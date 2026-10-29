@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
@@ -32,10 +32,16 @@ const MAX_NESTING = 5;
 const MAX_INPUT_BYTES = 1_000_000;
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 const OWNER_ONLY = 'This is reserved for the repository owner.';
+// Phase 3b (Fable attacker pass): the pipeline's run record, triage state and review-complete comment are comments of the agent's own login,
+// and `P merge` reads a missing run record as an ordinary run (a resumed one then needs no owner "merge"). Editing or deleting an existing
+// comment by hand (REST PATCH/PUT/DELETE on a comment, `gh pr|issue comment --edit-last / --delete-last`, GraphQL updateIssueComment /
+// deleteIssueComment) is refused; the pipeline commands update their own comments from their own process. Post a new comment instead.
+const COMMENT_EDIT_DENIED = 'editing or deleting an existing PR / issue comment is blocked: the pipeline keeps its run record, triage state and review in comments of this login, and a blanked or deleted one would read as "no record". Post a new comment instead (the pipeline commands update their own).';
 
 // The only graphql mutations an agent may run (comments, PR lifecycle, review threads). Everything else is denied.
+// (Phase 3b: updateIssueComment is no longer one: an edit of an existing comment can blank the pipeline's run record, see COMMENT_EDIT_DENIED)
 const GRAPHQL_ALLOWED_MUTATIONS = new Set([
-  'addComment', 'updateIssueComment', 'createPullRequest', 'enablePullRequestAutoMerge', 'disablePullRequestAutoMerge',
+  'addComment', 'createPullRequest', 'enablePullRequestAutoMerge', 'disablePullRequestAutoMerge',
   'markPullRequestReadyForReview', 'convertPullRequestToDraft', 'addPullRequestReview', 'resolveReviewThread', 'minimizeComment',
 ]);
 const PUSH_LONG_VALUE = ['repo', 'receive-pack', 'exec', 'push-option', 'recurse-submodules'];
@@ -79,7 +85,7 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // lowercase basename without .exe/.cmd/.bat/.com; handles /usr/bin/git and C:\Git\bin\GIT.EXE alike
 const baseName = (w) => commandName(w);
 // A command the parser could only partly resolve (`$g push`, `bash -c "$X"`, `curl … | sh`) is judged by what it mentions.
-const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close|claude-pipeline:review-complete/i;
+const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close|claude-pipeline:(?:review-complete|triage|state:|summary|needs-human|blocked|awaiting-review|record:|status:|event|followup)/i;
 const isProtectedBranch = (b) => PROTECTED_BRANCHES.includes(String(b).toLowerCase());
 const isPrefixOf = (name, full, min = 1) => name.length >= min && full.startsWith(name);
 // Label names are case-insensitive on GitHub; a name only counts when it is not part of a longer one.
@@ -159,7 +165,7 @@ function expandVars(text, ctx) {
 
 // Everything a script judged here can depend on: the directory, the nesting level and the line's variable / branch / config / alias state.
 // (and the writes of the line that count for the command: a script the line wrote is judged on what was written)
-const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.cfgDirty, ctx.envCfgDirty, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure], writeSignature(ctx.writeFrames)]);
+const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.cfgDirty, ctx.envCfgDirty, ctx.ghRepoDirty === true, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure], writeSignature(ctx.writeFrames)]);
 
 // What the policy's own tracking knows about variable `n` for a use the command's prefix does not override: its value, and
 // `$n` when it is unsure or tainted (the callers read that as "run-time value").
@@ -598,6 +604,8 @@ function trackConfig(args, ctx) {
   const key = String(positionals[0] ?? '').toLowerCase();
   if (key.startsWith('alias.') && positionals.length >= 2) ctx.gitAliases[key.slice('alias.'.length)] = positionals[1];
   if (writes && RISKY_CONFIG(key, String(positionals[1] ?? ''))) ctx.cfgDirty = true;
+  // (see directMergeVerdict; security review of de62b36: url.<base>.insteadOf rewrites a remote's URL, include / includeIf pull in other config)
+  if (writes && (DYNAMIC.test(key) || key === '' || /^(?:remote|url|include|includeif|core)\./.test(key))) ctx.ghRepoDirty = true;
 }
 
 function trackGit(sub, args, g, ctx) {
@@ -605,6 +613,7 @@ function trackGit(sub, args, g, ctx) {
   if (sub === 'checkout' || sub === 'switch') trackSwitch(sub, args, d, ctx);
   else if (sub === 'branch') trackBranch(args, d, g.gitDir, ctx);
   else if (sub === 'config') trackConfig(args, ctx);
+  else if (sub === 'remote' && args.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true; // (aliases expanded: see directMergeVerdict)
   else if (sub === 'rebase') {
     // `git rebase <upstream> <branch>` checks <branch> out first
     const { positionals } = parseOpts(args, { longValue: ['onto', 'exec', 'strategy', 'strategy-option', 'whitespace'], shortValue: 'xsXC' });
@@ -834,7 +843,8 @@ function checkApi(rest, env, dir, ctx) {
   const { flags, positionals } = parseOpts(rest, { longValue: API_LONG_VALUE, shortValue: 'XfFHqtp' });
   const explicit = flagValues(flags, ['method'], 'X').map((m) => m.toUpperCase());
   const hasBody = flags.some((f) => (f.short ? 'fF'.includes(f.name) : ['field', 'raw-field', 'input'].includes(f.name)));
-  const method = explicit.length ? (explicit.find((m) => m !== 'GET') ?? 'GET') : (hasBody ? 'POST' : 'GET');
+  // (security review of eb10860: gh takes the LAST -X / --method, so `-X POST -X DELETE` deletes; the first non-GET one was read before)
+  const method = explicit.length ? explicit[explicit.length - 1] : (hasBody ? 'POST' : 'GET');
   if (method === 'GET') return null;
   const ep = normaliseEndpoint(positionals[0]);
   const p = `/${ep}`;
@@ -846,6 +856,8 @@ function checkApi(rest, env, dir, ctx) {
   if (/^repos\/[^/]+\/[^/]+$/i.test(ep)) return deny(`${method} to repository settings is blocked. ${OWNER_ONLY}`);
   if (/\/collaborators/i.test(p)) return deny(`${method} to collaborators is blocked. ${OWNER_ONLY}`);
   if (/\/actions\/permissions/i.test(p)) return deny(`${method} to Actions permissions is blocked. ${OWNER_ONLY}`);
+  // -- (Phase 3b, Fable attacker pass) editing or deleting an existing comment: see COMMENT_EDIT_DENIED
+  if (/^repos\/[^/]+\/[^/]+\/(?:issues|pulls)\/comments\/[^/]+$/i.test(ep)) return deny(COMMENT_EDIT_DENIED); // (any method but GET, returned above)
 
   const body = gatherBody(flags, dir, ctx);
   const haystack = safeDecode(`${rest.join('\n')}\n${body.text}`);
@@ -921,23 +933,79 @@ const prNumberOf = (w) => {
   const m = /^#?(\d{1,7})$/.exec(String(w ?? '')) ?? /\/pull\/(\d{1,7})(?:[/?#]|$)/.exec(String(w ?? ''));
   return m ? Number(m[1]) : null;
 };
+// owner/name of a repository as gh takes it ([HOST/]OWNER/REPO, a URL, a PR URL), or null when the text is not one.
+// (security review of 26cfb30: the owner's "merge" names owner/name on github.com, so a host other than github.com — a GitHub
+// Enterprise server, a mirror — names another repository with the same owner/name: null, which refuses the merge)
+const repoSlugOf = (v) => {
+  const m = /^(?:[a-z][a-z0-9+.-]*:\/\/([^/]+)\/|([^/\s]+\.[^/\s]+)\/)?([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:\/pull\/\d+[^\s]*)?\/?$/i.exec(String(v ?? '').trim());
+  if (!m || DYNAMIC.test(String(v))) return null;
+  const host = m[1] ?? m[2];
+  return host === undefined || host.toLowerCase() === 'github.com' ? `${m[3]}/${m[4]}` : null;
+};
+// The value a variable that selects gh's repository (GH_REPO, GH_HOST) has for this command: this command's prefix, an assignment
+// earlier on the line that surely ran, or the hook's own environment, unless an `env -u NAME` / `env -i` / `env -` in front of the
+// command took it out (envUnset). undefined when unset; null when it cannot be known.
+function ghEnvValue(env, ctx, name, unset = envUnset(env, name)) {
+  if (unset === true) return undefined;
+  if (unset === null) return null;
+  if (Object.hasOwn(env, name)) return env[name];
+  if (unsureVar(ctx, name)) return null;
+  if (Object.hasOwn(ctx.vars, name)) return ctx.vars[name];
+  return ctx.env?.[name];
+}
+// (security review of de62b36) a line that names a git config file may write it (a redirect, a program): the remotes read before it may not hold
+const GIT_CONFIG_FILE = /(?:^|[\s/'"=])(?:\.git\/config|\.gitconfig|gitconfig|\.config\/git\/)/i;
+const GH_CONFIG_NAMES = ['GH_CONFIG_DIR', 'XDG_CONFIG_HOME', 'APPDATA', 'AppData', 'HOME'];
+// (Fable attacker pass) and the git environment gh reads the checkout's remotes and gh-resolved through: another repository (GIT_DIR …)
+// or injected config (GIT_CONFIG_COUNT/KEY_n/VALUE_n …)
+const GH_GIT_NAMES = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_CEILING_DIRECTORIES|GIT_DISCOVERY_ACROSS_FILESYSTEM|GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM))$/i;
+// Phase 3b: the repository a GH_REPO points gh at: undefined when none is set (or it is empty), null when it is set to something
+// that cannot be read. Also null whenever GH_HOST is (or may be) set to a host other than github.com: gh then reads -R owner/name,
+// GH_REPO and the checkout's remotes on that host, and the owner's "merge" names a repository on github.com.
+// `envOf`: the command whose `env` wrappers may have removed either variable (when `env` holds only values already in ctx.vars).
+// (security review of fe5a82d: gh reads its hosts — the default one too — from its config directory: GH_CONFIG_DIR, else XDG_CONFIG_HOME/gh,
+// else %AppData%/GitHub CLI on Windows, else ~/.config/gh. A line that points gh at another one (sets, changes or removes any of these)
+// may leave a sole logged-in enterprise host as the default: null, as for GH_HOST.)
+function ghRepoEnvSlug(env, ctx, envOf = env) {
+  const gitNames = [...Object.keys(env), ...Object.keys(ctx.vars ?? {}), ...(ctx.unsureVars ?? []), ...(ctx.tainted ?? [])].filter((n) => GH_GIT_NAMES.test(n));
+  for (const name of new Set([...GH_CONFIG_NAMES, ...gitNames])) {
+    const v = ghEnvValue(env, ctx, name, envUnset(envOf, name));
+    if (v === null || (v ?? '') !== (ctx.env?.[name] ?? '')) return null;
+  }
+  const host = ghEnvValue(env, ctx, 'GH_HOST', envUnset(envOf, 'GH_HOST'));
+  if (host === null || (typeof host === 'string' && host !== '' && host.trim().toLowerCase() !== 'github.com')) return null;
+  const value = ghEnvValue(env, ctx, 'GH_REPO', envUnset(envOf, 'GH_REPO'));
+  if (value === null) return null;
+  return typeof value === 'string' && value !== '' ? repoSlugOf(value) : undefined;
+}
 // `elsewhere`: the command names another repository (-R, a PR URL), whose mode is unknown here: judged as a chat repo.
 // `head`: the head the command pins (gh: --match-head-commit; the repo command: the flag before its {sha}); a merge that pins no full
 // head could land a later push the owner never saw, so it is refused, and the owner's "merge" must be for exactly that head.
-function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag = '--match-head-commit') {
+// `named` (Phase 3b): the repository the command itself names (-R, a PR URL, GH_REPO), null when it names one that cannot be read
+// (built at run time, or two that differ), undefined when it names none: then the checkout's (ownerGo.repoOf: its remotes, when they
+// name one repository). The owner's "merge" names its repository (the request's `· repo owner/name`), and must name this one.
+function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag = '--match-head-commit', named = undefined) {
   if (!ctx?.ownerGo) return null;
   if (!elsewhere && ownerGoMode(dir, ctx) !== 'chat') return null;
+  // (Fable attacker pass: a remote changed earlier on the line, or gh's default repository set, points gh at a repository the remotes
+  // read before the line never named: `git remote set-url …`, `git config remote.….gh-resolved …`, `gh repo set-default …`)
+  if (ctx.ghRepoDirty || GIT_CONFIG_FILE.test(String(ctx.fullText ?? ''))) named = null;
   const where = elsewhere ? 'a merge named by -R, a PR URL or GH_REPO (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
   const via = `Merge through \`P merge --pr ${pr ?? 'N'}\` (it merges a low-risk PR itself), or show the request (Head and 🔀 lines) and wait for the owner to type "merge".`;
   if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR and head. Name the PR number (run from the repository), or ${via[0].toLowerCase()}${via.slice(1)}`);
   if (!pinFlag) return deny(`${what} #${pr}: ${where} needs the owner's "merge" for the head it lands, and this merge command pins no head. ${via}`);
   if (!/^[0-9a-f]{40}$/.test(String(head ?? ''))) return deny(`${what} #${pr}: ${where} must pin the head the owner said "merge" for: add \`${pinFlag} <full 40-character head>\`. ${via}`);
+  let repo = named;
+  if (repo === undefined) {
+    try { repo = dir === null ? null : ctx.ownerGo.repoOf(dir) ?? null; } catch { repo = null; }
+  }
+  if (!repo) return deny(`${what} #${pr}: which repository it merges in cannot be told (the checkout's remotes name none, several or one off github.com; -R / a PR URL / GH_REPO is built at run time, disagrees or names a host other than github.com; or GH_HOST is set, or the line moves gh's config directory: GH_CONFIG_DIR, XDG_CONFIG_HOME, APPDATA, HOME, or its git: GIT_DIR, GIT_CONFIG_*; or changes the remotes or gh's default repository), and the owner's "merge" names its repository. Name it with -R owner/name, or ${via[0].toLowerCase()}${via.slice(1)}`);
   let ok = false;
   try {
-    ok = ctx.ownerGo.approvedHead(pr, head) === true;
+    ok = ctx.ownerGo.approvedHead(pr, head, repo) === true;
   } catch { /* unreadable records: not approved */ }
   if (ok) return null;
-  return deny(`${what} #${pr}: ${where} needs the owner's "merge" for #${pr} at head ${head.slice(0, 12)} in this session, and none is recorded. ${via}`);
+  return deny(`${what} #${pr}: ${where} needs the owner's "merge" for ${repo} #${pr} at head ${head.slice(0, 12)} in this session, and none is recorded (the request names it: \`Head ${head.slice(0, 12)} · items … · repo ${repo}\`). ${via}`);
 }
 // (the package-manager argv reading -- PM_RUN_ALIASES, canonPm, pmScriptOf ... -- lives in package-scripts.mjs: the two guards open package scripts with it too)
 // The repo's own merge command (pipeline.yml merge.command, e.g. `npm run merge -- {pr} --expect-head {sha}`) typed by hand. A `gh …`
@@ -967,7 +1035,7 @@ function pmScriptRefusal(prefix, shaFlag, raw, dir, ctx) {
   const canon = `${prefix.join(' ')} <PR>${shaFlag ? ` ${shaFlag} <full 40-character head>` : ''}`;
   return deny(`\`${raw.join(' ').slice(0, 120)}\` may run the merge script \`${script}\`, and ${moved ? 'a manager option moves its target directory, so it is judged as a chat repository' : 'in this repository (owner_approval: chat)'} a merge needs the owner's "merge" for that PR and head. Only the exact form \`${canon}\` is checked against the owner's record (nothing between the script name and \`--\`, no manager options, no wrapper). Use it, or merge through \`P merge --pr N\` (it merges a low-risk PR itself).`);
 }
-function repoMergeCommandVerdict(argv, dir, ctx) {
+function repoMergeCommandVerdict(argv, dir, ctx, cmdEnv = {}) {
   if (!ctx?.ownerGo) return null;
   // (an unknown directory is judged by the session's own; a pipeline.yml that cannot be read leaves `npm run merge` as the guess, as the mode of an unreadable one is chat)
   let templates = [];
@@ -992,7 +1060,7 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
       const vals = given.flatMap((w, j, all) => (w === shaFlag ? [all[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
       head = vals.length === 1 ? vals[0] ?? null : null;
     }
-    return directMergeVerdict(prNumberOf(given[0]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+    return directMergeVerdict(prNumberOf(given[0]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag, ghRepoEnvSlug({}, ctx, cmdEnv));
   }
   for (const { prefix, shaFlag } of scripts) {
     const v = pmScriptRefusal(prefix, shaFlag, raw, dir, ctx);
@@ -1008,7 +1076,7 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
       const vals = plain.flatMap((w, j, all) => (w === shaFlag ? [all[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
       head = vals.length === 1 ? vals[0] ?? null : null;
     }
-    return directMergeVerdict(prNumberOf(plain[p.length]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+    return directMergeVerdict(prNumberOf(plain[p.length]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag, ghRepoEnvSlug({}, ctx, cmdEnv));
   }
   return null;
 }
@@ -1023,10 +1091,28 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
 // body piped in on stdin from a file, or a client of the agent's own, is not seen; nor is a body file that a process started by
 // an EARLIER command (a background job) rewrites between this check and gh reading it (Fable attacker pass): the hook judges one
 // command line, not what else is running. The local review state itself (.review/state.json, which review-complete trusts) is
-// not protected here: tracked as an open item before ci.review_check is turned on anywhere.
-const REVIEW_MARKER_RE = new RegExp(escapeRe(REVIEW_MARKER_TEXT), 'i');
+// protected by the files guard (files-policy.mjs, REVIEW_FILE_SRC).
+// Phase 3b: the triage comment's markers are refused the same way. `pipeline state show --pr N` rebuilds (or, when they disagree,
+// replaces) .review/state.json from the newest triage comment of the viewer, which is the agent's own login, so a hand-posted one
+// would become a review state the files guard never saw written. Only `pipeline comment --pr N --kind triage` posts it, from its
+// own process. (TRIAGE_MARKER_TEXT / STATE_MARKER_TEXT: lib/render.mjs MARKERS.triage and lib/state.mjs encodeForComment, kept in
+// step by test/guard-git-review-marker.test.mjs.)
+export const TRIAGE_MARKER_TEXT = 'claude-pipeline:triage';
+export const STATE_MARKER_TEXT = 'claude-pipeline:state:';
+// Phase 3b: and every other marker the pipeline's own commands write, which readers trust as the pipeline's word because the viewer
+// (the agent's login) posted it: the summary comment and its run record (`P merge` reads from it whether a run was resumed, and so
+// whether the owner's approval of the head is needed), its status block, the needs-human / blocked / awaiting-review comments, run
+// events (prod-before, rollback intent and result: prod-watch and resume read them) and the follow-up issue stamp (a forged one
+// suppresses filing). Only `P summary` / `P checkpoint`, `P comment`, the run-event writers and `P followups create` post them.
+// (Kept in step with lib/render.mjs MARKERS, lib/run-record.mjs, lib/run-events.mjs and commands/followups.mjs by
+// test/guard-git-review-marker.test.mjs.)
+export const RUN_MARKER_TEXTS = Object.freeze(['claude-pipeline:summary', 'claude-pipeline:needs-human', 'claude-pipeline:blocked',
+  'claude-pipeline:awaiting-review', 'claude-pipeline:record:', 'claude-pipeline:status:', 'claude-pipeline:event:', 'claude-pipeline:event-data:',
+  'claude-pipeline:followup']);
+const POSTED_MARKERS = [REVIEW_MARKER_TEXT, TRIAGE_MARKER_TEXT, STATE_MARKER_TEXT, ...RUN_MARKER_TEXTS];
+const REVIEW_MARKER_RE = new RegExp(POSTED_MARKERS.map(escapeRe).join('|'), 'i');
 const mentionsReviewMarker = (text) => REVIEW_MARKER_RE.test(String(text ?? '')) || REVIEW_MARKER_RE.test(safeDecode(String(text ?? '')));
-const REVIEW_MARKER_DENIED = `the text carries the review-complete marker (${REVIEW_MARKER_TEXT}), which only \`pipeline review-complete --pr N\` may post: it checks that a clean review covers the current content first. Run it instead.`;
+const REVIEW_MARKER_DENIED = `the text carries a marker only the pipeline posts: the review-complete marker (${REVIEW_MARKER_TEXT}) comes only from \`pipeline review-complete --pr N\`, which checks that a clean review covers the current content first; the triage and review-state markers (${TRIAGE_MARKER_TEXT}, ${STATE_MARKER_TEXT}) only from \`pipeline comment --pr N --kind triage\`, which renders the local review state; the run's own markers (summary, record, status, needs-human, blocked, awaiting-review, event, followup) only from the pipeline commands that write them (summary / checkpoint, comment, followups create). Run those instead.`;
 // gh commands that post or edit text on a PR or issue (where the workflow reads the comments), by group and verb.
 const TEXT_VERBS = { pr: ['comment', 'create', 'edit', 'review', 'close', 'merge'], issue: ['comment', 'create', 'edit', 'close'] };
 // gh's short flags for those verbs (gh 2.x): text = value is posted text or a body file; value = other value-taking; bool = switches.
@@ -1045,6 +1131,9 @@ const SHORT_FLAGS = {
 };
 function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
   if (!(TEXT_VERBS[group] ?? []).includes(verb)) return null;
+  // (Phase 3b, Fable attacker pass: the pipeline's comments are the agent login's own, so `--edit-last` / `--delete-last` may blank or delete the
+  // run record, which P merge then reads as "no record": an ordinary run, no owner "merge" needed for a resumed one. COMMENT_EDIT_DENIED.)
+  if (verb === 'comment' && rest.some((w) => /^--(?:edit-last|delete-last)(?:=|$)/.test(w))) return deny(COMMENT_EDIT_DENIED);
   // (the whole line too: a here-string, or a printf that writes the body file before this command)
   if (rest.some(mentionsReviewMarker) || mentionsReviewMarker(ctx.fullText)) return deny(REVIEW_MARKER_DENIED);
   // The text values (--body, --comment, --title …) and body files (--body-file F, --body-file=F, -F F, -FF: gh pr/issue -F is
@@ -1062,7 +1151,7 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
   const LONG_REFUSED = new Set(['editor', 'template', 'recover']);
   const SHORT_TEXT = table.text;
   const SHORT_REFUSED = 'eT';
-  const EDITOR_DENIED = 'the text would come from an editor, a template or a recovered draft, which the guard cannot read for the review-complete marker. Pass the text with --body or a literal --body-file.';
+  const EDITOR_DENIED = 'the text would come from an editor, a template or a recovered draft, which the guard cannot read for the pipeline markers (review-complete, triage). Pass the text with --body or a literal --body-file.';
   const texts = [];
   const files = [];
   for (let i = 0; i < rest.length; i++) {
@@ -1100,22 +1189,22 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
     }
   }
   if (texts.some((t) => DYNAMIC.test(t))) {
-    return deny('the comment text (or its file name) is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the review-complete marker. Write the body to a file and pass --body-file with a literal name.');
+    return deny('the comment text (or its file name) is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the pipeline markers (review-complete, triage). Write the body to a file and pass --body-file with a literal name.');
   }
   for (const file of files) {
     if (file === '-') continue; // (stdin: the residual above; a here-string is in the line itself)
     // a name the shell rewrites before gh sees it (~, a glob, a brace list) names some other file than the one read here
-    if (/^~|[*?[\]{}]/.test(file)) return deny(`the body file name ${file} is expanded by the shell (~, a glob or a brace list), so which file is posted cannot be verified for the review-complete marker. Name the file literally.`);
-    if (dir === null) return deny('cannot tell which directory this runs in, so the body file cannot be checked for the review-complete marker. Use an absolute path, or chain the cd with &&.');
+    if (/^~|[*?[\]{}]/.test(file)) return deny(`the body file name ${file} is expanded by the shell (~, a glob or a brace list), so which file is posted cannot be verified for the pipeline markers (review-complete, triage). Name the file literally.`);
+    if (dir === null) return deny('cannot tell which directory this runs in, so the body file cannot be checked for the pipeline markers (review-complete, triage). Use an absolute path, or chain the cd with &&.');
     const abs = path.resolve(dir, file);
     // a body file an earlier command on this line wrote (or may have written) holds text that does not exist yet: refused
     if (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) !== null) {
-      return deny(`${file} may be written earlier on this line, so the body that is posted cannot be checked for the review-complete marker. Write the file in a command of its own.`);
+      return deny(`${file} may be written earlier on this line, so the body that is posted cannot be checked for the pipeline markers (review-complete, triage). Write the file in a command of its own.`);
     }
     countScript(ctx.budget);
     // (fail closed: a file that is missing, not a regular file, too large or unreadable cannot be checked)
     const text = ctx.readText(abs);
-    if (typeof text !== 'string') return deny(`the body file ${file} cannot be read here (missing, not a regular file, or over ${MAX_INPUT_BYTES} bytes), so it cannot be checked for the review-complete marker.`);
+    if (typeof text !== 'string') return deny(`the body file ${file} cannot be read here (missing, not a regular file, or over ${MAX_INPUT_BYTES} bytes), so it cannot be checked for the pipeline markers (review-complete, triage).`);
     if (mentionsReviewMarker(text)) return deny(REVIEW_MARKER_DENIED);
   }
   return null;
@@ -1149,12 +1238,12 @@ function apiReviewMarkerVerdict(ep, rawEp, haystack, body, dir, ctx) {
   const graphql = /^graphql$/i.test(ep);
   const runTimeEndpoint = DYNAMIC.test(String(rawEp ?? ''));
   if (!graphql && !runTimeEndpoint && !API_COMMENT_PATH.test(ep)) return null;
-  if (body.unknown) return deny('the body of this API write comes from stdin or a file that cannot be read here, so it cannot be checked for the review-complete marker. Pass a readable file with a literal name.');
+  if (body.unknown) return deny('the body of this API write comes from stdin or a file that cannot be read here, so it cannot be checked for the pipeline markers (review-complete, triage). Pass a readable file with a literal name.');
   for (const file of body.files) {
-    if (/^~|[*?[\]{}]/.test(file) || DYNAMIC.test(file)) return deny(`the input file name ${file} is expanded by the shell, so which file is sent cannot be verified for the review-complete marker. Name the file literally.`);
-    if (dir === null) return deny('cannot tell which directory this runs in, so the input file cannot be checked for the review-complete marker. Use an absolute path, or chain the cd with &&.');
+    if (/^~|[*?[\]{}]/.test(file) || DYNAMIC.test(file)) return deny(`the input file name ${file} is expanded by the shell, so which file is sent cannot be verified for the pipeline markers (review-complete, triage). Name the file literally.`);
+    if (dir === null) return deny('cannot tell which directory this runs in, so the input file cannot be checked for the pipeline markers (review-complete, triage). Use an absolute path, or chain the cd with &&.');
     if (writtenTo(ctx.writeFrames, path.resolve(dir, file), { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) !== null) {
-      return deny(`${file} may be written earlier on this line, so the body that is sent cannot be checked for the review-complete marker. Write the file in a command of its own.`);
+      return deny(`${file} may be written earlier on this line, so the body that is sent cannot be checked for the pipeline markers (review-complete, triage). Write the file in a command of its own.`);
     }
   }
   // Whether the query word holds an expansion is the shell parser's fact (cmd.litWords: the words without one), never a search of
@@ -1178,7 +1267,7 @@ function apiReviewMarkerVerdict(ep, rawEp, haystack, body, dir, ctx) {
   }
   const comment = !graphql || body.queries.some((q) => COMMENT_MUTATION.test(q));
   if (comment && body.fields.some((f) => f.key !== 'query' && typeof f.written === 'string' && DYNAMIC.test(f.written))) {
-    return deny('a field of this API write is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the review-complete marker. Write the body to a file and pass it with a literal name (-F body=@file or --input file).');
+    return deny('a field of this API write is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the pipeline markers (review-complete, triage). Write the body to a file and pass it with a literal name (-F body=@file or --input file).');
   }
   return null;
 }
@@ -1191,6 +1280,7 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
   const args = argv.slice(1).map((a) => expandVars(a, ctx));
   const { group, verb, rest } = splitGh(args);
   if (!group) return null;
+  if (group === 'repo' && verb === 'set-default') ctx.ghRepoDirty = true; // (also reached through a gh alias: see directMergeVerdict)
 
   // aliases: `gh alias set NAME EXPANSION` is checked as if it ran, and a name defined on this line is expanded
   if (group === 'alias' && verb === 'set') {
@@ -1239,10 +1329,17 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
     // (gh reads the repository from -R, a PR URL or GH_REPO: set on this command, earlier on the line (unknown if it ran) or inherited. An empty GH_REPO selects nothing)
     const ghRepo = envVar(env, ctx, 'GH_REPO');
     const viaEnv = !ghRepo.known || (Object.hasOwn(env, 'GH_REPO') ? ghRepo.value !== '' : (ghRepo.value !== undefined && ghRepo.value !== '') || (typeof ctx.env?.GH_REPO === 'string' && ctx.env.GH_REPO !== ''));
-    const elsewhere = flagValues(flags, ['repo'], 'R').length > 0 || /\/pull\//.test(positionals[0] ?? '') || viaEnv;
+    const repoFlags = flagValues(flags, ['repo'], 'R');
+    const elsewhere = repoFlags.length > 0 || /\/pull\//.test(positionals[0] ?? '') || viaEnv;
     // (gh uses the LAST --match-head-commit: a repeated one could pin another head than the one checked, so it pins nothing)
     const pins = flagValues(flags, ['match-head-commit']);
-    return directMergeVerdict(prNumberOf(positionals[0]), pins.length === 1 ? pins[0] : null, dir, ctx, '`gh pr merge`', elsewhere);
+    // (Phase 3b: the repository it names, each way gh reads one; any that cannot be read, or two that differ, is unknown)
+    const named = [...repoFlags, ...(/\/pull\//.test(positionals[0] ?? '') ? [positionals[0]] : [])].map(repoSlugOf);
+    const fromEnv = ghRepoEnvSlug(env, ctx);
+    if (fromEnv !== undefined) named.push(fromEnv);
+    const slugs = new Set(named.map((s) => (s === null ? null : s.toLowerCase())));
+    const repo = named.length === 0 ? undefined : slugs.size === 1 && !slugs.has(null) ? named[0] : null;
+    return directMergeVerdict(prNumberOf(positionals[0]), pins.length === 1 ? pins[0] : null, dir, ctx, '`gh pr merge`', elsewhere, undefined, repo);
   }
 
   if ((group === 'pr' || group === 'issue') && (verb === 'edit' || verb === 'create')) {
@@ -1874,6 +1971,7 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
   const carry = (r) => {
     for (const [d, e] of r.branches) if (ctx.branches.get(d) !== e) ctx.branches.set(d, e);
     if (r.cfgDirty) ctx.cfgDirty = true;
+    if (r.ghRepoDirty) ctx.ghRepoDirty = true;
     Object.assign(ctx.gitAliases, r.git);
     Object.assign(ctx.ghAliases, r.gh);
     for (const n of r.unsure) ctx.aliasUnsure.add(n);
@@ -1890,7 +1988,7 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
   fresh.fullText = typeof text === 'string' ? text : '';
   const v = checkScriptFile(rec, dir, fresh, 0);
   const done = {
-    verdict: v, branches: new Map(fresh.branches), cfgDirty: fresh.cfgDirty, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure],
+    verdict: v, branches: new Map(fresh.branches), cfgDirty: fresh.cfgDirty, ghRepoDirty: fresh.ghRepoDirty === true, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure],
     sens: (ctx.budget.unmodelledSeen ?? 0) !== seen0, flag,
   };
   memo.set(key, done);
@@ -2763,9 +2861,11 @@ function evalString(str, startDir, ctx, level, child = false) {
   ctx.writeFrames.push(frame);
   // the subshells open at the command being walked, outermost first: { id, dir, uncertain } as they were when it started (null: marks not trusted, see subshellsTrusted)
   const subs = subshellsTrusted(cmds) ? [] : null;
+  let chdirBase; // (the list's own directory while one command runs in its wrapper's -C / --chdir directory)
   try {
   for (const [i, c] of cmds.entries()) {
     checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
+    if (chdirBase !== undefined) { dir = chdirBase; chdirBase = undefined; }
     const argv = c.argv;
     if (subs) {
       // Why: a cd inside a subshell ($( ), ( ), backticks, <( )) moves that subshell only: when it ends, the line goes on in the directory it had when the subshell
@@ -2795,6 +2895,9 @@ function evalString(str, startDir, ctx, level, child = false) {
       const orExits = cmds[i + 1]?.sep === '||' && ['exit', 'return'].includes(cmds[i + 1].argv[0]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&';
       if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
     }
+    // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
+    // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)
+    if (c.chdir !== undefined) { chdirBase = dir; dir = c.chdir === null || dir === null ? null : joinDir(dir, c.chdir, ctx); }
     frame.i = i;
     dirAt.set(i, dir);
     if (!argv.length) { recordAssigned(c, ctx, level); continue; } // a bare `NAME=value`
@@ -2810,6 +2913,9 @@ function evalString(str, startDir, ctx, level, child = false) {
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
     else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
     else if (name === 'git' || name === 'gh') {
+      // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
+      if (name === 'git' && argv.includes('remote') && argv.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true;
+      if (name === 'gh' && argv[1] === 'repo' && argv[2] === 'set-default') ctx.ghRepoDirty = true;
       const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
       if (unsure !== null && ctx.zshNames?.has(unsure)) verdict = deny(zshModifiedReason(unsure));
       else if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);
@@ -2827,9 +2933,9 @@ function evalString(str, startDir, ctx, level, child = false) {
         const v = withPrefixEnv(c, ctx, () => evalString(inner, dir, ctx, level + 1));
         if (v.decision === 'deny') { verdict = v; break; }
       }
-      if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
+      if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx, c.env)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
       // (npm exec NAME / npx NAME: the parser unwraps them to `NAME …`, marked viaRunner. NAME is a bin, never a script, but it is judged as the merge script when it carries that name: `npx npm run NAME`)
-      if (!verdict && c.viaRunner) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(['npx', 'npm', 'run', argv[0]], dir, ctx));
+      if (!verdict && c.viaRunner) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(['npx', 'npm', 'run', argv[0]], dir, ctx, c.env));
       if (!verdict && c.viaRunner) {
         verdict = runnerBinVerdict(argv, dir, ctx, level);
         // (R1-B6: `npx --prefix sub tool`: the bin may come from the prefix's node_modules/.bin; it still runs in the working directory)
@@ -2942,7 +3048,7 @@ function evaluateGitOnce(command, {
   now = Date.now, // injectable clock (tests)
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
   nodePrefix, // #89 t3: where this node binary's npm keeps its global configuration (<nodePrefix>/etc/npmrc); undefined: from process.execPath, null: none (tests)
-  ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), approvedHead(pr, head) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
+  ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), repoOf(dir), approvedHead(pr, head, repo) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
 } = {}, bashState) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);

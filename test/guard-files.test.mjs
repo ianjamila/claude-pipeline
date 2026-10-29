@@ -916,3 +916,71 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
     'node /home/u/.claude/pipeline/hooks/session-version.mjs', // (the other installed hooks keep their read-only standing)
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
+
+// Phase 3b (Fable attacker pass on #107): review-complete trusts .review/state.json, so a repo's review state and the proofs beside it
+// are written only by the pipeline commands (their own process, which the hook never sees), in any checkout or worktree.
+test('Phase 3b: a repo\'s review state is protected from every write, wherever the checkout is', () => {
+  for (const p of ['/repo/.review/state.json', '.review/state.json', '/other/wt/.review/round-2/codex.json', '.review/round-1/model-proof.json', '.review/final-gate.json', '.review/preview-smoke.json', '.review/prod-before.json', '.review/state.json.123.tmp']) {
+    assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', p);
+    assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', p);
+  }
+  assert.equal(file('mcp__fs__write_file', { path: '/repo/.review/state.json', content: '{}' }), 'deny');
+  assert.equal(file('mcp__fs__move_file', { source: '/tmp/forged', destination: '/repo/.review' }), 'deny', 'the folder that holds it');
+  assert.equal(file('Write', { file_path: '/repo/.Review/State.json', content: '{}' }, MAC), 'deny', 'case-insensitive on macOS');
+  for (const cmd of [
+    "echo '{}' > .review/state.json",
+    'cp /tmp/forged.json .review/state.json',
+    'cp /tmp/forged.json /other/wt/.review/state.json',
+    'tee .review/round-1/model-proof.json < /tmp/x',
+    "sed -i 's/needs-human/ACCEPT/' .review/round-1/codex.json",
+    'mkdir -p .review/round-3',
+    'touch .review/final-gate.json',
+    'ln -s /tmp/forged.json .review/state.json',
+    'mv /tmp/forged .review',
+    'rm -rf .review',
+    'rsync -a /tmp/forged/ .review/',
+    'tar -C .review -xf /tmp/forged.tar',
+    'cd .review && echo x > state.json',
+    'cd .review/round-1 && cp /tmp/x codex.json',
+    'cp /tmp/x .review/*',
+    'cp /tmp/x .review/round-*/codex.json',
+    'cp /tmp/x .rev*/state.json',
+    'shopt -s dotglob globstar; cp /tmp/x **/state.json',
+    'cp /tmp/x */state.json(D)', // (a zsh glob qualifier: D lets the wildcard match the dot folder)
+    'cp /tmp/x */state.json(#q.ND)',
+    // (Codex R1: any round, any smoke target, not only the sample names; a wildcard name written into a review folder may be any of them)
+    'cp /tmp/forged.json .rev*/round-2/codex.json',
+    'cp /tmp/x .rev*/staging-smoke.json',
+    'cp /tmp/x .review/round-[2-9]/codex.json',
+    'cp /tmp/x .review/hardstops*.json',
+    "node -e \"require('fs').writeFileSync('.review/state.json', '{}')\"",
+    "node -e \"fs.writeFileSync(path.join(root, '.review', 'state.json'), s)\"",
+    'cd "$X" && echo x > state.json', // (an unknown directory may be a review folder)
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    'cat .review/state.json',
+    'jq .rounds .review/state.json',
+    'ls -la .review .review/round-1',
+    'mkdir -p .review', // (the ship skill, before it writes hardstops.json: an empty folder holds nothing)
+    'node ~/.claude/pipeline/bin/pipeline.mjs hardstops --base origin/main --head HEAD > .review/hardstops.json',
+    'cp /tmp/x .rev*/notes.md', // (a literal name that is no review file)
+    'cat .review/round-*/codex.json', // (reading through a wildcard)
+    'echo x > other/state.json',
+    'echo x > notes/review/state.json',
+    'npx prettier --write "src/**/*.ts"', // (a wildcard reaches a dot folder only with dotglob)
+    'cp /tmp/x */state.json',
+    'git commit -m "protect .review/state.json"',
+    'node ~/.claude/pipeline/bin/pipeline.mjs state show --pr 5',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+test('Phase 3b: a program that resolves into a review folder is judged like any other (only the installed pipeline is trusted)', () => {
+  // (run.mjs links to a file in a round folder: the hook judges the real file's text, it does not skip it as a pipeline program)
+  const prog = '/repo/.review/round-1/x.mjs';
+  const opts = {
+    existsSync: (p) => p === prog || p === '/repo/run.mjs',
+    realpath: (p) => (p === '/repo/run.mjs' ? prog : p),
+    readText: (p) => (p === '/repo/run.mjs' || p === prog ? "import fs from 'node:fs'; fs.writeFileSync('/home/u/.claude/settings.json', '{}');" : null),
+  };
+  assert.equal(bash('node run.mjs', opts), 'deny');
+});

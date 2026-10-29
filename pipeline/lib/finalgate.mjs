@@ -345,6 +345,10 @@ function sameTreeAs(sha, o) {
 }
 
 // `proofs` is an out-array: filled (in report order) only when this check passes, with where each deferrable step was proved.
+// Residual (Phase 3b): .verify/report.json is written by the verify command the agent runs, as the agent's OS user, so it proves only
+// what the agent reports; a tool hook cannot tell the verify process's own write from a forged one (and the files guard does not
+// cover .verify/ today). What backs it: a step deferred to CI is proved from GitHub (ciProof above), and branch protection requires
+// the CI checks on the merge itself.
 export async function verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs = [] }) {
   let report;
   try {

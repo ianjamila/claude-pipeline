@@ -201,7 +201,8 @@ last round, or any item `needsHuman` ⇒ label `needs-human`, post
 `P comment --pr N --kind needs-human --reason "…"` (no `--hits-file`),
 `P summary --pr N --outcome needs-human --action "…" --cause review:<reason>`, stop. With `owner_approval: chat` and items still `needsHuman`, that
 summary's `--action` is "Rule on <ids> in chat (accept / follow-up / reject), remove needs-human, then say ship resume N"; when the owner
-rules in chat, record it with `P triage owner-ruling` (**Owner rules in chat** in `reference/review-loop.md`).
+rules in chat, record it with `P triage owner-ruling` (**Owner rules in chat** in `reference/review-loop.md`: ask with a reply ending in
+`⚖️ Owner ruling needed #N: <ids> · repo <owner/name>`, or the owner's answer is not recorded and the ruling is refused).
 
 Codex `exitCode: 3` at any point (Codex unavailable) ⇒ `gh pr edit N --add-label awaiting-review`,
 `P comment --pr N --kind awaiting-review --reason "<reason from the JSON>"`,
@@ -337,24 +338,28 @@ each `P merge`, take the `ownerMerge` count of the `P final-gate --pr N` that co
   1. Post one comment: `gh pr comment N --body "<each item: rule, file, one-line why; head <sha12>; the owner merges by saying \"merge\" in chat>"`.
   2. `P checkpoint --pr N --step awaiting-owner-merge`, then `P summary --pr N --outcome awaiting-owner-merge --action "Check the listed items, then say \"merge\" for head <sha12>" --built "…"`, publish the agent-log line (Step 7), end the run with
      outcome `awaiting-owner-merge`, keep the worktree. The reply's LAST two lines are exactly (sha12 = the first 12 characters of
-     the head; ownerItems = the gate's `ownerItems`, `none` when there are no items):
-     `Head <sha12> · items <ownerItems>`
+     the head; ownerItems = the gate's `ownerItems`, `none` when there are no items; owner/name = the PR's repository, as
+     `gh repo view --json nameWithOwner` prints it):
+     `Head <sha12> · items <ownerItems> · repo <owner/name>`
      `🔀 Ready to merge #N — say "merge"`
-     Several PRs at once: one `#N head <sha12> · items <ownerItems>` line per PR, then `🔀 Ready to merge #N, #M — say "merge"`.
+     Several PRs at once: one `#N head <sha12> · items <ownerItems> · repo <owner/name>` line per PR, then `🔀 Ready to merge #N, #M — say "merge"`.
 - When the owner then says "merge" and the head and items are unchanged, run Step 6 (final gate again if the base moved,
   `P merge`, prod-watch, rollback handling). If the head changed or new items appeared after they said "merge",
   show the updated items and the new head and stop again, with a new `awaiting-owner-merge` summary for that head.
 The owner's chat message is the approval; never add an approval label yourself (invariant 2).
 
 **How the "merge" is recorded (#58).** The owner-go hook (UserPromptSubmit) records a prompt the owner types that STARTS with
-"merge" ("merge", "merge #N", "merge <sha12>"; never "do not merge" or "merge?"), bound to the Head / items lines of the reply
-right before it, and says so in one context line (`[claude-pipeline owner-go] the owner's "merge" is recorded: #N head … items …`).
+"merge" ("merge", "merge #N", "merge <sha12>"; never "do not merge" or "merge?"), bound to the Head / items / repo lines of the reply
+right before it, and says so in one context line (`[claude-pipeline owner-go] the owner's "merge" is recorded: owner/name #N head … items …`).
+A line without `· repo owner/name` approves nothing (Phase 3b: a "merge" for #N of one repository never merges #N of another).
 `P merge` checks that record: the flags only name it. So: always end the request reply with the two lines above (the record binds
 only to the LAST reply: if anything else was said since, show the request again); never type, quote or simulate the owner's
 prompt, run the owner-go hook, or write `~/.claude/pipeline-state/owner-go` (the guards refuse it). No record ⇒ `P merge` says
 "no owner \"merge\" is recorded": show the request again and wait. In an `owner_approval: chat` repo a direct `gh pr merge`, the repo's
-merge command typed by hand, or auto-merge through the API is refused too unless the owner said "merge" for that PR and head in this
-session (and it pins the head: `--match-head-commit <full head>`); `P merge` is the normal way.
+merge command typed by hand, or auto-merge through the API is refused too unless the owner said "merge" for that repository, PR and head in this
+session (and it pins the head: `--match-head-commit <full head>`; the repository is the one `-R`, a PR URL or GH_REPO names, else the
+checkout's when all its remotes name one; only on github.com: another host, or any GH_HOST but github.com, is refused, and an `env -u` /
+`env -i` that drops GH_REPO counts); `P merge` is the normal way.
 
 ## Step 7 — summary
 

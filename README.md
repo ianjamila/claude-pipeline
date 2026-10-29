@@ -200,12 +200,12 @@ Hard-stop PRs still go through the full review loop first, so you always get a r
 | Linear history / squash | ✅ | | | ✅ |
 | Fresh full verify bound to the head commit | | | | ✅ final-gate |
 | Gate judges the tree that will land (branch up to date with `main`) | | | ✅ `update-branch` stays allowed, merging through the API denied | ✅ `update-branch` before the gate, again in `merge` |
-| Cross-model review happened | | | | ✅ no review ⇒ no merge |
+| Cross-model review happened | | | ✅ guard-files keeps agents from writing a repo's review state (`.review/state.json`, round folders, gate / smoke / prod-before records); guard-git keeps them from posting the review-complete or triage markers | ✅ no review ⇒ no merge |
 | Arbiter really ran on Fable | | | | ✅ model-proof |
 | Pause switch | | | ✅ can't close the pause issue | ✅ |
 | Production smoke + rollback | | | | ✅ prod-watch |
 | Agents can't edit their own rules | ✅ protection edits need admin | | ✅ guard-files / guard-git | |
-| Owner items (`owner_approval: chat`) and resumed runs merge only on your chat "merge" for that head and item set | | | ✅ owner-go records (guard-files protects them); guard-git refuses a direct merge in a chat repo without one | ✅ `P merge` checks the record |
+| Owner items (`owner_approval: chat`) and resumed runs merge only on your chat "merge" for that repository, head and item set | | | ✅ owner-go records (guard-files protects them); guard-git refuses a direct merge in a chat repo without one | ✅ `P merge` checks the record |
 
 The label-based approvals rely on the local hook because the agents use your GitHub account.
 
@@ -374,7 +374,8 @@ executable.
   override, and that the model is available on your plan (an invalid model fails with
   `model_not_found`; it never silently falls back).
   With `owner_approval: chat` you can instead rule on the disputed items in chat: the run records it with
-  `pipeline triage owner-ruling` (your exact words are published in the triage comment), you still say "merge"
+  `pipeline triage owner-ruling` (it asks with a `⚖️ Owner ruling needed` line; your whole answer to it is recorded on this machine and
+  must be only the decisions, `R1-B1: accept` / `follow-up` / `reject` per item (reasons in another message); it is published in the triage comment), you still say "merge"
   yourself, then remove `needs-human` and say `ship resume N`.
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
 - **`--check` reports drift:** someone edited an installed file (or an install did not finish); run `node ~/.claude/pipeline/bin/pipeline.mjs update`, or re-run `./install.sh`.

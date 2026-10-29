@@ -21,9 +21,12 @@ export function pipelineStateDir(cwd = process.cwd()) {
 }
 
 // owner/name from GitHub (gh resolves the right remote, including forks and SSH remotes).
+// host (Phase 3b): the server gh resolved it on, from the repo's url (lower-case; null when gh gives none): GH_HOST, an ssh host
+// alias or a sole logged-in enterprise host can point gh at a server other than github.com, where owner/name is another repository.
 export function repoSlug(cwd = process.cwd(), { ghJsonFn = ghJson } = {}) {
-  const r = ghJsonFn(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef'], { cwd });
+  const r = ghJsonFn(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,url'], { cwd });
   const [owner, name] = String(r.nameWithOwner || '').split('/');
   if (!owner || !name) throw new Error(`could not resolve GitHub repo for ${cwd}`);
-  return { owner, name, slug: `${owner}/${name}`, defaultBranch: r.defaultBranchRef?.name || 'main' };
+  const host = /^https?:\/\/([^/]+)\//i.exec(String(r.url ?? ''))?.[1]?.toLowerCase() ?? null;
+  return { owner, name, slug: `${owner}/${name}`, host, defaultBranch: r.defaultBranchRef?.name || 'main' };
 }

@@ -10,11 +10,13 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
+  presentedRuling, recordRuling, ownerRuled, rulingsIn,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
-const REQUEST = `Two items for you.\nHead ${HEAD.slice(0, 12)} · items ${ITEMS}\n🔀 Ready to merge #58 — say "merge"`;
+const REPO = 'acme/app';
+const REQUEST = `Two items for you.\nHead ${HEAD.slice(0, 12)} · items ${ITEMS} · repo ${REPO}\n🔀 Ready to merge #58 — say "merge"`;
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'owner-go-unit-'));
 function transcript(dir, entries) {
@@ -44,7 +46,7 @@ test('owner-go: only a prompt that STARTS with "merge" and holds nothing but tar
 });
 
 test('owner-go: the request lines bind a PR to the head and item set shown; lines for PRs not on the 🔀 line are ignored', () => {
-  assert.deepEqual(presentedRequests(REQUEST), { prs: [58], requests: [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS }] });
+  assert.deepEqual(presentedRequests(REQUEST), { prs: [58], requests: [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }] });
   const two = `#1318 head ${'a'.repeat(12)} · items none\n#1319 head ${'b'.repeat(40)} · items ${ITEMS}\n#77 head ${'c'.repeat(12)} · items none\n🔀 Ready to merge #1318, #1319 — say "merge"`;
   assert.deepEqual(presentedRequests(two).requests.map((r) => r.pr), [1318, 1319]);
   // a bare Head line with several PRs on the 🔀 line names none of them; a 7-character head or a missing item set binds nothing
@@ -67,7 +69,7 @@ test('owner-go: an approval is recorded with what was shown, narrowed by the PRs
   const home = tmp();
   const now = () => Date.parse('2026-10-14T10:00:00Z');
   const r = recordApproval(input(home, 'merge', [said(REQUEST)]), { home, now });
-  assert.deepEqual(r.requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS }]);
+  assert.deepEqual(r.requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }]);
   assert.deepEqual(r.prs, [58]);
   assert.equal(r.session, 'sess-1');
   assert.ok(!JSON.stringify(r).includes('"merge"'), 'the prompt is stored as a hash only');
@@ -89,6 +91,57 @@ test('owner-go: subagents, other hook events and odd session names never record'
     { session_id: '' },
   ]) assert.equal(recordApproval(input(home, 'merge', [said(REQUEST)], extra), { home }), null, JSON.stringify(extra));
   assert.equal(existsSync(join(ownerGoDir(home), '..etc.jsonl')), false);
+});
+
+// Phase 3b: the ruling recorder (triage owner-ruling --owner-quote must be the owner's whole answer to a ruling request).
+test('owner-go: a ruling is recorded only after a reply that ends with the ruling line, and only for the owner', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-10-14T10:00:00Z');
+  const ASK = 'R1-B1 waits for you.\n⚖️ Owner ruling needed #58: R1-B1, R2-S3 · repo O/R';
+  assert.deepEqual(presentedRuling(ASK), { pr: 58, repo: 'o/r', ids: ['R1-B1', 'R2-S3'] });
+  assert.deepEqual(presentedRuling('Owner ruling needed #58: R1-B1 | repo o/r'), null, 'the ⚖ mark is part of the line');
+  for (const bad of [`${ASK}\nanything after`, '⚖️ Owner ruling needed #58: R1-B1', '⚖️ Owner ruling needed: R1-B1 · repo o/r', '⚖️ Owner ruling needed #58: all of them · repo o/r']) {
+    assert.equal(presentedRuling(bad), null, bad);
+  }
+  const answer = 'R1-B1: reject,  R2-S3 follow-up';
+  const r = recordRuling(input(home, answer, [said(ASK)]), { home, now });
+  assert.deepEqual([r.kind, r.repo, r.pr, r.ids, r.prompt], ['ruling', 'o/r', 58, ['R1-B1', 'R2-S3'], answer]);
+  const ruled = (o) => ownerRuled({ repo: 'o/r', pr: 58, id: 'R1-B1', quote: 'r1-b1: REJECT, r2-s3 follow-up', decision: 'REJECT', home, now, ...o });
+  assert.equal(ruled({}), true, 'the whole answer, white space and case aside');
+  assert.equal(ruled({ id: 'R2-S3', decision: 'FOLLOW-UP' }), true, 'each item its own decision');
+  assert.equal(ruled({ id: 'R2-S3', decision: 'REJECT' }), false, 'the decision written for another item');
+  assert.equal(ruled({ quote: 'R1-B1: reject' }), false, 'a part of the answer');
+  assert.equal(recordRuling(input(home, `R1-B1: accept${' '.repeat(1000)}.`, [said(ASK)]), { home, now }), null, 'an answer over 1000 characters is not recorded (never cut)');
+  assert.equal(ruled({ decision: 'ACCEPT' }), false);
+  assert.equal(ruled({ id: 'R3-B1' }), false, 'an item not asked about');
+  assert.equal(ruled({ quote: '  ' }), false, 'an empty quote');
+  assert.equal(ruled({ now: () => now() + 25 * 3600 * 1000 }), false, 'older than a day');
+  assert.deepEqual(readApprovals({ home, now }), [], 'a ruling never reads as a "merge"');
+  assert.equal(recordRuling(input(home, 'reject it', [said(ASK)], { agent_id: 'a1' }), { home, now }), null, 'a subagent');
+  assert.equal(recordRuling(input(home, 'reject it', [said('No ruling asked here.')]), { home, now }), null, 'no ruling line');
+  assert.equal(recordApproval(input(home, 'reject it', [said(ASK)]), { home, now }), null, 'not a "merge" either');
+});
+
+// Security reviews of f17b251 / ff8090f: the answer is read in one fixed form, so a negation, a loose answer to several items or
+// a decision written for another item never passes for the owner's ruling.
+test('owner-go: rulingsIn reads an answer that is only "<id>: <decision>" pairs, the id always written', () => {
+  const two = ['R1-B1', 'R2-S3'];
+  const read = (answer, asked = two) => Object.fromEntries(rulingsIn(answer, asked));
+  assert.deepEqual(read('R1-B1: accept. R2-S3 - reject'), { 'R1-B1': 'ACCEPT', 'R2-S3': 'REJECT' });
+  assert.deepEqual(read('r1-b1 followup, r2-s3=Follow up!'), { 'R1-B1': 'FOLLOW-UP', 'R2-S3': 'FOLLOW-UP' });
+  assert.deepEqual(read('R1-B1: accept and R2-S3: reject'), { 'R1-B1': 'ACCEPT', 'R2-S3': 'REJECT' });
+  assert.deepEqual(read('R2-S3: reject'), { 'R2-S3': 'REJECT' }, 'some of the asked items');
+  // anything but decisions decides nothing (security reviews of f17b251, ff8090f, 009d435)
+  for (const bad of ['R1-B1: accept, it is fine', 'accept one, reject the other', 'accept R1-B1', 'R1-B1: accept, R1-B1: reject', 'R1-B1: accept, R1-B1: accept',
+    'R1-B10: accept', "R1-B1: don’t accept", 'R1-B1: accept rather than reject', 'R1-B1: accept, R2-S3: reject. R1-B1 is fine', 'R1-B1: accepted', '']) {
+    assert.deepEqual(read(bad), {}, bad);
+  }
+  const one = (answer) => read(answer, ['R1-B1']);
+  assert.deepEqual(one('R1-B1: reject'), { 'R1-B1': 'REJECT' });
+  for (const bad of ['Follow-up.', 'accept', 'Yes, file it as a follow-up', 'ok', 'accept the first, reject the rest', 'accept R2-S3', 'do not accept', 'no follow-up', 'accept accept']) {
+    assert.deepEqual(one(bad), {}, bad);
+  }
+  assert.deepEqual(read('accept'), {}, 'a bare decision when two items were asked');
 });
 
 test('owner-go: records are written and read only through real folders and files', { skip: process.platform === 'win32' }, () => {
@@ -113,7 +166,7 @@ test('owner-go: approvals last a day, never come from the future, and must be in
   const home = tmp();
   const at = Date.parse('2026-10-14T10:00:00Z');
   recordApproval(input(home, 'merge', [said(REQUEST)]), { home, now: () => at });
-  const q = { pr: 58, head: HEAD, items: ITEMS, home };
+  const q = { repo: REPO, pr: 58, head: HEAD, items: ITEMS, home };
   assert.equal(approvedRequest({ ...q, now: () => at + 60_000 }), true);
   assert.equal(approvedRequest({ ...q, now: () => at + 25 * 3600_000 }), false, 'older than a day');
   assert.equal(approvedRequest({ ...q, now: () => at - 3600_000 }), false, 'from the future');
@@ -122,7 +175,7 @@ test('owner-go: approvals last a day, never come from the future, and must be in
   assert.equal(approvedRequest({ ...q, items: 'none', now: () => at }), false, 'another item set');
   assert.equal(approvedRequest({ ...q, pr: 59, now: () => at }), false, 'another PR');
   // the guard's question: this PR at this full head, this session
-  const g = { pr: 58, head: HEAD, session: 'sess-1', home, now: () => at };
+  const g = { repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home, now: () => at };
   assert.equal(approvedPr(g), true);
   assert.equal(approvedPr({ ...g, session: 'sess-2' }), false);
   assert.equal(approvedPr({ ...g, pr: 59 }), false);
@@ -158,7 +211,7 @@ test('owner-go: only the terminal request block binds; an earlier block, trailin
   const A = 'a'.repeat(12);
   const B = 'b'.repeat(12);
   const two = `Head ${A} · items none\n🔀 Ready to merge #7 — say "merge"\nHead ${B} · items none\n🔀 Ready to merge #8 — say "merge"`;
-  assert.deepEqual(presentedRequests(two), { prs: [8], requests: [{ pr: 8, head: B, items: 'none' }] }, 'the earlier #7 block is not a request');
+  assert.deepEqual(presentedRequests(two), { prs: [8], requests: [{ pr: 8, head: B, items: 'none', repo: null }] }, 'the earlier #7 block is not a request');
   const dup = `Head ${A} · items none\nHead ${B} · items none\n🔀 Ready to merge #8 — say "merge"`;
   assert.deepEqual(presentedRequests(dup).requests, [], 'two heads for one PR: ambiguous, so none');
   const dupPr = `#8 head ${A} · items none\n#8 head ${A} · items none\n🔀 Ready to merge #8, #9 — say "merge"`;
@@ -199,7 +252,7 @@ test('owner-go: the newest prompt in the transcript is "the current one" only wh
   assert.deepEqual(recordApproval(stale, { home, now }).requests, []);
   assert.deepEqual(recordApproval(stale, { home, now }).prs, []);
   const fresh = { ...stale, transcript_path: transcript(home, [user('go'), said(REQUEST)]) };
-  assert.deepEqual(recordApproval(fresh, { home, now }).requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS }]);
+  assert.deepEqual(recordApproval(fresh, { home, now }).requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }]);
 });
 
 // #58 round 4: an image-only (or any non-text, non-tool_result) user message is a prompt boundary too
@@ -225,4 +278,28 @@ test('owner-go: a user message with no tool_result is a prompt, text or not', ()
   const now = () => Date.parse('2026-10-14T10:00:00Z');
   const stale = { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'merge', transcript_path: transcript(home, [user('go'), said(REQUEST), image, tools, user('merge')]) };
   assert.deepEqual(recordApproval(stale, { home, now }).requests, []);
+});
+
+// Phase 3b: the owner's "merge" names its repository; one for #N of another repository (a fork, a mirror) never approves this one.
+test('owner-go: the request line binds the repository; a line without one is recorded but approves nothing', () => {
+  const home = tmp();
+  const at = Date.parse('2026-10-29T10:00:00Z');
+  const now = () => at;
+  assert.deepEqual(presentedRequests(`#7 head ${'a'.repeat(12)} | items none | repo Acme/App\n🔀 Ready to merge #7 — say "merge"`).requests, [{ pr: 7, head: 'a'.repeat(12), items: 'none', repo: 'acme/app' }]);
+  assert.deepEqual(presentedRequests(`Head ${'a'.repeat(12)} · items none · repo acme\n🔀 Ready to merge #7 — say "merge"`).requests, [], 'a repository is owner/name');
+  recordApproval(input(home, 'merge', [said(REQUEST)]), { home, now });
+  const q = { repo: REPO, pr: 58, head: HEAD, items: ITEMS, home, now };
+  assert.equal(approvedRequest(q), true);
+  assert.equal(approvedRequest({ ...q, repo: 'ACME/APP' }), true, 'GitHub names are case-insensitive');
+  assert.equal(approvedRequest({ ...q, repo: 'acme/fork' }), false, 'another repository');
+  assert.equal(approvedRequest({ ...q, repo: undefined }), false, 'no repository asked about');
+  assert.equal(approvedPr({ repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home, now }), true);
+  assert.equal(approvedPr({ repo: 'acme/fork', pr: 58, head: HEAD, session: 'sess-1', home, now }), false);
+  assert.equal(approvedPr({ repo: null, pr: 58, head: HEAD, session: 'sess-1', home, now }), false);
+  // a request line from before Phase 3b (no repo): recorded for the audit trail, approves nothing
+  const home2 = tmp();
+  const old = REQUEST.replace(` · repo ${REPO}`, '');
+  assert.deepEqual(recordApproval(input(home2, 'merge', [said(old)]), { home: home2, now }).requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: null }]);
+  assert.equal(approvedRequest({ ...q, home: home2 }), false);
+  assert.equal(approvedPr({ repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home: home2, now }), false);
 });

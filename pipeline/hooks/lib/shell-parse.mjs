@@ -208,27 +208,98 @@ function skipOpts(argv, i, shortVal = '', longVal = [], seen = null) {
 const rest = (argv, i, env = {}) => (i < argv.length ? { argv: argv.slice(i), env } : null);
 const plain = (shortVal, longVal) => (argv) => rest(argv, skipOpts(argv, 1, shortVal, longVal));
 
+// Phase 3b (security review): what an `env` wrapper takes out of the environment of the command it starts (-u NAME, -i, a bare `-`), kept on
+// the command's env object (not enumerable: the object still lists only what was set) as { all, removed, setAfter, unsure }. A name set by a later
+// `env NAME=v` is back (setAfter); an option this reading does not know may remove anything (unsure). Read it with envUnset.
+const ENV_UNSET = Symbol('envUnset');
+const ALT_CAP = 16; // other readings of unknown `env` options judged per line (see unwrapEnv)
+const ENV_LONG = ['ignore-environment', 'null', 'unset', 'chdir', 'split-string', 'argv0', 'block-signal', 'default-signal', 'ignore-signal', 'list-signal-handling', 'debug', 'help', 'version'];
+// (GNU getopt takes any unambiguous prefix of a long option: `--uns GH_REPO`, `--ignore-e`)
+const envLong = (name) => (ENV_LONG.includes(name) ? name : (ENV_LONG.filter((o) => o.startsWith(name)).length === 1 ? ENV_LONG.find((o) => o.startsWith(name)) : null));
+// true: the env wrappers in front of the command removed NAME (and none set it again); null: one may have (an option not understood); false: not removed.
+export function envUnset(env, name) {
+  const u = env?.[ENV_UNSET];
+  if (!u || u.setAfter.has(name)) return false;
+  if (u.all || u.removed.has(name)) return true;
+  return u.unsure ? null : false;
+}
+function unsetState(env) {
+  if (!env[ENV_UNSET]) Object.defineProperty(env, ENV_UNSET, { value: { all: false, removed: new Set(), setAfter: new Set(), unsure: false }, enumerable: false });
+  return env[ENV_UNSET];
+}
+// Applies one env wrapper's removals (`edits`, from unwrapEnv) to the env built so far, before that wrapper's own assignments are added.
+function applyEnvEdits(env, edits) {
+  if (!edits) return;
+  const u = unsetState(env);
+  if (edits.all) { u.all = true; u.removed.clear(); u.setAfter.clear(); u.unsure = false; }
+  for (const n of edits.removed) { u.removed.add(n); u.setAfter.delete(n); }
+  if (edits.unsure) u.unsure = true;
+}
+// (security review of 0a0c013: an option this reading does not know may take the next word as its value, as GNU `-a NAME` / `--argv0 NAME`
+// does, and then the command starts one word later: `env --frob X gh pr merge 7` ran gh while this reading judged a command named X.
+// Each such option adds that other reading, `env` + the words after its value, to `alts` (process judges it too, capped by ALT_CAP).)
 function unwrapEnv(argv) {
   let a = argv;
   const env = {};
+  const edits = { all: false, removed: [], unsure: false };
+  const alts = [];
+  let chdir; // (-C DIR / --chdir DIR: the directory the command runs in; read by the guard, see process)
   let i = 1;
   let optsDone = false;
   while (i < a.length) {
     const t = a[i];
     if (!optsDone && t === '--') { optsDone = true; i++; continue; }
-    if (!optsDone && t.startsWith('-') && t.length > 1) {
-      if (/^-[A-Za-z]*S/.test(t) || t.startsWith('--split-string')) {
-        // -S "git push -f": the string is split into words and becomes the command line
-        let str;
-        let end = i + 1;
-        if (t.startsWith('--split-string=')) str = t.slice('--split-string='.length);
-        else if (t === '--split-string' || t === '-S') { str = a[i + 1] ?? ''; end = i + 2; }
-        else str = t.slice(t.indexOf('S') + 1);
-        a = [...a.slice(0, i), ...splitArgs(str), ...a.slice(end)];
+    if (!optsDone && t === '-') { edits.all = true; i++; continue; } // (a bare `-` is -i)
+    if (!optsDone && t.startsWith('--')) {
+      const eq = t.indexOf('=');
+      const name = envLong(eq < 0 ? t.slice(2) : t.slice(2, eq));
+      const inline = eq < 0 ? undefined : t.slice(eq + 1);
+      if (name === 'split-string') {
+        // --split-string "git push -f": the string is split into words and becomes the command line
+        const str = inline ?? a[i + 1] ?? '';
+        a = [...a.slice(0, i), ...splitArgs(str), ...a.slice(inline === undefined ? i + 2 : i + 1)];
         continue;
       }
-      const valued = t === '-u' || t === '-C' || t === '-P' || t === '--unset' || t === '--chdir';
-      i += valued ? 2 : 1;
+      const valued = name === 'unset' || name === 'chdir' || name === 'argv0';
+      const value = valued ? inline ?? a[i + 1] : undefined;
+      if (name === 'ignore-environment') edits.all = true;
+      else if (name === 'unset') edits.removed.push(value ?? '');
+      else if (name === 'chdir') chdir = value ?? null;
+      else if (name === null) {
+        edits.unsure = true;
+        if (inline === undefined && i + 2 < a.length) alts.push(['env', ...a.slice(i + 2)]);
+      }
+      i += valued && inline === undefined ? 2 : 1;
+      continue;
+    }
+    if (!optsDone && t.startsWith('-') && t.length > 1) {
+      // a group of short options (-iv, -iu NAME, -uNAME, -vS "git push -f"): a valued one takes the rest of the word, or the next word
+      let step = 1;
+      let split = null;
+      for (let k = 1; k < t.length; k++) {
+        const c = t[k];
+        if (c === 'i') { edits.all = true; continue; }
+        if (c === '0' || c === 'v') continue;
+        if (c === 'u' || c === 'C' || c === 'P' || c === 'S' || c === 'a') {
+          const glued = t.slice(k + 1);
+          const value = glued !== '' ? glued : a[i + 1];
+          if (glued === '') step = 2;
+          if (c === 'u') edits.removed.push(value ?? '');
+          if (c === 'C') chdir = value ?? null;
+          if (c === 'S') split = value ?? '';
+          break;
+        }
+        edits.unsure = true;
+        // (unknown: it may take the rest of this word, or the next word when it is the last letter, as its value)
+        const after = k === t.length - 1 ? i + 2 : i + 1;
+        if (after < a.length) alts.push(['env', ...a.slice(after)]);
+      }
+      if (split !== null) {
+        // -S "git push -f": the string is split into words and becomes the command line
+        a = [...a.slice(0, i), ...splitArgs(split), ...a.slice(i + step)];
+        continue;
+      }
+      i += step;
       continue;
     }
     const kv = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(t);
@@ -236,7 +307,11 @@ function unwrapEnv(argv) {
     setEnv(env, kv[1], kv[2]);
     i++;
   }
-  return rest(a, i, env);
+  const out = rest(a, i, env);
+  if (out && (edits.all || edits.removed.length || edits.unsure)) Object.defineProperty(out, 'envEdits', { value: edits, enumerable: false });
+  if (out && alts.length) Object.defineProperty(out, 'alts', { value: alts, enumerable: false });
+  if (out && chdir !== undefined) Object.defineProperty(out, 'chdir', { value: chdir, enumerable: false });
+  return out;
 }
 
 function unwrapCommand(argv) {
@@ -262,9 +337,11 @@ function unwrapSudo(shortVal, longVal) {
       setEnv(env, kv[1], kv[2]);
     }
     if (i >= argv.length) return null;
+    const moved = seen.has('D') || seen.has('--chdir'); // (sudo -D DIR / --chdir: runs the command in DIR, not worked out here: unknown)
     // sudo -s / -i 'string': the string runs through a shell (`sh -c`), it is not a program name
-    if (seen.has('s') || seen.has('i') || seen.has('--shell') || seen.has('--login')) return { argv: ['sh', '-c', argv.slice(i).join(' ')], env };
-    return rest(argv, i, env);
+    const out = seen.has('s') || seen.has('i') || seen.has('--shell') || seen.has('--login') ? { argv: ['sh', '-c', argv.slice(i).join(' ')], env } : rest(argv, i, env);
+    if (out && moved) Object.defineProperty(out, 'chdir', { value: null, enumerable: false });
+    return out;
   };
 }
 
@@ -2821,8 +2898,11 @@ class Parser {
     return w === undefined ? a : [w, ...a.slice(1)];
   }
 
-  process(argv, env, seg, isExec) {
+  process(argv, env, seg, isExec, chdir0 = undefined) {
     let a = this.winFix(argv, seg);
+    // (a wrapper's -C / --chdir: the directory the command runs in; two of them, or one not readable: null. Codex recheck: a command inside a
+    // script such a wrapper started (`env -C D sh -c '…'`) runs in D or wherever the script's own cd took it: unknown, null)
+    let chdir = chdir0 !== undefined ? chdir0 : this.ctx.chdirInherit !== undefined ? null : undefined;
     let fan = null; // the xargs / parallel that built this command from stdin text
     const runnerDirs = [];
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
@@ -2838,7 +2918,21 @@ class Parser {
         }
       }
       if (!fan && (base(a[0]) === 'xargs' || base(a[0]) === 'parallel')) fan = a;
-      for (const k of Object.keys(un.env)) setEnv(env, k, un.env[k]);
+      if (un.chdir !== undefined) chdir = chdir === undefined && typeof un.chdir === 'string' ? un.chdir : null;
+      // the other readings of an `env` option not understood (unwrapEnv `alts`), judged too; their environment is unsure (no GH_REPO / GH_HOST
+      // is read from it). More than ALT_CAP on one line gives up: truncated, which the guards deny.
+      for (const alt of un.alts ?? []) {
+        this.ctx.envAlts = (this.ctx.envAlts ?? 0) + 1;
+        if (this.ctx.envAlts > ALT_CAP) { this.ctx.truncated = true; break; }
+        const altEnv = { ...env };
+        applyEnvEdits(altEnv, { all: false, removed: [], unsure: true });
+        this.process(alt, altEnv, seg, true, chdir);
+      }
+      applyEnvEdits(env, un.envEdits);
+      for (const k of Object.keys(un.env)) {
+        setEnv(env, k, un.env[k]);
+        env[ENV_UNSET]?.setAfter.add(k);
+      }
       a = this.winFix(un.argv, seg);
     }
     // Why: bash sets $BASH to its own path (zsh leaves it unset), so `"${BASH:-bash}" f.sh` runs f.sh with bash: read as bash, unless the text (or the environment) can bind
@@ -2852,6 +2946,7 @@ class Parser {
     const headDyn = a.length > 0 && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'));
     if (headDyn) this.ctx.dynamicHead = true; // (kept apart from the other causes of ctx.dynamic: see dynamicOther in simpleCommands)
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
+    if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
     if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
     if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep);
@@ -3105,7 +3200,9 @@ class Parser {
     this.cmd = cmd;
     // (the commands of a script text a package runner starts -- `npm exec -c TEXT`, `npx sh -c TEXT` -- run with node_modules/.bin on their PATH: binPath, see emit)
     if (cmd?.viaRunner) this.ctx.binPath = true;
-    try { this.interpretWords(argv, seg); } finally { this.cmd = saved; this.ctx.binPath = savedBinPath; }
+    const savedChdir = this.ctx.chdirInherit;
+    if (cmd?.chdir !== undefined) this.ctx.chdirInherit = cmd.chdir;
+    try { this.interpretWords(argv, seg); } finally { this.cmd = saved; this.ctx.binPath = savedBinPath; this.ctx.chdirInherit = savedChdir; }
   }
 
   interpretWords(argv, seg) {

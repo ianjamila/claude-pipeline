@@ -264,7 +264,7 @@ test('t9 npx -c / npm exec -c text is judged as a shell line', () => {
 });
 test('t9 the repo merge script run through npm exec is caught like npm run merge', () => {
   const H7 = '7'.repeat(40);
-  const ownerGo = { mode: () => 'chat', mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }], approvedHead: (pr, head) => pr === 7 && head === H7 };
+  const ownerGo = { mode: () => 'chat', mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }], repoOf: () => 'o/chat', approvedHead: (pr, head, repo) => repo === 'o/chat' && pr === 7 && head === H7 };
   const v = (cmd) => evaluateGitCommand(cmd, { cwd: '/chat', home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo, readText: () => null, readHead: () => null, pathExists: () => false, readDir: () => null });
   for (const cmd of ['npm exec merge -- 8', 'npm exec -- merge 8 --expect-head ' + '8'.repeat(40), 'npx merge 8', 'pnpm exec merge 8', 'pnpm dlx merge 8', 'yarn dlx merge 8', 'bunx merge 8', 'npm x -- merge 8', 'npx --yes merge 8']) {
     assert.equal(v(cmd).decision, 'deny', cmd);
@@ -314,7 +314,7 @@ test('t9 a package-manager call inside a script judged with a script of its own 
 });
 test('t9 (#73 follow-up) INIT_CWD and npm_package_json move the repo merge script like npm_config_prefix', () => {
   const H7 = '7'.repeat(40);
-  const ownerGo = { mode: () => 'chat', mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }], approvedHead: (pr, head) => pr === 7 && head === H7 };
+  const ownerGo = { mode: () => 'chat', mergeTemplates: () => [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }], repoOf: () => 'o/chat', approvedHead: (pr, head, repo) => repo === 'o/chat' && pr === 7 && head === H7 };
   const v = (cmd) => evaluateGitCommand(cmd, { cwd: '/chat', home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo, readText: () => null, readHead: () => null, pathExists: () => false, readDir: () => null });
   const exact = `npm run merge -- 7 --expect-head ${H7}`;
   assert.equal(v(exact).decision, 'allow', 'the exact approved form stays approvable');
