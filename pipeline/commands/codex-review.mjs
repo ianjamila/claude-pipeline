@@ -41,7 +41,8 @@ export const meta = {
     '  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, reviewer, reviewerReasons, path}',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
     '  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)',
-    '  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound)',
+    '  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound);',
+    '    base-only rounds (below) never count toward the cap',
     '  reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
     '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable',
     '  commits merged in from the PR\'s base branch since the previous round are left out of the reviewed diff; a round that only merged them in',
@@ -105,7 +106,7 @@ export const run = guarded(async (argv, ctx) => {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'state', message: err.message });
     }
   };
-  // Is this the next round of this PR's review? Run before Codex and again under the lock afterwards.
+  // Is this the next round of this PR's review? Run before Codex and again under the lock afterwards (the cap: see checkCap).
   const checkRound = (st) => {
     if (st && st.pr !== pr) {
       throw new Fail(EXIT.USAGE, {
@@ -120,7 +121,10 @@ export const run = guarded(async (argv, ctx) => {
         message: exists ? `round ${round} already exists in the review state` : `next round is ${expected}, not ${round}`,
       });
     }
-    const capped = st ? roundCapProblem(st, round) : null;
+  };
+  // The round cap counts reviewed rounds only, so it waits until baseOnly is known (before anything is written for the round).
+  const checkCap = (st, baseOnly) => {
+    const capped = st ? roundCapProblem(st, round, { baseOnly }) : null;
     if (capped) throw new Fail(EXIT.USAGE, { ok: false, error: 'round-cap', message: capped });
   };
 
@@ -183,7 +187,6 @@ export const run = guarded(async (argv, ctx) => {
   const fable = lane.reviewer === 'fable' || state?.reviewer === 'fable';
   const lightLane = !fable && (state ? state.lightLane === true : true) && isLightLane({ level, changedLines, hits, config });
 
-  ensureRoundDir(root, round);
   // What Codex is shown (and what the fix commits are measured against) is exactly this range. Round 1 starts at the merge
   // base; a later round starts where the previous one ended, with the base branch's commits merged in since then taken out.
   // Only commits that came from the protected default branch are left out: the base side is origin/<default_branch> (never a
@@ -199,6 +202,8 @@ export const run = guarded(async (argv, ctx) => {
   const { patch, skipped: largeBinaries } = reviewPatch(review.base, head, o);
   // Only the base branch was merged in since the last round: there is nothing of the PR's own to review.
   const baseOnly = review.kind === 'synthetic' && patch === '' && largeBinaries.length === 0;
+  checkCap(state, baseOnly);
+  ensureRoundDir(root, round);
   const note = largeBinaryNote(largeBinaries);
   writeFileAtomic(path.join(dir, 'diff.patch'), note.length === 0 ? patch : `${patch}\nLarge binary files (content not shown):\n${note.join('\n')}\n`);
 
@@ -274,6 +279,7 @@ export const run = guarded(async (argv, ctx) => {
     // state was replaced) is read again, and what is there now wins.
     const fresh = readState();
     checkRound(fresh);
+    checkCap(fresh, baseOnly);
     checkBase(fresh);
     if (headSha(o) !== head) throw headMoved();
     if (!fresh && slug === undefined) {

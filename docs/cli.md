@@ -97,7 +97,8 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
   -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, reviewer, reviewerReasons, path}
   --base must be the PR's merge base for round 1 and the previous round's toHead after that, else exit 2 {error:base-mismatch}
   exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)
-  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound)
+  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound);
+    base-only rounds (below) never count toward the cap
   reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired
     (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker's brief for the sensitive files; judge otherwise. Once fable, always fable
   commits merged in from the PR's base branch since the previous round are left out of the reviewed diff; a round that only merged them in
@@ -108,7 +109,7 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
 
 Exit: 0 round recorded · 2 usage, base-mismatch or round-cap · 3 Codex or GitHub could not deliver (quota, auth, unavailable, error, malformed, github): never "no findings".
 
-A later round is diffed against what the previous round reviewed plus the PR's base branch as it is now (a trial merge, `reviewBaseKind: synthetic`), not against the previous head itself, so commits an "Update branch" merged in from the default branch (`origin/<default_branch>`) are never shown to Codex: they were reviewed in their own PRs. Only the default branch counts: a PR that targets another branch, or code merged in from any other branch, is reviewed in full (nothing is left out, and Codex always runs). A stale `origin/<default_branch>` (the best-effort fetch failed) can only make the range bigger. When that trial merge conflicts (or git is older than 2.38), the round reviews the whole PR against the new base instead (`whole-pr`). Each round records `reviewBase` and `reviewBaseKind` next to `fromHead` / `toHead`. A round whose only new commit is such a merge is recorded as `baseOnly: true` with no items and Codex is not run; the outcome treats it like a clean round with no findings. `state mark-implemented` measures "a non-test file changed since round N" the same way and fails closed: when that range cannot be worked out exactly (conflicting trial merge, git error) it refuses with `base-unresolved`.
+A later round is diffed against what the previous round reviewed plus the PR's base branch as it is now (a trial merge, `reviewBaseKind: synthetic`), not against the previous head itself, so commits an "Update branch" merged in from the default branch (`origin/<default_branch>`) are never shown to Codex: they were reviewed in their own PRs. Only the default branch counts: a PR that targets another branch, or code merged in from any other branch, is reviewed in full (nothing is left out, and Codex always runs). A stale `origin/<default_branch>` (the best-effort fetch failed) can only make the range bigger. When that trial merge conflicts (or git is older than 2.38), the round reviews the whole PR against the new base instead (`whole-pr`). Each round records `reviewBase` and `reviewBaseKind` next to `fromHead` / `toHead`. A round whose only new commit is such a merge is recorded as `baseOnly: true` with no items and Codex is not run; it does not count toward `review.max_rounds`, and it is not a review: it carries the last reviewed round's result forward to the merged-in content, so the outcome is clean only if that reviewed round was (fixes it accepted still need a reviewed round). `state mark-implemented` measures "a non-test file changed since round N" the same way and fails closed: when that range cannot be worked out exactly (conflicting trial merge, git error) it refuses with `base-unresolved`.
 
 ## comment
 
@@ -483,7 +484,7 @@ pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr 
 pipeline state discard-round --round R [--pr N] [--repo DIR]
   -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;
      refused (exit 2) when the PR triage comment already holds round R
-pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending}; exit 0 whether or not clean
+pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean
 pipeline state mark-implemented --ids a,b [--repo DIR]
   -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed
      and a non-test file changed since (a test file counts for a testing finding or the finding's own file)

@@ -118,7 +118,7 @@ hard_stops:                    # project extras on top of the universal list
 review:
   codex_model: gpt-6-astra
   effort: {low: medium, medium: medium, high: high, followup: medium}
-  max_rounds: 2                 # plus one confirm round when the last round only accepted fixes
+  max_rounds: 2                 # plus one confirm round when the last round only accepted fixes; base-only rounds (main merged in) don't count
   light_lane_max_lines: 50
   arbiter_always_paths: []      # globs: a PR touching one gets the Fable review pass every round, even at low risk
 

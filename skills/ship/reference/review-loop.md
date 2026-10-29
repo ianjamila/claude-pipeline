@@ -5,7 +5,7 @@ request number, `<round>` the round number (1, 2, 3). One round = one Codex pass
 The reviewer is the `reviewer` that `codex-review` printed: `judge` (a low-risk PR: steps 2–4, then step 5 only for disputes) or
 `fable` (medium/high risk, or a sensitive path: skip steps 2–4, go straight to step 5, which is then the whole review).
 Max `review.max_rounds` (default 2), + one extra round when the last round's only open items are accepted fixes (`extraRound`);
-`codex-review` itself refuses any other round (exit 2 `round-cap`). Commands run as jobs report their
+base-only rounds (main merged in, nothing of the PR's own) don't count toward it; `codex-review` itself refuses any other round (exit 2 `round-cap`). Commands run as jobs report their
 real code as `exitCode` in `job wait` (see Invariant 8 in `SKILL.md`).
 
 ## Replaying a review (resume, or a second machine)
@@ -40,7 +40,7 @@ already holds. A `P state outcome` with `followupsPending: true` means a publish
   JSON in `tail`:
   - 0: round recorded: `counts`, `preRuled` (items answered from the cache), `lightLane`. Commits merged in from the
     base branch since the previous round ("Update branch") are not shown to Codex. If the output has `baseOnly: true`
-    the round was only such a merge: Codex did not run, there are no items, and it counts as a clean round with no findings.
+    the round was only such a merge: Codex did not run, there are no items, and it does not count toward `max_rounds`. It is not a review: it carries the last reviewed round's result forward to the merged-in content, so it is clean only if that reviewed round was (an accepted fix still needs its reviewed round).
   - 3 (`unavailable: true`, reason quota / auth / unavailable / error / malformed / github) ⇒
     `gh pr edit <pr> --add-label awaiting-review`, `P comment --pr <pr> --kind awaiting-review
     --reason "<reason>"`, `P summary --pr <pr> --outcome awaiting-review --built "…"` (works with no
@@ -169,7 +169,7 @@ permissions / data-integrity / data-loss item ⇒ `needsHuman` (the CLI applies 
 - `clean` (no open BLOCKING, no new ACCEPTED this round, nothing `needsHuman`, and review
   coverage matches the current content hash) ⇒ leave the loop.
 - `needsHuman` non-empty ⇒ **park needs-human** (label, comment, `P summary --outcome needs-human`), stop.
-- else if `<round>` < max ⇒ round `<round>`+1 (reviews only the diff since this round's head).
+- else if `reviewedRounds` < `maxRounds` (both in the output; base-only rounds are not counted) ⇒ round `<round>`+1 (reviews only the diff since this round's head).
 - else if `extraRound` ⇒ ONE extra round `<round>`+1 (the last: it reviews only the fixes since this round's head; afterwards `extraRound` is false, so anything not clean parks).
 - else ⇒ **park needs-human** with the unresolved list (same label, comment, `P summary`), stop.
 

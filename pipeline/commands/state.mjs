@@ -10,7 +10,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { MARKERS } from '../lib/render.mjs';
 import { decodeFromComment, loadState, saveState, updateItems } from '../lib/state.mjs';
-import { roundOutcome } from '../lib/triage.mjs';
+import { reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
 import {
   allItems, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, requireState, reviewBaseRef,
   roundDir, stateExtends, withStateLock,
@@ -28,7 +28,7 @@ export const meta = {
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
     '     refused (exit 2) when the PR triage comment already holds round R',
-    'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending}; exit 0 whether or not clean',
+    'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean',
     'pipeline state mark-implemented --ids a,b [--repo DIR]',
     '  -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed',
     '     and a non-test file changed since (a test file counts for a testing finding or the finding\'s own file)',
@@ -176,7 +176,7 @@ async function outcome(rest, ctx) {
   const result = roundOutcome({ ...state, currentContentHash: hash });
   return {
     exitCode: EXIT.OK,
-    output: { ok: true, ...result, followupsPending: followupsPending(state), currentContentHash: hash, rounds: state.rounds.length, maxRounds: state.maxRounds },
+    output: { ok: true, ...result, followupsPending: followupsPending(state), currentContentHash: hash, rounds: state.rounds.length, reviewedRounds: reviewedRoundCount(state), maxRounds: state.maxRounds },
   };
 }
 
