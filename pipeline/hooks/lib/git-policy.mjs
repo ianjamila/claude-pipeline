@@ -1157,14 +1157,18 @@ function apiReviewMarkerVerdict(ep, rawEp, haystack, body, dir, ctx) {
       return deny(`${file} may be written earlier on this line, so the body that is sent cannot be checked for the review-complete marker. Write the file in a command of its own.`);
     }
   }
-  const line = String(ctx.fullText ?? '');
+  // Whether the query word holds an expansion is the shell parser's fact (cmd.litWords: the words without one), never a search of
+  // the line text, which empty quotes (`''query=…$b…''`) or a decoy copy fool (security review of de35615). The word must be
+  // exactly one of this command's words (litWords is keyed by text: a second word with the same text could be the expanded one)
+  // and literal. Called from anywhere else (an alias, a job runner: no word list), such a query is refused.
+  const words = ctx.ghWords ?? null;
   for (const f of body.fields) {
     if (f.key !== 'query' || typeof f.written !== 'string') continue;
     const q = f.written.slice(f.written.indexOf('=') + 1);
     if (q.startsWith('@') || !DYNAMIC.test(q)) continue; // (a query read from a file is never shell-expanded)
-    const once = line.split(q).length === 2;
-    if (!once || !(line.includes(`'${q}'`) || line.includes(`'query=${q}'`))) {
-      return deny('this GraphQL query holds `$` or a backtick and is not single-quoted (once) on the line, so the shell may rewrite it after it was checked. Single-quote the query (-f query=\'...\') and pass values as variables, or use the REST comments API with -F body=@file.');
+    const holders = words ? words.argv.filter((w) => w === f.written || (w.startsWith('-') && w.endsWith(f.written))) : [];
+    if (holders.length !== 1 || !words.lit?.has(holders[0])) {
+      return deny('this GraphQL query holds `$` or a backtick that the shell may expand (it is not one fully single-quoted word), so what GitHub receives cannot be checked. Single-quote the query (-f query=\'...\') and pass values as variables, or use the REST comments API with -F body=@file.');
     }
   }
   const comment = !graphql || body.queries.some((q) => COMMENT_MUTATION.test(q));
@@ -2804,7 +2808,12 @@ function evalString(str, startDir, ctx, level, child = false) {
       const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
       if (unsure !== null && ctx.zshNames?.has(unsure)) verdict = deny(zshModifiedReason(unsure));
       else if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);
-      else verdict = name === 'git' ? checkGit(argv, c.env, dir, ctx, c.raw ?? '') : checkGh(argv, c.env, dir, ctx, c.raw ?? '');
+      else if (name === 'git') verdict = checkGit(argv, c.env, dir, ctx, c.raw ?? '');
+      else {
+        // (the parser's words of THIS command and which of them hold no expansion: apiReviewMarkerVerdict's GraphQL quoting test)
+        ctx.ghWords = { argv, lit: c.litWords ?? null };
+        try { verdict = checkGh(argv, c.env, dir, ctx, c.raw ?? ''); } finally { ctx.ghWords = null; }
+      }
     }
     else {
       for (const inner of jobStartCommands(argv, ctx) ?? []) {

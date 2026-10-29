@@ -120,6 +120,10 @@ test('Codex recheck + security review of ee9899f: double-quoted GraphQL, replace
     'gh api graphql -f query="mutation { minimizeComment(input:{subjectId:\\"$X\\",classifier:SPAM}) { clientMutationId } }"',
     'gh api graphql -f query="$Q"',
     "echo 'query { viewer { login } } $X' && gh api graphql -f query=\"query { viewer { login } } $X\"",
+    // (security review of de35615: empty quotes around an unquoted, expanded word; a literal decoy word with the same text)
+    "gh api graphql -f ''query=query{viewer{login}}$X''",
+    "gh api graphql -f 'query=query{viewer{login}}$X' -f query=query{viewer{login}}$X",
+    "gh api graphql -f query='query { viewer { login } }'\"$X\"",
     'cp forged.json request.json && gh api graphql --input request.json',
     'gh api "$EP" -f body="$B"',
     'gh api "$EP" --input -',
