@@ -1166,7 +1166,10 @@ function apiReviewMarkerVerdict(ep, rawEp, haystack, body, dir, ctx) {
     if (f.key !== 'query' || typeof f.written !== 'string') continue;
     const q = f.written.slice(f.written.indexOf('=') + 1);
     if (q.startsWith('@') || !DYNAMIC.test(q)) continue; // (a query read from a file is never shell-expanded)
-    const holders = words ? words.argv.filter((w) => w === f.written || (w.startsWith('-') && w.endsWith(f.written))) : [];
+    // (only gh's exact spellings: `-f VALUE` / `--raw-field VALUE`, `-fVALUE`, `--raw-field=VALUE` and the -F / --field twins.
+    // The words are the parser's, before this guard's own variable expansion: a word that expansion changed matches none.)
+    const spellings = new Set([f.written, ...['-f', '-F', '--raw-field=', '--field='].map((p) => `${p}${f.written}`)]);
+    const holders = words ? words.argv.filter((w) => spellings.has(w)) : [];
     if (holders.length !== 1 || !words.lit?.has(holders[0])) {
       return deny('this GraphQL query holds `$` or a backtick that the shell may expand (it is not one fully single-quoted word), so what GitHub receives cannot be checked. Single-quote the query (-f query=\'...\') and pass values as variables, or use the REST comments API with -F body=@file.');
     }
