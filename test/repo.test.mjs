@@ -20,6 +20,11 @@ test('repoRoot and gitCommonDir resolve for a repo and its worktree', () => {
 
 test('repoSlug parses nameWithOwner and default branch', () => {
   const s = repoSlug('.', { ghJsonFn: () => ({ nameWithOwner: 'o/r', defaultBranchRef: { name: 'trunk' } }) });
-  assert.deepEqual(s, { owner: 'o', name: 'r', slug: 'o/r', defaultBranch: 'trunk' });
+  assert.deepEqual(s, { owner: 'o', name: 'r', slug: 'o/r', host: null, defaultBranch: 'trunk' });
+  // (Phase 3b) the host gh resolved the repository on, from its url
+  const at = (url) => repoSlug('.', { ghJsonFn: () => ({ nameWithOwner: 'o/r', url }) }).host;
+  assert.equal(at('https://GitHub.com/o/r'), 'github.com');
+  assert.equal(at('https://ghe.corp/o/r'), 'ghe.corp');
+  assert.equal(at('github.com/o/r'), null);
   assert.throws(() => repoSlug('.', { ghJsonFn: () => ({}) }), /could not resolve/);
 });

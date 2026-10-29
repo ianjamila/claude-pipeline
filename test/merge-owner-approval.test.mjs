@@ -160,6 +160,18 @@ test('chat mode, hard-stop PR: the owner\'s recorded "merge" for the exact head 
   assert.equal(s.mergeCalls().length, 1);
 });
 
+test('Phase 3b chat mode, hard-stop PR: the recorded "merge" does not count when gh resolves the repository on another host', (t) => {
+  const s = scenario({ yml: chatYml(), gh: { extra: [{ match: '^repo view', stdoutJson: { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'main' }, url: 'https://ghe.corp/acme/widgets' } }] } });
+  const g = s.gate();
+  assertExit(g, 0);
+  ownerSays(t, 'merge', request(PR, s.head, g.json.ownerItems));
+  const r = mergeWith(s, approve(s, g));
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.match(r.json.reason, /on ghe\.corp, not github\.com/);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
 test('chat mode, hard-stop PR: the approval flags supplied by the agent itself, with no owner "merge" recorded, refuse', () => {
   const s = scenario({ yml: chatYml() });
   const g = s.gate();
@@ -268,6 +280,20 @@ test('Phase 3b --owner-go: a "merge" for the same PR and head in another reposit
   assert.deepEqual(s.mergeCalls(), []);
   ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none', 'ACME/Widgets')); // (GitHub names are case-insensitive)
   assertExit(goMerge(s), 0);
+});
+
+// Phase 3b: gh may resolve owner/name on a server other than github.com (GH_HOST, an ssh host alias, a sole logged-in enterprise
+// host); there the owner's "merge" for acme/widgets names another repository, as the guard already holds for a direct merge.
+test('Phase 3b --owner-go: a repository gh resolves on a host other than github.com refuses, even with the "merge" recorded', (t) => {
+  for (const url of ['https://ghe.corp/acme/widgets', undefined]) {
+    const s = goScenario({ gh: { extra: [{ match: '^repo view', stdoutJson: { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'main' }, url } }] } });
+    ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none', 'acme/widgets'));
+    const r = goMerge(s);
+    assertExit(r, 1);
+    assert.equal(r.json.error, 'owner-go');
+    assert.match(r.json.reason, url ? /on ghe\.corp, not github\.com/ : /on an unknown host, not github\.com/);
+    assert.deepEqual(s.mergeCalls(), []);
+  }
 });
 
 test('--owner-go: the live PR must be ready: behind base, a draft, a red required check or a blocking label refuse (live-check)', (t) => {

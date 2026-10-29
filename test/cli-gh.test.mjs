@@ -457,7 +457,7 @@ test('protect (dry run): prints the exact spec 6.6 payloads and changes nothing'
   assert.ok(r.json.commands[1].startsWith("gh api -X PATCH repos/acme/widgets --input - <<'JSON'\n"));
   assert.ok(r.json.commands[2].startsWith("gh api -X PUT repos/acme/widgets/actions/permissions/workflow --input - <<'JSON'\n"));
   // Only the repo lookup ran: no write.
-  assert.deepEqual(fake.lines(), ['repo view --json nameWithOwner,defaultBranchRef']);
+  assert.deepEqual(fake.lines(), ['repo view --json nameWithOwner,defaultBranchRef,url']);
 });
 
 test('protect: checks default to ci.required_checks; none at all is a usage error', () => {
