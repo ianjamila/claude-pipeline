@@ -14,7 +14,8 @@ import {
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
-const REQUEST = `Two items for you.\nHead ${HEAD.slice(0, 12)} · items ${ITEMS}\n🔀 Ready to merge #58 — say "merge"`;
+const REPO = 'acme/app';
+const REQUEST = `Two items for you.\nHead ${HEAD.slice(0, 12)} · items ${ITEMS} · repo ${REPO}\n🔀 Ready to merge #58 — say "merge"`;
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'owner-go-unit-'));
 function transcript(dir, entries) {
@@ -44,7 +45,7 @@ test('owner-go: only a prompt that STARTS with "merge" and holds nothing but tar
 });
 
 test('owner-go: the request lines bind a PR to the head and item set shown; lines for PRs not on the 🔀 line are ignored', () => {
-  assert.deepEqual(presentedRequests(REQUEST), { prs: [58], requests: [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS }] });
+  assert.deepEqual(presentedRequests(REQUEST), { prs: [58], requests: [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }] });
   const two = `#1318 head ${'a'.repeat(12)} · items none\n#1319 head ${'b'.repeat(40)} · items ${ITEMS}\n#77 head ${'c'.repeat(12)} · items none\n🔀 Ready to merge #1318, #1319 — say "merge"`;
   assert.deepEqual(presentedRequests(two).requests.map((r) => r.pr), [1318, 1319]);
   // a bare Head line with several PRs on the 🔀 line names none of them; a 7-character head or a missing item set binds nothing
@@ -67,7 +68,7 @@ test('owner-go: an approval is recorded with what was shown, narrowed by the PRs
   const home = tmp();
   const now = () => Date.parse('2026-10-14T10:00:00Z');
   const r = recordApproval(input(home, 'merge', [said(REQUEST)]), { home, now });
-  assert.deepEqual(r.requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS }]);
+  assert.deepEqual(r.requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }]);
   assert.deepEqual(r.prs, [58]);
   assert.equal(r.session, 'sess-1');
   assert.ok(!JSON.stringify(r).includes('"merge"'), 'the prompt is stored as a hash only');
@@ -113,7 +114,7 @@ test('owner-go: approvals last a day, never come from the future, and must be in
   const home = tmp();
   const at = Date.parse('2026-10-14T10:00:00Z');
   recordApproval(input(home, 'merge', [said(REQUEST)]), { home, now: () => at });
-  const q = { pr: 58, head: HEAD, items: ITEMS, home };
+  const q = { repo: REPO, pr: 58, head: HEAD, items: ITEMS, home };
   assert.equal(approvedRequest({ ...q, now: () => at + 60_000 }), true);
   assert.equal(approvedRequest({ ...q, now: () => at + 25 * 3600_000 }), false, 'older than a day');
   assert.equal(approvedRequest({ ...q, now: () => at - 3600_000 }), false, 'from the future');
@@ -122,7 +123,7 @@ test('owner-go: approvals last a day, never come from the future, and must be in
   assert.equal(approvedRequest({ ...q, items: 'none', now: () => at }), false, 'another item set');
   assert.equal(approvedRequest({ ...q, pr: 59, now: () => at }), false, 'another PR');
   // the guard's question: this PR at this full head, this session
-  const g = { pr: 58, head: HEAD, session: 'sess-1', home, now: () => at };
+  const g = { repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home, now: () => at };
   assert.equal(approvedPr(g), true);
   assert.equal(approvedPr({ ...g, session: 'sess-2' }), false);
   assert.equal(approvedPr({ ...g, pr: 59 }), false);
@@ -158,7 +159,7 @@ test('owner-go: only the terminal request block binds; an earlier block, trailin
   const A = 'a'.repeat(12);
   const B = 'b'.repeat(12);
   const two = `Head ${A} · items none\n🔀 Ready to merge #7 — say "merge"\nHead ${B} · items none\n🔀 Ready to merge #8 — say "merge"`;
-  assert.deepEqual(presentedRequests(two), { prs: [8], requests: [{ pr: 8, head: B, items: 'none' }] }, 'the earlier #7 block is not a request');
+  assert.deepEqual(presentedRequests(two), { prs: [8], requests: [{ pr: 8, head: B, items: 'none', repo: null }] }, 'the earlier #7 block is not a request');
   const dup = `Head ${A} · items none\nHead ${B} · items none\n🔀 Ready to merge #8 — say "merge"`;
   assert.deepEqual(presentedRequests(dup).requests, [], 'two heads for one PR: ambiguous, so none');
   const dupPr = `#8 head ${A} · items none\n#8 head ${A} · items none\n🔀 Ready to merge #8, #9 — say "merge"`;
@@ -199,7 +200,7 @@ test('owner-go: the newest prompt in the transcript is "the current one" only wh
   assert.deepEqual(recordApproval(stale, { home, now }).requests, []);
   assert.deepEqual(recordApproval(stale, { home, now }).prs, []);
   const fresh = { ...stale, transcript_path: transcript(home, [user('go'), said(REQUEST)]) };
-  assert.deepEqual(recordApproval(fresh, { home, now }).requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS }]);
+  assert.deepEqual(recordApproval(fresh, { home, now }).requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }]);
 });
 
 // #58 round 4: an image-only (or any non-text, non-tool_result) user message is a prompt boundary too
@@ -225,4 +226,28 @@ test('owner-go: a user message with no tool_result is a prompt, text or not', ()
   const now = () => Date.parse('2026-10-14T10:00:00Z');
   const stale = { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'merge', transcript_path: transcript(home, [user('go'), said(REQUEST), image, tools, user('merge')]) };
   assert.deepEqual(recordApproval(stale, { home, now }).requests, []);
+});
+
+// Phase 3b: the owner's "merge" names its repository; one for #N of another repository (a fork, a mirror) never approves this one.
+test('owner-go: the request line binds the repository; a line without one is recorded but approves nothing', () => {
+  const home = tmp();
+  const at = Date.parse('2026-10-29T10:00:00Z');
+  const now = () => at;
+  assert.deepEqual(presentedRequests(`#7 head ${'a'.repeat(12)} | items none | repo Acme/App\n🔀 Ready to merge #7 — say "merge"`).requests, [{ pr: 7, head: 'a'.repeat(12), items: 'none', repo: 'acme/app' }]);
+  assert.deepEqual(presentedRequests(`Head ${'a'.repeat(12)} · items none · repo acme\n🔀 Ready to merge #7 — say "merge"`).requests, [], 'a repository is owner/name');
+  recordApproval(input(home, 'merge', [said(REQUEST)]), { home, now });
+  const q = { repo: REPO, pr: 58, head: HEAD, items: ITEMS, home, now };
+  assert.equal(approvedRequest(q), true);
+  assert.equal(approvedRequest({ ...q, repo: 'ACME/APP' }), true, 'GitHub names are case-insensitive');
+  assert.equal(approvedRequest({ ...q, repo: 'acme/fork' }), false, 'another repository');
+  assert.equal(approvedRequest({ ...q, repo: undefined }), false, 'no repository asked about');
+  assert.equal(approvedPr({ repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home, now }), true);
+  assert.equal(approvedPr({ repo: 'acme/fork', pr: 58, head: HEAD, session: 'sess-1', home, now }), false);
+  assert.equal(approvedPr({ repo: null, pr: 58, head: HEAD, session: 'sess-1', home, now }), false);
+  // a request line from before Phase 3b (no repo): recorded for the audit trail, approves nothing
+  const home2 = tmp();
+  const old = REQUEST.replace(` · repo ${REPO}`, '');
+  assert.deepEqual(recordApproval(input(home2, 'merge', [said(old)]), { home: home2, now }).requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: null }]);
+  assert.equal(approvedRequest({ ...q, home: home2 }), false);
+  assert.equal(approvedPr({ repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home: home2, now }), false);
 });

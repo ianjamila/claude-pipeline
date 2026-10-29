@@ -18,7 +18,9 @@ const posix = (dir) => String(dir).replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
 const ownerGo = {
   mode: (dir) => (posix(dir).startsWith('/chat') ? 'chat' : posix(dir).startsWith('/broken') ? (() => { throw new Error('bad yml'); })() : 'none'),
   mergeTemplates: (dir) => (posix(dir).startsWith('/chat') ? [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: '--expect-head' }, { prefix: ['node', 'scripts/m.mjs'], shaFlag: null }] : []),
-  approvedHead: (pr, head) => pr === 7 && head === H7,
+  // (Phase 3b: the checkout's repository, from its remotes; the owner's "merge" names o/chat)
+  repoOf: (dir) => (posix(dir).startsWith('/chat') || posix(dir).startsWith('/broken') ? 'o/chat' : posix(dir).startsWith('/other') ? 'o/other' : null),
+  approvedHead: (pr, head, repo) => String(repo).toLowerCase() === 'o/chat' && pr === 7 && head === H7,
 };
 const opts = (cwd) => ({ cwd, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo });
 const verdict = (cmd, cwd = '/chat') => evaluateGitCommand(cmd, opts(cwd));
@@ -28,7 +30,7 @@ const allow = (cmd, cwd) => assert.equal(verdict(cmd, cwd).decision, 'allow', `$
 test('#58 chat repo: a direct `gh pr merge` needs the owner\'s recorded "merge" for that PR at the head it pins', () => {
   allow(`gh pr merge 7 --squash --auto --delete-branch --match-head-commit ${H7}`);
   for (const cmd of [`gh pr merge 8 --squash --match-head-commit ${H8}`, `gh pr merge https://github.com/o/r/pull/8 --match-head-commit ${H8}`, `gh pr merge -R o/r 8 --match-head-commit ${H8}`]) {
-    assert.match(deny(cmd).reason, /needs the owner's "merge" for #8 at head 888888888888 in this session, and none is recorded/);
+    assert.match(deny(cmd).reason, /needs the owner's "merge" for o\/\w+ #8 at head 888888888888 in this session, and none is recorded/);
   }
   // the head the owner approved, and only that one
   assert.match(deny(`gh pr merge 7 --squash --match-head-commit ${H8}`).reason, /#7 at head 888888888888/);
@@ -163,7 +165,7 @@ test('#58 GH_REPO (command prefix, earlier on the line, or inherited) selects an
   const pin7 = `--match-head-commit ${H7}`;
   for (const cmd of [`GH_REPO=o/chat gh pr merge 8 --squash ${pin8}`, `env GH_REPO=o/chat gh pr merge 8 ${pin8}`, `export GH_REPO=o/chat; gh pr merge 8 ${pin8}`,
     `GH_REPO=o/chat; gh pr merge 8 ${pin8}`, `GH_REPO=o/chat gh pr merge 8 --squash --auto`, `false && export GH_REPO=o/x; gh pr merge 8 ${pin8}`]) {
-    assert.match(deny(cmd, '/other').reason, /named by -R or a PR URL|may need the owner|needs the owner's "merge"|must pin/, cmd);
+    assert.match(deny(cmd, '/other').reason, /named by -R or a PR URL|may need the owner|needs the owner's "merge"|must pin|cannot be told/, cmd);
   }
   allow(`GH_REPO=o/chat gh pr merge 7 --squash ${pin7}`, '/other');
   allow(`export GH_REPO=o/chat; gh pr merge 7 --squash ${pin7}`, '/other');
@@ -304,7 +306,7 @@ test('#58 round 3: read-only and install package-manager commands that only ment
 // #58 round 4 (strict shape): the repo's package-script merge command is approvable ONLY in the template's own canonical shape; every
 // other way that may run that script is refused, so the guard no longer has to recognise each package runner one by one.
 test('#58 round 4: only the template\'s exact shape is approvable; every other way to run the merge script is refused', () => {
-  const only = (prefix) => ({ ...opts('/other'), ownerGo: { ...ownerGo, mode: () => 'chat', mergeTemplates: () => [{ prefix, shaFlag: '--expect-head' }] } });
+  const only = (prefix) => ({ ...opts('/other'), ownerGo: { ...ownerGo, mode: () => 'chat', repoOf: () => 'o/chat', mergeTemplates: () => [{ prefix, shaFlag: '--expect-head' }] } });
   const npmOnly = only(['npm', 'run', 'merge', '--']);
   const d = (cmd, o = npmOnly) => evaluateGitCommand(cmd, o);
   const CANON = /npm run merge -- <PR> --expect-head <full 40-character head>/;
@@ -360,4 +362,34 @@ test('#58 round 4: only the template\'s exact shape is approvable; every other w
   assert.equal(d(`yarn merge 7 --expect-head ${H7}`, many).decision, 'allow');
   assert.equal(d(`npm run merge -- 7 --expect-head ${H7}`, many).decision, 'allow');
   assert.equal(d(`pnpm merge 7 --expect-head ${H7}`, many).decision, 'deny');
+});
+
+// Phase 3b: the owner's "merge" names its repository (the request's `· repo owner/name`), and a direct merge must be in that one.
+test('Phase 3b: a direct merge is matched to the owner\'s "merge" by repository too', () => {
+  const pin7 = `--match-head-commit ${H7}`;
+  allow(`gh pr merge -R o/chat 7 ${pin7}`);
+  allow(`gh pr merge -R github.com/O/Chat 7 ${pin7}`); // (a host prefix, and GitHub names are case-insensitive)
+  allow(`gh pr merge https://github.com/o/chat/pull/7 ${pin7}`);
+  // the same PR number and head in another repository (a fork, a mirror) is not approved
+  for (const cmd of [`gh pr merge -R o/fork 7 ${pin7}`, `gh pr merge https://github.com/o/fork/pull/7 ${pin7}`, `GH_REPO=o/fork gh pr merge 7 ${pin7}`]) {
+    assert.match(deny(cmd).reason, /for o\/fork #7 at head 777777777777 in this session, and none is recorded \(the request names it: `Head 777777777777 · items … · repo o\/fork`\)/, cmd);
+  }
+  // a repository that cannot be read: built at run time, two that disagree, or a checkout whose remotes name none or several
+  for (const cmd of [`gh pr merge -R "$R" 7 ${pin7}`, `gh pr merge -R o/chat https://github.com/o/fork/pull/7 ${pin7}`, `GH_REPO=o/fork gh pr merge -R o/chat 7 ${pin7}`, `GH_REPO="$R" gh pr merge 7 ${pin7}`]) {
+    assert.equal(verdict(cmd).decision, 'deny', cmd);
+  }
+  const noRepo = { ...opts('/chat'), ownerGo: { ...ownerGo, repoOf: () => null } };
+  assert.match(evaluateGitCommand(`gh pr merge 7 ${pin7}`, noRepo).reason, /which repository it merges in cannot be told .*Name it with -R owner\/name/);
+  assert.equal(evaluateGitCommand(`gh pr merge -R o/chat 7 ${pin7}`, noRepo).decision, 'allow');
+  assert.equal(evaluateGitCommand(`npm run merge -- 7 --expect-head ${H7}`, noRepo).decision, 'deny', 'the merge command runs in the checkout\'s repository');
+  assert.equal(evaluateGitCommand(`npm run merge -- 7 --expect-head ${H7}`, { ...noRepo, env: { GH_REPO: 'o/chat' } }).decision, 'allow', 'an inherited GH_REPO names it');
+});
+
+test('Phase 3b: the checkout\'s repository is read from its remotes, and only when they all name the same one', () => {
+  const remotes = (text) => ownerGoWiring('sess', { gitShow: () => null, remotes: () => text }).repoOf('/x');
+  assert.equal(remotes('origin\tgit@github.com:o/chat.git (fetch)\norigin\tgit@github.com:o/chat.git (push)\n'), 'o/chat');
+  assert.equal(remotes('origin\thttps://github.com/o/chat (fetch)\nmirror\tssh://git@github.com/O/Chat.git (fetch)\n'), 'o/chat');
+  assert.equal(remotes('origin\thttps://github.com/me/chat (fetch)\nupstream\thttps://github.com/o/chat.git (fetch)\n'), null, 'gh may pick either');
+  assert.equal(remotes(''), null);
+  assert.equal(remotes(null), null, 'git failed');
 });

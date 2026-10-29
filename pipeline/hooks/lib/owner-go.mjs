@@ -3,9 +3,11 @@
 // alone was the agent's own word: nothing proved the owner had said it (Codex + Fable design reviews, 2026-10-14). So the
 // owner-go recorder (the UserPromptSubmit hook hooks/owner-go.mjs, which only a real prompt typed by the owner reaches) writes
 // down each owner prompt that STARTS with "merge", bound to what the reply right before it asked for:
-//   `Head <sha12> · items <digest>` lines + `🔀 Ready to merge #N — say "merge"` (skills/ship, Owner-merge approval).
-// `P merge` then needs a record for exactly that PR, head and owner-item set; the guard needs one (for that PR, in that
-// session) before a direct `gh pr merge` / the repo's merge command in an owner_approval: chat repo. guard-files keeps
+//   `Head <sha12> · items <digest> · repo <owner/name>` lines + `🔀 Ready to merge #N — say "merge"` (skills/ship, Owner-merge approval).
+// `P merge` then needs a record for exactly that repository, PR, head and owner-item set; the guard needs one (for that repository and
+// PR, in that session) before a direct `gh pr merge` / the repo's merge command in an owner_approval: chat repo. Phase 3b: the repository
+// is part of the request, so a "merge" said for #N of one repository never approves #N of another (a fork, a mirror, a vendored copy
+// that shares the commit). A request line without it approves nothing. guard-files keeps
 // agents from writing the folder or running the recorder.
 // Residual (owner ruling 2026-10-14, the "cheap step"): the agent runs as the same OS user, so a program the guards cannot
 // see into can still write the folder; the transcript the recorder reads is a file of that user; and the agent's GitHub
@@ -57,13 +59,15 @@ export function parseApproval(prompt) {
   return { prs: [...new Set(prs)], shas: [...new Set(shas)] };
 }
 
-// The merge request a reply ENDS with. The reply's last lines are the request (skills/ship): optional `Head <sha12> · items <digest>`
-// lines (or, for several PRs, `#N head <sha12> · items <digest>`) directly above the 🔀 line, which is the last non-blank line.
+// The merge request a reply ENDS with. The reply's last lines are the request (skills/ship): optional `Head <sha12> · items <digest> · repo <owner/name>`
+// lines (or, for several PRs, `#N head <sha12> · items <digest> · repo <owner/name>`) directly above the 🔀 line, which is the last non-blank line.
 // Only that terminal block binds: an earlier block in the same reply, a Head line with prose between it and the 🔀 line, or any
 // text after the 🔀 line binds nothing, and a PR bound twice (two heads, or the same line twice) is ambiguous, so it binds nothing.
-// Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items }] }.
+// Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items, repo }] } (repo: the
+// lower-cased owner/name, or null when the line names none: such a request approves nothing).
 const READY_LINE = /🔀\s*Ready to merge\s+([^\n]*)/;
-const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)\\s*$`, 'i');
+const REPO_NAME = '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+';
+const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)(?:\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME}))?\\s*$`, 'i');
 export function presentedRequests(text) {
   const lines = String(text ?? '').split(/\r?\n/);
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
@@ -80,7 +84,7 @@ export function presentedRequests(text) {
   for (const h of block) {
     const pr = h[1] ? Number(h[1]) : prs.length === 1 ? prs[0] : null;
     if (pr === null || !prs.includes(pr)) continue;
-    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase() });
+    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[4] ? h[4].toLowerCase() : null });
   }
   return { prs, requests: [...bound.values()].filter(Boolean) };
 }
@@ -248,24 +252,29 @@ export function readApprovals({ home = accountHome(), session = null, now = Date
         ts: r.ts,
         session: r.session,
         prs: Array.isArray(r.prs) ? r.prs.filter(Number.isInteger) : [],
-        requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string') : [],
+        requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string').map((q) => ({ ...q, repo: typeof q.repo === 'string' ? q.repo : null })) : [],
       });
     }
   }
   return out;
 }
 
-// P merge: did the owner say "merge" for exactly this PR, this full head and this owner-item set (any session, last 24 h)?
-export function approvedRequest({ pr, head, items, ...opts }) {
-  if (!/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return false;
-  return readApprovals(opts).some((r) => r.requests.some((q) => q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items));
+// The repository as the records hold it (owner/name, lower case; GitHub names are case-insensitive), or null when `repo` is none.
+export const repoKey = (repo) => (typeof repo === 'string' && new RegExp(`^${REPO_NAME}$`).test(repo) ? repo.toLowerCase() : null);
+
+// P merge: did the owner say "merge" for exactly this repository (owner/name), PR, full head and owner-item set (any session, last 24 h)?
+export function approvedRequest({ repo, pr, head, items, ...opts }) {
+  const key = repoKey(repo);
+  if (key === null || !/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return false;
+  return readApprovals(opts).some((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items));
 }
 
-// The guard, before a direct merge: did the owner say "merge" in this session (last 24 h) for a request about this PR whose head
-// is this full head? (A PR merely named in the prompt, `merge #7`, is recorded in `prs` for the audit trail but approves no head.)
-export function approvedPr({ pr, head, session, ...opts }) {
-  if (!Number.isInteger(pr) || !/^[0-9a-f]{40}$/.test(String(head)) || !SESSION_RE.test(String(session ?? ''))) return false;
-  return readApprovals({ ...opts, session }).some((r) => r.requests.some((q) => q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head)));
+// The guard, before a direct merge: did the owner say "merge" in this session (last 24 h) for a request about this repository and PR
+// whose head is this full head? (A PR merely named in the prompt, `merge #7`, is recorded in `prs` for the audit trail but approves no head.)
+export function approvedPr({ repo, pr, head, session, ...opts }) {
+  const key = repoKey(repo);
+  if (key === null || !Number.isInteger(pr) || !/^[0-9a-f]{40}$/.test(String(head)) || !SESSION_RE.test(String(session ?? ''))) return false;
+  return readApprovals({ ...opts, session }).some((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head)));
 }
 
 // The owner-item set as one short digest: each item is one line (kind, rule or id, file); 'none' when there are none.

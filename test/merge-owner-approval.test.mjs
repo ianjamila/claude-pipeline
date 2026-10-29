@@ -167,7 +167,7 @@ test('chat mode, hard-stop PR: the approval flags supplied by the agent itself, 
   const r = mergeWith(s, approve(s, g));
   assertExit(r, 1);
   assert.equal(r.json.error, 'pre-merge');
-  assert.match(r.json.reason, /no owner "merge" is recorded for #\d+ head [0-9a-f]{12} items [0-9a-f]{12}/);
+  assert.match(r.json.reason, /no owner "merge" is recorded for acme\/widgets #\d+ head [0-9a-f]{12} items [0-9a-f]{12}/);
   assert.deepEqual(s.mergeCalls(), []);
 });
 
@@ -222,7 +222,7 @@ test('--owner-go: no owner "merge" recorded refuses with error owner-go and runs
   const r = goMerge(s);
   assertExit(r, 1);
   assert.equal(r.json.error, 'owner-go');
-  assert.match(r.json.reason, /no owner "merge" is recorded for #\d+ head [0-9a-f]{12} items none/);
+  assert.match(r.json.reason, /no owner "merge" is recorded for acme\/widgets #\d+ head [0-9a-f]{12} items none/);
   assert.deepEqual(s.mergeCalls(), []);
 });
 
@@ -255,6 +255,19 @@ test('--owner-go: a "merge" for another head, other items, another PR or that is
   assertExit(r, 1);
   assert.equal(r.json.error, 'owner-go');
   assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('Phase 3b --owner-go: a "merge" for the same PR and head in another repository, or with no repository named, refuses', (t) => {
+  const s = goScenario();
+  ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none', 'acme/gadgets')); // (another repository: a fork, a mirror)
+  ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none', null)); // (a request line from before Phase 3b)
+  const r = goMerge(s);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'owner-go');
+  assert.match(r.json.reason, /`Head [0-9a-f]{12} · items none · repo acme\/widgets`/);
+  assert.deepEqual(s.mergeCalls(), []);
+  ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none', 'ACME/Widgets')); // (GitHub names are case-insensitive)
+  assertExit(goMerge(s), 0);
 });
 
 test('--owner-go: the live PR must be ready: behind base, a draft, a red required check or a blocking label refuse (live-check)', (t) => {

@@ -200,12 +200,12 @@ Hard-stop PRs still go through the full review loop first, so you always get a r
 | Linear history / squash | ✅ | | | ✅ |
 | Fresh full verify bound to the head commit | | | | ✅ final-gate |
 | Gate judges the tree that will land (branch up to date with `main`) | | | ✅ `update-branch` stays allowed, merging through the API denied | ✅ `update-branch` before the gate, again in `merge` |
-| Cross-model review happened | | | | ✅ no review ⇒ no merge |
+| Cross-model review happened | | | ✅ guard-files keeps agents from writing a repo's review state (`.review/state.json`, round folders, gate / smoke / prod-before records); guard-git keeps them from posting the review-complete or triage markers | ✅ no review ⇒ no merge |
 | Arbiter really ran on Fable | | | | ✅ model-proof |
 | Pause switch | | | ✅ can't close the pause issue | ✅ |
 | Production smoke + rollback | | | | ✅ prod-watch |
 | Agents can't edit their own rules | ✅ protection edits need admin | | ✅ guard-files / guard-git | |
-| Owner items (`owner_approval: chat`) and resumed runs merge only on your chat "merge" for that head and item set | | | ✅ owner-go records (guard-files protects them); guard-git refuses a direct merge in a chat repo without one | ✅ `P merge` checks the record |
+| Owner items (`owner_approval: chat`) and resumed runs merge only on your chat "merge" for that repository, head and item set | | | ✅ owner-go records (guard-files protects them); guard-git refuses a direct merge in a chat repo without one | ✅ `P merge` checks the record |
 
 The label-based approvals rely on the local hook because the agents use your GitHub account.
 

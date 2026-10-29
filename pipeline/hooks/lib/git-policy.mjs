@@ -921,10 +921,28 @@ const prNumberOf = (w) => {
   const m = /^#?(\d{1,7})$/.exec(String(w ?? '')) ?? /\/pull\/(\d{1,7})(?:[/?#]|$)/.exec(String(w ?? ''));
   return m ? Number(m[1]) : null;
 };
+// owner/name of a repository as gh takes it ([HOST/]OWNER/REPO, a URL, a PR URL), or null when the text is not one.
+const repoSlugOf = (v) => {
+  const m = /^(?:[a-z][a-z0-9+.-]*:\/\/[^/]+\/|[^/\s]+\.[^/\s]+\/)?([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:\/pull\/\d+[^\s]*)?\/?$/.exec(String(v ?? '').trim());
+  return m && !DYNAMIC.test(String(v)) ? `${m[1]}/${m[2]}` : null;
+};
+// Phase 3b: the repository a GH_REPO points gh at (this command's prefix, an assignment earlier on the line that surely ran, or the
+// hook's own environment): undefined when none is set (or it is empty), null when it is set to something that cannot be read.
+function ghRepoEnvSlug(env, ctx) {
+  let value;
+  if (Object.hasOwn(env, 'GH_REPO')) value = env.GH_REPO;
+  else if (unsureVar(ctx, 'GH_REPO')) return null;
+  else if (Object.hasOwn(ctx.vars, 'GH_REPO')) value = ctx.vars.GH_REPO;
+  else value = ctx.env?.GH_REPO;
+  return typeof value === 'string' && value !== '' ? repoSlugOf(value) : undefined;
+}
 // `elsewhere`: the command names another repository (-R, a PR URL), whose mode is unknown here: judged as a chat repo.
 // `head`: the head the command pins (gh: --match-head-commit; the repo command: the flag before its {sha}); a merge that pins no full
 // head could land a later push the owner never saw, so it is refused, and the owner's "merge" must be for exactly that head.
-function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag = '--match-head-commit') {
+// `named` (Phase 3b): the repository the command itself names (-R, a PR URL, GH_REPO), null when it names one that cannot be read
+// (built at run time, or two that differ), undefined when it names none: then the checkout's (ownerGo.repoOf: its remotes, when they
+// name one repository). The owner's "merge" names its repository (the request's `· repo owner/name`), and must name this one.
+function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag = '--match-head-commit', named = undefined) {
   if (!ctx?.ownerGo) return null;
   if (!elsewhere && ownerGoMode(dir, ctx) !== 'chat') return null;
   const where = elsewhere ? 'a merge named by -R, a PR URL or GH_REPO (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
@@ -932,12 +950,17 @@ function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag
   if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR and head. Name the PR number (run from the repository), or ${via[0].toLowerCase()}${via.slice(1)}`);
   if (!pinFlag) return deny(`${what} #${pr}: ${where} needs the owner's "merge" for the head it lands, and this merge command pins no head. ${via}`);
   if (!/^[0-9a-f]{40}$/.test(String(head ?? ''))) return deny(`${what} #${pr}: ${where} must pin the head the owner said "merge" for: add \`${pinFlag} <full 40-character head>\`. ${via}`);
+  let repo = named;
+  if (repo === undefined) {
+    try { repo = dir === null ? null : ctx.ownerGo.repoOf(dir) ?? null; } catch { repo = null; }
+  }
+  if (!repo) return deny(`${what} #${pr}: which repository it merges in cannot be told (the checkout's remotes name none or several, or -R / a PR URL / GH_REPO is built at run time or disagrees), and the owner's "merge" names its repository. Name it with -R owner/name, or ${via[0].toLowerCase()}${via.slice(1)}`);
   let ok = false;
   try {
-    ok = ctx.ownerGo.approvedHead(pr, head) === true;
+    ok = ctx.ownerGo.approvedHead(pr, head, repo) === true;
   } catch { /* unreadable records: not approved */ }
   if (ok) return null;
-  return deny(`${what} #${pr}: ${where} needs the owner's "merge" for #${pr} at head ${head.slice(0, 12)} in this session, and none is recorded. ${via}`);
+  return deny(`${what} #${pr}: ${where} needs the owner's "merge" for ${repo} #${pr} at head ${head.slice(0, 12)} in this session, and none is recorded (the request names it: \`Head ${head.slice(0, 12)} · items … · repo ${repo}\`). ${via}`);
 }
 // (the package-manager argv reading -- PM_RUN_ALIASES, canonPm, pmScriptOf ... -- lives in package-scripts.mjs: the two guards open package scripts with it too)
 // The repo's own merge command (pipeline.yml merge.command, e.g. `npm run merge -- {pr} --expect-head {sha}`) typed by hand. A `gh …`
@@ -992,7 +1015,7 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
       const vals = given.flatMap((w, j, all) => (w === shaFlag ? [all[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
       head = vals.length === 1 ? vals[0] ?? null : null;
     }
-    return directMergeVerdict(prNumberOf(given[0]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+    return directMergeVerdict(prNumberOf(given[0]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag, ghRepoEnvSlug({}, ctx));
   }
   for (const { prefix, shaFlag } of scripts) {
     const v = pmScriptRefusal(prefix, shaFlag, raw, dir, ctx);
@@ -1008,7 +1031,7 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
       const vals = plain.flatMap((w, j, all) => (w === shaFlag ? [all[j + 1]] : w.startsWith(`${shaFlag}=`) ? [w.slice(shaFlag.length + 1)] : []));
       head = vals.length === 1 ? vals[0] ?? null : null;
     }
-    return directMergeVerdict(prNumberOf(plain[p.length]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag);
+    return directMergeVerdict(prNumberOf(plain[p.length]), head, dir, ctx, `\`${prefix.join(' ')}\``, false, shaFlag, ghRepoEnvSlug({}, ctx));
   }
   return null;
 }
@@ -1247,10 +1270,17 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
     // (gh reads the repository from -R, a PR URL or GH_REPO: set on this command, earlier on the line (unknown if it ran) or inherited. An empty GH_REPO selects nothing)
     const ghRepo = envVar(env, ctx, 'GH_REPO');
     const viaEnv = !ghRepo.known || (Object.hasOwn(env, 'GH_REPO') ? ghRepo.value !== '' : (ghRepo.value !== undefined && ghRepo.value !== '') || (typeof ctx.env?.GH_REPO === 'string' && ctx.env.GH_REPO !== ''));
-    const elsewhere = flagValues(flags, ['repo'], 'R').length > 0 || /\/pull\//.test(positionals[0] ?? '') || viaEnv;
+    const repoFlags = flagValues(flags, ['repo'], 'R');
+    const elsewhere = repoFlags.length > 0 || /\/pull\//.test(positionals[0] ?? '') || viaEnv;
     // (gh uses the LAST --match-head-commit: a repeated one could pin another head than the one checked, so it pins nothing)
     const pins = flagValues(flags, ['match-head-commit']);
-    return directMergeVerdict(prNumberOf(positionals[0]), pins.length === 1 ? pins[0] : null, dir, ctx, '`gh pr merge`', elsewhere);
+    // (Phase 3b: the repository it names, each way gh reads one; any that cannot be read, or two that differ, is unknown)
+    const named = [...repoFlags, ...(/\/pull\//.test(positionals[0] ?? '') ? [positionals[0]] : [])].map(repoSlugOf);
+    const fromEnv = ghRepoEnvSlug(env, ctx);
+    if (fromEnv !== undefined) named.push(fromEnv);
+    const slugs = new Set(named.map((s) => (s === null ? null : s.toLowerCase())));
+    const repo = named.length === 0 ? undefined : slugs.size === 1 && !slugs.has(null) ? named[0] : null;
+    return directMergeVerdict(prNumberOf(positionals[0]), pins.length === 1 ? pins[0] : null, dir, ctx, '`gh pr merge`', elsewhere, undefined, repo);
   }
 
   if ((group === 'pr' || group === 'issue') && (verb === 'edit' || verb === 'create')) {
@@ -2950,7 +2980,7 @@ function evaluateGitOnce(command, {
   now = Date.now, // injectable clock (tests)
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
   nodePrefix, // #89 t3: where this node binary's npm keeps its global configuration (<nodePrefix>/etc/npmrc); undefined: from process.execPath, null: none (tests)
-  ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), approvedHead(pr, head) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
+  ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), repoOf(dir), approvedHead(pr, head, repo) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
 } = {}, bashState) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);

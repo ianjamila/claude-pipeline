@@ -25,8 +25,9 @@ export function ownerSays(t, prompt, reply) {
   return record;
 }
 
-// The reply's merge request, as the ship skill shows it (Owner-merge approval).
-export const mergeRequest = (pr, head, items) => `Owner items listed above.\nHead ${head.slice(0, 12)} · items ${items}\n🔀 Ready to merge #${pr} — say "merge"`;
+// The reply's merge request, as the ship skill shows it (Owner-merge approval). Phase 3b: it names the repository (the fake gh's by
+// default, fakegh-env.mjs REPO_VIEW); null leaves the repo out, as a request from before Phase 3b did.
+export const mergeRequest = (pr, head, items, repo = 'acme/widgets') => `Owner items listed above.\nHead ${head.slice(0, 12)} · items ${items}${repo === null ? '' : ` · repo ${repo}`}\n🔀 Ready to merge #${pr} — say "merge"`;
 
 // The flags P merge takes for it.
 export const approvalFlags = (head, items) => ['--owner-approved-head', head, '--owner-approved-items', items];

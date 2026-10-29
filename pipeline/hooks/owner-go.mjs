@@ -9,9 +9,9 @@ try {
   const { recordApproval } = await import('./lib/owner-go.mjs');
   const record = recordApproval(await readHookInput());
   if (record) {
-    const shown = record.requests.map((q) => `#${q.pr} head ${q.head} items ${q.items}`);
+    const shown = record.requests.map((q) => `${q.repo ?? '(no repo: approves nothing)'} #${q.pr} head ${q.head} items ${q.items}`);
     const prs = record.prs.map((n) => `#${n}`).join(', ');
-    process.stdout.write(`[claude-pipeline owner-go] the owner's "merge" is recorded: ${shown.length ? shown.join('; ') : 'no Head/items request was shown in the last merge request'}${prs ? `; PRs ${prs}` : ''}.\n`);
+    process.stdout.write(`[claude-pipeline owner-go] the owner's "merge" is recorded: ${shown.length ? shown.join('; ') : 'no Head/items/repo request was shown in the last merge request'}${prs ? `; PRs ${prs}` : ''}.\n`);
   }
 } catch { /* never block or break a prompt */ }
 process.exitCode = 0;
