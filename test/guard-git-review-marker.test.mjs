@@ -60,6 +60,28 @@ test('security review 2: pflag spellings, grouped shorts, unreadable body files 
   }
 });
 
+test('security review 3: short flags read with each verb\'s gh table (unknown ones refused); shell-expanded body-file names refused', () => {
+  for (const command of [
+    'gh pr comment 5 -cFmarked.md', // -c is no flag of pr comment: not read as text that would hide -F
+    'gh pr comment 5 -xF marked.md',
+    'gh issue comment 5 -zb hi',
+    'gh pr comment 5 -F ~/marked.md',
+    'gh pr comment 5 -F mark*.md',
+    'gh pr comment 5 --body-file "mark?d.md"',
+    'gh pr comment 5 --body-file m[a]rked.md',
+    'gh pr comment 5 --body-file {marked,plain}.md',
+  ]) assert.equal(decide(command), 'deny', command);
+  for (const command of [
+    'gh pr merge 5 --squash --auto -d -t "subject" --match-head-commit ' + 'a'.repeat(40),
+    'gh pr review 5 -c -b "fine"',
+    'gh pr review 5 -cF plain.md',
+    'gh pr create -d -B main -t title -F plain.md',
+    'gh pr comment 5 -R acme/app -F plain.md',
+    'gh pr comment 5 -RFoo/bar -F plain.md',
+    'gh pr close 5 -d -c "done"',
+  ]) assert.equal(decide(command), 'allow', command);
+});
+
 test('ordinary comments, reads and the review-complete command itself still pass; so does P merge --owner-go', () => {
   for (const command of [
     'gh pr comment 5 --body "looks good"',

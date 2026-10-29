@@ -1023,6 +1023,20 @@ const mentionsReviewMarker = (text) => REVIEW_MARKER_RE.test(String(text ?? ''))
 const REVIEW_MARKER_DENIED = `the text carries the review-complete marker (${REVIEW_MARKER_TEXT}), which only \`pipeline review-complete --pr N\` may post: it checks that a clean review covers the current content first. Run it instead.`;
 // gh commands that post or edit text on a PR or issue (where the workflow reads the comments), by group and verb.
 const TEXT_VERBS = { pr: ['comment', 'create', 'edit', 'review', 'close', 'merge'], issue: ['comment', 'create', 'edit', 'close'] };
+// gh's short flags for those verbs (gh 2.x): text = value is posted text or a body file; value = other value-taking; bool = switches.
+// -e / -T (editor, template) are refused before this table is read. -R (--repo) is global.
+const SHORT_FLAGS = {
+  'pr comment': { text: 'bF', value: 'R', bool: 'w' },
+  'pr create': { text: 'btF', value: 'RBHalmpr', bool: 'dfw' },
+  'pr edit': { text: 'btF', value: 'RBm', bool: '' },
+  'pr review': { text: 'bF', value: 'R', bool: 'acr' },
+  'pr close': { text: 'c', value: 'R', bool: 'd' },
+  'pr merge': { text: 'btF', value: 'RA', bool: 'dmrs' },
+  'issue comment': { text: 'bF', value: 'R', bool: 'w' },
+  'issue create': { text: 'btF', value: 'Ralmp', bool: 'w' },
+  'issue edit': { text: 'btF', value: 'Rm', bool: '' },
+  'issue close': { text: 'c', value: 'Rr', bool: '' },
+};
 function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
   if (!(TEXT_VERBS[group] ?? []).includes(verb)) return null;
   // (the whole line too: a here-string, or a printf that writes the body file before this command)
@@ -1033,11 +1047,14 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
   // Parsed as gh (pflag) does: --name=value or --name value; short flags may be grouped (`-wF f`, `-wFf`), and a value-taking
   // short takes the rest of the word (minus one leading '=': `-F=f` is the file `f`) or the next word. Security review of 8bf1fe2.
   // The editor routes (--editor, --template, --recover) write text the guard never sees (an EDITOR the agent chose): refused.
-  // (`gh pr review`: --comment / -c is a boolean, the review kind; its text is --body / --body-file)
+  // Short flags are read with each verb's own gh table (security review of 19a6886): `text` = shorts whose value is posted text
+  // or a body file, `value` = other value-taking shorts (their value is the rest of the word or the next word), `bool` = switches.
+  // A short the table does not know is refused rather than guessed at (fail closed). (`gh pr review`: -c is a switch.)
+  const table = SHORT_FLAGS[`${group} ${verb}`];
   const isReview = group === 'pr' && verb === 'review';
   const LONG_TEXT = new Set(isReview ? ['body', 'body-file'] : ['body', 'comment', 'title', 'subject', 'body-file']);
   const LONG_REFUSED = new Set(['editor', 'template', 'recover']);
-  const SHORT_TEXT = isReview ? 'bF' : 'bctF';
+  const SHORT_TEXT = table.text;
   const SHORT_REFUSED = 'eT';
   const EDITOR_DENIED = 'the text would come from an editor, a template or a recovered draft, which the guard cannot read for the review-complete marker. Pass the text with --body or a literal --body-file.';
   const texts = [];
@@ -1060,7 +1077,12 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
     for (let k = 1; k < w.length; k++) {
       const ch = w[k];
       if (SHORT_REFUSED.includes(ch)) return deny(EDITOR_DENIED);
-      if (!SHORT_TEXT.includes(ch)) continue;
+      if (table.bool.includes(ch)) continue;
+      if (table.value.includes(ch)) {
+        if (k === w.length - 1) i++; // (its value is the next word)
+        break;
+      }
+      if (!SHORT_TEXT.includes(ch)) return deny(`\`${w}\` holds the short flag -${ch}, which the guard does not know for \`gh ${group} ${verb}\`, so whether it carries text cannot be verified. Spell the flags out (--body-file F).`);
       let value = w.slice(k + 1);
       if (value.startsWith('=')) value = value.slice(1);
       if (value === '') value = rest[++i];
@@ -1076,6 +1098,8 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
   }
   for (const file of files) {
     if (file === '-') continue; // (stdin: the residual above; a here-string is in the line itself)
+    // a name the shell rewrites before gh sees it (~, a glob, a brace list) names some other file than the one read here
+    if (/^~|[*?[\]{}]/.test(file)) return deny(`the body file name ${file} is expanded by the shell (~, a glob or a brace list), so which file is posted cannot be verified for the review-complete marker. Name the file literally.`);
     if (dir === null) return deny('cannot tell which directory this runs in, so the body file cannot be checked for the review-complete marker. Use an absolute path, or chain the cd with &&.');
     const abs = path.resolve(dir, file);
     // a body file an earlier command on this line wrote (or may have written) holds text that does not exist yet: refused
