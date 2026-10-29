@@ -32,10 +32,16 @@ const MAX_NESTING = 5;
 const MAX_INPUT_BYTES = 1_000_000;
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 const OWNER_ONLY = 'This is reserved for the repository owner.';
+// Phase 3b (Fable attacker pass): the pipeline's run record, triage state and review-complete comment are comments of the agent's own login,
+// and `P merge` reads a missing run record as an ordinary run (a resumed one then needs no owner "merge"). Editing or deleting an existing
+// comment by hand (REST PATCH/PUT/DELETE on a comment, `gh pr|issue comment --edit-last / --delete-last`, GraphQL updateIssueComment /
+// deleteIssueComment) is refused; the pipeline commands update their own comments from their own process. Post a new comment instead.
+const COMMENT_EDIT_DENIED = 'editing or deleting an existing PR / issue comment is blocked: the pipeline keeps its run record, triage state and review in comments of this login, and a blanked or deleted one would read as "no record". Post a new comment instead (the pipeline commands update their own).';
 
 // The only graphql mutations an agent may run (comments, PR lifecycle, review threads). Everything else is denied.
+// (Phase 3b: updateIssueComment is no longer one: an edit of an existing comment can blank the pipeline's run record, see COMMENT_EDIT_DENIED)
 const GRAPHQL_ALLOWED_MUTATIONS = new Set([
-  'addComment', 'updateIssueComment', 'createPullRequest', 'enablePullRequestAutoMerge', 'disablePullRequestAutoMerge',
+  'addComment', 'createPullRequest', 'enablePullRequestAutoMerge', 'disablePullRequestAutoMerge',
   'markPullRequestReadyForReview', 'convertPullRequestToDraft', 'addPullRequestReview', 'resolveReviewThread', 'minimizeComment',
 ]);
 const PUSH_LONG_VALUE = ['repo', 'receive-pack', 'exec', 'push-option', 'recurse-submodules'];
@@ -846,6 +852,8 @@ function checkApi(rest, env, dir, ctx) {
   if (/^repos\/[^/]+\/[^/]+$/i.test(ep)) return deny(`${method} to repository settings is blocked. ${OWNER_ONLY}`);
   if (/\/collaborators/i.test(p)) return deny(`${method} to collaborators is blocked. ${OWNER_ONLY}`);
   if (/\/actions\/permissions/i.test(p)) return deny(`${method} to Actions permissions is blocked. ${OWNER_ONLY}`);
+  // -- (Phase 3b, Fable attacker pass) editing or deleting an existing comment: see COMMENT_EDIT_DENIED
+  if (/^repos\/[^/]+\/[^/]+\/(?:issues|pulls)\/comments\/[^/]+$/i.test(ep) && method !== 'POST') return deny(COMMENT_EDIT_DENIED);
 
   const body = gatherBody(flags, dir, ctx);
   const haystack = safeDecode(`${rest.join('\n')}\n${body.text}`);
@@ -1110,6 +1118,9 @@ const SHORT_FLAGS = {
 };
 function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
   if (!(TEXT_VERBS[group] ?? []).includes(verb)) return null;
+  // (Phase 3b, Fable attacker pass: the pipeline's comments are the agent login's own, so `--edit-last` / `--delete-last` may blank or delete the
+  // run record, which P merge then reads as "no record": an ordinary run, no owner "merge" needed for a resumed one. COMMENT_EDIT_DENIED.)
+  if (verb === 'comment' && rest.some((w) => /^--(?:edit-last|delete-last)(?:=|$)/.test(w))) return deny(COMMENT_EDIT_DENIED);
   // (the whole line too: a here-string, or a printf that writes the body file before this command)
   if (rest.some(mentionsReviewMarker) || mentionsReviewMarker(ctx.fullText)) return deny(REVIEW_MARKER_DENIED);
   // The text values (--body, --comment, --title …) and body files (--body-file F, --body-file=F, -F F, -FF: gh pr/issue -F is

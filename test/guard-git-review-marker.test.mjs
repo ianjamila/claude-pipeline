@@ -199,3 +199,19 @@ test('Phase 3b: the run markers (summary, record, status, needs-human, blocked, 
   // the words alone, in prose, are not a marker
   assert.equal(decide('gh pr comment 7 --body "the summary comment is updated by the pipeline"'), 'allow');
 });
+
+// Fable attacker pass (Phase 3b): the run record lives in a comment of the agent's own login, and P merge reads a missing record as an
+// ordinary run, so deleting or blanking a comment by hand is refused (no marker needed); the pipeline commands update their own.
+test('Phase 3b: editing or deleting an existing comment by hand is refused', () => {
+  for (const cmd of ['gh api -X DELETE repos/acme/app/issues/comments/9', 'gh api -X PATCH repos/acme/app/issues/comments/9 -f body=x',
+    'gh api --method=delete /repos/acme/app/pulls/comments/9', 'gh api -X PUT repos/{owner}/{repo}/issues/comments/9 -f body=x',
+    'gh pr comment 7 --edit-last --body x', 'gh pr comment 7 --delete-last --yes', 'gh issue comment 7 --edit-last=true -b x',
+    'gh api graphql -f query=\'mutation { updateIssueComment(input: {id: "IC_1", body: "x"}) { clientMutationId } }\'',
+    'gh api graphql -f query=\'mutation { deleteIssueComment(input: {id: "IC_1"}) { clientMutationId } }\'']) {
+    assert.equal(decide(cmd), 'deny', cmd);
+  }
+  for (const cmd of ['gh pr comment 7 --body x', 'gh api repos/acme/app/issues/comments/9', 'gh api -X POST repos/acme/app/issues/comments/9/reactions -f content=+1',
+    'gh api repos/acme/app/issues/7/comments -f body=x']) {
+    assert.equal(decide(cmd), 'allow', cmd);
+  }
+});
