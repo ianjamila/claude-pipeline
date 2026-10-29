@@ -32,10 +32,11 @@
 // Why the artifact (issue #3, closed here): everything above is data a spoofing run (a PR into a side branch whose copy
 // of the workflow was edited, same head sha) can satisfy by pointing its status at a genuine run of the same PR and head
 // that is still in progress, and the agent can open that window on demand (re-run, close/reopen, ready/draft). So the
-// genuine run also uploads an artifact named `pipeline-verdict_v1_<head>_<integrity>_<hardstops>[_<label>_<login>]` (see
-// verdictArtifactName) holding what it judged, and a status counts only if the artifact of the run it points at says the
+// genuine run also uploads an artifact named `pipeline-verdict_v2_<head>_<integrity>_<hardstops>_<review>[_<label>_<login>]`
+// (see verdictArtifactName; v1, from guards before the Cross-model review status, had no <review>) holding what it judged, and a status counts only if the artifact of the run it points at says the
 // same: for a guard status that run's state for that check must be `success`; for a receipt the artifact must name the
-// label and the approver of the latest labeling. A spoofing run cannot add an artifact to somebody else's run (an
+// label and the approver of the latest labeling. A v1 artifact still backs the two older guard statuses and a receipt, never
+// a Cross-model review status. A spoofing run cannot add an artifact to somebody else's run (an
 // artifact belongs to the run whose runtime token uploaded it), so it can only point at a run whose own verdict is the
 // one it claims. A run without an artifact (in progress, cancelled before the upload, deleted) fails closed.
 // Anything unreadable fails closed. What remains: the code of the genuine job is the trust anchor, and a workflow with
@@ -46,17 +47,24 @@ export const TIME_SLACK_MS = 10_000;
 // The two human approval labels (same values as ci-guard.mjs, which this shared lib cannot import).
 export const APPROVAL_LABELS = Object.freeze(['human-approved', 'test-change-approved']);
 // Which check of the verdict artifact backs which guard status context.
-export const GUARD_CONTEXT_CHECKS = Object.freeze({ 'Test integrity': 'integrity', 'Hard-stop scan': 'hardstops' });
+// 'Cross-model review' is posted only by a repo with ci.review_check on (review-marker.mjs#REVIEW_CONTEXT).
+export const GUARD_CONTEXT_CHECKS = Object.freeze({ 'Test integrity': 'integrity', 'Hard-stop scan': 'hardstops', 'Cross-model review': 'review' });
 export const VERDICT_STATES = Object.freeze(['success', 'failure', 'error']);
-export const ARTIFACT_PREFIX = 'pipeline-verdict_v1_';
+// The review check has one more state: 'off' (ci.review_check is false, so the run posted no Cross-model review status).
+export const REVIEW_STATES = Object.freeze([...VERDICT_STATES, 'off']);
+export const ARTIFACT_PREFIX = 'pipeline-verdict_v2_';
+export const LEGACY_ARTIFACT_PREFIX = 'pipeline-verdict_v1_';
 
 const RUN_URL = /^https?:\/\/[^/]+\/([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)\/actions\/runs\/([1-9][0-9]{0,18})(?:[/?#].*)?$/;
 const SHA = /^[0-9a-f]{40}$/;
 const STATE = VERDICT_STATES.join('|');
+const REVIEW_STATE = REVIEW_STATES.join('|');
 const LOGIN = '[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})?(?:\\[bot\\])?';
 const LOGIN_RE = new RegExp(`^${LOGIN}$`);
 // Artifact names cannot contain " : < > | * ? \ / or newlines: this format uses none of them.
-const ARTIFACT_RE = new RegExp(`^${ARTIFACT_PREFIX}([0-9a-f]{40})_(${STATE})_(${STATE})(?:_(${APPROVAL_LABELS.join('|')})_(${LOGIN}))?$`);
+const RECEIPT = `(?:_(${APPROVAL_LABELS.join('|')})_(${LOGIN}))?`;
+const ARTIFACT_RE = new RegExp(`^${ARTIFACT_PREFIX}([0-9a-f]{40})_(${STATE})_(${STATE})_(${REVIEW_STATE})${RECEIPT}$`);
+const LEGACY_ARTIFACT_RE = new RegExp(`^${LEGACY_ARTIFACT_PREFIX}([0-9a-f]{40})_(${STATE})_(${STATE})${RECEIPT}$`);
 const RUN_JQ = '{path: .path, event: .event, status: .status, head_sha: .head_sha, run_attempt: .run_attempt, created_at: .created_at, updated_at: .updated_at, '
   + 'pull_requests: [(.pull_requests // [])[] | {number: .number, head: {sha: .head.sha}, base: {ref: .base.ref, sha: .base.sha}}]}';
 
@@ -75,16 +83,18 @@ export function withinRunWindow(window, at) {
 }
 
 /**
- * The name of the verdict artifact: `pipeline-verdict_v1_<head40>_<integrity>_<hardstops>`, plus `_<label>_<login>` when
- * the run posted an approval receipt. integrity / hardstops are success|failure|error. Throws on a value outside the format.
+ * The name of the verdict artifact: `pipeline-verdict_v2_<head40>_<integrity>_<hardstops>_<review>`, plus `_<label>_<login>`
+ * when the run posted an approval receipt. integrity / hardstops are success|failure|error, review is that or 'off'. Throws on
+ * a value outside the format.
  */
-export function verdictArtifactName({ head, integrity, hardstops, receipt = null } = {}) {
+export function verdictArtifactName({ head, integrity, hardstops, review, receipt = null } = {}) {
   const h = String(head ?? '').toLowerCase();
   if (!SHA.test(h)) throw new Error(`verdict artifact: head is not a full commit sha: ${head}`);
   for (const [k, v] of [['integrity', integrity], ['hardstops', hardstops]]) {
     if (!VERDICT_STATES.includes(v)) throw new Error(`verdict artifact: ${k} state is not success|failure|error: ${v}`);
   }
-  let name = `${ARTIFACT_PREFIX}${h}_${integrity}_${hardstops}`;
+  if (!REVIEW_STATES.includes(review)) throw new Error(`verdict artifact: review state is not success|failure|error|off: ${review}`);
+  let name = `${ARTIFACT_PREFIX}${h}_${integrity}_${hardstops}_${review}`;
   if (receipt) {
     if (!APPROVAL_LABELS.includes(receipt.label)) throw new Error(`verdict artifact: not an approval label: ${receipt.label}`);
     if (!LOGIN_RE.test(String(receipt.login ?? ''))) throw new Error(`verdict artifact: not a GitHub login: ${receipt.login}`);
@@ -93,11 +103,17 @@ export function verdictArtifactName({ head, integrity, hardstops, receipt = null
   return name;
 }
 
-/** The inverse of verdictArtifactName: { head, integrity, hardstops, receipt: { label, login } | null }, or null for any other name. */
+/**
+ * The inverse of verdictArtifactName: { version: 2, head, integrity, hardstops, review, receipt: { label, login } | null }, or for
+ * a v1 name the same with version 1 and review null; null for any other name.
+ */
 export function parseVerdictArtifactName(name) {
-  const m = ARTIFACT_RE.exec(String(name ?? ''));
-  if (!m) return null;
-  return { head: m[1], integrity: m[2], hardstops: m[3], receipt: m[4] ? { label: m[4], login: m[5] } : null };
+  const text = String(name ?? '');
+  const m = ARTIFACT_RE.exec(text);
+  if (m) return { version: 2, head: m[1], integrity: m[2], hardstops: m[3], review: m[4], receipt: m[5] ? { label: m[5], login: m[6] } : null };
+  const l = LEGACY_ARTIFACT_RE.exec(text);
+  if (!l) return null;
+  return { version: 1, head: l[1], integrity: l[2], hardstops: l[3], review: null, receipt: l[4] ? { label: l[4], login: l[5] } : null };
 }
 
 /**
@@ -171,8 +187,10 @@ export function checkRunProvenance({ read, repo, url, bind = {}, cache = new Map
 
 /**
  * The run must carry a verdict artifact for `headSha` that backs the claim in `expect`:
- *   { check: 'integrity' | 'hardstops' }   a guard status: the artifact's state for that check must be `success`
- *                                           (every verdict artifact of that head must agree);
+ *   { check: 'integrity' | 'hardstops' | 'review' }
+ *                                           a guard status: the artifact's state for that check must be `success`
+ *                                           (every verdict artifact of that head must agree; for 'review' only v2
+ *                                           artifacts count, and there must be one);
  *   { receipt: { label, login } }          an approval receipt: the artifact must name that label and approver (login case-insensitive).
  * The run's artifact list is read once per run (cache) — but only when `final` (the run has completed): a running job
  * uploads its verdict at the end, so an early empty list must not stick. Unreadable or missing fails closed.
@@ -190,8 +208,10 @@ export function checkVerdictArtifact({ read, repo, runId, headSha, expect, cache
     const verdicts = String(list).split('\n').map((l) => l.trim()).filter(Boolean)
       .map(parseVerdictArtifactName).filter((v) => v && v.head === head);
     if (verdicts.length === 0) return { ok: false, reason: `the run carries no verdict artifact for ${head.slice(0, 7)} (still running, cancelled before the upload, or deleted)` };
-    if (Object.hasOwn(expect ?? {}, 'check') && ['integrity', 'hardstops'].includes(expect.check)) {
-      const bad = verdicts.find((v) => v[expect.check] !== 'success');
+    if (Object.hasOwn(expect ?? {}, 'check') && ['integrity', 'hardstops', 'review'].includes(expect.check)) {
+      const judged = expect.check === 'review' ? verdicts.filter((v) => v.review !== null) : verdicts;
+      if (judged.length === 0) return { ok: false, reason: `the run carries no v2 verdict artifact for ${head.slice(0, 7)}, so nothing backs a review status` };
+      const bad = judged.find((v) => v[expect.check] !== 'success');
       return bad
         ? { ok: false, reason: `the run's own verdict for ${expect.check} is ${bad[expect.check]}, not success` }
         : { ok: true };

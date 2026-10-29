@@ -19,6 +19,7 @@ export const LABELS = Object.freeze([
   { name: 'agent-build', color: '1d76db', description: 'Ask the pipeline to build this' },
   { name: 'human-approved', color: '0e8a16', description: 'Owner approved this head (hard-stop)' },
   { name: 'test-change-approved', color: '0e8a16', description: 'Owner approved a test change' },
+  { name: 'pipeline-recheck', color: 'c5def5', description: 'Added and removed by review-complete to re-run the guards' },
 ]);
 
 // GitHub label names are case-insensitive and colours come back with or without '#'.

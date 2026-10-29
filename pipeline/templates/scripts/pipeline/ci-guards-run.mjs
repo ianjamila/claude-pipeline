@@ -55,11 +55,21 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { HARDSTOP_LABEL, INTEGRITY_LABEL, MAX_DESCRIPTION, clip, runCheck } from './ci-guard.mjs';
 import { loadConfig } from './lib/config.mjs';
-import { APPROVAL_LABELS, VERDICT_STATES, checkGuardVerdict, parseRunUrl, verdictArtifactName, withinRunWindow } from './lib/guard-provenance.mjs';
-import { git, revParse } from './lib/git.mjs';
+import { APPROVAL_LABELS, REVIEW_STATES, VERDICT_STATES, checkGuardVerdict, parseRunUrl, verdictArtifactName, withinRunWindow } from './lib/guard-provenance.mjs';
+import { git, revParse, reviewContentHash } from './lib/git.mjs';
 import { gh as defaultGh, GhError } from './lib/proc.mjs';
+import { REVIEW_COMPLETE_MARKER, REVIEW_CONTEXT, latestReviewComment } from './lib/review-marker.mjs';
 
 export const CONTEXTS = { integrity: 'Test integrity', hardstops: 'Hard-stop scan' };
+// The third status, `Cross-model review`, only with ci.review_check (base config). Why: the review loop ends by posting a
+// review-complete comment (lib/review-marker.mjs) whose JSON names the content hash it reviewed; branch protection cannot
+// read a comment, so this run turns it into a status. It is `success` only when the latest such comment by an allowed author
+// (the approvers rule) names exactly the content hash of the PR head, recomputed here from git data (git.mjs#reviewContentHash:
+// merge base of the base tip and the head -> head, minus the base config's agent log). A push that changes the content
+// changes the hash, so the old review stops counting without anybody removing anything. It is never set `pending`: while
+// this runs, the head's previous review status stands, and a head without one has none, which branch protection treats as
+// missing. With ci.review_check off nothing is posted and the verdict records `off`.
+export const REVIEW_KEY = 'review';
 export const VERDICT_FILE = 'verdict.json';
 // Which check each approval label can override.
 const APPROVAL_CHECK = { [INTEGRITY_LABEL]: 'integrity', [HARDSTOP_LABEL]: 'hardstops' };
@@ -131,8 +141,9 @@ function session({ env, cwd, deps }, { repo, pr, head, base, runUrl }) {
   ]);
   const currentHead = () => api([`repos/${repo}/pulls/${pr}`, '--jq', '.head.sha']).trim().toLowerCase();
   // A newer commit exists: this run's verdict would describe the wrong code, and the run for the new head decides.
-  const superseded = () => {
-    for (const context of Object.values(CONTEXTS)) post('error', context, 'superseded by a newer commit');
+  // `review`: whether this repo posts the review status (unknown before the config is read: then only the two guards).
+  const superseded = (review = false) => {
+    for (const context of [...Object.values(CONTEXTS), ...(review ? [REVIEW_CONTEXT] : [])]) post('error', context, 'superseded by a newer commit');
     return { exitCode: 0, output: { ok: true, superseded: true, head, base } };
   };
   return { api, post, currentHead, superseded };
@@ -152,11 +163,20 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
   const fetched = revParse('refs/remotes/pr/head', { cwd }).toLowerCase();
   if (fetched !== head || currentHead() !== head) return superseded();
 
-  // Who may approve. An unreadable config is an internal error (fail closed). Only read when it is needed.
-  async function approverPolicy() {
+  // The base branch's config. An unreadable config is an internal error (fail closed). Read once, only when it is needed.
+  let loadedConfig = null;
+  async function baseConfig() {
+    if (loadedConfig) return loadedConfig;
     const loaded = await (deps.loadConfig ?? loadConfig)(cwd);
     if (!loaded.ok) throw new Error(`invalid or missing .claude/pipeline.yml: ${loaded.errors.join('; ')}`);
-    const approvers = (loaded.config.ci?.approvers ?? []).map((l) => l.toLowerCase());
+    loadedConfig = loaded.config;
+    return loadedConfig;
+  }
+
+  // Who may approve (and whose review-complete comment counts).
+  async function approverPolicy() {
+    const config = await baseConfig();
+    const approvers = (config.ci?.approvers ?? []).map((l) => l.toLowerCase());
     const orgWithoutList = approvers.length === 0 && ownerType !== '' && ownerType !== 'User';
     const allowed = (login) => !orgWithoutList && (approvers.length > 0 ? approvers.includes(login) : login === owner);
     return { approvers, orgWithoutList, allowed };
@@ -245,10 +265,47 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
     return { labels, approvals, results };
   }
 
+  // 3b. The cross-model review (see REVIEW_KEY): the latest review-complete comment by an allowed author must name the content
+  // hash of THIS head. Labels play no part in it.
+  async function evaluateReview() {
+    let config;
+    try {
+      config = await baseConfig();
+    } catch (err) {
+      // Whether this repo checks the review is unknown: fail closed with an error status, as the two guards do.
+      return { state: 'error', description: `Guard error: ${String(err?.message ?? err).split('\n')[0]}` };
+    }
+    if (config.ci?.review_check !== true) return { state: 'off', description: 'not checked (ci.review_check is off)' };
+    const policy = await approverPolicy();
+    if (policy.orgWithoutList) return { state: 'failure', description: 'no review author counts: org-owned repo, list the approvers in ci.approvers (org-repo-needs-ci.approvers)' };
+    const comments = lines(api([
+      `repos/${repo}/issues/${pr}/comments`, '--paginate', '--jq',
+      `.[] | select(.body | startswith(${JSON.stringify(REVIEW_COMPLETE_MARKER)})) | {id: .id, by: .user.login, at: .created_at, updated: .updated_at, body: .body} | @json`,
+    ])).map((l) => JSON.parse(l));
+    const latest = latestReviewComment(comments, policy.allowed);
+    if (!latest.found) return { state: 'failure', description: 'no review-complete comment for this PR: run the cross-model review' };
+    if (!latest.record) return { state: 'failure', description: latest.reason };
+    let hash;
+    try {
+      // The checkout is the base branch tip (github.sha): the merge base with the head is where the branch forked, as in the
+      // review loop's `origin/<default>`. The base config's agent log is left out, as there.
+      hash = reviewContentHash({ agentLog: config.agent_log, head: 'refs/remotes/pr/head', baseSha: revParse('HEAD', { cwd }) }, { cwd });
+    } catch (err) {
+      return { state: 'error', description: `could not compute the content hash of the head: ${String(err?.message ?? err).split('\n')[0]}` };
+    }
+    const r = latest.record;
+    if (hash !== r.contentHash) {
+      return { state: 'failure', description: `the content changed since the review (reviewed ${r.contentHash.slice(0, 8)}, head is ${hash.slice(0, 8)}): review it again` };
+    }
+    return { state: 'success', description: `reviewed at ${r.head.slice(0, 8)}: ${r.rounds} round(s), Codex ${r.codexModel}${r.modelProofDigest ? ', Fable' : ''}` };
+  }
+
   let pass = await evaluatePass();
+  const review = await evaluateReview();
+  const reviewOn = review.state !== 'off';
 
   // 4. Re-read before recording the verdict: a push or a label change while we worked must not be recorded over.
-  if (currentHead() !== head) return superseded();
+  if (currentHead() !== head) return superseded(reviewOn);
   if (!sameSet(listLabels(), pass.labels)) pass = await evaluatePass();
 
   // 5. Record the verdict (phase 2 publishes it). The note for an ignored approval goes on the status of the check that
@@ -265,9 +322,11 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
     const description = note ? `${clip(r.description, MAX_DESCRIPTION - note.length - 2)}; ${note}` : r.description;
     checks[check] = { context, state, description: clip(description, MAX_DESCRIPTION) };
   }
+  checks[REVIEW_KEY] = { context: REVIEW_CONTEXT, state: review.state, description: clip(review.description, MAX_DESCRIPTION) };
 
   const summary = [
     ...Object.values(pass.results).map((r) => r.summary),
+    ...(reviewOn ? [`## ${REVIEW_CONTEXT}\n\n${review.state}: ${checks[REVIEW_KEY].description}\n`] : []),
     ...(pass.approvals.invalid.length > 0
       ? [`## Approvals ignored\n\n${pass.approvals.invalid.map((a) => `- \`${a.label}\`: ${NOTES[a.reason]}`).join('\n')}\n`]
       : []),
@@ -278,15 +337,15 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
 
   if (!env.GITHUB_OUTPUT || !String(env.GITHUB_OUTPUT).trim()) throw new Error('missing environment variable GITHUB_OUTPUT');
   const receipt = ownReceipt ? { label: ownReceipt.label, login: ownReceipt.login } : null;
-  const artifact = verdictArtifactName({ head, integrity: checks.integrity.state, hardstops: checks.hardstops.state, receipt });
+  const artifact = verdictArtifactName({ head, integrity: checks.integrity.state, hardstops: checks.hardstops.state, review: review.state, receipt });
   const dir = verdictDir(env);
   mkdirSync(dir, { recursive: true });
   const verdict = {
-    version: 1,
+    version: 2,
     pr: Number(pr),
     head,
     base,
-    checks: { integrity: { state: checks.integrity.state, description: checks.integrity.description }, hardstops: { state: checks.hardstops.state, description: checks.hardstops.description } },
+    checks: Object.fromEntries(Object.entries(checks).map(([k, c]) => [k, { state: c.state, description: c.description }])),
     // Removed by phase 2, after the statuses: removing a label fires `unlabeled`, which starts (and cancels this) run.
     removeLabels: pass.approvals.invalid.map((a) => a.label),
     receipt,
@@ -297,11 +356,12 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
   return {
     exitCode: 0,
     output: {
-      ok: Object.values(checks).every((c) => c.state === 'success'),
+      ok: Object.values(checks).every((c) => c.state === 'success' || c.state === 'off'),
       head,
       base,
       artifact,
-      results: checks,
+      // (the review check only when this repo posts it)
+      results: reviewOn ? checks : Object.fromEntries(Object.entries(checks).filter(([k]) => k !== REVIEW_KEY)),
       approvals: { valid: pass.approvals.valid, ignored: pass.approvals.invalid },
     },
   };
@@ -321,16 +381,18 @@ export async function runPublish({ env = process.env, cwd = process.cwd(), deps 
   } catch (err) {
     throw new Error(`no readable verdict from the evaluate step: ${err.message}`);
   }
-  const shape = verdict?.version === 1 && String(verdict.pr) === pr && verdict.head === head && verdict.base === base
+  const shape = verdict?.version === 2 && String(verdict.pr) === pr && verdict.head === head && verdict.base === base
     && Object.keys(CONTEXTS).every((k) => VERDICT_STATES.includes(verdict.checks?.[k]?.state) && typeof verdict.checks[k].description === 'string')
+    && REVIEW_STATES.includes(verdict.checks?.[REVIEW_KEY]?.state) && typeof verdict.checks[REVIEW_KEY].description === 'string'
     && Array.isArray(verdict.removeLabels) && verdict.removeLabels.every((l) => APPROVAL_LABELS.includes(l));
   if (!shape) throw new Error('the verdict file does not describe this PR and head');
 
+  const reviewOn = verdict.checks[REVIEW_KEY].state !== 'off';
   // A newer commit may have arrived while the artifact was uploaded: the run for the new head decides.
-  if (currentHead() !== head) return superseded();
+  if (currentHead() !== head) return superseded(reviewOn);
 
   const published = {};
-  for (const [check, context] of Object.entries(CONTEXTS)) {
+  for (const [check, context] of [...Object.entries(CONTEXTS), ...(reviewOn ? [[REVIEW_KEY, REVIEW_CONTEXT]] : [])]) {
     const { state, description } = verdict.checks[check];
     post(state, context, description);
     published[check] = { context, state, description: clip(description, MAX_DESCRIPTION) };

@@ -12,7 +12,7 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node
 import { join, resolve } from 'node:path';
 import { gh as ghRun } from './proc.mjs';
 import { checkGuardVerdict, GUARD_CONTEXT_CHECKS } from './guard-provenance.mjs';
-import { GUARD_CHECKS, validateConfig } from './config.mjs';
+import { PROVENANCE_CHECKS, REVIEW_CHECK, validateConfig } from './config.mjs';
 import { ciProof as defaultCiProof } from './ci-proof.mjs';
 import { matchGlob } from './glob.mjs';
 import { blockingHits, collectHardStops, ownerMergeHits } from './hardstops.mjs';
@@ -29,8 +29,11 @@ import { ownerItemsDigest } from '../hooks/lib/owner-go.mjs';
 
 export const GATE_FILE = 'final-gate.json';
 export const BLOCKING_LABELS = Object.freeze(['needs-human', 'awaiting-review', 'pipeline-blocked']);
-// A gate older than this is evidence about a world that may be gone (base moved, a pause issue opened).
-export const GATE_MAX_AGE_MS = 30 * 60_000;
+// A gate older than this is evidence about a world that may be gone. Since `P merge` re-runs the whole gate live right before
+// the merge command (base moved, a pause issue opened, a new push: all re-read), the file only binds the head, patch and owner
+// items, so its age limit is the owner's: a day, as long as an owner's "merge" counts (hooks/lib/owner-go.mjs MAX_AGE_MS).
+// Waiting for that "merge" no longer forces a new verify.
+export const GATE_MAX_AGE_MS = 24 * 60 * 60_000;
 export const PR_FIELDS = Object.freeze(['state', 'headRefOid', 'baseRefName', 'isDraft', 'labels', 'mergeable', 'mergeStateStatus']);
 
 // What a gate must contain: exactly these checks (plus `preview` when config.preview is set), each once and passing.
@@ -329,6 +332,18 @@ async function proveDeferredStep({ step, ctx }) {
   }
 }
 
+// true when `sha` is a commit here whose tree is HEAD's tree; otherwise why not (a string), or null for a value that is no sha.
+function sameTreeAs(sha, o) {
+  if (typeof sha !== 'string' || !FULL_SHA.test(sha)) return null;
+  try {
+    const theirs = git(['rev-parse', '--verify', '--quiet', `${sha}^{tree}`], o).trim();
+    const mine = git(['rev-parse', '--verify', 'HEAD^{tree}'], o).trim();
+    return theirs !== '' && theirs === mine ? true : 'its tree is not HEAD\'s tree';
+  } catch {
+    return 'that commit is not in this repository';
+  }
+}
+
 // `proofs` is an out-array: filled (in report order) only when this check passes, with where each deferrable step was proved.
 export async function verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs = [] }) {
   let report;
@@ -415,15 +430,32 @@ export async function verifyReportCheck({ root, config, head, tree, o, pr, gh, e
   }
 
   const g = isObject(report.git) ? report.git : {};
-  if (g.head !== head) problems.push(`report is for ${short(g.head)}, HEAD is ${short(head)}`);
+  // A report made on ANOTHER commit whose tree is HEAD's (an amended message, the same tree re-committed) verified exactly these
+  // bytes, so it stands: its fingerprint must equal the one this working tree has with that commit as HEAD (git.mjs#treeFingerprint
+  // asHead), and it must be younger than THAT commit. What it never stands in for: a deferred step's CI proof, which is read for
+  // THIS head above, so the new head's CI run must still vouch for it; and a head with any other tree, which needs a new verify.
+  let verifiedAt = head;
+  if (g.head !== head) {
+    const same = sameTreeAs(g.head, o);
+    if (same === true) verifiedAt = g.head;
+    else problems.push(`report is for ${short(g.head)}, HEAD is ${short(head)}${same ? ` (${same})` : ''}`);
+  }
   if (g.dirty !== false) problems.push('report was produced on a dirty tree');
   // `treeHash` is the spec's spelling of the same field; either must equal the tree as it is now.
   const reportedTree = g.tree ?? g.treeHash;
-  if (typeof reportedTree !== 'string' || reportedTree === '' || reportedTree !== tree) problems.push('the working tree changed since verify ran');
+  let expectedTree = tree;
+  if (verifiedAt !== head) {
+    try {
+      expectedTree = treeFingerprint(o, { asHead: verifiedAt });
+    } catch {
+      expectedTree = '';
+    }
+  }
+  if (typeof reportedTree !== 'string' || reportedTree === '' || expectedTree === '' || reportedTree !== expectedTree) problems.push('the working tree changed since verify ran');
 
   const finished = Date.parse(report.finishedAt);
   if (!Number.isFinite(finished)) problems.push('finishedAt is missing or not a date');
-  else if (finished < commitTime(head, o)) problems.push('report finished before the HEAD commit was made');
+  else if (finished < commitTime(verifiedAt, o)) problems.push(`report finished before the ${verifiedAt === head ? 'HEAD' : 'verified'} commit was made`);
 
   if (problems.length) return check('verify-report', false, problems.join('; '));
   for (const row of rows) {
@@ -431,7 +463,8 @@ export async function verifyReportCheck({ root, config, head, tree, o, pr, gh, e
     else if (row.status === 'pass' && deferrable.includes(row.name)) proofs.push({ step: row.name, source: 'local' });
   }
   const via = ciProved.size > 0 ? `; CI proof: ${[...ciProved.values()].map((p) => `${p.step} via run ${p.run.id ?? '?'} attempt ${p.run.attempt ?? '?'}`).join(', ')}` : '';
-  return check('verify-report', true, `full verify passed at ${short(head)} (${steps.length} steps${skips.length ? `: ${steps.length - skips.length} ran, ${skips.length} skipped: ${skips.map((k) => `${k.name} \u2014 ${clip(k.reason, SKIP_REASON_SHOWN)}`).join('; ')}` : ''}${via})`);
+  const at = verifiedAt === head ? short(head) : `${short(verifiedAt)}, the same tree as HEAD ${short(head)}`;
+  return check('verify-report', true, `full verify passed at ${at} (${steps.length} steps${skips.length ? `: ${steps.length - skips.length} ran, ${skips.length} skipped: ${skips.map((k) => `${k.name} \u2014 ${clip(k.reason, SKIP_REASON_SHOWN)}`).join('; ')}` : ''}${via})`);
 }
 
 async function hardstopsCheck({ root, config, diff }) {
@@ -501,8 +534,10 @@ function reviewCheck({ root, config, pr, diff, hash, hashError }) {
 // required check that never ran (renamed, workflow deleted, path-filtered away) cannot be mistaken for a green PR.
 // `skipping` only passes for a trusted docs-only diff. Nothing configured and nothing required by GitHub fails closed,
 // unless the owner wrote `ci.required_checks: []` explicitly (then every reported check must pass).
-function ciCheck({ gh, pr, head, diff, config, explicitEmpty }) {
-  const named = config.ci?.required_checks ?? [];
+// With ci.review_check the review status is named too (posted by the guards workflow, so only next to its guard checks).
+export function ciCheck({ gh, pr, head, diff, config, explicitEmpty }) {
+  const reviewNamed = config.ci?.review_check === true && config.ci?.guard_checks !== false;
+  const named = [...new Set([...(config.ci?.required_checks ?? []), ...(reviewNamed ? [REVIEW_CHECK] : [])])];
   let requiredRows = [];
   try {
     const rows = gh.checks(pr, { required: true });
@@ -542,7 +577,7 @@ function ciCheck({ gh, pr, head, diff, config, explicitEmpty }) {
   // creation time.
   const guardNames = new Set();
   for (const r of used) {
-    if (r && GUARD_CHECKS.includes(r.name) && passing(r)) guardNames.add(r.name);
+    if (r && PROVENANCE_CHECKS.includes(r.name) && passing(r)) guardNames.add(r.name);
   }
   const forged = [];
   const provenanceCache = new Map();
@@ -669,6 +704,25 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     failed: checks.filter((c) => !c.ok).map((c) => c.name),
     at: new Date().toISOString(),
   };
+}
+
+// The checks of `P merge --owner-go` (owner decision 2026-10-28): work that never ran the ship loop (no verify report, no review
+// state, no final-gate.json) merges on the owner's "merge" alone, provided GitHub agrees the PR is ready: open, not a draft,
+// MERGEABLE, not behind its base, at the local HEAD, no blocking label, and every required check green on this head (ciCheck,
+// guard statuses and the Cross-model review status only with their provenance). The owner's recorded "merge" is checked by the
+// caller. Nothing here vouches for a verify step: no proofs are produced (a deferred step's CI proof is a gate matter), and
+// nothing is written, so a later plain `P merge` still needs its own final gate. Returns { ok, head, checks, failed }.
+export const OWNER_GO_CHECKS = Object.freeze(['pr-open', 'labels', 'ci']);
+export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep }) {
+  const head = headSha({ cwd: root });
+  const info = await readPrSettled({ gh, pr, fields: [...PR_FIELDS], sleep, pauseMs: mergeablePause(env) });
+  const diff = lazyDiff(root, config);
+  const checks = [
+    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config }) })),
+    await safely('labels', () => labelsCheck(info)),
+    await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
+  ];
+  return { ok: checks.every((c) => c.ok), head, checks, failed: checks.filter((c) => !c.ok).map((c) => c.name) };
 }
 
 // ---- merge --------------------------------------------------------------------------------------

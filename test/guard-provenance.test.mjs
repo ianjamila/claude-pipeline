@@ -14,24 +14,26 @@ const T = (hhmmss) => `2026-10-01T${hhmmss}Z`;
 
 // ---- the artifact name ------------------------------------------------------------------------------------------------------
 
-test('verdictArtifactName: the exact format, with and without a receipt', () => {
-  assert.equal(verdictArtifactName({ head: HEAD, integrity: 'success', hardstops: 'failure' }), `pipeline-verdict_v1_${HEAD}_success_failure`);
+test('verdictArtifactName: the exact v2 format (three states), with and without a receipt', () => {
+  assert.equal(verdictArtifactName({ head: HEAD, integrity: 'success', hardstops: 'failure', review: 'off' }), `pipeline-verdict_v2_${HEAD}_success_failure_off`);
+  assert.equal(verdictArtifactName({ head: HEAD, integrity: 'success', hardstops: 'success', review: 'success' }), `pipeline-verdict_v2_${HEAD}_success_success_success`);
   assert.equal(
-    verdictArtifactName({ head: HEAD, integrity: 'error', hardstops: 'success', receipt: { label: 'human-approved', login: 'Ian-J' } }),
-    `pipeline-verdict_v1_${HEAD}_error_success_human-approved_Ian-J`,
+    verdictArtifactName({ head: HEAD, integrity: 'error', hardstops: 'success', review: 'failure', receipt: { label: 'human-approved', login: 'Ian-J' } }),
+    `pipeline-verdict_v2_${HEAD}_error_success_failure_human-approved_Ian-J`,
   );
   assert.equal(
-    verdictArtifactName({ head: HEAD.toUpperCase(), integrity: 'success', hardstops: 'success', receipt: { label: 'test-change-approved', login: 'dependabot[bot]' } }),
-    `pipeline-verdict_v1_${HEAD}_success_success_test-change-approved_dependabot[bot]`,
+    verdictArtifactName({ head: HEAD.toUpperCase(), integrity: 'success', hardstops: 'success', review: 'error', receipt: { label: 'test-change-approved', login: 'dependabot[bot]' } }),
+    `pipeline-verdict_v2_${HEAD}_success_success_error_test-change-approved_dependabot[bot]`,
     'the head is lower-cased; a bot login keeps its [bot] suffix',
   );
 });
 
 test('verdictArtifactName: refuses anything outside the format instead of producing an ambiguous name', () => {
-  const ok = { head: HEAD, integrity: 'success', hardstops: 'success' };
+  const ok = { head: HEAD, integrity: 'success', hardstops: 'success', review: 'off' };
   for (const bad of [
     { ...ok, head: 'abc' }, { ...ok, head: `${HEAD}0` }, { ...ok, head: undefined },
     { ...ok, integrity: 'passed' }, { ...ok, hardstops: '' }, { ...ok, integrity: undefined },
+    { ...ok, review: undefined }, { ...ok, review: 'skipped' }, { ...ok, integrity: 'off' }, { ...ok, hardstops: 'off' },
     { ...ok, receipt: { label: 'needs-review', login: 'acme' } },
     { ...ok, receipt: { label: 'human-approved', login: 'a_b' } },
     { ...ok, receipt: { label: 'human-approved', login: 'a/b' } },
@@ -46,20 +48,28 @@ test('verdictArtifactName: refuses anything outside the format instead of produc
 test('parseVerdictArtifactName: round-trips every valid name and is strict about everything else', () => {
   for (const integrity of ['success', 'failure', 'error']) {
     for (const hardstops of ['success', 'failure', 'error']) {
-      for (const receipt of [null, ...APPROVAL_LABELS.map((label) => ({ label, login: 'acme' }))]) {
-        const name = verdictArtifactName({ head: HEAD, integrity, hardstops, receipt });
-        assert.deepEqual(parseVerdictArtifactName(name), { head: HEAD, integrity, hardstops, receipt }, name);
-        // GitHub rejects these characters in an artifact name: the format must never need them
-        assert.doesNotMatch(name, /[":<>|*?\\/\r\n]/);
+      for (const review of ['success', 'failure', 'error', 'off']) {
+        for (const receipt of [null, ...APPROVAL_LABELS.map((label) => ({ label, login: 'acme' }))]) {
+          const name = verdictArtifactName({ head: HEAD, integrity, hardstops, review, receipt });
+          assert.deepEqual(parseVerdictArtifactName(name), { version: 2, head: HEAD, integrity, hardstops, review, receipt }, name);
+          // GitHub rejects these characters in an artifact name: the format must never need them
+          assert.doesNotMatch(name, /[":<>|*?\\/\r\n]/);
+        }
       }
     }
   }
-  const good = `pipeline-verdict_v1_${HEAD}_success_success_human-approved_acme`;
+  // v1 (guards from before the review status) still parses, with review null
+  assert.deepEqual(parseVerdictArtifactName(`pipeline-verdict_v1_${HEAD}_success_failure`), { version: 1, head: HEAD, integrity: 'success', hardstops: 'failure', review: null, receipt: null });
+  assert.deepEqual(parseVerdictArtifactName(`pipeline-verdict_v1_${HEAD}_success_success_human-approved_acme`).receipt, { label: 'human-approved', login: 'acme' });
+  assert.equal(parseVerdictArtifactName(`pipeline-verdict_v1_${HEAD}_success_success_success`), null, 'a v1 name has no review state');
+  assert.equal(parseVerdictArtifactName(`pipeline-verdict_v2_${HEAD}_success_success`), null, 'a v2 name must have one');
+  assert.equal(parseVerdictArtifactName(`pipeline-verdict_v3_${HEAD}_success_success_success`), null);
+  const good = `pipeline-verdict_v2_${HEAD}_success_success_off_human-approved_acme`;
   assert.notEqual(parseVerdictArtifactName(good), null);
   for (const bad of [
     '', null, undefined, 42, 'verify-report',
     ` ${good}`, `${good} `, `${good}\n`, `\n${good}`, `${good}\nx`, `${good}_`, `${good}_x`, `${good}/..`,
-    good.replace('v1', 'v2'), good.replace('pipeline-verdict', 'Pipeline-verdict'),
+    good.replace('v2', 'v1'), good.replace('_off_', '_pending_'), good.replace('_off_', '_'), good.replace('pipeline-verdict', 'Pipeline-verdict'),
     good.replace(HEAD, 'a'.repeat(39)), good.replace(HEAD, 'A'.repeat(40)), good.replace(HEAD, 'g'.repeat(40)),
     good.replace('_success_success_', '_ok_success_'), good.replace('_success_success_', '_success_pending_'),
     good.replace('human-approved', 'human_approved'), good.replace('human-approved', 'needs-review'), good.replace('human-approved', 'Human-Approved'),
@@ -186,7 +196,23 @@ test('checkRunProvenance: the base.sha comes from the BOUND entry, not another P
 
 // ---- the artifact check ----------------------------------------------------------------------------------------------------
 
-const name = (integrity, hardstops, receipt = null, head = HEAD) => verdictArtifactName({ head, integrity, hardstops, receipt });
+const name = (integrity, hardstops, receipt = null, head = HEAD, review = 'off') => verdictArtifactName({ head, integrity, hardstops, review, receipt });
+
+test('checkVerdictArtifact: a review status needs a v2 artifact whose review state is success; v1 still backs the older checks', () => {
+  const reviewed = (state) => name('success', 'success', null, HEAD, state);
+  assert.equal(art([reviewed('success')], { check: 'review' }).ok, true);
+  for (const state of ['failure', 'error', 'off']) {
+    const r = art([reviewed(state)], { check: 'review' });
+    assert.equal(r.ok, false, state);
+    assert.match(r.reason, new RegExp(`verdict for review is ${state}`));
+  }
+  const v1 = `pipeline-verdict_v1_${HEAD}_success_success`;
+  assert.match(art([v1], { check: 'review' }).reason, /no v2 verdict artifact/, 'a v1 artifact says nothing about a review');
+  assert.equal(art([v1], { check: 'hardstops' }).ok, true);
+  assert.equal(art([`pipeline-verdict_v1_${HEAD}_success_success_human-approved_acme`], { receipt: { label: 'human-approved', login: 'acme' } }).ok, true);
+  // the v2 artifact next to a v1 one must still agree on the older checks
+  assert.equal(art([v1, name('success', 'failure')], { check: 'hardstops' }).ok, false);
+});
 const art = (artifacts, expect, extra = {}) => checkVerdictArtifact({ read: reader({ artifacts }), repo: REPO, runId: '1', headSha: HEAD, expect, ...extra });
 
 test('checkVerdictArtifact: a guard check needs the run\'s own state for THAT check to be success', () => {

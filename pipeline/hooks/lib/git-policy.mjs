@@ -19,6 +19,7 @@ import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf,
 export { withoutLiteralText, INDIRECT_EXPANSION };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
+import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
 
@@ -78,7 +79,7 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // lowercase basename without .exe/.cmd/.bat/.com; handles /usr/bin/git and C:\Git\bin\GIT.EXE alike
 const baseName = (w) => commandName(w);
 // A command the parser could only partly resolve (`$g push`, `bash -c "$X"`, `curl … | sh`) is judged by what it mentions.
-const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close/i;
+const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close|claude-pipeline:review-complete/i;
 const isProtectedBranch = (b) => PROTECTED_BRANCHES.includes(String(b).toLowerCase());
 const isPrefixOf = (name, full, min = 1) => name.length >= min && full.startsWith(name);
 // Label names are case-insensitive on GitHub; a name only counts when it is not part of a longer one.
@@ -846,6 +847,8 @@ function checkApi(rest, env, dir, ctx) {
 
   const body = gatherBody(flags, dir, ctx);
   const haystack = safeDecode(`${rest.join('\n')}\n${body.text}`);
+  // -- the review-complete marker, in any write (a comment, an edit of one, a review, an issue body): see reviewMarkerVerdict
+  if (mentionsReviewMarker(haystack)) return deny(REVIEW_MARKER_DENIED);
   const approval = mentionsAny(haystack, APPROVAL_LABELS);
   const guard = mentionsAny(haystack, GUARD_LABELS);
   const dynamicLabel = body.fields.some((f) => /^(labels(\[\])?|name|new_name)$/.test(f.key) && DYNAMIC.test(f.value));
@@ -1007,6 +1010,40 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
   return null;
 }
 
+// ---- the review-complete marker (Phase 3a) ----------------------------------------------------------------------------------
+// Why: the pipeline-guards workflow turns the latest review-complete comment of the owner (lib/review-marker.mjs) into the
+// `Cross-model review` status, and the owner's token is the agent's token. So a comment carrying the marker must only come from
+// `pipeline review-complete`, which checks that a clean, current review exists first and posts from its own process (which
+// this guard never sees). Every gh route that writes text an agent can see is refused when that text holds the marker: the
+// words of the command (--body, --comment, --title …), a --body-file / -F file, and gh api fields and --input files
+// (checkApi). The marker is matched without its comment delimiters or version, case-insensitively. Residual (as for labels): a
+// body piped in on stdin from a file, or a client of the agent's own, is not seen.
+const REVIEW_MARKER_RE = new RegExp(escapeRe(REVIEW_MARKER_TEXT), 'i');
+const mentionsReviewMarker = (text) => REVIEW_MARKER_RE.test(String(text ?? '')) || REVIEW_MARKER_RE.test(safeDecode(String(text ?? '')));
+const REVIEW_MARKER_DENIED = `the text carries the review-complete marker (${REVIEW_MARKER_TEXT}), which only \`pipeline review-complete --pr N\` may post: it checks that a clean review covers the current content first. Run it instead.`;
+// gh commands that post or edit text on a PR or issue (where the workflow reads the comments), by group and verb.
+const TEXT_VERBS = { pr: ['comment', 'create', 'edit', 'review', 'close', 'merge'], issue: ['comment', 'create', 'edit', 'close'] };
+function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
+  if (!(TEXT_VERBS[group] ?? []).includes(verb)) return null;
+  if (rest.some(mentionsReviewMarker)) return deny(REVIEW_MARKER_DENIED);
+  // --body-file F, --body-file=F, -F F, -FF (gh pr/issue: -F is --body-file); a file read like any other (counted)
+  const files = [];
+  for (let i = 0; i < rest.length; i++) {
+    const w = rest[i];
+    if (w === '--body-file' || w === '-F') files.push(rest[i + 1]);
+    else if (w.startsWith('--body-file=')) files.push(w.slice('--body-file='.length));
+    else if (/^-F./.test(w)) files.push(w.slice(2));
+  }
+  for (const file of files) {
+    if (file === undefined || file === '-') continue; // (stdin: the residual above; a here-string is in the line itself)
+    if (dir === null) continue;
+    countScript(ctx.budget);
+    const text = ctx.readText(path.resolve(dir, file));
+    if (typeof text === 'string' && mentionsReviewMarker(text)) return deny(REVIEW_MARKER_DENIED);
+  }
+  return null;
+}
+
 function checkGh(argv, env, dir, ctx, raw, level = 0) {
   // The group and verb must be written literally (`gh pr $X`, `gh pr ${X%-base}`, `gh pr "$(printf merge)"`): a variable's
   // value on the line is not proof — `X=merge; true || X=view; gh pr $X` runs merge.
@@ -1039,6 +1076,8 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
   }
 
   if (group === 'api') return checkApi(rest, env, dir, ctx);
+  const marker = reviewMarkerVerdict(group, verb, rest, dir, ctx);
+  if (marker) return marker;
 
   if (group === 'repo' && ['edit', 'delete', 'rename'].includes(verb)) return deny(`\`gh repo ${verb}\` changes repository settings and is blocked. ${OWNER_ONLY}`);
   if ((group === 'ruleset' || group === 'rs') && ['create', 'edit', 'update', 'delete'].includes(verb)) return deny(`\`gh ruleset ${verb}\` is blocked. ${OWNER_ONLY}`);

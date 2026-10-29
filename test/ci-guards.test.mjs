@@ -9,6 +9,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { run as procRun } from '../pipeline/lib/proc.mjs';
 import { verdictArtifactName } from '../pipeline/lib/guard-provenance.mjs';
+import { reviewContentHash } from '../pipeline/lib/git.mjs';
+import { reviewCompleteBody } from '../pipeline/commands/review-complete.mjs';
 import { CONFIG, project, runNode, scratchDir } from './helpers/project.mjs';
 
 const fakeGh = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-seq.mjs');
@@ -52,14 +54,16 @@ function defaultArtifacts(id, head, receipts, events) {
   const mine = receipts.filter((r) => r.url === url).map((r) => r.context.replace('pipeline-approval: ', ''));
   const names = [...new Set(mine)].map((label) => {
     const actor = events.filter((e) => e.label === label).sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0]?.actor ?? 'acme';
-    return verdictArtifactName({ head, integrity: 'success', hardstops: 'success', receipt: { label, login: actor } });
+    return verdictArtifactName({ head, integrity: 'success', hardstops: 'success', review: 'off', receipt: { label, login: actor } });
   });
-  return names.length > 0 ? names : [verdictArtifactName({ head, integrity: 'success', hardstops: 'success' })];
+  return names.length > 0 ? names : [verdictArtifactName({ head, integrity: 'success', hardstops: 'success', review: 'off' })];
 }
-function script({ head, pullHeads = [head], labels = [], labelSeq, suites = [T('10:00')], receipts = [], events = [], failOn = [], runs = {}, artifacts = {}, compare = 'ahead', statusReply = { id: 1 } }) {
+// comments: the PR's review-complete comments as the jq filter shapes them ({ id, by, at, updated, body }).
+function script({ head, pullHeads = [head], labels = [], labelSeq, suites = [T('10:00')], receipts = [], events = [], failOn = [], runs = {}, artifacts = {}, compare = 'ahead', statusReply = { id: 1 }, comments = [] }) {
   const lines = (a) => (a.length ? `${a.join('\n')}\n` : '');
   return [
     ...failOn.map((match) => ({ match, code: 1, stderr: 'HTTP 500' })),
+    { match: `^api repos/${REPO}/issues/${PR}/comments --paginate`, stdout: lines(comments.map((c) => JSON.stringify(c))) },
     { match: `^api repos/${REPO}/pulls/${PR} `, sequence: pullHeads.map((h) => ({ stdout: `${h}\n` })) },
     { match: `^api repos/${REPO}/issues/${PR}/labels --paginate`, sequence: (labelSeq ?? [labels]).map((l) => ({ stdout: lines(l) })) },
     { match: `^api repos/${REPO}/commits/${head}/check-suites`, stdout: lines(suites) },
@@ -316,8 +320,10 @@ test('an invalid pipeline.yml on the base is published as error statuses (fail c
   const s = await setup(cleanChange, { config: null });
   const r = await exec(s);
   assert.equal(r.code, 0);
-  assert.deepEqual(r.posts.map((p) => p.state), ['error', 'error']);
+  // (whether the repo checks the review is unknown without a config: the review status fails closed too)
+  assert.deepEqual(r.posts.map((p) => [p.context, p.state]), [['Test integrity', 'error'], ['Hard-stop scan', 'error'], ['Cross-model review', 'error']]);
   assert.match(r.posts[0].description, /^Guard error: invalid or missing \.claude\/pipeline\.yml/);
+  assert.match(r.posts[2].description, /^Guard error: invalid or missing \.claude\/pipeline\.yml/);
 });
 
 test('a failed label removal is best effort', async () => {
@@ -740,9 +746,10 @@ test('phase 1 records the verdict and announces its artifact without posting a f
   const r = await exec(s, { labels: ['human-approved'], events: [owner(T('10:05'))] }, labeledEnv(), { publish: false });
   assert.equal(r.code, 0, r.stderr);
   assert.deepEqual(r.posts.map((p) => p.context), ['pipeline-approval: human-approved'], 'only the receipt exists after phase 1');
-  assert.equal(r.artifact, `pipeline-verdict_v1_${s.head}_success_success_human-approved_acme`);
+  assert.equal(r.artifact, `pipeline-verdict_v2_${s.head}_success_success_off_human-approved_acme`);
   assert.equal(r.json.artifact, r.artifact);
-  assert.equal(r.verdict.version, 1);
+  assert.equal(r.verdict.version, 2);
+  assert.deepEqual(r.verdict.checks.review, { state: 'off', description: 'not checked (ci.review_check is off)' });
   assert.deepEqual([r.verdict.pr, r.verdict.head, r.verdict.base, r.verdict.removeLabels, r.verdict.receipt], [PR, s.head, s.repo.base, [], { label: 'human-approved', login: 'acme' }]);
   assert.equal(r.verdict.checks.integrity.state, 'success');
   assert.match(r.verdict.checks.hardstops.description, /approved by label human-approved/);
@@ -754,16 +761,16 @@ test('phase 1 records the verdict and announces its artifact without posting a f
   assert.deepEqual(after.json.results.hardstops.state, 'success');
 });
 
-test('the artifact name carries both states, and the receipt only when this run posted one', async () => {
+test('the artifact name carries all three states (review off by default), and the receipt only when this run posted one', async () => {
   const s = await setup(addDrop);
   const r = await exec(s, {}, {}, { publish: false });
-  assert.equal(r.artifact, `pipeline-verdict_v1_${s.head}_success_failure`);
+  assert.equal(r.artifact, `pipeline-verdict_v2_${s.head}_success_failure_off`);
   assert.equal(r.verdict.receipt, null);
   const t = await setup(deleteTest);
-  assert.equal((await exec(t, {}, {}, { publish: false })).artifact, `pipeline-verdict_v1_${t.head}_failure_success`);
+  assert.equal((await exec(t, {}, {}, { publish: false })).artifact, `pipeline-verdict_v2_${t.head}_failure_success_off`);
   // a labeled run that is NOT an allowed approver's mints no receipt, so the name has none either
   const m = await setup(addDrop);
-  assert.equal((await exec(m, {}, labeledEnv('mallory'), { publish: false })).artifact, `pipeline-verdict_v1_${m.head}_success_failure`);
+  assert.equal((await exec(m, {}, labeledEnv('mallory'), { publish: false })).artifact, `pipeline-verdict_v2_${m.head}_success_failure_off`);
 });
 
 test('invalid approval labels are removed by --publish, after both statuses, never by phase 1', async () => {
@@ -871,7 +878,7 @@ test('own receipt: an API-read receipt that points at the CURRENT run is never a
     const s = await setup(addDrop);
     const r = await exec(s, {
       labels: ['human-approved'], events: [owner(T('10:05'))], receipts: [receipt(T('10:05'), 'human-approved', BOT, url)],
-      runs: { 99: {} }, artifacts: { 99: [verdictArtifactName({ head: s.head, integrity: 'success', hardstops: 'success', receipt: { label: 'human-approved', login: 'acme' } })] },
+      runs: { 99: {} }, artifacts: { 99: [verdictArtifactName({ head: s.head, integrity: 'success', hardstops: 'success', review: 'off', receipt: { label: 'human-approved', login: 'acme' } })] },
     });
     ignoredAsNoReceipt(r);
     assert.match(r.stderr, /points at the current run/, url);
@@ -891,7 +898,7 @@ test('own receipt: a labeled run whose own receipt does not cover the latest lab
 
 // ---- the verdict artifact closes the spoof race (issue #3) ------------------------------------------------------------------
 
-const verdictFor = (head, label = 'human-approved', login = 'acme', states = ['success', 'success']) => verdictArtifactName({ head, integrity: states[0], hardstops: states[1], receipt: label ? { label, login } : null });
+const verdictFor = (head, label = 'human-approved', login = 'acme', states = ['success', 'success', 'off']) => verdictArtifactName({ head, integrity: states[0], hardstops: states[1], review: states[2] ?? 'off', receipt: label ? { label, login } : null });
 
 test('spoof race: a genuine run of this PR and head that is still in progress cannot vouch for a receipt it never recorded', async () => {
   // The spoofing run (a PR into a side branch with an edited workflow, same head) posts a receipt pointing at genuine run 1,
@@ -986,4 +993,128 @@ test('verify.yml runs on Node 24', () => {
   const yml = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'templates', 'workflows', 'verify.yml'), 'utf8');
   assert.match(yml, /node-version: 24$/m);
   assert.doesNotMatch(yml, /node-version: 20/);
+});
+
+// ---- Cross-model review (ci.review_check) -----------------------------------------------------------------------------------
+
+const REVIEW_ON = { config: CONFIG(undefined, 'ci:\n  review_check: true\n') };
+// The content the review covered: what reviewContentHash gives for the PR head against main, agent log excluded.
+const reviewedHash = (s, head = s.head) => reviewContentHash({ branch: 'main', agentLog: 'docs/agent-log.md', head }, { cwd: s.repo.dir });
+// A review-complete comment as the jq filter shapes it, with the body review-complete itself writes.
+const reviewComment = (s, { hash = reviewedHash(s), at = T('10:01'), updated = at, by = 'acme', id = 1, body } = {}) => ({
+  id, by, at, updated,
+  body: body ?? reviewCompleteBody({ contentHash: hash, base: s.repo.base, head: s.head, rounds: 2, codexModel: 'gpt-6-astra', modelProofDigest: null }),
+});
+const withLog = (repo) => { cleanChange(repo); repo.write('docs/agent-log.md', '- 2026-10-01 a line the pipeline appended\n'); };
+
+test('review_check: the latest review-complete comment whose hash is the head\'s content posts Cross-model review success (agent log left out)', async () => {
+  const s = await setup(withLog, REVIEW_ON);
+  const r = await exec(s, { comments: [reviewComment(s)] });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.posts.map((p) => [p.context, p.state]), [['Test integrity', 'success'], ['Hard-stop scan', 'success'], ['Cross-model review', 'success']]);
+  const review = r.byContext('Cross-model review');
+  assert.equal(review.sha, s.head);
+  assert.equal(review.target_url, CURRENT_RUN);
+  assert.match(review.description, /2 round\(s\), Codex gpt-6-astra/);
+  assert.equal(r.artifact, `pipeline-verdict_v2_${s.head}_success_success_success`);
+  assert.equal(r.verdict.checks.review.state, 'success');
+  assert.equal(r.json.results.review.state, 'success');
+  assert.match(r.md, /## Cross-model review/);
+  // the log is really left out: a hash over it as well is a different hash, and that one fails
+  const withTheLog = reviewContentHash({ branch: 'main', head: s.head }, { cwd: s.repo.dir });
+  assert.notEqual(withTheLog, reviewedHash(s));
+  const t = await exec(s, { comments: [reviewComment(s, { hash: withTheLog })] });
+  assert.equal(t.byContext('Cross-model review').state, 'failure');
+});
+
+test('review_check: no comment, someone else\'s comment, or a comment for other content is a failure that says why', async () => {
+  const s = await setup(cleanChange, REVIEW_ON);
+  const none = await exec(s);
+  assert.equal(none.byContext('Cross-model review').state, 'failure');
+  assert.match(none.byContext('Cross-model review').description, /no review-complete comment/);
+  assert.equal(none.artifact, `pipeline-verdict_v2_${s.head}_success_success_failure`);
+  // only the repo owner's (or a listed approver's) comment counts
+  const mallory = await exec(s, { comments: [reviewComment(s, { by: 'mallory' })] });
+  assert.match(mallory.byContext('Cross-model review').description, /no review-complete comment/);
+  // a push after the review: the comment names the old content
+  const stale = await exec(s, { comments: [reviewComment(s, { hash: 'b'.repeat(64) })] });
+  assert.equal(stale.byContext('Cross-model review').state, 'failure');
+  assert.match(stale.byContext('Cross-model review').description, /content changed since the review \(reviewed bbbbbbbb, head is [0-9a-f]{8}\)/);
+  // the other two statuses are judged as before
+  assert.equal(stale.byContext('Test integrity').state, 'success');
+});
+
+test('review_check: the NEWEST allowed comment decides; an edited or malformed newest one fails and an older one does not come back', async () => {
+  const s = await setup(cleanChange, REVIEW_ON);
+  const good = reviewComment(s, { id: 1, at: T('10:01') });
+  const newerStale = reviewComment(s, { id: 2, at: T('10:02'), hash: 'c'.repeat(64) });
+  assert.equal((await exec(s, { comments: [newerStale, good] })).byContext('Cross-model review').state, 'failure');
+  // order of the list does not matter, the creation time does
+  assert.equal((await exec(s, { comments: [reviewComment(s, { id: 2, at: T('10:02') }), { ...newerStale, id: 1, at: T('10:01'), updated: T('10:01') }] })).byContext('Cross-model review').state, 'success');
+  const edited = await exec(s, { comments: [good, reviewComment(s, { id: 3, at: T('10:03'), updated: T('10:04') })] });
+  assert.match(edited.byContext('Cross-model review').description, /edited after it was posted/);
+  const malformed = await exec(s, { comments: [good, { id: 4, by: 'acme', at: T('10:05'), updated: T('10:05'), body: '<!-- claude-pipeline:review-complete v1 -->\nlooks fine to me' }] });
+  assert.match(malformed.byContext('Cross-model review').description, /does not carry a valid review record/);
+  // a mallory comment newer than the owner's is not "the newest allowed" one
+  const after = await exec(s, { comments: [good, reviewComment(s, { id: 5, at: T('10:06'), by: 'mallory', hash: 'd'.repeat(64) })] });
+  assert.equal(after.byContext('Cross-model review').state, 'success');
+});
+
+test('review_check with ci.approvers: a listed approver\'s comment counts, the owner\'s no longer does; org repo without a list fails closed', async () => {
+  const cfg = { config: CONFIG(undefined, 'ci:\n  review_check: true\n  approvers: [alice]\n') };
+  const s = await setup(cleanChange, cfg);
+  assert.equal((await exec(s, { comments: [reviewComment(s, { by: 'Alice' })] })).byContext('Cross-model review').state, 'success');
+  assert.equal((await exec(s, { comments: [reviewComment(s, { by: 'acme' })] })).byContext('Cross-model review').state, 'failure');
+  const o = await setup(cleanChange, REVIEW_ON);
+  const org = await exec(o, { comments: [reviewComment(o)] }, { OWNER_TYPE: 'Organization' });
+  assert.equal(org.byContext('Cross-model review').state, 'failure');
+  assert.match(org.byContext('Cross-model review').description, /org-repo-needs-ci\.approvers/);
+});
+
+test('review_check: a superseded head gets an error for the review status too; review off posts none at all', async () => {
+  const s = await setup(cleanChange, REVIEW_ON);
+  const moved = await exec(s, { comments: [reviewComment(s)], pullHeads: [s.head, OTHER_SHA] });
+  assert.equal(moved.json.superseded, true);
+  assert.deepEqual(moved.posts.map((p) => [p.context, p.state]), [['Test integrity', 'error'], ['Hard-stop scan', 'error'], ['Cross-model review', 'error']]);
+  // --publish sees the move: the verdict says the review is on, so the review status is superseded as well
+  const late = await exec(s, { comments: [reviewComment(s)], pullHeads: [s.head, s.head, OTHER_SHA] });
+  assert.deepEqual(late.posts.map((p) => [p.context, p.state]), [['Test integrity', 'error'], ['Hard-stop scan', 'error'], ['Cross-model review', 'error']]);
+  // off (the default): the comments are not even read, and no review status is posted
+  const off = await setup(cleanChange);
+  const r = await exec(off, { comments: [reviewComment(off)] });
+  assert.deepEqual(r.posts.map((p) => p.context), ['Test integrity', 'Hard-stop scan']);
+  assert.equal(r.api(`/issues/${PR}/comments`).length, 0);
+  assert.equal(r.json.results.review, undefined);
+});
+
+test('--publish refuses a v1 verdict file or one without a valid review state', async () => {
+  const s = await setup(cleanChange, REVIEW_ON);
+  const r = await exec(s, { comments: [reviewComment(s)] }, {}, { publish: false });
+  const verdict = JSON.parse(readFileSync(r.verdictFile, 'utf8'));
+  for (const bad of [{ ...verdict, version: 1 }, { ...verdict, checks: { ...verdict.checks, review: { state: 'maybe', description: 'x' } } }]) {
+    writeFileSync(r.verdictFile, JSON.stringify(bad));
+    const p = await r.publishAgain();
+    assert.equal(p.code, 1);
+    assert.match(p.stdout, /does not describe this PR and head/);
+  }
+});
+
+test('the review comment --jq filter keeps only marker comments, shaped as the orchestrator reads them', { skip: !hasJq && 'jq not installed' }, async () => {
+  const s = await setup(cleanChange, REVIEW_ON);
+  const r = await exec(s, { comments: [reviewComment(s)] });
+  const call = r.api(`/issues/${PR}/comments`)[0];
+  const expr = call.argv[call.argv.indexOf('--jq') + 1];
+  const body = reviewComment(s).body;
+  const out = spawnSync('jq', ['-r', expr], {
+    encoding: 'utf8',
+    input: JSON.stringify([
+      { id: 9, user: { login: 'acme' }, created_at: T('10:01'), updated_at: T('10:01'), body },
+      { id: 10, user: { login: 'acme' }, created_at: T('10:02'), updated_at: T('10:02'), body: 'just a comment' },
+      { id: 11, user: { login: 'mallory' }, created_at: T('10:03'), updated_at: T('10:04'), body: `${body}\n` },
+    ]),
+  }).stdout.replace(/\r\n/g, '\n').trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(out, [
+    { id: 9, by: 'acme', at: T('10:01'), updated: T('10:01'), body },
+    { id: 11, by: 'mallory', at: T('10:03'), updated: T('10:04'), body: `${body}\n` },
+  ]);
 });

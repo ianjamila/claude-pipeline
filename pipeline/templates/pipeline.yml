@@ -54,6 +54,9 @@ ci:
   # guard_checks: true         # default true: preflight and `protect` ALWAYS require the "Test integrity" and "Hard-stop scan"
   #                            # statuses on top of required_checks. Set false only for a repo that does not run
   #                            # pipeline-guards.yml (then list its real checks in required_checks).
+  # review_check: false        # true: pipeline-guards.yml also posts "Cross-model review" (success only when the latest
+  #                            # review-complete comment's content hash is the PR head's), and preflight, `protect` and the
+  #                            # final gate require it. Turn it on together with branch protection that requires it.
   # approvers: [your-login]    # GitHub logins whose `human-approved` / `test-change-approved` labels count. Empty = the repo
   #                            # owner of a USER-owned repo. REQUIRED when the repo belongs to an organization: without it
   #                            # every approval fails closed (reason org-repo-needs-ci.approvers).

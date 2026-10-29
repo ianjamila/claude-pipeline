@@ -5,7 +5,7 @@
 // SHA (so a head that moved can never merge). It then waits for GitHub to say MERGED, re-checking the blockers on every
 // poll; anything else ends with auto-merge disabled, because an unattended queued merge could land later on a base nobody
 // verified against.
-import { EXIT, parseCommandArgs, intOption } from '../lib/cli.mjs';
+import { EXIT, UsageError, parseCommandArgs, intOption } from '../lib/cli.mjs';
 import { fill } from '../lib/config.mjs';
 import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
@@ -19,13 +19,13 @@ import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { approvedRequest } from '../hooks/lib/owner-go.mjs';
 import {
-  GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, gateRefusals, localContentHash, mergeTiming, preMergeProblems, readReviewJson,
+  GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, preMergeProblems, readReviewJson,
   tailLines, waitBlockers, waitForMerge, writeReviewJson,
 } from '../lib/finalgate.mjs';
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
-  usage: 'pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); for a repo with verify.deferrable_steps the proofs of the live gate (where each deferrable step was proved: the Mac, or a GitHub run and attempt) are recorded in the run record and in an append-only ci-proof-used event comment before the merge command too, and when either write fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate\'s ownerItems, AND the owner-go hook recorded the owner\'s \"merge\" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems',
+  usage: 'pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST | --owner-go] [--repo DIR]   -> {ok, merged, mergeSha, prodBefore, warning?, warnings?} ; --owner-go (work that never ran ship: no final-gate.json) merges the local HEAD when the owner-go hook recorded the owner\'s "merge" for this PR, that head and items none, the PR is open, not a draft, MERGEABLE, not behind its base, without a blocking label and every required check is green on that head (error owner-go / live-check / pre-merge otherwise; output mode owner-go, no prodBefore, nothing written); exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable or no known-good production deployment. While it runs the run record of the PR shows inFlight {kind: merge} and step merge; a prod-before event comment (the known-good deployment) is posted before the merge command, and when that post fails nothing is merged (error pre-merge); for a repo with verify.deferrable_steps the proofs of the live gate (where each deferrable step was proved: the Mac, or a GitHub run and attempt) are recorded in the run record and in an append-only ci-proof-used event comment before the merge command too, and when either write fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate\'s ownerItems, AND the owner-go hook recorded the owner\'s \"merge\" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems',
 };
 
 const APPROVAL_FLAGS = "--owner-approved-head <full head> --owner-approved-items <the gate's ownerItems>";
@@ -39,11 +39,19 @@ const refuse = (error, reasons, extra = {}) => ({
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
     pr: { type: 'string' }, repo: { type: 'string' }, 'owner-approved-head': { type: 'string' }, 'owner-approved-items': { type: 'string' },
+    'owner-go': { type: 'boolean' },
   }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
   const gh = createGitHub({ cwd: root, env: ctx.env });
+
+  if (values['owner-go'] === true) {
+    if (values['owner-approved-head'] !== undefined || values['owner-approved-items'] !== undefined) {
+      throw new UsageError('--owner-go takes no --owner-approved-head / --owner-approved-items: it is bound to the local HEAD and the owner-go record');
+    }
+    return guardGh(() => ownerGoMerge({ root, config, pr, gh, ctx }));
+  }
 
   return guardGh(async () => {
     // 1. The gate file must name this head and this patch, in this repo, and be fresh. It is only a binding: it proves nothing by itself.
@@ -256,3 +264,53 @@ export const run = guarded(async (argv, ctx) => {
     return result;
   });
 });
+
+// `P merge --pr N --owner-go` (owner decision 2026-10-28): the merge route for work that never ran the ship loop (no
+// final-gate.json, no verify report, no review state). It merges only when ALL of these hold, read live:
+//   * the owner-go recorder (hooks/lib/owner-go.mjs) holds the owner's "merge" for this PR, this exact head and the item set
+//     `none` (the reply ended with `Head <sha12> · items none` and the 🔀 line) — the flag itself approves nothing;
+//   * evaluateOwnerGo: open, not a draft, MERGEABLE, not behind its base, at the local HEAD, no blocking label, and every
+//     required check green on that head (guard statuses and Cross-model review only with their provenance);
+//   * the last look right before the merge command (preMergeProblems: head, draft, labels, pause / rollback issues).
+// It merges with the project's merge command pinned to that head ({sha}: --match-head-commit for gh), never adds a label,
+// writes no gate file and records no verify proof, then waits for MERGED like the gated path (auto-merge disabled otherwise).
+// What it does not do: production bookkeeping. No prod-before record is written (the owner watches this merge), so a later
+// prod-watch has no rollback target and refuses to roll back; the output says so (warning) when production is configured.
+async function ownerGoMerge({ root, config, pr, gh, ctx }) {
+  // The owner's record first: it is local, and without it nothing else matters.
+  const head = headSha({ cwd: root });
+  if (!approvedRequest({ pr, head, items: 'none' })) {
+    const reason = `no owner "merge" is recorded for #${pr} head ${head.slice(0, 12)} items none: end the reply with \`Head ${head.slice(0, 12)} · items none\` and \`🔀 Ready to merge #${pr} — say "merge"\`, and wait for the owner to type "merge"`;
+    return refuse('owner-go', [reason], { reason, head });
+  }
+  const live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env });
+  if (live.head !== head) return refuse('live-check', [`the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`], { head });
+  if (!live.ok) return refuse('live-check', live.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`), { head });
+
+  const late = await preMergeProblems({ gh, pr, head });
+  if (late.length > 0) return refuse('pre-merge', late, { head });
+
+  const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
+  const command = fill(config.merge.command, { pr: String(pr), sha: head }, { strict: true });
+  const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
+  const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
+  const noProd = config.production ? { warnings: ['owner-go records no prod-before deployment: prod-watch has no rollback target for this merge'] } : {};
+  const merged = (mergeSha, extra = {}) => ({
+    exitCode: EXIT.OK,
+    output: mergeSha
+      ? { ok: true, merged: true, mode: 'owner-go', head, mergeSha, ...noProd, ...extra }
+      : { ok: true, merged: true, mode: 'owner-go', head, mergeSha: null, warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading', ...noProd, ...extra },
+  });
+  const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh) });
+  if (outcome.state === 'merged') return merged(outcome.mergeSha, ran.code === 0 ? {} : { commandExitCode: ran.code, note: 'the merge command exited non-zero but the PR is MERGED' });
+  const abandoned = await abandonMerge({ gh, pr, cwd: root, env: ctx.env, pollMs });
+  if (abandoned.merged) return merged(abandoned.mergeSha, { note: 'the PR merged while auto-merge was being disabled', autoMergeDisabled: abandoned.autoMergeDisabled });
+  const failure = { merged: false, mode: 'owner-go', head, autoMergeDisabled: abandoned.autoMergeDisabled, commandExitCode: ran.code, commandOutput };
+  if (ran.code !== 0) return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged`, ...failure } };
+  const base = {
+    timeout: 'not merged in time', closed: 'the PR was closed without merging', error: `could not read the PR state while waiting (${outcome.error})`,
+    blocked: `a blocker appeared while waiting: ${(outcome.problems ?? []).join('; ')}`,
+  }[outcome.state];
+  const tail = abandoned.autoMergeDisabled ? 'auto-merge disabled' : 'could not confirm auto-merge is disabled: check the PR by hand';
+  return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${base} — ${tail}`, ...failure } };
+}
