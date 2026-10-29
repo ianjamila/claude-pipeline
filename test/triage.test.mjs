@@ -792,6 +792,44 @@ test('reviewValidFor: only the MOST RECENT clean round counts: a later round tha
   assert.equal(reviewValidFor(stateOf([clean, accepting, third]), 'h-final'), false, 'an older clean round no longer vouches');
 });
 
+test('reviewValidFor: a base-only round is not a review: it only carries the content hash of a clean reviewed round forward', () => {
+  const baseOnly = (n, hash) => round(n, [], hash, { baseOnly: true });
+  const accepting = round(3, [item({ id: 'R3-B1', bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), implemented: true })], 'h-3');
+  // accepted fixes (implemented) nobody reviewed yet, then main merged in: not valid at either hash
+  const unreviewed = stateOf([round(1, []), round(2, []), accepting, baseOnly(4, 'h-4')]);
+  assert.equal(reviewValidFor(unreviewed, 'h-4'), false);
+  assert.equal(reviewValidFor(unreviewed, 'h-3'), false);
+  // a clean reviewed round followed by base-only rounds (update-branch): valid for the LATEST round's hash only
+  const cleaned = stateOf([round(1, []), round(2, [], 'h-2'), baseOnly(3, 'h-3'), baseOnly(4, 'h-4')]);
+  assert.equal(reviewValidFor(cleaned, 'h-4'), true);
+  assert.equal(reviewValidFor(cleaned, 'h-2'), false, 'the content moved on with the base-only rounds');
+  assert.equal(reviewValidFor(cleaned, 'h-other'), false);
+  // only base-only rounds: nothing was ever reviewed
+  assert.equal(reviewValidFor(stateOf([baseOnly(1, 'h-1')]), 'h-1'), false);
+  // a reviewed round after the base-only one decides
+  const later = stateOf([round(1, []), baseOnly(2, 'h-2'), accepting]);
+  assert.equal(reviewValidFor(later, 'h-3'), false);
+});
+
+test('reviewValidFor and roundOutcome.clean agree on states with base-only rounds', () => {
+  const baseOnly = (n, hash) => round(n, [], hash, { baseOnly: true });
+  const acc = (implemented) => round(2, [item({ id: 'R2-B1', bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), ...(implemented ? { implemented: true } : {}) })], 'h-2');
+  const states = [
+    [round(1, [], 'h-1'), baseOnly(2, 'h-2')],
+    [round(1, [], 'h-1'), baseOnly(2, 'h-2'), baseOnly(3, 'h-3')],
+    [round(1, [], 'h-1'), acc(true), baseOnly(3, 'h-3')],
+    [round(1, [], 'h-1'), acc(false), baseOnly(3, 'h-3')],
+    [round(1, [], 'h-1'), baseOnly(2, 'h-2'), acc(true)],
+    [baseOnly(1, 'h-1')],
+  ];
+  for (const rounds of states) {
+    for (const hash of rounds.map((r) => r.contentHashAtToHead).concat('h-other')) {
+      const s = stateOf(rounds, { currentContentHash: hash });
+      assert.equal(reviewValidFor(s, hash), roundOutcome(s).clean, `${rounds.map((r) => `${r.n}${r.baseOnly ? 'b' : ''}`).join(',')} at ${hash}`);
+    }
+  }
+});
+
 // ---- review fixes: fail-closed rules --------------------------------------------------------
 
 // -- 1. roll-ups across ALL rounds

@@ -401,6 +401,7 @@ export function roundOutcome(state) {
     last.contentHashAtToHead === state.currentContentHash;
   const fablePending = fablePendingRounds(state);
   const clean =
+    lastReviewed !== undefined && // a state of base-only rounds alone reviewed nothing
     fablePending.length === 0 &&
     pending.length === 0 &&
     needsHuman.length === 0 &&
@@ -447,16 +448,17 @@ export function roundCapProblem(state, n, { baseOnly = false } = {}) {
     : `round ${n} would pass review.max_rounds (${max}) and its one extra round`;
 }
 
-// True when the MOST RECENT clean round (one that accepted nothing new) reviewed exactly `contentHash`, no later
-// round exists that is not clean, and no round has an unresolved item (spec R3'). An earlier clean round never
-// vouches for content that a later round went on to change or to accept fixes for. Agrees with roundOutcome.
+// True when the last REVIEWED round (not baseOnly: a round that only merged the base branch in reviewed nothing) accepted
+// nothing new, the latest round, base-only or not, covers exactly `contentHash`, and no round has an unresolved item (spec R3').
+// An earlier clean round never vouches for content that a later round went on to change or to accept fixes for; base-only
+// rounds after a clean reviewed round only carry its approval forward to the merged-in content. Agrees with roundOutcome.clean.
 export function reviewValidFor(state, contentHash) {
   if (!hasContentHash(contentHash)) return false;
   if (allItems(state).some(unresolved)) return false;
   if (fablePendingRounds(state).length > 0) return false;
   const rounds = state?.rounds ?? [];
   const isClean = (round) => (round.items ?? []).every((item) => !isNewAccept(item));
-  const lastClean = rounds.findLast(isClean);
-  if (lastClean === undefined || lastClean !== rounds.at(-1)) return false;
-  return lastClean.contentHashAtToHead === contentHash;
+  const lastReviewed = rounds.findLast((round) => round.baseOnly !== true);
+  if (lastReviewed === undefined || !isClean(lastReviewed)) return false;
+  return rounds.at(-1).contentHashAtToHead === contentHash;
 }
