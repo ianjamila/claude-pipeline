@@ -5,7 +5,7 @@ request number, `<round>` the round number (1, 2, 3). One round = one Codex pass
 The reviewer is the `reviewer` that `codex-review` printed: `judge` (a low-risk PR: steps 2–4, then step 5 only for disputes) or
 `fable` (medium/high risk, or a sensitive path: skip steps 2–4, go straight to step 5, which is then the whole review).
 Max `review.max_rounds` (default 2), + one extra round when the last round's only open items are accepted fixes (`extraRound`);
-`codex-review` itself refuses any other round (exit 2 `round-cap`). Commands run as jobs report their
+base-only rounds (main merged in, nothing of the PR's own) don't count toward it; `codex-review` itself refuses any other round (exit 2 `round-cap`). Commands run as jobs report their
 real code as `exitCode` in `job wait` (see Invariant 8 in `SKILL.md`).
 
 ## Replaying a review (resume, or a second machine)
