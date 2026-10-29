@@ -60,6 +60,12 @@ const defaultRemotes = (dir) => {
   const r = run('git', ['-C', dir, 'remote', '-v'], { timeoutMs: LOOKUP_TIMEOUT_MS });
   return r.code === 0 ? r.stdout : null;
 };
+// (Fable attacker pass) gh's own choice of repository among the remotes: `gh repo set-default` writes remote.<name>.gh-resolved, which
+// is `base` or an owner/name gh then uses instead. '' when none is set (git config exits 1), null when it cannot be read.
+const defaultResolved = (dir) => {
+  const r = run('git', ['-C', dir, 'config', '--get-regexp', '^remote\\..*\\.gh-resolved$'], { timeoutMs: LOOKUP_TIMEOUT_MS });
+  return r.code === 0 ? r.stdout : r.code === 1 ? '' : null;
+};
 // owner/name from a github.com remote URL (git@github.com:owner/name.git, https://github.com/owner/name, ssh://git@github.com/owner/name.git),
 // or null. (security review of 26cfb30: a remote on another host — GitHub Enterprise, a mirror, a local path — holds another repository
 // with the same owner/name, and the owner's "merge" names one on github.com)
@@ -69,15 +75,18 @@ export function remoteSlug(url) {
     ?? /^(?:[^@/:]*@)?([^/:@]+):(?!\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(s);
   return m && m[1].toLowerCase() === 'github.com' ? `${m[2]}/${m[3]}` : null;
 }
-export function repoOfRemotes(text) {
-  if (typeof text !== 'string') return null;
+export function repoOfRemotes(text, resolved = '') {
+  if (typeof text !== 'string' || typeof resolved !== 'string') return null;
   const urls = text.split(/\r?\n/).map((l) => l.trim().split(/\s+/)[1]).filter(Boolean);
   const slugs = urls.map(remoteSlug);
   if (slugs.length === 0 || slugs.includes(null)) return null;
   const keys = new Set(slugs.map((s) => s.toLowerCase()));
-  return keys.size === 1 ? slugs[0] : null;
+  if (keys.size !== 1) return null;
+  // (a gh-resolved naming another owner/name: gh merges there, not in the remotes' repository)
+  const chosen = resolved.split(/\r?\n/).map((l) => l.trim().split(/\s+/)[1]).filter(Boolean);
+  return chosen.every((v) => v === 'base' || v.toLowerCase() === [...keys][0]) ? slugs[0] : null;
 }
-export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8'), exists = existsSync, gitShow = defaultGitShow, remotes = defaultRemotes } = {}) {
+export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8'), exists = existsSync, gitShow = defaultGitShow, remotes = defaultRemotes, resolved = defaultResolved } = {}) {
   const rootOf = (dir) => {
     let d = path.resolve(dir);
     for (;;) {
@@ -118,7 +127,7 @@ export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8
       }
       return out;
     },
-    repoOf: (dir) => repoOfRemotes(remotes(dir)),
+    repoOf: (dir) => repoOfRemotes(remotes(dir), resolved(dir)),
     approvedHead: (pr, head, repo) => approvedPr({ repo, pr, head, session }),
   };
 }

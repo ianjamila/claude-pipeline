@@ -205,7 +205,9 @@ test('Phase 3b: the run markers (summary, record, status, needs-human, blocked, 
 test('Phase 3b: editing or deleting an existing comment by hand is refused', () => {
   for (const cmd of ['gh api -X DELETE repos/acme/app/issues/comments/9', 'gh api -X PATCH repos/acme/app/issues/comments/9 -f body=x',
     'gh api --method=delete /repos/acme/app/pulls/comments/9', 'gh api -X PUT repos/{owner}/{repo}/issues/comments/9 -f body=x',
-    'gh pr comment 7 --edit-last --body x', 'gh pr comment 7 --delete-last --yes', 'gh issue comment 7 --edit-last=true -b x',
+    'gh pr comment 7 --edit-last --body x', 'gh pr comment 7 --delete-last --yes', 'gh api -X POST -X DELETE repos/acme/app/issues/comments/9',
+    'gh api repos/acme/app/issues/comments/9 -f body=x', 'gh api -X POST repos/acme/app/issues/comments/9',
+    `gh api -X POST -X DELETE repos/acme/app/issues/7/labels/${'needs'}-human`, // (gh takes the last -X: a guard label deleted) 'gh issue comment 7 --edit-last=true -b x',
     'gh api graphql -f query=\'mutation { updateIssueComment(input: {id: "IC_1", body: "x"}) { clientMutationId } }\'',
     'gh api graphql -f query=\'mutation { deleteIssueComment(input: {id: "IC_1"}) { clientMutationId } }\'']) {
     assert.equal(decide(cmd), 'deny', cmd);

@@ -604,6 +604,7 @@ function trackConfig(args, ctx) {
   const key = String(positionals[0] ?? '').toLowerCase();
   if (key.startsWith('alias.') && positionals.length >= 2) ctx.gitAliases[key.slice('alias.'.length)] = positionals[1];
   if (writes && RISKY_CONFIG(key, String(positionals[1] ?? ''))) ctx.cfgDirty = true;
+  if (writes && (DYNAMIC.test(key) || key.startsWith('remote.') || key === '')) ctx.ghRepoDirty = true; // (see directMergeVerdict)
 }
 
 function trackGit(sub, args, g, ctx) {
@@ -840,7 +841,8 @@ function checkApi(rest, env, dir, ctx) {
   const { flags, positionals } = parseOpts(rest, { longValue: API_LONG_VALUE, shortValue: 'XfFHqtp' });
   const explicit = flagValues(flags, ['method'], 'X').map((m) => m.toUpperCase());
   const hasBody = flags.some((f) => (f.short ? 'fF'.includes(f.name) : ['field', 'raw-field', 'input'].includes(f.name)));
-  const method = explicit.length ? (explicit.find((m) => m !== 'GET') ?? 'GET') : (hasBody ? 'POST' : 'GET');
+  // (security review of eb10860: gh takes the LAST -X / --method, so `-X POST -X DELETE` deletes; the first non-GET one was read before)
+  const method = explicit.length ? explicit[explicit.length - 1] : (hasBody ? 'POST' : 'GET');
   if (method === 'GET') return null;
   const ep = normaliseEndpoint(positionals[0]);
   const p = `/${ep}`;
@@ -853,7 +855,7 @@ function checkApi(rest, env, dir, ctx) {
   if (/\/collaborators/i.test(p)) return deny(`${method} to collaborators is blocked. ${OWNER_ONLY}`);
   if (/\/actions\/permissions/i.test(p)) return deny(`${method} to Actions permissions is blocked. ${OWNER_ONLY}`);
   // -- (Phase 3b, Fable attacker pass) editing or deleting an existing comment: see COMMENT_EDIT_DENIED
-  if (/^repos\/[^/]+\/[^/]+\/(?:issues|pulls)\/comments\/[^/]+$/i.test(ep) && method !== 'POST') return deny(COMMENT_EDIT_DENIED);
+  if (/^repos\/[^/]+\/[^/]+\/(?:issues|pulls)\/comments\/[^/]+$/i.test(ep)) return deny(COMMENT_EDIT_DENIED); // (any method but GET, returned above)
 
   const body = gatherBody(flags, dir, ctx);
   const haystack = safeDecode(`${rest.join('\n')}\n${body.text}`);
@@ -950,6 +952,9 @@ function ghEnvValue(env, ctx, name, unset = envUnset(env, name)) {
   return ctx.env?.[name];
 }
 const GH_CONFIG_NAMES = ['GH_CONFIG_DIR', 'XDG_CONFIG_HOME', 'APPDATA', 'AppData', 'HOME'];
+// (Fable attacker pass) and the git environment gh reads the checkout's remotes and gh-resolved through: another repository (GIT_DIR …)
+// or injected config (GIT_CONFIG_COUNT/KEY_n/VALUE_n …)
+const GH_GIT_NAMES = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_CEILING_DIRECTORIES|GIT_DISCOVERY_ACROSS_FILESYSTEM|GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM))$/i;
 // Phase 3b: the repository a GH_REPO points gh at: undefined when none is set (or it is empty), null when it is set to something
 // that cannot be read. Also null whenever GH_HOST is (or may be) set to a host other than github.com: gh then reads -R owner/name,
 // GH_REPO and the checkout's remotes on that host, and the owner's "merge" names a repository on github.com.
@@ -958,7 +963,8 @@ const GH_CONFIG_NAMES = ['GH_CONFIG_DIR', 'XDG_CONFIG_HOME', 'APPDATA', 'AppData
 // else %AppData%/GitHub CLI on Windows, else ~/.config/gh. A line that points gh at another one (sets, changes or removes any of these)
 // may leave a sole logged-in enterprise host as the default: null, as for GH_HOST.)
 function ghRepoEnvSlug(env, ctx, envOf = env) {
-  for (const name of GH_CONFIG_NAMES) {
+  const gitNames = [...Object.keys(env), ...Object.keys(ctx.vars ?? {}), ...(ctx.unsureVars ?? []), ...(ctx.tainted ?? [])].filter((n) => GH_GIT_NAMES.test(n));
+  for (const name of new Set([...GH_CONFIG_NAMES, ...gitNames])) {
     const v = ghEnvValue(env, ctx, name, envUnset(envOf, name));
     if (v === null || (v ?? '') !== (ctx.env?.[name] ?? '')) return null;
   }
@@ -977,6 +983,9 @@ function ghRepoEnvSlug(env, ctx, envOf = env) {
 function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag = '--match-head-commit', named = undefined) {
   if (!ctx?.ownerGo) return null;
   if (!elsewhere && ownerGoMode(dir, ctx) !== 'chat') return null;
+  // (Fable attacker pass: a remote changed earlier on the line, or gh's default repository set, points gh at a repository the remotes
+  // read before the line never named: `git remote set-url …`, `git config remote.….gh-resolved …`, `gh repo set-default …`)
+  if (ctx.ghRepoDirty) named = null;
   const where = elsewhere ? 'a merge named by -R, a PR URL or GH_REPO (its repository may need the owner)' : 'in this repository (owner_approval: chat) a merge';
   const via = `Merge through \`P merge --pr ${pr ?? 'N'}\` (it merges a low-risk PR itself), or show the request (Head and 🔀 lines) and wait for the owner to type "merge".`;
   if (pr === null) return deny(`${what} without a literal PR number: ${where} needs the owner's "merge" for that PR and head. Name the PR number (run from the repository), or ${via[0].toLowerCase()}${via.slice(1)}`);
@@ -986,7 +995,7 @@ function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag
   if (repo === undefined) {
     try { repo = dir === null ? null : ctx.ownerGo.repoOf(dir) ?? null; } catch { repo = null; }
   }
-  if (!repo) return deny(`${what} #${pr}: which repository it merges in cannot be told (the checkout's remotes name none, several or one off github.com; -R / a PR URL / GH_REPO is built at run time, disagrees or names a host other than github.com; or GH_HOST is set, or the line moves gh's config directory: GH_CONFIG_DIR, XDG_CONFIG_HOME, APPDATA, HOME), and the owner's "merge" names its repository. Name it with -R owner/name, or ${via[0].toLowerCase()}${via.slice(1)}`);
+  if (!repo) return deny(`${what} #${pr}: which repository it merges in cannot be told (the checkout's remotes name none, several or one off github.com; -R / a PR URL / GH_REPO is built at run time, disagrees or names a host other than github.com; or GH_HOST is set, or the line moves gh's config directory: GH_CONFIG_DIR, XDG_CONFIG_HOME, APPDATA, HOME, or its git: GIT_DIR, GIT_CONFIG_*; or changes the remotes or gh's default repository), and the owner's "merge" names its repository. Name it with -R owner/name, or ${via[0].toLowerCase()}${via.slice(1)}`);
   let ok = false;
   try {
     ok = ctx.ownerGo.approvedHead(pr, head, repo) === true;
@@ -2898,6 +2907,9 @@ function evalString(str, startDir, ctx, level, child = false) {
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
     else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
     else if (name === 'git' || name === 'gh') {
+      // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
+      if (name === 'git' && argv.includes('remote') && argv.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true;
+      if (name === 'gh' && argv[1] === 'repo' && argv[2] === 'set-default') ctx.ghRepoDirty = true;
       const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
       if (unsure !== null && ctx.zshNames?.has(unsure)) verdict = deny(zshModifiedReason(unsure));
       else if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);

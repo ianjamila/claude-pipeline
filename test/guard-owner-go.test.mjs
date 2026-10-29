@@ -387,7 +387,7 @@ test('Phase 3b: a direct merge is matched to the owner\'s "merge" by repository 
 });
 
 test('Phase 3b: the checkout\'s repository is read from its remotes, and only when they all name the same one', () => {
-  const remotes = (text) => ownerGoWiring('sess', { gitShow: () => null, remotes: () => text }).repoOf('/x');
+  const remotes = (text, resolved = '') => ownerGoWiring('sess', { gitShow: () => null, remotes: () => text, resolved: () => resolved }).repoOf('/x');
   assert.equal(remotes('origin\tgit@github.com:o/chat.git (fetch)\norigin\tgit@github.com:o/chat.git (push)\n'), 'o/chat');
   assert.equal(remotes('origin\thttps://github.com/o/chat (fetch)\nmirror\tssh://git@github.com/O/Chat.git (fetch)\n'), 'o/chat');
   assert.equal(remotes('origin\thttps://github.com/me/chat (fetch)\nupstream\thttps://github.com/o/chat.git (fetch)\n'), null, 'gh may pick either');
@@ -413,12 +413,30 @@ test('Phase 3b: a merge on a host other than github.com, or with GH_HOST set, is
   allow(`GH_HOST= gh pr merge -R https://GitHub.com/o/chat 7 ${pin7}`);
   assert.equal(inherited(`env -u GH_HOST gh pr merge 7 ${pin7}`, { GH_HOST: 'ghe.corp' }).decision, 'allow');
   // the checkout's remotes: only github.com ones name a repository
-  const remotes = (text) => ownerGoWiring('sess', { gitShow: () => null, remotes: () => text }).repoOf('/x');
+  const remotes = (text, resolved = '') => ownerGoWiring('sess', { gitShow: () => null, remotes: () => text, resolved: () => resolved }).repoOf('/x');
   assert.equal(remotes('origin\tssh://git@github.com:22/o/chat.git (fetch)\nhttps\thttps://tok@GitHub.com/o/chat (fetch)\n'), 'o/chat');
   for (const url of ['git@ghe.corp:o/chat.git', 'https://ghe.corp/o/chat', 'ssh://git@ghe.corp/o/chat.git', '/srv/git/o/chat.git', 'file:///srv/o/chat', 'https://github.com.evil/o/chat']) {
     assert.equal(remotes(`origin\t${url} (fetch)\n`), null, url);
   }
   assert.equal(remotes('origin\tgit@github.com:o/chat.git (fetch)\nmirror\tgit@ghe.corp:o/chat.git (fetch)\n'), null, 'gh may pick the other host');
+  // (Fable attacker pass) gh's own default among the remotes (gh repo set-default → remote.<name>.gh-resolved)
+  const one = 'origin\tgit@github.com:o/chat.git (fetch)\n';
+  assert.equal(remotes(one, 'remote.origin.gh-resolved base\n'), 'o/chat');
+  assert.equal(remotes(one, 'remote.origin.gh-resolved O/Chat\n'), 'o/chat');
+  assert.equal(remotes(one, 'remote.origin.gh-resolved o/other\n'), null, 'gh merges in o/other');
+  assert.equal(remotes(one, null), null, 'unreadable');
+});
+
+// Fable attacker pass (Phase 3b): what gh reads the checkout's repository from can be changed on the line itself, before the merge.
+test('Phase 3b: a line that changes the remotes, gh\'s default repository or gh\'s git environment names no repository', () => {
+  const pin7 = `--match-head-commit ${H7}`;
+  for (const cmd of [`git config remote.origin.gh-resolved o/other && gh pr merge 7 ${pin7}`, `git remote set-url origin git@github.com:o/other.git; gh pr merge 7 ${pin7}`,
+    `git remote add up git@github.com:o/other.git && gh pr merge 7 ${pin7}`, `gh repo set-default o/other && gh pr merge 7 ${pin7}`, `git config "$K" o/other; gh pr merge 7 ${pin7}`,
+    `GIT_DIR=/other/.git gh pr merge 7 ${pin7}`, `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.gh-resolved GIT_CONFIG_VALUE_0=o/other gh pr merge 7 ${pin7}`,
+    `export GIT_WORK_TREE=/other; gh pr merge 7 ${pin7}`, `git remote set-url origin git@github.com:o/other.git; npm run merge -- 7 --expect-head ${H7}`]) {
+    assert.equal(verdict(cmd).decision, 'deny', cmd);
+  }
+  for (const cmd of [`git fetch origin && gh pr merge 7 ${pin7}`, `git config user.name x; gh pr merge 7 ${pin7}`, `git remote -v && gh pr merge 7 ${pin7}`]) allow(cmd);
 });
 
 // Phase 3b security review (26cfb30), finding 2: an `env` wrapper that takes GH_REPO / GH_HOST out of gh's environment (-u NAME, -i, a
