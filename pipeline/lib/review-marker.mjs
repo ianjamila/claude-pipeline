@@ -58,7 +58,11 @@ export function latestReviewComment(comments, allowed) {
   const comment = marked.at(-1);
   if (!comment) return { found: false };
   // An edit is not a path review-complete ever takes (it posts a new comment or reuses an identical one), so an edited comment
-  // says nothing about the review: it is refused rather than skipped, so an older comment cannot come back into force.
+  // says nothing about the review: it is refused rather than skipped, so an older comment cannot come back into force through it.
+  // A newer comment that is DELETED (or edited until it no longer starts with the marker) does let the one before it count again
+  // (Codex review of 4c595df). That revives nothing unreviewed: every comment is posted by review-complete for a content hash it
+  // checked, and the status is success only when that hash is the head's, so an older comment can only vouch for exactly the
+  // content it reviewed.
   if (Date.parse(comment.updated) !== Date.parse(comment.at)) return { found: true, comment, record: null, reason: 'the latest review-complete comment was edited after it was posted' };
   const record = parseReviewRecord(comment.body);
   return record

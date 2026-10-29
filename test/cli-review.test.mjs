@@ -1429,6 +1429,22 @@ test('review-complete: posts the marker comment with {contentHash, base, head, r
   assertExit(again, 0, again.stdout);
   assert.deepEqual([again.json.reused, again.json.comment], [true, { id: 77, url: 'u77' }]);
   assert.equal(postedBodies(w).length, 1);
+
+  // Codex review of 4c595df: only what the guard workflow would judge is reused. Our identical comment that was edited (even back
+  // to this text), or one with a newer marker comment of anyone after it, is not: a new comment is posted.
+  const view = GH.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { baseRefName: 'main', headRefOid: w.head, ...e.stdoutJson } } : e));
+  const POST = { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 90, html_url: 'u90' } };
+  for (const comments of [
+    [{ id: 77, user: { login: 'me' }, body, html_url: 'u77', created_at: '2026-10-29T00:00:00Z', updated_at: '2026-10-29T01:00:00Z' }],
+    [{ id: 77, user: { login: 'me' }, body, html_url: 'u77' }, { id: 78, user: { login: 'mallory' }, body: `${body}\nx`, html_url: 'u78' }],
+  ]) {
+    const before = postedBodies(w).length;
+    w.fake.setScript([...view, REMOVE_LABEL, { match: '^api user', stdout: 'me\n' }, { match: 'issues/7/comments --paginate', stdoutJson: comments }, POST]);
+    const fresh = w.cli(['review-complete', '--pr', '7']);
+    assertExit(fresh, 0, fresh.stdout);
+    assert.deepEqual([fresh.json.posted, fresh.json.reused, fresh.json.comment], [true, undefined, { id: 90, url: 'u90' }], JSON.stringify(comments));
+    assert.equal(postedBodies(w).length, before + 1);
+  }
 });
 
 // The recheck nudge: a ready PR gets no event from a comment, so review-complete adds and removes `pipeline-recheck`.

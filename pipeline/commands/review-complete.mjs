@@ -135,12 +135,16 @@ export const run = guarded(async (argv, ctx) => {
       });
       const body = reviewCompleteBody(record);
       // Retrying after a crash must not stack identical comments: our own latest marker comment with this exact body stands.
+      // It must also be what the guard workflow will judge (lib/review-marker.mjs#latestReviewComment): the newest marker comment
+      // of ANY author, and never edited — an edited one, even if edited back to this text, fails there forever (Codex review of
+      // 4c595df). Otherwise a new comment is posted.
       const me = gh.viewer();
       const latest = gh.listComments(pr)
-        .filter((c) => typeof c.body === 'string' && c.body.startsWith(REVIEW_COMPLETE_MARKER) && c.user?.login === me)
+        .filter((c) => typeof c.body === 'string' && c.body.startsWith(REVIEW_COMPLETE_MARKER))
         .sort((a, b) => Number(a.id) - Number(b.id))
         .at(-1);
-      const reused = latest !== undefined && latest.body.trim() === body.trim();
+      const reused = latest !== undefined && latest.user?.login === me && latest.body.trim() === body.trim()
+        && String(latest.updated_at ?? '') === String(latest.created_at ?? '');
       const comment = reused ? { id: latest.id, url: latest.html_url ?? null } : gh.createComment(pr, body);
 
       gh.removeLabels(pr, [AWAITING_REVIEW]);

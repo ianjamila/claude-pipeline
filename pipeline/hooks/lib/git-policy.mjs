@@ -714,7 +714,9 @@ function gatherBody(flags, dir, ctx) {
   let unknown = false;
   const fields = [];
   const queries = [];
+  const files = []; // every file the request body is read from (--input F, -F key=@F), as written
   const fromFile = (p) => {
+    files.push(p);
     if (dir !== null) countScript(ctx.budget); // a file read like any other (its size is up to 1 MB), so it is counted
     const t = dir === null ? null : ctx.readText(path.resolve(dir, p));
     if (typeof t === 'string') { text += `\n${t}`; return t; }
@@ -732,7 +734,7 @@ function gatherBody(flags, dir, ctx) {
       let value = eq < 0 ? '' : f.value.slice(eq + 1);
       const at = typed ? /^@(.+)$/.exec(value) : null;
       if (at) value = fromFile(at[1]) ?? '';
-      fields.push({ key, value });
+      fields.push({ key, value, written: f.value }); // (written: the flag as on the line, before any @file was read)
       if (key === 'query') queries.push(value);
     } else if (!f.short && f.name === 'input') {
       if (f.value === '-') { unknown = true; text += `\n${ctx.fullText}`; continue; }
@@ -745,7 +747,7 @@ function gatherBody(flags, dir, ctx) {
       } catch { queries.push(t); }
     }
   }
-  return { text, unknown, fields, queries };
+  return { text, unknown, fields, queries, files };
 }
 
 // ---- graphql mutation allowlist ---------------------------------------------------------------------------
@@ -848,7 +850,8 @@ function checkApi(rest, env, dir, ctx) {
   const body = gatherBody(flags, dir, ctx);
   const haystack = safeDecode(`${rest.join('\n')}\n${body.text}`);
   // -- the review-complete marker, in any write (a comment, an edit of one, a review, an issue body): see reviewMarkerVerdict
-  if (mentionsReviewMarker(haystack)) return deny(REVIEW_MARKER_DENIED);
+  const marker = apiReviewMarkerVerdict(ep, haystack, body, dir, ctx);
+  if (marker) return marker;
   const approval = mentionsAny(haystack, APPROVAL_LABELS);
   const guard = mentionsAny(haystack, GUARD_LABELS);
   const dynamicLabel = body.fields.some((f) => /^(labels(\[\])?|name|new_name)$/.test(f.key) && DYNAMIC.test(f.value));
@@ -1111,6 +1114,39 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
     const text = ctx.readText(abs);
     if (typeof text !== 'string') return deny(`the body file ${file} cannot be read here (missing, not a regular file, or over ${MAX_INPUT_BYTES} bytes), so it cannot be checked for the review-complete marker.`);
     if (mentionsReviewMarker(text)) return deny(REVIEW_MARKER_DENIED);
+  }
+  return null;
+}
+
+// JSON and GraphQL strings may spell any character as \uXXXX (`claude-pipeline:review-complete`): GitHub stores the decoded
+// text, so the marker is also looked for with those escapes decoded. (An escaped backslash before `u` is decoded too: that can
+// only refuse more, never less.)
+const decodeUnicodeEscapes = (s) => String(s ?? '').replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+// API writes that create or edit an issue / PR conversation comment, the only text the guard workflow reads for the marker
+// (REST, or the GraphQL addComment / updateIssueComment mutations).
+const API_COMMENT_PATH = /^repos\/[^/]+\/[^/]+\/issues\/([^/]+\/comments|comments\/[^/]+)$/i;
+const COMMENT_MUTATION = /\b(addComment|updateIssueComment)\b/;
+
+// The review-complete marker in a `gh api` write (Codex review of 4c595df): the line, every field and input file, with JSON /
+// GraphQL \u escapes decoded. For a write that creates or edits a conversation comment, what the guard cannot read is refused
+// as in reviewMarkerVerdict: a field value built at run time ($VAR, $(cat f), backticks; not the GraphQL query itself, whose
+// `$name` are its variables), a body on stdin (--input -) or in a file that is missing or unreadable, and a body file written
+// earlier on this line (it holds text that does not exist yet).
+function apiReviewMarkerVerdict(ep, haystack, body, dir, ctx) {
+  const texts = [haystack, ctx.fullText, ...body.fields.map((f) => f.value)];
+  if (texts.some((t) => mentionsReviewMarker(t) || mentionsReviewMarker(decodeUnicodeEscapes(t)))) return deny(REVIEW_MARKER_DENIED);
+  const mutation = /^graphql$/i.test(ep) && body.queries.some((q) => COMMENT_MUTATION.test(q));
+  if (!API_COMMENT_PATH.test(ep) && !mutation) return null;
+  if (body.fields.some((f) => f.key !== 'query' && typeof f.written === 'string' && DYNAMIC.test(f.written))) {
+    return deny('a field of this API write is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the review-complete marker. Write the body to a file and pass it with a literal name (-F body=@file or --input file).');
+  }
+  if (body.unknown) return deny('the body of this API write comes from stdin or a file that cannot be read here, so it cannot be checked for the review-complete marker. Pass a readable file with a literal name.');
+  for (const file of body.files) {
+    if (/^~|[*?[\]{}]/.test(file) || DYNAMIC.test(file)) return deny(`the input file name ${file} is expanded by the shell, so which file is sent cannot be verified for the review-complete marker. Name the file literally.`);
+    if (dir === null) return deny('cannot tell which directory this runs in, so the input file cannot be checked for the review-complete marker. Use an absolute path, or chain the cd with &&.');
+    if (writtenTo(ctx.writeFrames, path.resolve(dir, file), { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) !== null) {
+      return deny(`${file} may be written earlier on this line, so the body that is sent cannot be checked for the review-complete marker. Write the file in a command of its own.`);
+    }
   }
   return null;
 }
