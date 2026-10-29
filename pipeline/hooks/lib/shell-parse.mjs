@@ -243,6 +243,7 @@ function unwrapEnv(argv) {
   const env = {};
   const edits = { all: false, removed: [], unsure: false };
   const alts = [];
+  let chdir; // (-C DIR / --chdir DIR: the directory the command runs in; read by the guard, see process)
   let i = 1;
   let optsDone = false;
   while (i < a.length) {
@@ -263,6 +264,7 @@ function unwrapEnv(argv) {
       const value = valued ? inline ?? a[i + 1] : undefined;
       if (name === 'ignore-environment') edits.all = true;
       else if (name === 'unset') edits.removed.push(value ?? '');
+      else if (name === 'chdir') chdir = value ?? null;
       else if (name === null) {
         edits.unsure = true;
         if (inline === undefined && i + 2 < a.length) alts.push(['env', ...a.slice(i + 2)]);
@@ -283,6 +285,7 @@ function unwrapEnv(argv) {
           const value = glued !== '' ? glued : a[i + 1];
           if (glued === '') step = 2;
           if (c === 'u') edits.removed.push(value ?? '');
+          if (c === 'C') chdir = value ?? null;
           if (c === 'S') split = value ?? '';
           break;
         }
@@ -307,6 +310,7 @@ function unwrapEnv(argv) {
   const out = rest(a, i, env);
   if (out && (edits.all || edits.removed.length || edits.unsure)) Object.defineProperty(out, 'envEdits', { value: edits, enumerable: false });
   if (out && alts.length) Object.defineProperty(out, 'alts', { value: alts, enumerable: false });
+  if (out && chdir !== undefined) Object.defineProperty(out, 'chdir', { value: chdir, enumerable: false });
   return out;
 }
 
@@ -333,9 +337,11 @@ function unwrapSudo(shortVal, longVal) {
       setEnv(env, kv[1], kv[2]);
     }
     if (i >= argv.length) return null;
+    const moved = seen.has('D') || seen.has('--chdir'); // (sudo -D DIR / --chdir: runs the command in DIR, not worked out here: unknown)
     // sudo -s / -i 'string': the string runs through a shell (`sh -c`), it is not a program name
-    if (seen.has('s') || seen.has('i') || seen.has('--shell') || seen.has('--login')) return { argv: ['sh', '-c', argv.slice(i).join(' ')], env };
-    return rest(argv, i, env);
+    const out = seen.has('s') || seen.has('i') || seen.has('--shell') || seen.has('--login') ? { argv: ['sh', '-c', argv.slice(i).join(' ')], env } : rest(argv, i, env);
+    if (out && moved) Object.defineProperty(out, 'chdir', { value: null, enumerable: false });
+    return out;
   };
 }
 
@@ -2892,8 +2898,9 @@ class Parser {
     return w === undefined ? a : [w, ...a.slice(1)];
   }
 
-  process(argv, env, seg, isExec) {
+  process(argv, env, seg, isExec, chdir0 = undefined) {
     let a = this.winFix(argv, seg);
+    let chdir = chdir0; // (a wrapper's -C / --chdir: the directory the command runs in; two of them, or one not readable: null)
     let fan = null; // the xargs / parallel that built this command from stdin text
     const runnerDirs = [];
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
@@ -2909,6 +2916,7 @@ class Parser {
         }
       }
       if (!fan && (base(a[0]) === 'xargs' || base(a[0]) === 'parallel')) fan = a;
+      if (un.chdir !== undefined) chdir = chdir === undefined && typeof un.chdir === 'string' ? un.chdir : null;
       // the other readings of an `env` option not understood (unwrapEnv `alts`), judged too; their environment is unsure (no GH_REPO / GH_HOST
       // is read from it). More than ALT_CAP on one line gives up: truncated, which the guards deny.
       for (const alt of un.alts ?? []) {
@@ -2916,7 +2924,7 @@ class Parser {
         if (this.ctx.envAlts > ALT_CAP) { this.ctx.truncated = true; break; }
         const altEnv = { ...env };
         applyEnvEdits(altEnv, { all: false, removed: [], unsure: true });
-        this.process(alt, altEnv, seg, true);
+        this.process(alt, altEnv, seg, true, chdir);
       }
       applyEnvEdits(env, un.envEdits);
       for (const k of Object.keys(un.env)) {
@@ -2936,6 +2944,7 @@ class Parser {
     const headDyn = a.length > 0 && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'));
     if (headDyn) this.ctx.dynamicHead = true; // (kept apart from the other causes of ctx.dynamic: see dynamicOther in simpleCommands)
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
+    if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
     if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
     if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep);

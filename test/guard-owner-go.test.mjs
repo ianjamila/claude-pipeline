@@ -482,3 +482,18 @@ test('Phase 3b: `env -a NAME` / unknown env options do not hide gh; a moved gh c
   assert.equal(inherited(`env -u GH_CONFIG_DIR gh pr merge 7 ${pin7}`, { GH_CONFIG_DIR: '/home/u/gh' }).decision, 'deny', 'removed: ~/.config/gh instead');
   assert.equal(inherited(`env -i PATH=/usr/bin gh pr merge 7 ${pin7}`, { HOME: '/home/u' }).decision, 'deny', '-i drops HOME too');
 });
+
+// Fable attacker pass (Phase 3b): `env -C DIR` / `sudo -D DIR` run the command in DIR. From a directory that is no chat repository the merge
+// was never checked, while gh merged in the chat repository DIR names.
+test('Phase 3b: a wrapper\'s -C / --chdir / -D directory is where the merge is judged', () => {
+  const pin8 = `--match-head-commit ${H8}`;
+  for (const cmd of [`env -C /chat gh pr merge 8 ${pin8}`, `env -C/chat gh pr merge 8 ${pin8}`, `env --chdir=/chat gh pr merge 8 ${pin8}`, `env --chdir /chat gh pr merge 8 ${pin8}`,
+    `env -iC /chat gh pr merge 8 ${pin8}`, `cd /tmp && env -C ../chat gh pr merge 8 ${pin8}`, `env -C "$D" gh pr merge 8 ${pin8}`, `env -C /chat --frob X gh pr merge 8 ${pin8}`,
+    `sudo -D /chat gh pr merge 8 ${pin8}`, `sudo --chdir=/chat gh pr merge 8 ${pin8}`, `env -C /chat npm run merge -- 8 --expect-head ${H8}`,
+    `env -C /chat env -C . gh pr merge 8 ${pin8}`]) { // (two wrappers: the second -C is relative to the first: unknown)
+    assert.equal(verdict(cmd, '/tmp').decision, 'deny', cmd);
+  }
+  allow(`env -C /chat gh pr merge 7 --match-head-commit ${H7}`, '/tmp'); // (the PR the owner approved)
+  allow(`env -C /tmp gh pr merge 8 ${pin8}`, '/chat'); // (runs outside the chat repository)
+  allow(`env -C /chat gh pr view 8; gh pr merge 8 ${pin8}`, '/tmp'); // (the next command runs in the list's own directory again)
+});
