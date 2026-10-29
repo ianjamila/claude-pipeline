@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { ownerGoWiring } from '../pipeline/hooks/lib/git-wiring.mjs';
+import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
 
 // /chat is an owner_approval: chat repo whose merge command is `npm run merge -- {pr} --expect-head {sha}`; the owner said "merge" for
 // #7 at head H7 only.
@@ -447,4 +448,37 @@ test('Phase 3b: GH_REPO removed by `env -u` / `env -i` / `env -` is not the repo
   assert.equal(inherited(`env -i GH_REPO=o/chat gh pr merge 7 ${pin7}`, '/other', { GH_REPO: 'o/fork', GH_HOST: 'ghe.corp' }).decision, 'allow', '-i took the inherited GH_HOST too');
   // (and a short option group no longer hides gh: `env -iu GH_REPO gh …` runs gh, not a command named GH_REPO)
   assert.equal(verdict(`env -iu GH_REPO gh pr merge 8 --match-head-commit ${H8}`).decision, 'deny');
+});
+
+// Security review of 0a0c013: an `env` option that takes a value (GNU -a / --argv0 NAME), or one the guard does not know, hid the command:
+// `env -a X gh pr merge 8` ran gh while the guard judged a command named X. And a line that moves gh's config directory may leave a
+// sole logged-in enterprise host as gh's default, so -R owner/name or the checkout's remotes no longer name the github.com repository.
+test('Phase 3b: `env -a NAME` / unknown env options do not hide gh; a moved gh config directory names no repository', () => {
+  const pin8 = `--match-head-commit ${H8}`;
+  for (const cmd of [`env -a X gh pr merge 8 ${pin8}`, `env -aX gh pr merge 8 ${pin8}`, `env --argv0 X gh pr merge 8 ${pin8}`, `env --argv0=X gh pr merge 8 ${pin8}`,
+    `env -ia X gh pr merge 8 ${pin8}`, `env --frob X gh pr merge 8 ${pin8}`, `env -Z X gh pr merge 8 ${pin8}`, `env -Zq gh pr merge 8 ${pin8}`,
+    `env --frob X --frob Y gh pr merge 8 ${pin8}`, `env -Z X env --frob Y A=1 gh pr merge 8 ${pin8}`]) {
+    assert.match(deny(cmd).reason, /needs the owner's "merge"|cannot be told/, cmd);
+  }
+  // the reading judged for an unknown option's value has an unsure environment: refused even for the PR the owner approved
+  deny(`env --frob X gh pr merge 7 --match-head-commit ${H7}`);
+  allow(`env -a X gh pr merge 7 --match-head-commit ${H7}`);
+  // more other readings than the cap (6 unknown options: 2^6 readings > 16): the line is too complex to verify, at once (no deadline needed)
+  const sixUnknown = `env ${'--frob '.repeat(6)}X gh pr merge 7 --match-head-commit ${H7}`;
+  assert.equal(simpleCommands(sixUnknown).truncated, true);
+  assert.match(deny(sixUnknown).reason, /too complex/);
+  assert.notEqual(simpleCommands(`env --frob --frob X gh pr merge 7`).truncated, true, '4 readings: judged');
+  // gh's config directory: set, changed or removed by the line → which repository is unknown
+  const pin7 = `--match-head-commit ${H7}`;
+  for (const cmd of [`GH_CONFIG_DIR=/tmp/x gh pr merge 7 ${pin7}`, `XDG_CONFIG_HOME=/tmp/x gh pr merge -R o/chat 7 ${pin7}`, `HOME=/tmp/x gh pr merge 7 ${pin7}`,
+    `export GH_CONFIG_DIR=/tmp/x; gh pr merge 7 ${pin7}`, `env APPDATA=C:/x gh pr merge 7 ${pin7}`, `GH_CONFIG_DIR="$D" gh pr merge 7 ${pin7}`,
+    `[ -n "$Q" ] && export GH_CONFIG_DIR=/tmp/x; gh pr merge 7 ${pin7}`,
+    `GH_CONFIG_DIR=/tmp/x npm run merge -- 7 --expect-head ${H7}`]) {
+    assert.match(deny(cmd).reason, /cannot be told .*gh's config directory/, cmd);
+  }
+  const inherited = (cmd, env) => evaluateGitCommand(cmd, { ...opts('/chat'), env });
+  assert.equal(inherited(`gh pr merge 7 ${pin7}`, { GH_CONFIG_DIR: '/home/u/gh', HOME: '/home/u' }).decision, 'allow', 'the hook\'s own config directory');
+  assert.equal(inherited(`GH_CONFIG_DIR=/home/u/gh gh pr merge 7 ${pin7}`, { GH_CONFIG_DIR: '/home/u/gh' }).decision, 'allow', 'the same value again');
+  assert.equal(inherited(`env -u GH_CONFIG_DIR gh pr merge 7 ${pin7}`, { GH_CONFIG_DIR: '/home/u/gh' }).decision, 'deny', 'removed: ~/.config/gh instead');
+  assert.equal(inherited(`env -i PATH=/usr/bin gh pr merge 7 ${pin7}`, { HOME: '/home/u' }).decision, 'deny', '-i drops HOME too');
 });

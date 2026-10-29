@@ -212,7 +212,8 @@ const plain = (shortVal, longVal) => (argv) => rest(argv, skipOpts(argv, 1, shor
 // the command's env object (not enumerable: the object still lists only what was set) as { all, removed, setAfter, unsure }. A name set by a later
 // `env NAME=v` is back (setAfter); an option this reading does not know may remove anything (unsure). Read it with envUnset.
 const ENV_UNSET = Symbol('envUnset');
-const ENV_LONG = ['ignore-environment', 'null', 'unset', 'chdir', 'split-string', 'block-signal', 'default-signal', 'ignore-signal', 'list-signal-handling', 'debug', 'help', 'version'];
+const ALT_CAP = 16; // other readings of unknown `env` options judged per line (see unwrapEnv)
+const ENV_LONG = ['ignore-environment', 'null', 'unset', 'chdir', 'split-string', 'argv0', 'block-signal', 'default-signal', 'ignore-signal', 'list-signal-handling', 'debug', 'help', 'version'];
 // (GNU getopt takes any unambiguous prefix of a long option: `--uns GH_REPO`, `--ignore-e`)
 const envLong = (name) => (ENV_LONG.includes(name) ? name : (ENV_LONG.filter((o) => o.startsWith(name)).length === 1 ? ENV_LONG.find((o) => o.startsWith(name)) : null));
 // true: the env wrappers in front of the command removed NAME (and none set it again); null: one may have (an option not understood); false: not removed.
@@ -234,10 +235,14 @@ function applyEnvEdits(env, edits) {
   for (const n of edits.removed) { u.removed.add(n); u.setAfter.delete(n); }
   if (edits.unsure) u.unsure = true;
 }
+// (security review of 0a0c013: an option this reading does not know may take the next word as its value, as GNU `-a NAME` / `--argv0 NAME`
+// does, and then the command starts one word later: `env --frob X gh pr merge 7` ran gh while this reading judged a command named X.
+// Each such option adds that other reading, `env` + the words after its value, to `alts` (process judges it too, capped by ALT_CAP).)
 function unwrapEnv(argv) {
   let a = argv;
   const env = {};
   const edits = { all: false, removed: [], unsure: false };
+  const alts = [];
   let i = 1;
   let optsDone = false;
   while (i < a.length) {
@@ -254,11 +259,14 @@ function unwrapEnv(argv) {
         a = [...a.slice(0, i), ...splitArgs(str), ...a.slice(inline === undefined ? i + 2 : i + 1)];
         continue;
       }
-      const valued = name === 'unset' || name === 'chdir';
+      const valued = name === 'unset' || name === 'chdir' || name === 'argv0';
       const value = valued ? inline ?? a[i + 1] : undefined;
       if (name === 'ignore-environment') edits.all = true;
       else if (name === 'unset') edits.removed.push(value ?? '');
-      else if (name === null) edits.unsure = true;
+      else if (name === null) {
+        edits.unsure = true;
+        if (inline === undefined && i + 2 < a.length) alts.push(['env', ...a.slice(i + 2)]);
+      }
       i += valued && inline === undefined ? 2 : 1;
       continue;
     }
@@ -270,7 +278,7 @@ function unwrapEnv(argv) {
         const c = t[k];
         if (c === 'i') { edits.all = true; continue; }
         if (c === '0' || c === 'v') continue;
-        if (c === 'u' || c === 'C' || c === 'P' || c === 'S') {
+        if (c === 'u' || c === 'C' || c === 'P' || c === 'S' || c === 'a') {
           const glued = t.slice(k + 1);
           const value = glued !== '' ? glued : a[i + 1];
           if (glued === '') step = 2;
@@ -279,6 +287,9 @@ function unwrapEnv(argv) {
           break;
         }
         edits.unsure = true;
+        // (unknown: it may take the rest of this word, or the next word when it is the last letter, as its value)
+        const after = k === t.length - 1 ? i + 2 : i + 1;
+        if (after < a.length) alts.push(['env', ...a.slice(after)]);
       }
       if (split !== null) {
         // -S "git push -f": the string is split into words and becomes the command line
@@ -295,6 +306,7 @@ function unwrapEnv(argv) {
   }
   const out = rest(a, i, env);
   if (out && (edits.all || edits.removed.length || edits.unsure)) Object.defineProperty(out, 'envEdits', { value: edits, enumerable: false });
+  if (out && alts.length) Object.defineProperty(out, 'alts', { value: alts, enumerable: false });
   return out;
 }
 
@@ -2897,6 +2909,15 @@ class Parser {
         }
       }
       if (!fan && (base(a[0]) === 'xargs' || base(a[0]) === 'parallel')) fan = a;
+      // the other readings of an `env` option not understood (unwrapEnv `alts`), judged too; their environment is unsure (no GH_REPO / GH_HOST
+      // is read from it). More than ALT_CAP on one line gives up: truncated, which the guards deny.
+      for (const alt of un.alts ?? []) {
+        this.ctx.envAlts = (this.ctx.envAlts ?? 0) + 1;
+        if (this.ctx.envAlts > ALT_CAP) { this.ctx.truncated = true; break; }
+        const altEnv = { ...env };
+        applyEnvEdits(altEnv, { all: false, removed: [], unsure: true });
+        this.process(alt, altEnv, seg, true);
+      }
       applyEnvEdits(env, un.envEdits);
       for (const k of Object.keys(un.env)) {
         setEnv(env, k, un.env[k]);

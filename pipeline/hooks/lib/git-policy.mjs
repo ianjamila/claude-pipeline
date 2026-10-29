@@ -941,11 +941,19 @@ function ghEnvValue(env, ctx, name, unset = envUnset(env, name)) {
   if (Object.hasOwn(ctx.vars, name)) return ctx.vars[name];
   return ctx.env?.[name];
 }
+const GH_CONFIG_NAMES = ['GH_CONFIG_DIR', 'XDG_CONFIG_HOME', 'APPDATA', 'AppData', 'HOME'];
 // Phase 3b: the repository a GH_REPO points gh at: undefined when none is set (or it is empty), null when it is set to something
 // that cannot be read. Also null whenever GH_HOST is (or may be) set to a host other than github.com: gh then reads -R owner/name,
 // GH_REPO and the checkout's remotes on that host, and the owner's "merge" names a repository on github.com.
 // `envOf`: the command whose `env` wrappers may have removed either variable (when `env` holds only values already in ctx.vars).
+// (security review of fe5a82d: gh reads its hosts — the default one too — from its config directory: GH_CONFIG_DIR, else XDG_CONFIG_HOME/gh,
+// else %AppData%/GitHub CLI on Windows, else ~/.config/gh. A line that points gh at another one (sets, changes or removes any of these)
+// may leave a sole logged-in enterprise host as the default: null, as for GH_HOST.)
 function ghRepoEnvSlug(env, ctx, envOf = env) {
+  for (const name of GH_CONFIG_NAMES) {
+    const v = ghEnvValue(env, ctx, name, envUnset(envOf, name));
+    if (v === null || (v ?? '') !== (ctx.env?.[name] ?? '')) return null;
+  }
   const host = ghEnvValue(env, ctx, 'GH_HOST', envUnset(envOf, 'GH_HOST'));
   if (host === null || (typeof host === 'string' && host !== '' && host.trim().toLowerCase() !== 'github.com')) return null;
   const value = ghEnvValue(env, ctx, 'GH_REPO', envUnset(envOf, 'GH_REPO'));
@@ -970,7 +978,7 @@ function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag
   if (repo === undefined) {
     try { repo = dir === null ? null : ctx.ownerGo.repoOf(dir) ?? null; } catch { repo = null; }
   }
-  if (!repo) return deny(`${what} #${pr}: which repository it merges in cannot be told (the checkout's remotes name none, several or one off github.com; -R / a PR URL / GH_REPO is built at run time, disagrees or names a host other than github.com; or GH_HOST is set), and the owner's "merge" names its repository. Name it with -R owner/name, or ${via[0].toLowerCase()}${via.slice(1)}`);
+  if (!repo) return deny(`${what} #${pr}: which repository it merges in cannot be told (the checkout's remotes name none, several or one off github.com; -R / a PR URL / GH_REPO is built at run time, disagrees or names a host other than github.com; or GH_HOST is set, or the line moves gh's config directory: GH_CONFIG_DIR, XDG_CONFIG_HOME, APPDATA, HOME), and the owner's "merge" names its repository. Name it with -R owner/name, or ${via[0].toLowerCase()}${via.slice(1)}`);
   let ok = false;
   try {
     ok = ctx.ownerGo.approvedHead(pr, head, repo) === true;
