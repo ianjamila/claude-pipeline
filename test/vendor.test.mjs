@@ -10,7 +10,7 @@ import { run as vendor, meta, vendorDrift } from '../pipeline/commands/vendor.mj
 import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const LIBS = ['proc', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance'];
+const LIBS = ['proc', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker'];
 const ENTRIES = ['ci-guard', 'ci-guards-run', 'stop-verify', 'smoke', 'supabase-local'];
 
 const vendorInto = (dir, extra = []) => vendor(['--repo', dir, ...extra], { cwd: dir, env: process.env });
@@ -32,6 +32,7 @@ test('vendor copies libs, js-yaml, entry scripts byte-for-byte and stamps VERSIO
     'scripts/pipeline/VERSION',
   ];
   assert.deepEqual([...r.output.files].sort(), expected.sort());
+  assert.ok(r.output.files.includes('scripts/pipeline/lib/review-marker.mjs'), 'the review-marker lib ships to projects (the guards workflow reads the review comment with it)');
 
   for (const n of LIBS) {
     assert.equal(readFileSync(join(sp(repo.dir), 'lib', `${n}.mjs`), 'utf8'), readFileSync(join(root, 'pipeline', 'lib', `${n}.mjs`), 'utf8'));

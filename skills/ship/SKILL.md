@@ -422,7 +422,8 @@ the owner's next move.
 6. Continue: `build` ⇒ Step 2 with the unfinished tasks from `record.tasks`; `verify` ⇒ Step 2.2; `review` ⇒ Step 4
    from the first incomplete round (`P state discard-round` for an unpublished one); `followups` ⇒ `P followups create
    --round R`, re-post the triage comment, then Step 5; `gate` ⇒ Step 5.
-7. After a clean review, `P review-complete --pr N` removes `awaiting-review` (exit 1 ⇒ the review is not valid for
+7. After a clean review, `P review-complete --pr N` removes `awaiting-review` and, on a ready PR, nudges the guards so
+   `Cross-model review` is re-judged (`recheck: failed` ⇒ add and remove any label by hand) (exit 1 ⇒ the review is not valid for
    this head: run another round). Every route that reaches Step 5 ends at the plan's `stop` (invariant 9), with its
    `P summary --outcome awaiting-owner-merge` (chat) or `needs-human` (label), see **Owner-merge approval** "Resumed runs". Step 6
    runs only after the owner says "merge" for the head the gate covered, and then with `--owner-approved-head <sha> --owner-approved-items <ownerItems>`.

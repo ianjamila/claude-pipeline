@@ -3,9 +3,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { cli, scenario, named, assertOnlyFails, ymlFor, MERGE_SHA, PREVIEW_URL } from './helpers/gate-env.mjs';
+import { cli, scenario, named, assertOnlyFails, ymlFor, MERGE_SHA, PREVIEW_URL, PR } from './helpers/gate-env.mjs';
 import { pipelineYml } from './helpers/fakegh-env.mjs';
 import { verdictArtifactName } from '../pipeline/lib/guard-provenance.mjs';
+import { ciCheck } from '../pipeline/lib/finalgate.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 
 // ---- final-gate: ci -------------------------------------------------------------------------------
@@ -50,9 +51,10 @@ const BOT = 'github-actions[bot]';
 // and the artifacts of that run (default: the verdict a genuine run records, both checks success; `artifacts` is a function of the
 // head returning names). The final gate reads the status itself (not the row's link), so a status can be wrong in any of these ways.
 // `required`: what GitHub itself requires (default: the same rows as all checks); `named`: extra ci.required_checks of the config.
-const genuineVerdict = (head, states = ['success', 'success']) => verdictArtifactName({ head, integrity: states[0], hardstops: states[1] });
-const guardScenario = ({ context = 'Hard-stop scan', run = {}, prs, compare = 'ahead', link = GUARD_LINK, by = BOT, state = 'success', at = '2026-10-01T10:05:00Z', runFails = false, noStatus = false, artifacts = (h) => [genuineVerdict(h)], artifactsFail = false, required, named: extraNamed } = {}) => scenario({
-  ...(extraNamed ? { yml: ymlFor().replace('required_checks: [ci]', `required_checks: [${extraNamed.join(', ')}]`) } : {}),
+// `review`: the run's state for the Cross-model review check (success | failure | error | off).
+const genuineVerdict = (head, states = ['success', 'success'], review = 'success') => verdictArtifactName({ head, integrity: states[0], hardstops: states[1], review });
+const guardScenario = ({ context = 'Hard-stop scan', run = {}, prs, compare = 'ahead', link = GUARD_LINK, by = BOT, state = 'success', at = '2026-10-01T10:05:00Z', runFails = false, noStatus = false, artifacts = (h) => [genuineVerdict(h)], artifactsFail = false, required, named: extraNamed, yml: ownYml } = {}) => scenario({
+  ...(ownYml ? { yml: ownYml } : extraNamed ? { yml: ymlFor().replace('required_checks: [ci]', `required_checks: [${extraNamed.join(', ')}]`) } : {}),
   gh: {
     ci: [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }, { name: context, state: 'SUCCESS', bucket: 'pass', link: GUARD_LINK }],
     ...(required ? { requiredCi: required } : {}),
@@ -150,6 +152,95 @@ test('final-gate: a guard row GitHub does not require but the config names is st
   // a guard row that is only in the full list and needed by nobody is not looked up (no requirement names it)
   const unneeded = guardScenario({ required, by: 'mallory' }).gate();
   assert.equal(unneeded.code, 0, JSON.stringify(unneeded.json?.checks.filter((c) => !c.ok)));
+});
+
+// ---- final-gate: the Cross-model review status (ci.review_check) ------------------------------------
+
+const REVIEW = 'Cross-model review';
+const REVIEW_REFUSED = /guard status not posted by the pipeline-guards workflow: Cross-model review/;
+// ci.review_check on (with the guard checks it depends on); the row under test is the Cross-model review one.
+const reviewYml = ymlFor().replace('guard_checks: false', 'guard_checks: true\n  review_check: true');
+const reviewScenario = (over = {}) => guardScenario({ context: REVIEW, yml: reviewYml, ...over });
+
+test('final-gate: with ci.review_check the Cross-model review status is required; a missing row fails ci and names it', () => {
+  const s = scenario({ yml: reviewYml, gh: { requiredCi: 'error', ci: [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }] } });
+  const r = s.gate();
+  assert.equal(r.code, 1, `${r.stderr}${r.stdout}`);
+  assert.ok(r.json.failed.includes('ci'), JSON.stringify(r.json.failed));
+  assert.match(named(r.json, 'ci').detail, /required check\(s\) missing: Cross-model review/);
+  // the same repo with review_check off does not name it
+  const off = scenario({ gh: { requiredCi: 'error', ci: [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }] } }).gate();
+  assertExit(off, 0, JSON.stringify(off.json?.checks.filter((c) => !c.ok)));
+});
+
+test('ciCheck: names the review status as required only with review_check AND guard_checks', () => {
+  const diff = () => ({ ok: true, files: [{ path: 'src/app.js', status: 'M', binary: false, added: [], removed: [] }] });
+  const rows = [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }];
+  const gh = { checks: () => rows };
+  const run = (ci) => ciCheck({ gh, pr: PR, head: 'a'.repeat(40), diff, config: { ci }, explicitEmpty: false });
+  const on = run({ required_checks: ['ci'], guard_checks: true, review_check: true });
+  assert.equal(on.ok, false);
+  assert.match(on.detail, /required check\(s\) missing: Cross-model review/);
+  assert.equal(run({ required_checks: ['ci'], guard_checks: true, review_check: false }).ok, true);
+  assert.equal(run({ required_checks: ['ci'], guard_checks: false, review_check: true }).ok, true, 'no guards workflow, nothing posts it');
+});
+
+test('final-gate: a Cross-model review status posted by the real workflow for THIS PR and head, with a v2 success verdict, is accepted', () => {
+  const s = reviewScenario();
+  const r = s.gate();
+  assertExit(r, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
+});
+
+test('final-gate: a forged Cross-model review status (wrong creator, link, run, or no genuine verdict artifact) fails ci as forged', () => {
+  const forged = [
+    reviewScenario({ by: 'mallory' }),
+    reviewScenario({ link: 'https://github.com/evil/widgets/actions/runs/55' }),
+    reviewScenario({ link: '' }),
+    reviewScenario({ run: { path: '.github/workflows/evil.yml@refs/heads/x' } }),
+    reviewScenario({ noStatus: true }),
+    reviewScenario({ state: 'failure' }),
+    reviewScenario({ runFails: true }),
+    // the run's own verdict: review failure / error / off, no artifact at all, an artifact for another head, an unreadable list
+    reviewScenario({ artifacts: (h) => [genuineVerdict(h, ['success', 'success'], 'failure')] }),
+    reviewScenario({ artifacts: (h) => [genuineVerdict(h, ['success', 'success'], 'error')] }),
+    reviewScenario({ artifacts: (h) => [genuineVerdict(h, ['success', 'success'], 'off')] }),
+    reviewScenario({ artifacts: () => [] }),
+    reviewScenario({ artifacts: () => [genuineVerdict('e'.repeat(40))] }),
+    reviewScenario({ artifactsFail: true }),
+    // a v1 artifact (guards from before the review status) backs the two older statuses, never this one
+    reviewScenario({ artifacts: (h) => [`pipeline-verdict_v1_${h}_success_success`] }),
+    reviewScenario({ artifacts: (h) => [genuineVerdict(h), genuineVerdict(h, ['success', 'success'], 'failure')] }),
+  ];
+  for (const s of forged) {
+    const r = s.gate();
+    assert.equal(r.code, 1, `${r.stderr}${r.stdout}`);
+    assert.match(named(r.json, 'ci').detail, REVIEW_REFUSED);
+  }
+});
+
+test('final-gate: a v1 artifact still backs a guard status (Hard-stop scan), so an older guards run is not refused for that', () => {
+  const r = guardScenario({ artifacts: (h) => [`pipeline-verdict_v1_${h}_success_success`] }).gate();
+  assert.equal(r.code, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
+});
+
+test('final-gate: with review_check OFF a Cross-model review row that is required anyway is still provenance-checked', () => {
+  // ci.required_checks names it (guard_checks / review_check stay off): the row is believed only with its provenance
+  const configured = ['ci', '"Cross-model review"'];
+  const genuine = guardScenario({ context: REVIEW, named: configured }).gate();
+  assert.equal(genuine.code, 0, JSON.stringify(genuine.json?.checks.filter((c) => !c.ok)));
+  for (const s of [
+    guardScenario({ context: REVIEW, named: configured, by: 'mallory' }),
+    guardScenario({ context: REVIEW, named: configured, link: 'https://github.com/evil/widgets/actions/runs/55' }),
+    guardScenario({ context: REVIEW, named: configured, artifacts: () => [] }),
+    guardScenario({ context: REVIEW, named: configured, artifacts: (h) => [genuineVerdict(h, ['success', 'success'], 'off')] }),
+  ]) {
+    const r = s.gate();
+    assert.equal(r.code, 1, `${r.stderr}${r.stdout}`);
+    assert.match(named(r.json, 'ci').detail, REVIEW_REFUSED);
+  }
+  // required by GitHub only (not named by the config) and passing in the rows: still looked up, so a forged one fails
+  const gitHubRequired = guardScenario({ context: REVIEW, by: 'mallory' });
+  assert.equal(gitHubRequired.gate().code, 1, 'a forged review row GitHub itself requires is refused');
 });
 
 test('final-gate: non-guard checks need no provenance (their rows are never looked up)', () => {

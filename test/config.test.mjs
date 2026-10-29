@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
-import { DEFAULTS, GUARD_CHECKS, requiredChecks, stopHookTimeoutWarning, validateConfig, loadConfig, fill } from '../pipeline/lib/config.mjs';
+import { REVIEW_CONTEXT } from '../pipeline/lib/review-marker.mjs';
+import { DEFAULTS, GUARD_CHECKS, PROVENANCE_CHECKS, REVIEW_CHECK, requiredChecks, stopHookTimeoutWarning, validateConfig, loadConfig, fill } from '../pipeline/lib/config.mjs';
 import { MAX_PROOFS, MAX_PROOF_STEP, normaliseProofs, proofsProblem } from '../pipeline/lib/run-record.mjs';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
@@ -646,6 +647,40 @@ test('required_checks that omit the guard contexts WARN (not fail); guard_checks
   assert.deepEqual(validateConfig({ ...minimal(), ci: { required_checks: ['Test integrity', 'Hard-stop scan', 'build'] } }).warnings, []);
   assert.deepEqual(validateConfig({ ...minimal(), ci: { required_checks: ['build'], guard_checks: false } }).warnings, []);
   assert.match(validateConfig({ ...minimal(), ci: { required_checks: ['Test integrity'] } }).warnings[0], /"Hard-stop scan"/);
+});
+
+test('ci.review_check defaults to false, must be a boolean, and needs ci.guard_checks', () => {
+  assert.equal(DEFAULTS.ci.review_check, false);
+  assert.equal(validateConfig(minimal()).config.ci.review_check, false);
+  assert.equal(validateConfig({ ...minimal(), ci: { review_check: true } }).ok, true);
+  assert.equal(validateConfig({ ...minimal(), ci: { review_check: false, guard_checks: false } }).ok, true);
+  for (const bad of ['yes', 1, 0, null, []]) {
+    const r = validateConfig({ ...minimal(), ci: { review_check: bad } });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'ci.review_check must be a boolean'), JSON.stringify(bad));
+  }
+  const needs = validateConfig({ ...minimal(), ci: { review_check: true, guard_checks: false } });
+  assert.equal(needs.ok, false);
+  assert.ok(has(needs, 'guard_checks'));
+  assert.ok(has(needs, 'ci.review_check needs ci.guard_checks'));
+});
+
+test('requiredChecks adds Cross-model review only with review_check on and guard_checks not false, after configured and guard checks', () => {
+  assert.equal(REVIEW_CHECK, 'Cross-model review');
+  assert.equal(REVIEW_CHECK, REVIEW_CONTEXT, 'config.mjs and review-marker.mjs name the same status');
+  assert.deepEqual(requiredChecks({ required_checks: ['build'], guard_checks: true, review_check: true }), ['build', 'Test integrity', 'Hard-stop scan', 'Cross-model review']);
+  assert.deepEqual(requiredChecks({ required_checks: [], guard_checks: true, review_check: true }), ['Test integrity', 'Hard-stop scan', 'Cross-model review']);
+  assert.deepEqual(requiredChecks({ required_checks: ['build'], guard_checks: true, review_check: false }), ['build', 'Test integrity', 'Hard-stop scan']);
+  assert.deepEqual(requiredChecks({ required_checks: ['build'], guard_checks: true }), ['build', 'Test integrity', 'Hard-stop scan']);
+  assert.deepEqual(requiredChecks({ required_checks: ['build'], guard_checks: false, review_check: true }), ['build'], 'no guards workflow, no review status');
+  // deduped: listing it yourself does not repeat it, and the configured position wins
+  assert.deepEqual(requiredChecks({ required_checks: ['Cross-model review', 'build'], guard_checks: true, review_check: true }), ['Cross-model review', 'build', 'Test integrity', 'Hard-stop scan']);
+  assert.deepEqual(requiredChecks(validateConfig({ ...minimal(), ci: { review_check: true } }).config.ci), ['Test integrity', 'Hard-stop scan', 'Cross-model review']);
+});
+
+test('PROVENANCE_CHECKS is the two guard checks plus the review check', () => {
+  assert.deepEqual([...PROVENANCE_CHECKS], [...GUARD_CHECKS, 'Cross-model review']);
+  assert.deepEqual([...PROVENANCE_CHECKS], ['Test integrity', 'Hard-stop scan', 'Cross-model review']);
 });
 
 test('ci.approvers: defaults to [], accepts GitHub logins (incl. bots), rejects anything else', () => {

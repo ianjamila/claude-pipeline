@@ -1429,6 +1429,79 @@ test('review-complete: posts the marker comment with {contentHash, base, head, r
   assertExit(again, 0, again.stdout);
   assert.deepEqual([again.json.reused, again.json.comment], [true, { id: 77, url: 'u77' }]);
   assert.equal(postedBodies(w).length, 1);
+
+  // Codex review of 4c595df: only what the guard workflow would judge is reused. Our identical comment that was edited (even back
+  // to this text), or one with a newer marker comment of anyone after it, is not: a new comment is posted.
+  const view = GH.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { baseRefName: 'main', headRefOid: w.head, ...e.stdoutJson } } : e));
+  const POST = { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 90, html_url: 'u90' } };
+  for (const comments of [
+    [{ id: 77, user: { login: 'me' }, body, html_url: 'u77', created_at: '2026-10-29T00:00:00Z', updated_at: '2026-10-29T01:00:00Z' }],
+    [{ id: 77, user: { login: 'me' }, body, html_url: 'u77' }, { id: 78, user: { login: 'mallory' }, body: `${body}\nx`, html_url: 'u78' }],
+  ]) {
+    const before = postedBodies(w).length;
+    w.fake.setScript([...view, REMOVE_LABEL, { match: '^api user', stdout: 'me\n' }, { match: 'issues/7/comments --paginate', stdoutJson: comments }, POST]);
+    const fresh = w.cli(['review-complete', '--pr', '7']);
+    assertExit(fresh, 0, fresh.stdout);
+    assert.deepEqual([fresh.json.posted, fresh.json.reused, fresh.json.comment], [true, undefined, { id: 90, url: 'u90' }], JSON.stringify(comments));
+    assert.equal(postedBodies(w).length, before + 1);
+  }
+});
+
+// The recheck nudge: a ready PR gets no event from a comment, so review-complete adds and removes `pipeline-recheck`.
+const RECHECK_ADD = 'pr edit 7 --add-label pipeline-recheck';
+const RECHECK_REMOVE = 'pr edit 7 --remove-label pipeline-recheck';
+const RECHECK_OK = [{ match: '^pr edit 7 --add-label pipeline-recheck', code: 0 }, { match: '^pr edit 7 --remove-label pipeline-recheck', code: 0 }];
+// The PR as the first look (headRefOid, isDraft, labels) sees it; the read-back after removing awaiting-review is a later, separate look.
+const PR_VIEW_AFTER = { match: '^pr view 7 --json labels', stdoutJson: { labels: [] } };
+const gotPr = (view) => GH.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { ...e.stdoutJson, ...view } } : e));
+
+test('review-complete recheck: a ready PR without awaiting-review gets pipeline-recheck added, then removed (recheck triggered)', (t) => {
+  const w = world(t, { gh: [PR_VIEW_AFTER, ...gotPr({ isDraft: false, labels: [{ name: 'agent-build' }] }), REMOVE_LABEL, ...RECHECK_OK, ...REVIEW_COMMENT] });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.recheck, 'triggered');
+  assert.equal(r.json.recheckError, undefined);
+  const edits = w.fake.lines().filter((l) => l.startsWith('pr edit'));
+  assert.deepEqual(edits, ['pr edit 7 --remove-label awaiting-review', RECHECK_ADD, RECHECK_REMOVE]);
+});
+
+test('review-complete recheck: a ready PR that had awaiting-review needs no nudge (the unlabel fired the event): recheck label-removed', (t) => {
+  const w = world(t, { gh: [PR_VIEW_AFTER, ...gotPr({ isDraft: false, labels: [{ name: 'awaiting-review' }] }), REMOVE_LABEL, ...RECHECK_OK, ...REVIEW_COMMENT] });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.recheck, 'label-removed');
+  const edits = w.fake.lines().filter((l) => l.startsWith('pr edit'));
+  assert.deepEqual(edits, ['pr edit 7 --remove-label awaiting-review']);
+});
+
+test('review-complete recheck: a draft gets its run when it is marked ready (recheck on-ready), no pipeline-recheck label', (t) => {
+  for (const labels of [[], [{ name: 'awaiting-review' }]]) {
+    const w = world(t, { gh: [PR_VIEW_AFTER, ...gotPr({ isDraft: true, labels }), REMOVE_LABEL, ...RECHECK_OK, ...REVIEW_COMMENT] });
+    assertExit(w.codex(1, findingsOf()), 0);
+    const r = w.cli(['review-complete', '--pr', '7']);
+    assertExit(r, 0, r.stderr + r.stdout);
+    assert.equal(r.json.recheck, 'on-ready');
+    assert.ok(!w.fake.lines().includes(RECHECK_ADD), 'no label added to a draft');
+  }
+});
+
+test('review-complete recheck: a failed nudge never undoes the posted comment: exit 0, recheck failed, recheckError names `P labels`', (t) => {
+  const w = world(t, {
+    gh: [PR_VIEW_AFTER, ...gotPr({ isDraft: false, labels: [] }), REMOVE_LABEL, { match: '^pr edit 7 --add-label pipeline-recheck', code: 1, stderr: "could not add label: 'pipeline-recheck' not found" }, ...RECHECK_OK, ...REVIEW_COMMENT],
+  });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.posted, true);
+  assert.equal(r.json.removed, true);
+  assert.equal(r.json.recheck, 'failed');
+  assert.match(r.json.recheckError, /P labels/);
+  assert.ok(w.fake.lines().includes(RECHECK_ADD));
+  assert.ok(!w.fake.lines().includes(RECHECK_REMOVE), 'no remove after a failed add');
+  assert.equal(postedBodies(w).length, 1, 'the review-complete comment stays');
 });
 
 // A world whose only change is to a path the config sends to Fable every round, at low risk.

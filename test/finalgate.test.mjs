@@ -179,8 +179,11 @@ test('gateRefusals: the gate must name the repo it is being merged in', () => {
   assert.match(refusals(goodGate(), { repo: undefined }).join(), /could not determine the repo/);
 });
 
-test('gateRefusals: age limit is 30 minutes; a missing, bad or future timestamp is refused', () => {
+test('gateRefusals: age limit is 24 hours; a missing, bad or future timestamp is refused', () => {
   const at = (msAgo) => new Date(NOW - msAgo).toISOString();
+  assert.equal(GATE_MAX_AGE_MS, 24 * 3_600_000);
+  assert.deepEqual(refusals(goodGate({ at: at(23 * 3_600_000) })), [], 'a 23 hour old gate is accepted');
+  assert.match(refusals(goodGate({ at: at(25 * 3_600_000) })).join(), /1500 minutes old \(limit 1440\)/, 'a 25 hour old gate is refused');
   assert.deepEqual(refusals(goodGate({ at: at(GATE_MAX_AGE_MS - 1000) })), []);
   assert.match(refusals(goodGate({ at: at(GATE_MAX_AGE_MS + 60_000) })).join(), /minutes old/);
   assert.match(refusals(goodGate({ at: undefined })).join(), /no valid timestamp/);

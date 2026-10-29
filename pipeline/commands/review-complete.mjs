@@ -4,6 +4,10 @@
 // which is what marks the PR as reviewed (the review instructions mark the PR ready only after it exists; the guard
 // workflow will check it against the head). It also ends a Codex outage: `awaiting-review` comes off the PR once the
 // review is valid. Anything less posts nothing and keeps the label.
+// The guard workflow judges the comment on its next run. A draft gets one when it is marked ready; a PR that is ready
+// already (a re-review after a push) gets no event from a comment, so the command adds and removes the label
+// `pipeline-recheck` (a labeling event starts the guards; nothing else listens to it). Best effort: a failed nudge is
+// reported (recheck: 'failed') and never undoes the posted comment.
 import { createHash } from 'node:crypto';
 import { EXIT, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
@@ -12,12 +16,13 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, reviewLane } from '../lib/risk.mjs';
 import { loadState } from '../lib/state.mjs';
 import { reviewValidFor, roundOutcome } from '../lib/triage.mjs';
+import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
 import { currentContentHash, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'post the review-complete comment (and remove awaiting-review) once the review is valid for the current content',
   usage: [
-    'pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed}; exit 1 {ok:false, reason} when the review is not valid',
+    'pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?}; exit 1 {ok:false, reason} when the review is not valid',
     '  the checked-out HEAD must be the head GitHub holds for the PR; the PR must have had every Fable pass its risk or paths need',
     `  the comment starts with the line ${'`<!-- claude-pipeline:review-complete v1 -->`'} and carries the JSON {contentHash, base, head, rounds, codexModel, modelProofDigest}`,
     '  (base = the merge base the content hash is measured from; modelProofDigest = sha256 of the Fable model proofs, null when no Fable pass ran);',
@@ -26,7 +31,8 @@ export const meta = {
 };
 
 export const AWAITING_REVIEW = 'awaiting-review';
-export const REVIEW_COMPLETE_MARKER = '<!-- claude-pipeline:review-complete v1 -->';
+export { REVIEW_COMPLETE_MARKER };
+export const RECHECK_LABEL = 'pipeline-recheck';
 const LEVELS = ['low', 'medium', 'high'];
 
 // Why the review is not valid, in words a person can act on.
@@ -108,7 +114,8 @@ export const run = guarded(async (argv, ctx) => {
       // The review covers the content of the local checkout; the comment and the label are on the PR GitHub holds. They
       // must be the same commit, or the review of one would be used to vouch for the other.
       const local = headSha({ cwd: root });
-      const remote = gh.prView(pr, ['headRefOid']).headRefOid;
+      const view = gh.prView(pr, ['headRefOid', 'isDraft', 'labels']);
+      const remote = view.headRefOid;
       if (remote !== local) {
         return {
           exitCode: EXIT.FAILED,
@@ -128,12 +135,16 @@ export const run = guarded(async (argv, ctx) => {
       });
       const body = reviewCompleteBody(record);
       // Retrying after a crash must not stack identical comments: our own latest marker comment with this exact body stands.
+      // It must also be what the guard workflow will judge (lib/review-marker.mjs#latestReviewComment): the newest marker comment
+      // of ANY author, and never edited — an edited one, even if edited back to this text, fails there forever (Codex review of
+      // 4c595df). Otherwise a new comment is posted.
       const me = gh.viewer();
       const latest = gh.listComments(pr)
-        .filter((c) => typeof c.body === 'string' && c.body.startsWith(REVIEW_COMPLETE_MARKER) && c.user?.login === me)
+        .filter((c) => typeof c.body === 'string' && c.body.startsWith(REVIEW_COMPLETE_MARKER))
         .sort((a, b) => Number(a.id) - Number(b.id))
         .at(-1);
-      const reused = latest !== undefined && latest.body.trim() === body.trim();
+      const reused = latest !== undefined && latest.user?.login === me && latest.body.trim() === body.trim()
+        && String(latest.updated_at ?? '') === String(latest.created_at ?? '');
       const comment = reused ? { id: latest.id, url: latest.html_url ?? null } : gh.createComment(pr, body);
 
       gh.removeLabels(pr, [AWAITING_REVIEW]);
@@ -144,9 +155,25 @@ export const run = guarded(async (argv, ctx) => {
           output: { ok: false, unavailable: true, reason: 'label-not-removed', message: `${AWAITING_REVIEW} is still on PR #${pr} after removing it`, pr, comment },
         };
       }
+      // Removing awaiting-review already fired an `unlabeled` event; a draft gets its run when it is marked ready.
+      const hadAwaiting = (Array.isArray(view.labels) ? view.labels : []).some((l) => (typeof l === 'string' ? l : l?.name) === AWAITING_REVIEW);
+      let recheck = view.isDraft === false ? (hadAwaiting ? 'label-removed' : 'triggered') : 'on-ready';
+      let recheckError = null;
+      if (recheck === 'triggered') {
+        try {
+          gh.addLabels(pr, [RECHECK_LABEL]);
+          gh.removeLabels(pr, [RECHECK_LABEL]);
+        } catch (err) {
+          recheck = 'failed';
+          recheckError = `${String(err?.message ?? err).split('\n')[0].slice(0, 160)}; run \`P labels\` (creates ${RECHECK_LABEL}), or add and remove any label, so the guards post Cross-model review`;
+        }
+      }
       return {
         exitCode: EXIT.OK,
-        output: { ok: true, ...(reused ? { reused: true } : { posted: true }), comment, review: record, removed: true, pr, currentContentHash: hash },
+        output: {
+          ok: true, ...(reused ? { reused: true } : { posted: true }), comment, review: record, removed: true, recheck,
+          ...(recheckError ? { recheckError } : {}), pr, currentContentHash: hash,
+        },
       };
     });
   });

@@ -10,7 +10,7 @@
 //    gate), for normal and resumed runs alike. The flags alone are the agent's word and refuse.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { approvalFlags, mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { cli, scenario, ymlFor, ghEntries, PR } from './helpers/gate-env.mjs';
@@ -208,4 +208,109 @@ test('chat mode, hard-stop PR: items that changed after the owner\'s "merge" (sa
   assert.equal(r.json.error, 'pre-merge');
   assert.match(r.json.reason, /the owner items changed since the owner said "merge"/);
   assert.deepEqual(s.mergeCalls(), []);
+});
+
+// ---- `P merge --owner-go`: work that never ran ship merges on the owner's recorded "merge" alone (items none) -----------------
+// Only the owner-go record, the live PR state and the required checks gate it; there is no final-gate.json and no verify evidence.
+const goYml = (opts = {}) => ymlFor(opts).replace('{pr} {sha}', '{pr} --match-head-commit {sha}');
+const goScenario = (opts = {}) => scenario({ yml: goYml(opts.yml), ...opts.rest, gh: opts.gh, report: null, state: null });
+const goMerge = (s, extra = []) => mergeWith(s, ['--owner-go', ...extra]);
+const reviewFiles = (s) => (existsSync(join(s.repo.dir, '.review')) ? readdirSync(join(s.repo.dir, '.review')) : []);
+
+test('--owner-go: no owner "merge" recorded refuses with error owner-go and runs no merge command', () => {
+  const s = goScenario();
+  const r = goMerge(s);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'owner-go');
+  assert.match(r.json.reason, /no owner "merge" is recorded for #\d+ head [0-9a-f]{12} items none/);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('--owner-go: a recorded "merge" for this PR, the local HEAD and items none merges, pinned to the full head, writing nothing', (t) => {
+  const s = goScenario();
+  ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'));
+  const r = goMerge(s);
+  assertExit(r, 0);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.merged, true);
+  assert.equal(r.json.mode, 'owner-go');
+  assert.equal(r.json.head, s.head);
+  assert.equal(r.json.mergeSha, 'c'.repeat(40));
+  assert.equal('prodBefore' in r.json, false);
+  assert.deepEqual(s.mergeCalls(), [`${PR} --match-head-commit ${s.head}`]);
+  // no gate file, no prod-before record (neither a file nor an event comment)
+  assert.equal(reviewFiles(s).includes('final-gate.json'), false, reviewFiles(s).join(','));
+  assert.equal(reviewFiles(s).some((f) => /prod-before/.test(f)), false);
+  assert.equal(s.fake.lines().some((l) => /prod-before/.test(l) || /issues\/12\/comments/.test(l) && /-X POST/.test(l)), false, s.fake.lines().join('\n'));
+  assert.equal(r.json.warnings, undefined, 'no production configured: no prod-before warning');
+});
+
+test('--owner-go: a "merge" for another head, other items, another PR or that is not an approval refuses with owner-go', (t) => {
+  const s = goScenario();
+  ownerSays(t, 'merge', mergeRequest(PR, OLD, 'none')); // (an older head)
+  ownerSays(t, 'merge', mergeRequest(PR, s.head, 'f'.repeat(12))); // (items other than none)
+  ownerSays(t, 'merge', mergeRequest(PR + 1, s.head, 'none')); // (another PR)
+  ownerSays(t, 'do not merge', mergeRequest(PR, s.head, 'none'));
+  const r = goMerge(s);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'owner-go');
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('--owner-go: the live PR must be ready: behind base, a draft, a red required check or a blocking label refuse (live-check)', (t) => {
+  const cases = {
+    'behind base': { mergeStateStatus: 'BEHIND' },
+    draft: { isDraft: true },
+    'red required check': { ci: [{ name: 'ci', state: 'FAILURE', bucket: 'fail' }] },
+    'needs-human': { labels: ['needs-human'] },
+    'awaiting-review': { labels: ['awaiting-review'] },
+    'pipeline-blocked': { labels: ['pipeline-blocked'] },
+  };
+  for (const [name, gh] of Object.entries(cases)) {
+    const s = goScenario({ gh });
+    ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'));
+    const r = goMerge(s);
+    assertExit(r, 1, name);
+    assert.equal(r.json.error, 'live-check', `${name}: ${r.stdout}`);
+    assert.ok(r.json.reasons.length > 0, name);
+    assert.deepEqual(s.mergeCalls(), [], name);
+    assert.equal(reviewFiles(s).includes('final-gate.json'), false, name);
+  }
+});
+
+test('--owner-go with --owner-approved-head or --owner-approved-items is a usage error (exit 2)', (t) => {
+  const s = goScenario();
+  ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'));
+  for (const args of [['--owner-approved-head', s.head], ['--owner-approved-items', 'none'], ...[approvalFlags(s.head, 'none')]]) {
+    const r = goMerge(s, args);
+    assertExit(r, 2, args.join(' '));
+    assert.match(`${r.stderr}${r.stdout}`, /--owner-go takes no --owner-approved-head/, args.join(' '));
+  }
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('--owner-go with production configured: merges, records no prod-before and says so in a warning', (t) => {
+  const s = goScenario({ yml: { production: true } });
+  ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'));
+  const r = goMerge(s);
+  assertExit(r, 0);
+  assert.equal(r.json.merged, true);
+  assert.equal(r.json.mode, 'owner-go');
+  assert.equal('prodBefore' in r.json, false);
+  assert.match((r.json.warnings ?? []).join('\n'), /no prod-before/);
+  assert.equal(s.fake.lines().some((l) => /prod-before/.test(l)), false);
+});
+
+// Fable attacker pass: the agent writes `items none` itself, so a diff with an owner item (or a blocking hard-stop) never takes
+// the owner-go route, whatever the owner's record says: it needs the gated route bound to the gate's ownerItems digest.
+test('--owner-go refuses a diff with a hard-stop: owner-merge item (chat) or blocking hit (label mode)', (t) => {
+  for (const yml of [chatYml(), hardStopYml()]) {
+    const s = scenario({ yml: yml.replace('{pr} {sha}', '{pr} --match-head-commit {sha}'), report: null, state: null });
+    ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'));
+    const r = goMerge(s);
+    assertExit(r, 1);
+    assert.equal(r.json.error, 'live-check');
+    assert.match(r.json.reasons.join('\n'), /hardstops|owner-items: 1 owner item/);
+    assert.deepEqual(s.mergeCalls(), []);
+  }
 });

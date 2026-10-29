@@ -278,7 +278,9 @@ head you did not review (the receipt names the head the event carried).
 mention: `owner_approval` (`label` by default; `chat` drops the approval labels: blocking hard-stops and test-integrity
 violations no longer fail CI, the ship skill stops before the merge, lists them in a PR comment and merges when you say
 "merge" in chat; the PR ends as `awaiting-owner-merge`), `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop scan` statuses are always
-required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`)
+required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`), `ci.review_check`
+(default `false`; `true` makes the guards also post `Cross-model review`, green only when the newest review-complete comment
+names the head's content hash, and every required-check list includes it; turn it on together with branch protection)
 and `ci.approvers` (logins whose approval labels count; required for org-owned repos, otherwise approvals
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep

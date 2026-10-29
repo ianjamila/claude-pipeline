@@ -474,9 +474,12 @@ function digestEntry(abs) {
 
 // sha256 of HEAD + every tracked change vs HEAD (staged or not) + every untracked, non-ignored file with its bytes.
 // Equal fingerprints mean the same tree; a verify report that carries one is bound to exactly that tree.
-export function treeFingerprint(o) {
+// `asHead` (the final gate only): the fingerprint this same working tree would have had with HEAD at that commit instead. It is
+// only meaningful when `<asHead>^{tree}` is HEAD's tree: then `git diff <asHead>` and `git diff HEAD` are byte-identical (same
+// blobs, same ids), so the result is exactly what verify recorded on a clean checkout of asHead with these untracked files.
+export function treeFingerprint(o, { asHead = null } = {}) {
   const hash = createHash('sha256');
-  hash.update(headSha(o));
+  hash.update(asHead ?? headSha(o));
   hash.update('\0');
   // No --text: --binary already makes NUL and `-diff` files exact and compact (the `index` blob ids stay in this diff, so
   // even a lossy decode could not hide a change), where --text would dump whole binaries as raw text. --no-textconv:

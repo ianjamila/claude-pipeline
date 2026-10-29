@@ -51,8 +51,12 @@ export const DEFAULTS = deepFreeze({
   // guard_checks: the tamper-proof "Test integrity" and "Hard-stop scan" statuses are always required on top of
   // required_checks. false only for a repo that does not run the pipeline-guards workflow (e.g. this one).
   // approvers: GitHub logins whose approval labels (human-approved, test-change-approved) count. Empty = the repo owner,
-  // which only exists for user-owned repos: an org-owned repo MUST list its approvers.
-  ci: { required_checks: [], e2e_label: null, draft_while_iterating: false, guard_checks: true, approvers: [] },
+  // which only exists for user-owned repos: an org-owned repo MUST list its approvers. The same logins (or the owner) are the
+  // authors whose review-complete comment counts for review_check.
+  // review_check: the pipeline-guards workflow also posts a "Cross-model review" status (success only when the latest
+  // review-complete comment's content hash is the PR head's), and preflight, `protect` and the gate require it. Off by
+  // default: turn it on in the same change that applies branch protection with it, or every merge waits for a missing check.
+  ci: { required_checks: [], e2e_label: null, draft_while_iterating: false, guard_checks: true, review_check: false, approvers: [] },
   // {sha} is required: the approved head is passed to the merge so a head that moved after review can never merge.
   merge: { command: 'gh pr merge {pr} --squash --auto --delete-branch --match-head-commit {sha}', wait_minutes: 15 },
   preview: null,
@@ -86,13 +90,20 @@ export const DEFAULTS = deepFreeze({
 
 // The two required statuses pipeline-guards.yml posts (templates/scripts/pipeline/ci-guards-run.mjs CONTEXTS).
 export const GUARD_CHECKS = Object.freeze(['Test integrity', 'Hard-stop scan']);
+// The third one, posted only with ci.review_check (lib/review-marker.mjs#REVIEW_CONTEXT, the same string).
+export const REVIEW_CHECK = 'Cross-model review';
+// Every context the guards workflow may post: a passing row with one of these names is only believed with its provenance
+// (finalgate.mjs#ciCheck), whatever the config says about requiring it.
+export const PROVENANCE_CHECKS = Object.freeze([...GUARD_CHECKS, REVIEW_CHECK]);
 
 // Every status context branch protection must require: what the project lists plus, unless ci.guard_checks is false, the
-// two guard contexts. Without them a repo that lists no checks would read as "protected" with nothing required at all.
+// two guard contexts, plus the review context with ci.review_check. Without them a repo that lists no checks would read as
+// "protected" with nothing required at all.
 export function requiredChecks(ci) {
   const configured = Array.isArray(ci?.required_checks) ? ci.required_checks : [];
   const guards = ci?.guard_checks === false ? [] : GUARD_CHECKS;
-  return [...new Set([...configured, ...guards])];
+  const review = ci?.guard_checks !== false && ci?.review_check === true ? [REVIEW_CHECK] : [];
+  return [...new Set([...configured, ...guards, ...review])];
 }
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
@@ -129,7 +140,7 @@ const KEYS = {
   worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
   verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes', 'deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes'],
   ci_proof: ['workflow', 'job', 'event', 'steps'],
-  ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'approvers'],
+  ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'review_check', 'approvers'],
   merge: ['command', 'wait_minutes'],
   preview: ['environment', 'smoke', 'provider'],
   production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback', 'watch'],
@@ -602,6 +613,9 @@ export function validateConfig(obj) {
         warnings.push(`ci.required_checks does not list ${missing.map((m) => JSON.stringify(m)).join(' and ')}: they are required anyway (ci.guard_checks); list them so the config matches branch protection, or set ci.guard_checks: false if this repo does not run pipeline-guards.yml`);
       }
     }
+    if (typeof ci.review_check !== 'boolean') errors.push('ci.review_check must be a boolean');
+    // The review status comes from the guards workflow: without it nothing would ever post the check every merge waits for.
+    else if (ci.review_check && ci.guard_checks === false) errors.push('ci.review_check needs ci.guard_checks: the Cross-model review status is posted by pipeline-guards.yml');
   }
 
   if (config.preview !== null) checkPreview(config.preview, errors);

@@ -1,4 +1,5 @@
-# Pipeline guards — tamper-proof "Test integrity" and "Hard-stop scan" required checks.
+# Pipeline guards — tamper-proof "Test integrity" and "Hard-stop scan" required checks, plus "Cross-model review" when the
+# base config sets ci.review_check: true.
 #
 # Why pull_request_target: the workflow file, the guard scripts (scripts/pipeline/) and
 # .claude/pipeline.yml all come from the BASE branch, so a pull request cannot change how it is
@@ -13,9 +14,17 @@
 #
 # Verdict artifact: a spoofing run could still point its status at a genuine run of the same PR and head that is in progress.
 # So the job is split: "Evaluate" records the verdict (verdict.json) and names it, "Upload verdict" attaches it to THIS run as
-# the artifact pipeline-verdict_v1_<head>_<integrity>_<hardstops>[_<label>_<login>], and only then "Publish" posts the
-# statuses. A status counts only if the artifact of the run it points at says the same; a spoofing run cannot upload an
-# artifact to somebody else's run. Do not rename the artifact or the steps without changing guard-provenance.mjs.
+# the artifact pipeline-verdict_v2_<head>_<integrity>_<hardstops>_<review>[_<label>_<login>] (<review> is `off` without
+# ci.review_check), and only then "Publish" posts the statuses. A status counts only if the artifact of the run it points at
+# says the same; a spoofing run cannot upload an artifact to somebody else's run. Do not rename the artifact or the steps
+# without changing guard-provenance.mjs.
+#
+# Cross-model review (ci.review_check): `success` only when the newest review-complete comment by an allowed author (the
+# ci.approvers rule) names the content hash of THIS head, recomputed from git data; a push that changes the content makes it
+# fail until the review is redone. It is never posted `pending` (the step below only touches the two guards), so a head
+# without a review has no status at all, which branch protection treats as missing. A comment fires no event the guards
+# listen to: `pipeline review-complete` adds and removes the label `pipeline-recheck` on a ready PR to start a run (a draft
+# gets its run when it is marked ready).
 #
 # Approvals: a `labeled` run by an allowed approver first posts a receipt status (`pipeline-approval: <label>`) on the
 # exact head sha; an approval label only counts for a head that carries a fresh receipt from github-actions[bot], so an
@@ -33,7 +42,7 @@ permissions:
   contents: read        # read base + fetch the PR head as data
   pull-requests: write  # only to remove an approval label that has no receipt for the current head
   issues: read          # label timeline (who approved, when)
-  statuses: write       # publish the two required statuses and the approval receipts
+  statuses: write       # publish the required statuses (two, three with ci.review_check) and the approval receipts
   actions: read         # provenance: read workflow runs (actions/runs/{id}) and their artifacts with GITHUB_TOKEN; private repos need it
 
 concurrency:

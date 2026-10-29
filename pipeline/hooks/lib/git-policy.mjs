@@ -19,6 +19,7 @@ import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf,
 export { withoutLiteralText, INDIRECT_EXPANSION };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
+import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
 
@@ -78,7 +79,7 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // lowercase basename without .exe/.cmd/.bat/.com; handles /usr/bin/git and C:\Git\bin\GIT.EXE alike
 const baseName = (w) => commandName(w);
 // A command the parser could only partly resolve (`$g push`, `bash -c "$X"`, `curl … | sh`) is judged by what it mentions.
-const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close/i;
+const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close|claude-pipeline:review-complete/i;
 const isProtectedBranch = (b) => PROTECTED_BRANCHES.includes(String(b).toLowerCase());
 const isPrefixOf = (name, full, min = 1) => name.length >= min && full.startsWith(name);
 // Label names are case-insensitive on GitHub; a name only counts when it is not part of a longer one.
@@ -713,7 +714,9 @@ function gatherBody(flags, dir, ctx) {
   let unknown = false;
   const fields = [];
   const queries = [];
+  const files = []; // every file the request body is read from (--input F, -F key=@F), as written
   const fromFile = (p) => {
+    files.push(p);
     if (dir !== null) countScript(ctx.budget); // a file read like any other (its size is up to 1 MB), so it is counted
     const t = dir === null ? null : ctx.readText(path.resolve(dir, p));
     if (typeof t === 'string') { text += `\n${t}`; return t; }
@@ -731,7 +734,7 @@ function gatherBody(flags, dir, ctx) {
       let value = eq < 0 ? '' : f.value.slice(eq + 1);
       const at = typed ? /^@(.+)$/.exec(value) : null;
       if (at) value = fromFile(at[1]) ?? '';
-      fields.push({ key, value });
+      fields.push({ key, value, written: f.value }); // (written: the flag as on the line, before any @file was read)
       if (key === 'query') queries.push(value);
     } else if (!f.short && f.name === 'input') {
       if (f.value === '-') { unknown = true; text += `\n${ctx.fullText}`; continue; }
@@ -744,7 +747,7 @@ function gatherBody(flags, dir, ctx) {
       } catch { queries.push(t); }
     }
   }
-  return { text, unknown, fields, queries };
+  return { text, unknown, fields, queries, files };
 }
 
 // ---- graphql mutation allowlist ---------------------------------------------------------------------------
@@ -846,6 +849,9 @@ function checkApi(rest, env, dir, ctx) {
 
   const body = gatherBody(flags, dir, ctx);
   const haystack = safeDecode(`${rest.join('\n')}\n${body.text}`);
+  // -- the review-complete marker, in any write (a comment, an edit of one, a review, an issue body): see reviewMarkerVerdict
+  const marker = apiReviewMarkerVerdict(ep, positionals[0], haystack, body, dir, ctx);
+  if (marker) return marker;
   const approval = mentionsAny(haystack, APPROVAL_LABELS);
   const guard = mentionsAny(haystack, GUARD_LABELS);
   const dynamicLabel = body.fields.some((f) => /^(labels(\[\])?|name|new_name)$/.test(f.key) && DYNAMIC.test(f.value));
@@ -1007,6 +1013,176 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
   return null;
 }
 
+// ---- the review-complete marker (Phase 3a) ----------------------------------------------------------------------------------
+// Why: the pipeline-guards workflow turns the latest review-complete comment of the owner (lib/review-marker.mjs) into the
+// `Cross-model review` status, and the owner's token is the agent's token. So a comment carrying the marker must only come from
+// `pipeline review-complete`, which checks that a clean, current review exists first and posts from its own process (which
+// this guard never sees). Every gh route that writes text an agent can see is refused when that text holds the marker: the
+// words of the command (--body, --comment, --title …), a --body-file / -F file, and gh api fields and --input files
+// (checkApi). The marker is matched without its comment delimiters or version, case-insensitively. Residual (as for labels): a
+// body piped in on stdin from a file, or a client of the agent's own, is not seen; nor is a body file that a process started by
+// an EARLIER command (a background job) rewrites between this check and gh reading it (Fable attacker pass): the hook judges one
+// command line, not what else is running. The local review state itself (.review/state.json, which review-complete trusts) is
+// not protected here: tracked as an open item before ci.review_check is turned on anywhere.
+const REVIEW_MARKER_RE = new RegExp(escapeRe(REVIEW_MARKER_TEXT), 'i');
+const mentionsReviewMarker = (text) => REVIEW_MARKER_RE.test(String(text ?? '')) || REVIEW_MARKER_RE.test(safeDecode(String(text ?? '')));
+const REVIEW_MARKER_DENIED = `the text carries the review-complete marker (${REVIEW_MARKER_TEXT}), which only \`pipeline review-complete --pr N\` may post: it checks that a clean review covers the current content first. Run it instead.`;
+// gh commands that post or edit text on a PR or issue (where the workflow reads the comments), by group and verb.
+const TEXT_VERBS = { pr: ['comment', 'create', 'edit', 'review', 'close', 'merge'], issue: ['comment', 'create', 'edit', 'close'] };
+// gh's short flags for those verbs (gh 2.x): text = value is posted text or a body file; value = other value-taking; bool = switches.
+// -e / -T (editor, template) are refused before this table is read. -R (--repo) is global.
+const SHORT_FLAGS = {
+  'pr comment': { text: 'bF', value: 'R', bool: 'w' },
+  'pr create': { text: 'btF', value: 'RBHalmpr', bool: 'dfw' },
+  'pr edit': { text: 'btF', value: 'RBm', bool: '' },
+  'pr review': { text: 'bF', value: 'R', bool: 'acr' },
+  'pr close': { text: 'c', value: 'R', bool: 'd' },
+  'pr merge': { text: 'btF', value: 'RA', bool: 'dmrs' },
+  'issue comment': { text: 'bF', value: 'R', bool: 'w' },
+  'issue create': { text: 'btF', value: 'Ralmp', bool: 'w' },
+  'issue edit': { text: 'btF', value: 'Rm', bool: '' },
+  'issue close': { text: 'c', value: 'Rr', bool: '' },
+};
+function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
+  if (!(TEXT_VERBS[group] ?? []).includes(verb)) return null;
+  // (the whole line too: a here-string, or a printf that writes the body file before this command)
+  if (rest.some(mentionsReviewMarker) || mentionsReviewMarker(ctx.fullText)) return deny(REVIEW_MARKER_DENIED);
+  // The text values (--body, --comment, --title …) and body files (--body-file F, --body-file=F, -F F, -FF: gh pr/issue -F is
+  // --body-file), as written. A value built at run time ($VAR, $(cat f), backticks) holds text the guard cannot read: refused,
+  // as for a label set at run time. Security review of 53d82ef: `--body "$(cat f)"` and a file written earlier on the line passed.
+  // Parsed as gh (pflag) does: --name=value or --name value; short flags may be grouped (`-wF f`, `-wFf`), and a value-taking
+  // short takes the rest of the word (minus one leading '=': `-F=f` is the file `f`) or the next word. Security review of 8bf1fe2.
+  // The editor routes (--editor, --template, --recover) write text the guard never sees (an EDITOR the agent chose): refused.
+  // Short flags are read with each verb's own gh table (security review of 19a6886): `text` = shorts whose value is posted text
+  // or a body file, `value` = other value-taking shorts (their value is the rest of the word or the next word), `bool` = switches.
+  // A short the table does not know is refused rather than guessed at (fail closed). (`gh pr review`: -c is a switch.)
+  const table = SHORT_FLAGS[`${group} ${verb}`];
+  const isReview = group === 'pr' && verb === 'review';
+  const LONG_TEXT = new Set(isReview ? ['body', 'body-file'] : ['body', 'comment', 'title', 'subject', 'body-file']);
+  const LONG_REFUSED = new Set(['editor', 'template', 'recover']);
+  const SHORT_TEXT = table.text;
+  const SHORT_REFUSED = 'eT';
+  const EDITOR_DENIED = 'the text would come from an editor, a template or a recovered draft, which the guard cannot read for the review-complete marker. Pass the text with --body or a literal --body-file.';
+  const texts = [];
+  const files = [];
+  for (let i = 0; i < rest.length; i++) {
+    const w = rest[i];
+    if (w === '--') break;
+    if (w.startsWith('--')) {
+      const eq = w.indexOf('=');
+      const name = eq > 0 ? w.slice(2, eq) : w.slice(2);
+      if (LONG_REFUSED.has(name)) return deny(EDITOR_DENIED);
+      if (!LONG_TEXT.has(name)) continue;
+      const value = eq > 0 ? w.slice(eq + 1) : rest[++i];
+      if (value === undefined) continue;
+      texts.push(value);
+      if (name === 'body-file') files.push(value);
+      continue;
+    }
+    if (!/^-[^-]/.test(w)) continue;
+    for (let k = 1; k < w.length; k++) {
+      const ch = w[k];
+      if (SHORT_REFUSED.includes(ch)) return deny(EDITOR_DENIED);
+      if (table.bool.includes(ch)) continue;
+      if (table.value.includes(ch)) {
+        if (k === w.length - 1) i++; // (its value is the next word)
+        break;
+      }
+      if (!SHORT_TEXT.includes(ch)) return deny(`\`${w}\` holds the short flag -${ch}, which the guard does not know for \`gh ${group} ${verb}\`, so whether it carries text cannot be verified. Spell the flags out (--body-file F).`);
+      let value = w.slice(k + 1);
+      if (value.startsWith('=')) value = value.slice(1);
+      if (value === '') value = rest[++i];
+      if (value !== undefined) {
+        texts.push(value);
+        if (ch === 'F') files.push(value);
+      }
+      break;
+    }
+  }
+  if (texts.some((t) => DYNAMIC.test(t))) {
+    return deny('the comment text (or its file name) is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the review-complete marker. Write the body to a file and pass --body-file with a literal name.');
+  }
+  for (const file of files) {
+    if (file === '-') continue; // (stdin: the residual above; a here-string is in the line itself)
+    // a name the shell rewrites before gh sees it (~, a glob, a brace list) names some other file than the one read here
+    if (/^~|[*?[\]{}]/.test(file)) return deny(`the body file name ${file} is expanded by the shell (~, a glob or a brace list), so which file is posted cannot be verified for the review-complete marker. Name the file literally.`);
+    if (dir === null) return deny('cannot tell which directory this runs in, so the body file cannot be checked for the review-complete marker. Use an absolute path, or chain the cd with &&.');
+    const abs = path.resolve(dir, file);
+    // a body file an earlier command on this line wrote (or may have written) holds text that does not exist yet: refused
+    if (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) !== null) {
+      return deny(`${file} may be written earlier on this line, so the body that is posted cannot be checked for the review-complete marker. Write the file in a command of its own.`);
+    }
+    countScript(ctx.budget);
+    // (fail closed: a file that is missing, not a regular file, too large or unreadable cannot be checked)
+    const text = ctx.readText(abs);
+    if (typeof text !== 'string') return deny(`the body file ${file} cannot be read here (missing, not a regular file, or over ${MAX_INPUT_BYTES} bytes), so it cannot be checked for the review-complete marker.`);
+    if (mentionsReviewMarker(text)) return deny(REVIEW_MARKER_DENIED);
+  }
+  return null;
+}
+
+// JSON and GraphQL strings may spell any character as \uXXXX (`claude-pipeline:review-complete`): GitHub stores the decoded
+// text, so the marker is also looked for with those escapes decoded. (An escaped backslash before `u` is decoded too: that can
+// only refuse more, never less.)
+// GraphQL also has the braced form \u{XXXXXX} (security review of ee9899f).
+const decodeUnicodeEscapes = (s) => String(s ?? '')
+  .replace(/\\u\{([0-9a-fA-F]{1,6})\}/g, (m, h) => { const n = parseInt(h, 16); return n <= 0x10ffff ? String.fromCodePoint(n) : m; })
+  .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+// API writes that create or edit an issue / PR conversation comment, the only text the guard workflow reads for the marker
+// (REST, or the GraphQL addComment / updateIssueComment mutations).
+const API_COMMENT_PATH = /^repos\/[^/]+\/[^/]+\/issues\/([^/]+\/comments|comments\/[^/]+)$/i;
+const COMMENT_MUTATION = /\b(addComment|updateIssueComment)\b/;
+
+// The review-complete marker in a `gh api` write (Codex review of 4c595df): the line, every field and input file, with JSON /
+// GraphQL \u escapes decoded. For a write that creates or edits a conversation comment, what the guard cannot read is refused
+// as in reviewMarkerVerdict: a field value built at run time ($VAR, $(cat f), backticks), a body on stdin (--input -) or in a
+// file that is missing or unreadable, and a body file written earlier on this line (it holds text that does not exist yet).
+// Every GraphQL write gets the file checks BEFORE its query is judged (Codex recheck: an input file replaced earlier on the
+// line was judged on its old, harmless query). A GraphQL query typed on the line that holds `$` or a backtick must be
+// single-quoted, and appear once on the line (Codex recheck + security review of ee9899f): in double quotes the shell would
+// rewrite it after this guard read it — `body:\"$BODY\"`, or a declared `$b` the shell fills from an exported b — so the
+// mutation allowlist (checkGraphql) and the comment-mutation test below would judge a query GitHub never receives. Its own
+// `$name` variables are fine single-quoted. An endpoint built at run time may be a comment endpoint, so it is judged as one.
+function apiReviewMarkerVerdict(ep, rawEp, haystack, body, dir, ctx) {
+  const texts = [haystack, ctx.fullText, ...body.fields.map((f) => f.value)];
+  if (texts.some((t) => mentionsReviewMarker(t) || mentionsReviewMarker(decodeUnicodeEscapes(t)))) return deny(REVIEW_MARKER_DENIED);
+  const graphql = /^graphql$/i.test(ep);
+  const runTimeEndpoint = DYNAMIC.test(String(rawEp ?? ''));
+  if (!graphql && !runTimeEndpoint && !API_COMMENT_PATH.test(ep)) return null;
+  if (body.unknown) return deny('the body of this API write comes from stdin or a file that cannot be read here, so it cannot be checked for the review-complete marker. Pass a readable file with a literal name.');
+  for (const file of body.files) {
+    if (/^~|[*?[\]{}]/.test(file) || DYNAMIC.test(file)) return deny(`the input file name ${file} is expanded by the shell, so which file is sent cannot be verified for the review-complete marker. Name the file literally.`);
+    if (dir === null) return deny('cannot tell which directory this runs in, so the input file cannot be checked for the review-complete marker. Use an absolute path, or chain the cd with &&.');
+    if (writtenTo(ctx.writeFrames, path.resolve(dir, file), { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) !== null) {
+      return deny(`${file} may be written earlier on this line, so the body that is sent cannot be checked for the review-complete marker. Write the file in a command of its own.`);
+    }
+  }
+  // Whether the query word holds an expansion is the shell parser's fact (cmd.litWords: the words without one), never a search of
+  // the line text, which empty quotes (`''query=…$b…''`) or a decoy copy fool (security review of de35615). The word must be
+  // exactly one of this command's words (litWords is keyed by text: a second word with the same text could be the expanded one)
+  // and literal. Called from anywhere else (an alias, a job runner: no word list), such a query is refused.
+  const words = ctx.ghWords ?? null;
+  for (const f of body.fields) {
+    if (f.key !== 'query' || typeof f.written !== 'string') continue;
+    const q = f.written.slice(f.written.indexOf('=') + 1);
+    if (q.startsWith('@') || !DYNAMIC.test(q)) continue; // (a query read from a file is never shell-expanded)
+    // Every word ENDING with the value counts as a holder, whatever its flag spelling (`-f V`, `-fV`, `-f=V`, `--raw-field=V`,
+    // bundled shorts): the real word always ends with it, so a decoy can only make the count 2 (refused), never stand in for it
+    // (security review of 27f228c: an exact-spelling list missed `-f=V`, letting a literal decoy be the only holder). And the
+    // value must be the parser's own text: if this guard's variable expansion changed any word of the command, refused.
+    const expandedAny = words ? words.argv.some((w) => expandVars(w, ctx) !== w) : true;
+    const holders = words && !expandedAny ? words.argv.filter((w) => w.endsWith(f.written)) : [];
+    if (holders.length !== 1 || !words.lit?.has(holders[0])) {
+      return deny('this GraphQL query holds `$` or a backtick that the shell may expand (it is not one fully single-quoted word), so what GitHub receives cannot be checked. Single-quote the query (-f query=\'...\') and pass values as variables, or use the REST comments API with -F body=@file.');
+    }
+  }
+  const comment = !graphql || body.queries.some((q) => COMMENT_MUTATION.test(q));
+  if (comment && body.fields.some((f) => f.key !== 'query' && typeof f.written === 'string' && DYNAMIC.test(f.written))) {
+    return deny('a field of this API write is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the review-complete marker. Write the body to a file and pass it with a literal name (-F body=@file or --input file).');
+  }
+  return null;
+}
+
 function checkGh(argv, env, dir, ctx, raw, level = 0) {
   // The group and verb must be written literally (`gh pr $X`, `gh pr ${X%-base}`, `gh pr "$(printf merge)"`): a variable's
   // value on the line is not proof — `X=merge; true || X=view; gh pr $X` runs merge.
@@ -1039,6 +1215,8 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
   }
 
   if (group === 'api') return checkApi(rest, env, dir, ctx);
+  const marker = reviewMarkerVerdict(group, verb, rest, dir, ctx);
+  if (marker) return marker;
 
   if (group === 'repo' && ['edit', 'delete', 'rename'].includes(verb)) return deny(`\`gh repo ${verb}\` changes repository settings and is blocked. ${OWNER_ONLY}`);
   if ((group === 'ruleset' || group === 'rs') && ['create', 'edit', 'update', 'delete'].includes(verb)) return deny(`\`gh ruleset ${verb}\` is blocked. ${OWNER_ONLY}`);
@@ -2635,7 +2813,12 @@ function evalString(str, startDir, ctx, level, child = false) {
       const unsure = unsureVarUsed([...argv.slice(1), ...Object.values(c.env)], ctx);
       if (unsure !== null && ctx.zshNames?.has(unsure)) verdict = deny(zshModifiedReason(unsure));
       else if (unsure !== null) verdict = deny(`$${unsure} was assigned more than once on this line, so its value (and what this ${name} command does with it) cannot be verified. Assign it once, or write the value out.`);
-      else verdict = name === 'git' ? checkGit(argv, c.env, dir, ctx, c.raw ?? '') : checkGh(argv, c.env, dir, ctx, c.raw ?? '');
+      else if (name === 'git') verdict = checkGit(argv, c.env, dir, ctx, c.raw ?? '');
+      else {
+        // (the parser's words of THIS command and which of them hold no expansion: apiReviewMarkerVerdict's GraphQL quoting test)
+        ctx.ghWords = { argv, lit: c.litWords ?? null };
+        try { verdict = checkGh(argv, c.env, dir, ctx, c.raw ?? ''); } finally { ctx.ghWords = null; }
+      }
     }
     else {
       for (const inner of jobStartCommands(argv, ctx) ?? []) {

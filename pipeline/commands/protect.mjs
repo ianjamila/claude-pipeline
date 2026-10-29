@@ -14,9 +14,17 @@ export const meta = {
   usage: 'pipeline protect [--apply] [--checks a,b] [--repo DIR]   (--apply needs PIPELINE_ADMIN=1)',
 };
 
+// The GitHub Actions app. Every required check is pinned to it: a status or check run counts only when GITHUB_TOKEN (a workflow)
+// posted it, so a status posted with a person's token (the owner's, which agents also use) never satisfies branch protection.
+// That is what makes `Test integrity`, `Hard-stop scan` and `Cross-model review` unforgeable from a terminal. A check that
+// another app posts (a deploy provider, say) must not be listed in ci.required_checks, or nothing could ever satisfy it.
+// The pin does not stop a PR into a side branch whose own copy of the workflow posts as GitHub Actions on the same head: only
+// the final gate's provenance check (guard-provenance.mjs) catches that, so a direct `gh pr merge` must stay hook-blocked.
+export const GITHUB_ACTIONS_APP_ID = 15368;
+
 export function protectionPayload(checks) {
   return {
-    required_status_checks: { strict: false, checks: checks.map((context) => ({ context })) },
+    required_status_checks: { strict: false, checks: checks.map((context) => ({ context, app_id: GITHUB_ACTIONS_APP_ID })) },
     enforce_admins: true,
     required_pull_request_reviews: { required_approving_review_count: 0, dismiss_stale_reviews: false, require_code_owner_reviews: false },
     restrictions: null,
@@ -36,6 +44,12 @@ export const REPO_SETTINGS = Object.freeze({
 });
 
 export const WORKFLOW_PERMISSIONS = Object.freeze({ default_workflow_permissions: 'read', can_approve_pull_request_reviews: false });
+
+// The required checks GitHub reports WITHOUT the Actions pin (any app may satisfy them), from a protection read-back.
+export function unpinnedChecks(json, checks) {
+  const rows = json?.required_status_checks?.checks ?? [];
+  return checks.filter((name) => !rows.some((c) => c?.context === name && c?.app_id === GITHUB_ACTIONS_APP_ID));
+}
 
 // The three writes, in the order they are applied.
 export function buildRequests({ slug, branch, checks }) {
@@ -120,7 +134,9 @@ export async function run(argv, ctx) {
       return { exitCode: EXIT.FAILED, output: { ok: false, applied: true, mode: 'gate', missing: [], reason: p.reason, message: p.message, completed, slug, branch } };
     }
     const missing = protectionMissing(p.json, checks);
+    const unpinned = unpinnedChecks(p.json, checks);
     const mode = missing.length === 0 ? 'github' : 'gate';
-    return { exitCode: missing.length === 0 ? EXIT.OK : EXIT.FAILED, output: { ok: missing.length === 0, applied: true, mode, missing, completed, slug, branch } };
+    const ok = missing.length === 0 && unpinned.length === 0;
+    return { exitCode: ok ? EXIT.OK : EXIT.FAILED, output: { ok, applied: true, mode, missing, unpinned, completed, slug, branch } };
   });
 }

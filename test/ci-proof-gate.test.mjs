@@ -230,6 +230,55 @@ test('a CI proof does not excuse the other checks of the report: a failed step o
   refused(await judge(stale), /report is for/, 'other head');
 });
 
+// ---- a same-tree report from an earlier commit never stands in for the new head's CI proof ----------
+
+// Amends the PR commit's message (same tree, new sha) and makes the scenario's head the new one. -> the old head.
+function reword(s) {
+  const old = s.head;
+  execFileSync('git', ['commit', '--amend', '-q', '-m', 'feature, reworded'], { cwd: s.repo.dir });
+  s.head = s.repo.git(['rev-parse', 'HEAD']).trim();
+  assert.notEqual(s.head, old);
+  return old;
+}
+
+test('a same-tree report from the old commit: the deferred step still needs a CI proof for the NEW head', async () => {
+  const s = setup({ report: ciRow });
+  const old = reword(s);
+  const onlyFor = (sha) => async ({ head }) => (head === sha
+    ? { state: 'pass', reason: 'ok', run: RUN }
+    : { state: 'missing', reason: `no run for ${head.slice(0, 7)}` });
+
+  // a proof that exists only for the old head: refused, and the lookup was asked about the NEW head
+  const stale = await judge(s, onlyFor(old));
+  refused(stale, new RegExp(`ci-proof-missing:unit \\(no run for ${s.head.slice(0, 7)}\\)`), 'proof for the old head only');
+  assert.equal(stale.calls.length, 1);
+  assert.equal(stale.calls[0].head, s.head);
+  assert.equal(stale.calls[0].tree, treeFingerprint({ cwd: s.repo.dir }), 'the lookup is bound to HEAD\'s tree fingerprint');
+
+  // a proof for the new head: accepted, the detail names the old commit as the verified one
+  const fresh = await judge(s, onlyFor(s.head));
+  accepted(fresh, 'proof for the new head');
+  assert.deepEqual(fresh.proofs, [{ step: 'unit', source: 'ci', run: RUN }]);
+  assert.match(fresh.c.detail, new RegExp(`full verify passed at ${old.slice(0, 8)}, the same tree as HEAD ${s.head.slice(0, 8)}`));
+  assert.match(fresh.c.detail, /CI proof: unit via run 777 attempt 2/);
+});
+
+test('a same-tree report from the old commit: steps that ran locally need no CI lookup; a different-tree report is still refused with a proof at hand', async () => {
+  const s = setup();
+  reword(s);
+  const local = await judge(s);
+  accepted(local, 'same tree, plain pass');
+  assert.deepEqual(local.proofs, [{ step: 'unit', source: 'local' }]);
+  assert.equal(local.calls.length, 0);
+
+  // a real change after verify: a CI proof for the new head does not rescue a report of another tree
+  const moved = setup({ report: ciRow });
+  moved.repo.write('src/app.js', 'export const a = 3;\n');
+  moved.head = moved.repo.commit('after verify');
+  const r = await judge(moved);
+  refused(r, /report is for [0-9a-f]{8}, HEAD is [0-9a-f]{8} \(its tree is not HEAD's tree\)/, 'other tree');
+});
+
 // ---- wiring: evaluateGate, the CLI, merge ----------------------------------------------------------
 
 async function gateFor(s, extra = {}) {

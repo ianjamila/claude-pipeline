@@ -149,7 +149,8 @@ test('#58 `gh pr merge --disable-auto` is exempt only when it can only cancel au
     'gh pr merge 8 --squash --disable-auto --disable-auto=false', 'gh pr merge 8 --disable-auto=false', 'gh pr merge 8 --disable-auto=0',
     'gh pr merge 8 --disable-auto --auto', 'gh pr merge 8 --disable-auto --auto=true', 'gh pr merge 8 --disable-auto=banana', 'gh pr merge 8 -- --disable-auto',
     'gh pr merge 8 --squash --disable-auto=true --disable-auto=false']) {
-    assert.match(deny(cmd).reason, /gh pr merge/, cmd);
+    // (-F / --body-file names a body file `--disable-auto` here: the review-marker guard refuses it first, unreadable)
+    assert.match(deny(cmd).reason, /gh pr merge|the body file --disable-auto cannot be read/, cmd);
   }
   // a real cancellation (the last --disable-auto is on; --auto is not) stays exempt
   for (const cmd of ['gh pr merge 8 --disable-auto', 'gh pr merge --disable-auto 8', 'gh pr merge 8 --squash --disable-auto', 'gh pr merge 8 --disable-auto=true',
