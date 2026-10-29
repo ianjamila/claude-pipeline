@@ -40,6 +40,26 @@ test('security review: text built at run time or a body file written on the same
   ]) assert.equal(decide(command), 'deny', command);
 });
 
+test('security review 2: pflag spellings, grouped shorts, unreadable body files and the editor routes', () => {
+  for (const command of [
+    'gh pr comment 5 -F=marked.md',
+    'gh pr comment 5 -wF marked.md',
+    'gh pr comment 5 -wFmarked.md',
+    'gh pr comment 5 -wF=marked.md',
+    'gh pr comment 5 --body-file missing.md',
+    'gh pr comment 5 -F .',
+    'gh pr comment 5 --editor',
+    'gh pr comment 5 -e',
+    'gh pr create -T bug.md',
+    'gh pr create --template bug.md',
+    'gh pr create --recover draft.json',
+    'gh issue comment 5 -we',
+  ]) assert.equal(decide(command), 'deny', command);
+  for (const command of ['gh pr comment 5 -F=plain.md', 'gh pr comment 5 -wF plain.md', 'gh pr comment 5 --body-file=plain.md']) {
+    assert.equal(decide(command), 'allow', command);
+  }
+});
+
 test('ordinary comments, reads and the review-complete command itself still pass; so does P merge --owner-go', () => {
   for (const command of [
     'gh pr comment 5 --body "looks good"',

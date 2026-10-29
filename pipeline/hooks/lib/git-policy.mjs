@@ -1030,21 +1030,46 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
   // The text values (--body, --comment, --title …) and body files (--body-file F, --body-file=F, -F F, -FF: gh pr/issue -F is
   // --body-file), as written. A value built at run time ($VAR, $(cat f), backticks) holds text the guard cannot read: refused,
   // as for a label set at run time. Security review of 53d82ef: `--body "$(cat f)"` and a file written earlier on the line passed.
-  const TEXT_FLAGS = ['--body', '-b', '--comment', '-c', '--title', '-t', '--subject', '--body-file', '-F'];
+  // Parsed as gh (pflag) does: --name=value or --name value; short flags may be grouped (`-wF f`, `-wFf`), and a value-taking
+  // short takes the rest of the word (minus one leading '=': `-F=f` is the file `f`) or the next word. Security review of 8bf1fe2.
+  // The editor routes (--editor, --template, --recover) write text the guard never sees (an EDITOR the agent chose): refused.
+  // (`gh pr review`: --comment / -c is a boolean, the review kind; its text is --body / --body-file)
+  const isReview = group === 'pr' && verb === 'review';
+  const LONG_TEXT = new Set(isReview ? ['body', 'body-file'] : ['body', 'comment', 'title', 'subject', 'body-file']);
+  const LONG_REFUSED = new Set(['editor', 'template', 'recover']);
+  const SHORT_TEXT = isReview ? 'bF' : 'bctF';
+  const SHORT_REFUSED = 'eT';
+  const EDITOR_DENIED = 'the text would come from an editor, a template or a recovered draft, which the guard cannot read for the review-complete marker. Pass the text with --body or a literal --body-file.';
   const texts = [];
   const files = [];
   for (let i = 0; i < rest.length; i++) {
     const w = rest[i];
-    const eq = w.indexOf('=');
-    const name = w.startsWith('--') && eq > 0 ? w.slice(0, eq) : w;
-    let value;
-    if (w.startsWith('--') && eq > 0 && TEXT_FLAGS.includes(name)) value = w.slice(eq + 1);
-    else if (TEXT_FLAGS.includes(w)) value = rest[i + 1];
-    else if (/^-[bctF]./.test(w)) value = w.slice(2);
-    else continue;
-    if (value === undefined) continue;
-    texts.push(value);
-    if (name === '--body-file' || name === '-F' || w.startsWith('-F')) files.push(value);
+    if (w === '--') break;
+    if (w.startsWith('--')) {
+      const eq = w.indexOf('=');
+      const name = eq > 0 ? w.slice(2, eq) : w.slice(2);
+      if (LONG_REFUSED.has(name)) return deny(EDITOR_DENIED);
+      if (!LONG_TEXT.has(name)) continue;
+      const value = eq > 0 ? w.slice(eq + 1) : rest[++i];
+      if (value === undefined) continue;
+      texts.push(value);
+      if (name === 'body-file') files.push(value);
+      continue;
+    }
+    if (!/^-[^-]/.test(w)) continue;
+    for (let k = 1; k < w.length; k++) {
+      const ch = w[k];
+      if (SHORT_REFUSED.includes(ch)) return deny(EDITOR_DENIED);
+      if (!SHORT_TEXT.includes(ch)) continue;
+      let value = w.slice(k + 1);
+      if (value.startsWith('=')) value = value.slice(1);
+      if (value === '') value = rest[++i];
+      if (value !== undefined) {
+        texts.push(value);
+        if (ch === 'F') files.push(value);
+      }
+      break;
+    }
   }
   if (texts.some((t) => DYNAMIC.test(t))) {
     return deny('the comment text (or its file name) is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the review-complete marker. Write the body to a file and pass --body-file with a literal name.');
@@ -1058,8 +1083,10 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
       return deny(`${file} may be written earlier on this line, so the body that is posted cannot be checked for the review-complete marker. Write the file in a command of its own.`);
     }
     countScript(ctx.budget);
+    // (fail closed: a file that is missing, not a regular file, too large or unreadable cannot be checked)
     const text = ctx.readText(abs);
-    if (typeof text === 'string' && mentionsReviewMarker(text)) return deny(REVIEW_MARKER_DENIED);
+    if (typeof text !== 'string') return deny(`the body file ${file} cannot be read here (missing, not a regular file, or over ${MAX_INPUT_BYTES} bytes), so it cannot be checked for the review-complete marker.`);
+    if (mentionsReviewMarker(text)) return deny(REVIEW_MARKER_DENIED);
   }
   return null;
 }
