@@ -330,25 +330,48 @@ export function approvedPr({ repo, pr, head, session, ...opts }) {
   return readApprovals({ ...opts, session }).some((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head)));
 }
 
-// The decision words an owner's answer is read for (triage owner-ruling --decision).
-const DECISION_WORDS = { ACCEPT: /\baccept(?:s|ed)?\b/i, 'FOLLOW-UP': /\bfollow[- ]?ups?\b/i, REJECT: /\breject(?:s|ed)?\b/i };
+// What an owner's answer to a ruling request decides, per item (security reviews of f17b251 and ff8090f: a fragment of the answer,
+// a decision word read for the wrong item, or a negated one, "don't accept", must never pass for the owner's ruling). The answer is
+// read in ONE fixed form: `R1-B1: accept` (or `follow-up` / `reject`; `:` `-` `=` or nothing between, any words after) for each item.
+// Only when the request asked about exactly one item may the answer be a bare decision ("follow-up, not part of this PR"), and then
+// it must name no other item and only that one decision. Any negation before a decision word, or two decisions for one item, and
+// the answer decides nothing. Returns Map(ID upper case → ACCEPT | FOLLOW-UP | REJECT), only for asked ids.
+const DECISION = '(accept(?:s|ed)?|follow[- ]?ups?|reject(?:s|ed)?)';
+const ITEM = 'r\\d{1,4}-[a-z]{1,8}\\d{1,4}';
+const decisionOf = (w) => (/^accept/i.test(w) ? 'ACCEPT' : /^reject/i.test(w) ? 'REJECT' : 'FOLLOW-UP');
+const NEGATED = new RegExp(`\\b(?:not|no|don'?t|do not|never|instead of|rather than)\\s+(?:\\S+\\s+)?${DECISION}\\b`, 'i');
+export function rulingsIn(answer, askedIds) {
+  const a = String(answer ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const asked = (askedIds ?? []).map((x) => String(x).toUpperCase());
+  const out = new Map();
+  if (NEGATED.test(a)) return out;
+  const pairs = [...a.matchAll(new RegExp(`\\b(${ITEM})\\b\\s*[:=–—-]?\\s*${DECISION}\\b`, 'gi'))];
+  if (pairs.length > 0) {
+    const seen = new Map();
+    for (const [, id, d] of pairs) {
+      const k = id.toUpperCase();
+      seen.set(k, seen.has(k) && seen.get(k) !== decisionOf(d) ? null : decisionOf(d));
+    }
+    for (const [k, v] of seen) if (v !== null && asked.includes(k)) out.set(k, v);
+    return out;
+  }
+  if (asked.length !== 1) return out;
+  if ([...a.matchAll(new RegExp(`\\b${ITEM}\\b`, 'gi'))].some((m) => m[0].toUpperCase() !== asked[0])) return out;
+  const said = new Set([...a.matchAll(new RegExp(`\\b${DECISION}\\b`, 'gi'))].map((m) => decisionOf(m[1])));
+  if (said.size === 1) out.set(asked[0], [...said][0]);
+  return out;
+}
 
 // triage owner-ruling: did the owner answer a ruling request for this repository, PR and item (any session, last 24 h) with exactly
-// `quote`, and does that answer say `decision`? (Compared with runs of white space as one space, case-insensitive: the quote is
-// copied from the chat.) Security review of f17b251: a part of the answer ("ok") or a decision the owner did not name could be
-// passed as the owner's word, so the quote is the WHOLE answer, it must name the decision (accept / follow-up / reject), and an
-// answer that names more than one decision must also name this item's id. Residual: in such an answer, which decision goes with which
-// id is still the agent's reading of the owner's words, which are published whole in the triage comment.
+// `quote` (the WHOLE answer; runs of white space as one space, case-insensitive: it is copied from the chat), and does that answer
+// decide `decision` for this item (rulingsIn)?
 export function ownerRuled({ repo, pr, id, quote, decision, ...opts }) {
   const key = repoKey(repo);
   const words = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
   const q = words(quote);
-  if (key === null || !Number.isInteger(pr) || q === '' || !Object.hasOwn(DECISION_WORDS, decision)) return false;
-  const said = Object.keys(DECISION_WORDS).filter((d) => DECISION_WORDS[d].test(q));
-  if (!said.includes(decision)) return false;
-  if (said.length > 1 && !new RegExp(`(?:^|[^a-z0-9-])${String(id).toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9-])`).test(q)) return false;
+  if (key === null || !Number.isInteger(pr) || q === '') return false;
   return readRecords(opts).some((r) => r.kind === 'ruling' && r.repo === key && r.pr === pr && Array.isArray(r.ids) && r.ids.includes(id)
-    && typeof r.prompt === 'string' && words(r.prompt) === q);
+    && typeof r.prompt === 'string' && words(r.prompt) === q && rulingsIn(r.prompt, r.ids).get(String(id).toUpperCase()) === decision);
 }
 
 // The owner-item set as one short digest: each item is one line (kind, rule or id, file); 'none' when there are none.

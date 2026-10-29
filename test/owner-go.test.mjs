@@ -10,7 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
-  presentedRuling, recordRuling, ownerRuled,
+  presentedRuling, recordRuling, ownerRuled, rulingsIn,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -93,7 +93,7 @@ test('owner-go: subagents, other hook events and odd session names never record'
   assert.equal(existsSync(join(ownerGoDir(home), '..etc.jsonl')), false);
 });
 
-// Phase 3b: the ruling recorder (triage owner-ruling --owner-quote must be the owner's words, answering a ruling request).
+// Phase 3b: the ruling recorder (triage owner-ruling --owner-quote must be the owner's whole answer to a ruling request).
 test('owner-go: a ruling is recorded only after a reply that ends with the ruling line, and only for the owner', () => {
   const home = tmp();
   const now = () => Date.parse('2026-10-14T10:00:00Z');
@@ -103,29 +103,44 @@ test('owner-go: a ruling is recorded only after a reply that ends with the rulin
   for (const bad of [`${ASK}\nanything after`, '⚖️ Owner ruling needed #58: R1-B1', '⚖️ Owner ruling needed: R1-B1 · repo o/r', '⚖️ Owner ruling needed #58: all of them · repo o/r']) {
     assert.equal(presentedRuling(bad), null, bad);
   }
-  const r = recordRuling(input(home, 'Reject R1-B1, it is fine as is.', [said(ASK)]), { home, now });
-  assert.deepEqual([r.kind, r.repo, r.pr, r.ids, r.prompt], ['ruling', 'o/r', 58, ['R1-B1', 'R2-S3'], 'Reject R1-B1, it is fine as is.']);
-  const ruled = (o) => ownerRuled({ repo: 'o/r', pr: 58, id: 'R2-S3', quote: 'reject r1-b1,  IT IS FINE as is.', decision: 'REJECT', home, now, ...o });
+  const answer = 'R1-B1: reject, it is fine as is.  R2-S3 follow-up';
+  const r = recordRuling(input(home, answer, [said(ASK)]), { home, now });
+  assert.deepEqual([r.kind, r.repo, r.pr, r.ids, r.prompt], ['ruling', 'o/r', 58, ['R1-B1', 'R2-S3'], answer]);
+  const ruled = (o) => ownerRuled({ repo: 'o/r', pr: 58, id: 'R1-B1', quote: 'r1-b1: REJECT, it is fine as is. r2-s3 follow-up', decision: 'REJECT', home, now, ...o });
   assert.equal(ruled({}), true, 'the whole answer, white space and case aside');
-  assert.equal(ruled({ quote: 'it is fine as is' }), false, 'a part of the answer');
-  assert.equal(ruled({ decision: 'ACCEPT' }), false, 'a decision the answer does not say');
-  assert.equal(ruled({ decision: 'MAYBE' }), false);
+  assert.equal(ruled({ id: 'R2-S3', decision: 'FOLLOW-UP' }), true, 'each item its own decision');
+  assert.equal(ruled({ id: 'R2-S3', decision: 'REJECT' }), false, 'the decision written for another item');
+  assert.equal(ruled({ quote: 'R1-B1: reject, it is fine as is.' }), false, 'a part of the answer');
+  assert.equal(ruled({ decision: 'ACCEPT' }), false);
   assert.equal(ruled({ id: 'R3-B1' }), false, 'an item not asked about');
   assert.equal(ruled({ quote: '  ' }), false, 'an empty quote');
   assert.equal(ruled({ now: () => now() + 25 * 3600 * 1000 }), false, 'older than a day');
-  const two = 'R1-B1 accept, R2-S3 reject.';
-  recordRuling(input(home, two, [said(ASK)]), { home, now });
-  assert.equal(ruled({ quote: two, id: 'R1-B1', decision: 'ACCEPT' }), true, 'several decisions: the id is named');
-  const longer = 'R1-B10 accept, R2-S3 reject.';
-  recordRuling(input(home, longer, [said(ASK)]), { home, now });
-  assert.equal(ruled({ quote: longer, id: 'R1-B1', decision: 'ACCEPT' }), false, 'R1-B10 is another item than R1-B1');
-  const loose = 'accept one, reject the other';
-  recordRuling(input(home, loose, [said(ASK)]), { home, now });
-  assert.equal(ruled({ quote: loose, decision: 'ACCEPT' }), false, 'several decisions and no id named');
   assert.deepEqual(readApprovals({ home, now }), [], 'a ruling never reads as a "merge"');
   assert.equal(recordRuling(input(home, 'reject it', [said(ASK)], { agent_id: 'a1' }), { home, now }), null, 'a subagent');
   assert.equal(recordRuling(input(home, 'reject it', [said('No ruling asked here.')]), { home, now }), null, 'no ruling line');
   assert.equal(recordApproval(input(home, 'reject it', [said(ASK)]), { home, now }), null, 'not a "merge" either');
+});
+
+// Security reviews of f17b251 / ff8090f: the answer is read in one fixed form, so a negation, a loose answer to several items or
+// a decision written for another item never passes for the owner's ruling.
+test('owner-go: rulingsIn reads only "<id>: <decision>" pairs, or a bare decision when one item was asked', () => {
+  const two = ['R1-B1', 'R2-S3'];
+  const read = (answer, asked = two) => Object.fromEntries(rulingsIn(answer, asked));
+  assert.deepEqual(read('R1-B1: accept. R2-S3 - reject, it is fine'), { 'R1-B1': 'ACCEPT', 'R2-S3': 'REJECT' });
+  assert.deepEqual(read('r1-b1 followup, r2-s3=Follow up'), { 'R1-B1': 'FOLLOW-UP', 'R2-S3': 'FOLLOW-UP' });
+  assert.deepEqual(read('accept one, reject the other'), {}, 'several items asked: each must be named');
+  assert.deepEqual(read('accept R1-B1'), {}, 'the decision before the id is not the form');
+  assert.deepEqual(read('R1-B1: accept, R1-B1: reject'), {}, 'two decisions for one item');
+  assert.deepEqual(read('R1-B10: accept'), {}, 'R1-B10 is another item, not asked');
+  assert.deepEqual(read("R1-B1: don't accept, R2-S3: reject"), {}, 'a negated decision: the answer decides nothing');
+  assert.deepEqual(read('R1-B1: accept rather than reject'), {}, 'rather than: decides nothing');
+  const one = (answer) => read(answer, ['R1-B1']);
+  assert.deepEqual(one('Yes, file it as a follow-up, not part of this PR.'), { 'R1-B1': 'FOLLOW-UP' }, 'one item asked: a bare decision');
+  assert.deepEqual(one('ok'), {}, 'no decision');
+  assert.deepEqual(one('accept the first, reject the rest'), {}, 'two decisions');
+  assert.deepEqual(one('accept R2-S3'), {}, 'names another item');
+  assert.deepEqual(one('do not accept it'), {}, 'negated');
+  assert.deepEqual(one('no follow-up needed'), {}, 'negated');
 });
 
 test('owner-go: records are written and read only through real folders and files', { skip: process.platform === 'win32' }, () => {

@@ -375,7 +375,7 @@ executable.
   `model_not_found`; it never silently falls back).
   With `owner_approval: chat` you can instead rule on the disputed items in chat: the run records it with
   `pipeline triage owner-ruling` (it asks with a `⚖️ Owner ruling needed` line; your whole answer to it is recorded on this machine and
-  must say accept, follow-up or reject; it is published in the triage comment), you still say "merge"
+  must say `R1-B1: accept` / `follow-up` / `reject` per item; it is published in the triage comment), you still say "merge"
   yourself, then remove `needs-human` and say `ship resume N`.
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
 - **`--check` reports drift:** someone edited an installed file (or an install did not finish); run `node ~/.claude/pipeline/bin/pipeline.mjs update`, or re-run `./install.sh`.
