@@ -711,10 +711,13 @@ function makeMatchers(ctx) {
       if (!can(segs[i], '.review')) continue;
       const rest = segs.slice(i + 1).filter((s) => s !== '');
       if (rest.length === 0 || segs[i] === '**' || rest[0] === '**') return true;
-      if (REVIEW_SAMPLES.some((n) => can(rest[0], n)) && (rest.length === 1 || can(rest[0], 'round-1'))) return true;
+      // (Codex R1: comparing the next name with REVIEW_SAMPLES let `.rev*/round-2/codex.json` and `.rev*/staging-smoke.json` through. A
+      // literal name is judged by the protected pattern itself; a wildcard one in a review folder may be any protected file: refused.)
+      if (/[*?[]/.test(rest[0]) || reviewName.test(`.review/${rest[0]}`)) return true;
     }
     return false;
   };
+  const reviewName = new RegExp(REVIEW_FILE_SRC, ctx.ci ? 'i' : '');
 
   // Is a protected file named in `text`? By absolute path (in any of its spellings), by a tail with an unknown
   // prefix, or by a relative tail that lands in a protected root from one of `dirs`.

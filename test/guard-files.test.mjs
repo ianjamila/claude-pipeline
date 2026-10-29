@@ -948,6 +948,11 @@ test('Phase 3b: a repo\'s review state is protected from every write, wherever t
     'shopt -s dotglob globstar; cp /tmp/x **/state.json',
     'cp /tmp/x */state.json(D)', // (a zsh glob qualifier: D lets the wildcard match the dot folder)
     'cp /tmp/x */state.json(#q.ND)',
+    // (Codex R1: any round, any smoke target, not only the sample names; a wildcard name written into a review folder may be any of them)
+    'cp /tmp/forged.json .rev*/round-2/codex.json',
+    'cp /tmp/x .rev*/staging-smoke.json',
+    'cp /tmp/x .review/round-[2-9]/codex.json',
+    'cp /tmp/x .review/hardstops*.json',
     "node -e \"require('fs').writeFileSync('.review/state.json', '{}')\"",
     "node -e \"fs.writeFileSync(path.join(root, '.review', 'state.json'), s)\"",
     'cd "$X" && echo x > state.json', // (an unknown directory may be a review folder)
@@ -958,7 +963,8 @@ test('Phase 3b: a repo\'s review state is protected from every write, wherever t
     'ls -la .review .review/round-1',
     'mkdir -p .review', // (the ship skill, before it writes hardstops.json: an empty folder holds nothing)
     'node ~/.claude/pipeline/bin/pipeline.mjs hardstops --base origin/main --head HEAD > .review/hardstops.json',
-    'cp /tmp/x .review/hardstops*.json',
+    'cp /tmp/x .rev*/notes.md', // (a literal name that is no review file)
+    'cat .review/round-*/codex.json', // (reading through a wildcard)
     'echo x > other/state.json',
     'echo x > notes/review/state.json',
     'npx prettier --write "src/**/*.ts"', // (a wildcard reaches a dot folder only with dotglob)
