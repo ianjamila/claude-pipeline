@@ -300,3 +300,17 @@ test('--owner-go with production configured: merges, records no prod-before and 
   assert.match((r.json.warnings ?? []).join('\n'), /no prod-before/);
   assert.equal(s.fake.lines().some((l) => /prod-before/.test(l)), false);
 });
+
+// Fable attacker pass: the agent writes `items none` itself, so a diff with an owner item (or a blocking hard-stop) never takes
+// the owner-go route, whatever the owner's record says: it needs the gated route bound to the gate's ownerItems digest.
+test('--owner-go refuses a diff with a hard-stop: owner-merge item (chat) or blocking hit (label mode)', (t) => {
+  for (const yml of [chatYml(), hardStopYml()]) {
+    const s = scenario({ yml: yml.replace('{pr} {sha}', '{pr} --match-head-commit {sha}'), report: null, state: null });
+    ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'));
+    const r = goMerge(s);
+    assertExit(r, 1);
+    assert.equal(r.json.error, 'live-check');
+    assert.match(r.json.reasons.join('\n'), /hardstops|owner-items: 1 owner item/);
+    assert.deepEqual(s.mergeCalls(), []);
+  }
+});

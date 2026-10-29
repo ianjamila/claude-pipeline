@@ -850,7 +850,7 @@ function checkApi(rest, env, dir, ctx) {
   const body = gatherBody(flags, dir, ctx);
   const haystack = safeDecode(`${rest.join('\n')}\n${body.text}`);
   // -- the review-complete marker, in any write (a comment, an edit of one, a review, an issue body): see reviewMarkerVerdict
-  const marker = apiReviewMarkerVerdict(ep, haystack, body, dir, ctx);
+  const marker = apiReviewMarkerVerdict(ep, positionals[0], haystack, body, dir, ctx);
   if (marker) return marker;
   const approval = mentionsAny(haystack, APPROVAL_LABELS);
   const guard = mentionsAny(haystack, GUARD_LABELS);
@@ -1020,7 +1020,10 @@ function repoMergeCommandVerdict(argv, dir, ctx) {
 // this guard never sees). Every gh route that writes text an agent can see is refused when that text holds the marker: the
 // words of the command (--body, --comment, --title …), a --body-file / -F file, and gh api fields and --input files
 // (checkApi). The marker is matched without its comment delimiters or version, case-insensitively. Residual (as for labels): a
-// body piped in on stdin from a file, or a client of the agent's own, is not seen.
+// body piped in on stdin from a file, or a client of the agent's own, is not seen; nor is a body file that a process started by
+// an EARLIER command (a background job) rewrites between this check and gh reading it (Fable attacker pass): the hook judges one
+// command line, not what else is running. The local review state itself (.review/state.json, which review-complete trusts) is
+// not protected here: tracked as an open item before ci.review_check is turned on anywhere.
 const REVIEW_MARKER_RE = new RegExp(escapeRe(REVIEW_MARKER_TEXT), 'i');
 const mentionsReviewMarker = (text) => REVIEW_MARKER_RE.test(String(text ?? '')) || REVIEW_MARKER_RE.test(safeDecode(String(text ?? '')));
 const REVIEW_MARKER_DENIED = `the text carries the review-complete marker (${REVIEW_MARKER_TEXT}), which only \`pipeline review-complete --pr N\` may post: it checks that a clean review covers the current content first. Run it instead.`;
@@ -1121,7 +1124,10 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
 // JSON and GraphQL strings may spell any character as \uXXXX (`claude-pipeline:review-complete`): GitHub stores the decoded
 // text, so the marker is also looked for with those escapes decoded. (An escaped backslash before `u` is decoded too: that can
 // only refuse more, never less.)
-const decodeUnicodeEscapes = (s) => String(s ?? '').replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+// GraphQL also has the braced form \u{XXXXXX} (security review of ee9899f).
+const decodeUnicodeEscapes = (s) => String(s ?? '')
+  .replace(/\\u\{([0-9a-fA-F]{1,6})\}/g, (m, h) => { const n = parseInt(h, 16); return n <= 0x10ffff ? String.fromCodePoint(n) : m; })
+  .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
 // API writes that create or edit an issue / PR conversation comment, the only text the guard workflow reads for the marker
 // (REST, or the GraphQL addComment / updateIssueComment mutations).
 const API_COMMENT_PATH = /^repos\/[^/]+\/[^/]+\/issues\/([^/]+\/comments|comments\/[^/]+)$/i;
@@ -1129,17 +1135,20 @@ const COMMENT_MUTATION = /\b(addComment|updateIssueComment)\b/;
 
 // The review-complete marker in a `gh api` write (Codex review of 4c595df): the line, every field and input file, with JSON /
 // GraphQL \u escapes decoded. For a write that creates or edits a conversation comment, what the guard cannot read is refused
-// as in reviewMarkerVerdict: a field value built at run time ($VAR, $(cat f), backticks; not the GraphQL query itself, whose
-// `$name` are its variables), a body on stdin (--input -) or in a file that is missing or unreadable, and a body file written
-// earlier on this line (it holds text that does not exist yet).
-function apiReviewMarkerVerdict(ep, haystack, body, dir, ctx) {
+// as in reviewMarkerVerdict: a field value built at run time ($VAR, $(cat f), backticks), a body on stdin (--input -) or in a
+// file that is missing or unreadable, and a body file written earlier on this line (it holds text that does not exist yet).
+// Every GraphQL write gets the file checks BEFORE its query is judged (Codex recheck: an input file replaced earlier on the
+// line was judged on its old, harmless query). A GraphQL query typed on the line that holds `$` or a backtick must be
+// single-quoted, and appear once on the line (Codex recheck + security review of ee9899f): in double quotes the shell would
+// rewrite it after this guard read it — `body:\"$BODY\"`, or a declared `$b` the shell fills from an exported b — so the
+// mutation allowlist (checkGraphql) and the comment-mutation test below would judge a query GitHub never receives. Its own
+// `$name` variables are fine single-quoted. An endpoint built at run time may be a comment endpoint, so it is judged as one.
+function apiReviewMarkerVerdict(ep, rawEp, haystack, body, dir, ctx) {
   const texts = [haystack, ctx.fullText, ...body.fields.map((f) => f.value)];
   if (texts.some((t) => mentionsReviewMarker(t) || mentionsReviewMarker(decodeUnicodeEscapes(t)))) return deny(REVIEW_MARKER_DENIED);
-  const mutation = /^graphql$/i.test(ep) && body.queries.some((q) => COMMENT_MUTATION.test(q));
-  if (!API_COMMENT_PATH.test(ep) && !mutation) return null;
-  if (body.fields.some((f) => f.key !== 'query' && typeof f.written === 'string' && DYNAMIC.test(f.written))) {
-    return deny('a field of this API write is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the review-complete marker. Write the body to a file and pass it with a literal name (-F body=@file or --input file).');
-  }
+  const graphql = /^graphql$/i.test(ep);
+  const runTimeEndpoint = DYNAMIC.test(String(rawEp ?? ''));
+  if (!graphql && !runTimeEndpoint && !API_COMMENT_PATH.test(ep)) return null;
   if (body.unknown) return deny('the body of this API write comes from stdin or a file that cannot be read here, so it cannot be checked for the review-complete marker. Pass a readable file with a literal name.');
   for (const file of body.files) {
     if (/^~|[*?[\]{}]/.test(file) || DYNAMIC.test(file)) return deny(`the input file name ${file} is expanded by the shell, so which file is sent cannot be verified for the review-complete marker. Name the file literally.`);
@@ -1147,6 +1156,20 @@ function apiReviewMarkerVerdict(ep, haystack, body, dir, ctx) {
     if (writtenTo(ctx.writeFrames, path.resolve(dir, file), { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) !== null) {
       return deny(`${file} may be written earlier on this line, so the body that is sent cannot be checked for the review-complete marker. Write the file in a command of its own.`);
     }
+  }
+  const line = String(ctx.fullText ?? '');
+  for (const f of body.fields) {
+    if (f.key !== 'query' || typeof f.written !== 'string') continue;
+    const q = f.written.slice(f.written.indexOf('=') + 1);
+    if (q.startsWith('@') || !DYNAMIC.test(q)) continue; // (a query read from a file is never shell-expanded)
+    const once = line.split(q).length === 2;
+    if (!once || !(line.includes(`'${q}'`) || line.includes(`'query=${q}'`))) {
+      return deny('this GraphQL query holds `$` or a backtick and is not single-quoted (once) on the line, so the shell may rewrite it after it was checked. Single-quote the query (-f query=\'...\') and pass values as variables, or use the REST comments API with -F body=@file.');
+    }
+  }
+  const comment = !graphql || body.queries.some((q) => COMMENT_MUTATION.test(q));
+  if (comment && body.fields.some((f) => f.key !== 'query' && typeof f.written === 'string' && DYNAMIC.test(f.written))) {
+    return deny('a field of this API write is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the review-complete marker. Write the body to a file and pass it with a literal name (-F body=@file or --input file).');
   }
   return null;
 }

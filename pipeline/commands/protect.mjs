@@ -18,6 +18,8 @@ export const meta = {
 // posted it, so a status posted with a person's token (the owner's, which agents also use) never satisfies branch protection.
 // That is what makes `Test integrity`, `Hard-stop scan` and `Cross-model review` unforgeable from a terminal. A check that
 // another app posts (a deploy provider, say) must not be listed in ci.required_checks, or nothing could ever satisfy it.
+// The pin does not stop a PR into a side branch whose own copy of the workflow posts as GitHub Actions on the same head: only
+// the final gate's provenance check (guard-provenance.mjs) catches that, so a direct `gh pr merge` must stay hook-blocked.
 export const GITHUB_ACTIONS_APP_ID = 15368;
 
 export function protectionPayload(checks) {

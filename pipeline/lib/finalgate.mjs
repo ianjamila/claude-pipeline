@@ -712,15 +712,26 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
 // guard statuses and the Cross-model review status only with their provenance). The owner's recorded "merge" is checked by the
 // caller. Nothing here vouches for a verify step: no proofs are produced (a deferred step's CI proof is a gate matter), and
 // nothing is written, so a later plain `P merge` still needs its own final gate. Returns { ok, head, checks, failed }.
-export const OWNER_GO_CHECKS = Object.freeze(['pr-open', 'labels', 'ci']);
+// The owner's record says `items none`, but the agent wrote that line: the diff itself must have no owner item either (Fable
+// attacker pass): no blocking hard-stop, no test-integrity violation, and no hard-stop or integrity item the owner merges in chat.
+// A PR that has any of those takes the gated route, where the owner's "merge" is bound to the gate's ownerItems digest.
+export const OWNER_GO_CHECKS = Object.freeze(['pr-open', 'labels', 'ci', 'hardstops', 'integrity', 'owner-items']);
 export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep }) {
   const head = headSha({ cwd: root });
   const info = await readPrSettled({ gh, pr, fields: [...PR_FIELDS], sleep, pauseMs: mergeablePause(env) });
   const diff = lazyDiff(root, config);
+  const hardstops = await safely('hardstops', () => hardstopsCheck({ root, config, diff }));
+  const integrity = await safely('integrity', () => integrityCheck({ config, diff }));
+  const items = [...(hardstops.ownerItems ?? []), ...(integrity.ownerItems ?? [])];
   const checks = [
     await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config }) })),
     await safely('labels', () => labelsCheck(info)),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
+    hardstops,
+    integrity,
+    check('owner-items', items.length === 0, items.length === 0
+      ? 'none'
+      : `${items.length} owner item(s) (${items.slice(0, 3).join('; ')}${items.length > 3 ? '; ...' : ''}): --owner-go only merges a diff without any; run the final gate and merge with --owner-approved-head / --owner-approved-items`),
   ];
   return { ok: checks.every((c) => c.ok), head, checks, failed: checks.filter((c) => !c.ok).map((c) => c.name) };
 }

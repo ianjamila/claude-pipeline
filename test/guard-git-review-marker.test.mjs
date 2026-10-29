@@ -111,6 +111,30 @@ test('Codex review of 4c595df: gh api writes with escaped markers, run-time fiel
   ]) assert.equal(decide(command), 'allow', command);
 });
 
+test('Codex recheck + security review of ee9899f: double-quoted GraphQL, replaced GraphQL input, run-time endpoint, \\u{..} escapes', () => {
+  writeFileSync(join(dir, 'request.json'), '{"query":"query { viewer { login } }"}');
+  writeFileSync(join(dir, 'forged.json'), '{"query":"mutation { addComment(input: {subjectId: \\"X\\", body: \\"hi\\"}) { clientMutationId } }"}');
+  for (const command of [
+    'gh api graphql -f query="mutation { addComment(input:{subjectId:\\"X\\",body:\\"$BODY\\"}) { clientMutationId } }"',
+    'gh api graphql -f query="mutation($b: String!) { addComment(input:{subjectId:\\"X\\",body:$b}) { clientMutationId } }" -f b=hi',
+    'gh api graphql -f query="mutation { minimizeComment(input:{subjectId:\\"$X\\",classifier:SPAM}) { clientMutationId } }"',
+    'gh api graphql -f query="$Q"',
+    "echo 'query { viewer { login } } $X' && gh api graphql -f query=\"query { viewer { login } } $X\"",
+    'cp forged.json request.json && gh api graphql --input request.json',
+    'gh api "$EP" -f body="$B"',
+    'gh api "$EP" --input -',
+    "gh api graphql -f query='mutation { addComment(input: {subjectId: \"X\", body: \"claude-pipeline\\u{3a}review-complete\"}) { clientMutationId } }'",
+    "gh api graphql -f query='mutation { addComment(input: {subjectId: \"X\", body: \"claude-pipeline\\u{00003A}review-complete\"}) { clientMutationId } }'",
+  ]) assert.equal(decide(command), 'deny', command);
+  for (const command of [
+    "gh api graphql -f query='mutation($id: ID!) { markPullRequestReadyForReview(input:{pullRequestId:$id}) { clientMutationId } }' -f id=X",
+    "gh api graphql -f query='query($o: String!) { repository(owner:$o, name:\"x\") { id } }' -f o=\"$OWNER\"",
+    "gh api graphql -f 'query=query($o: String!) { repository(owner:$o, name:\"x\") { id } }' -f o=acme",
+    'gh api graphql --input request.json',
+    'gh api "$EP" -F body=@plain.md',
+  ]) assert.equal(decide(command), 'allow', command);
+});
+
 test('ordinary comments, reads and the review-complete command itself still pass; so does P merge --owner-go', () => {
   for (const command of [
     'gh pr comment 5 --body "looks good"',
