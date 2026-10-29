@@ -330,15 +330,25 @@ export function approvedPr({ repo, pr, head, session, ...opts }) {
   return readApprovals({ ...opts, session }).some((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head)));
 }
 
-// triage owner-ruling: did the owner answer a ruling request for this repository, PR and item (any session, last 24 h) with words
-// that hold `quote`? (Compared with runs of white space as one space, case-insensitive: the quote is copied from the chat.)
-export function ownerRuled({ repo, pr, id, quote, ...opts }) {
+// The decision words an owner's answer is read for (triage owner-ruling --decision).
+const DECISION_WORDS = { ACCEPT: /\baccept(?:s|ed)?\b/i, 'FOLLOW-UP': /\bfollow[- ]?ups?\b/i, REJECT: /\breject(?:s|ed)?\b/i };
+
+// triage owner-ruling: did the owner answer a ruling request for this repository, PR and item (any session, last 24 h) with exactly
+// `quote`, and does that answer say `decision`? (Compared with runs of white space as one space, case-insensitive: the quote is
+// copied from the chat.) Security review of f17b251: a part of the answer ("ok") or a decision the owner did not name could be
+// passed as the owner's word, so the quote is the WHOLE answer, it must name the decision (accept / follow-up / reject), and an
+// answer that names more than one decision must also name this item's id. Residual: in such an answer, which decision goes with which
+// id is still the agent's reading of the owner's words, which are published whole in the triage comment.
+export function ownerRuled({ repo, pr, id, quote, decision, ...opts }) {
   const key = repoKey(repo);
   const words = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
   const q = words(quote);
-  if (key === null || !Number.isInteger(pr) || q === '') return false;
+  if (key === null || !Number.isInteger(pr) || q === '' || !Object.hasOwn(DECISION_WORDS, decision)) return false;
+  const said = Object.keys(DECISION_WORDS).filter((d) => DECISION_WORDS[d].test(q));
+  if (!said.includes(decision)) return false;
+  if (said.length > 1 && !new RegExp(`(?:^|[^a-z0-9-])${String(id).toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9-])`).test(q)) return false;
   return readRecords(opts).some((r) => r.kind === 'ruling' && r.repo === key && r.pr === pr && Array.isArray(r.ids) && r.ids.includes(id)
-    && typeof r.prompt === 'string' && words(r.prompt).includes(q));
+    && typeof r.prompt === 'string' && words(r.prompt) === q);
 }
 
 // The owner-item set as one short digest: each item is one line (kind, rule or id, file); 'none' when there are none.

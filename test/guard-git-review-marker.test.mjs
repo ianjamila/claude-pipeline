@@ -5,8 +5,11 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { evaluateGitCommand, STATE_MARKER_TEXT, TRIAGE_MARKER_TEXT } from '../pipeline/hooks/lib/git-policy.mjs';
+import { evaluateGitCommand, RUN_MARKER_TEXTS, STATE_MARKER_TEXT, TRIAGE_MARKER_TEXT } from '../pipeline/hooks/lib/git-policy.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
+import { encodeRecord, STATUS_START, STATUS_END } from '../pipeline/lib/run-record.mjs';
+import { renderEvent } from '../pipeline/lib/run-events.mjs';
+import { followupMarker } from '../pipeline/commands/followups.mjs';
 import { encodeForComment } from '../pipeline/lib/state.mjs';
 
 const dir = mkdtempSync(join(tmpdir(), 'marker-'));
@@ -181,4 +184,18 @@ test('Phase 3b: the triage and review-state markers are refused like the review-
 test('Phase 3b: the guarded marker texts are the ones the pipeline writes', () => {
   assert.ok(MARKERS.triage.includes(TRIAGE_MARKER_TEXT));
   assert.ok(encodeForComment({ pr: 1 }).includes(STATE_MARKER_TEXT));
+});
+
+// Phase 3b: every marker the pipeline's commands write is refused in hand-posted text: each one as the real writer renders it.
+test('Phase 3b: the run markers (summary, record, status, needs-human, blocked, awaiting-review, events, follow-ups) are refused too', () => {
+  const written = [...Object.values(MARKERS), encodeRecord({ v: 1, step: 'merge' }), STATUS_START, STATUS_END,
+    renderEvent('rollback-result', 'r1', 'rolled back', { ok: true }), followupMarker(7, { fingerprint: 'fp1', id: 'R1-S1' })];
+  for (const text of written) {
+    assert.ok(RUN_MARKER_TEXTS.some((m) => text.toLowerCase().includes(m)) || text.includes(TRIAGE_MARKER_TEXT), `not guarded: ${text.slice(0, 60)}`);
+    const body = JSON.stringify(`${text}\nhand-written`);
+    assert.equal(decide(`gh pr comment 7 --body ${body}`), 'deny', text.slice(0, 60));
+    assert.equal(decide(`gh issue create --title t --body ${body}`), 'deny', text.slice(0, 60));
+  }
+  // the words alone, in prose, are not a marker
+  assert.equal(decide('gh pr comment 7 --body "the summary comment is updated by the pipeline"'), 'allow');
 });

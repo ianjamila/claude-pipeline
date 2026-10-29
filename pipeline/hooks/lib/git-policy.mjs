@@ -79,7 +79,7 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // lowercase basename without .exe/.cmd/.bat/.com; handles /usr/bin/git and C:\Git\bin\GIT.EXE alike
 const baseName = (w) => commandName(w);
 // A command the parser could only partly resolve (`$g push`, `bash -c "$X"`, `curl … | sh`) is judged by what it mentions.
-const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close|claude-pipeline:(?:review-complete|triage|state:)/i;
+const GUARDED_WORDS = /push|merge|human-approved|test-change-approved|needs-human|pipeline-pause|pipeline-rollback|pipeline-blocked|awaiting-review|protection|ruleset|issue\s+close|claude-pipeline:(?:review-complete|triage|state:|summary|needs-human|blocked|awaiting-review|record:|status:|event|followup)/i;
 const isProtectedBranch = (b) => PROTECTED_BRANCHES.includes(String(b).toLowerCase());
 const isPrefixOf = (name, full, min = 1) => name.length >= min && full.startsWith(name);
 // Label names are case-insensitive on GitHub; a name only counts when it is not part of a longer one.
@@ -1078,10 +1078,20 @@ function repoMergeCommandVerdict(argv, dir, ctx, cmdEnv = {}) {
 // step by test/guard-git-review-marker.test.mjs.)
 export const TRIAGE_MARKER_TEXT = 'claude-pipeline:triage';
 export const STATE_MARKER_TEXT = 'claude-pipeline:state:';
-const POSTED_MARKERS = [REVIEW_MARKER_TEXT, TRIAGE_MARKER_TEXT, STATE_MARKER_TEXT];
+// Phase 3b: and every other marker the pipeline's own commands write, which readers trust as the pipeline's word because the viewer
+// (the agent's login) posted it: the summary comment and its run record (`P merge` reads from it whether a run was resumed, and so
+// whether the owner's approval of the head is needed), its status block, the needs-human / blocked / awaiting-review comments, run
+// events (prod-before, rollback intent and result: prod-watch and resume read them) and the follow-up issue stamp (a forged one
+// suppresses filing). Only `P summary` / `P checkpoint`, `P comment`, the run-event writers and `P followups create` post them.
+// (Kept in step with lib/render.mjs MARKERS, lib/run-record.mjs, lib/run-events.mjs and commands/followups.mjs by
+// test/guard-git-review-marker.test.mjs.)
+export const RUN_MARKER_TEXTS = Object.freeze(['claude-pipeline:summary', 'claude-pipeline:needs-human', 'claude-pipeline:blocked',
+  'claude-pipeline:awaiting-review', 'claude-pipeline:record:', 'claude-pipeline:status:', 'claude-pipeline:event:', 'claude-pipeline:event-data:',
+  'claude-pipeline:followup']);
+const POSTED_MARKERS = [REVIEW_MARKER_TEXT, TRIAGE_MARKER_TEXT, STATE_MARKER_TEXT, ...RUN_MARKER_TEXTS];
 const REVIEW_MARKER_RE = new RegExp(POSTED_MARKERS.map(escapeRe).join('|'), 'i');
 const mentionsReviewMarker = (text) => REVIEW_MARKER_RE.test(String(text ?? '')) || REVIEW_MARKER_RE.test(safeDecode(String(text ?? '')));
-const REVIEW_MARKER_DENIED = `the text carries a marker only the pipeline posts: the review-complete marker (${REVIEW_MARKER_TEXT}) comes only from \`pipeline review-complete --pr N\`, which checks that a clean review covers the current content first; the triage and review-state markers (${TRIAGE_MARKER_TEXT}, ${STATE_MARKER_TEXT}) only from \`pipeline comment --pr N --kind triage\`, which renders the local review state. Run those instead.`;
+const REVIEW_MARKER_DENIED = `the text carries a marker only the pipeline posts: the review-complete marker (${REVIEW_MARKER_TEXT}) comes only from \`pipeline review-complete --pr N\`, which checks that a clean review covers the current content first; the triage and review-state markers (${TRIAGE_MARKER_TEXT}, ${STATE_MARKER_TEXT}) only from \`pipeline comment --pr N --kind triage\`, which renders the local review state; the run's own markers (summary, record, status, needs-human, blocked, awaiting-review, event, followup) only from the pipeline commands that write them (summary / checkpoint, comment, followups create). Run those instead.`;
 // gh commands that post or edit text on a PR or issue (where the workflow reads the comments), by group and verb.
 const TEXT_VERBS = { pr: ['comment', 'create', 'edit', 'review', 'close', 'merge'], issue: ['comment', 'create', 'edit', 'close'] };
 // gh's short flags for those verbs (gh 2.x): text = value is posted text or a body file; value = other value-taking; bool = switches.

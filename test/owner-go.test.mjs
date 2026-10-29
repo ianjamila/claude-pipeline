@@ -105,10 +105,23 @@ test('owner-go: a ruling is recorded only after a reply that ends with the rulin
   }
   const r = recordRuling(input(home, 'Reject R1-B1, it is fine as is.', [said(ASK)]), { home, now });
   assert.deepEqual([r.kind, r.repo, r.pr, r.ids, r.prompt], ['ruling', 'o/r', 58, ['R1-B1', 'R2-S3'], 'Reject R1-B1, it is fine as is.']);
-  assert.equal(ownerRuled({ repo: 'o/r', pr: 58, id: 'R2-S3', quote: 'it is FINE  as is', home, now }), true);
-  assert.equal(ownerRuled({ repo: 'o/r', pr: 58, id: 'R3-B1', quote: 'it is fine', home, now }), false, 'an item not asked about');
-  assert.equal(ownerRuled({ repo: 'o/r', pr: 58, id: 'R1-B1', quote: '  ', home, now }), false, 'an empty quote');
-  assert.equal(ownerRuled({ repo: 'o/r', pr: 58, id: 'R1-B1', quote: 'it is fine', home, now: () => now() + 25 * 3600 * 1000 }), false, 'older than a day');
+  const ruled = (o) => ownerRuled({ repo: 'o/r', pr: 58, id: 'R2-S3', quote: 'reject r1-b1,  IT IS FINE as is.', decision: 'REJECT', home, now, ...o });
+  assert.equal(ruled({}), true, 'the whole answer, white space and case aside');
+  assert.equal(ruled({ quote: 'it is fine as is' }), false, 'a part of the answer');
+  assert.equal(ruled({ decision: 'ACCEPT' }), false, 'a decision the answer does not say');
+  assert.equal(ruled({ decision: 'MAYBE' }), false);
+  assert.equal(ruled({ id: 'R3-B1' }), false, 'an item not asked about');
+  assert.equal(ruled({ quote: '  ' }), false, 'an empty quote');
+  assert.equal(ruled({ now: () => now() + 25 * 3600 * 1000 }), false, 'older than a day');
+  const two = 'R1-B1 accept, R2-S3 reject.';
+  recordRuling(input(home, two, [said(ASK)]), { home, now });
+  assert.equal(ruled({ quote: two, id: 'R1-B1', decision: 'ACCEPT' }), true, 'several decisions: the id is named');
+  const longer = 'R1-B10 accept, R2-S3 reject.';
+  recordRuling(input(home, longer, [said(ASK)]), { home, now });
+  assert.equal(ruled({ quote: longer, id: 'R1-B1', decision: 'ACCEPT' }), false, 'R1-B10 is another item than R1-B1');
+  const loose = 'accept one, reject the other';
+  recordRuling(input(home, loose, [said(ASK)]), { home, now });
+  assert.equal(ruled({ quote: loose, decision: 'ACCEPT' }), false, 'several decisions and no id named');
   assert.deepEqual(readApprovals({ home, now }), [], 'a ruling never reads as a "merge"');
   assert.equal(recordRuling(input(home, 'reject it', [said(ASK)], { agent_id: 'a1' }), { home, now }), null, 'a subagent');
   assert.equal(recordRuling(input(home, 'reject it', [said('No ruling asked here.')]), { home, now }), null, 'no ruling line');

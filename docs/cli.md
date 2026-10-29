@@ -523,11 +523,11 @@ pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJEC
   -> {ok, round, id, final, published: false, next}; records the OWNER's decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human
   -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state's
   -> works on an already published round. ACCEPT still needs the fix and a later review round; FOLLOW-UP is filed by `followups create`; the quote is published in the triage comment and the final gate counts it as ownerMerge (the owner's "merge" is still needed)
-  -> the quote must be words of the owner's prompt that answered a reply ENDING with `⚖️ Owner ruling needed #N: ID[, ID…] · repo owner/name` (the owner-go hook records it; any session, last 24 h; white space and case aside); exit 1 when no such prompt for this repository (gh's, on github.com), PR and id holds it
+  -> the quote must be the WHOLE owner prompt that answered a reply ENDING with `⚖️ Owner ruling needed #N: ID[, ID…] · repo owner/name` (the owner-go hook records it; any session, last 24 h; white space and case aside), and that answer must say the decision (accept / follow-up / reject; an answer saying several must also name ID); exit 1 otherwise, or when gh resolves the repository off github.com
   -> pass the owner's own words as --owner-quote, never a paraphrase; then re-post the triage comment NOW (`pipeline comment --pr N --kind triage`); until then the ruling is local only (`published: false`) and `pipeline state show` restores the published state without it
 ```
 
-Exit: `validate`: 0 applied, 1 judge output invalid (state untouched) · `settle`: 0 recorded, 1 refused · `light-lane`: 0 · `owner-ruling`: 0 recorded, 1 refused (label mode, a settled or missing item, empty words, a wrong --pr, no recorded owner answer holding the quote) · 2 usage / no state.
+Exit: `validate`: 0 applied, 1 judge output invalid (state untouched) · `settle`: 0 recorded, 1 refused · `light-lane`: 0 · `owner-ruling`: 0 recorded, 1 refused (label mode, a settled or missing item, empty words, a wrong --pr, no recorded owner answer that is the quote and says the decision) · 2 usage / no state.
 
 ## update
 

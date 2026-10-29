@@ -289,8 +289,8 @@ async function ownerRuling(rest, ctx) {
     const { slug, host } = gh.repo();
     const prNum = state.pr ?? pr;
     if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded ruling names a repository on github.com`);
-    if (!ownerRuled({ repo: slug, pr: prNum, id, quote: ownerQuote })) {
-      return refuse(`no owner ruling is recorded for ${slug} #${prNum} ${id} whose words hold --owner-quote: end the reply that asks with \`⚖️ Owner ruling needed #${prNum}: ${id} · repo ${slug}\` (Owner rules in chat, review-loop.md), wait for the owner's answer, and pass words copied from it as --owner-quote`);
+    if (!ownerRuled({ repo: slug, pr: prNum, id, quote: ownerQuote, decision })) {
+      return refuse(`no owner ruling is recorded for ${slug} #${prNum} ${id} whose whole answer is --owner-quote and says ${decision.toLowerCase()} (an answer naming several decisions must also name ${id}): end the reply that asks with \`⚖️ Owner ruling needed #${prNum}: ${id} · repo ${slug}\` (Owner rules in chat, review-loop.md), wait for the owner's answer, and pass all of it as --owner-quote`);
     }
     const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });
     saveState(root, updateItems(state, n, [ruled]));
