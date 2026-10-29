@@ -529,6 +529,36 @@ test('codex-review: a round that only merged the base branch in is recorded as b
   assert.equal(outcome.json.coverageValid, true);
 });
 
+test('codex-review: a base-only round past review.max_rounds is recorded (it does not count), a round with PR changes is still capped', (t) => {
+  const w = worldIgnoringReview(t, { yml: `${pipelineYml()}review:\n  max_rounds: 1\n` });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' });
+  const calls = w.captured().length;
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, true);
+  assert.equal(w.captured().length, calls, 'Codex did not run');
+  assert.deepEqual([w.state().rounds[1].n, w.state().rounds[1].baseOnly], [2, true]);
+  const outcome = w.cli(['state', 'outcome']);
+  assert.deepEqual([outcome.json.clean, outcome.json.coverageValid, outcome.json.reachedMax, outcome.json.rounds, outcome.json.reviewedRounds], [true, true, false, 2, 1]);
+
+  // a second update-branch is still not a reviewed round
+  const merged2 = mergeMainInto(w, { 'src/from-main2.js': 'export const other2 = 1;\n' });
+  const again = w.codex(3, findingsOf(), { from: merged, to: merged2 });
+  assertExit(again, 0, again.stderr + again.stdout);
+  assert.equal(again.json.baseOnly, true);
+
+  // the PR's own change on top of main's is a real round: past the cap, refused, and nothing is written for it
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head4 = w.repo.commit('own change');
+  const capped = w.codex(4, findingsOf(), { from: merged2, to: head4 });
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+  assert.equal(w.captured().length, calls, 'Codex never ran for the capped round');
+  assert.equal(existsSync(w.roundFile(4, 'diff.patch')), false, 'a refused round leaves no files');
+  assert.equal(w.state().rounds.length, 3);
+});
+
 test('codex-review: a conflicting merge falls back to the whole PR against the new base, never main\'s own changes', (t) => {
   const w = worldIgnoringReview(t);
   assertExit(w.codex(1, findingsOf()), 0);

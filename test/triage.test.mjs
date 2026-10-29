@@ -1257,6 +1257,57 @@ test('roundCapProblem: rounds stop at maxRounds plus ONE extra confirm round, on
   assert.equal(roundCapProblem({ rounds: [] }, 9), null); // not capped without a finite maxRounds
 });
 
+// Base-only rounds (main merged in, nothing of the PR's own) are not reviewed rounds: the cap counts reviewed rounds only.
+test('roundCapProblem: a base-only round is never capped, even past the extra round', () => {
+  const real = (n) => round(n, [item({ id: `R${n}-S1`, bucket: 'SUGGESTION', final: settled('REJECT') })]);
+  const baseOnly = (n) => round(n, [], 'h-final', { baseOnly: true });
+  const used = { rounds: [real(1), real(2), real(3)], maxRounds: 3, currentContentHash: 'h-new' };
+  assert.match(roundCapProblem(used, 4), /only one extra round is allowed/);
+  assert.equal(roundCapProblem(used, 4, { baseOnly: true }), null);
+  const more = { ...used, rounds: [real(1), real(2), real(3), baseOnly(4), baseOnly(5)] };
+  assert.equal(roundCapProblem(more, 6, { baseOnly: true }), null);
+  assert.match(roundCapProblem(more, 6), /only one extra round is allowed/, 'a real round after base-only rounds is still capped');
+});
+
+test('roundCapProblem: only reviewed rounds count toward max_rounds', () => {
+  const real = (n) => round(n, [], 'h-final');
+  const baseOnly = (n) => round(n, [], 'h-final', { baseOnly: true });
+  const accepting = (n) => round(n, [item({ id: `R${n}-B1`, bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), implemented: true })], 'h-old');
+  const st = (rounds) => ({ rounds, maxRounds: 3, currentContentHash: 'h-new' });
+  // [real, real, baseOnly]: two reviewed rounds, so a real round 4 is only the 3rd reviewed one
+  assert.equal(roundCapProblem(st([real(1), real(2), baseOnly(3)]), 4), null);
+  // [real x3, baseOnly]: the next real round (5) would be the 4th reviewed: refused unless the extra round is granted
+  assert.match(roundCapProblem(st([real(1), real(2), real(3), baseOnly(4)]), 5), /only one extra round is allowed/);
+  // ...which it is when the last reviewed round only accepted fixes and the base-only round came before it
+  assert.equal(roundCapProblem(st([real(1), baseOnly(2), real(3), accepting(4)]), 5), null);
+  assert.match(roundCapProblem(st([real(1), baseOnly(2), real(3), accepting(4), real(5)]), 6), /and its one extra round/);
+});
+
+test('roundOutcome: base-only rounds neither use up the extra round nor make reachedMax true', () => {
+  const real = (n) => round(n, [], 'h-final');
+  const baseOnly = (n) => round(n, [], 'h-final', { baseOnly: true });
+  const accepting = (n) => round(n, [item({ id: `R${n}-B1`, bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), implemented: true })], 'h-old');
+  // two reviewed rounds + a base-only one at maxRounds 3: not at the cap yet
+  const two = roundOutcome(stateOf([real(1), accepting(2), baseOnly(3)], { currentContentHash: 'h-new' }));
+  assert.deepEqual([two.reachedMax, two.extraRound, two.effectiveMaxRounds], [false, false, 3]);
+  // the 3rd reviewed round accepted fixes (a base-only round came before it): the extra round is still available
+  const three = roundOutcome(stateOf([real(1), baseOnly(2), real(3), accepting(4)], { currentContentHash: 'h-new' }));
+  assert.deepEqual([three.reachedMax, three.extraRound, three.effectiveMaxRounds], [false, true, 4]);
+  // the extra (4th reviewed) round used; later base-only rounds do not change that
+  const used = roundOutcome(stateOf([real(1), real(2), accepting(3), accepting(4), baseOnly(5)], { currentContentHash: 'h-new' }));
+  assert.deepEqual([used.reachedMax, used.extraRound, used.effectiveMaxRounds], [true, false, 4]);
+  // four rounds recorded but only 3 reviewed and all clean: not reachedMax, effective cap stays 3
+  const clean = roundOutcome(stateOf([real(1), baseOnly(2), real(3), baseOnly(4)]));
+  assert.deepEqual([clean.clean, clean.reachedMax, clean.effectiveMaxRounds], [true, false, 3]);
+});
+
+test('roundOutcome: a base-only round after unreviewed accepted fixes cannot look clean (fixes need a real round)', () => {
+  const unfixed = item({ id: 'R1-B1', bucket: 'BLOCKING', final: settled('ACCEPT', 'judge') });
+  const o = roundOutcome(stateOf([round(1, [unfixed]), round(2, [], 'h-final', { baseOnly: true })]));
+  assert.equal(o.clean, false);
+  assert.deepEqual(o.unimplemented, ['R1-B1']);
+});
+
 test('reuseRuled: a fixed SUGGESTION comes back implemented; a re-raised BLOCKING or security finding never does (fail closed)', () => {
   const sugg = { bucket: 'SUGGESTION', category: 'maintainability' };
   const fixed = item({ ...sugg, fingerprint: 'fx', final: settled('ACCEPT'), implemented: true });

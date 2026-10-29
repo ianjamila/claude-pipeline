@@ -10,7 +10,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { MARKERS } from '../lib/render.mjs';
 import { decodeFromComment, loadState, saveState, updateItems } from '../lib/state.mjs';
-import { roundOutcome } from '../lib/triage.mjs';
+import { reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
 import {
   allItems, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, requireState, reviewBaseRef,
   roundDir, stateExtends, withStateLock,
@@ -176,7 +176,7 @@ async function outcome(rest, ctx) {
   const result = roundOutcome({ ...state, currentContentHash: hash });
   return {
     exitCode: EXIT.OK,
-    output: { ok: true, ...result, followupsPending: followupsPending(state), currentContentHash: hash, rounds: state.rounds.length, maxRounds: state.maxRounds },
+    output: { ok: true, ...result, followupsPending: followupsPending(state), currentContentHash: hash, rounds: state.rounds.length, reviewedRounds: reviewedRoundCount(state), maxRounds: state.maxRounds },
   };
 }
 

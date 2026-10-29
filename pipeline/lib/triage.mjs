@@ -363,6 +363,10 @@ export function markLightLane(items) {
 
 // ---- exit rules -----------------------------------------------------------------------------
 
+// A round that only merged the base branch in ("Update branch") reviewed nothing of the PR's own: it does not count toward
+// maxRounds. Only reviewed rounds (not baseOnly) are counted by the cap.
+export const reviewedRoundCount = (state) => (state?.rounds ?? []).filter((r) => r?.baseOnly !== true).length;
+
 const isNewAccept = (item) => item.final?.decision === 'ACCEPT' && item.final.by !== 'cache';
 const isUnimplementedAccept = (item) => item.final?.decision === 'ACCEPT' && !item.implemented;
 const isOpenBlocking = (item) => item.bucket === 'BLOCKING' && (!item.final || isUnimplementedAccept(item));
@@ -403,12 +407,16 @@ export function roundOutcome(state) {
     coverageValid;
   // Why: a PR whose LAST allowed round only accepted items that were then fixed and verified is not in trouble,
   // it just has fixes nobody re-reviewed (owner ruling 2026-10-20). One extra round rechecks them instead of
-  // parking. It is the last: rounds.length > maxRounds is the record that it was used, so extraRound is false
+  // parking. It is the last: more than maxRounds reviewed rounds is the record that it was used, so extraRound is false
   // afterwards and anything not clean parks as before. A stale coverage hash with no new accepts does not qualify.
+  // Rounds that only merged the base branch in (baseOnly) are not counted: they neither use up a round nor the extra one.
+  // (newAccepted comes from the last round: a baseOnly round is recorded only when the PR's own patch since the previous
+  // round is empty, and an item is only marked implemented by a content change, so it never follows unreviewed fixes.)
+  const reviewed = reviewedRoundCount(state);
   const capped = Number.isFinite(state?.maxRounds);
   const extraRound =
     capped &&
-    rounds.length === state.maxRounds &&
+    reviewed === state.maxRounds &&
     !clean &&
     fablePending.length === 0 &&
     pending.length === 0 &&
@@ -416,18 +424,22 @@ export function roundOutcome(state) {
     openBlocking.length === 0 &&
     unimplemented.length === 0 &&
     newAccepted.length > 0;
-  const effectiveMaxRounds = capped ? state.maxRounds + (extraRound || rounds.length > state.maxRounds ? 1 : 0) : null;
-  const reachedMax = capped && !clean && rounds.length >= state.maxRounds && !extraRound;
+  const effectiveMaxRounds = capped ? state.maxRounds + (extraRound || reviewed > state.maxRounds ? 1 : 0) : null;
+  const reachedMax = capped && !clean && reviewed >= state.maxRounds && !extraRound;
   return { clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, extraRound, effectiveMaxRounds, coverageValid, fablePending };
 }
 
-// May round `n` start? Rounds stop at maxRounds, plus the one extra confirm round roundOutcome grants (extraRound). A state
-// without a finite maxRounds (hand-built) is not capped. -> null when it may, else the reason it may not.
-export function roundCapProblem(state, n) {
+// May round `n` start? Reviewed rounds stop at maxRounds, plus the one extra confirm round roundOutcome grants (extraRound). The
+// round being started counts as one more reviewed round unless it is baseOnly (only the base branch merged in), which is never
+// capped. A state without a finite maxRounds (hand-built) is not capped. -> null when it may, else the reason it may not.
+export function roundCapProblem(state, n, { baseOnly = false } = {}) {
   const max = state?.maxRounds;
-  if (!Number.isFinite(max) || n <= max) return null;
-  if (n === max + 1 && (state.rounds ?? []).length === max && roundOutcome(state).extraRound) return null;
-  return n === max + 1
+  if (!Number.isFinite(max) || baseOnly) return null;
+  const reviewed = reviewedRoundCount(state);
+  const next = reviewed + 1;
+  if (next <= max) return null;
+  if (next === max + 1 && reviewed === max && roundOutcome(state).extraRound) return null;
+  return next === max + 1
     ? `round ${n} would pass review.max_rounds (${max}): only one extra round is allowed, and only when the last round's open items are all accepted fixes`
     : `round ${n} would pass review.max_rounds (${max}) and its one extra round`;
 }
