@@ -1025,20 +1025,40 @@ const REVIEW_MARKER_DENIED = `the text carries the review-complete marker (${REV
 const TEXT_VERBS = { pr: ['comment', 'create', 'edit', 'review', 'close', 'merge'], issue: ['comment', 'create', 'edit', 'close'] };
 function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
   if (!(TEXT_VERBS[group] ?? []).includes(verb)) return null;
-  if (rest.some(mentionsReviewMarker)) return deny(REVIEW_MARKER_DENIED);
-  // --body-file F, --body-file=F, -F F, -FF (gh pr/issue: -F is --body-file); a file read like any other (counted)
+  // (the whole line too: a here-string, or a printf that writes the body file before this command)
+  if (rest.some(mentionsReviewMarker) || mentionsReviewMarker(ctx.fullText)) return deny(REVIEW_MARKER_DENIED);
+  // The text values (--body, --comment, --title …) and body files (--body-file F, --body-file=F, -F F, -FF: gh pr/issue -F is
+  // --body-file), as written. A value built at run time ($VAR, $(cat f), backticks) holds text the guard cannot read: refused,
+  // as for a label set at run time. Security review of 53d82ef: `--body "$(cat f)"` and a file written earlier on the line passed.
+  const TEXT_FLAGS = ['--body', '-b', '--comment', '-c', '--title', '-t', '--subject', '--body-file', '-F'];
+  const texts = [];
   const files = [];
   for (let i = 0; i < rest.length; i++) {
     const w = rest[i];
-    if (w === '--body-file' || w === '-F') files.push(rest[i + 1]);
-    else if (w.startsWith('--body-file=')) files.push(w.slice('--body-file='.length));
-    else if (/^-F./.test(w)) files.push(w.slice(2));
+    const eq = w.indexOf('=');
+    const name = w.startsWith('--') && eq > 0 ? w.slice(0, eq) : w;
+    let value;
+    if (w.startsWith('--') && eq > 0 && TEXT_FLAGS.includes(name)) value = w.slice(eq + 1);
+    else if (TEXT_FLAGS.includes(w)) value = rest[i + 1];
+    else if (/^-[bctF]./.test(w)) value = w.slice(2);
+    else continue;
+    if (value === undefined) continue;
+    texts.push(value);
+    if (name === '--body-file' || name === '-F' || w.startsWith('-F')) files.push(value);
+  }
+  if (texts.some((t) => DYNAMIC.test(t))) {
+    return deny('the comment text (or its file name) is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the review-complete marker. Write the body to a file and pass --body-file with a literal name.');
   }
   for (const file of files) {
-    if (file === undefined || file === '-') continue; // (stdin: the residual above; a here-string is in the line itself)
-    if (dir === null) continue;
+    if (file === '-') continue; // (stdin: the residual above; a here-string is in the line itself)
+    if (dir === null) return deny('cannot tell which directory this runs in, so the body file cannot be checked for the review-complete marker. Use an absolute path, or chain the cd with &&.');
+    const abs = path.resolve(dir, file);
+    // a body file an earlier command on this line wrote (or may have written) holds text that does not exist yet: refused
+    if (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: ctx.ignoreUnmodelled === true }) !== null) {
+      return deny(`${file} may be written earlier on this line, so the body that is posted cannot be checked for the review-complete marker. Write the file in a command of its own.`);
+    }
     countScript(ctx.budget);
-    const text = ctx.readText(path.resolve(dir, file));
+    const text = ctx.readText(abs);
     if (typeof text === 'string' && mentionsReviewMarker(text)) return deny(REVIEW_MARKER_DENIED);
   }
   return null;
