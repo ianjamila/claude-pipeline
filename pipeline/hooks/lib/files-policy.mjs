@@ -69,7 +69,13 @@ const REVIEW_SAMPLES = ['state.json', 'state.json.1.tmp', 'round-1', 'final-gate
 // A wildcard matches a name that starts with a dot (the .review folder) only when the line may switch that on: bash dotglob (shopt, or
 // BASHOPTS), zsh globdots / GLOB_DOTS, GLOBIGNORE (bash then matches dot names), a zsh (D) glob qualifier. Otherwise only a segment that
 // itself starts with a dot can match it (`.r*`, `.review`), as in every shell.
-const DOT_GLOB = { test: (s) => /dotglob|glob_?dots|GLOBIGNORE/i.test(s) || /\([^)\s]*D[^)\s]*\)/.test(s) };
+// (the qualifier: a `(` then a D before the next `)`, with no blank between, as /\([^)\s]*D[^)\s]*\)/ reads it; scanned in one pass, as
+// that pattern backtracks quadratically over a long run of `(` with no `)` (guard-t8b H2: 12 s for 200 kB of `$(`))
+const zshDotQualifier = (s) => String(s).split(/\s/).some((tok) => tok.split(')').slice(0, -1).some((seg) => {
+  const open = seg.indexOf('(');
+  return open >= 0 && seg.indexOf('D', open + 1) > open;
+}));
+const DOT_GLOB = { test: (s) => /dotglob|glob_?dots|GLOBIGNORE/i.test(s) || zshDotQualifier(s) };
 // The same names in command or program text, wherever they sit (a literal path, or one built from pieces: '.review', 'state.json').
 const reviewTextBody = (sep) => `(?<![\\w.\\-])\\.review${sep}(?:state\\.json|round-\\d+(?![\\w.\\-])|final-gate\\.json|[\\w.\\-]*-smoke\\.json|prod-before\\.json)`;
 
@@ -693,7 +699,8 @@ function makeMatchers(ctx) {
   // `.review`, then the end (the folder itself) or a segment that can be one of the protected names. `**` can stand for the folder and
   // for a round folder, so anything after it counts. A wildcard reaches a dot name only with DOT_GLOB on the line.
   const reviewGlob = (g) => {
-    const segs = g.split('/');
+    // (a trailing zsh glob qualifier, `*/state.json(D)`, is not part of the last name: dropped, which can only widen the match)
+    const segs = g.replace(/\([^()/]*\)$/, '').split('/');
     const can = (seg, name) => {
       if (seg === '**') return ctx.dotGlob === true || !name.startsWith('.');
       if (!/[*?[]/.test(seg)) return ctx.ci ? seg.toLowerCase() === name.toLowerCase() : seg === name;
@@ -916,8 +923,10 @@ function resolveGlobCd(e, bases, ctx, cmds, idx) {
   const real = realResolve(dir, ctx.api);
   return ctx.hit(dir) || ctx.hitAncestor(dir) || ctx.hit(real) || ctx.hitAncestor(real) ? null : real;
 }
-// (one rerun of a line per assumed directory, counted across the evaluation: past the allowance the line is refused rather than slow)
-const MAX_CD_RERUNS = 200;
+// (one rerun of a line per assumed directory, counted across the evaluation: past the allowance the line is refused rather than slow.
+// Phase 3b: 200 → 256 with the two review folders assumedCwds added, which cost a psql line under an unfollowable startup file 168 → 224
+// reruns (guard-false-positives J); the CPU deadline still bounds the line)
+const MAX_CD_RERUNS = 256;
 const MAKES_DIRS = new Set(['mkdir', 'cp', 'mv', 'tar', 'bsdtar', 'gtar', 'unzip', 'git', 'rsync', 'ditto', 'install', 'ln', 'curl', 'wget']);
 const MAX_BELOW_ROOT_DIRS = 64; // (subdirectories of the protected roots a rerun may add for a `..` write)
 function countCdRun(budget) {

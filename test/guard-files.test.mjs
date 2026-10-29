@@ -946,6 +946,8 @@ test('Phase 3b: a repo\'s review state is protected from every write, wherever t
     'cp /tmp/x .review/round-*/codex.json',
     'cp /tmp/x .rev*/state.json',
     'shopt -s dotglob globstar; cp /tmp/x **/state.json',
+    'cp /tmp/x */state.json(D)', // (a zsh glob qualifier: D lets the wildcard match the dot folder)
+    'cp /tmp/x */state.json(#q.ND)',
     "node -e \"require('fs').writeFileSync('.review/state.json', '{}')\"",
     "node -e \"fs.writeFileSync(path.join(root, '.review', 'state.json'), s)\"",
     'cd "$X" && echo x > state.json', // (an unknown directory may be a review folder)
