@@ -513,7 +513,9 @@ test('Phase 3b: a wrapper\'s -C / --chdir / -D directory is where the merge is j
   for (const cmd of [`env -C /chat gh pr merge 8 ${pin8}`, `env -C/chat gh pr merge 8 ${pin8}`, `env --chdir=/chat gh pr merge 8 ${pin8}`, `env --chdir /chat gh pr merge 8 ${pin8}`,
     `env -iC /chat gh pr merge 8 ${pin8}`, `cd /tmp && env -C ../chat gh pr merge 8 ${pin8}`, `env -C "$D" gh pr merge 8 ${pin8}`, `env -C /chat --frob X gh pr merge 8 ${pin8}`,
     `sudo -D /chat gh pr merge 8 ${pin8}`, `sudo --chdir=/chat gh pr merge 8 ${pin8}`, `env -C /chat npm run merge -- 8 --expect-head ${H8}`,
-    `env -C /chat env -C . gh pr merge 8 ${pin8}`]) { // (two wrappers: the second -C is relative to the first: unknown)
+    `env -C /chat env -C . gh pr merge 8 ${pin8}`,
+    // (Codex recheck: a script the wrapper starts runs there too)
+    `env -C /chat sh -c 'gh pr merge 8 ${pin8}'`, `env -C /chat bash -lc 'cd . && gh pr merge 8 ${pin8}'`, `env -C /tmp sh -c 'cd /chat && gh pr merge 8 ${pin8}'`]) { // (two wrappers: the second -C is relative to the first: unknown)
     assert.equal(verdict(cmd, '/tmp').decision, 'deny', cmd);
   }
   allow(`env -C /chat gh pr merge 7 --match-head-commit ${H7}`, '/tmp'); // (the PR the owner approved)

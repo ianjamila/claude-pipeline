@@ -2900,7 +2900,9 @@ class Parser {
 
   process(argv, env, seg, isExec, chdir0 = undefined) {
     let a = this.winFix(argv, seg);
-    let chdir = chdir0; // (a wrapper's -C / --chdir: the directory the command runs in; two of them, or one not readable: null)
+    // (a wrapper's -C / --chdir: the directory the command runs in; two of them, or one not readable: null. Codex recheck: a command inside a
+    // script such a wrapper started (`env -C D sh -c '…'`) runs in D or wherever the script's own cd took it: unknown, null)
+    let chdir = chdir0 !== undefined ? chdir0 : this.ctx.chdirInherit !== undefined ? null : undefined;
     let fan = null; // the xargs / parallel that built this command from stdin text
     const runnerDirs = [];
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
@@ -3198,7 +3200,9 @@ class Parser {
     this.cmd = cmd;
     // (the commands of a script text a package runner starts -- `npm exec -c TEXT`, `npx sh -c TEXT` -- run with node_modules/.bin on their PATH: binPath, see emit)
     if (cmd?.viaRunner) this.ctx.binPath = true;
-    try { this.interpretWords(argv, seg); } finally { this.cmd = saved; this.ctx.binPath = savedBinPath; }
+    const savedChdir = this.ctx.chdirInherit;
+    if (cmd?.chdir !== undefined) this.ctx.chdirInherit = cmd.chdir;
+    try { this.interpretWords(argv, seg); } finally { this.cmd = saved; this.ctx.binPath = savedBinPath; this.ctx.chdirInherit = savedChdir; }
   }
 
   interpretWords(argv, seg) {
