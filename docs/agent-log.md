@@ -83,3 +83,4 @@ full record.
 - 2026-10-28 · #101 · ci-proof: a project can require named job steps to have run and succeeded · risk high · rounds 1 · arbiter 0 · merged
 - 2026-10-28 · #97 · smoke: optional firewall-bypass header bound to an origin allowlist · risk high · rounds 3 · arbiter 0 · merged
 - 2026-10-29 · #108 · Base-only review rounds don't count toward max_rounds · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
+- 2026-10-29 · #108 · Base-only review rounds don't count toward max_rounds · risk high · rounds 4 · arbiter 3 · merged
