@@ -10,6 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
+  presentedRuling, recordRuling, ownerRuled,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -90,6 +91,28 @@ test('owner-go: subagents, other hook events and odd session names never record'
     { session_id: '' },
   ]) assert.equal(recordApproval(input(home, 'merge', [said(REQUEST)], extra), { home }), null, JSON.stringify(extra));
   assert.equal(existsSync(join(ownerGoDir(home), '..etc.jsonl')), false);
+});
+
+// Phase 3b: the ruling recorder (triage owner-ruling --owner-quote must be the owner's words, answering a ruling request).
+test('owner-go: a ruling is recorded only after a reply that ends with the ruling line, and only for the owner', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-10-14T10:00:00Z');
+  const ASK = 'R1-B1 waits for you.\n⚖️ Owner ruling needed #58: R1-B1, R2-S3 · repo O/R';
+  assert.deepEqual(presentedRuling(ASK), { pr: 58, repo: 'o/r', ids: ['R1-B1', 'R2-S3'] });
+  assert.deepEqual(presentedRuling('Owner ruling needed #58: R1-B1 | repo o/r'), null, 'the ⚖ mark is part of the line');
+  for (const bad of [`${ASK}\nanything after`, '⚖️ Owner ruling needed #58: R1-B1', '⚖️ Owner ruling needed: R1-B1 · repo o/r', '⚖️ Owner ruling needed #58: all of them · repo o/r']) {
+    assert.equal(presentedRuling(bad), null, bad);
+  }
+  const r = recordRuling(input(home, 'Reject R1-B1, it is fine as is.', [said(ASK)]), { home, now });
+  assert.deepEqual([r.kind, r.repo, r.pr, r.ids, r.prompt], ['ruling', 'o/r', 58, ['R1-B1', 'R2-S3'], 'Reject R1-B1, it is fine as is.']);
+  assert.equal(ownerRuled({ repo: 'o/r', pr: 58, id: 'R2-S3', quote: 'it is FINE  as is', home, now }), true);
+  assert.equal(ownerRuled({ repo: 'o/r', pr: 58, id: 'R3-B1', quote: 'it is fine', home, now }), false, 'an item not asked about');
+  assert.equal(ownerRuled({ repo: 'o/r', pr: 58, id: 'R1-B1', quote: '  ', home, now }), false, 'an empty quote');
+  assert.equal(ownerRuled({ repo: 'o/r', pr: 58, id: 'R1-B1', quote: 'it is fine', home, now: () => now() + 25 * 3600 * 1000 }), false, 'older than a day');
+  assert.deepEqual(readApprovals({ home, now }), [], 'a ruling never reads as a "merge"');
+  assert.equal(recordRuling(input(home, 'reject it', [said(ASK)], { agent_id: 'a1' }), { home, now }), null, 'a subagent');
+  assert.equal(recordRuling(input(home, 'reject it', [said('No ruling asked here.')]), { home, now }), null, 'no ruling line');
+  assert.equal(recordApproval(input(home, 'reject it', [said(ASK)]), { home, now }), null, 'not a "merge" either');
 });
 
 test('owner-go: records are written and read only through real folders and files', { skip: process.platform === 'win32' }, () => {

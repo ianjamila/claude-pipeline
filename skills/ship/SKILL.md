@@ -201,7 +201,8 @@ last round, or any item `needsHuman` ⇒ label `needs-human`, post
 `P comment --pr N --kind needs-human --reason "…"` (no `--hits-file`),
 `P summary --pr N --outcome needs-human --action "…" --cause review:<reason>`, stop. With `owner_approval: chat` and items still `needsHuman`, that
 summary's `--action` is "Rule on <ids> in chat (accept / follow-up / reject), remove needs-human, then say ship resume N"; when the owner
-rules in chat, record it with `P triage owner-ruling` (**Owner rules in chat** in `reference/review-loop.md`).
+rules in chat, record it with `P triage owner-ruling` (**Owner rules in chat** in `reference/review-loop.md`: ask with a reply ending in
+`⚖️ Owner ruling needed #N: <ids> · repo <owner/name>`, or the owner's answer is not recorded and the ruling is refused).
 
 Codex `exitCode: 3` at any point (Codex unavailable) ⇒ `gh pr edit N --add-label awaiting-review`,
 `P comment --pr N --kind awaiting-review --reason "<reason from the JSON>"`,

@@ -11,6 +11,8 @@ import { matchAny } from '../lib/glob.mjs';
 import { runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
+import { createGitHub, guardGh } from '../lib/github.mjs';
+import { ownerRuled } from '../hooks/lib/owner-go.mjs';
 import {
   applyJudge, applyOwnerRuling, applyTestResult, DECISIONS, finalizeWithoutArbiter, isOwnerRuled, markLightLane, validateTriage,
 } from '../lib/triage.mjs';
@@ -274,17 +276,27 @@ async function ownerRuling(rest, ctx) {
     return refuse(`--reason and --owner-quote are at most ${OWNER_TEXT_MAX} characters`);
   }
 
-  return withStateLock(root, ctx, () => {
+  const gh = createGitHub({ cwd: root, env: ctx.env });
+  return guardGh(() => withStateLock(root, ctx, () => {
     const state = requireState(root);
     if (pr !== undefined && state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`);
     const item = findRound(state, n).items.find((i) => i.id === id);
     const why = ownerRulingRefusal(item, id, n);
     if (why) return refuse(why);
+    // Phase 3b: the quote must be the owner's words, as the owner-go recorder wrote them down after a reply that asked for this ruling
+    // (hooks/lib/owner-go.mjs presentedRuling): before, --owner-quote was the agent's own word. The repository is the one gh resolves on
+    // github.com, as for "merge".
+    const { slug, host } = gh.repo();
+    const prNum = state.pr ?? pr;
+    if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded ruling names a repository on github.com`);
+    if (!ownerRuled({ repo: slug, pr: prNum, id, quote: ownerQuote })) {
+      return refuse(`no owner ruling is recorded for ${slug} #${prNum} ${id} whose words hold --owner-quote: end the reply that asks with \`⚖️ Owner ruling needed #${prNum}: ${id} · repo ${slug}\` (Owner rules in chat, review-loop.md), wait for the owner's answer, and pass words copied from it as --owner-quote`);
+    }
     const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });
     saveState(root, updateItems(state, n, [ruled]));
     const next = `run \`pipeline comment --pr ${state.pr ?? pr ?? '<N>'} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it`;
     return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final, published: false, next } };
-  }, pr);
+  }, pr));
 }
 
 const SUBCOMMANDS = { validate, settle, 'light-lane': lightLane, 'owner-ruling': ownerRuling };

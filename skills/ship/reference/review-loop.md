@@ -183,10 +183,13 @@ An arbiter ruling that parked an item makes the push an arbiter escalation by it
 ### Owner rules in chat (`owner_approval: chat` only)
 
 An item parked `needsHuman` (a failed model proof, a low-confidence arbiter, a dismissed security item) is cleared by the owner's
-word in chat, never by you. When the owner rules on it ("accept R4-B1", "follow-up", "reject, it is fine"):
+word in chat, never by you. Ask for it with a reply that ENDS with the ruling line (nothing after it):
+`⚖️ Owner ruling needed #<pr>: <id>[, <id>…] · repo <owner/name>` (repo: `gh repo view --json nameWithOwner`). The owner-go hook writes down
+the owner's next prompt for those ids; owner-ruling accepts only a quote from it (a ruling given without that line, or by anyone but
+the owner, records nothing: ask again with the line). When the owner rules on it ("accept R4-B1", "follow-up", "reject, it is fine"):
 1. Per item, with the owner's EXACT words (copy the message, never a paraphrase): `P triage owner-ruling --round <round> --id <id>
    --decision ACCEPT|FOLLOW-UP|REJECT --reason "<why, one line>" --owner-quote "<the owner's words>" --pr <pr>`. It refuses label mode, an item
-   that is not `needsHuman` and an empty quote; a published round is fine. It never clears the merge by itself: the quote is published in
+   that is not `needsHuman`, an empty quote and a quote that is not in the owner's recorded answer; a published round is fine. It never clears the merge by itself: the quote is published in
    the triage comment and the final gate counts the item in `ownerMerge`, so the owner still has to say "merge" for the head. Its output says
    `published: false` and a `next`: the ruling is local only until step 2, and `P state show` before that restores the published state WITHOUT it.
 2. `P comment --pr <pr> --kind triage` (re-post, so the ruling is published), then `P followups create --round <round>` for FOLLOW-UP,

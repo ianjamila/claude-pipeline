@@ -89,13 +89,34 @@ export function presentedRequests(text) {
   return { prs, requests: [...bound.values()].filter(Boolean) };
 }
 
+// Phase 3b: an owner ruling in chat (`P triage owner-ruling`) was the agent's word too: --owner-quote could be any text. A reply that
+// asks the owner to rule ENDS with `⚖️ Owner ruling needed #N: R1-B1, R2-S3 · repo owner/name` (skills/ship reference/review-loop.md),
+// and the owner's next prompt is recorded with those ids; owner-ruling then needs a recorded prompt for that repository, PR and id whose
+// words hold the quote. Returns { pr, repo (lower case), ids } or null when the reply does not end with that line.
+const RULING_LINE = new RegExp(`^\\s*⚖️?\\s*Owner ruling needed\\s+#(\\d{1,6})\\s*:\\s*([^\\n·|]+?)\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME})\\s*$`, 'i');
+const ITEM_ID = /^R\d{1,4}-[A-Za-z]{1,8}\d{1,4}$/;
+export function presentedRuling(text) {
+  const lines = String(text ?? '').split(/\r?\n/);
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  const m = RULING_LINE.exec(lines[lines.length - 1] ?? '');
+  if (!m) return null;
+  const ids = [...new Set(m[2].split(/[\s,]+/).filter(Boolean))];
+  if (ids.length === 0 || !ids.every((id) => ITEM_ID.test(id))) return null;
+  return { pr: Number(m[1]), repo: m[3].toLowerCase(), ids };
+}
+
 // The text of the last assistant reply in the transcript when it holds a 🔀 merge request ('' when none). Only the
 // transcript's last 4 MB are read. A reply is every assistant text block between two prompts.
 // `prompt` is the text being submitted (the UserPromptSubmit hook's input.prompt). Why (#58 round 3): the hook may run before or after the
 // transcript gets that prompt, so the newest prompt entry is "the current one" (its empty slot skipped) only when its text IS that prompt;
 // any other newest prompt is an older, unanswered one, and the empty reply slot after it is the reply to use: no request, the one before is stale.
 // Without `prompt` the newest prompt entry is taken to be the current one.
-export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt } = {}) {
+export function lastRequestText(transcriptPath, opts = {}) {
+  const text = lastReplyText(transcriptPath, opts);
+  return READY_LINE.test(text) ? text : '';
+}
+// The same reply, whatever it ends with ('' when there is none).
+export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt } = {}) {
   let raw = '';
   try {
     if (!lstatSync(transcriptPath).isFile()) return '';
@@ -140,7 +161,7 @@ export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BY
   // older request is never revived by a later "merge": the agent shows it again.
   const current = lastIsPrompt && (prompt === undefined || plain(prompt) === lastPromptText);
   const last = replies.length - 1 - (current && replies.length > 1 ? 1 : 0);
-  return READY_LINE.test(replies[last]) ? replies[last] : '';
+  return replies[last] ?? '';
 }
 
 // Is this hook input a subagent's (or not a prompt at all)? Those never approve anything.
@@ -193,28 +214,65 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
       prs,
       requests,
     };
-    if (!realDirChain(home, OWNER_GO_REL)) return null;
-    const file = path.join(ownerGoDir(home), `${session}.jsonl`);
-    try {
-      if (!lstatSync(file).isFile()) return null;
-    } catch (err) {
-      if (err?.code !== 'ENOENT') return null;
-    }
-    const fd = openSync(file, OPEN_APPEND, 0o600);
-    try {
-      if (!fstatSync(fd).isFile()) return null;
-      writeSync(fd, `${JSON.stringify(record)}\n`);
-    } finally {
-      closeSync(fd);
-    }
-    return record;
+    return appendRecord(home, session, record);
   } catch {
     return null;
   }
 }
 
-// Every valid record younger than maxAgeMs, from one session's file or (session null) from all of them. Never throws.
-export function readApprovals({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS } = {}) {
+// Appends one record to <home>/.claude/pipeline-state/owner-go/<session>.jsonl; the record, or null when it cannot be written safely.
+function appendRecord(home, session, record) {
+  if (!realDirChain(home, OWNER_GO_REL)) return null;
+  const file = path.join(ownerGoDir(home), `${session}.jsonl`);
+  try {
+    if (!lstatSync(file).isFile()) return null;
+  } catch (err) {
+    if (err?.code !== 'ENOENT') return null;
+  }
+  const fd = openSync(file, OPEN_APPEND, 0o600);
+  try {
+    if (!fstatSync(fd).isFile()) return null;
+    writeSync(fd, `${JSON.stringify(record)}\n`);
+  } finally {
+    closeSync(fd);
+  }
+  return record;
+}
+
+export const RULING_PROMPT_MAX = 4000; // the owner's words kept for a ruling (a longer prompt is cut: a quote must come from its start)
+
+// Phase 3b, the ruling recorder (same hook, same folder): when the reply right before the owner's prompt ends with the ruling line
+// (presentedRuling), writes the prompt's words, bound to that repository, PR and those item ids. Returns the record, or null. Never throws.
+export function recordRuling(input, { home = accountHome(), now = Date.now } = {}) {
+  try {
+    if (notOwnerPrompt(input)) return null;
+    const session = String(input?.session_id ?? '');
+    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '') return null;
+    const asked = presentedRuling(lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }));
+    if (!asked) return null;
+    return appendRecord(home, session, {
+      v: 1, kind: 'ruling', ts: new Date(now()).toISOString(), session,
+      prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
+      cwd: typeof input.cwd === 'string' ? input.cwd : null,
+      repo: asked.repo, pr: asked.pr, ids: asked.ids, prompt: input.prompt.slice(0, RULING_PROMPT_MAX),
+    });
+  } catch {
+    return null;
+  }
+}
+
+// Every valid "merge" record younger than maxAgeMs, from one session's file or (session null) from all of them. Never throws.
+export function readApprovals(opts = {}) {
+  return readRecords(opts).filter((r) => r.kind === undefined).map((r) => ({
+    ts: r.ts,
+    session: r.session,
+    prs: Array.isArray(r.prs) ? r.prs.filter(Number.isInteger) : [],
+    requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string').map((q) => ({ ...q, repo: typeof q.repo === 'string' ? q.repo : null })) : [],
+  }));
+}
+
+// Every valid record (any kind) younger than maxAgeMs, as written. Never throws.
+function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS } = {}) {
   const dir = ownerGoDir(home);
   const out = [];
   let names = [];
@@ -248,12 +306,7 @@ export function readApprovals({ home = accountHome(), session = null, now = Date
       if (r?.v !== 1 || `${r.session}.jsonl` !== name) continue;
       const at = Date.parse(r.ts);
       if (!Number.isFinite(at) || at > t + FUTURE_SKEW_MS || t - at > maxAgeMs) continue;
-      out.push({
-        ts: r.ts,
-        session: r.session,
-        prs: Array.isArray(r.prs) ? r.prs.filter(Number.isInteger) : [],
-        requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string').map((q) => ({ ...q, repo: typeof q.repo === 'string' ? q.repo : null })) : [],
-      });
+      out.push(r);
     }
   }
   return out;
@@ -275,6 +328,17 @@ export function approvedPr({ repo, pr, head, session, ...opts }) {
   const key = repoKey(repo);
   if (key === null || !Number.isInteger(pr) || !/^[0-9a-f]{40}$/.test(String(head)) || !SESSION_RE.test(String(session ?? ''))) return false;
   return readApprovals({ ...opts, session }).some((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head)));
+}
+
+// triage owner-ruling: did the owner answer a ruling request for this repository, PR and item (any session, last 24 h) with words
+// that hold `quote`? (Compared with runs of white space as one space, case-insensitive: the quote is copied from the chat.)
+export function ownerRuled({ repo, pr, id, quote, ...opts }) {
+  const key = repoKey(repo);
+  const words = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const q = words(quote);
+  if (key === null || !Number.isInteger(pr) || q === '') return false;
+  return readRecords(opts).some((r) => r.kind === 'ruling' && r.repo === key && r.pr === pr && Array.isArray(r.ids) && r.ids.includes(id)
+    && typeof r.prompt === 'string' && words(r.prompt).includes(q));
 }
 
 // The owner-item set as one short digest: each item is one line (kind, rule or id, file); 'none' when there are none.
