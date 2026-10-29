@@ -168,7 +168,7 @@ test('fresh install into an empty home (path with a space): files, manifest, hoo
 
   for (const rel of [
     'skills/ship/SKILL.md', 'skills/ship/reference/notes.md', 'skills/verify/SKILL.md', 'skills/pipeline-setup/SKILL.md',
-    'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md',
+    'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md', 'agents/Explore.md',
     'pipeline/bin/pipeline.mjs', 'pipeline/hooks/guard-git.mjs', 'pipeline/hooks/guard-files.mjs',
     'pipeline/hooks/stack-register.mjs', 'pipeline/hooks/stack-dev-bind.mjs', 'pipeline/hooks/stack-session-end.mjs',
     'pipeline/lib/answer.mjs', 'pipeline/templates/example.md', 'pipeline/VERSION', 'pipeline/INSTALLED.json',
@@ -667,7 +667,7 @@ test('--json prints one machine-readable report with the diagnostics block', () 
   assert.equal(j.files.total, Object.keys(readManifest(home).files).length);
   assert.equal(j.diagnostics.subagentModel.settingsEnv, 'sonnet');
   assert.equal(j.diagnostics.subagentModel.processEnv, 'haiku');
-  assert.match(j.diagnostics.note, /Pinned agent models \(judge=opus, arbiter=fable\) still win over this env var/);
+  assert.match(j.diagnostics.note, /Pinned agent models \(judge=sonnet, arbiter=fable, verifier=haiku, Explore=haiku\) still win over this env var/);
 });
 
 test('the human report lists version, files, hooks, backup and the model diagnostics', () => {
@@ -885,7 +885,7 @@ test('buildPlan and walkFiles read the fixture: sorted, excluded names skipped, 
   assert.ok(plan.files.has('skills/ship/reference/notes.md'));
   assert.ok(plan.files.has('agents/arbiter.md'));
   assert.deepEqual(plan.units.map((u) => u.rel), [
-    'pipeline', 'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md',
+    'pipeline', 'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md', 'agents/Explore.md',
     'skills/ship', 'skills/verify', 'skills/pipeline-setup',
   ]);
   const walked = walkFiles(join(FIXTURE, 'skills'));
@@ -912,7 +912,7 @@ test('collectDiagnostics: model var from settings env, process env and shell fil
   assert.equal(d.subagentModel.settingsEnv, 'sonnet');
   assert.equal(d.subagentModel.processEnv, 'haiku');
   assert.deepEqual(d.subagentModel.shellFiles, [{ file: join(home, '.zshrc'), line: 3, text: 'export CLAUDE_CODE_SUBAGENT_MODEL=opus' }]);
-  assert.match(d.note, /Pinned agent models \(judge=opus, arbiter=fable\) still win over this env var — verified on Claude Code 2\.1\.285; unpinned subagents use it\./);
+  assert.match(d.note, /Pinned agent models \(judge=sonnet, arbiter=fable, verifier=haiku, Explore=haiku\) still win over this env var — verified on Claude Code 2\.1\.285; unpinned subagents use it\./);
   assert.equal(d.versions.claude, '2.1.285 (Claude Code)');
   assert.equal(d.versions.codex, 'not found');
   assert.equal(d.versions.gh, 'not found');

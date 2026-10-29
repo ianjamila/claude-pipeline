@@ -139,14 +139,22 @@ export function decodeFromComment(body) {
 
 // reviewBase / reviewBaseKind: what the round was actually diffed against (see git.mjs#effectiveReviewBase); baseOnly: the
 // round only merged the base branch in, so Codex did not run. Each is recorded only when given.
-export function addRound(state, { n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly }) {
+// fableRequired: the round's second reviewer is the Fable pass (triage.mjs#fablePendingRounds), with fableReasons and the
+// sensitivePaths it was told to attack. forkPoint: the PR's merge base at this round (the whole-PR range starts there).
+// codexModel: the model Codex was run with.
+export function addRound(state, {
+  n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, forkPoint, codexModel, fableRequired, fableReasons, sensitivePaths,
+}) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
   return {
     ...state,
     rounds: [...state.rounds, {
       n, fromHead, toHead, ...(reviewBase === undefined ? {} : { reviewBase, reviewBaseKind }), contentHashAtToHead,
-      ...(baseOnly === true ? { baseOnly: true } : {}), items: structuredClone(items),
+      ...(forkPoint === undefined ? {} : { forkPoint }), ...(codexModel === undefined ? {} : { codexModel }),
+      ...(baseOnly === true ? { baseOnly: true } : {}),
+      ...(fableRequired === true ? { fableRequired: true, fableReasons: [...(fableReasons ?? [])], sensitivePaths: [...(sensitivePaths ?? [])] } : {}),
+      items: structuredClone(items),
     }],
   };
 }

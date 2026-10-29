@@ -183,7 +183,9 @@ note it in the summary and carry on, never stop the run for it.
 
 ## Step 4 — review loop
 
-Follow `reference/review-loop.md` exactly. In short, per round `R` (max `review.max_rounds`, plus one extra round when `P state outcome` says `extraRound`):
+Follow `reference/review-loop.md` exactly. ONE reviewer follows Codex: the `reviewer` `codex-review` prints. `fable` (medium/high risk
+or a sensitive path) ⇒ skip light lane, judge and settle tests: the arbiter (Fable) pass is the review, every round, even with zero
+Codex items. `judge` ⇒ the steps below. In short, per round `R` (max `review.max_rounds`, plus one extra round when `P state outcome` says `extraRound`):
 Codex (`P codex-review --pr N --round R …` as a job; light lane with nothing but WORTH CONSIDERING items ⇒
 `P triage light-lane --round R` and skip the judge) → judge (`judge` agent, no model param, only
 for items without a ruling yet; `P triage validate --round R --from-tag "pipeline-judge R<R> <d8>"`)
@@ -193,7 +195,7 @@ one batched call; its prompt starts with the `promptHeader` from `P arbiter need
 Fable from the subagent transcript; the tag is the Agent call's description) → implement ACCEPTED
 items (implementer + verifier: `verify.full`, or with `verify.after_fix: quick` the commands from `P verify plan-after-fix --round R`, already slot-wrapped when `verify.max_parallel_full` is set; Steps 2.2 and 5.3 stay full) → `P followups create --round R` for FOLLOW-UP →
 `P comment --pr N --kind triage`. After each round: `P checkpoint --pr N --step review --round R`. Exit when
-`P state outcome` says `clean`. Order and replay traps (triage comment BEFORE `followups create`, `P state
+`P state outcome` says `clean`, then `P review-complete --pr N` (posts the review-complete comment; a PR is marked ready only after it exits 0). Order and replay traps (triage comment BEFORE `followups create`, `P state
 discard-round` for an interrupted round): `reference/review-loop.md`. Not clean after the
 last round, or any item `needsHuman` ⇒ label `needs-human`, post
 `P comment --pr N --kind needs-human --reason "…"` (no `--hits-file`),
@@ -242,7 +244,7 @@ Details and every exit code: `reference/gates-and-exits.md`. First: `P checkpoin
    path (it would be refused anyway), or when the PR is a fork. Without `verify.ci_proof` never pass `--defer`.
    In a slot (`verify.max_parallel_full`) that is `node ~/.claude/pipeline/bin/pipeline.mjs verify slot --run --defer <step,step>`.
 4. High risk (from the Step 5.1 `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured).
-5. Draft ⇒ `gh pr ready N`. Wait for CI on this head: checks can take a few seconds to appear after
+5. Draft ⇒ `gh pr ready N` (only once `P review-complete --pr N` exited 0 for this head: no review comment, no ready). Wait for CI on this head: checks can take a few seconds to appear after
    a push (`gh pr checks --watch` then exits 1 "no checks reported"), so poll first:
    `P job start ci -- bash -c 'for i in 1 2 3 4 5 6 7 8 9 10 11 12; do gh pr checks N --required >/dev/null 2>&1; [ $? -ne 1 ] && break; sleep 10; done; gh pr checks N --watch --required'`
    → `P job wait ci --run-id <runId> --timeout 540` (repeat until `done`). The job's exit code is

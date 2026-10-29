@@ -1,6 +1,7 @@
 // Deterministic rules of the review loop: when the arbiter must be called, which rulings are final,
 // when a PR must go to a human, and when the loop may exit. A model never makes these decisions;
 // this file does. Everything is pure: functions return new values and never mutate their inputs.
+import { CATEGORIES } from './codex.mjs';
 
 export const SECURITY_CATEGORIES = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
 export const BUCKETS = ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING'];
@@ -60,10 +61,12 @@ export function validateTriage(json, itemIds) {
   return { ok: errors.length === 0, errors };
 }
 
-export function validateRulings(json, itemIds) {
+// `review: true` (a Fable review round, see fablePendingRounds): the output must ALSO carry `findings`, Fable's own review of
+// the diff, as an array (empty when it found nothing): a missing list means the review was not done, not that it was clean.
+export function validateRulings(json, itemIds, { review = false } = {}) {
   const errors = [];
   if (!isObject(json) || !Array.isArray(json.rulings)) {
-    return { ok: false, errors: ['rulings output must be an object {"rulings": [...]}'] };
+    return { ok: false, errors: [`rulings output must be an object {"rulings": [...]${review ? ', "findings": [...]' : ''}}`] };
   }
   checkIds(json.rulings, itemIds, 'rulings', errors);
   for (const r of json.rulings) {
@@ -72,8 +75,84 @@ export function validateRulings(json, itemIds) {
     if (!oneOf(r.confidence, CONFIDENCES)) errors.push(`${r.id}: confidence must be one of ${CONFIDENCES.join('|')}`);
     if (typeof r.reasoning !== 'string') errors.push(`${r.id}: reasoning must be a string`);
   }
+  if (review) errors.push(...findingErrors(json.findings));
+  else if (json.findings !== undefined) errors.push('findings are only accepted in a Fable review round');
   return { ok: errors.length === 0, errors };
 }
+
+// ---- Fable review rounds --------------------------------------------------------------------
+
+// What Fable may raise on its own. A finding it raises is something to do, so it is ACCEPT (fix it here) or FOLLOW-UP (an
+// issue), never REJECT. The cap keeps a runaway answer from flooding the triage comment.
+export const FABLE_FINDINGS_MAX = 20;
+const FINDING_DECISIONS = ['ACCEPT', 'FOLLOW-UP'];
+const FINDING_KEYS = ['bucket', 'category', 'title', 'file', 'line', 'detail', 'ruling', 'confidence', 'reasoning'];
+const FINDING_TEXT_MAX = 4000;
+
+function findingErrors(findings) {
+  if (!Array.isArray(findings)) return ['findings must be an array (empty when the review found nothing)'];
+  if (findings.length > FABLE_FINDINGS_MAX) return [`at most ${FABLE_FINDINGS_MAX} findings (got ${findings.length})`];
+  const errors = [];
+  findings.forEach((f, i) => {
+    const at = `findings[${i}]`;
+    if (!isObject(f)) {
+      errors.push(`${at} must be an object`);
+      return;
+    }
+    for (const k of Object.keys(f)) if (!FINDING_KEYS.includes(k)) errors.push(`${at}: unexpected key "${k}"`);
+    if (!oneOf(f.bucket, BUCKETS)) errors.push(`${at}.bucket must be one of ${BUCKETS.join('|')}`);
+    if (!oneOf(f.category, CATEGORIES)) errors.push(`${at}.category must be one of ${CATEGORIES.join('|')}`);
+    for (const k of ['title', 'detail', 'reasoning']) {
+      if (typeof f[k] !== 'string' || f[k].trim() === '') errors.push(`${at}.${k} must be a non-empty string`);
+      else if (f[k].length > FINDING_TEXT_MAX) errors.push(`${at}.${k} is longer than ${FINDING_TEXT_MAX} characters`);
+    }
+    if (typeof f.file !== 'string') errors.push(`${at}.file must be a string ("" when not file-specific)`);
+    if (!Number.isInteger(f.line) || f.line < 0) errors.push(`${at}.line must be an integer >= 0`);
+    if (!oneOf(f.ruling, FINDING_DECISIONS)) errors.push(`${at}.ruling must be one of ${FINDING_DECISIONS.join('|')}`);
+    if (!oneOf(f.confidence, CONFIDENCES)) errors.push(`${at}.confidence must be one of ${CONFIDENCES.join('|')}`);
+  });
+  return errors;
+}
+
+// Fable's own findings as review items `R<n>-F<k>` (source 'fable'), already ruled by Fable itself. Only called with a
+// PROVEN answer: an unproven one adds nothing (the round stays Fable-pending, see fablePendingRounds). Low confidence, or
+// deferring a BLOCKING security / data finding to a follow-up, goes to a human exactly like an arbiter ruling would.
+// `fingerprintFor(finding)` gives the cache fingerprint (it reads the code at head, so it is the caller's).
+export function fableFindingItems(findings, round, { transcript = null, fingerprintFor = () => null } = {}) {
+  if (!Number.isInteger(round) || round < 1) throw new Error(`invalid round ${String(round)}`);
+  const errors = findingErrors(findings);
+  if (errors.length > 0) throw new Error(`invalid findings: ${errors.join('; ')}`);
+  return findings.map((f, i) => {
+    const defersBlockingSecurity = f.bucket === 'BLOCKING' && SECURITY_CATEGORIES.includes(f.category) && f.ruling === 'FOLLOW-UP';
+    let final = { decision: f.ruling, by: 'arbiter', needsHuman: false, reason: f.reasoning };
+    if (f.confidence === 'low') final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence' };
+    else if (defersBlockingSecurity) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'would defer a blocking security/data finding' };
+    const item = {
+      id: `R${round}-F${i + 1}`,
+      round,
+      source: 'fable',
+      bucket: f.bucket,
+      category: f.category,
+      title: f.title,
+      file: f.file,
+      line: f.line,
+      detail: f.detail,
+      codexReasoning: '',
+      testable: false,
+      arbiter: { ruling: f.ruling, confidence: f.confidence, reasoning: f.reasoning, transcript },
+      final,
+    };
+    const fp = fingerprintFor(f);
+    return fp ? { ...item, fingerprint: fp } : item;
+  });
+}
+
+// A round recorded with `fableRequired` (codex-review: risk.mjs#reviewLane said fable) is reviewed by ONE Fable pass that
+// rules on every Codex item and reviews the diff itself. Until that pass is PROVEN (`arbiter.proofOk === true`) the round
+// is not reviewed, even when Codex found nothing: the Fable pass is the second review, not a dispute tie-break.
+export const fablePendingRounds = (state) => (state?.rounds ?? [])
+  .filter((r) => r?.fableRequired === true && r.baseOnly !== true && r.arbiter?.proofOk !== true)
+  .map((r) => r.n);
 
 // ---- judge, tests ---------------------------------------------------------------------------
 
@@ -235,7 +314,7 @@ export function reuseRuled(items, ruledCache) {
     const next = structuredClone(item);
     if (next.final || !next.fingerprint) return next;
     if (!Object.hasOwn(ruledCache, next.fingerprint)) return next;
-    const { bucket, category, followupIssue, ...final } = structuredClone(ruledCache[next.fingerprint]);
+    const { bucket, category, followupIssue, implemented, ...final } = structuredClone(ruledCache[next.fingerprint]);
     if (bucket !== next.bucket || category !== next.category) return next;
     const dismissal = final.decision === 'REJECT' || final.decision === 'FOLLOW-UP';
     if (dismissal && SECURITY_CATEGORIES.includes(next.category) && !isOwnerRuled({ final })) return next;
@@ -243,6 +322,11 @@ export function reuseRuled(items, ruledCache) {
     // The issue filed for the earlier item is the issue for this one: carrying it keeps `followups create` from
     // filing the same suggestion again every round.
     if (typeof followupIssue === 'string' && followupIssue !== '' && !next.followupIssue) next.followupIssue = followupIssue;
+    // The same suggestion (same code, same kind) was already accepted AND fixed: carrying the fix keeps it from reading as an
+    // unimplemented ACCEPT that `mark-implemented` can never clear. Never for a BLOCKING or security / data finding: raised
+    // again on unchanged code, that is evidence the fix may be missing, so it stays open (and parks for a human) instead.
+    const carriesFix = next.bucket !== 'BLOCKING' && !SECURITY_CATEGORIES.includes(next.category);
+    if (final.decision === 'ACCEPT' && implemented === true && carriesFix) next.implemented = true;
     return next;
   });
 }
@@ -254,9 +338,13 @@ export function ruledCacheFrom(items) {
   for (const item of items) {
     // A light-lane rejection is a default ("not triaged"), not a ruling: nobody looked at it.
     if (item.fingerprint && item.final && !item.final.needsHuman && item.final.by !== 'light-lane') {
-      const issue = item.followupIssue || (Object.hasOwn(cache, item.fingerprint) ? cache[item.fingerprint].followupIssue : null);
+      const prev = Object.hasOwn(cache, item.fingerprint) ? cache[item.fingerprint] : null;
+      const issue = item.followupIssue || prev?.followupIssue || null;
+      // Newest wins: a later copy that is not marked fixed clears the flag.
+      const fixed = item.final.decision === 'ACCEPT' && item.implemented === true;
       cache[item.fingerprint] = {
         ...structuredClone(item.final), bucket: item.bucket, category: item.category, ...(issue ? { followupIssue: issue } : {}),
+        ...(fixed ? { implemented: true } : {}),
       };
     }
   }
@@ -304,7 +392,9 @@ export function roundOutcome(state) {
     hasContentHash(last.contentHashAtToHead) &&
     hasContentHash(state.currentContentHash) &&
     last.contentHashAtToHead === state.currentContentHash;
+  const fablePending = fablePendingRounds(state);
   const clean =
+    fablePending.length === 0 &&
     pending.length === 0 &&
     needsHuman.length === 0 &&
     openBlocking.length === 0 &&
@@ -320,6 +410,7 @@ export function roundOutcome(state) {
     capped &&
     rounds.length === state.maxRounds &&
     !clean &&
+    fablePending.length === 0 &&
     pending.length === 0 &&
     needsHuman.length === 0 &&
     openBlocking.length === 0 &&
@@ -327,7 +418,18 @@ export function roundOutcome(state) {
     newAccepted.length > 0;
   const effectiveMaxRounds = capped ? state.maxRounds + (extraRound || rounds.length > state.maxRounds ? 1 : 0) : null;
   const reachedMax = capped && !clean && rounds.length >= state.maxRounds && !extraRound;
-  return { clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, extraRound, effectiveMaxRounds, coverageValid };
+  return { clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, extraRound, effectiveMaxRounds, coverageValid, fablePending };
+}
+
+// May round `n` start? Rounds stop at maxRounds, plus the one extra confirm round roundOutcome grants (extraRound). A state
+// without a finite maxRounds (hand-built) is not capped. -> null when it may, else the reason it may not.
+export function roundCapProblem(state, n) {
+  const max = state?.maxRounds;
+  if (!Number.isFinite(max) || n <= max) return null;
+  if (n === max + 1 && (state.rounds ?? []).length === max && roundOutcome(state).extraRound) return null;
+  return n === max + 1
+    ? `round ${n} would pass review.max_rounds (${max}): only one extra round is allowed, and only when the last round's open items are all accepted fixes`
+    : `round ${n} would pass review.max_rounds (${max}) and its one extra round`;
 }
 
 // True when the MOST RECENT clean round (one that accepted nothing new) reviewed exactly `contentHash`, no later
@@ -336,6 +438,7 @@ export function roundOutcome(state) {
 export function reviewValidFor(state, contentHash) {
   if (!hasContentHash(contentHash)) return false;
   if (allItems(state).some(unresolved)) return false;
+  if (fablePendingRounds(state).length > 0) return false;
   const rounds = state?.rounds ?? [];
   const isClean = (round) => (round.items ?? []).every((item) => !isNewAccept(item));
   const lastClean = rounds.findLast(isClean);

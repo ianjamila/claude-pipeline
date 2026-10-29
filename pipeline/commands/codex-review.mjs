@@ -26,9 +26,9 @@ import {
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { GhError, codexCommand, runAsync } from '../lib/proc.mjs';
-import { assessRisk, isLightLane } from '../lib/risk.mjs';
+import { assessRisk, isLightLane, reviewLane } from '../lib/risk.mjs';
 import { addRound, emptyState, loadState, saveState } from '../lib/state.mjs';
-import { reuseRuled, ruledCacheFrom } from '../lib/triage.mjs';
+import { reuseRuled, roundCapProblem, ruledCacheFrom } from '../lib/triage.mjs';
 import {
   allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, writeFileAtomic,
   writeJson,
@@ -38,9 +38,12 @@ export const meta = {
   summary: 'run one Codex review round over base..head and record its findings',
   usage: [
     'pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]',
-    '  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path}',
+    '  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, reviewer, reviewerReasons, path}',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
     '  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)',
+    '  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound)',
+    '  reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
+    '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable',
     '  commits merged in from the PR\'s base branch since the previous round are left out of the reviewed diff; a round that only merged them in',
     '    is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}',
     '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver',
@@ -117,6 +120,8 @@ export const run = guarded(async (argv, ctx) => {
         message: exists ? `round ${round} already exists in the review state` : `next round is ${expected}, not ${round}`,
       });
     }
+    const capped = st ? roundCapProblem(st, round) : null;
+    if (capped) throw new Fail(EXIT.USAGE, { ok: false, error: 'round-cap', message: capped });
   };
 
   let state = readState();
@@ -172,7 +177,11 @@ export const run = guarded(async (argv, ctx) => {
   const files = diffFiles(forkPoint, head, o);
   const hits = await collectHardStops({ base: forkPoint, head, cwd: root, config });
   const { level, changedLines } = assessRisk({ files, hits, config });
-  const lightLane = (state ? state.lightLane === true : true) && isLightLane({ level, changedLines, hits, config });
+  // The reviewer after Codex: a PR that was ever reviewed by Fable stays with Fable (a later round can only escalate), and a
+  // Fable PR is never on the light lane (that lane exists to skip the second reviewer).
+  const lane = reviewLane({ level, files, config });
+  const fable = lane.reviewer === 'fable' || state?.reviewer === 'fable';
+  const lightLane = !fable && (state ? state.lightLane === true : true) && isLightLane({ level, changedLines, hits, config });
 
   ensureRoundDir(root, round);
   // What Codex is shown (and what the fix commits are measured against) is exactly this range. Round 1 starts at the merge
@@ -202,6 +211,7 @@ export const run = guarded(async (argv, ctx) => {
   }));
   const prompt = buildReviewPrompt({
     pr, title: view.title, body: view.body, base: review.base, head, risk: level, round, lightLane, priorRulings, rulesRef: forkPoint, largeBinaries, baseKind: review.kind,
+    sensitivePaths: lane.sensitivePaths,
   });
 
   const hashAtHead = currentContentHash(root, config);
@@ -271,9 +281,12 @@ export const run = guarded(async (argv, ctx) => {
     }
     const base0 = fresh ?? emptyState({ repo: slug, pr, branch: view.headRefName ?? 'HEAD', risk: level, lightLane, maxRounds: config.review.max_rounds });
     const ruled = reuseRuled(assignIds(findings, round, excerptFor, { contentHash: hashAtHead }), ruledCacheFrom(allItems(base0)));
-    const next = addRound({ ...base0, risk: level, lightLane, currentContentHash: hashAtHead }, {
+    const reviewer = fable || fresh?.reviewer === 'fable' ? 'fable' : 'judge';
+    const reasons = lane.reasons.length > 0 ? lane.reasons : ['reviewed by Fable in an earlier round'];
+    const next = addRound({ ...base0, risk: level, lightLane: reviewer === 'fable' ? false : lightLane, reviewer, currentContentHash: hashAtHead }, {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled,
-      reviewBase: review.base, reviewBaseKind: review.kind, ...(baseOnly ? { baseOnly: true } : {}),
+      reviewBase: review.base, reviewBaseKind: review.kind, forkPoint, codexModel: model, ...(baseOnly ? { baseOnly: true } : {}),
+      ...(reviewer === 'fable' && !baseOnly ? { fableRequired: true, fableReasons: reasons, sensitivePaths: lane.sensitivePaths.slice(0, 50) } : {}),
     });
     writeJson(path.join(dir, 'codex.json'), { findings, items: ruled });
     writeFileAtomic(path.join(dir, 'codex.md'), renderFindingsMarkdown(findings, round, ruled));
@@ -295,6 +308,8 @@ export const run = guarded(async (argv, ctx) => {
       ...(baseOnly ? { baseOnly: true } : {}),
       preRuled: items.filter((i) => i.final).length,
       lightLane: state.lightLane,
+      reviewer: state.reviewer,
+      reviewerReasons: state.rounds.at(-1)?.fableReasons ?? [],
       path: dir,
     },
   };

@@ -42,14 +42,24 @@ decide which items need the arbiter, then prove and apply its rulings.
 
 ```
 pipeline arbiter needed --round R [--force] [--repo DIR]
-  -> {needed:false, items:[]} | {needed:true, items, inputPath, digest, digest8, tag, promptHeader}
+  -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader[, diffPath, scope]}
+  mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied
+    (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that)
+  mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none
   start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman
 pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
   the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)
-  -> {ok, round, tag, transcript, errors, items}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript
+  -> {ok, round, tag, transcript, errors, items[, findings]}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript
+  mode review: the answer must also carry `findings` (Fable's own review, [] when clean); proven findings become items R<n>-F<k>;
+    unproven ones are kept in rulings.json as `unverifiedFindings` and the round stays Fable-pending (run needed + the arbiter again)
 ```
 
 Exit: `needed`: 0 (`needed:false` is also 0) · `apply`: 0 proven + applied, 1 proof failed (arbitrated items marked needsHuman), 2 no transcript found / usage.
+
+A Fable review round (`fableRequired`, set by `codex-review`) is not clean until `apply` proves a pass, even with zero
+Codex items: `state outcome` lists it in `fablePending` and `review-complete` refuses. A failed proof leaves it pending:
+run `needed` again (it clears the unproven rulings, keeps the owner's) and start the arbiter again. `triage validate`
+refuses a Fable round (`fable-round`): there is one reviewer after Codex.
 
 ## artifacts
 
@@ -84,16 +94,19 @@ run one Codex review round over base..head and record its findings.
 
 ```
 pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]
-  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, path}
+  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, reviewer, reviewerReasons, path}
   --base must be the PR's merge base for round 1 and the previous round's toHead after that, else exit 2 {error:base-mismatch}
   exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)
+  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound)
+  reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired
+    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker's brief for the sensitive files; judge otherwise. Once fable, always fable
   commits merged in from the PR's base branch since the previous round are left out of the reviewed diff; a round that only merged them in
     is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}
   exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver
   env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)
 ```
 
-Exit: 0 round recorded · 2 usage or base-mismatch · 3 Codex or GitHub could not deliver (quota, auth, unavailable, error, malformed, github): never "no findings".
+Exit: 0 round recorded · 2 usage, base-mismatch or round-cap · 3 Codex or GitHub could not deliver (quota, auth, unavailable, error, malformed, github): never "no findings".
 
 A later round is diffed against what the previous round reviewed plus the PR's base branch as it is now (a trial merge, `reviewBaseKind: synthetic`), not against the previous head itself, so commits an "Update branch" merged in from the default branch (`origin/<default_branch>`) are never shown to Codex: they were reviewed in their own PRs. Only the default branch counts: a PR that targets another branch, or code merged in from any other branch, is reviewed in full (nothing is left out, and Codex always runs). A stale `origin/<default_branch>` (the best-effort fetch failed) can only make the range bigger. When that trial merge conflicts (or git is older than 2.38), the round reviews the whole PR against the new base instead (`whole-pr`). Each round records `reviewBase` and `reviewBaseKind` next to `fromHead` / `toHead`. A round whose only new commit is such a merge is recorded as `baseOnly: true` with no items and Codex is not run; the outcome treats it like a clean round with no findings. `state mark-implemented` measures "a non-test file changed since round N" the same way and fails closed: when that range cannot be worked out exactly (conflicting trial merge, git error) it refuses with `base-unresolved`.
 
@@ -381,14 +394,23 @@ Exit: 0 · 2 usage / PR not found · 3 GitHub (`gh`) unavailable.
 
 ## review-complete
 
-remove awaiting-review once the review is valid for the current content.
+post the review-complete comment (and remove awaiting-review) once the review is valid for the current content.
 
 ```
-pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, removed:true}; exit 1 {ok:false, reason} when the review is not valid
-  the checked-out HEAD must be the head GitHub holds for the PR; exit 3 when the label is still on the PR after removal
+pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed}; exit 1 {ok:false, reason} when the review is not valid
+  the checked-out HEAD must be the head GitHub holds for the PR; the PR must have had every Fable pass its risk or paths need
+  the comment starts with the line `<!-- claude-pipeline:review-complete v1 -->` and carries the JSON {contentHash, base, head, rounds, codexModel, modelProofDigest}
+  (base = the merge base the content hash is measured from; modelProofDigest = sha256 of the Fable model proofs, null when no Fable pass ran);
+  an identical latest comment of ours is reused, not posted again; exit 3 when GitHub is unavailable or the label is still on the PR after removal
 ```
 
-Exit: 0 label removed · 1 review not valid for this head · 2 usage · 3 label still on the PR after removal.
+Exit: 0 comment posted (or our identical one reused) and the label is off · 1 review not valid for this head (nothing posted) · 2 usage · 3 GitHub unavailable, or the label still on the PR after removal.
+
+Run it at the end of every clean review, before `gh pr ready`: the review instructions mark a PR ready only once this
+comment exists. The comment is append-only evidence (a new comment per new head, never an edit). `contentHash` is
+`contentHash(base, head)` minus the agent log (git.mjs), so a check that fetches only git data can recompute it.
+Validity is the state's (every round clean, coverage = this content) PLUS a lane re-check from the PR itself: a PR whose
+files, size or recorded risk call for the Fable pass is refused unless some round ran a proven one.
 
 ## risk
 
@@ -399,6 +421,12 @@ pipeline risk --base REF --head REF [--repo DIR]   -> {ok, level, reasons, light
 ```
 
 Exit: 0 whenever a level could be computed (it is a report, not a gate) · 2 usage / config / git.
+
+Levels: a blocking hard-stop hit, an `ownerMerge` hit (owner_approval: chat) or a `risk.high_risk_paths` match is
+`high`; a report-only (advisory) hit alone is `medium`; size adds `medium` / `high` by `risk.medium_lines`,
+`risk.high_lines`, `risk.medium_files`. The level picks the reviewer after Codex (`codex-review` records it): `low` →
+the judge (Sonnet); `medium` / `high`, or any file on `risk.high_risk_paths` or `review.arbiter_always_paths` → one
+Fable pass per round that rules on every Codex item and reviews the diff itself (`arbiter needed` mode `review`).
 
 ## smoke
 

@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
-import { assessRisk, isLightLane } from '../pipeline/lib/risk.mjs';
+import { classifyHardStops } from '../pipeline/lib/hardstops.mjs';
+import { assessRisk, isLightLane, reviewLane } from '../pipeline/lib/risk.mjs';
 
 const config = (risk = {}) => {
   const c = structuredClone(DEFAULTS);
@@ -155,4 +156,84 @@ test('a hard-stop hit keeps a many-file change high (the file-count rule never d
   assert.equal(r.reasons[0], 'hard-stop: R4-pipeline');
   assert.match(r.reasons.join('|'), /11 files > 10/);
   assert.equal(isLightLane({ level: r.level, changedLines: r.changedLines, hits: [hit()], config: config() }), false);
+});
+
+// ---- Phase 2: only blocking (and owner-approved) hits raise to high; report-only hits raise to medium -----------------
+
+const advisory = (rule = 'P-path', f = 'docs/legal/terms.md') => ({ rule, file: f, detail: 'x', advisory: true });
+const ownerChat = (rule = 'R2-auth', f = 'lib/a.ts') => ({ rule, file: f, detail: 'x', advisory: true, ownerMerge: true });
+
+test('advisory-only hits -> medium (never high, never low), reason names them as advisory', () => {
+  const r = assessRisk({ files: [file('docs/legal/terms.md', 2)], hits: [advisory(), advisory('R5-deps', 'package.json')], config: config() });
+  assert.equal(r.level, 'medium');
+  assert.deepEqual(r.reasons, ['advisory hard-stop: P-path, R5-deps']);
+  assert.equal(isLightLane({ level: r.level, changedLines: r.changedLines, hits: [advisory()], config: config() }), false);
+});
+
+test('a real report-only fixture (hard_stops.report_only_paths) scores medium; the same path as a hard-stop path scores high', () => {
+  const files = [file('docs/legal/terms.md', 4)];
+  const soft = config();
+  soft.hard_stops = { ...soft.hard_stops, report_only_paths: ['docs/legal/**'] };
+  const softHits = classifyHardStops({ files, config: soft });
+  assert.ok(softHits.length > 0 && softHits.every((h) => h.advisory === true && !h.ownerMerge), JSON.stringify(softHits));
+  assert.equal(assessRisk({ files, hits: softHits, config: soft }).level, 'medium');
+
+  const hard = config();
+  hard.hard_stops = { ...hard.hard_stops, paths: ['docs/legal/**'] };
+  const hardHits = classifyHardStops({ files, config: hard });
+  assert.ok(hardHits.some((h) => !h.advisory), JSON.stringify(hardHits));
+  assert.equal(assessRisk({ files, hits: hardHits, config: hard }).level, 'high');
+
+  // owner_approval: chat turns the blocking hit advisory + ownerMerge: still high (the owner approves it in chat).
+  const chat = { ...hard, owner_approval: 'chat' };
+  const chatHits = classifyHardStops({ files, config: chat });
+  assert.ok(chatHits.length > 0 && chatHits.every((h) => h.advisory === true && h.ownerMerge === true), JSON.stringify(chatHits));
+  assert.equal(assessRisk({ files, hits: chatHits, config: chat }).level, 'high');
+});
+
+test('an ownerMerge hit -> high; a blocking hit next to advisory ones -> high, both reasons listed', () => {
+  assert.equal(assessRisk({ files: [file('lib/a.ts', 2)], hits: [ownerChat()], config: config() }).level, 'high');
+  const r = assessRisk({ files: [file('lib/a.ts', 2)], hits: [advisory(), hit('R1-destructive')], config: config() });
+  assert.equal(r.level, 'high');
+  assert.deepEqual(r.reasons, ['hard-stop: R1-destructive', 'advisory hard-stop: P-path']);
+});
+
+test('a malformed hit (advisory not exactly true) counts as blocking: it can never lower the level', () => {
+  for (const h of [{ rule: 'R2-auth', advisory: 'true' }, { rule: 'R2-auth', advisory: 1 }, null]) {
+    assert.equal(assessRisk({ files: [file('lib/a.ts', 2)], hits: [h], config: config() }).level, 'high', JSON.stringify(h));
+  }
+});
+
+test('advisory hits plus a big diff still reach high by size', () => {
+  assert.equal(assessRisk({ files: [file('lib/a.ts', 700)], hits: [advisory()], config: config() }).level, 'high');
+});
+
+// ---- review lane: who follows Codex ------------------------------------------------------------------------------
+
+test('reviewLane: low and no sensitive path -> judge; medium or high -> fable', () => {
+  assert.deepEqual(reviewLane({ level: 'low', files: [file('lib/a.ts', 2)], config: config() }), { reviewer: 'judge', reasons: [], sensitivePaths: [] });
+  assert.deepEqual(reviewLane({ level: 'medium', files: [file('lib/a.ts', 2)], config: config() }).reasons, ['medium risk']);
+  assert.equal(reviewLane({ level: 'medium', files: [], config: config() }).reviewer, 'fable');
+  assert.equal(reviewLane({ level: 'high', files: [], config: config() }).reviewer, 'fable');
+});
+
+test('reviewLane: a low-risk PR touching review.arbiter_always_paths (old or new path, any case) -> fable, path listed', () => {
+  const c = config();
+  c.review = { ...c.review, arbiter_always_paths: ['lib/auth/**'] };
+  const a = reviewLane({ level: 'low', files: [file('lib/auth/session.ts', 2)], config: c });
+  assert.deepEqual(a, { reviewer: 'fable', reasons: ['sensitive path: lib/auth/session.ts'], sensitivePaths: ['lib/auth/session.ts'] });
+  assert.equal(reviewLane({ level: 'low', files: [file('lib/x.ts', 2, { status: 'R', oldPath: 'LIB/Auth/old.ts' })], config: c }).reviewer, 'fable');
+  // high_risk_paths are sensitive too (they also make the PR high).
+  assert.deepEqual(reviewLane({ level: 'high', files: [file('supabase/migrations/1.sql', 2)], config: config() }).sensitivePaths, ['supabase/migrations/1.sql']);
+  // A config without the key uses the default (no extra paths).
+  assert.equal(reviewLane({ level: 'low', files: [file('lib/auth/session.ts', 2)], config: {} }).reviewer, 'judge');
+});
+
+test('reviewLane throws TypeError on bad inputs instead of answering judge', () => {
+  const ok = { level: 'low', files: [], config: config() };
+  for (const bad of [{ level: 'LOW' }, { level: undefined }, { files: undefined }, { files: Promise.resolve([]) }]) {
+    assert.throws(() => reviewLane({ ...ok, ...bad }), TypeError, JSON.stringify(bad));
+  }
+  assert.throws(() => reviewLane({ ...ok, config: { review: { arbiter_always_paths: 'lib/**' } } }), TypeError);
+  assert.throws(() => reviewLane({ ...ok, config: { review: { arbiter_always_paths: [1] } } }), TypeError);
 });

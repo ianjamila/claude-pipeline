@@ -137,7 +137,7 @@ test('triage validate --from-tag: a judge that reports through SubagentHandback 
   const w = world(t);
   assertExit(w.codex(1, standardFindings()), 0);
   const projects = installTranscript(w, {
-    jsonl: handbackTranscript({ prompt: 'Triage round 1.', message: fenced(decisionsOf(STANDARD_JUDGE)), model: 'claude-opus-5-1' }),
+    jsonl: handbackTranscript({ prompt: 'Triage round 1.', message: fenced(decisionsOf(STANDARD_JUDGE)), model: 'claude-sonnet-5-5', effort: 'medium' }),
     meta: judgeMeta,
   });
   const r = w.cli(['triage', 'validate', '--round', '1', '--from-tag', JUDGE_TAG, '--projects-dir', projects]);
@@ -154,7 +154,7 @@ test('triage validate --from-tag: a hand-back that was never acknowledged is a r
   const w = world(t);
   assertExit(w.codex(1, standardFindings()), 0);
   const projects = installTranscript(w, {
-    jsonl: handbackTranscript({ prompt: 'Triage round 1.', message: fenced(decisionsOf(STANDARD_JUDGE)), model: 'claude-opus-5-1', ack: false }),
+    jsonl: handbackTranscript({ prompt: 'Triage round 1.', message: fenced(decisionsOf(STANDARD_JUDGE)), model: 'claude-sonnet-5-5', effort: 'medium', ack: false }),
     meta: judgeMeta,
   });
   const r = w.cli(['triage', 'validate', '--round', '1', '--from-tag', JUDGE_TAG, '--projects-dir', projects]);

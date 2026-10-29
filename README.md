@@ -3,7 +3,7 @@
 A global **build → verify → review → merge → production check** pipeline for Claude Code. Once a
 repo is onboarded, asking Claude to build or fix something runs the whole flow unattended: a
 branch and worktree, the change plus tests, a full local verify, a pull request, a cross-model
-review loop (Codex finds, an Opus judge triages, a Fable arbiter rules on disputes), a final gate
+review loop (Codex finds, a Sonnet judge triages low-risk PRs, a Fable pass rules on and reviews every medium/high-risk or sensitive PR), a final gate
 bound to the exact commit, the merge, a production smoke test, and an automatic rollback if
 production breaks. Nothing reaches `main` without proof, and anything sensitive stops for you.
 
