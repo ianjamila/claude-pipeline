@@ -13,7 +13,7 @@ import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { fingerprint, largeBinaryNote } from '../lib/codex.mjs';
-import { GitError, reviewPatch, showFile } from '../lib/git.mjs';
+import { GitError, ReviewBaseUnavailable, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
 import { seamFlag } from '../lib/proc.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
 import { extractJsonBlock, findSubagentTranscript, proveModel } from '../lib/transcript.mjs';
@@ -128,7 +128,15 @@ const FABLE_DIFF = 'fable-diff.patch';
 function writeFableDiff(state, round, root) {
   const earlierProven = state.rounds.some((r) => r.n < round.n && isFableRound(r) && r.arbiter?.proofOk === true);
   const scope = earlierProven ? 'round' : 'whole-pr';
-  const from = scope === 'round' ? round.reviewBase ?? round.fromHead : round.forkPoint ?? state.rounds[0]?.reviewBase;
+  // A synthetic / resolution round's base is a tree that exists only where it was made: rebuilt here when this clone lacks it,
+  // and never replaced by another range (a different review) when it cannot be.
+  let from;
+  try {
+    from = scope === 'round' ? ensureReviewBase(round, { cwd: root }) : round.forkPoint ?? state.rounds[0]?.reviewBase;
+  } catch (err) {
+    if (err instanceof ReviewBaseUnavailable) throw new Fail(EXIT.USAGE, { ok: false, error: err.code, message: err.message });
+    throw err;
+  }
   if (typeof from !== 'string' || from === '' || typeof round.toHead !== 'string') {
     throw new Fail(EXIT.USAGE, { ok: false, error: 'no-range', message: `round ${round.n} records no reviewed range: run codex-review for it again` });
   }

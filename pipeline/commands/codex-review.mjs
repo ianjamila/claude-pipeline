@@ -9,7 +9,9 @@
 // ended (so nothing between two rounds goes unreviewed). Anything else is exit 2 before Codex runs.
 // What Codex is shown for a later round is that range minus whatever was merged in from the PR's base branch since the
 // previous round (git.mjs#effectiveReviewBase): those commits were reviewed in their own PRs. A round that is nothing but
-// such a merge is recorded as `baseOnly` without running Codex. The state is
+// such a merge is recorded as `baseOnly` without running Codex. When that merge conflicted and the resolver only chose lines
+// the two sides already had (git.mjs#resolutionReviewBase proves it), the round is shown just the resolution and is recorded as
+// `resolutionOnly`: a real review that does not count toward the round cap. The state is
 // read-modified-written under the per-PR lock, but the lock is NOT held while Codex runs (up to 30 minutes): the
 // state is read again under the lock once Codex has answered, and a round recorded in the meantime wins.
 import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
@@ -21,7 +23,7 @@ import {
 } from '../lib/codex.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import {
-  GitError, NETWORK_TIMEOUT_MS, diffFiles, effectiveReviewBase, git, headSha, mergeBase, reviewPatch, revParse, showFile,
+  GitError, NETWORK_TIMEOUT_MS, diffFiles, effectiveReviewBase, git, headSha, mergeBase, resolutionReviewBase, reviewPatch, revParse, showFile,
 } from '../lib/git.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { createGitHub } from '../lib/github.mjs';
@@ -42,11 +44,15 @@ export const meta = {
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
     '  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)',
     '  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound);',
-    '    base-only rounds (below) never count toward the cap',
+    '    base-only rounds and resolution-only rounds (below) never count toward the cap',
     '  reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
     '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable',
     '  commits merged in from the PR\'s base branch since the previous round are left out of the reviewed diff; a round that only merged them in',
     '    is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}',
+    '  when that merge conflicted and the resolution only chose lines the two sides already had, Codex reviews just the resolution:',
+    '    {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise',
+    '    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not',
+    '    taken alone',
     '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver',
     '  env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)',
   ].join('\n'),
@@ -122,9 +128,10 @@ export const run = guarded(async (argv, ctx) => {
       });
     }
   };
-  // The round cap counts reviewed rounds only, so it waits until baseOnly is known (before anything is written for the round).
-  const checkCap = (st, baseOnly) => {
-    const capped = st ? roundCapProblem(st, round, { baseOnly }) : null;
+  // The round cap counts reviewed rounds only, so it waits until baseOnly / resolutionOnly are known (before anything is
+  // written for the round).
+  const checkCap = (st, flags) => {
+    const capped = st ? roundCapProblem(st, round, flags) : null;
     if (capped) throw new Fail(EXIT.USAGE, { ok: false, error: 'round-cap', message: capped });
   };
 
@@ -192,17 +199,33 @@ export const run = guarded(async (argv, ctx) => {
   // Only commits that came from the protected default branch are left out: the base side is origin/<default_branch> (never a
   // branch the PR author chose), and a PR that targets any other branch leaves nothing out. A failed or stale fetch only
   // leaves an older origin/<default_branch>, which can only make the range bigger.
+  // The conflict case ('whole-pr' above): when the merge of the default branch conflicted and the resolution only chose lines the
+  // two sides had, the range is the resolution alone and the round is free of the cap (resolutionReviewBase has every rule).
+  const baseBranchRef = reviewBaseRef(root, config, prBase);
+  const tryResolution = () => resolutionReviewBase({ from: base, forkPoint, head, baseRef: baseBranchRef }, o);
   let review = { base: forkPoint, kind: 'merge-base' };
+  let resolution = null;
+  let resolutionIneligible;
   if (state?.rounds.length > 0) {
     review = prBase === config.default_branch
       ? effectiveReviewBase({ from: base, forkPoint }, o)
       : { base, kind: 'previous' };
+    if (review.kind === 'whole-pr') {
+      const found = tryResolution();
+      if (found.ineligible === undefined) {
+        resolution = found;
+        review = { base: found.base, kind: 'resolution' };
+      } else {
+        resolutionIneligible = found.ineligible;
+      }
+    }
   }
+  const resolutionOnly = resolution !== null;
   // Large binary documents would overflow the buffer; they are named at the end of the patch and in the prompt instead.
   const { patch, skipped: largeBinaries } = reviewPatch(review.base, head, o);
   // Only the base branch was merged in since the last round: there is nothing of the PR's own to review.
   const baseOnly = review.kind === 'synthetic' && patch === '' && largeBinaries.length === 0;
-  checkCap(state, baseOnly);
+  checkCap(state, { baseOnly, resolutionOnly });
   ensureRoundDir(root, round);
   const note = largeBinaryNote(largeBinaries);
   writeFileAtomic(path.join(dir, 'diff.patch'), note.length === 0 ? patch : `${patch}\nLarge binary files (content not shown):\n${note.join('\n')}\n`);
@@ -217,6 +240,7 @@ export const run = guarded(async (argv, ctx) => {
   const prompt = buildReviewPrompt({
     pr, title: view.title, body: view.body, base: review.base, head, risk: level, round, lightLane, priorRulings, rulesRef: forkPoint, largeBinaries, baseKind: review.kind,
     sensitivePaths: lane.sensitivePaths,
+    ...(resolutionOnly ? { resolution: { from: base, forkPoint, conflicted: resolution.conflicted.slice(0, 50), conflictedCount: resolution.conflictedCount, blocks: resolution.blocks.slice(0, 50) } } : {}),
   });
 
   const hashAtHead = currentContentHash(root, config);
@@ -279,9 +303,14 @@ export const run = guarded(async (argv, ctx) => {
     // state was replaced) is read again, and what is there now wins.
     const fresh = readState();
     checkRound(fresh);
-    checkCap(fresh, baseOnly);
+    checkCap(fresh, { baseOnly, resolutionOnly });
     checkBase(fresh);
     if (headSha(o) !== head) throw headMoved();
+    // The cap waiver rests on the proof above. from (checkBase), head and forkPoint are pinned, but origin/<default> may have moved
+    // while Codex ran, and it is one of the proof's inputs: prove it again, and only accept the very range Codex was shown.
+    if (resolutionOnly && tryResolution().base !== review.base) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'resolution-changed', message: 'the conflict resolution can no longer be proven while Codex was reviewing; run the round again' });
+    }
     if (!fresh && slug === undefined) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'state-changed', message: '.review/state.json disappeared while Codex was reviewing; run the round again' });
     }
@@ -292,6 +321,7 @@ export const run = guarded(async (argv, ctx) => {
     const next = addRound({ ...base0, risk: level, lightLane: reviewer === 'fable' ? false : lightLane, reviewer, currentContentHash: hashAtHead }, {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled,
       reviewBase: review.base, reviewBaseKind: review.kind, forkPoint, codexModel: model, ...(baseOnly ? { baseOnly: true } : {}),
+      ...(resolutionOnly ? { resolutionOnly: true, conflicted: resolution.conflicted.slice(0, 50), conflictedCount: resolution.conflictedCount, blocks: resolution.blocks.slice(0, 50) } : {}),
       ...(reviewer === 'fable' && !baseOnly ? { fableRequired: true, fableReasons: reasons, sensitivePaths: lane.sensitivePaths.slice(0, 50) } : {}),
     });
     writeJson(path.join(dir, 'codex.json'), { findings, items: ruled });
@@ -312,6 +342,8 @@ export const run = guarded(async (argv, ctx) => {
         worth_considering: findings.worth_considering.length,
       },
       ...(baseOnly ? { baseOnly: true } : {}),
+      ...(resolutionOnly ? { resolutionOnly: true, conflicted: resolution.conflicted.slice(0, 50), conflictedCount: resolution.conflictedCount } : {}),
+      ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }),
       preRuled: items.filter((i) => i.final).length,
       lightLane: state.lightLane,
       reviewer: state.reviewer,

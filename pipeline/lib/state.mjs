@@ -139,11 +139,14 @@ export function decodeFromComment(body) {
 
 // reviewBase / reviewBaseKind: what the round was actually diffed against (see git.mjs#effectiveReviewBase); baseOnly: the
 // round only merged the base branch in, so Codex did not run. Each is recorded only when given.
+// resolutionOnly: the round is only how a conflict with the base branch was resolved (git.mjs#resolutionReviewBase); it is a
+// real review but does not count toward the round cap. conflicted (at most 50 paths) / conflictedCount / blocks (at most 50:
+// { path, block, droppedTheirs }) describe that resolution; ensureReviewBase needs conflicted to rebuild the base elsewhere.
 // fableRequired: the round's second reviewer is the Fable pass (triage.mjs#fablePendingRounds), with fableReasons and the
 // sensitivePaths it was told to attack. forkPoint: the PR's merge base at this round (the whole-PR range starts there).
 // codexModel: the model Codex was run with.
 export function addRound(state, {
-  n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, forkPoint, codexModel, fableRequired, fableReasons, sensitivePaths,
+  n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, forkPoint, codexModel, fableRequired, fableReasons, sensitivePaths,
 }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
@@ -153,6 +156,12 @@ export function addRound(state, {
       n, fromHead, toHead, ...(reviewBase === undefined ? {} : { reviewBase, reviewBaseKind }), contentHashAtToHead,
       ...(forkPoint === undefined ? {} : { forkPoint }), ...(codexModel === undefined ? {} : { codexModel }),
       ...(baseOnly === true ? { baseOnly: true } : {}),
+      ...(resolutionOnly === true
+        ? {
+          resolutionOnly: true, conflicted: structuredClone(conflicted ?? []), conflictedCount: conflictedCount ?? (conflicted ?? []).length,
+          blocks: structuredClone(blocks ?? []),
+        }
+        : {}),
       ...(fableRequired === true ? { fableRequired: true, fableReasons: [...(fableReasons ?? [])], sensitivePaths: [...(sensitivePaths ?? [])] } : {}),
       items: structuredClone(items),
     }],
