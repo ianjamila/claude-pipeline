@@ -18,7 +18,7 @@ const mk = (entries) => {
 
 test('repo() parses gh repo view once and caches it', () => {
   const { fake, gh } = mk([REPO]);
-  assert.deepEqual(gh.repo(), { owner: 'acme', name: 'widgets', slug: 'acme/widgets', defaultBranch: 'main' });
+  assert.deepEqual(gh.repo(), { owner: 'acme', name: 'widgets', slug: 'acme/widgets', host: 'github.com', defaultBranch: 'main' });
   gh.repo();
   assert.equal(fake.lines().filter((l) => l.startsWith('repo view')).length, 1);
 });

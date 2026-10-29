@@ -34,6 +34,7 @@ export const meta = {
     '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
     '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
     '  -> works on an already published round. ACCEPT still needs the fix and a later review round; FOLLOW-UP is filed by `followups create`; the quote is published in the triage comment and the final gate counts it as ownerMerge (the owner\'s "merge" is still needed)',
+    '  -> the quote must be the WHOLE owner prompt that answered a reply ENDING with `⚖️ Owner ruling needed #N: ID[, ID…] · repo owner/name` (the owner-go hook records it; any session, last 24 h; white space and case aside), and that answer must be nothing but decisions, `ID: accept|follow-up|reject` per asked id, the id always written (any other word decides nothing; over 1000 characters is not recorded); exit 1 otherwise, or when gh resolves the repository off github.com',
     '  -> pass the owner\'s own words as --owner-quote, never a paraphrase; then re-post the triage comment NOW (`pipeline comment --pr N --kind triage`); until then the ruling is local only (`published: false`) and `pipeline state show` restores the published state without it',
   ].join('\n'),
 };
