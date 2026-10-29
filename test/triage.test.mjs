@@ -1308,6 +1308,23 @@ test('roundOutcome: a base-only round after unreviewed accepted fixes cannot loo
   assert.deepEqual(o.unimplemented, ['R1-B1']);
 });
 
+test('roundOutcome / roundCapProblem: a base-only round after the last allowed round does not hide its accepted fixes (extra round stays available)', () => {
+  const real = (n) => round(n, [], 'h-final');
+  const baseOnly = (n) => round(n, [], 'h-final', { baseOnly: true });
+  const acc = (implemented) => item({ id: 'R3-B1', bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), ...(implemented ? { implemented: true } : {}) });
+  const st = (implemented) => stateOf([real(1), real(2), round(3, [acc(implemented)], 'h-old'), baseOnly(4)], { currentContentHash: 'h-new' });
+  // main merged in before the fix was implemented: nothing is clean, and the fix is not forgotten
+  let o = roundOutcome(st(false));
+  assert.deepEqual([o.clean, o.extraRound, o.reachedMax, o.unimplemented], [false, false, true, ['R3-B1']]);
+  // the fix is committed and marked implemented: the confirm round must still be granted (newAccepted comes from the last REVIEWED round)
+  o = roundOutcome(st(true));
+  assert.deepEqual([o.clean, o.newAccepted, o.extraRound, o.reachedMax, o.effectiveMaxRounds], [false, ['R3-B1'], true, false, 4]);
+  assert.equal(roundCapProblem(st(true), 5), null);
+  // a base-only round on the same content never makes unreviewed fixes look clean
+  const same = roundOutcome(stateOf([real(1), real(2), round(3, [acc(true)], 'h-final'), baseOnly(4)]));
+  assert.deepEqual([same.clean, same.newAccepted], [false, ['R3-B1']]);
+});
+
 test('reuseRuled: a fixed SUGGESTION comes back implemented; a re-raised BLOCKING or security finding never does (fail closed)', () => {
   const sugg = { bucket: 'SUGGESTION', category: 'maintainability' };
   const fixed = item({ ...sugg, fingerprint: 'fx', final: settled('ACCEPT'), implemented: true });

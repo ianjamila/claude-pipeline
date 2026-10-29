@@ -390,7 +390,10 @@ export function roundOutcome(state) {
   const needsHuman = idsOf(everything.filter((i) => i.final?.needsHuman));
   const openBlocking = idsOf(everything.filter(isOpenBlocking));
   const unimplemented = idsOf(everything.filter(isUnimplementedAccept));
-  const newAccepted = idsOf((last?.items ?? []).filter(isNewAccept));
+  // What the last REVIEWED round newly accepted still needs a round to review its fixes. A baseOnly round (main merged in) has
+  // no items, and must neither hide those accepts (clean) nor strand the confirm round once the fixes are made (extraRound).
+  const lastReviewed = rounds.findLast((r) => r?.baseOnly !== true);
+  const newAccepted = idsOf((lastReviewed?.items ?? []).filter(isNewAccept));
   const coverageValid =
     last !== undefined &&
     hasContentHash(last.contentHashAtToHead) &&
@@ -410,8 +413,8 @@ export function roundOutcome(state) {
   // parking. It is the last: more than maxRounds reviewed rounds is the record that it was used, so extraRound is false
   // afterwards and anything not clean parks as before. A stale coverage hash with no new accepts does not qualify.
   // Rounds that only merged the base branch in (baseOnly) are not counted: they neither use up a round nor the extra one.
-  // (newAccepted comes from the last round: a baseOnly round is recorded only when the PR's own patch since the previous
-  // round is empty, and an item is only marked implemented by a content change, so it never follows unreviewed fixes.)
+  // newAccepted comes from the last REVIEWED round: a baseOnly round can be recorded before the accepted fixes are made (it needs
+  // only an empty patch of the PR's own), and must change nothing about them.
   const reviewed = reviewedRoundCount(state);
   const capped = Number.isFinite(state?.maxRounds);
   const extraRound =

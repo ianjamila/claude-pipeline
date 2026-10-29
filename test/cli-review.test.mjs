@@ -559,6 +559,26 @@ test('codex-review: a base-only round past review.max_rounds is recorded (it doe
   assert.equal(w.state().rounds.length, 3);
 });
 
+test('codex-review: main merged in before an accepted fix is made does not strand the confirm round', (t) => {
+  const w = worldIgnoringReview(t, { yml: `${pipelineYml()}review:\n  max_rounds: 1\n` });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  // "Update branch" with a change next to the PR's lines: the content hash moves, the PR's own patch is empty
+  const merged = mergeMainInto(w, { 'src/a.js': aFile(false).replace('export const v9 = 9;', 'export const v9 = 90;') });
+  const r2 = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r2, 0, r2.stderr + r2.stdout);
+  assert.equal(r2.json.baseOnly, true);
+
+  w.repo.write('src/a.js', readFileSync(join(w.repo.dir, 'src/a.js'), 'utf8').replace('compute(x.y)', 'compute(x?.y)'));
+  const head3 = w.repo.commit('fix');
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  const outcome = w.cli(['state', 'outcome']);
+  assert.deepEqual([outcome.json.extraRound, outcome.json.reachedMax, outcome.json.reviewedRounds, outcome.json.rounds], [true, false, 1, 2], JSON.stringify(outcome.json));
+  const r3 = w.codex(3, findingsOf(), { from: merged, to: head3 });
+  assertExit(r3, 0, r3.stderr + r3.stdout);
+  assert.equal(w.state().rounds.length, 3);
+});
+
 test('codex-review: a conflicting merge falls back to the whole PR against the new base, never main\'s own changes', (t) => {
   const w = worldIgnoringReview(t);
   assertExit(w.codex(1, findingsOf()), 0);
