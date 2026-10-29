@@ -124,6 +124,9 @@ test('Codex recheck + security review of ee9899f: double-quoted GraphQL, replace
     "gh api graphql -f ''query=query{viewer{login}}$X''",
     "gh api graphql -f 'query=query{viewer{login}}$X' -f query=query{viewer{login}}$X",
     "gh api graphql -f query='query { viewer { login } }'\"$X\"",
+    // (security review of 27f228c: a spelling outside an exact list (-f=V) next to a literal decoy; a word the guard expanded)
+    "gh api graphql -f=query=query{viewer{login}}$X --raw-field='query=query{viewer{login}}$X'",
+    "Y=1; gh api graphql -f query='query($o: String!) { repository(owner:$o, name:\"x\") { id } }' -f o=$Y",
     'cp forged.json request.json && gh api graphql --input request.json',
     'gh api "$EP" -f body="$B"',
     'gh api "$EP" --input -',
