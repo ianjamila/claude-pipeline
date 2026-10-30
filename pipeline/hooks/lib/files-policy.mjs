@@ -794,13 +794,14 @@ function makeMatchers(ctx) {
   };
   // #111: a path-like word of `text` that is another name for the cwd's review folder (or a protected file in it, or anything in a round):
   // a program given such a path, or one that chdirs there, writes a protected file the text never names. Relative words are resolved
-  // against the directories inside the cwd, and against a `cd` target that is itself the review folder or lies under a round (one
-  // check per directory, not per word); other directories are skipped (a stat of every word under every assumed directory would walk the machine).
+  // against every directory the line may be in (the cwd and each cd target, outside the checkout too: `cd $T && cp x alias/state.json`,
+  // `cd $T && node -e "process.chdir('alias'); …"`). The directories are the line's own (at most 32, see collectDirs) and every stat is
+  // cached per evaluation, so this stays cheap; with no review folder nothing is looked up at all.
   // A text over the cap is not scanned word by word: with a review folder present it counts as a hit (fail closed; without one nothing can be reached).
   const ALIAS_WORD = /[^\s'"`;|&<>(){}[\],=*?$]+/g;
   const aliasInText = (v, dirs) => {
     if (v.length > MAX_ALIAS_TEXT) return ctx.hasReviewDir();
-    const where = (dirs?.length ? dirs : [ctx.cwd]).filter((d) => isInside(d, ctx.cwd, ctx.platform) || ctx.hitReviewInode(d, true));
+    const where = dirs?.length ? dirs : [ctx.cwd];
     for (const word of new Set(v.match(ALIAS_WORD) ?? [])) {
       if (!/[A-Za-z0-9]/.test(word)) continue;
       const e = word === '~' || word.startsWith('~/') ? pathsFor().join(ctx.homePosix, word.slice(1)) : word;

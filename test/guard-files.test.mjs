@@ -1134,3 +1134,24 @@ test('#111: repeated ancestors of the words of a long line are stat-ed once (per
   assert.equal(bash(`echo ${words}`, { statId, readDir }), 'allow');
   assert.ok(calls < 2000 * 2, `${calls} stat calls for 2000 words`); // (uncached: one per ancestor per word, ~6 per word)
 });
+
+test('#111: after a cd to a folder outside the checkout, a relative path through a link to the review folder is followed', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const T = w.tmp;
+  for (const cmd of [
+    `cd ${T} && cp /tmp/x alias/state.json`,
+    `cd ${T} && cp /tmp/x ralias/codex.json`,
+    `cd ${T}/alias/.. && cp /tmp/x alias/state.json`,
+    `cd ${T} && node -e "process.chdir('alias'); require('fs').writeFileSync('state.json','x')"`,
+    `cd ${T} && node -e "require('fs').writeFileSync('alias/state.json','x')"`,
+    `(cd ${T} && cp /tmp/x alias/state.json)`,
+    `pushd ${T} >/dev/null && cp /tmp/x alias/state.json`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `cd ${T} && cp /tmp/x alias/hardstops.json`, // (a scratch file directly in .review)
+    `cd ${T} && cp /tmp/x other/state.json`, // (no link)
+    `cd ${T} && cat alias/state.json`,
+    `cd ${T} && ls alias ralias`,
+  ]) assert.equal(w.bash(cmd), 'allow', cmd);
+});
