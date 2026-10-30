@@ -17,6 +17,11 @@ export class SearchCap extends Error {
 
 export const DEFAULT_BUDGET = 200_000;
 
+// The parse and the placement search walk the blocks of a file recursively (one frame per block), so a file with thousands of
+// conflict blocks would overflow the stack. Past this many blocks in one file (counted by opening-marker lines, which can only
+// over-count) the answer is "cannot tell", the same as an exhausted search budget.
+export const MAX_BLOCKS = 1000;
+
 export function makeBudget(steps = DEFAULT_BUDGET) {
   let left = steps;
   return (n = 1) => {
@@ -51,7 +56,7 @@ export const isMarkerLine = (line) => MARKER_LIKE.test(line);
 // lines of S3. That reconstruction check is what settles a "=======" line that is content: only a split that rebuilds BOTH
 // side blobs byte for byte is a parse. When a side's blob ends without a newline, git writes one before the next marker; that
 // single added "\n" is accepted on the side's last line and the blob's own bytes are what the side's line is.
-// -> { outsides: [lines[]] (blocks + 1 of them), blocks: [{ ours: lines[], theirs: lines[] }] } | { reason: 'no-parse' | 'ambiguous' }
+// -> { outsides: [lines[]] (blocks + 1 of them), blocks: [{ ours: lines[], theirs: lines[] }] } | { reason: 'no-parse' | 'ambiguous' | 'too-many-blocks' }
 export function parseConflictBlocks(markerLines, stage2Lines, stage3Lines, tick = makeBudget()) {
   const M = markerLines;
   const S2 = stage2Lines;
@@ -76,6 +81,8 @@ export function parseConflictBlocks(markerLines, stage2Lines, stage3Lines, tick 
     }
     return ends;
   };
+
+  if (M.reduce((n, l) => n + (OPEN.test(l) ? 1 : 0), 0) > MAX_BLOCKS) return { reason: 'too-many-blocks' };
 
   const go = (mi, p2, p3) => {
     let pushed = 0;

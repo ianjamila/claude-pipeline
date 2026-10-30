@@ -12,7 +12,7 @@ import { openSync, readSync, closeSync, lstatSync, readlinkSync } from 'node:fs'
 import { join } from 'node:path';
 import { run } from './proc.mjs';
 import { parseUnifiedDiff } from './diff.mjs';
-import { SearchCap, checkSelection, makeBudget, parseConflictBlocks, splitLines } from './resolution.mjs';
+import { MAX_BLOCKS, SearchCap, checkSelection, makeBudget, parseConflictBlocks, splitLines } from './resolution.mjs';
 
 // Upper bound for a git call that talks to a remote (fetch, push, ls-remote): a hung one inside a lock cannot be reclaimed.
 export const NETWORK_TIMEOUT_MS = 120_000;
@@ -313,13 +313,20 @@ function resolutionChecks({ from, forkPoint, head, baseRef }, o) {
       if (text.includes('\uFFFD')) throw fail('non-utf8', `${c.path} (${name}) is not valid UTF-8`);
     }
     const parsed = parseConflictBlocks(splitLines(marker), splitLines(s2), splitLines(s3), tick);
+    if (parsed.reason === 'too-many-blocks') throw fail('too-many-blocks', `${c.path} has more than ${MAX_BLOCKS} conflict blocks`);
     if (parsed.reason) throw fail(parsed.reason === 'ambiguous' ? 'parse-ambiguous' : 'parse', c.path);
     if (parsed.blocks.length === 0) throw fail('no-blocks', `${c.path} has no conflict block`);
     const sel = checkSelection(parsed, splitLines(resolved), tick);
     if (!sel.ok) throw fail(sel.reason, c.path);
     sel.droppedTheirs.forEach((droppedTheirs, i) => blocks.push({ path: c.path, block: i + 1, droppedTheirs }));
+    if (blocks.length > MAX_BLOCKS) throw fail('too-many-blocks', `more than ${MAX_BLOCKS} conflict blocks in all`);
   }
-  return { base: merged.tree, conflicted, conflictedCount: conflicted.length, blocks };
+  // Totals over EVERY block: a caller that shows or stores only some of them must not derive "dropped nothing" from its slice.
+  const withDrops = blocks.filter((b) => b.droppedTheirs > 0);
+  return {
+    base: merged.tree, conflicted, conflictedCount: conflicted.length, blocks,
+    blockCount: blocks.length, blocksWithDrops: withDrops.length, droppedTheirsTotal: withDrops.reduce((n, b) => n + b.droppedTheirs, 0),
+  };
 }
 
 // Was the branch's merge of the base branch (since the last reviewed head `from`) a conflict that was resolved only by choosing,
@@ -328,7 +335,8 @@ function resolutionChecks({ from, forkPoint, head, baseRef }, o) {
 // docs/plans/2026-10-29-conflict-resolution-round.md for every rule). Any failed rule, or any doubt, is `ineligible` and the
 // caller falls back to the whole-PR range. `baseRef` is the protected branch ref (origin/<default>) merges must come from.
 // `o.resolutionSearchBudget` overrides the search cap (tests).
-// -> { base: <marker tree id>, conflicted: [every conflicted path], conflictedCount, blocks: [{ path, block, droppedTheirs }] }
+// -> { base: <marker tree id>, conflicted: [every conflicted path], conflictedCount, blocks: [{ path, block, droppedTheirs }],
+//      blockCount, blocksWithDrops, droppedTheirsTotal (over all blocks) }
 //  | { ineligible: '<code>' | '<code>: <detail>' }
 export function resolutionReviewBase({ from, forkPoint, head, baseRef }, o) {
   try {
@@ -336,6 +344,8 @@ export function resolutionReviewBase({ from, forkPoint, head, baseRef }, o) {
   } catch (err) {
     if (err instanceof Ineligible) return { ineligible: err.message };
     if (err instanceof SearchCap) return { ineligible: 'search-cap: the block check exceeded its step budget' };
+    // Last line of defence: a stack overflow on some unforeseen input must fall back to the counted whole-PR round, never crash.
+    if (err instanceof RangeError) return { ineligible: 'too-many-blocks: the block check ran out of stack' };
     if (err instanceof GitError) return { ineligible: `git-error: ${err.message.slice(0, 300)}` };
     throw err;
   }

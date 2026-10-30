@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import {
   git, mergeBase, mergeTree, mergeTreeDetailed, effectiveReviewBase, resolutionReviewBase, ensureReviewBase, reviewPatch, revParse, ReviewBaseUnavailable,
 } from '../pipeline/lib/git.mjs';
-import { splitLines, interleave, parseConflictBlocks, checkSelection, makeBudget } from '../pipeline/lib/resolution.mjs';
+import { splitLines, interleave, parseConflictBlocks, checkSelection, makeBudget, MAX_BLOCKS } from '../pipeline/lib/resolution.mjs';
 import { run } from '../pipeline/lib/proc.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 
@@ -382,6 +382,45 @@ test('resolutionReviewBase: the step budget turns into ineligible, never a throw
   isNo(decide({ ...s, o: { ...s.o, resolutionSearchBudget: 2 } }, head), 'search-cap');
 });
 
+// n conflict blocks, five unchanged lines apart (closer ones are merged into one block by git). Line i*5 is changed on both sides.
+const manyLines = (name, n) => Array.from({ length: n * 5 }, (_, i) => (i % 5 === 0 ? `${name}${i}` : `keep${i}`));
+const manyText = (name, n) => manyLines(name, n).join('\n') + '\n';
+
+test('resolutionReviewBase: the totals are over every block (a drop in block 55 of 60 shows), not over a prefix', () => {
+  const s = conflictRepo({ base: { 'f.txt': manyText('base', 60) }, ours: { 'f.txt': manyText('ours', 60) }, theirs: { 'f.txt': manyText('theirs', 60) } });
+  const resolved = manyLines('theirs', 60);
+  resolved[54 * 5] = 'ours270'; // keeps ours in block 55, so one line of theirs is dropped
+  const head = resolveMerge(s.repo, { 'f.txt': resolved.join('\n') + '\n' });
+  const r = decide(s, head);
+  isOk(r);
+  assert.deepEqual([r.blockCount, r.blocksWithDrops, r.droppedTheirsTotal], [60, 1, 1]);
+  assert.deepEqual(r.blocks.filter((b) => b.droppedTheirs > 0), [{ path: 'f.txt', block: 55, droppedTheirs: 1 }]);
+});
+
+test('resolutionReviewBase: more than MAX_BLOCKS conflict blocks in a file is ineligible too-many-blocks, never a stack overflow', () => {
+  const n = MAX_BLOCKS + 200;
+  const s = conflictRepo({ base: { 'f.txt': manyText('base', n) }, ours: { 'f.txt': manyText('ours', n) }, theirs: { 'f.txt': manyText('theirs', n) } });
+  const head = resolveMerge(s.repo, { 'f.txt': manyText('theirs', n) });
+  isNo(decide(s, head), 'too-many-blocks');
+});
+
+test('resolutionReviewBase: more than MAX_BLOCKS conflict blocks in all (spread over files) is ineligible too-many-blocks', () => {
+  const per = 300;
+  const files = (name) => Object.fromEntries([1, 2, 3, 4].map((k) => [`f${k}.txt`, manyText(name, per)]));
+  const s = conflictRepo({ base: { ...files('base') }, ours: { ...files('ours') }, theirs: { ...files('theirs') } });
+  const head = resolveMerge(s.repo, files('theirs'));
+  isNo(decide(s, head), 'too-many-blocks');
+});
+
+test('resolutionReviewBase: a RangeError from the block check is ineligible, not a crash', () => {
+  // Cannot be provoked from a real repo any more (the block cap), so reach for the last line of defence directly: a head whose
+  // blob read throws a RangeError is what an overflow looks like to the caller.
+  const s = conflictRepo({ base: { 'f.txt': T('top', 'x', 'bottom') }, ours: { 'f.txt': T('top', 'o', 'bottom') }, theirs: { 'f.txt': T('top', 't', 'bottom') } });
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  const o = { ...s.o, get resolutionSearchBudget() { throw new RangeError('Maximum call stack size exceeded'); } };
+  isNo(decide({ ...s, o }, head), 'too-many-blocks');
+});
+
 test('resolutionReviewBase: a git error (unknown commit) is ineligible, not a throw', () => {
   const s = conflictRepo({ base: { 'f.txt': T('top', 'x', 'bottom') }, ours: { 'f.txt': T('top', 'o', 'bottom') }, theirs: { 'f.txt': T('top', 't', 'bottom') } });
   const r = resolutionReviewBase({ from: s.from, forkPoint: s.tip, head: 'f'.repeat(40), baseRef: 'main' }, s.o);
@@ -413,6 +452,21 @@ test('interleave: subsequence interleavings, order preserved, dropped count is t
   assert.equal(interleave(l('x'), l('a'), l('b')).ok, false);
   assert.deepEqual(interleave([], l('a'), l('b', 'c')), { ok: true, droppedTheirs: 2 });
   assert.deepEqual(interleave(l('a'), l('a'), l('a')), { ok: true, droppedTheirs: 1 });
+});
+
+test('parseConflictBlocks: 5000 blocks is "too-many-blocks" at once (no recursion, no throw); the limit itself still parses', () => {
+  const l = (...x) => x.map((s) => `${s}\n`);
+  const build = (n) => {
+    const marker = []; const s2 = []; const s3 = [];
+    for (let i = 0; i < n; i++) {
+      marker.push(...l('<<<<<<< a', `o${i}`, '=======', `t${i}`, '>>>>>>> b', 'sep'));
+      s2.push(...l(`o${i}`, 'sep'));
+      s3.push(...l(`t${i}`, 'sep'));
+    }
+    return [marker, s2, s3];
+  };
+  assert.deepEqual(parseConflictBlocks(...build(5000)), { reason: 'too-many-blocks' });
+  assert.equal(parseConflictBlocks(...build(MAX_BLOCKS)).blocks.length, MAX_BLOCKS);
 });
 
 test('parseConflictBlocks: no markers is zero blocks (a conflicted file without a block is ineligible upstream); a stage mismatch is no parse', () => {
