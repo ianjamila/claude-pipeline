@@ -640,10 +640,11 @@ holds nothing there for `lsof` to see, and once it has been idle longer than `mi
 transcript check, so Claude Code's own record of which sessions are open is read: `<config>/sessions/<pid>.json` for
 `$CLAUDE_CONFIG_DIR` and every `~/.claude*` (de-duplicated by realpath; a session both accounts list counts once). A record counts
 only while its pid is alive and the process started when its `procStart` (UTC) says (`ps -o pid=,lstart=` under `TZ=UTC`, so a
-reused pid is ignored). The session is where the last `cwd` of its transcript (`<config>/projects/*/<sessionId>.jsonl`, read from
-the end) says, or in the folder it started in when it has no transcript yet; one inside the worktree (any spelling of the path)
+reused pid is ignored). The session is where the last `cwd` of its transcript (`projects/*/<sessionId>.jsonl` of every config dir,
+not only the one that listed it, read from the end; when several accounts hold one, a `cwd` in the worktree from any of them counts)
+says, or in the folder it started in when it has no transcript yet; one inside the worktree (any spelling of the path)
 keeps it as `a Claude session is open there now (<id> pid <pid>)`, however long it has been idle, and the quarantine re-inspection
-asks again with a fresh scan. Fail-closed: a record that cannot be read or parsed, `ps` failing, a start time in an unrecognised
+asks again with a fresh scan. Fail-closed: a config dir (or the home folder) that cannot be listed or resolved for any reason but "is not there", a record that cannot be read or parsed, `ps` failing, a start time in an unrecognised
 format (or every running pid disagreeing with its `procStart`), or a live session whose transcript cannot be read or whose folder
 is unknown keeps **every** candidate (`an open Claude session could not be placed: <why>`). No `sessions/` folder in any config dir
 (an older Claude Code, another tool) and Windows make the signal unavailable: the run says `live-session signal unavailable (<why>)`
