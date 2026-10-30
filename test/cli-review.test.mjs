@@ -3057,6 +3057,56 @@ test('triage owner-ruling: works on a published round, and a state rebuilt from 
   assert.ok(triageComment(w.state()).includes(`owner (chat): ${QUOTE}`));
 });
 
+// ---- the review skill's loop, end to end (skills/review/SKILL.md section 2 and 3): the commands in the order it lists them ------
+
+test('review skill scenario: Codex ACCEPT item, fixed, state mark-implemented, clean round 2, review-complete succeeds (and is refused without mark-implemented)', (t) => {
+  for (const marked of [false, true]) {
+    const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
+    assertExit(w.codex(1, findingsOf([finding()])), 0); // 1. Codex round 1
+    assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0); // 3. judge, triage validate
+    assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0); // 5. publish the triage first
+    w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)')); // 5. the implementer's fix
+    const head2 = w.repo.commit('fix R1-B1');
+    w.prHead(head2);
+    if (marked) assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0); // 5. mark each fixed ACCEPT item
+    assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0); // round 2: the Codex fix check, clean
+    const outcome = w.cli(['state', 'outcome']); // 6. outcome
+    const done = w.cli(['review-complete', '--pr', '7']); // section 3.1
+    if (marked) {
+      assert.equal(outcome.json.clean, true, JSON.stringify(outcome.json));
+      assertExit(done, 0, done.stderr + done.stdout);
+      assert.ok(w.fake.lines().some((l) => l.startsWith('pr edit 7 ') && l.endsWith(' awaiting-review')), 'awaiting-review comes off');
+      assert.ok(postedBodies(w).some((b) => b.includes('claude-pipeline:review-complete')), 'the marker comment is posted');
+    } else {
+      assert.equal(outcome.json.clean, false, 'an unmarked ACCEPT is not clean');
+      assertExit(done, 1, done.stdout);
+      assert.match(done.json.reason, /not implemented: R1-B1/);
+    }
+  }
+});
+
+test('review skill scenario: owner ruling via ruling-request, the owner\'s recorded answer, owner-ruling, triage re-posted, review-complete succeeds', (t) => {
+  const w = world(t, { yml: CHAT_YML, gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(w, { 'R1-B1': 'REJECT' }); // what a failed arbiter model proof leaves behind
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  const before = w.cli(['review-complete', '--pr', '7']);
+  assertExit(before, 1, before.stdout); // an item waiting for a human blocks it
+  const req = w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', 'R1-B1']);
+  assertExit(req, 0, req.stderr + req.stdout);
+  // the reply ends with exactly this line; the owner answers with only the decisions
+  const answer = 'R1-B1: reject';
+  const recorded = ownerRules(t, answer, `Answer with only \`<id>: accept | follow-up | reject\`.\n${req.json.line}`);
+  assert.ok(recorded, 'the owner-go recorder wrote the owner\'s answer down against the line ruling-request printed');
+  const ruled = w.cli(rule('R1-B1', 'REJECT', { quote: answer, extra: ['--pr', '7'] }));
+  assertExit(ruled, 0, ruled.stderr + ruled.stdout);
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0); // re-post so the ruling is published
+  assert.equal(w.cli(['state', 'outcome']).json.clean, true);
+  const done = w.cli(['review-complete', '--pr', '7']);
+  assertExit(done, 0, done.stderr + done.stdout);
+  assert.ok(postedBodies(w).at(-1).includes('claude-pipeline:review-complete'));
+});
+
 test('followups create: a FOLLOW-UP ruled by the owner is filed, one that is still waiting for a human is held', (t) => {
   const url = 'https://github.com/acme/widgets/issues/31';
   const w = world(t, { yml: CHAT_YML, gh: [...GH, ...NO_ISSUES, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 31, html_url: url } }] });

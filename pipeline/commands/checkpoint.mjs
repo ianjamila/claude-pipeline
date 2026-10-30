@@ -1,4 +1,4 @@
-// `pipeline checkpoint --pr N --step S ...`: record where this `ship` run stands in the PR's summary comment (the run
+// `pipeline checkpoint --pr N --step S ...`: record where this review run stands in the PR's summary comment (the run
 // record), so another session or machine can pick the run up. It refuses unless the PR head on GitHub IS the local HEAD:
 // a checkpoint is a statement about pushed work, never about commits only this clone has.
 import { readFileSync, statSync } from 'node:fs';
@@ -13,7 +13,7 @@ import { VIEW_FIELDS, baseRecordFor } from '../lib/run-progress.mjs';
 import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 
 export const meta = {
-  summary: 'record where the ship run stands in the PR summary comment (refuses unless local HEAD is the pushed PR head)',
+  summary: 'record where the review run stands in the PR summary comment (refuses unless local HEAD is the pushed PR head)',
   usage: [
     'pipeline checkpoint --pr N --step build|verify|pr|review|gate|awaiting-owner-merge|merge|ended [--next TEXT] [--detail TEXT]',
     '                    [--request-file F] [--tasks-file F] [--task-done ID] [--verify-report] [--round R] [--resumed] [--repo DIR]',

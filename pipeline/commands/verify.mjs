@@ -1,4 +1,4 @@
-// `pipeline verify <sub>`: the deterministic parts of how the ship skill runs verify. The skill never builds these command
+// `pipeline verify <sub>`: the deterministic parts of how the review skill runs verify. The skill never builds these command
 // lines by hand. Subcommands: plan-after-fix (which verify commands to run after a round's accepted fixes) and slot (limit how
 // many full verifies run at once on one machine, opt-in through verify.max_parallel_full).
 //
@@ -28,7 +28,7 @@ import { guardVerdict } from '../lib/command-guard.mjs';
 import { loadState } from '../lib/state.mjs';
 
 export const meta = {
-  summary: 'plan the verify commands for the ship loop (plan-after-fix); limit parallel full verifies (slot)',
+  summary: 'plan the verify commands for the review skill (plan-after-fix); limit parallel full verifies (slot)',
   usage: [
     'pipeline verify plan-after-fix --round R [--repo DIR]   -> {ok, mode, commands, matchedSteps, base, head, files}',
     '  verify.after_fix full (default): commands = [verify.full]. quick: commands = [verify.quick] plus, when the fixes since round R\'s',

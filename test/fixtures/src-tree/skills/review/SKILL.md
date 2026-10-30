@@ -1,5 +1,5 @@
 ---
-name: ship
-description: fixture skill ship
+name: review
+description: fixture skill review
 ---
-# ship (fixture)
+# review (fixture)

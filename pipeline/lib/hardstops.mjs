@@ -14,7 +14,7 @@
 // pass/fail decision counts. Database rules (R0, R1-destructive, R1-migration-edited, R2-sql-*), R4-pipeline (the guard core) and unlisted rules can
 // never be advisory.
 // Owner-merge mode (`owner_approval: chat`): the owner no longer applies approval labels. Every hit that would otherwise block
-// becomes `advisory: true, ownerMerge: true`: CI passes, nothing needs a label, and `ownerMergeHits(hits)` lists what the ship
+// becomes `advisory: true, ownerMerge: true`: CI passes, nothing needs a label, and `ownerMergeHits(hits)` lists what the review
 // skill must put in front of the owner in chat before it merges. Report-only hits stay plain advisory (no ownerMerge).
 //
 // Shape: a pure core (`classifyHardStops` and the helpers exported for tests) plus ONE supported entry point,

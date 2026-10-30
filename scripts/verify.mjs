@@ -1,6 +1,6 @@
 // claude-pipeline's own copy of pipeline/templates/scripts/verify.mjs (test/self-verify.test.mjs keeps the two in step:
 // only the STEPS block, PROJECT and the library import paths may differ). It is what `verify.full` / `verify.quick` in
-// .claude/pipeline.yml run, and `ship` and CI both trust its report.
+// .claude/pipeline.yml run, and the review skill and CI both trust its report.
 //   node scripts/verify.mjs                full run: every step, in order, stop at the first failure
 //   node scripts/verify.mjs --quick        only steps marked quick:true (using quickCmd when a step has one)
 //   node scripts/verify.mjs --only a,b     just those steps (report mode "partial"; never a substitute for a full run)

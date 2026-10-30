@@ -9,7 +9,7 @@
 // when a whole file is the offender. Heuristics are deliberately blunt: a false positive costs one label click,
 // a miss ships a green suite that proves nothing.
 // Owner-merge mode (`owner_approval: chat`): violations do not fail the check (ok: true); the same violations are also
-// returned as `ownerMerge`, which the ship skill puts in front of the owner in chat before it merges.
+// returned as `ownerMerge`, which the review skill puts in front of the owner in chat before it merges.
 import { matchAny } from './glob.mjs';
 
 export const OVERRIDE_LABEL = 'test-change-approved';

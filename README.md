@@ -16,7 +16,7 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 
 | Piece | What it does |
 |---|---|
-| skills `ship`, `verify`, `pipeline-setup` | the process: ship runs the flow, verify proves a change works, pipeline-setup onboards a repo |
+| skills `review`, `verify`, `pipeline-setup` | the process: review builds the change and runs the cross-model review, then asks you to merge; verify runs the quick check; pipeline-setup onboards a repo |
 | agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `arbiter` (Fable) | the judgment; models are pinned in the agent files and proven from transcripts |
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge) |
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
@@ -126,8 +126,7 @@ Onboard a repo once, then just ask for work:
 | Say | What happens |
 |---|---|
 | "set up the pipeline" / "onboard this repo" | `pipeline-setup` audits the repo, shows a proposal, writes `.claude/pipeline.yml`, `scripts/verify.mjs`, the guard workflow and tests on `agent/pipeline-setup`, and opens a `needs-human` PR for you to merge |
-| "add a CSV export to the reports page" (any build/fix request) | `ship` runs the full flow and reports back with the PR, the review outcome and production status |
-| "resume pipeline reviews" | picks up every open `awaiting-review` PR (Codex was down or out of quota) and continues from the review step |
+| "add a CSV export to the reports page" (any build/fix request) | `review` builds it on a branch, opens a draft PR, runs the Codex review loop, and ends with a merge request for you to answer |
 | "build #123" or relabel an issue `agent-suggestion` → `agent-build` | builds a follow-up idea the review loop filed |
 | "verify this" / "is it working?" | `verify` runs the repo's verify and shows the evidence |
 
@@ -135,7 +134,7 @@ To onboard another project (e.g. DRMed): open Claude in that repo and say *"Set 
 for this repo. Ask me about hard-stops you can't infer."*
 
 **Opting out:** start a session with `PIPELINE_OFF=1 claude`, or tell Claude not to use the
-pipeline. ship and verify stand down; branch protection and the
+pipeline. review and verify stand down; branch protection and the
 global git guard stay on regardless.
 
 ### `P stacks`: stopping private Supabase stacks nobody needs
@@ -160,7 +159,7 @@ merges (PRs still get built, verified and reviewed). Agents cannot close it. An 
 |---|---|---|
 | `needs-human` | a blocking hard-stop (migration, auth/RLS, secrets, pipeline files, major dependency bump, sensitive personal data, project extras; a project can make the non-database ones report-only, except the guard core `R4-pipeline` (workflows, `.claude/`, CODEOWNERS, pipeline scripts, files the CI checks read), via `hard_stops.report_only_rules` / `report_only_paths`: listed, never blocking) or something the pipeline couldn't settle | read the PR and its summary comment; to approve add `human-approved` in the GitHub UI (while the PR still shows the commit you reviewed), `Hard-stop scan` re-runs, then merge. A new push drops the approval: re-apply it |
 | `pipeline-blocked` | verify stayed red after three fix cycles | the draft PR has the failing step and log excerpt |
-| `awaiting-review` | Codex was unavailable | say "resume pipeline reviews" later |
+| `awaiting-review` | Codex was unavailable | ask for the review again once Codex works; `pipeline review-complete` takes the label off |
 | `test-change-approved` (you add it) | approves a PR that weakens or deletes tests; like `human-approved` it covers only the commit it was applied to | — |
 
 Hard-stop PRs still go through the full review loop first, so you always get a reviewed PR.
@@ -216,7 +215,7 @@ head you did not review (the receipt names the head the event carried).
   `npm_*` / `yarn_*` / `pnpm_*` / `bun_*` / `COREPACK_*` variable, `INIT_CWD`, a .npmrc (the project's, the user's, and the global one under the prefix the user's or the project's `prefix=` / `--prefix` / node's own place names: `<prefix>/etc/npmrc`) that sets `script-shell`, `node-options` or `globalconfig`, a `prefix=` the guard cannot work out (an unknown `${VAR}`), a subcommand or option the guard does not know, and the manager's own writes earlier on the line (`npm pkg set`, `npm set-script`, `npm config set`, `npm init` ...) make the script unknown, and it is refused. `npm explore PKG -- CMD` runs CMD in `node_modules/PKG` of the project: CMD is judged like `bash -c CMD` run there, a file it runs inside that package is opened (a program run by path in node_modules is not otherwise), and a PKG that is not a plain name (a variable, a glob, `..`, a path) or a `-g` explore is refused; without CMD it opens an interactive shell and there is nothing to judge. A line that writes package.json or a configuration file before the manager reads it is refused too, and one that may write it (a target only known at run time) when it also mentions a guarded operation: the same rule as for a script file, so, like a script file, a `git checkout`, a `git worktree add`, a `tar x` or a background job earlier on the line is not followed. They also deny a command line too long to be read in full (when it contains a
   guarded word), a push to a dynamic destination (only `$(git branch --show-current)`,
   `$(git rev-parse --abbrev-ref HEAD)` or a variable assigned a literal in the same command are
-  understood; ship pushes `git push -u origin agent/<slug>`), `unset CLAUDECODE`, and setting
+  understood; the review skill pushes `git push -u origin agent/<slug>`), `unset CLAUDECODE`, and setting
   `PIPELINE_GH`, `PIPELINE_CODEX`, `PIPELINE_VERCEL`, `PIPELINE_TEST_MODE` or `PIPELINE_UPDATE_REMOTE` on a `pipeline.mjs` command;
   the installed CLI ignores those five seam variables altogether (they exist for the test suite).
   The stack-stop seams `PIPELINE_DOCKER`, `PIPELINE_PS`, `PIPELINE_LSOF`, `PIPELINE_SUPABASE`, `PIPELINE_STACKS_DEADLINE_MS` and `PIPELINE_INSTALL_WORKER_WAIT_MS` follow a stricter rule: an installed copy ignores them always; in the repo checkout they count only when `PIPELINE_STACKS_HOME` points somewhere other than the default `~/.claude/pipeline-state/stacks` **and** `PIPELINE_STACKS_ONLY` names the projects that isolated run may touch.
@@ -247,7 +246,7 @@ head you did not review (the receipt names the head the event carried).
 
 `.claude/pipeline.yml` is documented in its template (`pipeline/templates/pipeline.yml`). Three keys deserve a
 mention: `owner_approval` (`label` by default; `chat` drops the approval labels: blocking hard-stops and test-integrity
-violations no longer fail CI, the ship skill stops before the merge, lists them in a PR comment and merges when you say
+violations no longer fail CI, the review skill stops before the merge, lists them in a PR comment and merges when you say
 "merge" in chat; the PR ends as `awaiting-owner-merge`), `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop scan` statuses are always
 required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`), `ci.review_check`
 (default `false`; `true` makes the guards also post `Cross-model review`, green only when the newest review-complete comment
@@ -301,7 +300,7 @@ verify:
   ci_proof:
     sql-arms: { workflow: .github/workflows/migration-replay.yml, job: "SQL arms", event: pull_request }
   ci_proof_inputs: [supabase/tests/sql-arms/**]   # extra paths that make a PR ineligible
-  ci_proof_wait_minutes: 20        # how long ship waits for that run (unset = it does not wait)
+  ci_proof_wait_minutes: 20        # how long the pipeline waits for that run (unset = it does not wait)
 ```
 
 - Safety rule: the Mac is skipped for a step only when the final gate finds a passed run of exactly that workflow file and job, on this
@@ -315,7 +314,7 @@ verify:
   conclusion `success`; absent, repeated, skipped, cancelled or failed (even under a green job) sends the step back to the Mac. Names are matched
   exactly (case and spaces), at most 20 names of at most 200 characters, no repeats. The job's `steps` come from the run's jobs listing, or one extra read of the job.
   A repo's `scripts/pipeline/lib/config.mjs` (vendored) must know `steps` before the key is set: run `pipeline update`, then `pipeline vendor` in the repo.
-- `ci_proof_wait_minutes` is the longest ship waits for the GitHub run before it runs the step on the Mac instead; set it from the measured CI time.
+- `ci_proof_wait_minutes` is the longest the pipeline waits for the GitHub run before it runs the step on the Mac instead; set it from the measured CI time.
 - Rollout: eaglewatch enables `ci_proof` only after its PR B (draft runs, always-report, sharded jobs with one aggregator job) and one measured database PR.
   Until then it uses only `after_fix` and the slot limit.
 
@@ -324,12 +323,12 @@ Rollout: the config rejects unknown keys, so set these in a repo only after ever
 
 | Variable | Meaning |
 |---|---|
-| `PIPELINE_OFF=1` | ship and verify stand down for the session |
+| `PIPELINE_OFF=1` | review and verify stand down for the session |
 | `PIPELINE_ADMIN=1` | allows the installer and `protect --apply` from a Claude session |
 | `PIPELINE_MACHINE_ID` | stable id for this machine in the lock files (default: one generated once) |
 | `PIPELINE_SMOKE_BYPASS_KEY` | secret value of the `smoke_bypass_header` header (see "Smoke firewall bypass header"); read only by `scripts/pipeline/smoke.mjs`, never printed |
 | `PIPELINE_SMOKE_PORT` | the e2e smoke server's port; printed by `supabase-local env`, read by `playwright.smoke.config.ts` |
-| `PIPELINE_TEST_COMMIT_AS_IS`, `PIPELINE_TEST_FORCE_ARBITER`, `PIPELINE_ARBITER_MODEL_OVERRIDE` | proof switches: see `skills/ship/reference/proof-switches.md` |
+| `PIPELINE_TEST_COMMIT_AS_IS`, `PIPELINE_TEST_FORCE_ARBITER`, `PIPELINE_ARBITER_MODEL_OVERRIDE` | proof switches (test and proof runs only; see docs/cli.md) |
 
 `pipeline vendor` also writes `.gitattributes` lines (`scripts/pipeline/** -text`, `scripts/verify text
 eol=lf`) so a Windows checkout cannot change the vendored bytes; the `scripts/verify` shim must stay
@@ -338,7 +337,7 @@ executable.
 ## Troubleshooting
 
 - **Codex quota or outage:** the PR is built, verified, opened and labelled `awaiting-review`;
-  preflight warns up front. Once Codex works again say "resume pipeline reviews".
+  preflight warns up front. Once Codex works again, ask for the review to be run again on that PR (`P state show --pr N` restores its review state).
 - **`model-proof` failed** (the arbiter or judge transcript doesn't show the pinned model or
   effort): the disputed items go to `needs-human`. Check that the agent files in
   `~/.claude/agents/` still pin `model:` (`./install.sh --check`), that nothing passed a `model`
@@ -347,7 +346,7 @@ executable.
   With `owner_approval: chat` you can instead rule on the disputed items in chat: the run records it with
   `pipeline triage owner-ruling` (it asks with a `⚖️ Owner ruling needed` line; your whole answer to it is recorded on this machine and
   must be only the decisions, `R1-B1: accept` / `follow-up` / `reject` per item (reasons in another message); it is published in the triage comment), you still say "merge"
-  yourself, then remove `needs-human` and say `ship resume N`.
+  yourself, then remove `needs-human`.
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
 - **`--check` reports drift:** someone edited an installed file (or an install did not finish); run `node ~/.claude/pipeline/bin/pipeline.mjs update`, or re-run `./install.sh`.
 - **A merge didn't happen:** the run's summary comment and `.review/final-gate.json` in the
@@ -367,6 +366,6 @@ plus an installer round trip into a throwaway Claude home with a space in its pa
 `test (ubuntu)` and `test (windows)` are this repo's required checks.
 
 The repo is onboarded to itself (`.claude/pipeline.yml`) with **every path a hard-stop**, so a
-change to the pipeline never auto-merges: ship builds, verifies and reviews it, then hands you a
+change to the pipeline never auto-merges: the review skill builds, checks and reviews it, then hands you a
 `needs-human` PR. `scripts/verify.mjs` is the project template with only its steps changed;
 `test/self-verify.test.mjs` fails if the two drift.

@@ -59,14 +59,13 @@ test('a needs-human comment always carries --reason (the command exits 2 without
     }
     assert.ok(!/triage settle[^\n]*--evidence/.test(text), `${doc} still uses triage settle --evidence`);
   }
-  assert.ok(read('skills/ship/reference/review-loop.md').includes('--test-cmd') && read('skills/ship/reference/review-loop.md').includes('--test-file'));
+  assert.ok(read('skills/review/SKILL.md').includes('--test-cmd') && read('skills/review/SKILL.md').includes('--test-file'));
 });
 
-test('ship teaches reading the job exit code and every refusal the merge command can return', () => {
-  const ship = read('skills/ship/SKILL.md');
-  assert.match(ship, /exitCode/);
-  const table = read('skills/ship/reference/gates-and-exits.md');
-  for (const needle of ['behind-base:', 'pre-merge', 'live-check', 'mergeSha: null']) assert.ok(table.includes(needle), `gates-and-exits.md must cover ${needle}`);
+test('the review skill teaches reading the job exit code, and keeps the update-branch route for a PR whose base moved', () => {
+  const review = read('skills/review/SKILL.md');
+  assert.match(review, /exitCode/);
+  assert.match(review, /update-branch/);
 });
 
 test('agents: implementer and verifier inherit effort (spec 5.4); judge (Sonnet), arbiter (Fable) and Explore (Haiku) pin theirs', () => {

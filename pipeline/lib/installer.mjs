@@ -11,14 +11,14 @@ import { canonicalPath, toPosix } from './paths.mjs';
 // Kept exported from here: callers have imported it from the installer.
 export { canonicalPath };
 
-export const SKILLS = ['ship', 'verify', 'pipeline-setup'];
+export const SKILLS = ['review', 'verify', 'pipeline-setup'];
 // Retired units: no longer shipped, removed from an existing install by the next update. A retired hook is a script under
 // pipeline/hooks/ (its file leaves with the pipeline unit; its settings.json entries are recognised as ours and dropped, and
 // --check reports them). A retired skill is a skills/<name>/ dir: the files the manifest lists are removed (an edited one is
 // saved to backups/ first), files it does not list are kept. Retiring one is adding its name here (and dropping it from
-// SKILLS / the hook list in buildPlan). RETIRED_SKILLS is empty until the ship skill is retired.
+// SKILLS / the hook list in buildPlan). `ship` is retired: the review skill replaced it.
 export const RETIRED_HOOKS = Object.freeze(['session-version']);
-export const RETIRED_SKILLS = Object.freeze([]);
+export const RETIRED_SKILLS = Object.freeze(['ship']);
 // Explore: a Haiku stand-in for Claude Code's built-in Explore agent (same name, so it takes the built-in's place).
 export const AGENTS = ['implementer', 'verifier', 'judge', 'arbiter', 'Explore'];
 export const EXCLUDED_NAMES = new Set(['node_modules', '.DS_Store']);

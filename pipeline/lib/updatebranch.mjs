@@ -79,7 +79,7 @@ async function waitForNewHead({ gh, pr, from, waitMs, pollMs, now, sleep }) {
 // worktree's HEAD): a PR head that differs is `head-moved` before anything is written. The new head is accepted only if it is
 // the merge commit GitHub makes, parents exactly [the pinned head, the base tip captured with the behind count]; any other
 // successor (an external push that raced the update) is `head-moved` and nothing more is written. Waiting for the new head's
-// checks is opt-in (`waitChecks: true`): the ship flow marks the PR ready and labels it AFTER updating, and checks that only
+// checks is opt-in (`waitChecks: true`): the review flow marks the PR ready and labels it AFTER updating, and checks that only
 // start then (draft-skipped workflows, label-gated e2e) would otherwise be waited on forever. Merge needs no check wait either.
 export async function bringUpToDate({
   gh, pr, expectHead = null, maxCycles = MAX_UPDATE_CYCLES, waitChecks = false,

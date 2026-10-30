@@ -111,3 +111,55 @@ for (const doc of docs) {
     assert.deepEqual(problems, []);
   });
 }
+
+// ---- what the skills may say, and that the review skill keeps every step the review loop depends on ----------------------
+
+const skillsDir = join(root, 'skills');
+const skillDocs = docs.filter((d) => d.startsWith(skillsDir));
+const reviewSkill = readFileSync(join(skillsDir, 'review', 'SKILL.md'), 'utf8');
+
+test('(a) every `P <name>` / `pipeline <name>` in a skill names a file in pipeline/commands (the per-doc tests above check the flags)', () => {
+  const found = skillDocs.flatMap((d) => codeSpans(readFileSync(d, 'utf8')).flatMap(invocationsIn));
+  assert.ok(found.some((i) => i.cmd === 'review-complete'), 'the review skill is among the docs scanned');
+  const names = new Set(readdirSync(commandsDir).filter((f) => f.endsWith('.mjs')).map((f) => f.slice(0, -4)));
+  assert.deepEqual([...new Set(found.map((i) => i.cmd))].filter((c) => !names.has(c)), []);
+});
+
+test('(b) no skill sends the agent to a retired command or to the deleted ship skill', () => {
+  for (const doc of skillDocs) {
+    const text = readFileSync(doc, 'utf8');
+    for (const word of ['prod-watch', 'P deploy', 'P inbox', 'P resume', 'P notify', 'skills/ship', 'ship resume', 'ship inbox']) {
+      assert.ok(!text.includes(word), `${relative(root, doc)} still mentions \`${word}\``);
+    }
+  }
+});
+
+test('(c) the review skill stays short and keeps every step review-complete depends on', () => {
+  const lines = reviewSkill.split('\n').length;
+  assert.ok(lines <= 160, `skills/review/SKILL.md is ${lines} lines (cap 160)`);
+  for (const needle of [
+    'review-complete', 'cost', '--from-transcript', 'Ready to merge', 'mark-implemented', 'ruling-request', 'owner-ruling',
+    '## In plain English', 'triage validate', 'arbiter apply', 'codex-review', 'verify.quick',
+  ]) assert.ok(reviewSkill.includes(needle), `the review skill must mention ${needle}`);
+  assert.match(reviewSkill, /^name: review$/m);
+  assert.match(reviewSkill, /Head <sha12> · items <digest> · repo <owner\/name>/);
+});
+
+test('(c2) the review skill lists the steps in the order they must run: Codex, triage, comment, fix, mark-implemented, Codex check, review-complete, ready, merge request', () => {
+  const at = (needle) => {
+    const i = reviewSkill.indexOf(needle);
+    assert.ok(i >= 0, `the review skill must mention ${needle}`);
+    return i;
+  };
+  const order = ['codex-review', 'triage validate', '--kind triage', 'mark-implemented', '**Outcome.**', 'review-complete --pr N', 'gh pr ready N', 'Ready to merge'];
+  const positions = order.map(at);
+  assert.deepEqual(positions, [...positions].sort((x, y) => x - y), `out of order: ${order.join(' < ')}`);
+});
+
+test('(d) the installer installs exactly the skills in skills/, and retires ship', async () => {
+  const { SKILLS, RETIRED_SKILLS } = await import(pathToFileURL(join(root, 'pipeline', 'lib', 'installer.mjs')).href);
+  const dirs = readdirSync(skillsDir).filter((n) => statSync(join(skillsDir, n)).isDirectory());
+  assert.deepEqual([...SKILLS].sort(), dirs.sort());
+  assert.deepEqual([...RETIRED_SKILLS], ['ship']);
+  assert.ok(!SKILLS.includes('ship'));
+});

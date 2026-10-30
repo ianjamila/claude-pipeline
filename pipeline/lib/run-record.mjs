@@ -1,4 +1,4 @@
-// The run record: where a `ship` run stands, kept in the PR's summary comment so another session (or machine) can pick
+// The run record: where a review run stands, kept in the PR's summary comment so another session (or machine) can pick
 // it up. It is display + routing hints, editable by anyone with comment rights and last-writer-wins; nothing that
 // must not be lost lives only here (see run-events.mjs for the append-only evidence). Pure: no IO, no clock (callers
 // pass `now` and `host`).

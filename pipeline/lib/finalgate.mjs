@@ -628,7 +628,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     tree,
     contentHash: hash,
     checks,
-    // owner_approval: chat: items the owner merges in chat (0 = none, merge as usual). The ship skill reads this.
+    // owner_approval: chat: items the owner merges in chat (0 = none, merge as usual). The review skill reads this.
     ownerMerge: checks.reduce((n, c) => n + (c.ownerMerge ?? 0), 0),
     // #58: the owner-item set as one digest ('none' without items). The owner's "merge" is recorded against it, and P merge needs the
     // live gate to show the same set: an item added or swapped after the owner said "merge" (same head) needs a new "merge".
@@ -641,7 +641,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
   };
 }
 
-// The checks of `P merge --owner-go` (owner decision 2026-10-28): work that never ran the ship loop (no verify report, no review
+// The checks of `P merge --owner-go` (owner decision 2026-10-28): work that never ran the review skill (no verify report, no review
 // state, no final-gate.json) merges on the owner's "merge" alone, provided GitHub agrees the PR is ready: open, not a draft,
 // MERGEABLE, not behind its base, at the local HEAD, no blocking label, and every required check green on this head (ciCheck,
 // guard statuses and the Cross-model review status only with their provenance). The owner's recorded "merge" is checked by the

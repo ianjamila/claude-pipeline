@@ -1,13 +1,13 @@
-# .claude/pipeline.yml — project settings for the global ship/verify pipeline.
+# .claude/pipeline.yml — project settings for the global review/verify pipeline.
 # Validate with: node ~/.claude/pipeline/bin/pipeline.mjs config
 version: 1
 project: my-app
 default_branch: main
 enforcement: github            # github = branch protection must be live; gate = skills only
 # owner_approval: label        # label (default) = the owner adds `human-approved` / `test-change-approved` to let a blocking hard-stop
-#                              # or test-integrity violation merge. chat = no labels: CI does not fail on those, the ship skill
+#                              # or test-integrity violation merge. chat = no labels: CI does not fail on those, the review skill
 #                              # stops before the merge, lists them in a PR comment and merges when the owner says "merge" in chat.
-worktree_dir: .worktrees       # ship creates agent/<name> worktrees here (must be gitignored)
+worktree_dir: .worktrees       # the review skill creates agent/<name> worktrees here (must be gitignored)
 # worktrees:                 # `pipeline worktrees prune` (spec docs/specs/2026-10-13-worktree-prune-design.md)
 #   mode: report             # off | report | on — nothing is removed until this says on
 #   protect: [foundation, "*.stack"]
@@ -32,7 +32,7 @@ verify:
   #   "supabase/**": [db, db-grants]
   # after_fix_never: [sql-arms]    # optional: steps that must stay full-verify only; one listed in the map above is a config error
   # max_parallel_full: 2        # optional, positive integer: at most this many FULL verifies (of any repo) run at once on this machine; the
-  #                                # rest wait in arrival order. The ship skill then runs `P verify slot --run` (which runs verify.full itself). Unset = no limit.
+  #                                # rest wait in arrival order. The review skill then runs `P verify slot --run` (which runs verify.full itself). Unset = no limit.
   # max_load: 12                # optional, positive number, needs max_parallel_full: after getting a slot, wait while the 1-minute load
   #                                # average is above this (re-checked every 5-30 s), then run anyway with a warning. Not on Windows.
   # max_load_wait_minutes: 10   # optional, default 10, at most 10: how long that load wait may last
@@ -42,7 +42,7 @@ verify:
   #   sql-arms: { workflow: .github/workflows/migration-replay.yml, job: "SQL arms", event: pull_request }   # job: one aggregator job for a sharded matrix
   #   # optional per entry: steps: ["Typecheck", "Vitest"]   # step names inside the job that must each have run and succeeded (a job with a docs-only skip is green with every step skipped)
   # ci_proof_inputs: ["supabase/tests/sql-arms/**"]   # optional: extra paths that make a PR ineligible (.github/**, .claude/pipeline.yml, scripts/verify* always do)
-  # ci_proof_wait_minutes: 20      # optional, above 0: the most ship waits for that run before running the step on the Mac (unset = no waiting)
+  # ci_proof_wait_minutes: 20      # optional, above 0: the most the review skill waits for that run before running the step on the Mac (unset = no waiting)
 
 ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names

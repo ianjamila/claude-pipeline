@@ -1,5 +1,5 @@
 // Proves, from Claude Code's own transcript log, that a subagent (the arbiter) really ran on the pinned model at the
-// pinned effort: never the agent's say-so. Finds the transcript by tag (the Agent description the ship skill set) or
+// pinned effort: never the agent's say-so. Finds the transcript by tag (the Agent description the review skill set) or
 // by agent id, then checks every assistant turn. Exit 0 = proven, 1 = proof failed, 2 = no transcript or unreadable
 // (an environment problem the caller may retry, which is why it is not folded into "failed").
 import { readFileSync } from 'node:fs';

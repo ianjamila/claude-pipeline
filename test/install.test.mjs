@@ -168,7 +168,7 @@ test('fresh install into an empty home (path with a space): files, manifest, hoo
   assert.equal(r.status, 0, r.stderr + r.stdout);
 
   for (const rel of [
-    'skills/ship/SKILL.md', 'skills/ship/reference/notes.md', 'skills/verify/SKILL.md', 'skills/pipeline-setup/SKILL.md',
+    'skills/review/SKILL.md', 'skills/review/reference/notes.md', 'skills/verify/SKILL.md', 'skills/pipeline-setup/SKILL.md',
     'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md', 'agents/Explore.md',
     'pipeline/bin/pipeline.mjs', 'pipeline/hooks/guard-git.mjs', 'pipeline/hooks/guard-files.mjs',
     'pipeline/hooks/stack-register.mjs', 'pipeline/hooks/stack-dev-bind.mjs', 'pipeline/hooks/stack-session-end.mjs',
@@ -210,7 +210,7 @@ test('excluded names (node_modules, .DS_Store, test) are never copied or listed'
   mkdirSync(join(src, 'pipeline', 'test'), { recursive: true });
   writeFileSync(join(src, 'pipeline', 'test', 't.mjs'), 'x');
   writeFileSync(join(src, 'pipeline', '.DS_Store'), 'x');
-  writeFileSync(join(src, 'skills', 'ship', '.DS_Store'), 'x');
+  writeFileSync(join(src, 'skills', 'review', '.DS_Store'), 'x');
   const r = install(home, [], { source: src });
   assert.equal(r.status, 0, r.stderr);
   const files = listTree(home);
@@ -266,11 +266,11 @@ test('a second install changes nothing: settings, manifest files and hooks are i
 test('reinstall repairs an installed file that was edited', () => {
   const home = newHome();
   assert.equal(install(home).status, 0);
-  writeFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'tampered\n');
-  writeFileSync(join(home, 'skills', 'ship', 'stray.md'), 'stray\n');
+  writeFileSync(join(home, 'skills', 'review', 'SKILL.md'), 'tampered\n');
+  writeFileSync(join(home, 'skills', 'review', 'stray.md'), 'stray\n');
   assert.equal(install(home).status, 0);
-  assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), readFileSync(join(FIXTURE, 'skills', 'ship', 'SKILL.md'), 'utf8'));
-  assert.equal(existsSync(join(home, 'skills', 'ship', 'stray.md')), false);
+  assert.equal(readFileSync(join(home, 'skills', 'review', 'SKILL.md'), 'utf8'), readFileSync(join(FIXTURE, 'skills', 'review', 'SKILL.md'), 'utf8'));
+  assert.equal(existsSync(join(home, 'skills', 'review', 'stray.md')), false);
 });
 
 // 4
@@ -327,7 +327,7 @@ test('a foreign skill dir not in the manifest is refused (exit 1, nothing writte
   assert.match(r.stderr, /skills\/verify/);
   assert.equal(readFileSync(join(home, 'skills', 'verify', 'SKILL.md'), 'utf8'), 'my own verify skill\n');
   assert.equal(existsSync(join(home, 'pipeline')), false, 'nothing was installed');
-  assert.equal(existsSync(join(home, 'skills', 'ship')), false);
+  assert.equal(existsSync(join(home, 'skills', 'review')), false);
   assert.equal(readFileSync(settingsPath(home), 'utf8'), settingsBefore);
 
   const f = install(home, ['--force']);
@@ -465,10 +465,10 @@ test('--check also reports a missing file, a duplicated hook, a missing allow en
   assert.equal(install(home, [], { source: src }).status, 0);
   assert.equal(install(home, ['--check'], { source: src }).status, 0);
 
-  writeFileSync(join(src, 'skills', 'ship', 'SKILL.md'), 'new source\n');
+  writeFileSync(join(src, 'skills', 'review', 'SKILL.md'), 'new source\n');
   c = install(home, ['--check'], { source: src });
   assert.equal(c.status, 1, 'source changed since install');
-  assert.match(c.stdout, /skills\/ship\/SKILL\.md/);
+  assert.match(c.stdout, /skills\/review\/SKILL\.md/);
   assert.equal(install(home, [], { source: src }).status, 0);
 
   rmSync(join(src, 'agents', 'arbiter.md'));
@@ -516,7 +516,7 @@ test('--uninstall removes our files, hooks and allow entries, keeps everything e
 
   const r = install(home, ['--uninstall']);
   assert.equal(r.status, 0, r.stderr);
-  for (const rel of ['skills/ship', 'skills/verify', 'skills/pipeline-setup', 'agents/judge.md', 'agents/implementer.md', 'pipeline']) {
+  for (const rel of ['skills/review', 'skills/verify', 'skills/pipeline-setup', 'agents/judge.md', 'agents/implementer.md', 'pipeline']) {
     assert.equal(existsSync(join(home, ...rel.split('/'))), false, `${rel} should be gone`);
   }
   assert.equal(readFileSync(join(home, 'skills', 'mine', 'SKILL.md'), 'utf8'), 'keep me\n');
@@ -568,21 +568,21 @@ test('a file removed from the source between installs is removed from home on re
   const src = copyFixture();
   assert.equal(install(home, [], { source: src }).status, 0);
   assert.ok(existsSync(join(home, 'agents', 'arbiter.md')));
-  assert.ok(existsSync(join(home, 'skills', 'ship', 'reference', 'notes.md')));
+  assert.ok(existsSync(join(home, 'skills', 'review', 'reference', 'notes.md')));
   assert.ok(existsSync(join(home, 'pipeline', 'templates', 'example.md')));
   rmSync(join(src, 'agents', 'arbiter.md'));
-  rmSync(join(src, 'skills', 'ship', 'reference'), { recursive: true });
+  rmSync(join(src, 'skills', 'review', 'reference'), { recursive: true });
   rmSync(join(src, 'pipeline', 'templates'), { recursive: true });
   const r = install(home, ['--json'], { source: src });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(existsSync(join(home, 'agents', 'arbiter.md')), false);
-  assert.equal(existsSync(join(home, 'skills', 'ship', 'reference')), false);
+  assert.equal(existsSync(join(home, 'skills', 'review', 'reference')), false);
   assert.equal(existsSync(join(home, 'pipeline', 'templates')), false);
   assert.ok(existsSync(join(home, 'agents', 'judge.md')));
   const m = readManifest(home);
   assert.ok(!('agents/arbiter.md' in m.files));
   assert.deepEqual(JSON.parse(r.stdout).files.removed.sort(), [
-    'agents/arbiter.md', 'pipeline/templates/example.md', 'skills/ship/reference/notes.md',
+    'agents/arbiter.md', 'pipeline/templates/example.md', 'skills/review/reference/notes.md',
   ]);
 });
 
@@ -724,7 +724,7 @@ test('an incomplete source tree is rejected before anything is written; a missin
   assert.equal(ok.status, 0, ok.stderr);
   assert.match(JSON.parse(ok.stdout).warnings.join('\n'), /skills\/verify/);
   assert.equal(existsSync(join(home, 'skills', 'verify')), false);
-  assert.ok(existsSync(join(home, 'skills', 'ship')));
+  assert.ok(existsSync(join(home, 'skills', 'review')));
 });
 
 test('a manifest key that escapes the home is ignored, never deleted', () => {
@@ -871,7 +871,7 @@ test('parseArgs reads every flag, both --flag value and --flag=value', () => {
 });
 
 test('safeManifestKey accepts only relative posix keys under skills/, agents/ or pipeline/', () => {
-  for (const ok of ['skills/ship/SKILL.md', 'agents/judge.md', 'pipeline/VERSION', 'pipeline/a/b.mjs']) assert.equal(safeManifestKey(ok), true, ok);
+  for (const ok of ['skills/review/SKILL.md', 'agents/judge.md', 'pipeline/VERSION', 'pipeline/a/b.mjs']) assert.equal(safeManifestKey(ok), true, ok);
   for (const bad of ['', '/etc/passwd', 'C:/x', '../x', 'skills/../../x', 'skills//x', 'skills/./x', 'skills\\ship', 'settings.json', 'projects/x', 'pipeline', 'skills', 42, null]) {
     assert.equal(safeManifestKey(bad), false, String(bad));
   }
@@ -882,11 +882,11 @@ test('buildPlan and walkFiles read the fixture: sorted, excluded names skipped, 
   assert.deepEqual(plan.problems, []);
   assert.equal(plan.version, '9.9.9');
   assert.ok(plan.files.has('pipeline/VERSION'));
-  assert.ok(plan.files.has('skills/ship/reference/notes.md'));
+  assert.ok(plan.files.has('skills/review/reference/notes.md'));
   assert.ok(plan.files.has('agents/arbiter.md'));
   assert.deepEqual(plan.units.map((u) => u.rel), [
     'pipeline', 'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md', 'agents/Explore.md',
-    'skills/ship', 'skills/verify', 'skills/pipeline-setup',
+    'skills/review', 'skills/verify', 'skills/pipeline-setup',
   ]);
   const walked = walkFiles(join(FIXTURE, 'skills'));
   assert.deepEqual(walked, [...walked].sort());
@@ -982,24 +982,24 @@ test('a user hook under some other /pipeline/hooks/guard-*.mjs survives install 
 test('reinstall keeps a user-edited skill (modified file plus an extra one) in backups/<name>.<timestamp>', () => {
   const home = newHome();
   assert.equal(install(home).status, 0);
-  writeFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'my tuned skill\n');
-  writeFileSync(join(home, 'skills', 'ship', 'extra.md'), 'my notes\n');
+  writeFileSync(join(home, 'skills', 'review', 'SKILL.md'), 'my tuned skill\n');
+  writeFileSync(join(home, 'skills', 'review', 'extra.md'), 'my notes\n');
   writeFileSync(join(home, 'agents', 'judge.md'), 'my judge\n');
   const r = install(home, ['--json']);
   assert.equal(r.status, 0, r.stderr);
   const report = JSON.parse(r.stdout);
   assert.equal(report.editBackups.length, 2);
   const backups = readdirSync(join(home, 'backups'));
-  const shipBackup = backups.find((n) => /^ship\.\d{8}T\d{6}Z/.test(n));
+  const reviewBackup = backups.find((n) => /^review\.\d{8}T\d{6}Z/.test(n));
   const judgeBackup = backups.find((n) => /^judge\.md\.\d{8}T\d{6}Z/.test(n));
-  assert.ok(shipBackup && judgeBackup, backups.join(', '));
-  assert.equal(readFileSync(join(home, 'backups', shipBackup, 'SKILL.md'), 'utf8'), 'my tuned skill\n');
-  assert.equal(readFileSync(join(home, 'backups', shipBackup, 'extra.md'), 'utf8'), 'my notes\n');
+  assert.ok(reviewBackup && judgeBackup, backups.join(', '));
+  assert.equal(readFileSync(join(home, 'backups', reviewBackup, 'SKILL.md'), 'utf8'), 'my tuned skill\n');
+  assert.equal(readFileSync(join(home, 'backups', reviewBackup, 'extra.md'), 'utf8'), 'my notes\n');
   assert.equal(readFileSync(join(home, 'backups', judgeBackup), 'utf8'), 'my judge\n');
   assert.ok(report.editBackups.every((b) => b.backup.startsWith(join(home, 'backups'))));
   // the install itself is repaired, and the human report names the backup
-  assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), readFileSync(join(FIXTURE, 'skills', 'ship', 'SKILL.md'), 'utf8'));
-  assert.equal(existsSync(join(home, 'skills', 'ship', 'extra.md')), false);
+  assert.equal(readFileSync(join(home, 'skills', 'review', 'SKILL.md'), 'utf8'), readFileSync(join(FIXTURE, 'skills', 'review', 'SKILL.md'), 'utf8'));
+  assert.equal(existsSync(join(home, 'skills', 'review', 'extra.md')), false);
   writeFileSync(join(home, 'skills', 'verify', 'SKILL.md'), 'again\n');
   assert.match(install(home).stdout, /your edits in skills\/verify were replaced; the old copy is at .*verify\./);
 });
@@ -1008,11 +1008,11 @@ test('a plain source update (installed files untouched by the user) is not backe
   const home = newHome();
   const src = copyFixture();
   assert.equal(install(home, [], { source: src }).status, 0);
-  writeFileSync(join(src, 'skills', 'ship', 'SKILL.md'), 'new upstream text\n');
+  writeFileSync(join(src, 'skills', 'review', 'SKILL.md'), 'new upstream text\n');
   const r = install(home, [], { source: src });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(existsSync(join(home, 'backups')), false);
-  assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), 'new upstream text\n');
+  assert.equal(readFileSync(join(home, 'skills', 'review', 'SKILL.md'), 'utf8'), 'new upstream text\n');
 });
 
 test('a home path with whitespace gets the plain and a quoted allow entry; uninstall removes both; idempotent', () => {
@@ -1051,20 +1051,20 @@ test('a second no-op install leaves settings.json and INSTALLED.json byte-identi
 
 test('the top-level test/ exclusion does not hide a nested reference/test/ directory', () => {
   const src = copyFixture();
-  mkdirSync(join(src, 'skills', 'ship', 'test'), { recursive: true });
-  writeFileSync(join(src, 'skills', 'ship', 'test', 'top.md'), 'x');
-  mkdirSync(join(src, 'skills', 'ship', 'reference', 'test'), { recursive: true });
-  writeFileSync(join(src, 'skills', 'ship', 'reference', 'test', 'keep.md'), 'keep');
+  mkdirSync(join(src, 'skills', 'review', 'test'), { recursive: true });
+  writeFileSync(join(src, 'skills', 'review', 'test', 'top.md'), 'x');
+  mkdirSync(join(src, 'skills', 'review', 'reference', 'test'), { recursive: true });
+  writeFileSync(join(src, 'skills', 'review', 'reference', 'test', 'keep.md'), 'keep');
   mkdirSync(join(src, 'pipeline', 'lib', 'test'), { recursive: true });
   writeFileSync(join(src, 'pipeline', 'lib', 'test', 'keep.mjs'), 'keep');
   const plan = buildPlan(src);
-  assert.ok(plan.files.has('skills/ship/reference/test/keep.md'));
+  assert.ok(plan.files.has('skills/review/reference/test/keep.md'));
   assert.ok(plan.files.has('pipeline/lib/test/keep.mjs'));
-  assert.ok(!plan.files.has('skills/ship/test/top.md'));
+  assert.ok(!plan.files.has('skills/review/test/top.md'));
   const home = newHome();
   assert.equal(install(home, [], { source: src }).status, 0);
-  assert.equal(readFileSync(join(home, 'skills', 'ship', 'reference', 'test', 'keep.md'), 'utf8'), 'keep');
-  assert.equal(existsSync(join(home, 'skills', 'ship', 'test')), false);
+  assert.equal(readFileSync(join(home, 'skills', 'review', 'reference', 'test', 'keep.md'), 'utf8'), 'keep');
+  assert.equal(existsSync(join(home, 'skills', 'review', 'test')), false);
 });
 
 test('stage and rollback copies live under backups/.staging, never inside skills/ or agents/', () => {
@@ -1130,7 +1130,7 @@ test('a later unit failing while the pipeline unit is unchanged still marks the 
   const home = newHome();
   const src = copyFixture();
   assert.equal(install(home, [], { source: src }).status, 0);
-  writeFileSync(join(src, 'skills', 'ship', 'SKILL.md'), 'newer ship skill\n');
+  writeFileSync(join(src, 'skills', 'review', 'SKILL.md'), 'newer ship skill\n');
   rmSync(join(home, 'agents', 'judge.md'));
   mkdirSync(join(home, 'agents', 'judge.md')); // a directory where the agent file goes: its swap fails
   writeFileSync(join(home, 'agents', 'judge.md', 'x'), 'x');
@@ -1474,7 +1474,8 @@ test('the retired-skill seam is ignored unless PIPELINE_TEST_MODE=1: the retirem
     const home = newHome();
     makeOldSkill(home);
     writeFileSync(oldSkillFile(home, 'SKILL.md'), 'my tuned old skill\n');
-    const env = { PIPELINE_INSTALL_RETIRED_SKILLS: 'oldskill', ...(testMode ? { PIPELINE_TEST_MODE: testMode } : {}) };
+    // '' (not absent) so a developer shell that exports PIPELINE_TEST_MODE cannot turn the seam on for the undefined case.
+    const env = { PIPELINE_INSTALL_RETIRED_SKILLS: 'oldskill', PIPELINE_TEST_MODE: testMode ?? '' };
     const r = install(home, ['--json'], { env });
     assert.equal(r.status, 0, r.stderr);
     assert.deepEqual(JSON.parse(r.stdout).retired, [], `PIPELINE_TEST_MODE=${testMode}`);
@@ -1484,6 +1485,45 @@ test('the retired-skill seam is ignored unless PIPELINE_TEST_MODE=1: the retirem
   makeOldSkill(home);
   writeFileSync(oldSkillFile(home, 'SKILL.md'), 'my tuned old skill\n');
   assert.equal(JSON.parse(install(home, ['--json'], { env: RETIRED_ENV }).stdout).retired.length, 1, 'control: with PIPELINE_TEST_MODE=1 the same input retires it');
+});
+
+// The real retirement (Phase 4): an install of the previous release has skills/ship/ in its manifest.
+test('an install from the old shape: skills/ship/ is removed on update, the edited file is backed up, the owner\'s own file is kept, --check is clean, a second update is a no-op', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const manifest = readManifest(home);
+  const shipFile = (rel) => join(home, 'skills', 'ship', ...rel.split('/'));
+  for (const [rel, text] of Object.entries({ 'SKILL.md': 'the ship skill\n', 'reference/review-loop.md': 'the loop\n' })) {
+    mkdirSync(dirname(shipFile(rel)), { recursive: true });
+    writeFileSync(shipFile(rel), text);
+    manifest.files[`skills/ship/${rel}`] = sha(shipFile(rel));
+  }
+  writeFileSync(join(home, 'pipeline', 'INSTALLED.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  writeFileSync(shipFile('SKILL.md'), 'my tuned ship skill\n'); // the owner edited it
+  writeFileSync(shipFile('mine.md'), 'my own notes\n'); // and added a file of their own
+
+  const check = install(home, ['--check', '--json']);
+  assert.equal(check.status, 1, 'the old shape is drift before the update');
+  assert.ok(JSON.parse(check.stdout).drift.some((d) => d.kind === 'retired' && d.path === 'skills/ship/SKILL.md'));
+
+  const r = install(home, ['--json']);
+  assert.equal(r.status, 0, r.stderr);
+  const [ship] = JSON.parse(r.stdout).retired;
+  assert.equal(ship.rel, 'skills/ship');
+  assert.deepEqual(ship.removed, ['skills/ship/SKILL.md', 'skills/ship/reference/review-loop.md']);
+  assert.deepEqual(ship.backedUp, ['skills/ship/SKILL.md']);
+  assert.deepEqual(ship.kept, ['skills/ship/mine.md']);
+  const backup = readdirSync(join(home, 'backups')).find((n) => /^ship\.\d{8}T\d{6}Z/.test(n));
+  assert.ok(backup, 'the edited file is saved under backups/ship.<timestamp>/');
+  assert.equal(readFileSync(join(home, 'backups', backup, 'SKILL.md'), 'utf8'), 'my tuned ship skill\n');
+  assert.equal(readFileSync(shipFile('mine.md'), 'utf8'), 'my own notes\n');
+  assert.equal(existsSync(shipFile('SKILL.md')), false);
+  assert.equal(existsSync(join(home, 'skills', 'review', 'SKILL.md')), true, 'the review skill that replaces it is installed');
+
+  assert.equal(install(home, ['--check', '--json']).status, 0, 'no drift after the update');
+  const again = JSON.parse(install(home, ['--json']).stdout);
+  assert.deepEqual(again.retired, []);
+  assert.equal(again.files.copied, 0);
 });
 
 test('the retired-skill seam only takes plain directory names', () => {
@@ -1536,11 +1576,11 @@ test('a clean checkout records its HEAD sha and no sourceDirty flag', () => {
 
 test('an edited tracked file, an untracked file and an ignored extra each make sourceSha null with sourceDirty and a warning', () => {
   const edited = committedSource();
-  writeFileSync(join(edited.dir, 'skills', 'ship', 'SKILL.md'), 'edited after the commit\n');
+  writeFileSync(join(edited.dir, 'skills', 'review', 'SKILL.md'), 'edited after the commit\n');
   const home1 = newHome();
   const r1 = installReport(home1, edited.dir);
   assert.equal(r1.sourceSha, null);
-  assert.deepEqual(r1.warnings, [`source is not a clean checkout of ${edited.head.slice(0, 7)}: skills/ship/SKILL.md; recording no source sha`]);
+  assert.deepEqual(r1.warnings, [`source is not a clean checkout of ${edited.head.slice(0, 7)}: skills/review/SKILL.md; recording no source sha`]);
   assert.equal(readManifest(home1).sourceSha, null);
   assert.equal(readManifest(home1).sourceDirty, true);
 
@@ -1562,7 +1602,7 @@ test('an edited tracked file, an untracked file and an ignored extra each make s
 });
 
 test('an installable file deleted from the working tree (but still in HEAD) leaves no source sha; excluded files do not count', () => {
-  for (const gone of ['pipeline/lib/answer.mjs', 'skills/ship/reference/notes.md', 'agents/arbiter.md']) {
+  for (const gone of ['pipeline/lib/answer.mjs', 'skills/review/reference/notes.md', 'agents/arbiter.md']) {
     const { dir, head } = committedSource();
     rmSync(join(dir, ...gone.split('/')));
     const home = newHome();
@@ -1574,7 +1614,7 @@ test('an installable file deleted from the working tree (but still in HEAD) leav
 
   // HEAD holds files the installer never copies (pipeline/test/**, node_modules, a stray INSTALLED.json): deleting them is not a deletion of source.
   const dir = copyFixture();
-  for (const f of ['pipeline/test/t.mjs', 'pipeline/node_modules/m/i.js', 'pipeline/INSTALLED.json', 'skills/ship/test/t.md']) {
+  for (const f of ['pipeline/test/t.mjs', 'pipeline/node_modules/m/i.js', 'pipeline/INSTALLED.json', 'skills/review/test/t.md']) {
     mkdirSync(dirname(join(dir, ...f.split('/'))), { recursive: true });
     writeFileSync(join(dir, ...f.split('/')), 'x\n');
   }
@@ -1582,7 +1622,7 @@ test('an installable file deleted from the working tree (but still in HEAD) leav
   git(dir, 'add', '-A', '-f');
   git(dir, 'commit', '-q', '-m', 'fixture');
   const head = git(dir, 'rev-parse', 'HEAD');
-  for (const f of ['pipeline/test', 'pipeline/node_modules', 'pipeline/INSTALLED.json', 'skills/ship/test']) rmSync(join(dir, ...f.split('/')), { recursive: true });
+  for (const f of ['pipeline/test', 'pipeline/node_modules', 'pipeline/INSTALLED.json', 'skills/review/test']) rmSync(join(dir, ...f.split('/')), { recursive: true });
   assert.equal(installReport(newHome(), dir).sourceSha, head);
 });
 
@@ -1681,12 +1721,12 @@ test('install and uninstall refuse while another install holds the lock for that
   const manifestBefore = readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8');
   const lock = holdLock(home, dir);
   try {
-    writeFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'edited while locked\n');
+    writeFileSync(join(home, 'skills', 'review', 'SKILL.md'), 'edited while locked\n');
     const busy = install(home, [], { env });
     assert.equal(busy.status, 1);
     assert.match(busy.stderr, /another install is running in /);
     assert.ok(busy.stderr.includes(home), busy.stderr);
-    assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), 'edited while locked\n', 'nothing was repaired');
+    assert.equal(readFileSync(join(home, 'skills', 'review', 'SKILL.md'), 'utf8'), 'edited while locked\n', 'nothing was repaired');
     assert.equal(readFileSync(join(home, 'pipeline', 'INSTALLED.json'), 'utf8'), manifestBefore);
 
     const busyUninstall = install(home, ['--uninstall'], { env });
@@ -1700,7 +1740,7 @@ test('install and uninstall refuse while another install holds the lock for that
 
     const check = install(home, ['--check'], { env });
     assert.equal(check.status, 1, 'drift (the edit), not a lock error');
-    assert.match(check.stdout, /modified: skills\/ship\/SKILL\.md/);
+    assert.match(check.stdout, /modified: skills\/review\/SKILL\.md/);
 
     const other = newHome();
     assert.equal(install(other, [], { env }).status, 0, 'a different claude-home has its own lock');
@@ -1708,7 +1748,7 @@ test('install and uninstall refuse while another install holds the lock for that
     release(lock);
   }
   assert.equal(install(home, [], { env }).status, 0);
-  assert.equal(readFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'utf8'), readFileSync(join(FIXTURE, 'skills', 'ship', 'SKILL.md'), 'utf8'));
+  assert.equal(readFileSync(join(home, 'skills', 'review', 'SKILL.md'), 'utf8'), readFileSync(join(FIXTURE, 'skills', 'review', 'SKILL.md'), 'utf8'));
 });
 
 test('a lock left by a dead process is reclaimed; the lock is released after install, uninstall and a failed install', () => {

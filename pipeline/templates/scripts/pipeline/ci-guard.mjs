@@ -4,7 +4,7 @@
 // Fail closed: a missing/invalid config or any git error exits 2 (never 0), so a broken guard cannot pass a PR.
 // Exit codes: 0 ok (or overridden by a human label), 1 violations/hits, 2 error.
 // owner_approval: chat in pipeline.yml: no label exists to wait for, so blocking hits and integrity violations pass (exit 0)
-// and are listed as "owner merges in chat"; the ship skill stops before the merge and asks the owner.
+// and are listed as "owner merges in chat"; the review skill stops before the merge and asks the owner.
 // Vendored into projects by `pipeline vendor` (imports ./lib/*, which is the vendored copy of pipeline/lib).
 import { appendFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
