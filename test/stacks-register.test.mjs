@@ -1039,7 +1039,11 @@ test('proc.mjs re-exports splitCommand and the seam helpers from the light modul
   const words = await import('../pipeline/lib/shell-words.mjs');
   const seams = await import('../pipeline/lib/seams.mjs');
   assert.equal(proc.splitCommand, words.splitCommand);
-  for (const name of ['PIPELINE_ROOT', 'SEAM_VARS', 'isInstalledCopy', 'seamValue']) assert.equal(proc[name], seams[name], name);
+  for (const name of ['SEAM_VARS', 'isInstalledCopy', 'pipelineRoot', 'seamValue']) assert.equal(proc[name], seams[name], name);
+  // the root constant lives in proc.mjs only; seams.mjs works it out on first use (same value, cached)
+  assert.equal(seams.PIPELINE_ROOT, undefined);
+  assert.equal(proc.PIPELINE_ROOT, seams.pipelineRoot());
+  assert.equal(seams.pipelineRoot(), seams.pipelineRoot());
   // the platform is pinned: a backslash escapes on POSIX and is a literal (path) character on Windows
   assert.deepEqual(words.splitCommand('a "b c" d\\ e', 'linux'), ['a', 'b c', 'd e']);
   assert.deepEqual(words.splitCommand('a "b c" d\\ e', 'win32'), ['a', 'b c', 'd\\', 'e']);
