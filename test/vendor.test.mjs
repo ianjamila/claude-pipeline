@@ -11,7 +11,7 @@ import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.m
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const LIBS = ['proc', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker'];
-const ENTRIES = ['ci-guard', 'ci-guards-run', 'stop-verify', 'smoke', 'supabase-local'];
+const ENTRIES = ['ci-guard', 'ci-guards-run', 'smoke', 'supabase-local'];
 
 const vendorInto = (dir, extra = []) => vendor(['--repo', dir, ...extra], { cwd: dir, env: process.env });
 const sp = (dir) => join(dir, 'scripts', 'pipeline');
@@ -51,6 +51,64 @@ test('vendor copies libs, js-yaml, entry scripts byte-for-byte and stamps VERSIO
   const stamp = readFileSync(join(sp(repo.dir), 'VERSION'), 'utf8').trim();
   assert.equal(stamp, r.output.version);
   assert.match(stamp, new RegExp(`^${base.replace(/\./g, '\\.')}\\+([0-9a-f]{7,}|unknown)(\\.[a-z]+)*$`));
+});
+
+// ---- the stop-verify entry is retired: a copy an earlier vendor left in a project is removed, and is drift for --check -----------------
+
+const LEFTOVER = 'scripts/pipeline/stop-verify.mjs';
+
+test('vendor no longer copies stop-verify and does not name it for a repo that never had it', async () => {
+  const repo = createTmpRepo();
+  const r = await vendorInto(repo.dir);
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.output.files.includes(LEFTOVER), false);
+  assert.equal(existsSync(join(repo.dir, LEFTOVER)), false);
+  assert.deepEqual(r.output.removed, [], 'nothing to remove in a repo without it');
+  assert.equal((await vendorInto(repo.dir, ['--check'])).exitCode, 0);
+});
+
+test('vendoring into a repo that has stop-verify.mjs from an earlier vendor removes that file and says so; --check on it reports drift first', async () => {
+  const repo = createTmpRepo();
+  await vendorInto(repo.dir);
+  writeFileSync(join(repo.dir, LEFTOVER), '// vendored by an earlier release\n');
+  const check = await vendorInto(repo.dir, ['--check']);
+  assert.equal(check.exitCode, 1);
+  assert.deepEqual(check.output.drift, [{ file: LEFTOVER, reason: 'retired' }]);
+  assert.deepEqual(vendorDrift(repo.dir), [{ file: LEFTOVER, reason: 'retired' }]);
+
+  const r = await vendorInto(repo.dir);
+  assert.equal(r.exitCode, 0);
+  assert.deepEqual(r.output.removed, [LEFTOVER]);
+  assert.equal(existsSync(join(repo.dir, LEFTOVER)), false);
+  assert.equal((await vendorInto(repo.dir, ['--check'])).exitCode, 0);
+  assert.deepEqual((await vendorInto(repo.dir)).output.removed, [], 'a second vendor removes nothing');
+});
+
+test('removing the retired entry deletes that one file and nothing else in the project', async () => {
+  const repo = createTmpRepo();
+  repo.write('scripts/pipeline/stop-verify.mjs', '// old\n');
+  repo.write('scripts/pipeline/mine.mjs', '// the project\'s own script next to the vendored ones\n');
+  repo.write('scripts/pipeline/lib/notes.txt', 'the project\'s file inside lib/\n');
+  repo.write('scripts/stop-verify.mjs', '// not under scripts/pipeline/\n');
+  repo.write('src/stop-verify.mjs', '// the project\'s source\n');
+  const before = (rel) => readFileSync(join(repo.dir, rel), 'utf8');
+  const r = await vendorInto(repo.dir);
+  assert.equal(r.exitCode, 0);
+  assert.deepEqual(r.output.removed, [LEFTOVER]);
+  assert.equal(before('scripts/pipeline/mine.mjs'), '// the project\'s own script next to the vendored ones\n');
+  assert.equal(before('scripts/pipeline/lib/notes.txt'), 'the project\'s file inside lib/\n');
+  assert.equal(before('scripts/stop-verify.mjs'), '// not under scripts/pipeline/\n');
+  assert.equal(before('src/stop-verify.mjs'), '// the project\'s source\n');
+});
+
+test('a directory named stop-verify.mjs is not ours: not removed, not drift', async () => {
+  const repo = createTmpRepo();
+  repo.write('scripts/pipeline/stop-verify.mjs/keep.txt', 'x\n');
+  const r = await vendorInto(repo.dir);
+  assert.equal(r.exitCode, 0);
+  assert.deepEqual(r.output.removed, []);
+  assert.equal(existsSync(join(repo.dir, LEFTOVER, 'keep.txt')), true);
+  assert.equal((await vendorInto(repo.dir, ['--check'])).exitCode, 0);
 });
 
 test('vendor resolves the repo root from a subdirectory', async () => {

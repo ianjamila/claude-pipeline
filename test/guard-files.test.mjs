@@ -913,7 +913,7 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
     'git add pipeline/hooks/owner-go.mjs pipeline/hooks/lib/owner-go.mjs',
     'git diff -- pipeline/hooks/lib/owner-go.mjs',
     'node --test test/owner-go.test.mjs',
-    'node /home/u/.claude/pipeline/hooks/session-version.mjs', // (the other installed hooks keep their read-only standing)
+    'node /home/u/.claude/pipeline/hooks/stack-dev-bind.mjs', // (the other installed hooks keep their read-only standing)
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 

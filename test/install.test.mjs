@@ -18,6 +18,7 @@ import {
   mergeSettings, removeOurSettings, isOurHandler, ourAllowEntries, renameWithRetry, collectDiagnostics,
   installLockName, shellRcPaths, parseArgs, buildPlan, walkFiles, safeManifestKey, GUARD_FILES_MATCHER, GUARD_GIT_MATCHER, HOOK_LOADER, joinNative,
   STACK_REGISTER_MATCHERS, STACK_REGISTER_TIMEOUT_S, STACK_HOOK_TIMEOUT_S, ourStackGroups, inspectHooks,
+  RETIRED_HOOKS, RETIRED_SKILLS, SKILLS, retiredSkillUnits,
 } from '../pipeline/lib/installer.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -97,7 +98,7 @@ const guardFiles = (home) => ({
   matcher: 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*',
   hooks: [loaded(home, 'guard-files')],
 });
-// The SessionStart status hook (A3): plain, not the fail-closed loader, in its own group without a matcher.
+// The SessionStart status hook the previous release wrote (retired since): plain, in its own group without a matcher.
 const sessionVersion = (home) => ({
   hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'session-version.mjs')], timeout: 10 }],
 });
@@ -110,7 +111,7 @@ const ownerGo = (home) => ({
 const stackRegisterHandler = (home) => ({ ...loaded(home, 'stack-register'), args: ['--input-type=module', '-e', HOOK_LOADER, joinNative(home, 'pipeline', 'hooks', 'stack-register.mjs')], timeout: 30 });
 const stackRegisters = (home) => [
   { matcher: 'Bash', hooks: [stackRegisterHandler(home)] },
-  { matcher: 'Read|Edit|Write|Grep|Glob|NotebookEdit', hooks: [stackRegisterHandler(home)] },
+  { matcher: 'Edit|Write|MultiEdit|NotebookEdit', hooks: [stackRegisterHandler(home)] },
 ];
 const stackDevBind = (home) => ({
   matcher: 'Bash', hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'stack-dev-bind.mjs')], timeout: 10 }],
@@ -191,7 +192,8 @@ test('fresh install into an empty home (path with a space): files, manifest, hoo
   const s = readSettings(home);
   assert.deepEqual(s.hooks.PreToolUse, [...stackRegisters(home), guardGit(home), guardFiles(home)]);
   assert.deepEqual(s.hooks.PostToolUse, [stackDevBind(home)]);
-  assert.deepEqual(s.hooks.SessionStart, [sessionVersion(home)]);
+  assert.equal('SessionStart' in s.hooks, false, 'nothing is written to SessionStart');
+  assert.equal(existsSync(join(home, 'pipeline', 'hooks', 'session-version.mjs')), false);
   assert.deepEqual(s.hooks.SessionEnd, [stackSessionEnd(home)]);
   assert.deepEqual(s.permissions.allow, allowEntries(home));
   assert.deepEqual(Object.keys(s).sort(), ['hooks', 'permissions']);
@@ -228,7 +230,6 @@ test('existing settings: every other key survives unchanged, ours is appended on
   const expected = structuredClone(before);
   expected.hooks.PreToolUse.push(...stackRegisters(home), guardGit(home), guardFiles(home));
   expected.hooks.PostToolUse.push(stackDevBind(home)); // (after the owner's tab-event.sh and memory-index.js)
-  expected.hooks.SessionStart.push(sessionVersion(home));
   expected.hooks.SessionEnd.push(stackSessionEnd(home)); // (after the owner's heartbeat.mjs)
   expected.hooks.UserPromptSubmit.push(ownerGo(home)); // (after the owner's own)
   expected.permissions.allow.push(...allowEntries(home));
@@ -307,7 +308,6 @@ test('an older install in the string command form is replaced, not duplicated', 
   const expected = structuredClone(ownersSettings());
   expected.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }, ...stackRegisters(home), guardGit(home), guardFiles(home));
   expected.hooks.PostToolUse.push(stackDevBind(home));
-  expected.hooks.SessionStart.push(sessionVersion(home));
   expected.hooks.SessionEnd.push(stackSessionEnd(home));
   expected.hooks.UserPromptSubmit.push(ownerGo(home)); // (after the owner's own)
   expected.permissions.allow.push(...allowEntries(home));
@@ -1207,87 +1207,274 @@ test('the installer writes the loader handler; an old plain-args handler is hook
   assert.ok(JSON.parse(check.stdout).drift.some((d) => d.kind === 'hook-differs' && d.path === 'guard-git'), check.stdout);
 });
 
-// ---- A3: SessionStart status hook -------------------------------------------------------------------------------
+// ---- Phase 4: the SessionStart status hook (session-version) is retired; stack-register narrows; the retired-unit mechanism --------
 
-test('install appends the session-version group after the owner\'s SessionStart groups, once, and touches none of theirs', () => {
-  const home = newHome();
-  const before = ownersSettings();
-  before.hooks.SessionStart.push({ matcher: 'startup', hooks: [{ type: 'command', command: 'node ~/memory-sync.js' }] });
+const OLD_STACK_MATCHER = 'Read|Edit|Write|Grep|Glob|NotebookEdit';
+const SESSION_VERSION_FILE = 'pipeline/hooks/session-version.mjs';
+
+// An install in the shape the previous release wrote: the SessionStart status group, pipeline/hooks/session-version.mjs listed in
+// the manifest, and stack-register on its old second matcher. Built from a current install by adding those back; `before` is
+// the owner's settings.json at the start (the owner's own hooks sit next to ours).
+function makeOldShape(home, before = {}) {
   writeSettings(home, before);
   assert.equal(install(home).status, 0);
-  assert.equal(install(home).status, 0);
+  const file = join(home, ...SESSION_VERSION_FILE.split('/'));
+  writeFileSync(file, '// fixture stub: session-version\n');
+  const manifest = readManifest(home);
+  manifest.files[SESSION_VERSION_FILE] = sha(file);
+  writeFileSync(join(home, 'pipeline', 'INSTALLED.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   const s = readSettings(home);
-  assert.deepEqual(s.hooks.SessionStart, [...before.hooks.SessionStart, sessionVersion(home)]);
-  assert.equal(install(home, ['--check']).status, 0, 'a clean install has no drift');
-});
-
-test('--check: a later SessionStart entry after ours is fine; a missing, duplicated or edited session-version hook is reported', () => {
-  const home = newHome();
-  assert.equal(install(home).status, 0);
-  const drift = () => { const r = install(home, ['--check', '--json']); return { status: r.status, items: JSON.parse(r.stdout).drift }; };
-
-  const s = readSettings(home);
-  s.hooks.SessionStart.push({ hooks: [{ type: 'command', command: 'echo plugin added this later' }] });
+  s.hooks.SessionStart ??= [];
+  s.hooks.SessionStart.push(sessionVersion(home));
+  s.hooks.PreToolUse = s.hooks.PreToolUse.map((g) => (g.matcher === STACK_REGISTER_MATCHERS[1] ? { ...g, matcher: OLD_STACK_MATCHER } : g));
   writeSettings(home, s);
-  assert.equal(drift().status, 0, 'order among SessionStart entries is not drift');
+  return s;
+}
 
-  const dup = structuredClone(s);
-  dup.hooks.SessionStart.push(sessionVersion(home));
-  writeSettings(home, dup);
-  assert.ok(drift().items.some((d) => d.kind === 'hook-duplicated' && d.path === 'session-version'));
-
-  const edited = structuredClone(s);
-  edited.hooks.SessionStart[0].hooks[0].timeout = 99;
-  writeSettings(home, edited);
-  assert.ok(drift().items.some((d) => d.kind === 'hook-differs' && d.path === 'session-version'));
-
-  const gone = structuredClone(s);
-  gone.hooks.SessionStart = gone.hooks.SessionStart.filter((g) => !g.hooks.some((h) => isOurHandler(h, home)));
-  writeSettings(home, gone);
-  const missing = drift();
-  assert.equal(missing.status, 1);
-  assert.ok(missing.items.some((d) => d.kind === 'hook-missing' && d.path === 'session-version'));
-  assert.equal(install(home).status, 0);
-  assert.equal(drift().status, 0);
-});
-
-test('an install from before the status hook existed reports it missing until the next install', () => {
+test('update from the previous release: session-version is gone, stack-register sits on the two new matchers, the owner\'s hooks are untouched, no drift, a second update is a no-op', () => {
   const home = newHome();
-  assert.equal(install(home).status, 0);
+  const owner = ownersSettings();
+  makeOldShape(home, owner);
+
+  // the old shape is recognised as ours and reported before the update
+  const found = inspectHooks(readSettings(home), home);
+  assert.deepEqual(found.retired.map((r) => [r.script, r.matcher]), [['stack-register', OLD_STACK_MATCHER], ['session-version', undefined]]);
+  assert.deepEqual(found.unknown, []);
+  const old = driftOf(home);
+  assert.equal(old.status, 1);
+  assert.ok(old.items.some((d) => d.kind === 'hook-retired' && d.path === 'session-version'), JSON.stringify(old.items));
+  assert.ok(old.items.some((d) => d.kind === 'hook-retired' && d.path === `stack-register (${OLD_STACK_MATCHER})`), JSON.stringify(old.items));
+  assert.ok(old.items.some((d) => d.kind === 'stale' && d.path === SESSION_VERSION_FILE));
+
+  const r = install(home, ['--json']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(JSON.parse(r.stdout).files.removed.includes(SESSION_VERSION_FILE));
+  assert.equal(existsSync(join(home, ...SESSION_VERSION_FILE.split('/'))), false, 'the hook file is gone');
+  assert.equal(readdirSync(join(home, 'pipeline', 'hooks')).includes('session-version.mjs'), false);
+  assert.equal(Object.hasOwn(readManifest(home).files, SESSION_VERSION_FILE), false);
   const s = readSettings(home);
-  delete s.hooks.SessionStart;
-  writeSettings(home, s);
-  const r = install(home, ['--check', '--json']);
-  assert.deepEqual(JSON.parse(r.stdout).drift.map((d) => d.kind), ['hook-missing']);
+  assert.equal(JSON.stringify(s).includes('session-version'), false, 'no settings entry runs it');
+  assert.deepEqual(s.hooks.PreToolUse, [...owner.hooks.PreToolUse, ...stackRegisters(home), guardGit(home), guardFiles(home)]);
+  assert.deepEqual(s.hooks.SessionStart, owner.hooks.SessionStart, 'the owner\'s SessionStart hook is byte-identical');
+  for (const event of ['PostToolUse', 'SessionEnd', 'UserPromptSubmit', 'Stop']) {
+    assert.deepEqual(s.hooks[event].slice(0, owner.hooks[event].length), owner.hooks[event], `${event}: the owner's groups come first, untouched`);
+  }
+  assert.deepEqual({ ...s, hooks: undefined, permissions: undefined }, { ...owner, hooks: undefined, permissions: undefined }, 'every other key is untouched');
+  assert.deepEqual(s.permissions.allow.slice(0, owner.permissions.allow.length), owner.permissions.allow);
+  assert.deepEqual(driftOf(home), { status: 0, items: [] });
+
+  const text = readFileSync(settingsPath(home), 'utf8');
+  const files = readManifest(home).files;
+  const again = install(home, ['--json']);
+  assert.equal(again.status, 0, again.stderr);
+  const report = JSON.parse(again.stdout);
+  assert.equal(report.files.copied, 0);
+  assert.equal(report.settings.changed, false);
+  assert.deepEqual(report.retired, []);
+  assert.equal(readFileSync(settingsPath(home), 'utf8'), text, 'a second update changes nothing');
+  assert.deepEqual(readManifest(home).files, files);
 });
 
-test('--uninstall removes the session-version hook only; the owner\'s SessionStart groups stay', () => {
+test('update from the previous release into a settings.json whose only SessionStart hook was ours: the emptied SessionStart key is dropped', () => {
   const home = newHome();
-  const before = ownersSettings();
-  writeSettings(home, before);
+  makeOldShape(home, {});
+  assert.deepEqual(readSettings(home).hooks.SessionStart, [sessionVersion(home)]);
   assert.equal(install(home).status, 0);
-  assert.equal(install(home, ['--uninstall']).status, 0);
-  assert.deepEqual(readSettings(home).hooks.SessionStart, before.hooks.SessionStart);
-  assert.deepEqual(readSettings(home), before);
+  assert.equal('SessionStart' in readSettings(home).hooks, false);
+  assert.deepEqual(driftOf(home), { status: 0, items: [] });
 });
 
-test('mergeSettings/removeOurSettings round-trip with SessionStart; our handler is lifted out of a shared SessionStart group', () => {
+test('--uninstall from the previous release\'s shape leaves no pipeline files and puts the owner\'s settings back', () => {
+  const home = newHome();
+  const owner = ownersSettings();
+  makeOldShape(home, owner);
+  const r = install(home, ['--uninstall', '--json']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).hooks.removed, 8, 'stack-register x2 (one on the old matcher), dev-bind, session-end, guard-git, guard-files, session-version, owner-go');
+  assert.deepEqual(readSettings(home), owner);
+  assert.deepEqual(listTree(home).filter((f) => !f.startsWith('backups/')), ['settings.json']);
+});
+
+test('an owner-edited session-version.mjs is kept: the old pipeline copy goes to backups/, the live file is gone', () => {
+  const home = newHome();
+  makeOldShape(home, ownersSettings());
+  writeFileSync(join(home, ...SESSION_VERSION_FILE.split('/')), '// my tuned status hook\n');
+  const r = install(home, ['--json']);
+  assert.equal(r.status, 0, r.stderr);
+  const report = JSON.parse(r.stdout);
+  assert.deepEqual(report.editBackups.map((b) => b.rel), ['pipeline']);
+  assert.equal(readFileSync(join(report.editBackups[0].backup, 'hooks', 'session-version.mjs'), 'utf8'), '// my tuned status hook\n');
+  assert.equal(existsSync(join(home, ...SESSION_VERSION_FILE.split('/'))), false);
+  assert.deepEqual(driftOf(home), { status: 0, items: [] });
+});
+
+test('mergeSettings drops a session-version handler of ours from a shared SessionStart group and does not write one back', () => {
   const home = '/h/.claude';
-  assert.deepEqual(removeOurSettings(mergeSettings({}, { home }), { home }), {});
   const shared = { hooks: { SessionStart: [{ hooks: [
     { type: 'command', command: 'echo mine' },
     { type: 'command', command: 'node', args: ['/h/.claude/pipeline/hooks/session-version.mjs'], timeout: 10 },
   ] }] } };
   const merged = mergeSettings(shared, { home });
-  assert.deepEqual(merged.hooks.SessionStart, [{ hooks: [{ type: 'command', command: 'echo mine' }] }, sessionVersion(home)]);
+  assert.deepEqual(merged.hooks.SessionStart, [{ hooks: [{ type: 'command', command: 'echo mine' }] }]);
+  assert.equal('SessionStart' in mergeSettings({}, { home }).hooks, false, 'a fresh install writes nothing to SessionStart');
+  assert.deepEqual(removeOurSettings(mergeSettings({}, { home }), { home }), {});
   assert.throws(() => mergeSettings({ hooks: { SessionStart: {} } }, { home }), /hooks\.SessionStart" is not an array/);
+  const own = { hooks: { SessionStart: [] } };
+  assert.deepEqual(mergeSettings(own, { home }).hooks.SessionStart, [], 'an empty SessionStart the owner had stays');
 });
 
-test('buildPlan requires pipeline/hooks/session-version.mjs like the two guards', () => {
-  const src = copyFixture();
-  rmSync(join(src, 'pipeline', 'hooks', 'session-version.mjs'));
-  assert.ok(buildPlan(src).problems.includes('pipeline/hooks/session-version.mjs is missing'));
+test('buildPlan no longer asks for pipeline/hooks/session-version.mjs; the three stack hooks and the guards are still required', () => {
   assert.equal(buildPlan(FIXTURE).problems.length, 0);
+  assert.equal(buildPlan(FIXTURE).files.has(SESSION_VERSION_FILE), false);
+  const src = copyFixture();
+  rmSync(join(src, 'pipeline', 'hooks', 'guard-git.mjs'));
+  assert.ok(buildPlan(src).problems.includes('pipeline/hooks/guard-git.mjs is missing'));
+});
+
+test('RETIRED_HOOKS names session-version; no retired skill is a current skill; retiredSkillUnits never retires a current skill', () => {
+  assert.ok(RETIRED_HOOKS.includes('session-version'));
+  assert.ok(RETIRED_SKILLS.every((n) => !SKILLS.includes(n)));
+  assert.deepEqual(retiredSkillUnits(['oldskill', 'verify', 'oldskill']).map((u) => u.rel), ['skills/oldskill']);
+});
+
+// The retired-unit mechanism, on a test-only retired skill (PIPELINE_INSTALL_RETIRED_SKILLS adds it to RETIRED_SKILLS for one run).
+const RETIRED_ENV = { PIPELINE_INSTALL_RETIRED_SKILLS: 'oldskill' };
+const OLD_SKILL = { 'SKILL.md': 'the old skill\n', 'ref/a.md': 'reference a\n' };
+const oldSkillFile = (home, rel) => join(home, 'skills', 'oldskill', ...rel.split('/'));
+// A current install plus skills/oldskill/, with its files listed in the manifest (what an install of the previous release left).
+function makeOldSkill(home, files = OLD_SKILL) {
+  assert.equal(install(home).status, 0);
+  const manifest = readManifest(home);
+  for (const [rel, text] of Object.entries(files)) {
+    mkdirSync(dirname(oldSkillFile(home, rel)), { recursive: true });
+    writeFileSync(oldSkillFile(home, rel), text);
+    manifest.files[`skills/oldskill/${rel}`] = sha(oldSkillFile(home, rel));
+  }
+  writeFileSync(join(home, 'pipeline', 'INSTALLED.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+}
+const retiredDrift = (home) => {
+  const r = install(home, ['--check', '--json'], { env: RETIRED_ENV });
+  return { status: r.status, items: JSON.parse(r.stdout).drift };
+};
+
+test('a retired skill: its listed files are removed and --check says so before; afterwards no drift, other skills untouched, a second update is a no-op', () => {
+  const home = newHome();
+  makeOldSkill(home);
+  const before = retiredDrift(home);
+  assert.equal(before.status, 1);
+  assert.deepEqual(before.items.map((d) => [d.kind, d.path]), [['retired', 'skills/oldskill/SKILL.md'], ['retired', 'skills/oldskill/ref/a.md']]);
+
+  const r = install(home, ['--json'], { env: RETIRED_ENV });
+  assert.equal(r.status, 0, r.stderr);
+  const report = JSON.parse(r.stdout);
+  assert.deepEqual(report.retired, [{ rel: 'skills/oldskill', removed: ['skills/oldskill/SKILL.md', 'skills/oldskill/ref/a.md'], backedUp: [], backup: null, kept: [] }]);
+  assert.equal(existsSync(join(home, 'skills', 'oldskill')), false, 'the emptied directory is gone too');
+  assert.equal(existsSync(join(home, 'skills', 'verify', 'SKILL.md')), true);
+  assert.equal(existsSync(join(home, 'backups')), false, 'nothing was edited, so nothing is backed up');
+  assert.deepEqual(Object.keys(readManifest(home).files).filter((k) => k.startsWith('skills/oldskill/')), []);
+  assert.deepEqual(retiredDrift(home), { status: 0, items: [] });
+
+  const again = JSON.parse(install(home, ['--json'], { env: RETIRED_ENV }).stdout);
+  assert.deepEqual(again.retired, []);
+  assert.equal(again.files.copied, 0);
+});
+
+test('a retired skill with a file the owner modified: that file is saved under backups/<name>.<timestamp>/ (as an edited unit is) before it is removed, and reported', () => {
+  const home = newHome();
+  makeOldSkill(home);
+  writeFileSync(oldSkillFile(home, 'SKILL.md'), 'my tuned old skill\n');
+  assert.match(retiredDrift(home).items[0].message, /edited|saving your edits/);
+  const r = install(home, [], { env: RETIRED_ENV });
+  assert.equal(r.status, 0, r.stderr);
+  const backups = readdirSync(join(home, 'backups'));
+  const backup = backups.find((n) => /^oldskill\.\d{8}T\d{6}Z/.test(n));
+  assert.ok(backup, backups.join(', '));
+  assert.equal(readFileSync(join(home, 'backups', backup, 'SKILL.md'), 'utf8'), 'my tuned old skill\n');
+  assert.equal(existsSync(join(home, 'backups', backup, 'ref', 'a.md')), false, 'an unmodified file is not backed up');
+  assert.equal(existsSync(join(home, 'skills', 'oldskill')), false);
+  assert.match(r.stdout, /retired skills\/oldskill\/: 2 files removed/);
+  assert.match(r.stdout, /your edits in skills\/oldskill\/SKILL\.md were saved; the old copy is at .*oldskill\./);
+  assert.deepEqual(retiredDrift(home), { status: 0, items: [] });
+});
+
+test('a file in a retired skill dir that the manifest does not list is kept and reported, never deleted; the update still ends with no drift and stays quiet afterwards', () => {
+  const home = newHome();
+  makeOldSkill(home);
+  writeFileSync(oldSkillFile(home, 'mine.md'), 'my own notes\n');
+  const r = install(home, ['--json'], { env: RETIRED_ENV });
+  assert.equal(r.status, 0, r.stderr);
+  const report = JSON.parse(r.stdout);
+  assert.deepEqual(report.retired[0].kept, ['skills/oldskill/mine.md']);
+  assert.deepEqual(report.retired[0].removed, ['skills/oldskill/SKILL.md', 'skills/oldskill/ref/a.md']);
+  assert.equal(readFileSync(oldSkillFile(home, 'mine.md'), 'utf8'), 'my own notes\n');
+  assert.equal(existsSync(oldSkillFile(home, 'SKILL.md')), false);
+  assert.equal(existsSync(join(home, 'backups')), false, 'a kept file is not copied anywhere');
+  assert.match(install(home, [], { env: RETIRED_ENV }).stdout, /files:\s+0 copied/);
+  assert.deepEqual(retiredDrift(home), { status: 0, items: [] }, 'what the owner kept is not drift');
+  assert.deepEqual(JSON.parse(install(home, ['--json'], { env: RETIRED_ENV }).stdout).retired, []);
+  assert.equal(readFileSync(oldSkillFile(home, 'mine.md'), 'utf8'), 'my own notes\n');
+});
+
+test('the human report names what a retired skill kept', () => {
+  const home = newHome();
+  makeOldSkill(home);
+  writeFileSync(oldSkillFile(home, 'mine.md'), 'my own notes\n');
+  assert.match(install(home, [], { env: RETIRED_ENV }).stdout, /kept skills\/oldskill\/mine\.md: claude-pipeline did not install it/);
+});
+
+test('an update that dies in the middle of retiring a skill is completed by the next run', { skip: process.platform === 'win32' || (typeof process.getuid === 'function' && process.getuid() === 0) }, () => {
+  const home = newHome();
+  makeOldSkill(home);
+  writeFileSync(oldSkillFile(home, 'SKILL.md'), 'my tuned old skill\n');
+  const refDir = dirname(oldSkillFile(home, 'ref/a.md'));
+  chmodSync(refDir, 0o555); // SKILL.md goes first (code-unit order), then removing ref/a.md fails
+  try {
+    const failed = install(home, [], { env: RETIRED_ENV });
+    assert.equal(failed.status, 1, failed.stdout);
+    assert.equal(existsSync(oldSkillFile(home, 'SKILL.md')), false, 'the first file was already retired');
+    assert.equal(existsSync(oldSkillFile(home, 'ref/a.md')), true);
+    assert.equal(readManifest(home).complete, true, 'the pipeline unit was not touched: the manifest still lists everything');
+    assert.ok(Object.hasOwn(readManifest(home).files, 'skills/oldskill/ref/a.md'));
+  } finally { chmodSync(refDir, 0o755); }
+  const r = install(home, ['--json'], { env: RETIRED_ENV });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(existsSync(join(home, 'skills', 'oldskill')), false);
+  const backups = readdirSync(join(home, 'backups')).filter((n) => n.startsWith('oldskill.'));
+  assert.equal(backups.length, 1, 'the edit was saved once, by the first run');
+  assert.equal(readFileSync(join(home, 'backups', backups[0], 'SKILL.md'), 'utf8'), 'my tuned old skill\n');
+  assert.deepEqual(retiredDrift(home), { status: 0, items: [] });
+});
+
+test('a retired skill dir that is a symlink, or that the manifest never listed, is not touched', { skip: process.platform === 'win32' }, () => {
+  const home = newHome();
+  makeOldSkill(home);
+  const elsewhere = scratch('cp-elsewhere');
+  writeFileSync(join(elsewhere, 'SKILL.md'), 'mine, elsewhere\n');
+  rmSync(join(home, 'skills', 'oldskill'), { recursive: true });
+  symlinkSync(elsewhere, join(home, 'skills', 'oldskill'), 'dir');
+  const r = install(home, ['--json'], { env: RETIRED_ENV });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout).retired, [{ rel: 'skills/oldskill', removed: [], backedUp: [], backup: null, kept: ['skills/oldskill'] }]);
+  assert.equal(readFileSync(join(elsewhere, 'SKILL.md'), 'utf8'), 'mine, elsewhere\n');
+  assert.equal(lstatSync(join(home, 'skills', 'oldskill')).isSymbolicLink(), true);
+
+  const home2 = newHome();
+  assert.equal(install(home2).status, 0);
+  mkdirSync(join(home2, 'skills', 'oldskill'), { recursive: true });
+  writeFileSync(join(home2, 'skills', 'oldskill', 'SKILL.md'), 'not ours\n');
+  const r2 = install(home2, ['--json'], { env: RETIRED_ENV });
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.deepEqual(JSON.parse(r2.stdout).retired, []);
+  assert.equal(readFileSync(join(home2, 'skills', 'oldskill', 'SKILL.md'), 'utf8'), 'not ours\n');
+});
+
+test('the retired-skill seam only takes plain directory names', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const r = install(home, ['--json'], { env: { PIPELINE_INSTALL_RETIRED_SKILLS: '../pipeline,a/b,..' } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout).retired, []);
+  assert.equal(existsSync(join(home, 'pipeline', 'bin', 'pipeline.mjs')), true);
 });
 
 test('buildPlan requires the three stack hook files', () => {
@@ -1552,7 +1739,7 @@ const driftOf = (home, source = FIXTURE) => {
 };
 
 test('constants and ourStackGroups: stack-register per matcher through the fail-closed loader (30 s), dev-bind and session-end plain (10 s)', () => {
-  assert.deepEqual([...STACK_REGISTER_MATCHERS], ['Bash', 'Read|Edit|Write|Grep|Glob|NotebookEdit']);
+  assert.deepEqual([...STACK_REGISTER_MATCHERS], ['Bash', 'Edit|Write|MultiEdit|NotebookEdit']);
   assert.equal(STACK_REGISTER_TIMEOUT_S, 30);
   assert.equal(STACK_HOOK_TIMEOUT_S, 10);
   const g = ourStackGroups('/h/.claude');
@@ -1706,7 +1893,7 @@ test('--check: a duplicated, edited or wrongly matched stack-register entry is r
   const edited = structuredClone(base);
   edited.hooks.PreToolUse[1].hooks[0].timeout = 5;
   writeSettings(home, edited);
-  assert.ok(driftOf(home).items.some((i) => i.kind === 'hook-differs' && /stack-register \(Read/.test(i.path)));
+  assert.ok(driftOf(home).items.some((i) => i.kind === 'hook-differs' && /stack-register \(Edit/.test(i.path)));
 
   const plainArgs = structuredClone(base);
   plainArgs.hooks.PreToolUse[0].hooks[0].args = [joinNative(home, 'pipeline', 'hooks', 'stack-register.mjs')];
@@ -1749,7 +1936,7 @@ test('--uninstall removes our three stack hooks, drops the PostToolUse / Session
   assert.equal(install(home).status, 0);
   const r = install(home, ['--uninstall', '--json']);
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(JSON.parse(r.stdout).hooks.removed, 8, 'stack-register x2, dev-bind, session-end, guard-git, guard-files, session-version, owner-go');
+  assert.equal(JSON.parse(r.stdout).hooks.removed, 7, 'stack-register x2, dev-bind, session-end, guard-git, guard-files, owner-go');
   assert.equal(existsSync(settingsPath(home)) ? JSON.stringify(readSettings(home)) : '{}', '{}');
 
   const home2 = newHome();

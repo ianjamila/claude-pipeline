@@ -17,7 +17,7 @@ test('installer hook matchers are what the docs say', () => {
   assert.ok(spec.includes(`**guard-files** (matcher \`${GUARD_FILES_MATCHER}\`)`));
 });
 
-test('the project settings template allows what ship runs, nothing that merges or edits protection, and a Stop hook that survives any cwd', () => {
+test('the project settings template allows what ship runs, nothing that merges or edits protection, and carries no hooks', () => {
   const settings = JSON.parse(read('pipeline/templates/settings.json'));
   const allow = settings.permissions.allow;
   for (const needed of [
@@ -27,9 +27,7 @@ test('the project settings template allows what ship runs, nothing that merges o
   for (const entry of allow) {
     assert.ok(!/gh pr merge|gh api|--force|--dangerously|bypassPermissions|git reset|git rebase|git branch -D|git remote/.test(entry), `${entry} must not be allowed`);
   }
-  const stop = settings.hooks.Stop[0].hooks[0];
-  assert.match(stop.command, /\$\{CLAUDE_PROJECT_DIR:-\.\}\/scripts\/pipeline\/stop-verify\.mjs/, 'the Stop hook must not depend on the session cwd being the repo root');
-  assert.equal(stop.timeout, 900);
+  assert.equal('hooks' in settings, false, 'the stop-verify Stop hook is retired; the template installs no hooks');
 });
 
 test('pipeline.yml template documents the optional ci keys, and CODEOWNERS names its placeholders', () => {

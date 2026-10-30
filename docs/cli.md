@@ -129,7 +129,7 @@ load and validate .claude/pipeline.yml.
 pipeline config [--repo DIR]   -> {ok, path, config}; exit 2 when missing or invalid
 ```
 
-Exit: 0 valid · 2 missing or invalid (`errors` listed). A valid config may carry `warnings` (e.g. `ci.required_checks` omits the guard contexts `Test integrity` / `Hard-stop scan`, or `verify.stop_queue_wait_minutes` is above 0 and the Stop hook running `stop-verify` in `.claude/settings.json` has a `timeout` below 900 + minutes * 60 seconds). `verify.stop_queue_wait_minutes` (integer 0..30, default 0) is the time `verify.quick` may spend queued before it runs: the Stop hook's run limit is 840 s plus that many minutes, so set the hook's `timeout` to 900 + minutes * 60 (5 -> 1200). `ci.review_check` (boolean, default false) adds the `Cross-model review` status to the guard workflow and to every required-check list (preflight, `protect`, the final gate); `true` with `ci.guard_checks: false` is an error (nothing would post it). Turn it on in the same change that applies branch protection with it.
+Exit: 0 valid · 2 missing or invalid (`errors` listed). A valid config may carry `warnings` (e.g. `ci.required_checks` omits the guard contexts `Test integrity` / `Hard-stop scan`, or `verify.stop_queue_wait_minutes` is above 0 and a leftover Stop hook running `stop-verify` in `.claude/settings.json` has a `timeout` below 900 + minutes * 60 seconds). `verify.stop_queue_wait_minutes` (integer 0..30, default 0) is retired together with the Stop hook (`stop-verify`) and nothing reads it; it is still accepted so a config that sets it validates. `ci.review_check` (boolean, default false) adds the `Cross-model review` status to the guard workflow and to every required-check list (preflight, `protect`, the final gate); `true` with `ci.guard_checks: false` is an error (nothing would post it). Turn it on in the same change that applies branch protection with it.
 
 ## cost
 
@@ -467,7 +467,7 @@ pipeline vendor --repo DIR [--check]
 
 Exit: 0 copied / no drift · 1 drift found (`--check`) · 2 usage.
 
-Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to the project's `.gitattributes` (idempotent; output `gitattributes` lists what was added), so a Windows autocrlf checkout cannot make the byte comparison drift. `--check` warns when the entries are missing. The vendored libs include `lib/review-marker.mjs` (the review-complete marker and its parser, used by the guards for `Cross-model review`).
+Vendoring removes a leftover `scripts/pipeline/stop-verify.mjs` from an earlier vendor (the Stop hook was retired; output `removed` lists it, and only that file is ever deleted); `--check` reports it as drift with reason `retired`. Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to the project's `.gitattributes` (idempotent; output `gitattributes` lists what was added), so a Windows autocrlf checkout cannot make the byte comparison drift. `--check` warns when the entries are missing. The vendored libs include `lib/review-marker.mjs` (the review-complete marker and its parser, used by the guards for `Cross-model review`).
 
 ## verify
 

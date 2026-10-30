@@ -21,9 +21,8 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge) |
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
-| hook `session-version` (SessionStart) | tells you at the top of a session when the installed pipeline is stale, edited, half-installed or older than a repo's vendored copy; silent when all is well (see [Staying current](#staying-current)) |
 | hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge") against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
-| hook `stack-register` (PreToolUse on `Bash` and the file tools `Read\|Edit\|Write\|Grep\|Glob\|NotebookEdit`, 30 s) | records which private Supabase stack a session is about to use, before the tool runs; **fail-closed** like the guards (an unloadable file blocks with exit 2) |
+| hook `stack-register` (PreToolUse on `Bash` and the write tools `Edit\|Write\|MultiEdit\|NotebookEdit`, 30 s) | records which private Supabase stack a session is about to use, before the tool runs; **fail-closed** like the guards (an unloadable file blocks with exit 2) |
 | hook `stack-dev-bind` (PostToolUse on `Bash`, 10 s) | notes which stack a dev server you started is bound to; non-blocking |
 | hook `stack-session-end` (SessionEnd, 10 s) | when a session ends (not on `/clear`) it starts a detached worker that decides whether that session's stacks can be stopped; non-blocking |
 | settings allow entries | `Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)` so pipeline calls don't prompt |
@@ -34,7 +33,7 @@ refuse to overwrite skills or agents it didn't install, and lets `--check` repor
 - **Fail-closed guards.** The two guard hooks are started through a small loader, not directly. If
   the hook file cannot be loaded (deleted, half-written, a syntax error) the loader blocks the
   tool call with exit 2 instead of letting Claude Code treat the crash as "allowed". The
-  `session-version` status hook, the `owner-go` recorder and the `stack-dev-bind` and `stack-session-end` hooks are the exceptions: they never block anything. `stack-register` is fail-closed like the guards.
+  `owner-go` recorder and the `stack-dev-bind` and `stack-session-end` hooks are the exceptions: they never block anything. `stack-register` is fail-closed like the guards.
 - **Complete-install marker.** The installer writes the manifest with `"complete": false` first and
   flips it to `true` as its very last step, so an install that was interrupted (or whose later
   steps failed) is never mistaken for a good one. `--check`, `pipeline version` and the session
@@ -104,7 +103,7 @@ cd ~/Claude/claude-pipeline
 
 ### Staying current
 
-Three things tell you where an install stands:
+Two things tell you where an install stands:
 
 - **The version stamp** (`node ~/.claude/pipeline/bin/pipeline.mjs version`, also written to a
   repo's `scripts/pipeline/VERSION` by `pipeline vendor`) is `<base>+<sha7>` plus flags that say
@@ -116,28 +115,9 @@ Three things tell you where an install stands:
   | `….incomplete` | an install started and did not finish (the complete-install marker is still `false`) |
   | `….unverified` | built from a source tree that was not a clean, published checkout (uncommitted edits, or HEAD not in `origin/main`), so the sha does not vouch for the files |
   | `0.1.0+unknown` | no source commit is known (no git, or no manifest), so nothing can be compared |
-  A stamp with a flag or `+unknown` is never treated as "current": `update --check` exits 1, the
-  session warning says the version cannot be compared, and `pipeline vendor --check` warns that a
-  vendored `VERSION` carrying one does not prove which commit its files came from.
-- **The SessionStart warning.** At the top of a session the `session-version` hook prints a short
-  notice, and nothing at all when the install is fine. It compares your install with upstream
-  `main` and with the copy a repo vendored into `scripts/pipeline/`, within a 4-second budget, and
-  caches the lookups on disk (`$XDG_CACHE_HOME` or `~/.cache`, `claude-pipeline/`; `main` for 15
-  minutes) so most sessions never touch the network. What the messages mean:
-  | Message | What to do |
-  |---|---|
-  | `installed pipeline is modified / incomplete / unverified (…)` or `has no readable INSTALLED.json` | run `update` in your own terminal |
-  | `claude-pipeline main is ahead of your install (abc1234 → def5678)` | run `update` |
-  | `… have diverged, so it cannot be told which is newer` | `update` moves you to `main` |
-  | `WARNING: this repo's scripts/pipeline (…) is NEWER than your installed pipeline` | the repo's CI rules are newer than your local CLI, so local checks may pass what CI rejects: `update` before relying on it |
-  | `this repo's scripts/pipeline is out of date … a pipeline vendor PR is owed` | run `pipeline vendor` in that repo and open the PR - or say "open the vendor PR": the message ends with that offer, and Claude (told so in its own context only) checks for an already-open vendor PR first, then runs `ship` on a new `agent/` branch; it never vendors without your yes |
-  | `could not check claude-pipeline main (<reason>); your install is <stamp>` | informational (the reason is one of `timed out`, `rate limited`, `not found`, `gh unavailable`, `network error`, `unexpected response`, never the raw error text): you are offline or GitHub is unreachable, so there is no comparison this session; a machine that is offline sees only this one line |
-  | `this repo's scripts/pipeline/VERSION is not a version stamp` / `… carries an unrecognised stamp` | informational: the repo's `VERSION` is missing a stamp's shape, is not a plain regular file (a symlink, FIFO, …), or has parts outside the known set; its text is never echoed because the repo is untrusted |
-  | `pipeline version check incomplete (timed out)` | informational: the 4-second budget ran out with nothing else to say |
-  Everything read from the session's repo is treated as hostile: `VERSION` is read as a plain regular file (no symlinks, at most 256 bytes), the vendored-file comparison skips symlinks and special files, caps each file at 2 MB and stops at the deadline, and no repo or `gh` text is repeated in a message.
-  The hook always exits 0 and is never started through the fail-closed loader: a failing version
-  check cannot block a session.
-- **`pipeline update --check`** gives the same comparison on demand, with exit codes (see above).
+  A stamp with a flag or `+unknown` is never treated as "current": `update --check` exits 1, and
+  `pipeline vendor --check` warns that a vendored `VERSION` carrying one does not prove which commit its files came from.
+- **`pipeline update --check`** compares your install with upstream `main` on demand, with exit codes (see above).
 
 ## Using it
 
@@ -155,7 +135,7 @@ To onboard another project (e.g. DRMed): open Claude in that repo and say *"Set 
 for this repo. Ask me about hard-stops you can't infer."*
 
 **Opting out:** start a session with `PIPELINE_OFF=1 claude`, or tell Claude not to use the
-pipeline. ship and verify stand down and the project Stop hook skips; branch protection and the
+pipeline. ship and verify stand down; branch protection and the
 global git guard stay on regardless.
 
 ### `P stacks`: stopping private Supabase stacks nobody needs
@@ -344,7 +324,7 @@ Rollout: the config rejects unknown keys, so set these in a repo only after ever
 
 | Variable | Meaning |
 |---|---|
-| `PIPELINE_OFF=1` | ship, verify and the Stop hook stand down for the session |
+| `PIPELINE_OFF=1` | ship and verify stand down for the session |
 | `PIPELINE_ADMIN=1` | allows the installer and `protect --apply` from a Claude session |
 | `PIPELINE_MACHINE_ID` | stable id for this machine in the lock files (default: one generated once) |
 | `PIPELINE_SMOKE_BYPASS_KEY` | secret value of the `smoke_bypass_header` header (see "Smoke firewall bypass header"); read only by `scripts/pipeline/smoke.mjs`, never printed |

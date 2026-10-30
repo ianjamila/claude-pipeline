@@ -372,8 +372,8 @@ function transcriptFiles(dir) {
 }
 
 // Does one transcript line show a session working in a worktree? Its top-level `cwd` equals or is inside one of `paths`, or
-// it carries a `tool_use` content block whose input names one. Tool results, user and assistant prose do not count: one
-// a `git worktree list` output names every worktree. A line that is not a JSON object counts (fail-closed).
+// it carries a `tool_use` content block whose input names one. Tool results, user and assistant prose do not count: a
+// `git worktree list` output, for one, names every worktree. A line that is not a JSON object counts (fail-closed).
 export function lineShowsWork(text, paths) {
   let obj;
   try {

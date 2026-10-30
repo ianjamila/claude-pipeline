@@ -16,7 +16,7 @@ worktree_dir: .worktrees       # ship creates agent/<name> worktrees here (must 
 
 verify:
   full: node scripts/verify.mjs          # everything; must pass before a PR and at the final gate
-  quick: node scripts/verify.mjs --quick # fast subset; the Stop hook runs this
+  quick: node scripts/verify.mjs --quick # fast subset for quick checks while you work
   report: .verify/report.json
   screenshots: .verify/screenshots
   # expected_steps: [install, typecheck, lint, unit, build]   # optional: final-gate then requires the report's steps to
@@ -24,10 +24,7 @@ verify:
   # skippable_steps: [db]          # optional: steps verify may skip (report status "skipped" + a reason, e.g. a slow db step
   #                                # when nothing it depends on changed). final-gate refuses a skipped step not listed here;
   #                                # absent = no step may be skipped. Every name must also be in expected_steps (when set).
-  # stop_queue_wait_minutes: 5   # optional, integer 0..30, default 0: minutes verify.quick may WAIT (e.g. for a machine-wide
-  #                                # heavy-check slot) before it runs. The Stop hook adds this to its 840 s execution allowance, so
-  #                                # raise the hook's "timeout" in .claude/settings.json to 900 + minutes * 60 seconds (5 -> 1200);
-  #                                # `P config` warns when it is lower.
+  # stop_queue_wait_minutes: 0   # retired with the Stop hook (stop-verify); still accepted (integer 0..30) so an older config validates, but nothing reads it.
   # after_fix: quick            # optional, full (default) | quick: what the verifier runs after review fixes are accepted. quick = verify.quick,
   #                                # plus verify.full --only <steps> when the fixes touch a path below (`P verify plan-after-fix --round R`
   #                                # prints the commands). The first full verify and the final gate's verify stay full.

@@ -23,7 +23,7 @@ const settings = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
 const named = (event, hook) => (settings.hooks?.[event] ?? []).flatMap((g) => (g.hooks ?? []).map((h) => ({ matcher: g.matcher, h })))
   .filter(({ h }) => [h.command, ...(h.args ?? [])].some((s) => typeof s === "string" && new RegExp("[\\\\/]" + hook + "\\.mjs$").test(s)));
 const expected = [
-  ["PreToolUse", "stack-register", "Bash"], ["PreToolUse", "stack-register", "Read|Edit|Write|Grep|Glob|NotebookEdit"],
+  ["PreToolUse", "stack-register", "Bash"], ["PreToolUse", "stack-register", "Edit|Write|MultiEdit|NotebookEdit"],
   ["PostToolUse", "stack-dev-bind", "Bash"], ["SessionEnd", "stack-session-end", undefined],
 ];
 const problems = [];

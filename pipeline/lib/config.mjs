@@ -44,8 +44,7 @@ export const DEFAULTS = deepFreeze({
     archive: ['.review/', '.verify/'],
     memory_dirs: ['~/claude-memory'],
   },
-  // stop_queue_wait_minutes: how long verify.quick may WAIT (for a machine-wide heavy-check slot) before it runs, on top of the
-  // Stop hook's own 840 s execution allowance. 0 = no queue. The hook's timeout in .claude/settings.json must grow to match.
+  // stop_queue_wait_minutes: retired with the Stop hook (stop-verify); kept so a config that still sets it validates. Nothing reads it.
   // after_fix: what the verifier runs after review fixes are accepted: 'full' (today) or 'quick' (see `pipeline verify plan-after-fix`).
   verify: { report: '.verify/report.json', screenshots: '.verify/screenshots', stop_queue_wait_minutes: 0, after_fix: 'full' },
   // guard_checks: the tamper-proof "Test integrity" and "Hard-stop scan" statuses are always required on top of
@@ -636,7 +635,7 @@ export function validateConfig(obj) {
   return errors.length === 0 ? { ok: true, errors, warnings, config } : { ok: false, errors, warnings, config: null };
 }
 
-// The Stop hook's own timeout (seconds) in the template settings.json, and the part of it stop-verify spends executing.
+// The retired Stop hook's own timeout (seconds), and the part of it stop-verify spent executing. Kept for a project that still has the hook.
 const STOP_HOOK_TIMEOUT_S = 900;
 
 /**

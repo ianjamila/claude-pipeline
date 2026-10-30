@@ -1,17 +1,16 @@
-// Copies the CI-side pipeline code into a project (<repo>/scripts/pipeline/) so the project's own CI and Stop hook run
+// Copies the CI-side pipeline code into a project (<repo>/scripts/pipeline/) so the project's own CI runs
 // without the global install, and `--check` proves the project copy is still byte-identical to this checkout.
 // Why byte-for-byte: CI executes the project copy as its trust anchor, so any divergence (an edit, a stale copy) must be
 // visible as drift rather than silently becoming the new rules.
 // Source paths are relative to this file only (<commandsDir>/../lib etc.), so the same code works from the git
 // checkout (pipeline/ is a child of the repo root) and from the installed copy under ~/.claude/pipeline/.
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXIT, UsageError, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { checkoutIdentity, formatStamp, installedIdentity, parseStamp } from '../lib/identity.mjs';
 import { repoRoot } from '../lib/repo.mjs';
-import { readRegularFile } from '../lib/safe-read.mjs';
 
 export const meta = {
   summary: 'copy the CI-side scripts into a project (scripts/pipeline/); --check reports drift',
@@ -19,7 +18,10 @@ export const meta = {
 };
 
 const LIBS = ['proc', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker'];
-const ENTRIES = ['ci-guard', 'ci-guards-run', 'stop-verify', 'smoke', 'supabase-local'];
+const ENTRIES = ['ci-guard', 'ci-guards-run', 'smoke', 'supabase-local'];
+// Entries an earlier vendor copied and this one no longer does. A leftover scripts/pipeline/<name>.mjs is removed by vendor (that
+// exact file only) and is drift for --check.
+const RETIRED_ENTRIES = ['stop-verify'];
 const DEST = ['scripts', 'pipeline'];
 const VERSION_FILE = 'VERSION';
 
@@ -67,11 +69,22 @@ function manifest(l) {
 }
 
 const repoRel = (rel) => posix(...DEST, rel);
+// The retired entries still lying in <repo>/scripts/pipeline (a file or a symlink; a directory under that name is not ours).
+function retiredFiles(target) {
+  const found = [];
+  for (const n of RETIRED_ENTRIES) {
+    const dest = join(target, `${n}.mjs`);
+    let st;
+    try { st = lstatSync(dest); } catch { continue; }
+    if (st.isFile() || st.isSymbolicLink()) found.push({ rel: `${n}.mjs`, dest });
+  }
+  return found;
+}
 
 // Content drift of a project's scripts/pipeline/ from the code this pipeline would vendor: [{ file, reason }] for every
-// file that is missing or whose bytes differ (empty = identical). Only bytes count: the VERSION stamp's +sha moves with
-// every pipeline commit and says nothing about the copied code. Takes the repo root from the caller, runs no git, so
-// the SessionStart hook can call it in-process under its deadline.
+// file that is missing, whose bytes differ, or that is a retired entry still lying there (empty = identical). Only bytes
+// count: the VERSION stamp's +sha moves with every pipeline commit and says nothing about the copied code. Takes the repo
+// root from the caller and runs no git.
 export function vendorDrift(root, items = manifest(layout())) {
   const target = join(root, ...DEST);
   const drift = [];
@@ -80,26 +93,8 @@ export function vendorDrift(root, items = manifest(layout())) {
     if (!existsSync(dest)) drift.push({ file: repoRel(it.rel), reason: 'missing' });
     else if (sha256(dest) !== sha256(it.src)) drift.push({ file: repoRel(it.rel), reason: 'differs' });
   }
+  for (const f of retiredFiles(target)) drift.push({ file: repoRel(f.rel), reason: 'retired' });
   return drift;
-}
-
-// The same comparison for a caller that must not be held hostage by the repo it inspects (the SessionStart hook): the
-// project's files are untrusted, so a destination that is a symlink or any non-regular file (a FIFO, /dev/zero, a
-// directory) or larger than `maxBytes` counts as 'differs' without being read through, every file is read with a size
-// cap, and the loop stops once `deadlineAt` (ms, compared with `now()`) has passed. Returns { drift, timedOut };
-// when timedOut the drift list is partial and the caller must not report from it.
-export const DRIFT_MAX_FILE_BYTES = 2 * 1024 * 1024;
-export function vendorDriftBounded(root, { deadlineAt = Infinity, now = Date.now, maxBytes = DRIFT_MAX_FILE_BYTES, items = manifest(layout()) } = {}) {
-  const target = join(root, ...DEST);
-  const drift = [];
-  for (const it of items) {
-    if (now() >= deadlineAt) return { drift, timedOut: true };
-    const have = readRegularFile(join(target, it.rel), maxBytes, { rejectLarger: true });
-    if (have.status === 'missing') drift.push({ file: repoRel(it.rel), reason: 'missing' });
-    else if (have.status !== 'ok') drift.push({ file: repoRel(it.rel), reason: 'differs' });
-    else if (!have.buffer.equals(readFileSync(it.src))) drift.push({ file: repoRel(it.rel), reason: 'differs' });
-  }
-  return { drift, timedOut: false };
 }
 
 // Why a project's VERSION stamp proves nothing about the vendored code, or null when it is a clean, sha-bearing one.
@@ -178,8 +173,10 @@ export async function run(argv) {
     mkdirSync(dirname(dest), { recursive: true });
     copyFileSync(it.src, dest);
   }
+  // Only the named retired files, nothing else in the project.
+  const removed = retiredFiles(target).map((f) => { unlinkSync(f.dest); return repoRel(f.rel); });
   writeFileSync(join(target, VERSION_FILE), `${version}\n`);
   const attributesAdded = ensureAttributes(root);
-  return { exitCode: EXIT.OK, output: { ok: true, files: allFiles, version, gitattributes: attributesAdded } };
+  return { exitCode: EXIT.OK, output: { ok: true, files: allFiles, version, gitattributes: attributesAdded, removed } };
 }
 

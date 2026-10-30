@@ -1,6 +1,6 @@
 ---
 name: pipeline-setup
-description: Use when the user says "set up the pipeline", "onboard this repo", "add the agent pipeline", "make this repo shippable by agents", or when ship/verify finds no .claude/pipeline.yml. Audits the repo read-only, then creates everything the global ship/verify pipeline needs — .claude/pipeline.yml, scripts/verify with --quick and a JSON report, missing test tooling (Vitest, Playwright, pgTAP for Supabase), tamper-proof CI guard checks (test integrity + hard-stop scan), CODEOWNERS, a Stop hook running quick verify, a permission allowlist, CLAUDE.md rules, labels — and branch protection via gh api.
+description: Use when the user says "set up the pipeline", "onboard this repo", "add the agent pipeline", "make this repo shippable by agents", or when ship/verify finds no .claude/pipeline.yml. Audits the repo read-only, then creates everything the global ship/verify pipeline needs — .claude/pipeline.yml, scripts/verify with --quick and a JSON report, missing test tooling (Vitest, Playwright, pgTAP for Supabase), tamper-proof CI guard checks (test integrity + hard-stop scan), CODEOWNERS, a permission allowlist, CLAUDE.md rules, labels — and branch protection via gh api.
 when_to_use: Onboarding any git repo (any stack) to the autonomous pipeline, re-running setup after the stack changed, or repairing drift reported by `pipeline vendor --check` / `pipeline preflight`.
 ---
 
@@ -98,8 +98,8 @@ Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard cont
 
 ### e. Test-integrity + hard-stop checks
 
-`P vendor --repo .` copies `ci-guard`, `ci-guards-run`, `stop-verify`, `smoke` and `supabase-local`
-(plus `lib/`, `vendor/js-yaml.mjs` and a `VERSION` file) into `scripts/pipeline/`, and appends
+`P vendor --repo .` copies `ci-guard`, `ci-guards-run`, `smoke` and `supabase-local`
+(plus `lib/`, `vendor/js-yaml.mjs` and a `VERSION` file) into `scripts/pipeline/` (and removes a `stop-verify.mjs` an earlier vendor left there), and appends
 `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to `.gitattributes` so a Windows checkout cannot
 rewrite them (commit that file; `P vendor --repo . --check` reports drift and warns when the lines are
 missing). The `VERSION` file holds the stamp of the pipeline that ran `vendor` (`<base>+<sha7>`, with
@@ -118,9 +118,7 @@ branch protection.
 
 ### g. `.claude/settings.json`
 
-Merge `templates/settings.json`: the Stop hook (`node "${CLAUDE_PROJECT_DIR:-.}/scripts/pipeline/stop-verify.mjs"`,
-timeout 900: it resolves the script from the project dir, so a session opened in a subdirectory still
-runs it, and the script finds the repo root with git itself) and the permission allowlist for the
+Merge `templates/settings.json`: the permission allowlist for the
 commands ship runs (pipeline CLI, verify, `gh pr create|edit|ready|checks|update-branch`, `git push|pull|
 fetch|add|commit|worktree`…; nothing that merges or edits protection). Keep existing keys. Never add
 `--dangerously-skip-permissions` or `bypassPermissions`.

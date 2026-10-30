@@ -1,4 +1,4 @@
-// Why: a version label is trusted by the session hook, the updater and vendor stamps, so each way a label can be a
+// Why: a version label is trusted by the updater and vendor stamps, so each way a label can be a
 // lie (edited install, half install, dirty source, unpublished checkout, no sha) must show up in the stamp. Installed
 // copies are built by hand in a temp claude-home; checkouts are real throwaway git repos.
 import { test } from 'node:test';
@@ -311,16 +311,6 @@ test('installedIdentity: files the installer ignores or does not own are not ext
   assert.equal(id.stamp, '1.4.0+0123456');
 });
 
-test('the session hook and update --check treat an added installed file as modified', async () => {
-  const { installedProblems } = await import('../pipeline/lib/session-version.mjs');
-  const home = installedHome();
-  assert.deepEqual(installedProblems(installedIdentity(home)), []);
-  writeFileSync(join(home, 'pipeline', 'added.mjs'), 'x\n');
-  const problems = installedProblems(installedIdentity(home));
-  assert.equal(problems.length, 1);
-  assert.match(problems[0], /^modified \(1 installed file differs/);
-});
-
 function installRepo() {
   const repo = createTmpRepo();
   repo.write('VERSION', '1.4.0\n');
@@ -492,9 +482,3 @@ test('installedIdentity: an unreadable manifest-listed file is .modified, not a 
   } finally { chmodSync(f, 0o644); }
 });
 
-test('the session hook flags a scan error as modified', async () => {
-  const { installedProblems } = await import('../pipeline/lib/session-version.mjs');
-  const problems = installedProblems({ complete: true, modified: [], missing: [], extra: [], scanError: ['pipeline/x'], sourceDirty: false });
-  assert.equal(problems.length, 1);
-  assert.match(problems[0], /^modified/);
-});
