@@ -77,8 +77,21 @@ A stack is in use if ANY holds (all sources evaluated together):
   ports as `:<port>`; or whose cwd is inside the stack folder.
 - **C4 Consumer worktrees:** every worktree that (a) a ledger event or transcript backfill ties to the stack, or
   (b) has a `.env*` file at its root pointing at one of the stack's published ports (`127.0.0.1:<port>` /
-  `localhost:<port>`). A live process with cwd inside a consumer worktree ⇒ in use (session-end); an existing consumer
-  worktree with an open PR or no PR ⇒ in use (sweeper).
+  `localhost:<port>`). A live process with cwd inside a consumer worktree, OR an open Claude session parked in one
+  (or in the stack folder) ⇒ in use (session-end and sweeper); an existing consumer worktree with an open PR or no PR ⇒ in
+  use (sweeper).
+  *Open sessions (revision 2026-10-30):* a Claude Code session's own process keeps the folder it started in (usually
+  `~`); only its short-lived Bash shell enters a worktree, so lsof sees nothing and a session parked there for days has
+  no lease and a transcript older than the 24 h window. Claude Code lists its open sessions in
+  `<config>/sessions/<pid>.json`; a record counts while its pid is alive with the recorded start time (the same scanner
+  `pipeline worktrees prune` uses, `worktree-prune/live-sessions.mjs`), and the session is where the last `cwd` of its
+  transcript is. One scan per evidence call (the session-end worker scans again for its re-check under the lock). No
+  owner or session-id exclusion: session-end assesses after its owner is gone, whose record is then dead to the scanner,
+  and excluding a pid would hide a new session that reused it. Fail closed: a record or transcript that cannot be read, a
+  failing `ps`, or the decision deadline running out is unknown (session-end keeps, the sweep lists); only "no sessions
+  folder at all" is an absent extra signal (a note). A session inside a NESTED git worktree under the stack folder that
+  is not itself a consumer works in its own worktree and does not count for the stack folder; if the folder's worktree
+  list cannot be read, every session inside the folder counts.
 - **C6 Recent transcripts (sweeper only):** a transcript modified in the last 24 h names the stack folder/project.
 Other users' processes (R3-1): their real use of a stack is covered by C2 (server side) and by C3's command line; their environment and cwd/open files cannot be read without root, so those checks see this user's processes only (reports show `hidden: N`).
 (Kong/Postgres traffic mining is dropped from the gates — Codex's P3 simplification; it may come back as a report
@@ -317,6 +330,15 @@ CLAUDE.md shared-stacks bullet gains one line only when a mode is switched to `a
 - Unregistered consumers that hold no connection, no env/cmdline reference and no cwd in a consumer worktree can be
   missed. Measure-first exists for this: near-misses show whether it happens before anything is stopped.
 - A session that crashed while its worktree's PR is open keeps its stack until that PR is merged/closed (condition 3).
+- (Revision 2026-10-30) Open sessions are placed by their transcript's last `cwd`, read from EVERY account's `projects/`: a
+  session that `cd`'d away still counts while any copy of its transcript last points inside. Consumer worktrees are still
+  found only through the ledger, `.env*` port references and the 24 h transcript backfill, so a worktree known only through
+  an older transcript is not checked. A persistent `unplaced` (a root-owned `~/.claude*/sessions`, a `procStart` format
+  change) keeps every private stack at session-end and lists them in the sweep until fixed: the same trade-off as lsof
+  failing. A `CLAUDE_CONFIG_DIR` outside `~/.claude*` while the variable is unset (a launchd job) is not seen: no signal,
+  as before. A record with no `procStart` (older Claude Code only) counts on pid-alive alone. The live-process `cwd`
+  check keeps its wider meaning (a process inside a nested non-consumer worktree still counts); aligning it is a possible
+  follow-up.
 
 ## Out of scope / later (owner to prune)
 - Killing orphaned dev servers in the sweeper.
