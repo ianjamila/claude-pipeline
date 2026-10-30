@@ -1,6 +1,6 @@
 ---
 name: pipeline-setup
-description: Use when the user says "set up the pipeline", "onboard this repo", "add the agent pipeline", "make this repo shippable by agents", or when review/verify finds no .claude/pipeline.yml. Audits the repo read-only, then creates everything the global ship/verify pipeline needs — .claude/pipeline.yml, scripts/verify with --quick and a JSON report, missing test tooling (Vitest, Playwright, pgTAP for Supabase), tamper-proof CI guard checks (test integrity + hard-stop scan), CODEOWNERS, a permission allowlist, CLAUDE.md rules, labels — and branch protection via gh api.
+description: Use when the user says "set up the pipeline", "onboard this repo", "add the agent pipeline", "make this repo shippable by agents", or when review/verify finds no .claude/pipeline.yml. Audits the repo read-only, then creates everything the global review/verify pipeline needs — .claude/pipeline.yml, scripts/verify with --quick and a JSON report, missing test tooling (Vitest, Playwright, pgTAP for Supabase), tamper-proof CI guard checks (test integrity + hard-stop scan), CODEOWNERS, a permission allowlist, CLAUDE.md rules, labels — and branch protection via gh api.
 when_to_use: Onboarding any git repo (any stack) to the autonomous pipeline, re-running setup after the stack changed, or repairing drift reported by `pipeline vendor --check` / `pipeline preflight`.
 ---
 

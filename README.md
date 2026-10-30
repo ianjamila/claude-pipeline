@@ -1,10 +1,10 @@
 # claude-pipeline
 
 A global **build → verify → review → merge → production check** pipeline for Claude Code. Once a
-repo is onboarded, asking Claude to build or fix something runs the whole flow unattended: a
-branch and worktree, the change plus tests, a full local verify, a pull request, a cross-model
-review loop (Codex finds, a Sonnet judge triages low-risk PRs, a Fable pass rules on and reviews every medium/high-risk or sensitive PR), a final gate
-bound to the exact commit, and the merge. Nothing reaches `main` without proof, and anything sensitive stops for you.
+repo is onboarded, asking Claude to build or fix something runs the build and review unattended: a
+branch and worktree, the change plus tests, a quick local check, a draft pull request, a cross-model
+review loop (Codex finds, a Sonnet judge triages low-risk PRs, a Fable pass rules on and reviews every medium/high-risk or sensitive PR), then CI (the full proof) on the
+exact commit. You merge: the agent hands you the exact merge request and never merges itself. Nothing reaches `main` without proof, and anything sensitive stops for you.
 
 Design: [`docs/specs/2026-10-01-claude-pipeline-design.md`](docs/specs/2026-10-01-claude-pipeline-design.md) ·
 plan: [`docs/plans/2026-10-01-claude-pipeline-plan.md`](docs/plans/2026-10-01-claude-pipeline-plan.md) ·
@@ -173,7 +173,7 @@ Hard-stop PRs still go through the full review loop first, so you always get a r
 | Hard-stop needs the owner | ✅ via required `Hard-stop scan` | ✅ | ✅ label guard | ✅ |
 | Test weakening blocked | ✅ via required `Test integrity` | ✅ | ✅ label guard | |
 | Linear history / squash | ✅ | | | ✅ |
-| Fresh full verify bound to the head commit | | | | ✅ final-gate |
+| Full proof on the head commit | | ✅ CI runs the full verify | | ✅ final-gate checks the verify report and the required checks for that exact head |
 | Gate judges the tree that will land (branch up to date with `main`) | | | ✅ `update-branch` stays allowed, merging through the API denied | ✅ `update-branch` before the gate, again in `merge` |
 | Cross-model review happened | | | ✅ guard-files keeps agents from writing a repo's review state (`.review/state.json`, round folders, gate / smoke records); guard-git keeps them from posting the review-complete or triage markers | ✅ no review ⇒ no merge |
 | Arbiter really ran on Fable | | | | ✅ model-proof |
@@ -234,8 +234,8 @@ head you did not review (the receipt names the head the event carried).
   not caught (a protected registry of chat repos is the planned fix).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
-- **Local verify, lean CI.** The full verify runs on your machine; CI keeps the repo's existing
-  checks plus the cheap guard jobs, and runs E2E only for high-risk PRs.
+- **Quick check locally, CI is the full proof.** The agent runs only `verify.quick` on the changed area; CI runs the full verify, the
+  repo's existing checks and the cheap guard jobs (E2E only for high-risk PRs). The owner merges, never the agent.
 - **Verify slots are per machine.** `verify.max_parallel_full` limits full verifies on one computer, not across your machines, and the
   `verify.max_load` check is skipped on Windows (with a warning).
 - **Agent log lives on its own branch.** `docs/agent-log.md` can't be pushed to `main` directly and a file every PR edits would
