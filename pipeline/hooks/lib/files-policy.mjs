@@ -1557,7 +1557,8 @@ function baseDirsOf(argv) {
     }
   } else if (name === 'tar' || name === 'bsdtar' || name === 'gtar') flagValue('C', 'directory');
   else if (name === 'unzip') flagValue('d', 'directory');
-  else if (name === 'make' || name === 'gmake') flagValue('C', 'directory');  else if (name === 'cp' || name === 'mv' || name === 'install' || name === 'ln') flagValue('t', 'target-directory');
+  else if (name === 'make' || name === 'gmake') flagValue('C', 'directory');
+  else if (name === 'cp' || name === 'mv' || name === 'install' || name === 'ln') flagValue('t', 'target-directory');
   else if (name === 'rsync') { const pos = args.filter((a) => !a.startsWith('-')); if (pos.length >= 2) out.push(pos[pos.length - 1]); }
   return out;
 }
