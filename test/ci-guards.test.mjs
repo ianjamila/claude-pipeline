@@ -1060,6 +1060,26 @@ test('review_check: the NEWEST allowed comment decides; an edited or malformed n
   assert.equal(after.byContext('Cross-model review').state, 'success');
 });
 
+test('review_check: a newest comment whose JSON is broken or whose record is not exactly the shape fails; an older good one does not come back', async () => {
+  const s = await setup(cleanChange, REVIEW_ON);
+  const good = reviewComment(s, { id: 1, at: T('10:01') });
+  const record = JSON.stringify({ contentHash: reviewedHash(s), base: s.repo.base, head: s.head, rounds: 2, codexModel: 'gpt-6-astra', modelProofDigest: null });
+  assert.ok(good.body.includes(record), 'the fixture body carries the record on one line');
+  const bodies = {
+    'broken JSON': good.body.replace(record, '{"contentHash": '),
+    'not an object': good.body.replace(record, '[]'),
+    'hash not 64 hex': good.body.replace(reviewedHash(s), 'abc123'),
+    'zero rounds': good.body.replace('"rounds":2', '"rounds":0'),
+  };
+  for (const [what, body] of Object.entries(bodies)) {
+    assert.notEqual(body, good.body, what);
+    const r = await exec(s, { comments: [good, { id: 2, by: 'acme', at: T('10:02'), updated: T('10:02'), body }] });
+    assert.equal(r.byContext('Cross-model review').state, 'failure', what);
+    assert.match(r.byContext('Cross-model review').description, /does not carry a valid review record/, what);
+    assert.equal(r.artifact, `pipeline-verdict_v2_${s.head}_success_success_failure`, what);
+  }
+});
+
 test('review_check with ci.approvers: a listed approver\'s comment counts, the owner\'s no longer does; org repo without a list fails closed', async () => {
   const cfg = { config: CONFIG(undefined, 'ci:\n  review_check: true\n  approvers: [alice]\n') };
   const s = await setup(cleanChange, cfg);

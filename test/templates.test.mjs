@@ -611,6 +611,51 @@ test('smoke bypass: main threads the configured name and PIPELINE_SMOKE_BYPASS_K
   assert.equal(Object.keys(notConfigured.seen[0].init.headers).length, 2, 'only user-agent and cache-control');
 });
 
+test('smoke bypass: a redirect to another origin is reported, never followed, and the other origin sees no request or header', async () => {
+  const { runSmoke } = await importVendored((await project()).dir, 'smoke');
+  const seen = [];
+  const fetch = async (url, init) => {
+    seen.push({ url: String(url), init });
+    return new Response(null, { status: 307, headers: { location: 'https://evil.example/steal' } });
+  };
+  const r = await runSmoke({ base: HTTPS_BASE, checks: [{ path: '/', status: [307] }], bypass: BYPASS }, { fetch, ...noSleep });
+  assert.equal(r.ok, true);
+  assert.equal(seen.length, 1, 'only the configured origin was asked');
+  assert.equal(new URL(seen[0].url).origin, HTTPS_BASE);
+  assert.equal(seen[0].init.redirect, 'manual', 'fetch is told not to follow');
+  assert.ok(!seen.some((x) => x.url.includes('evil.example')));
+  assert.ok(!JSON.stringify(r).includes(KEY));
+});
+
+test('smoke bypass: a denied origin or port, a plain-http base and an invalid path never get the header; the key is not in the output', async () => {
+  const { main } = await importVendored((await project()).dir, 'smoke');
+  const run = async (base, extra = []) => {
+    const repo = await project({ config: CONFIG(undefined, BYPASS_YML) });
+    const seen = [];
+    let out = '';
+    const orig = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (c, ...rest) => (typeof c === 'string' && c.startsWith('{') ? ((out += c), true) : orig(c, ...rest));
+    let code;
+    try { code = await main(['--base', base, ...extra], { env: { PIPELINE_SMOKE_BYPASS_KEY: KEY }, cwd: repo.dir, deps: { fetch: okFetch(seen), ...noSleep } }); } finally { process.stdout.write = orig; }
+    return { code, seen, out };
+  };
+  for (const base of ['https://other.example.com', 'https://app.example.com:8443']) {
+    const r = await run(base);
+    assert.equal(r.code, 0, r.out);
+    assert.equal(r.seen.length, 1, base);
+    assert.equal(r.seen[0].init.headers['x-smoke-key'], undefined, base);
+    assert.ok(!r.out.includes(KEY), base);
+  }
+  const plain = await run('http://app.example.com'); // a different scheme is a different origin; smoke refuses plain http outright
+  assert.equal(plain.code, 2, plain.out);
+  assert.equal(plain.seen.length, 0);
+  assert.ok(!plain.out.includes(KEY));
+  const bad = await run(HTTPS_BASE, ['--expect-text', 'x', '--expect-path', '//evil.example/x']);
+  assert.equal(bad.code, 2);
+  assert.equal(bad.seen.length, 0, 'an invalid path makes no request at all');
+  assert.ok(!bad.out.includes(KEY));
+});
+
 test('every template is a plain script module with a short why-header', () => {
   for (const n of ['ci-guard', 'smoke']) {
     const text = readFileSync(new URL(`../pipeline/templates/scripts/pipeline/${n}.mjs`, import.meta.url), 'utf8');
