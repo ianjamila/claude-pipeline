@@ -812,7 +812,11 @@ function braceWordsOf(raw) {
     if (c === '\\' && i + 1 < raw.length) { cur += hide(raw[++i]); any = true; continue; }
     if (c === "'" || c === '"') { q = c; any = true; continue; }
     if (/\s/.test(c)) { flush(); continue; }
-    if (/[<>|;&]/.test(c)) break scan;
+    if (/[<>|;&]/.test(c)) {
+      if (/[<>]/.test(c) && /^\d+$/.test(cur)) { cur = ''; any = false; } // (`2>/dev/null`: the fd number is part of the redirection, not a word)
+      break scan;
+    }
+    if (c === '#' && !any) break scan; // (a comment)
     if (c === '{') brace = true;
     cur += c;
     any = true;
@@ -823,7 +827,8 @@ function braceWordsOf(raw) {
   toks.forEach((t, k) => {
     if (!t.brace) return;
     const viaT = /^(?:-t|--target-directory=)/.test(t.text) || /^(?:-t|--target-directory)$/.test(toks[k - 1]?.text ?? '');
-    if (!viaT && toks.slice(k + 1).some((u) => !u.text.startsWith('-'))) return;
+    // (only a later word known to be non-empty makes it a source: `$E`, `$(…)` or `""` may expand to nothing and leave it the destination)
+    if (!viaT && toks.slice(k + 1).some((u) => u.text !== '' && !u.text.startsWith('-') && !/[$`]/.test(u.text))) return;
     const r = expandBraceWord(t.text);
     if (r.over) over = true;
     if (r.list.length > 1 || r.list[0] !== t.text) for (const x of r.list) words.push(x.replace(//g, '{').replace(//g, '}').replace(//g, ','));

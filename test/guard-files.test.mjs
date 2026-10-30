@@ -1275,6 +1275,17 @@ test('#111: a brace list or range that expands to a protected review file is den
     'echo y | tee .review/st{a..b}te.json',
     `echo y | tee ${A}/st{a,b}te.json`,
     'touch .review/{state,x}.json',
+    // (a trailing fd redirection, a comment or a word that may expand to nothing is not a later source word)
+    'cp x .review/{state,y}.json 2>/dev/null',
+    'cp x .review/{state,y}.json 2>&1',
+    'cp x .review/{state,y}.json 12>err.log',
+    'install x .review/{state,y}.json 2>/dev/null',
+    'rsync x rv/{state,y}.json 2>>log',
+    'cp x .review/{state,y}.json # note',
+    'cp x .review/{state,y}.json $E',
+    'cp x .review/{state,y}.json "$E"',
+    'cp x .review/{state,y}.json ""',
+    'cp x .review/{state,y}.json $(true)',
   ]) assert.equal(w.bash(cmd), 'deny', cmd);
   // (controls: no protected name among the expansions, a quoted brace is the literal name, a brace in a source or in a string)
   for (const cmd of [
