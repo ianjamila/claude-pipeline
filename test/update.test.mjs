@@ -396,8 +396,8 @@ test('a fetch that fails reports it, installs nothing, and still removes the scr
 test('an install that fails is reported and the scratch directory is still removed', async () => {
   const { sha } = remote();
   const home = newHome();
-  mkdirSync(join(home, 'skills', 'ship'), { recursive: true }); // a skill that is not ours: the installer refuses to overwrite it
-  writeFileSync(join(home, 'skills', 'ship', 'SKILL.md'), 'mine\n');
+  mkdirSync(join(home, 'skills', 'review'), { recursive: true }); // a skill that is not ours: the installer refuses to overwrite it
+  writeFileSync(join(home, 'skills', 'review', 'SKILL.md'), 'mine\n');
   const { result: r, left } = await withTmp(home, () => update(['--claude-home', home], { env: envFor(ghFor(sha)) }));
   assert.equal(r.exitCode, 1);
   assert.equal(r.output.error, 'install-failed');
