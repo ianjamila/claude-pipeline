@@ -451,6 +451,28 @@ function lexicalTarget(target, ctx) {
   return s.length > 1 && s.endsWith('/') ? s.slice(0, -1) : s;
 }
 
+// #111 (final round): the absolute path `p` (NOT normalised) with each `..` read as the physical parent: the directory a link points into, then its parent, not the directory the link sits in.
+// null when p has no `..`, is not POSIX-absolute (the inode check is POSIX-only) or nothing differs. Where a prefix does not exist (realpath fails) the lexical parent stands in.
+function physicalDots(p, api) {
+  if (!p.startsWith('/') || !/(?:^|\/)\.\.(?:\/|$)/.test(p)) return null;
+  let cur = '/';
+  for (const seg of p.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg !== '..') { cur = cur === '/' ? `/${seg}` : `${cur}/${seg}`; continue; }
+    let real = cur;
+    try { real = toPosix(api.realpath(cur)).replace(DEVICE_PREFIX, ''); } catch { /* missing prefix: the lexical parent */ }
+    cur = posix.dirname(real);
+  }
+  return cur;
+}
+// -> the extra candidates for a file-tool target: its `..` read physically (see physicalDots), and that path's real location
+function physicalTargets(target, ctx) {
+  let s = toPosix(expandHome(target, ctx.homeNative)).replace(DEVICE_PREFIX, '');
+  if (!isAbs(s)) s = `${ctx.cwd.replace(/\/$/, '')}/${s}`;
+  const phys = physicalDots(s, ctx.api);
+  return phys === null ? [] : [phys, realResolve(phys, ctx.api)];
+}
+
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
 const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go\.mjs$/i;
 
@@ -505,7 +527,7 @@ function evaluateMcp(tool, ti, input, opts) {
   const writeVerb = MCP_WRITE_VERB.test(last);
   const resolve = (t) => {
     const lexical = lexicalTarget(t, ctx);
-    return unique([lexical, realResolve(lexical, ctx.api)]);
+    return unique([lexical, realResolve(lexical, ctx.api), ...physicalTargets(t, ctx)]);
   };
   // 1. a file write: the path keys name the targets (an exact ancestor dir counts too)
   const targets = writeVerb ? f.paths.map((t) => ({ t, candidates: resolve(t) })) : [];
@@ -555,7 +577,7 @@ function evaluateFileToolUnchecked(input, opts = {}) {
 
   const resolved = targets.map((t) => {
     const lexical = lexicalTarget(t, ctx);
-    return { t, candidates: unique([lexical, realResolve(lexical, ctx.api)]) };
+    return { t, candidates: unique([lexical, realResolve(lexical, ctx.api), ...physicalTargets(t, ctx)]) };
   });
   for (const { t, candidates } of resolved) {
     if (candidates.some((c) => ctx.hit(c) || ctx.hitInode(c))) return deny(`${t} is a protected pipeline file (${PROTECTED_MSG})`);
@@ -998,7 +1020,11 @@ function makeMatchers(ctx) {
     for (const word of words) {
       if (!/[A-Za-z0-9]/.test(word)) continue;
       const e = word === '~' || word.startsWith('~/') ? pathsFor().join(ctx.homePosix, word.slice(1)) : word;
-      for (const d of isAbs(e) ? [''] : where) if (ctx.hitReviewInode(isAbs(e) ? pathsFor().normalize(e) : pathsFor().join(d, e), true)) return true;
+      for (const d of isAbs(e) ? [''] : where) {
+        if (ctx.hitReviewInode(isAbs(e) ? pathsFor().normalize(e) : pathsFor().join(d, e), true)) return true;
+        // (#111 final round: `link/../state.json` -- after a link, `..` is the PHYSICAL parent of what the link points to, which the lexical join above has already dropped)
+        if (/(?:^|\/)\.\.(?:\/|$)/.test(e)) { const phys = physicalDots(isAbs(e) ? e : `${d}/${e}`, ctx.api); if (phys !== null && ctx.hitReviewInode(phys, true)) return true; }
+      }
     }
     return false;
   };

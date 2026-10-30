@@ -1297,6 +1297,23 @@ test('#111: a brace list or range that expands to a protected review file is den
   assert.equal(n.bash('touch out/{1..100}.txt'), 'allow');
 });
 
+test('#111: `..` after a link is the physical parent of what the link points to (Bash words, redirects and the file tools)', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { tmp: T, ralias: R } = w;
+  // (ralias -> .review/round-1, so ralias/.. is .review: the protected name below it is reached though the lexical path says <tmp>/state.json)
+  for (const cmd of [
+    `cp x ${R}/../state.json`, `echo y > ${R}/../state.json`, `cd ${T} && cp x ralias/../state.json`, `cd ${T} && echo y > ralias/../state.json`,
+    `echo y | tee ${R}/../state.json`, `cp x ${R}/../final-gate.json`, `cp x ${R}/./../state.json`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  assert.equal(w.write(`${R}/../state.json`), 'deny');
+  assert.equal(w.write(`${R}/../final-gate.json`), 'deny');
+  // (controls: a scratch name in .review, a `..` that never leaves the checkout's plain directories, a link that is no review link)
+  for (const cmd of [`cp x ${R}/../hardstops.json`, `cd ${T} && cp x ralias/../hardstops.json`, `echo y > ${R}/../hardstops.json`, `cp x ${T}/other/../state.json`, `cat ${R}/../state.json`]) assert.equal(w.bash(cmd), 'allow', cmd);
+  assert.equal(w.write(`${R}/../hardstops.json`), 'allow');
+  assert.equal(w.write(`${T}/other/../state.json`), 'allow');
+});
+
 test('#111: a link whose name holds `,` or `=` is followed too', (t) => {
   const w = reviewAliasWorld(t);
   if (!w) return;
