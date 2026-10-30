@@ -212,6 +212,15 @@ export function cwdChain(command, cwd, { platform = process.platform, home = os.
   return chainFrom(parseCommand(command, platform), start, home);
 }
 
+// What a hook payload says about the tool call: the tool name, its input object and, for Bash, the command. register() and the
+// hook's pre-check (fastpath.mjs) both read the call through this, so they cannot disagree about it.
+export function callOf(input) {
+  const tool = typeof input?.tool_name === 'string' ? input.tool_name : '';
+  const toolInput = input?.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
+  const command = tool === 'Bash' && typeof toolInput.command === 'string' ? toolInput.command : '';
+  return { tool, toolInput, command };
+}
+
 // ---- dev servers ----
 // One { port } per dev command in the chain (port from -p N, --port N, --port=N, PORT=N; default 3000), duplicates collapsed.
 export function devTargets(command) {
