@@ -472,12 +472,23 @@ function digestEntry(abs) {
   return sha256OfFile(abs);
 }
 
+// The precondition of `asHead`: a real commit (a tree or blob id would also satisfy `<id>^{tree}`) whose tree is HEAD's. Without it
+// the result would bind a verify report to bytes it never saw, so refuse here whatever the caller checked before.
+function assertSameTree(asHead, o) {
+  const treeOf = (rev) => revParse(`${rev}^{tree}`, o); // revParse refuses a rev that starts with `-`
+  revParse(`${asHead}^{commit}`, o);
+  if (treeOf(asHead) !== treeOf('HEAD')) {
+    throw new GitError({ args: ['treeFingerprint', asHead], code: 1, stderr: `${asHead} has a different tree than HEAD; asHead needs an equal-tree commit` });
+  }
+}
+
 // sha256 of HEAD + every tracked change vs HEAD (staged or not) + every untracked, non-ignored file with its bytes.
 // Equal fingerprints mean the same tree; a verify report that carries one is bound to exactly that tree.
 // `asHead` (the final gate only): the fingerprint this same working tree would have had with HEAD at that commit instead. It is
 // only meaningful when `<asHead>^{tree}` is HEAD's tree: then `git diff <asHead>` and `git diff HEAD` are byte-identical (same
 // blobs, same ids), so the result is exactly what verify recorded on a clean checkout of asHead with these untracked files.
 export function treeFingerprint(o, { asHead = null } = {}) {
+  if (asHead !== null) assertSameTree(asHead, o);
   const hash = createHash('sha256');
   hash.update(asHead ?? headSha(o));
   hash.update('\0');

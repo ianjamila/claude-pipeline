@@ -293,6 +293,32 @@ test('treeFingerprint: staged vs unstaged, new HEAD, and subdirectory cwd', () =
   assert.notEqual(treeFingerprint(o), unstaged);
 });
 
+test('treeFingerprint asHead: an equal-tree commit gives the fingerprint that commit would have had as HEAD', () => {
+  const { repo, o } = baseRepo();
+  repo.write('scratch.txt', 'untracked\n');
+  repo.write('src/a.js', 'edited\n');
+  const old = headSha(o);
+  const before = treeFingerprint(o); // taken with `old` as HEAD
+  repo.git(['commit', '-q', '--amend', '-m', 'reworded']); // same tree, new commit id
+  assert.notEqual(headSha(o), old);
+  assert.notEqual(treeFingerprint(o), before, 'plain fingerprint hashes the new HEAD');
+  assert.equal(treeFingerprint(o, { asHead: old }), before, 'the old sha is the prefix: same as when it was HEAD');
+  assert.equal(treeFingerprint(o, { asHead: headSha(o) }), treeFingerprint(o), 'asHead = HEAD is the plain fingerprint');
+});
+
+test('treeFingerprint asHead: refuses a commit whose tree is not HEAD\'s, and anything that is not a commit', () => {
+  const { repo, base, o } = baseRepo();
+  repo.write('src/a.js', 'changed\n');
+  repo.commit('different tree');
+  assert.throws(() => treeFingerprint(o, { asHead: base }), GitError, 'a commit with another tree');
+  assert.throws(() => treeFingerprint(o, { asHead: 'f'.repeat(40) }), GitError, 'an unknown object');
+  assert.throws(() => treeFingerprint(o, { asHead: 'no-such-ref' }), GitError, 'an unknown ref');
+  assert.throws(() => treeFingerprint(o, { asHead: '--output=x' }), GitError, 'an option-looking value');
+  // HEAD's own tree id has the right tree (`<tree>^{tree}` is itself) but is not a commit
+  const tree = git(['rev-parse', 'HEAD^{tree}'], o).trim();
+  assert.throws(() => treeFingerprint(o, { asHead: tree }), GitError, 'a tree id is not a commit');
+});
+
 test('treeFingerprint hashes untracked bytes exactly (whitespace, CRLF, binary)', () => {
   const { repo, o } = baseRepo();
   repo.write('u.txt', 'a b\n');
