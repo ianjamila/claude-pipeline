@@ -140,7 +140,12 @@ test('(c) the review skill stays short and keeps every step review-complete depe
   for (const needle of [
     'review-complete', 'cost', '--from-transcript', 'Ready to merge', 'mark-implemented', 'ruling-request', 'owner-ruling',
     '## In plain English', 'triage validate', 'arbiter apply', 'codex-review', 'verify.quick',
+    // every stop books its cost and writes the agent log; a protected-area PR ends with the owner-merge command, not the Head/Ready lines
+    'P summary', 'agent-log publish', 'agentLogLine', 'merge.command', '--expect-head',
   ]) assert.ok(reviewSkill.includes(needle), `the review skill must mention ${needle}`);
+  for (const outcome of ['awaiting-owner-merge', 'needs-human', 'blocked', 'awaiting-review']) {
+    assert.match(reviewSkill, new RegExp(`outcome \`${outcome}\``), `the review skill must name the stop outcome ${outcome}`);
+  }
   assert.match(reviewSkill, /^name: review$/m);
   assert.match(reviewSkill, /Head <sha12> · items <digest> · repo <owner\/name>/);
 });
