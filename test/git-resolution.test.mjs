@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import {
   git, mergeBase, mergeTree, mergeTreeDetailed, effectiveReviewBase, resolutionReviewBase, ensureReviewBase, reviewPatch, revParse, ReviewBaseUnavailable,
 } from '../pipeline/lib/git.mjs';
-import { splitLines, interleave, parseConflictBlocks, checkSelection, makeBudget, sameMarkerShape, SearchCap, MAX_BLOCKS } from '../pipeline/lib/resolution.mjs';
+import { splitLines, interleave, parseConflictBlocks, checkSelection, makeBudget, SearchCap, MAX_BLOCKS } from '../pipeline/lib/resolution.mjs';
 import { run } from '../pipeline/lib/proc.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 
@@ -419,31 +419,125 @@ test('resolutionReviewBase: with clean hunks elsewhere, a typed line inside the 
   isNo(withCleanHunks('typed by hand'), 'not-selection');
 });
 
-test('resolutionReviewBase: a "=======" content line inside a side, next to clean hunks elsewhere, still parses (kept = marker-line)', () => {
+test('resolutionReviewBase: a "=======" content line inside a side, next to clean hunks elsewhere, skips the fast path and is ineligible, never eligible', () => {
   const lines = (l4a, l4b, l15, l25) => T('top', 'l2', 'l3', ...l4a, ...l4b, 'l5', 'l6', 'l7', 'l8', 'l9', 'l10', 'l11', 'l12', 'l13', 'l14', l15, 'l16', 'l17', 'l18', 'l19', 'l20', 'l21', 'l22', 'l23', 'l24', l25, 'bottom');
-  const s = conflictRepo({
-    base: { 'f.txt': lines(['x'], [], 'l15', 'l25') },
-    ours: { 'f.txt': lines(['o', '=======', 'o2'], [], 'l15', 'pr25') },
-    theirs: { 'f.txt': lines(['t'], [], 'main15', 'l25') },
-  });
-  const head = resolveMerge(s.repo, { 'f.txt': lines(['o', 'o2'], [], 'main15', 'pr25') });
-  isOk(decide(s, head));
-  const kept = conflictRepo({
-    base: { 'f.txt': lines(['x'], [], 'l15', 'l25') },
-    ours: { 'f.txt': lines(['o', '=======', 'o2'], [], 'l15', 'pr25') },
-    theirs: { 'f.txt': lines(['t'], [], 'main15', 'l25') },
-  });
-  isNo(decide(kept, resolveMerge(kept.repo, { 'f.txt': lines(['o', '=======', 'o2'], [], 'main15', 'pr25') })), 'marker-line');
+  const mk = (resolved) => {
+    const s = conflictRepo({
+      base: { 'f.txt': lines(['x'], [], 'l15', 'l25') },
+      ours: { 'f.txt': lines(['o', '=======', 'o2'], [], 'l15', 'pr25') },
+      theirs: { 'f.txt': lines(['t'], [], 'main15', 'l25') },
+    });
+    return decide(s, resolveMerge(s.repo, { 'f.txt': resolved }));
+  };
+  // The marker blob holds an extra "=======" line, so the fast path is skipped; the exact reconstruction parser cannot rebuild the
+  // stage blobs around the clean hunks, so the answer is "no parse" (a counted round, today's behaviour), never a wrong "eligible".
+  isNo(mk(lines(['o', 'o2'], [], 'main15', 'pr25')), 'parse');
+  isNo(mk(lines(['o', '=======', 'o2'], [], 'main15', 'pr25')), 'parse');
 });
 
-test('resolutionReviewBase: a merge-file that disagrees with the marker blob, or does not run, is ineligible merge-file-mismatch', () => {
-  const s = conflictRepo({ base: { 'f.txt': T('top', 'x', 'bottom') }, ours: { 'f.txt': T('top', 'o', 'bottom') }, theirs: { 'f.txt': T('top', 't', 'bottom') } });
-  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
-  const tamper = (fn) => ({ ...s, o: { ...s.o, run: (cmd, args, opts) => { const r = run(cmd, args, opts); return args.includes('merge-file') ? fn(r, args) : r; } } });
-  isOk(decide(tamper((r) => r), head));
-  isNo(decide(tamper((r, args) => (args.includes('--ours') || args.includes('--theirs') ? r : { ...r, stdout: r.stdout.replace('top', 'tip') })), head), 'merge-file-mismatch');
-  isNo(decide(tamper((r) => ({ ...r, code: 200 })), head), 'merge-file-mismatch');
-  isNo(decide(tamper((r) => ({ ...r, stderr: 'fatal: boom' })), head), 'merge-file-mismatch');
+// Two conflicts separated only by lines with no letter or digit in them (blank lines, closing braces; four or more of them, or git
+// folds the pair into one block anyway): merge-tree keeps TWO blocks, `git merge-file` folds them into ONE, so a check that
+// replayed the merge with merge-file would call the file a mismatch. The check reads merge-tree's own blob.
+for (const sep of [['', '', '', ''], ['}', '}', '}', '}'], ['', '}', '', '}', '']]) {
+  test(`resolutionReviewBase: two conflicts separated only by ${JSON.stringify(sep)} stay two blocks and a per-block selection is eligible`, () => {
+    const file = (a, b) => T('a', a, ...sep, b, 'b');
+    const mk = (resolved) => {
+      const s = conflictRepo({ base: { 'f.txt': file('x1', 'x2') }, ours: { 'f.txt': file('o1', 'o2') }, theirs: { 'f.txt': file('t1', 't2') } });
+      return decide(s, resolveMerge(s.repo, { 'f.txt': resolved }));
+    };
+    const r = mk(file('o1', 't2'));
+    isOk(r);
+    assert.equal(r.blockCount, 2);
+    isOk(mk(file('t1', 'o2')));
+    isNo(mk(file('typed', 'o2')), 'not-selection');
+  });
+}
+
+// Property test: random three-way merges over a small vocabulary with many repeated lines (the case that makes diff algorithms
+// disagree). Whenever merge-tree conflicts, head = the marker blob with every block replaced by its ours lines (and, in a second
+// run, by its theirs lines) must be a selection of the parsed blocks; every fifth conflicted case also goes through the whole
+// resolutionReviewBase. A deterministic generator keeps a failure reproducible. One repo, every commit written by two
+// `git fast-import` runs: spawning git is what costs time here.
+test('resolutionReviewBase: random conflicts over repeated lines are eligible when every block is resolved to ours / to theirs', () => {
+  let seed = 20261030;
+  const rnd = (n) => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return Math.floor((seed / 4294967296) * n);
+  };
+  const vocab = ['{', '}', '', 'return x;', 'if (a) {', 'foo();', 'bar();', 'x = 1;', '} else {', 'break;', 'i++;'];
+  const pick = () => vocab[rnd(vocab.length)];
+  const edit = (lines) => {
+    const out = lines.slice();
+    for (let n = 3 + rnd(6); n > 0; n--) {
+      const at = rnd(out.length);
+      const op = rnd(3);
+      if (op === 0) out.splice(at, 0, pick());
+      else if (op === 1 && out.length > 5) out.splice(at, 1);
+      else out[at] = pick();
+    }
+    return out;
+  };
+  const OPEN_RE = /^<{7} /; const SEP_RE = /^={7}$/; const CLOSE_RE = /^>{7} /;
+  const replaceBlocks = (marker, side) => {
+    const out = []; let part = 'out';
+    for (const line of marker.split('\n').slice(0, -1)) {
+      if (OPEN_RE.test(line)) part = 'ours';
+      else if (part === 'ours' && SEP_RE.test(line)) part = 'theirs';
+      else if (part === 'theirs' && CLOSE_RE.test(line)) part = 'out';
+      else if (part === 'out' || part === side) out.push(line);
+    }
+    return T(...out);
+  };
+  // one commit of a fast-import stream: ref, optional parents (a mark or a full sha), the content of f.txt
+  const stream = [];
+  const addCommit = (ref, parents, text) => {
+    stream.push(`commit ${ref}\ncommitter T <t@example.invalid> 1000000000 +0000\ndata 1\nx\n`);
+    parents.forEach((p, i) => stream.push(`${i === 0 ? 'from' : 'merge'} ${p}\n`));
+    stream.push(`M 100644 inline f.txt\ndata ${Buffer.byteLength(text)}\n${text}\n`);
+  };
+  const repo = createTmpRepo();
+  const o = { cwd: repo.dir };
+  const N = 60;
+  for (let i = 0; i < N; i++) {
+    const base = Array.from({ length: 20 + rnd(21) }, pick);
+    addCommit(`refs/cases/${i}/base`, [], T(...base));
+    addCommit(`refs/cases/${i}/ours`, [`refs/cases/${i}/base`], T(...edit(base)));
+    addCommit(`refs/cases/${i}/theirs`, [`refs/cases/${i}/base`], T(...edit(base)));
+  }
+  repo.git(['fast-import', '--quiet'], { input: stream.join('') });
+  const sha = Object.fromEntries(repo.git(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/cases']).trim().split('\n').map((l) => l.split(' ')));
+
+  const cases = [];
+  for (let i = 0; i < N; i++) {
+    const [from, tip] = [sha[`refs/cases/${i}/ours`], sha[`refs/cases/${i}/theirs`]];
+    const merged = mergeTreeDetailed(from, tip, o);
+    if (merged.clean) continue;
+    const [c] = merged.conflicts;
+    const [marker, s2, s3] = [`${merged.tree}:f.txt`, c.stages[2].oid, c.stages[3].oid].map((ref) => git(['cat-file', 'blob', ref], o));
+    cases.push({ i, from, tip, marker, s2, s3 });
+  }
+  assert.ok(cases.length >= 20, `only ${cases.length} of ${N} random merges conflicted`);
+
+  stream.length = 0;
+  for (const k of cases) for (const side of ['ours', 'theirs']) addCommit(`refs/heads/head-${k.i}-${side}`, [k.from, k.tip], replaceBlocks(k.marker, side));
+  repo.git(['fast-import', '--quiet'], { input: stream.join('') });
+  const heads = Object.fromEntries(repo.git(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads']).trim().split('\n').map((l) => l.split(' ')));
+  for (const k of cases) {
+    for (const side of ['ours', 'theirs']) {
+      const head = heads[`refs/heads/head-${k.i}-${side}`];
+      const resolved = replaceBlocks(k.marker, side);
+      const parsed = parseConflictBlocks(splitLines(k.marker), splitLines(k.s2), splitLines(k.s3));
+      assert.ok(!parsed.reason && parsed.blocks.length > 0, `case ${k.i}: ${JSON.stringify(parsed.reason)}\n${k.marker}`);
+      const sel = checkSelection(parsed, splitLines(resolved));
+      assert.ok(sel.ok, `case ${k.i} (${side}): ${JSON.stringify(sel)}\n${k.marker}`);
+      if (k.i % 5 === 0) {
+        repo.git(['update-ref', 'refs/heads/main', k.tip]);
+        const r = decide({ from: k.from, o }, head);
+        assert.ok(!r.ineligible, `case ${k.i} (${side}): ${JSON.stringify(r)}\n${k.marker}`);
+        assert.equal(r.blockCount, parsed.blocks.length);
+      }
+    }
+  }
 });
 
 test('resolutionReviewBase: the step budget turns into ineligible, never a throw', () => {
@@ -524,20 +618,6 @@ test('interleave: subsequence interleavings, order preserved, dropped count is t
   assert.deepEqual(interleave(l('a'), l('a'), l('a')), { ok: true, droppedTheirs: 1 });
 });
 
-test('sameMarkerShape: equal except the label text on the open / close marker lines', () => {
-  const l = (...x) => x.map((s) => `${s}\n`);
-  const m = l('top', '<<<<<<< 1111', 'o', '=======', 't', '>>>>>>> 2222', 'bottom');
-  assert.equal(sameMarkerShape(m, l('top', '<<<<<<< ours', 'o', '=======', 't', '>>>>>>> theirs', 'bottom')), true);
-  assert.equal(sameMarkerShape(m, m), true);
-  assert.equal(sameMarkerShape(m, l('top', '<<<<<<< ours', 'o', '=======', 'T', '>>>>>>> theirs', 'bottom')), false); // content differs
-  assert.equal(sameMarkerShape(m, l('top', '<<<<<<< ours', 'o', '=======', 't', 'bottom')), false); // length differs
-  assert.equal(sameMarkerShape(m, l('top', '>>>>>>> ours', 'o', '=======', 't', '<<<<<<< theirs', 'bottom')), false); // other marker kind
-  assert.equal(sameMarkerShape(m, l('top', '<<<<<<<', 'o', '=======', 't', '>>>>>>> theirs', 'bottom')), false); // not a marker line with a label
-  assert.equal(sameMarkerShape(l('<<<<<<< a'), ['<<<<<<< a\r\n']), false); // line ending differs
-  assert.equal(sameMarkerShape(['<<<<<<< a\r\n'], ['<<<<<<< b\r\n']), true);
-  assert.equal(sameMarkerShape(['plain\n'], ['plain']), false);
-});
-
 test('checkSelection / interleave: the budget is charged per line of work, so a block of ~20k lines is a verdict or a SearchCap within seconds', () => {
   const l = (x) => `${x}\n`;
   const n = 20_000;
@@ -588,6 +668,27 @@ test('parseConflictBlocks: 5000 blocks is "too-many-blocks" at once (no recursio
   };
   assert.deepEqual(parseConflictBlocks(...build(5000)), { reason: 'too-many-blocks' });
   assert.equal(parseConflictBlocks(...build(MAX_BLOCKS)).blocks.length, MAX_BLOCKS);
+});
+
+test('parseConflictBlocks fast path: clean hunks outside the blocks parse against the raw stage blobs; sides must be in-order runs of their blob', () => {
+  const l = (...x) => x.map((s) => `${s}\n`);
+  // M holds clean hunks (m1 from main, p1 from the PR) that are in neither stage blob as they are; both blocks are runs of S2 / S3.
+  const M = l('top', 'm1', '<<<<<<< a', 'o1', 'o2', '=======', 't1', '>>>>>>> b', 'mid', '<<<<<<< a', 'o3', '=======', '>>>>>>> b', 'p1', 'bottom');
+  const S2 = l('top', 'o0', 'o1', 'o2', 'mid', 'o3', 'bottom');
+  const S3 = l('top', 'm0', 't1', 'mid', 'bottom');
+  const p = parseConflictBlocks(M, S2, S3);
+  assert.deepEqual(p.blocks, [{ ours: l('o1', 'o2'), theirs: l('t1') }, { ours: l('o3'), theirs: [] }]);
+  assert.deepEqual(p.outsides, [l('top', 'm1'), l('mid'), l('p1', 'bottom')]);
+  // a side line that is not in its blob (or only out of order) is not a fast-path parse: it falls back to the exact parser, which fails here
+  assert.deepEqual(parseConflictBlocks(M, l('top', 'o0', 'o1', 'mid', 'o3', 'bottom'), S3), { reason: 'no-parse' });
+  assert.deepEqual(parseConflictBlocks(M, l('top', 'o3', 'o1', 'o2', 'mid', 'bottom'), S3), { reason: 'no-parse' });
+  // any other marker-shaped line anywhere skips the fast path
+  const extra = l('top', 'm1', '<<<<<<< a', 'o1', '=======', '=======', 't1', '>>>>>>> b', 'bottom');
+  assert.deepEqual(parseConflictBlocks(extra, l('top', 'o1', '=======', 'bottom'), l('top', 't1', 'bottom')), { reason: 'no-parse' });
+  assert.deepEqual(parseConflictBlocks(l('<<<<<<< a', 'o', '||||||| base', 'x', '=======', 't', '>>>>>>> b'), l('o'), l('t')), { reason: 'no-parse' });
+  // git's added newline: a side blob without a final newline; the block's own line is the blob's bytes
+  const e = parseConflictBlocks(l('top', '<<<<<<< a', 'o', '=======', 't', '>>>>>>> b', 'm9'), [...l('top', 'x'), 'o'], l('top', 't', 'z'));
+  assert.deepEqual(e.blocks, [{ ours: ['o'], theirs: l('t') }]);
 });
 
 test('parseConflictBlocks: no markers is zero blocks (a conflicted file without a block is ineligible upstream); a stage mismatch is no parse', () => {

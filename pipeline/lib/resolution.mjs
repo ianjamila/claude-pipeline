@@ -1,9 +1,8 @@
 // Text-level half of "was this merge conflict resolved only by SELECTING lines the two sides already had?" (the git half is
 // git.mjs#resolutionReviewBase). Pure functions, no git: they take blob text and answer yes / no / "cannot tell".
 //
-// The inputs are three texts of one conflicted file: the marker blob (git's trial merge with conflict markers left in,
-// merge style: no base section), the same merge with every conflict resolved to `ours` and again to `theirs` (`git merge-file
-// --ours / --theirs`: unlike the raw stage blobs, those keep the clean hunks git auto-merged from one side), and the resolved
+// The inputs are three blobs of one conflicted file: the marker blob (git's trial merge with conflict markers left in,
+// merge style: no base section), the two sides' blobs (stages 2 and 3 of that merge), and the resolved
 // file from the branch head. Everything is compared as byte-exact lines that KEEP their terminators ("a\r\n" and "a\n" are different lines, a
 // last line without "\n" keeps its missing terminator), so an editor that rewrites EOLs, trailing spaces or a final newline
 // makes the answer "no". Any doubt is "no": the caller treats it as a counted whole-PR round, which is today's behaviour.
@@ -52,22 +51,78 @@ const CLOSE = /^>{7} [^\r\n]*\r?\n$/;
 const MARKER_LIKE = /^(?:(?:<{7}|>{7}|\|{7})(?: [^\r\n]*)?|={7})\r?\n?$/;
 export const isMarkerLine = (line) => MARKER_LIKE.test(line);
 
-// Do two marker texts (lines, terminators kept) agree byte for byte except for the label text on the `<<<<<<< ` and
-// `>>>>>>> ` lines? Labels are compared by shape only (a marker line, with the same line ending): merge-tree writes commit ids,
-// `git merge-file` writes whatever -L said. Anything else that differs is a different merge.
-export function sameMarkerShape(a, b) {
-  if (a.length !== b.length) return false;
-  const eol = (line) => (line.endsWith('\r\n') ? '\r\n' : line.endsWith('\n') ? '\n' : '');
-  return a.every((line, i) => line === b[i] || (((OPEN.test(line) && OPEN.test(b[i])) || (CLOSE.test(line) && CLOSE.test(b[i]))) && line.slice(0, 7) === b[i].slice(0, 7) && eol(line) === eol(b[i])));
+// Splits M (marker blob lines) into the lines outside the conflict blocks and the two sides of each block, against S2 / S3 (the
+// sides' blobs, stages 2 and 3 of the merge). Two ways, tried in this order:
+//
+// 1. FAST PATH, for the usual file (and the only one that copes with clean hunks). git writes M from S2 and S3 under a forced
+//    merge config: outside the blocks it holds the lines both sides agree on AND the hunks it auto-merged from one side only, so
+//    the outside lines of M are not the lines of S2 or S3 and cannot be compared with them. Instead: if every marker-shaped line
+//    of M is an exact opening / `=======` / closing line and they come as (open sep close)+ in order, then no content line of M is
+//    marker-shaped, so the split into blocks is unique and nothing about it needs guessing. Each side of each block is then PROVEN
+//    to come from its blob: its lines occur as one contiguous run of S2 (S3), and the runs of successive blocks follow one
+//    another in order (earliest match, searched on from the end of the previous run). Outside lines are not compared with S2 / S3
+//    here: they are git's own merge output, and checkSelection requires the branch head to repeat them exactly. Any marker-shaped
+//    line that is not part of that sequence (a `=======` content line, a `|||||||` line, an unterminated marker) or any run that
+//    is not found skips the fast path.
+// 2. EXACT RECONSTRUCTION, for everything else, and for a file without clean hunks: outside lines must be equal in M, S2 and S3;
+//    between an opening marker and `=======` the lines must be the next lines of S2, between `=======` and the closing marker
+//    the next lines of S3. That reconstruction check is what settles a "=======" line that is content: only a split that rebuilds
+//    BOTH side blobs byte for byte is a parse. (With clean hunks in the file it finds no parse, which is a counted round.)
+// When a side's blob ends without a newline, git writes one before the next marker; that single added "\n" is accepted on the
+// side's last line and the blob's own bytes are what the side's line is.
+// The budget is charged for the scan of M and for every position and line the run search looks at.
+// -> { outsides: [lines[]] (blocks + 1 of them), blocks: [{ ours: lines[], theirs: lines[] }] } | { reason: 'no-parse' | 'ambiguous' | 'too-many-blocks' }
+// The fast path (see parseConflictBlocks). -> { outsides, blocks } | null (not applicable: use the exact parser)
+function fastSplit(M, S2, S3, tick) {
+  tick(M.length + 1);
+  const spans = []; // [openIndex, sepIndex, closeIndex] per block
+  let open = -1;
+  let sep = -1;
+  for (let i = 0; i < M.length; i++) {
+    const line = M[i];
+    if (!isMarkerLine(line)) continue;
+    if (open < 0 && OPEN.test(line)) open = i;
+    else if (open >= 0 && sep < 0 && SEP.test(line)) sep = i;
+    else if (sep >= 0 && CLOSE.test(line)) { spans.push([open, sep, i]); open = -1; sep = -1; }
+    else return null;
+  }
+  if (open >= 0 || spans.length === 0) return null;
+
+  // The first run of lines `seg` in S at or after `from` (the missing-final-newline rule applies at the blob's last line), as the
+  // blob's own lines; null when there is none. -> { at, lines }
+  const run = (seg, S, from) => {
+    for (let q = from; q + seg.length <= S.length; q++) {
+      tick();
+      let i = 0;
+      for (; i < seg.length; i++) {
+        const want = S[q + i];
+        if (seg[i] === want) continue;
+        const last = q + i === S.length - 1;
+        if (!(last && i === seg.length - 1 && !want.endsWith('\n') && seg[i] === `${want}\n`)) break;
+      }
+      tick(i);
+      if (i === seg.length) return { at: q + seg.length, lines: S.slice(q, q + seg.length) };
+    }
+    return null;
+  };
+
+  const outsides = [M.slice(0, spans[0][0])];
+  const blocks = [];
+  let p2 = 0;
+  let p3 = 0;
+  for (let b = 0; b < spans.length; b++) {
+    const [o, e, c] = spans[b];
+    const ours = run(M.slice(o + 1, e), S2, p2);
+    const theirs = run(M.slice(e + 1, c), S3, p3);
+    if (!ours || !theirs) return null;
+    p2 = ours.at;
+    p3 = theirs.at;
+    blocks.push({ ours: ours.lines, theirs: theirs.lines });
+    outsides.push(M.slice(c + 1, b + 1 < spans.length ? spans[b + 1][0] : M.length));
+  }
+  return { outsides, blocks };
 }
 
-// Walks M (marker blob lines) against S2 / S3, the favor-ours / favor-theirs merges of the same file (M with every conflict block
-// replaced by its ours / theirs side; the raw stage blobs would do for a file without clean auto-merged hunks, but not
-// otherwise). Outside lines must be equal in M, S2 and S3; between an opening marker and `=======` the lines must be the next
-// lines of S2, between `=======` and the closing marker the next lines of S3. That reconstruction check is what settles a "=======" line that is content: only a split that rebuilds BOTH
-// side texts byte for byte is a parse. When a side's text ends without a newline, git writes one before the next marker; that
-// single added "\n" is accepted on the side's last line and the text's own bytes are what the side's line is.
-// -> { outsides: [lines[]] (blocks + 1 of them), blocks: [{ ours: lines[], theirs: lines[] }] } | { reason: 'no-parse' | 'ambiguous' | 'too-many-blocks' }
 export function parseConflictBlocks(markerLines, stage2Lines, stage3Lines, tick = makeBudget()) {
   const M = markerLines;
   const S2 = stage2Lines;
@@ -94,6 +149,8 @@ export function parseConflictBlocks(markerLines, stage2Lines, stage3Lines, tick 
   };
 
   if (M.reduce((n, l) => n + (OPEN.test(l) ? 1 : 0), 0) > MAX_BLOCKS) return { reason: 'too-many-blocks' };
+  const fastParse = fastSplit(M, S2, S3, tick);
+  if (fastParse) return fastParse;
 
   const go = (mi, p2, p3) => {
     let pushed = 0;

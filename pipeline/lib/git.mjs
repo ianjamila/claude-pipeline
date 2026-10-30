@@ -8,12 +8,11 @@
 // Reads go through proc.run, so output is decoded as UTF-8: invalid UTF-8 inside a diffed text-looking file is not
 // byte-exact (binary files are: --binary emits ASCII).
 import { createHash } from 'node:crypto';
-import { openSync, readSync, closeSync, lstatSync, readlinkSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { openSync, readSync, closeSync, lstatSync, readlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { run } from './proc.mjs';
 import { parseUnifiedDiff } from './diff.mjs';
-import { MAX_BLOCKS, SearchCap, checkSelection, makeBudget, parseConflictBlocks, sameMarkerShape, splitLines } from './resolution.mjs';
+import { MAX_BLOCKS, SearchCap, checkSelection, makeBudget, parseConflictBlocks, splitLines } from './resolution.mjs';
 
 // Upper bound for a git call that talks to a remote (fetch, push, ls-remote): a hung one inside a lock cannot be reclaimed.
 export const NETWORK_TIMEOUT_MS = 120_000;
@@ -261,16 +260,6 @@ function historyProblem({ from, head, baseRef }, o) {
   return null;
 }
 
-// `git merge-file -p` over three files (ours, base, theirs), with the pinned merge config. Its exit status is the number of
-// conflicts (0..127, capped), so a non-zero status is normal; a status past 127, or anything on stderr, is a failed run.
-// -> the merged text, or null when it did not run.
-function mergeFileText(extra, files, o) {
-  const args = [...MERGE_CONFIG, 'merge-file', '-p', ...extra, '-L', 'ours', '-L', 'base', '-L', 'theirs', ...files];
-  const r = exec(args, o);
-  if (r.code < 0 || r.code > 127 || (r.stderr ?? '').trim() !== '') return null;
-  return r.stdout;
-}
-
 const catBlob = (ref, o) => git(['cat-file', 'blob', assertRef(ref, ['cat-file', 'blob', ref])], o);
 
 function resolutionChecks({ from, forkPoint, head, baseRef }, o) {
@@ -316,48 +305,28 @@ function resolutionChecks({ from, forkPoint, head, baseRef }, o) {
     if (ch.newMode !== c.stages[2].mode || ch.oldMode !== c.stages[2].mode) throw fail('conflict-mode', `${c.path} is ${ch.newMode} in head`);
   }
 
-  // 2d: per file, every block resolved by selecting lines of its two sides.
-  // The marker blob may hold clean hunks git auto-merged from one side next to its conflict blocks, so the stage blobs cannot be
-  // compared with it line by line outside the blocks. `git merge-file` redoes the same three-way merge from the stage blobs:
-  // its marker output must be the marker blob (labels aside), and its --ours / --theirs variants are the marker blob with every
-  // block replaced by one side, which is what the parser walks. The blobs go to a private temp dir as exact bytes.
+  // 2d: per file, every block resolved by selecting lines of its two sides. The marker blob may hold clean hunks git auto-merged
+  // from one side next to its conflict blocks; parseConflictBlocks (resolution.mjs) proves each block's sides are runs of the
+  // stage blobs and checkSelection holds the resolution to the marker blob's own lines outside the blocks.
   const tick = makeBudget(o?.resolutionSearchBudget);
   const blocks = [];
-  const dir = mkdtempSync(join(tmpdir(), 'resolution-'));
-  try {
-    for (const c of merged.conflicts) {
-      const [s1, s2, s3] = [1, 2, 3].map((n) => catBlob(c.stages[n].oid, o));
-      const marker = catBlob(`${merged.tree}:${c.path}`, o);
-      const resolved = catBlob(`${headFull}:${c.path}`, o);
-      for (const [name, text] of [['base', s1], ['ours', s2], ['theirs', s3], ['marker', marker], ['head', resolved]]) {
-        if (text.includes('\0')) throw fail('conflict-nul', `${c.path} (${name}) contains a NUL byte`);
-        // proc.run decodes UTF-8: invalid bytes would compare equal after the decode, so they are not byte-exact.
-        if (text.includes('\uFFFD')) throw fail('non-utf8', `${c.path} (${name}) is not valid UTF-8`);
-      }
-      const files = [s2, s1, s3].map((text, i) => {
-        const file = join(dir, `${['ours', 'base', 'theirs'][i]}.blob`);
-        writeFileSync(file, Buffer.from(text, 'utf8'));
-        return file;
-      });
-      const redone = mergeFileText([], files, o);
-      if (redone === null || !sameMarkerShape(splitLines(marker), splitLines(redone))) throw fail('merge-file-mismatch', c.path);
-      const favorOurs = mergeFileText(['--ours'], files, o);
-      const favorTheirs = mergeFileText(['--theirs'], files, o);
-      if (favorOurs === null || favorTheirs === null) throw fail('merge-file-mismatch', c.path);
-      for (const [name, text] of [['favor-ours', favorOurs], ['favor-theirs', favorTheirs]]) {
-        if (text.includes('\0') || text.includes('\uFFFD')) throw fail('merge-file-mismatch', `${c.path} (${name})`);
-      }
-      const parsed = parseConflictBlocks(splitLines(marker), splitLines(favorOurs), splitLines(favorTheirs), tick);
-      if (parsed.reason === 'too-many-blocks') throw fail('too-many-blocks', `${c.path} has more than ${MAX_BLOCKS} conflict blocks`);
-      if (parsed.reason) throw fail(parsed.reason === 'ambiguous' ? 'parse-ambiguous' : 'parse', c.path);
-      if (parsed.blocks.length === 0) throw fail('no-blocks', `${c.path} has no conflict block`);
-      const sel = checkSelection(parsed, splitLines(resolved), tick);
-      if (!sel.ok) throw fail(sel.reason, c.path);
-      sel.droppedTheirs.forEach((droppedTheirs, i) => blocks.push({ path: c.path, block: i + 1, droppedTheirs }));
-      if (blocks.length > MAX_BLOCKS) throw fail('too-many-blocks', `more than ${MAX_BLOCKS} conflict blocks in all`);
+  for (const c of merged.conflicts) {
+    const [s1, s2, s3] = [1, 2, 3].map((n) => catBlob(c.stages[n].oid, o));
+    const marker = catBlob(`${merged.tree}:${c.path}`, o);
+    const resolved = catBlob(`${headFull}:${c.path}`, o);
+    for (const [name, text] of [['base', s1], ['ours', s2], ['theirs', s3], ['marker', marker], ['head', resolved]]) {
+      if (text.includes('\0')) throw fail('conflict-nul', `${c.path} (${name}) contains a NUL byte`);
+      // proc.run decodes UTF-8: invalid bytes would compare equal after the decode, so they are not byte-exact.
+      if (text.includes('\uFFFD')) throw fail('non-utf8', `${c.path} (${name}) is not valid UTF-8`);
     }
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+    const parsed = parseConflictBlocks(splitLines(marker), splitLines(s2), splitLines(s3), tick);
+    if (parsed.reason === 'too-many-blocks') throw fail('too-many-blocks', `${c.path} has more than ${MAX_BLOCKS} conflict blocks`);
+    if (parsed.reason) throw fail(parsed.reason === 'ambiguous' ? 'parse-ambiguous' : 'parse', c.path);
+    if (parsed.blocks.length === 0) throw fail('no-blocks', `${c.path} has no conflict block`);
+    const sel = checkSelection(parsed, splitLines(resolved), tick);
+    if (!sel.ok) throw fail(sel.reason, c.path);
+    sel.droppedTheirs.forEach((droppedTheirs, i) => blocks.push({ path: c.path, block: i + 1, droppedTheirs }));
+    if (blocks.length > MAX_BLOCKS) throw fail('too-many-blocks', `more than ${MAX_BLOCKS} conflict blocks in all`);
   }
   // Totals over EVERY block: a caller that shows or stores only some of them must not derive "dropped nothing" from its slice.
   const withDrops = blocks.filter((b) => b.droppedTheirs > 0);
