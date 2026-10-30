@@ -92,3 +92,4 @@ full record.
 - 2026-10-30 · #123 · feat(worktrees): prune keeps a worktree an open Claude session is in, however long it has been idle · risk high · rounds 2 · arbiter 1 · merged
 - 2026-10-30 · #124 · perf(hooks): stack-register and stack-dev-bind decide cheaply before loading the stack libraries · risk high · rounds 2 · arbiter 0 · merged
 - 2026-10-30 · #129 · feat(stacks): an open Claude session keeps its stack at session-end and in the sweep · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge
+- 2026-10-30 · #129 · feat(stacks): an open Claude session keeps its stack at session-end and in the sweep · risk high · rounds 1 · arbiter 1 · merged
