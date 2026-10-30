@@ -11,6 +11,9 @@ const ROOTS = ['pipeline', 'scripts', 'test', 'install.mjs', '.github/scripts'];
 // pipeline/templates holds files copied into other repos; their imports resolve against that layout, not this tree.
 const SKIP_DIRS = new Set(['node_modules', '.git', 'templates']);
 
+// A specifier that resolves to a directory does not load either, so only a file counts.
+const isFile = (p) => existsSync(p) && statSync(p).isFile();
+
 function collect(p, out) {
   if (!existsSync(p)) return out;
   const st = statSync(p);
@@ -89,7 +92,7 @@ test('every relative import in pipeline/, scripts/, test/, install.mjs and .gith
   const dangling = [];
   for (const file of files) {
     for (const spec of relativeSpecifiers(readFileSync(file, 'utf8'))) {
-      if (!existsSync(resolve(dirname(file), spec))) dangling.push(`${relative(root, file)} imports ${spec}`);
+      if (!isFile(resolve(dirname(file), spec))) dangling.push(`${relative(root, file)} imports ${spec}`);
     }
   }
   assert.deepEqual(dangling, [], `dangling relative imports:\n${dangling.join('\n')}`);

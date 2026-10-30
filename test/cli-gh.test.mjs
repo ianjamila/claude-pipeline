@@ -347,22 +347,6 @@ test('comment: bad arguments are usage errors, a gh failure is exit 3', () => {
   assertExit(cli(['comment', '--pr', '4', '--kind', 'triage'], { repo, fake: createFakeGh([{ match: '.', code: 1, stderr: 'HTTP 500' }]) }), 3);
 });
 
-// ---- resume ---------------------------------------------------------------------------------
-
-test('resume list: open PRs labelled awaiting-review, each with a why', () => {
-  const fake = createFakeGh([REPO, ME, {
-    match: 'graphql[\\s\\S]*states: OPEN',
-    stdoutJson: { data: { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{
-      number: 5, title: 'Add widget', headRefName: 'feat/widget', headRefOid: 'a'.repeat(40), baseRefName: 'main', url: 'https://github.com/acme/widgets/pull/5',
-      labels: { nodes: [{ name: 'awaiting-review' }] }, commits: { nodes: [] },
-    }] } } } },
-  }]);
-  const r = cli(['resume', 'list'], { repo: repoWith(), fake });
-  assertExit(r, 0);
-  assert.deepEqual(r.json, { ok: true, prs: [{ number: 5, title: 'Add widget', headRefName: 'feat/widget', url: 'https://github.com/acme/widgets/pull/5', why: 'awaiting a cross-model review (label awaiting-review)' }] });
-  assertExit(cli(['resume'], { repo: repoWith(), fake }), 2);
-});
-
 // ---- protect --------------------------------------------------------------------------------
 
 const PROTECTION_PAYLOAD = {

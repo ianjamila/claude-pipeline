@@ -40,33 +40,6 @@ export function parseEvent(body) {
   }
 }
 
-// The viewer's events, oldest comment first. `comments` is the full (paginated) list.
-export function listEvents(comments, viewerLogin) {
-  return comments
-    .filter((c) => c?.user?.login === viewerLogin)
-    .map((c) => ({ c, event: parseEvent(c.body) }))
-    .filter((x) => x.event)
-    .sort((a, b) => Number(a.c.id) - Number(b.c.id))
-    .map(({ c, event }) => ({ commentId: c.id, url: c.html_url ?? null, ...event }));
-}
-
-// Rollback attempts whose `rollback-intent` has no `rollback-result` OF THE SAME ID (attempts are `<sha7>-<n>`, so an
-// earlier attempt's result never closes a later attempt's intent). Oldest first. `mergeSha` narrows to one merge; an
-// event whose payload cannot be read still counts, because it may be this merge's.
-export function unresolvedRollbacks(events, { mergeSha = null } = {}) {
-  const forMerge = (e) => !mergeSha || e.dataStatus !== 'ok' || e.data?.mergeSha === mergeSha;
-  const done = new Set((events ?? []).filter((e) => e.kind === 'rollback-result' && forMerge(e)).map((e) => String(e.id)));
-  return (events ?? []).filter((e) => e.kind === 'rollback-intent' && forMerge(e) && !done.has(String(e.id)));
-}
-
-// The `rollback-result` events of THIS merge, oldest first: attempts whose outcome was recorded. A result whose payload
-// cannot be read is left out (it cannot be shown to belong to this merge, nor say how the attempt ended).
-export function resolvedRollbacks(events, { mergeSha = null } = {}) {
-  return (events ?? []).filter((e) => e.kind === 'rollback-result' && e.dataStatus === 'ok' && (!mergeSha || e.data?.mergeSha === mergeSha));
-}
-
-export const readEvents = (gh, pr) => listEvents(gh.listComments(pr), gh.viewer());
-
 // Always a new comment: this never calls upsertComment, so a second event can never rewrite a first one.
 export function postEvent(gh, pr, kind, id, sentence, data) {
   return gh.createComment(pr, renderEvent(kind, id, sentence, data));

@@ -1081,7 +1081,7 @@ test('contentHash and diffFiles stay byte-stable between commits whatever the us
   assert.deepEqual(diffFiles('main', 'feat', o).map((f) => f.path), ['src/a.js']);
 });
 
-// A diff past the old 64 MiB output cap (a real 174 MB PR diff killed git with SIGKILL, which broke the gate and the inbox).
+// A diff past the old 64 MiB output cap (a real 174 MB PR diff killed git with SIGKILL, which broke the gate).
 test('contentHash: a diff larger than 64 MiB still hashes, to exactly the sha256 of the normalised diff text', () => {
   const { repo, o } = baseRepo();
   repo.branch('big');
