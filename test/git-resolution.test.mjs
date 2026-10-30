@@ -71,7 +71,8 @@ test('mergeTreeDetailed: a content conflict lists its three stages and the liter
 });
 
 test('mergeTreeDetailed: several files, paths with spaces and newlines, a clean merge, and the old mergeTree keeps working', () => {
-  const names = ['dir/one.txt', 'sp ace.txt', 'new\nline.txt'];
+  // Windows file names cannot contain a newline; the -z parsing of one is covered on the other platforms.
+  const names = ['dir/one.txt', 'sp ace.txt', ...(process.platform === 'win32' ? [] : ['new\nline.txt'])];
   const files = (v) => Object.fromEntries(names.map((n) => [n, T(v)]));
   const s = conflictRepo({ base: files('x'), ours: files('o'), theirs: files('t') });
   const d = mergeTreeDetailed(s.from, 'main', s.o);
