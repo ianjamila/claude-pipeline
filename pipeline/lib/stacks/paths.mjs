@@ -5,7 +5,7 @@
 import path from 'node:path';
 import os from 'node:os';
 import { expandHome, canonicalPath, samePath } from '../paths.mjs';
-import { seamValue } from '../proc.mjs';
+import { seamValue } from '../seams.mjs';
 
 export class StacksIsolationError extends Error {
   constructor(message) {

@@ -9,8 +9,10 @@ import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, re
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { register, readTailLines, resolveSeams, DEFAULT_DEADLINE_MS } from '../pipeline/lib/stacks/register.mjs';
+import { registerCanSkip, registerFastSkip } from '../pipeline/lib/stacks/fastpath.mjs';
+import { devTargets } from '../pipeline/lib/stacks/match.mjs';
 import { stackFiles, lockDirs } from '../pipeline/lib/stacks/paths.mjs';
 import { parseLstart } from '../pipeline/lib/stacks/identity.mjs';
 import { ok, unknown } from '../pipeline/lib/stacks/result.mjs';
@@ -27,6 +29,7 @@ const FAKE_DOCKER = join(here, 'fixtures', 'fake-docker-bin.mjs');
 const FAKE_PS = join(here, 'fixtures', 'fake-ps-bin.mjs');
 const SPY = join(here, 'fixtures', 'fs-spy-preload.mjs');
 const CPU_PROBE = join(here, 'fixtures', 'cpu-probe-preload.mjs');
+const RESOLVE_SPY = join(here, 'fixtures', 'resolve-spy-preload.mjs');
 const HOLD = join(here, 'fixtures', 'hold-lock.mjs');
 const LSTART = 'Mon Oct 19 02:47:17 2026';
 const OWNER = { pid: 4242, birth: 1000 };
@@ -752,4 +755,293 @@ test('e2e Review Focus 3: a 100 000-line ledger is never read; unrelated and mat
   assert.ok(onLedger.every((o) => o.op === 'openSync' && o.flags === 'a'), `ledger opened other than for append: ${JSON.stringify(onLedger)}`);
   assert.ok(ops.length > 0, 'the spy saw the hook');
   assert.equal(lines(x.w.files.ledger).length, 100002);
+});
+
+// ---- the fast path (fastpath.mjs): the hook decides before it loads register.mjs ----
+// Contract: registerCanSkip may say `true` ONLY for a call register() would do nothing for. So every call register() takes past
+// its prefilter (a lease, a dev record, an exit 2, an inventory refresh) must get `false`, and a `true` must mean exit 0 with no
+// event and not one touch of the ledger, the locks, the owner lookup or the inventory refresh.
+
+// Every call shape the register tests use, plus the other things the prefilter and devTargets look at.
+function fastCases(w) {
+  const wd = w.wd('sa-corrections.stack');
+  const sub = w.wd('sub detach.stack');
+  const cases = [];
+  for (const [command, cwd] of table(w)) cases.push([`table: ${command}`, bash(command, cwd)]);
+  const commands = [
+    // harmless
+    'ls -la', 'git status', 'cat README.md | head -3', 'npm test', 'node scripts/verify.mjs --quick', 'echo hello', 'pwd', '', '   ', 'git log --oneline -5',
+    'grep -rn foo src/', 'curl https://example.com/api', 'echo 1234', 'rm -rf node_modules', 'npm run devtools', 'npm run develop', 'pnpm dev',
+    // supabase, psql, docker exec, ports, PG*= variables
+    'supabase status', 'npx supabase@latest db reset', 'echo $SUPABASE_URL', 'SUPABASE_ANON_KEY=x node a.js', 'PGPASSWORD=x psql -h h', 'PGPORT=54322 pg_dump db',
+    'psql -h localhost -p 54322', 'docker exec -i foo bash', 'docker   exec x ls', 'curl http://127.0.0.1:54321/rest/v1/x', 'curl localhost:3000', 'echo a:12345',
+    'cd ../foo.stack && ls', 'ls x.STACK', 'ls ../sa-corrections.stack',
+    // dev servers
+    'npm run dev', 'npm start', 'npm run start', 'next dev', 'next dev -p 4000', 'next start --port=4001', 'PORT=4017 npm run dev', 'cd app && npm run dev &',
+    'echo "next dev"', 'npm run dev && npm run dev -- -p 3001',
+    // names taken from the inventory (project, folder, container), in any case, and near misses
+    'echo sa-corrections', 'docker logs supabase_db_sa-corrections', 'docker ps --filter name=sa-corrections', 'ls "sub detach.stack"', 'echo SA-CORRECTIONS',
+    'echo sa-corrections2', 'echo xsa-corrections', 'cat sub detach', 'ls e2e-wt', 'echo e2e-ci', 'echo sub-detach',
+  ];
+  for (const command of commands) cases.push([`bash: ${JSON.stringify(command)}`, bash(command, w.base)]);
+  const paths = [
+    join(wd, 'supabase', 'config.toml'), wd, join(wd, 'migrations', '1.sql'), join(sub, 'x'), '/srv/app/supabase/migrations/1.sql', '/srv/app/foo.stack/a.txt',
+    '/srv/app/Foo.STACK/a.txt', 'supabase/config.toml', './x.stack/y', join(w.base, 'notes.md'), '/Users/x/proj/src/a.ts', '/Users/x/proj/supabase.md', '/Users/x/my.stack.md',
+  ];
+  for (const tool of ['Read', 'Edit', 'Write', 'Grep', 'Glob', 'NotebookEdit']) {
+    for (const p of paths) {
+      for (const key of ['file_path', 'path', 'notebook_path']) cases.push([`${tool} ${key}=${p}`, { tool_name: tool, tool_input: { [key]: p }, cwd: w.base, session_id: 's1', tool_use_id: 'tu2' }]);
+    }
+  }
+  for (const pattern of [`${wd}/**/*.ts`, '**/*.stack/**', 'supabase/**', '/srv/app/foo.stack/*', '**/*.ts', '*.stack', 'src/{a,b}/*.mjs']) {
+    cases.push([`Glob pattern=${pattern}`, { tool_name: 'Glob', tool_input: { pattern, path: '/srv/app' }, cwd: w.base, session_id: 's1' }]);
+    cases.push([`Grep pattern=${pattern}`, { tool_name: 'Grep', tool_input: { pattern, path: '/srv/app' }, cwd: w.base, session_id: 's1' }]);
+  }
+  const odd = [
+    { tool_name: 'WebFetch', tool_input: { url: 'http://localhost:54321' } }, { tool_name: 'Task', tool_input: { prompt: 'supabase' } }, { tool_name: 'mcp__x__y', tool_input: { command: 'supabase' } },
+    { tool_input: { command: 'supabase status' } }, { tool_name: 42, tool_input: { command: 'supabase status' } }, {}, { tool_name: 'Bash' }, { tool_name: 'Bash', tool_input: null },
+    { tool_name: 'Bash', tool_input: 'supabase status' }, { tool_name: 'Bash', tool_input: ['supabase status'] }, { tool_name: 'Bash', tool_input: { command: 42 } },
+    { tool_name: 'Bash', tool_input: { command: null } }, { tool_name: 'Bash', tool_input: { cmd: 'supabase status' } }, { tool_name: 'Read', tool_input: { file_path: 7 } },
+    { tool_name: 'Read', tool_input: null }, { tool_name: 'Edit', tool_input: { file_path: '' } }, { tool_name: 'bash', tool_input: { command: 'supabase status' } },
+  ];
+  odd.forEach((input, i) => cases.push([`odd #${i}: ${JSON.stringify(input)}`, { cwd: w.base, session_id: 's1', ...input }]));
+  return cases;
+}
+
+const inventoriesOf = (w) => [['the stacks', w.inv], ['no cache', null], ['no stacks', { dockerDown: false, stacks: [] }], ['docker down', { dockerDown: true, stacks: [] }]];
+
+// What register() does with the call: did it go past its prefilter (a refresh was needed, a record was written, or it blocked)?
+async function pastPrefilter(w, input, inv) {
+  const touched = [];
+  const r = await register(input, deps(w, { inventory: () => ({ inv, fresh: false }), refreshInventory: async () => { touched.push('refresh'); return ok(w.inv); } }));
+  return { r, past: touched.length > 0 || r.events.length > 0 || r.exit === 2 };
+}
+
+// deps whose every effect is recorded in `touched` AND throws, so a skipped call proves it reached none of them
+function untouchable(w, inv, touched) {
+  const trap = (name) => () => { touched.push(name); throw new Error(`${name} must not be touched`); };
+  return deps(w, {
+    inventory: () => ({ inv, fresh: false }),
+    owner: trap('owner'), worktree: trap('worktree'), appendEvent: trap('appendEvent'), acquire: trap('acquire'), release: trap('release'),
+    refreshInventory: trap('refreshInventory'), readTail: trap('readTail'), run: trap('run'), invalidateCache: trap('invalidateCache'), log: trap('log'),
+  });
+}
+
+test('fast path, register: every call register() takes past its prefilter (a lease, a dev record, an exit 2, a refresh) is NOT skippable', async () => {
+  const w = world();
+  let past = 0;
+  let total = 0;
+  for (const [label, inv] of inventoriesOf(w)) {
+    for (const [name, input] of fastCases(w)) {
+      const skip = registerCanSkip({ input, inventory: inv, platform: 'linux' });
+      const ran = await pastPrefilter(w, input, inv);
+      total++;
+      if (ran.past) past++;
+      if (ran.past) assert.equal(skip, false, `${label}: ${name}: register() went past its prefilter (exit ${ran.r.exit}, ${ran.r.events.length} events) but the fast path would skip it`);
+    }
+  }
+  // not vacuous: the table has plenty of calls on both sides
+  assert.ok(past > 150 && total - past > 150, `${past} of ${total} calls went past the prefilter`);
+});
+
+test('fast path, register: a call it skips gets exit 0 with no event and touches no ledger, lock, owner, worktree, log, docker or inventory refresh', async () => {
+  const w = world();
+  let skipped = 0;
+  for (const [label, inv] of inventoriesOf(w)) {
+    for (const [name, input] of fastCases(w)) {
+      if (!registerCanSkip({ input, inventory: inv, platform: 'linux' })) continue;
+      skipped++;
+      const touched = [];
+      const r = await register(input, untouchable(w, inv, touched));
+      assert.deepEqual(r, { exit: 0, events: [] }, `${label}: ${name}`);
+      assert.deepEqual(touched, [], `${label}: ${name}`);
+    }
+  }
+  assert.ok(skipped > 150, `${skipped} calls skipped`);
+  assert.equal(existsSync(w.root), false, 'a skipped call creates no state (no ledger, lock or log)');
+});
+
+test('fast path, register: the ordinary calls the cost model is about ARE skipped (so the fast path is not vacuous); stack and dev calls are not', () => {
+  const w = world();
+  for (const input of [
+    bash('ls -la', w.base), bash('git status', w.base), bash('npm test', w.base), bash('cat README.md', w.base), bash('', w.base),
+    fileTool('Read', '/Users/x/proj/src/a.ts'), fileTool('Edit', join(w.base, 'notes.md')), fileTool('Write', '/Users/x/proj/supabase.md'),
+    { tool_name: 'Glob', tool_input: { pattern: '**/*.ts', path: '/srv/app' } }, { tool_name: 'Grep', tool_input: { pattern: 'foo', path: '/srv/app' } },
+    { tool_name: 'WebFetch', tool_input: { url: 'https://example.com' } }, {},
+  ]) {
+    assert.equal(registerCanSkip({ input, inventory: w.inv, platform: 'linux' }), true, JSON.stringify(input));
+    assert.equal(registerCanSkip({ input, inventory: null, platform: 'linux' }), true, JSON.stringify(input));
+  }
+  for (const input of [
+    bash('npm run dev', w.base), bash('supabase status', w.base), bash('docker exec x ls', w.base), bash('curl localhost:54321', w.base), bash('PGPORT=1 psql', w.base),
+    bash('echo sa-corrections', w.base), fileTool('Read', join(w.wd('sa-corrections.stack'), 'supabase', 'config.toml')), fileTool('Edit', '/srv/app/foo.stack/a'),
+    { tool_name: 'Glob', tool_input: { pattern: 'supabase/**' } },
+  ]) {
+    assert.equal(registerCanSkip({ input, inventory: w.inv, platform: 'linux' }), false, JSON.stringify(input));
+  }
+});
+
+test('fast path, register: registerFastSkip reads the cache register() reads, stale or not; a missing or corrupt cache is "no inventory", as there', async () => {
+  const w = world();
+  mkdirSync(w.root, { recursive: true });
+  const env = { PIPELINE_STACKS_HOME: w.root };
+  const named = bash('echo sa-corrections', w.base); // only the inventory knows this names a stack
+  const plain = bash('ls -la', w.base);
+  const cacheStates = [
+    ['stale cache', () => writeFileSync(w.files.cache, JSON.stringify({ writtenAt: Date.now() - 3600 * 1000, inventory: w.inv })), false],
+    ['fresh cache', () => writeFileSync(w.files.cache, JSON.stringify({ writtenAt: Date.now(), inventory: w.inv })), false],
+    ['cache from the future', () => writeFileSync(w.files.cache, JSON.stringify({ writtenAt: Date.now() + 3600 * 1000, inventory: w.inv })), false],
+    ['no cache', () => fs.rmSync(w.files.cache, { force: true }), true],
+    ['corrupt cache', () => writeFileSync(w.files.cache, '{"writtenAt": 1, "inventory": '), true],
+    ['cache without stacks', () => writeFileSync(w.files.cache, JSON.stringify({ writtenAt: Date.now(), inventory: { dockerDown: false } })), true],
+  ];
+  for (const [state, setUp, skips] of cacheStates) {
+    setUp();
+    assert.equal(registerFastSkip({ input: named, env, home: w.base, platform: 'linux' }), skips, state);
+    assert.equal(registerFastSkip({ input: plain, env, home: w.base, platform: 'linux' }), true, state);
+    // register() with its own cache read (no injected inventory) agrees: it goes past the prefilter exactly when the fast path does not skip
+    const touched = [];
+    const r = await register(named, deps(w, { inventory: undefined, refreshInventory: async () => { touched.push('refresh'); return ok(w.inv); } }));
+    assert.equal(touched.length > 0 || r.events.length > 0 || r.exit === 2, !skips, state);
+  }
+  // the default root, no PIPELINE_STACKS_HOME: the cache under <home>/.claude/pipeline-state/stacks
+  const defaultRoot = join(w.base, '.claude', 'pipeline-state', 'stacks');
+  mkdirSync(defaultRoot, { recursive: true });
+  writeFileSync(join(defaultRoot, 'inventory.json'), JSON.stringify({ writtenAt: Date.now() - 7200 * 1000, inventory: w.inv }));
+  assert.equal(registerFastSkip({ input: named, env: {}, home: w.base, platform: 'linux' }), false);
+  assert.equal(registerFastSkip({ input: named, env: { PIPELINE_STACKS_HOME: join(w.base, 'other') }, home: w.base, platform: 'linux' }), true);
+});
+
+// ---- the fast path in the real hook ----
+const spyOf = (x) => join(x.dir, 'resolve.log');
+const loadedBy = (file) => new Set(existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((u) => u.split('/').pop()) : []);
+// proc.mjs and node:child_process are on the list too: the fast path must not even start a process-spawning module
+const HEAVY_LIBS = ['register.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs', 'inventory.mjs', 'config.mjs', 'claude-ancestry.mjs', 'dev.mjs', 'proc.mjs', 'node:child_process'];
+const spied = (x, extraEnv = {}) => ({ nodeArgs: ['--import', RESOLVE_SPY], extraEnv: { RESOLVE_SPY_LOG: spyOf(x), ...extraEnv } });
+
+test('e2e fast path: an ordinary Bash call and an ordinary file read exit 0 without loading register.mjs, the locks, the ledger, identity or the inventory', posixOnly, () => {
+  for (const [name, mk] of [
+    ['ls -la', (x) => bash('ls -la', x.w.base)],
+    ['git status', (x) => bash('git status', x.w.base)],
+    ['Read of an ordinary file', (x) => fileTool('Read', join(x.w.base, 'notes.md'))],
+    ['Edit of an ordinary file', (x) => fileTool('Edit', '/Users/x/proj/src/a.ts')],
+  ]) {
+    const x = e2e();
+    const r = x.hook(mk(x), spied(x));
+    assert.equal(r.status, 0, `${name}: ${r.stderr}`);
+    assert.equal(r.stderr, '', name);
+    const loaded = loadedBy(spyOf(x));
+    assert.ok(loaded.has('fastpath.mjs'), `${name}: the fast path ran`);
+    for (const lib of HEAVY_LIBS) assert.equal(loaded.has(lib), false, `${name}: ${lib} must not be loaded`);
+    assert.equal(existsSync(x.w.files.ledger), false, name);
+    assert.equal(x.calls('docker.log') + x.calls('ps.log'), 0, name);
+  }
+});
+
+test('e2e fast path: a call that names a stack or starts a dev server DOES load register.mjs and its libraries, and is registered as before', posixOnly, () => {
+  const stack = e2e();
+  const s = stack.hook(bash(`supabase status --workdir ${stack.sa.workdir}`, stack.w.base), spied(stack));
+  assert.equal(s.status, 0, s.stderr);
+  for (const lib of ['fastpath.mjs', 'register.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs', 'inventory.mjs', 'proc.mjs', 'node:child_process']) assert.ok(loadedBy(spyOf(stack)).has(lib), `supabase status: ${lib} must be loaded`);
+  assert.deepEqual(lines(stack.w.files.ledger).map((e) => [e.kind, e.project]), [['use', 'sa-corrections']]);
+
+  const dev = e2e();
+  const d = dev.hook(bash('npm run dev', dev.w.base), spied(dev));
+  assert.equal(d.status, 0, d.stderr);
+  for (const lib of ['fastpath.mjs', 'register.mjs', 'ledger.mjs']) assert.ok(loadedBy(spyOf(dev)).has(lib), `npm run dev: ${lib} must be loaded`);
+  assert.deepEqual(lines(dev.w.files.ledger).map((e) => [e.kind, e.port]), [['dev', 3000]]);
+
+  // a file tool on a stack workdir, and a project name that only the cached inventory knows
+  const file = e2e();
+  assert.equal(file.hook(fileTool('Edit', join(file.sa.workdir, 'supabase', 'config.toml')), spied(file)).status, 0);
+  assert.ok(loadedBy(spyOf(file)).has('register.mjs'));
+  assert.equal(lines(file.w.files.ledger).length, 1);
+  const named = e2e();
+  mkdirSync(named.w.root, { recursive: true });
+  writeFileSync(named.w.files.cache, JSON.stringify({ writtenAt: Date.now() - 3600 * 1000, inventory: named.w.inv }));
+  assert.equal(named.hook(bash('echo sa-corrections', named.w.base), spied(named)).status, 0);
+  assert.ok(loadedBy(spyOf(named)).has('register.mjs'), 'a name from a STALE cache still sends the call to the full path');
+});
+
+test('e2e fast path fails closed: when the fast path cannot be imported, or throws, the full path runs and decides (never exit 0 on an error)', posixOnly, () => {
+  for (const mode of ['import', 'throw']) {
+    const brk = { RESOLVE_SPY_BREAK: `fastpath.mjs:${mode}` };
+    // a call the fast path would skip: the full path runs (and, naming nothing, exits 0 itself)
+    const ls = e2e();
+    const a = ls.hook(bash('ls -la', ls.w.base), spied(ls, brk));
+    assert.equal(a.status, 0, `${mode}: ${a.stderr}`);
+    assert.ok(loadedBy(spyOf(ls)).has('register.mjs'), `${mode}: register.mjs must be loaded after a fast-path failure`);
+    // a dev server and a stack use are registered exactly as without the fast path
+    const dev = e2e();
+    assert.equal(dev.hook(bash('npm run dev', dev.w.base), spied(dev, brk)).status, 0);
+    assert.deepEqual(lines(dev.w.files.ledger).map((e) => [e.kind, e.port]), [['dev', 3000]], mode);
+    const stack = e2e();
+    assert.equal(stack.hook(bash(`supabase status --workdir ${stack.sa.workdir}`, stack.w.base), spied(stack, brk)).status, 0);
+    assert.deepEqual(lines(stack.w.files.ledger).map((e) => [e.kind, e.project]), [['use', 'sa-corrections']], mode);
+    // a failure the full path blocks on (no owner) still blocks: the same exit and message as with the fast path working
+    const lost = e2e({ ps: { procs: {} } });
+    const command = bash(`supabase status --workdir ${lost.sa.workdir}`, lost.w.base);
+    const working = lost.hook(command);
+    const broken = lost.hook(command, spied(lost, brk));
+    assert.equal(broken.status, 2, `${mode}: ${broken.stderr}`);
+    assert.equal(working.status, 2);
+    assert.equal(broken.stderr, working.stderr, mode);
+    assert.match(broken.stderr, /owner not found/);
+    // paused: the same exit 0 as without the fast path
+    mkdirSync(lost.w.root, { recursive: true });
+    writeFileSync(lost.w.files.pause, '');
+    assert.equal(lost.hook(command, spied(lost, brk)).status, 0, `${mode}: paused`);
+  }
+});
+
+test('e2e fast path: bad stdin still fails closed (exit 2), and a corrupt inventory cache behaves as it does without the fast path', posixOnly, () => {
+  const x = e2e();
+  const bad = spawnSync(process.execPath, [HOOK], { input: 'not json', env: x.env, encoding: 'utf8' });
+  assert.equal(bad.status, 2);
+  assert.match(bad.stderr, /autostop could not register use of stack/);
+  // a corrupt cache: "echo sa-corrections" names no stack without an inventory (exit 0, no lease), `supabase status` refreshes through docker
+  mkdirSync(x.w.root, { recursive: true });
+  writeFileSync(x.w.files.cache, '{"writtenAt": 1, "inve');
+  assert.equal(x.hook(bash('echo sa-corrections', x.w.base)).status, 0);
+  assert.equal(existsSync(x.w.files.ledger), false);
+  assert.equal(x.hook(bash(`supabase status --workdir ${x.sa.workdir}`, x.w.base)).status, 0);
+  assert.equal(lines(x.w.files.ledger).length, 1);
+});
+
+test('fast path, register: a dev record (what stack-dev-bind keys on) is written for a call exactly when devTargets() matches its command', async () => {
+  // This is the premise of the dev-bind fast path: a command devTargets() cannot match never has a dev record under its tool_use_id.
+  const w = world();
+  let devs = 0;
+  for (const [name, input] of fastCases(w)) {
+    const r = await register(input, deps(w, { inventory: () => ({ inv: w.inv, fresh: true }) }));
+    const wrote = r.events.some((e) => e.kind === 'dev');
+    const command = input?.tool_name === 'Bash' && typeof input?.tool_input?.command === 'string' ? input.tool_input.command : '';
+    assert.equal(wrote, devTargets(command).length > 0, name);
+    if (wrote) devs++;
+  }
+  assert.ok(devs >= 8, `${devs} dev records`);
+});
+
+test('e2e fast path: the resolve spy sees node:child_process and proc.mjs when something imports them (so their absence above means something)', posixOnly, () => {
+  const x = e2e();
+  const procUrl = pathToFileURL(join(here, '..', 'pipeline', 'lib', 'proc.mjs')).href;
+  const r = spawnSync(process.execPath, ['--import', RESOLVE_SPY, '--input-type=module', '-e', `await import('node:child_process'); await import(${JSON.stringify(procUrl)});`], {
+    env: { ...process.env, RESOLVE_SPY_LOG: spyOf(x) }, encoding: 'utf8',
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const loaded = loadedBy(spyOf(x));
+  assert.ok(loaded.has('node:child_process'), 'the spy logs builtins');
+  assert.ok(loaded.has('proc.mjs'));
+});
+
+test('proc.mjs re-exports splitCommand and the seam helpers from the light modules the hooks\' fast path imports instead (same functions, one warned-once state)', async () => {
+  const proc = await import('../pipeline/lib/proc.mjs');
+  const words = await import('../pipeline/lib/shell-words.mjs');
+  const seams = await import('../pipeline/lib/seams.mjs');
+  assert.equal(proc.splitCommand, words.splitCommand);
+  for (const name of ['PIPELINE_ROOT', 'SEAM_VARS', 'isInstalledCopy', 'seamValue']) assert.equal(proc[name], seams[name], name);
+  // the platform is pinned: a backslash escapes on POSIX and is a literal (path) character on Windows
+  assert.deepEqual(words.splitCommand('a "b c" d\\ e', 'linux'), ['a', 'b c', 'd e']);
+  assert.deepEqual(words.splitCommand('a "b c" d\\ e', 'win32'), ['a', 'b c', 'd\\', 'e']);
+  assert.deepEqual(proc.splitCommand('a "b c" d\\ e', 'win32'), words.splitCommand('a "b c" d\\ e', 'win32'));
 });

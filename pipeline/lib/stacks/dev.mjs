@@ -32,14 +32,14 @@ import { acquire as realAcquire, release as realRelease } from '../locks.mjs';
 import { run as realRun } from '../proc.mjs';
 import { canonicalPath, isInside } from '../paths.mjs';
 import { isPaused, loadMachineConfig, loadModes } from './config.mjs';
+import { MAX_AGE_MS, MIN_AGE_MS } from './dev-ages.mjs';
 import { isAlive as realIsAlive, procIdentity } from './identity.mjs';
 import { appendEvent as realAppendEvent } from './ledger.mjs';
 import { lockDirs, stackFiles, stacksRoot, stacksSeam } from './paths.mjs';
 import { ok, unknown } from './result.mjs';
 
 export const DEV_DEADLINE_MS = 8000;
-export const MIN_AGE_MS = 3000; // a record younger than this has had no time to listen yet
-export const MAX_AGE_MS = 10 * 60 * 1000; // an older unbound record is given up on
+export { MAX_AGE_MS, MIN_AGE_MS }; // defined in dev-ages.mjs, which the hook's pre-check (fastpath.mjs) reads as well
 export const BIRTH_BEFORE_S = 2;
 export const BIRTH_AFTER_S = 60;
 export const TERM_WAIT_MS = 10000;

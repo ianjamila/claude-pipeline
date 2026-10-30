@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { splitCommand } from '../proc.mjs';
+import { splitCommand } from '../shell-words.mjs';
 import { expandHome, isInside, samePath, toPosix } from '../paths.mjs';
 
 export const DEV_RE = /\b(?:next\s+(?:dev|start)|npm\s+(?:run\s+)?(?:dev|start)|npm\s+start)\b/;
@@ -210,6 +210,15 @@ export function cwdChain(command, cwd, { platform = process.platform, home = os.
   const start = typeof cwd === 'string' && cwd !== '' ? cwd : process.cwd();
   if (typeof command !== 'string' || command === '') return [start];
   return chainFrom(parseCommand(command, platform), start, home);
+}
+
+// What a hook payload says about the tool call: the tool name, its input object and, for Bash, the command. register() and the
+// hook's pre-check (fastpath.mjs) both read the call through this, so they cannot disagree about it.
+export function callOf(input) {
+  const tool = typeof input?.tool_name === 'string' ? input.tool_name : '';
+  const toolInput = input?.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
+  const command = tool === 'Bash' && typeof toolInput.command === 'string' ? toolInput.command : '';
+  return { tool, toolInput, command };
 }
 
 // ---- dev servers ----

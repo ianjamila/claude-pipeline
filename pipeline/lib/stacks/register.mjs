@@ -22,7 +22,7 @@ import { isPaused, isShared, loadMachineConfig } from './config.mjs';
 import { findClaudeOwner } from './identity.mjs';
 import { cachedInventory, readInventory, refreshCache, resolveDocker } from './inventory.mjs';
 import { appendEvent as realAppendEvent } from './ledger.mjs';
-import { devTargets, isStartCommand, prefilter, stackTargets } from './match.mjs';
+import { callOf, devTargets, isStartCommand, prefilter, stackTargets } from './match.mjs';
 import { isolation, lockDirs, projectAllowed, projectLockName, stackFiles, stacksRoot, stacksSeam } from './paths.mjs';
 import { ok, unknown } from './result.mjs';
 
@@ -144,10 +144,9 @@ export async function register(input, deps = {}) {
     }
   };
 
-  const tool = typeof input?.tool_name === 'string' ? input.tool_name : '';
-  const toolInput = input?.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
+  // read through callOf, as the hook's pre-check (fastpath.mjs registerCanSkip) does, so the two cannot disagree about the call
+  const { tool, toolInput, command } = callOf(input);
   const cwd = typeof input?.cwd === 'string' && input.cwd !== '' ? input.cwd : process.cwd();
-  const command = tool === 'Bash' && typeof toolInput.command === 'string' ? toolInput.command : '';
 
   let cfgValue;
   const getCfg = () => (cfgValue ??= deps.cfg ?? loadMachineConfig(files.config, { home }));
