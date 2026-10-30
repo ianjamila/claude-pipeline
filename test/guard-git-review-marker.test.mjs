@@ -5,7 +5,12 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
+import { evaluateGitCommand, RUN_MARKER_TEXTS, STATE_MARKER_TEXT, TRIAGE_MARKER_TEXT } from '../pipeline/hooks/lib/git-policy.mjs';
+import { MARKERS } from '../pipeline/lib/render.mjs';
+import { encodeRecord, STATUS_START, STATUS_END } from '../pipeline/lib/run-record.mjs';
+import { renderEvent } from '../pipeline/lib/run-events.mjs';
+import { followupMarker } from '../pipeline/commands/followups.mjs';
+import { encodeForComment } from '../pipeline/lib/state.mjs';
 
 const dir = mkdtempSync(join(tmpdir(), 'marker-'));
 const MARKER = '<!-- claude-pipeline:review-complete v1 -->';
@@ -151,4 +156,64 @@ test('ordinary comments, reads and the review-complete command itself still pass
     'node /opt/pipeline/bin/pipeline.mjs review-complete --pr 5',
     'node /opt/pipeline/bin/pipeline.mjs merge --pr 5 --owner-go',
   ]) assert.equal(decide(command), 'allow', command);
+});
+
+// Phase 3b: `pipeline state show --pr N` rebuilds .review/state.json from the newest triage comment of the viewer (the agent's own
+// login), so the triage and state markers may only come from `pipeline comment --kind triage`, like the review-complete marker.
+test('Phase 3b: the triage and review-state markers are refused like the review-complete marker', () => {
+  const state = encodeForComment({ version: 1, pr: 5, rounds: [] });
+  writeFileSync(join(dir, 'triage.md'), `${MARKERS.triage}\n${state}\n`);
+  for (const command of [
+    `gh pr comment 5 --body '${MARKERS.triage}'`,
+    `gh pr comment 5 --body '${state}'`,
+    'gh pr comment 5 -b "x <!-- CLAUDE-PIPELINE:TRIAGE -->"',
+    'gh pr comment 5 --body-file triage.md',
+    'gh pr review 5 --comment -F triage.md',
+    `gh api repos/acme/app/issues/5/comments -f body='${MARKERS.triage}'`,
+    'gh api -X PATCH repos/acme/app/issues/comments/9 --input triage.md',
+    "gh api repos/acme/app/issues/5/comments -f body='claude-pipeline\\u003astate:x'",
+    "printf 'claude-pipeline:triage' > new2.md && gh pr comment 5 -F new2.md",
+  ]) assert.equal(decide(command), 'deny', command);
+  for (const command of [
+    'gh pr view 5 --comments',
+    'node /opt/pipeline/bin/pipeline.mjs comment --pr 5 --kind triage',
+    'node /opt/pipeline/bin/pipeline.mjs state show --pr 5',
+  ]) assert.equal(decide(command), 'allow', command);
+});
+
+test('Phase 3b: the guarded marker texts are the ones the pipeline writes', () => {
+  assert.ok(MARKERS.triage.includes(TRIAGE_MARKER_TEXT));
+  assert.ok(encodeForComment({ pr: 1 }).includes(STATE_MARKER_TEXT));
+});
+
+// Phase 3b: every marker the pipeline's commands write is refused in hand-posted text: each one as the real writer renders it.
+test('Phase 3b: the run markers (summary, record, status, needs-human, blocked, awaiting-review, events, follow-ups) are refused too', () => {
+  const written = [...Object.values(MARKERS), encodeRecord({ v: 1, step: 'merge' }), STATUS_START, STATUS_END,
+    renderEvent('rollback-result', 'r1', 'rolled back', { ok: true }), followupMarker(7, { fingerprint: 'fp1', id: 'R1-S1' })];
+  for (const text of written) {
+    assert.ok(RUN_MARKER_TEXTS.some((m) => text.toLowerCase().includes(m)) || text.includes(TRIAGE_MARKER_TEXT), `not guarded: ${text.slice(0, 60)}`);
+    const body = JSON.stringify(`${text}\nhand-written`);
+    assert.equal(decide(`gh pr comment 7 --body ${body}`), 'deny', text.slice(0, 60));
+    assert.equal(decide(`gh issue create --title t --body ${body}`), 'deny', text.slice(0, 60));
+  }
+  // the words alone, in prose, are not a marker
+  assert.equal(decide('gh pr comment 7 --body "the summary comment is updated by the pipeline"'), 'allow');
+});
+
+// Fable attacker pass (Phase 3b): the run record lives in a comment of the agent's own login, and P merge reads a missing record as an
+// ordinary run, so deleting or blanking a comment by hand is refused (no marker needed); the pipeline commands update their own.
+test('Phase 3b: editing or deleting an existing comment by hand is refused', () => {
+  for (const cmd of ['gh api -X DELETE repos/acme/app/issues/comments/9', 'gh api -X PATCH repos/acme/app/issues/comments/9 -f body=x',
+    'gh api --method=delete /repos/acme/app/pulls/comments/9', 'gh api -X PUT repos/{owner}/{repo}/issues/comments/9 -f body=x',
+    'gh pr comment 7 --edit-last --body x', 'gh pr comment 7 --delete-last --yes', 'gh api -X POST -X DELETE repos/acme/app/issues/comments/9',
+    'gh api repos/acme/app/issues/comments/9 -f body=x', 'gh api -X POST repos/acme/app/issues/comments/9',
+    `gh api -X POST -X DELETE repos/acme/app/issues/7/labels/${'needs'}-human`, // (gh takes the last -X: a guard label deleted) 'gh issue comment 7 --edit-last=true -b x',
+    'gh api graphql -f query=\'mutation { updateIssueComment(input: {id: "IC_1", body: "x"}) { clientMutationId } }\'',
+    'gh api graphql -f query=\'mutation { deleteIssueComment(input: {id: "IC_1"}) { clientMutationId } }\'']) {
+    assert.equal(decide(cmd), 'deny', cmd);
+  }
+  for (const cmd of ['gh pr comment 7 --body x', 'gh api repos/acme/app/issues/comments/9', 'gh api -X POST repos/acme/app/issues/comments/9/reactions -f content=+1',
+    'gh api repos/acme/app/issues/7/comments -f body=x']) {
+    assert.equal(decide(cmd), 'allow', cmd);
+  }
 });

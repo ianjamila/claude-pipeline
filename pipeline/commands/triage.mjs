@@ -11,6 +11,8 @@ import { matchAny } from '../lib/glob.mjs';
 import { runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
+import { createGitHub, guardGh } from '../lib/github.mjs';
+import { ownerRuled } from '../hooks/lib/owner-go.mjs';
 import {
   applyJudge, applyOwnerRuling, applyTestResult, DECISIONS, finalizeWithoutArbiter, isOwnerRuled, markLightLane, validateTriage,
 } from '../lib/triage.mjs';
@@ -32,6 +34,7 @@ export const meta = {
     '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
     '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
     '  -> works on an already published round. ACCEPT still needs the fix and a later review round; FOLLOW-UP is filed by `followups create`; the quote is published in the triage comment and the final gate counts it as ownerMerge (the owner\'s "merge" is still needed)',
+    '  -> the quote must be the WHOLE owner prompt that answered a reply ENDING with `⚖️ Owner ruling needed #N: ID[, ID…] · repo owner/name` (the owner-go hook records it; any session, last 24 h; white space and case aside), and that answer must be nothing but decisions, `ID: accept|follow-up|reject` per asked id, the id always written (any other word decides nothing; over 1000 characters is not recorded); exit 1 otherwise, or when gh resolves the repository off github.com',
     '  -> pass the owner\'s own words as --owner-quote, never a paraphrase; then re-post the triage comment NOW (`pipeline comment --pr N --kind triage`); until then the ruling is local only (`published: false`) and `pipeline state show` restores the published state without it',
   ].join('\n'),
 };
@@ -274,17 +277,27 @@ async function ownerRuling(rest, ctx) {
     return refuse(`--reason and --owner-quote are at most ${OWNER_TEXT_MAX} characters`);
   }
 
-  return withStateLock(root, ctx, () => {
+  const gh = createGitHub({ cwd: root, env: ctx.env });
+  return guardGh(() => withStateLock(root, ctx, () => {
     const state = requireState(root);
     if (pr !== undefined && state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`);
     const item = findRound(state, n).items.find((i) => i.id === id);
     const why = ownerRulingRefusal(item, id, n);
     if (why) return refuse(why);
+    // Phase 3b: the quote must be the owner's words, as the owner-go recorder wrote them down after a reply that asked for this ruling
+    // (hooks/lib/owner-go.mjs presentedRuling): before, --owner-quote was the agent's own word. The repository is the one gh resolves on
+    // github.com, as for "merge".
+    const { slug, host } = gh.repo();
+    const prNum = state.pr ?? pr;
+    if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded ruling names a repository on github.com`);
+    if (!ownerRuled({ repo: slug, pr: prNum, id, quote: ownerQuote, decision })) {
+      return refuse(`no owner ruling is recorded for ${slug} #${prNum} ${id} whose whole answer is --owner-quote and says ${decision.toLowerCase()} (an answer naming several decisions must also name ${id}): end the reply that asks with \`⚖️ Owner ruling needed #${prNum}: ${id} · repo ${slug}\` (Owner rules in chat, review-loop.md), wait for the owner's answer, and pass all of it as --owner-quote`);
+    }
     const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });
     saveState(root, updateItems(state, n, [ruled]));
     const next = `run \`pipeline comment --pr ${state.pr ?? pr ?? '<N>'} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it`;
     return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final, published: false, next } };
-  }, pr);
+  }, pr));
 }
 
 const SUBCOMMANDS = { validate, settle, 'light-lane': lightLane, 'owner-ruling': ownerRuling };

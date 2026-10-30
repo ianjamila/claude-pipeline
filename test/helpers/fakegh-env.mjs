@@ -59,7 +59,7 @@ export function fullProtection(checks = ['ci']) {
   };
 }
 
-export const REPO_VIEW = { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'main' } };
+export const REPO_VIEW = { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'main' }, url: 'https://github.com/acme/widgets' };
 
 // A minimal valid .claude/pipeline.yml declaring the given enforcement mode and required checks.
 // guardChecks stays false here: most tests are about the configured list, not the always-required guard contexts.

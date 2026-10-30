@@ -47,13 +47,46 @@ export function realGitWiring() {
 // is never read), in every version at hand: the working tree, HEAD and the remote's default branch. Any one of them saying chat
 // makes it a chat repo, so a local edit or an uncommitted file cannot switch the check off (a rewritten local ref still can:
 // the documented residual). A pipeline.yml that cannot be parsed throws: the policy then treats the repo as chat (fail closed).
-// Whether the owner said "merge" comes from the owner-go records of THIS session, for the exact PR and head (lib/owner-go.mjs).
+// Whether the owner said "merge" comes from the owner-go records of THIS session, for the exact repository, PR and head (lib/owner-go.mjs).
+// Phase 3b: the repository a bare gh command in a checkout acts on is read from its remotes (`git remote -v`, no network). gh may pick
+// any of them (upstream, a `gh repo set-default`), so the answer is a repository only when every remote names the same one; none, or
+// several, is unknown (the policy then refuses the merge and asks for -R owner/name).
 const COMMITTED_REFS = ['HEAD', 'origin/HEAD', 'origin/main', 'origin/master'];
 const defaultGitShow = (root, ref) => {
   const r = run('git', ['-C', root, 'show', `${ref}:.claude/pipeline.yml`], { timeoutMs: LOOKUP_TIMEOUT_MS });
   return r.code === 0 ? r.stdout : null;
 };
-export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8'), exists = existsSync, gitShow = defaultGitShow } = {}) {
+const defaultRemotes = (dir) => {
+  const r = run('git', ['-C', dir, 'remote', '-v'], { timeoutMs: LOOKUP_TIMEOUT_MS });
+  return r.code === 0 ? r.stdout : null;
+};
+// (Fable attacker pass) gh's own choice of repository among the remotes: `gh repo set-default` writes remote.<name>.gh-resolved, which
+// is `base` or an owner/name gh then uses instead. '' when none is set (git config exits 1), null when it cannot be read.
+const defaultResolved = (dir) => {
+  const r = run('git', ['-C', dir, 'config', '--get-regexp', '^remote\\..*\\.gh-resolved$'], { timeoutMs: LOOKUP_TIMEOUT_MS });
+  return r.code === 0 ? r.stdout : r.code === 1 ? '' : null;
+};
+// owner/name from a github.com remote URL (git@github.com:owner/name.git, https://github.com/owner/name, ssh://git@github.com/owner/name.git),
+// or null. (security review of 26cfb30: a remote on another host — GitHub Enterprise, a mirror, a local path — holds another repository
+// with the same owner/name, and the owner's "merge" names one on github.com)
+export function remoteSlug(url) {
+  const s = String(url ?? '').trim();
+  const m = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?([^/:@]+)(?::\d*)?\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i.exec(s)
+    ?? /^(?:[^@/:]*@)?([^/:@]+):(?!\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(s);
+  return m && m[1].toLowerCase() === 'github.com' ? `${m[2]}/${m[3]}` : null;
+}
+export function repoOfRemotes(text, resolved = '') {
+  if (typeof text !== 'string' || typeof resolved !== 'string') return null;
+  const urls = text.split(/\r?\n/).map((l) => l.trim().split(/\s+/)[1]).filter(Boolean);
+  const slugs = urls.map(remoteSlug);
+  if (slugs.length === 0 || slugs.includes(null)) return null;
+  const keys = new Set(slugs.map((s) => s.toLowerCase()));
+  if (keys.size !== 1) return null;
+  // (a gh-resolved naming another owner/name: gh merges there, not in the remotes' repository)
+  const chosen = resolved.split(/\r?\n/).map((l) => l.trim().split(/\s+/)[1]).filter(Boolean);
+  return chosen.every((v) => v === 'base' || v.toLowerCase() === [...keys][0]) ? slugs[0] : null;
+}
+export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8'), exists = existsSync, gitShow = defaultGitShow, remotes = defaultRemotes, resolved = defaultResolved } = {}) {
   const rootOf = (dir) => {
     let d = path.resolve(dir);
     for (;;) {
@@ -94,6 +127,7 @@ export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8
       }
       return out;
     },
-    approvedHead: (pr, head) => approvedPr({ pr, head, session }),
+    repoOf: (dir) => repoOfRemotes(remotes(dir), resolved(dir)),
+    approvedHead: (pr, head, repo) => approvedPr({ repo, pr, head, session }),
   };
 }

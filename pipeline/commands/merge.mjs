@@ -78,8 +78,9 @@ export const run = guarded(async (argv, ctx) => {
       if (values['owner-approved-head'] !== gate.head || !/^[0-9a-f]{40}$/.test(gate.head)) approvalProblem = '--owner-approved-head is not the gate head';
       else if (typeof gate.ownerItems !== 'string') approvalProblem = 'the gate file names no owner-item set (written by an older final-gate): run final-gate again';
       else if (values['owner-approved-items'] !== gate.ownerItems) approvalProblem = `--owner-approved-items is not the gate's owner-item set (${gate.ownerItems})`;
-      else if (!approvedRequest({ pr, head: gate.head, items: gate.ownerItems })) {
-        approvalProblem = `no owner "merge" is recorded for #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}: show the request (Owner-merge approval in the ship skill) and wait for the owner to type "merge"`;
+      else if (gh.repo().host !== 'github.com') approvalProblem = hostProblem(gh);
+      else if (!approvedRequest({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems })) {
+        approvalProblem = `no owner "merge" is recorded for ${gh.repo().slug} #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}: show the request (Owner-merge approval in the ship skill: \`Head ${gate.head.slice(0, 12)} · items ${gate.ownerItems} · repo ${gh.repo().slug}\`) and wait for the owner to type "merge"`;
       }
     }
     const ownerApproved = values['owner-approved-head'] !== undefined && approvalProblem === null;
@@ -277,11 +278,20 @@ export const run = guarded(async (argv, ctx) => {
 // writes no gate file and records no verify proof, then waits for MERGED like the gated path (auto-merge disabled otherwise).
 // What it does not do: production bookkeeping. No prod-before record is written (the owner watches this merge), so a later
 // prod-watch has no rollback target and refuses to roll back; the output says so (warning) when production is configured.
+// Phase 3b: the owner's "merge" names owner/name on github.com; gh may resolve that name on another server (GH_HOST, an ssh host
+// alias, a sole logged-in enterprise host), where it is another repository — refused, as the guard does for a direct merge.
+const hostProblem = (gh) => `gh resolves this repository on ${gh.repo().host ?? 'an unknown host'}, not github.com, and the owner's "merge" names a repository on github.com`;
+
 async function ownerGoMerge({ root, config, pr, gh, ctx }) {
   // The owner's record first: it is local, and without it nothing else matters.
   const head = headSha({ cwd: root });
-  if (!approvedRequest({ pr, head, items: 'none' })) {
-    const reason = `no owner "merge" is recorded for #${pr} head ${head.slice(0, 12)} items none: end the reply with \`Head ${head.slice(0, 12)} · items none\` and \`🔀 Ready to merge #${pr} — say "merge"\`, and wait for the owner to type "merge"`;
+  const repo = gh.repo().slug;
+  if (gh.repo().host !== 'github.com') {
+    const reason = hostProblem(gh);
+    return refuse('owner-go', [reason], { reason, head });
+  }
+  if (!approvedRequest({ repo, pr, head, items: 'none' })) {
+    const reason = `no owner "merge" is recorded for ${repo} #${pr} head ${head.slice(0, 12)} items none: end the reply with \`Head ${head.slice(0, 12)} · items none · repo ${repo}\` and \`🔀 Ready to merge #${pr} — say "merge"\`, and wait for the owner to type "merge"`;
     return refuse('owner-go', [reason], { reason, head });
   }
   const live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env });

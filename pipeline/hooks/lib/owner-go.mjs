@@ -3,9 +3,11 @@
 // alone was the agent's own word: nothing proved the owner had said it (Codex + Fable design reviews, 2026-10-14). So the
 // owner-go recorder (the UserPromptSubmit hook hooks/owner-go.mjs, which only a real prompt typed by the owner reaches) writes
 // down each owner prompt that STARTS with "merge", bound to what the reply right before it asked for:
-//   `Head <sha12> · items <digest>` lines + `🔀 Ready to merge #N — say "merge"` (skills/ship, Owner-merge approval).
-// `P merge` then needs a record for exactly that PR, head and owner-item set; the guard needs one (for that PR, in that
-// session) before a direct `gh pr merge` / the repo's merge command in an owner_approval: chat repo. guard-files keeps
+//   `Head <sha12> · items <digest> · repo <owner/name>` lines + `🔀 Ready to merge #N — say "merge"` (skills/ship, Owner-merge approval).
+// `P merge` then needs a record for exactly that repository, PR, head and owner-item set; the guard needs one (for that repository and
+// PR, in that session) before a direct `gh pr merge` / the repo's merge command in an owner_approval: chat repo. Phase 3b: the repository
+// is part of the request, so a "merge" said for #N of one repository never approves #N of another (a fork, a mirror, a vendored copy
+// that shares the commit). A request line without it approves nothing. guard-files keeps
 // agents from writing the folder or running the recorder.
 // Residual (owner ruling 2026-10-14, the "cheap step"): the agent runs as the same OS user, so a program the guards cannot
 // see into can still write the folder; the transcript the recorder reads is a file of that user; and the agent's GitHub
@@ -57,13 +59,15 @@ export function parseApproval(prompt) {
   return { prs: [...new Set(prs)], shas: [...new Set(shas)] };
 }
 
-// The merge request a reply ENDS with. The reply's last lines are the request (skills/ship): optional `Head <sha12> · items <digest>`
-// lines (or, for several PRs, `#N head <sha12> · items <digest>`) directly above the 🔀 line, which is the last non-blank line.
+// The merge request a reply ENDS with. The reply's last lines are the request (skills/ship): optional `Head <sha12> · items <digest> · repo <owner/name>`
+// lines (or, for several PRs, `#N head <sha12> · items <digest> · repo <owner/name>`) directly above the 🔀 line, which is the last non-blank line.
 // Only that terminal block binds: an earlier block in the same reply, a Head line with prose between it and the 🔀 line, or any
 // text after the 🔀 line binds nothing, and a PR bound twice (two heads, or the same line twice) is ambiguous, so it binds nothing.
-// Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items }] }.
+// Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items, repo }] } (repo: the
+// lower-cased owner/name, or null when the line names none: such a request approves nothing).
 const READY_LINE = /🔀\s*Ready to merge\s+([^\n]*)/;
-const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)\\s*$`, 'i');
+const REPO_NAME = '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+';
+const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)(?:\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME}))?\\s*$`, 'i');
 export function presentedRequests(text) {
   const lines = String(text ?? '').split(/\r?\n/);
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
@@ -80,9 +84,25 @@ export function presentedRequests(text) {
   for (const h of block) {
     const pr = h[1] ? Number(h[1]) : prs.length === 1 ? prs[0] : null;
     if (pr === null || !prs.includes(pr)) continue;
-    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase() });
+    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[4] ? h[4].toLowerCase() : null });
   }
   return { prs, requests: [...bound.values()].filter(Boolean) };
+}
+
+// Phase 3b: an owner ruling in chat (`P triage owner-ruling`) was the agent's word too: --owner-quote could be any text. A reply that
+// asks the owner to rule ENDS with `⚖️ Owner ruling needed #N: R1-B1, R2-S3 · repo owner/name` (skills/ship reference/review-loop.md),
+// and the owner's next prompt is recorded with those ids; owner-ruling then needs a recorded prompt for that repository, PR and id whose
+// words hold the quote. Returns { pr, repo (lower case), ids } or null when the reply does not end with that line.
+const RULING_LINE = new RegExp(`^\\s*⚖️?\\s*Owner ruling needed\\s+#(\\d{1,6})\\s*:\\s*([^\\n·|]+?)\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME})\\s*$`, 'i');
+const ITEM_ID = /^R\d{1,4}-[A-Za-z]{1,8}\d{1,4}$/;
+export function presentedRuling(text) {
+  const lines = String(text ?? '').split(/\r?\n/);
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  const m = RULING_LINE.exec(lines[lines.length - 1] ?? '');
+  if (!m) return null;
+  const ids = [...new Set(m[2].split(/[\s,]+/).filter(Boolean))];
+  if (ids.length === 0 || !ids.every((id) => ITEM_ID.test(id))) return null;
+  return { pr: Number(m[1]), repo: m[3].toLowerCase(), ids };
 }
 
 // The text of the last assistant reply in the transcript when it holds a 🔀 merge request ('' when none). Only the
@@ -91,7 +111,12 @@ export function presentedRequests(text) {
 // transcript gets that prompt, so the newest prompt entry is "the current one" (its empty slot skipped) only when its text IS that prompt;
 // any other newest prompt is an older, unanswered one, and the empty reply slot after it is the reply to use: no request, the one before is stale.
 // Without `prompt` the newest prompt entry is taken to be the current one.
-export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt } = {}) {
+export function lastRequestText(transcriptPath, opts = {}) {
+  const text = lastReplyText(transcriptPath, opts);
+  return READY_LINE.test(text) ? text : '';
+}
+// The same reply, whatever it ends with ('' when there is none).
+export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt } = {}) {
   let raw = '';
   try {
     if (!lstatSync(transcriptPath).isFile()) return '';
@@ -136,7 +161,7 @@ export function lastRequestText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BY
   // older request is never revived by a later "merge": the agent shows it again.
   const current = lastIsPrompt && (prompt === undefined || plain(prompt) === lastPromptText);
   const last = replies.length - 1 - (current && replies.length > 1 ? 1 : 0);
-  return READY_LINE.test(replies[last]) ? replies[last] : '';
+  return replies[last] ?? '';
 }
 
 // Is this hook input a subagent's (or not a prompt at all)? Those never approve anything.
@@ -189,28 +214,65 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
       prs,
       requests,
     };
-    if (!realDirChain(home, OWNER_GO_REL)) return null;
-    const file = path.join(ownerGoDir(home), `${session}.jsonl`);
-    try {
-      if (!lstatSync(file).isFile()) return null;
-    } catch (err) {
-      if (err?.code !== 'ENOENT') return null;
-    }
-    const fd = openSync(file, OPEN_APPEND, 0o600);
-    try {
-      if (!fstatSync(fd).isFile()) return null;
-      writeSync(fd, `${JSON.stringify(record)}\n`);
-    } finally {
-      closeSync(fd);
-    }
-    return record;
+    return appendRecord(home, session, record);
   } catch {
     return null;
   }
 }
 
-// Every valid record younger than maxAgeMs, from one session's file or (session null) from all of them. Never throws.
-export function readApprovals({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS } = {}) {
+// Appends one record to <home>/.claude/pipeline-state/owner-go/<session>.jsonl; the record, or null when it cannot be written safely.
+function appendRecord(home, session, record) {
+  if (!realDirChain(home, OWNER_GO_REL)) return null;
+  const file = path.join(ownerGoDir(home), `${session}.jsonl`);
+  try {
+    if (!lstatSync(file).isFile()) return null;
+  } catch (err) {
+    if (err?.code !== 'ENOENT') return null;
+  }
+  const fd = openSync(file, OPEN_APPEND, 0o600);
+  try {
+    if (!fstatSync(fd).isFile()) return null;
+    writeSync(fd, `${JSON.stringify(record)}\n`);
+  } finally {
+    closeSync(fd);
+  }
+  return record;
+}
+
+export const RULING_PROMPT_MAX = 1000; // a ruling answer is only decisions (rulingsIn); a longer prompt is no answer and is not recorded (never cut)
+
+// Phase 3b, the ruling recorder (same hook, same folder): when the reply right before the owner's prompt ends with the ruling line
+// (presentedRuling), writes the prompt's words, bound to that repository, PR and those item ids. Returns the record, or null. Never throws.
+export function recordRuling(input, { home = accountHome(), now = Date.now } = {}) {
+  try {
+    if (notOwnerPrompt(input)) return null;
+    const session = String(input?.session_id ?? '');
+    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > RULING_PROMPT_MAX) return null;
+    const asked = presentedRuling(lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }));
+    if (!asked) return null;
+    return appendRecord(home, session, {
+      v: 1, kind: 'ruling', ts: new Date(now()).toISOString(), session,
+      prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
+      cwd: typeof input.cwd === 'string' ? input.cwd : null,
+      repo: asked.repo, pr: asked.pr, ids: asked.ids, prompt: input.prompt,
+    });
+  } catch {
+    return null;
+  }
+}
+
+// Every valid "merge" record younger than maxAgeMs, from one session's file or (session null) from all of them. Never throws.
+export function readApprovals(opts = {}) {
+  return readRecords(opts).filter((r) => r.kind === undefined).map((r) => ({
+    ts: r.ts,
+    session: r.session,
+    prs: Array.isArray(r.prs) ? r.prs.filter(Number.isInteger) : [],
+    requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string').map((q) => ({ ...q, repo: typeof q.repo === 'string' ? q.repo : null })) : [],
+  }));
+}
+
+// Every valid record (any kind) younger than maxAgeMs, as written. Never throws.
+function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS } = {}) {
   const dir = ownerGoDir(home);
   const out = [];
   let names = [];
@@ -244,28 +306,66 @@ export function readApprovals({ home = accountHome(), session = null, now = Date
       if (r?.v !== 1 || `${r.session}.jsonl` !== name) continue;
       const at = Date.parse(r.ts);
       if (!Number.isFinite(at) || at > t + FUTURE_SKEW_MS || t - at > maxAgeMs) continue;
-      out.push({
-        ts: r.ts,
-        session: r.session,
-        prs: Array.isArray(r.prs) ? r.prs.filter(Number.isInteger) : [],
-        requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string') : [],
-      });
+      out.push(r);
     }
   }
   return out;
 }
 
-// P merge: did the owner say "merge" for exactly this PR, this full head and this owner-item set (any session, last 24 h)?
-export function approvedRequest({ pr, head, items, ...opts }) {
-  if (!/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return false;
-  return readApprovals(opts).some((r) => r.requests.some((q) => q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items));
+// The repository as the records hold it (owner/name, lower case; GitHub names are case-insensitive), or null when `repo` is none.
+export const repoKey = (repo) => (typeof repo === 'string' && new RegExp(`^${REPO_NAME}$`).test(repo) ? repo.toLowerCase() : null);
+
+// P merge: did the owner say "merge" for exactly this repository (owner/name), PR, full head and owner-item set (any session, last 24 h)?
+export function approvedRequest({ repo, pr, head, items, ...opts }) {
+  const key = repoKey(repo);
+  if (key === null || !/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return false;
+  return readApprovals(opts).some((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items));
 }
 
-// The guard, before a direct merge: did the owner say "merge" in this session (last 24 h) for a request about this PR whose head
-// is this full head? (A PR merely named in the prompt, `merge #7`, is recorded in `prs` for the audit trail but approves no head.)
-export function approvedPr({ pr, head, session, ...opts }) {
-  if (!Number.isInteger(pr) || !/^[0-9a-f]{40}$/.test(String(head)) || !SESSION_RE.test(String(session ?? ''))) return false;
-  return readApprovals({ ...opts, session }).some((r) => r.requests.some((q) => q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head)));
+// The guard, before a direct merge: did the owner say "merge" in this session (last 24 h) for a request about this repository and PR
+// whose head is this full head? (A PR merely named in the prompt, `merge #7`, is recorded in `prs` for the audit trail but approves no head.)
+export function approvedPr({ repo, pr, head, session, ...opts }) {
+  const key = repoKey(repo);
+  if (key === null || !Number.isInteger(pr) || !/^[0-9a-f]{40}$/.test(String(head)) || !SESSION_RE.test(String(session ?? ''))) return false;
+  return readApprovals({ ...opts, session }).some((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head)));
+}
+
+// What an owner's answer to a ruling request decides, per item. Security reviews of f17b251, ff8090f and 009d435: reading decisions
+// out of free text (a fragment, a word read for the wrong item, "don't accept", a contradicting word left over) always left a way to
+// pass words for a ruling the owner did not give, so the answer is now ONLY the decisions, nothing else: `R1-B1: accept, R2-S3: reject`
+// (each asked id at most once; `:` `-` `=` or a space between id and decision; commas, semicolons, full stops, `and` between pairs).
+// The id is always written (Fable attacker pass: the ruling line is the agent's, so a bare "accept" answering an unrelated question
+// under it would rule). Any other word, an id not asked, or an id twice, and the answer decides nothing (the owner's reasons go in
+// another message). Returns Map(ID upper case → ACCEPT | FOLLOW-UP | REJECT).
+const DECISION = '(accept|follow[- ]?up|reject)';
+const ITEM = '(r\\d{1,4}-[a-z]{1,8}\\d{1,4})';
+const decisionOf = (w) => (/^accept/i.test(w) ? 'ACCEPT' : /^reject/i.test(w) ? 'REJECT' : 'FOLLOW-UP');
+const SEP = '(?:\\s*[,;.]\\s*|\\s+and\\s+|\\s+)';
+const PAIR = `${ITEM}\\s*[:=–—-]?\\s*${DECISION}`;
+const PAIRS_ONLY = new RegExp(`^${PAIR}(?:${SEP}${PAIR})*[.!]?$`, 'i');
+export function rulingsIn(answer, askedIds) {
+  const a = String(answer ?? '').replace(/\s+/g, ' ').trim();
+  const asked = (askedIds ?? []).map((x) => String(x).toUpperCase());
+  const out = new Map();
+  if (!PAIRS_ONLY.test(a)) return out;
+  for (const [, id, d] of a.matchAll(new RegExp(PAIR, 'gi'))) {
+    const k = id.toUpperCase();
+    if (!asked.includes(k) || out.has(k)) return new Map();
+    out.set(k, decisionOf(d));
+  }
+  return out;
+}
+
+// triage owner-ruling: did the owner answer a ruling request for this repository, PR and item (any session, last 24 h) with exactly
+// `quote` (the WHOLE answer; runs of white space as one space, case-insensitive: it is copied from the chat), and does that answer
+// decide `decision` for this item (rulingsIn)?
+export function ownerRuled({ repo, pr, id, quote, decision, ...opts }) {
+  const key = repoKey(repo);
+  const words = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const q = words(quote);
+  if (key === null || !Number.isInteger(pr) || q === '') return false;
+  return readRecords(opts).some((r) => r.kind === 'ruling' && r.repo === key && r.pr === pr && Array.isArray(r.ids) && r.ids.includes(id)
+    && typeof r.prompt === 'string' && words(r.prompt) === q && rulingsIn(r.prompt, r.ids).get(String(id).toUpperCase()) === decision);
 }
 
 // The owner-item set as one short digest: each item is one line (kind, rule or id, file); 'none' when there are none.
