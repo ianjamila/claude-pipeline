@@ -2294,7 +2294,16 @@ function linkTargets(argv) {
 
 function linkReachesProtected(cmds, dirs, ctx) {
   for (const c of cmds) {
-    if (baseOf(c.argv[0] ?? '') !== 'ln') continue;
+    const prog = baseOf(c.argv[0] ?? '');
+    // #111 (Fable): a link whose TARGET is built by a command substitution (`ln -s "$(printf '.%s' review)" rv`) is never resolved, so it may be
+    // the review folder under a name no stat can see yet: with a review folder present it is refused (fail closed, also for a harmless
+    // `$(pwd)/x`: write the target out). ln, link and cp -s make such links; without a review folder nothing here changes.
+    const symCp = prog === 'cp' && c.argv.slice(1).some((x) => x === '--symbolic-link' || (/^-[A-Za-z]+$/.test(x) && x.includes('s')));
+    if ((prog === 'ln' || prog === 'link' || symCp) && ctx.hasReviewDir()) {
+      const hidden = linkTargets(c.argv).find((t) => /\$\(|`|<\(|>\(/.test(expandRefs(t, ctx)));
+      if (hidden !== undefined) return hidden;
+    }
+    if (prog !== 'ln') continue;
     for (const t of linkTargets(c.argv)) {
       const e = expandRefs(t, ctx);
       if (/[*?[]/.test(e)) continue; // a glob target is judged by the glob rules
