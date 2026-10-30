@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import {
   git, mergeBase, mergeTree, mergeTreeDetailed, effectiveReviewBase, resolutionReviewBase, ensureReviewBase, reviewPatch, revParse, ReviewBaseUnavailable,
 } from '../pipeline/lib/git.mjs';
-import { splitLines, interleave, parseConflictBlocks, checkSelection, makeBudget, MAX_BLOCKS } from '../pipeline/lib/resolution.mjs';
+import { splitLines, interleave, parseConflictBlocks, checkSelection, makeBudget, sameMarkerShape, MAX_BLOCKS } from '../pipeline/lib/resolution.mjs';
 import { run } from '../pipeline/lib/proc.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 
@@ -377,6 +377,57 @@ test('resolutionReviewBase: M1 conflict merge then M2 clean merge that carries a
   isOk(mk(false));
 });
 
+// A conflicted file that ALSO holds clean hunks git auto-merged from one side each (the #1574 shape): a changes line 4 on both
+// sides (the conflict), main alone changes line 15, the PR alone changes line 25.
+const cleanHunks = (l4, l15, l25) => T(...Array.from({ length: 30 }, (_, i) => (i === 3 ? l4 : i === 14 ? l15 : i === 24 ? l25 : `line${i + 1}`)));
+const withCleanHunks = (resolved4) => {
+  const s = conflictRepo({
+    base: { 'f.txt': cleanHunks('x', 'line15', 'line25') },
+    ours: { 'f.txt': cleanHunks('o4', 'line15', 'pr25') },
+    theirs: { 'f.txt': cleanHunks('t4', 'main15', 'line25') },
+  });
+  const head = resolveMerge(s.repo, { 'f.txt': cleanHunks(resolved4, 'main15', 'pr25') });
+  return decide(s, head);
+};
+
+test('resolutionReviewBase: clean hunks auto-merged elsewhere in a conflicted file (from main and from the PR) keep a selection eligible', () => {
+  const r = withCleanHunks('o4');
+  isOk(r);
+  assert.deepEqual(r.blocks, [{ path: 'f.txt', block: 1, droppedTheirs: 1 }]);
+  isOk(withCleanHunks('t4'));
+});
+
+test('resolutionReviewBase: with clean hunks elsewhere, a typed line inside the block is still not-selection', () => {
+  isNo(withCleanHunks('typed by hand'), 'not-selection');
+});
+
+test('resolutionReviewBase: a "=======" content line inside a side, next to clean hunks elsewhere, still parses (kept = marker-line)', () => {
+  const lines = (l4a, l4b, l15, l25) => T('top', 'l2', 'l3', ...l4a, ...l4b, 'l5', 'l6', 'l7', 'l8', 'l9', 'l10', 'l11', 'l12', 'l13', 'l14', l15, 'l16', 'l17', 'l18', 'l19', 'l20', 'l21', 'l22', 'l23', 'l24', l25, 'bottom');
+  const s = conflictRepo({
+    base: { 'f.txt': lines(['x'], [], 'l15', 'l25') },
+    ours: { 'f.txt': lines(['o', '=======', 'o2'], [], 'l15', 'pr25') },
+    theirs: { 'f.txt': lines(['t'], [], 'main15', 'l25') },
+  });
+  const head = resolveMerge(s.repo, { 'f.txt': lines(['o', 'o2'], [], 'main15', 'pr25') });
+  isOk(decide(s, head));
+  const kept = conflictRepo({
+    base: { 'f.txt': lines(['x'], [], 'l15', 'l25') },
+    ours: { 'f.txt': lines(['o', '=======', 'o2'], [], 'l15', 'pr25') },
+    theirs: { 'f.txt': lines(['t'], [], 'main15', 'l25') },
+  });
+  isNo(decide(kept, resolveMerge(kept.repo, { 'f.txt': lines(['o', '=======', 'o2'], [], 'main15', 'pr25') })), 'marker-line');
+});
+
+test('resolutionReviewBase: a merge-file that disagrees with the marker blob, or does not run, is ineligible merge-file-mismatch', () => {
+  const s = conflictRepo({ base: { 'f.txt': T('top', 'x', 'bottom') }, ours: { 'f.txt': T('top', 'o', 'bottom') }, theirs: { 'f.txt': T('top', 't', 'bottom') } });
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  const tamper = (fn) => ({ ...s, o: { ...s.o, run: (cmd, args, opts) => { const r = run(cmd, args, opts); return args.includes('merge-file') ? fn(r, args) : r; } } });
+  isOk(decide(tamper((r) => r), head));
+  isNo(decide(tamper((r, args) => (args.includes('--ours') || args.includes('--theirs') ? r : { ...r, stdout: r.stdout.replace('top', 'tip') })), head), 'merge-file-mismatch');
+  isNo(decide(tamper((r) => ({ ...r, code: 200 })), head), 'merge-file-mismatch');
+  isNo(decide(tamper((r) => ({ ...r, stderr: 'fatal: boom' })), head), 'merge-file-mismatch');
+});
+
 test('resolutionReviewBase: the step budget turns into ineligible, never a throw', () => {
   const s = conflictRepo({ base: { 'f.txt': T('top', 'x', 'bottom') }, ours: { 'f.txt': T('top', 'o', 'bottom') }, theirs: { 'f.txt': T('top', 't', 'bottom') } });
   const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
@@ -453,6 +504,20 @@ test('interleave: subsequence interleavings, order preserved, dropped count is t
   assert.equal(interleave(l('x'), l('a'), l('b')).ok, false);
   assert.deepEqual(interleave([], l('a'), l('b', 'c')), { ok: true, droppedTheirs: 2 });
   assert.deepEqual(interleave(l('a'), l('a'), l('a')), { ok: true, droppedTheirs: 1 });
+});
+
+test('sameMarkerShape: equal except the label text on the open / close marker lines', () => {
+  const l = (...x) => x.map((s) => `${s}\n`);
+  const m = l('top', '<<<<<<< 1111', 'o', '=======', 't', '>>>>>>> 2222', 'bottom');
+  assert.equal(sameMarkerShape(m, l('top', '<<<<<<< ours', 'o', '=======', 't', '>>>>>>> theirs', 'bottom')), true);
+  assert.equal(sameMarkerShape(m, m), true);
+  assert.equal(sameMarkerShape(m, l('top', '<<<<<<< ours', 'o', '=======', 'T', '>>>>>>> theirs', 'bottom')), false); // content differs
+  assert.equal(sameMarkerShape(m, l('top', '<<<<<<< ours', 'o', '=======', 't', 'bottom')), false); // length differs
+  assert.equal(sameMarkerShape(m, l('top', '>>>>>>> ours', 'o', '=======', 't', '<<<<<<< theirs', 'bottom')), false); // other marker kind
+  assert.equal(sameMarkerShape(m, l('top', '<<<<<<<', 'o', '=======', 't', '>>>>>>> theirs', 'bottom')), false); // not a marker line with a label
+  assert.equal(sameMarkerShape(l('<<<<<<< a'), ['<<<<<<< a\r\n']), false); // line ending differs
+  assert.equal(sameMarkerShape(['<<<<<<< a\r\n'], ['<<<<<<< b\r\n']), true);
+  assert.equal(sameMarkerShape(['plain\n'], ['plain']), false);
 });
 
 test('parseConflictBlocks: 5000 blocks is "too-many-blocks" at once (no recursion, no throw); the limit itself still parses', () => {

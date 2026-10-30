@@ -1,9 +1,10 @@
 // Text-level half of "was this merge conflict resolved only by SELECTING lines the two sides already had?" (the git half is
 // git.mjs#resolutionReviewBase). Pure functions, no git: they take blob text and answer yes / no / "cannot tell".
 //
-// The inputs are three blobs of one conflicted file: the marker blob (git's trial merge with conflict markers left in,
-// merge style: no base section), the two sides' blobs (stages 2 and 3 of that merge), and the resolved file from the branch
-// head. Everything is compared as byte-exact lines that KEEP their terminators ("a\r\n" and "a\n" are different lines, a
+// The inputs are three texts of one conflicted file: the marker blob (git's trial merge with conflict markers left in,
+// merge style: no base section), the same merge with every conflict resolved to `ours` and again to `theirs` (`git merge-file
+// --ours / --theirs`: unlike the raw stage blobs, those keep the clean hunks git auto-merged from one side), and the resolved
+// file from the branch head. Everything is compared as byte-exact lines that KEEP their terminators ("a\r\n" and "a\n" are different lines, a
 // last line without "\n" keeps its missing terminator), so an editor that rewrites EOLs, trailing spaces or a final newline
 // makes the answer "no". Any doubt is "no": the caller treats it as a counted whole-PR round, which is today's behaviour.
 
@@ -51,11 +52,21 @@ const CLOSE = /^>{7} [^\r\n]*\r?\n$/;
 const MARKER_LIKE = /^(?:(?:<{7}|>{7}|\|{7})(?: [^\r\n]*)?|={7})\r?\n?$/;
 export const isMarkerLine = (line) => MARKER_LIKE.test(line);
 
-// Walks M (marker blob lines) against S2 / S3 (the sides' blob lines). Outside lines must be equal in M, S2 and S3; between
-// an opening marker and `=======` the lines must be the next lines of S2, between `=======` and the closing marker the next
-// lines of S3. That reconstruction check is what settles a "=======" line that is content: only a split that rebuilds BOTH
-// side blobs byte for byte is a parse. When a side's blob ends without a newline, git writes one before the next marker; that
-// single added "\n" is accepted on the side's last line and the blob's own bytes are what the side's line is.
+// Do two marker texts (lines, terminators kept) agree byte for byte except for the label text on the `<<<<<<< ` and
+// `>>>>>>> ` lines? Labels are compared by shape only (a marker line, with the same line ending): merge-tree writes commit ids,
+// `git merge-file` writes whatever -L said. Anything else that differs is a different merge.
+export function sameMarkerShape(a, b) {
+  if (a.length !== b.length) return false;
+  const eol = (line) => (line.endsWith('\r\n') ? '\r\n' : line.endsWith('\n') ? '\n' : '');
+  return a.every((line, i) => line === b[i] || (((OPEN.test(line) && OPEN.test(b[i])) || (CLOSE.test(line) && CLOSE.test(b[i]))) && line.slice(0, 7) === b[i].slice(0, 7) && eol(line) === eol(b[i])));
+}
+
+// Walks M (marker blob lines) against S2 / S3, the favor-ours / favor-theirs merges of the same file (M with every conflict block
+// replaced by its ours / theirs side; the raw stage blobs would do for a file without clean auto-merged hunks, but not
+// otherwise). Outside lines must be equal in M, S2 and S3; between an opening marker and `=======` the lines must be the next
+// lines of S2, between `=======` and the closing marker the next lines of S3. That reconstruction check is what settles a "=======" line that is content: only a split that rebuilds BOTH
+// side texts byte for byte is a parse. When a side's text ends without a newline, git writes one before the next marker; that
+// single added "\n" is accepted on the side's last line and the text's own bytes are what the side's line is.
 // -> { outsides: [lines[]] (blocks + 1 of them), blocks: [{ ours: lines[], theirs: lines[] }] } | { reason: 'no-parse' | 'ambiguous' | 'too-many-blocks' }
 export function parseConflictBlocks(markerLines, stage2Lines, stage3Lines, tick = makeBudget()) {
   const M = markerLines;
