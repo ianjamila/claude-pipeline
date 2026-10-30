@@ -4,6 +4,9 @@
 // (`dev-bind`), by process ancestry only. All judgement is in lib/stacks/dev.mjs. This hook NEVER blocks: whatever happens
 // (bad input, a failed import, a probe error, the internal 8 s deadline) it exits 0, at worst leaving a line in the log.
 // Windows: exits 0 at once.
+// Fast path: lib/stacks/fastpath.mjs decides first, from the payload and the ledger file's mtime alone, whether runDevBind could
+// append anything (a later plain `ls` may be the call that binds an earlier dev server, so the command alone is not enough), and
+// lib/stacks/dev.mjs with locks, ledger and identity is only loaded when it could. Any error in the fast path takes the full path.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -30,8 +33,17 @@ async function readInput() {
 
 try {
   const input = await readInput();
-  const { runDevBind } = await import('../lib/stacks/dev.mjs');
-  await runDevBind(input);
+  let skip = false;
+  try {
+    const { devBindFastSkip } = await import('../lib/stacks/fastpath.mjs');
+    skip = devBindFastSkip({ input }) === true;
+  } catch {
+    skip = false; // the full path decides
+  }
+  if (!skip) {
+    const { runDevBind } = await import('../lib/stacks/dev.mjs');
+    await runDevBind(input);
+  }
 } catch (err) {
   logFailure(err);
 }
