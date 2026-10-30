@@ -984,3 +984,94 @@ test('Phase 3b: a program that resolves into a review folder is judged like any 
   };
   assert.equal(bash('node run.mjs', opts), 'deny');
 });
+
+// ---- #111: a review folder reached through a symlink (real filesystem) -----------------------------------------
+// The link is made in a PRIOR step, the way an agent would: a link a judged program makes itself does not exist yet when the hook
+// looks, so no stat can see it (a residual class, like every run-time-built path).
+
+function reviewAliasWorld(t) {
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-review-')));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  const home = path.join(tmp, 'home');
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  const cwd = path.join(tmp, 'repo');
+  fs.mkdirSync(path.join(cwd, '.review', 'round-1'), { recursive: true });
+  const alias = path.join(tmp, 'alias');
+  const ralias = path.join(tmp, 'ralias');
+  try {
+    fs.symlinkSync(path.join(cwd, '.review'), alias, 'dir');
+    fs.symlinkSync(path.join(cwd, '.review', 'round-1'), ralias, 'dir');
+    fs.symlinkSync('.review', path.join(cwd, 'rv'), 'dir'); // (a relative link inside the checkout)
+  } catch (e) {
+    if (e.code === 'EPERM' || e.code === 'EACCES') return null;
+    throw e;
+  }
+  const opts = { home, env: {}, cwd, platform: process.platform };
+  return {
+    tmp, cwd, alias, ralias,
+    bash: (cmd) => evaluateBashForFiles(cmd, opts).decision,
+    write: (p) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: p, content: 'x' }, cwd }, opts).decision,
+  };
+}
+
+test('#111: a protected review file written through a symlink to .review or .review/round-N is denied', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return t.skip('cannot create symlinks here');
+  const { alias: A, ralias: R } = w;
+  assert.equal(w.write(`${A}/state.json`), 'deny');
+  assert.equal(w.write(`${R}/codex.json`), 'deny');
+  assert.equal(w.write(`${R}/sub/deeper.json`), 'deny');
+  for (const cmd of [
+    `echo x > ${A}/state.json`,
+    `echo x > ${R}/codex.json`,
+    `cd ${A} && echo x > state.json`,
+    `cp /tmp/x ${A}/state.json`,
+    `cp /tmp/x ${A}/final-gate.json`,
+    `cp /tmp/x ${A}/production-smoke.json`,
+    `cp /tmp/x ${R}/codex.json`,
+    `tee ${A}/state.json < /tmp/x`,
+    `node -e "require('fs').writeFileSync('${A}/state.json','x')"`,
+    `node -e "require('fs').writeFileSync(require('path').join('${A}','state.json'),'x')"`,
+    `node -e "const d='${A}'; require('fs').writeFileSync(d+'/state.json','x')"`,
+    `node -e "const d='${R}'; require('fs').writeFileSync(d+'/codex.json','x')"`,
+    `node -e "require('fs').writeFileSync('${R}/codex.json','x')"`,
+    `node -e "process.chdir('${A}'); require('fs').writeFileSync('state.json','x')"`,
+    `node -e "process.chdir('${R}'); require('fs').writeFileSync('codex.json','x')"`,
+    'cp /tmp/x rv/state.json',
+    'echo x > rv/state.json',
+    `node -e "require('fs').writeFileSync('rv/state.json','x')"`,
+    `node -e "process.chdir('rv'); require('fs').writeFileSync('state.json','x')"`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+});
+
+test('#111: the inode check works on injected inodes too (file tools and redirects, no real filesystem)', () => {
+  const ids = { '/repo/.review': 'd:1', '/repo/.review/round-1': 'd:2', '/alias': 'd:1', '/ralias': 'd:2' };
+  const fake = { statId: (p) => ids[p] ?? null, readDir: (d) => (d === '/repo/.review' ? ['round-1', 'notes', 'round-x'] : []) };
+  assert.equal(file('Write', { file_path: '/alias/state.json', content: 'x' }, fake), 'deny');
+  assert.equal(file('Write', { file_path: '/ralias/codex.json', content: 'x' }, fake), 'deny');
+  assert.equal(file('Write', { file_path: '/ralias/a/b.json', content: 'x' }, fake), 'deny');
+  assert.equal(file('Write', { file_path: '/alias/hardstops.json', content: 'x' }, fake), 'allow');
+  assert.equal(file('Write', { file_path: '/other/state.json', content: 'x' }, fake), 'allow');
+  assert.equal(bash('echo x > /alias/state.json', fake), 'deny');
+  assert.equal(bash('echo x > /alias/hardstops.json', fake), 'allow');
+  // (no review folder: no entry, no error)
+  assert.equal(file('Write', { file_path: '/alias/state.json', content: 'x' }, { statId: () => null }), 'allow');
+});
+
+test('#111: scratch files directly in .review stay writable, by name and through a symlink', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return t.skip('cannot create symlinks here');
+  const { alias: A, cwd } = w;
+  assert.equal(w.write(`${cwd}/.review/hardstops.json`), 'allow');
+  assert.equal(w.write(`${A}/hardstops.json`), 'allow');
+  for (const cmd of [
+    'node ~/.claude/pipeline/bin/pipeline.mjs hardstops --base origin/main --head HEAD > .review/hardstops.json',
+    'mkdir -p .review',
+    'echo x > .review/hardstops.json',
+    `echo x > ${A}/hardstops.json`,
+    `cp /tmp/x ${A}/hardstops.json`,
+    `node -e "require('fs').writeFileSync('${A}/hardstops.json','x')"`,
+    `cat ${A}/state.json`,
+    `ls -la ${A} ${w.ralias}`,
+  ]) assert.equal(w.bash(cmd), 'allow', cmd);
+});

@@ -28,6 +28,7 @@ import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultRe
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
+const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
 const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|prod-before|[\w.-]*smoke)/i;
@@ -244,6 +245,44 @@ function makeCtx(opts) {
   const pipelineHit = (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); };
   const pipelineAncestor = (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); };
   let rootIds = null;
+  // #111: a symlink (or any other spelling) of the cwd's review folder. dev:ino of <cwd>/.review and of each existing
+  // <cwd>/.review/round-*; none when the folder is missing (no error). NOT added to rootIds: hitInode walks the ancestors of a
+  // target, so that would protect every child of .review (hardstops.json and other scratch files must stay writable).
+  let reviewIds = null;
+  const reviewFolders = () => {
+    if (reviewIds !== null) return reviewIds;
+    const dir = api.statId(pathsFor().join(cwd, '.review'));
+    const rounds = new Set();
+    if (dir !== null) {
+      const names = (opts.readDir ?? defaultReadDir)(pathsFor().join(cwd, '.review'));
+      if (Array.isArray(names)) for (const n of names) if (/^round-\d+$/.test(n)) { const id = api.statId(pathsFor().join(cwd, '.review', n)); if (id !== null) rounds.add(id); }
+    }
+    reviewIds = { dir, rounds };
+    return reviewIds;
+  };
+  // Is `p` a protected review file reached through another name for the folder? (a) its parent directory IS <cwd>/.review and its
+  // basename is a protected name (REVIEW_FILE_SRC): the protected-NAME rule, so scratch files in .review stay writable; (b) it is, or
+  // lies under, an existing round-* folder (everything in a round is protected); (c) withDir: it IS <cwd>/.review itself under a name
+  // that is not `.review` (a program that chdirs there, or builds a name below it, writes a protected file the text never names).
+  // A link the judged program makes itself does not exist yet when the hook looks: no stat can see it (a residual class).
+  const hitReviewInode = (p, withDir = false) => {
+    const { dir, rounds } = reviewFolders();
+    if (dir === null) return false;
+    const P = pathsFor();
+    const base = P.basename(p);
+    if (reviewFile.test(`.review/${base}`) && api.statId(P.dirname(p)) === dir) return true;
+    if (withDir && (ci ? base.toLowerCase() : base) !== '.review' && api.statId(p) === dir) return true;
+    if (rounds.size === 0) return false;
+    let cur = p;
+    for (let i = 0; i < 64; i++) {
+      const id = api.statId(cur);
+      if (id !== null && rounds.has(id)) return true;
+      const parent = P.dirname(cur);
+      if (parent === cur) return false;
+      cur = parent;
+    }
+    return false;
+  };
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
     user: opts.user ?? posix.basename(homePosix),
@@ -272,8 +311,10 @@ function makeCtx(opts) {
     unFirm,
     // Is `p`, or the nearest existing directory above it, the very same file or directory (same device and inode) as a
     // protected root? Catches hard links and any other spelling of the path that realpath does not unify.
+    hitReviewInode,
     hitInode: (p) => {
       if (rootIds === null) rootIds = new Set(roots.map((r) => api.statId(r)).filter(Boolean));
+      if (hitReviewInode(p)) return true;
       if (rootIds.size === 0) return false;
       let cur = p;
       for (let i = 0; i < 64; i++) {
@@ -740,10 +781,25 @@ function makeMatchers(ctx) {
     }
     return rawHitOne(text, dirs) || rs.some((r) => rawHitOne(r, dirs));
   };
+  // #111: a path-like word of `text` that is another name for the cwd's review folder (or a protected file in it, or anything in a round):
+  // a program given such a path, or one that chdirs there, writes a protected file the text never names. Relative words are resolved
+  // against the directories inside the cwd only (a stat of every word under every assumed directory would walk the whole machine).
+  const ALIAS_WORD = /[^\s'"`;|&<>(){}[\],=*?$]+/g;
+  const aliasInText = (v, dirs) => {
+    if (v.length > MAX_ALIAS_TEXT) return false;
+    const where = (dirs?.length ? dirs : [ctx.cwd]).filter((d) => isInside(d, ctx.cwd, ctx.platform));
+    for (const word of new Set(v.match(ALIAS_WORD) ?? [])) {
+      if (!/[A-Za-z0-9]/.test(word)) continue;
+      const e = word === '~' || word.startsWith('~/') ? pathsFor().join(ctx.homePosix, word.slice(1)) : word;
+      for (const d of isAbs(e) ? [''] : where) if (ctx.hitReviewInode(isAbs(e) ? pathsFor().normalize(e) : pathsFor().join(d, e), true)) return true;
+    }
+    return false;
+  };
   const rawHitOne = (text, dirs) => {
     for (const v of refVariants(String(text), ctx)) {
       if (rootRes.some((re) => re.test(v))) return true;
       if (reviewText.test(v)) return true; // (a repo's review state: protected wherever it is, so the name alone is the reference)
+      if (aliasInText(v, dirs)) return true;
       if (!(ctx.ci ? v.toLowerCase() : v).includes('.claude')) continue;
       if (suffix.nonlit.test(v)) return true;
       if (dirs) {
