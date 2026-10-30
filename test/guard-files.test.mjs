@@ -1135,6 +1135,19 @@ test('#111: repeated ancestors of the words of a long line are stat-ed once (per
   assert.ok(calls < 2000 * 2, `${calls} stat calls for 2000 words`); // (uncached: one per ancestor per word, ~6 per word)
 });
 
+test('#111: many words times many cd targets is refused with a review folder (bounded stats), allowed without one', () => {
+  const ids = { '/repo/.review': 'd:1', '/repo/.review/round-1': 'd:2' };
+  let calls = 0;
+  const statId = (p) => { calls++; return ids[p] ?? null; };
+  const readDir = (d) => (d === '/repo/.review' ? ['round-1'] : []);
+  const cds = Array.from({ length: 25 }, (_, i) => `cd /outside${i}`).join(' && ');
+  const words = Array.from({ length: 1000 }, (_, i) => `src/deep/f${i}.js`).join(' ');
+  assert.equal(bash(`${cds} && touch ${words}`, { statId, readDir }), 'deny');
+  assert.ok(calls < 5000, `${calls} stat calls for 1000 words x 26 directories`); // (uncapped: one per ancestor per word per directory)
+  // (no review folder: nothing to reach, the same line is judged as before)
+  assert.equal(bash(`${cds} && touch ${words}`, { statId: () => null, readDir: () => [] }), 'allow');
+});
+
 test('#111: after a cd to a folder outside the checkout, a relative path through a link to the review folder is followed', (t) => {
   const w = reviewAliasWorld(t);
   if (!w) return;

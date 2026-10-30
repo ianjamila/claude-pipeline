@@ -28,6 +28,7 @@ import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultRe
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
+const MAX_ALIAS_LOOKUPS = 20_000; // (#111: distinct words x directories the line may be in; above it the text is refused like an over-long one, so the stats stay bounded)
 const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
@@ -797,12 +798,15 @@ function makeMatchers(ctx) {
   // against every directory the line may be in (the cwd and each cd target, outside the checkout too: `cd $T && cp x alias/state.json`,
   // `cd $T && node -e "process.chdir('alias'); …"`). The directories are the line's own (at most 32, see collectDirs) and every stat is
   // cached per evaluation, so this stays cheap; with no review folder nothing is looked up at all.
-  // A text over the cap is not scanned word by word: with a review folder present it counts as a hit (fail closed; without one nothing can be reached).
+  // A text over either cap (its length, or its distinct words times the directories) is not scanned word by word: with a review folder
+  // present it counts as a hit (fail closed; without one nothing can be reached).
   const ALIAS_WORD = /[^\s'"`;|&<>(){}[\],=*?$]+/g;
   const aliasInText = (v, dirs) => {
     if (v.length > MAX_ALIAS_TEXT) return ctx.hasReviewDir();
     const where = dirs?.length ? dirs : [ctx.cwd];
-    for (const word of new Set(v.match(ALIAS_WORD) ?? [])) {
+    const words = new Set(v.match(ALIAS_WORD) ?? []);
+    if (words.size * where.length > MAX_ALIAS_LOOKUPS) return ctx.hasReviewDir();
+    for (const word of words) {
       if (!/[A-Za-z0-9]/.test(word)) continue;
       const e = word === '~' || word.startsWith('~/') ? pathsFor().join(ctx.homePosix, word.slice(1)) : word;
       for (const d of isAbs(e) ? [''] : where) if (ctx.hitReviewInode(isAbs(e) ? pathsFor().normalize(e) : pathsFor().join(d, e), true)) return true;
@@ -1515,8 +1519,7 @@ function collectDirs(cmds, ctx, cdOnly = false) {
   };
   for (const [ci, c] of cmds.entries()) {
     // commands that run relative to another directory: git -C DIR, tar -C DIR, unzip -d DIR, make -C DIR, cp -t DIR
-    if (!cdOnly) for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
-    const cdName = baseOf(c.argv[0] ?? '');
+    if (!cdOnly) for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));    const cdName = baseOf(c.argv[0] ?? '');
     if (!CD_CMDS.has(cdName)) continue;
     let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
     if (!t && (cdName === 'cd' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
@@ -1551,8 +1554,7 @@ function baseDirsOf(argv) {
     }
   } else if (name === 'tar' || name === 'bsdtar' || name === 'gtar') flagValue('C', 'directory');
   else if (name === 'unzip') flagValue('d', 'directory');
-  else if (name === 'make' || name === 'gmake') flagValue('C', 'directory');
-  else if (name === 'cp' || name === 'mv' || name === 'install' || name === 'ln') flagValue('t', 'target-directory');
+  else if (name === 'make' || name === 'gmake') flagValue('C', 'directory');  else if (name === 'cp' || name === 'mv' || name === 'install' || name === 'ln') flagValue('t', 'target-directory');
   else if (name === 'rsync') { const pos = args.filter((a) => !a.startsWith('-')); if (pos.length >= 2) out.push(pos[pos.length - 1]); }
   return out;
 }
