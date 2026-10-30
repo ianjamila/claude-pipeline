@@ -11,8 +11,9 @@ import { GitError, git } from '../git.mjs';
 import { listWorktrees } from '../local-branches.mjs';
 import { LockTimeoutError, withLock } from '../locks.mjs';
 import { canonicalPath, isInside, samePath } from '../paths.mjs';
-import { entriesFor, processesInside, recentFiles, walkTree } from './inspect.mjs';
-import { classifyEntries } from './rules.mjs';
+import { entriesFor, pathSpellings, processesInside, recentFiles, walkTree } from './inspect.mjs';
+import { liveSessionsIn, scanLiveSessions } from './live-sessions.mjs';
+import { classifyEntries, liveSessionReasons } from './rules.mjs';
 
 const DAY_MS = 86400e3;
 const MANIFEST = 'MANIFEST.json';
@@ -455,7 +456,9 @@ const RUN_ID = /^[A-Za-z0-9_-]+$/; // no dot: restoreLeftovers splits <slug>.<ru
 const gitMessage = (err) => String(err instanceof GitError ? err.message : err?.message ?? err).replace(/\s*\n\s*/g, ' ').trim();
 
 // Final inspection of the quarantined tree (spec §2 step 3). -> null when it may go, else the reason to keep it.
-function reinspect(q, cfg, runStartMs, procOpts) {
+// `live` = { scan, spellings }: a FRESH scan of the open Claude sessions (one may have moved in since the run began),
+// matched against the spellings of the path the worktree had BEFORE the move (the quarantine path is only temporary).
+function reinspect(q, cfg, runStartMs, procOpts, live) {
   let walk;
   let classified;
   try {
@@ -469,6 +472,8 @@ function reinspect(q, cfg, runStartMs, procOpts) {
   if (recent.length) return { reason: `write detected during removal (${recent[0]})` };
   const procs = processesInside(q, procOpts);
   if (!procs.available || procs.pids.length) return { reason: 'in use during removal' };
+  const open = liveSessionReasons(liveSessionsIn(live.scan(), [...live.spellings, ...pathSpellings(q)]));
+  if (open.length) return { reason: `in use during removal: ${open.join('; ')}` };
   for (const rel of [...classified.del, ...classified.arch]) {
     try {
       const abs = resolveInside(q, rel, 'remove');
@@ -501,11 +506,13 @@ function deleteInside(q, rel) {
 // re-inspect there, then archive + delete + `git worktree remove`. Any doubt after the move => move it back and keep it.
 // The quarantine sits next to the worktree: candidates are direct children of <root>/<worktree_dir>.
 // -> { removed: true, archived: [manifest items], deleted: [rels] } | { removed: false, reason, restored }
-export async function removeWorktree({ root, wt, cfg, pr, holdingDir, runId, runStartMs, settleMs = 5000, hooks = {}, procOpts, lockDir, lockWaitMs, lockPollMs }) {
+// `liveScan` -> a scan of the open Claude sessions (live-sessions.mjs); it is called once, after the move and the settle wait.
+export async function removeWorktree({ root, wt, cfg, pr, holdingDir, runId, runStartMs, settleMs = 5000, hooks = {}, procOpts, liveScan = scanLiveSessions, lockDir, lockWaitMs, lockPollMs }) {
   if (!RUN_ID.test(String(runId))) throw new Error(`removeWorktree: runId must match ${RUN_ID}: ${runId}`);
   if (!Number.isFinite(runStartMs)) throw new Error('removeWorktree: runStartMs must be a number');
   const qDir = path.join(path.dirname(wt.path), QUARANTINE_DIR);
   const q = path.join(qDir, `${wt.slug}.${runId}`);
+  const spellings = pathSpellings(wt.path); // while the worktree is still there to resolve
   try {
     mkdirSync(qDir, { recursive: true });
     if (lstatSync(qDir).isSymbolicLink()) return { removed: false, reason: `move refused: ${qDir} is a symlink`, restored: false };
@@ -528,7 +535,7 @@ export async function removeWorktree({ root, wt, cfg, pr, holdingDir, runId, run
   try {
     await hooks.afterMove?.(q);
     if (settleMs > 0) await new Promise((r) => setTimeout(r, settleMs));
-    verdict = reinspect(q, cfg, runStartMs, procOpts);
+    verdict = reinspect(q, cfg, runStartMs, procOpts, { scan: liveScan, spellings });
   } catch (err) {
     return moveBack(`could not re-inspect during removal: ${gitMessage(err)}`);
   }

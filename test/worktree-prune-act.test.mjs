@@ -7,7 +7,11 @@ import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { tryAcquire, release } from '../pipeline/lib/locks.mjs';
-import { archivePaths, archivePathsLocked, holdingLockName, listHolding, purgeHolding, purgeHoldingLocked, holdingRoot, removeWorktree, restoreLeftovers, QUARANTINE_DIR } from '../pipeline/lib/worktree-prune/act.mjs';
+import { archivePaths, archivePathsLocked, holdingLockName, listHolding, purgeHolding, purgeHoldingLocked, holdingRoot, removeWorktree as removeWorktreeReal, restoreLeftovers, QUARANTINE_DIR } from '../pipeline/lib/worktree-prune/act.mjs';
+
+// removeWorktree scans the open Claude sessions of THIS machine unless told otherwise; these tests never read the real ones.
+const noSessions = () => ({ available: false, reason: 'test' });
+const removeWorktree = (opts) => removeWorktreeReal({ liveScan: noSessions, ...opts });
 
 // Same fixture as test/worktree-prune-inspect.test.mjs: a repo with an origin, an ignore list and a .worktrees dir.
 function world() {
