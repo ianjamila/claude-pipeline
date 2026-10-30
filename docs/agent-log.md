@@ -89,3 +89,4 @@ full record.
 - 2026-10-30 · #121 · fix(review): resolution-only rounds tolerate clean hunks in a conflicted file; bounded search; pinned rename config · risk high · rounds 4 · arbiter 3 · merged
 - 2026-10-30 · #124 · perf(hooks): stack-register and stack-dev-bind decide cheaply before loading the stack libraries · risk high · rounds 2 · arbiter 0 · awaiting-owner-merge
 - 2026-10-30 · #123 · feat(worktrees): prune keeps a worktree an open Claude session is in, however long it has been idle · risk high · rounds 2 · arbiter 1 · awaiting-owner-merge
+- 2026-10-30 · #123 · feat(worktrees): prune keeps a worktree an open Claude session is in, however long it has been idle · risk high · rounds 2 · arbiter 1 · merged
