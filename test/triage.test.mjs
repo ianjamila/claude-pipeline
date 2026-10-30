@@ -26,7 +26,9 @@ import {
   fableFindingItems,
   roundCapProblem,
   FABLE_FINDINGS_MAX,
+  rulingContentDigest,
 } from '../pipeline/lib/triage.mjs';
+import { assignIds } from '../pipeline/lib/codex.mjs';
 
 // ---- fixtures -------------------------------------------------------------------------------
 
@@ -1388,4 +1390,47 @@ test('reuseRuled: a fixed SUGGESTION comes back implemented; a re-raised BLOCKIN
   assert.deepEqual(ob.unimplemented, [d.id]);
   // Newest wins: a later copy that is not marked fixed clears the flag.
   assert.equal(ruledCacheFrom([fixed, item({ ...sugg, fingerprint: 'fx', final: settled('ACCEPT', 'cache'), implemented: false })]).fx.implemented, undefined);
+});
+
+// ---- #110: the content digest an owner ruling is bound to -----------------------------------
+
+// Items from the REAL producers (Codex: assignIds; Fable: fableFindingItems), never hand-made {title, body}.
+const codexFinding = (over = {}) => ({
+  title: 'Missing null check', file: 'src/a.js', line: 12, category: 'bug', detail: 'x is read before it is checked',
+  reasoning: 'compute(x.y) throws when x is undefined', testable: true, ...over,
+});
+const codexItems = (over = {}) => assignIds({ summary: 's', blocking: [codexFinding(over)], suggestions: [codexFinding({ title: 'Rename helper', file: 'src/b.js', line: 3 })], worth_considering: [] }, 1);
+
+test('rulingContentDigest: 12 hex over exactly the finding text, in id order whatever the order given', () => {
+  const [b1, s1] = codexItems();
+  const d = rulingContentDigest([b1, s1]);
+  assert.match(d, /^[0-9a-f]{12}$/);
+  assert.equal(rulingContentDigest([s1, b1]), d, 'sorted by id');
+  assert.notEqual(rulingContentDigest([b1]), d, 'the set of ids is part of it');
+  assert.equal(rulingContentDigest([{ ...b1, id: 'r1-b1' }, s1]), d, 'the id is read in upper case');
+});
+
+test('rulingContentDigest: every finding-text field of both producers changes it, one at a time', () => {
+  const base = rulingContentDigest(codexItems());
+  for (const [field, value] of [['title', 'Another title'], ['detail', 'a different detail'], ['reasoning', 'different codex reasoning'], ['file', 'src/z.js'], ['line', 13], ['category', 'security']]) {
+    const [b1, s1] = codexItems({ [field]: value });
+    assert.notEqual(rulingContentDigest([b1, s1]), base, `codex ${field}`);
+  }
+  const [b1, s1] = codexItems();
+  assert.notEqual(rulingContentDigest([{ ...b1, bucket: 'SUGGESTION' }, s1]), base, 'bucket');
+  const fable = () => fableFindingItems([fableFinding()], 1);
+  const fbase = rulingContentDigest(fable());
+  for (const [field, value] of [['title', 'other'], ['detail', 'other'], ['file', 'lib/x.ts'], ['line', 4], ['category', 'data-loss'], ['bucket', 'SUGGESTION'], ['reasoning', 'a different reasoning']]) {
+    const f = field === 'reasoning' ? fableFinding({ reasoning: value }) : fableFinding({ [field]: value });
+    // a Fable item's reasoning lives at item.arbiter.reasoning
+    assert.notEqual(rulingContentDigest(fableFindingItems([f], 1)), fbase, `fable ${field}`);
+  }
+  assert.notEqual(rulingContentDigest([{ ...fable()[0], source: 'codex' }]), fbase, 'source');
+});
+
+test('rulingContentDigest: ignores the decision fields, so applying one ruling does not change the others', () => {
+  const [b1, s1] = codexItems();
+  const base = rulingContentDigest([b1, s1]);
+  const ruled = applyOwnerRuling({ ...b1, final: { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'x' } }, { decision: 'ACCEPT', reason: 'r', ownerQuote: 'R1-B1: accept', ruledAt: '2026-10-30T00:00:00Z' });
+  assert.equal(rulingContentDigest([{ ...ruled, implemented: true, followupIssue: 12, test: { status: 'bug-confirmed', evidence: 'e' }, judge: { decision: 'ACCEPT' } }, s1]), base);
 });

@@ -406,7 +406,7 @@ Without `.review/state.json` only `--outcome blocked`, `awaiting-review`, `stopp
 
 ## triage
 
-apply the judge triage, settle disputed bugs with test results, close the light lane, record owner rulings made in chat.
+apply the judge triage, settle disputed bugs with test results, close the light lane, ask for and record owner rulings made in chat.
 
 ```
 pipeline triage validate --round R (--from-tag TAG | --file F) [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
@@ -416,15 +416,18 @@ pipeline triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd C
   -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented
   -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman
 pipeline triage light-lane --round R [--repo DIR]
+pipeline triage ruling-request --pr N --ids ID[,ID…] [--repo DIR]
+  -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state's, or a repository off github.com)
 pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]
   -> {ok, round, id, final, published: false, next}; records the OWNER's decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human
   -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state's
   -> works on an already published round. ACCEPT still needs the fix and a later review round; FOLLOW-UP is filed by `followups create`; the quote is published in the triage comment and the final gate counts it as ownerMerge (the owner's "merge" is still needed)
-  -> the quote must be the WHOLE owner prompt that answered a reply ENDING with `⚖️ Owner ruling needed #N: ID[, ID…] · repo owner/name` (the owner-go hook records it; any session, last 24 h; white space and case aside), and that answer must be nothing but decisions, `ID: accept|follow-up|reject` per asked id, the id always written (any other word decides nothing; over 1000 characters is not recorded); exit 1 otherwise, or when gh resolves the repository off github.com
+  -> the quote must be the WHOLE owner prompt that answered a reply ENDING with the line `triage ruling-request` printed (`⚖️ Owner ruling needed #N: ID[, ID…] · content <digest12> · repo owner/name`; the owner-go hook records it; any session, last 24 h; white space and case aside), and that answer must be nothing but decisions, `ID: accept|follow-up|reject` per asked id, the id always written (any other word decides nothing; over 1000 characters is not recorded); exit 1 otherwise, or when gh resolves the repository off github.com
+  -> the request is bound to the findings' text: the digest is recomputed over ALL the ids of the request from the current review state and must equal the recorded one, so a rebuilt review that reuses an id for a changed finding (or a request in the old line shape, with no digest) cannot reuse the ruling; ask again with ruling-request
   -> pass the owner's own words as --owner-quote, never a paraphrase; then re-post the triage comment NOW (`pipeline comment --pr N --kind triage`); until then the ruling is local only (`published: false`) and `pipeline state show` restores the published state without it
 ```
 
-Exit: `validate`: 0 applied, 1 judge output invalid (state untouched) · `settle`: 0 recorded, 1 refused · `light-lane`: 0 · `owner-ruling`: 0 recorded, 1 refused (label mode, a settled or missing item, empty words, a wrong --pr, no recorded owner answer that is the quote and says the decision) · 2 usage / no state.
+Exit: `validate`: 0 applied, 1 judge output invalid (state untouched) · `settle`: 0 recorded, 1 refused · `light-lane`: 0 · `ruling-request`: 0 the line, 1 refused (unknown id, a wrong --pr, a repository off github.com) · `owner-ruling`: 0 recorded, 1 refused (label mode, a settled or missing item, empty words, a wrong --pr, no recorded owner answer that is the quote and says the decision, or one bound to other finding text or to no content digest) · 2 usage / no state.
 
 ## update
 
