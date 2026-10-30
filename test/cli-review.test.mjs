@@ -83,7 +83,8 @@ const fenced = (obj) => `Done.\n\n\`\`\`json\n${JSON.stringify(obj)}\n\`\`\``;
 
 // By default the feature commit is big enough (>= 50 changed lines) to be off the light lane, so the arbiter rules apply in
 // full; `light: true` keeps the change tiny.
-function world(t, { gh = GH, light = false, yml = pipelineYml() } = {}) {
+// baseFiles / featFiles: extra { path: content } committed in the base commit / the feature commit.
+function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {}, featFiles = {} } = {}) {
   const repo = createTmpRepo();
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
@@ -92,10 +93,12 @@ function world(t, { gh = GH, light = false, yml = pipelineYml() } = {}) {
   repo.write('.gitignore', '.review/\n');
   repo.write('src/a.js', aFile(false));
   repo.write('src/b.js', bFile);
+  for (const [p, c] of Object.entries(baseFiles)) repo.write(p, c);
   const base = repo.commit('init');
   repo.branch('feat/x');
   repo.write('src/a.js', aFile(true));
   if (!light) repo.write('src/big.js', Array.from({ length: 60 }, (_, i) => `export const big${i} = ${i};`).join('\n') + '\n');
+  for (const [p, c] of Object.entries(featFiles)) repo.write(p, c);
   const head = repo.commit('feature');
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-review-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -3005,8 +3008,31 @@ test('codex-review: an ineligible conflict round at the cap is refused (round-ca
   const capped = w.codex(2, findingsOf(), { from: w.head, to: head2 });
   assertExit(capped, 2, capped.stdout);
   assert.equal(capped.json.error, 'round-cap');
+  assert.match(capped.json.resolutionIneligible, /^history-nonmerge/, 'the refusal says why the free resolution round was not available');
   assert.equal(w.captured().length, 1, 'Codex never ran');
   assert.equal(w.state().rounds.length, 1);
+});
+
+test('codex-review: a drop in block 55 of 60 is in the prompt (not "kept every line") and in the stored totals; dropped blocks come first', (t) => {
+  // 60 blocks, five unchanged lines apart so git keeps them separate; the resolver keeps main's side everywhere but block 55.
+  const lines = (name) => Array.from({ length: 300 }, (_, i) => (i % 5 === 0 ? `${name}${i}` : `keep${i}`));
+  const text = (xs) => xs.join('\n') + '\n';
+  const w = worldIgnoringReview(t, { baseFiles: { 'src/many.txt': text(lines('base')) }, featFiles: { 'src/many.txt': text(lines('feat')) } });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const resolved = lines('main');
+  resolved[270] = 'feat270'; // block 55
+  const merged = mergeMainInto(w, { 'src/many.txt': text(lines('main')) }, { resolve: { 'src/many.txt': text(resolved) } });
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.resolutionOnly, true);
+  const prompt = w.captured()[1].stdin;
+  assert.doesNotMatch(prompt, /kept every line/);
+  assert.match(prompt, /src\/many\.txt block 55: 1 line\(s\) dropped/);
+  assert.match(prompt, /1 line\(s\) of the base branch's side, in 1 of 60 conflict block/);
+  const round = w.state().rounds[1];
+  assert.deepEqual([round.blockCount, round.blocksWithDrops, round.droppedTheirsTotal], [60, 1, 1]);
+  assert.equal(round.blocks.length, 50);
+  assert.deepEqual(round.blocks[0], { path: 'src/many.txt', block: 55, droppedTheirs: 1 }, 'the dropped block survives the cut');
 });
 
 test('codex-review: a resolution that types new text into a block stays a counted whole-pr round', (t) => {
