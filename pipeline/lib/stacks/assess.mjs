@@ -203,11 +203,13 @@ export function openSessions(stack, consumers, opts = {}) {
     const more = scanned.unplaced.length > 3 ? ` (+${scanned.unplaced.length - 3} more)` : '';
     return unknown(`open Claude sessions could not all be placed: ${scanned.unplaced.slice(0, 3).join('; ')}${more}`);
   }
+  const spelled = new Map(); // pathSpellings reads every ancestor directory: once per path
+  const spellingsOf = (p) => { if (!spelled.has(p)) spelled.set(p, pathSpellings(p)); return spelled.get(p); };
   const inDir = (session, spellings) => liveSessionsIn({ available: true, sessions: [session], unplaced: [] }, spellings, { platform }).hits.length > 0;
   const workdir = typeof stack?.workdir === 'string' && stack.workdir !== '' ? stack.workdir : null;
   const hits = [];
   for (const dir of dirs) {
-    const spellings = pathSpellings(dir);
+    const spellings = spellingsOf(dir);
     let sessions = scanned.sessions;
     if (dir === workdir) {
       const inside = sessions.filter((x) => inDir(x, spellings));
@@ -218,12 +220,12 @@ export function openSessions(stack, consumers, opts = {}) {
         try {
           nested = listWorktrees(dir)
             .filter((w) => w?.path && !w.bare && spellings.some((sp) => isInside(w.path, sp, platform) && !samePath(w.path, sp, platform)))
-            .filter((w) => !(consumers ?? []).some((cw) => typeof cw?.path === 'string' && pathSpellings(cw.path).some((sp) => samePath(sp, w.path, platform))));
+            .filter((w) => !(consumers ?? []).some((cw) => typeof cw?.path === 'string' && spellingsOf(cw.path).some((sp) => samePath(sp, w.path, platform))));
         } catch (err) {
           nested = [];
           notes.push(`worktrees of ${dir} could not be listed (${shortMsg(err)}): every open session inside it counts`);
         }
-        const own = nested.map((w) => pathSpellings(w.path));
+        const own = nested.map((w) => spellingsOf(w.path));
         sessions = inside.filter((x) => !own.some((sp) => inDir(x, sp)));
       }
     }
