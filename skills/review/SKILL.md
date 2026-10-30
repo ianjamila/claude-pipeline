@@ -108,7 +108,7 @@ items end in `needs-human` (as in step 6): the owner rules outside this session.
 2. Only after that exit 0: `gh pr ready N`. CI runs now and is the full proof: `P job start ci -- gh pr checks N --watch --required`, `P job wait ci …`.
    Red ⇒ implementer fix, push, back to step 1 of this section. Base moved ⇒ `P update-branch --pr N`, `git pull --ff-only`, review again if content changed.
 3. **STOP** (outcome `awaiting-owner-merge`; `owner_approval: label` with a blocking item parks instead, no merge request): run the stop ritual first, then tell the owner in plain English what changed, the PR link, the review outcome and
-   follow-up issues. Which ending depends on the item note from 1.5:
+   follow-up issues. Which ending depends on the item note from 1.5 (re-run 1.5 first if a review fix touched files it had not seen):
    - **Any `blocking` / `ownerMerge` / test-integrity item** (always the case for a protected-area PR under `owner_approval: chat`): NO `Head …` / `🔀` lines
      (`P merge --owner-go` refuses such a diff) and no `needs-human` label. Say the PR is reviewed and CI is green, name the protected areas it touches
      (from `.review/hardstops.json` and `P integrity`), and give the repo's `merge.command` from `P config` with `{pr}` = N and `{sha}` = the head sha

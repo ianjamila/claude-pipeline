@@ -173,7 +173,7 @@ Hard-stop PRs still go through the full review loop first, so you always get a r
 | Hard-stop needs the owner | ✅ via required `Hard-stop scan` | ✅ | ✅ label guard | ✅ |
 | Test weakening blocked | ✅ via required `Test integrity` | ✅ | ✅ label guard | |
 | Linear history / squash | ✅ | | | ✅ |
-| Full proof on the head commit | | ✅ CI runs the full verify | | ✅ final-gate checks the verify report and the required checks for that exact head |
+| Full proof on the head commit | | ✅ CI runs the full verify | | ✅ the merge checks the required checks for that exact head (and the verify report, when `final-gate` is used) |
 | Gate judges the tree that will land (branch up to date with `main`) | | | ✅ `update-branch` stays allowed, merging through the API denied | ✅ `update-branch` before the gate, again in `merge` |
 | Cross-model review happened | | | ✅ guard-files keeps agents from writing a repo's review state (`.review/state.json`, round folders, gate / smoke records); guard-git keeps them from posting the review-complete or triage markers | ✅ no review ⇒ no merge |
 | Arbiter really ran on Fable | | | | ✅ model-proof |
@@ -349,9 +349,9 @@ executable.
   yourself, then remove `needs-human`.
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
 - **`--check` reports drift:** someone edited an installed file (or an install did not finish); run `node ~/.claude/pipeline/bin/pipeline.mjs update`, or re-run `./install.sh`.
-- **A merge didn't happen:** the run's summary comment and `.review/final-gate.json` in the
-  worktree say which check failed (stale verify report, head moved, a required check not green,
-  a blocking label, a pause or rollback issue).
+- **A merge didn't happen:** `P merge` prints its refusal `reasons`, which say which check failed
+  (head moved, a required check not green, a hard-stop or test-integrity item, a blocking label,
+  a pause or rollback issue; `.review/final-gate.json` only exists when `P final-gate` was run).
 
 ## Developing this repo
 
