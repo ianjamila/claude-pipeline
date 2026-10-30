@@ -5,7 +5,8 @@
 import { EXIT, parseCommandArgs, intOption } from '../lib/cli.mjs';
 import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { GATE_FILE, evaluateGate, removeReviewFile, writeReviewJson } from '../lib/finalgate.mjs';
+import { GATE_FILE, evaluateGate, removeReviewFile } from '../lib/finalgate.mjs';
+import { writeReviewJson } from '../lib/cmd-io.mjs';
 
 export const meta = {
   summary: 'prove this PR head is verified, reviewed, CI-green and smoked; writes .review/final-gate.json',

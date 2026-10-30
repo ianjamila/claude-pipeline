@@ -8,7 +8,7 @@
 // git.tree (nothing changed in the working tree since verify ran) and contentHash (the review covered exactly
 // this patch). Each one defeats a different mistake, so none is redundant.
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gh as ghRun } from './proc.mjs';
 import { checkGuardVerdict, GUARD_CONTEXT_CHECKS } from './guard-provenance.mjs';
@@ -56,8 +56,6 @@ const AGENT_INSTRUCTION_FILES = new Set(['claude.md', 'agents.md', 'gemini.md', 
 // Instructions, hooks, workflows and the pipeline itself: text files here change what agents or CI do, so they are code.
 const NEVER_DOCS_DIRS = new Set(['.claude', '.github', '.githooks', 'skills', 'agents', 'pipeline', 'scripts']);
 const FULL_SHA = /^[0-9a-f]{40}$/;
-const TAIL_LINES = 30;
-const MAX_LINE = 400;
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const short = (sha) => (typeof sha === 'string' && sha ? sha.slice(0, 8) : String(sha));
@@ -71,16 +69,6 @@ const check = (name, ok, detail, ownerMerge = 0, ownerItems = []) => ({
 
 export const reviewFile = (root, name) => join(root, '.review', name);
 
-// tmp + rename: a reader (merge, final-gate) sees the old file or the whole new one, never half of it.
-export function writeReviewJson(root, name, value) {
-  const file = reviewFile(root, name);
-  mkdirSync(join(root, '.review'), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
-  renameSync(tmp, file);
-  return file;
-}
-
 // null when the file is absent or unparseable: for evidence, "unreadable" and "missing" both mean "not proven".
 export function readReviewJson(root, name) {
   try {
@@ -93,32 +81,6 @@ export function readReviewJson(root, name) {
 
 export function removeReviewFile(root, name) {
   rmSync(reviewFile(root, name), { force: true });
-}
-
-// Last `n` lines of command output: colours stripped, absurdly long lines (minified bundles) clipped.
-export function tailLines(text, n = TAIL_LINES) {
-  const lines = String(text ?? '')
-    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
-    .split(/\r?\n/)
-    .map((l) => (l.length > MAX_LINE ? `${l.slice(0, MAX_LINE)}...` : l));
-  while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
-  return lines.slice(-n).join('\n');
-}
-
-// node's parseArgs refuses an option value that starts with a dash (`--line "- 2026-10-01 ..."`: markdown bullets do), so
-// fold `--name value` into `--name=value` for the named options before parsing. Only the token right after the name is taken.
-export function inlineOptionValues(argv, names) {
-  const out = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (names.includes(a) && i + 1 < argv.length) {
-      out.push(`${a}=${argv[i + 1]}`);
-      i += 1;
-    } else {
-      out.push(a);
-    }
-  }
-  return out;
 }
 
 // ---- classifiers --------------------------------------------------------------------------------

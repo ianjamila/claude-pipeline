@@ -10,7 +10,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { GitError } from '../lib/git.mjs';
 import { loadState } from '../lib/state.mjs';
 import { LockTimeoutError } from '../lib/locks.mjs';
-import { inlineOptionValues } from '../lib/finalgate.mjs';
+import { inlineOptionValues } from '../lib/cmd-io.mjs';
 import {
   AGENT_LOG_BRANCH, DEFAULT_OUTCOME, LogTooLargeError, appendToQueue, buildAgentLogLine, assertSingleLine, clearWritten, landedLines, logRelPath, originLogLines, publishLines, queuePath, readQueue,
   resolveLogPath, withQueueLock, writeQueue,

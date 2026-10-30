@@ -6,9 +6,10 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  BLOCKING_LABELS, CANONICAL_CHECKS, GATE_MAX_AGE_MS, abandonMerge, blockingLabelsOf, expectedCheckNames, gateRefusals, inlineOptionValues,
-  isDocsOnly, isLogOnly, labelNames, labelsCheck, mergeTiming, readPrSettled, readReviewJson, tailLines, waitForMerge, writeReviewJson,
+  BLOCKING_LABELS, CANONICAL_CHECKS, GATE_MAX_AGE_MS, abandonMerge, blockingLabelsOf, expectedCheckNames, gateRefusals,
+  isDocsOnly, isLogOnly, labelNames, labelsCheck, mergeTiming, readPrSettled, readReviewJson, waitForMerge,
 } from '../pipeline/lib/finalgate.mjs';
+import { writeReviewJson } from '../pipeline/lib/cmd-io.mjs';
 import {
   AGENT_LOG_HEADER, appendLines, assertSingleLine, buildAgentLogLine, countArbiterCalls, resolveLogPath,
 } from '../pipeline/lib/agentlog.mjs';
@@ -107,25 +108,6 @@ test('labelsCheck: labels must be a list of objects with string names; anything 
     assert.match(c.detail, /labels/, JSON.stringify(labels));
   }
   assert.equal(labelsCheck(undefined).ok, false);
-});
-
-test('tailLines: last N lines, colours stripped, long lines clipped, trailing blanks dropped', () => {
-  const text = `${Array.from({ length: 40 }, (_, i) => `l${i + 1}`).join('\n')}\n\n`;
-  const t = tailLines(text, 30).split('\n');
-  assert.equal(t.length, 30);
-  assert.equal(t[0], 'l11');
-  assert.equal(t.at(-1), 'l40');
-  assert.equal(tailLines('\x1b[31mred\x1b[0m'), 'red');
-  assert.ok(tailLines('x'.repeat(1000)).length < 500);
-  assert.equal(tailLines(undefined), '');
-});
-
-test('inlineOptionValues: folds \`--name value\` into \`--name=value\` so dash-leading values (markdown bullets) survive parseArgs', () => {
-  assert.deepEqual(inlineOptionValues(['--pr', '12', '--line', '- 2026 · #12'], ['--line']), ['--pr', '12', '--line=- 2026 · #12']);
-  assert.deepEqual(inlineOptionValues(['--line=- x', '--pr', '1'], ['--line']), ['--line=- x', '--pr', '1']);
-  assert.deepEqual(inlineOptionValues(['--line'], ['--line']), ['--line'], 'a dangling flag is left for parseArgs to reject');
-  assert.deepEqual(inlineOptionValues(['--other', '--line'], ['--line']), ['--other', '--line']);
-  assert.deepEqual(inlineOptionValues(['--built', '- a', '--outcome', 'ok'], ['--built', '--outcome']), ['--built=- a', '--outcome=ok']);
 });
 
 // ---- gateRefusals --------------------------------------------------------------------------------

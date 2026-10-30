@@ -20,8 +20,9 @@ import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { approvedRequest } from '../hooks/lib/owner-go.mjs';
 import {
   GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, preMergeProblems, readReviewJson,
-  tailLines, waitBlockers, waitForMerge, writeReviewJson,
+  waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
+import { tailLines, writeReviewJson } from '../lib/cmd-io.mjs';
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',

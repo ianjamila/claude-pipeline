@@ -5,7 +5,7 @@ import { EXIT, UsageError, parseCommandArgs, requireOption } from '../lib/cli.mj
 import { fill } from '../lib/config.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { envWithGhDir, runShellAsync } from '../lib/proc.mjs';
-import { inlineOptionValues, tailLines, writeReviewJson } from '../lib/finalgate.mjs';
+import { inlineOptionValues, tailLines, writeReviewJson } from '../lib/cmd-io.mjs';
 
 export const meta = {
   summary: 'run the configured preview/production smoke command and record the result',

@@ -15,7 +15,7 @@ import { recordForOutcome } from '../lib/run-record.mjs';
 import { costReport, guardLogFile, readGuardLog } from '../lib/run-cost.mjs';
 import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 import { DEFAULT_OUTCOME, buildAgentLogLine } from '../lib/agentlog.mjs';
-import { inlineOptionValues } from '../lib/finalgate.mjs';
+import { inlineOptionValues } from '../lib/cmd-io.mjs';
 import { readModelProofs } from '../lib/review-context.mjs';
 import { headSha } from '../lib/git.mjs';
 import { classifyOutcome, defaultAction, notifyEvent } from '../lib/notify.mjs';
