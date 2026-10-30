@@ -13,7 +13,9 @@
 //     cannot match is NOT enough. What proves (2) empty is the ledger: a due record's tPre is within MAX_AGE_MS of now and the
 //     record was appended at or after tPre, so the ledger's mtime is no older than that either. A ledger that does not exist, or
 //     whose mtime is older than MAX_AGE_MS + LEDGER_SLACK_MS, holds no due record. A stat error other than ENOENT, an mtime in the
-//     future or one that is not a number proves nothing and is "do not skip".
+//     future or one that is not a number proves nothing and is "do not skip". One assumption sits beside the ledger proof: (1) relies
+//     on a tool_use_id naming ONE call, so a command devTargets() cannot match never carries the id of a dev record (register
+//     writes one only for a matching command); tests in stacks-register.test.mjs and stacks-dev.test.mjs pin it down.
 // The hooks call these inside their own try/catch: any error here, or in importing this file, sends the call down the full path.
 import fs from 'node:fs';
 import os from 'node:os';
