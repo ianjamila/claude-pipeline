@@ -84,3 +84,4 @@ full record.
 - 2026-10-28 · #97 · smoke: optional firewall-bypass header bound to an origin allowlist · risk high · rounds 3 · arbiter 0 · merged
 - 2026-10-29 · #108 · Base-only review rounds don't count toward max_rounds · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
 - 2026-10-29 · #108 · Base-only review rounds don't count toward max_rounds · risk high · rounds 4 · arbiter 3 · merged
+- 2026-10-30 · #118 · Review only the conflict resolution after a main merge (uncounted round) — #117 · risk high · rounds 3 · arbiter 2 · needs-human
