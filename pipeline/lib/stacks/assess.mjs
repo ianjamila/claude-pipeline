@@ -14,7 +14,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { acquire as realAcquire, release as realRelease } from '../locks.mjs';
+import { listWorktrees as realListWorktrees } from '../local-branches.mjs';
+import { isInside, samePath } from '../paths.mjs';
 import { run as realRun } from '../proc.mjs';
+import { pathSpellings } from '../worktree-prune/inspect.mjs';
+import { liveSessionsIn, scanLiveSessions as realScanLiveSessions } from '../worktree-prune/live-sessions.mjs';
 import { isShared, isPaused, loadKeep, loadMachineConfig } from './config.mjs';
 import { checkBinding } from './decide.mjs';
 import * as realEvidence from './evidence.mjs';
@@ -25,8 +29,8 @@ import { readProjectId } from './match.mjs';
 import { lockDirs, stackFiles } from './paths.mjs';
 import { ok, unknown } from './result.mjs';
 
-export const SESSION_END_PROBES = Object.freeze(['paused', 'keep', 'otherLiveLeases', 'connections', 'processRefs', 'cwdProcs', 'binding']);
-export const SWEEP_PROBES = Object.freeze(['paused', 'keep', 'liveLeases', 'consumers', 'prStates', 'cwdProcs', 'connections', 'processRefs', 'uptimeMs', 'memory', 'transcripts', 'binding']);
+export const SESSION_END_PROBES = Object.freeze(['paused', 'keep', 'otherLiveLeases', 'connections', 'processRefs', 'cwdProcs', 'openSessions', 'binding']);
+export const SWEEP_PROBES = Object.freeze(['paused', 'keep', 'liveLeases', 'consumers', 'prStates', 'cwdProcs', 'openSessions', 'connections', 'processRefs', 'uptimeMs', 'memory', 'transcripts', 'binding']);
 export const DEFAULT_DEADLINE_MS = 120_000;
 export const TRANSCRIPT_WINDOW_MS = 24 * 3_600_000;
 
@@ -170,6 +174,66 @@ export function cwdDirs(stack, consumers, { home = os.homedir(), platform = proc
   return dirs;
 }
 
+// "Is a Claude Code session OPEN in this stack's folder or a consumer worktree?", however long it has sat idle (the blind spot
+// cwdProcs has: a session's own process keeps its START folder, only its short-lived Bash shell enters a worktree, and the sweep's
+// 24 h transcript window misses a session parked longer). Claude Code lists its open sessions in <config>/sessions/<pid>.json;
+// worktree-prune/live-sessions.mjs places each by its transcript's last cwd. Scanned ONCE per call (never cached: the session-end
+// worker gathers twice, the second time under the lock, and a session may have opened between).
+//   * No owner / pid / session-id exclusion: session-end assesses only after the owner {pid, birth} has exited, and the scanner
+//     drops a record whose pid is dead or whose start time no longer matches ps, so the ended owner is already gone; excluding by
+//     pid would hide a NEW session that reused it.
+//   * Fail closed: a record or transcript that cannot be read, ps failing, or the deadline hitting mid-scan is unknown. Only "this
+//     machine has no sessions folder" is an extra signal that is absent (ok([]) with a note), as for worktree prune.
+//   * The stack folder only: a session inside a NESTED git worktree under it that is not itself a consumer of the stack works in
+//     its own worktree, not in this stack's folder, so it does not count (a session at the folder or in a plain subfolder does;
+//     if the worktree list cannot be read, every session inside the folder counts, with a note).
+// -> ok([{ id, pid, dir }]) | unknown. `opts`: home, env, platform, deadlineAt, now, scan (scanLiveSessions), starts (its ps seam),
+// listWorktrees (root -> [{ path, bare }]).
+export function openSessions(stack, consumers, opts = {}) {
+  const { home = os.homedir(), env = process.env, platform = process.platform, deadlineAt, now = Date.now, scan = realScanLiveSessions, starts, listWorktrees = realListWorktrees } = opts;
+  const notes = [];
+  const dirs = cwdDirs(stack, consumers, { home, platform, notes });
+  if (dirs.length === 0) return { ok: true, value: [], notes };
+  const scanned = scan({ home, env, platform, ...(starts ? { starts } : {}), ...(deadlineAt !== undefined ? { deadlineAt, now } : {}) });
+  if (!scanned?.available) {
+    notes.push(`open-session records unavailable (${scanned?.reason ?? 'no answer'})`);
+    return { ok: true, value: [], notes };
+  }
+  if (scanned.unplaced?.length) {
+    const more = scanned.unplaced.length > 3 ? ` (+${scanned.unplaced.length - 3} more)` : '';
+    return unknown(`open Claude sessions could not all be placed: ${scanned.unplaced.slice(0, 3).join('; ')}${more}`);
+  }
+  const inDir = (session, spellings) => liveSessionsIn({ available: true, sessions: [session], unplaced: [] }, spellings, { platform }).hits.length > 0;
+  const workdir = typeof stack?.workdir === 'string' && stack.workdir !== '' ? stack.workdir : null;
+  const hits = [];
+  for (const dir of dirs) {
+    const spellings = pathSpellings(dir);
+    let sessions = scanned.sessions;
+    if (dir === workdir) {
+      const inside = sessions.filter((x) => inDir(x, spellings));
+      const atRoot = (x) => spellings.some((sp) => samePath(x.cwd, sp, platform));
+      sessions = inside;
+      if (inside.some((x) => !atRoot(x))) {
+        let nested;
+        try {
+          nested = listWorktrees(dir)
+            .filter((w) => w?.path && !w.bare && spellings.some((sp) => isInside(w.path, sp, platform) && !samePath(w.path, sp, platform)))
+            .filter((w) => !(consumers ?? []).some((cw) => typeof cw?.path === 'string' && pathSpellings(cw.path).some((sp) => samePath(sp, w.path, platform))));
+        } catch (err) {
+          nested = [];
+          notes.push(`worktrees of ${dir} could not be listed (${shortMsg(err)}): every open session inside it counts`);
+        }
+        const own = nested.map((w) => pathSpellings(w.path));
+        sessions = inside.filter((x) => !own.some((sp) => inDir(x, sp)));
+      }
+    }
+    for (const h of liveSessionsIn({ available: true, sessions, unplaced: [] }, spellings, { platform }).hits) {
+      if (!hits.some((x) => x.id === h.id && x.pid === h.pid)) hits.push({ id: h.id, pid: h.pid, dir });
+    }
+  }
+  return notes.length ? { ok: true, value: hits, notes } : ok(hits);
+}
+
 // gatherEvidence(stack, ctx, { probes, excludeOwner, deadlineMs }) -> Promise<{ evidence, current, fresh }>
 //   stack         the Stack as assessed (inventory.mjs shape)
 //   probes        which of SESSION_END_PROBES / SWEEP_PROBES to run (any subset; 'binding' is the only one needing a fresh inventory)
@@ -177,8 +241,9 @@ export function cwdDirs(stack, consumers, { home = os.homedir(), platform = proc
 //   ctx           { root, files?, cfg, run, docker, bins: { lsof, ps }, platform, now, kill, home, isAlive, acquire, release,
 //                   readInventory, readEvents (async () => ok(events)), evidence (override probe functions), excludePids
 //                   (default this process; the registered workers from ownPids() are always added; ownPids: a Set overriding that lookup),
-//                   ghFor, listWorktrees, git, fsx }
-//   evidence      { stack, paused?, keep?, otherLiveLeases?, liveLeases?, consumers?, prStates?, cwdProcs?, connections?, processRefs?,
+//                   ghFor, listWorktrees, git, fsx, env (config dirs of the open-session scan; default process.env),
+//                   scanLiveSessions / liveSessionStarts (test seams of that scan and its ps call) }
+//   evidence      { stack, paused?, keep?, otherLiveLeases?, liveLeases?, consumers?, prStates?, cwdProcs?, openSessions?, connections?, processRefs?,
 //                   uptimeMs?, memory?, transcripts?, binding? }: `stack` is the FRESH stack when one was read, else the assessed one
 //   current       buildCurrent(...) when 'binding' was requested (else null); fresh the fresh Stack (or null)
 export async function gatherEvidence(stack, ctx = {}, { probes = SESSION_END_PROBES, excludeOwner = null, deadlineMs = DEFAULT_DEADLINE_MS } = {}) {
@@ -191,7 +256,7 @@ export async function gatherEvidence(stack, ctx = {}, { probes = SESSION_END_PRO
   const files = ctx.files ?? stackFiles(root);
   const cfg = ctx.cfg ?? loadMachineConfig(files.config, { home });
   const bins = ctx.bins ?? { lsof: undefined, ps: undefined };
-  const ev = { ...realEvidence, ...(ctx.evidence ?? {}) };
+  const ev = { openSessions, ...realEvidence, ...(ctx.evidence ?? {}) };
   const deadlineAt = now() + deadlineMs;
   const isAliveFn = ctx.isAlive ?? ((o) => realIsAlive(o, { run, ps: bins.ps, kill: ctx.kill, platform, deadlineAt, now }));
   // the probes skip this process, its probe children, and every registered worker of the feature (never a consumer of a stack)
@@ -287,6 +352,21 @@ export async function gatherEvidence(stack, ctx = {}, { probes = SESSION_END_PRO
       }
     }
   }
+  if (want.has('openSessions')) {
+    const c = await getConsumers();
+    if (!c.ok) evidence.openSessions = unknown(`openSessions need the consumer worktrees: ${c.reason}`);
+    else {
+      try {
+        evidence.openSessions = ev.openSessions(probeStack, c.value, {
+          home, env: ctx.env ?? process.env, platform, deadlineAt, now,
+          ...(ctx.scanLiveSessions ? { scan: ctx.scanLiveSessions } : {}), ...(ctx.liveSessionStarts ? { starts: ctx.liveSessionStarts } : {}),
+          ...(ctx.listWorktrees ? { listWorktrees: ctx.listWorktrees } : {}),
+        });
+      } catch (err) {
+        evidence.openSessions = unknown(`open-session probe failed: ${shortMsg(err)}`);
+      }
+    }
+  }
   const guarded = (fn) => {
     try {
       return fn();
@@ -317,7 +397,7 @@ export function summarizeEvidence(evidence = {}, verdict = null) {
     return Array.isArray(v) ? v.length : v instanceof Map || v instanceof Set ? v.size : v;
   };
   const out = {};
-  for (const k of ['keep', 'otherLiveLeases', 'liveLeases', 'connections', 'processRefs', 'cwdProcs', 'consumers', 'prStates', 'memory', 'transcripts']) {
+  for (const k of ['keep', 'otherLiveLeases', 'liveLeases', 'connections', 'processRefs', 'cwdProcs', 'openSessions', 'consumers', 'prStates', 'memory', 'transcripts']) {
     if (evidence[k] !== undefined) out[k] = k === 'keep' ? (evidence.keep?.ok ? [...evidence.keep.value].includes(lower(evidence.stack?.project)) : count(evidence.keep)) : count(evidence[k]);
   }
   if (evidence.paused !== undefined) out.paused = evidence.paused;

@@ -25,6 +25,8 @@
 //   C3 process reference   any process whose command line OR environment names the stack folder, workdir, a container name, the
 //                          project id (whole word) or a published port.
 //   cwd                    a live process whose cwd/open files are inside the stack folder or any consumer worktree.
+//   openSessions           a Claude Code session OPEN (<config>/sessions/<pid>.json, alive) whose transcript's last cwd is inside
+//                          the stack folder or any consumer worktree, however long idle (assess.mjs openSessions).
 //   C4 consumer worktrees  worktrees tied to the stack by the ledger, a transcript backfill, or a `.env*` pointing at its ports.
 //   C6 recent transcripts  (sweeper only) a transcript modified in the last 24 h names the stack folder/project.
 //
@@ -35,7 +37,7 @@
 //
 // SESSION-END verdict (sessionEndVerdict): stop only if the db container is running; not shared; workdir exists and the binding
 // holds; not keep-listed; not paused; no live lease from another owner (C1); no connection (C2); no process reference (C3); no
-// live process with cwd in the stack folder or any consumer worktree. Anything else: `kept` + reasons (unknown included).
+// live process with cwd in the stack folder or any consumer worktree; no open Claude session there. Anything else: `kept` + reasons (unknown included).
 //
 // SWEEP verdict (sweepVerdict), the owner's seven conditions made precise, plus workdir/binding and C6:
 //   1. not shared;
@@ -44,7 +46,7 @@
 //      HEAD == the PR head. Folder names never identify owners; an empty set means the owner is unknown => listed. A consumer
 //      that exists with NO PR, or whose PR head differs from its HEAD, => listed (never stop). Any consumer with an OPEN PR
 //      => kept (a mixed set, one gone/merged and one OPEN, is therefore kept);
-//   4. no live process with cwd in any consumer worktree or the stack folder; no C2 connection; no C3 reference;
+//   4. no live process with cwd in any consumer worktree or the stack folder, no open Claude session there; no C2 connection; no C3 reference;
 //   5. the db container has been up for MORE than 24 h (`uptimeMs > DAY_MS`; exactly 24 h is not more);
 //   6. no memory note names the project id or the stack folder name;
 //   7. not keep-listed;
@@ -154,6 +156,12 @@ function cwdReasons(c, value) {
   c.kept.push(`cwdProcs: ${value.length} live process(es) with cwd in the stack folder or a consumer worktree (${value.map((x) => `pid ${x?.pid ?? '?'} in ${x?.dir ?? '?'}`).join('; ')})`);
 }
 
+function openSessionReasons(c, value) {
+  if (!Array.isArray(value)) { c.listed.push('openSessions unknown: unexpected result shape'); return; }
+  if (value.length === 0) { c.passed.push('openSessions: none'); return; }
+  c.kept.push(`openSessions: ${value.length} open Claude session(s) in the stack folder or a consumer worktree (${value.map((x) => `session ${x?.id ?? '?'} pid ${x?.pid ?? '?'} in ${x?.dir ?? '?'}`).join('; ')})`);
+}
+
 function keepReasons(c, value, project) {
   const items = value instanceof Set || Array.isArray(value) ? [...value] : null;
   if (items === null) { c.listed.push('keep unknown: unexpected result shape'); return; }
@@ -179,7 +187,7 @@ function commonRules(c, e) {
 
 // ---- verdicts ----
 
-// e = { stack, paused, keep, otherLiveLeases, connections, processRefs, cwdProcs, binding }  -> { verdict: 'stop'|'kept', reasons, notes }
+// e = { stack, paused, keep, otherLiveLeases, connections, processRefs, cwdProcs, openSessions, binding }  -> { verdict: 'stop'|'kept', reasons, notes }
 export function sessionEndVerdict(e = {}) {
   const c = collector();
   commonRules(c, e);
@@ -193,6 +201,8 @@ export function sessionEndVerdict(e = {}) {
   if (refs !== undefined) refReasons(c, refs);
   const cwd = need(c, 'cwdProcs', e.cwdProcs);
   if (cwd !== undefined) cwdReasons(c, cwd);
+  const open = need(c, 'openSessions', e.openSessions);
+  if (open !== undefined) openSessionReasons(c, open);
   // session-end has no `listed`: whatever cannot be decided is kept
   const reasons = [...c.kept, ...c.listed];
   if (reasons.length > 0) return { verdict: 'kept', reasons, notes: c.notes };
@@ -227,7 +237,7 @@ function listReasons(c, name, value, label) {
   c.kept.push(`${name}: ${label} ${value.slice(0, 5).join(', ')}${value.length > 5 ? ` (+${value.length - 5} more)` : ''}`);
 }
 
-// e = { stack, paused, keep, liveLeases, consumers, prStates, cwdProcs, connections, processRefs, uptimeMs, memory, transcripts, binding }
+// e = { stack, paused, keep, liveLeases, consumers, prStates, cwdProcs, openSessions, connections, processRefs, uptimeMs, memory, transcripts, binding }
 //   -> { verdict: 'stop'|'kept'|'listed', reasons, notes }
 export function sweepVerdict(e = {}) {
   const c = collector();
@@ -241,6 +251,8 @@ export function sweepVerdict(e = {}) {
   consumerReasons(c, consumers, states);
   const cwd = need(c, 'cwdProcs', e.cwdProcs);
   if (cwd !== undefined) cwdReasons(c, cwd);
+  const open = need(c, 'openSessions', e.openSessions);
+  if (open !== undefined) openSessionReasons(c, open);
   const conn = need(c, 'connections', e.connections);
   if (conn !== undefined) connectionReasons(c, conn);
   const refs = need(c, 'processRefs', e.processRefs);

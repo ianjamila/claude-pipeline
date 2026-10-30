@@ -22,6 +22,7 @@ import { unFirm } from './inspect.mjs';
 const START_SHAPE = /^[A-Za-z]{3} [A-Za-z]{3} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/; // goes into a file name: nothing that could climb out of projects/
 const PS_TIMEOUT_MS = 30_000;
+const MIN_REMAINING_MS = 500; // a scan with a deadline stops placing sessions under this much time
 const FIRST_WINDOW = 1 << 20;
 const MAX_WINDOW = 1 << 28; // a last `cwd` further back than this is "cannot place", not a 512 MB string
 const norm = (s) => String(s ?? '').trim().replace(/\s+/g, ' ');
@@ -65,8 +66,8 @@ export function claudeConfigDirs(home = os.homedir(), env = process.env, problem
 // some are missing, so the rows are read whatever 0 or 1 it exits with. The environment is minimal and fixed: UTC is what
 // `procStart` is written in, and the C locale pins the date format. `run` is a test seam.
 const PS_ENV = Object.freeze({ PATH: '/bin:/usr/bin', LC_ALL: 'C', TZ: 'UTC' });
-function runPs(args) {
-  const r = spawnSync('ps', args, { encoding: 'utf8', env: PS_ENV, timeout: PS_TIMEOUT_MS, killSignal: 'SIGKILL', windowsHide: true });
+function runPs(args, timeoutMs = PS_TIMEOUT_MS) {
+  const r = spawnSync('ps', args, { encoding: 'utf8', env: PS_ENV, timeout: timeoutMs, killSignal: 'SIGKILL', windowsHide: true });
   return { status: r.status, signal: r.signal, error: r.error, stdout: r.stdout ?? '' };
 }
 export function psStarts(pids, run = runPs) {
@@ -221,7 +222,14 @@ function readRecords(configs) {
 // per cwd). Never throws. Options (all test seams):
 // `home`/`env` pick the config dirs, `platform` gates ps (only macOS and Linux have it; processesInside is "unavailable"
 // elsewhere too), `starts(pids)` replaces the ps call (-> Map<pid, start> | null).
-export function scanLiveSessions({ home = os.homedir(), env = process.env, platform = process.platform, starts = psStarts } = {}) {
+// `deadlineAt` (epoch ms, with `now()`; both optional) is for callers with a time budget (stack-stop): the ps timeout becomes
+// min(30 s, time left), and under MIN_REMAINING_MS before ps or before placing a session the scan stops and lists
+// "deadline reached ..." in `unplaced` (the caller then fails closed). A transcript tail read already started is not
+// interrupted (bounded by lastCwd's window cap). Without `deadlineAt` nothing here changes: `starts(pids)` is called as before.
+export function scanLiveSessions({ home = os.homedir(), env = process.env, platform = process.platform, starts = psStarts, deadlineAt, now = Date.now } = {}) {
+  const timed = Number.isFinite(deadlineAt);
+  const left = () => deadlineAt - now();
+  const DEADLINE = 'deadline reached before every open session was placed';
   try {
     if (platform !== 'darwin' && platform !== 'linux') return { available: false, reason: `not supported on ${platform}` };
     const problems = [];
@@ -229,7 +237,18 @@ export function scanLiveSessions({ home = os.homedir(), env = process.env, platf
     const { records, unplaced, sawDir } = readRecords(configs);
     unplaced.unshift(...problems); // a config dir we could not look into: the scan is partial, so it is not "unavailable"
     if (!sawDir && problems.length === 0) return { available: false, reason: 'no Claude sessions folder found' };
-    const running = records.length ? starts([...new Set(records.map((r) => r.pid))]) : new Map();
+    let running = new Map();
+    if (records.length) {
+      const pids = [...new Set(records.map((r) => r.pid))];
+      if (!timed) running = starts(pids);
+      else if (left() < MIN_REMAINING_MS) {
+        unplaced.push(DEADLINE);
+        return { available: true, sessions: [], unplaced };
+      } else {
+        const timeoutMs = Math.min(PS_TIMEOUT_MS, left());
+        running = starts === psStarts ? psStarts(pids, (args) => runPs(args, timeoutMs)) : starts(pids, { timeoutMs });
+      }
+    }
     if (running === null || running === undefined) {
       unplaced.push('ps failed, so open Claude sessions cannot be told apart from finished ones');
       return { available: true, sessions: [], unplaced };
@@ -245,6 +264,10 @@ export function scanLiveSessions({ home = os.homedir(), env = process.env, platf
     for (const rec of records) {
       const start = running.get(rec.pid);
       if (start === undefined || seen.has(rec.sessionId)) continue;
+      if (timed && left() < MIN_REMAINING_MS) {
+        unplaced.push(DEADLINE);
+        break;
+      }
       const label = `open session ${rec.sessionId.slice(0, 8)} pid ${rec.pid}`;
       if (rec.procStart !== undefined && rec.procStart !== null && rec.procStart !== '') {
         // A start time in a shape ps does not use cannot be compared: a lone session would look like a reused pid.
@@ -272,9 +295,9 @@ export function scanLiveSessions({ home = os.homedir(), env = process.env, platf
 
 // What a scan means for one worktree. `spellings` = every way the worktree's path may be written (pathSpellings, taken while
 // the worktree is still where it was). A session is in it when its working folder, as logged or resolved through symlinks,
-// equals or lies below one of them (case rules as isInside: folded on macOS and Windows).
+// equals or lies below one of them (case rules as isInside: folded on macOS and Windows; `platform` is a test seam).
 // -> { hits: [{ id, pid }], unplaced: string[] }. An unavailable scan says nothing.
-export function liveSessionsIn(scan, spellings) {
+export function liveSessionsIn(scan, spellings, { platform = process.platform } = {}) {
   if (!scan?.available) return { hits: [], unplaced: [] };
   const roots = spellings.map(unFirm);
   const forms = (cwd) => {
@@ -286,7 +309,7 @@ export function liveSessionsIn(scan, spellings) {
   };
   const hits = [];
   for (const s of scan.sessions) {
-    if (forms(s.cwd).some((c) => roots.some((r) => isInside(c, r))) && !hits.some((h) => h.id === s.id && h.pid === s.pid)) hits.push({ id: s.id, pid: s.pid });
+    if (forms(s.cwd).some((c) => roots.some((r) => isInside(c, r, platform))) && !hits.some((h) => h.id === s.id && h.pid === s.pid)) hits.push({ id: s.id, pid: s.pid });
   }
   return { hits, unplaced: scan.unplaced ?? [] };
 }

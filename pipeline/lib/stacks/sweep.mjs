@@ -385,8 +385,9 @@ export async function runSweep({ apply = false, deps = {} } = {}) {
 
     const isAliveFn = deps.isAlive ?? ((o) => realIsAlive(o, { run, ps: bins.ps, platform, ...(probeKill ? { kill: probeKill } : {}) }));
     const ctx = {
-      root, files, cfg, run, docker, bins, platform, now, home, acquire, release, isAlive: isAliveFn, evidence: deps.evidence,
+      root, files, cfg, run, docker, bins, platform, now, home, env, acquire, release, isAlive: isAliveFn, evidence: deps.evidence,
       ...(deps.kill ? { kill: deps.kill } : {}), ...(deps.readInventory ? { readInventory: deps.readInventory } : {}),
+      ...(deps.scanLiveSessions ? { scanLiveSessions: deps.scanLiveSessions } : {}), ...(deps.liveSessionStarts ? { liveSessionStarts: deps.liveSessionStarts } : {}),
       ...(deps.readEvents ? { readEvents: deps.readEvents } : {}),
       ...(deps.freshStack ? { freshStack: deps.freshStack } : {}), ...(deps.listWorktrees ? { listWorktrees: deps.listWorktrees } : {}),
       ...(deps.fsx ? { fsx: deps.fsx } : {}), ...(deps.realpath ? { realpath: deps.realpath } : {}), ...(deps.readFile ? { readFile: deps.readFile } : {}),
