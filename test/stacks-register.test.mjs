@@ -9,7 +9,7 @@ import fs, { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, re
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { register, readTailLines, resolveSeams, DEFAULT_DEADLINE_MS } from '../pipeline/lib/stacks/register.mjs';
 import { registerCanSkip, registerFastSkip } from '../pipeline/lib/stacks/fastpath.mjs';
 import { devTargets } from '../pipeline/lib/stacks/match.mjs';
@@ -915,7 +915,8 @@ test('fast path, register: registerFastSkip reads the cache register() reads, st
 // ---- the fast path in the real hook ----
 const spyOf = (x) => join(x.dir, 'resolve.log');
 const loadedBy = (file) => new Set(existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((u) => u.split('/').pop()) : []);
-const HEAVY_LIBS = ['register.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs', 'inventory.mjs', 'config.mjs', 'claude-ancestry.mjs', 'dev.mjs'];
+// proc.mjs and node:child_process are on the list too: the fast path must not even start a process-spawning module
+const HEAVY_LIBS = ['register.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs', 'inventory.mjs', 'config.mjs', 'claude-ancestry.mjs', 'dev.mjs', 'proc.mjs', 'node:child_process'];
 const spied = (x, extraEnv = {}) => ({ nodeArgs: ['--import', RESOLVE_SPY], extraEnv: { RESOLVE_SPY_LOG: spyOf(x), ...extraEnv } });
 
 test('e2e fast path: an ordinary Bash call and an ordinary file read exit 0 without loading register.mjs, the locks, the ledger, identity or the inventory', posixOnly, () => {
@@ -941,7 +942,7 @@ test('e2e fast path: a call that names a stack or starts a dev server DOES load 
   const stack = e2e();
   const s = stack.hook(bash(`supabase status --workdir ${stack.sa.workdir}`, stack.w.base), spied(stack));
   assert.equal(s.status, 0, s.stderr);
-  for (const lib of ['fastpath.mjs', 'register.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs', 'inventory.mjs']) assert.ok(loadedBy(spyOf(stack)).has(lib), `supabase status: ${lib} must be loaded`);
+  for (const lib of ['fastpath.mjs', 'register.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs', 'inventory.mjs', 'proc.mjs', 'node:child_process']) assert.ok(loadedBy(spyOf(stack)).has(lib), `supabase status: ${lib} must be loaded`);
   assert.deepEqual(lines(stack.w.files.ledger).map((e) => [e.kind, e.project]), [['use', 'sa-corrections']]);
 
   const dev = e2e();
@@ -1019,4 +1020,25 @@ test('fast path, register: a dev record (what stack-dev-bind keys on) is written
     if (wrote) devs++;
   }
   assert.ok(devs >= 8, `${devs} dev records`);
+});
+
+test('e2e fast path: the resolve spy sees node:child_process and proc.mjs when something imports them (so their absence above means something)', posixOnly, () => {
+  const x = e2e();
+  const procUrl = pathToFileURL(join(here, '..', 'pipeline', 'lib', 'proc.mjs')).href;
+  const r = spawnSync(process.execPath, ['--import', RESOLVE_SPY, '--input-type=module', '-e', `await import('node:child_process'); await import(${JSON.stringify(procUrl)});`], {
+    env: { ...process.env, RESOLVE_SPY_LOG: spyOf(x) }, encoding: 'utf8',
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const loaded = loadedBy(spyOf(x));
+  assert.ok(loaded.has('node:child_process'), 'the spy logs builtins');
+  assert.ok(loaded.has('proc.mjs'));
+});
+
+test('proc.mjs re-exports splitCommand and the seam helpers from the light modules the hooks\' fast path imports instead (same functions, one warned-once state)', async () => {
+  const proc = await import('../pipeline/lib/proc.mjs');
+  const words = await import('../pipeline/lib/shell-words.mjs');
+  const seams = await import('../pipeline/lib/seams.mjs');
+  assert.equal(proc.splitCommand, words.splitCommand);
+  for (const name of ['PIPELINE_ROOT', 'SEAM_VARS', 'isInstalledCopy', 'seamValue']) assert.equal(proc[name], seams[name], name);
+  assert.deepEqual(words.splitCommand('a "b c" d\\ e'), ['a', 'b c', 'd e']);
 });

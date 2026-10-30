@@ -994,7 +994,8 @@ test('fast path, dev-bind: devBindFastSkip stats the ledger under the stacks roo
 // ---- the fast path in the real hook ----
 const RESOLVE_SPY = join(here, 'fixtures', 'resolve-spy-preload.mjs');
 const loadedBy = (file) => new Set(existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((u) => u.split('/').pop()) : []);
-const HEAVY_LIBS = ['dev.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs', 'config.mjs', 'claude-ancestry.mjs', 'register.mjs', 'inventory.mjs'];
+// proc.mjs and node:child_process are on the list too: the fast path must not even start a process-spawning module
+const HEAVY_LIBS = ['dev.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs', 'config.mjs', 'claude-ancestry.mjs', 'register.mjs', 'inventory.mjs', 'proc.mjs', 'node:child_process'];
 const spyEnv = (x, extra = {}) => ({ RESOLVE_SPY_LOG: join(x.d.dir, 'resolve.log'), ...extra });
 const loadedIn = (x) => loadedBy(join(x.d.dir, 'resolve.log'));
 const lsPayload = (x, over = {}) => JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls -la' }, session_id: 's1', tool_use_id: 'tu2', cwd: x.d.wt, ...over });
@@ -1032,7 +1033,7 @@ test('e2e fast path: a plain `ls -la` while the session has a dev record 10 s ol
   const x = e2e();
   const r = x.hook(lsPayload(x), { nodeArgs: ['--import', RESOLVE_SPY], extraEnv: spyEnv(x) });
   assert.equal(r.status, 0, r.stderr);
-  for (const lib of ['fastpath.mjs', 'dev.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs']) assert.ok(loadedIn(x).has(lib), `${lib} must be loaded`);
+  for (const lib of ['fastpath.mjs', 'dev.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs', 'proc.mjs', 'node:child_process']) assert.ok(loadedIn(x).has(lib), `${lib} must be loaded`);
   assert.deepEqual(x.lines().map((e) => e.kind), ['dev', 'dev-bind']);
   assert.equal(x.lines()[1].listenerPid, 5001);
 });
