@@ -98,9 +98,6 @@ export function parseStamp(text) {
   return { base: m[1], sha: m[2] === 'unknown' ? null : m[2], flags: m[3] === '' ? [] : m[3].slice(1).split('.') };
 }
 
-// A stamp that proves what it names: a sha and no flag.
-export const stampIsTrusted = (parsed) => Boolean(parsed && parsed.sha && parsed.flags.length === 0);
-
 // ---- an installed copy -----------------------------------------------------------------------------------------
 
 // Identity of what is installed in `home`, from <home>/pipeline/INSTALLED.json and the files on disk. null when

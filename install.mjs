@@ -8,13 +8,13 @@
 // CLAUDECODE=1 in the environment OR a Claude Code ancestor process (the variable can be stripped, the parent cannot).
 // All decisions live in pipeline/lib/installer.mjs; this file does the disk work, the report and the exit code.
 // PIPELINE_INSTALL_NO_PROBES=1 skips the claude/codex/gh version probes (tests and CI).
-// PIPELINE_INSTALL_RETIRED_SKILLS=a,b (a test seam, ignored by an installed copy) adds skill names to I.RETIRED_SKILLS.
+// PIPELINE_INSTALL_RETIRED_SKILLS=a,b (a test seam: honoured only with PIPELINE_TEST_MODE=1, like the other seams) adds skill names to I.RETIRED_SKILLS.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { run, seamValue } from './pipeline/lib/proc.mjs';
+import { run, seamFlag, seamValue } from './pipeline/lib/proc.mjs';
 import { expandHome, isInside, safeTimestamp } from './pipeline/lib/paths.mjs';
 // `pipeline update` (commands/update.mjs installerAcceptsPrivateTmpSource) detects this import to know the installer accepts its download.
 import { TMP_ROOT_REL } from './pipeline/lib/private-tmp.mjs';
@@ -214,9 +214,10 @@ function diagnostics(ctx, settings) {
   return I.collectDiagnostics({ settings, env: ctx.env, home: os.homedir(), platform: process.platform, runFn: probes });
 }
 
-// The skills to retire: the shipped list, plus (test seam) names from PIPELINE_INSTALL_RETIRED_SKILLS. Only plain directory names count.
+// The skills to retire: the shipped list, plus (test seam, PIPELINE_TEST_MODE=1 only) names from PIPELINE_INSTALL_RETIRED_SKILLS. Only plain directory names count.
 function retiredSkillNames(env) {
-  const raw = seamValue('PIPELINE_INSTALL_RETIRED_SKILLS', env, { root: fileURLToPath(new URL('./pipeline', import.meta.url)) });
+  const opts = { root: fileURLToPath(new URL('./pipeline', import.meta.url)) };
+  const raw = seamFlag('PIPELINE_TEST_MODE', env, opts) ? seamValue('PIPELINE_INSTALL_RETIRED_SKILLS', env, opts) : undefined;
   const extra = raw === undefined ? [] : raw.split(',').map((s) => s.trim()).filter((s) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(s));
   return [...I.RETIRED_SKILLS, ...extra];
 }

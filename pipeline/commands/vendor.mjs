@@ -69,6 +69,20 @@ function manifest(l) {
 }
 
 const repoRel = (rel) => posix(...DEST, rel);
+
+// Project settings files that may still run the removed Stop hook. Warn only: the project's settings are never edited here.
+const SETTINGS_FILES = ['settings.json', 'settings.local.json'];
+function stopVerifyWarnings(root) {
+  const out = [];
+  for (const name of SETTINGS_FILES) {
+    try {
+      const settings = JSON.parse(readFileSync(join(root, '.claude', name), 'utf8'));
+      if (!JSON.stringify(settings?.hooks ?? null).includes('stop-verify')) continue;
+      out.push(`.claude/${name} still has a hook that runs scripts/pipeline/stop-verify.mjs, which vendor removes (the Stop hook is retired): remove that Stop hook entry from .claude/${name}, or every stop will try to run a missing file`);
+    } catch { /* missing, unreadable or not JSON: nothing to say */ }
+  }
+  return out;
+}
 // The retired entries still lying in <repo>/scripts/pipeline (a file or a symlink; a directory under that name is not ours).
 function retiredFiles(target) {
   const found = [];
@@ -156,12 +170,14 @@ export async function run(argv) {
       const have = readFileSync(vfile, 'utf8').trim().split('+')[0];
       if (have !== base) drift.push({ file: repoRel(VERSION_FILE), reason: `version ${have} != pipeline ${base}` });
     }
-    if (drift.length > 0) return { exitCode: EXIT.FAILED, output: { ok: false, drift } };
+    const stopWarnings = stopVerifyWarnings(root);
+    if (drift.length > 0) return { exitCode: EXIT.FAILED, output: { ok: false, drift, ...(stopWarnings.length ? { warnings: stopWarnings } : {}) } };
     const gaFile = join(root, '.gitattributes');
     const present = attributeLines(existsSync(gaFile) ? readFileSync(gaFile, 'utf8') : '');
     const unpinned = ATTRIBUTES.filter((l) => !present.has(l));
     const stamp = readFileSync(vfile, 'utf8').trim();
     const warnings = [
+      ...stopWarnings,
       ...(unpinned.length ? [`.gitattributes lacks ${unpinned.map((l) => JSON.stringify(l)).join(', ')}: with autocrlf a Windows checkout rewrites the vendored files and this check reports drift; run \`pipeline vendor\` to add it`] : []),
       ...[stampWarning(stamp)].filter(Boolean),
     ];
@@ -177,6 +193,7 @@ export async function run(argv) {
   const removed = retiredFiles(target).map((f) => { unlinkSync(f.dest); return repoRel(f.rel); });
   writeFileSync(join(target, VERSION_FILE), `${version}\n`);
   const attributesAdded = ensureAttributes(root);
-  return { exitCode: EXIT.OK, output: { ok: true, files: allFiles, version, gitattributes: attributesAdded, removed } };
+  const warnings = stopVerifyWarnings(root);
+  return { exitCode: EXIT.OK, output: { ok: true, files: allFiles, version, gitattributes: attributesAdded, removed, ...(warnings.length ? { warnings } : {}) } };
 }
 

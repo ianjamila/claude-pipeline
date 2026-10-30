@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { installedIdentity, checkoutIdentity, parseStamp, formatStamp, stampIsTrusted, fileProvenance } from '../pipeline/lib/identity.mjs';
+import { installedIdentity, checkoutIdentity, parseStamp, formatStamp, fileProvenance } from '../pipeline/lib/identity.mjs';
 import { MANIFEST_REL, buildPlan, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 import { versionReport, meta as versionMeta } from '../pipeline/commands/version.mjs';
 
@@ -105,17 +105,13 @@ test('parseStamp: base, sha, flags; unknown sha is null; anything else is null',
   for (const bad of ['1.4.0', '', null, undefined, '1.4.0+', '1.4.0+xyz', '1.4.0+abc', 'a b+0123456', '+0123456']) assert.equal(parseStamp(bad), null, String(bad));
 });
 
-test('formatStamp and parseStamp round-trip; only a sha with no flags is trusted', () => {
+test('formatStamp and parseStamp round-trip', () => {
   for (const [sha, flags] of [[SHA, []], [SHA, ['modified']], [null, ['unverified']], [null, []]]) {
     const p = parseStamp(formatStamp('2.0.1', sha, flags));
     assert.equal(p.base, '2.0.1');
     assert.equal(p.sha, sha ? sha.slice(0, 7) : null);
     assert.deepEqual(p.flags, flags);
   }
-  assert.equal(stampIsTrusted(parseStamp('1.0.0+0123456')), true);
-  assert.equal(stampIsTrusted(parseStamp('1.0.0+0123456.modified')), false);
-  assert.equal(stampIsTrusted(parseStamp('1.0.0+unknown')), false);
-  assert.equal(stampIsTrusted(null), false);
 });
 
 // ---- checkoutIdentity --------------------------------------------------------------------------------------------

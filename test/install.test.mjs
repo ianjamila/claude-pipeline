@@ -1337,8 +1337,9 @@ test('RETIRED_HOOKS names session-version; no retired skill is a current skill; 
   assert.deepEqual(retiredSkillUnits(['oldskill', 'verify', 'oldskill']).map((u) => u.rel), ['skills/oldskill']);
 });
 
-// The retired-unit mechanism, on a test-only retired skill (PIPELINE_INSTALL_RETIRED_SKILLS adds it to RETIRED_SKILLS for one run).
-const RETIRED_ENV = { PIPELINE_INSTALL_RETIRED_SKILLS: 'oldskill' };
+// The retired-unit mechanism, on a test-only retired skill (PIPELINE_INSTALL_RETIRED_SKILLS adds it to RETIRED_SKILLS for one run; like
+// the other seams it needs PIPELINE_TEST_MODE=1).
+const RETIRED_ENV = { PIPELINE_INSTALL_RETIRED_SKILLS: 'oldskill', PIPELINE_TEST_MODE: '1' };
 const OLD_SKILL = { 'SKILL.md': 'the old skill\n', 'ref/a.md': 'reference a\n' };
 const oldSkillFile = (home, rel) => join(home, 'skills', 'oldskill', ...rel.split('/'));
 // A current install plus skills/oldskill/, with its files listed in the manifest (what an install of the previous release left).
@@ -1468,10 +1469,27 @@ test('a retired skill dir that is a symlink, or that the manifest never listed, 
   assert.equal(readFileSync(join(home2, 'skills', 'oldskill', 'SKILL.md'), 'utf8'), 'not ours\n');
 });
 
+test('the retired-skill seam is ignored unless PIPELINE_TEST_MODE=1: the retirement path (report, backup of an edited file) is not entered', () => {
+  for (const testMode of [undefined, 'yes']) {
+    const home = newHome();
+    makeOldSkill(home);
+    writeFileSync(oldSkillFile(home, 'SKILL.md'), 'my tuned old skill\n');
+    const env = { PIPELINE_INSTALL_RETIRED_SKILLS: 'oldskill', ...(testMode ? { PIPELINE_TEST_MODE: testMode } : {}) };
+    const r = install(home, ['--json'], { env });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout).retired, [], `PIPELINE_TEST_MODE=${testMode}`);
+    assert.equal(existsSync(join(home, 'backups')), false, 'no retirement, so no backup of the edited file');
+  }
+  const home = newHome();
+  makeOldSkill(home);
+  writeFileSync(oldSkillFile(home, 'SKILL.md'), 'my tuned old skill\n');
+  assert.equal(JSON.parse(install(home, ['--json'], { env: RETIRED_ENV }).stdout).retired.length, 1, 'control: with PIPELINE_TEST_MODE=1 the same input retires it');
+});
+
 test('the retired-skill seam only takes plain directory names', () => {
   const home = newHome();
   assert.equal(install(home).status, 0);
-  const r = install(home, ['--json'], { env: { PIPELINE_INSTALL_RETIRED_SKILLS: '../pipeline,a/b,..' } });
+  const r = install(home, ['--json'], { env: { PIPELINE_INSTALL_RETIRED_SKILLS: '../pipeline,a/b,..', PIPELINE_TEST_MODE: '1' } });
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(JSON.parse(r.stdout).retired, []);
   assert.equal(existsSync(join(home, 'pipeline', 'bin', 'pipeline.mjs')), true);

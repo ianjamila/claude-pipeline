@@ -1,6 +1,6 @@
 // claude-pipeline's own copy of pipeline/templates/scripts/verify.mjs (test/self-verify.test.mjs keeps the two in step:
 // only the STEPS block, PROJECT and the library import paths may differ). It is what `verify.full` / `verify.quick` in
-// .claude/pipeline.yml run, and the Stop hook, `ship` and CI all trust its report.
+// .claude/pipeline.yml run, and `ship` and CI both trust its report.
 //   node scripts/verify.mjs                full run: every step, in order, stop at the first failure
 //   node scripts/verify.mjs --quick        only steps marked quick:true (using quickCmd when a step has one)
 //   node scripts/verify.mjs --only a,b     just those steps (report mode "partial"; never a substitute for a full run)
@@ -30,7 +30,7 @@ const PROJECT = 'claude-pipeline'; // must match `project:` in .claude/pipeline.
 // Claude Code session, which is where this script usually runs.
 // name      unique, letters/digits/./_/- (it names the log file)
 // cmd       shell command (POSIX sh, or cmd.exe on Windows); exit 0 = pass
-// quick     true = also part of `--quick` (the Stop hook runs that, so keep these fast: seconds, not minutes)
+// quick     true = also part of `--quick` (keep these fast: seconds, not minutes)
 // quickCmd  cheaper command to use in quick mode instead of cmd (e.g. an incremental or changed-files-only variant)
 // lockGroup 'db' = needs the dedicated local database; consecutive steps in one group run under a single lock
 // env       extra environment: an object, or a function returning one (called just before the step starts)

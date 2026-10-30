@@ -16,7 +16,7 @@ import { expandHome, isInside, samePath, toPosix } from '../paths.mjs';
 
 export const DEV_RE = /\b(?:next\s+(?:dev|start)|npm\s+(?:run\s+)?(?:dev|start)|npm\s+start)\b/;
 
-const FILE_TOOLS = new Set(['Read', 'Edit', 'Write', 'Grep', 'Glob', 'NotebookEdit']);
+const FILE_TOOLS = new Set(['Read', 'Edit', 'Write', 'MultiEdit', 'Grep', 'Glob', 'NotebookEdit']);
 const READ_ONLY_FILE_TOOLS = new Set(['Read', 'Grep', 'Glob']);
 const BASH_PREFILTER_RE = /supabase|\.stack\b|psql|docker\s+exec|:\d{4,5}\b|SUPABASE|PG[A-Z]+=/;
 const SUPABASE_TOKEN_RE = /(?:^|[\\/])supabase(?:@[^\\/]*)?(?:\.exe|\.cmd)?$/i;

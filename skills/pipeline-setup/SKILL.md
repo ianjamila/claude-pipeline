@@ -121,7 +121,8 @@ branch protection.
 Merge `templates/settings.json`: the permission allowlist for the
 commands ship runs (pipeline CLI, verify, `gh pr create|edit|ready|checks|update-branch`, `git push|pull|
 fetch|add|commit|worktree`…; nothing that merges or edits protection). Keep existing keys. Never add
-`--dangerously-skip-permissions` or `bypassPermissions`.
+`--dangerously-skip-permissions` or `bypassPermissions`. If the repo's `.claude/settings.json` (or `settings.local.json`) still has a Stop hook
+that runs `stop-verify` (an older onboarding), remove that entry: vendor deletes the script and warns, but never edits the settings.
 
 ### h. CLAUDE.md
 

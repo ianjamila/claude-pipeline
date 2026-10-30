@@ -301,6 +301,8 @@ export const PIPELINE_ROOT = fileURLToPath(new URL('..', import.meta.url));
 export const SEAM_VARS = [
   'PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE', 'PIPELINE_UPDATE_REMOTE',
   'PIPELINE_DOCKER', 'PIPELINE_PS', 'PIPELINE_LSOF', 'PIPELINE_SUPABASE', 'PIPELINE_STACKS_DEADLINE_MS',
+  // install.mjs: extra skill names to retire; read only together with PIPELINE_TEST_MODE=1.
+  'PIPELINE_INSTALL_RETIRED_SKILLS',
 ];
 export const isInstalledCopy = (root = PIPELINE_ROOT) => existsSync(path.join(root, 'INSTALLED.json'));
 

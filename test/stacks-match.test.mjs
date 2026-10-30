@@ -197,6 +197,13 @@ test('Edit / Write / NotebookEdit of a path inside a stack folder', () => {
   assert.deepEqual(projects(fileTargets('NotebookEdit', { notebook_path: '/w/.worktrees/sa-corrections.stack/n.ipynb' })), ['sa-corrections']);
 });
 
+test('MultiEdit of a path inside a stack folder names the stack (the stack-register matcher fires on MultiEdit)', () => {
+  const input = { file_path: '/w/.worktrees/sa-corrections.stack/supabase/config.toml', edits: [{ old_string: 'a', new_string: 'b' }] };
+  assert.equal(fileTargets('MultiEdit', input)[0].via, 'path');
+  assert.deepEqual(projects(fileTargets('MultiEdit', { ...input, file_path: '../sa-corrections.stack/x.sql' }, '/w/.worktrees/x')), ['sa-corrections']);
+  assert.deepEqual(fileTargets('MultiEdit', { file_path: '/repo/src/a.ts', edits: [] }), []);
+});
+
 test('Read / Grep / Glob are read-only inspection: they name no stack, even inside a stack folder', () => {
   assert.deepEqual(fileTargets('Read', { file_path: '/w/.worktrees/sa-corrections.stack/supabase/config.toml' }), []);
   assert.deepEqual(fileTargets('Grep', { pattern: 'x', path: '/w/.worktrees/sa-corrections.stack' }), []);
@@ -365,6 +372,8 @@ test('prefilter: file tools hit on a path inside an inventory folder, a .stack s
   assert.equal(pf('Edit', { file_path: '/repo/supabase/config.toml' }), true);
   assert.equal(pf('Grep', { pattern: 'x', path: '/repo/supabase' }), true);
   assert.equal(pf('Glob', { pattern: '/w/.worktrees/sa-corrections.stack/**' }), true);
+  assert.equal(pf('MultiEdit', { file_path: '/w/.worktrees/sa-corrections.stack/a', edits: [] }), true);
+  assert.equal(pf('MultiEdit', { file_path: '/repo/src/a.ts', edits: [] }), false);
   assert.equal(pf('NotebookEdit', { notebook_path: '/w/.worktrees/sa-corrections.stack/n.ipynb' }), true);
   assert.equal(pf('Read', { file_path: '/repo/src/a.ts' }), false);
   assert.equal(pf('Read', { file_path: '/repo/supabase-notes.md' }), false);

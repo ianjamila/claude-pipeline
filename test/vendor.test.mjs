@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, rmSync, existsSync, readdirSync, statSync, cpSync, mkdtempSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, rmSync, existsSync, readdirSync, statSync, cpSync, mkdtempSync, realpathSync, symlinkSync, lstatSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
@@ -99,6 +99,62 @@ test('removing the retired entry deletes that one file and nothing else in the p
   assert.equal(before('scripts/pipeline/lib/notes.txt'), 'the project\'s file inside lib/\n');
   assert.equal(before('scripts/stop-verify.mjs'), '// not under scripts/pipeline/\n');
   assert.equal(before('src/stop-verify.mjs'), '// the project\'s source\n');
+});
+
+test('a symlinked stop-verify.mjs is unlinked, and what it points at is left alone', { skip: process.platform === 'win32' }, async () => {
+  const repo = createTmpRepo();
+  repo.write('keep/target.mjs', '// the target\n');
+  await vendorInto(repo.dir);
+  symlinkSync(join(repo.dir, 'keep', 'target.mjs'), join(repo.dir, LEFTOVER));
+  assert.deepEqual(vendorDrift(repo.dir), [{ file: LEFTOVER, reason: 'retired' }]);
+  const r = await vendorInto(repo.dir);
+  assert.deepEqual(r.output.removed, [LEFTOVER]);
+  assert.equal(lstatSync(join(repo.dir, LEFTOVER), { throwIfNoEntry: false }), undefined);
+  assert.equal(readFileSync(join(repo.dir, 'keep', 'target.mjs'), 'utf8'), '// the target\n');
+});
+
+// ---- a project whose settings still run the removed Stop hook is told to drop it (warn only; settings are never edited) ------------
+
+const STOP_SETTINGS = JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'node "${CLAUDE_PROJECT_DIR:-.}/scripts/pipeline/stop-verify.mjs"', timeout: 900 }] }] } }, null, 2);
+const stopWarnings = (res) => (res.output.warnings ?? []).filter((w) => w.includes('stop-verify'));
+
+test('vendor and vendor --check warn when .claude/settings.json or settings.local.json still runs stop-verify; they never edit the settings', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/settings.json', STOP_SETTINGS);
+  repo.write('.claude/settings.local.json', STOP_SETTINGS);
+  const run1 = await vendorInto(repo.dir);
+  assert.equal(run1.exitCode, 0);
+  const w = stopWarnings(run1);
+  assert.equal(w.length, 2, JSON.stringify(run1.output.warnings));
+  assert.match(w[0], /\.claude\/settings\.json/);
+  assert.match(w[1], /\.claude\/settings\.local\.json/);
+  assert.match(w[0], /remove that Stop hook entry/);
+  const check = await vendorInto(repo.dir, ['--check']);
+  assert.equal(check.exitCode, 0);
+  assert.equal(stopWarnings(check).length, 2, 'a clean --check still carries the warning');
+  assert.equal(readFileSync(join(repo.dir, '.claude', 'settings.json'), 'utf8'), STOP_SETTINGS);
+  assert.equal(readFileSync(join(repo.dir, '.claude', 'settings.local.json'), 'utf8'), STOP_SETTINGS);
+  // and on the drift path
+  rmSync(join(sp(repo.dir), 'smoke.mjs'));
+  const drifted = await vendorInto(repo.dir, ['--check']);
+  assert.equal(drifted.exitCode, 1);
+  assert.equal(stopWarnings(drifted).length, 2);
+});
+
+test('no stop-verify warning when the settings do not run it, are missing, unreadable or malformed', async () => {
+  const repo = createTmpRepo();
+  assert.deepEqual(stopWarnings(await vendorInto(repo.dir)), [], 'no .claude at all');
+  repo.write('.claude/settings.json', JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo done' }] }] }, permissions: { allow: ['Bash(node scripts/pipeline/smoke.mjs:*)'] } }));
+  assert.deepEqual(stopWarnings(await vendorInto(repo.dir)), []);
+  repo.write('.claude/settings.json', '{ not json stop-verify');
+  const bad = await vendorInto(repo.dir);
+  assert.equal(bad.exitCode, 0);
+  assert.deepEqual(stopWarnings(bad), [], 'malformed settings: no warning, no crash');
+  rmSync(join(repo.dir, '.claude', 'settings.json'));
+  mkdirSync(join(repo.dir, '.claude', 'settings.json'));
+  const unreadable = await vendorInto(repo.dir, ['--check']);
+  assert.equal(unreadable.exitCode, 0);
+  assert.deepEqual(stopWarnings(unreadable), [], 'a settings.json that cannot be read as a file: no warning, no crash');
 });
 
 test('a directory named stop-verify.mjs is not ours: not removed, not drift', async () => {

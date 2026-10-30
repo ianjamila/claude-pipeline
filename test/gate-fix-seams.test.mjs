@@ -23,7 +23,7 @@ test('the repo checkout is not an installed copy, so seams are honoured', () => 
   assert.equal(seamFlag('PIPELINE_TEST_MODE', { PIPELINE_TEST_MODE: '1' }), true);
   assert.equal(seamFlag('PIPELINE_TEST_MODE', { PIPELINE_TEST_MODE: 'yes' }), false);
   assert.deepEqual(SEAM_VARS.slice().sort(), [
-    'PIPELINE_CODEX', 'PIPELINE_DOCKER', 'PIPELINE_GH', 'PIPELINE_LSOF', 'PIPELINE_PS', 'PIPELINE_STACKS_DEADLINE_MS', 'PIPELINE_SUPABASE',
+    'PIPELINE_CODEX', 'PIPELINE_DOCKER', 'PIPELINE_GH', 'PIPELINE_INSTALL_RETIRED_SKILLS', 'PIPELINE_LSOF', 'PIPELINE_PS', 'PIPELINE_STACKS_DEADLINE_MS', 'PIPELINE_SUPABASE',
     'PIPELINE_TEST_MODE', 'PIPELINE_UPDATE_REMOTE', 'PIPELINE_VERCEL',
   ]);
 });
