@@ -29,7 +29,7 @@ import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultRe
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
 const MAX_ALIAS_LOOKUPS = 20_000; // (#111: distinct words x directories the line may be in; above it the text is refused like an over-long one, so the stats stay bounded)
-const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its rounds whose inodes are collected, so a hard link to a protected one is known)
+const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its rounds whose inodes are collected, so a hard link to a protected one is known; past it collection STOPS silently, so a hard link to a file beyond the cap is not seen: a documented residual, not a fail-closed)
 const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
@@ -290,7 +290,7 @@ function makeCtx(opts) {
   // that is not `.review` (a program that chdirs there, or builds a name below it, writes a protected file the text never names); (d) the
   // path is itself the same file (dev:ino) as a protected file of the folder or a round: a hard link or file symlink under another name.
   // Closed since the first cut: a glob through a link (hitReviewGlob), a link target built by a command substitution (linkReachesProtected),
-  // a hard link to a protected file (d). Residuals: a link the judged program makes itself does not exist yet when the hook looks, so no stat can see it; and only the
+  // a hard link to a protected file (d). Closed in the final round: a brace list / range into a protected name, link names with `,` `=`, `..` after a link, big directory globs. Residuals: a link the judged program makes itself does not exist yet when the hook looks, so no stat can see it; a hard link to a file past MAX_REVIEW_FILE_IDS; and only the
   // cwd's own <cwd>/.review is known, so a session whose cwd is a subdirectory of the checkout is not covered. The alias / inode check
   // is POSIX-only, like the protected-root inode check above: on win32 statId is null and nothing here fires (Windows behaviour unchanged).
   const statCache = new Map(); // (one evaluation: the same ancestors come up for every word of a long line)
@@ -325,7 +325,7 @@ function makeCtx(opts) {
   // against the real listing of the literal parent, each matching entry (a link to the folder included) judged with the rest of the glob.
   // Fail closed: `**` (any depth), a listing that failed or is over the entry cap, and more candidates than the work cap are hits; a
   // parent that does not exist holds nothing. With no review folder nothing is looked up.
-  const MAX_GLOB_CANDIDATES = 400;
+  const MAX_GLOB_CANDIDATES = 4000; // (= the entry cap of one listing below: a big directory of packages is no hit by its size alone)
   const hitReviewGlob = (g) => {
     if (reviewFolders().dir === null) return false;
     let work = 0;

@@ -1314,6 +1314,16 @@ test('#111: `..` after a link is the physical parent of what the link points to 
   assert.equal(w.write(`${T}/other/../state.json`), 'allow');
 });
 
+test('#111: a glob over a big directory (1000 packages) is no hit by its size alone while a review folder exists; past the entry cap it still is', () => {
+  const ids = { '/repo/.review': 'd:1', '/repo/.review/round-1': 'd:2' };
+  const pkgs = (n) => Array.from({ length: n }, (_, i) => `pkg${i}`);
+  const fake = (n) => ({ statId: (p) => ids[p] ?? null, readDir: (d) => (d === '/repo/.review' ? ['round-1'] : d === '/repo/pkgs' || d === '/repo/node_modules' ? pkgs(n) : []) });
+  for (const cmd of ['rm -rf ./node_modules/*/x', 'cp x ./pkgs/*/out.txt', 'echo y > ./pkgs/*/out.txt']) {
+    assert.equal(bash(cmd, fake(1000)), 'allow', cmd);
+    assert.equal(bash(cmd, fake(4001)), 'deny', `${cmd} (past the entry cap)`);
+  }
+});
+
 test('#111: a link whose name holds `,` or `=` is followed too', (t) => {
   const w = reviewAliasWorld(t);
   if (!w) return;
