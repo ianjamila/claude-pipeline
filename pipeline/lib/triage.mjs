@@ -1,6 +1,7 @@
 // Deterministic rules of the review loop: when the arbiter must be called, which rulings are final,
 // when a PR must go to a human, and when the loop may exit. A model never makes these decisions;
 // this file does. Everything is pure: functions return new values and never mutate their inputs.
+import { createHash } from 'node:crypto';
 import { CATEGORIES } from './codex.mjs';
 
 export const SECURITY_CATEGORIES = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
@@ -293,6 +294,18 @@ export function applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt }
   const next = structuredClone(item);
   next.final = { decision, by: 'owner', needsHuman: false, reason, ownerQuote, ruledAt, overruled: structuredClone(item.final) };
   return next;
+}
+
+// #110: what an owner ruling request is bound to. The owner is asked about the finding's TEXT, so the request carries a digest of
+// it (`P triage ruling-request`) and `owner-ruling` recomputes it: a rebuilt review that reuses an id for a finding that says something
+// else cannot reuse the ruling. Only the finding text is hashed (the fields of codex.mjs assignIds and of fableFindingItems, whose
+// reasoning is item.arbiter.reasoning), never a decision field (final, owner-ruling results, implemented), so applying one ruling of
+// a request leaves the digest of the others alone. First 12 hex of sha256 over one tuple per item, sorted by id.
+export function rulingContentDigest(items) {
+  const tuples = [...items]
+    .map((i) => [String(i.id).toUpperCase(), i.source, i.bucket, i.category, i.title, i.file, i.line, i.detail, i.codexReasoning, i.arbiter?.reasoning].map((v) => v ?? null))
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return createHash('sha256').update(JSON.stringify(tuples)).digest('hex').slice(0, 12);
 }
 
 // The marker is the quote, not `by`: a later round's cached copy of the ruling has by 'cache' and is still the owner's word.

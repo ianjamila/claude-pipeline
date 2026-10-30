@@ -18,7 +18,7 @@ export function sectionsOf(body) {
 
 // The newest summary comment the viewer wrote that STARTS with the marker: the same one upsertComment edits.
 // -> {status: ok|absent|legacy|unsupported|invalid, record?, sections, url, id}
-// `summaryFromComments` works on a comment list the caller already holds (`P inbox` reads each PR's list once).
+// `summaryFromComments` works on a comment list the caller already holds.
 export function summaryFromComments(comments, viewerLogin) {
   const mine = comments
     .filter((c) => typeof c.body === 'string' && c.body.startsWith(MARKERS.summary) && c.user?.login === viewerLogin)

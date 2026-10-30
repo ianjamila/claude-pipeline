@@ -2,7 +2,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { GhError } from '../pipeline/lib/proc.mjs';
 import { createGitHub, parseConcatenatedJson, classifyApiError } from '../pipeline/lib/github.mjs';
-import { findDeployment, currentProduction } from '../pipeline/lib/deploy.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
 
 const cwd = process.cwd();
@@ -220,20 +219,6 @@ test('protection: a branch containing a slash keeps its slashes in the path', ()
   assert.ok(fake.lines().includes('api repos/acme/widgets/branches/release/1.x/protection'));
 });
 
-// ---- deployments ----------------------------------------------------------------------------
-
-test('deployments / deploymentStatuses build the right API paths', () => {
-  const { fake, gh } = mk([REPO, { match: 'deployments\\?', stdoutJson: [{ id: 1 }] }, { match: 'statuses', stdoutJson: [{ state: 'success' }] }]);
-  assert.deepEqual(gh.deployments({ sha: 'a'.repeat(40), environment: 'Preview' }), [{ id: 1 }]);
-  assert.deepEqual(gh.deploymentStatuses(77), [{ state: 'success' }]);
-  assert.deepEqual(gh.deployments({ environment: 'Production' }), [{ id: 1 }]);
-  assert.deepEqual(fake.lines().filter((l) => l.startsWith('api repos/acme/widgets/deployments')), [
-    `api repos/acme/widgets/deployments?sha=${'a'.repeat(40)}&environment=Preview&per_page=30`,
-    'api repos/acme/widgets/deployments/77/statuses?per_page=30',
-    'api repos/acme/widgets/deployments?environment=Production&per_page=30',
-  ]);
-});
-
 // ---- checks ---------------------------------------------------------------------------------
 
 test('checks parses the JSON that gh prints while exiting 8 (pending) or 1 (failed)', () => {
@@ -250,123 +235,6 @@ test('checks passes --required, and throws when stdout is not JSON', () => {
   assert.equal(fake.lines()[0], 'pr checks 3 --json name,state,bucket,link,workflow --required');
   const bad = mk([{ match: '^pr checks', stderr: "no checks reported on the 'x' branch", code: 1 }]);
   assert.throws(() => bad.gh.checks(3), GhError);
-});
-
-// ---- deploy.mjs -----------------------------------------------------------------------------
-
-// A scripted gh for deploy.mjs: each poll consumes the next frame { deployments, statuses: {id: [...]} }.
-function stubGh(frames) {
-  let i = -1;
-  const frame = () => frames[Math.min(i, frames.length - 1)];
-  return {
-    deployments: () => { i += 1; return frame().deployments; },
-    deploymentStatuses: (id) => frame().statuses[id] ?? [],
-  };
-}
-const clock = () => {
-  let t = 1_000;
-  return { now: () => t, sleep: async (ms) => { t += ms; } };
-};
-const SHA = 'a'.repeat(40);
-
-test('findDeployment: success returns the environment_url of the newest deployment', async () => {
-  const gh = stubGh([{
-    deployments: [{ id: 1, sha: SHA, created_at: '2026-10-01T00:00:00Z' }, { id: 2, sha: SHA, created_at: '2026-10-01T01:00:00Z' }],
-    statuses: {
-      1: [{ state: 'failure' }],
-      2: [{ state: 'success', environment_url: 'https://preview.example', target_url: 'https://log' }, { state: 'in_progress' }],
-    },
-  }]);
-  const r = await findDeployment({ gh, sha: SHA, environment: 'Preview', timeoutMs: 60_000, ...clock() });
-  assert.deepEqual(r, { state: 'success', id: 2, url: 'https://preview.example', sha: SHA, createdAt: '2026-10-01T01:00:00Z' });
-});
-
-test('findDeployment: falls back to target_url when there is no environment_url', async () => {
-  const gh = stubGh([{ deployments: [{ id: 1, sha: SHA }], statuses: { 1: [{ state: 'success', target_url: 'https://t.example' }] } }]);
-  const r = await findDeployment({ gh, sha: SHA, environment: 'Preview', timeoutMs: 1000, ...clock() });
-  assert.equal(r.url, 'https://t.example');
-});
-
-test('findDeployment: failure and error statuses are failures', async () => {
-  for (const state of ['failure', 'error']) {
-    const gh = stubGh([{ deployments: [{ id: 5, sha: SHA }], statuses: { 5: [{ state, log_url: 'https://logs' }] } }]);
-    const r = await findDeployment({ gh, sha: SHA, environment: 'Preview', timeoutMs: 1000, ...clock() });
-    assert.equal(r.state, 'failure');
-    assert.equal(r.id, 5);
-    assert.equal(r.url, 'https://logs');
-  }
-});
-
-test('findDeployment: keeps polling through "no deployment yet" and "in progress", then succeeds', async () => {
-  const gh = stubGh([
-    { deployments: [], statuses: {} },
-    { deployments: [{ id: 3, sha: SHA }], statuses: { 3: [{ state: 'in_progress' }, { state: 'pending' }] } },
-    { deployments: [{ id: 3, sha: SHA }], statuses: { 3: [{ state: 'success', environment_url: 'https://ok' }] } },
-  ]);
-  const c = clock();
-  const slept = [];
-  const r = await findDeployment({ gh, sha: SHA, environment: 'Preview', timeoutMs: 600_000, pollMs: 15_000, now: c.now, sleep: async (ms) => { slept.push(ms); await c.sleep(ms); } });
-  assert.equal(r.state, 'success');
-  assert.deepEqual(slept, [15_000, 15_000]);
-});
-
-test('findDeployment: times out when nothing finishes (injected clock, no real waiting)', async () => {
-  const gh = stubGh([{ deployments: [{ id: 3, sha: SHA }], statuses: { 3: [{ state: 'in_progress' }] } }]);
-  const r = await findDeployment({ gh, sha: SHA, environment: 'Preview', timeoutMs: 45_000, pollMs: 15_000, ...clock() });
-  assert.deepEqual(r, { state: 'timeout' });
-});
-
-test('findDeployment: always polls once, even with a zero timeout', async () => {
-  const calls = [];
-  const gh = { deployments: () => { calls.push(1); return []; }, deploymentStatuses: () => [] };
-  const r = await findDeployment({ gh, sha: SHA, environment: 'Preview', timeoutMs: 0, ...clock() });
-  assert.equal(r.state, 'timeout');
-  assert.equal(calls.length, 1);
-});
-
-test('findDeployment: a superseded (inactive) status does not hide the success underneath it', async () => {
-  const gh = stubGh([{ deployments: [{ id: 3, sha: SHA }], statuses: { 3: [{ state: 'inactive' }, { state: 'success', environment_url: 'https://was-ok' }] } }]);
-  const r = await findDeployment({ gh, sha: SHA, environment: 'Preview', timeoutMs: 1000, ...clock() });
-  assert.equal(r.state, 'success');
-});
-
-test('findDeployment: a success with no URL at all is not a success', async () => {
-  const gh = stubGh([{ deployments: [{ id: 3, sha: SHA }], statuses: { 3: [{ state: 'success' }] } }]);
-  const r = await findDeployment({ gh, sha: SHA, environment: 'Preview', timeoutMs: 20_000, pollMs: 10_000, ...clock() });
-  assert.equal(r.state, 'timeout');
-});
-
-test('findDeployment: tolerates a transient gh error but gives up after three in a row', async () => {
-  let n = 0;
-  const flaky = {
-    deployments: () => { n += 1; if (n === 1) throw new GhError({ code: 1, stderr: 'HTTP 502', args: ['api'] }); return [{ id: 1, sha: SHA }]; },
-    deploymentStatuses: () => [{ state: 'success', environment_url: 'https://ok' }],
-  };
-  assert.equal((await findDeployment({ gh: flaky, sha: SHA, environment: 'P', timeoutMs: 60_000, ...clock() })).state, 'success');
-  const dead = { deployments: () => { throw new GhError({ code: 1, stderr: 'HTTP 401', args: ['api'] }); }, deploymentStatuses: () => [] };
-  await assert.rejects(findDeployment({ gh: dead, sha: SHA, environment: 'P', timeoutMs: 600_000, ...clock() }), GhError);
-});
-
-test('currentProduction: newest deployment whose latest status is success', async () => {
-  const gh = {
-    deployments: () => [
-      { id: 30, sha: 'c'.repeat(40), created_at: '2026-10-03T00:00:00Z' },
-      { id: 20, sha: 'b'.repeat(40), created_at: '2026-10-02T00:00:00Z' },
-      { id: 10, sha: 'a'.repeat(40), created_at: '2026-10-01T00:00:00Z' },
-    ],
-    deploymentStatuses: (id) => ({
-      30: [{ state: 'in_progress' }],
-      20: [{ state: 'success', environment_url: 'https://prod.example' }, { state: 'in_progress' }],
-      10: [{ state: 'inactive' }, { state: 'success', environment_url: 'https://old' }],
-    })[id],
-  };
-  assert.deepEqual(await currentProduction({ gh, environment: 'Production' }), { id: 20, sha: 'b'.repeat(40), url: 'https://prod.example' });
-});
-
-test('currentProduction: null when nothing has succeeded', async () => {
-  const gh = { deployments: () => [{ id: 1, sha: SHA }], deploymentStatuses: () => [{ state: 'failure' }] };
-  assert.equal(await currentProduction({ gh, environment: 'Production' }), null);
-  assert.equal(await currentProduction({ gh: { deployments: () => [], deploymentStatuses: () => [] }, environment: 'Production' }), null);
 });
 
 test('a gh call that timed out is a failure even if it printed something parseable', () => {

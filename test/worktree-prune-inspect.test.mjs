@@ -232,7 +232,7 @@ test('listCandidates: a pipeline-keep lock older than 7 days is a stale keep; a 
 });
 
 // spec §4 rule 6: only a session WORKING in the worktree counts (its cwd, or a tool call naming the path), never a
-// listing that merely prints it (`git worktree list`, `ship inbox`) or prose about it.
+// listing that merely prints it (`git worktree list`) or prose about it.
 test('transcriptMentions: cwd inside or a tool_use input naming the path count; tool results and prose do not', () => {
   const p = '/r/.worktrees/agent-x';
   const t = mkdtempSync(join(tmpdir(), 'tr-'));

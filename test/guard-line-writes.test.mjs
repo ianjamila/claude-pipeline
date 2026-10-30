@@ -202,6 +202,15 @@ test('h: curl writes every file its options name; what is not certain is unmodel
   denyBoth((_, mid) => `curl -sD ok.sh https://x; ${mid}; bash ok.sh`);
   // switches, header / data values and a plain download to stdout write nothing
   for (const c of ['curl -sSL https://x', "curl -H 'x-o: n.sh' https://x", 'curl -d o https://x', 'curl -s -w "%{http_code}" https://x', 'curl --silent --fail https://x']) allowBoth((_, _m, mid) => `${c}; ${mid}; bash n.sh`);
+  // #113: a URL with [ or { is a curl glob (many files, or a #1 name): -g / --globoff is not trusted (our argument reading can differ from curl's)
+  for (const flags of ['', '-g', '--globoff', '-sg', '-g --no-globoff']) {
+    denyBoth((_, mid) => `curl ${flags} -o out 'https://api.github.com/x/[1-2]'; ${mid}; bash n.sh`);
+    denyBoth((_, mid) => `curl ${flags} -o out 'https://api.github.com/x/{a,b}'; ${mid}; bash n.sh`);
+  }
+  // a bracketed host is exempt only as a real IPv6 literal: a colon inside, and the bracket ends the host
+  for (const u of ['http://[::1]:8080/x', 'https://[2001:db8::1]/x', 'http://user@[::1]/x']) allowBoth((_, _m, mid) => `curl -g -o out '${u}'; ${mid}; bash n.sh`);
+  for (const u of ['http://[::1]:8080/x', 'https://[2001:db8::1]/x']) allowBoth((_, _m, mid) => `curl -o out '${u}'; ${mid}; bash n.sh`);
+  for (const u of ['http://[abc]/x', 'https://[a]pi.github.com/x', 'https://[::1]api.github.com/x', 'http://[::1]:8080/x/[1-2]', 'http://a[1-2]@[::1]/x', 'http://a{b,c}@[::1]/x']) denyBoth((_, mid) => `curl -o out '${u}'; ${mid}; bash n.sh`);
   // tar -c / -r / -u write the archive named by -f
   denyBoth((_, mid) => `tar -cf n.sh d; ${mid}; bash n.sh`);
   denyBoth((_, mid) => `tar cf n.sh d; ${mid}; bash n.sh`);

@@ -153,13 +153,14 @@ test('missing inputs -> run', async () => {
 
 // ---- how ci.yml wires it in ----
 const ci = read('.github/workflows/ci.yml');
-const jobBlocks = () => ci.split(/^ {2}(?=test-(?:ubuntu|windows):)/m).slice(1);
+const jobBlocks = () => ci.split(/^ {2}(?=test-(?:ubuntu|windows-shard|windows):)/m).slice(1);
+const blockOf = (id) => jobBlocks().find((b) => b.startsWith(`test-${id}:`));
 const stepsOf = (block) => block.split(/^ {6}(?=- )/m).slice(1);
 
-test('both jobs open with the skip step, push only, naming their own job', () => {
+test('the test jobs open with the skip step, push only, naming their own job (ubuntu and each Windows shard)', () => {
   const blocks = jobBlocks();
-  assert.equal(blocks.length, 2);
-  for (const block of blocks) {
+  assert.equal(blocks.length, 3, 'ubuntu, the Windows shard job and the aggregate');
+  for (const block of blocks.filter((b) => !b.startsWith('test-windows:'))) {
     const jobName = block.match(/^ {4}name: (.+)$/m)[1].trim();
     const steps = stepsOf(block);
     const at = steps.findIndex((s) => s.includes('tested-tree.mjs'));
@@ -175,10 +176,32 @@ test('both jobs open with the skip step, push only, naming their own job', () =>
     // Only checkout (and the windows autocrlf setting) may come before it; everything after is gated.
     for (const before of steps.slice(0, at)) assert.match(before, /actions\/checkout@|core\.autocrlf/);
     assert.ok(steps.slice(0, at).some((s) => s.includes('actions/checkout@')), 'the script comes from the checkout');
+    const gated = "github.event_name != 'push' || steps.tested.outputs.run != 'false'";
     for (const after of steps.slice(at + 1)) {
-      assert.match(after, /if: github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'\s*$/m, after.split('\n')[0]);
+      // The one exception: the shard job's installer round trip runs in shard 3 only, and keeps the skip gate too.
+      const shard3Only = after.includes('installer-round-trip.sh') && block.startsWith('test-windows-shard:');
+      const want = shard3Only ? `if: matrix.shard == 3 && (${gated})` : `if: ${gated}`;
+      assert.ok(after.split('\n').some((l) => l.trim() === want), `${after.split('\n')[0]}: expected "${want}"`);
     }
   }
+});
+
+test('the Windows shard job: JOB_NAME is the per-shard name, shards run `--shard I/3`, the installer runs in shard 3 only', () => {
+  const block = blockOf('windows-shard');
+  assert.match(block, /^ {4}name: test \(windows \$\{\{ matrix\.shard \}\}\/3\)$/m);
+  assert.match(block, /JOB_NAME: test \(windows \$\{\{ matrix\.shard \}\}\/3\)$/m);
+  assert.match(block, /run: node scripts\/test\.mjs --shard \$\{\{ matrix\.shard \}\}\/3$/m);
+  const installer = stepsOf(block).filter((st) => st.includes('installer-round-trip.sh'));
+  assert.equal(installer.length, 1);
+  assert.match(installer[0], /if: matrix\.shard == 3 && \(github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'\)/);
+});
+
+test('the aggregate test (windows) job has no skip step and always evaluates the shard result', () => {
+  const block = blockOf('windows');
+  assert.ok(!block.includes('tested-tree.mjs'), 'nothing to skip: it only reads the shards');
+  assert.match(block, /^ {4}name: test \(windows\)$/m);
+  assert.match(block, /^ {4}needs: test-windows-shard$/m);
+  assert.match(block, /^ {4}if: always\(\)$/m);
 });
 
 test('ci.yml grants only the extra read scopes the skip step needs, with a comment', () => {

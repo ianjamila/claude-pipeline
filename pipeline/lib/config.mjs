@@ -29,7 +29,7 @@ export const DEFAULTS = deepFreeze({
   version: 1,
   enforcement: 'github',
   // owner_approval: how the owner signs off a PR that trips a blocking hard-stop or a test-integrity rule. 'label' = the
-  // owner adds human-approved / test-change-approved; 'chat' = no label and CI does not fail on those: the ship skill stops
+  // owner adds human-approved / test-change-approved; 'chat' = no label and CI does not fail on those: the review skill stops
   // before the merge, asks in chat, and runs the merge when the owner says "merge".
   owner_approval: 'label',
   default_branch: 'main',
@@ -44,8 +44,7 @@ export const DEFAULTS = deepFreeze({
     archive: ['.review/', '.verify/'],
     memory_dirs: ['~/claude-memory'],
   },
-  // stop_queue_wait_minutes: how long verify.quick may WAIT (for a machine-wide heavy-check slot) before it runs, on top of the
-  // Stop hook's own 840 s execution allowance. 0 = no queue. The hook's timeout in .claude/settings.json must grow to match.
+  // stop_queue_wait_minutes: retired with the Stop hook (stop-verify); kept so a config that still sets it validates. Nothing reads it.
   // after_fix: what the verifier runs after review fixes are accepted: 'full' (today) or 'quick' (see `pipeline verify plan-after-fix`).
   verify: { report: '.verify/report.json', screenshots: '.verify/screenshots', stop_queue_wait_minutes: 0, after_fix: 'full' },
   // guard_checks: the tamper-proof "Test integrity" and "Hard-stop scan" statuses are always required on top of
@@ -110,7 +109,9 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
 const EFFORT_LANES = ['low', 'medium', 'high', 'followup'];
 const OWNER_APPROVALS = ['label', 'chat'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];
-// Who owns the production smoke: the ship session (prod-watch) or a CI workflow that posts the result on the merged PR.
+// Who owns the production smoke: a session or a CI workflow that posts the result on the merged PR.
+// `preview` and `production` are validated exactly as before, but the final gate and `pipeline merge` no longer read them;
+// `pipeline smoke` reads `preview.smoke` and `production.smoke` (and `agent-log close` the watch mode).
 const WATCH_MODES = ['session', 'workflow'];
 const AFTER_FIX_MODES = ['full', 'quick'];
 // Lowercase "x-" + 1..60 of [a-z0-9-]: no standard header (authorization, cookie, ...) can match, so the smoke can never
@@ -246,7 +247,7 @@ function checkSlots(verify, errors) {
 // by a check name alone); every deferrable step needs an entry and every entry a deferrable step. An entry may also carry `steps`:
 // the exact names of steps INSIDE that job that must each have run and succeeded (a job with a step-level skip, e.g. a docs-only
 // PR, reports success although every work step was skipped; ci-proof.mjs rule 5 then refuses the proof). verify.ci_proof_inputs: globs of
-// extra files whose change makes a PR ineligible for CI proof. verify.ci_proof_wait_minutes: how long the ship skill waits for the
+// extra files whose change makes a PR ineligible for CI proof. verify.ci_proof_wait_minutes: how long the review skill waits for the
 // proof (no default: unset = it does not wait). The GATE reads deferrable_steps / ci_proof / ci_proof_inputs from the base branch.
 export const CI_PROOF_WORKFLOW = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 function checkCiProof(verify, errors) {
@@ -634,7 +635,7 @@ export function validateConfig(obj) {
   return errors.length === 0 ? { ok: true, errors, warnings, config } : { ok: false, errors, warnings, config: null };
 }
 
-// The Stop hook's own timeout (seconds) in the template settings.json, and the part of it stop-verify spends executing.
+// The retired Stop hook's own timeout (seconds), and the part of it stop-verify spent executing. Kept for a project that still has the hook.
 const STOP_HOOK_TIMEOUT_S = 900;
 
 /**

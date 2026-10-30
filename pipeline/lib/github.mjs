@@ -12,61 +12,12 @@ import { resolve } from 'node:path';
 const CALL_TIMEOUT_MS = 60_000;
 const PER_PAGE = 30;
 
-// ---- GraphQL: the inbox's open / recently merged PR lists --------------------------------------
-// Page size 20: each node carries up to 100 check contexts, and a bigger page trips GitHub's node limit.
+// ---- GraphQL: paged pull request lists -----------------------------------------------------------
+// Page size 20: a bigger page can trip GitHub's node limit on heavy queries.
 const GRAPHQL_PAGE = 20;
 const MAX_PAGES = 100;
 
-const OPEN_PRS_QUERY = `query($owner: String!, $name: String!, $first: Int!, $after: String) {
-  repository(owner: $owner, name: $name) {
-    pullRequests(states: OPEN, first: $first, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        number title url isDraft createdAt baseRefName headRefName headRefOid isCrossRepository mergeable
-        labels(first: 50) { nodes { name } }
-        autoMergeRequest { enabledAt }
-        reviews(last: 1) { nodes { submittedAt } }
-        commits(last: 1) { nodes { commit { committedDate statusCheckRollup { contexts(first: 100) { nodes {
-          __typename
-          ... on CheckRun { name status conclusion }
-          ... on StatusContext { context state }
-        } } } } } }
-      }
-    }
-  }
-}`;
-
-const MERGED_PRS_QUERY = `query($owner: String!, $name: String!, $first: Int!, $after: String) {
-  repository(owner: $owner, name: $name) {
-    pullRequests(states: MERGED, first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
-      pageInfo { hasNextPage endCursor }
-      nodes { number title url mergedAt updatedAt baseRefName headRefName headRefOid isCrossRepository }
-    }
-  }
-}`;
-
 const nodesOf = (conn) => (Array.isArray(conn?.nodes) ? conn.nodes.filter((n) => n !== null && typeof n === 'object') : []);
-
-function normaliseOpenPr(n) {
-  const commit = nodesOf(n.commits)[0]?.commit ?? null;
-  return {
-    number: n.number,
-    title: n.title ?? '',
-    url: n.url ?? null,
-    isDraft: n.isDraft === true,
-    createdAt: n.createdAt ?? null,
-    baseRefName: n.baseRefName,
-    headRefName: n.headRefName,
-    headRefOid: n.headRefOid,
-    isCrossRepository: n.isCrossRepository === true,
-    mergeable: n.mergeable ?? 'UNKNOWN',
-    labels: nodesOf(n.labels).map((l) => l.name).filter((x) => typeof x === 'string'),
-    autoMergeEnabledAt: n.autoMergeRequest?.enabledAt ?? null,
-    reviewDates: nodesOf(n.reviews).map((r) => r.submittedAt).filter((x) => typeof x === 'string'),
-    commitDate: commit?.committedDate ?? null,
-    contexts: nodesOf(commit?.statusCheckRollup?.contexts),
-  };
-}
 
 export const encodePath = (p) => String(p).split('/').map(encodeURIComponent).join('/');
 
@@ -252,32 +203,6 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       throw new GhError({ code: 0, stderr: `more than ${MAX_PAGES} pages of pull requests`, args: ['api', 'graphql'] });
     },
 
-    // Every open PR (no comment bodies), oldest first, as plain facts: labels are names, contexts the latest commit's
-    // check runs and status contexts.
-    listOpenPrsDetailed() {
-      const out = [];
-      self.pagePullRequests(OPEN_PRS_QUERY, (nodes) => {
-        out.push(...nodes.map(normaliseOpenPr));
-      });
-      return out;
-    },
-
-    // PRs merged at or after `sinceMs`. The list is ordered by updatedAt, and mergedAt <= updatedAt, so the first page whose
-    // newest-to-oldest tail is older than `sinceMs` ends the walk: nothing after it can have merged inside the window.
-    listMergedPrsSince(sinceMs) {
-      const out = [];
-      self.pagePullRequests(MERGED_PRS_QUERY, (nodes) => {
-        for (const n of nodes) {
-          const merged = Date.parse(n.mergedAt);
-          if (!Number.isNaN(merged) && merged >= sinceMs) out.push({ number: n.number, title: n.title ?? '', url: n.url ?? null, mergedAt: n.mergedAt, baseRefName: n.baseRefName, headRefName: n.headRefName, headRefOid: n.headRefOid, isCrossRepository: n.isCrossRepository === true });
-        }
-        const last = nodes.at(-1);
-        const updated = Date.parse(last?.updatedAt);
-        return nodes.length === 0 || (!Number.isNaN(updated) && updated < sinceMs);
-      });
-      return out;
-    },
-
     listIssues: ({ label, state = 'open' }) =>
       getJson(['issue', 'list', '--label', label, '--state', state, '--json', 'number,title,url,labels', '--limit', '100']),
     listPrs: ({ label, state = 'open' }) =>
@@ -399,15 +324,6 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       }
       throw failure(r, args);
     },
-
-    deployments({ sha, environment } = {}) {
-      const q = [];
-      if (sha) q.push(`sha=${encodeURIComponent(sha)}`);
-      if (environment) q.push(`environment=${encodeURIComponent(environment)}`);
-      q.push(`per_page=${PER_PAGE}`);
-      return getJson(['api', `repos/${self.repo().slug}/deployments?${q.join('&')}`]);
-    },
-    deploymentStatuses: (id) => getJson(['api', `repos/${self.repo().slug}/deployments/${Number(id)}/statuses?per_page=${PER_PAGE}`]),
 
     // gh exits 8 while checks are pending and 1 when some failed, and still prints the JSON; only a
     // reply that is not JSON (auth error, "no checks reported") is a failure.

@@ -16,12 +16,12 @@ import { isInside } from './paths.mjs';
 export const AGENT_LOG_HEADER = [
   '# Agent log',
   '',
-  'One line per pipeline run, newest last. Written by the `ship` skill; the PR summary comment is the',
+  'One line per pipeline run, newest last. Written by the review skill; the PR summary comment is the',
   'full record.',
   '',
 ].join('\n');
 
-// The outcome of the line the ship skill logs for a run that merged: the production smoke has not reported yet.
+// The outcome of the line the review skill logs for a run that merged: the production smoke has not reported yet.
 export const DEFAULT_OUTCOME = 'merged — prod smoke pending';
 
 const QUEUE_FILE = 'agent-log-queue.jsonl';

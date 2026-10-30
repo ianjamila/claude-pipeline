@@ -6,9 +6,10 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  BLOCKING_LABELS, CANONICAL_CHECKS, GATE_MAX_AGE_MS, abandonMerge, blockingLabelsOf, expectedCheckNames, gateRefusals, inlineOptionValues,
-  isDocsOnly, isLogOnly, labelNames, labelsCheck, mergeTiming, readPrSettled, readReviewJson, tailLines, waitForMerge, writeReviewJson,
+  BLOCKING_LABELS, CANONICAL_CHECKS, GATE_MAX_AGE_MS, abandonMerge, blockingLabelsOf, expectedCheckNames, gateRefusals,
+  isDocsOnly, isLogOnly, labelNames, labelsCheck, mergeTiming, readPrSettled, readReviewJson, waitForMerge,
 } from '../pipeline/lib/finalgate.mjs';
+import { writeReviewJson } from '../pipeline/lib/cmd-io.mjs';
 import {
   AGENT_LOG_HEADER, appendLines, assertSingleLine, buildAgentLogLine, countArbiterCalls, resolveLogPath,
 } from '../pipeline/lib/agentlog.mjs';
@@ -109,25 +110,6 @@ test('labelsCheck: labels must be a list of objects with string names; anything 
   assert.equal(labelsCheck(undefined).ok, false);
 });
 
-test('tailLines: last N lines, colours stripped, long lines clipped, trailing blanks dropped', () => {
-  const text = `${Array.from({ length: 40 }, (_, i) => `l${i + 1}`).join('\n')}\n\n`;
-  const t = tailLines(text, 30).split('\n');
-  assert.equal(t.length, 30);
-  assert.equal(t[0], 'l11');
-  assert.equal(t.at(-1), 'l40');
-  assert.equal(tailLines('\x1b[31mred\x1b[0m'), 'red');
-  assert.ok(tailLines('x'.repeat(1000)).length < 500);
-  assert.equal(tailLines(undefined), '');
-});
-
-test('inlineOptionValues: folds \`--name value\` into \`--name=value\` so dash-leading values (markdown bullets) survive parseArgs', () => {
-  assert.deepEqual(inlineOptionValues(['--pr', '12', '--line', '- 2026 · #12'], ['--line']), ['--pr', '12', '--line=- 2026 · #12']);
-  assert.deepEqual(inlineOptionValues(['--line=- x', '--pr', '1'], ['--line']), ['--line=- x', '--pr', '1']);
-  assert.deepEqual(inlineOptionValues(['--line'], ['--line']), ['--line'], 'a dangling flag is left for parseArgs to reject');
-  assert.deepEqual(inlineOptionValues(['--other', '--line'], ['--line']), ['--other', '--line']);
-  assert.deepEqual(inlineOptionValues(['--built', '- a', '--outcome', 'ok'], ['--built', '--outcome']), ['--built=- a', '--outcome=ok']);
-});
-
 // ---- gateRefusals --------------------------------------------------------------------------------
 
 const NOW = Date.parse('2026-10-01T12:00:00Z');
@@ -158,14 +140,13 @@ test('gateRefusals: every mismatch is refused, each with its own reason', () => 
 
 test('gateRefusals: the check-name set is pinned: every canonical check, once, and nothing else', () => {
   assert.deepEqual([...CANONICAL_CHECKS], ['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'review', 'ci']);
-  assert.deepEqual(expectedCheckNames(false), [...CANONICAL_CHECKS]);
-  assert.deepEqual(expectedCheckNames(true), [...CANONICAL_CHECKS, 'preview']);
-  assert.deepEqual(refusals(goodGate({ checks: checksOf(expectedCheckNames(true)) }), { previewConfigured: true }), []);
+  assert.deepEqual(expectedCheckNames(), [...CANONICAL_CHECKS]);
+  assert.deepEqual(expectedCheckNames(true), [...CANONICAL_CHECKS], 'no argument changes the set: a configured preview adds no check');
+  assert.deepEqual(refusals(goodGate({ checks: checksOf(expectedCheckNames()) })), []);
   assert.match(refusals(goodGate({ checks: [{ name: 'x', ok: true }] })).join(), /missing canonical check\(s\): pr-open, labels, preflight, verify-report, hardstops, integrity, review, ci/);
   assert.match(refusals(goodGate({ checks: checksOf().filter((c) => c.name !== 'ci') })).join(), /missing canonical check\(s\): ci$/);
   assert.match(refusals(goodGate({ checks: checksOf(CANONICAL_CHECKS.filter((n) => n !== 'review')) })).join(), /missing canonical check\(s\): review/);
-  assert.match(refusals(goodGate(), { previewConfigured: true }).join(), /missing canonical check\(s\): preview/);
-  assert.match(refusals(goodGate({ checks: checksOf(expectedCheckNames(true)) })).join(), /unexpected check\(s\): preview/);
+  assert.match(refusals(goodGate({ checks: checksOf([...CANONICAL_CHECKS, 'preview']) })).join(), /unexpected check\(s\): preview/);
   assert.match(refusals(goodGate({ checks: [...checksOf(), { name: 'bonus', ok: true }] })).join(), /unexpected check\(s\): bonus/);
   assert.match(refusals(goodGate({ checks: [...checksOf(), { name: 'ci', ok: true }] })).join(), /more than once/);
   assert.match(refusals(goodGate({ checks: [...checksOf().slice(0, 7), null] })).join(), /failing or missing checks/);

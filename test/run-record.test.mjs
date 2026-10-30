@@ -23,11 +23,6 @@ test('every outcome has a step, a next line, and a known step', () => {
   assert.equal(OUTCOME_STEP['prod-unknown'], 'prod-watch');
 });
 
-test('every `P summary` outcome word the owner push knows is a record outcome too (else the record would stay "running")', async () => {
-  const { OUTCOME_EVENTS } = await import('../pipeline/lib/notify.mjs');
-  for (const w of Object.keys(OUTCOME_EVENTS)) assert.ok(OUTCOMES.includes(w), w);
-});
-
 for (const outcome of [null, ...OUTCOMES]) {
   test(`round trip: outcome ${outcome}`, () => {
     const rec = { ...emptyRecord(ID), outcome, step: outcome ? OUTCOME_STEP[outcome] : 'review', head: 'a'.repeat(40) };

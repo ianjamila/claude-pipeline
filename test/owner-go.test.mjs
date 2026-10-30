@@ -97,16 +97,22 @@ test('owner-go: subagents, other hook events and odd session names never record'
 test('owner-go: a ruling is recorded only after a reply that ends with the ruling line, and only for the owner', () => {
   const home = tmp();
   const now = () => Date.parse('2026-10-14T10:00:00Z');
-  const ASK = 'R1-B1 waits for you.\n⚖️ Owner ruling needed #58: R1-B1, R2-S3 · repo O/R';
-  assert.deepEqual(presentedRuling(ASK), { pr: 58, repo: 'o/r', ids: ['R1-B1', 'R2-S3'] });
+  const CONTENT = 'abcdef012345';
+  const ASK = `R1-B1 waits for you.\n⚖️ Owner ruling needed #58: R1-B1, R2-S3 · content ${CONTENT} · repo O/R`;
+  assert.deepEqual(presentedRuling(ASK), { pr: 58, repo: 'o/r', ids: ['R1-B1', 'R2-S3'], content: CONTENT });
+  assert.equal(presentedRuling(ASK.replace(CONTENT, CONTENT.toUpperCase())).content, CONTENT, 'the digest is read in lower case');
+  assert.deepEqual(presentedRuling('⚖️ Owner ruling needed #58: R1-B1 · repo o/r'), { pr: 58, repo: 'o/r', ids: ['R1-B1'], content: null }, 'the old line shape has no content');
+  for (const bad of ['abcdef01234', 'abcdef0123456', 'ghijkl012345', 'none']) {
+    assert.equal(presentedRuling(ASK.replace(CONTENT, bad)), null, `content ${bad}`);
+  }
   assert.deepEqual(presentedRuling('Owner ruling needed #58: R1-B1 | repo o/r'), null, 'the ⚖ mark is part of the line');
   for (const bad of [`${ASK}\nanything after`, '⚖️ Owner ruling needed #58: R1-B1', '⚖️ Owner ruling needed: R1-B1 · repo o/r', '⚖️ Owner ruling needed #58: all of them · repo o/r']) {
     assert.equal(presentedRuling(bad), null, bad);
   }
   const answer = 'R1-B1: reject,  R2-S3 follow-up';
   const r = recordRuling(input(home, answer, [said(ASK)]), { home, now });
-  assert.deepEqual([r.kind, r.repo, r.pr, r.ids, r.prompt], ['ruling', 'o/r', 58, ['R1-B1', 'R2-S3'], answer]);
-  const ruled = (o) => ownerRuled({ repo: 'o/r', pr: 58, id: 'R1-B1', quote: 'r1-b1: REJECT, r2-s3 follow-up', decision: 'REJECT', home, now, ...o });
+  assert.deepEqual([r.kind, r.repo, r.pr, r.ids, r.content, r.prompt], ['ruling', 'o/r', 58, ['R1-B1', 'R2-S3'], CONTENT, answer]);
+  const ruled = (o) => ownerRuled({ repo: 'o/r', pr: 58, id: 'R1-B1', quote: 'r1-b1: REJECT, r2-s3 follow-up', decision: 'REJECT', contentOf: () => CONTENT, home, now, ...o });
   assert.equal(ruled({}), true, 'the whole answer, white space and case aside');
   assert.equal(ruled({ id: 'R2-S3', decision: 'FOLLOW-UP' }), true, 'each item its own decision');
   assert.equal(ruled({ id: 'R2-S3', decision: 'REJECT' }), false, 'the decision written for another item');
@@ -116,6 +122,16 @@ test('owner-go: a ruling is recorded only after a reply that ends with the rulin
   assert.equal(ruled({ id: 'R3-B1' }), false, 'an item not asked about');
   assert.equal(ruled({ quote: '  ' }), false, 'an empty quote');
   assert.equal(ruled({ now: () => now() + 25 * 3600 * 1000 }), false, 'older than a day');
+  // #110: the recorded digest must equal the one recomputed over the record's WHOLE id list from the current state
+  let asked;
+  assert.equal(ruled({ contentOf: (ids) => { asked = ids; return CONTENT; } }), true);
+  assert.deepEqual(asked, ['R1-B1', 'R2-S3'], 'every id of the request, not only the one being ruled');
+  assert.equal(ruled({ contentOf: () => '000000000000' }), false, 'the finding text changed');
+  assert.equal(ruled({ contentOf: () => null }), false, 'one of the items is gone');
+  assert.equal(ruled({ contentOf: undefined }), false, 'no way to check the content: fail closed');
+  const old = recordRuling(input(home, 'R1-B1: reject', [said('R1-B1 waits.\n⚖️ Owner ruling needed #59: R1-B1 · repo o/r')]), { home, now });
+  assert.deepEqual([old.pr, old.content], [59, null]);
+  assert.equal(ruled({ pr: 59, quote: 'R1-B1: reject', contentOf: () => CONTENT }), false, 'a ruling asked in the old line shape approves nothing');
   assert.deepEqual(readApprovals({ home, now }), [], 'a ruling never reads as a "merge"');
   assert.equal(recordRuling(input(home, 'reject it', [said(ASK)], { agent_id: 'a1' }), { home, now }), null, 'a subagent');
   assert.equal(recordRuling(input(home, 'reject it', [said('No ruling asked here.')]), { home, now }), null, 'no ruling line');

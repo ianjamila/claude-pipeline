@@ -90,10 +90,13 @@ export function presentedRequests(text) {
 }
 
 // Phase 3b: an owner ruling in chat (`P triage owner-ruling`) was the agent's word too: --owner-quote could be any text. A reply that
-// asks the owner to rule ENDS with `⚖️ Owner ruling needed #N: R1-B1, R2-S3 · repo owner/name` (skills/ship reference/review-loop.md),
-// and the owner's next prompt is recorded with those ids; owner-ruling then needs a recorded prompt for that repository, PR and id whose
-// words hold the quote. Returns { pr, repo (lower case), ids } or null when the reply does not end with that line.
-const RULING_LINE = new RegExp(`^\\s*⚖️?\\s*Owner ruling needed\\s+#(\\d{1,6})\\s*:\\s*([^\\n·|]+?)\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME})\\s*$`, 'i');
+// asks the owner to rule ENDS with `⚖️ Owner ruling needed #N: R1-B1, R2-S3 · content <digest12> · repo owner/name` (`P triage ruling-request`
+// writes it; skills/ship reference/review-loop.md), and the owner's next prompt is recorded with those ids; owner-ruling then needs a
+// recorded prompt for that repository, PR and id whose words hold the quote. #110: the digest (rulingContentDigest, lib/triage.mjs) binds
+// the request to the finding text the owner was shown; owner-ruling recomputes it. A line without one (the shape before #110) is
+// still read, with content null, and owner-ruling refuses it. Returns { pr, repo (lower case), ids, content (lower case hex, or null) }
+// or null when the reply does not end with that line.
+const RULING_LINE = new RegExp(`^\\s*⚖️?\\s*Owner ruling needed\\s+#(\\d{1,6})\\s*:\\s*([^\\n·|]+?)\\s*(?:(?:·|\\|)\\s*content\\s+([0-9a-f]{12})\\s*)?(?:·|\\|)\\s*repo\\s+(${REPO_NAME})\\s*$`, 'i');
 const ITEM_ID = /^R\d{1,4}-[A-Za-z]{1,8}\d{1,4}$/;
 export function presentedRuling(text) {
   const lines = String(text ?? '').split(/\r?\n/);
@@ -102,7 +105,7 @@ export function presentedRuling(text) {
   if (!m) return null;
   const ids = [...new Set(m[2].split(/[\s,]+/).filter(Boolean))];
   if (ids.length === 0 || !ids.every((id) => ITEM_ID.test(id))) return null;
-  return { pr: Number(m[1]), repo: m[3].toLowerCase(), ids };
+  return { pr: Number(m[1]), repo: m[4].toLowerCase(), ids, content: m[3] ? m[3].toLowerCase() : null };
 }
 
 // The text of the last assistant reply in the transcript when it holds a 🔀 merge request ('' when none). Only the
@@ -254,7 +257,7 @@ export function recordRuling(input, { home = accountHome(), now = Date.now } = {
       v: 1, kind: 'ruling', ts: new Date(now()).toISOString(), session,
       prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
       cwd: typeof input.cwd === 'string' ? input.cwd : null,
-      repo: asked.repo, pr: asked.pr, ids: asked.ids, prompt: input.prompt,
+      repo: asked.repo, pr: asked.pr, ids: asked.ids, content: asked.content, prompt: input.prompt,
     });
   } catch {
     return null;
@@ -356,16 +359,31 @@ export function rulingsIn(answer, askedIds) {
   return out;
 }
 
-// triage owner-ruling: did the owner answer a ruling request for this repository, PR and item (any session, last 24 h) with exactly
-// `quote` (the WHOLE answer; runs of white space as one space, case-insensitive: it is copied from the chat), and does that answer
-// decide `decision` for this item (rulingsIn)?
-export function ownerRuled({ repo, pr, id, quote, decision, ...opts }) {
+// Every ruling record (any session, last 24 h) that answers a ruling request for this repository, PR and item with exactly `quote` (the
+// WHOLE answer; runs of white space as one space, case-insensitive: it is copied from the chat) and decides `decision` for the item (rulingsIn).
+function rulingsFor({ repo, pr, id, quote, decision, ...opts }) {
   const key = repoKey(repo);
   const words = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
   const q = words(quote);
-  if (key === null || !Number.isInteger(pr) || q === '') return false;
-  return readRecords(opts).some((r) => r.kind === 'ruling' && r.repo === key && r.pr === pr && Array.isArray(r.ids) && r.ids.includes(id)
+  if (key === null || !Number.isInteger(pr) || q === '') return [];
+  return readRecords(opts).filter((r) => r.kind === 'ruling' && r.repo === key && r.pr === pr && Array.isArray(r.ids) && r.ids.includes(id)
     && typeof r.prompt === 'string' && words(r.prompt) === q && rulingsIn(r.prompt, r.ids).get(String(id).toUpperCase()) === decision);
+}
+
+// triage owner-ruling: did the owner answer a ruling request for this repository, PR and item (rulingsFor), and is the finding text the
+// owner was shown (the request's `content`) still the current one? #110: `contentOf(ids)` is the caller's digest of those items in the
+// current review state (null when any is gone); it is called with the record's FULL id list, and a record with no content (the line
+// shape before #110) or no `contentOf` approves nothing.
+export function ownerRuled({ contentOf, ...q }) {
+  return typeof contentOf === 'function' && rulingsFor(q).some((r) => typeof r.content === 'string' && r.content === contentOf(r.ids));
+}
+
+// Why ownerRuled said no, for the message: 'none' (no such answer recorded), 'no-content' (every one is in the old line shape) or
+// 'changed' (the finding text differs from the one the owner was asked about).
+export function ownerRulingGap(q) {
+  const found = rulingsFor(q);
+  if (found.length === 0) return 'none';
+  return found.every((r) => typeof r.content !== 'string') ? 'no-content' : 'changed';
 }
 
 // The owner-item set as one short digest: each item is one line (kind, rule or id, file); 'none' when there are none.

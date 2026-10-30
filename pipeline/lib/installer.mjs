@@ -11,7 +11,14 @@ import { canonicalPath, toPosix } from './paths.mjs';
 // Kept exported from here: callers have imported it from the installer.
 export { canonicalPath };
 
-export const SKILLS = ['ship', 'verify', 'pipeline-setup'];
+export const SKILLS = ['review', 'verify', 'pipeline-setup'];
+// Retired units: no longer shipped, removed from an existing install by the next update. A retired hook is a script under
+// pipeline/hooks/ (its file leaves with the pipeline unit; its settings.json entries are recognised as ours and dropped, and
+// --check reports them). A retired skill is a skills/<name>/ dir: the files the manifest lists are removed (an edited one is
+// saved to backups/ first), files it does not list are kept. Retiring one is adding its name here (and dropping it from
+// SKILLS / the hook list in buildPlan). `ship` is retired: the review skill replaced it.
+export const RETIRED_HOOKS = Object.freeze(['session-version']);
+export const RETIRED_SKILLS = Object.freeze(['ship']);
 // Explore: a Haiku stand-in for Claude Code's built-in Explore agent (same name, so it takes the built-in's place).
 export const AGENTS = ['implementer', 'verifier', 'judge', 'arbiter', 'Explore'];
 export const EXCLUDED_NAMES = new Set(['node_modules', '.DS_Store']);
@@ -21,17 +28,18 @@ export const MANIFEST_REL = 'pipeline/INSTALLED.json';
 export const GUARD_GIT_MATCHER = 'Bash|PowerShell|Monitor|mcp__.*';
 export const GUARD_FILES_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*';
 export const HOOK_TIMEOUT_S = 15;
-export const SESSION_HOOK_TIMEOUT_S = 10;
 export const OWNER_GO_TIMEOUT_S = 10;
 // The stack-stop hooks (docs/specs/2026-10-19-stack-stop-design.md): stack-register (PreToolUse, fail-closed loader, one group per
 // matcher), stack-dev-bind (PostToolUse Bash) and stack-session-end (SessionEnd), the last two plain and non-blocking.
-export const STACK_REGISTER_MATCHERS = Object.freeze(['Bash', 'Read|Edit|Write|Grep|Glob|NotebookEdit']);
+export const STACK_REGISTER_MATCHERS = Object.freeze(['Bash', 'Edit|Write|MultiEdit|NotebookEdit']);
+// Matchers an earlier install registered stack-register on (it no longer watches reads): still ours, replaced on update.
+export const RETIRED_STACK_REGISTER_MATCHERS = Object.freeze(['Read|Edit|Write|Grep|Glob|NotebookEdit']);
 export const STACK_REGISTER_TIMEOUT_S = 30;
 export const STACK_HOOK_TIMEOUT_S = 10;
 export const STACK_DEV_BIND_MATCHER = 'Bash';
-// The events whose hooks this installer manages: guard hooks and stack-register on PreToolUse, stack-dev-bind on PostToolUse, the
-// version-status hook on SessionStart, stack-session-end on SessionEnd, the owner-go recorder (#58: the owner's chat "merge") on
-// UserPromptSubmit.
+// The events whose hooks this installer manages: guard hooks and stack-register on PreToolUse, stack-dev-bind on PostToolUse,
+// stack-session-end on SessionEnd, the owner-go recorder (#58: the owner's chat "merge") on UserPromptSubmit. SessionStart is
+// listed only so the retired version-status hook is found and removed there; nothing is written to it.
 export const HOOK_EVENTS = ['PreToolUse', 'PostToolUse', 'SessionStart', 'SessionEnd', 'UserPromptSubmit'];
 export const STAGING_REL = 'backups/.staging';
 export const TILDE_ALLOW_ENTRY = 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)';
@@ -149,7 +157,7 @@ export function buildPlan(source) {
     const entries = walkFiles(pipelineDir)
       .filter((r) => r !== 'INSTALLED.json')
       .map((r) => ({ rel: `pipeline/${r}`, abs: path.join(pipelineDir, ...r.split('/')) }));
-    for (const hook of ['guard-git.mjs', 'guard-files.mjs', 'session-version.mjs', 'owner-go.mjs', 'stack-register.mjs', 'stack-dev-bind.mjs', 'stack-session-end.mjs']) {
+    for (const hook of ['guard-git.mjs', 'guard-files.mjs', 'owner-go.mjs', 'stack-register.mjs', 'stack-dev-bind.mjs', 'stack-session-end.mjs']) {
       if (!entries.some((e) => e.rel === `pipeline/hooks/${hook}`)) problems.push(`pipeline/hooks/${hook} is missing`);
     }
     if (isFile(path.join(source, 'VERSION'))) {
@@ -259,6 +267,28 @@ export function userEditedFiles(home, unit, manifest) {
   const edited = [];
   for (const [rel, hash] of scanUnitDisk(home, unit)) if (manifest.files[rel] !== hash) edited.push(rel);
   return edited;
+}
+
+// The retired skills as unit descriptors (a name that is a current skill again is never retired).
+export const retiredSkillUnits = (names = RETIRED_SKILLS) => [...new Set(names)]
+  .filter((name) => !SKILLS.includes(name))
+  .map((name) => ({ kind: 'skill', name, rel: `skills/${name}` }));
+
+// What is left of a retired skill dir, per the manifest: `listed` = files the manifest lists ({ rel, modified }: the owner changed it
+// since install), `kept` = files in the dir the manifest does not list (the owner's; never removed). A dir the manifest says
+// nothing about is not ours: nothing listed, nothing kept. A symlinked dir is the owner's too: kept whole, touched by nothing.
+export function scanRetiredUnit(home, unit, manifest) {
+  const out = { rel: unit.rel, listed: [], kept: [] };
+  if (!manifest || !Object.keys(manifest.files).some((k) => k.startsWith(`${unit.rel}/`))) return out;
+  const target = unitTarget(home, unit);
+  let st;
+  try { st = fs.lstatSync(target); } catch { return out; }
+  if (st.isSymbolicLink()) return { ...out, kept: [unit.rel] };
+  for (const [rel, hash] of scanUnitDisk(home, unit)) {
+    if (Object.hasOwn(manifest.files, rel)) out.listed.push({ rel, modified: manifest.files[rel] !== hash });
+    else out.kept.push(rel);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -464,14 +494,6 @@ const handlerFor = (home, name) => ({
   timeout: HOOK_TIMEOUT_S,
 });
 
-// The status hook is deliberately NOT started through the fail-closed loader: a SessionStart failure must never block anything.
-const sessionHandlerFor = (home) => ({
-  type: 'command',
-  command: 'node',
-  args: [joinNative(home, 'pipeline', 'hooks', 'session-version.mjs')],
-  timeout: SESSION_HOOK_TIMEOUT_S,
-});
-
 // The owner-go recorder is NOT started through the fail-closed loader either: an exit 2 on UserPromptSubmit would swallow the owner's prompt.
 const ownerGoHandlerFor = (home) => ({
   type: 'command',
@@ -506,9 +528,6 @@ export function ourHookGroups(home, { skipFileGuard = false } = {}) {
   if (!skipFileGuard) groups.push({ matcher: GUARD_FILES_MATCHER, hooks: [handlerFor(home, 'guard-files')] });
   return groups;
 }
-
-// Our own group (no matcher: every start source), appended after whatever the owner already has on SessionStart.
-export const ourSessionStartGroups = (home) => [{ hooks: [sessionHandlerFor(home)] }];
 
 // Our own UserPromptSubmit group (no matcher: that event has none), appended after the owner's own.
 export const ourPromptGroups = (home) => [{ hooks: [ownerGoHandlerFor(home)] }];
@@ -548,12 +567,15 @@ function stripOurHandlers(settings, home, byEvent = null) {
   return removed;
 }
 
-// Pure: returns a new settings object with our hook groups appended (guard-files last; the SessionStart status group
-// after the owner's own) and our allow entries added once. Any earlier handlers of ours are replaced; every other key, hook and entry is left as it was.
+// Pure: returns a new settings object with our hook groups appended (guard-files last) and our allow entries added once. Any
+// earlier handlers of ours are replaced (a retired one, such as the SessionStart status hook, is dropped and not re-added; an
+// event array that leaves empty is removed); every other key, hook and entry is left as it was.
 export function mergeSettings(settings, { home, skipFileGuard = false }) {
   assertShape(settings);
   const out = structuredClone(settings);
-  stripOurHandlers(out, home);
+  const byEvent = {};
+  stripOurHandlers(out, home, byEvent);
+  for (const event of HOOK_EVENTS) if (byEvent[event] > 0 && Array.isArray(out.hooks[event]) && out.hooks[event].length === 0) delete out.hooks[event];
   const stack = ourStackGroups(home);
   out.hooks ??= {};
   // Order: the stack-register groups, then the guards, so guard-files stays the LAST PreToolUse entry (the only order-sensitive event).
@@ -561,8 +583,6 @@ export function mergeSettings(settings, { home, skipFileGuard = false }) {
   out.hooks.PreToolUse.push(...stack.PreToolUse, ...ourHookGroups(home, { skipFileGuard }));
   out.hooks.PostToolUse ??= [];
   out.hooks.PostToolUse.push(...stack.PostToolUse);
-  out.hooks.SessionStart ??= [];
-  out.hooks.SessionStart.push(...ourSessionStartGroups(home));
   out.hooks.SessionEnd ??= [];
   out.hooks.SessionEnd.push(...stack.SessionEnd);
   out.hooks.UserPromptSubmit ??= [];
@@ -603,25 +623,24 @@ const scriptOf = (handler) => {
   const text = [handler.command, ...(Array.isArray(handler.args) ? handler.args : [])].filter((s) => typeof s === 'string').map(toPosix).join(' ');
   if (/\/guard-git\.mjs/.test(text)) return 'guard-git';
   if (/\/guard-files\.mjs/.test(text)) return 'guard-files';
-  if (/\/session-version\.mjs/.test(text)) return 'session-version';
   if (/\/owner-go\.mjs/.test(text)) return 'owner-go';
   if (/\/stack-register\.mjs/.test(text)) return 'stack-register';
   if (/\/stack-dev-bind\.mjs/.test(text)) return 'stack-dev-bind';
   if (/\/stack-session-end\.mjs/.test(text)) return 'stack-session-end';
-  return null;
+  return RETIRED_HOOKS.find((name) => text.includes(`/${name}.mjs`)) ?? null;
 };
 
 // Our handlers, grouped by script, each flagged exact when it equals what install writes. The guards are read from
-// hooks.PreToolUse, the status hook from hooks.SessionStart, the owner-go recorder from hooks.UserPromptSubmit, stack-register from
-// hooks.PreToolUse (one entry per matcher; an entry on a matcher we do not write is not exact), stack-dev-bind from hooks.PostToolUse and
-// stack-session-end from hooks.SessionEnd; one of ours under the wrong event is `unknown`.
+// hooks.PreToolUse, the owner-go recorder from hooks.UserPromptSubmit, stack-register from hooks.PreToolUse (one entry per
+// matcher; an entry on a matcher we do not write is not exact), stack-dev-bind from hooks.PostToolUse and stack-session-end from
+// hooks.SessionEnd; one of ours under the wrong event is `unknown`. `retired` holds what an earlier install wrote and this one
+// no longer does (a RETIRED_HOOKS script on any event, stack-register on a RETIRED_STACK_REGISTER_MATCHERS matcher): update drops it.
 export function inspectHooks(settings, home) {
-  const out = { 'guard-git': [], 'guard-files': [], 'session-version': [], 'owner-go': [], 'stack-register': [], 'stack-dev-bind': [], 'stack-session-end': [], unknown: [] };
+  const out = { 'guard-git': [], 'guard-files': [], 'owner-go': [], 'stack-register': [], 'stack-dev-bind': [], 'stack-session-end': [], retired: [], unknown: [] };
   const stack = ourStackGroups(home);
   const expected = {
     'guard-git': { event: 'PreToolUse', matcher: GUARD_GIT_MATCHER, handler: handlerFor(home, 'guard-git') },
     'guard-files': { event: 'PreToolUse', matcher: GUARD_FILES_MATCHER, handler: handlerFor(home, 'guard-files') },
-    'session-version': { event: 'SessionStart', matcher: undefined, handler: sessionHandlerFor(home) },
     'owner-go': { event: 'UserPromptSubmit', matcher: undefined, handler: ownerGoHandlerFor(home) },
     'stack-register': { event: 'PreToolUse', matchers: STACK_REGISTER_MATCHERS, handler: stack.PreToolUse[0].hooks[0] },
     'stack-dev-bind': { event: 'PostToolUse', matcher: STACK_DEV_BIND_MATCHER, handler: stack.PostToolUse[0].hooks[0] },
@@ -635,6 +654,10 @@ export function inspectHooks(settings, home) {
       for (const handler of group.hooks) {
         if (!isOurHandler(handler, home)) continue;
         const script = scriptOf(handler);
+        if (script && (RETIRED_HOOKS.includes(script) || (script === 'stack-register' && RETIRED_STACK_REGISTER_MATCHERS.includes(group.matcher)))) {
+          out.retired.push({ script, event, matcher: group.matcher, handler });
+          continue;
+        }
         if (!script || expected[script].event !== event) { out.unknown.push({ matcher: group.matcher, handler }); continue; }
         out[script].push({
           matcher: group.matcher,
@@ -653,7 +676,7 @@ export function inspectHooks(settings, home) {
 
 // Everything install would change, as { kind, path?, message } items. Empty means nothing to do.
 // settings is the parsed settings.json (null when the file is missing); settingsProblem is set when it is unusable.
-export function computeDrift({ home, plan, manifest, settings, settingsProblem, skipFileGuard }) {
+export function computeDrift({ home, plan, manifest, settings, settingsProblem, skipFileGuard, retiredSkills = RETIRED_SKILLS }) {
   const drift = [];
   const add = (kind, p, message) => drift.push({ kind, path: p, message });
 
@@ -690,13 +713,21 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
       else add('extra', rel, `extra: ${rel} (not part of the install; reinstall removes it)`);
     }
   }
+  // Retired skills: the files install lists for them are drift until an update removes them (the owner's own files there are not).
+  const retiredUnits = retiredSkillUnits(retiredSkills);
+  for (const unit of retiredUnits) {
+    for (const f of scanRetiredUnit(home, unit, manifest).listed) {
+      add('retired', f.rel, `retired: ${f.rel} (${unit.rel}/ is no longer part of the pipeline; update removes it${f.modified ? ', saving your edits to backups/ first' : ''})`);
+    }
+  }
   // Manifest entries whose whole unit has left the source (a skill dir or agent that was dropped).
   const plannedUnits = new Set(plan.units.map((u) => u.rel));
+  const retiredRels = new Set(retiredUnits.map((u) => u.rel));
   for (const rel of Object.keys(manifest?.files ?? {})) {
     if (plan.files.has(rel)) continue;
     const parts = rel.split('/');
     const unitRel = parts[0] === 'skills' ? `skills/${parts[1]}` : parts[0] === 'agents' ? rel : 'pipeline';
-    if (plannedUnits.has(unitRel) || !lexists(fromRel(home, rel))) continue;
+    if (plannedUnits.has(unitRel) || retiredRels.has(unitRel) || !lexists(fromRel(home, rel))) continue;
     add('stale', rel, `stale: ${rel} (no longer in the source; reinstall removes it)`);
   }
 
@@ -721,7 +752,6 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   };
   hookCheck('guard-git', true);
   hookCheck('guard-files', expectGuardFiles);
-  hookCheck('session-version', true, 'SessionStart');
   hookCheck('owner-go', true, 'UserPromptSubmit');
   hookCheck('stack-dev-bind', true, 'PostToolUse');
   hookCheck('stack-session-end', true, 'SessionEnd');
@@ -736,6 +766,10 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   for (const e of found['stack-register']) {
     if (!STACK_REGISTER_MATCHERS.includes(e.matcher)) add('hook-differs', 'stack-register', `hook differs: a stack-register entry has matcher ${JSON.stringify(e.matcher ?? null)}, which install does not write`);
   }
+  for (const r of found.retired) {
+    const label = r.script === 'stack-register' ? `stack-register (${r.matcher})` : r.script;
+    add('hook-retired', label, `hook retired: ${label} (hooks.${r.event}) is from an older install; update removes it`);
+  }
   for (const u of found.unknown) add('hook-unknown', null, `unrecognised hook entry in the pipeline hooks dir: ${JSON.stringify(u.handler)}`);
 
   const allow = Array.isArray(settings.permissions?.allow) ? settings.permissions.allow : [];
@@ -746,7 +780,7 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   if (drift.length === before) {
     let merged = null;
     try { merged = mergeSettings(settings, { home, skipFileGuard: !expectGuardFiles }); } catch { /* shape problems surface at install */ }
-    // Only PreToolUse is order-sensitive (guard-files must run last); other SessionStart entries may follow ours.
+    // Only PreToolUse is order-sensitive (guard-files must run last).
     if (merged && !isDeepStrictEqual(merged.hooks?.PreToolUse, settings.hooks?.PreToolUse)) {
       add('hook-order', 'settings.json', 'hook order: our hook entries are not the last PreToolUse entries (guard-files must be last); reinstall fixes it');
     }

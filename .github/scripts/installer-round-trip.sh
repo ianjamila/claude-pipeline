@@ -23,7 +23,7 @@ const settings = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
 const named = (event, hook) => (settings.hooks?.[event] ?? []).flatMap((g) => (g.hooks ?? []).map((h) => ({ matcher: g.matcher, h })))
   .filter(({ h }) => [h.command, ...(h.args ?? [])].some((s) => typeof s === "string" && new RegExp("[\\\\/]" + hook + "\\.mjs$").test(s)));
 const expected = [
-  ["PreToolUse", "stack-register", "Bash"], ["PreToolUse", "stack-register", "Read|Edit|Write|Grep|Glob|NotebookEdit"],
+  ["PreToolUse", "stack-register", "Bash"], ["PreToolUse", "stack-register", "Edit|Write|MultiEdit|NotebookEdit"],
   ["PostToolUse", "stack-dev-bind", "Bash"], ["SessionEnd", "stack-session-end", undefined],
 ];
 const problems = [];
@@ -77,7 +77,7 @@ node --input-type=module -e '
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 const home = process.argv[1];
-const left = ["pipeline", "skills/ship", "skills/verify", "skills/pipeline-setup",
+const left = ["pipeline", "skills/ship", "skills/review", "skills/verify", "skills/pipeline-setup",
   "agents/implementer.md", "agents/verifier.md", "agents/judge.md", "agents/arbiter.md"]
   .filter((p) => existsSync(join(home, p)));
 const settingsFile = join(home, "settings.json");

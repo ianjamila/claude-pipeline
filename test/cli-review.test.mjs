@@ -20,6 +20,7 @@ import { currentContentHash, excerptWindow, reviewBaseRef } from '../pipeline/li
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { ownerRules, rulingRequest } from './helpers/owner-go.mjs';
+import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -2084,7 +2085,15 @@ test('codex-review: a timeout kills Codex AND what it started; a late write from
   assert.equal(r.json.reason, 'unavailable');
   const pid = Number(readFileSync(pidFile, 'utf8'));
   await new Promise((resolve) => setTimeout(resolve, 3000)); // the helper would have written its answer at 2 s
-  assert.throws(() => process.kill(pid, 0), (e) => e.code === 'ESRCH', 'the helper process is gone');
+  if (process.platform === 'win32') {
+    // #116: on Windows a killed process can keep answering kill(pid, 0) for a while (the handle outlives the process, or
+    // the PID is not yet reaped), so poll up to 10 s. If it still answers, the observable effect below (no late write
+    // from that run) is what proves the kill; the strict ESRCH check stays on every other platform.
+    const alive = () => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
+    for (let waited = 0; alive() && waited < 10000; waited += 250) await new Promise((resolve) => setTimeout(resolve, 250));
+  } else {
+    assert.throws(() => process.kill(pid, 0), (e) => e.code === 'ESRCH', 'the helper process is gone');
+  }
   assert.ok(!existsSync(w.roundFile(1, 'codex-raw.json')), 'nothing was written after the timeout');
   assert.ok(noState(w));
 });
@@ -2783,7 +2792,13 @@ function waitingForHuman(w, decisions) {
   writeFileSync(join(w.repo.dir, '.review', 'state.json'), JSON.stringify(state));
 }
 // Phase 3b: the owner's answer to a ruling request for PR #7's items, as the owner-go recorder writes it down.
-const ownerAnswers = (t, { prompt = QUOTE, ids = ['R1-B1'], pr = 7, repo } = {}) => ownerRules(t, prompt, rulingRequest(pr, ids, repo));
+// #110: the line carries the digest `triage ruling-request` prints for the CURRENT state (ids the state does not have get a placeholder).
+const askedContent = (w, ids) => {
+  const r = w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', ids.join(',')]);
+  return r.code === 0 ? / · content ([0-9a-f]{12}) · /.exec(r.json.line)[1] : '0'.repeat(12);
+};
+const ownerAnswers = (w, t, { prompt = QUOTE, ids = ['R1-B1'], pr = 7, repo, content } = {}) =>
+  ownerRules(t, prompt, rulingRequest(pr, ids, repo, content === undefined ? askedContent(w, ids) : content));
 const rule = (id, decision, { quote = QUOTE, reason = 'owner confirmed in chat', extra = [] } = {}) =>
   ['triage', 'owner-ruling', '--round', '1', '--id', id, '--decision', decision, '--reason', reason, '--owner-quote', quote, ...extra];
 
@@ -2825,36 +2840,156 @@ test('triage owner-ruling: needs the owner\'s recorded answer to a ruling reques
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
   const none = w.cli(rule('R1-B1', 'FOLLOW-UP'));
   assertExit(none, 1);
-  assert.match(none.json.reason, /no owner ruling is recorded for acme\/widgets #7 R1-B1 .*⚖️ Owner ruling needed #7: R1-B1 · repo acme\/widgets/);
-  ownerAnswers(t, { pr: 8 }); // another PR
-  ownerAnswers(t, { repo: 'acme/gadgets' }); // another repository
-  ownerAnswers(t, { ids: ['R1-S1'] }); // another item
-  ownerAnswers(t, { prompt: 'No, keep it in this PR.' }); // other words
-  ownerAnswers(t, { prompt: `ok. ${QUOTE} Thanks` }); // (security review of f17b251) the quote is only a part of the answer
+  assert.match(none.json.reason, /no owner ruling is recorded for acme\/widgets #7 R1-B1 .*triage ruling-request --pr 7 --ids R1-B1/);
+  ownerAnswers(w, t, { pr: 8 }); // another PR
+  ownerAnswers(w, t, { repo: 'acme/gadgets' }); // another repository
+  ownerAnswers(w, t, { ids: ['R1-S1'] }); // another item
+  ownerAnswers(w, t, { prompt: 'No, keep it in this PR.' }); // other words
+  ownerAnswers(w, t, { prompt: `ok. ${QUOTE} Thanks` }); // (security review of f17b251) the quote is only a part of the answer
   assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP')), 1);
   // the whole answer must name the decision: an answer that says another one, or none, records nothing
-  ownerAnswers(t, { prompt: REJECT_QUOTE });
+  ownerAnswers(w, t, { prompt: REJECT_QUOTE });
   assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { quote: REJECT_QUOTE })), 1, 'the answer says reject');
-  ownerAnswers(t, { prompt: 'ok' });
+  ownerAnswers(w, t, { prompt: 'ok' });
   for (const d of ['ACCEPT', 'FOLLOW-UP', 'REJECT']) assertExit(w.cli(rule('R1-B1', d, { quote: 'ok' })), 1, `"ok" says no ${d}`);
   // an answer naming several decisions must name the item it is read for
   const both = 'Accept the first one and reject the other.';
-  ownerAnswers(t, { prompt: both });
+  ownerAnswers(w, t, { prompt: both });
   assertExit(w.cli(rule('R1-B1', 'ACCEPT', { quote: both })), 1, 'which item is accepted is not said');
   // (security review of ff8090f) a negated decision decides nothing; nor does a bare answer when several items were asked
   const negated = "Don't accept it, file a follow-up.";
-  ownerAnswers(t, { prompt: negated });
+  ownerAnswers(w, t, { prompt: negated });
   for (const d of ['ACCEPT', 'FOLLOW-UP']) assertExit(w.cli(rule('R1-B1', d, { quote: negated })), 1, `negated: no ${d}`);
   const loose = 'Follow-up for this one.';
-  ownerAnswers(t, { prompt: loose, ids: ['R1-B1', 'R1-S1'] });
+  ownerAnswers(w, t, { prompt: loose, ids: ['R1-B1', 'R1-S1'] });
   assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { quote: loose })), 1, 'two items asked: the answer must name R1-B1');
   assert.equal(ownerRules(t, QUOTE, `${rulingRequest(7, ['R1-B1'])}\nmore text after the line`), null, 'only a reply that ENDS with the line asks');
   assert.equal(ownerRules(t, QUOTE, rulingRequest(7, ['R1-B1', 'not-an-id'])), null, 'a line naming something that is no item id asks nothing');
   assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP')), 1);
   assert.equal(w.item('R1-B1').final.by, 'arbiter', 'state untouched');
-  ownerAnswers(t, { prompt: `\n  ${QUOTE.toUpperCase()}  ` }); // (white space and case aside)
+  ownerAnswers(w, t, { prompt: `\n  ${QUOTE.toUpperCase()}  ` }); // (white space and case aside)
   assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP')), 0);
   assert.equal(w.item('R1-B1').final.ownerQuote, QUOTE);
+});
+
+// ---- #110: a ruling request is bound to the finding text, not just the item id ----------------------------
+
+test('triage ruling-request: prints the ruling line with the content digest of exactly the asked ids', (t) => {
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-S1': 'REJECT' });
+  const items = w.state().rounds[0].items;
+  const ask = (...ids) => w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', ids.join(',')]);
+  const both = ask('R1-B1', 'R1-S1');
+  assertExit(both, 0, both.stderr + both.stdout);
+  assert.deepEqual(both.json, { ok: true, line: `⚖️ Owner ruling needed #7: R1-B1, R1-S1 · content ${rulingContentDigest(items)} · repo acme/widgets` });
+  assert.equal(ask('R1-B1').json.line, `⚖️ Owner ruling needed #7: R1-B1 · content ${rulingContentDigest([items[0]])} · repo acme/widgets`, 'only the asked ids');
+  assert.notEqual(ask('R1-B1').json.line.split(' · ')[1], ask('R1-S1').json.line.split(' · ')[1]);
+  assert.equal(ask('R1-B1', 'r1-b1').json.line, ask('R1-B1').json.line, 'ids differing only in case are one id');
+  assertExit(ask('R1-B1', 'R1-X9'), 1, 'an unknown id');
+  assert.match(ask('R1-B1', 'R1-X9').json.reason, /R1-X9/);
+  assertExit(w.cli(['triage', 'ruling-request', '--pr', '99', '--ids', 'R1-B1']), 1, 'a PR that is not the review state\'s');
+  assertExit(w.cli(['triage', 'ruling-request', '--pr', '7']), 2, 'no --ids');
+  assertExit(w.cli(['triage', 'ruling-request', '--ids', 'R1-B1']), 2, 'no --pr');
+  assertExit(w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', ' , ']), 2, 'no id at all');
+  // what it prints is what the recorder reads back
+  assert.equal(ownerRules(t, 'R1-B1: reject', `Waiting.\n${both.json.line}`).content, rulingContentDigest(items));
+});
+
+// A Fable item that waits for a human (low confidence), as the arbiter pass leaves it.
+const addFableItem = (w) => editState(w, (s) => {
+  s.rounds[0].items.push(...fableFindingItems([{
+    bucket: 'BLOCKING', category: 'auth', title: 'role check skipped', file: 'lib/auth.ts', line: 3, detail: 'a guest reaches it',
+    ruling: 'ACCEPT', confidence: 'low', reasoning: 'lib/auth.ts:3 returns early',
+  }], 1));
+});
+
+// The same id, a different finding: the owner's recorded ruling must not carry over.
+const CHANGES = [
+  ['detail', (i) => { i.detail = 'a different explanation of the problem'; }, 'R1-B1'],
+  ['title', (i) => { i.title = 'Something else entirely'; }, 'R1-B1'],
+  ['codexReasoning', (i) => { i.codexReasoning = 'new reasoning'; }, 'R1-B1'],
+  ['file', (i) => { i.file = 'src/z.js'; }, 'R1-B1'],
+  ['line', (i) => { i.line = 99; }, 'R1-B1'],
+  ['category', (i) => { i.category = 'security'; }, 'R1-B1'],
+  ['bucket', (i) => { i.bucket = 'SUGGESTION'; }, 'R1-B1'],
+  ['a Fable item\'s detail', (i) => { i.detail = 'nobody reaches it'; }, 'R1-F1'],
+  ['a Fable item\'s arbiter.reasoning', (i) => { i.arbiter.reasoning = 'a different reason'; }, 'R1-F1'],
+];
+for (const [what, change, id] of CHANGES) {
+  test(`triage owner-ruling: refused when only ${what} of ${id} changed after the owner was asked (#110)`, (t) => {
+    const w = world(t, { yml: CHAT_YML });
+    assertExit(w.codex(1, findingsOf([finding()])), 0);
+    addFableItem(w);
+    waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-F1': 'ACCEPT' });
+    const quote = `${id}: follow-up`;
+    ownerAnswers(w, t, { prompt: quote, ids: [id] });
+    editState(w, (s) => change(s.rounds[0].items.find((i) => i.id === id)));
+    const before = w.stateText();
+    const r = w.cli(rule(id, 'FOLLOW-UP', { quote }));
+    assertExit(r, 1, r.stdout);
+    assert.match(r.json.reason, /changed since the owner was asked/);
+    assert.match(r.json.reason, /ruling-request/);
+    assert.equal(w.stateText(), before, 'state untouched');
+  });
+}
+
+test('triage owner-ruling: unchanged content is accepted (#110)', (t) => {
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  addFableItem(w);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-F1': 'ACCEPT' });
+  ownerAnswers(w, t, { prompt: 'R1-B1: follow-up', ids: ['R1-B1'] });
+  ownerAnswers(w, t, { prompt: 'R1-F1: accept', ids: ['R1-F1'] });
+  assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { quote: 'R1-B1: follow-up' })), 0);
+  assertExit(w.cli(rule('R1-F1', 'ACCEPT', { quote: 'R1-F1: accept' })), 0);
+});
+
+test('triage owner-ruling: one changed item of a two-item request refuses the ruling on the other too; applying one first does not (#110)', (t) => {
+  const asked = ['R1-B1', 'R1-S1'];
+  const answer = 'R1-B1: follow-up; R1-S1: reject.';
+  const make = () => {
+    const w = world(t, { yml: CHAT_YML });
+    assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
+    waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-S1': 'REJECT' });
+    ownerAnswers(w, t, { prompt: answer, ids: asked });
+    return w;
+  };
+  const changed = make();
+  editState(changed, (s) => { s.rounds[0].items[1].detail = 'the other finding now says something else'; });
+  const r = changed.cli(rule('R1-B1', 'FOLLOW-UP', { quote: answer }));
+  assertExit(r, 1, r.stdout);
+  assert.match(r.json.reason, /changed since the owner was asked/);
+  assertExit(changed.cli(rule('R1-S1', 'REJECT', { quote: answer })), 1);
+  // (c2) both answered, nothing changed: the first ruling is recorded into the state and the second is still accepted
+  const fine = make();
+  assertExit(fine.cli(rule('R1-B1', 'FOLLOW-UP', { quote: answer })), 0);
+  assert.equal(fine.item('R1-B1').final.by, 'owner');
+  assertExit(fine.cli(rule('R1-S1', 'REJECT', { quote: answer })), 0);
+});
+
+test('triage owner-ruling: a request whose item is gone is refused (#110)', (t) => {
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+  const answer = 'R1-B1: follow-up';
+  ownerAnswers(w, t, { prompt: answer, ids: ['R1-B1', 'R1-S1'] });
+  editState(w, (s) => { s.rounds[0].items = s.rounds[0].items.filter((i) => i.id !== 'R1-S1'); });
+  const r = w.cli(rule('R1-B1', 'FOLLOW-UP', { quote: answer }));
+  assertExit(r, 1, r.stdout);
+  assert.match(r.json.reason, /changed since the owner was asked/);
+});
+
+test('triage owner-ruling: a ruling asked in the old line shape (no content) approves nothing (#110)', (t) => {
+  const w = world(t, { yml: CHAT_YML });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+  assert.equal(ownerAnswers(w, t, { content: null }).content, null);
+  const r = w.cli(rule('R1-B1', 'FOLLOW-UP'));
+  assertExit(r, 1, r.stdout);
+  assert.match(r.json.reason, /no content digest|old line/);
+  assert.match(r.json.reason, /ruling-request/);
+  assert.equal(w.item('R1-B1').final.by, 'arbiter', 'state untouched');
 });
 
 test('triage owner-ruling: an answer that rules on several items names each one it is read for', (t) => {
@@ -2862,7 +2997,7 @@ test('triage owner-ruling: an answer that rules on several items names each one 
   assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-S1': 'REJECT' });
   const both = 'R1-B1: follow-up; R1-S1: reject.';
-  ownerAnswers(t, { prompt: both, ids: ['R1-B1', 'R1-S1'] });
+  ownerAnswers(w, t, { prompt: both, ids: ['R1-B1', 'R1-S1'] });
   assertExit(w.cli(rule('R1-S1', 'FOLLOW-UP', { quote: both })), 1, 'the decision written for the other item');
   assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP', { quote: both })), 0);
   assertExit(w.cli(rule('R1-S1', 'REJECT', { quote: both })), 0);
@@ -2873,7 +3008,7 @@ test('triage owner-ruling: records the owner ruling, keeps the overruled final, 
   const w = world(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-S1': 'REJECT' });
-  ownerAnswers(t);
+  ownerAnswers(w, t);
   assert.deepEqual(w.cli(['state', 'outcome']).json.needsHuman, ['R1-B1', 'R1-S1']);
 
   const r = w.cli(rule('R1-B1', 'FOLLOW-UP', { extra: ['--pr', '7'] }));
@@ -2887,12 +3022,12 @@ test('triage owner-ruling: records the owner ruling, keeps the overruled final, 
   assert.ok(!Number.isNaN(Date.parse(final.ruledAt)));
   assert.deepEqual(r.json.final, final);
   assert.equal(w.cli(['state', 'outcome']).json.clean, false, 'one item still waits');
-  ownerAnswers(t, { prompt: REJECT_QUOTE, ids: ['R1-S1'] });
+  ownerAnswers(w, t, { prompt: REJECT_QUOTE, ids: ['R1-S1'] });
   assertExit(w.cli(rule('R1-S1', 'REJECT', { quote: REJECT_QUOTE })), 0);
   const outcome = w.cli(['state', 'outcome']).json;
   assert.deepEqual(outcome.needsHuman, []);
   assert.equal(outcome.clean, true, JSON.stringify(outcome));
-  ownerAnswers(t, { prompt: ACCEPT_QUOTE, ids: ['R1-S1'] });
+  ownerAnswers(w, t, { prompt: ACCEPT_QUOTE, ids: ['R1-S1'] });
   assertExit(w.cli(rule('R1-S1', 'ACCEPT', { quote: ACCEPT_QUOTE })), 1, 'an item the owner already ruled is settled: no second ruling');
 });
 
@@ -2900,7 +3035,7 @@ test('triage owner-ruling: ACCEPT stays unclean until the fix is built and a lat
   const w = world(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   waitingForHuman(w, { 'R1-B1': 'REJECT' });
-  ownerAnswers(t, { prompt: ACCEPT_QUOTE });
+  ownerAnswers(w, t, { prompt: ACCEPT_QUOTE });
   assertExit(w.cli(rule('R1-B1', 'ACCEPT', { quote: ACCEPT_QUOTE })), 0);
   assert.notEqual(w.item('R1-B1').implemented, true, 'ACCEPT still has to be built');
   const open = w.cli(['state', 'outcome']).json;
@@ -2918,7 +3053,7 @@ test('triage owner-ruling: works on a published round, and a state rebuilt from 
   const w0 = world(t, { yml: CHAT_YML });
   assertExit(w0.codex(1, findingsOf([finding()])), 0);
   waitingForHuman(w0, { 'R1-B1': 'FOLLOW-UP' });
-  ownerAnswers(t);
+  ownerAnswers(w0, t);
   assertExit(w0.cli(rule('R1-B1', 'FOLLOW-UP')), 0);
   const ruled = w0.state();
   const gh = [
@@ -2934,12 +3069,62 @@ test('triage owner-ruling: works on a published round, and a state rebuilt from 
   assert.ok(triageComment(w.state()).includes(`owner (chat): ${QUOTE}`));
 });
 
+// ---- the review skill's loop, end to end (skills/review/SKILL.md section 2 and 3): the commands in the order it lists them ------
+
+test('review skill scenario: Codex ACCEPT item, fixed, state mark-implemented, clean round 2, review-complete succeeds (and is refused without mark-implemented)', (t) => {
+  for (const marked of [false, true]) {
+    const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
+    assertExit(w.codex(1, findingsOf([finding()])), 0); // 1. Codex round 1
+    assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0); // 3. judge, triage validate
+    assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0); // 5. publish the triage first
+    w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)')); // 5. the implementer's fix
+    const head2 = w.repo.commit('fix R1-B1');
+    w.prHead(head2);
+    if (marked) assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0); // 5. mark each fixed ACCEPT item
+    assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0); // round 2: the Codex fix check, clean
+    const outcome = w.cli(['state', 'outcome']); // 6. outcome
+    const done = w.cli(['review-complete', '--pr', '7']); // section 3.1
+    if (marked) {
+      assert.equal(outcome.json.clean, true, JSON.stringify(outcome.json));
+      assertExit(done, 0, done.stderr + done.stdout);
+      assert.ok(w.fake.lines().some((l) => l.startsWith('pr edit 7 ') && l.endsWith(' awaiting-review')), 'awaiting-review comes off');
+      assert.ok(postedBodies(w).some((b) => b.includes('claude-pipeline:review-complete')), 'the marker comment is posted');
+    } else {
+      assert.equal(outcome.json.clean, false, 'an unmarked ACCEPT is not clean');
+      assertExit(done, 1, done.stdout);
+      assert.match(done.json.reason, /not implemented: R1-B1/);
+    }
+  }
+});
+
+test('review skill scenario: owner ruling via ruling-request, the owner\'s recorded answer, owner-ruling, triage re-posted, review-complete succeeds', (t) => {
+  const w = world(t, { yml: CHAT_YML, gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  waitingForHuman(w, { 'R1-B1': 'REJECT' }); // what a failed arbiter model proof leaves behind
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  const before = w.cli(['review-complete', '--pr', '7']);
+  assertExit(before, 1, before.stdout); // an item waiting for a human blocks it
+  const req = w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', 'R1-B1']);
+  assertExit(req, 0, req.stderr + req.stdout);
+  // the reply ends with exactly this line; the owner answers with only the decisions
+  const answer = 'R1-B1: reject';
+  const recorded = ownerRules(t, answer, `Answer with only \`<id>: accept | follow-up | reject\`.\n${req.json.line}`);
+  assert.ok(recorded, 'the owner-go recorder wrote the owner\'s answer down against the line ruling-request printed');
+  const ruled = w.cli(rule('R1-B1', 'REJECT', { quote: answer, extra: ['--pr', '7'] }));
+  assertExit(ruled, 0, ruled.stderr + ruled.stdout);
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0); // re-post so the ruling is published
+  assert.equal(w.cli(['state', 'outcome']).json.clean, true);
+  const done = w.cli(['review-complete', '--pr', '7']);
+  assertExit(done, 0, done.stderr + done.stdout);
+  assert.ok(postedBodies(w).at(-1).includes('claude-pipeline:review-complete'));
+});
+
 test('followups create: a FOLLOW-UP ruled by the owner is filed, one that is still waiting for a human is held', (t) => {
   const url = 'https://github.com/acme/widgets/issues/31';
   const w = world(t, { yml: CHAT_YML, gh: [...GH, ...NO_ISSUES, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 31, html_url: url } }] });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
-  ownerAnswers(t);
+  ownerAnswers(w, t);
   const held = w.cli(['followups', 'create', '--round', '1']);
   assert.deepEqual([held.json.held, held.json.created], [['R1-B1'], []]);
   assertExit(w.cli(rule('R1-B1', 'FOLLOW-UP')), 0);
@@ -2977,7 +3162,7 @@ test('triage owner-ruling: says the ruling is not published yet and that state s
   const w = world(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
-  ownerAnswers(t);
+  ownerAnswers(w, t);
   const r = w.cli(rule('R1-B1', 'FOLLOW-UP', { extra: ['--pr', '7'] }));
   assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.published, false);

@@ -1,6 +1,6 @@
 // The final gate and merge helpers: the last line of defence before an agent merges to production.
-// `evaluateGate` proves that THIS exact PR head was fully verified, cross-model reviewed, CI-green and
-// preview-smoked; `pipeline merge` then refuses anything the gate file does not vouch for. Everything fails
+// `evaluateGate` proves that THIS exact PR head was fully verified, cross-model reviewed and CI-green;
+// `pipeline merge` then refuses anything the gate file does not vouch for. Everything fails
 // closed: a check that cannot be evaluated is a failed check, never a skipped one, and a gate that errors out
 // leaves no final-gate.json behind (the command deletes the old one first), so stale evidence can never merge.
 //
@@ -8,7 +8,7 @@
 // git.tree (nothing changed in the working tree since verify ran) and contentHash (the review covered exactly
 // this patch). Each one defeats a different mistake, so none is redundant.
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gh as ghRun } from './proc.mjs';
 import { checkGuardVerdict, GUARD_CONTEXT_CHECKS } from './guard-provenance.mjs';
@@ -18,7 +18,6 @@ import { matchGlob } from './glob.mjs';
 import { blockingHits, collectHardStops, ownerMergeHits } from './hardstops.mjs';
 import { checkIntegrity } from './integrity.mjs';
 import { runPreflight } from './preflight.mjs';
-import { findDeployment } from './deploy.mjs';
 import { toPosix } from './paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
@@ -36,10 +35,10 @@ export const BLOCKING_LABELS = Object.freeze(['needs-human', 'awaiting-review', 
 export const GATE_MAX_AGE_MS = 24 * 60 * 60_000;
 export const PR_FIELDS = Object.freeze(['state', 'headRefOid', 'baseRefName', 'isDraft', 'labels', 'mergeable', 'mergeStateStatus']);
 
-// What a gate must contain: exactly these checks (plus `preview` when config.preview is set), each once and passing.
+// What a gate must contain: exactly these checks, each once and passing (config.preview adds none: the gate no longer reads deployments).
 // `merge` refuses a gate file that lacks any of them, so a hand-written or truncated file cannot vouch for a merge.
 export const CANONICAL_CHECKS = Object.freeze(['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'review', 'ci']);
-export const expectedCheckNames = (previewConfigured) => (previewConfigured ? [...CANONICAL_CHECKS, 'preview'] : [...CANONICAL_CHECKS]);
+export const expectedCheckNames = () => [...CANONICAL_CHECKS];
 
 // `gh pr view` computes `mergeable` lazily: UNKNOWN right after a push. Re-read this many times, this far apart.
 export const MERGEABLE_RETRIES = 3;
@@ -56,8 +55,6 @@ const AGENT_INSTRUCTION_FILES = new Set(['claude.md', 'agents.md', 'gemini.md', 
 // Instructions, hooks, workflows and the pipeline itself: text files here change what agents or CI do, so they are code.
 const NEVER_DOCS_DIRS = new Set(['.claude', '.github', '.githooks', 'skills', 'agents', 'pipeline', 'scripts']);
 const FULL_SHA = /^[0-9a-f]{40}$/;
-const TAIL_LINES = 30;
-const MAX_LINE = 400;
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const short = (sha) => (typeof sha === 'string' && sha ? sha.slice(0, 8) : String(sha));
@@ -71,16 +68,6 @@ const check = (name, ok, detail, ownerMerge = 0, ownerItems = []) => ({
 
 export const reviewFile = (root, name) => join(root, '.review', name);
 
-// tmp + rename: a reader (merge, final-gate) sees the old file or the whole new one, never half of it.
-export function writeReviewJson(root, name, value) {
-  const file = reviewFile(root, name);
-  mkdirSync(join(root, '.review'), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
-  renameSync(tmp, file);
-  return file;
-}
-
 // null when the file is absent or unparseable: for evidence, "unreadable" and "missing" both mean "not proven".
 export function readReviewJson(root, name) {
   try {
@@ -93,32 +80,6 @@ export function readReviewJson(root, name) {
 
 export function removeReviewFile(root, name) {
   rmSync(reviewFile(root, name), { force: true });
-}
-
-// Last `n` lines of command output: colours stripped, absurdly long lines (minified bundles) clipped.
-export function tailLines(text, n = TAIL_LINES) {
-  const lines = String(text ?? '')
-    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
-    .split(/\r?\n/)
-    .map((l) => (l.length > MAX_LINE ? `${l.slice(0, MAX_LINE)}...` : l));
-  while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
-  return lines.slice(-n).join('\n');
-}
-
-// node's parseArgs refuses an option value that starts with a dash (`--line "- 2026-10-01 ..."`: markdown bullets do), so
-// fold `--name value` into `--name=value` for the named options before parsing. Only the token right after the name is taken.
-export function inlineOptionValues(argv, names) {
-  const out = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (names.includes(a) && i + 1 < argv.length) {
-      out.push(`${a}=${argv[i + 1]}`);
-      i += 1;
-    } else {
-      out.push(a);
-    }
-  }
-  return out;
 }
 
 // ---- classifiers --------------------------------------------------------------------------------
@@ -608,35 +569,6 @@ export function ciCheck({ gh, pr, head, diff, config, explicitEmpty }) {
   return check('ci', true, `${examined.length} ${source} check(s) passing${named.length ? ` (all ${named.length} named in config present)` : ''}${docsOnly ? ' (docs-only: skipped checks accepted)' : ''}`);
 }
 
-// The smoke record is the agent's own claim (--sha and --url are arguments), so it is only believed when GitHub's
-// deployments agree: a successful deployment of exactly this head in the configured environment, at the same origin the
-// smoke ran against.
-async function previewCheck({ root, head, config, gh }) {
-  const smoke = readReviewJson(root, 'preview-smoke.json');
-  if (!smoke) return check('preview', false, 'no preview smoke evidence at .review/preview-smoke.json');
-  if (smoke.ok !== true) return check('preview', false, 'preview smoke did not pass');
-  if (smoke.sha !== head) return check('preview', false, `preview smoke is for ${short(smoke.sha)}, HEAD is ${short(head)}`);
-  const originOf = (u) => {
-    try {
-      const url = new URL(u);
-      return /^https?:$/.test(url.protocol) ? url.origin : null;
-    } catch {
-      return null;
-    }
-  };
-  const smokeOrigin = originOf(smoke.url);
-  if (!smokeOrigin) return check('preview', false, 'preview smoke record has no usable url (an http(s) URL is required)');
-  const environment = config.preview.environment;
-  const found = await findDeployment({ gh, sha: head, environment, timeoutMs: 0 });
-  if (found.state !== 'success') return check('preview', false, `no successful ${environment} deployment of ${short(head)} on GitHub (${found.state})`);
-  if (found.sha !== head) return check('preview', false, `the ${environment} deployment is for ${short(found.sha)}, not HEAD ${short(head)}`);
-  const deployedOrigin = originOf(found.url);
-  if (deployedOrigin !== smokeOrigin) {
-    return check('preview', false, `preview smoke ran against ${smokeOrigin}, but the ${environment} deployment of ${short(head)} is at ${deployedOrigin ?? 'an unknown URL'} (origin mismatch)`);
-  }
-  return check('preview', true, `preview smoke passed at ${short(head)} against the GitHub ${environment} deployment ${deployedOrigin}`);
-}
-
 // A check that throws is a failed check: it must show up in the report instead of aborting the whole gate.
 async function safely(name, fn) {
   try {
@@ -683,7 +615,6 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     await safely('review', () => reviewCheck({ root, config, pr, diff, hash, hashError })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
   ];
-  if (config.preview !== null) checks.push(await safely('preview', () => previewCheck({ root, head, config, gh })));
 
   const d = diff();
   const ok = checks.every((c) => c.ok);
@@ -697,7 +628,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     tree,
     contentHash: hash,
     checks,
-    // owner_approval: chat: items the owner merges in chat (0 = none, merge as usual). The ship skill reads this.
+    // owner_approval: chat: items the owner merges in chat (0 = none, merge as usual). The review skill reads this.
     ownerMerge: checks.reduce((n, c) => n + (c.ownerMerge ?? 0), 0),
     // #58: the owner-item set as one digest ('none' without items). The owner's "merge" is recorded against it, and P merge needs the
     // live gate to show the same set: an item added or swapped after the owner said "merge" (same head) needs a new "merge".
@@ -710,7 +641,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
   };
 }
 
-// The checks of `P merge --owner-go` (owner decision 2026-10-28): work that never ran the ship loop (no verify report, no review
+// The checks of `P merge --owner-go` (owner decision 2026-10-28): work that never ran the review skill (no verify report, no review
 // state, no final-gate.json) merges on the owner's "merge" alone, provided GitHub agrees the PR is ready: open, not a draft,
 // MERGEABLE, not behind its base, at the local HEAD, no blocking label, and every required check green on this head (ciCheck,
 // guard statuses and the Cross-model review status only with their provenance). The owner's recorded "merge" is checked by the
@@ -743,13 +674,13 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
 // ---- merge --------------------------------------------------------------------------------------
 
 // Why a gate file does not vouch for merging `pr` at `head` right now. Empty list = it does.
-export function gateRefusals({ gate, pr, head, prHead, hash, repo, previewConfigured = false, now = Date.now() }) {
+export function gateRefusals({ gate, pr, head, prHead, hash, repo, now = Date.now() }) {
   if (!isObject(gate)) return ['no final-gate.json (or it is unreadable)'];
   const out = [];
   if (gate.ok !== true) out.push('the gate did not pass');
   if (!Array.isArray(gate.checks) || gate.checks.length === 0 || !gate.checks.every((c) => c?.ok === true)) out.push('the gate has failing or missing checks');
   const names = Array.isArray(gate.checks) ? gate.checks.map((c) => (isObject(c) ? c.name : undefined)) : [];
-  const expected = expectedCheckNames(previewConfigured === true);
+  const expected = expectedCheckNames();
   const missing = expected.filter((n) => !names.includes(n));
   if (missing.length) out.push(`the gate is missing canonical check(s): ${missing.join(', ')}`);
   const unexpected = [...new Set(names.filter((n) => typeof n === 'string' && !expected.includes(n)))];
@@ -786,8 +717,8 @@ async function readMergeSha({ gh, pr, first, sleep, pollMs }) {
   return sha;
 }
 
-// The last look before the merge command: GitHub as it is NOW. The live gate read the PR and ran slow probes (Codex, CI,
-// preview) after that read, so a label, a pause issue or a new push can have landed since. Returns the reasons the merge
+// The last look before the merge command: GitHub as it is NOW. The live gate read the PR and ran slow probes (Codex, CI)
+// after that read, so a label, a pause issue or a new push can have landed since. Returns the reasons the merge
 // must not run (empty = go). An unreadable PR is a reason.
 export async function preMergeProblems({ gh, pr, head }) {
   let view;
@@ -864,7 +795,7 @@ export function disableAutoMerge({ pr, cwd, env }) {
 }
 
 // After a failed, blocked or timed-out wait: disarm auto-merge, then LOOK AT THE PR AGAIN. Auto-merge may have fired
-// between the last poll and the disable call; a PR that is MERGED must be reported as merged (so prod-watch and the
+// between the last poll and the disable call; a PR that is MERGED must be reported as merged (so the
 // summary still run), not as a failure that leaves the caller believing nothing shipped.
 export async function abandonMerge({ gh, pr, cwd, env, disable = disableAutoMerge, sleep = defaultSleep, pollMs = 10_000 }) {
   const autoMergeDisabled = disable({ pr, cwd, env });

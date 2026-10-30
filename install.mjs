@@ -1,18 +1,20 @@
 #!/usr/bin/env node
 // Why: one installer for macOS and Windows that copies the pipeline's skills, agents and CLI into ~/.claude and
-// registers its two safety hooks (plus a SessionStart version-status hook, the owner-go recorder and the three stack-stop hooks) in
-// settings.json without disturbing anything else the owner has there.
+// registers its two safety hooks (plus the owner-go recorder and the three stack-stop hooks) in settings.json without
+// disturbing anything else the owner has there. Units this version no longer ships (I.RETIRED_SKILLS, I.RETIRED_HOOKS) are removed
+// from an existing install by the next run.
 // It is idempotent, refuses to overwrite files it did not install, and refuses to run inside a Claude Code
 // session (an agent must not be able to reinstall or remove its own guards) unless PIPELINE_ADMIN=1. "Inside" means
 // CLAUDECODE=1 in the environment OR a Claude Code ancestor process (the variable can be stripped, the parent cannot).
 // All decisions live in pipeline/lib/installer.mjs; this file does the disk work, the report and the exit code.
 // PIPELINE_INSTALL_NO_PROBES=1 skips the claude/codex/gh version probes (tests and CI).
+// PIPELINE_INSTALL_RETIRED_SKILLS=a,b (a test seam: honoured only with PIPELINE_TEST_MODE=1, like the other seams) adds skill names to I.RETIRED_SKILLS.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { run } from './pipeline/lib/proc.mjs';
+import { run, seamFlag, seamValue } from './pipeline/lib/proc.mjs';
 import { expandHome, isInside, safeTimestamp } from './pipeline/lib/paths.mjs';
 // `pipeline update` (commands/update.mjs installerAcceptsPrivateTmpSource) detects this import to know the installer accepts its download.
 import { TMP_ROOT_REL } from './pipeline/lib/private-tmp.mjs';
@@ -212,6 +214,41 @@ function diagnostics(ctx, settings) {
   return I.collectDiagnostics({ settings, env: ctx.env, home: os.homedir(), platform: process.platform, runFn: probes });
 }
 
+// The skills to retire: the shipped list, plus (test seam, PIPELINE_TEST_MODE=1 only) names from PIPELINE_INSTALL_RETIRED_SKILLS. Only plain directory names count.
+function retiredSkillNames(env) {
+  const opts = { root: fileURLToPath(new URL('./pipeline', import.meta.url)) };
+  const raw = seamFlag('PIPELINE_TEST_MODE', env, opts) ? seamValue('PIPELINE_INSTALL_RETIRED_SKILLS', env, opts) : undefined;
+  const extra = raw === undefined ? [] : raw.split(',').map((s) => s.trim()).filter((s) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(s));
+  return [...I.RETIRED_SKILLS, ...extra];
+}
+
+// Takes the retired skills out of the install. Per unit: the files the manifest lists are removed, an owner-modified one is first
+// copied to backups/<name>.<ts>/ (the name an edited unit's backup gets in swapIn, uniquified the same way); files the manifest does
+// not list stay. Runs BEFORE the pipeline unit is swapped, while the old manifest still lists every file, so a run that dies half
+// way is finished by the next one. Returns [{ rel, removed, backedUp, backup, kept }] for the units that had something to do.
+function retireUnits(home, manifest, names, ts) {
+  const report = [];
+  for (const unit of I.retiredSkillUnits(names)) {
+    const { listed, kept } = I.scanRetiredUnit(home, unit, manifest);
+    if (listed.length === 0 && kept.length === 0) continue;
+    const edited = listed.filter((f) => f.modified);
+    let backup = null;
+    if (edited.length > 0) {
+      fs.mkdirSync(path.join(home, 'backups'), { recursive: true });
+      backup = uniquePath(path.join(home, 'backups', `${path.basename(I.unitTarget(home, unit))}.${ts}`));
+      for (const f of edited) {
+        const dest = I.fromRel(backup, f.rel.slice(unit.rel.length + 1));
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(I.fromRel(home, f.rel), dest);
+      }
+    }
+    const removed = [];
+    for (const f of listed) if (removeInstalledFile(home, f.rel)) removed.push(f.rel);
+    report.push({ rel: unit.rel, removed, backedUp: edited.map((f) => f.rel), backup, kept });
+  }
+  return report;
+}
+
 function loadPlan(source) {
   const plan = I.buildPlan(source);
   if (plan.problems.length > 0) throw new InstallError(`cannot install from ${source}:\n  - ${plan.problems.join('\n  - ')}`);
@@ -240,13 +277,16 @@ function doInstall(ctx) {
     throw new InstallError(conflicts.map((rel) => `refusing to overwrite ${rel}: it exists in ${home} and was not installed by claude-pipeline (it is not listed in ${I.MANIFEST_REL}). Move it away, or re-run with --force (the old copy is kept in backups/).`).join('\n'));
   }
   const backupsExisted = I.lexists(path.join(home, 'backups'));
-  const staleRels = Object.keys(manifest?.files ?? {}).filter((rel) => !plan.files.has(rel) && I.lexists(I.fromRel(home, rel)));
+  const retiredNames = retiredSkillNames(ctx.env);
+  const retiredRels = I.retiredSkillUnits(retiredNames).map((u) => `${u.rel}/`);
+  const staleRels = Object.keys(manifest?.files ?? {}).filter((rel) => !plan.files.has(rel) && !retiredRels.some((r) => rel.startsWith(r)) && I.lexists(I.fromRel(home, rel)));
 
   const settingsChanged = !current.exists || !isDeepStrictEqual(merged, current.settings);
   fs.mkdirSync(home, { recursive: true });
   const backup = settingsChanged && current.exists ? backupSettings(home, current.file) : null;
 
   const ts = safeTimestamp();
+  const retired = retireUnits(home, manifest, retiredNames, ts);
   // The pipeline unit is staged with "complete": false; only the rewrite at the very end says true, so an install
   // that dies half way never reads as current.
   const provenance = sourceProvenance(source, plan);
@@ -314,6 +354,7 @@ function doInstall(ctx) {
     allow: { added: I.ourAllowEntries(home).filter((e) => !allowBefore.has(e)) },
     foreignBackups,
     editBackups,
+    retired,
     warnings,
     diagnostics: diagnostics(ctx, merged),
   };
@@ -340,6 +381,7 @@ function doCheck(ctx) {
     settings: current.exists ? current.settings : null,
     settingsProblem: problem,
     skipFileGuard: opts.skipFileGuard,
+    retiredSkills: retiredSkillNames(ctx.env),
   });
   return { ok: drift.length === 0, mode: 'check', home, source, version: plan.version, installedVersion: manifest?.version ?? null, drift, warnings: [...plan.warnings, ...warnings] };
 }
@@ -421,13 +463,18 @@ function formatReport(r) {
     lines.push(`claude-pipeline ${r.version} installed in ${r.home}`);
     lines.push(`  files:     ${r.files.copied} copied, ${r.files.unchanged} unchanged, ${r.files.removed.length} removed`);
     for (const rel of r.files.removed) lines.push(`             removed ${rel}`);
-    lines.push(`  hooks:     guard-git yes, guard-files ${r.hooks.guardFiles ? 'yes' : 'no (--skip-file-guard)'}, session-version (SessionStart) yes, stack-stop yes (stack-register PreToolUse, stack-dev-bind PostToolUse, stack-session-end SessionEnd)`);
+    lines.push(`  hooks:     guard-git yes, guard-files ${r.hooks.guardFiles ? 'yes' : 'no (--skip-file-guard)'}, stack-stop yes (stack-register PreToolUse, stack-dev-bind PostToolUse, stack-session-end SessionEnd)`);
     const state = r.settings.created ? 'created' : r.settings.changed ? 'updated' : 'unchanged';
     lines.push(`  settings:  ${r.settings.path} ${state}`);
     lines.push(`  backup:    ${r.settings.backup ?? 'none (settings.json was not changed or did not exist)'}`);
     lines.push(`  allow:     ${r.allow.added.length === 0 ? 'entries already present' : `added ${r.allow.added.join(', ')}`}`);
     for (const b of r.foreignBackups) lines.push(`  replaced a file that was not ours; the old copy is at ${b}`);
     for (const b of r.editBackups) lines.push(`  your edits in ${b.rel} were replaced; the old copy is at ${b.backup}`);
+    for (const u of r.retired) {
+      lines.push(`  retired ${u.rel}/: ${u.removed.length} file${u.removed.length === 1 ? '' : 's'} removed (no longer part of claude-pipeline)`);
+      if (u.backup) lines.push(`    your edits in ${u.backedUp.join(', ')} were saved; the old copy is at ${u.backup}`);
+      for (const k of u.kept) lines.push(`    kept ${k}: claude-pipeline did not install it`);
+    }
     lines.push(...formatDiagnostics(r.diagnostics));
   } else if (r.mode === 'uninstall') {
     lines.push(`claude-pipeline uninstalled from ${r.home}`);

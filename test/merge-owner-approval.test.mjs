@@ -328,7 +328,7 @@ test('--owner-go with --owner-approved-head or --owner-approved-items is a usage
   assert.deepEqual(s.mergeCalls(), []);
 });
 
-test('--owner-go with production configured: merges, records no prod-before and says so in a warning', (t) => {
+test('--owner-go with production configured: merges, records no prod-before and has nothing to warn about', (t) => {
   const s = goScenario({ yml: { production: true } });
   ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'));
   const r = goMerge(s);
@@ -336,7 +336,7 @@ test('--owner-go with production configured: merges, records no prod-before and 
   assert.equal(r.json.merged, true);
   assert.equal(r.json.mode, 'owner-go');
   assert.equal('prodBefore' in r.json, false);
-  assert.match((r.json.warnings ?? []).join('\n'), /no prod-before/);
+  assert.equal(r.json.warnings, undefined, 'no deployment bookkeeping exists, so nothing to warn about');
   assert.equal(s.fake.lines().some((l) => /prod-before/.test(l)), false);
 });
 

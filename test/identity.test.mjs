@@ -1,4 +1,4 @@
-// Why: a version label is trusted by the session hook, the updater and vendor stamps, so each way a label can be a
+// Why: a version label is trusted by the updater and vendor stamps, so each way a label can be a
 // lie (edited install, half install, dirty source, unpublished checkout, no sha) must show up in the stamp. Installed
 // copies are built by hand in a temp claude-home; checkouts are real throwaway git repos.
 import { test } from 'node:test';
@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { installedIdentity, checkoutIdentity, parseStamp, formatStamp, stampIsTrusted, fileProvenance } from '../pipeline/lib/identity.mjs';
+import { installedIdentity, checkoutIdentity, parseStamp, formatStamp, fileProvenance } from '../pipeline/lib/identity.mjs';
 import { MANIFEST_REL, buildPlan, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 import { versionReport, meta as versionMeta } from '../pipeline/commands/version.mjs';
 
@@ -22,7 +22,7 @@ const scratch = () => {
 };
 
 const SHA = '0123456789abcdef0123456789abcdef01234567';
-const FILES = { 'agents/judge.md': 'judge\n', 'skills/ship/SKILL.md': 'ship\n', 'pipeline/bin/pipeline.mjs': 'cli\n' };
+const FILES = { 'agents/judge.md': 'judge\n', 'skills/review/SKILL.md': 'ship\n', 'pipeline/bin/pipeline.mjs': 'cli\n' };
 
 // A claude-home holding FILES and an INSTALLED.json that vouches for them.
 function installedHome(manifestExtra = {}, { version = '1.4.0', sourceSha = SHA } = {}) {
@@ -63,10 +63,10 @@ test('installedIdentity: nothing installed (no or unusable manifest) is null', (
 test('installedIdentity: an edited file and a deleted file are listed and mark the stamp .modified', () => {
   const home = installedHome();
   writeFileSync(join(home, 'agents', 'judge.md'), 'edited\n');
-  rmSync(join(home, 'skills', 'ship', 'SKILL.md'));
+  rmSync(join(home, 'skills', 'review', 'SKILL.md'));
   const id = installedIdentity(home);
   assert.deepEqual(id.modified, ['agents/judge.md']);
-  assert.deepEqual(id.missing, ['skills/ship/SKILL.md']);
+  assert.deepEqual(id.missing, ['skills/review/SKILL.md']);
   assert.equal(id.stamp, '1.4.0+0123456.modified');
   const onlyMissing = installedHome();
   rmSync(join(onlyMissing, 'agents', 'judge.md'));
@@ -105,17 +105,13 @@ test('parseStamp: base, sha, flags; unknown sha is null; anything else is null',
   for (const bad of ['1.4.0', '', null, undefined, '1.4.0+', '1.4.0+xyz', '1.4.0+abc', 'a b+0123456', '+0123456']) assert.equal(parseStamp(bad), null, String(bad));
 });
 
-test('formatStamp and parseStamp round-trip; only a sha with no flags is trusted', () => {
+test('formatStamp and parseStamp round-trip', () => {
   for (const [sha, flags] of [[SHA, []], [SHA, ['modified']], [null, ['unverified']], [null, []]]) {
     const p = parseStamp(formatStamp('2.0.1', sha, flags));
     assert.equal(p.base, '2.0.1');
     assert.equal(p.sha, sha ? sha.slice(0, 7) : null);
     assert.deepEqual(p.flags, flags);
   }
-  assert.equal(stampIsTrusted(parseStamp('1.0.0+0123456')), true);
-  assert.equal(stampIsTrusted(parseStamp('1.0.0+0123456.modified')), false);
-  assert.equal(stampIsTrusted(parseStamp('1.0.0+unknown')), false);
-  assert.equal(stampIsTrusted(null), false);
 });
 
 // ---- checkoutIdentity --------------------------------------------------------------------------------------------
@@ -290,14 +286,14 @@ test('installedIdentity: a file added to an installer-owned unit makes the stamp
   assert.deepEqual(installedIdentity(home).extra, []);
   mkdirSync(join(home, 'pipeline', 'commands'), { recursive: true });
   writeFileSync(join(home, 'pipeline', 'commands', 'extra.mjs'), 'export default 1;\n');
-  writeFileSync(join(home, 'skills', 'ship', 'EXTRA.md'), 'added\n');
+  writeFileSync(join(home, 'skills', 'review', 'EXTRA.md'), 'added\n');
   const id = installedIdentity(home);
-  assert.deepEqual(id.extra, ['pipeline/commands/extra.mjs', 'skills/ship/EXTRA.md']);
+  assert.deepEqual(id.extra, ['pipeline/commands/extra.mjs', 'skills/review/EXTRA.md']);
   assert.deepEqual(id.modified, []);
   assert.deepEqual(id.missing, []);
   assert.equal(id.stamp, '1.4.0+0123456.modified');
   assert.equal(versionReport(join(home, 'pipeline')).version, '1.4.0+0123456.modified');
-  assert.deepEqual(versionReport(join(home, 'pipeline')).extra, ['pipeline/commands/extra.mjs', 'skills/ship/EXTRA.md']);
+  assert.deepEqual(versionReport(join(home, 'pipeline')).extra, ['pipeline/commands/extra.mjs', 'skills/review/EXTRA.md']);
 });
 
 test('installedIdentity: files the installer ignores or does not own are not extra (INSTALLED.json, test/, node_modules, other skills, foreign agents)', () => {
@@ -311,16 +307,6 @@ test('installedIdentity: files the installer ignores or does not own are not ext
   assert.equal(id.stamp, '1.4.0+0123456');
 });
 
-test('the session hook and update --check treat an added installed file as modified', async () => {
-  const { installedProblems } = await import('../pipeline/lib/session-version.mjs');
-  const home = installedHome();
-  assert.deepEqual(installedProblems(installedIdentity(home)), []);
-  writeFileSync(join(home, 'pipeline', 'added.mjs'), 'x\n');
-  const problems = installedProblems(installedIdentity(home));
-  assert.equal(problems.length, 1);
-  assert.match(problems[0], /^modified \(1 installed file differs/);
-});
-
 function installRepo() {
   const repo = createTmpRepo();
   repo.write('VERSION', '1.4.0\n');
@@ -329,11 +315,11 @@ function installRepo() {
   repo.write('pipeline/test/t.mjs', 't\n');
   repo.write('agents/judge.md', 'judge\n');
   repo.write('agents/unlisted.md', 'not an installable agent\n');
-  repo.write('skills/ship/SKILL.md', 'ship\n');
-  repo.write('skills/ship/ref/r.md', 'r\n');
+  repo.write('skills/review/SKILL.md', 'ship\n');
+  repo.write('skills/review/ref/r.md', 'r\n');
   const sha = repo.commit('init');
   repo.git(['update-ref', 'refs/remotes/origin/main', sha]);
-  const planned = (repo2) => ['pipeline/lib/a.mjs', 'pipeline/lib/b.mjs', 'agents/judge.md', 'skills/ship/SKILL.md', 'skills/ship/ref/r.md', 'VERSION']
+  const planned = (repo2) => ['pipeline/lib/a.mjs', 'pipeline/lib/b.mjs', 'agents/judge.md', 'skills/review/SKILL.md', 'skills/review/ref/r.md', 'VERSION']
     .filter((r) => existsSync(join(repo2.dir, ...r.split('/')))).map((r) => join(repo2.dir, ...r.split('/')));
   return { repo, sha, planned };
 }
@@ -345,11 +331,11 @@ test('fileProvenance (install scope): a HEAD file deleted from the working tree 
   repo.rm('pipeline/test/t.mjs');
   repo.rm('agents/unlisted.md');
   assert.equal(fileProvenance(repo.dir, planned(repo), { scope: 'install' }).state, 'clean');
-  repo.rm('skills/ship/ref/r.md');
+  repo.rm('skills/review/ref/r.md');
   const p = fileProvenance(repo.dir, planned(repo), { scope: 'install' });
   assert.equal(p.state, 'dirty');
-  assert.deepEqual(p.deleted, ['skills/ship/ref/r.md']);
-  assert.deepEqual(p.differing, ['skills/ship/ref/r.md']);
+  assert.deepEqual(p.deleted, ['skills/review/ref/r.md']);
+  assert.deepEqual(p.differing, ['skills/review/ref/r.md']);
   // Without the install scope the same call cannot see it: that is the hole being closed.
   assert.equal(fileProvenance(repo.dir, planned(repo)).state, 'clean');
 });
@@ -393,7 +379,7 @@ test('a tracked installable file replaced by an empty directory is a provenance 
   const { repo, sha } = installRepo();
   // agents/judge.md etc. are what buildPlan finds; make the plan's source realistic
   repo.write('agents/reviewer.md', 'r\n');
-  repo.write('skills/ship/SKILL.md', 'ship\n');
+  repo.write('skills/review/SKILL.md', 'ship\n');
   const sha2 = repo.commit('more');
   repo.git(['update-ref', 'refs/remotes/origin/main', sha2]);
   assert.notEqual(sha, sha2);
@@ -456,11 +442,11 @@ test('installedIdentity: an unreadable extra file does not hide the other extras
   mkdirSync(join(home, 'pipeline', 'commands'), { recursive: true });
   const secret = join(home, 'pipeline', 'commands', 'locked.mjs');
   writeFileSync(secret, 'x\n');
-  writeFileSync(join(home, 'skills', 'ship', 'EXTRA.md'), 'added\n');
+  writeFileSync(join(home, 'skills', 'review', 'EXTRA.md'), 'added\n');
   chmodSync(secret, 0o000);
   try {
     const id = installedIdentity(home);
-    assert.deepEqual(id.extra, ['pipeline/commands/locked.mjs', 'skills/ship/EXTRA.md']);
+    assert.deepEqual(id.extra, ['pipeline/commands/locked.mjs', 'skills/review/EXTRA.md']);
     assert.equal(id.stamp, '1.4.0+0123456.modified');
   } finally { chmodSync(secret, 0o644); }
 });
@@ -483,18 +469,12 @@ test('installedIdentity: a directory that cannot be listed leaves extras unknown
 test('installedIdentity: an unreadable manifest-listed file is .modified, not a throw and not clean', { skip: !canChmod }, () => {
   const home = installedHome();
   assert.equal(installedIdentity(home).stamp, '1.4.0+0123456'); // control
-  const f = join(home, 'skills', 'ship', 'SKILL.md');
+  const f = join(home, 'skills', 'review', 'SKILL.md');
   chmodSync(f, 0o000);
   try {
     const id = installedIdentity(home);
-    assert.deepEqual(id.modified, ['skills/ship/SKILL.md']);
+    assert.deepEqual(id.modified, ['skills/review/SKILL.md']);
     assert.equal(id.stamp, '1.4.0+0123456.modified');
   } finally { chmodSync(f, 0o644); }
 });
 
-test('the session hook flags a scan error as modified', async () => {
-  const { installedProblems } = await import('../pipeline/lib/session-version.mjs');
-  const problems = installedProblems({ complete: true, modified: [], missing: [], extra: [], scanError: ['pipeline/x'], sourceDirty: false });
-  assert.equal(problems.length, 1);
-  assert.match(problems[0], /^modified/);
-});

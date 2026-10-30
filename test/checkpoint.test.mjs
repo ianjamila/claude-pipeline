@@ -256,12 +256,8 @@ test('checkpoint: a record from a newer pipeline version is never overwritten', 
   assert.deepEqual(commentWrites(s.fake), []);
 });
 
-// ---- P merge: inFlight + the prod-before event -----------------------------------------------------------------------
+// ---- P merge: inFlight (a configured production adds no deployment lookup and no event) -----------------------------------------------------------------------
 
-const DEPLOYMENTS = [
-  { match: 'deployments/7/statuses', stdoutJson: [{ state: 'success', environment_url: 'https://prod-7.example.test' }] },
-  { match: 'deployments\\?.*environment=Production', stdoutJson: [{ id: 7, sha: 'b'.repeat(40), created_at: '2026-10-01T00:00:00Z' }] },
-];
 // A merge command that marks the moment it ran in the gh call log, so the order of writes can be asserted.
 const MERGE_MARKER = [
   "import { appendFileSync } from 'node:fs';",
@@ -269,7 +265,7 @@ const MERGE_MARKER = [
   "if (process.env.FAKE_MERGE_EXIT) process.exit(Number(process.env.FAKE_MERGE_EXIT));",
   '',
 ].join('\n');
-const mergeScenario = (o = {}) => scenario({ production: true, baseFiles: { 'scripts/fake-merge.mjs': MERGE_MARKER }, ...o, gh: { extra: DEPLOYMENTS, ...o.gh } });
+const mergeScenario = (o = {}) => scenario({ production: true, baseFiles: { 'scripts/fake-merge.mjs': MERGE_MARKER }, ...o, gh: { ...o.gh } });
 const marker = (s) => s.fake.calls().findIndex((c) => c.argv[0] === 'MERGE-COMMAND');
 const recordIndexes = (s, pred) => s.fake.calls()
   .map((c, i) => ({ c, i }))
@@ -277,7 +273,7 @@ const recordIndexes = (s, pred) => s.fake.calls()
   .map(({ i }) => i);
 const decoded = (body) => (body.startsWith(MARKERS.summary) ? decodeRecord(body).record : null);
 
-test('merge: inFlight is written BEFORE the merge command and cleared after it (merged: step prod-watch + mergeSha)', () => {
+test('merge: inFlight is written BEFORE the merge command and cleared after it (merged: step merge + mergeSha)', () => {
   const s = mergeScenario();
   assertExit(s.gate(), 0);
   const r = s.merge();
@@ -303,35 +299,25 @@ test('merge: inFlight is written BEFORE the merge command and cleared after it (
   assert.equal(set.head, s.head);
   const cleared = writes.at(-1).record;
   assert.equal(cleared.inFlight, null);
-  assert.equal(cleared.step, 'prod-watch');
+  assert.equal(cleared.step, 'merge');
   assert.equal(cleared.mergeSha, 'c'.repeat(40));
 });
 
-test('merge: the prod-before event is a NEW comment, posted after inFlight and before the merge command', () => {
+test('merge: with production configured no prod-before event is posted; the summary comment is edited (set + clear), never a new comment', () => {
   const s = mergeScenario();
-  withComment(s, existingSummary({ record: baseRecord({ step: 'gate', request: 'keep me' }), sections: '## Summary\n\nkept' }), DEPLOYMENTS);
+  withComment(s, existingSummary({ record: baseRecord({ step: 'gate', request: 'keep me' }), sections: '## Summary\n\nkept' }));
   assertExit(s.gate(), 0);
   const r = s.merge();
   assertExit(r, 0);
-  const events = eventWrites(s.fake);
-  assert.equal(events.length, 1);
-  assert.equal(events[0].method, 'POST', 'an event is never an edit');
-  assert.equal(events[0].path, 'repos/acme/widgets/issues/12/comments');
-  const { event } = events[0];
-  assert.equal(event.kind, 'prod-before');
-  assert.equal(event.dataStatus, 'ok');
-  assert.deepEqual(event.data, {
-    repo: 'acme/widgets', environment: 'Production', pr: PR, headBeforeMerge: s.head,
-    deployment: { id: 7, sha: 'b'.repeat(40), url: 'https://prod-7.example.test' },
-  });
-  const at = s.fake.calls().findIndex((c) => c.stdin && c.stdin.includes('claude-pipeline:event:prod-before'));
-  assert.ok(at < marker(s), 'before the merge command');
+  assert.deepEqual(eventWrites(s.fake), []);
+  assert.equal(s.fake.calls().some((c) => c.stdin && c.stdin.includes('claude-pipeline:event:prod-before')), false);
+  assert.equal(s.fake.lines().some((l) => /deployments/.test(l)), false);
   const patches = commentWrites(s.fake).filter((w) => w.method === 'PATCH');
-  assert.ok(patches.length >= 2, 'the summary comment is edited (set + clear) while the event stays its own comment');
+  assert.ok(patches.length >= 2, 'the summary comment is edited (set + clear)');
   assert.ok(patches.every((w) => w.body.startsWith(MARKERS.summary)));
 });
 
-test('merge: no production configured => inFlight is still recorded, but there is no prod-before event', () => {
+test('merge: no production configured => inFlight is still recorded, and there is no event', () => {
   const s = scenario({ baseFiles: { 'scripts/fake-merge.mjs': MERGE_MARKER } });
   assertExit(s.gate(), 0);
   assertExit(s.merge(), 0);
@@ -359,7 +345,7 @@ test('merge: a refusal by the last look at GitHub (after inFlight was set) clear
   const lastLook = { match: '^pr view 12 --json state,headRefOid,labels,isDraft$', stdoutJson: { state: 'OPEN', headRefOid: 'x', labels: [], isDraft: true } };
   const s = mergeScenario();
   assertExit(s.gate(), 0);
-  s.fake.setScript(ghEntries({ prHead: s.head, extra: [lastLook, ...DEPLOYMENTS] }));
+  s.fake.setScript(ghEntries({ prHead: s.head, extra: [lastLook] }));
   const r = s.merge();
   assertExit(r, 1);
   assert.equal(r.json.error, 'pre-merge');
@@ -394,7 +380,7 @@ test('merge: an exception after inFlight was set still clears it (finally), then
 test('merge: a record write that fails only warns; the merge still happens', (t) => {
   // Only the summary comment write fails: it is a PATCH/POST of the record, the event is a POST too, so fail by body.
   // (The comment list read fails too, so the resumed-run guard cannot be checked: the owner approves this exact head.)
-  const s = mergeScenario({ gh: { extra: [{ match: 'repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'gh: Server Error (HTTP 502)' }, ...DEPLOYMENTS] } });
+  const s = mergeScenario({ gh: { extra: [{ match: 'repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'gh: Server Error (HTTP 502)' }] } });
   const g = s.gate();
   assertExit(g, 0);
   ownerSays(t, 'merge', mergeRequest(12, s.head, g.json.ownerItems));
@@ -402,37 +388,8 @@ test('merge: a record write that fails only warns; the merge still happens', (t)
   assertExit(r, 0);
   assert.equal(r.json.merged, true);
   assert.ok(r.json.warnings.some((w) => w.startsWith('run record not updated:')), r.json.warnings.join());
-  assert.equal(eventWrites(s.fake).length, 1, 'the prod-before event was still posted');
+  assert.deepEqual(eventWrites(s.fake), [], 'no prod-before event');
   assert.ok(marker(s) > 0, 'the merge command ran');
-});
-
-test('merge: fails CLOSED when the prod-before event cannot be posted: pre-merge refusal, merge command never ran, inFlight cleared', () => {
-  const s = mergeScenario({ gh: { extra: [{ match: '-X POST repos/acme/widgets/issues/12/comments', code: 1, stderr: 'gh: Server Error (HTTP 500)' }, ...DEPLOYMENTS] } });
-  assertExit(s.gate(), 0);
-  const r = s.merge();
-  assertExit(r, 1);
-  assert.equal(r.json.merged, false);
-  assert.equal(r.json.error, 'pre-merge');
-  assert.equal(r.json.reason, 'could not record the rollback target on the PR (prod-before event)');
-  assert.deepEqual(r.json.reasons, [r.json.reason]);
-  assert.equal(marker(s), -1, 'the merge command never ran');
-  assert.ok(!s.fake.lines().some((l) => l.startsWith('pr merge')));
-  // the record writes (also POSTs here) failed too, so they only warn; with a readable comment list the clear is attempted
-  assert.ok(r.json.warnings.some((w) => w.startsWith('run record not updated:')));
-});
-
-test('merge: the prod-before failure refusal clears inFlight when the record can be written (PATCH works, the event POST fails)', () => {
-  const s = mergeScenario();
-  withComment(s, existingSummary({ record: baseRecord({ step: 'gate' }) }), [{ match: '-X POST repos/acme/widgets/issues/12/comments', code: 1, stderr: 'gh: Server Error (HTTP 500)' }, ...DEPLOYMENTS]);
-  assertExit(s.gate(), 0);
-  const r = s.merge();
-  assertExit(r, 1);
-  assert.equal(r.json.error, 'pre-merge');
-  assert.equal(marker(s), -1);
-  const writes = recordWrites(s.fake);
-  assert.equal(writes[0].record.inFlight.kind, 'merge');
-  assert.equal(writes.at(-1).record.inFlight, null);
-  assert.equal(writes.at(-1).record.step, 'gate');
 });
 
 // ---- P update-branch: inFlight ---------------------------------------------------------------------------------------
@@ -485,7 +442,7 @@ const RESUMED = { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: 'a'.repeat
 const mergeWith = (s, args = []) => cli(['merge', '--pr', String(PR), ...args], { dir: s.repo.dir, fake: s.fake, env: s.env });
 const withRecord = (o, record, extra = {}) => {
   const s = mergeScenario(o);
-  s.fake.setScript(ghEntries({ prHead: s.head, comments: [existingSummary({ record })], extra: [PATCH_77, ...DEPLOYMENTS], ...extra }));
+  s.fake.setScript(ghEntries({ prHead: s.head, comments: [existingSummary({ record })], extra: [PATCH_77], ...extra }));
   return s;
 };
 
@@ -555,7 +512,7 @@ test('merge: a record that is NOT resumed merges as before, with or without the 
 });
 
 test('merge: a run record that cannot be checked fails CLOSED (it may be a resumed one): pre-merge unless the owner approved this exact head', (t) => {
-  const unreadable = () => mergeScenario({ gh: { extra: [{ match: 'repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'gh: Server Error (HTTP 500)' }, ...DEPLOYMENTS] } });
+  const unreadable = () => mergeScenario({ gh: { extra: [{ match: 'repos/acme/widgets/issues/12/comments --paginate', code: 1, stderr: 'gh: Server Error (HTTP 500)' }] } });
   const cases = [
     ['unreadable comments', unreadable, /^the run record could not be read \(.*\), so the resumed-run guard cannot be checked/],
     ['a newer record version', () => withRecord({}, baseRecord({ step: 'gate', v: 99, resumed: RESUMED })), /^the run record is unsupported, so the resumed-run guard cannot be checked/],

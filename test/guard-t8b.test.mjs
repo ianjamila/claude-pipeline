@@ -84,7 +84,8 @@ for (const [name, unit] of Object.entries(SHAPES)) {
 const OLD_DEFAULTED_WORD = /\$\{!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-]):?[-=+]/; // (what shell-parse.mjs tested before isDefaultedWord: unbounded subscript, ~5 s of CPU on a 200 kB word)
 // Why: the Windows CI runner is ~3-4x slower than a Mac (the worst shape: 0.33 s on the Mac, 1.08 s on Windows); 4 s there is still far below
 // the old pattern's ~20 s on that runner (5.2 s on the Mac) and below the guard's 5 s deadline.
-const SUBSCRIPT_CAP_MS = process.platform === 'win32' ? 4000 : 1000;
+// (a shared CI runner measured 1184 ms on the worst shape, ~3.5× a Mac, with no code change: CI gets its own cap)
+const SUBSCRIPT_CAP_MS = process.platform === 'win32' ? 4000 : process.env.CI ? 2500 : 1000;
 test(`H2 a long word of unclosed subscripts after a command that can take options is answered in under ${SUBSCRIPT_CAP_MS} ms of CPU time by each guard (allow or deny, never a throw)`, () => {
   const prefixes = ['bash ', 'source ', 'node ', 'find . '];
   const units = ['${a[', '${a[x', '${a[${b[', '${!a[', '${a[1]:-${a[', '${a[]'];

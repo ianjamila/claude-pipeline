@@ -2,7 +2,8 @@
 // say-so about where it came from), refuses anything that is not exactly one decision per pending item, applies it,
 // and settles whatever the deterministic rules allow without the arbiter. `settle` records a test result, which
 // outranks every opinion. `light-lane` closes out the untriaged WORTH CONSIDERING items of a small low-risk PR.
-// `owner-ruling` records what the owner decided in chat about an item that was waiting for a human.
+// `owner-ruling` records what the owner decided in chat about an item that was waiting for a human; `ruling-request` prints the
+// line that asks the owner (it carries a digest of the findings' text, which `owner-ruling` checks again).
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
@@ -12,16 +13,16 @@ import { runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { ownerRuled } from '../hooks/lib/owner-go.mjs';
+import { ownerRuled, ownerRulingGap } from '../hooks/lib/owner-go.mjs';
 import {
-  applyJudge, applyOwnerRuling, applyTestResult, DECISIONS, finalizeWithoutArbiter, isOwnerRuled, markLightLane, validateTriage,
+  applyJudge, applyOwnerRuling, applyTestResult, DECISIONS, finalizeWithoutArbiter, isOwnerRuled, markLightLane, rulingContentDigest, validateTriage,
 } from '../lib/triage.mjs';
 import {
   ensureRoundDir, findItem, findRound, readFileOrFail, requireState, withStateLock, writeJson,
 } from '../lib/review-context.mjs';
 
 export const meta = {
-  summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane, record owner rulings made in chat',
+  summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane, ask for and record owner rulings made in chat',
   usage: [
     'pipeline triage validate --round R (--from-tag TAG | --file F) [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
     '  -> {ok, round, counts:{ACCEPT,FOLLOW-UP,REJECT}, settled, unsettled, judgeProof}; exit 1 + errors when the judge output is invalid (state untouched)',
@@ -30,11 +31,14 @@ export const meta = {
     '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented',
     '  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman',
     'pipeline triage light-lane --round R [--repo DIR]',
+    'pipeline triage ruling-request --pr N --ids ID[,ID…] [--repo DIR]',
+    '  -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state\'s, or a repository off github.com)',
     'pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]',
     '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
     '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
     '  -> works on an already published round. ACCEPT still needs the fix and a later review round; FOLLOW-UP is filed by `followups create`; the quote is published in the triage comment and the final gate counts it as ownerMerge (the owner\'s "merge" is still needed)',
-    '  -> the quote must be the WHOLE owner prompt that answered a reply ENDING with `⚖️ Owner ruling needed #N: ID[, ID…] · repo owner/name` (the owner-go hook records it; any session, last 24 h; white space and case aside), and that answer must be nothing but decisions, `ID: accept|follow-up|reject` per asked id, the id always written (any other word decides nothing; over 1000 characters is not recorded); exit 1 otherwise, or when gh resolves the repository off github.com',
+    '  -> the quote must be the WHOLE owner prompt that answered a reply ENDING with the line `triage ruling-request` printed (`⚖️ Owner ruling needed #N: ID[, ID…] · content <digest12> · repo owner/name`; the owner-go hook records it; any session, last 24 h; white space and case aside), and that answer must be nothing but decisions, `ID: accept|follow-up|reject` per asked id, the id always written (any other word decides nothing; over 1000 characters is not recorded); exit 1 otherwise, or when gh resolves the repository off github.com',
+    '  -> the request is bound to the findings\' text: the digest is recomputed over ALL the ids of the request from the current review state and must equal the recorded one, so a rebuilt review that reuses an id for a changed finding (or a request in the old line shape, with no digest) cannot reuse the ruling; ask again with ruling-request',
     '  -> pass the owner\'s own words as --owner-quote, never a paraphrase; then re-post the triage comment NOW (`pipeline comment --pr N --kind triage`); until then the ruling is local only (`published: false`) and `pipeline state show` restores the published state without it',
   ].join('\n'),
 };
@@ -290,8 +294,14 @@ async function ownerRuling(rest, ctx) {
     const { slug, host } = gh.repo();
     const prNum = state.pr ?? pr;
     if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded ruling names a repository on github.com`);
-    if (!ownerRuled({ repo: slug, pr: prNum, id, quote: ownerQuote, decision })) {
-      return refuse(`no owner ruling is recorded for ${slug} #${prNum} ${id} whose whole answer is --owner-quote and says ${decision.toLowerCase()} (an answer naming several decisions must also name ${id}): end the reply that asks with \`⚖️ Owner ruling needed #${prNum}: ${id} · repo ${slug}\` (Owner rules in chat, review-loop.md), wait for the owner's answer, and pass all of it as --owner-quote`);
+    const asked = { repo: slug, pr: prNum, id, quote: ownerQuote, decision };
+    if (!ownerRuled({ ...asked, contentOf: contentOfState(state) })) {
+      const again = `ask again: end the reply with the line \`pipeline triage ruling-request --pr ${prNum} --ids ${id}\` prints (Owner rules in chat, review-loop.md), wait for the owner's answer, and pass all of it as --owner-quote`;
+      // #110: the owner's answer exists but is bound to other text (or to none): say which.
+      const gap = ownerRulingGap(asked);
+      if (gap === 'no-content') return refuse(`the owner's ruling for ${slug} #${prNum} ${id} was asked with the old ruling line, which has no content digest, so it approves nothing; ${again}`);
+      if (gap === 'changed') return refuse(`the finding text of ${id} (or of another item asked in the same request, or an item is gone) changed since the owner was asked, so the recorded ruling no longer applies; ${again}`);
+      return refuse(`no owner ruling is recorded for ${slug} #${prNum} ${id} whose whole answer is --owner-quote and says ${decision.toLowerCase()} (an answer naming several decisions must also name ${id}): ${again}`);
     }
     const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });
     saveState(root, updateItems(state, n, [ruled]));
@@ -300,7 +310,42 @@ async function ownerRuling(rest, ctx) {
   }, pr));
 }
 
-const SUBCOMMANDS = { validate, settle, 'light-lane': lightLane, 'owner-ruling': ownerRuling };
+// #110: the digest of the findings the owner is asked about, for the items of the current review state (case-insensitive ids), or null when
+// any is missing. owner-ruling hands it to ownerRuled, which calls it with the recorded request's FULL id list.
+function itemsFor(state, ids) {
+  const all = (state.rounds ?? []).flatMap((r) => r.items ?? []);
+  const found = ids.map((id) => all.find((i) => String(i.id).toUpperCase() === String(id).toUpperCase()));
+  return found.every(Boolean) ? found : null;
+}
+const contentOfState = (state) => (ids) => {
+  const items = itemsFor(state, ids);
+  return items ? rulingContentDigest(items) : null;
+};
+
+// The line that ends the reply asking the owner to rule: the CLI writes it, so the agent cannot state a digest of its own choosing.
+async function rulingRequest(rest, ctx) {
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, ids: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const pr = intOption(values, 'pr', { required: true, min: 1 });
+  const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean).map((id) => id.toUpperCase()))]; // (R1-B1 and r1-b1 are one item)
+  if (ids.length === 0) throw new UsageError('--ids must name at least one item');
+  const root = resolveRepo(values, ctx);
+  const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, reason } });
+  const gh = createGitHub({ cwd: root, env: ctx.env });
+  return guardGh(() => withStateLock(root, ctx, () => {
+    const state = requireState(root);
+    if (state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`);
+    const items = itemsFor(state, ids);
+    if (items === null) {
+      const missing = ids.filter((id) => itemsFor(state, [id]) === null);
+      return refuse(`no item ${missing.join(', ')} in the review state`);
+    }
+    const { slug, host } = gh.repo();
+    if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded ruling names a repository on github.com`);
+    return { exitCode: EXIT.OK, output: { ok: true, line: `⚖️ Owner ruling needed #${pr}: ${items.map((i) => i.id).join(', ')} · content ${rulingContentDigest(items)} · repo ${slug}` } };
+  }, pr));
+}
+
+const SUBCOMMANDS = { validate, settle, 'light-lane': lightLane, 'owner-ruling': ownerRuling, 'ruling-request': rulingRequest };
 
 export const run = guarded(async (argv, ctx) => {
   const [sub, ...rest] = argv;

@@ -34,7 +34,8 @@ function said(t, prompt, reply, recorder) {
 export const mergeRequest = (pr, head, items, repo = 'acme/widgets') => `Owner items listed above.\nHead ${head.slice(0, 12)} · items ${items}${repo === null ? '' : ` · repo ${repo}`}\n🔀 Ready to merge #${pr} — say "merge"`;
 
 // A reply that asks the owner to rule on review items, as the ship skill ends it (review-loop.md, Owner rules in chat).
-export const rulingRequest = (pr, ids, repo = 'acme/widgets') => `R1-B1 is waiting for your decision.\n⚖️ Owner ruling needed #${pr}: ${ids.join(', ')} · repo ${repo}`;
+// #110: the line carries the content digest `P triage ruling-request` prints (a placeholder unless a test passes the real one).
+export const rulingRequest = (pr, ids, repo = 'acme/widgets', content = 'c0ffee000000') => `R1-B1 is waiting for your decision.\n⚖️ Owner ruling needed #${pr}: ${ids.join(', ')}${content === null ? '' : ` · content ${content}`} · repo ${repo}`;
 
 // The flags P merge takes for it.
 export const approvalFlags = (head, items) => ['--owner-approved-head', head, '--owner-approved-items', items];

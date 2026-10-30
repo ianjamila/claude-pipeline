@@ -1,6 +1,6 @@
 ---
 name: pipeline-setup
-description: Use when the user says "set up the pipeline", "onboard this repo", "add the agent pipeline", "make this repo shippable by agents", or when ship/verify finds no .claude/pipeline.yml. Audits the repo read-only, then creates everything the global ship/verify pipeline needs — .claude/pipeline.yml, scripts/verify with --quick and a JSON report, missing test tooling (Vitest, Playwright, pgTAP for Supabase), tamper-proof CI guard checks (test integrity + hard-stop scan), CODEOWNERS, a Stop hook running quick verify, a permission allowlist, CLAUDE.md rules, labels — and branch protection via gh api.
+description: Use when the user says "set up the pipeline", "onboard this repo", "add the agent pipeline", "make this repo shippable by agents", or when review/verify finds no .claude/pipeline.yml. Audits the repo read-only, then creates everything the global review/verify pipeline needs — .claude/pipeline.yml, scripts/verify with --quick and a JSON report, missing test tooling (Vitest, Playwright, pgTAP for Supabase), tamper-proof CI guard checks (test integrity + hard-stop scan), CODEOWNERS, a permission allowlist, CLAUDE.md rules, labels — and branch protection via gh api.
 when_to_use: Onboarding any git repo (any stack) to the autonomous pipeline, re-running setup after the stack changed, or repairing drift reported by `pipeline vendor --check` / `pipeline preflight`.
 ---
 
@@ -72,9 +72,9 @@ them unless you set `ci.guard_checks: false`, only for a repo that does not run 
 `ci.approvers` (GitHub logins whose approval labels count: REQUIRED when the repo is owned by an
 organization, otherwise every approval fails closed with `org-repo-needs-ci.approvers`; ask the owner for
 the logins); preview (environment name in GitHub
-deployments + smoke command); production (URL, provider, read-only smoke, rollback command (documentation only: prod-watch runs
-`vercel rollback <known-good> --yes --timeout 3m` itself for provider `vercel`) + notes; `watch: workflow` only when a CI workflow of the project
-posts the production smoke result on the merged PR, default `session`); `smoke_checks` (GET-only, unauthenticated); `risk.high_risk_paths`; `hard_stops.paths` /
+deployments + smoke command); production (URL, provider, read-only smoke, rollback command (documentation only: the pipeline no longer watches production
+or rolls back) + notes; `watch: workflow` only when a CI workflow of the project
+posts the production smoke result on the merged PR); `smoke_checks` (GET-only, unauthenticated); `risk.high_risk_paths`; `hard_stops.paths` /
 `patterns` / `auth_calls` (project extras on top of the universal list); `hard_stops.disable_rules: [R6-sensitive]` only when
 sensitive-data words are routine for the domain (an HR/payroll/medical app; nothing else can be switched off — ask the owner
 first); `hard_stops.report_only_rules` / `report_only_paths` downgrade non-database rules to report-only (listed, never blocking, no
@@ -98,8 +98,8 @@ Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard cont
 
 ### e. Test-integrity + hard-stop checks
 
-`P vendor --repo .` copies `ci-guard`, `ci-guards-run`, `stop-verify`, `smoke` and `supabase-local`
-(plus `lib/`, `vendor/js-yaml.mjs` and a `VERSION` file) into `scripts/pipeline/`, and appends
+`P vendor --repo .` copies `ci-guard`, `ci-guards-run`, `smoke` and `supabase-local`
+(plus `lib/`, `vendor/js-yaml.mjs` and a `VERSION` file) into `scripts/pipeline/` (and removes a `stop-verify.mjs` an earlier vendor left there), and appends
 `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to `.gitattributes` so a Windows checkout cannot
 rewrite them (commit that file; `P vendor --repo . --check` reports drift and warns when the lines are
 missing). The `VERSION` file holds the stamp of the pipeline that ran `vendor` (`<base>+<sha7>`, with
@@ -118,16 +118,15 @@ branch protection.
 
 ### g. `.claude/settings.json`
 
-Merge `templates/settings.json`: the Stop hook (`node "${CLAUDE_PROJECT_DIR:-.}/scripts/pipeline/stop-verify.mjs"`,
-timeout 900: it resolves the script from the project dir, so a session opened in a subdirectory still
-runs it, and the script finds the repo root with git itself) and the permission allowlist for the
-commands ship runs (pipeline CLI, verify, `gh pr create|edit|ready|checks|update-branch`, `git push|pull|
+Merge `templates/settings.json`: the permission allowlist for the
+commands the review skill runs (pipeline CLI, verify, `gh pr create|edit|ready|checks|update-branch`, `git push|pull|
 fetch|add|commit|worktree`…; nothing that merges or edits protection). Keep existing keys. Never add
-`--dangerously-skip-permissions` or `bypassPermissions`.
+`--dangerously-skip-permissions` or `bypassPermissions`. If the repo's `.claude/settings.json` (or `settings.local.json`) still has a Stop hook
+that runs `stop-verify` (an older onboarding), remove that entry: vendor deletes the script and warns, but never edits the settings.
 
 ### h. CLAUDE.md
 
-Insert `templates/CLAUDE-block.md` (all work through `ship` unless the user opts out; never push
+Insert `templates/CLAUDE-block.md` (all work through `review` unless the user opts out; never push
 to main; never claim done without verify evidence; agents never apply migrations or touch
 production data; hard-stop PRs wait for the owner's `human-approved`). Respect any structure
 checker the repo has for CLAUDE.md.

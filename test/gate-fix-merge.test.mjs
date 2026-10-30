@@ -138,7 +138,7 @@ test('7 merge: with nothing changed the extra read does not get in the way', () 
 
 // ---- 11. MERGED but no merge SHA --------------------------------------------------------------------------------------
 
-test('11 merge: a MERGED PR with no readable merge commit is exit 0, merged:true, mergeSha:null and a warning (prod-watch resolves the SHA)', () => {
+test('11 merge: a MERGED PR with no readable merge commit is exit 0, merged:true, mergeSha:null and a warning', () => {
   const s = scenario({ gh: { mergeView: { state: 'MERGED', mergeCommit: null } } });
   assert.equal(s.gate().code, 0);
   const r = s.merge({ PIPELINE_MERGE_POLL_MS: '10' });

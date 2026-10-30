@@ -649,7 +649,7 @@ function normaliseDiff(text) {
 // are anchored at the repo root so cwd cannot narrow what is hashed.
 // The diff is read as ONE string, so the cap is what a JS string can hold (V8: 2^29-24 chars, and a char is at least one
 // byte): 512 MiB. The default 64 MiB cap killed git with SIGKILL on a real 174 MB PR diff (a regenerated data file), which
-// made the gate and `P inbox` fail for exactly the PRs that most need a look. Past 512 MiB it fails loudly, never truncates.
+// made the gate fail for exactly the PRs that most need a look. Past 512 MiB it fails loudly, never truncates.
 export const DIFF_MAX_BYTES = 512 * 1024 * 1024;
 
 export function contentHash(base, head, { exclude = [], maxBuffer = DIFF_MAX_BYTES, ...o } = {}) {
@@ -702,7 +702,7 @@ export function reviewBaseRef(branch, o) {
 //
 // `head` (default 'HEAD') and `baseSha` (default: the resolved review base ref) let a caller hash an arbitrary commit
 // that is only present as objects (a PR head fetched, not checked out) against an explicit base; this stays the one
-// definition, so `ship inbox` / `ship resume` agree byte for byte with the review loop and the final gate.
+// definition, so every caller agrees byte for byte with the review loop and the final gate.
 export function reviewContentHash({ branch, agentLog, head = 'HEAD', baseSha } = {}, o) {
   return contentHash(baseSha ?? reviewBaseRef(branch, o), head, { ...o, exclude: agentLog ? [agentLog] : [] });
 }
@@ -731,12 +731,23 @@ function digestEntry(abs) {
   return sha256OfFile(abs);
 }
 
+// The precondition of `asHead`: a real commit (a tree or blob id would also satisfy `<id>^{tree}`) whose tree is HEAD's. Without it
+// the result would bind a verify report to bytes it never saw, so refuse here whatever the caller checked before.
+function assertSameTree(asHead, o) {
+  const treeOf = (rev) => revParse(`${rev}^{tree}`, o); // revParse refuses a rev that starts with `-`
+  revParse(`${asHead}^{commit}`, o);
+  if (treeOf(asHead) !== treeOf('HEAD')) {
+    throw new GitError({ args: ['treeFingerprint', asHead], code: 1, stderr: `${asHead} has a different tree than HEAD; asHead needs an equal-tree commit` });
+  }
+}
+
 // sha256 of HEAD + every tracked change vs HEAD (staged or not) + every untracked, non-ignored file with its bytes.
 // Equal fingerprints mean the same tree; a verify report that carries one is bound to exactly that tree.
 // `asHead` (the final gate only): the fingerprint this same working tree would have had with HEAD at that commit instead. It is
 // only meaningful when `<asHead>^{tree}` is HEAD's tree: then `git diff <asHead>` and `git diff HEAD` are byte-identical (same
 // blobs, same ids), so the result is exactly what verify recorded on a clean checkout of asHead with these untracked files.
 export function treeFingerprint(o, { asHead = null } = {}) {
+  if (asHead !== null) assertSameTree(asHead, o);
   const hash = createHash('sha256');
   hash.update(asHead ?? headSha(o));
   hash.update('\0');

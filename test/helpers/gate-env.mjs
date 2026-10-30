@@ -1,5 +1,5 @@
 // Shared scaffolding for the cli-gate*.test.mjs files: a real git repo holding a PR branch with a full evidence trail
-// (verify report, review state, preview smoke) plus a scripted fake gh, and a runner for the real CLI. Every option of
+// (verify report, review state) plus a scripted fake gh, and a runner for the real CLI. Every option of
 // `scenario` breaks exactly one thing, so a failing final-gate check names the check that caught it. The suite is
 // split over several files only so node runs them in parallel: each CLI call costs about a second.
 import { strict as assert } from 'node:assert';
@@ -26,7 +26,7 @@ export const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
 // running this inside a pipeline session cannot change the outcome.
 export function cli(args, { dir, fake, env = {} }) {
   // PIPELINE_MERGEABLE_PAUSE_MS shortens the 2 s wait between `mergeable: UNKNOWN` re-reads (it can never lengthen it).
-  const base = { ...process.env, PIPELINE_NOTIFY: 'off', PIPELINE_MERGEABLE_PAUSE_MS: '1', ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
+  const base = { ...process.env, PIPELINE_MERGEABLE_PAUSE_MS: '1', ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
   for (const k of ['PIPELINE_OFF', 'PIPELINE_ADMIN', 'PIPELINE_MERGE_WAIT_MS', 'PIPELINE_MERGE_POLL_MS']) if (!(k in env)) delete base[k];
   const r = spawnSync(process.execPath, [bin, ...args], { cwd: dir, env: base, encoding: 'utf8', timeout: 120_000 });
   let json = null;
@@ -75,20 +75,6 @@ export function reviewState(hash, { pending = false } = {}) {
   return s;
 }
 
-export const PREVIEW_URL = 'https://pr-12.example.test';
-
-// GitHub deployments for the PR head in the Preview environment. `previewDeploy`: undefined = no entries (the gh fake
-// then errors on the lookup), null = GitHub reports no deployment, object = {url, sha?, state?, id?}.
-function previewDeployEntries(o) {
-  if (o.previewDeploy === undefined) return [];
-  if (o.previewDeploy === null) return [{ match: 'deployments\\?.*sha=', stdoutJson: [] }];
-  const d = o.previewDeploy;
-  return [
-    { match: 'deployments/901/statuses', stdoutJson: [{ state: d.state ?? 'success', environment_url: d.url }] },
-    { match: 'deployments\\?.*sha=', stdoutJson: [{ id: 901, sha: d.sha ?? o.prHead, environment: 'Preview', created_at: '2026-10-01T00:00:00Z' }] },
-  ];
-}
-
 const UPDATE_REPLIES = {
   accepted: { match: 'pulls/12/update-branch', stdoutJson: { message: 'Updating pull request branch.', url: 'https://github.com/acme/widgets/pull/12' } },
   conflict: { match: 'pulls/12/update-branch', code: 1, stderr: 'gh: merge conflict between base and head (HTTP 422)', stdoutJson: { message: 'merge conflict between base and head', status: '422' } },
@@ -108,7 +94,6 @@ export function ghEntries(o) {
   const ci = o.ci ?? [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }];
   return [
     ...(typeof o.extra === 'function' ? o.extra(o) : (o.extra ?? [])),
-    ...previewDeployEntries(o),
     { match: '^pr view 12 --json state,headRefOid', stdoutJson: pr },
     // The run record merge / update-branch keep in the summary comment: no comment yet, and writing one succeeds.
     { match: '^pr view 12 --json headRefOid,headRefName,baseRefName', stdoutJson: { headRefOid: o.prHead, headRefName: 'agent/feature', baseRefName: o.base ?? 'main' } },
@@ -170,9 +155,8 @@ export function scenario(opts = {}) {
     repo.write('.verify/report.json', JSON.stringify(report, null, 2));
   }
   opts.afterReport?.(repo);
-  if (opts.previewSmoke !== undefined) repo.write('.review/preview-smoke.json', JSON.stringify(opts.previewSmoke(head)));
 
-  const fake = createFakeGh(ghEntries({ prHead: head, ...(opts.preview ? { previewDeploy: { url: PREVIEW_URL } } : {}), ...opts.gh }));
+  const fake = createFakeGh(ghEntries({ prHead: head, ...opts.gh }));
   const env = opts.env ?? {};
   const s = {
     repo, fake, head, hash, env,

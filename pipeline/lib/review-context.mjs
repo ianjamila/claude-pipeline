@@ -58,7 +58,7 @@ export function readFileOrFail(file, what) {
 // ---- locking --------------------------------------------------------------------------------
 
 // Every command that reads-modifies-writes .review/state.json holds this lock for the whole read-modify-write, so two
-// sessions (a ship loop and a person with a terminal, two ship loops on one PR) cannot lose each other's update.
+// sessions (a review run and a person with a terminal, two review runs on one PR) cannot lose each other's update.
 // One lock per repository checkout and PR. The lock directory is ~/.claude/pipeline-state/locks unless
 // PIPELINE_LOCK_DIR says otherwise (tests); PIPELINE_LOCK_WAIT_MS shortens the wait (tests).
 export const LOCK_WAIT_MS = 2 * 60 * 1000;

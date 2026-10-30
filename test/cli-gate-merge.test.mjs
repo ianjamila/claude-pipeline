@@ -127,9 +127,8 @@ test('merge: runs the configured command with the approved pr and head, then exi
   assertExit(s.gate(), 0);
   const r = s.merge();
   assertExit(r, 0);
-  assert.deepEqual(r.json, { ok: true, merged: true, mergeSha: MERGE_SHA, prodBefore: null });
+  assert.deepEqual(r.json, { ok: true, merged: true, mergeSha: MERGE_SHA });
   assert.deepEqual(s.mergeCalls(), [`${PR} ${s.head}`]);
-  assert.equal(existsSync(join(s.repo.dir, '.review', 'prod-before.json')), false, 'no production configured, nothing to record');
   assert.ok(!s.fake.lines().some((l) => l.includes('--disable-auto')));
 });
 
@@ -193,45 +192,19 @@ test('merge: a PR closed without merging while waiting fails', () => {
   assert.match(r.json.reason, /closed without merging/);
 });
 
-test('merge: with production configured the known-good deployment is recorded BEFORE the merge command runs', () => {
-  const deployments = [
-    { match: 'deployments/7/statuses', stdoutJson: [{ state: 'success', environment_url: 'https://prod-7.example.test' }] },
-    { match: 'deployments\\?.*environment=Production', stdoutJson: [{ id: 7, sha: 'b'.repeat(40), created_at: '2026-10-01T00:00:00Z' }] },
-  ];
-  const s = scenario({ production: true, gh: { extra: deployments } });
+test('merge: with production configured it merges without any deployments call and writes no prod-before record', () => {
+  // a deployments lookup that would fail (or find nothing) used to refuse the merge with exit 3: it is never made now
+  const s = scenario({ production: true, gh: { extra: [{ match: 'deployments', code: 1, stderr: 'HTTP 500' }] } });
   assertExit(s.gate(), 0);
   const r = s.merge();
   assertExit(r, 0);
-  const rec = JSON.parse(readFileSync(join(s.repo.dir, '.review', 'prod-before.json'), 'utf8'));
-  assert.equal(rec.id, 7);
-  assert.equal(rec.sha, 'b'.repeat(40));
-  assert.equal(rec.url, 'https://prod-7.example.test');
-  assert.equal(rec.environment, 'Production');
-  assert.deepEqual(r.json.prodBefore, { id: 7, sha: 'b'.repeat(40), url: 'https://prod-7.example.test' });
+  assert.deepEqual(r.json, { ok: true, merged: true, mergeSha: MERGE_SHA });
+  assert.deepEqual(s.mergeCalls(), [`${PR} ${s.head}`]);
+  assert.equal(existsSync(join(s.repo.dir, '.review', 'prod-before.json')), false);
   const lines = s.fake.lines();
-  const lookedUp = lines.findIndex((l) => /deployments\?/.test(l));
-  assert.ok(lookedUp >= 0, 'deployments were queried');
-  assert.ok(Date.parse(rec.at) <= Date.now());
+  assert.equal(lines.some((l) => /deployments/.test(l)), false, lines.join('\n'));
+  assert.equal(lines.some((l) => /prod-before/.test(l)), false, 'no prod-before event comment either');
 });
-
-test('merge: production configured but no known-good deployment found refuses (exit 3); an unreachable deployments API refuses too', () => {
-  const none = scenario({ production: true, gh: { extra: [{ match: 'deployments\\?', stdoutJson: [] }] } });
-  assertExit(none.gate(), 0);
-  const refused = none.merge();
-  assertExit(refused, 3, 'no rollback target means no merge');
-  assert.equal(refused.json.ok, false);
-  assert.equal(refused.json.merged, false);
-  assert.match(refused.json.reason, /known-good production deployment not found/);
-  assert.deepEqual(none.mergeCalls(), []);
-  assert.equal(existsSync(join(none.repo.dir, '.review', 'prod-before.json')), false);
-
-  const down = scenario({ production: true, gh: { extra: [{ match: 'deployments\\?', code: 1, stderr: 'HTTP 500' }] } });
-  assertExit(down.gate(), 0);
-  const r = down.merge();
-  assertExit(r, 3, 'without the rollback target the merge must not proceed');
-  assert.deepEqual(down.mergeCalls(), []);
-});
-
 
 // ---- merge re-runs the whole gate live (reviewer finding 1) ----------------------------------------
 
@@ -281,13 +254,13 @@ test('merge: a gate that lacks any canonical check, or carries an unknown one, i
   attempt('a duplicated check', (g) => { g.checks.push({ ...g.checks[0] }); }, /more than once/);
 });
 
-test('merge: with preview configured the gate must carry a preview check', () => {
-  const s = scenario({ preview: true, previewSmoke: (head) => ({ ok: true, sha: head, url: 'https://pr-12.example.test' }) });
+test('merge: with preview configured the gate carries no preview check, and a gate that does is refused as unexpected', () => {
+  const s = scenario({ preview: true });
   assertExit(s.gate(), 0);
-  s.editGate((g) => { g.checks = g.checks.filter((c) => c.name !== 'preview'); });
+  s.editGate((g) => { g.checks.push({ name: 'preview', ok: true, detail: '' }); });
   const r = s.merge();
   assertExit(r, 1);
-  assert.match(r.json.reasons.join(), /missing canonical check\(s\): preview/);
+  assert.match(r.json.reasons.join(), /unexpected check\(s\): preview/);
   assert.deepEqual(s.mergeCalls(), []);
 });
 
@@ -301,21 +274,6 @@ test('merge: a gate with no repo, or another repo, is refused', () => {
   s.editGate((g) => { g.repo = null; });
   assert.match(s.merge().json.reasons.join(), /records no repo/);
   assert.deepEqual(s.mergeCalls(), []);
-});
-
-test('merge: the live gate runs AFTER the production lookup and right before the merge command', () => {
-  const deployments = [
-    { match: 'deployments/7/statuses', stdoutJson: [{ state: 'success', environment_url: 'https://prod-7.example.test' }] },
-    { match: 'deployments\\?.*environment=Production', stdoutJson: [{ id: 7, sha: 'b'.repeat(40), created_at: '2026-10-01T00:00:00Z' }] },
-  ];
-  const s = scenario({ production: true, gh: { extra: deployments } });
-  assertExit(s.gate(), 0);
-  const before = s.fake.lines().length;
-  assertExit(s.merge(), 0);
-  const lines = s.fake.lines().slice(before);
-  const lookup = lines.findIndex((l) => /deployments\?/.test(l));
-  const lastCiRead = lines.map((l, i) => (l.startsWith('pr checks 12') ? i : -1)).filter((i) => i >= 0).at(-1);
-  assert.ok(lookup >= 0 && lastCiRead > lookup, `production lookup at ${lookup}, last CI read at ${lastCiRead}`);
 });
 
 // ---- the wait: blockers that appear while auto-merge is queued (reviewer finding 6) ----------------

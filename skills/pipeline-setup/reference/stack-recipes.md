@@ -21,10 +21,9 @@ may carry a `skipIf` in `verify.mjs` (full mode only; it must fail closed); list
 the skipped report.
 
 Preview: GitHub deployments environment `Preview`; production: provider `vercel`. On a failed production
-smoke `pipeline prod-watch` itself runs the Vercel CLI (`vercel rollback <known-good> --yes --timeout 3m`, where
-`<known-good>` is the deployment production served before the merge); it never executes
-`production.rollback.command`. That key is still required by validation: write the equivalent manual command
-(`vercel rollback <known-good> --yes`) as documentation for humans. After a rollback Vercel stops auto-assigning
+smoke the pipeline no longer watches production or rolls back; `production.rollback.command` is documentation only,
+but validation still requires the key: write the manual command (`vercel rollback <known-good> --yes`, where
+`<known-good>` is the deployment production served before the merge) for humans. After a rollback Vercel stops auto-assigning
 production domains until a deployment is promoted.
 
 ## Plain Node / TypeScript library

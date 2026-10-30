@@ -28,6 +28,9 @@ import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultRe
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
+const MAX_ALIAS_LOOKUPS = 20_000; // (#111: distinct words x directories the line may be in; above it the text is refused like an over-long one, so the stats stay bounded)
+const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its rounds whose inodes are collected, so a hard link to a protected one is known; past it collection STOPS silently, so a hard link to a file beyond the cap is not seen: a documented residual, not a fail-closed. Which files fall past it depends on listing order. Depth: the protected names directly in .review, and a round folder's entries two levels down)
+const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
 const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|prod-before|[\w.-]*smoke)/i;
@@ -35,7 +38,8 @@ const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|inst
 // ---- the protected set ------------------------------------------------------------------------
 
 const PROTECTED_REL = [
-  '.claude/skills/ship',
+  '.claude/skills/ship', // (retired: the review skill replaces it; kept protected for installs that still have it)
+  '.claude/skills/review',
   '.claude/skills/verify',
   '.claude/skills/pipeline-setup',
   '.claude/agents/implementer.md',
@@ -244,8 +248,130 @@ function makeCtx(opts) {
   const pipelineHit = (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); };
   const pipelineAncestor = (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); };
   let rootIds = null;
+  // #111: a symlink (or any other spelling) of the cwd's review folder. dev:ino of <cwd>/.review and of each existing
+  // <cwd>/.review/round-*; none when the folder is missing (no error). NOT added to rootIds: hitInode walks the ancestors of a
+  // target, so that would protect every child of .review (hardstops.json and other scratch files must stay writable).
+  let reviewIds = null;
+  const reviewFolders = () => {
+    if (reviewIds !== null) return reviewIds;
+    const dir = api.statId(pathsFor().join(cwd, '.review'));
+    const rounds = new Set();
+    // (#111 Fable: dev:ino of the protected FILES themselves: a hard link to one is the same file under a name the path rules cannot see. The
+    // protected names directly in .review, and every file in a round folder one level down and two: bounded, POSIX-only like the rest.)
+    const files = new Set();
+    if (dir !== null) {
+      const readDir = opts.readDir ?? defaultReadDir;
+      const names = readDir(pathsFor().join(cwd, '.review'));
+      let budget = MAX_REVIEW_FILE_IDS;
+      const addFiles = (d, depth) => {
+        const kids = readDir(d);
+        if (!Array.isArray(kids)) return;
+        for (const k of kids) {
+          if (budget-- <= 0) return;
+          const kp = pathsFor().join(d, k);
+          const id = api.statId(kp);
+          if (id !== null) files.add(id);
+          if (depth < 2) addFiles(kp, depth + 1);
+        }
+      };
+      if (Array.isArray(names)) {
+        for (const n of names) {
+          const np = pathsFor().join(cwd, '.review', n);
+          if (/^round-\d+$/.test(n)) { const id = api.statId(np); if (id !== null) { rounds.add(id); addFiles(np, 1); } } else if (reviewFile.test(`.review/${n}`)) { const id = api.statId(np); if (id !== null) files.add(id); }
+        }
+      }
+    }
+    reviewIds = { dir, rounds, files };
+    return reviewIds;
+  };
+  // Is `p` a protected review file reached through another name for the folder? (a) its parent directory IS <cwd>/.review and its
+  // basename is a protected name (REVIEW_FILE_SRC): the protected-NAME rule, so scratch files in .review stay writable; (b) it is, or
+  // lies under, an existing round-* folder (everything in a round is protected); (c) withDir: it IS <cwd>/.review itself under a name
+  // that is not `.review` (a program that chdirs there, or builds a name below it, writes a protected file the text never names); (d) the
+  // path is itself the same file (dev:ino) as a protected file of the folder or a round: a hard link or file symlink under another name.
+  // Closed since the first cut: a glob through a link (hitReviewGlob), a link target built by a command substitution (linkReachesProtected),
+  // a hard link to a protected file (d). Closed in the final round: a brace list / range into a protected name, link names with `,` `=`, `..` after a link, big directory globs. Residuals: a link the judged program makes itself does not exist yet when the hook looks, so no stat can see it; a hard link to a file past MAX_REVIEW_FILE_IDS; and only the
+  // cwd's own <cwd>/.review is known, so a session whose cwd is a subdirectory of the checkout is not covered. The alias / inode check
+  // is POSIX-only, like the protected-root inode check above: on win32 statId is null and nothing here fires (Windows behaviour unchanged).
+  const statCache = new Map(); // (one evaluation: the same ancestors come up for every word of a long line)
+  const stat = (p) => {
+    if (statCache.has(p)) return statCache.get(p);
+    const id = api.statId(p);
+    statCache.set(p, id);
+    return id;
+  };
+  const hitReviewInode = (p, withDir = false) => {
+    const { dir, rounds, files } = reviewFolders();
+    if (dir === null) return false;
+    const P = pathsFor();
+    if (files.size > 0) { const own = stat(p); if (own !== null && files.has(own)) return true; } // (a hard link to a protected file, or a link to one)
+    const base = P.basename(p);
+    if (reviewFile.test(`.review/${base}`) && stat(P.dirname(p)) === dir) return true;
+    if (withDir && (ci ? base.toLowerCase() : base) !== '.review' && stat(p) === dir) return true;
+    if (rounds.size === 0) return false;
+    let cur = p;
+    for (let i = 0; i < 64; i++) {
+      const id = stat(cur);
+      if (id !== null && rounds.has(id)) return true;
+      const parent = P.dirname(cur);
+      if (parent === cur) return false;
+      cur = parent;
+    }
+    return false;
+  };
+  // #111 (Fable): can the glob write target `g` (an absolute, normalised path with wildcards) reach a protected review file through another
+  // name for the folder? Its literal directory prefix is looked up (hitReviewInode); a wildcard in the LAST name must be able to match a
+  // protected name when the prefix is the review folder (a round folder: anything), and a wildcard in a DIRECTORY name is expanded
+  // against the real listing of the literal parent, each matching entry (a link to the folder included) judged with the rest of the glob.
+  // Fail closed: `**` (any depth), a listing that failed or is over the entry cap, and more candidates than the work cap are hits; a
+  // parent that does not exist holds nothing. With no review folder nothing is looked up.
+  const MAX_GLOB_CANDIDATES = 4000; // (= the entry cap of one listing below: a big directory of packages is no hit by its size alone)
+  const hitReviewGlob = (g) => {
+    if (reviewFolders().dir === null) return false;
+    let work = 0;
+    const walk = (glob, depth) => {
+      const P = pathsFor();
+      const segs = glob.split('/');
+      const at = segs.findIndex((s) => /[*?[]/.test(s));
+      if (at < 0) return hitReviewInode(glob, true);
+      const prefix = segs.slice(0, at).join('/') || '/';
+      if (segs[at] === '**' || segs.slice(at).includes('**') || depth > 8) return true;
+      const last = at === segs.length - 1;
+      if (last) {
+        const re = globToRe(segs[at], ci);
+        if (re === null) return true;
+        // (in a round folder anything is protected; in the review folder the glob must be able to match a protected name)
+        if (hitReviewInode(P.join(prefix, 'x')) || REVIEW_SAMPLES.some((n) => re.test(n) && hitReviewInode(P.join(prefix, n)))) return true;
+        // (Codex recheck: the samples are not every protected name (`staging-smoke.json`), and a hard link to a protected file can sit in any
+        // folder: the entries the glob really matches are judged one by one, each as a literal path)
+        const names = (opts.readDir ?? defaultReadDir)(prefix);
+        if (names === null) return false;
+        if (!Array.isArray(names) || names.length > 4000) return true;
+        for (const e of names) {
+          if (!re.test(e)) continue;
+          if (++work > MAX_GLOB_CANDIDATES) return true;
+          if (hitReviewInode(P.join(prefix, e))) return true;
+        }
+        return false;
+      }
+      const re = globToRe(segs[at], ci);
+      if (re === null) return true;
+      const entries = (opts.readDir ?? defaultReadDir)(prefix);
+      if (entries === null) return false;
+      if (!Array.isArray(entries) || entries.length > 4000) return true;
+      const rest = segs.slice(at + 1).join('/');
+      for (const e of [...entries, '.', '..']) {
+        if (!re.test(e)) continue;
+        if (++work > MAX_GLOB_CANDIDATES) return true;
+        if (walk(P.join(prefix, e, rest), depth + 1)) return true;
+      }
+      return false;
+    };
+    return walk(g, 0);
+  };
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
+    hitReviewGlob,
     user: opts.user ?? posix.basename(homePosix),
     selfZero: opts._selfZero ?? null, selfBash: opts._selfBash ?? null, selfAbs: opts._selfAbs === true, selfZsh: opts._selfZsh === true, // the judged script file's own path (its $0 unless it was sourced; BASH_SOURCE[0])
     parentFsChanged: opts._fsChanged === true, // (the calling line ran something before this script that may have changed which paths exist)
@@ -272,8 +398,11 @@ function makeCtx(opts) {
     unFirm,
     // Is `p`, or the nearest existing directory above it, the very same file or directory (same device and inode) as a
     // protected root? Catches hard links and any other spelling of the path that realpath does not unify.
+    hitReviewInode,
+    hasReviewDir: () => reviewFolders().dir !== null,
     hitInode: (p) => {
       if (rootIds === null) rootIds = new Set(roots.map((r) => api.statId(r)).filter(Boolean));
+      if (hitReviewInode(p)) return true;
       if (rootIds.size === 0) return false;
       let cur = p;
       for (let i = 0; i < 64; i++) {
@@ -333,6 +462,28 @@ function lexicalTarget(target, ctx) {
   return s.length > 1 && s.endsWith('/') ? s.slice(0, -1) : s;
 }
 
+// #111 (final round): the absolute path `p` (NOT normalised) with each `..` read as the physical parent: the directory a link points into, then its parent, not the directory the link sits in.
+// null when p has no `..`, is not POSIX-absolute (the inode check is POSIX-only) or nothing differs. Where a prefix does not exist (realpath fails) the lexical parent stands in.
+function physicalDots(p, api) {
+  if (!p.startsWith('/') || !/(?:^|\/)\.\.(?:\/|$)/.test(p)) return null;
+  let cur = '/';
+  for (const seg of p.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg !== '..') { cur = cur === '/' ? `/${seg}` : `${cur}/${seg}`; continue; }
+    let real = cur;
+    try { real = toPosix(api.realpath(cur)).replace(DEVICE_PREFIX, ''); } catch { /* missing prefix: the lexical parent */ }
+    cur = posix.dirname(real);
+  }
+  return cur;
+}
+// -> the extra candidates for a file-tool target: its `..` read physically (see physicalDots), and that path's real location
+function physicalTargets(target, ctx) {
+  let s = toPosix(expandHome(target, ctx.homeNative)).replace(DEVICE_PREFIX, '');
+  if (!isAbs(s)) s = `${ctx.cwd.replace(/\/$/, '')}/${s}`;
+  const phys = physicalDots(s, ctx.api);
+  return phys === null ? [] : [phys, realResolve(phys, ctx.api)];
+}
+
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
 const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go\.mjs$/i;
 
@@ -387,7 +538,7 @@ function evaluateMcp(tool, ti, input, opts) {
   const writeVerb = MCP_WRITE_VERB.test(last);
   const resolve = (t) => {
     const lexical = lexicalTarget(t, ctx);
-    return unique([lexical, realResolve(lexical, ctx.api)]);
+    return unique([lexical, realResolve(lexical, ctx.api), ...physicalTargets(t, ctx)]);
   };
   // 1. a file write: the path keys name the targets (an exact ancestor dir counts too)
   const targets = writeVerb ? f.paths.map((t) => ({ t, candidates: resolve(t) })) : [];
@@ -437,7 +588,7 @@ function evaluateFileToolUnchecked(input, opts = {}) {
 
   const resolved = targets.map((t) => {
     const lexical = lexicalTarget(t, ctx);
-    return { t, candidates: unique([lexical, realResolve(lexical, ctx.api)]) };
+    return { t, candidates: unique([lexical, realResolve(lexical, ctx.api), ...physicalTargets(t, ctx)]) };
   });
   for (const { t, candidates } of resolved) {
     if (candidates.some((c) => ctx.hit(c) || ctx.hitInode(c))) return deny(`${t} is a protected pipeline file (${PROTECTED_MSG})`);
@@ -552,21 +703,148 @@ function expandRefs(text, ctx) {
   return drivePaths && DRIVE_RELATIVE.test(e) ? `$DRIVE_RELATIVE_${e.slice(2)}` : e;
 }
 
+// #111 (final round): a range `{1..3}` / `{a..e}` / `{01..10..2}` is a brace form too (bash order, zero-padded when an end has a leading zero). Returns { list, over } (at most
+// BRACE_MAX words; over: it was cut), or null when the body is no range.
+const BRACE_MAX = 64;
+function braceRange(body) {
+  const out = [];
+  let over = false;
+  const push = (x) => { if (out.length >= BRACE_MAX) { over = true; return false; } out.push(x); return true; };
+  const num = /^(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?$/.exec(body);
+  if (num) {
+    const a = Number(num[1]);
+    const b = Number(num[2]);
+    const step = Math.abs(Number(num[3] ?? 1)) || 1;
+    const pad = /^-?0\d/.test(num[1]) || /^-?0\d/.test(num[2]) ? Math.max(num[1].replace('-', '').length, num[2].replace('-', '').length) : 0;
+    const dir = a <= b ? 1 : -1;
+    for (let n = a; dir > 0 ? n <= b : n >= b; n += dir * step) if (!push((n < 0 ? '-' : '') + String(Math.abs(n)).padStart(pad, '0'))) break;
+    return { list: out, over };
+  }
+  const chr = /^([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d+))?$/.exec(body);
+  if (!chr) return null;
+  const a = chr[1].charCodeAt(0);
+  const b = chr[2].charCodeAt(0);
+  const step = Math.abs(Number(chr[3] ?? 1)) || 1;
+  const dir = a <= b ? 1 : -1;
+  for (let n = a; dir > 0 ? n <= b : n >= b; n += dir * step) if (!push(String.fromCharCode(n))) break;
+  return { list: out, over };
+}
+
 // Expands the first `{a,b}` groups of each word so `~/.claude/{pipeline,settings.json}` shows both paths.
 // Above 5,000 characters the expansion is skipped and the scan is marked dynamic (callers fail closed).
+// #111 (final round): ranges expand too; an expansion cut by a cap sets ctx.braceOver (rawHitOne fails closed on it while a review folder exists).
 function braceExpand(s, ctx) {
-  if (!s.includes('{') || !s.includes(',')) return s;
+  if (!s.includes('{') || !(s.includes(',') || s.includes('..'))) return s;
   if (s.length > 5000) { ctx.dynamic = true; return s; }
-  let cur = s;
+  let cur = s.replace(/(?<!\$)\{([^{}\s,]+)\}/g, (m, body) => {
+    const r = braceRange(body);
+    if (!r) return m;
+    if (r.over) ctx.braceOver = true;
+    return r.list.length > 1 ? `{${r.list.join(',')}}` : r.list[0] ?? '';
+  });
   for (let round = 0; round < 4; round++) {
     let changed = false;
     cur = cur.replace(/(\S*?)\{([^{}\s]*,[^{}\s]*)\}(\S*)/g, (_m, pre, body, post) => {
       changed = true;
       return body.split(',').map((x) => pre + x + post).join(' ');
     });
+    if (cur.length > 50_000) ctx.braceOver = true;
     if (!changed || cur.length > 50_000) break;
   }
   return cur;
+}
+
+// One word with unquoted braces -> { list, over }: every expansion (nested, ranges), at most BRACE_MAX of them; over: the cap cut the list.
+function expandBraceWord(word) {
+  let over = false;
+  const go = (t) => {
+    for (let p = 0; p < t.length; p++) {
+      if (t[p] !== '{' || t[p - 1] === '$') continue;
+      let depth = 0;
+      let q = -1;
+      const commas = [];
+      for (let j = p; j < t.length; j++) {
+        if (t[j] === '{') depth++;
+        else if (t[j] === '}') { if (--depth === 0) { q = j; break; } } else if (t[j] === ',' && depth === 1) commas.push(j);
+      }
+      if (q < 0) continue;
+      let alts;
+      if (commas.length) {
+        const cuts = [p, ...commas, q];
+        alts = cuts.slice(0, -1).map((c, k) => t.slice(c + 1, cuts[k + 1]));
+      } else {
+        const r = braceRange(t.slice(p + 1, q));
+        if (!r) continue;
+        if (r.over) over = true;
+        alts = r.list;
+      }
+      const post = go(t.slice(q + 1));
+      const out = [];
+      for (const a of alts) {
+        for (const x of go(a)) {
+          for (const y of post) {
+            if (out.length >= BRACE_MAX) { over = true; return out; }
+            out.push(t.slice(0, p) + x + y);
+          }
+        }
+      }
+      return out;
+    }
+    return [t];
+  };
+  return { list: go(word), over };
+}
+
+// #111 (final round): the expansions of the UNQUOTED brace words of `raw` that can be a destination (a quoted brace is literal). The shell parser expands them too, but
+// `cp x .review/{state,y}.json` leaves it only `.review/y.json` as the destination word; this gives back every expansion so each can be judged as a target.
+// A braced word followed by a plain word is a source (the destination is the last word, or the -t value), and the words stop at the first redirection / separator.
+const BRACE_HIDE = { '{': '', '}': '', ',': '' };
+function braceWordsOf(raw) {
+  const toks = [];
+  let cur = '';
+  let q = '';
+  let brace = false;
+  let any = false;
+  const hide = (c) => BRACE_HIDE[c] ?? c;
+  const flush = () => {
+    if (any) toks.push({ text: cur, brace });
+    cur = '';
+    brace = false;
+    any = false;
+  };
+  scan: for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (q) {
+      if (c === q) q = '';
+      else if (q === '"' && c === '\\' && i + 1 < raw.length) cur += hide(raw[++i]);
+      else cur += hide(c);
+      continue;
+    }
+    if (c === '\\' && i + 1 < raw.length) { cur += hide(raw[++i]); any = true; continue; }
+    if (c === "'" || c === '"') { q = c; any = true; continue; }
+    if (/\s/.test(c)) { flush(); continue; }
+    if (/[<>|;&]/.test(c)) {
+      if (/[<>]/.test(c) && /^\d+$/.test(cur)) { cur = ''; any = false; } // (`2>/dev/null`: the fd number is part of the redirection, not a word)
+      break scan;
+    }
+    if (c === '#' && !any) break scan; // (a comment)
+    if (c === '{') brace = true;
+    cur += c;
+    any = true;
+  }
+  flush();
+  let over = false;
+  const words = [];
+  toks.forEach((t, k) => {
+    if (!t.brace) return;
+    const viaT = /^(?:-t|--target-directory=)/.test(t.text) || /^(?:-t|--target-directory)$/.test(toks[k - 1]?.text ?? '');
+    // (only a later word known to be non-empty makes it a source: `$E`, `$(…)` or `""` may expand to nothing and leave it the destination)
+    if (!viaT && toks.slice(k + 1).some((u) => u.text !== '' && !u.text.startsWith('-') && !/[$`]/.test(u.text))) return;
+    const r = expandBraceWord(t.text);
+    if (r.over) over = true;
+    if (r.list.length > 1 || r.list[0] !== t.text) for (const x of r.list) words.push(x.replace(//g, '{').replace(//g, '}').replace(//g, ','));
+  });
+  return { words, over };
 }
 
 // Several readings of `text` to look for protected paths in: as is, with string glue squashed ('+', ',' and '/'
@@ -740,10 +1018,38 @@ function makeMatchers(ctx) {
     }
     return rawHitOne(text, dirs) || rs.some((r) => rawHitOne(r, dirs));
   };
+  // #111: a path-like word of `text` that is another name for the cwd's review folder (or a protected file in it, or anything in a round):
+  // a program given such a path, or one that chdirs there, writes a protected file the text never names. Relative words are resolved
+  // against every directory the line may be in (the cwd and each cd target, outside the checkout too: `cd $T && cp x alias/state.json`,
+  // `cd $T && node -e "process.chdir('alias'); …"`). The directories are the line's own (at most 32, see collectDirs) and every stat is
+  // cached per evaluation, so this stays cheap; with no review folder nothing is looked up at all.
+  // A text over either cap (its length, or its distinct words times the directories) is not scanned word by word: with a review folder
+  // present it counts as a hit (fail closed; without one nothing can be reached).
+  // (the second pattern keeps `,` and `=`: a link may be named `a,b` or `a=b`; the first stays for `VAR=path` and `a,path` glue, so both readings are candidates)
+  const ALIAS_WORD = /[^\s'"`;|&<>(){}[\],=*?$]+/g;
+  const ALIAS_WORD_WIDE = /[^\s'"`;|&<>(){}[\]*?$]+/g;
+  const aliasInText = (v, dirs) => {
+    if (v.length > MAX_ALIAS_TEXT) return ctx.hasReviewDir();
+    const where = dirs?.length ? dirs : [ctx.cwd];
+    const words = new Set([...(v.match(ALIAS_WORD) ?? []), ...(v.match(ALIAS_WORD_WIDE) ?? [])]);
+    if (words.size * where.length > MAX_ALIAS_LOOKUPS) return ctx.hasReviewDir();
+    for (const word of words) {
+      if (!/[A-Za-z0-9]/.test(word)) continue;
+      const e = word === '~' || word.startsWith('~/') ? pathsFor().join(ctx.homePosix, word.slice(1)) : word;
+      for (const d of isAbs(e) ? [''] : where) {
+        if (ctx.hitReviewInode(isAbs(e) ? pathsFor().normalize(e) : pathsFor().join(d, e), true)) return true;
+        // (#111 final round: `link/../state.json` -- after a link, `..` is the PHYSICAL parent of what the link points to, which the lexical join above has already dropped)
+        if (/(?:^|\/)\.\.(?:\/|$)/.test(e)) { const phys = physicalDots(isAbs(e) ? e : `${d}/${e}`, ctx.api); if (phys !== null && ctx.hitReviewInode(phys, true)) return true; }
+      }
+    }
+    return false;
+  };
   const rawHitOne = (text, dirs) => {
     for (const v of refVariants(String(text), ctx)) {
+      if (ctx.braceOver === true && ctx.hasReviewDir()) return true; // (#111: a brace expansion cut by its cap may hide a protected name; fail closed with a review folder)
       if (rootRes.some((re) => re.test(v))) return true;
       if (reviewText.test(v)) return true; // (a repo's review state: protected wherever it is, so the name alone is the reference)
+      if (aliasInText(v, dirs)) return true;
       if (!(ctx.ci ? v.toLowerCase() : v).includes('.claude')) continue;
       if (suffix.nonlit.test(v)) return true;
       if (dirs) {
@@ -762,6 +1068,7 @@ function makeMatchers(ctx) {
     const lit = g.slice(0, g.lastIndexOf('/', star) + 1) || '/';
     if (ctx.hit(lit)) return true;
     if (reviewGlob(g)) return true;
+    if (ctx.hitReviewGlob(g)) return true; // (#111: the same glob through another name for the review folder)
     // a glob that can match a protected root or anything inside one (~/.claude/skills/*/SKILL.md, ~/.c*/pipeline/x) ...
     if (ctx.roots.some((r) => globReaches(g, r, ctx.ci))) return true;
     // ... or a directory that holds them (~/.cla*, ~/.claude/*)
@@ -1446,6 +1753,8 @@ function collectDirs(cmds, ctx, cdOnly = false) {
   for (const [ci, c] of cmds.entries()) {
     // commands that run relative to another directory: git -C DIR, tar -C DIR, unzip -d DIR, make -C DIR, cp -t DIR
     if (!cdOnly) for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
+    // (a wrapper's -C DIR / --chdir DIR, `env -C DIR cp x link/state.json`: the parser unwraps `env`, so the directory is on the command, not in its argv)
+    if (!cdOnly && typeof c.chdir === 'string') addDir(expandRefs(c.chdir, ctx));
     const cdName = baseOf(c.argv[0] ?? '');
     if (!CD_CMDS.has(cdName)) continue;
     let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
@@ -2146,7 +2455,7 @@ function changesClaudeCode(cmds, scanRaw) {
 
 // Test seams that swap the real gh / codex / vercel for a fake, or lift the model pins: handing one to the pipeline CLI
 // would let a fake satisfy the merge gate. (The installed CLI also ignores them; this is the hook side.)
-const SEAM_VARS = /^PIPELINE_(?:GH|CODEX|VERCEL|TEST_MODE|UPDATE_REMOTE)$/i;
+const SEAM_VARS = /^PIPELINE_(?:GH|CODEX|VERCEL|TEST_MODE|UPDATE_REMOTE|INSTALL_RETIRED_SKILLS)$/i;
 const RUNTIMES = new Set(['node', 'nodejs', 'bun', 'deno', 'npx', 'tsx']);
 
 function setsSeamForPipeline(cmds) {
@@ -2177,7 +2486,16 @@ function linkTargets(argv) {
 
 function linkReachesProtected(cmds, dirs, ctx) {
   for (const c of cmds) {
-    if (baseOf(c.argv[0] ?? '') !== 'ln') continue;
+    const prog = baseOf(c.argv[0] ?? '');
+    // #111 (Fable): a link whose TARGET is built by a command substitution (`ln -s "$(printf '.%s' review)" rv`) is never resolved, so it may be
+    // the review folder under a name no stat can see yet: with a review folder present it is refused (fail closed, also for a harmless
+    // `$(pwd)/x`: write the target out). ln, link and cp -s make such links; without a review folder nothing here changes.
+    const symCp = prog === 'cp' && c.argv.slice(1).some((x) => x === '--symbolic-link' || (/^-[A-Za-z]+$/.test(x) && x.includes('s')));
+    if ((prog === 'ln' || prog === 'link' || symCp) && ctx.hasReviewDir()) {
+      const hidden = linkTargets(c.argv).find((t) => /\$\(|`|<\(|>\(/.test(expandRefs(t, ctx)));
+      if (hidden !== undefined) return hidden;
+    }
+    if (prog !== 'ln') continue;
     for (const t of linkTargets(c.argv)) {
       const e = expandRefs(t, ctx);
       if (/[*?[]/.test(e)) continue; // a glob target is judged by the glob rules
@@ -2983,7 +3301,12 @@ function evaluateBashForFilesFrame(command, opts) {
     // (inline interpreter code that writes can build any name there)
     if (opts._writesOnly === true && (impliesCwdWrite(c) || (runsInlineCode(c, ctx) && WRITE_HINT.test(c.raw ?? c.argv.join(' '))))) return true;
     // (a destination word is never filtered: a writer may create a protected name that does not exist yet)
-    if (DEST_ONLY.has(name)) return destsOf(wordsOf(c), name).some(tokenHitAll);
+    if (DEST_ONLY.has(name)) {
+      if (destsOf(wordsOf(c), name).some(tokenHitAll)) return true;
+      // (#111: `cp x .review/{state,y}.json` -- the parser keeps only the last expansion as the destination, but a brace form is a family of targets: each expansion is judged as one)
+      const bw = braceWordsOf(rawOfCmd(c));
+      return (bw.over && ctx.hasReviewDir()) || bw.words.some(tokenHitAll);
+    }
     // (mkdir of a repo's .review folder itself only makes an empty folder, which holds nothing: see REVIEW_FILE_SRC)
     if (name === 'mkdir') return names(c, 'pipeline');
     return names(c) || (MOVERS.has(name) && destsOf(wordsOf(c), name).some(tokenHitAll));

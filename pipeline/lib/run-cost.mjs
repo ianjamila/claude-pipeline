@@ -1,4 +1,4 @@
-// Cost attribution for a `ship` run (issue #57 item 1): tokens and USD by phase and by role, plus how often the run
+// Cost attribution for a review run (issue #57 item 1): tokens and USD by phase and by role, plus how often the run
 // retried and how many times the guards denied one of its commands. It rides in the run record (`record.cost`), so
 // `P summary` can show it and old records simply lack it. Pure except `readGuardLog` (one file read). Display only:
 // nothing here may change what a command decides.

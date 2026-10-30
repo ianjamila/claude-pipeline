@@ -26,6 +26,7 @@ const inCheckout = { cwd: CHECKOUT, existsSync: (p) => p === GUARD_IN_CHECKOUT }
 test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form', () => {
   assert.deepEqual(protectedRoots('/home/u'), [
     '/home/u/.claude/skills/ship',
+    '/home/u/.claude/skills/review',
     '/home/u/.claude/skills/verify',
     '/home/u/.claude/skills/pipeline-setup',
     '/home/u/.claude/agents/implementer.md',
@@ -52,6 +53,8 @@ const FILE_DENY = [
   ['Edit repo settings.json adding disableAllHooks', 'Edit', { file_path: '/repo/.claude/settings.json', old_string: '{', new_string: '{"disableAllHooks":true,' }],
   ['Write a script exporting PIPELINE_ADMIN', 'Write', { file_path: '/tmp/x.sh', content: 'export PIPELINE_ADMIN=1\nclaude' }],
   ['Edit through a .. segment', 'Edit', { file_path: '/home/u/.claude/skills/ship/../ship/SKILL.md', old_string: 'a', new_string: 'b' }],
+  ['Edit review skill via ~', 'Edit', { file_path: '~/.claude/skills/review/SKILL.md', old_string: 'a', new_string: 'b' }],
+  ['Write review skill', 'Write', { file_path: '/home/u/.claude/skills/review/SKILL.md', content: 'x' }],
   ['Write pipeline-setup skill', 'Write', { file_path: '/home/u/.claude/skills/pipeline-setup/SKILL.md', content: 'x' }],
   ['Write the ship skill directory itself', 'Write', { file_path: '/home/u/.claude/skills/ship', content: 'x' }],
   ['relative path resolved against cwd', 'Edit', { file_path: '../home/u/.claude/pipeline/x', old_string: 'a', new_string: 'b' }, '/repo'],
@@ -75,6 +78,8 @@ const FILE_ALLOW = [
   ['repo settings without disableAllHooks', 'Write', { file_path: '/repo/.claude/settings.json', content: '{"permissions":{}}' }],
   ['global CLAUDE.md', 'Edit', { file_path: '/home/u/.claude/CLAUDE.md', old_string: 'a', new_string: 'b' }],
   ['memory file', 'Edit', { file_path: '/home/u/.claude/projects/-x/memory/a.md', old_string: 'a', new_string: 'b' }],
+  ['another skill under ~/.claude/skills', 'Write', { file_path: '/home/u/.claude/skills/other/SKILL.md', content: 'x' }],
+  ['prefix lookalike of the review skill', 'Edit', { file_path: '/home/u/.claude/skills/reviews/SKILL.md', old_string: 'a', new_string: 'b' }],
   ['prefix lookalike skill dir', 'Edit', { file_path: '/home/u/.claude/skills/shipping/SKILL.md', old_string: 'a', new_string: 'b' }],
   ['prefix lookalike pipeline dir', 'Write', { file_path: '/home/u/.claude/pipeline-notes/a.md', content: 'x' }],
   ['settings.json backup name', 'Write', { file_path: '/home/u/.claude/settings.json.bak', content: 'x' }],
@@ -147,6 +152,10 @@ test('file tool: a realpath that throws falls back to the lexical check', () => 
 // ---- Bash (Appendix B) ----------------------------------------------------------------------
 
 const BASH_DENY = [
+  ['redirect into the review skill', 'echo x > ~/.claude/skills/review/SKILL.md'],
+  ['tee into the review skill', 'echo x | tee ~/.claude/skills/review/SKILL.md'],
+  ['cp over the review skill', 'cp evil.md ~/.claude/skills/review/SKILL.md'],
+  ['rm the review skill', 'rm -rf ~/.claude/skills/review'],
   ['sed -i on the ship skill', "sed -i '' 's/x/y/' ~/.claude/skills/ship/SKILL.md"],
   ['echo redirect to $HOME agent', 'echo x > $HOME/.claude/agents/judge.md'],
   ['cp over ${HOME} skill', 'cp evil.md ${HOME}/.claude/skills/ship/SKILL.md'],
@@ -226,6 +235,8 @@ const BASH_ALLOW = [
   ['redirect to a repo file', 'echo hi > notes.txt'],
   ['repo-local .claude directory', 'cp template.json .claude/settings.json'],
   ['prefix lookalike skill', 'rm -rf ~/.claude/skills/shipping'],
+  ['write another skill', 'cp evil.md ~/.claude/skills/other/SKILL.md'],
+  ['cat the review skill', 'cat ~/.claude/skills/review/SKILL.md'],
   ['other files under .claude', 'cp x ~/.claude/CLAUDE.md'],
   ['memory dir glob', 'rm ~/.claude/projects/-x/memory/*.md'],
   ['head and wc on settings', 'head -n 5 ~/.claude/settings.json | wc -l'],
@@ -913,7 +924,7 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
     'git add pipeline/hooks/owner-go.mjs pipeline/hooks/lib/owner-go.mjs',
     'git diff -- pipeline/hooks/lib/owner-go.mjs',
     'node --test test/owner-go.test.mjs',
-    'node /home/u/.claude/pipeline/hooks/session-version.mjs', // (the other installed hooks keep their read-only standing)
+    'node /home/u/.claude/pipeline/hooks/stack-dev-bind.mjs', // (the other installed hooks keep their read-only standing)
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 
@@ -983,4 +994,372 @@ test('Phase 3b: a program that resolves into a review folder is judged like any 
     readText: (p) => (p === '/repo/run.mjs' || p === prog ? "import fs from 'node:fs'; fs.writeFileSync('/home/u/.claude/settings.json', '{}');" : null),
   };
   assert.equal(bash('node run.mjs', opts), 'deny');
+});
+
+// ---- #111: a review folder reached through a symlink (real filesystem) -----------------------------------------
+// The link is made in a PRIOR step, the way an agent would: a link a judged program makes itself does not exist yet when the hook
+// looks, so no stat can see it (a residual class, like every run-time-built path).
+
+// (POSIX only: on win32 the inode check is off (statId is null there), as it is for the protected roots; these tests skip with that reason)
+function reviewAliasWorld(t, { review = true } = {}) {
+  if (process.platform === 'win32') { t.skip('the alias / inode check is POSIX-only (no inodes on win32)'); return null; }
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-review-')));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  const home = path.join(tmp, 'home');
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  const cwd = path.join(tmp, 'repo');
+  fs.mkdirSync(review ? path.join(cwd, '.review', 'round-1') : cwd, { recursive: true });
+  const alias = path.join(tmp, 'alias');
+  const ralias = path.join(tmp, 'ralias');
+  try {
+    fs.symlinkSync(path.join(cwd, '.review'), alias, 'dir');
+    fs.symlinkSync(path.join(cwd, '.review', 'round-1'), ralias, 'dir');
+    fs.symlinkSync('.review', path.join(cwd, 'rv'), 'dir'); // (a relative link inside the checkout)
+    fs.symlinkSync(path.join(cwd, '.review'), path.join(cwd, 'a,b'), 'dir'); // (link names with `,` and `=`)
+    fs.symlinkSync(path.join(cwd, '.review'), path.join(cwd, 'a=b'), 'dir');
+  } catch (e) {
+    if (e.code === 'EPERM' || e.code === 'EACCES') { t.skip('cannot create symlinks here'); return null; }
+    throw e;
+  }
+  const opts = { home, env: {}, cwd, platform: process.platform };
+  return {
+    tmp, cwd, alias, ralias,
+    bash: (cmd) => evaluateBashForFiles(cmd, opts).decision,
+    write: (p) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: p, content: 'x' }, cwd }, opts).decision,
+  };
+}
+
+test('#111: a protected review file written through a symlink to .review or .review/round-N is denied', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { alias: A, ralias: R } = w;
+  assert.equal(w.write(`${A}/state.json`), 'deny');
+  assert.equal(w.write(`${R}/codex.json`), 'deny');
+  assert.equal(w.write(`${R}/sub/deeper.json`), 'deny');
+  for (const cmd of [
+    `echo x > ${A}/state.json`,
+    `echo x > ${R}/codex.json`,
+    `cd ${A} && echo x > state.json`,
+    `cp /tmp/x ${A}/state.json`,
+    `cp /tmp/x ${A}/final-gate.json`,
+    `cp /tmp/x ${A}/production-smoke.json`,
+    `cp /tmp/x ${R}/codex.json`,
+    `tee ${A}/state.json < /tmp/x`,
+    `node -e "require('fs').writeFileSync('${A}/state.json','x')"`,
+    `node -e "require('fs').writeFileSync(require('path').join('${A}','state.json'),'x')"`,
+    `node -e "const d='${A}'; require('fs').writeFileSync(d+'/state.json','x')"`,
+    `node -e "const d='${R}'; require('fs').writeFileSync(d+'/codex.json','x')"`,
+    `node -e "require('fs').writeFileSync('${R}/codex.json','x')"`,
+    `node -e "process.chdir('${A}'); require('fs').writeFileSync('state.json','x')"`,
+    `node -e "process.chdir('${R}'); require('fs').writeFileSync('codex.json','x')"`,
+    'cp /tmp/x rv/state.json',
+    'echo x > rv/state.json',
+    `node -e "require('fs').writeFileSync('rv/state.json','x')"`,
+    `node -e "process.chdir('rv'); require('fs').writeFileSync('state.json','x')"`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+});
+
+test('#111: the inode check works on injected inodes too (file tools and redirects, no real filesystem)', () => {
+  const ids = { '/repo/.review': 'd:1', '/repo/.review/round-1': 'd:2', '/alias': 'd:1', '/ralias': 'd:2' };
+  const fake = { statId: (p) => ids[p] ?? null, readDir: (d) => (d === '/repo/.review' ? ['round-1', 'notes', 'round-x'] : []) };
+  assert.equal(file('Write', { file_path: '/alias/state.json', content: 'x' }, fake), 'deny');
+  assert.equal(file('Write', { file_path: '/ralias/codex.json', content: 'x' }, fake), 'deny');
+  assert.equal(file('Write', { file_path: '/ralias/a/b.json', content: 'x' }, fake), 'deny');
+  assert.equal(file('Write', { file_path: '/alias/hardstops.json', content: 'x' }, fake), 'allow');
+  assert.equal(file('Write', { file_path: '/other/state.json', content: 'x' }, fake), 'allow');
+  assert.equal(bash('echo x > /alias/state.json', fake), 'deny');
+  assert.equal(bash('echo x > /alias/hardstops.json', fake), 'allow');
+  // (no review folder: no entry, no error)
+  assert.equal(file('Write', { file_path: '/alias/state.json', content: 'x' }, { statId: () => null }), 'allow');
+});
+
+test('#111: scratch files directly in .review stay writable, by name and through a symlink', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { alias: A, cwd } = w;
+  assert.equal(w.write(`${cwd}/.review/hardstops.json`), 'allow');
+  assert.equal(w.write(`${A}/hardstops.json`), 'allow');
+  for (const cmd of [
+    'node ~/.claude/pipeline/bin/pipeline.mjs hardstops --base origin/main --head HEAD > .review/hardstops.json',
+    'mkdir -p .review',
+    'echo x > .review/hardstops.json',
+    `echo x > ${A}/hardstops.json`,
+    `cp /tmp/x ${A}/hardstops.json`,
+    `node -e "require('fs').writeFileSync('${A}/hardstops.json','x')"`,
+    `cat ${A}/state.json`,
+    `ls -la ${A} ${w.ralias}`,
+  ]) assert.equal(w.bash(cmd), 'allow', cmd);
+});
+
+test('#111: a script padded past the scan cap still cannot write a review file through a link (fails closed with a review folder)', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const pad = '// padding padding padding padding padding padding padding\n'.repeat(4500); // ~250 KB
+  assert.ok(pad.length > 200_000);
+  fs.writeFileSync(path.join(w.cwd, 'big.mjs'), `${pad}import fs from 'node:fs'; fs.writeFileSync('${w.alias}/state.json', 'x');\n`);
+  fs.writeFileSync(path.join(w.cwd, 'small.mjs'), `import fs from 'node:fs'; fs.writeFileSync('${w.alias}/state.json', 'x');\n`);
+  assert.equal(w.bash('node small.mjs'), 'deny', 'under the cap');
+  assert.equal(w.bash('node big.mjs'), 'deny', 'over the cap');
+  // (a repo without a review folder: nothing to reach, an ordinary large script is judged as before)
+  const n = reviewAliasWorld(t, { review: false });
+  fs.writeFileSync(path.join(n.cwd, 'big.mjs'), `${pad}import fs from 'node:fs'; fs.writeFileSync('${n.tmp}/out.json', 'x');\n`);
+  assert.equal(n.bash('node big.mjs'), 'allow');
+});
+
+test('#111: a cd into a link to the review folder (outside the checkout) makes the relative writers below it protected', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { alias: A, ralias: R } = w;
+  for (const dir of [A, R]) {
+    const name = dir === A ? 'state.json' : 'codex.json';
+    for (const body of [
+      `cp /tmp/x ${name}`, `echo x | tee ${name}`, `mv /tmp/x ${name}`, `sed -i 's/a/b/' ${name}`, `rm ${name}`, `ln -sf /tmp/x ${name}`,
+      `node -e "require('fs').writeFileSync('${name}','x')"`,
+    ]) {
+      assert.equal(w.bash(`cd ${dir} && ${body}`), 'deny', `cd && ${body}`);
+      assert.equal(w.bash(`(cd ${dir} && ${body})`), 'deny', `subshell ${body}`);
+      assert.equal(w.bash(`pushd ${dir} >/dev/null && ${body}`), 'deny', `pushd ${body}`);
+    }
+  }
+  // (reading, and a scratch file directly in .review, stay fine)
+  for (const cmd of [`cd ${A} && cat state.json`, `cd ${A} && cp /tmp/x hardstops.json`, `(cd ${A} && ls)`, 'cd /tmp && cp x state.json', `cd ${w.tmp} && cp /tmp/x notes.json`]) assert.equal(w.bash(cmd), 'allow', cmd);
+  // (an unknown cd target in a checkout that has review folders: ordinary words below it are no hits)
+  for (const cmd of ['cd "$X" && npm test', 'cd "$X" && git commit -m foo']) assert.equal(w.bash(cmd), 'allow', cmd);
+});
+
+test('#111: repeated ancestors of the words of a long line are stat-ed once (per-evaluation cache)', () => {
+  const ids = { '/repo/.review': 'd:1', '/repo/.review/round-1': 'd:2' };
+  let calls = 0;
+  const statId = (p) => { calls++; return ids[p] ?? null; };
+  const readDir = (d) => (d === '/repo/.review' ? ['round-1'] : []);
+  const words = Array.from({ length: 2000 }, (_, i) => `src/deep/er/path/f${i}.js`).join(' ');
+  assert.equal(bash(`echo ${words}`, { statId, readDir }), 'allow');
+  assert.ok(calls < 2000 * 2, `${calls} stat calls for 2000 words`); // (uncached: one per ancestor per word, ~6 per word)
+});
+
+test('#111: many words times many cd targets is refused with a review folder (bounded stats), allowed without one', () => {
+  const ids = { '/repo/.review': 'd:1', '/repo/.review/round-1': 'd:2' };
+  let calls = 0;
+  const statId = (p) => { calls++; return ids[p] ?? null; };
+  const readDir = (d) => (d === '/repo/.review' ? ['round-1'] : []);
+  const cds = Array.from({ length: 25 }, (_, i) => `cd /outside${i}`).join(' && ');
+  const words = Array.from({ length: 1000 }, (_, i) => `src/deep/f${i}.js`).join(' ');
+  assert.equal(bash(`${cds} && touch ${words}`, { statId, readDir }), 'deny');
+  assert.ok(calls < 5000, `${calls} stat calls for 1000 words x 26 directories`); // (uncapped: one per ancestor per word per directory)
+  // (no review folder: nothing to reach, the same line is judged as before)
+  assert.equal(bash(`${cds} && touch ${words}`, { statId: () => null, readDir: () => [] }), 'allow');
+});
+
+test('#111: after a cd to a folder outside the checkout, a relative path through a link to the review folder is followed', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const T = w.tmp;
+  for (const cmd of [
+    `cd ${T} && cp /tmp/x alias/state.json`,
+    `cd ${T} && cp /tmp/x ralias/codex.json`,
+    `cd ${T}/alias/.. && cp /tmp/x alias/state.json`,
+    `cd ${T} && node -e "process.chdir('alias'); require('fs').writeFileSync('state.json','x')"`,
+    `cd ${T} && node -e "require('fs').writeFileSync('alias/state.json','x')"`,
+    `(cd ${T} && cp /tmp/x alias/state.json)`,
+    `pushd ${T} >/dev/null && cp /tmp/x alias/state.json`,
+    `env -C ${T} cp /tmp/x alias/state.json`, // (GNU env chdir)
+    `env --chdir=${T} cp /tmp/x alias/state.json`,
+    `env --chdir ${T} cp /tmp/x alias/state.json`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `env -C ${T} cat alias/state.json`,
+    `cd ${T} && cp /tmp/x alias/hardstops.json`, // (a scratch file directly in .review)
+    `cd ${T} && cp /tmp/x other/state.json`, // (no link)
+    `cd ${T} && cat alias/state.json`,
+    `cd ${T} && ls alias ralias`,
+  ]) assert.equal(w.bash(cmd), 'allow', cmd);
+});
+
+// ---- #111 (Fable): globs through an alias, link targets built at run time, hard links ------------------------------
+
+test('#111: a glob write target through a link to the review folder (or in a glob directory name) is denied', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { tmp: T, alias: A, cwd } = w;
+  for (const cmd of [
+    `cp /tmp/x ${A}/stat?.json`,
+    `cp /tmp/x ${A}/st*te.json`,
+    `cp /tmp/x ${A}/[s]tate.json`,
+    `cp /tmp/x ${T}/al*as/state.json`,
+    `cp /tmp/x ${T}/al?as/st*.json`,
+    `cp /tmp/x ${w.ralias}/*.json`,
+    `cp /tmp/x ${T}/r*lias/codex.json`,
+    'cp /tmp/x rv/stat?.json',
+    `cd ${A} && cp /tmp/x stat?.json`,
+    `echo y > ${A}/stat?.json`,
+    `echo y > ${T}/al*as/state.json`,
+    `tee ${A}/st*.json < /tmp/x`,
+    `sed -n 'w ${A}/stat?.json' /tmp/x`,
+    `cd ${T} && cp /tmp/x al*as/state.json`,
+    `cd ${cwd} && cp /tmp/x r?/state.json`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  // (controls: reads, a glob that cannot name a protected file, a directory that is no link, a directory that holds no link)
+  for (const cmd of [
+    `cat ${A}/stat?.json`, `ls ${T}/al*as`, `cp /tmp/x ${T}/other/stat?.json`, `cp /tmp/x ${A}/hard*.json`,
+    `cp /tmp/x ${T}/no*such/stat?.json`, `echo y > ${A}/hard?tops.json`, `cp /tmp/x ${cwd}/*.txt`,
+  ]) assert.equal(w.bash(cmd), 'allow', cmd);
+});
+
+test('#111 (Codex recheck): a last-name glob is judged by the entries it really matches: protected names off the sample list, hard links elsewhere', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { tmp: T, alias: A, cwd } = w;
+  fs.writeFileSync(path.join(cwd, '.review', 'staging-smoke.json'), '{}');
+  fs.writeFileSync(path.join(cwd, '.review', 'notes-x.json'), '{}');
+  const hl = path.join(T, 'hl');
+  fs.mkdirSync(hl);
+  try { fs.linkSync(path.join(cwd, '.review', 'staging-smoke.json'), path.join(hl, 'Hlink')); } catch { t.skip('cannot create hard links here'); return; }
+  for (const cmd of [
+    'echo y > rv/staging-smok?.json',
+    `cp /tmp/x ${A}/stag*.json`,
+    `echo y > ${hl}/H*`,
+    `cp /tmp/x ${hl}/Hlin?`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  // (controls: a matched scratch file, a glob that matches nothing protected, a read)
+  for (const cmd of [`echo y > ${A}/notes-?.json`, `cp /tmp/x ${hl}/Z*`, `cat ${hl}/H*`]) assert.equal(w.bash(cmd), 'allow', cmd);
+});
+
+test('#111: a link whose target is a command substitution is refused with a review folder (it cannot be resolved), allowed without one', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  for (const cmd of [
+    `ln -s "$(printf '.%s' review)" lnk`,
+    'ln -s "$(echo .review)" lnk',
+    'ln -s `echo .review` lnk',
+    'ln -sf "$(pwd)/x" lnk', // (fails closed too: a substitution is never resolved)
+    'link "$(echo .review)" lnk',
+    'cp -s "$(echo .review)" lnk',
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  for (const cmd of ['ln -s ../x lnk', 'ln -s target lnk']) assert.equal(w.bash(cmd), 'allow', cmd);
+  const n = reviewAliasWorld(t, { review: false });
+  for (const cmd of ['ln -s "$(echo .review)" lnk', 'ln -sf "$(pwd)/x" lnk']) assert.equal(n.bash(cmd), 'allow', cmd);
+});
+
+test('#111: a hard link to a protected review file under another name is denied; one to a scratch file is not', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { cwd } = w;
+  fs.writeFileSync(path.join(cwd, '.review', 'state.json'), '{}');
+  fs.writeFileSync(path.join(cwd, '.review', 'round-1', 'codex.json'), '{}');
+  fs.writeFileSync(path.join(cwd, '.review', 'hardstops.json'), '{}');
+  const mk = (src, dest) => { try { fs.linkSync(path.join(cwd, ...src), path.join(cwd, dest)); return true; } catch { return false; } };
+  if (!mk(['.review', 'state.json'], 'H') || !mk(['.review', 'round-1', 'codex.json'], 'HC') || !mk(['.review', 'hardstops.json'], 'HS')) { t.skip('cannot create hard links here'); return; }
+  assert.equal(w.write(path.join(cwd, 'H')), 'deny');
+  assert.equal(w.write(path.join(cwd, 'HC')), 'deny');
+  assert.equal(w.write(path.join(cwd, 'HS')), 'allow');
+  // (a symlink to the file itself is the same file too)
+  fs.symlinkSync(path.join(cwd, '.review', 'state.json'), path.join(cwd, 'L'), 'file');
+  assert.equal(w.write(path.join(cwd, 'L')), 'deny');
+  assert.equal(w.bash('echo y > L'), 'deny');
+  for (const cmd of [
+    'cp /tmp/x H', 'echo y > H', 'tee H < /tmp/x', 'sed -i s/a/b/ H', `node -e "require('fs').writeFileSync('H','y')"`, 'cp /tmp/x HC', 'echo y > HC',
+    `cd ${cwd} && cp /tmp/x H`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  for (const cmd of ['cat H', 'cp /tmp/x HS', 'echo y > HS', `node -e "require('fs').writeFileSync('HS','y')"`, 'cp /tmp/x unrelated.txt']) assert.equal(w.bash(cmd), 'allow', cmd);
+});
+
+// ---- #111 (final round): brace expansion into a protected name ------------------------------------------------------
+// The shell parser expands `{a,b}` into words, but cp / rsync / install judge only the LAST word as the destination, so the other expansions slipped through.
+
+test('#111: a brace list or range that expands to a protected review file is denied as a target (with and without a link)', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const A = w.alias;
+  for (const cmd of [
+    'cp x .review/{state,y}.json',
+    'cp x .review/{state,}.json',
+    'cp x .review/{state.json,y}',
+    'cp x .review/st{a,b}te.json',
+    'cp x .review/st{a..b}te.json',
+    'cp x .review/{round-1,y}/codex.json',
+    'cp x rv/st{a,b}te.json',
+    'cp x rv/st{a..b}te.json',
+    `cp x ${A}/st{a,b}te.json`,
+    `cp x ${A}/st{a..b}te.json`,
+    `cp x ${A}/{state,hardstops}.json`,
+    'install -m 644 x .review/{state,y}.json',
+    'rsync x rv/{state,y}.json',
+    'cp -t rv/{state,y}.json x',
+    'cp x .review/{y,{state,z}}.json', // (nested)
+    'echo y > .review/{state,x}.json',
+    'echo y > .review/st{a..b}te.json',
+    'echo y > rv/st{a..b}te.json',
+    `echo y > ${A}/{state,x}.json`,
+    'echo y | tee .review/{state,x}.json',
+    'echo y | tee .review/st{a..b}te.json',
+    `echo y | tee ${A}/st{a,b}te.json`,
+    'touch .review/{state,x}.json',
+    // (a trailing fd redirection, a comment or a word that may expand to nothing is not a later source word)
+    'cp x .review/{state,y}.json 2>/dev/null',
+    'cp x .review/{state,y}.json 2>&1',
+    'cp x .review/{state,y}.json 12>err.log',
+    'install x .review/{state,y}.json 2>/dev/null',
+    'rsync x rv/{state,y}.json 2>>log',
+    'cp x .review/{state,y}.json # note',
+    'cp x .review/{state,y}.json $E',
+    'cp x .review/{state,y}.json "$E"',
+    'cp x .review/{state,y}.json ""',
+    'cp x .review/{state,y}.json $(true)',
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  // (controls: no protected name among the expansions, a quoted brace is the literal name, a brace in a source or in a string)
+  for (const cmd of [
+    'cp x out/{a,b}.txt',
+    'cp x out/{1..3}.txt',
+    'cp x .review/{a,b}.json',
+    'cp x .review/{1..3}.json',
+    'cp x rv/{hardstops,y}.json',
+    `cp x ${A}/{hardstops,y}.json`,
+    `cp .review/{state,y}.json ${w.tmp}/out`,
+    "echo '{a,b}' > notes.txt",
+    'echo {a,b} > notes.txt',
+    'cp x out/${HOME}.txt',
+  ]) assert.equal(w.bash(cmd), 'allow', cmd);
+  // (over the 64-expansion bound: refused while a review folder exists, as before without one)
+  assert.equal(w.bash('cp x out/{a..z}{1..9}.txt'), 'deny');
+  assert.equal(w.bash('touch out/{1..100}.txt'), 'deny');
+  const n = reviewAliasWorld(t, { review: false });
+  assert.equal(n.bash('cp x out/{a..z}{1..9}.txt'), 'allow');
+  assert.equal(n.bash('touch out/{1..100}.txt'), 'allow');
+});
+
+test('#111: `..` after a link is the physical parent of what the link points to (Bash words, redirects and the file tools)', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { tmp: T, ralias: R } = w;
+  // (ralias -> .review/round-1, so ralias/.. is .review: the protected name below it is reached though the lexical path says <tmp>/state.json)
+  for (const cmd of [
+    `cp x ${R}/../state.json`, `echo y > ${R}/../state.json`, `cd ${T} && cp x ralias/../state.json`, `cd ${T} && echo y > ralias/../state.json`,
+    `echo y | tee ${R}/../state.json`, `cp x ${R}/../final-gate.json`, `cp x ${R}/./../state.json`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  assert.equal(w.write(`${R}/../state.json`), 'deny');
+  assert.equal(w.write(`${R}/../final-gate.json`), 'deny');
+  // (controls: a scratch name in .review, a `..` that never leaves the checkout's plain directories, a link that is no review link)
+  for (const cmd of [`cp x ${R}/../hardstops.json`, `cd ${T} && cp x ralias/../hardstops.json`, `echo y > ${R}/../hardstops.json`, `cp x ${T}/other/../state.json`, `cat ${R}/../state.json`]) assert.equal(w.bash(cmd), 'allow', cmd);
+  assert.equal(w.write(`${R}/../hardstops.json`), 'allow');
+  assert.equal(w.write(`${T}/other/../state.json`), 'allow');
+});
+
+test('#111: a glob over a big directory (1000 packages) is no hit by its size alone while a review folder exists; past the entry cap it still is', () => {
+  const ids = { '/repo/.review': 'd:1', '/repo/.review/round-1': 'd:2' };
+  const pkgs = (n) => Array.from({ length: n }, (_, i) => `pkg${i}`);
+  const fake = (n) => ({ statId: (p) => ids[p] ?? null, readDir: (d) => (d === '/repo/.review' ? ['round-1'] : d === '/repo/pkgs' || d === '/repo/node_modules' ? pkgs(n) : []) });
+  for (const cmd of ['rm -rf ./node_modules/*/x', 'cp x ./pkgs/*/out.txt', 'echo y > ./pkgs/*/out.txt']) {
+    assert.equal(bash(cmd, fake(1000)), 'allow', cmd);
+    assert.equal(bash(cmd, fake(4001)), 'deny', `${cmd} (past the entry cap)`);
+  }
+});
+
+test('#111: a link whose name holds `,` or `=` is followed too', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  for (const cmd of [
+    'cp x a,b/state.json', "cp x 'a=b'/state.json", 'cp x a=b/state.json', 'echo y > a,b/state.json', 'echo y > a=b/state.json',
+    `cd ${w.tmp}/repo && tee a,b/state.json < /tmp/x`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  for (const cmd of ['cp x a,b/notes.txt', 'cp x a=b/hardstops.json', 'cp x c,d/state.json', 'cat a,b/state.json']) assert.equal(w.bash(cmd), 'allow', cmd);
 });

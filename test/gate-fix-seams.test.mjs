@@ -23,7 +23,7 @@ test('the repo checkout is not an installed copy, so seams are honoured', () => 
   assert.equal(seamFlag('PIPELINE_TEST_MODE', { PIPELINE_TEST_MODE: '1' }), true);
   assert.equal(seamFlag('PIPELINE_TEST_MODE', { PIPELINE_TEST_MODE: 'yes' }), false);
   assert.deepEqual(SEAM_VARS.slice().sort(), [
-    'PIPELINE_CODEX', 'PIPELINE_DOCKER', 'PIPELINE_GH', 'PIPELINE_LSOF', 'PIPELINE_PS', 'PIPELINE_STACKS_DEADLINE_MS', 'PIPELINE_SUPABASE',
+    'PIPELINE_CODEX', 'PIPELINE_DOCKER', 'PIPELINE_GH', 'PIPELINE_INSTALL_RETIRED_SKILLS', 'PIPELINE_LSOF', 'PIPELINE_PS', 'PIPELINE_STACKS_DEADLINE_MS', 'PIPELINE_SUPABASE',
     'PIPELINE_TEST_MODE', 'PIPELINE_UPDATE_REMOTE', 'PIPELINE_VERCEL',
   ]);
 });
@@ -53,8 +53,7 @@ test('a real installed copy: gh / codex / vercel / test-mode seams are ignored e
   // Built per root: the probe holds file:// URLs, so a string replace of a Windows path would never match.
   const probeFor = (root) => `
     const p = await import(${JSON.stringify(pathToFileURL(join(root, 'lib', 'proc.mjs')).href)});
-    const v = await import(${JSON.stringify(pathToFileURL(join(root, 'lib', 'vercel.mjs')).href)});
-    console.log(JSON.stringify({ codex: p.codexCommand(), vercel: v.vercelCommand(), mode: p.seamFlag('PIPELINE_TEST_MODE'), installed: p.isInstalledCopy() }));
+    console.log(JSON.stringify({ codex: p.codexCommand(), vercel: p.overrideCommand('PIPELINE_VERCEL', 'vercel', process.env), mode: p.seamFlag('PIPELINE_TEST_MODE'), installed: p.isInstalledCopy() }));
   `;
   // The hooks' fast path imports seams.mjs alone (no proc.mjs): its lazily worked-out root must still find INSTALLED.json.
   const seamsProbeFor = (root) => `
