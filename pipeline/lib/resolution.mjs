@@ -97,8 +97,7 @@ function fastSplit(M, S2, S3, tick, labels) {
   }
   if (open >= 0 || spans.length === 0) return null;
 
-  // The first run of lines `seg` in S at or after `from` (the missing-final-newline rule applies at the blob's last line), as the
-  // blob's own lines; null when there is none. -> { at, lines }
+  // Do the lines `seg` occur in S starting at position q? (The missing-final-newline rule applies at the blob's last line.) -> boolean
   const matchAt = (seg, S, q) => {
     tick();
     let i = 0;
@@ -115,6 +114,8 @@ function fastSplit(M, S2, S3, tick, labels) {
   // line WITH a newline, so an identical line earlier in the blob (with its own newline) matches too, and would make the block's
   // side line differ from the blob's own bytes. When a run ending at the blob's newline-less last line also matches and its lines
   // differ from the earliest run's, which one the block is cannot be told here: null, so the exact parser decides.
+  // The first run of lines `seg` in S at or after `from`, as the blob's own lines; null when there is none (or it is ambiguous as
+  // above). -> { at, lines } | null
   const run = (seg, S, from) => {
     for (let q = from; q + seg.length <= S.length; q++) {
       if (!matchAt(seg, S, q)) continue;
