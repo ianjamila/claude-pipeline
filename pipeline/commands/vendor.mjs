@@ -77,7 +77,7 @@ function stopVerifyWarnings(root) {
   for (const name of SETTINGS_FILES) {
     try {
       const settings = JSON.parse(readFileSync(join(root, '.claude', name), 'utf8'));
-      if (!JSON.stringify(settings?.hooks ?? null).includes('stop-verify')) continue;
+      if (!JSON.stringify(settings?.hooks?.Stop ?? null).includes('stop-verify')) continue;
       out.push(`.claude/${name} still has a hook that runs scripts/pipeline/stop-verify.mjs, which vendor removes (the Stop hook is retired): remove that Stop hook entry from .claude/${name}, or every stop will try to run a missing file`);
     } catch { /* missing, unreadable or not JSON: nothing to say */ }
   }

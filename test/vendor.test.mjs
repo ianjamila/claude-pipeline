@@ -146,6 +146,9 @@ test('no stop-verify warning when the settings do not run it, are missing, unrea
   assert.deepEqual(stopWarnings(await vendorInto(repo.dir)), [], 'no .claude at all');
   repo.write('.claude/settings.json', JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo done' }] }] }, permissions: { allow: ['Bash(node scripts/pipeline/smoke.mjs:*)'] } }));
   assert.deepEqual(stopWarnings(await vendorInto(repo.dir)), []);
+  // the message says "Stop hook": a command that merely names the file under another event is not that
+  repo.write('.claude/settings.json', JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'node scripts/pipeline/stop-verify.mjs' }] }] } }));
+  assert.deepEqual(stopWarnings(await vendorInto(repo.dir)), [], 'stop-verify under PreToolUse is not a Stop hook');
   repo.write('.claude/settings.json', '{ not json stop-verify');
   const bad = await vendorInto(repo.dir);
   assert.equal(bad.exitCode, 0);

@@ -1,6 +1,6 @@
-// `pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE]`: upserts the PR's single summary
+// `pipeline summary --pr N --outcome O [--built TEXT]`: upserts the PR's single summary
 // comment (rendered from the review state, the Fable model proofs and the follow-up issues, with the run record riding in
-// it) and prints the agent-log line for this run. --action and --cause are accepted for old callers and not used.
+// it) and prints the agent-log line for this run.
 import { readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
@@ -19,14 +19,13 @@ import { readModelProofs } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
-  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost}   (--action/--cause: accepted, unused; pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")',
+  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")',
 };
 
 // These stops never reach a review round (verify red three times, Codex out in round 1) or happen after the run's state
 // is no longer the point (a stop on a gate, the owner closing the PR, an outside merge), so there may be no state.json to
 // render from. They still get a comment and a log line: rounds are empty, the verify report (if any) names where it stopped.
 const NO_STATE_OUTCOMES = new Set(['blocked', 'awaiting-review', 'stopped', 'closed', 'merged-externally']);
-const CAUSE_RE = /^[A-Za-z0-9:_.-]{1,60}$/;
 
 async function verifyDetail(root) {
   let file = join(root, '.verify', 'report.json');
@@ -73,13 +72,12 @@ function guardBlocksFor(record, extraSessions, ctx) {
 }
 
 export const run = guarded(async (argv, ctx) => {
-  const { values } = parseCommandArgs(inlineOptionValues(argv, ['--outcome', '--built', '--action', '--cause', '--session']), {
+  const { values } = parseCommandArgs(inlineOptionValues(argv, ['--outcome', '--built', '--session']), {
     pr: { type: 'string' }, outcome: { type: 'string' }, built: { type: 'string' }, repo: { type: 'string' },
-    action: { type: 'string' }, cause: { type: 'string' }, session: { type: 'string', multiple: true },
+    session: { type: 'string', multiple: true },
   }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const outcome = requireOption(values, 'outcome');
-  if (values.cause !== undefined && !CAUSE_RE.test(values.cause)) throw new UsageError('--cause must be a short code of letters, digits, : _ . -');
   const root = resolveRepo(values, ctx);
 
   let state;

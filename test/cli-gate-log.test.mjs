@@ -191,16 +191,14 @@ test('summary: every outcome word posts the comment and logs a line, with no not
   }
 });
 
-test('summary: --action and --cause are accepted and change nothing; an invalid --cause is still a usage error', async () => {
+test('summary: --action and --cause are gone (only the retired ship skill passed them): a usage error, nothing posted', async () => {
   const repo = pushRepo(null);
-  const plain = await summaryIn(repo, ['--outcome', 'stopped']);
-  const withOpts = await summaryIn(repo, ['--outcome', 'stopped', '--action', '- Final gate refused: a blocking label is set', '--cause', 'final-gate:labels']);
-  assert.equal(withOpts.error, undefined);
-  assert.equal(withOpts.res.exitCode, 0);
-  assert.equal(withOpts.res.output.agentLogLine, plain.res.output.agentLogLine);
-  assert.equal('notify' in withOpts.res.output, false);
-  const bad = await summaryIn(repo, ['--outcome', 'stopped', '--cause', 'bad cause!']);
-  assert.match(bad.error.message, /--cause must be a short code/);
+  assert.equal((await summaryIn(repo, ['--outcome', 'stopped'])).res.exitCode, 0, 'control: the same call without them works');
+  for (const flag of [['--action', 'Close the pause issue'], ['--cause', 'final-gate:labels']]) {
+    const t = await summaryIn(repo, ['--outcome', 'stopped', ...flag]);
+    assert.equal(t.res, undefined, `${flag[0]} must not be accepted`);
+    assert.match(t.error.message, new RegExp(flag[0]));
+  }
 });
 
 test('summary: `stopped`, `closed` and `merged-externally` work with no review state', async () => {
