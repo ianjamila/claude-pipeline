@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import {
   git, mergeBase, mergeTree, mergeTreeDetailed, effectiveReviewBase, resolutionReviewBase, ensureReviewBase, reviewPatch, revParse, ReviewBaseUnavailable,
 } from '../pipeline/lib/git.mjs';
-import { splitLines, interleave, parseConflictBlocks, checkSelection, makeBudget, sameMarkerShape, MAX_BLOCKS } from '../pipeline/lib/resolution.mjs';
+import { splitLines, interleave, parseConflictBlocks, checkSelection, makeBudget, sameMarkerShape, SearchCap, MAX_BLOCKS } from '../pipeline/lib/resolution.mjs';
 import { run } from '../pipeline/lib/proc.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 
@@ -518,6 +518,43 @@ test('sameMarkerShape: equal except the label text on the open / close marker li
   assert.equal(sameMarkerShape(l('<<<<<<< a'), ['<<<<<<< a\r\n']), false); // line ending differs
   assert.equal(sameMarkerShape(['<<<<<<< a\r\n'], ['<<<<<<< b\r\n']), true);
   assert.equal(sameMarkerShape(['plain\n'], ['plain']), false);
+});
+
+test('checkSelection / interleave: the budget is charged per line of work, so a block of ~20k lines is a verdict or a SearchCap within seconds', () => {
+  const l = (x) => `${x}\n`;
+  const n = 20_000;
+  const run1 = (fn) => {
+    const t0 = Date.now();
+    let out;
+    try { out = fn(); } catch (err) { if (!(err instanceof SearchCap)) throw err; out = 'cap'; }
+    assert.ok(Date.now() - t0 < 10_000, `took ${Date.now() - t0} ms`);
+    return out;
+  };
+  const same = Array.from({ length: n }, () => l('s'));
+  const uniq = (name) => Array.from({ length: n }, (_, i) => l(`${name}${i}`));
+  // identical lines everywhere: many placements, long position lists
+  assert.equal(run1(() => interleave(same, same, same)), 'cap');
+  assert.equal(run1(() => interleave(Array.from({ length: 5 * n }, () => l('s')), Array.from({ length: 6 * n }, () => l('s')), [l('s'), l('s'), l('s')])), 'cap');
+  // a long outside that matches for thousands of candidate ends before it fails
+  const O = [...Array.from({ length: 5000 }, () => l('mid')), l('x')];
+  const mids = same.map(() => l('mid'));
+  const parsed = { outsides: [[l('top')], O, [l('bottom')]], blocks: [{ ours: mids, theirs: mids }, { ours: [l('z')], theirs: [l('y')] }] };
+  assert.equal(run1(() => checkSelection(parsed, [l('top'), ...mids, ...mids, l('bottom')])), 'cap');
+  // a block that is just big and unique is still decided (eligible), well inside the default budget
+  const ours = uniq('o');
+  const big = { outsides: [[l('top')], [l('bottom')]], blocks: [{ ours, theirs: uniq('t') }] };
+  assert.deepEqual(run1(() => checkSelection(big, [l('top'), ...ours, l('bottom')])), { ok: true, droppedTheirs: [n] });
+});
+
+test('checkSelection: a candidate end costs steps for the lines it compares and copies, and a marker scan is not repeated per end', () => {
+  const l = (x) => `${x}\n`;
+  let spent = 0;
+  const counting = (k = 1) => { spent += k; };
+  const O = [...Array.from({ length: 2000 }, () => l('mid')), l('x')];
+  const mids = Array.from({ length: 3000 }, () => l('mid'));
+  const parsed = { outsides: [[l('top')], O, [l('bottom')]], blocks: [{ ours: mids, theirs: mids }, { ours: [l('z')], theirs: [l('y')] }] };
+  checkSelection(parsed, [l('top'), ...mids, ...mids, l('bottom')], counting);
+  assert.ok(spent > 2000 * 1000, `only ${spent} steps charged for millions of line comparisons`);
 });
 
 test('parseConflictBlocks: 5000 blocks is "too-many-blocks" at once (no recursion, no throw); the limit itself still parses', () => {

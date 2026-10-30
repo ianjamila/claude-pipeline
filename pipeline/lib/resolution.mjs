@@ -154,7 +154,19 @@ export function interleave(R, ours, theirs, tick = makeBudget()) {
   };
   const oursAt = positions(ours);
   const theirsAt = positions(theirs);
-  const next = (map, line, from) => map.get(line)?.find((i) => i >= from) ?? -1;
+  // First position >= from in the (ascending) position list of `line`, or -1: a binary search, so one step costs O(log n), not O(n).
+  const next = (map, line, from) => {
+    const at = map.get(line);
+    if (!at) return -1;
+    let lo = 0;
+    let hi = at.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (at[mid] < from) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo < at.length ? at[lo] : -1;
+  };
   const width = theirs.length + 1;
   let layer = new Map([[0, 0]]); // i * width + j -> fewest lines taken from theirs
   for (const line of R) {
@@ -181,15 +193,24 @@ export function interleave(R, ours, theirs, tick = makeBudget()) {
 }
 
 // Does `head` equal the marker blob with every conflict block replaced by lines taken from its two sides?
+// The budget is charged in proportion to the work: one step per candidate end, per line compared and per line copied, so a
+// block of tens of thousands of lines trips it long before the quadratic part of the search has run for any length of time.
 // -> { ok: true, droppedTheirs: [n per block] } | { ok: false, reason: 'outside-edit' | 'not-selection' | 'marker-line' }
 export function checkSelection(parsed, headLines, tick = makeBudget()) {
   const { outsides, blocks } = parsed;
   const H = headLines;
   const matchesAt = (O, pos) => {
     if (pos < 0 || pos + O.length > H.length) return false;
-    for (let i = 0; i < O.length; i++) if (H[pos + i] !== O[i]) return false;
+    for (let i = 0; i < O.length; i++) {
+      if (H[pos + i] !== O[i]) { tick(i + 1); return false; }
+    }
+    tick(Math.max(O.length, 1));
     return true;
   };
+  // markersBefore[i] = how many of H[0..i) are marker-like lines, so "does H[p..e) hold a marker line" is O(1).
+  tick(H.length + 1);
+  const markersBefore = [0];
+  for (const line of H) markersBefore.push(markersBefore.at(-1) + (isMarkerLine(line) ? 1 : 0));
   if (!matchesAt(outsides[0], 0)) return { ok: false, reason: 'outside-edit' };
 
   let sawMarker = false;
@@ -207,8 +228,9 @@ export function checkSelection(parsed, headLines, tick = makeBudget()) {
     for (let e = Math.max(lo, p); e <= hi; e++) {
       tick();
       if (!matchesAt(O, e)) continue;
+      if (markersBefore[e] > markersBefore[p]) { sawMarker = true; continue; }
+      tick(e - p + 1);
       const R = H.slice(p, e);
-      if (R.some(isMarkerLine)) { sawMarker = true; continue; }
       const got = interleave(R, ours, theirs, tick);
       if (!got.ok) { sawOther = true; continue; }
       const rest = place(b + 1, e + O.length);
