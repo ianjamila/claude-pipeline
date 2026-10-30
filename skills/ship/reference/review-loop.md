@@ -41,6 +41,13 @@ already holds. A `P state outcome` with `followupsPending: true` means a publish
   - 0: round recorded: `counts`, `preRuled` (items answered from the cache), `lightLane`. Commits merged in from the
     base branch since the previous round ("Update branch") are not shown to Codex. If the output has `baseOnly: true`
     the round was only such a merge: Codex did not run, there are no items, and it does not count toward `max_rounds`. It is not a review: it carries the last reviewed round's result forward to the merged-in content, so it is clean only if that reviewed round was (an accepted fix still needs its reviewed round).
+  - If the output has `resolutionOnly: true` (with `conflicted`, `conflictedCount`), main was merged in with a conflict and the
+    resolver only chose lines the two sides already had, so Codex was shown just the resolution (`reviewBaseKind: resolution`).
+    It is a real review (Codex, triage, judge or Fable as usual; an ACCEPT still needs its fix round) but it does not count toward
+    `max_rounds`. If the output has `resolutionIneligible: "<reason>"`, the resolution could not be taken alone (PR work in the
+    merge range, text typed into a conflict block, a lockfile or binary or renamed file, an attribute on the path, …) and the round
+    reviews the whole PR as a counted round, as before. By design these stay counted: a regenerated lockfile, merged import lines,
+    any typed text, line endings normalised by an editor, non-text conflicts, and conflicted paths with merge/diff/eol attributes.
   - 3 (`unavailable: true`, reason quota / auth / unavailable / error / malformed / github) ⇒
     `gh pr edit <pr> --add-label awaiting-review`, `P comment --pr <pr> --kind awaiting-review
     --reason "<reason>"`, `P summary --pr <pr> --outcome awaiting-review --built "…"` (works with no

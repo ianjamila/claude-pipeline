@@ -185,7 +185,7 @@ note it in the summary and carry on, never stop the run for it.
 
 Follow `reference/review-loop.md` exactly. ONE reviewer follows Codex: the `reviewer` `codex-review` prints. `fable` (medium/high risk
 or a sensitive path) ⇒ skip light lane, judge and settle tests: the arbiter (Fable) pass is the review, every round, even with zero
-Codex items. `judge` ⇒ the steps below. In short, per round `R` (max `review.max_rounds`, plus one extra round when `P state outcome` says `extraRound`; base-only rounds, where only main was merged in, don't count):
+Codex items. `judge` ⇒ the steps below. In short, per round `R` (max `review.max_rounds`, plus one extra round when `P state outcome` says `extraRound`; base-only rounds, where only main was merged in, and resolution-only rounds, where a conflict with main was resolved by choosing lines, don't count):
 Codex (`P codex-review --pr N --round R …` as a job; light lane with nothing but WORTH CONSIDERING items ⇒
 `P triage light-lane --round R` and skip the judge) → judge (`judge` agent, no model param, only
 for items without a ruling yet; `P triage validate --round R --from-tag "pipeline-judge R<R> <d8>"`)
