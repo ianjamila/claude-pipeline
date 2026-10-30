@@ -3060,3 +3060,80 @@ test('codex-review: when the proof of the resolution no longer holds after Codex
   assert.equal(r.json.error, 'resolution-changed');
   assert.equal(w.state().rounds.length, 1);
 });
+
+// End to end: a Fable PR's conflict-resolution round, published, replayed in a fresh clone (which lacks the marker tree the round was
+// diffed against), proven there by the arbiter (the tree is rebuilt), then review-complete and the review predicate the final gate uses.
+test('resolution round end to end: publish, replay in a fresh clone, arbiter rebuilds the review base, review-complete', async (t) => {
+  const w = worldIgnoringReview(t, { yml: `${SENSITIVE_YML}  max_rounds: 1\n` });
+  assertExit(w.codex(1, findingsOf()), 0);
+  assertExit(w.cli(['arbiter', 'needed', '--round', '1']), 0);
+  assertExit(arbiterRun(w, { text: fenced(FABLE_CLEAN) }), 0);
+  const merged = conflictKeepingOurs(w);
+  w.prHead(merged);
+  const r2 = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r2, 0, r2.stderr + r2.stdout);
+  assert.equal(r2.json.resolutionOnly, true);
+  const published = w.state();
+  const markerTree = published.rounds[1].reviewBase;
+  const roundPatch = patchOf(w, 2);
+  w.fake.setScript([...JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')), REMOVE_LABEL, ...COMMENTS(mine(published)), REVIEW_COMMENT[2]]);
+
+  // A fresh clone (--no-local: a local clone would copy every object): only the objects reachable from a branch come along, so the marker tree is not there.
+  const clone = join(w.scratch, 'clone');
+  const gitIn = (...args) => spawnSync('git', args, { cwd: clone, encoding: 'utf8' });
+  assert.equal(spawnSync('git', ['clone', '-q', '--no-local', w.repo.dir, clone], { encoding: 'utf8' }).status, 0);
+  const hasTree = () => gitIn('cat-file', '-e', markerTree).status === 0;
+  assert.equal(hasTree(), false, 'precondition: the marker tree exists only where the round was made');
+  // The clone's own git would write a different marker style: the forced config must make the rebuilt tree identical.
+  gitIn('config', 'merge.conflictStyle', 'zdiff3');
+  const cloneCli = (args, env = {}) => {
+    const r = spawnSync(process.execPath, [bin, ...args], {
+      cwd: clone, encoding: 'utf8',
+      env: { ...process.env, ...w.fake.env, PIPELINE_LOCK_DIR: join(w.scratch, 'locks-clone'), ...env },
+    });
+    let json = null;
+    try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* the assertion on json will say so */ }
+    return { code: r.status, json, stdout: r.stdout, stderr: r.stderr };
+  };
+  const cloneState = () => JSON.parse(readFileSync(join(clone, '.review', 'state.json'), 'utf8'));
+
+  const shown = cloneCli(['state', 'show', '--pr', '7']);
+  assertExit(shown, 0, shown.stderr + shown.stdout);
+  assert.deepEqual([shown.json.source, shown.json.recovered], ['published', true]);
+  const replayed = cloneState().rounds[1];
+  assert.deepEqual([replayed.resolutionOnly, replayed.conflicted, replayed.reviewBaseKind], [true, ['src/a.js'], 'resolution']);
+
+  // Where the rebuild cannot be trusted (an attribute on the conflicted path), the arbiter refuses; it never diffs another range.
+  const attrs = join(clone, '.git', 'info', 'attributes');
+  mkdirSync(dirname(attrs), { recursive: true });
+  writeFileSync(attrs, 'src/a.js merge=binary\n');
+  const refused = cloneCli(['arbiter', 'needed', '--round', '2']);
+  assertExit(refused, 2, refused.stdout + refused.stderr);
+  assert.equal(refused.json.error, 'review-base-unavailable');
+  assert.match(refused.json.message, /merge\.conflictStyle|attributes/);
+  rmSync(attrs);
+  assert.equal(hasTree(), false);
+
+  const needed = cloneCli(['arbiter', 'needed', '--round', '2']);
+  assertExit(needed, 0, needed.stderr + needed.stdout);
+  assert.deepEqual([needed.json.needed, needed.json.mode, needed.json.scope], [true, 'review', 'round']);
+  assert.equal(hasTree(), true, 'the review base was rebuilt');
+  assert.equal(readFileSync(needed.json.diffPath, 'utf8'), roundPatch, 'Fable is shown exactly what Codex was shown');
+
+  const projects = installTranscript(w, {
+    agentId: 'a2',
+    jsonl: transcript({ prompt: promptFor(needed.json.digest, 2), text: fenced(FABLE_CLEAN) }),
+    meta: { agentType: 'arbiter', description: needed.json.tag },
+  });
+  const applied = cloneCli(['arbiter', 'apply', '--round', '2', '--projects-dir', projects]);
+  assertExit(applied, 0, applied.stderr + applied.stdout);
+  const outcome = cloneCli(['state', 'outcome']);
+  assert.deepEqual([outcome.json.clean, outcome.json.fablePending, outcome.json.reviewedRounds, outcome.json.reachedMax], [true, [], 1, false]);
+
+  const done = cloneCli(['review-complete', '--pr', '7']);
+  assertExit(done, 0, done.stderr + done.stdout);
+  const { reviewValidFor } = await import('../pipeline/lib/triage.mjs');
+  const { config } = await loadConfig(clone);
+  assert.equal(reviewValidFor(cloneState(), currentContentHash(clone, config)), true, 'the predicate the final gate evaluates');
+  assert.match(reviewJson(postedBodies(w).at(-1)).modelProofDigest, /^[0-9a-f]{64}$/);
+});
