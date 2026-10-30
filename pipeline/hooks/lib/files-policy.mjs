@@ -2203,7 +2203,7 @@ function changesClaudeCode(cmds, scanRaw) {
 
 // Test seams that swap the real gh / codex / vercel for a fake, or lift the model pins: handing one to the pipeline CLI
 // would let a fake satisfy the merge gate. (The installed CLI also ignores them; this is the hook side.)
-const SEAM_VARS = /^PIPELINE_(?:GH|CODEX|VERCEL|TEST_MODE|UPDATE_REMOTE)$/i;
+const SEAM_VARS = /^PIPELINE_(?:GH|CODEX|VERCEL|TEST_MODE|UPDATE_REMOTE|INSTALL_RETIRED_SKILLS)$/i;
 const RUNTIMES = new Set(['node', 'nodejs', 'bun', 'deno', 'npx', 'tsx']);
 
 function setsSeamForPipeline(cmds) {

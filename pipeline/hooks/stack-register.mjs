@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Why: PreToolUse hook (matchers `Bash` and `Read|Edit|Write|Grep|Glob|NotebookEdit`) that records, BEFORE the tool runs, that
+// Why: PreToolUse hook (matchers `Bash` and `Edit|Write|MultiEdit|NotebookEdit`) that records, BEFORE the tool runs, that
 // this Claude process is using a private Supabase stack. Started through the installer's fail-closed loader (a load failure
 // exits 2). Exit 2 blocks the call; every failure after a stack was named exits 2 with the reason, unless the pause file
 // exists (then it is only logged). All judgement is in lib/stacks/register.mjs; this file reads stdin, calls it, writes the
