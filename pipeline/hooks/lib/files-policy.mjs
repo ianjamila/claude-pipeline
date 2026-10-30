@@ -29,6 +29,7 @@ import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultRe
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
 const MAX_ALIAS_LOOKUPS = 20_000; // (#111: distinct words x directories the line may be in; above it the text is refused like an over-long one, so the stats stay bounded)
+const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its rounds whose inodes are collected, so a hard link to a protected one is known)
 const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
@@ -255,18 +256,41 @@ function makeCtx(opts) {
     if (reviewIds !== null) return reviewIds;
     const dir = api.statId(pathsFor().join(cwd, '.review'));
     const rounds = new Set();
+    // (#111 Fable: dev:ino of the protected FILES themselves: a hard link to one is the same file under a name the path rules cannot see. The
+    // protected names directly in .review, and every file in a round folder one level down and two: bounded, POSIX-only like the rest.)
+    const files = new Set();
     if (dir !== null) {
-      const names = (opts.readDir ?? defaultReadDir)(pathsFor().join(cwd, '.review'));
-      if (Array.isArray(names)) for (const n of names) if (/^round-\d+$/.test(n)) { const id = api.statId(pathsFor().join(cwd, '.review', n)); if (id !== null) rounds.add(id); }
+      const readDir = opts.readDir ?? defaultReadDir;
+      const names = readDir(pathsFor().join(cwd, '.review'));
+      let budget = MAX_REVIEW_FILE_IDS;
+      const addFiles = (d, depth) => {
+        const kids = readDir(d);
+        if (!Array.isArray(kids)) return;
+        for (const k of kids) {
+          if (budget-- <= 0) return;
+          const kp = pathsFor().join(d, k);
+          const id = api.statId(kp);
+          if (id !== null) files.add(id);
+          if (depth < 2) addFiles(kp, depth + 1);
+        }
+      };
+      if (Array.isArray(names)) {
+        for (const n of names) {
+          const np = pathsFor().join(cwd, '.review', n);
+          if (/^round-\d+$/.test(n)) { const id = api.statId(np); if (id !== null) { rounds.add(id); addFiles(np, 1); } } else if (reviewFile.test(`.review/${n}`)) { const id = api.statId(np); if (id !== null) files.add(id); }
+        }
+      }
     }
-    reviewIds = { dir, rounds };
+    reviewIds = { dir, rounds, files };
     return reviewIds;
   };
   // Is `p` a protected review file reached through another name for the folder? (a) its parent directory IS <cwd>/.review and its
   // basename is a protected name (REVIEW_FILE_SRC): the protected-NAME rule, so scratch files in .review stay writable; (b) it is, or
   // lies under, an existing round-* folder (everything in a round is protected); (c) withDir: it IS <cwd>/.review itself under a name
-  // that is not `.review` (a program that chdirs there, or builds a name below it, writes a protected file the text never names).
-  // Residuals: a link the judged program makes itself does not exist yet when the hook looks, so no stat can see it; and only the
+  // that is not `.review` (a program that chdirs there, or builds a name below it, writes a protected file the text never names); (d) the
+  // path is itself the same file (dev:ino) as a protected file of the folder or a round: a hard link or file symlink under another name.
+  // Closed since the first cut: a glob through a link (hitReviewGlob), a link target built by a command substitution (linkReachesProtected),
+  // a hard link to a protected file (d). Residuals: a link the judged program makes itself does not exist yet when the hook looks, so no stat can see it; and only the
   // cwd's own <cwd>/.review is known, so a session whose cwd is a subdirectory of the checkout is not covered. The alias / inode check
   // is POSIX-only, like the protected-root inode check above: on win32 statId is null and nothing here fires (Windows behaviour unchanged).
   const statCache = new Map(); // (one evaluation: the same ancestors come up for every word of a long line)
@@ -277,9 +301,10 @@ function makeCtx(opts) {
     return id;
   };
   const hitReviewInode = (p, withDir = false) => {
-    const { dir, rounds } = reviewFolders();
+    const { dir, rounds, files } = reviewFolders();
     if (dir === null) return false;
     const P = pathsFor();
+    if (files.size > 0) { const own = stat(p); if (own !== null && files.has(own)) return true; } // (a hard link to a protected file, or a link to one)
     const base = P.basename(p);
     if (reviewFile.test(`.review/${base}`) && stat(P.dirname(p)) === dir) return true;
     if (withDir && (ci ? base.toLowerCase() : base) !== '.review' && stat(p) === dir) return true;

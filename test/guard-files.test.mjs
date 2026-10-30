@@ -1172,3 +1172,72 @@ test('#111: after a cd to a folder outside the checkout, a relative path through
     `cd ${T} && ls alias ralias`,
   ]) assert.equal(w.bash(cmd), 'allow', cmd);
 });
+
+// ---- #111 (Fable): globs through an alias, link targets built at run time, hard links ------------------------------
+
+test('#111: a glob write target through a link to the review folder (or in a glob directory name) is denied', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { tmp: T, alias: A, cwd } = w;
+  for (const cmd of [
+    `cp /tmp/x ${A}/stat?.json`,
+    `cp /tmp/x ${A}/st*te.json`,
+    `cp /tmp/x ${A}/[s]tate.json`,
+    `cp /tmp/x ${T}/al*as/state.json`,
+    `cp /tmp/x ${T}/al?as/st*.json`,
+    `cp /tmp/x ${w.ralias}/*.json`,
+    `cp /tmp/x ${T}/r*lias/codex.json`,
+    'cp /tmp/x rv/stat?.json',
+    `cd ${A} && cp /tmp/x stat?.json`,
+    `echo y > ${A}/stat?.json`,
+    `echo y > ${T}/al*as/state.json`,
+    `tee ${A}/st*.json < /tmp/x`,
+    `sed -n 'w ${A}/stat?.json' /tmp/x`,
+    `cd ${T} && cp /tmp/x al*as/state.json`,
+    `cd ${cwd} && cp /tmp/x r?/state.json`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  // (controls: reads, a glob that cannot name a protected file, a directory that is no link, a directory that holds no link)
+  for (const cmd of [
+    `cat ${A}/stat?.json`, `ls ${T}/al*as`, `cp /tmp/x ${T}/other/stat?.json`, `cp /tmp/x ${A}/hard*.json`,
+    `cp /tmp/x ${T}/no*such/stat?.json`, `echo y > ${A}/hard?tops.json`, `cp /tmp/x ${cwd}/*.txt`,
+  ]) assert.equal(w.bash(cmd), 'allow', cmd);
+});
+
+test('#111: a link whose target is a command substitution is refused with a review folder (it cannot be resolved), allowed without one', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  for (const cmd of [
+    `ln -s "$(printf '.%s' review)" lnk`,
+    'ln -s "$(echo .review)" lnk',
+    'ln -s `echo .review` lnk',
+    'ln -sf "$(pwd)/x" lnk', // (fails closed too: a substitution is never resolved)
+    'link "$(echo .review)" lnk',
+    'cp -s "$(echo .review)" lnk',
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  for (const cmd of ['ln -s ../x lnk', 'ln -s target lnk']) assert.equal(w.bash(cmd), 'allow', cmd);
+  const n = reviewAliasWorld(t, { review: false });
+  for (const cmd of ['ln -s "$(echo .review)" lnk', 'ln -sf "$(pwd)/x" lnk']) assert.equal(n.bash(cmd), 'allow', cmd);
+});
+
+test('#111: a hard link to a protected review file under another name is denied; one to a scratch file is not', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { cwd } = w;
+  fs.writeFileSync(path.join(cwd, '.review', 'state.json'), '{}');
+  fs.writeFileSync(path.join(cwd, '.review', 'round-1', 'codex.json'), '{}');
+  fs.writeFileSync(path.join(cwd, '.review', 'hardstops.json'), '{}');
+  const mk = (src, dest) => { try { fs.linkSync(path.join(cwd, ...src), path.join(cwd, dest)); return true; } catch { return false; } };
+  if (!mk(['.review', 'state.json'], 'H') || !mk(['.review', 'round-1', 'codex.json'], 'HC') || !mk(['.review', 'hardstops.json'], 'HS')) { t.skip('cannot create hard links here'); return; }
+  assert.equal(w.write(path.join(cwd, 'H')), 'deny');
+  assert.equal(w.write(path.join(cwd, 'HC')), 'deny');
+  assert.equal(w.write(path.join(cwd, 'HS')), 'allow');
+  // (a symlink to the file itself is the same file too)
+  fs.symlinkSync(path.join(cwd, '.review', 'state.json'), path.join(cwd, 'L'), 'file');
+  assert.equal(w.write(path.join(cwd, 'L')), 'deny');
+  assert.equal(w.bash('echo y > L'), 'deny');
+  for (const cmd of [
+    'cp /tmp/x H', 'echo y > H', 'tee H < /tmp/x', 'sed -i s/a/b/ H', `node -e "require('fs').writeFileSync('H','y')"`, 'cp /tmp/x HC', 'echo y > HC',
+    `cd ${cwd} && cp /tmp/x H`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  for (const cmd of ['cat H', 'cp /tmp/x HS', 'echo y > HS', `node -e "require('fs').writeFileSync('HS','y')"`, 'cp /tmp/x unrelated.txt']) assert.equal(w.bash(cmd), 'allow', cmd);
+});
