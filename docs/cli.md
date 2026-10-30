@@ -98,14 +98,15 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
   --base must be the PR's merge base for round 1 and the previous round's toHead after that, else exit 2 {error:base-mismatch}
   exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)
   exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound);
-    base-only and resolution-only rounds (below) never count toward the cap
+    base-only rounds and resolution-only rounds (below) never count toward the cap
   reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired
     (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker's brief for the sensitive files; judge otherwise. Once fable, always fable
   commits merged in from the PR's base branch since the previous round are left out of the reviewed diff; a round that only merged them in
     is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}
   when that merge conflicted and the resolution only chose lines the two sides already had, Codex reviews just the resolution:
-    {resolutionOnly:true, conflicted, conflictedCount}; otherwise the whole PR is reviewed as a counted round and
-    {resolutionIneligible:"<reason>"} says why
+    {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise
+    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not
+    taken alone
   exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver
   env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)
 ```
