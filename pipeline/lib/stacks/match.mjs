@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { splitCommand } from '../proc.mjs';
+import { splitCommand } from '../shell-words.mjs';
 import { expandHome, isInside, samePath, toPosix } from '../paths.mjs';
 
 export const DEV_RE = /\b(?:next\s+(?:dev|start)|npm\s+(?:run\s+)?(?:dev|start)|npm\s+start)\b/;
