@@ -1296,3 +1296,13 @@ test('#111: a brace list or range that expands to a protected review file is den
   assert.equal(n.bash('cp x out/{a..z}{1..9}.txt'), 'allow');
   assert.equal(n.bash('touch out/{1..100}.txt'), 'allow');
 });
+
+test('#111: a link whose name holds `,` or `=` is followed too', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  for (const cmd of [
+    'cp x a,b/state.json', "cp x 'a=b'/state.json", 'cp x a=b/state.json', 'echo y > a,b/state.json', 'echo y > a=b/state.json',
+    `cd ${w.tmp}/repo && tee a,b/state.json < /tmp/x`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  for (const cmd of ['cp x a,b/notes.txt', 'cp x a=b/hardstops.json', 'cp x c,d/state.json', 'cat a,b/state.json']) assert.equal(w.bash(cmd), 'allow', cmd);
+});

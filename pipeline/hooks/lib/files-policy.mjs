@@ -987,11 +987,13 @@ function makeMatchers(ctx) {
   // cached per evaluation, so this stays cheap; with no review folder nothing is looked up at all.
   // A text over either cap (its length, or its distinct words times the directories) is not scanned word by word: with a review folder
   // present it counts as a hit (fail closed; without one nothing can be reached).
+  // (the second pattern keeps `,` and `=`: a link may be named `a,b` or `a=b`; the first stays for `VAR=path` and `a,path` glue, so both readings are candidates)
   const ALIAS_WORD = /[^\s'"`;|&<>(){}[\],=*?$]+/g;
+  const ALIAS_WORD_WIDE = /[^\s'"`;|&<>(){}[\]*?$]+/g;
   const aliasInText = (v, dirs) => {
     if (v.length > MAX_ALIAS_TEXT) return ctx.hasReviewDir();
     const where = dirs?.length ? dirs : [ctx.cwd];
-    const words = new Set(v.match(ALIAS_WORD) ?? []);
+    const words = new Set([...(v.match(ALIAS_WORD) ?? []), ...(v.match(ALIAS_WORD_WIDE) ?? [])]);
     if (words.size * where.length > MAX_ALIAS_LOOKUPS) return ctx.hasReviewDir();
     for (const word of words) {
       if (!/[A-Za-z0-9]/.test(word)) continue;
