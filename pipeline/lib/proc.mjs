@@ -4,7 +4,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { accessSync, constants as fsConstants, existsSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { PIPELINE_ROOT, SEAM_VARS, isInstalledCopy, seamValue } from './seams.mjs';
+import { splitCommand } from './shell-words.mjs';
 
 const MAX_BUFFER = 64 * 1024 * 1024;
 
@@ -245,78 +246,10 @@ export function runAsync(cmd, args = [], opts = {}) {
   return spawnAsync(plan.file, plan.args, { windowsVerbatimArguments: plan.windowsVerbatimArguments }, opts);
 }
 
-// Minimal quote-aware splitter for the PIPELINE_GH / PIPELINE_CODEX override strings.
-// Single quotes are literal; backslash escapes outside single quotes. Inside double quotes only
-// `\"` and `\\` are escapes, so a quoted Windows path keeps its backslashes. On Windows an unquoted
-// backslash is always literal (paths), except before a double quote.
-export function splitCommand(str, platform = process.platform) {
-  const out = [];
-  let cur = '';
-  let inToken = false;
-  let quote = null;
-  for (let i = 0; i < str.length; i++) {
-    const ch = str[i];
-    const next = str[i + 1];
-    if (quote === "'") {
-      if (ch === "'") quote = null;
-      else cur += ch;
-    } else if (ch === '\\') {
-      if (quote === '"') {
-        if (next === '"' || next === '\\') { cur += next; i++; } else cur += ch;
-      } else if (platform === 'win32' && next !== '"') {
-        cur += ch;
-        inToken = true;
-      } else if (next !== undefined) {
-        cur += next;
-        i++;
-        inToken = true;
-      }
-    } else if (quote === '"') {
-      if (ch === '"') quote = null;
-      else cur += ch;
-    } else if (ch === '"' || ch === "'") {
-      quote = ch;
-      inToken = true;
-    } else if (/\s/.test(ch)) {
-      if (inToken) { out.push(cur); cur = ''; inToken = false; }
-    } else {
-      cur += ch;
-      inToken = true;
-    }
-  }
-  if (quote) throw new Error(`splitCommand: unterminated ${quote} quote in: ${str}`);
-  if (inToken) out.push(cur);
-  return out;
-}
-
-// ---- test seams are for the repo checkout only --------------------------------------------------------------------
-// PIPELINE_GH / PIPELINE_CODEX / PIPELINE_VERCEL swap the tool the gate trusts for a script, PIPELINE_TEST_MODE relaxes
-// the arbiter's model proof, and PIPELINE_UPDATE_REMOTE points `pipeline update` at another repository to fetch from. They exist so the test suite can run the real CLI against fakes; a production install must
-// never honour them (an environment variable set by anything that can launch the CLI would otherwise decide what the
-// gate sees). An installed copy is recognised by the INSTALLED.json manifest the installer writes into the pipeline root
-// (the directory holding bin/); the repo checkout has none. When installed, a seam is ignored with one warning on stderr.
-export const PIPELINE_ROOT = fileURLToPath(new URL('..', import.meta.url));
-// PIPELINE_DOCKER / PS / LSOF / SUPABASE / STACKS_DEADLINE_MS belong to the stack-stop hooks: they are read through stacksSeam
-// (lib/stacks/paths.mjs), which additionally requires an isolated state root.
-export const SEAM_VARS = [
-  'PIPELINE_GH', 'PIPELINE_CODEX', 'PIPELINE_VERCEL', 'PIPELINE_TEST_MODE', 'PIPELINE_UPDATE_REMOTE',
-  'PIPELINE_DOCKER', 'PIPELINE_PS', 'PIPELINE_LSOF', 'PIPELINE_SUPABASE', 'PIPELINE_STACKS_DEADLINE_MS',
-];
-export const isInstalledCopy = (root = PIPELINE_ROOT) => existsSync(path.join(root, 'INSTALLED.json'));
-
-const warned = new Set();
-// The value of a test seam variable (call env first, then process.env), or undefined when unset or not honoured.
-// `root` and `warn` are injectable for tests.
-export function seamValue(name, env, { root = PIPELINE_ROOT, warn = (m) => process.stderr.write(m) } = {}) {
-  const raw = env?.[name] ?? process.env[name];
-  if (raw === undefined || raw === '') return undefined;
-  if (!isInstalledCopy(root)) return raw;
-  if (!warned.has(name)) {
-    warned.add(name);
-    warn(`pipeline: ignoring ${name}: test seams are not honoured by an installed copy\n`);
-  }
-  return undefined;
-}
+// splitCommand (the quote-aware splitter for the PIPELINE_GH / PIPELINE_CODEX override strings) and the test-seam helpers
+// (PIPELINE_ROOT, SEAM_VARS, isInstalledCopy, seamValue) live in shell-words.mjs and seams.mjs, which spawn nothing; they are
+// re-exported here so every importer of proc.mjs is unchanged.
+export { splitCommand, PIPELINE_ROOT, SEAM_VARS, isInstalledCopy, seamValue };
 
 // A seam that is a switch: only the exact value `1` turns it on.
 export const seamFlag = (name, env, opts) => seamValue(name, env, opts) === '1';
