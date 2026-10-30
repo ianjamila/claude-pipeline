@@ -2915,3 +2915,148 @@ test('triage owner-ruling: says the ruling is not published yet and that state s
   assert.match(r.json.next, /comment --pr 7 --kind triage/);
   assert.match(r.json.next, /state show/);
 });
+
+// ---- a conflict with main resolved by choosing lines: a resolution-only round --------------------------------
+
+// Main edits the very line (src/a.js 12) the PR changed, so the merge conflicts; the resolver keeps the PR's side. Whatever is in
+// src/a.js on the branch right now is what the resolver keeps. -> the merge commit.
+const MAIN_EDITS_V12 = () => aFile(false).replace('v12 = 12', 'v12 = 1200');
+function conflictKeepingOurs(w, extra = {}) {
+  const ours = readFileSync(join(w.repo.dir, 'src/a.js'), 'utf8');
+  return mergeMainInto(w, { 'src/a.js': MAIN_EDITS_V12(), 'src/from-main.js': 'export const other = 1;\n', ...extra }, { resolve: { 'src/a.js': ours } });
+}
+const MAX1 = `${pipelineYml()}review:\n  max_rounds: 1\n`;
+
+test('codex-review: a conflict resolved by choosing lines is a resolution-only round: Codex sees only the resolution, and the cap is not charged', (t) => {
+  const w = worldIgnoringReview(t, { yml: MAX1 });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = conflictKeepingOurs(w);
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.resolutionOnly, true);
+  assert.deepEqual([r.json.conflicted, r.json.conflictedCount, r.json.baseOnly, r.json.resolutionIneligible], [['src/a.js'], 1, undefined, undefined]);
+  assert.equal(w.captured().length, 2, 'Codex ran: a resolution round is a real review');
+  const round = w.state().rounds[1];
+  assert.equal(round.reviewBaseKind, 'resolution');
+  assert.equal(round.resolutionOnly, true);
+  assert.deepEqual([round.conflicted, round.conflictedCount, round.baseOnly], [['src/a.js'], 1, undefined]);
+  assert.deepEqual(round.blocks, [{ path: 'src/a.js', block: 1, droppedTheirs: 1 }]);
+  const patch = patchOf(w, 2);
+  assert.equal((patch.match(/^diff --git /gm) ?? []).length, 1, 'one file');
+  assert.match(patch, /^diff --git a\/src\/a\.js b\/src\/a\.js$/m);
+  assert.match(patch, /^-<<<<<<< /m, 'the marker lines are what the resolution removed');
+  assert.match(patch, /^-export const v12 = 1200;$/m, 'main\'s dropped line is shown');
+  assert.doesNotMatch(patch, /from-main\.js/);
+  assert.deepEqual(patch.split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')), [], 'nothing is added');
+
+  const prompt = w.captured()[1].stdin;
+  assert.match(prompt, /trial-merged with the base branch/);
+  assert.match(prompt, /```conflicted paths\nsrc\/a\.js\n```/);
+  assert.match(prompt, /```dropped base-branch lines\nsrc\/a\.js block 1: 1 line\(s\) dropped\n```/);
+  assert.match(prompt, /justify EVERY dropped base-branch line/);
+  assert.ok(prompt.includes(`git show ${w.head}:<path>`) && prompt.includes('git show '), 'both sides can be read');
+  const outcome = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([outcome.rounds, outcome.reviewedRounds, outcome.clean, outcome.reachedMax], [2, 1, true, false]);
+});
+
+test('codex-review: a resolution-only round is not capped after the extra confirm round was used', (t) => {
+  const w = worldIgnoringReview(t, { yml: MAX1 });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head2 = w.repo.commit('fix');
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0, 'the extra confirm round');
+  const merged = conflictKeepingOurs(w);
+  const r = w.codex(3, findingsOf(), { from: head2, to: merged });
+  assertExit(r, 0, 'would be round-cap for a counted round: ' + r.stderr + r.stdout);
+  assert.equal(r.json.resolutionOnly, true);
+  assert.equal(w.cli(['state', 'outcome']).json.reviewedRounds, 2);
+  // a counted round after it is still refused
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head4 = w.repo.commit('own change');
+  const capped = w.codex(4, findingsOf(), { from: merged, to: head4 });
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+});
+
+test('codex-review: PR work after the conflict merge is NOT eligible: whole-pr, counted, resolutionIneligible says why', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  conflictKeepingOurs(w);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('later pr commit');
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.resolutionOnly, undefined);
+  assert.match(r.json.resolutionIneligible, /^history-nonmerge/);
+  const round = w.state().rounds[1];
+  assert.deepEqual([round.reviewBaseKind, round.resolutionOnly, round.conflicted], ['whole-pr', undefined, undefined]);
+  assert.equal(w.cli(['state', 'outcome']).json.reviewedRounds, 2, 'counted');
+  assert.match(patchOf(w, 2), /src\/c\.js/);
+});
+
+test('codex-review: an ineligible conflict round at the cap is refused (round-cap) exactly as before', (t) => {
+  const w = worldIgnoringReview(t, { yml: MAX1 });
+  assertExit(w.codex(1, findingsOf()), 0);
+  conflictKeepingOurs(w);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('later pr commit');
+  const capped = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+  assert.equal(w.captured().length, 1, 'Codex never ran');
+  assert.equal(w.state().rounds.length, 1);
+});
+
+test('codex-review: a resolution that types new text into a block stays a counted whole-pr round', (t) => {
+  const w = worldIgnoringReview(t, { yml: MAX1 });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const typed = readFileSync(join(w.repo.dir, 'src/a.js'), 'utf8').replace('compute(x.y)', 'compute(x.y) + typedByHand');
+  mergeMainInto(w, { 'src/a.js': MAIN_EDITS_V12() }, { resolve: { 'src/a.js': typed } });
+  const capped = w.codex(2, findingsOf(), { from: w.head, to: w.repo.git(['rev-parse', 'HEAD']).trim() });
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap', 'typed text is PR work: counted, so capped');
+});
+
+test('codex-review: a PR that targets another branch gets no resolution round: unchanged (previous, Codex runs, no resolutionIneligible)', (t) => {
+  const gh = GH.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { ...e.stdoutJson, baseRefName: 'release' } } : e));
+  const w = worldIgnoringReview(t, { gh, yml: MAX1 });
+  w.repo.git(['branch', 'release', w.base]);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const ours = readFileSync(join(w.repo.dir, 'src/a.js'), 'utf8');
+  const merged = mergeMainInto(w, { 'src/a.js': MAIN_EDITS_V12() }, { branch: 'release', resolve: { 'src/a.js': ours } });
+  const capped = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap', 'the target is not the default branch: a counted round');
+  const w2 = worldIgnoringReview(t, { gh });
+  w2.repo.git(['branch', 'release', w2.base]);
+  assertExit(w2.codex(1, findingsOf()), 0);
+  const merged2 = mergeMainInto(w2, { 'src/a.js': MAIN_EDITS_V12() }, { branch: 'release', resolve: { 'src/a.js': readFileSync(join(w2.repo.dir, 'src/a.js'), 'utf8') } });
+  const r = w2.codex(2, findingsOf(), { from: w2.head, to: merged2 });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.resolutionOnly, r.json.resolutionIneligible, w2.state().rounds[1].reviewBaseKind], [undefined, undefined, 'previous']);
+});
+
+test('codex-review: a Fable PR gets fableRequired on its resolution round', (t) => {
+  const w = worldIgnoringReview(t, { yml: `${SENSITIVE_YML}  max_rounds: 1\n` });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = conflictKeepingOurs(w);
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.resolutionOnly, r.json.reviewer], [true, 'fable']);
+  const round = w.state().rounds[1];
+  assert.deepEqual([round.fableRequired, round.sensitivePaths, round.resolutionOnly], [true, ['src/a.js'], true]);
+  assert.deepEqual(w.cli(['state', 'outcome']).json.fablePending, [1, 2]);
+});
+
+test('codex-review: when the proof of the resolution no longer holds after Codex answered (main moved), the round is refused, not counted free', (t) => {
+  const w = worldIgnoringReview(t, { yml: MAX1 });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = conflictKeepingOurs(w);
+  // while "Codex is thinking" main goes back to where it was: the merged-in commit is no longer on it
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged, env: { FAKE_CODEX_DURING: `git -C "${w.repo.dir}" update-ref refs/heads/main ${w.base}` } });
+  assertExit(r, 2, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'resolution-changed');
+  assert.equal(w.state().rounds.length, 1);
+});
