@@ -450,6 +450,20 @@ test('resolutionReviewBase: a marker-shaped trio already in the file as content 
   assert.ok(deleted.ineligible, `deleting the content trio must not be eligible: ${JSON.stringify(deleted)}`);
 });
 
+test('parseConflictBlocks fast path (R2-B1): a side ending the blob without a newline is the blob\'s own last line, not an identical earlier line', () => {
+  const l = (...x) => x.map((s) => `${s}\n`);
+  // Common prefix "o a b c d", then ours ends the file with "o" (no newline), theirs with "t\n". git's marker blob shows ours as "o\n",
+  // which also matches the FIRST line of the blob. The block's ours line must be the blob's own "o" (no newline).
+  const M = l('o', 'a', 'b', 'c', 'd', '<<<<<<< x', 'o', '=======', 't', '>>>>>>> y');
+  const S2 = [...l('o', 'a', 'b', 'c', 'd'), 'o'];
+  const S3 = l('o', 'a', 'b', 'c', 'd', 't');
+  const p = parseConflictBlocks(M, S2, S3);
+  assert.deepEqual(p.blocks, [{ ours: ['o'], theirs: l('t') }]);
+  // picking ours unchanged is a selection; adding a newline to it is not
+  assert.equal(checkSelection(p, S2).ok, true);
+  assert.equal(checkSelection(p, l('o', 'a', 'b', 'c', 'd', 'o')).ok, false);
+});
+
 test('parseConflictBlocks fast path with labels: only markers carrying the trial merge labels (alone or with ":<path>") open and close a block', () => {
   const l = (...x) => x.map((s) => `${s}\n`);
   const labels = { ours: 'aaa', theirs: 'bbb' };

@@ -99,18 +99,32 @@ function fastSplit(M, S2, S3, tick, labels) {
 
   // The first run of lines `seg` in S at or after `from` (the missing-final-newline rule applies at the blob's last line), as the
   // blob's own lines; null when there is none. -> { at, lines }
+  const matchAt = (seg, S, q) => {
+    tick();
+    let i = 0;
+    for (; i < seg.length; i++) {
+      const want = S[q + i];
+      if (seg[i] === want) continue;
+      const last = q + i === S.length - 1;
+      if (!(last && i === seg.length - 1 && !want.endsWith('\n') && seg[i] === `${want}\n`)) break;
+    }
+    tick(i);
+    return i === seg.length;
+  };
+  // The earliest run can be the wrong one when the side ends the blob without a final newline: git's marker blob shows that last
+  // line WITH a newline, so an identical line earlier in the blob (with its own newline) matches too, and would make the block's
+  // side line differ from the blob's own bytes. When a run ending at the blob's newline-less last line also matches and its lines
+  // differ from the earliest run's, which one the block is cannot be told here: null, so the exact parser decides.
   const run = (seg, S, from) => {
     for (let q = from; q + seg.length <= S.length; q++) {
-      tick();
-      let i = 0;
-      for (; i < seg.length; i++) {
-        const want = S[q + i];
-        if (seg[i] === want) continue;
-        const last = q + i === S.length - 1;
-        if (!(last && i === seg.length - 1 && !want.endsWith('\n') && seg[i] === `${want}\n`)) break;
+      if (!matchAt(seg, S, q)) continue;
+      const found = { at: q + seg.length, lines: S.slice(q, q + seg.length) };
+      const eof = S.length - seg.length;
+      if (seg.length > 0 && eof > q && !S[S.length - 1].endsWith('\n') && matchAt(seg, S, eof)) {
+        const other = S.slice(eof);
+        if (other.some((l, k) => l !== found.lines[k])) return null;
       }
-      tick(i);
-      if (i === seg.length) return { at: q + seg.length, lines: S.slice(q, q + seg.length) };
+      return found;
     }
     return null;
   };
