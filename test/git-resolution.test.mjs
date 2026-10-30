@@ -112,7 +112,25 @@ test('mergeTree (and so the synthetic base of effectiveReviewBase) runs with the
   const mt = calls.filter((a) => a.includes('merge-tree'));
   assert.equal(mt.length, 1);
   const cfg = mt[0].filter((a, i) => mt[0][i - 1] === '-c');
-  assert.ok(cfg.includes('merge.conflictStyle=merge') && cfg.includes('merge.renormalize=false'), JSON.stringify(cfg));
+  for (const want of ['merge.conflictStyle=merge', 'merge.renormalize=false', 'merge.renames=true', 'merge.directoryRenames=conflict', 'merge.renameLimit=7000']) assert.ok(cfg.includes(want), `${want} in ${JSON.stringify(cfg)}`);
+});
+
+test('mergeTree: the user\'s rename settings (merge.directoryRenames, merge.renames, rename limits) do not change the trial merge tree', () => {
+  // ours renames the directory d to e; main adds d/new.txt and edits d/f2.txt. With directory renames on (conflict) that is a
+  // conflict; a user's merge.directoryRenames=false would leave new.txt in d and merge cleanly, so the tree id would differ.
+  const f = (i, last) => T('l1', 'l2', 'l3', 'l4', 'l5', 'l6', last ?? `l7 ${i}`);
+  const s = conflictRepo({
+    base: { 'd/f1.txt': f(1), 'd/f2.txt': f(2), 'd/f3.txt': f(3) },
+    ours: { 'd/f1.txt': null, 'd/f2.txt': null, 'd/f3.txt': null, 'e/f1.txt': f(1, 'l7 changed'), 'e/f2.txt': f(2), 'e/f3.txt': f(3) },
+    theirs: { 'd/new.txt': T('n'), 'd/f2.txt': f(2, 'l7 2 MAIN') },
+  });
+  const plain = mergeTree(s.from, 'main', s.o);
+  assert.equal(plain.clean, false, 'directoryRenames=conflict reports new.txt');
+  for (const [k, v] of [['merge.directoryRenames', 'false'], ['merge.directoryRenames', 'true'], ['merge.renames', 'false'], ['diff.renames', 'false'], ['merge.renameLimit', '1'], ['diff.renameLimit', '1']]) {
+    s.repo.git(['config', k, v]);
+    assert.deepEqual(mergeTree(s.from, 'main', s.o), plain, `${k}=${v}`);
+    assert.equal(mergeTreeDetailed(s.from, 'main', s.o).tree, plain.tree, `${k}=${v}`);
+  }
 });
 
 // ---------- resolutionReviewBase: eligible ----------
