@@ -110,8 +110,13 @@ export const supportsMergeTreeWrite = (o) => {
 };
 
 // A trial merge must give the SAME tree id on every machine: a user's merge.conflictStyle (zdiff3 / diff3 write other marker
-// text) or merge.renormalize would change the tree, and the tree id is what a review round records as its base.
-const MERGE_CONFIG = ['-c', 'merge.conflictStyle=merge', '-c', 'merge.renormalize=false'];
+// text) or merge.renormalize would change the tree, and the tree id is what a review round records as its base. So would the
+// settings merge-ort reads for rename detection (merge.renames, merge.directoryRenames, merge.renameLimit / diff.renameLimit):
+// they are pinned to git's own documented defaults, so a default-config machine gets the same tree id as before.
+const MERGE_CONFIG = [
+  '-c', 'merge.conflictStyle=merge', '-c', 'merge.renormalize=false',
+  '-c', 'merge.renames=true', '-c', 'merge.directoryRenames=conflict', '-c', 'merge.renameLimit=7000',
+];
 
 // A trial merge of `head` into `base` that touches no ref, index or working tree (it only writes tree objects).
 // -> { clean: true, tree } | { clean: false, tree } (exit 1: conflicts). Any other exit (a missing object, an old git) throws.
@@ -300,7 +305,9 @@ function resolutionChecks({ from, forkPoint, head, baseRef }, o) {
     if (ch.newMode !== c.stages[2].mode || ch.oldMode !== c.stages[2].mode) throw fail('conflict-mode', `${c.path} is ${ch.newMode} in head`);
   }
 
-  // 2d: per file, every block resolved by selecting lines of its two sides.
+  // 2d: per file, every block resolved by selecting lines of its two sides. The marker blob may hold clean hunks git auto-merged
+  // from one side next to its conflict blocks; parseConflictBlocks (resolution.mjs) proves each block's sides are runs of the
+  // stage blobs and checkSelection holds the resolution to the marker blob's own lines outside the blocks.
   const tick = makeBudget(o?.resolutionSearchBudget);
   const blocks = [];
   for (const c of merged.conflicts) {
@@ -312,7 +319,7 @@ function resolutionChecks({ from, forkPoint, head, baseRef }, o) {
       // proc.run decodes UTF-8: invalid bytes would compare equal after the decode, so they are not byte-exact.
       if (text.includes('\uFFFD')) throw fail('non-utf8', `${c.path} (${name}) is not valid UTF-8`);
     }
-    const parsed = parseConflictBlocks(splitLines(marker), splitLines(s2), splitLines(s3), tick);
+    const parsed = parseConflictBlocks(splitLines(marker), splitLines(s2), splitLines(s3), tick, { ours: fromSha, theirs: forkSha });
     if (parsed.reason === 'too-many-blocks') throw fail('too-many-blocks', `${c.path} has more than ${MAX_BLOCKS} conflict blocks`);
     if (parsed.reason) throw fail(parsed.reason === 'ambiguous' ? 'parse-ambiguous' : 'parse', c.path);
     if (parsed.blocks.length === 0) throw fail('no-blocks', `${c.path} has no conflict block`);
