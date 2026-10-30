@@ -1,5 +1,8 @@
-# Repo CI for claude-pipeline itself. The two job names are this repo's required checks
-# (.claude/pipeline.yml ci.required_checks): renaming a job breaks branch protection.
+# Repo CI for claude-pipeline itself. The two check names "test (ubuntu)" and "test (windows)" are this repo's required
+# checks (.claude/pipeline.yml ci.required_checks): renaming either breaks branch protection. "test (windows)" is an
+# AGGREGATE job: the suite runs in three shards ("test (windows 1/3)" .. "3/3", not required on their own) and the
+# aggregate goes green only when every shard succeeded. A failed, cancelled or skipped shard makes it red, never
+# green or skipped, so a required check can never be satisfied by a shard that did not run.
 #
 # Every step runs under bash (Git Bash on Windows) so one script serves both runners. The
 # installer runs into a throwaway Claude home whose path contains a space, then --check must
@@ -9,7 +12,7 @@
 # (.github/scripts/tested-tree.mjs): identical tree (git tree sha of the pushed commit == tree of the PR head), the PR
 # head contains the previous main (so the PR run's merge checkout was that same tree), and a completed pull_request run
 # of this workflow on that head has this job green. That makes the main run redundant, so a squash merge of an
-# up-to-date PR costs no second ~40 minutes. If the PR branch was NOT up to date at merge, the trees differ and the job
+# up-to-date PR costs no second long run. If the PR branch was NOT up to date at merge, the trees differ and the job
 # runs: that is the intended fail-open. Any API or git error also means run. The job itself still starts and reports
 # success (skipped steps), so the required check names are unchanged. pull_request runs never skip.
 name: CI
@@ -87,12 +90,18 @@ jobs:
     permissions: {}
     uses: ./.github/workflows/proof-anchor.yml
 
-  test-windows:
-    name: test (windows)
+  # The Windows suite is slow (~30-36 min as one job), so it runs as three shards in parallel: node scripts/test.mjs
+  # --shard I/3 gives each runner a size-balanced third of the test files. One Node version on Windows: Node 24, the
+  # current LTS line and what the actions themselves run on. Node 20 stays covered on ubuntu.
+  test-windows-shard:
+    name: test (windows ${{ matrix.shard }}/3)
     runs-on: windows-latest
-    # One Node version on Windows (the suite takes ~30-36 min there): Node 24, the current LTS line and what the
-    # actions themselves run on. Node 20 stays covered on ubuntu.
-    timeout-minutes: 60
+    timeout-minutes: 45
+    strategy:
+      # Let the other shards finish so one run shows every failure; the aggregate below still goes red.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       # Keep LF endings: .gitattributes pins *.mjs/*.sh to LF and fixtures to -text, and the
       # byte-exact fixture tests (diffs, .cmd quoting) depend on that.
@@ -112,16 +121,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
-          JOB_NAME: test (windows)
+          JOB_NAME: test (windows ${{ matrix.shard }}/3)
 
       - name: Node 24
         if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - name: Tests (Node 24)
+      - name: Tests (Node 24, shard ${{ matrix.shard }}/3)
         if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
-        run: node scripts/test.mjs
+        run: node scripts/test.mjs --shard ${{ matrix.shard }}/3
+      # The installer round trip is one script, not a shard of the suite: it runs once, in shard 3.
       - name: Installer round trip (Node 24)
-        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
+        if: matrix.shard == 3 && (github.event_name != 'push' || steps.tested.outputs.run != 'false')
         run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 24"
+
+  # The required check. always() makes it run (and report) even when a shard failed or was cancelled; it is green only
+  # when the shard job's overall result is exactly "success" (a skipped or cancelled matrix would otherwise leave the
+  # check missing or neutral). Do not add steps that can succeed independently of that result.
+  test-windows:
+    name: test (windows)
+    needs: test-windows-shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every Windows shard passed
+        env:
+          SHARDS_RESULT: ${{ needs.test-windows-shard.result }}
+        run: |
+          echo "test-windows-shard result: $SHARDS_RESULT"
+          [ "$SHARDS_RESULT" = "success" ] || exit 1
