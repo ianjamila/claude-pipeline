@@ -1,7 +1,7 @@
 // Per-branch PR discovery for `pipeline worktrees prune` (spec §4 rule 2). Complete or nothing: any GitHub error,
 // non-advancing cursor or page cap returns ok:false, which the caller turns into "kept: PR data incomplete" — a
 // truncated answer is never read as "no open PR".
-import { parseRemote } from '../notify.mjs';
+import { parseRemote } from '../remote-url.mjs';
 
 export const BRANCH_PRS_QUERY = `query($owner: String!, $name: String!, $first: Int!, $after: String, $branch: String!) {
   repository(owner: $owner, name: $name) {

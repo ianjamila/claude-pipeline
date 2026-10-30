@@ -76,17 +76,17 @@ Exit: 0 pushed (or nothing to push) · 2 environment / git error · 3 GitHub (`g
 record where the ship run stands in the PR summary comment (refuses unless local HEAD is the pushed PR head).
 
 ```
-pipeline checkpoint --pr N --step build|verify|pr|review|gate|awaiting-owner-merge|merge|prod-watch|ended [--next TEXT] [--detail TEXT]
+pipeline checkpoint --pr N --step build|verify|pr|review|gate|awaiting-owner-merge|merge|ended [--next TEXT] [--detail TEXT]
                     [--request-file F] [--tasks-file F] [--task-done ID] [--verify-report] [--round R] [--resumed] [--repo DIR]
   -> {ok, url, action, record, warnings}; exit 1 {error: unpushed | behind | diverged} (local HEAD is not the PR head on GitHub), 2 usage, 3 GitHub unavailable
   --request-file: the user's request, text, at most 2 KB · --tasks-file: JSON [{id, title, spec}] · --task-done ID: mark one task done (repeatable)
-  --resumed: this run was taken over by `ship resume` (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require the owner's recorded "merge" (--owner-approved-head + --owner-approved-items)
+  --resumed: this run was taken over from an earlier session (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require the owner's recorded "merge" (--owner-approved-head + --owner-approved-items)
   --verify-report: copy {head, tree, mode, ok, failedStep} of the verify report, only when its head and tree are this HEAD's (otherwise a warning)
 ```
 
 Exit: 0 recorded · 1 `unpushed` (local HEAD is ahead of the PR head on GitHub: push first) / `behind` (the PR has newer commits: pull) / `diverged` (neither is an ancestor of the other, or the PR head is not fetched here: nothing is written) · 2 usage (unknown `--step`, a `--request-file` over 2 KB or not text, a bad `--tasks-file`, a record from a newer pipeline version) · 3 GitHub (`gh`) unavailable.
 
-`--resumed` is passed by a session that takes over a stalled run (or adopts a PR) as its first checkpoint: it stamps `record.resumed` `{at, host, head}`, which later checkpoints keep, and which makes `merge` demand the owner's recorded "merge" for the exact head and owner-item set (`--owner-approved-head` + `--owner-approved-items`, checked against the owner-go records). It sets the heartbeat (`os.hostname()` and the time) and keeps the summary sections already in the comment. `--verify-report` copies the report at `verify.report` only when its head and tree are this HEAD's; otherwise it is ignored and `warnings` says why. A step other than `ended` / `awaiting-owner-merge` clears a previous `outcome` (the run is going again).
+`--resumed` is passed by a session that takes over a stalled run (or adopts a PR) as its first checkpoint (kept so records written by the removed `ship resume` stay guarded): it stamps `record.resumed` `{at, host, head}`, which later checkpoints keep, and which makes `merge` demand the owner's recorded "merge" for the exact head and owner-item set (`--owner-approved-head` + `--owner-approved-items`, checked against the owner-go records). It sets the heartbeat (`os.hostname()` and the time) and keeps the summary sections already in the comment. `--verify-report` copies the report at `verify.report` only when its head and tree are this HEAD's; otherwise it is ignored and `warnings` says why. A step other than `ended` / `awaiting-owner-merge` clears a previous `outcome` (the run is going again).
 
 ## codex-review
 
@@ -200,21 +200,6 @@ With `owner_approval: chat` in pipeline.yml every would-be-blocking hit is retur
 
 Exit: 0 no blocking hits (report-only hits, `advisory`, are listed but never block), or blocking hits approved by `human-approved` · 1 unapproved blocking hits · 2 usage / config.
 
-## inbox
-
-read-only triage of every open PR (and recently merged ones): what each waits for and the next action.
-
-```
-pipeline inbox [--stale-days 14] [--merged-days 7] [--no-git] [--repo DIR]
-  -> {ok, generatedAt, bases[{ref, sha}], prs[], triage{merge, resume, close, leave}, strandedAfterMerge[], local{unpushed[], orphanWorktrees[]}, warnings[]}
-```
-
-Never comments, labels, closes, merges or creates a ref. Facts: one paginated GraphQL query for the open PRs (page size 20) and one for PRs merged within `--merged-days`; per PR the full paginated comment list (our run record, review state, needs-human reason and run events are read from the viewer's own comments only, so a forged marker from someone else is ignored; a record bound to another PR or branch is ignored with a warning). Git, unless `--no-git`: ONE `git fetch --no-tags origin +refs/heads/<base>:refs/remotes/origin/<base> refs/pull/<n>/head …` per distinct base (the only things it writes are fetched objects and that remote-tracking ref), then per PR `git merge-tree --write-tree` for `conflicts` / `alreadyOnBase` and the review content hash (the gate's own, agent log excluded) as `contentHash`. `--no-git`, git older than 2.38 or a failed fetch leave those facts `null` and add a `warnings` entry; with `--no-git` `local` is `{unpushed: null, orphanWorktrees: null}`. `local` lists branches with unpushed commits, uncommitted changes or a diverged ref, and worktrees under `worktree_dir` whose branch has no open PR (listed only). CI is judged against the required checks (`ci.required_checks` plus the guard contexts unless `ci.guard_checks: false`): `passed` only when every one has a successful row.
-
-Each PR carries `waitingOn` (`nothing-left` · `running` · `owner-decision` · `failing-check` · `review` · `owner-merge` · `pipeline` · `abandoned`), `reason`, `nextAction`, `lastActivity`, `stale` and `suggest` (`merge` · `resume` · `close` · `leave`, also the keys of `triage`). A PR with no run record and no review state whose last activity is older than `--stale-days` is `abandoned` (close) only when something also says it is going nowhere: a draft, a failed required check or conflicts (these are appended to the reason: "; also …"). Age alone never suggests close: a quiet PR that is ready with nothing failing is `owner-decision` (leave; `ship resume <n>` adopts it, or the owner closes it). `owner-merge` suggests `merge` only when the PR is known to merge cleanly (git's trial merge, or with `--no-git` / git < 2.38 GitHub's `mergeable`: `CONFLICTING` counts as a conflict, `MERGEABLE` as clean); when mergeability is unknown it stays `owner-merge` but suggests `leave`; `failing-check` names the failed required checks (`ciFailed`) or the base it conflicts with. `strandedAfterMerge` lists PRs merged within `--merged-days` whose run stopped in the merge / prod-watch step or has a `rollback-intent` without a `rollback-result`.
-
-Exit: 0 · 2 usage / config / not a git repository · 3 GitHub (`gh`) unavailable.
-
 ## integrity
 
 check that a branch diff does not weaken tests (exit 1 unless test-change-approved).
@@ -271,7 +256,7 @@ Owner approval (#58): with `owner_approval: chat` a gate with `ownerMerge > 0`, 
 
 Owner-go (`--owner-go`, owner decision 2026-10-28): the route for work that never ran the ship loop (no verify report, no review state, no `final-gate.json`). The reply asking for the merge ends with `Head <sha12> · items none · repo <owner/name>` above the 🔀 line; once the owner types "merge" the owner-go hook records it, and `merge --pr N --owner-go` then checks, in this order: the record for this repository, PR, the local HEAD and items `none` (else `error: owner-go`, nothing read from GitHub); the live PR (open, not a draft, MERGEABLE, not behind its base, at the local HEAD, no blocking label) and every required check green on that head, guard statuses and `Cross-model review` only with their provenance, and a diff without any hard-stop or test-integrity item, blocking or owner-merge (the agent writes `items none`, so a diff with an owner item must take the gated route, whose approval is bound to the gate's `ownerItems`) (else `error: live-check` with the failing checks); the last pre-merge look (`error: pre-merge`). It runs `merge.command` pinned to the head (`{sha}`) and waits for MERGED like the gated route. It proves no verify step, writes no gate file and refuses `--owner-approved-head` / `--owner-approved-items` (usage, exit 2). The final gate file itself is now valid for 24 h (the owner's "merge" window): `merge` re-runs the whole gate live anyway.
 
-Run record: before the merge command, `merge` sets the record's `inFlight` `{kind: merge, host, startedAt, maxMinutes: 2 × merge.wait_minutes + 15}` and `step: merge`. On every exit `inFlight` is cleared: merged → `step: prod-watch` (a step name kept so old records stay readable) and `mergeSha`; not merged → `step: gate`. `merge` makes no deployments call and writes no `.review/prod-before.json`, whether or not `production` is configured. The run record itself is display: a failed record write is listed in `warnings` and never fails the merge.
+Run record: before the merge command, `merge` sets the record's `inFlight` `{kind: merge, host, startedAt, maxMinutes: 2 × merge.wait_minutes + 15}` and `step: merge`. On every exit `inFlight` is cleared: merged → `step: merge` and `mergeSha`; not merged → `step: gate`. `merge` makes no deployments call and writes no `.review/prod-before.json`, whether or not `production` is configured. The run record itself is display: a failed record write is listed in `warnings` and never fails the merge.
 
 ## model-proof
 
@@ -284,26 +269,6 @@ pipeline model-proof (--tag TAG | --agent-id ID) [--expect-model claude-fable-] 
 ```
 
 Exit: 0 proven · 1 mismatch · 2 transcript not found / usage.
-
-## notify
-
-send the owner a push notification (ntfy, plus a Windows toast under WSL2).
-
-```
-pipeline notify --test [--repo DIR]   |   pipeline notify --event owner-merge|needs-human|arbiter-escalation|stopped --pr N --action TEXT [--cause CODE] [--repo DIR]   -> {ok, sent, reason?, transports:{ntfy, toast}}
-```
-
-`--test` sends one real push to every transport and prints the per-transport result (the rollout check; it is never deduplicated). `--event` is the manual route for a stop that cannot be expressed through `pipeline summary`.
-
-Configuration, in this order per field: the environment, then `~/.config/claude-secrets.sh` (`PIPELINE_SECRETS_FILE` overrides the path; the file is parsed as literal `NAME=value` lines, never sourced): `NTFY_TOPIC` (required), `NTFY_SERVER` (default `https://ntfy.sh`), `NTFY_TOKEN` (optional). A field that is present but invalid sends nothing (`reason: invalid-config:<field>`); no topic is a silent `no-topic`; `PIPELINE_NOTIFY=off` disables everything (the test suite sets it). The result never contains the topic, token or server path.
-
-Every push title starts with the machine it came from, `[Mac]` (macOS), `[PC]` (WSL or Windows) or `[<hostname>]` elsewhere, e.g. `[Mac] #33 Fix the thing` (the whole title is still cut at 80 characters, never the label); an optional `NTFY_MACHINE` (letters, digits, space, `_ . -`, at most 20; environment first, then the secrets file) overrides it, and an invalid value is ignored (default label, result `machineLabel: 'default (invalid NTFY_MACHINE)'`) rather than blocking the push. The label is not part of the identity.
-
-The real ntfy publish tolerates slow networks: it raises Node's per-address connect timeout (default 250 ms, which failed ~4 of 5 publishes on a WSL2 PC) to at least 2500 ms for the CLI process, and retries once on a network-level failure (never after an HTTP response, and only while the 5 s ntfy budget has at least 1 s left).
-
-One push per event: a ledger under `~/.claude/pipeline-state/` (`notify-ledger.jsonl`) makes a replay of the same event a no-op (`reason: duplicate`). Identity is repo, PR, event, head, outcome, open needs-human ids and `--cause`, never the action text. The whole call is capped at 15 s.
-
-Exit: `--test` 0 when ntfy accepted the push, 1 when it did not · `--event` 0 whether or not a push went out (read `sent` / `reason`) · 2 usage.
 
 ## preflight
 
@@ -328,43 +293,6 @@ pipeline protect [--apply] [--checks a,b] [--repo DIR]   (--apply needs PIPELINE
 Exit: 0 dry run printed, or applied with nothing missing or unpinned · 1 no admin rights / plan limit, or something still missing or `unpinned` after applying · 2 usage (`--apply` without `PIPELINE_ADMIN=1`) · 3 GitHub (`gh`) unavailable.
 
 Every required check is pinned to the GitHub Actions app (`app_id: 15368`): only a status a workflow posted with `GITHUB_TOKEN` satisfies it, never one posted with a person's token (which agents share), so `Test integrity`, `Hard-stop scan` and `Cross-model review` cannot be posted from a terminal. Do not list a check another app posts (a deploy provider) in `ci.required_checks`: nothing could satisfy it. The read-back after `--apply` lists checks GitHub reports without that pin in `unpinned` and fails. The default list is `requiredChecks` (`ci.required_checks`, the guard contexts unless `ci.guard_checks: false`, and `Cross-model review` with `ci.review_check: true`).
-
-## resume
-
-find PRs a session can pick up, and plan where a stalled run resumes.
-
-```
-pipeline resume list [--repo DIR]
-  -> {ok, prs[{number, title, headRefName, url, why}]}: open PRs labelled awaiting-review, plus open PRs whose run record
-     (written by this GitHub user) is readable and has no outcome yet (a run that stopped mid-way)
-pipeline resume plan --pr N [--repo DIR]
-  -> {ok, pr, title, url, prState, branch, base, liveHead, enter, reason, adopt, confirm, autoMerge, worktree, stop, recordStatus, record,
-      events, local, mergeSha, notes[], warnings[]}; read-only (its only git writes are fetches: the PR head, the base and origin/<branch>)
-     enter: closed | ended | observe-prod | not-resumable | local-work | decision | build | verify | review | followups | gate
-     adopt: no run record (the PR was not started by the pipeline); confirm: {host, step, minutesAgo, why} when another run may be live,
-     stop: where a run on a route that can reach Step 5 ends, never at a merge: awaiting-owner-merge (owner_approval chat) | needs-human (label mode); null on the other routes
-     autoMerge: {armed, action: disarm} when an unattended auto-merge is queued, worktree: {action: reuse|add-existing-ref|add-from-remote|none, path?, then?}
-  exit 2 when the PR does not exist
-```
-
-`list` shows what a session can pick up: PRs parked as `awaiting-review` and open PRs whose run record (written by this GitHub user) has no outcome, i.e. a run that stopped mid-way. `plan` reads the PR, its comments (run record, review state, events), the local branch and the worktrees holding it, and routes the resume by the pure rules in `pipeline/lib/resume-plan.mjs`:
-
-| `enter` | When |
-|---|---|
-| `closed` | closed without a merge |
-| `ended` | merged and nothing is left to watch |
-| `observe-prod` | merged, but the run stopped in `merge` / `prod-watch`, or a `rollback-intent` has no `rollback-result`: watch production from a detached worktree of `origin/<base>` at the merge commit; never roll back |
-| `not-resumable` | fork PR |
-| `local-work` | the local branch diverged from the PR, or a worktree holding it is dirty: the owner decides |
-| `decision` | `needs-human`; `reason` is our needs-human comment's first sentence |
-| `build` / `verify` | the record has tasks not done / no passing verify for the live head and the run had only reached build or verify |
-| `review` | no review state, an incomplete round, content changed since the last round, a round that is not clean, or `awaiting-review` |
-| `followups` | published follow-ups without an issue |
-| `gate` | everything else: a fresh gate, then the owner-merge stop (resume never merges) |
-
-No usable run record means `adopt: true`; a published review state is still honoured ("no run record" is not "no review state"). `confirm` is set when the heartbeat is from another host and under 90 minutes old, or a command is in flight inside its time budget: ask the owner before doing anything. `autoMerge` asks the skill to disarm an armed auto-merge that no live merge owns. `worktree.action` is `reuse` (a worktree already holds the branch), `add-existing-ref`, `add-from-remote` or `none`, with `then: ff-only` (local behind) or `push` (local ahead); a branch is never reset with `-B`.
-
-Exit: 0 · 2 usage / PR not found · 3 GitHub (`gh`) unavailable.
 
 ## review-complete
 
@@ -422,7 +350,7 @@ pipeline smoke --target preview|production --url URL [--expect-text T] [--sha SH
 
 Exit: 0 passed · 1 failed · 2 not configured / usage.
 
-Optional firewall bypass: with `smoke_bypass_header: x-smoke-key` (lowercase `x-` name, default null) in `.claude/pipeline.yml` and the secret in the `PIPELINE_SMOKE_BYPASS_KEY` environment variable, the vendored `scripts/pipeline/smoke.mjs` sends that one header, only when the base's origin is exactly one of `smoke_bypass_origins` (required, non-empty when the header is set; https origins such as `https://www.example.com`, no wildcards, default `[]`; never a preview URL, other host or localhost), so a firewall "Bypass" rule can let a CI runner through. It is a firewall hint, not app auth (still a cookie-less GET, redirects not followed). The value is read from the environment only (the smoke command inherits the caller's environment here and in prod-watch) and is never printed: the smoke's JSON gains `bypassHeader: true|false` (whether it was sent; false when the env value is missing or the base is not a listed origin).
+Optional firewall bypass: with `smoke_bypass_header: x-smoke-key` (lowercase `x-` name, default null) in `.claude/pipeline.yml` and the secret in the `PIPELINE_SMOKE_BYPASS_KEY` environment variable, the vendored `scripts/pipeline/smoke.mjs` sends that one header, only when the base's origin is exactly one of `smoke_bypass_origins` (required, non-empty when the header is set; https origins such as `https://www.example.com`, no wildcards, default `[]`; never a preview URL, other host or localhost), so a firewall "Bypass" rule can let a CI runner through. It is a firewall hint, not app auth (still a cookie-less GET, redirects not followed). The value is read from the environment only (the smoke command inherits the caller's environment) and is never printed: the smoke's JSON gains `bypassHeader: true|false` (whether it was sent; false when the env value is missing or the base is not a listed origin).
 
 PATH of project commands: `merge.command` (merge), the `smoke` commands (smoke) run with the caller's environment. When `gh` is not on that `PATH` but the pipeline's own `gh()` finds it in a fixed install dir (`/opt/homebrew/bin`, `/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`, `/usr/bin`), that directory is APPENDED to the command's `PATH`, so a command that spawns `gh` itself (a sandbox `PATH` often lacks `/opt/homebrew/bin`) no longer fails `spawn gh ENOENT`. Unchanged on Windows, under a `PIPELINE_GH` override, or when `gh` is nowhere.
 
@@ -468,14 +396,13 @@ Exit: 0 · 2 no state / usage (`outcome` is 0 whether or not `clean`).
 upsert the PR summary comment and print the agent-log line.
 
 ```
-pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost, notify}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")
+pipeline summary --pr N --outcome O [--built TEXT] [--action TEXT] [--cause CODE] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost}   (--action/--cause: accepted, unused; pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
 
 Without `.review/state.json` only `--outcome blocked`, `awaiting-review`, `stopped`, `closed` and `merged-externally` are accepted (the early-stop paths: verify red three times, Codex out in round 1, a stop on a gate or merge refusal, the owner closing the PR, a merge made outside the pipeline): the comment is rendered with no rounds (a `blocked` one names the failing step from the verify report) and `agentLogLine` is still printed. Any other outcome without state is exit 2.
 
-Owner push (see `pipeline notify`): the outcome is classified before any GitHub call, and the push is sent after the comment work whether or not GitHub answered (with the PR title when it was fetched; the exit code and JSON are exactly what they would have been, plus `notify`). `awaiting-owner-merge` pushes "ready to merge", `needs-human` pushes "needs you" (or an arbiter escalation when an arbiter ruling parked an item: the push then names ALL open needs-human items, arbiter ones first), and `blocked` / `awaiting-review` / `stopped` push "run stopped". `merged`, `closed`, `merged-externally`, `prod-unknown` (written after a prod-watch exit with no outcome) and every prod-watch outcome word (prod-watch pushed already) send nothing: `notify` is `{sent:false, reason:'no-event'}`. A word that is not classified sends nothing, reports `reason:'unclassified-outcome'` and prints one warning on stderr. `--action TEXT` is the one-line "what to do" the push carries (default per event); `--cause CODE` (letters, digits, `: _ . -`, at most 60) is a short slug such as `final-gate:labels` that is part of the push's identity, so a reworded retry of the same stop does not push twice.
 
 ## triage
 
@@ -582,7 +509,7 @@ Exit: 0.
 remove finished worktrees (prune), keep one with a lock (keep / unkeep), list or purge the holding folder.
 
 ```
-pipeline worktrees prune [--repo DIR] [--dry-run] [--notify] [--summary-only]   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], hiddenProcesses, restored:[...], outside:[...], holding:{batches, purged}, summary, log} | --summary-only: one line {ok, summary, errors?}
+pipeline worktrees prune [--repo DIR] [--dry-run] [--notify] [--summary-only]   (--notify: accepted, does nothing; old schedules pass it)   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], hiddenProcesses, restored:[...], outside:[...], holding:{batches, purged}, summary, log} | --summary-only: one line {ok, summary, errors?}
 pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}
 pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}
 pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}
@@ -622,7 +549,7 @@ Exit: 0 completed (also `skipped: "already running"` / `"git operation in progre
 
 `schedule` (Linux: cron; macOS: launchd, below) keeps one crontab line per repository, found again by the marker comment
 `# claude-pipeline worktrees-prune <lock name>` at its end: `--install` adds it (or replaces it in place, so installing from the
-main checkout or any linked worktree gives the same single line) to run `worktrees prune --notify --summary-only` from the main checkout at
+main checkout or any linked worktree gives the same single line) to run `worktrees prune --summary-only` from the main checkout at
 `--at HH:MM` (default `02:30`), `--remove` deletes it, `--status` says whether it is there. Every other crontab line is kept
 byte-for-byte. cron's own `PATH` is only `/usr/bin:/bin`, so `--install` looks up `node`, `git` and `gh` on the current `PATH`
 (exit 2 `tool-missing` if `git` or `gh` is not found) and the job sets `PATH` to their directories plus `/usr/bin:/bin`. Its
@@ -637,7 +564,7 @@ Mac wakes. On macOS `schedule` therefore installs one per-user LaunchAgent per r
 is still `unsupported-platform`: "schedule is only supported on Linux (cron) and macOS (launchd)"):
 
 - Label `com.claude-pipeline.<lock name>` (the same lock name as the cron marker); plist
-  `~/Library/LaunchAgents/<label>.plist`. It runs `node <pipeline> worktrees prune --notify --summary-only` from the main
+  `~/Library/LaunchAgents/<label>.plist`. It runs `node <pipeline> worktrees prune --summary-only` from the main
   checkout at `--at HH:MM` (default `02:30`, `StartCalendarInterval`, `RunAtLoad` false). Its `PATH` is the directories of `node`,
   `git` and `gh` (found at install time; exit 2 `tool-missing` if `git` or `gh` is missing) plus `/usr/bin:/bin:/usr/sbin:/sbin`
   (`lsof` is `/usr/sbin/lsof`).
@@ -664,5 +591,5 @@ The spec table was written before the build; the CLI that shipped differs as fol
 | `triage-validate`, `arbiter-needed`, `rulings-apply` | `triage validate`, `arbiter needed`, `arbiter apply` (apply proves the model from the transcript itself; no separate `model-proof` step needed) |
 | `triage-comment`, `summary` | `comment --kind triage|summary|needs-human|blocked|awaiting-review`; `summary` also posts the summary comment |
 | `agent-log --line` (docs-only PR) | `agent-log queue --line` and `agent-log publish [--line]` (appends to the orphan branch `pipeline-agent-log`; `stage` is a deprecated alias that commits nothing) |
-| not listed | `artifacts push`, `followups create`, `hardstops`, `integrity`, `job start\|wait\|read`, `protect`, `resume list\|plan`, `review-complete`, `state show\|outcome\|mark-implemented\|record-followup\|set-outcome`, `triage settle\|light-lane\|owner-ruling`, `vendor`, `version` |
+| not listed | `artifacts push`, `followups create`, `hardstops`, `integrity`, `job start\|wait\|read`, `protect`, `review-complete`, `state show\|outcome\|mark-implemented\|record-followup\|set-outcome`, `triage settle\|light-lane\|owner-ruling`, `vendor`, `version` |
 | `risk` returns `files[]`, `stats` | `risk` returns `level, reasons, lightLane, changedLines, fileCount, hardStops, base, head, mergeBase` |

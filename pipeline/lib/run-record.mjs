@@ -19,9 +19,8 @@ export const OUTCOMES = Object.freeze([
   'not-live', 'deploy-failed', 'deploy-not-observed', 'no-production', 'needs-owner',
 ]);
 
-// Exhaustive: an outcome the run stopped at. `awaiting-owner-merge` is a place the run waits; `prod-unknown` (prod-watch
-// exited with no outcome) leaves the merged run in its prod-watch step, so the inbox lists it as stranded and resume
-// observes production again; every other outcome ends it.
+// Exhaustive: an outcome the run stopped at. `awaiting-owner-merge` is a place the run waits; `prod-unknown` (the removed
+// prod-watch exited with no outcome) leaves an old merged run in its prod-watch step; every other outcome ends it.
 export const OUTCOME_STEP = Object.freeze({
   merged: 'ended',
   blocked: 'ended',

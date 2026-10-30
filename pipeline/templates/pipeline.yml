@@ -67,7 +67,7 @@ merge:
   wait_minutes: 15
 
 # preview and production are still validated, but the final gate and `pipeline merge` no longer read them: there is no
-# deployment lookup, no preview check, no rollback target and no production watch. Only `pipeline smoke` reads production.
+# deployment lookup, no preview check, no rollback target and no production watch. `pipeline smoke` reads `preview.smoke` and `production.smoke`.
 preview: null
 #  provider: github-deployments
 #  environment: Preview

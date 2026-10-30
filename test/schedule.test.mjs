@@ -14,8 +14,9 @@ const programArguments = (plist) => {
 };
 
 test('schedulePlist: default args are today\'s worktrees prune job', () => {
-  assert.deepEqual(programArguments(schedulePlist(base)), [base.nodePath, base.binPath, 'worktrees', 'prune', '--notify', '--summary-only']);
-  assert.match(scheduleLine(base), / worktrees prune --notify --summary-only >>/);
+  assert.deepEqual(programArguments(schedulePlist(base)), [base.nodePath, base.binPath, 'worktrees', 'prune', '--summary-only']);
+  assert.match(scheduleLine(base), / worktrees prune --summary-only >>/);
+  assert.doesNotMatch(scheduleLine(base), /--notify/);
   assert.ok(scheduleLine(base).endsWith(` ${scheduleMarker('abc123')}`));
   assert.equal(scheduleMarker('abc123'), '# claude-pipeline worktrees-prune abc123');
 });

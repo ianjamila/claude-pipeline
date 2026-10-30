@@ -7,8 +7,9 @@ import { EXIT, UsageError } from './cli.mjs';
 import { Fail } from './cmd-common.mjs';
 import { run as runProc } from './proc.mjs';
 
-// What the worktrees job runs after `node <bin>`; every helper below takes `args` and defaults to this.
-export const WORKTREES_PRUNE_ARGS = Object.freeze(['worktrees', 'prune', '--notify', '--summary-only']);
+// What the worktrees job runs after `node <bin>`; every helper below takes `args` and defaults to this. Schedules installed
+// before notifications were removed also pass `--notify` (accepted, does nothing); they are found by their marker, not their args.
+export const WORKTREES_PRUNE_ARGS = Object.freeze(['worktrees', 'prune', '--summary-only']);
 
 export const AT_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const SAFE_WORD = /^[A-Za-z0-9_\/.@+=,:-]+$/;

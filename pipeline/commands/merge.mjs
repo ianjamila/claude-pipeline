@@ -67,7 +67,7 @@ export const run = guarded(async (argv, ctx) => {
     if (refusals.length > 0) return refuse('gate', refusals);
 
     // 1a. A resumed run never merges on its own: the run record (viewer-authored, so not forgeable by a commenter) says whether this
-    // run was taken over by `ship resume`; if so the owner's approval of THIS exact head must come in as a flag. Read before
+    // run was taken over from an earlier session (an older record from `ship resume` carries the flag); if so the owner's approval of THIS exact head must come in as a flag. Read before
     // anything irreversible. A record that cannot be checked (unreadable comments, an invalid or newer record) fails CLOSED: it
     // may be a resumed one, so it needs the same approval. No record (absent) or a legacy comment is an ordinary run.
     // Why (#58): the flags were the agent's own word. They now only name what the owner approved: the owner-go recorder (a
@@ -218,7 +218,7 @@ export const run = guarded(async (argv, ctx) => {
     } finally {
       const out = result?.output;
       recorder.update(out?.merged === true
-        ? { step: 'prod-watch', mergeSha: out.mergeSha ?? null, inFlight: null }
+        ? { step: 'merge', mergeSha: out.mergeSha ?? null, inFlight: null }
         : { step: 'gate', inFlight: null });
     }
     warnings.push(...recorder.warnings);

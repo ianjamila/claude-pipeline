@@ -3,7 +3,8 @@
 // docs/specs/2026-10-13-worktree-prune-design.md. One `worktrees.mode` setting governs every mutation: `report` (the
 // default) and `off` change nothing, `--dry-run` never changes anything; keep-locks only protect, so they work in every
 // mode. The prune flow lives in lib/worktree-prune/run.mjs. Exit 0 completed (skips are normal), 2 usage / repo / config,
-// 3 GitHub unavailable. `schedule` adds, removes or reports one nightly cron line that runs `prune --notify --summary-only` (Linux, cron) or one launchd LaunchAgent (macOS).
+// 3 GitHub unavailable. `schedule` adds, removes or reports one nightly cron line that runs `prune --summary-only` (Linux, cron) or one launchd LaunchAgent (macOS).
+// `--notify` is an accepted no-op: schedules installed before notifications were removed still pass it.
 import { mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,7 +25,7 @@ import { loadRepo, prune, pruneLogDir, summaryOnly } from '../lib/worktree-prune
 export const meta = {
   summary: 'remove finished worktrees (prune), keep one with a lock (keep / unkeep), list or purge the holding folder',
   usage: [
-    'pipeline worktrees prune [--repo DIR] [--dry-run] [--notify] [--summary-only]   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], hiddenProcesses, restored:[...], outside:[...], holding:{batches, purged}, summary, log} | --summary-only: one line {ok, summary, errors?}',
+    'pipeline worktrees prune [--repo DIR] [--dry-run] [--notify] [--summary-only]   (--notify: accepted, does nothing; old schedules pass it)   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], hiddenProcesses, restored:[...], outside:[...], holding:{batches, purged}, summary, log} | --summary-only: one line {ok, summary, errors?}',
     'pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}',
     'pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}',
     'pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}',

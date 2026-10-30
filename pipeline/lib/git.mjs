@@ -390,7 +390,7 @@ function normaliseDiff(text) {
 // are anchored at the repo root so cwd cannot narrow what is hashed.
 // The diff is read as ONE string, so the cap is what a JS string can hold (V8: 2^29-24 chars, and a char is at least one
 // byte): 512 MiB. The default 64 MiB cap killed git with SIGKILL on a real 174 MB PR diff (a regenerated data file), which
-// made the gate and `P inbox` fail for exactly the PRs that most need a look. Past 512 MiB it fails loudly, never truncates.
+// made the gate fail for exactly the PRs that most need a look. Past 512 MiB it fails loudly, never truncates.
 export const DIFF_MAX_BYTES = 512 * 1024 * 1024;
 
 export function contentHash(base, head, { exclude = [], maxBuffer = DIFF_MAX_BYTES, ...o } = {}) {
@@ -443,7 +443,7 @@ export function reviewBaseRef(branch, o) {
 //
 // `head` (default 'HEAD') and `baseSha` (default: the resolved review base ref) let a caller hash an arbitrary commit
 // that is only present as objects (a PR head fetched, not checked out) against an explicit base; this stays the one
-// definition, so `ship inbox` / `ship resume` agree byte for byte with the review loop and the final gate.
+// definition, so every caller agrees byte for byte with the review loop and the final gate.
 export function reviewContentHash({ branch, agentLog, head = 'HEAD', baseSha } = {}, o) {
   return contentHash(baseSha ?? reviewBaseRef(branch, o), head, { ...o, exclude: agentLog ? [agentLog] : [] });
 }

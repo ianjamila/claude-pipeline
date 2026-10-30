@@ -273,7 +273,7 @@ const recordIndexes = (s, pred) => s.fake.calls()
   .map(({ i }) => i);
 const decoded = (body) => (body.startsWith(MARKERS.summary) ? decodeRecord(body).record : null);
 
-test('merge: inFlight is written BEFORE the merge command and cleared after it (merged: step prod-watch + mergeSha)', () => {
+test('merge: inFlight is written BEFORE the merge command and cleared after it (merged: step merge + mergeSha)', () => {
   const s = mergeScenario();
   assertExit(s.gate(), 0);
   const r = s.merge();
@@ -299,7 +299,7 @@ test('merge: inFlight is written BEFORE the merge command and cleared after it (
   assert.equal(set.head, s.head);
   const cleared = writes.at(-1).record;
   assert.equal(cleared.inFlight, null);
-  assert.equal(cleared.step, 'prod-watch');
+  assert.equal(cleared.step, 'merge');
   assert.equal(cleared.mergeSha, 'c'.repeat(40));
 });
 

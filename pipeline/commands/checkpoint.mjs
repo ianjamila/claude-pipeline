@@ -15,11 +15,11 @@ import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.
 export const meta = {
   summary: 'record where the ship run stands in the PR summary comment (refuses unless local HEAD is the pushed PR head)',
   usage: [
-    'pipeline checkpoint --pr N --step build|verify|pr|review|gate|awaiting-owner-merge|merge|prod-watch|ended [--next TEXT] [--detail TEXT]',
+    'pipeline checkpoint --pr N --step build|verify|pr|review|gate|awaiting-owner-merge|merge|ended [--next TEXT] [--detail TEXT]',
     '                    [--request-file F] [--tasks-file F] [--task-done ID] [--verify-report] [--round R] [--resumed] [--repo DIR]',
     '  -> {ok, url, action, record, warnings}; exit 1 {error: unpushed | behind | diverged} (local HEAD is not the PR head on GitHub), 2 usage, 3 GitHub unavailable',
     "  --request-file: the user's request, text, at most 2 KB · --tasks-file: JSON [{id, title, spec}] · --task-done ID: mark one task done (repeatable)",
-    '  --resumed: this run was taken over by `ship resume` (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require the owner\'s recorded "merge" (--owner-approved-head + --owner-approved-items)',
+    '  --resumed: this run was taken over from an earlier session (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require the owner\'s recorded "merge" (--owner-approved-head + --owner-approved-items)',
     "  --verify-report: copy {head, tree, mode, ok, failedStep} of the verify report, only when its head and tree are this HEAD's (otherwise a warning)",
   ].join('\n'),
 };

@@ -12,7 +12,7 @@ import { GitError, git, showFile } from '../git.mjs';
 import { createGitHub, guardGh } from '../github.mjs';
 import { listWorktrees } from '../local-branches.mjs';
 import { LockTimeoutError, withLock } from '../locks.mjs';
-import { notifyEvent, parseRemote } from '../notify.mjs';
+import { parseRemote } from '../remote-url.mjs';
 import { samePath } from '../paths.mjs';
 import { QUARANTINE_DIR, holdingRoot, listHolding, purgeHoldingLocked, removeWorktree, restoreLeftovers } from './act.mjs';
 import {
@@ -387,7 +387,7 @@ function finishShort(repo, env, output) {
   return { exitCode: EXIT.OK, output };
 }
 
-async function pruneLocked(repo, { mode, dryRun, notify, ctx, env }) {
+async function pruneLocked(repo, { mode, dryRun, ctx, env }) {
   const { root, worktreeDir } = repo;
   const runStartMs = Date.now();
   const runId = `${runStartMs.toString(36)}-${process.pid}`;
@@ -425,12 +425,6 @@ async function pruneLocked(repo, { mode, dryRun, notify, ctx, env }) {
 
   const log = await step('log', () => appendLog(env, repo.slug, `${new Date().toISOString()} ${summary}`), null);
   if (log) output.log = log;
-  if (notify && (removed.length || restored.some((r) => r.restored))) {
-    output.notify = await step('notify', () => notifyEvent(
-      { event: 'worktrees', pr: null, action: summary, ids: removed.map((r) => r.slug) },
-      { cwd: root, env, ...(ctx?.notifyDeps ?? {}) },
-    ), undefined);
-  }
   return { exitCode: EXIT.OK, output };
 }
 
@@ -447,7 +441,7 @@ export async function prune(values, ctx) {
     if (!modeAllows(mode, 'evaluate', { dryRun })) {
       return finishShort(repo, env, { ok: true, mode, dryRun, disabled: true, restored: restoreLeftovers(repo.root, repo.worktreeDir) });
     }
-    return pruneLocked(repo, { mode, dryRun, notify: values.notify === true, ctx, env });
+    return pruneLocked(repo, { mode, dryRun, ctx, env });
   }, () => finishShort(repo, env, { ok: true, mode, dryRun, skipped: 'already running' }));
   if (repo.configSource === 'worktree') return result;
   const warning = `the main checkout has no ${CONFIG_FILE}; used the copy committed on ${repo.configSource}`;

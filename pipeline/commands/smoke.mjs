@@ -1,6 +1,7 @@
 // `pipeline smoke --target preview|production --url URL [--expect-text T] [--sha SHA]`: runs the project's configured
-// smoke command against a deployment and records the result in .review/<target>-smoke.json. The preview record is
-// evidence for final-gate (it must name the PR head), so --sha is what the deployment was built from, not a guess.
+// smoke command against a deployment and records the result in .review/<target>-smoke.json. Nothing in the pipeline reads
+// that record back (the final gate and merge do not); it is for whoever ran the smoke. --sha is what the deployment was
+// built from, not a guess.
 import { EXIT, UsageError, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { fill } from '../lib/config.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';

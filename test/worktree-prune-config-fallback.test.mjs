@@ -94,7 +94,7 @@ test('happy path unchanged: the main checkout config wins over origin', async ()
 test('CLI: worktrees keep works from a linked worktree when the main checkout has no config', () => {
   const { feat } = setup({ originConfig: pipelineYml(), rootConfig: null });
   const r = spawnSync(process.execPath, [bin, 'worktrees', 'keep', 'feat', '--reason', 'testing'], {
-    cwd: feat, encoding: 'utf8', env: { ...process.env, PIPELINE_NOTIFY: 'off' },
+    cwd: feat, encoding: 'utf8', env: { ...process.env },
   });
   assert.equal(r.status, 0, r.stdout + r.stderr);
 });
@@ -106,7 +106,7 @@ test('CLI: prune warns that the committed default-branch config was used', () =>
   mkdirSync(logs); mkdirSync(holding); mkdirSync(locks);
   const r = spawnSync(process.execPath, [bin, 'worktrees', 'prune'], {
     cwd: feat, encoding: 'utf8',
-    env: { ...process.env, PIPELINE_NOTIFY: 'off', PIPELINE_PRUNE_LOG_DIR: logs, PIPELINE_HOLDING_DIR: holding, PIPELINE_LOCK_DIR: locks },
+    env: { ...process.env, PIPELINE_PRUNE_LOG_DIR: logs, PIPELINE_HOLDING_DIR: holding, PIPELINE_LOCK_DIR: locks },
   });
   assert.equal(r.status, 0, r.stdout + r.stderr);
   const out = JSON.parse(r.stdout);

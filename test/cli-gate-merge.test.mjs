@@ -129,7 +129,7 @@ test('merge: runs the configured command with the approved pr and head, then exi
   assertExit(r, 0);
   assert.deepEqual(r.json, { ok: true, merged: true, mergeSha: MERGE_SHA });
   assert.deepEqual(s.mergeCalls(), [`${PR} ${s.head}`]);
-    assert.ok(!s.fake.lines().some((l) => l.includes('--disable-auto')));
+  assert.ok(!s.fake.lines().some((l) => l.includes('--disable-auto')));
 });
 
 test('merge: the merge command runs with the caller PATH intact (PIPELINE_GH override: gh dir not appended)', () => {

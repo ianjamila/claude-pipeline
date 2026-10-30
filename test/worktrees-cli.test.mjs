@@ -135,7 +135,7 @@ function world() {
   for (const k of ['CLAUDE_CONFIG_DIR', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR']) delete env[k];
   Object.assign(env, {
     HOME: dirs.home, USERPROFILE: dirs.home, PIPELINE_HOLDING_DIR: dirs.holding, PIPELINE_PRUNE_LOG_DIR: dirs.logs,
-    PIPELINE_LOCK_DIR: dirs.locks, PIPELINE_SCRATCH_DIR: dirs.scratch, PIPELINE_PRUNE_SETTLE_MS: '0', PIPELINE_NOTIFY: 'off',
+    PIPELINE_LOCK_DIR: dirs.locks, PIPELINE_SCRATCH_DIR: dirs.scratch, PIPELINE_PRUNE_SETTLE_MS: '0',
   });
   const cli = (args, { cwd = repo.dir, extraEnv = {} } = {}) => {
     const r = spawnSync(process.execPath, [bin, 'worktrees', ...args], { cwd, env: { ...env, ...extraEnv }, encoding: 'utf8' });
@@ -166,7 +166,7 @@ test('report mode (default): the eligible worktree is reported, nothing on disk 
   assert.equal(r.code, 0, r.stderr);
   assert.equal(r.json.ok, true);
   assert.equal(r.json.mode, 'report');
-  assert.equal(r.json.notify, undefined, 'nothing removed or restored: no push');
+  assert.equal(r.json.notify, undefined, '--notify is an accepted no-op: no notify field');
   assertDoneEvaluated(w, r.json, 'wouldRemove');
   if (INSPECTS) assert.ok(r.json.wouldRemove[0].bytes > 0);
   assert.deepEqual(r.json.removed, []);
@@ -220,7 +220,7 @@ test('mode: on removes only the eligible worktree, archives its evidence, keeps 
   const r = w.cli(['prune', '--notify']);
   assert.equal(r.code, 0, r.stderr);
   assert.deepEqual(slugs(r.json.removed), ['done'], JSON.stringify(r.json.kept));
-  assert.equal(r.json.notify?.reason, 'disabled', 'a removal with --notify asks for a push (the test runner turns pushes off)');
+  assert.equal(r.json.notify, undefined, '--notify is an accepted no-op: a removal reports no notify field');
   assert.equal(existsSync(w.wtPath('done')), false);
   assert.deepEqual(slugs(r.json.kept), ['dirty', 'local', 'nopr', 'open']);
   assert.match(w.keptReason(r.json, 'open'), /^open PR #2/);
@@ -538,10 +538,10 @@ function fakeCrontab(initial = '') {
   return { box, fn };
 }
 
-test('scheduleLine: minute hour, cd into the root, node + bin, notify, marker last', () => {
+test('scheduleLine: minute hour, cd into the root, node + bin, marker last', () => {
   assert.equal(
     scheduleLine(LINE_ARGS),
-    `30 02 * * * cd '/home/u/proj' && PATH='/home/u/.nvm/bin:/usr/bin:/bin' /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify --summary-only >>'/home/u/.local/state/pipeline/cron-worktrees-prune-0123456789ab.log' 2>&1 ${MARKER}`,
+    `30 02 * * * cd '/home/u/proj' && PATH='/home/u/.nvm/bin:/usr/bin:/bin' /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --summary-only >>'/home/u/.local/state/pipeline/cron-worktrees-prune-0123456789ab.log' 2>&1 ${MARKER}`,
   );
   assert.match(scheduleLine({ ...LINE_ARGS, at: '23:05' }), /^05 23 \* \* \* /);
 });
@@ -598,6 +598,19 @@ test('applySchedule install: a second install is idempotent (one line, no rewrit
   applySchedule({ action: 'install', line: later, marker: MARKER, crontabFn: ct.fn, tzFn: () => 'Asia/Manila' });
   assert.equal(ct.box.text, `${OTHER_LINES}${later}\n# tail\n`);
   assert.equal(ct.box.text.split(MARKER).length - 1, 1);
+});
+
+test('applySchedule: a schedule installed with the old --notify argument is still ours (status finds it, install replaces it, remove drops it)', () => {
+  const current = scheduleLine(LINE_ARGS);
+  const old = current.replace('prune --summary-only', 'prune --notify --summary-only');
+  assert.notEqual(old, current);
+  const ct = fakeCrontab(`${OTHER_LINES}${old}\n`);
+  assert.deepEqual(applySchedule({ action: 'status', line: current, marker: MARKER, crontabFn: ct.fn, tzFn: () => 'Asia/Manila' }), { installed: true, line: old });
+  applySchedule({ action: 'install', line: current, marker: MARKER, crontabFn: ct.fn, tzFn: () => 'Asia/Manila' });
+  assert.equal(ct.box.text, `${OTHER_LINES}${current}\n`);
+  const ct2 = fakeCrontab(`${OTHER_LINES}${old}\n`);
+  assert.deepEqual(applySchedule({ action: 'remove', line: current, marker: MARKER, crontabFn: ct2.fn, tzFn: () => 'Asia/Manila' }), { removed: true });
+  assert.equal(ct2.box.text, OTHER_LINES);
 });
 
 test('applySchedule install: duplicate marker lines collapse to one; a line with a different lock name is left alone', () => {
@@ -660,7 +673,7 @@ test('schedule --install: writes the repo-keyed line (default 02:30); --status a
   assert.equal(r.exitCode, 0);
   assert.equal(r.output.ok, true);
   assert.equal(r.output.installed, true);
-  assert.equal(r.output.line, `30 02 * * * cd '${w.repo.dir}' && PATH='/usr/bin:/opt/git/bin:/opt/gh/bin:/bin' /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --notify --summary-only >>'${join(w.logDir, `cron-${lockName}.log`)}' 2>&1 # claude-pipeline worktrees-prune ${lockName}`);
+  assert.equal(r.output.line, `30 02 * * * cd '${w.repo.dir}' && PATH='/usr/bin:/opt/git/bin:/opt/gh/bin:/bin' /usr/bin/node /opt/p/pipeline/bin/pipeline.mjs worktrees prune --summary-only >>'${join(w.logDir, `cron-${lockName}.log`)}' 2>&1 # claude-pipeline worktrees-prune ${lockName}`);
   assert.equal(w.ct.box.text, `${OTHER_LINES}${r.output.line}\n`);
   const st = await w.run(['--status']);
   assert.deepEqual([st.exitCode, st.output.installed, st.output.line], [0, true, r.output.line]);
@@ -789,7 +802,6 @@ test('schedulePlist: the exact plist (label, argv, root, PATH, calendar interval
     '    <string>/opt/p/pipeline/bin/pipeline.mjs</string>',
     '    <string>worktrees</string>',
     '    <string>prune</string>',
-    '    <string>--notify</string>',
     '    <string>--summary-only</string>',
     '  </array>',
     '  <key>WorkingDirectory</key>',
@@ -1018,7 +1030,7 @@ test('schedule through the CLI uses the system crontab: no crontab yet, then ins
   assert.equal(inst.json.installed, true);
   assert.equal(readFileSync(store, 'utf8'), `${inst.json.line}\n`);
   assert.ok(inst.json.line.includes(`cd '${w.repo.dir}' && PATH=`) && inst.json.line.includes(`' ${process.execPath} `), inst.json.line);
-  assert.ok(inst.json.line.includes(`${bin} worktrees prune --notify --summary-only >>'${logs}/cron-`), inst.json.line);
+  assert.ok(inst.json.line.includes(`${bin} worktrees prune --summary-only >>'${logs}/cron-`), inst.json.line);
   assert.ok(inst.json.line.match(/PATH='([^']*)'/)[1].split(':').includes(bin2), inst.json.line); // the stub dir is where gh (and crontab) were found
   assert.equal(cli('--status').json.installed, true);
   assert.equal(cli('--remove').json.removed, true);

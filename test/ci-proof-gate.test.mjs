@@ -283,7 +283,7 @@ test('a same-tree report from the old commit: steps that ran locally need no CI 
 
 async function gateFor(s, extra = {}) {
   const { config } = await loadConfig(s.repo.dir);
-  const env = { ...process.env, ...s.fake.env, ...createFakeCodex().env, PIPELINE_NOTIFY: 'off', PIPELINE_MERGEABLE_PAUSE_MS: '1' };
+  const env = { ...process.env, ...s.fake.env, ...createFakeCodex().env, PIPELINE_MERGEABLE_PAUSE_MS: '1' };
   return evaluateGate({ root: s.repo.dir, config, pr: PR, gh: createGitHub({ cwd: s.repo.dir, env }), env, ...extra });
 }
 
@@ -296,7 +296,7 @@ test('evaluateGate: the injected ciProof decides, the check keeps its name, and 
   assert.deepEqual(gate.proofs, [{ step: 'unit', source: 'ci', run: RUN }]);
   assert.equal(seen.pr, PR);
   assert.equal(typeof seen.gh.prView, 'function', 'the real gh client is passed through');
-  assert.equal(seen.env.PIPELINE_NOTIFY, 'off');
+  assert.equal(seen.env.PIPELINE_MERGEABLE_PAUSE_MS, '1', 'the gate env is passed through');
 
   // a saved gate with a proofs field still satisfies gateRefusals
   const refusals = gateRefusals({ gate: { ...gate, at: new Date().toISOString() }, pr: PR, head: gate.head, prHead: gate.head, hash: gate.contentHash, repo: gate.repo });
