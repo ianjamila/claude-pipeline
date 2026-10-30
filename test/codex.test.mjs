@@ -834,3 +834,23 @@ test('assignIds passes the content hash to file-less findings only', () => {
   assert.notEqual(a[0].fingerprint, b[0].fingerprint);
   assert.equal(a[1].fingerprint, b[1].fingerprint);
 });
+
+test("buildReviewPrompt baseKind 'resolution': names the base as a marker tree, fences the conflicted paths and asks to justify dropped base-branch lines", () => {
+  const sha = (c) => c.repeat(40);
+  const resolution = {
+    from: sha('c'), forkPoint: sha('d'), conflicted: ['src/a ``` b.js'], conflictedCount: 3,
+    blocks: [{ path: 'src/a ``` b.js', block: 1, droppedTheirs: 2 }, { path: 'src/z.js', block: 1, droppedTheirs: 0 }],
+  };
+  const p = buildReviewPrompt({ pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'resolution', resolution });
+  assert.match(p, /trial-merged with the base branch/);
+  assert.match(p, /exactly how each merge conflict was resolved/);
+  assert.ok(p.includes(`git show ${sha('c')}:<path>`) && p.includes(`git show ${sha('d')}:<path>`));
+  assert.match(p, /````conflicted paths\nsrc\/a ``` b\.js\n\(\+2 more\)\n````/, 'a path with backticks cannot close the fence; the rest is counted');
+  assert.match(p, /justify EVERY dropped base-branch line/);
+  assert.match(p, /src\/a ``` b\.js block 1: 2 line\(s\) dropped/);
+  assert.doesNotMatch(p, /z\.js block 1/, 'blocks that dropped nothing are not listed');
+  const none = buildReviewPrompt({ pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'resolution', resolution: { ...resolution, blocks: [] } });
+  assert.match(none, /kept every line of the base branch's side/);
+  assert.doesNotMatch(buildReviewPrompt({ pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'whole-pr' }), /Conflict resolution|trial-merged/);
+  assert.throws(() => buildReviewPrompt({ pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'resolution' }), /resolution\.from/);
+});
