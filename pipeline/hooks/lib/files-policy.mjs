@@ -670,21 +670,143 @@ function expandRefs(text, ctx) {
   return drivePaths && DRIVE_RELATIVE.test(e) ? `$DRIVE_RELATIVE_${e.slice(2)}` : e;
 }
 
+// #111 (final round): a range `{1..3}` / `{a..e}` / `{01..10..2}` is a brace form too (bash order, zero-padded when an end has a leading zero). Returns { list, over } (at most
+// BRACE_MAX words; over: it was cut), or null when the body is no range.
+const BRACE_MAX = 64;
+function braceRange(body) {
+  const out = [];
+  let over = false;
+  const push = (x) => { if (out.length >= BRACE_MAX) { over = true; return false; } out.push(x); return true; };
+  const num = /^(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?$/.exec(body);
+  if (num) {
+    const a = Number(num[1]);
+    const b = Number(num[2]);
+    const step = Math.abs(Number(num[3] ?? 1)) || 1;
+    const pad = /^-?0\d/.test(num[1]) || /^-?0\d/.test(num[2]) ? Math.max(num[1].replace('-', '').length, num[2].replace('-', '').length) : 0;
+    const dir = a <= b ? 1 : -1;
+    for (let n = a; dir > 0 ? n <= b : n >= b; n += dir * step) if (!push((n < 0 ? '-' : '') + String(Math.abs(n)).padStart(pad, '0'))) break;
+    return { list: out, over };
+  }
+  const chr = /^([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d+))?$/.exec(body);
+  if (!chr) return null;
+  const a = chr[1].charCodeAt(0);
+  const b = chr[2].charCodeAt(0);
+  const step = Math.abs(Number(chr[3] ?? 1)) || 1;
+  const dir = a <= b ? 1 : -1;
+  for (let n = a; dir > 0 ? n <= b : n >= b; n += dir * step) if (!push(String.fromCharCode(n))) break;
+  return { list: out, over };
+}
+
 // Expands the first `{a,b}` groups of each word so `~/.claude/{pipeline,settings.json}` shows both paths.
 // Above 5,000 characters the expansion is skipped and the scan is marked dynamic (callers fail closed).
+// #111 (final round): ranges expand too; an expansion cut by a cap sets ctx.braceOver (rawHitOne fails closed on it while a review folder exists).
 function braceExpand(s, ctx) {
-  if (!s.includes('{') || !s.includes(',')) return s;
+  if (!s.includes('{') || !(s.includes(',') || s.includes('..'))) return s;
   if (s.length > 5000) { ctx.dynamic = true; return s; }
-  let cur = s;
+  let cur = s.replace(/(?<!\$)\{([^{}\s,]+)\}/g, (m, body) => {
+    const r = braceRange(body);
+    if (!r) return m;
+    if (r.over) ctx.braceOver = true;
+    return r.list.length > 1 ? `{${r.list.join(',')}}` : r.list[0] ?? '';
+  });
   for (let round = 0; round < 4; round++) {
     let changed = false;
     cur = cur.replace(/(\S*?)\{([^{}\s]*,[^{}\s]*)\}(\S*)/g, (_m, pre, body, post) => {
       changed = true;
       return body.split(',').map((x) => pre + x + post).join(' ');
     });
+    if (cur.length > 50_000) ctx.braceOver = true;
     if (!changed || cur.length > 50_000) break;
   }
   return cur;
+}
+
+// One word with unquoted braces -> { list, over }: every expansion (nested, ranges), at most BRACE_MAX of them; over: the cap cut the list.
+function expandBraceWord(word) {
+  let over = false;
+  const go = (t) => {
+    for (let p = 0; p < t.length; p++) {
+      if (t[p] !== '{' || t[p - 1] === '$') continue;
+      let depth = 0;
+      let q = -1;
+      const commas = [];
+      for (let j = p; j < t.length; j++) {
+        if (t[j] === '{') depth++;
+        else if (t[j] === '}') { if (--depth === 0) { q = j; break; } } else if (t[j] === ',' && depth === 1) commas.push(j);
+      }
+      if (q < 0) continue;
+      let alts;
+      if (commas.length) {
+        const cuts = [p, ...commas, q];
+        alts = cuts.slice(0, -1).map((c, k) => t.slice(c + 1, cuts[k + 1]));
+      } else {
+        const r = braceRange(t.slice(p + 1, q));
+        if (!r) continue;
+        if (r.over) over = true;
+        alts = r.list;
+      }
+      const post = go(t.slice(q + 1));
+      const out = [];
+      for (const a of alts) {
+        for (const x of go(a)) {
+          for (const y of post) {
+            if (out.length >= BRACE_MAX) { over = true; return out; }
+            out.push(t.slice(0, p) + x + y);
+          }
+        }
+      }
+      return out;
+    }
+    return [t];
+  };
+  return { list: go(word), over };
+}
+
+// #111 (final round): the expansions of the UNQUOTED brace words of `raw` that can be a destination (a quoted brace is literal). The shell parser expands them too, but
+// `cp x .review/{state,y}.json` leaves it only `.review/y.json` as the destination word; this gives back every expansion so each can be judged as a target.
+// A braced word followed by a plain word is a source (the destination is the last word, or the -t value), and the words stop at the first redirection / separator.
+const BRACE_HIDE = { '{': '', '}': '', ',': '' };
+function braceWordsOf(raw) {
+  const toks = [];
+  let cur = '';
+  let q = '';
+  let brace = false;
+  let any = false;
+  const hide = (c) => BRACE_HIDE[c] ?? c;
+  const flush = () => {
+    if (any) toks.push({ text: cur, brace });
+    cur = '';
+    brace = false;
+    any = false;
+  };
+  scan: for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (q) {
+      if (c === q) q = '';
+      else if (q === '"' && c === '\\' && i + 1 < raw.length) cur += hide(raw[++i]);
+      else cur += hide(c);
+      continue;
+    }
+    if (c === '\\' && i + 1 < raw.length) { cur += hide(raw[++i]); any = true; continue; }
+    if (c === "'" || c === '"') { q = c; any = true; continue; }
+    if (/\s/.test(c)) { flush(); continue; }
+    if (/[<>|;&]/.test(c)) break scan;
+    if (c === '{') brace = true;
+    cur += c;
+    any = true;
+  }
+  flush();
+  let over = false;
+  const words = [];
+  toks.forEach((t, k) => {
+    if (!t.brace) return;
+    const viaT = /^(?:-t|--target-directory=)/.test(t.text) || /^(?:-t|--target-directory)$/.test(toks[k - 1]?.text ?? '');
+    if (!viaT && toks.slice(k + 1).some((u) => !u.text.startsWith('-'))) return;
+    const r = expandBraceWord(t.text);
+    if (r.over) over = true;
+    if (r.list.length > 1 || r.list[0] !== t.text) for (const x of r.list) words.push(x.replace(//g, '{').replace(//g, '}').replace(//g, ','));
+  });
+  return { words, over };
 }
 
 // Several readings of `text` to look for protected paths in: as is, with string glue squashed ('+', ',' and '/'
@@ -880,6 +1002,7 @@ function makeMatchers(ctx) {
   };
   const rawHitOne = (text, dirs) => {
     for (const v of refVariants(String(text), ctx)) {
+      if (ctx.braceOver === true && ctx.hasReviewDir()) return true; // (#111: a brace expansion cut by its cap may hide a protected name; fail closed with a review folder)
       if (rootRes.some((re) => re.test(v))) return true;
       if (reviewText.test(v)) return true; // (a repo's review state: protected wherever it is, so the name alone is the reference)
       if (aliasInText(v, dirs)) return true;
@@ -3134,7 +3257,12 @@ function evaluateBashForFilesFrame(command, opts) {
     // (inline interpreter code that writes can build any name there)
     if (opts._writesOnly === true && (impliesCwdWrite(c) || (runsInlineCode(c, ctx) && WRITE_HINT.test(c.raw ?? c.argv.join(' '))))) return true;
     // (a destination word is never filtered: a writer may create a protected name that does not exist yet)
-    if (DEST_ONLY.has(name)) return destsOf(wordsOf(c), name).some(tokenHitAll);
+    if (DEST_ONLY.has(name)) {
+      if (destsOf(wordsOf(c), name).some(tokenHitAll)) return true;
+      // (#111: `cp x .review/{state,y}.json` -- the parser keeps only the last expansion as the destination, but a brace form is a family of targets: each expansion is judged as one)
+      const bw = braceWordsOf(rawOfCmd(c));
+      return (bw.over && ctx.hasReviewDir()) || bw.words.some(tokenHitAll);
+    }
     // (mkdir of a repo's .review folder itself only makes an empty folder, which holds nothing: see REVIEW_FILE_SRC)
     if (name === 'mkdir') return names(c, 'pipeline');
     return names(c) || (MOVERS.has(name) && destsOf(wordsOf(c), name).some(tokenHitAll));

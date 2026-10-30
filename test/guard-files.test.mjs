@@ -1015,6 +1015,8 @@ function reviewAliasWorld(t, { review = true } = {}) {
     fs.symlinkSync(path.join(cwd, '.review'), alias, 'dir');
     fs.symlinkSync(path.join(cwd, '.review', 'round-1'), ralias, 'dir');
     fs.symlinkSync('.review', path.join(cwd, 'rv'), 'dir'); // (a relative link inside the checkout)
+    fs.symlinkSync(path.join(cwd, '.review'), path.join(cwd, 'a,b'), 'dir'); // (link names with `,` and `=`)
+    fs.symlinkSync(path.join(cwd, '.review'), path.join(cwd, 'a=b'), 'dir');
   } catch (e) {
     if (e.code === 'EPERM' || e.code === 'EACCES') { t.skip('cannot create symlinks here'); return null; }
     throw e;
@@ -1240,4 +1242,57 @@ test('#111: a hard link to a protected review file under another name is denied;
     `cd ${cwd} && cp /tmp/x H`,
   ]) assert.equal(w.bash(cmd), 'deny', cmd);
   for (const cmd of ['cat H', 'cp /tmp/x HS', 'echo y > HS', `node -e "require('fs').writeFileSync('HS','y')"`, 'cp /tmp/x unrelated.txt']) assert.equal(w.bash(cmd), 'allow', cmd);
+});
+
+// ---- #111 (final round): brace expansion into a protected name ------------------------------------------------------
+// The shell parser expands `{a,b}` into words, but cp / rsync / install judge only the LAST word as the destination, so the other expansions slipped through.
+
+test('#111: a brace list or range that expands to a protected review file is denied as a target (with and without a link)', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const A = w.alias;
+  for (const cmd of [
+    'cp x .review/{state,y}.json',
+    'cp x .review/{state,}.json',
+    'cp x .review/{state.json,y}',
+    'cp x .review/st{a,b}te.json',
+    'cp x .review/st{a..b}te.json',
+    'cp x .review/{round-1,y}/codex.json',
+    'cp x rv/st{a,b}te.json',
+    'cp x rv/st{a..b}te.json',
+    `cp x ${A}/st{a,b}te.json`,
+    `cp x ${A}/st{a..b}te.json`,
+    `cp x ${A}/{state,hardstops}.json`,
+    'install -m 644 x .review/{state,y}.json',
+    'rsync x rv/{state,y}.json',
+    'cp -t rv/{state,y}.json x',
+    'cp x .review/{y,{state,z}}.json', // (nested)
+    'echo y > .review/{state,x}.json',
+    'echo y > .review/st{a..b}te.json',
+    'echo y > rv/st{a..b}te.json',
+    `echo y > ${A}/{state,x}.json`,
+    'echo y | tee .review/{state,x}.json',
+    'echo y | tee .review/st{a..b}te.json',
+    `echo y | tee ${A}/st{a,b}te.json`,
+    'touch .review/{state,x}.json',
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  // (controls: no protected name among the expansions, a quoted brace is the literal name, a brace in a source or in a string)
+  for (const cmd of [
+    'cp x out/{a,b}.txt',
+    'cp x out/{1..3}.txt',
+    'cp x .review/{a,b}.json',
+    'cp x .review/{1..3}.json',
+    'cp x rv/{hardstops,y}.json',
+    `cp x ${A}/{hardstops,y}.json`,
+    `cp .review/{state,y}.json ${w.tmp}/out`,
+    "echo '{a,b}' > notes.txt",
+    'echo {a,b} > notes.txt',
+    'cp x out/${HOME}.txt',
+  ]) assert.equal(w.bash(cmd), 'allow', cmd);
+  // (over the 64-expansion bound: refused while a review folder exists, as before without one)
+  assert.equal(w.bash('cp x out/{a..z}{1..9}.txt'), 'deny');
+  assert.equal(w.bash('touch out/{1..100}.txt'), 'deny');
+  const n = reviewAliasWorld(t, { review: false });
+  assert.equal(n.bash('cp x out/{a..z}{1..9}.txt'), 'allow');
+  assert.equal(n.bash('touch out/{1..100}.txt'), 'allow');
 });
