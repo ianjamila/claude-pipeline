@@ -73,7 +73,17 @@ export function selectLifecycle(prs, { nowMs, minMergedHours }) {
 const glob = (pat) => new RegExp(`^${pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`);
 export const isProtectedName = (slug, protect) => protect.some((p) => glob(p).test(slug));
 
-// signals: { locked: string|null, processes: {available, pids, hidden}, transcripts: string[], memoryNotes: string[], recentFiles: string[] }
+// What the live-session scan (live-sessions.mjs liveSessionsIn: { hits: [{ id, pid }], unplaced: string[] }) means for a worktree:
+// a Claude session open there now, however long it has been idle, and an open session we could not place at all, which
+// counts for every worktree (fail-closed). Shared by the evaluation below and the re-inspection right before removal.
+export function liveSessionReasons(live) {
+  const r = [];
+  if (live?.unplaced?.length) r.push(`an open Claude session could not be placed: ${live.unplaced[0]}${live.unplaced.length > 1 ? ` (+${live.unplaced.length - 1} more)` : ''}`);
+  if (live?.hits?.length) r.push(`a Claude session is open there now (${live.hits.map((h) => `${h.id} pid ${h.pid}`).join(', ')})`);
+  return r;
+}
+
+// signals: { locked: string|null, processes: {available, pids, hidden}, liveSessions?: {hits, unplaced}, transcripts: string[], memoryNotes: string[], recentFiles: string[] }
 // `processes.hidden` (other users' processes we may not inspect) is reported, never a keep reason: every non-root user
 // sees root daemons that way, so it would keep everything. The quarantine re-inspection catches their writes (spec §2).
 export function inUseReasons(s) {
@@ -81,6 +91,7 @@ export function inUseReasons(s) {
   if (s.locked !== null && s.locked !== undefined) r.push(`locked (${s.locked || 'no reason given'})`);
   if (!s.processes.available) r.push('cannot check running processes on this platform');
   else if (s.processes.pids.length) r.push(`in use by process ${s.processes.pids.join(', ')}`);
+  r.push(...liveSessionReasons(s.liveSessions));
   if (s.transcripts.length) r.push(`a Claude session mentioned it recently (${s.transcripts[0]})`);
   if (s.memoryNotes.length) r.push(`a memory note says it is still needed (${s.memoryNotes[0]})`);
   if (s.recentFiles.length) r.push(`files changed recently (${s.recentFiles.slice(0, 3).join(', ')})`);

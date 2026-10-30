@@ -1,0 +1,20 @@
+{
+  "pid": 4242,
+  "sessionId": "00000000-0000-4000-8000-00000000fa6e",
+  "cwd": "/Users/fake/start",
+  "startedAt": 1790000000000,
+  "procStart": "Thu Oct 29 08:54:42 2026",
+  "version": "0.0.0",
+  "peerProtocol": 1,
+  "peerFeatures": ["notify_idle", "reply_across_default_dirs", "artifact_yield"],
+  "kind": "interactive",
+  "entrypoint": "cli",
+  "pidDomain": "darwin",
+  "messagingSocketPath": "/tmp/fake-sockets/4242.sock",
+  "name": "fakenm-1a",
+  "nameSource": "derived",
+  "nameSince": 1790000000000,
+  "status": "idle",
+  "updatedAt": 1790000000000,
+  "statusUpdatedAt": 1790000000000
+}
