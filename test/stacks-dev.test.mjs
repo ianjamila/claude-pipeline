@@ -5,12 +5,14 @@
 // real spawn with fake ps / lsof binaries and a throwaway state root.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, rmSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, rmSync, appendFileSync, utimesSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { listeners, bindDev, devSessionEnd, devRows, devRecords, runDevBind, readRecentEvents, resolveDevBins, psLookup, TERM_WAIT_MS } from '../pipeline/lib/stacks/dev.mjs';
+import { listeners, bindDev, devSessionEnd, devRows, devRecords, runDevBind, readRecentEvents, resolveDevBins, psLookup, TERM_WAIT_MS, MAX_AGE_MS, MIN_AGE_MS } from '../pipeline/lib/stacks/dev.mjs';
+import * as devAges from '../pipeline/lib/stacks/dev-ages.mjs';
+import { devBindCanSkip, devBindFastSkip, LEDGER_SLACK_MS } from '../pipeline/lib/stacks/fastpath.mjs';
 import { stackFiles, lockDirs } from '../pipeline/lib/stacks/paths.mjs';
 import { parseLstart } from '../pipeline/lib/stacks/identity.mjs';
 import { ok, unknown } from '../pipeline/lib/stacks/result.mjs';
@@ -728,7 +730,7 @@ test('hook flow win32: exit 0 with no I/O at all', async () => {
 
 // ---------------------------------------------------------------- the real hook entry
 
-function e2e({ listenerPpid = 4300, sleepMs } = {}) {
+function e2e({ listenerPpid = 4300, sleepMs, recordAgeMs = 10000 } = {}) {
   const d = dirs();
   const nowS = Math.floor(Date.now() / 1000);
   const ownerBirth = nowS - 3600;
@@ -756,13 +758,13 @@ function e2e({ listenerPpid = 4300, sleepMs } = {}) {
     FAKE_LSOF_SCENARIO: lsof,
     PIPELINE_MACHINE_ID: 'test-machine-id',
   };
-  const tPre = new Date(Date.now() - 10000).toISOString();
+  const tPre = new Date(Date.now() - recordAgeMs).toISOString();
   const dev = { t: tPre, kind: 'dev', session_id: 's1', tool_use_id: 'tu1', owner, cwd: d.wt, worktree: d.wt, tool: 'Bash', port: 3000, tPre };
   writeFileSync(d.files.ledger, `${JSON.stringify(dev)}\n`);
   const input = { tool_name: 'Bash', tool_input: { command: 'npm run dev' }, session_id: 's1', tool_use_id: 'tu1', cwd: d.wt };
-  const hook = (stdin = JSON.stringify(input)) => {
+  const hook = (stdin = JSON.stringify(input), { nodeArgs = [], extraEnv = {} } = {}) => {
     const started = performance.now();
-    const r = spawnSync(process.execPath, [HOOK], { input: stdin, env, encoding: 'utf8', timeout: 20000 });
+    const r = spawnSync(process.execPath, [...nodeArgs, HOOK], { input: stdin, env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 20000 });
     return { status: r.status, stderr: r.stderr, ms: performance.now() - started };
   };
   const lines = () => readFileSync(d.files.ledger, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
@@ -814,4 +816,283 @@ test('e2e: without PIPELINE_STACKS_ONLY the fake ps / lsof overrides are ignored
   assert.equal(r.status, 0);
   assert.equal(existsSync(join(x.d.dir, 'lsof.log')), false, 'the fake lsof must not have been run');
   assert.equal(existsSync(join(x.d.dir, 'ps.log')), false, 'the fake ps must not have been run');
+});
+
+// ---------------------------------------------------------------- the fast path (fastpath.mjs)
+// Contract: devBindCanSkip may say `true` ONLY when runDevBind would append nothing. A command devTargets() cannot match is NOT
+// enough: a later plain `ls` is the call that usually binds an earlier dev server of the session. What is enough is the ledger:
+// no file, or none touched for longer than a dev record stays due (MAX_AGE_MS) plus a slack.
+
+// The ledger of a hookWorld, stamped as the real one would be: touched no earlier than its newest line (a line is appended at or
+// after its own `t`). That is the oldest mtime the ledger can legally have, so the least favourable one for the fast path.
+const stampLedger = (h, events, atMs = Math.max(...events.map((e) => Date.parse(e.t)))) => utimesSync(h.d.files.ledger, atMs / 1000, atMs / 1000);
+const NOW_MS = (T0 + 30) * 1000;
+const lsOf = (h, over = {}) => ({ ...h.input, tool_input: { command: 'ls -la' }, ...over });
+const errno = (code) => Object.assign(new Error(`${code}: simulated`), { code });
+
+// The ledgers of the hook-flow tests above (and a few more), each as { h, events }.
+const devScenarios = () => {
+  const withRecord = (over = {}, { tPre = T0 + 20, born = tPre + 4, extra = [], listenerPpid } = {}) => () => {
+    const h = hookWorld();
+    h.dev = { ...h.dev, t: iso(tPre), tPre: iso(tPre), ...over };
+    bornAt(h, born);
+    if (listenerPpid) {
+      h.w.procs[300].ppid = listenerPpid;
+      h.w.procs[listenerPpid] = { ppid: 1, birth: T0 - 5000, comm: 'zsh' };
+    }
+    return { h, events: [h.dev, ...extra] };
+  };
+  return [
+    ['a 10 s old record, a descended listener (binds)', withRecord()],
+    ['a terminal-started listener (dev-post only)', withRecord({}, { listenerPpid: 800 })],
+    ['a record 2 s old (too young)', withRecord({}, { tPre: T0 + 28 })],
+    ['a record 3 s old (the youngest that binds)', withRecord({}, { tPre: T0 + 27 })],
+    ['a record 10 min old (the oldest that binds)', withRecord({}, { tPre: T0 + 30 - 600 })],
+    ['a record 10 min + 1 s old (given up on)', withRecord({}, { tPre: T0 + 30 - 601 })],
+    ['a record of another session', withRecord({ session_id: 's2' })],
+    ['a record 25 min old', withRecord({}, { tPre: T0 + 30 - 1500 })],
+    ['a record already bound', () => {
+      const { h, events } = withRecord()();
+      const bind = { t: iso(T0 + 26), kind: 'dev-bind', session_id: 's1', tool_use_id: 'tu1', owner: OWNER, port: 3000, devT: h.dev.t, listenerPid: 300, listenerBirth: T0 + 24, cwd: h.d.wt, worktree: h.d.wt };
+      return { h, events: [...events, bind] };
+    }],
+    ['a dev record and its dev-post', () => {
+      const { h, events } = withRecord()();
+      return { h, events: [...events, { t: iso(T0 + 22), kind: 'dev-post', session_id: 's1', tool_use_id: 'tu1', owner: OWNER, tPost: iso(T0 + 22) }] };
+    }],
+    ['only a lease line', () => ({ h: hookWorld(), events: [{ t: iso(T0 + 25), kind: 'use', project: 'x', owner: OWNER }] })],
+    ['an old lease line', () => ({ h: hookWorld(), events: [{ t: iso(T0 - 7200), kind: 'use', project: 'x', owner: OWNER }] })],
+  ];
+};
+// The payloads a real PostToolUse can carry. A tool_use_id names ONE call, and register writes a dev record only for a call whose
+// command devTargets() matches, so a command it cannot match never carries the tool_use_id of a dev record (tested in stacks-register).
+const payloadsOf = (h) => [
+  ['npm run dev (the record\'s own call)', h.input],
+  ['ls -la, another call', lsOf(h, { tool_use_id: 'tu2' })],
+  ['ls -la, no tool_use_id', lsOf(h, { tool_use_id: undefined })],
+  ['git status, no tool_use_id', lsOf(h, { tool_input: { command: 'git status' }, tool_use_id: undefined })],
+  ['no tool_input, another call', { ...h.input, tool_use_id: 'tu2', tool_input: undefined }],
+  ['a dev command, another call', { ...h.input, tool_use_id: 'tu3', tool_input: { command: 'next dev -p 3000' } }],
+  ['a dev command on another port', { ...h.input, tool_input: { command: 'next dev -p 4000' } }],
+];
+
+test('fast path, dev-bind: every case where runDevBind appends (dev-post or dev-bind) is NOT skippable, given the ledger mtime it ran with', async () => {
+  let appended = 0;
+  let skipped = 0;
+  let total = 0;
+  // the oldest mtime the ledger can legally have, and the same with a file-system clock running 30 s behind (what LEDGER_SLACK_MS is for)
+  for (const lagMs of [0, 30000]) {
+    for (const [scenario, build] of devScenarios()) {
+      const names = payloadsOf(build().h).map(([n]) => n);
+      for (let i = 0; i < names.length; i++) {
+        const { h, events } = build();
+        const input = payloadsOf(h)[i][1];
+        seedLedger(h, events);
+        stampLedger(h, events, Math.max(...events.map((e) => Date.parse(e.t))) - lagMs);
+        const skip = devBindCanSkip({ input, now: NOW_MS, ledgerFile: h.d.files.ledger });
+        const r = await runDevBind(input, hookDeps(h));
+        total++;
+        if (r.events.length > 0) appended++;
+        if (skip) skipped++;
+        if (r.events.length > 0) assert.equal(skip, false, `${scenario} / ${names[i]} / clock ${lagMs} ms behind: runDevBind appended ${r.events.map((e) => e.kind)} but the fast path would skip it`);
+        if (skip) assert.deepEqual(ledgerLines(h), events, `${scenario} / ${names[i]}: a skipped call must leave the ledger as it was`);
+      }
+    }
+  }
+  assert.ok(appended >= 30 && skipped >= 2 && total - appended >= 30, `${appended} appended, ${skipped} skipped, of ${total}`);
+});
+
+test('fast path, dev-bind: a plain `ls -la` 5 s after the `npm run dev` record of the same session is NOT skipped, and it is the call that binds the server', async () => {
+  const h = hookWorld();
+  const tPre = T0 + 25;
+  h.dev = { ...h.dev, t: iso(tPre), tPre: iso(tPre) };
+  bornAt(h, tPre + 4);
+  seedLedger(h, [h.dev]);
+  stampLedger(h, [h.dev]);
+  const input = lsOf(h, { tool_use_id: 'tu2' });
+  assert.equal(devBindCanSkip({ input, now: NOW_MS, ledgerFile: h.d.files.ledger }), false);
+  const r = await runDevBind(input, hookDeps(h));
+  assert.deepEqual(r.events.map((e) => e.kind), ['dev-bind']);
+});
+
+test('fast path, dev-bind: a ledger untouched for longer than a record stays due, and a command that starts no dev server => skipped; nothing is appended then', async () => {
+  const h = hookWorld();
+  const old = { ...h.dev, t: iso(T0 + 30 - 720), tPre: iso(T0 + 30 - 720) }; // the record's call began 12 min ago
+  seedLedger(h, [old]);
+  stampLedger(h, [old]);
+  bornAt(h, T0 + 30 - 716);
+  const input = lsOf(h, { tool_use_id: 'tu2' });
+  assert.equal(devBindCanSkip({ input, now: NOW_MS, ledgerFile: h.d.files.ledger }), true);
+  const before = ledgerLines(h);
+  const r = await runDevBind(input, hookDeps(h));
+  assert.deepEqual(r.events, []);
+  assert.deepEqual(ledgerLines(h), before);
+  // ...but the same stale ledger does NOT excuse a dev command: its own record still gets its dev-post
+  const dev = h.input;
+  assert.equal(devBindCanSkip({ input: dev, now: NOW_MS, ledgerFile: h.d.files.ledger }), false);
+  assert.deepEqual((await runDevBind(dev, hookDeps(h))).events.map((e) => e.kind), ['dev-post']);
+});
+
+test('fast path, dev-bind: no ledger file => skipped; a ledger from the future, an unreadable one, or a stat answer that is not a time => NOT skipped', () => {
+  const h = hookWorld();
+  const input = lsOf(h);
+  const skip = (statSync, over = {}) => devBindCanSkip({ input, now: NOW_MS, ledgerFile: h.d.files.ledger, statSync, ...over });
+  assert.equal(devBindCanSkip({ input, now: NOW_MS, ledgerFile: h.d.files.ledger }), true, 'no file on disk');
+  assert.equal(skip(() => { throw errno('ENOENT'); }), true);
+  for (const code of ['EACCES', 'EPERM', 'ENOTDIR', 'EIO', 'ELOOP', 'ENAMETOOLONG', 'EMFILE', undefined]) assert.equal(skip(() => { throw errno(code); }), false, String(code));
+  assert.equal(skip(() => { throw new TypeError('not an fs error'); }), false);
+  assert.equal(skip(() => { throw 'a string'; }), false);
+  for (const mtimeMs of [NOW_MS + 1, NOW_MS + 3600 * 1000, NOW_MS, NOW_MS - 1000, NOW_MS - 600 * 1000, NaN, Infinity, -Infinity, undefined, null, '1']) {
+    assert.equal(skip(() => ({ mtimeMs })), false, `mtime ${String(mtimeMs)}`);
+  }
+  assert.equal(skip(() => ({})), false);
+  assert.equal(skip(() => undefined), false);
+  // the edge: older than MAX_AGE_MS + the slack, strictly
+  const edge = MAX_AGE_MS + LEDGER_SLACK_MS;
+  assert.equal(skip(() => ({ mtimeMs: NOW_MS - edge })), false, 'exactly at the edge');
+  assert.equal(skip(() => ({ mtimeMs: NOW_MS - edge - 1 })), true, 'one ms past the edge');
+  assert.equal(skip(() => ({ mtimeMs: NOW_MS - 3600 * 1000 })), true);
+  assert.ok(LEDGER_SLACK_MS > 0);
+});
+
+test('fast path, dev-bind: the edge is dev.mjs\'s own MAX_AGE_MS (one definition), and a record older than that binds nothing', () => {
+  assert.equal(MAX_AGE_MS, devAges.MAX_AGE_MS);
+  assert.equal(MIN_AGE_MS, devAges.MIN_AGE_MS);
+  assert.equal(MAX_AGE_MS, 600000);
+  assert.equal(MIN_AGE_MS, 3000);
+});
+
+test('fast path, dev-bind: runDevBind\'s own no-ops (not Bash, no session) skip without touching the disk; a dev command never skips, with any ledger', () => {
+  const h = hookWorld();
+  const never = () => assert.fail('the ledger must not be looked at');
+  for (const input of [{ ...h.input, tool_name: 'Read' }, { ...h.input, tool_name: undefined }, { ...h.input, session_id: undefined }, { ...h.input, session_id: '' }, { ...h.input, session_id: 7 }, {}]) {
+    assert.equal(devBindCanSkip({ input, now: NOW_MS, ledgerFile: h.d.files.ledger, statSync: never }), true, JSON.stringify(input));
+  }
+  const ancient = () => ({ mtimeMs: 0 });
+  const missing = () => { throw errno('ENOENT'); };
+  for (const command of ['npm run dev', 'npm start', 'next dev -p 4000', 'PORT=3001 npm run dev', 'cd app && npm run dev &', 'echo "next dev"', 'next start --port=4001']) {
+    for (const statSync of [ancient, missing]) assert.equal(devBindCanSkip({ input: { ...h.input, tool_input: { command } }, now: NOW_MS, ledgerFile: h.d.files.ledger, statSync }), false, command);
+  }
+});
+
+test('fast path, dev-bind: devBindFastSkip stats the ledger under the stacks root (PIPELINE_STACKS_HOME, else <home>/.claude/pipeline-state/stacks)', () => {
+  const h = hookWorld();
+  const input = lsOf(h);
+  const env = { PIPELINE_STACKS_HOME: h.d.root };
+  assert.equal(devBindFastSkip({ input, env, home: h.d.dir, now: NOW_MS }), true, 'no ledger');
+  writeFileSync(h.d.files.ledger, '');
+  assert.equal(devBindFastSkip({ input, env, home: h.d.dir, now: Date.now() }), false, 'a ledger touched just now');
+  utimesSync(h.d.files.ledger, (Date.now() - 20 * 60 * 1000) / 1000, (Date.now() - 20 * 60 * 1000) / 1000);
+  assert.equal(devBindFastSkip({ input, env, home: h.d.dir, now: Date.now() }), true, 'a ledger touched 20 min ago');
+  assert.equal(devBindFastSkip({ input, env: { PIPELINE_STACKS_HOME: join(h.d.dir, 'elsewhere') }, home: h.d.dir, now: Date.now() }), true, 'another root has no ledger');
+  const defaultRoot = join(h.d.dir, '.claude', 'pipeline-state', 'stacks');
+  mkdirSync(defaultRoot, { recursive: true });
+  writeFileSync(join(defaultRoot, 'ledger.jsonl'), '');
+  assert.equal(devBindFastSkip({ input, env: {}, home: h.d.dir, now: Date.now() }), false, 'the default root\'s ledger');
+});
+
+// ---- the fast path in the real hook ----
+const RESOLVE_SPY = join(here, 'fixtures', 'resolve-spy-preload.mjs');
+const loadedBy = (file) => new Set(existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((u) => u.split('/').pop()) : []);
+const HEAVY_LIBS = ['dev.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs', 'config.mjs', 'claude-ancestry.mjs', 'register.mjs', 'inventory.mjs'];
+const spyEnv = (x, extra = {}) => ({ RESOLVE_SPY_LOG: join(x.d.dir, 'resolve.log'), ...extra });
+const loadedIn = (x) => loadedBy(join(x.d.dir, 'resolve.log'));
+const lsPayload = (x, over = {}) => JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls -la' }, session_id: 's1', tool_use_id: 'tu2', cwd: x.d.wt, ...over });
+const ageLedger = (x, minutes) => {
+  const s = (Date.now() - minutes * 60 * 1000) / 1000;
+  utimesSync(x.d.files.ledger, s, s);
+};
+
+test('e2e fast path: a plain command with no ledger, or a ledger idle for 11+ min, exits 0 without loading dev.mjs, the locks, the ledger code or identity', posixOnly, () => {
+  const idle = e2e({ recordAgeMs: 20 * 60 * 1000 });
+  ageLedger(idle, 20);
+  const before = readFileSync(idle.d.files.ledger, 'utf8');
+  for (const [name, x, stdin] of [
+    ['a stale ledger, ls -la', idle, lsPayload(idle)],
+    ['a stale ledger, a non-Bash tool', idle, lsPayload(idle, { tool_name: 'Read', tool_input: { file_path: '/x' } })],
+    ['a stale ledger, no session id', idle, lsPayload(idle, { session_id: undefined })],
+  ]) {
+    const r = x.hook(stdin, { nodeArgs: ['--import', RESOLVE_SPY], extraEnv: spyEnv(x) });
+    assert.equal(r.status, 0, `${name}: ${r.stderr}`);
+    assert.equal(r.stderr, '', name);
+    assert.ok(loadedIn(x).has('fastpath.mjs'), `${name}: the fast path ran`);
+    for (const lib of HEAVY_LIBS) assert.equal(loadedIn(x).has(lib), false, `${name}: ${lib} must not be loaded`);
+  }
+  assert.equal(readFileSync(idle.d.files.ledger, 'utf8'), before, 'the ledger is untouched');
+
+  const none = e2e();
+  rmSync(none.d.files.ledger);
+  const r = none.hook(lsPayload(none), { nodeArgs: ['--import', RESOLVE_SPY], extraEnv: spyEnv(none) });
+  assert.equal(r.status, 0, r.stderr);
+  for (const lib of HEAVY_LIBS) assert.equal(loadedIn(none).has(lib), false, `no ledger: ${lib} must not be loaded`);
+  assert.equal(existsSync(none.d.files.ledger), false);
+});
+
+test('e2e fast path: a plain `ls -la` while the session has a dev record 10 s old DOES load dev.mjs and is the call that binds the server', posixOnly, () => {
+  const x = e2e();
+  const r = x.hook(lsPayload(x), { nodeArgs: ['--import', RESOLVE_SPY], extraEnv: spyEnv(x) });
+  assert.equal(r.status, 0, r.stderr);
+  for (const lib of ['fastpath.mjs', 'dev.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs']) assert.ok(loadedIn(x).has(lib), `${lib} must be loaded`);
+  assert.deepEqual(x.lines().map((e) => e.kind), ['dev', 'dev-bind']);
+  assert.equal(x.lines()[1].listenerPid, 5001);
+});
+
+test('e2e fast path: a dev command DOES load dev.mjs, with a fresh ledger and with a stale one (its own record still gets the dev-post)', posixOnly, () => {
+  const fresh = e2e();
+  const a = fresh.hook(undefined, { nodeArgs: ['--import', RESOLVE_SPY], extraEnv: spyEnv(fresh) });
+  assert.equal(a.status, 0, a.stderr);
+  for (const lib of ['dev.mjs', 'locks.mjs', 'ledger.mjs', 'identity.mjs']) assert.ok(loadedIn(fresh).has(lib), `fresh: ${lib} must be loaded`);
+  assert.deepEqual(fresh.lines().map((e) => e.kind), ['dev', 'dev-post', 'dev-bind']);
+
+  const stale = e2e({ recordAgeMs: 20 * 60 * 1000 });
+  ageLedger(stale, 20);
+  const b = stale.hook(undefined, { nodeArgs: ['--import', RESOLVE_SPY], extraEnv: spyEnv(stale) });
+  assert.equal(b.status, 0, b.stderr);
+  assert.ok(loadedIn(stale).has('dev.mjs'), 'stale: dev.mjs must be loaded');
+  assert.deepEqual(stale.lines().map((e) => e.kind), ['dev', 'dev-post']);
+});
+
+test('e2e fast path fails closed: when it cannot be imported, throws, or the ledger cannot be stat\'ed, the full path runs and binds exactly as before', posixOnly, () => {
+  for (const mode of ['import', 'throw']) {
+    const brk = { RESOLVE_SPY_BREAK: `fastpath.mjs:${mode}` };
+    // a call the fast path would skip: the full path loads dev.mjs and, finding nothing due, appends nothing
+    const idle = e2e({ recordAgeMs: 20 * 60 * 1000 });
+    ageLedger(idle, 20);
+    const r = idle.hook(lsPayload(idle), { nodeArgs: ['--import', RESOLVE_SPY], extraEnv: spyEnv(idle, brk) });
+    assert.equal(r.status, 0, `${mode}: ${r.stderr}`);
+    assert.ok(loadedIn(idle).has('dev.mjs'), `${mode}: dev.mjs must be loaded after a fast-path failure`);
+    assert.equal(idle.lines().length, 1);
+    // a bind the full path makes is made
+    const due = e2e();
+    assert.equal(due.hook(lsPayload(due), { nodeArgs: ['--import', RESOLVE_SPY], extraEnv: spyEnv(due, brk) }).status, 0);
+    assert.deepEqual(due.lines().map((e) => e.kind), ['dev', 'dev-bind'], mode);
+    // bad stdin is still only logged
+    const bad = e2e();
+    assert.equal(bad.hook('not json', { nodeArgs: ['--import', RESOLVE_SPY], extraEnv: spyEnv(bad, brk) }).status, 0);
+    assert.match(readFileSync(bad.d.files.log, 'utf8'), /dev-bind hook failed/);
+  }
+  if (process.getuid?.() === 0) return; // root can stat through a mode-000 directory
+  const locked = e2e();
+  chmodSync(locked.d.root, 0o000);
+  try {
+    const r = locked.hook(lsPayload(locked), { nodeArgs: ['--import', RESOLVE_SPY], extraEnv: spyEnv(locked) });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(loadedIn(locked).has('dev.mjs'), 'an unreadable state root is no proof of anything: the full path runs');
+  } finally {
+    chmodSync(locked.d.root, 0o700);
+  }
+});
+
+test('fast path, dev-bind: the one assumption beyond the ledger: a command devTargets() cannot match never carries the tool_use_id of a dev record', async () => {
+  // Known limit, stated rather than hidden: runDevBind posts the dev-post for ANY payload whose tool_use_id has a dev record, so a
+  // non-dev command with that id, over a ledger idle for 11+ min, would be skipped here and posted there. It cannot happen: the
+  // record's call is the call this hook follows, with the same command. Were the command rewritten in between, the cost is a
+  // missing tPost on a record already given up on (older than MAX_AGE_MS), which only widens its window.
+  const h = hookWorld();
+  const old = { ...h.dev, t: iso(T0 + 30 - 1500), tPre: iso(T0 + 30 - 1500) };
+  seedLedger(h, [old]);
+  stampLedger(h, [old]);
+  const impostor = lsOf(h);
+  assert.equal(devBindCanSkip({ input: impostor, now: NOW_MS, ledgerFile: h.d.files.ledger }), true);
+  assert.deepEqual((await runDevBind(impostor, hookDeps(h))).events.map((e) => e.kind), ['dev-post']);
 });
