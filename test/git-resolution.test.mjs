@@ -655,6 +655,25 @@ test('checkSelection: a candidate end costs steps for the lines it compares and 
   assert.ok(spent > 2000 * 1000, `only ${spent} steps charged for millions of line comparisons`);
 });
 
+test('checkSelection: the position maps of a block are built once and charged once, not rebuilt for every candidate end', () => {
+  const l = (x) => `${x}\n`;
+  let spent = 0;
+  const counting = (k = 1) => { spent += k; };
+  const N = 2000;
+  const K = 200;
+  const ours = Array.from({ length: N }, (_, i) => l(`u${i}`));
+  const theirs = Array.from({ length: N }, (_, i) => l(`v${i}`));
+  // every 'm' is a candidate end (outside = one 'm'), each cut by interleave after a few lines
+  const parsed = { outsides: [[l('top')], [l('m')], [l('bottom')]], blocks: [{ ours, theirs }, { ours: [l('z')], theirs: [l('y')] }] };
+  const head = [l('top'), l('u0'), ...Array.from({ length: K }, () => l('m')), l('bottom')];
+  checkSelection(parsed, head, counting);
+  assert.ok(spent >= 2 * N, `the maps over ${2 * N} lines were never charged (${spent} steps)`);
+  assert.ok(spent < 40 * N, `${spent} steps: the maps look rebuilt (and charged) per candidate end`);
+  spent = 0;
+  interleave([l('u0')], ours, theirs, counting);
+  assert.ok(spent >= 2 * N, `interleave on its own must charge its map build (${spent})`);
+});
+
 test('parseConflictBlocks: 5000 blocks is "too-many-blocks" at once (no recursion, no throw); the limit itself still parses', () => {
   const l = (...x) => x.map((s) => `${s}\n`);
   const build = (n) => {

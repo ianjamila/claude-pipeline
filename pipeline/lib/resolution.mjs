@@ -195,22 +195,29 @@ export function parseConflictBlocks(markerLines, stage2Lines, stage3Lines, tick 
   return found[0];
 }
 
+// line -> ascending positions, for both sides of a block. Charged one step per line.
+export function positionMaps(ours, theirs, tick = makeBudget()) {
+  tick(ours.length + theirs.length + 1);
+  const positions = (side) => {
+    const m = new Map();
+    side.forEach((l, i) => (m.has(l) ? m.get(l).push(i) : m.set(l, [i])));
+    return m;
+  };
+  return { oursAt: positions(ours), theirsAt: positions(theirs) };
+}
+
 // Is R an interleaving of a subsequence of `ours` and a subsequence of `theirs`? Existential: some way to give every line of R
 // to one side such that each side's lines keep their order. Greedy would be wrong: ours [a,b], theirs [b,a], R [b,a,b] only
 // works as b and a from theirs and the last b from ours (giving the first b to ours strands the a). So this is a layered search over (next ours, next theirs)
 // pointers; handing a line to a side always takes that side's EARLIEST matching line, which dominates any later one.
 // The cost of a path is the number of lines it takes from `theirs`; the cheapest path gives the most lines of theirs that
 // can have been dropped (the number the reviewer is asked to justify), so an identical line is credited to ours.
+// `at` is the line -> positions maps of the two sides (positionMaps); a caller that asks about one block many times builds them
+// once. Without it they are built here, and charged.
 // -> { ok: false } | { ok: true, droppedTheirs }
-export function interleave(R, ours, theirs, tick = makeBudget()) {
+export function interleave(R, ours, theirs, tick = makeBudget(), at = null) {
   if (R.length > ours.length + theirs.length) return { ok: false };
-  const positions = (side) => {
-    const m = new Map();
-    side.forEach((l, i) => (m.has(l) ? m.get(l).push(i) : m.set(l, [i])));
-    return m;
-  };
-  const oursAt = positions(ours);
-  const theirsAt = positions(theirs);
+  const { oursAt, theirsAt } = at ?? positionMaps(ours, theirs, tick);
   // First position >= from in the (ascending) position list of `line`, or -1: a binary search, so one step costs O(log n), not O(n).
   const next = (map, line, from) => {
     const at = map.get(line);
@@ -273,6 +280,7 @@ export function checkSelection(parsed, headLines, tick = makeBudget()) {
   let sawMarker = false;
   let sawOther = false;
   const bad = new Set();
+  const maps = []; // per block, built on first use: the same block is asked about at every candidate end
   const place = (b, p) => {
     if (b === blocks.length) return p === H.length ? [] : null;
     const key = b * (H.length + 1) + p;
@@ -288,7 +296,7 @@ export function checkSelection(parsed, headLines, tick = makeBudget()) {
       if (markersBefore[e] > markersBefore[p]) { sawMarker = true; continue; }
       tick(e - p + 1);
       const R = H.slice(p, e);
-      const got = interleave(R, ours, theirs, tick);
+      const got = interleave(R, ours, theirs, tick, (maps[b] ??= positionMaps(ours, theirs, tick)));
       if (!got.ok) { sawOther = true; continue; }
       const rest = place(b + 1, e + O.length);
       if (rest) return [got.droppedTheirs, ...rest];
