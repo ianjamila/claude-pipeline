@@ -364,8 +364,25 @@ export function markLightLane(items) {
 // ---- exit rules -----------------------------------------------------------------------------
 
 // A round that only merged the base branch in ("Update branch") reviewed nothing of the PR's own: it does not count toward
-// maxRounds. Only reviewed rounds (not baseOnly) are counted by the cap.
-export const reviewedRoundCount = (state) => (state?.rounds ?? []).filter((r) => r?.baseOnly !== true).length;
+// maxRounds. Nor does a round that is only the resolution of a merge conflict with the base branch (resolutionOnly: git.mjs#
+// resolutionReviewBase proved the resolver only chose lines the two sides already had). That one IS a real review (Codex, triage
+// and Fable all run), only the cap is waived. Only the other rounds are counted by the cap.
+export const countsTowardCap = (r) => r?.baseOnly !== true && r?.resolutionOnly !== true;
+export const reviewedRoundCount = (state) => (state?.rounds ?? []).filter(countsTowardCap).length;
+
+// The rounds whose new accepts still wait for a round that reviews their fixes: from the end back through the rounds that
+// reviewed nothing of their own (baseOnly, skipped) and the resolution-only ones (their own accepts count, and so do the
+// earlier round's, which a conflict resolved before the fix was made must not hide), up to the first round that counts toward
+// the cap. Without that, a resolution round recorded between an accept and its fix would strand the confirm round.
+const roundsAwaitingFixReview = (rounds) => {
+  const out = [];
+  for (let i = rounds.length - 1; i >= 0; i -= 1) {
+    if (rounds[i]?.baseOnly === true) continue;
+    out.push(rounds[i]);
+    if (countsTowardCap(rounds[i])) break;
+  }
+  return out;
+};
 
 const isNewAccept = (item) => item.final?.decision === 'ACCEPT' && item.final.by !== 'cache';
 const isUnimplementedAccept = (item) => item.final?.decision === 'ACCEPT' && !item.implemented;
@@ -392,8 +409,9 @@ export function roundOutcome(state) {
   const unimplemented = idsOf(everything.filter(isUnimplementedAccept));
   // What the last REVIEWED round newly accepted still needs a round to review its fixes. A baseOnly round (main merged in) has
   // no items, and must neither hide those accepts (clean) nor strand the confirm round once the fixes are made (extraRound).
+  // A resolutionOnly round is reviewed (it has items, accepts and a Fable obligation like any round); only the cap skips it.
   const lastReviewed = rounds.findLast((r) => r?.baseOnly !== true);
-  const newAccepted = idsOf((lastReviewed?.items ?? []).filter(isNewAccept));
+  const newAccepted = idsOf(roundsAwaitingFixReview(rounds).flatMap((r) => r.items ?? []).filter(isNewAccept));
   const coverageValid =
     last !== undefined &&
     hasContentHash(last.contentHashAtToHead) &&
@@ -413,7 +431,8 @@ export function roundOutcome(state) {
   // it just has fixes nobody re-reviewed (owner ruling 2026-10-20). One extra round rechecks them instead of
   // parking. It is the last: more than maxRounds reviewed rounds is the record that it was used, so extraRound is false
   // afterwards and anything not clean parks as before. A stale coverage hash with no new accepts does not qualify.
-  // Rounds that only merged the base branch in (baseOnly) are not counted: they neither use up a round nor the extra one.
+  // Rounds that only merged the base branch in (baseOnly) or only resolved a conflict with it (resolutionOnly) are not counted:
+  // they neither use up a round nor the extra one.
   // newAccepted comes from the last REVIEWED round: a baseOnly round can be recorded before the accepted fixes are made (it needs
   // only an empty patch of the PR's own), and must change nothing about them.
   const reviewed = reviewedRoundCount(state);
@@ -434,11 +453,12 @@ export function roundOutcome(state) {
 }
 
 // May round `n` start? Reviewed rounds stop at maxRounds, plus the one extra confirm round roundOutcome grants (extraRound). The
-// round being started counts as one more reviewed round unless it is baseOnly (only the base branch merged in), which is never
-// capped. A state without a finite maxRounds (hand-built) is not capped. -> null when it may, else the reason it may not.
-export function roundCapProblem(state, n, { baseOnly = false } = {}) {
+// round being started counts as one more reviewed round unless it is baseOnly (only the base branch merged in) or resolutionOnly
+// (only a conflict with it resolved), which are never capped. A state without a finite maxRounds (hand-built) is not capped.
+// -> null when it may, else the reason it may not.
+export function roundCapProblem(state, n, { baseOnly = false, resolutionOnly = false } = {}) {
   const max = state?.maxRounds;
-  if (!Number.isFinite(max) || baseOnly) return null;
+  if (!Number.isFinite(max) || baseOnly || resolutionOnly) return null;
   const reviewed = reviewedRoundCount(state);
   const next = reviewed + 1;
   if (next <= max) return null;
@@ -459,6 +479,6 @@ export function reviewValidFor(state, contentHash) {
   const rounds = state?.rounds ?? [];
   const isClean = (round) => (round.items ?? []).every((item) => !isNewAccept(item));
   const lastReviewed = rounds.findLast((round) => round.baseOnly !== true);
-  if (lastReviewed === undefined || !isClean(lastReviewed)) return false;
+  if (lastReviewed === undefined || !roundsAwaitingFixReview(rounds).every(isClean)) return false;
   return rounds.at(-1).contentHashAtToHead === contentHash;
 }

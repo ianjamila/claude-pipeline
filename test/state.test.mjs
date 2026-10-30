@@ -393,3 +393,38 @@ test('stateExtends: equal and extra trailing rounds extend; any change to a publ
   assert.equal(stateExtends(edit((r) => { r.items[0].title = 'reworded'; r.items[0].final = { reason: undefined, ...r.items[0].final }; }), pub), true);
   assert.equal(decidedItemsKey({ items: [{ id: 'a', final: { x: 1, y: 2 } }] }), decidedItemsKey({ items: [{ final: { y: 2, x: 1 }, id: 'a' }] }));
 });
+
+test('addRound keeps resolutionOnly with its conflicted paths, count and blocks; a normal round carries none of them', () => {
+  const s0 = emptyState({ repo: 'ianjamila/x', pr: 12, branch: 'agent/x', risk: 'low', lightLane: true, maxRounds: 3 });
+  const blocks = [{ path: 'a.js', block: 1, droppedTheirs: 2 }];
+  const s1 = addRound(s0, {
+    n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], reviewBase: 'tree', reviewBaseKind: 'resolution',
+    resolutionOnly: true, conflicted: ['a.js'], conflictedCount: 3, blocks,
+  });
+  const r = s1.rounds[0];
+  assert.deepEqual([r.resolutionOnly, r.conflicted, r.conflictedCount, r.blocks], [true, ['a.js'], 3, blocks]);
+  blocks[0].droppedTheirs = 99;
+  assert.equal(s1.rounds[0].blocks[0].droppedTheirs, 2, 'copied, not shared');
+  const plain = addRound(s0, { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], conflicted: ['x'], resolutionOnly: false });
+  for (const k of ['resolutionOnly', 'conflicted', 'conflictedCount', 'blocks']) assert.equal(Object.hasOwn(plain.rounds[0], k), false, k);
+});
+
+test('a resolution-only round survives save / load and the published-comment round trip; an old state reads as not resolutionOnly', () => {
+  const dir = tmp();
+  try {
+    let s = emptyState({ repo: 'ianjamila/x', pr: 12, branch: 'agent/x', risk: 'low', lightLane: true, maxRounds: 3 });
+    s = addRound(s, { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [] });
+    s = addRound(s, {
+      n: 2, fromHead: 'b', toHead: 'c', contentHashAtToHead: 'h2', items: [], reviewBase: 'tree', reviewBaseKind: 'resolution', forkPoint: 'f',
+      resolutionOnly: true, conflicted: ['a b.js', 'c\nd.js'], conflictedCount: 2, blocks: [{ path: 'a b.js', block: 1, droppedTheirs: 0 }],
+    });
+    saveState(dir, s);
+    assert.deepEqual(loadState(dir), s);
+    const back = decodeFromComment(encodeForComment(s));
+    assert.deepEqual(back, s);
+    assert.equal(back.rounds[0].resolutionOnly, undefined, 'old rounds are not resolutionOnly');
+    assert.deepEqual(back.rounds[1].conflicted, ['a b.js', 'c\nd.js']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
