@@ -852,5 +852,24 @@ test("buildReviewPrompt baseKind 'resolution': names the base as a marker tree, 
   const none = buildReviewPrompt({ pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'resolution', resolution: { ...resolution, blocks: [] } });
   assert.match(none, /kept every line of the base branch's side/);
   assert.doesNotMatch(buildReviewPrompt({ pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'whole-pr' }), /Conflict resolution|trial-merged/);
+
+  // The list passed in is cut: the totals over all blocks decide, so a drop that is not in the list is still named.
+  const cut = buildReviewPrompt({
+    pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'resolution',
+    resolution: { ...resolution, blocks: [{ path: 'src/z.js', block: 1, droppedTheirs: 0 }], blockCount: 60, blocksWithDrops: 1, droppedTheirsTotal: 4 },
+  });
+  assert.doesNotMatch(cut, /kept every line/);
+  assert.match(cut, /dropped 4 line\(s\) of the base branch's side, in 1 of 60 conflict block/);
+  assert.match(cut, /\(\+1 more block\(s\) with dropped lines, not listed/);
+  const unchecked = buildReviewPrompt({
+    pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'resolution', resolution: { ...resolution, blocks: [], blockCount: 60 },
+  });
+  assert.doesNotMatch(unchecked, /kept every line/, 'blocks not seen are not vouched for');
+  assert.match(unchecked, /Only 0 of the 60 conflict blocks/);
+  const clean = buildReviewPrompt({
+    pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'resolution',
+    resolution: { ...resolution, blocks: [{ path: 'src/z.js', block: 1, droppedTheirs: 0 }], blockCount: 60, blocksWithDrops: 0, droppedTheirsTotal: 0 },
+  });
+  assert.match(clean, /kept every line/, 'totals that say nothing was dropped, over all 60 blocks, do vouch for it');
   assert.throws(() => buildReviewPrompt({ pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'resolution' }), /resolution\.from/);
 });

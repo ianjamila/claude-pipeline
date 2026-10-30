@@ -69,6 +69,17 @@ const tail = (s) => {
   return text.length > DETAIL_CHARS ? text.slice(-DETAIL_CHARS) : text;
 };
 
+// What the prompt and the stored round carry of a proven resolution. The lists are cut to 50 (dropped blocks first, so a cut never
+// hides a drop); the totals are over ALL blocks and travel with them, so nothing downstream has to count a truncated list.
+const resolutionSummary = (r) => ({
+  conflicted: r.conflicted.slice(0, 50),
+  conflictedCount: r.conflictedCount,
+  blocks: [...r.blocks.filter((b) => b.droppedTheirs > 0), ...r.blocks.filter((b) => b.droppedTheirs === 0)].slice(0, 50),
+  blockCount: r.blockCount,
+  blocksWithDrops: r.blocksWithDrops,
+  droppedTheirsTotal: r.droppedTheirsTotal,
+});
+
 const unavailable = (reason, extra = {}) => new Fail(EXIT.UNAVAILABLE, { ok: false, unavailable: true, reason, ...extra });
 
 export const run = guarded(async (argv, ctx) => {
@@ -132,7 +143,8 @@ export const run = guarded(async (argv, ctx) => {
   // written for the round).
   const checkCap = (st, flags) => {
     const capped = st ? roundCapProblem(st, round, flags) : null;
-    if (capped) throw new Fail(EXIT.USAGE, { ok: false, error: 'round-cap', message: capped });
+    // resolutionIneligible: why the free (resolution-only) round was refused, when one was tried (it is computed before the cap).
+    if (capped) throw new Fail(EXIT.USAGE, { ok: false, error: 'round-cap', message: capped, ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }) });
   };
 
   let state = readState();
@@ -226,6 +238,7 @@ export const run = guarded(async (argv, ctx) => {
   // Only the base branch was merged in since the last round: there is nothing of the PR's own to review.
   const baseOnly = review.kind === 'synthetic' && patch === '' && largeBinaries.length === 0;
   checkCap(state, { baseOnly, resolutionOnly });
+  const resolutionView = resolutionOnly ? resolutionSummary(resolution) : null;
   ensureRoundDir(root, round);
   const note = largeBinaryNote(largeBinaries);
   writeFileAtomic(path.join(dir, 'diff.patch'), note.length === 0 ? patch : `${patch}\nLarge binary files (content not shown):\n${note.join('\n')}\n`);
@@ -240,7 +253,7 @@ export const run = guarded(async (argv, ctx) => {
   const prompt = buildReviewPrompt({
     pr, title: view.title, body: view.body, base: review.base, head, risk: level, round, lightLane, priorRulings, rulesRef: forkPoint, largeBinaries, baseKind: review.kind,
     sensitivePaths: lane.sensitivePaths,
-    ...(resolutionOnly ? { resolution: { from: base, forkPoint, conflicted: resolution.conflicted.slice(0, 50), conflictedCount: resolution.conflictedCount, blocks: resolution.blocks.slice(0, 50) } } : {}),
+    ...(resolutionOnly ? { resolution: { from: base, forkPoint, ...resolutionView } } : {}),
   });
 
   const hashAtHead = currentContentHash(root, config);
@@ -321,7 +334,7 @@ export const run = guarded(async (argv, ctx) => {
     const next = addRound({ ...base0, risk: level, lightLane: reviewer === 'fable' ? false : lightLane, reviewer, currentContentHash: hashAtHead }, {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled,
       reviewBase: review.base, reviewBaseKind: review.kind, forkPoint, codexModel: model, ...(baseOnly ? { baseOnly: true } : {}),
-      ...(resolutionOnly ? { resolutionOnly: true, conflicted: resolution.conflicted.slice(0, 50), conflictedCount: resolution.conflictedCount, blocks: resolution.blocks.slice(0, 50) } : {}),
+      ...(resolutionOnly ? { resolutionOnly: true, ...resolutionView } : {}),
       ...(reviewer === 'fable' && !baseOnly ? { fableRequired: true, fableReasons: reasons, sensitivePaths: lane.sensitivePaths.slice(0, 50) } : {}),
     });
     writeJson(path.join(dir, 'codex.json'), { findings, items: ruled });
@@ -342,7 +355,7 @@ export const run = guarded(async (argv, ctx) => {
         worth_considering: findings.worth_considering.length,
       },
       ...(baseOnly ? { baseOnly: true } : {}),
-      ...(resolutionOnly ? { resolutionOnly: true, conflicted: resolution.conflicted.slice(0, 50), conflictedCount: resolution.conflictedCount } : {}),
+      ...(resolutionOnly ? { resolutionOnly: true, conflicted: resolutionView.conflicted, conflictedCount: resolution.conflictedCount } : {}),
       ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }),
       preRuled: items.filter((i) => i.final).length,
       lightLane: state.lightLane,
