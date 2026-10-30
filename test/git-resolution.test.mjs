@@ -435,6 +435,36 @@ test('resolutionReviewBase: a "=======" content line inside a side, next to clea
   isNo(mk(lines(['o', '=======', 'o2'], [], 'main15', 'pr25')), 'parse');
 });
 
+test('resolutionReviewBase: a marker-shaped trio already in the file as content is never taken for a block (deleting it is not a selection)', () => {
+  // The trio sits in a clean region (the same in base, ours and theirs), far from the real conflict and the clean hunks. Its labels
+  // are not the trial merge's commit ids, so the fast path skips the file instead of reading the trio as a conflict block whose
+  // "resolution" could drop it; the exact parser then finds no parse (clean hunks), a counted round.
+  const lines = (l4, l15, l25, trio) => T('top', 'l2', 'l3', l4, 'l5', 'l6', 'l7', 'l8', 'l9', 'l10', 'l11', 'l12', 'l13', 'l14', l15, 'l16', 'l17', 'l18', 'l19', 'l20', 'l21', 'l22', 'l23', 'l24', l25, 'l26', 'l27', 'l28', 'l29', ...trio, 'bottom');
+  const TRIO = ['<<<<<<< fixture-ours', 'kept content', '=======', 'other content', '>>>>>>> fixture-theirs'];
+  const s = conflictRepo({
+    base: { 'f.txt': lines('x', 'l15', 'l25', TRIO) },
+    ours: { 'f.txt': lines('o', 'l15', 'pr25', TRIO) },
+    theirs: { 'f.txt': lines('t', 'main15', 'l25', TRIO) },
+  });
+  const deleted = decide(s, resolveMerge(s.repo, { 'f.txt': lines('o', 'main15', 'pr25', ['kept content']) }));
+  assert.ok(deleted.ineligible, `deleting the content trio must not be eligible: ${JSON.stringify(deleted)}`);
+});
+
+test('parseConflictBlocks fast path with labels: only markers carrying the trial merge labels (alone or with ":<path>") open and close a block', () => {
+  const l = (...x) => x.map((s) => `${s}\n`);
+  const labels = { ours: 'aaa', theirs: 'bbb' };
+  const M = (open, close) => l('top', 'm1', open, 'o1', '=======', 't1', close, 'bottom');
+  const S2 = l('top', 'o1', 'bottom');
+  const S3 = l('top', 't1', 'bottom');
+  assert.deepEqual(parseConflictBlocks(M('<<<<<<< aaa', '>>>>>>> bbb'), S2, S3, makeBudget(), labels).blocks, [{ ours: l('o1'), theirs: l('t1') }]);
+  assert.deepEqual(parseConflictBlocks(M('<<<<<<< aaa:f.txt', '>>>>>>> bbb:g.txt'), S2, S3, makeBudget(), labels).blocks.length, 1);
+  // another label (or one that only starts with the id) is content-shaped, not this merge's marker: the fast path is skipped
+  assert.deepEqual(parseConflictBlocks(M('<<<<<<< aaax', '>>>>>>> bbb'), S2, S3, makeBudget(), labels), { reason: 'no-parse' });
+  assert.deepEqual(parseConflictBlocks(M('<<<<<<< aaa', '>>>>>>> other'), S2, S3, makeBudget(), labels), { reason: 'no-parse' });
+  // without labels (direct callers) any label is accepted, as before
+  assert.equal(parseConflictBlocks(M('<<<<<<< x', '>>>>>>> y'), S2, S3).blocks.length, 1);
+});
+
 // Two conflicts separated only by lines with no letter or digit in them (blank lines, closing braces; four or more of them, or git
 // folds the pair into one block anyway): merge-tree keeps TWO blocks, `git merge-file` folds them into ONE, so a check that
 // replayed the merge with merge-file would call the file a mismatch. The check reads merge-tree's own blob.

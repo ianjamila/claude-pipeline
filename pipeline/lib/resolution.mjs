@@ -72,18 +72,27 @@ export const isMarkerLine = (line) => MARKER_LIKE.test(line);
 // side's last line and the blob's own bytes are what the side's line is.
 // The budget is charged for the scan of M and for every position and line the run search looks at.
 // -> { outsides: [lines[]] (blocks + 1 of them), blocks: [{ ours: lines[], theirs: lines[] }] } | { reason: 'no-parse' | 'ambiguous' | 'too-many-blocks' }
-// The fast path (see parseConflictBlocks). -> { outsides, blocks } | null (not applicable: use the exact parser)
-function fastSplit(M, S2, S3, tick) {
+// The fast path (see parseConflictBlocks). `labels` ({ ours, theirs }: the two arguments the trial merge was run with, which git
+// writes after the opening / closing marker, alone or followed by ":<path>") makes the split depend on the labels too: a trio of
+// marker-shaped lines already in a file as content cannot carry the commit ids of a merge that contains it, so it is never taken
+// for a block (it skips the fast path instead). Without `labels` any label is accepted.
+// -> { outsides, blocks } | null (not applicable: use the exact parser)
+function fastSplit(M, S2, S3, tick, labels) {
   tick(M.length + 1);
+  const labelled = (line, label) => {
+    if (!labels) return true;
+    const rest = line.slice(8).replace(/\r?\n$/, '');
+    return rest === label || rest.startsWith(`${label}:`);
+  };
   const spans = []; // [openIndex, sepIndex, closeIndex] per block
   let open = -1;
   let sep = -1;
   for (let i = 0; i < M.length; i++) {
     const line = M[i];
     if (!isMarkerLine(line)) continue;
-    if (open < 0 && OPEN.test(line)) open = i;
+    if (open < 0 && OPEN.test(line) && labelled(line, labels?.ours)) open = i;
     else if (open >= 0 && sep < 0 && SEP.test(line)) sep = i;
-    else if (sep >= 0 && CLOSE.test(line)) { spans.push([open, sep, i]); open = -1; sep = -1; }
+    else if (sep >= 0 && CLOSE.test(line) && labelled(line, labels?.theirs)) { spans.push([open, sep, i]); open = -1; sep = -1; }
     else return null;
   }
   if (open >= 0 || spans.length === 0) return null;
@@ -123,7 +132,7 @@ function fastSplit(M, S2, S3, tick) {
   return { outsides, blocks };
 }
 
-export function parseConflictBlocks(markerLines, stage2Lines, stage3Lines, tick = makeBudget()) {
+export function parseConflictBlocks(markerLines, stage2Lines, stage3Lines, tick = makeBudget(), labels = null) {
   const M = markerLines;
   const S2 = stage2Lines;
   const S3 = stage3Lines;
@@ -149,7 +158,7 @@ export function parseConflictBlocks(markerLines, stage2Lines, stage3Lines, tick 
   };
 
   if (M.reduce((n, l) => n + (OPEN.test(l) ? 1 : 0), 0) > MAX_BLOCKS) return { reason: 'too-many-blocks' };
-  const fastParse = fastSplit(M, S2, S3, tick);
+  const fastParse = fastSplit(M, S2, S3, tick, labels);
   if (fastParse) return fastParse;
 
   const go = (mi, p2, p3) => {
