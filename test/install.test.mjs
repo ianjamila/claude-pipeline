@@ -33,9 +33,12 @@ function scratch(label = 'cp-install') {
   made.push(d);
   return d;
 }
-// A claude-home path that does not exist yet; `space` puts a space in it (R10).
+// A claude-home path that does not exist yet; `space` puts a space in it (R10). The leaf is never `claude`: on Windows the
+// installer's real ancestor walk (PowerShell, not fakeable) can land on a recycled parent PID, and a concurrent test's
+// child whose command line ends in `…\claude` (or `…\claude home`) matches the Claude Code pattern, so it refused at random.
+const HOME_LEAF = 'cp-home';
 function newHome({ space = false } = {}) {
-  return join(scratch(space ? 'cp install' : 'cp-install'), space ? 'claude home' : 'claude');
+  return join(scratch(space ? 'cp install' : 'cp-install'), space ? 'cp home' : HOME_LEAF);
 }
 function copyFixture() {
   const dir = join(scratch('cp-src'), 'src');
@@ -1682,7 +1685,7 @@ const holdLock = (home, dir, extra = {}) => {
 test('the lock name is scoped to the resolved claude-home: same home same name, another home another name, always a safe file name', () => {
   const a = newHome();
   const b = newHome();
-  assert.equal(installLockName(a), installLockName(join(a, '..', 'claude')));
+  assert.equal(installLockName(a), installLockName(join(a, '..', HOME_LEAF)));
   assert.notEqual(installLockName(a), installLockName(b));
   assert.match(installLockName(newHome({ space: true })), /^installer-[0-9a-f]{16}$/);
 });
@@ -1696,7 +1699,7 @@ test('the lock is scoped to the canonical destination: a symlinked alias names t
   // not created yet, reached through an alias of its parent
   const parentLink = join(scratch('cp-alias2'), 'plink');
   symlinkSync(dirname(real), parentLink, 'dir');
-  assert.equal(installLockName(join(parentLink, 'claude')), installLockName(real));
+  assert.equal(installLockName(join(parentLink, HOME_LEAF)), installLockName(real));
 
   // No PIPELINE_LOCK_DIR: the default lock directory is inside the destination, not in the caller's ~/.claude.
   const env = { PIPELINE_MACHINE_ID: MACHINE };

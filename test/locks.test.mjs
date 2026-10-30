@@ -419,7 +419,10 @@ test('12. two processes racing tryAcquire in the same instant: exactly one wins 
 });
 
 test('13. racing reclaimers of one stale lock: exactly one wins, nobody steals the new lock (x10)', { timeout: 120000 }, async () => {
-  const pid = deadPid();
+  // Not deadPid(): Windows hands a just-freed PID straight to the next process, which here is one of the racers, so the
+  // planted owner looked alive and nobody reclaimed (CI: 0 winners). 2^30 is above every OS's PID range: never assigned.
+  const pid = 2 ** 30;
+  assert.equal(isPidAlive(pid), false, 'the planted owner PID must be dead on this OS');
   for (let i = 0; i < 10; i++) {
     const dir = tmpDir();
     plantLock(dir, 'db', ownerRecord('db', { pid, runId: 'crashed' }));
