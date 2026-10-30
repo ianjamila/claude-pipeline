@@ -479,6 +479,114 @@ test('processes that cannot be inspected are reported once per run (output + sum
   assert.match(r.output.summary, / · 3 processes could not be inspected \(other users\) · /);
 });
 
+// ---- an OPEN Claude session (claude-pipeline #115): <config>/sessions/<pid>.json says which sessions are open; the transcript's
+// last cwd says where. The test process itself plays the session (its pid is alive, its real start time is the procStart).
+const SESSION_ID = 'abcdef01-2345-4678-9abc-def012345678';
+function openSession(w, { cwd, ageHours = 48, config = '.claude' } = {}) {
+  const lstart = spawnSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], { encoding: 'utf8', env: { PATH: '/bin:/usr/bin', LC_ALL: 'C', TZ: 'UTC' } });
+  assert.equal(lstart.status, 0, lstart.stderr);
+  const cfg = join(w.dirs.home, config);
+  mkdirSync(join(cfg, 'sessions'), { recursive: true });
+  const record = join(cfg, 'sessions', `${process.pid}.json`);
+  // started in the home folder, like a real session; it has since moved into the worktree
+  writeFileSync(record, JSON.stringify({ pid: process.pid, sessionId: SESSION_ID, cwd: w.dirs.home, procStart: lstart.stdout.trim(), version: '0.0.0' }));
+  const projects = join(cfg, 'projects', w.dirs.home.replace(/[^a-zA-Z0-9]/g, '-'));
+  mkdirSync(projects, { recursive: true });
+  const transcript = join(projects, `${SESSION_ID}.jsonl`);
+  writeFileSync(transcript, [w.dirs.home, cwd].map((c) => JSON.stringify({ type: 'user', cwd: c })).join('\n') + '\n');
+  const t = (Date.now() - ageHours * 3.6e6) / 1000;
+  utimesSync(transcript, t, t); // idle for longer than min_idle_hours: only the live-session signal can still see it
+  return { record, transcript };
+}
+
+test('a Claude session open in a worktree keeps it however long it has been idle; the other worktrees are judged as before', { skip: !INSPECTS && 'process inspection needs /proc or lsof' }, () => {
+  const w = world();
+  openSession(w, { cwd: w.wtPath('done'), ageHours: 48 });
+  const r = w.cli(['prune']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.json.wouldRemove, []);
+  assert.match(w.keptReason(r.json, 'done'), /^a Claude session is open there now \(abcdef01 pid \d+\)$/);
+  assert.deepEqual(r.json.liveSessions, { available: true, open: 1 });
+  assert.match(w.keptReason(r.json, 'open'), /^open PR #2/);
+  assert.equal(w.keptReason(r.json, 'nopr'), 'no PR');
+  assert.match(r.json.summary, /\d+ a Claude session is open there now/);
+  assert.doesNotMatch(r.json.summary, /signal unavailable/);
+  assert.ok(existsSync(w.wtPath('done')));
+});
+
+test('a session open in ANOTHER folder does not keep the eligible worktree (the signal is not "any session at all")', { skip: !INSPECTS && 'process inspection needs /proc or lsof' }, () => {
+  const w = world();
+  openSession(w, { cwd: w.wtPath('open') });
+  const r = w.cli(['prune']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(slugs(r.json.wouldRemove), ['done'], JSON.stringify(r.json.kept));
+  assert.deepEqual(r.json.liveSessions, { available: true, open: 1 });
+});
+
+test('mode: on does not remove a worktree a Claude session is open in; once the session is gone the same run removes it', { skip: !LINUX && 'process inspection needs /proc' }, () => {
+  const w = world();
+  w.setMode('on');
+  const { record } = openSession(w, { cwd: w.wtPath('done') });
+  const kept = w.cli(['prune']);
+  assert.equal(kept.code, 0, kept.stderr);
+  assert.deepEqual(kept.json.removed, []);
+  assert.match(w.keptReason(kept.json, 'done'), /^a Claude session is open there now/);
+  assert.ok(existsSync(w.wtPath('done')), 'still on disk');
+  rmSync(record);
+  const removed = w.cli(['prune']);
+  assert.equal(removed.code, 0, removed.stderr);
+  assert.deepEqual(slugs(removed.json.removed), ['done'], JSON.stringify(removed.json.kept));
+});
+
+test('an open session that cannot be placed (unparseable record) keeps every worktree that reaches the in-use check', { skip: !INSPECTS && 'process inspection needs /proc or lsof' }, () => {
+  const w = world();
+  mkdirSync(join(w.dirs.home, '.claude', 'sessions'), { recursive: true });
+  writeFileSync(join(w.dirs.home, '.claude', 'sessions', '4242.json'), '{ half a record');
+  const r = w.cli(['prune']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.json.wouldRemove, []);
+  assert.match(w.keptReason(r.json, 'done'), /^an open Claude session could not be placed: session record .*4242\.json is unreadable \(not JSON\)$/);
+  assert.equal(r.json.liveSessions.available, true);
+  assert.match(r.json.liveSessions.unplaced[0], /4242\.json/);
+  assert.match(w.keptReason(r.json, 'open'), /^open PR #2/, 'earlier rules still speak first');
+});
+
+test('no Claude sessions folder (older Claude Code, another tool): the signal is reported unavailable and the decisions are what they were', () => {
+  const w = world();
+  const r = w.cli(['prune']);
+  assert.equal(r.code, 0, r.stderr);
+  assertDoneEvaluated(w, r.json, 'wouldRemove');
+  assert.equal(r.json.liveSessions.available, false);
+  assert.match(r.json.summary, / · live-session signal unavailable \(.+\) · /);
+  assert.match(readFileSync(r.json.log, 'utf8'), /live-session signal unavailable/, 'and it is in the log line');
+});
+
+test('the open-session check is made again, fresh, right before a worktree is removed: a session that moved in meanwhile keeps it', { skip: !LINUX && 'process inspection needs /proc' }, async () => {
+  const w = world();
+  w.setMode('on');
+  const { run: runCli } = await import('../pipeline/commands/worktrees.mjs');
+  const homeBefore = process.env.HOME;
+  process.env.HOME = w.dirs.home; // in-process: transcript and memory lookups must not read the real home
+  let scans = 0;
+  const liveSessions = () => {
+    scans += 1;
+    // 1st scan = the evaluation (nobody there); 2nd = right before removal (a session cd'd into the worktree since)
+    return { available: true, sessions: scans === 1 ? [] : [{ id: 'abcdef01', pid: 99, cwd: w.wtPath('done') }], unplaced: [] };
+  };
+  let r;
+  try {
+    r = await runCli(['prune'], { cwd: w.repo.dir, env: w.env, pruneDeps: { liveSessions } });
+  } finally {
+    process.env.HOME = homeBefore;
+  }
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.deepEqual(r.output.removed, []);
+  assert.equal(w.keptReason(r.output, 'done'), 'in use during removal: a Claude session is open there now (abcdef01 pid 99)');
+  assert.equal(scans, 2, 'one scan for the run, one fresh one before the removal');
+  assert.ok(existsSync(w.wtPath('done')), 'moved back to where it was');
+  assert.deepEqual(readdirSync(join(w.repo.dir, '.worktrees', '.prune-quarantine')), [], 'nothing left in quarantine');
+});
+
 test('a quarantine left by a killed run is moved back, even in off mode', () => {
   const w = world();
   w.setMode('off');

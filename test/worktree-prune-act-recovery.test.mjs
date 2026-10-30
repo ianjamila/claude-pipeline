@@ -7,12 +7,14 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { archivePaths, listHolding, purgeHolding, removeWorktree } from '../pipeline/lib/worktree-prune/act.mjs';
+import { archivePaths, listHolding, purgeHolding, removeWorktree as removeWorktreeReal } from '../pipeline/lib/worktree-prune/act.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 
 const day = 86400e3;
 const T = Date.parse('2026-10-13T00:00:00Z');
 const BATCH = '2026-10-13';
+// removeWorktree scans the open Claude sessions of THIS machine unless told otherwise; these tests never read the real ones.
+const removeWorktree = (opts) => removeWorktreeReal({ liveScan: () => ({ available: false, reason: 'test' }), ...opts });
 
 function fixture() {
   const wt = mkdtempSync(join(tmpdir(), 'wt-'));
