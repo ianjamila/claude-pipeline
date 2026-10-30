@@ -25,6 +25,8 @@ import {
   fablePendingRounds,
   fableFindingItems,
   roundCapProblem,
+  countsTowardCap,
+  reviewedRoundCount,
   FABLE_FINDINGS_MAX,
   rulingContentDigest,
 } from '../pipeline/lib/triage.mjs';
@@ -1433,4 +1435,89 @@ test('rulingContentDigest: ignores the decision fields, so applying one ruling d
   const base = rulingContentDigest([b1, s1]);
   const ruled = applyOwnerRuling({ ...b1, final: { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'x' } }, { decision: 'ACCEPT', reason: 'r', ownerQuote: 'R1-B1: accept', ruledAt: '2026-10-30T00:00:00Z' });
   assert.equal(rulingContentDigest([{ ...ruled, implemented: true, followupIssue: 12, test: { status: 'bug-confirmed', evidence: 'e' }, judge: { decision: 'ACCEPT' } }, s1]), base);
+});
+
+// ---- resolutionOnly rounds (a conflict with main resolved by choosing lines): real reviews that do not count toward the cap ----
+
+test('countsTowardCap: neither a base-only nor a resolution-only round counts; reviewedRoundCount uses it', () => {
+  assert.deepEqual([{}, { baseOnly: true }, { resolutionOnly: true }, { resolutionOnly: false }].map(countsTowardCap), [true, false, false, true]);
+  const rounds = [round(1, []), round(2, [], 'h', { resolutionOnly: true }), round(3, [], 'h', { baseOnly: true }), round(4, [])];
+  assert.equal(reviewedRoundCount({ rounds }), 2);
+  assert.equal(reviewedRoundCount(null), 0);
+});
+
+test('roundCapProblem: a resolution-only round is never capped, even past the extra round; a counted round after it still is', () => {
+  const real = (n) => round(n, [item({ id: `R${n}-S1`, bucket: 'SUGGESTION', final: settled('REJECT') })]);
+  const resolution = (n) => round(n, [], 'h-final', { resolutionOnly: true });
+  const used = { rounds: [real(1), real(2), real(3)], maxRounds: 3, currentContentHash: 'h-new' };
+  assert.match(roundCapProblem(used, 4), /only one extra round is allowed/);
+  assert.equal(roundCapProblem(used, 4, { resolutionOnly: true }), null);
+  const more = { ...used, rounds: [real(1), real(2), real(3), resolution(4), resolution(5)] };
+  assert.equal(roundCapProblem(more, 6, { resolutionOnly: true }), null);
+  assert.match(roundCapProblem(more, 6), /only one extra round is allowed/);
+  // the extra round already consumed: [real x3, real(accepting) as the 4th] is past the extra round, resolution still free
+  const accepting = (n) => round(n, [item({ id: `R${n}-B1`, bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), implemented: true })], 'h-old');
+  const extraUsed = { rounds: [real(1), real(2), accepting(3), accepting(4)], maxRounds: 3, currentContentHash: 'h-new' };
+  assert.match(roundCapProblem(extraUsed, 5), /and its one extra round/);
+  assert.equal(roundCapProblem(extraUsed, 5, { resolutionOnly: true }), null);
+});
+
+test('roundOutcome: a resolution-only round neither uses up the cap nor the extra round, but its own result decides clean', () => {
+  const real = (n) => round(n, [], 'h-final');
+  const resolution = (n, items = []) => round(n, items, 'h-final', { resolutionOnly: true });
+  const accepting = (n) => round(n, [item({ id: `R${n}-B1`, bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), implemented: true })], 'h-old');
+  // the last allowed round accepted a fix, then main conflicted before the fix was reviewed: the resolution round neither hides
+  // that accept nor strands the confirm round (the extra round stays available)
+  const three = roundOutcome(stateOf([real(1), real(2), accepting(3), resolution(4)], { currentContentHash: 'h-new' }));
+  assert.deepEqual([three.reachedMax, three.extraRound, three.effectiveMaxRounds, three.newAccepted], [false, true, 4, ['R3-B1']]);
+  assert.equal(roundCapProblem(stateOf([real(1), real(2), accepting(3), resolution(4)], { currentContentHash: 'h-new' }), 5), null, 'the fix round fits the extra round');
+  const keeps = roundOutcome(stateOf([real(1), real(2), accepting(3)], { currentContentHash: 'h-new' }));
+  assert.deepEqual([keeps.extraRound, keeps.newAccepted], [true, ['R3-B1']]);
+  // a clean resolution round after a clean past-the-cap state carries clean (coverage valid)
+  const clean = roundOutcome(stateOf([real(1), real(2), real(3), resolution(4)]));
+  assert.deepEqual([clean.clean, clean.reachedMax, clean.effectiveMaxRounds], [true, false, 3]);
+  // the extra round used up, then a resolution round: still parked as before, the resolution round did not add one
+  const used = roundOutcome(stateOf([real(1), real(2), accepting(3), accepting(4), resolution(5)], { currentContentHash: 'h-new' }));
+  assert.deepEqual([used.reachedMax, used.effectiveMaxRounds], [true, 4]);
+});
+
+test('roundOutcome / reviewValidFor: an ACCEPT in a resolution-only round is newAccepted (needs a fix round); it is not skipped like a base-only round', () => {
+  const accept = item({ id: 'R2-B1', bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), implemented: false });
+  const s = stateOf([round(1, []), round(2, [accept], 'h-final', { resolutionOnly: true })]);
+  const o = roundOutcome(s);
+  assert.deepEqual([o.clean, o.newAccepted, o.unimplemented], [false, ['R2-B1'], ['R2-B1']]);
+  assert.equal(reviewValidFor(s, 'h-final'), false);
+  const fixed = stateOf([round(1, []), round(2, [{ ...accept, implemented: true }], 'h-old', { resolutionOnly: true })], { currentContentHash: 'h-new' });
+  assert.deepEqual([roundOutcome(fixed).extraRound, roundOutcome(fixed).newAccepted], [false, ['R2-B1']], 'maxRounds 3, 2 counted rounds: not an extra-round state, but still needs its fix round');
+  assert.equal(roundCapProblem(fixed, 3), null, 'the fix round is a counted round and fits');
+});
+
+test('roundOutcome / reviewValidFor: a resolution-only Fable round blocks clean until its Fable pass is proven; reviewValidFor agrees', () => {
+  const pending = stateOf([round(1, [], 'h1'), round(2, [], 'h-final', { resolutionOnly: true, fableRequired: true })]);
+  const o = roundOutcome(pending);
+  assert.deepEqual([o.clean, o.fablePending], [false, [2]]);
+  assert.equal(reviewValidFor(pending, 'h-final'), false);
+  const proven = stateOf([round(1, [], 'h1'), round(2, [], 'h-final', { resolutionOnly: true, fableRequired: true, arbiter: { proofOk: true } })]);
+  assert.deepEqual([roundOutcome(proven).clean, roundOutcome(proven).fablePending], [true, []]);
+  assert.equal(reviewValidFor(proven, 'h-final'), true);
+  // stale coverage: the content moved after the resolution round
+  assert.equal(reviewValidFor(proven, 'h-other'), false);
+  assert.equal(roundOutcome({ ...proven, currentContentHash: 'h-other' }).coverageValid, false);
+});
+
+test('reviewValidFor agrees with roundOutcome.clean over resolution-only histories', () => {
+  const acc = (implemented) => round(2, [item({ id: 'R2-B1', bucket: 'BLOCKING', final: settled('ACCEPT', 'judge'), implemented })], 'h-2', { resolutionOnly: true });
+  const res = (n, hash) => round(n, [], hash, { resolutionOnly: true });
+  for (const rounds of [
+    [round(1, [], 'h-1'), res(2, 'h-2')],
+    [round(1, [], 'h-1'), res(2, 'h-2'), res(3, 'h-3')],
+    [round(1, [], 'h-1'), acc(true)],
+    [round(1, [], 'h-1'), acc(false)],
+    [res(1, 'h-1')],
+  ]) {
+    for (const hash of ['h-1', 'h-2', 'h-3']) {
+      const s = stateOf(rounds, { currentContentHash: hash });
+      assert.equal(reviewValidFor(s, hash), roundOutcome(s).clean, `${rounds.map((r) => `${r.n}${r.resolutionOnly ? 'r' : ''}`).join(',')} at ${hash}`);
+    }
+  }
 });

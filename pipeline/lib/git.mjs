@@ -12,6 +12,7 @@ import { openSync, readSync, closeSync, lstatSync, readlinkSync } from 'node:fs'
 import { join } from 'node:path';
 import { run } from './proc.mjs';
 import { parseUnifiedDiff } from './diff.mjs';
+import { MAX_BLOCKS, SearchCap, checkSelection, makeBudget, parseConflictBlocks, splitLines } from './resolution.mjs';
 
 // Upper bound for a git call that talks to a remote (fetch, push, ls-remote): a hung one inside a lock cannot be reclaimed.
 export const NETWORK_TIMEOUT_MS = 120_000;
@@ -108,15 +109,68 @@ export const supportsMergeTreeWrite = (o) => {
   return v !== null && (v[0] > 2 || (v[0] === 2 && v[1] >= 38));
 };
 
+// A trial merge must give the SAME tree id on every machine: a user's merge.conflictStyle (zdiff3 / diff3 write other marker
+// text) or merge.renormalize would change the tree, and the tree id is what a review round records as its base. So would the
+// settings merge-ort reads for rename detection (merge.renames, merge.directoryRenames, merge.renameLimit / diff.renameLimit):
+// they are pinned to git's own documented defaults, so a default-config machine gets the same tree id as before.
+const MERGE_CONFIG = [
+  '-c', 'merge.conflictStyle=merge', '-c', 'merge.renormalize=false',
+  '-c', 'merge.renames=true', '-c', 'merge.directoryRenames=conflict', '-c', 'merge.renameLimit=7000',
+];
+
 // A trial merge of `head` into `base` that touches no ref, index or working tree (it only writes tree objects).
 // -> { clean: true, tree } | { clean: false, tree } (exit 1: conflicts). Any other exit (a missing object, an old git) throws.
+// Always run with MERGE_CONFIG, so the 'synthetic' base of effectiveReviewBase is reproducible too.
 export function mergeTree(base, head, o) {
-  const args = ['merge-tree', '--write-tree', assertRef(base, ['merge-tree', base, head]), assertRef(head, ['merge-tree', base, head])];
+  const args = [...MERGE_CONFIG, 'merge-tree', '--write-tree', assertRef(base, ['merge-tree', base, head]), assertRef(head, ['merge-tree', base, head])];
   const r = exec(args, o);
   if (r.code !== 0 && r.code !== 1) throw new GitError({ args, code: r.code, stderr: r.stderr });
   const tree = String(r.stdout).split('\n')[0].trim();
   if (!/^[0-9a-f]{40,64}$/.test(tree)) throw new GitError({ args, code: r.code, stderr: `merge-tree printed no tree id: ${String(r.stdout).slice(0, 200)}` });
   return { clean: r.code === 0, tree };
+}
+
+// mergeTree with the conflict detail, from `merge-tree --write-tree -z` (NUL-delimited, so a path may hold any character):
+//   <tree>\0 { <mode> <oid> <stage>\t<path>\0 }* \0 { <n>\0 <path>\0 x n  <type>\0 <message>\0 }*
+// Pass FULL commit ids when the marker text matters: the labels git writes into the files are the arguments as given.
+// -> { clean, tree, conflicts: [{ path, stages: { 1?, 2?, 3?: { mode, oid } }, types: [...], messages: [...] }],
+//      messages: [{ paths, type, text }] } (conflicts sorted as git lists them; types / messages are those naming the path).
+// A git too old, a missing object or output that does not parse throws GitError.
+export function mergeTreeDetailed(base, head, o) {
+  const args = [...MERGE_CONFIG, 'merge-tree', '--write-tree', '-z', assertRef(base, ['merge-tree', base, head]), assertRef(head, ['merge-tree', base, head])];
+  const r = exec(args, o);
+  if (r.code !== 0 && r.code !== 1) throw new GitError({ args, code: r.code, stderr: r.stderr });
+  const bad = (why) => new GitError({ args, code: r.code, stderr: `unparseable merge-tree -z output: ${why}` });
+  const parts = String(r.stdout).split('\0');
+  const tree = parts[0];
+  if (!/^[0-9a-f]{40,64}$/.test(tree)) throw bad(`no tree id in ${String(r.stdout).slice(0, 80)}`);
+  let i = 1;
+  const byPath = new Map();
+  for (; i < parts.length && parts[i] !== ''; i++) {
+    const m = /^(\d{6}) ([0-9a-f]{40,64}) ([123])\t([^]+)$/.exec(parts[i]);
+    if (!m) throw bad(`conflicted-file entry ${JSON.stringify(parts[i].slice(0, 80))}`);
+    if (!byPath.has(m[4])) byPath.set(m[4], { path: m[4], stages: {}, types: [], messages: [] });
+    byPath.get(m[4]).stages[m[3]] = { mode: m[1], oid: m[2] };
+  }
+  const messages = [];
+  if (i < parts.length) i++; // the empty entry that ends the file list
+  while (i < parts.length && !(i === parts.length - 1 && parts[i] === '')) {
+    const n = parts[i];
+    if (!/^\d+$/.test(n)) throw bad(`message path count ${JSON.stringify(n.slice(0, 40))}`);
+    const paths = parts.slice(i + 1, i + 1 + Number(n));
+    const type = parts[i + 1 + Number(n)];
+    const text = parts[i + 2 + Number(n)];
+    if (paths.length !== Number(n) || type === undefined || text === undefined) throw bad('truncated message');
+    messages.push({ paths, type, text });
+    i += 3 + Number(n);
+  }
+  for (const msg of messages) {
+    for (const p of msg.paths) {
+      const c = byPath.get(p);
+      if (c) { c.types.push(msg.type); c.messages.push(msg.text); }
+    }
+  }
+  return { clean: r.code === 0, tree, conflicts: [...byPath.values()], messages };
 }
 
 // What a later review round (or a "did a non-test file change since round N" check) should diff the branch head against.
@@ -140,6 +194,211 @@ export function effectiveReviewBase({ from, forkPoint }, o) {
     if (!(err instanceof GitError)) throw err; // a merge-tree that cannot run is the same answer as a conflict
   }
   return { base: forkPoint, kind: 'whole-pr' };
+}
+
+// ---------- review round that is only a conflict resolution ----------
+
+class Ineligible extends Error {}
+const fail = (code, detail) => new Ineligible(detail ? `${code}: ${detail}` : code);
+const shortList = (xs) => (xs.length > 5 ? `${xs.slice(0, 5).join(', ')} (+${xs.length - 5} more)` : xs.join(', '));
+
+const MAX_RESOLUTION_HISTORY = 100;
+const TEXT_MODES = new Set(['100644', '100755']);
+// Attributes that change what a trial merge writes (merge driver, marker size) or how the content is read back.
+const MERGE_ATTRS = ['merge', 'conflict-marker-size', 'diff', 'text', 'eol'];
+
+// merge-tree reads attributes from the checkout (and the user's global ones), so a trial merge is only reproducible while
+// none of them is set on the conflicted paths. -> null, or a sentence naming the first attribute that is set.
+function attributeProblem(paths, o) {
+  if (paths.length === 0) return null;
+  const top = git(['rev-parse', '--show-toplevel'], o).trim();
+  const out = git(['check-attr', '-z', '--stdin', ...MERGE_ATTRS], { ...o, cwd: top, input: paths.map((p) => `${p}\0`).join('') });
+  const parts = out.split('\0');
+  if (parts.at(-1) === '') parts.pop();
+  if (parts.length !== paths.length * MERGE_ATTRS.length * 3) return 'git check-attr output did not parse';
+  for (let i = 0; i < parts.length; i += 3) {
+    if (parts[i + 2] !== 'unspecified') return `${parts[i]} has attribute ${parts[i + 1]}=${parts[i + 2]}`;
+  }
+  return null;
+}
+
+// `git diff --raw -z --no-renames` between a tree and a commit. -> Map path -> { oldMode, newMode, status }
+function rawDiffNoRenames(tree, commit, o) {
+  const parts = git([
+    ...STABLE_CONFIG, 'diff', '--raw', '-z', '--no-renames', '--no-abbrev', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative',
+    '--ignore-submodules=none', assertRef(tree, ['diff', tree]), assertRef(commit, ['diff', commit]),
+  ], o).split('\0');
+  const out = new Map();
+  for (let i = 0; i < parts.length; i += 2) {
+    if (parts[i] === '') continue;
+    const m = /^:(\d+) (\d+) [0-9a-f]+ [0-9a-f]+ ([A-Z])$/.exec(parts[i]);
+    if (!m || parts[i + 1] === undefined) throw new GitError({ args: ['diff', '--raw', '-z'], code: 0, stderr: `unexpected raw diff entry: ${parts[i]}` });
+    out.set(parts[i + 1], { oldMode: m[1], newMode: m[2], status: m[3] });
+  }
+  return out;
+}
+
+// 2a: head's first-parent history back to `from` is nothing but merges of the protected branch. All shas are full.
+function historyProblem({ from, head, baseRef }, o) {
+  const entries = new Map();
+  for (const line of git(['rev-list', '--first-parent', '--parents', head, `^${from}`], o).split('\n')) {
+    if (line === '') continue;
+    const [sha, ...parents] = line.split(' ');
+    entries.set(sha, parents);
+  }
+  if (entries.size === 0) return fail('history-empty', 'no commits since the last reviewed head');
+  if (entries.size > MAX_RESOLUTION_HISTORY) return fail('history-too-long', `${entries.size} commits since the last reviewed head`);
+  for (let cur = head; cur !== from; ) {
+    const parents = entries.get(cur);
+    if (!parents) return fail('history-not-first-parent', 'the last reviewed head is not on the first-parent chain of HEAD');
+    if (parents.length === 1) return fail('history-nonmerge', `${cur} is not a merge commit`);
+    if (parents.length > 2) return fail('history-octopus', `${cur} merges ${parents.length} parents`);
+    if (parents.length === 0) return fail('history-not-first-parent', `${cur} is a root commit`);
+    if (!isAncestor(parents[1], baseRef, o)) return fail('history-foreign-merge', `${cur} merges ${parents[1]}, which is not on ${baseRef}`);
+    cur = parents[0];
+  }
+  return null;
+}
+
+const catBlob = (ref, o) => git(['cat-file', 'blob', assertRef(ref, ['cat-file', 'blob', ref])], o);
+
+function resolutionChecks({ from, forkPoint, head, baseRef }, o) {
+  if (!supportsMergeTreeWrite(o)) throw fail('unsupported-git', 'merge-tree --write-tree needs git 2.38');
+  assertRef(baseRef, ['rev-list', baseRef]);
+  const [fromSha, forkSha, headFull] = [from, forkPoint, head].map((x) => revParse(`${assertRef(x, ['rev-parse', x])}^{commit}`, o));
+
+  const history = historyProblem({ from: fromSha, head: headFull, baseRef }, o);
+  if (history) throw history;
+
+  // 2b2: full shas (they become the marker labels), forced merge config (inside mergeTreeDetailed).
+  const merged = mergeTreeDetailed(fromSha, forkSha, o);
+  if (merged.clean) throw fail('not-conflicted', 'the trial merge is clean');
+  if (merged.conflicts.length === 0) throw fail('not-conflicted', 'merge-tree reported a conflict but listed no conflicted file');
+
+  // 2b: text content conflicts only.
+  const known = new Set(merged.conflicts.map((c) => c.path));
+  for (const m of merged.messages) {
+    if (/Cannot merge binary files/.test(m.text) || m.type === 'CONFLICT (binary)') throw fail('conflict-binary', shortList(m.paths));
+    if (m.type !== 'Auto-merging' && m.type !== 'CONFLICT (contents)') throw fail('conflict-type', `${m.type} ${shortList(m.paths)}`);
+    if (m.type === 'CONFLICT (contents)' && m.paths.some((p) => !known.has(p))) throw fail('conflict-mismatch', shortList(m.paths));
+  }
+  for (const c of merged.conflicts) {
+    if (!c.stages[1] || !c.stages[2] || !c.stages[3]) throw fail('conflict-stages', `${c.path} is missing a merge stage (add/add or delete)`);
+    if (!c.types.includes('CONFLICT (contents)')) throw fail('conflict-type', `${c.path} is not reported as a content conflict`);
+    const mode = c.stages[2].mode;
+    if (c.stages[1].mode !== mode || c.stages[3].mode !== mode || !TEXT_MODES.has(mode)) throw fail('conflict-mode', `${c.path}: ${c.stages[1].mode}/${mode}/${c.stages[3].mode}`);
+  }
+  const conflicted = merged.conflicts.map((c) => c.path);
+
+  const attr = attributeProblem(conflicted, o);
+  if (attr) throw fail('attributes', attr);
+
+  // 2c: head differs from the marker tree in conflicted files only.
+  const changes = rawDiffNoRenames(merged.tree, headFull, o);
+  if (changes.size === 0) throw fail('no-changes', 'head equals the marker tree');
+  const extra = [...changes.keys()].filter((p) => !known.has(p));
+  if (extra.length > 0) throw fail('extra-files', shortList(extra));
+  for (const c of merged.conflicts) {
+    const ch = changes.get(c.path);
+    if (!ch) throw fail('unresolved', `${c.path} still has its conflict markers`);
+    if (ch.status !== 'M') throw fail('not-modified', `${c.path} changed as ${ch.status}`);
+    if (ch.newMode !== c.stages[2].mode || ch.oldMode !== c.stages[2].mode) throw fail('conflict-mode', `${c.path} is ${ch.newMode} in head`);
+  }
+
+  // 2d: per file, every block resolved by selecting lines of its two sides. The marker blob may hold clean hunks git auto-merged
+  // from one side next to its conflict blocks; parseConflictBlocks (resolution.mjs) proves each block's sides are runs of the
+  // stage blobs and checkSelection holds the resolution to the marker blob's own lines outside the blocks.
+  const tick = makeBudget(o?.resolutionSearchBudget);
+  const blocks = [];
+  for (const c of merged.conflicts) {
+    const [s1, s2, s3] = [1, 2, 3].map((n) => catBlob(c.stages[n].oid, o));
+    const marker = catBlob(`${merged.tree}:${c.path}`, o);
+    const resolved = catBlob(`${headFull}:${c.path}`, o);
+    for (const [name, text] of [['base', s1], ['ours', s2], ['theirs', s3], ['marker', marker], ['head', resolved]]) {
+      if (text.includes('\0')) throw fail('conflict-nul', `${c.path} (${name}) contains a NUL byte`);
+      // proc.run decodes UTF-8: invalid bytes would compare equal after the decode, so they are not byte-exact.
+      if (text.includes('\uFFFD')) throw fail('non-utf8', `${c.path} (${name}) is not valid UTF-8`);
+    }
+    const parsed = parseConflictBlocks(splitLines(marker), splitLines(s2), splitLines(s3), tick, { ours: fromSha, theirs: forkSha });
+    if (parsed.reason === 'too-many-blocks') throw fail('too-many-blocks', `${c.path} has more than ${MAX_BLOCKS} conflict blocks`);
+    if (parsed.reason) throw fail(parsed.reason === 'ambiguous' ? 'parse-ambiguous' : 'parse', c.path);
+    if (parsed.blocks.length === 0) throw fail('no-blocks', `${c.path} has no conflict block`);
+    const sel = checkSelection(parsed, splitLines(resolved), tick);
+    if (!sel.ok) throw fail(sel.reason, c.path);
+    sel.droppedTheirs.forEach((droppedTheirs, i) => blocks.push({ path: c.path, block: i + 1, droppedTheirs }));
+    if (blocks.length > MAX_BLOCKS) throw fail('too-many-blocks', `more than ${MAX_BLOCKS} conflict blocks in all`);
+  }
+  // Totals over EVERY block: a caller that shows or stores only some of them must not derive "dropped nothing" from its slice.
+  const withDrops = blocks.filter((b) => b.droppedTheirs > 0);
+  return {
+    base: merged.tree, conflicted, conflictedCount: conflicted.length, blocks,
+    blockCount: blocks.length, blocksWithDrops: withDrops.length, droppedTheirsTotal: withDrops.reduce((n, b) => n + b.droppedTheirs, 0),
+  };
+}
+
+// Was the branch's merge of the base branch (since the last reviewed head `from`) a conflict that was resolved only by choosing,
+// per conflict block, lines the two sides already had? If so the review base is the trial merge WITH its conflict markers, and
+// head differs from it by exactly the resolution; the round need not count toward the round cap (see the plan
+// docs/plans/2026-10-29-conflict-resolution-round.md for every rule). Any failed rule, or any doubt, is `ineligible` and the
+// caller falls back to the whole-PR range. `baseRef` is the protected branch ref (origin/<default>) merges must come from.
+// `o.resolutionSearchBudget` overrides the search cap (tests).
+// -> { base: <marker tree id>, conflicted: [every conflicted path], conflictedCount, blocks: [{ path, block, droppedTheirs }],
+//      blockCount, blocksWithDrops, droppedTheirsTotal (over all blocks) }
+//  | { ineligible: '<code>' | '<code>: <detail>' }
+export function resolutionReviewBase({ from, forkPoint, head, baseRef }, o) {
+  try {
+    return resolutionChecks({ from, forkPoint, head, baseRef }, o);
+  } catch (err) {
+    if (err instanceof Ineligible) return { ineligible: err.message };
+    if (err instanceof SearchCap) return { ineligible: 'search-cap: the block check exceeded its step budget' };
+    // Last line of defence: a stack overflow on some unforeseen input must fall back to the counted whole-PR round, never crash.
+    if (err instanceof RangeError) return { ineligible: 'too-many-blocks: the block check ran out of stack' };
+    if (err instanceof GitError) return { ineligible: `git-error: ${err.message.slice(0, 300)}` };
+    throw err;
+  }
+}
+
+export class ReviewBaseUnavailable extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ReviewBaseUnavailable';
+    this.code = 'review-base-unavailable';
+  }
+}
+
+// The tree a 'synthetic' or 'resolution' round was diffed against exists only where it was made. On another clone it is
+// rebuilt with the same forced merge config from the round's own commits, and only the SAME tree id is accepted: a different
+// id means this checkout merges differently (conflict style, attributes), and quietly diffing against another tree would be a
+// different review. -> the base to diff from. Other kinds, and rounds without a recorded base, are returned as they are.
+export function ensureReviewBase(round, o) {
+  const id = round.reviewBase;
+  if (id === undefined) return round.fromHead;
+  const kind = round.reviewBaseKind;
+  if (kind !== 'synthetic' && kind !== 'resolution') return id;
+  if (gitOrNull(['cat-file', '-e', assertRef(id, ['cat-file', '-e', id])], 1, o) !== null) return id;
+  const unavailable = (why) => new ReviewBaseUnavailable(
+    `review-base-unavailable: the ${kind} review base ${id} is not in this clone and could not be rebuilt (${why}). `
+    + 'A trial merge depends on merge.conflictStyle / merge.renormalize (forced here) and on .gitattributes merge, conflict-marker-size, diff, text, eol attributes of the conflicted paths.',
+  );
+  let rebuilt;
+  try {
+    if (!supportsMergeTreeWrite(o)) throw unavailable('git is older than 2.38');
+    const fromFull = revParse(`${round.fromHead}^{commit}`, o);
+    const forkFull = revParse(`${round.forkPoint}^{commit}`, o);
+    if (kind === 'resolution') {
+      const attr = attributeProblem(round.conflicted ?? [], o);
+      if (attr) throw unavailable(attr);
+      rebuilt = mergeTreeDetailed(fromFull, forkFull, o).tree;
+    } else {
+      rebuilt = mergeTree(fromFull, forkFull, o).tree;
+    }
+  } catch (err) {
+    if (err instanceof ReviewBaseUnavailable) throw err;
+    if (err instanceof GitError || err instanceof TypeError) throw unavailable(err.message.slice(0, 300));
+    throw err;
+  }
+  if (rebuilt !== id) throw unavailable(`rebuilding gave tree ${rebuilt}`);
+  return id;
 }
 
 export const headSha = (o) => git(['rev-parse', 'HEAD'], o).trim();
@@ -416,7 +675,7 @@ export function contentHash(base, head, { exclude = [], maxBuffer = DIFF_MAX_BYT
 export function reviewPatch(from, to, o) {
   const { skipped } = largeBinaryChanges(from, to, o);
   const patch = git([
-    'diff', '--binary', '--no-color', '--no-ext-diff', `${from}..${assertRef(to, ['diff', to])}`,
+    'diff', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', `${from}..${assertRef(to, ['diff', to])}`,
     ...(skipped.length > 0 ? ['--', ':/', ...excludeSpecs(skipped)] : []),
   ], o);
   const names = skipped.map(({ status, oldPath, newPath, size }) => ({ status, oldPath, newPath, size }));

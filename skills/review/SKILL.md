@@ -63,6 +63,9 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    `P job start codex-rR -- node ~/.claude/pipeline/bin/pipeline.mjs codex-review --pr N --round R --base <base> --head <head> --effort <effort>`,
    then `P job wait codex-rR …`. Exit 2 `empty-range`: the "fix" changed no code, go back to step 5. `base-mismatch` / `head-moved`: recompute and rerun.
    An interrupted round (no triage comment yet): `P state discard-round --round R --pr N` before rerunning it.
+   `baseOnly: true` (only main merged in): Codex did not run, no items, not counted; it carries the last reviewed result forward.
+   `resolutionOnly: true` (a main conflict resolved by choosing lines): a real review of just the resolution, triaged as usual
+   (an ACCEPT still needs its fix round) but not counted; `resolutionIneligible: "<reason>"` ⇒ a normal counted round.
 2. **Who reviews.** The output names `reviewer`. `fable` (medium/high risk, `risk.high_risk_paths` or `review.arbiter_always_paths`):
    skip the judge; the arbiter pass (step 4) is the review every round, even with zero Codex items. `judge`: `P triage light-lane --round R`
    when `P risk` said `lightLane` and Codex returned only WORTH CONSIDERING items, else the judge below.
