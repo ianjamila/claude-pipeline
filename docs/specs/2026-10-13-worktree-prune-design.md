@@ -133,7 +133,16 @@ pipeline worktrees holding [--purge] [--json]        # list holding batches + re
    (under any spelling: the path, its realpath, or an alias through a symlinked ancestor such as `~/Claude`);
    tool results and user/assistant prose do not (one `git worktree list` or `ship inbox` output names every worktree),
    and branch names are not searched (they appear in every PR list). Fail-closed: a line that names the path but is
-   not a JSON object counts, and so does a recent transcript that cannot be read. No non-archived memory note
+   not a JSON object counts, and so does a recent transcript that cannot be read. **No Claude session is open there now**
+   (claude-pipeline #115; a session idle past `min_idle_hours` is invisible to the two checks above): each
+   `<config>/sessions/<pid>.json` (`$CLAUDE_CONFIG_DIR` and every `~/.claude*`, one entry per sessionId) whose pid is alive
+   and whose start time equals `procStart` (UTC; `ps -o pid=,lstart=` under `TZ=UTC LC_ALL=C`) is placed by the `cwd` of the
+   LAST line of `projects/*/<sessionId>.jsonl` in any config dir (read from the end; several accounts holding one ⇒ any of their
+   `cwd`s counts; no transcript yet ⇒ the record's start `cwd`), and one inside
+   the worktree (any spelling) keeps it, whatever the idle time. Fail-closed ⇒ kept for every candidate: a home or config dir that cannot be listed or resolved (anything but "not there"), an unparseable record,
+   `ps` failing, a start-time format that does not match, a live session whose transcript cannot be read or whose `cwd` is
+   unknown. No `sessions/` folder anywhere, or Windows ⇒ the signal is "unavailable" (reported in the summary) and the other
+   checks decide; the quarantine re-inspection (§2) scans again, fresh. No non-archived memory note
    (`~/claude-memory/*/*.md` excluding `MEMORY-archive.md`, `archive/`) names the slug, branch or notes path together with
    `BUILDING`, `ledger home` or `keep`; no file outside `delete`/`archive` modified in the last `min_idle_hours` (judged
    per file, never by directory mtime).

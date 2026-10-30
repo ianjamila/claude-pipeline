@@ -516,7 +516,7 @@ Exit: 0.
 remove finished worktrees (prune), keep one with a lock (keep / unkeep), list or purge the holding folder.
 
 ```
-pipeline worktrees prune [--repo DIR] [--dry-run] [--notify] [--summary-only]   (--notify: accepted, does nothing; old schedules pass it)   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], hiddenProcesses, restored:[...], outside:[...], holding:{batches, purged}, summary, log} | --summary-only: one line {ok, summary, errors?}
+pipeline worktrees prune [--repo DIR] [--dry-run] [--notify] [--summary-only]   (--notify: accepted, does nothing; old schedules pass it)   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], hiddenProcesses, liveSessions?, restored:[...], outside:[...], holding:{batches, purged}, summary, log} | --summary-only: one line {ok, summary, errors?}
 pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}
 pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}
 pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}
@@ -527,13 +527,27 @@ Design: [docs/specs/2026-10-13-worktree-prune-design.md](specs/2026-10-13-worktr
 container, a linked worktree or a subdirectory: candidates, config (the main worktree's `.claude/pipeline.yml`) and the
 run lock all come from the main worktree. A worktree is removed only when its newest same-repo PR merged at least
 `min_merged_hours` ago, every local commit is in that PR, nothing but `delete` / `archive` files is left in it, and
-nothing uses it (lock, process, a recent Claude transcript whose session worked there — its `cwd` inside the worktree or
-a tool call naming the path; a tool result or prose that merely prints it does not count — memory note, recently changed
-file); removal goes through a quarantine move and a final re-inspection, and the `archive` files wait 30 days in the
+nothing uses it (lock, process, a Claude session that is open there now, a recent Claude transcript whose session worked
+there — its `cwd` inside the worktree or a tool call naming the path; a tool result or prose that merely prints it does not
+count — memory note, recently changed file); removal goes through a quarantine move and a final re-inspection (which scans the
+open Claude sessions again), and the `archive` files wait 30 days in the
 holding folder (archiving and purging both take a lock on that folder, so two clones of one repo cannot overwrite each other's files or manifest, and a purge never runs mid-archive; a lock not obtained within 30 s keeps the worktree, or makes the purge skip that run and report `purgeSkipped`). The process check reads `/proc` on Linux and runs one `lsof` on macOS (fail-closed: a missing or failing `lsof`, or
 one that cannot show our own process's cwd — the positive control — keeps every candidate); on Windows every candidate
 is kept ("cannot check running processes on this platform") and prune never removes anything there — `mode: on` is
-report-only in effect. A `pipeline-keep:` lock older than 7 days is reported as `stale keep (<N>d: <reason>) — still needed?` (its own
+report-only in effect. **Open Claude sessions** (`liveSessions` in the output): a session whose shell `cd`'d into a worktree
+holds nothing there for `lsof` to see, and once it has been idle longer than `min_idle_hours` its transcript is too old for the
+transcript check, so Claude Code's own record of which sessions are open is read: `<config>/sessions/<pid>.json` for
+`$CLAUDE_CONFIG_DIR` and every `~/.claude*` (de-duplicated by realpath; a session both accounts list counts once). A record counts
+only while its pid is alive and the process started when its `procStart` (UTC) says (`ps -o pid=,lstart=` under `TZ=UTC`, so a
+reused pid is ignored). The session is where the last `cwd` of its transcript (`projects/*/<sessionId>.jsonl` of every config dir,
+not only the one that listed it, read from the end; when several accounts hold one, a `cwd` in the worktree from any of them counts)
+says, or in the folder it started in when it has no transcript yet; one inside the worktree (any spelling of the path)
+keeps it as `a Claude session is open there now (<id> pid <pid>)`, however long it has been idle, and the quarantine re-inspection
+asks again with a fresh scan. Fail-closed: a config dir (or the home folder) that cannot be listed or resolved for any reason but "is not there", a record that cannot be read or parsed, `ps` failing, a start time in an unrecognised
+format (or every running pid disagreeing with its `procStart`), or a live session whose transcript cannot be read or whose folder
+is unknown keeps **every** candidate (`an open Claude session could not be placed: <why>`). No `sessions/` folder in any config dir
+(an older Claude Code, another tool) and Windows make the signal unavailable: the run says `live-session signal unavailable (<why>)`
+in its summary and `liveSessions: {available: false, reason}`, and decides by the other checks as before. A `pipeline-keep:` lock older than 7 days is reported as `stale keep (<N>d: <reason>) — still needed?` (its own
 group in the summary) and never released. `worktrees.mode` governs every mutation:
 
 | action | off | report (default) | on | `--dry-run` |
