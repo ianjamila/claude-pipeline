@@ -30,6 +30,11 @@
 # exact head sha; an approval label only counts for a head that carries a fresh receipt from github-actions[bot], so an
 # approval can never carry over to a later commit. The label name and the sender reach the job only through env:.
 #
+# Label events: only labels the pipeline acts on start a run (the list below, kept identical in `concurrency` and the job's
+# `if`): the two approval labels; `pipeline-recheck` and `awaiting-review`, whose add/remove is how review-complete wakes
+# the guards; and needs-human, pipeline-blocked, pipeline-pause, pipeline-rollback. Any other label (a triage tag, `agent-*`)
+# changes nothing the guards judge, so it is skipped in its own no-op group: it costs no runner and cancels no real run.
+#
 # Do not add steps that run code from the PR (npm install, its scripts, its actions).
 name: Pipeline guards
 
@@ -46,16 +51,24 @@ permissions:
   actions: read         # provenance: read workflow runs (actions/runs/{id}) and their artifacts with GITHUB_TOKEN; private repos need it
 
 concurrency:
-  # An edit that does not change the base (title, body) is a no-op below; it gets its own group so it can never cancel a
-  # real evaluation that is still running for the same PR.
-  group: pipeline-guards-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && '-noop' || '' }}
+  # An edit that does not change the base (title, body), and a label event for a label the pipeline does not act on, are
+  # no-ops below; they get their own group so they can never cancel a real evaluation that is still running for the same PR.
+  group: >-
+    pipeline-guards-${{ github.event.pull_request.number }}${{ ((github.event.action == 'edited' && !github.event.changes.base)
+    || ((github.event.action == 'labeled' || github.event.action == 'unlabeled')
+    && !contains(fromJSON('["human-approved","test-change-approved","pipeline-recheck","awaiting-review","needs-human","pipeline-blocked","pipeline-pause","pipeline-rollback"]'), github.event.label.name)))
+    && '-noop' || '' }}
   cancel-in-progress: true
 
 jobs:
   guards:
     name: pipeline-guards
-    # `edited` also fires for title/body edits: only a base-branch change needs a new verdict.
-    if: github.event.action != 'edited' || github.event.changes.base
+    # `edited` also fires for title/body edits: only a base-branch change needs a new verdict. A label event runs only for a
+    # label the pipeline acts on (same list as `concurrency`).
+    if: >-
+      (github.event.action != 'edited' || github.event.changes.base)
+      && ((github.event.action != 'labeled' && github.event.action != 'unlabeled')
+      || contains(fromJSON('["human-approved","test-change-approved","pipeline-recheck","awaiting-review","needs-human","pipeline-blocked","pipeline-pause","pipeline-rollback"]'), github.event.label.name))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:

@@ -1554,6 +1554,9 @@ test('review-complete recheck: a failed nudge never undoes the posted comment: e
   assert.equal(r.json.removed, true);
   assert.equal(r.json.recheck, 'failed');
   assert.match(r.json.recheckError, /P labels/);
+  // Only labels the guards act on start a run now, so the hand fallback names pipeline-recheck, never "any label".
+  assert.match(r.json.recheckError, /add and remove pipeline-recheck by hand/);
+  assert.doesNotMatch(r.json.recheckError, /any label/);
   assert.ok(w.fake.lines().includes(RECHECK_ADD));
   assert.ok(!w.fake.lines().includes(RECHECK_REMOVE), 'no remove after a failed add');
   assert.equal(postedBodies(w).length, 1, 'the review-complete comment stays');
