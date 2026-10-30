@@ -1205,6 +1205,25 @@ test('#111: a glob write target through a link to the review folder (or in a glo
   ]) assert.equal(w.bash(cmd), 'allow', cmd);
 });
 
+test('#111 (Codex recheck): a last-name glob is judged by the entries it really matches: protected names off the sample list, hard links elsewhere', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { tmp: T, alias: A, cwd } = w;
+  fs.writeFileSync(path.join(cwd, '.review', 'staging-smoke.json'), '{}');
+  fs.writeFileSync(path.join(cwd, '.review', 'notes-x.json'), '{}');
+  const hl = path.join(T, 'hl');
+  fs.mkdirSync(hl);
+  try { fs.linkSync(path.join(cwd, '.review', 'staging-smoke.json'), path.join(hl, 'Hlink')); } catch { t.skip('cannot create hard links here'); return; }
+  for (const cmd of [
+    'echo y > rv/staging-smok?.json',
+    `cp /tmp/x ${A}/stag*.json`,
+    `echo y > ${hl}/H*`,
+    `cp /tmp/x ${hl}/Hlin?`,
+  ]) assert.equal(w.bash(cmd), 'deny', cmd);
+  // (controls: a matched scratch file, a glob that matches nothing protected, a read)
+  for (const cmd of [`echo y > ${A}/notes-?.json`, `cp /tmp/x ${hl}/Z*`, `cat ${hl}/H*`]) assert.equal(w.bash(cmd), 'allow', cmd);
+});
+
 test('#111: a link whose target is a command substitution is refused with a review folder (it cannot be resolved), allowed without one', (t) => {
   const w = reviewAliasWorld(t);
   if (!w) return;

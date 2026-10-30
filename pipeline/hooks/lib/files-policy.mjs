@@ -29,7 +29,7 @@ import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultRe
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
 const MAX_ALIAS_LOOKUPS = 20_000; // (#111: distinct words x directories the line may be in; above it the text is refused like an over-long one, so the stats stay bounded)
-const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its rounds whose inodes are collected, so a hard link to a protected one is known; past it collection STOPS silently, so a hard link to a file beyond the cap is not seen: a documented residual, not a fail-closed)
+const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its rounds whose inodes are collected, so a hard link to a protected one is known; past it collection STOPS silently, so a hard link to a file beyond the cap is not seen: a documented residual, not a fail-closed. Which files fall past it depends on listing order. Depth: the protected names directly in .review, and a round folder's entries two levels down)
 const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
@@ -341,7 +341,18 @@ function makeCtx(opts) {
         const re = globToRe(segs[at], ci);
         if (re === null) return true;
         // (in a round folder anything is protected; in the review folder the glob must be able to match a protected name)
-        return hitReviewInode(P.join(prefix, 'x')) || REVIEW_SAMPLES.some((n) => re.test(n) && hitReviewInode(P.join(prefix, n)));
+        if (hitReviewInode(P.join(prefix, 'x')) || REVIEW_SAMPLES.some((n) => re.test(n) && hitReviewInode(P.join(prefix, n)))) return true;
+        // (Codex recheck: the samples are not every protected name (`staging-smoke.json`), and a hard link to a protected file can sit in any
+        // folder: the entries the glob really matches are judged one by one, each as a literal path)
+        const names = (opts.readDir ?? defaultReadDir)(prefix);
+        if (names === null) return false;
+        if (!Array.isArray(names) || names.length > 4000) return true;
+        for (const e of names) {
+          if (!re.test(e)) continue;
+          if (++work > MAX_GLOB_CANDIDATES) return true;
+          if (hitReviewInode(P.join(prefix, e))) return true;
+        }
+        return false;
       }
       const re = globToRe(segs[at], ci);
       if (re === null) return true;
