@@ -1000,13 +1000,15 @@ test('Phase 3b: a program that resolves into a review folder is judged like any 
 // The link is made in a PRIOR step, the way an agent would: a link a judged program makes itself does not exist yet when the hook
 // looks, so no stat can see it (a residual class, like every run-time-built path).
 
-function reviewAliasWorld(t) {
+// (POSIX only: on win32 the inode check is off (statId is null there), as it is for the protected roots; these tests skip with that reason)
+function reviewAliasWorld(t, { review = true } = {}) {
+  if (process.platform === 'win32') { t.skip('the alias / inode check is POSIX-only (no inodes on win32)'); return null; }
   const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'gf-review-')));
   t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
   const home = path.join(tmp, 'home');
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
   const cwd = path.join(tmp, 'repo');
-  fs.mkdirSync(path.join(cwd, '.review', 'round-1'), { recursive: true });
+  fs.mkdirSync(review ? path.join(cwd, '.review', 'round-1') : cwd, { recursive: true });
   const alias = path.join(tmp, 'alias');
   const ralias = path.join(tmp, 'ralias');
   try {
@@ -1014,7 +1016,7 @@ function reviewAliasWorld(t) {
     fs.symlinkSync(path.join(cwd, '.review', 'round-1'), ralias, 'dir');
     fs.symlinkSync('.review', path.join(cwd, 'rv'), 'dir'); // (a relative link inside the checkout)
   } catch (e) {
-    if (e.code === 'EPERM' || e.code === 'EACCES') return null;
+    if (e.code === 'EPERM' || e.code === 'EACCES') { t.skip('cannot create symlinks here'); return null; }
     throw e;
   }
   const opts = { home, env: {}, cwd, platform: process.platform };
@@ -1027,7 +1029,7 @@ function reviewAliasWorld(t) {
 
 test('#111: a protected review file written through a symlink to .review or .review/round-N is denied', (t) => {
   const w = reviewAliasWorld(t);
-  if (!w) return t.skip('cannot create symlinks here');
+  if (!w) return;
   const { alias: A, ralias: R } = w;
   assert.equal(w.write(`${A}/state.json`), 'deny');
   assert.equal(w.write(`${R}/codex.json`), 'deny');
@@ -1071,7 +1073,7 @@ test('#111: the inode check works on injected inodes too (file tools and redirec
 
 test('#111: scratch files directly in .review stay writable, by name and through a symlink', (t) => {
   const w = reviewAliasWorld(t);
-  if (!w) return t.skip('cannot create symlinks here');
+  if (!w) return;
   const { alias: A, cwd } = w;
   assert.equal(w.write(`${cwd}/.review/hardstops.json`), 'allow');
   assert.equal(w.write(`${A}/hardstops.json`), 'allow');
@@ -1085,4 +1087,50 @@ test('#111: scratch files directly in .review stay writable, by name and through
     `cat ${A}/state.json`,
     `ls -la ${A} ${w.ralias}`,
   ]) assert.equal(w.bash(cmd), 'allow', cmd);
+});
+
+test('#111: a script padded past the scan cap still cannot write a review file through a link (fails closed with a review folder)', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const pad = '// padding padding padding padding padding padding padding\n'.repeat(4500); // ~250 KB
+  assert.ok(pad.length > 200_000);
+  fs.writeFileSync(path.join(w.cwd, 'big.mjs'), `${pad}import fs from 'node:fs'; fs.writeFileSync('${w.alias}/state.json', 'x');\n`);
+  fs.writeFileSync(path.join(w.cwd, 'small.mjs'), `import fs from 'node:fs'; fs.writeFileSync('${w.alias}/state.json', 'x');\n`);
+  assert.equal(w.bash('node small.mjs'), 'deny', 'under the cap');
+  assert.equal(w.bash('node big.mjs'), 'deny', 'over the cap');
+  // (a repo without a review folder: nothing to reach, an ordinary large script is judged as before)
+  const n = reviewAliasWorld(t, { review: false });
+  fs.writeFileSync(path.join(n.cwd, 'big.mjs'), `${pad}import fs from 'node:fs'; fs.writeFileSync('${n.tmp}/out.json', 'x');\n`);
+  assert.equal(n.bash('node big.mjs'), 'allow');
+});
+
+test('#111: a cd into a link to the review folder (outside the checkout) makes the relative writers below it protected', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const { alias: A, ralias: R } = w;
+  for (const dir of [A, R]) {
+    const name = dir === A ? 'state.json' : 'codex.json';
+    for (const body of [
+      `cp /tmp/x ${name}`, `echo x | tee ${name}`, `mv /tmp/x ${name}`, `sed -i 's/a/b/' ${name}`, `rm ${name}`, `ln -sf /tmp/x ${name}`,
+      `node -e "require('fs').writeFileSync('${name}','x')"`,
+    ]) {
+      assert.equal(w.bash(`cd ${dir} && ${body}`), 'deny', `cd && ${body}`);
+      assert.equal(w.bash(`(cd ${dir} && ${body})`), 'deny', `subshell ${body}`);
+      assert.equal(w.bash(`pushd ${dir} >/dev/null && ${body}`), 'deny', `pushd ${body}`);
+    }
+  }
+  // (reading, and a scratch file directly in .review, stay fine)
+  for (const cmd of [`cd ${A} && cat state.json`, `cd ${A} && cp /tmp/x hardstops.json`, `(cd ${A} && ls)`, 'cd /tmp && cp x state.json', `cd ${w.tmp} && cp /tmp/x notes.json`]) assert.equal(w.bash(cmd), 'allow', cmd);
+  // (an unknown cd target in a checkout that has review folders: ordinary words below it are no hits)
+  for (const cmd of ['cd "$X" && npm test', 'cd "$X" && git commit -m foo']) assert.equal(w.bash(cmd), 'allow', cmd);
+});
+
+test('#111: repeated ancestors of the words of a long line are stat-ed once (per-evaluation cache)', () => {
+  const ids = { '/repo/.review': 'd:1', '/repo/.review/round-1': 'd:2' };
+  let calls = 0;
+  const statId = (p) => { calls++; return ids[p] ?? null; };
+  const readDir = (d) => (d === '/repo/.review' ? ['round-1'] : []);
+  const words = Array.from({ length: 2000 }, (_, i) => `src/deep/er/path/f${i}.js`).join(' ');
+  assert.equal(bash(`echo ${words}`, { statId, readDir }), 'allow');
+  assert.ok(calls < 2000 * 2, `${calls} stat calls for 2000 words`); // (uncached: one per ancestor per word, ~6 per word)
 });

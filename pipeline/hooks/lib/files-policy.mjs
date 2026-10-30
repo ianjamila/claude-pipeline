@@ -28,7 +28,7 @@ import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultRe
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
-const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word)
+const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
 const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|prod-before|[\w.-]*smoke)/i;
@@ -265,18 +265,27 @@ function makeCtx(opts) {
   // basename is a protected name (REVIEW_FILE_SRC): the protected-NAME rule, so scratch files in .review stay writable; (b) it is, or
   // lies under, an existing round-* folder (everything in a round is protected); (c) withDir: it IS <cwd>/.review itself under a name
   // that is not `.review` (a program that chdirs there, or builds a name below it, writes a protected file the text never names).
-  // A link the judged program makes itself does not exist yet when the hook looks: no stat can see it (a residual class).
+  // Residuals: a link the judged program makes itself does not exist yet when the hook looks, so no stat can see it; and only the
+  // cwd's own <cwd>/.review is known, so a session whose cwd is a subdirectory of the checkout is not covered. The alias / inode check
+  // is POSIX-only, like the protected-root inode check above: on win32 statId is null and nothing here fires (Windows behaviour unchanged).
+  const statCache = new Map(); // (one evaluation: the same ancestors come up for every word of a long line)
+  const stat = (p) => {
+    if (statCache.has(p)) return statCache.get(p);
+    const id = api.statId(p);
+    statCache.set(p, id);
+    return id;
+  };
   const hitReviewInode = (p, withDir = false) => {
     const { dir, rounds } = reviewFolders();
     if (dir === null) return false;
     const P = pathsFor();
     const base = P.basename(p);
-    if (reviewFile.test(`.review/${base}`) && api.statId(P.dirname(p)) === dir) return true;
-    if (withDir && (ci ? base.toLowerCase() : base) !== '.review' && api.statId(p) === dir) return true;
+    if (reviewFile.test(`.review/${base}`) && stat(P.dirname(p)) === dir) return true;
+    if (withDir && (ci ? base.toLowerCase() : base) !== '.review' && stat(p) === dir) return true;
     if (rounds.size === 0) return false;
     let cur = p;
     for (let i = 0; i < 64; i++) {
-      const id = api.statId(cur);
+      const id = stat(cur);
       if (id !== null && rounds.has(id)) return true;
       const parent = P.dirname(cur);
       if (parent === cur) return false;
@@ -313,6 +322,7 @@ function makeCtx(opts) {
     // Is `p`, or the nearest existing directory above it, the very same file or directory (same device and inode) as a
     // protected root? Catches hard links and any other spelling of the path that realpath does not unify.
     hitReviewInode,
+    hasReviewDir: () => reviewFolders().dir !== null,
     hitInode: (p) => {
       if (rootIds === null) rootIds = new Set(roots.map((r) => api.statId(r)).filter(Boolean));
       if (hitReviewInode(p)) return true;
@@ -784,11 +794,13 @@ function makeMatchers(ctx) {
   };
   // #111: a path-like word of `text` that is another name for the cwd's review folder (or a protected file in it, or anything in a round):
   // a program given such a path, or one that chdirs there, writes a protected file the text never names. Relative words are resolved
-  // against the directories inside the cwd only (a stat of every word under every assumed directory would walk the whole machine).
+  // against the directories inside the cwd, and against a `cd` target that is itself the review folder or lies under a round (one
+  // check per directory, not per word); other directories are skipped (a stat of every word under every assumed directory would walk the machine).
+  // A text over the cap is not scanned word by word: with a review folder present it counts as a hit (fail closed; without one nothing can be reached).
   const ALIAS_WORD = /[^\s'"`;|&<>(){}[\],=*?$]+/g;
   const aliasInText = (v, dirs) => {
-    if (v.length > MAX_ALIAS_TEXT) return false;
-    const where = (dirs?.length ? dirs : [ctx.cwd]).filter((d) => isInside(d, ctx.cwd, ctx.platform));
+    if (v.length > MAX_ALIAS_TEXT) return ctx.hasReviewDir();
+    const where = (dirs?.length ? dirs : [ctx.cwd]).filter((d) => isInside(d, ctx.cwd, ctx.platform) || ctx.hitReviewInode(d, true));
     for (const word of new Set(v.match(ALIAS_WORD) ?? [])) {
       if (!/[A-Za-z0-9]/.test(word)) continue;
       const e = word === '~' || word.startsWith('~/') ? pathsFor().join(ctx.homePosix, word.slice(1)) : word;
