@@ -1160,8 +1160,12 @@ test('#111: after a cd to a folder outside the checkout, a relative path through
     `cd ${T} && node -e "require('fs').writeFileSync('alias/state.json','x')"`,
     `(cd ${T} && cp /tmp/x alias/state.json)`,
     `pushd ${T} >/dev/null && cp /tmp/x alias/state.json`,
+    `env -C ${T} cp /tmp/x alias/state.json`, // (GNU env chdir)
+    `env --chdir=${T} cp /tmp/x alias/state.json`,
+    `env --chdir ${T} cp /tmp/x alias/state.json`,
   ]) assert.equal(w.bash(cmd), 'deny', cmd);
   for (const cmd of [
+    `env -C ${T} cat alias/state.json`,
     `cd ${T} && cp /tmp/x alias/hardstops.json`, // (a scratch file directly in .review)
     `cd ${T} && cp /tmp/x other/state.json`, // (no link)
     `cd ${T} && cat alias/state.json`,

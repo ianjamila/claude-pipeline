@@ -1519,7 +1519,10 @@ function collectDirs(cmds, ctx, cdOnly = false) {
   };
   for (const [ci, c] of cmds.entries()) {
     // commands that run relative to another directory: git -C DIR, tar -C DIR, unzip -d DIR, make -C DIR, cp -t DIR
-    if (!cdOnly) for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));    const cdName = baseOf(c.argv[0] ?? '');
+    if (!cdOnly) for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
+    // (a wrapper's -C DIR / --chdir DIR, `env -C DIR cp x link/state.json`: the parser unwraps `env`, so the directory is on the command, not in its argv)
+    if (!cdOnly && typeof c.chdir === 'string') addDir(expandRefs(c.chdir, ctx));
+    const cdName = baseOf(c.argv[0] ?? '');
     if (!CD_CMDS.has(cdName)) continue;
     let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
     if (!t && (cdName === 'cd' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
