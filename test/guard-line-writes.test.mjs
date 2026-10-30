@@ -210,7 +210,7 @@ test('h: curl writes every file its options name; what is not certain is unmodel
   // a bracketed host is exempt only as a real IPv6 literal: a colon inside, and the bracket ends the host
   for (const u of ['http://[::1]:8080/x', 'https://[2001:db8::1]/x', 'http://user@[::1]/x']) allowBoth((_, _m, mid) => `curl -g -o out '${u}'; ${mid}; bash n.sh`);
   for (const u of ['http://[::1]:8080/x', 'https://[2001:db8::1]/x']) allowBoth((_, _m, mid) => `curl -o out '${u}'; ${mid}; bash n.sh`);
-  for (const u of ['http://[abc]/x', 'https://[a]pi.github.com/x', 'https://[::1]api.github.com/x', 'http://[::1]:8080/x/[1-2]']) denyBoth((_, mid) => `curl -o out '${u}'; ${mid}; bash n.sh`);
+  for (const u of ['http://[abc]/x', 'https://[a]pi.github.com/x', 'https://[::1]api.github.com/x', 'http://[::1]:8080/x/[1-2]', 'http://a[1-2]@[::1]/x', 'http://a{b,c}@[::1]/x']) denyBoth((_, mid) => `curl -o out '${u}'; ${mid}; bash n.sh`);
   // tar -c / -r / -u write the archive named by -f
   denyBoth((_, mid) => `tar -cf n.sh d; ${mid}; bash n.sh`);
   denyBoth((_, mid) => `tar cf n.sh d; ${mid}; bash n.sh`);

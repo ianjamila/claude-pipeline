@@ -326,7 +326,7 @@ const contentOfState = (state) => (ids) => {
 async function rulingRequest(rest, ctx) {
   const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, ids: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
-  const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean))];
+  const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean).map((id) => id.toUpperCase()))]; // (R1-B1 and r1-b1 are one item)
   if (ids.length === 0) throw new UsageError('--ids must name at least one item');
   const root = resolveRepo(values, ctx);
   const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, reason } });

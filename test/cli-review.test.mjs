@@ -2873,6 +2873,7 @@ test('triage ruling-request: prints the ruling line with the content digest of e
   assert.deepEqual(both.json, { ok: true, line: `⚖️ Owner ruling needed #7: R1-B1, R1-S1 · content ${rulingContentDigest(items)} · repo acme/widgets` });
   assert.equal(ask('R1-B1').json.line, `⚖️ Owner ruling needed #7: R1-B1 · content ${rulingContentDigest([items[0]])} · repo acme/widgets`, 'only the asked ids');
   assert.notEqual(ask('R1-B1').json.line.split(' · ')[1], ask('R1-S1').json.line.split(' · ')[1]);
+  assert.equal(ask('R1-B1', 'r1-b1').json.line, ask('R1-B1').json.line, 'ids differing only in case are one id');
   assertExit(ask('R1-B1', 'R1-X9'), 1, 'an unknown id');
   assert.match(ask('R1-B1', 'R1-X9').json.reason, /R1-X9/);
   assertExit(w.cli(['triage', 'ruling-request', '--pr', '99', '--ids', 'R1-B1']), 1, 'a PR that is not the review state\'s');

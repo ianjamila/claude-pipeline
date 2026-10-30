@@ -243,7 +243,7 @@ function curlRecords(args, idx, env = {}) {
   for (const n of named) { out.push(unknown(inDir(n))); if (outDir && (n.startsWith('/') || /^[A-Za-z]:/.test(n))) out.push(unknown(n)); }
   // (a globbed URL / a #1 output name makes many files. -g / --globoff is NOT trusted to switch the glob off (#113): a later --no-globoff, a -g taken as the value of
   // an option this reading does not know, or a config file can each leave globbing on. The one exemption is an IPv6 literal host ([::1]): a colon inside, and the bracket ends the host.)
-  const v6Host = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:[^/@?#]*@)?\[[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*\](?=[:/?#]|$)/;
+  const v6Host = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:[^/@?#[\]{}]*@)?\[[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*\](?=[:/?#]|$)/;
   if (urls.some((u) => /[[{]/.test(u.slice(v6Host.exec(u)?.[0].length ?? 0))) || out.some((o) => /#\d/.test(o.dest))) anyOutput = true;
   if (remote) {
     for (const u of urls) if (urlBase(u)) out.push(unknown(inDir(urlBase(u))));
