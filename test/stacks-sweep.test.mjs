@@ -16,6 +16,7 @@ import { stackFiles, lockDirs } from '../pipeline/lib/stacks/paths.mjs';
 import { ok, unknown } from '../pipeline/lib/stacks/result.mjs';
 import { acquire, release } from '../pipeline/lib/locks.mjs';
 import { fakeDocker, container } from './fixtures/fake-docker.mjs';
+import { addSession, aliveStarts } from './helpers/claude-sessions.mjs';
 
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id'; // lock owner records never create ~/.claude/pipeline-state/machine-id
 
@@ -80,6 +81,7 @@ function makeMachine({ mode = 'report', config = true, devPorts = [], extra = []
     consumerWorktrees: (stack) => ok(m.consumers[stack.project] ?? [{ path: join(base, 'wt', `${stack.project}-gone`), exists: false }]),
     prStates: (wts) => ok(new Map(wts.map((w) => [w.path, m.prs[w.path] ?? { state: 'GONE', headMatches: true, eligible: true }]))),
     cwdInside: (dirs) => ok(m.cwd[dirs[0]] ?? []),
+    openSessions: () => ok([]),
     connections: (stack) => ok(m.conns[stack.project] ?? []),
     processRefs: (stack) => ok(m.refs[stack.project] ?? []),
     memoryRefs: () => ok(m.memory),
@@ -226,6 +228,8 @@ test('each evidence input flipped one at a time turns the orphan from would-stop
     'connection': { kind: 'kept', set: (m) => { m.conns['orphan-demo'] = [{ pid: null, birth: null, command: 'hidden client', port: 54323 }]; } },
     'process reference': { kind: 'kept', set: (m) => { m.refs['orphan-demo'] = [{ pid: 9, birth: 9, command: 'psql orphan-demo', field: 'cmdline' }]; } },
     'cwd process': { kind: 'kept', set: (m) => { m.evidence.cwdInside = () => ok([{ pid: 8, dir: m.spec('orphan-demo').workdir }]); } },
+    'open Claude session': { kind: 'kept', set: (m) => { m.evidence.openSessions = () => ok([{ id: 'aaaaaaaa', pid: 31, dir: m.spec('orphan-demo').workdir }]); } },
+    'open-session probe unknown': { kind: 'listed', set: (m) => { m.evidence.openSessions = () => unknown('open Claude sessions could not all be placed: x'); } },
     'memory note': { kind: 'kept', set: (m) => { m.memory = ['/notes/x.md']; } },
     'recent transcript': { kind: 'kept', set: (m) => { m.transcripts['orphan-demo'] = ['/t/a.jsonl']; } },
     'keep list': { kind: 'kept', set: (m) => writeFileSync(m.files.keep, 'orphan-demo\n') },
@@ -245,6 +249,45 @@ test('each evidence input flipped one at a time turns the orphan from would-stop
       assert.equal(m.supabaseCalls.length, 0, name);
     });
   }
+});
+
+// An OPEN Claude session parked in the stack folder or a consumer worktree keeps the stack however long it has been idle (no lease,
+// transcript older than the 24 h window). The real scanner reads a fake config dir under the machine's home; only ps is stubbed.
+function realOpenSessions(m, alive) {
+  const { openSessions, ...rest } = m.evidence;
+  return { evidence: rest, liveSessionStarts: aliveStarts(alive) };
+}
+
+test('open sessions: a session parked 48 h in a consumer worktree keeps the orphan; closing it lets the sweep would-stop it', async () => {
+  await withMachine({ mode: 'apply' }, async (m) => {
+    const wt = join(m.base, 'wt', 'orphan-feature');
+    mkdirSync(wt, { recursive: true });
+    m.consumers['orphan-demo'] = [{ path: wt, exists: true }];
+    addSession(m.base, { pid: 31, sid: 'aaaaaaaa-1111', lines: [m.base, wt], ageHours: 48 });
+    const r = await m.sweep({ apply: true }, realOpenSessions(m, [31]));
+    assert.deepEqual(r.stopped, []);
+    assert.ok(names(r.kept).includes('orphan-demo'), `kept=${names(r.kept)} listed=${names(r.listed)}`);
+    assert.match(r.kept.find((k) => k.project === 'orphan-demo').reasons.join('\n'), /openSessions: 1 open Claude session\(s\).*session aaaaaaaa pid 31 in .*orphan-feature/);
+    assert.equal(m.supabaseCalls.length, 0);
+    rmSync(join(m.base, '.claude', 'sessions', '31.json'));
+    const after = await m.sweep({ apply: true }, realOpenSessions(m, [31]));
+    assert.deepEqual(names(after.stopped), ['orphan-demo']);
+  });
+});
+
+test('open sessions: a session parked in the stack folder keeps it; one that cannot be placed lists it with the reason', async () => {
+  await withMachine({ mode: 'apply' }, async (m) => {
+    addSession(m.base, { pid: 31, sid: 'aaaaaaaa-1111', lines: [join(m.spec('orphan-demo').workdir, 'supabase')], ageHours: 100 });
+    const r = await m.sweep({ apply: true }, realOpenSessions(m, [31]));
+    assert.ok(names(r.kept).includes('orphan-demo'));
+    assert.match(r.kept.find((k) => k.project === 'orphan-demo').reasons.join('\n'), /openSessions: 1 open Claude session.*orphan\.stack/);
+    rmSync(join(m.base, '.claude'), { recursive: true });
+    addSession(m.base, { pid: 41, raw: '{ not json' });
+    const listed = await m.sweep({ apply: true }, realOpenSessions(m, []));
+    assert.deepEqual(listed.stopped, []);
+    assert.ok(names(listed.listed).includes('orphan-demo'), `kept=${names(listed.kept)} listed=${names(listed.listed)}`);
+    assert.match(listed.listed.find((k) => k.project === 'orphan-demo').reasons.join('\n'), /openSessions unknown: open Claude sessions could not all be placed: session record .*41\.json is unreadable/);
+  });
 });
 
 // ======================================================================= gates

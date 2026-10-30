@@ -3,7 +3,7 @@
 // hand each verdict exactly the probes it asked for, fail closed (unknown) and read the ledger under its lock.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, symlinkSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, symlinkSync, appendFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildCurrent, cwdDirs, findStack, freshStack, gatherEvidence, ownPids, readLedgerLocked, summarizeEvidence, SESSION_END_PROBES, SWEEP_PROBES } from '../pipeline/lib/stacks/assess.mjs';
@@ -12,6 +12,8 @@ import { appendEvent } from '../pipeline/lib/stacks/ledger.mjs';
 import { stackFiles, lockDirs } from '../pipeline/lib/stacks/paths.mjs';
 import { ok, unknown } from '../pipeline/lib/stacks/result.mjs';
 import { acquire, release } from '../pipeline/lib/locks.mjs';
+import { scanLiveSessions } from '../pipeline/lib/worktree-prune/live-sessions.mjs';
+import { addSession, aliveStarts } from './helpers/claude-sessions.mjs';
 
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id'; // lock owner records never create ~/.claude/pipeline-state/machine-id
 
@@ -39,7 +41,9 @@ function world() {
 }
 
 const lease = (owner, over = {}) => ({ t: new Date(NOW - 60_000).toISOString(), kind: 'use', owner, project: 'alpha', worktree: 'none', tool: 'Bash', via: 't', ...over });
-const clean = { connections: () => ok([]), processRefs: () => ok([]), cwdInside: () => ok([]), consumerWorktrees: () => ok([]) };
+// `cleanReal` leaves openSessions to the real probe (fake config dirs); `clean` stubs it out like the other probes.
+const cleanReal = { connections: () => ok([]), processRefs: () => ok([]), cwdInside: () => ok([]), consumerWorktrees: () => ok([]) };
+const clean = { ...cleanReal, openSessions: () => ok([]) };
 
 function ctxFor(w, over = {}) {
   return {
@@ -520,6 +524,295 @@ test('gatherEvidence: every probe excludes the registered workers (alive, birth-
     for (const name of ['connections', 'processRefs', 'cwdInside']) {
       assert.ok(seen[name].has(4242) && seen[name].has(process.pid), `${name} excludes the worker and itself`);
       assert.ok(!seen[name].has(5050), `${name} still counts a reused pid`);
+    }
+  } finally {
+    w.cleanup();
+  }
+});
+
+// ---- openSessions: the REAL scanner over a fake config dir (<base>/.claude); only its ps call is stubbed ----
+
+function sessionWorld() {
+  const w = world();
+  w.wtA = join(w.base, 'wt', 'a');
+  w.wtB = join(w.base, 'wt', 'b');
+  for (const d of [w.wtA, w.wtB]) mkdirSync(d, { recursive: true });
+  w.consumers = [{ path: w.wtA, exists: true }];
+  // gather with the real openSessions probe. `alive`: the pids ps reports running; ctx: extra ctx; probes / gather: gatherEvidence options
+  w.open = async (alive = [], { consumers = w.consumers, ctx: extra = {}, probes = ['openSessions'], gather = {}, startsOpts } = {}) => {
+    const starts = aliveStarts(alive, startsOpts);
+    const ctx = ctxFor(w, { env: {}, liveSessionStarts: starts, listWorktrees: () => [], evidence: { ...cleanReal, consumerWorktrees: () => ok(consumers) }, ...extra });
+    const r = await gatherEvidence(w.stack, ctx, { probes, ...gather });
+    return { ...r, starts, ctx };
+  };
+  return w;
+}
+
+test('openSessions is a probe of both verdicts, and the decisions log summarises it', () => {
+  assert.ok(SESSION_END_PROBES.includes('openSessions') && SWEEP_PROBES.includes('openSessions'));
+  assert.equal(summarizeEvidence({ openSessions: ok([{ id: 'a', pid: 1, dir: '/x' }]) }).openSessions, 1);
+  assert.match(summarizeEvidence({ openSessions: unknown('records unreadable') }).openSessions, /^unknown: records unreadable/);
+});
+
+test('openSessions: nobody parked in the stack folder or a consumer worktree -> ok([]); a session elsewhere does not count', posixOnly, async () => {
+  const w = sessionWorld();
+  try {
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [w.base, join(w.base, 'elsewhere')], ageHours: 48 });
+    const { evidence } = await w.open([11]);
+    assert.deepEqual(evidence.openSessions, { ok: true, value: [] });
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions: a session parked 48 h in a consumer worktree, and one in the stack folder, are hits (both far past the 24 h transcript window); both verdicts keep', posixOnly, async () => {
+  const w = sessionWorld();
+  try {
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [w.base, w.wtA], ageHours: 48 });
+    addSession(w.base, { pid: 12, sid: 'bbbbbbbb-2222', lines: [join(w.workdir, 'supabase')], ageHours: 72 });
+    const { evidence } = await w.open([11, 12], { probes: SESSION_END_PROBES });
+    assert.deepEqual(evidence.openSessions, ok([{ id: 'bbbbbbbb', pid: 12, dir: w.workdir }, { id: 'aaaaaaaa', pid: 11, dir: w.wtA }]));
+    const v = sessionEndVerdict(evidence);
+    assert.equal(v.verdict, 'kept');
+    assert.match(v.reasons.join('\n'), /openSessions: 2 open Claude session\(s\).*session bbbbbbbb pid 12 in .*alpha\.stack; session aaaaaaaa pid 11 in .*wt\/a/);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions: the ended owner\'s stale record is ignored; a pid reused by another process is ignored; a LIVE session that reused the owner\'s pid is counted (no owner filtering)', posixOnly, async () => {
+  const w = sessionWorld();
+  try {
+    addSession(w.base, { pid: OWNER.pid, sid: 'oooooooo-0000', lines: [w.wtA] }); // the exited owner's record
+    const gone = await w.open([], { gather: { excludeOwner: OWNER } });
+    assert.deepEqual(gone.evidence.openSessions, ok([]), 'pid dead: not counted');
+    assert.equal(gone.starts.calls.length, 1, 'ps was asked, and the pid was not running');
+    const reused = await w.open([OWNER.pid], { startsOpts: { startOf: { [OWNER.pid]: 'Fri Oct 30 01:00:00 2026' } }, gather: { excludeOwner: OWNER } });
+    assert.deepEqual(reused.evidence.openSessions, ok([]), 'pid reused with another start time: not counted');
+    // a NEW session that got the same pid (and so the same <pid>.json name) and really started at its own procStart
+    addSession(w.base, { pid: OWNER.pid, sid: 'nnnnnnnn-1111', procStart: 'Fri Oct 30 01:00:00 2026', lines: [w.wtA] });
+    const live = await w.open([OWNER.pid], { startsOpts: { startOf: { [OWNER.pid]: 'Fri Oct 30 01:00:00 2026' } }, gather: { excludeOwner: OWNER } });
+    assert.deepEqual(live.evidence.openSessions, ok([{ id: 'nnnnnnnn', pid: OWNER.pid, dir: w.wtA }]));
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions: no Claude sessions folder at all -> ok([]) with a note (an extra signal, never a requirement)', posixOnly, async () => {
+  const w = sessionWorld();
+  try {
+    const { evidence } = await w.open([]);
+    assert.deepEqual(evidence.openSessions, { ok: true, value: [], notes: ['open-session records unavailable (no Claude sessions folder found)'] });
+    assert.equal(sessionEndVerdict({ ...evidence, stack: w.stack }).notes.some((n) => /^openSessions: open-session records unavailable/.test(n)), true);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions: a record we cannot read is unknown with the scanner\'s reason (session-end keeps and says why)', posixOnly, async () => {
+  const w = sessionWorld();
+  try {
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [w.base] });
+    addSession(w.base, { pid: 21, raw: '{ this is not json' });
+    const { evidence } = await w.open([11], { probes: SESSION_END_PROBES });
+    assert.equal(evidence.openSessions.ok, false);
+    assert.match(evidence.openSessions.reason, /^open Claude sessions could not all be placed: session record .*21\.json is unreadable \(not JSON\)/);
+    const v = sessionEndVerdict(evidence);
+    assert.equal(v.verdict, 'kept');
+    assert.ok(v.reasons.some((r) => r.startsWith('openSessions unknown: open Claude sessions could not all be placed: session record') && r.includes('21.json')), JSON.stringify(v.reasons));
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions: a transcript that cannot be read is unknown too', { skip: (WIN_OR_ROOT() && 'chmod 000 is not enforced here') }, async () => {
+  const w = sessionWorld();
+  try {
+    const file = addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wtB] });
+    chmodSync(file, 0);
+    try {
+      const { evidence } = await w.open([11]);
+      assert.equal(evidence.openSessions.ok, false);
+      assert.match(evidence.openSessions.reason, /open session aaaaaaaa pid 11: transcript unreadable \(EACCES\)/);
+    } finally {
+      chmodSync(file, 0o644);
+    }
+  } finally {
+    w.cleanup();
+  }
+});
+
+function WIN_OR_ROOT() {
+  return process.platform === 'win32' || process.getuid?.() === 0;
+}
+
+test('openSessions: consumers unknown -> unknown (the scan is not even started)', posixOnly, async () => {
+  const w = sessionWorld();
+  try {
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wtA] });
+    const ctx = ctxFor(w, { env: {}, liveSessionStarts: aliveStarts([11]), evidence: { ...cleanReal, consumerWorktrees: () => unknown('cannot list worktrees of /repo') }, scanLiveSessions: () => { throw new Error('no scan'); } });
+    const { evidence } = await gatherEvidence(w.stack, ctx, { probes: ['openSessions'] });
+    assert.deepEqual(evidence.openSessions, unknown('openSessions need the consumer worktrees: cannot list worktrees of /repo'));
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions: a too-broad consumer dir is left out (with a note), so a session under it does not keep the stack', posixOnly, async () => {
+  const w = sessionWorld();
+  try {
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: ['/tmp/some/where'] });
+    const { evidence } = await w.open([11], { consumers: [{ path: '/tmp', exists: true }, { path: w.wtA, exists: true }] });
+    assert.equal(evidence.openSessions.ok, true);
+    assert.deepEqual(evidence.openSessions.value, []);
+    assert.ok(evidence.openSessions.notes.some((n) => /"\/tmp" left out of the cwd check: too broad/.test(n)), JSON.stringify(evidence.openSessions.notes));
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions: the probe can be replaced through ctx.evidence, and the scan through ctx.scanLiveSessions; both get the deadline, env and home', posixOnly, async () => {
+  const w = sessionWorld();
+  try {
+    let args;
+    const stub = await gatherEvidence(w.stack, ctxFor(w, { env: { X: '1' }, listWorktrees: () => [], evidence: { ...cleanReal, openSessions: (stack, consumers, opts) => { args = { stack, consumers, opts }; return ok([{ id: 'zzzzzzzz', pid: 9, dir: '/d' }]); } } }), { probes: ['openSessions'], deadlineMs: 7000 });
+    assert.deepEqual(stub.evidence.openSessions, ok([{ id: 'zzzzzzzz', pid: 9, dir: '/d' }]));
+    assert.equal(args.stack.project, 'alpha');
+    assert.deepEqual(args.opts.env, { X: '1' });
+    assert.equal(args.opts.home, w.base);
+    assert.equal(args.opts.deadlineAt, NOW + 7000);
+    let scanArgs;
+    const { evidence } = await gatherEvidence(w.stack, ctxFor(w, { env: { Y: '2' }, listWorktrees: () => [], evidence: { ...cleanReal, consumerWorktrees: () => ok([]) }, scanLiveSessions: (o) => { scanArgs = o; return { available: true, sessions: [{ id: 'cccccccc', pid: 3, cwd: join(w.workdir, 'supabase') }], unplaced: [] }; } }), { probes: ['openSessions'], deadlineMs: 7000 });
+    assert.deepEqual(evidence.openSessions, ok([{ id: 'cccccccc', pid: 3, dir: w.workdir }]));
+    assert.equal(scanArgs.deadlineAt, NOW + 7000);
+    assert.deepEqual(scanArgs.env, { Y: '2' });
+    assert.equal(scanArgs.home, w.base);
+    assert.equal(scanArgs.platform, 'linux');
+    const thrown = await gatherEvidence(w.stack, ctxFor(w, { evidence: { ...cleanReal, openSessions: () => { throw new Error('boom'); } } }), { probes: ['openSessions'] });
+    assert.match(thrown.evidence.openSessions.reason, /open-session probe failed: boom/);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions deadline: out of time -> unknown without asking ps; the ps timeout is the time left', posixOnly, async () => {
+  const w = sessionWorld();
+  try {
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wtA] });
+    const late = await w.open([11], { gather: { deadlineMs: 0 } });
+    assert.equal(late.evidence.openSessions.ok, false);
+    assert.match(late.evidence.openSessions.reason, /could not all be placed: deadline reached before every open session was placed/);
+    assert.equal(late.starts.calls.length, 0, 'ps was not run');
+    const capped = await w.open([11], { gather: { deadlineMs: 8000 } });
+    assert.equal(capped.starts.calls[0].opts.timeoutMs, 8000);
+    assert.equal(capped.evidence.openSessions.ok, true);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions: scanned once per gather call, never cached on ctx (a session that opens before the locked re-gather is seen by it)', posixOnly, async () => {
+  const w = sessionWorld();
+  try {
+    let scans = 0;
+    const starts = aliveStarts([11]);
+    const ctx = ctxFor(w, {
+      env: {}, liveSessionStarts: starts, listWorktrees: () => [], evidence: { ...cleanReal, consumerWorktrees: () => ok(w.consumers) },
+      scanLiveSessions: (o) => { scans += 1; return scanLiveSessions(o); },
+    });
+    addSession(w.base, { pid: 12, sid: 'bbbbbbbb-2222', lines: [w.base] }); // some other, dead, session so a sessions folder exists
+    const first = await gatherEvidence(w.stack, ctx, { probes: SESSION_END_PROBES });
+    assert.equal(scans, 1);
+    assert.deepEqual(first.evidence.openSessions, ok([]));
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wtA], ageHours: 30 });
+    const again = await gatherEvidence(w.stack, ctx, { probes: SESSION_END_PROBES });
+    assert.equal(scans, 2);
+    assert.deepEqual(again.evidence.openSessions, ok([{ id: 'aaaaaaaa', pid: 11, dir: w.wtA }]));
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions: case rules follow ctx.platform (a session in a different-case folder: another folder on linux, the same on macOS)', posixOnly, async () => {
+  const w = sessionWorld();
+  try {
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [join(w.base, 'wt', 'A')] });
+    const linux = await w.open([11], { ctx: { platform: 'linux' } });
+    assert.deepEqual(linux.evidence.openSessions, ok([]));
+    const mac = await w.open([11], { ctx: { platform: 'darwin' } });
+    assert.deepEqual(mac.evidence.openSessions, ok([{ id: 'aaaaaaaa', pid: 11, dir: w.wtA }]));
+  } finally {
+    w.cleanup();
+  }
+});
+
+// A nested git worktree under the stack folder works in its own folder, not in this stack's: it does not keep the stack unless it is a
+// consumer of it (then the consumer entry keeps it). The folder itself and plain subfolders still keep. Unreadable list -> counts.
+function nestedWorld() {
+  const w = sessionWorld();
+  w.nested = join(w.workdir, '.worktrees', 'x');
+  mkdirSync(w.nested, { recursive: true });
+  w.listed = [];
+  w.listWorktrees = (root) => { w.listed.push(root); return [{ path: w.workdir }, { path: w.nested }, { path: w.wtA }, { path: '/elsewhere/other', bare: true }]; };
+  return w;
+}
+
+test('openSessions (stack folder): a session in a nested worktree that is not a consumer does not count; one at the folder, or in a plain subfolder, does', posixOnly, async () => {
+  const w = nestedWorld();
+  try {
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [join(w.nested, 'app')], ageHours: 48 });
+    const none = await w.open([11], { ctx: { listWorktrees: w.listWorktrees } });
+    assert.deepEqual(none.evidence.openSessions, ok([]), 'it works in its own worktree');
+    assert.deepEqual(w.listed, [w.workdir]);
+    addSession(w.base, { pid: 12, sid: 'bbbbbbbb-2222', lines: [w.workdir] });
+    w.listed.length = 0;
+    const root = await w.open([11, 12], { ctx: { listWorktrees: w.listWorktrees } });
+    assert.deepEqual(root.evidence.openSessions, ok([{ id: 'bbbbbbbb', pid: 12, dir: w.workdir }]));
+    assert.deepEqual(w.listed, [w.workdir], 'only needed for the session that is below the folder');
+    addSession(w.base, { pid: 13, sid: 'cccccccc-3333', lines: [join(w.workdir, 'supabase')] });
+    const sub = await w.open([11, 13], { ctx: { listWorktrees: w.listWorktrees } });
+    assert.deepEqual(sub.evidence.openSessions, ok([{ id: 'cccccccc', pid: 13, dir: w.workdir }]));
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions (stack folder): the same nested worktree DOES keep the stack when it is a consumer; a session at the folder alone never needs the worktree list', posixOnly, async () => {
+  const w = nestedWorld();
+  try {
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [w.nested] });
+    const r = await w.open([11], { consumers: [{ path: w.nested, exists: true }], ctx: { listWorktrees: w.listWorktrees } });
+    assert.equal(r.evidence.openSessions.ok, true);
+    assert.deepEqual(r.evidence.openSessions.value.map((h) => [h.id, h.pid]), [['aaaaaaaa', 11]], 'kept (counted once, whichever folder names it)');
+    const at = nestedWorld();
+    try {
+      addSession(at.base, { pid: 12, sid: 'bbbbbbbb-2222', lines: [at.workdir] });
+      const hit = await at.open([12], { ctx: { listWorktrees: () => { throw new Error('not needed'); } } });
+      assert.deepEqual(hit.evidence.openSessions, ok([{ id: 'bbbbbbbb', pid: 12, dir: at.workdir }]));
+    } finally {
+      at.cleanup();
+    }
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions (stack folder): a session whose transcripts disagree (one copy inside the nested worktree, one at the folder) still counts; an unreadable worktree list counts everything, with a note', posixOnly, async () => {
+  const w = nestedWorld();
+  try {
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [w.nested] });
+    addSession(w.base, { config: '.claude-b', pid: 11, sid: 'aaaaaaaa-1111', lines: [w.workdir] });
+    const both = await w.open([11], { ctx: { listWorktrees: w.listWorktrees } });
+    assert.deepEqual(both.evidence.openSessions, ok([{ id: 'aaaaaaaa', pid: 11, dir: w.workdir }]));
+    const w2 = nestedWorld();
+    try {
+      addSession(w2.base, { pid: 12, sid: 'bbbbbbbb-2222', lines: [w2.nested] });
+      const r = await w2.open([12], { ctx: { listWorktrees: () => { throw new Error('not a git repository'); } } });
+      assert.equal(r.evidence.openSessions.ok, true);
+      assert.deepEqual(r.evidence.openSessions.value, [{ id: 'bbbbbbbb', pid: 12, dir: w2.workdir }]);
+      assert.ok(r.evidence.openSessions.notes.some((n) => /could not be listed \(not a git repository\): every open session inside it counts/.test(n)));
+    } finally {
+      w2.cleanup();
     }
   } finally {
     w.cleanup();

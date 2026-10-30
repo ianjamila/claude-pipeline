@@ -560,3 +560,74 @@ test('removeWorktree: without a liveScan option it scans this machine for real (
     if (home === undefined) delete process.env.HOME;
   }
 });
+
+// ---- a scan with a deadline (stack stop; worktree prune passes none) and platform-aware matching (stack open sessions) ----
+
+test('deadline: already passed with a live record -> unplaced, ps never asked; without a deadline ps is asked as before (one argument)', () => {
+  const w = world();
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wt] });
+  let asked = 0;
+  const starts = () => { asked += 1; return new Map([[11, START]]); };
+  const late = scanLiveSessions({ home: w.home, env: {}, platform: 'linux', starts, deadlineAt: 1_000, now: () => 1_000 });
+  assert.deepEqual(late, { available: true, sessions: [], unplaced: ['deadline reached before every open session was placed'] });
+  assert.equal(asked, 0);
+  const none = scanLiveSessions({ home: w.home, env: {}, platform: 'linux', starts: (...args) => { asked = args.length; return new Map([[11, START]]); } });
+  assert.equal(asked, 1, 'no deadline: starts(pids) exactly as before');
+  assert.equal(none.sessions.length, 1);
+  assert.deepEqual(none.unplaced, []);
+});
+
+test('deadline: nothing to place (no live record) needs no time; a deadline well ahead changes nothing', () => {
+  const w = world();
+  assert.deepEqual(scanLiveSessions({ home: w.home, env: {}, platform: 'linux', deadlineAt: 0, now: () => 5_000 }), { available: false, reason: 'no Claude sessions folder found' });
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wt] });
+  const r = scanLiveSessions({ home: w.home, env: {}, platform: 'linux', starts: () => new Map([[11, START]]), deadlineAt: 10_000_000, now: () => 0 });
+  assert.equal(r.sessions.length, 1);
+  assert.deepEqual(r.unplaced, []);
+});
+
+test('deadline: the ps timeout is the time left, capped at 30 s', () => {
+  const w = world();
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wt] });
+  const seen = [];
+  const starts = (pids, opts) => { seen.push(opts?.timeoutMs); return new Map([[11, START]]); };
+  scanLiveSessions({ home: w.home, env: {}, platform: 'linux', starts, deadlineAt: 5_000, now: () => 0 });
+  scanLiveSessions({ home: w.home, env: {}, platform: 'linux', starts, deadlineAt: 5_000_000, now: () => 0 });
+  assert.deepEqual(seen, [5_000, 30_000]);
+});
+
+test('deadline: reached between two sessions -> the first is placed, the scan reports it did not place the rest (fail closed)', () => {
+  const w = world();
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wt] });
+  w.addSession({ pid: 12, sid: 'bbbbbbbb-2222', lines: [w.wt] });
+  // clock reads: before ps, for the ps timeout, before session 1 -> plenty of time; before session 2 -> out of it
+  let reads = 0;
+  const now = () => (++reads <= 3 ? 0 : 99_900);
+  const r = scanLiveSessions({ home: w.home, env: {}, platform: 'linux', starts: () => new Map([[11, START], [12, START]]), deadlineAt: 100_000, now });
+  assert.deepEqual(r.sessions.map((s) => s.pid), [11]);
+  assert.deepEqual(r.unplaced, ['deadline reached before every open session was placed']);
+});
+
+test('deadline: the real ps still runs with its fixed environment under a deadline', { skip: WIN && 'no ps on Windows' }, () => {
+  const lstart = spawnSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], { encoding: 'utf8', env: { PATH: '/bin:/usr/bin', LC_ALL: 'C', TZ: 'UTC' } });
+  const w = world();
+  w.addSession({ pid: process.pid, sid: 'eeeeeeee-5555', procStart: lstart.stdout.trim(), lines: [w.wt] });
+  const zone = process.env.TZ;
+  process.env.TZ = 'Asia/Manila';
+  try {
+    const r = scanLiveSessions({ home: w.home, env: {}, platform: process.platform, deadlineAt: Date.now() + 60_000 });
+    assert.deepEqual(r.unplaced, []);
+    assert.deepEqual(r.sessions, [{ id: 'eeeeeeee', pid: process.pid, cwd: w.wt }]);
+  } finally {
+    if (zone === undefined) delete process.env.TZ;
+    else process.env.TZ = zone;
+  }
+});
+
+test('liveSessionsIn: case rules follow the platform passed (a different-case folder is another folder on linux, the same on macOS/Windows)', () => {
+  const scan = { available: true, sessions: [{ id: 'aaaaaaaa', pid: 11, cwd: '/Work/Wt-A/app' }], unplaced: [] };
+  assert.deepEqual(liveSessionsIn(scan, ['/work/wt-a'], { platform: 'linux' }).hits, []);
+  assert.equal(liveSessionsIn(scan, ['/work/wt-a'], { platform: 'darwin' }).hits.length, 1);
+  assert.equal(liveSessionsIn(scan, ['/work/wt-a'], { platform: 'win32' }).hits.length, 1);
+  assert.equal(liveSessionsIn(scan, ['/Work/Wt-A'], { platform: 'linux' }).hits.length, 1);
+});

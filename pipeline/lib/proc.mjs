@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { accessSync, constants as fsConstants, existsSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { PIPELINE_ROOT, SEAM_VARS, isInstalledCopy, seamValue } from './seams.mjs';
+import { SEAM_VARS, isInstalledCopy, pipelineRoot, seamValue } from './seams.mjs';
 import { splitCommand } from './shell-words.mjs';
 
 const MAX_BUFFER = 64 * 1024 * 1024;
@@ -247,9 +247,11 @@ export function runAsync(cmd, args = [], opts = {}) {
 }
 
 // splitCommand (the quote-aware splitter for the PIPELINE_GH / PIPELINE_CODEX override strings) and the test-seam helpers
-// (PIPELINE_ROOT, SEAM_VARS, isInstalledCopy, seamValue) live in shell-words.mjs and seams.mjs, which spawn nothing; they are
-// re-exported here so every importer of proc.mjs is unchanged.
-export { splitCommand, PIPELINE_ROOT, SEAM_VARS, isInstalledCopy, seamValue };
+// (SEAM_VARS, isInstalledCopy, pipelineRoot, seamValue) live in shell-words.mjs and seams.mjs, which spawn nothing; they are
+// re-exported here so every importer of proc.mjs is unchanged. PIPELINE_ROOT, the root as a constant, lives here only:
+// seams.mjs works it out on first use so the hooks' fast path does not pay for it.
+export { splitCommand, SEAM_VARS, isInstalledCopy, pipelineRoot, seamValue };
+export const PIPELINE_ROOT = pipelineRoot();
 
 // A seam that is a switch: only the exact value `1` turns it on.
 export const seamFlag = (name, env, opts) => seamValue(name, env, opts) === '1';

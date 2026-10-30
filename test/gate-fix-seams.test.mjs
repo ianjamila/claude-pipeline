@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isInstalledCopy, seamFlag, seamValue, overrideCommand, SEAM_VARS } from '../pipeline/lib/proc.mjs';
 
@@ -56,6 +56,11 @@ test('a real installed copy: gh / codex / vercel / test-mode seams are ignored e
     const v = await import(${JSON.stringify(pathToFileURL(join(root, 'lib', 'vercel.mjs')).href)});
     console.log(JSON.stringify({ codex: p.codexCommand(), vercel: v.vercelCommand(), mode: p.seamFlag('PIPELINE_TEST_MODE'), installed: p.isInstalledCopy() }));
   `;
+  // The hooks' fast path imports seams.mjs alone (no proc.mjs): its lazily worked-out root must still find INSTALLED.json.
+  const seamsProbeFor = (root) => `
+    const s = await import(${JSON.stringify(pathToFileURL(join(root, 'lib', 'seams.mjs')).href)});
+    console.log(JSON.stringify({ gh: s.seamValue('PIPELINE_GH', {}) ?? null, installed: s.isInstalledCopy(), root: s.pipelineRoot() }));
+  `;
   const probe = probeFor(installed);
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
     encoding: 'utf8',
@@ -72,4 +77,13 @@ test('a real installed copy: gh / codex / vercel / test-mode seams are ignored e
   });
   assert.deepEqual(JSON.parse(ok.stdout), { codex: { cmd: 'node', prefixArgs: ['fake-codex.mjs'] }, vercel: { cmd: 'fv', prefixArgs: [] }, mode: true, installed: false });
   assert.equal(ok.stderr, '');
+
+  const seamsEnv = { encoding: 'utf8', env: { ...process.env, PIPELINE_GH: 'node fake-gh.mjs' } };
+  const s1 = spawnSync(process.execPath, ['--input-type=module', '-e', seamsProbeFor(installed)], seamsEnv);
+  assert.equal(s1.status, 0, s1.stderr);
+  assert.deepEqual(JSON.parse(s1.stdout), { gh: null, installed: true, root: join(installed, sep) });
+  assert.match(s1.stderr, /ignoring PIPELINE_GH/);
+  const s2 = spawnSync(process.execPath, ['--input-type=module', '-e', seamsProbeFor(join(here, '..', 'pipeline'))], seamsEnv);
+  assert.equal(s2.status, 0, s2.stderr);
+  assert.deepEqual(JSON.parse(s2.stdout), { gh: 'node fake-gh.mjs', installed: false, root: join(here, '..', 'pipeline', sep) });
 });
