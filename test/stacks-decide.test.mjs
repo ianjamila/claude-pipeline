@@ -31,6 +31,7 @@ const baseSweep = () => ({
   consumers: ok([{ path: '/w/a', exists: false, branch: null, via: 'ledger' }]),
   prStates: ok(new Map([['/w/a', { state: 'GONE', headMatches: true, eligible: true }]])),
   cwdProcs: ok([]),
+  openSessions: ok([]),
   connections: ok([]),
   processRefs: ok([]),
   uptimeMs: DAY_MS + 1,
@@ -47,6 +48,7 @@ const baseSession = () => ({
   connections: ok([]),
   processRefs: ok([]),
   cwdProcs: ok([]),
+  openSessions: ok([]),
   binding: goodBinding(),
 });
 
@@ -73,6 +75,7 @@ const sweepFlips = {
   'existing consumer worktree with no PR': [(e) => { e.consumers = ok([{ path: '/w/a', exists: true }]); e.prStates = ok(new Map([['/w/a', { state: 'NONE', headMatches: false, eligible: false }]])); }, /prStates.*no PR/],
   'consumer with no PR state at all': [(e) => { e.prStates = ok(new Map()); }, /prStates.*no PR state/],
   'cwd process': [(e) => { e.cwdProcs = ok([{ pid: 5, dir: '/w/a' }]); }, /cwdProcs.*pid 5/],
+  'open Claude session': [(e) => { e.openSessions = ok([{ id: 'aaaaaaaa', pid: 41, dir: '/w/a' }]); }, /openSessions: 1 open Claude session.*session aaaaaaaa pid 41 in \/w\/a/],
   connection: [(e) => { e.connections = ok([{ pid: 6, command: 'node', port: 54422 }]); }, /connections.*node/],
   'hidden-client connection': [(e) => { e.connections = ok([{ pid: null, birth: null, command: 'hidden client', port: 54422 }]); }, /connections.*hidden client/],
   'process ref': [(e) => { e.processRefs = ok([{ pid: 7, command: 'node x', field: 'env' }]); }, /processRefs.*pid 7.*env/],
@@ -90,7 +93,7 @@ const sweepFlips = {
   'database container not running': [(e) => { e.stack.containers[0].running = false; }, /not running/],
   'binding failed': [(e) => { e.binding = { ok: false, reasons: ['binding: container id x != assessed c1'] }; }, /binding: container id/],
   'binding missing': [(e) => { delete e.binding; }, /binding/],
-  ...Object.fromEntries(['cwdProcs', 'connections', 'processRefs', 'memory', 'keep', 'transcripts', 'consumers', 'prStates', 'liveLeases']
+  ...Object.fromEntries(['cwdProcs', 'openSessions', 'connections', 'processRefs', 'memory', 'keep', 'transcripts', 'consumers', 'prStates', 'liveLeases']
     .map((k) => [`${k} unknown`, [(e) => { e[k] = unknown('probe failed'); }, new RegExp(`${k} unknown: probe failed`)]])),
 };
 for (const [name, [flip, re]] of Object.entries(sweepFlips)) {
@@ -106,10 +109,10 @@ for (const [name, [flip, re]] of Object.entries(sweepFlips)) {
 }
 
 test('sweep: kept (positive evidence of use) vs listed (cannot decide) are told apart', () => {
-  const kept = ['shared', 'live lease', 'consumer worktree open PR', 'cwd process', 'connection', 'hidden-client connection', 'process ref',
+  const kept = ['shared', 'live lease', 'consumer worktree open PR', 'cwd process', 'open Claude session', 'connection', 'hidden-client connection', 'process ref',
     'uptime exactly 24h', 'memory mention', 'keep listed', 'recent transcript', 'paused'];
   const listed = ['no consumers known', 'merged but head differs', 'existing consumer worktree with no PR', 'missing workdir', 'binding failed',
-    'cwdProcs unknown', 'connections unknown', 'consumers unknown', 'prStates unknown', 'liveLeases unknown', 'memory unknown', 'keep unknown', 'transcripts unknown'];
+    'cwdProcs unknown', 'openSessions unknown', 'connections unknown', 'consumers unknown', 'prStates unknown', 'liveLeases unknown', 'memory unknown', 'keep unknown', 'transcripts unknown'];
   for (const name of kept) {
     const e = baseSweep(); sweepFlips[name][0](e);
     assert.equal(sweepVerdict(e).verdict, 'kept', name);
@@ -219,6 +222,7 @@ const sessionFlips = {
   'built-in shared project id': [(e) => { e.stack.project = 'foo-pipeline'; }, /shared/],
   'other live lease': [(e) => { e.otherLiveLeases = ok([{ owner: { pid: 9, birth: 1 } }]); }, /otherLiveLeases.*pid 9/],
   'cwd process': [(e) => { e.cwdProcs = ok([{ pid: 5, dir: '/w/a' }]); }, /cwdProcs.*pid 5/],
+  'open Claude session': [(e) => { e.openSessions = ok([{ id: 'aaaaaaaa', pid: 41, dir: '/w/a' }, { id: 'bbbbbbbb', pid: 42, dir: '/w/b' }]); }, /openSessions: 2 open Claude session.*session aaaaaaaa pid 41 in \/w\/a; session bbbbbbbb pid 42 in \/w\/b/],
   connection: [(e) => { e.connections = ok([{ pid: 6, command: 'node', port: 54422 }]); }, /connections.*node/],
   'hidden-client connection': [(e) => { e.connections = ok([{ pid: null, birth: null, command: 'hidden client', port: 54422 }]); }, /connections.*hidden client/],
   'process ref': [(e) => { e.processRefs = ok([{ pid: 7, command: 'node x', field: 'cmdline' }]); }, /processRefs.*pid 7/],
@@ -230,7 +234,7 @@ const sessionFlips = {
   'database container not running': [(e) => { e.stack.containers[0].running = false; }, /not running/],
   'binding failed': [(e) => { e.binding = { ok: false, reasons: ['binding: container StartedAt differs'] }; }, /binding: container StartedAt/],
   'binding missing': [(e) => { delete e.binding; }, /binding/],
-  ...Object.fromEntries(['cwdProcs', 'connections', 'processRefs', 'keep', 'otherLiveLeases']
+  ...Object.fromEntries(['cwdProcs', 'openSessions', 'connections', 'processRefs', 'keep', 'otherLiveLeases']
     .map((k) => [`${k} unknown`, [(e) => { e[k] = unknown('probe failed'); }, new RegExp(`${k} unknown: probe failed`)]])),
 };
 for (const [name, [flip, re]] of Object.entries(sessionFlips)) {
@@ -368,4 +372,34 @@ test('decide.mjs is pure: no fs, subprocess, env or clock; its header states the
     'supabase stop --workdir', 'Target binding', 'fail closed', 'MORE than 24 h', 'hidden client', 'OTHER USERS', 'server side',
     'C2', 'C3', 'C4', 'C6', 'NON-EMPTY', 'keep-listed', 'listed', 'kept',
   ]) assert.ok(header.toLowerCase().includes(phrase.toLowerCase()), `header lacks "${phrase}"`);
+});
+
+test('open sessions: the reason carries the unknown text (a persistent unplaced keeps/lists every stack until fixed); a bad shape is unknown', () => {
+  const reason = 'open Claude sessions could not all be placed: cannot read /home/x/.claude/sessions (EACCES)';
+  const k = baseSession();
+  k.openSessions = unknown(reason);
+  const kv = sessionEndVerdict(k);
+  assert.equal(kv.verdict, 'kept');
+  assert.ok(kv.reasons.some((r) => r === `openSessions unknown: ${reason}`), JSON.stringify(kv.reasons));
+  const w = baseSweep();
+  w.openSessions = unknown(reason);
+  const wv = sweepVerdict(w);
+  assert.equal(wv.verdict, 'listed');
+  assert.ok(wv.reasons.some((r) => r === `openSessions unknown: ${reason}`), JSON.stringify(wv.reasons));
+  for (const [verdict, base] of [[sessionEndVerdict, baseSession()], [sweepVerdict, baseSweep()]]) {
+    base.openSessions = ok('nope');
+    assert.notEqual(verdict(base).verdict, 'stop');
+  }
+});
+
+test('open sessions: a kept open session wins over a listed unknown in the sweep; notes of the probe reach the verdict', () => {
+  const e = baseSweep();
+  e.openSessions = ok([{ id: 'aaaaaaaa', pid: 41, dir: '/w/a' }]);
+  e.memory = unknown('memory dirs unreadable');
+  assert.equal(sweepVerdict(e).verdict, 'kept');
+  const n = baseSession();
+  n.openSessions = { ok: true, value: [], notes: ['open-session records unavailable (no Claude sessions folder found)'] };
+  const v = sessionEndVerdict(n);
+  assert.equal(v.verdict, 'stop');
+  assert.ok(v.notes.some((x) => /^openSessions: open-session records unavailable/.test(x)));
 });

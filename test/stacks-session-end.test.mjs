@@ -21,6 +21,8 @@ import { acquire as realAcquire } from '../pipeline/lib/locks.mjs';
 import { parseOwner, run as runStacksCommand } from '../pipeline/commands/stacks.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
 import { fakeDocker, container } from './fixtures/fake-docker.mjs';
+import { addSession, aliveStarts } from './helpers/claude-sessions.mjs';
+import { scanLiveSessions } from '../pipeline/lib/worktree-prune/live-sessions.mjs';
 
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id'; // lock owner records never create ~/.claude/pipeline-state/machine-id
 
@@ -81,7 +83,9 @@ function makeWorld({ mode = 'apply', config = true, devMode = 'report' } = {}) {
   return w;
 }
 
-const quiet = { connections: () => ok([]), processRefs: () => ok([]), cwdInside: () => ok([]), consumerWorktrees: () => ok([]) };
+// `quietReal` leaves openSessions to the real probe (a fake config dir under the world's home); `quiet` stubs it out like the others.
+const quietReal = { connections: () => ok([]), processRefs: () => ok([]), cwdInside: () => ok([]), consumerWorktrees: () => ok([]) };
+const quiet = { ...quietReal, openSessions: () => ok([]) };
 
 function depsFor(w, c, over = {}) {
   return {
@@ -101,6 +105,96 @@ async function withWorld(opts, fn) {
     w.cleanup();
   }
 }
+
+// ---- an OPEN Claude session parked in the stack folder or a consumer worktree keeps the stack (the real scanner, only ps stubbed) ----
+
+// a consumer worktree of alpha, and deps whose evidence leaves openSessions to the real probe; `alive`: pids ps reports running
+function openDeps(w, c, alive, over = {}) {
+  w.wt = join(w.base, 'wt', 'alpha-feature');
+  mkdirSync(w.wt, { recursive: true });
+  return depsFor(w, c, { evidence: { ...quietReal, consumerWorktrees: () => ok([{ path: w.wt, exists: true }]) }, liveSessionStarts: aliveStarts(alive), observeAtMs: [], ...over });
+}
+
+test('open sessions: a session parked 48 h in a consumer worktree (no lease, transcript long past 24 h) keeps the stack; once it is gone the stack is stopped', posixOnly, () => withWorld({}, async (w, c) => {
+  await w.lease(OWNER);
+  const deps = openDeps(w, c, [31]);
+  addSession(w.base, { pid: 31, sid: 'aaaaaaaa-1111', lines: [w.base, w.wt], ageHours: 48 });
+  const r = await runSessionEnd({ owner: OWNER, deps });
+  assert.equal(r.stacks[0].action, 'kept');
+  assert.match(r.stacks[0].reasons.join('\n'), /openSessions: 1 open Claude session\(s\).*session aaaaaaaa pid 31 in .*alpha-feature/);
+  assert.equal(w.supabaseCalls.length, 0);
+  assert.equal(w.actions()[0].evidence.openSessions, 1, 'the decisions log counts it');
+  rmSync(join(w.base, '.claude', 'sessions', '31.json')); // the session was closed
+  const again = await runSessionEnd({ owner: OWNER, deps });
+  assert.equal(again.stacks[0].action, 'stopped');
+  assert.equal(w.supabaseCalls.length, 1);
+  assertSafe(w);
+}));
+
+test('open sessions: a session open in some other folder does not keep the stack', posixOnly, () => withWorld({}, async (w, c) => {
+  await w.lease(OWNER);
+  addSession(w.base, { pid: 32, sid: 'bbbbbbbb-2222', lines: [join(w.base, 'elsewhere')], ageHours: 90 });
+  const r = await runSessionEnd({ owner: OWNER, deps: openDeps(w, c, [32]) });
+  assert.equal(r.stacks[0].action, 'stopped');
+}));
+
+test('open sessions: a session in the stack folder keeps it', posixOnly, () => withWorld({}, async (w, c) => {
+  await w.lease(OWNER);
+  addSession(w.base, { pid: 31, sid: 'aaaaaaaa-1111', lines: [join(w.workdir, 'supabase')], ageHours: 30 });
+  const r = await runSessionEnd({ owner: OWNER, deps: openDeps(w, c, [31]) });
+  assert.equal(r.stacks[0].action, 'kept');
+  assert.match(r.stacks[0].reasons.join('\n'), /openSessions: 1 open Claude session.*in .*alpha\.stack/);
+  assert.equal(w.supabaseCalls.length, 0);
+}));
+
+test('open sessions: a session that opens between the first assessment and the re-check under the lock keeps the stack (nothing is cached across the two)', posixOnly, () => withWorld({}, async (w, c) => {
+  await w.lease(OWNER);
+  let scans = 0;
+  const deps = openDeps(w, c, [31], {
+    scanLiveSessions: (o) => {
+      scans += 1;
+      if (scans === 2) addSession(w.base, { pid: 31, sid: 'aaaaaaaa-1111', lines: [w.wt], ageHours: 40 });
+      return scanLiveSessions(o);
+    },
+  });
+  addSession(w.base, { pid: 32, sid: 'bbbbbbbb-2222', lines: [w.base] }); // a sessions folder exists, with nobody in the stack
+  const r = await runSessionEnd({ owner: OWNER, deps });
+  assert.equal(scans, 2, 'the first gather and the locked re-gather each scanned');
+  assert.equal(r.stacks[0].action, 'kept');
+  assert.match(r.stacks[0].reasons.join('\n'), /openSessions: 1 open Claude session/);
+  assert.equal(w.supabaseCalls.length, 0);
+}));
+
+test('open sessions: the ended owner\'s stale record does not keep the stack; a live session that reused the owner\'s pid does (no owner filtering)', posixOnly, () => withWorld({}, async (w, c) => {
+  await w.lease(OWNER);
+  const deps = openDeps(w, c, []); // ps knows no pid
+  addSession(w.base, { pid: OWNER.pid, sid: 'oooooooo-0000', lines: [w.wt] }); // the exited owner's own record, parked in a consumer worktree
+  const gone = await runSessionEnd({ owner: OWNER, deps });
+  assert.equal(gone.stacks[0].action, 'stopped');
+  const w2 = makeWorld({});
+  try {
+    await w2.lease(OWNER);
+    const c2 = clock();
+    const start = 'Fri Oct 30 01:00:00 2026';
+    addSession(w2.base, { pid: OWNER.pid, sid: 'nnnnnnnn-1111', procStart: start, lines: [join(w2.base, 'wt', 'alpha-feature')] });
+    const deps = openDeps(w2, c2, [OWNER.pid]);
+    deps.liveSessionStarts = aliveStarts([OWNER.pid], { start });
+    const r = await runSessionEnd({ owner: OWNER, deps });
+    assert.equal(r.stacks[0].action, 'kept');
+    assert.match(r.stacks[0].reasons.join('\n'), new RegExp(`session nnnnnnnn pid ${OWNER.pid}`));
+  } finally {
+    w2.cleanup();
+  }
+}));
+
+test('open sessions: a record that cannot be read keeps the stack and the kept reason carries the scanner\'s text (a persistent one keeps every private stack: the same trade-off as lsof failing)', posixOnly, () => withWorld({}, async (w, c) => {
+  await w.lease(OWNER);
+  addSession(w.base, { pid: 41, raw: '{ not json' });
+  const r = await runSessionEnd({ owner: OWNER, deps: openDeps(w, c, []) });
+  assert.equal(r.stacks[0].action, 'kept');
+  assert.match(r.stacks[0].reasons.join('\n'), /openSessions unknown: open Claude sessions could not all be placed: session record .*41\.json is unreadable \(not JSON\)/);
+  assert.equal(w.supabaseCalls.length, 0);
+}));
 
 // every supabase call in every test is exactly the one safe argv
 function assertSafe(w) {
