@@ -294,8 +294,48 @@ function makeCtx(opts) {
     }
     return false;
   };
+  // #111 (Fable): can the glob write target `g` (an absolute, normalised path with wildcards) reach a protected review file through another
+  // name for the folder? Its literal directory prefix is looked up (hitReviewInode); a wildcard in the LAST name must be able to match a
+  // protected name when the prefix is the review folder (a round folder: anything), and a wildcard in a DIRECTORY name is expanded
+  // against the real listing of the literal parent, each matching entry (a link to the folder included) judged with the rest of the glob.
+  // Fail closed: `**` (any depth), a listing that failed or is over the entry cap, and more candidates than the work cap are hits; a
+  // parent that does not exist holds nothing. With no review folder nothing is looked up.
+  const MAX_GLOB_CANDIDATES = 400;
+  const hitReviewGlob = (g) => {
+    if (reviewFolders().dir === null) return false;
+    let work = 0;
+    const walk = (glob, depth) => {
+      const P = pathsFor();
+      const segs = glob.split('/');
+      const at = segs.findIndex((s) => /[*?[]/.test(s));
+      if (at < 0) return hitReviewInode(glob, true);
+      const prefix = segs.slice(0, at).join('/') || '/';
+      if (segs[at] === '**' || segs.slice(at).includes('**') || depth > 8) return true;
+      const last = at === segs.length - 1;
+      if (last) {
+        const re = globToRe(segs[at], ci);
+        if (re === null) return true;
+        // (in a round folder anything is protected; in the review folder the glob must be able to match a protected name)
+        return hitReviewInode(P.join(prefix, 'x')) || REVIEW_SAMPLES.some((n) => re.test(n) && hitReviewInode(P.join(prefix, n)));
+      }
+      const re = globToRe(segs[at], ci);
+      if (re === null) return true;
+      const entries = (opts.readDir ?? defaultReadDir)(prefix);
+      if (entries === null) return false;
+      if (!Array.isArray(entries) || entries.length > 4000) return true;
+      const rest = segs.slice(at + 1).join('/');
+      for (const e of [...entries, '.', '..']) {
+        if (!re.test(e)) continue;
+        if (++work > MAX_GLOB_CANDIDATES) return true;
+        if (walk(P.join(prefix, e, rest), depth + 1)) return true;
+      }
+      return false;
+    };
+    return walk(g, 0);
+  };
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
+    hitReviewGlob,
     user: opts.user ?? posix.basename(homePosix),
     selfZero: opts._selfZero ?? null, selfBash: opts._selfBash ?? null, selfAbs: opts._selfAbs === true, selfZsh: opts._selfZsh === true, // the judged script file's own path (its $0 unless it was sourced; BASH_SOURCE[0])
     parentFsChanged: opts._fsChanged === true, // (the calling line ran something before this script that may have changed which paths exist)
@@ -836,6 +876,7 @@ function makeMatchers(ctx) {
     const lit = g.slice(0, g.lastIndexOf('/', star) + 1) || '/';
     if (ctx.hit(lit)) return true;
     if (reviewGlob(g)) return true;
+    if (ctx.hitReviewGlob(g)) return true; // (#111: the same glob through another name for the review folder)
     // a glob that can match a protected root or anything inside one (~/.claude/skills/*/SKILL.md, ~/.c*/pipeline/x) ...
     if (ctx.roots.some((r) => globReaches(g, r, ctx.ci))) return true;
     // ... or a directory that holds them (~/.cla*, ~/.claude/*)
