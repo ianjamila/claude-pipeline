@@ -36,7 +36,8 @@ const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|inst
 // ---- the protected set ------------------------------------------------------------------------
 
 const PROTECTED_REL = [
-  '.claude/skills/ship',
+  '.claude/skills/ship', // (retired: the review skill replaces it; kept protected for installs that still have it)
+  '.claude/skills/review',
   '.claude/skills/verify',
   '.claude/skills/pipeline-setup',
   '.claude/agents/implementer.md',

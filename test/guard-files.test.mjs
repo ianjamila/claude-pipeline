@@ -26,6 +26,7 @@ const inCheckout = { cwd: CHECKOUT, existsSync: (p) => p === GUARD_IN_CHECKOUT }
 test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form', () => {
   assert.deepEqual(protectedRoots('/home/u'), [
     '/home/u/.claude/skills/ship',
+    '/home/u/.claude/skills/review',
     '/home/u/.claude/skills/verify',
     '/home/u/.claude/skills/pipeline-setup',
     '/home/u/.claude/agents/implementer.md',
@@ -52,6 +53,8 @@ const FILE_DENY = [
   ['Edit repo settings.json adding disableAllHooks', 'Edit', { file_path: '/repo/.claude/settings.json', old_string: '{', new_string: '{"disableAllHooks":true,' }],
   ['Write a script exporting PIPELINE_ADMIN', 'Write', { file_path: '/tmp/x.sh', content: 'export PIPELINE_ADMIN=1\nclaude' }],
   ['Edit through a .. segment', 'Edit', { file_path: '/home/u/.claude/skills/ship/../ship/SKILL.md', old_string: 'a', new_string: 'b' }],
+  ['Edit review skill via ~', 'Edit', { file_path: '~/.claude/skills/review/SKILL.md', old_string: 'a', new_string: 'b' }],
+  ['Write review skill', 'Write', { file_path: '/home/u/.claude/skills/review/SKILL.md', content: 'x' }],
   ['Write pipeline-setup skill', 'Write', { file_path: '/home/u/.claude/skills/pipeline-setup/SKILL.md', content: 'x' }],
   ['Write the ship skill directory itself', 'Write', { file_path: '/home/u/.claude/skills/ship', content: 'x' }],
   ['relative path resolved against cwd', 'Edit', { file_path: '../home/u/.claude/pipeline/x', old_string: 'a', new_string: 'b' }, '/repo'],
@@ -75,6 +78,8 @@ const FILE_ALLOW = [
   ['repo settings without disableAllHooks', 'Write', { file_path: '/repo/.claude/settings.json', content: '{"permissions":{}}' }],
   ['global CLAUDE.md', 'Edit', { file_path: '/home/u/.claude/CLAUDE.md', old_string: 'a', new_string: 'b' }],
   ['memory file', 'Edit', { file_path: '/home/u/.claude/projects/-x/memory/a.md', old_string: 'a', new_string: 'b' }],
+  ['another skill under ~/.claude/skills', 'Write', { file_path: '/home/u/.claude/skills/other/SKILL.md', content: 'x' }],
+  ['prefix lookalike of the review skill', 'Edit', { file_path: '/home/u/.claude/skills/reviews/SKILL.md', old_string: 'a', new_string: 'b' }],
   ['prefix lookalike skill dir', 'Edit', { file_path: '/home/u/.claude/skills/shipping/SKILL.md', old_string: 'a', new_string: 'b' }],
   ['prefix lookalike pipeline dir', 'Write', { file_path: '/home/u/.claude/pipeline-notes/a.md', content: 'x' }],
   ['settings.json backup name', 'Write', { file_path: '/home/u/.claude/settings.json.bak', content: 'x' }],
@@ -147,6 +152,10 @@ test('file tool: a realpath that throws falls back to the lexical check', () => 
 // ---- Bash (Appendix B) ----------------------------------------------------------------------
 
 const BASH_DENY = [
+  ['redirect into the review skill', 'echo x > ~/.claude/skills/review/SKILL.md'],
+  ['tee into the review skill', 'echo x | tee ~/.claude/skills/review/SKILL.md'],
+  ['cp over the review skill', 'cp evil.md ~/.claude/skills/review/SKILL.md'],
+  ['rm the review skill', 'rm -rf ~/.claude/skills/review'],
   ['sed -i on the ship skill', "sed -i '' 's/x/y/' ~/.claude/skills/ship/SKILL.md"],
   ['echo redirect to $HOME agent', 'echo x > $HOME/.claude/agents/judge.md'],
   ['cp over ${HOME} skill', 'cp evil.md ${HOME}/.claude/skills/ship/SKILL.md'],
@@ -226,6 +235,8 @@ const BASH_ALLOW = [
   ['redirect to a repo file', 'echo hi > notes.txt'],
   ['repo-local .claude directory', 'cp template.json .claude/settings.json'],
   ['prefix lookalike skill', 'rm -rf ~/.claude/skills/shipping'],
+  ['write another skill', 'cp evil.md ~/.claude/skills/other/SKILL.md'],
+  ['cat the review skill', 'cat ~/.claude/skills/review/SKILL.md'],
   ['other files under .claude', 'cp x ~/.claude/CLAUDE.md'],
   ['memory dir glob', 'rm ~/.claude/projects/-x/memory/*.md'],
   ['head and wc on settings', 'head -n 5 ~/.claude/settings.json | wc -l'],
