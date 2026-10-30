@@ -53,8 +53,7 @@ test('a real installed copy: gh / codex / vercel / test-mode seams are ignored e
   // Built per root: the probe holds file:// URLs, so a string replace of a Windows path would never match.
   const probeFor = (root) => `
     const p = await import(${JSON.stringify(pathToFileURL(join(root, 'lib', 'proc.mjs')).href)});
-    const v = await import(${JSON.stringify(pathToFileURL(join(root, 'lib', 'vercel.mjs')).href)});
-    console.log(JSON.stringify({ codex: p.codexCommand(), vercel: v.vercelCommand(), mode: p.seamFlag('PIPELINE_TEST_MODE'), installed: p.isInstalledCopy() }));
+    console.log(JSON.stringify({ codex: p.codexCommand(), vercel: p.overrideCommand('PIPELINE_VERCEL', 'vercel', process.env), mode: p.seamFlag('PIPELINE_TEST_MODE'), installed: p.isInstalledCopy() }));
   `;
   const probe = probeFor(installed);
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {

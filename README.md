@@ -4,8 +4,7 @@ A global **build → verify → review → merge → production check** pipeline
 repo is onboarded, asking Claude to build or fix something runs the whole flow unattended: a
 branch and worktree, the change plus tests, a full local verify, a pull request, a cross-model
 review loop (Codex finds, a Sonnet judge triages low-risk PRs, a Fable pass rules on and reviews every medium/high-risk or sensitive PR), a final gate
-bound to the exact commit, the merge, a production smoke test, and an automatic rollback if
-production breaks. Nothing reaches `main` without proof, and anything sensitive stops for you.
+bound to the exact commit, and the merge. Nothing reaches `main` without proof, and anything sensitive stops for you.
 
 Design: [`docs/specs/2026-10-01-claude-pipeline-design.md`](docs/specs/2026-10-01-claude-pipeline-design.md) ·
 plan: [`docs/plans/2026-10-01-claude-pipeline-plan.md`](docs/plans/2026-10-01-claude-pipeline-plan.md) ·
@@ -19,7 +18,7 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 |---|---|
 | skills `ship`, `verify`, `pipeline-setup` | the process: ship runs the flow, verify proves a change works, pipeline-setup onboards a repo |
 | agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `arbiter` (Fable) | the judgment; models are pinned in the agent files and proven from transcripts |
-| `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge, rollback) |
+| `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge) |
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
 | hook `session-version` (SessionStart) | tells you at the top of a session when the installed pipeline is stale, edited, half-installed or older than a repo's vendored copy; silent when all is well (see [Staying current](#staying-current)) |
@@ -45,8 +44,7 @@ refuse to overwrite skills or agents it didn't install, and lets `--check` repor
   swaps. The lock sits inside that home (`backups/.locks`) and is named for its real,
   symlink-resolved path, so reaching the home through an alias does not get around it. A lock whose owner process is gone is reclaimed; a live one is never touched, and the
   second run stops with a message naming the owner.
-Requirements: Node ≥ 20, git, `gh` (authenticated); `codex` for reviews; `vercel` for projects
-that deploy there.
+Requirements: Node ≥ 20, git, `gh` (authenticated); `codex` for reviews.
 
 ## Install, update, uninstall
 
@@ -175,8 +173,8 @@ Private local stacks (one per worktree) keep eating memory after the work is don
 - **Safety.** Shared stacks (your configured ids, anything ending `-pipeline`, anything under `.verify/supabase-workdir`) are never stopped. The only stop command is `supabase stop --workdir <dir>`, which keeps the data. Volumes are never deleted. Any doubt (a probe fails, a process cannot be read) means the stack is kept. Processes of other OS users are seen by their connections and command lines only; their environment and open files cannot be read without root.
 
 **Pausing all merges in a repo:** open an issue labelled `pipeline-pause`. While it is open no run
-merges (PRs still get built, verified and reviewed). Agents cannot close it. A failed production
-smoke opens a `pipeline-rollback` issue that has the same effect until you close it.
+merges (PRs still get built, verified and reviewed). Agents cannot close it. An open
+`pipeline-rollback` issue (one you or your own tooling opened) has the same effect until you close it.
 
 ### When a PR stops for you
 
@@ -200,10 +198,9 @@ Hard-stop PRs still go through the full review loop first, so you always get a r
 | Linear history / squash | ✅ | | | ✅ |
 | Fresh full verify bound to the head commit | | | | ✅ final-gate |
 | Gate judges the tree that will land (branch up to date with `main`) | | | ✅ `update-branch` stays allowed, merging through the API denied | ✅ `update-branch` before the gate, again in `merge` |
-| Cross-model review happened | | | ✅ guard-files keeps agents from writing a repo's review state (`.review/state.json`, round folders, gate / smoke / prod-before records); guard-git keeps them from posting the review-complete or triage markers | ✅ no review ⇒ no merge |
+| Cross-model review happened | | | ✅ guard-files keeps agents from writing a repo's review state (`.review/state.json`, round folders, gate / smoke records); guard-git keeps them from posting the review-complete or triage markers | ✅ no review ⇒ no merge |
 | Arbiter really ran on Fable | | | | ✅ model-proof |
 | Pause switch | | | ✅ can't close the pause issue | ✅ |
-| Production smoke + rollback | | | | ✅ prod-watch |
 | Agents can't edit their own rules | ✅ protection edits need admin | | ✅ guard-files / guard-git | |
 | Owner items (`owner_approval: chat`) and resumed runs merge only on your chat "merge" for that repository, head and item set | | | ✅ owner-go records (guard-files protects them); guard-git refuses a direct merge in a chat repo without one | ✅ `P merge` checks the record |
 
@@ -267,10 +264,6 @@ head you did not review (the receipt names the head the event carried).
 - **Agent log lives on its own branch.** `docs/agent-log.md` can't be pushed to `main` directly and a file every PR edits would
   conflict, so each run's outcome line is pushed to the orphan branch `pipeline-agent-log` (never into a PR). If that push
   fails, the line stays queued and goes out with the next run. The PR's summary comment is the immediate record.
-- **Rollback race.** prod-watch re-reads the live deployment before and after rolling back and
-  reports `superseded`, `recovered` or `rollback-failed`; a deploy from a merge outside the run
-  can still race it, but is always detected, never silent. After a Vercel rollback, Vercel stops
-  auto-assigning production domains until a deployment is promoted.
 
 ## Project settings and environment
 

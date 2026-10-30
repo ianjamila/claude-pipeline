@@ -1,12 +1,12 @@
-// final-gate, part 3: CI and preview evidence, plus the smoke command that produces the preview evidence.
+// final-gate, part 3: CI evidence (a configured preview adds no check), plus the smoke command.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { cli, scenario, named, assertOnlyFails, ymlFor, MERGE_SHA, PREVIEW_URL, PR } from './helpers/gate-env.mjs';
+import { cli, scenario, named, assertOnlyFails, ymlFor, MERGE_SHA, PR } from './helpers/gate-env.mjs';
 import { pipelineYml } from './helpers/fakegh-env.mjs';
 import { verdictArtifactName } from '../pipeline/lib/guard-provenance.mjs';
-import { ciCheck } from '../pipeline/lib/finalgate.mjs';
+import { CANONICAL_CHECKS, ciCheck } from '../pipeline/lib/finalgate.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 
 // ---- final-gate: ci -------------------------------------------------------------------------------
@@ -248,32 +248,12 @@ test('final-gate: non-guard checks need no provenance (their rows are never look
   assert.equal(r.code, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
 });
 
-// ---- final-gate: preview --------------------------------------------------------------------------
+// ---- final-gate: preview -------------------------------------------------------------------------
 
-test('final-gate: with preview configured, a missing, failed or other-sha preview smoke fails preview', () => {
-  assertOnlyFails(scenario({ preview: true }).gate(), 'preview', /no preview smoke evidence/);
-  assertOnlyFails(scenario({ preview: true, previewSmoke: (head) => ({ ok: false, sha: head, url: PREVIEW_URL }) }).gate(), 'preview', /did not pass/);
-  assertOnlyFails(scenario({ preview: true, previewSmoke: () => ({ ok: true, sha: 'f'.repeat(40), url: PREVIEW_URL }) }).gate(), 'preview', /preview smoke is for/);
-  const good = scenario({ preview: true, previewSmoke: (head) => ({ ok: true, sha: head, url: PREVIEW_URL }) }).gate();
-  assertExit(good, 0, JSON.stringify(good.json?.checks.filter((c) => !c.ok)));
-  assert.equal(good.json.checks.at(-1).name, 'preview');
-});
-
-test('final-gate: without preview configured there is no preview check at all', () => {
-  assert.equal(scenario().gate().json.checks.some((c) => c.name === 'preview'), false);
-});
-
-test('smoke then final-gate: the evidence smoke records is exactly what the preview check accepts', () => {
-  const s = scenario({ preview: true });
-  const sm = cli(['smoke', '--target', 'preview', '--url', 'https://pr-12.example.test', '--sha', s.head], { dir: s.repo.dir, fake: s.fake });
-  assertExit(sm, 0);
-  assertExit(s.gate(), 0);
-  const wrong = cli(['smoke', '--target', 'preview', '--url', 'https://pr-12.example.test', '--sha', 'a'.repeat(40)], { dir: s.repo.dir, fake: s.fake });
-  assertExit(wrong, 0);
-  assertOnlyFails(s.gate(), 'preview', /preview smoke is for/);
-  const noSha = cli(['smoke', '--target', 'preview', '--url', 'https://pr-12.example.test'], { dir: s.repo.dir, fake: s.fake });
-  assert.equal(noSha.json.sha, null);
-  assertOnlyFails(s.gate(), 'preview');
+test('final-gate: a configured preview adds no check: the gate carries exactly the canonical checks and needs no preview smoke or deployment', () => {
+  const r = scenario({ preview: true }).gate();
+  assertExit(r, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
+  assert.deepEqual(r.json.checks.map((c) => c.name), [...CANONICAL_CHECKS]);
 });
 
 // ---- smoke ----------------------------------------------------------------------------------------
@@ -378,32 +358,4 @@ test('final-gate: no configured required checks and none reported by branch prot
   assertExit(explicit, 0, JSON.stringify(explicit.json?.checks.filter((c) => !c.ok)));
   assert.match(named(explicit.json, 'ci').detail, /all check/);
   assertOnlyFails(scenario({ yml: pipelineYml('gate', []), gh: { requiredCi: 'error', ci: [] } }).gate(), 'ci', /no CI checks reported/);
-});
-
-// ---- final-gate: preview is confirmed through GitHub deployments -----------------------------------
-
-test('final-gate: a self-attested preview smoke is not enough without a successful GitHub deployment for the head (reviewer repro I)', () => {
-  const smoke = (head) => ({ ok: true, sha: head, url: 'https://example.com/anything' });
-  // the record names an arbitrary URL and the head; GitHub knows no deployment at all
-  assertOnlyFails(scenario({ preview: true, previewSmoke: smoke, gh: { previewDeploy: null } }).gate(), 'preview', /no successful Preview deployment/);
-  // GitHub has a deployment, but at its own URL
-  assertOnlyFails(scenario({ preview: true, previewSmoke: smoke }).gate(), 'preview', /origin/);
-  // the deployment is for another commit, failed, or the deployments API is unreachable
-  const ok = (head) => ({ ok: true, sha: head, url: PREVIEW_URL });
-  assertOnlyFails(scenario({ preview: true, previewSmoke: ok, gh: { previewDeploy: { url: PREVIEW_URL, sha: 'e'.repeat(40) } } }).gate(), 'preview', /deployment/);
-  assertOnlyFails(scenario({ preview: true, previewSmoke: ok, gh: { previewDeploy: { url: PREVIEW_URL, state: 'failure' } } }).gate(), 'preview', /no successful Preview deployment/);
-  const down = scenario({ preview: true, previewSmoke: ok, gh: { previewDeploy: undefined, extra: [{ match: 'deployments', code: 1, stderr: 'HTTP 500' }] } });
-  assertOnlyFails(down.gate(), 'preview', /no successful Preview deployment/); // fails closed: a failed lookup is never read as a deployment
-});
-
-test('final-gate: the preview deployment is matched by origin (path and query may differ) in the configured environment', () => {
-  const s = scenario({ preview: true, previewSmoke: (head) => ({ ok: true, sha: head, url: `${PREVIEW_URL}/some/page?x=1` }) });
-  const r = s.gate();
-  assertExit(r, 0, JSON.stringify(r.json?.checks.filter((c) => !c.ok)));
-  assert.ok(s.fake.lines().some((l) => /deployments\?sha=[0-9a-f]{40}&environment=Preview/.test(l)), s.fake.lines().join('\n'));
-  // a look-alike host is a different origin
-  const evil = scenario({ preview: true, previewSmoke: (head) => ({ ok: true, sha: head, url: 'https://pr-12.example.test.evil.example/' }) });
-  assertOnlyFails(evil.gate(), 'preview', /origin/);
-  const noUrl = scenario({ preview: true, previewSmoke: (head) => ({ ok: true, sha: head }) });
-  assertOnlyFails(noUrl.gate(), 'preview', /no usable url/);
 });

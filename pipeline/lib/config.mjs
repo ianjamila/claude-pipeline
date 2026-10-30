@@ -110,7 +110,9 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
 const EFFORT_LANES = ['low', 'medium', 'high', 'followup'];
 const OWNER_APPROVALS = ['label', 'chat'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];
-// Who owns the production smoke: the ship session (prod-watch) or a CI workflow that posts the result on the merged PR.
+// Who owns the production smoke: a session or a CI workflow that posts the result on the merged PR.
+// `preview` and `production` are validated exactly as before, but the final gate and `pipeline merge` no longer read them;
+// only `pipeline smoke` reads `production` (and `agent-log close` the watch mode).
 const WATCH_MODES = ['session', 'workflow'];
 const AFTER_FIX_MODES = ['full', 'quick'];
 // Lowercase "x-" + 1..60 of [a-z0-9-]: no standard header (authorization, cookie, ...) can match, so the smoke can never

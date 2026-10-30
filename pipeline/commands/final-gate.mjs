@@ -9,7 +9,7 @@ import { GATE_FILE, evaluateGate, removeReviewFile } from '../lib/finalgate.mjs'
 import { writeReviewJson } from '../lib/cmd-io.mjs';
 
 export const meta = {
-  summary: 'prove this PR head is verified, reviewed, CI-green and smoked; writes .review/final-gate.json',
+  summary: 'prove this PR head is verified, reviewed, and CI-green; writes .review/final-gate.json',
   usage: 'pipeline final-gate --pr N [--repo DIR]   -> {ok, repo, pr, base, head, tree, contentHash, checks[{name,ok,detail}], failed[], at, proofs?}; exit 0 all checks pass, 1 any fails (pr-open detail starts "behind-base:" when the PR is behind its base: update the branch and re-verify), 3 GitHub unavailable',
 };
 

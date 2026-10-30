@@ -140,14 +140,13 @@ test('gateRefusals: every mismatch is refused, each with its own reason', () => 
 
 test('gateRefusals: the check-name set is pinned: every canonical check, once, and nothing else', () => {
   assert.deepEqual([...CANONICAL_CHECKS], ['pr-open', 'labels', 'preflight', 'verify-report', 'hardstops', 'integrity', 'review', 'ci']);
-  assert.deepEqual(expectedCheckNames(false), [...CANONICAL_CHECKS]);
-  assert.deepEqual(expectedCheckNames(true), [...CANONICAL_CHECKS, 'preview']);
-  assert.deepEqual(refusals(goodGate({ checks: checksOf(expectedCheckNames(true)) }), { previewConfigured: true }), []);
+  assert.deepEqual(expectedCheckNames(), [...CANONICAL_CHECKS]);
+  assert.deepEqual(expectedCheckNames(true), [...CANONICAL_CHECKS], 'no argument changes the set: a configured preview adds no check');
+  assert.deepEqual(refusals(goodGate({ checks: checksOf(expectedCheckNames()) })), []);
   assert.match(refusals(goodGate({ checks: [{ name: 'x', ok: true }] })).join(), /missing canonical check\(s\): pr-open, labels, preflight, verify-report, hardstops, integrity, review, ci/);
   assert.match(refusals(goodGate({ checks: checksOf().filter((c) => c.name !== 'ci') })).join(), /missing canonical check\(s\): ci$/);
   assert.match(refusals(goodGate({ checks: checksOf(CANONICAL_CHECKS.filter((n) => n !== 'review')) })).join(), /missing canonical check\(s\): review/);
-  assert.match(refusals(goodGate(), { previewConfigured: true }).join(), /missing canonical check\(s\): preview/);
-  assert.match(refusals(goodGate({ checks: checksOf(expectedCheckNames(true)) })).join(), /unexpected check\(s\): preview/);
+  assert.match(refusals(goodGate({ checks: checksOf([...CANONICAL_CHECKS, 'preview']) })).join(), /unexpected check\(s\): preview/);
   assert.match(refusals(goodGate({ checks: [...checksOf(), { name: 'bonus', ok: true }] })).join(), /unexpected check\(s\): bonus/);
   assert.match(refusals(goodGate({ checks: [...checksOf(), { name: 'ci', ok: true }] })).join(), /more than once/);
   assert.match(refusals(goodGate({ checks: [...checksOf().slice(0, 7), null] })).join(), /failing or missing checks/);

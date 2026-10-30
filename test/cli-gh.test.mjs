@@ -347,64 +347,6 @@ test('comment: bad arguments are usage errors, a gh failure is exit 3', () => {
   assertExit(cli(['comment', '--pr', '4', '--kind', 'triage'], { repo, fake: createFakeGh([{ match: '.', code: 1, stderr: 'HTTP 500' }]) }), 3);
 });
 
-// ---- deploy url -----------------------------------------------------------------------------
-
-const SHA = 'a'.repeat(40);
-const deployArgs = (...extra) => ['deploy', 'url', '--sha', SHA, '--environment', 'Preview', '--timeout', '0', ...extra];
-
-test('deploy url: success exits 0 with the URL', () => {
-  const fake = createFakeGh([
-    REPO,
-    { match: 'deployments\\?sha=', stdoutJson: [{ id: 7, sha: SHA, created_at: '2026-10-01T00:00:00Z' }] },
-    { match: 'deployments/7/statuses', stdoutJson: [{ state: 'success', environment_url: 'https://preview.example' }] },
-  ]);
-  const r = cli(deployArgs(), { repo: repoWith(), fake });
-  assertExit(r, 0);
-  assert.deepEqual([r.json.ok, r.json.url, r.json.id], [true, 'https://preview.example', 7]);
-  assert.ok(fake.lines().includes(`api repos/acme/widgets/deployments?sha=${SHA}&environment=Preview&per_page=30`));
-});
-
-test('deploy url: a failed deployment exits 1', () => {
-  const fake = createFakeGh([
-    REPO,
-    { match: 'deployments\\?sha=', stdoutJson: [{ id: 7, sha: SHA }] },
-    { match: 'deployments/7/statuses', stdoutJson: [{ state: 'failure', log_url: 'https://logs.example' }] },
-  ]);
-  const r = cli(deployArgs(), { repo: repoWith(), fake });
-  assertExit(r, 1);
-  assert.deepEqual([r.json.ok, r.json.state, r.json.url], [false, 'failure', 'https://logs.example']);
-});
-
-test('deploy url: no deployment in time exits 3', () => {
-  const fake = createFakeGh([REPO, { match: 'deployments\\?sha=', stdoutJson: [] }]);
-  const r = cli(deployArgs(), { repo: repoWith(), fake });
-  assertExit(r, 3);
-  assert.equal(r.json.state, 'timeout');
-});
-
-test('deploy url: a still-pending deployment is polled again and then times out (exit 3)', () => {
-  const fake = createFakeGh([
-    REPO,
-    { match: 'deployments\\?sha=', stdoutJson: [{ id: 7, sha: SHA }] },
-    { match: 'deployments/7/statuses', stdoutJson: [{ state: 'in_progress' }] },
-  ]);
-  // A 6 s budget with a 1 s poll: each loop spawns the fake gh twice, and under machine load one loop alone can take over a
-  // second, so `--timeout 1` timed out before a second poll could happen (flake, not a product bug).
-  const r = cli(['deploy', 'url', '--sha', SHA, '--environment', 'Preview', '--timeout', '6', '--poll', '1'], { repo: repoWith(), fake });
-  assertExit(r, 3);
-  assert.ok(fake.lines().filter((l) => l.includes('/statuses')).length >= 2);
-});
-
-test('deploy url: usage errors (missing flags, short sha) exit 2', () => {
-  const repo = repoWith();
-  const fake = createFakeGh([]);
-  assertExit(cli(['deploy', 'url', '--environment', 'Preview'], { repo, fake }), 2);
-  assertExit(cli(['deploy', 'url', '--sha', SHA], { repo, fake }), 2);
-  assertExit(cli(['deploy', 'url', '--sha', 'abc123', '--environment', 'P'], { repo, fake }), 2);
-  assertExit(cli(['deploy', '--sha', SHA, '--environment', 'P'], { repo, fake }), 2);
-  assert.equal(fake.calls().length, 0);
-});
-
 // ---- resume ---------------------------------------------------------------------------------
 
 test('resume list: open PRs labelled awaiting-review, each with a why', () => {

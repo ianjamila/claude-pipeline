@@ -66,6 +66,8 @@ merge:
   command: gh pr merge {pr} --squash --auto --delete-branch --match-head-commit {sha}
   wait_minutes: 15
 
+# preview and production are still validated, but the final gate and `pipeline merge` no longer read them: there is no
+# deployment lookup, no preview check, no rollback target and no production watch. Only `pipeline smoke` reads production.
 preview: null
 #  provider: github-deployments
 #  environment: Preview
@@ -76,18 +78,13 @@ production: null
 #  provider: vercel
 #  environment: Production
 #  deploy_timeout_minutes: 20
-#  watch: session               # session (default): ship runs prod-watch (smoke + rollback). workflow: a CI workflow of yours
-#                               # owns the production smoke and posts `<!-- prod-smoke-result v=1 … -->` comments (as
-#                               # github-actions[bot]) on the merged PR; ship never runs prod-watch or rolls back, and
+#  watch: session               # session (default) | workflow: a CI workflow of yours owns the production smoke and posts
+#                               # `<!-- prod-smoke-result v=1 … -->` comments (as github-actions[bot]) on the merged PR;
 #                               # `pipeline agent-log close` copies those results into the agent log.
 #  smoke: node scripts/pipeline/smoke.mjs --base {url} --production
-#  rollback:                    # required by validation, but `command` is documentation for humans only:
-#    command: vercel rollback <known-good-deployment> --yes   # what prod-watch runs for provider "vercel": see below
+#  rollback:                    # required by validation; `command` is documentation for humans only (nothing runs it)
+#    command: vercel rollback <known-good-deployment> --yes
 #    notes: After a rollback Vercel stops auto-assigning production domains until you promote a deployment.
-#  # prod-watch never executes rollback.command. For provider "vercel" it runs the Vercel CLI itself, from the
-#  # linked project checkout: `vercel rollback <known-good> --yes --timeout 3m`, where <known-good> is the deployment
-#  # production served just before the merge (`pipeline merge` records it in .review/prod-before.json). For provider
-#  # "other" nothing is automatic: it opens a needs-human issue and prints rollback.command for a person to run.
 
 smoke_checks: []               # GET-only, unauthenticated: [{path: /, status: [200], contains: ["…"]}]
 # smoke_bypass_header: x-smoke-key   # optional, default null. NAME of one extra request header the smoke sends to the

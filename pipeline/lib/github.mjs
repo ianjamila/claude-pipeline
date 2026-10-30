@@ -400,15 +400,6 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       throw failure(r, args);
     },
 
-    deployments({ sha, environment } = {}) {
-      const q = [];
-      if (sha) q.push(`sha=${encodeURIComponent(sha)}`);
-      if (environment) q.push(`environment=${encodeURIComponent(environment)}`);
-      q.push(`per_page=${PER_PAGE}`);
-      return getJson(['api', `repos/${self.repo().slug}/deployments?${q.join('&')}`]);
-    },
-    deploymentStatuses: (id) => getJson(['api', `repos/${self.repo().slug}/deployments/${Number(id)}/statuses?per_page=${PER_PAGE}`]),
-
     // gh exits 8 while checks are pending and 1 when some failed, and still prints the JSON; only a
     // reply that is not JSON (auth error, "no checks reported") is a failure.
     checks(n, { required = false } = {}) {
