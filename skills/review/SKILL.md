@@ -14,7 +14,8 @@ number, `R` a review round, `<slug>` 2–5 lowercase words from the request.
 
 ## Rules
 
-1. Only the owner merges. You never run `gh pr merge` or the repo's merge command yourself, never push to `main`/`master`
+1. Only the owner decides a merge: the one merge you run is `P merge --pr N --owner-go`, after the owner's own "merge" for that head
+   (3.3). You never run `gh pr merge` or the repo's merge command yourself, never push to `main`/`master`
    or force-push (`git push -u origin agent/<slug>`), never add `human-approved` / `test-change-approved`, never remove
    `needs-human` / `pipeline-blocked` / `pipeline-pause` / `pipeline-rollback`. The guards block these; don't route around them.
 2. No cross-model review, no merge. Codex unavailable (`exitCode: 3`) ⇒ `gh pr edit N --add-label awaiting-review`,
@@ -108,10 +109,14 @@ items end in `needs-human` (as in step 6): the owner rules outside this session.
 1. `P review-complete --pr N` (HEAD pushed and equal to the PR head). Exit 0 posts the marker comment and takes `awaiting-review` off. Exit 1 ⇒ read
    `reason` (a commit since the last round, an unmarked ACCEPT, a Fable pass owed) and go back to the round it names. Any later commit that changes
    the code needs another round and another `review-complete`.
-2. Only after that exit 0: `gh pr ready N`. CI runs now and is the full proof: `P job start ci -- gh pr checks N --watch --required`, `P job wait ci …`.
-   Red ⇒ implementer fix, push, back to step 1 of this section. Base moved ⇒ `P update-branch --pr N`, `git pull --ff-only`, review again if content changed.
+2. Only after that exit 0: high risk (1.5's `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured); then `gh pr ready N`.
+   CI runs now and is the full proof. Checks can take a few seconds to appear (`gh pr checks --watch` exits 1 "no checks reported"), so poll first:
+   `P job start ci -- bash -c 'for i in 1 2 3 4 5 6 7 8 9 10 11 12; do gh pr checks N --required >/dev/null 2>&1; [ $? -ne 1 ] && break; sleep 10; done; gh pr checks N --watch --required'`,
+   then `P job wait ci …`. `owner_approval: label` with a blocking item noted at 1.5: the guard checks reporting just those items are
+   expected to be red — that is not a fix target: park (section 2) once the other checks are green.
+   Any other red ⇒ implementer fix, push, back to step 1 of this section. Base moved ⇒ `P update-branch --pr N`, `git pull --ff-only`, review again if content changed.
 3. **STOP** (outcome `awaiting-owner-merge`; `owner_approval: label` with a blocking item parks instead, no merge request): run the stop ritual first, then tell the owner in plain English what changed, the PR link, the review outcome and
-   follow-up issues. Which ending depends on the item note from 1.5 (re-run 1.5 first if a review fix touched files it had not seen):
+   follow-up issues. Which ending depends on the item note from 1.5 (re-run 1.5 first if any review fix landed since):
    - **Any `blocking` / `ownerMerge` / test-integrity item** (always the case for a protected-area PR under `owner_approval: chat`): NO `Head …` / `🔀` lines
      (`P merge --owner-go` refuses such a diff) and no `needs-human` label. Say the PR is reviewed and CI is green, name the protected areas it touches
      (from `.review/hardstops.json` and `P integrity`), and give the repo's `merge.command` from `P config` with `{pr}` = N and `{sha}` = the head sha
