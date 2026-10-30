@@ -268,7 +268,7 @@ async function evaluateCandidates(repo, { gh, mode, dryRun, env, runId, runStart
 function liveReport(scan) {
   if (!scan) return null;
   if (!scan.available) return { available: false, reason: scan.reason };
-  return { available: true, open: scan.sessions.length, ...(scan.unplaced.length ? { unplaced: scan.unplaced } : {}) };
+  return { available: true, open: new Set(scan.sessions.map((s) => `${s.id} ${s.pid}`)).size, ...(scan.unplaced.length ? { unplaced: scan.unplaced } : {}) };
 }
 
 // Size and newest mtime of a path, symlinks never followed, at most MEASURE_CAP entries (then `partial: true`).

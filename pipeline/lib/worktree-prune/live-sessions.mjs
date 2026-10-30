@@ -31,12 +31,16 @@ const isAbs = (p) => typeof p === 'string' && (p.startsWith('/') || /^[A-Za-z]:[
 const goneCode = (err) => err?.code === 'ENOENT' || err?.code === 'ENOTDIR';
 
 // $CLAUDE_CONFIG_DIR plus every <home>/.claude* directory, de-duplicated by realpath (the same set defaultTranscriptDirs
-// reads, but by config dir: two accounts share projects/ through a symlink yet each has its own sessions/).
-export function claudeConfigDirs(home = os.homedir(), env = process.env) {
+// reads, but by config dir: two accounts share projects/ through a symlink yet each has its own sessions/). Only "is not
+// there" (ENOENT/ENOTDIR) is absence; any other failure to list the home or resolve a candidate (EACCES, ELOOP, EIO, ...) means
+// a config dir may exist that we cannot look into, so it is pushed onto `problems` for the caller to treat as unplaced.
+export function claudeConfigDirs(home = os.homedir(), env = process.env, problems = []) {
   let named = [];
   try {
     named = readdirSync(home).filter((n) => /^\.claude/.test(n)).sort();
-  } catch { /* no readable home: only CLAUDE_CONFIG_DIR, if any */ }
+  } catch (err) {
+    if (!goneCode(err)) problems.push(`cannot list ${home} (${err?.code ?? oneLine(err)})`);
+  }
   const wanted = [env.CLAUDE_CONFIG_DIR && path.resolve(env.CLAUDE_CONFIG_DIR), ...named.map((n) => path.join(home, n))];
   const seen = new Set();
   const dirs = [];
@@ -45,7 +49,8 @@ export function claudeConfigDirs(home = os.homedir(), env = process.env) {
     try {
       real = realpathSync(dir);
       if (!statSync(real).isDirectory()) continue; // ~/.claude.json and its backups
-    } catch {
+    } catch (err) {
+      if (!goneCode(err)) problems.push(`cannot resolve ${dir} (${err?.code ?? oneLine(err)})`);
       continue;
     }
     if (seen.has(real)) continue;
@@ -140,19 +145,37 @@ function findTranscript(projects, session) {
   return null;
 }
 
-// Where one open session is: its transcript's last cwd, else the record's start folder, else null. Throws when a transcript
-// that exists cannot be read.
-function placeSession(rec) {
-  const transcript = findTranscript(path.join(rec.config, 'projects'), rec);
-  let cwd = null;
-  if (transcript !== null) {
+// Where one open session is: the last cwd of its transcript, else the record's start folder; [] when neither is known. A
+// session is listed in the config dir of the account that runs it, but two accounts may list the same one and the first one
+// scanned may hold no transcript, so EVERY config dir's projects/ is searched (own first; a projects/ shared through a symlink
+// is looked at once). When several hold one, ALL their last cwds are returned and any of them inside a worktree keeps it:
+// modification times cannot pick the live one (an idle session's files are all static, and a copy of a transcript is newer
+// than the original), so only "any of them" cannot fail open. Throws when a transcript that exists cannot be read.
+function placeSession(rec, configs) {
+  const cwds = [];
+  const looked = new Set();
+  for (const config of [rec.config, ...configs.filter((c) => c !== rec.config)]) {
+    let projects;
+    try {
+      projects = realpathSync(path.join(config, 'projects'));
+    } catch (err) {
+      if (goneCode(err)) continue;
+      throw err;
+    }
+    if (looked.has(projects)) continue;
+    looked.add(projects);
+    const transcript = findTranscript(projects, rec);
+    if (transcript === null) continue;
+    let cwd = null;
     try {
       cwd = lastCwd(transcript);
     } catch (err) {
       if (err?.code !== 'ENOENT') throw err; // (gone since it was found: as if there were none)
     }
+    if (cwd !== null && !cwds.includes(cwd)) cwds.push(cwd);
   }
-  return cwd ?? (isAbs(rec.cwd) ? rec.cwd : null);
+  if (cwds.length) return cwds;
+  return isAbs(rec.cwd) ? [rec.cwd] : [];
 }
 
 // -> { records: [{ pid, sessionId, cwd, procStart, config }], unplaced: string[], sawDir } from every <config>/sessions/<pid>.json.
@@ -194,14 +217,18 @@ function readRecords(configs) {
 }
 
 // Every open Claude Code session and where it is now. -> { available: false, reason } | { available: true, sessions:
-// [{ id (first 8 of the session id), pid, cwd }], unplaced: [reason, ...] }. Never throws. Options (all test seams):
+// [{ id (first 8 of the session id), pid, cwd }], unplaced: [reason, ...] } (a session whose transcripts disagree has one entry
+// per cwd). Never throws. Options (all test seams):
 // `home`/`env` pick the config dirs, `platform` gates ps (only macOS and Linux have it; processesInside is "unavailable"
 // elsewhere too), `starts(pids)` replaces the ps call (-> Map<pid, start> | null).
 export function scanLiveSessions({ home = os.homedir(), env = process.env, platform = process.platform, starts = psStarts } = {}) {
   try {
     if (platform !== 'darwin' && platform !== 'linux') return { available: false, reason: `not supported on ${platform}` };
-    const { records, unplaced, sawDir } = readRecords(claudeConfigDirs(home, env));
-    if (!sawDir) return { available: false, reason: 'no Claude sessions folder found' };
+    const problems = [];
+    const configs = claudeConfigDirs(home, env, problems);
+    const { records, unplaced, sawDir } = readRecords(configs);
+    unplaced.unshift(...problems); // a config dir we could not look into: the scan is partial, so it is not "unavailable"
+    if (!sawDir && problems.length === 0) return { available: false, reason: 'no Claude sessions folder found' };
     const running = records.length ? starts([...new Set(records.map((r) => r.pid))]) : new Map();
     if (running === null || running === undefined) {
       unplaced.push('ps failed, so open Claude sessions cannot be told apart from finished ones');
@@ -230,9 +257,9 @@ export function scanLiveSessions({ home = os.homedir(), env = process.env, platf
       }
       seen.add(rec.sessionId); // both accounts list a session they share: count it once
       try {
-        const cwd = placeSession(rec);
-        if (cwd === null) unplaced.push(`${label}: working folder unknown`);
-        else sessions.push({ id: rec.sessionId.slice(0, 8), pid: rec.pid, cwd });
+        const cwds = placeSession(rec, configs);
+        if (cwds.length === 0) unplaced.push(`${label}: working folder unknown`);
+        for (const cwd of cwds) sessions.push({ id: rec.sessionId.slice(0, 8), pid: rec.pid, cwd });
       } catch (err) {
         unplaced.push(`${label}: transcript unreadable (${err?.code ?? oneLine(err)})`);
       }
@@ -257,8 +284,9 @@ export function liveSessionsIn(scan, spellings) {
     } catch { /* gone, or not readable: only the logged spelling */ }
     return [...new Set([cwd, real].map(unFirm))];
   };
-  const hits = scan.sessions
-    .filter((s) => forms(s.cwd).some((c) => roots.some((r) => isInside(c, r))))
-    .map(({ id, pid }) => ({ id, pid }));
+  const hits = [];
+  for (const s of scan.sessions) {
+    if (forms(s.cwd).some((c) => roots.some((r) => isInside(c, r))) && !hits.some((h) => h.id === s.id && h.pid === s.pid)) hits.push({ id: s.id, pid: s.pid });
+  }
   return { hits, unplaced: scan.unplaced ?? [] };
 }

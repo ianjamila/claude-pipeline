@@ -212,6 +212,119 @@ test('the second account is read too: a session only it lists is found', () => {
   assert.deepEqual(w.inWt([11, 31]).hits, [{ id: 'ffffffff', pid: 31 }]);
 });
 
+// R1-B1: a session is placed by the transcripts of EVERY config dir, not only of the account that was scanned first.
+test('the account scanned first has no transcript: the other account that lists the session is searched before the start folder is used', () => {
+  const w = world();
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wt], ageHours: 48 }); // record + transcript under .claude
+  mkdirSync(join(w.home, '.claude-two', 'sessions'), { recursive: true }); // a copy of the record, no projects/ at all
+  copyFileSync(join(w.home, '.claude', 'sessions', '11.json'), join(w.home, '.claude-two', 'sessions', '11.json'));
+  const first = w.scan([11], { env: { CLAUDE_CONFIG_DIR: join(w.home, '.claude-two') } }); // .claude-two is scanned FIRST
+  assert.deepEqual(first.sessions, [{ id: 'aaaaaaaa', pid: 11, cwd: w.wt }], 'placed by the transcript, not by the start folder (home)');
+  assert.deepEqual(liveSessionsIn(first, pathSpellings(w.wt)).hits, [{ id: 'aaaaaaaa', pid: 11 }]);
+  const other = w.scan([11], { env: { CLAUDE_CONFIG_DIR: join(w.home, '.claude') } });
+  assert.deepEqual(other.sessions, first.sessions, 'the same either way round');
+});
+
+test('a transcript under another account\'s projects/ places the session even though only the first account has its live record', () => {
+  const w = world();
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111' }); // the record only (under .claude), no transcript there
+  w.addSession({ config: '.claude-two', pid: 99, sid: 'aaaaaaaa-1111', lines: [w.wt] }); // someone else's record of it, with the transcript
+  const scan = w.scan([11]);
+  assert.deepEqual(scan.sessions, [{ id: 'aaaaaaaa', pid: 11, cwd: w.wt }]);
+});
+
+test('two accounts that each hold a transcript of the session: it is wherever ANY of them says (no guessing from modification times)', () => {
+  const sid = 'aaaaaaaa-1111';
+  // .claude holds the older transcript (48 h), .claude-two the newer (1 h); each says where the session is: 'wt' or 'elsewhere'
+  const twoAccounts = (olderSays, newerSays) => {
+    const h = world();
+    h.addSession({ pid: 11, sid, lines: [h[olderSays]], ageHours: 48 });
+    h.addSession({ config: '.claude-two', pid: 11, sid, lines: [h[newerSays]], ageHours: 1 });
+    const scan = h.scan([11]);
+    return { h, scan, hits: liveSessionsIn(scan, pathSpellings(h.wt)).hits };
+  };
+  // the older transcript says "in the worktree", the newer "elsewhere" (a stale copy can be the newer file): kept
+  let r = twoAccounts('wt', 'elsewhere');
+  assert.deepEqual(r.scan.sessions.map((x) => x.cwd).sort(), [r.h.elsewhere, r.h.wt].sort(), 'both places are reported');
+  assert.deepEqual(r.hits, [{ id: 'aaaaaaaa', pid: 11 }], 'one hit, not one per transcript');
+  // the other way round: kept too
+  assert.equal(twoAccounts('elsewhere', 'wt').hits.length, 1);
+  // both say somewhere inside the worktree: two entries (two cwds), still ONE hit
+  const both = world();
+  both.addSession({ pid: 11, sid, lines: [both.wt] });
+  both.addSession({ config: '.claude-two', pid: 11, sid, lines: [join(both.wt, 'app')] });
+  const bothScan = both.scan([11]);
+  assert.equal(bothScan.sessions.length, 2);
+  assert.deepEqual(liveSessionsIn(bothScan, pathSpellings(both.wt)).hits, [{ id: 'aaaaaaaa', pid: 11 }]);
+  // both say elsewhere: not kept, and identical answers are one entry
+  r = twoAccounts('elsewhere', 'elsewhere');
+  assert.deepEqual(r.scan.sessions.map((x) => x.cwd), [r.h.elsewhere]);
+  assert.deepEqual(r.hits, []);
+});
+
+test('a projects/ shared between two accounts through a symlink is looked at once', { skip: WIN && 'symlinks need privileges on Windows CI' }, () => {
+  const w = world();
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wt] });
+  mkdirSync(join(w.home, '.claude-two', 'sessions'), { recursive: true });
+  symlinkSync(join(w.home, '.claude', 'projects'), join(w.home, '.claude-two', 'projects'));
+  copyFileSync(join(w.home, '.claude', 'sessions', '11.json'), join(w.home, '.claude-two', 'sessions', '11.json'));
+  assert.deepEqual(w.scan([11], { env: { CLAUDE_CONFIG_DIR: join(w.home, '.claude-two') } }).sessions, [{ id: 'aaaaaaaa', pid: 11, cwd: w.wt }]);
+});
+
+// R1-B2: only "is not there" is absence; a config dir we could not look into makes the scan partial, which keeps everything.
+test('fails closed: a home folder that cannot be listed is "could not be placed", not "no sessions folder"', { skip: (WIN && 'chmod 000 is not enforced on Windows') || (ROOT && 'root lists any directory') }, () => {
+  const w = world();
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111', lines: [w.elsewhere] });
+  chmodSync(w.home, 0);
+  try {
+    const scan = w.scan([11]);
+    assert.equal(scan.available, true, 'not "unavailable": that would keep nothing');
+    assert.deepEqual(scan.sessions, []);
+    assert.match(scan.unplaced[0], /^cannot list .*home \(EACCES\)$/);
+    assert.match(liveSessionReasons(liveSessionsIn(scan, pathSpellings(w.wt)))[0], /^an open Claude session could not be placed: cannot list /);
+  } finally {
+    chmodSync(w.home, 0o755);
+  }
+});
+
+test('fails closed: a CLAUDE_CONFIG_DIR behind a folder we may not enter is unplaced; the other accounts are still scanned', { skip: (WIN && 'chmod 000 is not enforced on Windows') || (ROOT && 'root enters any directory') }, () => {
+  const w = world();
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wt] });
+  const locked = join(w.base, 'locked');
+  mkdirSync(join(locked, 'cfg', 'sessions'), { recursive: true });
+  chmodSync(locked, 0);
+  try {
+    const scan = w.scan([11], { env: { CLAUDE_CONFIG_DIR: join(locked, 'cfg') } });
+    assert.match(scan.unplaced[0], /^cannot resolve .*cfg \(EACCES\)$/);
+    assert.deepEqual(scan.sessions.map((x) => x.pid), [11], 'the readable account is still scanned');
+  } finally {
+    chmodSync(locked, 0o755);
+  }
+});
+
+test('fails closed: a config dir that cannot be resolved for another reason (a symlink loop) is unplaced', { skip: WIN && 'symlinks need privileges on Windows CI' }, () => {
+  const w = world();
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111', lines: [w.elsewhere] });
+  symlinkSync(join(w.home, '.claude-loop'), join(w.home, '.claude-loop'));
+  const scan = w.scan([11]);
+  assert.match(scan.unplaced[0], /^cannot resolve .*\.claude-loop \(ELOOP\)$/);
+  assert.equal(scan.available, true);
+});
+
+test('a CLAUDE_CONFIG_DIR (or a ~/.claude* link) that is simply not there is absence: nothing unplaced, the other accounts are scanned', { skip: WIN && 'symlinks need privileges on Windows CI' }, () => {
+  const w = world();
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wt] });
+  symlinkSync(join(w.base, 'nowhere'), join(w.home, '.claude-gone')); // dangling
+  writeFileSync(join(w.home, '.claude.json'), '{}'); // a file, not a config dir
+  const scan = w.scan([11], { env: { CLAUDE_CONFIG_DIR: join(w.base, 'does-not-exist') } });
+  assert.deepEqual(scan.unplaced, []);
+  assert.deepEqual(scan.sessions.map((x) => x.pid), [11]);
+  assert.deepEqual(claudeConfigDirs(w.home, { CLAUDE_CONFIG_DIR: join(w.base, 'does-not-exist') }).map((d) => basename(d)), ['.claude']);
+  // and with no usable config dir at all it is still just "unavailable"
+  const empty = world();
+  assert.deepEqual(empty.scan([], { env: { CLAUDE_CONFIG_DIR: join(empty.base, 'does-not-exist') } }), { available: false, reason: 'no Claude sessions folder found' });
+});
+
 test('no sessions folder anywhere: the signal is unavailable and says nothing about any worktree', () => {
   const w = world();
   mkdirSync(join(w.home, '.claude', 'projects'), { recursive: true });
