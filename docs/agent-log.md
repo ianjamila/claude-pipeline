@@ -86,3 +86,4 @@ full record.
 - 2026-10-29 · #108 · Base-only review rounds don't count toward max_rounds · risk high · rounds 4 · arbiter 3 · merged
 - 2026-10-30 · #118 · Review only the conflict resolution after a main merge (uncounted round) — #117 · risk high · rounds 3 · arbiter 2 · needs-human
 - 2026-10-30 · #121 · fix(review): resolution-only rounds tolerate clean hunks in a conflicted file; bounded search; pinned rename config · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
+- 2026-10-30 · #121 · fix(review): resolution-only rounds tolerate clean hunks in a conflicted file; bounded search; pinned rename config · risk high · rounds 4 · arbiter 3 · merged
