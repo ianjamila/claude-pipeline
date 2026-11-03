@@ -197,3 +197,91 @@ test('text that only mentions claude is not a run', () => {
     'gh issue view 132 --json title',
   ]) assert.equal(decide(command), 'allow', command);
 });
+
+// ---- review round 1 (#133) ----
+
+test('R1-B1: a backslash inside the name is still claude (the shell removes it)', () => {
+  for (const command of [
+    'clau\\de -p hi',
+    'clau\\de --continue',
+    'cla\\ude -p hi',
+    'alias c=cla\\ude; c -p x',
+    '/opt/homebrew/bin/clau\\de -p x',
+  ]) assert.equal(decide(command), 'deny', command);
+});
+
+test('R1-B2: node options in front of the claude-code package file do not hide it', () => {
+  for (const command of [
+    'node --no-warnings --no-deprecation --trace-warnings --trace-deprecation --trace-uncaught ./node_modules/@anthropic-ai/claude-code/cli.js -p hi',
+    'node --max-old-space-size=4096 --no-warnings --no-deprecation --trace-warnings --stack-trace-limit=50 --enable-source-maps ./node_modules/@anthropic-ai/claude-code/cli.js --continue',
+    'bun --bun --silent --smol --hot --watch --no-install ./node_modules/@anthropic-ai/claude-code/cli.js -p x',
+  ]) assert.equal(decide(command), 'deny', command);
+});
+
+test('R1-B3: an interpreter string that names a claude run is refused', () => {
+  for (const command of [
+    `python3 -c 'import os; os.system("claude -p hi")'`,
+    `node -e 'require("child_process").execSync("claude -p hi")'`,
+    `node -e 'require("child_process").execSync("claude --continue")'`,
+    `perl -e 'system("claude --resume abc")'`,
+    `osascript -e 'do shell script "claude -p hi"'`,
+    `python3 -c "import subprocess; subprocess.run(['claude', '-p', 'hi'])"`,
+    `ruby -e 'system("claude hello")'`,
+  ]) assert.equal(decide(command), 'deny', command);
+});
+
+test('R1-B3: interpreter strings that only mention claude stay allowed', () => {
+  for (const command of [
+    `python3 -c 'print("see ~/.claude and CLAUDE.md and claude-pipeline")'`,
+    `node -e 'console.log(require("os").homedir() + "/.claude/settings.json")'`,
+    `node -e 'console.log("claude --version")'`,
+    `python3 -c 'print("the claude hook")'`,
+  ]) assert.equal(decide(command), 'allow', command);
+});
+
+test('R1-F1: the claude-code cli.js run directly through its shebang is refused', () => {
+  for (const command of [
+    './node_modules/@anthropic-ai/claude-code/cli.js -p hi',
+    '~/.claude/local/node_modules/@anthropic-ai/claude-code/cli.js --continue',
+    '/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js "merge"',
+  ]) assert.equal(decide(command), 'deny', command);
+  assert.equal(decide('./node_modules/@anthropic-ai/claude-code/cli.js --version'), 'allow');
+});
+
+test('R1-F2: a dynamic command name whose claude spelling is split by quotes is refused', () => {
+  for (const command of [
+    '$(echo cla""ude) -p hi',
+    `"$(printf 'cla%s' ude)" --continue`,
+    `$(echo cla''ude) -p hi`,
+    '$(echo cla\\ude) -p hi',
+  ]) assert.equal(decide(command), 'deny', command);
+});
+
+test('R1-F3: hash binds a short name to claude like an alias', () => {
+  for (const command of [
+    'hash -p /opt/homebrew/bin/claude c; c -p hi',
+    'hash c=/opt/homebrew/bin/claude; c -p hi',
+    'hash -p ~/.local/bin/claude c',
+  ]) assert.equal(decide(command), 'deny', command);
+  for (const command of ['hash -r', 'hash git', 'hash -p /usr/bin/git g']) assert.equal(decide(command), 'allow', command);
+});
+
+test('R1-F4: the dynamic-line denial says the command is only known at run time, and prose with a dynamic part is not accused of running the CLI', () => {
+  const v = run('git commit -m "fix claude hook" && $RUN');
+  assert.equal(v.decision, 'deny');
+  assert.ok(String(v.reason).includes('only known at run time'), v.reason);
+  assert.ok(!String(v.reason).includes('only the owner starts'), v.reason);
+  const w = run('C=claude; $C -p x');
+  assert.equal(w.decision, 'deny');
+  assert.ok(String(w.reason).includes('only known at run time'), w.reason);
+});
+
+test('R1: ordinary lines that mention claude as a path or document stay allowed', () => {
+  for (const command of [
+    'cd ~/Claude && ls',
+    'cat CLAUDE.md',
+    'git commit -m "fix claude hook"',
+    'ls ~/Claude/claude-pipeline',
+    'cat ~/.claude/settings.json',
+  ]) assert.equal(decide(command), 'allow', command);
+});
