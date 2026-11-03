@@ -19,7 +19,7 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | skills `review`, `verify`, `pipeline-setup` | the process: review builds the change and runs the cross-model review, then asks you to merge; verify runs the quick check; pipeline-setup onboards a repo |
 | agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `arbiter` (Fable) | the judgment; models are pinned in the agent files and proven from transcripts |
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge) |
-| hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
+| hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, a nested Claude Code conversation (`claude -p`, `--resume`, `--continue`, a prompt), whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
 | hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge") against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
 | hook `stack-register` (PreToolUse on `Bash` and the write tools `Edit\|Write\|MultiEdit\|NotebookEdit`, 30 s) | records which private Supabase stack a session is about to use, before the tool runs; **fail-closed** like the guards (an unloadable file blocks with exit 2) |
@@ -232,6 +232,13 @@ head you did not review (the receipt names the head the event carried).
   words before `--`) is refused in a chat repo; the refusal names the exact form. Merge through `P merge --pr N` otherwise. The chat
   mode is read from the repository the command runs in: a nested or separate clone whose own `pipeline.yml` is not chat is
   not caught (a protected registry of chat repos is the planned fix).
+- **A nested Claude Code run is refused (#132).** Your chat words are the strongest authority the pipeline has, and whether a
+  conversation started from an agent's shell (`claude -p`, `--print`, `--resume`, `--continue`, or a bare prompt) could ever
+  be recorded as you typing is unverified (no agent has probed it, and none may). So guard-git refuses the `claude` CLI from agent
+  Bash in every spelling it can resolve (a path, `command`, `env`, `exec`, `nohup`, `timeout`, `xargs`, `bash -c`, `$( )`,
+  `npx @anthropic-ai/claude-code`, `pnpm dlx`, `bunx`, `node …/claude-code/cli.js`) unless it is `--version`, `--help`, `doctor`,
+  `mcp list|get` or `config get|list`; an option or name only known at run time is refused too. Residual: a program the guard
+  cannot see into (a script that builds the command at run time) can still start one.
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
 - **Quick check locally, CI is the full proof.** The agent runs only `verify.quick` on the changed area; CI runs the full verify, the
