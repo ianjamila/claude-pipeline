@@ -94,3 +94,4 @@ full record.
 - 2026-10-30 · #129 · feat(stacks): an open Claude session keeps its stack at session-end and in the sweep · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge
 - 2026-10-30 · #129 · feat(stacks): an open Claude session keeps its stack at session-end and in the sweep · risk high · rounds 1 · arbiter 1 · merged
 - 2026-11-03 · #133 · guard-git: refuse a nested Claude Code conversation from agent shells (#132) · risk high · rounds 3 · arbiter 3 · needs-human
+- 2026-11-03 · #140 · Owner-granted extra review round, recorded from the owner's chat words · risk high · rounds 3 · arbiter 2 · awaiting-owner-merge
