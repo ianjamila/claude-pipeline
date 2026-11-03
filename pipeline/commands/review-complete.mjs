@@ -130,7 +130,7 @@ export const run = guarded(async (argv, ctx) => {
         return { exitCode: EXIT.FAILED, output: { ok: false, reason: whyNot(state, hash), currentContentHash: hash } };
       }
       // The same proof as the final gate: a round past review.max_rounds must be backed by the owner's record and its marker.
-      const grants = verifyOwnerGrants(state, { repo: gh.repo().slug, pr });
+      const grants = verifyOwnerGrants(state, { repo: gh.repo().slug, pr, maxRounds: config.review.max_rounds });
       if (!grants.ok) return { exitCode: EXIT.FAILED, output: { ok: false, reason: grants.problems.join('; '), currentContentHash: hash } };
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
       const lane = laneProblem(state, root, config, base);

@@ -487,7 +487,7 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   }
   // A round past review.max_rounds must carry the owner's extra-round grant, re-proved here from the owner's record and its marker (never
   // from the state alone). A grant lets a round run; it is no merge authority, so it is shown but never an owner-merge item.
-  const grants = verifyOwnerGrants(state, { repo, pr, ...ownerGo });
+  const grants = verifyOwnerGrants(state, { repo, pr, maxRounds: config?.review?.max_rounds, ...ownerGo });
   if (!grants.ok) return check('review', false, grants.problems.join('; '));
   const grantNote = grants.granted.map((g) => `; owner-granted round ${g.k}: "${clip(g.quote.replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('');
   // owner_approval: chat: an item the owner ruled in chat (an original or a later round's cached copy) never clears the merge by

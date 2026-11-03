@@ -439,7 +439,7 @@ test('verifyOwnerGrants: a forged or mismatched grant fails with the recovery me
   for (const [label, ownerGrant] of Object.entries(cases)) {
     const r = verify(forge(ownerGrant), w);
     assert.equal(r.ok, false, label);
-    assert.match(r.problems.join('; '), /round 4: owner grant cannot be verified on this machine — run the gate on the machine that reviewed it, or `P state discard-round --pr 12 --round 4`, `P triage round-request`, and ask the owner again/, label);
+    assert.match(r.problems.join('; '), /round 4: owner grant cannot be verified on this machine — run the gate on the machine that reviewed it \(the only recovery once the round is published\), or, for an unpublished trailing round only, `P state discard-round --pr 12 --round 4`, `P triage round-request`, and ask the owner again/, label);
   }
   assert.equal(verify(forge(real.ownerGrant), w).ok, true, 'the genuine one passes in the same world');
   assert.match(verify(forge(real.ownerGrant), { home: mkdtempSync(join(tmpdir(), 'other-machine-')) }).problems.join(), CANNOT, 'another machine has no record');
@@ -476,6 +476,25 @@ test('verifyOwnerGrants: a non-finite max_rounds skips the cap rules but still v
   assert.match(verify(saved, w).problems.join(), CANNOT);
 });
 
+test('verifyOwnerGrants: the configured cap is authoritative - a state whose maxRounds is null or larger cannot switch the cap rules off', () => {
+  const w = ownerWorld();
+  const three = [{ admission: 'normal' }, { admission: 'normal' }, { admission: 'normal' }];
+  const forgedNull = JSON.parse(JSON.stringify(granted(three, { max: 1 })));
+  forgedNull.maxRounds = null;
+  assert.equal(verify(forgedNull, w).ok, true, 'without the configured cap a hand-built state is believed (the fallback)');
+  const withCap = verify(forgedNull, w, { maxRounds: 1 });
+  assert.equal(withCap.ok, false);
+  assert.match(withCap.problems.join('; '), /round 3: .*past review\.max_rounds \(1\)/);
+  const looser = granted(three, { max: 5 });
+  const r = verify(looser, w, { maxRounds: 1 });
+  assert.equal(r.ok, false, 'a state that records a larger cap than the configured one fails closed');
+  assert.match(r.problems.join('; '), /maxRounds/);
+  assert.equal(verify(granted(three, { max: 1 }), w, { maxRounds: 1 }).ok, false, 'matching caps: counted round 3 is past max+1 and needs a grant');
+  const ok = granted([{ admission: 'normal' }, { admission: 'auto-extra' }], { max: 1 });
+  assert.equal(verify(ok, w, { maxRounds: 1 }).ok, true, 'a genuine state under the same cap still passes');
+  assert.equal(verify(granted([{ admission: 'normal' }, { admission: 'normal' }], { max: 1 }), w, { maxRounds: 1 }).ok, false, 'normal at max+1 still fails');
+});
+
 // reviewCheck itself: the same verification, with the quote in the detail and no owner-merge item.
 function gateRoot(state) {
   const root = mkdtempSync(join(tmpdir(), 'gate-root-'));
@@ -504,6 +523,16 @@ test('final gate review: the quote in the detail is clipped to 100 characters', 
   assert.equal(r.ok, true, r.detail);
   const shown = /owner-granted round 3: "([^"]*)"/.exec(r.detail)[1];
   assert.ok(shown.length <= 101 && shown.endsWith('\u2026'), shown);
+});
+
+test('final gate review: the configured review.max_rounds is the cap - a state with maxRounds null and ordinary rounds past it fails', () => {
+  const w = ownerWorld();
+  const state = JSON.parse(JSON.stringify(granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'normal' }], { max: 1 })));
+  state.maxRounds = null;
+  assert.equal(reviewOf(state, w).ok, true, 'a config without review.max_rounds falls back to the state');
+  const r = reviewOf(state, w, { config: { review: { max_rounds: 1 } } });
+  assert.equal(r.ok, false);
+  assert.match(r.detail, /past review\.max_rounds \(1\)/);
 });
 
 test('final gate review: a forged grant, a round past max+1 with none, or a wrong admission fails review', () => {

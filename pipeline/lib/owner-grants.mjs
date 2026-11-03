@@ -7,20 +7,28 @@
 //  (b) every counted round with ordinal k > max_rounds + 1 must carry a verified grant;
 //  (c) a counted round at ordinal max_rounds + 1 without a grant is the automatic extra round: accepted when it is recorded
 //      `admission: 'auto-extra'` or has no admission field (a state written before admission was recorded); `'normal'` fails.
-// Any round recorded `admission: 'owner'` must carry its grant. A non-finite max_rounds (JSON turns Infinity into null) skips (b) and (c).
+// Any round recorded `admission: 'owner'` must carry its grant. The cap is the configured review.max_rounds, which both callers pass as
+// `maxRounds` (an integer 1..5): the state's own maxRounds is only a cross-check (a state recording a larger or non-finite cap than the
+// configured one fails closed), because a cap read from the very state being verified could be edited away. Only a caller that passes no
+// cap (a hand-built state) falls back to the state's value, and there a non-finite max_rounds (JSON turns Infinity into null) skips (b) and (c).
 // The ordinal k counts only rounds that count toward the cap (never baseOnly / resolutionOnly); n is the round number in the state.
 import { verifyOwnerGrant } from '../hooks/lib/owner-go.mjs';
 import { countsTowardCap } from './triage.mjs';
 
 // What to do when the owner's record cannot be read here.
-const cannotVerify = (n, pr) => `round ${n}: owner grant cannot be verified on this machine — run the gate on the machine that reviewed it, or \`P state discard-round --pr ${pr} --round ${n}\`, \`P triage round-request\`, and ask the owner again`;
+const cannotVerify = (n, pr) => `round ${n}: owner grant cannot be verified on this machine — run the gate on the machine that reviewed it (the only recovery once the round is published), or, for an unpublished trailing round only, \`P state discard-round --pr ${pr} --round ${n}\`, \`P triage round-request\`, and ask the owner again`;
 
-// -> { ok: true, granted: [{ n, k, quote }] } | { ok: false, problems: [string], granted }. `opts`: { repo, pr, home?, now? }. Never throws.
-export function verifyOwnerGrants(state, { repo, pr, ...opts } = {}) {
+// -> { ok: true, granted: [{ n, k, quote }] } | { ok: false, problems: [string], granted }. `opts`: { repo, pr, maxRounds?, home?, now? }. Never throws.
+export function verifyOwnerGrants(state, { repo, pr, maxRounds, ...opts } = {}) {
   const rounds = Array.isArray(state?.rounds) ? state.rounds : [];
-  const max = state?.maxRounds;
+  const stateMax = state?.maxRounds;
+  const configured = Number.isInteger(maxRounds) && maxRounds >= 1;
+  const max = configured ? maxRounds : stateMax;
   const capped = Number.isFinite(max);
   const problems = [];
+  if (configured && !(Number.isFinite(stateMax) && stateMax <= maxRounds)) {
+    problems.push(`the review state records maxRounds ${JSON.stringify(stateMax ?? null)}, not within the configured review.max_rounds (${maxRounds}): the cap cannot be trusted`);
+  }
   const granted = [];
   let k = 0;
   for (const r of rounds) {

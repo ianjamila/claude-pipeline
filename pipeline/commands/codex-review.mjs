@@ -47,9 +47,9 @@ export const meta = {
     '  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound)',
     '    or ONE round per owner grant (owner_approval: chat only): the owner typed "extra round" after a reply ending with the line triage round-request',
     '    printed, for this repository, PR, counted round and head (an owner record younger than 24 h; the automatic extra round is used first). The',
-    '    grant is claimed AFTER Codex answered, under the final lock, by exclusively creating a machine-global marker (one grant admits one run on',
-    '    this machine): a grant already used, or recorded for another head ("ask again"), is exit 2 round-cap; Codex exit 3, head-moved and a kill',
-    '    leave the grant open. Success adds grantUsed:{grantId}; the round records admission and ownerGrant {grantId, k, quote, ownerTs}',
+    '    grant is claimed AFTER Codex answered, under the final lock, as the last step before the state is saved, by exclusively creating a machine-global marker (one grant admits one run on',
+    '    this machine): a grant already used, or recorded for another head ("ask again"), is exit 2 round-cap; Codex exit 3, head-moved and a kill before the claim',
+    '    leave the grant open (a failure after the claim spends it: ask again). Success adds grantUsed:{grantId}; the round records admission and ownerGrant {grantId, k, quote, ownerTs}',
     '    base-only rounds and resolution-only rounds (below) never count toward the cap',
     '  reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
     '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable',
@@ -149,15 +149,11 @@ export const run = guarded(async (argv, ctx) => {
   // written for the round).
   // An owner grant is looked up only when ordinary admission does not cover the round, and only in chat mode (label mode never grants).
   // The lookup is the owner's records for this PR on github.com (the gh repo), any head: roundAdmission compares the head itself.
+  // The gh repo is resolved eagerly below, before any admission check, in chat mode: roundAdmission swallows what the lookup throws
+  // (no grant), so a GitHub failure here would otherwise read as a round-cap refusal instead of exit 3.
   let ghRepo;
   const ownerRecords = (k) => {
     if (config.owner_approval !== 'chat') return [];
-    try {
-      ghRepo ??= gh.repo();
-    } catch (err) {
-      if (err instanceof GhError) throw unavailable('github', { error: 'unavailable', message: err.message });
-      throw err;
-    }
     if (ghRepo.host !== 'github.com') return [];
     return ownerGrantedRounds({ repo: ghRepo.slug, pr, k, anyHead: true }).map((r) => ({ grantId: grantIdOf(r), head: r.head, quote: r.prompt }));
   };
@@ -184,6 +180,7 @@ export const run = guarded(async (argv, ctx) => {
   let slug;
   try {
     view = gh.prView(pr, ['title', 'body', 'headRefName', 'baseRefName']);
+    if (config.owner_approval === 'chat') ghRepo = gh.repo();
     if (!state) slug = gh.repo().slug;
   } catch (err) {
     if (err instanceof GhError) throw unavailable('github', { error: 'unavailable', message: err.message });
@@ -358,23 +355,27 @@ export const run = guarded(async (argv, ctx) => {
     if (!fresh && slug === undefined) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'state-changed', message: '.review/state.json disappeared while Codex was reviewing; run the round again' });
     }
-    // The owner's grant is claimed here, after Codex, as late as possible: every record that covers this head is consumed together (a duplicate
-    // "extra round" must not admit a second run after discard-round); the first claimer on the machine wins. A failed claim discards Codex's answer.
+    // The owner's grant is read here and claimed just before the state is saved (below), after everything else that can fail has run.
     let ownerGrant;
+    let claimGrant = () => {};
     if (admission === 'owner') {
       const k = reviewedRoundCount(fresh) + 1;
       const records = ownerGrantedRounds({ repo: ghRepo.slug, pr, k, head });
-      const claim = claimGrantMarkers(records, { repo: ghRepo.slug, pr, k, head, checkout: root });
-      if (!claim.ok) {
-        throw new Fail(EXIT.USAGE, {
-          ok: false, error: 'round-cap',
-          message: claim.reason === 'used' || claim.reason === 'none'
-            ? "the owner's extra round was already used (grant already used): ask the owner again (triage round-request)"
-            : `the owner's extra round could not be claimed (${claim.reason}) and is spent: ask the owner again (triage round-request)`,
-        });
-      }
       const newest = records[0];
-      ownerGrant = { grantId: grantIdOf(newest), k, quote: newest.prompt, ownerTs: newest.ts };
+      if (newest !== undefined) ownerGrant = { grantId: grantIdOf(newest), k, quote: newest.prompt, ownerTs: newest.ts };
+      // Every record that covers this head is consumed together (a duplicate "extra round" must not admit a second run after
+      // discard-round); the first claimer on the machine wins. A failed claim discards Codex's answer.
+      claimGrant = () => {
+        const claim = claimGrantMarkers(records, { repo: ghRepo.slug, pr, k, head, checkout: root });
+        if (!claim.ok) {
+          throw new Fail(EXIT.USAGE, {
+            ok: false, error: 'round-cap',
+            message: claim.reason === 'used' || claim.reason === 'none'
+              ? "the owner's extra round was already used (grant already used): ask the owner again (triage round-request)"
+              : `the owner's extra round could not be claimed (${claim.reason}) and is spent: ask the owner again (triage round-request)`,
+          });
+        }
+      };
     }
     const base0 = fresh ?? emptyState({ repo: slug, pr, branch: view.headRefName ?? 'HEAD', risk: level, lightLane, maxRounds: config.review.max_rounds });
     const ruled = reuseRuled(assignIds(findings, round, excerptFor, { contentHash: hashAtHead }), ruledCacheFrom(allItems(base0)));
@@ -389,6 +390,7 @@ export const run = guarded(async (argv, ctx) => {
     });
     writeJson(path.join(dir, 'codex.json'), { findings, items: ruled });
     writeFileAtomic(path.join(dir, 'codex.md'), renderFindingsMarkdown(findings, round, ruled));
+    claimGrant();
     saveState(root, next);
     state = next;
     grantUsed = ownerGrant === undefined ? undefined : { grantId: ownerGrant.grantId };

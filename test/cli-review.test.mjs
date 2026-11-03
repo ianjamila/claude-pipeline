@@ -3546,6 +3546,28 @@ test('codex-review owner grant: Codex exit 3 leaves the grant open, and the retr
   assert.equal(readGrantMarker(grantIdOf(record)).spent, true);
 });
 
+test('codex-review owner grant: github down while the grant is looked up is exit 3 (unavailable), not a round-cap refusal', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  w.fake.setScript(GH.map((e) => (e.match === '^repo view' ? { match: e.match, code: 1, stderr: 'HTTP 502' } : e.match === '^pr view 7' ? { ...e, stdoutJson: { baseRefName: 'main', headRefOid: h2, ...e.stdoutJson } } : e)));
+  const down = codexThree(w, h1, h2);
+  assertExit(down, 3, down.stdout);
+  assert.equal(down.json.error, 'unavailable');
+  assert.equal(readGrantMarker(grantIdOf(record)).spent, false, 'nothing was claimed');
+  assert.equal(w.state().rounds.length, 2);
+});
+
+test('codex-review owner grant: a failure while the round\'s files are written spends nothing (the claim is the last step before the state is saved)', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  // A directory squatting on codex.md makes the round's markdown write throw after the findings are in.
+  mkdirSync(join(w.repo.dir, '.review', 'round-3', 'codex.md'), { recursive: true });
+  const crashed = codexThree(w, h1, h2);
+  assert.notEqual(crashed.code, 0, crashed.stdout);
+  assert.equal(readGrantMarker(grantIdOf(record)).spent, false, 'the grant is still open');
+  assert.equal(w.state().rounds.length, 2);
+});
+
 test('codex-review owner grant: a head that moved after the grant is "ask again"; round-request names the new head and a fresh grant works', (t) => {
   const { w, h1, h2 } = atCap(t);
   const stale = ownerGrantsRound(t, { k: 3, head: h2 });
@@ -3695,6 +3717,23 @@ test('triage round-request: the exact line, and the refusals', (t) => {
   const granted = w.cli(['triage', 'round-request', '--pr', '7']);
   assertExit(granted, 1, granted.stdout);
   assert.match(granted.json.reason, /already granted for this head: run codex-review --round 3/);
+});
+
+test('review-complete: the configured review.max_rounds is the cap - a state edited to maxRounds null with an ordinary round past it is refused', (t) => {
+  const { w, h1, h2 } = atCap(t, CAP1_CHAT, [...GH, REMOVE_LABEL, ...REVIEW_COMMENT]);
+  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  assertExit(codexThree(w, h1, h2), 0);
+  w.prHead(h2);
+  const st = w.state();
+  delete st.rounds[2].ownerGrant;
+  st.rounds[2].admission = 'normal';
+  st.maxRounds = null;
+  writeFileSync(join(w.repo.dir, '.review', 'state.json'), JSON.stringify(st));
+  rmSync(markerPath(grantIdOf(record)), { force: true });
+  const refused = w.cli(['review-complete', '--pr', '7']);
+  assertExit(refused, 1, refused.stderr + refused.stdout);
+  assert.match(refused.json.reason, /past review\.max_rounds \(1\)/);
+  assert.equal(postedBodies(w).length, 0);
 });
 
 test('review-complete: refuses the marker when an owner-granted round cannot be verified (a forged state, a missing marker), posts when it can', (t) => {
