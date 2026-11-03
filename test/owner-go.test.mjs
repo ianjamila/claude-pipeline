@@ -544,6 +544,11 @@ test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice void
     ['a ruling line, not the last line', `${ask(59)}\nSorry, one more thing.`],
     ['the same ask shown again', ask(58)],
     ['a 🔀 request', REQUEST],
+    // R2-F2: the agent chooses its wording, so a paraphrase of a new ask voids the slot too: a finding id, or a decision word beside a PR number
+    ['a paraphrased ask naming a finding', 'For #59 please answer R1-B1: accept or reject'],
+    ['a finding id in lower case', 'Back to r2-f1 on pr 59, your call.'],
+    ['a decision word next to a PR number', 'Please reply accept or reject for #59.'],
+    ['a decision word before the PR number', 'Should I merge #59? Tell me follow-up or reject.'],
   ]) {
     assert.equal(rule([...head, notice, said('The build finished.'), said(shown)]), null, name);
     assert.equal(rule([...head, notice, said(shown)]), null, `${name}, no other text`);
@@ -552,6 +557,9 @@ test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice void
   assert.deepEqual(readApprovals({ home, now }), []);
   // the limit is the reply to a harness turn only: a plain reply after the ask, an ask shown BEFORE the notice, and a new owner turn after the poisoned reply all work as before
   assert.deepEqual([rule([...head, notice, said('The build finished.')])?.pr], [58], 'no ask in the reply');
+  for (const text of ['The build finished.', 'Build #1042 finished, 3 tests rerun.', 'Rejected the stale cache; all green.', 'Noted: the PR is still open.', 'I will accept the default.']) {
+    assert.deepEqual([rule([...head, notice, said(text)])?.pr], [58], `an ordinary reply still binds: ${text}`);
+  }
   assert.deepEqual([rule([promptEntry('go'), said(ask(59)), notice, said('ok')])?.pr], [59], 'the ask is the last thing before the notice');
   assert.deepEqual([rule([...head, notice, said(ask(59)), promptEntry('what is that?'), said(ask(59))])?.pr], [59], 'the owner asked again: a new slot');
 });
