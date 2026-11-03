@@ -255,7 +255,7 @@ function makeCtx(opts) {
   // #128: the transcripts and their folders; R1-B2: also under $CLAUDE_CONFIG_DIR, whatever that is called (as given and as resolved)
   const cfgDir = configDirOf(opts.env ?? process.env, homePosix);
   const transcriptRoots = unique([cfgDir, cfgDir && realResolve(cfgDir, api)].filter(Boolean));
-  const transcripts = transcriptRes(transcriptRoots, ci);
+  const transcripts = transcriptRes(transcriptRoots, ci, unique([homePosix, realResolve(homePosix, api)]));
   const pipelineHit = (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); };
   const pipelineAncestor = (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); };
   let rootIds = null;

@@ -1148,6 +1148,36 @@ test('#128 R2-B1: a run that fills the $CLAUDE_CONFIG_DIR folder itself (rsync, 
   assert.equal(bash('rsync -a /tmp/forged/ /home/u/claude-config/'), 'allow');
 });
 
+// #128 round 2 (R2-B1, the home-level config dirs): the owner's second account keeps its transcripts in ~/.claude-eaglewatch, which the owner-go check accepts like ~/.claude's,
+// so that folder is held like ~/.claude is: a name directly under the home that starts with .claude (no further dot: ~/.claude.json is a file). A .claude/ inside a repo is not.
+test('#128 R2-B1: ~/.claude-eaglewatch (any home-level .claude* folder) is a transcript root like ~/.claude; a repo\'s .claude/ folder is not', () => {
+  for (const cmd of [
+    'tar -xf x -C ~/.claude-eaglewatch',
+    'tar -xf x -C /home/u/.claude-eaglewatch/',
+    'rsync -a x/ ~/.claude-eaglewatch/',
+    'cp -R /tmp/forged/. ~/.claude-eaglewatch',
+    'rm -rf ~/.claude-eaglewatch',
+    'cd ~/.claude-eaglewatch && tar -xf x',
+    'cd ~/.claude-eaglewatch && /usr/bin/tar -xf x',
+    'rsync -a x/ ~/.claude-work/',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    'cat ~/.claude-eaglewatch/settings.json',
+    'ls ~/.claude-eaglewatch',
+    'echo x > ~/.claude-eaglewatch/notes.txt',
+    'cp /tmp/n.md ~/.claude-eaglewatch/CLAUDE.md',
+    'cp x ~/.claude.json',
+    'cp x ~/.claude.json.backup',
+    'echo x > /repo/.claude/settings.local.json',
+    'mkdir -p /repo/.claude/x',
+    'tar -xf x -C /repo/.claude',
+    'rsync -a x/ /repo/.claude/',
+    'cd /repo/.claude && tar -xf x',
+    'rsync -a x/ /home/u/proj/.claude-eaglewatch/',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+  assert.equal(file('Edit', { file_path: '/repo/.claude/settings.local.json', old_string: 'a', new_string: 'b' }), 'allow');
+});
+
 // R2-B2: a wildcard segment is asked whether it can stand for ANY name that starts with .claude, not for two sample names.
 test('#128 R2-B2: a glob segment that can match any .claude* folder name is refused (? in the middle, a leading ?, a tail wildcard); unrelated globs stay open', () => {
   for (const cmd of [

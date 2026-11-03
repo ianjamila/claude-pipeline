@@ -142,15 +142,18 @@ export function configDirOf(env, home = os.homedir()) {
 // (absolute POSIX paths; null/'' are skipped). R2-B1: a config dir is itself a folder that holds them (the way ~/.claude is an ancestor of its
 // protected entries): `rsync -a x/ <dir>/`, `tar -xf x -C <dir>` and a shell sitting in it fill projects/ without naming it, so the dir is in `dirs` and `below`.
 // (The folders ABOVE a config dir are not: the same gap as for the pipeline files, not closed here.)
-export function transcriptRes(configDirs = [], ci = false) {
+// `homes` (absolute POSIX paths): a name directly under one that starts with .claude and has no further dot (the folders claudeConfigDirs scans: ~/.claude,
+// ~/.claude-eaglewatch; not ~/.claude.json, a file) is such a config dir too, without being named by $CLAUDE_CONFIG_DIR. A .claude/ inside a repo is not.
+export function transcriptRes(configDirs = [], ci = false, homes = []) {
   const flags = ci ? 'i' : '';
   const dirs = [...new Set(configDirs.filter(Boolean))];
+  const homeDirs = [...new Set(homes.filter(Boolean))].map((h) => `^${reEscape(h.replace(/\/+$/, ''))}/\\.claude[^/.]*/*$`);
   const roots = dirs.map((d) => `^${reEscape(d)}/`);
   const self = dirs.map((d) => `^${reEscape(d)}/*$`);
   return {
     files: [TRANSCRIPT_FILE_SRC, ...roots.map((r) => r + TRANSCRIPT_LEAF)].map((s) => new RegExp(s, flags)),
-    dirs: [ANY_CLAUDE_DIR + TRANSCRIPT_TOP, ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...self, ...roots.flatMap((r) => [r + TRANSCRIPT_TOP, r + TRANSCRIPT_BELOW])].map((x) => new RegExp(x, flags)),
-    below: [ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...self, ...roots.map((r) => r + TRANSCRIPT_BELOW)].map((x) => new RegExp(x, flags)),
+    dirs: [ANY_CLAUDE_DIR + TRANSCRIPT_TOP, ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...self, ...homeDirs, ...roots.flatMap((r) => [r + TRANSCRIPT_TOP, r + TRANSCRIPT_BELOW])].map((x) => new RegExp(x, flags)),
+    below: [ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...self, ...homeDirs, ...roots.map((r) => r + TRANSCRIPT_BELOW)].map((x) => new RegExp(x, flags)),
   };
 }
 // Is this path (any slash flavour) a transcript FILE the guard protects?
