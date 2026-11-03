@@ -11,7 +11,8 @@ import { MARKERS } from '../pipeline/lib/render.mjs';
 import { applyCheckpoint, decodeRecord, emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { LABELS } from '../pipeline/commands/labels.mjs';
-import { GITHUB_ACTIONS_APP_ID, unpinnedChecks } from '../pipeline/commands/protect.mjs';
+import { GITHUB_ACTIONS_APP_ID, foreignPins, readCurrentProtection, unpinnedChecks } from '../pipeline/commands/protect.mjs';
+import { GhError } from '../pipeline/lib/proc.mjs';
 
 const bin = join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'bin', 'pipeline.mjs');
 
@@ -360,8 +361,11 @@ const PROTECTION_PAYLOAD = {
   required_conversation_resolution: false,
 };
 
+// The read of the current protection that protect makes before it builds the payload, on a branch with none yet.
+const NOT_PROTECTED = { match: '^api repos/acme/widgets/branches/main/protection$', code: 1, stderr: 'gh: Branch not protected (HTTP 404)' };
+
 test('protect (dry run): prints the exact spec 6.6 payloads and changes nothing', () => {
-  const fake = createFakeGh([REPO]);
+  const fake = createFakeGh([REPO, NOT_PROTECTED]);
   const r = cli(['protect', '--checks', 'ci,e2e'], { repo: repoWith(), fake });
   assertExit(r, 0);
   assert.equal(r.json.ok, true);
@@ -382,8 +386,81 @@ test('protect (dry run): prints the exact spec 6.6 payloads and changes nothing'
   assert.deepEqual(JSON.parse(printed), PROTECTION_PAYLOAD);
   assert.ok(r.json.commands[1].startsWith("gh api -X PATCH repos/acme/widgets --input - <<'JSON'\n"));
   assert.ok(r.json.commands[2].startsWith("gh api -X PUT repos/acme/widgets/actions/permissions/workflow --input - <<'JSON'\n"));
-  // Only the repo lookup ran: no write.
-  assert.deepEqual(fake.lines(), ['repo view --json nameWithOwner,defaultBranchRef,url']);
+  // Only the repo lookup and the read of the current protection ran: no write.
+  assert.deepEqual(fake.lines(), ['repo view --json nameWithOwner,defaultBranchRef,url', 'api repos/acme/widgets/branches/main/protection']);
+  assert.deepEqual(r.json.pins, {});
+});
+
+// A current protection whose rows carry the given app ids ({ context: app_id }).
+function protectionWithApps(apps) {
+  const p = fullProtection(Object.keys(apps));
+  p.required_status_checks.checks = Object.entries(apps).map(([context, app_id]) => ({ context, app_id }));
+  return p;
+}
+
+test('protect (dry run): a check the current protection pins to another app keeps that app; guard contexts never do', () => {
+  const current = protectionWithApps({ ci: 15368, Vercel: 8329, 'Test integrity': 8329, e2e: -1, gone: 77 });
+  const fake = createFakeGh([REPO, { match: '^api repos/acme/widgets/branches/main/protection$', stdoutJson: current }]);
+  const r = cli(['protect', '--checks', 'ci,Vercel,Test integrity,e2e'], { repo: repoWith(), fake });
+  assertExit(r, 0);
+  assert.deepEqual(r.json.requests[0].body.required_status_checks.checks, [
+    { context: 'ci', app_id: 15368 },
+    { context: 'Vercel', app_id: 8329 },
+    { context: 'Test integrity', app_id: 15368 },
+    { context: 'e2e', app_id: 15368 },
+  ]);
+  assert.deepEqual(r.json.pins, { Vercel: 8329 });
+  assert.match(r.stderr, /"Vercel" stays pinned to app 8329 \(from the current protection\)/);
+  // the printed command carries the same pins
+  assert.deepEqual(JSON.parse(r.json.commands[0].split('\n').slice(1, -1).join('\n')).required_status_checks, r.json.requests[0].body.required_status_checks);
+});
+
+test('protect --pin NAME=APP_ID: names the app for a required check, wins over the current pin, and refuses bad input', () => {
+  const fresh = cli(['protect', '--checks', 'ci,Vercel', '--pin', 'Vercel=8329'], { repo: repoWith(), fake: createFakeGh([REPO, NOT_PROTECTED]) });
+  assertExit(fresh, 0);
+  assert.deepEqual(fresh.json.requests[0].body.required_status_checks.checks.map((c) => c.app_id), [15368, 8329]);
+  assert.match(fresh.stderr, /"Vercel" stays pinned to app 8329 \(from --pin\)/);
+  const current = protectionWithApps({ ci: 15368, Vercel: 111 });
+  const over = cli(['protect', '--checks', 'ci,Vercel', '--pin', 'Vercel=8329'], {
+    repo: repoWith(), fake: createFakeGh([REPO, { match: '^api repos/acme/widgets/branches/main/protection$', stdoutJson: current }]),
+  });
+  assert.deepEqual(over.json.pins, { Vercel: 8329 });
+  const fake = createFakeGh([REPO, NOT_PROTECTED]);
+  for (const bad of ['Vercel', 'Vercel=', 'Vercel=abc', 'Vercel=0', 'Vercel=-5', '=8329', 'nope=1', 'Test integrity=8329', 'Cross-model review=8329']) {
+    const r = cli(['protect', '--checks', 'ci,Vercel,Test integrity,Cross-model review', '--pin', bad], { repo: repoWith(), fake });
+    assertExit(r, 2);
+    assert.match(r.json.message, /--pin/, bad);
+  }
+  // validated before any gh call
+  assert.equal(fake.calls().length, 0);
+});
+
+test('protect (dry run): an unreadable current protection still prints the commands, with no kept pins, and says so', () => {
+  const fake = createFakeGh([REPO, { match: '^api repos/acme/widgets/branches/main/protection$', code: 1, stderr: 'gh: Server Error (HTTP 502)' }]);
+  const r = cli(['protect', '--checks', 'ci,Vercel'], { repo: repoWith(), fake });
+  assertExit(r, 0);
+  assert.deepEqual(r.json.pins, {});
+  assert.match(r.stderr, /could not read the current protection/);
+});
+
+test('readCurrentProtection: the protection JSON, null when there is none to read, and --apply stops on any other failure', () => {
+  const json = protectionWithApps({ ci: 15368 });
+  assert.deepEqual(readCurrentProtection({ protection: () => ({ status: 200, json }) }, 'main', { apply: true }), json);
+  for (const status of [404, 403]) {
+    assert.equal(readCurrentProtection({ protection: () => ({ status, reason: 'x', message: 'x' }) }, 'main', { apply: true }), null);
+  }
+  const broken = { protection: () => { throw new GhError({ code: 1, stderr: 'HTTP 502', args: ['api'] }); } };
+  // applying without the current pins would move a deploy provider's check onto GitHub Actions: refuse
+  assert.throws(() => readCurrentProtection(broken, 'main', { apply: true }), GhError);
+  assert.equal(readCurrentProtection(broken, 'main', { apply: false }), null);
+  // a bug is never swallowed, even in a dry run
+  assert.throws(() => readCurrentProtection({ protection: () => { throw new TypeError('bug'); } }, 'main', { apply: false }), TypeError);
+});
+
+test('foreignPins: only required, non-guard checks pinned to a positive app id other than GitHub Actions', () => {
+  const json = protectionWithApps({ a: 15368, b: 8329, c: -1, d: null, 'Hard-stop scan': 42, 'Cross-model review': 42, e: 7, f: '9' });
+  assert.deepEqual(foreignPins(json, ['a', 'b', 'c', 'd', 'Hard-stop scan', 'Cross-model review', 'f']), { b: 8329 });
+  for (const empty of [{}, null, undefined, { required_status_checks: {} }]) assert.deepEqual(foreignPins(empty, ['a']), {});
 });
 
 test('protect: checks default to ci.required_checks; none at all is a usage error', () => {
@@ -439,6 +516,11 @@ test('unpinnedChecks: names every required check the read-back does not pin to t
   for (const empty of [{}, null, undefined, { required_status_checks: {} }]) {
     assert.deepEqual(unpinnedChecks(empty, ['a']), ['a'], JSON.stringify(empty));
   }
+  // with pins: a pinned check must carry ITS app, the rest the Actions app
+  const pins = { b: 8329 };
+  assert.deepEqual(unpinnedChecks(json([row('a', 15368), row('b', 8329)]), ['a', 'b'], pins), []);
+  assert.deepEqual(unpinnedChecks(json([row('a', 15368), row('b', 15368)]), ['a', 'b'], pins), ['b'], 'Actions is not the app a pinned check needs');
+  assert.deepEqual(unpinnedChecks(json([row('a', 8329), row('b', 8329)]), ['a', 'b'], pins), ['a'], 'a pin covers only its own check');
 });
 
 test('protect: ci.review_check adds Cross-model review to the checks (after the guard checks)', () => {
@@ -519,6 +601,7 @@ test('protect --apply: a read-back that still misses settings is not ok (exit 1)
 test('protect --apply: 403 on a free plan is exit 1 with reason plan (and stops at the first write)', () => {
   const fake = createFakeGh([
     REPO,
+    NOT_PROTECTED,
     {
       match: '^api -X PUT repos/acme/widgets/branches/main/protection ',
       code: 1,
@@ -536,6 +619,7 @@ test('protect --apply: 403 on a free plan is exit 1 with reason plan (and stops 
 test('protect --apply: 403 without admin rights is exit 1 with reason permission and the commands to run', () => {
   const fake = createFakeGh([
     REPO,
+    NOT_PROTECTED,
     { match: '^api -X PUT repos/acme/widgets/branches/main/protection ', stdoutJson: {} },
     { match: '^api -X PATCH repos/acme/widgets ', code: 1, stderr: 'gh: Must have admin rights to Repository. (HTTP 403)' },
   ]);
@@ -548,7 +632,7 @@ test('protect --apply: 403 without admin rights is exit 1 with reason permission
 });
 
 test('protect --apply: a non-403 failure is exit 3, not a pass', () => {
-  const fake = createFakeGh([REPO, { match: '^api -X PUT ', code: 1, stderr: 'gh: Server Error (HTTP 502)' }]);
+  const fake = createFakeGh([REPO, NOT_PROTECTED, { match: '^api -X PUT ', code: 1, stderr: 'gh: Server Error (HTTP 502)' }]);
   const r = cli(['protect', '--apply', '--checks', 'ci'], { repo: repoWith(), fake, env: { PIPELINE_ADMIN: '1' } });
   assertExit(r, 3);
   assert.equal(r.json.ok, false);

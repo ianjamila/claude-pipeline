@@ -91,7 +91,8 @@ Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard cont
   filters from required workflows and use a job-level docs-only skip instead (a workflow that
   never triggers never reports, which blocks every such PR).
 - Branch protection is applied **after the onboarding PR merges**: `P protect --repo .` prints
-  the exact `gh api` calls (required checks = `ci.required_checks` + the two guard contexts); `P protect --repo . --apply` (requires the session to have been
+  the exact `gh api` calls (required checks = `ci.required_checks` + the two guard contexts, each pinned to GitHub Actions;
+  a check another app posts, such as `Vercel`, keeps its current app or takes `--pin Vercel=<app id>`); `P protect --repo . --apply` (requires the session to have been
   started with `PIPELINE_ADMIN=1`) applies them: PR required, required checks, enforce admins,
   linear history, no force pushes/deletions, auto-merge allowed, squash only. 403 ⇒ tell the
   owner what plan/permission is missing and print the command for them to run.
