@@ -1224,6 +1224,66 @@ test('#128 R2-F1: program text (python -c, node -e, a heredoc body) that names a
   assert.equal(bash(`python3 -c "open('${T}','w').write('x')"`), 'allow');
 });
 
+// R3-B1: a wildcard spelling of the config dir itself (not of something below it) is the folder once the shell expands it.
+test('#128 R3-B1: a glob that can stand for the config dir itself (-C, rsync target, cd) is refused like the literal; unrelated globs stay open', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    'tar -xf x -C /home/u/claude-confi?',
+    'rsync -a /tmp/forged/ /home/u/claude-confi?/',
+    'rsync -a /tmp/forged/ /home/u/claude-conf*/',
+    'cp -R /tmp/forged/. /home/u/claude-confi?/',
+    'cd /home/u/claude-confi? && tar -xf x',
+    'cd /home/u/claude-c[o]nfig && tar -xf x',
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  // (the home-level .claude* folders need no environment variable)
+  for (const cmd of [
+    'tar -xf x -C /home/u/.claud?-eaglewatch',
+    'tar -xf x -C ~/.claud?-eaglewatch/',
+    'rsync -a /tmp/forged/ /home/u/.claude-eaglewat*/',
+    'cd ~/.claud?-eaglewatch && tar -xf x',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    'tar -xf x -C /home/u/claude-confi?-old',
+    'rsync -a /tmp/forged/ /home/u/claude-confi?-old/',
+    'tar -xf x -C /home/u/.clause?-eaglewatch',
+    'tar -xf x -C /home/u/proj/.claud?-eaglewatch',
+    'tar -xf x -C /repo/.claud?',
+    'rsync -a x/ /repo/.claud?/',
+    'tar -xf x -C /home/u/other-d?r',
+  ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  // (without the variable the custom folder is just a folder)
+  assert.equal(bash('tar -xf x -C /home/u/claude-confi?'), 'allow');
+});
+
+// R3-F1: every prefix of a wildcard segment was compiled as a pattern of its own (quadratic): a long one outlasted the hook's timeout, which then fails open.
+test('#128 R3-F1: a very long wildcard segment is refused at once (no quadratic scan that could run past the hook timeout)', () => {
+  for (const seg of ['.x' + '?'.repeat(12000), '.' + 'a?'.repeat(6000), '.zz' + '*'.repeat(12000)]) { // (no prefix can match .claude: the old scan ran to the end)
+    const t0 = Date.now();
+    const d = bash('cp /tmp/x.jsonl ~/' + seg + '/projects/-repo/abc.jsonl');
+    assert.equal(d, 'deny', seg.slice(0, 12));
+    assert.ok(Date.now() - t0 < 1000, 'took ' + (Date.now() - t0) + ' ms');
+  }
+});
+
+// R3-F2: program text can name the folder through the environment variable rather than a path.
+test('#128 R3-F2: program text that builds a transcript path from CLAUDE_CONFIG_DIR is refused; the variable alone stays open', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    "python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/projects/-repo/abc.jsonl','w').write('x')\"",
+    "python3 -c \"import os; open(os.getenv('CLAUDE_CONFIG_DIR')+'/projects/-repo/abc.jsonl','w').write('x')\"",
+    "node -e \"require('fs').writeFileSync(process.env.CLAUDE_CONFIG_DIR+'/projects/-repo/abc.jsonl','x')\"",
+    "node -e \"require('fs').writeFileSync(process.env.CLAUDE_CONFIG_DIR + '/projects/-repo/abc/subagents/agent-1.jsonl','x')\"",
+    "python3 - <<'EOF'\nimport os\nopen(os.environ['CLAUDE_CONFIG_DIR'] + '/projects/-repo/abc.jsonl', 'w').write('x')\nEOF",
+    "cat <<EOF | python3\nimport os\nopen(os.environ['CLAUDE_CONFIG_DIR'] + \"/projects/-repo/abc.jsonl\", \"w\").write(\"x\")\nEOF",
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  for (const cmd of [
+    "python3 -c \"import os; print(os.environ['CLAUDE_CONFIG_DIR'])\"",
+    "node -e \"console.log(process.env.CLAUDE_CONFIG_DIR)\"",
+    "python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/settings.json').read()\"",
+    "python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/projects/-repo/memory/n.md','w').write('x')\"",
+  ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+});
+
 test('Phase 3b: a program that resolves into a review folder is judged like any other (only the installed pipeline is trusted)', () => {
   // (run.mjs links to a file in a round folder: the hook judges the real file's text, it does not skip it as a pipeline program)
   const prog = '/repo/.review/round-1/x.mjs';
