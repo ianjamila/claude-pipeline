@@ -985,6 +985,39 @@ test('Phase 3b: a repo\'s review state is protected from every write, wherever t
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 
+// #128: the owner-go check trusts the transcript's prompt entries, so a tool may not write one.
+test('#128: Claude Code session transcripts are protected from every write, in every config dir; reading them stays open', () => {
+  const T = '/home/u/.claude/projects/-repo/abc.jsonl';
+  for (const p of [T, '/home/u/.claude-eaglewatch/projects/-repo/abc.jsonl', '/home/u/.claude/projects/-repo/abc/subagents/agent-1.jsonl', '~/.claude/projects/-repo/abc.jsonl']) {
+    assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', p);
+    assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', p);
+  }
+  assert.equal(file('mcp__fs__write_file', { path: T, content: '{}' }), 'deny');
+  for (const cmd of [
+    `echo '{}' >> ${T}`,
+    `echo '{}' >> ~/.claude/projects/-repo/abc.jsonl`,
+    `printf x > ~/.claude-eaglewatch/projects/-repo/abc.jsonl`,
+    `sed -i 's/human/x/' ${T}`,
+    `cp /tmp/forged.jsonl ${T}`,
+    `tee -a ${T} < /tmp/x`,
+    `mv /tmp/forged.jsonl ~/.claude/projects/-repo/abc.jsonl`,
+    `rm ${T}`,
+    'echo x >> ~/.claude/projects/*/*.jsonl',
+    `cd ~/.claude/projects/-repo && echo x >> abc.jsonl`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `cat ${T}`,
+    `grep -c promptId ${T}`,
+    `jq -c .type ${T}`,
+    'tail -n 5 ~/.claude/projects/-repo/abc.jsonl',
+    'ls -la ~/.claude/projects/-repo',
+    'echo x > ~/.claude/projects/-repo/memory/note.md', // (memory notes and other files there stay writable)
+    'echo x >> /tmp/notes.jsonl',
+    'echo x >> ~/.claude/pipeline-state/guard-log.jsonl',
+    'node ~/.claude/pipeline/bin/pipeline.mjs cost --pr 5 --phase build --role implementer --from-transcript ~/.claude/projects/-repo/abc/subagents/agent-1.jsonl', // (the review skill books a call from its transcript)
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
 test('Phase 3b: a program that resolves into a review folder is judged like any other (only the installed pipeline is trusted)', () => {
   // (run.mjs links to a file in a round folder: the hook judges the real file's text, it does not skip it as a pipeline program)
   const prog = '/repo/.review/round-1/x.mjs';

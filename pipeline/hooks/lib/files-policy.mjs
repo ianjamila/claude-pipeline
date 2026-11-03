@@ -68,6 +68,19 @@ const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents', '.claude/pi
 // agent produces itself and is not protected). The state's other source, the PR triage comment, is guarded in git-policy.mjs.
 const REVIEW_FILE_SRC = String.raw`(?:^|/)\.review/(?:state\.json(?:\.[^/]*)?|round-\d+(?:/.*)?|final-gate\.json(?:\.[^/]*)?|[^/]+-smoke\.json(?:\.[^/]*)?|prod-before\.json(?:\.[^/]*)?)$`;
 const REVIEW_DIR_SRC = String.raw`(?:^|/)\.review/*$`;
+// #128: Claude Code's own session transcripts (<config dir>/projects/<project>/<session>.jsonl, subagents/ below it; every config dir, `.claude*`,
+// as the stacks' default transcriptDirs). The owner-go check reads them to learn who typed a prompt (hooks/lib/owner-go.mjs promptProvenance), so a
+// prompt entry the model wrote would pass for the owner's. Protected for writes like the review state (reads stay open: they are how a transcript is
+// analysed); nothing in the pipeline writes there (grep 2026-11-03: only readers). A writer that is not a tool call (a pty-driven interactive
+// `claude --resume`) is a residual.
+const TRANSCRIPT_FILE_SRC = String.raw`(?:^|/)\.claude[^/]*/projects/(?:[^/]+/)+[^/]+\.jsonl$`;
+const TRANSCRIPT_TEXT_SRC = String.raw`(?<![\w.\-])\.claude[^/\s'"]*/projects/[^\s'"]*\.jsonl(?![\w.\-])`;
+// A glob that can match one: a literal `.claude*/projects/` prefix and a last name that ends in .jsonl or is a wildcard.
+const transcriptGlob = (g) => {
+  const last = g.split('/').pop() ?? '';
+  // (a last name with a literal other extension, `*.md`, or a path through a memory folder, cannot be one)
+  return /(?:^|\/)\.claude[^/]*\/projects\//.test(g) && !/\/memory\//.test(g) && (last.endsWith('.jsonl') || (/[*?[]/.test(last) && !/\.[A-Za-z0-9]+$/.test(last)));
+};
 // One name of each kind, for globs: a glob that can match one of them can match a protected file.
 const REVIEW_SAMPLES = ['state.json', 'state.json.1.tmp', 'round-1', 'final-gate.json', 'preview-smoke.json', 'production-smoke.json', 'prod-before.json'];
 // A wildcard matches a name that starts with a dot (the .review folder) only when the line may switch that on: bash dotglob (shopt, or
@@ -245,6 +258,7 @@ function makeCtx(opts) {
   const ci = caseInsensitive(platform);
   const reviewFile = new RegExp(REVIEW_FILE_SRC, ci ? 'i' : '');
   const reviewDir = new RegExp(REVIEW_DIR_SRC, ci ? 'i' : '');
+  const transcriptFile = new RegExp(TRANSCRIPT_FILE_SRC, ci ? 'i' : '');
   const pipelineHit = (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); };
   const pipelineAncestor = (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); };
   let rootIds = null;
@@ -389,7 +403,7 @@ function makeCtx(opts) {
     bashState: opts._bashState, // the BASH rewrite record of the whole evaluation (see evaluateBashForFilesUnchecked)
     // (hit / hitAncestor: the installed pipeline files and, in any directory, a repo's review state (REVIEW_FILE_SRC). trusted: only
     // the installed pipeline files, whose programs are not judged on their content when run.)
-    hit: (p) => pipelineHit(p) || reviewFile.test(unFirm(p)),
+    hit: (p) => pipelineHit(p) || reviewFile.test(unFirm(p)) || transcriptFile.test(unFirm(p)),
     trusted: pipelineHit,
     hitAncestor: (p) => pipelineAncestor(p) || reviewDir.test(unFirm(p)),
     hitPipelineAncestor: pipelineAncestor,
@@ -973,6 +987,7 @@ function makeMatchers(ctx) {
   const suffix = suffixRegexes(ctx.ci);
   const ancestors = rootsAndAncestors(ctx);
   const reviewText = new RegExp(reviewTextBody(SEP), ctx.ci ? 'i' : '');
+  const transcriptText = new RegExp(TRANSCRIPT_TEXT_SRC, ctx.ci ? 'i' : '');
   // A glob that can match a repo's review folder or a protected file in it (REVIEW_FILE_SRC), wherever it is: a segment that can be
   // `.review`, then the end (the folder itself) or a segment that can be one of the protected names. `**` can stand for the folder and
   // for a round folder, so anything after it counts. A wildcard reaches a dot name only with DOT_GLOB on the line.
@@ -1049,6 +1064,7 @@ function makeMatchers(ctx) {
       if (ctx.braceOver === true && ctx.hasReviewDir()) return true; // (#111: a brace expansion cut by its cap may hide a protected name; fail closed with a review folder)
       if (rootRes.some((re) => re.test(v))) return true;
       if (reviewText.test(v)) return true; // (a repo's review state: protected wherever it is, so the name alone is the reference)
+      if (transcriptText.test(v)) return true; // (#128: a session transcript, in any config dir)
       if (aliasInText(v, dirs)) return true;
       if (!(ctx.ci ? v.toLowerCase() : v).includes('.claude')) continue;
       if (suffix.nonlit.test(v)) return true;
@@ -1067,7 +1083,7 @@ function makeMatchers(ctx) {
     const star = g.search(/[*?[]/);
     const lit = g.slice(0, g.lastIndexOf('/', star) + 1) || '/';
     if (ctx.hit(lit)) return true;
-    if (reviewGlob(g)) return true;
+    if (reviewGlob(g) || transcriptGlob(g)) return true;
     if (ctx.hitReviewGlob(g)) return true; // (#111: the same glob through another name for the review folder)
     // a glob that can match a protected root or anything inside one (~/.claude/skills/*/SKILL.md, ~/.c*/pipeline/x) ...
     if (ctx.roots.some((r) => globReaches(g, r, ctx.ci))) return true;
