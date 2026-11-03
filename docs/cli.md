@@ -513,13 +513,14 @@ Exit: 0.
 
 ## worktrees
 
-remove finished worktrees (prune), keep one with a lock (keep / unkeep), list or purge the holding folder.
+remove finished worktrees (prune), keep one with a lock (keep / unkeep), list or purge the holding folder, check for an open Claude session (sessions).
 
 ```
 pipeline worktrees prune [--repo DIR] [--dry-run] [--notify] [--summary-only]   (--notify: accepted, does nothing; old schedules pass it)   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], hiddenProcesses, liveSessions?, restored:[...], outside:[...], holding:{batches, purged}, summary, log} | --summary-only: one line {ok, summary, errors?}
 pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}
 pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}
 pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}
+pipeline worktrees sessions DIR   -> {ok, dir, available, open:[{id, pid}], unplaced:[...], reason?}   read-only, needs no repo, config or GitHub; exit 0 = the scan is complete and no session is open in DIR, 1 = a session is open there, 2 = usage, 3 = unsure (scan unavailable or partial, or a session folder that cannot be resolved): treat every non-zero as "keep"
 pipeline worktrees schedule (--install [--at HH:MM] | --remove | --status) [--repo DIR]   -> {ok, installed, line, timezone, warning?} | {ok, removed} | {ok, installed, line}   (macOS: a launchd LaunchAgent; adds plist, changed, loaded, note)
 ```
 
@@ -557,6 +558,8 @@ group in the summary) and never released. `worktrees.mode` governs every mutatio
 | move back a quarantine left by a killed run | yes | yes | yes | report only |
 | purge holding batches older than 30 days | no | no | yes | no |
 | `keep` / `unkeep` locks | yes | yes | yes | n/a |
+
+`sessions DIR` is a read-only check for a person or agent about to remove a worktree by hand: "is a Claude Code session open in DIR right now?" It uses the same scan as `prune` (the `<config>/sessions/<pid>.json` records, placed by the last `cwd` of their transcripts) but needs no repository, `.claude/pipeline.yml` or GitHub, and `worktrees.mode` does not apply. Exit 0 only when the scan is available and complete and no session is open in DIR; 1 when one is (`open` lists id and pid; this wins over an unplaced session); 2 for a usage error (no DIR, DIR not a directory); 3 when the answer is unsure: the scan is unavailable (`available: false` and a `reason`: Windows, no `sessions/` folder), any session could not be placed (`unplaced`), or a session's working folder cannot be resolved (denied, deleted, a loop) and is not DIR by its logged spelling, which could be an alias of DIR (this strictness is only for `sessions`; prune still reads such a folder as elsewhere). Treat every non-zero exit as "keep".
 
 `unkeep` releases only a `pipeline-keep:` lock, and with `--run ID` only the one whose reason carries `ship run ID`.
 
