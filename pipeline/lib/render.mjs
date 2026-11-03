@@ -54,12 +54,20 @@ function triageRow(n, item) {
   return `| ${cell(n)} | ${cell(item.id)} | ${cell(item.bucket)} | ${cell(finding, 80)} | ${cell(decision)} | ${cell(by)} | ${cell(conf)} | ${cell(reason, final?.ownerQuote ? OWNER_REASON_MAX : 120)} |`;
 }
 
+// The rounds an owner's chat words admitted past the cap (the quote is the owner record's own prompt, kept on the round by codex-review).
+const grantedRounds = (state) => (state.rounds ?? [])
+  .filter((r) => typeof r?.ownerGrant?.quote === 'string' && r.ownerGrant.quote !== '')
+  .map((r) => ({ k: Number.isInteger(r.ownerGrant.k) ? r.ownerGrant.k : null, n: r.n, quote: r.ownerGrant.quote }));
+const grantLabel = (g) => `round ${line(g.k ?? g.n)}`;
+
 export function triageComment(state) {
   const rounds = state.rounds ?? [];
   const rows = rounds.flatMap((r) => (r.items ?? []).map((item) => triageRow(r.n, item)));
   const out = [MARKERS.triage, '', '### Pipeline review triage', '', TRIAGE_HEADER, '|---|---|---|---|---|---|---|---|', ...rows];
   if (rounds.length === 0) out.push('', '_No review rounds recorded yet._');
   else if (rows.length === 0) out.push('', '_Codex raised no findings._');
+  const granted = grantedRounds(state);
+  if (granted.length > 0) out.push('', `Owner-granted extra round(s): ${granted.map((g) => `${grantLabel(g)} - "${line(g.quote, 300)}"`).join('; ')}`);
   out.push('', encodeForComment(state));
   return out.join('\n');
 }
@@ -100,7 +108,7 @@ function fmtModels(p) {
   return 'unknown';
 }
 
-function outliersSection(entries, modelProofs) {
+function outliersSection(entries, modelProofs, state) {
   const out = [];
   const arbitrated = entries.filter(({ item }) => item.arbiter);
   for (const { item } of unique(arbitrated)) {
@@ -118,6 +126,9 @@ function outliersSection(entries, modelProofs) {
   }
   for (const { item } of unique(entries.filter(({ item: i }) => i.final?.ownerQuote))) {
     out.push(`- ${findingLabel(item)} · Owner (chat): ${line(item.final.decision)} — "${line(item.final.ownerQuote, 300)}"`);
+  }
+  for (const g of grantedRounds(state)) {
+    out.push(`- Owner (chat) granted ${grantLabel(g)} - "${line(g.quote, 300)}"`);
   }
   for (const p of modelProofs) {
     out.push(`- Fable proof: ${line(p.transcript)}, models ${fmtModels(p)}, effort ${line(p.effort ?? 'high')}`);
@@ -168,7 +179,7 @@ export function summarySections(state, { outcome, built, followups = [], modelPr
   });
   const section = (heading, body) => `${heading}\n\n${body}`;
   return [
-    section('### Outliers', outliersSection(entries, modelProofs)),
+    section('### Outliers', outliersSection(entries, modelProofs, state)),
     '',
     section('### What was built', built ? defuse(String(built).trim()) : '_Not provided_'),
     '',
