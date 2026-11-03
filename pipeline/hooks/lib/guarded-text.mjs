@@ -12,7 +12,11 @@ const FORCE_FLAGS = /(?:^|\s)(?:\+\S+|-f|--force\S*|--all|--mirror|--delete)(?=\
 // name in command position (a path, "=", whitespace or an opening quote in front; not ".claude", "CLAUDE.md" or "claude-pipeline") followed by -p/-r/-c, --print/--resume/--continue,
 // or (right after a quote) a bare prompt word. The bare word is case-sensitive, so prose ("Claude Code is…") is not read as a prompt.
 const CLAUDE_RUN_FLAGS = /(?:^|[\s=/])claude(?:-code)?\s+(?:-[a-zA-Z]*[prc]\b|--(?:print|resume|continue)\b)/i;
-const CLAUDE_RUN_PROMPT = /["'`]\s*(?:[^\s"'`]*\/)?claude(?:-code)?\s+(?!-)[A-Za-z0-9"']/;
+// Quote-anchored name (a string that starts with it, or an argv array's first element): what follows it, as one string (`claude --model x hello`) or as the array's next element
+// (`'claude', 'hello'`), is a run unless it is one of the calls that cannot submit a prompt (the same allowlist as the direct rule). The name alone (`which("claude")`) is no run.
+const CLAUDE_QUOTED = /["'`]\s*(?:[^\s"'`]*\/)?claude(?:-code)?(?=\s|["'`])(?:\s+([^"'`]*)|["'`]\s*,\s*\[?\s*["'`]([^"'`]*))/g;
+const CLAUDE_READ_ONLY = /^(?:--version|-v|-V|--help|-h|doctor|(?:mcp|config)\s+(?:list|get)\b.*)$/;
+const claudePromptRun = (t) => [...t.matchAll(CLAUDE_QUOTED)].some((m) => { const args = (m[1] ?? m[2] ?? '').trim(); return args !== '' && !CLAUDE_READ_ONLY.test(args); });
 const PROTECTED_DEST = /(?:^|[\s:+])(?:refs\/heads\/)?(?:main|master)(?=\s|$)/i;
 
 // Readers and tools whose arguments are data, not commands; judged by their own rules or not at all.
@@ -42,7 +46,7 @@ export function guardedCommandText(text) {
     if (/\bprotect\b.*--apply\b/i.test(seg)) return 'it runs `pipeline protect --apply`';
     if (CLAUDE_RUN_FLAGS.test(seg)) return 'it runs the Claude Code CLI with a prompt, -p/--print, --resume or --continue (#132)';
   }
-  if (CLAUDE_RUN_PROMPT.test(t)) return 'it runs the Claude Code CLI with a prompt (#132)';
+  if (claudePromptRun(t)) return 'it runs the Claude Code CLI with a prompt or options (#132)';
   return null;
 }
 

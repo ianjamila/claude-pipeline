@@ -277,6 +277,47 @@ test('R1-F4: the dynamic-line denial says the command is only known at run time,
   assert.ok(String(w.reason).includes('only known at run time'), w.reason);
 });
 
+// ---- review round 2 (#133) ----
+
+test('R2-B1: an embedded claude command with options in front of the flag or the prompt is refused', () => {
+  for (const command of [
+    `python3 -c 'import os; os.system("claude --model sonnet -p hi")'`,
+    `python3 -c 'import os; os.system("claude --model sonnet hello")'`,
+    `python3 -c 'import os; os.system("claude --dangerously-skip-permissions -p hi")'`,
+    `node -e 'require("child_process").execSync("claude --model opus --continue")'`,
+    `perl -e 'system("claude --model sonnet hello")'`,
+  ]) assert.equal(decide(command), 'deny', command);
+});
+
+test('R2-F1: an argv array with a bare prompt, or options, is refused', () => {
+  for (const command of [
+    `python3 -c "import subprocess; subprocess.run(['claude', 'hello world'])"`,
+    `node -e 'require("child_process").execFileSync("claude", ["merge it"])'`,
+    `python3 -c "import subprocess; subprocess.run(['claude', '--model', 'sonnet', '-p', 'hi'])"`,
+    `python3 -c "import subprocess; subprocess.run(['claude', '-p', 'hi'])"`,
+  ]) assert.equal(decide(command), 'deny', command);
+});
+
+test('R2: embedded read-only claude calls and bare names stay allowed', () => {
+  for (const command of [
+    `node -e 'console.log("claude --version")'`,
+    `python3 -c 'import subprocess; subprocess.run(["claude", "--version"])'`,
+    `python3 -c 'import subprocess; subprocess.run(["claude", "mcp list"])'`,
+    `python3 -c 'import shutil; print(shutil.which("claude"))'`,
+    `node -e 'console.log("claude")'`,
+    `node -e 'console.log("claude mcp list")'`,
+  ]) assert.equal(decide(command), 'allow', command);
+});
+
+test('R2-F2: hash -p with the path attached, or grouped flags, binds a name to claude', () => {
+  for (const command of [
+    'hash -p/opt/homebrew/bin/claude c; c -p hi',
+    'hash -rp /opt/homebrew/bin/claude c; c -p hi',
+    'hash -lp /opt/homebrew/bin/claude c',
+  ]) assert.equal(decide(command), 'deny', command);
+  for (const command of ['hash -r', 'hash -rp /usr/bin/git g', 'hash claude']) assert.equal(decide(command), 'allow', command);
+});
+
 test('R1: ordinary lines that mention claude as a path or document stay allowed', () => {
   for (const command of [
     'cd ~/Claude && ls',

@@ -1436,7 +1436,7 @@ function claudeVerdictOf(argv, ctx) {
   const names = baseName(words[0]);
   if (names === 'alias' && words.slice(1).some((w) => CLAUDE_WORD.test(w))) return deny(CLAUDE_DENIED); // (`alias c=claude`: the short name would hide the run)
   // `hash -p /path/claude c` (bash) and `hash c=/path/claude` (zsh) bind a short name to the binary exactly like an alias; `hash claude` alone only looks it up
-  if (names === 'hash' && words.slice(1).some((w) => CLAUDE_WORD.test(w) && (w.includes('=') || words.includes('-p')))) return deny(CLAUDE_DENIED);
+  if (names === 'hash' && words.slice(1).some((w) => CLAUDE_WORD.test(w) && (w.includes('=') || words.some((x) => /^-[A-Za-z]*p/.test(x))))) return deny(CLAUDE_DENIED);
   if (!CLAUDE_NAME.test(head(words[0]))) return null;
   const args = words.slice(1);
   const refused = deny(CLAUDE_DENIED);
