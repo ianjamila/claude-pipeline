@@ -1117,6 +1117,83 @@ test('#128 R1-F2: cp -l / --link, pax -rwl and rsync --link-dest from a transcri
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 
+// #128 round 2 (R2-B1): the config dir ITSELF is a transcript root like ~/.claude is an ancestor: a recursive copy or an extract into it lands in projects/.
+test('#128 R2-B1: a run that fills the $CLAUDE_CONFIG_DIR folder itself (rsync, tar -C, a shell sitting in it) is refused, as for ~/.claude; files beside projects stay open', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    'rsync -a /tmp/forged/ /home/u/claude-config/',
+    'rsync -a /tmp/forged/ /home/u/claude-config',
+    'tar -xf x -C /home/u/claude-config',
+    'cp -R /tmp/forged/. /home/u/claude-config/',
+    'rm -rf /home/u/claude-config',
+    'mv /tmp/forged /home/u/claude-config',
+    'cd /home/u/claude-config && tar -xf x',
+    'cd /home/u/claude-config && /usr/bin/tar -xf x',
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  // (as resolved: the folder is a link to another one)
+  const link = { env, realpath: (p) => p.replace('/home/u/claude-config', '/data/cfg'), existsSync: (p) => p === '/home/u/claude-config' };
+  assert.equal(bash('rsync -a /tmp/forged/ /data/cfg/', link), 'deny');
+  assert.equal(bash('cd /data/cfg && tar -xf x', link), 'deny');
+  for (const cmd of [
+    'ls -la /home/u/claude-config',
+    'cat /home/u/claude-config/settings.json',
+    'cp -R /home/u/claude-config /tmp/copy',
+    'echo x > /home/u/claude-config/notes.txt',
+    'echo x >> /home/u/claude-config/other.jsonl',
+    'rsync -a /tmp/forged/ /home/u/claude-config-old/',
+    'tar -xf x -C /home/u/claude-config-old',
+    'cd /home/u/claude-configs && tar -xf x',
+  ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  // (without the variable it is just a folder)
+  assert.equal(bash('rsync -a /tmp/forged/ /home/u/claude-config/'), 'allow');
+});
+
+// R2-B2: a wildcard segment is asked whether it can stand for ANY name that starts with .claude, not for two sample names.
+test('#128 R2-B2: a glob segment that can match any .claude* folder name is refused (? in the middle, a leading ?, a tail wildcard); unrelated globs stay open', () => {
+  for (const cmd of [
+    'cp /tmp/forged.jsonl ~/.claud?-eaglewatch/projects/-repo/abc.jsonl',
+    'cp /tmp/forged.jsonl ~/.?laude-eaglewatch/projects/-repo/abc.jsonl',
+    'cp /tmp/forged.jsonl ~/.claud?-e*/projects/-repo/abc.jsonl',
+    'printf x > ~/.cl[a]ude-eaglewatch/projects/-repo/abc.jsonl',
+    'printf x > ~/.c?aude-ea*/projects/-repo/abc.jsonl',
+    'printf x > ~/.claude-?agle*/projects/-repo/abc.jsonl',
+    'cp -R /tmp/forged/. ~/.claud?-eaglewatch/projects/-repo/',
+    'cp /tmp/forged.jsonl ~/.claude-eaglewatch/projects/-repo/abc.jsonl',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    'cp /tmp/x ~/.cache/*',
+    'cp /tmp/forged.jsonl ~/.cache/*/projects/-repo/abc.jsonl',
+    'cp /tmp/forged.jsonl ~/.clause?-x/projects/-repo/abc.jsonl', // (.clause…: never .claude…)
+    'cp /tmp/forged.jsonl ~/.cl?ud-x/projects/-repo/abc.jsonl', // (.cl + one character + ud-x: the 7th character is -, so no name starts with .claude)
+    'cp /tmp/x ~/.claud?-eaglewatch/projects/-repo/notes.md',
+    'cat ~/.claud?-eaglewatch/projects/-repo/abc.jsonl',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// R2-F1: program text names a path the shell never sees as a word.
+test('#128 R2-F1: program text (python -c, node -e, a heredoc body) that names a transcript under $CLAUDE_CONFIG_DIR is refused, as one under .claude is', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  const T = '/home/u/claude-config/projects/-repo/abc.jsonl';
+  const S = '/home/u/claude-config/projects/-repo/abc/subagents/agent-1.jsonl';
+  for (const cmd of [
+    `python3 -c "open('${T}','w').write('x')"`,
+    `python3 -c "open('${S}','a').write('x')"`,
+    `node -e "require('fs').writeFileSync('${T}','x')"`,
+    `python3 - <<'EOF'\nopen('${T}','w').write('x')\nEOF`,
+    `cat <<EOF | python3\nopen("${T}", "w").write("x")\nEOF`,
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  // (the default config dir is denied the same way)
+  assert.equal(bash(`python3 -c "open('/home/u/.claude/projects/-repo/abc.jsonl','w').write('x')"`), 'deny');
+  for (const cmd of [
+    `python3 -c "open('/home/u/claude-config/other.jsonl','w').write('x')"`,
+    `python3 -c "open('/home/u/claude-config/projects/-repo/memory/n.md','w').write('x')"`,
+    `python3 -c "open('/mnt/home/u/claude-config/projects/-repo/abc.jsonl','w').write('x')"`,
+    `python3 -c "open('/home/u/claude-config-old/projects/-repo/abc.jsonl','w').write('x')"`,
+  ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  // (without the variable it is just a folder)
+  assert.equal(bash(`python3 -c "open('${T}','w').write('x')"`), 'allow');
+});
+
 test('Phase 3b: a program that resolves into a review folder is judged like any other (only the installed pipeline is trusted)', () => {
   // (run.mjs links to a file in a round folder: the hook judges the real file's text, it does not skip it as a pipeline program)
   const prog = '/repo/.review/round-1/x.mjs';

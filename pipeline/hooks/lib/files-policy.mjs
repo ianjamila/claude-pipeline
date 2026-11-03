@@ -989,6 +989,9 @@ function makeMatchers(ctx) {
   const ancestors = rootsAndAncestors(ctx);
   const reviewText = new RegExp(reviewTextBody(SEP), ctx.ci ? 'i' : '');
   const transcriptText = new RegExp(TRANSCRIPT_TEXT_SRC, ctx.ci ? 'i' : '');
+  // R2-F1: the same for each config dir ($CLAUDE_CONFIG_DIR, as given and as resolved), whatever it is called: a transcript named in program text (python -c, node -e, a heredoc
+  // body). On a path boundary, as rootRegexes do it. (The dir alone, or a project folder, is not text that names a transcript: for `.claude` neither is.)
+  const rootTranscriptText = ctx.transcriptRoots.map((r) => new RegExp(`(?:(?<![\\w.~])|(?<=\\s-[A-Za-z]))${escapeRe(r)}/projects/[^\\s'"]*\\.jsonl(?![\\w.\\-])`, ctx.ci ? 'i' : ''));
   // A glob that can match a repo's review folder or a protected file in it (REVIEW_FILE_SRC), wherever it is: a segment that can be
   // `.review`, then the end (the folder itself) or a segment that can be one of the protected names. `**` can stand for the folder and
   // for a round folder, so anything after it counts. A wildcard reaches a dot name only with DOT_GLOB on the line.
@@ -1018,7 +1021,17 @@ function makeMatchers(ctx) {
   // or a last name that ends in .jsonl or is a wildcard with no literal other extension (`*.md` cannot be one); a path through a memory folder cannot be one.
   // (`cp x GLOB/notes.md` is also judged as GLOB/notes.md/x, a file in a folder: a literal last name is no transcript there)
   // (R1-B2: `$CLAUDE_CONFIG_DIR/projects` reached by a glob is judged the same way)
-  const claudeSeg = (seg) => (/[*?[]/.test(seg) ? can(seg, '.claude') || can(seg, '.claude-x') || /^\.claude/i.test(seg) : /^\.claude/i.test(seg));
+  // (R2-B2: can the segment stand for ANY name that starts with `.claude`, not for two sample names? A glob matches such a name exactly when some token-prefix of it
+  // matches `.claude` whole -- what follows is then the free tail of the name -- so each cut of the segment is read as a glob of its own with segmentRe (a cut inside a
+  // [class] reads as a literal "[" and matches nothing: harmless, the cut after the class is tried too). `.claud?-eaglewatch` is cut at `.claud?`, `.?laude-e*` at `.?laude`.)
+  const CLAUDE = '.claude';
+  const claudeSeg = (seg) => {
+    if (!/[*?[]/.test(seg)) return /^\.claude/i.test(seg);
+    if (!seg.startsWith('.') && ctx.dotGlob !== true) return false; // (a wildcard reaches a dot name only with DOT_GLOB, as in can())
+    if (seg === '**') return true;
+    for (let i = 1; i <= seg.length; i++) if (segmentRe(seg.slice(0, i), ctx.ci)?.test(CLAUDE)) return true;
+    return false;
+  };
   const transcriptTail = (rest) => {
     const last = rest[rest.length - 1] ?? '';
     if (rest.length <= 1) return rest.length === 0 || last.endsWith('.jsonl') || !/\.[A-Za-z0-9]+$/.test(last); // (projects/ itself, or a project folder)
@@ -1084,7 +1097,7 @@ function makeMatchers(ctx) {
       if (ctx.braceOver === true && ctx.hasReviewDir()) return true; // (#111: a brace expansion cut by its cap may hide a protected name; fail closed with a review folder)
       if (rootRes.some((re) => re.test(v))) return true;
       if (reviewText.test(v)) return true; // (a repo's review state: protected wherever it is, so the name alone is the reference)
-      if (transcriptText.test(v)) return true; // (#128: a session transcript, in any config dir)
+      if (transcriptText.test(v) || rootTranscriptText.some((re) => re.test(v))) return true; // (#128: a session transcript, in any config dir; R2-F1: also under $CLAUDE_CONFIG_DIR)
       if (aliasInText(v, dirs)) return true;
       if (!(ctx.ci ? v.toLowerCase() : v).includes('.claude')) continue;
       if (suffix.nonlit.test(v)) return true;

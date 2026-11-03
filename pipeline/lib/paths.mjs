@@ -139,14 +139,18 @@ export function configDirOf(env, home = os.homedir()) {
 }
 // The patterns for files (`files`), for the folders (`dirs`: a word that IS one is a protected reference) and for the folders a command may be run
 // in (`below`: dirs but `projects/` itself, which is also where a shell may sit to write notes): the `.claude*` shape, plus each of `configDirs`
-// (absolute POSIX paths; null/'' are skipped).
+// (absolute POSIX paths; null/'' are skipped). R2-B1: a config dir is itself a folder that holds them (the way ~/.claude is an ancestor of its
+// protected entries): `rsync -a x/ <dir>/`, `tar -xf x -C <dir>` and a shell sitting in it fill projects/ without naming it, so the dir is in `dirs` and `below`.
+// (The folders ABOVE a config dir are not: the same gap as for the pipeline files, not closed here.)
 export function transcriptRes(configDirs = [], ci = false) {
   const flags = ci ? 'i' : '';
-  const roots = [...new Set(configDirs.filter(Boolean))].map((d) => `^${reEscape(d)}/`);
+  const dirs = [...new Set(configDirs.filter(Boolean))];
+  const roots = dirs.map((d) => `^${reEscape(d)}/`);
+  const self = dirs.map((d) => `^${reEscape(d)}/*$`);
   return {
     files: [TRANSCRIPT_FILE_SRC, ...roots.map((r) => r + TRANSCRIPT_LEAF)].map((s) => new RegExp(s, flags)),
-    dirs: [ANY_CLAUDE_DIR + TRANSCRIPT_TOP, ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...roots.flatMap((r) => [r + TRANSCRIPT_TOP, r + TRANSCRIPT_BELOW])].map((x) => new RegExp(x, flags)),
-    below: [ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...roots.map((r) => r + TRANSCRIPT_BELOW)].map((x) => new RegExp(x, flags)),
+    dirs: [ANY_CLAUDE_DIR + TRANSCRIPT_TOP, ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...self, ...roots.flatMap((r) => [r + TRANSCRIPT_TOP, r + TRANSCRIPT_BELOW])].map((x) => new RegExp(x, flags)),
+    below: [ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...self, ...roots.map((r) => r + TRANSCRIPT_BELOW)].map((x) => new RegExp(x, flags)),
   };
 }
 // Is this path (any slash flavour) a transcript FILE the guard protects?
