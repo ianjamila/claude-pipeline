@@ -21,8 +21,10 @@ const REPO = 'acme/app';
 const REQUEST = `Two items for you.\nHead ${HEAD.slice(0, 12)} · items ${ITEMS} · repo ${REPO}\n🔀 Ready to merge #58 — say "merge"`;
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'owner-go-unit-'));
+// (R1-B2: a transcript has the shape Claude Code gives it and the guard protects, <config dir>/projects/<project>/<session>.jsonl: the use-time check takes no other)
 function transcript(dir, entries) {
-  const file = join(dir, `t-${Math.random().toString(36).slice(2)}.jsonl`);
+  mkdirSync(join(dir, '.claude', 'projects', '-repo'), { recursive: true });
+  const file = join(dir, '.claude', 'projects', '-repo', `t-${Math.random().toString(36).slice(2)}.jsonl`);
   writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
   return file;
 }
@@ -524,6 +526,62 @@ test('#128 rulings: nothing is skipped by its text, and an owner turn between th
   assert.equal(lastRequestText(transcript(home, [promptEntry('go'), promptEntry(NOTICE, NOTICE_META), said(REQUEST), promptEntry('merge')]), { prompt: 'merge', skipSynthetic: true }), '', '…nor a 🔀 line');
   // an ask made BEFORE a notice and answered after it still needs the line to be the last thing the agent said before the notice
   assert.equal(rule([promptEntry('go'), said(`${ASK_REPLY}\nand one more thing`), promptEntry(NOTICE, NOTICE_META), said('ok')]), null);
+});
+
+// R1-F3: a reply to a notice is dropped from the look-back, but what it SHOWED may be a newer ask: the owner's answer then belongs to that one.
+test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice voids the pending ruling ask (nothing is recorded for either PR)', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-11-03T10:00:00Z');
+  const ask = (pr) => `R1-B1 waits for you.\n⚖️ Owner ruling needed #${pr}: R1-B1 · content ${pr === 58 ? 'aaaaaaaaaaaa' : 'bbbbbbbbbbbb'} · repo acme/app`;
+  const rule = (entries, answer = 'R1-B1: reject') => {
+    const e = promptEntry(answer);
+    return recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: answer, prompt_id: e.promptId, transcript_path: transcript(home, [...entries, e]) }, { home, now });
+  };
+  const head = [promptEntry('go'), said(ask(58))];
+  const notice = promptEntry(NOTICE, NOTICE_META);
+  for (const [name, shown] of [
+    ['a ruling line for another PR', ask(59)],
+    ['a ruling line, not the last line', `${ask(59)}\nSorry, one more thing.`],
+    ['the same ask shown again', ask(58)],
+    ['a 🔀 request', REQUEST],
+  ]) {
+    assert.equal(rule([...head, notice, said('The build finished.'), said(shown)]), null, name);
+    assert.equal(rule([...head, notice, said(shown)]), null, `${name}, no other text`);
+  }
+  for (const pr of [58, 59]) assert.equal(ownerRuled({ repo: 'acme/app', pr, id: 'R1-B1', quote: 'R1-B1: reject', decision: 'REJECT', contentOf: () => (pr === 58 ? 'aaaaaaaaaaaa' : 'bbbbbbbbbbbb'), home, now }), false, `#${pr}`);
+  assert.deepEqual(readApprovals({ home, now }), []);
+  // the limit is the reply to a harness turn only: a plain reply after the ask, an ask shown BEFORE the notice, and a new owner turn after the poisoned reply all work as before
+  assert.deepEqual([rule([...head, notice, said('The build finished.')])?.pr], [58], 'no ask in the reply');
+  assert.deepEqual([rule([promptEntry('go'), said(ask(59)), notice, said('ok')])?.pr], [59], 'the ask is the last thing before the notice');
+  assert.deepEqual([rule([...head, notice, said(ask(59)), promptEntry('what is that?'), said(ask(59))])?.pr], [59], 'the owner asked again: a new slot');
+});
+
+test('#128 R1-B2: provenance is taken only from a transcript of the shape the guard protects (any .claude* folder, or $CLAUDE_CONFIG_DIR)', () => {
+  const root = tmp();
+  const put = (rel) => {
+    const f = join(root, rel);
+    mkdirSync(join(f, '..'), { recursive: true });
+    writeFileSync(f, `${JSON.stringify(promptEntry('merge', OWNER_META, 'pid-m'))}\n`);
+    return { transcript_path: f, prompt_id: 'pid-m' };
+  };
+  for (const rel of ['.claude/projects/-repo/s.jsonl', '.claude-eaglewatch/projects/-repo/s.jsonl', '.claude/projects/-repo/s/subagents/x.jsonl'.replace('/subagents', '/tool-results')]) {
+    assert.equal(promptProvenance(put(rel), { env: {} }), 'owner', rel);
+  }
+  for (const rel of ['t.jsonl', 'claude-config/projects/-repo/s.jsonl', '.claude/other/-repo/s.jsonl', '.claude/projects/s.jsonl', '.claude/projects/-repo/s.json', 'cfg/.claude/s.jsonl']) {
+    assert.equal(promptProvenance(put(rel), { env: {} }), 'missing', rel);
+  }
+  // a config dir under another name is the guard's too once the environment names it
+  const custom = put('claude-config/projects/-repo/s.jsonl');
+  assert.equal(promptProvenance(custom, { env: { CLAUDE_CONFIG_DIR: join(root, 'claude-config') } }), 'owner');
+  assert.equal(promptProvenance(custom, { env: { CLAUDE_CONFIG_DIR: join(root, 'elsewhere') } }), 'missing');
+  // …and a record whose transcript is outside never approves
+  const w = mergeWorld(root, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] });
+  assert.deepEqual(askedFor(w), [true, true, 'ok']);
+  const moved = join(root, 'moved.jsonl');
+  writeFileSync(moved, readFileSync(w.file));
+  const line = JSON.parse(readFileSync(join(ownerGoDir(w.g.home), 'sess-1.jsonl'), 'utf8').trim());
+  writeFileSync(join(ownerGoDir(w.g.home), 'sess-1.jsonl'), `${JSON.stringify({ ...line, transcript_path: moved })}\n`);
+  assert.deepEqual(askedFor(w), [false, false, 'provenance'], 'a transcript the guard does not protect');
 });
 
 test('#128 merges stay strict: a notice and the reply to it make the 🔀 request stale', () => {

@@ -26,6 +26,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { isTranscriptFile } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
 export const MAX_AGE_MS = 24 * 60 * 60 * 1000; // a "merge" older than a day approves nothing
@@ -191,8 +192,13 @@ export function lastRequestText(transcriptPath, opts = {}) {
 // text) opens no reply slot, and every assistant text after it up to the next other prompt is dropped, so the owner can answer a ruling
 // ask after a background notice and the agent's reply to it, and a ruling or 🔀 line printed in that reply binds nothing. An owner prompt
 // or one of unknown source is a boundary as before, so a pasted `<task-notification>` typed by the owner keeps its boundary.
+// R1-F3 (the limit): a dropped reply may itself have shown a NEWER ask (the agent can start a synthetic turn at will, with a background task), and the owner
+// answers the ask they last saw. So a dropped reply that holds a ruling line or a 🔀 line voids the pending slot: '' (the owner is asked again, the nudge fires).
+const SHOWS_ASK = /Owner ruling needed\s+#\d/i;
+const showsAsk = (text) => SHOWS_ASK.test(text) || READY_LINE.test(text);
 export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
   const replies = [''];
+  const voided = new Set(); // slots (indexes of replies) whose ask a dropped reply replaced
   let lastIsPrompt = false; // is the newest user/assistant entry a prompt (the owner's current one)?
   let lastPromptText = '';
   let skipping = false; // inside a synthetic turn: its prompt and the replies to it
@@ -209,7 +215,10 @@ export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTE
       }
       lastIsPrompt = isPrompt;
     } else if (e?.type === 'assistant' && Array.isArray(content)) {
-      if (skipping) continue;
+      if (skipping) {
+        if (content.some((b) => b?.type === 'text' && typeof b.text === 'string' && showsAsk(b.text))) voided.add(replies.length - 1);
+        continue;
+      }
       lastIsPrompt = false;
       for (const b of content) if (b?.type === 'text' && typeof b.text === 'string') replies[replies.length - 1] += `${b.text}\n`;
     }
@@ -219,7 +228,7 @@ export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTE
   // older request is never revived by a later "merge": the agent shows it again.
   const current = lastIsPrompt && (prompt === undefined || plain(prompt) === lastPromptText);
   const last = replies.length - 1 - (current && replies.length > 1 ? 1 : 0);
-  return replies[last] ?? '';
+  return voided.has(last) ? '' : (replies[last] ?? '');
 }
 
 // ---- #128: is this prompt the owner's words? --------------------------------------------------------------------------------------
@@ -454,11 +463,13 @@ export const repoKey = (repo) => (typeof repo === 'string' && new RegExp(`^${REP
 // PROMPT entries only (a tool_result sharing the id is no prompt); two prompt entries with one id is a replayed or forged id: synthetic.
 // A record without prompt_id (a hook that sends none) is matched by its stored words within FALLBACK_WINDOW_MS of the record, same rule.
 // Returns 'owner', 'synthetic', or 'missing' (no such entry within PROVENANCE_CAP_BYTES of the end, or the transcript is not a readable regular
-// file). An entry of unknown source (no provenance field) counts as the owner's ONLY when no prompt in the scanned transcript carries any
+// file, or one of a shape the guard does not write-protect: R1-B2, lib/paths.mjs isTranscriptFile, the ONE definition files-policy.mjs protects by: a file the
+// guard leaves writable is not evidence of who typed anything, so a transcript_path elsewhere, or in a config dir the environment does not name, is refused here).
+// An entry of unknown source (no provenance field) counts as the owner's ONLY when no prompt in the scanned transcript carries any
 // such field (a genuinely old Claude Code); in a modern transcript it is untrusted, and so is an unknown one when the scan fell short of the start.
-export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, capBytes = PROVENANCE_CAP_BYTES } = {}) {
+export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, capBytes = PROVENANCE_CAP_BYTES, env = process.env } = {}) {
   const file = record?.transcript_path;
-  if (typeof file !== 'string' || file === '' || !path.isAbsolute(file) || /(?:^|[\\/])subagents[\\/]/.test(file)) return 'missing';
+  if (typeof file !== 'string' || file === '' || !path.isAbsolute(file) || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { env })) return 'missing';
   let match;
   if (typeof record.prompt_id === 'string' && record.prompt_id !== '') {
     const id = record.prompt_id;

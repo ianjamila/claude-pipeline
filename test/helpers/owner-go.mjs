@@ -1,7 +1,7 @@
 // #58: the owner's chat "merge", as the owner-go recorder writes it. `P merge` reads the records from the account's real home
 // (never $HOME, which the agent could point elsewhere), so a test writes its record there under a random session name and
 // deletes it afterwards (t.after). A random temp-repo head never matches anything else.
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -14,6 +14,12 @@ const HOOK = fileURLToPath(new URL('../../pipeline/hooks/owner-go.mjs', import.m
 // What Claude Code writes on a prompt entry the owner typed (#128): the use-time provenance check accepts a record only for such an entry.
 export const OWNER_ENTRY = { origin: { kind: 'human' }, promptSource: 'typed', entrypoint: 'cli' };
 
+// Where a test transcript lives: <dir>/.claude/projects/-repo/t.jsonl, the shape the use-time provenance check accepts (R1-B2; lib/paths.mjs isTranscriptFile).
+const transcriptIn = (dir) => {
+  mkdirSync(join(dir, '.claude', 'projects', '-repo'), { recursive: true });
+  return join(dir, '.claude', 'projects', '-repo', 't.jsonl');
+};
+
 // What the recorder writes when the owner types `prompt` after a reply that showed `reply`. Returns the record (or null).
 // `entry` overrides the prompt entry's provenance fields (a test of a prompt that is NOT the owner's).
 // `after` (#128 use-time check): once the record is written, the prompt's transcript entry is replaced by one with these provenance fields
@@ -24,7 +30,7 @@ export const ownerRules = (t, prompt, reply, entry, after) => said(t, prompt, re
 
 function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined) {
   const dir = mkdtempSync(join(tmpdir(), 'owner-go-'));
-  const transcript = join(dir, 't.jsonl');
+  const transcript = transcriptIn(dir);
   const promptId = `pid-${randomUUID()}`;
   writeFileSync(transcript, `${[
     { type: 'user', message: { content: 'ship it' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
@@ -64,7 +70,7 @@ export const approvalFlags = (head, items) => ['--owner-approved-head', head, '-
 // afterwards. Returns { stdout, status, record } (record: the owner-go line written for the session, or null).
 export function runHook(t, { entries, prompt, entry = OWNER_ENTRY, appended = true, input = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'owner-go-hook-'));
-  const transcript = join(dir, 't.jsonl');
+  const transcript = transcriptIn(dir);
   const promptId = `pid-${randomUUID()}`;
   const all = appended ? [...entries, { type: 'user', message: { content: prompt }, promptId, ...entry }] : entries;
   writeFileSync(transcript, `${all.map((e) => JSON.stringify(e)).join('\n')}\n`);
