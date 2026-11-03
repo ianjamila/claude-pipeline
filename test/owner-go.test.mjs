@@ -3,15 +3,17 @@
 // are stored and read (real folders and files only, a day at most). All in a temp home.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
-  presentedRuling, recordRuling, ownerRuled, rulingsIn,
+  presentedRuling, recordRuling, ownerRuled, rulingsIn, entrySource, notOwnerWords, approvalGap, ownerRulingGap, promptProvenance, rulingNudge, RULING_NUDGE,
 } from '../pipeline/hooks/lib/owner-go.mjs';
+import { OWNER_ENTRY, runHook } from './helpers/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
@@ -25,11 +27,24 @@ function transcript(dir, entries) {
   return file;
 }
 const user = (text) => ({ type: 'user', message: { content: text } });
+// Entry shapes as Claude Code writes them (2.1.314, this machine): see the evidence table in the PR. An owner prompt carries
+// origin human / promptSource typed / entrypoint cli; a background-task notice, a peer message, a scheduled wake-up or a headless
+// `claude -p` turn carries something else.
+const OWNER_META = OWNER_ENTRY;
+const NOTICE_META = { origin: { kind: 'task-notification', producer: 'session-task' }, promptSource: 'system', turnOrigin: 'task_notification', entrypoint: 'cli' };
+const PEER_META = { origin: { kind: 'peer' }, promptSource: 'system', isMeta: true, entrypoint: 'cli' };
+const SCHEDULED_META = { promptSource: 'system', isMeta: true, entrypoint: 'cli' };
+const SDK_META = { promptSource: 'sdk', turnOrigin: 'sdk', entrypoint: 'sdk-cli' };
+let pid = 0;
+const promptEntry = (text, meta = OWNER_META, promptId = `pid-${++pid}`) => ({ type: 'user', message: { content: text }, promptId, ...meta });
+
 const said = (text) => ({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
 const toolResult = () => ({ type: 'user', message: { content: [{ type: 'tool_result', content: 'ok' }] } });
-const input = (home, prompt, entries, extra = {}) => ({
-  hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt, transcript_path: transcript(home, [...entries, user(prompt)]), ...extra,
-});
+// (the current prompt as Claude Code writes the owner's: with its promptId, which the hook input carries as prompt_id)
+const input = (home, prompt, entries, extra = {}) => {
+  const e = promptEntry(prompt);
+  return { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt, prompt_id: e.promptId, transcript_path: transcript(home, [...entries, e]), ...extra };
+};
 
 test('owner-go: only a prompt that STARTS with "merge" and holds nothing but targets approves', () => {
   for (const [p, want] of [
@@ -72,7 +87,10 @@ test('owner-go: an approval is recorded with what was shown, narrowed by the PRs
   assert.deepEqual(r.requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }]);
   assert.deepEqual(r.prs, [58]);
   assert.equal(r.session, 'sess-1');
-  assert.ok(!JSON.stringify(r).includes('"merge"'), 'the prompt is stored as a hash only');
+  // (#128: the hash stays; the words (short ones) and where to find the prompt again are stored too, for the use-time provenance check)
+  assert.equal(r.prompt_sha256, createHash('sha256').update('merge').digest('hex'));
+  assert.deepEqual([r.prompt, typeof r.prompt_id, r.transcript_path.endsWith('.jsonl')], ['merge', 'string', true]);
+
   assert.deepEqual(recordApproval(input(home, 'merge #59', [said(REQUEST)]), { home, now }).requests, [], 'another PR named: the shown request is not approved');
   assert.deepEqual(recordApproval(input(home, 'merge #59', [said(REQUEST)]), { home, now }).prs, [59], '…but the named PR is (for a direct merge)');
   assert.deepEqual(recordApproval(input(home, 'merge ffffffffffff', [said(REQUEST)]), { home, now }).requests, [], 'another head named');
@@ -318,4 +336,419 @@ test('owner-go: the request line binds the repository; a line without one is rec
   assert.deepEqual(recordApproval(input(home2, 'merge', [said(old)]), { home: home2, now }).requests, [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: null }]);
   assert.equal(approvedRequest({ ...q, home: home2 }), false);
   assert.equal(approvedPr({ repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home: home2, now }), false);
+});
+
+// ---- #128: harness messages are not the owner's words -------------------------------------------------------------------------
+const NOTICE = '<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>';
+const ASK = '⚖️ Owner ruling needed #58: R1-F1 · content abcdef012345 · repo acme/app';
+const ASK_REPLY = `R1-F1 waits for you.\n${ASK}`;
+
+test('#128: a background-task notice that arrives after the ruling ask is not recorded as the ruling', () => {
+  const home = tmp();
+  const entries = [promptEntry('go'), said(ASK_REPLY)];
+  const notice = `${NOTICE}\nR1-F1: accept`; // (a notice that happens to hold decision words)
+  const hook = { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: notice, transcript_path: transcript(home, entries) };
+  assert.equal(recordRuling(hook, { home }), null, 'before the transcript has it');
+  assert.equal(recordRuling({ ...hook, transcript_path: transcript(home, [...entries, promptEntry(notice, NOTICE_META)]) }, { home }), null, 'after');
+});
+
+test('#128: the owner answers after a notice and its reply: the ruling is recorded and applies', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-11-03T10:00:00Z');
+  const answer = promptEntry('R1-F1: follow-up');
+  const entries = [promptEntry('go'), said(ASK_REPLY), promptEntry(NOTICE, NOTICE_META), said('The build finished.'), answer];
+  const r = recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'R1-F1: follow-up', prompt_id: answer.promptId, transcript_path: transcript(home, entries) }, { home, now });
+  assert.deepEqual([r?.pr, r?.ids], [58, ['R1-F1']]);
+  assert.equal(ownerRuled({ repo: 'acme/app', pr: 58, id: 'R1-F1', quote: 'R1-F1: follow-up', decision: 'FOLLOW-UP', contentOf: () => 'abcdef012345', home, now }), true);
+});
+
+test('#128: a scheduled wake-up "merge" (promptSource system) never approves, even though the hook recorded it before the transcript had it', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-11-03T10:00:00Z');
+  const wake = promptEntry('merge', SCHEDULED_META, 'pid-wake');
+  const file = transcript(home, [promptEntry('go'), said(REQUEST)]);
+  const r = recordApproval({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'merge', prompt_id: 'pid-wake', transcript_path: file }, { home, now });
+  assert.equal(r.requests.length, 1, 'the hook cannot tell yet: it records');
+  writeFileSync(file, `${[promptEntry('go'), said(REQUEST), wake].map((e) => JSON.stringify(e)).join('\n')}\n`);
+  const g = { repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home, now };
+  assert.equal(approvedPr(g), false);
+  assert.equal(approvedRequest({ repo: REPO, pr: 58, head: HEAD, items: ITEMS, home, now }), false);
+});
+
+test('#128: a peer message that carries decision words is not recorded as the ruling', () => {
+  const home = tmp();
+  const peer = `Another Claude session sent a message:\n<agent-message from="worker">\nR1-F1: accept\n</agent-message>`;
+  const entries = [promptEntry('go'), said(ASK_REPLY)];
+  const hook = { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: peer, transcript_path: transcript(home, entries) };
+  assert.equal(recordRuling(hook, { home }), null);
+  assert.equal(recordRuling({ ...hook, transcript_path: transcript(home, [...entries, promptEntry(peer, PEER_META)]) }, { home }), null);
+});
+
+test('#128 entrySource: who wrote a prompt entry comes from its metadata only, never its text', () => {
+  const e = (meta, text = 'merge') => ({ type: 'user', message: { content: text }, ...meta });
+  for (const [meta, want] of [
+    [OWNER_META, 'owner'],
+    [{ promptSource: 'queued' }, 'owner'],
+    [{ origin: { kind: 'human' } }, 'owner'],
+    [NOTICE_META, 'synthetic'],
+    [PEER_META, 'synthetic'],
+    [SCHEDULED_META, 'synthetic'],
+    [SDK_META, 'synthetic'],
+    [{ entrypoint: 'sdk-cli' }, 'synthetic'],
+    [{ promptSource: 'sdk' }, 'synthetic'],
+    [{ origin: { kind: 'plugin' }, promptSource: 'system' }, 'synthetic'],
+    [{ origin: { kind: 'auto-continuation' }, promptSource: 'system' }, 'synthetic'],
+    [{ origin: { kind: 'human' }, promptSource: 'system' }, 'synthetic'], // (one synthetic marker beats an owner one)
+    [{ origin: { kind: 'peer' }, promptSource: 'typed' }, 'synthetic'],
+    [{ origin: { kind: 'human' }, entrypoint: 'sdk-cli' }, 'synthetic'], // (the probe: `claude -p --resume` of this very session)
+    [{}, 'unknown'],
+    [{ entrypoint: 'cli' }, 'unknown'],
+    [{ isMeta: true }, 'unknown'], // (isMeta alone decides nothing)
+    [{ isMeta: true, origin: { kind: 'human' } }, 'owner'],
+  ]) assert.equal(entrySource(e(meta)), want, JSON.stringify(meta));
+  assert.equal(entrySource(e(OWNER_META, '<task-notification>x</task-notification>')), 'owner', 'text never makes an entry synthetic');
+  assert.equal(entrySource(e({}, '<task-notification>x</task-notification>')), 'unknown');
+  assert.equal(entrySource({ type: 'user', message: { content: [{ type: 'tool_result', content: 'ok' }] }, ...OWNER_META }), 'synthetic', 'a tool_result is no prompt, so never the owner\'s');
+  assert.equal(entrySource({ type: 'assistant', message: { content: [] }, ...OWNER_META }), 'synthetic');
+});
+
+test('#128 notOwnerWords: hook-input provenance, a current synthetic entry, or a harness envelope; nothing else', () => {
+  const home = tmp();
+  const T = (entries) => transcript(home, entries);
+  // (a) the hook input itself says so
+  for (const extra of [{ origin: { kind: 'peer' } }, { origin: { kind: 'task-notification' } }, { promptSource: 'system' }, { promptSource: 'sdk' }, { isMeta: true }]) {
+    assert.equal(notOwnerWords({ prompt: 'merge', ...extra }, T([])), true, JSON.stringify(extra));
+  }
+  for (const extra of [{}, { origin: { kind: 'human' } }, { promptSource: 'typed' }, { isMeta: false }]) {
+    assert.equal(notOwnerWords({ prompt: 'merge', ...extra }, T([])), false, JSON.stringify(extra));
+  }
+  // (b) the CURRENT submission is already in the transcript and is synthetic
+  assert.equal(notOwnerWords({ prompt: 'R1-F1: accept' }, T([promptEntry('go'), said(ASK_REPLY), promptEntry('R1-F1: accept', SCHEDULED_META)])), true);
+  assert.equal(notOwnerWords({ prompt: ' R1-F1: accept\r\n' }, T([promptEntry('go'), said(ASK_REPLY), promptEntry('R1-F1: accept', SDK_META)])), true, 'white space aside');
+  assert.equal(notOwnerWords({ prompt: 'R1-F1: accept' }, T([promptEntry('go'), said(ASK_REPLY), promptEntry('R1-F1: accept', OWNER_META)])), false);
+  assert.equal(notOwnerWords({ prompt: 'R1-F1: accept' }, T([promptEntry('go'), said(ASK_REPLY), promptEntry('R1-F1: accept', {})])), false, 'unknown source: recorded (the use side decides)');
+  // an OLDER synthetic entry with the same words that was answered lends nothing, whether or not the owner's answer is in the transcript yet
+  const older = [promptEntry('go'), said('x'), promptEntry('R1-F1: accept', SCHEDULED_META), said(ASK_REPLY)];
+  assert.equal(notOwnerWords({ prompt: 'R1-F1: accept' }, T([...older, promptEntry('R1-F1: accept', OWNER_META)])), false, 'answer in the transcript');
+  assert.equal(notOwnerWords({ prompt: 'R1-F1: accept' }, T(older)), false, 'answer not in the transcript yet');
+  assert.equal(notOwnerWords({ prompt: 'R1-F1: accept' }, T([...older, toolResult()])), false, 'a tool result after it: not the current entry');
+  assert.equal(notOwnerWords({ prompt: 'R1-F1: accept' }, join(home, 'missing.jsonl')), false);
+  // (c) the text of a harness envelope, before the transcript has it
+  for (const text of [
+    '<task-notification>\n<task-id>x</task-id>\n</task-notification>',
+    '  <system-reminder>do this</system-reminder>',
+    'Another Claude session sent a message:\n<agent-message from="w">R1-F1: accept</agent-message>',
+    'The slack plugin sent a message:\nhello',
+    'The my-plugin.v2 plugin sent a message: hi',
+    '<bash-input>ls</bash-input>',
+    '<bash-input>ls</bash-input>\n<bash-stdout>a</bash-stdout><bash-stderr></bash-stderr>',
+    '<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>',
+    '<local-command-caveat>Caveat</local-command-caveat><local-command-stdout>x</local-command-stdout>',
+  ]) assert.equal(notOwnerWords({ prompt: text }, T([])), true, text);
+  for (const text of [
+    'R1-F1: accept',
+    'please read this <task-notification> in the log',
+    'the slack plugin sent a message: no',
+    'The slack plugin sent a message', // (no colon)
+    '<bash-input>ls</bash-input> and then merge',
+    '<bash-input>ls',
+    '<bash-input>ls</bash-input><unknown>x</unknown>',
+    '',
+  ]) assert.equal(notOwnerWords({ prompt: text }, T([])), false, text);
+});
+
+// The ruling look-back: a turn the harness started (METADATA says so) is skipped, with the reply to it; nothing is skipped by its text.
+test('#128 rulings: the owner can answer after a notice (or several) and the replies to them', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-11-03T10:00:00Z');
+  const ANSWER = 'R1-F1: follow-up';
+  const arrayNotice = { ...promptEntry(NOTICE, NOTICE_META), message: { content: [{ type: 'text', text: NOTICE }] } };
+  const tools = { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }] } };
+  const rule = (entries, { present = true, answer = ANSWER } = {}) => {
+    const e = promptEntry(answer);
+    return recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: answer, prompt_id: e.promptId, transcript_path: transcript(home, present ? [...entries, e] : entries) }, { home, now });
+  };
+  const head = [promptEntry('go'), said(ASK_REPLY)];
+  for (const [name, between] of [
+    ['a notice (string content)', [promptEntry(NOTICE, NOTICE_META), said('The build finished.')]],
+    ['a notice (text-array content)', [arrayNotice, said('The build finished.')]],
+    ['two notices', [promptEntry(NOTICE, NOTICE_META), said('One.'), promptEntry(NOTICE, NOTICE_META), said('Two.')]],
+    ['a notice answered by a tool-only turn', [promptEntry(NOTICE, NOTICE_META), tools, toolResult(), said('Done.')]],
+    ['a peer hand-back', [promptEntry('Another Claude session sent a message:\n<agent-message from="w">done</agent-message>', PEER_META), said('Thanks.')]],
+    ['a plugin message', [promptEntry('The slack plugin sent a message:\nping', { origin: { kind: 'plugin' }, promptSource: 'system' }), said('Noted.')]],
+    ['a scheduled (/loop) turn', [promptEntry('check the PRs', SCHEDULED_META), said('Checked.')]],
+    ['a notice with no reply yet', [promptEntry(NOTICE, NOTICE_META)]],
+  ]) {
+    for (const present of [true, false]) {
+      const r = rule([...head, ...between], { present });
+      assert.deepEqual([r?.pr, r?.ids], [58, ['R1-F1']], `${name}, answer ${present ? 'in' : 'not in'} the transcript`);
+    }
+  }
+  // …and the record applies
+  const r = rule([...head, promptEntry(NOTICE, NOTICE_META), said('The build finished.')]);
+  assert.equal(ownerRuled({ repo: 'acme/app', pr: 58, id: 'R1-F1', quote: ANSWER, decision: 'FOLLOW-UP', contentOf: () => 'abcdef012345', home, now }), true);
+  assert.equal(r.kind, 'ruling');
+});
+
+test('#128 rulings: nothing is skipped by its text, and an owner turn between the ask and the answer is still a boundary', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-11-03T10:00:00Z');
+  const rule = (entries, answer = 'R1-F1: accept', present = true) => {
+    const e = promptEntry(answer);
+    return recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: answer, prompt_id: e.promptId, transcript_path: transcript(home, present ? [...entries, e] : entries) }, { home, now });
+  };
+  const head = [promptEntry('go'), said(ASK_REPLY)];
+  const image = { ...promptEntry('x'), message: { content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } }] } };
+  const tools = { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }] } };
+  for (const present of [true, false]) {
+    // an owner question in between, answered or not
+    assert.equal(rule([...head, promptEntry('wait, what is R1-F1?'), said('It is a finding.')], 'R1-F1: accept', present), null, `owner turn answered (${present})`);
+    assert.equal(rule([...head, promptEntry('wait, what is R1-F1?')], 'R1-F1: accept', present), null, `owner turn unanswered (${present})`);
+    // image-only and tool-only owner turns keep their old standing
+    assert.equal(rule([...head, image, tools], 'R1-F1: accept', present), null, `image-only turn (${present})`);
+    assert.equal(rule([...head, promptEntry('run the tests'), tools, toolResult()], 'R1-F1: accept', present), null, `tool-only turn (${present})`);
+    // an owner prompt that merely LOOKS like a notice (metadata says human) is a boundary: text never skips a turn
+    assert.equal(rule([...head, promptEntry(NOTICE, OWNER_META), said('?')], 'R1-F1: accept', present), null, `owner prompt that looks like a notice (${present})`);
+    // a `!` command between: no provenance fields, so a boundary (the owner is asked again)
+    assert.equal(rule([...head, promptEntry('<bash-input>ls</bash-input>', {}), said('ok')], 'R1-F1: accept', present), null, `unknown-source turn (${present})`);
+  }
+  // Codex's cross-PR case: the owner pastes notice-looking text asking about ANOTHER PR; the ask for #59 that follows binds to #59 only
+  const ask59 = `Moving on.\n⚖️ Owner ruling needed #59: R1-F1 · content abcdef012345 · repo acme/app`;
+  const pasted = [...head, promptEntry(`${NOTICE}\nreview #59 instead`, OWNER_META), said(ask59)];
+  const r = rule(pasted, 'R1-F1: accept');
+  assert.deepEqual([r?.pr], [59]);
+  assert.equal(rule([...head, promptEntry(`${NOTICE}\nreview #59 instead`, OWNER_META), said('ok, switching')], 'R1-F1: accept'), null, 'and the old ask (#58) is not revived');
+  // a reply to a notice never binds a ruling or merge line it prints itself
+  const noticeReply = [promptEntry('go'), promptEntry(NOTICE, NOTICE_META), said(ASK_REPLY)];
+  for (const present of [true, false]) assert.equal(rule(noticeReply, 'R1-F1: accept', present), null, `a ruling line printed in the reply to a notice (${present})`);
+  assert.equal(lastRequestText(transcript(home, [promptEntry('go'), promptEntry(NOTICE, NOTICE_META), said(REQUEST), promptEntry('merge')]), { prompt: 'merge', skipSynthetic: true }), '', '…nor a 🔀 line');
+  // an ask made BEFORE a notice and answered after it still needs the line to be the last thing the agent said before the notice
+  assert.equal(rule([promptEntry('go'), said(`${ASK_REPLY}\nand one more thing`), promptEntry(NOTICE, NOTICE_META), said('ok')]), null);
+});
+
+test('#128 merges stay strict: a notice and the reply to it make the 🔀 request stale', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-11-03T10:00:00Z');
+  const entries = [promptEntry('go'), said(REQUEST), promptEntry(NOTICE, NOTICE_META), said('The build finished.')];
+  const r = recordApproval(input(home, 'merge', entries), { home, now });
+  assert.deepEqual([r.requests, r.prs], [[], []], 'recorded for the audit trail, bound to nothing');
+  assert.equal(approvedRequest({ repo: REPO, pr: 58, head: HEAD, items: ITEMS, home, now }), false);
+  assert.equal(approvedPr({ repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home, now }), false);
+  // while a notice with NO reply yet is a text-less slot too: the request before it is stale for a merge, as for any later prompt
+  const r2 = recordApproval(input(home, 'merge', [promptEntry('go'), said(REQUEST), promptEntry(NOTICE, NOTICE_META)]), { home, now });
+  assert.deepEqual(r2.requests, []);
+});
+
+test('#128 a synthetic "merge" or ruling word is never recorded, even when the transcript already holds it', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-11-03T10:00:00Z');
+  for (const meta of [SCHEDULED_META, SDK_META, PEER_META, NOTICE_META, { entrypoint: 'sdk-cli' }]) {
+    const w = promptEntry('merge', meta);
+    const base = { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'merge', prompt_id: w.promptId };
+    assert.equal(recordApproval({ ...base, transcript_path: transcript(home, [promptEntry('go'), said(REQUEST), w]) }, { home, now }), null, JSON.stringify(meta));
+    const x = promptEntry('R1-F1: reject', meta);
+    const ruling = { ...base, prompt: 'R1-F1: reject', prompt_id: x.promptId, transcript_path: transcript(home, [promptEntry('go'), said(ASK_REPLY), x]) };
+    assert.equal(recordRuling(ruling, { home, now }), null, JSON.stringify(meta));
+  }
+  assert.deepEqual(readApprovals({ home, now }), []);
+  assert.equal(ownerRuled({ repo: 'acme/app', pr: 58, id: 'R1-F1', quote: 'R1-F1: reject', decision: 'REJECT', contentOf: () => 'abcdef012345', home, now }), false);
+  assert.equal(approvedPr({ repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home, now }), false);
+});
+
+// ---- #128 use-time provenance: the consumers ask the transcript again ---------------------------------------------------------------
+const AT = Date.parse('2026-11-03T10:00:00Z');
+const nowAt = () => AT;
+const stamp = (ms) => new Date(AT + ms).toISOString();
+const lines = (entries) => `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`;
+// A "merge" the hook recorded at AT (before the transcript had it, as it may), then the transcript gets `appended`. Returns the pieces to ask with.
+function mergeWorld(_home, { appended, recordedId = 'pid-m', head = [promptEntry('go'), said(REQUEST)], raw = null } = {}) {
+  const home = tmp(); // (a world of its own: records of the same session would answer for each other)
+  const file = transcript(home, head);
+  const r = recordApproval({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'merge', prompt_id: recordedId, transcript_path: file }, { home, now: nowAt });
+  assert.ok(r, 'recorded');
+  if (appended) writeFileSync(file, lines([...head, ...appended]));
+  if (raw) writeFileSync(file, raw);
+  return { file, r, g: { repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home, now: nowAt }, q: { repo: REPO, pr: 58, head: HEAD, items: ITEMS, home, now: nowAt } };
+}
+const askedFor = (w) => [approvedPr(w.g), approvedRequest(w.q), approvalGap(w.q)];
+
+test('#128 provenance: a record is used only when its transcript entry (found by prompt_id) is the owner\'s', () => {
+  const home = tmp();
+  const head = [promptEntry('go'), said(REQUEST)];
+  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] })), [true, true, 'ok'], 'typed by the owner');
+  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', { ...OWNER_META, promptSource: 'queued' }, 'pid-m')] }))[0], true, 'queued while the agent worked');
+  for (const [name, meta] of [['scheduled', SCHEDULED_META], ['peer', PEER_META], ['notice', NOTICE_META], ['headless sdk', SDK_META], ['sdk-cli entrypoint', { entrypoint: 'sdk-cli', origin: { kind: 'human' }, promptSource: 'typed' }]]) {
+    assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', meta, 'pid-m')] })), [false, false, 'provenance'], name);
+  }
+  // the entry never shows up (not appended yet, or another id), or the transcript is gone: never "retry in a moment", always provenance
+  assert.deepEqual(askedFor(mergeWorld(home, { appended: [] })), [false, false, 'provenance'], 'entry missing');
+  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', OWNER_META, 'pid-other')] })), [false, false, 'provenance'], 'another prompt id');
+  const gone = mergeWorld(home, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] });
+  rmSync(gone.file);
+  assert.deepEqual(askedFor(gone), [false, false, 'provenance'], 'transcript gone');
+  // no record at all for this head: 'none', not 'provenance'
+  assert.equal(approvalGap({ repo: REPO, pr: 58, head: HEAD, items: 'f'.repeat(12), home: gone.q.home, now: nowAt }), 'none');
+  // a record from before #128 (no prompt_id / transcript_path / prompt) stays for its last day but approves nothing
+  const old = tmp();
+  mkdirSync(ownerGoDir(old), { recursive: true });
+  writeFileSync(join(ownerGoDir(old), 'sess-1.jsonl'), `${JSON.stringify({ v: 1, ts: new Date(AT).toISOString(), session: 'sess-1', prompt_sha256: 'x', cwd: null, prs: [58], requests: [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }] })}\n`);
+  assert.deepEqual([approvedPr({ repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home: old, now: nowAt }), approvalGap({ repo: REPO, pr: 58, head: HEAD, items: ITEMS, home: old, now: nowAt })], [false, 'provenance']);
+  // a subagent's transcript is never the owner's
+  const sub = join(tmp(), 'subagents', 'agent-1.jsonl');
+  mkdirSync(join(sub, '..'), { recursive: true });
+  writeFileSync(sub, lines([promptEntry('merge', OWNER_META, 'pid-m')]));
+  assert.equal(promptProvenance({ transcript_path: sub, prompt_id: 'pid-m' }), 'missing');
+  assert.equal(promptProvenance({ transcript_path: 'relative.jsonl', prompt_id: 'pid-m' }), 'missing');
+  assert.equal(promptProvenance({ prompt_id: 'pid-m' }), 'missing');
+  assert.equal(head.length, 2);
+});
+
+test('#128 provenance: only PROMPT entries count; one id on two prompts, or on tool results, is judged by the prompt', () => {
+  const home = tmp();
+  const tr = (id) => ({ ...toolResult(), promptId: id, ...OWNER_META });
+  // a synthetic prompt followed by tool results that share its id and carry owner-looking fields: still refused
+  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', SCHEDULED_META, 'pid-m'), tr('pid-m'), tr('pid-m')] })), [false, false, 'provenance']);
+  // the owner's prompt with two tool results sharing its id: approved (they are not a second prompt)
+  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', OWNER_META, 'pid-m'), tr('pid-m'), tr('pid-m')] })), [true, true, 'ok']);
+  // two PROMPT entries with one id: a replayed or forged id
+  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', OWNER_META, 'pid-m'), said('ok'), promptEntry('merge again', OWNER_META, 'pid-m')] })), [false, false, 'provenance']);
+  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', SCHEDULED_META, 'pid-m'), promptEntry('merge', OWNER_META, 'pid-m')] })), [false, false, 'provenance']);
+});
+
+test('#128 provenance: an entry of unknown source counts only in a legacy transcript (no prompt anywhere carries a provenance field)', () => {
+  const home = tmp();
+  const old = (text, id) => ({ type: 'user', message: { content: text }, promptId: id });
+  // legacy: no entry has any field
+  assert.deepEqual(askedFor(mergeWorld(home, { head: [old('go', 'p0'), said(REQUEST)], appended: [old('merge', 'pid-m')] })), [true, true, 'ok'], 'legacy transcript');
+  // modern: an earlier prompt carries fields, so an entry without any is untrusted (an interrupt marker, a summary, a source nobody listed)
+  assert.deepEqual(askedFor(mergeWorld(home, { head: [promptEntry('go'), said(REQUEST)], appended: [old('merge', 'pid-m')] })), [false, false, 'provenance'], 'modern transcript');
+  // …also when the modern prompt comes LATER than the unknown one
+  assert.deepEqual(askedFor(mergeWorld(home, { head: [old('go', 'p0'), said(REQUEST)], appended: [old('merge', 'pid-m'), said('x'), promptEntry('later')] })), [false, false, 'provenance']);
+  // isMeta alone is no provenance field: a legacy transcript with a caveat entry stays legacy
+  assert.deepEqual(askedFor(mergeWorld(home, { head: [{ ...old('caveat', 'p0'), isMeta: true }, said(REQUEST)], appended: [old('merge', 'pid-m')] }))[0], true);
+});
+
+test('#128 provenance: without a prompt_id the stored words are matched to a prompt entry within two minutes; two matches are refused', () => {
+  const home = tmp();
+  const at = (text, meta, ms) => ({ ...promptEntry(text, meta, undefined), timestamp: stamp(ms) });
+  const noId = (appended) => { const w = mergeWorld(home, { appended, recordedId: null }); return askedFor(w); };
+  assert.equal(readApprovals({ home, now: nowAt }).length, 0);
+  assert.deepEqual(noId([at('merge', OWNER_META, 3000)]), [true, true, 'ok'], 'the owner\'s entry 3 s later');
+  assert.deepEqual(noId([at('merge', OWNER_META, -100_000)]), [true, true, 'ok'], 'a transcript stamp slightly before the hook');
+  assert.deepEqual(noId([at('merge', SCHEDULED_META, 3000)]), [false, false, 'provenance'], 'a scheduled one');
+  assert.deepEqual(noId([at('merge', OWNER_META, 600_000)]), [false, false, 'provenance'], 'ten minutes off');
+  assert.deepEqual(noId([{ ...promptEntry('merge', OWNER_META), timestamp: undefined }]), [false, false, 'provenance'], 'no timestamp');
+  assert.deepEqual(noId([at('merge please', OWNER_META, 3000)]), [false, false, 'provenance'], 'other words');
+  assert.deepEqual(noId([at('merge', OWNER_META, 3000), said('x'), at('merge', SCHEDULED_META, 9000)]), [false, false, 'provenance'], 'two entries with these words: refused');
+  assert.deepEqual(noId([at('merge', OWNER_META, 3000), said('x'), at('merge', OWNER_META, 400_000)]), [true, true, 'ok'], 'the second is outside the window');
+  // an approval's words are stored when short: an over-long prompt stores none, so with no prompt_id it can never be found
+  assert.equal(recordApproval(input(home, `merge ${'a'.repeat(1100)}`, [said(REQUEST)]), { home, now: nowAt }), null, 'not an approval at all');
+  // a ruling carries its prompt as before
+  const x = recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-9', cwd: home, prompt: 'R1-F1: accept', transcript_path: transcript(home, [promptEntry('go'), said(ASK_REPLY)]) }, { home, now: nowAt });
+  assert.equal(x.prompt_id, null);
+  assert.equal(promptProvenance({ ...x, transcript_path: transcript(home, [promptEntry('go'), said(ASK_REPLY), at('R1-F1: accept', OWNER_META, 2000)]) }), 'owner');
+});
+
+test('#128 provenance: the transcript is scanned from the end, 4 MB at a time, up to 64 MB back', () => {
+  const home = tmp();
+  const filler = (mb) => { const line = `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'x'.repeat(1024 * 1024 - 100) }] } })}\n`; return line.repeat(mb); };
+  const owner = promptEntry('merge', OWNER_META, 'pid-m');
+  // the owner's entry 6 MB before the end (more than one chunk back)
+  const w = mergeWorld(home, { appended: [] });
+  writeFileSync(w.file, lines([promptEntry('go'), said(REQUEST), owner]) + filler(6));
+  assert.deepEqual(askedFor(w), [true, true, 'ok'], 'found 6 MB back');
+  // a line that straddles a chunk boundary is read whole
+  const wide = { ...promptEntry('merge', OWNER_META, 'pid-w'), pad: 'y'.repeat(5 * 1024 * 1024) };
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-w' }), 'missing');
+  writeFileSync(w.file, lines([promptEntry('go'), wide]) + filler(2));
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-w' }), 'owner', 'a 5 MB line across the 4 MB chunks');
+  // 70 MB of later lines: out of reach, so missing
+  writeFileSync(w.file, lines([promptEntry('go'), said(REQUEST), owner]) + filler(70));
+  assert.deepEqual(askedFor(w), [false, false, 'provenance'], 'more than 64 MB back');
+  // a legacy 'unknown' entry whose scan stopped short of the start cannot be proven legacy
+  const legacy = { type: 'user', message: { content: 'merge' }, promptId: 'pid-l' };
+  writeFileSync(w.file, lines([{ type: 'user', message: { content: 'go' } }]) + filler(5) + lines([legacy]) + filler(1));
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }), 'owner', 'whole transcript scanned: legacy');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { capBytes: 3 * 1024 * 1024 }), 'synthetic', 'found, but the scan fell short of the start');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { capBytes: 512 * 1024 }), 'missing', 'not found within the cap');
+});
+
+test('#128 provenance: rulings need the owner\'s prompt too, and "provenance" is the gap named first', () => {
+  const home = tmp();
+  const ask = [promptEntry('go'), said(ASK_REPLY)];
+  const asked = (answer, { content = 'abcdef012345' } = {}) => ({ repo: 'acme/app', pr: 58, id: 'R1-F1', quote: answer, decision: answer.includes('reject') ? 'REJECT' : 'ACCEPT', contentOf: () => 'abcdef012345', home, now: nowAt, content });
+  const ruleVia = (answer, meta, id) => {
+    const file = transcript(home, ask);
+    const r = recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: answer, prompt_id: id, transcript_path: file }, { home, now: nowAt });
+    assert.ok(r, 'recorded before the transcript had it');
+    writeFileSync(file, lines([...ask, promptEntry(answer, meta, id)]));
+    return r;
+  };
+  ruleVia('R1-F1: reject', SCHEDULED_META, 'pid-a');
+  const rej = asked('R1-F1: reject');
+  assert.deepEqual([ownerRuled(rej), ownerRulingGap(rej)], [false, 'provenance'], 'a scheduled bare ruling');
+  ruleVia('R1-F1: accept', OWNER_META, 'pid-b');
+  const acc = asked('R1-F1: accept');
+  assert.deepEqual([ownerRuled(acc), ownerRulingGap(acc)], [true, 'changed'], 'the owner\'s: applies (gap only matters when it does not)');
+  assert.equal(ownerRulingGap({ ...acc, contentOf: () => '000000000000' }), 'changed');
+  assert.equal(ownerRulingGap({ ...acc, quote: 'R1-F1: follow-up', decision: 'FOLLOW-UP' }), 'none', 'no record with these words');
+  // the old line shape (no content) and no owner prompt: provenance is named before no-content
+  const home2 = tmp();
+  const file = transcript(home2, [promptEntry('go'), said('x\n⚖️ Owner ruling needed #59: R1-F1 · repo acme/app')]);
+  recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home2, prompt: 'R1-F1: accept', prompt_id: 'pid-c', transcript_path: file }, { home: home2, now: nowAt });
+  const q59 = { repo: 'acme/app', pr: 59, id: 'R1-F1', quote: 'R1-F1: accept', decision: 'ACCEPT', contentOf: () => 'abcdef012345', home: home2, now: nowAt };
+  assert.equal(ownerRulingGap(q59), 'provenance', 'no owner prompt behind it (never appended)');
+  writeFileSync(file, lines([promptEntry('go'), said('x\n⚖️ Owner ruling needed #59: R1-F1 · repo acme/app'), promptEntry('R1-F1: accept', OWNER_META, 'pid-c')]));
+  assert.equal(ownerRulingGap(q59), 'no-content', 'with the owner\'s prompt behind it, the old line shape is the reason');
+});
+
+// ---- #128 the hook: the nudge, and nothing recorded for a harness turn ---------------------------------------------------------------
+test('#128 hook: a ruling answer nothing was recorded for gets one line of context; everything else stays quiet', (t) => {
+  const go = [promptEntry('go')];
+  const out = (o) => runHook(t, { entries: [], ...o });
+  // the reply before did not end with the ruling line: nudge, nothing recorded
+  let r = out({ entries: [...go, said('I fixed it.')], prompt: 'R1-F1: accept' });
+  assert.deepEqual([r.status, r.stdout, r.record], [0, `${RULING_NUDGE}\n`, null]);
+  assert.match(r.stdout, /no ruling was recorded[\s\S]*P triage ruling-request/);
+  // …the line was printed, but a `!` command (no provenance fields) came between: boundary kept, nudge shown
+  r = out({ entries: [...go, said(ASK_REPLY), promptEntry('<bash-input>ls</bash-input>', {}), said('ok')], prompt: 'R1-F1: accept' });
+  assert.deepEqual([r.stdout, r.record], [`${RULING_NUDGE}\n`, null]);
+  // a proper ask, even with a notice and its reply between: recorded, no nudge
+  r = out({ entries: [...go, said(ASK_REPLY), promptEntry(NOTICE, NOTICE_META), said('Built.')], prompt: 'R1-F1: accept' });
+  assert.match(r.stdout, /^\[claude-pipeline owner-go\] the owner's ruling is recorded for acme\/app #58: R1-F1/);
+  assert.doesNotMatch(r.stdout, /no ruling was recorded/);
+  assert.equal(r.record.prompt_id.startsWith('pid-'), true);
+  // quiet: an ordinary prompt, one that is not only decisions, a longer answer, an envelope, and a synthetic entry (no nudge loop)
+  for (const quiet of [
+    { entries: go, prompt: 'hello there' },
+    { entries: go, prompt: 'R1-F1: accept, because it is fine' },
+    { entries: go, prompt: 'accept' },
+    { entries: [...go, said('x')], prompt: 'Another Claude session sent a message:\n<agent-message from="w">R1-F1: accept</agent-message>' },
+    { entries: [...go, said('x')], prompt: `${NOTICE}\nR1-F1: accept` },
+    { entries: [...go, said('x')], prompt: 'R1-F1: accept', entry: SCHEDULED_META },
+    { entries: [...go, said('x')], prompt: 'R1-F1: accept', input: { agent_id: 'sub-1' } },
+  ]) {
+    r = out(quiet);
+    assert.deepEqual([r.status, r.stdout, r.record], [0, '', null], JSON.stringify(quiet).slice(0, 80));
+  }
+  // the unit: same rule, and never throws
+  assert.equal(rulingNudge({ session_id: 'sess-1', prompt: 'R1-F1: accept', transcript_path: join(tmp(), 'none.jsonl') }), RULING_NUDGE);
+  assert.equal(rulingNudge({ session_id: '', prompt: 'R1-F1: accept' }), null);
+  assert.equal(rulingNudge(null), null);
+});
+
+test('#128 hook: a notice, a peer message and a scheduled "merge" are not recorded by the real hook', (t) => {
+  const withRequest = [promptEntry('go'), said(REQUEST)];
+  for (const [name, o] of [
+    ['notice', { prompt: NOTICE, entry: NOTICE_META }],
+    ['notice, entry not yet in the transcript', { prompt: NOTICE, appended: false }],
+    ['scheduled merge', { prompt: 'merge', entry: SCHEDULED_META }],
+    ['sdk merge', { prompt: 'merge', entry: SDK_META }],
+  ]) {
+    const r = runHook(t, { entries: withRequest, ...o });
+    assert.deepEqual([r.status, r.stdout, r.record], [0, '', null], name);
+  }
+  const ok = runHook(t, { entries: withRequest, prompt: 'merge' });
+  assert.match(ok.stdout, /the owner's "merge" is recorded: acme\/app #58/);
+  assert.equal(ok.record.prompt, 'merge');
 });

@@ -1,17 +1,21 @@
 #!/usr/bin/env node
 // Why (#58): global UserPromptSubmit hook (~/.claude/settings.json) that records the owner's chat "merge", and (Phase 3b) the owner's
 // answer to a review-item ruling request (lib/owner-go.mjs has
-// the rules and the residual). Only a prompt the owner types reaches this event; the model cannot raise it. It must never
+// the rules and the residual). The owner's typed prompts reach this event, and (#128) so do harness-injected turns (task notices, peer and
+// scheduled messages), which the recorders therefore screen out. It must never
 // block a prompt: it always exits 0, and it is started WITHOUT the guards' fail-closed loader (an exit 2 here would swallow
 // the owner's message). On UserPromptSubmit, stdout is added to the model's context: one line says what was recorded, so the
-// agent can run `P merge` with the matching flags; nothing is printed otherwise.
+// agent can run `P merge` with the matching flags; nothing is printed otherwise, except (#128) one line when the owner's prompt reads as a ruling
+// answer that nothing was recorded for (the agent must ask again).
 try {
   const { readHookInput } = await import('./lib/hook-io.mjs');
-  const { recordApproval, recordRuling } = await import('./lib/owner-go.mjs');
+  const { recordApproval, recordRuling, rulingNudge } = await import('./lib/owner-go.mjs');
   const input = await readHookInput();
   const record = recordApproval(input);
   const ruling = recordRuling(input);
+  const nudge = ruling ? null : rulingNudge(input);
   if (ruling) process.stdout.write(`[claude-pipeline owner-go] the owner's ruling is recorded for ${ruling.repo} #${ruling.pr}: ${ruling.ids.join(', ')} (pass words from it as --owner-quote).\n`);
+  else if (nudge) process.stdout.write(`${nudge}\n`);
   if (record) {
     const shown = record.requests.map((q) => `${q.repo ?? '(no repo: approves nothing)'} #${q.pr} head ${q.head} items ${q.items}`);
     const prs = record.prs.map((n) => `#${n}`).join(', ');
