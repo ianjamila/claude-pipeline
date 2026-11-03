@@ -354,11 +354,15 @@ test('#128: a background-task notice that arrives after the ruling ask is not re
   assert.equal(recordRuling({ ...hook, transcript_path: transcript(home, [...entries, promptEntry(notice, NOTICE_META)]) }, { home }), null, 'after');
 });
 
-test('#128: the owner answers after a notice and its reply: the ruling is recorded and applies', () => {
+test('#128: the owner answers after a notice and its reply (R3-B2: a text-less one): the ruling is recorded and applies; a reply with text voids it', () => {
   const home = tmp();
   const now = () => Date.parse('2026-11-03T10:00:00Z');
   const answer = promptEntry('R1-F1: follow-up');
-  const entries = [promptEntry('go'), said(ASK_REPLY), promptEntry(NOTICE, NOTICE_META), said('The build finished.'), answer];
+  const toolsOnly = { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }] } };
+  const run = (entries) => recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'R1-F1: follow-up', prompt_id: answer.promptId, transcript_path: transcript(home, entries) }, { home, now });
+  // R3-B2 (owner decision): ANY text in the agent's reply to a notice voids the pending ask, so the answer binds to nothing
+  assert.equal(run([promptEntry('go'), said(ASK_REPLY), promptEntry(NOTICE, NOTICE_META), said('The build finished.'), answer]), null);
+  const entries = [promptEntry('go'), said(ASK_REPLY), promptEntry(NOTICE, NOTICE_META), toolsOnly, answer];
   const r = recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'R1-F1: follow-up', prompt_id: answer.promptId, transcript_path: transcript(home, entries) }, { home, now });
   assert.deepEqual([r?.pr, r?.ids], [58, ['R1-F1']]);
   assert.equal(ownerRuled({ repo: 'acme/app', pr: 58, id: 'R1-F1', quote: 'R1-F1: follow-up', decision: 'FOLLOW-UP', contentOf: () => 'abcdef012345', home, now }), true);
@@ -471,14 +475,29 @@ test('#128 rulings: the owner can answer after a notice (or several) and the rep
     return recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: answer, prompt_id: e.promptId, transcript_path: transcript(home, present ? [...entries, e] : entries) }, { home, now });
   };
   const head = [promptEntry('go'), said(ASK_REPLY)];
-  for (const [name, between] of [
+  // R3-B2 (owner decision): the ask survives a harness turn only when the agent's reply to it has no text at all (tool calls only, or no reply yet);
+  // any text voids it whatever it says, and the owner is asked again
+  const textual = [
     ['a notice (string content)', [promptEntry(NOTICE, NOTICE_META), said('The build finished.')]],
     ['a notice (text-array content)', [arrayNotice, said('The build finished.')]],
     ['two notices', [promptEntry(NOTICE, NOTICE_META), said('One.'), promptEntry(NOTICE, NOTICE_META), said('Two.')]],
-    ['a notice answered by a tool-only turn', [promptEntry(NOTICE, NOTICE_META), tools, toolResult(), said('Done.')]],
+    ['a notice answered by a tool-only turn and a closing word', [promptEntry(NOTICE, NOTICE_META), tools, toolResult(), said('Done.')]],
     ['a peer hand-back', [promptEntry('Another Claude session sent a message:\n<agent-message from="w">done</agent-message>', PEER_META), said('Thanks.')]],
     ['a plugin message', [promptEntry('The slack plugin sent a message:\nping', { origin: { kind: 'plugin' }, promptSource: 'system' }), said('Noted.')]],
     ['a scheduled (/loop) turn', [promptEntry('check the PRs', SCHEDULED_META), said('Checked.')]],
+    ['a paraphrased ask with no reference, question mark or call word', [promptEntry(NOTICE, NOTICE_META), said('Tell me what to do about the first blocker.')]],
+  ];
+  for (const [name, between] of textual) {
+    for (const present of [true, false]) assert.equal(rule([...head, ...between], { present }), null, `${name}, answer ${present ? 'in' : 'not in'} the transcript: voided`);
+    // …and the feature stays covered: a fresh ask in a reply to the OWNER's next turn binds the answer to that ask, whatever came before
+    const fresh = rule([...head, ...between, promptEntry('what is that?'), said(ASK_REPLY)]);
+    assert.deepEqual([fresh?.pr, fresh?.ids], [58, ['R1-F1']], `${name}, then a fresh ask`);
+  }
+  for (const [name, between] of [
+    ['a notice answered by a tool-only turn', [promptEntry(NOTICE, NOTICE_META), tools, toolResult()]],
+    ['two notices, both answered by tool-only turns', [promptEntry(NOTICE, NOTICE_META), tools, toolResult(), promptEntry(NOTICE, NOTICE_META), tools, toolResult()]],
+    ['a peer hand-back answered by a tool-only turn', [promptEntry('Another Claude session sent a message:\n<agent-message from="w">done</agent-message>', PEER_META), tools]],
+    ['a scheduled (/loop) turn answered by tools only', [promptEntry('check the PRs', SCHEDULED_META), tools, toolResult()]],
     ['a notice with no reply yet', [promptEntry(NOTICE, NOTICE_META)]],
   ]) {
     for (const present of [true, false]) {
@@ -487,7 +506,7 @@ test('#128 rulings: the owner can answer after a notice (or several) and the rep
     }
   }
   // …and the record applies
-  const r = rule([...head, promptEntry(NOTICE, NOTICE_META), said('The build finished.')]);
+  const r = rule([...head, promptEntry(NOTICE, NOTICE_META), tools, toolResult()]);
   assert.equal(ownerRuled({ repo: 'acme/app', pr: 58, id: 'R1-F1', quote: ANSWER, decision: 'FOLLOW-UP', contentOf: () => 'abcdef012345', home, now }), true);
   assert.equal(r.kind, 'ruling');
 });
@@ -562,12 +581,16 @@ test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice void
   }
   for (const pr of [58, 59]) assert.equal(ownerRuled({ repo: 'acme/app', pr, id: 'R1-B1', quote: 'R1-B1: reject', decision: 'REJECT', contentOf: () => (pr === 58 ? 'aaaaaaaaaaaa' : 'bbbbbbbbbbbb'), home, now }), false, `#${pr}`);
   assert.deepEqual(readApprovals({ home, now }), []);
-  // the limit is the reply to a harness turn only: a plain reply after the ask, an ask shown BEFORE the notice, and a new owner turn after the poisoned reply all work as before
-  assert.deepEqual([rule([...head, notice, said('The build finished.')])?.pr], [58], 'no ask in the reply');
-  for (const text of ['The build finished.', 'Rejected the stale cache; all green.', 'Noted: the PR is still open.', 'I will accept the default.']) {
-    assert.deepEqual([rule([...head, notice, said(text)])?.pr], [58], `an ordinary reply still binds: ${text}`);
+  // R3-B2 (owner decision): ANY text in the reply to a harness turn voids the pending ask, whatever it says (the agent picks its wording); only a reply without text leaves it standing
+  for (const text of ['The build finished.', 'Build #1042 finished, 3 tests rerun.', 'Rejected the stale cache; all green.', 'Noted: the PR is still open.', 'I will accept the default.', 'ok', 'Tell me what to do about the first blocker.']) {
+    assert.equal(rule([...head, notice, said(text)]), null, `any text voids the ask: ${text}`);
   }
-  assert.deepEqual([rule([promptEntry('go'), said(ask(59)), notice, said('ok')])?.pr], [59], 'the ask is the last thing before the notice');
+  const toolsOnly = { type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] } };
+  assert.deepEqual([rule([...head, notice, toolsOnly])?.pr], [58], 'no text in the reply: the ask stands');
+  assert.deepEqual([rule([...head, notice, said('   \n')])?.pr], [58], 'a blank text block carries no text');
+  // the limit is the reply to a harness turn only: an ask shown BEFORE the notice (answered by tools only) and a new owner turn after the poisoned reply work as before
+  assert.deepEqual([rule([promptEntry('go'), said(ask(59)), notice, toolsOnly])?.pr], [59], 'the ask is the last thing before the notice');
+  assert.equal(rule([promptEntry('go'), said(ask(59)), notice, said('ok')]), null, 'a reply with text after it voids that ask too');
   assert.deepEqual([rule([...head, notice, said(ask(59)), promptEntry('what is that?'), said(ask(59))])?.pr], [59], 'the owner asked again: a new slot');
 });
 
@@ -786,8 +809,11 @@ test('#128 hook: a ruling answer nothing was recorded for gets one line of conte
   // …the line was printed, but a `!` command (no provenance fields) came between: boundary kept, nudge shown
   r = out({ entries: [...go, said(ASK_REPLY), promptEntry('<bash-input>ls</bash-input>', {}), said('ok')], prompt: 'R1-F1: accept' });
   assert.deepEqual([r.stdout, r.record], [`${RULING_NUDGE}\n`, null]);
-  // a proper ask, even with a notice and its reply between: recorded, no nudge
+  // R3-B2: a notice answered with text voids the ask: nudge, nothing recorded
   r = out({ entries: [...go, said(ASK_REPLY), promptEntry(NOTICE, NOTICE_META), said('Built.')], prompt: 'R1-F1: accept' });
+  assert.deepEqual([r.stdout, r.record], [`${RULING_NUDGE}\n`, null]);
+  // a proper ask, even with a notice (answered by tool calls only) between: recorded, no nudge
+  r = out({ entries: [...go, said(ASK_REPLY), promptEntry(NOTICE, NOTICE_META), { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }] } }], prompt: 'R1-F1: accept' });
   assert.match(r.stdout, /^\[claude-pipeline owner-go\] the owner's ruling is recorded for acme\/app #58: R1-F1/);
   assert.doesNotMatch(r.stdout, /no ruling was recorded/);
   assert.equal(r.record.prompt_id.startsWith('pid-'), true);

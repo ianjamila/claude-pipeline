@@ -190,19 +190,13 @@ export function lastRequestText(transcriptPath, opts = {}) {
 // The same reply, whatever it ends with ('' when there is none).
 // #128 skipSynthetic (rulings only; a merge request stays strict): a prompt entry whose METADATA says synthetic (entrySource, never its
 // text) opens no reply slot, and every assistant text after it up to the next other prompt is dropped, so the owner can answer a ruling
-// ask after a background notice and the agent's reply to it, and a ruling or 🔀 line printed in that reply binds nothing. An owner prompt
+// ask after a background notice the agent answered without text, and nothing the agent prints in such a reply binds. An owner prompt
 // or one of unknown source is a boundary as before, so a pasted `<task-notification>` typed by the owner keeps its boundary.
-// R1-F3 (the limit): a dropped reply may itself have shown a NEWER ask (the agent can start a synthetic turn at will, with a background task), and the owner
-// answers the ask they last saw. So a dropped reply that holds a ruling line or a 🔀 line voids the pending slot: '' (the owner is asked again, the nudge fires).
-// R2-F2 / R3-B2: the agent is the untrusted party and picks its wording ("For #59, what is your ruling on the first blocker?" has no ruling line or finding id), so the
-// test fails towards voiding and does not depend on a phrase: a ruling line, a finding id, a reference to a PR or issue ("#59", "PR 59", "pull request 59"), a question
-// mark, or a word that asks for a call (ruling, decide, your call, blocker, finding ...). An ordinary reply to a notice ("The build finished.")
-// has none of them and still leaves the ask standing: the owner can answer after a background notice, the point of skipSynthetic.
-const SHOWS_ASK = /Owner ruling needed\s+#\d/i;
-const FINDING_ID_TEXT = /\bR\d{1,4}-[A-Za-z]{1,8}\d{1,4}\b/i;
-const PR_REF = /#\d|\b(?:pr|pull\s+request|issue)s?\s*#?\d/i;
-const CALL_WORD = /\?|\b(?:ruling|rule on|verdict|decision|decide|your call|which of|blockers?|findings?)\b/i;
-const showsAsk = (text) => SHOWS_ASK.test(text) || READY_LINE.test(text) || FINDING_ID_TEXT.test(text) || PR_REF.test(text) || CALL_WORD.test(text);
+// R1-F3 / R2-F2 / R3-B2 (the limit, owner decision 2026-11-03): a dropped reply may itself have shown a NEWER ask (the agent can start a synthetic turn at will, with a background
+// task), and the owner answers the ask they last saw. The agent is the untrusted party and picks its wording ("For #59, what is your ruling on the first blocker?", "Tell me
+// what to do about it"), so no test of WHAT the reply says can be complete: ANY non-empty text in a dropped reply voids the pending slot: '' (the owner is asked again, the nudge
+// fires). The cost is one re-ask; a harness turn the agent answers with tool calls only (no text) leaves the ask standing, which is what skipSynthetic is for.
+const showsText = (text) => text.trim() !== '';
 export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
   const replies = [''];
   const voided = new Set(); // slots (indexes of replies) whose ask a dropped reply replaced
@@ -223,7 +217,7 @@ export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTE
       lastIsPrompt = isPrompt;
     } else if (e?.type === 'assistant' && Array.isArray(content)) {
       if (skipping) {
-        if (content.some((b) => b?.type === 'text' && typeof b.text === 'string' && showsAsk(b.text))) voided.add(replies.length - 1);
+        if (content.some((b) => b?.type === 'text' && typeof b.text === 'string' && showsText(b.text))) voided.add(replies.length - 1);
         continue;
       }
       lastIsPrompt = false;
