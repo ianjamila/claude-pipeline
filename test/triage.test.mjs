@@ -25,6 +25,8 @@ import {
   fablePendingRounds,
   fableFindingItems,
   roundCapProblem,
+  roundAdmission,
+  autoExtraOrdinal,
   countsTowardCap,
   reviewedRoundCount,
   FABLE_FINDINGS_MAX,
@@ -615,7 +617,7 @@ test('roundOutcome: clean when every item is settled, nothing accepted, and the 
   ];
   const o = roundOutcome(stateOf([round(1, []), round(2, items)]));
   assert.deepEqual(o, {
-    clean: true, openBlocking: [], newAccepted: [], needsHuman: [], pending: [], unimplemented: [], reachedMax: false, extraRound: false, effectiveMaxRounds: 3, coverageValid: true, fablePending: [],
+    clean: true, openBlocking: [], newAccepted: [], needsHuman: [], pending: [], unimplemented: [], reachedMax: false, extraRound: false, effectiveMaxRounds: 3, coverageValid: true, fablePending: [], grantedRound: null, autoExtraOrdinal: null,
   });
 });
 
@@ -1520,4 +1522,90 @@ test('reviewValidFor agrees with roundOutcome.clean over resolution-only histori
       assert.equal(reviewValidFor(s, hash), roundOutcome(s).clean, `${rounds.map((r) => `${r.n}${r.resolutionOnly ? 'r' : ''}`).join(',')} at ${hash}`);
     }
   }
+});
+
+// ---- owner-granted rounds (the record lookup is injected: no files here) ---------------------------------------------------------
+
+const H40 = 'a'.repeat(40);
+const H12 = 'a'.repeat(12);
+// The lookup roundOutcome / roundAdmission are given: the owner's open records for counted ordinal k, any head.
+const grantFor = (k, head = H12, grantId = 'g1') => (ord) => (ord === k ? [{ grantId, head, quote: 'extra round' }] : []);
+const stuck = () => item({ id: 'R3-B2', final: settled('REJECT', 'arbiter', { needsHuman: true }) }); // a human item blocks the automatic extra round
+const grantedRound = (n, over = {}) => round(n, [fixed(n)], 'h-final', { admission: 'owner', ownerGrant: { grantId: 'g1', k: n, quote: 'extra round', ownerTs: '2026-11-01T00:00:00.000Z' }, ...over });
+const asKeys = (o) => [o.reachedMax, o.extraRound, o.effectiveMaxRounds, o.grantedRound?.k ?? null, o.autoExtraOrdinal];
+
+const grantOutcomeCases = [
+  ['cap + open grant (a human item blocks the auto extra)', () => [stateOf(upTo(3, [fixed(3), stuck()], 'h-old')), { grants: grantFor(4), head: H40 }], [false, false, 4, 4, null]],
+  ['cap, no grant', () => [stateOf(upTo(3, [fixed(3), stuck()], 'h-old')), { grants: grantFor(5), head: H40 }], [true, false, 3, null, null]],
+  ['cap, the grant is for another head (stale)', () => [stateOf(upTo(3, [fixed(3), stuck()], 'h-old')), { grants: grantFor(4, 'b'.repeat(12)), head: H40 }], [true, false, 3, null, null]],
+  ['cap, no head given: any record counts', () => [stateOf(upTo(3, [fixed(3), stuck()], 'h-old')), { grants: grantFor(4, 'b'.repeat(12)) }], [false, false, 4, 4, null]],
+  ['the granted round (4) is used: no longer open', () => [stateOf([...upTo(3, [fixed(3)]), grantedRound(4)]), { grants: () => [], head: H40 }], [true, false, 4, null, null]],
+  ['auto + grant, same ordinal, counts once', () => [stateOf(upTo(3, [fixed(3)], 'h-old')), { grants: grantFor(4), head: H40 }], [false, true, 4, null, null]],
+  ['auto extra (4) used, open grant for 5', () => [stateOf(upTo(4, [fixed(4)])), { grants: grantFor(5), head: H40 }], [false, false, 5, 5, 4]],
+  ['auto 4 + granted 5, both used', () => [stateOf([...upTo(3, [fixed(3)]), round(4, [fixed(4)], 'h-final', { admission: 'auto-extra' }), grantedRound(5)]), { grants: () => [], head: H40 }], [true, false, 5, null, 4]],
+  ['granted 4 used, open grant for 5', () => [stateOf([...upTo(3, [fixed(3)]), grantedRound(4)]), { grants: grantFor(5), head: H40 }], [false, false, 5, 5, null]],
+  ['an open grant for 5 at reviewed 3 is not open', () => [stateOf(upTo(3, [fixed(3), stuck()], 'h-old')), { grants: grantFor(5), head: H40 }], [true, false, 3, null, null]],
+  ['below the cap a grant is not looked at', () => [stateOf(upTo(2, [fixed(2)])), { grants: () => { throw new Error('must not be asked'); }, head: H40 }], [false, false, 3, null, null]],
+  ['discarded granted round, regranted: counts the one open grant once', () => [stateOf(upTo(3, [fixed(3), stuck()], 'h-old')), { grants: grantFor(4), head: H40 }], [false, false, 4, 4, null]],
+  ['discarded auto 4, regranted for 4 while a human item blocks it', () => [stateOf(upTo(3, [fixed(3), stuck()], 'h-old')), { grants: grantFor(4), head: H40 }], [false, false, 4, 4, null]],
+  ['a throwing lookup is no grant', () => [stateOf(upTo(3, [fixed(3), stuck()], 'h-old')), { grants: () => { throw new Error('boom'); }, head: H40 }], [true, false, 3, null, null]],
+  ['malformed records are ignored', () => [stateOf(upTo(3, [fixed(3), stuck()], 'h-old')), { grants: () => [null, { grantId: 7, head: H12 }, { grantId: 'g', head: 5 }], head: H40 }], [true, false, 3, null, null]],
+  ['no maxRounds: never capped, a grant changes nothing', () => [stateOf(upTo(3, [fixed(3)]), { maxRounds: undefined }), { grants: grantFor(4), head: H40 }], [false, false, null, null, null]],
+  ['a clean round at the cap: nothing to grant', () => [stateOf(upTo(3, [])), { grants: grantFor(4), head: H40 }], [false, false, 3, null, null]],
+  ['legacy: round 4 without admission is the auto extra', () => [stateOf(upTo(4, [fixed(4)])), { grants: () => [], head: H40 }], [true, false, 4, null, 4]],
+];
+for (const [name, build, want] of grantOutcomeCases) {
+  test(`roundOutcome owner grant: ${name}`, () => {
+    const [state, opts] = build();
+    assert.deepEqual(asKeys(roundOutcome(state, opts)), want);
+  });
+}
+
+test('roundOutcome owner grant: grantedRound carries the record (id, head, quote) and the ordinal', () => {
+  const o = roundOutcome(stateOf(upTo(3, [fixed(3), stuck()], 'h-old')), { grants: grantFor(4, H12, 'abc'), head: H40 });
+  assert.deepEqual(o.grantedRound, { k: 4, grantId: 'abc', head: H12, quote: 'extra round' });
+});
+
+test('autoExtraOrdinal: the counted round at max + 1 that no owner grant admitted', () => {
+  assert.equal(autoExtraOrdinal(stateOf(upTo(3, [fixed(3)]))), null, 'not used yet');
+  assert.equal(autoExtraOrdinal(stateOf(upTo(4, [fixed(4)]))), 4, 'legacy: no admission recorded');
+  assert.equal(autoExtraOrdinal(stateOf([...upTo(3, [fixed(3)]), round(4, [], 'h', { admission: 'auto-extra' })])), 4);
+  assert.equal(autoExtraOrdinal(stateOf([...upTo(3, [fixed(3)]), grantedRound(4)])), null, 'an owner round is not the auto extra');
+  assert.equal(autoExtraOrdinal(stateOf([...upTo(3, [fixed(3)]), round(4, [], 'h', { admission: 'owner' })])), null);
+  // base-only and resolution-only rounds are not counted: the ordinal skips them
+  assert.equal(autoExtraOrdinal(stateOf([round(1, []), round(2, [], 'h', { baseOnly: true }), round(3, []), round(4, []), round(5, [])])), 4, 'ordinal 4 is round n=5');
+  assert.equal(autoExtraOrdinal(stateOf(upTo(4, [fixed(4)]), { maxRounds: undefined })), null);
+});
+
+test('roundAdmission: normal, auto-extra, owner, uncounted - and why a round is refused', () => {
+  const asked = (state, flags = {}, n = state.rounds.length + 1) => roundAdmission(state, n, { head: H40, grants: () => { throw new Error('must not be asked'); }, ...flags });
+  assert.equal(asked(stateOf(upTo(2, [fixed(2)]))).admission, 'normal');
+  assert.equal(roundAdmission({ rounds: [] }, 9).admission, 'normal', 'no finite maxRounds');
+  assert.equal(asked(stateOf(upTo(3, [fixed(3)]))).admission, 'auto-extra', 'the auto extra is checked first: no grant lookup');
+  assert.equal(asked(stateOf(upTo(4, [fixed(4)])), { baseOnly: true }).admission, 'uncounted');
+  assert.equal(asked(stateOf(upTo(4, [fixed(4)])), { resolutionOnly: true }).admission, 'uncounted');
+  const blocked = stateOf(upTo(3, [fixed(3), stuck()], 'h-old'));
+  assert.deepEqual(roundAdmission(blocked, 4, { head: H40, grants: grantFor(4) }), { admission: 'owner', problem: null, k: 4 });
+  const stale = roundAdmission(blocked, 4, { head: H40, grants: grantFor(4, 'b'.repeat(12)) });
+  assert.equal(stale.admission, null);
+  assert.match(stale.problem, /round 4 is granted for head b{12}, not a{12}: ask again \(triage round-request\)/);
+  const none = roundAdmission(blocked, 4, { head: H40, grants: () => [] });
+  assert.match(none.problem, /only one extra round is allowed, and only when .* or an owner-granted round$/);
+  const beyond = roundAdmission(stateOf([...upTo(3, [fixed(3)]), grantedRound(4)]), 5, { head: H40, grants: () => [] });
+  assert.match(beyond.problem, /and its one extra round, or an owner-granted round$/);
+});
+
+test('roundCapProblem owner grant: an open grant allows exactly the next counted round, never a baseOnly/resolutionOnly one', () => {
+  const blocked = stateOf(upTo(3, [fixed(3), stuck()], 'h-old'));
+  assert.equal(roundCapProblem(blocked, 4, { head: H40, grants: grantFor(4) }), null);
+  assert.match(roundCapProblem(blocked, 4, { head: H40, grants: grantFor(4, 'c'.repeat(12)) }), /ask again \(triage round-request\)/);
+  assert.match(roundCapProblem(blocked, 4, { head: H40, grants: grantFor(5) }), /or an owner-granted round/);
+  assert.match(roundCapProblem(blocked, 4, { head: H40 }), /or an owner-granted round/, 'no lookup: no grant');
+  // baseOnly / resolutionOnly neither need nor use a grant (the lookup is not even asked)
+  const never = { head: H40, grants: () => { throw new Error('must not be asked'); } };
+  assert.equal(roundCapProblem(blocked, 4, { ...never, baseOnly: true }), null);
+  assert.equal(roundCapProblem(blocked, 4, { ...never, resolutionOnly: true }), null);
+  // used: round 4 holds the grant, so round 5 is refused (a grant never carries to a later ordinal)
+  const used = stateOf([...upTo(3, [fixed(3)]), grantedRound(4)]);
+  assert.match(roundCapProblem(used, 5, { head: H40, grants: grantFor(4) }), /and its one extra round, or an owner-granted round/);
 });

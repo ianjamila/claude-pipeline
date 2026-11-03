@@ -68,6 +68,23 @@ test('the review skill teaches reading the job exit code, and keeps the update-b
   assert.match(review, /update-branch/);
 });
 
+test('the owner-granted extra round: the review skill asks with round-request and never forges the owner; the docs name the grant, the gate machine and the nested-claude vector', () => {
+  const review = read('skills/review/SKILL.md');
+  assert.match(review, /`reachedMax`.*`owner_approval: chat`/s);
+  assert.match(review, /P triage round-request --pr N/);
+  assert.match(review, /ends with the exact `line`\*\*, nothing after it/);
+  assert.match(review, /Never\s+type, paraphrase or forge the owner's words/);
+  assert.match(review, /Label mode ⇒ no grant exists: park as before/);
+  const cli = read('docs/cli.md');
+  assert.match(cli, /grantedRound/);
+  assert.match(cli, /grantUsed/);
+  assert.match(cli, /run the gate \(and `review-complete`\) on the machine that reviewed a granted round/);
+  assert.match(cli, /`merge` \(the 🔀 line\), a ruling answer \(the ⚖️ line\) and `extra round` \(the 🔁 line\)/);
+  const readme = read('README.md');
+  assert.match(readme, /`extra round`/);
+  assert.match(readme, /nested `claude -p`, `claude --resume` or\s+`claude --continue`.*see #132 \/ PR #133/s);
+});
+
 test('agents: implementer and verifier inherit effort (spec 5.4); judge (Sonnet), arbiter (Fable) and Explore (Haiku) pin theirs', () => {
   const front = (doc) => read(doc).split('---')[1];
   assert.ok(!/^effort:/m.test(front('agents/implementer.md')));

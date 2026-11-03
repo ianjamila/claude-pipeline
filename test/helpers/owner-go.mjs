@@ -5,12 +5,15 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { ownerGoDir, recordApproval, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
+import { ownerGoDir, recordApproval, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
 
 // What the recorder writes when the owner types `prompt` after a reply that showed `reply`. Returns the record (or null).
 export const ownerSays = (t, prompt, reply) => said(t, prompt, reply, recordApproval);
 // Phase 3b: the same for a ruling (the reply ends with rulingRequest's line).
 export const ownerRules = (t, prompt, reply) => said(t, prompt, reply, recordRuling);
+
+// Owner-granted extra round: the same for the owner's `extra round` (the reply ends with roundRequest's line).
+export const ownerGrants = (t, prompt, reply) => said(t, prompt, reply, recordRoundGrant);
 
 function said(t, prompt, reply, recorder) {
   const dir = mkdtempSync(join(tmpdir(), 'owner-go-'));
@@ -36,6 +39,9 @@ export const mergeRequest = (pr, head, items, repo = 'acme/widgets') => `Owner i
 // A reply that asks the owner to rule on review items, as the ship skill ends it (review-loop.md, Owner rules in chat).
 // #110: the line carries the content digest `P triage ruling-request` prints (a placeholder unless a test passes the real one).
 export const rulingRequest = (pr, ids, repo = 'acme/widgets', content = 'c0ffee000000') => `R1-B1 is waiting for your decision.\n⚖️ Owner ruling needed #${pr}: ${ids.join(', ')}${content === null ? '' : ` · content ${content}`} · repo ${repo}`;
+
+// A reply that asks for one more counted review round, as `P triage round-request` prints it (k = the counted ordinal; head >= 12 hex).
+export const roundRequest = (pr, k, head, repo = 'acme/widgets') => `Round ${k - 1} left items open.\n🔁 Extra review round needed #${pr}: round ${k} · head ${head.slice(0, 12)} · repo ${repo}`;
 
 // The flags P merge takes for it.
 export const approvalFlags = (head, items) => ['--owner-approved-head', head, '--owner-approved-items', items];

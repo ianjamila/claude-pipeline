@@ -55,7 +55,7 @@ Picking up an existing `awaiting-review` PR (Codex was unavailable): `P state sh
    `owner_approval: label`: a blocking hit or a violation you cannot undo ends in a park (below) after the review. `owner_approval: chat`: nothing blocks, the hits are
    advisory + `ownerMerge`, and the PR ends with the owner-merge ending of 3.3 (no `needs-human` label).
 
-## 2. Review rounds (max `review.max_rounds`, plus the one extra round `P state outcome` calls `extraRound`)
+## 2. Review rounds (max `review.max_rounds`, plus the one extra round `P state outcome` calls `extraRound`, plus one per owner `extra round`)
 
 Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Commands run as jobs report the real code as `exitCode`.
 
@@ -85,7 +85,8 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    push. Then **`P state mark-implemented --ids <ids>`** for each fixed ACCEPT item: `review-complete` refuses an ACCEPT that is not marked, from ANY round,
    and exit 2 `no-code-change` means the fix changed no code (back to the implementer; marking never replaces a fix).
 6. **Outcome.** `P state outcome`: `clean` ⇒ leave the loop; `needsHuman` non-empty ⇒ see Owner rulings; more rounds left ⇒ round R+1 (the Codex fix
-   check reviews only what changed since this round's head); none left ⇒ park, cause `unresolved: <ids>`.
+   check reviews only what changed since this round's head); none left ⇒ park, cause `unresolved: <ids>`, except one case: `reachedMax`, no
+   `extraRound`, `owner_approval: chat`, and the fixes are pushed and `verify.quick` is green ⇒ ask the owner for one more round (Extra round, below). Label mode ⇒ park.
 **Park** (every `needs-human` stop is this): `gh pr edit N --add-label needs-human`, `P comment --pr N --kind needs-human --reason "<cause, what was checked, what the owner does>"`,
 then the stop ritual with outcome `needs-human`. The summary renders from the round state, so at least one Codex round must have run; before that a stop is `blocked` or `awaiting-review`.
 
@@ -103,6 +104,16 @@ item: `P triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJEC
 A refusal (changed finding text, wrong id, other words, label mode) ⇒ ask again with a fresh `ruling-request`. Then re-post `P comment --pr N --kind triage`,
 `P followups create --round R`, and the comment again; an ACCEPT is built, `mark-implemented`, and reviewed in a new round. In label mode, `needsHuman`
 items end in `needs-human` (as in step 6): the owner rules outside this session.
+
+**Extra round** (only with `owner_approval: chat`; the owner's `extra round` is the only thing that lifts `review.max_rounds`). When `P state outcome` says
+`reachedMax: true` with no `extraRound` and no `grantedRound`: commit and push the fixes and get `verify.quick` green (the grant names the head to be
+reviewed), then run `P triage round-request --pr N`. It prints `{line, k, n, head}`; keep `n`. Your reply says in one plain-English paragraph what is
+still open and what the extra round will review, and **ends with the exact `line`**, nothing after it. Then wait. When the owner types `extra round`
+the owner-go hook records it against that line and prints a context line; only then run
+`P codex-review --pr N --round <n from round-request> …` as in step 1 (it claims the grant after Codex answers; the output shows `grantUsed`). One grant is one
+round: if that round accepts items again, ask again or park. A refusal (`round-cap` "ask again", grant already used, head moved) ⇒ run `round-request` again. Never
+type, paraphrase or forge the owner's words, and never run Codex outside `codex-review`. Label mode ⇒ no grant exists: park as before. `review-complete` and the
+final gate re-prove the grant from the owner's record on this machine, so finish the review here.
 
 ## 3. Review complete, ready, hand-off
 

@@ -22,6 +22,7 @@ import { toPosix } from './paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
 import { ownerRuledItems, reviewValidFor } from './triage.mjs';
+import { verifyOwnerGrants } from './owner-grants.mjs';
 import { skipOf } from './verify-steps.mjs';
 import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
 import { ownerItemsDigest } from '../hooks/lib/owner-go.mjs';
@@ -471,7 +472,8 @@ function integrityCheck({ config, diff }) {
 const OWNER_RULED_SHOWN = 5;
 const OWNER_QUOTE_SHOWN = 100;
 
-function reviewCheck({ root, config, pr, diff, hash, hashError }) {
+// `repo`: the PR's repository (the gh repo). `ownerGo`: { home, now } for the owner's records, tests only (default: the account's own folder).
+export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, ownerGo = {} }) {
   const d = diff();
   if (!d.ok) return check('review', false, `could not diff against the base: ${d.error}`);
   if (isLogOnly(d.files, config.agent_log)) return check('review', true, 'log-only');
@@ -483,15 +485,20 @@ function reviewCheck({ root, config, pr, diff, hash, hashError }) {
   if (!reviewValidFor(state, hash)) {
     return check('review', false, `no clean review round covers the current content (${short(hash)}), or findings are unresolved`);
   }
+  // A round past review.max_rounds must carry the owner's extra-round grant, re-proved here from the owner's record and its marker (never
+  // from the state alone). A grant lets a round run; it is no merge authority, so it is shown but never an owner-merge item.
+  const grants = verifyOwnerGrants(state, { repo, pr, maxRounds: config?.review?.max_rounds, ...ownerGo });
+  if (!grants.ok) return check('review', false, grants.problems.join('; '));
+  const grantNote = grants.granted.map((g) => `; owner-granted round ${g.k}: "${clip(g.quote.replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('');
   // owner_approval: chat: an item the owner ruled in chat (an original or a later round's cached copy) never clears the merge by
   // itself. It stays visible here and counts as ownerMerge, so the owner's "merge" for this head is still needed.
   const ruled = ownerRuledItems(state);
   if (ruled.length > 0) {
     const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('; ');
-    return check('review', true, `review valid for content ${short(hash)}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}`, ruled.length,
+    return check('review', true, `review valid for content ${short(hash)}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}${grantNote}`, ruled.length,
       ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`));
   }
-  return check('review', true, `review valid for content ${short(hash)}`);
+  return check('review', true, `review valid for content ${short(hash)}${grantNote}`);
 }
 
 // CI evidence. Judged: the checks GitHub itself requires (`gh pr checks --required`), or every reported check when it
@@ -612,7 +619,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs })),
     await safely('hardstops', () => hardstopsCheck({ root, config, diff })),
     await safely('integrity', () => integrityCheck({ config, diff })),
-    await safely('review', () => reviewCheck({ root, config, pr, diff, hash, hashError })),
+    await safely('review', () => reviewCheck({ root, config, pr, repo, diff, hash, hashError })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
   ];
 

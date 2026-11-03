@@ -16,6 +16,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, reviewLane } from '../lib/risk.mjs';
 import { loadState } from '../lib/state.mjs';
 import { reviewValidFor, roundOutcome } from '../lib/triage.mjs';
+import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
 import { currentContentHash, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 
@@ -27,6 +28,8 @@ export const meta = {
     `  the comment starts with the line ${'`<!-- claude-pipeline:review-complete v1 -->`'} and carries the JSON {contentHash, base, head, rounds, codexModel, modelProofDigest}`,
     '  (base = the merge base the content hash is measured from; modelProofDigest = sha256 of the Fable model proofs, null when no Fable pass ran);',
     '  an identical latest comment of ours is reused, not posted again; exit 3 when GitHub is unavailable or the label is still on the PR after removal',
+    '  a round past review.max_rounds must carry the owner\'s extra-round grant (codex-review records it), re-proved here against the owner\'s record and its marker on THIS machine (the',
+    '  same check as the final gate\'s review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise',
   ].join('\n'),
 };
 
@@ -126,6 +129,9 @@ export const run = guarded(async (argv, ctx) => {
       if (!state || !reviewValidFor(state, hash)) {
         return { exitCode: EXIT.FAILED, output: { ok: false, reason: whyNot(state, hash), currentContentHash: hash } };
       }
+      // The same proof as the final gate: a round past review.max_rounds must be backed by the owner's record and its marker.
+      const grants = verifyOwnerGrants(state, { repo: gh.repo().slug, pr, maxRounds: config.review.max_rounds });
+      if (!grants.ok) return { exitCode: EXIT.FAILED, output: { ok: false, reason: grants.problems.join('; '), currentContentHash: hash } };
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
       const lane = laneProblem(state, root, config, base);
       if (lane) return { exitCode: EXIT.FAILED, output: { ok: false, reason: lane, currentContentHash: hash } };
