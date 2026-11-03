@@ -322,8 +322,8 @@ With `ci.review_check: true` the guard workflow turns this comment into the `Cro
 the newest such comment by an allowed author names the content hash of the PR head). A comment starts no workflow, so
 `recheck` says how the guards learn about it: `on-ready` (a draft: marking it ready starts them), `label-removed`
 (removing `awaiting-review` already did), `triggered` (a ready PR: the command added and removed the label
-`pipeline-recheck`, created by `P labels`), or `failed` with `recheckError` (the comment stands; add and remove any label
-by hand). A failed nudge never changes the exit code. The guards recompute the hash from the BASE branch's config
+`pipeline-recheck`, created by `P labels`), or `failed` with `recheckError` (the comment stands; add and remove
+`pipeline-recheck` by hand — only labels the guards act on start a run, see the header of `pipeline-guards.yml`). A failed nudge never changes the exit code. The guards recompute the hash from the BASE branch's config
 (`agent_log`) and the base tip the workflow checked out; this command uses the local config and `origin/<default>`. When the
 two differ (a stale local `origin` ref, an agent log renamed on the branch) the status fails closed with "the content changed
 since the review": fetch, re-run the review, and post again.

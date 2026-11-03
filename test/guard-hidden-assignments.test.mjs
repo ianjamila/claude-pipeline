@@ -243,6 +243,10 @@ const chain = (twice, depth, words, names = 4) => {
   return out;
 };
 const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; }; // (CPU time, not the clock: a busy machine must not fail the test)
+// The timing bound below proves the refusal came well before the guard's 5 s deadline (the reason check proves it was the reading
+// cap). A shared CI runner measured 3480 ms of CPU and 3068 ms of clock for the 20-word chain (main e48f4ae, no code change), so CI
+// gets the headroom guard-t8b's cap got; it stays under the deadline.
+const EARLY_MS = process.env.CI ? 4500 : 3000;
 test('three nested scripts that each assign four names twice and loop over eight words are refused at once, not at the deadline', () => {
   const t0 = cpu();
   const w0 = Date.now();
@@ -251,9 +255,9 @@ test('three nested scripts that each assign four names twice and loop over eight
   assert.match(r.reason, /too many readings/, r.reason);
   const ms = cpu() - t0;
   const wall = Date.now() - w0;
-  // Either clock under 3 s proves the refusal came long before the 5 s deadline: CPU time is inflated on a CI runner whose cores
+  // Either clock under EARLY_MS proves the refusal came before the 5 s deadline: CPU time is inflated on a CI runner whose cores
   // are shared with parallel test files (GC threads, contention), the clock on a merely busy machine.
-  assert.ok(ms < 3000 || wall < 3000, `took ${Math.round(ms)} ms of CPU and ${wall} ms of clock`);
+  assert.ok(ms < EARLY_MS || wall < EARLY_MS, `took ${Math.round(ms)} ms of CPU and ${wall} ms of clock`);
 });
 test('a chain with a few readings is still allowed', () => {
   assert.equal(files('bash F1.sh', fakeFs(PROJ, chain(true, 2, 'w1 w2', 2))).decision, 'allow'); // (two names twice, two words: 8 readings a level)
@@ -269,9 +273,9 @@ test('loop words alone (names assigned once) also share the allowance across nes
   assert.match(r.reason, /too many readings/, r.reason);
   const ms = cpu() - t0;
   const wall = Date.now() - w0;
-  // Either clock under 3 s proves the refusal came long before the 5 s deadline: CPU time is inflated on a CI runner whose cores
+  // Either clock under EARLY_MS proves the refusal came before the 5 s deadline: CPU time is inflated on a CI runner whose cores
   // are shared with parallel test files (GC threads, contention), the clock on a merely busy machine.
-  assert.ok(ms < 3000 || wall < 3000, `took ${Math.round(ms)} ms of CPU and ${wall} ms of clock`);
+  assert.ok(ms < EARLY_MS || wall < EARLY_MS, `took ${Math.round(ms)} ms of CPU and ${wall} ms of clock`);
 });
 
 test('program text in quotes (node -e, awk, sed) is no assignment: += and a[i]= in it change nothing', () => {

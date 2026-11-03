@@ -165,7 +165,7 @@ export const run = guarded(async (argv, ctx) => {
           gh.removeLabels(pr, [RECHECK_LABEL]);
         } catch (err) {
           recheck = 'failed';
-          recheckError = `${String(err?.message ?? err).split('\n')[0].slice(0, 160)}; run \`P labels\` (creates ${RECHECK_LABEL}), or add and remove any label, so the guards post Cross-model review`;
+          recheckError = `${String(err?.message ?? err).split('\n')[0].slice(0, 160)}; run \`P labels\` (creates ${RECHECK_LABEL}), then add and remove ${RECHECK_LABEL} by hand, so the guards post Cross-model review`;
         }
       }
       return {

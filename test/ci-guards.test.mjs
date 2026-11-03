@@ -10,7 +10,9 @@ import { fileURLToPath } from 'node:url';
 import { run as procRun } from '../pipeline/lib/proc.mjs';
 import { verdictArtifactName } from '../pipeline/lib/guard-provenance.mjs';
 import { reviewContentHash } from '../pipeline/lib/git.mjs';
-import { reviewCompleteBody } from '../pipeline/commands/review-complete.mjs';
+import { reviewCompleteBody, RECHECK_LABEL, AWAITING_REVIEW } from '../pipeline/commands/review-complete.mjs';
+import { BLOCKING_LABELS } from '../pipeline/lib/finalgate.mjs';
+import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { CONFIG, project, runNode, scratchDir } from './helpers/project.mjs';
 
 const fakeGh = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-seq.mjs');
@@ -400,8 +402,9 @@ test('pipeline-guards.yml re-evaluates a PR whose base changed (edited), but ign
   const yml = readFileSync(join(root, 'pipeline', 'templates', 'workflows', 'pipeline-guards.yml'), 'utf8');
   const types = /types: \[([^\]]*)\]/.exec(yml)[1].split(',').map((x) => x.trim());
   for (const t of ['opened', 'synchronize', 'reopened', 'ready_for_review', 'labeled', 'unlabeled', 'edited']) assert.ok(types.includes(t), t);
-  assert.match(yml, /^    if: github\.event\.action != 'edited' \|\| github\.event\.changes\.base$/m);
-  assert.match(yml, /group: pipeline-guards-\$\{\{ github\.event\.pull_request\.number \}\}\$\{\{ github\.event\.action == 'edited' && !github\.event\.changes\.base && '-noop' \|\| '' \}\}/);
+  assert.match(yml, /^      \(github\.event\.action != 'edited' \|\| github\.event\.changes\.base\)$/m);
+  assert.match(yml, /pipeline-guards-\$\{\{ github\.event\.pull_request\.number \}\}\$\{\{ \(\(github\.event\.action == 'edited' && !github\.event\.changes\.base\)$/m);
+  assert.match(yml, /^    && '-noop' \|\| '' \}\}$/m);
   // The orchestrator takes the base from the event payload, which after a retarget holds the NEW base.
   assert.match(yml, /BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
   // The checkout is the commit this workflow file came from (the base branch tip), never the lazily refreshed
@@ -430,6 +433,78 @@ test('pipeline-guards.yml hands the labeling event to the job through env only, 
   for (const b of runBlocks) assert.doesNotMatch(b, /\$\{\{/);
   assert.match(yml, /node-version: 24$/m);
   assert.doesNotMatch(yml, /checks: read/);
+});
+
+// Evaluates the workflow's own `if` / `concurrency.group` expressions for one event. Only the subset this file uses:
+// github.* paths (a missing field reads as null, as on GitHub), == / !=, && / ||, !, contains(fromJSON('[…]'), x)
+// (case-insensitive, as on GitHub), string literals. The source is this repo's own workflow file, checked against an
+// allow-list of characters before it is compiled.
+function actionsExpr(src) {
+  const js = src
+    .replace(/\bfromJSON\('([^']*)'\)/g, (_, json) => JSON.stringify(JSON.parse(json)))
+    .replace(/!=/g, '!==').replace(/([^!=])==(?!=)/g, '$1===')
+    .replace(/\bgithub((?:\.\w+)+)/g, (_, p) => `ctx.github${p.replace(/\./g, '?.')}`);
+  assert.doesNotMatch(js.replace(/'[^']*'|"[^"]*"/g, ''), /[^\w\s.?()![\]=&|,]/, `unsupported expression: ${src}`);
+  const f = new Function('ctx', 'contains', `return (${js});`);
+  const contains = (list, v) => list.some((x) => String(x).toLowerCase() === String(v ?? '').toLowerCase());
+  return (github) => f({ github }, contains);
+}
+
+test('pipeline-guards.yml runs on every label the pipeline acts on and skips any other label without cancelling real runs', () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const wf = parseYaml(readFileSync(join(root, 'pipeline', 'templates', 'workflows', 'pipeline-guards.yml'), 'utf8'));
+  const ifExpr = actionsExpr(wf.jobs.guards.if);
+  const runs = (github) => Boolean(ifExpr(github)); // GitHub casts an `if` result to a boolean
+  const groupParts = /^pipeline-guards-\$\{\{ (.+?) \}\}\$\{\{ (.+) \}\}$/.exec(wf.concurrency.group);
+  assert.ok(groupParts, wf.concurrency.group);
+  const prNumber = actionsExpr(groupParts[1]);
+  const suffix = actionsExpr(groupParts[2]);
+  const group = (github) => `pipeline-guards-${prNumber(github)}${suffix(github)}`;
+  const ev = (action, extra = {}) => ({ event: { action, pull_request: { number: 7 }, changes: {}, ...extra } });
+
+  // Every label the guards read (the approval labels, taken from the guard's own source: the template only resolves its
+  // imports once vendored), every label whose add/remove review-complete relies on to wake them, and the owner's stop
+  // labels: labeled AND unlabeled must start a real run in the PR's real group.
+  const guardSrc = readFileSync(join(root, 'pipeline', 'templates', 'scripts', 'pipeline', 'ci-guard.mjs'), 'utf8');
+  const approvals = ['INTEGRITY_LABEL', 'HARDSTOP_LABEL'].map((k) => new RegExp(`^export const ${k} = '([^']+)';$`, 'm').exec(guardSrc)?.[1]);
+  assert.deepEqual(approvals, ['test-change-approved', 'human-approved']);
+  const acted = [...approvals, RECHECK_LABEL, AWAITING_REVIEW, ...BLOCKING_LABELS, 'pipeline-pause', 'pipeline-rollback'];
+  for (const name of new Set(acted)) {
+    for (const action of ['labeled', 'unlabeled']) {
+      const e = ev(action, { label: { name } });
+      assert.equal(runs(e), true, `${action} ${name} must run the guards`);
+      assert.equal(group(e), 'pipeline-guards-7', `${action} ${name} must share the real group`);
+    }
+  }
+  // GitHub compares label names in expressions case-insensitively; a differently cased approval still runs (fail open
+  // toward running: the guard itself decides what counts).
+  assert.equal(runs(ev('labeled', { label: { name: 'Human-Approved' } })), true);
+
+  // Any other label: skipped, in the no-op group, so it can neither bill a runner nor cancel a running evaluation.
+  for (const name of ['agent-build', 'agent-suggestion', 'bug', 'human-approved-later', '', undefined]) {
+    for (const action of ['labeled', 'unlabeled']) {
+      const e = ev(action, name === undefined ? {} : { label: { name } });
+      assert.equal(runs(e), false, `${action} ${String(name)} must be skipped`);
+      assert.equal(group(e), 'pipeline-guards-7-noop', `${action} ${String(name)} must use the no-op group`);
+    }
+  }
+
+  // Unchanged: every non-label event runs in the real group (whatever label it carries), a base retarget runs, and a
+  // title/body edit is a no-op.
+  for (const action of ['opened', 'synchronize', 'reopened', 'ready_for_review']) {
+    const e = ev(action, { label: { name: 'bug' } });
+    assert.equal(runs(e), true, action);
+    assert.equal(group(e), 'pipeline-guards-7', action);
+  }
+  assert.equal(runs(ev('edited', { changes: { base: { ref: { from: 'dev' } } } })), true);
+  assert.equal(group(ev('edited', { changes: { base: { ref: { from: 'dev' } } } })), 'pipeline-guards-7');
+  assert.equal(runs(ev('edited', { changes: { title: { from: 'x' } } })), false);
+  assert.equal(group(ev('edited', { changes: { title: { from: 'x' } } })), 'pipeline-guards-7-noop');
+
+  // The job filter and the group use the same list, so a label can never run in the no-op group or be skipped in the real one.
+  const lists = [wf.jobs.guards.if, wf.concurrency.group].map((s) => [...s.matchAll(/fromJSON\('([^']*)'\)/g)].map((m) => JSON.parse(m[1])));
+  assert.deepEqual(lists[0], lists[1]);
+  assert.equal(lists[0].length, 1);
 });
 
 // ---- who may approve: ci.approvers, the owner of a user repo, never an org name -----------------------------------------
