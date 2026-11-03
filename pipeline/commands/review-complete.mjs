@@ -28,6 +28,8 @@ export const meta = {
     `  the comment starts with the line ${'`<!-- claude-pipeline:review-complete v1 -->`'} and carries the JSON {contentHash, base, head, rounds, codexModel, modelProofDigest}`,
     '  (base = the merge base the content hash is measured from; modelProofDigest = sha256 of the Fable model proofs, null when no Fable pass ran);',
     '  an identical latest comment of ours is reused, not posted again; exit 3 when GitHub is unavailable or the label is still on the PR after removal',
+    '  a round past review.max_rounds must carry the owner\'s extra-round grant (codex-review records it), re-proved here against the owner\'s record and its marker on THIS machine (the',
+    '  same check as the final gate\'s review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise',
   ].join('\n'),
 };
 
