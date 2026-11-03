@@ -68,7 +68,8 @@ export function ymlFor({ preview = false, production = false, smokeCommand = 'no
 export const bump = (r) => r.write('src/app.js', 'export const a = 2;\n');
 
 export function reviewState(hash, { pending = false } = {}) {
-  let s = emptyState({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', risk: 'low' });
+  // maxRounds 2 = the config default (review.max_rounds): the gate refuses a state whose cap exceeds the configured one.
+  let s = emptyState({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', risk: 'low', maxRounds: 2 });
   s.currentContentHash = hash;
   const items = pending ? [{ id: 'F1', bucket: 'BLOCKING', title: 'open question', judge: { decision: 'ACCEPT', confidence: 'high', reason: 'x' } }] : [];
   s = addRound(s, { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: hash, items });

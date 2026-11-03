@@ -535,6 +535,15 @@ test('final gate review: the configured review.max_rounds is the cap - a state w
   assert.match(r.detail, /past review\.max_rounds \(1\)/);
 });
 
+test('final gate review: a state whose maxRounds exceeds the configured review.max_rounds fails with "the cap cannot be trusted"', () => {
+  const w = ownerWorld();
+  const state = granted([{ admission: 'normal' }], { max: 3 });
+  const r = reviewOf(state, w, { config: { review: { max_rounds: 2 } } });
+  assert.equal(r.ok, false);
+  assert.match(r.detail, /the review state records maxRounds 3, not within the configured review\.max_rounds \(2\): the cap cannot be trusted/);
+  assert.equal(reviewOf(granted([{ admission: 'normal' }], { max: 2 }), w, { config: { review: { max_rounds: 2 } } }).ok, true, 'a matching cap passes');
+});
+
 test('final gate review: a forged grant, a round past max+1 with none, or a wrong admission fails review', () => {
   const w = ownerWorld();
   const forged = granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'auto-extra' }, { head: head('4'), ownerGrant: { grantId: 'f'.repeat(16), k: 4, quote: 'extra round' } }]);
