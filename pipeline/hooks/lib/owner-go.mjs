@@ -196,7 +196,16 @@ export function lastRequestText(transcriptPath, opts = {}) {
 // task), and the owner answers the ask they last saw. The agent is the untrusted party and picks its wording ("For #59, what is your ruling on the first blocker?", "Tell me
 // what to do about it"), so no test of WHAT the reply says can be complete: ANY non-empty text in a dropped reply voids the pending slot: '' (the owner is asked again, the nudge
 // fires). The cost is one re-ask; a harness turn the agent answers with tool calls only (no text) leaves the ask standing, which is what skipSynthetic is for.
+// R4-F3 (owner decision 2026-11-03): a tool-only reply can still SURFACE a newer ask, in the tool call (a Bash `ruling-request` command, an echoed
+// ruling line) or in its result (a user entry with a tool_result block, which the owner sees in the tool box). Those lines are machine-printed, so
+// here a fixed test is sound: a tool_use input or a tool_result that contains a ruling line, a merge line or a `head <sha> · items` line, or the
+// command name `ruling-request`, voids the slot like text does. A tool-only reply without any of them still leaves the ask standing.
 const showsText = (text) => text.trim() !== '';
+const SURFACED_ASK = new RegExp(`Owner ruling needed\\s+#\\d|ruling-request|${READY_LINE.source}`, 'u');
+const surfacesAsk = (text) => SURFACED_ASK.test(text) || text.split(/\r?\n/).some((l) => HEAD_LINE.test(l));
+// The text of a tool_result block's content (a string, or text blocks), or of a tool_use block's input.
+const toolResultText = (c) => (typeof c === 'string' ? c : Array.isArray(c) ? c.map((x) => (typeof x === 'string' ? x : typeof x?.text === 'string' ? x.text : '')).join('\n') : '');
+const toolUseText = (input) => { try { return JSON.stringify(input ?? '') ?? ''; } catch { return ''; } };
 export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
   const replies = [''];
   const voided = new Set(); // slots (indexes of replies) whose ask a dropped reply replaced
@@ -209,7 +218,10 @@ export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTE
       const isPrompt = isPromptEntry(e);
       if (isPrompt && skipSynthetic && entrySource(e) === 'synthetic') { skipping = true; continue; }
       if (isPrompt) skipping = false;
-      else if (skipping) continue;
+      else if (skipping) {
+        if (Array.isArray(content) && content.some((b) => b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content)))) voided.add(replies.length - 1);
+        continue;
+      }
       if (isPrompt) {
         replies.push('');
         lastPromptText = promptTextOf(e);
@@ -217,7 +229,7 @@ export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTE
       lastIsPrompt = isPrompt;
     } else if (e?.type === 'assistant' && Array.isArray(content)) {
       if (skipping) {
-        if (content.some((b) => b?.type === 'text' && typeof b.text === 'string' && showsText(b.text))) voided.add(replies.length - 1);
+        if (content.some((b) => (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) || (b?.type === 'tool_use' && surfacesAsk(toolUseText(b.input))))) voided.add(replies.length - 1);
         continue;
       }
       lastIsPrompt = false;

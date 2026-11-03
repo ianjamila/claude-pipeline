@@ -512,6 +512,40 @@ test('#128 rulings: the owner can answer after a notice (or several) and the rep
   assert.equal(r.kind, 'ruling');
 });
 
+// R4-F3 (owner decision 2026-11-03): a tool-only reply to a harness turn can still SURFACE a newer ask: in the tool call (the `ruling-request` command,
+// an echoed ruling line) or in its result. Those machine-printed lines void the pending ask like text does; an unrelated tool leaves it standing.
+test('#128 rulings (R4-F3): a tool call or result that surfaces a newer ask voids the pending one; an unrelated tool does not', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-11-03T10:00:00Z');
+  const ANSWER = 'R1-B1: accept';
+  const head = [promptEntry('go'), said(ASK_REPLY)];
+  const rule = (between, { present = true } = {}) => {
+    const e = promptEntry(ANSWER);
+    return recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: ANSWER, prompt_id: e.promptId, transcript_path: transcript(home, present ? [...head, ...between, e] : [...head, ...between]) }, { home, now });
+  };
+  const use = (command) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: { command } }] } });
+  const result = (c) => ({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'x', content: c }] } });
+  const notice = () => promptEntry(NOTICE, NOTICE_META);
+  const RULING = '⚖️ Owner ruling needed #59: R1-B1 · content abcdef012345 · repo acme/app';
+  const surfacing = [
+    ['a ruling-request command', [notice(), use('pipeline triage ruling-request --pr 59 --ids R1-B1'), result('(truncated)')]],
+    ['an echoed ruling line in the call', [notice(), use(`echo "${RULING}"`), result('')]],
+    ['a ruling line in a result (string)', [notice(), use('cat out.txt'), result(`some output\n${RULING}\n`)]],
+    ['a ruling line in a result (text blocks)', [notice(), use('cat out.txt'), result([{ type: 'text', text: RULING }])]],
+    ['a merge line in a result', [notice(), use('cat out.txt'), result('x\n🔀 Ready to merge #59 — say "merge"')]],
+    ['a head line in a result', [notice(), use('cat out.txt'), result('Head 0123456789ab · items 0123456789ab · repo acme/app')]],
+  ];
+  for (const [name, between] of surfacing) {
+    for (const present of [true, false]) assert.equal(rule(between, { present }), null, `${name}, answer ${present ? 'in' : 'not in'} the transcript: voided`);
+    const fresh = rule([...between, promptEntry('what is that?'), said(ASK_REPLY)]);
+    assert.deepEqual([fresh?.pr, fresh?.ids], [58, ['R1-F1']], `${name}, then a fresh ask`);
+  }
+  // an unrelated tool leaves the ask standing (the ask was for R1-F1; answer it)
+  const standing = promptEntry('R1-F1: accept');
+  const r = recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'R1-F1: accept', prompt_id: standing.promptId, transcript_path: transcript(home, [...head, notice(), use('ls'), result('a.txt'), standing]) }, { home, now });
+  assert.deepEqual([r?.pr, r?.ids], [58, ['R1-F1']], 'an unrelated tool: the ask still binds');
+});
+
 test('#128 rulings: nothing is skipped by its text, and an owner turn between the ask and the answer is still a boundary', () => {
   const home = tmp();
   const now = () => Date.parse('2026-11-03T10:00:00Z');
