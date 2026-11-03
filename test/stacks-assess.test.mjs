@@ -6,7 +6,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, symlinkSync, appendFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildCurrent, cwdDirs, findStack, freshStack, gatherEvidence, ownPids, readLedgerLocked, summarizeEvidence, SESSION_END_PROBES, SWEEP_PROBES } from '../pipeline/lib/stacks/assess.mjs';
+import { buildCurrent, cwdDirs, findStack, freshStack, gatherEvidence, openSessions, ownPids, readLedgerLocked, summarizeEvidence, SESSION_END_PROBES, SWEEP_PROBES } from '../pipeline/lib/stacks/assess.mjs';
+import { consumerWorktrees } from '../pipeline/lib/stacks/evidence.mjs';
 import { checkBinding, sessionEndVerdict } from '../pipeline/lib/stacks/decide.mjs';
 import { appendEvent } from '../pipeline/lib/stacks/ledger.mjs';
 import { stackFiles, lockDirs } from '../pipeline/lib/stacks/paths.mjs';
@@ -814,6 +815,86 @@ test('openSessions (stack folder): a session whose transcripts disagree (one cop
     } finally {
       w2.cleanup();
     }
+  } finally {
+    w.cleanup();
+  }
+});
+
+// ---- #130: both `git worktree list` calls of the gather run under the gather deadline ----
+
+test('openSessions (stack folder): the nested worktree list is bounded by min(cap, time left); a deadline reached before it skips the spawn and every session inside the folder counts, with a note', posixOnly, async () => {
+  const w = nestedWorld();
+  try {
+    addSession(w.base, { pid: 11, sid: 'aaaaaaaa-1111', lines: [join(w.nested, 'app')], ageHours: 48 });
+    const seen = [];
+    const bounded = await w.open([11], { ctx: { listWorktrees: (root, o) => { seen.push([root, o?.timeoutMs]); return w.listWorktrees(root); } }, gather: { deadlineMs: 8000 } });
+    assert.deepEqual(bounded.evidence.openSessions, ok([]));
+    assert.deepEqual(seen, [[w.workdir, 8000]]);
+    const roomy = [];
+    await w.open([11], { ctx: { listWorktrees: (root, o) => { roomy.push(o?.timeoutMs); return w.listWorktrees(root); } }, gather: { deadlineMs: 60_000 } });
+    assert.deepEqual(roomy, [15_000], 'capped at 15 s');
+
+    let clock = NOW;
+    let spawned = 0;
+    const ctx = {
+      now: () => clock,
+      // the scan eats the budget: 300 ms are left when the nested list would start
+      scanLiveSessions: () => { clock = NOW + 7700; return { available: true, sessions: [{ id: 'aaaaaaaa', pid: 11, cwd: join(w.nested, 'app') }], unplaced: [] }; },
+      listWorktrees: () => { spawned += 1; return w.listWorktrees(w.workdir); },
+    };
+    const late = await w.open([11], { ctx, gather: { deadlineMs: 8000 } });
+    assert.equal(spawned, 0, 'no git spawned under 500 ms');
+    assert.equal(late.evidence.openSessions.ok, true);
+    assert.deepEqual(late.evidence.openSessions.value, [{ id: 'aaaaaaaa', pid: 11, dir: w.workdir }]);
+    assert.ok(late.evidence.openSessions.notes.some((n) => /could not be listed \(deadline\): every open session inside it counts/.test(n)));
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('openSessions (stack folder): a worktree list that times out counts every session inside the folder; called without a deadline it still passes the 15 s cap', posixOnly, () => {
+  const w = nestedWorld();
+  try {
+    const sessions = [{ id: 'aaaaaaaa', pid: 11, cwd: join(w.nested, 'app') }];
+    const scan = () => ({ available: true, sessions, unplaced: [] });
+    const caps = [];
+    const timedOut = openSessions(w.stack, [], {
+      home: w.base, env: {}, platform: 'linux', scan,
+      listWorktrees: (root, o) => { caps.push(o?.timeoutMs); throw new Error('git worktree list --porcelain failed (exit null): timed out'); },
+    });
+    assert.deepEqual(caps, [15_000]);
+    assert.equal(timedOut.ok, true);
+    assert.deepEqual(timedOut.value, [{ id: 'aaaaaaaa', pid: 11, dir: w.workdir }]);
+    assert.ok(timedOut.notes.some((n) => /could not be listed \(.*timed out\): every open session inside it counts/.test(n)));
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('gatherEvidence hands consumerWorktrees its deadline and clock, and the real probe then bounds each configured repo\'s list by what is left', async () => {
+  const w = world();
+  try {
+    let got;
+    const spy = (stack, o) => { got = o; return ok([]); };
+    const cfg = { ...CFG, repos: ['/r1', '/r2'] };
+    await gatherEvidence(w.stack, ctxFor(w, { cfg, evidence: { ...cleanReal, consumerWorktrees: spy } }), { probes: ['consumers'], deadlineMs: 7000 });
+    assert.equal(got.deadlineAt, NOW + 7000);
+    assert.equal(typeof got.now, 'function');
+    assert.equal(got.now(), NOW);
+
+    let clock = NOW;
+    const seen = [];
+    const listWorktrees = (repo, o) => { seen.push([repo, o?.timeoutMs]); clock += 5000; return []; };
+    const real = await gatherEvidence(w.stack, ctxFor(w, { cfg, now: () => clock, listWorktrees, evidence: { ...cleanReal, consumerWorktrees } }), { probes: ['consumers'], deadlineMs: 7000 });
+    assert.deepEqual(seen, [['/r1', 7000], ['/r2', 2000]]);
+    assert.equal(real.evidence.consumers.ok, true);
+
+    clock = NOW;
+    seen.length = 0;
+    const tight = await gatherEvidence(w.stack, ctxFor(w, { cfg, now: () => clock, listWorktrees: (repo, o) => { seen.push(repo); clock += 6800; return []; }, evidence: { ...cleanReal, consumerWorktrees } }), { probes: ['consumers'], deadlineMs: 7000 });
+    assert.deepEqual(seen, ['/r1'], 'under 500 ms left, the second repo is not listed');
+    assert.equal(tight.evidence.consumers.ok, false);
+    assert.match(tight.evidence.consumers.reason, /cannot list worktrees of \/r2: deadline/);
   } finally {
     w.cleanup();
   }

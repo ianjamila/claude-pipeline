@@ -218,7 +218,10 @@ export function openSessions(stack, consumers, opts = {}) {
       if (inside.some((x) => !atRoot(x))) {
         let nested;
         try {
-          nested = listWorktrees(dir)
+          // bounded like every other call of the gather: under 500 ms left, no spawn (the catch below counts every session)
+          const timeoutMs = realEvidence.callBudget(deadlineAt, now);
+          if (timeoutMs === null) throw new Error('deadline');
+          nested = listWorktrees(dir, { timeoutMs })
             .filter((w) => w?.path && !w.bare && spellings.some((sp) => isInside(w.path, sp, platform) && !samePath(w.path, sp, platform)))
             .filter((w) => !(consumers ?? []).some((cw) => typeof cw?.path === 'string' && spellingsOf(cw.path).some((sp) => samePath(sp, w.path, platform))));
         } catch (err) {
@@ -321,6 +324,8 @@ export async function gatherEvidence(stack, ctx = {}, { probes = SESSION_END_PRO
         repos: cfg.repos ?? [],
         platform,
         home,
+        deadlineAt,
+        now,
         ...(ctx.listWorktrees ? { listWorktrees: ctx.listWorktrees } : {}),
         ...(ctx.fsx ? { fsx: ctx.fsx } : {}),
       });
