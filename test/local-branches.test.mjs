@@ -77,7 +77,7 @@ const fakeRun = (seen, over = {}) => (bin, args, opts) => {
 test('listWorktrees: timeoutMs reaches the git subprocess; without it the call is unchanged (no timeout option)', () => {
   const seen = [];
   const list = listWorktrees('/x/repo', { timeoutMs: 1234, run: fakeRun(seen) });
-  assert.equal(list[0].path, '/x/repo');
+  assert.equal(list[0].path, path.resolve('/x/repo')); // native form: `D:\x\repo` on Windows, unchanged on POSIX
   assert.equal(seen[0].bin, 'git');
   assert.deepEqual(seen[0].args.slice(-3), ['worktree', 'list', '--porcelain']);
   assert.equal(seen[0].opts.timeoutMs, 1234);
