@@ -16,6 +16,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, reviewLane } from '../lib/risk.mjs';
 import { loadState } from '../lib/state.mjs';
 import { reviewValidFor, roundOutcome } from '../lib/triage.mjs';
+import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
 import { currentContentHash, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 
@@ -126,6 +127,9 @@ export const run = guarded(async (argv, ctx) => {
       if (!state || !reviewValidFor(state, hash)) {
         return { exitCode: EXIT.FAILED, output: { ok: false, reason: whyNot(state, hash), currentContentHash: hash } };
       }
+      // The same proof as the final gate: a round past review.max_rounds must be backed by the owner's record and its marker.
+      const grants = verifyOwnerGrants(state, { repo: gh.repo().slug, pr });
+      if (!grants.ok) return { exitCode: EXIT.FAILED, output: { ok: false, reason: grants.problems.join('; '), currentContentHash: hash } };
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
       const lane = laneProblem(state, root, config, base);
       if (lane) return { exitCode: EXIT.FAILED, output: { ok: false, reason: lane, currentContentHash: hash } };

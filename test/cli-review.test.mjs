@@ -3696,3 +3696,22 @@ test('triage round-request: the exact line, and the refusals', (t) => {
   assertExit(granted, 1, granted.stdout);
   assert.match(granted.json.reason, /already granted for this head: run codex-review --round 3/);
 });
+
+test('review-complete: refuses the marker when an owner-granted round cannot be verified (a forged state, a missing marker), posts when it can', (t) => {
+  const { w, h1, h2 } = atCap(t, CAP1_CHAT, [...GH, REMOVE_LABEL, ...REVIEW_COMMENT]);
+  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  assertExit(codexThree(w, h1, h2), 0);
+  w.prHead(h2);
+  assert.equal(w.state().rounds[2].ownerGrant.grantId, grantIdOf(record));
+  const ok = w.cli(['review-complete', '--pr', '7']);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  assert.equal(postedBodies(w).length, 1);
+
+  // the marker is gone (another machine, or a state that was edited): the same state no longer vouches for itself
+  rmSync(markerPath(grantIdOf(record)));
+  const refused = w.cli(['review-complete', '--pr', '7']);
+  assertExit(refused, 1, refused.stderr + refused.stdout);
+  assert.equal(refused.json.ok, false);
+  assert.match(refused.json.reason, /round 3: owner grant cannot be verified on this machine — run the gate on the machine that reviewed it/);
+  assert.equal(postedBodies(w).length, 1, 'no second review-complete comment');
+});
