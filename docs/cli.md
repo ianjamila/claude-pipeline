@@ -97,7 +97,12 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
   -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, reviewer, reviewerReasons, path}
   --base must be the PR's merge base for round 1 and the previous round's toHead after that, else exit 2 {error:base-mismatch}
   exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)
-  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound);
+  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound)
+    or ONE round per owner grant (owner_approval: chat only): the owner typed "extra round" after a reply ending with the line triage round-request
+    printed, for this repository, PR, counted round and head (an owner record younger than 24 h; the automatic extra round is used first). The
+    grant is claimed AFTER Codex answered, under the final lock, as the last step before the state is saved, by exclusively creating a machine-global marker (one grant admits one run on
+    this machine): a grant already used, or recorded for another head ("ask again"), is exit 2 round-cap; Codex exit 3, head-moved and a kill before the claim
+    leave the grant open (a failure after the claim spends it: ask again). Success adds grantUsed:{grantId}; the round records admission and ownerGrant {grantId, k, quote, ownerTs}
     base-only rounds and resolution-only rounds (below) never count toward the cap
   reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired
     (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker's brief for the sensitive files; judge otherwise. Once fable, always fable
@@ -162,6 +167,10 @@ pipeline final-gate --pr N [--repo DIR]   -> {ok, repo, pr, base, head, tree, co
 ```
 
 Exit: 0 every check passes (writes .review/final-gate.json) · 1 any check fails · 3 GitHub (`gh`) unavailable.
+
+Owner-granted rounds (`owner_approval: chat`): a counted round past `review.max_rounds` and its one automatic extra round exists only because the owner typed `extra round` (see `triage round-request` and `codex-review`). The `review` check does not believe the review state for that: it re-proves every round that carries an `ownerGrant` against the owner's record (the owner-go hook's file for the session, read at any age) and its machine-global marker (`consumed/<grantId>.json` in the same folder): same repository, PR and counted round, the marker's head is the round's head, and the quote is the record's words byte for byte. A counted round past max+1 without a verified grant, a round recorded as owner-admitted without one, and a round past max recorded as a normal admission all fail `review`. A passing detail shows `owner-granted round K: "<quote>"`; a grant is never an owner-merge item (it lets a round run, it approves no merge). The records live on the machine where the owner typed, so run the gate (and `review-complete`) on the machine that reviewed a granted round; elsewhere it fails with "round n: owner grant cannot be verified on this machine", and the way out is running the gate on that machine; `P state discard-round --pr N --round n` (then `P triage round-request` and asking the owner again) applies only to an unpublished trailing round, and is refused with `round-published` once the round is in the triage comment. The gate and `review-complete` take the cap from `review.max_rounds` in the config, never from the state: a state that records a larger or non-finite `maxRounds` fails the `review` check. `state outcome` reports `grantedRound` (the open grant) and `autoExtraOrdinal`.
+
+The owner-go hook records three kinds of chat words, each only for a prompt the owner types after a reply ending in the matching CLI-printed line: `merge` (the 🔀 line), a ruling answer (the ⚖️ line) and `extra round` (the 🔁 line).
 
 `proofs` appears only for a repo with `verify.deferrable_steps`, when `verify-report` passed: `[{step, source: "local"}]` for a step the Mac ran, `[{step, source: "ci", run: {id, attempt, jobId, workflow, job, url}}]` for a step a GitHub Actions run vouched for (a report row `skipped` with `skipKind: "ci"`). The gate reads `deferrable_steps`, `ci_proof` and `ci_proof_inputs` from the BASE branch's `.claude/pipeline.yml`, never the PR's, and takes the proof only when ALL hold: the PR touches none of `.github/**`, `.claude/pipeline.yml`, `scripts/verify*` or `ci_proof_inputs`; the newest `pull_request` run of the configured workflow file for this exact head belongs to this PR (one `pull_requests` entry, this PR into the base branch, its head branch, a head from this repo, not a fork); the merge commit that run executed (`refs/pull/N/merge` in `referenced_workflows`) has the same tree as the PR head (a run that does not say is not accepted); and exactly one job there has the configured name and succeeded (when the `ci_proof` entry also lists `steps`, each named step must appear exactly once in that job as completed + success; a skipped, missing, repeated or failed step is `ci-proof-missing:<step>`, and the `run` in the proof then also carries `steps`). A newer queued or running run is `ci-proof-pending:<step>`; a red job is `ci-proof-failed:<step>`; everything else, including any GitHub error and a cancelled or skipped run, is `ci-proof-missing:<step>`: the Mac must run the step. `pipeline merge` re-evaluates the proof live and records the one it used.
 
@@ -308,6 +317,8 @@ pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused
   the comment starts with the line `<!-- claude-pipeline:review-complete v1 -->` and carries the JSON {contentHash, base, head, rounds, codexModel, modelProofDigest}
   (base = the merge base the content hash is measured from; modelProofDigest = sha256 of the Fable model proofs, null when no Fable pass ran);
   an identical latest comment of ours is reused, not posted again; exit 3 when GitHub is unavailable or the label is still on the PR after removal
+  a round past review.max_rounds must carry the owner's extra-round grant (codex-review records it), re-proved here against the owner's record and its marker on THIS machine (the
+  same check as the final gate's review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise
 ```
 
 Exit: 0 comment posted (or our identical one reused) and the label is off · 1 review not valid for this head (nothing posted) · 2 usage · 3 GitHub unavailable, or the label still on the PR after removal.
@@ -386,6 +397,9 @@ pipeline state discard-round --round R [--pr N] [--repo DIR]
   -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;
      refused (exit 2) when the PR triage comment already holds round R
 pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean
+  grantedRound {k, grantId, head, quote}: the owner's open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner
+  record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the
+  automatic extra round took, or null
 pipeline state mark-implemented --ids a,b [--repo DIR]
   -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed
      and a non-test file changed since (a test file counts for a testing finding or the finding's own file)
@@ -422,6 +436,12 @@ pipeline triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd C
 pipeline triage light-lane --round R [--repo DIR]
 pipeline triage ruling-request --pr N --ids ID[,ID…] [--repo DIR]
   -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state's, or a repository off github.com)
+pipeline triage round-request --pr N [--repo DIR]
+  -> {ok, line, k, n, head}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`
+     (k = the counted round it would be: reviewed rounds + 1, base-only and resolution-only rounds not counted; n = the round number to pass to codex-review --round; head = the checked-out HEAD)
+  -> commit, push and quick-verify first: the grant is for that head. The owner answers `extra round` (or `grant round K`, optionally with #N); the owner-go hook records it, and
+     `codex-review --round n` then claims it (see its usage). Exit 1 for label mode (no grant exists), a --pr that is not the review state's, a repository off github.com,
+     or a round that is already allowed (within review.max_rounds, the automatic extra round, or an open grant for this head)
 pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]
   -> {ok, round, id, final, published: false, next}; records the OWNER's decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human
   -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state's

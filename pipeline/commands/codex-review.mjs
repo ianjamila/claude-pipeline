@@ -30,7 +30,8 @@ import { createGitHub } from '../lib/github.mjs';
 import { GhError, codexCommand, runAsync } from '../lib/proc.mjs';
 import { assessRisk, isLightLane, reviewLane } from '../lib/risk.mjs';
 import { addRound, emptyState, loadState, saveState } from '../lib/state.mjs';
-import { reuseRuled, roundCapProblem, ruledCacheFrom } from '../lib/triage.mjs';
+import { reuseRuled, reviewedRoundCount, roundAdmission, ruledCacheFrom } from '../lib/triage.mjs';
+import { claimGrantMarkers, grantIdOf, ownerGrantedRounds } from '../hooks/lib/owner-go.mjs';
 import {
   allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, writeFileAtomic,
   writeJson,
@@ -43,7 +44,12 @@ export const meta = {
     '  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, reviewer, reviewerReasons, path}',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
     '  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)',
-    '  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound);',
+    '  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound)',
+    '    or ONE round per owner grant (owner_approval: chat only): the owner typed "extra round" after a reply ending with the line triage round-request',
+    '    printed, for this repository, PR, counted round and head (an owner record younger than 24 h; the automatic extra round is used first). The',
+    '    grant is claimed AFTER Codex answered, under the final lock, as the last step before the state is saved, by exclusively creating a machine-global marker (one grant admits one run on',
+    '    this machine): a grant already used, or recorded for another head ("ask again"), is exit 2 round-cap; Codex exit 3, head-moved and a kill before the claim',
+    '    leave the grant open (a failure after the claim spends it: ask again). Success adds grantUsed:{grantId}; the round records admission and ownerGrant {grantId, k, quote, ownerTs}',
     '    base-only rounds and resolution-only rounds (below) never count toward the cap',
     '  reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
     '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable',
@@ -141,10 +147,29 @@ export const run = guarded(async (argv, ctx) => {
   };
   // The round cap counts reviewed rounds only, so it waits until baseOnly / resolutionOnly are known (before anything is
   // written for the round).
-  const checkCap = (st, flags) => {
-    const capped = st ? roundCapProblem(st, round, flags) : null;
+  // An owner grant is looked up only when ordinary admission does not cover the round, and only in chat mode (label mode never grants).
+  // The lookup is the owner's records for this PR on github.com (the gh repo), any head: roundAdmission compares the head itself.
+  // The gh repo is resolved eagerly below, before any admission check, in chat mode: roundAdmission swallows what the lookup throws
+  // (no grant), so a GitHub failure here would otherwise read as a round-cap refusal instead of exit 3.
+  let ghRepo;
+  const ownerRecords = (k) => {
+    if (config.owner_approval !== 'chat') return [];
+    if (ghRepo.host !== 'github.com') return [];
+    return ownerGrantedRounds({ repo: ghRepo.slug, pr, k, anyHead: true }).map((r) => ({ grantId: grantIdOf(r), head: r.head, quote: r.prompt }));
+  };
+  const admit = (st, flags) => (st ? roundAdmission(st, round, { ...flags, head, grants: ownerRecords }) : { admission: reviewedAdmission(flags), problem: null });
+  const reviewedAdmission = ({ baseOnly, resolutionOnly }) => (baseOnly || resolutionOnly ? 'uncounted' : 'normal');
+  const checkCap = (st, flags, { already = false } = {}) => {
+    const { admission, problem } = admit(st, flags);
     // resolutionIneligible: why the free (resolution-only) round was refused, when one was tried (it is computed before the cap).
-    if (capped) throw new Fail(EXIT.USAGE, { ok: false, error: 'round-cap', message: capped, ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }) });
+    if (problem) {
+      throw new Fail(EXIT.USAGE, {
+        ok: false, error: 'round-cap',
+        message: already ? `the owner's extra round was already used (grant already used): ${problem}` : problem,
+        ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }),
+      });
+    }
+    return admission;
   };
 
   let state = readState();
@@ -155,6 +180,7 @@ export const run = guarded(async (argv, ctx) => {
   let slug;
   try {
     view = gh.prView(pr, ['title', 'body', 'headRefName', 'baseRefName']);
+    if (config.owner_approval === 'chat') ghRepo = gh.repo();
     if (!state) slug = gh.repo().slug;
   } catch (err) {
     if (err instanceof GhError) throw unavailable('github', { error: 'unavailable', message: err.message });
@@ -237,7 +263,7 @@ export const run = guarded(async (argv, ctx) => {
   const { patch, skipped: largeBinaries } = reviewPatch(review.base, head, o);
   // Only the base branch was merged in since the last round: there is nothing of the PR's own to review.
   const baseOnly = review.kind === 'synthetic' && patch === '' && largeBinaries.length === 0;
-  checkCap(state, { baseOnly, resolutionOnly });
+  const preAdmission = checkCap(state, { baseOnly, resolutionOnly });
   const resolutionView = resolutionOnly ? resolutionSummary(resolution) : null;
   ensureRoundDir(root, round);
   const note = largeBinaryNote(largeBinaries);
@@ -311,12 +337,14 @@ export const run = guarded(async (argv, ctx) => {
     }
     return excerptWindow(fileCache.get(file), line)?.lines.join('\n') ?? '';
   };
+  let grantUsed;
   const items = await withReviewLock(root, pr, ctx, async () => {
     // Codex took a while: whatever happened to the review meanwhile (another session recorded this round, the PR's
     // state was replaced) is read again, and what is there now wins.
     const fresh = readState();
     checkRound(fresh);
-    checkCap(fresh, { baseOnly, resolutionOnly });
+    // A grant that admitted the round before Codex ran but is gone now (another checkout claimed it meanwhile) says so.
+    const admission = checkCap(fresh, { baseOnly, resolutionOnly }, { already: preAdmission === 'owner' });
     checkBase(fresh);
     if (headSha(o) !== head) throw headMoved();
     // The cap waiver rests on the proof above. from (checkBase), head and forkPoint are pinned, but origin/<default> may have moved
@@ -327,6 +355,28 @@ export const run = guarded(async (argv, ctx) => {
     if (!fresh && slug === undefined) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'state-changed', message: '.review/state.json disappeared while Codex was reviewing; run the round again' });
     }
+    // The owner's grant is read here and claimed just before the state is saved (below), after everything else that can fail has run.
+    let ownerGrant;
+    let claimGrant = () => {};
+    if (admission === 'owner') {
+      const k = reviewedRoundCount(fresh) + 1;
+      const records = ownerGrantedRounds({ repo: ghRepo.slug, pr, k, head });
+      const newest = records[0];
+      if (newest !== undefined) ownerGrant = { grantId: grantIdOf(newest), k, quote: newest.prompt, ownerTs: newest.ts };
+      // Every record that covers this head is consumed together (a duplicate "extra round" must not admit a second run after
+      // discard-round); the first claimer on the machine wins. A failed claim discards Codex's answer.
+      claimGrant = () => {
+        const claim = claimGrantMarkers(records, { repo: ghRepo.slug, pr, k, head, checkout: root });
+        if (!claim.ok) {
+          throw new Fail(EXIT.USAGE, {
+            ok: false, error: 'round-cap',
+            message: claim.reason === 'used' || claim.reason === 'none'
+              ? "the owner's extra round was already used (grant already used): ask the owner again (triage round-request)"
+              : `the owner's extra round could not be claimed (${claim.reason}) and is spent: ask the owner again (triage round-request)`,
+          });
+        }
+      };
+    }
     const base0 = fresh ?? emptyState({ repo: slug, pr, branch: view.headRefName ?? 'HEAD', risk: level, lightLane, maxRounds: config.review.max_rounds });
     const ruled = reuseRuled(assignIds(findings, round, excerptFor, { contentHash: hashAtHead }), ruledCacheFrom(allItems(base0)));
     const reviewer = fable || fresh?.reviewer === 'fable' ? 'fable' : 'judge';
@@ -334,13 +384,16 @@ export const run = guarded(async (argv, ctx) => {
     const next = addRound({ ...base0, risk: level, lightLane: reviewer === 'fable' ? false : lightLane, reviewer, currentContentHash: hashAtHead }, {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled,
       reviewBase: review.base, reviewBaseKind: review.kind, forkPoint, codexModel: model, ...(baseOnly ? { baseOnly: true } : {}),
+      ...(admission === 'uncounted' ? {} : { admission }), ...(ownerGrant === undefined ? {} : { ownerGrant }),
       ...(resolutionOnly ? { resolutionOnly: true, ...resolutionView } : {}),
       ...(reviewer === 'fable' && !baseOnly ? { fableRequired: true, fableReasons: reasons, sensitivePaths: lane.sensitivePaths.slice(0, 50) } : {}),
     });
     writeJson(path.join(dir, 'codex.json'), { findings, items: ruled });
     writeFileAtomic(path.join(dir, 'codex.md'), renderFindingsMarkdown(findings, round, ruled));
+    claimGrant();
     saveState(root, next);
     state = next;
+    grantUsed = ownerGrant === undefined ? undefined : { grantId: ownerGrant.grantId };
     return ruled;
   });
 
@@ -357,6 +410,7 @@ export const run = guarded(async (argv, ctx) => {
       ...(baseOnly ? { baseOnly: true } : {}),
       ...(resolutionOnly ? { resolutionOnly: true, conflicted: resolutionView.conflicted, conflictedCount: resolution.conflictedCount } : {}),
       ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }),
+      ...(grantUsed === undefined ? {} : { grantUsed }),
       preRuled: items.filter((i) => i.final).length,
       lightLane: state.lightLane,
       reviewer: state.reviewer,
