@@ -1065,7 +1065,14 @@ function makeMatchers(ctx) {
   // R3-F2: program text names the folder through the environment instead of a path (`os.environ['CLAUDE_CONFIG_DIR']+'/projects/-repo/a.jsonl'`, `process.env.CLAUDE_CONFIG_DIR` in node -e,
   // os.getenv, a heredoc body): the variable together with a projects/ … .jsonl tail is a transcript reference, whatever joins them (fail closed: the pieces may be built at run time).
   // The variable alone, or with a projects/ path that is no .jsonl, is not.
-  const envTranscriptText = (v) => v.includes('CLAUDE_CONFIG_DIR') && /\/projects\/[\s\S]*?\.jsonl/.test(v);
+  // (R4-B1 / R4-F1: no slash requirement -- os.path.join(env['CLAUDE_CONFIG_DIR'],'projects','-repo','a.jsonl'), pathlib's /, node's path.join, and a literal or .claude root joined the same way have no
+  // contiguous <root>/projects/. A config root (the variable, a configured root on a path boundary, a .claude* name), a projects word and a .jsonl word anywhere in the text are a transcript
+  // reference; the cost is a false positive on a program that merely mentions all three. Any one missing, or a projects/ path that is no .jsonl, stays open.)
+  const rootWordText = ctx.transcriptRoots.map((r) => new RegExp(`(?:(?<![\\w.~])|(?<=\\s-[A-Za-z]))${escapeRe(r)}(?![\\w.\\-])`, ctx.ci ? 'i' : ''));
+  const envTranscriptText = (v) => {
+    if (!/(?<![\w])projects(?![\w])/i.test(v) || !/\.jsonl(?![\w])/i.test(v)) return false;
+    return v.includes('CLAUDE_CONFIG_DIR') || /(?<![\w.\-])\.claude/i.test(v) || rootWordText.some((re) => re.test(v));
+  };
 
   // Is a protected file named in `text`? By absolute path (in any of its spellings), by a tail with an unknown
   // prefix, or by a relative tail that lands in a protected root from one of `dirs`.

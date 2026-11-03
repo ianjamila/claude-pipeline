@@ -1284,6 +1284,24 @@ test('#128 R3-F2: program text that builds a transcript path from CLAUDE_CONFIG_
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
 });
 
+// R4-B1 / R4-F1: the folder joined from pieces (os.path.join, pathlib /, path.join) has no contiguous <root>/projects/.
+test('#128 R4-B1/F1: program text with a config root, a projects word and a .jsonl word is refused whatever joins them; any one missing stays open', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    "python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo','abc.jsonl'),'w').write('x')\"",
+    "python3 -c \"import os,pathlib; (pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'projects'/'-repo'/'abc.jsonl').write_text('x')\"",
+    "node -e \"require('fs').writeFileSync(require('path').join(process.env.CLAUDE_CONFIG_DIR,'projects','-repo','abc.jsonl'),'x')\"",
+    "python3 -c \"import os; open(os.path.join('/home/u/claude-config','projects','-repo','abc.jsonl'),'w').write('x')\"",
+    "python3 -c \"import os; open(os.path.join(os.path.expanduser('~'),'.claude','projects','-repo','abc.jsonl'),'w').write('x')\"",
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  for (const cmd of [
+    "python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'settings.json')).read()\"",
+    "python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo','memory','n.md'),'w').write('x')\"",
+    "python3 -c \"open('/tmp/projects/a.jsonl','w').write('x')\"",
+    "python3 -c \"import os; open(os.path.join('/mnt/home/u/claude-config','projects','-repo','abc.jsonl'),'w').write('x')\"",
+  ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+});
+
 test('Phase 3b: a program that resolves into a review folder is judged like any other (only the installed pipeline is trusted)', () => {
   // (run.mjs links to a file in a round folder: the hook judges the real file's text, it does not skip it as a pipeline program)
   const prog = '/repo/.review/round-1/x.mjs';
