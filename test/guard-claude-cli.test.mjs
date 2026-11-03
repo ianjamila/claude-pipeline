@@ -318,6 +318,38 @@ test('R2-F2: hash -p with the path attached, or grouped flags, binds a name to c
   for (const command of ['hash -r', 'hash -rp /usr/bin/git g', 'hash claude']) assert.equal(decide(command), 'allow', command);
 });
 
+// ---- review round 3 (#133) ----
+
+test('R3-B1: a quoted prompt after the embedded name is a prompt', () => {
+  for (const command of [
+    `python3 -c "import os; os.system(\\"claude 'hello world'\\")"`,
+    `python3 -c "import os; os.system('claude \\"hi\\"')"`,
+    `node -e "require('child_process').execSync(\\"claude 'merge it'\\")"`,
+  ]) assert.equal(decide(command), 'deny', command);
+});
+
+test('R3-B2: the real multi-element argv array of a read-only call stays allowed, a prompt after it does not', () => {
+  for (const command of [
+    `python3 -c 'import subprocess; subprocess.run(["claude", "mcp", "list"])'`,
+    `python3 -c "import subprocess; subprocess.run(['claude', 'config', 'get', 'theme'])"`,
+    `node -e 'require("child_process").execFileSync("claude", ["mcp", "get", "github"])'`,
+  ]) assert.equal(decide(command), 'allow', command);
+  for (const command of [
+    `python3 -c 'import subprocess; subprocess.run(["claude", "mcp", "add", "x"])'`,
+    `python3 -c 'import subprocess; subprocess.run(["claude", "config", "set", "a", "b"])'`,
+  ]) assert.equal(decide(command), 'deny', command);
+});
+
+test('R3-F1: a second claude run after a separator in the embedded string is judged', () => {
+  for (const command of [
+    `python3 -c 'import os; os.system("claude mcp list; claude hello")'`,
+    `python3 -c 'import os; os.system("claude mcp list && claude -p hi")'`,
+    `python3 -c 'import os; os.system("claude --version || claude hello")'`,
+    `python3 -c 'import os; os.system("claude config get a | claude hello")'`,
+  ]) assert.equal(decide(command), 'deny', command);
+  assert.equal(decide(`python3 -c 'import os; os.system("claude mcp list; echo done")'`), 'allow');
+});
+
 test('R1: ordinary lines that mention claude as a path or document stay allowed', () => {
   for (const command of [
     'cd ~/Claude && ls',

@@ -14,9 +14,26 @@ const FORCE_FLAGS = /(?:^|\s)(?:\+\S+|-f|--force\S*|--all|--mirror|--delete)(?=\
 const CLAUDE_RUN_FLAGS = /(?:^|[\s=/])claude(?:-code)?\s+(?:-[a-zA-Z]*[prc]\b|--(?:print|resume|continue)\b)/i;
 // Quote-anchored name (a string that starts with it, or an argv array's first element): what follows it, as one string (`claude --model x hello`) or as the array's next element
 // (`'claude', 'hello'`), is a run unless it is one of the calls that cannot submit a prompt (the same allowlist as the direct rule). The name alone (`which("claude")`) is no run.
-const CLAUDE_QUOTED = /["'`]\s*(?:[^\s"'`]*\/)?claude(?:-code)?(?=\s|["'`])(?:\s+([^"'`]*)|["'`]\s*,\s*\[?\s*["'`]([^"'`]*))/g;
-const CLAUDE_READ_ONLY = /^(?:--version|-v|-V|--help|-h|doctor|(?:mcp|config)\s+(?:list|get)\b.*)$/;
-const claudePromptRun = (t) => [...t.matchAll(CLAUDE_QUOTED)].some((m) => { const args = (m[1] ?? m[2] ?? '').trim(); return args !== '' && !CLAUDE_READ_ONLY.test(args); });
+// The string form runs to the quote that closes it (the opener; the other quote kind is part of the prompt, `"claude 'hi'"`); the array form gathers every following string element
+// (`"claude", "mcp", "list"`). A separator (; & | newline) starts another command, whose own `claude …` is judged the same way.
+const CLAUDE_QUOTED = /(["'`])\s*(?:[^\s"'`]*\/)?claude(?:-code)?(?=\s|["'`])/g;
+const CLAUDE_READ_ONLY = /^(?:--version|-v|-V|--help|-h|doctor|(?:mcp|config)\s+(?:list|get)\b[^;&|\n]*)$/;
+const CLAUDE_LATER = /^\s*(?:[^\s"'`]*\/)?claude(?:-code)?(?:\s+(.*))?$/;
+function claudeArgsRun(args) {
+  const [first, ...later] = args.split(/[;&|\n]+/);
+  if (first.trim() !== '' && !CLAUDE_READ_ONLY.test(first.trim())) return true;
+  return later.some((seg) => { const m = CLAUDE_LATER.exec(seg); return m !== null && claudeArgsRun(m[1] ?? ''); });
+}
+function claudePromptRun(t) {
+  return [...t.matchAll(CLAUDE_QUOTED)].some((m) => {
+    const rest = t.slice(m.index + m[0].length);
+    if (/^\s/.test(rest)) { const end = rest.indexOf(m[1], 1); return claudeArgsRun(end < 0 ? rest : rest.slice(0, end)); }
+    const elements = [];
+    let r = rest.slice(1); // (past the quote that closes the name)
+    for (let e = /^\s*,\s*\[?\s*(["'`])(.*?)\1/.exec(r); e; e = /^\s*,\s*(["'`])(.*?)\1/.exec(r)) { elements.push(e[2]); r = r.slice(e[0].length); }
+    return claudeArgsRun(elements.join(' '));
+  });
+}
 const PROTECTED_DEST = /(?:^|[\s:+])(?:refs\/heads\/)?(?:main|master)(?=\s|$)/i;
 
 // Readers and tools whose arguments are data, not commands; judged by their own rules or not at all.
