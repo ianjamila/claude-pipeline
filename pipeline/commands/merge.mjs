@@ -16,7 +16,7 @@ import { proofLine } from '../lib/run-record.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
-import { approvalGap } from '../hooks/lib/owner-go.mjs';
+import { approvalConfigDirHint, approvalGap } from '../hooks/lib/owner-go.mjs';
 import {
   GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, preMergeProblems, readReviewJson,
   waitBlockers, waitForMerge,
@@ -81,7 +81,7 @@ export const run = guarded(async (argv, ctx) => {
       else if (gh.repo().host !== 'github.com') approvalProblem = hostProblem(gh);
       else {
         const gap = approvalGap({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems });
-        if (gap !== 'ok') approvalProblem = missingApproval(gap, `${gh.repo().slug} #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}`, `show the request (Owner-merge approval in the review skill: \`Head ${gate.head.slice(0, 12)} · items ${gate.ownerItems} · repo ${gh.repo().slug}\`) and wait for the owner to type "merge"`);
+        if (gap !== 'ok') approvalProblem = missingApproval(gap, `${gh.repo().slug} #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}`, `show the request (Owner-merge approval in the review skill: \`Head ${gate.head.slice(0, 12)} · items ${gate.ownerItems} · repo ${gh.repo().slug}\`) and wait for the owner to type "merge"`, { repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems });
       }
     }
     const ownerApproved = values['owner-approved-head'] !== undefined && approvalProblem === null;
@@ -241,8 +241,9 @@ export const run = guarded(async (argv, ctx) => {
 // Phase 3b: the owner's "merge" names owner/name on github.com; gh may resolve that name on another server (GH_HOST, an ssh host
 // alias, a sole logged-in enterprise host), where it is another repository — refused, as the guard does for a direct merge.
 // Why no owner "merge" stands for `what` (approvalGap): none was recorded, or one was but the prompt behind it cannot be confirmed as typed by the owner (#128).
-const missingApproval = (gap, what, again) => (gap === 'provenance'
-  ? `a "merge" is recorded for ${what}, but it cannot be confirmed as typed by the owner (its prompt is not in the transcript as the owner's, or came from a notice, another session or a scheduled turn): ${again}, and ask the owner to type "merge" again`
+// R2-F3: when the likely cause is the environment, not the prompt (the transcript is in a config dir this process does not know), `q` (the approval asked for) lets the reason say so.
+const missingApproval = (gap, what, again, q) => (gap === 'provenance'
+  ? `a "merge" is recorded for ${what}, but it cannot be confirmed as typed by the owner (its prompt is not in the transcript as the owner's, or came from a notice, another session or a scheduled turn${approvalConfigDirHint(q) ? `; or ${approvalConfigDirHint(q)}` : ''}): ${again}, and ask the owner to type "merge" again`
   : `no owner "merge" is recorded for ${what}: ${again}`);
 const hostProblem = (gh) => `gh resolves this repository on ${gh.repo().host ?? 'an unknown host'}, not github.com, and the owner's "merge" names a repository on github.com`;
 
@@ -256,7 +257,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx }) {
   }
   const gap = approvalGap({ repo, pr, head, items: 'none' });
   if (gap !== 'ok') {
-    const reason = missingApproval(gap, `${repo} #${pr} head ${head.slice(0, 12)} items none`, `end the reply with \`Head ${head.slice(0, 12)} · items none · repo ${repo}\` and \`🔀 Ready to merge #${pr} — say "merge"\`, and wait for the owner to type "merge"`);
+    const reason = missingApproval(gap, `${repo} #${pr} head ${head.slice(0, 12)} items none`, `end the reply with \`Head ${head.slice(0, 12)} · items none · repo ${repo}\` and \`🔀 Ready to merge #${pr} — say "merge"\`, and wait for the owner to type "merge"`, { repo, pr, head, items: 'none' });
     return refuse('owner-go', [reason], { reason, head });
   }
   const live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env });

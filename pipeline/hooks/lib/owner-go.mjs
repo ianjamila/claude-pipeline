@@ -553,14 +553,33 @@ function ownedBy(list) {
 // P merge: did the owner say "merge" for exactly this repository (owner/name), PR, full head and owner-item set (any session, last 24 h),
 // and is that prompt the owner's (promptProvenance)? approvalGap says why not: 'provenance' (a matching record exists but no owner prompt
 // stands behind it), 'none' (no matching record), 'ok'.
-export function approvalGap({ repo, pr, head, items, ...opts }) {
+const approvalsFor = ({ repo, pr, head, items, ...opts }) => {
   const key = repoKey(repo);
-  if (key === null || !/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return 'none';
-  const matching = readApprovals(opts).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items));
+  if (key === null || !/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return [];
+  return readApprovals(opts).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items));
+};
+export function approvalGap(q) {
+  const matching = approvalsFor(q);
   if (matching.length === 0) return 'none';
   return ownedBy(matching).length > 0 ? 'ok' : 'provenance';
 }
 export const approvedRequest = (q) => approvalGap(q) === 'ok';
+
+// R2-F3: promptProvenance takes the transcript root from the environment of the process that asks (the config-dir variable, lib/paths.mjs), so a genuine record refused for
+// "missing" may only mean the command runs where that variable is not set (a plain terminal, for an owner whose config dir is not ~/.claude*). That is likely when
+// the record's transcript has the shape of a session transcript (<dir>/projects/<project>/<session>.jsonl) yet is under no root this process knows; a record whose
+// transcript is simply gone, or is no transcript at all, gets no hint. Returns text to append to the refusal ('' when it does not apply).
+export const CONFIG_DIR_HINT = 'the transcript of that prompt is under a Claude Code config dir this process does not know (CLAUDE_CONFIG_DIR is not set here, or names another folder): run this command with CLAUDE_CONFIG_DIR set to the owner\'s config dir (the folder that holds projects/), or from inside the Claude Code session';
+const TRANSCRIPT_SHAPE = /[\\/]projects[\\/][^\\/]+[\\/][^\\/]+\.jsonl$/;
+export function configDirHint(records, { env = process.env } = {}) {
+  const plausible = (r) => {
+    const file = r?.transcript_path;
+    return typeof file === 'string' && path.isAbsolute(file) && TRANSCRIPT_SHAPE.test(file) && !/(?:^|[\\/])subagents[\\/]/.test(file) && !isTranscriptFile(file, { env });
+  };
+  return (records ?? []).some(plausible) ? CONFIG_DIR_HINT : '';
+}
+export const approvalConfigDirHint = (q) => configDirHint(approvalsFor(q), { env: q.env });
+export const rulingConfigDirHint = (q) => configDirHint(rulingsFor(q), { env: q.env });
 
 // The guard, before a direct merge: did the owner say "merge" in this session (last 24 h) for a request about this repository and PR
 // whose head is this full head? (A PR merely named in the prompt, `merge #7`, is recorded in `prs` for the audit trail but approves no head.)

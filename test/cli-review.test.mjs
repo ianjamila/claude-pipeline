@@ -2888,6 +2888,25 @@ test('triage owner-ruling: an answer whose prompt is synthetic or missing from t
   }
 });
 
+// R2-F3: the same for a ruling answer whose transcript is in a config dir the process does not know.
+test('triage owner-ruling: an answer whose transcript is in a config dir this process does not know names CLAUDE_CONFIG_DIR in the refusal (R2-F3); a missing one does not', (t) => {
+  const refusal = (after) => {
+    const w = world(t, { yml: CHAT_YML });
+    assertExit(w.codex(1, findingsOf([finding()])), 0);
+    waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+    ownerRules(t, QUOTE, rulingRequest(7, ['R1-B1'], undefined, askedContent(w, ['R1-B1'])), undefined, after);
+    const r = w.cli(rule('R1-B1', 'FOLLOW-UP'));
+    assertExit(r, 1);
+    return r.json.reason;
+  };
+  // The missing case first: both write a record for the same repo, PR, item and answer (records stay until the test ends), and the hint looks at every matching one.
+  const missing = refusal('missing');
+  assert.match(missing, /cannot be confirmed as typed by the owner/);
+  assert.doesNotMatch(missing, /CLAUDE_CONFIG_DIR/);
+  const elsewhere = refusal('elsewhere');
+  assert.match(elsewhere, /cannot be confirmed as typed by the owner[\s\S]*CLAUDE_CONFIG_DIR is not set here[\s\S]*run this command with CLAUDE_CONFIG_DIR set to the owner's config dir/);
+});
+
 // ---- #110: a ruling request is bound to the finding text, not just the item id ----------------------------
 
 test('triage ruling-request: prints the ruling line with the content digest of exactly the asked ids', (t) => {

@@ -277,6 +277,25 @@ test('--owner-go and the gate flags: a "merge" whose prompt is synthetic or miss
   assert.equal(c.mergeCalls().length, 0);
 });
 
+// R2-F3: the transcript root comes from the environment of the process that checks, so a record whose transcript is in a custom config dir is refused where that
+// variable is not set; the reason then says what to set. An ordinary missing record gets no such hint.
+test('--owner-go: a record whose transcript is in a config dir this process does not know names CLAUDE_CONFIG_DIR in the refusal (R2-F3); a missing one does not', (t) => {
+  const refusal = (after) => {
+    const s = goScenario();
+    ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'), undefined, after);
+    const r = goMerge(s, []);
+    assertExit(r, 1);
+    assert.deepEqual(s.mergeCalls(), []);
+    return r.json.reason;
+  };
+  // The missing case first: both write a record for the same repo, PR, head and items (records stay until the test ends), and the hint looks at every matching one.
+  const missing = refusal('missing');
+  assert.match(missing, /cannot be confirmed as typed by the owner/);
+  assert.doesNotMatch(missing, /CLAUDE_CONFIG_DIR/);
+  const elsewhere = refusal('elsewhere');
+  assert.match(elsewhere, /cannot be confirmed as typed by the owner[\s\S]*CLAUDE_CONFIG_DIR is not set here[\s\S]*run this command with CLAUDE_CONFIG_DIR set to the owner's config dir/);
+});
+
 test('--owner-go: a "merge" for another head, other items, another PR or that is not an approval refuses with owner-go', (t) => {
   const s = goScenario();
   ownerSays(t, 'merge', mergeRequest(PR, OLD, 'none')); // (an older head)

@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
   presentedRuling, recordRuling, ownerRuled, rulingsIn, entrySource, notOwnerWords, approvalGap, ownerRulingGap, promptProvenance, rulingNudge, RULING_NUDGE,
+  approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import { OWNER_ENTRY, runHook } from './helpers/owner-go.mjs';
 
@@ -620,6 +621,53 @@ test('#128 R1-B2: provenance is taken only from a transcript of the shape the gu
   const line = JSON.parse(readFileSync(join(ownerGoDir(w.g.home), 'sess-1.jsonl'), 'utf8').trim());
   writeFileSync(join(ownerGoDir(w.g.home), 'sess-1.jsonl'), `${JSON.stringify({ ...line, transcript_path: moved })}\n`);
   assert.deepEqual(askedFor(w), [false, false, 'provenance'], 'a transcript the guard does not protect');
+});
+
+// R2-F3: a transcript in a custom config dir is judged by the checking process's CLAUDE_CONFIG_DIR; the refusal says so when that is the plausible cause.
+test('#128 R2-F3: a refusal for a transcript outside every known root names CLAUDE_CONFIG_DIR; an ordinary missing record does not', () => {
+  const saved = process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.CLAUDE_CONFIG_DIR;
+  try {
+    const home = tmp();
+    const world = (transcriptDir) => {
+      const dir = join(home, transcriptDir, 'projects', '-repo');
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, 's.jsonl');
+      writeFileSync(file, lines([promptEntry('go'), said(REQUEST), promptEntry('merge', OWNER_META, 'pid-m')]));
+      const w = mergeWorld(home, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] });
+      const line = JSON.parse(readFileSync(join(ownerGoDir(w.g.home), 'sess-1.jsonl'), 'utf8').trim());
+      writeFileSync(join(ownerGoDir(w.g.home), 'sess-1.jsonl'), JSON.stringify({ ...line, transcript_path: file }) + '\n');
+      return { ...w, file };
+    };
+    // the transcript is in claude-config/, and the process does not know that folder
+    const w = world('claude-config');
+    assert.equal(approvalGap(w.q), 'provenance');
+    assert.equal(approvalConfigDirHint(w.q), CONFIG_DIR_HINT);
+    assert.match(CONFIG_DIR_HINT, /CLAUDE_CONFIG_DIR[\s\S]*set to the owner's config dir/);
+    // …and once the process names it, the record is accepted and there is nothing to hint at
+    process.env.CLAUDE_CONFIG_DIR = join(home, 'claude-config');
+    assert.equal(approvalGap(w.q), 'ok');
+    assert.equal(approvalConfigDirHint(w.q), '');
+    delete process.env.CLAUDE_CONFIG_DIR;
+    // ordinary missing records: the entry never shows up, the transcript is gone, it is no session transcript, or it sits in a folder the process knows
+    const ordinary = mergeWorld(home, { appended: [] });
+    assert.deepEqual([approvalGap(ordinary.q), approvalConfigDirHint(ordinary.q)], ['provenance', ''], 'entry missing (known root)');
+    const gone = mergeWorld(home, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] });
+    rmSync(gone.file);
+    assert.deepEqual([approvalGap(gone.q), approvalConfigDirHint(gone.q)], ['provenance', ''], 'transcript gone (known root)');
+    const moved = mergeWorld(home, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] });
+    const flat = join(home, 'flat.jsonl');
+    writeFileSync(flat, readFileSync(moved.file));
+    const rec = JSON.parse(readFileSync(join(ownerGoDir(moved.g.home), 'sess-1.jsonl'), 'utf8').trim());
+    writeFileSync(join(ownerGoDir(moved.g.home), 'sess-1.jsonl'), JSON.stringify({ ...rec, transcript_path: flat }) + '\n');
+    assert.deepEqual([approvalGap(moved.q), approvalConfigDirHint(moved.q)], ['provenance', ''], 'no session transcript at all');
+    assert.equal(configDirHint([{ transcript_path: null }, {}, { transcript_path: 'relative/projects/-r/s.jsonl' }]), '');
+    assert.equal(configDirHint([{ transcript_path: '/x/projects/-r/s/subagents/a.jsonl' }]), '');
+    assert.equal(configDirHint([{ transcript_path: '/x/cfg/projects/-r/s.jsonl' }], { env: { CLAUDE_CONFIG_DIR: '/x/cfg' } }), '');
+    assert.equal(configDirHint([{ transcript_path: '/x/cfg/projects/-r/s.jsonl' }], { env: {} }), CONFIG_DIR_HINT);
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = saved;
+  }
 });
 
 test('#128 merges stay strict: a notice and the reply to it make the 🔀 request stale', () => {

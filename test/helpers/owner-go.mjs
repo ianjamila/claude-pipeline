@@ -23,7 +23,8 @@ const transcriptIn = (dir) => {
 // What the recorder writes when the owner types `prompt` after a reply that showed `reply`. Returns the record (or null).
 // `entry` overrides the prompt entry's provenance fields (a test of a prompt that is NOT the owner's).
 // `after` (#128 use-time check): once the record is written, the prompt's transcript entry is replaced by one with these provenance fields
-// (the hook cannot always tell at record time), or removed with 'missing'.
+// (the hook cannot always tell at record time), or removed with 'missing'. R2-F3: 'elsewhere' moves the transcript to <dir>/claude-config/projects/-repo/t.jsonl, the shape of a transcript in a custom config dir
+// that the checking process does not know (the record's transcript_path is patched to it; the prompt entry is the owner's).
 export const ownerSays = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordApproval, entry, after);
 // Phase 3b: the same for a ruling (the reply ends with rulingRequest's line).
 export const ownerRules = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordRuling, entry, after);
@@ -39,7 +40,13 @@ function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined
   ].map((e) => JSON.stringify(e)).join('\n')}\n`);
   const session = `test-${randomUUID()}`;
   const record = recorder({ hook_event_name: 'UserPromptSubmit', session_id: session, transcript_path: transcript, cwd: dir, prompt, prompt_id: promptId });
-  if (after !== undefined) {
+  if (after === 'elsewhere') {
+    const moved = join(dir, 'claude-config', 'projects', '-repo', 't.jsonl');
+    mkdirSync(join(dir, 'claude-config', 'projects', '-repo'), { recursive: true });
+    writeFileSync(moved, readFileSync(transcript));
+    const file = join(ownerGoDir(), `${session}.jsonl`);
+    writeFileSync(file, readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.stringify({ ...JSON.parse(l), transcript_path: moved })).join('\n') + '\n');
+  } else if (after !== undefined) {
     const kept = [
       { type: 'user', message: { content: 'ship it' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
       { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
