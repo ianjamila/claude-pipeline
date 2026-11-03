@@ -16,11 +16,13 @@ export const OWNER_ENTRY = { origin: { kind: 'human' }, promptSource: 'typed', e
 
 // What the recorder writes when the owner types `prompt` after a reply that showed `reply`. Returns the record (or null).
 // `entry` overrides the prompt entry's provenance fields (a test of a prompt that is NOT the owner's).
-export const ownerSays = (t, prompt, reply, entry) => said(t, prompt, reply, recordApproval, entry);
+// `after` (#128 use-time check): once the record is written, the prompt's transcript entry is replaced by one with these provenance fields
+// (the hook cannot always tell at record time), or removed with 'missing'.
+export const ownerSays = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordApproval, entry, after);
 // Phase 3b: the same for a ruling (the reply ends with rulingRequest's line).
-export const ownerRules = (t, prompt, reply, entry) => said(t, prompt, reply, recordRuling, entry);
+export const ownerRules = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordRuling, entry, after);
 
-function said(t, prompt, reply, recorder, entry = OWNER_ENTRY) {
+function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined) {
   const dir = mkdtempSync(join(tmpdir(), 'owner-go-'));
   const transcript = join(dir, 't.jsonl');
   const promptId = `pid-${randomUUID()}`;
@@ -31,6 +33,14 @@ function said(t, prompt, reply, recorder, entry = OWNER_ENTRY) {
   ].map((e) => JSON.stringify(e)).join('\n')}\n`);
   const session = `test-${randomUUID()}`;
   const record = recorder({ hook_event_name: 'UserPromptSubmit', session_id: session, transcript_path: transcript, cwd: dir, prompt, prompt_id: promptId });
+  if (after !== undefined) {
+    const kept = [
+      { type: 'user', message: { content: 'ship it' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
+      { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
+    ];
+    if (after !== 'missing') kept.push({ type: 'user', message: { content: prompt }, promptId, ...after });
+    writeFileSync(transcript, `${kept.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  }
   t.after(() => {
     rmSync(join(ownerGoDir(), `${session}.jsonl`), { force: true });
     rmSync(dir, { recursive: true, force: true });

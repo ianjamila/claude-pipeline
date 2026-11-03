@@ -257,6 +257,26 @@ test('--owner-go: a recorded "merge" for this PR, the local HEAD and items none 
   assert.equal(r.json.warnings, undefined, 'no production configured: no prod-before warning');
 });
 
+test('--owner-go and the gate flags: a "merge" whose prompt is synthetic or missing from the transcript refuses with the provenance reason (#128)', (t) => {
+  for (const after of [{ promptSource: 'system', isMeta: true, entrypoint: 'cli' }, { promptSource: 'sdk', entrypoint: 'sdk-cli' }, 'missing']) {
+    const s = goScenario();
+    ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'), undefined, after);
+    const r = goMerge(s);
+    assertExit(r, 1);
+    assert.equal(r.json.error, 'owner-go');
+    assert.match(r.json.reason, /a "merge" is recorded for acme\/widgets #\d+ head [0-9a-f]{12} items none, but it cannot be confirmed as typed by the owner[\s\S]*ask the owner to type "merge" again/);
+    assert.deepEqual(s.mergeCalls(), []);
+  }
+  // …and the same on the gate path (--owner-approved-head)
+  const c = scenario({ yml: chatYml() });
+  const g = c.gate();
+  ownerSays(t, 'merge', request(PR, c.head, g.json.ownerItems), undefined, { promptSource: 'system', isMeta: true, entrypoint: 'cli' });
+  const r = mergeWith(c, approve(c, g));
+  assertExit(r, 1);
+  assert.match(JSON.stringify(r.json), /cannot be confirmed as typed by the owner/);
+  assert.equal(c.mergeCalls().length, 0);
+});
+
 test('--owner-go: a "merge" for another head, other items, another PR or that is not an approval refuses with owner-go', (t) => {
   const s = goScenario();
   ownerSays(t, 'merge', mergeRequest(PR, OLD, 'none')); // (an older head)

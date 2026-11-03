@@ -737,6 +737,13 @@ test('#128 hook: a ruling answer nothing was recorded for gets one line of conte
   assert.equal(rulingNudge(null), null);
 });
 
+test('#128 hook: the input Claude Code sends (probed 2026-11-03: session_id, transcript_path, cwd, prompt_id, permission_mode, hook_event_name, prompt) records for the owner', (t) => {
+  const r = runHook(t, { entries: [promptEntry('go'), said(REQUEST)], prompt: 'merge', input: { permission_mode: 'default' } });
+  assert.match(r.stdout, /the owner's "merge" is recorded/);
+  assert.deepEqual([typeof r.record.prompt_id, r.record.prompt_id.startsWith('pid-')], ['string', true], 'the id the hook sent is stored and found again in the transcript');
+  assert.equal(promptProvenance({ ...r.record }), 'owner');
+});
+
 test('#128 hook: a notice, a peer message and a scheduled "merge" are not recorded by the real hook', (t) => {
   const withRequest = [promptEntry('go'), said(REQUEST)];
   for (const [name, o] of [

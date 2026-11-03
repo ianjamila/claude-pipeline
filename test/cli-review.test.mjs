@@ -2875,6 +2875,19 @@ test('triage owner-ruling: needs the owner\'s recorded answer to a ruling reques
   assert.equal(w.item('R1-B1').final.ownerQuote, QUOTE);
 });
 
+test('triage owner-ruling: an answer whose prompt is synthetic or missing from the transcript is refused with the provenance reason (#128)', (t) => {
+  for (const after of [{ promptSource: 'system', isMeta: true, entrypoint: 'cli' }, { origin: { kind: 'peer' }, promptSource: 'system', entrypoint: 'cli' }, 'missing']) {
+    const w = world(t, { yml: CHAT_YML });
+    assertExit(w.codex(1, findingsOf([finding()])), 0);
+    waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+    ownerRules(t, QUOTE, rulingRequest(7, ['R1-B1'], undefined, askedContent(w, ['R1-B1'])), undefined, after);
+    const r = w.cli(rule('R1-B1', 'FOLLOW-UP'));
+    assertExit(r, 1);
+    assert.match(r.json.reason, /an answer is recorded for acme\/widgets #7 R1-B1, but it cannot be confirmed as typed by the owner[\s\S]*ask again[\s\S]*ask the owner to answer again/);
+    assert.equal(w.item('R1-B1').final.by, 'arbiter', 'state untouched');
+  }
+});
+
 // ---- #110: a ruling request is bound to the finding text, not just the item id ----------------------------
 
 test('triage ruling-request: prints the ruling line with the content digest of exactly the asked ids', (t) => {
