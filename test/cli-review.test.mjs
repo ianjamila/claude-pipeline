@@ -19,7 +19,8 @@ import { loadConfig } from '../pipeline/lib/config.mjs';
 import { currentContentHash, excerptWindow, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { ownerRules, rulingRequest } from './helpers/owner-go.mjs';
+import { ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -3426,4 +3427,272 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   const { config } = await loadConfig(clone);
   assert.equal(reviewValidFor(cloneState(), currentContentHash(clone, config)), true, 'the predicate the final gate evaluates');
   assert.match(reviewJson(postedBodies(w).at(-1)).modelProofDigest, /^[0-9a-f]{64}$/);
+});
+
+// ---- owner-granted extra round (owner_approval: chat) ------------------------------------------------------------
+// The owner's `extra round` is recorded by the owner-go hook after a reply ending with `triage round-request`'s line; codex-review claims it
+// AFTER Codex answered, under the final lock, by exclusively creating a machine-global marker (claimGrantMarkers).
+
+const CAP1_CHAT = `${pipelineYml()}review:\n  max_rounds: 1\nowner_approval: chat\n`;
+const CAP1_LABEL = `${pipelineYml()}review:\n  max_rounds: 1\n`;
+const CAP2_CHAT = `${pipelineYml()}review:\n  max_rounds: 2\nowner_approval: chat\n`;
+
+// Round n finds one blocking item, the judge accepts it and the fix is committed and marked implemented. -> the fix commit.
+function reviewAndFix(w, n, from, to) {
+  const found = w.codex(n, findingsOf([finding({ title: `Issue ${n}`, file: 'src/b.js', line: 2 })]), { from, to });
+  assertExit(found, 0, found.stderr + found.stdout);
+  assertExit(w.judge(n, { [`R${n}-B1`]: ['ACCEPT'] }), 0);
+  w.repo.write(`src/fix${n}.js`, `export const fix${n} = ${n};\n`);
+  const fixed = w.repo.commit(`fix ${n}`);
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', `R${n}-B1`]), 0);
+  return fixed;
+}
+// max_rounds 1: round 1, then the one automatic extra round (2); both only accepted fixes. Round 3 now needs the owner.
+function atCap(t, yml = CAP1_CHAT, gh = GH) {
+  const w = world(t, { yml, gh });
+  const h1 = reviewAndFix(w, 1, w.base, w.head);
+  const h2 = reviewAndFix(w, 2, w.head, h1);
+  return { w, h1, h2 };
+}
+// The owner types `extra round` after a reply ending with the request line. The marker its use leaves is removed afterwards.
+function ownerGrantsRound(t, { pr = 7, k, head, prompt = 'extra round', repo = 'acme/widgets' }) {
+  const record = ownerGrants(t, prompt, roundRequest(pr, k, head, repo));
+  assert.ok(record, 'the recorder wrote the grant');
+  t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+  return record;
+}
+const codexThree = (w, from, to, extra = {}) => w.codex(3, findingsOf(), { from, to, ...extra });
+
+test('codex-review owner grant: no grant is the same round-cap as before, and the refusal names the owner-granted round', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  const calls = w.captured().length;
+  const capped = codexThree(w, h1, h2);
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+  assert.match(capped.json.message, /review\.max_rounds \(1\) and its one extra round, or an owner-granted round/);
+  assert.equal(w.captured().length, calls, 'Codex never ran');
+});
+
+test('codex-review owner grant: round-request -> the owner\'s grant -> codex-review runs round 3 once; the next round is capped again', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  assert.deepEqual(['reachedMax', 'grantedRound'].map((k) => w.cli(['state', 'outcome']).json[k]), [true, null]);
+  const req = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(req, 0, req.stderr + req.stdout);
+  assert.deepEqual([req.json.k, req.json.n, req.json.head], [3, 3, h2]);
+  assert.equal(req.json.line, `🔁 Extra review round needed #7: round 3 · head ${h2.slice(0, 12)} · repo acme/widgets`);
+  assert.deepEqual(presentedRoundRequest(`Round 2 left items open.\n${req.json.line}`), { pr: 7, k: 3, head: h2.slice(0, 12), repo: 'acme/widgets' });
+
+  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const before = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([before.reachedMax, before.effectiveMaxRounds, before.grantedRound?.k, before.grantedRound?.quote], [false, 3, 3, 'extra round']);
+  assert.equal(readGrantMarker(grantIdOf(record)).spent, false, 'asking for the outcome claims nothing');
+
+  const calls = w.captured().length;
+  const r = codexThree(w, h1, h2);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(w.captured().length, calls + 1, 'Codex ran once');
+  assert.deepEqual(r.json.grantUsed, { grantId: grantIdOf(record) });
+  const marker = readGrantMarker(grantIdOf(record));
+  assert.deepEqual([marker.spent, marker.verifiable, marker.marker.repo, marker.marker.pr, marker.marker.k, marker.marker.head], [true, true, 'acme/widgets', 7, 3, h2]);
+  const [r1, r2, r3] = w.state().rounds;
+  assert.deepEqual([r1.admission, r2.admission, r3.admission], ['normal', 'auto-extra', 'owner']);
+  assert.deepEqual([r1.ownerGrant, r2.ownerGrant], [undefined, undefined]);
+  assert.deepEqual(r3.ownerGrant, { grantId: grantIdOf(record), k: 3, quote: 'extra round', ownerTs: record.ts }, 'the quote is the recorder\'s exact prompt');
+  const after = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([after.grantedRound, after.autoExtraOrdinal, after.effectiveMaxRounds, after.reviewedRounds], [null, 2, 3, 3]);
+
+  // one grant = one round: the next counted round is refused
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const h3 = w.repo.commit('more');
+  const again = w.codex(4, findingsOf(), { from: h2, to: h3 });
+  assertExit(again, 2, again.stdout);
+  assert.equal(again.json.error, 'round-cap');
+  assert.equal(w.state().rounds.length, 3);
+});
+
+test('codex-review owner grant: label mode never grants and never claims', (t) => {
+  const { w, h1, h2 } = atCap(t, CAP1_LABEL);
+  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const capped = codexThree(w, h1, h2);
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+  assert.equal(readGrantMarker(grantIdOf(record)).spent, false);
+  assert.equal(w.cli(['state', 'outcome']).json.grantedRound, null);
+  const req = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(req, 1, req.stdout);
+  assert.match(req.json.reason, /owner_approval: chat/);
+});
+
+test('codex-review owner grant: a grant recorded for another round, PR or repository admits nothing', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  ownerGrantsRound(t, { k: 4, head: h2 });
+  ownerGrantsRound(t, { pr: 8, k: 3, head: h2 });
+  ownerGrantsRound(t, { k: 3, head: h2, repo: 'other/repo' });
+  const capped = codexThree(w, h1, h2);
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+  assert.doesNotMatch(capped.json.message, /ask again/);
+});
+
+test('codex-review owner grant: Codex exit 3 leaves the grant open, and the retry uses it', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const down = codexThree(w, h1, h2, { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'boom' } });
+  assertExit(down, 3, down.stdout);
+  assert.equal(readGrantMarker(grantIdOf(record)).spent, false, 'a failed Codex run spends nothing');
+  assert.equal(w.state().rounds.length, 2);
+  const retry = codexThree(w, h1, h2);
+  assertExit(retry, 0, retry.stderr + retry.stdout);
+  assert.equal(readGrantMarker(grantIdOf(record)).spent, true);
+});
+
+test('codex-review owner grant: a head that moved after the grant is "ask again"; round-request names the new head and a fresh grant works', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  const stale = ownerGrantsRound(t, { k: 3, head: h2 });
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const h3 = w.repo.commit('one more fix');
+  const refused = codexThree(w, h1, h3);
+  assertExit(refused, 2, refused.stdout);
+  assert.equal(refused.json.error, 'round-cap');
+  assert.match(refused.json.message, new RegExp(`round 3 is granted for head ${h2.slice(0, 12)}, not ${h3.slice(0, 12)}: ask again \\(triage round-request\\)`));
+  assert.equal(readGrantMarker(grantIdOf(stale)).spent, false);
+  assert.equal(w.cli(['state', 'outcome']).json.reachedMax, true, 'a stale grant does not lift the cap in the outcome either');
+
+  const req = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(req, 0, req.stderr + req.stdout);
+  assert.equal(req.json.head, h3);
+  ownerGrantsRound(t, { k: 3, head: h3 });
+  const ok = codexThree(w, h1, h3);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  assert.equal(w.state().rounds[2].toHead, h3);
+});
+
+test('codex-review owner grant: a grant used elsewhere while Codex ran is exit 2 "grant already used": one marker, one recorded round', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  // A second checkout of the same PR at the same commit (its own lock folder) reviews round 3 WHILE this checkout's Codex is running.
+  const other = join(w.scratch, 'checkout-2');
+  const cloned = spawnSync('git', ['clone', '-q', w.repo.dir, other], { encoding: 'utf8' });
+  assert.equal(cloned.status, 0, cloned.stderr);
+  cpSync(join(w.repo.dir, '.review'), join(other, '.review'), { recursive: true });
+  writeFileSync(join(other, '.git', 'info', 'exclude'), '.review/\n');
+  const out = w.file('findings-race.json', findingsOf());
+  const nested = `node "${bin}" codex-review --pr 7 --round 3 --base ${h1} --head ${h2} --effort high --repo "${other}"`;
+  const loser = codexThree(w, h1, h2, { env: { FAKE_CODEX_DURING: nested, FAKE_CODEX_DURING_OUTPUT: out, PIPELINE_LOCK_DIR: join(w.scratch, 'locks-2') } });
+  assertExit(loser, 2, loser.stdout);
+  assert.equal(loser.json.error, 'round-cap');
+  assert.match(loser.json.message, /grant already used/);
+  assert.equal(w.state().rounds.length, 2, 'the loser recorded nothing');
+  const winner = JSON.parse(readFileSync(join(other, '.review', 'state.json'), 'utf8'));
+  assert.equal(winner.rounds.length, 3, 'the winner recorded the round');
+  assert.equal(winner.rounds[2].ownerGrant.grantId, grantIdOf(record));
+  assert.equal(readGrantMarker(grantIdOf(record)).spent, true);
+});
+
+test('codex-review owner grant: the marker is created AFTER Codex answers (a Codex run that looks for it finds none)', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const file = markerPath(grantIdOf(record));
+  const probe = join(w.scratch, 'marker-during-codex');
+  const during = `node -e "require('fs').writeFileSync(process.argv[1], String(require('fs').existsSync(process.argv[2])))" "${probe}" "${file}"`;
+  const r = codexThree(w, h1, h2, { env: { FAKE_CODEX_DURING: during } });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(readFileSync(probe, 'utf8'), 'false');
+  assert.equal(existsSync(file), true);
+});
+
+test('codex-review owner grant: two records for the same round and head are claimed together, so discard-round and a rerun is round-cap', (t) => {
+  const { w, h1, h2 } = atCap(t, CAP1_CHAT, [...GH, ...COMMENTS()]); // (discard-round asks GitHub which rounds are published: none)
+  const first = ownerGrantsRound(t, { k: 3, head: h2 });
+  const second = ownerGrantsRound(t, { k: 3, head: h2, prompt: 'grant round' });
+  assertExit(codexThree(w, h1, h2), 0);
+  assert.equal(readGrantMarker(grantIdOf(first)).spent, true);
+  assert.equal(readGrantMarker(grantIdOf(second)).spent, true, 'the duplicate is spent with it');
+  const discarded = w.cli(['state', 'discard-round', '--round', '3', '--pr', '7']);
+  assertExit(discarded, 0, discarded.stderr + discarded.stdout);
+  const again = codexThree(w, h1, h2);
+  assertExit(again, 2, again.stdout);
+  assert.equal(again.json.error, 'round-cap');
+  assert.equal(w.state().rounds.length, 2);
+  // a fresh grant after the discard is the one open grant: effective cap 3, counted once
+  ownerGrantsRound(t, { k: 3, head: h2, prompt: 'extra round please' });
+  const out = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([out.reachedMax, out.effectiveMaxRounds, out.grantedRound?.k], [false, 3, 3]);
+  assertExit(codexThree(w, h1, h2), 0);
+  assert.equal(w.state().rounds.length, 3);
+});
+
+test('codex-review owner grant: the automatic extra round wins - a grant for the same round is not claimed', (t) => {
+  const w = world(t, { yml: CAP1_CHAT });
+  const h1 = reviewAndFix(w, 1, w.base, w.head);
+  const record = ownerGrantsRound(t, { k: 2, head: h1 });
+  assert.equal(w.cli(['state', 'outcome']).json.effectiveMaxRounds, 2, 'auto extra + grant for the same ordinal count once');
+  const r = w.codex(2, findingsOf(), { from: w.head, to: h1 });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.grantUsed, undefined);
+  assert.equal(readGrantMarker(grantIdOf(record)).spent, false);
+  assert.deepEqual([w.state().rounds[1].admission, w.state().rounds[1].ownerGrant], ['auto-extra', undefined]);
+});
+
+test('codex-review owner grant: counted ordinal k and round number n differ after a base-only round (3 counted + 1 base-only: k=4, --round 5)', (t) => {
+  const w = world(t, { yml: CAP2_CHAT });
+  const h1 = reviewAndFix(w, 1, w.base, w.head);
+  const h2 = reviewAndFix(w, 2, w.head, h1);
+  assertExit(w.codex(3, findingsOf(), { from: h1, to: h2 }), 0); // the automatic extra round
+  const merged = mergeMainInto(w, { 'src/a.js': aFile(false).replace('export const v9 = 9;', 'export const v9 = 90;') });
+  const baseOnly = w.codex(4, findingsOf(), { from: h2, to: merged });
+  assertExit(baseOnly, 0, baseOnly.stderr + baseOnly.stdout);
+  assert.equal(baseOnly.json.baseOnly, true);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const h5 = w.repo.commit('own change');
+  const capped = w.codex(5, findingsOf(), { from: merged, to: h5 });
+  assertExit(capped, 2, capped.stdout);
+  const req = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(req, 0, req.stderr + req.stdout);
+  assert.deepEqual([req.json.k, req.json.n, req.json.head], [4, 5, h5]);
+  assert.match(req.json.line, /round 4 · head /);
+  const record = ownerGrantsRound(t, { k: 4, head: h5 });
+  const wrong = w.codex(4, findingsOf(), { from: merged, to: h5 });
+  assertExit(wrong, 2, wrong.stdout);
+  assert.equal(wrong.json.error, 'round-order');
+  const ok = w.codex(5, findingsOf(), { from: merged, to: h5 });
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  const round = w.state().rounds[4];
+  assert.deepEqual([round.n, round.admission, round.ownerGrant.k, round.ownerGrant.grantId], [5, 'owner', 4, grantIdOf(record)]);
+  assert.equal(w.state().rounds[3].admission, undefined, 'a base-only round records no admission');
+});
+
+test('codex-review owner grant: a base-only round past the cap neither needs nor uses a grant', (t) => {
+  const w = world(t, { yml: CAP1_CHAT });
+  const h1 = reviewAndFix(w, 1, w.base, w.head);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: h1 }), 0); // the automatic extra round: everything is reviewed, the cap is reached
+  const merged = mergeMainInto(w, { 'src/a.js': aFile(false).replace('export const v9 = 9;', 'export const v9 = 90;') });
+  const record = ownerGrantsRound(t, { k: 3, head: merged });
+  const r = w.codex(3, findingsOf(), { from: h1, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, true);
+  assert.equal(r.json.grantUsed, undefined);
+  assert.equal(readGrantMarker(grantIdOf(record)).spent, false);
+  assert.equal(w.state().rounds[2].admission, undefined);
+});
+
+test('triage round-request: the exact line, and the refusals', (t) => {
+  const w = world(t, { yml: CAP1_CHAT });
+  const early = w.cli(['triage', 'round-request', '--pr', '7']);
+  assert.equal(early.code, 2, 'no review state yet');
+  const h1 = reviewAndFix(w, 1, w.base, w.head);
+  const auto = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(auto, 1, auto.stdout);
+  assert.match(auto.json.reason, /round 2 is already allowed \(the automatic extra round\)/);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: h1 }), 0);
+  const wrongPr = w.cli(['triage', 'round-request', '--pr', '9']);
+  assertExit(wrongPr, 1, wrongPr.stdout);
+  assert.match(wrongPr.json.reason, /review state is for PR #7, not #9/);
+  const ok = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  assert.equal(ok.json.line, `🔁 Extra review round needed #7: round 3 · head ${h1.slice(0, 12)} · repo acme/widgets`);
+  ownerGrantsRound(t, { k: 3, head: h1 });
+  const granted = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(granted, 1, granted.stdout);
+  assert.match(granted.json.reason, /already granted for this head: run codex-review --round 3/);
 });
