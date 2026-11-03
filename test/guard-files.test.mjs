@@ -909,6 +909,36 @@ test('#58 owner-go: the records folder is protected from every write; reading it
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 
+// Owner-granted extra round: the consumed markers live INSIDE the protected owner-go folder, so no guard rule had to change for them.
+test('owner-granted round: the consumed markers (owner-go/consumed/*) are protected from Write, Edit and every shell write; reading them is open', () => {
+  const M = '/home/u/.claude/pipeline-state/owner-go/consumed';
+  const id = '0123456789abcdef';
+  assert.equal(file('Write', { file_path: `${M}/${id}.json`, content: '{}' }), 'deny');
+  assert.equal(file('Edit', { file_path: `${M}/${id}.json`, old_string: 'a', new_string: 'b' }), 'deny');
+  assert.equal(file('Write', { file_path: `~/.claude/pipeline-state/owner-go/consumed/${id}.json`, content: '{}' }), 'deny');
+  assert.equal(file('Write', { file_path: `${M}/../consumed/${id}.json`, content: '{}' }), 'deny');
+  for (const cmd of [
+    `echo '{}' > ${M}/${id}.json`,
+    `rm ${M}/${id}.json`,
+    `rm -rf ${M}`,
+    `rm -f ~/.claude/pipeline-state/owner-go/consumed/${id}.json`,
+    `mv ${M}/${id}.json /tmp/x.json`,
+    `mv /tmp/x.json ${M}/${id}.json`,
+    `mv ${M} /tmp/consumed.old`,
+    `cp /tmp/x.json ${M}/${id}.json`,
+    `tee ${M}/${id}.json < /tmp/x`,
+    `tee -a ${M}/${id}.json < /tmp/x`,
+    `ln -s /tmp/mine ${M}`,
+    `touch ${M}/${id}.json`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [`ls -la ${M}`, `cat ${M}/${id}.json`]) assert.equal(bash(cmd), 'allow', cmd);
+  // …and the marker helpers cannot be called by hand through the library either
+  for (const cmd of [
+    `node -e "import('./pipeline/hooks/lib/owner-go.mjs').then((m) => m.claimGrantMarkers([], {}))"`,
+    `node -e "import('./pipeline/hooks/lib/owner-go.mjs').then((m) => m.recordRoundGrant({}))"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
 test('#58 owner-go: running the recorder by hand (installed or a source copy) is refused; reading or committing it is not', () => {
   for (const cmd of [
     `echo '{"prompt":"merge"}' | node /home/u/.claude/pipeline/hooks/owner-go.mjs`,
