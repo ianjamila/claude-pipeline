@@ -383,6 +383,32 @@ export function markLightLane(items) {
 export const countsTowardCap = (r) => r?.baseOnly !== true && r?.resolutionOnly !== true;
 export const reviewedRoundCount = (state) => (state?.rounds ?? []).filter(countsTowardCap).length;
 
+// ---- owner-granted rounds (the pure side; the owner's records are looked up by the caller and INJECTED) ---------------------------
+// `grants` is a function k -> [{ grantId, head, quote }]: the owner's open extra-round records for counted ordinal k (any head, newest first;
+// hooks/lib/owner-go.mjs#ownerGrantedRounds with anyHead). A throwing or malformed lookup is no grant. `head` is the head under review: a
+// record covers it when its (>= 12 hex) head is a prefix of it; with no head given every record counts (advisory callers).
+const grantsOf = (grants, k) => {
+  if (typeof grants !== 'function') return [];
+  try {
+    const found = grants(k);
+    return Array.isArray(found) ? found.filter((g) => typeof g?.grantId === 'string' && typeof g.head === 'string') : [];
+  } catch {
+    return [];
+  }
+};
+const coversHead = (g, head) => head === undefined || (typeof head === 'string' && head.startsWith(g.head));
+const grantedRetained = (state) => (state?.rounds ?? []).filter((r) => countsTowardCap(r) && typeof r.ownerGrant?.grantId === 'string').length;
+
+// The counted ordinal (1-based) the automatic extra round took, or null. It is the counted round at max + 1 that no owner grant admitted:
+// recorded `admission: 'auto-extra'`, or (a state written before admission was recorded) no admission and no ownerGrant.
+export function autoExtraOrdinal(state) {
+  const max = state?.maxRounds;
+  if (!Number.isFinite(max)) return null;
+  const r = (state?.rounds ?? []).filter(countsTowardCap)[max];
+  if (r === undefined || r.ownerGrant !== undefined) return null;
+  return r.admission === 'auto-extra' || r.admission === undefined ? max + 1 : null;
+}
+
 // The rounds whose new accepts still wait for a round that reviews their fixes: from the end back through the rounds that
 // reviewed nothing of their own (baseOnly, skipped) and the resolution-only ones (their own accepts count, and so do the
 // earlier round's, which a conflict resolved before the fix was made must not hide), up to the first round that counts toward
@@ -412,7 +438,7 @@ const unresolved = (item) => !item.final || item.final.needsHuman || isOpenBlock
 // Clean needs: nothing pending, needing a human, open, or accepted-but-unfixed anywhere; nothing
 // newly accepted in the LAST round (its fixes still need a round to review them); and the last
 // round reviewed exactly the content that exists now (coverageValid).
-export function roundOutcome(state) {
+export function roundOutcome(state, { grants, head } = {}) {
   const rounds = state?.rounds ?? [];
   const last = rounds.at(-1);
   const everything = allItems(state);
@@ -460,26 +486,51 @@ export function roundOutcome(state) {
     openBlocking.length === 0 &&
     unimplemented.length === 0 &&
     newAccepted.length > 0;
-  const effectiveMaxRounds = capped ? state.maxRounds + (extraRound || reviewed > state.maxRounds ? 1 : 0) : null;
-  const reachedMax = capped && !clean && reviewed >= state.maxRounds && !extraRound;
-  return { clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, extraRound, effectiveMaxRounds, coverageValid, fablePending };
+  // An owner-granted round (REVISIONS 1-3): the automatic extra round wins (a grant for the ordinal it admits is never claimed, so it is not
+  // counted twice), and a grant counts only while it is open for the round that would be next, for the head under review.
+  const autoOrd = autoExtraOrdinal(state);
+  const open = capped && !clean && reviewed >= state.maxRounds && !extraRound
+    ? grantsOf(grants, reviewed + 1).find((g) => coversHead(g, head))
+    : undefined;
+  const effectiveMaxRounds = capped ? state.maxRounds + (extraRound || autoOrd !== null ? 1 : 0) + grantedRetained(state) + (open ? 1 : 0) : null;
+  const reachedMax = capped && !clean && reviewed >= state.maxRounds && !extraRound && !open;
+  const grantedRound = open ? { k: reviewed + 1, grantId: open.grantId, head: open.head, quote: typeof open.quote === 'string' ? open.quote : null } : null;
+  return {
+    clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, extraRound, effectiveMaxRounds, coverageValid, fablePending,
+    grantedRound, autoExtraOrdinal: autoOrd,
+  };
 }
 
-// May round `n` start? Reviewed rounds stop at maxRounds, plus the one extra confirm round roundOutcome grants (extraRound). The
-// round being started counts as one more reviewed round unless it is baseOnly (only the base branch merged in) or resolutionOnly
-// (only a conflict with it resolved), which are never capped. A state without a finite maxRounds (hand-built) is not capped.
-// -> null when it may, else the reason it may not.
-export function roundCapProblem(state, n, { baseOnly = false, resolutionOnly = false } = {}) {
+// How may round `n` start? -> { admission, problem }. admission: 'uncounted' (baseOnly / resolutionOnly: never capped, never needs or uses a
+// grant), 'normal' (within maxRounds, or no finite maxRounds), 'auto-extra' (the one extra confirm round roundOutcome grants), 'owner' (an
+// open owner grant for counted ordinal reviewed + 1 that covers `head`), or null with `problem` (the reason it may not). The automatic
+// extra is checked first and wins; a grant only admits what ordinary admission does not cover.
+export function roundAdmission(state, n, { baseOnly = false, resolutionOnly = false, head, grants } = {}) {
   const max = state?.maxRounds;
-  if (!Number.isFinite(max) || baseOnly || resolutionOnly) return null;
+  if (baseOnly || resolutionOnly) return { admission: 'uncounted', problem: null };
+  if (!Number.isFinite(max)) return { admission: 'normal', problem: null };
   const reviewed = reviewedRoundCount(state);
   const next = reviewed + 1;
-  if (next <= max) return null;
-  if (next === max + 1 && reviewed === max && roundOutcome(state).extraRound) return null;
-  return next === max + 1
-    ? `round ${n} would pass review.max_rounds (${max}): only one extra round is allowed, and only when the last round's open items are all accepted fixes`
-    : `round ${n} would pass review.max_rounds (${max}) and its one extra round`;
+  if (next <= max) return { admission: 'normal', problem: null };
+  if (next === max + 1 && reviewed === max && roundOutcome(state).extraRound) return { admission: 'auto-extra', problem: null };
+  const open = grantsOf(grants, next);
+  if (open.some((g) => coversHead(g, head))) return { admission: 'owner', problem: null, k: next };
+  if (open.length > 0) {
+    return { admission: null, problem: `round ${n} is granted for head ${open[0].head.slice(0, 12)}, not ${String(head).slice(0, 12)}: ask again (triage round-request)` };
+  }
+  return {
+    admission: null,
+    problem: next === max + 1
+      ? `round ${n} would pass review.max_rounds (${max}): only one extra round is allowed, and only when the last round's open items are all accepted fixes, or an owner-granted round`
+      : `round ${n} would pass review.max_rounds (${max}) and its one extra round, or an owner-granted round`,
+  };
 }
+
+// May round `n` start? Reviewed rounds stop at maxRounds, plus the one extra confirm round roundOutcome grants (extraRound) or one round the
+// owner granted (roundAdmission). The round being started counts as one more reviewed round unless it is baseOnly (only the base branch
+// merged in) or resolutionOnly (only a conflict with it resolved), which are never capped. A state without a finite maxRounds (hand-built)
+// is not capped. -> null when it may, else the reason it may not.
+export const roundCapProblem = (state, n, flags = {}) => roundAdmission(state, n, flags).problem;
 
 // True when the last REVIEWED round (not baseOnly: a round that only merged the base branch in reviewed nothing) accepted
 // nothing new, the latest round, base-only or not, covers exactly `contentHash`, and no round has an unresolved item (spec R3').

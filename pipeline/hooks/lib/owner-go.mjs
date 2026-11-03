@@ -494,11 +494,12 @@ function chainState(home, rel) {
 
 // Every record for this repository, PR, counted round k whose recorded head starts the full head under review, younger than 24 h, with NO
 // marker (a consumed, partial or unreadable marker is spent), newest first. All of them: a duplicate "extra round" must not outlive a claim.
-export function ownerGrantedRounds({ repo, pr, k, head, ...opts } = {}) {
+// anyHead: true drops the head test (head is then ignored): the caller compares the head itself, to tell a stale grant from none.
+export function ownerGrantedRounds({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
   const key = repoKey(repo);
-  if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || !FULL_HEAD.test(String(head))) return [];
+  if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || (!anyHead && !FULL_HEAD.test(String(head)))) return [];
   return readRecords(opts)
-    .filter((r) => isRoundRecord(r) && r.repo === key && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && head.startsWith(r.head)
+    .filter((r) => isRoundRecord(r) && r.repo === key && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head))
       && !readGrantMarker(grantIdOf(r), { home: opts.home }).spent)
     .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
 }
