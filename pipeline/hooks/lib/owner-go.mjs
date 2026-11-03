@@ -194,13 +194,15 @@ export function lastRequestText(transcriptPath, opts = {}) {
 // or one of unknown source is a boundary as before, so a pasted `<task-notification>` typed by the owner keeps its boundary.
 // R1-F3 (the limit): a dropped reply may itself have shown a NEWER ask (the agent can start a synthetic turn at will, with a background task), and the owner
 // answers the ask they last saw. So a dropped reply that holds a ruling line or a 🔀 line voids the pending slot: '' (the owner is asked again, the nudge fires).
-// R2-F2: the agent is the untrusted party and picks its wording ("For #59 please answer R1-B1: accept or reject" has neither line), so the test is wider and fails
-// towards voiding: a finding id anywhere in the reply, or a decision word together with a PR reference. An ordinary reply to a notice ("The build finished.") has neither.
+// R2-F2 / R3-B2: the agent is the untrusted party and picks its wording ("For #59, what is your ruling on the first blocker?" has no ruling line or finding id), so the
+// test fails towards voiding and does not depend on a phrase: a ruling line, a finding id, a reference to a PR or issue ("#59", "PR 59", "pull request 59"), a question
+// mark, or a word that asks for a call (ruling, decide, your call, blocker, finding ...). An ordinary reply to a notice ("The build finished.")
+// has none of them and still leaves the ask standing: the owner can answer after a background notice, the point of skipSynthetic.
 const SHOWS_ASK = /Owner ruling needed\s+#\d/i;
 const FINDING_ID_TEXT = /\bR\d{1,4}-[A-Za-z]{1,8}\d{1,4}\b/i;
-const DECISION_WORD = /\b(?:accept|reject|follow[- ]?up|approve|merge)\b/i;
-const PR_REF = /#\d|\bpr\s*\d/i;
-const showsAsk = (text) => SHOWS_ASK.test(text) || READY_LINE.test(text) || FINDING_ID_TEXT.test(text) || (DECISION_WORD.test(text) && PR_REF.test(text));
+const PR_REF = /#\d|\b(?:pr|pull\s+request|issue)s?\s*#?\d/i;
+const CALL_WORD = /\?|\b(?:ruling|rule on|verdict|decision|decide|your call|which of|blockers?|findings?)\b/i;
+const showsAsk = (text) => SHOWS_ASK.test(text) || READY_LINE.test(text) || FINDING_ID_TEXT.test(text) || PR_REF.test(text) || CALL_WORD.test(text);
 export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
   const replies = [''];
   const voided = new Set(); // slots (indexes of replies) whose ask a dropped reply replaced

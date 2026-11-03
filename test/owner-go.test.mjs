@@ -549,6 +549,13 @@ test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice void
     ['a finding id in lower case', 'Back to r2-f1 on pr 59, your call.'],
     ['a decision word next to a PR number', 'Please reply accept or reject for #59.'],
     ['a decision word before the PR number', 'Should I merge #59? Tell me follow-up or reject.'],
+    // R3-B2: the agent picks its wording, so any reference to a PR / issue, a question, or a word that asks for a call voids the slot, not only a fixed phrasing
+    ['a ruling question with no finding id or decision word', 'For #59, what is your ruling on the first blocker?'],
+    ['"pull request" spelled out', 'please accept or reject pull request 59'],
+    ['a question with no reference at all', 'Which of the two do you want?'],
+    ['a request for a call with no punctuation', 'Tell me your call on the first blocker'],
+    ['a PR number after "PR"', 'Now looking at PR 59 instead.'],
+    ['a #number reference, even in an otherwise ordinary sentence', 'Build #1042 finished, 3 tests rerun.'],
   ]) {
     assert.equal(rule([...head, notice, said('The build finished.'), said(shown)]), null, name);
     assert.equal(rule([...head, notice, said(shown)]), null, `${name}, no other text`);
@@ -557,7 +564,7 @@ test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice void
   assert.deepEqual(readApprovals({ home, now }), []);
   // the limit is the reply to a harness turn only: a plain reply after the ask, an ask shown BEFORE the notice, and a new owner turn after the poisoned reply all work as before
   assert.deepEqual([rule([...head, notice, said('The build finished.')])?.pr], [58], 'no ask in the reply');
-  for (const text of ['The build finished.', 'Build #1042 finished, 3 tests rerun.', 'Rejected the stale cache; all green.', 'Noted: the PR is still open.', 'I will accept the default.']) {
+  for (const text of ['The build finished.', 'Rejected the stale cache; all green.', 'Noted: the PR is still open.', 'I will accept the default.']) {
     assert.deepEqual([rule([...head, notice, said(text)])?.pr], [58], `an ordinary reply still binds: ${text}`);
   }
   assert.deepEqual([rule([promptEntry('go'), said(ask(59)), notice, said('ok')])?.pr], [59], 'the ask is the last thing before the notice');
