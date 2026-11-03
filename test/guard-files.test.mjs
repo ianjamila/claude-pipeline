@@ -1302,6 +1302,25 @@ test('#128 R4-B1/F1: program text with a config root, a projects word and a .jso
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
 });
 
+// R4-B2 / R4-F2: a trailing zsh glob qualifier, (/) included, is not part of the name.
+test('#128 R4-B2/F2: a trailing zsh glob qualifier (/) does not hide the config dir (glob or literal); unrelated paths stay open', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    'tar -xf x -C /home/u/claude-confi?(/)',
+    'rsync -a /tmp/f/ /home/u/claude-confi?(/)',
+    'tar -xf x -C /home/u/claude-config(/)',
+    'rsync -a /tmp/forged/ ~/.claud?/projects/-rep?(/)',
+    'tar -xf x -C ~/.claude-eaglewatch(/)',
+    'tar -xf x -C /home/u/.claud?-eaglewatch(/)',
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  for (const cmd of [
+    'tar -xf x -C /tmp/out?(/)',
+    'tar -xf x -C /tmp/out(/)',
+    'tar -xf x -C /home/u/claude-config-old(/)',
+    'rsync -a /tmp/f/ /home/u/claude-confi?-old(/)',
+  ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+});
+
 test('Phase 3b: a program that resolves into a review folder is judged like any other (only the installed pipeline is trusted)', () => {
   // (run.mjs links to a file in a round folder: the hook judges the real file's text, it does not skip it as a pipeline program)
   const prog = '/repo/.review/round-1/x.mjs';

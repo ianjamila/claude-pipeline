@@ -131,6 +131,8 @@ const DRIVE_RELATIVE = /^[A-Za-z]:(?![/\s])/; // D:foo or D: (a drive and no sla
 const caseInsensitive = (platform) => platform === 'win32' || platform === 'darwin';
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
 const unique = (a) => [...new Set(a)];
+// R4-B2: a trailing zsh glob qualifier (`*.jsonl(D)`, `dir(/)`) is no part of the last name; dropping it can only widen a match
+const noQualifier = (w) => String(w).replace(/\([^()]*\)$/, '');
 const baseOf = commandName;
 const deny = (reason) => ({ decision: 'deny', reason });
 const allow = () => ({ decision: 'allow', reason: '' });
@@ -405,8 +407,9 @@ function makeCtx(opts) {
     hitAncestor: (p) => pipelineAncestor(p) || reviewDir.test(unFirm(p)),
     // #128: a transcript folder (R1-B1) is a protected reference when a word IS it; a shell sitting in one (cwd, a cd target) may write only what is not a transcript
     // (hit), but runs of its own (tar -x, cp -R x .) land in it, so there ctx.hitTranscriptBelow counts like an ancestor (projects/ itself does not: notes may be written from it)
-    hitTranscriptDir: (p) => transcripts.dirs.some((re) => re.test(unFirm(p))),
-    hitTranscriptBelow: (p) => transcripts.below.some((re) => re.test(unFirm(p))),
+    // (R4-B2 / R4-F2: a trailing zsh glob qualifier, `claude-config(/)`, is not part of the name: dropped, which can only widen the match)
+    hitTranscriptDir: (p) => transcripts.dirs.some((re) => re.test(unFirm(noQualifier(p)))),
+    hitTranscriptBelow: (p) => transcripts.below.some((re) => re.test(unFirm(noQualifier(p)))),
     hitPipelineAncestor: pipelineAncestor,
     reviewFile, reviewDir, transcriptRoots,
     hitTree: (p) => { const q = unFirm(p); return treeRoots.some((r) => isInside(q, r, platform)); },
@@ -1004,7 +1007,7 @@ function makeMatchers(ctx) {
   };
   const reviewGlob = (g) => {
     // (a trailing zsh glob qualifier, `*/state.json(D)`, is not part of the last name: dropped, which can only widen the match)
-    const segs = g.replace(/\([^()/]*\)$/, '').split('/');
+    const segs = noQualifier(g).split('/');
     for (let i = 0; i < segs.length; i++) {
       if (!can(segs[i], '.review')) continue;
       const rest = segs.slice(i + 1).filter((s) => s !== '');
@@ -1041,7 +1044,7 @@ function makeMatchers(ctx) {
     return !rest.slice(0, -1).includes('memory') && (last.endsWith('.jsonl') || (/[*?[]/.test(last) && !/\.[A-Za-z0-9]+$/.test(last)));
   };
   const transcriptGlob = (g) => {
-    const segs = g.replace(/\([^()/]*\)$/, '').split('/');
+    const segs = noQualifier(g).split('/');
     for (let i = 0; i + 1 < segs.length; i++) {
       if (claudeSeg(segs[i]) && can(segs[i + 1], 'projects') && transcriptTail(segs.slice(i + 2).filter((s) => s !== ''))) return true;
     }
@@ -1052,7 +1055,7 @@ function makeMatchers(ctx) {
   // a place to extract or copy into (hitTranscriptDir / hitTranscriptBelow); a wildcard spelling of the same folder (`-C ~/claude-confi?`, `rsync x/ ~/.claud?-eaglewatch/`) is the same folder
   // once the shell expands it, and transcriptGlob above only sees globs that reach projects/ below one.
   const configDirGlob = (g) => {
-    const gp = g.replace(/\/+$/, '');
+    const gp = noQualifier(g).replace(/\/+$/, ''); // (R4-B2: before both the pattern test and the split at the last slash, which would land inside `(/)`)
     const re = globToRe(gp, ctx.ci);
     if (re && ctx.transcriptRoots.some((r) => re.test(r.replace(/\/+$/, '')))) return true;
     const at = gp.lastIndexOf('/');
