@@ -115,3 +115,42 @@ export const drivePosix = {
     return da.toLowerCase() === db.toLowerCase() ? posix.relative(ra, rb) : `${db}${rb}`;
   },
 };
+
+// ---- Claude Code session transcripts (#128) --------------------------------------------------------------------------------------
+// ONE definition of what a transcript is, for both sides of the owner-go check: the guard (hooks/lib/files-policy.mjs) write-protects
+// <config dir>/projects/<project>/<session>.jsonl (and subagents/ below it) and the folders that hold them, and the use-time check
+// (hooks/lib/owner-go.mjs promptProvenance) takes a prompt's provenance only from a file of that shape: a transcript the guard does not protect
+// is not evidence. The config dir is any `.claude*` folder (the stacks' default transcriptDirs) or $CLAUDE_CONFIG_DIR, whatever its name.
+const TRANSCRIPT_LEAF = String.raw`projects/(?:[^/]+/)+[^/]+\.jsonl$`;
+// the folders that hold them: projects/ itself, and BELOW it each project and every folder in it but its memory/ (names without a dot: a session is a
+// uuid, subagents/ …). A project folder is named as Claude Code names it, the working directory with every non-alphanumeric turned into "-": it starts
+// with "-" (POSIX) or "C--" (a drive), so a folder of any other name is no session's. (A file in one is still a transcript: TRANSCRIPT_LEAF.)
+const TRANSCRIPT_BELOW = String.raw`projects/(?:-|[A-Za-z]--)[^/]*(?:/(?!memory(?:/|$))[^/.]+(?:/[^/.]+)*)?/*$`;
+const TRANSCRIPT_TOP = String.raw`projects/*$`;
+const ANY_CLAUDE_DIR = String.raw`(?:^|/)\.claude[^/]*/`;
+export const TRANSCRIPT_FILE_SRC = ANY_CLAUDE_DIR + TRANSCRIPT_LEAF;
+const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// The absolute POSIX form of $CLAUDE_CONFIG_DIR (home references expanded), or null when it is unset or not absolute.
+export function configDirOf(env, home = os.homedir()) {
+  const v = env?.CLAUDE_CONFIG_DIR;
+  if (typeof v !== 'string' || v.trim() === '') return null;
+  const p = toPosix(expandHome(v.trim(), toPosix(home))).replace(/\/+$/, '');
+  return p.startsWith('/') || /^[A-Za-z]:\//.test(p) ? p : null;
+}
+// The patterns for files (`files`), for the folders (`dirs`: a word that IS one is a protected reference) and for the folders a command may be run
+// in (`below`: dirs but `projects/` itself, which is also where a shell may sit to write notes): the `.claude*` shape, plus each of `configDirs`
+// (absolute POSIX paths; null/'' are skipped).
+export function transcriptRes(configDirs = [], ci = false) {
+  const flags = ci ? 'i' : '';
+  const roots = [...new Set(configDirs.filter(Boolean))].map((d) => `^${reEscape(d)}/`);
+  return {
+    files: [TRANSCRIPT_FILE_SRC, ...roots.map((r) => r + TRANSCRIPT_LEAF)].map((s) => new RegExp(s, flags)),
+    dirs: [ANY_CLAUDE_DIR + TRANSCRIPT_TOP, ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...roots.flatMap((r) => [r + TRANSCRIPT_TOP, r + TRANSCRIPT_BELOW])].map((x) => new RegExp(x, flags)),
+    below: [ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...roots.map((r) => r + TRANSCRIPT_BELOW)].map((x) => new RegExp(x, flags)),
+  };
+}
+// Is this path (any slash flavour) a transcript FILE the guard protects?
+export function isTranscriptFile(file, { env = process.env, platform = process.platform, home } = {}) {
+  const p = toPosix(file);
+  return transcriptRes([configDirOf(env, home)], platform === 'win32' || platform === 'darwin').files.some((re) => re.test(p));
+}

@@ -1018,6 +1018,105 @@ test('#128: Claude Code session transcripts are protected from every write, in e
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 
+// #128 round 1 (R1-B1): the folders that hold the transcripts are protected like the .review folder: a recursive copy, rsync, tar or a rename of a
+// forged folder replaces the trusted files without naming one.
+test('#128 R1-B1: replacing or filling a transcript folder (projects, a project, a session, subagents) is refused; reading, memory notes and mkdir stay open', () => {
+  for (const cmd of [
+    'cp -R /tmp/forged/. ~/.claude/projects/-repo/',
+    'cp -R /tmp/forged/. /home/u/.claude/projects/-repo',
+    'rsync -a /tmp/forged/ ~/.claude/projects/-repo/',
+    'tar -x -C ~/.claude/projects/-repo -f /tmp/forged.tar',
+    'tar -xf /tmp/forged.tar -C ~/.claude-eaglewatch/projects/-repo',
+    'rm -rf ~/.claude/projects/-repo && mv /tmp/forged ~/.claude/projects/-repo',
+    'mv ~/.claude/projects/-repo /tmp/gone',
+    'rm -rf ~/.claude/projects',
+    'mv /tmp/forged ~/.claude/projects',
+    'cp -R /tmp/forged/. ~/.claude/projects/-repo/abc/',
+    'cp -R /tmp/forged/. ~/.claude/projects/-repo/abc/subagents',
+    'rm -rf ~/.claude/projects/-repo/abc/subagents',
+    'cd ~/.claude/projects/-repo && cp -R /tmp/forged/. .',
+    'cd ~/.claude/projects/-repo && tar -xf /tmp/forged.tar', // (a run in the folder, no folder word)
+    'cd ~/.claude/projects/-repo && /usr/bin/tar -xf /tmp/forged.tar', // (no relative word at all: the folder the shell sits in is what counts)
+    'cd ~/.claude/projects/-repo/abc/subagents && tar -xf /tmp/forged.tar',
+    'cp -R /tmp/forged/. ~/.claude/projects/C--Users-u-repo/',
+    'cp -R /tmp/forged/. ~/.claude/projects/-rep?/',
+    'rm -rf ~/.claude/projects/*',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    'ls -la ~/.claude/projects/-repo/',
+    'cp -R ~/.claude/projects/-repo /tmp/copy', // (a read copy)
+    'cp /tmp/note.md ~/.claude/projects/-repo/memory/',
+    'cp /tmp/note.md ~/.claude/projects/-repo/memory/note.md',
+    'mkdir -p ~/.claude/projects/-repo',
+    'cp -R /tmp/x /tmp/projects/-repo/',
+    'cd ~/.claude/projects && echo x > notes.txt', // (from projects/ itself a shell may write notes; guard-a2-shell-f2d)
+    'cd ~/.claude/projects/-repo/memory && echo x > n.md',
+    'rm -rf ~/.claude/projects/old', // (no session's folder: the old table in guard-files-bypass keeps it allowed)
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// R1-B2: a config dir named by CLAUDE_CONFIG_DIR is protected under any name (the owner-go check accepts only transcripts the guard protects).
+test('#128 R1-B2: transcripts under $CLAUDE_CONFIG_DIR/projects are protected whatever the folder is called', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  const T = '/home/u/claude-config/projects/-repo/abc.jsonl';
+  assert.equal(file('Edit', { file_path: T, old_string: 'a', new_string: 'b' }, { env }), 'deny');
+  assert.equal(file('Write', { file_path: T, content: '{}' }, { env }), 'deny');
+  for (const cmd of [`echo x >> ${T}`, `cp /tmp/forged.jsonl ${T}`, 'cp -R /tmp/forged/. /home/u/claude-config/projects/-repo/', 'rm -rf /home/u/claude-config/projects/-repo']) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  for (const cmd of [`cat ${T}`, 'echo x > /home/u/claude-config/projects/-repo/memory/n.md', 'echo x >> /home/u/claude-config/other.jsonl']) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  // (without the variable it is just a folder)
+  assert.equal(file('Write', { file_path: T, content: '{}' }), 'allow');
+});
+
+// R1-F1: the transcript glob is read segment by segment (as the review glob is), so a wildcard spelling of .claude or projects still counts.
+test('#128 R1-F1: a glob that can name a transcript is refused whatever the wildcards stand for', () => {
+  for (const cmd of [
+    'printf x > ~/.claud?/projects/-repo/abc.jsonl',
+    'cp /tmp/forged.jsonl ~/.claud?/projects/-repo/abc.jsonl',
+    'echo x >> ~/.cl*/projects/*/*.jsonl',
+    'printf x > ~/.[c]laude/projects/-repo/abc.jsonl',
+    'cp /tmp/forged.jsonl ~/.claude/proj?cts/-repo/abc.jsonl',
+    'cp /tmp/forged.jsonl ~/.claude/p*/-repo/abc.jsonl',
+    'cp /tmp/forged.jsonl ~/.claude-e*/projects/-repo/abc.jsonl',
+    'cp -R /tmp/forged/. ~/.cl*/projects/-repo/',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    'cat ~/.cl*/projects/*/*.jsonl',
+    'echo x > ~/.cl*/projects/*/memory/n.md',
+    'cp /tmp/x ~/.cl*/projects/-repo/notes.md',
+    'echo x >> /tmp/.cl*/proj/abc.jsonl',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// R1-F2: a hard link is the same file under another name, and the guard cannot see inodes of transcripts: the commands that make one are
+// judged by their SOURCES (as ln is).
+test('#128 R1-F2: cp -l / --link, pax -rwl and rsync --link-dest from a transcript (or its folder) are refused; a plain read copy stays open', () => {
+  const T = '~/.claude/projects/-repo/abc.jsonl';
+  for (const cmd of [
+    `cp -l ${T} ~/t.jsonl`,
+    `cp --link ${T} /tmp/t.jsonl`,
+    'cp -al ~/.claude/projects/-repo /tmp/m',
+    'cp -rl ~/.claude/projects/-repo/. /tmp/m',
+    `cp --link=always ${T} /tmp/t.jsonl`,
+    `cp -t /tmp/m -l ${T}`,
+    'pax -rwl ~/.claude/projects/-repo /tmp/m',
+    'pax -rw -l ~/.claude/projects/-repo /tmp/m',
+    'rsync -a --link-dest=$HOME/.claude/projects/-repo /tmp/src/ /tmp/m/',
+    'rsync -a --link-dest ~/.claude/projects/-repo /tmp/src/ /tmp/m/',
+    'cp -l ~/.claude/projects/*/*.jsonl /tmp/m/',
+    `link ${T} /tmp/t.jsonl`,
+    `ln ${T} /tmp/t.jsonl`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `cp ${T} /tmp/x`,
+    `cp -p ${T} /tmp/x.jsonl`,
+    'cp -R ~/.claude/projects/-repo /tmp/copy',
+    'cp -l /tmp/a.jsonl /tmp/b.jsonl',
+    'rsync -a --link-dest=/tmp/prev /tmp/src/ /tmp/m/',
+    'pax -rw /tmp/src /tmp/m',
+    'pax -rwl /tmp/src /tmp/m',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
 test('Phase 3b: a program that resolves into a review folder is judged like any other (only the installed pipeline is trusted)', () => {
   // (run.mjs links to a file in a round folder: the hook judges the real file's text, it does not skip it as a pipeline program)
   const prog = '/repo/.review/round-1/x.mjs';

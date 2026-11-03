@@ -21,7 +21,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
-import { toPosix, expandHome, isInside, samePath, drivePosix } from '../../lib/paths.mjs';
+import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
@@ -73,14 +73,8 @@ const REVIEW_DIR_SRC = String.raw`(?:^|/)\.review/*$`;
 // prompt entry the model wrote would pass for the owner's. Protected for writes like the review state (reads stay open: they are how a transcript is
 // analysed); nothing in the pipeline writes there (grep 2026-11-03: only readers). A writer that is not a tool call (a pty-driven interactive
 // `claude --resume`) is a residual.
-const TRANSCRIPT_FILE_SRC = String.raw`(?:^|/)\.claude[^/]*/projects/(?:[^/]+/)+[^/]+\.jsonl$`;
+// (the file and folder patterns live in lib/paths.mjs, the one place the use-time check reads too: R1-B2)
 const TRANSCRIPT_TEXT_SRC = String.raw`(?<![\w.\-])\.claude[^/\s'"]*/projects/[^\s'"]*\.jsonl(?![\w.\-])`;
-// A glob that can match one: a literal `.claude*/projects/` prefix and a last name that ends in .jsonl or is a wildcard.
-const transcriptGlob = (g) => {
-  const last = g.split('/').pop() ?? '';
-  // (a last name with a literal other extension, `*.md`, or a path through a memory folder, cannot be one)
-  return /(?:^|\/)\.claude[^/]*\/projects\//.test(g) && !/\/memory\//.test(g) && (last.endsWith('.jsonl') || (/[*?[]/.test(last) && !/\.[A-Za-z0-9]+$/.test(last)));
-};
 // One name of each kind, for globs: a glob that can match one of them can match a protected file.
 const REVIEW_SAMPLES = ['state.json', 'state.json.1.tmp', 'round-1', 'final-gate.json', 'preview-smoke.json', 'production-smoke.json', 'prod-before.json'];
 // A wildcard matches a name that starts with a dot (the .review folder) only when the line may switch that on: bash dotglob (shopt, or
@@ -258,7 +252,10 @@ function makeCtx(opts) {
   const ci = caseInsensitive(platform);
   const reviewFile = new RegExp(REVIEW_FILE_SRC, ci ? 'i' : '');
   const reviewDir = new RegExp(REVIEW_DIR_SRC, ci ? 'i' : '');
-  const transcriptFile = new RegExp(TRANSCRIPT_FILE_SRC, ci ? 'i' : '');
+  // #128: the transcripts and their folders; R1-B2: also under $CLAUDE_CONFIG_DIR, whatever that is called (as given and as resolved)
+  const cfgDir = configDirOf(opts.env ?? process.env, homePosix);
+  const transcriptRoots = unique([cfgDir, cfgDir && realResolve(cfgDir, api)].filter(Boolean));
+  const transcripts = transcriptRes(transcriptRoots, ci);
   const pipelineHit = (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); };
   const pipelineAncestor = (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); };
   let rootIds = null;
@@ -403,11 +400,15 @@ function makeCtx(opts) {
     bashState: opts._bashState, // the BASH rewrite record of the whole evaluation (see evaluateBashForFilesUnchecked)
     // (hit / hitAncestor: the installed pipeline files and, in any directory, a repo's review state (REVIEW_FILE_SRC). trusted: only
     // the installed pipeline files, whose programs are not judged on their content when run.)
-    hit: (p) => pipelineHit(p) || reviewFile.test(unFirm(p)) || transcriptFile.test(unFirm(p)),
+    hit: (p) => pipelineHit(p) || reviewFile.test(unFirm(p)) || transcripts.files.some((re) => re.test(unFirm(p))),
     trusted: pipelineHit,
     hitAncestor: (p) => pipelineAncestor(p) || reviewDir.test(unFirm(p)),
+    // #128: a transcript folder (R1-B1) is a protected reference when a word IS it; a shell sitting in one (cwd, a cd target) may write only what is not a transcript
+    // (hit), but runs of its own (tar -x, cp -R x .) land in it, so there ctx.hitTranscriptBelow counts like an ancestor (projects/ itself does not: notes may be written from it)
+    hitTranscriptDir: (p) => transcripts.dirs.some((re) => re.test(unFirm(p))),
+    hitTranscriptBelow: (p) => transcripts.below.some((re) => re.test(unFirm(p))),
     hitPipelineAncestor: pipelineAncestor,
-    reviewFile, reviewDir,
+    reviewFile, reviewDir, transcriptRoots,
     hitTree: (p) => { const q = unFirm(p); return treeRoots.some((r) => isInside(q, r, platform)); },
     unFirm,
     // Is `p`, or the nearest existing directory above it, the very same file or directory (same device and inode) as a
@@ -557,7 +558,7 @@ function evaluateMcp(tool, ti, input, opts) {
   // 1. a file write: the path keys name the targets (an exact ancestor dir counts too)
   const targets = writeVerb ? f.paths.map((t) => ({ t, candidates: resolve(t) })) : [];
   for (const { t, candidates } of targets) {
-    if (candidates.some((c) => ctx.hit(c) || ctx.hitAncestor(c) || ctx.hitInode(c))) return deny(`${t} is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
+    if (candidates.some((c) => ctx.hit(c) || ctx.hitAncestor(c) || ctx.hitTranscriptDir(c) || ctx.hitInode(c))) return deny(`${t} is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
   }
   if (targets.length) {
     const texts = f.contents.flatMap(variantsOf);
@@ -991,15 +992,16 @@ function makeMatchers(ctx) {
   // A glob that can match a repo's review folder or a protected file in it (REVIEW_FILE_SRC), wherever it is: a segment that can be
   // `.review`, then the end (the folder itself) or a segment that can be one of the protected names. `**` can stand for the folder and
   // for a round folder, so anything after it counts. A wildcard reaches a dot name only with DOT_GLOB on the line.
+  // Can this glob segment stand for `name`? (`**` and a wildcard reach a dot name only with DOT_GLOB on the line)
+  const can = (seg, name) => {
+    if (seg === '**') return ctx.dotGlob === true || !name.startsWith('.');
+    if (!/[*?[]/.test(seg)) return ctx.ci ? seg.toLowerCase() === name.toLowerCase() : seg === name;
+    if (name.startsWith('.') && !seg.startsWith('.') && ctx.dotGlob !== true) return false;
+    return !!segmentRe(seg, ctx.ci)?.test(name);
+  };
   const reviewGlob = (g) => {
     // (a trailing zsh glob qualifier, `*/state.json(D)`, is not part of the last name: dropped, which can only widen the match)
     const segs = g.replace(/\([^()/]*\)$/, '').split('/');
-    const can = (seg, name) => {
-      if (seg === '**') return ctx.dotGlob === true || !name.startsWith('.');
-      if (!/[*?[]/.test(seg)) return ctx.ci ? seg.toLowerCase() === name.toLowerCase() : seg === name;
-      if (name.startsWith('.') && !seg.startsWith('.') && ctx.dotGlob !== true) return false;
-      return !!segmentRe(seg, ctx.ci)?.test(name);
-    };
     for (let i = 0; i < segs.length; i++) {
       if (!can(segs[i], '.review')) continue;
       const rest = segs.slice(i + 1).filter((s) => s !== '');
@@ -1011,6 +1013,24 @@ function makeMatchers(ctx) {
     return false;
   };
   const reviewName = new RegExp(REVIEW_FILE_SRC, ctx.ci ? 'i' : '');
+  // #128 (R1-F1, as reviewGlob reads `.review`): a glob that can name a transcript or a folder that holds them. A segment that can start a name
+  // with `.claude` (`.claud?`, `.cl*`, `.[c]laude`, `.claude-e*`), then one that can be `projects`, then either nothing more or a project (a folder)
+  // or a last name that ends in .jsonl or is a wildcard with no literal other extension (`*.md` cannot be one); a path through a memory folder cannot be one.
+  // (`cp x GLOB/notes.md` is also judged as GLOB/notes.md/x, a file in a folder: a literal last name is no transcript there)
+  // (R1-B2: `$CLAUDE_CONFIG_DIR/projects` reached by a glob is judged the same way)
+  const claudeSeg = (seg) => (/[*?[]/.test(seg) ? can(seg, '.claude') || can(seg, '.claude-x') || /^\.claude/i.test(seg) : /^\.claude/i.test(seg));
+  const transcriptTail = (rest) => {
+    const last = rest[rest.length - 1] ?? '';
+    if (rest.length <= 1) return rest.length === 0 || last.endsWith('.jsonl') || !/\.[A-Za-z0-9]+$/.test(last); // (projects/ itself, or a project folder)
+    return !rest.slice(0, -1).includes('memory') && (last.endsWith('.jsonl') || (/[*?[]/.test(last) && !/\.[A-Za-z0-9]+$/.test(last)));
+  };
+  const transcriptGlob = (g) => {
+    const segs = g.replace(/\([^()/]*\)$/, '').split('/');
+    for (let i = 0; i + 1 < segs.length; i++) {
+      if (claudeSeg(segs[i]) && can(segs[i + 1], 'projects') && transcriptTail(segs.slice(i + 2).filter((s) => s !== ''))) return true;
+    }
+    return ctx.transcriptRoots.some((r) => globReaches(g, `${r}/projects`, ctx.ci) && transcriptTail(segs.slice(r.split('/').length + 1).filter((s) => s !== '')));
+  };
 
   // Is a protected file named in `text`? By absolute path (in any of its spellings), by a tail with an unknown
   // prefix, or by a relative tail that lands in a protected root from one of `dirs`.
@@ -1113,7 +1133,7 @@ function makeMatchers(ctx) {
         const bases = isAbs(e) ? [''] : dirs;
         for (const d of bases) {
           const full = isAbs(e) ? pathsFor().normalize(e) : pathsFor().join(d, e);
-          if (/[*?[]/.test(full) ? globHit(full) : (ctx.hit(full) || (withAncestors === 'pipeline' ? ctx.hitPipelineAncestor(full) : withAncestors && ctx.hitAncestor(full))) && (!plausible || plausible(full, e)) ) return true;
+          if (/[*?[]/.test(full) ? globHit(full) : (ctx.hit(full) || (withAncestors === 'pipeline' ? ctx.hitPipelineAncestor(full) : withAncestors && (ctx.hitAncestor(full) || ctx.hitTranscriptDir(full)))) && (!plausible || plausible(full, e)) ) return true;
         }
       }
     }
@@ -1477,6 +1497,16 @@ const FIND_UNSAFE = /^-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/;
 const SHELL_NAMES = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'pwsh', 'powershell', 'cmd']);
 // For these only the destination (last word, or -t DIR) can change a protected file; reading one into /tmp is fine.
 const DEST_ONLY = new Set(['cp', 'rsync', 'install']);
+// #128 R1-F2: the DEST_ONLY commands that make a HARD LINK to a source (cp -l / --link, rsync --link-dest=DIR): the new name is the same file, so a later
+// write to it rewrites a protected one (transcripts have no inode set to compare, hitInode). Their sources are judged like their destination. (ln, link and
+// pax -rwl name their sources as words of a command that is not DEST_ONLY: every word counts for them already.)
+const makesHardLinks = (c) => {
+  const name = baseOf(c.argv[0] ?? '');
+  const args = c.argv.slice(1);
+  if (name === 'cp') return args.some((a) => a === '--link' || a.startsWith('--link=') || (/^-[A-Za-z]+$/.test(a) && a.includes('l')));
+  if (name === 'rsync') return args.some((a) => a === '--link-dest' || a.startsWith('--link-dest='));
+  return false;
+};
 const MOVERS = new Set(['mv', 'ln', 'ditto']); // any named protected path counts, and so does DEST/basename(SRC)
 // (zsh's lowercase `cdpath` array is tied to CDPATH: setting either sets both)
 const CDPATH_NAMES = ['CDPATH', 'cdpath'];
@@ -2518,7 +2548,7 @@ function linkReachesProtected(cmds, dirs, ctx) {
       for (const d of isAbs(e) ? [''] : dirs) {
         const full = pathsFor().normalize(isAbs(e) ? e : pathsFor().join(d, e));
         for (const p of unique([full, realResolve(full, ctx.api)])) {
-          if (ctx.hit(p) || ctx.hitAncestor(p) || ctx.roots.some((r) => isInside(r, p, ctx.platform))) return t;
+          if (ctx.hit(p) || ctx.hitAncestor(p) || ctx.hitTranscriptDir(p) || ctx.roots.some((r) => isInside(r, p, ctx.platform))) return t;
         }
       }
     }
@@ -3162,7 +3192,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const totalWords = cmds.reduce((n, c) => n + c.argv.length, 0);
   const tooMany = totalWords > 5000; // per-token scans are skipped; the raw-text scans still run
   if (tooMany) ctx.dynamic = true;
-  const insideRoot = opts._writesOnly !== true && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d)); // cwd or a `cd` target is a protected dir (or its parent): relative words and bare commands reach it
+  const insideRoot = opts._writesOnly !== true && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTranscriptBelow(d)); // cwd or a `cd` target is a protected dir (or its parent): relative words and bare commands reach it
   const protectedInRaw = m.rawHit(scanRaw, dirs);
 
   // #58: running the owner-go recorder (any copy) by hand would write an owner "merge" the owner never typed. Only Claude Code runs it,
@@ -3319,6 +3349,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // (a destination word is never filtered: a writer may create a protected name that does not exist yet)
     if (DEST_ONLY.has(name)) {
       if (destsOf(wordsOf(c), name).some(tokenHitAll)) return true;
+      if (makesHardLinks(c) && wordsOf(c).some(tokenHitAll)) return true; // (R1-F2: and its sources)
       // (#111: `cp x .review/{state,y}.json` -- the parser keeps only the last expansion as the destination, but a brace form is a family of targets: each expansion is judged as one)
       const bw = braceWordsOf(rawOfCmd(c));
       return (bw.over && ctx.hasReviewDir()) || bw.words.some(tokenHitAll);
