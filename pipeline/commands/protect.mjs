@@ -23,30 +23,33 @@ export const meta = {
 // the final gate's provenance check (guard-provenance.mjs) catches that, so a direct `gh pr merge` must stay hook-blocked.
 export const GITHUB_ACTIONS_APP_ID = 15368;
 
-// The app a required check must be posted by: its pin, else GitHub Actions.
-const appFor = (context, pins) => pins?.[context] ?? GITHUB_ACTIONS_APP_ID;
+// The app a required check must be posted by: its own pin, else GitHub Actions. Own properties only, and the pin maps have
+// no prototype, so a check named `constructor` or `__proto__` can never pick up an inherited value.
+const appFor = (context, pins) => (pins && Object.hasOwn(pins, context) ? pins[context] : GITHUB_ACTIONS_APP_ID);
+const isAppId = (n) => Number.isSafeInteger(n) && n > 0;
 
 // The checks the current protection pins to an app other than GitHub Actions (a positive app id; -1 or null means "any app"),
 // among the ones being required. Guard contexts are left out: they are only ever trusted from GitHub Actions.
 export function foreignPins(json, checks) {
-  const pins = {};
+  const pins = Object.create(null);
   for (const row of json?.required_status_checks?.checks ?? []) {
     const context = row?.context;
     const appId = row?.app_id;
     if (!checks.includes(context) || PROVENANCE_CHECKS.includes(context)) continue;
-    if (Number.isInteger(appId) && appId > 0 && appId !== GITHUB_ACTIONS_APP_ID) pins[context] = appId;
+    if (isAppId(appId) && appId !== GITHUB_ACTIONS_APP_ID) pins[context] = appId;
   }
   return pins;
 }
 
 // `--pin NAME=APP_ID[,NAME=APP_ID]`: each name must be a required check and not a guard context; the id a positive integer.
 export function parsePins(raw, checks) {
-  const pins = {};
+  const pins = Object.create(null);
   for (const item of raw.split(',').map((s) => s.trim()).filter(Boolean)) {
     const at = item.lastIndexOf('=');
     const name = at > 0 ? item.slice(0, at).trim() : '';
     const id = at > 0 ? item.slice(at + 1).trim() : '';
-    if (!name || !/^[1-9]\d*$/.test(id)) throw new UsageError(`--pin expects NAME=APP_ID (a positive integer), got "${item}"`);
+    // checked after conversion too: a digit string past 2^53 would round, and a long one becomes Infinity
+    if (!name || !/^[1-9]\d*$/.test(id) || !isAppId(Number(id))) throw new UsageError(`--pin expects NAME=APP_ID (a positive integer), got "${item}"`);
     if (!checks.includes(name)) throw new UsageError(`--pin names "${name}", which is not one of the required checks (${checks.join(', ')})`);
     if (PROVENANCE_CHECKS.includes(name)) throw new UsageError(`--pin cannot move "${name}" off GitHub Actions: guard contexts are only trusted from a workflow`);
     pins[name] = Number(id);
@@ -145,14 +148,14 @@ export async function run(argv, ctx) {
   if (checks.length === 0) {
     throw new UsageError('no required checks: pass --checks a,b or set ci.required_checks in .claude/pipeline.yml (the guard contexts are added unless ci.guard_checks is false; protection without required checks would let anything merge)');
   }
-  const explicitPins = values.pin !== undefined ? parsePins(values.pin, checks) : {};
+  const explicitPins = values.pin !== undefined ? parsePins(values.pin, checks) : Object.create(null);
   const gh = createGitHub({ cwd, env: ctx.env });
 
   return guardGh(async () => {
     const { slug, defaultBranch: branch } = gh.repo();
-    const pins = { ...foreignPins(readCurrentProtection(gh, branch, { apply }), checks), ...explicitPins };
+    const pins = Object.assign(Object.create(null), foreignPins(readCurrentProtection(gh, branch, { apply }), checks), explicitPins);
     for (const [name, appId] of Object.entries(pins)) {
-      const source = name in explicitPins ? '--pin' : 'the current protection';
+      const source = Object.hasOwn(explicitPins, name) ? '--pin' : 'the current protection';
       process.stderr.write(`"${name}" stays pinned to app ${appId} (from ${source}): another app posts it, not GitHub Actions.\n`);
     }
     const requests = buildRequests({ slug, branch, checks, pins });

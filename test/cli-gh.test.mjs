@@ -459,8 +459,43 @@ test('readCurrentProtection: the protection JSON, null when there is none to rea
 
 test('foreignPins: only required, non-guard checks pinned to a positive app id other than GitHub Actions', () => {
   const json = protectionWithApps({ a: 15368, b: 8329, c: -1, d: null, 'Hard-stop scan': 42, 'Cross-model review': 42, e: 7, f: '9' });
-  assert.deepEqual(foreignPins(json, ['a', 'b', 'c', 'd', 'Hard-stop scan', 'Cross-model review', 'f']), { b: 8329 });
-  for (const empty of [{}, null, undefined, { required_status_checks: {} }]) assert.deepEqual(foreignPins(empty, ['a']), {});
+  assert.deepEqual({ ...foreignPins(json, ['a', 'b', 'c', 'd', 'Hard-stop scan', 'Cross-model review', 'f']) }, { b: 8329 });
+  for (const empty of [{}, null, undefined, { required_status_checks: {} }]) assert.deepEqual({ ...foreignPins(empty, ['a']) }, {});
+  // an id past 2^53 is not an app id
+  assert.deepEqual({ ...foreignPins(protectionWithApps({ a: 2 ** 53 }), ['a']) }, {});
+});
+
+test('protect: check names that are Object.prototype keys get the Actions pin unless pinned, and keep a pin when they have one', () => {
+  const names = ['constructor', 'toString', '__proto__', 'hasOwnProperty'];
+  const plain = cli(['protect', '--checks', names.join(',')], { repo: repoWith(), fake: createFakeGh([REPO, NOT_PROTECTED]) });
+  assertExit(plain, 0);
+  assert.deepEqual(plain.json.requests[0].body.required_status_checks.checks, names.map((context) => ({ context, app_id: 15368 })));
+  assert.deepEqual(plain.json.pins, {});
+  const pinned = cli(['protect', '--checks', names.join(','), '--pin', '__proto__=8329,constructor=77'], { repo: repoWith(), fake: createFakeGh([REPO, NOT_PROTECTED]) });
+  assertExit(pinned, 0);
+  assert.deepEqual(pinned.json.requests[0].body.required_status_checks.checks.map((c) => c.app_id), [77, 15368, 8329, 15368]);
+  // kept from the current protection too
+  // (rows built by hand: `{ __proto__: n }` in a literal sets the prototype instead of making a key)
+  const current = fullProtection(['__proto__', 'toString']);
+  current.required_status_checks.checks = [{ context: '__proto__', app_id: 8329 }, { context: 'toString', app_id: 15368 }];
+  const kept = cli(['protect', '--checks', '__proto__,toString'], {
+    repo: repoWith(), fake: createFakeGh([REPO, { match: '^api repos/acme/widgets/branches/main/protection$', stdoutJson: current }]),
+  });
+  assert.deepEqual(kept.json.requests[0].body.required_status_checks.checks, [{ context: '__proto__', app_id: 8329 }, { context: 'toString', app_id: 15368 }]);
+  // unpinnedChecks reads own pins only
+  assert.deepEqual(unpinnedChecks({ required_status_checks: { checks: [{ context: 'constructor', app_id: 15368 }] } }, ['constructor']), []);
+});
+
+test('protect --pin: an app id that would round or overflow is refused before any gh call', () => {
+  const fake = createFakeGh([REPO, NOT_PROTECTED]);
+  for (const id of ['9007199254740993', '9'.repeat(309)]) {
+    const r = cli(['protect', '--checks', 'Vercel', '--pin', `Vercel=${id}`], { repo: repoWith(), fake });
+    assertExit(r, 2);
+    assert.match(r.json.message, /--pin expects NAME=APP_ID/);
+  }
+  assert.equal(fake.calls().length, 0);
+  // the largest safe integer is still an app id
+  assertExit(cli(['protect', '--checks', 'Vercel', '--pin', `Vercel=${Number.MAX_SAFE_INTEGER}`], { repo: repoWith(), fake }), 0);
 });
 
 test('protect: checks default to ci.required_checks; none at all is a usage error', () => {
