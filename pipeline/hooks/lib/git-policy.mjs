@@ -1408,6 +1408,41 @@ function jobStartCommands(argv, ctx) {
   return [...new Set([cmd.map(shellQuote).join(' '), cmd.join(' ')])].filter((s) => s.trim());
 }
 
+// Why (#132): the owner's chat words are the pipeline's strongest authority, and whether a nested Claude Code run (`claude -p`, `--resume`,
+// `--continue`, or a bare prompt) could ever be taken for the owner typing is unverified, so an agent's shell may not start or continue a
+// conversation. Only calls that cannot submit a prompt are allowed, and only in these exact shapes; everything else (an unknown option, a
+// word or option only known at run time, a bare `claude`) is refused. The wrappers (command, env, exec, nohup, timeout, xargs, bash -c, $( ),
+// npx / pnpm dlx / bunx) are unwrapped by the parser, so this sees the bare `claude …` it runs.
+const CLAUDE_DENIED = 'an agent may not run the Claude Code CLI with a prompt, -p/--print, --resume or --continue: only the owner starts or continues a conversation (#132)';
+const CLAUDE_NAME = /^claude(?:-code)?$/;
+const CLAUDE_WORD = /(?<![\w.-])claude(?:-code)?(?![\w/-])/i; // (a command name only known at run time on a line that names it; "Claude/…" and ".claude" are paths)
+const CLAUDE_PACKAGE_FILE = /@anthropic-ai[\\/]claude-code|claude-code[\\/](?:cli|bin)/i; // (`node …/@anthropic-ai/claude-code/cli.js -p x`)
+const CLAUDE_LONG_DENIED = new Set(['print', 'resume', 'continue', 'session-id', 'from-pr', 'fork-session', 'teleport', 'remote', 'input-format', 'output-format']);
+const CLAUDE_VERSION_HELP = new Set(['--version', '-v', '-V', '--help', '-h']);
+function claudeVerdict(argv, ctx) {
+  let words = argv.map((a) => expandVars(a, ctx));
+  const head = (w) => baseName(w).replace(/(?<=.)@[^@]*$/, '');
+  if (['node', 'nodejs', 'bun', 'deno'].includes(baseName(words[0]))) {
+    const at = words.slice(1, 6).findIndex((w) => CLAUDE_PACKAGE_FILE.test(w));
+    if (at >= 0) words = ['claude', ...words.slice(at + 2)];
+  }
+  if (baseName(words[0]) === 'alias' && words.slice(1).some((w) => CLAUDE_WORD.test(w))) return deny(CLAUDE_DENIED); // (`alias c=claude`: the short name would hide the run)
+  if (!CLAUDE_NAME.test(head(words[0]))) return null;
+  const args = words.slice(1);
+  const refused = deny(CLAUDE_DENIED);
+  if (args.some((a) => DYNAMIC.test(a))) return refused; // (an option only known at run time may be -p)
+  for (const a of args) {
+    if (a.startsWith('--')) {
+      if (CLAUDE_LONG_DENIED.has(a.slice(2).split('=')[0])) return refused;
+    } else if (/^-[^-]/.test(a) && /[prc]/.test(a.slice(1).split('=')[0])) return refused; // (-p, -r, -c, also grouped: -pc, -rabc)
+  }
+  const [first, second] = args;
+  if ((CLAUDE_VERSION_HELP.has(first) || first === 'doctor') && args.length === 1) return null; // (nothing after it: `claude --help "merge"` is not worth a reading)
+  if (first === 'mcp' && ['list', 'get'].includes(second)) return null;
+  if (first === 'config' && ['list', 'get'].includes(second)) return null;
+  return refused;
+}
+
 // Every directory a command list may run in: where it starts and each cd / pushd target (chained ones too), like files-policy's collectDirs.
 // (startDir null: where the list starts is unknown — a script judged after the line lost its directory — so no place is named; the bare word stays the fallback, see locate)
 function cdTargets(cmds, startDir, ctx) {
@@ -2812,6 +2847,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
+  if (cmds.dynamic && CLAUDE_WORD.test(str)) return deny(CLAUDE_DENIED); // (#132: `C=claude; $C -p x`)
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Rewrite: write the command out literally (`git push origin agent/x`, not `$G push` or `... | sh`); if the guarded words are only text (a commit message, a PR body), put that text in a file (`git commit -F msg.txt`, `gh pr create --body-file body.md`).');
   }
@@ -2927,6 +2963,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
     }
     else {
+      verdict = claudeVerdict(argv, ctx); // (#132: a nested Claude Code conversation)
       for (const inner of jobStartCommands(argv, ctx) ?? []) {
         // Why (#58 round 3): the job runs in THIS command's environment, so its prefix (`GH_REPO=o/chat … job start m -- gh pr merge 8`) names the
         // merge's repository exactly as it would for the merge typed directly.
