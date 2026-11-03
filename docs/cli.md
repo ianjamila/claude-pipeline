@@ -568,8 +568,8 @@ timestamp, to `prune-<repo>.log` in the prune log directory (the last 30 kept; i
 prints only `{ok, summary}` (plus `errors` when a step failed) as one compact JSON line; a run that fails before it has a
 summary prints its usual error object, also on one line.
 
-Exit: 0 completed (also `skipped: "already running"` / `"git operation in progress"`) · 2 usage, repo, config, or the
-`gh` repository does not match `origin` · 3 GitHub unavailable.
+Exit (prune / keep / holding / schedule): 0 completed (also `skipped: "already running"` / `"git operation in progress"`) · 2 usage, repo, config, or the
+`gh` repository does not match `origin` · 3 GitHub unavailable. `sessions`: 0 nothing open · 1 open · 2 usage · 3 unsure (see above).
 
 `schedule` (Linux: cron; macOS: launchd, below) keeps one crontab line per repository, found again by the marker comment
 `# claude-pipeline worktrees-prune <lock name>` at its end: `--install` adds it (or replaces it in place, so installing from the
