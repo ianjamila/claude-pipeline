@@ -8,6 +8,11 @@ import { commandName } from './shell-parse.mjs';
 const APPROVAL = /human-approved|test-change-approved/i;
 const GUARD = /needs-human|pipeline-blocked|awaiting-review|pipeline-pause|pipeline-rollback/i;
 const FORCE_FLAGS = /(?:^|\s)(?:\+\S+|-f|--force\S*|--all|--mirror|--delete)(?=\s|$)/i;
+// #132/#133: a nested Claude Code run written out inside a string an interpreter runs (`python3 -c 'os.system("claude -p hi")'`, `node -e`, `perl -e`, `osascript -e`): the
+// name in command position (a path, "=", whitespace or an opening quote in front; not ".claude", "CLAUDE.md" or "claude-pipeline") followed by -p/-r/-c, --print/--resume/--continue,
+// or (right after a quote) a bare prompt word. The bare word is case-sensitive, so prose ("Claude Code is…") is not read as a prompt.
+const CLAUDE_RUN_FLAGS = /(?:^|[\s=/])claude(?:-code)?\s+(?:-[a-zA-Z]*[prc]\b|--(?:print|resume|continue)\b)/i;
+const CLAUDE_RUN_PROMPT = /["'`]\s*(?:[^\s"'`]*\/)?claude(?:-code)?\s+(?!-)[A-Za-z0-9"']/;
 const PROTECTED_DEST = /(?:^|[\s:+])(?:refs\/heads\/)?(?:main|master)(?=\s|$)/i;
 
 // Readers and tools whose arguments are data, not commands; judged by their own rules or not at all.
@@ -35,7 +40,9 @@ export function guardedCommandText(text) {
     if (APPROVAL.test(seg) && /(?:--add-label|--label|\s-l\s|\blabels?\b|\bgh\b)/i.test(seg)) return 'it adds an owner-only approval label';
     if (GUARD.test(seg) && /(?:--remove-label|\bDELETE\b|-X\s*DELETE|\bremoveLabel)/i.test(seg)) return 'it removes a guard label';
     if (/\bprotect\b.*--apply\b/i.test(seg)) return 'it runs `pipeline protect --apply`';
+    if (CLAUDE_RUN_FLAGS.test(seg)) return 'it runs the Claude Code CLI with a prompt, -p/--print, --resume or --continue (#132)';
   }
+  if (CLAUDE_RUN_PROMPT.test(t)) return 'it runs the Claude Code CLI with a prompt (#132)';
   return null;
 }
 

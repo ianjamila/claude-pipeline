@@ -237,8 +237,12 @@ head you did not review (the receipt names the head the event carried).
   be recorded as you typing is unverified (no agent has probed it, and none may). So guard-git refuses the `claude` CLI from agent
   Bash in every spelling it can resolve (a path, `command`, `env`, `exec`, `nohup`, `timeout`, `xargs`, `bash -c`, `$( )`,
   `npx @anthropic-ai/claude-code`, `pnpm dlx`, `bunx`, `node …/claude-code/cli.js`) unless it is `--version`, `--help`, `doctor`,
-  `mcp list|get` or `config get|list`; an option or name only known at run time is refused too. Residual: a program the guard
-  cannot see into (a script that builds the command at run time) can still start one.
+  `mcp list|get` or `config get|list`; an option or name only known at run time is refused too. A `\` inside the name, `alias` and
+  `hash` bindings, the package's `cli.js` run directly or behind any number of `node` options, and a literal `claude -p …` inside a
+  `python3 -c` / `node -e` / `perl -e` / `osascript -e` string are refused as well. Residuals: a program the guard cannot see into
+  (a script that builds the command at run time, or a name assembled by a format string such as `"$(printf 'cla%s' ude)"`) can
+  still start one, and a native install's versioned binary (`~/.local/share/claude/versions/<v>`, the target of the `claude`
+  symlink) carries no claude name, so running it by that path is not recognised.
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
 - **Quick check locally, CI is the full proof.** The agent runs only `verify.quick` on the changed area; CI runs the full verify, the

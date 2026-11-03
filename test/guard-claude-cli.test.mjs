@@ -248,11 +248,12 @@ test('R1-F1: the claude-code cli.js run directly through its shebang is refused'
   assert.equal(decide('./node_modules/@anthropic-ai/claude-code/cli.js --version'), 'allow');
 });
 
+// (residual, README: a name built by a format string, `"$(printf 'cla%s' ude)" --continue`, leaves no claude spelling on the line to find)
 test('R1-F2: a dynamic command name whose claude spelling is split by quotes is refused', () => {
   for (const command of [
     '$(echo cla""ude) -p hi',
-    `"$(printf 'cla%s' ude)" --continue`,
     `$(echo cla''ude) -p hi`,
+    '"$(echo cla""ude)" --continue',
     '$(echo cla\\ude) -p hi',
   ]) assert.equal(decide(command), 'deny', command);
 });

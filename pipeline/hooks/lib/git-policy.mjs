@@ -1420,13 +1420,23 @@ const CLAUDE_PACKAGE_FILE = /@anthropic-ai[\\/]claude-code|claude-code[\\/](?:cl
 const CLAUDE_LONG_DENIED = new Set(['print', 'resume', 'continue', 'session-id', 'from-pr', 'fork-session', 'teleport', 'remote', 'input-format', 'output-format']);
 const CLAUDE_VERSION_HELP = new Set(['--version', '-v', '-V', '--help', '-h']);
 function claudeVerdict(argv, ctx) {
+  // A backslash inside a word is kept by the parser as a possible Windows path (`clau\de` reads as the file `de`), but a POSIX shell removes it and runs `claude`: judge both readings.
+  const plain = argv.map((a) => a.replace(/\\(.)/g, '$1'));
+  const first = claudeVerdictOf(argv, ctx);
+  if (first !== null || plain.every((a, i) => a === argv[i])) return first;
+  return claudeVerdictOf(plain, ctx);
+}
+function claudeVerdictOf(argv, ctx) {
   let words = argv.map((a) => expandVars(a, ctx));
   const head = (w) => baseName(w).replace(/(?<=.)@[^@]*$/, '');
   if (['node', 'nodejs', 'bun', 'deno'].includes(baseName(words[0]))) {
-    const at = words.slice(1, 6).findIndex((w) => CLAUDE_PACKAGE_FILE.test(w));
+    const at = words.slice(1).findIndex((w) => CLAUDE_PACKAGE_FILE.test(w)); // (any number of runtime options may come first)
     if (at >= 0) words = ['claude', ...words.slice(at + 2)];
-  }
-  if (baseName(words[0]) === 'alias' && words.slice(1).some((w) => CLAUDE_WORD.test(w))) return deny(CLAUDE_DENIED); // (`alias c=claude`: the short name would hide the run)
+  } else if (CLAUDE_PACKAGE_FILE.test(words[0])) words = ['claude', ...words.slice(1)]; // (the package's cli.js run through its shebang)
+  const names = baseName(words[0]);
+  if (names === 'alias' && words.slice(1).some((w) => CLAUDE_WORD.test(w))) return deny(CLAUDE_DENIED); // (`alias c=claude`: the short name would hide the run)
+  // `hash -p /path/claude c` (bash) and `hash c=/path/claude` (zsh) bind a short name to the binary exactly like an alias; `hash claude` alone only looks it up
+  if (names === 'hash' && words.slice(1).some((w) => CLAUDE_WORD.test(w) && (w.includes('=') || words.includes('-p')))) return deny(CLAUDE_DENIED);
   if (!CLAUDE_NAME.test(head(words[0]))) return null;
   const args = words.slice(1);
   const refused = deny(CLAUDE_DENIED);
@@ -2847,7 +2857,9 @@ function evalString(str, startDir, ctx, level, child = false) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
-  if (cmds.dynamic && CLAUDE_WORD.test(str)) return deny(CLAUDE_DENIED); // (#132: `C=claude; $C -p x`)
+  if (cmds.dynamic && !GUARDED_WORDS.test(str) && (CLAUDE_WORD.test(str) || CLAUDE_WORD.test(str.replace(/['"`\\]/g, '')))) { // (#132: `C=claude; $C -p x`, `$(echo cla""ude) -p x`)
+    return deny('the command that runs is only known at run time ($VAR / $(...)) and the line names claude, so it cannot be verified. Rewrite: write the command out literally; if the word is only text (a commit message, a PR body), put that text in a file (`git commit -F msg.txt`, `gh pr create --body-file body.md`).');
+  }
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Rewrite: write the command out literally (`git push origin agent/x`, not `$G push` or `... | sh`); if the guarded words are only text (a commit message, a PR body), put that text in a file (`git commit -F msg.txt`, `gh pr create --body-file body.md`).');
   }
