@@ -403,7 +403,6 @@ pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending
 pipeline state mark-implemented --ids a,b [--repo DIR]
   -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed
      and a non-test file changed since (a test file counts for a testing finding or the finding's own file)
-     (a file counts only when its current content was written by an ordinary, non-merge commit of the PR, not by a merge or the default branch)
 pipeline state record-followup --id ID --url URL [--repo DIR]
 pipeline state set-outcome --outcome TEXT [--repo DIR]
 ```
