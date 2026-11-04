@@ -255,6 +255,41 @@ function baseProofSettings({ root, config }) {
   }
 }
 
+// Dry-run twin of baseProofSettings (P merge --dry-run, owner ruling: no shared git state may change): no fetch, no ref update. The
+// base's .claude/pipeline.yml is read from GitHub's contents API at the PR's baseRefOid, i.e. the very bytes a fetch would give for that
+// commit. The settings' ref AND sha are both that commit: the protected-input scan (diffFiles(ref, 'HEAD')) and the proof check's base
+// must never use a local origin/<base> that may be stale. The commit must also exist locally (the diff needs it): no fetching to get it.
+// Every failure is { ok: false, reason: 'proof-settings-unverified: …' }, never a silent pass.
+function baseProofSettingsReadOnly({ root, config, gh, baseSha }) {
+  const o = { cwd: root };
+  const unverified = (why) => ({ ok: false, reason: `proof-settings-unverified: ${why}` });
+  if (typeof baseSha !== 'string' || !FULL_SHA.test(baseSha)) return unverified('GitHub did not name the base commit of the PR (baseRefOid)');
+  try {
+    git(['cat-file', '-e', `${baseSha}^{commit}`], o);
+  } catch {
+    return unverified(`the PR's base commit ${short(baseSha)} is not in this repository (a dry run does not fetch: fetch it, or run the real merge)`);
+  }
+  let text;
+  try {
+    const reply = JSON.parse(gh.apiText(`repos/${gh.repo().slug}/contents/.claude/pipeline.yml?ref=${baseSha}`, '[.type, .encoding, .content]'));
+    if (!Array.isArray(reply) || reply[0] !== 'file' || reply[1] !== 'base64' || typeof reply[2] !== 'string') return unverified(`GitHub has no readable .claude/pipeline.yml at ${short(baseSha)}`);
+    text = Buffer.from(reply[2], 'base64').toString('utf8');
+  } catch (err) {
+    return unverified(`could not read .claude/pipeline.yml at ${short(baseSha)} from GitHub: ${firstLine(err)}`);
+  }
+  try {
+    const parsed = validateConfig(parseYaml(text));
+    if (!parsed.ok) return unverified(`the base's .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}`);
+    const v = parsed.config.verify;
+    return {
+      ok: true, ref: baseSha, branch: config.default_branch, sha: baseSha,
+      deferrable: v.deferrable_steps ?? [], proof: v.ci_proof ?? {}, inputs: v.ci_proof_inputs ?? [],
+    };
+  } catch (err) {
+    return unverified(`could not parse the base's .claude/pipeline.yml: ${firstLine(err)}`);
+  }
+}
+
 // The first path of the PR diff (against the base, renames on both sides) that is a protected input, else null. Throws when the diff
 // cannot be taken: the caller treats that as ineligible.
 function protectedInputHit({ root, settings }) {
@@ -311,7 +346,8 @@ function sameTreeAs(sha, o) {
 // what the agent reports; a tool hook cannot tell the verify process's own write from a forged one (and the files guard does not
 // cover .verify/ today). What backs it: a step deferred to CI is proved from GitHub (ciProof above), and branch protection requires
 // the CI checks on the merge itself.
-export async function verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs = [] }) {
+// readOnly (P merge --dry-run): the base's proof settings come from GitHub at baseSha, not from a fetch (baseProofSettingsReadOnly).
+export async function verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs = [], readOnly = false, baseSha = null }) {
   let report;
   try {
     report = JSON.parse(readFileSync(resolve(root, config.verify.report), 'utf8'));
@@ -376,7 +412,7 @@ export async function verifyReportCheck({ root, config, head, tree, o, pr, gh, e
     let hit;
     const ctx = {
       root, pr, head, tree, gh, env, ciProof: ciProof ?? defaultCiProof,
-      settings: () => (settings ??= baseProofSettings({ root, config })),
+      settings: () => (settings ??= (readOnly ? baseProofSettingsReadOnly({ root, config, gh, baseSha }) : baseProofSettings({ root, config }))),
       protectedHit: () => {
         if (hit === undefined) {
           try {
@@ -589,10 +625,12 @@ async function safely(name, fn) {
 
 // Runs every check (no short-circuit, so one run reports every problem). A gh failure on the PR lookup itself throws:
 // the caller maps it to exit 3, because without the PR there is nothing to judge.
-export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultSleep, ciProof = defaultCiProof }) {
+// readOnly (P merge --dry-run): changes no shared git state. The only step that does is the deferred-CI proof's base-settings read
+// (a `git fetch` that moves origin/<base>); readOnly reads them from GitHub at the PR's baseRefOid instead.
+export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultSleep, ciProof = defaultCiProof, readOnly = false }) {
   const o = { cwd: root };
   const head = headSha(o);
-  const info = await readPrSettled({ gh, pr, fields: [...PR_FIELDS], sleep, pauseMs: mergeablePause(env) });
+  const info = await readPrSettled({ gh, pr, fields: readOnly ? [...PR_FIELDS, 'baseRefOid'] : [...PR_FIELDS], sleep, pauseMs: mergeablePause(env) });
   const diff = lazyDiff(root, config);
 
   let hash = '';
@@ -616,7 +654,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config }) })),
     await safely('labels', () => labelsCheck(info)),
     await safely('preflight', () => preflightCheck({ root, env, gh })),
-    await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs })),
+    await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs, readOnly, baseSha: info?.baseRefOid ?? null })),
     await safely('hardstops', () => hardstopsCheck({ root, config, diff })),
     await safely('integrity', () => integrityCheck({ config, diff })),
     await safely('review', () => reviewCheck({ root, config, pr, repo, diff, hash, hashError })),
