@@ -174,6 +174,18 @@ test('findClaudeOwner: a node host is recognised by its args; plain commands nev
   assert.deepEqual(argsCalls, ['8'], 'args= asked only for the node process');
 });
 
+test('findClaudeOwner: a background job is owned by its `claude bg-spare` process, not the pty host above it', () => {
+  // Real macOS chain of a Claude Code background job (2026-11-04): the job shell's parent renames itself.
+  const tree = {
+    70: { ppid: 60, comm: '/usr/local/bin/node', args: 'node hook.mjs' },
+    60: { ppid: 55, comm: '/bin/zsh', args: '/bin/zsh -c x' },
+    55: { ppid: 54, comm: 'claude bg-spare', args: 'claude bg-spare --bg-spare /tmp/cc-daemon-501/x/spare/y.claim.sock' },
+    54: { ppid: 1, comm: 'claude bg-pty-host', args: 'claude bg-pty-host --bg-pty-host /tmp/cc-daemon-501/x/spare/y.pty.sock' },
+  };
+  const run = fakePs({ tree, lstart: { 55: LSTART } });
+  assert.equal(findClaudeOwner({ startPid: 70, run, platform: 'darwin', kill: alive }).value.pid, 55);
+});
+
 test('findClaudeOwner: the start pid itself may be claude', () => {
   const run = fakePs({ tree: TREE, lstart: { 30: LSTART } });
   assert.equal(findClaudeOwner({ startPid: 30, run, platform: 'darwin', kill: alive }).value.pid, 30);
