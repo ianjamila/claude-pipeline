@@ -1,0 +1,130 @@
+[
+ {
+  "id": 126485522095,
+  "name": "Typecheck + Vitest",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.example/runs/126485522095",
+  "started_at": "2026-11-04T08:59:17Z",
+  "completed_at": "2026-11-04T08:59:31Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 113269952637
+  }
+ },
+ {
+  "id": 126478395086,
+  "name": "Playwright suite",
+  "status": "completed",
+  "conclusion": "skipped",
+  "html_url": "https://github.example/runs/126478395086",
+  "started_at": "2026-11-04T08:42:36Z",
+  "completed_at": "2026-11-04T08:42:28Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 113269945608
+  }
+ },
+ {
+  "id": 126478381529,
+  "name": "Playwright suite",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.example/runs/126478381529",
+  "started_at": "2026-11-04T08:42:54Z",
+  "completed_at": "2026-11-04T08:54:48Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 113269952498
+  }
+ },
+ {
+  "id": 126477028606,
+  "name": "Vercel Preview Comments",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.example/runs/126477028606",
+  "started_at": "2026-11-04T08:39:22Z",
+  "completed_at": "2026-11-04T08:39:22Z",
+  "app": {
+   "id": 8329,
+   "slug": "vercel"
+  },
+  "check_suite": {
+   "id": 113268533447
+  }
+ },
+ {
+  "id": 126476672841,
+  "name": "Typecheck + Vitest",
+  "status": "completed",
+  "conclusion": "skipped",
+  "html_url": "https://github.example/runs/126476672841",
+  "started_at": "2026-11-04T08:38:31Z",
+  "completed_at": "2026-11-04T08:38:23Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 113268557037
+  }
+ },
+ {
+  "id": 126476616242,
+  "name": "Playwright suite",
+  "status": "completed",
+  "conclusion": "skipped",
+  "html_url": "https://github.example/runs/126476616242",
+  "started_at": "2026-11-04T08:38:23Z",
+  "completed_at": "2026-11-04T08:38:23Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 113268557210
+  }
+ },
+ {
+  "id": 126476613526,
+  "name": "Static guards",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.example/runs/126476613526",
+  "started_at": "2026-11-04T08:38:51Z",
+  "completed_at": "2026-11-04T08:39:45Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 113268557098
+  }
+ },
+ {
+  "id": 126476600123,
+  "name": "Vercel Preview Comments",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.example/runs/126476600123",
+  "started_at": "2026-11-04T08:38:21Z",
+  "completed_at": "2026-11-04T08:38:21Z",
+  "app": {
+   "id": 8329,
+   "slug": "vercel"
+  },
+  "check_suite": {
+   "id": 113268533447
+  }
+ }
+]

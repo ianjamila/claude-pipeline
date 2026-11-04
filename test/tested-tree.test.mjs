@@ -180,7 +180,9 @@ test('the test jobs open with the skip step, push only, naming their own job (ub
     for (const after of steps.slice(at + 1)) {
       // The one exception: the shard job's installer round trip runs in shard 3 only, and keeps the skip gate too.
       const shard3Only = after.includes('installer-round-trip.sh') && block.startsWith('test-windows-shard:');
-      const want = shard3Only ? `if: matrix.shard == 3 && (${gated})` : `if: ${gated}`;
+      // ...and the shard job's file-times print runs even after a red Tests step (always()), so a failing shard still reports its times.
+      const fileTimes = after.includes('CP-FILE-TIMES-BEGIN') && block.startsWith('test-windows-shard:');
+      const want = shard3Only ? `if: matrix.shard == 3 && (${gated})` : fileTimes ? `if: always() && (${gated})` : `if: ${gated}`;
       assert.ok(after.split('\n').some((l) => l.trim() === want), `${after.split('\n')[0]}: expected "${want}"`);
     }
   }

@@ -543,7 +543,7 @@ function main(argv, env) {
       return 2;
     }
     if (hasClaudeCodeAncestor()) {
-      process.stderr.write('install.mjs refuses to run inside a Claude Code session (a Claude Code process is an ancestor of this one, whatever CLAUDECODE says): run this in your own terminal, or start Claude with PIPELINE_ADMIN=1.\n');
+      process.stderr.write('install.mjs refuses to run inside a Claude Code session (a Claude Code process is an ancestor of this one, whatever CLAUDECODE says): close Claude Code or retry, run this in your own terminal, or start Claude with PIPELINE_ADMIN=1.\n');
       return 2;
     }
   }

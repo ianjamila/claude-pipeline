@@ -1,0 +1,34 @@
+[
+ {
+  "id": 125780666822,
+  "name": "Playwright suite",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.example/runs/125780666822",
+  "started_at": "2026-11-03T07:16:14Z",
+  "completed_at": "2026-11-03T07:34:42Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 112705781917
+  }
+ },
+ {
+  "id": 125773117764,
+  "name": "Playwright suite",
+  "status": "completed",
+  "conclusion": "failure",
+  "html_url": "https://github.example/runs/125773117764",
+  "started_at": "2026-11-03T06:54:17Z",
+  "completed_at": "2026-11-03T07:13:58Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 112705781917
+  }
+ }
+]

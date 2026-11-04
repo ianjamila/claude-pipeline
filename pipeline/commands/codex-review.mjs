@@ -14,6 +14,7 @@
 // `resolutionOnly`: a real review that does not count toward the round cap. The state is
 // read-modified-written under the per-PR lock, but the lock is NOT held while Codex runs (up to 30 minutes): the
 // state is read again under the lock once Codex has answered, and a round recorded in the meantime wins.
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
@@ -295,6 +296,11 @@ export const run = guarded(async (argv, ctx) => {
   });
 
   const hashAtHead = currentContentHash(root, config);
+  // The exact bytes Codex gets on stdin. Saved as round-<R>/prompt.md BEFORE Codex starts (so a timed-out or crashed round keeps it)
+  // from this same buffer, and its sha256 goes into the round record: the hash is of what was sent, not of a re-serialisation.
+  // A base-only round asks nothing, so it has neither.
+  const promptBytes = Buffer.from(prompt, 'utf8');
+  const promptSha256 = baseOnly ? undefined : createHash('sha256').update(promptBytes).digest('hex');
 
   const headMoved = () => new Fail(EXIT.USAGE, { ok: false, error: 'head-moved', message: 'HEAD moved while Codex was reviewing; run the round again' });
   // Runs Codex over the prepared prompt and returns its validated findings (every failure is an exit-3 Fail).
@@ -306,7 +312,8 @@ export const run = guarded(async (argv, ctx) => {
     const { cmd, prefixArgs } = codexCommand(ctx.env);
     const timeoutMs = Number(ctx.env?.PIPELINE_CODEX_TIMEOUT_MS) || CODEX_TIMEOUT_MS;
     // On a timeout the whole process tree is killed, so a helper Codex started cannot write its answer afterwards.
-    const r = await runAsync(cmd, [...prefixArgs, ...args], { cwd: root, env: ctx.env, input: prompt, timeoutMs });
+    writeFileAtomic(path.join(dir, 'prompt.md'), promptBytes);
+    const r = await runAsync(cmd, [...prefixArgs, ...args], { cwd: root, env: ctx.env, input: promptBytes, timeoutMs });
     // A spawn failure is reported as stderr "spawn <cmd> ENOENT"; classify it as the missing binary it is.
     const spawnError = /^spawn(?:Sync)? .*\bENOENT\b/.test(r.stderr) ? { code: 'ENOENT', message: r.stderr } : undefined;
     if (r.code !== 0 || r.timedOut) {
@@ -395,7 +402,7 @@ export const run = guarded(async (argv, ctx) => {
     const reasons = lane.reasons.length > 0 ? lane.reasons : ['reviewed by Fable in an earlier round'];
     const next = addRound({ ...base0, risk: level, lightLane: reviewer === 'fable' ? false : lightLane, reviewer, currentContentHash: hashAtHead }, {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled,
-      reviewBase: review.base, reviewBaseKind: review.kind, forkPoint, codexModel: model, ...(baseOnly ? { baseOnly: true } : {}),
+      reviewBase: review.base, reviewBaseKind: review.kind, forkPoint, codexModel: model, ...(promptSha256 === undefined ? {} : { promptSha256 }), ...(baseOnly ? { baseOnly: true } : {}),
       ...(admission === 'uncounted' ? {} : { admission }), ...(ownerGrant === undefined ? {} : { ownerGrant }),
       ...(resolutionOnly ? { resolutionOnly: true, ...resolutionView } : {}),
       ...(reviewer === 'fable' && !baseOnly ? { fableRequired: true, fableReasons: reasons, sensitivePaths: lane.sensitivePaths.slice(0, 50) } : {}),

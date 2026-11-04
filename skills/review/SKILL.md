@@ -123,17 +123,26 @@ final gate re-prove the grant from the owner's record on this machine, so finish
    the code needs another round and another `review-complete`.
 2. Only after that exit 0. If the head changed since 1.5 ran (any review fix), re-run 1.5 on it first: the label below, the CI reading and 3's ending use its notes.
    High risk (1.5's `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured); then `gh pr ready N`.
-   CI runs now and is the full proof. Checks can take a few seconds to appear (`gh pr checks --watch` exits 1 "no checks reported"), so poll first:
-   `P job start ci -- bash -c 'for i in 1 2 3 4 5 6 7 8 9 10 11 12; do gh pr checks N --required >/dev/null 2>&1; [ $? -ne 1 ] && break; sleep 10; done; gh pr checks N --watch --required'`,
-   then `P job wait ci …`. `owner_approval: label` with a blocking item noted at 1.5: the guard checks reporting just those items are
-   expected to be red — that is not a fix target: park (section 2) once the other checks are green.
-   Any other red ⇒ implementer fix, push, back to step 1 of this section. Base moved ⇒ `P update-branch --pr N`, `git pull --ff-only`, review again if content changed.
+   CI runs now and is the full proof. Wait with `P job start ci -- node ~/.claude/pipeline/bin/pipeline.mjs ci-wait --pr N`, then
+   `P job wait ci --run-id <runId> …` again until it is done. Never `gh pr checks --watch` here: right after `gh pr ready` a required
+   check's only result is the draft-era SKIPPED one, which `gh` counts as passed (Phase 6: hand-off 14 min early); ci-wait waits for
+   every required check of the base branch to report after the PR became ready. Its `verdict` when not ok: `failed` ⇒ implementer fix
+   (below); `head-moved` / `base-changed` ⇒ back to step 1 of this section; `missing` / `stale-skipped` (a required check never ran on the ready event),
+   `unverified` (branch protection or rules unreadable), `no-required-checks`, `timeout` ⇒ tell the owner in plain English, with the
+   check names, and wait. `owner_approval: label` with a blocking item noted at 1.5: run it with `--wait-all`; the guard checks
+   reporting just those items are expected to be red — that is not a fix target: park (section 2) once ci-wait shows every other check
+   green. Any other red ⇒ implementer fix, push, back to step 1 of this section. Base moved ⇒ `P update-branch --pr N`, `git pull --ff-only`, review again if content changed.
 3. **STOP** (outcome `awaiting-owner-merge`; `owner_approval: label` with a blocking item parks instead, no merge request): run the stop ritual first, then tell the owner in plain English what changed, the PR link, the review outcome and
    follow-up issues. Which ending depends on the item note from 1.5 (as refreshed in step 2):
    - **Any `blocking` / `ownerMerge` / test-integrity item** (always the case for a protected-area PR under `owner_approval: chat`): NO `Head …` / `🔀` lines
      (`P merge --owner-go` refuses such a diff) and no `needs-human` label. Say the PR is reviewed and CI is green, name the protected areas it touches
      (from `.review/hardstops.json` and `P integrity`), and give the repo's `merge.command` from `P config` with `{pr}` = N and `{sha}` = the head sha
      filled in (EagleWatch: `npm run merge -- <PR> --expect-head <sha>`) for the owner to run.
+   - Any owner command that starts with `gh` is written with gh's absolute path, shell-quoted (`/opt/homebrew/bin/gh …` on this kind of
+     Mac, else `/usr/local/bin/gh`; `command -v gh` when it answers): the owner's `!` prompt shell does not load the PATH that has gh.
+   - To preview the verdict before the owner's word, use only `P merge --pr N --dry-run` (add `--owner-go` for that route): it runs the
+     same checks, writes and merges nothing, and its `ownerStep` says which of the two endings above applies. Never run the repo's own
+     merge command (`npm run merge …`, even with `--dry-run`) to preview: the git guard refuses it, and the dry run grants nothing.
    - **No such item**: the reply's LAST two lines are exactly (sha12 = first 12 characters of `git rev-parse HEAD`; owner/name from
      `gh repo view --json nameWithOwner`; the digest is `none` on the `--owner-go` route):
      `Head <sha12> · items <digest> · repo <owner/name>`
