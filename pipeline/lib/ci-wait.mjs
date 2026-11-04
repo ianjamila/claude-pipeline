@@ -86,6 +86,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   const elapsed = () => clock.now() - start;
 
   let head = null;
+  let base = null; // the base branch the cached policy sources were read for; a retarget (same head) invalidates them
   let last = { identities: [], states: [], readyAt: null };
   const sources = { classic: null, rules: null };
   const suiteCache = new Map();
@@ -201,16 +202,20 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     };
   };
 
+  const baseChanged = (now) => result(EXIT.FAILED, 'base-changed', { message: `the base branch changed from ${base} to ${now}: the required checks are those of the new base, so the wait must restart`, newBase: now ?? null });
+
   const poll = async () => {
     readyAtMemo = undefined;
     const pr = await readers.pr();
     last = { ...last, pr };
     if (head === null) {
       head = pr.head;
+      base = pr.base ?? null;
       if (pr.isDraft) return result(EXIT.USAGE, 'draft', { message: 'the PR is a draft: run `gh pr ready` first' });
     } else {
       if (pr.head !== head) return result(EXIT.FAILED, 'head-moved', { message: `the head moved from ${head} to ${pr.head}`, newHead: pr.head });
       if (pr.isDraft) return result(EXIT.FAILED, 'draft', { message: 'the PR went back to draft' });
+      if ((pr.base ?? null) !== base) return baseChanged(pr.base);
     }
 
     // The required set: two independent policy sources, each read until it answers present or absent.
@@ -288,6 +293,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     const again = await readers.pr();
     if (again.head !== head) return result(EXIT.FAILED, 'head-moved', { message: `the head moved from ${head} to ${again.head}`, newHead: again.head });
     if (again.isDraft) return result(EXIT.FAILED, 'draft', { message: 'the PR went back to draft' });
+    if ((again.base ?? null) !== base) return baseChanged(again.base);
     if (unverified) return unverifiedResult();
     return result(EXIT.OK, 'passed');
   };

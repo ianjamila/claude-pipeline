@@ -22,10 +22,17 @@ const at = (v, t) => (typeof v === 'function' ? v(t) : v);
 function sim(world, options = {}) {
   let t = 0;
   const calls = [];
+  const reads = { classic: [], rules: [] }; // the base each policy read asked for
   const readers = {
     pr: async () => at(world.pr ?? PR, t / 1000),
-    classic: async () => at(world.classic, t / 1000),
-    rules: async () => at(world.rules ?? [], t / 1000),
+    classic: async (base) => {
+      reads.classic.push(base);
+      return at(world.classic, t / 1000);
+    },
+    rules: async (base) => {
+      reads.rules.push(base);
+      return at(world.rules ?? [], t / 1000);
+    },
     checkRuns: async () => at(world.checkRuns ?? [], t / 1000),
     statuses: async () => at(world.statuses ?? [], t / 1000),
     timeline: async () => at(world.timeline ?? [], t / 1000),
@@ -42,6 +49,7 @@ function sim(world, options = {}) {
     elapsed: () => t,
     progress,
     suiteCalls: calls,
+    reads,
   };
 }
 
@@ -411,6 +419,32 @@ test('the PR is re-read before a success: a head that moves right at the end is 
   const r = await sim(world).run();
   assert.equal(r.output.verdict, 'head-moved');
   assert.equal(r.exitCode, 1);
+});
+
+// A retarget keeps the head but changes which branch's protection decides the required set: the cached one is no longer the right one.
+test('the base branch changing mid-wait (same head) => `base-changed` (exit 1), not a verdict from the old required set', async () => {
+  const s = sim({ pr: (t) => ({ ...PR, base: t >= 15 ? 'release' : 'main' }), classic: present('A'), checkRuns: [cr('A', null)] });
+  const r = await s.run();
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.verdict, 'base-changed');
+  assert.equal(r.output.head, HEAD);
+  assert.match(r.output.message, /main.*release/);
+  assert.deepEqual(s.reads.classic, ['main'], 'no policy read for the new base: the wait restarts');
+});
+
+test('the base branch changing only at the final reread before a success => `base-changed`, not a pass', async () => {
+  let reads = 0;
+  const r = await sim({ classic: present('A'), checkRuns: [cr('A', 'success')], pr: () => ({ ...PR, base: (reads += 1) >= 2 ? 'release' : 'main' }) }).run();
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.verdict, 'base-changed');
+});
+
+test('an unchanged base keeps the cached required set: one classic and one rules read over the whole wait', async () => {
+  const s = sim({ classic: present('A'), checkRuns: (t) => [cr('A', t < 45 ? null : 'success')] });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed');
+  assert.deepEqual(s.reads.classic, ['main']);
+  assert.deepEqual(s.reads.rules, ['main']);
 });
 
 // ---- the required set --------------------------------------------------------------------------
