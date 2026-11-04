@@ -98,3 +98,4 @@ full record.
 - 2026-11-03 · #143 · fix(stacks): bound the gather's git worktree list by its deadline (#130) + pipeline worktrees sessions DIR · risk high · rounds 3 · arbiter 1 · awaiting-owner-merge
 - 2026-11-03 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 4 · arbiter 4 · needs-human
 - 2026-11-04 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 5 · arbiter 5 · needs-human
+- 2026-11-04 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 6 · arbiter 6 · needs-human
