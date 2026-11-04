@@ -509,11 +509,11 @@ const OWNER_RULED_SHOWN = 5;
 const OWNER_QUOTE_SHOWN = 100;
 
 // `repo`: the PR's repository (the gh repo). `ownerGo`: { home, now } for the owner's records, tests only (default: the account's own folder).
-export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, ownerGo = {} }) {
+export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, ownerGo = {}, readOnly = false }) {
   const d = diff();
   if (!d.ok) return check('review', false, `could not diff against the base: ${d.error}`);
   if (isLogOnly(d.files, config.agent_log)) return check('review', true, 'log-only');
-  const state = loadState(root); // a corrupt state throws: caught by the caller as a failed check
+  const state = loadState(root, { cleanup: !readOnly }); // a corrupt state throws: caught by the caller as a failed check
   if (!state) return check('review', false, 'no review state at .review/state.json');
   if (!(Number.isInteger(state.pr) && state.pr > 0)) return check('review', false, `review state records no valid PR number (${JSON.stringify(state.pr)}), expected #${pr}`);
   if (state.pr !== pr) return check('review', false, `review state is for PR #${state.pr}, not #${pr}`);
@@ -657,7 +657,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs, readOnly, baseSha: info?.baseRefOid ?? null })),
     await safely('hardstops', () => hardstopsCheck({ root, config, diff })),
     await safely('integrity', () => integrityCheck({ config, diff })),
-    await safely('review', () => reviewCheck({ root, config, pr, repo, diff, hash, hashError })),
+    await safely('review', () => reviewCheck({ root, config, pr, repo, diff, hash, hashError, readOnly })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
   ];
 

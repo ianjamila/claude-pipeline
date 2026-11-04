@@ -4,7 +4,7 @@
 // other merge tests; this file only asserts the dry run.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertExit } from './helpers/assert-exit.mjs';
@@ -68,6 +68,11 @@ test('dry run, clean PR: wouldMerge, exit 0, ZERO write calls to gh, nothing und
   const s = setup({});
   s.fake.setScript(script(s));
   assertExit(s.gate(), 0);
+  // A crashed save's tmp file, over an hour old: a real run's loadState deletes it, a dry run must leave it (it writes and deletes nothing).
+  const strayTmp = join(s.repo.dir, '.review', 'state.json.4242.deadbeef.tmp');
+  writeFileSync(strayTmp, '{}');
+  const aged = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  utimesSync(strayTmp, aged, aged);
   const before = { review: snapshot(s.repo.dir), refs: s.repo.git(['for-each-ref']), calls: s.fake.calls().length };
   const d = dry(s);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
@@ -75,6 +80,7 @@ test('dry run, clean PR: wouldMerge, exit 0, ZERO write calls to gh, nothing und
   assert.equal(d.r.json.ownerStep, null, 'a low-risk review: P merges by itself');
   assert.deepEqual(d.writes, [], 'no update-branch, comment, label or merge call');
   assert.deepEqual(snapshot(s.repo.dir), before.review);
+  assert.ok(existsSync(strayTmp), 'the aged stray tmp file survives a dry run');
   assert.equal(s.repo.git(['for-each-ref']), before.refs);
   assert.deepEqual(s.mergeCalls(), [], 'the merge command never ran');
   noGitWrites(d);

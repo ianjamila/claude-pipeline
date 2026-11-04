@@ -376,7 +376,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   } else {
     let lowRisk = false;
     try {
-      lowRisk = !ownerGo && loadState(root)?.risk === 'low';
+      lowRisk = !ownerGo && loadState(root, { cleanup: false })?.risk === 'low';
     } catch { /* an unreadable review state is not a low-risk one */ }
     if (!lowRisk) ownerStep = { kind: 'say-merge', line: `Head ${head.slice(0, 12)} · items ${ownerGo ? 'none' : (live.ownerItems ?? 'none')} · repo ${slug}` };
   }

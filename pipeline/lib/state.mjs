@@ -58,9 +58,10 @@ function removeStrayTmpFiles(reviewDir) {
   }
 }
 
-export function loadState(dir) {
+// cleanup: false (P merge --dry-run) reads without deleting stray tmp files: a dry run writes and removes nothing.
+export function loadState(dir, { cleanup = true } = {}) {
   const file = stateFile(dir);
-  removeStrayTmpFiles(join(dir, '.review'));
+  if (cleanup) removeStrayTmpFiles(join(dir, '.review'));
   let text;
   try {
     text = readFileSync(file, 'utf8');
