@@ -164,6 +164,11 @@ merges (PRs still get built, verified and reviewed). Agents cannot close it. An 
 
 Hard-stop PRs still go through the full review loop first, so you always get a reviewed PR.
 
+Commands the agent hands you to run (a merge command, `pipeline protect` lines) are written with `gh`'s absolute path
+(`/opt/homebrew/bin/gh …`): a command typed at Claude Code's `!` prompt runs in a shell that does not load your login PATH, so a bare
+`gh` is "command not found" there. To see whether a PR would merge without merging it, the agent runs `pipeline merge --pr N
+--dry-run`; it changes nothing and grants nothing.
+
 ## Enforcement — what stops what
 
 | Guarantee | GitHub (Pro) | CI | Global hook | Skill / CLI |

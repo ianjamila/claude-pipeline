@@ -50,6 +50,18 @@ test('the shard job runs shards 1..3 of 3 on Windows with Node 24 and does not c
   assert.equal(node[0].with['node-version'], 24);
 });
 
+test('each Windows shard records per-file times and prints them between marker lines even when the tests failed', () => {
+  const tests = shardJob.steps.find((s) => s.run === 'node scripts/test.mjs --shard ${{ matrix.shard }}/3');
+  assert.equal(tests.env.CP_TEST_TIMES, '${{ runner.temp }}/cp-file-times.json');
+  const print = shardJob.steps.find((s) => String(s.run).includes('CP-FILE-TIMES-BEGIN'));
+  assert.ok(print, 'a step prints the times');
+  assert.equal(print.env.CP_TEST_TIMES, tests.env.CP_TEST_TIMES, 'it reads the file the tests wrote');
+  assert.match(print.if, /^always\(\) && /, 'a red shard still reports its times');
+  assert.ok(shardJob.steps.indexOf(print) > shardJob.steps.indexOf(tests));
+  assert.ok(print.run.indexOf('CP-FILE-TIMES-BEGIN') < print.run.indexOf('CP-FILE-TIMES-END'));
+  assert.equal(print.shell, undefined, 'no step overrides the workflow-wide bash default (self-verify)');
+});
+
 test('the installer round trip runs on Windows in shard 3 only', () => {
   const installer = shardJob.steps.filter((s) => String(s.run).includes('installer-round-trip.sh'));
   assert.equal(installer.length, 1);

@@ -1,0 +1,41 @@
+{
+ "113268557037": [
+  {
+   "id": 41801056230,
+   "name": "Typecheck + Unit tests",
+   "event": "pull_request",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-04T08:38:22Z",
+   "run_attempt": 1,
+   "check_suite_id": 113268557037,
+   "path": ".github/workflows/checks.yml"
+  }
+ ],
+ "113269952637": [
+  {
+   "id": 41801571640,
+   "name": "Typecheck + Unit tests",
+   "event": "pull_request",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-11-04T08:42:29Z",
+   "run_attempt": 1,
+   "check_suite_id": 113269952637,
+   "path": ".github/workflows/checks.yml"
+  }
+ ],
+ "113268557098": [
+  {
+   "id": 41801056257,
+   "name": "Static guards",
+   "event": "pull_request",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-11-04T08:38:22Z",
+   "run_attempt": 1,
+   "check_suite_id": 113268557098,
+   "path": ".github/workflows/static-guards.yml"
+  }
+ ]
+}

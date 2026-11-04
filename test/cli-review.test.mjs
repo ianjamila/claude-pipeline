@@ -3969,3 +3969,41 @@ test('review-complete: refuses the marker when an owner-granted round cannot be 
   assert.match(refused.json.reason, /round 3: owner grant cannot be verified on this machine — run the gate on the machine that reviewed it/);
   assert.equal(postedBodies(w).length, 1, 'no second review-complete comment');
 });
+
+// ---- codex-review saves the prompt it sent (round-<R>/prompt.md + promptSha256) ----------------------------------------
+
+test('codex-review: round-R/prompt.md holds exactly the bytes Codex received on stdin, and the round records their sha256', (t) => {
+  const w = world(t);
+  const r = w.codex(1, standardFindings());
+  assertExit(r, 0, r.stderr + r.stdout);
+  const saved = readFileSync(w.roundFile(1, 'prompt.md'));
+  assert.deepEqual(saved, Buffer.from(w.captured()[0].stdin, 'utf8'), 'prompt.md is the stdin Codex got');
+  assert.equal(w.state().rounds[0].promptSha256, createHash('sha256').update(saved).digest('hex'));
+  assert.match(saved.toString('utf8'), /PR: #7/);
+});
+
+test('codex-review: a high-risk (sensitive-path) round saves the prompt with the attacker brief', (t) => {
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT], yml: SENSITIVE_YML });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const saved = readFileSync(w.roundFile(1, 'prompt.md'), 'utf8');
+  assert.match(saved, /## Attacker's brief[\s\S]*```sensitive paths\nsrc\/a\.js\n```/);
+  assert.equal(w.state().rounds[0].promptSha256, sha256(saved));
+});
+
+test('codex-review: a round whose Codex run fails still keeps prompt.md (it is written before Codex starts), and no round is recorded', (t) => {
+  const w = world(t);
+  const r = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '2', FAKE_CODEX_STDERR: 'segfault' } });
+  assertExit(r, 3);
+  assert.deepEqual(readFileSync(w.roundFile(1, 'prompt.md')), Buffer.from(w.captured()[0].stdin, 'utf8'));
+  assert.ok(!existsSync(join(w.repo.dir, '.review', 'state.json')), 'no state was written for the failed round');
+});
+
+test('codex-review: a base-only round (Codex not run) has no prompt.md and no promptSha256', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' });
+  assertExit(w.codex(2, findingsOf([finding()]), { from: w.head, to: merged }), 0);
+  assert.ok(!existsSync(w.roundFile(2, 'prompt.md')));
+  assert.equal(Object.hasOwn(w.state().rounds[1], 'promptSha256'), false);
+  assert.equal(w.state().rounds[0].promptSha256.length, 64);
+});

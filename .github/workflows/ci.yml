@@ -91,8 +91,10 @@ jobs:
     uses: ./.github/workflows/proof-anchor.yml
 
   # The Windows suite is slow (~30-36 min as one job), so it runs as three shards in parallel: node scripts/test.mjs
-  # --shard I/3 gives each runner a size-balanced third of the test files. One Node version on Windows: Node 24, the
-  # current LTS line and what the actions themselves run on. Node 20 stays covered on ubuntu.
+  # --shard I/3 gives each runner a third of the test files balanced by measured time (scripts/lib/test-weights.json, refreshed
+  # with scripts/shard-weights.mjs from the file times printed below; files not measured yet are balanced by size).
+  # One Node version on Windows: Node 24, the current LTS line and what the actions themselves run on. Node 20 stays covered
+  # on ubuntu.
   test-windows-shard:
     name: test (windows ${{ matrix.shard }}/3)
     runs-on: windows-latest
@@ -131,6 +133,18 @@ jobs:
       - name: Tests (Node 24, shard ${{ matrix.shard }}/3)
         if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         run: node scripts/test.mjs --shard ${{ matrix.shard }}/3
+        env:
+          CP_TEST_TIMES: ${{ runner.temp }}/cp-file-times.json
+      # Per-file wall-clock times of this shard, between marker lines, for scripts/shard-weights.mjs to read from the job log.
+      - name: File times (shard ${{ matrix.shard }}/3)
+        if: always() && (github.event_name != 'push' || steps.tested.outputs.run != 'false')
+        env:
+          CP_TEST_TIMES: ${{ runner.temp }}/cp-file-times.json
+        run: |
+          echo CP-FILE-TIMES-BEGIN
+          cat "$CP_TEST_TIMES" || true
+          echo
+          echo CP-FILE-TIMES-END
       # The installer round trip is one script, not a shard of the suite: it runs once, in shard 3.
       - name: Installer round trip (Node 24)
         if: matrix.shard == 3 && (github.event_name != 'push' || steps.tested.outputs.run != 'false')

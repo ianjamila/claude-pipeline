@@ -1,0 +1,50 @@
+[
+ {
+  "id": 126545012329,
+  "name": "Typecheck + Vitest",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.example/runs/126545012329",
+  "started_at": "2026-11-04T11:30:01Z",
+  "completed_at": "2026-11-04T11:30:13Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 113317632608
+  }
+ },
+ {
+  "id": 126539552566,
+  "name": "Vercel Preview Comments",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.example/runs/126539552566",
+  "started_at": "2026-11-04T11:15:55Z",
+  "completed_at": "2026-11-04T11:15:55Z",
+  "app": {
+   "id": 8329,
+   "slug": "vercel"
+  },
+  "check_suite": {
+   "id": 113317613385
+  }
+ },
+ {
+  "id": 126539015176,
+  "name": "Static guards",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.example/runs/126539015176",
+  "started_at": "2026-11-04T11:14:56Z",
+  "completed_at": "2026-11-04T11:15:38Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 113317632778
+  }
+ }
+]
