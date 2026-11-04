@@ -8,6 +8,10 @@ import { GhError } from '../lib/proc.mjs';
 import { loadConfig, requiredChecks, PROVENANCE_CHECKS } from '../lib/config.mjs';
 import { createGitHub, classifyApiError, encodePath, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
 import { protectionMissing } from '../lib/preflight.mjs';
+import { isAppId, readCurrentProtection } from '../lib/protection.mjs';
+
+// kept importable from here: the reader moved to lib/protection.mjs so ci-wait shares it
+export { readCurrentProtection };
 
 export const meta = {
   summary: 'print (or with --apply, set) the GitHub branch protection and repo settings the pipeline relies on',
@@ -26,7 +30,6 @@ export const GITHUB_ACTIONS_APP_ID = 15368;
 // The app a required check must be posted by: its own pin, else GitHub Actions. Own properties only, and the pin maps have
 // no prototype, so a check named `constructor` or `__proto__` can never pick up an inherited value.
 const appFor = (context, pins) => (pins && Object.hasOwn(pins, context) ? pins[context] : GITHUB_ACTIONS_APP_ID);
-const isAppId = (n) => Number.isSafeInteger(n) && n > 0;
 
 // The checks the current protection pins to an app other than GitHub Actions (a positive app id; -1 or null means "any app"),
 // among the ones being required. Guard contexts are left out: they are only ever trusted from GitHub Actions.
@@ -113,20 +116,6 @@ async function resolveChecks(values, root) {
   if (!cfg.ok) throw new UsageError(`cannot read the required checks from the config (${cfg.errors.join('; ')}); pass --checks a,b`);
   // Same list preflight demands, so what --apply sets is exactly what preflight later reads back as complete.
   return requiredChecks(cfg.config.ci);
-}
-
-// The branch's protection as it stands, or null when there is none to read (not protected yet; no admin rights or plan, which
-// the write itself then reports). Any other failure: a dry run prints the commands without kept pins and says so; --apply
-// stops, because writing without the current pins would move a deploy provider's check onto GitHub Actions and block every PR.
-export function readCurrentProtection(gh, branch, { apply }) {
-  try {
-    const p = gh.protection(branch);
-    return p.status === 200 ? p.json : null;
-  } catch (err) {
-    if (apply || !(err instanceof GhError)) throw err;
-    process.stderr.write(`could not read the current protection (${String(err.message).split('\n')[0]}): no check keeps a non-Actions pin unless --pin names it.\n`);
-    return null;
-  }
 }
 
 const PLAN_MESSAGE = 'GitHub Pro required for private repos: branch protection is not available on this plan. Upgrade (or make the repo public), then run this again.';
