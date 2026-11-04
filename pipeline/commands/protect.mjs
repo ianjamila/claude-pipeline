@@ -4,7 +4,7 @@
 // which needs admin rights, so it refuses unless the session was started with PIPELINE_ADMIN=1: an agent
 // session must never be able to loosen or tighten the repo's protection on its own.
 import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
-import { GhError } from '../lib/proc.mjs';
+import { GhError, findOnPosixPath, overrideCommand } from '../lib/proc.mjs';
 import { loadConfig, requiredChecks, PROVENANCE_CHECKS } from '../lib/config.mjs';
 import { createGitHub, classifyApiError, encodePath, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
 import { protectionMissing } from '../lib/preflight.mjs';
@@ -99,11 +99,23 @@ export function buildRequests({ slug, branch, checks, pins = {} }) {
   ];
 }
 
-const shellWord = (s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+// POSIX sh quoting: a plain word stays bare, anything else is single-quoted (a ' becomes '\'').
+export const shellWord = (s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+
+// The word that starts a printed owner command. The owner pastes these into a `!` shell whose PATH can lack gh (brew's
+// /opt/homebrew/bin), so on POSIX it is the absolute path of the gh found on PATH, else in the fixed fallback dirs (the same
+// lookup the pipeline's own gh calls use), quoted for sh. Windows and "gh not found anywhere" keep the bare `gh`; so does the
+// PIPELINE_GH test seam, whose fake the owner's shell would not have.
+export function ghCommandWord(env = process.env, { platform = process.platform, fallbackDirs } = {}) {
+  if (platform === 'win32') return 'gh';
+  if (overrideCommand('PIPELINE_GH', 'gh', env).cmd !== 'gh') return 'gh';
+  const found = findOnPosixPath('gh', env?.PATH, fallbackDirs);
+  return found ? shellWord(found) : 'gh';
+}
 
 // A copy-pasteable shell command: the JSON body goes in through a quoted heredoc, so nothing in it is expanded.
-export function toCommand({ method, path, body }) {
-  return `gh api -X ${method} ${shellWord(path)} --input - <<'JSON'\n${JSON.stringify(body, null, 2)}\nJSON`;
+export function toCommand({ method, path, body }, ghWord = 'gh') {
+  return `${ghWord} api -X ${method} ${shellWord(path)} --input - <<'JSON'\n${JSON.stringify(body, null, 2)}\nJSON`;
 }
 
 function parseChecks(raw) {
@@ -148,7 +160,8 @@ export async function run(argv, ctx) {
       process.stderr.write(`"${name}" stays pinned to app ${appId} (from ${source}): another app posts it, not GitHub Actions.\n`);
     }
     const requests = buildRequests({ slug, branch, checks, pins });
-    const commands = requests.map(toCommand);
+    const ghWord = ghCommandWord(ctx.env);
+    const commands = requests.map((req) => toCommand(req, ghWord));
 
     if (!apply) {
       process.stderr.write(`dry run: nothing was changed. Run these as an admin of ${slug}, or re-run with --apply in a PIPELINE_ADMIN=1 session.\n`);
