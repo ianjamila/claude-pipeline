@@ -385,6 +385,7 @@ test('inside Claude Code means CLAUDECODE or a Claude Code ancestor process: str
   const blocked = install(home, [], { psTable: withClaude });
   assert.equal(blocked.status, 2, blocked.stderr);
   assert.match(blocked.stderr, /ancestor/);
+  assert.match(blocked.stderr, /close Claude Code or retry/, 'a recycled PID on Windows can look like Claude Code: the message says how out');
   assert.match(blocked.stderr, /PIPELINE_ADMIN=1/);
   assert.equal(existsSync(home), false, 'nothing written');
   assert.equal(install(home, ['--uninstall'], { psTable: withClaude }).status, 2);

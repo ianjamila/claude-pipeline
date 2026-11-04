@@ -1,0 +1,42 @@
+{
+ "required_status_checks": {
+  "strict": false,
+  "contexts": [
+   "Typecheck + Vitest",
+   "Static guards",
+   "Vercel",
+   "Test integrity",
+   "Hard-stop scan",
+   "Cross-model review"
+  ],
+  "checks": [
+   {
+    "context": "Typecheck + Vitest",
+    "app_id": 15368
+   },
+   {
+    "context": "Static guards",
+    "app_id": 15368
+   },
+   {
+    "context": "Vercel",
+    "app_id": 8329
+   },
+   {
+    "context": "Test integrity",
+    "app_id": 15368
+   },
+   {
+    "context": "Hard-stop scan",
+    "app_id": 15368
+   },
+   {
+    "context": "Cross-model review",
+    "app_id": 15368
+   }
+  ]
+ },
+ "enforce_admins": {
+  "enabled": true
+ }
+}
