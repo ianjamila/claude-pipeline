@@ -13,7 +13,7 @@ import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
   presentedRuling, recordRuling, ownerRuled, rulingsIn, entrySource, notOwnerWords, approvalGap, ownerRulingGap, promptProvenance, rulingNudge, RULING_NUDGE,
   approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT,
-  parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
+  parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import { OWNER_ENTRY, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
 
@@ -1238,4 +1238,67 @@ test('owner-go round grant: the helper records through the account home under a 
   const r = ownerGrants(t, 'grant round 4', roundRequest(7, 4, GHEAD, 'Acme/Widgets'));
   assert.deepEqual([r.kind, r.repo, r.pr, r.k], ['extra-round', 'acme/widgets', 7, 4]);
   assert.equal(ownerGrantedRounds({ repo: 'acme/widgets', pr: 7, k: 4, head: GHEAD }).some((x) => x.session === r.session), true);
+});
+
+// ---- #128 applies to the owner's `extra round` exactly as to a "merge": the prompt must be the owner's, at record time and at use time ----------
+const SYNTHETIC = [['scheduled', SCHEDULED_META], ['sdk', SDK_META], ['peer', PEER_META], ['task notification', NOTICE_META]];
+const freshHead = () => Array.from({ length: 40 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+
+test('#128 extra round: a synthetic or harness "extra round" is never recorded; the owner\'s record names its prompt and transcript', (t) => {
+  for (const [name, meta] of SYNTHETIC) {
+    const head = freshHead();
+    assert.equal(ownerGrants(t, 'extra round', roundRequest(58, 4, head, REPO), meta), null, name);
+    assert.deepEqual(ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head }), [], name);
+  }
+  // the hook input's own provenance fields
+  const home = tmp();
+  const plain = () => transcript(home, [promptEntry('go'), said(RASK), promptEntry('extra round')]);
+  const base = { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: 'extra round', transcript_path: plain() };
+  assert.ok(recordRoundGrant(base, { home, now: NOW }), 'control: the same input records');
+  assert.equal(recordRoundGrant({ ...base, promptSource: 'system' }, { home, now: NOW }), null, 'hook input says system');
+  assert.equal(recordRoundGrant({ ...base, origin: { kind: 'peer' } }, { home, now: NOW }), null, 'hook input origin is not human');
+  const head = freshHead();
+  const ok = ownerGrants(t, 'extra round', roundRequest(58, 4, head, REPO));
+  assert.ok(ok, 'the owner\'s own words are recorded');
+  assert.match(ok.prompt_id, /^pid-/);
+  assert.match(ok.transcript_path, /projects[\\/]-repo[\\/]t\.jsonl$/);
+  assert.equal(ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head }).length, 1, 'a typed owner grant is honoured');
+});
+
+test('#128 extra round: a grant whose prompt turns out synthetic, or is missing from the transcript, grants nothing (use time)', (t) => {
+  for (const [name, after] of [...SYNTHETIC, ['missing', 'missing']]) {
+    const head = freshHead();
+    const rec = ownerGrants(t, 'extra round', roundRequest(58, 4, head, REPO), undefined, after);
+    assert.ok(rec, `${name}: the hook could not tell at record time`);
+    assert.deepEqual(ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head }), [], `${name}: not honoured`);
+    assert.deepEqual(ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, anyHead: true }).filter((r) => r.session === rec.session), [], `${name}: not honoured for any head`);
+    assert.equal(ownerGrantGap({ repo: REPO, pr: 58, k: 4, head }), 'provenance', name);
+  }
+  const head = freshHead();
+  ownerGrants(t, 'extra round', roundRequest(58, 4, head, REPO));
+  assert.deepEqual([ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head }).length, ownerGrantGap({ repo: REPO, pr: 58, k: 4, head })], [1, 'ok']);
+  assert.equal(ownerGrantGap({ repo: REPO, pr: 58, k: 4, head: freshHead() }), 'none');
+  // R2-F3: a transcript under a config dir this process does not know names CLAUDE_CONFIG_DIR in the refusal; an ordinary missing one does not
+  const elsewhere = freshHead();
+  ownerGrants(t, 'extra round', roundRequest(58, 4, elsewhere, REPO), undefined, 'elsewhere');
+  assert.equal(ownerGrantGap({ repo: REPO, pr: 58, k: 4, head: elsewhere }), 'provenance');
+  assert.match(ownerGrantConfigDirHint({ repo: REPO, pr: 58, k: 4, head: elsewhere, env: {} }), /CLAUDE_CONFIG_DIR/);
+  const gone = freshHead();
+  ownerGrants(t, 'extra round', roundRequest(58, 4, gone, REPO), undefined, 'missing');
+  assert.equal(ownerGrantConfigDirHint({ repo: REPO, pr: 58, k: 4, head: gone, env: {} }), '');
+});
+
+test('#128 extra round: the final gate (verifyOwnerGrant) re-checks the prompt, so a spent marker cannot vouch for a synthetic one', (t) => {
+  const spend = (rec, head) => {
+    t.after(() => rmSync(markerPath(grantIdOf(rec)), { force: true }));
+    assert.equal(claimGrantMarkers([rec], { repo: REPO, pr: 58, k: 4, head, checkout: '/x' }).ok, true);
+    return verifyOwnerGrant({ repo: REPO, pr: 58, k: 4, toHead: head, ownerGrant: { grantId: grantIdOf(rec), quote: 'extra round' } });
+  };
+  const typedHead = freshHead();
+  assert.equal(spend(ownerGrants(t, 'extra round', roundRequest(58, 4, typedHead, REPO)), typedHead).ok, true, 'typed by the owner');
+  for (const [name, after] of [...SYNTHETIC, ['missing', 'missing']]) {
+    const head = freshHead();
+    const bad = spend(ownerGrants(t, 'extra round', roundRequest(58, 4, head, REPO), undefined, after), head);
+    assert.deepEqual([bad.ok, bad.reason], [false, 'provenance'], name);
+  }
 });

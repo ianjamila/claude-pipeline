@@ -3505,6 +3505,24 @@ test('codex-review owner grant: no grant is the same round-cap as before, and th
   assert.equal(w.captured().length, calls, 'Codex never ran');
 });
 
+test('codex-review owner grant: an "extra round" whose prompt is synthetic or missing from the transcript admits nothing, and the refusal says it cannot be confirmed as typed by the owner (#128)', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  for (const after of [{ promptSource: 'system', isMeta: true, entrypoint: 'cli' }, { promptSource: 'sdk', entrypoint: 'sdk-cli' }, 'missing']) {
+    const record = ownerGrants(t, 'extra round', roundRequest(7, 3, h2, 'acme/widgets'), undefined, after);
+    assert.ok(record, 'the hook could not tell at record time');
+    t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+  }
+  const calls = w.captured().length;
+  const capped = codexThree(w, h1, h2);
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+  assert.match(capped.json.message, /an extra round is recorded for this PR, but it cannot be confirmed as typed by the owner[\s\S]*ask the owner to type "extra round" again/);
+  assert.equal(w.captured().length, calls, 'Codex never ran');
+  // the gate path: the owner's own words admit the round, as before
+  ownerGrantsRound(t, { k: 3, head: h2 });
+  assertExit(codexThree(w, h1, h2), 0);
+});
+
 test('codex-review owner grant: round-request -> the owner\'s grant -> codex-review runs round 3 once; the next round is capped again', (t) => {
   const { w, h1, h2 } = atCap(t);
   assert.deepEqual(['reachedMax', 'grantedRound'].map((k) => w.cli(['state', 'outcome']).json[k]), [true, null]);

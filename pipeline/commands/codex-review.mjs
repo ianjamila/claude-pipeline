@@ -31,7 +31,7 @@ import { GhError, codexCommand, runAsync } from '../lib/proc.mjs';
 import { assessRisk, isLightLane, reviewLane } from '../lib/risk.mjs';
 import { addRound, emptyState, loadState, saveState } from '../lib/state.mjs';
 import { reuseRuled, reviewedRoundCount, roundAdmission, ruledCacheFrom } from '../lib/triage.mjs';
-import { claimGrantMarkers, grantIdOf, ownerGrantedRounds } from '../hooks/lib/owner-go.mjs';
+import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
   allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, writeFileAtomic,
   writeJson,
@@ -159,13 +159,25 @@ export const run = guarded(async (argv, ctx) => {
   };
   const admit = (st, flags) => (st ? roundAdmission(st, round, { ...flags, head, grants: ownerRecords }) : { admission: reviewedAdmission(flags), problem: null });
   const reviewedAdmission = ({ baseOnly, resolutionOnly }) => (baseOnly || resolutionOnly ? 'uncounted' : 'normal');
+  // #128: an extra round recorded for this PR whose prompt cannot be confirmed as the owner's grants nothing; the refusal says so (and, R2-F3, names CLAUDE_CONFIG_DIR when that may be the reason).
+  const unconfirmedGrant = (st) => {
+    try {
+      if (config.owner_approval !== 'chat' || ghRepo?.host !== 'github.com') return '';
+      const q = { repo: ghRepo.slug, pr, k: reviewedRoundCount(st) + 1, anyHead: true };
+      if (ownerGrantGap(q) !== 'provenance') return '';
+      const hint = ownerGrantConfigDirHint(q);
+      return `; an extra round is recorded for this PR, but it cannot be confirmed as typed by the owner${hint ? ` (${hint})` : ''}: ask the owner to type "extra round" again after triage round-request`;
+    } catch {
+      return '';
+    }
+  };
   const checkCap = (st, flags, { already = false } = {}) => {
     const { admission, problem } = admit(st, flags);
     // resolutionIneligible: why the free (resolution-only) round was refused, when one was tried (it is computed before the cap).
     if (problem) {
       throw new Fail(EXIT.USAGE, {
         ok: false, error: 'round-cap',
-        message: already ? `the owner's extra round was already used (grant already used): ${problem}` : problem,
+        message: (already ? `the owner's extra round was already used (grant already used): ${problem}` : problem) + unconfirmedGrant(st),
         ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }),
       });
     }

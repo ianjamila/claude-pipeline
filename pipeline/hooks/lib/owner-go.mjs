@@ -13,8 +13,8 @@
 // subagents' messages, plugin and scheduled (/loop) turns and headless `claude -p` runs, and its input carries no field that says which.
 // Two defences, both "record less": (1) the recorders skip a prompt that is evidently not typed (notOwnerWords: hook-input provenance, the
 // transcript entry once it exists, a text envelope), and the ruling look-back skips turns the TRANSCRIPT METADATA marks synthetic
-// (entrySource: never text); (2) at USE time, when the transcript has caught up, `P merge`, the guard and `P triage owner-ruling`
-// accept a record only when its prompt entry (found by the hook's prompt_id, else by text and time) is the owner's (promptProvenance).
+// (entrySource: never text); (2) at USE time, when the transcript has caught up, `P merge`, the guard, `P triage owner-ruling` and the
+// owner-granted extra round (ownerGrantedRounds, the final gate's verifyOwnerGrant) accept a record only when its prompt entry (found by the hook's prompt_id, else by text and time) is the owner's (promptProvenance).
 // A record whose entry cannot be found or is not the owner's approves nothing. Records written before #128 carry no prompt_id, so they
 // are refused for their last day at most.
 // Residual (#128): the model could still write a transcript entry itself (files-policy refuses a tool write to ~/.claude*/projects/**/*.jsonl)
@@ -674,6 +674,8 @@ export function ownerItemsDigest(items) {
 // and head. codex-review then needs such a record (< 24 h) for the head under review, and consumes it AFTER Codex ran by exclusively
 // creating a machine-global marker `consumed/<grantId>.json` (claimGrantMarkers): one grant admits one run, wherever the checkout is. The
 // final gate recomputes the grant from record + marker (verifyOwnerGrant), so a forged `ownerGrant` in review state proves nothing.
+// #128: the grant is as strict as a "merge": a harness-injected turn is never recorded (notOwnerWords), and a record counts only while its prompt
+// is still the owner's in the transcript (promptProvenance, ownedBy) — at the cap lookup (ownerGrantedRounds) and at the final gate (verifyOwnerGrant).
 // Residual: as for "merge" and rulings (see the top of this file), plus a nested `claude -p --resume` the guards do not name (cp issue).
 const ROUND_LINE = new RegExp(`^\\s*(?:🔁)?\\s*Extra review round needed\\s+#(\\d{1,6})\\s*:\\s*round\\s+(\\d{1,3})\\s*(?:·|\\|)\\s*head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME})\\s*$`, 'i');
 export const ROUND_GRANT_PROMPT_MAX = 300; // a grant is a few words; a longer prompt is not one and is not recorded (never cut)
@@ -717,6 +719,7 @@ export function recordRoundGrant(input, { home = accountHome(), now = Date.now }
     if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > ROUND_GRANT_PROMPT_MAX) return null;
     const g = parseRoundGrant(input.prompt);
     if (!g) return null;
+    if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: strict like a "merge" — a notice, a peer's or a scheduled turn's "extra round")
     const asked = presentedRoundRequest(lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }));
     if (!asked) return null;
     if (!g.prs.every((n) => n === asked.pr) || !g.numbers.every((n) => n === asked.pr || n === asked.k)) return null;
@@ -724,7 +727,7 @@ export function recordRoundGrant(input, { home = accountHome(), now = Date.now }
       v: 1, kind: 'extra-round', ts: new Date(now()).toISOString(), session,
       prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
       cwd: typeof input.cwd === 'string' ? input.cwd : null,
-      repo: asked.repo, pr: asked.pr, k: asked.k, head: asked.head, prompt: input.prompt,
+      repo: asked.repo, pr: asked.pr, k: asked.k, head: asked.head, ...promptRefs(input), prompt: input.prompt,
     });
   } catch {
     return null;
@@ -764,10 +767,8 @@ function chainState(home, rel) {
   return 'ok';
 }
 
-// Every record for this repository, PR, counted round k whose recorded head starts the full head under review, younger than 24 h, with NO
-// marker (a consumed, partial or unreadable marker is spent), newest first. All of them: a duplicate "extra round" must not outlive a claim.
-// anyHead: true drops the head test (head is then ignored): the caller compares the head itself, to tell a stale grant from none.
-export function ownerGrantedRounds({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
+// The unspent records (before the provenance check) for this repository, PR, counted round k, newest first (see ownerGrantedRounds).
+function grantsFor({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
   const key = repoKey(repo);
   if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || (!anyHead && !FULL_HEAD.test(String(head)))) return [];
   return readRecords(opts)
@@ -775,6 +776,23 @@ export function ownerGrantedRounds({ repo, pr, k, head, anyHead = false, ...opts
       && !readGrantMarker(grantIdOf(r), { home: opts.home }).spent)
     .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
 }
+
+// Every record for this repository, PR, counted round k whose recorded head starts the full head under review, younger than 24 h, with NO
+// marker (a consumed, partial or unreadable marker is spent), newest first. All of them: a duplicate "extra round" must not outlive a claim.
+// anyHead: true drops the head test (head is then ignored): the caller compares the head itself, to tell a stale grant from none.
+// #128: only a record whose prompt is the owner's (promptProvenance) counts, as for a "merge".
+export const ownerGrantedRounds = (q = {}) => ownedBy(grantsFor(q));
+
+// Why ownerGrantedRounds found nothing, for the message: 'none' (no such record), 'provenance' (records exist but none is confirmed as typed
+// by the owner) or 'ok' (at least one is the owner's).
+export function ownerGrantGap(q = {}) {
+  const found = grantsFor(q);
+  if (found.length === 0) return 'none';
+  return ownedBy(found).length > 0 ? 'ok' : 'provenance';
+}
+
+// R2-F3 for a grant: text to append to a refusal when the unconfirmed records' transcripts are under a config dir this process does not know ('' otherwise).
+export const ownerGrantConfigDirHint = (q = {}) => configDirHint(grantsFor(q), { env: q.env });
 
 // Consumes the grants: exclusively creates one marker per record (sorted by id, so two claimers meet on the same first marker). body =
 // { repo, pr, k, head (40 hex), checkout }; each marker holds { v:1, grantId, repo, pr, k, head, consumedAt, checkout }. The file is written
@@ -866,6 +884,7 @@ export function verifyOwnerGrant({ repo, pr, k, toHead, ownerGrant } = {}, opts 
   const record = readRecords({ ...opts, maxAgeMs: Infinity, maxBytes: VERIFY_MAX_BYTES }).find((r) => isRoundRecord(r) && grantIdOf(r) === id);
   if (!record) return { ok: false, reason: 'no-record' };
   if (record.repo !== key || record.pr !== pr || record.k !== k || !toHead.startsWith(record.head)) return { ok: false, reason: 'mismatch' };
+  if (ownedBy([record]).length === 0) return { ok: false, reason: 'provenance' }; // (#128: the prompt is not the owner's, or is gone from the transcript)
   const m = readGrantMarker(id, { home: opts.home });
   if (!m.spent) return { ok: false, reason: 'no-marker' };
   if (!m.verifiable) return { ok: false, reason: 'unverifiable-marker' };
