@@ -5,7 +5,8 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { mkdirSync, existsSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { effectiveReviewBase, git, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
+import { effectiveReviewBase, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
+import { grantIdOf, ownerGrantedRounds } from '../hooks/lib/owner-go.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { MARKERS } from '../lib/render.mjs';
@@ -29,6 +30,9 @@ export const meta = {
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
     '     refused (exit 2) when the PR triage comment already holds round R',
     'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean',
+    '  grantedRound {k, grantId, head, quote}: the owner\'s open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner',
+    '  record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the',
+    '  automatic extra round took, or null',
     'pipeline state mark-implemented --ids a,b [--repo DIR]',
     '  -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed',
     '     and a non-test file changed since (a test file counts for a testing finding or the finding\'s own file)',
@@ -173,7 +177,12 @@ async function outcome(rest, ctx) {
   const { config } = await requireConfig(root);
   const state = requireState(root);
   const hash = currentContentHash(root, config);
-  const result = roundOutcome({ ...state, currentContentHash: hash });
+  // The owner's open extra-round grant for the next counted round, for the checked-out HEAD (chat mode only; codex-review is the authority).
+  const head = headSha({ cwd: root });
+  const grants = config.owner_approval === 'chat'
+    ? (k) => ownerGrantedRounds({ repo: state.repo, pr: state.pr, k, anyHead: true }).map((r) => ({ grantId: grantIdOf(r), head: r.head, quote: r.prompt }))
+    : undefined;
+  const result = roundOutcome({ ...state, currentContentHash: hash }, { grants, head });
   return {
     exitCode: EXIT.OK,
     output: { ok: true, ...result, followupsPending: followupsPending(state), currentContentHash: hash, rounds: state.rounds.length, reviewedRounds: reviewedRoundCount(state), maxRounds: state.maxRounds },

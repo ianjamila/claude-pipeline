@@ -5,26 +5,61 @@
 // session must never be able to loosen or tighten the repo's protection on its own.
 import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
 import { GhError } from '../lib/proc.mjs';
-import { loadConfig, requiredChecks } from '../lib/config.mjs';
+import { loadConfig, requiredChecks, PROVENANCE_CHECKS } from '../lib/config.mjs';
 import { createGitHub, classifyApiError, encodePath, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
 import { protectionMissing } from '../lib/preflight.mjs';
 
 export const meta = {
   summary: 'print (or with --apply, set) the GitHub branch protection and repo settings the pipeline relies on',
-  usage: 'pipeline protect [--apply] [--checks a,b] [--repo DIR]   (--apply needs PIPELINE_ADMIN=1)',
+  usage: 'pipeline protect [--apply] [--checks a,b] [--pin NAME=APP_ID,...] [--repo DIR]   (--apply needs PIPELINE_ADMIN=1)',
 };
 
-// The GitHub Actions app. Every required check is pinned to it: a status or check run counts only when GITHUB_TOKEN (a workflow)
-// posted it, so a status posted with a person's token (the owner's, which agents also use) never satisfies branch protection.
-// That is what makes `Test integrity`, `Hard-stop scan` and `Cross-model review` unforgeable from a terminal. A check that
-// another app posts (a deploy provider, say) must not be listed in ci.required_checks, or nothing could ever satisfy it.
+// The GitHub Actions app. Every required check is pinned to it by default: a status or check run counts only when GITHUB_TOKEN
+// (a workflow) posted it, so a status posted with a person's token (the owner's, which agents also use) never satisfies branch
+// protection. That is what makes `Test integrity`, `Hard-stop scan` and `Cross-model review` unforgeable from a terminal.
+// A check another app posts (a deploy provider's `Vercel`, say) cannot be satisfied by GitHub Actions, so it keeps the app the
+// current protection already pins it to, or the one `--pin NAME=APP_ID` names. The three guard contexts never take a foreign pin.
 // The pin does not stop a PR into a side branch whose own copy of the workflow posts as GitHub Actions on the same head: only
 // the final gate's provenance check (guard-provenance.mjs) catches that, so a direct `gh pr merge` must stay hook-blocked.
 export const GITHUB_ACTIONS_APP_ID = 15368;
 
-export function protectionPayload(checks) {
+// The app a required check must be posted by: its own pin, else GitHub Actions. Own properties only, and the pin maps have
+// no prototype, so a check named `constructor` or `__proto__` can never pick up an inherited value.
+const appFor = (context, pins) => (pins && Object.hasOwn(pins, context) ? pins[context] : GITHUB_ACTIONS_APP_ID);
+const isAppId = (n) => Number.isSafeInteger(n) && n > 0;
+
+// The checks the current protection pins to an app other than GitHub Actions (a positive app id; -1 or null means "any app"),
+// among the ones being required. Guard contexts are left out: they are only ever trusted from GitHub Actions.
+export function foreignPins(json, checks) {
+  const pins = Object.create(null);
+  for (const row of json?.required_status_checks?.checks ?? []) {
+    const context = row?.context;
+    const appId = row?.app_id;
+    if (!checks.includes(context) || PROVENANCE_CHECKS.includes(context)) continue;
+    if (isAppId(appId) && appId !== GITHUB_ACTIONS_APP_ID) pins[context] = appId;
+  }
+  return pins;
+}
+
+// `--pin NAME=APP_ID[,NAME=APP_ID]`: each name must be a required check and not a guard context; the id a positive integer.
+export function parsePins(raw, checks) {
+  const pins = Object.create(null);
+  for (const item of raw.split(',').map((s) => s.trim()).filter(Boolean)) {
+    const at = item.lastIndexOf('=');
+    const name = at > 0 ? item.slice(0, at).trim() : '';
+    const id = at > 0 ? item.slice(at + 1).trim() : '';
+    // checked after conversion too: a digit string past 2^53 would round, and a long one becomes Infinity
+    if (!name || !/^[1-9]\d*$/.test(id) || !isAppId(Number(id))) throw new UsageError(`--pin expects NAME=APP_ID (a positive integer), got "${item}"`);
+    if (!checks.includes(name)) throw new UsageError(`--pin names "${name}", which is not one of the required checks (${checks.join(', ')})`);
+    if (PROVENANCE_CHECKS.includes(name)) throw new UsageError(`--pin cannot move "${name}" off GitHub Actions: guard contexts are only trusted from a workflow`);
+    pins[name] = Number(id);
+  }
+  return pins;
+}
+
+export function protectionPayload(checks, pins = {}) {
   return {
-    required_status_checks: { strict: false, checks: checks.map((context) => ({ context, app_id: GITHUB_ACTIONS_APP_ID })) },
+    required_status_checks: { strict: false, checks: checks.map((context) => ({ context, app_id: appFor(context, pins) })) },
     enforce_admins: true,
     required_pull_request_reviews: { required_approving_review_count: 0, dismiss_stale_reviews: false, require_code_owner_reviews: false },
     restrictions: null,
@@ -45,16 +80,17 @@ export const REPO_SETTINGS = Object.freeze({
 
 export const WORKFLOW_PERMISSIONS = Object.freeze({ default_workflow_permissions: 'read', can_approve_pull_request_reviews: false });
 
-// The required checks GitHub reports WITHOUT the Actions pin (any app may satisfy them), from a protection read-back.
-export function unpinnedChecks(json, checks) {
+// The required checks GitHub reports WITHOUT their pin (the Actions app, or the check's own entry in `pins`), from a
+// protection read-back.
+export function unpinnedChecks(json, checks, pins = {}) {
   const rows = json?.required_status_checks?.checks ?? [];
-  return checks.filter((name) => !rows.some((c) => c?.context === name && c?.app_id === GITHUB_ACTIONS_APP_ID));
+  return checks.filter((name) => !rows.some((c) => c?.context === name && c?.app_id === appFor(name, pins)));
 }
 
 // The three writes, in the order they are applied.
-export function buildRequests({ slug, branch, checks }) {
+export function buildRequests({ slug, branch, checks, pins = {} }) {
   return [
-    { step: 'branch-protection', method: 'PUT', path: `repos/${slug}/branches/${encodePath(branch)}/protection`, body: protectionPayload(checks) },
+    { step: 'branch-protection', method: 'PUT', path: `repos/${slug}/branches/${encodePath(branch)}/protection`, body: protectionPayload(checks, pins) },
     { step: 'repo-settings', method: 'PATCH', path: `repos/${slug}`, body: { ...REPO_SETTINGS } },
     { step: 'workflow-permissions', method: 'PUT', path: `repos/${slug}/actions/permissions/workflow`, body: { ...WORKFLOW_PERMISSIONS } },
   ];
@@ -79,12 +115,27 @@ async function resolveChecks(values, root) {
   return requiredChecks(cfg.config.ci);
 }
 
+// The branch's protection as it stands, or null when there is none to read (not protected yet; no admin rights or plan, which
+// the write itself then reports). Any other failure: a dry run prints the commands without kept pins and says so; --apply
+// stops, because writing without the current pins would move a deploy provider's check onto GitHub Actions and block every PR.
+export function readCurrentProtection(gh, branch, { apply }) {
+  try {
+    const p = gh.protection(branch);
+    return p.status === 200 ? p.json : null;
+  } catch (err) {
+    if (apply || !(err instanceof GhError)) throw err;
+    process.stderr.write(`could not read the current protection (${String(err.message).split('\n')[0]}): no check keeps a non-Actions pin unless --pin names it.\n`);
+    return null;
+  }
+}
+
 const PLAN_MESSAGE = 'GitHub Pro required for private repos: branch protection is not available on this plan. Upgrade (or make the repo public), then run this again.';
 
 export async function run(argv, ctx) {
   const { values } = parseCommandArgs(argv, {
     apply: { type: 'boolean' },
     checks: { type: 'string' },
+    pin: { type: 'string' },
     repo: { type: 'string' },
   }, { allowPositionals: false });
   const apply = values.apply === true;
@@ -97,16 +148,22 @@ export async function run(argv, ctx) {
   if (checks.length === 0) {
     throw new UsageError('no required checks: pass --checks a,b or set ci.required_checks in .claude/pipeline.yml (the guard contexts are added unless ci.guard_checks is false; protection without required checks would let anything merge)');
   }
+  const explicitPins = values.pin !== undefined ? parsePins(values.pin, checks) : Object.create(null);
   const gh = createGitHub({ cwd, env: ctx.env });
 
   return guardGh(async () => {
     const { slug, defaultBranch: branch } = gh.repo();
-    const requests = buildRequests({ slug, branch, checks });
+    const pins = Object.assign(Object.create(null), foreignPins(readCurrentProtection(gh, branch, { apply }), checks), explicitPins);
+    for (const [name, appId] of Object.entries(pins)) {
+      const source = Object.hasOwn(explicitPins, name) ? '--pin' : 'the current protection';
+      process.stderr.write(`"${name}" stays pinned to app ${appId} (from ${source}): another app posts it, not GitHub Actions.\n`);
+    }
+    const requests = buildRequests({ slug, branch, checks, pins });
     const commands = requests.map(toCommand);
 
     if (!apply) {
       process.stderr.write(`dry run: nothing was changed. Run these as an admin of ${slug}, or re-run with --apply in a PIPELINE_ADMIN=1 session.\n`);
-      return { exitCode: EXIT.OK, output: { ok: true, applied: false, slug, branch, checks, requests, commands } };
+      return { exitCode: EXIT.OK, output: { ok: true, applied: false, slug, branch, checks, pins, requests, commands } };
     }
 
     const completed = [];
@@ -134,9 +191,9 @@ export async function run(argv, ctx) {
       return { exitCode: EXIT.FAILED, output: { ok: false, applied: true, mode: 'gate', missing: [], reason: p.reason, message: p.message, completed, slug, branch } };
     }
     const missing = protectionMissing(p.json, checks);
-    const unpinned = unpinnedChecks(p.json, checks);
+    const unpinned = unpinnedChecks(p.json, checks, pins);
     const mode = missing.length === 0 ? 'github' : 'gate';
     const ok = missing.length === 0 && unpinned.length === 0;
-    return { exitCode: ok ? EXIT.OK : EXIT.FAILED, output: { ok, applied: true, mode, missing, unpinned, completed, slug, branch } };
+    return { exitCode: ok ? EXIT.OK : EXIT.FAILED, output: { ok, applied: true, mode, missing, unpinned, pins, completed, slug, branch } };
   });
 }

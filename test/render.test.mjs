@@ -644,3 +644,44 @@ test('summaryComment: owner rulings are listed under Outliers with the quote', (
   assert.match(outliers, /R1-B1/);
   assert.match(outliers, /Owner \(chat\): FOLLOW-UP — "yes, make it a follow-up"/);
 });
+
+// ---- owner-granted extra rounds ---------------------------------------------------------------
+
+// A state whose round 2 carries the grant the owner typed (quote = the record's exact prompt).
+function grantedState(quote, k = 2) {
+  let s = stateWith([[]]);
+  s = addRound(s, {
+    n: 2, fromHead: 't0', toHead: 't1', contentHashAtToHead: 'h1', items: [],
+    ownerGrant: { grantId: '0123456789abcdef', k, quote, ownerTs: '2026-10-30T01:02:03.000Z' },
+  });
+  return s;
+}
+
+test('triageComment: an owner-granted round shows the owner\'s quote on one line before the state marker; none without a grant', () => {
+  const comment = triageComment(grantedState('extra round #123'));
+  const lines = comment.split('\n');
+  const at = lines.indexOf('Owner-granted extra round(s): round 2 - "extra round #123"');
+  assert.ok(at > 0, comment);
+  assert.ok(at < lines.findIndex((l) => l.startsWith('<!-- claude-pipeline:state')), 'before the state marker');
+  assert.ok(!triageComment(stateWith([[]])).includes('Owner-granted'));
+});
+
+test('triageComment: the grant quote is defused, and a long one is clipped to 300 characters', () => {
+  const evil = triageComment(grantedState('extra round <!-- x --> @someone'));
+  const row = evil.split('\n').find((l) => l.startsWith('Owner-granted'));
+  assert.ok(!row.includes('<!--') && !row.includes('@someone'), row);
+  const long = triageComment(grantedState(`extra round ${'x'.repeat(500)}`)).split('\n').find((l) => l.startsWith('Owner-granted'));
+  assert.ok(long.includes('…"'), long);
+  assert.ok(Array.from(long.split(' - "')[1]).length <= 302, 'quote clipped');
+  assert.equal(decodeFromComment(triageComment(grantedState('extra round'))).rounds[1].ownerGrant.quote, 'extra round', 'the state keeps the quote');
+});
+
+test('summaryComment: an owner-granted round is listed under Outliers with the quote (defused, clipped)', () => {
+  const outliers = summaryComment(grantedState('extra round'), { outcome: 'awaiting-owner-merge' }).split('### What was built')[0];
+  assert.match(outliers, /Owner \(chat\) granted round 2 - "extra round"/);
+  const evil = summaryComment(grantedState(`extra round <!-- x --> @someone ${'y'.repeat(400)}`), { outcome: 'o' }).split('### What was built')[0].split('### Outliers')[1];
+  assert.ok(!evil.includes('<!--') && !evil.includes('@someone'), evil);
+  assert.ok(evil.includes('…"'), 'clipped');
+  const none = summaryComment(stateWith([[]]), { outcome: 'o' }).split('### What was built')[0];
+  assert.ok(!none.includes('granted round'));
+});

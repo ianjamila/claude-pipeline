@@ -4,11 +4,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import {
   BLOCKING_LABELS, CANONICAL_CHECKS, GATE_MAX_AGE_MS, abandonMerge, blockingLabelsOf, expectedCheckNames, gateRefusals,
-  isDocsOnly, isLogOnly, labelNames, labelsCheck, mergeTiming, readPrSettled, readReviewJson, waitForMerge,
+  isDocsOnly, isLogOnly, labelNames, labelsCheck, mergeTiming, readPrSettled, readReviewJson, reviewCheck, waitForMerge,
 } from '../pipeline/lib/finalgate.mjs';
+import { verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
+import { claimGrantMarkers, grantIdOf, recordRoundGrant } from '../pipeline/hooks/lib/owner-go.mjs';
+import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { writeReviewJson } from '../pipeline/lib/cmd-io.mjs';
 import {
   AGENT_LOG_HEADER, appendLines, assertSingleLine, buildAgentLogLine, countArbiterCalls, resolveLogPath,
@@ -358,4 +362,195 @@ test('review dir helpers do not need a git repo', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cp-rj2-'));
   writeReviewJson(dir, 'a.json', { ok: true });
   assert.match(readFileSync(join(dir, '.review', 'a.json'), 'utf8'), /"ok": true/);
+});
+
+// ---- owner-granted rounds: the gate re-verifies every grant against the owner's record and its marker ------------------
+
+const REPO = 'acme/widgets';
+const PR = 12;
+const head = (c) => c.repeat(40);
+
+// A temp account home. grant(): the owner types `prompt` after a reply ending with the request line for counted round k and head `at`,
+// the recorder writes the record, and (claim) codex-review's marker is created for `claimed` (default: the same head).
+function ownerWorld() {
+  const home = mkdtempSync(join(tmpdir(), 'grant-home-'));
+  const grant = ({ k, at, pr = PR, repo = REPO, prompt = 'extra round', claim = true, claimed = at, claimK = k }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'grant-tr-'));
+    const transcript = join(dir, 't.jsonl');
+    const reply = `Round ${k - 1} left items open.\n🔁 Extra review round needed #${pr}: round ${k} · head ${at.slice(0, 12)} · repo ${repo}`;
+    writeFileSync(transcript, `${[
+      { type: 'user', message: { content: 'go' } },
+      { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
+      { type: 'user', message: { content: prompt } },
+    ].map((e) => JSON.stringify(e)).join('\n')}\n`);
+    const record = recordRoundGrant({ hook_event_name: 'UserPromptSubmit', session_id: `test-${randomUUID()}`, transcript_path: transcript, cwd: dir, prompt }, { home });
+    assert.ok(record, 'the recorder wrote the grant');
+    if (claim) assert.equal(claimGrantMarkers([record], { repo, pr, k: claimK, head: claimed, checkout: dir }, { home }).ok, true);
+    return { record, ownerGrant: { grantId: grantIdOf(record), k, quote: record.prompt, ownerTs: record.ts } };
+  };
+  return { home, grant };
+}
+
+// max_rounds `max`; each spec is { head, baseOnly?, admission?, ownerGrant? } (n = its position + 1). Every round is clean.
+function granted(rounds, { max = 2, pr = PR } = {}) {
+  let st = emptyState({ repo: REPO, pr, branch: 'agent/x', risk: 'low', maxRounds: max });
+  st.currentContentHash = 'h';
+  rounds.forEach((r, i) => {
+    st = addRound(st, { n: i + 1, fromHead: head('0'), toHead: r.head ?? head('1'), contentHashAtToHead: 'h', items: [], ...r });
+  });
+  return st;
+}
+const verify = (state, w, over = {}) => verifyOwnerGrants(state, { repo: REPO, pr: PR, home: w.home, ...over });
+const CANNOT = /owner grant cannot be verified on this machine/;
+
+test('verifyOwnerGrants: a genuine grant past the automatic extra round verifies and returns the record\'s exact words', () => {
+  const w = ownerWorld();
+  const g = w.grant({ k: 4, at: head('4'), prompt: 'Extra Round, please' });
+  const state = granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'auto-extra' }, { head: head('4'), ownerGrant: g.ownerGrant }]);
+  const r = verify(state, w);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(r.granted.map((x) => [x.n, x.k, x.quote]), [[4, 4, 'Extra Round, please']]);
+});
+
+test('verifyOwnerGrants: a grant at max+1 (no automatic extra) verifies, and a base-only round does not move the ordinal k', () => {
+  const w = ownerWorld();
+  const g = w.grant({ k: 3, at: head('3') });
+  const ok = granted([{ admission: 'normal' }, { baseOnly: true }, { admission: 'normal' }, { head: head('3'), ownerGrant: g.ownerGrant }]);
+  assert.equal(verify(ok, w).ok, true);
+  assert.equal(verify(ok, w).granted[0].n, 4, 'n is the actual round number, k the counted ordinal');
+});
+
+test('verifyOwnerGrants: a forged or mismatched grant fails with the recovery message (no record, no marker, other PR / round / head, other grant\'s marker, other quote)', () => {
+  const w = ownerWorld();
+  const forge = (ownerGrant, toHead = head('4')) => granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'auto-extra' }, { head: toHead, ownerGrant }]);
+  const real = w.grant({ k: 4, at: head('4') });
+  const cases = {
+    'no record': { grantId: 'f'.repeat(16), k: 4, quote: 'extra round', ownerTs: 'x' },
+    'no marker': w.grant({ k: 4, at: head('4'), claim: false }).ownerGrant,
+    'record for another PR': w.grant({ k: 4, at: head('4'), pr: 99 }).ownerGrant,
+    'record for another repository': w.grant({ k: 4, at: head('4'), repo: 'other/repo' }).ownerGrant,
+    'record for another round': w.grant({ k: 3, at: head('4') }).ownerGrant,
+    'marker claimed for another round': w.grant({ k: 4, at: head('4'), claimK: 5 }).ownerGrant,
+    'record head is not the round\'s head': w.grant({ k: 4, at: head('5') }).ownerGrant,
+    'marker head is not the round\'s head': w.grant({ k: 4, at: head('4'), claimed: head('5') }).ownerGrant,
+    'quote differs from the record': { ...real, quote: 'extra round please' },
+    'no grantId': { k: 4, quote: 'extra round' },
+  };
+  for (const [label, ownerGrant] of Object.entries(cases)) {
+    const r = verify(forge(ownerGrant), w);
+    assert.equal(r.ok, false, label);
+    assert.match(r.problems.join('; '), /round 4: owner grant cannot be verified on this machine — run the gate on the machine that reviewed it \(the only recovery once the round is published\), or, for an unpublished trailing round only, `P state discard-round --pr 12 --round 4`, `P triage round-request`, and ask the owner again/, label);
+  }
+  assert.equal(verify(forge(real.ownerGrant), w).ok, true, 'the genuine one passes in the same world');
+  assert.match(verify(forge(real.ownerGrant), { home: mkdtempSync(join(tmpdir(), 'other-machine-')) }).problems.join(), CANNOT, 'another machine has no record');
+});
+
+test('verifyOwnerGrants: a counted round past max+1 needs a grant; "owner" without one, "normal" past max, and a marker in the wrong place fail; legacy states stay valid', () => {
+  const w = ownerWorld();
+  const three = [{ admission: 'normal' }, { admission: 'normal' }, { admission: 'auto-extra' }];
+  const past = verify(granted([...three, { admission: 'normal' }]), w);
+  assert.equal(past.ok, false);
+  assert.match(past.problems.join(), /round 4: .*past review\.max_rounds.*no owner grant/);
+  assert.equal(verify(granted([...three, { admission: 'auto-extra' }]), w).ok, false, 'auto-extra is only max+1');
+  assert.equal(verify(granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'owner' }]), w).ok, false, 'owner without ownerGrant');
+  assert.equal(verify(granted([{ admission: 'normal' }, { admission: 'owner' }]), w).ok, false, 'owner without ownerGrant even within the cap');
+  assert.equal(verify(granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'normal' }]), w).ok, false, 'normal past max');
+  assert.equal(verify(granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'auto-extra' }]), w).ok, true, 'the automatic extra round');
+  assert.equal(verify(granted([{}, {}, {}]), w).ok, true, 'legacy: no admission recorded, <= max+1');
+  assert.equal(verify(granted([{}, {}, {}, {}]), w).ok, false, 'legacy states cannot have more than max+1 either');
+  assert.equal(verify(granted([{}, {}, {}, { baseOnly: true }, { resolutionOnly: true, conflicted: [] }]), w).ok, true, 'uncounted rounds are never capped');
+  assert.deepEqual(verify(granted([{}, {}]), w), { ok: true, granted: [] });
+});
+
+test('verifyOwnerGrants: a non-finite max_rounds skips the cap rules but still verifies every round that carries a grant', () => {
+  const w = ownerWorld();
+  const none = granted([{}, {}, {}, {}, {}], { max: Infinity });
+  assert.equal(verify(none, w).ok, true, 'nothing is capped');
+  const g = w.grant({ k: 2, at: head('2') });
+  const withGrant = granted([{}, { head: head('2'), ownerGrant: g.ownerGrant }], { max: Infinity });
+  assert.equal(verify(withGrant, w).ok, true);
+  const forged = granted([{}, { head: head('2'), ownerGrant: { grantId: 'f'.repeat(16), k: 2, quote: 'extra round' } }], { max: Infinity });
+  assert.match(verify(forged, w).problems.join(), CANNOT);
+  const saved = JSON.parse(JSON.stringify(forged)); // Infinity is written as null
+  assert.equal(saved.maxRounds, null);
+  assert.match(verify(saved, w).problems.join(), CANNOT);
+});
+
+test('verifyOwnerGrants: the configured cap is authoritative - a state whose maxRounds is null or larger cannot switch the cap rules off', () => {
+  const w = ownerWorld();
+  const three = [{ admission: 'normal' }, { admission: 'normal' }, { admission: 'normal' }];
+  const forgedNull = JSON.parse(JSON.stringify(granted(three, { max: 1 })));
+  forgedNull.maxRounds = null;
+  assert.equal(verify(forgedNull, w).ok, true, 'without the configured cap a hand-built state is believed (the fallback)');
+  const withCap = verify(forgedNull, w, { maxRounds: 1 });
+  assert.equal(withCap.ok, false);
+  assert.match(withCap.problems.join('; '), /round 3: .*past review\.max_rounds \(1\)/);
+  const looser = granted(three, { max: 5 });
+  const r = verify(looser, w, { maxRounds: 1 });
+  assert.equal(r.ok, false, 'a state that records a larger cap than the configured one fails closed');
+  assert.match(r.problems.join('; '), /maxRounds/);
+  assert.equal(verify(granted(three, { max: 1 }), w, { maxRounds: 1 }).ok, false, 'matching caps: counted round 3 is past max+1 and needs a grant');
+  const ok = granted([{ admission: 'normal' }, { admission: 'auto-extra' }], { max: 1 });
+  assert.equal(verify(ok, w, { maxRounds: 1 }).ok, true, 'a genuine state under the same cap still passes');
+  assert.equal(verify(granted([{ admission: 'normal' }, { admission: 'normal' }], { max: 1 }), w, { maxRounds: 1 }).ok, false, 'normal at max+1 still fails');
+});
+
+// reviewCheck itself: the same verification, with the quote in the detail and no owner-merge item.
+function gateRoot(state) {
+  const root = mkdtempSync(join(tmpdir(), 'gate-root-'));
+  saveState(root, state);
+  return root;
+}
+const reviewOf = (state, w, over = {}) => reviewCheck({
+  root: gateRoot(state), config: {}, pr: PR, repo: REPO, diff: () => ({ ok: true, files: [f('src/a.js')] }), hash: 'h', hashError: null, ownerGo: { home: w.home }, ...over,
+});
+
+test('final gate review: a genuine owner grant passes and shows the owner\'s words, and is never an owner-merge item', () => {
+  const w = ownerWorld();
+  const g = w.grant({ k: 4, at: head('4'), prompt: 'extra round #12' });
+  const state = granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'auto-extra' }, { head: head('4'), ownerGrant: g.ownerGrant }]);
+  const r = reviewOf(state, w);
+  assert.equal(r.ok, true, r.detail);
+  assert.match(r.detail, /review valid for content h; owner-granted round 4: "extra round #12"/);
+  assert.equal(r.ownerMerge, undefined, 'a round grants no merge authority');
+  assert.equal(r.ownerItems, undefined);
+});
+
+test('final gate review: the quote in the detail is clipped to 100 characters', () => {
+  const w = ownerWorld();
+  const g = w.grant({ k: 3, at: head('3'), prompt: `extra round${' please'.repeat(20)}` });
+  const r = reviewOf(granted([{ admission: 'normal' }, { admission: 'normal' }, { head: head('3'), ownerGrant: g.ownerGrant }]), w);
+  assert.equal(r.ok, true, r.detail);
+  const shown = /owner-granted round 3: "([^"]*)"/.exec(r.detail)[1];
+  assert.ok(shown.length <= 101 && shown.endsWith('\u2026'), shown);
+});
+
+test('final gate review: the configured review.max_rounds is the cap - a state with maxRounds null and ordinary rounds past it fails', () => {
+  const w = ownerWorld();
+  const state = JSON.parse(JSON.stringify(granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'normal' }], { max: 1 })));
+  state.maxRounds = null;
+  assert.equal(reviewOf(state, w).ok, true, 'a config without review.max_rounds falls back to the state');
+  const r = reviewOf(state, w, { config: { review: { max_rounds: 1 } } });
+  assert.equal(r.ok, false);
+  assert.match(r.detail, /past review\.max_rounds \(1\)/);
+});
+
+test('final gate review: a state whose maxRounds exceeds the configured review.max_rounds fails with "the cap cannot be trusted"', () => {
+  const w = ownerWorld();
+  const state = granted([{ admission: 'normal' }], { max: 3 });
+  const r = reviewOf(state, w, { config: { review: { max_rounds: 2 } } });
+  assert.equal(r.ok, false);
+  assert.match(r.detail, /the review state records maxRounds 3, not within the configured review\.max_rounds \(2\): the cap cannot be trusted/);
+  assert.equal(reviewOf(granted([{ admission: 'normal' }], { max: 2 }), w, { config: { review: { max_rounds: 2 } } }).ok, true, 'a matching cap passes');
+});
+
+test('final gate review: a forged grant, a round past max+1 with none, or a wrong admission fails review', () => {
+  const w = ownerWorld();
+  const forged = granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'auto-extra' }, { head: head('4'), ownerGrant: { grantId: 'f'.repeat(16), k: 4, quote: 'extra round' } }]);
+  const a = reviewOf(forged, w);
+  assert.equal(a.ok, false);
+  assert.match(a.detail, CANNOT);
+  assert.equal(reviewOf(granted([{}, {}, {}, {}]), w).ok, false);
+  assert.equal(reviewOf(granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'owner' }]), w).ok, false);
+  assert.equal(reviewOf(granted([{}, {}, {}]), w).ok, true, 'legacy state, within max+1');
 });

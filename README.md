@@ -21,7 +21,7 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge) |
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
-| hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge") against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
+| hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge"), your answer to a ruling request and your `extra round` (a prompt that starts with `extra round` or `grant round`: one more review round past `review.max_rounds`) against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
 | hook `stack-register` (PreToolUse on `Bash` and the write tools `Edit\|Write\|MultiEdit\|NotebookEdit`, 30 s) | records which private Supabase stack a session is about to use, before the tool runs; **fail-closed** like the guards (an unloadable file blocks with exit 2) |
 | hook `stack-dev-bind` (PostToolUse on `Bash`, 10 s) | notes which stack a dev server you started is bound to; non-blocking |
 | hook `stack-session-end` (SessionEnd, 10 s) | when a session ends (not on `/clear`) it starts a detached worker that decides whether that session's stacks can be stopped; non-blocking |
@@ -231,7 +231,9 @@ head you did not review (the receipt names the head the event carried).
   of running the script (another manager or spelling, `run-script`, a wrapper such as `npx npm@11`, `--prefix` / `-C` / `--cwd` / workspace options,
   words before `--`) is refused in a chat repo; the refusal names the exact form. Merge through `P merge --pr N` otherwise. The chat
   mode is read from the repository the command runs in: a nested or separate clone whose own `pipeline.yml` is not chat is
-  not caught (a protected registry of chat repos is the planned fix).
+  not caught (a protected registry of chat repos is the planned fix). One more vector is open: a nested `claude -p`, `claude --resume` or
+  `claude --continue` run from the agent's shell may produce a top-level prompt the hook records as yours, for a "merge", a ruling or an
+  `extra round` alike; no guard names the `claude` CLI yet (see #132 / PR #133).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
 - **Quick check locally, CI is the full proof.** The agent runs only `verify.quick` on the changed area; CI runs the full verify, the

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { ownerGoDir, recordApproval, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
+import { ownerGoDir, recordApproval, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
 
 const HOOK = fileURLToPath(new URL('../../pipeline/hooks/owner-go.mjs', import.meta.url));
 
@@ -28,6 +28,8 @@ const transcriptIn = (dir) => {
 export const ownerSays = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordApproval, entry, after);
 // Phase 3b: the same for a ruling (the reply ends with rulingRequest's line).
 export const ownerRules = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordRuling, entry, after);
+// Owner-granted extra round: the same for the owner's `extra round` (the reply ends with roundRequest's line).
+export const ownerGrants = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordRoundGrant, entry, after);
 
 function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined) {
   const dir = mkdtempSync(join(tmpdir(), 'owner-go-'));
@@ -68,6 +70,9 @@ export const mergeRequest = (pr, head, items, repo = 'acme/widgets') => `Owner i
 // A reply that asks the owner to rule on review items, as the ship skill ends it (review-loop.md, Owner rules in chat).
 // #110: the line carries the content digest `P triage ruling-request` prints (a placeholder unless a test passes the real one).
 export const rulingRequest = (pr, ids, repo = 'acme/widgets', content = 'c0ffee000000') => `R1-B1 is waiting for your decision.\n⚖️ Owner ruling needed #${pr}: ${ids.join(', ')}${content === null ? '' : ` · content ${content}`} · repo ${repo}`;
+
+// A reply that asks for one more counted review round, as `P triage round-request` prints it (k = the counted ordinal; head >= 12 hex).
+export const roundRequest = (pr, k, head, repo = 'acme/widgets') => `Round ${k - 1} left items open.\n🔁 Extra review round needed #${pr}: round ${k} · head ${head.slice(0, 12)} · repo ${repo}`;
 
 // The flags P merge takes for it.
 export const approvalFlags = (head, items) => ['--owner-approved-head', head, '--owner-approved-items', items];
