@@ -55,6 +55,8 @@ whose ready-event run is not created yet (seconds after `gh pr ready`) counts as
 same workflow keeps the wait open until that workflow's ready run exists) and `P merge`'s live gate re-reads CI before any merge.
 Requiring a ready-era run for every identity would hang on checks whose workflows do not trigger on `ready_for_review`.
 
+*BUILD NOTE (11-04, real EW data PR 1631):* a draft-era FAILURE (Cross-model review) stands until re-posted after ready, so failures get the same freshness rule as skips: `stale-fail` (result predates readyAt) waits until --appear-timeout, then becomes `failed`; a fresh failure still ends the wait at once.
+
 *One state machine (Codex R1-6):* poll until every identity is terminal-good (`pass`/`fresh-skip`) ⇒ exit 0; any `fail`/`cancelled`
 ⇒ exit 1 `failed` right away (names + html_url) — unless `--wait-all` (Codex R2-7: label mode with blocking items expects some guard
 checks red and must park only once the OTHERS are green): then failures are recorded and the wait goes on until no identity is
@@ -162,6 +164,7 @@ Bytes-balanced today; 6 PR runs (11-03/04): shard 2 6–9 min, shards 1/3 14–2
 4. `shardFiles` weight = measured ms when known, else bytes × (median ms/byte of measured files); same deterministic longest-first
    greedy, ties by name. Tests extend `test/test-runner.test.mjs` (where the shard tests live): weights override bytes; unknown file
    fallback; bins partition; deterministic; reporter emits per-file ms for a 2-file fixture.
+   BUILD NOTE (11-04): the span reporter did NOT hold on Node 24 (events of a later file are replayed only after earlier files end; enqueue is queue time; summary excludes module load). Built instead: `scripts/lib/file-times-preload.mjs` via `node --import` when CP_TEST_TIMES is set; each test-file child appends its whole wall clock at exit; output `{file:{spanMs}}` (no sumMs). Verified on the plan fixture (slow >= 600 ms, quick >= 140 ms, separate entries).
 5. Proof: the shard minutes of the PR's last CI run, reported in the PR body (before/after table).
 
 ## F6. Installer: false "Claude Code ancestor" on Windows (#25)
