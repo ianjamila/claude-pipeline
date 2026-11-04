@@ -547,6 +547,24 @@ test('#128 rulings (R4-F3): a tool call or result that surfaces a newer ask void
   assert.deepEqual([r?.pr, r?.ids], [58, ['R1-F1']], 'an unrelated tool: the ask still binds');
 });
 
+// Codex finding 2: the ruling-line parser (RULING_LINE) matches any case, so the surfaced-ask detector must too.
+test('#128 rulings (R4-F3, case): a newer ask printed in another case in a skipped turn still voids the pending one', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-11-03T10:00:00Z');
+  const ANSWER = 'R1-B1: accept';
+  const head = [promptEntry('go'), said(ASK_REPLY)];
+  const use = (command) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: { command } }] } });
+  const result = (c) => ({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'x', content: c }] } });
+  for (const [name, between] of [
+    ['a lower-case ruling line in the call', [promptEntry(NOTICE, NOTICE_META), use('echo "⚖️ owner ruling needed #59: R1-B1 · content abcdef012345 · repo acme/app"'), result('')]],
+    ['an upper-case ruling line in a result', [promptEntry(NOTICE, NOTICE_META), use('cat out.txt'), result('⚖️ OWNER RULING NEEDED #59: R1-B1 · content abcdef012345 · repo acme/app')]],
+  ]) {
+    const e = promptEntry(ANSWER);
+    const r = recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: ANSWER, prompt_id: e.promptId, transcript_path: transcript(home, [...head, ...between, e]) }, { home, now });
+    assert.equal(r, null, name);
+  }
+});
+
 test('#128 rulings: nothing is skipped by its text, and an owner turn between the ask and the answer is still a boundary', () => {
   const home = tmp();
   const now = () => Date.parse('2026-11-03T10:00:00Z');

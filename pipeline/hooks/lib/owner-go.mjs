@@ -201,7 +201,7 @@ export function lastRequestText(transcriptPath, opts = {}) {
 // here a fixed test is sound: a tool_use input or a tool_result that contains a ruling line, a merge line or a `head <sha> · items` line, or the
 // command name `ruling-request`, voids the slot like text does. A tool-only reply without any of them still leaves the ask standing.
 const showsText = (text) => text.trim() !== '';
-const SURFACED_ASK = new RegExp(`Owner ruling needed\\s+#\\d|ruling-request|${READY_LINE.source}`, 'u');
+const SURFACED_ASK = new RegExp(`Owner ruling needed\\s+#\\d|ruling-request|${READY_LINE.source}`, 'iu'); // (case-insensitive like RULING_LINE and HEAD_LINE: a detector narrower than the parsers lets a differently-cased ask through)
 const surfacesAsk = (text) => SURFACED_ASK.test(text) || text.split(/\r?\n/).some((l) => HEAD_LINE.test(l));
 // The text of a tool_result block's content (a string, or text blocks), or of a tool_use block's input.
 const toolResultText = (c) => (typeof c === 'string' ? c : Array.isArray(c) ? c.map((x) => (typeof x === 'string' ? x : typeof x?.text === 'string' ? x.text : '')).join('\n') : '');
