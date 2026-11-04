@@ -1173,6 +1173,29 @@ test('state mark-implemented: files that came in from merging the base branch do
   assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
 });
 
+test('state mark-implemented: a signed fix commit still counts when the user\'s git config has log.showSignature=true', (t) => {
+  const w = worldIgnoringReview(t);
+  const key = join(w.scratch, 'sign-key');
+  const gen = spawnSync('ssh-keygen', ['-t', 'ed25519', '-N', '', '-q', '-f', key], { encoding: 'utf8' });
+  if (gen.error || gen.status !== 0) { t.skip('ssh-keygen is unavailable, so a signed commit cannot be made without gpg'); return; }
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  const pub = readFileSync(`${key}.pub`, 'utf8').trim();
+  writeFileSync(join(w.scratch, 'allowed-signers'), `fixer@example.test ${pub}\n`);
+  w.repo.git(['config', 'log.showSignature', 'true']);
+  w.repo.git(['config', 'gpg.format', 'ssh']);
+  w.repo.git(['config', 'user.signingkey', `${key}.pub`]);
+  w.repo.git(['config', 'gpg.ssh.allowedSignersFile', join(w.scratch, 'allowed-signers')]);
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  w.repo.git(['add', '-A']);
+  w.repo.git(['commit', '-q', '-S', '-m', 'signed fix']);
+  const shown = w.repo.git(['log', '-1', '--format=']);
+  assert.match(shown, /signature|Good|Good "git" signature/i, 'git prints signature text for this commit under log.showSignature');
+  const r = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(w.item('R1-B1').implemented !== undefined, true);
+});
+
 test('state mark-implemented fails closed: a conflicting base merge, or a state whose toHead git cannot resolve, refuses the mark', (t) => {
   const w = worldIgnoringReview(t);
   assertExit(w.codex(1, findingsOf([finding()])), 0);

@@ -242,7 +242,8 @@ function parseRawZ(out) {
 // Throws on a git error or output it cannot parse. -> the subset of `changes`
 function ownAuthored({ root, config, toHead, changes }) {
   const o = { cwd: root };
-  const log = git(['log', '--no-merges', '--no-renames', '--raw', '--no-abbrev', '-z', '--format=', `${revParse(toHead, o)}..HEAD`, `^${reviewBaseRef(root, config)}`], o);
+  // --no-show-signature: a user's log.showSignature=true prints the gpg/ssh verdict before the records even with --format=
+  const log = git(['log', '--no-merges', '--no-show-signature', '--no-renames', '--raw', '--no-abbrev', '-z', '--format=', `${revParse(toHead, o)}..HEAD`, `^${reviewBaseRef(root, config)}`], o);
   const wrote = new Map(); // path -> Set of the blob ids ordinary commits left there
   for (const { path: file, id } of parseRawZ(log)) {
     if (!wrote.has(file)) wrote.set(file, new Set());
