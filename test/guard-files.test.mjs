@@ -1296,7 +1296,7 @@ test('#128 R3-F1: a very long wildcard segment is refused at once (no quadratic 
 });
 
 // R3-F2: program text can name the folder through the environment variable rather than a path.
-test('#128 R3-F2: program text that builds a transcript path from CLAUDE_CONFIG_DIR is refused; the variable alone stays open', () => {
+test('#128 R3-F2: program text that builds a transcript path from CLAUDE_CONFIG_DIR is refused; so is the variable alone in program text (R7)', () => {
   const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
   for (const cmd of [
     "python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/projects/-repo/abc.jsonl','w').write('x')\"",
@@ -1306,17 +1306,18 @@ test('#128 R3-F2: program text that builds a transcript path from CLAUDE_CONFIG_
     "python3 - <<'EOF'\nimport os\nopen(os.environ['CLAUDE_CONFIG_DIR'] + '/projects/-repo/abc.jsonl', 'w').write('x')\nEOF",
     "cat <<EOF | python3\nimport os\nopen(os.environ['CLAUDE_CONFIG_DIR'] + \"/projects/-repo/abc.jsonl\", \"w\").write(\"x\")\nEOF",
   ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  // (R7: a program naming the root is refused whatever it does, so these read-only programs are refused too; a program naming no root stays open)
   for (const cmd of [
     "python3 -c \"import os; print(os.environ['CLAUDE_CONFIG_DIR'])\"",
     "node -e \"console.log(process.env.CLAUDE_CONFIG_DIR)\"",
     "python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/settings.json').read()\"",
-  ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
   // (R6-B1: program text has no memory exemption)
   assert.equal(bash("python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/projects/-repo/memory/n.md','w').write('x')\"", { env }), 'deny');
 });
 
 // R4-B1 / R4-F1: the folder joined from pieces (os.path.join, pathlib /, path.join) has no contiguous <root>/projects/.
-test('#128 R4-B1/F1: program text with a config root, a projects word and a .jsonl word is refused whatever joins them; any one missing stays open', () => {
+test('#128 R4-B1/F1: program text with a config root, a projects word and a .jsonl word is refused whatever joins them; a root with no projects or .jsonl word is refused too (R7); no root stays open', () => {
   const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
   for (const cmd of [
     "python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo','abc.jsonl'),'w').write('x')\"",
@@ -1324,9 +1325,10 @@ test('#128 R4-B1/F1: program text with a config root, a projects word and a .jso
     "node -e \"require('fs').writeFileSync(require('path').join(process.env.CLAUDE_CONFIG_DIR,'projects','-repo','abc.jsonl'),'x')\"",
     "python3 -c \"import os; open(os.path.join('/home/u/claude-config','projects','-repo','abc.jsonl'),'w').write('x')\"",
     "python3 -c \"import os; open(os.path.join(os.path.expanduser('~'),'.claude','projects','-repo','abc.jsonl'),'w').write('x')\"",
+    // (R7: no projects or .jsonl word needed)
+    "python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'settings.json')).read()\"",
   ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
   for (const cmd of [
-    "python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'settings.json')).read()\"",
     "python3 -c \"open('/tmp/projects/a.jsonl','w').write('x')\"",
     "python3 -c \"import os; open(os.path.join('/mnt/home/u/claude-config','projects','-repo','abc.jsonl'),'w').write('x')\"",
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
@@ -1757,7 +1759,6 @@ test('#128 R5-B1: program text with a config root and a projects word is refused
   for (const cmd of [
     "python3 -c \"import shutil; shutil.copytree('/tmp/forged','/tmp/projects/-repo',dirs_exist_ok=True)\"",
     "python3 -c \"import shutil; shutil.copytree('/tmp/forged','/mnt/home/u/claude-config/projects/-repo',dirs_exist_ok=True)\"",
-    "python3 -c \"import os; print(os.environ['CLAUDE_CONFIG_DIR'])\"",
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
   // (a memory mention does not excuse a second projects word that is not a memory path)
   assert.equal(bash("python3 -c \"import os,shutil; shutil.copytree('/tmp/f',os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo')); print('projects','-x','memory')\"", { env }), 'deny');
@@ -1788,7 +1789,7 @@ test('#128 R6-B1: program text that walks up from a projects/<proj>/memory path 
   assert.equal(file('Write', { file_path: '/home/u/claude-config/projects/-repo/memory/notes.md', content: 'x' }, { env }), 'allow');
 });
 
-test('#128 R6-F1: program text naming a bare config root with a write or whole-tree operation is refused with no projects word (python, node; variable, literal root, ~/.claude); read-only and unrelated programs stay open', () => {
+test('#128 R6-F1: program text naming a bare config root is refused whatever it does, with no projects word (python, node; variable, literal root, ~/.claude); programs naming no root stay open', () => {
   const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
   for (const cmd of [
     "python3 -c \"import os,shutil; shutil.copytree('/tmp/forged', os.environ['CLAUDE_CONFIG_DIR'], dirs_exist_ok=True)\"",
@@ -1808,7 +1809,7 @@ test('#128 R6-F1: program text naming a bare config root with a write or whole-t
     "node -e \"require('fs').rmSync(process.env.CLAUDE_CONFIG_DIR,{recursive:true})\"",
     "node -e \"require('fs').renameSync('/tmp/forged','/home/u/claude-config')\"",
     "node -e \"require('fs').cpSync('/tmp/forged','/home/u/claude-config',{recursive:true})\"",
-    "node -e \"require('tar').x({file:'x',cwd:process.env.CLAUDE_CONFIG_DIR}); require('fs').writeFileSync('a','b')\"",
+    "node -e \"require('tar').x({file:'x',cwd:process.env.CLAUDE_CONFIG_DIR})\"",
     "python3 -c \"import shutil; shutil.rmtree('/home/u/.claude-eaglewatch')\"",
     "python3 -c \"import shutil; shutil.copytree('/tmp/forged','/home/u/.claude-eaglewatch',dirs_exist_ok=True)\"",
     "python3 -c \"import os,shutil; shutil.rmtree(os.path.expanduser('~/.claude'))\"",
@@ -1817,10 +1818,6 @@ test('#128 R6-F1: program text naming a bare config root with a write or whole-t
   ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
   for (const cmd of [
     "node -e \"console.log(path.join(home,'.claude','projects'))\"",
-    "python3 -c \"import os; print(os.environ['CLAUDE_CONFIG_DIR'])\"",
-    "python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/settings.json').read()\"",
-    "python3 -c \"import os; print(os.listdir(os.environ['CLAUDE_CONFIG_DIR']))\"",
-    "node -e \"console.log(require('fs').readdirSync(process.env.CLAUDE_CONFIG_DIR))\"",
     "python3 -c \"import shutil; shutil.copytree('/tmp/a','/tmp/b')\"",
     "python3 -c \"import shutil; shutil.rmtree('/home/u/claude-config-old')\"",
     "python3 -c \"import shutil; shutil.rmtree('/mnt/home/u/claude-config')\"",
@@ -1831,6 +1828,46 @@ test('#128 R6-F1: program text naming a bare config root with a write or whole-t
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
   // (a literal root that is not configured is just a folder)
   assert.equal(bash("python3 -c \"import shutil; shutil.rmtree('/home/u/claude-config')\""), 'allow');
+});
+
+// R7-B1 / R7-F1 / R7-F2 / R7-F3 (owner-approved simplification): program text that names a config root is refused WHATEVER it does (read or write), so no list of write verbs can be outrun;
+// the home .claude spelling carries a path tail; a repo's own .claude/ (under a /home/... path) stays open.
+test('#128 R7-B1/F2: program text naming a config root is refused whatever it does (extract, tar.x, link, os.open + sendfile, print(file=), dd) and when it only reads', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    "python3 -c 'import os,tarfile; t=tarfile.open(\"/tmp/payload.tar\"); t.extract(t.getmembers()[0],os.environ[\"CLAUDE_CONFIG_DIR\"])'",
+    "node -e \"require('tar').x({cwd: process.env.CLAUDE_CONFIG_DIR})\"",
+    "python3 -c \"import os; os.link('/tmp/forged', os.path.join(os.environ['CLAUDE_CONFIG_DIR'], *parts))\"",
+    "python3 -c \"import os; p=os.environ['CLAUDE_CONFIG_DIR']+'/x'; fd=os.open(p, os.O_WRONLY|os.O_CREAT|os.O_TRUNC); os.sendfile(fd, src, 0, n)\"",
+    "python3 -c \"import os; p=os.environ['CLAUDE_CONFIG_DIR']+'/x'; print(data, file=open(p, **{'mode':'w'}))\"",
+    "python3 -c \"import os,subprocess; p=os.environ['CLAUDE_CONFIG_DIR']+'/x'; subprocess.run(['dd','if=/tmp/f','of='+p])\"",
+    // read-only programs naming a root are refused by design
+    "python3 -c \"import os; print(os.environ['CLAUDE_CONFIG_DIR'])\"",
+    "python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/settings.json').read()\"",
+    "python3 -c \"import os; print(os.listdir(os.environ['CLAUDE_CONFIG_DIR']))\"",
+    "node -e \"console.log(require('fs').readdirSync(process.env.CLAUDE_CONFIG_DIR))\"",
+    "python3 -c \"import os; open('/home/u/claude-config/settings.json').read()\"",
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+});
+
+test('#128 R7-F1: the home .claude folder spelled as a quoted piece with a path tail is refused (copytree, three spellings)', () => {
+  for (const cmd of [
+    "python3 -c \"import os,shutil; shutil.copytree('/tmp/forged', os.environ['HOME'] + '/.claude/projects/-repo', dirs_exist_ok=True)\"",
+    "python3 -c \"from pathlib import Path; import shutil; shutil.copytree('/tmp/forged', Path.home() / '.claude/projects/-repo', dirs_exist_ok=True)\"",
+    "python3 -c \"import os,shutil; shutil.copytree('/tmp/forged', os.path.join(os.path.expanduser('~'), '.claude/projects'), dirs_exist_ok=True)\"",
+    // (no write word at all: the home folder named with a path tail is refused like the bare one)
+    "python3 -c \"import os; print(os.environ['HOME'] + '/.claude/projects/-repo')\"",
+    "python3 -c \"from pathlib import Path; print(Path.home() / '.claude/projects/-repo')\"",
+    "python3 -c \"import os; print(os.path.join(os.path.expanduser('~'), '.claude/projects'))\"",
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
+test('#128 R7-F3: a repo path with a home word, and text naming no root, stay open', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    "python3 -c \"import os; open(os.path.join('/home/u/repo', '.claude', 'settings.local.json'), 'w').write('{}')\"",
+    "python3 -c \"print('x', 'a')\"",
+  ]) { assert.equal(bash(cmd, { env }), 'allow', cmd); assert.equal(bash(cmd), 'allow', cmd); }
 });
 
 // R5-F1: a wildcard root/projects segment with a literal folder below the project is the session folder the literal rule protects (mirrors TRANSCRIPT_BELOW).

@@ -236,7 +236,6 @@ table('code-built path', [
 table('code-built path', [
   `node -e "console.log(require('os').homedir())"`,
   'node -e "console.log(process.env.HOME)"',
-  `node -e "console.log(require('path').join(require('os').homedir(),'.claude','projects'))"`,
   'echo $HOME',
   'cp x .claude/settings.json',
   'cat ~/proj/.claude/settings.json',
@@ -249,6 +248,7 @@ table('code-built path', [
 table('code-built path', [
   `node -e "require('fs').writeFileSync(require('os').homedir()+'/.claude/CLAUDE.md','x')"`,
   `python3 -c "from pathlib import Path; (Path.home()/'.claude'/'CLAUDE.md').write_text('x')"`,
+  `node -e "console.log(require('path').join(require('os').homedir(),'.claude','projects'))"`, // (R7: a program naming the home config folder is refused even when it only reads)
 ], 'deny');
 
 // ---- 4. variables ---------------------------------------------------------------------------------
