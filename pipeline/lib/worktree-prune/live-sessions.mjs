@@ -297,19 +297,32 @@ export function scanLiveSessions({ home = os.homedir(), env = process.env, platf
 // the worktree is still where it was). A session is in it when its working folder, as logged or resolved through symlinks,
 // equals or lies below one of them (case rules as isInside: folded on macOS and Windows; `platform` is a test seam).
 // -> { hits: [{ id, pid }], unplaced: string[] }. An unavailable scan says nothing.
-export function liveSessionsIn(scan, spellings, { platform = process.platform } = {}) {
+// `strict` (`pipeline worktrees sessions`; prune leaves it off): a working folder whose realpath fails, for any reason (denied,
+// gone, a loop), and that does not match by its logged spelling may be an alias of the folder (a symlink under an unreadable
+// ancestor, or one deleted since) and cannot be told from a folder elsewhere, so it goes to `unplaced` naming the session and folder.
+export function liveSessionsIn(scan, spellings, { platform = process.platform, strict = false } = {}) {
   if (!scan?.available) return { hits: [], unplaced: [] };
   const roots = spellings.map(unFirm);
   const forms = (cwd) => {
     let real = cwd;
+    let failed = null;
     try {
       real = realpathSync(cwd);
-    } catch { /* gone, or not readable: only the logged spelling */ }
-    return [...new Set([cwd, real].map(unFirm))];
+    } catch (err) { /* gone, or not readable: only the logged spelling */
+      failed = err?.code ?? 'unreadable';
+    }
+    return { forms: [...new Set([cwd, real].map(unFirm))], failed };
   };
   const hits = [];
+  const unplaced = [...(scan.unplaced ?? [])];
   for (const s of scan.sessions) {
-    if (forms(s.cwd).some((c) => roots.some((r) => isInside(c, r, platform))) && !hits.some((h) => h.id === s.id && h.pid === s.pid)) hits.push({ id: s.id, pid: s.pid });
+    const { forms: seen, failed } = forms(s.cwd);
+    if (seen.some((c) => roots.some((r) => isInside(c, r, platform)))) {
+      if (!hits.some((h) => h.id === s.id && h.pid === s.pid)) hits.push({ id: s.id, pid: s.pid });
+    } else if (strict && failed) {
+      const note = `open session ${s.id} pid ${s.pid}: working folder ${JSON.stringify(s.cwd)} cannot be resolved (${failed}), so it cannot be told apart from an alias of this folder; close that session`;
+      if (!unplaced.includes(note)) unplaced.push(note);
+    }
   }
-  return { hits, unplaced: scan.unplaced ?? [] };
+  return { hits, unplaced };
 }
