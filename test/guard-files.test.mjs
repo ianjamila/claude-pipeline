@@ -1068,6 +1068,14 @@ test('#128 R1-B1: replacing or filling a transcript folder (projects, a project,
     'cd ~/.claude/projects/-repo && tar -xf /tmp/forged.tar', // (a run in the folder, no folder word)
     'cd ~/.claude/projects/-repo && /usr/bin/tar -xf /tmp/forged.tar', // (no relative word at all: the folder the shell sits in is what counts)
     'cd ~/.claude/projects/-repo/abc/subagents && tar -xf /tmp/forged.tar',
+    // R8-B1: projects/ itself holds the session folders, so a shell sitting there fills them without naming one
+    'cd ~/.claude/projects && /usr/bin/tar -xf /tmp/forged.tar',
+    'cd ~/.claude/projects && tar -xf /tmp/forged.tar',
+    'cd ~/.claude/projects && unzip -o /tmp/forged.zip',
+    'cd ~/.claude/projects && git clone /tmp/forged -repo',
+    'cd ~/.claude/projects && curl -O https://example.com/forged.jsonl',
+    'cd ~/.claude-eaglewatch/projects/ && tar -xf /tmp/forged.tar',
+    'cd ~/.claude/projects && cp -R /tmp/forged -repo',
     'cp -R /tmp/forged/. ~/.claude/projects/C--Users-u-repo/',
     'cp -R /tmp/forged/. ~/.claude/projects/-rep?/',
     'rm -rf ~/.claude/projects/*',
@@ -1079,7 +1087,8 @@ test('#128 R1-B1: replacing or filling a transcript folder (projects, a project,
     'cp /tmp/note.md ~/.claude/projects/-repo/memory/note.md',
     'mkdir -p ~/.claude/projects/-repo',
     'cp -R /tmp/x /tmp/projects/-repo/',
-    'cd ~/.claude/projects && echo x > notes.txt', // (from projects/ itself a shell may write notes; guard-a2-shell-f2d)
+    'cd ~/.claude/projects && ls -la',
+    'cd ~/.claude/projects && echo x > notes.txt', // (a literal file target in projects/ is no transcript; bare writers there are refused, R8-B1)
     'cd ~/.claude/projects/-repo/memory && echo x > n.md',
     'rm -rf ~/.claude/projects/old', // (no session's folder: the old table in guard-files-bypass keeps it allowed)
   ]) assert.equal(bash(cmd), 'allow', cmd);
