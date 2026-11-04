@@ -428,3 +428,26 @@ test('a resolution-only round survives save / load and the published-comment rou
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('addRound persists promptSha256; it survives save, comment encode/decode and load; a state without it still loads', () => {
+  const sha = 'ab'.repeat(32);
+  const withSha = addRound(emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'low' }), {
+    n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], promptSha256: sha,
+  });
+  assert.equal(withSha.rounds[0].promptSha256, sha);
+  assert.equal(decodeFromComment(encodeForComment(withSha)).rounds[0].promptSha256, sha);
+  const dir = tmp();
+  try {
+    saveState(dir, withSha);
+    assert.equal(loadState(dir).rounds[0].promptSha256, sha);
+
+    // an old state (no field) loads unchanged, and addRound does not invent one
+    const old = sampleState();
+    assert.equal(Object.hasOwn(old.rounds[0], 'promptSha256'), false);
+    saveState(dir, old);
+    assert.deepEqual(loadState(dir), old);
+    assert.deepEqual(decodeFromComment(encodeForComment(old)), old);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
