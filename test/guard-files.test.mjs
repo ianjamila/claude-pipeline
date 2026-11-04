@@ -1351,6 +1351,14 @@ test('#128 R4-B2/F2: a trailing zsh glob qualifier (/) does not hide the config 
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
 });
 
+// Codex finding 1: dropping a trailing (...) may only WIDEN the match; a real folder whose name ends in (...) is still that folder.
+test('#128 R4-B2 widen-only: a config dir whose real name ends in (...) is still refused, as literal -C target and as cwd', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config(copy)' };
+  assert.equal(bash("tar -xf x -C '/home/u/claude-config(copy)'", { env }), 'deny');
+  assert.equal(bash('tar -xf x', { env, cwd: '/home/u/claude-config(copy)' }), 'deny');
+  assert.equal(bash('tar -xf x -C /tmp/out?(/)', { env }), 'allow');
+});
+
 test('Phase 3b: a program that resolves into a review folder is judged like any other (only the installed pipeline is trusted)', () => {
   // (run.mjs links to a file in a round folder: the hook judges the real file's text, it does not skip it as a pipeline program)
   const prog = '/repo/.review/round-1/x.mjs';
