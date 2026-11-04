@@ -1310,6 +1310,165 @@ test('state mark-implemented: a conflict resolved by merging a branch other than
   assert.doesNotMatch(refused.json.message, /resolve the base branch merge and try again/);
 });
 
+// ---- cp #120: a file counts as the fix only when an ordinary (non-merge) commit of the PR wrote its current content --------------
+
+// A hand edit typed into a merge commit (an "evil merge": a tree that differs from the automatic merge of its parents) is not the PR's
+// fix, whichever merge it is in and whichever base the measurement starts from.
+const NOT_WRITTEN = /was not written by an ordinary commit of this PR/;
+const markA = (w) => w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+const refusedAs = (w, named) => {
+  const r = markA(w);
+  assertExit(r, 2, r.stderr + r.stdout);
+  assert.equal(r.json.error, 'no-code-change');
+  assert.match(r.json.message, NOT_WRITTEN);
+  assert.match(r.json.message, named);
+  assert.equal(w.item('R1-B1').implemented, undefined);
+  return r;
+};
+const countedAs = (w) => {
+  const r = markA(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(w.item('R1-B1').implemented, true);
+};
+const SMUGGLED = { 'src/smuggled.js': 'export const evil = true;\n' };
+const FROM_MAIN = { 'src/from-main2.js': 'export const other2 = 1;\n' };
+
+test('state mark-implemented (#120): a hand-written file in a clean main merge after the conflict-resolving merge is not the fix', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  mergeMainInto(w, FROM_MAIN, { evil: SMUGGLED });
+  refusedAs(w, /smuggled\.js/);
+});
+
+test('state mark-implemented (#120): an extra line typed into a clean main merge, in a file the PR never changed, is not the fix', (t) => {
+  const w = acceptedWorld(t);
+  conflictMerge(w);
+  mergeMainInto(w, FROM_MAIN, { evil: { 'src/b.js': `${bFile}export const extra = 1;\n` } });
+  refusedAs(w, /src\/b\.js/);
+});
+
+test('state mark-implemented (#120): the same without a conflict (the synthetic base): a clean main merge with a hand edit is not the fix', (t) => {
+  const w = acceptedWorld(t);
+  mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' }, { evil: SMUGGLED });
+  refusedAs(w, /smuggled\.js/);
+});
+
+test('state mark-implemented (#120): an octopus merge (main and a side branch) with a hand edit is not the fix', (t) => {
+  const w = acceptedWorld(t);
+  // side branches from the fork point, not from main, so git keeps all three parents; its own commit changes only a test file
+  w.repo.git(['checkout', '-q', '-b', 'side', w.base]);
+  w.repo.write('src/side.test.js', 'console.log("side");\n');
+  w.repo.commit('side work');
+  w.repo.checkout('main');
+  w.repo.write('src/from-main.js', 'export const other = 1;\n');
+  w.repo.commit('main moves on');
+  w.repo.checkout('feat/x');
+  w.repo.git(['merge', '--no-ff', '--no-commit', '-m', 'octopus', 'main', 'side']);
+  w.repo.write('src/smuggled.js', SMUGGLED['src/smuggled.js']);
+  w.repo.git(['add', '-A']);
+  w.repo.git(['commit', '-q', '--no-edit']);
+  assert.equal(w.repo.git(['rev-list', '--parents', '-n', '1', 'HEAD']).trim().split(/\s+/).length, 4, 'the merge has three parents');
+  refusedAs(w, /smuggled\.js/);
+});
+
+test('state mark-implemented (#120): a merge of a branch other than the default branch brings that branch\'s own commits, which are PR work', (t) => {
+  const w = acceptedWorld(t);
+  w.repo.git(['checkout', '-q', '-b', 'topic', w.base]);
+  w.repo.write('src/topic.js', 'export const topic = 1;\n');
+  w.repo.commit('topic work');
+  w.repo.checkout('feat/x');
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge topic into feat/x', 'topic']);
+  countedAs(w);
+});
+
+test('state mark-implemented (#120): a fix committed before a hand-edited main merge still counts; so does one committed after it', (t) => {
+  const w = acceptedWorld(t);
+  fixA(w);
+  mergeMainInto(w, FROM_MAIN, { evil: SMUGGLED });
+  countedAs(w);
+
+  const w2 = acceptedWorld(t);
+  mergeMainInto(w2, FROM_MAIN, { evil: SMUGGLED });
+  fixA(w2);
+  countedAs(w2);
+});
+
+test('state mark-implemented (#120): a change reverted by a second commit and then hand-edited inside a merge is not the fix', (t) => {
+  const w = acceptedWorld(t);
+  w.repo.write('src/b.js', `${bFile}export const changed = 1;\n`);
+  w.repo.commit('change b');
+  w.repo.write('src/b.js', bFile);
+  w.repo.commit('revert b');
+  mergeMainInto(w, FROM_MAIN, { evil: { 'src/b.js': `${bFile}export const typed = 1;\n` } });
+  refusedAs(w, /src\/b\.js/);
+});
+
+test('state mark-implemented (#120): a merge that discards an earlier change to a file leaves that file uncounted', (t) => {
+  const w = acceptedWorld(t);
+  w.repo.write('src/b.js', `${bFile}export const changed = 1;\n`);
+  w.repo.commit('change b');
+  mergeMainInto(w, FROM_MAIN, { evil: { 'src/b.js': `${bFile}export const somethingElse = 2;\n` } });
+  refusedAs(w, /src\/b\.js/);
+});
+
+test('state mark-implemented (#120): main\'s own change merged cleanly into the fixed file leaves it uncounted until a commit finishes the fix there', (t) => {
+  const w = acceptedWorld(t);
+  w.repo.write('src/b.js', bFile.replace('w1 = 1', 'w1 = 100'));
+  w.repo.commit('fix b');
+  mergeMainInto(w, { 'src/b.js': bFile.replace('w8 = 8', 'w8 = 800') });
+  assert.match(readFileSync(join(w.repo.dir, 'src/b.js'), 'utf8'), /w1 = 100[\s\S]*w8 = 800/, 'a clean merge holding both edits');
+  refusedAs(w, /src\/b\.js/);
+  w.repo.write('src/b.js', bFile.replace('w1 = 1', 'w1 = 101').replace('w8 = 8', 'w8 = 800'));
+  w.repo.commit('finish the fix in b');
+  countedAs(w);
+});
+
+test('state mark-implemented (#120): deleting a code file is a fix', (t) => {
+  const w = acceptedWorld(t);
+  w.repo.rm('src/b.js');
+  w.repo.commit('delete b');
+  countedAs(w);
+});
+
+test('state mark-implemented (#120): a file name with non-ASCII characters is counted when a commit wrote it and refused when a merge did', (t) => {
+  const w = acceptedWorld(t);
+  w.repo.write('src/café.js', 'export const cafe = 1;\n');
+  w.repo.commit('add cafe');
+  countedAs(w);
+
+  const w2 = acceptedWorld(t);
+  mergeMainInto(w2, FROM_MAIN, { evil: { 'src/café.js': 'export const cafe = 1;\n' } });
+  refusedAs(w2, /café\.js/);
+});
+
+test('state mark-implemented (#120): a test file hand-edited inside a merge cannot satisfy a testing finding', (t) => {
+  const mk = () => {
+    const w = worldIgnoringReview(t);
+    assertExit(w.codex(1, findingsOf([finding({ category: 'testing', file: 'src/a.test.js', line: 1 })])), 0);
+    assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+    return w;
+  };
+  const w = mk();
+  mergeMainInto(w, FROM_MAIN, { evil: { 'src/a.test.js': 'console.log("typed into the merge");\n' } });
+  refusedAs(w, /a\.test\.js/);
+
+  const w2 = mk();
+  w2.repo.write('src/a.test.js', 'console.log("a real test fix");\n');
+  w2.repo.commit('test fix');
+  countedAs(w2);
+});
+
+test('state mark-implemented (#120): a merge that sets a file to main\'s earlier content is not the fix (commits of the default branch never count)', (t) => {
+  const w = acceptedWorld(t);
+  w.repo.checkout('main');
+  w.repo.write('src/p.js', 'export const p = "z1";\n');
+  w.repo.commit('main: p z1');
+  w.repo.checkout('feat/x');
+  // main moves on again; the merge brings p = z2 and a hand edit puts it back to z1, a blob only main's first commit wrote
+  mergeMainInto(w, { 'src/p.js': 'export const p = "z2";\n' }, { evil: { 'src/p.js': 'export const p = "z1";\n' } });
+  refusedAs(w, /src\/p\.js/);
+});
+
 test('state record-followup and set-outcome', (t) => {
   const w = world(t);
   assertExit(w.codex(1, standardFindings()), 0);
