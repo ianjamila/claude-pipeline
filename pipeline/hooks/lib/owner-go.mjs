@@ -197,12 +197,16 @@ export function lastRequestText(transcriptPath, opts = {}) {
 // what to do about it"), so no test of WHAT the reply says can be complete: ANY non-empty text in a dropped reply voids the pending slot: '' (the owner is asked again, the nudge
 // fires). The cost is one re-ask; a harness turn the agent answers with tool calls only (no text) leaves the ask standing, which is what skipSynthetic is for.
 // R4-F3 (owner decision 2026-11-03): a tool-only reply can still SURFACE a newer ask, in the tool call (a Bash `ruling-request` command, an echoed
-// ruling line) or in its result (a user entry with a tool_result block, which the owner sees in the tool box). Those lines are machine-printed, so
-// here a fixed test is sound: a tool_use input or a tool_result that contains a ruling line, a merge line or a `head <sha> · items` line, or the
-// command name `ruling-request`, voids the slot like text does. A tool-only reply without any of them still leaves the ask standing.
+// ruling line) or in its result (a user entry with a tool_result block, which the owner sees in the tool box): a tool_use input or a tool_result that contains a ruling line,
+// a merge line or a `head <sha> · items` line, or the command name `ruling-request`, voids the slot like text does.
+// R5-B2 (owner decision 2026-11-04, option b): those canonical lines are NOT all the agent can show. It writes a tool_use input itself (`echo 'For PR #59, please answer R1-B1: accept or reject'`),
+// so no fixed wording test is complete there either (the premise of R4-F3, that the lines are machine-printed, holds only for a result). A middle ground between voiding every tool-only reply
+// (which would end skipSynthetic) and a wording test: tool input or result that ALSO holds a finding id, a PR reference, a decision word or a question mark voids the slot. The cost is one
+// re-ask; a tool-only reply without any of them (`ls` and `file.txt`) still leaves the ask standing.
 const showsText = (text) => text.trim() !== '';
 const SURFACED_ASK = new RegExp(`Owner ruling needed\\s+#\\d|ruling-request|${READY_LINE.source}`, 'iu'); // (case-insensitive like RULING_LINE and HEAD_LINE: a detector narrower than the parsers lets a differently-cased ask through)
-const surfacesAsk = (text) => SURFACED_ASK.test(text) || text.split(/\r?\n/).some((l) => HEAD_LINE.test(l));
+const ASK_WORDS = /(?<![\w])R\d{1,4}-[A-Za-z]{1,8}\d{1,4}(?![\w])|#\d|(?<![\w])PR\s*#?\d|(?<![\w])(?:accept|reject|follow-?up)(?![\w])|\?/iu; // (a finding id as ITEM_ID spells it, #N / PR N, a decision word, a question mark)
+const surfacesAsk = (text) => SURFACED_ASK.test(text) || ASK_WORDS.test(text) || text.split(/\r?\n/).some((l) => HEAD_LINE.test(l));
 // The text of a tool_result block's content (a string, or text blocks), or of a tool_use block's input.
 const toolResultText = (c) => (typeof c === 'string' ? c : Array.isArray(c) ? c.map((x) => (typeof x === 'string' ? x : typeof x?.text === 'string' ? x.text : '')).join('\n') : '');
 // A tool_use input as the owner reads it: the DECODED string values, one per line (JSON.stringify would re-escape a tab or a newline in a command to `\t` / `\n`, so a ruling

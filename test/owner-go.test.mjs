@@ -547,6 +547,51 @@ test('#128 rulings (R4-F3): a tool call or result that surfaces a newer ask void
   assert.deepEqual([r?.pr, r?.ids], [58, ['R1-F1']], 'an unrelated tool: the ask still binds');
 });
 
+// R5-B2 (owner decision 2026-11-04, option b): the agent AUTHORS a tool_use input, so `echo 'For PR #59, please answer R1-B1: accept or reject'` is a visible newer ask no fixed wording test sees.
+// In a skipped turn, tool input or result that holds a finding id, a PR reference, a decision word or a question mark voids the pending ask; a plain tool use does not.
+test('#128 rulings (R5-B2): an agent-authored paraphrase of an ask in a skipped turn voids the pending one, in the tool call and in its result; a plain tool use does not', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-11-04T10:00:00Z');
+  const head = [promptEntry('go'), said(ASK_REPLY)];
+  const use = (command) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: { command } }] } });
+  const result = (c) => ({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'x', content: c }] } });
+  const notice = () => promptEntry(NOTICE, NOTICE_META);
+  const rule = (between, answer = 'R1-F1: reject', { present = true } = {}) => {
+    const e = promptEntry(answer);
+    return recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: answer, prompt_id: e.promptId, transcript_path: transcript(home, present ? [...head, ...between, e] : [...head, ...between]) }, { home, now });
+  };
+  // the review's example
+  for (const present of [true, false]) assert.equal(rule([notice(), use("echo 'For PR #59, please answer R1-B1: accept or reject'"), result('For PR #59, please answer R1-B1: accept or reject')], 'R1-F1: reject', { present }), null, `the echoed paraphrase (${present})`);
+  // each trigger alone, in the call and in the result
+  for (const [name, text] of [
+    ['a finding id (R12-F3)', 'about R12-F3 now'],
+    ['a finding id (R2-S1)', 'R2-S1'],
+    ['a finding id (R3-W2, lower case)', 'see r3-w2'],
+    ['a PR reference (#123)', 'the one in #123'],
+    ['a PR reference (PR 123)', 'pr 123 looks odd'],
+    ['a PR reference (PR #123)', 'PR #123'],
+    ['a decision word (accept)', 'Accept'],
+    ['a decision word (reject)', 'please REJECT it'],
+    ['a decision word (follow-up)', 'make it a follow-up'],
+    ['a decision word (followup)', 'followup'],
+    ['a question mark', 'what do you think?'],
+  ]) {
+    assert.equal(rule([notice(), use(`echo '${text}'`), result('ok')]), null, `${name} in the call`);
+    assert.equal(rule([notice(), use('cat out.txt'), result(text)]), null, `${name} in a result`);
+    assert.equal(rule([notice(), use('cat out.txt'), result([{ type: 'text', text }])]), null, `${name} in a result (text blocks)`);
+    const fresh = rule([notice(), use(`echo '${text}'`), result('ok'), promptEntry('what is that?'), said(ASK_REPLY)]);
+    assert.deepEqual([fresh?.pr, fresh?.ids], [58, ['R1-F1']], `${name}, then a fresh ask`);
+  }
+  // whole words only: an id-like or decision-like substring of a longer word is no trigger
+  for (const text of ['unaccepted', 'rejection', 'R1-B1x', 'PRs', 'a#b']) {
+    const r = rule([notice(), use(`echo '${text}'`), result(text)], 'R1-F1: reject');
+    assert.deepEqual([r?.pr, r?.ids], [58, ['R1-F1']], `no trigger in ${text}`);
+  }
+  // a plain tool use leaves the ask standing (skipSynthetic still works)
+  const r = rule([notice(), use('ls'), result('file.txt')], 'R1-F1: reject');
+  assert.deepEqual([r?.pr, r?.ids], [58, ['R1-F1']], 'a plain tool use: the ask still binds');
+});
+
 // Codex finding 2: the ruling-line parser (RULING_LINE) matches any case, so the surfaced-ask detector must too.
 test('#128 rulings (R4-F3, case): a newer ask printed in another case in a skipped turn still voids the pending one', () => {
   const home = tmp();
