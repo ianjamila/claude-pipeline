@@ -518,7 +518,7 @@ test('#128 rulings: the owner can answer after a notice (or several) and the rep
 test('#128 rulings (R4-F3): a tool call or result that surfaces a newer ask voids the pending one; an unrelated tool does not', () => {
   const home = tmp();
   const now = () => Date.parse('2026-11-03T10:00:00Z');
-  const ANSWER = 'R1-B1: accept';
+  const ANSWER = 'R1-F1: accept'; // the pending ask's id: a null below is the void, not a mismatched answer
   const head = [promptEntry('go'), said(ASK_REPLY)];
   const rule = (between, { present = true } = {}) => {
     const e = promptEntry(ANSWER);
