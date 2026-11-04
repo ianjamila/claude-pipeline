@@ -6,9 +6,9 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
   presentedRuling, recordRuling, ownerRuled, rulingsIn,
@@ -619,4 +619,31 @@ test('owner-go round grant: the helper records through the account home under a 
   const r = ownerGrants(t, 'grant round 4', roundRequest(7, 4, GHEAD, 'Acme/Widgets'));
   assert.deepEqual([r.kind, r.repo, r.pr, r.k], ['extra-round', 'acme/widgets', 7, 4]);
   assert.equal(ownerGrantedRounds({ repo: 'acme/widgets', pr: 7, k: 4, head: GHEAD }).some((x) => x.session === r.session), true);
+});
+
+// #122: a test process that dies before its t.after hooks run still removes the owner-go files IT wrote (the exit hook of the test helper),
+// and nothing else: the child records one ruling and leaves a second, hand-made file next to it that must survive.
+test('test helper owner-go: a process that exits without t.after removes the records it wrote, and touches no other file', () => {
+  const helper = pathToFileURL(fileURLToPath(new URL('./helpers/owner-go.mjs', import.meta.url))).href;
+  const hooks = pathToFileURL(fileURLToPath(new URL('../pipeline/hooks/lib/owner-go.mjs', import.meta.url))).href;
+  const other = join(ownerGoDir(), `test-${randomUUID()}.jsonl`);
+  mkdirSync(ownerGoDir(), { recursive: true });
+  writeFileSync(other, '');
+  try {
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { existsSync } from 'node:fs';
+      import { join } from 'node:path';
+      import { ownerRules, rulingRequest } from ${JSON.stringify(helper)};
+      import { ownerGoDir } from ${JSON.stringify(hooks)};
+      const record = ownerRules({ after() {} }, 'R1-B1: follow-up.', rulingRequest(7, ['R1-B1'], 'acme/widgets-exit-hook'));
+      console.log(JSON.stringify({ file: join(ownerGoDir(), record.session + '.jsonl'), written: existsSync(join(ownerGoDir(), record.session + '.jsonl')) }));
+    `], { encoding: 'utf8' });
+    assert.equal(child.status, 0, child.stderr);
+    const out = JSON.parse(child.stdout);
+    assert.equal(out.written, true, 'the child wrote its record');
+    assert.equal(existsSync(out.file), false, 'removed when the child exited');
+    assert.equal(existsSync(other), true, 'a file the child did not write is left alone');
+  } finally {
+    rmSync(other, { force: true });
+  }
 });

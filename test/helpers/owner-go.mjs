@@ -1,6 +1,11 @@
 // #58: the owner's chat "merge", as the owner-go recorder writes it. `P merge` reads the records from the account's real home
 // (never $HOME, which the agent could point elsewhere), so a test writes its record there under a random session name and
-// deletes it afterwards (t.after). A random temp-repo head never matches anything else.
+// deletes it afterwards (t.after, and at process exit for a test that died before t.after ran).
+// ISOLATION (#122): the folder is shared by every test and every concurrent run of the suite, and a ruling or a round grant matches on
+// repository, PR and item (or round) only. A test that records those must build its world with a repository name of its own
+// (test/cli-review.test.mjs ownerWorld: a unique slug per test), so its records can never match another test's or another process's.
+// Approval records are bound to a head instead; the temp repos use fixed author details, so identical fixtures made in the same second
+// can share heads - callers of ownerSays keep that known risk (tracked in a follow-up issue).
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -15,6 +20,18 @@ export const ownerRules = (t, prompt, reply) => said(t, prompt, reply, recordRul
 // Owner-granted extra round: the same for the owner's `extra round` (the reply ends with roundRequest's line).
 export const ownerGrants = (t, prompt, reply) => said(t, prompt, reply, recordRoundGrant);
 
+// Files this process wrote and has not removed yet. Removed at exit, so an uncaught error or a failed test before t.after still leaves
+// nothing behind. Only paths this process itself wrote are ever touched: production accepts `test-<uuid>` session names and reads
+// consumed grants without an age limit, so a sweep of the folder by name or age could destroy real owner evidence.
+const leftovers = new Set();
+let exitHook = false;
+export function cleanupAtExit(file) {
+  leftovers.add(file);
+  if (exitHook) return;
+  exitHook = true;
+  process.on('exit', () => { for (const f of leftovers) rmSync(f, { force: true }); });
+}
+
 function said(t, prompt, reply, recorder) {
   const dir = mkdtempSync(join(tmpdir(), 'owner-go-'));
   const transcript = join(dir, 't.jsonl');
@@ -24,9 +41,11 @@ function said(t, prompt, reply, recorder) {
     { type: 'user', message: { content: prompt } },
   ].map((e) => JSON.stringify(e)).join('\n')}\n`);
   const session = `test-${randomUUID()}`;
+  const file = join(ownerGoDir(), `${session}.jsonl`);
+  cleanupAtExit(file);
   const record = recorder({ hook_event_name: 'UserPromptSubmit', session_id: session, transcript_path: transcript, cwd: dir, prompt });
   t.after(() => {
-    rmSync(join(ownerGoDir(), `${session}.jsonl`), { force: true });
+    rmSync(file, { force: true });
     rmSync(dir, { recursive: true, force: true });
   });
   return record;
