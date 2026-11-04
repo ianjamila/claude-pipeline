@@ -319,6 +319,7 @@ function resolutionChecks({ from, forkPoint, head, baseRef }, o) {
       // proc.run decodes UTF-8: invalid bytes would compare equal after the decode, so they are not byte-exact.
       if (text.includes('\uFFFD')) throw fail('non-utf8', `${c.path} (${name}) is not valid UTF-8`);
     }
+    // The labels are what makes the parser's fast path legal; without them it falls back to the exact parser (#1598).
     const parsed = parseConflictBlocks(splitLines(marker), splitLines(s2), splitLines(s3), tick, { ours: fromSha, theirs: forkSha });
     if (parsed.reason === 'too-many-blocks') throw fail('too-many-blocks', `${c.path} has more than ${MAX_BLOCKS} conflict blocks`);
     if (parsed.reason) throw fail(parsed.reason === 'ambiguous' ? 'parse-ambiguous' : 'parse', c.path);
