@@ -1,0 +1,130 @@
+[
+ {
+  "id": 125752297151,
+  "name": "tripwire",
+  "status": "completed",
+  "conclusion": "skipped",
+  "html_url": "https://github.example/runs/125752297151",
+  "started_at": "2026-11-03T05:50:31Z",
+  "completed_at": "2026-11-03T05:50:31Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 112688199750
+  }
+ },
+ {
+  "id": 125750780435,
+  "name": "tripwire",
+  "status": "completed",
+  "conclusion": "skipped",
+  "html_url": "https://github.example/runs/125750780435",
+  "started_at": "2026-11-03T05:45:39Z",
+  "completed_at": "2026-11-03T05:45:38Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 112673284808
+  }
+ },
+ {
+  "id": 125742946615,
+  "name": "Typecheck + Vitest",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.example/runs/125742946615",
+  "started_at": "2026-11-03T05:20:43Z",
+  "completed_at": "2026-11-03T05:45:38Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 112673284808
+  }
+ },
+ {
+  "id": 125742611688,
+  "name": "tripwire",
+  "status": "completed",
+  "conclusion": "skipped",
+  "html_url": "https://github.example/runs/125742611688",
+  "started_at": "2026-11-03T05:19:17Z",
+  "completed_at": "2026-11-03T05:19:16Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 112673284808
+  }
+ },
+ {
+  "id": 125739942336,
+  "name": "tripwire",
+  "status": "completed",
+  "conclusion": "skipped",
+  "html_url": "https://github.example/runs/125739942336",
+  "started_at": "2026-11-03T05:10:57Z",
+  "completed_at": "2026-11-03T05:10:57Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 112673284525
+  }
+ },
+ {
+  "id": 125735420486,
+  "name": "tripwire",
+  "status": "completed",
+  "conclusion": "skipped",
+  "html_url": "https://github.example/runs/125735420486",
+  "started_at": "2026-11-03T04:56:16Z",
+  "completed_at": "2026-11-03T04:56:15Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 112673284269
+  }
+ },
+ {
+  "id": 125734746584,
+  "name": "tripwire",
+  "status": "completed",
+  "conclusion": "skipped",
+  "html_url": "https://github.example/runs/125734746584",
+  "started_at": "2026-11-03T04:53:58Z",
+  "completed_at": "2026-11-03T04:53:57Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 112673284344
+  }
+ },
+ {
+  "id": 125734435447,
+  "name": "Typecheck + Vitest",
+  "status": "completed",
+  "conclusion": "failure",
+  "html_url": "https://github.example/runs/125734435447",
+  "started_at": "2026-11-03T04:53:15Z",
+  "completed_at": "2026-11-03T05:19:16Z",
+  "app": {
+   "id": 15368,
+   "slug": "github-actions"
+  },
+  "check_suite": {
+   "id": 112673284808
+  }
+ }
+]
