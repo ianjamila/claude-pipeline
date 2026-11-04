@@ -138,7 +138,6 @@ jobs:
       # Per-file wall-clock times of this shard, between marker lines, for scripts/shard-weights.mjs to read from the job log.
       - name: File times (shard ${{ matrix.shard }}/3)
         if: always() && (github.event_name != 'push' || steps.tested.outputs.run != 'false')
-        shell: bash
         env:
           CP_TEST_TIMES: ${{ runner.temp }}/cp-file-times.json
         run: |

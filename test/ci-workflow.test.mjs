@@ -59,7 +59,7 @@ test('each Windows shard records per-file times and prints them between marker l
   assert.match(print.if, /^always\(\) && /, 'a red shard still reports its times');
   assert.ok(shardJob.steps.indexOf(print) > shardJob.steps.indexOf(tests));
   assert.ok(print.run.indexOf('CP-FILE-TIMES-BEGIN') < print.run.indexOf('CP-FILE-TIMES-END'));
-  assert.equal(print.shell, 'bash');
+  assert.equal(print.shell, undefined, 'no step overrides the workflow-wide bash default (self-verify)');
 });
 
 test('the installer round trip runs on Windows in shard 3 only', () => {
