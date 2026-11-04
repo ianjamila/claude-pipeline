@@ -28,11 +28,13 @@ export class GitError extends Error {
 }
 
 // interHunkContext/algorithm/indentHeuristic decide where git cuts hunks and which of several equal diffs it prints, so
-// leaving them to user config would let the same change hash differently on two machines.
+// leaving them to user config would let the same change hash differently on two machines. log.showSignature=false keeps
+// a signature verdict out of `git log` / `git show` output we parse.
 const FORCED_CONFIG = [
   '-c', 'core.quotePath=true', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicPrefix=false',
   '-c', 'diff.renames=true', '-c', 'color.ui=false',
   '-c', 'diff.interHunkContext=0', '-c', 'diff.algorithm=myers', '-c', 'diff.indentHeuristic=true',
+  '-c', 'log.showSignature=false',
 ];
 // core.autocrlf is deliberately NOT forced for status / working-tree reads / `diff HEAD`: with Git for Windows' default
 // (autocrlf=true) a CRLF working file is the same content as its LF blob, and forcing false would make isClean() false
@@ -600,7 +602,7 @@ export function grepAtRef(ref, fixedString, o) {
 
 // Committer time in epoch ms. `^{commit}` peels annotated tags, which `git show` would otherwise print as a tag first.
 export function commitTime(sha, o) {
-  const out = git(['show', '-s', '--format=%ct', `${assertRef(sha, ['show', sha])}^{commit}`], o).trim();
+  const out = git(['show', '-s', '--no-show-signature', '--format=%ct', `${assertRef(sha, ['show', sha])}^{commit}`], o).trim();
   const seconds = Number(out);
   if (!/^\d+$/.test(out)) throw new GitError({ args: ['show', '-s', '--format=%ct', sha], code: 0, stderr: `unexpected commit time: ${out}` });
   return seconds * 1000;
