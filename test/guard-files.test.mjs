@@ -1737,3 +1737,27 @@ test('#111: a link whose name holds `,` or `=` is followed too', (t) => {
   ]) assert.equal(w.bash(cmd), 'deny', cmd);
   for (const cmd of ['cp x a,b/notes.txt', 'cp x a=b/hardstops.json', 'cp x c,d/state.json', 'cat a,b/state.json']) assert.equal(w.bash(cmd), 'allow', cmd);
 });
+
+// R5-B1: program text can replace, remove or rename a whole transcript FOLDER without naming a .jsonl.
+test('#128 R5-B1: program text with a config root and a projects word is refused with no .jsonl word (copytree, rmtree, rename, glob); a memory folder stays open', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    "python3 -c \"import os,shutil; shutil.copytree('/tmp/forged',os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo'),dirs_exist_ok=True)\"",
+    "python3 -c \"import os,shutil; shutil.rmtree(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo'))\"",
+    "python3 -c \"import os; os.rename('/tmp/forged',os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo'))\"",
+    "python3 -c \"import shutil; shutil.copytree('/tmp/forged','/home/u/.claude/projects/-repo',dirs_exist_ok=True)\"",
+    "python3 -c \"import shutil; shutil.copytree('/tmp/forged','/home/u/claude-config/projects/-repo',dirs_exist_ok=True)\"",
+    "python3 -c \"import glob,os; [open(p,'w').write('x') for p in glob.glob(os.environ['CLAUDE_CONFIG_DIR']+'/projects/*/*')]\"",
+    "node -e \"require('fs').cpSync('/tmp/forged',require('path').join(process.env.CLAUDE_CONFIG_DIR,'projects','-repo'),{recursive:true})\"",
+    "python3 - <<'EOF'\nimport shutil\nshutil.copytree('/tmp/forged', '/home/u/.claude/projects/-repo', dirs_exist_ok=True)\nEOF",
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  for (const cmd of [
+    "python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo','memory','n.md'),'w').write('x')\"",
+    "python3 -c \"import shutil; shutil.copytree('/tmp/notes','/home/u/claude-config/projects/-repo/memory',dirs_exist_ok=True)\"",
+    "python3 -c \"import shutil; shutil.copytree('/tmp/forged','/tmp/projects/-repo',dirs_exist_ok=True)\"",
+    "python3 -c \"import shutil; shutil.copytree('/tmp/forged','/mnt/home/u/claude-config/projects/-repo',dirs_exist_ok=True)\"",
+    "python3 -c \"import os; print(os.environ['CLAUDE_CONFIG_DIR'])\"",
+  ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  // (a memory mention does not excuse a second projects word that is not a memory path)
+  assert.equal(bash("python3 -c \"import os,shutil; shutil.copytree('/tmp/f',os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo')); print('projects','-x','memory')\"", { env }), 'deny');
+});

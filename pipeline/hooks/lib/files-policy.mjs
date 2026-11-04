@@ -1077,8 +1077,21 @@ function makeMatchers(ctx) {
   // contiguous <root>/projects/. A config root (the variable, a configured root on a path boundary, a .claude* name), a projects word and a .jsonl word anywhere in the text are a transcript
   // reference; the cost is a false positive on a program that merely mentions all three. Any one missing, or a projects/ path that is no .jsonl, stays open.)
   const rootWordText = ctx.transcriptRoots.map((r) => new RegExp(`(?:(?<![\\w.~])|(?<=\\s-[A-Za-z]))${escapeRe(r)}(?![\\w.\\-])`, ctx.ci ? 'i' : ''));
+  // (R5-B1: a program can write, copy, remove or rename a whole transcript FOLDER without naming a .jsonl: shutil.copytree(src, os.path.join(root,'projects','-repo')), shutil.rmtree / os.rename of it, the
+  // same with a literal root, or glob.glob(root+'/projects/*/*') and a write of each. In program text (it has a call or an index: a parenthesis or bracket) a config root and a projects word
+  // are a transcript reference with no .jsonl word when the program also writes, moves or deletes (WRITE_HINT, or fs.cpSync), unless every projects word is followed by a project folder and then memory
+  // (project memory under projects/<proj>/memory stays writable). A plain shell path word has no parenthesis: the shell rules (hitTranscriptDir / hitTranscriptBelow) judge it; a program that only
+  // prints a path (console.log(path.join(home,'.claude','projects'))) stays open.)
+  const projectsWord = /(?<![\w])projects(?![\w])/gi;
+  const memoryTail = /^[/'"`,+\s\\]+[^/'"`,+\s)\]\\]+[/'"`,+\s\\]+memory(?![\w])/i;
+  const onlyMemoryBelow = (v) => {
+    for (const mm of v.matchAll(projectsWord)) if (!memoryTail.test(v.slice(mm.index + mm[0].length))) return false;
+    return true;
+  };
   const envTranscriptText = (v) => {
-    if (!/(?<![\w])projects(?![\w])/i.test(v) || !/\.jsonl(?![\w])/i.test(v)) return false;
+    if (!/(?<![\w])projects(?![\w])/i.test(v)) return false;
+    const jsonl = /\.jsonl(?![\w])/i.test(v);
+    if (!jsonl && (!/[()[\]]/.test(v) || !(WRITE_HINT.test(v) || /\bcp(?:Sync)?\b/i.test(v)) || onlyMemoryBelow(v))) return false;
     return v.includes('CLAUDE_CONFIG_DIR') || /(?<![\w.\-])\.claude/i.test(v) || rootWordText.some((re) => re.test(v));
   };
 
