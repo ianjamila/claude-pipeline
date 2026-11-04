@@ -206,20 +206,24 @@ const surfacesAsk = (text) => SURFACED_ASK.test(text) || text.split(/\r?\n/).som
 // The text of a tool_result block's content (a string, or text blocks), or of a tool_use block's input.
 const toolResultText = (c) => (typeof c === 'string' ? c : Array.isArray(c) ? c.map((x) => (typeof x === 'string' ? x : typeof x?.text === 'string' ? x.text : '')).join('\n') : '');
 // A tool_use input as the owner reads it: the DECODED string values, one per line (JSON.stringify would re-escape a tab or a newline in a command to `\t` / `\n`, so a ruling
-// line with a tab, or a `head … · items …` line inside a heredoc, would not be seen). Depth and total length are bounded (a record is read within MAX_RECORD_BYTES).
+// line with a tab, or a `head … · items …` line inside a heredoc, would not be seen). Depth and total length are bounded; an input past either bound cannot be searched
+// whole, and the agent writes it, so it fails closed: null, which voids the slot like a surfaced ask (padding must not hide a ruling line past the bound).
 const TOOL_INPUT_MAX_DEPTH = 8;
 const toolUseText = (input) => {
   const out = [];
   let size = 0;
+  let over = false;
   const walk = (v, depth) => {
-    if (size > MAX_RECORD_BYTES || depth > TOOL_INPUT_MAX_DEPTH || v === null || v === undefined) return;
-    if (typeof v === 'string') { out.push(v); size += v.length; return; }
+    if (over || v === null || v === undefined) return;
+    if (size > MAX_RECORD_BYTES || depth > TOOL_INPUT_MAX_DEPTH) { over = true; return; }
+    if (typeof v === 'string') { out.push(v); size += v.length; if (size > MAX_RECORD_BYTES) over = true; return; }
     if (typeof v !== 'object') return;
     for (const x of Array.isArray(v) ? v : Object.values(v)) walk(x, depth + 1);
   };
-  try { walk(input, 0); } catch { return ''; }
-  return out.join('\n');
+  try { walk(input, 0); } catch { return null; }
+  return over ? null : out.join('\n');
 };
+const inputSurfacesAsk = (input) => { const text = toolUseText(input); return text === null || surfacesAsk(text); };
 export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
   const replies = [''];
   const voided = new Set(); // slots (indexes of replies) whose ask a dropped reply replaced
@@ -243,7 +247,7 @@ export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTE
       lastIsPrompt = isPrompt;
     } else if (e?.type === 'assistant' && Array.isArray(content)) {
       if (skipping) {
-        if (content.some((b) => (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) || (b?.type === 'tool_use' && surfacesAsk(toolUseText(b.input))))) voided.add(replies.length - 1);
+        if (content.some((b) => (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) || (b?.type === 'tool_use' && inputSurfacesAsk(b.input)))) voided.add(replies.length - 1);
         continue;
       }
       lastIsPrompt = false;

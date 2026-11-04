@@ -580,6 +580,10 @@ test('#128 rulings (R4-F3, decoded input): a tab or a multi-line tool input that
   assert.equal(rule([notice(), use({ command: "echo '⚖️ Owner ruling needed\t#59: R1-B1 · content abcdef012345 · repo acme/app' >/dev/null" }), result('')]), null, 'a tab inside the ruling line');
   assert.equal(rule([notice(), use({ command: "cat <<'EOF' > note.txt\nsome prose\nhead 0123456789ab · items none · repo acme/app\nEOF" }), result('')]), null, 'a head line inside a heredoc');
   assert.equal(rule([notice(), use({ nested: [{ deep: 'x\nhead 0123456789ab · items none · repo acme/app' }] }), result('')]), null, 'a head line in a nested input value');
+  // fail closed: an input that cannot be searched whole (padding past the size bound, nesting past the depth bound) voids the slot, whatever it holds
+  assert.equal(rule([notice(), use({ pad: 'x'.repeat(1024 * 1024 + 1), command: 'ls' }), result('')]), null, 'an input past the size bound');
+  const deep = Array.from({ length: 10 }).reduce((v) => ({ v }), 'ls');
+  assert.equal(rule([notice(), use(deep), result('')]), null, 'an input past the depth bound');
   const r = rule([notice(), use({ command: 'cat <<EOF > a.txt\nline one\nline two\nEOF', description: 'write a file' }), result('')], 'R1-F1: accept');
   assert.deepEqual([r?.pr, r?.ids], [58, ['R1-F1']], 'an unrelated multi-line input: the ask still binds');
 });
