@@ -65,3 +65,27 @@ test('parseWorktreePorcelain: locked, prunable, detached', () => {
   assert.equal(b.locked, ''); assert.equal(b.detached, true); assert.equal(b.branch, null);
   assert.equal(c.prunable, true);
 });
+
+// The stack gather runs this under a deadline: the bound reaches git's exec as `timeoutMs`, and a timeout is a GitError
+// (fail closed), never an empty list. `run` is the same seam git() takes.
+const PORCELAIN = 'worktree /x/repo\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbranch refs/heads/main\n\n';
+const fakeRun = (seen, over = {}) => (bin, args, opts) => {
+  seen.push({ bin, args, opts });
+  return { code: 0, stdout: PORCELAIN, stderr: '', timedOut: false, signal: null, ...over };
+};
+
+test('listWorktrees: timeoutMs reaches the git subprocess; without it the call is unchanged (no timeout option)', () => {
+  const seen = [];
+  const list = listWorktrees('/x/repo', { timeoutMs: 1234, run: fakeRun(seen) });
+  assert.equal(list[0].path, path.resolve('/x/repo')); // native form: `D:\x\repo` on Windows, unchanged on POSIX
+  assert.equal(seen[0].bin, 'git');
+  assert.deepEqual(seen[0].args.slice(-3), ['worktree', 'list', '--porcelain']);
+  assert.equal(seen[0].opts.timeoutMs, 1234);
+  assert.equal(seen[0].opts.cwd, '/x/repo');
+  listWorktrees('/x/repo', { run: fakeRun(seen) });
+  assert.equal('timeoutMs' in seen[1].opts, false);
+});
+
+test('listWorktrees: a git that timed out throws (never an empty list)', () => {
+  assert.throws(() => listWorktrees('/x/repo', { timeoutMs: 50, run: fakeRun([], { timedOut: true, code: null, stdout: '' }) }), /timed out/);
+});

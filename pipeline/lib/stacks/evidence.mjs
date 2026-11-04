@@ -78,6 +78,14 @@ function call(run, bin, args, { deadlineAt, now = Date.now, env, replaceEnv, max
   return { r };
 }
 
+// Milliseconds for the next subprocess: min(15 s, time left until deadlineAt), the cap alone when there is no deadline, or null
+// when the deadline leaves under MIN_REMAINING_MS (do not spawn; fail closed). call() applies the same rule.
+export function callBudget(deadlineAt, now = Date.now) {
+  if (deadlineAt === undefined || deadlineAt === null) return CALL_CAP_MS;
+  const remaining = deadlineAt - now();
+  return remaining < MIN_REMAINING_MS ? null : Math.min(CALL_CAP_MS, remaining);
+}
+
 // { pid, birth } at observation time, or birth null when the lookup is unknown or the process just exited.
 function identify(pid, { run, ps, kill, platform, deadlineAt, now }) {
   const id = procIdentity(pid, { run, ps, platform, deadlineAt, now, ...(kill ? { kill } : {}) });
@@ -654,15 +662,18 @@ const PORT_ENV_RE = (ports) => new RegExp(`(?:127\\.0\\.0\\.1|localhost):(?:${po
 
 export function consumerWorktrees(stack, {
   events = [], transcripts = null, repos = [], platform = process.platform, listWorktrees = realListWorktrees, fsx = fs, spellings = pathSpellings,
-  home: homeDir = os.homedir(),
+  home: homeDir = os.homedir(), deadlineAt, now = Date.now,
 } = {}) {
   if (platform === 'win32') return WINDOWS();
   const notes = [];
   // worktrees of every configured repo (once)
   const known = [];
   for (const repo of repos) {
+    // each list is bounded by what is left of the gather deadline (this runs under the project lock): under 500 ms, no spawn
+    const timeoutMs = callBudget(deadlineAt, now);
+    if (timeoutMs === null) return unknown(`cannot list worktrees of ${repo}: deadline`);
     try {
-      for (const w of listWorktrees(repo)) if (w?.path && !w.bare) known.push({ ...w, repo });
+      for (const w of listWorktrees(repo, { timeoutMs })) if (w?.path && !w.bare) known.push({ ...w, repo });
     } catch (err) {
       return unknown(`cannot list worktrees of ${repo}: ${shortMsg(err)}`);
     }

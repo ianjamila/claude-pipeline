@@ -28,6 +28,8 @@ export function parseWorktreePorcelain(out, platform = process.platform) {
   return list;
 }
 
-export function listWorktrees(root) {
-  return parseWorktreePorcelain(git(['worktree', 'list', '--porcelain'], { cwd: root }));
+// `timeoutMs` bounds the git call (a timeout throws a GitError: a caller under a deadline fails closed); absent = unbounded, as
+// before. `run` is git()'s subprocess seam, for tests.
+export function listWorktrees(root, { timeoutMs, run } = {}) {
+  return parseWorktreePorcelain(git(['worktree', 'list', '--porcelain'], { cwd: root, ...(timeoutMs ? { timeoutMs } : {}), ...(run ? { run } : {}) }));
 }
