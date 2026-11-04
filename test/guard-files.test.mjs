@@ -1244,9 +1244,9 @@ test('#128 R2-F1: program text (python -c, node -e, a heredoc body) that names a
   ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
   // (the default config dir is denied the same way)
   assert.equal(bash(`python3 -c "open('/home/u/.claude/projects/-repo/abc.jsonl','w').write('x')"`), 'deny');
+  // (R6-B1 / R6-F1: any write under a config root in program text is refused, a file beside projects and a memory note included; the shell and file-tool rules keep those open)
+  for (const cmd of [`python3 -c "open('/home/u/claude-config/other.jsonl','w').write('x')"`, `python3 -c "open('/home/u/claude-config/projects/-repo/memory/n.md','w').write('x')"`]) assert.equal(bash(cmd, { env }), 'deny', cmd);
   for (const cmd of [
-    `python3 -c "open('/home/u/claude-config/other.jsonl','w').write('x')"`,
-    `python3 -c "open('/home/u/claude-config/projects/-repo/memory/n.md','w').write('x')"`,
     `python3 -c "open('/mnt/home/u/claude-config/projects/-repo/abc.jsonl','w').write('x')"`,
     `python3 -c "open('/home/u/claude-config-old/projects/-repo/abc.jsonl','w').write('x')"`,
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
@@ -1310,8 +1310,9 @@ test('#128 R3-F2: program text that builds a transcript path from CLAUDE_CONFIG_
     "python3 -c \"import os; print(os.environ['CLAUDE_CONFIG_DIR'])\"",
     "node -e \"console.log(process.env.CLAUDE_CONFIG_DIR)\"",
     "python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/settings.json').read()\"",
-    "python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/projects/-repo/memory/n.md','w').write('x')\"",
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  // (R6-B1: program text has no memory exemption)
+  assert.equal(bash("python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/projects/-repo/memory/n.md','w').write('x')\"", { env }), 'deny');
 });
 
 // R4-B1 / R4-F1: the folder joined from pieces (os.path.join, pathlib /, path.join) has no contiguous <root>/projects/.
@@ -1326,10 +1327,11 @@ test('#128 R4-B1/F1: program text with a config root, a projects word and a .jso
   ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
   for (const cmd of [
     "python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'settings.json')).read()\"",
-    "python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo','memory','n.md'),'w').write('x')\"",
     "python3 -c \"open('/tmp/projects/a.jsonl','w').write('x')\"",
     "python3 -c \"import os; open(os.path.join('/mnt/home/u/claude-config','projects','-repo','abc.jsonl'),'w').write('x')\"",
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  // (R6-B1: program text has no memory exemption)
+  assert.equal(bash("python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo','memory','n.md'),'w').write('x')\"", { env }), 'deny');
 });
 
 // R4-B2 / R4-F2: a trailing zsh glob qualifier, (/) included, is not part of the name.
@@ -1739,7 +1741,7 @@ test('#111: a link whose name holds `,` or `=` is followed too', (t) => {
 });
 
 // R5-B1: program text can replace, remove or rename a whole transcript FOLDER without naming a .jsonl.
-test('#128 R5-B1: program text with a config root and a projects word is refused with no .jsonl word (copytree, rmtree, rename, glob); a memory folder stays open', () => {
+test('#128 R5-B1: program text with a config root and a projects word is refused with no .jsonl word (copytree, rmtree, rename, glob); program text has no memory exemption (R6-B1)', () => {
   const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
   for (const cmd of [
     "python3 -c \"import os,shutil; shutil.copytree('/tmp/forged',os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo'),dirs_exist_ok=True)\"",
@@ -1751,15 +1753,84 @@ test('#128 R5-B1: program text with a config root and a projects word is refused
     "node -e \"require('fs').cpSync('/tmp/forged',require('path').join(process.env.CLAUDE_CONFIG_DIR,'projects','-repo'),{recursive:true})\"",
     "python3 - <<'EOF'\nimport shutil\nshutil.copytree('/tmp/forged', '/home/u/.claude/projects/-repo', dirs_exist_ok=True)\nEOF",
   ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  // (R6-B1: the two memory-folder cases that were allowed here are refused now: program text names a config root and writes; see the R6-B1 test)
   for (const cmd of [
-    "python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo','memory','n.md'),'w').write('x')\"",
-    "python3 -c \"import shutil; shutil.copytree('/tmp/notes','/home/u/claude-config/projects/-repo/memory',dirs_exist_ok=True)\"",
     "python3 -c \"import shutil; shutil.copytree('/tmp/forged','/tmp/projects/-repo',dirs_exist_ok=True)\"",
     "python3 -c \"import shutil; shutil.copytree('/tmp/forged','/mnt/home/u/claude-config/projects/-repo',dirs_exist_ok=True)\"",
     "python3 -c \"import os; print(os.environ['CLAUDE_CONFIG_DIR'])\"",
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
   // (a memory mention does not excuse a second projects word that is not a memory path)
   assert.equal(bash("python3 -c \"import os,shutil; shutil.copytree('/tmp/f',os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo')); print('projects','-x','memory')\"", { env }), 'deny');
+});
+
+// R6-B1 / R6-F1: ONE rule for program text (a call or an index) -- a config root (the variable, a configured root, a .claude* name) next to any write or whole-tree operation is a transcript
+// reference, with or without a projects or .jsonl word, and a memory path in the text excuses nothing (parent walks, a bare root).
+test('#128 R6-B1: program text that walks up from a projects/<proj>/memory path (.parent, .., dirname) and replaces what it finds is refused; a memory mention is no exemption', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    "python3 -c \"import os,shutil,pathlib; shutil.copytree('/tmp/forged',pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo','memory').parent,dirs_exist_ok=True)\"",
+    "python3 -c \"import os,shutil; shutil.rmtree(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo','memory','..'))\"",
+    "python3 -c \"import os,shutil; shutil.copytree('/tmp/forged',os.path.dirname(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo','memory')),dirs_exist_ok=True)\"",
+    "node -e \"require('fs').cpSync('/tmp/forged',require('path').dirname(require('path').join(process.env.CLAUDE_CONFIG_DIR,'projects','-repo','memory')),{recursive:true})\"",
+    "python3 -c \"import shutil,pathlib; shutil.rmtree(pathlib.Path('/home/u/.claude/projects/-repo/memory').parent)\"",
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  // (the memory mention is no exemption in program text any more; shell and file-tool memory writes are judged by the literal path and stay open)
+  for (const cmd of [
+    "python3 -c \"import os; open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo','memory','n.md'),'w').write('x')\"",
+    "python3 -c \"import shutil; shutil.copytree('/tmp/notes','/home/u/claude-config/projects/-repo/memory',dirs_exist_ok=True)\"",
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  for (const cmd of [
+    'cp notes.md ~/.claude/projects/-repo/memory/notes.md',
+    'cp /tmp/n.md /home/u/claude-config/projects/-repo/memory/n.md',
+    'echo x > ~/.claude/projects/-repo/memory/note.md',
+  ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  assert.equal(file('Write', { file_path: '/home/u/.claude/projects/-repo/memory/notes.md', content: 'x' }), 'allow');
+  assert.equal(file('Write', { file_path: '/home/u/claude-config/projects/-repo/memory/notes.md', content: 'x' }, { env }), 'allow');
+});
+
+test('#128 R6-F1: program text naming a bare config root with a write or whole-tree operation is refused with no projects word (python, node; variable, literal root, ~/.claude); read-only and unrelated programs stay open', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    "python3 -c \"import os,shutil; shutil.copytree('/tmp/forged', os.environ['CLAUDE_CONFIG_DIR'], dirs_exist_ok=True)\"",
+    "python3 -c \"import os,shutil; shutil.rmtree(os.environ['CLAUDE_CONFIG_DIR'])\"",
+    "python3 -c \"import os; os.rename('/tmp/forged','/home/u/claude-config')\"",
+    "node -e \"require('fs').cpSync('/tmp/forged', process.env.CLAUDE_CONFIG_DIR, {recursive:true})\"",
+    "python3 -c \"import os,shutil; shutil.copytree('/tmp/forged', os.path.expanduser('~/.claude'), dirs_exist_ok=True)\"",
+    // (the R2-B1 shell list in program form)
+    "python3 -c \"import shutil; shutil.copytree('/tmp/forged', '/home/u/claude-config', dirs_exist_ok=True)\"",
+    "python3 -c \"import tarfile; tarfile.open('x').extractall('/home/u/claude-config')\"",
+    "python3 -c \"import os,tarfile; tarfile.open('x').extractall(os.environ['CLAUDE_CONFIG_DIR'])\"",
+    "python3 -c \"import os,shutil; shutil.move('/tmp/forged', os.environ['CLAUDE_CONFIG_DIR'])\"",
+    "python3 -c \"import os,tarfile; os.chdir(os.environ['CLAUDE_CONFIG_DIR']); tarfile.open('x').extractall()\"",
+    "python3 -c \"import shutil; shutil.rmtree('/home/u/claude-config')\"",
+    "python3 -c \"import os; os.replace('/tmp/forged','/home/u/claude-config')\"",
+    "python3 -c \"import os; os.symlink('/tmp/forged','/home/u/claude-config')\"",
+    "node -e \"require('fs').rmSync(process.env.CLAUDE_CONFIG_DIR,{recursive:true})\"",
+    "node -e \"require('fs').renameSync('/tmp/forged','/home/u/claude-config')\"",
+    "node -e \"require('fs').cpSync('/tmp/forged','/home/u/claude-config',{recursive:true})\"",
+    "node -e \"require('tar').x({file:'x',cwd:process.env.CLAUDE_CONFIG_DIR}); require('fs').writeFileSync('a','b')\"",
+    "python3 -c \"import shutil; shutil.rmtree('/home/u/.claude-eaglewatch')\"",
+    "python3 -c \"import shutil; shutil.copytree('/tmp/forged','/home/u/.claude-eaglewatch',dirs_exist_ok=True)\"",
+    "python3 -c \"import os,shutil; shutil.rmtree(os.path.expanduser('~/.claude'))\"",
+    "node -e \"require('fs').rmSync(require('os').homedir()+'/.claude',{recursive:true})\"",
+    "python3 - <<'EOF'\nimport os,shutil\nshutil.copytree('/tmp/forged', os.environ['CLAUDE_CONFIG_DIR'], dirs_exist_ok=True)\nEOF",
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  for (const cmd of [
+    "node -e \"console.log(path.join(home,'.claude','projects'))\"",
+    "python3 -c \"import os; print(os.environ['CLAUDE_CONFIG_DIR'])\"",
+    "python3 -c \"import os; open(os.environ['CLAUDE_CONFIG_DIR']+'/settings.json').read()\"",
+    "python3 -c \"import os; print(os.listdir(os.environ['CLAUDE_CONFIG_DIR']))\"",
+    "node -e \"console.log(require('fs').readdirSync(process.env.CLAUDE_CONFIG_DIR))\"",
+    "python3 -c \"import shutil; shutil.copytree('/tmp/a','/tmp/b')\"",
+    "python3 -c \"import shutil; shutil.rmtree('/home/u/claude-config-old')\"",
+    "python3 -c \"import shutil; shutil.rmtree('/mnt/home/u/claude-config')\"",
+    "node -e \"require('fs').writeFileSync('/tmp/x',JSON.stringify({a:1}))\"",
+    "python3 -c \"import shutil; shutil.rmtree('/repo/.claude/cache')\"",
+    "node -e \"require('fs').writeFileSync('.claude/settings.local.json','{}')\"",
+    "python3 -c \"import os,shutil; shutil.rmtree(os.path.join('/repo','.claude','cache'))\"",
+  ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  // (a literal root that is not configured is just a folder)
+  assert.equal(bash("python3 -c \"import shutil; shutil.rmtree('/home/u/claude-config')\""), 'allow');
 });
 
 // R5-F1: a wildcard root/projects segment with a literal folder below the project is the session folder the literal rule protects (mirrors TRANSCRIPT_BELOW).

@@ -1081,21 +1081,22 @@ function makeMatchers(ctx) {
   // contiguous <root>/projects/. A config root (the variable, a configured root on a path boundary, a .claude* name), a projects word and a .jsonl word anywhere in the text are a transcript
   // reference; the cost is a false positive on a program that merely mentions all three. Any one missing, or a projects/ path that is no .jsonl, stays open.)
   const rootWordText = ctx.transcriptRoots.map((r) => new RegExp(`(?:(?<![\\w.~])|(?<=\\s-[A-Za-z]))${escapeRe(r)}(?![\\w.\\-])`, ctx.ci ? 'i' : ''));
-  // (R5-B1: a program can write, copy, remove or rename a whole transcript FOLDER without naming a .jsonl: shutil.copytree(src, os.path.join(root,'projects','-repo')), shutil.rmtree / os.rename of it, the
-  // same with a literal root, or glob.glob(root+'/projects/*/*') and a write of each. In program text (it has a call or an index: a parenthesis or bracket) a config root and a projects word
-  // are a transcript reference with no .jsonl word when the program also writes, moves or deletes (WRITE_HINT, or fs.cpSync), unless every projects word is followed by a project folder and then memory
-  // (project memory under projects/<proj>/memory stays writable). A plain shell path word has no parenthesis: the shell rules (hitTranscriptDir / hitTranscriptBelow) judge it; a program that only
-  // prints a path (console.log(path.join(home,'.claude','projects'))) stays open.)
-  const projectsWord = /(?<![\w])projects(?![\w])/gi;
-  const memoryTail = /^[/'"`,+\s\\]+[^/'"`,+\s)\]\\]+[/'"`,+\s\\]+memory(?![\w])/i;
-  const onlyMemoryBelow = (v) => {
-    for (const mm of v.matchAll(projectsWord)) if (!memoryTail.test(v.slice(mm.index + mm[0].length))) return false;
-    return true;
-  };
+  // (R5-B1 / R6-B1 / R6-F1, one rule for PROGRAM TEXT (it has a call or an index: a parenthesis or bracket): a program can write, copy, remove or rename a whole transcript FOLDER, or the config
+  // root itself, without naming a .jsonl or a projects folder: shutil.copytree(src, os.environ['CLAUDE_CONFIG_DIR']), shutil.rmtree / os.rename of it, the same with a literal root or ~/.claude,
+  // node's fs.cpSync / rmSync, or a walk up from a memory path (Path(root,'projects','-repo','memory').parent, '..', os.path.dirname). So a config root next to any write or whole-tree operation
+  // (PROGRAM_WRITE) is a transcript reference, with or without a projects word, and a memory path in the text excuses nothing. A plain shell path word has no parenthesis: the shell rules
+  // (hitTranscriptDir / hitTranscriptBelow, which keep projects/<proj>/memory writable) judge it. A program that only reads or prints a path (console.log(path.join(home,'.claude','projects')),
+  // open(root+'/settings.json').read()) stays open. For the write rule a .claude* name counts as the HOME's folder, not a repo's own .claude/ (rm of /repo/.claude/cache, a write to
+  // .claude/settings.local.json stay open): the home path in front of it (~ and $HOME are expanded already), or the bare name quoted as a join piece ('.claude', '/.claude') in a text that names
+  // a home (expanduser, homedir, Path.home, a home word, $HOME, ~).)
+  const homeClaudeRes = unique([ctx.homePosix, ctx.homePosix && realResolve(ctx.homePosix, ctx.api)]).filter((h) => h && h !== '/')
+    .map((h) => new RegExp(`(?<![\\w.~])${escapeRe(h)}/\\.claude[\\w\\-]*(?![\\w.\\-])`, ctx.ci ? 'i' : ''));
+  const homeClaudeText = (v) => homeClaudeRes.some((re) => re.test(v))
+    || (/['"`]\/?\.claude[\w\-]*['"`]/i.test(v) && /expanduser|homedir|Path\.home|\bhome\b|\$HOME|USERPROFILE|~/i.test(v));
   const envTranscriptText = (v) => {
-    if (!/(?<![\w])projects(?![\w])/i.test(v)) return false;
-    const jsonl = /\.jsonl(?![\w])/i.test(v);
-    if (!jsonl && (!/[()[\]]/.test(v) || !(WRITE_HINT.test(v) || /\bcp(?:Sync)?\b/i.test(v)) || onlyMemoryBelow(v))) return false;
+    const call = /[()[\]]/.test(v);
+    if (call && PROGRAM_WRITE.test(v) && (v.includes('CLAUDE_CONFIG_DIR') || rootWordText.some((re) => re.test(v)) || homeClaudeText(v))) return true;
+    if (!/(?<![\w])projects(?![\w])/i.test(v) || !/\.jsonl(?![\w])/i.test(v)) return false;
     return v.includes('CLAUDE_CONFIG_DIR') || /(?<![\w.\-])\.claude/i.test(v) || rootWordText.some((re) => re.test(v));
   };
 
@@ -2081,7 +2082,10 @@ function jobInner(cmd) {
 const SHEBANG_PROGRAM = /^#!\s*(?:\S*\/)?(?:env\s+(?:-\S+\s+)*)?(\S+)/;
 const INTERP_PROGRAM = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|perl|php)$/;
 // Program text that names a protected path next to something that writes, moves or deletes.
-const WRITE_HINT = /write|append|unlink|\brm\b|rmSync|rmdir|rename|copy|\bcp\b|\bmv\b|\bln\b|mkdir|truncate|symlink|chmod|open\s*\(|>>?\s*['"\w$~/.]|\btee\b|shutil|os\.remove|move|dump|save|replace|\bsed\b|install/i;
+const WRITE_WORDS = String.raw`write|append|unlink|\brm\b|rmSync|rmtree|rmdir|rename|copy|\bcp(?:Sync)?\b|\bmv\b|\bln\b|mkdir|truncate|symlink|chmod|extractall|>>?\s*['"\w$~/.]|\btee\b|shutil|os\.remove|move|dump|save|replace|\bsed\b|install`;
+const WRITE_HINT = new RegExp(`${WRITE_WORDS}|open\\s*\\(`, 'i');
+// (R6-F1: for a program naming a config root, an open() counts only when it opens for writing -- a mode argument that writes, appends or creates -- so open(root + '/settings.json').read() stays open)
+const PROGRAM_WRITE = new RegExp(`${WRITE_WORDS}|,\\s*['"][rbt]*[wax+][rbt+]*['"]\\s*[,)]|\\b(?:mode|flags?)\\s*[=:]`, 'i');
 
 // `bash f.sh`, `source f`, `./f`, `node f.mjs`, `python f.py`: the file is read (up to 1 MB) and judged like the same text
 // typed on the line. A shell script that exists but cannot be read is denied; a missing file runs nothing; a
