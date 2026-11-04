@@ -408,7 +408,7 @@ function makeCtx(opts) {
     trusted: pipelineHit,
     hitAncestor: (p) => pipelineAncestor(p) || reviewDir.test(unFirm(p)),
     // #128: a transcript folder (R1-B1) is a protected reference when a word IS it; a shell sitting in one (cwd, a cd target) may write only what is not a transcript
-    // (hit), but runs of its own (tar -x, cp -R x .) land in it, so there ctx.hitTranscriptBelow counts like an ancestor (projects/ itself does not: notes may be written from it)
+    // (hit), but runs of its own (tar -x, cp -R x .) land in it, so there ctx.hitTranscriptBelow counts like an ancestor (R8-B1: projects/ itself too; the same folders as hitTranscriptDir, see transcriptRes; notes stay writable in projects/<proj>/memory/)
     // (R4-B2 / R4-F2: a trailing zsh glob qualifier, `claude-config(/)`, is not part of the name: dropped, which can only widen the match)
     hitTranscriptDir: (p) => withoutQualifier(p).some((q) => transcripts.dirs.some((re) => re.test(unFirm(q)))),
     hitTranscriptBelow: (p) => withoutQualifier(p).some((q) => transcripts.below.some((re) => re.test(unFirm(q)))),

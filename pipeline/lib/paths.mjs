@@ -138,8 +138,8 @@ export function configDirOf(env, home = os.homedir()) {
   return p.startsWith('/') || /^[A-Za-z]:\//.test(p) ? p : null;
 }
 // The patterns for files (`files`), for the folders (`dirs`: a word that IS one is a protected reference) and for the folders a command may be run
-// in (`below`: the same, R8-B1: `projects/` itself holds the session folders, so `cd projects && tar -xf x` fills them; notes live in
-// projects/<proj>/memory/, which stays open): the `.claude*` shape, plus each of `configDirs`
+// in (`below`: the SAME list since R8-B1, one array under both names: `projects/` itself holds the session folders, so `cd projects && tar -xf x` fills
+// them; notes live in projects/<proj>/memory/, which stays open): the `.claude*` shape, plus each of `configDirs`
 // (absolute POSIX paths; null/'' are skipped). R2-B1: a config dir is itself a folder that holds them (the way ~/.claude is an ancestor of its
 // protected entries): `rsync -a x/ <dir>/`, `tar -xf x -C <dir>` and a shell sitting in it fill projects/ without naming it, so the dir is in `dirs` and `below`.
 // (The folders ABOVE a config dir are not: the same gap as for the pipeline files, not closed here.)
@@ -151,10 +151,11 @@ export function transcriptRes(configDirs = [], ci = false, homes = []) {
   const homeDirs = [...new Set(homes.filter(Boolean))].map((h) => `^${reEscape(h.replace(/\/+$/, ''))}/\\.claude[^/.]*/*$`);
   const roots = dirs.map((d) => `^${reEscape(d)}/`);
   const self = dirs.map((d) => `^${reEscape(d)}/*$`);
+  const folders = [ANY_CLAUDE_DIR + TRANSCRIPT_TOP, ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...self, ...homeDirs, ...roots.flatMap((r) => [r + TRANSCRIPT_TOP, r + TRANSCRIPT_BELOW])].map((x) => new RegExp(x, flags));
   return {
     files: [TRANSCRIPT_FILE_SRC, ...roots.map((r) => r + TRANSCRIPT_LEAF)].map((s) => new RegExp(s, flags)),
-    dirs: [ANY_CLAUDE_DIR + TRANSCRIPT_TOP, ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...self, ...homeDirs, ...roots.flatMap((r) => [r + TRANSCRIPT_TOP, r + TRANSCRIPT_BELOW])].map((x) => new RegExp(x, flags)),
-    below: [ANY_CLAUDE_DIR + TRANSCRIPT_TOP, ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...self, ...homeDirs, ...roots.flatMap((r) => [r + TRANSCRIPT_TOP, r + TRANSCRIPT_BELOW])].map((x) => new RegExp(x, flags)),
+    dirs: folders,
+    below: folders,
   };
 }
 // Is this path (any slash flavour) a transcript FILE the guard protects?
