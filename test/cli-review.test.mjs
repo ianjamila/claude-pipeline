@@ -1,7 +1,7 @@
 // End-to-end tests for the review-loop commands (codex-review, triage, arbiter, state, review-complete, followups).
 // They spawn the real CLI against a real throwaway git repo, a scripted fake gh and a scripted fake codex, because the
 // contract the ship skill depends on is the pair (stdout JSON, exit code) plus the .review/ files left behind.
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -19,7 +19,7 @@ import { loadConfig } from '../pipeline/lib/config.mjs';
 import { currentContentHash, excerptWindow, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
 
@@ -51,10 +51,11 @@ const standardFindings = () => findingsOf(
 );
 
 // What `followups create` asks before it files anything: who we are and which issues of ours exist (none).
-const NO_ISSUES = [
+const noIssues = (slug) => [
   { match: '^api user', stdout: 'me\n' },
-  { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=30 --paginate', stdout: '[]' },
+  { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=30 --paginate`, stdout: '[]' },
 ];
+const NO_ISSUES = noIssues('acme/widgets');
 
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x' } },
@@ -87,7 +88,8 @@ const fenced = (obj) => `Done.\n\n\`\`\`json\n${JSON.stringify(obj)}\n\`\`\``;
 // By default the feature commit is big enough (>= 50 changed lines) to be off the light lane, so the arbiter rules apply in
 // full; `light: true` keeps the change tiny.
 // baseFiles / featFiles: extra { path: content } committed in the base commit / the feature commit.
-function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {}, featFiles = {} } = {}) {
+// slug: the repository name the fake gh reports (`repo view`). Tests that record the owner's chat words use ownerWorld (below).
+function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {}, featFiles = {}, slug = 'acme/widgets' } = {}) {
   const repo = createTmpRepo();
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
@@ -106,13 +108,19 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-review-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
   // The PR as GitHub reports it: its base branch and the head commit it holds (what review-complete compares to).
-  const withPr = (sha) => gh.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { baseRefName: 'main', headRefOid: sha, ...e.stdoutJson } } : e));
+  // (a world with its own slug: every API path the scripts match on names that repository instead of acme/widgets)
+  const forSlug = (e) => (slug === 'acme/widgets' || e.match.includes(slug) ? e : { ...e, match: e.match.split('acme/widgets').join(slug) });
+  const withPr = (sha) => gh.map((e) => {
+    if (e.match === '^pr view 7') return { ...e, stdoutJson: { baseRefName: 'main', headRefOid: sha, ...e.stdoutJson } };
+    if (e.match === '^repo view' && slug !== 'acme/widgets') return { ...e, stdoutJson: { ...e.stdoutJson, nameWithOwner: slug, url: `https://github.com/${slug}` } };
+    return forSlug(e);
+  });
   const fake = createFakeGh(withPr(head));
   const capture = join(scratch, 'codex-capture.jsonl');
   const lockDir = join(scratch, 'locks');
 
   const w = {
-    repo, base, head, scratch, fake, capture, lockDir,
+    repo, base, head, scratch, fake, capture, lockDir, slug,
     // Tell the fake GitHub the PR's head moved (after a new commit).
     prHead: (sha) => fake.setScript(withPr(sha)),
     cli(args, env = {}) {
@@ -162,6 +170,12 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
   };
   return w;
 }
+
+// #122: the owner's recorded chat words live in the account's real owner-go folder (production reads the real home, never $HOME), so
+// every test and every concurrent run of the suite shares that folder. A ruling or grant matches on repository, PR and item, so a world
+// that records any gets a repository name of its own (lower-case hex: repoKey lower-cases) and never matches another test's record.
+const uniqueSlug = () => `acme/widgets-${randomUUID()}`;
+const ownerWorld = (t, opts = {}) => world(t, { slug: uniqueSlug(), ...opts });
 
 // <tmp>/p/<encoded-cwd>/<session>/subagents/agent-<id>.{jsonl,meta.json}: the layout Claude Code writes.
 function installTranscript(w, { jsonl, meta, agentId = 'a1' }) {
@@ -1399,7 +1413,7 @@ const REVIEW_COMMENT = [
   { match: 'issues/7/comments --paginate', stdoutJson: [] },
   { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 77, html_url: 'https://github.com/acme/widgets/pull/7#issuecomment-77' } },
 ];
-const postedBodies = (w) => w.fake.calls().filter((c) => /^api -X POST repos\/acme\/widgets\/issues\/7\/comments /.test(c.argv.join(' '))).map((c) => JSON.parse(c.stdin).body);
+const postedBodies = (w) => w.fake.calls().filter((c) => c.argv.join(' ').startsWith(`api -X POST repos/${w.slug}/issues/7/comments `)).map((c) => JSON.parse(c.stdin).body);
 const reviewJson = (body) => JSON.parse(/```json\n(.*)\n```/.exec(body)[1]);
 
 test('review-complete: removes awaiting-review only when the review is valid for the current content', (t) => {
@@ -2762,7 +2776,7 @@ test('followups create: an issue-list outage is exit 3 and nothing is filed', (t
 
 test('summary reads model proofs from the state rounds, the files only as a fallback', (t) => {
   const url = 'https://github.com/acme/widgets/pull/7#issuecomment-5';
-  const w = world(t, {
+  const w = ownerWorld(t, {
     gh: [...GH, { match: '^api user', stdout: 'me\n' }, { match: 'issues/7/comments --paginate', stdoutJson: [] },
       { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 5, html_url: url } }],
   });
@@ -2801,7 +2815,7 @@ const askedContent = (w, ids) => {
   const r = w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', ids.join(',')]);
   return r.code === 0 ? / · content ([0-9a-f]{12}) · /.exec(r.json.line)[1] : '0'.repeat(12);
 };
-const ownerAnswers = (w, t, { prompt = QUOTE, ids = ['R1-B1'], pr = 7, repo, content } = {}) =>
+const ownerAnswers = (w, t, { prompt = QUOTE, ids = ['R1-B1'], pr = 7, repo = w.slug, content } = {}) =>
   ownerRules(t, prompt, rulingRequest(pr, ids, repo, content === undefined ? askedContent(w, ids) : content));
 const rule = (id, decision, { quote = QUOTE, reason = 'owner confirmed in chat', extra = [] } = {}) =>
   ['triage', 'owner-ruling', '--round', '1', '--id', id, '--decision', decision, '--reason', reason, '--owner-quote', quote, ...extra];
@@ -2839,12 +2853,12 @@ test('triage owner-ruling: refused in label mode, for an item that needs no huma
 // Phase 3b: --owner-quote was the agent's own word. It now has to come from the owner's prompt that answered a ruling request for this
 // repository, PR and item (the owner-go recorder); white space and case aside, the words must be in it.
 test('triage owner-ruling: needs the owner\'s recorded answer to a ruling request for this repository, PR and item, holding the quote', (t) => {
-  const w = world(t, { yml: CHAT_YML });
+  const w = ownerWorld(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
   const none = w.cli(rule('R1-B1', 'FOLLOW-UP'));
   assertExit(none, 1);
-  assert.match(none.json.reason, /no owner ruling is recorded for acme\/widgets #7 R1-B1 .*triage ruling-request --pr 7 --ids R1-B1/);
+  assert.match(none.json.reason, new RegExp(`no owner ruling is recorded for ${w.slug.replace('/', '\\/')} #7 R1-B1 .*triage ruling-request --pr 7 --ids R1-B1`));
   ownerAnswers(w, t, { pr: 8 }); // another PR
   ownerAnswers(w, t, { repo: 'acme/gadgets' }); // another repository
   ownerAnswers(w, t, { ids: ['R1-S1'] }); // another item
@@ -2876,18 +2890,35 @@ test('triage owner-ruling: needs the owner\'s recorded answer to a ruling reques
   assert.equal(w.item('R1-B1').final.ownerQuote, QUOTE);
 });
 
+test('triage owner-ruling: one world\'s recorded answer never satisfies another world (#122: a repository name per test)', (t) => {
+  // Two worlds built from identical fixtures: the same needsHuman state and the same content digests, so the only thing telling their
+  // records apart is the repository name. The records live in the account's real owner-go folder, shared by every test and every
+  // concurrent run of the suite.
+  const build = () => {
+    const w = ownerWorld(t, { yml: CHAT_YML });
+    assertExit(w.codex(1, findingsOf([finding()])), 0);
+    waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+    return w;
+  };
+  const a = build();
+  const b = build();
+  ownerAnswers(a, t);
+  assertExit(a.cli(rule('R1-B1', 'FOLLOW-UP')), 0, 'the world that was answered');
+  assertExit(b.cli(rule('R1-B1', 'FOLLOW-UP')), 1, 'another world must not see that answer');
+});
+
 // ---- #110: a ruling request is bound to the finding text, not just the item id ----------------------------
 
 test('triage ruling-request: prints the ruling line with the content digest of exactly the asked ids', (t) => {
-  const w = world(t, { yml: CHAT_YML });
+  const w = ownerWorld(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-S1': 'REJECT' });
   const items = w.state().rounds[0].items;
   const ask = (...ids) => w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', ids.join(',')]);
   const both = ask('R1-B1', 'R1-S1');
   assertExit(both, 0, both.stderr + both.stdout);
-  assert.deepEqual(both.json, { ok: true, line: `⚖️ Owner ruling needed #7: R1-B1, R1-S1 · content ${rulingContentDigest(items)} · repo acme/widgets` });
-  assert.equal(ask('R1-B1').json.line, `⚖️ Owner ruling needed #7: R1-B1 · content ${rulingContentDigest([items[0]])} · repo acme/widgets`, 'only the asked ids');
+  assert.deepEqual(both.json, { ok: true, line: `⚖️ Owner ruling needed #7: R1-B1, R1-S1 · content ${rulingContentDigest(items)} · repo ${w.slug}` });
+  assert.equal(ask('R1-B1').json.line, `⚖️ Owner ruling needed #7: R1-B1 · content ${rulingContentDigest([items[0]])} · repo ${w.slug}`, 'only the asked ids');
   assert.notEqual(ask('R1-B1').json.line.split(' · ')[1], ask('R1-S1').json.line.split(' · ')[1]);
   assert.equal(ask('R1-B1', 'r1-b1').json.line, ask('R1-B1').json.line, 'ids differing only in case are one id');
   assertExit(ask('R1-B1', 'R1-X9'), 1, 'an unknown id');
@@ -2922,7 +2953,7 @@ const CHANGES = [
 ];
 for (const [what, change, id] of CHANGES) {
   test(`triage owner-ruling: refused when only ${what} of ${id} changed after the owner was asked (#110)`, (t) => {
-    const w = world(t, { yml: CHAT_YML });
+    const w = ownerWorld(t, { yml: CHAT_YML });
     assertExit(w.codex(1, findingsOf([finding()])), 0);
     addFableItem(w);
     waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-F1': 'ACCEPT' });
@@ -2939,7 +2970,7 @@ for (const [what, change, id] of CHANGES) {
 }
 
 test('triage owner-ruling: unchanged content is accepted (#110)', (t) => {
-  const w = world(t, { yml: CHAT_YML });
+  const w = ownerWorld(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   addFableItem(w);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-F1': 'ACCEPT' });
@@ -2953,7 +2984,7 @@ test('triage owner-ruling: one changed item of a two-item request refuses the ru
   const asked = ['R1-B1', 'R1-S1'];
   const answer = 'R1-B1: follow-up; R1-S1: reject.';
   const make = () => {
-    const w = world(t, { yml: CHAT_YML });
+    const w = ownerWorld(t, { yml: CHAT_YML });
     assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
     waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-S1': 'REJECT' });
     ownerAnswers(w, t, { prompt: answer, ids: asked });
@@ -2973,7 +3004,7 @@ test('triage owner-ruling: one changed item of a two-item request refuses the ru
 });
 
 test('triage owner-ruling: a request whose item is gone is refused (#110)', (t) => {
-  const w = world(t, { yml: CHAT_YML });
+  const w = ownerWorld(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
   const answer = 'R1-B1: follow-up';
@@ -2985,7 +3016,7 @@ test('triage owner-ruling: a request whose item is gone is refused (#110)', (t) 
 });
 
 test('triage owner-ruling: a ruling asked in the old line shape (no content) approves nothing (#110)', (t) => {
-  const w = world(t, { yml: CHAT_YML });
+  const w = ownerWorld(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
   assert.equal(ownerAnswers(w, t, { content: null }).content, null);
@@ -2997,7 +3028,7 @@ test('triage owner-ruling: a ruling asked in the old line shape (no content) app
 });
 
 test('triage owner-ruling: an answer that rules on several items names each one it is read for', (t) => {
-  const w = world(t, { yml: CHAT_YML });
+  const w = ownerWorld(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-S1': 'REJECT' });
   const both = 'R1-B1: follow-up; R1-S1: reject.';
@@ -3009,7 +3040,7 @@ test('triage owner-ruling: an answer that rules on several items names each one 
 });
 
 test('triage owner-ruling: records the owner ruling, keeps the overruled final, and clears the needs-human block', (t) => {
-  const w = world(t, { yml: CHAT_YML });
+  const w = ownerWorld(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()], [finding({ title: 'Rename helper', file: 'src/b.js', line: 3 })])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP', 'R1-S1': 'REJECT' });
   ownerAnswers(w, t);
@@ -3036,7 +3067,7 @@ test('triage owner-ruling: records the owner ruling, keeps the overruled final, 
 });
 
 test('triage owner-ruling: ACCEPT stays unclean until the fix is built and a later round reviews it', (t) => {
-  const w = world(t, { yml: CHAT_YML });
+  const w = ownerWorld(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   waitingForHuman(w, { 'R1-B1': 'REJECT' });
   ownerAnswers(w, t, { prompt: ACCEPT_QUOTE });
@@ -3054,7 +3085,7 @@ test('triage owner-ruling: ACCEPT stays unclean until the fix is built and a lat
 });
 
 test('triage owner-ruling: works on a published round, and a state rebuilt from the triage comment keeps the ruling', (t) => {
-  const w0 = world(t, { yml: CHAT_YML });
+  const w0 = ownerWorld(t, { yml: CHAT_YML });
   assertExit(w0.codex(1, findingsOf([finding()])), 0);
   waitingForHuman(w0, { 'R1-B1': 'FOLLOW-UP' });
   ownerAnswers(w0, t);
@@ -3065,7 +3096,7 @@ test('triage owner-ruling: works on a published round, and a state rebuilt from 
     { match: '^api user', stdout: 'me\n' },
     { match: 'issues/7/comments --paginate', stdoutJson: [{ id: 9, user: { login: 'me' }, body: triageComment(ruled) }] },
   ];
-  const w = world(t, { gh, yml: CHAT_YML });
+  const w = ownerWorld(t, { gh, yml: CHAT_YML });
   const shown = w.cli(['state', 'show', '--pr', '7']);
   assertExit(shown, 0, shown.stderr + shown.stdout);
   assert.equal(shown.json.recovered, true);
@@ -3102,7 +3133,7 @@ test('review skill scenario: Codex ACCEPT item, fixed, state mark-implemented, c
 });
 
 test('review skill scenario: owner ruling via ruling-request, the owner\'s recorded answer, owner-ruling, triage re-posted, review-complete succeeds', (t) => {
-  const w = world(t, { yml: CHAT_YML, gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
+  const w = ownerWorld(t, { yml: CHAT_YML, gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   waitingForHuman(w, { 'R1-B1': 'REJECT' }); // what a failed arbiter model proof leaves behind
   assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
@@ -3124,8 +3155,9 @@ test('review skill scenario: owner ruling via ruling-request, the owner\'s recor
 });
 
 test('followups create: a FOLLOW-UP ruled by the owner is filed, one that is still waiting for a human is held', (t) => {
-  const url = 'https://github.com/acme/widgets/issues/31';
-  const w = world(t, { yml: CHAT_YML, gh: [...GH, ...NO_ISSUES, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 31, html_url: url } }] });
+  const slug = uniqueSlug();
+  const url = `https://github.com/${slug}/issues/31`;
+  const w = ownerWorld(t, { slug, yml: CHAT_YML, gh: [...GH, ...noIssues(slug), { match: `^api -X POST repos/${slug}/issues `, stdoutJson: { number: 31, html_url: url } }] });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
   ownerAnswers(w, t);
@@ -3135,7 +3167,7 @@ test('followups create: a FOLLOW-UP ruled by the owner is filed, one that is sti
   const r = w.cli(['followups', 'create', '--round', '1']);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual(r.json.created, [{ id: 'R1-B1', number: 31, url }]);
-  const post = w.fake.calls().find((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues '));
+  const post = w.fake.calls().find((c) => c.argv.join(' ').startsWith(`api -X POST repos/${slug}/issues `));
   assert.ok(JSON.parse(post.stdin).body.includes('**Owner (why this is a follow-up, not part of the PR):** owner confirmed in chat'));
 });
 
@@ -3163,7 +3195,7 @@ test('triage settle: a cached copy of an owner ruling (by cache, ownerQuote kept
 });
 
 test('triage owner-ruling: says the ruling is not published yet and that state show would restore the published state without it', (t) => {
-  const w = world(t, { yml: CHAT_YML });
+  const w = ownerWorld(t, { yml: CHAT_YML });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
   ownerAnswers(w, t);
@@ -3449,15 +3481,16 @@ function reviewAndFix(w, n, from, to) {
 }
 // max_rounds 1: round 1, then the one automatic extra round (2); both only accepted fixes. Round 3 now needs the owner.
 function atCap(t, yml = CAP1_CHAT, gh = GH) {
-  const w = world(t, { yml, gh });
+  const w = ownerWorld(t, { yml, gh });
   const h1 = reviewAndFix(w, 1, w.base, w.head);
   const h2 = reviewAndFix(w, 2, w.head, h1);
   return { w, h1, h2 };
 }
 // The owner types `extra round` after a reply ending with the request line. The marker its use leaves is removed afterwards.
-function ownerGrantsRound(t, { pr = 7, k, head, prompt = 'extra round', repo = 'acme/widgets' }) {
+function ownerGrantsRound(w, t, { pr = 7, k, head, prompt = 'extra round', repo = w.slug }) {
   const record = ownerGrants(t, prompt, roundRequest(pr, k, head, repo));
   assert.ok(record, 'the recorder wrote the grant');
+  cleanupAtExit(markerPath(grantIdOf(record)));
   t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
   return record;
 }
@@ -3479,10 +3512,10 @@ test('codex-review owner grant: round-request -> the owner\'s grant -> codex-rev
   const req = w.cli(['triage', 'round-request', '--pr', '7']);
   assertExit(req, 0, req.stderr + req.stdout);
   assert.deepEqual([req.json.k, req.json.n, req.json.head], [3, 3, h2]);
-  assert.equal(req.json.line, `🔁 Extra review round needed #7: round 3 · head ${h2.slice(0, 12)} · repo acme/widgets`);
-  assert.deepEqual(presentedRoundRequest(`Round 2 left items open.\n${req.json.line}`), { pr: 7, k: 3, head: h2.slice(0, 12), repo: 'acme/widgets' });
+  assert.equal(req.json.line, `🔁 Extra review round needed #7: round 3 · head ${h2.slice(0, 12)} · repo ${w.slug}`);
+  assert.deepEqual(presentedRoundRequest(`Round 2 left items open.\n${req.json.line}`), { pr: 7, k: 3, head: h2.slice(0, 12), repo: w.slug });
 
-  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const record = ownerGrantsRound(w, t, { k: 3, head: h2 });
   const before = w.cli(['state', 'outcome']).json;
   assert.deepEqual([before.reachedMax, before.effectiveMaxRounds, before.grantedRound?.k, before.grantedRound?.quote], [false, 3, 3, 'extra round']);
   assert.equal(readGrantMarker(grantIdOf(record)).spent, false, 'asking for the outcome claims nothing');
@@ -3493,7 +3526,7 @@ test('codex-review owner grant: round-request -> the owner\'s grant -> codex-rev
   assert.equal(w.captured().length, calls + 1, 'Codex ran once');
   assert.deepEqual(r.json.grantUsed, { grantId: grantIdOf(record) });
   const marker = readGrantMarker(grantIdOf(record));
-  assert.deepEqual([marker.spent, marker.verifiable, marker.marker.repo, marker.marker.pr, marker.marker.k, marker.marker.head], [true, true, 'acme/widgets', 7, 3, h2]);
+  assert.deepEqual([marker.spent, marker.verifiable, marker.marker.repo, marker.marker.pr, marker.marker.k, marker.marker.head], [true, true, w.slug, 7, 3, h2]);
   const [r1, r2, r3] = w.state().rounds;
   assert.deepEqual([r1.admission, r2.admission, r3.admission], ['normal', 'auto-extra', 'owner']);
   assert.deepEqual([r1.ownerGrant, r2.ownerGrant], [undefined, undefined]);
@@ -3512,7 +3545,7 @@ test('codex-review owner grant: round-request -> the owner\'s grant -> codex-rev
 
 test('codex-review owner grant: label mode never grants and never claims', (t) => {
   const { w, h1, h2 } = atCap(t, CAP1_LABEL);
-  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const record = ownerGrantsRound(w, t, { k: 3, head: h2 });
   const capped = codexThree(w, h1, h2);
   assertExit(capped, 2, capped.stdout);
   assert.equal(capped.json.error, 'round-cap');
@@ -3525,9 +3558,9 @@ test('codex-review owner grant: label mode never grants and never claims', (t) =
 
 test('codex-review owner grant: a grant recorded for another round, PR or repository admits nothing', (t) => {
   const { w, h1, h2 } = atCap(t);
-  ownerGrantsRound(t, { k: 4, head: h2 });
-  ownerGrantsRound(t, { pr: 8, k: 3, head: h2 });
-  ownerGrantsRound(t, { k: 3, head: h2, repo: 'other/repo' });
+  ownerGrantsRound(w, t, { k: 4, head: h2 });
+  ownerGrantsRound(w, t, { pr: 8, k: 3, head: h2 });
+  ownerGrantsRound(w, t, { k: 3, head: h2, repo: 'other/repo' });
   const capped = codexThree(w, h1, h2);
   assertExit(capped, 2, capped.stdout);
   assert.equal(capped.json.error, 'round-cap');
@@ -3536,7 +3569,7 @@ test('codex-review owner grant: a grant recorded for another round, PR or reposi
 
 test('codex-review owner grant: Codex exit 3 leaves the grant open, and the retry uses it', (t) => {
   const { w, h1, h2 } = atCap(t);
-  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const record = ownerGrantsRound(w, t, { k: 3, head: h2 });
   const down = codexThree(w, h1, h2, { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'boom' } });
   assertExit(down, 3, down.stdout);
   assert.equal(readGrantMarker(grantIdOf(record)).spent, false, 'a failed Codex run spends nothing');
@@ -3548,7 +3581,7 @@ test('codex-review owner grant: Codex exit 3 leaves the grant open, and the retr
 
 test('codex-review owner grant: github down while the grant is looked up is exit 3 (unavailable), not a round-cap refusal', (t) => {
   const { w, h1, h2 } = atCap(t);
-  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const record = ownerGrantsRound(w, t, { k: 3, head: h2 });
   w.fake.setScript(GH.map((e) => (e.match === '^repo view' ? { match: e.match, code: 1, stderr: 'HTTP 502' } : e.match === '^pr view 7' ? { ...e, stdoutJson: { baseRefName: 'main', headRefOid: h2, ...e.stdoutJson } } : e)));
   const down = codexThree(w, h1, h2);
   assertExit(down, 3, down.stdout);
@@ -3559,7 +3592,7 @@ test('codex-review owner grant: github down while the grant is looked up is exit
 
 test('codex-review owner grant: a failure while the round\'s files are written spends nothing (the claim is the last step before the state is saved)', (t) => {
   const { w, h1, h2 } = atCap(t);
-  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const record = ownerGrantsRound(w, t, { k: 3, head: h2 });
   // A directory squatting on codex.md makes the round's markdown write throw after the findings are in.
   mkdirSync(join(w.repo.dir, '.review', 'round-3', 'codex.md'), { recursive: true });
   const crashed = codexThree(w, h1, h2);
@@ -3570,7 +3603,7 @@ test('codex-review owner grant: a failure while the round\'s files are written s
 
 test('codex-review owner grant: a head that moved after the grant is "ask again"; round-request names the new head and a fresh grant works', (t) => {
   const { w, h1, h2 } = atCap(t);
-  const stale = ownerGrantsRound(t, { k: 3, head: h2 });
+  const stale = ownerGrantsRound(w, t, { k: 3, head: h2 });
   w.repo.write('src/c.js', 'export const c = 1;\n');
   const h3 = w.repo.commit('one more fix');
   const refused = codexThree(w, h1, h3);
@@ -3583,7 +3616,7 @@ test('codex-review owner grant: a head that moved after the grant is "ask again"
   const req = w.cli(['triage', 'round-request', '--pr', '7']);
   assertExit(req, 0, req.stderr + req.stdout);
   assert.equal(req.json.head, h3);
-  ownerGrantsRound(t, { k: 3, head: h3 });
+  ownerGrantsRound(w, t, { k: 3, head: h3 });
   const ok = codexThree(w, h1, h3);
   assertExit(ok, 0, ok.stderr + ok.stdout);
   assert.equal(w.state().rounds[2].toHead, h3);
@@ -3591,7 +3624,7 @@ test('codex-review owner grant: a head that moved after the grant is "ask again"
 
 test('codex-review owner grant: a grant used elsewhere while Codex ran is exit 2 "grant already used": one marker, one recorded round', (t) => {
   const { w, h1, h2 } = atCap(t);
-  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const record = ownerGrantsRound(w, t, { k: 3, head: h2 });
   // A second checkout of the same PR at the same commit (its own lock folder) reviews round 3 WHILE this checkout's Codex is running.
   const other = join(w.scratch, 'checkout-2');
   const cloned = spawnSync('git', ['clone', '-q', w.repo.dir, other], { encoding: 'utf8' });
@@ -3613,7 +3646,7 @@ test('codex-review owner grant: a grant used elsewhere while Codex ran is exit 2
 
 test('codex-review owner grant: the marker is created AFTER Codex answers (a Codex run that looks for it finds none)', (t) => {
   const { w, h1, h2 } = atCap(t);
-  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const record = ownerGrantsRound(w, t, { k: 3, head: h2 });
   const file = markerPath(grantIdOf(record));
   const probe = join(w.scratch, 'marker-during-codex');
   const during = `node -e "require('fs').writeFileSync(process.argv[1], String(require('fs').existsSync(process.argv[2])))" "${probe}" "${file}"`;
@@ -3625,8 +3658,8 @@ test('codex-review owner grant: the marker is created AFTER Codex answers (a Cod
 
 test('codex-review owner grant: two records for the same round and head are claimed together, so discard-round and a rerun is round-cap', (t) => {
   const { w, h1, h2 } = atCap(t, CAP1_CHAT, [...GH, ...COMMENTS()]); // (discard-round asks GitHub which rounds are published: none)
-  const first = ownerGrantsRound(t, { k: 3, head: h2 });
-  const second = ownerGrantsRound(t, { k: 3, head: h2, prompt: 'grant round' });
+  const first = ownerGrantsRound(w, t, { k: 3, head: h2 });
+  const second = ownerGrantsRound(w, t, { k: 3, head: h2, prompt: 'grant round' });
   assertExit(codexThree(w, h1, h2), 0);
   assert.equal(readGrantMarker(grantIdOf(first)).spent, true);
   assert.equal(readGrantMarker(grantIdOf(second)).spent, true, 'the duplicate is spent with it');
@@ -3637,7 +3670,7 @@ test('codex-review owner grant: two records for the same round and head are clai
   assert.equal(again.json.error, 'round-cap');
   assert.equal(w.state().rounds.length, 2);
   // a fresh grant after the discard is the one open grant: effective cap 3, counted once
-  ownerGrantsRound(t, { k: 3, head: h2, prompt: 'extra round please' });
+  ownerGrantsRound(w, t, { k: 3, head: h2, prompt: 'extra round please' });
   const out = w.cli(['state', 'outcome']).json;
   assert.deepEqual([out.reachedMax, out.effectiveMaxRounds, out.grantedRound?.k], [false, 3, 3]);
   assertExit(codexThree(w, h1, h2), 0);
@@ -3645,9 +3678,9 @@ test('codex-review owner grant: two records for the same round and head are clai
 });
 
 test('codex-review owner grant: the automatic extra round wins - a grant for the same round is not claimed', (t) => {
-  const w = world(t, { yml: CAP1_CHAT });
+  const w = ownerWorld(t, { yml: CAP1_CHAT });
   const h1 = reviewAndFix(w, 1, w.base, w.head);
-  const record = ownerGrantsRound(t, { k: 2, head: h1 });
+  const record = ownerGrantsRound(w, t, { k: 2, head: h1 });
   assert.equal(w.cli(['state', 'outcome']).json.effectiveMaxRounds, 2, 'auto extra + grant for the same ordinal count once');
   const r = w.codex(2, findingsOf(), { from: w.head, to: h1 });
   assertExit(r, 0, r.stderr + r.stdout);
@@ -3657,7 +3690,7 @@ test('codex-review owner grant: the automatic extra round wins - a grant for the
 });
 
 test('codex-review owner grant: counted ordinal k and round number n differ after a base-only round (3 counted + 1 base-only: k=4, --round 5)', (t) => {
-  const w = world(t, { yml: CAP2_CHAT });
+  const w = ownerWorld(t, { yml: CAP2_CHAT });
   const h1 = reviewAndFix(w, 1, w.base, w.head);
   const h2 = reviewAndFix(w, 2, w.head, h1);
   assertExit(w.codex(3, findingsOf(), { from: h1, to: h2 }), 0); // the automatic extra round
@@ -3673,7 +3706,7 @@ test('codex-review owner grant: counted ordinal k and round number n differ afte
   assertExit(req, 0, req.stderr + req.stdout);
   assert.deepEqual([req.json.k, req.json.n, req.json.head], [4, 5, h5]);
   assert.match(req.json.line, /round 4 · head /);
-  const record = ownerGrantsRound(t, { k: 4, head: h5 });
+  const record = ownerGrantsRound(w, t, { k: 4, head: h5 });
   const wrong = w.codex(4, findingsOf(), { from: merged, to: h5 });
   assertExit(wrong, 2, wrong.stdout);
   assert.equal(wrong.json.error, 'round-order');
@@ -3685,11 +3718,11 @@ test('codex-review owner grant: counted ordinal k and round number n differ afte
 });
 
 test('codex-review owner grant: a base-only round past the cap neither needs nor uses a grant', (t) => {
-  const w = world(t, { yml: CAP1_CHAT });
+  const w = ownerWorld(t, { yml: CAP1_CHAT });
   const h1 = reviewAndFix(w, 1, w.base, w.head);
   assertExit(w.codex(2, findingsOf(), { from: w.head, to: h1 }), 0); // the automatic extra round: everything is reviewed, the cap is reached
   const merged = mergeMainInto(w, { 'src/a.js': aFile(false).replace('export const v9 = 9;', 'export const v9 = 90;') });
-  const record = ownerGrantsRound(t, { k: 3, head: merged });
+  const record = ownerGrantsRound(w, t, { k: 3, head: merged });
   const r = w.codex(3, findingsOf(), { from: h1, to: merged });
   assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.baseOnly, true);
@@ -3699,7 +3732,7 @@ test('codex-review owner grant: a base-only round past the cap neither needs nor
 });
 
 test('triage round-request: the exact line, and the refusals', (t) => {
-  const w = world(t, { yml: CAP1_CHAT });
+  const w = ownerWorld(t, { yml: CAP1_CHAT });
   const early = w.cli(['triage', 'round-request', '--pr', '7']);
   assert.equal(early.code, 2, 'no review state yet');
   const h1 = reviewAndFix(w, 1, w.base, w.head);
@@ -3712,8 +3745,8 @@ test('triage round-request: the exact line, and the refusals', (t) => {
   assert.match(wrongPr.json.reason, /review state is for PR #7, not #9/);
   const ok = w.cli(['triage', 'round-request', '--pr', '7']);
   assertExit(ok, 0, ok.stderr + ok.stdout);
-  assert.equal(ok.json.line, `🔁 Extra review round needed #7: round 3 · head ${h1.slice(0, 12)} · repo acme/widgets`);
-  ownerGrantsRound(t, { k: 3, head: h1 });
+  assert.equal(ok.json.line, `🔁 Extra review round needed #7: round 3 · head ${h1.slice(0, 12)} · repo ${w.slug}`);
+  ownerGrantsRound(w, t, { k: 3, head: h1 });
   const granted = w.cli(['triage', 'round-request', '--pr', '7']);
   assertExit(granted, 1, granted.stdout);
   assert.match(granted.json.reason, /already granted for this head: run codex-review --round 3/);
@@ -3721,7 +3754,7 @@ test('triage round-request: the exact line, and the refusals', (t) => {
 
 test('review-complete: the configured review.max_rounds is the cap - a state edited to maxRounds null with an ordinary round past it is refused', (t) => {
   const { w, h1, h2 } = atCap(t, CAP1_CHAT, [...GH, REMOVE_LABEL, ...REVIEW_COMMENT]);
-  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const record = ownerGrantsRound(w, t, { k: 3, head: h2 });
   assertExit(codexThree(w, h1, h2), 0);
   w.prHead(h2);
   const st = w.state();
@@ -3738,7 +3771,7 @@ test('review-complete: the configured review.max_rounds is the cap - a state edi
 
 test('review-complete: refuses the marker when an owner-granted round cannot be verified (a forged state, a missing marker), posts when it can', (t) => {
   const { w, h1, h2 } = atCap(t, CAP1_CHAT, [...GH, REMOVE_LABEL, ...REVIEW_COMMENT]);
-  const record = ownerGrantsRound(t, { k: 3, head: h2 });
+  const record = ownerGrantsRound(w, t, { k: 3, head: h2 });
   assertExit(codexThree(w, h1, h2), 0);
   w.prHead(h2);
   assert.equal(w.state().rounds[2].ownerGrant.grantId, grantIdOf(record));
