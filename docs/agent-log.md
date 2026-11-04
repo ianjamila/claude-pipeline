@@ -102,3 +102,4 @@ full record.
 - 2026-11-04 · #148 · Hardening: mark-implemented counts only PR-authored content (#120); fastSplit needs labels (EW #1598); owner-go test isolation (#122) · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
 - 2026-11-04 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 7 · arbiter 7 · needs-human
 - 2026-11-04 · #155 · fix(stacks): background jobs own their private stack (claude bg-spare) · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge
+- 2026-11-04 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 8 · arbiter 8 · needs-human
