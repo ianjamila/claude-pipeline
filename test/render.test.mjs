@@ -685,3 +685,9 @@ test('summaryComment: an owner-granted round is listed under Outliers with the q
   const none = summaryComment(stateWith([[]]), { outcome: 'o' }).split('### What was built')[0];
   assert.ok(!none.includes('granted round'));
 });
+
+test('triageComment: a round\'s promptSha256 round-trips through the state marker', () => {
+  const s = stateWith([[item({ id: 'R1-B1', title: 'x', final: final('REJECT') })]]);
+  s.rounds[0].promptSha256 = 'cd'.repeat(32);
+  assert.equal(decodeFromComment(triageComment(s)).rounds[0].promptSha256, 'cd'.repeat(32));
+});
