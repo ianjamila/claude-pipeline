@@ -631,3 +631,52 @@ test('liveSessionsIn: case rules follow the platform passed (a different-case fo
   assert.equal(liveSessionsIn(scan, ['/work/wt-a'], { platform: 'win32' }).hits.length, 1);
   assert.equal(liveSessionsIn(scan, ['/Work/Wt-A'], { platform: 'linux' }).hits.length, 1);
 });
+
+// `pipeline worktrees sessions` answers "may I remove this folder?", so it is strict where prune is tolerant: a session working
+// folder that cannot be resolved (and is not the folder by its logged spelling) might be an alias of the folder, so it is
+// reported as unplaced instead of being read as "elsewhere". Prune's default is unchanged.
+test('liveSessionsIn strict: an unresolvable working folder that does not match lexically is unplaced (naming the session and folder); the default reads it as elsewhere', { skip: WIN && 'symlinks and chmod need privileges on Windows CI' }, () => {
+  const w = world();
+  const gone = join(w.base, 'nowhere', 'deleted');
+  const scan = { available: true, sessions: [{ id: 'aaaaaaaa', pid: 11, cwd: gone }, { id: 'bbbbbbbb', pid: 12, cwd: w.elsewhere }], unplaced: [] };
+  const spellings = pathSpellings(w.wt);
+  assert.deepEqual(liveSessionsIn(scan, spellings), { hits: [], unplaced: [] }, 'default unchanged');
+  const strict = liveSessionsIn(scan, spellings, { strict: true });
+  assert.deepEqual(strict.hits, []);
+  assert.equal(strict.unplaced.length, 1, 'the resolvable session elsewhere is plainly elsewhere');
+  assert.match(strict.unplaced[0], /session aaaaaaaa pid 11/);
+  assert.ok(strict.unplaced[0].includes(gone), strict.unplaced[0]);
+  assert.match(strict.unplaced[0], /ENOENT/);
+});
+
+test('liveSessionsIn strict: an unresolvable folder that matches by its logged spelling is a hit (not unplaced); earlier unplaced entries are kept', () => {
+  const w = world();
+  const inside = join(w.wt, 'app', 'removed-subfolder');
+  const scan = { available: true, sessions: [{ id: 'aaaaaaaa', pid: 11, cwd: inside }], unplaced: ['open session cccccccc pid 5: working folder unknown'] };
+  const r = liveSessionsIn(scan, pathSpellings(w.wt), { strict: true });
+  assert.deepEqual(r.hits, [{ id: 'aaaaaaaa', pid: 11 }]);
+  assert.deepEqual(r.unplaced, ['open session cccccccc pid 5: working folder unknown']);
+});
+
+test('liveSessionsIn strict: a logged alias behind an unreadable ancestor (chmod 000) or a removed alias link is unplaced, never "elsewhere"', { skip: (WIN && 'symlinks and chmod need privileges on Windows CI') || (ROOT && 'chmod 000 does not stop root') }, () => {
+  const w = world();
+  const locked = join(w.base, 'locked');
+  mkdirSync(locked);
+  symlinkSync(w.wt, join(locked, 'alias'));
+  symlinkSync(w.wt, join(w.base, 'gone-alias'));
+  const spellings = pathSpellings(w.wt);
+  const scan = { available: true, sessions: [{ id: 'aaaaaaaa', pid: 11, cwd: join(locked, 'alias', 'app') }], unplaced: [] };
+  const removed = { available: true, sessions: [{ id: 'bbbbbbbb', pid: 12, cwd: join(w.base, 'gone-alias') }], unplaced: [] };
+  rmSync(join(w.base, 'gone-alias'));
+  chmodSync(locked, 0o000);
+  try {
+    assert.deepEqual(liveSessionsIn(scan, spellings).hits, [], 'the default cannot see through it');
+    const strict = liveSessionsIn(scan, spellings, { strict: true });
+    assert.deepEqual(strict.hits, []);
+    assert.match(strict.unplaced[0], /session aaaaaaaa pid 11.*EACCES/);
+    const deleted = liveSessionsIn(removed, spellings, { strict: true });
+    assert.match(deleted.unplaced[0], /session bbbbbbbb pid 12.*ENOENT/, 'a deleted alias cannot be told from a deleted target');
+  } finally {
+    chmodSync(locked, 0o755);
+  }
+});
