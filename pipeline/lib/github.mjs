@@ -124,6 +124,22 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     return list;
   };
 
+  // GET a list, every page: [{...}, ...]. A reply that is not a list of objects is a failure, never partial data.
+  const pagedList = (path, jq) => {
+    const args = ['api', path, '--paginate', ...(jq ? ['--jq', jq] : [])];
+    const r = ok(args);
+    let list;
+    try {
+      list = parseConcatenatedJson(r.stdout);
+    } catch (err) {
+      throw new GhError({ code: r.code, stderr: `could not parse ${path.split('?')[0]}: ${err.message}`, args });
+    }
+    if (!list.every((x) => x !== null && typeof x === 'object')) {
+      throw new GhError({ code: r.code, stderr: `${path.split('?')[0]} reply was not a list of objects`, args });
+    }
+    return list;
+  };
+
   const self = {
     api,
 
@@ -305,6 +321,20 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       }
       return parents;
     },
+
+    // The REST reads ci-wait polls. Each is a paginated list read to the end: with --jq the filter runs per page, so every page
+    // prints as one array (`[..][..]`) that parseConcatenatedJson reads whole; a bare --paginate of an object reply would
+    // print concatenated objects and lose page 2.
+    // Check runs of a commit (the Checks API: name, app.id, status, conclusion, check_suite.id).
+    checkRunsOf: (head) => pagedList(`repos/${self.repo().slug}/commits/${encodeURIComponent(head)}/check-runs?per_page=100`, '.check_runs'),
+    // The status LIST of a commit (every status ever posted, newest first; carries creator.login). NOT the combined /status.
+    statusesOf: (head) => pagedList(`repos/${self.repo().slug}/commits/${encodeURIComponent(head)}/statuses?per_page=100`),
+    // Rules that apply to a branch from repository rulesets; an empty list means none.
+    branchRules: (branch) => pagedList(`repos/${self.repo().slug}/rules/branches/${encodePath(branch)}?per_page=100`),
+    // The timeline events of an issue or PR (ready_for_review, converted_to_draft, ...).
+    timelineOf: (n) => pagedList(`repos/${self.repo().slug}/issues/${prNumber(n)}/timeline?per_page=100`),
+    // The workflow runs of one check suite (their created_at tells a draft-era run from a ready-era one).
+    workflowRunsOfSuite: (suiteId) => pagedList(`repos/${self.repo().slug}/actions/runs?check_suite_id=${encodeURIComponent(suiteId)}&per_page=100`, '.workflow_runs'),
 
     // PUT pulls/{n}/update-branch: merge the base into the PR branch on GitHub (a merge commit, never a force push), but only
     // if the head is still `expectedHeadSha`. 202 = accepted (the new head appears a moment later). The two 422s are answers,
