@@ -428,6 +428,42 @@ test('consumerWorktrees: a worktree listing that fails is unknown; Windows never
   assert.equal(called, 0);
 });
 
+// #130: `git worktree list` runs under the project lock, so each call is bounded like every other subprocess of the gather:
+// min(15 s, time left), no spawn under 500 ms, and a failure keeps the stack.
+test('consumerWorktrees: each repo lookup gets min(cap, time left at that moment); an advancing clock across two repos shrinks the second budget', () => {
+  let clock = 1_000_000;
+  const seen = [];
+  const listWorktrees = (repo, o) => { seen.push([repo, o?.timeoutMs]); clock += 12_000; return [wtEntry(repo, 'main')]; };
+  const r = consumerWorktrees(stackSa, { events: [], repos: ['/r1', '/r2'], listWorktrees, platform: 'darwin', deadlineAt: 1_000_000 + 20_000, now: () => clock });
+  assert.equal(r.ok, true);
+  assert.deepEqual(seen, [['/r1', 15_000], ['/r2', 8_000]]);
+});
+
+test('consumerWorktrees: under 500 ms left, no further worktree list is spawned and the result is unknown (stack kept)', () => {
+  let clock = 0;
+  const seen = [];
+  const listWorktrees = (repo, o) => { seen.push([repo, o?.timeoutMs]); clock += 19_700; return []; };
+  const r = consumerWorktrees(stackSa, { events: [], repos: ['/r1', '/r2'], listWorktrees, platform: 'darwin', deadlineAt: 20_000, now: () => clock });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /cannot list worktrees of \/r2: deadline/);
+  assert.deepEqual(seen, [['/r1', 15_000]], 'the second repo was never listed');
+  const late = [];
+  const none = consumerWorktrees(stackSa, { events: [], repos: ['/r1'], listWorktrees: (repo) => { late.push(repo); return []; }, platform: 'darwin', deadlineAt: 100, now: () => 100 });
+  assert.equal(none.ok, false);
+  assert.deepEqual(late, [], 'deadline already reached: nothing spawned');
+});
+
+test('consumerWorktrees: no deadline -> the 15 s cap is still passed (a worktree list is never unbounded); a timed-out list is unknown', () => {
+  const seen = [];
+  const r = consumerWorktrees(stackSa, { events: [], repos: ['/r1'], listWorktrees: (repo, o) => { seen.push(o?.timeoutMs); return []; }, platform: 'darwin' });
+  assert.equal(r.ok, true);
+  assert.deepEqual(seen, [15_000]);
+  const stalled = () => { throw new Error('git worktree list --porcelain failed (exit null): timed out'); };
+  const t = consumerWorktrees(stackSa, { events: [], repos: ['/r1'], listWorktrees: stalled, platform: 'darwin', deadlineAt: 50_000, now: () => 0 });
+  assert.equal(t.ok, false);
+  assert.match(t.reason, /cannot list worktrees of \/r1: .*timed out/);
+});
+
 // ---- prStates ----
 const SHA = 'c'.repeat(40);
 const OTHER = 'd'.repeat(40);

@@ -3,9 +3,9 @@
 // docs/specs/2026-10-13-worktree-prune-design.md. One `worktrees.mode` setting governs every mutation: `report` (the
 // default) and `off` change nothing, `--dry-run` never changes anything; keep-locks only protect, so they work in every
 // mode. The prune flow lives in lib/worktree-prune/run.mjs. Exit 0 completed (skips are normal), 2 usage / repo / config,
-// 3 GitHub unavailable. `schedule` adds, removes or reports one nightly cron line that runs `prune --summary-only` (Linux, cron) or one launchd LaunchAgent (macOS).
+// 3 GitHub unavailable. `sessions DIR` is the read-only check "is a Claude session open in DIR?" (below). `schedule` adds, removes or reports one nightly cron line that runs `prune --summary-only` (Linux, cron) or one launchd LaunchAgent (macOS).
 // `--notify` is an accepted no-op: schedules installed before notifications were removed still pass it.
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,23 +19,26 @@ import {
   systemCrontab, systemLaunchctl,
 } from '../lib/schedule.mjs';
 import { holdingRoot, listHolding, purgeHoldingLocked } from '../lib/worktree-prune/act.mjs';
+import { pathSpellings } from '../lib/worktree-prune/inspect.mjs';
+import { liveSessionsIn, scanLiveSessions } from '../lib/worktree-prune/live-sessions.mjs';
 import { KEEP_PREFIX, lockNameFor, modeAllows } from '../lib/worktree-prune/rules.mjs';
 import { loadRepo, prune, pruneLogDir, summaryOnly } from '../lib/worktree-prune/run.mjs';
 
 export const meta = {
-  summary: 'remove finished worktrees (prune), keep one with a lock (keep / unkeep), list or purge the holding folder',
+  summary: 'remove finished worktrees (prune), keep one with a lock (keep / unkeep), list or purge the holding folder, check for an open Claude session (sessions)',
   usage: [
     'pipeline worktrees prune [--repo DIR] [--dry-run] [--notify] [--summary-only]   (--notify: accepted, does nothing; old schedules pass it)   -> {ok, mode, removed:[...], wouldRemove:[...], kept:[...], hiddenProcesses, liveSessions?, restored:[...], outside:[...], holding:{batches, purged}, summary, log} | --summary-only: one line {ok, summary, errors?}',
     'pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}',
     'pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}',
     'pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}',
+    'pipeline worktrees sessions DIR   -> {ok, dir, available, open:[{id, pid}], unplaced:[...], reason?}   read-only, needs no repo, config or GitHub; exit 0 = the scan is complete and no session is open in DIR, 1 = a session is open there, 2 = usage, 3 = unsure (scan unavailable or partial, or a session folder that cannot be resolved): treat every non-zero as "keep"',
     'pipeline worktrees schedule (--install [--at HH:MM] | --remove | --status) [--repo DIR]   -> {ok, installed, line, timezone, warning?} | {ok, removed} | {ok, installed, line}   (macOS: a launchd LaunchAgent; adds plist, changed, loaded, note)',
   ].join('\n'),
 };
 
 export { KEEP_PREFIX };
 export { applyLaunchd, applySchedule, detectTimezone, findOnPath, scheduleLabel, scheduleLine, scheduleMarker, schedulePlist } from '../lib/schedule.mjs';
-const SUBS = 'prune [--dry-run] [--notify] [--summary-only] | keep NAME [--reason TEXT] | unkeep NAME [--run ID] | holding [--purge] | schedule (--install [--at HH:MM] | --remove | --status)';
+const SUBS = 'prune [--dry-run] [--notify] [--summary-only] | keep NAME [--reason TEXT] | unkeep NAME [--run ID] | holding [--purge] | sessions DIR | schedule (--install [--at HH:MM] | --remove | --status)';
 
 // NAME is a direct child of <root>/<worktree_dir>: no separators, no dot-names (the quarantine), no control characters.
 function findWorktree(repo, positionals, sub) {
@@ -107,6 +110,30 @@ async function holding(rest, ctx) {
   }
   output.batches = listHolding(dir);
   return { exitCode: EXIT.OK, output };
+}
+
+// Is a Claude Code session open in DIR right now? Read-only and self-contained (no repository, pipeline.yml or GitHub; `worktrees.mode`
+// does not apply). Strict where prune is tolerant, because the answer gates a removal done by hand: exit 0 ONLY for an available,
+// complete scan with no match; a hit is exit 1 (and wins over an unplaced session); an unavailable scan, any unplaced session and,
+// in strict matching, any session folder that cannot be resolved (even ENOENT: a deleted alias looks like a deleted target) is exit 3.
+// ctx.sessionsDeps = { home, starts, platform } are test seams of the scan.
+async function sessions(rest, ctx) {
+  const { positionals } = parseCommandArgs(rest, {});
+  if (positionals.length !== 1) throw new UsageError('worktrees sessions takes exactly one DIR');
+  const dir = path.resolve(ctx?.cwd ?? process.cwd(), positionals[0]);
+  let isDir = false;
+  try {
+    isDir = statSync(dir).isDirectory();
+  } catch { /* reported below */ }
+  if (!isDir) throw new UsageError(`not a directory: ${dir}`);
+  const deps = ctx?.sessionsDeps ?? {};
+  const scan = scanLiveSessions({ home: deps.home ?? os.homedir(), env: ctx?.env ?? process.env, ...(deps.platform ? { platform: deps.platform } : {}), ...(deps.starts ? { starts: deps.starts } : {}) });
+  const { hits, unplaced } = liveSessionsIn(scan, pathSpellings(dir), { strict: true });
+  const exitCode = hits.length ? EXIT.FAILED : !scan.available || unplaced.length ? EXIT.UNAVAILABLE : EXIT.OK;
+  return {
+    exitCode,
+    output: { ok: exitCode === EXIT.OK, dir, available: Boolean(scan.available), ...(scan.available ? {} : { reason: scan.reason }), open: hits, unplaced },
+  };
 }
 
 // ---- schedule: one cron line per repository, found again by the marker comment at its end (helpers: lib/schedule.mjs) ---
@@ -193,5 +220,6 @@ export const run = guarded(async (argv, ctx) => {
   if (sub === 'unkeep') return unkeep(rest, ctx);
   if (sub === 'holding') return holding(rest, ctx);
   if (sub === 'schedule') return schedule(rest, ctx);
+  if (sub === 'sessions') return sessions(rest, ctx);
   throw new UsageError(`usage: pipeline worktrees (${SUBS})`);
 });
