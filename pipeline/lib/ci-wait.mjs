@@ -9,10 +9,16 @@
 // required rows) is re-proved by `pipeline merge`'s live gate (finalgate.mjs ciCheck) and by GitHub branch protection before
 // any merge. ci-wait never reports success on evidence it knows to be incomplete: an unreadable policy source is `unverified`.
 //
-// RESIDUAL (documented, not closed): freshness is judged only for SKIPPED results. A draft-era SUCCESS of a name whose
-// ready-event run is not created yet (seconds after `gh pr ready`) counts as pass. The window is narrow: the skipped job of
-// the same workflow keeps the wait open until that workflow's ready run exists, and the live gate re-reads CI before any merge.
-// Requiring a ready-era run for every identity would hang on checks whose workflows do not trigger on `ready_for_review`.
+// Freshness is judged for SKIPPED and for FAILED / CANCELLED results. A skip or a failure that predates the ready event is
+// draft-era (`stale-skip` / `stale-fail`): the check keeps waiting for its ready-era result, up to --appear-timeout. A stale
+// failure never re-posted then stands as `failed` (marked "result predates ready"); a fresh failure ends the wait at once. This
+// matters on EW, where the `Cross-model review` status is a draft-era FAILURE until it is re-posted after `gh pr ready`.
+// Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
+// created_at. Freshness that cannot be read counts as fresh (fail fast).
+// RESIDUAL (documented, not closed): a draft-era SUCCESS is not second-guessed. A draft-era success of a name whose ready-event
+// run is not created yet (seconds after `gh pr ready`) counts as pass. The window is narrow: the skipped job of the same workflow
+// keeps the wait open until that workflow's ready run exists, and the live gate re-reads CI before any merge. Requiring a
+// ready-era run for every identity would hang on checks whose workflows do not trigger on `ready_for_review`.
 import { EXIT } from './cli.mjs';
 import { requiredFromRules } from './protection.mjs';
 
@@ -25,11 +31,11 @@ export const MAX_READ_FAILURES = 5;
 
 const GOOD = new Set(['success', 'neutral']);
 const BAD = new Set(['failure', 'timed_out', 'action_required', 'startup_failure', 'stale']);
-// fail > cancelled > pending > missing / stale-skip > fresh-skip > pass: the worst producer decides the identity.
-const RANK = { fail: 7, cancelled: 6, pending: 5, missing: 4, 'stale-skip': 4, 'fresh-skip': 2, pass: 1 };
+// fail > cancelled > pending > missing / stale-skip / stale-fail > fresh-skip > pass: the worst producer decides the identity.
+const RANK = { fail: 7, cancelled: 6, pending: 5, missing: 4, 'stale-skip': 4, 'stale-fail': 4, 'fresh-skip': 2, pass: 1 };
 const isGood = (s) => s === 'pass' || s === 'fresh-skip';
 const isBad = (s) => s === 'fail' || s === 'cancelled';
-const isWaiting = (s) => s === 'pending' || s === 'missing' || s === 'stale-skip';
+const isWaiting = (s) => s === 'pending' || s === 'missing' || s === 'stale-skip' || s === 'stale-fail';
 
 const keyOf = (i) => `${i.name}\u0000${i.appId ?? ''}`;
 const byIdDesc = (a, b) => Number(b.id) - Number(a.id);
@@ -97,32 +103,61 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return readyAtMemo;
   };
 
-  // A skipped check run is only "done" when its workflow run was created at or after the ready event; a draft-era skip is not.
-  const skipState = async (run, pr) => {
+  // created_at (ms) of the workflow runs of a check run's suite: [] for a non-Actions check run. Cached per suite; an unreadable
+  // lookup throws and is not cached, so the next poll asks again.
+  const suiteCreated = async (run) => {
     const suite = run.check_suite?.id;
-    if (suite === undefined || suite === null) return 'stale-skip';
+    if (suite === undefined || suite === null) return [];
     let workflowRuns = suiteCache.get(suite);
     if (workflowRuns === undefined) {
-      try {
-        workflowRuns = await readers.suiteRuns(suite);
-      } catch {
-        return 'stale-skip'; // unreadable: not proven fresh, and not cached, so the next poll asks again
-      }
+      workflowRuns = await readers.suiteRuns(suite);
       suiteCache.set(suite, workflowRuns);
     }
-    const created = workflowRuns.map((w) => Date.parse(w?.created_at)).filter(Number.isFinite);
+    return workflowRuns.map((w) => Date.parse(w?.created_at)).filter(Number.isFinite);
+  };
+
+  // A skipped check run is only "done" when its workflow run was created at or after the ready event; a draft-era skip is not.
+  const skipState = async (run, pr) => {
+    let created;
+    try {
+      created = await suiteCreated(run);
+    } catch {
+      return 'stale-skip'; // unreadable: not proven fresh
+    }
     if (created.length === 0) return 'stale-skip'; // a non-Actions skipped check run has no workflow run
     const readyAt = Date.parse(await getReadyAt(pr));
     return Math.max(...created) >= readyAt ? 'fresh-skip' : 'stale-skip';
   };
 
+  // Does a failed / cancelled check run predate the ready event? By its workflow run, else by its own timestamps. Anything
+  // unreadable or unknown counts as fresh: a failure is reported rather than waited on.
+  const runPredatesReady = async (run, pr) => {
+    try {
+      const readyAt = Date.parse(await getReadyAt(pr));
+      const created = await suiteCreated(run);
+      if (created.length > 0) return Math.max(...created) < readyAt;
+      const at = Date.parse(run.completed_at ?? run.started_at);
+      return Number.isFinite(at) && at < readyAt;
+    } catch {
+      return false;
+    }
+  };
+  const statusPredatesReady = async (status, pr) => {
+    try {
+      const at = Date.parse(status.created_at);
+      return Number.isFinite(at) && at < Date.parse(await getReadyAt(pr));
+    } catch {
+      return false;
+    }
+  };
+
   const runState = async (run, pr) => {
     if (run.status !== 'completed') return 'pending';
     if (GOOD.has(run.conclusion)) return 'pass';
-    if (BAD.has(run.conclusion)) return 'fail';
-    if (run.conclusion === 'cancelled') return 'cancelled';
     if (run.conclusion === 'skipped') return skipState(run, pr);
-    return 'fail'; // completed with a conclusion we do not know: never a pass
+    // failure, timed_out, ... or a conclusion we do not know (never a pass); a draft-era one is stale and keeps waiting
+    const bad = run.conclusion === 'cancelled' ? 'cancelled' : 'fail';
+    return (await runPredatesReady(run, pr)) ? 'stale-fail' : bad;
   };
 
   const evaluate = async (identity, obs, pr) => {
@@ -134,7 +169,11 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if (status) {
       const bot = identity.appId === null ? undefined : KNOWN_APP_BOTS[identity.appId];
       const counts = identity.appId === null || (bot !== undefined && status.creator?.login === bot);
-      if (counts) producers.push({ state: statusState(status), url: status.target_url ?? null });
+      if (counts) {
+        let state = statusState(status);
+        if (state === 'fail' && (await statusPredatesReady(status, pr))) state = 'stale-fail';
+        producers.push({ state, url: status.target_url ?? null });
+      }
     }
     if (producers.length === 0) return { name: identity.name, appId: identity.appId, state: 'missing', url: null };
     const worst = producers.reduce((a, b) => (RANK[b.state] > RANK[a.state] ? b : a));
@@ -223,12 +262,21 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     }
 
     if (waiting.length > 0) {
-      const absent = waiting.filter((s) => s.state === 'missing' || s.state === 'stale-skip');
+      const absent = waiting.filter((s) => s.state === 'missing' || s.state === 'stale-skip' || s.state === 'stale-fail');
       if (absent.length > 0 && elapsed() >= appearTimeoutMs) {
         const missing = absent.filter((s) => s.state === 'missing');
         const stale = absent.filter((s) => s.state === 'stale-skip');
+        const staleFails = absent.filter((s) => s.state === 'stale-fail');
+        const skipNote = stale.length ? `only a draft-era skip for: ${stale.map((s) => s.name).join(', ')}` : '';
         if (missing.length > 0) {
-          return result(EXIT.FAILED, 'missing', { message: `no result appeared for: ${missing.map((s) => s.name).join(', ')}${stale.length ? `; only a draft-era skip for: ${stale.map((s) => s.name).join(', ')}` : ''}` });
+          const failNote = staleFails.length ? `a draft-era failure stands for: ${staleFails.map((s) => s.name).join(', ')}` : '';
+          const notes = [skipNote, failNote].filter(Boolean);
+          return result(EXIT.FAILED, 'missing', { message: `no result appeared for: ${missing.map((s) => s.name).join(', ')}${notes.length ? `; ${notes.join('; ')}` : ''}` });
+        }
+        if (staleFails.length > 0) {
+          // The failure was never replaced by a ready-era result, so it stands (a draft-era skip, if any, is listed with it).
+          const listed = staleFails.map((s) => `${s.name}=fail${s.url ? ` (${s.url})` : ''} (result predates ready)`).join('; ');
+          return result(EXIT.FAILED, 'failed', { message: `failed: ${listed}${skipNote ? `; ${skipNote}` : ''}`, failures: staleFails });
         }
         return result(EXIT.FAILED, 'stale-skipped', { message: `only a draft-era skipped result exists for: ${stale.map((s) => s.name).join(', ')}: their workflow did not run on the ready event: re-run it or ask the owner` });
       }

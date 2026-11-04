@@ -31,7 +31,7 @@ function sim(world, options = {}) {
     timeline: async () => at(world.timeline ?? [], t / 1000),
     suiteRuns: async (id) => {
       calls.push(id);
-      return at(world.suiteRuns ?? (() => []), t / 1000)(id);
+      return at(world.suiteRuns ?? (() => () => []), t / 1000)(id);
     },
   };
   const clock = { now: () => t, sleep: async (ms) => { t += ms; } };
@@ -56,12 +56,10 @@ const st = (context, state, login = 'github-actions[bot]', over = {}) => ({ id: 
 
 // ---- the Phase 6 race, on the captured PR 1631 shapes -------------------------------------------
 
-// EW main's protection minus `Cross-model review`: on the real PR 1631 that status was a draft-era FAILURE until the ready run
-// re-posted it, a separate matter (a failure is reported at once); this test is about the skipped required check.
+// EW main's real protection. On the real PR 1631 the `Cross-model review` status was a draft-era FAILURE (08:38:49) until the
+// ready run re-posted it as a success (08:42:55): that failure must not end the wait either.
 function raceClassic() {
-  const p = fx('protection-main.json');
-  const checks = p.required_status_checks.checks.filter((c) => c.context !== 'Cross-model review');
-  return readClassicRequired({ protection: () => ({ status: 200, json: { required_status_checks: { checks } } }) }, 'main');
+  return readClassicRequired({ protection: () => ({ status: 200, json: fx('protection-main.json') }) }, 'main');
 }
 
 test('the Phase 6 race: a draft-era SKIPPED Typecheck + Vitest keeps the wait open until the ready run passes', async () => {
@@ -92,10 +90,91 @@ test('the Phase 6 race: a draft-era SKIPPED Typecheck + Vitest keeps the wait op
   assert.equal(r.output.readyAt, '2026-11-04T08:42:27Z');
   assert.deepEqual(r.output.requiredSource, { classic: 'present', rules: 'absent' });
   const states = Object.fromEntries(r.output.checks.map((c) => [c.name, c.state]));
-  assert.deepEqual(states, { 'Typecheck + Vitest': 'pass', 'Static guards': 'pass', Vercel: 'pass', 'Test integrity': 'pass', 'Hard-stop scan': 'pass' });
+  assert.deepEqual(states, { 'Typecheck + Vitest': 'pass', 'Static guards': 'pass', Vercel: 'pass', 'Test integrity': 'pass', 'Hard-stop scan': 'pass', 'Cross-model review': 'pass' });
+  assert.ok(s.progress.some((l) => /Cross-model review=stale-fail/.test(l)), 'the draft-era failure was waited on, not reported');
   assert.ok(s.progress.some((l) => /Typecheck \+ Vitest=stale-skip/.test(l)), s.progress.join(' | '));
   // the draft-era skip was judged by its workflow run, once (cached per suite)
   assert.deepEqual(s.suiteCalls, [113268557037]);
+});
+
+// ---- draft-era failures are waited on like draft-era skips ---------------------------------------
+
+const READY = '2026-01-01T12:00:00Z';
+const readyTimeline = [{ event: 'ready_for_review', created_at: READY }];
+
+test('a draft-era failure never re-posted stands as `failed` at the appear deadline, marked "result predates ready"', async () => {
+  // status variant: created before the ready event
+  const status = sim({ classic: present(pin('Cross-model review', ACTIONS)), timeline: readyTimeline, statuses: [st('Cross-model review', 'failure', 'github-actions[bot]', { created_at: '2026-01-01T11:00:00Z' })] });
+  const a = await status.run();
+  assert.equal(a.exitCode, 1);
+  assert.equal(a.output.verdict, 'failed');
+  assert.equal(status.elapsed(), 300_000);
+  assert.match(a.output.message, /Cross-model review=fail .*\(result predates ready\)/);
+  assert.equal(a.output.checks[0].state, 'stale-fail');
+  assert.deepEqual(a.output.failures.map((f) => f.name), ['Cross-model review']);
+  // check-run variant: its workflow run was created before the ready event
+  const run = sim({ classic: present('ci'), timeline: readyTimeline, checkRuns: [cr('ci', 'failure', { check_suite: { id: 4 } })], suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z' }] });
+  const b = await run.run();
+  assert.equal(b.output.verdict, 'failed');
+  assert.equal(run.elapsed(), 300_000);
+  assert.match(b.output.message, /predates ready/);
+  // a non-Actions check run (no workflow run) is judged by its own timestamps
+  const bare = sim({ classic: present('ci'), timeline: readyTimeline, checkRuns: [cr('ci', 'cancelled', { completed_at: '2026-01-01T11:30:00Z' })] });
+  const c = await bare.run();
+  assert.equal(c.output.verdict, 'failed');
+  assert.equal(bare.elapsed(), 300_000);
+});
+
+test('a draft-era failure that is re-posted after ready ends the wait on the new result (status and check run)', async () => {
+  const status = sim({
+    classic: present(pin('Cross-model review', ACTIONS)), timeline: readyTimeline,
+    statuses: (t) => [st('Cross-model review', 'failure', 'github-actions[bot]', { id: 1, created_at: '2026-01-01T11:00:00Z' }), ...(t >= 30 ? [st('Cross-model review', 'success', 'github-actions[bot]', { id: 2, created_at: '2026-01-01T12:00:30Z' })] : [])],
+  });
+  assert.equal((await status.run()).exitCode, 0);
+  assert.equal(status.elapsed(), 30_000);
+  const run = sim({
+    classic: present('ci'), timeline: readyTimeline,
+    checkRuns: (t) => [cr('ci', 'failure', { id: 1, check_suite: { id: 4 } }), ...(t >= 30 ? [cr('ci', 'success', { id: 2, check_suite: { id: 5 } })] : [])],
+    suiteRuns: () => (id) => [{ created_at: id === 4 ? '2026-01-01T11:00:00Z' : '2026-01-01T12:00:10Z' }],
+  });
+  assert.equal((await run.run()).exitCode, 0);
+  assert.equal(run.elapsed(), 30_000);
+  // a fresh failure re-posted over the stale one is then reported at once
+  const again = sim({
+    classic: present(pin('Cross-model review', ACTIONS)), timeline: readyTimeline,
+    statuses: (t) => [st('Cross-model review', 'failure', 'github-actions[bot]', { id: 1, created_at: '2026-01-01T11:00:00Z' }), ...(t >= 30 ? [st('Cross-model review', 'failure', 'github-actions[bot]', { id: 2, created_at: '2026-01-01T12:00:30Z' })] : [])],
+  });
+  const r = await again.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(again.elapsed(), 30_000);
+  assert.doesNotMatch(r.output.message, /predates ready/);
+});
+
+test('a FRESH failure (after the ready event) still ends the wait at once; unreadable freshness counts as fresh', async () => {
+  const status = sim({ classic: present('lint'), timeline: readyTimeline, statuses: [st('lint', 'failure', 'x', { created_at: '2026-01-01T12:00:05Z' })] });
+  assert.equal((await status.run()).output.verdict, 'failed');
+  assert.equal(status.elapsed(), 0);
+  const run = sim({ classic: present('ci'), timeline: readyTimeline, checkRuns: [cr('ci', 'failure', { check_suite: { id: 4 } })], suiteRuns: () => () => [{ created_at: '2026-01-01T12:00:05Z' }] });
+  assert.equal((await run.run()).output.verdict, 'failed');
+  assert.equal(run.elapsed(), 0);
+  const unreadable = sim({ classic: present('ci'), timeline: readyTimeline, checkRuns: [cr('ci', 'failure', { check_suite: { id: 4 } })], suiteRuns: () => () => { throw new Error('HTTP 502'); } });
+  assert.equal((await unreadable.run()).output.verdict, 'failed');
+  assert.equal(unreadable.elapsed(), 0, 'could not tell: fail fast');
+  const noTimeline = sim({ classic: present('lint'), timeline: () => { throw new Error('HTTP 502'); }, statuses: [st('lint', 'failure', 'x', { created_at: '2000-01-01T00:00:00Z' })] });
+  const n = await noTimeline.run();
+  assert.equal(n.output.verdict, 'failed');
+  assert.equal(noTimeline.elapsed(), 0);
+});
+
+test('--wait-all keeps waiting on a stale failure; a stale failure beside a missing check reports the missing one first', async () => {
+  const world = { classic: present('Test integrity', 'other'), timeline: readyTimeline, statuses: [st('Test integrity', 'failure', 'x', { created_at: '2026-01-01T11:00:00Z' })], checkRuns: [cr('other', 'success')] };
+  const s = sim(world, { waitAll: true });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(s.elapsed(), 300_000);
+  const m = await sim({ ...world, checkRuns: [] }).run();
+  assert.equal(m.output.verdict, 'missing');
+  assert.match(m.output.message, /a draft-era failure stands for: Test integrity/);
 });
 
 test('a skipped check whose workflow run only started before the ready event stays stale-skipped at the appear deadline', async () => {
