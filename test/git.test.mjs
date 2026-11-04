@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { symlinkSync, rmSync, cpSync, writeFileSync, mkdtempSync, chmodSync } from 'node:fs';
+import { symlinkSync, rmSync, cpSync, writeFileSync, mkdtempSync, chmodSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import {
@@ -367,6 +368,27 @@ test('commitTime returns epoch ms close to now for a fresh commit', () => {
   assert.equal(commitTime('v1', o), t); // peels annotated tags to the commit
 });
 
+test('commitTime ignores log.showSignature=true in the user\'s git config (a signed commit still parses)', (t) => {
+  const { repo, o } = baseRepo();
+  const scratch = mkdtempSync(join(tmpdir(), 'cp-sign-'));
+  t.after(() => rmSync(scratch, { recursive: true, force: true }));
+  const key = join(scratch, 'sign-key');
+  const gen = spawnSync('ssh-keygen', ['-t', 'ed25519', '-N', '', '-q', '-f', key], { encoding: 'utf8' });
+  if (gen.error || gen.status !== 0) { t.skip('ssh-keygen is unavailable, so a signed commit cannot be made without gpg'); return; }
+  writeFileSync(join(scratch, 'allowed-signers'), `fixer@example.test ${readFileSync(`${key}.pub`, 'utf8').trim()}\n`);
+  repo.git(['config', 'log.showSignature', 'true']);
+  repo.git(['config', 'gpg.format', 'ssh']);
+  repo.git(['config', 'user.signingkey', `${key}.pub`]);
+  repo.git(['config', 'gpg.ssh.allowedSignersFile', join(scratch, 'allowed-signers')]);
+  repo.write('signed.txt', 'signed\n');
+  repo.git(['add', 'signed.txt']);
+  repo.git(['commit', '-q', '-S', '-m', 'signed']);
+  const sha = repo.git(['rev-parse', 'HEAD']).trim();
+  assert.match(repo.git(['show', '-s', '--format=%ct', sha]), /signature/i, 'git prints signature text under log.showSignature');
+  const expected = Number(repo.git(['show', '-s', '--no-show-signature', '--format=%ct', sha]).trim()) * 1000;
+  assert.equal(commitTime(sha, o), expected);
+});
+
 test('currentBranch: branch name, and "HEAD" when detached', () => {
   const { repo, o } = baseRepo();
   assert.equal(currentBranch(o), 'main');
@@ -443,7 +465,8 @@ test('git() forces its config and environment through an injected runner, and re
   assert.deepEqual(calls[0].args, [
     '-c', 'core.quotePath=true', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicPrefix=false',
     '-c', 'diff.renames=true', '-c', 'color.ui=false',
-    '-c', 'diff.interHunkContext=0', '-c', 'diff.algorithm=myers', '-c', 'diff.indentHeuristic=true', 'status', '--short',
+    '-c', 'diff.interHunkContext=0', '-c', 'diff.algorithm=myers', '-c', 'diff.indentHeuristic=true',
+    '-c', 'log.showSignature=false', 'status', '--short',
   ]);
   assert.equal(calls[0].opts.cwd, '/somewhere');
   assert.equal(calls[0].opts.input, 'piped');

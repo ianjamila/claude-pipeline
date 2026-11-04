@@ -210,6 +210,52 @@ function baseAfterConflictMerge({ root, config, toHead, forkPoint }) {
 
 // ---- small updates --------------------------------------------------------------------------
 
+// The records of `git diff --raw -z` / `git log --raw -z --format=`: `:<mode> <mode> <id> <id> <status>\0<path>\0`, repeated. Anything
+// that is not exactly that throws (the caller turns it into base-unresolved). Ids are 40 hex (SHA-1) or 64 hex (SHA-256); with
+// --no-renames the status is one of A, D, M, T. An empty field is accepted only where a record starts (git versions differ in
+// whether they put a NUL between the commits of a log). -> [{ path, id: the blob the path has after the change; all zeros = deleted }]
+const RAW_META = /^:[0-7]{6} [0-7]{6} (?:[0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) [ADMT]$/;
+function parseRawZ(out) {
+  const fields = out.split('\0');
+  const records = [];
+  for (let i = 0; i < fields.length;) {
+    if (fields[i] === '') { i += 1; continue; }
+    const m = RAW_META.exec(fields[i]);
+    const file = fields[i + 1];
+    if (!m || file === undefined || file === '') throw new Error(`unexpected git output: ${JSON.stringify(fields[i].slice(0, 80))}`);
+    records.push({ path: file, id: m[1] });
+    i += 2;
+  }
+  return records;
+}
+
+// Which of the net changes `changes` ([{ path, id }]) did an ordinary commit of the PR write? A path is kept only when its content at
+// HEAD is EXACTLY a version that a non-merge commit since `toHead` left in that path (a deletion leaves the all-zero id). So:
+// - what is typed into a merge commit (clean, conflict-resolving, octopus, a merge of another branch) never counts: the merge's tree
+//   is not a blob any ordinary commit wrote; likewise a change that a later merge altered or discarded, or a file a later merge
+//   also changed (main edited it too). Authorship, not "was touched", is the test: a revert followed by a hand edit in a merge
+//   touches the file in the log but leaves a blob nobody wrote.
+// - `^<default branch>` drops the default branch's own commits (they are not the PR's work); commits that came in by merging another
+//   branch stay: they are the PR's.
+// This proves "an ordinary PR commit wrote this code", not "the fix is real": a merge that re-chooses an earlier PR commit's content
+// counts (C1 sets P=X, C2 sets P=Y, a merge puts P=X back), and a cherry-pick or a copy is an ordinary commit. Both are reviewable.
+// Throws on a git error or output it cannot parse. -> the subset of `changes`
+function ownAuthored({ root, config, toHead, changes }) {
+  const o = { cwd: root };
+  // --no-show-signature: a user's log.showSignature=true prints the gpg/ssh verdict before the records even with --format=
+  const log = git(['log', '--no-merges', '--no-show-signature', '--no-renames', '--raw', '--no-abbrev', '-z', '--format=', `${revParse(toHead, o)}..HEAD`, `^${reviewBaseRef(root, config)}`], o);
+  const wrote = new Map(); // path -> Set of the blob ids ordinary commits left there
+  for (const { path: file, id } of parseRawZ(log)) {
+    if (!wrote.has(file)) wrote.set(file, new Set());
+    wrote.get(file).add(id);
+  }
+  return changes.filter((c) => wrote.get(c.path)?.has(c.id));
+}
+
+// The refusal's clause for the paths ownAuthored dropped ('' when none).
+const notWritten = (paths) => (paths.length === 0 ? ''
+  : ` (their current content was not written by an ordinary commit of this PR — it came from a merge or from the default branch: ${paths.slice(0, 3).join(', ')}; commit any further change to those files after the merge, or fix another file)`);
+
 async function markImplemented(rest, ctx) {
   const { values } = parseCommandArgs(rest, { ids: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const ids = [...new Set(requireOption(values, 'ids').split(',').map((s) => s.trim()).filter(Boolean))];
@@ -240,11 +286,15 @@ async function markImplemented(rest, ctx) {
       // change). This gate fails closed: if that range cannot be worked out exactly (git failed, or a conflicting merge
       // whose resolution is not recorded as a merge commit), the mark is refused rather than counting files the fix did not touch.
       let changed;
+      let dropped = []; // changed since the base, but the current content was written by a merge or by the default branch
+      let netEmpty = false;
+      let wholePr = false;
       try {
         const forkPoint = mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root });
         const since = effectiveReviewBase({ from: round.toHead, forkPoint }, { cwd: root });
         let base = since.base;
         if (since.kind === 'whole-pr') {
+          wholePr = true;
           // The trial merge conflicted (or is unsupported), and it will never change: both of its inputs are fixed. The PR's
           // own work since then is measured from the merge commit that resolved the conflict.
           base = baseAfterConflictMerge({ root, config, toHead: round.toHead, forkPoint });
@@ -254,7 +304,12 @@ async function markImplemented(rest, ctx) {
         } else if (since.kind !== 'previous' && since.kind !== 'synthetic') {
           throw new Error(`unexpected review base kind ${since.kind}`);
         }
-        changed = git(['diff', '--name-only', '--no-renames', `${base}..HEAD`], { cwd: root }).split('\n').filter(Boolean);
+        const net = parseRawZ(git(['diff', '--raw', '--no-renames', '--no-abbrev', '-z', `${base}..HEAD`], { cwd: root }));
+        netEmpty = net.length === 0;
+        // The authorship filter covers every changed path, test files too, so a test hand-edited inside a merge cannot satisfy testFix.
+        const authored = new Set(ownAuthored({ root, config, toHead: round.toHead, changes: net }).map((c) => c.path));
+        changed = net.filter((c) => authored.has(c.path)).map((c) => c.path);
+        dropped = net.filter((c) => !authored.has(c.path) && c.path !== config.agent_log).map((c) => c.path);
       } catch (err) {
         throw new Fail(EXIT.USAGE, {
           ok: false, error: 'base-unresolved',
@@ -270,7 +325,7 @@ async function markImplemented(rest, ctx) {
       if (code.length === 0 && !testFix) {
         throw new Fail(EXIT.USAGE, {
           ok: false, error: 'no-code-change',
-          message: `${item.id} cannot be marked implemented: since round ${round.n} only test files changed (${changed.join(', ') || 'nothing'}); commit the fix itself (a test-only fix counts only for a testing finding or one about that test file)`,
+          message: `${item.id} cannot be marked implemented: since round ${round.n} only test files changed (${changed.join(', ') || 'nothing'}); commit the fix itself (a test-only fix counts only for a testing finding or one about that test file)${notWritten(dropped)}${wholePr && netEmpty ? '; a fix committed before the conflict-resolving merge must be committed again after it' : ''}`,
         });
       }
     }

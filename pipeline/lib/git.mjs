@@ -28,11 +28,13 @@ export class GitError extends Error {
 }
 
 // interHunkContext/algorithm/indentHeuristic decide where git cuts hunks and which of several equal diffs it prints, so
-// leaving them to user config would let the same change hash differently on two machines.
+// leaving them to user config would let the same change hash differently on two machines. log.showSignature=false keeps
+// a signature verdict out of `git log` / `git show` output we parse.
 const FORCED_CONFIG = [
   '-c', 'core.quotePath=true', '-c', 'diff.noprefix=false', '-c', 'diff.mnemonicPrefix=false',
   '-c', 'diff.renames=true', '-c', 'color.ui=false',
   '-c', 'diff.interHunkContext=0', '-c', 'diff.algorithm=myers', '-c', 'diff.indentHeuristic=true',
+  '-c', 'log.showSignature=false',
 ];
 // core.autocrlf is deliberately NOT forced for status / working-tree reads / `diff HEAD`: with Git for Windows' default
 // (autocrlf=true) a CRLF working file is the same content as its LF blob, and forcing false would make isClean() false
@@ -319,6 +321,7 @@ function resolutionChecks({ from, forkPoint, head, baseRef }, o) {
       // proc.run decodes UTF-8: invalid bytes would compare equal after the decode, so they are not byte-exact.
       if (text.includes('\uFFFD')) throw fail('non-utf8', `${c.path} (${name}) is not valid UTF-8`);
     }
+    // The labels are what makes the parser's fast path legal; without them it falls back to the exact parser (#1598).
     const parsed = parseConflictBlocks(splitLines(marker), splitLines(s2), splitLines(s3), tick, { ours: fromSha, theirs: forkSha });
     if (parsed.reason === 'too-many-blocks') throw fail('too-many-blocks', `${c.path} has more than ${MAX_BLOCKS} conflict blocks`);
     if (parsed.reason) throw fail(parsed.reason === 'ambiguous' ? 'parse-ambiguous' : 'parse', c.path);
@@ -599,7 +602,7 @@ export function grepAtRef(ref, fixedString, o) {
 
 // Committer time in epoch ms. `^{commit}` peels annotated tags, which `git show` would otherwise print as a tag first.
 export function commitTime(sha, o) {
-  const out = git(['show', '-s', '--format=%ct', `${assertRef(sha, ['show', sha])}^{commit}`], o).trim();
+  const out = git(['show', '-s', '--no-show-signature', '--format=%ct', `${assertRef(sha, ['show', sha])}^{commit}`], o).trim();
   const seconds = Number(out);
   if (!/^\d+$/.test(out)) throw new GitError({ args: ['show', '-s', '--format=%ct', sha], code: 0, stderr: `unexpected commit time: ${out}` });
   return seconds * 1000;

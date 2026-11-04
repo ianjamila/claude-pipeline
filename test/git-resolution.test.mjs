@@ -12,6 +12,9 @@ import { splitLines, interleave, parseConflictBlocks, checkSelection, makeBudget
 import { run } from '../pipeline/lib/proc.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 
+// labels matching the 'a' / 'b' markers most parseConflictBlocks fixtures use (the fast path needs labels, #1598)
+const AB = { ours: 'a', theirs: 'b' };
+
 const T = (...lines) => lines.map((l) => `${l}\n`).join('');
 
 // main holds `base`; feat is branched from it and holds `ours` (the last reviewed head, `from`); main then gets `theirs`.
@@ -457,7 +460,9 @@ test('parseConflictBlocks fast path (R2-B1): a side ending the blob without a ne
   const M = l('o', 'a', 'b', 'c', 'd', '<<<<<<< x', 'o', '=======', 't', '>>>>>>> y');
   const S2 = [...l('o', 'a', 'b', 'c', 'd'), 'o'];
   const S3 = l('o', 'a', 'b', 'c', 'd', 't');
-  const p = parseConflictBlocks(M, S2, S3);
+  // (labels { x, y } match the markers; run()'s ambiguous-eof rule hands this file to the exact parser, so what is proved here is
+  // the exact parser's newline handling)
+  const p = parseConflictBlocks(M, S2, S3, makeBudget(), { ours: 'x', theirs: 'y' });
   assert.deepEqual(p.blocks, [{ ours: ['o'], theirs: l('t') }]);
   // picking ours unchanged is a selection; adding a newline to it is not
   assert.equal(checkSelection(p, S2).ok, true);
@@ -475,8 +480,29 @@ test('parseConflictBlocks fast path with labels: only markers carrying the trial
   // another label (or one that only starts with the id) is content-shaped, not this merge's marker: the fast path is skipped
   assert.deepEqual(parseConflictBlocks(M('<<<<<<< aaax', '>>>>>>> bbb'), S2, S3, makeBudget(), labels), { reason: 'no-parse' });
   assert.deepEqual(parseConflictBlocks(M('<<<<<<< aaa', '>>>>>>> other'), S2, S3, makeBudget(), labels), { reason: 'no-parse' });
-  // without labels (direct callers) any label is accepted, as before
-  assert.equal(parseConflictBlocks(M('<<<<<<< x', '>>>>>>> y'), S2, S3).blocks.length, 1);
+  // without labels the fast path is skipped: M holds the clean hunk m1, which the exact parser cannot place
+  assert.deepEqual(parseConflictBlocks(M('<<<<<<< x', '>>>>>>> y'), S2, S3), { reason: 'no-parse' });
+});
+
+test('parseConflictBlocks fast path refuses without labels (#1598): a marker-shaped trio already in a reviewed file is content, not a block', () => {
+  const l = (...x) => x.map((s) => `${s}\n`);
+  // The trio is plain content of a reviewed file (S2 = S3 = M), so nothing about it can carry the two commit ids of a merge.
+  const M = l('top', '<<<<<<< x', 'o1', '=======', 't1', '>>>>>>> y', 'bottom');
+  const content = { outsides: [M], blocks: [] };
+  assert.deepEqual(parseConflictBlocks(M, M, M), content);
+  assert.deepEqual(parseConflictBlocks(M, M, M, makeBudget(), null), content);
+  assert.deepEqual(parseConflictBlocks(M, M, M, makeBudget(), {}), content);
+  assert.deepEqual(parseConflictBlocks(M, M, M, makeBudget(), { ours: '', theirs: '' }), content);
+  assert.deepEqual(parseConflictBlocks(M, M, M, makeBudget(), { ours: 'q', theirs: 'q' }), content);
+  // the labels the trial merge wrote are what licence the split
+  assert.equal(parseConflictBlocks(M, l('top', 'o1', 'bottom'), l('top', 't1', 'bottom'), makeBudget(), { ours: 'x', theirs: 'y' }).blocks.length, 1);
+
+  // clean hunks in the file: no labels is the exact parser's no-parse; with labels the fast path parses
+  const CM = l('top', 'm1', '<<<<<<< a', 'o1', '=======', 't1', '>>>>>>> b', 'bottom');
+  const S2 = l('top', 'o1', 'bottom');
+  const S3 = l('top', 't1', 'bottom');
+  assert.deepEqual(parseConflictBlocks(CM, S2, S3), { reason: 'no-parse' });
+  assert.equal(parseConflictBlocks(CM, S2, S3, makeBudget(), { ours: 'a', theirs: 'b' }).blocks.length, 1);
 });
 
 // Two conflicts separated only by lines with no letter or digit in them (blank lines, closing braces; four or more of them, or git
@@ -570,7 +596,7 @@ test('resolutionReviewBase: random conflicts over repeated lines are eligible wh
     for (const side of ['ours', 'theirs']) {
       const head = heads[`refs/heads/head-${k.i}-${side}`];
       const resolved = replaceBlocks(k.marker, side);
-      const parsed = parseConflictBlocks(splitLines(k.marker), splitLines(k.s2), splitLines(k.s3));
+      const parsed = parseConflictBlocks(splitLines(k.marker), splitLines(k.s2), splitLines(k.s3), makeBudget(), { ours: k.from, theirs: k.tip });
       assert.ok(!parsed.reason && parsed.blocks.length > 0, `case ${k.i}: ${JSON.stringify(parsed.reason)}\n${k.marker}`);
       const sel = checkSelection(parsed, splitLines(resolved));
       assert.ok(sel.ok, `case ${k.i} (${side}): ${JSON.stringify(sel)}\n${k.marker}`);
@@ -729,8 +755,8 @@ test('parseConflictBlocks: 5000 blocks is "too-many-blocks" at once (no recursio
     }
     return [marker, s2, s3];
   };
-  assert.deepEqual(parseConflictBlocks(...build(5000)), { reason: 'too-many-blocks' });
-  assert.equal(parseConflictBlocks(...build(MAX_BLOCKS)).blocks.length, MAX_BLOCKS);
+  assert.deepEqual(parseConflictBlocks(...build(5000), makeBudget(), AB), { reason: 'too-many-blocks' });
+  assert.equal(parseConflictBlocks(...build(MAX_BLOCKS), makeBudget(), AB).blocks.length, MAX_BLOCKS);
 });
 
 test('parseConflictBlocks fast path: clean hunks outside the blocks parse against the raw stage blobs; sides must be in-order runs of their blob', () => {
@@ -739,28 +765,28 @@ test('parseConflictBlocks fast path: clean hunks outside the blocks parse agains
   const M = l('top', 'm1', '<<<<<<< a', 'o1', 'o2', '=======', 't1', '>>>>>>> b', 'mid', '<<<<<<< a', 'o3', '=======', '>>>>>>> b', 'p1', 'bottom');
   const S2 = l('top', 'o0', 'o1', 'o2', 'mid', 'o3', 'bottom');
   const S3 = l('top', 'm0', 't1', 'mid', 'bottom');
-  const p = parseConflictBlocks(M, S2, S3);
+  const p = parseConflictBlocks(M, S2, S3, makeBudget(), AB);
   assert.deepEqual(p.blocks, [{ ours: l('o1', 'o2'), theirs: l('t1') }, { ours: l('o3'), theirs: [] }]);
   assert.deepEqual(p.outsides, [l('top', 'm1'), l('mid'), l('p1', 'bottom')]);
   // a side line that is not in its blob (or only out of order) is not a fast-path parse: it falls back to the exact parser, which fails here
-  assert.deepEqual(parseConflictBlocks(M, l('top', 'o0', 'o1', 'mid', 'o3', 'bottom'), S3), { reason: 'no-parse' });
-  assert.deepEqual(parseConflictBlocks(M, l('top', 'o3', 'o1', 'o2', 'mid', 'bottom'), S3), { reason: 'no-parse' });
+  assert.deepEqual(parseConflictBlocks(M, l('top', 'o0', 'o1', 'mid', 'o3', 'bottom'), S3, makeBudget(), AB), { reason: 'no-parse' });
+  assert.deepEqual(parseConflictBlocks(M, l('top', 'o3', 'o1', 'o2', 'mid', 'bottom'), S3, makeBudget(), AB), { reason: 'no-parse' });
   // any other marker-shaped line anywhere skips the fast path
   const extra = l('top', 'm1', '<<<<<<< a', 'o1', '=======', '=======', 't1', '>>>>>>> b', 'bottom');
-  assert.deepEqual(parseConflictBlocks(extra, l('top', 'o1', '=======', 'bottom'), l('top', 't1', 'bottom')), { reason: 'no-parse' });
-  assert.deepEqual(parseConflictBlocks(l('<<<<<<< a', 'o', '||||||| base', 'x', '=======', 't', '>>>>>>> b'), l('o'), l('t')), { reason: 'no-parse' });
+  assert.deepEqual(parseConflictBlocks(extra, l('top', 'o1', '=======', 'bottom'), l('top', 't1', 'bottom'), makeBudget(), AB), { reason: 'no-parse' });
+  assert.deepEqual(parseConflictBlocks(l('<<<<<<< a', 'o', '||||||| base', 'x', '=======', 't', '>>>>>>> b'), l('o'), l('t'), makeBudget(), AB), { reason: 'no-parse' });
   // git's added newline: a side blob without a final newline; the block's own line is the blob's bytes
-  const e = parseConflictBlocks(l('top', '<<<<<<< a', 'o', '=======', 't', '>>>>>>> b', 'm9'), [...l('top', 'x'), 'o'], l('top', 't', 'z'));
+  const e = parseConflictBlocks(l('top', '<<<<<<< a', 'o', '=======', 't', '>>>>>>> b', 'm9'), [...l('top', 'x'), 'o'], l('top', 't', 'z'), makeBudget(), AB);
   assert.deepEqual(e.blocks, [{ ours: ['o'], theirs: l('t') }]);
 });
 
 test('parseConflictBlocks: no markers is zero blocks (a conflicted file without a block is ineligible upstream); a stage mismatch is no parse', () => {
   const l = (...x) => x.map((s) => `${s}\n`);
   const same = l('a', 'b');
-  assert.deepEqual(parseConflictBlocks(same, same, same).blocks, []);
-  assert.deepEqual(parseConflictBlocks(l('a', 'q'), same, same), { reason: 'no-parse' });
+  assert.deepEqual(parseConflictBlocks(same, same, same, makeBudget(), AB).blocks, []);
+  assert.deepEqual(parseConflictBlocks(l('a', 'q'), same, same, makeBudget(), AB), { reason: 'no-parse' });
   const marker = l('top', '<<<<<<< aaa', 'o', '=======', 't', '>>>>>>> bbb', 'bottom');
-  const p = parseConflictBlocks(marker, l('top', 'o', 'bottom'), l('top', 't', 'bottom'));
+  const p = parseConflictBlocks(marker, l('top', 'o', 'bottom'), l('top', 't', 'bottom'), makeBudget(), { ours: 'aaa', theirs: 'bbb' });
   assert.deepEqual(p.blocks, [{ ours: l('o'), theirs: l('t') }]);
   assert.deepEqual(p.outsides, [l('top'), l('bottom')]);
   assert.equal(checkSelection(p, l('top', 't', 'bottom')).ok, true);
