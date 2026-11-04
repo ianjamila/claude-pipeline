@@ -1761,3 +1761,27 @@ test('#128 R5-B1: program text with a config root and a projects word is refused
   // (a memory mention does not excuse a second projects word that is not a memory path)
   assert.equal(bash("python3 -c \"import os,shutil; shutil.copytree('/tmp/f',os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'projects','-repo')); print('projects','-x','memory')\"", { env }), 'deny');
 });
+
+// R5-F1: a wildcard root/projects segment with a literal folder below the project is the session folder the literal rule protects (mirrors TRANSCRIPT_BELOW).
+test('#128 R5-F1: a glob root or projects segment followed by a literal session or subagents folder is refused like the literal; files, memory and other trees stay open', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    'cp -R /tmp/forged/. ~/.claud?/projects/-repo/abc/subagents',
+    'cp -R /tmp/forged/. ~/.cl*/projects/-repo/abc',
+    'rm -rf ~/.claude/proj?cts/-repo/abc',
+    'cp -R /tmp/forged/. /home/u/claude-confi?/projects/-repo/abc',
+    'rm -rf ~/.claude/proj?cts/-repo/abc/subagents',
+    'mv /tmp/forged ~/.claud?/projects/C--Users-u-repo/abc',
+  ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
+  for (const cmd of [
+    'cp x ~/.claud?/projects/-repo/notes.md',
+    'cp x ~/.cl*/projects/-repo/abc/notes.md',
+    'cp x /home/u/claude-confi?/projects/-repo/notes.md',
+    'cp -R /tmp/n ~/.claud?/projects/-repo/memory',
+    'cp -R /tmp/n ~/.claud?/projects/-repo/memory/sub',
+    'cp x ~/.claud?/projects/-repo/memory/note.md',
+    'rm -rf ~/.claude/proj?cts/old/abc', // (no session's folder: the literal rule keeps rm -rf ~/.claude/projects/old open)
+    'cp -R /tmp/forged/. ~/.cache/*/projects/-repo/abc',
+    'cat ~/.claud?/projects/-repo/abc/subagents/agent-1.jsonl',
+  ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+});

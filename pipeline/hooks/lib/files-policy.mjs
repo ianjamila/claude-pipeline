@@ -1044,7 +1044,11 @@ function makeMatchers(ctx) {
   const transcriptTail = (rest) => {
     const last = rest[rest.length - 1] ?? '';
     if (rest.length <= 1) return rest.length === 0 || last.endsWith('.jsonl') || !/\.[A-Za-z0-9]+$/.test(last); // (projects/ itself, or a project folder)
-    return !rest.slice(0, -1).includes('memory') && (last.endsWith('.jsonl') || (/[*?[]/.test(last) && !/\.[A-Za-z0-9]+$/.test(last)));
+    if (rest.slice(0, -1).includes('memory')) return false;
+    if (last.endsWith('.jsonl') || (/[*?[]/.test(last) && !/\.[A-Za-z0-9]+$/.test(last))) return true;
+    // (R5-F1: as TRANSCRIPT_BELOW reads the literal path -- a project, then folders whose names have no dot, never the project's memory/ -- so the same folder reached through a wildcard root or
+    // projects segment is refused too. `cp x GLOB/notes.md` is judged as GLOB/notes.md/x: a dot name on the way is a file, no folder.)
+    return (/[*?[]/.test(rest[0]) || /^(?:-|[A-Za-z]--)/.test(rest[0])) && rest.slice(1).every((seg) => !seg.includes('.')) && !(rest.length === 2 && last === 'memory');
   };
   const transcriptGlob = (g) => withoutQualifier(g).some(transcriptGlobOf);
   const transcriptGlobOf = (g) => {
