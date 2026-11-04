@@ -565,6 +565,25 @@ test('#128 rulings (R4-F3, case): a newer ask printed in another case in a skipp
   }
 });
 
+// Codex finding 3: a tool input is searched as DECODED text (a tab or newline in the command is a tab / newline, not the two characters \\t / \\n).
+test('#128 rulings (R4-F3, decoded input): a tab or a multi-line tool input that surfaces a newer ask voids the pending one; an unrelated multi-line input does not', () => {
+  const home = tmp();
+  const now = () => Date.parse('2026-11-03T10:00:00Z');
+  const head = [promptEntry('go'), said(ASK_REPLY)];
+  const use = (input) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input }] } });
+  const result = (c) => ({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'x', content: c }] } });
+  const rule = (between, answer = 'R1-B1: accept') => {
+    const e = promptEntry(answer);
+    return recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: answer, prompt_id: e.promptId, transcript_path: transcript(home, [...head, ...between, e]) }, { home, now });
+  };
+  const notice = () => promptEntry(NOTICE, NOTICE_META);
+  assert.equal(rule([notice(), use({ command: "echo '⚖️ Owner ruling needed\t#59: R1-B1 · content abcdef012345 · repo acme/app' >/dev/null" }), result('')]), null, 'a tab inside the ruling line');
+  assert.equal(rule([notice(), use({ command: "cat <<'EOF' > note.txt\nsome prose\nhead 0123456789ab · items none · repo acme/app\nEOF" }), result('')]), null, 'a head line inside a heredoc');
+  assert.equal(rule([notice(), use({ nested: [{ deep: 'x\nhead 0123456789ab · items none · repo acme/app' }] }), result('')]), null, 'a head line in a nested input value');
+  const r = rule([notice(), use({ command: 'cat <<EOF > a.txt\nline one\nline two\nEOF', description: 'write a file' }), result('')], 'R1-F1: accept');
+  assert.deepEqual([r?.pr, r?.ids], [58, ['R1-F1']], 'an unrelated multi-line input: the ask still binds');
+});
+
 test('#128 rulings: nothing is skipped by its text, and an owner turn between the ask and the answer is still a boundary', () => {
   const home = tmp();
   const now = () => Date.parse('2026-11-03T10:00:00Z');
