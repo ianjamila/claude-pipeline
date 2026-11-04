@@ -99,3 +99,4 @@ full record.
 - 2026-11-03 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 4 · arbiter 4 · needs-human
 - 2026-11-04 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 5 · arbiter 5 · needs-human
 - 2026-11-04 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 6 · arbiter 6 · needs-human
+- 2026-11-04 · #148 · Hardening: mark-implemented counts only PR-authored content (#120); fastSplit needs labels (EW #1598); owner-go test isolation (#122) · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
