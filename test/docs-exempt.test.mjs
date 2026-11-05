@@ -592,17 +592,39 @@ test('a token with a backslash is refused, whichever reading of it would have be
   }
 });
 
-test('an escaped space is not a backslash: an unlisted file is fine, a listed one with a space in its name is a hit', (t) => {
-  const r = exemptWith(importWorld(t, { 'CLAUDE.md': 'see @docs/my\\ notes.md\n' }));
-  assert.equal(r.exempt, true, r.reason);
-  const w = world(t, { list: ['docs/my notes.md'], baseFiles: { 'CLAUDE.md': '@docs/my\\ notes.md\n', 'docs/my notes.md': '# Ledger\n\n| Num | Name | Date | PR | Note |\n|---|---|---|---|---|\n' + row(1) } });
-  w.append('docs/my notes.md', row(2));
-  w.repo.commit('notes');
-  refused(w.exempt(), /imports docs\/my notes\.md, a listed document/);
+test('an escaped space is a backslash like any other: refused, listed or not, whatever follows it', (t) => {
+  // Windows strips a trailing space and dot, so `docs/ledger.md\ ` would open the ledger while its candidate misses the listed path.
+  for (const token of ['docs/ledger.md\\ ', 'docs/ledger.md\\ #a', 'docs/ledger.md\\ .', 'docs/my\\ notes.md']) {
+    const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': `see @${token}\n` })), BACKSLASH);
+    assert.ok(r.reason.includes('CLAUDE.md imports ' + token.split(' ')[0]), r.reason);
+  }
+  // a plain space ends the token: `@docs /ledger.md` is the token `docs`, which is not the listed document
+  const cut = exemptWith(importWorld(t, { 'CLAUDE.md': 'see @docs /ledger.md\n' }));
+  assert.equal(cut.exempt, true, cut.reason);
+});
+
+const DOTTED = /which cannot be judged because a path segment ending in a dot or a space has two readings: this needs a review round/;
+
+test('a path segment that ends in a dot is refused (Windows drops it), but sentence punctuation after the path is not one', (t) => {
+  for (const token of ['docs./ledger.md', 'docs./other.md', 'docs/sub./x.md', '.../x.md']) {
+    const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': `see @${token}\n` })), DOTTED);
+    assert.ok(r.reason.includes('CLAUDE.md imports ' + token + ','), r.reason);
+  }
+  // through a hop
+  const hop = refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'docs/guide.md': '@docs./ledger.md\n' })), DOTTED);
+  assert.ok(hop.reason.includes('docs/guide.md imports docs./ledger.md,'), hop.reason);
+  // a segment left ending in a dot after the trailing punctuation is cut is never exempt: here it is cut to the listed document
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': 'see @docs/ledger.md..\n' })), /a listed document/);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': 'see @docs/ledger.md.\n' })), /imports docs\/ledger\.md, a listed document/);
+  // plain `.` and `..` segments are fine
+  for (const body of ['see @docs/guide.md.\n', '@docs/guide.md,\n', '@./docs/./guide.md\n', '@../docs/other.md\n']) {
+    const r = exemptWith(importWorld(t, { 'docs/a.md': body, 'CLAUDE.md': '@docs/a.md\n' }));
+    assert.equal(r.exempt, true, `${body}: ${r.reason}`);
+  }
 });
 
 test('not a drive, not a home, not a climb: still just a relative path that does not exist', (t) => {
-  for (const token of ['foo@example.com', '@supabase/ssr', '@note:later', '@ab:c']) {
+  for (const token of ['foo@example.com', '@supabase/ssr', '@note:later', '@ab:c', '@docs/guide.md.', '@docs/guide.md,']) {
     const r = exemptWith(importWorld(t, { 'CLAUDE.md': `see ${token}\n` }));
     assert.equal(r.exempt, true, `${token}: ${r.reason}`);
   }

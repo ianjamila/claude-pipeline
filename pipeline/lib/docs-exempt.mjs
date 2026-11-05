@@ -56,7 +56,7 @@ const MAX_TOKENS = 5000;
 const MAX_LINK_FOLLOWS = 40;
 const REGULAR_MODES = new Set(['100644', '100755']);
 // `@path`: at the start of a line or after a character that cannot end a word (whitespace, a bracket, a quote, markup).
-const IMPORT_TOKEN = /(?:^|[^A-Za-z0-9.\-/@\\])@((?:\\ |[^\s])+)/gm;
+const IMPORT_TOKEN = /(?:^|[^A-Za-z0-9.\-/@\\])@([^\s]+)/gm;
 const TRAILING_PUNCTUATION = /[)\]}>"'`.,;:!?*_~|]+$/;
 const lc = (s) => s.toLowerCase();
 class Unjudgeable extends Error {}
@@ -129,11 +129,13 @@ function resolveInTree(tree, rel, readBlob) {
 // A backslash is not judged here: it is a separator on Windows and a filename character on POSIX, so a token or symlink target with one is refused.
 const isAbsoluteOrHome = (p) => /^(?:\/|~(?:\/|$)|[A-Za-z]:)/.test(p);
 
-// The paths an `@token` may stand for, as written (escaped spaces undone; trailing punctuation and a #fragment cut off in turn).
+// A path segment that ends in a dot or a space: Windows drops it, so it names another file there. `.` and `..` are the real ones.
+const dotted = (seg) => seg !== '.' && seg !== '..' && /[. ]$/.test(seg);
+
+// The paths an `@token` may stand for, as written (trailing punctuation and a #fragment cut off in turn).
 function candidatesOf(token) {
-  const raw = token.replace(/\\ /g, ' ');
   const out = new Set();
-  for (const t of [raw, raw.replace(TRAILING_PUNCTUATION, '')]) {
+  for (const t of [token, token.replace(TRAILING_PUNCTUATION, '')]) {
     for (const c of [t, t.split('#')[0]]) if (c !== '') out.add(c);
   }
   return [...out];
@@ -193,9 +195,13 @@ function importProblem({ listed, tree, o }) {
     let tokens = 0;
     for (const m of text.matchAll(IMPORT_TOKEN)) {
       if (++tokens > MAX_TOKENS) return `${path} cannot be judged: too many @ tokens`;
-      // A backslash (an escaped space aside) has two readings, a separator or a filename character, so judging one could miss the other.
-      // Judged on the whole token, before any trailing punctuation or #fragment is cut off.
-      if (m[1].replace(/\\ /g, ' ').includes('\\')) return `${path} imports ${m[1]}, which cannot be judged because a backslash has two readings: this needs a review round`;
+      // A backslash has two readings, a separator or a filename character, so judging one could miss the other; an escaped space is no
+      // exception (the space is then dropped on Windows). Judged on the whole token, before any trailing punctuation or #fragment is cut off.
+      if (m[1].includes('\\')) return `${path} imports ${m[1]}, which cannot be judged because a backslash has two readings: this needs a review round`;
+      // A segment ending in a dot or a space is refused the same way. Sentence punctuation after the path is not one: the last segment is
+      // judged only after it is cut off (once with, once without the #fragment); every earlier segment is judged as written.
+      const stripped = [m[1], m[1].split('#')[0]].map((x) => x.replace(TRAILING_PUNCTUATION, ''));
+      if ([...m[1].split('/').slice(0, -1), ...stripped.flatMap((x) => x.split('/'))].some(dotted)) return `${path} imports ${m[1]}, which cannot be judged because a path segment ending in a dot or a space has two readings: this needs a review round`;
       for (const written of candidatesOf(m[1])) {
         // An absolute or home path is not a place inside the reviewed tree, so it cannot be judged there.
         if (isAbsoluteOrHome(written)) return leaves(path, written);
