@@ -30,7 +30,7 @@ import { createGitHub } from '../lib/github.mjs';
 import { GhError } from '../lib/proc.mjs';
 import { assessRisk, isLightLane, reviewLane } from '../lib/risk.mjs';
 import { addRound, emptyState, loadState, saveState } from '../lib/state.mjs';
-import { reuseRuled, reviewedRoundCount, roundAdmission, ruledCacheFrom } from '../lib/triage.mjs';
+import { reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from '../lib/triage.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
   allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, writeFileAtomic,
@@ -43,7 +43,9 @@ export const meta = {
     'pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]',
     '  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, reviewer, reviewerReasons, path}',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
-    '  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head)',
+    '  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head, an empty commit,',
+    '    an amend); the message names the accepted items still waiting for a fix, or says the content is what round N reviewed. Never for a round that only merged',
+    '    the base branch in (below): that is recorded as baseOnly even when the content hash did not move',
     '  exit 2 {error:round-cap} past review.max_rounds, except ONE extra round when the last round only accepted fixes (state outcome extraRound)',
     '    or ONE round per owner grant (owner_approval: chat only): the owner typed "extra round" after a reply ending with the line triage round-request',
     '    printed, for this repository, PR, counted round and head (an owner record younger than 24 h; the automatic extra round is used first). The',
@@ -217,16 +219,6 @@ export const run = guarded(async (argv, ctx) => {
   };
   checkBase(state);
 
-  // A later round exists to review the fixes for what earlier rounds accepted. An empty range (or no change in the
-  // branch content since the last round) reviews nothing, and would let an unfixed accepted item look resolved.
-  const hasAccepted = allItems(state ?? { rounds: [] }).some((i) => i.final?.decision === 'ACCEPT');
-  if (state && hasAccepted && (base === head || currentContentHash(root, config) === state.rounds.at(-1)?.contentHashAtToHead)) {
-    throw new Fail(EXIT.USAGE, {
-      ok: false, error: 'empty-range',
-      message: `round ${round} would review nothing: the branch content has not changed since round ${state.rounds.at(-1).n}, and earlier rounds accepted items that need a fix`,
-    });
-  }
-
   // Risk and light lane describe the whole PR (merge base..head), whatever slice this round reviews. A later round can
   // only take a PR off the light lane, never put it on.
   const files = diffFiles(forkPoint, head, o);
@@ -269,6 +261,23 @@ export const run = guarded(async (argv, ctx) => {
   const { patch, skipped: largeBinaries } = reviewPatch(review.base, head, o);
   // Only the base branch was merged in since the last round: there is nothing of the PR's own to review.
   const baseOnly = review.kind === 'synthetic' && patch === '' && largeBinaries.length === 0;
+  // A later round exists to review the fixes for what earlier rounds accepted. An empty range (or no change in the branch content
+  // since the last round) reviews nothing, and would let an unfixed accepted item look resolved. It is judged HERE, once baseOnly
+  // is known: a round that only merged the base branch in is never refused (it is recorded below, without Codex, and does not
+  // count; an accepted, unfixed item stays unimplemented through it: roundOutcome / reviewValidFor skip baseOnly rounds). A clean
+  // merge that leaves the content hash alone is exactly that case, so refusing it as empty-range (#1658) was wrong. Still before
+  // checkCap and before anything is written. base == head is kind 'previous' with an empty patch, so never baseOnly.
+  const hasAccepted = allItems(state ?? { rounds: [] }).some((i) => i.final?.decision === 'ACCEPT');
+  if (state && hasAccepted && !baseOnly && (base === head || currentContentHash(root, config) === state.rounds.at(-1)?.contentHashAtToHead)) {
+    const last = state.rounds.at(-1).n;
+    const waiting = roundOutcome(state).newAccepted;
+    throw new Fail(EXIT.USAGE, {
+      ok: false, error: 'empty-range',
+      message: waiting.length > 0
+        ? `round ${round} would review nothing: the branch content has not changed since round ${last}, and these accepted items still need a fix: commit the fix for ${waiting.join(', ')} first`
+        : `round ${round} would review nothing: nothing new to review: the content is what round ${last} reviewed; if that round was clean, review-complete uses it`,
+    });
+  }
   const preAdmission = checkCap(state, { baseOnly, resolutionOnly });
   const resolutionView = resolutionOnly ? resolutionSummary(resolution) : null;
   ensureRoundDir(root, round);

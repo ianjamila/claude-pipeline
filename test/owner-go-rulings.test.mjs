@@ -316,6 +316,25 @@ test('review-complete: corrupt local state fails the check (no throw); evaluateO
   assert.equal(live.rulings, '');
 });
 
+test('review-complete: evaluateOwnerGo measures from GitHub\'s base, so a stale local base after update-branch + pull does not refuse', async () => {
+  const w = await checkWorld({ items: [claudeItem()] });
+  const published = w.published();
+  const stale = w.baseTip;
+  w.repo.git(['checkout', 'main']);
+  w.repo.write('src/other.js', 'export const other = 1;\n');
+  const tip = w.repo.commit('main moved');
+  w.repo.git(['checkout', 'agent/feature']);
+  w.repo.git(['merge', '--no-ff', '--no-edit', 'main']);
+  w.repo.git(['update-ref', 'refs/heads/main', stale]); // the cached base the PR's own pull leaves behind
+  const g = { ...gh(published), prView: () => ({ baseRefOid: tip, baseRefName: 'main' }), repo: () => ({ slug: 'acme/widgets', host: 'github.com' }), checks: () => [], pullFiles: () => [] };
+  const live = await evaluateOwnerGo({ root: w.repo.dir, config: w.config, pr: PR, gh: g, sleep: async () => {}, env: {} });
+  const completion = live.checks.find((c) => c.name === 'review-complete');
+  assert.equal(completion.ok, true, completion.detail);
+  assert.equal(live.rulingCount, 1);
+  // The same check measured from the stale base sees main's commit as part of the PR: this is what the base from GitHub avoids.
+  refusal(await w.check(gh(published)), /no clean review round/);
+});
+
 test('review-complete: the docs-only exemption keeps a PR whose only newer commit adds lines to a listed document', async () => {
   const yml = `${goYml()}review:\n  docs_exempt_paths: ["docs/guide.md"]\n`;
   const e = await checkWorld({ yml, items: [], local: 'none' });

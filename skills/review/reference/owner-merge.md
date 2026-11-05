@@ -37,6 +37,7 @@ Which ending depends on the item note from 1.5 (as refreshed in step 2):
    - **Protected areas under `owner_approval: chat`** (`ownerMerge` items, nothing blocking): the owner's "merge" covers them. Run
      `P merge --pr N --dry-run --owner-go`; for a `say-merge` with `areas`, name the protected areas in plain English from its `areaIds` (never from the
      agent-writable `.review/hardstops.json`) and end the reply with the closing lines (last bullet). A dry run with blockers ⇒ fix them first; `owner-runs` ⇒ the first bullet.
+     `ownerStep.behindNote` (behind main, accepted: base config `merge.behind_base: disjoint`) ⇒ say it in plain English ABOVE the closing lines (Areas / Hold / Head), never between them; "merge" still covers only that head and items.
    - **Rulings** (`ownerStep.rulings` present: dismissed BLOCKING or security items, single-PR requests only; several PRs with rulings ⇒ a separate reply for each): in plain English, above the closing lines, say what was dismissed and why, naming each item;
      then print the `Rulings <digest12>` block verbatim from the dry run, directly above `Areas` / `Hold` / `Head`. Never type or edit the block: that makes the "merge" bind nothing.
    - **A `needs-human` hold** (`ownerStep.hold` present, with or without areas): say in plain English that the owner's "merge" also lifts the needs-human hold; report it from the event, `ownerStep.holdInfo` (who added the label, when: the account is shared, so never call it the owner's or yours);

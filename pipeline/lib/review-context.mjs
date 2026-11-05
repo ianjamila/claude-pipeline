@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
 import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { Fail } from './cmd-common.mjs';
-import { git, reviewBaseRef as gitReviewBaseRef, reviewContentHash } from './git.mjs';
+import { GitError, NETWORK_TIMEOUT_MS, git, reviewBaseRef as gitReviewBaseRef, reviewContentHash } from './git.mjs';
 import { LockTimeoutError, withLock } from './locks.mjs';
 import { parseRemote } from './remote-url.mjs';
 import { loadState } from './state.mjs';
@@ -22,6 +22,28 @@ export const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 // `origin/<branch>` is what the PR will be merged into (the default branch unless the PR names its own base); see
 // git.mjs#reviewBaseRef for the fallback.
 export const reviewBaseRef = (root, config, branch = config.default_branch) => gitReviewBaseRef(branch, { cwd: root });
+
+// Best-effort refresh of origin/<default_branch>, for the commands that hash the content WITHOUT having fetched (review-complete,
+// state outcome, state mark-implemented; codex-review fetches on its own). The hash is the PR's diff against merge-base(origin/<branch>,
+// HEAD): after `update-branch` + `git pull --ff-only` (which fetches the PR branch only) the local origin/<branch> is older than the
+// main that was merged in, so the merge base is older, the diff includes main's new commits and the hash differs from the round's.
+// Offline, no remote or a slow one (GitError, timeouts included) keeps the cached ref, as codex-review does: { refreshed: false, reason }.
+// usesRemoteRef: the hash is measured from origin/<branch> (it exists, fetched now or left over), not from the local <branch>. A caller
+// that must not trust a stale ref (mark-implemented) refuses when usesRemoteRef && !refreshed. Anything but a GitError is a bug and throws.
+export function refreshBaseRef(root, config) {
+  const branch = config.default_branch;
+  let refreshed = false;
+  let reason;
+  try {
+    git(['fetch', '--no-tags', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { cwd: root, timeoutMs: NETWORK_TIMEOUT_MS });
+    refreshed = true;
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+    reason = String(err.message).split('\n')[0].slice(0, 200);
+  }
+  const usesRemoteRef = reviewBaseRef(root, config) === `origin/${branch}`;
+  return { refreshed, ...(reason === undefined ? {} : { reason }), usesRemoteRef };
+}
 
 // What the branch changes relative to where it forked, minus the agent log. One definition, in git.mjs, shared with the
 // final gate (finalgate.mjs#localContentHash).

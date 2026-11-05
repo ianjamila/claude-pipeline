@@ -354,6 +354,19 @@ test('real run, Rev-4 8: a needs-human put back during the wait ends it as block
   assert.ok(s.st().labels.includes('needs-human'));
 });
 
+test('real run: the base moves off the evaluated one while the lifted-hold merge waits => blocked, auto-merge disabled, the hold put back', async (t) => {
+  const moved = 'f'.repeat(40);
+  const extra = [{ match: '^pr view 12 --json state,mergeCommit,labels,baseRefOid$', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [], baseRefOid: moved } }];
+  const s = world({ gh: { mergeView: STILL_OPEN, extra }, env: { PIPELINE_MERGE_WAIT_MS: '30000', PIPELINE_MERGE_POLL_MS: '1' } });
+  approve(t, s);
+  const r = s.go();
+  assertExit(r, 1);
+  assert.match(r.json.reason, new RegExp(`a blocker appeared while waiting: PR base is now ${moved.slice(0, 8)}`));
+  assert.ok(s.lines().some((l) => /--disable-auto/.test(l)), 'auto-merge is disabled');
+  assert.equal(s.mergeCalls().length, 1);
+  restored(s, r);
+});
+
 test('real run, Rev-4 8: the look after the delete has no exemption either (a needs-human back on the PR refuses before the merge command)', async (t) => {
   const hooks = [{ match: 'api -X DELETE', phase: 'after', addLabels: ['needs-human'] }]; // (no labeled event: only the plain blocker look can see it)
   const s = world({ state: { hooks } });
@@ -368,9 +381,12 @@ test('real run, Rev-4 8: the look after the delete has no exemption either (a ne
 test('real run: abandonMerge finds the PR MERGED after all => the label is not put back', async (t) => {
   const extra = [
     { match: '^pr view 12 --json state,mergeCommit$', stdoutJson: { state: 'MERGED', mergeCommit: { oid: MERGE_SHA } } },
-    { match: '^pr view 12 --json state,mergeCommit,labels$', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [] } },
+    // (the wait poll also reads baseRefOid: every --owner-go wait pins the base the scan was of, filled in below once the repo exists)
+    { match: '^pr view 12 --json state,mergeCommit,labels,baseRefOid$', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [], baseRefOid: 'BASE_TIP' } },
   ];
   const s = world({ gh: { extra }, env: { FAKE_MERGE_EXIT: '1' } });
+  const script = join(s.fake.dir, 'script.json');
+  writeFileSync(script, readFileSync(script, 'utf8').replace('"BASE_TIP"', JSON.stringify(s.baseTip)));
   approve(t, s);
   const r = s.go();
   assertExit(r, 0, `${r.stderr}${r.stdout}`);
