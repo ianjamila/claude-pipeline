@@ -14,6 +14,9 @@ const SCRUBBED = [
   // Identity overrides beat repo-local user.name/user.email and would make the per-repo nonce inert. (The *_DATE vars are
   // left alone: tests pin them on purpose.)
   'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL',
+  // Env-supplied config also outranks repo-local config (dropping COUNT disables every GIT_CONFIG_KEY_n/VALUE_n pair), and
+  // GIT_CONFIG would redirect `git config` away from .git/config entirely.
+  'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
 ];
 // undefined values drop the variable from the child's environment (proc.run merges over process.env).
 const ENV = Object.fromEntries(SCRUBBED.map((k) => [k, undefined]));

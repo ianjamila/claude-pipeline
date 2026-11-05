@@ -426,7 +426,9 @@ test('commitTime ignores log.showSignature=true in the user\'s git config (a sig
   try {
     repo.git(['commit', '-q', '-S', '-m', 'signed']);
   } catch (err) {
-    // A supported git (>= 2.34) must sign: a failure there is a real regression. Skip only when the version was unparseable.
+    // A supported git (>= 2.34) must sign: a failure there is a real regression. Skip only when the signer on PATH is too old
+    // (OpenSSH < 8.2p1 has no `-Y sign`) or the git version was unparseable.
+    if (/ssh-keygen -Y sign is needed/.test(err.message)) { t.skip(`the ssh-keygen on PATH cannot sign (${err.message.split('\n')[0]})`); return; }
     if (gv) throw err;
     t.skip(`could not parse the git version and this git cannot make an SSH-signed commit (${err.message.split('\n')[0]})`); return;
   }
