@@ -144,8 +144,7 @@ final gate re-prove the grant from the owner's record on this machine, so finish
      agent-writable `.review/hardstops.json`) and end the reply with these LAST three lines, copied from the dry run (Areas directly above Head):
      `<ownerStep.areas>`, then `<ownerStep.line>`, then `🔀 Ready to merge #N — say "merge"`. The owner says "merge" ⇒ `P merge --pr N --owner-go`
      (it re-scans GitHub's base..head and refuses unless the record is for exactly that digest and Areas; if anything changed, show the new dry-run lines).
-     A dry run with blockers ⇒ fix them first; `owner-runs` ⇒ the first bullet.
-     `ownerStep.behindNote` (behind main, accepted: base config `merge.behind_base: disjoint`) ⇒ say it in plain English ABOVE the Areas/Head lines, never between them; "merge" still covers only that head and items.
+     A dry run with blockers ⇒ fix them first; `owner-runs` ⇒ the first bullet. `ownerStep.behindNote` (behind main, accepted: base config `merge.behind_base: disjoint`) ⇒ say it in plain English ABOVE the Areas/Head lines, never between them; "merge" still covers only that head and items.
    - Any owner command that starts with `gh` is written with gh's absolute path, shell-quoted (`/opt/homebrew/bin/gh …` on this kind of
      Mac, else `/usr/local/bin/gh`; `command -v gh` when it answers): the owner's `!` prompt shell does not load the PATH that has gh.
    - To preview the verdict before the owner's word, use only `P merge --pr N --dry-run` (add `--owner-go` for that route): it runs the
