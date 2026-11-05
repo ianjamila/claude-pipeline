@@ -89,6 +89,7 @@ export function ghEntries(o) {
     labels: 'rawLabels' in o ? o.rawLabels : (o.labels ?? []).map((name) => ({ name })), mergeable: o.mergeable ?? 'MERGEABLE',
   };
   if (o.mergeStateStatus) pr.mergeStateStatus = o.mergeStateStatus;
+  if (o.baseOid) pr.baseRefOid = o.baseOid; // what GitHub says the PR's base commit is (the --owner-go scan range)
   if (o.noLabels) delete pr.labels; // `labels` absent from the reply entirely
   if (o.noMergeable) delete pr.mergeable;
 
@@ -109,6 +110,8 @@ export function ghEntries(o) {
     { match: 'repos/acme/widgets/compare/', stdoutJson: { status: o.behindBy ? 'diverged' : 'ahead', behind_by: o.behindBy ?? 0, ahead_by: 1, base: BASE_SHA } },
     // `commitParents`: { <sha>: [parent shas] } for GET commits/<sha> (the update-branch result is bound to its parents).
     ...Object.entries(o.commitParents ?? {}).map(([commit, parents]) => ({ match: `commits/${commit} --jq`, stdoutJson: parents })),
+    // GET pulls/12/files (the --owner-go cross-check of the scanned file list): [{ filename, previous_filename?, status }]
+    { match: 'repos/acme/widgets/pulls/12/files', stdoutJson: o.prFiles ?? [] },
     o.requiredCi === 'error'
       ? { match: '^pr checks 12 .*--required$', code: 1, stderr: "no required checks reported on the 'main' branch" }
       : o.requiredCi === 'fail502'
@@ -137,10 +140,15 @@ export function scenario(opts = {}) {
   repo.write('scripts/fake-merge.mjs', FAKE_MERGE);
   repo.write('scripts/fake-smoke.mjs', FAKE_SMOKE);
   for (const [file, content] of Object.entries(opts.baseFiles ?? {})) repo.write(file, content);
-  repo.commit('init');
+  const baseTip = repo.commit('init');
   repo.branch('agent/feature');
   (opts.change ?? bump)(repo);
   const head = repo.commit('feature');
+  // What GitHub's pulls/12/files lists for this branch (default for the fake gh; --owner-go cross-checks the local diff against it).
+  const prFiles = repo.git(['diff', '-M', '--name-status', baseTip, head]).trim().split('\n').filter(Boolean).map((line) => {
+    const [status, a, b] = line.split('\t');
+    return b === undefined ? { filename: a, status } : { filename: b, previous_filename: a, status };
+  });
   const hash = contentHash(mergeBase('main', 'HEAD', { cwd: repo.dir }), 'HEAD', { cwd: repo.dir, exclude: [AGENT_LOG] });
 
   if (opts.state !== null) {
@@ -157,10 +165,10 @@ export function scenario(opts = {}) {
   }
   opts.afterReport?.(repo);
 
-  const fake = createFakeGh(ghEntries({ prHead: head, ...opts.gh }));
+  const fake = createFakeGh(ghEntries({ prHead: head, baseOid: baseTip, prFiles, ...opts.gh }));
   const env = opts.env ?? {};
   const s = {
-    repo, fake, head, hash, env,
+    repo, fake, head, hash, env, baseTip, prFiles,
     gate: () => cli(['final-gate', '--pr', String(PR)], { dir: repo.dir, fake, env }),
     merge: (extraEnv = {}) => cli(['merge', '--pr', String(PR)], { dir: repo.dir, fake, env: { ...env, ...extraEnv } }),
     gateFile: () => JSON.parse(readFileSync(join(repo.dir, '.review', 'final-gate.json'), 'utf8')),

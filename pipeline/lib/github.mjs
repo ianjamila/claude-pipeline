@@ -336,6 +336,10 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     // The workflow runs of one check suite (their created_at tells a draft-era run from a ready-era one).
     workflowRunsOfSuite: (suiteId) => pagedList(`repos/${self.repo().slug}/actions/runs?check_suite_id=${encodeURIComponent(suiteId)}&per_page=100`, '.workflow_runs'),
 
+    // The files of a PR as GitHub lists them (every page): [{ filename, previous_filename?, status, ... }]. GitHub computes this from its own
+    // copy of the commits, so it is the cross-check for a local diff (--owner-go: an object graph altered here shows up as a difference).
+    pullFiles: (n) => pagedList(`repos/${self.repo().slug}/pulls/${prNumber(n)}/files?per_page=100`),
+
     // PUT pulls/{n}/update-branch: merge the base into the PR branch on GitHub (a merge commit, never a force push), but only
     // if the head is still `expectedHeadSha`. 202 = accepted (the new head appears a moment later). The two 422s are answers,
     // told apart by their message; anything else (403, 404, 5xx, an unrecognised 422) throws, so it can never read as success.

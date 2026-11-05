@@ -92,6 +92,44 @@ test('diffFiles uses the merge-base: unrelated commits that landed on main are n
   assert.match(twoDot, /D\tunrelated\.txt/);
 });
 
+test('diffFiles ignores replace refs: a replacement commit cannot hide the real change (GIT_NO_REPLACE_OBJECTS)', () => {
+  const { repo, base, o } = baseRepo();
+  repo.branch('feat');
+  repo.write('src/feature.js', 'feature\n');
+  const real = repo.commit('feature');
+  repo.checkout('main');
+  repo.branch('decoy');
+  const decoy = repo.commit('decoy', { allowEmpty: true });
+  repo.git(['replace', real, decoy]);
+  // plain git honours the replacement: the branch looks empty
+  assert.equal(repo.git(['diff', '--name-only', base, real]).trim(), '');
+  // the wrapper does not
+  assert.deepEqual(diffFiles(base, real, o).map((f) => f.path), ['src/feature.js']);
+});
+
+test('diffFiles ignores an inherited GIT_GRAFT_FILE / GIT_SHALLOW_FILE: a graft cannot hide the real change', () => {
+  const { repo, base, o } = baseRepo();
+  repo.branch('feat');
+  repo.write('src/feature.js', 'feature\n');
+  const real = repo.commit('feature');
+  // a decoy beside the real commit with the same tree; grafting it in as the real commit's parent makes it the merge-base
+  const decoy = repo.git(['commit-tree', `${real}^{tree}`, '-p', base, '-m', 'decoy']).trim();
+  const dir = mkdtempSync(join(tmpdir(), 'graft-'));
+  const graftFile = join(dir, 'grafts');
+  writeFileSync(graftFile, `${real} ${decoy}\n`);
+  const shallowFile = join(dir, 'shallow');
+  writeFileSync(shallowFile, `${decoy}\n`);
+  withProcessEnv({ GIT_GRAFT_FILE: graftFile }, () => {
+    // plain git honours the graft: decoy..real looks empty
+    assert.equal(repo.git(['diff', '--name-only', repo.git(['merge-base', decoy, real]).trim(), real]).trim(), '');
+  });
+  assert.deepEqual(diffFiles(decoy, real, o).map((f) => f.path), ['src/feature.js']);
+  withProcessEnv({ GIT_GRAFT_FILE: graftFile, GIT_SHALLOW_FILE: shallowFile }, () => {
+    // the wrapper does not
+    assert.deepEqual(diffFiles(decoy, real, o).map((f) => f.path), ['src/feature.js']);
+  });
+});
+
 test('diffFiles survives hostile user config (noprefix, mnemonicPrefix, quotePath, renames, color, autocrlf)', () => {
   const { repo, o } = baseRepo();
   repo.write('with space.txt', 'spaced\n');

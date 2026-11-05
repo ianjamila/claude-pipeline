@@ -134,17 +134,23 @@ final gate re-prove the grant from the owner's record on this machine, so finish
    green. Any other red ⇒ implementer fix, push, back to step 1 of this section. Base moved ⇒ `P update-branch --pr N`, `git pull --ff-only`, review again if content changed.
 3. **STOP** (outcome `awaiting-owner-merge`; `owner_approval: label` with a blocking item parks instead, no merge request): run the stop ritual first, then tell the owner in plain English what changed, the PR link, the review outcome and
    follow-up issues. Which ending depends on the item note from 1.5 (as refreshed in step 2):
-   - **Any `blocking` / `ownerMerge` / test-integrity item** (always the case for a protected-area PR under `owner_approval: chat`): NO `Head …` / `🔀` lines
-     (`P merge --owner-go` refuses such a diff) and no `needs-human` label. Say the PR is reviewed and CI is green, name the protected areas it touches
+   - **A `blocking` item** (a blocking hard-stop or test-integrity violation: always under `owner_approval: label`) : NO `Head …` / `🔀` lines
+     (`P merge --owner-go` refuses such a diff) and no `needs-human` label. Say the PR is reviewed and CI is green, name what blocks it
      (from `.review/hardstops.json` and `P integrity`), and give the repo's `merge.command` from `P config` with `{pr}` = N and `{sha}` = the head sha
      filled in (EagleWatch: `npm run merge -- <PR> --expect-head <sha>`) for the owner to run.
+   - **Protected areas under `owner_approval: chat`** (`ownerMerge` items, nothing blocking): the owner's "merge" covers them. Run
+     `P merge --pr N --dry-run --owner-go`; for a `say-merge` with `areas`, name the protected areas in plain English from its `areaIds` (never from the
+     agent-writable `.review/hardstops.json`) and end the reply with these LAST three lines, copied from the dry run (Areas directly above Head):
+     `<ownerStep.areas>`, then `<ownerStep.line>`, then `🔀 Ready to merge #N — say "merge"`. The owner says "merge" ⇒ `P merge --pr N --owner-go`
+     (it re-scans GitHub's base..head and refuses unless the record is for exactly that digest and Areas; if anything changed, show the new dry-run lines).
+     A dry run with blockers ⇒ fix them first; `owner-runs` ⇒ the first bullet.
    - Any owner command that starts with `gh` is written with gh's absolute path, shell-quoted (`/opt/homebrew/bin/gh …` on this kind of
      Mac, else `/usr/local/bin/gh`; `command -v gh` when it answers): the owner's `!` prompt shell does not load the PATH that has gh.
    - To preview the verdict before the owner's word, use only `P merge --pr N --dry-run` (add `--owner-go` for that route): it runs the
      same checks, writes and merges nothing, and its `ownerStep` says which of the two endings above applies. Never run the repo's own
      merge command (`npm run merge …`, even with `--dry-run`) to preview: the git guard refuses it, and the dry run grants nothing.
    - **No such item**: the reply's LAST two lines are exactly (sha12 = first 12 characters of `git rev-parse HEAD`; owner/name from
-     `gh repo view --json nameWithOwner`; the digest is `none` on the `--owner-go` route):
+     `gh repo view --json nameWithOwner`; on `--owner-go` copy `ownerStep.line` (and `ownerStep.areas` above it when present) from the dry run, never type the digest):
      `Head <sha12> · items <digest> · repo <owner/name>`
      `🔀 Ready to merge #N — say "merge"`
      The owner-go hook binds the owner's "merge" to the LAST reply: if anything else was said since, or the context was compacted since you showed

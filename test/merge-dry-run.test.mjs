@@ -33,7 +33,7 @@ const prReply = (s, o = {}) => ({
 const script = (s, o = {}) => [
   ...(o.before ?? []),
   { match: '^pr view 12 --json state,headRefOid.*baseRefOid', stdoutJson: prReply(s, o) },
-  ...ghEntries({ prHead: s.head, mergeStateStatus: o.merge ?? 'CLEAN', labels: o.labels, behindBy: o.behindBy, ...o.gh }),
+  ...ghEntries({ prHead: s.head, prFiles: s.prFiles, mergeStateStatus: o.merge ?? 'CLEAN', labels: o.labels, behindBy: o.behindBy, ...o.gh }),
 ];
 
 // Every .review file with its bytes: a dry run changes none.
@@ -233,6 +233,7 @@ test('dry run with no final-gate.json: blocker gate, and the live checks are sti
 // ---- the owner step -------------------------------------------------------------------------------------------------------------
 
 const chatYml = () => `${ymlFor()}hard_stops:\n  paths: ['src/**']\nowner_approval: chat\n`;
+const hardStopYml = () => `${ymlFor()}hard_stops:\n  paths: ['src/**']\n`;
 
 test('dry run, ownerMerge > 0 under owner_approval: chat -> ownerStep owner-runs with the filled merge command and NO request line', () => {
   const s = scenario({ yml: chatYml(), gh: { mergeStateStatus: 'CLEAN' } });
@@ -299,8 +300,37 @@ test('dry run --owner-go: the owner-go route preconditions are checked live, the
   assert.match(bad.r.json.blockers.map((b) => b.detail).join('\n'), /labels: blocking label[\s\S]*ci: /);
 });
 
-test('dry run --owner-go on a diff with a hard-stop item -> blocker owner-items and ownerStep owner-runs', () => {
+test('dry run --owner-go: a baseRefOid that is not a full sha is its own blocker (the base re-read cannot be skipped), besides scan-range', () => {
+  const s = scenario({ report: null, state: null, gh: { mergeStateStatus: 'CLEAN' } });
+  s.fake.setScript(script(s, { baseRefOid: 'nothex' }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 1);
+  assert.equal(d.r.json.wouldMerge, false);
+  assert.match(d.r.json.blockers.map((b) => b.detail).join('\n'), /did not name the PR's base commit as a full 40-character sha \(baseRefOid is null\)/);
+  assert.deepEqual(d.writes, []);
+});
+
+test('dry run --owner-go, chat mode, a protected diff -> say-merge with the LIVE items digest and the Areas line; nothing is written', async () => {
   const s = scenario({ yml: chatYml(), report: null, state: null, gh: { mergeStateStatus: 'CLEAN' } });
+  s.fake.setScript(script(s));
+  const before = s.repo.git(['for-each-ref']);
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.wouldMerge, true, JSON.stringify(d.r.json.blockers));
+  const { ownerStep } = d.r.json;
+  assert.equal(ownerStep.kind, 'say-merge');
+  assert.match(ownerStep.line, new RegExp(`^Head ${s.head.slice(0, 12)} · items [0-9a-f]{12} · repo acme/widgets$`));
+  assert.doesNotMatch(ownerStep.line, /items none/);
+  assert.equal(ownerStep.areaIds.length, 1);
+  assert.equal(ownerStep.areas, `Areas ${ownerStep.areaIds.join(' ')}`);
+  assert.deepEqual(d.writes, []);
+  assert.deepEqual(s.mergeCalls(), []);
+  noGitWrites(d);
+  assert.equal(s.repo.git(['for-each-ref']), before);
+});
+
+test('dry run --owner-go, label mode, a blocking hard-stop -> blocker owner-items and ownerStep owner-runs', () => {
+  const s = scenario({ yml: hardStopYml(), report: null, state: null, gh: { mergeStateStatus: 'CLEAN' } });
   s.fake.setScript(script(s));
   const d = dry(s, ['--owner-go']);
   assertExit(d.r, 1);
