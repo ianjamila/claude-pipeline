@@ -17,7 +17,12 @@
 //    would still match after a main merge that discards an upstream change. A merge since the round always takes a round (the
 //    existing baseOnly / resolutionOnly paths deal with it);
 //  * toHead..HEAD changes at least one file, and every file, by BOTH rename sides, is listed, is a regular (100644) non-binary text
-//    file, and is only added to: no edited or removed line, no deletion, no rename, no mode change, no symlink or submodule.
+//    file, and is only added to: no edited or removed line, no deletion, no rename, no mode change, no symlink or submodule;
+//  * every ADDED line is a strict ledger row (LEDGER_ROW below): a four-digit number, the migration's name, a date, a PR number and
+//    an empty note, nothing else. The added rows are the last lines of the file (nothing after them), their numbers strictly
+//    increase and continue above the last row of the reviewed file, and each names a migration file (<number>_<name>.sql, a regular
+//    file in a directory called migrations) that exists in the REVIEWED head's tree. So a row carries no free text, and the only
+//    word in it that is not fixed was already reviewed as a file name. A row with a note, or any other line, needs a round.
 import { DEFAULTS, docsExemptProblem } from './config.mjs';
 import { contentHash, diffFiles, diffModes, git, isAncestor, mergeBase, revParse, reviewBaseRef, showFile } from './git.mjs';
 import { reviewValidFor } from './triage.mjs';
@@ -28,6 +33,48 @@ const SHA = /^[0-9a-f]{40}$/;
 const REGULAR = '100644';
 const SHOWN = 5;
 const oneLine = (e) => String(e?.message ?? e).split('\n')[0].slice(0, 200);
+
+// | 0240 | `name` | 2026-11-05 | #1234 | |   The Note column must be empty: a row with a note takes a round.
+const LEDGER_ROW = /^\| (\d{4}) \| `([a-z0-9_]{1,63})` \| \d{4}-\d{2}-\d{2} \| #\d{1,6} \| \|$/;
+const ROW_NUMBER = /^\| (\d{4}) \| /;
+const quote = (text) => JSON.stringify(String(text).slice(0, 60));
+
+// File names of the regular files (100644 / 100755) directly in a directory called migrations at the reviewed head. Read on demand.
+function migrationNames(toHead, o) {
+  const names = new Set();
+  for (const entry of git(['ls-tree', '-r', '-z', '--full-tree', toHead], o).split('\0')) {
+    const m = /^(100644|100755) blob [0-9a-f]+\t(.+)$/s.exec(entry);
+    const parts = m?.[2].split('/');
+    if (parts && parts.length >= 2 && parts.at(-2) === 'migrations' && parts.at(-1).endsWith('.sql')) names.add(parts.at(-1));
+  }
+  return names;
+}
+
+// Why the lines this file ADDS are not ledger rows laid out as the exemption allows, or null. `reviewed`: the file at the reviewed head
+// (null when it is new), `head`: the file at HEAD. The diff has no removed line here, so the added lines are the only change.
+function rowsProblem(file, f, reviewed, head, migrations) {
+  const added = f.added ?? [];
+  if (added.length === 0) return null;
+  const lines = String(head).split('\n');
+  if (lines.pop() !== '') return `${file}: the file does not end in a newline`;
+  const bad = added.find((l) => !LEDGER_ROW.test(String(l.text)));
+  if (bad) return `${file} line ${bad.line}: ${quote(bad.text)} is not a ledger row (| NNNN | \`name\` | YYYY-MM-DD | #PR | |); any other added line needs a review round`;
+  const first = lines.length - added.length + 1;
+  const off = added.find((l, i) => l.line !== first + i);
+  if (off) return `${file} line ${off.line}: added rows must be the last lines of the file, with nothing after them`;
+  let previous = null;
+  for (const l of String(reviewed ?? '').split('\n').reverse()) {
+    const m = ROW_NUMBER.exec(l);
+    if (m) { previous = m[1]; break; }
+  }
+  for (const l of added) {
+    const [, number, name] = LEDGER_ROW.exec(l.text);
+    if (previous !== null && number <= previous) return `${file} line ${l.line}: row ${number} does not come after row ${previous}: row numbers must strictly increase, above the last row of the reviewed file`;
+    previous = number;
+    if (!migrations().has(`${number}_${name}.sql`)) return `${file} line ${l.line}: no regular file ${number}_${name}.sql in a migrations directory at the reviewed head (a row for a migration that is not there needs a review round)`;
+  }
+  return null;
+}
 
 const stringsOf = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []);
 const pathsOf = (f) => [...new Set([f.oldPath, f.newPath, f.path].filter((p) => typeof p === 'string'))];
@@ -116,6 +163,8 @@ function decide(state, { root, config, hash }) {
   const modes = new Map(diffModes(toHead, 'HEAD', o).map((m) => [m.newPath ?? m.oldPath, m]));
   const problems = [];
   const changed = new Set();
+  let names = null;
+  const migrations = () => (names ??= migrationNames(toHead, o));
   for (const f of files) {
     const paths = pathsOf(f);
     const unlisted = paths.filter((p) => !allowed.has(p));
@@ -125,6 +174,11 @@ function decide(state, { root, config, hash }) {
     }
     const why = fileProblem(f, modes.get(f.newPath ?? f.oldPath ?? f.path));
     if (why) problems.push(`${paths.join(' -> ')}: ${why}`);
+    else {
+      const file = f.newPath ?? f.path;
+      const rows = rowsProblem(file, f, f.status === 'A' ? null : showFile(toHead, file, o), showFile('HEAD', file, o), migrations);
+      if (rows) problems.push(rows);
+    }
     for (const p of paths) changed.add(p);
   }
   if (problems.length > 0) {
