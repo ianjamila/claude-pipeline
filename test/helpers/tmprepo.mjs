@@ -11,6 +11,9 @@ import { run } from '../../pipeline/lib/proc.mjs';
 const SCRUBBED = [
   'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
   'GIT_COMMON_DIR', 'GIT_PREFIX', 'GIT_NAMESPACE',
+  // Identity overrides beat repo-local user.name/user.email and would make the per-repo nonce inert. (The *_DATE vars are
+  // left alone: tests pin them on purpose.)
+  'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL',
 ];
 // undefined values drop the variable from the child's environment (proc.run merges over process.env).
 const ENV = Object.fromEntries(SCRUBBED.map((k) => [k, undefined]));

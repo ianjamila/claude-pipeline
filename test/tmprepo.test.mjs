@@ -37,6 +37,28 @@ test('a commit made through repo.git([commit, ...]) directly is unique per repo 
   });
 });
 
+// GIT_AUTHOR_* / GIT_COMMITTER_* override repo-local user.name/user.email (git exports them to hooks), which would make
+// the per-repo nonce inert. The helper must scrub them from the children it spawns.
+test('inherited git identity env vars do not defeat head uniqueness', () => {
+  const keys = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'];
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  for (const k of keys) process.env[k] = k.endsWith('EMAIL') ? 'fixed@example.invalid' : 'Fixed Name';
+  try {
+    withPinnedDates(() => {
+      const a = createTmpRepo();
+      const b = createTmpRepo();
+      try {
+        a.write('f.txt', 'same\n'); b.write('f.txt', 'same\n');
+        assert.notEqual(a.commit('same message'), b.commit('same message'));
+        for (const r of [a, b]) { r.write('g.txt', 'x\n'); r.git(['add', '-A']); r.git(['commit', '-q', '-m', 'direct']); }
+        assert.notEqual(a.git(['rev-parse', 'HEAD']), b.git(['rev-parse', 'HEAD']));
+      } finally { a.cleanup(); b.cleanup(); }
+    });
+  } finally {
+    for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
+});
+
 test('every commit in one repo keeps the same identity (the nonce is per repo, not per commit)', () => {
   const r = createTmpRepo();
   try {
