@@ -23,7 +23,11 @@
 //    increase and continue above the last row of the reviewed file, and each names a migration file (<number>_<name>.sql, a regular
 //    file in a directory called migrations) that exists in the REVIEWED head's tree. So a row carries no free text, and the only
 //    word in it that is not fixed was already reviewed as a file name. A row with a note, or any other line, needs a round.
+import { realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { posix } from 'node:path';
 import { DEFAULTS, docsExemptProblem } from './config.mjs';
+import { isAgentInstructionPath } from './doc-paths.mjs';
 import { contentHash, diffFiles, diffModes, git, isAncestor, mergeBase, revParse, reviewBaseRef, showFile } from './git.mjs';
 import { reviewValidFor } from './triage.mjs';
 import { parseYaml } from './yaml.mjs';
@@ -39,15 +43,191 @@ const LEDGER_ROW = /^\| (\d{4}) \| `([a-z0-9_]{1,63})` \| \d{4}-\d{2}-\d{2} \| #
 const ROW_NUMBER = /^\| (\d{4}) \| /;
 const quote = (text) => JSON.stringify(String(text).slice(0, 60));
 
-// File names of the regular files (100644 / 100755) directly in a directory called migrations at the reviewed head. Read on demand.
-function migrationNames(toHead, o) {
+// ---- @-imports: an instruction file that pulls a listed document in --------------------------------------------------------------------
+// CLAUDE.md and its kin may `@path` other files, which are then read as instructions (Claude Code follows them up to 5 hops). A listed
+// document that is imported steers the agent like an instruction file, yet its added lines would skip review. The scan reads the REVIEWED
+// head's tree (instruction files cannot change after it: an unlisted file forces a round, and an instruction file can never be listed).
+// It over-matches on purpose (tokens in code spans, any case, both the importer's own and its target's directory), and fails closed:
+// whatever cannot be read or followed (a link that cycles, dangles or ends outside the repo, an oversized file) is "not exempt".
+const MAX_HOPS = 5;
+const MAX_READS = 2000;
+const MAX_FILE_BYTES = 1024 * 1024;
+const MAX_TOKENS = 5000;
+const MAX_LINK_FOLLOWS = 40;
+const REGULAR_MODES = new Set(['100644', '100755']);
+// `@path`: at the start of a line or after a character that cannot end a word (whitespace, a bracket, a quote, markup).
+const IMPORT_TOKEN = /(?:^|[^A-Za-z0-9.\-/@\\])@((?:[^\s\\]|\\ )+)/gm;
+const TRAILING_PUNCTUATION = /[)\]}>"'`.,;:!?*_~|]+$/;
+const lc = (s) => s.toLowerCase();
+class Unjudgeable extends Error {}
+
+// Every file in the tree at `toHead`: { entries: path -> { mode, oid }, lower: lowercased path -> [paths] }. The lowercase index is how a
+// case-insensitive file system (macOS, Windows) would resolve a name.
+function readTree(toHead, o) {
+  const entries = new Map();
+  const lower = new Map();
+  for (const raw of git(['ls-tree', '-r', '-z', '--full-tree', toHead], o).split('\0')) {
+    const m = /^(\d+) (?:blob|commit) ([0-9a-f]+)\t(.+)$/s.exec(raw);
+    if (!m) continue;
+    entries.set(m[3], { mode: m[1], oid: m[2] });
+    lower.set(lc(m[3]), [...(lower.get(lc(m[3])) ?? []), m[3]]);
+  }
+  return { entries, lower };
+}
+
+// File names of the regular files directly in a directory called migrations. Read on demand.
+function migrationNames(tree) {
   const names = new Set();
-  for (const entry of git(['ls-tree', '-r', '-z', '--full-tree', toHead], o).split('\0')) {
-    const m = /^(100644|100755) blob [0-9a-f]+\t(.+)$/s.exec(entry);
-    const parts = m?.[2].split('/');
-    if (parts && parts.length >= 2 && parts.at(-2) === 'migrations' && parts.at(-1).endsWith('.sql')) names.add(parts.at(-1));
+  for (const [p, e] of tree.entries) {
+    const parts = p.split('/');
+    if (REGULAR_MODES.has(e.mode) && parts.length >= 2 && parts.at(-2) === 'migrations' && parts.at(-1).endsWith('.sql')) names.add(parts.at(-1));
   }
   return names;
+}
+
+// Walks `rel` (a posix path from the repo root, `.` and `..` allowed) through the tree, following a symlink at every segment, directories
+// included. -> { path: canonical tree path | null (nothing there), entry } | { outside: true } (a plain path that leaves the repo) | throws
+// Unjudgeable (a link that cycles, dangles, is absolute or ends outside the repo; ambiguous names).
+function resolveInTree(tree, rel, readBlob) {
+  let segs = rel.split('/').filter((s) => s !== '' && s !== '.');
+  let done = [];
+  let follows = 0;
+  while (segs.length > 0) {
+    const next = segs.shift();
+    if (next === '..') {
+      if (done.length === 0) {
+        if (follows > 0) throw new Unjudgeable('a symlink leads out of the repository');
+        return { outside: true };
+      }
+      done.pop();
+      continue;
+    }
+    const at = [...done, next].join('/');
+    const hits = tree.lower.get(lc(at));
+    if (hits === undefined) { done.push(next); continue; } // a directory, or nothing
+    if (hits.length > 1) throw new Unjudgeable(`${at} is ambiguous (two names that differ only in case)`);
+    const real = hits[0];
+    const entry = tree.entries.get(real);
+    if (entry.mode !== '120000') { done.push(real.split('/').at(-1)); continue; }
+    if (++follows > MAX_LINK_FOLLOWS) throw new Unjudgeable(`symlinks at ${real} cycle`);
+    const target = readBlob(entry.oid, real);
+    if (target === '' || target.includes('\0')) throw new Unjudgeable(`${real} is a symlink with an unreadable target`);
+    if (target.startsWith('/')) throw new Unjudgeable(`${real} is a symlink to an absolute path`);
+    segs = [...target.split('/'), ...segs];
+    // `done` is the directory that holds the link, unchanged: the target is relative to it.
+  }
+  const full = done.join('/');
+  const hit = tree.lower.get(lc(full));
+  if (hit === undefined) {
+    if (follows > 0) throw new Unjudgeable(`a symlink on the way to ${full === '' ? rel : full} dangles`);
+    return { path: null, entry: null };
+  }
+  if (hit.length > 1) throw new Unjudgeable(`${full} is ambiguous (two names that differ only in case)`);
+  return { path: hit[0], entry: tree.entries.get(hit[0]) };
+}
+
+// The paths an `@token` may stand for, as written (escaped spaces undone; trailing punctuation and a #fragment cut off in turn).
+function candidatesOf(token) {
+  const raw = token.replace(/\\ /g, ' ');
+  const out = new Set();
+  for (const t of [raw, raw.replace(TRAILING_PUNCTUATION, '')]) {
+    for (const c of [t, t.split('#')[0]]) if (c !== '') out.add(c);
+  }
+  return [...out];
+}
+
+// Does any instruction file of the reviewed head import (directly or by up to 5 hops) a document of `listed`? -> a reason | null.
+function importProblem({ toHead, root, listed, tree, home, o }) {
+  const listedLower = new Set(listed.map(lc));
+  let reads = 0;
+  const readBlob = (oid, path) => {
+    if (++reads > MAX_READS) throw new Unjudgeable('too many files to read');
+    let text;
+    try {
+      text = git(['cat-file', 'blob', oid], { ...o, maxBuffer: MAX_FILE_BYTES });
+    } catch {
+      throw new Unjudgeable(`${path} is too large or cannot be read`);
+    }
+    return text;
+  };
+  let rootReal = root;
+  try { rootReal = realpathSync(root); } catch { /* the root as given */ }
+  const roots = [...new Set([root, rootReal].map((r) => posix.normalize(r.replace(/\\/g, '/')).replace(/\/$/, '')))];
+
+  const seen = new Set();
+  const queue = [];
+  const enqueue = (path, canonical, depth) => {
+    if (seen.has(lc(canonical))) return;
+    seen.add(lc(canonical));
+    queue.push({ path, canonical, depth });
+  };
+
+  // The instruction files are the roots. One that is itself a link is followed; one that ends in a listed document makes that document
+  // an instruction file, which it may never be.
+  for (const p of tree.entries.keys()) {
+    if (!isAgentInstructionPath(p)) continue;
+    let r;
+    try {
+      r = resolveInTree(tree, p, readBlob);
+    } catch (e) {
+      if (!(e instanceof Unjudgeable)) throw e;
+      return `${p} cannot be judged: ${e.message}`;
+    }
+    if (r.outside || r.path === null) return `${p} is a symlink that dangles or leads out of the repository (symlink targets cannot be judged)`;
+    if (REGULAR_MODES.has(r.entry.mode) === false) continue;
+    if (listedLower.has(lc(r.path))) return `${p} is read as an instruction file but is a symlink to ${r.path}, a listed document`;
+    enqueue(p, r.path, 0);
+  }
+
+  const hit = (importer, lexical, canonical) => {
+    const direct = !lexical.startsWith('..') && listedLower.has(lc(lexical));
+    if (!direct && !(canonical !== null && listedLower.has(lc(canonical)))) return null;
+    return `${importer} imports ${lexical}${direct ? '' : ` (a symlink to ${canonical})`}, a listed document: an imported document steers the agents like an instruction file`;
+  };
+  for (let i = 0; i < queue.length; i++) {
+    const { path, canonical, depth } = queue[i];
+    const text = readBlob(tree.entries.get(canonical).oid, path);
+    let tokens = 0;
+    for (const m of text.matchAll(IMPORT_TOKEN)) {
+      if (++tokens > MAX_TOKENS) return `${path} cannot be judged: too many @ tokens`;
+      for (const written of candidatesOf(m[1])) {
+        // Where the token may point, as paths from the repo root: the importer's directory as it was reached and as it really is.
+        const rels = [];
+        let absolute = null;
+        if (written.startsWith('~/')) {
+          if (!home) return `${path} imports ${written}, and HOME is unknown: it cannot be judged`;
+          absolute = `${home.replace(/\/$/, '')}/${written.slice(2)}`;
+        } else if (written.startsWith('/')) {
+          absolute = written;
+        }
+        if (absolute !== null) {
+          const target = posix.normalize(absolute);
+          const base = roots.find((r) => target === r || target.startsWith(`${r}/`));
+          if (!base) continue; // outside the repo: it cannot be a listed document
+          rels.push(target.slice(base.length + 1));
+        } else {
+          for (const dir of new Set([posix.dirname(path), posix.dirname(canonical)])) rels.push(`${dir === '.' ? '' : `${dir}/`}${written}`);
+        }
+        for (const rel of rels) {
+          const lexical = posix.normalize(rel);
+          const direct = hit(path, lexical, null);
+          if (direct) return direct;
+          let r;
+          try {
+            r = resolveInTree(tree, rel, readBlob);
+          } catch (e) {
+            if (!(e instanceof Unjudgeable)) throw e;
+            return `${path} imports ${written}, which cannot be judged: ${e.message}`;
+          }
+          if (r.outside) continue;
+          const found = hit(path, lexical, r.path);
+          if (found) return found;
+          if (r.path !== null && REGULAR_MODES.has(r.entry.mode) && depth < MAX_HOPS) enqueue(r.path, r.path, depth + 1);
+        }
+      }
+    }
+  }
+  return null;
 }
 
 // Why the lines this file ADDS are not ledger rows laid out as the exemption allows, or null. `reviewed`: the file at the reviewed head
@@ -96,15 +276,15 @@ function fileProblem(f, mode) {
  * -> { exempt: true, files: [paths], reviewedHead } | { exempt: false, files: [], reason, off? } (off: the feature is not configured, so the caller
  * should not mention it).
  */
-export function docsExemptFrom(state, { root, config, hash }) {
+export function docsExemptFrom(state, { root, config, hash, home }) {
   try {
-    return decide(state, { root, config, hash });
+    return decide(state, { root, config, hash, home });
   } catch (err) {
     return { exempt: false, files: [], reason: `the docs-only exemption could not be checked: ${oneLine(err)}` };
   }
 }
 
-function decide(state, { root, config, hash }) {
+function decide(state, { root, config, hash, home }) {
   const no = (reason, extra = {}) => ({ exempt: false, files: [], reason, ...extra });
   const o = { cwd: root };
   const last = state?.rounds?.at(-1);
@@ -160,11 +340,21 @@ function decide(state, { root, config, hash }) {
 
   const files = diffFiles(toHead, 'HEAD', o);
   if (files.length === 0) return no(`no file changed since the reviewed head ${toHead.slice(0, 12)}`);
+  let treeMemo = null;
+  const tree = () => (treeMemo ??= readTree(toHead, o));
+  let importWhy;
+  try {
+    importWhy = importProblem({ toHead, root, listed, tree: tree(), home: home === undefined ? homedir() : home, o });
+  } catch (e) {
+    if (!(e instanceof Unjudgeable)) throw e;
+    importWhy = e.message;
+  }
+  if (importWhy) return no(importWhy);
   const modes = new Map(diffModes(toHead, 'HEAD', o).map((m) => [m.newPath ?? m.oldPath, m]));
   const problems = [];
   const changed = new Set();
   let names = null;
-  const migrations = () => (names ??= migrationNames(toHead, o));
+  const migrations = () => (names ??= migrationNames(tree()));
   for (const f of files) {
     const paths = pathsOf(f);
     const unlisted = paths.filter((p) => !allowed.has(p));
@@ -172,10 +362,10 @@ function decide(state, { root, config, hash }) {
       problems.push(`${unlisted.join(', ')} is not in review.docs_exempt_paths: it needs a review round`);
       continue;
     }
+    const file = f.newPath ?? f.path;
     const why = fileProblem(f, modes.get(f.newPath ?? f.oldPath ?? f.path));
     if (why) problems.push(`${paths.join(' -> ')}: ${why}`);
     else {
-      const file = f.newPath ?? f.path;
       const rows = rowsProblem(file, f, f.status === 'A' ? null : showFile(toHead, file, o), showFile('HEAD', file, o), migrations);
       if (rows) problems.push(rows);
     }

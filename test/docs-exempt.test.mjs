@@ -43,8 +43,8 @@ function world(t, { list = [LEDGER], yml, items = [], fable = false, baseFiles =
   repo.write('docs/other.md', '# Other\n');
   repo.write('docs/guide.html', '<p>guide</p>\n');
   repo.write('CLAUDE.md', '# rules\n');
-  for (const [p, c] of Object.entries(baseFiles)) repo.write(p, c);
-  for (const [p, target] of Object.entries(baseLinks)) { mkdirSync(dirname(join(repo.dir, p)), { recursive: true }); symlinkSync(target, join(repo.dir, p)); }
+  for (const [p, c] of Object.entries(baseFiles)) repo.write(p, typeof c === 'function' ? c(repo.dir) : c);
+  for (const [p, target] of Object.entries(baseLinks)) { mkdirSync(dirname(join(repo.dir, p)), { recursive: true }); rmSync(join(repo.dir, p), { force: true }); symlinkSync(target, join(repo.dir, p)); }
   const base = repo.commit('init');
   repo.branch('feat/x');
   repo.write('src/a.js', 'export const a = 2;\n');
@@ -56,7 +56,7 @@ function world(t, { list = [LEDGER], yml, items = [], fable = false, baseFiles =
   });
   w.state = state;
   w.append = (rel, line) => { writeFileSync(join(repo.dir, rel), readFileSync(join(repo.dir, rel), 'utf8') + line); };
-  w.exempt = (config = baseline(), s = state) => docsExemptFrom(s, { root: repo.dir, config, hash: w.hash('HEAD') });
+  w.exempt = (config = baseline(), s = state, extra = {}) => docsExemptFrom(s, { root: repo.dir, config, hash: w.hash('HEAD'), ...extra });
   return w;
 }
 const refused = (r, pattern) => {
@@ -430,11 +430,6 @@ test('a new listed document may hold only rows: a heading in it is refused', (t)
   w.repo.write('docs/new.md', '# New\n' + row(2));
   w.repo.commit('new doc with a heading');
   refused(w.exempt(), /docs\/new\.md line 1/);
-});
-
-test('a reviewed file with no final newline: appending is refused (see A4 for the message)', (t) => {
-  const w = world(t, { baseFiles: { [LEDGER]: `# Ledger\n\n${row(1).replace(/\n$/, '')}` } });
-  refused(addRow(w, row(2)), /docs\/ledger\.md/);
 });
 
 // ---- the final gate's review check, and review-complete ---------------------------------------------------------------
