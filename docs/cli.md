@@ -343,6 +343,20 @@ comment exists. The comment is append-only evidence (a new comment per new head,
 Validity is the state's (every round clean, coverage = this content) PLUS a lane re-check from the PR itself: a PR whose
 files, size or recorded risk call for the Fable pass is refused unless some round ran a proven one.
 
+Docs-only exemption (`review.docs_exempt_paths`, default empty = off): the one exception to "coverage = this content". When the last round
+is valid for its OWN content (nothing unresolved, every Fable pass proven) and its hash really is the hash of its `toHead`, and
+the only changes since `toHead` ADD lines to files listed in that list, the comment is posted for the CURRENT hash and head (the record's
+shape is unchanged, so the vendored guards read it as ever) with a visible line naming the files and the reviewed head, and the output
+carries `docsExempt: {files, reviewedHead}`. The final gate's `review` check uses the same helper (`lib/docs-exempt.mjs`) and shows the files
+in its detail; verify/CI coverage of the docs head is NOT exempted. Every condition: the list is read from `.claude/pipeline.yml` AT `toHead`
+(a commit cannot widen its own exemption); every entry is an exact path of an ordinary document (`lib/doc-paths.mjs`: markdown anywhere,
+text/rst/adoc under `docs/`, LICENSE/CHANGELOG; never an agent-instruction file (`CLAUDE` / `AGENTS` / `AGENT` / `GEMINI` `.md` and their `.<variant>.md` forms, e.g. `AGENTS.override.md`, `CLAUDE.local.md`; `.cursorrules`; `copilot-instructions.md`), html, mdx, source, or anything under
+any dot-directory (`.claude/ .github/ .cursor/ ...`), `app/`, `pages/`, `skills/ agents/ pipeline/ scripts/`) that no hard-stop path rule claims and that is not on `integrity.test_globs`,
+`hard_stops.paths`, `review.arbiter_always_paths`, `risk.high_risk_paths`, nor under `supabase/` or a `migrations` directory (validated by
+config AND re-checked at run time); `toHead` is an ancestor of HEAD, no merge commit and no merge-base change since; every changed file
+(both sides of a rename) is listed, a regular 100644 non-binary file, and only added to (no edited or removed line, deletion, rename, mode
+change, symlink). A refusal names the file that forces a round: `reason` ends with "the docs-only exemption does not apply: <file> ...".
+
 With `ci.review_check: true` the guard workflow turns this comment into the `Cross-model review` status (success only when
 the newest such comment by an allowed author names the content hash of the PR head). A comment starts no workflow, so
 `recheck` says how the guards learn about it: `on-ready` (a draft: marking it ready starts them), `label-removed`
