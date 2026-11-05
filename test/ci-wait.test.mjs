@@ -17,12 +17,12 @@ const HEAD = 'a'.repeat(40);
 const PR = { head: HEAD, isDraft: false, createdAt: '2026-01-01T00:00:00Z', base: 'main' };
 
 // A world is described by values or by functions of the simulated seconds since the command started.
-const at = (v, t) => (typeof v === 'function' ? v(t) : v);
+const at = (v, t, n) => (typeof v === 'function' ? v(t, n) : v);
 
 function sim(world, options = {}) {
   let t = 0;
   const calls = [];
-  const reads = { classic: [], rules: [] }; // the base each policy read asked for
+  const reads = { classic: [], rules: [], statuses: 0, headRuns: [] }; // the base each policy read asked for
   const readers = {
     pr: async () => at(world.pr ?? PR, t / 1000),
     classic: async (base) => {
@@ -34,7 +34,14 @@ function sim(world, options = {}) {
       return at(world.rules ?? [], t / 1000);
     },
     checkRuns: async () => at(world.checkRuns ?? [], t / 1000),
-    statuses: async () => at(world.statuses ?? [], t / 1000),
+    statuses: async () => {
+      reads.statuses += 1;
+      return at(world.statuses ?? [], t / 1000, reads.statuses);
+    },
+    headRuns: async (head) => {
+      reads.headRuns.push(head);
+      return at(world.headRuns ?? [], t / 1000);
+    },
     timeline: async () => at(world.timeline ?? [], t / 1000),
     suiteRuns: async (id) => {
       calls.push(id);
@@ -103,6 +110,133 @@ test('the Phase 6 race: a draft-era SKIPPED Typecheck + Vitest keeps the wait op
   assert.ok(s.progress.some((l) => /Typecheck \+ Vitest=stale-skip/.test(l)), s.progress.join(' | '));
   // the draft-era skip was judged by its workflow run, once (cached per suite)
   assert.deepEqual(s.suiteCalls, [113268557037]);
+});
+
+// ---- a needs:-gated aggregate appears late by design: ready-era runs still going keep the wait open (#159) ------------------
+
+// A world where the required aggregate `Typecheck + Vitest` has only a draft-era skip until `appearAt` seconds, while a shard job
+// of the ready-event workflow run (suite 7, created after the ready event) is in_progress until `shardDoneAt`.
+function lateAggregate({ appearAt, shardDoneAt = appearAt, shardSuiteCreated = '2026-01-01T12:00:05Z', skipOnly = true } = {}) {
+  const aggregate = cr('Typecheck + Vitest', 'success', { check_suite: { id: 7 } });
+  return {
+    classic: present('Typecheck + Vitest'),
+    timeline: readyTimeline,
+    checkRuns: (t) => [
+      ...(skipOnly ? [cr('Typecheck + Vitest', 'skipped', { id: 1, check_suite: { id: 3 } })] : []),
+      cr('Typecheck + Vitest (shard 1/2)', t < shardDoneAt ? null : 'success', { id: 5, check_suite: { id: 7 } }),
+      ...(t >= appearAt ? [aggregate] : []),
+    ],
+    suiteRuns: () => (id) => [{ created_at: id === 7 ? shardSuiteCreated : '2026-01-01T11:00:00Z' }],
+  };
+}
+
+test('a stale-skipped aggregate keeps waiting past the appear window while a ready-era run is in progress, then passes when it appears', async () => {
+  const s = sim(lateAggregate({ appearAt: 600 }));
+  const r = await s.run();
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(s.elapsed(), 600_000, 'not at the 300s appear deadline');
+  assert.equal(r.output.heldBy.kind, 'check-run');
+  assert.equal(r.output.heldBy.name, 'Typecheck + Vitest (shard 1/2)');
+  assert.equal(r.output.heldBy.status, 'in_progress');
+  assert.ok(s.progress.some((l) => /still running/.test(l) && /shard 1\/2/.test(l)), s.progress.join(' | '));
+});
+
+test('the same wait on a MISSING aggregate (no draft-era skip either) is held by an in-progress ready-era workflow run', async () => {
+  const aggregate = cr('Typecheck + Vitest', 'success', { check_suite: { id: 7 } });
+  // only the workflow run is visible (no check run of it yet): it is read from the head's workflow runs
+  const s = sim({
+    classic: present('Typecheck + Vitest'), timeline: readyTimeline,
+    checkRuns: (t) => (t >= 705 ? [aggregate] : []),
+    headRuns: (t) => (t < 705 ? [{ id: 55, name: 'CI', status: 'queued', created_at: '2026-01-01T12:00:05Z', html_url: 'https://github.example/actions/55' }] : []),
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 705_000);
+  assert.deepEqual(r.output.heldBy, { kind: 'workflow-run', id: 55, name: 'CI', status: 'queued', createdAt: '2026-01-01T12:00:05Z', url: 'https://github.example/actions/55' });
+});
+
+test('with nothing ready-era running, the appear deadline ends the wait with the old verdicts (stale-skipped / missing)', async () => {
+  const skip = sim(lateAggregate({ appearAt: 99999, shardDoneAt: 0 }));
+  const a = await skip.run();
+  assert.equal(a.output.verdict, 'stale-skipped');
+  assert.equal(skip.elapsed(), 300_000);
+  assert.equal(a.output.heldBy, undefined);
+  const missing = sim({ classic: present('ci'), timeline: readyTimeline, headRuns: [{ id: 9, name: 'Other', status: 'completed', created_at: '2026-01-01T12:00:05Z' }] });
+  const b = await missing.run();
+  assert.equal(b.output.verdict, 'missing');
+  assert.equal(missing.elapsed(), 300_000);
+});
+
+test('an in-progress run created BEFORE the ready event does not hold the wait', async () => {
+  const draftEra = sim(lateAggregate({ appearAt: 99999, shardSuiteCreated: '2026-01-01T11:30:00Z' }));
+  const a = await draftEra.run();
+  assert.equal(a.output.verdict, 'stale-skipped');
+  assert.equal(draftEra.elapsed(), 300_000);
+  const wf = sim({ classic: present('ci'), timeline: readyTimeline, headRuns: [{ id: 9, name: 'Old', status: 'in_progress', created_at: '2026-01-01T11:59:59Z' }] });
+  const b = await wf.run();
+  assert.equal(b.output.verdict, 'missing');
+  assert.equal(wf.elapsed(), 300_000);
+});
+
+test('an in-progress ready-era run only extends the wait up to the overall --timeout (verdict `timeout`, heldBy reported)', async () => {
+  const s = sim(lateAggregate({ appearAt: 99999, shardDoneAt: 99999 }), { timeoutMs: 900_000 });
+  const r = await s.run();
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.verdict, 'timeout');
+  assert.equal(s.elapsed(), 900_000);
+  assert.equal(r.output.heldBy.name, 'Typecheck + Vitest (shard 1/2)');
+});
+
+test('a draft-era failure also keeps waiting while a ready-era run is in progress', async () => {
+  const s = sim({
+    classic: present(pin('Cross-model review', ACTIONS)), timeline: readyTimeline,
+    checkRuns: (t) => [cr('Playwright', t < 500 ? null : 'success', { check_suite: { id: 7 } })],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T12:00:05Z' }],
+    statuses: (t) => [st('Cross-model review', 'failure', 'github-actions[bot]', { id: 1, created_at: '2026-01-01T11:00:00Z' }), ...(t >= 405 ? [st('Cross-model review', 'success', 'github-actions[bot]', { id: 2, created_at: '2026-01-01T12:06:40Z' })] : [])],
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 405_000);
+});
+
+// ---- a failure read from a commit status is confirmed by a fresh read before it is reported (#159 part 2) -----------
+
+test('a Cross-model review failure superseded by a success after the poll read is not reported: statuses are re-read before the verdict', async () => {
+  // read 1 (the poll) sees only the failure; the success is posted before the confirming read 2
+  const s = sim({
+    classic: present(pin('Cross-model review', ACTIONS)), timeline: readyTimeline,
+    statuses: (t, n) => [st('Cross-model review', 'failure', 'github-actions[bot]', { id: 10, created_at: '2026-01-01T12:00:05Z' }), ...(n >= 2 ? [st('Cross-model review', 'success', 'github-actions[bot]', { id: 11, created_at: '2026-01-01T12:00:09Z' })] : [])],
+  });
+  const r = await s.run();
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(s.elapsed(), 0, 'decided in the same poll, no extra wait');
+});
+
+test('a status failure the re-read confirms is reported with the status id and created_at it rests on', async () => {
+  const s = sim({ classic: present('lint'), timeline: readyTimeline, statuses: [st('lint', 'failure', 'x', { id: 42, created_at: '2026-01-01T12:00:05Z' })] });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(s.reads.statuses, 2, 'one poll read + one confirming read');
+  assert.deepEqual(r.output.statusEvidence, [{ context: 'lint', id: 42, state: 'failure', createdAt: '2026-01-01T12:00:05Z' }]);
+  // a check-run failure needs no status re-read
+  const run = sim({ classic: present('ci'), timeline: readyTimeline, checkRuns: [cr('ci', 'failure')] });
+  const b = await run.run();
+  assert.equal(b.output.verdict, 'failed');
+  assert.equal(run.reads.statuses, 1);
+  assert.equal(b.output.statusEvidence, undefined);
+});
+
+test('a stale (draft-era) status failure at the appear deadline is confirmed by a re-read too, and a newer success wins', async () => {
+  const s = sim({
+    classic: present(pin('Cross-model review', ACTIONS)), timeline: readyTimeline,
+    // the success is posted just before the confirming read at the appear deadline (poll 21, t = 300s; read 22 is its re-read)
+    statuses: (t, n) => [st('Cross-model review', 'failure', 'github-actions[bot]', { id: 1, created_at: '2026-01-01T11:00:00Z' }), ...(n >= 22 ? [st('Cross-model review', 'success', 'github-actions[bot]', { id: 2, created_at: '2026-01-01T12:04:59Z' })] : [])],
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 300_000);
 });
 
 // ---- draft-era failures are waited on like draft-era skips ---------------------------------------

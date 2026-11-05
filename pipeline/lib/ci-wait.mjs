@@ -15,6 +15,10 @@
 // matters on EW, where the `Cross-model review` status is a draft-era FAILURE until it is re-posted after `gh pr ready`.
 // Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
 // created_at. Freshness that cannot be read counts as fresh (fail fast).
+// A needs:-gated aggregate (EW "Typecheck + Vitest") is only created when its shard jobs finish, ~8-12 min after ready, so a
+// required identity that is still absent at --appear-timeout does not end the wait while any check run or workflow run of the
+// head, created at or after the ready event, is still queued / in progress (reported as `heldBy`); only --timeout bounds that.
+// A failure read from a commit status is confirmed by one more read of the head's statuses before it is reported (#159).
 // RESIDUAL (documented, not closed): a draft-era SUCCESS is not second-guessed. A draft-era success of a name whose ready-event
 // run is not created yet (seconds after `gh pr ready`) counts as pass. The window is narrow: the skipped job of the same workflow
 // keeps the wait open until that workflow's ready run exists, and the live gate re-reads CI before any merge. Requiring a
@@ -35,6 +39,8 @@ const BAD = new Set(['failure', 'timed_out', 'action_required', 'startup_failure
 const RANK = { fail: 7, cancelled: 6, pending: 5, missing: 4, 'stale-skip': 4, 'stale-fail': 4, 'fresh-skip': 2, pass: 1 };
 const isGood = (s) => s === 'pass' || s === 'fresh-skip';
 const isBad = (s) => s === 'fail' || s === 'cancelled';
+// A workflow run / check run that has not finished (GitHub's statuses: queued, in_progress, waiting, pending, requested).
+const ACTIVE_WORKFLOW_RUN = new Set(['queued', 'in_progress', 'waiting', 'pending', 'requested']);
 const isWaiting = (s) => s === 'pending' || s === 'missing' || s === 'stale-skip' || s === 'stale-fail';
 
 const keyOf = (i) => `${i.name}\u0000${i.appId ?? ''}`;
@@ -94,6 +100,8 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   let readFailures = 0;
   let lastError = null;
   let readyAtMemo;
+  let held = null; // the ready-era run that last kept an absent required check waiting past --appear-timeout
+  let heldSignature = null;
 
   const getReadyAt = async (pr) => {
     if (readyAtMemo !== undefined) return readyAtMemo;
@@ -161,6 +169,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return (await runPredatesReady(run, pr)) ? 'stale-fail' : bad;
   };
 
+  const statusBasis = new WeakMap(); // evaluate() result -> the commit status it rests on (for the status re-read and its evidence)
   const evaluate = async (identity, obs, pr) => {
     const producers = [];
     for (const run of latestRuns(obs.checkRuns, identity.name, identity.appId)) {
@@ -173,18 +182,43 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       if (counts) {
         let state = statusState(status);
         if (state === 'fail' && (await statusPredatesReady(status, pr))) state = 'stale-fail';
-        producers.push({ state, url: status.target_url ?? null });
+        producers.push({ state, url: status.target_url ?? null, status });
       }
     }
     if (producers.length === 0) return { name: identity.name, appId: identity.appId, state: 'missing', url: null };
     const worst = producers.reduce((a, b) => (RANK[b.state] > RANK[a.state] ? b : a));
-    return { name: identity.name, appId: identity.appId, state: worst.state, url: worst.url };
+    const out = { name: identity.name, appId: identity.appId, state: worst.state, url: worst.url };
+    if (worst.status) statusBasis.set(out, worst.status);
+    return out;
   };
+
+  // The first check run or workflow run of the head that was created at or after the ready event and has not finished, else null.
+  // A check run is dated by its workflow run (else its own started_at); a run whose age cannot be read does not hold the wait.
+  const findHolder = async (obs, pr) => {
+    const readyAt = Date.parse(await getReadyAt(pr));
+    for (const run of obs.checkRuns) {
+      if (!run || run.status === 'completed') continue;
+      const created = await suiteCreated(run);
+      const at = created.length > 0 ? Math.max(...created) : Date.parse(run.started_at);
+      if (Number.isFinite(at) && at >= readyAt) return { kind: 'check-run', id: run.id ?? null, name: run.name ?? null, status: run.status ?? null, createdAt: Number.isFinite(at) ? new Date(at).toISOString().replace('.000Z', 'Z') : null, url: run.html_url ?? null };
+    }
+    if (readers.headRuns) {
+      for (const w of await readers.headRuns(pr.head)) {
+        if (!w || !ACTIVE_WORKFLOW_RUN.has(w.status)) continue;
+        const at = Date.parse(w.created_at);
+        if (Number.isFinite(at) && at >= readyAt) return { kind: 'workflow-run', id: w.id ?? null, name: w.name ?? null, status: w.status, createdAt: w.created_at, url: w.html_url ?? null };
+      }
+    }
+    return null;
+  };
+
+  const statusEvidenceOf = (failures) => failures.map((f) => statusBasis.get(f)).filter(Boolean).map((x) => ({ context: x.context, id: x.id ?? null, state: x.state, createdAt: x.created_at ?? null }));
 
   const describe = (states) => states.map((s) => `${s.name}=${s.state}`).join(', ');
 
   const result = async (exitCode, verdict, extra = {}) => {
     let readyAt = readyAtMemo ?? null;
+    if (held !== null) extra = { heldBy: held, ...extra };
     if (readyAt === null && last.pr) {
       try { readyAt = await getReadyAt(last.pr); } catch { readyAt = null; }
     }
@@ -233,10 +267,17 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     const unverified = sources.classic.kind === 'unreadable' || sources.rules.kind === 'unreadable';
     const identities = identitiesOf(sources);
 
-    const obs = { checkRuns: await readers.checkRuns(pr.head), statuses: await readers.statuses(pr.head) };
+    // Everything from the evaluation to the verdict. `confirmed` is true on the second pass, which a failure read from a commit
+    // status triggers: the head's statuses are read again first, so a failure a newer status already replaced is not reported.
+    const decide = async (obs, confirmed) => {
     const states = [];
     for (const identity of identities) states.push(await evaluate(identity, obs, pr));
     last = { ...last, identities, states };
+    const confirmStatusFailures = async (failures) => (confirmed || !failures.some((f) => statusBasis.has(f)) ? undefined : decide({ ...obs, statuses: await readers.statuses(pr.head) }, true));
+    const failedResult = (message, failures) => {
+      const statusEvidence = statusEvidenceOf(failures);
+      return result(EXIT.FAILED, 'failed', { message, failures, ...(statusEvidence.length > 0 ? { statusEvidence } : {}) });
+    };
 
     // Nothing known to wait for (both sources unreadable, or one unreadable and the other absent): report the config's list.
     const configStates = async () => {
@@ -263,12 +304,25 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     }
 
     if (bad.length > 0 && (!waitAll || waiting.length === 0)) {
-      return result(EXIT.FAILED, 'failed', { message: `failed: ${bad.map((s) => `${s.name}=${s.state}${s.url ? ` (${s.url})` : ''}`).join('; ')}`, failures: bad });
+      const rechecked = await confirmStatusFailures(bad);
+      if (rechecked !== undefined) return rechecked;
+      return failedResult(`failed: ${bad.map((s) => `${s.name}=${s.state}${s.url ? ` (${s.url})` : ''}`).join('; ')}`, bad);
     }
 
     if (waiting.length > 0) {
       const absent = waiting.filter((s) => s.state === 'missing' || s.state === 'stale-skip' || s.state === 'stale-fail');
-      if (absent.length > 0 && elapsed() >= appearTimeoutMs) {
+      // Past --appear-timeout an absent identity is final only if nothing of the ready era is still running on the head: a
+      // needs:-gated aggregate is created late by design (#159). Until --timeout the wait goes on, naming what holds it.
+      const holder = absent.length > 0 && elapsed() >= appearTimeoutMs ? await findHolder(obs, pr) : null;
+      if (holder !== null) {
+        held = holder;
+        const note = `still running past the appear window: ${holder.kind} ${holder.name ?? holder.id} (${holder.status})`;
+        if (note !== heldSignature) {
+          heldSignature = note;
+          onProgress(note);
+        }
+      }
+      if (absent.length > 0 && elapsed() >= appearTimeoutMs && holder === null) {
         const missing = absent.filter((s) => s.state === 'missing');
         const stale = absent.filter((s) => s.state === 'stale-skip');
         const staleFails = absent.filter((s) => s.state === 'stale-fail');
@@ -281,7 +335,9 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         if (staleFails.length > 0) {
           // The failure was never replaced by a ready-era result, so it stands (a draft-era skip, if any, is listed with it).
           const listed = staleFails.map((s) => `${s.name}=fail${s.url ? ` (${s.url})` : ''} (result predates ready)`).join('; ');
-          return result(EXIT.FAILED, 'failed', { message: `failed: ${listed}${skipNote ? `; ${skipNote}` : ''}`, failures: staleFails });
+          const rechecked = await confirmStatusFailures(staleFails);
+          if (rechecked !== undefined) return rechecked;
+          return failedResult(`failed: ${listed}${skipNote ? `; ${skipNote}` : ''}`, staleFails);
         }
         return result(EXIT.FAILED, 'stale-skipped', { message: `only a draft-era skipped result exists for: ${stale.map((s) => s.name).join(', ')}: their workflow did not run on the ready event: re-run it or ask the owner` });
       }
@@ -296,6 +352,8 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if ((again.base ?? null) !== base) return baseChanged(again.base);
     if (unverified) return unverifiedResult();
     return result(EXIT.OK, 'passed');
+    };
+    return decide({ checkRuns: await readers.checkRuns(pr.head), statuses: await readers.statuses(pr.head) }, false);
   };
 
   for (;;) {

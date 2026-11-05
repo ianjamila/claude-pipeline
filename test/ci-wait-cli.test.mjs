@@ -117,3 +117,18 @@ test('ci-wait: --appear-timeout, --timeout, --interval and --wait-all reach the 
   assert.equal(t, 40_000, 'polls every 10s; first poll at or past 35s ends it');
   assert.deepEqual(all.output.checks.map((c) => c.state), ['fail', 'pending']);
 });
+
+test('ci-wait: past --appear-timeout an absent check is held by an in-progress ready-era workflow run of the head (read with head_sha, paginated), and heldBy is reported', () => {
+  const fake = createFakeGh(base([
+    { match: '/check-runs', stdout: pages([run(2, 'ci', 'success')]) },
+    { match: '/statuses', stdout: '[]\n' },
+    { match: '/timeline', stdout: pages([{ event: 'ready_for_review', created_at: '2026-01-01T12:00:00Z' }]) },
+    { match: `^api repos/acme/widgets/actions/runs\\?head_sha=${HEAD}&per_page=100 --paginate --jq .workflow_runs$`, stdout: pages([{ id: 77, name: 'CI', status: 'in_progress', created_at: '2026-01-01T12:00:10Z', html_url: 'https://github.example/actions/77' }]) },
+  ]));
+  // `lint` is required but never reports; --appear-timeout 0 puts the first poll past the appear window, --timeout 1 ends the wait
+  const r = cli(['ci-wait', '--pr', '5', '--appear-timeout', '0', '--timeout', '1', '--interval', '1'], { repo: repoWith(), fake });
+  assert.equal(r.code, 1, r.stdout + r.stderr);
+  assert.equal(r.json.verdict, 'timeout');
+  assert.deepEqual(r.json.heldBy, { kind: 'workflow-run', id: 77, name: 'CI', status: 'in_progress', createdAt: '2026-01-01T12:00:10Z', url: 'https://github.example/actions/77' });
+  assert.ok(fake.lines().includes(`api repos/acme/widgets/actions/runs?head_sha=${HEAD}&per_page=100 --paginate --jq .workflow_runs`));
+});
