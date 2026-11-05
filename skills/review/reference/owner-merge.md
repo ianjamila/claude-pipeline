@@ -1,10 +1,11 @@
-# review — owner rulings, extra round and the merge hand-off
+# review — owner override, extra round and the merge hand-off
 
-Read by the `review` skill (`skills/review/SKILL.md`) at the points it names: Owner rulings and Extra round (section 2, step 6) and 3.3 (the hand-off).
+Read by the `review` skill (`skills/review/SKILL.md`) at the points it names: Owner override and Extra round (section 2, step 6) and 3.3 (the hand-off).
 
-## Owner rulings (only with `owner_approval: chat` in `P config`)
+## Owner override (rare; only with `owner_approval: chat` in `P config`)
 
-An item left `needsHuman` (failed model proof, low-confidence arbiter, a dismissed security item) is cleared only by the owner's word.
+Only for an owner who says they want to dismiss what Claude or Codex would not (an item Claude or Codex's second review made ACCEPT): never offer or ask for it. By default you decide
+(`P triage claude-ruling`, SKILL.md Rulings). This path is the only one that loosens an ACCEPT or clears an item Claude may not rule on.
 Run `P triage ruling-request --pr N --ids R1-B1,R2-S3`. Your reply says "answer with only `<id>: accept | follow-up | reject`; reasons in another
 message" and **ends with the exact `line` it printed**, nothing after it. The owner-go hook records the owner's next prompt against that line. Per
 item: `P triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason "<why>" --owner-quote "<the owner's whole answer, copied, never paraphrased>" --pr N`.
@@ -36,6 +37,8 @@ Which ending depends on the item note from 1.5 (as refreshed in step 2):
    - **Protected areas under `owner_approval: chat`** (`ownerMerge` items, nothing blocking): the owner's "merge" covers them. Run
      `P merge --pr N --dry-run --owner-go`; for a `say-merge` with `areas`, name the protected areas in plain English from its `areaIds` (never from the
      agent-writable `.review/hardstops.json`) and end the reply with the closing lines (last bullet). A dry run with blockers ⇒ fix them first; `owner-runs` ⇒ the first bullet.
+   - **Rulings** (`ownerStep.rulings` present: dismissed BLOCKING or security items, single-PR requests only; several PRs with rulings ⇒ a separate reply for each): in plain English, above the closing lines, say what was dismissed and why, naming each item;
+     then print the `Rulings <digest12>` block verbatim from the dry run, directly above `Areas` / `Hold` / `Head`. Never type or edit the block: that makes the "merge" bind nothing.
    - **A `needs-human` hold** (`ownerStep.hold` present, with or without areas): say in plain English that the owner's "merge" also lifts the needs-human hold; report it from the event, `ownerStep.holdInfo` (who added the label, when: the account is shared, so never call it the owner's or yours);
      quote `ownerStep.parkNote.text` only when `parkNote` is present, labelled `pipeline park note (agent-written)`, never as the hold's reason. Never start a prose line with `Hold <x> by`: a Hold-looking line outside the closing lines voids the request.
    - **Merge as a job.** The owner says "merge" ⇒ `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N --owner-go`, then `P job wait merge --run-id <runId> --timeout 540` until `state` is `done` (it can outlast the Bash tool's 10-minute cap; `replaced`/`lost` ⇒ dry run and `gh pr view` first). Read `exitCode` and `tail`:
@@ -45,7 +48,7 @@ Which ending depends on the item note from 1.5 (as refreshed in step 2):
    - To preview the verdict before the owner's word, use only `P merge --pr N --dry-run` (add `--owner-go` for that route): same checks, writes and merges nothing; its `ownerStep` says which ending above applies.
      Never run the repo's own merge command (`npm run merge …`, even with `--dry-run`) to preview: the git guard refuses it, and the dry run grants nothing.
    - **No such item**, and the closing lines of every request: the reply's LAST lines are exactly (sha12 = first 12 characters of `git rev-parse HEAD`; owner/name from `gh repo view --json nameWithOwner`; on `--owner-go` copy
-     them from the dry run, never type the digest: `ownerStep.areas` and `ownerStep.hold` when present, then `ownerStep.line`, then `ownerStep.ready` when present, with nothing after):
+     them from the dry run, never type the digest: `ownerStep.rulings` when present, then `ownerStep.areas` and `ownerStep.hold` when present, then `ownerStep.line`, then `ownerStep.ready` when present, with nothing after):
      `Head <sha12> · items <digest> · repo <owner/name>`
      `🔀 Ready to merge #N — say "merge"`
      The owner-go hook binds the owner's "merge" to the LAST reply: if anything else was said since, or the context was compacted, show the lines again (a blank line between them is harmless, prose is not). Never type or simulate the owner's "merge".

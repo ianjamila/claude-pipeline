@@ -21,7 +21,7 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge) |
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
-| hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge"), your answer to a ruling request and your `extra round` (a prompt that starts with `extra round` or `grant round`: one more review round past `review.max_rounds`) against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
+| hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge"), your typed ruling when you override one (a ruling request) and your `extra round` (a prompt that starts with `extra round` or `grant round`: one more review round past `review.max_rounds`) against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
 | hook `stack-register` (PreToolUse on `Bash` and the write tools `Edit\|Write\|MultiEdit\|NotebookEdit`, 30 s) | records which private Supabase stack a session is about to use, before the tool runs; **fail-closed** like the guards (an unloadable file blocks with exit 2) |
 | hook `stack-dev-bind` (PostToolUse on `Bash`, 10 s) | notes which stack a dev server you started is bound to; non-blocking |
 | hook `stack-session-end` (SessionEnd, 10 s) | when a session ends (not on `/clear`) it starts a detached worker that decides whether that session's stacks can be stopped; non-blocking |
@@ -350,10 +350,10 @@ executable.
   `~/.claude/agents/` still pin `model:` (`./install.sh --check`), that nothing passed a `model`
   override, and that the model is available on your plan (an invalid model fails with
   `model_not_found`; it never silently falls back).
-  With `owner_approval: chat` you can instead rule on the disputed items in chat: the run records it with
-  `pipeline triage owner-ruling` (it asks with a `⚖️ Owner ruling needed` line; your whole answer to it is recorded on this machine and
-  must be only the decisions, `R1-B1: accept` / `follow-up` / `reject` per item (reasons in another message); it is published in the triage comment), you still say "merge"
-  yourself, then remove `needs-human`.
+  With `owner_approval: chat` Claude now decides those items itself and records why (`pipeline triage claude-ruling`): a dismissal of a BLOCKING or security item, or any REJECT, needs a Codex
+  second review that also dismisses it at high confidence, and every such dismissal is shown to you in a Rulings block above the merge request, so your "merge" covers it. You are not asked to type a ruling.
+  If you want to dismiss something Claude or Codex would not, say so: the typed path stays as the override (`pipeline triage owner-ruling`; it asks with a `⚖️ Owner ruling needed` line, your whole answer
+  is recorded on this machine and must be only the decisions, `R1-B1: accept` / `follow-up` / `reject` per item, reasons in another message; it is published in the triage comment). Then remove `needs-human`.
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
 - **`--check` reports drift:** someone edited an installed file (or an install did not finish); run `node ~/.claude/pipeline/bin/pipeline.mjs update`, or re-run `./install.sh`.
 - **A merge didn't happen:** `P merge` prints its refusal `reasons`, which say which check failed
