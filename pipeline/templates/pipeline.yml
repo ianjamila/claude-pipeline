@@ -62,6 +62,14 @@ merge:
   # {pr} = PR number, {sha} = approved head SHA (the merge must refuse any other head).
   command: gh pr merge {pr} --squash --auto --delete-branch --match-head-commit {sha}
   wait_minutes: 15
+  # Optional merge-hold seam for a repo whose merge command keeps a cooperative merge lock (all three or none; {pr} required in each,
+  # {reason} required in the release command, {sha} not allowed). The check must be read-only and differ from the other two; its last
+  # stdout line is {"pr":N,"blockedBy":[{"number":A,"title":"...","since":"<ISO>","expires":"<ISO>"}]}. Enforcement is cooperative; add the
+  # keys only after a pipeline version that knows them is installed, remove them first to roll back. A PR whose hold expires and is renewed
+  # goes to the back of the queue: the owner's exits are merging the PR ahead, the provider's --release, or its --ignore-hold.
+  # hold_command: npm run merge-hold -- {pr}
+  # hold_release_command: npm run merge-hold -- {pr} --release --reason {reason}
+  # hold_check_command: npm run merge-hold -- --status {pr} --json
 
 # preview and production are still validated, but the final gate and `pipeline merge` no longer read them: there is no
 # deployment lookup, no preview check, no rollback target and no production watch. `pipeline smoke` reads `preview.smoke` and `production.smoke`.
