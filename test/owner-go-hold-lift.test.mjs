@@ -5,8 +5,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
@@ -16,8 +17,8 @@ import { holdBlock, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import { runShellAsync } from '../pipeline/lib/proc.mjs';
-import { findOrphanedLift, installRestoreOnSignal, mergeLockName, parseTimeline, readEligibleHold, withHoldLifted } from '../pipeline/lib/hold.mjs';
-import { inspect, release, tryAcquire } from '../pipeline/lib/locks.mjs';
+import { findOrphanedLift, installRestoreOnSignal, mergeLockName, parseTimeline, readEligibleHold, withHoldLifted, withMergeLock } from '../pipeline/lib/hold.mjs';
+import { INCOMPLETE_STALE_MS, inspect, readMachineId, release, tryAcquire } from '../pipeline/lib/locks.mjs';
 
 const fakeHold = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-hold.mjs');
 const HOLD = { id: 'LE_hold1', login: 'jamila', at: '2026-11-05T09:00:00Z' };
@@ -995,4 +996,162 @@ test('dry run, Codex 5: unreadable comments are a blocker for --owner-go (its re
   const t2 = world({ state: { ...orphaned({ state: { labels: ['needs-human'] } }), timeline: [] } });
   const g2 = cli(['merge', '--pr', String(PR), '--dry-run'], { dir: t2.repo.dir, fake: t2.fake, env: t2.env });
   assert.ok(g2.json.blockers.some((b) => b.kind === 'hold-lift-unverified'), JSON.stringify(g2.json.blockers));
+});
+
+// ---- Codex round 2, finding 1: a merge command that outlived its run (SIGKILL) keeps every later run away ------------------------
+
+const childFile = join(LOCK_DIR, `${lockName}.child.json`);
+// A live process group of its own, like the merge command's (proc.mjs spawnAsync is detached): its pid is its group id.
+const liveGroup = () => {
+  const c = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { detached: true, stdio: 'ignore' });
+  c.unref();
+  return c.pid;
+};
+const stopGroup = (pid) => { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } };
+const writeChild = (rec) => writeFileSync(childFile, typeof rec === 'string' ? rec : JSON.stringify(rec));
+
+test('merge child, Codex R2-1: a dead run left its merge command running => both routes refuse merge-in-progress and touch nothing; the dry run says so', async () => {
+  const pid = liveGroup();
+  try {
+    writeChild({ pid, pr: PR, parentPid: 1, startedAt: '2026-11-05T09:00:00Z' });
+    for (const route of ['go', 'merge']) {
+      takeLock(deadPid()); // (the dead run's lock: taken over, then released again)
+      const s = world({ state: orphaned() });
+      const r = s[route]();
+      refused(r, 'merge-in-progress', new RegExp(`still running \\(process group ${pid}`));
+      assert.equal(r.json.mergeInProgress, true);
+      assert.deepEqual(s.st().labels, [], `${route}: no label restored under a live merge command`);
+      assert.deepEqual(s.wrote(), [], `${route}: nothing written (no disarm either): ${s.wrote().join(' | ')}`);
+      assert.deepEqual(s.mergeCalls(), []);
+      assert.equal(inspect(lockName, { dir: LOCK_DIR }), null, `${route}: the taken-over lock is released again`);
+    }
+    const d = world({ state: orphaned() }).dry();
+    const kinds = d.json.blockers.map((b) => b.kind);
+    assert.ok(kinds.includes('merge-in-progress'), JSON.stringify(d.json.blockers));
+    assert.ok(!kinds.includes('hold-lift-orphan'));
+    assert.match(JSON.stringify(d.json.blockers), /still running/);
+    assert.ok(readFileSync(childFile, 'utf8').includes(String(pid)), 'the record stays while the group lives');
+  } finally {
+    stopGroup(pid);
+    rmSync(childFile, { force: true });
+  }
+});
+
+test('merge child, Codex R2-1: a record whose group is gone is dropped and recovery runs; an unreadable record refuses (both routes)', async () => {
+  writeChild({ pid: deadPid(), pr: PR, parentPid: 1, startedAt: '2026-11-05T09:00:00Z' });
+  const s = world({ state: orphaned() });
+  refused(s.go(), 'hold-recovery', /label is back on the PR/);
+  assert.equal(existsSync(childFile), false, 'the dead record is removed');
+  try {
+    for (const route of ['go', 'merge']) {
+      for (const bad of ['{not json', JSON.stringify({ pr: PR })]) {
+        writeChild(bad);
+        const w = world({ state: orphaned() });
+        refused(w[route](), 'merge-in-progress', /is unreadable/);
+        assert.deepEqual(w.wrote(), []);
+        assert.ok(w.dry().json.blockers.some((b) => b.kind === 'merge-in-progress'), `${route}: dry run`);
+      }
+    }
+  } finally {
+    rmSync(childFile, { force: true });
+  }
+});
+
+test('merge child, Codex R2-1: withMergeLock records the merge group while it runs and drops the record only once the whole group is gone', async () => {
+  const gh = { repo: () => ({ slug: 'acme/widgets' }) };
+  const env = { PIPELINE_LOCK_DIR: LOCK_DIR };
+  const refuse = (error, lines, extra) => ({ error, lines, ...extra });
+  const pid = liveGroup();
+  try {
+    const out = await withMergeLock({ gh, pr: PR, env, refuse, fn: async (track) => {
+      track.started(pid);
+      const rec = JSON.parse(readFileSync(childFile, 'utf8'));
+      assert.equal(rec.pid, pid);
+      assert.equal(rec.parentPid, process.pid);
+      track.ended(); // the group is still alive (a grandchild that outlived the shell): the record stays
+      assert.equal(existsSync(childFile), true);
+      stopGroup(pid);
+      for (let i = 0; i < 50 && existsSync(childFile); i += 1) {
+        await new Promise((r) => setTimeout(r, 20));
+        track.ended();
+      }
+      assert.equal(existsSync(childFile), false);
+      return 'done';
+    } });
+    assert.equal(out, 'done');
+  } finally {
+    stopGroup(pid);
+    rmSync(childFile, { force: true });
+  }
+  // a record left behind by a killed run: the next withMergeLock refuses before fn runs
+  const live = liveGroup();
+  try {
+    writeChild({ pid: live });
+    let ran = false;
+    const r = await withMergeLock({ gh, pr: PR, env, refuse, fn: async () => { ran = true; } });
+    assert.equal(r.error, 'merge-in-progress');
+    assert.equal(ran, false);
+  } finally {
+    stopGroup(live);
+    rmSync(childFile, { force: true });
+  }
+});
+
+test('merge child, Codex R2-1: a normal merge leaves no child record behind', async (t) => {
+  const s = world();
+  approve(t, s);
+  assertExit(s.go(), 0);
+  assert.equal(existsSync(childFile), false);
+});
+
+// ---- Codex round 2, findings 2-3: the dry run's lock look writes nothing and ages an unfinished lock like tryAcquire --------------
+
+test('merge lock, Codex R2-2: the dry run never creates the machine-id file (no PIPELINE_MACHINE_ID, a fresh home)', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'hold-home-'));
+  const other = tryAcquire(lockName, { dir: LOCK_DIR, pid: deadPid(), host: 'another-host', machineId: 'another-machine-id' });
+  assert.equal(other.acquired, true);
+  try {
+    const d = world({ state: orphaned(), env: { HOME: home, PIPELINE_MACHINE_ID: '' } }).dry();
+    assert.ok(d.json.blockers.some((b) => b.kind === 'merge-in-progress'), 'another machine\'s lock is held for the dry run too');
+    assert.equal(existsSync(join(home, '.claude', 'pipeline-state', 'machine-id')), false, 'no machine-id written');
+    assert.equal(readMachineId({ env: {}, stateDir: join(home, 'nope') }), null);
+    assert.equal(existsSync(join(home, 'nope')), false);
+  } finally {
+    release(other.lock);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('merge lock, Codex R2-3: an unfinished lock past its age limit is no blocker for the dry run (tryAcquire would take it over); a fresh one is', async () => {
+  const dir = join(LOCK_DIR, `${lockName}.lock`);
+  mkdirSync(dir);
+  try {
+    const fresh = world({ state: orphaned() }).dry().json.blockers.map((b) => b.kind);
+    assert.ok(fresh.includes('merge-in-progress'), fresh.join());
+    const old = (Date.now() - INCOMPLETE_STALE_MS - 60_000) / 1000;
+    utimesSync(dir, old, old);
+    const s = world({ state: orphaned() });
+    const aged = s.dry().json.blockers.map((b) => b.kind);
+    assert.ok(!aged.includes('merge-in-progress'), aged.join());
+    assert.ok(aged.includes('hold-lift-orphan'), 'the orphan judgement runs');
+    assert.equal(existsSync(dir), true, 'the dry run reclaims nothing');
+    refused(s.go(), 'hold-recovery', /label is back on the PR/); // the real run takes it over, as the dry run said
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- the --disable-auto false alarm: gh errors when auto-merge was never armed ---------------------------------------------------
+
+test('recovery: --disable-auto fails because auto-merge was never armed (autoMergeRequest null) => no false "may still be armed" alarm', async () => {
+  for (const run of ['go', 'merge']) {
+    const s = world({ state: orphaned(), gh: { disableAutoCode: 1, autoMergeRequest: null } });
+    const r = s[run]();
+    refused(r, 'hold-recovery', /label is back on the PR/);
+    assert.ok(!('autoMergeDisarmFailed' in r.json), `${run}: ${r.stdout}`);
+    assert.doesNotMatch(r.stdout, /may still be armed/);
+  }
+  // still armed after the failed disable => the alarm stays
+  const s = world({ state: orphaned(), gh: { disableAutoCode: 1, autoMergeRequest: { enabledAt: '2026-11-05T09:00:00Z' } } });
+  assert.equal(s.go().json.autoMergeDisarmFailed, true);
 });

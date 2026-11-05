@@ -11,11 +11,12 @@
 // append-only `hold-lift-aborted` event so recovery never mistakes a later manual removal for its own. A lift comment with no label and
 // no merge (the run was killed) is put right by recoverOrphanedLift. A signal kills the merge command's process group and disarms
 // auto-merge BEFORE the label goes back, so a merge cannot land on a PR that has the hold again.
-import { createHash } from 'node:crypto';
-import os from 'node:os';
+import { createHash, randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { holdBlock } from '../hooks/lib/owner-go.mjs';
 import { blockingLabelsOf, labelNames, validLabels } from './finalgate.mjs';
-import { inspect, isPidAlive, machineId, release, tryAcquire } from './locks.mjs';
+import { defaultLockDir, isPidAlive, peek, release, tryAcquire } from './locks.mjs';
 import { killTree } from './proc.mjs';
 import { MARKERS } from './render.mjs';
 import { parseEvent, postEvent } from './run-events.mjs';
@@ -159,33 +160,63 @@ export function installRestoreOnSignal({ restore, proc = process, exit = (code) 
   return () => handlers.forEach(([signal, handler]) => proc.removeListener(signal, handler));
 }
 
-// ---- the merge lock (Codex round 1, finding 3) --------------------------------------------------
+// ---- the merge lock (Codex round 1, finding 3; round 2, findings 1-3) -----------------------------
 // Recovery cannot tell a dead run from one that is merging right now, so every `P merge` of a PR holds a per-repo-and-PR lock (lib/locks.mjs) from before recovery to the
 // end (the wait for MERGED included) and recovery changes labels only while holding it. A lock held by a live process refuses the second run (`merge-in-progress`); one whose
 // process is dead is taken over by tryAcquire. RESIDUAL: the lock is per machine (a run on another machine is not seen); a lock of another machine is never taken over, so it
 // refuses until that run ends or the lock directory entry is removed by hand.
+// The merge command runs in its own process group (proc.mjs spawnAsync, detached), so a run killed outright (SIGKILL: no handler runs) leaves it running while the lock looks
+// stale. While it runs, its group id is kept in `<lock dir>/<lock name>.child.json`; a run that takes the lock over refuses while that group is alive (`merge-in-progress`,
+// nothing changed) and drops a record whose group is gone. A reused pid only makes a run refuse (the safe direction; remove the file by hand). RESIDUAL: a run killed in the
+// instant between the spawn and the record write leaves an unrecorded child.
 export const mergeLockName = (slug, pr) => `merge-${String(slug).replace(/\//g, '__').replace(/[^A-Za-z0-9._-]/g, '_')}-pr${Number(pr)}`;
 const lockDirOf = (env) => env?.PIPELINE_LOCK_DIR || undefined;
+const childFileOf = (env, name) => path.join(lockDirOf(env) ?? defaultLockDir(), `${name}.child.json`);
+// kill(-pgid, 0) asks about the whole group, so a grandchild that outlives the shell still counts; Windows has no groups (the spawn is not detached there).
+const groupAlive = (pid, alive = isPidAlive) => alive(process.platform === 'win32' ? pid : -pid);
 
-// The holder of a live merge lock for this PR, or null (no lock, or its process is gone). Read-only (the dry run). An unfinished lock counts as held.
-export function mergeInProgress({ gh, pr, env = {} }) {
-  const owner = inspect(mergeLockName(gh.repo().slug, pr), { dir: lockDirOf(env) });
-  if (owner === null) return null;
-  if (!owner.incomplete) {
-    const machine = machineId();
-    const local = owner.host === os.hostname() || (Boolean(machine) && owner.machineId === machine);
-    if (local && !isPidAlive(owner.pid)) return null;
+// The merge child record, read-only: { state: 'none' } | { state: 'dead' } | { state: 'live', pid, startedAt } | { state: 'unreadable', why } (counts as live: refuse).
+export function readMergeChild(file, alive = isPidAlive) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    return err?.code === 'ENOENT' ? { state: 'none' } : { state: 'unreadable', why: msg(err) };
   }
-  return owner;
+  let rec;
+  try {
+    rec = JSON.parse(text);
+  } catch {
+    return { state: 'unreadable', why: 'not JSON' };
+  }
+  if (!isObject(rec) || !Number.isInteger(rec.pid) || rec.pid <= 0) return { state: 'unreadable', why: 'no process id in it' };
+  return groupAlive(rec.pid, alive) ? { state: 'live', pid: rec.pid, startedAt: rec.startedAt ?? null } : { state: 'dead' };
 }
 
-const holderText = (owner) => (owner?.pid ? `pid ${owner.pid} on ${owner.host}, since ${owner.startedAt}` : 'an unknown holder');
+const childText = (pr, child, file) => (child.state === 'live'
+  ? `the merge command of an earlier \`P merge\` for #${pr} is still running (process group ${child.pid}, since ${child.startedAt ?? 'an unknown time'}) after that run ended: wait for it to finish, or stop it and remove ${file}`
+  : `the merge command record ${file} is unreadable (${child.why}): check no merge command for #${pr} is still running, then remove it`);
+const holderText = (owner) => (owner?.incomplete ? 'an unfinished lock' : owner?.pid ? `pid ${owner.pid} on ${owner.host}, since ${owner.startedAt}` : 'an unknown holder');
 
-// Runs fn() holding the lock; a lock held by a live process (or one that cannot be taken) refuses with `merge-in-progress` and changes nothing.
-export async function withMergeLock({ gh, pr, env = {}, refuse, fn }) {
+// Read-only (the dry run: no lock taken or reclaimed, no machine-id file created): null, or { why } when the real run would refuse `merge-in-progress`. The same judgement as
+// tryAcquire (lib/locks.mjs peek: a dead local holder or an unfinished lock past its age limit is stale), then the merge child record.
+export function mergeInProgress({ gh, pr, env = {}, alive = isPidAlive }) {
+  const name = mergeLockName(gh.repo().slug, pr);
+  const seen = peek(name, { dir: lockDirOf(env), isAlive: alive });
+  if (seen.state === 'held') return { why: `another \`P merge\` for #${pr} is running (${holderText(seen.owner)})` };
+  const file = childFileOf(env, name);
+  const child = readMergeChild(file, alive);
+  return child.state === 'live' || child.state === 'unreadable' ? { why: childText(pr, child, file) } : null;
+}
+
+// Runs fn(track) holding the lock; a lock held by a live process (or one that cannot be taken), or a live merge child of an earlier run, refuses with `merge-in-progress`
+// and changes nothing. `track.started(pid)` records the merge command's group the moment it is spawned (runShellAsync onStart); `track.ended()` drops the record once
+// that group is gone (a group member still alive keeps it, so the next run refuses).
+export async function withMergeLock({ gh, pr, env = {}, refuse, fn, alive = isPidAlive }) {
+  const name = mergeLockName(gh.repo().slug, pr);
   let got;
   try {
-    got = tryAcquire(mergeLockName(gh.repo().slug, pr), { dir: lockDirOf(env) });
+    got = tryAcquire(name, { dir: lockDirOf(env), isAlive: alive });
   } catch (err) {
     got = { acquired: false, owner: null, error: err };
   }
@@ -194,7 +225,30 @@ export async function withMergeLock({ gh, pr, env = {}, refuse, fn }) {
     return refuse('merge-in-progress', [`${why}: nothing was changed`], { mergeInProgress: true });
   }
   try {
-    return await fn();
+    const file = childFileOf(env, name);
+    const child = readMergeChild(file, alive);
+    if (child.state === 'live' || child.state === 'unreadable') return refuse('merge-in-progress', [`${childText(pr, child, file)}: nothing was changed`], { mergeInProgress: true });
+    if (child.state === 'dead') fs.rmSync(file, { force: true });
+    let recorded = null;
+    const track = {
+      started: (pid) => {
+        if (!Number.isInteger(pid) || pid <= 0) return;
+        recorded = pid;
+        const tmp = `${file}.${process.pid}-${randomUUID()}.tmp`;
+        try {
+          fs.writeFileSync(tmp, `${JSON.stringify({ pid, pr: Number(pr), parentPid: process.pid, startedAt: new Date().toISOString() })}\n`, { flag: 'wx' });
+          fs.renameSync(tmp, file);
+        } catch {
+          try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+        }
+      },
+      ended: () => {
+        if (recorded === null || groupAlive(recorded, alive)) return;
+        try { fs.rmSync(file, { force: true }); } catch { /* a dead record left behind is dropped by the next run */ }
+        recorded = null;
+      },
+    };
+    return await fn(track);
   } finally {
     try { release(got.lock); } catch { /* a lock lost meanwhile is not ours to report */ }
   }

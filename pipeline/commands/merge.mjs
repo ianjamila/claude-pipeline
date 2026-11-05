@@ -60,10 +60,10 @@ export const run = guarded(async (argv, ctx) => {
       throw new UsageError('--owner-go takes no --owner-approved-head / --owner-approved-items: it is bound to the local HEAD and the owner-go record');
     }
     // One merge per PR at a time on this machine: recovery below must never run under a live merge (lib/hold.mjs withMergeLock).
-    return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: () => ownerGoMerge({ root, config, pr, gh, ctx }) }));
+    return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: (track) => ownerGoMerge({ root, config, pr, gh, ctx, track }) }));
   }
 
-  return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: async () => {
+  return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: async (track) => {
     // 0. A lift comment with no label and no merge (an `--owner-go` run that died after removing needs-human) is put right before anything else.
     const recovered = await recoverOrphanedLift({ gh, pr, refuse, strict: false, env: ctx.env ?? process.env, disableAuto: () => disableAutoMerge({ pr, cwd: root, env: ctx.env }) });
     if (recovered !== null) return recovered;
@@ -184,7 +184,8 @@ export const run = guarded(async (argv, ctx) => {
       const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
       const command = fill(config.merge.command, { pr: String(pr), sha: gate.head }, { strict: true });
       // The project command (eaglewatch: scripts/merge-pr.mjs) spawns gh itself: give it the dir gh() would have found.
-      const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
+      const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000, onStart: track.started });
+      track.ended();
       const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
 
       // MERGED is MERGED: a merge commit GitHub cannot name yet is a warning, not a refusal (exit 1 means "nothing merged", and
@@ -272,7 +273,7 @@ const requestParts = ({ head, items, repo, areas, hold }) => ({
 });
 const requestLines = (q) => Object.values(requestParts(q)).filter(Boolean);
 
-async function ownerGoMerge({ root, config, pr, gh, ctx }) {
+async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   const head = headSha({ cwd: root });
   const repo = gh.repo().slug;
   if (gh.repo().host !== 'github.com') {
@@ -308,8 +309,9 @@ async function ownerGoMerge({ root, config, pr, gh, ctx }) {
   const mergeAndWait = async (running = {}) => {
     const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
     const command = fill(config.merge.command, { pr: String(pr), sha: head }, { strict: true });
-    const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000, onStart: (pid) => { running.pid = pid; } });
+    const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000, onStart: (pid) => { running.pid = pid; track.started(pid); } });
     running.pid = undefined; // (gone: its pid may be reused)
+    track.ended();
     const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
     const merged = (mergeSha, extra = {}) => ({
       exitCode: EXIT.OK,
@@ -390,7 +392,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   } catch (err) {
     add('merge-in-progress', `the merge lock for #${pr} could not be read (${String(err?.message ?? err).slice(0, 200)})`);
   }
-  if (busy !== null) add('merge-in-progress', `another \`P merge\` for #${pr} is running (${busy.pid ? `pid ${busy.pid} on ${busy.host}, since ${busy.startedAt}` : 'an unfinished lock'}): the real run refuses until it ends`);
+  if (busy !== null) add('merge-in-progress', `${busy.why}: the real run refuses until it ends`);
   else {
     let found = findOrphanedLift({ gh, pr });
     if (ownerGo && found.commentsUnreadable) { // (the real --owner-go run reads the comments once more after one pause)
