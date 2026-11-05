@@ -10,7 +10,7 @@ import { fill } from '../lib/config.mjs';
 import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
-import { envWithGhDir, runShellAsync } from '../lib/proc.mjs';
+import { envWithGhDir, killTree, runShellAsync } from '../lib/proc.mjs';
 import { postEvent } from '../lib/run-events.mjs';
 import { proofLine } from '../lib/run-record.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
@@ -20,7 +20,7 @@ import { loadState } from '../lib/state.mjs';
 import { approvalConfigDirHint, approvalGap, areasBlock, holdBlock, readyLine } from '../hooks/lib/owner-go.mjs';
 import { findOrphanedLift, parkNoteOf, readEligibleHold, recoverOrphanedLift, withHoldLifted } from '../lib/hold.mjs';
 import {
-  GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, preMergeProblems, readReviewJson,
+  GATE_FILE, PR_FIELDS, abandonMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, preMergeProblems, readReviewJson,
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
 import { tailLines } from '../lib/cmd-io.mjs';
@@ -64,7 +64,7 @@ export const run = guarded(async (argv, ctx) => {
 
   return guardGh(async () => {
     // 0. A lift comment with no label and no merge (an `--owner-go` run that died after removing needs-human) is put right before anything else.
-    const recovered = recoverOrphanedLift({ gh, pr, refuse, strict: false });
+    const recovered = await recoverOrphanedLift({ gh, pr, refuse, strict: false, env: ctx.env ?? process.env });
     if (recovered !== null) return recovered;
     // 1. The gate file must name this head and this patch, in this repo, and be fresh. It is only a binding: it proves nothing by itself.
     const gate = readReviewJson(root, GATE_FILE);
@@ -279,7 +279,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx }) {
     return refuse('owner-go', [reason], { reason, head });
   }
   // Rev 4 item 4: an earlier run that lifted the hold and died is put right (label back, this run refused) before anything else.
-  const recovered = recoverOrphanedLift({ gh, pr, refuse });
+  const recovered = await recoverOrphanedLift({ gh, pr, refuse, env: ctx.env ?? process.env });
   if (recovered !== null) return recovered;
   // The needs-human hold the owner's "merge" may lift (lib/hold.mjs; none = today's flow, the label stays a blocker). Only the labels check and the
   // look BEFORE the lift ignore it (Rev-4 8).
@@ -303,10 +303,12 @@ async function ownerGoMerge({ root, config, pr, gh, ctx }) {
   const late = await preMergeProblems({ gh, pr, head, base: live.baseRefOid, exemptHold: hold !== null });
   if (late.length > 0) return refuse('pre-merge', late, { head });
 
-  const mergeAndWait = async () => {
+  // `running.pid` (hold lift only) is the merge command's process id while it runs: a signal kills that group and disarms auto-merge before the label goes back.
+  const mergeAndWait = async (running = {}) => {
     const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
     const command = fill(config.merge.command, { pr: String(pr), sha: head }, { strict: true });
-    const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
+    const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000, onStart: (pid) => { running.pid = pid; } });
+    running.pid = undefined; // (gone: its pid may be reused)
     const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
     const merged = (mergeSha, extra = {}) => ({
       exitCode: EXIT.OK,
@@ -334,6 +336,8 @@ async function ownerGoMerge({ root, config, pr, gh, ctx }) {
     gh, pr, hold, head, items: live.ownerItems, repo, env: ctx.env ?? process.env, refuse,
     check: () => preMergeProblems({ gh, pr, head, base: live.baseRefOid }),
     merge: mergeAndWait,
+    kill: killTree,
+    disableAuto: () => disableAutoMerge({ pr, cwd: root, env: ctx.env }),
   });
 }
 

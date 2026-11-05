@@ -7,16 +7,23 @@
 // withHoldLifted is the real run's lift, in order: re-read the timeline (the bound hold must still be the newest), post the append-only
 // lift comment, install signal handlers, DELETE the label, read the timeline again (it must show the delete's own `unlabeled` event and no
 // newer hold), the plain blocker check, then the merge. Whenever nothing merged, the label is put back (a new hold: the owner says
-// "merge" again). A lift comment with no label and no merge (the run was killed) is put right by recoverOrphanedLift.
+// "merge" again) unless the PR is MERGED or someone else removed it; a run that exits WITHOUT its delete having taken effect posts an
+// append-only `hold-lift-aborted` event so recovery never mistakes a later manual removal for its own. A lift comment with no label and
+// no merge (the run was killed) is put right by recoverOrphanedLift. A signal kills the merge command's process group and disarms
+// auto-merge BEFORE the label goes back, so a merge cannot land on a PR that has the hold again.
 import { createHash } from 'node:crypto';
 import { holdBlock } from '../hooks/lib/owner-go.mjs';
 import { blockingLabelsOf, labelNames, validLabels } from './finalgate.mjs';
+import { killTree } from './proc.mjs';
 import { MARKERS } from './render.mjs';
 import { parseEvent, postEvent } from './run-events.mjs';
 
 export const HOLD_LABEL = 'needs-human';
 export const PARK_NOTE_LABEL = 'pipeline park note (agent-written)';
 export const RESTORE_NOTE = 'a restore creates a new hold: the owner must say "merge" again';
+// The delete follows the lift comment within seconds: an `unlabeled` event further out than this was somebody's manual removal, not ours.
+export const LIFT_WINDOW_MS = 15 * 60_000;
+const PR_VIEW = ['state', 'headRefOid', 'labels'];
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isHold = (name) => typeof name === 'string' && name.toLowerCase() === HOLD_LABEL;
@@ -107,7 +114,9 @@ export function parkNoteOf({ gh, pr, hold }) {
     const updated = Date.parse(note.updated_at);
     const at = Date.parse(hold.at);
     if (!Number.isFinite(updated) || !Number.isFinite(at) || updated < at) return null;
-    return { label: PARK_NOTE_LABEL, updatedAt: note.updated_at, text: note.body.slice(MARKERS.needsHuman.length).trim().slice(0, 1500) };
+    // One line, prefixed: whatever the agent wrote, no quoted line can start with Hold / Head / Areas / 🔀 and pass for part of the request.
+    const oneLine = note.body.slice(MARKERS.needsHuman.length).replace(/\s+/g, ' ').trim().slice(0, 1500);
+    return { label: PARK_NOTE_LABEL, updatedAt: note.updated_at, text: `quoted note: ${oneLine}` };
   } catch {
     return null;
   }
@@ -149,31 +158,45 @@ export function installRestoreOnSignal({ restore, proc = process, exit = (code) 
 // ---- recovery (rev 4 item 4) --------------------------------------------------------------------
 
 // A lift comment (ours, append-only) for the newest hold that is newer than that hold, with the PR open and the label gone: a run that lifted the hold died before
-// it finished. { orphan: {hold} | null, unverified: why | null }. Reads comments first; the timeline and the PR only when a lift comment exists.
-export function findOrphanedLift({ gh, pr }) {
+// it finished. { orphan: {hold} | null, unverified: why | null, commentsUnreadable?: true }. Reads comments first (or takes the list the caller read); the timeline and
+// the PR only when a lift comment of ours exists. Fails closed: once a lift comment of ours is there, a timeline or PR that cannot be trusted is `unverified`, never "nothing".
+// The lift counts only when (a) no abort event of ours for that hold follows it, and (b) the first `unlabeled` event after the hold came within LIFT_WINDOW_MS of it
+// (a later one is somebody's manual removal).
+export function findOrphanedLift({ gh, pr, comments: given }) {
   const nothing = { orphan: null, unverified: null };
-  const unverified = (why) => ({ orphan: null, unverified: why });
-  let comments;
-  try {
-    comments = gh.listComments(pr);
-  } catch (err) {
-    return unverified(`the PR comments could not be read (${msg(err)})`);
+  const unverified = (why, extra = {}) => ({ orphan: null, unverified: why, ...extra });
+  let comments = given;
+  if (comments === undefined) {
+    try {
+      comments = gh.listComments(pr);
+    } catch (err) {
+      return unverified(`the PR comments could not be read (${msg(err)})`, { commentsUnreadable: true });
+    }
   }
-  const lifts = comments.map((c) => ({ c, ev: parseEvent(c.body) })).filter(({ ev }) => ev?.kind === 'hold-lifted' && ev.dataStatus === 'ok' && typeof ev.data?.hold === 'string');
+  const events = comments.map((c, index) => ({ c, index, ev: parseEvent(c.body) })).filter(({ ev }) => ev?.dataStatus === 'ok' && typeof ev.data?.hold === 'string');
+  const lifts = events.filter(({ ev }) => ev.kind === 'hold-lifted');
   if (lifts.length === 0) return nothing;
   try {
     const me = gh.viewer();
-    const mine = lifts.filter(({ c }) => c.user?.login === me);
-    if (mine.length === 0) return nothing;
+    const mine = (kind) => events.filter(({ c, ev }) => ev.kind === kind && c.user?.login === me);
+    const ourLifts = mine('hold-lifted');
+    if (ourLifts.length === 0) return nothing;
     const read = readTimeline(gh, pr);
     if (!read.ok) return unverified(read.why);
     const newest = newestHold(read.events);
-    if (newest === null) return nothing;
-    const lifted = mine.find(({ c, ev }) => ev.data.hold === newest.id && typeof c.created_at === 'string' && c.created_at >= newest.at);
+    if (newest === null) return unverified('the timeline names no newest needs-human hold event, so the lift comment cannot be placed');
+    const lifted = ourLifts.filter(({ c, ev }) => ev.data.hold === newest.id && typeof c.created_at === 'string' && c.created_at >= newest.at).at(-1);
     if (!lifted) return nothing;
-    const view = gh.prView(pr, ['state', 'headRefOid', 'labels']);
+    if (mine('hold-lift-aborted').some(({ index, ev }) => ev.data.hold === newest.id && index > lifted.index)) return nothing;
+    const view = gh.prView(pr, PR_VIEW);
     if (!validLabels(view?.labels)) return unverified('the PR labels could not be read');
     if (view.state !== 'OPEN' || labelNames(view.labels).some(isHold)) return nothing;
+    const bound = read.events.find((e) => e.kind === 'labeled' && isHold(e.label) && e.id === newest.id);
+    const removal = holdEvents(read.events).find((e) => e.kind === 'unlabeled' && e.index > bound.index);
+    if (!removal) return unverified('the timeline does not show who removed the label');
+    const gap = Date.parse(removal.at) - Date.parse(lifted.c.created_at);
+    if (!Number.isFinite(gap)) return unverified('the lift comment has no usable time');
+    if (gap < 0 || gap > LIFT_WINDOW_MS) return nothing; // a manual removal, not our delete
     return { orphan: { hold: newest.id }, unverified: null };
   } catch (err) {
     return unverified(`the lift could not be checked (${msg(err)})`);
@@ -191,10 +214,27 @@ export function restoreLabel(gh, pr) {
 }
 
 // The real-run recovery: null (nothing to recover) or the refusal to return. `refuse` is the command's own.
-// `strict` (--owner-go): a PR whose comments or timeline cannot be read refuses; the gated route (strict false) goes on, its run-record guard fails closed by itself.
-export function recoverOrphanedLift({ gh, pr, refuse, strict = true }) {
-  const { orphan, unverified } = findOrphanedLift({ gh, pr });
-  if (unverified !== null && !strict) return null;
+// The comments are read twice at most (strict only; one pause, shortened by PIPELINE_HOLD_RETRY_MS). `strict` (--owner-go): comments that stay unreadable refuse (an
+// interrupted lift cannot be ruled out). The gated route (strict false) tolerates ONLY a failed comments read (its run-record guard reads the same comments and fails closed by
+// itself); a lift comment present with a timeline / PR that cannot be verified refuses in BOTH routes.
+export async function recoverOrphanedLift({ gh, pr, refuse, strict = true, env = {}, sleep = defaultSleep }) {
+  let comments;
+  let readFailure = null;
+  for (let attempt = 0; attempt < (strict ? 2 : 1); attempt += 1) {
+    if (attempt > 0) await sleep(holdTiming(env).pauseMs);
+    try {
+      comments = gh.listComments(pr);
+      readFailure = null;
+      break;
+    } catch (err) {
+      readFailure = msg(err);
+    }
+  }
+  if (readFailure !== null) {
+    if (!strict) return null;
+    return refuse('hold-recovery', [`#${pr}: PR comments unreadable, so an interrupted hold lift cannot be ruled out: run again (${readFailure}). Nothing was merged`]);
+  }
+  const { orphan, unverified } = findOrphanedLift({ gh, pr, comments });
   if (unverified !== null) return refuse('hold-recovery', [`#${pr}: could not check whether an earlier --owner-go run left a needs-human hold lifted (${unverified}): nothing was merged`]);
   if (orphan === null) return null;
   const failed = restoreLabel(gh, pr);
@@ -219,7 +259,21 @@ function judgeAfterDelete(events, hold) {
 
 // `check()` returns the problems that stop a merge once the hold is lifted (the plain rule); `merge()` returns the command's { exitCode, output };
 // `refuse(error, reasons, extra)` is the command's own refusal. Returns the { exitCode, output } to give back.
-export async function withHoldLifted({ gh, pr, hold, head, items, repo, env = {}, sleep = defaultSleep, proc = process, exit, refuse, check, merge }) {
+// `merge(running)` gets `{ pid }` to fill with the merge command's process id (runShellAsync onStart) so a signal can kill that group; `kill(pid)` and
+// `disableAuto()` (the synchronous disableAutoMerge) are what the signal handler runs, in that order, BEFORE the label goes back.
+const liftId = (pr, hold) => `pr${pr}-${createHash('sha256').update(hold.id).digest('hex').slice(0, 16)}`;
+
+// Best effort: tell recovery this run's lift did not take effect (or was not ours to undo), so a later manual removal is never "recovered".
+function postAbort(gh, pr, hold, why) {
+  try {
+    postEvent(gh, pr, 'hold-lift-aborted', liftId(pr, hold), `hold ${hold.id} lift aborted: ${why}`, { pr, hold: hold.id, why });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function withHoldLifted({ gh, pr, hold, head, items, repo, env = {}, sleep = defaultSleep, proc = process, exit, refuse, check, merge, kill = killTree, disableAuto = () => {} }) {
   const base = { head };
   // 2. Still the bound hold, still applied: nothing has changed yet, so a mismatch just refuses.
   const again = readTimeline(gh, pr);
@@ -238,30 +292,47 @@ export async function withHoldLifted({ gh, pr, hold, head, items, repo, env = {}
   }
   // 3. The append-only evidence comes first: if the run dies after the delete, it says which hold was lifted and for what.
   try {
-    postEvent(gh, pr, 'hold-lifted', `pr${pr}-${createHash('sha256').update(hold.id).digest('hex').slice(0, 16)}`,
+    postEvent(gh, pr, 'hold-lifted', liftId(pr, hold),
       `hold ${hold.id} lifted on the owner's merge for head ${head.slice(0, 12)} items ${items}`, { repo, pr, head, items, hold: hold.id, login: hold.login, at: hold.at });
   } catch (err) {
+    // (a POST that timed out may still have stored the comment: say it was not acted on)
+    postAbort(gh, pr, hold, 'the lift comment could not be confirmed and the label was not touched');
     return refuse('hold', [`could not post the lift comment on #${pr} (${msg(err)}): the hold was not lifted`], base);
   }
 
-  // From here the label may be gone: every way out that did not merge puts it back.
+  // From here the label may be gone: every way out that did not merge puts it back (unless the PR is MERGED, or someone else removed it).
   const restoreSync = () => {
     try {
-      if (gh.prView(pr, ['state'])?.state === 'MERGED') return;
+      if (gh.prView(pr, PR_VIEW)?.state === 'MERGED') return;
     } catch { /* unreadable: put it back */ }
     gh.addLabels(pr, [HOLD_LABEL]);
   };
-  const removeSignals = installRestoreOnSignal({ restore: restoreSync, proc, ...(exit ? { exit } : {}) });
+  // A signal: the merge command (and auto-merge) must be stopped BEFORE the label returns, else the PR could merge seconds later with the hold on.
+  const running = { pid: undefined };
+  const stopAndRestore = () => {
+    try { kill(running.pid); } catch { /* the process is gone */ }
+    try { disableAuto(); } catch { /* expected when auto-merge was never enabled */ }
+    restoreSync();
+  };
+  const removeSignals = installRestoreOnSignal({ restore: stopAndRestore, proc, ...(exit ? { exit } : {}) });
   let result;
-  let thrown = null;
+  let thrown;
+  let threw = false;
+  let removedByOther = false;
   try {
-    // 4. DELETE; a failure may still have deleted (a timeout), so it is handled like every other exit below.
+    // 4. DELETE; a failure may still have deleted (a timeout), so it is handled like every other exit below. A 404 is the exception: the label was not there
+    // to delete, i.e. someone else removed it between the look and the delete; that is theirs to keep.
     let deleted = true;
     try {
       gh.deleteLabel(pr, HOLD_LABEL);
     } catch (err) {
       deleted = false;
-      result = refuse('hold', [`could not remove needs-human from #${pr} (${msg(err)}); the hold was not lifted`], base);
+      if (/\bHTTP 404\b/.test(msg(err))) {
+        removedByOther = true;
+        result = refuse('hold', [`the needs-human label was removed by someone else before this run's delete (${msg(err)}): it was not put back and nothing was merged`], { ...base, holdRemovedByOther: true });
+      } else {
+        result = refuse('hold', [`could not remove needs-human from #${pr} (${msg(err)}); the hold was not lifted`], base);
+      }
     }
     if (deleted) {
       // 5. The proof the read is current: this delete's own `unlabeled` event after the bound hold, and no newer hold.
@@ -278,36 +349,81 @@ export async function withHoldLifted({ gh, pr, hold, head, items, repo, env = {}
       } else {
         // 6. The plain blocker rule from here (a needs-human re-added now is a blocker), then the merge.
         const problems = await check();
-        result = problems.length > 0 ? refuse('pre-merge', problems, base) : await merge();
+        result = problems.length > 0 ? refuse('pre-merge', problems, base) : await merge(running);
       }
     }
   } catch (err) {
     thrown = err;
+    threw = true;
   }
-  if (result?.output?.merged === true) {
+  if (result?.output?.merged === true && !threw) {
     removeSignals();
     result.output.holdLifted = hold.id;
     return result;
   }
-  // Nothing merged (command failure, timeout, closed, blocked, a refusal, an exception): the hold comes back, after abandonMerge (merge() did that).
-  let failed = null;
-  try {
-    gh.addLabels(pr, [HOLD_LABEL]);
-  } catch (err) {
-    failed = msg(err);
+  // Someone else removed the label: not ours to put back. The abort event keeps recovery from reading their removal as this run's.
+  if (removedByOther && !threw) {
+    postAbort(gh, pr, hold, 'the label was removed by someone else before the delete');
+    removeSignals();
+    return result;
   }
+  // Nothing merged (command failure, timeout, closed, blocked, a refusal, an exception): the hold comes back, after abandonMerge (merge() did that).
+  const back = await putBack({ gh, pr, hold, env, sleep });
+  if (back.status === 'kept' || back.status === 'unverified') postAbort(gh, pr, hold, back.status === 'kept' ? 'the label never left' : 'the label is on the PR but a new hold could not be confirmed');
   removeSignals();
-  if (failed !== null) {
-    return refuse('hold-restore', [`COULD NOT put needs-human back on PR #${pr} (${failed}): the owner's merge lifted hold ${hold.id} and the PR did not merge. Add the label by hand${thrown ? `; the run failed with: ${msg(thrown)}` : ''}`],
+  if (back.status === 'merged') {
+    // The PR is MERGED after all (the command reported failure, or the wait ended first): the label stays off.
+    return { exitCode: 0, output: { ok: true, merged: true, mergeSha: null, ...base, holdLifted: hold.id, warning: 'the PR is MERGED, seen after the merge attempt reported otherwise: resolve the merge SHA before anything depends on it' } };
+  }
+  if (back.status === 'failed') {
+    return refuse('hold-restore', [`COULD NOT put needs-human back on PR #${pr} (${back.why}): the owner's merge lifted hold ${hold.id} and the PR did not merge. Add the label by hand${threw ? `; the run failed with: ${msg(thrown)}` : ''}`],
       { ...base, holdRestored: false, holdRestoreFailed: true });
   }
-  if (thrown) {
-    if (thrown instanceof Error) {
-      thrown.message = `${thrown.message} (needs-human was put back on #${pr}; ${RESTORE_NOTE})`;
-      thrown.holdRestored = true;
-    }
-    throw thrown;
+  const extra = {
+    restored: { holdRestored: true, holdRestoredNote: RESTORE_NOTE },
+    kept: { holdKept: true, holdKeptNote: 'the label never left the PR: the hold the owner approved is still the newest one' },
+    unverified: { holdRestored: false, holdRestoreUnverified: true, holdRestoreNote: `needs-human is on the PR but whether it is a new hold could not be read (${back.why}): ask the owner to say "merge" again` },
+  }[back.status];
+  if (threw) {
+    const error = thrown instanceof Error ? thrown : new Error(String(thrown));
+    error.message = `${error.message} (${back.status === 'restored' ? `needs-human was put back on #${pr}; ${RESTORE_NOTE}` : `needs-human is on #${pr}; ${extra.holdKeptNote ?? extra.holdRestoreNote}`})`;
+    Object.assign(error, extra);
+    throw error;
   }
-  result.output = { ...result.output, holdRestored: true, holdRestoredNote: RESTORE_NOTE };
+  result.output = { ...result.output, ...extra };
   return result;
+}
+
+// The label goes back (read first: a label that is already on is not re-added) and the answer is what the timeline then shows:
+// 'restored' = a NEW labeled needs-human event exists (only then is it "a new hold"), 'kept' = the old hold is still the newest (the label never left),
+// 'unverified' = the label is on but the timeline could not be read, 'merged' = the PR is MERGED (nothing is put back), 'failed' = the label could not be added.
+async function putBack({ gh, pr, hold, env, sleep }) {
+  let view = null;
+  try {
+    view = gh.prView(pr, PR_VIEW);
+  } catch { /* unreadable: put it back */ }
+  if (view?.state === 'MERGED') return { status: 'merged' };
+  let on = null;
+  if (view && validLabels(view.labels)) on = labelNames(view.labels).some(isHold);
+  if (on !== true) {
+    try {
+      gh.addLabels(pr, [HOLD_LABEL]);
+    } catch (err) {
+      return { status: 'failed', why: msg(err) };
+    }
+  }
+  const timing = holdTiming(env);
+  let seen = { status: 'unverified', why: 'the timeline was not read' };
+  for (let attempt = 0; attempt <= (on !== true ? timing.retries : 0); attempt += 1) {
+    if (attempt > 0) await sleep(timing.pauseMs);
+    const read = readTimeline(gh, pr);
+    if (!read.ok) {
+      seen = { status: 'unverified', why: read.why };
+      continue;
+    }
+    const newest = newestHold(read.events);
+    if (newest !== null && newest.id !== hold.id && appliedPer(read.events)) return { status: 'restored' };
+    seen = newest !== null && newest.id === hold.id ? { status: 'kept' } : { status: 'unverified', why: 'the timeline names no newest needs-human hold event' };
+  }
+  return seen;
 }

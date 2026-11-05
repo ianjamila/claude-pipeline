@@ -14,6 +14,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { holdBlock, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { renderEvent } from '../pipeline/lib/run-events.mjs';
+import { runShellAsync } from '../pipeline/lib/proc.mjs';
 import { findOrphanedLift, installRestoreOnSignal, parseTimeline, readEligibleHold, withHoldLifted } from '../pipeline/lib/hold.mjs';
 
 const fakeHold = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-hold.mjs');
@@ -54,11 +55,11 @@ const READD = /^pr edit 12 --add-label needs-human$/;
 
 // The reply the owner answers, exactly as the dry run prints its parts (nothing retyped).
 const replyOf = (step) => ['Protected areas and the hold are listed above.', step.areas, step.hold, step.line, step.ready ?? readyLine([PR])].filter(Boolean).join('\n');
-const approve = (t, s) => {
+const approve = (t, s, entry, after) => {
   const d = s.dry();
   assertExit(d, 0, `${d.stderr}${d.stdout}`);
-  ownerSays(t, 'merge', replyOf(d.json.ownerStep));
-  s.patch((st) => { st.timelineReads = 0; }); // (the numbered timeline overrides count the real run's reads, not the dry run's)
+  ownerSays(t, 'merge', replyOf(d.json.ownerStep), entry, after);
+  s.patch((st) => { st.timelineReads = 0; st.commentReads = 0; }); // (the numbered timeline overrides and the comment-read failures count the real run's reads, not the dry run's)
   return d.json.ownerStep;
 };
 const refused = (r, error, pattern) => {
@@ -71,11 +72,23 @@ const untouched = (s) => {
   assert.deepEqual(s.wrote(), [], `nothing may be written: ${s.wrote().join(' | ')}`);
   assert.deepEqual(s.st().labels, ['needs-human']);
 };
+// "A new hold" is claimed only when the timeline shows a new labeled event (a new node id after the bound hold).
+const newHolds = (s) => s.st().timeline.filter((e) => e.event === 'labeled' && e.label.name === 'needs-human' && e.node_id !== HOLD.id);
 const restored = (s, r) => {
   assert.equal(r.json.holdRestored, true, r.stdout);
   assert.match(JSON.stringify(r.json), /a restore creates a new hold: the owner must say \\"merge\\" again/);
   assert.ok(s.st().labels.includes('needs-human'), 'the label is back');
   assert.ok(s.idx(DELETE) >= 0 && s.lines().slice(s.idx(DELETE)).some((l) => READD.test(l)), 'the re-add comes after the delete');
+  assert.ok(newHolds(s).length > 0, 'a new labeled event exists: it really is a new hold');
+};
+// The label never left: the old hold is still the newest, no "new hold" is claimed, and an abort event keeps recovery from re-adding it later.
+const kept = (s, r) => {
+  assert.equal(r.json.holdKept, true, r.stdout);
+  assert.ok(!('holdRestored' in r.json) || r.json.holdRestored === false, 'no new hold claimed');
+  assert.doesNotMatch(JSON.stringify(r.json), /new hold/);
+  assert.deepEqual(s.st().labels, ['needs-human']);
+  assert.equal(newHolds(s).length, 0);
+  assert.ok(s.st().comments.some((c) => /claude-pipeline:event:hold-lift-aborted:/.test(c.body)), 'the abort event is posted');
 };
 
 // ---- dry run ------------------------------------------------------------------------------------------------------------
@@ -260,17 +273,28 @@ test('real run: the post-delete timeline never shows the delete\'s own unlabeled
   const r = s.go();
   refused(r, 'hold', /does not show the removal of the label/);
   restored(s, r);
-  assert.equal(s.st().timelineReads, 1 + 1 + 4, 'eligibility, step 2, then the post-delete read and 3 retries');
+  assert.equal(s.st().timelineReads, 1 + 1 + 4 + 1, 'eligibility, step 2, the post-delete read and 3 retries, then the restore check');
   assert.deepEqual(s.mergeCalls(), []);
 });
 
 test('real run: the post-delete timeline is unreadable => put back and refused', async (t) => {
-  const s = world({ state: { fail: { timelineFrom: 3 } } });
+  const s = world({ state: { fail: { timelineFrom: 3, timelineTo: 6 } } }); // (the restore check, the 7th read, works)
   approve(t, s);
   const r = s.go();
   refused(r, 'hold', /could not be read/);
   restored(s, r);
   assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('real run: the timeline stays unreadable after the re-add => the label is back but NO new hold is claimed (holdRestoreUnverified), an abort is posted', async (t) => {
+  const s = world({ state: { fail: { timelineFrom: 3 } } });
+  approve(t, s);
+  const r = s.go();
+  refused(r, 'hold', /could not be read/);
+  assert.equal(r.json.holdRestored, false);
+  assert.equal(r.json.holdRestoreUnverified, true);
+  assert.ok(s.st().labels.includes('needs-human'));
+  assert.ok(s.st().comments.some((c) => /event:hold-lift-aborted:/.test(c.body)));
 });
 
 test('real run: a stale post-delete read that catches up within the retries still merges', async (t) => {
@@ -287,8 +311,8 @@ test('real run: the delete itself fails => refused, the label is (still) on the 
   approve(t, s);
   const r = s.go();
   refused(r, 'hold', /could not remove needs-human/);
-  assert.equal(r.json.holdRestored, true);
-  assert.deepEqual(s.st().labels, ['needs-human']);
+  kept(s, r);
+  assert.ok(!s.lines().some((l) => READD.test(l)), 'the label never left: no re-add');
   assert.deepEqual(s.mergeCalls(), []);
 });
 
@@ -325,13 +349,14 @@ test('real run, Rev-4 8: a needs-human put back during the wait ends it as block
 });
 
 test('real run, Rev-4 8: the look after the delete has no exemption either (a needs-human back on the PR refuses before the merge command)', async (t) => {
-  const hooks = [{ match: 'api -X DELETE', phase: 'after', addLabels: ['needs-human'] }];
+  const hooks = [{ match: 'api -X DELETE', phase: 'after', addLabels: ['needs-human'] }]; // (no labeled event: only the plain blocker look can see it)
   const s = world({ state: { hooks } });
   approve(t, s);
   const r = s.go();
   refused(r, 'pre-merge', /blocking label\(s\): needs-human/);
   assert.deepEqual(s.mergeCalls(), []);
-  assert.equal(r.json.holdRestored, true);
+  assert.equal(r.json.holdKept, true, 'the old hold is still the newest: no new hold is claimed');
+  assert.ok(!('holdRestored' in r.json));
 });
 
 test('real run: abandonMerge finds the PR MERGED after all => the label is not put back', async (t) => {
@@ -406,7 +431,7 @@ function memGh({ labels = ['needs-human'], timeline = [HOLD_EVENT], comments = [
   return Object.assign(m, {
     timelineOf: () => m.timeline,
     prView: (pr, fields) => { m.calls.push(`prView ${fields.join(',')}`); return { state: m.prState, headRefOid: 'h', labels: m.labels.map((name) => ({ name })) }; },
-    addLabels: (pr, names) => { m.calls.push(`add ${names}`); if (failAdd) throw new Error('boom 502'); for (const n of names) if (!m.labels.includes(n)) m.labels.push(n); },
+    addLabels: (pr, names) => { m.calls.push(`add ${names}`); if (failAdd) throw new Error('boom 502'); for (const n of names) if (!m.labels.includes(n)) { m.labels.push(n); m.timeline.push(ev('labeled', n, `LE_re${m.timeline.length}`, 'me', '2026-11-05T10:30:00Z')); } },
     deleteLabel: (pr, name) => { m.calls.push(`delete ${name}`); m.labels = m.labels.filter((l) => l !== name); m.timeline.push(ev('unlabeled', name, 'UE_own', 'me', '2026-11-05T10:00:00Z')); },
     createComment: (pr, body) => { m.calls.push('comment'); m.comments.push({ body, user: { login: 'me' } }); return { id: 1 }; },
     listComments: () => m.comments,
@@ -495,4 +520,246 @@ test('findOrphanedLift: a comment that is not ours, malformed or without data fi
   const broken = Object.assign(memGh({ ...gone, comments: [lift()] }), { timelineOf: () => { throw new Error('502'); } });
   assert.match(findOrphanedLift({ gh: broken, pr: PR }).unverified, /timeline could not be read/);
   assert.match(findOrphanedLift({ gh: Object.assign(memGh(), { listComments: () => { throw new Error('502'); } }), pr: PR }).unverified, /comments could not be read/);
+});
+
+// ---- fix round: abort events and the lift window (item 1) ----------------------------------------------------------------
+
+const abortOf = (hold = HOLD.id) => ({ id: 11, body: renderEvent('hold-lift-aborted', 'pr12-x', 'hold lift aborted', { hold }), user: { login: 'me' }, created_at: '2026-11-05T09:35:00Z', updated_at: '2026-11-05T09:35:00Z' });
+
+test('recovery, item 1: a run whose delete failed posts an abort; the owner removing the label by hand later is NOT recovered (both routes, dry run too)', async (t) => {
+  const s = world({ state: { fail: { delete: true } } });
+  approve(t, s);
+  kept(s, s.go());
+  // later, by hand: the label goes, at a time far from the lift comment
+  s.patch((st) => { st.fail = {}; st.labels = []; st.timeline.push(ev('unlabeled', 'needs-human', 'UE_manual', 'jamila', '2026-11-05T13:00:00Z')); });
+  const before = s.lines().length;
+  const go = s.go();
+  assert.notEqual(go.json.error, 'hold-recovery', go.stdout);
+  assert.equal(s.merge().json.error, 'gate', 'the gated route is not recovered either');
+  assert.ok(!s.dry().json.blockers.some((b) => b.kind === 'hold-lift-orphan'), 'nor reported by the dry run');
+  assert.ok(!s.lines().slice(before).some((l) => READD.test(l)), 'the label is not re-added');
+  assert.deepEqual(s.st().labels, []);
+});
+
+test('recovery, item 1: a lift comment followed by an abort for the same hold is ignored; an abort for another hold, or from before the lift, is not', () => {
+  const lift = { id: 9, body: renderEvent('hold-lifted', 'pr12-x', 's', { hold: HOLD.id }), user: { login: 'me' }, created_at: '2026-11-05T09:30:00Z' };
+  const gone = { labels: [], timeline: [HOLD_EVENT, ev('unlabeled', 'needs-human', 'UE', 'me', '2026-11-05T09:31:00Z')] };
+  const found = (comments) => findOrphanedLift({ gh: memGh({ ...gone, comments }), pr: PR });
+  assert.deepEqual(found([lift]).orphan, { hold: HOLD.id });
+  assert.equal(found([lift, abortOf()]).orphan, null, 'lift then abort');
+  assert.deepEqual(found([abortOf(), lift]).orphan, { hold: HOLD.id }, 'an abort from before the lift says nothing about it');
+  assert.deepEqual(found([lift, abortOf('LE_other')]).orphan, { hold: HOLD.id });
+  assert.deepEqual(found([lift, abortOf(), lift]).orphan, { hold: HOLD.id }, 'a newer lift after the abort counts again');
+  assert.deepEqual(found([lift, { ...abortOf(), user: { login: 'stranger' } }]).orphan, { hold: HOLD.id }, 'only our own abort counts');
+});
+
+test('recovery, item 1: the label must have gone within 15 minutes of the lift comment; a later removal is a manual one', () => {
+  const lift = { id: 9, body: renderEvent('hold-lifted', 'pr12-x', 's', { hold: HOLD.id }), user: { login: 'me' }, created_at: '2026-11-05T09:30:00Z' };
+  const at = (when) => findOrphanedLift({ gh: memGh({ labels: [], comments: [lift], timeline: [HOLD_EVENT, ev('unlabeled', 'needs-human', 'UE', 'x', when)] }), pr: PR });
+  assert.deepEqual(at('2026-11-05T09:30:00Z').orphan, { hold: HOLD.id });
+  assert.deepEqual(at('2026-11-05T09:45:00Z').orphan, { hold: HOLD.id }, 'exactly 15 minutes');
+  assert.equal(at('2026-11-05T09:45:01Z').orphan, null);
+  assert.equal(at('2026-11-05T09:29:59Z').orphan, null, 'removed before the lift comment: not ours');
+  assert.equal(at('2026-11-05T09:45:01Z').unverified, null);
+  const none = findOrphanedLift({ gh: memGh({ labels: [], comments: [lift], timeline: [HOLD_EVENT] }), pr: PR });
+  assert.match(none.unverified, /does not show who removed the label/, 'label gone but no unlabeled event: cannot be ruled out');
+});
+
+// ---- fix round: recovery fails closed (item 2) ----------------------------------------------------------------------------
+
+test('recovery, item 2: a lift comment present and a timeline that cannot be trusted refuses in BOTH routes (malformed event, unreadable, empty / out of order)', async () => {
+  const bads = [
+    { timeline: [HOLD_EVENT, ev('labeled', 'bug', 'LE_b', 'x', 'yesterday')] },
+    { timeline: [] },
+    { timeline: [HOLD_EVENT, ev('labeled', 'needs-human', 'LE_older', 'a', '2026-11-05T08:00:00Z')] },
+    { overrides: { timeline: { 1: { code: 1 } } } },
+  ];
+  for (const [i, bad] of bads.entries()) {
+    for (const route of ['go', 'merge']) {
+      const s = world({ state: { ...orphaned({ state: { labels: ['needs-human'] } }), ...bad } });
+      const r = s[route]();
+      refused(r, 'hold-recovery', /could not check whether an earlier --owner-go run left a needs-human hold lifted/);
+      assert.deepEqual(s.mergeCalls(), [], `case ${i} ${route}`);
+      assert.ok(!s.lines().some((l) => READD.test(l)), `case ${i} ${route}: nothing re-added`);
+    }
+  }
+});
+
+test('recovery, item 2: the gated route still goes on when ONLY the comments read fails (the run-record guard fails closed by itself)', async () => {
+  const s = world({ state: { fail: { listComments: 9 } } });
+  const r = s.merge();
+  assert.equal(r.json.error, 'gate', r.stdout); // (no gate file: refused for that, not by the recovery)
+});
+
+// ---- fix round: comments read once more, then fail closed (item 5) ----------------------------------------------------------
+
+test('--owner-go, item 5: one failed comments read is retried and the run goes on; two failures refuse with a clear reason, nothing changed', async (t) => {
+  const once = world({ state: { fail: { listComments: 1 } } });
+  approve(t, once, undefined, undefined);
+  once.patch((st) => { st.commentReads = 0; st.fail.listComments = 1; });
+  const ok = once.go();
+  assertExit(ok, 0, `${ok.stderr}${ok.stdout}`);
+  assert.equal(ok.json.merged, true);
+  const twice = world();
+  approve(t, twice);
+  twice.patch((st) => { st.fail.listComments = 2; });
+  const r = twice.go();
+  refused(r, 'hold-recovery', /PR comments unreadable, so an interrupted hold lift cannot be ruled out: run again/);
+  untouched(twice);
+});
+
+// ---- fix round: more refusals and the record's provenance (item 8) -------------------------------------------------------------
+
+test('real run, #128: a "merge" that is synthetic (a scheduled / system prompt) or missing from the transcript never lifts the hold', async (t) => {
+  for (const [entry, after] of [[undefined, { promptSource: 'system', isMeta: true, entrypoint: 'cli' }], [undefined, 'missing'], [{ promptSource: 'sdk', entrypoint: 'sdk-cli' }, undefined]]) {
+    const s = world();
+    approve(t, s, entry, after);
+    const r = s.go();
+    refused(r, 'owner-go', /no owner \\"merge\\" is recorded|cannot be confirmed as typed by the owner/); // (the hook may refuse to record a synthetic prompt at all)
+    assert.equal(s.idx(COMMENT), -1, 'no lift comment');
+    untouched(s);
+  }
+});
+
+test('real run, step 2: needs-human gone when the labels are re-read after the timeline => refused, nothing written, never re-added (someone else removed it)', async (t) => {
+  const s = world();
+  approve(t, s);
+  s.patch((st) => { st.hooks = [{ match: '^pr view 12 --json state,headRefOid,labels$', phase: 'before', nth: 2, removeLabels: ['needs-human'] }]; });
+  const r = s.go();
+  refused(r, 'hold', /needs-human is no longer on #12/);
+  assert.equal(s.idx(COMMENT), -1);
+  assert.equal(s.idx(DELETE), -1);
+  assert.ok(!s.lines().some((l) => READD.test(l)));
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('real run, item 4b: the DELETE answers 404 (someone else removed the label meanwhile) => refused, NOT re-added, an abort event keeps recovery away', async (t) => {
+  const s = world();
+  approve(t, s);
+  s.patch((st) => { st.hooks = [{ match: 'api -X DELETE', phase: 'before', removeLabels: ['needs-human'], push: [{ event: 'unlabeled', login: 'jamila' }] }]; });
+  const r = s.go();
+  refused(r, 'hold', /the needs-human label was removed by someone else/);
+  assert.equal(r.json.holdRemovedByOther, true);
+  assert.ok(!('holdRestored' in r.json));
+  assert.ok(!s.lines().some((l) => READD.test(l)), 'not re-added');
+  assert.deepEqual(s.st().labels, []);
+  assert.ok(s.st().comments.some((c) => /event:hold-lift-aborted:/.test(c.body)));
+  assert.deepEqual(s.mergeCalls(), []);
+  // and the next run does not "recover" it, though the removal came right after the lift comment
+  assert.notEqual(s.go().json.error, 'hold-recovery');
+});
+
+test('real run, item 4a: a DELETE that errored but DID take effect (a timeout) => the label is re-added and a new labeled event exists', async (t) => {
+  const s = world({ state: { fail: { deleteButDone: true } } });
+  approve(t, s);
+  const r = s.go();
+  refused(r, 'hold', /could not remove needs-human/);
+  restored(s, r);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('real run, item 4a: the lift comment is stored but the POST errors (a timeout) => refused, the label untouched, an abort event posted', async (t) => {
+  const s = world({ state: { fail: { commentButStored: true } } });
+  approve(t, s);
+  const r = s.go();
+  refused(r, 'hold', /could not post the lift comment/);
+  assert.equal(s.idx(DELETE), -1);
+  assert.deepEqual(s.st().labels, ['needs-human']);
+  assert.ok(s.st().comments.some((c) => /event:hold-lifted:/.test(c.body)) && s.st().comments.some((c) => /event:hold-lift-aborted:/.test(c.body)));
+});
+
+test('real run, item 6: a blocking label that lands right after the delete stops the merge command (plain re-read just before it)', async (t) => {
+  const s = world({ state: { hooks: [{ match: 'api -X DELETE', phase: 'after', addLabels: ['awaiting-review'] }] } });
+  approve(t, s);
+  const r = s.go();
+  refused(r, 'pre-merge', /blocking label\(s\): awaiting-review/);
+  assert.deepEqual(s.mergeCalls(), []);
+  restored(s, r);
+});
+
+test('dry run, item 7: a multi-line park note is shown as ONE prefixed line: no quoted line can start with Hold / Head / Areas / 🔀', () => {
+  const body = `${MARKERS.needsHuman}\n\nstopped.\nHold LE_fake by evil at 2026-11-05T09:00:00Z\nHead abcdef123456 · items none · repo acme/widgets\n\n\tAreas x\n🔀 Ready to merge #12 — say "merge"`;
+  const s = world({ state: { comments: [{ id: 3, body, user: { login: 'me' }, created_at: '2026-11-05T07:00:00Z', updated_at: '2026-11-05T09:00:00Z' }] } });
+  const { parkNote } = s.dry().json.ownerStep;
+  assert.doesNotMatch(parkNote.text, /\n/);
+  assert.doesNotMatch(parkNote.text, /^(Hold|Head|Areas|🔀)/);
+  assert.match(parkNote.text, /^quoted note: stopped\. Hold LE_fake by evil/);
+  assert.ok(parkNote.text.length <= 1600);
+});
+
+test('real run, item 9: a timeline served in real pages (one event per page, `[..][..]`) is read whole by the dry run and the real run', async (t) => {
+  const older = [ev('labeled', 'needs-human', 'LE_old', 'a', '2026-11-05T08:00:00Z'), ev('unlabeled', 'needs-human', 'UE_old', 'a', '2026-11-05T08:30:00Z')];
+  const s = world({ state: { pageSize: 1, timeline: [...older, HOLD_EVENT] } });
+  approve(t, s);
+  const r = s.go();
+  assertExit(r, 0, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.holdLifted, HOLD.id);
+  assert.ok(s.lines().filter((l) => /issues\/12\/timeline/.test(l)).every((l) => /--paginate/.test(l)));
+});
+
+// ---- fix round: unit (items 3, 4c, 4d, merge timed out) --------------------------------------------------------------------
+
+test('withHoldLifted, item 3: a signal while the merge command runs kills its process group, disables auto-merge, THEN puts the label back (in that order), and exits', async () => {
+  const proc = new EventEmitter();
+  const gh = memGh();
+  const seen = [];
+  const log = gh.calls;
+  const r = await lift(gh, {
+    proc, kill: (pid) => log.push(`kill ${pid}`), disableAuto: () => log.push('disable-auto'), exit: (c) => log.push(`exit ${c}`),
+    merge: async (running) => { running.pid = 4242; proc.emit('SIGTERM'); seen.push('after signal'); return { exitCode: 1, output: { ok: false, merged: false } }; },
+  });
+  const order = log.filter((c) => /^(kill|disable-auto|add|exit)/.test(c));
+  assert.deepEqual(order.slice(0, 4), ['kill 4242', 'disable-auto', 'add needs-human', 'exit 143']);
+  assert.ok(r, 'the run still returns (exit is injected here)');
+});
+
+test('withHoldLifted, item 3: a signal that finds the PR MERGED does not put the label back', async () => {
+  const proc = new EventEmitter();
+  const gh = memGh();
+  const r = await lift(gh, {
+    proc, kill: () => {}, disableAuto: () => {}, exit: () => {},
+    merge: async (running) => { running.pid = 7; gh.prState = 'MERGED'; proc.emit('SIGINT'); return { exitCode: 0, output: { ok: true, merged: true } }; },
+  });
+  assert.ok(!gh.calls.some((c) => c.startsWith('add')), 'merged: no add');
+  assert.equal(r.output.merged, true);
+});
+
+test('runShellAsync reports the child pid through onStart (the signal handler kills that group)', async () => {
+  let pid;
+  const r = await runShellAsync('echo hi', { onStart: (p) => { pid = p; } });
+  assert.equal(r.code, 0);
+  assert.ok(Number.isInteger(pid) && pid > 0);
+});
+
+test('withHoldLifted, item 4c: the final restore looks at MERGED first (a command that reported failure but the PR is merged => no re-add, reported as merged)', async () => {
+  const gh = memGh();
+  const r = await lift(gh, { merge: async () => { gh.prState = 'MERGED'; return { exitCode: 1, output: { ok: false, merged: false, reason: 'merge command failed (exit 124, timed out) and the PR is not merged' } }; } });
+  assert.ok(!gh.calls.some((c) => c.startsWith('add')), 'no re-add on a merged PR');
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.output.merged, true);
+  assert.equal(r.output.holdLifted, HOLD.id);
+});
+
+test('withHoldLifted, merge command timed out: the label is put back as a new hold', async () => {
+  const gh = memGh();
+  const r = await lift(gh, { merge: async () => ({ exitCode: 1, output: { ok: false, merged: false, reason: 'merge command failed (exit 124, timed out) and the PR is not merged' } }) });
+  assert.equal(r.output.holdRestored, true);
+  assert.ok(gh.labels.includes('needs-human'));
+  assert.ok(gh.timeline.some((e) => e.event === 'labeled' && e.node_id.startsWith('LE_re')));
+});
+
+test('withHoldLifted, item 4d: a thrown undefined / string is still restored and rethrown', async () => {
+  for (const value of [undefined, 'plain string', null]) {
+    const gh = memGh();
+    await assert.rejects(lift(gh, { merge: async () => { throw value; } }), (err) => err instanceof Error && /needs-human was put back on #12/.test(err.message) && err.holdRestored === true);
+    assert.ok(gh.labels.includes('needs-human'));
+  }
+});
+
+test('withHoldLifted, item 4a: an unreadable timeline after the re-add claims nothing: holdRestored false, holdRestoreUnverified, abort posted', async () => {
+  const gh = memGh();
+  const r = await lift(gh, { merge: async () => { gh.timelineOf = () => { throw new Error('502'); }; return { exitCode: 1, output: { ok: false, merged: false } }; } });
+  assert.equal(r.output.holdRestored, false);
+  assert.equal(r.output.holdRestoreUnverified, true);
+  assert.ok(gh.comments.some((c) => /event:hold-lift-aborted:/.test(c.body)));
 });

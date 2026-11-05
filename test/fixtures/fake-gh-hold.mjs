@@ -2,7 +2,7 @@
 // fake-gh.mjs (PIPELINE_FAKE_GH_SCRIPT, PIPELINE_FAKE_GH_LOG), plus a state file (PIPELINE_FAKE_GH_STATE) that the label, timeline and comment
 // routes read and write, so the order of the calls shows in the state they leave:
 //   { labels: [names], prState?, timeline: [events], comments: [comments], clock, seq,
-//     fail: { delete?, add?, comment?, timelineFrom? }, overrides: { timeline: { "<nth read>": { raw?, code?, stderr?, events? } } },
+//     fail: { delete?, deleteButDone?, add?, comment?, commentButStored?, timelineFrom?, timelineTo?, listComments?: <n> }, pageSize?: <timeline events per page>, overrides: { timeline: { "<nth read>": { raw?, code?, stderr?, events? } } },
 //     hooks: [{ match: <regex source>, phase: 'before' | 'after', nth?: 1, addLabels?, removeLabels?, push?: [events], prState? }] }
 // Routes: `api -X DELETE .../issues/12/labels/needs-human` (removes the label, appends an `unlabeled` event by "me"), `pr edit 12 --add-label X`
 // (adds it, appends a `labeled` event by "me" with a new node id), GET .../issues/12/timeline, GET / POST .../issues/12/comments. Every
@@ -55,6 +55,7 @@ const run = () => {
     if (!state.labels.includes('needs-human')) return out(undefined, 1, 'gh: Label does not exist (HTTP 404)');
     state.labels = state.labels.filter((l) => l !== 'needs-human');
     if (!state.noUnlabeled) state.timeline.push(event('unlabeled', 'needs-human'));
+    if (state.fail?.deleteButDone) return out(undefined, 1, 'gh: timed out (the delete did happen)'); // (a timeout after the server acted)
     return out([]);
   }
   const add = /^pr edit 12 --add-label (\S+)$/.exec(joined);
@@ -69,19 +70,31 @@ const run = () => {
   if (/repos\/acme\/widgets\/issues\/12\/timeline/.test(joined)) {
     state.timelineReads = (state.timelineReads ?? 0) + 1;
     const o = state.overrides?.timeline?.[String(state.timelineReads)];
-    if (state.fail?.timelineFrom && state.timelineReads >= state.fail.timelineFrom) return out(undefined, 1, 'gh: Server Error (HTTP 502)');
+    if (state.fail?.timelineFrom && state.timelineReads >= state.fail.timelineFrom && (!state.fail.timelineTo || state.timelineReads <= state.fail.timelineTo)) return out(undefined, 1, 'gh: Server Error (HTTP 502)');
     if (o?.code) return out(undefined, o.code, o.stderr ?? 'gh: Server Error (HTTP 502)');
     if (o?.raw !== undefined) return out(o.raw);
-    return out(o?.events ?? state.timeline);
+    const events = o?.events ?? state.timeline;
+    // A real paginated read: `gh api --paginate` prints one array per page back to back (`[..][..]`), which github.mjs pagedList reads whole.
+    if (state.pageSize > 0) {
+      const pages = [];
+      for (let i = 0; i < events.length; i += state.pageSize) pages.push(JSON.stringify(events.slice(i, i + state.pageSize)));
+      return out(pages.join('\n'));
+    }
+    return out(events);
   }
   if (/^api -X POST repos\/acme\/widgets\/issues\/12\/comments/.test(joined)) {
     if (state.fail?.comment) return out(undefined, 1, 'gh: Server Error (HTTP 500)');
     const id = 700 + next();
     const t = now();
     state.comments.push({ id, body: JSON.parse(stdin).body, user: { login: 'me' }, created_at: t, updated_at: t });
+    if (state.fail?.commentButStored) return out(undefined, 1, 'gh: timed out (the comment was stored)');
     return out({ id, html_url: `https://github.com/acme/widgets/pull/12#issuecomment-${id}` });
   }
-  if (/^api repos\/acme\/widgets\/issues\/12\/comments --paginate/.test(joined)) return out(state.comments);
+  if (/^api repos\/acme\/widgets\/issues\/12\/comments --paginate/.test(joined)) {
+    state.commentReads = (state.commentReads ?? 0) + 1;
+    if (state.commentReads <= (state.fail?.listComments ?? 0)) return out(undefined, 1, 'gh: Server Error (HTTP 500)');
+    return out(state.comments);
+  }
   const entries = JSON.parse(readFileSync(process.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8'));
   const hit = entries.find((e) => new RegExp(e.match).test(joined));
   if (!hit) return out(undefined, 99, `fake-gh-hold: no match for ${joined}`);
