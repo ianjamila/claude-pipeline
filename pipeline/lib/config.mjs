@@ -194,7 +194,7 @@ export function docsExemptProblem(p, lists = []) {
   if (/[*?[\]{}]/.test(p)) return 'must be an exact path, not a glob';
   const parts = p.split('/');
   if (p.startsWith('/') || parts.some((s) => s === '' || s === '.' || s === '..')) return 'must be a normalised repo-relative path (no leading "/" or "./", no "..", no trailing "/")';
-  if (!isDocPath(p)) return 'is not an ordinary document (markdown anywhere, text/rst/adoc under docs/, LICENSE/CHANGELOG; never an agent instruction file (CLAUDE.md, AGENTS.md, *.override.md / *.local.md ...), html, mdx, source, or a file under a dot-directory (.claude, .github, .cursor ...), app/, pages/, skills/, agents/, pipeline/ or scripts/)';
+  if (!isDocPath(p)) return 'is not an ordinary document (markdown anywhere, text/rst/adoc under docs/, LICENSE/CHANGELOG; never an agent instruction file (CLAUDE / AGENTS / AGENT / GEMINI .md and their .<variant>.md forms such as .override.md / .local.md, .cursorrules, copilot-instructions.md), html, mdx, source, or a file under a dot-directory (.claude, .github, .cursor ...), app/, pages/, skills/, agents/, pipeline/ or scripts/)';
   if (parts.slice(0, -1).some((s) => ['supabase', 'migrations'].includes(s.toLowerCase()))) return 'is under supabase/ or a migrations directory';
   if (isUniversalHardStopPath(p)) return 'is claimed by a hard-stop path rule (secrets, auth, sensitive data, pipeline or agent-instruction files ...)';
   for (const [name, globs] of lists) {

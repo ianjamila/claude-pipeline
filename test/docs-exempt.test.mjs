@@ -506,3 +506,34 @@ test('run-time check: dot-directory and route-dir documents are refused with a l
     refused(w.exempt(), new RegExp(p.replace(/[.\/]/g, '\\$&')));
   }
 });
+
+// ---- review round 2: GEMINI.md claimed; agent-instruction name pattern (*.override.md / *.local.md / AGENT.md) ---------------
+
+const AGENT_NAME_FILES = ['CLAUDE.override.md', 'AGENTS.local.md', 'GEMINI.local.md', 'AGENT.md'];
+
+test('hard stops: GEMINI.md is claimed like CLAUDE.md, at any depth', () => {
+  for (const p of ['GEMINI.md', 'docs/GEMINI.md']) assert.equal(isUniversalHardStopPath(p), true, p);
+});
+
+test('doc-paths: the agent-instruction name pattern is never a document, at any depth and case', () => {
+  for (const n of [...AGENT_NAME_FILES, 'docs/agent.md', 'docs/CLAUDE.override.md', 'pkg/sub/gemini.local.md']) assert.equal(isDocPath(n), false, n);
+  for (const p of ['agent-guide.md', 'docs/agent-guide/prod-ledger.md', 'agents-guide.md', 'CLAUDE-notes.md']) assert.equal(isDocPath(p), true, p);
+});
+
+test('validation refuses the agent-instruction name pattern; similar names stay valid', () => {
+  for (const p of [...AGENT_NAME_FILES, 'docs/agent.md', 'docs/CLAUDE.override.md']) {
+    const r = withList([p]);
+    assert.equal(r.ok, false, p);
+    assert.ok(r.errors.some((e) => e.includes('docs_exempt_paths')), `${p}: ${r.errors.join('; ')}`);
+  }
+  for (const p of ['agent-guide.md', 'docs/agent-guide/prod-ledger.md', 'agents-guide.md', 'CLAUDE-notes.md']) assert.equal(withList([p]).ok, true, p);
+});
+
+test('run-time check: the agent-instruction name pattern is refused with a list that skipped validation', (t) => {
+  for (const p of ['CLAUDE.override.md', 'docs/CLAUDE.override.md', 'AGENTS.local.md', 'GEMINI.local.md', 'AGENT.md', 'docs/agent.md']) {
+    const w = world(t, { list: [p], baseFiles: { [p]: '# x\n' } });
+    w.append(p, 'more\n');
+    w.repo.commit('append');
+    refused(w.exempt(), new RegExp(p.replace(/[.\/]/g, '\\$&')));
+  }
+});

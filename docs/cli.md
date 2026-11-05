@@ -350,7 +350,7 @@ shape is unchanged, so the vendored guards read it as ever) with a visible line 
 carries `docsExempt: {files, reviewedHead}`. The final gate's `review` check uses the same helper (`lib/docs-exempt.mjs`) and shows the files
 in its detail; verify/CI coverage of the docs head is NOT exempted. Every condition: the list is read from `.claude/pipeline.yml` AT `toHead`
 (a commit cannot widen its own exemption); every entry is an exact path of an ordinary document (`lib/doc-paths.mjs`: markdown anywhere,
-text/rst/adoc under `docs/`, LICENSE/CHANGELOG; never an agent-instruction file (incl. `AGENTS.override.md`, `CLAUDE.local.md`), html, mdx, source, or anything under
+text/rst/adoc under `docs/`, LICENSE/CHANGELOG; never an agent-instruction file (`CLAUDE` / `AGENTS` / `AGENT` / `GEMINI` `.md` and their `.<variant>.md` forms, e.g. `AGENTS.override.md`, `CLAUDE.local.md`; `.cursorrules`; `copilot-instructions.md`), html, mdx, source, or anything under
 any dot-directory (`.claude/ .github/ .cursor/ ...`), `app/`, `pages/`, `skills/ agents/ pipeline/ scripts/`) that no hard-stop path rule claims and that is not on `integrity.test_globs`,
 `hard_stops.paths`, `review.arbiter_always_paths`, `risk.high_risk_paths`, nor under `supabase/` or a `migrations` directory (validated by
 config AND re-checked at run time); `toHead` is an ancestor of HEAD, no merge commit and no merge-base change since; every changed file

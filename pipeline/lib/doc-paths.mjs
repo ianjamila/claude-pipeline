@@ -9,11 +9,11 @@ import { toPosix } from './paths.mjs';
 const MARKDOWN = /\.(?:md|markdown)$/i;
 const DOCS_DIR_TEXT = /\.(?:md|markdown|txt|rst|adoc)$/i;
 const DOC_NAMES = /^(?:license|licence|changelog)(?:\.(?:md|markdown|txt))?$/i;
-// Agent instruction files steer what an agent does next, so they are code wherever they sit (docs/ included). The .override /
-// .local variants are read by the same tools and win over the committed file.
-const AGENT_INSTRUCTION_FILES = new Set([
-  'claude.md', 'agents.md', 'gemini.md', '.cursorrules', 'copilot-instructions.md', 'agents.override.md', 'claude.local.md',
-]);
+// Agent instruction files steer what an agent does next, so they are code wherever they sit (docs/ included). Any CLAUDE / AGENTS /
+// AGENT / GEMINI .md, and any .<variant>.md of them (.override, .local ...: read by the same tools, they win over the committed
+// file), by name at any depth and case; AGENT.md (singular) is read by Amp and OpenCode.
+const AGENT_INSTRUCTION_NAME = /^(?:claude|agents?|gemini)(?:\.[^.]+)?\.md$/i;
+const AGENT_INSTRUCTION_FILES = new Set(['.cursorrules', 'copilot-instructions.md']);
 // Instructions, hooks, workflows and the pipeline itself: text files here change what agents or CI do, so they are code.
 // Any directory whose name starts with "." (.claude, .github, .githooks, .cursor, .windsurf, .clinerules, .gemini, .roo, .kiro ...)
 // is never docs either (tools keep their rules there); that is a rule on directory segments, so a root file like .foo.md is judged by its name.
@@ -29,7 +29,7 @@ const neverDocsDir = (d) => {
 export function isDocPath(p) {
   const parts = toPosix(p).replace(/^\.\//, '').split('/');
   const name = parts.at(-1);
-  if (AGENT_INSTRUCTION_FILES.has(name.toLowerCase()) || parts.slice(0, -1).some(neverDocsDir)) return false;
+  if (AGENT_INSTRUCTION_NAME.test(name) || AGENT_INSTRUCTION_FILES.has(name.toLowerCase()) || parts.slice(0, -1).some(neverDocsDir)) return false;
   if (MARKDOWN.test(name) || DOC_NAMES.test(name)) return true;
   return parts.length > 1 && parts[0].toLowerCase() === 'docs' && DOCS_DIR_TEXT.test(name);
 }
