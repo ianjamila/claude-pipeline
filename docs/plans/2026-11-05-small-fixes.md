@@ -35,6 +35,10 @@ rounds ago.
   item; after the fix, round 3 runs normally (counted).
 - Existing: empty commit after an accept → still `empty-range` (message now names the open accept); `base == head` → still
   `empty-range`.
+- (Codex plan R1) a clean main merge that changes the PR diff's CONTEXT lines (main edits lines next to a PR hunk): the content hash
+  changes, the round is still `baseOnly`, and `review-complete` then passes (the baseOnly round's contentHashAtToHead covers it).
+- (Codex plan R1) a conflicting main merge whose resolution only chose existing lines (`resolutionOnly`) after an accept: unchanged by
+  this fix (Codex runs over the resolution, not refused as empty-range; the accept still needs its fix round).
 
 ## 2. P merge --owner-go: accept "behind, but main's new commits touch none of the PR's files"
 
@@ -51,18 +55,24 @@ A PR whose head lacks commits of its base is accepted as "behind but fresh enoug
    <baseRefOid>:.claude/pipeline.yml`; baseRefOid = GitHub's, read by evaluateOwnerGo; the commit must already be local — the
    scan-range check requires that today). Never the PR's own copy (a PR must not loosen its own merge rule). Missing / invalid /
    `update` (the default) → strict, and the detail says which.
-2. **GitHub agrees it can merge:** `mergeStateStatus` is not `BEHIND` (that only appears under strict branch protection, where GitHub
-   itself refuses) and not `DIRTY`; `mergeable` is `MERGEABLE` (prOpenCheck already requires it — #1642 landed a real README conflict
-   between a dry run and the merge).
+2. **GitHub agrees it can merge:** `mergeStateStatus` is one of the states the dry run already treats as readable (`CLEAN`,
+   `HAS_HOOKS`, `UNSTABLE`, `BLOCKED` — one shared constant, so the real merge and the dry run accept exactly the same states; never
+   `BEHIND`, which only appears under strict branch protection where GitHub itself refuses, never `DIRTY` / `UNKNOWN`); `mergeable` is
+   `MERGEABLE` (prOpenCheck already requires it — #1642 landed a real README conflict between a dry run and the merge).
 3. **Disjoint:** M = every path main changed from `merge-base(baseRefOid, HEAD)` to `baseRefOid` (local `git diff`, renames as both
    names; no 300-file API truncation), P = every path the PR changes (the same diff the scan uses, already cross-checked against
    GitHub's `pulls/N/files` by scan-range). M ∩ P = ∅, compared case-insensitively (case-insensitive file systems).
 4. **Nothing on main's side that changes how the checks run:** no path in M matches the built-in list (`.github/**`,
-   `.claude/pipeline.yml`, `.gitattributes`, `.gitmodules`) or the base's `merge.behind_base_stale_paths` (globs, default `[]`; EW
-   will add its toolchain files, e.g. `package.json`, `package-lock.json`, `tsconfig*.json`, `supabase/**`).
+   `.claude/pipeline.yml`, `**/.gitattributes` (nested ones apply to their subtree — Codex plan R1), `.gitmodules`) or the base's
+   `merge.behind_base_stale_paths` (globs, default `[]`; EW will add its toolchain files, e.g. `package.json`, `package-lock.json`,
+   `tsconfig*.json`, `supabase/**`).
 5. Everything else unchanged: required checks green on THIS head, labels, hard-stops / integrity / owner items, the owner's recorded
    "merge" for this head + items (+ Areas), and the last look (`preMergeProblems`) refusing when baseRefOid or headRefOid moved since
    the evaluation.
+6. **(Codex plan R1) No landing on a base nobody checked:** the merge command may queue (`gh pr merge --auto`), so while
+   `waitForMerge` polls, an accepted-behind merge adds one blocker: GitHub's `baseRefOid` is no longer the evaluated one → the
+   existing abandon path (disable auto-merge, look once more, report). The residual (main moves in the seconds between the last look
+   and GitHub merging) is the same one the strict path has today: an up-to-date PR also lands on whatever main is at that moment.
 
 **Code:**
 - `pipeline/lib/config.mjs`: `merge.behind_base` ('update' | 'disjoint', default 'update'), `merge.behind_base_stale_paths` (string[]
@@ -86,6 +96,10 @@ A PR whose head lacks commits of its base is accepted as "behind but fresh enoug
 - PR's OWN pipeline.yml says `disjoint`, base's does not (or base has none / an invalid one) → `behind-base` (+ reason).
 - mergeStateStatus `BEHIND` → `behind-base` even with `disjoint`; `DIRTY` → conflicts + behind-base-unverified as today.
 - dry run: compare reports a base tip other than the evaluated baseRefOid → `behind-base`.
+- a nested `sub/.gitattributes` changed on main → `behind-base`.
+- mergeStateStatus `UNKNOWN` on the real `--owner-go` with `disjoint` → not accepted (parity with the dry run).
+- accepted-behind merge with a queued (`--auto`) merge command; GitHub's baseRefOid changes during the wait → abandon (auto-merge
+  disabled), exit 1, not merged.
 - config: validation of both keys (bad value, non-array, non-string glob), defaults.
 
 **Risk (why Fable):** the one rule that lets code reach main on a base it was not tested against. Failure mode: a meaning-level clash
@@ -109,12 +123,17 @@ with no code change; `codex-review`'s empty-range check catches it later).
 +refs/heads/<default_branch>:refs/remotes/origin/<default_branch>` (NETWORK_TIMEOUT_MS; GitError swallowed: offline / no remote keeps
 the cached ref, as codex-review does), called before `currentContentHash` in `review-complete` (inside the lock, before the hash),
 `state outcome` and `state mark-implemented`. No retry loop: the stale ref is the cause. When `review-complete` still refuses on
-coverage and the fetch failed, the reason adds "(origin/<branch> could not be refreshed: <first line>)".
+coverage and the fetch failed, the reason adds "(origin/<branch> could not be refreshed: <first line>)". A stale ref can only make
+`review-complete` / `state outcome` refuse (the round's hash was taken right after codex-review's own fetch), so best effort is safe
+there. **`mark-implemented` fails CLOSED (Codex plan R1):** a stale ref makes the hash differ and would count main's commits as the
+fix, so when an `origin` remote exists and the fetch fails it exits 3 `{unavailable, reason: 'base-refresh'}` and marks nothing; a
+repo with no `origin` remote keeps the cached/local ref as today.
 
 **Tests (test/cli-review.test.mjs or a new test/review-complete-fetch.test.mjs):** a bare "origin" whose main moves after the local
 fetch; the PR branch merges it (simulating update-branch + pull, local origin/main left stale) → `review-complete` exits 0 (without
 the fix: exit 1 "no review round covers"); `state outcome` coverageValid true; `mark-implemented` on an unfixed accept → `no-code-change`;
-no remote → still runs on the cached ref.
+no remote → still runs on the cached ref; `origin` pointing at a missing path (fetch fails) → `review-complete` still answers from the
+cached ref, `mark-implemented` exits 3 `base-refresh` and marks nothing.
 
 ## 4. Windows shard weights refresh
 
