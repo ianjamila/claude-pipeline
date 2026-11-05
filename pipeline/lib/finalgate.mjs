@@ -19,6 +19,7 @@ import { blockingHits, collectHardStops, ownerMergeHits } from './hardstops.mjs'
 import { checkIntegrity } from './integrity.mjs';
 import { runPreflight } from './preflight.mjs';
 import { toPosix } from './paths.mjs';
+import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
 import { ownerRuledItems, reviewValidFor } from './triage.mjs';
@@ -47,16 +48,6 @@ export const expectedCheckNames = () => [...CANONICAL_CHECKS];
 export const MERGEABLE_RETRIES = 3;
 export const MERGEABLE_PAUSE_MS = 2000;
 const MERGE_SHA_RETRIES = 3;
-// Docs-only is deliberately narrow: markdown anywhere (not .mdx, which can hold executable JSX), text/reStructuredText/AsciiDoc
-// under the root docs/ directory, and the LICENSE / CHANGELOG files. A .txt anywhere else (requirements.txt, CMakeLists.txt, a
-// prompt file) is code.
-const MARKDOWN = /\.(?:md|markdown)$/i;
-const DOCS_DIR_TEXT = /\.(?:md|markdown|txt|rst|adoc)$/i;
-const DOC_NAMES = /^(?:license|licence|changelog)(?:\.(?:md|markdown|txt))?$/i;
-// Agent instruction files steer what an agent does next, so they are code wherever they sit (docs/ included).
-const AGENT_INSTRUCTION_FILES = new Set(['claude.md', 'agents.md', 'gemini.md', '.cursorrules', 'copilot-instructions.md']);
-// Instructions, hooks, workflows and the pipeline itself: text files here change what agents or CI do, so they are code.
-const NEVER_DOCS_DIRS = new Set(['.claude', '.github', '.githooks', 'skills', 'agents', 'pipeline', 'scripts']);
 const FULL_SHA = /^[0-9a-f]{40}$/;
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -97,14 +88,6 @@ export function blockingLabelsOf(labels) {
 }
 
 const pathsOf = (f) => [f.oldPath, f.newPath, f.path].filter((p) => typeof p === 'string');
-
-function isDocPath(p) {
-  const parts = toPosix(p).replace(/^\.\//, '').split('/');
-  const name = parts.at(-1);
-  if (AGENT_INSTRUCTION_FILES.has(name.toLowerCase()) || parts.slice(0, -1).some((d) => NEVER_DOCS_DIRS.has(d.toLowerCase()))) return false;
-  if (MARKDOWN.test(name) || DOC_NAMES.test(name)) return true;
-  return parts.length > 1 && parts[0].toLowerCase() === 'docs' && DOCS_DIR_TEXT.test(name);
-}
 
 // Every changed file is a non-binary doc (see isDocPath) outside the instruction/hook/workflow/pipeline directories (a
 // rename counts by BOTH its paths: moving code into docs/ is not docs-only). Living under docs/ is not enough: a
