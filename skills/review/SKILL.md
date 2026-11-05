@@ -150,7 +150,7 @@ final gate re-prove the grant from the owner's record on this machine, so finish
      same checks, writes and merges nothing, and its `ownerStep` says which of the two endings above applies. Never run the repo's own
      merge command (`npm run merge …`, even with `--dry-run`) to preview: the git guard refuses it, and the dry run grants nothing.
    - **No such item**: the reply's LAST two lines are exactly (sha12 = first 12 characters of `git rev-parse HEAD`; owner/name from
-     `gh repo view --json nameWithOwner`; the digest is `none` on the `--owner-go` route; no Areas line without protected areas):
+     `gh repo view --json nameWithOwner`; on `--owner-go` copy `ownerStep.line` (and `ownerStep.areas` above it when present) from the dry run, never type the digest):
      `Head <sha12> · items <digest> · repo <owner/name>`
      `🔀 Ready to merge #N — say "merge"`
      The owner-go hook binds the owner's "merge" to the LAST reply: if anything else was said since, or the context was compacted since you showed
