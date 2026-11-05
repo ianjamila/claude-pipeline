@@ -114,6 +114,16 @@ test('listComments concatenates every page', () => {
   assert.ok(fake.lines().includes('api repos/acme/widgets/issues/4/comments --paginate'));
 });
 
+test('pullFiles concatenates every page of pulls/N/files (gh --paginate prints one array per page)', () => {
+  const page1 = JSON.stringify([{ filename: 'a.js', status: 'added' }, { filename: 'new.js', previous_filename: 'old.js', status: 'renamed' }]);
+  const page2 = JSON.stringify([{ filename: 'c.js', status: 'modified' }]);
+  const { fake, gh } = mk([REPO, { match: 'pulls/4/files', stdout: `${page1}${page2}` }]);
+  assert.deepEqual(gh.pullFiles(4).map((f) => f.filename), ['a.js', 'new.js', 'c.js']);
+  assert.equal(gh.pullFiles(4)[1].previous_filename, 'old.js');
+  assert.ok(fake.lines().includes('api repos/acme/widgets/pulls/4/files?per_page=100 --paginate'));
+  assert.throws(() => mk([REPO, { match: 'pulls/4/files', stdout: page1 + '[{"filename":' }]).gh.pullFiles(4), GhError);
+});
+
 const comments = (...c) => ({ match: 'issues/4/comments --paginate', stdoutJson: c });
 
 test('upsertComment PATCHes the viewer\'s existing marker comment (the newest one)', () => {

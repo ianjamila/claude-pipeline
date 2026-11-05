@@ -134,6 +134,48 @@ test('--owner-go: the GitHub files list unreadable (HTTP 502, or not a list) is 
   }
 });
 
+test('--owner-go: an EMPTY GitHub files list for a non-empty local diff is refused (the cross-check runs both ways)', (t) => {
+  const s = plainScenario();
+  assert.ok(s.prFiles.length > 0);
+  s.fake.setScript(script(s, { prFiles: [] }));
+  withRecord(t, s);
+  const r = goMerge(s);
+  refusedWith(r, /local diff has 2 file\(s\) that GitHub does not list/, s);
+  assert.match(JSON.stringify(r.json), /\.salt, src\/app\.js/);
+});
+
+test('--owner-go: a GitHub files list that lacks one local file is refused, naming it; a lacking rename side counts too', (t) => {
+  const s = plainScenario({ change: (repo) => { repo.write('src/extra.js', 'x\n'); repo.git(['mv', 'src/app.js', 'src/renamed.js']); } });
+  const names = s.prFiles.flatMap((f) => [f.filename, f.previous_filename]).filter(Boolean);
+  assert.ok(names.includes('src/extra.js') && names.includes('src/app.js'), names.join());
+  // GitHub forgets the added file
+  s.fake.setScript(script(s, { prFiles: s.prFiles.filter((f) => f.filename !== 'src/extra.js') }));
+  withRecord(t, s);
+  refusedWith(goMerge(s), /does not list[^"]*src\/extra\.js/, s);
+  // GitHub lists the rename without its old name
+  const t2 = plainScenario({ change: (repo) => { repo.git(['mv', 'src/app.js', 'src/renamed.js']); } });
+  t2.fake.setScript(script(t2, { prFiles: t2.prFiles.map(({ previous_filename: _old, ...f }) => f) }));
+  withRecord(t, t2);
+  refusedWith(goMerge(t2), /does not list[^"]*src\/app\.js/, t2);
+});
+
+test('--owner-go: a GitHub files list at its 3000-file cap is refused ("too many files to cross-check"), not compared truncated', (t) => {
+  const s = plainScenario();
+  const filler = Array.from({ length: 3000 }, (_, i) => ({ filename: `gen/f${i}.js`, status: 'added' }));
+  s.fake.setScript(script(s, { prFiles: [...s.prFiles, ...filler] }));
+  withRecord(t, s);
+  refusedWith(goMerge(s), /too many files to cross-check/, s);
+});
+
+test('--owner-go: a non-ASCII file name is accepted (the local diff is decoded from git\'s C-quoting; GitHub lists raw UTF-8)', (t) => {
+  const s = plainScenario({ change: (repo) => { repo.write('src/é.js', 'x\n'); } });
+  // the fixture's own list may hold git's quoted form ("src/\303\251.js"); GitHub's API gives the raw name
+  const raw = [...s.prFiles.filter((f) => !f.filename.startsWith('"')), { filename: 'src/é.js', status: 'added' }];
+  s.fake.setScript(script(s, { prFiles: raw }));
+  withRecord(t, s);
+  assertExit(goMerge(s), 0);
+});
+
 test('--owner-go: GitHub\'s files list that equals the local diff (a rename included) is accepted', (t) => {
   const s = plainScenario({ change: (repo) => { repo.git(['mv', 'src/app.js', 'src/renamed.js']); } });
   assert.ok(s.prFiles.some((f) => f.previous_filename === 'src/app.js'), JSON.stringify(s.prFiles));

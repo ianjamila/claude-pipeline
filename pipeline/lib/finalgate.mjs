@@ -718,6 +718,8 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
 export const OWNER_GO_CHECKS = Object.freeze(['pr-open', 'labels', 'ci', 'scan-range', 'hardstops', 'integrity', 'owner-items']);
 
 const NAMED_SHOWN = 3;
+// GitHub's pulls/{n}/files returns at most this many files, however many pages are read.
+const PULL_FILES_CAP = 3000;
 
 // The scan of a --owner-go diff is only as good as the objects it reads. Refused (fail closed) when the range cannot be pinned to GitHub's
 // base commit, or when this clone can show a different history than GitHub has: replace refs, a grafts file, a shallow clone. And the
@@ -744,9 +746,11 @@ function scanRangeCheck({ root, gh, pr, diff, info, explicit }) {
   if (shallow === 'true') problems.push('this repository is a shallow clone: its history is cut short, so the merge-base and the diff cannot be trusted (git fetch --unshallow)');
   if (d.ok) {
     let listed = null;
+    let listFailed = false;
     try {
       listed = typeof gh.pullFiles === 'function' ? gh.pullFiles(pr) : null;
     } catch (err) {
+      listFailed = true;
       problems.push(`could not read GitHub's file list for the PR (pulls/${pr}/files): ${firstLine(err)}`);
     }
     if (listed !== null) {
@@ -761,12 +765,25 @@ function scanRangeCheck({ root, gh, pr, diff, info, explicit }) {
         if (typeof entry.previous_filename === 'string' && entry.previous_filename !== '') names.push(entry.previous_filename);
       }
       if (malformed) problems.push(`GitHub's file list for the PR (pulls/${pr}/files) could not be read (an entry has no filename)`);
-      const local = new Set(d.files.flatMap(pathsOf));
-      const absent = [...new Set(names.filter((n) => !local.has(n)))];
-      if (absent.length > 0) {
-        problems.push(`GitHub lists ${absent.length} file(s) for the PR that the local diff lacks (${absent.slice(0, NAMED_SHOWN).join(', ')}${absent.length > NAMED_SHOWN ? ', ...' : ''}): the local history is not the PR's`);
+      const named = (list) => `${list.slice(0, NAMED_SHOWN).join(', ')}${list.length > NAMED_SHOWN ? ', ...' : ''}`;
+      if (Array.isArray(listed) && listed.length >= PULL_FILES_CAP) {
+        // GitHub's files API returns at most 3000 files: a list this long may be cut short, so it cannot vouch for the local diff.
+        problems.push(`GitHub's file list for the PR (pulls/${pr}/files) has ${listed.length} entries, the most that API returns: too many files to cross-check the local diff against it`);
+      } else {
+        // Both ways: a file GitHub lists that the local diff lacks (the local objects are not the PR's), and a local file GitHub does not list
+        // (an empty or short reply must not pass). A rename counts under both of its names, on both sides.
+        const local = new Set(d.files.flatMap(pathsOf));
+        const listedNames = new Set(names);
+        const absent = [...new Set(names.filter((n) => !local.has(n)))];
+        const unlisted = [...local].filter((p) => !listedNames.has(p));
+        if (absent.length > 0) {
+          problems.push(`GitHub lists ${absent.length} file(s) for the PR that the local diff lacks (${named(absent)}): the local history is not the PR's`);
+        }
+        if (unlisted.length > 0) {
+          problems.push(`the local diff has ${unlisted.length} file(s) that GitHub does not list for the PR (${named(unlisted)}): its file list is incomplete or the local history is not the PR's`);
+        }
       }
-    } else if (!problems.some((p) => /file list/.test(p))) {
+    } else if (!listFailed) {
       problems.push('GitHub\'s file list for the PR could not be read (this gh client has no pullFiles)');
     }
   }
