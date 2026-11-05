@@ -19,7 +19,7 @@ import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { loadState } from '../lib/state.mjs';
 import { approvalConfigDirHint, approvalGap, areasBlock } from '../hooks/lib/owner-go.mjs';
 import {
-  GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, preMergeProblems, readReviewJson,
+  GATE_FILE, PR_FIELDS, READABLE_MERGE_STATES, abandonMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, preMergeProblems, readReviewJson,
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
 import { tailLines } from '../lib/cmd-io.mjs';
@@ -293,14 +293,15 @@ async function ownerGoMerge({ root, config, pr, gh, ctx }) {
   const merged = (mergeSha, extra = {}) => ({
     exitCode: EXIT.OK,
     output: mergeSha
-      ? { ok: true, merged: true, mode: 'owner-go', head, mergeSha, ...extra }
-      : { ok: true, merged: true, mode: 'owner-go', head, mergeSha: null, warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading', ...extra },
+      ? { ok: true, merged: true, mode: 'owner-go', head, behind: live.behind ?? null, mergeSha, ...extra }
+      : { ok: true, merged: true, mode: 'owner-go', head, behind: live.behind ?? null, mergeSha: null, warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading', ...extra },
   });
-  const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh) });
+  // Every --owner-go merge (behind or not) waits with GitHub's baseRefOid pinned to the evaluated one: a queued merge (--auto) must not land on a base nobody checked.
+  const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh, { base: live.baseRefOid }) });
   if (outcome.state === 'merged') return merged(outcome.mergeSha, ran.code === 0 ? {} : { commandExitCode: ran.code, note: 'the merge command exited non-zero but the PR is MERGED' });
   const abandoned = await abandonMerge({ gh, pr, cwd: root, env: ctx.env, pollMs });
   if (abandoned.merged) return merged(abandoned.mergeSha, { note: 'the PR merged while auto-merge was being disabled', autoMergeDisabled: abandoned.autoMergeDisabled });
-  const failure = { merged: false, mode: 'owner-go', head, autoMergeDisabled: abandoned.autoMergeDisabled, commandExitCode: ran.code, commandOutput };
+  const failure = { merged: false, mode: 'owner-go', head, behind: live.behind ?? null, autoMergeDisabled: abandoned.autoMergeDisabled, commandExitCode: ran.code, commandOutput };
   if (ran.code !== 0) return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged`, ...failure } };
   const base = {
     timeout: 'not merged in time', closed: 'the PR was closed without merging', error: `could not read the PR state while waiting (${outcome.error})`,
@@ -315,10 +316,12 @@ async function ownerGoMerge({ root, config, pr, gh, ctx }) {
 // refused on. Read-only means: no bringUpToDate (the branch is not touched; behind-ness is read), no run record / inFlight / ci-proof-used
 // event, no label or comment, no merge command, no file written, and no shared git state changed (evaluateGate readOnly: no `git fetch`).
 // It grants nothing: the owner's recorded "merge" is checked by the real run.
-const READABLE_MERGE_STATES = new Set(['CLEAN', 'HAS_HOOKS', 'UNSTABLE', 'BLOCKED']);
+// (READABLE_MERGE_STATES is finalgate's: the real --owner-go merge and this dry run accept exactly the same GitHub states.)
 
 // Behind-ness without the update: GitHub's own mergeStateStatus, then the compare API. Never "not behind" by default.
-function readBehind(gh, pr) {
+// `accepted` (--owner-go, merge.behind_base: disjoint): the behind summary the live evaluation accepted. A compare "behind" whose base tip is
+// the very baseRefOid that evaluation scanned is then no blocker; any other base tip (main moved in between) still is.
+function readBehind(gh, pr, { accepted = null } = {}) {
   const view = gh.prView(pr, [...PR_FIELDS, 'baseRefOid']);
   const state = view?.mergeStateStatus;
   if (state === 'BEHIND') return [{ kind: 'behind-base', detail: 'GitHub reports the PR is BEHIND its base (mergeStateStatus BEHIND): update the branch (P update-branch), re-verify and run final-gate again' }];
@@ -330,7 +333,8 @@ function readBehind(gh, pr) {
   }
   try {
     const cmp = gh.compare(view.baseRefName, view.headRefOid);
-    if (cmp.behindBy > 0) return [{ kind: 'behind-base', detail: `the PR head lacks ${cmp.behindBy} commit(s) of ${view.baseRefName} (compare API): update the branch (P update-branch), re-verify and run final-gate again` }];
+    if (cmp.behindBy > 0 && accepted !== null && cmp.baseSha === accepted.baseRefOid) return out;
+    if (cmp.behindBy > 0) return [{ kind: 'behind-base', detail: `the PR head lacks ${cmp.behindBy} commit(s) of ${view.baseRefName} (compare API${accepted !== null ? `; its base tip ${String(cmp.baseSha).slice(0, 8)} is not the ${accepted.baseRefOid.slice(0, 8)} that was checked` : ''}): update the branch (P update-branch), re-verify and run final-gate again` }];
   } catch (err) {
     return [{ kind: 'behind-base-unverified', detail: `could not compare the head with its base (${String(err?.message ?? err).slice(0, 200)})` }];
   }
@@ -381,7 +385,8 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     ownerRuns = Number(live.ownerMerge) > 0 || Number(gate?.ownerMerge) > 0;
   }
 
-  for (const b of readBehind(gh, pr)) add(b.kind, b.detail);
+  const behind = ownerGo ? (live.behind ?? null) : null;
+  for (const b of readBehind(gh, pr, { accepted: behind })) add(b.kind, b.detail);
   for (const reason of await preMergeProblems({ gh, pr, head, base: ownerGo ? live.baseRefOid : null })) add('pre-merge', reason);
 
   let ownerStep = null;
@@ -402,9 +407,11 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     if (!lowRisk) {
       ownerStep = { kind: 'say-merge', line: `Head ${head.slice(0, 12)} · items ${live.ownerItems ?? 'none'} · repo ${slug}` };
       if (ownerGo && live.areas.length > 0) ownerStep = { ...ownerStep, areas: areasBlock(live.areas), areaIds: live.areas };
+      // Behind its base but accepted (merge.behind_base: disjoint): the owner is told so in the request, above the Areas / Head lines.
+      if (behind !== null) ownerStep = { ...ownerStep, behindNote: `behind ${config.default_branch} by ${behind.behindBy} commit(s); ${config.default_branch}'s ${behind.mainFiles} new file(s) touch none of this PR's files` };
     }
   }
 
   const wouldMerge = blockers.length === 0;
-  return { exitCode: wouldMerge ? EXIT.OK : EXIT.FAILED, output: { ok: wouldMerge, dryRun: true, wouldMerge, mode: ownerGo ? 'owner-go' : 'gate', head, blockers, ownerStep } };
+  return { exitCode: wouldMerge ? EXIT.OK : EXIT.FAILED, output: { ok: wouldMerge, dryRun: true, wouldMerge, mode: ownerGo ? 'owner-go' : 'gate', head, ...(ownerGo ? { behind } : {}), blockers, ownerStep } };
 }
