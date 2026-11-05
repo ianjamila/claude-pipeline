@@ -107,6 +107,8 @@ export function ghEntries(o) {
     { match: '-X PATCH repos/acme/widgets/issues/comments/', stdoutJson: { id: 501, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-501' } },
     { match: '^pr view 12 --json state,mergeCommit', stdoutJson: { labels: [], ...(o.mergeView ?? { state: 'MERGED', mergeCommit: { oid: MERGE_SHA } }) } },
     { match: '^pr merge 12 --disable-auto', code: o.disableAutoCode ?? 0 },
+    // `autoMergeRequest`: what the look after a failed --disable-auto sees (null = never armed); absent = that read finds no answer (fails).
+    ...('autoMergeRequest' in o ? [{ match: '^pr view 12 --json autoMergeRequest$', stdoutJson: { autoMergeRequest: o.autoMergeRequest } }] : []),
     // `behindBy`: how many base commits the PR head lacks (compare); 0 = up to date, which is what merge's update step expects.
     // `update`: what PUT pulls/12/update-branch answers: accepted (default) | conflict | head-moved (the two 422s) | forbidden.
     UPDATE_REPLIES[o.update ?? 'accepted'],

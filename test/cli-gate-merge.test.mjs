@@ -184,6 +184,22 @@ test('merge: if --disable-auto itself fails the output says so instead of claimi
   assert.match(r.json.reason, /could not confirm auto-merge is disabled/);
 });
 
+test('merge: --disable-auto fails only because auto-merge was never armed (autoMergeRequest null) => no false "check the PR by hand"', () => {
+  const s = scenario({ gh: { mergeView: { state: 'OPEN', mergeCommit: null }, disableAutoCode: 1, autoMergeRequest: null } });
+  assertExit(s.gate(), 0);
+  const r = s.merge({ PIPELINE_MERGE_WAIT_MS: '100', PIPELINE_MERGE_POLL_MS: '50' });
+  assertExit(r, 1);
+  assert.equal(r.json.autoMergeDisabled, true);
+  assert.match(r.json.reason, /auto-merge disabled$/);
+  assert.ok(s.fake.lines().includes('pr view 12 --json autoMergeRequest'));
+  // armed and the disable failed => still the honest warning
+  const armed = scenario({ gh: { mergeView: { state: 'OPEN', mergeCommit: null }, disableAutoCode: 1, autoMergeRequest: { enabledAt: '2026-11-05T09:00:00Z' } } });
+  assertExit(armed.gate(), 0);
+  const a = armed.merge({ PIPELINE_MERGE_WAIT_MS: '100', PIPELINE_MERGE_POLL_MS: '50' });
+  assert.equal(a.json.autoMergeDisabled, false);
+  assert.match(a.json.reason, /could not confirm auto-merge is disabled/);
+});
+
 test('merge: a PR closed without merging while waiting fails', () => {
   const s = scenario({ gh: { mergeView: { state: 'CLOSED', mergeCommit: null } } });
   assertExit(s.gate(), 0);

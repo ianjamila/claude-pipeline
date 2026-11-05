@@ -962,11 +962,20 @@ export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sle
   }
 }
 
-// No unattended queued merges: after a failed or timed-out merge, auto-merge must not be left armed. gh errors when
-// it was never enabled; that is expected and ignored.
+// No unattended queued merges: after a failed or timed-out merge, auto-merge must not be left armed. true = auto-merge is off.
+// gh errors when it was never enabled, so a failed --disable-auto is followed by one look at the PR: a clean read whose
+// `autoMergeRequest` is null proves nothing is armed (no false "check the PR by hand"). Anything else stays false.
 export function disableAutoMerge({ pr, cwd, env }) {
   const r = ghRun(['pr', 'merge', String(pr), '--disable-auto'], { cwd, env, timeoutMs: 60_000 });
-  return r.code === 0 && !r.timedOut;
+  if (r.code === 0 && !r.timedOut) return true;
+  const view = ghRun(['pr', 'view', String(pr), '--json', 'autoMergeRequest'], { cwd, env, timeoutMs: 60_000 });
+  if (view.code !== 0 || view.timedOut) return false;
+  try {
+    const json = JSON.parse(view.stdout);
+    return json !== null && typeof json === 'object' && Object.hasOwn(json, 'autoMergeRequest') && json.autoMergeRequest === null;
+  } catch {
+    return false;
+  }
 }
 
 // After a failed, blocked or timed-out wait: disarm auto-merge, then LOOK AT THE PR AGAIN. Auto-merge may have fired
