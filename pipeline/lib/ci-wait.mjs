@@ -114,15 +114,19 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   };
 
   // created_at (ms) of the workflow runs of a check run's suite: [] for a non-Actions check run. Cached per suite; an unreadable
-  // lookup throws and is not cached, so the next poll asks again.
+  // lookup throws and is not cached, so the next poll asks again. A re-run keeps its suite but moves the workflow run's
+  // run_started_at, and its new check runs have higher ids: seeing an id above the one the entry was read for re-reads the suite
+  // (at most once per newer check run, never once per poll), so a re-run is not judged by a stale cached start.
   const suiteCreated = async (run) => {
     const suite = run.check_suite?.id;
     if (suite === undefined || suite === null) return [];
-    let workflowRuns = suiteCache.get(suite);
-    if (workflowRuns === undefined) {
-      workflowRuns = await readers.suiteRuns(suite);
-      suiteCache.set(suite, workflowRuns);
+    let entry = suiteCache.get(suite);
+    if (entry === undefined || Number(run.id) > entry.maxId) {
+      const workflowRuns = await readers.suiteRuns(suite);
+      entry = { workflowRuns, maxId: Math.max(Number(run.id), entry?.maxId ?? -Infinity) };
+      suiteCache.set(suite, entry);
     }
+    const workflowRuns = entry.workflowRuns;
     return workflowRuns.map((w) => Date.parse(w?.created_at)).filter(Number.isFinite);
   };
   // Like suiteCreated, but a re-run keeps its run id and created_at and only moves run_started_at: both instants of each workflow
@@ -132,7 +136,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     const suite = run.check_suite?.id;
     if (suite === undefined || suite === null) return [];
     await suiteCreated(run); // fills the cache
-    return suiteCache.get(suite).flatMap((w) => [Date.parse(w?.created_at), Date.parse(w?.run_started_at)]).filter(Number.isFinite);
+    return suiteCache.get(suite).workflowRuns.flatMap((w) => [Date.parse(w?.created_at), Date.parse(w?.run_started_at)]).filter(Number.isFinite);
   };
 
   // run_started_at (ms) of the workflow runs of a check run's suite, else created_at when a run has none: when this attempt of the
@@ -141,7 +145,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     const suite = run.check_suite?.id;
     if (suite === undefined || suite === null) return [];
     await suiteCreated(run); // fills the cache
-    return suiteCache.get(suite).map((w) => { const s = Date.parse(w?.run_started_at); return Number.isFinite(s) ? s : Date.parse(w?.created_at); }).filter(Number.isFinite);
+    return suiteCache.get(suite).workflowRuns.map((w) => { const s = Date.parse(w?.run_started_at); return Number.isFinite(s) ? s : Date.parse(w?.created_at); }).filter(Number.isFinite);
   };
 
   // A skipped check run is only "done" when its workflow run was created at or after the ready event; a draft-era skip is not.

@@ -379,6 +379,20 @@ test('a re-run (old created_at) whose run_started_at is after ready: its failure
   assert.equal((await plain.run()).output.checks[0].state, 'stale-fail');
 });
 
+test('a re-run seen on a LATER poll refreshes the cached suite start: its failure is fresh at once, not stale-fail from the draft-era cache (#173, #168 R3)', async () => {
+  const s = sim({
+    classic: present('ci'), timeline: readyTimeline,
+    // poll 1 (t=0): the draft-era run failed; the re-run (same suite, new check run id) starts after ready and fails by poll 2 (t=15s)
+    checkRuns: (t) => [t < 15 ? cr('ci', 'failure', { id: 1, check_suite: { id: 4 } }) : cr('ci', 'failure', { id: 2, check_suite: { id: 4 } })],
+    suiteRuns: (t) => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: t < 15 ? '2026-01-01T11:00:00Z' : '2026-01-01T12:05:00Z', run_attempt: t < 15 ? 1 : 2 }],
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'failed', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 15_000, 'reported at poll 2, not held to --appear-timeout by the cached draft-era start');
+  assert.equal(r.output.checks[0].state, 'fail');
+  assert.deepEqual(s.suiteCalls, [4, 4], 'one refresh when a newer check run of the suite appeared, not one per poll');
+});
+
 test('a re-run (old created_at, ready-era run_started_at) that SKIPPED is still stale-skipped: it replays the draft payload (#173)', async () => {
   const s = sim({
     classic: present('lint'), timeline: readyTimeline,
