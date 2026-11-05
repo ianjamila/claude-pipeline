@@ -3130,7 +3130,7 @@ test('triage owner-ruling: an answer whose prompt is synthetic or missing from t
 });
 
 // R2-F3: the same for a ruling answer whose transcript is in a config dir the process does not know.
-test('triage owner-ruling: an answer whose transcript is in a config dir this process does not know names CLAUDE_CONFIG_DIR in the refusal (R2-F3); a missing one does not', (t) => {
+test('triage owner-ruling: an answer whose transcript is outside a .claude* folder under the home says so in the refusal (R2-F3); a missing one does not', (t) => {
   const refusal = (after) => {
     const w = ownerWorld(t, { yml: CHAT_YML });
     assertExit(w.codex(1, findingsOf([finding()])), 0);
@@ -3145,7 +3145,8 @@ test('triage owner-ruling: an answer whose transcript is in a config dir this pr
   assert.match(missing, /cannot be confirmed as typed by the owner/);
   assert.doesNotMatch(missing, /CLAUDE_CONFIG_DIR/);
   const elsewhere = refusal('elsewhere');
-  assert.match(elsewhere, /cannot be confirmed as typed by the owner[\s\S]*CLAUDE_CONFIG_DIR is not set here[\s\S]*run this command with CLAUDE_CONFIG_DIR set to the owner's config dir/);
+  assert.match(elsewhere, /cannot be confirmed as typed by the owner[\s\S]*\.claude\* folder directly under the (?:account's )?home/);
+  assert.doesNotMatch(elsewhere, /run this command with CLAUDE_CONFIG_DIR/);
 });
 
 test('triage owner-ruling: one world\'s recorded answer never satisfies another world (#122: a repository name per test)', (t) => {

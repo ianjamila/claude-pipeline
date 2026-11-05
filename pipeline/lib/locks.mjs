@@ -75,14 +75,7 @@ export function machineId({ env = process.env, stateDir = path.join(os.homedir()
   if (cachedMachineId !== undefined && stateDir === path.join(os.homedir(), '.claude', 'pipeline-state')) return cachedMachineId;
   const file = path.join(stateDir, 'machine-id');
   let id = null;
-  const read = () => {
-    try {
-      const text = fs.readFileSync(file, 'utf8').trim();
-      return MACHINE_ID_RE.test(text) ? text : null;
-    } catch {
-      return null;
-    }
-  };
+  const read = () => readMachineIdFile(file);
   id = read();
   if (!id) {
     try {
@@ -95,6 +88,23 @@ export function machineId({ env = process.env, stateDir = path.join(os.homedir()
   }
   if (stateDir === path.join(os.homedir(), '.claude', 'pipeline-state')) cachedMachineId = id;
   return id;
+}
+
+function readMachineIdFile(file) {
+  try {
+    const text = fs.readFileSync(file, 'utf8').trim();
+    return MACHINE_ID_RE.test(text) ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+// machineId() without its side effect: never creates the id file (a dry run writes nothing). null => hostnames only, the stricter judgement.
+export function readMachineId({ env = process.env, stateDir = path.join(os.homedir(), '.claude', 'pipeline-state') } = {}) {
+  const fromEnv = String(env.PIPELINE_MACHINE_ID ?? '').trim();
+  if (fromEnv) return MACHINE_ID_RE.test(fromEnv) ? fromEnv : null;
+  if (cachedMachineId !== undefined && stateDir === path.join(os.homedir(), '.claude', 'pipeline-state')) return cachedMachineId;
+  return readMachineIdFile(path.join(stateDir, 'machine-id'));
 }
 
 // Is a lock owner's process on THIS machine (so its PID can be checked)? Same hostname, or same machine id.
@@ -455,4 +465,10 @@ export function inspect(name, { dir = defaultLockDir() } = {}) {
     throw err;
   }
   return readOwner(lockPath) ?? incompleteOwner(name);
+}
+
+// The judgement tryAcquire makes before it takes a lock, without taking or reclaiming anything: { state: 'absent' } | { state: 'held', owner }
+// | { state: 'stale', owner, reason } (a dead local owner, or an unfinished lock older than INCOMPLETE_STALE_MS: tryAcquire would take it over).
+export function peek(name, { dir = defaultLockDir(), now = Date.now(), host = os.hostname(), machineId: machine = readMachineId(), isAlive = isPidAlive } = {}) {
+  return assess(lockPathFor(dir, name), { now, host, machineId: machine, isAlive, hooks: {} });
 }
