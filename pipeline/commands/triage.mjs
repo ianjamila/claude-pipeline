@@ -8,7 +8,7 @@
 // second review's verdict already on the item). `second-review` runs the blind Codex check that verdict comes from (see secondReview below).
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
+import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
@@ -26,6 +26,7 @@ import {
 import {
   ensureRoundDir, findItem, findRound, readFileOrFail, requireState, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
+import { publishTriage } from '../lib/review-publish.mjs';
 
 export const meta = {
   summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane, ask for and record owner rulings made in chat, record Claude\'s own rulings, run the blind Codex second review',
@@ -46,21 +47,21 @@ export const meta = {
     '     `codex-review --round n` then claims it (see its usage). Exit 1 for label mode (no grant exists), a --pr that is not the review state\'s, a repository off github.com,',
     '     or a round that is already allowed (within review.max_rounds, the automatic extra round, or an open grant for this head)',
     'pipeline triage claude-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --pr N [--repo DIR]',
-    '  -> {ok, round, id, final, published: false, next}; records CLAUDE\'s decision (final.by claude, needsHuman false, the overruled final and the cause kept) for an item waiting for a human, or tightens a Claude dismissal',
+    '  -> {ok, round, id, final, published, next?}; records CLAUDE\'s decision (final.by claude, needsHuman false, the overruled final and the cause kept) for an item waiting for a human, or tightens a Claude dismissal',
     '  -> only with owner_approval: chat; exit 1 for label mode, a --pr that is not the review state\'s, an empty reason or one over 1000 characters, or a ruling the rules refuse (state untouched)',
     '  -> ACCEPT is always allowed (also for a judge/arbiter malfunction). FOLLOW-UP alone only for a non-BLOCKING, non-security item with a known cause; any REJECT, and any dismissal of a BLOCKING or security item,',
     '     needs a second review already on the item that also dismisses it at high confidence (the result is the stricter of the two). Refused: a dismissal through a model-proof / invalid-arbiter / invalid-judge',
     '     malfunction (re-run the judge/arbiter, or ACCEPT), a loosened ACCEPT (only the owner\'s typed ruling loosens), an implemented item, and anything settled by a test, the judge, the arbiter or the owner',
-    '  -> the ruling is local until the triage comment is published (published: false); it writes review state format version 2',
+    '  -> the ruling is published at once, under the review lock (published: true): the triage comment is updated as a compare-and-swap on the state\'s content (lib/review-publish.mjs). When GitHub cannot be reached the ruling stands locally (published: false, next = the retry, `pipeline comment --kind triage`); when the PR holds a state this copy did not publish or restore it is published: false, publishError: \'stale-publication\' (run `pipeline state show --pr N`, then redo). It writes review state format version 2',
     'pipeline triage second-review --round R --ids ID[,ID…] --pr N [--repo DIR]',
-    '  -> {ok, round, verdicts:[{id, decision, confidence, reasoning, final}], forcedAccept:[ids], published: false, next}; runs ONE Codex call (review.codex_model, effort high, read-only, fresh session) over a BLIND packet of the named items',
+    '  -> {ok, round, verdicts:[{id, decision, confidence, reasoning, final}], forcedAccept:[ids], published, publishError?, next}; runs ONE Codex call (review.codex_model, effort high, read-only, fresh session) over a BLIND packet of the named items',
     '     and stores its verdict in each item (item.secondReview), for claude-ruling to read. The packet is built from the review state and git alone: the original finding (id, bucket, category, title, file, line, detail, the reviewer\'s reasoning),',
     '     the test evidence the CLI recorded, the pinned head, the PR title and risk, fenced as untrusted text; never the judge\'s, the arbiter\'s or Claude\'s reason or decision. Codex is told to verify the claims in the code, read-only',
     '  -> only with owner_approval: chat; each id must be an item of round R that waits for a human (final.needsHuman) with a cause that is not a judge/arbiter malfunction, is not implemented and has no second review yet: anything else refuses the whole call naming the id (exit 1, state untouched)',
     '     (ONE second review per item: a second call refuses). Codex ACCEPT sets the final ACCEPT at once (final.forcedBy second-review; fix it); a dismissal leaves the final as it was: at high confidence claude-ruling may dismiss it (the stricter of the two stands), below high only ACCEPT (or the owner\'s typed ruling) is possible',
     '  -> the check runs under the review lock, Codex runs outside it, then the state is read again under the lock: nothing is recorded (exit 1) when HEAD moved, an item\'s final or finding text changed, or a verdict appeared meanwhile',
     '  -> exit 1 {ok:false, reason} for an answer that is not exactly one valid verdict per requested id (or no usable answer after Codex exited 0): nothing is stored, so run it again. exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|github} when Codex or GitHub could not deliver: state untouched, the PR waits (review-loop.md rule 2)',
-    '  -> the prompt and the raw answer are kept as .review/round-R/second-review-<first id>.md and .json; the result is local until the triage comment is published (published: false); it writes review state format version 2; env PIPELINE_CODEX_TIMEOUT_MS as for codex-review',
+    '  -> the prompt and the raw answer are kept as .review/round-R/second-review-<first id>.md and .json; the result is published like a Claude ruling (published / publishError / next as for claude-ruling); it writes review state format version 2; env PIPELINE_CODEX_TIMEOUT_MS as for codex-review',
     'pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]',
     '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
     '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human and has no unimplemented Claude ruling (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
@@ -345,10 +346,22 @@ async function ownerRuling(rest, ctx) {
 
 // Claude's own ruling (plan 2026-11-05-claude-rulings.md section 10). The rules are all in triage.mjs#claudeRulingRefusal / applyClaudeRuling; this
 // checks what only the command can (mode, PR, the text), writes the state under the lock, and says what is left to publish.
-// PUBLICATION SPOT (claude-ruling and second-review both end here): task 3 replaces this one function with the compare-and-swap publish under the
-// review lock (and returns published: true when GitHub took it). Until then the result is local only.
-function publishClaudeRuling({ pr }) {
-  return { published: false, next: `run \`pipeline comment --pr ${pr} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it` };
+// Publication (claude-ruling and second-review both end here), still under the review lock: the compare-and-swap of review-publish.mjs. The local
+// result always stands. -> { published: true } when GitHub took it; { published: false, next } when GitHub could not be reached (`next` is the retry);
+// { published: false, publishError: 'stale-publication', next } when the PR holds a state this copy neither published nor restored (run state show).
+function publishRuling({ ctx, root, pr, state }) {
+  try {
+    publishTriage({ gh: createGitHub({ cwd: root, env: ctx.env }), root, pr, state });
+    return { published: true };
+  } catch (err) {
+    if (err instanceof Fail && err.output?.error === 'stale-publication') {
+      return { published: false, publishError: 'stale-publication', next: `NOT published: ${err.output.reason}. The decision is saved here only` };
+    }
+    if (err instanceof GhError || err instanceof UnavailableError) {
+      return { published: false, next: `GitHub could not be reached, so the result is only local: run \`pipeline comment --pr ${pr} --kind triage\` when it is back (until then \`pipeline state show\` restores the published state without it)` };
+    }
+    throw err;
+  }
 }
 
 async function claudeRuling(rest, ctx) {
@@ -379,8 +392,9 @@ async function claudeRuling(rest, ctx) {
     if (why) return refuse(why);
     const ruled = applyClaudeRuling(item, { decision, reason, ruledAt: new Date().toISOString() });
     // Format version 2: an older pipeline must not read a state that holds a Claude ruling (state.mjs SUPPORTED_STATE_VERSION).
-    saveState(root, { ...updateItems(state, n, [ruled]), version: 2 });
-    return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final, ...publishClaudeRuling({ pr }) } };
+    const next = { ...updateItems(state, n, [ruled]), version: 2 };
+    saveState(root, next);
+    return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final, ...publishRuling({ ctx, root, pr, state: next }) } };
   }, pr);
 }
 
@@ -512,14 +526,15 @@ async function secondReview(rest, ctx) {
       return settleSecondReview(item, { decision: e.decision, confidence: e.confidence, reasoning: clip(e.reasoning.trim(), REASONING_MAX), model, effort: SECOND_REVIEW_EFFORT, inputDigest, ranAt });
     });
     // Format version 2: an older pipeline must not read a state that holds a second-review verdict (state.mjs SUPPORTED_STATE_VERSION).
-    saveState(root, { ...updateItems(state, n, settled), version: 2 });
+    const saved = { ...updateItems(state, n, settled), version: 2 };
+    saveState(root, saved);
     const verdicts = settled.map((i) => ({ id: i.id, decision: i.secondReview.decision, confidence: i.secondReview.confidence, reasoning: i.secondReview.reasoning, final: i.final }));
-    const published = publishClaudeRuling({ pr });
+    const { next: publishNext, ...published } = publishRuling({ ctx, root, pr, state: saved });
     return {
       exitCode: EXIT.OK,
       output: {
-        ok: true, round: n, verdicts, forcedAccept: verdicts.filter((v) => v.decision === 'ACCEPT').map((v) => v.id), published: published.published,
-        next: `${secondReviewNext(verdicts)}. ${published.next}`,
+        ok: true, round: n, verdicts, forcedAccept: verdicts.filter((v) => v.decision === 'ACCEPT').map((v) => v.id), ...published,
+        next: [secondReviewNext(verdicts), publishNext].filter(Boolean).join('. '),
       },
     };
   }, pr);

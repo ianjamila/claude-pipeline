@@ -15,16 +15,20 @@ import { diffFiles, headSha, mergeBase } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, reviewLane } from '../lib/risk.mjs';
 import { loadState } from '../lib/state.mjs';
-import { reviewValidFor, roundOutcome } from '../lib/triage.mjs';
+import { reviewEligibilityProblems, reviewValidFor, roundOutcome, rulingsDigest } from '../lib/triage.mjs';
 import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
 import { currentContentHash, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
+import { publishTriage } from '../lib/review-publish.mjs';
 
 export const meta = {
   summary: 'post the review-complete comment (and remove awaiting-review) once the review is valid for the current content',
   usage: [
     'pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?}; exit 1 {ok:false, reason} when the review is not valid',
+    '  after the validity checks it also refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet',
+    '  confirmed by a later round, then publishes the triage state when the PR holds a different one (exit 1 {error:stale-publication} when the PR holds a state this',
+    '  copy did not publish or restore: run `pipeline state show --pr N`), and only then posts the marker. The record carries rulingsDigest only when there are rulings',
     '  the checked-out HEAD must be the head GitHub holds for the PR; the PR must have had every Fable pass its risk or paths need',
     `  the comment starts with the line ${'`<!-- claude-pipeline:review-complete v1 -->`'} and carries the JSON {contentHash, base, head, rounds, codexModel, modelProofDigest}`,
     '  (base = the merge base the content hash is measured from; modelProofDigest = sha256 of the Fable model proofs, null when no Fable pass ran);',
@@ -74,6 +78,7 @@ export const fableProofs = (state) => (state?.rounds ?? [])
   .map((r) => ({ round: r.n, transcript: r.modelProof.transcript, models: r.modelProof.models, ...(r.modelProof.effort ? { effort: r.modelProof.effort } : {}) }));
 
 export function reviewRecord(state, { contentHash, base, head, modelProofs, defaultCodexModel }) {
+  const rulings = rulingsDigest(state);
   const last = state.rounds.at(-1);
   return {
     contentHash,
@@ -82,6 +87,8 @@ export function reviewRecord(state, { contentHash, base, head, modelProofs, defa
     rounds: state.rounds.length,
     codexModel: typeof last?.codexModel === 'string' && last.codexModel !== '' ? last.codexModel : defaultCodexModel,
     modelProofDigest: modelProofs.length > 0 ? createHash('sha256').update(JSON.stringify(modelProofs)).digest('hex') : null,
+    // Only when there are rulings, so the marker of an ordinary review is byte-identical to what it always was.
+    ...(rulings === 'none' ? {} : { rulingsDigest: rulings }),
   };
 }
 
@@ -151,6 +158,13 @@ export const run = guarded(async (argv, ctx) => {
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
       const lane = laneProblem(state, root, config, base);
       if (lane) return { exitCode: EXIT.FAILED, output: { ok: false, reason: lane, currentContentHash: hash } };
+      // Items that read as resolved but are not yet: a Claude-ruled follow-up with no issue, a fix made outside the file the finding names that no
+      // later round confirmed (triage.mjs#reviewEligibilityProblems).
+      const eligibility = reviewEligibilityProblems(state);
+      if (eligibility.length > 0) return { exitCode: EXIT.FAILED, output: { ok: false, reason: eligibility.join('; '), currentContentHash: hash } };
+      // The marker vouches for the state the PR holds, so publish it first when it differs (a base-only round or a late mark-implemented leaves the
+      // copies apart). A PR that holds a state this copy did not publish or restore is refused (stale-publication, exit 1); GitHub failing is exit 3.
+      publishTriage({ gh, root, pr, state });
 
       const record = reviewRecord(state, {
         contentHash: hash, base, head: local, modelProofs: fableProofs(state), defaultCodexModel: config.review.codex_model,

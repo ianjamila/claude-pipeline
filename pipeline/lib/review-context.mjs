@@ -3,12 +3,13 @@
 // reviewed" means. In particular `currentContentHash` is the single definition of the hash that round coverage and
 // the merge gate compare, so a command that hashed differently would let a stale review look current. (The formula itself lives in git.mjs.)
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { Fail } from './cmd-common.mjs';
-import { reviewBaseRef as gitReviewBaseRef, reviewContentHash } from './git.mjs';
+import { git, reviewBaseRef as gitReviewBaseRef, reviewContentHash } from './git.mjs';
 import { LockTimeoutError, withLock } from './locks.mjs';
+import { parseRemote } from './remote-url.mjs';
 import { loadState } from './state.mjs';
 
 export const EXCERPT_RADIUS = 20;
@@ -59,11 +60,39 @@ export function readFileOrFail(file, what) {
 
 // Every command that reads-modifies-writes .review/state.json holds this lock for the whole read-modify-write, so two
 // sessions (a review run and a person with a terminal, two review runs on one PR) cannot lose each other's update.
-// One lock per repository checkout and PR. The lock directory is ~/.claude/pipeline-state/locks unless
+// One lock per repository and PR: every worktree and clone of one repo on this machine shares it (the key is the normalized origin remote, see
+// repoLockKey), so a decision written in one checkout cannot interleave with a publication or a merge from another. The lock directory is ~/.claude/pipeline-state/locks unless
 // PIPELINE_LOCK_DIR says otherwise (tests); PIPELINE_LOCK_WAIT_MS shortens the wait (tests).
 export const LOCK_WAIT_MS = 2 * 60 * 1000;
 
-export const reviewLockName = (root, pr) => `review-${sha256(root).slice(0, 12)}-pr${pr}`;
+// What identifies the repository, not the checkout: the origin remote as host/owner/name, lower-cased (https, ssh and scp forms of one
+// remote agree); with no usable origin, the absolute git common dir (shared by the worktrees of one repo); outside a git repo, the root
+// itself. Never throws. Memoized per root for the life of the process.
+const lockKeys = new Map();
+export function repoLockKey(root) {
+  if (lockKeys.has(root)) return lockKeys.get(root);
+  let key = root;
+  try {
+    let remote = null;
+    try {
+      remote = parseRemote(git(['config', '--get', 'remote.origin.url'], { cwd: root }).trim());
+    } catch { /* no origin */ }
+    if (remote) {
+      key = `remote:${remote.host}/${remote.owner}/${remote.name}`.toLowerCase();
+    } else {
+      const common = path.resolve(root, git(['rev-parse', '--git-common-dir'], { cwd: root }).trim());
+      try {
+        key = `git:${realpathSync(common)}`;
+      } catch {
+        key = `git:${common}`;
+      }
+    }
+  } catch { /* not a git repository: the root itself */ }
+  lockKeys.set(root, key);
+  return key;
+}
+
+export const reviewLockName = (root, pr) => `review-${sha256(repoLockKey(root)).slice(0, 12)}-pr${pr}`;
 
 export async function withReviewLock(root, pr, ctx, fn) {
   const env = ctx?.env ?? process.env;
@@ -161,7 +190,7 @@ export const followupsPending = (state) => allItems(state).some(
 
 // JSON with sorted keys and no undefined, so two copies of the same decision compare equal whatever order a writer
 // emitted the keys in.
-function canonicalJson(value) {
+export function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v ?? null)).join(',')}]`;
   if (value !== null && typeof value === 'object') {
     return `{${Object.keys(value).sort().filter((k) => value[k] !== undefined).map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
@@ -174,6 +203,7 @@ function canonicalJson(value) {
 export function decidedItemsKey(round) {
   const items = (round.items ?? []).map((i) => canonicalJson({
     id: i.id, fingerprint: i.fingerprint, final: i.final, judge: i.judge, arbiter: i.arbiter, implemented: i.implemented, followupIssue: i.followupIssue,
+    secondReview: i.secondReview, test: i.test,
   }));
   return items.sort().join('\n');
 }

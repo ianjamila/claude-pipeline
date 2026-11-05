@@ -9,9 +9,9 @@ import { effectiveReviewBase, git, headSha, isAncestor, mergeBase, revParse } fr
 import { grantIdOf, ownerGrantedRounds } from '../hooks/lib/owner-go.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
-import { MARKERS } from '../lib/render.mjs';
-import { decodeFromComment, loadState, saveState, updateItems } from '../lib/state.mjs';
-import { reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
+import { loadState, saveState, updateItems } from '../lib/state.mjs';
+import { isProtectedFinal, reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
+import { readBaseline, readPublished, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, requireState, reviewBaseRef,
   roundDir, stateExtends, withStateLock,
@@ -24,11 +24,14 @@ export const meta = {
     '  -> {ok, recovered, source, count, items}; with --pr and no local state, rebuilds it from the PR triage comment',
     '  with --pr and a local state: the published (triage comment) state is authoritative. Local is kept (source local) when it',
     '  equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,',
-    '  quarantinedTo) and the published state is restored. source is local | published | quarantined | local-unverified',
+    '  quarantinedTo) and the published state is restored. source is local | published | quarantined | local-ahead | local-unverified',
+    '  (local-ahead: the PR still holds what this copy last published, and the local copy holds a second-review verdict or a Claude / forced final that was',
+    '  never published: kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline',
+    '  (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)',
     '  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)',
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
-    '     refused (exit 2) when the PR triage comment already holds round R',
+    '     refused (exit 2) when the PR triage comment already holds round R, or (error round-has-verdict) when the round holds a second-review verdict',
     'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean',
     '  grantedRound {k, grantId, head, quote}: the owner\'s open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner',
     '  record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the',
@@ -36,6 +39,8 @@ export const meta = {
     'pipeline state mark-implemented --ids a,b [--repo DIR]',
     '  -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed',
     '     and a non-test file changed since (a test file counts for a testing finding or the finding\'s own file)',
+    '  -> a forced or Claude-ruled ACCEPT whose named file is empty or was not changed is still marked, with implementedVia \'other-files\': the next codex-review',
+    '     round asks Codex to confirm it (round.confirmFixed) and review-complete waits for that round. Ordinary ACCEPTs get no such field',
     'pipeline state record-followup --id ID --url URL [--repo DIR]',
     'pipeline state set-outcome --outcome TEXT [--repo DIR]',
   ].join('\n'),
@@ -47,17 +52,21 @@ const isAccepted = (i) => i.final?.decision === 'ACCEPT' && !i.implemented;
 const isDisputed = (i) => i.judge?.disputedBug === true && i.judge.settleTest?.possible === true && (i.test?.status ?? 'none') === 'none';
 const needsHuman = (i) => i.final?.needsHuman === true;
 
-// Newest comment of ours that STARTS with the triage marker: a quoted or forged marker in someone else's comment
-// (or in the middle of ours) must never become the state.
+// The published review state: the newest comment of ours that STARTS with the triage marker (a quoted or forged marker in someone else's comment,
+// or in the middle of ours, must never become the state). -> { state, hash, ... } (lib/review-publish.mjs#readPublished); state is null when there is none.
 function recoverState(root, pr, ctx) {
-  return guardGh(() => {
-    const gh = createGitHub({ cwd: root, env: ctx.env });
-    const me = gh.viewer();
-    const mine = gh.listComments(pr)
-      .filter((c) => typeof c.body === 'string' && c.body.startsWith(MARKERS.triage) && c.user?.login === me)
-      .sort((a, b) => Number(a.id) - Number(b.id));
-    const state = mine.length > 0 ? decodeFromComment(mine.at(-1).body) : null;
-    return state && state.pr === pr ? state : null;
+  return guardGh(() => readPublished(createGitHub({ cwd: root, env: ctx.env }), pr));
+}
+
+// The local copy holds a second-review verdict or a Claude / forced final that the published copy lacks for the same item (what a ruling saved while
+// GitHub was down, or a second review, leaves behind). With the published copy equal to this copy's baseline that is plain local progress, not
+// a superseded copy: it must be published, not quarantined.
+function localAheadOfPublished(local, published, baseline) {
+  if (baseline === null || published.hash !== baseline) return false;
+  const theirs = new Map((published.state.rounds ?? []).flatMap((r) => r.items ?? []).map((i) => [i.id, i]));
+  return (local.rounds ?? []).flatMap((r) => r.items ?? []).some((i) => {
+    const before = theirs.get(i.id);
+    return before !== undefined && ((i.secondReview !== undefined && before.secondReview === undefined) || (isProtectedFinal(i) && !isProtectedFinal(before)));
   });
 }
 
@@ -88,11 +97,13 @@ async function showLocked(values, n, pr, root, ctx) {
     if (pr === undefined) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'no-state', message: 'no review state here: pass --pr N to rebuild it from the PR triage comment' });
     }
-    state = await recoverState(root, pr, ctx);
+    const found = await recoverState(root, pr, ctx);
+    state = found.state;
     if (!state) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'no-state', message: `no local review state and no triage comment with state on PR #${pr}` });
     }
     saveState(root, state);
+    writeBaseline(root, pr, found.hash); // what this copy restored: the next publication is measured from it (lib/review-publish.mjs)
     recovered = true;
     source = 'published';
   } else if (pr !== undefined && state.pr !== pr) {
@@ -102,19 +113,25 @@ async function showLocked(values, n, pr, root, ctx) {
     // state only goes further (its extra rounds were never published).
     // GitHub unreachable: the local state is all there is. It is served, but flagged: it was NOT compared with the published
     // triage comment, so the caller must not treat it as proven current.
-    let published;
+    let found;
     try {
-      published = await recoverState(root, pr, ctx);
+      found = await recoverState(root, pr, ctx);
     } catch (err) {
       if (!(err instanceof UnavailableError)) throw err;
       warnings.push(`GitHub unavailable: the local review state was not compared with the published triage comment (${String(err.message).split('\n')[0].slice(0, 200)})`);
       source = 'local-unverified';
     }
-    if (published && !stateExtends(state, published)) {
-      quarantinedTo = path.relative(root, quarantineReviewDir(root)).split(path.sep).join('/');
-      state = published;
-      saveState(root, state);
-      source = 'quarantined';
+    if (found?.state && !stateExtends(state, found.state)) {
+      if (localAheadOfPublished(state, found, readBaseline(root, pr))) {
+        source = 'local-ahead';
+        warnings.push(`the local review state holds a second-review verdict or a Claude ruling that the published triage comment lacks (it was saved but not published): kept as is; publish it now with \`pipeline comment --pr ${pr} --kind triage\``);
+      } else {
+        quarantinedTo = path.relative(root, quarantineReviewDir(root)).split(path.sep).join('/');
+        state = found.state;
+        saveState(root, state);
+        writeBaseline(root, pr, found.hash);
+        source = 'quarantined';
+      }
     }
   }
 
@@ -150,7 +167,12 @@ async function discardRound(rest, ctx) {
     if (inState && (state.rounds ?? []).some((r) => r.n > n)) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'not-trailing', message: `round ${n} is not the newest round: a later round builds on it` });
     }
-    const published = await recoverState(root, pr, ctx);
+    // A second review's verdict is evidence a round-trip through Codex bought: it is not thrown away with the round (re-running it is refused).
+    const withVerdict = (state.rounds ?? []).find((r) => r.n === n)?.items?.filter((i) => i.secondReview !== undefined).map((i) => i.id) ?? [];
+    if (withVerdict.length > 0) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'round-has-verdict', message: `round ${n} holds a second-review verdict (${withVerdict.join(', ')}), so it cannot be discarded: a second review runs once per item` });
+    }
+    const published = (await recoverState(root, pr, ctx)).state;
     if ((published?.rounds ?? []).some((r) => r.n === n)) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'round-published', message: `round ${n} is in the PR triage comment: it is history, not an interrupted round` });
     }
@@ -277,6 +299,7 @@ async function markImplemented(rest, ctx) {
     // An accepted item is only "implemented" by a change to the code: the branch content must differ from what the
     // round that accepted it reviewed. Otherwise an empty fix and an empty review round would clear a BLOCKING finding.
     const hash = currentContentHash(root, config);
+    const otherFiles = new Set(); // ids of forced / Claude-ruled ACCEPTs whose fix is not in the file they name (E7)
     for (const { round, item } of found) {
       if (hash === round.contentHashAtToHead) {
         throw new Fail(EXIT.USAGE, {
@@ -331,8 +354,16 @@ async function markImplemented(rest, ctx) {
           message: `${item.id} cannot be marked implemented: since round ${round.n} only test files changed (${changed.join(', ') || 'nothing'}); commit the fix itself (a test-only fix counts only for a testing finding or one about that test file)${notWritten(dropped)}${wholePr && netEmpty ? '; a fix committed before the conflict-resolving merge must be committed again after it' : ''}`,
         });
       }
+      // A forced or Claude-ruled ACCEPT whose named file is empty or was not changed: the mark stands, but nobody has seen that the named problem is
+      // fixed, so it is confirm-needed ('other-files'): the next review round's prompt asks Codex, and review-complete waits for that round.
+      // Ordinary ACCEPTs (the judge's, the arbiter's, a test's, the owner's) are untouched.
+      const claudeOrForced = typeof item.final?.forcedBy === 'string' || item.final?.by === 'claude' || (item.final?.claude !== undefined && item.final.claude !== null);
+      if (claudeOrForced && (itemFile === '' || !own.includes(itemFile))) otherFiles.add(item.id);
     }
-    for (const { round, item } of found) state = updateItems(state, round.n, [{ ...item, implemented: true }]);
+    for (const { round, item } of found) {
+      const { implementedVia: _earlier, ...rest } = item; // an earlier mark is judged again: the named file may have been changed since
+      state = updateItems(state, round.n, [{ ...rest, implemented: true, ...(otherFiles.has(item.id) ? { implementedVia: 'other-files' } : {}) }]);
+    }
     saveState(root, state);
     return { exitCode: EXIT.OK, output: { ok: true, marked: ids } };
   });

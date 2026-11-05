@@ -53,6 +53,9 @@ export const meta = {
     '    base-only rounds and resolution-only rounds (below) never count toward the cap',
     '  reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
     '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable',
+    '  confirm fixed: an accepted item that a forced or Claude ruling marked implemented through files other than the one it names (state mark-implemented,',
+    '    implementedVia other-files) is listed in the prompt of the next round that runs Codex (not a base-only one), with its original finding fenced as untrusted',
+    '    text: Codex says whether it is really fixed and raises it again as BLOCKING when it is not. The round records round.confirmFixed:[ids] (absent when none)',
     '  commits merged in from the PR\'s base branch since the previous round are left out of the reviewed diff; a round that only merged them in',
     '    is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}',
     '  when that merge conflicted and the resolution only chose lines the two sides already had, Codex reviews just the resolution:',
@@ -279,9 +282,15 @@ export const run = guarded(async (argv, ctx) => {
   const priorRulings = [...latestByFingerprint].map(([fp, item]) => ({
     id: item.id, title: item.title, ruling: `${cache[fp].decision ?? 'unknown'}: ${cache[fp].reason ?? ''}`,
   }));
+  // Accepted items a forced or Claude ruling marked fixed through OTHER files than the one they name (state mark-implemented, implementedVia
+  // 'other-files'), not yet asked about in an earlier round: this round's prompt asks whether they are really fixed, and the round records the ids
+  // (round.confirmFixed) so review-complete can see they were asked. A base-only round asks nothing, so it consumes none.
+  const confirmed = new Set((state?.rounds ?? []).flatMap((r) => (Array.isArray(r.confirmFixed) ? r.confirmFixed : [])));
+  const confirmItems = baseOnly ? [] : priorItems.filter((i) => i.implementedVia === 'other-files' && !confirmed.has(i.id));
   const prompt = buildReviewPrompt({
     pr, title: view.title, body: view.body, base: review.base, head, risk: level, round, lightLane, priorRulings, rulesRef: forkPoint, largeBinaries, baseKind: review.kind,
     sensitivePaths: lane.sensitivePaths,
+    ...(confirmItems.length > 0 ? { confirmFixed: confirmItems.map((i) => ({ id: i.id, title: i.title, file: i.file, detail: i.detail })) } : {}),
     ...(resolutionOnly ? { resolution: { from: base, forkPoint, ...resolutionView } } : {}),
   });
 
@@ -381,6 +390,7 @@ export const run = guarded(async (argv, ctx) => {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled,
       reviewBase: review.base, reviewBaseKind: review.kind, forkPoint, codexModel: model, ...(promptSha256 === undefined ? {} : { promptSha256 }), ...(baseOnly ? { baseOnly: true } : {}),
       ...(admission === 'uncounted' ? {} : { admission }), ...(ownerGrant === undefined ? {} : { ownerGrant }),
+      ...(confirmItems.length > 0 ? { confirmFixed: confirmItems.map((i) => i.id) } : {}),
       ...(resolutionOnly ? { resolutionOnly: true, ...resolutionView } : {}),
       ...(reviewer === 'fable' && !baseOnly ? { fableRequired: true, fableReasons: reasons, sensitivePaths: lane.sensitivePaths.slice(0, 50) } : {}),
     });

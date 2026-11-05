@@ -698,3 +698,74 @@ export function reviewValidFor(state, contentHash) {
   if (lastReviewed === undefined || !roundsAwaitingFixReview(rounds).every(isClean)) return false;
   return rounds.at(-1).contentHashAtToHead === contentHash;
 }
+
+// ---- the rulings inventory (E11) and review eligibility (E7, E9) -------------------------------------------------------------------
+// The visible record of what was dismissed without the owner reading it: every dismissed (REJECT or FOLLOW-UP) BLOCKING or security-category
+// item whose final is settled, one row each, with who decided it. The owner-go block prints it, the review-complete marker carries its
+// digest, and the merge check compares both with the live state, so a dismissal nobody showed the owner cannot ride along.
+
+const TITLE_MAX = 60;
+const WHY_MAX = 140;
+// Printable ASCII only (anything else becomes ?), white space collapsed, cut with "..." at max: a row is one line of one fixed shape, and a
+// finding's text can never add a separator (the middle dot is not ASCII), a line or a quote of its own.
+const asciiLine = (s, max) => {
+  const text = String(s ?? '').replace(/\s+/g, ' ').trim().replace(/[^\x20-\x7e]/g, '?');
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+};
+const byLabel = (item) => {
+  const by = item.final?.by;
+  if (by === 'claude') return item.secondReview !== undefined ? 'claude+codex' : 'claude';
+  return typeof by === 'string' && by !== '' ? by : 'unknown';
+};
+const isCriticalItem = (item) => item.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(item.category);
+const byIdAsc = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
+// -> { rows: [line], count }. Sorted by id; a by:'cache' copy is skipped when an item with the same fingerprint is already listed (a ruling
+// that was carried into later rounds is one dismissal, not several).
+export function rulingsInventory(state) {
+  const dismissed = allItems(state)
+    .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && isCriticalItem(i))
+    .map((i) => ({ item: i, id: String(i.id) }))
+    .sort(byIdAsc);
+  const listed = new Set();
+  const kept = [];
+  for (const entry of [...dismissed.filter((e) => e.item.final.by !== 'cache'), ...dismissed.filter((e) => e.item.final.by === 'cache')]) {
+    const fp = typeof entry.item.fingerprint === 'string' && entry.item.fingerprint !== '' ? entry.item.fingerprint : null;
+    if (entry.item.final.by === 'cache' && fp !== null && listed.has(fp)) continue;
+    if (fp !== null) listed.add(fp);
+    kept.push(entry);
+  }
+  const rows = kept.sort(byIdAsc).map(({ item, id }) => [
+    id, item.final.decision, item.bucket, asciiLine(item.category, 40) || '-', `by ${byLabel(item)}`, `content ${rulingContentDigest([item])}`,
+    `"${asciiLine(String(item.title ?? '').replace(/"/g, "'"), TITLE_MAX)}"`, `why: ${asciiLine(item.final.reason, WHY_MAX)}`,
+  ].join(' · '));
+  return { rows, count: rows.length };
+}
+
+// sha256 hex of the rows joined by a newline; 'none' when there are no rulings.
+export function rulingsDigest(state) {
+  const { rows } = rulingsInventory(state);
+  return rows.length === 0 ? 'none' : createHash('sha256').update(rows.join('\n')).digest('hex');
+}
+
+// `Rulings <digest first 12>` then the rows, one per line; '' when there are none.
+export function rulingsBlock(state) {
+  const { rows } = rulingsInventory(state);
+  return rows.length === 0 ? '' : [`Rulings ${rulingsDigest(state).slice(0, 12)}`, ...rows].join('\n');
+}
+
+// What keeps a review from completing even though its items read as resolved (local, no marker, no GitHub). One line per problem, naming the ids:
+// - a FOLLOW-UP that Claude ruled (or a cached copy of one) with no follow-up issue filed yet (E9: the issue is what makes the dismissal real);
+// - an item marked implemented through files other than the one it names (item.implementedVia 'other-files', E7) that no LATER round's prompt
+//   asked Codex to confirm (round.confirmFixed).
+export function reviewEligibilityProblems(state) {
+  const problems = [];
+  const rounds = state?.rounds ?? [];
+  const noIssue = allItems(state).filter((i) => isClaudeRuled(i) && i.final?.decision === 'FOLLOW-UP' && !i.followupIssue).map((i) => i.id);
+  if (noIssue.length > 0) problems.push(`Claude-ruled follow-up(s) without a filed issue: ${noIssue.join(', ')} (run followups create, or rule them ACCEPT)`);
+  const unconfirmed = rounds.flatMap((r) => (r.items ?? [])
+    .filter((i) => i.implementedVia === 'other-files' && !rounds.some((later) => later.n > r.n && Array.isArray(later.confirmFixed) && later.confirmFixed.includes(i.id)))
+    .map((i) => i.id));
+  if (unconfirmed.length > 0) problems.push(`fix(es) made outside the file the finding names, not yet confirmed by a later review round: ${unconfirmed.join(', ')} (run another codex-review round)`);
+  return problems;
+}

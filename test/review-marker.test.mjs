@@ -18,13 +18,16 @@ test('one marker, one status name everywhere', () => {
   assert.equal(GUARD_CONTEXT_CHECKS[REVIEW_CONTEXT], 'review');
 });
 
+// The reader adds the rulings digest ('none' when the marker has none: every marker written before rulings, and every review without any).
+const READ = { ...RECORD, rulingsDigest: 'none' };
+
 test('parseReviewRecord round-trips what review-complete posts, with or without a Fable digest', () => {
-  assert.deepEqual(parseReviewRecord(reviewCompleteBody(RECORD)), RECORD);
+  assert.deepEqual(parseReviewRecord(reviewCompleteBody(RECORD)), READ);
   const fable = { ...RECORD, modelProofDigest: 'd'.repeat(64) };
-  assert.deepEqual(parseReviewRecord(reviewCompleteBody(fable)), fable);
-  assert.deepEqual(parseReviewRecord(reviewCompleteBody(RECORD).replace(/\n/g, '\r\n')), RECORD, 'CRLF line ends');
+  assert.deepEqual(parseReviewRecord(reviewCompleteBody(fable)), { ...fable, rulingsDigest: 'none' });
+  assert.deepEqual(parseReviewRecord(reviewCompleteBody(RECORD).replace(/\n/g, '\r\n')), READ, 'CRLF line ends');
   // extra keys are dropped, not trusted
-  assert.deepEqual(Object.keys(parseReviewRecord(reviewCompleteBody({ ...RECORD, approved: true }))), Object.keys(RECORD));
+  assert.deepEqual(Object.keys(parseReviewRecord(reviewCompleteBody({ ...RECORD, approved: true }))), Object.keys(READ));
 });
 
 test('parseReviewRecord refuses anything that is not exactly the shape', () => {
@@ -62,4 +65,35 @@ test('latestReviewComment: an edited or malformed newest comment is refused, and
   assert.deepEqual([malformed.record, malformed.comment.id], [null, 3]);
   assert.match(malformed.reason, /does not carry a valid review record/);
   assert.equal(latestReviewComment([comment({ updated: undefined })], owner).record, null, 'no updated_at: treated as edited');
+});
+
+// ---- the rulings digest in the marker (plan 2026-11-05-claude-rulings.md E5) ----------------------------------------------------------
+
+test('rulingsDigest: written only when there are rulings, read back as 64 hex; absent reads as none', () => {
+  const digest = 'e'.repeat(64);
+  const body = reviewCompleteBody({ ...RECORD, rulingsDigest: digest });
+  assert.equal(parseReviewRecord(body).rulingsDigest, digest);
+  assert.match(body, /"rulingsDigest":"e{64}"/);
+  assert.equal(parseReviewRecord(reviewCompleteBody(RECORD)).rulingsDigest, 'none', 'a legacy marker has no field');
+  assert.doesNotMatch(reviewCompleteBody(RECORD), /rulingsDigest/);
+});
+
+test('rulingsDigest: a malformed value makes the whole record null (never read as none)', () => {
+  for (const bad of ['e'.repeat(63), 'E'.repeat(64), 'none', '', null, 7, ['e'.repeat(64)]]) {
+    assert.equal(parseReviewRecord(reviewCompleteBody({ ...RECORD, rulingsDigest: bad })), null, JSON.stringify(bad));
+  }
+});
+
+test('an ordinary marker body is byte-identical to what it was before rulings existed', () => {
+  // The exact body review-complete posted for a review with no rulings (snapshot taken before the field existed).
+  const expected = [
+    '<!-- claude-pipeline:review-complete v1 -->',
+    '**Cross-model review complete** for `aaaaaaaaaaaa`: 2 round(s), Codex `gpt-6-astra`.',
+    '',
+    '```json',
+    '{"contentHash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","base":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","rounds":2,"codexModel":"gpt-6-astra","modelProofDigest":null}',
+    '```',
+    '',
+  ].join('\n');
+  assert.equal(reviewCompleteBody(RECORD), expected);
 });
