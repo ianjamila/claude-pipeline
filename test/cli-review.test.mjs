@@ -1639,7 +1639,8 @@ const REVIEW_COMMENT = [
   { match: 'issues/7/comments --paginate', stdoutJson: [] },
   { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 77, html_url: 'https://github.com/acme/widgets/pull/7#issuecomment-77' } },
 ];
-const postedBodies = (w) => w.fake.calls().filter((c) => c.argv.join(' ').startsWith(`api -X POST repos/${w.slug}/issues/7/comments `)).map((c) => JSON.parse(c.stdin).body);
+// review-complete now publishes the triage state first, so the bodies posted include a triage comment: these are the review-complete markers.
+const postedBodies = (w) => w.fake.calls().filter((c) => c.argv.join(' ').startsWith(`api -X POST repos/${w.slug}/issues/7/comments `)).map((c) => JSON.parse(c.stdin).body).filter((b) => b.startsWith('<!-- claude-pipeline:review-complete'));
 const reviewJson = (body) => JSON.parse(/```json\n(.*)\n```/.exec(body)[1]);
 
 test('review-complete: removes awaiting-review only when the review is valid for the current content', (t) => {
@@ -3354,6 +3355,7 @@ test('triage owner-ruling: works on a published round, and a state rebuilt from 
     ...GH,
     { match: '^api user', stdout: 'me\n' },
     { match: 'issues/7/comments --paginate', stdoutJson: [{ id: 9, user: { login: 'me' }, body: triageComment(ruled) }] },
+    { match: '^api -X PATCH repos/acme/widgets/issues/comments/9 ', stdoutJson: { id: 9, html_url: 'u9' } }, // review-complete publishes the state first
   ];
   const w = ownerWorld(t, { gh, yml: CHAT_YML });
   const shown = w.cli(['state', 'show', '--pr', '7']);

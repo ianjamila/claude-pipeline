@@ -11,7 +11,11 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createCommentsGh, createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
+import { decodeFromComment } from '../pipeline/lib/state.mjs';
+import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
+import { reviewEligibilityProblems, rulingsDigest } from '../pipeline/lib/triage.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { ownerRules, rulingRequest } from './helpers/owner-go.mjs';
 import { applyClaudeRuling, settleSecondReview } from '../pipeline/lib/triage.mjs';
@@ -37,7 +41,8 @@ const sugg = (over = {}) => finding({ title: 'Rename helper', file: 'src/b.js', 
 const findingsOf = (blocking = [], suggestions = [], worth = []) => ({ summary: 'Reviewed.', blocking, suggestions, worth_considering: worth });
 const DISPUTED = { disputedBug: true, settleTest: { possible: true, plan: 'write a failing test' } };
 
-function world(t, { yml = CHAT_YML, slug = 'acme/widgets' } = {}) {
+// comments: true swaps in a gh that remembers the PR's comments (test/fixtures/fake-gh-comments.mjs), so a publication can be read back.
+function world(t, { yml = CHAT_YML, slug = 'acme/widgets', comments = false } = {}) {
   const repo = createTmpRepo();
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
@@ -51,13 +56,14 @@ function world(t, { yml = CHAT_YML, slug = 'acme/widgets' } = {}) {
   const head = repo.commit('feature');
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-claude-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
-  const fake = createFakeGh([
+  const fake = (comments ? createCommentsGh : createFakeGh)([
     { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: head } },
     { match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: slug, url: `https://github.com/${slug}` } },
+    { match: '^pr edit 7 ', code: 0 },
   ]);
   const lockDir = join(scratch, 'locks');
   const w = {
-    repo, base, head, scratch, slug,
+    repo, base, head, scratch, slug, fake,
     cli(args, env = {}) {
       const merged = { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...env };
       for (const k of ['PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_TEST_MODE', 'FAKE_CODEX_OUTPUT']) if (!(k in env)) delete merged[k];
@@ -732,4 +738,207 @@ test('second-review: nothing is recorded when an item changed while Codex was re
     assert.notEqual(after.final?.forcedBy, 'second-review', name);
     if (name !== 'verdict') assert.equal(after.secondReview, undefined, name);
   }
+});
+
+// ---- publication: the commands publish by themselves (plan E1) -----------------------------------------------------------------
+
+const publishedState = (w) => decodeFromComment(w.fake.comments().filter((c) => c.body.startsWith(MARKERS.triage)).at(-1)?.body);
+const markerBodies = (w) => w.fake.comments().filter((c) => c.body.startsWith('<!-- claude-pipeline:review-complete'));
+
+test('claude-ruling publishes under the lock by itself; a GitHub failure leaves the local result (published:false) and a later comment triage succeeds', (t) => {
+  const w = world(t, { comments: true });
+  assertExit(w.codex(1, findingsOf([finding()], [sugg()])), 0);
+  w.wait('R1-B1');
+  w.wait('R1-S1');
+  const ok = w.cli(ruling('R1-B1', 'ACCEPT', { reason: 'real bug' }));
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+  assert.equal(ok.json.published, true);
+  assert.equal(ok.json.next, undefined);
+  assert.equal(publishedState(w).rounds[0].items[0].final.by, 'claude', 'the comment holds the ruling');
+  assert.equal(JSON.parse(readFileSync(join(w.repo.dir, '.review', 'published-baseline.json'), 'utf8')).hash, reviewContentHash(w.state()));
+
+  w.fake.setFail({ write: true });
+  const down = w.cli(ruling('R1-S1', 'FOLLOW-UP', { reason: 'later' }));
+  assertExit(down, 0, down.stdout + down.stderr);
+  assert.equal(down.json.published, false);
+  assert.match(down.json.next, /pipeline comment --pr 7 --kind triage/);
+  assert.equal(w.item('R1-S1').final.by, 'claude', 'the local result stands');
+  assert.equal(publishedState(w).rounds[0].items[1].final.by, 'arbiter', 'and the PR does not have it yet');
+  w.fake.setFail({});
+  const retry = w.cli(['comment', '--pr', '7', '--kind', 'triage']);
+  assertExit(retry, 0, retry.stdout + retry.stderr);
+  assert.equal(publishedState(w).rounds[0].items[1].final.by, 'claude');
+});
+
+test('claude-ruling: a state published by someone else is reported as published:false, publishError stale-publication; the local save stands', (t) => {
+  const w = world(t, { comments: true });
+  assertExit(w.codex(1, findingsOf([finding()], [sugg()])), 0);
+  w.wait('R1-B1');
+  w.wait('R1-S1');
+  assertExit(w.cli(ruling('R1-B1', 'ACCEPT')), 0);
+  // another checkout publishes its own decision on R1-S1 (the PR no longer holds what this copy published)
+  const theirs = w.state();
+  theirs.rounds[0].items[1].final = { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'theirs' };
+  w.fake.addComment({ body: triageComment(theirs) });
+  const r = w.cli(ruling('R1-S1', 'FOLLOW-UP', { reason: 'mine' }));
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.published, false);
+  assert.equal(r.json.publishError, 'stale-publication');
+  assert.match(r.json.next, /pipeline state show --pr 7/);
+  assert.equal(w.item('R1-S1').final.by, 'claude', 'saved locally');
+  assert.equal(publishedState(w).rounds[0].items[1].final.reason, 'theirs', 'the PR was not touched');
+});
+
+test('second-review publishes by itself too, and says how to retry when GitHub is down', (t) => {
+  const w = world(t, { comments: true });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  w.wait('R1-B1');
+  const r = second(w, 'R1-B1', answerOf(['R1-B1', 'REJECT', 'high']));
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.published, true);
+  assert.equal(publishedState(w).rounds[0].items[0].secondReview.decision, 'REJECT');
+  assert.equal(publishedState(w).version, 2);
+  const w2 = world(t, { comments: true });
+  assertExit(w2.codex(1, findingsOf([finding()])), 0);
+  w2.wait('R1-B1');
+  w2.fake.setFail({ write: true });
+  const down = second(w2, 'R1-B1', answerOf(['R1-B1', 'REJECT', 'high']));
+  assertExit(down, 0, down.stdout + down.stderr);
+  assert.equal(down.json.published, false);
+  assert.match(down.json.next, /dismisses it at high confidence.*pipeline comment --pr 7 --kind triage/);
+  assert.equal(w2.item('R1-B1').secondReview.decision, 'REJECT');
+});
+
+// ---- review-complete: eligibility and publication --------------------------------------------------------------------------------
+
+test('review-complete publishes first when a late change made the copies differ; a stale or unreachable PR posts no marker', (t) => {
+  const w = world(t, { comments: true });
+  assertExit(w.codex(1, findingsOf([], [], [sugg()])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  assertExit(w.cli(['state', 'record-followup', '--id', 'R1-W1', '--url', 'https://github.com/acme/widgets/issues/9']), 0); // a late change, after the publication
+  assert.notEqual(reviewContentHash(publishedState(w)), reviewContentHash(w.state()));
+
+  w.fake.setFail({ write: true });
+  const down = w.cli(['review-complete', '--pr', '7']);
+  assertExit(down, 3, down.stdout + down.stderr);
+  assert.equal(markerBodies(w).length, 0, 'no marker before the state is published');
+  w.fake.setFail({});
+
+  // the PR holds another checkout's state: refused, nothing posted
+  const theirs = w.state();
+  theirs.rounds[0].items[0].final = { decision: 'REJECT', by: 'arbiter', needsHuman: false, reason: 'theirs' };
+  w.fake.addComment({ body: triageComment(theirs) });
+  const stale = w.cli(['review-complete', '--pr', '7']);
+  assertExit(stale, 1, stale.stdout + stale.stderr);
+  assert.equal(stale.json.error, 'stale-publication');
+  assert.equal(markerBodies(w).length, 0);
+  assert.equal(w.cli(['state', 'show', '--pr', '7']).json.source, 'quarantined');
+});
+
+test('review-complete: publishes, then posts the marker; the marker has no rulingsDigest unless there are rulings', (t) => {
+  const w = world(t, { comments: true });
+  assertExit(w.codex(1, findingsOf([], [], [sugg()])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  assertExit(w.cli(['state', 'record-followup', '--id', 'R1-W1', '--url', 'https://github.com/acme/widgets/issues/9']), 0);
+  const ok = w.cli(['review-complete', '--pr', '7']);
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+  assert.equal(reviewContentHash(publishedState(w)), reviewContentHash(w.state()), 'the state was published first');
+  assert.equal(markerBodies(w).length, 1);
+  assert.doesNotMatch(markerBodies(w)[0].body, /rulingsDigest/);
+  assert.equal('rulingsDigest' in ok.json.review, false);
+  // a dismissed security item makes the marker carry the digest of the rulings
+  w.edit((s) => { s.rounds[0].items[0].category = 'security'; });
+  const again = w.cli(['review-complete', '--pr', '7']);
+  assertExit(again, 0, again.stdout + again.stderr);
+  assert.equal(again.json.review.rulingsDigest, rulingsDigest(w.state()));
+  assert.match(again.json.review.rulingsDigest, /^[0-9a-f]{64}$/);
+});
+
+test('review-complete refuses a Claude-ruled FOLLOW-UP with no issue, naming it; the issue clears it', (t) => {
+  const w = world(t, { comments: true });
+  assertExit(w.codex(1, findingsOf([], [sugg()])), 0);
+  w.wait('R1-S1');
+  assertExit(w.cli(ruling('R1-S1', 'FOLLOW-UP', { reason: 'later' })), 0);
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.match(r.json.reason, /R1-S1/);
+  assert.match(r.json.reason, /follow-up/i);
+  assert.equal(markerBodies(w).length, 0);
+  assertExit(w.cli(['state', 'record-followup', '--id', 'R1-S1', '--url', 'https://github.com/acme/widgets/issues/9']), 0);
+  assertExit(w.cli(['review-complete', '--pr', '7']), 0);
+});
+
+// ---- mark-implemented: other-files and the confirm round (plan E7) -----------------------------------------------------------------
+
+const roundPrompt = (w, n) => readFileSync(join(w.repo.dir, '.review', `round-${n}`, 'prompt.md'), 'utf8');
+// Round 1 raised B1 on src/a.js; ACCEPT it the given way, then commit a change to `file` and return the new head.
+function acceptAndFix(w, { by, file }) {
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  if (by === 'claude') {
+    w.wait('R1-B1');
+    assertExit(w.cli(ruling('R1-B1', 'ACCEPT', { reason: 'real bug' })), 0);
+  } else {
+    assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  }
+  w.repo.write(file, file === 'src/a.js' ? aFile(true).replace('compute(x.y)', 'compute(x?.y)') : `${bFile}export const fixedElsewhere = true;\n`);
+  return w.repo.commit('fix');
+}
+
+test('mark-implemented: a Claude-ruled ACCEPT fixed in the file it names carries no field', (t) => {
+  const w = world(t);
+  acceptAndFix(w, { by: 'claude', file: 'src/a.js' });
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  assert.equal(w.item('R1-B1').implemented, true);
+  assert.equal('implementedVia' in w.item('R1-B1'), false);
+});
+
+test('mark-implemented: a Claude-ruled ACCEPT fixed in another file is other-files; the next round asks Codex to confirm it and records confirmFixed', (t) => {
+  const w = world(t);
+  const fix = acceptAndFix(w, { by: 'claude', file: 'src/b.js' });
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  assert.equal(w.item('R1-B1').implemented, true);
+  assert.equal(w.item('R1-B1').implementedVia, 'other-files');
+  assert.equal(reviewEligibilityProblems(w.state()).length, 1, 'not eligible until a later round asked');
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: fix }), 0);
+  const prompt = roundPrompt(w, 2);
+  assert.match(prompt, /## Confirm fixed/);
+  assert.match(prompt, /id: R1-B1\ntitle: Missing null check\nfile: src\/a\.js\ndetail: x is dereferenced before it is checked/);
+  assert.match(prompt, /raise it again as a new BLOCKING/);
+  assert.deepEqual(w.state().rounds[1].confirmFixed, ['R1-B1']);
+  assert.equal(w.state().rounds[1].promptSha256, sha256(prompt));
+  assert.deepEqual(reviewEligibilityProblems(w.state()), [], 'a later round asked');
+});
+
+test('mark-implemented: an ordinary (judge) BLOCKING ACCEPT fixed elsewhere gets no field, and the next prompt has no confirm section', (t) => {
+  const w = world(t);
+  const fix = acceptAndFix(w, { by: 'judge', file: 'src/b.js' });
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  assert.equal('implementedVia' in w.item('R1-B1'), false);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: fix }), 0);
+  assert.doesNotMatch(roundPrompt(w, 2), /Confirm fixed/);
+  assert.equal('confirmFixed' in w.state().rounds[1], false);
+});
+
+test('codex-review: a base-only round does not consume a pending confirm; the next real round asks', (t) => {
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  // (codex-review refuses a round that reviews nothing while an ACCEPT is open, so the field is put on an item that is not one; only the field matters to the round)
+  w.edit((s) => { Object.assign(s.rounds[0].items[0], { final: { decision: 'FOLLOW-UP', by: 'claude', needsHuman: false, reason: 'later', claude: { cause: 'low-confidence', critical: false } }, implementedVia: 'other-files' }); });
+  // main moves on and is merged into the branch: nothing of the PR's own changed, so the round is base-only
+  w.repo.checkout('main');
+  w.repo.write('src/main-only.js', 'export const m = 1;\n');
+  w.repo.commit('main moves');
+  w.repo.checkout('feat/x');
+  w.repo.git(['merge', '--no-ff', '-q', '-m', 'Update branch', 'main']);
+  const merged = w.repo.git(['rev-parse', 'HEAD']).trim();
+  const baseOnly = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(baseOnly, 0, baseOnly.stdout + baseOnly.stderr);
+  assert.equal(baseOnly.json.baseOnly, true);
+  assert.equal('confirmFixed' in w.state().rounds[1], false, 'a base-only round asks nothing');
+  w.repo.write('src/b.js', `${bFile}export const fixedElsewhere = true;\n`);
+  const fix = w.repo.commit('fix');
+  assertExit(w.codex(3, findingsOf(), { from: merged, to: fix }), 0);
+  assert.deepEqual(w.state().rounds[2].confirmFixed, ['R1-B1']);
+  assert.match(roundPrompt(w, 3), /## Confirm fixed/);
 });
