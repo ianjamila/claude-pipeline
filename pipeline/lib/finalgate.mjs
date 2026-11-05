@@ -8,7 +8,7 @@
 // git.tree (nothing changed in the working tree since verify ran) and contentHash (the review covered exactly
 // this patch). Each one defeats a different mistake, so none is redundant.
 import { createHash } from 'node:crypto';
-import { readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gh as ghRun } from './proc.mjs';
 import { checkGuardVerdict, GUARD_CONTEXT_CHECKS } from './guard-provenance.mjs';
@@ -35,6 +35,8 @@ export const BLOCKING_LABELS = Object.freeze(['needs-human', 'awaiting-review', 
 // Waiting for that "merge" no longer forces a new verify.
 export const GATE_MAX_AGE_MS = 24 * 60 * 60_000;
 export const PR_FIELDS = Object.freeze(['state', 'headRefOid', 'baseRefName', 'isDraft', 'labels', 'mergeable', 'mergeStateStatus']);
+// --owner-go also needs the commit GitHub says the PR is based on: its scan range is bound to that, not to a local ref.
+export const OWNER_GO_FIELDS = Object.freeze([...PR_FIELDS, 'baseRefOid']);
 
 // What a gate must contain: exactly these checks, each once and passing (config.preview adds none: the gate no longer reads deployments).
 // `merge` refuses a gate file that lacks any of them, so a hand-written or truncated file cannot vouch for a merge.
@@ -158,19 +160,34 @@ export const baseRefFor = (root, config) => reviewBaseRef(config.default_branch,
 export const localContentHash = (root, config) =>
   reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log }, { cwd: root });
 
-function lazyDiff(root, config) {
+// `explicit` ({ sha, branch }, --owner-go): scan merge-base(sha, HEAD)..HEAD for the base commit GitHub names (baseRefOid), never a local
+// ref. The commit must be a local object already (no fetch here, and no fallback to origin/<branch> or the local branch).
+function lazyDiff(root, config, explicit = null) {
   let cached = null;
   return () => {
     if (cached) return cached;
     try {
       const o = { cwd: root };
-      const mb = mergeBase(baseRefFor(root, config), 'HEAD', o);
+      if (explicit !== null) assertBaseObject(explicit, o);
+      const mb = mergeBase(explicit !== null ? explicit.sha : baseRefFor(root, config), 'HEAD', o);
       cached = { ok: true, mb, files: diffFiles(mb, 'HEAD', o) };
     } catch (err) {
       cached = { ok: false, error: String(err?.message ?? err) };
     }
     return cached;
   };
+}
+
+// Throws unless `explicit.sha` is a commit object in this repository, saying what to do about it.
+function assertBaseObject(explicit, o) {
+  if (typeof explicit.sha !== 'string' || !FULL_SHA.test(explicit.sha)) {
+    throw new Error(`GitHub did not name the PR's base commit (baseRefOid is ${JSON.stringify(explicit.sha ?? null)}): cannot bind the scan to it`);
+  }
+  try {
+    git(['cat-file', '-e', `${explicit.sha}^{commit}`], o);
+  } catch {
+    throw new Error(`the PR's base commit ${short(explicit.sha)} is not in this repository: run \`git fetch origin ${explicit.branch}\` and try again (the scan never falls back to a local ref)`);
+  }
 }
 
 // ---- the checks ---------------------------------------------------------------------------------
@@ -193,14 +210,15 @@ function prOpenCheck({ info, head, config, behind = null }) {
 // Why this PR is behind its base, or null: GitHub says BEHIND, or the base tip is not an ancestor of HEAD (the merge base
 // with the base ref is not the base ref's own commit). The local ref can be stale, which only makes this check lenient;
 // GitHub's own mergeStateStatus is the authority.
-function behindBase({ info, diff, root, config }) {
+// `baseSha` (--owner-go): the base tip is the commit GitHub names, not the local ref.
+function behindBase({ info, diff, root, config, baseSha = null }) {
   if (info?.mergeStateStatus === 'BEHIND') return 'GitHub reports the PR is BEHIND its base (mergeStateStatus BEHIND)';
   const d = diff();
   if (!d.ok) return null; // the checks that need the diff report it themselves
   try {
-    const ref = baseRefFor(root, config);
-    const tip = revParse(`${ref}^{commit}`, { cwd: root });
-    if (tip !== d.mb) return `the base (${ref} at ${short(tip)}) is not an ancestor of HEAD; the branch forked from ${short(d.mb)}`;
+    const ref = baseSha ?? baseRefFor(root, config);
+    const tip = baseSha ?? revParse(`${ref}^{commit}`, { cwd: root });
+    if (tip !== d.mb) return `the base (${baseSha ? 'GitHub\'s base commit' : ref} at ${short(tip)}) is not an ancestor of HEAD; the branch forked from ${short(d.mb)}`;
   } catch { /* an unreadable ref was already reported by the diff */ }
   return null;
 }
@@ -695,25 +713,101 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
 // The owner's record says `items none`, but the agent wrote that line: the diff itself must have no owner item either (Fable
 // attacker pass): no blocking hard-stop, no test-integrity violation, and no hard-stop or integrity item the owner merges in chat.
 // A PR that has any of those takes the gated route, where the owner's "merge" is bound to the gate's ownerItems digest.
-export const OWNER_GO_CHECKS = Object.freeze(['pr-open', 'labels', 'ci', 'hardstops', 'integrity', 'owner-items']);
+export const OWNER_GO_CHECKS = Object.freeze(['pr-open', 'labels', 'ci', 'scan-range', 'hardstops', 'integrity', 'owner-items']);
+
+const NAMED_SHOWN = 3;
+
+// The scan of a --owner-go diff is only as good as the objects it reads. Refused (fail closed) when the range cannot be pinned to GitHub's
+// base commit, or when this clone can show a different history than GitHub has: replace refs, a grafts file, a shallow clone. And the
+// scanned file list is cross-checked against GitHub's own list for the PR (pulls/{n}/files, both names of a rename): a file GitHub lists
+// that the local diff lacks means the local objects are not the PR's. (GIT_NO_REPLACE_OBJECTS already makes our own git reads ignore replace refs.)
+function scanRangeCheck({ root, gh, pr, diff, info, explicit }) {
+  const o = { cwd: root };
+  const problems = [];
+  const d = diff();
+  if (!d.ok) problems.push(d.error);
+  const inspect = (what, fn) => {
+    try {
+      return fn();
+    } catch (err) {
+      problems.push(`could not inspect ${what}: ${firstLine(err)}`);
+      return null;
+    }
+  };
+  const replaced = inspect('replace refs', () => git(['for-each-ref', '--count=1', '--format=%(refname)', 'refs/replace/'], o).trim());
+  if (replaced) problems.push(`this repository has replace refs (${replaced}): they can show a history other than GitHub's`);
+  const grafts = inspect('the grafts file', () => resolve(root, git(['rev-parse', '--git-path', 'info/grafts'], o).trim()));
+  if (grafts && existsSync(grafts)) problems.push('this repository has a grafts file (.git/info/grafts): it can show a history other than GitHub\'s');
+  const shallow = inspect('whether the clone is shallow', () => git(['rev-parse', '--is-shallow-repository'], o).trim());
+  if (shallow === 'true') problems.push('this repository is a shallow clone: its history is cut short, so the merge-base and the diff cannot be trusted (git fetch --unshallow)');
+  if (d.ok) {
+    let listed = null;
+    try {
+      listed = typeof gh.pullFiles === 'function' ? gh.pullFiles(pr) : null;
+    } catch (err) {
+      problems.push(`could not read GitHub's file list for the PR (pulls/${pr}/files): ${firstLine(err)}`);
+    }
+    if (listed !== null) {
+      const names = [];
+      let malformed = false;
+      for (const entry of Array.isArray(listed) ? listed : [null]) {
+        if (!isObject(entry) || typeof entry.filename !== 'string' || entry.filename === '') {
+          malformed = true;
+          continue;
+        }
+        names.push(entry.filename);
+        if (typeof entry.previous_filename === 'string' && entry.previous_filename !== '') names.push(entry.previous_filename);
+      }
+      if (malformed) problems.push(`GitHub's file list for the PR (pulls/${pr}/files) could not be read (an entry has no filename)`);
+      const local = new Set(d.files.flatMap(pathsOf));
+      const absent = [...new Set(names.filter((n) => !local.has(n)))];
+      if (absent.length > 0) {
+        problems.push(`GitHub lists ${absent.length} file(s) for the PR that the local diff lacks (${absent.slice(0, NAMED_SHOWN).join(', ')}${absent.length > NAMED_SHOWN ? ', ...' : ''}): the local history is not the PR's`);
+      }
+    } else if (!problems.some((p) => /file list/.test(p))) {
+      problems.push('GitHub\'s file list for the PR could not be read (this gh client has no pullFiles)');
+    }
+  }
+  return problems.length ? check('scan-range', false, problems.join('; ')) : check('scan-range', true, `scanned merge-base(${short(explicit.sha)}, ${short(info?.headRefOid)})..HEAD, ${d.files.length} file(s), all listed by GitHub`);
+}
+
+// The owner-item lines are "<kind> <rule or type> <file>": the area of a line is its second word (hard-stop rule id, integrity kind).
+const areasOf = (lines) => [...new Set(lines.map((l) => String(l).split(' ')[1]).filter((a) => typeof a === 'string' && a !== ''))].sort();
+
 export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep }) {
   const head = headSha({ cwd: root });
-  const info = await readPrSettled({ gh, pr, fields: [...PR_FIELDS], sleep, pauseMs: mergeablePause(env) });
-  const diff = lazyDiff(root, config);
+  const info = await readPrSettled({ gh, pr, fields: [...OWNER_GO_FIELDS], sleep, pauseMs: mergeablePause(env) });
+  // The range is GitHub's: the PR's base commit and head, as read now. headRefOid must be the local HEAD (pr-open), baseRefOid a local object.
+  const explicit = { sha: info?.baseRefOid, branch: typeof info?.baseRefName === 'string' && info.baseRefName !== '' ? info.baseRefName : config.default_branch };
+  const baseSha = typeof explicit.sha === 'string' && FULL_SHA.test(explicit.sha) ? explicit.sha : null;
+  const diff = lazyDiff(root, config, explicit);
   const hardstops = await safely('hardstops', () => hardstopsCheck({ root, config, diff }));
   const integrity = await safely('integrity', () => integrityCheck({ config, diff }));
   const items = [...(hardstops.ownerItems ?? []), ...(integrity.ownerItems ?? [])];
   const checks = [
-    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config }) })),
+    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config, baseSha }) })),
     await safely('labels', () => labelsCheck(info)),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
+    await safely('scan-range', () => scanRangeCheck({ root, gh, pr, diff, info, explicit })),
     hardstops,
     integrity,
     check('owner-items', items.length === 0, items.length === 0
       ? 'none'
       : `${items.length} owner item(s) (${items.slice(0, 3).join('; ')}${items.length > 3 ? '; ...' : ''}): --owner-go only merges a diff without any; run the final gate and merge with --owner-approved-head / --owner-approved-items`),
   ];
-  return { ok: checks.every((c) => c.ok), head, checks, failed: checks.filter((c) => !c.ok).map((c) => c.name) };
+  return {
+    ok: checks.every((c) => c.ok),
+    head,
+    checks,
+    failed: checks.filter((c) => !c.ok).map((c) => c.name),
+    // The range that was scanned, as GitHub named it: the final look before the merge command re-reads both and refuses if either moved.
+    baseRefOid: baseSha,
+    headRefOid: typeof info?.headRefOid === 'string' ? info.headRefOid : null,
+    // The owner items of the diff, all from ONE list: their digest ('none' without items), the lines, and the areas they fall in.
+    ownerItems: ownerItemsDigest(items),
+    ownerItemLines: items,
+    areas: areasOf(items),
+  };
 }
 
 // ---- merge --------------------------------------------------------------------------------------
@@ -765,10 +859,11 @@ async function readMergeSha({ gh, pr, first, sleep, pollMs }) {
 // The last look before the merge command: GitHub as it is NOW. The live gate read the PR and ran slow probes (Codex, CI)
 // after that read, so a label, a pause issue or a new push can have landed since. Returns the reasons the merge
 // must not run (empty = go). An unreadable PR is a reason.
-export async function preMergeProblems({ gh, pr, head }) {
+// `base` (--owner-go): the base commit the scan was of; GitHub's baseRefOid must still be it.
+export async function preMergeProblems({ gh, pr, head, base = null }) {
   let view;
   try {
-    view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft']);
+    view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft', ...(base !== null ? ['baseRefOid'] : [])]);
   } catch (err) {
     return [`could not re-read the PR before merging: ${String(err?.message ?? err)}`];
   }
@@ -776,6 +871,7 @@ export async function preMergeProblems({ gh, pr, head }) {
   if (view?.state !== 'OPEN') problems.push(`PR state is ${view?.state}`);
   if (view?.isDraft !== false) problems.push('PR is a draft');
   if (view?.headRefOid !== head) problems.push(`PR head is now ${short(view?.headRefOid)}, the gate approved ${short(head)}`);
+  if (base !== null && view?.baseRefOid !== base) problems.push(`PR base is now ${short(view?.baseRefOid)}, the scan was of ${short(base)}: scan again`);
   problems.push(...(await waitBlockers(gh)(view)));
   return problems;
 }

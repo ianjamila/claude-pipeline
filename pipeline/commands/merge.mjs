@@ -272,7 +272,8 @@ async function ownerGoMerge({ root, config, pr, gh, ctx }) {
   if (live.head !== head) return refuse('live-check', [`the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`], { head });
   if (!live.ok) return refuse('live-check', live.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`), { head });
 
-  const late = await preMergeProblems({ gh, pr, head });
+  // A.4: the scan was of GitHub's base and head as read by evaluateOwnerGo; the last look re-reads both and refuses if either moved since.
+  const late = await preMergeProblems({ gh, pr, head, base: live.baseRefOid });
   if (late.length > 0) return refuse('pre-merge', late, { head });
 
   const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
@@ -369,7 +370,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   }
 
   for (const b of readBehind(gh, pr)) add(b.kind, b.detail);
-  for (const reason of await preMergeProblems({ gh, pr, head })) add('pre-merge', reason);
+  for (const reason of await preMergeProblems({ gh, pr, head, base: ownerGo ? live.baseRefOid : null })) add('pre-merge', reason);
 
   let ownerStep = null;
   if (ownerRuns) {
