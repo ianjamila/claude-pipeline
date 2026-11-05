@@ -606,8 +606,8 @@ test('a dense graph reached through directory aliases is still bounded', (t) => 
 test('a symlink target spelled with ./ or a trailing / is followed, not mistaken for a dangling link', (t) => {
   const ok = exemptWith(importWorld(t, { 'CLAUDE.md': '# rules\n' }, { 'AGENTS.md': './CLAUDE.md', 'docs/GEMINI.md': '.././CLAUDE.md' }));
   assert.equal(ok.exempt, true, ok.reason);
-  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@linkdir/ledger.md\n' }, { linkdir: 'docs/' })), /CLAUDE\.md imports linkdir\/ledger\.md/);
-  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@linkdir/ledger.md\n' }, { linkdir: './docs' })), /CLAUDE\.md imports linkdir\/ledger\.md/);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@linkdir/ledger.md\n' }, { linkdir: 'docs/' })), /CLAUDE\.md imports linkdir\/ledger\.md \(a symlink to docs\/ledger\.md\), a listed document/);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@linkdir/ledger.md\n' }, { linkdir: './docs' })), /CLAUDE\.md imports linkdir\/ledger\.md \(a symlink to docs\/ledger\.md\), a listed document/);
 });
 
 test('a code file in the commits is named even when an instruction file imports a listed document; the tree is not read for it', (t) => {
