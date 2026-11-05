@@ -26,7 +26,11 @@ import { spawnSync } from 'node:child_process';
 const MAX_HOPS = 32;
 const LOOKUP_TIMEOUT_MS = 3000;
 const REUSE_SKEW_MS = 2000;
-const CLAUDE_COMM = /^claude(?:\.exe)?$/; // the Claude Code binary; the desktop app is `Claude` and is not matched
+// The Claude Code binary; the desktop app is `Claude` and is not matched. A background job's processes rename themselves
+// `claude bg-spare` (the job's own session, parent of its shell) and `claude bg-pty-host` (above it): without them a
+// background job had no Claude ancestor, so the stack hooks refused its private stacks ("no Claude Code process above
+// the hook"). The nearest match wins, so a job is owned by its bg-spare process.
+const CLAUDE_COMM = /^claude(?:\.exe)?(?: bg-[a-z]+(?:-[a-z]+)*)?$/;
 const RUNTIME = /^(?:node|nodejs|bun|deno)(?:\.exe)?$/i;
 // `node …/@anthropic-ai/claude-code/cli.js`, `bun …/claude-code/cli.js`, `bun run /x/claude`, `node "C:\Program Files\x\claude"`
 // (the closing quote after the name is allowed).
