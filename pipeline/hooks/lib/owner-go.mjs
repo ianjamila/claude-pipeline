@@ -86,11 +86,11 @@ export function parseApproval(prompt) {
 // prose between it and the Head line is no part of the block: the request then binds WITHOUT areas, which approves no diff that has any.
 // The needs-human hold (rev 4 items 2a, 5; review note 6): a PR whose hold the owner's "merge" lifts has the Head line carry ONE `· hold <event id>` field between
 // `items …` and `repo …`, and a canonical `Hold <id> by <login> at <ISO>` line (holdBlock) DIRECTLY above that Head line. Block order, top to bottom: Areas (optional),
-// Hold, Head; Areas binds above Head or above a Hold that sits above its Head. UNLIKE Areas, ANY Hold-shaped line anywhere in the reply that is not consumed exactly so
-// (malformed, prose between it and its Head, two in a row, against the 🔀 line, ahead of Areas, another PR's, an id other than its Head's `hold` field) makes the WHOLE reply
-// bind nothing, and so does a Head line with `hold X` and no Hold line right above it; a hold field repeated or after `repo` is no Head line at all. The record keeps the hold
-// id and sha256 of the block (holdDigest). And a request with a hold binds only when the 🔀 line says it lifts the hold (readyLine, LIFT_PHRASE): the phrase with no hold
-// in the block, or a hold with no phrase, binds nothing.
+// Hold, Head; Areas binds above Head or above a Hold that sits above its Head. UNLIKE Areas, a Hold-shaped line (the canonical prefix `Hold <id> by `, HOLD_START; prose such as
+// "Hold on, …" is none) anywhere in the reply that is not consumed exactly so (prose between it and its Head, two in a row, against the 🔀 line, ahead of Areas, another PR's, an id
+// other than its Head's `hold` field, a malformed rest) makes the WHOLE reply bind nothing, and so does a Head line with `hold X` and no Hold line right above it; a hold field repeated
+// or after `repo` is no Head line at all. The record keeps the hold id and sha256 of the block (holdDigest). And a request with a hold binds only when the 🔀 line says it lifts the hold
+// (readyLine, LIFT_PHRASE) AND every request bound carries one (singular: the one PR; plural: all listed): the phrase with no hold in the bound requests, or a hold with no phrase, binds nothing.
 // Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items, repo, areas?, hold?, holdBlock? }] } (repo: the
 // lower-cased owner/name, or null when the line names none: such a request approves nothing; areas: the block's digest, absent = no areas shown; hold: the event id,
 // holdBlock: the Hold block's digest, both absent = no hold).
