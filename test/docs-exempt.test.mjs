@@ -571,6 +571,56 @@ test('an instruction file too large to read cannot be judged: refused', (t) => {
   refused(exemptWith(w), /CLAUDE\.md.*(too large|cannot be (read|judged))/);
 });
 
+// ---- R1 follow-ups to A3: re-entry, link aliases, `./` in link targets, and the order of the checks ---------------------------------------
+
+test('a relative import that leaves the repo and comes back in reaches the listed document: refused', (t) => {
+  const name = (dir) => dir.split('/').at(-1);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': (dir) => `see @../${name(dir)}/docs/ledger.md\n` })), /CLAUDE\.md imports docs\/ledger\.md/);
+  refused(exemptWith(importWorld(t, { 'sub/CLAUDE.md': (dir) => `see @../../${name(dir)}/docs/ledger.md\n` })), /sub\/CLAUDE\.md imports docs\/ledger\.md/);
+  // a chain: the re-entry is followed from an imported file as well
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'docs/guide.md': (dir) => `@../../${name(dir)}/docs/ledger.md\n` })), /guide\.md imports docs\/ledger\.md/);
+  // a path that really leaves the repo and does not come back is still nothing to judge
+  const r = exemptWith(importWorld(t, { 'CLAUDE.md': (dir) => `@../${name(dir)}-other/docs/ledger.md\n` }));
+  assert.equal(r.exempt, true, r.reason);
+});
+
+test('an importer reached through a symlink is checked in the directory it was reached in, as well as where it really is', (t) => {
+  // docs/guide.md is a link to shared/guide.md, which says @ledger.md: from docs/ that is the listed ledger.
+  const w = importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'shared/guide.md': '@ledger.md\n' }, { 'docs/guide.md': '../shared/guide.md' });
+  refused(exemptWith(w), /docs\/guide\.md imports docs\/ledger\.md/);
+  // and the real directory still counts
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'shared/guide.md': '@ledger.md\n', 'shared/ledger.md': 'x\n' }, { 'docs/guide.md': '../shared/guide.md' }, { list: [LEDGER, 'shared/ledger.md'] })), /imports (docs|shared)\/ledger\.md/);
+  // one file reached through two aliases is read from both directories (the second alias is not dropped as seen)
+  const two = importWorld(t, { 'CLAUDE.md': '@a/guide.md @docs/guide.md\n', 'shared/guide.md': '@ledger.md\n', 'a/x': 'x\n' }, { 'a/guide.md': '../shared/guide.md', 'docs/guide.md': '../shared/guide.md' });
+  refused(exemptWith(two), /docs\/guide\.md imports docs\/ledger\.md/);
+});
+
+test('a dense graph reached through directory aliases is still bounded', (t) => {
+  const all = [1, 2, 3, 4, 5, 6, 7].map((n) => `@d${n}.md`).join(' ') + '\n';
+  const files = { 'CLAUDE.md': '@a/d1.md @b/d1.md @c/d1.md\n', ...Object.fromEntries([1, 2, 3, 4, 5, 6, 7].map((n) => [`real/d${n}.md`, all])) };
+  const links = { 'a/d1.md': '../real/d1.md', 'b/d1.md': '../real/d1.md', 'c/d1.md': '../real/d1.md' };
+  const r = exemptWith(importWorld(t, files, links));
+  assert.equal(r.exempt, true, r.reason);
+});
+
+test('a symlink target spelled with ./ or a trailing / is followed, not mistaken for a dangling link', (t) => {
+  const ok = exemptWith(importWorld(t, { 'CLAUDE.md': '# rules\n' }, { 'AGENTS.md': './CLAUDE.md', 'docs/GEMINI.md': '.././CLAUDE.md' }));
+  assert.equal(ok.exempt, true, ok.reason);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@linkdir/ledger.md\n' }, { linkdir: 'docs/' })), /CLAUDE\.md imports linkdir\/ledger\.md/);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@linkdir/ledger.md\n' }, { linkdir: './docs' })), /CLAUDE\.md imports linkdir\/ledger\.md/);
+});
+
+test('a code file in the commits is named even when an instruction file imports a listed document; the tree is not read for it', (t) => {
+  const w = world(t, { baseFiles: { 'CLAUDE.md': '@docs/ledger.md\n' } });
+  w.append('src/b.js', 'export const c = 3;\n');
+  w.repo.commit('code only');
+  const r = refused(exemptWith(w), /src\/b\.js/);
+  assert.doesNotMatch(r.reason, /CLAUDE\.md/);
+  // a docs-only commit in that repo still gets the import refusal
+  const d = importWorld(t, { 'CLAUDE.md': '@docs/ledger.md\n' });
+  refused(exemptWith(d), /CLAUDE\.md imports docs\/ledger\.md/);
+});
+
 // ---- the final gate's review check, and review-complete ---------------------------------------------------------------
 
 const gateRoot = (w) => { saveState(w.dir, w.state); return w.dir; };
