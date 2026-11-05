@@ -882,6 +882,14 @@ async function readMergeSha({ gh, pr, first, sleep, pollMs }) {
   return sha;
 }
 
+// --owner-go: the scan's base commit must be a full sha, whatever the scan-range check says, because the last look (preMergeProblems) only
+// re-reads GitHub's baseRefOid when it is given one. Returns the reason to refuse, or null.
+export function ownerGoBaseProblem(live) {
+  const sha = live?.baseRefOid;
+  if (typeof sha === 'string' && FULL_SHA.test(sha)) return null;
+  return `GitHub did not name the PR's base commit as a full 40-character sha (baseRefOid is ${JSON.stringify(sha ?? null)}): the base cannot be re-read before the merge`;
+}
+
 // The last look before the merge command: GitHub as it is NOW. The live gate read the PR and ran slow probes (Codex, CI)
 // after that read, so a label, a pause issue or a new push can have landed since. Returns the reasons the merge
 // must not run (empty = go). An unreadable PR is a reason.

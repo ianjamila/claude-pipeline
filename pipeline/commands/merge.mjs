@@ -19,7 +19,7 @@ import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { loadState } from '../lib/state.mjs';
 import { approvalConfigDirHint, approvalGap, areasBlock } from '../hooks/lib/owner-go.mjs';
 import {
-  GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, preMergeProblems, readReviewJson,
+  GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, preMergeProblems, readReviewJson,
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
 import { tailLines } from '../lib/cmd-io.mjs';
@@ -272,6 +272,9 @@ async function ownerGoMerge({ root, config, pr, gh, ctx }) {
   const live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env });
   if (live.head !== head) return refuse('live-check', [`the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`], { head });
   if (!live.ok) return refuse('live-check', live.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`), { head });
+  // A.4: never merge without the base re-read below, even if scan-range stops requiring a base sha.
+  const noBase = ownerGoBaseProblem(live);
+  if (noBase !== null) return refuse('live-check', [noBase], { head });
   const gap = approvalGap({ repo, pr, head, items: live.ownerItems, areas: live.areas });
   if (gap !== 'ok') {
     const lines = requestLines({ head, items: live.ownerItems, repo, areas: live.areas });
@@ -350,6 +353,8 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     if (live.head !== head) add('live-check', `the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`);
     for (const c of live.checks.filter((x) => !x.ok)) add('live-check', `${c.name}: ${c.detail}`);
     ownerRuns = live.checks.some((c) => c.name === 'owner-items' && !c.ok);
+    const noBase = ownerGoBaseProblem(live);
+    if (noBase !== null) add('live-check', noBase);
   } else {
     gate = readReviewJson(root, GATE_FILE);
     let hash = '';

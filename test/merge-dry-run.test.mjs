@@ -33,7 +33,7 @@ const prReply = (s, o = {}) => ({
 const script = (s, o = {}) => [
   ...(o.before ?? []),
   { match: '^pr view 12 --json state,headRefOid.*baseRefOid', stdoutJson: prReply(s, o) },
-  ...ghEntries({ prHead: s.head, mergeStateStatus: o.merge ?? 'CLEAN', labels: o.labels, behindBy: o.behindBy, ...o.gh }),
+  ...ghEntries({ prHead: s.head, prFiles: s.prFiles, mergeStateStatus: o.merge ?? 'CLEAN', labels: o.labels, behindBy: o.behindBy, ...o.gh }),
 ];
 
 // Every .review file with its bytes: a dry run changes none.
@@ -298,6 +298,16 @@ test('dry run --owner-go: the owner-go route preconditions are checked live, the
   const bad = dry(s, ['--owner-go']);
   assertExit(bad.r, 1);
   assert.match(bad.r.json.blockers.map((b) => b.detail).join('\n'), /labels: blocking label[\s\S]*ci: /);
+});
+
+test('dry run --owner-go: a baseRefOid that is not a full sha is its own blocker (the base re-read cannot be skipped), besides scan-range', () => {
+  const s = scenario({ report: null, state: null, gh: { mergeStateStatus: 'CLEAN' } });
+  s.fake.setScript(script(s, { baseRefOid: 'nothex' }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 1);
+  assert.equal(d.r.json.wouldMerge, false);
+  assert.match(d.r.json.blockers.map((b) => b.detail).join('\n'), /did not name the PR's base commit as a full 40-character sha \(baseRefOid is null\)/);
+  assert.deepEqual(d.writes, []);
 });
 
 test('dry run --owner-go, chat mode, a protected diff -> say-merge with the LIVE items digest and the Areas line; nothing is written', async () => {

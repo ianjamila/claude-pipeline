@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { bump, cli, ghEntries, scenario, ymlFor, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { evaluateOwnerGo, preMergeProblems } from '../pipeline/lib/finalgate.mjs';
+import { evaluateOwnerGo, ownerGoBaseProblem, preMergeProblems } from '../pipeline/lib/finalgate.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { ownerItemsDigest } from '../pipeline/hooks/lib/owner-go.mjs';
 
@@ -260,4 +260,20 @@ test('evaluateOwnerGo on a diff without items: ownerItems is "none", no lines, n
   const live = await evaluateOwnerGo({ root: s.repo.dir, config, pr: PR, gh: stubGh(s), env: {} });
   assert.equal(live.ok, true, JSON.stringify(live.checks.filter((c) => !c.ok)));
   assert.deepEqual([live.ownerItems, live.ownerItemLines, live.areas], ['none', [], []]);
+});
+
+// ---- the base re-read cannot hinge on scan-range -------------------------------------------------------------------------------------
+
+test('ownerGoBaseProblem: only a full 40-hex baseRefOid lets the merge go on (P merge --owner-go and its dry run both ask)', async () => {
+  const s = plainScenario();
+  const { config } = await loadConfig(s.repo.dir);
+  const live = await evaluateOwnerGo({ root: s.repo.dir, config, pr: PR, gh: stubGh(s), env: {} });
+  assert.equal(ownerGoBaseProblem(live), null);
+  for (const baseRefOid of [null, undefined, '', 'main', 'nothex', 'A'.repeat(40), 'b'.repeat(39), 'b'.repeat(41), 7]) {
+    assert.match(ownerGoBaseProblem({ ...live, baseRefOid }) ?? '', /did not name the PR's base commit as a full 40-character sha/, String(baseRefOid));
+  }
+  // and the real thing: GitHub's view without baseRefOid gives a live result that carries none
+  const noBase = await evaluateOwnerGo({ root: s.repo.dir, config, pr: PR, gh: { ...stubGh(s), prView: () => ({ ...stubGh(s).prView(), baseRefOid: undefined }) }, env: {} });
+  assert.equal(noBase.baseRefOid, null);
+  assert.match(ownerGoBaseProblem(noBase), /base commit/);
 });
