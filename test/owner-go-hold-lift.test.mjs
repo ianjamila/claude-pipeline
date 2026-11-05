@@ -14,7 +14,9 @@ import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { bump, cli, scenario, ymlFor, LOCK_DIR, MERGE_SHA, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { holdBlock, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
-import { MARKERS } from '../pipeline/lib/render.mjs';
+import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
+import { comment as prComment, rulingState } from './helpers/rulings-world.mjs';
+import { withReviewLock } from '../pipeline/lib/review-context.mjs';
 import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import { runShellAsync } from '../pipeline/lib/proc.mjs';
 import { findOrphanedLift, installRestoreOnSignal, mergeLockName, parseTimeline, readEligibleHold, withHoldLifted, withMergeLock } from '../pipeline/lib/hold.mjs';
@@ -1155,4 +1157,32 @@ test('recovery: --disable-auto fails because auto-merge was never armed (autoMer
   // still armed after the failed disable => the alarm stays
   const s = world({ state: orphaned(), gh: { disableAutoCode: 1, autoMergeRequest: { enabledAt: '2026-11-05T09:00:00Z' } } });
   assert.equal(s.go().json.autoMergeDisarmFailed, true);
+});
+
+// ---- the review-complete check and the review lock, with a hold (plan 2026-11-05-claude-rulings E2, E5) -------------------------------------------------
+
+test('a failing review-complete check is found before the lift: the needs-human label stays, nothing is written, nothing merges', (t) => {
+  // history on the PR (a triage comment of ours) but no review state in this checkout: the review is not finished here
+  const s = world({ state: { comments: [prComment(31, triageComment(rulingState({ hash: 'a'.repeat(64) })))] } });
+  const d = s.dry();
+  assertExit(d, 1, `${d.stderr}${d.stdout}`);
+  assert.match(JSON.stringify(d.json.blockers), /review-complete/);
+  assert.equal(d.json.ownerStep.kind, 'say-merge', 'the owner step is still reported');
+  ownerSays(t, 'merge', replyOf(d.json.ownerStep));
+  const r = s.go();
+  refused(r, 'live-check', /review-complete.*state show --pr 12/);
+  untouched(s);
+  assert.equal(s.idx(DELETE), -1, 'the label was never lifted');
+});
+
+test('the review lock held by a writer: the merge refuses lock-timeout BEFORE the hold is touched', async (t) => {
+  const s = world();
+  approve(t, s);
+  let r;
+  await withReviewLock(s.repo.dir, PR, { env: { PIPELINE_LOCK_DIR: LOCK_DIR } }, async () => {
+    r = cli(['merge', '--pr', String(PR), '--owner-go'], { dir: s.repo.dir, fake: s.fake, env: { ...s.env, PIPELINE_LOCK_WAIT_MS: '200' } });
+  });
+  refused(r, 'lock-timeout', /review lock/);
+  untouched(s);
+  assert.equal(s.idx(DELETE), -1, 'the label was never lifted');
 });
