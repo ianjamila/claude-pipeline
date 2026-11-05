@@ -5,7 +5,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseYaml } from './yaml.mjs';
-import { globToRegExp } from './glob.mjs';
+import { globToRegExp, matchAny } from './glob.mjs';
+import { isDocPath } from './doc-paths.mjs';
+import { isUniversalHardStopPath } from './hardstops.mjs';
 
 // How many verify proofs a run record holds, and how long a proof step name may be. Defined here (config.mjs is vendored into
 // project repos; run-record.mjs is not) and imported by run-record.mjs, so a config this file accepts always fits the record.
@@ -83,6 +85,11 @@ export const DEFAULTS = deepFreeze({
     light_lane_max_lines: 50,
     // Paths whose every review round gets the Fable pass (triage + its own review), whatever the risk level.
     arbiter_always_paths: [],
+    // EXACT repo-relative paths of ordinary documents (lib/doc-paths.mjs#isDocPath, no hard-stop path, not under supabase/ or a
+    // migrations directory, not on integrity.test_globs, hard_stops.paths, review.arbiter_always_paths or risk.high_risk_paths).
+    // A commit after the last review round that only ADDS lines to these files needs no new round (lib/docs-exempt.mjs).
+    // Empty = off.
+    docs_exempt_paths: [],
   },
   agent_log: 'docs/agent-log.md',
 });
@@ -150,7 +157,7 @@ const KEYS = {
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'arbiter_always_paths'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'arbiter_always_paths', 'docs_exempt_paths'],
   smoke: ['path', 'status', 'contains', 'location_contains'],
 };
 
@@ -174,6 +181,49 @@ function merge(base, over) {
     return out;
   }
   return structuredClone(over);
+}
+
+// Why `p` may not be listed in review.docs_exempt_paths, or null when it may. `lists` is [[name, globs]] of the project's own
+// protected paths (integrity.test_globs, hard_stops.paths, review.arbiter_always_paths, risk.high_risk_paths). Used by validation
+// AND by lib/docs-exempt.mjs at run time, so a list that skipped validation is judged by the same rules. Two parts, both required:
+// it IS an ordinary document, and nothing protects its path. Globs match case-insensitively (over-matching is the safe direction);
+// a glob that cannot be read protects everything.
+export function docsExemptProblem(p, lists = []) {
+  if (typeof p !== 'string' || p === '') return 'must be a non-empty string';
+  if (/[\x00-\x1f\x7f\\]/.test(p)) return 'must not contain control characters or backslashes';
+  if (/[*?[\]{}]/.test(p)) return 'must be an exact path, not a glob';
+  const parts = p.split('/');
+  if (p.startsWith('/') || parts.some((s) => s === '' || s === '.' || s === '..')) return 'must be a normalised repo-relative path (no leading "/" or "./", no "..", no trailing "/")';
+  if (!isDocPath(p)) return 'is not an ordinary document (markdown anywhere, text/rst/adoc under docs/, LICENSE/CHANGELOG; never an agent instruction file (CLAUDE / AGENTS / AGENT / GEMINI .md and their .<variant>.md forms such as .override.md / .local.md, .cursorrules, copilot-instructions.md), html, mdx, source, or a file under a dot-directory (.claude, .github, .cursor ...), app/, pages/, skills/, agents/, pipeline/ or scripts/)';
+  if (parts.slice(0, -1).some((s) => ['supabase', 'migrations'].includes(s.toLowerCase()))) return 'is under supabase/ or a migrations directory';
+  if (isUniversalHardStopPath(p)) return 'is claimed by a hard-stop path rule (secrets, auth, sensitive data, pipeline or agent-instruction files ...)';
+  for (const [name, globs] of lists) {
+    try {
+      if (Array.isArray(globs) && matchAny(p, globs.filter((g) => typeof g === 'string'), { nocase: true })) return `is protected by ${name}`;
+    } catch {
+      return `cannot be judged: a glob in ${name} could not be read`;
+    }
+  }
+  return null;
+}
+
+// review.docs_exempt_paths: an array of exact, distinct, eligible document paths.
+function checkDocsExempt(config, errors) {
+  const list = config.review?.docs_exempt_paths;
+  if (!Array.isArray(list)) return errors.push('review.docs_exempt_paths must be an array of exact document paths');
+  const lists = [
+    ['integrity.test_globs', config.integrity?.test_globs],
+    ['hard_stops.paths', config.hard_stops?.paths],
+    ['review.arbiter_always_paths', config.review?.arbiter_always_paths],
+    ['risk.high_risk_paths', config.risk?.high_risk_paths],
+  ];
+  const seen = new Set();
+  list.forEach((p, i) => {
+    const why = docsExemptProblem(p, lists);
+    if (why) errors.push(`review.docs_exempt_paths[${i}] (${JSON.stringify(p)}) ${why}`);
+    else if (seen.has(p)) errors.push(`review.docs_exempt_paths[${i}] (${JSON.stringify(p)}) is listed twice`);
+    seen.add(p);
+  });
 }
 
 // Optional. verify.after_fix_steps_by_path: { "<glob>": [step, ...] } - the extra steps (run as `verify.full --only ...`) a
@@ -598,6 +648,7 @@ export function validateConfig(obj) {
 
   const integrity = section(config, 'integrity', errors);
   if (integrity) checkStrArray(integrity.test_globs, 'integrity.test_globs', errors);
+  if (review) checkDocsExempt(config, errors); // after the lists it compares against
 
   const ci = section(config, 'ci', errors);
   if (ci) {

@@ -558,3 +558,11 @@ test('final gate review: a forged grant, a round past max+1 with none, or a wron
   assert.equal(reviewOf(granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'owner' }]), w).ok, false);
   assert.equal(reviewOf(granted([{}, {}, {}]), w).ok, true, 'legacy state, within max+1');
 });
+
+test('isDocsOnly: markdown under an app/ or pages/ route directory is code, dot-directory docs are not docs', () => {
+  assert.equal(isDocsOnly([f('src/app/page.md')]), false);
+  assert.equal(isDocsOnly([f('pages/landing.md')]), false);
+  assert.equal(isDocsOnly([f('README.md'), f('.windsurf/rules/x.md')]), false);
+  assert.equal(isDocsOnly([f('AGENTS.override.md')]), false);
+  assert.equal(isDocsOnly([f('docs/agent-guide/prod-ledger.md')]), true);
+});

@@ -17,6 +17,7 @@ import { assessRisk, reviewLane } from '../lib/risk.mjs';
 import { loadState } from '../lib/state.mjs';
 import { reviewValidFor, roundOutcome } from '../lib/triage.mjs';
 import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
+import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
 import { currentContentHash, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 
@@ -84,11 +85,17 @@ export function reviewRecord(state, { contentHash, base, head, modelProofs, defa
   };
 }
 
-export function reviewCompleteBody(record) {
+// docsExempt ({ files, reviewedHead }, lib/docs-exempt.mjs): the head is past the last reviewed one only by lines added to listed documents.
+// The record is unchanged (the guards read the same JSON); the extra line is for the people reading the PR.
+export function reviewCompleteBody(record, docsExempt = null) {
   const fable = record.modelProofDigest ? `, Fable proof \`${record.modelProofDigest.slice(0, 8)}\`` : '';
+  const docs = docsExempt
+    ? [`**Docs-only exemption** (review.docs_exempt_paths): lines were added to ${docsExempt.files.map((f) => `\`${f}\``).join(', ')} after the last reviewed head \`${docsExempt.reviewedHead.slice(0, 12)}\`; no new review round.`]
+    : [];
   return [
     REVIEW_COMPLETE_MARKER,
     `**Cross-model review complete** for \`${record.head.slice(0, 12)}\`: ${record.rounds} round(s), Codex \`${record.codexModel}\`${fable}.`,
+    ...docs,
     '',
     '```json',
     JSON.stringify(record),
@@ -126,8 +133,17 @@ export const run = guarded(async (argv, ctx) => {
         };
       }
       const hash = currentContentHash(root, config);
+      // The review is valid for the content as it is, or (review.docs_exempt_paths) the content is the reviewed one plus lines added to
+      // listed documents. The same helper decides it in the final gate; everything below (grants, Fable, the lane) runs either way.
+      let docsExempt = null;
       if (!state || !reviewValidFor(state, hash)) {
-        return { exitCode: EXIT.FAILED, output: { ok: false, reason: whyNot(state, hash), currentContentHash: hash } };
+        const ex = state ? docsExemptFrom(state, { root, config, hash }) : null;
+        if (!ex?.exempt) {
+          const why = whyNot(state, hash);
+          const note = ex && !ex.off ? `; the docs-only exemption does not apply: ${ex.reason}` : '';
+          return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${why}${note}`, currentContentHash: hash } };
+        }
+        docsExempt = ex;
       }
       // The same proof as the final gate: a round past review.max_rounds must be backed by the owner's record and its marker.
       const grants = verifyOwnerGrants(state, { repo: gh.repo().slug, pr, maxRounds: config.review.max_rounds });
@@ -139,7 +155,7 @@ export const run = guarded(async (argv, ctx) => {
       const record = reviewRecord(state, {
         contentHash: hash, base, head: local, modelProofs: fableProofs(state), defaultCodexModel: config.review.codex_model,
       });
-      const body = reviewCompleteBody(record);
+      const body = reviewCompleteBody(record, docsExempt);
       // Retrying after a crash must not stack identical comments: our own latest marker comment with this exact body stands.
       // It must also be what the guard workflow will judge (lib/review-marker.mjs#latestReviewComment): the newest marker comment
       // of ANY author, and never edited — an edited one, even if edited back to this text, fails there forever (Codex review of
@@ -178,6 +194,7 @@ export const run = guarded(async (argv, ctx) => {
         exitCode: EXIT.OK,
         output: {
           ok: true, ...(reused ? { reused: true } : { posted: true }), comment, review: record, removed: true, recheck,
+          ...(docsExempt ? { docsExempt: { files: docsExempt.files, reviewedHead: docsExempt.reviewedHead } } : {}),
           ...(recheckError ? { recheckError } : {}), pr, currentContentHash: hash,
         },
       };
