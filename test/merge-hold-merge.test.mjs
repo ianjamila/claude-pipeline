@@ -338,6 +338,74 @@ test('dry run, a stale PR behind a hold: the "update the branch" advice is withd
   const behind = d.json.blockers.find((b) => b.kind === 'behind-base');
   assert.match(behind.detail, /do NOT update the branch/);
   assert.doesNotMatch(behind.detail, /P update-branch/);
+  // The pr-open live check carries the same advice ("behind-base: …; update the branch from main and re-verify before merging").
+  const everything = JSON.stringify(d.json);
+  assert.doesNotMatch(everything.replace(/do NOT update the branch/g, ''), /update the branch|P update-branch|re-verify before merging/i, 'no stale-branch advice anywhere in the output');
+  assert.ok(d.json.blockers.some((b) => b.kind === 'live-check' && /behind-base/.test(b.detail) && /do NOT update the branch/.test(b.detail)), 'the live-check entry is rewritten, not dropped');
+});
+
+test('dry run --owner-go, a stale PR behind a hold: no "update the branch" advice anywhere either', () => {
+  const s = scenario({ yml: holdYml({ merge: goMergeCmd }), baseFiles: holdFiles, report: null, state: null, change: unique });
+  s.fake.setScript(dryScript(s, { merge: 'BEHIND' }));
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(BLOCKED) }, ['--owner-go']);
+  assertExit(d, 1);
+  assert.ok(kinds(d).includes('merge-hold'), JSON.stringify(d.json.blockers));
+  assert.ok(d.json.blockers.some((b) => b.kind === 'live-check' && /behind-base/.test(b.detail)), JSON.stringify(d.json.blockers));
+  assert.doesNotMatch(JSON.stringify(d.json).replace(/do NOT update the branch/g, ''), /update the branch|P update-branch|re-verify before merging/i);
+});
+
+// ---- ownerStep.holdEligible: may this hand-off take the merge hold? Computed in code, read by the review skill -------------------
+
+const hardStopHoldYml = () => `${holdYml({ merge: goMergeCmd })}hard_stops:\n  paths: ['**']\n`;
+const ownerRunsWorld = (o = {}) => {
+  const s = scenario({ yml: hardStopHoldYml(), baseFiles: holdFiles, report: null, state: null, change: unique });
+  s.fake.setScript(dryScript(s, o));
+  return s;
+};
+
+test('dry run --owner-go, say-merge with nothing ahead: wouldMerge and ownerStep.holdEligible true', () => {
+  const s = scenario({ yml: holdYml({ merge: goMergeCmd }), baseFiles: holdFiles, report: null, state: null, change: unique });
+  s.fake.setScript(dryScript(s));
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']);
+  assertExit(d, 0, `${d.stderr}${d.stdout}`);
+  assert.equal(d.json.ownerStep.kind, 'say-merge');
+  assert.equal(d.json.ownerStep.holdEligible, true);
+});
+
+test('dry run --owner-go, owner-runs whose ONLY blockers are the owner-items check and the hardstops check behind it: holdEligible true although wouldMerge is false', () => {
+  const s = ownerRunsWorld();
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']);
+  assertExit(d, 1, `${d.stderr}${d.stdout}`);
+  assert.equal(d.json.wouldMerge, false);
+  assert.equal(d.json.ownerStep.kind, 'owner-runs');
+  assert.deepEqual(d.json.blockers.map((x) => x.detail.split(':')[0]), ['hardstops', 'owner-items'], JSON.stringify(d.json.blockers));
+  assert.equal(d.json.ownerStep.holdEligible, true);
+});
+
+test('dry run --owner-go, owner-runs with a hold ahead: holdEligible false (the merge-hold blocker disqualifies)', () => {
+  const s = ownerRunsWorld();
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(BLOCKED) }, ['--owner-go']);
+  assertExit(d, 1);
+  assert.equal(d.json.ownerStep.kind, 'owner-runs');
+  assert.ok(kinds(d).includes('merge-hold'));
+  assert.equal(d.json.ownerStep.holdEligible, false);
+});
+
+test('dry run --owner-go, owner-runs with another blocker (the PR is behind): holdEligible false', () => {
+  const s = ownerRunsWorld({ merge: 'BEHIND' });
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']);
+  assertExit(d, 1);
+  assert.equal(d.json.ownerStep.kind, 'owner-runs');
+  assert.ok(kinds(d).includes('behind-base'), JSON.stringify(d.json.blockers));
+  assert.equal(d.json.ownerStep.holdEligible, false);
+});
+
+test('dry run --owner-go, say-merge: a hold ahead makes the hand-off ineligible, and so does an unreadable check', () => {
+  const s = scenario({ yml: holdYml({ merge: goMergeCmd }), baseFiles: holdFiles, report: null, state: null, change: unique });
+  s.fake.setScript(dryScript(s));
+  assert.equal(dry(s, { FAKE_HOLD_CHECK_SEQ: seq(BLOCKED) }, ['--owner-go']).json.ownerStep.holdEligible, false);
+  assert.equal(dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR), FAKE_HOLD_CHECK_EXIT: '1' }, ['--owner-go']).json.ownerStep.holdEligible, false);
+  assert.equal(dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']).json.ownerStep.holdEligible, true);
 });
 
 test('dry run, a repo WITHOUT the hold keys: no `holds` key at all and no shell call', () => {
