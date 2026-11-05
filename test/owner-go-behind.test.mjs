@@ -152,6 +152,18 @@ test('behind_base disjoint: main removed src/foo/, which the PR adds a file into
   refusedBehind(goMerge(s), s, /removed src\/foo\/, which this PR adds into \(src\/foo\/new\.js\)/);
 });
 
+// Codex code review R1: the directory is compared folded. Called directly with the PR's side as a diff entry: a case-insensitive checkout
+// (macOS, Windows) cannot even write src/foo/new.js next to src/Foo/, and main's side (real commits) is what must be read folded.
+test('behind_base disjoint: main removed src/Foo/ and the PR adds src/foo/new.js -> the same directory, folded (rule 4b)', () => {
+  const s = fresh({ baseFiles: { 'src/Foo/a.js': 'a\n' } });
+  const tip = mainMoves(s, (repo) => repo.git(['rm', '-q', '-r', 'src/Foo']));
+  const r = behindFreshEnough({
+    root: s.repo.dir, config: { default_branch: 'main' }, baseSha: tip, info: { mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' },
+    diff: () => ({ ok: true, mb: s.baseTip, files: [{ status: 'A', oldPath: null, newPath: 'src/foo/new.js' }] }),
+  });
+  assert.deepEqual(r, { ok: false, reason: 'main removed src/foo/, which this PR adds into (src/foo/new.js)' });
+});
+
 // ---- rule 4: nothing on main's side changes how the checks run ------------------------------------------------------------------------
 
 const hits = [
@@ -295,11 +307,28 @@ test('waitBlockers: with a base it asks for baseRefOid and blocks on any other (
   assert.deepEqual(seen[0], ['state', 'mergeCommit', 'labels', 'baseRefOid']);
 });
 
-test('behindFreshEnough never throws and never returns null: a missing base sha or a failed diff is { ok: false }', () => {
+test('behindFreshEnough never throws and never returns null: a missing base sha is { ok: false }', () => {
   const diff = () => ({ ok: false, error: 'boom' });
   for (const baseSha of [undefined, null, 'main', '', 'a'.repeat(39)]) {
     const r = behindFreshEnough({ root: '.', config: { default_branch: 'main' }, diff, baseSha, info: {} });
     assert.equal(r.ok, false);
     assert.equal(typeof r.reason, 'string');
   }
+});
+
+// Codex code review R1: the case above returns before the diff is ever taken. Here the base is a real opted-in commit and GitHub's state is
+// readable, so the diff IS read: a failed PR diff, and a failed read of main's side, are each a refusal with its reason (never a throw or null).
+test('behindFreshEnough: with an opted-in base and a readable state, a failed PR diff or an unreadable main side is { ok: false }', () => {
+  const s = fresh();
+  const tip = mainMoves(s, (repo) => repo.write('other.txt', 'x\n'));
+  const args = { root: s.repo.dir, config: { default_branch: 'main' }, baseSha: tip, info: { mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' } };
+  let calls = 0;
+  const failed = behindFreshEnough({ ...args, diff: () => { calls += 1; return { ok: false, error: 'boom' }; } });
+  assert.equal(calls, 1, 'the PR diff was read');
+  assert.deepEqual(failed, { ok: false, reason: "the PR's diff could not be taken (boom)" });
+
+  const missing = 'f'.repeat(40); // a well-formed merge base that is not in the repository: main's side cannot be diffed
+  const mainSide = behindFreshEnough({ ...args, diff: () => ({ ok: true, mb: missing, files: [] }) });
+  assert.equal(mainSide.ok, false);
+  assert.match(mainSide.reason, /could not (compare|count)/);
 });

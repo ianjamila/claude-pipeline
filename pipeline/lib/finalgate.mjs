@@ -275,16 +275,25 @@ export function behindFreshEnough({ root, config, diff, baseSha, info }) {
       if (hit !== undefined) return no(`${config.default_branch} changed ${p}, which changes how the checks run (matches ${hit})`);
     }
 
-    // 4b: a path-level clash disjoint names cannot see (main moves src/foo/, the PR adds src/foo/new.js).
-    const hasEntries = (rev, dir) => git(['ls-tree', '--name-only', '-z', rev, '--', `${dir}/`], o) !== '';
-    const checked = new Map();
+    // 4b: a path-level clash disjoint names cannot see (main moves src/foo/, the PR adds src/foo/new.js). Directories are compared folded,
+    // like the files above: main removing src/Foo/ while the PR adds src/foo/new.js is the same directory on a case-insensitive (or
+    // normalising) file system, so a literal tree lookup of the PR's spelling would miss it (Codex code review R1).
+    const foldedDirs = (rev) => {
+      const dirs = new Set();
+      for (const file of git(['ls-tree', '-r', '--name-only', '-z', rev], o).split('\0')) {
+        const parts = file.split('/');
+        for (let i = 1; i < parts.length; i += 1) dirs.add(foldPath(parts.slice(0, i).join('/')));
+      }
+      return dirs;
+    };
+    const atBase = foldedDirs(baseSha);
+    const removed = new Set([...foldedDirs(mb)].filter((dir) => !atBase.has(dir)));
     for (const f of d.files) {
       if ((f.status !== 'A' && f.status !== 'R') || typeof f.newPath !== 'string') continue;
       const parts = f.newPath.split('/');
       for (let i = 1; i < parts.length; i += 1) {
         const dir = parts.slice(0, i).join('/');
-        if (!checked.has(dir)) checked.set(dir, hasEntries(mb, dir) && !hasEntries(baseSha, dir));
-        if (checked.get(dir)) return no(`${config.default_branch} removed ${dir}/, which this PR adds into (${f.newPath})`);
+        if (removed.has(foldPath(dir))) return no(`${config.default_branch} removed ${dir}/, which this PR adds into (${f.newPath})`);
       }
     }
     return { ok: true, behindBy, mergeBase: mb, mainFiles: mainPaths.length };
