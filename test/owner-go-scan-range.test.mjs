@@ -4,10 +4,11 @@
 // disagrees with GitHub's, and a base or head that moved between the scan and the merge command.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
-import { cli, ghEntries, scenario, ymlFor, PR } from './helpers/gate-env.mjs';
+import { bump, cli, ghEntries, scenario, ymlFor, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { evaluateOwnerGo, preMergeProblems } from '../pipeline/lib/finalgate.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
@@ -15,9 +16,12 @@ import { ownerItemsDigest } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const goYml = () => ymlFor().replace('{pr} {sha}', '{pr} --match-head-commit {sha}');
 const protectedYml = (mode = 'chat') => `${goYml()}hard_stops:\n  paths: ['src/**']\nowner_approval: ${mode}\n`;
+// Every fixture gets its own head: the owner's records are matched on repo, PR and head, and identical fixtures made in the same second would
+// share a head with the records other test files write (see test/helpers/owner-go.mjs), so a record here could approve a merge there.
+const unique = (change = bump) => (repo) => { change(repo); repo.write('.salt', randomUUID()); };
 // A protected PR (src/** is a hard-stop path, owner_approval: chat) without the review evidence --owner-go never needs.
-const protectedScenario = (opts = {}) => scenario({ yml: protectedYml(), report: null, state: null, ...opts });
-const plainScenario = (opts = {}) => scenario({ yml: goYml(), report: null, state: null, ...opts });
+const protectedScenario = (opts = {}) => scenario({ yml: protectedYml(), report: null, state: null, ...opts, change: unique(opts.change) });
+const plainScenario = (opts = {}) => scenario({ yml: goYml(), report: null, state: null, ...opts, change: unique(opts.change) });
 const goMerge = (s) => cli(['merge', '--pr', String(PR), '--owner-go'], { dir: s.repo.dir, fake: s.fake, env: s.env });
 const refusedWith = (r, pattern, s) => {
   assertExit(r, 1);
