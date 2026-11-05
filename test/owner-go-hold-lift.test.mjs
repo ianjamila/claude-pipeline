@@ -158,8 +158,9 @@ test('real run, eligible hold + a record naming it: the lift comment comes BEFOR
   assert.ok(!s.lines().some((l) => READD.test(l)), 'merged: the label is not put back');
   const st = s.st();
   assert.deepEqual(st.labels, []);
-  assert.equal(st.comments.length, 1);
+  assert.equal(st.comments.length, 2, 'the lift comment and the delete marker');
   assert.match(st.comments[0].body, /claude-pipeline:event:hold-lifted:/);
+  assert.match(st.comments[1].body, /claude-pipeline:event:hold-lift-deleted:/);
   assert.match(st.comments[0].body, new RegExp(`hold LE_hold1 lifted on the owner's merge for head ${s.head.slice(0, 12)} items [0-9a-f]{12}`));
 });
 
@@ -433,7 +434,7 @@ function memGh({ labels = ['needs-human'], timeline = [HOLD_EVENT], comments = [
     prView: (pr, fields) => { m.calls.push(`prView ${fields.join(',')}`); return { state: m.prState, headRefOid: 'h', labels: m.labels.map((name) => ({ name })) }; },
     addLabels: (pr, names) => { m.calls.push(`add ${names}`); if (failAdd) throw new Error('boom 502'); for (const n of names) if (!m.labels.includes(n)) { m.labels.push(n); m.timeline.push(ev('labeled', n, `LE_re${m.timeline.length}`, 'me', '2026-11-05T10:30:00Z')); } },
     deleteLabel: (pr, name) => { m.calls.push(`delete ${name}`); m.labels = m.labels.filter((l) => l !== name); m.timeline.push(ev('unlabeled', name, 'UE_own', 'me', '2026-11-05T10:00:00Z')); },
-    createComment: (pr, body) => { m.calls.push('comment'); m.comments.push({ body, user: { login: 'me' } }); return { id: 1 }; },
+    createComment: (pr, body) => { m.calls.push('comment'); const id = 100 + m.comments.length; m.comments.push({ id, body, user: { login: 'me' } }); m.timeline.push({ event: 'commented', id, node_id: `IC_${id}`, created_at: '2026-11-05T10:00:01Z', actor: { login: 'me' }, body }); return { id }; },
     listComments: () => m.comments,
     viewer: () => 'me',
   });
@@ -762,4 +763,83 @@ test('withHoldLifted, item 4a: an unreadable timeline after the re-add claims no
   assert.equal(r.output.holdRestored, false);
   assert.equal(r.output.holdRestoreUnverified, true);
   assert.ok(gh.comments.some((c) => /event:hold-lift-aborted:/.test(c.body)));
+});
+
+// ---- Codex round 1, finding 1: the post-delete read must be at least as new as the delete (the hold-lift-deleted marker) ----------
+
+const MARKER = /event:hold-lift-deleted:/;
+const swapHooks = [{ match: 'api -X DELETE', phase: 'before', push: [{ event: 'unlabeled', login: 'x' }, { event: 'labeled', login: 'x', node_id: 'LE_newer' }] }]; // (somebody swaps hold A for hold B before our delete, which then removes B)
+const STALE = [HOLD_EVENT, ev('unlabeled', 'needs-human', 'UE_x', 'x', '2026-11-05T09:10:00Z')]; // (A and the other removal; not yet B, our delete or the marker)
+
+test('real run, Codex 1.1: a marker comment follows the delete (same lift id) and the merge goes ahead only after the read shows it', async (t) => {
+  const s = world();
+  approve(t, s);
+  const r = s.go();
+  assertExit(r, 0, `${r.stderr}${r.stdout}`);
+  const [liftComment, markerComment] = s.st().comments;
+  assert.match(liftComment.body, /event:hold-lifted:(pr12-[0-9a-f]{16}) /);
+  assert.match(markerComment.body, MARKER);
+  assert.equal(/event:hold-lift-deleted:(\S+) /.exec(markerComment.body)[1], /event:hold-lifted:(\S+) /.exec(liftComment.body)[1], 'the same lift id');
+  const lines = s.lines();
+  const posts = lines.map((l, i) => (COMMENT.test(l) ? i : -1)).filter((i) => i >= 0);
+  assert.ok(posts.length === 2 && posts[0] < s.idx(DELETE) && s.idx(DELETE) < posts[1], `lift comment, delete, marker: ${lines.join(' | ')}`);
+  assert.equal(s.mergeCalls().length, 1);
+});
+
+test('real run, Codex 1.1: hold A swapped for hold B before the delete, and a STALE post-delete read (no B, no marker) => never merged, put back, refused', async (t) => {
+  const s = world({ state: { hooks: swapHooks, overrides: { timeline: { 3: { events: STALE }, 4: { events: STALE }, 5: { events: STALE }, 6: { events: STALE } } } } });
+  approve(t, s);
+  const r = s.go();
+  refused(r, 'hold', /marker/);
+  restored(s, r);
+  assert.deepEqual(s.mergeCalls(), []);
+  assert.equal(s.st().timelineReads, 1 + 1 + 4 + 1, 'eligibility, step 2, the post-delete read and 3 retries, then the restore check');
+});
+
+test('real run, Codex 1.1: the same swap read consistently (B and the marker both shown) => newer hold, put back, refused', async (t) => {
+  const s = world({ state: { hooks: swapHooks } });
+  approve(t, s);
+  const r = s.go();
+  refused(r, 'hold', /a newer hold appeared \(LE_newer\)/);
+  restored(s, r);
+  assert.ok(s.st().comments.some((c) => MARKER.test(c.body)), 'the marker was posted');
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('real run, Codex 1.1: the marker never shows in the timeline (3 retries) => put back and refused, not merged', async (t) => {
+  const s = world({ state: { noCommentedEvents: true } });
+  approve(t, s);
+  const r = s.go();
+  refused(r, 'hold', /marker/);
+  restored(s, r);
+  assert.equal(s.st().timelineReads, 1 + 1 + 4 + 1);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('real run, Codex 1.1: the marker comment cannot be posted => put back and refused, not merged', async (t) => {
+  const s = world({ state: { fail: { commentBody: 'hold-lift-deleted' } } });
+  approve(t, s);
+  const r = s.go();
+  refused(r, 'hold', /could not post the delete marker/);
+  restored(s, r);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('real run, Codex 1.1: two needs-human removals between the bound hold and the marker => refused (exactly one is ours), put back', async (t) => {
+  const s = world({ state: { hooks: [{ match: 'api -X DELETE', phase: 'before', push: [{ event: 'unlabeled', login: 'x' }] }] } });
+  approve(t, s);
+  const r = s.go();
+  refused(r, 'hold', /more than one/);
+  restored(s, r);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('recovery, Codex 1.1: a marker comment after the lift comment does not hide the orphan (with or without it)', async () => {
+  const marker = { id: 10, body: renderEvent('hold-lift-deleted', 'pr12-x', 'hold LE_hold1 label deleted', { hold: HOLD.id }), user: { login: 'me' }, created_at: '2026-11-05T09:31:00Z', updated_at: '2026-11-05T09:31:00Z' };
+  const base = orphaned();
+  for (const comments of [base.comments, [...base.comments, marker]]) {
+    const s = world({ state: { ...base, comments } });
+    refused(s.go(), 'hold-recovery', /lifted needs-human hold LE_hold1 and died/);
+    assert.deepEqual(s.st().labels, ['needs-human']);
+  }
 });

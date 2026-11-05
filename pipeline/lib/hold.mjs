@@ -5,8 +5,8 @@
 // blocker. The pipeline never says whose hold it is (the account is shared); the owner is shown the machine-generated Hold block.
 //
 // withHoldLifted is the real run's lift, in order: re-read the timeline (the bound hold must still be the newest), post the append-only
-// lift comment, install signal handlers, DELETE the label, read the timeline again (it must show the delete's own `unlabeled` event and no
-// newer hold), the plain blocker check, then the merge. Whenever nothing merged, the label is put back (a new hold: the owner says
+// lift comment, install signal handlers, DELETE the label, post the append-only `hold-lift-deleted` marker comment, read the timeline again (it must show
+// that marker, which makes the read at least as new as the delete, then exactly one needs-human removal before it and no newer hold), the plain blocker check, then the merge. Whenever nothing merged, the label is put back (a new hold: the owner says
 // "merge" again) unless the PR is MERGED or someone else removed it; a run that exits WITHOUT its delete having taken effect posts an
 // append-only `hold-lift-aborted` event so recovery never mistakes a later manual removal for its own. A lift comment with no label and
 // no merge (the run was killed) is put right by recoverOrphanedLift. A signal kills the merge command's process group and disarms
@@ -37,8 +37,10 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export function parseTimeline(list) {
   if (!Array.isArray(list)) return { ok: false, why: 'the timeline reply is not a list' };
   const events = [];
+  const comments = []; // the `commented` events (id = the comment's id): the ordering barrier of the post-delete read
   for (const [index, e] of list.entries()) {
     if (!isObject(e)) return { ok: false, why: `timeline entry ${index} is not an object` };
+    if (e.event === 'commented' && (typeof e.id === 'number' || (typeof e.id === 'string' && e.id !== ''))) comments.push({ index, id: String(e.id) });
     if (e.event !== 'labeled' && e.event !== 'unlabeled') continue;
     if (typeof e.node_id !== 'string' || e.node_id === '' || typeof e.created_at !== 'string' || !ISO.test(e.created_at)
       || !isObject(e.actor) || typeof e.actor.login !== 'string' || e.actor.login === '' || !isObject(e.label) || typeof e.label.name !== 'string') {
@@ -46,7 +48,7 @@ export function parseTimeline(list) {
     }
     events.push({ index, kind: e.event, id: e.node_id, at: e.created_at, login: e.actor.login, label: e.label.name });
   }
-  return { ok: true, events };
+  return { ok: true, events, comments };
 }
 
 export function readTimeline(gh, pr) {
@@ -246,15 +248,22 @@ export async function recoverOrphanedLift({ gh, pr, refuse, strict = true, env =
 
 // ---- the lift -----------------------------------------------------------------------------------
 
-// After the delete: what the timeline says. 'newer' = a newer needs-human hold exists; 'ok' = the bound hold, then this delete's own unlabeled event, nothing newer;
-// 'pending' = the bound hold is there but the delete's event is not yet.
-function judgeAfterDelete(events, hold) {
+// After the delete: what the timeline says. 'newer' = a newer needs-human hold exists; 'ambiguous' = more than one removal before the marker (one is not ours to claim);
+// 'ok' = the bound hold, then exactly one needs-human removal before THIS run's marker, nothing newer; 'pending' = the read is not yet as new as the delete: the marker comment
+// (posted right after the delete, matched by the id the POST returned) is not in it, or the removal is not before it.
+// Why the marker: any `unlabeled` event after the bound hold could be somebody else's. A read that shows the marker is at least as new as the delete, so the removals it shows
+// before the marker are all there are, and exactly one of them is ours.
+function judgeAfterDelete(read, hold, markerId) {
+  const { events, comments } = read;
   const bound = events.find((e) => e.kind === 'labeled' && isHold(e.label) && e.id === hold.id);
   if (!bound) return { status: 'unreadable', why: 'the bound hold event is not in the timeline' };
   const newer = holdEvents(events).filter((e) => e.kind === 'labeled' && e.id !== hold.id && (e.index > bound.index || e.at > bound.at));
   if (newer.length > 0) return { status: 'newer', why: `a newer hold appeared (${newer.at(-1).id})` };
-  const own = holdEvents(events).find((e) => e.kind === 'unlabeled' && e.index > bound.index);
-  return own ? { status: 'ok' } : { status: 'pending', why: 'the timeline does not show the removal of the label' };
+  const marker = comments.find((c) => c.id === markerId);
+  if (!marker) return { status: 'pending', why: 'the timeline does not yet show this run\'s hold-lift-deleted marker comment, so the read may predate the delete' };
+  const removals = holdEvents(events).filter((e) => e.kind === 'unlabeled' && e.index > bound.index && e.index < marker.index);
+  if (removals.length > 1) return { status: 'ambiguous', why: `the timeline shows more than one needs-human removal after the hold (${removals.map((e) => e.id).join(', ')}), so this run's own cannot be told` };
+  return removals.length === 1 ? { status: 'ok' } : { status: 'pending', why: 'the timeline does not show the removal of the label' };
 }
 
 // `check()` returns the problems that stop a merge once the hold is lifted (the plain rule); `merge()` returns the command's { exitCode, output };
@@ -334,15 +343,30 @@ export async function withHoldLifted({ gh, pr, hold, head, items, repo, env = {}
         result = refuse('hold', [`could not remove needs-human from #${pr} (${msg(err)}); the hold was not lifted`], base);
       }
     }
+    // 4b. The ordering barrier: an append-only marker comment right after the delete. The post-delete read must show it (matched by the comment id the POST returned),
+    // which proves that read is at least as new as the delete. Posting fails => the hold is put back, as for every other way out that did not merge.
+    let markerId = null;
+    let markerFailure = null;
     if (deleted) {
-      // 5. The proof the read is current: this delete's own `unlabeled` event after the bound hold, and no newer hold.
+      try {
+        const posted = postEvent(gh, pr, 'hold-lift-deleted', liftId(pr, hold), `hold ${hold.id} label deleted on the owner's merge`, { pr, hold: hold.id });
+        markerId = posted?.id === undefined || posted?.id === null || posted.id === '' ? null : String(posted.id);
+        if (markerId === null) markerFailure = 'the reply names no comment id';
+      } catch (err) {
+        markerFailure = msg(err);
+      }
+    }
+    if (deleted && markerFailure !== null) {
+      result = refuse('hold', [`could not post the delete marker comment on #${pr} (${markerFailure}): the hold was put back and nothing was merged`], base);
+    } else if (deleted) {
+      // 5. The proof the read is current: it shows the marker, exactly one removal of needs-human after the bound hold and before the marker, and no newer hold.
       const timing = holdTiming(env);
       let verdict = { status: 'unreadable', why: 'the timeline was not read' };
       for (let attempt = 0; attempt <= timing.retries; attempt += 1) {
         if (attempt > 0) await sleep(timing.pauseMs);
         const read = readTimeline(gh, pr);
-        verdict = read.ok ? judgeAfterDelete(read.events, hold) : { status: 'unreadable', why: read.why };
-        if (verdict.status === 'newer' || verdict.status === 'ok') break;
+        verdict = read.ok ? judgeAfterDelete(read, hold, markerId) : { status: 'unreadable', why: read.why };
+        if (verdict.status === 'newer' || verdict.status === 'ambiguous' || verdict.status === 'ok') break;
       }
       if (verdict.status !== 'ok') {
         result = refuse('hold', [`${verdict.why}: the hold was put back and nothing was merged`], base);

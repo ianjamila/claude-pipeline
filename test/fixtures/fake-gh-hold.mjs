@@ -2,7 +2,7 @@
 // fake-gh.mjs (PIPELINE_FAKE_GH_SCRIPT, PIPELINE_FAKE_GH_LOG), plus a state file (PIPELINE_FAKE_GH_STATE) that the label, timeline and comment
 // routes read and write, so the order of the calls shows in the state they leave:
 //   { labels: [names], prState?, timeline: [events], comments: [comments], clock, seq,
-//     fail: { delete?, deleteButDone?, add?, comment?, commentButStored?, timelineFrom?, timelineTo?, listComments?: <n> }, pageSize?: <timeline events per page>, overrides: { timeline: { "<nth read>": { raw?, code?, stderr?, events? } } },
+//     fail: { delete?, deleteButDone?, add?, comment?, commentBody?: <regex source: only a comment whose body matches fails>, commentButStored?, timelineFrom?, timelineTo?, listComments?: <n> }, pageSize?: <timeline events per page>, overrides: { timeline: { "<nth read>": { raw?, code?, stderr?, events? } } },
 //     hooks: [{ match: <regex source>, phase: 'before' | 'after', nth?: 1, addLabels?, removeLabels?, push?: [events], prState? }] }
 // Routes: `api -X DELETE .../issues/12/labels/needs-human` (removes the label, appends an `unlabeled` event by "me"), `pr edit 12 --add-label X`
 // (adds it, appends a `labeled` event by "me" with a new node id), GET .../issues/12/timeline, GET / POST .../issues/12/comments. Every
@@ -84,9 +84,13 @@ const run = () => {
   }
   if (/^api -X POST repos\/acme\/widgets\/issues\/12\/comments/.test(joined)) {
     if (state.fail?.comment) return out(undefined, 1, 'gh: Server Error (HTTP 500)');
+    const body = JSON.parse(stdin).body;
+    if (state.fail?.commentBody && new RegExp(state.fail.commentBody).test(body)) return out(undefined, 1, 'gh: Server Error (HTTP 500)');
     const id = 700 + next();
     const t = now();
-    state.comments.push({ id, body: JSON.parse(stdin).body, user: { login: 'me' }, created_at: t, updated_at: t });
+    state.comments.push({ id, body, user: { login: 'me' }, created_at: t, updated_at: t });
+    // GitHub shows every issue comment in the timeline as a `commented` event whose `id` is the comment's id: the ordering barrier of the post-delete read.
+    if (!state.noCommentedEvents) state.timeline.push({ event: 'commented', id, node_id: `IC_fake${id}`, created_at: t, actor: { login: 'me' }, body });
     if (state.fail?.commentButStored) return out(undefined, 1, 'gh: timed out (the comment was stored)');
     return out({ id, html_url: `https://github.com/acme/widgets/pull/12#issuecomment-${id}` });
   }
