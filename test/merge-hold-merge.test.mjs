@@ -431,8 +431,9 @@ test('dry run --owner-go: a hold ahead is a merge-hold blocker and holds is repo
   assert.deepEqual(writes(s), []);
 });
 
-// A scan that CRASHED (safely() turns the throw into a failed 'could not evaluate' check) is no verdict: it also fails owner-items, so the hand-off
-// looks like owner-runs, but taking the merge hold for a PR whose hard-stop / integrity scan never ran would stall every other merge for nothing.
+// A scan that CRASHED (safely() turns the throw into a failed 'could not evaluate' check) is no verdict: it also fails owner-items, but a PR whose
+// hard-stop / integrity scan never ran is not an owner-runs hand-off (the owner would merge it by hand with no scan): ownerStep stays null, the
+// blockers are the answer, and nothing takes the merge hold.
 const TOO_COMPLEX = `${'*/'.repeat(20)}x`; // more wildcards than a glob may have (lib/glob.mjs tooComplex): the matcher throws
 const crashWorld = (extraYml) => {
   const s = scenario({ yml: `${holdYml({ merge: goMergeCmd })}${extraYml}`, baseFiles: holdFiles, report: null, state: null, change: unique });
@@ -440,22 +441,22 @@ const crashWorld = (extraYml) => {
   return s;
 };
 
-test('dry run --owner-go, a hardstops scan that threw: the owner-runs hand-off is NOT holdEligible', () => {
+test('dry run --owner-go, a hardstops scan that threw: no owner-runs hand-off (ownerStep null), the crash is the blocker', () => {
   const s = crashWorld(`hard_stops:\n  paths: ['${TOO_COMPLEX}']\n`);
   const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']);
   assertExit(d, 1, `${d.stderr}${d.stdout}`);
-  assert.equal(d.json.ownerStep.kind, 'owner-runs');
+  assert.equal(d.json.wouldMerge, false);
+  assert.equal(d.json.ownerStep, null);
   assert.ok(d.json.blockers.some((b) => /^hardstops: could not evaluate/.test(b.detail)), JSON.stringify(d.json.blockers));
-  assert.equal(d.json.ownerStep.holdEligible, false);
 });
 
-test('dry run --owner-go, an integrity scan that threw: the owner-runs hand-off is NOT holdEligible', () => {
+test('dry run --owner-go, an integrity scan that threw: no owner-runs hand-off (ownerStep null), the crash is the blocker', () => {
   const s = crashWorld(`integrity:\n  test_globs: ['${TOO_COMPLEX}']\n`);
   const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']);
   assertExit(d, 1, `${d.stderr}${d.stdout}`);
-  assert.equal(d.json.ownerStep.kind, 'owner-runs');
+  assert.equal(d.json.wouldMerge, false);
+  assert.equal(d.json.ownerStep, null);
   assert.ok(d.json.blockers.some((b) => /^integrity: could not evaluate/.test(b.detail)), JSON.stringify(d.json.blockers));
-  assert.equal(d.json.ownerStep.holdEligible, false);
 });
 
 test('dry run --owner-go, a real hard-stop hit still hands off with holdEligible true (the crash guard does not cover verdicts)', () => {
@@ -463,4 +464,32 @@ test('dry run --owner-go, a real hard-stop hit still hands off with holdEligible
   const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']);
   assert.match(d.json.blockers.find((b) => /^hardstops:/.test(b.detail)).detail, /hard-stop hit\(s\)/);
   assert.equal(d.json.ownerStep.holdEligible, true);
+});
+
+// The other scan can still carry an ownerMerge count while one crashed (chat mode: a skipped test is an owner-merge integrity item). That count
+// must not turn the crash into an owner-runs hand-off either, on the gate route (counts from the live gate) or on --owner-go.
+const skipChange = (repo) => { unique(repo); repo.write('src/app.test.js', "test.skip('x', () => {});\n"); };
+const crashWithItemWorld = () => {
+  const s = scenario({
+    yml: `${holdYml({ merge: goMergeCmd })}owner_approval: chat\nintegrity:\n  test_globs: ['**/*.test.js']\nhard_stops:\n  paths: ['${TOO_COMPLEX}']\n`,
+    baseFiles: holdFiles, report: null, state: null, change: skipChange,
+  });
+  s.fake.setScript(dryScript(s));
+  return s;
+};
+
+test('dry run (gate route), a hardstops scan that threw while integrity carries an owner-merge item: ownerStep null, not owner-runs', () => {
+  const s = crashWithItemWorld();
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) });
+  assertExit(d, 1, `${d.stderr}${d.stdout}`);
+  assert.ok(d.json.blockers.some((b) => /^hardstops: could not evaluate/.test(b.detail)), JSON.stringify(d.json.blockers));
+  assert.equal(d.json.ownerStep, null);
+});
+
+test('dry run --owner-go, a hardstops scan that threw while integrity carries an owner-merge item: ownerStep null, not owner-runs', () => {
+  const s = crashWithItemWorld();
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']);
+  assertExit(d, 1, `${d.stderr}${d.stdout}`);
+  assert.ok(d.json.blockers.some((b) => /^hardstops: could not evaluate/.test(b.detail)), JSON.stringify(d.json.blockers));
+  assert.equal(d.json.ownerStep, null);
 });

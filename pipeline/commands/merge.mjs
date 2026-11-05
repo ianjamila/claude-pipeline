@@ -372,13 +372,19 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   let live;
   let ownerRuns = false;
   let flags = null;
+  // A hardstops / integrity scan that threw or could not diff (a failed check WITHOUT verdict: true) is no verdict at all: whatever else the
+  // live gate says (owner-items fails behind it, or another check's ownerMerge count), nothing is handed to the owner and ownerStep stays null.
+  const scanCrashed = (checks) => checks.some((c) => !c.ok && ['hardstops', 'integrity'].includes(c.name) && c.verdict !== true);
+  let crashed = false;
 
   if (ownerGo) {
     if (gh.repo().host !== 'github.com') add('owner-go', hostProblem(gh));
     live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env });
     if (live.head !== head) add('live-check', `the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`);
     const failed = live.checks.filter((x) => !x.ok);
-    ownerRuns = failed.some((c) => c.name === 'owner-items');
+    crashed = scanCrashed(failed);
+    // owner-items fails for a verdict (a hardstops / integrity check carrying verdict: true) or for its own label / area reasons; a crashed scan fails it too.
+    ownerRuns = !crashed && failed.some((c) => c.name === 'owner-items');
     for (const c of failed) {
       const b = add('live-check', `${c.name}: ${c.detail}`);
       // hardstops / integrity only as a real verdict (c.verdict): a scan that threw ("could not evaluate") or could not diff is no hand-off.
@@ -409,7 +415,9 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
       add(/proof-settings-unverified/.test(c.detail) ? 'proof-settings-unverified' : 'live-check', `${c.name}: ${c.detail}`);
     }
     if (gate !== null && (live.head !== gate.head || live.contentHash !== gate.contentHash)) add('live-check', 'the live gate is for a different head or patch than final-gate.json approved');
-    ownerRuns = Number(live.ownerMerge) > 0 || Number(gate?.ownerMerge) > 0;
+    // One scan crashing leaves the other check's ownerMerge count standing, so the live checks are asked, not the count alone.
+    crashed = scanCrashed(live.checks);
+    ownerRuns = !crashed && (Number(live.ownerMerge) > 0 || Number(gate?.ownerMerge) > 0);
   }
 
   for (const b of readBehind(gh, pr)) add(b.kind, b.detail);
@@ -435,7 +443,9 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   }
 
   let ownerStep = null;
-  if (ownerRuns) {
+  if (crashed) {
+    // No owner step: the crashed scan is a blocker to fix first, not a merge to hand over.
+  } else if (ownerRuns) {
     try {
       ownerStep = { kind: 'owner-runs', command: fill(config.merge.command, { pr: String(pr), sha: head }, { strict: true }) };
     } catch (err) {
