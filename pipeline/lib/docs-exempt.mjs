@@ -56,7 +56,7 @@ const MAX_TOKENS = 5000;
 const MAX_LINK_FOLLOWS = 40;
 const REGULAR_MODES = new Set(['100644', '100755']);
 // `@path`: at the start of a line or after a character that cannot end a word (whitespace, a bracket, a quote, markup).
-const IMPORT_TOKEN = /(?:^|[^A-Za-z0-9.\-/@\\])@((?:[^\s\\]|\\ )+)/gm;
+const IMPORT_TOKEN = /(?:^|[^A-Za-z0-9.\-/@\\])@((?:\\ |[^\s])+)/gm;
 const TRAILING_PUNCTUATION = /[)\]}>"'`.,;:!?*_~|]+$/;
 const lc = (s) => s.toLowerCase();
 class Unjudgeable extends Error {}
@@ -109,8 +109,8 @@ function resolveInTree(tree, rel, readBlob) {
     if (++follows > MAX_LINK_FOLLOWS) throw new Unjudgeable(`symlinks at ${real} cycle`);
     const target = readBlob(entry.oid, real);
     if (target === '' || target.includes('\0')) throw new Unjudgeable(`${real} is a symlink with an unreadable target`);
-    if (target.startsWith('/')) throw new Unjudgeable(`${real} is a symlink to an absolute path`);
-    segs = [...target.split('/').filter((s) => s !== '' && s !== '.'), ...segs];
+    if (isAbsoluteOrHome(target)) throw new Unjudgeable(`${real} is a symlink to an absolute path`);
+    segs = [...slashed(target).split('/').filter((s) => s !== '' && s !== '.'), ...segs];
     // `done` is the directory that holds the link, unchanged: the target is relative to it.
   }
   const full = done.join('/');
@@ -122,6 +122,12 @@ function resolveInTree(tree, rel, readBlob) {
   if (hit.length > 1) throw new Unjudgeable(`${full} is ambiguous (two names that differ only in case)`);
   return { path: hit[0], entry: tree.entries.get(hit[0]) };
 }
+
+// A path that names a place outside the reviewed tree whatever the platform: rooted (`/x`, `\x`, `\\server\share`), the home directory (`~`, `~/x`,
+// `~\x`) or a drive (`C:`, `c:/x`, `C:x`). Windows forms count on every platform: the same tree is reviewed on all of them, and over-matching is safe.
+const isAbsoluteOrHome = (p) => /^(?:[/\\]|~(?:[/\\]|$)|[A-Za-z]:)/.test(p);
+// A backslash separates like a slash, so `..\x` climbs and `docs\ledger.md` is `docs/ledger.md`.
+const slashed = (p) => p.replaceAll('\\', '/');
 
 // The paths an `@token` may stand for, as written (escaped spaces undone; trailing punctuation and a #fragment cut off in turn).
 function candidatesOf(token) {
@@ -189,10 +195,10 @@ function importProblem({ listed, tree, o }) {
       if (++tokens > MAX_TOKENS) return `${path} cannot be judged: too many @ tokens`;
       for (const written of candidatesOf(m[1])) {
         // An absolute or home path is not a place inside the reviewed tree, so it cannot be judged there.
-        if (written.startsWith('/') || written === '~' || written.startsWith('~/')) return leaves(path, written);
+        if (isAbsoluteOrHome(written)) return leaves(path, written);
         // Where the token may point, as paths from the repo root: the importer's directory as it was reached and as it really is.
         for (const dir of new Set([posix.dirname(path), posix.dirname(canonical)])) {
-          const rel = `${dir === '.' ? '' : `${dir}/`}${written}`;
+          const rel = `${dir === '.' ? '' : `${dir}/`}${slashed(written)}`;
           const lexical = posix.normalize(rel);
           if (lexical === '..' || lexical.startsWith('../')) return leaves(path, written);
           const direct = hit(path, lexical, null);

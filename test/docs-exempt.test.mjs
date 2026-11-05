@@ -582,7 +582,7 @@ test('a Windows absolute, drive, UNC or home token, or a backslash climb, is ref
     assert.equal(r.exempt, true, `${token}: ${r.reason}`);
   }
   // a symlink whose target is absolute in either style
-  for (const target of ['C:\\x.md', '\\x.md', '~\\x.md'.replace('~', 'C:')]) {
+  for (const target of ['C:\\x.md', '\\x.md', '\\\\srv\\x.md']) {
     const w = world(t, { baseFiles: { 'CLAUDE.md': '@out.md\n' }, baseLinks: { 'out.md': target } });
     w.append(LEDGER, row(2));
     w.repo.commit('ledger row');

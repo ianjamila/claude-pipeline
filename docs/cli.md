@@ -360,7 +360,7 @@ with a note, prose, a blank line or CRLF takes a round); the added rows are the 
 continue above the last row of the reviewed file, and `NNNN_name.sql` is a regular file in a directory called `migrations` in the tree at `toHead`.
 No instruction file of the reviewed head (and no file it `@`-imports, up to 5 hops, symlinks followed, case-insensitive) may import a listed document, and no
 symlink on the way may cycle, dangle or lead out of the repository. An import the scan cannot judge inside the reviewed tree also takes a round: a relative path that
-climbs above the repo root (lexically or through a symlink), `@/abs/path`, `@~/path` and `@~`. A path that only does not exist in the tree (`@supabase/ssr`) is ignored.
+climbs above the repo root (lexically or through a symlink), `@/abs/path`, `@~/path` and `@~`, and the Windows forms of those on every platform (a backslash counts as a separator; `@\x`, `@\\server\share`, `@~\x`, a drive such as `@C:\x`, `@c:/x` or `@C:x`). A path that only does not exist in the tree (`@supabase/ssr`) is ignored.
 A reviewed file with no final newline takes a round for any append (git sees its last line as edited); the reason says so.
 A refusal names the file that forces a round: `reason` ends with "the docs-only exemption does not apply: <file> ...".
 
