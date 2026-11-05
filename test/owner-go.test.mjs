@@ -15,7 +15,7 @@ import {
   approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT, legacyTranscriptOf,
   parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
-import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
+import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, isTranscriptFile, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { OWNER_ENTRY, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
 
@@ -718,7 +718,7 @@ test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice void
   assert.deepEqual([rule([...head, notice, said(ask(59)), promptEntry('what is that?'), said(ask(59))])?.pr], [59], 'the owner asked again: a new slot');
 });
 
-test('#128 R1-B2: provenance is taken only from a transcript of the shape the guard protects (any .claude* folder, or $CLAUDE_CONFIG_DIR)', () => {
+test('#128 R1-B2: provenance is taken only from a transcript of the shape the guard protects (a ~/.claude* folder, or $CLAUDE_CONFIG_DIR)', () => {
   const root = tmp();
   const put = (rel) => {
     const f = join(root, rel);
@@ -727,15 +727,15 @@ test('#128 R1-B2: provenance is taken only from a transcript of the shape the gu
     return { transcript_path: f, prompt_id: 'pid-m' };
   };
   for (const rel of ['.claude/projects/-repo/s.jsonl', '.claude-eaglewatch/projects/-repo/s.jsonl', '.claude/projects/-repo/s/subagents/x.jsonl'.replace('/subagents', '/tool-results')]) {
-    assert.equal(promptProvenance(put(rel), { env: {} }), 'owner', rel);
+    assert.equal(promptProvenance(put(rel), { env: {}, home: root }), 'owner', rel);
   }
   for (const rel of ['t.jsonl', 'claude-config/projects/-repo/s.jsonl', '.claude/other/-repo/s.jsonl', '.claude/projects/s.jsonl', '.claude/projects/-repo/s.json', 'cfg/.claude/s.jsonl']) {
-    assert.equal(promptProvenance(put(rel), { env: {} }), 'missing', rel);
+    assert.equal(promptProvenance(put(rel), { env: {}, home: root }), 'missing', rel);
   }
   // a config dir under another name is the guard's too once the environment names it
   const custom = put('claude-config/projects/-repo/s.jsonl');
-  assert.equal(promptProvenance(custom, { env: { CLAUDE_CONFIG_DIR: join(root, 'claude-config') } }), 'owner');
-  assert.equal(promptProvenance(custom, { env: { CLAUDE_CONFIG_DIR: join(root, 'elsewhere') } }), 'missing');
+  assert.equal(promptProvenance(custom, { env: { CLAUDE_CONFIG_DIR: join(root, 'claude-config') }, home: root }), 'owner');
+  assert.equal(promptProvenance(custom, { env: { CLAUDE_CONFIG_DIR: join(root, 'elsewhere') }, home: root }), 'missing');
   // …and a record whose transcript is outside never approves
   const w = mergeWorld(root, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] });
   assert.deepEqual(askedFor(w), [true, true, 'ok']);
@@ -744,6 +744,53 @@ test('#128 R1-B2: provenance is taken only from a transcript of the shape the gu
   const line = JSON.parse(readFileSync(join(ownerGoDir(w.g.home), 'sess-1.jsonl'), 'utf8').trim());
   writeFileSync(join(ownerGoDir(w.g.home), 'sess-1.jsonl'), `${JSON.stringify({ ...line, transcript_path: moved })}\n`);
   assert.deepEqual(askedFor(w), [false, false, 'provenance'], 'a transcript the guard does not protect');
+});
+
+// Codex #145 P1: the use-time check used to take a transcript under ANY .claude* folder anywhere, but the guard protects a config root only when it is $CLAUDE_CONFIG_DIR or a
+// folder directly under the account's home with the HOME_CONFIG_DIR_RE shape; a whole-folder cp/tar/rsync into /tmp/.claude-x or ~/.claude.personal is not refused, so a forged
+// "transcript" there was taken as the owner's words. Now exactly those two roots count.
+test('#128 Codex #145 P1: a transcript is evidence only under $CLAUDE_CONFIG_DIR or ~/<HOME_CONFIG_DIR_RE>/, never under an unprotected .claude* folder', () => {
+  const home = '/home/u';
+  const leaf = 'projects/-a/s.jsonl';
+  const is = (p, over = {}) => isTranscriptFile(p, { env: {}, platform: 'linux', home, ...over });
+  for (const ok of [`${home}/.claude/${leaf}`, `${home}/.claude-eaglewatch/${leaf}`, `${home}/.claude2/${leaf}`, `${home}/.claude/projects/-a/s/tool-results/x.jsonl`]) assert.equal(is(ok), true, ok);
+  for (const bad of [
+    `/tmp/.claude-x/${leaf}`, `${home}/.claude.personal/${leaf}`, `${home}/.claude.forged/${leaf}`, `${home}/sub/.claude/${leaf}`, `${home}/.claude/sub/.claude/${leaf}`,
+    `/home/other/.claude/${leaf}`, `/.claude/${leaf}`, `${home}/.claude/other/-a/s.jsonl`, `${home}/.claude/projects/s.jsonl`, `${home}/claude/${leaf}`,
+  ]) assert.equal(is(bad), false, bad);
+  // $CLAUDE_CONFIG_DIR: whatever the folder is called and wherever it is (also spelled with ~)
+  assert.equal(is(`/opt/cfg/${leaf}`, { env: { CLAUDE_CONFIG_DIR: '/opt/cfg' } }), true);
+  assert.equal(is(`/opt/cfg/${leaf}`, { env: { CLAUDE_CONFIG_DIR: '/opt/cfg/' } }), true);
+  assert.equal(is(`${home}/cfg/${leaf}`, { env: { CLAUDE_CONFIG_DIR: '~/cfg' } }), true);
+  assert.equal(is(`/opt/cfg2/${leaf}`, { env: { CLAUDE_CONFIG_DIR: '/opt/cfg' } }), false, 'a sibling that merely starts with the same letters');
+  assert.equal(is(`/tmp/.claude-x/${leaf}`, { env: { CLAUDE_CONFIG_DIR: '/opt/cfg' } }), false, 'the variable names ONE root, not every .claude* folder');
+  // case-insensitive where the file system is (darwin, win32), exact elsewhere; any slash flavour
+  assert.equal(is(`/Home/U/.CLAUDE/${leaf}`, { platform: 'darwin' }), true);
+  assert.equal(is(`/Home/U/.CLAUDE/${leaf}`), false);
+  assert.equal(is(`/tmp/.CLAUDE-x/${leaf}`, { platform: 'darwin' }), false, 'still not a protected root on darwin');
+  assert.equal(is('C:\\Users\\u\\.claude-b\\projects\\-a\\s.jsonl', { platform: 'win32', home: 'C:\\Users\\u' }), true);
+  assert.equal(is('C:\\Users\\u\\sub\\.claude\\projects\\-a\\s.jsonl', { platform: 'win32', home: 'C:\\Users\\u' }), false);
+  // the use-time check agrees: only a protected root's file is evidence, a copy in an unprotected .claude* folder is 'missing'
+  const root = tmp();
+  const acct = join(root, 'home');
+  const put = (rel) => {
+    const f = join(root, rel);
+    mkdirSync(join(f, '..'), { recursive: true });
+    writeFileSync(f, `${JSON.stringify(promptEntry('merge', OWNER_META, 'pid-m'))}\n`);
+    return { transcript_path: f, prompt_id: 'pid-m' };
+  };
+  for (const rel of ['.claude-x/projects/-a/s.jsonl', 'home/.claude.personal/projects/-a/s.jsonl', 'home/sub/.claude/projects/-a/s.jsonl']) {
+    assert.equal(promptProvenance(put(rel), { env: {}, home: acct }), 'missing', rel);
+  }
+  for (const rel of ['home/.claude-eaglewatch/projects/-a/s.jsonl', 'home/.claude/projects/-a/s.jsonl']) {
+    assert.equal(promptProvenance(put(rel), { env: {}, home: acct }), 'owner', rel);
+  }
+  const named = put('anywhere/cfg/projects/-a/s.jsonl');
+  assert.equal(promptProvenance(named, { env: { CLAUDE_CONFIG_DIR: join(root, 'anywhere', 'cfg') }, home: acct }), 'owner');
+  // the hint for a transcript under a root this process does not know still fires for any .claude* folder (the advice: set CLAUDE_CONFIG_DIR to it) and is silent under a known root
+  for (const p of [`/tmp/.claude-x/${leaf}`, `${home}/.claude.personal/${leaf}`, `${home}/sub/.claude/${leaf}`]) assert.equal(configDirHint([{ transcript_path: p }], { env: {}, home }), CONFIG_DIR_HINT, p);
+  assert.equal(configDirHint([{ transcript_path: `${home}/.claude-eaglewatch/${leaf}` }], { env: {}, home }), '');
+  assert.equal(configDirHint([{ transcript_path: `/tmp/.claude-x/${leaf}` }], { env: { CLAUDE_CONFIG_DIR: '/tmp/.claude-x' }, home }), '');
 });
 
 // R2-F3: a transcript in a custom config dir is judged by the checking process's CLAUDE_CONFIG_DIR; the refusal says so when that is the plausible cause.
@@ -913,7 +960,7 @@ test('#128 provenance: without a prompt_id the stored words are matched to a pro
   // a ruling carries its prompt as before
   const x = recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-9', cwd: home, prompt: 'R1-F1: accept', transcript_path: transcript(home, [promptEntry('go'), said(ASK_REPLY)]) }, { home, now: nowAt });
   assert.equal(x.prompt_id, null);
-  assert.equal(promptProvenance({ ...x, transcript_path: transcript(home, [promptEntry('go'), said(ASK_REPLY), at('R1-F1: accept', OWNER_META, 2000)]) }), 'owner');
+  assert.equal(promptProvenance({ ...x, transcript_path: transcript(home, [promptEntry('go'), said(ASK_REPLY), at('R1-F1: accept', OWNER_META, 2000)]) }, { home }), 'owner');
 });
 
 test('#128 provenance: the transcript is scanned from the end, 4 MB at a time, up to 64 MB back', () => {
@@ -926,18 +973,18 @@ test('#128 provenance: the transcript is scanned from the end, 4 MB at a time, u
   assert.deepEqual(askedFor(w), [true, true, 'ok'], 'found 6 MB back');
   // a line that straddles a chunk boundary is read whole
   const wide = { ...promptEntry('merge', OWNER_META, 'pid-w'), pad: 'y'.repeat(5 * 1024 * 1024) };
-  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-w' }), 'missing');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-w' }, { home: w.g.home }), 'missing');
   writeFileSync(w.file, lines([promptEntry('go'), wide]) + filler(2));
-  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-w' }), 'owner', 'a 5 MB line across the 4 MB chunks');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-w' }, { home: w.g.home }), 'owner', 'a 5 MB line across the 4 MB chunks');
   // 70 MB of later lines: out of reach, so missing
   writeFileSync(w.file, lines([promptEntry('go'), said(REQUEST), owner]) + filler(70));
   assert.deepEqual(askedFor(w), [false, false, 'provenance'], 'more than 64 MB back');
   // a legacy 'unknown' entry whose scan stopped short of the start cannot be proven legacy
   const legacy = { type: 'user', message: { content: 'merge' }, promptId: 'pid-l' };
   writeFileSync(w.file, lines([{ type: 'user', message: { content: 'go' } }]) + filler(5) + lines([legacy]) + filler(1));
-  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }), 'owner', 'whole transcript scanned: legacy');
-  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { capBytes: 3 * 1024 * 1024 }), 'synthetic', 'found, but the scan fell short of the start');
-  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { capBytes: 512 * 1024 }), 'missing', 'not found within the cap');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { home: w.g.home }), 'owner', 'whole transcript scanned: legacy');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { home: w.g.home, capBytes: 3 * 1024 * 1024 }), 'synthetic', 'found, but the scan fell short of the start');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { home: w.g.home, capBytes: 512 * 1024 }), 'missing', 'not found within the cap');
 });
 
 test('#128 provenance: rulings need the owner\'s prompt too, and "provenance" is the gap named first', () => {

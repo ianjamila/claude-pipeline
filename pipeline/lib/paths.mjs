@@ -120,7 +120,8 @@ export const drivePosix = {
 // ONE definition of what a transcript is, for both sides of the owner-go check: the guard (hooks/lib/files-policy.mjs) write-protects
 // <config dir>/projects/<project>/<session>.jsonl (and subagents/ below it) and the folders that hold them, and the use-time check
 // (hooks/lib/owner-go.mjs promptProvenance) takes a prompt's provenance only from a file of that shape: a transcript the guard does not protect
-// is not evidence. The config dir is any `.claude*` folder (the stacks' default transcriptDirs) or $CLAUDE_CONFIG_DIR, whatever its name.
+// is not evidence. The GUARD protects a transcript under any `.claude*` folder (the stacks' default transcriptDirs) or $CLAUDE_CONFIG_DIR, whatever its name (TRANSCRIPT_FILE_SRC, transcriptRes);
+// the USE-TIME check is narrower (Codex #145 P1, isTranscriptFile): only the roots the guard protects as a ROOT, $CLAUDE_CONFIG_DIR and the folders directly under the home.
 const TRANSCRIPT_LEAF = String.raw`projects/(?:[^/]+/)+[^/]+\.jsonl$`;
 // the folders that hold them: projects/ itself, and BELOW it each project and every folder in it but its memory/ (names without a dot: a session is a
 // uuid, subagents/ …). A project folder is named as Claude Code names it, the working directory with every non-alphanumeric turned into "-": it starts
@@ -175,8 +176,24 @@ export function transcriptConfigDirs({ home = os.homedir() } = {}) {
   try { named = fs.readdirSync(home).filter((n) => HOME_CONFIG_DIR_RE.test(n)).sort(); } catch { /* an unreadable home has none */ }
   return named.map((n) => path.join(home, n)).filter((d) => { try { return fs.statSync(d).isDirectory(); } catch { return false; } });
 }
-// Is this path (any slash flavour) a transcript FILE the guard protects?
-export function isTranscriptFile(file, { env = process.env, platform = process.platform, home } = {}) {
+// The account's home from the OS user database, NOT $HOME (the agent can set that to a folder it writes): the home the owner-go checks trust (owner-go.mjs re-exports it).
+export function accountHome() {
+  try {
+    const h = os.userInfo().homedir;
+    if (typeof h === 'string' && h) return h;
+  } catch { /* no passwd entry: fall back */ }
+  return os.homedir();
+}
+// Is this path (any slash flavour) a transcript FILE the guard protects, as the USE-TIME check (owner-go evidence)? Codex #145 P1: it used to mean "under any .claude* folder anywhere"
+// (TRANSCRIPT_FILE_SRC, which transcriptRes keeps for the guard, a belt over every spelling), but the guard protects a config ROOT only when it is $CLAUDE_CONFIG_DIR (files-policy.mjs, as given
+// and real-resolved) or a folder directly under the home with the HOME_CONFIG_DIR_RE shape; a folder-level cp/tar/rsync into /tmp/.claude-x or ~/.claude.personal is not refused, so a
+// forged transcript there was taken as the owner's words. So the same two roots here and nothing else: <configDirOf(env, home)>/projects/… or <home>/<HOME_CONFIG_DIR_RE>/projects/…,
+// same leaf shape. `home` defaults to the account's home (accountHome), never $HOME; the unit tests pass a temp one. Case-insensitive where the file system is (darwin, win32).
+export function isTranscriptFile(file, { env = process.env, platform = process.platform, home = accountHome() } = {}) {
   const p = toPosix(file);
-  return transcriptRes([configDirOf(env, home)], platform === 'win32' || platform === 'darwin').files.some((re) => re.test(p));
+  const homePosix = toPosix(home).replace(/\/+$/, '');
+  const cfg = configDirOf(env, homePosix);
+  const roots = [`^${reEscape(homePosix)}/${HOME_CONFIG_DIR_SRC}/`, ...(cfg ? [`^${reEscape(cfg)}/`] : [])];
+  const flags = platform === 'win32' || platform === 'darwin' ? 'i' : '';
+  return roots.some((r) => new RegExp(r + TRANSCRIPT_LEAF, flags).test(p));
 }

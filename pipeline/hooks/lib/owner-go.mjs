@@ -29,9 +29,8 @@
 // token is the owner's. A second GitHub identity + a ruleset is the server-side backstop (issue #65).
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, writeSync } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs } from '../../lib/paths.mjs';
+import { accountHome, isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
 export const MAX_AGE_MS = 24 * 60 * 60 * 1000; // a "merge" older than a day approves nothing
@@ -45,14 +44,8 @@ const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 export const HEAD_CHARS = 12; // the head is shown (and matched) by its first 12 characters at least
 
 // The account's home from the OS user database, NOT $HOME: `HOME=/tmp/x P merge …` must not point the check at a folder the agent
-// can write. (The `home` options below are for the unit tests, which call these functions in-process.)
-export function accountHome() {
-  try {
-    const h = os.userInfo().homedir;
-    if (typeof h === 'string' && h) return h;
-  } catch { /* no passwd entry: fall back */ }
-  return os.homedir();
-}
+// can write. (The `home` options below are for the unit tests, which call these functions in-process.) Defined in lib/paths.mjs, where isTranscriptFile needs the same home.
+export { accountHome };
 
 export const ownerGoDir = (home = accountHome()) => path.join(home, ...OWNER_GO_REL.split('/'));
 
@@ -532,13 +525,15 @@ export const repoKey = (repo) => (typeof repo === 'string' && new RegExp(`^${REP
 // PROMPT entries only (a tool_result sharing the id is no prompt); two prompt entries with one id is a replayed or forged id: synthetic.
 // A record without prompt_id (a hook that sends none) is matched by its stored words within FALLBACK_WINDOW_MS of the record, same rule.
 // Returns 'owner', 'synthetic', or 'missing' (no such entry within PROVENANCE_CAP_BYTES of the end, or the transcript is not a readable regular
-// file, or one of a shape the guard does not write-protect: R1-B2, lib/paths.mjs isTranscriptFile, the ONE definition files-policy.mjs protects by: a file the
-// guard leaves writable is not evidence of who typed anything, so a transcript_path elsewhere, or in a config dir the environment does not name, is refused here).
+// file, or one of a shape the guard does not write-protect: R1-B2, lib/paths.mjs isTranscriptFile: a file the guard leaves writable is not evidence of who typed anything,
+// so a transcript_path elsewhere, or in a config dir the environment does not name, is refused here). Codex #145 P1: "protected" means under a config ROOT the guard protects as one,
+// $CLAUDE_CONFIG_DIR or a folder directly under the account's home with the HOME_CONFIG_DIR_RE shape, NOT under any .claude* folder (a folder-level cp/tar/rsync into /tmp/.claude-x or
+// ~/.claude.personal is not refused, so a forged transcript there would otherwise pass for the owner's words). `home` is the account's home (accountHome, never $HOME); tests pass a temp one.
 // An entry of unknown source (no provenance field) counts as the owner's ONLY when no prompt in the scanned transcript carries any
 // such field (a genuinely old Claude Code); in a modern transcript it is untrusted, and so is an unknown one when the scan fell short of the start.
-export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, capBytes = PROVENANCE_CAP_BYTES, env = process.env } = {}) {
+export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, capBytes = PROVENANCE_CAP_BYTES, env = process.env, home = accountHome() } = {}) {
   const file = record?.transcript_path;
-  if (typeof file !== 'string' || file === '' || !path.isAbsolute(file) || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { env })) return 'missing';
+  if (typeof file !== 'string' || file === '' || !path.isAbsolute(file) || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { env, home })) return 'missing';
   let match;
   if (typeof record.prompt_id === 'string' && record.prompt_id !== '') {
     const id = record.prompt_id;
@@ -619,6 +614,8 @@ function scanBackwards(file, visit, wants, { chunkBytes, capBytes }) {
 // so `ln -s ~/.claude/forged ~/.claude/projects/evil`, or a copy of it, is the agent's own file; the scan below lists only project-shaped names too, so the two agree).
 // De-duplicated by real path (one account's projects/ can be a link to the other's). None, or two different files, is null.
 // (Hook-written transcript_path records are different: isTranscriptFile / promptProvenance still honour $CLAUDE_CONFIG_DIR for those, the protected recorder wrote them.)
+// Codex #145 P1: the isTranscriptFile test below gets the SAME `home` as the scan (env {}: no variable root), so it accepts exactly these roots and no more: every dir transcriptConfigDirs lists is
+// directly under that home with the HOME_CONFIG_DIR_RE shape, a root the guard protects (its home is the hook process's, the same account's).
 const protectedShape = (rel, session) => { // rel: a real path relative to a root's real path
   const parts = rel.split(/[\\/]/);
   return parts.length === 3 && parts[0] === 'projects' && TRANSCRIPT_PROJECT_RE.test(parts[1]) && parts[2] === `${session}.jsonl`;
@@ -636,7 +633,7 @@ export function legacyTranscriptOf(session, { home = accountHome() } = {}) {
       if (!TRANSCRIPT_PROJECT_RE.test(project)) continue;
       const file = path.join(dir, 'projects', project, `${session}.jsonl`);
       try {
-        if (!lstatSync(file).isFile() || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { env: {} })) continue;
+        if (!lstatSync(file).isFile() || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { env: {}, home })) continue;
         const real = realpathSync(file);
         if (!roots.some((r) => isInside(real, r) && protectedShape(path.relative(r, real), session))) continue;
         if (!found.has(real)) found.set(real, file);
@@ -655,7 +652,7 @@ function ownedBy(list, { grant = false, home, env } = {}) {
     if (!memo.has(key)) {
       const derive = grant && (typeof r.transcript_path !== 'string' || r.transcript_path === '');
       const file = derive ? legacyTranscriptOf(r.session, { home }) : r.transcript_path;
-      memo.set(key, derive && file === null ? 'missing' : promptProvenance(derive ? { ...r, transcript_path: file } : r, env ? { env } : undefined));
+      memo.set(key, derive && file === null ? 'missing' : promptProvenance(derive ? { ...r, transcript_path: file } : r, { env, home }));
     }
     return memo.get(key) === 'owner';
   });
@@ -678,7 +675,7 @@ const approvalsFor = ({ repo, pr, head, items, areas, ...opts }) => {
 export function approvalGap(q) {
   const matching = approvalsFor(q);
   if (matching.length === 0) return 'none';
-  return ownedBy(matching).length > 0 ? 'ok' : 'provenance';
+  return ownedBy(matching, { home: q.home }).length > 0 ? 'ok' : 'provenance';
 }
 export const approvedRequest = (q) => approvalGap(q) === 'ok';
 
@@ -686,24 +683,26 @@ export const approvedRequest = (q) => approvalGap(q) === 'ok';
 // "missing" may only mean the command runs where that variable is not set (a plain terminal, for an owner whose config dir is not ~/.claude*). That is likely when
 // the record's transcript has the shape of a session transcript (<dir>/projects/<project>/<session>.jsonl) yet is under no root this process knows; a record whose
 // transcript is simply gone, or is no transcript at all, gets no hint. Returns text to append to the refusal ('' when it does not apply).
+// Codex #145 P1: "a root this process knows" is now only $CLAUDE_CONFIG_DIR and the folders directly under `home` with the guard's shape (isTranscriptFile), so a transcript under any other
+// .claude* folder (/tmp/.claude-x, ~/.claude.personal) gets the hint: setting CLAUDE_CONFIG_DIR to the folder that holds projects/ is how such a genuine config dir is named.
 export const CONFIG_DIR_HINT = 'the transcript of that prompt is under a Claude Code config dir this process does not know (CLAUDE_CONFIG_DIR is not set here, or names another folder): run this command with CLAUDE_CONFIG_DIR set to the owner\'s config dir (the folder that holds projects/), or from inside the Claude Code session';
 const TRANSCRIPT_SHAPE = /[\\/]projects[\\/][^\\/]+[\\/][^\\/]+\.jsonl$/;
-export function configDirHint(records, { env = process.env } = {}) {
+export function configDirHint(records, { env = process.env, home = accountHome() } = {}) {
   const plausible = (r) => {
     const file = r?.transcript_path;
-    return typeof file === 'string' && path.isAbsolute(file) && TRANSCRIPT_SHAPE.test(file) && !/(?:^|[\\/])subagents[\\/]/.test(file) && !isTranscriptFile(file, { env });
+    return typeof file === 'string' && path.isAbsolute(file) && TRANSCRIPT_SHAPE.test(file) && !/(?:^|[\\/])subagents[\\/]/.test(file) && !isTranscriptFile(file, { env, home });
   };
   return (records ?? []).some(plausible) ? CONFIG_DIR_HINT : '';
 }
-export const approvalConfigDirHint = (q) => configDirHint(approvalsFor(q), { env: q.env });
-export const rulingConfigDirHint = (q) => configDirHint(rulingsFor(q), { env: q.env });
+export const approvalConfigDirHint = (q) => configDirHint(approvalsFor(q), { env: q.env, home: q.home });
+export const rulingConfigDirHint = (q) => configDirHint(rulingsFor(q), { env: q.env, home: q.home });
 
 // The guard, before a direct merge: did the owner say "merge" in this session (last 24 h) for a request about this repository and PR
 // whose head is this full head? (A PR merely named in the prompt, `merge #7`, is recorded in `prs` for the audit trail but approves no head.)
 export function approvedPr({ repo, pr, head, session, ...opts }) {
   const key = repoKey(repo);
   if (key === null || !Number.isInteger(pr) || !/^[0-9a-f]{40}$/.test(String(head)) || !SESSION_RE.test(String(session ?? ''))) return false;
-  return ownedBy(readApprovals({ ...opts, session }).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head)))).length > 0;
+  return ownedBy(readApprovals({ ...opts, session }).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head))), { home: opts.home }).length > 0;
 }
 
 // What an owner's answer to a ruling request decides, per item. Security reviews of f17b251, ff8090f and 009d435: reading decisions
@@ -749,7 +748,7 @@ function rulingsFor({ repo, pr, id, quote, decision, ...opts }) {
 // shape before #110) or no `contentOf` approves nothing.
 // #128: only a record whose prompt is the owner's (promptProvenance) counts.
 export function ownerRuled({ contentOf, ...q }) {
-  return typeof contentOf === 'function' && ownedBy(rulingsFor(q)).some((r) => typeof r.content === 'string' && r.content === contentOf(r.ids));
+  return typeof contentOf === 'function' && ownedBy(rulingsFor(q), { home: q.home }).some((r) => typeof r.content === 'string' && r.content === contentOf(r.ids));
 }
 
 // Why ownerRuled said no, for the message: 'none' (no such answer recorded), 'provenance' (answers exist but none is confirmed as typed by
@@ -758,7 +757,7 @@ export function ownerRuled({ contentOf, ...q }) {
 export function ownerRulingGap(q) {
   const found = rulingsFor(q);
   if (found.length === 0) return 'none';
-  const owned = ownedBy(found);
+  const owned = ownedBy(found, { home: q.home });
   if (owned.length === 0) return 'provenance';
   return owned.every((r) => typeof r.content !== 'string') ? 'no-content' : 'changed';
 }
@@ -896,7 +895,7 @@ export function ownerGrantGap(q = {}) {
 }
 
 // R2-F3 for a grant: text to append to a refusal when the unconfirmed records' transcripts are under a config dir this process does not know ('' otherwise).
-export const ownerGrantConfigDirHint = (q = {}) => configDirHint(grantsFor(q), { env: q.env });
+export const ownerGrantConfigDirHint = (q = {}) => configDirHint(grantsFor(q), { env: q.env, home: q.home });
 
 // Consumes the grants: exclusively creates one marker per record (sorted by id, so two claimers meet on the same first marker). body =
 // { repo, pr, k, head (40 hex), checkout }; each marker holds { v:1, grantId, repo, pr, k, head, consumedAt, checkout }. The file is written
