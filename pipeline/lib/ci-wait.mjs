@@ -126,7 +126,8 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return workflowRuns.map((w) => Date.parse(w?.created_at)).filter(Number.isFinite);
   };
   // Like suiteCreated, but a re-run keeps its run id and created_at and only moves run_started_at: both instants of each workflow
-  // run are returned (the caller takes the maximum). Used to decide whether a run is still of the ready era (findHolder); freshness of a RESULT stays on created_at.
+  // run are returned (the caller takes the maximum). Used to decide whether a run is still of the ready era (findHolder).
+  // A RESULT is dated by suiteStarted (a failure) or suiteCreated (a skip), see below.
   const suiteActive = async (run) => {
     const suite = run.check_suite?.id;
     if (suite === undefined || suite === null) return [];
@@ -134,7 +135,19 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return suiteCache.get(suite).flatMap((w) => [Date.parse(w?.created_at), Date.parse(w?.run_started_at)]).filter(Number.isFinite);
   };
 
+  // run_started_at (ms) of the workflow runs of a check run's suite, else created_at when a run has none: when this attempt of the
+  // run began. A re-run keeps created_at and moves run_started_at, so this is what dates a re-run's FAILURE.
+  const suiteStarted = async (run) => {
+    const suite = run.check_suite?.id;
+    if (suite === undefined || suite === null) return [];
+    await suiteCreated(run); // fills the cache
+    return suiteCache.get(suite).map((w) => { const s = Date.parse(w?.run_started_at); return Number.isFinite(s) ? s : Date.parse(w?.created_at); }).filter(Number.isFinite);
+  };
+
   // A skipped check run is only "done" when its workflow run was created at or after the ready event; a draft-era skip is not.
+  // This stays on created_at, not run_started_at, on purpose (the asymmetry with a failure, see runPredatesReady): a re-run replays
+  // the original run's (draft-era) event payload, so it skips again however late it starts, and a skip stays stale until a run
+  // that was created after the ready event replaces it.
   const skipState = async (run, pr) => {
     let created;
     try {
@@ -147,13 +160,15 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return Math.max(...created) >= readyAt ? 'fresh-skip' : 'stale-skip';
   };
 
-  // Does a failed / cancelled check run predate the ready event? By its workflow run, else by its own timestamps. Anything
-  // unreadable or unknown counts as fresh: a failure is reported rather than waited on.
+  // Does a failed / cancelled check run predate the ready event? By its workflow run's start (run_started_at, which a re-run moves;
+  // else created_at), else by its own timestamps. A re-run started after ready that then failed is a fresh, real failure of the
+  // ready-era code, unlike a re-run's skip (see skipState). Anything unreadable or unknown counts as fresh: a failure is
+  // reported rather than waited on.
   const runPredatesReady = async (run, pr) => {
     try {
       const readyAt = Date.parse(await getReadyAt(pr));
-      const created = await suiteCreated(run);
-      if (created.length > 0) return Math.max(...created) < readyAt;
+      const started = await suiteStarted(run);
+      if (started.length > 0) return Math.max(...started) < readyAt;
       const at = Date.parse(run.completed_at ?? run.started_at);
       return Number.isFinite(at) && at < readyAt;
     } catch {

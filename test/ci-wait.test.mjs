@@ -353,6 +353,43 @@ test('a draft-era failure that is re-posted after ready ends the wait on the new
   assert.doesNotMatch(r.output.message, /predates ready/);
 });
 
+test('a re-run (old created_at) whose run_started_at is after ready: its failure is fresh at once; one started before ready stays stale-fail (#173)', async () => {
+  const world = (startedAt) => ({
+    classic: present('ci'), timeline: readyTimeline,
+    checkRuns: [cr('ci', 'failure', { check_suite: { id: 4 } })],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: startedAt, run_attempt: 2 }],
+  });
+  const fresh = sim(world('2026-01-01T12:05:00Z'));
+  const a = await fresh.run();
+  assert.equal(a.output.verdict, 'failed', JSON.stringify(a.output));
+  assert.equal(fresh.elapsed(), 0, 'reported at once, not at --appear-timeout');
+  assert.equal(a.output.checks[0].state, 'fail');
+  assert.doesNotMatch(a.output.message, /predates ready/);
+  const cancelled = sim({ ...world('2026-01-01T12:05:00Z'), checkRuns: [cr('ci', 'cancelled', { check_suite: { id: 4 } })] });
+  assert.equal((await cancelled.run()).output.checks[0].state, 'cancelled');
+  assert.equal(cancelled.elapsed(), 0);
+  const old = sim(world('2026-01-01T11:30:00Z'));
+  const b = await old.run();
+  assert.equal(b.output.verdict, 'failed');
+  assert.equal(old.elapsed(), 300_000, 'a re-run started before ready is still a draft-era result');
+  assert.equal(b.output.checks[0].state, 'stale-fail');
+  assert.match(b.output.message, /predates ready/);
+  // a run that was never re-run (no run_started_at) is dated by created_at as before
+  const plain = sim({ classic: present('ci'), timeline: readyTimeline, checkRuns: [cr('ci', 'failure', { check_suite: { id: 4 } })], suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z' }] });
+  assert.equal((await plain.run()).output.checks[0].state, 'stale-fail');
+});
+
+test('a re-run (old created_at, ready-era run_started_at) that SKIPPED is still stale-skipped: it replays the draft payload (#173)', async () => {
+  const s = sim({
+    classic: present('lint'), timeline: readyTimeline,
+    checkRuns: [cr('lint', 'skipped', { check_suite: { id: 9 } })],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: '2026-01-01T12:05:00Z', run_attempt: 2 }],
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'stale-skipped');
+  assert.equal(s.elapsed(), 300_000);
+});
+
 test('a FRESH failure (after the ready event) still ends the wait at once; unreadable freshness counts as fresh', async () => {
   const status = sim({ classic: present('lint'), timeline: readyTimeline, statuses: [st('lint', 'failure', 'x', { created_at: '2026-01-01T12:00:05Z' })] });
   assert.equal((await status.run()).output.verdict, 'failed');
