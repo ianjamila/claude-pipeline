@@ -24,6 +24,7 @@ import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
 import { ownerRuledItems, reviewValidFor } from './triage.mjs';
 import { verifyOwnerGrants } from './owner-grants.mjs';
+import { docsExemptFrom } from './docs-exempt.mjs';
 import { skipOf } from './verify-steps.mjs';
 import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
 import { ownerItemsDigest } from '../hooks/lib/owner-go.mjs';
@@ -519,9 +520,17 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   if (!(Number.isInteger(state.pr) && state.pr > 0)) return check('review', false, `review state records no valid PR number (${JSON.stringify(state.pr)}), expected #${pr}`);
   if (state.pr !== pr) return check('review', false, `review state is for PR #${state.pr}, not #${pr}`);
   if (!hash) return check('review', false, `cannot compute the content hash: ${hashError}`);
+  // Valid for the content as it is, or (review.docs_exempt_paths) the reviewed content plus lines added to listed documents: the same
+  // helper review-complete uses. Verify/CI coverage of that head is judged by the other checks, as ever.
+  let exempt = null;
   if (!reviewValidFor(state, hash)) {
-    return check('review', false, `no clean review round covers the current content (${short(hash)}), or findings are unresolved`);
+    const ex = docsExemptFrom(state, { root, config, hash });
+    if (!ex.exempt) {
+      return check('review', false, `no clean review round covers the current content (${short(hash)}), or findings are unresolved${ex.off ? '' : `; the docs-only exemption does not apply: ${ex.reason}`}`);
+    }
+    exempt = ex;
   }
+  const exemptNote = exempt ? `; docs-only exemption (review.docs_exempt_paths): ${exempt.files.join(', ')} added after the reviewed head ${exempt.reviewedHead.slice(0, 12)}` : '';
   // A round past review.max_rounds must carry the owner's extra-round grant, re-proved here from the owner's record and its marker (never
   // from the state alone). A grant lets a round run; it is no merge authority, so it is shown but never an owner-merge item.
   const grants = verifyOwnerGrants(state, { repo, pr, maxRounds: config?.review?.max_rounds, ...ownerGo });
@@ -532,10 +541,10 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   const ruled = ownerRuledItems(state);
   if (ruled.length > 0) {
     const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('; ');
-    return check('review', true, `review valid for content ${short(hash)}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}${grantNote}`, ruled.length,
+    return check('review', true, `review valid for content ${short(hash)}${exemptNote}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}${grantNote}`, ruled.length,
       ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`));
   }
-  return check('review', true, `review valid for content ${short(hash)}${grantNote}`);
+  return check('review', true, `review valid for content ${short(hash)}${exemptNote}${grantNote}`);
 }
 
 // CI evidence. Judged: the checks GitHub itself requires (`gh pr checks --required`), or every reported check when it

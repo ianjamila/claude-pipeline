@@ -5,6 +5,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GUARD_FILES_MATCHER, GUARD_GIT_MATCHER } from '../pipeline/lib/installer.mjs';
+import { parseYaml } from '../pipeline/lib/yaml.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(root, rel), 'utf8');
@@ -105,4 +106,18 @@ test('pipeline-setup: ignores the worktree dir, pins verify.expected_steps, ment
   for (const needle of ['<worktree_dir>/', 'verify.expected_steps', '100755', 'ci.approvers', 'ci.guard_checks', '.gitattributes', '{{OWNER}}', '--reason']) {
     assert.ok(setup.includes(needle), `pipeline-setup must mention ${needle}`);
   }
+});
+
+test('the docs-only review exemption is documented where owners and agents look: template, review skill, CLI reference', () => {
+  const yml = read('pipeline/templates/pipeline.yml');
+  assert.match(yml, /^ {2}docs_exempt_paths: \[\]/m);
+  assert.ok(parseYaml(yml).review.docs_exempt_paths.length === 0, 'the template ships the feature off');
+  const skill = read('skills/review/SKILL.md');
+  assert.match(skill, /review\.docs_exempt_paths/);
+  assert.match(skill, /only add lines|ONLY ADD lines/);
+  assert.match(skill, /Verification .*still owed/s);
+  const cli = read('docs/cli.md');
+  assert.match(cli, /Docs-only exemption \(`review\.docs_exempt_paths`/);
+  assert.match(cli, /docsExempt: \{files, reviewedHead\}/);
+  assert.match(cli, /verify\/CI coverage of the docs head is NOT exempted/);
 });

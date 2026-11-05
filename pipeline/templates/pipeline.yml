@@ -115,5 +115,10 @@ review:
   max_rounds: 2                 # plus one confirm round when the last round only accepted fixes; base-only rounds (main merged in) don't count
   light_lane_max_lines: 50
   arbiter_always_paths: []      # globs: a PR touching one gets the Fable review pass every round, even at low risk
+  docs_exempt_paths: []         # EXACT paths (no globs) of ordinary documents (markdown anywhere, docs/ text, LICENSE/CHANGELOG): lines ADDED to them after the last review round
+                                # need no new round (review-complete and the final gate agree). Never an agent instruction file (CLAUDE.md ...), html, mdx or source, nothing
+                                # a hard-stop path rule, integrity.test_globs, hard_stops.paths, arbiter_always_paths or risk.high_risk_paths covers, nothing under supabase/ or
+                                # migrations/. Read from the config at the reviewed head, so the commit that adds a path cannot use it. Empty = off. The vendored CI runner
+                                # validates this key: run `pipeline vendor` first, or it rejects the unknown key
 
 agent_log: docs/agent-log.md   # one line per run; kept on the orphan branch `pipeline-agent-log` (`pipeline agent-log publish`), never committed to a PR branch
