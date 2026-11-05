@@ -2410,7 +2410,7 @@ const LOCATE_MS = 250;
 const LOCATE_EXCERPT = 100;
 function programHitWhere(text, m, dir, ctx, file) {
   const b = ctx.budget;
-  const saved = { grown: b.grown, braceOver: ctx.braceOver };
+  const saved = { grown: b.grown, braceOver: ctx.braceOver, dynamic: ctx.dynamic };
   try {
     const stopAt = Math.min(b.deadline, b.now() + LOCATE_MS);
     // (rawHit reads a home config folder in program text as a hit when the text holds a call anywhere: `(` `)` `[` `]`; a line is judged as the text would be, with that call added)
@@ -2442,6 +2442,7 @@ function programHitWhere(text, m, dir, ctx, file) {
   } finally {
     b.grown = saved.grown;
     ctx.braceOver = saved.braceOver;
+    ctx.dynamic = saved.dynamic;
   }
 }
 
