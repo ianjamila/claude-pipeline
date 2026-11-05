@@ -2512,6 +2512,124 @@ test('codex-review: a later round whose content is unchanged since the last roun
   assertExit(w.codex(2, findingsOf(), { from: w.head, to: head3 }), 0);
 });
 
+// ---- a pure main merge after accepted items (#1658): baseOnly, never empty-range -------------------------------
+
+test('codex-review: an accepted item fixed and re-reviewed clean, then a pure main merge: the next round is baseOnly (not empty-range)', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  const head2 = fixA(w);
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0);
+  const calls = w.captured().length;
+
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' }); // clean merge, no PR hunk touched
+  const r = w.codex(3, findingsOf([finding()]), { from: head2, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, true);
+  assert.equal(w.captured().length, calls, 'Codex was not run');
+  assert.deepEqual([w.state().rounds[2].n, w.state().rounds[2].baseOnly, w.state().rounds[2].toHead], [3, true, merged]);
+  const outcome = w.cli(['state', 'outcome']);
+  assert.deepEqual([outcome.json.clean, outcome.json.coverageValid, outcome.json.reviewedRounds], [true, true, 2], JSON.stringify(outcome.json));
+});
+
+test('codex-review: an accepted item NOT fixed, then a pure main merge: the round is baseOnly, the accept stays open, the fix round runs normally', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' });
+  const calls = w.captured().length;
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, true, 'not refused as empty-range');
+  assert.equal(w.captured().length, calls);
+
+  const open = w.cli(['state', 'outcome']);
+  assertExit(open, 0);
+  assert.equal(open.json.clean, false);
+  assert.deepEqual(open.json.newAccepted, ['R1-B1']);
+  assert.deepEqual(open.json.unimplemented, ['R1-B1']);
+  // main's commit is not a fix
+  const nope = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(nope, 2, nope.stdout);
+  assert.equal(nope.json.error, 'no-code-change');
+
+  const head3 = fixA(w);
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  const r3 = w.codex(3, findingsOf(), { from: merged, to: head3 });
+  assertExit(r3, 0, r3.stderr + r3.stdout);
+  assert.equal(r3.json.baseOnly, undefined);
+  assert.equal(w.captured().length, calls + 1, 'Codex ran for the fix round');
+  const outcome = w.cli(['state', 'outcome']);
+  assert.deepEqual([outcome.json.clean, outcome.json.reviewedRounds, outcome.json.rounds], [true, 2, 3]);
+});
+
+test('codex-review: a clean main merge that edits lines next to the PR hunk changes the content hash; the round is baseOnly and the PR still completes', (t) => {
+  const w = worldIgnoringReview(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  const head2 = fixA(w);
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0);
+  const hashBefore = w.cli(['state', 'outcome']).json.currentContentHash;
+
+  const merged = mergeMainInto(w, { 'src/a.js': aFile(false).replace('export const v9 = 9;', 'export const v9 = 90;') });
+  assert.notEqual(w.cli(['state', 'outcome']).json.currentContentHash, hashBefore, 'the merge moved the hash (context lines)');
+  const r = w.codex(3, findingsOf(), { from: head2, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, true);
+  const outcome = w.cli(['state', 'outcome']);
+  assert.deepEqual([outcome.json.clean, outcome.json.coverageValid], [true, true], JSON.stringify(outcome.json));
+  w.prHead(merged);
+  const done = w.cli(['review-complete', '--pr', '7']);
+  assertExit(done, 0, done.stderr + done.stdout);
+  assert.equal(done.json.ok, true);
+});
+
+test('codex-review: a conflicting main merge resolved by choosing lines, after an accept: Codex reviews the resolution (not empty-range) and the accept still needs its fix round', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  const merged = conflictKeepingOurs(w);
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.resolutionOnly, true);
+  assert.equal(r.json.baseOnly, undefined);
+  assert.equal(w.captured().length, 2, 'Codex ran over the resolution');
+  const outcome = w.cli(['state', 'outcome']);
+  assert.equal(outcome.json.clean, false);
+  assert.deepEqual(outcome.json.unimplemented, ['R1-B1']);
+});
+
+test('codex-review: empty-range after an accept names the accepts still waiting for their fix; with none waiting it says what round the content is', (t) => {
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  const same = w.codex(2, findingsOf(), { from: w.head, to: w.head }); // base == head
+  assertExit(same, 2, same.stdout);
+  assert.equal(same.json.error, 'empty-range');
+  assert.match(same.json.message, /commit the fix for R1-B1 first/);
+  w.repo.git(['commit', '-q', '--allow-empty', '-m', 'nothing']);
+  const head2 = w.repo.git(['rev-parse', 'HEAD']).trim();
+  const empty = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assertExit(empty, 2, empty.stdout);
+  assert.match(empty.json.message, /commit the fix for R1-B1 first/);
+  assert.equal(w.state().rounds.length, 1, 'nothing was recorded');
+  assert.equal(existsSync(w.roundFile(2, 'diff.patch')), false, 'and nothing was written for the round');
+
+  // fixed and re-reviewed clean: an amend-like empty commit has no accept waiting any more
+  const head3 = fixA(w);
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head3 }), 0);
+  w.repo.git(['commit', '-q', '--allow-empty', '-m', 'nothing again']);
+  const head4 = w.repo.git(['rev-parse', 'HEAD']).trim();
+  const none = w.codex(3, findingsOf(), { from: head3, to: head4 });
+  assertExit(none, 2, none.stdout);
+  assert.equal(none.json.error, 'empty-range');
+  assert.match(none.json.message, /nothing new to review: the content is what round 2 reviewed; if that round was clean, review-complete uses it/);
+  assert.doesNotMatch(none.json.message, /commit the fix/);
+});
+
 test('mark-implemented: a commit that only adds or edits tests is not a fix; a source change is', (t) => {
   const w = world(t);
   assertExit(w.codex(1, findingsOf([finding()])), 0);
