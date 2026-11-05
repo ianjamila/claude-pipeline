@@ -77,11 +77,29 @@ export function parseApproval(prompt) {
 // lines (or, for several PRs, `#N head <sha12> · items <digest> · repo <owner/name>`) directly above the 🔀 line, which is the last non-blank line.
 // Only that terminal block binds: an earlier block in the same reply, a Head line with prose between it and the 🔀 line, or any
 // text after the 🔀 line binds nothing, and a PR bound twice (two heads, or the same line twice) is ambiguous, so it binds nothing.
-// Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items, repo }] } (repo: the
-// lower-cased owner/name, or null when the line names none: such a request approves nothing).
+// Protected areas (plan 2026-11-05-chat-merge-protected, rev 4 item 2b): a PR whose diff has owner items is shown with one more line DIRECTLY above its
+// Head line, `Areas <area ids, sorted, one space apart>` (areasBlock: the hard-stop rule ids / integrity kinds P merge --dry-run prints), and the record keeps
+// sha256 of that block (areasDigest). In the several-PR form it is `#N areas <ids>` above `#N head …`. Exactly that shape binds: an Areas line that is
+// not directly above its own Head line (two in a row, one against the 🔀 line, another PR's number) makes the whole block bind nothing. An Areas line with
+// prose between it and the Head line is no part of the block: the request then binds WITHOUT areas, which approves no diff that has any.
+// Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items, repo, areas? }] } (repo: the
+// lower-cased owner/name, or null when the line names none: such a request approves nothing; areas: the block's digest, absent = no areas shown).
 const READY_LINE = /🔀\s*Ready to merge\s+([^\n]*)/;
 const REPO_NAME = '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+';
 const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)(?:\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME}))?\\s*$`, 'i');
+const AREAS_START = /^\s*(?:#\d+\s+)?areas\b/i;
+const AREA_ID = '[A-Za-z0-9_.-]{1,64}';
+const AREAS_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?areas((?:\\s+${AREA_ID})+)\\s*$`, 'i');
+// The canonical block the owner is shown for the areas of a diff: `Areas <sorted distinct ids>`; '' when there are none.
+export const areasBlock = (ids) => {
+  const list = [...new Set((ids ?? []).map(String))].sort();
+  return list.length === 0 ? '' : `Areas ${list.join(' ')}`;
+};
+// What the record stores for it and P merge compares: sha256 of the block, 'none' without areas.
+export const areasDigest = (ids) => {
+  const block = areasBlock(ids);
+  return block === '' ? 'none' : createHash('sha256').update(block).digest('hex');
+};
 export function presentedRequests(text) {
   const lines = String(text ?? '').split(/\r?\n/);
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
@@ -89,17 +107,27 @@ export function presentedRequests(text) {
   if (!r) return { prs: [], requests: [] };
   const prs = [...new Set([...r[1].split(/—|\s--?\s|\bsay\b/)[0].matchAll(/#(\d{1,6})\b/g)].map((x) => Number(x[1])))];
   const block = [];
-  for (let i = lines.length - 2; i >= 0; i--) {
+  let i = lines.length - 2;
+  for (; i >= 0; i--) {
     const h = HEAD_LINE.exec(lines[i]);
-    if (!h) break;
-    block.unshift(h);
+    const a = h ? null : AREAS_LINE.exec(lines[i]);
+    if (!h && !a) break;
+    block.unshift({ h, a });
   }
+  if (i >= 0 && AREAS_START.test(lines[i])) return { prs, requests: [] }; // an Areas line of any other shape against the block: malformed
   const bound = new Map();
-  for (const h of block) {
+  for (let j = 0; j < block.length; j++) {
+    const { h } = block[j];
+    if (!h) continue;
+    const above = j > 0 ? block[j - 1].a : null;
+    if (above && (above[1] ?? null) !== (h[1] ?? null)) return { prs, requests: [] }; // another PR's Areas line
     const pr = h[1] ? Number(h[1]) : prs.length === 1 ? prs[0] : null;
     if (pr === null || !prs.includes(pr)) continue;
-    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[4] ? h[4].toLowerCase() : null });
+    const areas = above ? createHash('sha256').update(`Areas ${above[2].trim().split(/\s+/).join(' ')}`).digest('hex') : null;
+    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[4] ? h[4].toLowerCase() : null, ...(areas ? { areas } : {}) });
   }
+  // An Areas line that no Head line below it takes (a second one in a row, one against the 🔀 line) is a malformed block.
+  if (block.some((b, j) => b.a && !block[j + 1]?.h)) return { prs, requests: [] };
   return { prs, requests: [...bound.values()].filter(Boolean) };
 }
 
@@ -588,10 +616,15 @@ function ownedBy(list) {
 // P merge: did the owner say "merge" for exactly this repository (owner/name), PR, full head and owner-item set (any session, last 24 h),
 // and is that prompt the owner's (promptProvenance)? approvalGap says why not: 'provenance' (a matching record exists but no owner prompt
 // stands behind it), 'none' (no matching record), 'ok'.
-const approvalsFor = ({ repo, pr, head, items, ...opts }) => {
+// `areas` (the ids of the protected areas the live scan found; --owner-go passes it, always): the record must carry exactly the digest of the Areas block
+// the owner was shown for them (areasDigest). A record without the field (shown before Areas lines, or none shown) means "no areas": it still approves a
+// diff without areas, exactly as before, and never one with areas. A caller that passes none (the gated route, bound by the gate's ownerItems) compares nothing.
+const approvalsFor = ({ repo, pr, head, items, areas, ...opts }) => {
   const key = repoKey(repo);
   if (key === null || !/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return [];
-  return readApprovals(opts).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items));
+  const wantAreas = areas === undefined ? null : areasDigest(areas);
+  return readApprovals(opts).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items
+    && (wantAreas === null || (typeof q.areas === 'string' ? q.areas : 'none') === wantAreas)));
 };
 export function approvalGap(q) {
   const matching = approvalsFor(q);

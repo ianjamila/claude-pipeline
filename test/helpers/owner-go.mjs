@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { ownerGoDir, recordApproval, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
+import { areasBlock, ownerGoDir, recordApproval, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
 
 const HOOK = fileURLToPath(new URL('../../pipeline/hooks/owner-go.mjs', import.meta.url));
 
@@ -83,7 +83,8 @@ function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined
 
 // The reply's merge request, as the ship skill shows it (Owner-merge approval). Phase 3b: it names the repository (the fake gh's by
 // default, fakegh-env.mjs REPO_VIEW); null leaves the repo out, as a request from before Phase 3b did.
-export const mergeRequest = (pr, head, items, repo = 'acme/widgets') => `Owner items listed above.\nHead ${head.slice(0, 12)} · items ${items}${repo === null ? '' : ` · repo ${repo}`}\n🔀 Ready to merge #${pr} — say "merge"`;
+// `areas` (protected areas): the ids `P merge --dry-run --owner-go` reports; they are printed as the Areas line directly above the Head line.
+export const mergeRequest = (pr, head, items, repo = 'acme/widgets', areas = []) => `Owner items listed above.\n${areas.length > 0 ? `${areasBlock(areas)}\n` : ''}Head ${head.slice(0, 12)} · items ${items}${repo === null ? '' : ` · repo ${repo}`}\n🔀 Ready to merge #${pr} — say "merge"`;
 
 // A reply that asks the owner to rule on review items, as the ship skill ends it (review-loop.md, Owner rules in chat).
 // #110: the line carries the content digest `P triage ruling-request` prints (a placeholder unless a test passes the real one).
