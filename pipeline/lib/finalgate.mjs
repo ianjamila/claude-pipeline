@@ -799,8 +799,9 @@ export function ownerItemsCheck({ items, hardstops, integrity, label }) {
     return check('owner-items', false, `${[!hardstops.ok && 'hardstops', !integrity.ok && 'integrity'].filter(Boolean).join(' and ')} did not pass: no chat "merge" covers a blocking hard-stop or a test-integrity violation${items.length > 0 ? `; also ${shown}` : ''}`);
   }
   if (label && items.length > 0) return check('owner-items', false, `${shown} under owner_approval: label: the owner merges it by hand`);
-  // Fail closed: items the owner would approve must fall in some area, or no Areas line can be shown for them (an item line with an empty rule / type).
-  if (items.length > 0 && areasOf(items).length === 0) return check('owner-items', false, `${shown} name no area (a hard-stop rule or integrity kind is empty): the owner cannot be shown what they fall in`);
+  // Fail closed: EVERY item the owner would approve must fall in an area, or the Areas line would leave it out (an item line with an empty rule / type).
+  const arealess = items.filter((l) => areasOf([l]).length === 0);
+  if (arealess.length > 0) return check('owner-items', false, `${arealess.length} owner item(s) name no area (${arealess.slice(0, 3).join('; ')}${arealess.length > 3 ? '; ...' : ''}): a hard-stop rule or integrity kind is empty, so the owner cannot be shown what they fall in`);
   return check('owner-items', true, items.length === 0 ? 'none' : `${shown}: the owner's "merge" must be bound to them (items ${ownerItemsDigest(items)})`);
 }
 

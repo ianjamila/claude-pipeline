@@ -312,6 +312,10 @@ test('owner-items fails closed when items exist but name no area (an item line w
   const c = ownerItemsCheck({ items, hardstops: ok, integrity: ok, label: false });
   assert.equal(c.ok, false, c.detail);
   assert.match(c.detail, /no area/);
+  // one area-less item among normal ones still fails: the Areas line would leave it out
+  const mixed = ownerItemsCheck({ items: ['integrity deleted-test test/a.js', 'integrity  src/x.js'], hardstops: ok, integrity: ok, label: false });
+  assert.equal(mixed.ok, false, mixed.detail);
+  assert.match(mixed.detail, /1 owner item\(s\) name no area \(integrity  src\/x\.js\)/);
   // the normal case is untouched: items with areas pass, and no items pass
   assert.equal(ownerItemsCheck({ items: ['integrity deleted-test test/a.js'], hardstops: ok, integrity: ok, label: false }).ok, true);
   assert.equal(ownerItemsCheck({ items: [], hardstops: ok, integrity: ok, label: false }).ok, true);
