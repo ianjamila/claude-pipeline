@@ -6,7 +6,7 @@
 // (test/cli-review.test.mjs ownerWorld: a unique slug per test), so its records can never match another test's or another process's.
 // Approval records are bound to a head instead; the temp repos use fixed author details, so identical fixtures made in the same second
 // can share heads - callers of ownerSays keep that known risk (tracked in a follow-up issue).
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -20,10 +20,22 @@ const HOOK = fileURLToPath(new URL('../../pipeline/hooks/owner-go.mjs', import.m
 export const OWNER_ENTRY = { origin: { kind: 'human' }, promptSource: 'typed', entrypoint: 'cli' };
 
 // Where a test transcript lives: <account home>/.claude-ownergo-test-<uuid>/projects/-repo/t.jsonl, a root the use-time provenance check accepts (R1-B2; lib/paths.mjs isTranscriptFile).
-// Codex #145 P1: only $CLAUDE_CONFIG_DIR and a folder directly under the account's home with the guard's name shape are roots, so a temp dir's own .claude/ no longer is one.
-// Like the owner-go records, the folder lives in the account home, so it is removed after the test and at exit.
+// Codex #145 P1 / fix round: only a folder directly under the account's home with the guard's name shape is a root ($CLAUDE_CONFIG_DIR is none), so a temp dir's own .claude/ is not one.
+// NOTE: this writes a config-shaped folder into the REAL account home (like the owner-go records). Each is removed after its test and at exit; one a killed run left behind is swept at load
+// (prefix `.claude-ownergo-test-` is unique to these tests; only folders older than a day). A home that is not writable skips the sweep with a message (the tests then fail where they write).
+const TEST_CFG_PREFIX = '.claude-ownergo-test-';
+(function sweepStaleTestFolders() {
+  const home = accountHome();
+  try {
+    for (const n of readdirSync(home)) {
+      if (!n.startsWith(TEST_CFG_PREFIX)) continue;
+      const d = join(home, n);
+      try { if (Date.now() - statSync(d).mtimeMs > 24 * 3600 * 1000) rmSync(d, { recursive: true, force: true }); } catch { /* gone or not ours to remove */ }
+    }
+  } catch (e) { console.error(`owner-go test helper: cannot sweep stale ${TEST_CFG_PREFIX}* folders in ${home} (${e.code ?? e.message}); skipped`); }
+})();
 const transcriptIn = (t) => {
-  const cfg = join(accountHome(), `.claude-ownergo-test-${randomUUID()}`);
+  const cfg = join(accountHome(), `${TEST_CFG_PREFIX}${randomUUID()}`);
   cleanupAtExit(cfg);
   t.after(() => rmSync(cfg, { recursive: true, force: true }));
   mkdirSync(join(cfg, 'projects', '-repo'), { recursive: true });
