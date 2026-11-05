@@ -18,8 +18,9 @@ const SCRUBBED = [
   // GIT_CONFIG would redirect `git config` away from .git/config entirely.
   'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
 ];
-// undefined values drop the variable from the child's environment (proc.run merges over process.env).
-const ENV = Object.fromEntries(SCRUBBED.map((k) => [k, undefined]));
+// undefined values drop the variable from the child's environment (proc.run merges over process.env). LC_ALL/LANG pin git's
+// messages to English (as pipeline/lib/git.mjs does), so tests matching git's translatable text pass under any locale.
+const ENV = { ...Object.fromEntries(SCRUBBED.map((k) => [k, undefined])), LC_ALL: 'C', LANG: 'C' };
 
 const made = new Set();
 function removeDir(dir) {

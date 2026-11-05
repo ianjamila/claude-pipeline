@@ -100,3 +100,19 @@ test('every commit in one repo keeps the same identity (the nonce is per repo, n
     assert.equal(new Set(idents).size, 1);
   } finally { r.cleanup(); }
 });
+
+// Tests match git's translatable messages, so fixture git must not inherit the caller's locale. A shell alias echoes the
+// locale git actually runs under (a translated message can't be provoked portably: the locale may not be installed).
+test('fixture git runs under LC_ALL=C / LANG=C whatever locale the caller has', () => {
+  const saved = { LC_ALL: process.env.LC_ALL, LANG: process.env.LANG };
+  process.env.LC_ALL = 'de_DE.UTF-8';
+  process.env.LANG = 'de_DE.UTF-8';
+  const r = createTmpRepo();
+  try {
+    assert.equal(r.git(['-c', 'alias.locprobe=!echo "$LC_ALL/$LANG"', 'locprobe']).trim(), 'C/C');
+    assert.throws(() => r.git(['rev-parse', '--verify', 'nope']), /Needed a single revision/);
+  } finally {
+    for (const k of Object.keys(saved)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    r.cleanup();
+  }
+});
