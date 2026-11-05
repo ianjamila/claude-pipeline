@@ -120,7 +120,7 @@ final gate re-prove the grant from the owner's record on this machine, so finish
 
 1. `P review-complete --pr N` (HEAD pushed and equal to the PR head). Exit 0 posts the marker comment and takes `awaiting-review` off. Exit 1 ⇒ read
    `reason` (a commit since the last round, an unmarked ACCEPT, a Fable pass owed) and go back to the round it names. Any later commit that changes
-   the code needs another round and another `review-complete`. One exception: commits after the last round that ONLY ADD strict ledger rows (`` | 0240 | `name` | YYYY-MM-DD | #PR | | ``, last in the file, numbers rising, for a migration at the reviewed head) to `review.docs_exempt_paths` documents (`P config`) need no round;
+   the code needs another round and another `review-complete`. One exception: commits after the last round that ONLY ADD lines to `review.docs_exempt_paths` documents (`P config`) need no round, and each added line must be a strict ledger row (`` | 0240 | `name` | YYYY-MM-DD | #PR | | ``, last in the file, numbers rising, for a migration at the reviewed head); anything else, or a listed document an instruction file `@`-imports, takes a round;
    `review-complete` posts for the current head (`docsExempt`), a refusal names the file that forces a round. Verification of that head is still owed.
 2. Only after that exit 0. If the head changed since 1.5 ran (any review fix), re-run 1.5 on it first: the label below, the CI reading and 3's ending use its notes.
    High risk (1.5's `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured); then `gh pr ready N`.
