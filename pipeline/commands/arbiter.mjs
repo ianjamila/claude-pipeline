@@ -18,7 +18,8 @@ import { seamFlag } from '../lib/proc.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
 import { extractJsonBlock, findSubagentTranscript, proveModel } from '../lib/transcript.mjs';
 import {
-  applyRulings, arbiterNeeded, fableFindingItems, finalizeWithoutArbiter, isOwnerRuled, reuseRuled, ruledCacheFrom, validateRulings,
+  MALFUNCTION_CAUSES, applyRulings, arbiterNeeded, fableFindingItems, finalizeWithoutArbiter, isOwnerRuled, isProtectedFinal, needsHumanCause, reuseRuled,
+  ruledCacheFrom, validateRulings,
 } from '../lib/triage.mjs';
 import {
   ensureRoundDir, excerptWindow, findRound, oneLine, patchRound, readFileOrFail, requireState, roundDir, sha256,
@@ -32,6 +33,7 @@ export const meta = {
     '  -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader[, diffPath, scope]}',
     '  mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied',
     '    (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that)',
+    '  a retry clears an unproven or malformed ruling (model-proof / invalid-arbiter, in either mode) so the arbiter answers again; the owner\'s and Claude\'s rulings are kept; an item the arbiter no longer needs is settled by the judge again',
     '  mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none',
     '  start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman',
     'pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
@@ -201,14 +203,31 @@ function neededLocked(values, n, root, ctx) {
   if (review && round.arbiter?.proofOk === true) return { exitCode: EXIT.OK, output: { needed: false, items: [], mode, done: true } };
   if (review && round.arbiter) {
     // An earlier pass for this round was not proven, so its rulings never counted (they only parked items): clear them and
-    // rule again. The owner's own rulings stay.
+    // rule again. The owner's own rulings and Claude's stay (E10: a protected final is never reset).
     const reset = round.items.map((item) => {
-      if (item.final?.by !== 'arbiter' || isOwnerRuled(item)) return item;
+      if (item.final?.by !== 'arbiter' || isOwnerRuled(item) || isProtectedFinal(item)) return item;
       const { final, arbiter, ...rest } = item;
       return rest;
     });
     state = updateItems(state, n, reset);
     round = findRound(state, n);
+  }
+  // A dispute round retries the same way (E8): an arbiter malfunction (model-proof failed, invalid output) is cleared so the item goes to the
+  // arbiter again, while a judgement (low confidence, a security dismissal) and the owner's and Claude's finals stay. An item that no longer
+  // needs the arbiter once its malfunction is gone is finalized again by the judge, so nothing is left pending without a way forward.
+  if (!review) {
+    const isMalfunction = (item) => item.final?.by === 'arbiter' && item.final.needsHuman === true && !isOwnerRuled(item) && !isProtectedFinal(item)
+      && MALFUNCTION_CAUSES.includes(needsHumanCause(item));
+    if (round.items.some(isMalfunction)) {
+      const cleared = round.items.filter(isMalfunction).map((item) => {
+        const { final, arbiter, ...rest } = item;
+        return rest;
+      });
+      const again = finalizeWithoutArbiter(cleared, { lightLane: state.lightLane, force: values.force === true || forceArbiter(ctx.env) });
+      state = updateItems(state, n, again);
+      round = findRound(state, n);
+      saveState(root, state);
+    }
   }
 
   const force = review || values.force === true || forceArbiter(ctx.env);

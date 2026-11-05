@@ -3,7 +3,9 @@
 // and settles whatever the deterministic rules allow without the arbiter. `settle` records a test result, which
 // outranks every opinion. `light-lane` closes out the untriaged WORTH CONSIDERING items of a small low-risk PR.
 // `owner-ruling` records what the owner decided in chat about an item that was waiting for a human; `ruling-request` prints the
-// line that asks the owner (it carries a digest of the findings' text, which `owner-ruling` checks again).
+// line that asks the owner (it carries a digest of the findings' text, which `owner-ruling` checks again). `claude-ruling` records
+// Claude's own ruling on such an item, within the limits of triage.mjs#claudeRulingRefusal (a dismissal of a critical item needs the
+// second review's verdict already on the item).
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
@@ -15,15 +17,15 @@ import { saveState, updateItems } from '../lib/state.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { grantIdOf, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
-  applyJudge, applyOwnerRuling, applyTestResult, DECISIONS, finalizeWithoutArbiter, isOwnerRuled, markLightLane, reviewedRoundCount, roundAdmission,
-  rulingContentDigest, validateTriage,
+  applyClaudeRuling, applyJudge, applyOwnerRuling, applyTestResult, claudeRulingRefusal, DECISIONS, finalizeWithoutArbiter, isOwnerRuled, isProtectedFinal,
+  markLightLane, reviewedRoundCount, roundAdmission, rulingContentDigest, validateTriage,
 } from '../lib/triage.mjs';
 import {
   ensureRoundDir, findItem, findRound, readFileOrFail, requireState, withStateLock, writeJson,
 } from '../lib/review-context.mjs';
 
 export const meta = {
-  summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane, ask for and record owner rulings made in chat',
+  summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane, ask for and record owner rulings made in chat, record Claude\'s own rulings',
   usage: [
     'pipeline triage validate --round R (--from-tag TAG | --file F) [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
     '  -> {ok, round, counts:{ACCEPT,FOLLOW-UP,REJECT}, settled, unsettled, judgeProof}; exit 1 + errors when the judge output is invalid (state untouched)',
@@ -40,9 +42,16 @@ export const meta = {
     '  -> commit, push and quick-verify first: the grant is for that head. The owner answers `extra round` (or `grant round K`, optionally with #N); the owner-go hook records it, and',
     '     `codex-review --round n` then claims it (see its usage). Exit 1 for label mode (no grant exists), a --pr that is not the review state\'s, a repository off github.com,',
     '     or a round that is already allowed (within review.max_rounds, the automatic extra round, or an open grant for this head)',
+    'pipeline triage claude-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --pr N [--repo DIR]',
+    '  -> {ok, round, id, final, published: false, next}; records CLAUDE\'s decision (final.by claude, needsHuman false, the overruled final and the cause kept) for an item waiting for a human, or tightens a Claude dismissal',
+    '  -> only with owner_approval: chat; exit 1 for label mode, a --pr that is not the review state\'s, an empty reason or one over 1000 characters, or a ruling the rules refuse (state untouched)',
+    '  -> ACCEPT is always allowed (also for a judge/arbiter malfunction). FOLLOW-UP alone only for a non-BLOCKING, non-security item with a known cause; any REJECT, and any dismissal of a BLOCKING or security item,',
+    '     needs a second review already on the item that also dismisses it at high confidence (the result is the stricter of the two). Refused: a dismissal through a model-proof / invalid-arbiter / invalid-judge',
+    '     malfunction (re-run the judge/arbiter, or ACCEPT), a loosened ACCEPT (only the owner\'s typed ruling loosens), an implemented item, and anything settled by a test, the judge, the arbiter or the owner',
+    '  -> the ruling is local until the triage comment is published (published: false); it writes review state format version 2',
     'pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]',
     '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
-    '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
+    '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human and has no unimplemented Claude ruling (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
     '  -> works on an already published round. ACCEPT still needs the fix and a later review round; FOLLOW-UP is filed by `followups create`; the quote is published in the triage comment and the final gate counts it as ownerMerge (the owner\'s "merge" is still needed)',
     '  -> the quote must be the WHOLE owner prompt that answered a reply ENDING with the line `triage ruling-request` printed (`⚖️ Owner ruling needed #N: ID[, ID…] · content <digest12> · repo owner/name`; the owner-go hook records it; any session, last 24 h; white space and case aside), and that answer must be nothing but decisions, `ID: accept|follow-up|reject` per asked id, the id always written (any other word decides nothing; over 1000 characters is not recorded); exit 1 otherwise, or when gh resolves the repository off github.com',
     '  -> the request is bound to the findings\' text: the digest is recomputed over ALL the ids of the request from the current review state and must equal the recorded one, so a rebuilt review that reuses an id for a changed finding (or a request in the old line shape, with no digest) cannot reuse the ruling; ask again with ruling-request',
@@ -163,6 +172,7 @@ function settleRefusal(item, id) {
   if (item.final?.needsHuman === true) return `${id} needs a human decision; a test result cannot settle it`;
   if (item.final?.by === 'arbiter') return `${id} was already ruled by the arbiter`;
   if (isOwnerRuled(item)) return `${id} was already ruled by the owner`;
+  if (isProtectedFinal(item)) return `${id} was ruled by Claude (or forced by a second review); a test result cannot settle it`;
   if (item.implemented === true) return `${id} is already implemented`;
   if ((item.test?.status ?? 'none') !== 'none') return `${id} already has a test result`;
   if (!(item.judge?.disputedBug === true && item.judge.settleTest?.possible === true)) {
@@ -259,7 +269,10 @@ const OWNER_TEXT_MAX = 1000;
 // an item that is waiting for a human. It is not a way to reopen an item somebody already settled.
 function ownerRulingRefusal(item, id, round) {
   if (item === undefined) return `no item ${id} in round ${round}`;
-  if (item.final?.needsHuman !== true) return `${id} does not need a human decision (an owner ruling cannot reopen a settled item)`;
+  // The owner may rule on an item waiting for a human, or (E6) override a Claude or forced final that is not implemented yet.
+  const protectedFinal = isProtectedFinal(item);
+  if (item.final?.needsHuman !== true && !protectedFinal) return `${id} does not need a human decision (an owner ruling cannot reopen a settled item)`;
+  if (item.final?.needsHuman !== true && item.implemented === true) return `${id} is already implemented (an owner ruling cannot reopen it)`;
   return null;
 }
 
@@ -316,6 +329,47 @@ async function ownerRuling(rest, ctx) {
     const next = `run \`pipeline comment --pr ${state.pr ?? pr ?? '<N>'} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it`;
     return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final, published: false, next } };
   }, pr));
+}
+
+// Claude's own ruling (plan 2026-11-05-claude-rulings.md section 10). The rules are all in triage.mjs#claudeRulingRefusal / applyClaudeRuling; this
+// checks what only the command can (mode, PR, the text), writes the state under the lock, and says what is left to publish.
+// PUBLICATION SPOT: task 3 replaces this one function with the compare-and-swap publish under the review lock (and returns published: true when
+// GitHub took it). Until then the ruling is local only.
+function publishClaudeRuling({ pr }) {
+  return { published: false, next: `run \`pipeline comment --pr ${pr} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it` };
+}
+
+async function claudeRuling(rest, ctx) {
+  const { values } = parseCommandArgs(rest, {
+    round: { type: 'string' }, id: { type: 'string' }, decision: { type: 'string' }, reason: { type: 'string' }, pr: { type: 'string' }, repo: { type: 'string' },
+  }, { allowPositionals: false });
+  const n = intOption(values, 'round', { required: true, min: 1 });
+  const pr = intOption(values, 'pr', { required: true, min: 1 });
+  const id = requireOption(values, 'id');
+  const decision = requireOption(values, 'decision');
+  if (!DECISIONS.includes(decision)) throw new UsageError(`--decision must be ${DECISIONS.join('|')}`);
+  if (values.reason === undefined) throw new UsageError('missing --reason');
+  const root = resolveRepo(values, ctx);
+  const { config } = await requireConfig(root);
+  const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, round: n, id, reason } });
+  if (config.owner_approval !== 'chat') {
+    return refuse('a Claude ruling is recorded only with owner_approval: chat in pipeline.yml; in label mode the owner clears needs-human by label');
+  }
+  const reason = values.reason.trim();
+  if (reason === '') return refuse('--reason must not be empty: say why');
+  if (reason.length > OWNER_TEXT_MAX) return refuse(`--reason is at most ${OWNER_TEXT_MAX} characters`);
+
+  return withStateLock(root, ctx, () => {
+    const state = requireState(root);
+    if (state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`);
+    const item = findRound(state, n).items.find((i) => i.id === id);
+    const why = item === undefined ? `no item ${id} in round ${n}` : claudeRulingRefusal(item, decision);
+    if (why) return refuse(why);
+    const ruled = applyClaudeRuling(item, { decision, reason, ruledAt: new Date().toISOString() });
+    // Format version 2: an older pipeline must not read a state that holds a Claude ruling (state.mjs SUPPORTED_STATE_VERSION).
+    saveState(root, { ...updateItems(state, n, [ruled]), version: 2 });
+    return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final, ...publishClaudeRuling({ pr }) } };
+  }, pr);
 }
 
 // #110: the digest of the findings the owner is asked about, for the items of the current review state (case-insensitive ids), or null when
@@ -382,7 +436,7 @@ async function roundRequest(rest, ctx) {
   }, pr));
 }
 
-const SUBCOMMANDS = { validate, settle, 'light-lane': lightLane, 'owner-ruling': ownerRuling, 'ruling-request': rulingRequest, 'round-request': roundRequest };
+const SUBCOMMANDS = { validate, settle, 'light-lane': lightLane, 'owner-ruling': ownerRuling, 'claude-ruling': claudeRuling, 'ruling-request': rulingRequest, 'round-request': roundRequest };
 
 export const run = guarded(async (argv, ctx) => {
   const [sub, ...rest] = argv;
