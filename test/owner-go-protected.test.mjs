@@ -8,7 +8,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { bump, cli, scenario, ymlFor, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { evaluateOwnerGo } from '../pipeline/lib/finalgate.mjs';
+import { areasOf, evaluateOwnerGo, ownerItemsCheck } from '../pipeline/lib/finalgate.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { approvalGap, areasBlock, areasDigest, presentedRequests } from '../pipeline/hooks/lib/owner-go.mjs';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
@@ -247,4 +247,19 @@ test('parser: an Areas line with prose between it and the Head line is no part o
   assert.equal('areas' in r.requests[0], false, 'so it approves no diff that has areas');
   // a line that is not an Areas line at all (a bullet) is prose too
   assert.equal('areas' in presentedRequests(`- Areas R1-a\nHead ${A} · items abcdefabcdef\n${READY(7)}`).requests[0], false);
+});
+
+// ---- an owner item that falls in no area cannot be shown ---------------------------------------------------------------------
+
+test('owner-items fails closed when items exist but name no area (an item line with an empty rule: nothing to put on the Areas line)', () => {
+  // No real hard-stop / integrity path builds such a line today (a rule id is never ''), so this drives ownerItemsCheck and areasOf directly.
+  const ok = { ok: true };
+  const items = ['integrity  src/x.js'];
+  assert.deepEqual(areasOf(items), []);
+  const c = ownerItemsCheck({ items, hardstops: ok, integrity: ok, label: false });
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /no area/);
+  // the normal case is untouched: items with areas pass, and no items pass
+  assert.equal(ownerItemsCheck({ items: ['integrity deleted-test test/a.js'], hardstops: ok, integrity: ok, label: false }).ok, true);
+  assert.equal(ownerItemsCheck({ items: [], hardstops: ok, integrity: ok, label: false }).ok, true);
 });

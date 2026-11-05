@@ -791,14 +791,16 @@ function scanRangeCheck({ root, gh, pr, diff, info, explicit }) {
 }
 
 // The owner-item lines are "<kind> <rule or type> <file>": the area of a line is its second word (hard-stop rule id, integrity kind).
-const areasOf = (lines) => [...new Set(lines.map((l) => String(l).split(' ')[1]).filter((a) => typeof a === 'string' && a !== ''))].sort();
+export const areasOf = (lines) => [...new Set(lines.map((l) => String(l).split(' ')[1]).filter((a) => typeof a === 'string' && a !== ''))].sort();
 
-function ownerItemsCheck({ items, hardstops, integrity, label }) {
+export function ownerItemsCheck({ items, hardstops, integrity, label }) {
   const shown = `${items.length} owner item(s) (${items.slice(0, 3).join('; ')}${items.length > 3 ? '; ...' : ''})`;
   if (!hardstops.ok || !integrity.ok) {
     return check('owner-items', false, `${[!hardstops.ok && 'hardstops', !integrity.ok && 'integrity'].filter(Boolean).join(' and ')} did not pass: no chat "merge" covers a blocking hard-stop or a test-integrity violation${items.length > 0 ? `; also ${shown}` : ''}`);
   }
   if (label && items.length > 0) return check('owner-items', false, `${shown} under owner_approval: label: the owner merges it by hand`);
+  // Fail closed: items the owner would approve must fall in some area, or no Areas line can be shown for them (an item line with an empty rule / type).
+  if (items.length > 0 && areasOf(items).length === 0) return check('owner-items', false, `${shown} name no area (a hard-stop rule or integrity kind is empty): the owner cannot be shown what they fall in`);
   return check('owner-items', true, items.length === 0 ? 'none' : `${shown}: the owner's "merge" must be bound to them (items ${ownerItemsDigest(items)})`);
 }
 
