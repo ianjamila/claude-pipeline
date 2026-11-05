@@ -57,7 +57,9 @@ test('--owner-go, chat mode, several areas (a hard-stop path and a deleted test)
   const live = await liveOf(s);
   assert.equal(live.areas.length, 2, JSON.stringify(live.ownerItemLines));
   assert.deepEqual(live.areas, [...live.areas].sort());
-  ownerSays(t, 'merge', mergeRequest(PR, s.head, live.ownerItems, 'acme/widgets', [...live.areas].reverse())); // (order on the page is the recorder's concern: areasBlock sorts)
+  // mergeRequest prints the Areas line through areasBlock, which sorts and dedupes: handing it the ids reversed still puts `Areas <sorted>` on the page.
+  // (A page that is NOT in that canonical shape is refused: see the unsorted and duplicate tests below.)
+  ownerSays(t, 'merge', mergeRequest(PR, s.head, live.ownerItems, 'acme/widgets', [...live.areas].reverse()));
   assertExit(goMerge(s), 0);
 });
 
@@ -89,6 +91,54 @@ test('--owner-go, chat mode: the right digest with other areas in the Areas line
   const s = world();
   const live = await liveOf(s);
   ownerSays(t, 'merge', mergeRequest(PR, s.head, live.ownerItems, 'acme/widgets', ['R9-other']));
+  refused(goMerge(s), 'owner-go', /Areas /, s);
+});
+
+const dryRun = (s) => cli(['merge', '--pr', String(PR), '--dry-run', '--owner-go'], { dir: s.repo.dir, fake: s.fake, env: s.env });
+
+test('round trip: the dry run\'s printed ownerStep.areas + ownerStep.line, as the reply shows them, are recorded, read back and approve the real merge', async (t) => {
+  const s = world({ gh: { mergeStateStatus: 'CLEAN' } });
+  const d = dryRun(s);
+  assertExit(d, 0, `${d.stderr}${d.stdout}`);
+  const { ownerStep } = d.json;
+  assert.equal(ownerStep.kind, 'say-merge');
+  const reply = `Protected areas listed above.\n${ownerStep.areas}\n${ownerStep.line}\n🔀 Ready to merge #${PR} — say "merge"`; // the exact printed text, nothing retyped
+  const live = await liveOf(s);
+  const [request, ...rest] = presentedRequests(reply).requests;
+  assert.equal(rest.length, 0);
+  assert.equal(request.head, s.head.slice(0, 12));
+  assert.equal(request.items, live.ownerItems);
+  assert.equal(request.areas, areasDigest(live.areas));
+  ownerSays(t, 'merge', reply);
+  assert.equal(approvalGap({ repo: 'acme/widgets', pr: PR, head: s.head, items: live.ownerItems, areas: live.areas }), 'ok');
+  const r = goMerge(s);
+  assertExit(r, 0);
+  assert.equal(r.json.merged, true);
+  assert.deepEqual(s.mergeCalls(), [`${PR} --match-head-commit ${s.head}`]);
+});
+
+test('--owner-go, chat mode: an Areas line on the page that is not the canonical sorted one (`Areas b a`) is refused, whatever the live areas are', async (t) => {
+  const s = world({ change: deleteTest });
+  const live = await liveOf(s);
+  assert.equal(live.areas.length, 2);
+  const [first, second] = live.areas; // sorted
+  const head = `Head ${s.head.slice(0, 12)} · items ${live.ownerItems} · repo acme/widgets`;
+  const reply = `Areas ${second} ${first}\n${head}\n🔀 Ready to merge #${PR} — say "merge"`;
+  // the digest is of the text as written, so it is not the digest of the canonical block P merge compares
+  assert.notEqual(presentedRequests(reply).requests[0]?.areas, areasDigest(live.areas));
+  ownerSays(t, 'merge', reply);
+  refused(goMerge(s), 'owner-go', /Areas /, s);
+});
+
+test('--owner-go, chat mode: a duplicate in the Areas line (`Areas a a`) is refused, even when the distinct ids are the live areas', async (t) => {
+  const s = world();
+  const live = await liveOf(s);
+  assert.equal(live.areas.length, 1);
+  const [only] = live.areas;
+  const head = `Head ${s.head.slice(0, 12)} · items ${live.ownerItems} · repo acme/widgets`;
+  const reply = `Areas ${only} ${only}\n${head}\n🔀 Ready to merge #${PR} — say "merge"`;
+  assert.notEqual(presentedRequests(reply).requests[0]?.areas, areasDigest(live.areas));
+  ownerSays(t, 'merge', reply);
   refused(goMerge(s), 'owner-go', /Areas /, s);
 });
 
