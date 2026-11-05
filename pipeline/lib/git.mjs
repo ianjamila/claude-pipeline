@@ -42,7 +42,9 @@ const FORCED_CONFIG = [
 // anyway so their bytes cannot depend on a user's setting.
 const STABLE_CONFIG = ['-c', 'core.autocrlf=false'];
 // GIT_OPTIONAL_LOCKS=0: these are reads; they must never fight a concurrent git for the index lock.
-const GIT_ENV = { LC_ALL: 'C', GIT_OPTIONAL_LOCKS: '0' };
+// GIT_NO_REPLACE_OBJECTS=1: a refs/replace/* ref swaps one object for another everywhere git reads it, so a diff, a hash or a hard-stop
+// scan would judge the replacement instead of the commit GitHub has; every read here sees the real objects.
+const GIT_ENV = { LC_ALL: 'C', GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1' };
 // Variables that make git operate on some other repository than `cwd` (a hook or wrapper leaves them behind).
 // An undefined value removes the variable from the child's environment (proc.run merges over process.env).
 const SCRUBBED_ENV = Object.fromEntries([
