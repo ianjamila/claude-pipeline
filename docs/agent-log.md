@@ -104,3 +104,4 @@ full record.
 - 2026-11-04 · #155 · fix(stacks): background jobs own their private stack (claude bg-spare) · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge
 - 2026-11-04 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 8 · arbiter 8 · needs-human
 - 2026-11-04 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 9 · arbiter 9 · needs-human
+- 2026-11-05 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 11 · arbiter 9 · awaiting-owner-merge
