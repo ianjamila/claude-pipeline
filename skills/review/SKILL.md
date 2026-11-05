@@ -132,7 +132,7 @@ final gate re-prove the grant from the owner's record on this machine, so finish
    `unverified` (branch protection or rules unreadable), `no-required-checks`, `timeout` ⇒ tell the owner in plain English, with the
    check names, and wait. `owner_approval: label` with a blocking item noted at 1.5: run it with `--wait-all`; the guard checks
    reporting just those items are expected to be red — that is not a fix target: park (section 2) once ci-wait shows every other check
-   green. Any other red ⇒ implementer fix, push, back to step 1 of this section. Base moved ⇒ `P update-branch --pr N`, `git pull --ff-only`, review again if content changed.
+   green. Any other red ⇒ implementer fix, push, back to step 1 of this section. Base moved ⇒ `P update-branch --pr N`, `git pull --ff-only`, review again if content changed. `outcome: "queued-behind"` (another PR's merge hold is ahead; `blockedBy`, `doNotUpdate`) ⇒ report it as in 3's **Queued behind** and stop; never update past it.
 3. **STOP** (outcome `awaiting-owner-merge`; `owner_approval: label` with a blocking item parks instead, no merge request): run the stop ritual first, then tell the owner in plain English what changed, the PR link, the review outcome and
    follow-up issues. Which ending depends on the item note from 1.5 (as refreshed in step 2):
    - **A `blocking` item** (a blocking hard-stop or test-integrity violation: always under `owner_approval: label`) : NO `Head …` / `🔀` lines
@@ -150,6 +150,20 @@ final gate re-prove the grant from the owner's record on this machine, so finish
    - To preview the verdict before the owner's word, use only `P merge --pr N --dry-run` (add `--owner-go` for that route): it runs the
      same checks, writes and merges nothing, and its `ownerStep` says which of the two endings above applies. Never run the repo's own
      merge command (`npm run merge …`, even with `--dry-run`) to preview: the git guard refuses it, and the dry run grants nothing.
+   - **Merge hold** (only when `P config` has `merge.hold_command`; a repo without it skips this whole bullet). Run `P merge --pr N --dry-run --owner-go` first; take the hold only when it says `wouldMerge: true` and
+     `ownerStep.kind` is `say-merge` (with or without `areas`) or `owner-runs`.
+     - **Take.** Run `P merge-hold --pr N` after the dry run and add ONE plain-English line before the ending: hold confirmed (other merges pause up to 90 min), or NOT confirmed (say so, continue).
+       The ending lines stay LAST and unchanged.
+     - **Hold ahead.** A dry run with a `merge-hold` blocker (#A ahead): say so with #A and its expiry in PHT, give NO `Head` / `🔀` lines, stop. `P merge-hold --pr N --check` re-reads it.
+     - **Unreadable** (`hold-unreadable`, here or anywhere): retry once after 60 s; still unreadable ⇒ tell the owner, stop.
+     - **Release** when you leave the hand-off for PR N: `P merge-hold --pr N --release --reason <code>`, code `new-commits` (a commit pushed after the hand-off), `parked`,
+       `owner-declined` (the owner declines or asks for changes) or `handoff-withdrawn` (any other withdrawal). A successful merge needs no release.
+     - **Queued behind.** The owner says "merge" and `P merge` returns `error: "queued-behind"`: tell the owner which PR is ahead (`blockedBy`) and when its hold expires (PHT);
+       do NOT run `P update-branch`; list the exits: say "merge" again after #A merges or its hold expires; merge #A; or the repo's own hold release / `--ignore-hold` (the owner's call);
+       stop.
+     - **Fresh "merge".** On the owner's next prompt run the dry run again and show the new lines. A "merge" given before a `queued-behind` refusal is never reused:
+       `P merge --pr N --owner-go` runs only on a "merge" given after the new lines.
+     - **Other PRs.** Never release, take or ignore a hold of any PR but N, never use `--ignore-hold`.
    - **No such item**: the reply's LAST two lines are exactly (sha12 = first 12 characters of `git rev-parse HEAD`; owner/name from
      `gh repo view --json nameWithOwner`; on `--owner-go` copy `ownerStep.line` (and `ownerStep.areas` above it when present) from the dry run, never type the digest):
      `Head <sha12> · items <digest> · repo <owner/name>`
