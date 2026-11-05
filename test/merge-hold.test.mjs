@@ -213,7 +213,7 @@ test('releaseHold: the reason is a fixed sentence, shell-quoted; an unknown code
   assert.equal(seen.length, 4);
   for (const [i, reason] of Object.keys(RELEASE_REASONS).entries()) {
     assert.equal(seen[i], `npm run merge-hold -- 12 --release --reason ${quoteReason(RELEASE_REASONS[reason])}`);
-    assert.match(seen[i], /--reason '[A-Za-z0-9 ,.-]+'$/, 'single-quoted, plain words only');
+    assert.match(seen[i], process.platform === 'win32' ? /--reason "[A-Za-z0-9 ,.-]+"$/ : /--reason '[A-Za-z0-9 ,.-]+'$/, 'quoted for this platform, plain words only');
   }
   assert.deepEqual(Object.keys(RELEASE_REASONS), ['new-commits', 'parked', 'owner-declined', 'handoff-withdrawn']);
   await assert.rejects(releaseHold({ config: CONFIG, pr: PR, reason: 'x; rm -rf /', root: '/r', env: {}, run: async () => assert.fail('must not run') }), /unknown release reason/);
