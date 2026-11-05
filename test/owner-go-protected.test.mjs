@@ -105,19 +105,22 @@ test('--owner-go: an old record without the areas field (shown before Areas line
   assertExit(goMerge(s), 0);
 });
 
-test('approvalGap: a record without areas means "no areas" (old records keep working, and never cover a diff with areas); the gated route compares none', (t) => {
+test('approvalGap: a record without areas means "no areas" (old records keep working, and never cover a diff with areas); the gated route passes areas: null (binds none); undefined fails closed', (t) => {
   const head = randomUUID().replaceAll('-', '').padEnd(40, 'a').slice(0, 40);
   ownerSays(t, 'merge', mergeRequest(PR, head, 'none'));
   const q = { repo: 'acme/widgets', pr: PR, head, items: 'none' };
   assert.equal(approvalGap({ ...q, areas: [] }), 'ok');
   assert.equal(approvalGap({ ...q, areas: ['R2-auth-removed'] }), 'none');
-  assert.equal(approvalGap(q), 'ok', 'a caller that passes no areas (the gated route) is bound by items only');
+  assert.equal(approvalGap({ ...q, areas: null }), 'ok', 'areas: null (the gated route) is bound by items only');
+  assert.equal(approvalGap(q), 'ok', 'undefined compares as no areas, which this record says');
   const withAreas = randomUUID().replaceAll('-', '').padEnd(40, 'b').slice(0, 40);
   ownerSays(t, 'merge', mergeRequest(PR, withAreas, 'abcdefabcdef', 'acme/widgets', ['R2-x', 'R1-y']));
   const p = { repo: 'acme/widgets', pr: PR, head: withAreas, items: 'abcdefabcdef' };
   assert.equal(approvalGap({ ...p, areas: ['R1-y', 'R2-x'] }), 'ok');
   assert.equal(approvalGap({ ...p, areas: ['R2-x'] }), 'none');
   assert.equal(approvalGap({ ...p, areas: [] }), 'none');
+  assert.equal(approvalGap({ ...p, areas: null }), 'ok', 'null = this route does not bind areas');
+  assert.equal(approvalGap(p), 'none', 'undefined is NOT "compare nothing": it compares as no areas, so a caller that forgets them fails closed');
   assert.equal(areasDigest([]), 'none');
 });
 

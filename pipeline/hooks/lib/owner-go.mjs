@@ -618,11 +618,12 @@ function ownedBy(list) {
 // stands behind it), 'none' (no matching record), 'ok'.
 // `areas` (the ids of the protected areas the live scan found; --owner-go passes it, always): the record must carry exactly the digest of the Areas block
 // the owner was shown for them (areasDigest). A record without the field (shown before Areas lines, or none shown) means "no areas": it still approves a
-// diff without areas, exactly as before, and never one with areas. A caller that passes none (the gated route, bound by the gate's ownerItems) compares nothing.
+// diff without areas, exactly as before, and never one with areas. `areas: null` (only the gated route, bound by the gate's ownerItems) says "this route does
+// not bind areas" and compares nothing; `undefined` (a caller that forgot) compares as no areas, so it fails closed.
 const approvalsFor = ({ repo, pr, head, items, areas, ...opts }) => {
   const key = repoKey(repo);
   if (key === null || !/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return [];
-  const wantAreas = areas === undefined ? null : areasDigest(areas);
+  const wantAreas = areas === null ? null : areasDigest(areas);
   return readApprovals(opts).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items
     && (wantAreas === null || (typeof q.areas === 'string' ? q.areas : 'none') === wantAreas)));
 };

@@ -88,8 +88,8 @@ export const run = guarded(async (argv, ctx) => {
       else if (values['owner-approved-items'] !== gate.ownerItems) approvalProblem = `--owner-approved-items is not the gate's owner-item set (${gate.ownerItems})`;
       else if (gh.repo().host !== 'github.com') approvalProblem = hostProblem(gh);
       else {
-        const gap = approvalGap({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems });
-        if (gap !== 'ok') approvalProblem = missingApproval(gap, `${gh.repo().slug} #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}`, `show the request (Owner-merge approval in the review skill: \`Head ${gate.head.slice(0, 12)} · items ${gate.ownerItems} · repo ${gh.repo().slug}\`) and wait for the owner to type "merge"`, { repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems });
+        const gap = approvalGap({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null }); // the gated route binds items only
+        if (gap !== 'ok') approvalProblem = missingApproval(gap, `${gh.repo().slug} #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}`, `show the request (Owner-merge approval in the review skill: \`Head ${gate.head.slice(0, 12)} · items ${gate.ownerItems} · repo ${gh.repo().slug}\`) and wait for the owner to type "merge"`, { repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null });
       }
     }
     const ownerApproved = values['owner-approved-head'] !== undefined && approvalProblem === null;
