@@ -1721,6 +1721,7 @@ test('review-complete: posts the marker comment with {contentHash, base, head, r
     REMOVE_LABEL,
     { match: '^api user', stdout: 'me\n' },
     { match: 'issues/7/comments --paginate', stdoutJson: [{ id: 76, user: { login: 'mallory' }, body: 'x' }, { id: 77, user: { login: 'me' }, body, html_url: 'u77' }] },
+    { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 91, html_url: 'u91' } }, // the triage state is published first: postedBodies counts markers only
   ]);
   const again = w.cli(['review-complete', '--pr', '7']);
   assertExit(again, 0, again.stdout);
@@ -3650,7 +3651,8 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   const published = w.state();
   const markerTree = published.rounds[1].reviewBase;
   const roundPatch = patchOf(w, 2);
-  w.fake.setScript([...JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')), REMOVE_LABEL, ...COMMENTS(mine(published)), REVIEW_COMMENT[2]]);
+  w.fake.setScript([...JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')), REMOVE_LABEL, ...COMMENTS(mine(published)), REVIEW_COMMENT[2],
+    { match: '^api -X PATCH repos/acme/widgets/issues/comments/9 ', stdoutJson: { id: 9, html_url: 'u9' } }]); // review-complete publishes the state first
 
   // A fresh clone (--no-local: a local clone would copy every object): only the objects reachable from a branch come along, so the marker tree is not there.
   const clone = join(w.scratch, 'clone');
