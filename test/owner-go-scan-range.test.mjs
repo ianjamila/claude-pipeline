@@ -52,6 +52,7 @@ test('--owner-go: GitHub\'s base commit not present locally refuses and says to 
   const r = goMerge(s);
   refusedWith(r, /git fetch origin main/, s);
   assert.doesNotMatch(JSON.stringify(r.json), /\d+ owner item/, 'it never fell back to a local ref and scanned');
+  assert.match(r.json.reasons.join('\n'), /^scan-range: /m, 'scan-range is one of the failed checks');
 });
 
 test('--owner-go: GitHub naming no usable base commit refuses (fail closed)', (t) => {
