@@ -80,14 +80,27 @@ export function parseApproval(prompt) {
 // sha256 of that block (areasDigest). In the several-PR form it is `#N areas <ids>` above `#N head …`. Exactly that shape binds: an Areas line that is
 // not directly above its own Head line (two in a row, one against the 🔀 line, another PR's number) makes the whole block bind nothing. An Areas line with
 // prose between it and the Head line is no part of the block: the request then binds WITHOUT areas, which approves no diff that has any.
-// Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items, repo, areas? }] } (repo: the
-// lower-cased owner/name, or null when the line names none: such a request approves nothing; areas: the block's digest, absent = no areas shown).
+// The needs-human hold (rev 4 items 2a, 5; review note 6): a PR whose hold the owner's "merge" lifts has the Head line carry ONE `· hold <event id>` field between
+// `items …` and `repo …`, and a canonical `Hold <id> by <login> at <ISO>` line (holdBlock) DIRECTLY above that Head line. Block order, top to bottom: Areas (optional),
+// Hold, Head; Areas binds above Head or above a Hold that sits above its Head. UNLIKE Areas, ANY Hold-shaped line anywhere in the reply that is not consumed exactly so
+// (malformed, prose between it and its Head, two in a row, against the 🔀 line, ahead of Areas, another PR's, an id other than its Head's `hold` field) makes the WHOLE reply
+// bind nothing, and so does a Head line with `hold X` and no Hold line right above it; a hold field repeated or after `repo` is no Head line at all. The record keeps the hold
+// id and sha256 of the block (holdDigest). And a request with a hold binds only when the 🔀 line says it lifts the hold (readyLine, LIFT_PHRASE): the phrase with no hold
+// in the block, or a hold with no phrase, binds nothing.
+// Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items, repo, areas?, hold?, holdBlock? }] } (repo: the
+// lower-cased owner/name, or null when the line names none: such a request approves nothing; areas: the block's digest, absent = no areas shown; hold: the event id,
+// holdBlock: the Hold block's digest, both absent = no hold).
 const READY_LINE = /🔀\s*Ready to merge\s+([^\n]*)/;
 const REPO_NAME = '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+';
-const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)(?:\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME}))?\\s*$`, 'i');
+const HOLD_ID = '[A-Za-z0-9_=+/-]{1,128}';
+const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)(?:\\s*(?:·|\\|)\\s*hold\\s+(${HOLD_ID}))?(?:\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME}))?\\s*$`, 'i');
 const AREAS_START = /^\s*(?:#\d+\s+)?areas\b/i;
 const AREA_ID = '[A-Za-z0-9_.-]{1,64}';
 const AREAS_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?areas((?:\\s+${AREA_ID})+)\\s*$`, 'i');
+const HOLD_START = /^\s*(?:#\d+\s+)?hold\b/i;
+const HOLD_LOGIN = '[A-Za-z0-9-]{1,39}(?:\\[bot\\])?';
+const HOLD_AT = '\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z';
+const HOLD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?hold\\s+(${HOLD_ID})\\s+by\\s+(${HOLD_LOGIN})\\s+at\\s+(${HOLD_AT})\\s*$`, 'i');
 // The canonical block the owner is shown for the areas of a diff: `Areas <sorted distinct ids>`; '' when there are none.
 export const areasBlock = (ids) => {
   const list = [...new Set((ids ?? []).map(String))].sort();
@@ -98,7 +111,31 @@ export const areasDigest = (ids) => {
   const block = areasBlock(ids);
   return block === '' ? 'none' : createHash('sha256').update(block).digest('hex');
 };
+// The canonical block the owner is shown for the needs-human hold their "merge" lifts: `Hold <event node id> by <actor login> at <created_at>` (the id and login as GitHub
+// spells them, the time exactly as GitHub's created_at: ISO-8601 UTC, whole seconds). '' for input of another shape: a caller treats '' as "no showable hold" and fails closed.
+export const holdBlock = (hold) => {
+  const { id, login, at } = hold ?? {};
+  return typeof id === 'string' && typeof login === 'string' && typeof at === 'string'
+    && new RegExp(`^${HOLD_ID}$`).test(id) && new RegExp(`^${HOLD_LOGIN}$`).test(login) && new RegExp(`^${HOLD_AT}$`).test(at)
+    ? `Hold ${id} by ${login} at ${at}` : '';
+};
+// What the record stores for it and P merge compares: sha256 of the block; 'none' for no hold (null / absent); 'invalid' for a hold with no showable block (it equals no record's value).
+export const holdDigest = (hold) => {
+  if (hold === null || hold === undefined) return 'none';
+  const block = holdBlock(hold);
+  return block === '' ? 'invalid' : createHash('sha256').update(block).digest('hex');
+};
+// The 🔀 line a request ends with. A request whose Head line has a hold ends with the lift phrase (rev 4 item 2a), exactly: `🔀 Ready to merge #N and lift its needs-human hold — say "merge"`,
+// or for several PRs `🔀 Ready to merge #1, #2 and lift their needs-human holds — say "merge"`. presentedRequests binds a hold only under that wording (a dash as `-` / `--` or a final full stop also read).
+export const LIFT_PHRASE = Object.freeze({ one: 'and lift its needs-human hold', many: 'and lift their needs-human holds' });
+export const readyLine = (prs, { lift = false } = {}) => `🔀 Ready to merge ${prs.map((n) => `#${n}`).join(', ')}${lift ? ` ${prs.length === 1 ? LIFT_PHRASE.one : LIFT_PHRASE.many}` : ''} — say "merge"`;
+const LIFT_LINE = new RegExp(`^(#\\d{1,6}(?:\\s*,\\s*#\\d{1,6})*)\\s+(${LIFT_PHRASE.one}|${LIFT_PHRASE.many})\\s*(?:—|\\s--?\\s)\\s*say\\s+"merge"\\.?\\s*$`);
+const liftsHold = (rest, prs) => {
+  const m = LIFT_LINE.exec(rest.trim());
+  return m !== null && [...new Set([...m[1].matchAll(/#(\d{1,6})\b/g)].map((x) => Number(x[1])))].join() === prs.join() && m[2] === (prs.length === 1 ? LIFT_PHRASE.one : LIFT_PHRASE.many);
+};
 export function presentedRequests(text) {
+  const none = (prs) => ({ prs, requests: [] });
   const lines = String(text ?? '').split(/\r?\n/);
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
   const r = READY_LINE.exec(lines[lines.length - 1] ?? '');
@@ -109,23 +146,39 @@ export function presentedRequests(text) {
   for (; i >= 0; i--) {
     const h = HEAD_LINE.exec(lines[i]);
     const a = h ? null : AREAS_LINE.exec(lines[i]);
-    if (!h && !a) break;
-    block.unshift({ h, a });
+    const o = h || a ? null : HOLD_LINE.exec(lines[i]);
+    if (!h && !a && !o) break;
+    block.unshift({ h, a, o });
   }
-  if (i >= 0 && AREAS_START.test(lines[i])) return { prs, requests: [] }; // an Areas line of any other shape against the block: malformed
+  if (i >= 0 && AREAS_START.test(lines[i])) return none(prs); // an Areas line of any other shape against the block: malformed
+  if (lines.slice(0, i + 1).some((l) => HOLD_START.test(l))) return none(prs); // a Hold-shaped line outside the block (malformed, prose between it and its Head, an earlier block's): review note 6
   const bound = new Map();
+  let anyHold = false;
   for (let j = 0; j < block.length; j++) {
     const { h } = block[j];
     if (!h) continue;
-    const above = j > 0 ? block[j - 1].a : null;
-    if (above && (above[1] ?? null) !== (h[1] ?? null)) return { prs, requests: [] }; // another PR's Areas line
+    const hold = h[4] ?? null;
+    const o = block[j - 1]?.o ?? null; // the Hold line right above (null: none)
+    if ((hold === null) !== (o === null)) return none(prs); // a hold field with no Hold line right above, or a Hold line above a Head line without the field
+    let hasHold = null;
+    if (o) {
+      if ((o[1] ?? null) !== (h[1] ?? null) || o[2] !== hold) return none(prs); // another PR's Hold line, or another hold's id
+      const rebuilt = { id: o[2], login: o[3], at: o[4] };
+      if (holdBlock(rebuilt) === '') return none(prs); // (the regex reads T / Z in any case; the block is canonical only in upper case)
+      hasHold = rebuilt;
+      anyHold = true;
+    }
+    const above = o ? block[j - 2]?.a ?? null : block[j - 1]?.a ?? null;
+    if (above && (above[1] ?? null) !== (h[1] ?? null)) return none(prs); // another PR's Areas line
     const pr = h[1] ? Number(h[1]) : prs.length === 1 ? prs[0] : null;
     if (pr === null || !prs.includes(pr)) continue;
     const areas = above ? createHash('sha256').update(`Areas ${above[2].trim().split(/\s+/).join(' ')}`).digest('hex') : null;
-    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[4] ? h[4].toLowerCase() : null, ...(areas ? { areas } : {}) });
+    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[5] ? h[5].toLowerCase() : null, ...(areas ? { areas } : {}), ...(hasHold ? { hold: hasHold.id, holdBlock: holdDigest(hasHold) } : {}) });
   }
-  // An Areas line that no Head line below it takes (a second one in a row, one against the 🔀 line) is a malformed block.
-  if (block.some((b, j) => b.a && !block[j + 1]?.h)) return { prs, requests: [] };
+  // An Areas line that no Head line below it takes (a second one in a row, one against the 🔀 line) is a malformed block; so is a Hold line no Head line right below takes.
+  const takesHead = (j) => block[j + 1]?.h || (block[j + 1]?.o && block[j + 2]?.h);
+  if (block.some((b, j) => (b.a && !takesHead(j)) || (b.o && !block[j + 1]?.h))) return none(prs);
+  if (liftsHold(r[1], prs) !== anyHold) return none(prs); // rev 4 item 2a: a hold binds only under the lift wording, and the wording only with a hold
   return { prs, requests: [...bound.values()].filter(Boolean) };
 }
 
@@ -665,12 +718,18 @@ function ownedBy(list, { grant = false, home, env } = {}) {
 // the owner was shown for them (areasDigest). A record without the field (shown before Areas lines, or none shown) means "no areas": it still approves a
 // diff without areas, exactly as before, and never one with areas. `areas: null` (only the gated route, bound by the gate's ownerItems) says "this route does
 // not bind areas" and compares nothing; `undefined` (a caller that forgot) compares as no areas, so it fails closed.
-const approvalsFor = ({ repo, pr, head, items, areas, ...opts }) => {
+// `hold` (rev 4 items 2a, 5; the same rule for the needs-human hold): `{ id, login, at }`, the LIVE hold P merge read from the PR timeline (null: no hold); the record must name exactly
+// that hold id AND carry the digest of the Hold block the owner was shown (holdDigest), compared both ways: an old record without them (shown before Hold lines) never lifts a hold, a
+// record for hold X never covers hold Y, a record with a hold never approves a PR that has none now. `hold: null` (only the gated route, which lifts no hold) compares nothing;
+// `undefined` (absent, a caller that forgot) means "no hold" and fails closed.
+const approvalsFor = ({ repo, pr, head, items, areas, hold, ...opts }) => {
   const key = repoKey(repo);
   if (key === null || !/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return [];
   const wantAreas = areas === null ? null : areasDigest(areas);
+  const wantHold = hold === null ? null : { id: hold ? hold.id : 'none', digest: holdDigest(hold) }; // (undefined = no hold)
   return readApprovals(opts).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items
-    && (wantAreas === null || (typeof q.areas === 'string' ? q.areas : 'none') === wantAreas)));
+    && (wantAreas === null || (typeof q.areas === 'string' ? q.areas : 'none') === wantAreas)
+    && (wantHold === null || ((typeof q.hold === 'string' ? q.hold : 'none') === wantHold.id && (typeof q.holdBlock === 'string' ? q.holdBlock : 'none') === wantHold.digest))));
 };
 export function approvalGap(q) {
   const matching = approvalsFor(q);
