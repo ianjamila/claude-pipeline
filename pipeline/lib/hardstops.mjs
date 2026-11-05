@@ -206,6 +206,18 @@ const camelSplit = (s) => s.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
 const isSensitivePath = (p) => SENSITIVE_PATH.test(p) || SENSITIVE_PATH.test(p.replace(/([a-z0-9])([A-Z])/g, '$1-$2'));
 const isSensitiveText = (t) => SENSITIVE_TEXT.test(t) || SENSITIVE_TEXT.test(camelSplit(t));
 
+// Path-only and config-free: does ANY universal path rule above claim this path (a migration, a secret or credential file, auth
+// / roles / permissions / session code, sensitive-data names, the guard core, agent instructions and local hooks, pgTAP tests,
+// server entry points)? Not the project's own lists (hard_stops.paths ...): the caller adds those. It over-matches on purpose,
+// and ignores whether the file is code: review.docs_exempt_paths asks it about documents, which the content rules do not
+// judge, so a document whose NAME is claimed is simply never exempt. A function declaration (not a const): config.mjs
+// imports it while this file imports config.mjs, and a declaration is usable whatever order the two load in.
+export function isUniversalHardStopPath(p) {
+  const x = String(p);
+  return inc(x, MIGRATION_GLOBS) || inc(x, R2_PATH_GLOBS) || isAuthLogicPath(x) || isSensitivePath(x) || inc(x, R3_PATH_GLOBS)
+    || isR4Pipeline(x) || isR4Config(x) || inc(x, TEST_DIR_GLOBS) || inc(x, SERVER_ENTRY_GLOBS) || inc(x, WORKFLOW_GLOBS);
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // SQL: comment/string-aware scanning
 // ---------------------------------------------------------------------------------------------------------------
