@@ -106,3 +106,4 @@ full record.
 - 2026-11-04 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 9 · arbiter 9 · needs-human
 - 2026-11-05 · #145 · fix(owner-go): harness messages are never the owner's words; records are checked against the transcript when used (#128) · risk high · rounds 11 · arbiter 9 · awaiting-owner-merge
 - 2026-11-05 · #164 · fix(owner-go): prove a pre-#128 owner grant through its session's transcript · risk high · rounds 3 · arbiter 2 · awaiting-owner-merge
+- 2026-11-05 · #166 · review: lines added to listed documents after the last round need no new round · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge
