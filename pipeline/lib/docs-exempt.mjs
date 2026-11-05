@@ -50,6 +50,7 @@ const quote = (text) => JSON.stringify(String(text).slice(0, 60));
 // It over-matches on purpose (tokens in code spans, any case, both the importer's own and its target's directory), and fails closed:
 // whatever cannot be read or followed (a link that cycles, dangles or ends outside the repo, an oversized file) is "not exempt".
 const MAX_HOPS = 5;
+const MAX_REENTRIES = 4; // times one relative import may leave the repo and come back in
 const MAX_READS = 2000;
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_TOKENS = 5000;
@@ -97,7 +98,7 @@ function resolveInTree(tree, rel, readBlob) {
     if (next === '..') {
       if (done.length === 0) {
         if (follows > 0) throw new Unjudgeable('a symlink leads out of the repository');
-        return { outside: true };
+        return { outside: true, rest: ['..', ...segs] }; // `rest`: what is left to walk, starting from the directory above the root
       }
       done.pop();
       continue;
@@ -113,7 +114,7 @@ function resolveInTree(tree, rel, readBlob) {
     const target = readBlob(entry.oid, real);
     if (target === '' || target.includes('\0')) throw new Unjudgeable(`${real} is a symlink with an unreadable target`);
     if (target.startsWith('/')) throw new Unjudgeable(`${real} is a symlink to an absolute path`);
-    segs = [...target.split('/'), ...segs];
+    segs = [...target.split('/').filter((s) => s !== '' && s !== '.'), ...segs];
     // `done` is the directory that holds the link, unchanged: the target is relative to it.
   }
   const full = done.join('/');
@@ -154,12 +155,24 @@ function importProblem({ toHead, root, listed, tree, home, o }) {
   try { rootReal = realpathSync(root); } catch { /* the root as given */ }
   const roots = [...new Set([root, rootReal].map((r) => posix.normalize(r.replace(/\\/g, '/')).replace(/\/$/, '')))];
 
+  // One entry per file AND directory it was reached in: the same file behind two symlinked directories is read from each, because an
+  // `@name` in it resolves against the directory it was reached in. The set of directories is bounded by the tree, the reads by MAX_READS.
   const seen = new Set();
   const queue = [];
   const enqueue = (path, canonical, depth) => {
-    if (seen.has(lc(canonical))) return;
-    seen.add(lc(canonical));
+    const key = `${lc(canonical)}\0${lc(posix.dirname(path))}`;
+    if (seen.has(key)) return;
+    seen.add(key);
     queue.push({ path, canonical, depth });
+  };
+  // A path that left the repo (`rest`, walked from the directory above the root) and came back in: -> the path from the root, or null.
+  const reenter = (rest) => {
+    for (const base of roots) {
+      const target = posix.normalize(`${base}/${rest.join('/')}`);
+      const inside = roots.find((r) => target === r || target.startsWith(`${r}/`));
+      if (inside) return target.slice(inside.length + 1);
+    }
+    return null;
   };
 
   // The instruction files are the roots. One that is itself a link is followed; one that ends in a listed document makes that document
@@ -208,21 +221,32 @@ function importProblem({ toHead, root, listed, tree, home, o }) {
         } else {
           for (const dir of new Set([posix.dirname(path), posix.dirname(canonical)])) rels.push(`${dir === '.' ? '' : `${dir}/`}${written}`);
         }
-        for (const rel of rels) {
-          const lexical = posix.normalize(rel);
-          const direct = hit(path, lexical, null);
-          if (direct) return direct;
-          let r;
-          try {
-            r = resolveInTree(tree, rel, readBlob);
-          } catch (e) {
-            if (!(e instanceof Unjudgeable)) throw e;
-            return `${path} imports ${written}, which cannot be judged: ${e.message}`;
+        for (const start of rels) {
+          let rel = start;
+          let lexical = posix.normalize(rel);
+          let r = null;
+          // A relative path may leave the repo and re-enter it (`../<this directory>/docs/x.md`): follow it back in, a few times at most.
+          for (let again = 0; again <= MAX_REENTRIES; again++) {
+            const direct = hit(path, lexical, null);
+            if (direct) return direct;
+            try {
+              r = resolveInTree(tree, rel, readBlob);
+            } catch (e) {
+              if (!(e instanceof Unjudgeable)) throw e;
+              return `${path} imports ${written}, which cannot be judged: ${e.message}`;
+            }
+            if (!r.outside) break;
+            const back = reenter(r.rest);
+            if (back === null) break; // outside the repo for good: it cannot be a listed document
+            rel = back;
+            lexical = posix.normalize(rel);
+            r = null;
           }
-          if (r.outside) continue;
+          if (r === null || r.outside) continue;
           const found = hit(path, lexical, r.path);
           if (found) return found;
-          if (r.path !== null && REGULAR_MODES.has(r.entry.mode) && depth < MAX_HOPS) enqueue(r.path, r.path, depth + 1);
+          // The file as it was reached (the importer's directory matters to what it imports), and where it really is.
+          if (r.path !== null && REGULAR_MODES.has(r.entry.mode) && depth < MAX_HOPS) enqueue(lexical.startsWith('..') ? r.path : lexical, r.path, depth + 1);
         }
       }
     }
@@ -350,14 +374,6 @@ function decide(state, { root, config, hash, home }) {
   if (files.length === 0) return no(`no file changed since the reviewed head ${toHead.slice(0, 12)}`);
   let treeMemo = null;
   const tree = () => (treeMemo ??= readTree(toHead, o));
-  let importWhy;
-  try {
-    importWhy = importProblem({ toHead, root, listed, tree: tree(), home: home === undefined ? homedir() : home, o });
-  } catch (e) {
-    if (!(e instanceof Unjudgeable)) throw e;
-    importWhy = e.message;
-  }
-  if (importWhy) return no(importWhy);
   const modes = new Map(diffModes(toHead, 'HEAD', o).map((m) => [m.newPath ?? m.oldPath, m]));
   const problems = [];
   const changed = new Set();
@@ -379,6 +395,17 @@ function decide(state, { root, config, hash, home }) {
       if (rows) problems.push(rows);
     }
     for (const p of paths) changed.add(p);
+  }
+  // Only when nothing else is wrong: a code file is named before an import is, and the tree is read only for a commit that could pass.
+  if (problems.length === 0) {
+    let importWhy;
+    try {
+      importWhy = importProblem({ toHead, root, listed, tree: tree(), home: home === undefined ? homedir() : home, o });
+    } catch (e) {
+      if (!(e instanceof Unjudgeable)) throw e;
+      importWhy = e.message;
+    }
+    if (importWhy) return no(importWhy);
   }
   if (problems.length > 0) {
     const shown = problems.slice(0, SHOWN).join('; ');
