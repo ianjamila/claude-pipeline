@@ -407,6 +407,9 @@ test('commitTime returns epoch ms close to now for a fresh commit', () => {
 });
 
 test('commitTime ignores log.showSignature=true in the user\'s git config (a signed commit still parses)', (t) => {
+  // SSH signing needs git >= 2.34: older gits accept gpg.format=ssh but then fail `git commit -S`.
+  const gv = /git version (\d+)\.(\d+)/.exec(spawnSync('git', ['--version'], { encoding: 'utf8' }).stdout ?? '');
+  if (gv && (Number(gv[1]) < 2 || (Number(gv[1]) === 2 && Number(gv[2]) < 34))) { t.skip(`git ${gv[1]}.${gv[2]} is older than 2.34, so it cannot make an SSH-signed commit`); return; }
   const { repo, o } = baseRepo();
   const scratch = mkdtempSync(join(tmpdir(), 'cp-sign-'));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -420,7 +423,9 @@ test('commitTime ignores log.showSignature=true in the user\'s git config (a sig
   repo.git(['config', 'gpg.ssh.allowedSignersFile', join(scratch, 'allowed-signers')]);
   repo.write('signed.txt', 'signed\n');
   repo.git(['add', 'signed.txt']);
-  repo.git(['commit', '-q', '-S', '-m', 'signed']);
+  try {
+    repo.git(['commit', '-q', '-S', '-m', 'signed']);
+  } catch (err) { t.skip(`this git cannot make an SSH-signed commit (${err.message.split('\n')[0]})`); return; }
   const sha = repo.git(['rev-parse', 'HEAD']).trim();
   assert.match(repo.git(['show', '-s', '--format=%ct', sha]), /signature/i, 'git prints signature text under log.showSignature');
   const expected = Number(repo.git(['show', '-s', '--no-show-signature', '--format=%ct', sha]).trim()) * 1000;
