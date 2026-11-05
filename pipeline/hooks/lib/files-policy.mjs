@@ -1098,9 +1098,53 @@ function makeMatchers(ctx) {
   // #161: a file directly in a config dir's pipeline-state/ other than the owner-go records (the run history verify.mjs appends to, verify-runs.jsonl) is no transcript, so the config dir in front of it
   // is no reference to a transcript folder: the path is left out of the text before it is judged. (owner-go, a name with a slash after it -- pipeline-state/x/../../projects -- and `..` stay in the
   // text; the owner-go records themselves are protected by rootRes, not here.)
+  // (R1-B1 / #162: ONLY when the path sits in a COMMENT, text the program cannot use at run time. In a string or template literal (or a docstring) it is data: the program can derive a protected path
+  // from it -- dirname(p) + '/owner-go/x.json', resolve(dirname(p), '../projects/..') -- with no config root left in the judged text, which would defeat the rule above. Comments are found by a small
+  // scan of the text: a `/* */` block, a `//` that starts a line, a `#` that starts a line or follows white space, none of them inside a '…' / "…" / '''…''' / `…` literal (with its `${ }` code). Anything
+  // it cannot tell apart is judged as before. Known residual, best-effort like the rest: a regex literal holding a quote or ` #`, and Python's `//` starting a line inside brackets, can fool the scan.)
+  const commentRanges = (t) => {
+    const out = [];
+    const n = t.length;
+    const frames = []; // one brace depth per open `${` of a template literal
+    let tpl = false;
+    let blank = true; // only white space so far on this line
+    let i = 0;
+    const comment = (end) => { out.push([i, end]); i = end; };
+    while (i < n) {
+      const c = t[i];
+      if (tpl) {
+        if (c === '\\') i += 2;
+        else if (c === '`') { tpl = false; i++; } else if (c === '$' && t[i + 1] === '{') { frames.push(0); tpl = false; i += 2; } else i++;
+        continue;
+      }
+      if (c === '\n') { blank = true; i++; continue; }
+      if (c === '`') { tpl = true; blank = false; i++; continue; }
+      if (frames.length && c === '{') frames[frames.length - 1]++;
+      else if (frames.length && c === '}') { if (frames[frames.length - 1] === 0) { frames.pop(); tpl = true; } else frames[frames.length - 1]--; i++; continue; }
+      if (c === "'" || c === '"') {
+        blank = false;
+        if (t.startsWith(c.repeat(3), i)) { const e = t.indexOf(c.repeat(3), i + 3); i = e < 0 ? n : e + 3; continue; }
+        let j = i + 1;
+        while (j < n && t[j] !== c && t[j] !== '\n') j += t[j] === '\\' ? 2 : 1;
+        i = t[j] === c ? j + 1 : j; // (a string stops at the end of its line: a stray quote costs one line, not the rest of the text)
+        continue;
+      }
+      if (c === '/' && t[i + 1] === '*') { const e = t.indexOf('*/', i + 2); comment(e < 0 ? n : e + 2); continue; }
+      if ((c === '/' && t[i + 1] === '/' && blank) || (c === '#' && (blank || /\s/.test(t[i - 1])))) { const e = t.indexOf('\n', i); comment(e < 0 ? n : e); continue; }
+      if (!/\s/.test(c)) blank = false;
+      i++;
+    }
+    return out;
+  };
   const pipelineStateFile = new RegExp(`(?<![\\w.~\\-/])(?:[\\w.~\\-/]*/)?(?:\\.claude[\\w\\-]*${ctx.transcriptRoots.map((r) => '|' + escapeRe(r)).join('')})/pipeline-state/(?!owner-go(?![\\w.\\-]))[\\w\\-][\\w.\\-]*(?=[\\s'"\`)\\]};,:]|$)`, ctx.ci ? 'gi' : 'g');
+  const withoutPipelineStateComments = (text) => {
+    if (!pipelineStateFile.test(text)) return text;
+    pipelineStateFile.lastIndex = 0;
+    const comments = commentRanges(text);
+    return text.replace(pipelineStateFile, (m, at) => (comments.some(([s, e]) => at >= s && at + m.length <= e) ? ' ' : m));
+  };
   const envTranscriptText = (text) => {
-    const v = text.replace(pipelineStateFile, ' ');
+    const v = withoutPipelineStateComments(text);
     const call = /[()[\]]/.test(v);
     if (call && (v.includes('CLAUDE_CONFIG_DIR') || rootWordText.some((re) => re.test(v)) || homeClaudeText(v))) return true;
     if (!/(?<![\w])projects(?![\w])/i.test(v) || !/\.jsonl(?![\w])/i.test(v)) return false;

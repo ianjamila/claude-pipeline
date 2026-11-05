@@ -471,4 +471,24 @@ test('N: a program naming a non-owner-go pipeline-state file (verify-runs.jsonl)
     "fs.writeFileSync(path.join(os.homedir(), '.claude', 'projects', '-home-u-proj', 'a.jsonl'), x)"]) {
     assert.equal(run(`${COMMENT}${JS}${bad}\n`).decision, 'deny', bad);
   }
+  // R1-B1 (#162): only text a program cannot use at run time is left out. A path in a string or template literal (or a docstring) is data: the program can derive a protected path from it
+  // (dirname + '/owner-go/..', a '../projects/..' join), so it still counts as naming the config root.
+  const LIT = '/home/u/.claude/pipeline-state/verify-runs.jsonl';
+  for (const bad of [`const p = '${LIT}';\nfs.writeFileSync(path.dirname(p) + '/owner-go/pr-1.json', x);\n`,
+    `const p = '${LIT}';\nfs.writeFileSync(resolve(dirname(p), '../projects/-home-u-proj/a.jsonl'), x);\n`,
+    `const p = \`${LIT}\`;\nfs.writeFileSync(path.dirname(p) + '/owner-go/pr-1.json', x);\n`,
+    // (a template literal that spans lines, with a comment-looking line and a nested template inside it)
+    `const t = \`\n// history: ${LIT}\n\`;\nfs.writeFileSync(path.dirname(t.split(' ')[2]) + '/owner-go/pr-1.json', x);\n`,
+    `const t = \`a \${\`b\`} \n// history: ${LIT}\n\`;\nfs.writeFileSync(path.dirname(t.split(' ')[2]) + '/owner-go/pr-1.json', x);\n`,
+    // (a path in prose inside a string is still data; so is one in a docstring)
+    `const m = "history: ${LIT}";\nfs.writeFileSync(path.dirname(m.split(' ')[1]) + '/owner-go/pr-1.json', x);\n`,
+    `"""\nhistory: ${LIT}\n"""\nopen(os.path.dirname(__doc__.split()[1]) + '/owner-go/pr-1.json', 'w').write(x)\n`,
+    // (a comment opener inside a string does not make the rest a comment)
+    `const m = "# ${LIT}";\nfs.writeFileSync(path.dirname(m.slice(2)) + '/owner-go/pr-1.json', x);\n`]) {
+    assert.equal(run(`${JS}${bad}`).decision, 'deny', bad);
+  }
+  // a block comment and a trailing # comment are left out too
+  for (const ok of [`/* history: ${LIT}\n   (moved by VERIFY_RUN_HISTORY) */\nrun(x);\n`, `run(x)  # history: ${LIT}\n`]) {
+    assert.equal(run(`${ok}${JS}`).decision, 'allow', ok);
+  }
 });
