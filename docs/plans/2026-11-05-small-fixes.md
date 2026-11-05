@@ -12,7 +12,8 @@ nothing: the branch content has not changed since round 2, and earlier rounds ac
 passed, i.e. nothing needed a fix.
 
 **Cause:** `pipeline/commands/codex-review.mjs:229-235` refuses when ANY round ever accepted an item (`hasAccepted`) and the content
-hash (the PR's own diff against its fork point) is unchanged since the last round. A clean merge of main never changes that hash, and
+hash (the PR's own diff against its fork point) is unchanged since the last round. The two #1658 merges left that hash unchanged (a clean merge
+can change it only through context lines next to a PR hunk), and
 the check runs BEFORE the code that would record the round as `baseOnly` (line 278). The accepts it names were fixed and re-reviewed
 rounds ago.
 
@@ -59,20 +60,37 @@ A PR whose head lacks commits of its base is accepted as "behind but fresh enoug
    `HAS_HOOKS`, `UNSTABLE`, `BLOCKED` — one shared constant, so the real merge and the dry run accept exactly the same states; never
    `BEHIND`, which only appears under strict branch protection where GitHub itself refuses, never `DIRTY` / `UNKNOWN`); `mergeable` is
    `MERGEABLE` (prOpenCheck already requires it — #1642 landed a real README conflict between a dry run and the merge).
-3. **Disjoint:** M = every path main changed from `merge-base(baseRefOid, HEAD)` to `baseRefOid` (local `git diff`, renames as both
-   names; no 300-file API truncation), P = every path the PR changes (the same diff the scan uses, already cross-checked against
-   GitHub's `pulls/N/files` by scan-range). M ∩ P = ∅, compared case-insensitively (case-insensitive file systems).
-4. **Nothing on main's side that changes how the checks run:** no path in M matches the built-in list (`.github/**`,
-   `.claude/pipeline.yml`, `**/.gitattributes` (nested ones apply to their subtree — Codex plan R1), `.gitmodules`) or the base's
-   `merge.behind_base_stale_paths` (globs, default `[]`; EW will add its toolchain files, e.g. `package.json`, `package-lock.json`,
-   `tsconfig*.json`, `supabase/**`).
+3. **Disjoint:** M = every path main changed from `mb = merge-base(baseRefOid, HEAD)` to `baseRefOid`, P = every path the PR
+   changes (the same diff the scan uses, already cross-checked against GitHub's `pulls/N/files` by scan-range). **Both sides are
+   read the same way (Fable F2):** `diffFiles` + `pathsOf` (renames as both names, C-quoted paths unquoted) — never `git diff
+   --name-only` without `-z`, whose `"docs/r\303\251sum\303\251.md"` would never equal P's `docs/résumé.md`. Local git: no 300-file
+   API truncation. M ∩ P = ∅, compared after NFC normalisation and lower-casing (case-insensitive, normalising file systems).
+   A failed diff on either side → not fresh enough (`{ok:false}`), never null (Fable F6).
+4. **Nothing on main's side that changes how the checks run:** no path in M matches (`matchGlob(p, g, { nocase: true })`, as the
+   CI-proof scan does) the built-in list — `CI_PROOF_PROTECTED` (`.github/**`, `.claude/pipeline.yml`, `scripts/verify*`,
+   `scripts/verify*/**`: what the required checks execute) ∪ `**/.gitattributes` (nested ones apply to their subtree — Codex plan
+   R1; also matches the root file) ∪ `.gitmodules`, `.nvmrc`, `.node-version`, `.tool-versions` (they steer the CI toolchain — Fable
+   F3) — nor the base's `verify.ci_proof_inputs` (the repo's own list of "inputs whose change changes what CI proves" — Fable F3) nor
+   the base's `merge.behind_base_stale_paths` (globs, default `[]`; EW will add its toolchain files, e.g. `package.json`,
+   `package-lock.json`, `tsconfig*.json`, `supabase/**`). The built-in part cannot be configured away.
+4b. **(Fable F4) Main did not remove a directory the PR adds into:** for every PR path the PR adds (status A, or the new name of an
+   R), if an ancestor directory has entries at `mb` (`git ls-tree`) but none at `baseRefOid`, refuse "main removed <dir>, which the
+   PR adds into" (a path-level clash disjoint names cannot see: main moves `src/foo/`, the PR adds `src/foo/new.js`).
 5. Everything else unchanged: required checks green on THIS head, labels, hard-stops / integrity / owner items, the owner's recorded
    "merge" for this head + items (+ Areas), and the last look (`preMergeProblems`) refusing when baseRefOid or headRefOid moved since
    the evaluation.
-6. **(Codex plan R1) No landing on a base nobody checked:** the merge command may queue (`gh pr merge --auto`), so while
-   `waitForMerge` polls, an accepted-behind merge adds one blocker: GitHub's `baseRefOid` is no longer the evaluated one → the
-   existing abandon path (disable auto-merge, look once more, report). The residual (main moves in the seconds between the last look
-   and GitHub merging) is the same one the strict path has today: an up-to-date PR also lands on whatever main is at that moment.
+6. **(Codex plan R1, Fable F5) No landing on a base nobody checked:** the merge command may queue (`gh pr merge --auto`), so while
+   `waitForMerge` polls, EVERY `--owner-go` merge (behind or not: an up-to-date PR whose main moves during the wait runs the same
+   risk) adds one blocker: GitHub's `baseRefOid` is no longer the evaluated one → the existing abandon path (disable auto-merge, look
+   once more, and report truthfully if it merged meanwhile). `waitBlockers` gets the evaluated base and asks for `baseRefOid` only
+   then; the dry run has no wait and adds nothing. The gated `P merge` path is unchanged. Residual: main moving in the seconds
+   between the last look and GitHub merging (the same as today).
+7. **(Owner ruling 2026-11-05, Fable F1) The approval is NOT bound to main's commit.** The owner's "merge" stays bound to head +
+   items (+ Areas); the frozen owner-go hook is not touched. If main gains more commits between the dry run and the real merge, the
+   real run re-checks rules 1–6 against the new base and merges only if they still hold; its output carries `behind`
+   `{behindBy, baseRefOid, mainFiles}` for the base it actually merged on.
+8. **(Fable F6)** `merge.behind_base` / `behind_base_stale_paths` from the LOCAL (PR) copy of the config are never read, anywhere
+   (`readBehind` included); only the base commit's.
 
 **Code:**
 - `pipeline/lib/config.mjs`: `merge.behind_base` ('update' | 'disjoint', default 'update'), `merge.behind_base_stale_paths` (string[]
@@ -96,7 +114,11 @@ A PR whose head lacks commits of its base is accepted as "behind but fresh enoug
 - PR's OWN pipeline.yml says `disjoint`, base's does not (or base has none / an invalid one) → `behind-base` (+ reason).
 - mergeStateStatus `BEHIND` → `behind-base` even with `disjoint`; `DIRTY` → conflicts + behind-base-unverified as today.
 - dry run: compare reports a base tip other than the evaluated baseRefOid → `behind-base`.
-- a nested `sub/.gitattributes` changed on main → `behind-base`.
+- a nested `sub/.gitattributes` changed on main → `behind-base`; root `.gitattributes` → `behind-base`.
+- (Fable) `scripts/verify.mjs`, `.nvmrc`, a base `verify.ci_proof_inputs` match changed on main → `behind-base`.
+- (Fable) a non-ASCII path (`docs/résumé.md`) and a path with a space changed on BOTH sides → `behind-base` (not accepted).
+- (Fable) main removes `src/foo/` (moves it), the PR adds `src/foo/new.js` → `behind-base` naming the directory.
+- (Fable) an UP-TO-DATE owner-go merge whose base moves during a queued wait → abandoned, not merged.
 - mergeStateStatus `UNKNOWN` on the real `--owner-go` with `disjoint` → not accepted (parity with the dry run).
 - accepted-behind merge with a queued (`--auto`) merge command; GitHub's baseRefOid changes during the wait → abandon (auto-merge
   disabled), exit 1, not merged.
@@ -126,8 +148,11 @@ the cached ref, as codex-review does), called before `currentContentHash` in `re
 coverage and the fetch failed, the reason adds "(origin/<branch> could not be refreshed: <first line>)". A stale ref can only make
 `review-complete` / `state outcome` refuse (the round's hash was taken right after codex-review's own fetch), so best effort is safe
 there. **`mark-implemented` fails CLOSED (Codex plan R1):** a stale ref makes the hash differ and would count main's commits as the
-fix, so when an `origin` remote exists and the fetch fails it exits 3 `{unavailable, reason: 'base-refresh'}` and marks nothing; a
-repo with no `origin` remote keeps the cached/local ref as today.
+fix, so whenever the hash would be measured from `origin/<branch>` (reviewBaseRef picked it) and that ref was NOT refreshed this
+call — fetch failed, timed out, or there is no `origin` remote but a leftover `refs/remotes/origin/<branch>` (Codex recheck P2) — it
+exits 3 `{unavailable, reason: 'base-refresh'}` and marks nothing. Only a repo whose base resolves to the local `<branch>` (no
+`origin/<branch>` ref at all) keeps today's behaviour. Test: no-origin + stale `origin/main` ref + merged newer main, unfixed accept →
+exit 3, item unchanged.
 
 **Tests (test/cli-review.test.mjs or a new test/review-complete-fetch.test.mjs):** a bare "origin" whose main moves after the local
 fetch; the PR branch merges it (simulating update-branch + pull, local origin/main left stale) → `review-complete` exits 0 (without
