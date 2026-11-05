@@ -158,6 +158,13 @@ export function transcriptRes(configDirs = [], ci = false, homes = []) {
     below: folders,
   };
 }
+// The config dirs whose projects/ folder isTranscriptFile can trust, for `home`: $CLAUDE_CONFIG_DIR and each <home>/.claude* folder (the shape of
+// ANY_CLAUDE_DIR). A caller that looks a transcript up by session (owner-go.mjs legacyTranscriptOf) still tests each file it finds with isTranscriptFile.
+export function transcriptConfigDirs({ env = process.env, home = os.homedir() } = {}) {
+  let named = [];
+  try { named = fs.readdirSync(home).filter((n) => n.startsWith('.claude')).sort(); } catch { /* an unreadable home has none */ }
+  return [...new Set([configDirOf(env, home), ...named.map((n) => path.join(home, n))].filter(Boolean))];
+}
 // Is this path (any slash flavour) a transcript FILE the guard protects?
 export function isTranscriptFile(file, { env = process.env, platform = process.platform, home } = {}) {
   const p = toPosix(file);

@@ -15,18 +15,21 @@
 // transcript entry once it exists, a text envelope), and the ruling look-back skips turns the TRANSCRIPT METADATA marks synthetic
 // (entrySource: never text); (2) at USE time, when the transcript has caught up, `P merge`, the guard, `P triage owner-ruling` and the
 // owner-granted extra round (ownerGrantedRounds, the final gate's verifyOwnerGrant) accept a record only when its prompt entry (found by the hook's prompt_id, else by text and time) is the owner's (promptProvenance).
-// A record whose entry cannot be found or is not the owner's approves nothing. Records written before #128 carry no prompt_id, so they
-// are refused for their last day at most.
+// A record whose entry cannot be found or is not the owner's approves nothing. Records written before #128 carry no prompt_id (nor transcript_path):
+// a "merge" or a ruling from then is refused for its last day at most (it ages out, MAX_AGE_MS). An owner-granted extra round is different: it is read
+// at any age (verifyOwnerGrant), so a pre-#128 grant on a PR still in flight would block its review-complete and final gate for good. The grant readers
+// therefore find such a record's transcript from its session (legacyTranscriptOf: exactly one real file under the trusted roots, else missing) and prove
+// the prompt by its words and time like any record without a prompt_id; the derived path is never written back. Nothing else gets this.
 // Residual (#128): the model could still write a transcript entry itself (files-policy refuses a tool write to ~/.claude*/projects/**/*.jsonl)
 // or type into an interactive `claude --resume` through a pty, which types as the owner; GitHub-side separation (issue #65) is the backstop.
 // Residual (owner ruling 2026-10-14, the "cheap step"): the agent runs as the same OS user, so a program the guards cannot
 // see into can still write the folder; the transcript the recorder reads is a file of that user; and the agent's GitHub
 // token is the owner's. A second GitHub identity + a ruleset is the server-side backstop (issue #65).
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, writeSync } from 'node:fs';
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { isTranscriptFile } from '../../lib/paths.mjs';
+import { isTranscriptFile, transcriptConfigDirs } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
 export const MAX_AGE_MS = 24 * 60 * 60 * 1000; // a "merge" older than a day approves nothing
@@ -575,12 +578,38 @@ function scanBackwards(file, visit, wants, { chunkBytes, capBytes }) {
   }
 }
 
-// The records of `list` whose prompt is the owner's (each distinct prompt is looked up once).
-function ownedBy(list) {
+// A record written before #128 has no transcript_path: the one transcript of its session, or null. <config dir>/projects/<project>/<session>.jsonl under the
+// config dirs isTranscriptFile trusts for `env` (paths.mjs transcriptConfigDirs); a regular file of the shape isTranscriptFile accepts, not a subagent's;
+// de-duplicated by real path (one account's projects/ can be a link to the other's). None, or two different files, is null.
+export function legacyTranscriptOf(session, { home = accountHome(), env = process.env } = {}) {
+  if (typeof session !== 'string' || !SESSION_RE.test(session)) return null;
+  const found = new Map(); // real path -> the path it was first seen by
+  for (const dir of transcriptConfigDirs({ env, home })) {
+    let projects;
+    try { projects = readdirSync(path.join(dir, 'projects')); } catch { continue; }
+    for (const project of projects) {
+      const file = path.join(dir, 'projects', project, `${session}.jsonl`);
+      try {
+        if (!lstatSync(file).isFile() || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { env })) continue;
+        const real = realpathSync(file);
+        if (!found.has(real)) found.set(real, file);
+      } catch { /* not there */ }
+    }
+  }
+  return found.size === 1 ? [...found.values()][0] : null;
+}
+
+// The records of `list` whose prompt is the owner's (each distinct prompt is looked up once). grant: true (the extra-round readers) finds a pre-#128
+// record's transcript by its session (legacyTranscriptOf) when it names none; `home` / `env` say where to look.
+function ownedBy(list, { grant = false, home, env } = {}) {
   const memo = new Map();
   return list.filter((r) => {
-    const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}`;
-    if (!memo.has(key)) memo.set(key, promptProvenance(r));
+    const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}\0${grant ? r.session : ''}`;
+    if (!memo.has(key)) {
+      const derive = grant && (typeof r.transcript_path !== 'string' || r.transcript_path === '');
+      const file = derive ? legacyTranscriptOf(r.session, { home, env }) : r.transcript_path;
+      memo.set(key, derive && file === null ? 'missing' : promptProvenance(derive ? { ...r, transcript_path: file } : r, env ? { env } : undefined));
+    }
     return memo.get(key) === 'owner';
   });
 }
@@ -803,14 +832,14 @@ function grantsFor({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
 // marker (a consumed, partial or unreadable marker is spent), newest first. All of them: a duplicate "extra round" must not outlive a claim.
 // anyHead: true drops the head test (head is then ignored): the caller compares the head itself, to tell a stale grant from none.
 // #128: only a record whose prompt is the owner's (promptProvenance) counts, as for a "merge".
-export const ownerGrantedRounds = (q = {}) => ownedBy(grantsFor(q));
+export const ownerGrantedRounds = (q = {}) => ownedBy(grantsFor(q), { grant: true, home: q.home, env: q.env });
 
 // Why ownerGrantedRounds found nothing, for the message: 'none' (no such record), 'provenance' (records exist but none is confirmed as typed
 // by the owner) or 'ok' (at least one is the owner's).
 export function ownerGrantGap(q = {}) {
   const found = grantsFor(q);
   if (found.length === 0) return 'none';
-  return ownedBy(found).length > 0 ? 'ok' : 'provenance';
+  return ownedBy(found, { grant: true, home: q.home, env: q.env }).length > 0 ? 'ok' : 'provenance';
 }
 
 // R2-F3 for a grant: text to append to a refusal when the unconfirmed records' transcripts are under a config dir this process does not know ('' otherwise).
@@ -906,7 +935,7 @@ export function verifyOwnerGrant({ repo, pr, k, toHead, ownerGrant } = {}, opts 
   const record = readRecords({ ...opts, maxAgeMs: Infinity, maxBytes: VERIFY_MAX_BYTES }).find((r) => isRoundRecord(r) && grantIdOf(r) === id);
   if (!record) return { ok: false, reason: 'no-record' };
   if (record.repo !== key || record.pr !== pr || record.k !== k || !toHead.startsWith(record.head)) return { ok: false, reason: 'mismatch' };
-  if (ownedBy([record]).length === 0) return { ok: false, reason: 'provenance' }; // (#128: the prompt is not the owner's, or is gone from the transcript)
+  if (ownedBy([record], { grant: true, home: opts.home, env: opts.env }).length === 0) return { ok: false, reason: 'provenance' }; // (#128: the prompt is not the owner's, or is gone from the transcript)
   const m = readGrantMarker(id, { home: opts.home });
   if (!m.spent) return { ok: false, reason: 'no-marker' };
   if (!m.verifiable) return { ok: false, reason: 'unverifiable-marker' };

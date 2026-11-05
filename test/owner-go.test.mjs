@@ -12,7 +12,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
   presentedRuling, recordRuling, ownerRuled, rulingsIn, entrySource, notOwnerWords, approvalGap, ownerRulingGap, promptProvenance, rulingNudge, RULING_NUDGE,
-  approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT,
+  approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT, legacyTranscriptOf,
   parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import { OWNER_ENTRY, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
@@ -1414,4 +1414,95 @@ test('test helper owner-go: a process that exits without t.after removes the rec
   } finally {
     rmSync(other, { force: true });
   }
+});
+
+// ---- #128 follow-up: a grant recorded BEFORE #128 (no transcript_path, no prompt_id) is read at any age, so it is proven through its session's transcript ----
+// (a "merge" or a ruling from then ages out in a day and approves nothing; a grant would block its PR's review-complete and final gate for good)
+const LEGACY_SESSION = 'f5fd6f51-0000-4000-8000-0123456789ab';
+const legacyRecord = (over = {}) => ({
+  v: 1, kind: 'extra-round', ts: stamp(0), session: LEGACY_SESSION, prompt_sha256: createHash('sha256').update('extra round').digest('hex'),
+  cwd: '/work/app', repo: REPO, pr: 58, k: 4, head: GHEAD.slice(0, 12), prompt: 'extra round', ...over,
+});
+// A temp home holding the pre-#128 record and, under each of `places` ([config dir name, project name]), a transcript of the session with `entries`.
+function legacyWorld({ entries, places = [['.claude', '-repo']], record = legacyRecord() } = {}) {
+  const home = tmp();
+  mkdirSync(ownerGoDir(home), { recursive: true });
+  writeFileSync(join(ownerGoDir(home), `${LEGACY_SESSION}.jsonl`), `${JSON.stringify(record)}\n`);
+  for (const [cfg, project] of places) {
+    mkdirSync(join(home, cfg, 'projects', project), { recursive: true });
+    writeFileSync(join(home, cfg, 'projects', project, `${record.session}.jsonl`), lines(entries));
+  }
+  const q = { repo: REPO, pr: 58, k: 4, head: GHEAD, home, env: {}, now: () => AT + 5000 };
+  const verify = () => {
+    assert.equal(claimGrantMarkers([record], { repo: REPO, pr: 58, k: 4, head: GHEAD, checkout: '/work/app' }, { home }).ok, true);
+    const v = verifyOwnerGrant({ repo: REPO, pr: 58, k: 4, toHead: GHEAD, ownerGrant: { grantId: grantIdOf(record), quote: 'extra round' } }, { home, env: {} });
+    return [v.ok, v.reason];
+  };
+  return { home, record, q, verify };
+}
+const typed = (text, meta = OWNER_META, ms = 2000) => ({ ...promptEntry(text, meta, undefined), timestamp: stamp(ms) });
+const legacyEntries = [promptEntry('go'), said(RASK), typed('extra round')];
+
+test('#128 legacy grant: no transcript_path / prompt_id: the owner\'s typed words in the session\'s transcript prove it (cap lookup and final gate)', () => {
+  const w = legacyWorld({ entries: legacyEntries });
+  assert.equal(ownerGrantedRounds(w.q).length, 1);
+  assert.equal(ownerGrantGap(w.q), 'ok');
+  assert.deepEqual(w.verify(), [true, undefined]);
+  assert.equal(readFileSync(join(ownerGoDir(w.home), `${LEGACY_SESSION}.jsonl`), 'utf8'), `${JSON.stringify(w.record)}\n`, 'the record is not rewritten');
+});
+
+test('#128 legacy grant: one real transcript reached through a symlinked second config dir counts once', () => {
+  const w = legacyWorld({ entries: legacyEntries });
+  mkdirSync(join(w.home, '.claude-eaglewatch'), { recursive: true });
+  symlinkSync(join(w.home, '.claude', 'projects'), join(w.home, '.claude-eaglewatch', 'projects'));
+  assert.equal(ownerGrantGap(w.q), 'ok');
+  assert.deepEqual(w.verify(), [true, undefined]);
+});
+
+test('#128 legacy grant: a synthetic entry, or one outside the time window, is refused', () => {
+  for (const [name, meta] of [['scheduled', SCHEDULED_META], ['sdk', SDK_META], ['peer', PEER_META], ['notice', NOTICE_META]]) {
+    const w = legacyWorld({ entries: [promptEntry('go'), said(RASK), typed('extra round', meta)] });
+    assert.equal(ownerGrantGap(w.q), 'provenance', name);
+    assert.deepEqual(ownerGrantedRounds(w.q), [], name);
+    assert.deepEqual(w.verify(), [false, 'provenance'], name);
+  }
+  const outside = legacyWorld({ entries: [promptEntry('go'), said(RASK), typed('extra round', OWNER_META, 600_000)] });
+  assert.deepEqual(outside.verify(), [false, 'provenance'], 'ten minutes off');
+});
+
+test('#128 legacy grant: no transcript, two different transcripts, a subagent\'s or an unnamed config dir\'s, or an unsafe session name is refused', () => {
+  assert.deepEqual(legacyWorld({ entries: legacyEntries, places: [] }).verify(), [false, 'provenance'], 'no transcript');
+  assert.deepEqual(legacyWorld({ entries: legacyEntries, places: [['.claude', '-repo'], ['.claude', '-other']] }).verify(), [false, 'provenance'], 'two projects');
+  assert.deepEqual(legacyWorld({ entries: legacyEntries, places: [['.claude', '-repo'], ['.claude-eaglewatch', '-repo']] }).verify(), [false, 'provenance'], 'two config dirs');
+  // a transcript only under subagents/ or in a config dir the environment does not name is no evidence
+  const sub = legacyWorld({ entries: legacyEntries, places: [] });
+  mkdirSync(join(sub.home, '.claude', 'projects', '-repo', LEGACY_SESSION, 'subagents'), { recursive: true });
+  writeFileSync(join(sub.home, '.claude', 'projects', '-repo', LEGACY_SESSION, 'subagents', `${LEGACY_SESSION}.jsonl`), lines(legacyEntries));
+  mkdirSync(join(sub.home, 'claude-config', 'projects', '-repo'), { recursive: true });
+  writeFileSync(join(sub.home, 'claude-config', 'projects', '-repo', `${LEGACY_SESSION}.jsonl`), lines(legacyEntries));
+  assert.equal(ownerGrantGap(sub.q), 'provenance', 'subagent / unnamed config dir');
+  // …but a config dir the environment names is trusted, as for any transcript
+  assert.equal(ownerGrantGap({ ...sub.q, env: { CLAUDE_CONFIG_DIR: join(sub.home, 'claude-config') } }), 'ok');
+  // a session that is not a plain name never reaches the file system, whatever sits where '../x' would point
+  // (the readers cannot hand one over: a record's session must be its file's name; legacyTranscriptOf refuses it on its own)
+  const evil = legacyWorld({ entries: legacyEntries, places: [] });
+  mkdirSync(join(evil.home, '.claude', 'projects', '-repo'), { recursive: true });
+  for (const f of [join(evil.home, '.claude', 'x.jsonl'), join(evil.home, '.claude', 'projects', 'x.jsonl'), join(evil.home, '.claude', 'projects', '-repo', 'x.jsonl')]) writeFileSync(f, lines(legacyEntries));
+  for (const s of ['../x', '../../x', '-repo/../x', 'a/b', '', '.', null, undefined, 7]) assert.equal(legacyTranscriptOf(s, { home: evil.home, env: {} }), null, String(s));
+  assert.equal(legacyTranscriptOf('x', { home: evil.home, env: {} }), join(evil.home, '.claude', 'projects', '-repo', 'x.jsonl'), 'a plain name is found');
+});
+
+test('#128 legacy grant: nothing else gets this: a pre-#128 "merge" with a findable transcript approves nothing', () => {
+  const home = tmp();
+  mkdirSync(ownerGoDir(home), { recursive: true });
+  writeFileSync(join(ownerGoDir(home), 'sess-1.jsonl'), `${JSON.stringify({ v: 1, ts: new Date(AT).toISOString(), session: 'sess-1', prompt_sha256: 'x', cwd: null, prs: [58], requests: [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }], prompt: 'merge' })}\n`);
+  mkdirSync(join(home, '.claude', 'projects', '-repo'), { recursive: true });
+  writeFileSync(join(home, '.claude', 'projects', '-repo', 'sess-1.jsonl'), lines([promptEntry('go'), said(REQUEST), typed('merge', OWNER_META, 1000)]));
+  assert.deepEqual([approvedPr({ repo: REPO, pr: 58, head: HEAD, session: 'sess-1', home, now: nowAt }), approvalGap({ repo: REPO, pr: 58, head: HEAD, items: ITEMS, home, now: nowAt })], [false, 'provenance']);
+});
+
+test('#128 legacy grant: two "extra round" prompts within the window are refused as synthetic (a replay)', () => {
+  const w = legacyWorld({ entries: [promptEntry('go'), said(RASK), typed('extra round', OWNER_META, 2000), said('ok'), typed('extra round', OWNER_META, 9000)] });
+  assert.equal(ownerGrantGap(w.q), 'provenance');
+  assert.deepEqual(w.verify(), [false, 'provenance']);
 });
