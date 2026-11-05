@@ -191,8 +191,10 @@ export function restoreLabel(gh, pr) {
 }
 
 // The real-run recovery: null (nothing to recover) or the refusal to return. `refuse` is the command's own.
-export function recoverOrphanedLift({ gh, pr, refuse }) {
+// `strict` (--owner-go): a PR whose comments or timeline cannot be read refuses; the gated route (strict false) goes on, its run-record guard fails closed by itself.
+export function recoverOrphanedLift({ gh, pr, refuse, strict = true }) {
   const { orphan, unverified } = findOrphanedLift({ gh, pr });
+  if (unverified !== null && !strict) return null;
   if (unverified !== null) return refuse('hold-recovery', [`#${pr}: could not check whether an earlier --owner-go run left a needs-human hold lifted (${unverified}): nothing was merged`]);
   if (orphan === null) return null;
   const failed = restoreLabel(gh, pr);
