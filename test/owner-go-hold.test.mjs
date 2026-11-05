@@ -4,8 +4,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { ownerSays } from './helpers/owner-go.mjs';
-import { approvalGap, areasBlock, areasDigest, holdBlock, holdDigest, LIFT_PHRASE, presentedRequests, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
+import { approvalGap, areasBlock, ownerGoDir, areasDigest, holdBlock, holdDigest, LIFT_PHRASE, presentedRequests, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
@@ -84,7 +86,7 @@ test('parser: a Hold line with a malformed shape (no author, bad time, bad login
 
 test('parser: a Hold line with prose between it and the Head line binds nothing (unlike Areas)', () => {
   nothing(reply(holdLine(), 'The hold is explained here.', head(A, { hold: HOLD.id }), READY));
-  nothing(reply(holdLine(), '', head(A, { hold: HOLD.id }), READY));
+  assert.equal(presentedRequests(reply(holdLine(), '', head(A, { hold: HOLD.id }), READY)).requests.length, 1, 'a blank line is no prose (item 15): the Hold line is still directly above its Head');
   assert.equal(presentedRequests(reply('Areas R1-a', 'prose', head(A), readyLine([7]))).requests.length, 1, 'an Areas line with prose still binds without areas (PR 1)');
 });
 
@@ -132,7 +134,8 @@ test('parser: a hold needs the lift wording on the 🔀 line; the wording needs 
   nothing(reply(holdLine(), head(A, { hold: HOLD.id }), '🔀 Ready to merge #7 and lift the needs-human hold — say "merge"'), 'another wording');
   nothing(reply(holdLine(), head(A, { hold: HOLD.id }), '🔀 Ready to merge #7 and lift their needs-human holds — say "merge"'), 'plural wording for one PR');
   nothing(reply(holdLine(), head(A, { hold: HOLD.id }), '🔀 Ready to merge #7 and lift its needs-human hold'), 'no say "merge"');
-  nothing(reply(holdLine(), head(A, { pr: 7, hold: HOLD.id }), '🔀 Ready to merge #8 and lift its needs-human hold — say "merge"'), 'a prefixed Head line for a PR the line does not name');
+  nothing(reply(holdLine(), head(A, { pr: 7, hold: HOLD.id }), '🔀 Ready to merge #7, #8 and lift their needs-human holds — say "merge"'), 'plural wording, but only #7 has a hold: ALL listed PRs must carry one');
+  nothing(reply(holdLine(), head(A, { pr: 7, hold: HOLD.id }), '🔀 Ready to merge #8 and lift its needs-human hold — say "merge"'), 'a prefixed Head line for a PR the line does not name binds nothing, so the wording has no hold behind it');
   assert.equal(presentedRequests(reply(holdLine(), head(A, { hold: HOLD.id }), '🔀 Ready to merge #7 and lift its needs-human hold - say "merge".')).requests.length, 1, 'a hyphen and a final full stop read');
   assert.equal(presentedRequests(reply(holdLine(), head(A, { hold: HOLD.id }), '🔀 Ready to merge #7 and lift its needs-human hold -- say "merge"')).requests.length, 1);
 });
@@ -149,9 +152,8 @@ test('parser: several PRs with holds and the plural wording', () => {
   const r = presentedRequests(text);
   assert.deepEqual(r.prs, [1, 2]);
   assert.deepEqual(r.requests.map((q) => [q.pr, q.hold, q.holdBlock, q.areas]), [[1, 'LE_one', holdDigest(h1), areasDigest(['R1-a'])], [2, 'LE_two', holdDigest(h2), undefined]]);
-  // one PR with a hold, one without: the plural wording covers it
-  const mixed = presentedRequests(reply(holdLine(h1, 1), head(A, { pr: 1, hold: h1.id }), head(B, { pr: 2 }), readyLine([1, 2], { lift: true })));
-  assert.deepEqual(mixed.requests.map((q) => [q.pr, q.hold]), [[1, 'LE_one'], [2, undefined]]);
+  // one PR with a hold, one without: the plural wording says ALL listed PRs' holds are lifted, so it binds nothing (item 9)
+  nothing(reply(holdLine(h1, 1), head(A, { pr: 1, hold: h1.id }), head(B, { pr: 2 }), readyLine([1, 2], { lift: true })), 'mixed: the wording needs a hold on every listed PR');
   nothing(reply(holdLine(h1, 1), head(A, { pr: 1, hold: h1.id }), head(B, { pr: 2 }), readyLine([1, 2])), 'holds without the wording');
   nothing(reply(holdLine(h1, 1), head(A, { pr: 1, hold: h1.id }), head(B, { pr: 2 }), '🔀 Ready to merge #1, #2 and lift its needs-human hold — say "merge"'), 'singular wording for two PRs');
 });
@@ -168,8 +170,75 @@ test('parser: Areas two lines above Head (over a Hold) must carry the Head\'s PR
   assert.equal(ok.requests[0]?.areas, areasDigest(['R1-a']));
 });
 
-test('parser: a Hold line elsewhere in the reply (earlier prose "Hold ...") fails the whole reply, even without a hold request', () => {
-  nothing(reply('Hold on, a second.', head(A), readyLine([7])));
+test('parser: only a CANONICAL Hold line outside the block fails the reply; prose that starts with the word "Hold" does not (item 8)', () => {
+  const bound = (text, why) => assert.equal(presentedRequests(text).requests.length, 1, why ?? text);
+  bound(reply('Hold on, a second.', head(A), readyLine([7])), 'prose above a plain request');
+  bound(reply('Hold on, a second.', holdLine(), head(A, { hold: HOLD.id }), READY), 'prose above a hold request');
+  bound(reply('Hold the line #7 by tomorrow', head(A), readyLine([7])), 'a Hold sentence that is not the canonical prefix');
+  bound(reply('hold ups happen', head(A), readyLine([7])));
+  // a canonical-prefix line that the block does not consume exactly still voids the reply (any case, with or without a PR prefix)
+  nothing(reply(holdLine(), 'prose between', head(A, { hold: HOLD.id }), READY), 'prose between a Hold line and its Head');
+  nothing(reply(holdBlock(HOLD), 'Some notes.', head(A), readyLine([7])), 'an earlier canonical Hold line, plain request');
+  nothing(reply(`#7 ${holdBlock(HOLD).toLowerCase()}`, 'Some notes.', head(A), readyLine([7])), 'prefixed, lower case');
+  nothing(reply('HOLD LE_x by someone', head(A), readyLine([7])), 'canonical prefix, malformed rest');
+});
+
+test('parser: the Hold-bearing Head lines that bind nothing do not decide the lift wording (item 9)', () => {
+  const holdFor8 = reply(holdLine(HOLD, 8), head(B, { pr: 8, hold: HOLD.id }));
+  nothing(reply(head(A), holdFor8, '🔀 Ready to merge #7 and lift its needs-human hold — say "merge"'), 'lift wording for #7 (no hold) with a #8 hold pair off the 🔀 line');
+  assert.equal(presentedRequests(reply(head(A), holdFor8, readyLine([7]))).requests.length, 1, 'the #8 hold pair is not bound, so it neither forbids nor requires the wording');
+  nothing(reply(holdLine(), head(A, { hold: HOLD.id }), head(A, { hold: HOLD.id }), READY), 'a duplicate');
+  // plural: every listed PR needs a hold
+  const two = reply(holdLine(HOLD, 7), head(A, { pr: 7, hold: HOLD.id }), head(B, { pr: 8 }));
+  nothing(reply(two, '🔀 Ready to merge #7, #8 and lift their needs-human holds — say "merge"'), 'only #7 has a hold');
+});
+
+test('parser: blank lines inside the closing block are transparent; prose still ends it (item 15, EW #1659)', () => {
+  const ok = (text, why) => assert.equal(presentedRequests(text).requests.length, 1, why);
+  const A12 = A.slice(0, 12);
+  ok(reply(head(A), '', readyLine([7])), 'blank between Head and the 🔀 line (the owner-reported miss)');
+  ok(reply(head(A), '', '', '   ', readyLine([7])), 'several blank lines, one with spaces');
+  ok(reply(head(A), '   ', readyLine([7])), 'a NBSP-only line');
+  ok(reply(head(A), '\t', readyLine([7])), 'a tab-only line');
+  ok(`Two items.\r\nHead ${A12} · items ${ITEMS} · repo acme/widgets\r\n\r\n🔀 Ready to merge #7 — say "merge"\r\n\r\n`, 'CRLF with a blank line and trailing blanks');
+  const areas = areasBlock(['R1-a']);
+  assert.equal(presentedRequests(reply(areas, '', head(A), '', readyLine([7]))).requests[0]?.areas, areasDigest(['R1-a']), 'blank between Areas and Head: Areas bound');
+  const withHold = presentedRequests(reply(holdLine(), '', head(A, { hold: HOLD.id }), '', READY)).requests[0];
+  assert.equal(withHold?.hold, HOLD.id, 'blank between Hold and Head: Hold bound');
+  const all = presentedRequests(reply(areas, '', holdLine(), '', head(A, { hold: HOLD.id }), '', READY)).requests[0];
+  assert.deepEqual([all?.areas, all?.hold], [areasDigest(['R1-a']), HOLD.id], 'Areas + Hold + Head, blanks everywhere');
+  // prose is NOT transparent: it ends the block exactly as before
+  assert.equal(presentedRequests(reply(areas, 'prose', head(A), readyLine([7]))).requests[0]?.areas, undefined, 'prose between Areas and Head: bound without areas');
+  assert.deepEqual(presentedRequests(reply(head(A), 'prose', readyLine([7]))).requests, [], 'prose between Head and the 🔀 line: no block');
+  nothing(reply(holdLine(), 'prose', '', head(A, { hold: HOLD.id }), READY), 'prose between Hold and Head, blank too');
+  // every void rule is unchanged across blanks: an Areas line against the 🔀 line, two in a row, another PR's
+  nothing(reply(head(A), '', areas, '', readyLine([7])), 'Areas against the 🔀 line');
+  nothing(reply(areas, '', areas, '', head(A), readyLine([7])), 'two Areas lines in a row');
+  nothing(reply(holdLine(), '', holdLine(), '', head(A, { hold: HOLD.id }), READY), 'two Hold lines in a row');
+  nothing(reply(holdLine(), '', READY), 'a Hold line against the 🔀 line');
+  nothing(reply(`#8 ${areas}`, '', head(A, { pr: 7 }), '', '🔀 Ready to merge #7, #8 — say "merge"'), "another PR's Areas line");
+  // the blank line after the 🔀 line was already ignored; text after it still voids the block
+  assert.deepEqual(presentedRequests(reply(head(A), readyLine([7]), '', 'thanks')).requests, []);
+});
+
+test('parser: line-ending and spacing variants of the Hold and Head lines (item 12)', () => {
+  const A12 = A.slice(0, 12);
+  const headText = head(A, { hold: HOLD.id });
+  const ok = (text, why) => assert.equal(presentedRequests(text).requests.length, 1, why);
+  ok(`${holdLine()}\r\n${headText}\r\n${READY}\r\n`, 'CRLF everywhere');
+  ok(`${holdLine()}   \n${headText}  \n${READY}`, 'trailing spaces on the Hold and Head lines');
+  ok(`${holdLine()} \n${headText} \n${READY}`, 'a trailing NBSP on the Hold and Head lines');
+  ok(` ${holdLine()}\n  ${headText}\n${READY}`, 'leading NBSP / spaces');
+  for (const id of ['LE_a/b', 'LE_a=b', 'LE_a+b', 'LE_a/b=+==']) {
+    const hold = { ...HOLD, id };
+    ok(reply(holdLine(hold), head(A, { hold: id }), READY), `id ${id}`);
+    assert.equal(presentedRequests(reply(holdLine(hold), head(A, { hold: id }), READY)).requests[0]?.hold, id);
+  }
+  // a lone \r inside a line is no line break: it spoils that line
+  nothing(`${holdLine()}\n${headText.replace('·', '\r·')}\n${READY}`, 'a lone \\r inside the Head line');
+  nothing(`${holdLine().replace(' by ', '\r by ')}\n${headText}\n${READY}`, 'a lone \\r inside the Hold line');
+  nothing(`${holdLine()}\r${headText}\n${READY}`, 'a lone \\r between the Hold and Head lines');
+  void A12;
 });
 
 // ----- the record and the match -----
@@ -227,7 +296,35 @@ test('approvalGap: hold: null (the gated route) compares nothing; undefined mean
 });
 
 test('record: a block that binds nothing records no request', (t) => {
-  const record = ownerSays(t, 'merge', reply(holdLine(), head(A, { hold: HOLD.id }), readyLine([7])));
-  assert.deepEqual(record?.requests ?? [], []);
+  const bad = reply(holdLine(), head(A, { hold: HOLD.id }), readyLine([7]));
+  assert.deepEqual(presentedRequests(bad).requests, [], 'the parser binds nothing for it (no lift wording)');
+  const record = ownerSays(t, 'merge', bad);
+  assert.ok(record, 'a "merge" is still recorded (for the audit trail)');
+  assert.deepEqual(record.requests, []);
   assert.equal(approvalGap(q({ hold: HOLD })), 'none');
+  assert.equal(approvalGap(q()), 'none', 'no request, no approval, with or without a live hold');
+  // positive control: the same block with the lift wording approves
+  said(t, one);
+  assert.equal(approvalGap(q({ hold: HOLD })), 'ok');
+});
+
+// Item 10: the hold-id clause and the holdBlock clause of approvalsFor are each load-bearing, not just their product. A record is doctored on disk (the way an old or damaged record could look).
+test('approvalGap: the hold id and the hold block are compared independently (doctored records)', (t) => {
+  const record = said(t, one);
+  const file = join(ownerGoDir(), `${record.session}.jsonl`);
+  const original = readFileSync(file, 'utf8');
+  const rewrite = (patch) => writeFileSync(file, original.trim().split('\n').map((l) => { const r = JSON.parse(l); r.requests = r.requests.map((x) => patch({ ...x })); return JSON.stringify(r); }).join('\n') + '\n');
+  assert.equal(approvalGap(q({ hold: HOLD })), 'ok', 'control');
+  rewrite((x) => ({ ...x, hold: 'LE_lADOother' }));
+  assert.equal(approvalGap(q({ hold: HOLD })), 'none', 'right holdBlock, wrong hold id');
+  rewrite((x) => { delete x.holdBlock; return x; });
+  assert.equal(approvalGap(q({ hold: HOLD })), 'none', 'right hold id, no holdBlock');
+  rewrite((x) => { delete x.hold; return x; });
+  assert.equal(approvalGap(q({ hold: HOLD })), 'none', 'right holdBlock, no hold id');
+  rewrite((x) => ({ ...x, holdBlock: 'f'.repeat(64) }));
+  assert.equal(approvalGap(q({ hold: HOLD })), 'none', 'right hold id, wrong holdBlock');
+  rewrite((x) => ({ ...x, hold: 7, holdBlock: 7 }));
+  assert.equal(approvalGap(q({ hold: HOLD })), 'none', 'non-string fields read as none');
+  rewrite((x) => x);
+  assert.equal(approvalGap(q({ hold: HOLD })), 'ok', 'restored');
 });

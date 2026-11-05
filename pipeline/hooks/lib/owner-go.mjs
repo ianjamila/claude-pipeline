@@ -3,7 +3,8 @@
 // alone was the agent's own word: nothing proved the owner had said it (Codex + Fable design reviews, 2026-10-14). So the
 // owner-go recorder (the UserPromptSubmit hook hooks/owner-go.mjs, which fires for the owner's typed prompts and for harness turns, which #128 screens out) writes
 // down each owner prompt that STARTS with "merge", bound to what the reply right before it asked for:
-//   `Head <sha12> · items <digest> · repo <owner/name>` lines + `🔀 Ready to merge #N — say "merge"` (skills/ship, Owner-merge approval).
+//   `Head <sha12> · items <digest> · repo <owner/name>` lines + `🔀 Ready to merge #N — say "merge"` (skills/ship, Owner-merge approval). The block may also carry an
+//   `Areas …` line (protected areas) and a `Hold … by … at …` line with the lift wording on the 🔀 line (the needs-human hold the "merge" lifts): see presentedRequests.
 // `P merge` then needs a record for exactly that repository, PR, head and owner-item set; the guard needs one (for that repository and
 // PR, in that session) before a direct `gh pr merge` / the repo's merge command in an owner_approval: chat repo. Phase 3b: the repository
 // is part of the request, so a "merge" said for #N of one repository never approves #N of another (a fork, a mirror, a vendored copy
@@ -74,13 +75,14 @@ export function parseApproval(prompt) {
 }
 
 // The merge request a reply ENDS with. The reply's last lines are the request (skills/ship): optional `Head <sha12> · items <digest> · repo <owner/name>`
-// lines (or, for several PRs, `#N head <sha12> · items <digest> · repo <owner/name>`) directly above the 🔀 line, which is the last non-blank line.
+// lines (or, for several PRs, `#N head <sha12> · items <digest> · repo <owner/name>`) directly above the 🔀 line, which is the last non-blank line. Blank (whitespace-only) lines
+// anywhere in the reply are transparent ("directly above" = the next non-blank line above; EW #1659: a blank line before the 🔀 line voided the owner's "merge"); prose is not.
 // Only that terminal block binds: an earlier block in the same reply, a Head line with prose between it and the 🔀 line, or any
 // text after the 🔀 line binds nothing, and a PR bound twice (two heads, or the same line twice) is ambiguous, so it binds nothing.
 // Protected areas (plan 2026-11-05-chat-merge-protected, rev 4 item 2b): a PR whose diff has owner items is shown with one more line DIRECTLY above its
-// Head line, `Areas <area ids, sorted, one space apart>` (areasBlock: the hard-stop rule ids / integrity kinds P merge --dry-run prints), and the record keeps
-// sha256 of that block (areasDigest). In the several-PR form it is `#N areas <ids>` above `#N head …`. Exactly that shape binds: an Areas line that is
-// not directly above its own Head line (two in a row, one against the 🔀 line, another PR's number) makes the whole block bind nothing. An Areas line with
+// Head line (or directly above the Hold line that sits directly above its Head line), `Areas <area ids, sorted, one space apart>` (areasBlock: the hard-stop rule ids / integrity kinds
+// P merge --dry-run prints), and the record keeps sha256 of that block (areasDigest). In the several-PR form it is `#N areas <ids>` above `#N head …`. Exactly that shape binds: an Areas
+// line that is not directly above its own Head line or Hold line (two in a row, one against the 🔀 line, another PR's number) makes the whole block bind nothing. An Areas line with
 // prose between it and the Head line is no part of the block: the request then binds WITHOUT areas, which approves no diff that has any.
 // The needs-human hold (rev 4 items 2a, 5; review note 6): a PR whose hold the owner's "merge" lifts has the Head line carry ONE `· hold <event id>` field between
 // `items …` and `repo …`, and a canonical `Hold <id> by <login> at <ISO>` line (holdBlock) DIRECTLY above that Head line. Block order, top to bottom: Areas (optional),
@@ -99,7 +101,9 @@ const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHAR
 const AREAS_START = /^\s*(?:#\d+\s+)?areas\b/i;
 const AREA_ID = '[A-Za-z0-9_.-]{1,64}';
 const AREAS_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?areas((?:\\s+${AREA_ID})+)\\s*$`, 'i');
-const HOLD_START = /^\s*(?:#\d+\s+)?hold\b/i;
+// "Hold-shaped" is the canonical PREFIX only (`Hold <id> by `, an optional `#N ` before it, any case): prose that merely starts with the word ("Hold on, a second.") is no Hold line.
+const HOLD_START = /^\s*(?:#\d+\s+)?hold\s+\S+\s+by\s+/i;
+// (GitHub logins: letters, digits, hyphens, an optional `[bot]`. A `_` (an EMU login) is rejected on purpose: such a hold has no showable block, so the request fails closed.)
 const HOLD_LOGIN = '[A-Za-z0-9-]{1,39}(?:\\[bot\\])?';
 const HOLD_AT = '\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z';
 const HOLD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?hold\\s+(${HOLD_ID})\\s+by\\s+(${HOLD_LOGIN})\\s+at\\s+(${HOLD_AT})\\s*$`, 'i');
@@ -134,18 +138,20 @@ export const readyLine = (prs, { lift = false } = {}) => `🔀 Ready to merge ${
 const LIFT_LINE = new RegExp(`^(#\\d{1,6}(?:\\s*,\\s*#\\d{1,6})*)\\s+(${LIFT_PHRASE.one}|${LIFT_PHRASE.many})\\s*(?:—|\\s--?\\s)\\s*say\\s+"merge"\\.?\\s*$`);
 const liftsHold = (rest, prs) => {
   const m = LIFT_LINE.exec(rest.trim());
-  return m !== null && [...new Set([...m[1].matchAll(/#(\d{1,6})\b/g)].map((x) => Number(x[1])))].join() === prs.join() && m[2] === (prs.length === 1 ? LIFT_PHRASE.one : LIFT_PHRASE.many);
+  return m !== null && m[2] === (prs.length === 1 ? LIFT_PHRASE.one : LIFT_PHRASE.many); // (the PR numbers in m[1] are the text `prs` was read from)
 };
 export function presentedRequests(text) {
   const none = (prs) => ({ prs, requests: [] });
-  const lines = String(text ?? '').split(/\r?\n/);
-  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  // A whitespace-only line carries no content, so it is transparent: "directly above" means the next NON-BLANK line above (owner-reported miss, EW #1659: a blank line between the
+  // Head line and the 🔀 line made the owner's "merge" record nothing). Prose still ends the block, and every rule below is unchanged.
+  const lines = String(text ?? '').split(/\r?\n/).filter((l) => l.trim() !== '');
   const r = READY_LINE.exec(lines[lines.length - 1] ?? '');
   if (!r) return { prs: [], requests: [] };
   const prs = [...new Set([...r[1].split(/—|\s--?\s|\bsay\b/)[0].matchAll(/#(\d{1,6})\b/g)].map((x) => Number(x[1])))];
   const block = [];
   let i = lines.length - 2;
   for (; i >= 0; i--) {
+    if (lines[i].includes('\r')) break; // a lone \r (CRLF was split off above) redraws the line on a terminal: what the owner sees is not what the parser would read, so it is prose
     const h = HEAD_LINE.exec(lines[i]);
     const a = h ? null : AREAS_LINE.exec(lines[i]);
     const o = h || a ? null : HOLD_LINE.exec(lines[i]);
@@ -153,9 +159,8 @@ export function presentedRequests(text) {
     block.unshift({ h, a, o });
   }
   if (i >= 0 && AREAS_START.test(lines[i])) return none(prs); // an Areas line of any other shape against the block: malformed
-  if (lines.slice(0, i + 1).some((l) => HOLD_START.test(l))) return none(prs); // a Hold-shaped line outside the block (malformed, prose between it and its Head, an earlier block's): review note 6
+  if (lines.slice(0, i + 1).some((l) => HOLD_START.test(l))) return none(prs); // a canonical-prefix Hold line outside the block (prose between it and its Head, an earlier block's): review note 6
   const bound = new Map();
-  let anyHold = false;
   for (let j = 0; j < block.length; j++) {
     const { h } = block[j];
     if (!h) continue;
@@ -168,7 +173,6 @@ export function presentedRequests(text) {
       const rebuilt = { id: o[2], login: o[3], at: o[4] };
       if (holdBlock(rebuilt) === '') return none(prs); // (the regex reads T / Z in any case; the block is canonical only in upper case)
       hasHold = rebuilt;
-      anyHold = true;
     }
     const above = o ? block[j - 2]?.a ?? null : block[j - 1]?.a ?? null;
     if (above && (above[1] ?? null) !== (h[1] ?? null)) return none(prs); // another PR's Areas line
@@ -180,8 +184,11 @@ export function presentedRequests(text) {
   // An Areas line that no Head line below it takes (a second one in a row, one against the 🔀 line) is a malformed block; so is a Hold line no Head line right below takes.
   const takesHead = (j) => block[j + 1]?.h || (block[j + 1]?.o && block[j + 2]?.h);
   if (block.some((b, j) => (b.a && !takesHead(j)) || (b.o && !block[j + 1]?.h))) return none(prs);
-  if (liftsHold(r[1], prs) !== anyHold) return none(prs); // rev 4 item 2a: a hold binds only under the lift wording, and the wording only with a hold
-  return { prs, requests: [...bound.values()].filter(Boolean) };
+  // rev 4 item 2a: a hold binds only under the lift wording, and the wording only when EVERY request bound carries a hold (singular: the one PR; plural: all listed). A Hold-bearing
+  // Head line that binds nothing itself (a PR not on the 🔀 line, an unprefixed Head in the several-PR form, a duplicate) neither makes the wording legitimate nor forbids it.
+  const requests = [...bound.values()].filter(Boolean);
+  if (liftsHold(r[1], prs) ? !prs.every((p) => bound.get(p)?.hold) : requests.some((x) => x.hold)) return none(prs);
+  return { prs, requests };
 }
 
 // Phase 3b: an owner ruling in chat (`P triage owner-ruling`) was the agent's word too: --owner-quote could be any text. A reply that
