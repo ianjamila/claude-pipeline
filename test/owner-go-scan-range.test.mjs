@@ -38,8 +38,12 @@ const script = (s, o = {}) => ghEntries({ prHead: s.head, baseOid: s.baseTip, pr
 test('--owner-go: a local origin/main moved onto the PR head does not empty the scan (items come from baseRefOid)', (t) => {
   const s = protectedScenario();
   s.repo.git(['update-ref', 'refs/remotes/origin/main', s.head]); // the diff against it is empty
+  // a record for `items none` (what an emptied scan would have produced) cannot cover it: the refusal names the LIVE digest, found from baseRefOid
   withRecord(t, s);
-  refusedWith(goMerge(s), /owner-items: 1 owner item/, s);
+  const r = goMerge(s);
+  refusedWith(r, /items [0-9a-f]{12}/, s);
+  assert.doesNotMatch(JSON.stringify(r.json), /items none/);
+  assert.equal(r.json.error, 'owner-go');
 });
 
 test('--owner-go: GitHub\'s base commit not present locally refuses and says to fetch the base branch', (t) => {
@@ -47,7 +51,7 @@ test('--owner-go: GitHub\'s base commit not present locally refuses and says to 
   withRecord(t, s);
   const r = goMerge(s);
   refusedWith(r, /git fetch origin main/, s);
-  assert.doesNotMatch(JSON.stringify(r.json), /owner-items/, 'it never fell back to a local ref and scanned');
+  assert.doesNotMatch(JSON.stringify(r.json), /\d+ owner item/, 'it never fell back to a local ref and scanned');
 });
 
 test('--owner-go: GitHub naming no usable base commit refuses (fail closed)', (t) => {
@@ -203,8 +207,9 @@ test('evaluateOwnerGo returns ownerItems, the item lines and areas from ONE list
   assert.equal(live.ownerItems, ownerItemsDigest(live.ownerItemLines));
   assert.notEqual(live.ownerItems, 'none');
   assert.deepEqual(live.areas, [live.ownerItemLines[0].split(' ')[1]]);
-  // the owner-items check is unchanged: a diff with an owner item still fails it
-  assert.equal(live.checks.find((c) => c.name === 'owner-items').ok, false);
+  // chat mode: an owner item no longer fails the owner-items check (the owner's record is bound to its digest instead)
+  assert.equal(live.checks.find((c) => c.name === 'owner-items').ok, true);
+  assert.equal(live.ok, true, JSON.stringify(live.checks.filter((c) => !c.ok)));
 });
 
 test('evaluateOwnerGo on a diff without items: ownerItems is "none", no lines, no areas', async () => {

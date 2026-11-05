@@ -710,9 +710,11 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
 // guard statuses and the Cross-model review status only with their provenance). The owner's recorded "merge" is checked by the
 // caller. Nothing here vouches for a verify step: no proofs are produced (a deferred step's CI proof is a gate matter), and
 // nothing is written, so a later plain `P merge` still needs its own final gate. Returns { ok, head, checks, failed }.
-// The owner's record says `items none`, but the agent wrote that line: the diff itself must have no owner item either (Fable
-// attacker pass): no blocking hard-stop, no test-integrity violation, and no hard-stop or integrity item the owner merges in chat.
-// A PR that has any of those takes the gated route, where the owner's "merge" is bound to the gate's ownerItems digest.
+// The agent writes the request lines, so the owner's record is checked against what THIS scan finds (Fable attacker pass): the
+// `owner-items` check fails for a blocking hard-stop, a test-integrity violation, or any owner item in `owner_approval: label` mode (the
+// label route has no chat "merge" for them). In chat mode an owner item (a hard-stop or integrity item the owner merges in chat) does NOT
+// fail it: it is returned as `ownerItems` / `areas`, and `P merge --owner-go` requires the owner's record for exactly that digest and
+// the Areas block shown for those areas (hooks/lib/owner-go.mjs approvalGap). A record for `items none` never covers a diff with items.
 export const OWNER_GO_CHECKS = Object.freeze(['pr-open', 'labels', 'ci', 'scan-range', 'hardstops', 'integrity', 'owner-items']);
 
 const NAMED_SHOWN = 3;
@@ -774,6 +776,15 @@ function scanRangeCheck({ root, gh, pr, diff, info, explicit }) {
 // The owner-item lines are "<kind> <rule or type> <file>": the area of a line is its second word (hard-stop rule id, integrity kind).
 const areasOf = (lines) => [...new Set(lines.map((l) => String(l).split(' ')[1]).filter((a) => typeof a === 'string' && a !== ''))].sort();
 
+function ownerItemsCheck({ items, hardstops, integrity, label }) {
+  const shown = `${items.length} owner item(s) (${items.slice(0, 3).join('; ')}${items.length > 3 ? '; ...' : ''})`;
+  if (!hardstops.ok || !integrity.ok) {
+    return check('owner-items', false, `${[!hardstops.ok && 'hardstops', !integrity.ok && 'integrity'].filter(Boolean).join(' and ')} did not pass: no chat "merge" covers a blocking hard-stop or a test-integrity violation${items.length > 0 ? `; also ${shown}` : ''}`);
+  }
+  if (label && items.length > 0) return check('owner-items', false, `${shown} under owner_approval: label: the owner merges it by hand`);
+  return check('owner-items', true, items.length === 0 ? 'none' : `${shown}: the owner's "merge" must be bound to them (items ${ownerItemsDigest(items)})`);
+}
+
 export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep }) {
   const head = headSha({ cwd: root });
   const info = await readPrSettled({ gh, pr, fields: [...OWNER_GO_FIELDS], sleep, pauseMs: mergeablePause(env) });
@@ -791,9 +802,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     await safely('scan-range', () => scanRangeCheck({ root, gh, pr, diff, info, explicit })),
     hardstops,
     integrity,
-    check('owner-items', items.length === 0, items.length === 0
-      ? 'none'
-      : `${items.length} owner item(s) (${items.slice(0, 3).join('; ')}${items.length > 3 ? '; ...' : ''}): --owner-go only merges a diff without any; run the final gate and merge with --owner-approved-head / --owner-approved-items`),
+    ownerItemsCheck({ items, hardstops, integrity, label: config.owner_approval === 'label' }),
   ];
   return {
     ok: checks.every((c) => c.ok),

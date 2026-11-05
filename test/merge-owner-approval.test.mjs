@@ -379,16 +379,17 @@ test('--owner-go with production configured: merges, records no prod-before and 
   assert.equal(s.fake.lines().some((l) => /prod-before/.test(l)), false);
 });
 
-// Fable attacker pass: the agent writes `items none` itself, so a diff with an owner item (or a blocking hard-stop) never takes
-// the owner-go route, whatever the owner's record says: it needs the gated route bound to the gate's ownerItems digest.
-test('--owner-go refuses a diff with a hard-stop: owner-merge item (chat) or blocking hit (label mode)', (t) => {
-  for (const yml of [chatYml(), hardStopYml()]) {
+// Fable attacker pass: the agent writes the request lines itself, so the owner's record is checked against the live scan. A record for
+// `items none` never covers a diff with an owner item (chat mode: refused as owner-go, naming the live line; test/owner-go-protected.test.mjs
+// has the matching-record cases), and a blocking hit (label mode) is refused whatever the record says.
+test('--owner-go refuses a diff with a hard-stop: a record for items none (chat), a blocking hit (label mode)', (t) => {
+  for (const [yml, error, reasons] of [[chatYml(), 'owner-go', /items [0-9a-f]{12}/], [hardStopYml(), 'live-check', /hardstops|owner-items/]]) {
     const s = scenario({ yml: yml.replace('{pr} {sha}', '{pr} --match-head-commit {sha}'), report: null, state: null });
     ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'));
     const r = goMerge(s);
     assertExit(r, 1);
-    assert.equal(r.json.error, 'live-check');
-    assert.match(r.json.reasons.join('\n'), /hardstops|owner-items: 1 owner item/);
+    assert.equal(r.json.error, error);
+    assert.match(JSON.stringify(r.json), reasons);
     assert.deepEqual(s.mergeCalls(), []);
   }
 });
