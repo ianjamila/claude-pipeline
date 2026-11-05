@@ -558,7 +558,7 @@ test('an @/absolute or @~/home import is refused whatever it points at, naming t
     ['@/etc/hosts\n', '/etc/hosts'],
     ['@~/x.md\n', '~/x.md'],
     ['and @~\n', '~'],
-    [(dir) => `@~/${dir.split('/').at(-1)}/docs/ledger.md\n`, null],
+    [(dir) => `@~/${dir.split(/[\\/]/).at(-1)}/docs/ledger.md\n`, null],
   ]) {
     const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': body })), LEAVES);
     assert.ok(r.reason.includes('CLAUDE.md imports '), r.reason);
@@ -566,6 +566,28 @@ test('an @/absolute or @~/home import is refused whatever it points at, naming t
   }
   // from an imported file too
   refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'docs/guide.md': '@/etc/hosts\n' })), /docs\/guide\.md imports \/etc\/hosts, which leaves/);
+});
+
+// Windows forms are judged the same on every platform: the reviewed tree is the same, and over-matching is the safe direction.
+test('a Windows absolute, drive, UNC or home token, or a backslash climb, is refused; a backslash path is the listed document', (t) => {
+  for (const token of ['C:\\repo\\docs\\ledger.md', 'c:/x.md', 'C:x.md', '\\\\server\\share\\x.md', '\\x.md', '~\\x.md', '..\\other\\x.md']) {
+    const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': `see @${token}\n` })), LEAVES);
+    assert.ok(r.reason.includes(`imports ${token},`), r.reason);
+  }
+  // a backslash is a separator: this is the listed document
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs\\ledger.md\n' })), /imports docs\/ledger\.md, a listed document/);
+  // not a drive, not a home, not a climb: still just a relative path that does not exist
+  for (const token of ['foo@example.com', '@supabase/ssr', '@note:later', '@ab:c']) {
+    const r = exemptWith(importWorld(t, { 'CLAUDE.md': `see ${token}\n` }));
+    assert.equal(r.exempt, true, `${token}: ${r.reason}`);
+  }
+  // a symlink whose target is absolute in either style
+  for (const target of ['C:\\x.md', '\\x.md', '~\\x.md'.replace('~', 'C:')]) {
+    const w = world(t, { baseFiles: { 'CLAUDE.md': '@out.md\n' }, baseLinks: { 'out.md': target } });
+    w.append(LEDGER, row(2));
+    w.repo.commit('ledger row');
+    refused(exemptWith(w), /absolute path/);
+  }
 });
 
 test('@/ and @~ tokens only count where an import can start: an e-mail or a package name is not a refusal', (t) => {
