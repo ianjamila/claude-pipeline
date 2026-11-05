@@ -20,6 +20,12 @@ const RENAME_WAIT_MS = 50;
 const STRAY_TMP = /^state\.json\..+\.tmp$/;
 const STRAY_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 
+// The newest state format this code understands. A state with a higher `version` was written by a newer pipeline (a Claude ruling or a
+// second review: those, and only those, write version 2; every other state stays 1): loadState refuses it and decodeFromComment reads it
+// as no state, so an older reader never rules from a state it cannot fully see.
+export const SUPPORTED_STATE_VERSION = 2;
+const newerThanSupported = (state) => Number.isFinite(state.version) && state.version > SUPPORTED_STATE_VERSION;
+
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
@@ -77,6 +83,9 @@ export function loadState(dir, { cleanup = true } = {}) {
     throw new Error(`corrupt review state at ${file}: ${err.message}`);
   }
   if (!isPlainObject(parsed)) throw new Error(`corrupt review state at ${file}: expected a JSON object`);
+  if (newerThanSupported(parsed)) {
+    throw new Error(`corrupt review state at ${file}: it is format version ${parsed.version}, this pipeline supports up to ${SUPPORTED_STATE_VERSION} (a newer pipeline wrote it): update the pipeline`);
+  }
   return parsed;
 }
 
@@ -132,7 +141,7 @@ export function decodeFromComment(body) {
     const state = JSON.parse(raw.toString('utf8'));
     // Anything that is not recognisably a review state (an array of rounds, a real PR number) is
     // treated as garbage, so a hand-edited comment cannot feed resume a half-made state.
-    return isPlainObject(state) && Array.isArray(state.rounds) && Number.isInteger(state.pr) && state.pr > 0 ? state : null;
+    return isPlainObject(state) && Array.isArray(state.rounds) && Number.isInteger(state.pr) && state.pr > 0 && !newerThanSupported(state) ? state : null;
   } catch {
     return null;
   }

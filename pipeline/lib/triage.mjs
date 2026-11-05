@@ -126,8 +126,8 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
   return findings.map((f, i) => {
     const defersBlockingSecurity = f.bucket === 'BLOCKING' && SECURITY_CATEGORIES.includes(f.category) && f.ruling === 'FOLLOW-UP';
     let final = { decision: f.ruling, by: 'arbiter', needsHuman: false, reason: f.reasoning };
-    if (f.confidence === 'low') final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence' };
-    else if (defersBlockingSecurity) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'would defer a blocking security/data finding' };
+    if (f.confidence === 'low') final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence' };
+    else if (defersBlockingSecurity) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'would defer a blocking security/data finding', cause: 'security-dismissal' };
     const item = {
       id: `R${round}-F${i + 1}`,
       round,
@@ -157,7 +157,7 @@ export const fablePendingRounds = (state) => (state?.rounds ?? [])
 
 // ---- judge, tests ---------------------------------------------------------------------------
 
-const invalidJudgeFinal = () => ({ decision: null, by: 'judge', needsHuman: true, reason: 'invalid judge output' });
+const invalidJudgeFinal = () => ({ decision: null, by: 'judge', needsHuman: true, reason: 'invalid judge output', cause: 'invalid-judge' });
 
 // `triage` may be the judge's whole output ({items}) or just its array.
 export function applyJudge(items, triage) {
@@ -198,7 +198,7 @@ export function applyTestResult(item, status, evidence = '', proof = null) {
   if (status === 'bug-confirmed') {
     next.final = { decision: 'ACCEPT', by: 'test', needsHuman: false, reason: `test confirmed: ${evidence}` };
   } else if (SECURITY_CATEGORIES.includes(item.category)) {
-    next.final = { decision: 'REJECT', by: 'test', needsHuman: true, reason: `test disproved, but it would dismiss a security/data item: ${evidence}` };
+    next.final = { decision: 'REJECT', by: 'test', needsHuman: true, reason: `test disproved, but it would dismiss a security/data item: ${evidence}`, cause: 'test-security' };
   } else {
     next.final = { decision: 'REJECT', by: 'test', needsHuman: false, reason: `test disproved: ${evidence}` };
   }
@@ -247,7 +247,9 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
     const next = structuredClone(item);
     const r = byId.get(item.id);
     if (!r) return next;
-    if (next.final?.by === 'test' || isOwnerRuled(next)) return next; // a test is evidence and the owner's word is final (also its cached copy, by 'cache'); no opinion overrides either
+    // a test is evidence, the owner's word is final (also its cached copy, by 'cache'), and a Claude or forced final (also its cached copy) is
+    // protected (E10): no opinion overrides any of them
+    if (next.final?.by === 'test' || isOwnerRuled(next) || isProtectedFinal(next)) return next;
     next.arbiter = { ruling: r.ruling, confidence: r.confidence, reasoning: r.reasoning, transcript: transcript ?? null };
     const rulingValid = DECISIONS.includes(r.ruling) && CONFIDENCES.includes(r.confidence);
     const dismissesBlockingSecurity =
@@ -262,6 +264,7 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
         by: 'arbiter',
         needsHuman: true,
         reason: 'model-proof failed: ruling not provably from Fable',
+        cause: 'model-proof',
       };
     } else if (!rulingValid) {
       // Output a validator would have refused (wrong case, missing, wrong type): never act on it.
@@ -270,16 +273,141 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
         by: 'arbiter',
         needsHuman: true,
         reason: 'invalid arbiter output',
+        cause: 'invalid-arbiter',
       };
     } else if (r.confidence === 'low') {
-      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence' };
+      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence' };
     } else if (dismissesBlockingSecurity) {
-      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'would dismiss a blocking security/data item' };
+      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'would dismiss a blocking security/data item', cause: 'security-dismissal' };
     } else {
       next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning };
     }
     return next;
   });
+}
+
+// ---- Claude's own rulings (plan 2026-11-05-claude-rulings.md section 10 and E1-E11) ----------------------------------------------
+
+// Why an item waits for a human: `final.cause` (set where the final is made). The first three are malfunctions (a judge or arbiter answer that
+// could not be used): Claude may not dismiss through them, only ACCEPT, or have the arbiter run again. The others are judgements a human may make.
+export const MALFUNCTION_CAUSES = ['model-proof', 'invalid-arbiter', 'invalid-judge'];
+const NEEDS_HUMAN_CAUSES = [...MALFUNCTION_CAUSES, 'low-confidence', 'security-dismissal', 'test-security'];
+// The reason strings of states written before `cause` existed.
+const LEGACY_CAUSES = [
+  [/^model-proof failed/, 'model-proof'],
+  [/^invalid arbiter output$/, 'invalid-arbiter'],
+  [/^invalid judge output$/, 'invalid-judge'],
+  [/^arbiter low confidence$/, 'low-confidence'],
+  [/^would (dismiss a blocking security\/data item|defer a blocking security\/data finding)$/, 'security-dismissal'],
+  [/^test disproved, but it would dismiss a security\/data item/, 'test-security'],
+];
+
+// A Claude ruling (or a cached copy of one, which keeps `final.claude`) and a final a second review forced (`forcedBy`): no later writer
+// (settle, arbiter apply, the cache) may replace these; only Claude tightening to ACCEPT or the owner's typed ruling can.
+export const isClaudeRuled = (item) => item?.final?.by === 'claude' || isObject(item?.final?.claude);
+export const isProtectedFinal = (item) => isClaudeRuled(item) || typeof item?.final?.forcedBy === 'string';
+
+// The cause of the item's needs-human final, kept in `final.claude.cause` once Claude has ruled; for an older state the reason string says;
+// anything else is 'unknown', which is treated as critical.
+export function needsHumanCause(item) {
+  const final = item?.final;
+  const kept = final?.claude?.cause;
+  if (NEEDS_HUMAN_CAUSES.includes(kept)) return kept;
+  if (NEEDS_HUMAN_CAUSES.includes(final?.cause)) return final.cause;
+  if (isProtectedFinal(item)) return 'unknown';
+  const reason = typeof final?.reason === 'string' ? final.reason : '';
+  return LEGACY_CAUSES.find(([re]) => re.test(reason))?.[1] ?? 'unknown';
+}
+
+// Dismissing (REJECT or FOLLOW-UP) is critical, and needs a second review that also dismisses it, unless it is a FOLLOW-UP of a non-BLOCKING,
+// non-security item with a known cause. ACCEPT is never a dismissal.
+export function isCriticalDismissal(item, decision) {
+  if (decision === 'ACCEPT') return false;
+  return decision === 'REJECT' || item.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(item.category) || needsHumanCause(item) === 'unknown';
+}
+
+const STRICTNESS = { ACCEPT: 3, 'FOLLOW-UP': 2, REJECT: 1 };
+const strictest = (a, b) => (STRICTNESS[a] >= STRICTNESS[b] ? a : b);
+const claudeFinalIsAccept = (item) => isProtectedFinal(item) && item.final.decision === 'ACCEPT';
+const claudeDismissal = (item) => isClaudeRuled(item) && item.final.decision !== 'ACCEPT' && item.final.needsHuman !== true;
+const RERUN = 're-run the judge/arbiter (\`arbiter needed\`) so it answers again, or rule ACCEPT';
+
+// Why a second review (Codex) may not be run for this item, or null. Not for what is settled, built, already reviewed, or a malfunction.
+export function secondReviewRefusal(item) {
+  if (!isObject(item)) return 'no item given';
+  if (item.implemented === true) return `${item.id} is already implemented`;
+  if (item.secondReview !== undefined) return `${item.id} already has a second review`;
+  if (item.final?.needsHuman !== true && !claudeDismissal(item)) {
+    return `${item.id} is not waiting for a human decision and is not a Claude dismissal (settled finals are not reopened)`;
+  }
+  if (MALFUNCTION_CAUSES.includes(needsHumanCause(item))) return `${item.id} waits because of a ${needsHumanCause(item)} malfunction: ${RERUN}`;
+  return null;
+}
+
+// Why Claude may not record this ruling alone, or null. `secondReview` overrides item.secondReview (the Codex verdict stored in the item).
+export function claudeRulingRefusal(item, decision, { secondReview } = {}) {
+  if (!isObject(item)) return 'no item given';
+  const id = item.id;
+  if (!DECISIONS.includes(decision)) return `decision must be one of ${DECISIONS.join('|')}`;
+  if (item.implemented === true) return `${id} is already implemented`;
+  if (claudeFinalIsAccept(item)) {
+    return decision === 'ACCEPT'
+      ? `${id} is already ACCEPT`
+      : `${id} is ACCEPT by Claude or a second review: Claude cannot loosen it; only the owner's typed ruling can`;
+  }
+  if (item.final?.needsHuman !== true && !claudeDismissal(item)) {
+    return `${id} is not waiting for a human decision and is not a Claude dismissal (settled finals are not reopened)`;
+  }
+  if (decision === 'ACCEPT') return null;
+  const cause = needsHumanCause(item);
+  if (MALFUNCTION_CAUSES.includes(cause)) return `${id} waits because of a ${cause} malfunction, which Claude cannot dismiss: ${RERUN}`;
+  const verdict = secondReview ?? item.secondReview;
+  if (verdict?.decision === 'ACCEPT') return `${id}: the second review says ACCEPT, so it cannot be dismissed`;
+  if (!isCriticalDismissal(item, decision)) return null;
+  if (!isObject(verdict)) {
+    return `${id}: this dismissal (REJECT, BLOCKING, security, or an unknown cause) needs a second review that also dismisses it at high confidence: run the second review first`;
+  }
+  if (!DECISIONS.includes(verdict.decision)) return `${id}: the second review verdict is unreadable (decision ${JSON.stringify(verdict.decision)})`;
+  if (verdict.confidence !== 'high') return `${id}: the second review dismissed it only at ${JSON.stringify(verdict.confidence)} confidence, high is needed`;
+  return null;
+}
+
+// The ruling itself: the stricter of Claude's and the second review's decision (ACCEPT > FOLLOW-UP > REJECT). Throws on anything refused.
+export function applyClaudeRuling(item, { decision, reason, ruledAt }) {
+  const refusal = claudeRulingRefusal(item, decision);
+  if (refusal) throw new Error(refusal);
+  const next = structuredClone(item);
+  const codex = DECISIONS.includes(item.secondReview?.decision) ? item.secondReview.decision : null;
+  next.final = {
+    decision: codex === null ? decision : strictest(decision, codex),
+    by: 'claude',
+    needsHuman: false,
+    reason,
+    claude: { ruledAt, cause: needsHumanCause(item), critical: isCriticalDismissal(item, decision), overruled: structuredClone(item.final) },
+  };
+  return next;
+}
+
+// Stores the second review's verdict ({decision, confidence, reasoning, model, effort, inputDigest, ranAt}). A Codex ACCEPT forces the final ACCEPT at
+// once (it only ever asks for more work); a dismissal leaves the final as it was: the item still waits for Claude's ruling or a human.
+export function settleSecondReview(item, verdict) {
+  const refusal = secondReviewRefusal(item);
+  if (refusal) throw new Error(refusal);
+  if (!isObject(verdict) || !DECISIONS.includes(verdict.decision)) throw new Error(`second review decision must be one of ${DECISIONS.join('|')}`);
+  if (!CONFIDENCES.includes(verdict.confidence)) throw new Error(`second review confidence must be one of ${CONFIDENCES.join('|')}`);
+  const next = structuredClone(item);
+  next.secondReview = structuredClone(verdict);
+  if (verdict.decision === 'ACCEPT') {
+    next.final = {
+      decision: 'ACCEPT',
+      by: 'claude',
+      forcedBy: 'second-review',
+      needsHuman: false,
+      reason: verdict.reasoning,
+      claude: { ruledAt: verdict.ranAt, cause: needsHumanCause(item), critical: false, overruled: structuredClone(item.final) },
+    };
+  }
+  return next;
 }
 
 // ---- owner ruling (owner_approval: chat) ---------------------------------------------------
@@ -290,7 +418,11 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
 // `implemented` false, so the exit rules still ask for the fix and a review round that covers it.
 export function applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt }) {
   if (!DECISIONS.includes(decision)) throw new Error(`decision must be one of ${DECISIONS.join('|')}`);
-  if (item.final?.needsHuman !== true) throw new Error(`${item.id} needs no human decision`);
+  // The owner may rule on an item waiting for a human, and (E6) on a Claude or forced final that is not implemented yet: the typed
+  // override is the one path that may loosen what Claude settled.
+  if (item.final?.needsHuman !== true && !(isProtectedFinal(item) && item.implemented !== true)) {
+    throw new Error(isProtectedFinal(item) ? `${item.id} is already implemented; an owner ruling cannot reopen it` : `${item.id} needs no human decision`);
+  }
   const next = structuredClone(item);
   next.final = { decision, by: 'owner', needsHuman: false, reason, ownerQuote, ruledAt, overruled: structuredClone(item.final) };
   return next;
@@ -351,6 +483,9 @@ export function ruledCacheFrom(items) {
   for (const item of items) {
     // A light-lane rejection is a default ("not triaged"), not a ruling: nobody looked at it.
     if (item.fingerprint && item.final && !item.final.needsHuman && item.final.by !== 'light-lane') {
+      // A Claude or forced dismissal of a BLOCKING or security item (or one that was critical when ruled) is looked at again, never reused (E10).
+      if (isProtectedFinal(item) && item.final.decision !== 'ACCEPT'
+        && (item.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(item.category) || item.final.claude?.critical === true)) continue;
       const prev = Object.hasOwn(cache, item.fingerprint) ? cache[item.fingerprint] : null;
       const issue = item.followupIssue || prev?.followupIssue || null;
       // Newest wins: a later copy that is not marked fixed clears the flag.
