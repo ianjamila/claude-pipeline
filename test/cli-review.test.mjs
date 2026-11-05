@@ -1173,6 +1173,50 @@ test('state mark-implemented: files that came in from merging the base branch do
   assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']), 0);
 });
 
+// cp #151: git's paths are decoded as UTF-8, so two different non-UTF-8 file names would collapse to the same U+FFFD string and
+// ownAuthored could count a merge-only file as ordinarily authored. A path that does not round-trip is refused (base-unresolved).
+const BAD_NAME = Buffer.from([0x73, 0x72, 0x63, 0x2f, 0x80, 0x2e, 0x6a, 0x73]); // 'src/' + a lone 0x80 byte + '.js'
+const fixSrcA = (w) => w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+const refusedUnresolved = (w) => {
+  const before = w.stateText();
+  const refused = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1']);
+  assertExit(refused, 2, refused.stderr + refused.stdout);
+  assert.equal(refused.json.error, 'base-unresolved');
+  assert.equal(w.stateText(), before, 'nothing was marked');
+};
+
+test('state mark-implemented (#151): a changed path that is not valid UTF-8 refuses the mark (base-unresolved), whatever else was fixed', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  fixSrcA(w);
+  // Straight into the index, so no filesystem has to be able to hold the name (APFS and others reject invalid UTF-8).
+  const gitRaw = (args, input) => {
+    const env = { ...process.env };
+    for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) delete env[k];
+    const r = spawnSync('git', args, { cwd: w.repo.dir, env, input });
+    assert.equal(r.status, 0, String(r.stderr));
+    return r.stdout.toString('utf8').trim();
+  };
+  const blob = gitRaw(['hash-object', '-w', '--stdin'], 'export const odd = 1;\n');
+  gitRaw(['update-index', '-z', '--index-info'], Buffer.concat([Buffer.from(`100644 ${blob}\t`), BAD_NAME, Buffer.from([0])]));
+  w.repo.git(['add', 'src/a.js']);
+  w.repo.git(['commit', '-q', '-m', 'fix, plus a file whose name is not UTF-8']);
+  refusedUnresolved(w);
+});
+
+test('state mark-implemented (#151): the same through a real file on disk (skipped where the filesystem refuses the name)', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.judge(1, { 'R1-B1': ['ACCEPT'] }), 0);
+  fixSrcA(w);
+  try {
+    writeFileSync(Buffer.concat([Buffer.from(`${w.repo.dir}/`), BAD_NAME.subarray(0)]), 'export const odd = 1;\n');
+  } catch (err) { t.skip(`this filesystem cannot create a non-UTF-8 file name (${err.code})`); return; }
+  w.repo.commit('fix, plus a file whose name is not UTF-8');
+  refusedUnresolved(w);
+});
+
 test('state mark-implemented: a signed fix commit still counts when the user\'s git config has log.showSignature=true', (t) => {
   const w = worldIgnoringReview(t);
   const key = join(w.scratch, 'sign-key');
@@ -3204,7 +3248,7 @@ test('triage owner-ruling: an answer whose prompt is synthetic or missing from t
 });
 
 // R2-F3: the same for a ruling answer whose transcript is in a config dir the process does not know.
-test('triage owner-ruling: an answer whose transcript is in a config dir this process does not know names CLAUDE_CONFIG_DIR in the refusal (R2-F3); a missing one does not', (t) => {
+test('triage owner-ruling: an answer whose transcript is outside a .claude* folder under the home says so in the refusal (R2-F3); a missing one does not', (t) => {
   const refusal = (after) => {
     const w = ownerWorld(t, { yml: CHAT_YML });
     assertExit(w.codex(1, findingsOf([finding()])), 0);
@@ -3219,7 +3263,8 @@ test('triage owner-ruling: an answer whose transcript is in a config dir this pr
   assert.match(missing, /cannot be confirmed as typed by the owner/);
   assert.doesNotMatch(missing, /CLAUDE_CONFIG_DIR/);
   const elsewhere = refusal('elsewhere');
-  assert.match(elsewhere, /cannot be confirmed as typed by the owner[\s\S]*CLAUDE_CONFIG_DIR is not set here[\s\S]*run this command with CLAUDE_CONFIG_DIR set to the owner's config dir/);
+  assert.match(elsewhere, /cannot be confirmed as typed by the owner[\s\S]*\.claude\* folder directly under the (?:account's )?home/);
+  assert.doesNotMatch(elsewhere, /run this command with CLAUDE_CONFIG_DIR/);
 });
 
 test('triage owner-ruling: one world\'s recorded answer never satisfies another world (#122: a repository name per test)', (t) => {

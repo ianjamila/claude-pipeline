@@ -162,7 +162,7 @@ export const run = guarded(async (argv, ctx) => {
   };
   const admit = (st, flags) => (st ? roundAdmission(st, round, { ...flags, head, grants: ownerRecords }) : { admission: reviewedAdmission(flags), problem: null });
   const reviewedAdmission = ({ baseOnly, resolutionOnly }) => (baseOnly || resolutionOnly ? 'uncounted' : 'normal');
-  // #128: an extra round recorded for this PR whose prompt cannot be confirmed as the owner's grants nothing; the refusal says so (and, R2-F3, names CLAUDE_CONFIG_DIR when that may be the reason).
+  // #128: an extra round recorded for this PR whose prompt cannot be confirmed as the owner's grants nothing; the refusal says so (and, R2-F3, says the config dir must be a .claude* folder under the home when that may be the reason).
   const unconfirmedGrant = (st) => {
     try {
       if (config.owner_approval !== 'chat' || ghRepo?.host !== 'github.com') return '';

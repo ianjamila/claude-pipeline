@@ -6,23 +6,40 @@
 // (test/cli-review.test.mjs ownerWorld: a unique slug per test), so its records can never match another test's or another process's.
 // Approval records are bound to a head instead; the temp repos use fixed author details, so identical fixtures made in the same second
 // can share heads - callers of ownerSays keep that known risk (tracked in a follow-up issue).
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { areasBlock, ownerGoDir, recordApproval, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
+import { accountHome, areasBlock, ownerGoDir, recordApproval, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
 
 const HOOK = fileURLToPath(new URL('../../pipeline/hooks/owner-go.mjs', import.meta.url));
 
 // What Claude Code writes on a prompt entry the owner typed (#128): the use-time provenance check accepts a record only for such an entry.
 export const OWNER_ENTRY = { origin: { kind: 'human' }, promptSource: 'typed', entrypoint: 'cli' };
 
-// Where a test transcript lives: <dir>/.claude/projects/-repo/t.jsonl, the shape the use-time provenance check accepts (R1-B2; lib/paths.mjs isTranscriptFile).
-const transcriptIn = (dir) => {
-  mkdirSync(join(dir, '.claude', 'projects', '-repo'), { recursive: true });
-  return join(dir, '.claude', 'projects', '-repo', 't.jsonl');
+// Where a test transcript lives: <account home>/.claude-ownergo-test-<uuid>/projects/-repo/t.jsonl, a root the use-time provenance check accepts (R1-B2; lib/paths.mjs isTranscriptFile).
+// Codex #145 P1 / fix round: only a folder directly under the account's home with the guard's name shape is a root ($CLAUDE_CONFIG_DIR is none), so a temp dir's own .claude/ is not one.
+// NOTE: this writes a config-shaped folder into the REAL account home (like the owner-go records). Each is removed after its test and at exit; one a killed run left behind is swept at load
+// (prefix `.claude-ownergo-test-` is unique to these tests; only folders older than a day). A home that is not writable skips the sweep with a message (the tests then fail where they write).
+const TEST_CFG_PREFIX = '.claude-ownergo-test-';
+(function sweepStaleTestFolders() {
+  const home = accountHome();
+  try {
+    for (const n of readdirSync(home)) {
+      if (!n.startsWith(TEST_CFG_PREFIX)) continue;
+      const d = join(home, n);
+      try { if (Date.now() - statSync(d).mtimeMs > 24 * 3600 * 1000) rmSync(d, { recursive: true, force: true }); } catch { /* gone or not ours to remove */ }
+    }
+  } catch (e) { console.error(`owner-go test helper: cannot sweep stale ${TEST_CFG_PREFIX}* folders in ${home} (${e.code ?? e.message}); skipped`); }
+})();
+const transcriptIn = (t) => {
+  const cfg = join(accountHome(), `${TEST_CFG_PREFIX}${randomUUID()}`);
+  cleanupAtExit(cfg);
+  t.after(() => rmSync(cfg, { recursive: true, force: true }));
+  mkdirSync(join(cfg, 'projects', '-repo'), { recursive: true });
+  return join(cfg, 'projects', '-repo', 't.jsonl');
 };
 
 // What the recorder writes when the owner types `prompt` after a reply that showed `reply`. Returns the record (or null).
@@ -45,12 +62,12 @@ export function cleanupAtExit(file) {
   leftovers.add(file);
   if (exitHook) return;
   exitHook = true;
-  process.on('exit', () => { for (const f of leftovers) rmSync(f, { force: true }); });
+  process.on('exit', () => { for (const f of leftovers) rmSync(f, { recursive: true, force: true }); });
 }
 
 function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined) {
   const dir = mkdtempSync(join(tmpdir(), 'owner-go-'));
-  const transcript = transcriptIn(dir);
+  const transcript = transcriptIn(t);
   const promptId = `pid-${randomUUID()}`;
   writeFileSync(transcript, `${[
     { type: 'user', message: { content: 'ship it' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
@@ -101,7 +118,7 @@ export const approvalFlags = (head, items) => ['--owner-approved-head', head, '-
 // afterwards. Returns { stdout, status, record } (record: the owner-go line written for the session, or null).
 export function runHook(t, { entries, prompt, entry = OWNER_ENTRY, appended = true, input = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'owner-go-hook-'));
-  const transcript = transcriptIn(dir);
+  const transcript = transcriptIn(t);
   const promptId = `pid-${randomUUID()}`;
   const all = appended ? [...entries, { type: 'user', message: { content: prompt }, promptId, ...entry }] : entries;
   writeFileSync(transcript, `${all.map((e) => JSON.stringify(e)).join('\n')}\n`);

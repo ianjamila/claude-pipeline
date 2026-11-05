@@ -218,7 +218,9 @@ function baseAfterConflictMerge({ root, config, toHead, forkPoint }) {
 // The records of `git diff --raw -z` / `git log --raw -z --format=`: `:<mode> <mode> <id> <id> <status>\0<path>\0`, repeated. Anything
 // that is not exactly that throws (the caller turns it into base-unresolved). Ids are 40 hex (SHA-1) or 64 hex (SHA-256); with
 // --no-renames the status is one of A, D, M, T. An empty field is accepted only where a record starts (git versions differ in
-// whether they put a NUL between the commits of a log). -> [{ path, id: the blob the path has after the change; all zeros = deleted }]
+// whether they put a NUL between the commits of a log). The output is decoded as UTF-8, so distinct non-UTF-8 file names would all become
+// the same U+FFFD string and ownAuthored could match a merge-only file against an ordinarily authored one: a path containing U+FFFD
+// throws (a real name that holds a literal U+FFFD is refused too, which is acceptable). -> [{ path, id: the blob the path has after the change; all zeros = deleted }]
 const RAW_META = /^:[0-7]{6} [0-7]{6} (?:[0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) [ADMT]$/;
 function parseRawZ(out) {
   const fields = out.split('\0');
@@ -228,6 +230,7 @@ function parseRawZ(out) {
     const m = RAW_META.exec(fields[i]);
     const file = fields[i + 1];
     if (!m || file === undefined || file === '') throw new Error(`unexpected git output: ${JSON.stringify(fields[i].slice(0, 80))}`);
+    if (file.includes('\uFFFD')) throw new Error(`a changed path is not valid UTF-8, so it cannot be told apart from other such paths: ${JSON.stringify(file.slice(0, 80))}`);
     records.push({ path: file, id: m[1] });
     i += 2;
   }
