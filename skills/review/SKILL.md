@@ -17,8 +17,7 @@ number, `R` a review round, `<slug>` 2–5 lowercase words from the request.
 1. Only the owner decides a merge: the one merge you run is `P merge --pr N --owner-go`, after the owner's own "merge" for that head
    (3.3). You never run `gh pr merge` or the repo's merge command yourself, never push to `main`/`master`
    or force-push (`git push -u origin agent/<slug>`), never add `human-approved` / `test-change-approved`, never remove
-   `needs-human` / `pipeline-blocked` / `pipeline-pause` / `pipeline-rollback` yourself: `P merge --owner-go` lifts exactly the one
-   `needs-human` hold the owner's verified "merge" named (3.3), and nothing else. The guards block these; don't route around them.
+   `needs-human` / `pipeline-blocked` / `pipeline-pause` / `pipeline-rollback` yourself (`P merge --owner-go` lifts exactly the `needs-human` hold the owner's verified "merge" named, 3.3). The guards block these; don't route around them.
 2. No cross-model review, no merge. Codex unavailable (`exitCode: 3`) ⇒ `gh pr edit N --add-label awaiting-review`,
    `P comment --pr N --kind awaiting-review --reason "<reason from the JSON>"`, tell the owner, stop (outcome `awaiting-review`). A failed Codex run is never "no findings".
 3. Never pass a `model` parameter to `judge`, `arbiter` or `implementer`: their agent files pin the model (Sonnet, Fable, Sonnet).
@@ -89,8 +88,7 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    check reviews only what changed since this round's head); none left ⇒ park, cause `unresolved: <ids>`, except one case: `reachedMax`, no
    `extraRound`, `owner_approval: chat`, and the fixes are pushed and `verify.quick` is green ⇒ ask the owner for one more round (Extra round, below). Label mode ⇒ park.
 **Park** (every `needs-human` stop is this): `gh pr edit N --add-label needs-human`, `P comment --pr N --kind needs-human --reason "<cause, what was checked, what the owner does>"`,
-then the stop ritual with outcome `needs-human`. The summary renders from the round state, so at least one Codex round must have run; before that a stop is `blocked` or `awaiting-review`.
-The park comment is your own text: if the owner later says "merge" on a parked PR (`owner_approval: chat`), 3.3 shows the hold from GitHub's label event and quotes this comment only labelled as agent-written.
+then the stop ritual with outcome `needs-human`. The summary renders from the round state, so at least one Codex round must have run; before that a stop is `blocked` or `awaiting-review`. The park comment is your own text: 3.3 shows a later hold from GitHub's label event and quotes the comment only as agent-written.
 
 Book every agent call (implementer, judge, arbiter) right after it returns:
 `P cost --pr N --phase <build|review> --role <implementer|judge|arbiter> --from-transcript <the agent's transcript>` (add `--retry` on a fix retry). The transcript is
@@ -143,34 +141,20 @@ final gate re-prove the grant from the owner's record on this machine, so finish
      filled in (EagleWatch: `npm run merge -- <PR> --expect-head <sha>`) for the owner to run.
    - **Protected areas under `owner_approval: chat`** (`ownerMerge` items, nothing blocking): the owner's "merge" covers them. Run
      `P merge --pr N --dry-run --owner-go`; for a `say-merge` with `areas`, name the protected areas in plain English from its `areaIds` (never from the
-     agent-writable `.review/hardstops.json`) and end the reply with the LAST lines copied from the dry run, in this order (Areas above Hold above Head):
-     `<ownerStep.areas>`, `<ownerStep.hold>` (only when present, see the hold bullet), `<ownerStep.line>`, then `<ownerStep.ready>` when present, else `🔀 Ready to merge #N — say "merge"`.
-     The owner says "merge" ⇒ run it as a job (below; it re-scans GitHub's base..head and refuses unless the record is for exactly that digest, Areas and hold;
-     if anything changed, show the new dry-run lines). A dry run with blockers ⇒ fix them first; `owner-runs` ⇒ the first bullet.
-   - **A `needs-human` hold** (the dry run's `ownerStep` carries `hold`, with or without protected areas; a PR parked earlier, or one the owner marked): say in plain English that the
-     owner's "merge" also lifts the needs-human hold. Report the hold from the EVENT, `ownerStep.holdInfo` (the account that added the label and when): the GitHub account is shared with
-     you, so never call it the owner's hold or yours. Quote `ownerStep.parkNote.text` only when `parkNote` is present, labelled `pipeline park note (agent-written)`; it is never the hold's
-     reason. The reply ends with the dry run's lines copied verbatim: `ownerStep.areas` (when present), `ownerStep.hold`, `ownerStep.line`, `ownerStep.ready` (the 🔀 line that says
-     "and lift its needs-human hold"), nothing after; a blank line between them is harmless, prose is not. Never start a prose line with `Hold <x> by`: a canonical-looking Hold line
-     that is not part of the closing block voids the whole request. No `hold` in the dry run (no eligible hold, or label mode) ⇒ nothing is lifted and the lines are as without a hold.
-   - **Run the merge as a job.** The owner says "merge" ⇒ `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N --owner-go`, then `P job wait merge --run-id <runId> --timeout 540`
-     until `state` is `done` (the wait can outlast the Bash tool's 10-minute cap; `replaced`/`lost` ⇒ `P merge --pr N --dry-run --owner-go` and `gh pr view` first, never start it blind). Read `exitCode` and
-     the JSON in `tail`. `merged: true` (with `holdLifted`: the hold is lifted) ⇒ done. Nothing merged and the output has `holdRestored`, `holdKept`, `holdRestoreUnverified`,
-     `holdRemovedByOther` or `error: hold-recovery`: tell the owner in plain English what happened (the hold is back, or was never lifted, or someone else removed it) and show the NEW dry-run lines;
-     a restored hold is a new hold, so the owner's old "merge" cannot lift it and the owner must say "merge" again. `holdRestoreFailed: true` (`error: hold-restore`) ⇒ tell the owner the
-     label could not be put back and must be re-added by hand. `error: hold-recovery` with "PR comments unreadable" ⇒ run it once more later; an earlier run's interrupted lift is put right first.
+     agent-writable `.review/hardstops.json`) and end the reply with the closing lines (last bullet). A dry run with blockers ⇒ fix them first; `owner-runs` ⇒ the first bullet.
+   - **A `needs-human` hold** (`ownerStep.hold` present, with or without areas): say in plain English that the owner's "merge" also lifts the needs-human hold; report it from the event, `ownerStep.holdInfo` (who added the label, when: the account is shared, so never call it the owner's or yours);
+     quote `ownerStep.parkNote.text` only when `parkNote` is present, labelled `pipeline park note (agent-written)`, never as the hold's reason. Never start a prose line with `Hold <x> by`: a Hold-looking line outside the closing lines voids the request.
+   - **Merge as a job.** The owner says "merge" ⇒ `P job start merge -- node ~/.claude/pipeline/bin/pipeline.mjs merge --pr N --owner-go`, then `P job wait merge --run-id <runId> --timeout 540` until `state` is `done` (it can outlast the Bash tool's 10-minute cap; `replaced`/`lost` ⇒ dry run and `gh pr view` first). Read `exitCode` and `tail`:
+     `merged: true` ⇒ done (`holdLifted` names the lifted hold). Output with `holdRestored`, `holdKept`, `holdRestoreUnverified`, `holdRemovedByOther` or `error: hold-recovery` ⇒ nothing merged: tell the owner plainly, show the NEW dry-run lines; a restored hold is a new hold, so the owner must say "merge" again.
+     `holdRestoreFailed` (`error: hold-restore`) ⇒ the owner re-adds the label by hand; "PR comments unreadable" ⇒ run again later. A changed digest, areas or hold ⇒ show the new lines.
    - Any owner command that starts with `gh` is written with gh's absolute path, shell-quoted (`/opt/homebrew/bin/gh …` on this kind of
      Mac, else `/usr/local/bin/gh`; `command -v gh` when it answers): the owner's `!` prompt shell does not load the PATH that has gh.
-   - To preview the verdict before the owner's word, use only `P merge --pr N --dry-run` (add `--owner-go` for that route): it runs the
-     same checks, writes and merges nothing, and its `ownerStep` says which of the two endings above applies. Never run the repo's own
-     merge command (`npm run merge …`, even with `--dry-run`) to preview: the git guard refuses it, and the dry run grants nothing.
-   - **No such item**: the reply's LAST two lines are exactly (sha12 = first 12 characters of `git rev-parse HEAD`; owner/name from
-     `gh repo view --json nameWithOwner`; on `--owner-go` copy `ownerStep.line` (with `ownerStep.areas` and `ownerStep.hold` above it when present, and `ownerStep.ready` instead of the plain 🔀 line when present) from the dry run, never type the digest):
+   - To preview the verdict before the owner's word, use only `P merge --pr N --dry-run` (add `--owner-go` for that route): same checks, writes and merges nothing; its `ownerStep` says which ending above applies.
+     Never run the repo's own merge command (`npm run merge …`, even with `--dry-run`) to preview: the git guard refuses it, and the dry run grants nothing.
+   - **No such item**, and the closing lines of every request: the reply's LAST lines are exactly (sha12 = first 12 characters of `git rev-parse HEAD`; owner/name from `gh repo view --json nameWithOwner`; on `--owner-go` copy
+     them from the dry run, never type the digest: `ownerStep.areas` and `ownerStep.hold` when present, then `ownerStep.line`, then `ownerStep.ready` when present, with nothing after):
      `Head <sha12> · items <digest> · repo <owner/name>`
      `🔀 Ready to merge #N — say "merge"`
-     The owner-go hook binds the owner's "merge" to the LAST reply: if anything else was said since, or the context was compacted since you showed
-     it, show the lines again. Never type or simulate the owner's "merge". The owner then says "merge" and you run `P merge --pr N --owner-go` as the job above
-     (only that command: it checks the owner's record); no record ⇒ `P merge` says so: show the request again and wait. Exception: the owner said "merge" after a request that had a
-     Hold line, `P merge` finds no record, and the installed pipeline predates hold support (`P update --check` shows it behind main) ⇒ say "run `pipeline update` first" (an old hook records nothing for these lines) instead of showing the request again.
-     A refusal that says the transcript is not under a config dir the check trusts: the owner's Claude Code config dir must be a `.claude*` folder directly under the account's home; setting
-     `CLAUDE_CONFIG_DIR` does not help (tell the owner, do not retry). Label mode and the gated route are unchanged (the gated route lifts no hold).
+     The owner-go hook binds the owner's "merge" to the LAST reply: if anything else was said since, or the context was compacted, show the lines again (a blank line between them is harmless, prose is not). Never type or simulate the owner's "merge".
+     No record ⇒ `P merge` says so: show the request again and wait; but after a Hold line, with an installed pipeline that predates hold support (`P update --check` shows it behind main), say "run pipeline update first" instead.
+     A refusal that the transcript is not under a trusted config dir: the owner's Claude Code config dir must be a `.claude*` folder directly under the home (`CLAUDE_CONFIG_DIR` does not count): tell the owner. Label mode and the gated route are unchanged (the gated route lifts no hold).
