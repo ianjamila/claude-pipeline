@@ -9,15 +9,27 @@ import { toPosix } from './paths.mjs';
 const MARKDOWN = /\.(?:md|markdown)$/i;
 const DOCS_DIR_TEXT = /\.(?:md|markdown|txt|rst|adoc)$/i;
 const DOC_NAMES = /^(?:license|licence|changelog)(?:\.(?:md|markdown|txt))?$/i;
-// Agent instruction files steer what an agent does next, so they are code wherever they sit (docs/ included).
-const AGENT_INSTRUCTION_FILES = new Set(['claude.md', 'agents.md', 'gemini.md', '.cursorrules', 'copilot-instructions.md']);
+// Agent instruction files steer what an agent does next, so they are code wherever they sit (docs/ included). The .override /
+// .local variants are read by the same tools and win over the committed file.
+const AGENT_INSTRUCTION_FILES = new Set([
+  'claude.md', 'agents.md', 'gemini.md', '.cursorrules', 'copilot-instructions.md', 'agents.override.md', 'claude.local.md',
+]);
 // Instructions, hooks, workflows and the pipeline itself: text files here change what agents or CI do, so they are code.
-const NEVER_DOCS_DIRS = new Set(['.claude', '.github', '.githooks', 'skills', 'agents', 'pipeline', 'scripts']);
+// Any directory whose name starts with "." (.claude, .github, .githooks, .cursor, .windsurf, .clinerules, .gemini, .roo, .kiro ...)
+// is never docs either (tools keep their rules there); that is a rule on directory segments, so a root file like .foo.md is judged by its name.
+const NEVER_DOCS_DIRS = new Set(['skills', 'agents', 'pipeline', 'scripts']);
+// Next route directories: markdown there is a page when pageExtensions include md (hardstops.mjs MD_ROUTE_GLOBS). Over-matches
+// on purpose: any app/ or pages/ segment, in any case, even under docs/.
+const ROUTE_DIRS = new Set(['app', 'pages']);
+const neverDocsDir = (d) => {
+  const l = d.toLowerCase();
+  return l.startsWith('.') || NEVER_DOCS_DIRS.has(l) || ROUTE_DIRS.has(l);
+};
 
 export function isDocPath(p) {
   const parts = toPosix(p).replace(/^\.\//, '').split('/');
   const name = parts.at(-1);
-  if (AGENT_INSTRUCTION_FILES.has(name.toLowerCase()) || parts.slice(0, -1).some((d) => NEVER_DOCS_DIRS.has(d.toLowerCase()))) return false;
+  if (AGENT_INSTRUCTION_FILES.has(name.toLowerCase()) || parts.slice(0, -1).some(neverDocsDir)) return false;
   if (MARKDOWN.test(name) || DOC_NAMES.test(name)) return true;
   return parts.length > 1 && parts[0].toLowerCase() === 'docs' && DOCS_DIR_TEXT.test(name);
 }

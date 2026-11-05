@@ -13,6 +13,7 @@ import { DEFAULTS, validateConfig } from '../pipeline/lib/config.mjs';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { contentHash } from '../pipeline/lib/git.mjs';
 import { isDocPath } from '../pipeline/lib/doc-paths.mjs';
+import { isUniversalHardStopPath } from '../pipeline/lib/hardstops.mjs';
 import { docsExemptFrom } from '../pipeline/lib/docs-exempt.mjs';
 import { reviewCheck } from '../pipeline/lib/finalgate.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
@@ -458,4 +459,50 @@ test('review-complete: a missing Fable pass still refuses a docs-only commit', (
   assert.equal(r.code, 1);
   assert.match(r.json.reason, /Fable/);
   assert.equal(r.posted.length, 0);
+});
+
+// ---- review round 1: instruction files, route dirs, dot directories -------------------------------------------------------
+
+const DOT_DIR_DOCS = ['.windsurf/rules/x.md', '.clinerules/x.md', '.cursor/rules/x.md', '.gemini/styleguide.md', '.roo/rules/x.md', '.kiro/steering/x.md'];
+const OVERRIDE_FILES = ['AGENTS.override.md', 'CLAUDE.local.md'];
+
+test('doc-paths: override / local agent instruction files are never documents, at any depth and case', () => {
+  for (const n of OVERRIDE_FILES) {
+    for (const p of [n, `docs/${n}`, `pkg/sub/${n}`, n.toLowerCase(), `pkg/${n.toUpperCase()}`]) assert.equal(isDocPath(p), false, p);
+  }
+  assert.equal(isDocPath('docs/agents-override-notes.md'), true, 'similar names are still documents');
+});
+
+test('doc-paths: markdown under an app/ or pages/ directory is a route, not a document', () => {
+  for (const p of ['src/app/page.md', 'pages/landing.md', 'app/x.md', 'packages/web/App/y.md', 'docs/app/guide.md']) assert.equal(isDocPath(p), false, p);
+  for (const p of ['docs/agent-guide/prod-ledger.md', 'docs/application.md', 'docs/pages-notes.md']) assert.equal(isDocPath(p), true, p);
+});
+
+test('doc-paths: any dot-directory segment is never a document; a root dot-file name is not judged by that rule', () => {
+  for (const p of DOT_DIR_DOCS) assert.equal(isDocPath(p), false, p);
+  assert.equal(isDocPath('docs/.hidden/a.md'), false, 'a nested dot directory');
+  assert.equal(isDocPath('.foo.md'), true, 'the rule is about directory segments');
+});
+
+test('hard stops: AGENTS.override.md and CLAUDE.local.md are claimed like CLAUDE.md, at any depth', () => {
+  for (const n of OVERRIDE_FILES) for (const p of [n, `pkg/${n}`, n.toLowerCase()]) assert.equal(isUniversalHardStopPath(p), true, p);
+});
+
+test('validation refuses override files, route-dir markdown and dot-directory documents', () => {
+  const bad = [...OVERRIDE_FILES, 'docs/CLAUDE.local.md', 'src/app/page.md', 'pages/landing.md', 'app/x.md', ...DOT_DIR_DOCS];
+  for (const p of bad) {
+    const r = withList([p]);
+    assert.equal(r.ok, false, p);
+    assert.ok(r.errors.some((e) => e.includes('docs_exempt_paths')), `${p}: ${r.errors.join('; ')}`);
+  }
+  assert.equal(withList(['docs/agent-guide/prod-ledger.md']).ok, true);
+});
+
+test('run-time check: dot-directory and route-dir documents are refused with a list that skipped validation', (t) => {
+  for (const p of ['.windsurf/rules/x.md', '.kiro/steering/x.md', 'src/app/page.md']) {
+    const w = world(t, { list: [p], baseFiles: { [p]: '# x\n' } });
+    w.append(p, 'more\n');
+    w.repo.commit('append');
+    refused(w.exempt(), new RegExp(p.replace(/[.\/]/g, '\\$&')));
+  }
 });

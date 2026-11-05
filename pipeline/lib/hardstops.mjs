@@ -174,7 +174,7 @@ const GITHUB_DIR_GLOBS = ['**/.github/**'];
 const MARKDOWN_FILE = /\.(?:md|mdx|markdown)$/i;
 const R4_CONFIG_GLOBS = [
   // Agent-instruction files steer the agents that review and write code; a PR must not rewrite its own rules.
-  '**/CLAUDE.md', '**/AGENTS.md', '**/.cursorrules',
+  '**/CLAUDE.md', '**/AGENTS.md', '**/.cursorrules', '**/AGENTS.override.md', '**/CLAUDE.local.md',
   // Local git hooks: they run on a developer machine, never in CI. (pre-commit / lefthook configs are core: CI often runs them.)
   '**/.githooks/**', '**/.husky/**',
 ];
