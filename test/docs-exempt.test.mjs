@@ -568,25 +568,52 @@ test('an @/absolute or @~/home import is refused whatever it points at, naming t
   refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'docs/guide.md': '@/etc/hosts\n' })), /docs\/guide\.md imports \/etc\/hosts, which leaves/);
 });
 
-// Windows forms are judged the same on every platform: the reviewed tree is the same, and over-matching is the safe direction.
-test('a Windows absolute, drive, UNC or home token, or a backslash climb, is refused; a backslash path is the listed document', (t) => {
-  for (const token of ['C:\\repo\\docs\\ledger.md', 'c:/x.md', 'C:x.md', '\\\\server\\share\\x.md', '\\x.md', '~\\x.md', '..\\other\\x.md']) {
+// A backslash is a separator on Windows and a filename character on POSIX, so a token or symlink target with one has two readings and fails
+// closed. Literal tokens only: nothing here is built from the OS path, so the test runs the same everywhere.
+const BACKSLASH = /which cannot be judged because a backslash has two readings: this needs a review round/;
+
+test('a drive token is refused on every platform; \'@c:/x.md\' and \'@C:x.md\' leave the repository', (t) => {
+  for (const token of ['c:/x.md', 'C:x.md']) {
     const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': `see @${token}\n` })), LEAVES);
     assert.ok(r.reason.includes(`imports ${token},`), r.reason);
   }
-  // a backslash is a separator: this is the listed document
-  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs\\ledger.md\n' })), /imports docs\/ledger\.md, a listed document/);
-  // not a drive, not a home, not a climb: still just a relative path that does not exist
+});
+
+test('a token with a backslash is refused, whichever reading of it would have been harmless', (t) => {
+  for (const token of ['docs/ledger.md\\x', 'guide\\x.md', 'C:\\repo\\docs\\ledger.md', '..\\other\\x.md', '\\\\server\\share\\x.md', '\\x.md', '~\\x.md', 'docs\\ledger.md',
+    'guide.md#a\\b', 'guide.md\\.', 'docs/other.md\\)']) {
+    const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': `see @${token}\n` })), BACKSLASH);
+    assert.ok(r.reason.includes(`CLAUDE.md imports ${token},`), r.reason);
+  }
+  // through a hop: the importer is an imported file
+  for (const token of ['guide\\x.md', 'docs/ledger.md\\x']) {
+    const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'docs/guide.md': `@${token}\n` })), BACKSLASH);
+    assert.ok(r.reason.includes(`docs/guide.md imports ${token},`), r.reason);
+  }
+});
+
+test('an escaped space is not a backslash: an unlisted file is fine, a listed one with a space in its name is a hit', (t) => {
+  const r = exemptWith(importWorld(t, { 'CLAUDE.md': 'see @docs/my\\ notes.md\n' }));
+  assert.equal(r.exempt, true, r.reason);
+  const w = world(t, { list: ['docs/my notes.md'], baseFiles: { 'CLAUDE.md': '@docs/my\\ notes.md\n', 'docs/my notes.md': '# Ledger\n\n| Num | Name | Date | PR | Note |\n|---|---|---|---|---|\n' + row(1) } });
+  w.append('docs/my notes.md', row(2));
+  w.repo.commit('notes');
+  refused(w.exempt(), /imports docs\/my notes\.md, a listed document/);
+});
+
+test('not a drive, not a home, not a climb: still just a relative path that does not exist', (t) => {
   for (const token of ['foo@example.com', '@supabase/ssr', '@note:later', '@ab:c']) {
     const r = exemptWith(importWorld(t, { 'CLAUDE.md': `see ${token}\n` }));
     assert.equal(r.exempt, true, `${token}: ${r.reason}`);
   }
-  // a symlink whose target is absolute in either style
-  for (const target of ['C:\\x.md', '\\x.md', '\\\\srv\\x.md']) {
+});
+
+test('a symlink target that is absolute or has a backslash cannot be judged', (t) => {
+  for (const [target, why] of [['C:\\x.md', /absolute path/], ['\\x.md', /backslash/], ['\\\\srv\\x.md', /backslash/], ['..\\x', /backslash/], ['docs\\ledger.md', /backslash/], ['C:/x.md', /absolute path/]]) {
     const w = world(t, { baseFiles: { 'CLAUDE.md': '@out.md\n' }, baseLinks: { 'out.md': target } });
     w.append(LEDGER, row(2));
     w.repo.commit('ledger row');
-    refused(exemptWith(w), /absolute path/);
+    refused(exemptWith(w), why);
   }
 });
 

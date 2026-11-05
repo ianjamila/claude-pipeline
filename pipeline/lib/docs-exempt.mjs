@@ -110,7 +110,8 @@ function resolveInTree(tree, rel, readBlob) {
     const target = readBlob(entry.oid, real);
     if (target === '' || target.includes('\0')) throw new Unjudgeable(`${real} is a symlink with an unreadable target`);
     if (isAbsoluteOrHome(target)) throw new Unjudgeable(`${real} is a symlink to an absolute path`);
-    segs = [...slashed(target).split('/').filter((s) => s !== '' && s !== '.'), ...segs];
+    if (target.includes('\\')) throw new Unjudgeable(`${real} is a symlink whose target has a backslash, which has two readings`);
+    segs = [...target.split('/').filter((s) => s !== '' && s !== '.'), ...segs];
     // `done` is the directory that holds the link, unchanged: the target is relative to it.
   }
   const full = done.join('/');
@@ -123,11 +124,10 @@ function resolveInTree(tree, rel, readBlob) {
   return { path: hit[0], entry: tree.entries.get(hit[0]) };
 }
 
-// A path that names a place outside the reviewed tree whatever the platform: rooted (`/x`, `\x`, `\\server\share`), the home directory (`~`, `~/x`,
-// `~\x`) or a drive (`C:`, `c:/x`, `C:x`). Windows forms count on every platform: the same tree is reviewed on all of them, and over-matching is safe.
-const isAbsoluteOrHome = (p) => /^(?:[/\\]|~(?:[/\\]|$)|[A-Za-z]:)/.test(p);
-// A backslash separates like a slash, so `..\x` climbs and `docs\ledger.md` is `docs/ledger.md`.
-const slashed = (p) => p.replaceAll('\\', '/');
+// A path that names a place outside the reviewed tree whatever the platform: rooted (`/x`), the home directory (`~`, `~/x`) or a drive
+// (`C:`, `c:/x`, `C:x`). The drive form counts on every platform: the same tree is reviewed on all of them, and over-matching is safe.
+// A backslash is not judged here: it is a separator on Windows and a filename character on POSIX, so a token or symlink target with one is refused.
+const isAbsoluteOrHome = (p) => /^(?:\/|~(?:\/|$)|[A-Za-z]:)/.test(p);
 
 // The paths an `@token` may stand for, as written (escaped spaces undone; trailing punctuation and a #fragment cut off in turn).
 function candidatesOf(token) {
@@ -193,12 +193,15 @@ function importProblem({ listed, tree, o }) {
     let tokens = 0;
     for (const m of text.matchAll(IMPORT_TOKEN)) {
       if (++tokens > MAX_TOKENS) return `${path} cannot be judged: too many @ tokens`;
+      // A backslash (an escaped space aside) has two readings, a separator or a filename character, so judging one could miss the other.
+      // Judged on the whole token, before any trailing punctuation or #fragment is cut off.
+      if (m[1].replace(/\\ /g, ' ').includes('\\')) return `${path} imports ${m[1]}, which cannot be judged because a backslash has two readings: this needs a review round`;
       for (const written of candidatesOf(m[1])) {
         // An absolute or home path is not a place inside the reviewed tree, so it cannot be judged there.
         if (isAbsoluteOrHome(written)) return leaves(path, written);
         // Where the token may point, as paths from the repo root: the importer's directory as it was reached and as it really is.
         for (const dir of new Set([posix.dirname(path), posix.dirname(canonical)])) {
-          const rel = `${dir === '.' ? '' : `${dir}/`}${slashed(written)}`;
+          const rel = `${dir === '.' ? '' : `${dir}/`}${written}`;
           const lexical = posix.normalize(rel);
           if (lexical === '..' || lexical.startsWith('../')) return leaves(path, written);
           const direct = hit(path, lexical, null);
