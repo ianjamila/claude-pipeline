@@ -2,6 +2,7 @@
 // output, so a mocked git would prove nothing. Raw `git` (not the wrapper's forced config) so tests can set local
 // config such as diff.noprefix and check the wrapper still copes. Inherited GIT_DIR / GIT_INDEX_FILE are scrubbed so a
 // run from inside a git hook can never touch the outer repo. Every repo is removed when the test process exits.
+import { randomBytes } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -10,9 +11,16 @@ import { run } from '../../pipeline/lib/proc.mjs';
 const SCRUBBED = [
   'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
   'GIT_COMMON_DIR', 'GIT_PREFIX', 'GIT_NAMESPACE',
+  // Identity overrides beat repo-local user.name/user.email and would make the per-repo nonce inert. (The *_DATE vars are
+  // left alone: tests pin them on purpose.)
+  'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL',
+  // Env-supplied config also outranks repo-local config (dropping COUNT disables every GIT_CONFIG_KEY_n/VALUE_n pair), and
+  // GIT_CONFIG would redirect `git config` away from .git/config entirely.
+  'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
 ];
-// undefined values drop the variable from the child's environment (proc.run merges over process.env).
-const ENV = Object.fromEntries(SCRUBBED.map((k) => [k, undefined]));
+// undefined values drop the variable from the child's environment (proc.run merges over process.env). LC_ALL/LANG pin git's
+// messages to English (as pipeline/lib/git.mjs does), so tests matching git's translatable text pass under any locale.
+const ENV = { ...Object.fromEntries(SCRUBBED.map((k) => [k, undefined])), LC_ALL: 'C', LANG: 'C' };
 
 const made = new Set();
 function removeDir(dir) {
@@ -36,8 +44,12 @@ export function createTmpRepo() {
   };
 
   git(['init', '-q', '-b', 'main']);
+  // A per-repo random nonce in the identity (repo-local config, so it reaches commits made through git() directly too):
+  // identical fixtures committed in the same second must not share a head sha, or an approval record keyed on a head
+  // from one process could satisfy another process's negative assertion.
+  const nonce = randomBytes(6).toString('hex');
   git(['config', 'user.name', 'Pipeline Test']);
-  git(['config', 'user.email', 'test@example.invalid']);
+  git(['config', 'user.email', `test-${nonce}@example.invalid`]);
   git(['config', 'commit.gpgsign', 'false']);
   git(['config', 'tag.gpgsign', 'false']);
   git(['config', 'core.autocrlf', 'false']);
