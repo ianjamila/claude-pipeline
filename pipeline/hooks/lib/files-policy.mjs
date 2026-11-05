@@ -21,7 +21,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
-import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf } from '../../lib/paths.mjs';
+import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
@@ -1070,7 +1070,7 @@ function makeMatchers(ctx) {
     const at = gp.lastIndexOf('/');
     const last = gp.slice(at + 1);
     const parent = gp.slice(0, at);
-    if (!last || !claudeSeg(last) || (!/[*?[]/.test(last) && /^\.claude[^.]*$/i.test(last) === false)) return false;
+    if (!last || !claudeSeg(last) || (!/[*?[]/.test(last) && new RegExp(HOME_CONFIG_DIR_RE.source, 'i').test(last) === false)) return false;
     return unique([ctx.homePosix, ctx.homePosix && realResolve(ctx.homePosix, ctx.api)]).filter(Boolean).some((h) => parent.split('/').length === h.split('/').length && globReaches(parent, h, ctx.ci));
   };
 

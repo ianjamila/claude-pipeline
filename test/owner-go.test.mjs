@@ -15,6 +15,8 @@ import {
   approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT, legacyTranscriptOf,
   parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
+import { HOME_CONFIG_DIR_RE, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
+import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { OWNER_ENTRY, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -1474,15 +1476,16 @@ test('#128 legacy grant: no transcript, two different transcripts, a subagent\'s
   assert.deepEqual(legacyWorld({ entries: legacyEntries, places: [] }).verify(), [false, 'provenance'], 'no transcript');
   assert.deepEqual(legacyWorld({ entries: legacyEntries, places: [['.claude', '-repo'], ['.claude', '-other']] }).verify(), [false, 'provenance'], 'two projects');
   assert.deepEqual(legacyWorld({ entries: legacyEntries, places: [['.claude', '-repo'], ['.claude-eaglewatch', '-repo']] }).verify(), [false, 'provenance'], 'two config dirs');
-  // a transcript only under subagents/ or in a config dir the environment does not name is no evidence
+  // a transcript only under subagents/ or in a config dir that is no home-level root is no evidence
   const sub = legacyWorld({ entries: legacyEntries, places: [] });
   mkdirSync(join(sub.home, '.claude', 'projects', '-repo', LEGACY_SESSION, 'subagents'), { recursive: true });
   writeFileSync(join(sub.home, '.claude', 'projects', '-repo', LEGACY_SESSION, 'subagents', `${LEGACY_SESSION}.jsonl`), lines(legacyEntries));
   mkdirSync(join(sub.home, 'claude-config', 'projects', '-repo'), { recursive: true });
   writeFileSync(join(sub.home, 'claude-config', 'projects', '-repo', `${LEGACY_SESSION}.jsonl`), lines(legacyEntries));
   assert.equal(ownerGrantGap(sub.q), 'provenance', 'subagent / unnamed config dir');
-  // …but a config dir the environment names is trusted, as for any transcript
-  assert.equal(ownerGrantGap({ ...sub.q, env: { CLAUDE_CONFIG_DIR: join(sub.home, 'claude-config') } }), 'ok');
+  // R1-F1: …and neither does naming it: the grant readers run in the agent's shell, so CLAUDE_CONFIG_DIR=<a file the agent wrote> must not point the lookup there
+  assert.equal(ownerGrantGap({ ...sub.q, env: { CLAUDE_CONFIG_DIR: join(sub.home, 'claude-config') } }), 'provenance', 'the environment names no root for a derived lookup');
+  assert.equal(legacyTranscriptOf(LEGACY_SESSION, { home: sub.home, env: { CLAUDE_CONFIG_DIR: join(sub.home, 'claude-config') } }), null);
   // a session that is not a plain name never reaches the file system, whatever sits where '../x' would point
   // (the readers cannot hand one over: a record's session must be its file's name; legacyTranscriptOf refuses it on its own)
   const evil = legacyWorld({ entries: legacyEntries, places: [] });
@@ -1505,4 +1508,80 @@ test('#128 legacy grant: two "extra round" prompts within the window are refused
   const w = legacyWorld({ entries: [promptEntry('go'), said(RASK), typed('extra round', OWNER_META, 2000), said('ok'), typed('extra round', OWNER_META, 9000)] });
   assert.equal(ownerGrantGap(w.q), 'provenance');
   assert.deepEqual(w.verify(), [false, 'provenance']);
+});
+
+// ---- R1-B1 / R1-F1: a derived lookup trusts only the roots the guard protects without help from the command's environment ----
+// (a name directly under the account's home with the guard's own shape, HOME_CONFIG_DIR_RE; the candidate's real path must stay inside one of them)
+const withPlace = (home, cfg) => { // a transcript of the session under <home>/<cfg>/projects/-repo
+  mkdirSync(join(home, cfg, 'projects', '-repo'), { recursive: true });
+  writeFileSync(join(home, cfg, 'projects', '-repo', `${LEGACY_SESSION}.jsonl`), lines(legacyEntries));
+};
+
+test('#128 legacy grant R1-B1: a forged home-level root (~/.claude.forged: real dir or symlink) holding the only transcript proves nothing', { skip: process.platform === 'win32' }, () => {
+  const real = legacyWorld({ entries: legacyEntries, places: [['.claude.forged', '-repo']] });
+  assert.equal(ownerGrantGap(real.q), 'provenance', 'a real dir');
+  assert.deepEqual(real.verify(), [false, 'provenance']);
+  assert.deepEqual(ownerGrantedRounds(real.q), []);
+  const linked = legacyWorld({ entries: legacyEntries, places: [] });
+  const elsewhere = tmp();
+  withPlace(elsewhere, '.');
+  symlinkSync(elsewhere, join(linked.home, '.claude.forged'));
+  assert.equal(ownerGrantGap(linked.q), 'provenance', 'a symlink the guard does not stop');
+  assert.deepEqual(linked.verify(), [false, 'provenance']);
+  // a forged root next to the real one neither adds a second file (ambiguity) nor replaces the real one
+  const both = legacyWorld({ entries: legacyEntries, places: [['.claude.forged', '-repo']] });
+  withPlace(both.home, '.claude');
+  assert.equal(ownerGrantGap(both.q), 'ok', 'only the protected root counts');
+});
+
+test('#128 legacy grant R1-F1: CLAUDE_CONFIG_DIR is ignored by the derived lookup', () => {
+  const w = legacyWorld({ entries: legacyEntries, places: [] });
+  const dir = tmp();
+  withPlace(dir, '.');
+  const env = { CLAUDE_CONFIG_DIR: dir };
+  assert.equal(ownerGrantGap({ ...w.q, env }), 'provenance');
+  assert.equal(legacyTranscriptOf(LEGACY_SESSION, { home: w.home, env }), null);
+  // …and does not hide the real one either
+  withPlace(w.home, '.claude');
+  assert.equal(ownerGrantGap({ ...w.q, env }), 'ok');
+  assert.equal(legacyTranscriptOf(LEGACY_SESSION, { home: w.home, env }), join(w.home, '.claude', 'projects', '-repo', `${LEGACY_SESSION}.jsonl`));
+});
+
+test('#128 legacy grant R1-B1: a transcript file (or projects/ or project folder) inside a protected root that links outside it is refused', { skip: process.platform === 'win32' }, () => {
+  const outside = tmp();
+  const target = join(outside, 'forged.jsonl');
+  writeFileSync(target, lines(legacyEntries));
+  const file = legacyWorld({ entries: legacyEntries, places: [] });
+  mkdirSync(join(file.home, '.claude', 'projects', '-repo'), { recursive: true });
+  symlinkSync(target, join(file.home, '.claude', 'projects', '-repo', `${LEGACY_SESSION}.jsonl`));
+  assert.equal(ownerGrantGap(file.q), 'provenance', 'a symlinked file');
+  assert.equal(legacyTranscriptOf(LEGACY_SESSION, { home: file.home }), null);
+  withPlace(outside, '.');
+  const folder = legacyWorld({ entries: legacyEntries, places: [] });
+  mkdirSync(join(folder.home, '.claude', 'projects'), { recursive: true });
+  symlinkSync(join(outside, 'projects', '-repo'), join(folder.home, '.claude', 'projects', '-repo'));
+  assert.equal(ownerGrantGap(folder.q), 'provenance', 'a symlinked project folder');
+  const projects = legacyWorld({ entries: legacyEntries, places: [] });
+  mkdirSync(join(projects.home, '.claude'), { recursive: true });
+  symlinkSync(join(outside, 'projects'), join(projects.home, '.claude', 'projects'));
+  assert.equal(ownerGrantGap(projects.q), 'provenance', 'a symlinked projects/');
+});
+
+test('#128 legacy grant R1-B1: the root shape is the guard\'s: HOME_CONFIG_DIR_RE, transcriptRes and the guard\'s refusal to link such a name agree', () => {
+  const names = ['.claude', '.claude-eaglewatch', '.claude_alt', '.claude2', '.claude.forged', '.claude.json', '.claude.bak-1', '.claudex.y', 'claude', 'x.claude'];
+  const home = tmp();
+  for (const n of names) mkdirSync(join(home, n));
+  const derived = transcriptConfigDirs({ home }).map((d) => d.slice(home.length + 1)).sort();
+  const shaped = names.filter((n) => HOME_CONFIG_DIR_RE.test(n)).sort();
+  assert.deepEqual(shaped, ['.claude', '.claude-eaglewatch', '.claude2', '.claude_alt']);
+  assert.deepEqual(derived, shaped, 'the derived lookup scans exactly the shaped names');
+  const O = { home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, existsSync: () => false, cwd: '/repo' };
+  const folders = transcriptRes([], false, ['/home/u']).dirs;
+  for (const n of names) {
+    const guarded = evaluateBashForFiles(`ln -s /tmp/x ~/${n}`, O).decision === 'deny';
+    assert.equal(guarded, HOME_CONFIG_DIR_RE.test(n), `the guard refuses to link ${n} iff the shape matches`);
+    assert.equal(folders.some((re) => re.test(`/home/u/${n}`)), HOME_CONFIG_DIR_RE.test(n), `transcriptRes protects the folder ${n} iff the shape matches`);
+  }
+  // the guard's glob rule (files-policy) is built from the same export, not a copy
+  assert.match(readFileSync(fileURLToPath(new URL('../pipeline/hooks/lib/files-policy.mjs', import.meta.url)), 'utf8'), /HOME_CONFIG_DIR_RE/);
 });

@@ -18,7 +18,9 @@
 // A record whose entry cannot be found or is not the owner's approves nothing. Records written before #128 carry no prompt_id (nor transcript_path):
 // a "merge" or a ruling from then is refused for its last day at most (it ages out, MAX_AGE_MS). An owner-granted extra round is different: it is read
 // at any age (verifyOwnerGrant), so a pre-#128 grant on a PR still in flight would block its review-complete and final gate for good. The grant readers
-// therefore find such a record's transcript from its session (legacyTranscriptOf: exactly one real file under the trusted roots, else missing) and prove
+// therefore find such a record's transcript from its session (legacyTranscriptOf: exactly one real file under the ROOTS THE GUARD PROTECTS, else missing: the folders
+// directly under the account's home named like ~/.claude, ~/.claude-eaglewatch (HOME_CONFIG_DIR_RE, the shape the guard stops a tool from creating or replacing), the file's real
+// path inside its root's; never $CLAUDE_CONFIG_DIR, which the grant readers take from the agent's shell, never ~/.claude.forged, which nothing stops) and prove
 // the prompt by its words and time like any record without a prompt_id; the derived path is never written back. Nothing else gets this.
 // Residual (#128): the model could still write a transcript entry itself (files-policy refuses a tool write to ~/.claude*/projects/**/*.jsonl)
 // or type into an interactive `claude --resume` through a pty, which types as the owner; GitHub-side separation (issue #65) is the backstop.
@@ -29,7 +31,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { isTranscriptFile, transcriptConfigDirs } from '../../lib/paths.mjs';
+import { isInside, isTranscriptFile, transcriptConfigDirs } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
 export const MAX_AGE_MS = 24 * 60 * 60 * 1000; // a "merge" older than a day approves nothing
@@ -578,20 +580,29 @@ function scanBackwards(file, visit, wants, { chunkBytes, capBytes }) {
   }
 }
 
-// A record written before #128 has no transcript_path: the one transcript of its session, or null. <config dir>/projects/<project>/<session>.jsonl under the
-// config dirs isTranscriptFile trusts for `env` (paths.mjs transcriptConfigDirs); a regular file of the shape isTranscriptFile accepts, not a subagent's;
-// de-duplicated by real path (one account's projects/ can be a link to the other's). None, or two different files, is null.
-export function legacyTranscriptOf(session, { home = accountHome(), env = process.env } = {}) {
+// A record written before #128 has no transcript_path: the one transcript of its session, or null. <config dir>/projects/<project>/<session>.jsonl, where the
+// config dirs are ONLY the folders directly under the account's home with the guard's own shape (paths.mjs transcriptConfigDirs / HOME_CONFIG_DIR_RE: the names the guard
+// refuses to let a tool create or replace, so what lies in them is the guard's). Why those and nothing else: the grant readers run in the agent's shell, so the
+// environment is the agent's word. CLAUDE_CONFIG_DIR is ignored here (it would point the lookup at a file the agent wrote, and no guard reads that prefix), exactly as $HOME is
+// (accountHome). A home-level name outside the shape (~/.claude.forged: `ln -s` creates it unguarded) is no root either. The candidate must be a regular file (not a link) of
+// the shape isTranscriptFile accepts, not a subagent's, and its REAL path must lie inside the real path of one of those roots (a link inside a root that points out of
+// them is not the guard's file; ~/.claude-eaglewatch/projects linked to ~/.claude/projects is); de-duplicated by real path (one account's projects/ can be a link to the other's). None, or two different files, is null.
+// (Hook-written transcript_path records are different: isTranscriptFile / promptProvenance still honour $CLAUDE_CONFIG_DIR for those, the protected recorder wrote them.)
+export function legacyTranscriptOf(session, { home = accountHome() } = {}) {
   if (typeof session !== 'string' || !SESSION_RE.test(session)) return null;
   const found = new Map(); // real path -> the path it was first seen by
-  for (const dir of transcriptConfigDirs({ env, home })) {
+  const dirs = transcriptConfigDirs({ home });
+  const roots = []; // the roots' real paths
+  for (const dir of dirs) { try { roots.push(realpathSync(dir)); } catch { /* gone */ } }
+  for (const dir of dirs) {
     let projects;
     try { projects = readdirSync(path.join(dir, 'projects')); } catch { continue; }
     for (const project of projects) {
       const file = path.join(dir, 'projects', project, `${session}.jsonl`);
       try {
-        if (!lstatSync(file).isFile() || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { env })) continue;
+        if (!lstatSync(file).isFile() || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { env: {} })) continue;
         const real = realpathSync(file);
+        if (!roots.some((r) => isInside(real, r))) continue;
         if (!found.has(real)) found.set(real, file);
       } catch { /* not there */ }
     }
@@ -600,14 +611,14 @@ export function legacyTranscriptOf(session, { home = accountHome(), env = proces
 }
 
 // The records of `list` whose prompt is the owner's (each distinct prompt is looked up once). grant: true (the extra-round readers) finds a pre-#128
-// record's transcript by its session (legacyTranscriptOf) when it names none; `home` / `env` say where to look.
+// record's transcript by its session (legacyTranscriptOf) when it names none, under `home` only (env never says where; it only reaches promptProvenance).
 function ownedBy(list, { grant = false, home, env } = {}) {
   const memo = new Map();
   return list.filter((r) => {
     const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}\0${grant ? r.session : ''}`;
     if (!memo.has(key)) {
       const derive = grant && (typeof r.transcript_path !== 'string' || r.transcript_path === '');
-      const file = derive ? legacyTranscriptOf(r.session, { home, env }) : r.transcript_path;
+      const file = derive ? legacyTranscriptOf(r.session, { home }) : r.transcript_path;
       memo.set(key, derive && file === null ? 'missing' : promptProvenance(derive ? { ...r, transcript_path: file } : r, env ? { env } : undefined));
     }
     return memo.get(key) === 'owner';

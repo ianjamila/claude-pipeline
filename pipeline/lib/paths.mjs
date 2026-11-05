@@ -128,6 +128,11 @@ const TRANSCRIPT_LEAF = String.raw`projects/(?:[^/]+/)+[^/]+\.jsonl$`;
 const TRANSCRIPT_BELOW = String.raw`projects/(?:-|[A-Za-z]--)[^/]*(?:/(?!memory(?:/|$))[^/.]+(?:/[^/.]+)*)?/*$`;
 const TRANSCRIPT_TOP = String.raw`projects/*$`;
 const ANY_CLAUDE_DIR = String.raw`(?:^|/)\.claude[^/]*/`;
+// A config dir directly under the home: `.claude` plus a suffix with no further dot (~/.claude, ~/.claude-eaglewatch; not ~/.claude.json, a file, and not ~/.claude.forged). THE shape the guard
+// protects as a home-level folder (transcriptRes `homeDirs` below and the files-policy glob rule use this one definition): a tool cannot create or replace such a name, so what lies inside
+// it is the guard's own. A name outside the shape is unguarded (`ln -s /tmp/x ~/.claude.forged` goes through), so nothing found there is evidence.
+export const HOME_CONFIG_DIR_SRC = String.raw`\.claude[^/.]*`;
+export const HOME_CONFIG_DIR_RE = new RegExp(`^${HOME_CONFIG_DIR_SRC}$`);
 export const TRANSCRIPT_FILE_SRC = ANY_CLAUDE_DIR + TRANSCRIPT_LEAF;
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // The absolute POSIX form of $CLAUDE_CONFIG_DIR (home references expanded), or null when it is unset or not absolute.
@@ -148,7 +153,7 @@ export function configDirOf(env, home = os.homedir()) {
 export function transcriptRes(configDirs = [], ci = false, homes = []) {
   const flags = ci ? 'i' : '';
   const dirs = [...new Set(configDirs.filter(Boolean))];
-  const homeDirs = [...new Set(homes.filter(Boolean))].map((h) => `^${reEscape(h.replace(/\/+$/, ''))}/\\.claude[^/.]*/*$`);
+  const homeDirs = [...new Set(homes.filter(Boolean))].map((h) => `^${reEscape(h.replace(/\/+$/, ''))}/${HOME_CONFIG_DIR_SRC}/*$`);
   const roots = dirs.map((d) => `^${reEscape(d)}/`);
   const self = dirs.map((d) => `^${reEscape(d)}/*$`);
   const folders = [ANY_CLAUDE_DIR + TRANSCRIPT_TOP, ANY_CLAUDE_DIR + TRANSCRIPT_BELOW, ...self, ...homeDirs, ...roots.flatMap((r) => [r + TRANSCRIPT_TOP, r + TRANSCRIPT_BELOW])].map((x) => new RegExp(x, flags));
@@ -158,12 +163,14 @@ export function transcriptRes(configDirs = [], ci = false, homes = []) {
     below: folders,
   };
 }
-// The config dirs whose projects/ folder isTranscriptFile can trust, for `home`: $CLAUDE_CONFIG_DIR and each <home>/.claude* folder (the shape of
-// ANY_CLAUDE_DIR). A caller that looks a transcript up by session (owner-go.mjs legacyTranscriptOf) still tests each file it finds with isTranscriptFile.
-export function transcriptConfigDirs({ env = process.env, home = os.homedir() } = {}) {
+// The config dirs whose projects/ folder a DERIVED lookup (owner-go.mjs legacyTranscriptOf: find a transcript by its session) may trust, for `home`: the folders directly
+// under it with the HOME_CONFIG_DIR_RE shape that exist, and nothing else. The environment is NOT consulted (R1-F1): the callers run in the agent's shell, where
+// CLAUDE_CONFIG_DIR=<a folder the agent wrote> is the agent's own word and no guard reads that prefix. (A path the hook recorded, isTranscriptFile / promptProvenance, may still
+// name $CLAUDE_CONFIG_DIR: the protected recorder wrote it.) The caller still tests each file it finds with isTranscriptFile and checks its real path stays inside the folder's.
+export function transcriptConfigDirs({ home = os.homedir() } = {}) {
   let named = [];
-  try { named = fs.readdirSync(home).filter((n) => n.startsWith('.claude')).sort(); } catch { /* an unreadable home has none */ }
-  return [...new Set([configDirOf(env, home), ...named.map((n) => path.join(home, n))].filter(Boolean))];
+  try { named = fs.readdirSync(home).filter((n) => HOME_CONFIG_DIR_RE.test(n)).sort(); } catch { /* an unreadable home has none */ }
+  return named.map((n) => path.join(home, n)).filter((d) => { try { return fs.statSync(d).isDirectory(); } catch { return false; } });
 }
 // Is this path (any slash flavour) a transcript FILE the guard protects?
 export function isTranscriptFile(file, { env = process.env, platform = process.platform, home } = {}) {
