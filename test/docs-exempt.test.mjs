@@ -549,21 +549,31 @@ test('symlinks that cycle, dangle or leave the repo, on an instruction file or a
   assert.equal(exemptWith(importWorld(t, { 'CLAUDE.md': '@nothing/here.md\n' })).exempt, true);
 });
 
-test('@/absolute and @~/home imports resolve against the repo root and HOME: inside the repo they compare, outside they are ignored', (t) => {
-  const abs = (dir) => `see @${dir}/docs/ledger.md\n`;
-  const w = importWorld(t, { 'CLAUDE.md': (dir) => abs(dir) });
-  refused(exemptWith(w), /CLAUDE\.md imports docs\/ledger\.md/);
-  const home = importWorld(t, { 'CLAUDE.md': (dir) => `see @~/${dir.split('/').at(-1)}/docs/ledger.md\n` });
-  refused(exemptWith(home, { home: dirname(home.dir) }), /CLAUDE\.md imports docs\/ledger\.md/);
-  // a ../ walk that comes back into the repo through an absolute path
-  const back = importWorld(t, { 'CLAUDE.md': (dir) => `@${dir}/src/../docs/ledger.md\n` });
-  refused(exemptWith(back), /imports docs\/ledger\.md/);
-  // outside the repo: cannot be a listed document, so it does not matter
-  const out = importWorld(t, { 'CLAUDE.md': '@/etc/hosts @~/notes/x.md @../../elsewhere.md\n' });
-  const r = exemptWith(out, { home: '/home/nobody' });
+// An import the scan cannot judge purely inside the reviewed tree refuses the exemption; the checkout's own location is never consulted.
+const LEAVES = /leaves the repository, so it cannot be judged: this needs a review round/;
+
+test('an @/absolute or @~/home import is refused whatever it points at, naming the importer and the token', (t) => {
+  for (const [body, token] of [
+    [(dir) => `see @${dir}/docs/ledger.md\n`, null],
+    ['@/etc/hosts\n', '/etc/hosts'],
+    ['@~/x.md\n', '~/x.md'],
+    ['and @~\n', '~'],
+    [(dir) => `@~/${dir.split('/').at(-1)}/docs/ledger.md\n`, null],
+  ]) {
+    const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': body })), LEAVES);
+    assert.ok(r.reason.includes('CLAUDE.md imports '), r.reason);
+    if (token !== null) assert.ok(r.reason.includes(`imports ${token},`), r.reason);
+  }
+  // from an imported file too
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'docs/guide.md': '@/etc/hosts\n' })), /docs\/guide\.md imports \/etc\/hosts, which leaves/);
+});
+
+test('@/ and @~ tokens only count where an import can start: an e-mail or a package name is not a refusal', (t) => {
+  // not a token at all: `@` does not follow a start of line, whitespace or a bracket
+  assert.equal(exemptWith(importWorld(t, { 'CLAUDE.md': 'write to foo@example.com or a@b.co.uk\n' })).exempt, true);
+  // a token, but a relative path that does not exist in the tree: ignored
+  const r = exemptWith(importWorld(t, { 'CLAUDE.md': 'we use @supabase/ssr and (@types/node) and @scope/pkg.\n' }));
   assert.equal(r.exempt, true, r.reason);
-  // an @~ import with no HOME cannot be judged
-  refused(exemptWith(out, { home: '' }), /cannot be judged|HOME/);
 });
 
 test('an instruction file too large to read cannot be judged: refused', (t) => {
@@ -573,15 +583,32 @@ test('an instruction file too large to read cannot be judged: refused', (t) => {
 
 // ---- R1 follow-ups to A3: re-entry, link aliases, `./` in link targets, and the order of the checks ---------------------------------------
 
-test('a relative import that leaves the repo and comes back in reaches the listed document: refused', (t) => {
+test('a relative import that climbs above the repo root, even to come back in, is refused', (t) => {
   const name = (dir) => dir.split('/').at(-1);
-  refused(exemptWith(importWorld(t, { 'CLAUDE.md': (dir) => `see @../${name(dir)}/docs/ledger.md\n` })), /CLAUDE\.md imports docs\/ledger\.md/);
-  refused(exemptWith(importWorld(t, { 'sub/CLAUDE.md': (dir) => `see @../../${name(dir)}/docs/ledger.md\n` })), /sub\/CLAUDE\.md imports docs\/ledger\.md/);
-  // a chain: the re-entry is followed from an imported file as well
-  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'docs/guide.md': (dir) => `@../../${name(dir)}/docs/ledger.md\n` })), /guide\.md imports docs\/ledger\.md/);
-  // a path that really leaves the repo and does not come back is still nothing to judge
-  const r = exemptWith(importWorld(t, { 'CLAUDE.md': (dir) => `@../${name(dir)}-other/docs/ledger.md\n` }));
+  const named = (what) => new RegExp(`${what.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&')}, which leaves the repository`);
+  const back = (dir) => `../${name(dir)}/docs/ledger.md`;
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': (dir) => `see @${back(dir)}\n` })), LEAVES);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': (dir) => `see @../${name(dir).toUpperCase()}/docs/ledger.md\n` })), LEAVES); // a case-insensitive file system
+  refused(exemptWith(importWorld(t, { 'sub/CLAUDE.md': (dir) => `see @../../${name(dir)}/docs/ledger.md\n` })), /sub\/CLAUDE\.md imports \.\.\/\.\.\/.*, which leaves the repository/);
+  // a chain: the importer that climbs is the imported file
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'docs/guide.md': (dir) => `@../../${name(dir)}/docs/ledger.md\n` })), /docs\/guide\.md imports \.\.\/\.\./);
+  // a path that leaves the repo and does not come back
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@../other/file.md\n' })), named('../other/file.md'));
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@../../elsewhere.md\n' })), LEAVES);
+  // a climb at any point of the path, not only at the start
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/../../x.md\n' })), LEAVES);
+  // a symlinked directory in the way does not hide the climb
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@linkdir/../../x.md\n' }, { linkdir: 'docs' })), LEAVES);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@up/x.md\n' }, { up: '..' })), /CLAUDE\.md imports up\/x\.md, which cannot be judged: a symlink leads out of the repository/);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/up/x.md\n' }, { 'docs/up': '../..' })), /which cannot be judged: a symlink leads out/);
+});
+
+test('a ../ that stays inside the repo is judged as the path it is: the listed document is a hit, another file is not', (t) => {
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/a.md\n', 'docs/a.md': '@../docs/ledger.md\n' })), /docs\/a\.md imports docs\/ledger\.md, a listed document/);
+  const r = exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/a.md\n', 'docs/a.md': '@../docs/other.md\n', 'docs/other.md': 'text\n' }));
   assert.equal(r.exempt, true, r.reason);
+  // a link back up and in again: followed per segment
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@a/b/../ledger.md\n', 'docs/sub/z.md': 'z\n' }, { 'a/b': '../docs/sub' })), /imports a\/ledger\.md \(a symlink to docs\/ledger\.md\)/);
 });
 
 test('an importer reached through a symlink is checked in the directory it was reached in, as well as where it really is', (t) => {

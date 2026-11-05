@@ -23,8 +23,6 @@
 //    increase and continue above the last row of the reviewed file, and each names a migration file (<number>_<name>.sql, a regular
 //    file in a directory called migrations) that exists in the REVIEWED head's tree. So a row carries no free text, and the only
 //    word in it that is not fixed was already reviewed as a file name. A row with a note, or any other line, needs a round.
-import { realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { posix } from 'node:path';
 import { DEFAULTS, docsExemptProblem } from './config.mjs';
 import { isAgentInstructionPath } from './doc-paths.mjs';
@@ -48,9 +46,10 @@ const quote = (text) => JSON.stringify(String(text).slice(0, 60));
 // document that is imported steers the agent like an instruction file, yet its added lines would skip review. The scan reads the REVIEWED
 // head's tree (instruction files cannot change after it: an unlisted file forces a round, and an instruction file can never be listed).
 // It over-matches on purpose (tokens in code spans, any case, both the importer's own and its target's directory), and fails closed:
-// whatever cannot be read or followed (a link that cycles, dangles or ends outside the repo, an oversized file) is "not exempt".
+// whatever cannot be read or followed (a link that cycles, dangles or ends outside the repo, an oversized file) is "not exempt". So is an
+// import the scan cannot judge purely inside the reviewed tree: a relative path that climbs above the repo root (lexically or through a
+// symlink), and an absolute or home path. Nothing is compared against the checkout's location, so no spelling of it can matter.
 const MAX_HOPS = 5;
-const MAX_REENTRIES = 4; // times one relative import may leave the repo and come back in
 const MAX_READS = 2000;
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_TOKENS = 5000;
@@ -87,8 +86,8 @@ function migrationNames(tree) {
 }
 
 // Walks `rel` (a posix path from the repo root, `.` and `..` allowed) through the tree, following a symlink at every segment, directories
-// included. -> { path: canonical tree path | null (nothing there), entry } | { outside: true } (a plain path that leaves the repo) | throws
-// Unjudgeable (a link that cycles, dangles, is absolute or ends outside the repo; ambiguous names).
+// included. -> { path: canonical tree path | null (nothing there), entry } | throws Unjudgeable (a link that cycles, dangles, is absolute or
+// ends outside the repo; ambiguous names; a path that climbs above the root).
 function resolveInTree(tree, rel, readBlob) {
   let segs = rel.split('/').filter((s) => s !== '' && s !== '.');
   let done = [];
@@ -96,10 +95,7 @@ function resolveInTree(tree, rel, readBlob) {
   while (segs.length > 0) {
     const next = segs.shift();
     if (next === '..') {
-      if (done.length === 0) {
-        if (follows > 0) throw new Unjudgeable('a symlink leads out of the repository');
-        return { outside: true, rest: ['..', ...segs] }; // `rest`: what is left to walk, starting from the directory above the root
-      }
+      if (done.length === 0) throw new Unjudgeable(follows > 0 ? 'a symlink leads out of the repository' : 'the path leaves the repository');
       done.pop();
       continue;
     }
@@ -138,7 +134,7 @@ function candidatesOf(token) {
 }
 
 // Does any instruction file of the reviewed head import (directly or by up to 5 hops) a document of `listed`? -> a reason | null.
-function importProblem({ toHead, root, listed, tree, home, o }) {
+function importProblem({ listed, tree, o }) {
   const listedLower = new Set(listed.map(lc));
   let reads = 0;
   const readBlob = (oid, path) => {
@@ -151,9 +147,6 @@ function importProblem({ toHead, root, listed, tree, home, o }) {
     }
     return text;
   };
-  let rootReal = root;
-  try { rootReal = realpathSync(root); } catch { /* the root as given */ }
-  const roots = [...new Set([root, rootReal].map((r) => posix.normalize(r.replace(/\\/g, '/')).replace(/\/$/, '')))];
 
   // One entry per file AND directory it was reached in: the same file behind two symlinked directories is read from each, because an
   // `@name` in it resolves against the directory it was reached in. The set of directories is bounded by the tree, the reads by MAX_READS.
@@ -165,16 +158,6 @@ function importProblem({ toHead, root, listed, tree, home, o }) {
     seen.add(key);
     queue.push({ path, canonical, depth });
   };
-  // A path that left the repo (`rest`, walked from the directory above the root) and came back in: -> the path from the root, or null.
-  const reenter = (rest) => {
-    for (const base of roots) {
-      const target = posix.normalize(`${base}/${rest.join('/')}`);
-      const inside = roots.find((r) => target === r || target.startsWith(`${r}/`));
-      if (inside) return target.slice(inside.length + 1);
-    }
-    return null;
-  };
-
   // The instruction files are the roots. One that is itself a link is followed; one that ends in a listed document makes that document
   // an instruction file, which it may never be.
   for (const p of tree.entries.keys()) {
@@ -186,14 +169,15 @@ function importProblem({ toHead, root, listed, tree, home, o }) {
       if (!(e instanceof Unjudgeable)) throw e;
       return `${p} cannot be judged: ${e.message}`;
     }
-    if (r.outside || r.path === null) return `${p} is a symlink that dangles or leads out of the repository (symlink targets cannot be judged)`;
+    if (r.path === null) return `${p} is a symlink that dangles or leads out of the repository (symlink targets cannot be judged)`;
     if (REGULAR_MODES.has(r.entry.mode) === false) continue;
     if (listedLower.has(lc(r.path))) return `${p} is read as an instruction file but is a symlink to ${r.path}, a listed document`;
     enqueue(p, r.path, 0);
   }
 
+  const leaves = (importer, token) => `${importer} imports ${token}, which leaves the repository, so it cannot be judged: this needs a review round`;
   const hit = (importer, lexical, canonical) => {
-    const direct = !lexical.startsWith('..') && listedLower.has(lc(lexical));
+    const direct = listedLower.has(lc(lexical));
     if (!direct && !(canonical !== null && listedLower.has(lc(canonical)))) return null;
     return `${importer} imports ${lexical}${direct ? '' : ` (a symlink to ${canonical})`}, a listed document: an imported document steers the agents like an instruction file`;
   };
@@ -204,49 +188,26 @@ function importProblem({ toHead, root, listed, tree, home, o }) {
     for (const m of text.matchAll(IMPORT_TOKEN)) {
       if (++tokens > MAX_TOKENS) return `${path} cannot be judged: too many @ tokens`;
       for (const written of candidatesOf(m[1])) {
+        // An absolute or home path is not a place inside the reviewed tree, so it cannot be judged there.
+        if (written.startsWith('/') || written === '~' || written.startsWith('~/')) return leaves(path, written);
         // Where the token may point, as paths from the repo root: the importer's directory as it was reached and as it really is.
-        const rels = [];
-        let absolute = null;
-        if (written.startsWith('~/')) {
-          if (!home) return `${path} imports ${written}, and HOME is unknown: it cannot be judged`;
-          absolute = `${home.replace(/\/$/, '')}/${written.slice(2)}`;
-        } else if (written.startsWith('/')) {
-          absolute = written;
-        }
-        if (absolute !== null) {
-          const target = posix.normalize(absolute);
-          const base = roots.find((r) => target === r || target.startsWith(`${r}/`));
-          if (!base) continue; // outside the repo: it cannot be a listed document
-          rels.push(target.slice(base.length + 1));
-        } else {
-          for (const dir of new Set([posix.dirname(path), posix.dirname(canonical)])) rels.push(`${dir === '.' ? '' : `${dir}/`}${written}`);
-        }
-        for (const start of rels) {
-          let rel = start;
-          let lexical = posix.normalize(rel);
-          let r = null;
-          // A relative path may leave the repo and re-enter it (`../<this directory>/docs/x.md`): follow it back in, a few times at most.
-          for (let again = 0; again <= MAX_REENTRIES; again++) {
-            const direct = hit(path, lexical, null);
-            if (direct) return direct;
-            try {
-              r = resolveInTree(tree, rel, readBlob);
-            } catch (e) {
-              if (!(e instanceof Unjudgeable)) throw e;
-              return `${path} imports ${written}, which cannot be judged: ${e.message}`;
-            }
-            if (!r.outside) break;
-            const back = reenter(r.rest);
-            if (back === null) break; // outside the repo for good: it cannot be a listed document
-            rel = back;
-            lexical = posix.normalize(rel);
-            r = null;
+        for (const dir of new Set([posix.dirname(path), posix.dirname(canonical)])) {
+          const rel = `${dir === '.' ? '' : `${dir}/`}${written}`;
+          const lexical = posix.normalize(rel);
+          if (lexical === '..' || lexical.startsWith('../')) return leaves(path, written);
+          const direct = hit(path, lexical, null);
+          if (direct) return direct;
+          let r;
+          try {
+            r = resolveInTree(tree, rel, readBlob); // the path as written: a symlink is followed at every segment, `..` included
+          } catch (e) {
+            if (!(e instanceof Unjudgeable)) throw e;
+            return `${path} imports ${written}, which cannot be judged: ${e.message}`;
           }
-          if (r === null || r.outside) continue;
           const found = hit(path, lexical, r.path);
           if (found) return found;
           // The file as it was reached (the importer's directory matters to what it imports), and where it really is.
-          if (r.path !== null && REGULAR_MODES.has(r.entry.mode) && depth < MAX_HOPS) enqueue(lexical.startsWith('..') ? r.path : lexical, r.path, depth + 1);
+          if (r.path !== null && REGULAR_MODES.has(r.entry.mode) && depth < MAX_HOPS) enqueue(lexical, r.path, depth + 1);
         }
       }
     }
@@ -308,15 +269,15 @@ function fileProblem(f, mode) {
  * -> { exempt: true, files: [paths], reviewedHead } | { exempt: false, files: [], reason, off? } (off: the feature is not configured, so the caller
  * should not mention it).
  */
-export function docsExemptFrom(state, { root, config, hash, home }) {
+export function docsExemptFrom(state, { root, config, hash }) {
   try {
-    return decide(state, { root, config, hash, home });
+    return decide(state, { root, config, hash });
   } catch (err) {
     return { exempt: false, files: [], reason: `the docs-only exemption could not be checked: ${oneLine(err)}` };
   }
 }
 
-function decide(state, { root, config, hash, home }) {
+function decide(state, { root, config, hash }) {
   const no = (reason, extra = {}) => ({ exempt: false, files: [], reason, ...extra });
   const o = { cwd: root };
   const last = state?.rounds?.at(-1);
@@ -400,7 +361,7 @@ function decide(state, { root, config, hash, home }) {
   if (problems.length === 0) {
     let importWhy;
     try {
-      importWhy = importProblem({ toHead, root, listed, tree: tree(), home: home === undefined ? homedir() : home, o });
+      importWhy = importProblem({ listed, tree: tree(), o });
     } catch (e) {
       if (!(e instanceof Unjudgeable)) throw e;
       importWhy = e.message;
