@@ -5,17 +5,19 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
-import { bump, cli, scenario, ymlFor, MERGE_SHA, PR } from './helpers/gate-env.mjs';
+import { bump, cli, scenario, ymlFor, LOCK_DIR, MERGE_SHA, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { holdBlock, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import { runShellAsync } from '../pipeline/lib/proc.mjs';
-import { findOrphanedLift, installRestoreOnSignal, parseTimeline, readEligibleHold, withHoldLifted } from '../pipeline/lib/hold.mjs';
+import { findOrphanedLift, installRestoreOnSignal, mergeLockName, parseTimeline, readEligibleHold, withHoldLifted } from '../pipeline/lib/hold.mjs';
+import { inspect, release, tryAcquire } from '../pipeline/lib/locks.mjs';
 
 const fakeHold = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-hold.mjs');
 const HOLD = { id: 'LE_hold1', login: 'jamila', at: '2026-11-05T09:00:00Z' };
@@ -842,4 +844,155 @@ test('recovery, Codex 1.1: a marker comment after the lift comment does not hide
     refused(s.go(), 'hold-recovery', /lifted needs-human hold LE_hold1 and died/);
     assert.deepEqual(s.st().labels, ['needs-human']);
   }
+});
+
+// ---- Codex round 1, finding 2: recovery disarms auto-merge before it puts the label back ----------------------------------------
+
+const DISARM = /^pr merge 12 --disable-auto$/;
+
+test('recovery, Codex 2: auto-merge is disarmed BEFORE the label goes back (both routes); the refusal does not claim anything about auto-merge being on', async () => {
+  for (const run of ['go', 'merge']) {
+    const s = world({ state: orphaned() });
+    const r = s[run]();
+    refused(r, 'hold-recovery', /label is back on the PR/);
+    assert.ok(s.idx(DISARM) >= 0, `${run}: disarmed`);
+    assert.ok(s.idx(DISARM) < s.idx(READD), `${run}: the disarm comes before the re-add: ${s.lines().join(' | ')}`);
+    assert.deepEqual(s.st().labels, ['needs-human']);
+    assert.ok(!('autoMergeDisarmFailed' in r.json), `${run}: ${r.stdout}`);
+  }
+});
+
+test('recovery, Codex 2: the PR MERGED after all (auto-merge fired before the disarm) => no label put back, this run refused plainly', async () => {
+  for (const run of ['go', 'merge']) {
+    const s = world({ state: { ...orphaned(), hooks: [{ match: '--disable-auto', phase: 'after', prState: 'MERGED' }] } });
+    const r = s[run]();
+    refused(r, 'hold-recovery', /MERGED after all/);
+    assert.equal(r.json.prMerged, true, r.stdout);
+    assert.ok(!s.lines().some((l) => READD.test(l)), `${run}: no re-add on a merged PR`);
+    assert.deepEqual(s.st().labels, []);
+    assert.deepEqual(s.mergeCalls(), []);
+  }
+});
+
+test('recovery, Codex 2: the disarm fails => the label still goes back, and the refusal says LOUDLY that auto-merge may still be armed (autoMergeDisarmFailed)', async () => {
+  for (const run of ['go', 'merge']) {
+    const s = world({ state: orphaned(), gh: { disableAutoCode: 1 } });
+    const r = s[run]();
+    refused(r, 'hold-recovery', /auto-merge may still be armed on #12: disable it by hand/);
+    assert.equal(r.json.autoMergeDisarmFailed, true, r.stdout);
+    assert.equal(r.json.holdRestored, true);
+    assert.deepEqual(s.st().labels, ['needs-human']);
+  }
+});
+
+test('recovery, Codex 2: the disarm fails AND the label cannot be put back => the restore failure is the refusal, still naming auto-merge', async () => {
+  const s = world({ state: { ...orphaned(), fail: { add: true } }, gh: { disableAutoCode: 1 } });
+  const r = s.go();
+  refused(r, 'hold-restore', /auto-merge may still be armed on #12/);
+  assert.equal(r.json.holdRestoreFailed, true);
+  assert.equal(r.json.autoMergeDisarmFailed, true);
+});
+
+// ---- Codex round 1, finding 3: a per-PR merge lock keeps recovery away from a live merge ----------------------------------------
+
+const lockName = mergeLockName('acme/widgets', PR);
+const takeLock = (pid = process.pid) => {
+  const got = tryAcquire(lockName, { dir: LOCK_DIR, pid, machineId: 'gate-env-test-machine' });
+  assert.equal(got.acquired, true);
+  return got.lock;
+};
+const deadPid = () => spawnSync(process.execPath, ['-e', '0']).pid; // (a finished child: its pid is gone)
+
+test('merge lock, Codex 3: a second run while a live process holds the lock is refused (merge-in-progress) and touches nothing (both routes)', async () => {
+  const lock = takeLock();
+  try {
+    for (const route of ['go', 'merge']) {
+      const s = world({ state: orphaned() });
+      const r = s[route]();
+      refused(r, 'merge-in-progress', /another `P merge` for #12 is running/);
+      assert.deepEqual(s.st().labels, [], `${route}: the label is not restored under a live merge`);
+      assert.deepEqual(s.wrote(), [], `${route}: nothing written: ${s.wrote().join(' | ')}`);
+      assert.ok(!s.lines().some((l) => DISARM.test(l)), `${route}: auto-merge not touched`);
+      assert.deepEqual(s.mergeCalls(), []);
+    }
+  } finally {
+    release(lock);
+  }
+});
+
+test('merge lock, Codex 3: a lock whose process is dead is taken over, recovery runs, and the lock is released afterwards', async () => {
+  const lock = takeLock(deadPid());
+  const s = world({ state: orphaned() });
+  const r = s.go();
+  refused(r, 'hold-recovery', /label is back on the PR/);
+  assert.deepEqual(s.st().labels, ['needs-human']);
+  assert.equal(inspect(lockName, { dir: LOCK_DIR }), null, 'released');
+  assert.notEqual(lock, null);
+});
+
+test('merge lock, Codex 3: a lock of ANOTHER machine is never taken over (refused, nothing touched)', async () => {
+  const other = tryAcquire(lockName, { dir: LOCK_DIR, pid: 1, host: 'another-host', machineId: 'another-machine-id' });
+  assert.equal(other.acquired, true);
+  try {
+    const s = world({ state: orphaned() });
+    refused(s.go(), 'merge-in-progress', /another/);
+    assert.deepEqual(s.wrote(), []);
+  } finally {
+    release(other.lock);
+  }
+});
+
+test('merge lock, Codex 3: a normal merge holds the lock to the end and releases it (merged, and refused)', async (t) => {
+  const s = world();
+  approve(t, s);
+  assertExit(s.go(), 0);
+  assert.equal(inspect(lockName, { dir: LOCK_DIR }), null);
+  const r = world({ state: orphaned() }).go();
+  assert.equal(r.json.error, 'hold-recovery');
+  assert.equal(inspect(lockName, { dir: LOCK_DIR }), null);
+});
+
+test('merge lock, Codex 3: the dry run reports merge-in-progress for a live lock and skips the orphan judgement; a dead lock is no blocker', async () => {
+  const lock = takeLock();
+  try {
+    const d = world({ state: orphaned() }).dry();
+    const kinds = d.json.blockers.map((b) => b.kind);
+    assert.ok(kinds.includes('merge-in-progress'), JSON.stringify(d.json.blockers));
+    assert.ok(!kinds.includes('hold-lift-orphan'), 'the orphan judgement is skipped under a live merge');
+    assert.equal(d.json.wouldMerge, false);
+  } finally {
+    release(lock);
+  }
+  const stale = takeLock(deadPid());
+  const s = world({ state: orphaned() });
+  const kinds = s.dry().json.blockers.map((b) => b.kind);
+  assert.ok(!kinds.includes('merge-in-progress'), kinds.join());
+  assert.ok(kinds.includes('hold-lift-orphan'));
+  assert.deepEqual(s.wrote(), [], 'the dry run writes nothing');
+  assert.notEqual(inspect(lockName, { dir: LOCK_DIR }), null, 'and never takes the lock');
+  release(stale);
+});
+
+// ---- Codex round 1, finding 5: the dry run reports what the real recovery would refuse on --------------------------------------
+
+test('dry run, Codex 5: a lift comment with a timeline that cannot be trusted is blocker hold-lift-unverified (the real run refuses hold-recovery)', async () => {
+  const state = { ...orphaned({ state: { labels: ['needs-human'] } }), timeline: [] };
+  const d = world({ state }).dry();
+  const b = d.json.blockers.find((x) => x.kind === 'hold-lift-unverified');
+  assert.ok(b, JSON.stringify(d.json.blockers));
+  assert.match(b.detail, /could not check whether an earlier --owner-go run left a needs-human hold lifted/);
+  assert.equal(d.json.wouldMerge, false);
+});
+
+test('dry run, Codex 5: unreadable comments are a blocker for --owner-go (its real run refuses) but not for the gated route (it tolerates only that)', async () => {
+  assert.ok(!world({ state: { fail: { listComments: 1 } } }).dry().json.blockers.some((b) => b.kind === 'hold-lift-unverified'), 'one failed read is retried, as in the real run');
+  const go = world({ state: { fail: { listComments: 9 } } }).dry();
+  assert.ok(go.json.blockers.some((b) => b.kind === 'hold-lift-unverified' && /comments could not be read/.test(b.detail)), JSON.stringify(go.json.blockers));
+  const s = world({ state: { fail: { listComments: 9 } } });
+  const gated = cli(['merge', '--pr', String(PR), '--dry-run'], { dir: s.repo.dir, fake: s.fake, env: s.env });
+  assert.ok(!gated.json.blockers.some((b) => b.kind === 'hold-lift-unverified'), JSON.stringify(gated.json.blockers));
+  // ...but an untrustworthy timeline blocks the gated dry run as well
+  const t2 = world({ state: { ...orphaned({ state: { labels: ['needs-human'] } }), timeline: [] } });
+  const g2 = cli(['merge', '--pr', String(PR), '--dry-run'], { dir: t2.repo.dir, fake: t2.fake, env: t2.env });
+  assert.ok(g2.json.blockers.some((b) => b.kind === 'hold-lift-unverified'), JSON.stringify(g2.json.blockers));
 });

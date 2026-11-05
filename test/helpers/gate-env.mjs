@@ -4,7 +4,8 @@
 // split over several files only so node runs them in parallel: each CLI call costs about a second.
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './tmprepo.mjs';
@@ -14,6 +15,8 @@ import { contentHash, mergeBase, treeFingerprint } from '../../pipeline/lib/git.
 
 const bin = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'pipeline', 'bin', 'pipeline.mjs');
 export const PR = 12;
+// The merge commands take a per-PR lock: the CLI runs get a private lock directory and machine id, never the developer's real ones.
+export const LOCK_DIR = mkdtempSync(join(tmpdir(), 'gate-env-locks-'));
 export const AGENT_LOG = 'docs/agent-log.md';
 export const STEPS = ['install', 'typecheck', 'lint', 'unit', 'build'];
 export const MERGE_SHA = 'c'.repeat(40);
@@ -26,7 +29,7 @@ export const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
 // running this inside a pipeline session cannot change the outcome.
 export function cli(args, { dir, fake, env = {} }) {
   // PIPELINE_MERGEABLE_PAUSE_MS shortens the 2 s wait between `mergeable: UNKNOWN` re-reads (it can never lengthen it).
-  const base = { ...process.env, PIPELINE_MERGEABLE_PAUSE_MS: '1', ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
+  const base = { ...process.env, PIPELINE_MERGEABLE_PAUSE_MS: '1', PIPELINE_LOCK_DIR: LOCK_DIR, PIPELINE_MACHINE_ID: 'gate-env-test-machine', ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
   for (const k of ['PIPELINE_OFF', 'PIPELINE_ADMIN', 'PIPELINE_MERGE_WAIT_MS', 'PIPELINE_MERGE_POLL_MS']) if (!(k in env)) delete base[k];
   const r = spawnSync(process.execPath, [bin, ...args], { cwd: dir, env: base, encoding: 'utf8', timeout: 120_000 });
   let json = null;

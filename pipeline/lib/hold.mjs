@@ -12,8 +12,10 @@
 // no merge (the run was killed) is put right by recoverOrphanedLift. A signal kills the merge command's process group and disarms
 // auto-merge BEFORE the label goes back, so a merge cannot land on a PR that has the hold again.
 import { createHash } from 'node:crypto';
+import os from 'node:os';
 import { holdBlock } from '../hooks/lib/owner-go.mjs';
 import { blockingLabelsOf, labelNames, validLabels } from './finalgate.mjs';
+import { inspect, isPidAlive, machineId, release, tryAcquire } from './locks.mjs';
 import { killTree } from './proc.mjs';
 import { MARKERS } from './render.mjs';
 import { parseEvent, postEvent } from './run-events.mjs';
@@ -157,6 +159,47 @@ export function installRestoreOnSignal({ restore, proc = process, exit = (code) 
   return () => handlers.forEach(([signal, handler]) => proc.removeListener(signal, handler));
 }
 
+// ---- the merge lock (Codex round 1, finding 3) --------------------------------------------------
+// Recovery cannot tell a dead run from one that is merging right now, so every `P merge` of a PR holds a per-repo-and-PR lock (lib/locks.mjs) from before recovery to the
+// end (the wait for MERGED included) and recovery changes labels only while holding it. A lock held by a live process refuses the second run (`merge-in-progress`); one whose
+// process is dead is taken over by tryAcquire. RESIDUAL: the lock is per machine (a run on another machine is not seen); a lock of another machine is never taken over, so it
+// refuses until that run ends or the lock directory entry is removed by hand.
+export const mergeLockName = (slug, pr) => `merge-${String(slug).replace(/\//g, '__').replace(/[^A-Za-z0-9._-]/g, '_')}-pr${Number(pr)}`;
+const lockDirOf = (env) => env?.PIPELINE_LOCK_DIR || undefined;
+
+// The holder of a live merge lock for this PR, or null (no lock, or its process is gone). Read-only (the dry run). An unfinished lock counts as held.
+export function mergeInProgress({ gh, pr, env = {} }) {
+  const owner = inspect(mergeLockName(gh.repo().slug, pr), { dir: lockDirOf(env) });
+  if (owner === null) return null;
+  if (!owner.incomplete) {
+    const machine = machineId();
+    const local = owner.host === os.hostname() || (Boolean(machine) && owner.machineId === machine);
+    if (local && !isPidAlive(owner.pid)) return null;
+  }
+  return owner;
+}
+
+const holderText = (owner) => (owner?.pid ? `pid ${owner.pid} on ${owner.host}, since ${owner.startedAt}` : 'an unknown holder');
+
+// Runs fn() holding the lock; a lock held by a live process (or one that cannot be taken) refuses with `merge-in-progress` and changes nothing.
+export async function withMergeLock({ gh, pr, env = {}, refuse, fn }) {
+  let got;
+  try {
+    got = tryAcquire(mergeLockName(gh.repo().slug, pr), { dir: lockDirOf(env) });
+  } catch (err) {
+    got = { acquired: false, owner: null, error: err };
+  }
+  if (!got.acquired) {
+    const why = got.error ? `the merge lock for #${pr} could not be taken (${msg(got.error)})` : `another \`P merge\` for #${pr} is running (${holderText(got.owner)})`;
+    return refuse('merge-in-progress', [`${why}: nothing was changed`], { mergeInProgress: true });
+  }
+  try {
+    return await fn();
+  } finally {
+    try { release(got.lock); } catch { /* a lock lost meanwhile is not ours to report */ }
+  }
+}
+
 // ---- recovery (rev 4 item 4) --------------------------------------------------------------------
 
 // A lift comment (ours, append-only) for the newest hold that is newer than that hold, with the PR open and the label gone: a run that lifted the hold died before
@@ -215,11 +258,12 @@ export function restoreLabel(gh, pr) {
   }
 }
 
-// The real-run recovery: null (nothing to recover) or the refusal to return. `refuse` is the command's own.
+// The real-run recovery: null (nothing to recover) or the refusal to return. `refuse` is the command's own; `disableAuto()` (the synchronous disableAutoMerge: true when auto-merge is off) runs
+// before the label goes back, and a PR that turns out MERGED is left alone (`prMerged`).
 // The comments are read twice at most (strict only; one pause, shortened by PIPELINE_HOLD_RETRY_MS). `strict` (--owner-go): comments that stay unreadable refuse (an
 // interrupted lift cannot be ruled out). The gated route (strict false) tolerates ONLY a failed comments read (its run-record guard reads the same comments and fails closed by
 // itself); a lift comment present with a timeline / PR that cannot be verified refuses in BOTH routes.
-export async function recoverOrphanedLift({ gh, pr, refuse, strict = true, env = {}, sleep = defaultSleep }) {
+export async function recoverOrphanedLift({ gh, pr, refuse, strict = true, env = {}, sleep = defaultSleep, disableAuto = () => true }) {
   let comments;
   let readFailure = null;
   for (let attempt = 0; attempt < (strict ? 2 : 1); attempt += 1) {
@@ -239,11 +283,25 @@ export async function recoverOrphanedLift({ gh, pr, refuse, strict = true, env =
   const { orphan, unverified } = findOrphanedLift({ gh, pr, comments });
   if (unverified !== null) return refuse('hold-recovery', [`#${pr}: could not check whether an earlier --owner-go run left a needs-human hold lifted (${unverified}): nothing was merged`]);
   if (orphan === null) return null;
-  const failed = restoreLabel(gh, pr);
-  if (failed !== null) {
-    return refuse('hold-restore', [`COULD NOT put needs-human back on PR #${pr} (${failed}): an earlier --owner-go run lifted hold ${orphan.hold} and died. Add the label by hand; nothing was merged`], { holdRestored: false, holdRestoreFailed: true });
+  // The dead run may have armed auto-merge (the project's merge command can be `gh pr merge --auto`): disarm it, synchronously, BEFORE the label goes back, then look at the PR again.
+  let disarmed = false;
+  try {
+    disarmed = disableAuto() !== false;
+  } catch { /* reported below */ }
+  let merged = false;
+  try {
+    merged = gh.prView(pr, PR_VIEW)?.state === 'MERGED';
+  } catch { /* unreadable: put the label back */ }
+  if (merged) {
+    return refuse('hold-recovery', [`#${pr}: an earlier \`P merge --owner-go\` lifted needs-human hold ${orphan.hold} and died, and the PR has MERGED after all (auto-merge was still armed). The label was not put back; this run merged nothing`], { prMerged: true, holdRestored: false });
   }
-  return refuse('hold-recovery', [`#${pr}: an earlier \`P merge --owner-go\` lifted needs-human hold ${orphan.hold} and died before it merged; the label is back on the PR. ${RESTORE_NOTE}. Nothing was merged`], { holdRestored: true, holdRestoredNote: RESTORE_NOTE });
+  const armed = disarmed ? {} : { autoMergeDisarmFailed: true };
+  const failed = restoreLabel(gh, pr);
+  const armedNote = disarmed ? '' : `. WARNING: auto-merge may still be armed on #${pr}: disable it by hand (\`gh pr merge ${pr} --disable-auto\`)`;
+  if (failed !== null) {
+    return refuse('hold-restore', [`COULD NOT put needs-human back on PR #${pr} (${failed}): an earlier --owner-go run lifted hold ${orphan.hold} and died. Add the label by hand; nothing was merged${armedNote}`], { holdRestored: false, holdRestoreFailed: true, ...armed });
+  }
+  return refuse('hold-recovery', [`#${pr}: an earlier \`P merge --owner-go\` lifted needs-human hold ${orphan.hold} and died before it merged; the label is back on the PR. ${RESTORE_NOTE}. Nothing was merged${armedNote}`], { holdRestored: true, holdRestoredNote: RESTORE_NOTE, ...armed });
 }
 
 // ---- the lift -----------------------------------------------------------------------------------
