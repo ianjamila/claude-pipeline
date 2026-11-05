@@ -447,3 +447,28 @@ test('M: the pipeline CLI run after a command whose writes are unknown is not re
   const other = files('eval "$X"; bash PIPELINE_ADMIN.sh', fakeFs(PROJ, { 'PIPELINE_ADMIN.sh': 'echo hi\n' }, DIRS));
   assert.equal(other.decision, 'deny');
 });
+
+// Why (issue #161, after #145): eaglewatch's scripts/verify.mjs has a COMMENT naming `~/.claude/pipeline-state/verify-runs.jsonl` (its run history, a log the guard has no reason to protect). #145's
+// rule "program text that names a config root is a transcript reference" read that comment, and with the program's ordinary writes it was refused. Only the owner-go records and real transcripts
+// live under the config dir and need protecting; the rest of pipeline-state/ does not.
+test('N: a program naming a non-owner-go pipeline-state file (verify-runs.jsonl) is not refused; owner-go records and transcripts still are', () => {
+  const COMMENT = '// Each run also appends one JSON line to ~/.claude/pipeline-state/verify-runs.jsonl (VERIFY_RUN_HISTORY=<path> moves it, =off or CI disables it; scripts/lib/verify-run-history.mjs)\n';
+  const JS = "const ok = true;\nfs.writeFileSync('.verify/report.json', '{}');\n";
+  const run = (prog) => files('node scripts/verify.mjs --quick', fakeFs(PROJ, { 'scripts/verify.mjs': prog }, ['scripts']));
+  assert.equal(run(`${COMMENT}${JS}`).decision, 'allow');
+  for (const named of ['/home/u/.claude/pipeline-state/verify-runs.jsonl', '$HOME/.claude/pipeline-state/verify-runs.jsonl', '~/.claude-eaglewatch/pipeline-state/runs.log']) {
+    assert.equal(run(`// history: ${named} (moved by VERIFY_RUN_HISTORY)\nrun(x);\n${JS}`).decision, 'allow', named);
+  }
+  // the owner-go records stay protected, named beside an ordinary write
+  for (const bad of ["fs.writeFileSync('/home/u/.claude/pipeline-state/owner-go/pr-1.json', x)", "fs.writeFileSync(os.homedir() + '/.claude/pipeline-state/owner-go/pr-1.json', x)",
+    "// ~/.claude/pipeline-state/verify-runs.jsonl\nfs.writeFileSync('/home/u/.claude/pipeline-state/owner-go/pr-1.json', x)", "// ~/.claude/pipeline-state/owner-go (records)\nfs.writeFileSync(f(), x)",
+    // (a name that climbs out of pipeline-state/ is not a file in it)
+    "// ~/.claude/pipeline-state/../settings.json (x)\nfs.writeFileSync(f(), x)"]) {
+    assert.equal(run(`${JS}${bad}\n`).decision, 'deny', bad);
+  }
+  // a real transcript path, as pipeline/lib/paths.mjs defines it, stays protected next to the same comment
+  for (const bad of ["fs.appendFileSync('/home/u/.claude/projects/-home-u-proj/0a1b2c.jsonl', x)", "// ~/.claude/projects/-home-u-proj/0a1b2c.jsonl\nfs.writeFileSync(f(), x)",
+    "fs.writeFileSync(path.join(os.homedir(), '.claude', 'projects', '-home-u-proj', 'a.jsonl'), x)"]) {
+    assert.equal(run(`${COMMENT}${JS}${bad}\n`).decision, 'deny', bad);
+  }
+});

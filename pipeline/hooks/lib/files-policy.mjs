@@ -1095,7 +1095,12 @@ function makeMatchers(ctx) {
   // (a quoted piece with an optional path tail, or the same glued by refVariants to a call/slash with no quote: Path.home()/.claude/projects/-repo)
   const HOME_CLAUDE_PIECE = /['"`]\/?\.claude[\w\-]*(?:\/|['"`])|(?<=[)\]\s])\/\.claude[\w\-]*\//i;
   const homeClaudeText = (v) => homeClaudeRes.some((re) => re.test(v)) || (HOME_CLAUDE_PIECE.test(v) && HOME_LOOKUP.test(v));
-  const envTranscriptText = (v) => {
+  // #161: a file directly in a config dir's pipeline-state/ other than the owner-go records (the run history verify.mjs appends to, verify-runs.jsonl) is no transcript, so the config dir in front of it
+  // is no reference to a transcript folder: the path is left out of the text before it is judged. (owner-go, a name with a slash after it -- pipeline-state/x/../../projects -- and `..` stay in the
+  // text; the owner-go records themselves are protected by rootRes, not here.)
+  const pipelineStateFile = new RegExp(`(?<![\\w.~\\-/])(?:[\\w.~\\-/]*/)?(?:\\.claude[\\w\\-]*${ctx.transcriptRoots.map((r) => '|' + escapeRe(r)).join('')})/pipeline-state/(?!owner-go(?![\\w.\\-]))[\\w\\-][\\w.\\-]*(?=[\\s'"\`)\\]};,:]|$)`, ctx.ci ? 'gi' : 'g');
+  const envTranscriptText = (text) => {
+    const v = text.replace(pipelineStateFile, ' ');
     const call = /[()[\]]/.test(v);
     if (call && (v.includes('CLAUDE_CONFIG_DIR') || rootWordText.some((re) => re.test(v)) || homeClaudeText(v))) return true;
     if (!/(?<![\w])projects(?![\w])/i.test(v) || !/\.jsonl(?![\w])/i.test(v)) return false;
