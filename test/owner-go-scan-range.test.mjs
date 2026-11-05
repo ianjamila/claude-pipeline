@@ -237,6 +237,8 @@ const stubGh = (s) => ({
   checks: () => [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }],
   pullFiles: () => s.prFiles,
   repo: () => ({ slug: 'acme/widgets', host: 'github.com' }),
+  viewer: () => 'me', // review-complete: no comment of ours, no history
+  listComments: () => [],
 });
 
 test('evaluateOwnerGo returns ownerItems, the item lines and areas from ONE list, plus the range it scanned', async () => {

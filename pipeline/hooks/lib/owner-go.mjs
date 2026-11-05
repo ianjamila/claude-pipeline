@@ -4,7 +4,8 @@
 // owner-go recorder (the UserPromptSubmit hook hooks/owner-go.mjs, which fires for the owner's typed prompts and for harness turns, which #128 screens out) writes
 // down each owner prompt that STARTS with "merge", bound to what the reply right before it asked for:
 //   `Head <sha12> · items <digest> · repo <owner/name>` lines + `🔀 Ready to merge #N — say "merge"` (skills/ship, Owner-merge approval). The block may also carry an
-//   `Areas …` line (protected areas) and a `Hold … by … at …` line with the lift wording on the 🔀 line (the needs-human hold the "merge" lifts): see presentedRequests.
+//   `Areas …` line (protected areas), a `Hold … by … at …` line with the lift wording on the 🔀 line (the needs-human hold the "merge" lifts) and, for one PR, a `Rulings <digest12>` header with
+//   its rows (the dismissals Claude or the arbiter made on BLOCKING / security items). The order, top to bottom: Rulings, Areas, Hold, Head, 🔀. See presentedRequests.
 // `P merge` then needs a record for exactly that repository, PR, head and owner-item set; the guard needs one (for that repository and
 // PR, in that session) before a direct `gh pr merge` / the repo's merge command in an owner_approval: chat repo. Phase 3b: the repository
 // is part of the request, so a "merge" said for #N of one repository never approves #N of another (a fork, a mirror, a vendored copy
@@ -143,6 +144,16 @@ const liftsHold = (rest, prs) => {
   const m = LIFT_LINE.exec(rest.trim());
   return m !== null && m[2] === (prs.length === 1 ? LIFT_PHRASE.one : LIFT_PHRASE.many); // (the PR numbers in m[1] are the text `prs` was read from)
 };
+// The rulings block (plan 2026-11-05-claude-rulings, E11): `Rulings <digest12>` then one `<item id> · …` row per dismissed BLOCKING / security item (P merge --dry-run --owner-go prints it).
+// presentedRequests binds it only as ONE contiguous run of rows directly under the header and directly above the Areas / Hold / Head lines. Every other shape binds no rulings
+// (the record then carries none, which fails closed against a live digest): header-less rows, a header with no rows, prose between, a second header or run of rows above it.
+const RULINGS_HEADER = /^\s*Rulings\s+[0-9a-f]{12}\s*$/;
+const RULINGS_ROW = /^\s*R\d+-[A-Za-z]\d+\s+·\s+.+$/;
+// What the record stores for the block and P merge compares: sha256 of its non-blank lines (each trimmed, runs of white space as one space) joined by a newline; 'none' for no block.
+export const rulingsBlockDigest = (text) => {
+  const lines = String(text ?? '').split(/\r?\n/).map((l) => l.trim().replace(/\s+/g, ' ')).filter((l) => l !== '');
+  return lines.length === 0 ? 'none' : createHash('sha256').update(lines.join('\n')).digest('hex');
+};
 export function presentedRequests(text) {
   const none = (prs) => ({ prs, requests: [] });
   // A whitespace-only line carries no content, so it is transparent: "directly above" means the next NON-BLANK line above (owner-reported miss, EW #1659: a blank line between the
@@ -161,6 +172,23 @@ export function presentedRequests(text) {
     if (!h && !a && !o) break;
     block.unshift({ h, a, o });
   }
+  // The rulings block, if any, sits directly above the Areas / Hold / Head lines: rows walked up while contiguous, then exactly one header. A run of rows with no header directly above, a
+  // header with no rows, prose in between, or a second header / run above the one found binds nothing (rulings stay absent; the lines are then plain prose to every rule below).
+  let rulings = null;
+  {
+    const lineOk = (l) => l !== undefined && !l.includes('\r');
+    let k = i;
+    while (k >= 0 && lineOk(lines[k]) && RULINGS_ROW.test(lines[k])) k--;
+    if (k < i && k >= 0 && lineOk(lines[k]) && RULINGS_HEADER.test(lines[k])) {
+      const above = lines[k - 1];
+      const stacked = lineOk(above) && (RULINGS_ROW.test(above) || RULINGS_HEADER.test(above)); // a duplicate header, or rows apart from this block
+      if (!stacked) {
+        rulings = rulingsBlockDigest(lines.slice(k, i + 1).join('\n'));
+        i = k - 1;
+      }
+    }
+  }
+  if (rulings !== null && prs.length !== 1) return none(prs); // a rulings block belongs to ONE PR: with several on the 🔀 line the whole reply binds nothing
   if (i >= 0 && AREAS_START.test(lines[i])) return none(prs); // an Areas line of any other shape against the block: malformed
   if (lines.slice(0, i + 1).some((l) => HOLD_START.test(l))) return none(prs); // a canonical-prefix Hold line outside the block (prose between it and its Head, an earlier block's): review note 6
   const bound = new Map();
@@ -182,7 +210,7 @@ export function presentedRequests(text) {
     const pr = h[1] ? Number(h[1]) : prs.length === 1 ? prs[0] : null;
     if (pr === null || !prs.includes(pr)) continue;
     const areas = above ? createHash('sha256').update(`Areas ${above[2].trim().split(/\s+/).join(' ')}`).digest('hex') : null;
-    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[5] ? h[5].toLowerCase() : null, ...(areas ? { areas } : {}), ...(hasHold ? { hold: hasHold.id, holdBlock: holdDigest(hasHold) } : {}) });
+    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[5] ? h[5].toLowerCase() : null, ...(areas ? { areas } : {}), ...(rulings !== null ? { rulings } : {}), ...(hasHold ? { hold: hasHold.id, holdBlock: holdDigest(hasHold) } : {}) });
   }
   // An Areas line that no Head line below it takes (a second one in a row, one against the 🔀 line) is a malformed block; so is a Hold line no Head line right below takes.
   const takesHead = (j) => block[j + 1]?.h || (block[j + 1]?.o && block[j + 2]?.h);
@@ -734,13 +762,17 @@ function ownedBy(list, { grant = false, home } = {}) {
 // that hold id AND carry the digest of the Hold block the owner was shown (holdDigest), compared both ways: an old record without them (shown before Hold lines) never lifts a hold, a
 // record for hold X never covers hold Y, a record with a hold never approves a PR that has none now. `hold: null` (only the gated route, which lifts no hold) compares nothing;
 // `undefined` (absent, a caller that forgot) means "no hold" and fails closed.
-const approvalsFor = ({ repo, pr, head, items, areas, hold, ...opts }) => {
+// `rulings` (plan 2026-11-05-claude-rulings E11): the sha256 the live scan holds for the Rulings block (rulingsBlockDigest, 'none' without one); the record's `rulings` must equal it, an absent
+// field reading as 'none', so a record without a block never covers a PR with rulings and the other way round. `rulings: null` (only the gated route) compares nothing.
+const approvalsFor = ({ repo, pr, head, items, areas, hold, rulings, ...opts }) => {
   const key = repoKey(repo);
   if (key === null || !/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return [];
   const wantAreas = areas === null ? null : areasDigest(areas);
+  const wantRulings = rulings === null ? null : (rulings ?? 'none'); // null = this route does not bind the rulings block; absent / undefined = 'none' (fails closed against a live digest)
   const wantHold = hold === null ? null : { id: hold ? hold.id : 'none', digest: holdDigest(hold) }; // (undefined = no hold)
   return readApprovals(opts).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items
     && (wantAreas === null || (typeof q.areas === 'string' ? q.areas : 'none') === wantAreas)
+    && (wantRulings === null || (typeof q.rulings === 'string' ? q.rulings : 'none') === wantRulings)
     && (wantHold === null || ((typeof q.hold === 'string' ? q.hold : 'none') === wantHold.id && (typeof q.holdBlock === 'string' ? q.holdBlock : 'none') === wantHold.digest))));
 };
 export function approvalGap(q) {

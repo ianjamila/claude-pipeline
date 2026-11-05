@@ -722,7 +722,7 @@ const byIdAsc = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
 // -> { rows: [line], count }. Sorted by id; a by:'cache' copy is skipped when an item with the same fingerprint is already listed (a ruling
 // that was carried into later rounds is one dismissal, not several).
-export function rulingsInventory(state) {
+function inventoryEntries(state) {
   const dismissed = allItems(state)
     .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && isCriticalItem(i))
     .map((i) => ({ item: i, id: String(i.id) }))
@@ -735,12 +735,19 @@ export function rulingsInventory(state) {
     if (fp !== null) listed.add(fp);
     kept.push(entry);
   }
-  const rows = kept.sort(byIdAsc).map(({ item, id }) => [
+  return kept.sort(byIdAsc).map(({ item, id }) => ({ item, id, row: [
     id, item.final.decision, item.bucket, asciiLine(item.category, 40) || '-', `by ${byLabel(item)}`, `content ${rulingContentDigest([item])}`,
     `"${asciiLine(String(item.title ?? '').replace(/"/g, "'"), TITLE_MAX)}"`, `why: ${asciiLine(item.final.reason, WHY_MAX)}`,
-  ].join(' · '));
+  ].join(' · ') }));
+}
+
+export function rulingsInventory(state) {
+  const rows = inventoryEntries(state).map((e) => e.row);
   return { rows, count: rows.length };
 }
+
+// The inventory rows of the dismissals CLAUDE made (final.by 'claude', or a cached copy carrying final.claude): [{ id, row }]. The gated merge route counts each as an owner item (E3).
+export const claudeRulingRows = (state) => inventoryEntries(state).filter((e) => isClaudeRuled(e.item)).map(({ id, row }) => ({ id, row }));
 
 // sha256 hex of the rows joined by a newline; 'none' when there are no rulings.
 export function rulingsDigest(state) {

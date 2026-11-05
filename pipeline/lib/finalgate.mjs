@@ -22,12 +22,13 @@ import { toPosix } from './paths.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
-import { ownerRuledItems, reviewValidFor } from './triage.mjs';
+import { claudeRulingRows, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory } from './triage.mjs';
+import { readPublished, reviewContentHash as stateContentHash } from './review-publish.mjs';
 import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
 import { skipOf } from './verify-steps.mjs';
 import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
-import { ownerItemsDigest } from '../hooks/lib/owner-go.mjs';
+import { ownerItemsDigest, rulingsBlockDigest } from '../hooks/lib/owner-go.mjs';
 
 export const GATE_FILE = 'final-gate.json';
 export const BLOCKING_LABELS = Object.freeze(['needs-human', 'awaiting-review', 'pipeline-blocked']);
@@ -532,6 +533,9 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
     }
     exempt = ex;
   }
+  // What keeps a review from completing although its items read as resolved (a Claude-ruled follow-up with no issue, a fix made outside the named file nobody confirmed).
+  const eligibility = reviewEligibilityProblems(state);
+  if (eligibility.length > 0) return check('review', false, eligibility.join('; '));
   const exemptNote = exempt ? `; docs-only exemption (review.docs_exempt_paths): ${exempt.files.join(', ')} added after the reviewed head ${exempt.reviewedHead.slice(0, 12)}` : '';
   // A round past review.max_rounds must carry the owner's extra-round grant, re-proved here from the owner's record and its marker (never
   // from the state alone). A grant lets a round run; it is no merge authority, so it is shown but never an owner-merge item.
@@ -541,6 +545,15 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   // owner_approval: chat: an item the owner ruled in chat (an original or a later round's cached copy) never clears the merge by
   // itself. It stays visible here and counts as ownerMerge, so the owner's "merge" for this head is still needed.
   const ruled = ownerRuledItems(state);
+  // E3: a dismissal CLAUDE made (not the arbiter, the judge or a test) is an owner item too: the owner's "merge" is bound to its inventory row, so a changed ruling needs a new word.
+  const claudeRulings = claudeRulingRows(state);
+  if (claudeRulings.length > 0) {
+    const claudeItems = claudeRulings.map(({ id, row }) => `review-ruling ${id} ${createHash('sha256').update(row).digest('hex').slice(0, 12)}`);
+    const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`);
+    const ruledNote = ruled.length > 0 ? `; ${ruled.length} owner-ruled item(s), owner-merge: ${shown.join('; ')}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}` : '';
+    return check('review', true, `review valid for content ${short(hash)}${exemptNote}${ruledNote}; ${claudeRulings.length} Claude-made dismissal(s), owner-merge: ${claudeRulings.slice(0, OWNER_RULED_SHOWN).map((c) => c.id).join(', ')}${claudeRulings.length > OWNER_RULED_SHOWN ? ', ...' : ''}${grantNote}`,
+      ruled.length + claudeRulings.length, [...ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`), ...claudeItems]);
+  }
   if (ruled.length > 0) {
     const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('; ');
     return check('review', true, `review valid for content ${short(hash)}${exemptNote}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}${grantNote}`, ruled.length,
@@ -709,7 +722,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
 // label route has no chat "merge" for them). In chat mode an owner item (a hard-stop or integrity item the owner merges in chat) does NOT
 // fail it: it is returned as `ownerItems` / `areas`, and `P merge --owner-go` requires the owner's record for exactly that digest and
 // the Areas block shown for those areas (hooks/lib/owner-go.mjs approvalGap). A record for `items none` never covers a diff with items.
-export const OWNER_GO_CHECKS = Object.freeze(['pr-open', 'labels', 'ci', 'scan-range', 'hardstops', 'integrity', 'owner-items']);
+export const OWNER_GO_CHECKS = Object.freeze(['pr-open', 'labels', 'ci', 'scan-range', 'hardstops', 'integrity', 'review-complete', 'owner-items']);
 
 const NAMED_SHOWN = 3;
 // GitHub's pulls/{n}/files returns at most this many files, however many pages are read.
@@ -799,6 +812,69 @@ export function ownerItemsCheck({ items, hardstops, integrity, label }) {
   return check('owner-items', true, items.length === 0 ? 'none' : `${shown}: the owner's "merge" must be bound to them (items ${ownerItemsDigest(items)})`);
 }
 
+// ---- review-complete (plan 2026-11-05-claude-rulings E5) -------------------------------------------------------------------------------
+// The owner-go route never read the review state. Once the review skill ran for this PR it must have ENDED (review-complete), with this machine's state equal to the one the PR holds, and with every
+// dismissal the owner is shown. Work that never ran the review skill (no review comment by us, no local state for the PR) passes unchanged. Grants and the Fable lane are NOT re-proved here: the
+// marker for this very content plus state equality already prove review-complete checked them.
+const NO_RULINGS = Object.freeze({ block: '', digest: 'none', blockDigest: 'none', count: 0 });
+const stripRulings = ({ rulings, ...rest }) => rest;
+const rulingsOf = (state) => {
+  const block = rulingsBlock(state);
+  return { block, digest: rulingsDigest(state), blockDigest: rulingsBlockDigest(block), count: rulingsInventory(state).count };
+};
+
+export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep = defaultSleep, env }) {
+  const fail = (detail, rulings = NO_RULINGS) => ({ ...check('review-complete', false, detail), rulings });
+  const RUN = `run \`pipeline review-complete --pr ${pr}\``;
+  let state;
+  try {
+    state = loadState(root, { cleanup: false });
+  } catch (err) {
+    return fail(`the local review state is unreadable (${String(err?.message ?? err).slice(0, 160)}): restore it with \`pipeline state show --pr ${pr}\``);
+  }
+  const local = state && state.pr === pr ? state : null;
+  let published = readPublished(gh, pr);
+  if (!published.history) {
+    if (local === null) return { ...check('review-complete', true, 'no review history on this PR and no local review state: the review skill never ran'), rulings: NO_RULINGS };
+    return fail(`this checkout holds a review state for #${pr} but the PR has no triage or review-complete comment from us: ${RUN}`, rulingsOf(local));
+  }
+  if (local === null) return fail(`this PR has review history but this checkout holds no review state for it: finish the review here, or restore it with \`pipeline state show --pr ${pr}\``);
+  const rulings = rulingsOf(local);
+  let liveHash = hash;
+  if (!liveHash) {
+    try {
+      liveHash = localContentHash(root, config);
+    } catch (err) {
+      return fail(`cannot compute the content hash: ${String(err?.message ?? err).slice(0, 160)}`, rulings);
+    }
+  }
+  if (!reviewValidFor(local, liveHash) && !docsExemptFrom(local, { root, config, hash: liveHash }).exempt) {
+    return fail(`no clean review round covers the current content (${short(liveHash)}), or findings are unresolved: run another codex-review round, then ${RUN}`, rulings);
+  }
+  const mine = stateContentHash(local);
+  // Everything that depends on what GitHub lists; judged again once after a pause (a comment just posted may not be listed yet).
+  const problemWith = (p) => {
+    if (p.undecodable) return `the PR's newest triage comment holds no readable review state: restore it with \`pipeline state show --pr ${pr}\``;
+    const m = p.marker;
+    if (!m.found) return `the review has not been completed on this PR (no review-complete comment): ${RUN}`;
+    if (m.record === null) return `${m.reason}: ${RUN}`;
+    if (m.record.contentHash !== liveHash) return `the review-complete comment is for other content (${short(m.record.contentHash)}, now ${short(liveHash)}): ${RUN}`;
+    if (p.hash === null || p.hash !== mine) return `the review state on this machine differs from the one published on the PR: ${RUN} (it publishes this copy first), or restore the published one with \`pipeline state show --pr ${pr}\``;
+    if (m.record.rulingsDigest !== rulings.digest) return `the review-complete comment does not carry the current rulings (${m.record.rulingsDigest === 'none' ? 'none' : short(m.record.rulingsDigest)} there, ${rulings.digest === 'none' ? 'none' : short(rulings.digest)} now): ${RUN}`;
+    return null;
+  };
+  let problem = problemWith(published);
+  if (problem !== null) {
+    await sleep(mergeablePause(env ?? {}));
+    published = readPublished(gh, pr);
+    problem = problemWith(published);
+  }
+  if (problem !== null) return fail(problem, rulings);
+  const eligibility = reviewEligibilityProblems(local);
+  if (eligibility.length > 0) return fail(`${eligibility.join('; ')}`, rulings);
+  return { ...check('review-complete', true, `review complete for content ${short(liveHash)}, state equal to the published one${rulings.count > 0 ? `; ${rulings.count} dismissal(s) in the Rulings block` : ''}`), rulings };
+}
+
 // `exemptHold` (Rev-4 8): the labels check ignores needs-human for the eligible hold the owner's "merge" names; nothing else does.
 export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep, exemptHold = false }) {
   const head = headSha({ cwd: root });
@@ -810,6 +886,12 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
   const hardstops = await safely('hardstops', () => hardstopsCheck({ root, config, diff }));
   const integrity = await safely('integrity', () => integrityCheck({ config, diff }));
   const items = [...(hardstops.ownerItems ?? []), ...(integrity.ownerItems ?? [])];
+  let completion;
+  try {
+    completion = await reviewCompletionCheck({ root, config, pr, gh, sleep, env });
+  } catch (err) {
+    completion = { ...check('review-complete', false, `could not evaluate: ${String(err?.message ?? err)}`), rulings: NO_RULINGS };
+  }
   const checks = [
     await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config, baseSha }) })),
     await safely('labels', () => labelsCheck(info, { exemptHold })),
@@ -817,6 +899,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     await safely('scan-range', () => scanRangeCheck({ root, gh, pr, diff, info, explicit })),
     hardstops,
     integrity,
+    stripRulings(completion),
     ownerItemsCheck({ items, hardstops, integrity, label: config.owner_approval === 'label' }),
   ];
   return {
@@ -831,6 +914,11 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     ownerItems: ownerItemsDigest(items),
     ownerItemLines: items,
     areas: areasOf(items),
+    // The Rulings block the owner must be shown (E11): '' / 'none' / 0 for an ordinary PR; rulingsDigest = the marker's digest of the state, rulingsBlockDigest = what the owner's record is bound to.
+    rulings: completion.rulings.block,
+    rulingsDigest: completion.rulings.digest,
+    rulingsBlockDigest: completion.rulings.blockDigest,
+    rulingCount: completion.rulings.count,
   };
 }
 
