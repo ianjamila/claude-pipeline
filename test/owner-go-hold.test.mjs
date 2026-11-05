@@ -328,3 +328,21 @@ test('approvalGap: the hold id and the hold block are compared independently (do
   rewrite((x) => x);
   assert.equal(approvalGap(q({ hold: HOLD })), 'ok', 'restored');
 });
+
+test('parser: the closing line must BE the 🔀 line; prose before the 🔀 on the same line binds nothing (Codex round 1, with and without a hold)', () => {
+  const ready = (rest) => `🔀 Ready to merge ${rest}`;
+  nothing(reply(holdLine(), head(A, { hold: HOLD.id }), `Do not ${ready('#7 and lift its needs-human hold — say "merge"')}`), 'negated prose before the lift line');
+  nothing(reply(head(A), `Do not ${ready('#7 — say "merge"')}`), 'negated prose before the plain line');
+  nothing(reply(head(A), `I would not ${ready('#7 — say "merge"')}`), 'any prose prefix');
+  nothing(reply(head(A), `> ${ready('#7 — say "merge"')}`), 'a quoted line');
+  assert.deepEqual(presentedRequests(reply(head(A), `Do not ${ready('#7 — say "merge"')}`)).prs, [], 'and no PR is read from it');
+  // the accepted shapes still bind
+  const bound = (text, why) => assert.equal(presentedRequests(text).requests.length, 1, why);
+  bound(reply(head(A), ready('#7 — say "merge"')), 'the plain line');
+  bound(reply(head(A), `  ${ready('#7 — say "merge"')}  `), 'surrounding spaces');
+  bound(reply(head(A), ready('#7 - say "merge"')), 'a hyphen dash');
+  bound(reply(head(A), ready('#7 -- say "merge"')), 'a double hyphen dash');
+  bound(reply(head(A), ready('#7 — say "merge".')), 'a final full stop');
+  bound(reply(holdLine(), head(A, { hold: HOLD.id }), READY), 'the lift line');
+  assert.deepEqual(presentedRequests(reply(head(A, { pr: 7 }), head(B, { pr: 8 }), ready('#7, #8 — say "merge"'))).prs, [7, 8], 'a PR list');
+});

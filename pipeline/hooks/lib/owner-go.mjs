@@ -95,6 +95,9 @@ export function parseApproval(prompt) {
 // lower-cased owner/name, or null when the line names none: such a request approves nothing; areas: the block's digest, absent = no areas shown; hold: the event id,
 // holdBlock: the Hold block's digest, both absent = no hold).
 const READY_LINE = /🔀\s*Ready to merge\s+([^\n]*)/;
+// The request's LAST line is anchored: nothing but spaces before the 🔀 (prose such as `Do not 🔀 Ready to merge …` is no request). READY_LINE stays unanchored: SURFACED_ASK and
+// lastRequestText only ask "does the reply mention a request anywhere".
+const READY_FULL_LINE = new RegExp(`^\\s*${READY_LINE.source}$`);
 const REPO_NAME = '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+';
 const HOLD_ID = '[A-Za-z0-9_=+/-]{1,128}';
 const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)(?:\\s*(?:·|\\|)\\s*hold\\s+(${HOLD_ID}))?(?:\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME}))?\\s*$`, 'i');
@@ -145,7 +148,7 @@ export function presentedRequests(text) {
   // A whitespace-only line carries no content, so it is transparent: "directly above" means the next NON-BLANK line above (owner-reported miss, EW #1659: a blank line between the
   // Head line and the 🔀 line made the owner's "merge" record nothing). Prose still ends the block, and every rule below is unchanged.
   const lines = String(text ?? '').split(/\r?\n/).filter((l) => l.trim() !== '');
-  const r = READY_LINE.exec(lines[lines.length - 1] ?? '');
+  const r = READY_FULL_LINE.exec(lines[lines.length - 1] ?? '');
   if (!r) return { prs: [], requests: [] };
   const prs = [...new Set([...r[1].split(/—|\s--?\s|\bsay\b/)[0].matchAll(/#(\d{1,6})\b/g)].map((x) => Number(x[1])))];
   const block = [];
