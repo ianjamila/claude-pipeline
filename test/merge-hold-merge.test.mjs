@@ -430,3 +430,37 @@ test('dry run --owner-go: a hold ahead is a merge-hold blocker and holds is repo
   assert.deepEqual(holdCalls(s), [`check ${PR}`]);
   assert.deepEqual(writes(s), []);
 });
+
+// A scan that CRASHED (safely() turns the throw into a failed 'could not evaluate' check) is no verdict: it also fails owner-items, so the hand-off
+// looks like owner-runs, but taking the merge hold for a PR whose hard-stop / integrity scan never ran would stall every other merge for nothing.
+const TOO_COMPLEX = `${'*/'.repeat(20)}x`; // more wildcards than a glob may have (lib/glob.mjs tooComplex): the matcher throws
+const crashWorld = (extraYml) => {
+  const s = scenario({ yml: `${holdYml({ merge: goMergeCmd })}${extraYml}`, baseFiles: holdFiles, report: null, state: null, change: unique });
+  s.fake.setScript(dryScript(s));
+  return s;
+};
+
+test('dry run --owner-go, a hardstops scan that threw: the owner-runs hand-off is NOT holdEligible', () => {
+  const s = crashWorld(`hard_stops:\n  paths: ['${TOO_COMPLEX}']\n`);
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']);
+  assertExit(d, 1, `${d.stderr}${d.stdout}`);
+  assert.equal(d.json.ownerStep.kind, 'owner-runs');
+  assert.ok(d.json.blockers.some((b) => /^hardstops: could not evaluate/.test(b.detail)), JSON.stringify(d.json.blockers));
+  assert.equal(d.json.ownerStep.holdEligible, false);
+});
+
+test('dry run --owner-go, an integrity scan that threw: the owner-runs hand-off is NOT holdEligible', () => {
+  const s = crashWorld(`integrity:\n  test_globs: ['${TOO_COMPLEX}']\n`);
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']);
+  assertExit(d, 1, `${d.stderr}${d.stdout}`);
+  assert.equal(d.json.ownerStep.kind, 'owner-runs');
+  assert.ok(d.json.blockers.some((b) => /^integrity: could not evaluate/.test(b.detail)), JSON.stringify(d.json.blockers));
+  assert.equal(d.json.ownerStep.holdEligible, false);
+});
+
+test('dry run --owner-go, a real hard-stop hit still hands off with holdEligible true (the crash guard does not cover verdicts)', () => {
+  const s = ownerRunsWorld();
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']);
+  assert.match(d.json.blockers.find((b) => /^hardstops:/.test(b.detail)).detail, /hard-stop hit\(s\)/);
+  assert.equal(d.json.ownerStep.holdEligible, true);
+});
