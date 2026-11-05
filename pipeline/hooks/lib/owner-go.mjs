@@ -31,7 +31,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { isInside, isTranscriptFile, transcriptConfigDirs } from '../../lib/paths.mjs';
+import { isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
 export const MAX_AGE_MS = 24 * 60 * 60 * 1000; // a "merge" older than a day approves nothing
@@ -586,8 +586,15 @@ function scanBackwards(file, visit, wants, { chunkBytes, capBytes }) {
 // environment is the agent's word. CLAUDE_CONFIG_DIR is ignored here (it would point the lookup at a file the agent wrote, and no guard reads that prefix), exactly as $HOME is
 // (accountHome). A home-level name outside the shape (~/.claude.forged: `ln -s` creates it unguarded) is no root either. The candidate must be a regular file (not a link) of
 // the shape isTranscriptFile accepts, not a subagent's, and its REAL path must lie inside the real path of one of those roots (a link inside a root that points out of
-// them is not the guard's file; ~/.claude-eaglewatch/projects linked to ~/.claude/projects is); de-duplicated by real path (one account's projects/ can be a link to the other's). None, or two different files, is null.
+// them is not the guard's file; ~/.claude-eaglewatch/projects linked to ~/.claude/projects is), and taken relative to that root's real path it must be exactly
+// projects/<project>/<session>.jsonl with <project> in the guard's project-folder shape (R2-B1: below ~/.claude the guard protects only projects/ and a project-shaped folder in it by NAME,
+// so `ln -s ~/.claude/forged ~/.claude/projects/evil`, or a copy of it, is the agent's own file; the scan below lists only project-shaped names too, so the two agree).
+// De-duplicated by real path (one account's projects/ can be a link to the other's). None, or two different files, is null.
 // (Hook-written transcript_path records are different: isTranscriptFile / promptProvenance still honour $CLAUDE_CONFIG_DIR for those, the protected recorder wrote them.)
+const protectedShape = (rel, session) => { // rel: a real path relative to a root's real path
+  const parts = rel.split(/[\\/]/);
+  return parts.length === 3 && parts[0] === 'projects' && TRANSCRIPT_PROJECT_RE.test(parts[1]) && parts[2] === `${session}.jsonl`;
+};
 export function legacyTranscriptOf(session, { home = accountHome() } = {}) {
   if (typeof session !== 'string' || !SESSION_RE.test(session)) return null;
   const found = new Map(); // real path -> the path it was first seen by
@@ -598,11 +605,12 @@ export function legacyTranscriptOf(session, { home = accountHome() } = {}) {
     let projects;
     try { projects = readdirSync(path.join(dir, 'projects')); } catch { continue; }
     for (const project of projects) {
+      if (!TRANSCRIPT_PROJECT_RE.test(project)) continue;
       const file = path.join(dir, 'projects', project, `${session}.jsonl`);
       try {
         if (!lstatSync(file).isFile() || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { env: {} })) continue;
         const real = realpathSync(file);
-        if (!roots.some((r) => isInside(real, r))) continue;
+        if (!roots.some((r) => isInside(real, r) && protectedShape(path.relative(r, real), session))) continue;
         if (!found.has(real)) found.set(real, file);
       } catch { /* not there */ }
     }

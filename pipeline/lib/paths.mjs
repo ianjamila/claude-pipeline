@@ -125,7 +125,10 @@ const TRANSCRIPT_LEAF = String.raw`projects/(?:[^/]+/)+[^/]+\.jsonl$`;
 // the folders that hold them: projects/ itself, and BELOW it each project and every folder in it but its memory/ (names without a dot: a session is a
 // uuid, subagents/ …). A project folder is named as Claude Code names it, the working directory with every non-alphanumeric turned into "-": it starts
 // with "-" (POSIX) or "C--" (a drive), so a folder of any other name is no session's. (A file in one is still a transcript: TRANSCRIPT_LEAF.)
-const TRANSCRIPT_BELOW = String.raw`projects/(?:-|[A-Za-z]--)[^/]*(?:/(?!memory(?:/|$))[^/.]+(?:/[^/.]+)*)?/*$`;
+// THE project-folder name shape (exported: owner-go.mjs legacyTranscriptOf accepts a derived transcript only in a folder of this name, the one folder name below projects/ the guard protects).
+const TRANSCRIPT_PROJECT_SRC = String.raw`(?:-|[A-Za-z]--)[^/]*`;
+export const TRANSCRIPT_PROJECT_RE = new RegExp(`^${TRANSCRIPT_PROJECT_SRC}$`);
+const TRANSCRIPT_BELOW = String.raw`projects/${TRANSCRIPT_PROJECT_SRC}(?:/(?!memory(?:/|$))[^/.]+(?:/[^/.]+)*)?/*$`;
 const TRANSCRIPT_TOP = String.raw`projects/*$`;
 const ANY_CLAUDE_DIR = String.raw`(?:^|/)\.claude[^/]*/`;
 // A config dir directly under the home: `.claude` plus a suffix with no further dot (~/.claude, ~/.claude-eaglewatch; not ~/.claude.json, a file, and not ~/.claude.forged). THE shape the guard

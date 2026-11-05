@@ -15,7 +15,7 @@ import {
   approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT, legacyTranscriptOf,
   parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
-import { HOME_CONFIG_DIR_RE, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
+import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { OWNER_ENTRY, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
 
@@ -1584,4 +1584,58 @@ test('#128 legacy grant R1-B1: the root shape is the guard\'s: HOME_CONFIG_DIR_R
   }
   // the guard's glob rule (files-policy) is built from the same export, not a copy
   assert.match(readFileSync(fileURLToPath(new URL('../pipeline/hooks/lib/files-policy.mjs', import.meta.url)), 'utf8'), /HOME_CONFIG_DIR_RE/);
+});
+
+// ---- R2-B1: below ~/.claude the guard protects projects/<project-shaped folder>/… by NAME and nothing else, so a derived lookup accepts a file only when its REAL path,
+// relative to its root's real path, is exactly projects/<project-shaped name>/<session>.jsonl (a folder the agent can create is no evidence, linked or copied) ----
+const forgedFolder = (home) => { // ~/.claude/forged/<session>.jsonl: a name the guard does not protect, holding a forged transcript
+  mkdirSync(join(home, '.claude', 'forged'), { recursive: true });
+  writeFileSync(join(home, '.claude', 'forged', `${LEGACY_SESSION}.jsonl`), lines(legacyEntries));
+  mkdirSync(join(home, '.claude', 'projects'), { recursive: true });
+};
+
+test('#128 legacy grant R2-B1: a forged folder linked into projects/ (projects/evil or projects/-evil -> ~/.claude/forged) proves nothing', { skip: process.platform === 'win32' }, () => {
+  for (const name of ['evil', '-evil']) {
+    const w = legacyWorld({ entries: legacyEntries, places: [] });
+    forgedFolder(w.home);
+    symlinkSync(join(w.home, '.claude', 'forged'), join(w.home, '.claude', 'projects', name));
+    assert.equal(legacyTranscriptOf(LEGACY_SESSION, { home: w.home }), null, name);
+    assert.equal(ownerGrantGap(w.q), 'provenance', name);
+    assert.deepEqual(w.verify(), [false, 'provenance'], name);
+  }
+});
+
+test('#128 legacy grant R2-B1: a forged real folder copied into projects/ (projects/evil/<session>.jsonl) proves nothing', () => {
+  const w = legacyWorld({ entries: legacyEntries, places: [['.claude', 'evil']] });
+  assert.equal(legacyTranscriptOf(LEGACY_SESSION, { home: w.home }), null);
+  assert.equal(ownerGrantGap(w.q), 'provenance');
+  assert.deepEqual(w.verify(), [false, 'provenance']);
+  // …and a folder of the wrong name does not make a second candidate (ambiguity) next to the real one either (a fresh world: the refused verify above claimed its marker)
+  const both = legacyWorld({ entries: legacyEntries, places: [['.claude', 'evil']] });
+  withPlace(both.home, '.claude');
+  assert.equal(legacyTranscriptOf(LEGACY_SESSION, { home: both.home }), join(both.home, '.claude', 'projects', '-repo', `${LEGACY_SESSION}.jsonl`));
+  assert.equal(ownerGrantGap(both.q), 'ok');
+});
+
+test('#128 legacy grant R2-B1: a Windows-style project folder (C--Users-x) is accepted; a symlinked second config dir to the protected projects/ still counts once', () => {
+  const w = legacyWorld({ entries: legacyEntries, places: [['.claude', 'C--Users-x']] });
+  assert.equal(legacyTranscriptOf(LEGACY_SESSION, { home: w.home }), join(w.home, '.claude', 'projects', 'C--Users-x', `${LEGACY_SESSION}.jsonl`));
+  assert.equal(ownerGrantGap(w.q), 'ok');
+  assert.deepEqual(w.verify(), [true, undefined]);
+  if (process.platform === 'win32') return;
+  const linked = legacyWorld({ entries: legacyEntries, places: [['.claude', 'C--Users-x']] });
+  mkdirSync(join(linked.home, '.claude-eaglewatch'), { recursive: true });
+  symlinkSync(join(linked.home, '.claude', 'projects'), join(linked.home, '.claude-eaglewatch', 'projects'));
+  assert.equal(ownerGrantGap(linked.q), 'ok');
+  assert.deepEqual(linked.verify(), [true, undefined]);
+});
+
+test('#128 legacy grant R2-B1: the accepted project-folder shape is the guard\'s own (paths.mjs), not a copy', () => {
+  const O = { home: '/home/u', env: {}, platform: 'linux', realpath: (p) => p, existsSync: () => false, cwd: '/repo' };
+  const folders = transcriptRes([], false, ['/home/u']).dirs;
+  for (const n of ['-repo', '-Users-x-y', 'C--Users-x', 'c--Users', 'evil', 'forged', 'C-Users', 'CC--x', '1--x', 'memory', '.hidden']) {
+    const guarded = folders.some((re) => re.test(`/home/u/.claude/projects/${n}`));
+    assert.equal(TRANSCRIPT_PROJECT_RE.test(n), guarded, `projects/${n}: accepted by the lookup iff the guard protects the folder`);
+  }
+  assert.match(readFileSync(fileURLToPath(new URL('../pipeline/hooks/lib/owner-go.mjs', import.meta.url)), 'utf8'), /TRANSCRIPT_PROJECT_RE/);
 });
