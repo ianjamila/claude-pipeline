@@ -22,7 +22,7 @@ const at = (v, t, n) => (typeof v === 'function' ? v(t, n) : v);
 function sim(world, options = {}) {
   let t = 0;
   const calls = [];
-  const reads = { classic: [], rules: [], statuses: 0, headRuns: [] }; // the base each policy read asked for
+  const reads = { classic: [], rules: [], statuses: 0, checkRuns: 0, headRuns: [] }; // the base each policy read asked for
   const readers = {
     pr: async () => at(world.pr ?? PR, t / 1000),
     classic: async (base) => {
@@ -33,7 +33,10 @@ function sim(world, options = {}) {
       reads.rules.push(base);
       return at(world.rules ?? [], t / 1000);
     },
-    checkRuns: async () => at(world.checkRuns ?? [], t / 1000),
+    checkRuns: async () => {
+      reads.checkRuns += 1;
+      return at(world.checkRuns ?? [], t / 1000, reads.checkRuns);
+    },
     statuses: async () => {
       reads.statuses += 1;
       return at(world.statuses ?? [], t / 1000, reads.statuses);
@@ -198,6 +201,64 @@ test('a draft-era failure also keeps waiting while a ready-era run is in progres
   const r = await s.run();
   assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
   assert.equal(s.elapsed(), 405_000);
+});
+
+// ---- the absence verdict is confirmed by a fresh read of the check runs and statuses (#168 R1-B1) ----------------------
+
+test('an aggregate that appears between the poll snapshot and the head-runs read is not reported missing: the check results are re-read first', async () => {
+  const aggregate = cr('Typecheck + Vitest', 'success', { check_suite: { id: 7 } });
+  // polls 1-21 (t = 0..300s) read the check runs once each; read 22 is the confirming re-read after the head's workflow runs showed nothing running
+  const s = sim({ classic: present('Typecheck + Vitest'), timeline: readyTimeline, checkRuns: (t, n) => (n >= 22 ? [aggregate] : []) });
+  const r = await s.run();
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(s.elapsed(), 300_000, 'decided at the appear deadline, no extra wait');
+  assert.equal(s.reads.checkRuns, 22);
+});
+
+test('the confirming re-read happens once: still nothing there => the old verdict, with a bounded number of reads', async () => {
+  const s = sim({ classic: present('ci'), timeline: readyTimeline });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'missing');
+  assert.equal(s.elapsed(), 300_000);
+  assert.equal(s.reads.checkRuns, 22, '21 polls + exactly one confirming re-read');
+  assert.equal(s.reads.headRuns.length, 2, 'the head runs are read by the poll and by the one confirmed pass');
+  const skip = sim(lateAggregate({ appearAt: 99999, shardDoneAt: 0 }));
+  const b = await skip.run();
+  assert.equal(b.output.verdict, 'stale-skipped');
+  assert.equal(skip.reads.checkRuns, 22);
+});
+
+// ---- a re-run keeps its run id and created_at: it is dated by run_started_at too (#168 R1-F2) ------------------------------
+
+test('a re-run of a draft-era workflow run (old created_at, ready-era run_started_at) in progress holds the wait; one started before ready does not', async () => {
+  const rerun = (startedAt) => ({ id: 31, name: 'CI', status: 'in_progress', created_at: '2026-01-01T11:00:00Z', run_started_at: startedAt, run_attempt: 2, html_url: 'https://github.example/actions/31' });
+  const held = sim({ classic: present('ci'), timeline: readyTimeline, headRuns: [rerun('2026-01-01T12:05:00Z')] }, { timeoutMs: 900_000 });
+  const a = await held.run();
+  assert.equal(a.output.verdict, 'timeout', JSON.stringify(a.output));
+  assert.equal(held.elapsed(), 900_000);
+  assert.deepEqual(a.output.heldBy, { kind: 'workflow-run', id: 31, name: 'CI', status: 'in_progress', createdAt: '2026-01-01T12:05:00Z', url: 'https://github.example/actions/31' });
+  const old = sim({ classic: present('ci'), timeline: readyTimeline, headRuns: [rerun('2026-01-01T11:30:00Z')] });
+  const b = await old.run();
+  assert.equal(b.output.verdict, 'missing');
+  assert.equal(old.elapsed(), 300_000);
+});
+
+test('a check run of a re-run workflow run (old created_at, ready-era run_started_at) in progress holds the wait; one started before ready does not', async () => {
+  const world = (startedAt) => ({
+    classic: present('Typecheck + Vitest'), timeline: readyTimeline,
+    checkRuns: [cr('Typecheck + Vitest (shard 1/2)', null, { check_suite: { id: 7 } })],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: startedAt, run_attempt: 2 }],
+  });
+  const held = sim(world('2026-01-01T12:05:00Z'), { timeoutMs: 900_000 });
+  const a = await held.run();
+  assert.equal(a.output.verdict, 'timeout');
+  assert.equal(a.output.heldBy.kind, 'check-run');
+  assert.equal(a.output.heldBy.name, 'Typecheck + Vitest (shard 1/2)');
+  const old = sim(world('2026-01-01T11:30:00Z'));
+  const b = await old.run();
+  assert.equal(b.output.verdict, 'missing');
+  assert.equal(old.elapsed(), 300_000);
 });
 
 // ---- a failure read from a commit status is confirmed by a fresh read before it is reported (#159 part 2) -----------

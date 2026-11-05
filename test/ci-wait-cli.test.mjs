@@ -118,6 +118,22 @@ test('ci-wait: --appear-timeout, --timeout, --interval and --wait-all reach the 
   assert.deepEqual(all.output.checks.map((c) => c.state), ['fail', 'pending']);
 });
 
+test('ci-wait: a gh without the head-runs reader is a counted GitHub read failure (exit 3), never a silent `missing` (#168 R1-F1)', async () => {
+  const repo = repoWith(['lint']);
+  let t = 0;
+  const gh = {
+    prView: () => pr(),
+    protection: () => ({ status: 200, json: { required_status_checks: { checks: [{ context: 'lint', app_id: 15368 }] } } }),
+    branchRules: () => [], checkRunsOf: () => [], statusesOf: () => [], timelineOf: () => [], workflowRunsOfSuite: () => [],
+  };
+  const clock = { now: () => t, sleep: async (ms) => { t += ms; } };
+  // `lint` never reports and --appear-timeout 0 puts the first poll past the appear window, so the head's workflow runs are read
+  const r = await ciWait(['--pr', '5', '--appear-timeout', '0'], { cwd: repo.dir, env: process.env, ciWait: { gh, clock, onProgress: () => {} } });
+  assert.equal(r.exitCode, 3, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'github');
+  assert.match(r.output.message, /workflowRunsOfHead/);
+});
+
 test('ci-wait: past --appear-timeout an absent check is held by an in-progress ready-era workflow run of the head (read with head_sha, paginated), and heldBy is reported', () => {
   const fake = createFakeGh(base([
     { match: '/check-runs', stdout: pages([run(2, 'ci', 'success')]) },

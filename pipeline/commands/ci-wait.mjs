@@ -51,7 +51,7 @@ export const run = guarded(async (argv, ctx) => {
     statuses: async (head) => gh.statusesOf(head),
     timeline: async () => gh.timelineOf(pr),
     suiteRuns: async (suiteId) => gh.workflowRunsOfSuite(suiteId),
-    headRuns: async (head) => (typeof gh.workflowRunsOfHead === 'function' ? gh.workflowRunsOfHead(head) : []),
+    headRuns: async (head) => gh.workflowRunsOfHead(head), // no fallback: a gh without it must fail the read, not silently end the late-aggregate hold
   };
   const result = await waitForCi({
     readers,

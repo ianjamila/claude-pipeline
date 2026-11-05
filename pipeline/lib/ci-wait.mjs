@@ -17,8 +17,9 @@
 // created_at. Freshness that cannot be read counts as fresh (fail fast).
 // A needs:-gated aggregate (EW "Typecheck + Vitest") is only created when its shard jobs finish, ~8-12 min after ready, so a
 // required identity that is still absent at --appear-timeout does not end the wait while any check run or workflow run of the
-// head, created at or after the ready event, is still queued / in progress (reported as `heldBy`); only --timeout bounds that.
-// A failure read from a commit status is confirmed by one more read of the head's statuses before it is reported (#159).
+// head, created or (re-)started at or after the ready event, is still queued / in progress (reported as `heldBy`); only --timeout bounds that.
+// A failure read from a commit status, and an absence verdict past --appear-timeout, are each confirmed by one more read of the
+// head's check runs and statuses before they are reported (#159, #168).
 // RESIDUAL (documented, not closed): a draft-era SUCCESS is not second-guessed. A draft-era success of a name whose ready-event
 // run is not created yet (seconds after `gh pr ready`) counts as pass. The window is narrow: the skipped job of the same workflow
 // keeps the wait open until that workflow's ready run exists, and the live gate re-reads CI before any merge. Requiring a
@@ -124,6 +125,14 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     }
     return workflowRuns.map((w) => Date.parse(w?.created_at)).filter(Number.isFinite);
   };
+  // Like suiteCreated, but a re-run keeps its run id and created_at and only moves run_started_at: both instants of each workflow
+  // run are returned (the caller takes the maximum). Used to decide whether a run is still of the ready era (findHolder); freshness of a RESULT stays on created_at.
+  const suiteActive = async (run) => {
+    const suite = run.check_suite?.id;
+    if (suite === undefined || suite === null) return [];
+    await suiteCreated(run); // fills the cache
+    return suiteCache.get(suite).flatMap((w) => [Date.parse(w?.created_at), Date.parse(w?.run_started_at)]).filter(Number.isFinite);
+  };
 
   // A skipped check run is only "done" when its workflow run was created at or after the ready event; a draft-era skip is not.
   const skipState = async (run, pr) => {
@@ -192,21 +201,24 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return out;
   };
 
-  // The first check run or workflow run of the head that was created at or after the ready event and has not finished, else null.
-  // A check run is dated by its workflow run (else its own started_at); a run whose age cannot be read does not hold the wait.
+  // The first check run or workflow run of the head that was created or (re-)started at or after the ready event and has not
+  // finished, else null. A check run is dated by its workflow run (else its own started_at); a workflow run by its created_at or,
+  // for a re-run, its run_started_at; a run whose age cannot be read does not hold the wait.
   const findHolder = async (obs, pr) => {
     const readyAt = Date.parse(await getReadyAt(pr));
     for (const run of obs.checkRuns) {
       if (!run || run.status === 'completed') continue;
-      const created = await suiteCreated(run);
-      const at = created.length > 0 ? Math.max(...created) : Date.parse(run.started_at);
+      const active = await suiteActive(run);
+      const at = active.length > 0 ? Math.max(...active) : Date.parse(run.started_at);
       if (Number.isFinite(at) && at >= readyAt) return { kind: 'check-run', id: run.id ?? null, name: run.name ?? null, status: run.status ?? null, createdAt: Number.isFinite(at) ? new Date(at).toISOString().replace('.000Z', 'Z') : null, url: run.html_url ?? null };
     }
     if (readers.headRuns) {
       for (const w of await readers.headRuns(pr.head)) {
         if (!w || !ACTIVE_WORKFLOW_RUN.has(w.status)) continue;
-        const at = Date.parse(w.created_at);
-        if (Number.isFinite(at) && at >= readyAt) return { kind: 'workflow-run', id: w.id ?? null, name: w.name ?? null, status: w.status, createdAt: w.created_at, url: w.html_url ?? null };
+        const created = Date.parse(w.created_at);
+        const restarted = Date.parse(w.run_started_at);
+        const when = Number.isFinite(created) && created >= readyAt ? w.created_at : Number.isFinite(restarted) && restarted >= readyAt ? w.run_started_at : null;
+        if (when !== null) return { kind: 'workflow-run', id: w.id ?? null, name: w.name ?? null, status: w.status, createdAt: when, url: w.html_url ?? null };
       }
     }
     return null;
@@ -268,12 +280,14 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     const identities = identitiesOf(sources);
 
     // Everything from the evaluation to the verdict. `confirmed` is true on the second pass, which a failure read from a commit
-    // status triggers: the head's statuses are read again first, so a failure a newer status already replaced is not reported.
+    // status, or an absence verdict past --appear-timeout, triggers: the head's check runs and statuses are read again first, so a
+    // failure a newer status already replaced, or an aggregate that appeared after the snapshot, is not reported. Never a third pass.
+    const reread = async () => ({ checkRuns: await readers.checkRuns(pr.head), statuses: await readers.statuses(pr.head) });
     const decide = async (obs, confirmed) => {
     const states = [];
     for (const identity of identities) states.push(await evaluate(identity, obs, pr));
     last = { ...last, identities, states };
-    const confirmStatusFailures = async (failures) => (confirmed || !failures.some((f) => statusBasis.has(f)) ? undefined : decide({ ...obs, statuses: await readers.statuses(pr.head) }, true));
+    const confirmStatusFailures = async (failures) => (confirmed || !failures.some((f) => statusBasis.has(f)) ? undefined : decide(await reread(), true));
     const failedResult = (message, failures) => {
       const statusEvidence = statusEvidenceOf(failures);
       return result(EXIT.FAILED, 'failed', { message, failures, ...(statusEvidence.length > 0 ? { statusEvidence } : {}) });
@@ -323,6 +337,9 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         }
       }
       if (absent.length > 0 && elapsed() >= appearTimeoutMs && holder === null) {
+        // The snapshot was taken before findHolder read the workflow runs: an aggregate created and finished in between (or a lagging
+        // check-runs read) would otherwise be reported absent. Look once more before the terminal verdict.
+        if (!confirmed) return decide(await reread(), true);
         const missing = absent.filter((s) => s.state === 'missing');
         const stale = absent.filter((s) => s.state === 'stale-skip');
         const staleFails = absent.filter((s) => s.state === 'stale-fail');
