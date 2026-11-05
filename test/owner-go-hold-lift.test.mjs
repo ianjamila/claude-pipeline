@@ -1007,7 +1007,8 @@ const liveGroup = () => {
   c.unref();
   return c.pid;
 };
-const stopGroup = (pid) => { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } };
+// Windows has no process groups (kill(-pid) throws there, so the child would live on): kill the pid itself, as groupAlive asks about it.
+const stopGroup = (pid) => { try { process.kill(process.platform === 'win32' ? pid : -pid, 'SIGKILL'); } catch { /* gone */ } };
 const writeChild = (rec) => writeFileSync(childFile, typeof rec === 'string' ? rec : JSON.stringify(rec));
 
 test('merge child, Codex R2-1: a dead run left its merge command running => both routes refuse merge-in-progress and touch nothing; the dry run says so', async () => {
@@ -1071,7 +1072,7 @@ test('merge child, Codex R2-1: withMergeLock records the merge group while it ru
       track.ended(); // the group is still alive (a grandchild that outlived the shell): the record stays
       assert.equal(existsSync(childFile), true);
       stopGroup(pid);
-      for (let i = 0; i < 50 && existsSync(childFile); i += 1) {
+      for (let i = 0; i < 150 && existsSync(childFile); i += 1) {
         await new Promise((r) => setTimeout(r, 20));
         track.ended();
       }
