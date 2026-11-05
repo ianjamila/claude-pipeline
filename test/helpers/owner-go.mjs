@@ -1,24 +1,40 @@
 // #58: the owner's chat "merge", as the owner-go recorder writes it. `P merge` reads the records from the account's real home
 // (never $HOME, which the agent could point elsewhere), so a test writes its record there under a random session name and
-// deletes it afterwards (t.after, and at process exit for a test that died before t.after ran).
+// deletes it afterwards (t.after, and at process exit for a test that died before t.after ran). A random temp-repo head never matches anything else.
 // ISOLATION (#122): the folder is shared by every test and every concurrent run of the suite, and a ruling or a round grant matches on
 // repository, PR and item (or round) only. A test that records those must build its world with a repository name of its own
 // (test/cli-review.test.mjs ownerWorld: a unique slug per test), so its records can never match another test's or another process's.
 // Approval records are bound to a head instead; the temp repos use fixed author details, so identical fixtures made in the same second
 // can share heads - callers of ownerSays keep that known risk (tracked in a follow-up issue).
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { ownerGoDir, recordApproval, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
 
-// What the recorder writes when the owner types `prompt` after a reply that showed `reply`. Returns the record (or null).
-export const ownerSays = (t, prompt, reply) => said(t, prompt, reply, recordApproval);
-// Phase 3b: the same for a ruling (the reply ends with rulingRequest's line).
-export const ownerRules = (t, prompt, reply) => said(t, prompt, reply, recordRuling);
+const HOOK = fileURLToPath(new URL('../../pipeline/hooks/owner-go.mjs', import.meta.url));
 
+// What Claude Code writes on a prompt entry the owner typed (#128): the use-time provenance check accepts a record only for such an entry.
+export const OWNER_ENTRY = { origin: { kind: 'human' }, promptSource: 'typed', entrypoint: 'cli' };
+
+// Where a test transcript lives: <dir>/.claude/projects/-repo/t.jsonl, the shape the use-time provenance check accepts (R1-B2; lib/paths.mjs isTranscriptFile).
+const transcriptIn = (dir) => {
+  mkdirSync(join(dir, '.claude', 'projects', '-repo'), { recursive: true });
+  return join(dir, '.claude', 'projects', '-repo', 't.jsonl');
+};
+
+// What the recorder writes when the owner types `prompt` after a reply that showed `reply`. Returns the record (or null).
+// `entry` overrides the prompt entry's provenance fields (a test of a prompt that is NOT the owner's).
+// `after` (#128 use-time check): once the record is written, the prompt's transcript entry is replaced by one with these provenance fields
+// (the hook cannot always tell at record time), or removed with 'missing'. R2-F3: 'elsewhere' moves the transcript to <dir>/claude-config/projects/-repo/t.jsonl, the shape of a transcript in a custom config dir
+// that the checking process does not know (the record's transcript_path is patched to it; the prompt entry is the owner's).
+export const ownerSays = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordApproval, entry, after);
+// Phase 3b: the same for a ruling (the reply ends with rulingRequest's line).
+export const ownerRules = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordRuling, entry, after);
 // Owner-granted extra round: the same for the owner's `extra round` (the reply ends with roundRequest's line).
-export const ownerGrants = (t, prompt, reply) => said(t, prompt, reply, recordRoundGrant);
+export const ownerGrants = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordRoundGrant, entry, after);
 
 // Files this process wrote and has not removed yet. Removed at exit, so an uncaught error or a failed test before t.after still leaves
 // nothing behind. Only paths this process itself wrote are ever touched: production accepts `test-<uuid>` session names and reads
@@ -32,18 +48,32 @@ export function cleanupAtExit(file) {
   process.on('exit', () => { for (const f of leftovers) rmSync(f, { force: true }); });
 }
 
-function said(t, prompt, reply, recorder) {
+function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined) {
   const dir = mkdtempSync(join(tmpdir(), 'owner-go-'));
-  const transcript = join(dir, 't.jsonl');
+  const transcript = transcriptIn(dir);
+  const promptId = `pid-${randomUUID()}`;
   writeFileSync(transcript, `${[
-    { type: 'user', message: { content: 'ship it' } },
+    { type: 'user', message: { content: 'ship it' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
     { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
-    { type: 'user', message: { content: prompt } },
+    { type: 'user', message: { content: prompt }, promptId, ...entry },
   ].map((e) => JSON.stringify(e)).join('\n')}\n`);
   const session = `test-${randomUUID()}`;
   const file = join(ownerGoDir(), `${session}.jsonl`);
   cleanupAtExit(file);
-  const record = recorder({ hook_event_name: 'UserPromptSubmit', session_id: session, transcript_path: transcript, cwd: dir, prompt });
+  const record = recorder({ hook_event_name: 'UserPromptSubmit', session_id: session, transcript_path: transcript, cwd: dir, prompt, prompt_id: promptId });
+  if (after === 'elsewhere') {
+    const moved = join(dir, 'claude-config', 'projects', '-repo', 't.jsonl');
+    mkdirSync(join(dir, 'claude-config', 'projects', '-repo'), { recursive: true });
+    writeFileSync(moved, readFileSync(transcript));
+    writeFileSync(file, readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.stringify({ ...JSON.parse(l), transcript_path: moved })).join('\n') + '\n');
+  } else if (after !== undefined) {
+    const kept = [
+      { type: 'user', message: { content: 'ship it' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
+      { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
+    ];
+    if (after !== 'missing') kept.push({ type: 'user', message: { content: prompt }, promptId, ...after });
+    writeFileSync(transcript, `${kept.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  }
   t.after(() => {
     rmSync(file, { force: true });
     rmSync(dir, { recursive: true, force: true });
@@ -64,3 +94,25 @@ export const roundRequest = (pr, k, head, repo = 'acme/widgets') => `Round ${k -
 
 // The flags P merge takes for it.
 export const approvalFlags = (head, items) => ['--owner-approved-head', head, '--owner-approved-items', items];
+
+// #128: runs the real hook (a subprocess, the account's real home) for a prompt submitted after `entries`, the way Claude Code would:
+// the transcript is written first (`appended`: the current prompt is already in it, as its last entry) and the record, if any, is deleted
+// afterwards. Returns { stdout, status, record } (record: the owner-go line written for the session, or null).
+export function runHook(t, { entries, prompt, entry = OWNER_ENTRY, appended = true, input = {} }) {
+  const dir = mkdtempSync(join(tmpdir(), 'owner-go-hook-'));
+  const transcript = transcriptIn(dir);
+  const promptId = `pid-${randomUUID()}`;
+  const all = appended ? [...entries, { type: 'user', message: { content: prompt }, promptId, ...entry }] : entries;
+  writeFileSync(transcript, `${all.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  const session = `test-${randomUUID()}`;
+  const file = join(ownerGoDir(), `${session}.jsonl`);
+  t.after(() => {
+    rmSync(file, { force: true });
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const stdin = JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: session, transcript_path: transcript, cwd: dir, prompt, prompt_id: promptId, ...input });
+  const r = spawnSync(process.execPath, [HOOK], { input: stdin, encoding: 'utf8' });
+  let record = null;
+  try { record = JSON.parse(readFileSync(file, 'utf8').trim().split('\n').pop()); } catch { /* nothing was recorded */ }
+  return { stdout: r.stdout, status: r.status, record };
+}

@@ -167,10 +167,12 @@ test('F2d 40: a run-time write target is refused anywhere under the protected di
   for (const c of ['echo x > "$V"', 'cp /tmp/x $(echo ../settings.json)', 'tee $V < /tmp/x']) assert.equal(inTree(c).decision, 'deny', c);
   // literal targets, reads, and run-time targets outside the tree stay allowed
   allows(files, {}, [
-    `cd ${T}/projects && echo x > notes.txt`, `cd ${T}/projects && echo hi`, `cd ${T}/projects && cat $V`, `cd ${T}/projects && cp a.txt b.txt`,
+    `cd ${T}/projects && echo x > notes.txt`, `cd ${T}/projects && echo hi`, `cd ${T}/projects && cat $V`,
     'cd /home/u/proj && echo x > $(echo out.txt)', 'cd /home/u/proj && cp /tmp/x "$V"', 'echo x > $V', 'cd /home/u/other && tee $V < /tmp/x',
   ]);
   assert.equal(inTree('echo x > notes.txt').decision, 'allow');
+  // #128 R8-B1: projects/ itself holds the session folders, so a bare writer's relative words there are refused (`cp -R x -repo` has the same shape)
+  denies(files, {}, [`cd ${T}/projects && cp a.txt b.txt`]);
 });
 
 // Why (item 99): zsh's lowercase `cdpath` array is tied to CDPATH, so every CDPATH check also sees it.

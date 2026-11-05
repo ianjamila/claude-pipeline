@@ -12,6 +12,7 @@ import {
 } from '../pipeline/lib/finalgate.mjs';
 import { verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
 import { claimGrantMarkers, grantIdOf, recordRoundGrant } from '../pipeline/hooks/lib/owner-go.mjs';
+import { OWNER_ENTRY } from './helpers/owner-go.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { writeReviewJson } from '../pipeline/lib/cmd-io.mjs';
 import {
@@ -376,14 +377,17 @@ function ownerWorld() {
   const home = mkdtempSync(join(tmpdir(), 'grant-home-'));
   const grant = ({ k, at, pr = PR, repo = REPO, prompt = 'extra round', claim = true, claimed = at, claimK = k }) => {
     const dir = mkdtempSync(join(tmpdir(), 'grant-tr-'));
-    const transcript = join(dir, 't.jsonl');
+    // #128: the record counts only while its prompt is the owner's in a transcript of the shape Claude Code gives it (helpers/owner-go.mjs).
+    mkdirSync(join(dir, '.claude', 'projects', '-repo'), { recursive: true });
+    const transcript = join(dir, '.claude', 'projects', '-repo', 't.jsonl');
+    const promptId = `pid-${randomUUID()}`;
     const reply = `Round ${k - 1} left items open.\n🔁 Extra review round needed #${pr}: round ${k} · head ${at.slice(0, 12)} · repo ${repo}`;
     writeFileSync(transcript, `${[
-      { type: 'user', message: { content: 'go' } },
+      { type: 'user', message: { content: 'go' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
       { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
-      { type: 'user', message: { content: prompt } },
+      { type: 'user', message: { content: prompt }, promptId, ...OWNER_ENTRY },
     ].map((e) => JSON.stringify(e)).join('\n')}\n`);
-    const record = recordRoundGrant({ hook_event_name: 'UserPromptSubmit', session_id: `test-${randomUUID()}`, transcript_path: transcript, cwd: dir, prompt }, { home });
+    const record = recordRoundGrant({ hook_event_name: 'UserPromptSubmit', session_id: `test-${randomUUID()}`, transcript_path: transcript, cwd: dir, prompt, prompt_id: promptId }, { home });
     assert.ok(record, 'the recorder wrote the grant');
     if (claim) assert.equal(claimGrantMarkers([record], { repo, pr, k: claimK, head: claimed, checkout: dir }, { home }).ok, true);
     return { record, ownerGrant: { grantId: grantIdOf(record), k, quote: record.prompt, ownerTs: record.ts } };

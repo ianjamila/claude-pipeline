@@ -3072,6 +3072,38 @@ test('triage owner-ruling: needs the owner\'s recorded answer to a ruling reques
   assert.equal(w.item('R1-B1').final.ownerQuote, QUOTE);
 });
 
+test('triage owner-ruling: an answer whose prompt is synthetic or missing from the transcript is refused with the provenance reason (#128)', (t) => {
+  for (const after of [{ promptSource: 'system', isMeta: true, entrypoint: 'cli' }, { origin: { kind: 'peer' }, promptSource: 'system', entrypoint: 'cli' }, 'missing']) {
+    const w = ownerWorld(t, { yml: CHAT_YML });
+    assertExit(w.codex(1, findingsOf([finding()])), 0);
+    waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+    ownerRules(t, QUOTE, rulingRequest(7, ['R1-B1'], w.slug, askedContent(w, ['R1-B1'])), undefined, after);
+    const r = w.cli(rule('R1-B1', 'FOLLOW-UP'));
+    assertExit(r, 1);
+    assert.match(r.json.reason, /an answer is recorded for acme\/widgets-[0-9a-f-]+ #7 R1-B1, but it cannot be confirmed as typed by the owner[\s\S]*ask again[\s\S]*ask the owner to answer again/);
+    assert.equal(w.item('R1-B1').final.by, 'arbiter', 'state untouched');
+  }
+});
+
+// R2-F3: the same for a ruling answer whose transcript is in a config dir the process does not know.
+test('triage owner-ruling: an answer whose transcript is in a config dir this process does not know names CLAUDE_CONFIG_DIR in the refusal (R2-F3); a missing one does not', (t) => {
+  const refusal = (after) => {
+    const w = ownerWorld(t, { yml: CHAT_YML });
+    assertExit(w.codex(1, findingsOf([finding()])), 0);
+    waitingForHuman(w, { 'R1-B1': 'FOLLOW-UP' });
+    ownerRules(t, QUOTE, rulingRequest(7, ['R1-B1'], w.slug, askedContent(w, ['R1-B1'])), undefined, after);
+    const r = w.cli(rule('R1-B1', 'FOLLOW-UP'));
+    assertExit(r, 1);
+    return r.json.reason;
+  };
+  // The missing case first: both write a record for the same repo, PR, item and answer (records stay until the test ends), and the hint looks at every matching one.
+  const missing = refusal('missing');
+  assert.match(missing, /cannot be confirmed as typed by the owner/);
+  assert.doesNotMatch(missing, /CLAUDE_CONFIG_DIR/);
+  const elsewhere = refusal('elsewhere');
+  assert.match(elsewhere, /cannot be confirmed as typed by the owner[\s\S]*CLAUDE_CONFIG_DIR is not set here[\s\S]*run this command with CLAUDE_CONFIG_DIR set to the owner's config dir/);
+});
+
 test('triage owner-ruling: one world\'s recorded answer never satisfies another world (#122: a repository name per test)', (t) => {
   // Two worlds built from identical fixtures: the same needsHuman state and the same content digests, so the only thing telling their
   // records apart is the repository name. The records live in the account's real owner-go folder, shared by every test and every
@@ -3686,6 +3718,24 @@ test('codex-review owner grant: no grant is the same round-cap as before, and th
   assert.equal(capped.json.error, 'round-cap');
   assert.match(capped.json.message, /review\.max_rounds \(1\) and its one extra round, or an owner-granted round/);
   assert.equal(w.captured().length, calls, 'Codex never ran');
+});
+
+test('codex-review owner grant: an "extra round" whose prompt is synthetic or missing from the transcript admits nothing, and the refusal says it cannot be confirmed as typed by the owner (#128)', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  for (const after of [{ promptSource: 'system', isMeta: true, entrypoint: 'cli' }, { promptSource: 'sdk', entrypoint: 'sdk-cli' }, 'missing']) {
+    const record = ownerGrants(t, 'extra round', roundRequest(7, 3, h2, w.slug), undefined, after);
+    assert.ok(record, 'the hook could not tell at record time');
+    t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+  }
+  const calls = w.captured().length;
+  const capped = codexThree(w, h1, h2);
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+  assert.match(capped.json.message, /an extra round is recorded for this PR, but it cannot be confirmed as typed by the owner[\s\S]*ask the owner to type "extra round" again/);
+  assert.equal(w.captured().length, calls, 'Codex never ran');
+  // the gate path: the owner's own words admit the round, as before
+  ownerGrantsRound(w, t, { k: 3, head: h2 });
+  assertExit(codexThree(w, h1, h2), 0);
 });
 
 test('codex-review owner grant: round-request -> the owner\'s grant -> codex-review runs round 3 once; the next round is capped again', (t) => {

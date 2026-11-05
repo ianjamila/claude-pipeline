@@ -101,6 +101,7 @@ An item left `needsHuman` (failed model proof, low-confidence arbiter, a dismiss
 Run `P triage ruling-request --pr N --ids R1-B1,R2-S3`. Your reply says "answer with only `<id>: accept | follow-up | reject`; reasons in another
 message" and **ends with the exact `line` it printed**, nothing after it. The owner-go hook records the owner's next prompt against that line. Per
 item: `P triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason "<why>" --owner-quote "<the owner's whole answer, copied, never paraphrased>" --pr N`.
+A background notice or another session's message between your ask and the owner's answer does not break a pending ruling (the answer binds across them) only while you answer it with tool calls alone: any text in your reply to such a turn voids the pending ask whatever it says (nothing is recorded, ask again), so keep a reply to a notice to tool calls; if you did write text, the owner's answer is refused with a nudge and you show the ask again in your reply to that prompt; a merge request does break (any later reply makes it stale): show it again. An answer the hook could not confirm as typed by the owner is refused (`provenance`) ⇒ ask again.
 A refusal (changed finding text, wrong id, other words, label mode) ⇒ ask again with a fresh `ruling-request`. Then re-post `P comment --pr N --kind triage`,
 `P followups create --round R`, and the comment again; an ACCEPT is built, `mark-implemented`, and reviewed in a new round. In label mode, `needsHuman`
 items end in `needs-human` (as in step 6): the owner rules outside this session.
@@ -111,7 +112,7 @@ reviewed), then run `P triage round-request --pr N`. It prints `{line, k, n, hea
 still open and what the extra round will review, and **ends with the exact `line`**, nothing after it. Then wait. When the owner types `extra round`
 the owner-go hook records it against that line and prints a context line; only then run
 `P codex-review --pr N --round <n from round-request> …` as in step 1 (it claims the grant after Codex answers; the output shows `grantUsed`). One grant is one
-round: if that round accepts items again, ask again or park. A refusal (`round-cap` "ask again", grant already used, head moved) ⇒ run `round-request` again. Never
+round: if that round accepts items again, ask again or park. A refusal that says the grant "cannot be confirmed as typed by the owner" (#128: the prompt was a harness message, or its transcript entry is gone or elsewhere) is a refusal too: `round-request` again, and the owner types `extra round` themselves. A refusal (`round-cap` "ask again", grant already used, head moved) ⇒ run `round-request` again. Never
 type, paraphrase or forge the owner's words, and never run Codex outside `codex-review`. Label mode ⇒ no grant exists: park as before. `review-complete` and the
 final gate re-prove the grant from the owner's record on this machine, so finish the review here.
 

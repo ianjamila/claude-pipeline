@@ -236,9 +236,6 @@ table('code-built path', [
 table('code-built path', [
   `node -e "console.log(require('os').homedir())"`,
   'node -e "console.log(process.env.HOME)"',
-  `node -e "console.log(require('path').join(require('os').homedir(),'.claude','projects'))"`,
-  `node -e "require('fs').writeFileSync(require('os').homedir()+'/.claude/CLAUDE.md','x')"`,
-  `python3 -c "from pathlib import Path; (Path.home()/'.claude'/'CLAUDE.md').write_text('x')"`,
   'echo $HOME',
   'cp x .claude/settings.json',
   'cat ~/proj/.claude/settings.json',
@@ -246,6 +243,13 @@ table('code-built path', [
   'cat "$X/.claude/settings.json"',
   `python3 -c "print(open('.claude/settings.json').read())"`,
 ], 'allow');
+
+// R6-F1: program text that writes under a config root is refused whatever the file (the program may build the path of a transcript at run time); a CLAUDE.md note is written with the Write tool or a shell cp
+table('code-built path', [
+  `node -e "require('fs').writeFileSync(require('os').homedir()+'/.claude/CLAUDE.md','x')"`,
+  `python3 -c "from pathlib import Path; (Path.home()/'.claude'/'CLAUDE.md').write_text('x')"`,
+  `node -e "console.log(require('path').join(require('os').homedir(),'.claude','projects'))"`, // (R7: a program naming the home config folder is refused even when it only reads)
+], 'deny');
 
 // ---- 4. variables ---------------------------------------------------------------------------------
 
