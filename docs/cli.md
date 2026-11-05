@@ -360,6 +360,7 @@ with a note, prose, a blank line or CRLF takes a round); the added rows are the 
 continue above the last row of the reviewed file, and `NNNN_name.sql` is a regular file in a directory called `migrations` in the tree at `toHead`.
 No instruction file of the reviewed head (and no file it `@`-imports, up to 5 hops, symlinks followed, case-insensitive) may import a listed document, and no
 symlink on the way may cycle, dangle or lead out of the repository: `@/abs/path` and `@~/path` count when they land inside the repo, and are ignored outside it.
+A reviewed file with no final newline takes a round for any append (git sees its last line as edited); the reason says so.
 A refusal names the file that forces a round: `reason` ends with "the docs-only exemption does not apply: <file> ...".
 
 With `ci.review_check: true` the guard workflow turns this comment into the `Cross-model review` status (success only when

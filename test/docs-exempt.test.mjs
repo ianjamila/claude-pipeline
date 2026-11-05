@@ -432,6 +432,145 @@ test('a new listed document may hold only rows: a heading in it is refused', (t)
   refused(w.exempt(), /docs\/new\.md line 1/);
 });
 
+// ---- A4 (#167): a reviewed file with no final newline ------------------------------------------------------------------------------------
+
+test('a reviewed file with no final newline: appending still takes a round, and the reason says why', (t) => {
+  const w = world(t, { baseFiles: { [LEDGER]: `# Ledger\n\n${row(1).replace(/\n$/, '')}` } });
+  const r = refused(addRow(w, '\n' + row(2)), /docs\/ledger\.md.*no final newline.*appending.*review round/s);
+  assert.doesNotMatch(r.reason, /edited or removed/);
+  // an ordinary edit keeps the ordinary reason
+  const e = world(t);
+  writeFileSync(join(e.dir, LEDGER), readFileSync(join(e.dir, LEDGER), 'utf8').replace('2026-11-05', '2026-11-06'));
+  e.repo.commit('edit a row');
+  const er = refused(e.exempt(), /edited or removed/);
+  assert.doesNotMatch(er.reason, /final newline/);
+  // a newline-less reviewed file whose last line was really edited is not blamed on the newline
+  const x = world(t, { baseFiles: { [LEDGER]: `# Ledger\n\n${row(1).replace(/\n$/, '')}` } });
+  writeFileSync(join(x.dir, LEDGER), `# Ledger\n\nsomething else\n${row(2)}`);
+  x.repo.commit('rewrite');
+  assert.doesNotMatch(refused(x.exempt(), /docs\/ledger\.md/).reason, /final newline/);
+});
+
+// ---- A3 (#171): an @-imported listed document steers an agent like an instruction file -------------------------------------------------
+
+// A world whose reviewed tree carries `files` / `links`; one ledger row is then added after the round.
+const importWorld = (t, baseFiles, baseLinks = {}, extra = {}) => {
+  const w = world(t, { baseFiles, baseLinks, ...extra });
+  w.append(LEDGER, row(2));
+  w.repo.commit('ledger row');
+  return w;
+};
+const exemptWith = (w, extra) => w.exempt(baseline(), w.state, extra);
+
+test('an instruction file that @-imports a listed document: refused, naming the importer and the document', (t) => {
+  for (const [file, body] of [
+    ['CLAUDE.md', 'See @docs/ledger.md for the log.\n'],
+    ['AGENTS.md', '@docs/ledger.md\n'],
+    ['GEMINI.md', '- read @./docs/ledger.md first\n'],
+    ['.github/copilot-instructions.md', 'rules (@../docs/ledger.md).\n'],
+    ['sub/dir/CLAUDE.md', 'x @../../docs/ledger.md y\n'],
+    ['docs/CLAUDE.md', '@ledger.md\n'],
+    ['CLAUDE.md', 'a `@docs/ledger.md` code span counts too\n'],
+    ['CLAUDE.md', 'a fragment @docs/ledger.md#top is the same file\n'],
+    ['CLAUDE.md', 'wrapped in *emphasis* **@docs/ledger.md**\n'],
+    ['CLAUDE.md', 'any case: @DOCS/Ledger.MD\n'],
+    ['CLAUDE.md', 'a sentence ending in @docs/ledger.md.\n'],
+  ]) {
+    const w = importWorld(t, { [file]: body });
+    const first = exemptWith(w);
+    assert.equal(first.exempt, false, `${file}: ${JSON.stringify(body)} was not refused`);
+    const r = refused(first, /imports docs\/ledger\.md/i);
+    assert.ok(r.reason.includes(file), `${file}: the reason names the importer: ${r.reason}`);
+  }
+});
+
+test('a markdown link, plain text or an e-mail address is not an import (the ledger design stays legal)', (t) => {
+  for (const body of ['See [the ledger](docs/ledger.md) and docs/ledger.md.\n', 'mail me@docs/ledger.md\n', 'a@b.com\n', '@missing.md\n']) {
+    const r = exemptWith(importWorld(t, { 'CLAUDE.md': body }));
+    assert.equal(r.exempt, true, `${JSON.stringify(body)}: ${r.reason}`);
+  }
+});
+
+test('an import chain is followed (two hops, five hops), a cycle ends, and a file nobody imports is not read', (t) => {
+  const two = importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'docs/guide.md': 'then @other.md\n', 'docs/other.md': 'and finally @ledger.md\n' });
+  refused(exemptWith(two), /docs\/other\.md imports docs\/ledger\.md/);
+  const chain = (hops) => Object.fromEntries([['CLAUDE.md', '@c1.md\n'], ...Array.from({ length: hops }, (_, i) => [`c${i + 1}.md`, i + 1 === hops ? '@docs/ledger.md\n' : `@c${i + 2}.md\n`])]);
+  refused(exemptWith(importWorld(t, chain(5))), /c5\.md imports docs\/ledger\.md/);
+  assert.equal(exemptWith(importWorld(t, chain(6))).exempt, true); // Claude Code stops at 5 hops; the scan reads no deeper
+  const cycle = exemptWith(importWorld(t, { 'CLAUDE.md': '@a.md\n', 'a.md': '@b.md\n', 'b.md': '@a.md @CLAUDE.md\n' }));
+  assert.equal(cycle.exempt, true, cycle.reason);
+  const loose = exemptWith(importWorld(t, { 'docs/other.md': '@docs/ledger.md\n' }));
+  assert.equal(loose.exempt, true, loose.reason);
+});
+
+test('a dense import graph is read once per file, not once per path (the visited set bounds the scan)', (t) => {
+  const all = [1, 2, 3, 4, 5, 6, 7].map((n) => `@d${n}.md`).join(' ') + '\n';
+  const files = { 'CLAUDE.md': all, ...Object.fromEntries([1, 2, 3, 4, 5, 6, 7].map((n) => [`d${n}.md`, all])) };
+  const r = exemptWith(importWorld(t, files));
+  assert.equal(r.exempt, true, r.reason);
+});
+
+test('a symlink alias, a symlinked directory or a symlinked instruction file that reaches a listed document is refused', (t) => {
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/alias.md\n' }, { 'docs/alias.md': 'ledger.md' })), /CLAUDE\.md imports docs\/alias\.md/);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@linkdir/ledger.md\n' }, { linkdir: 'docs' })), /CLAUDE\.md imports linkdir\/ledger\.md/);
+  // CLAUDE.md IS the listed ledger, through a link: the ledger is read as an instruction file.
+  const w = world(t, { baseLinks: { 'AGENTS.md': 'docs/ledger.md' } });
+  w.append(LEDGER, row(2));
+  w.repo.commit('ledger row');
+  refused(exemptWith(w), /AGENTS\.md.*docs\/ledger\.md/);
+});
+
+test('an instruction file that is a symlink to another file in the repo keeps working', (t) => {
+  const w = importWorld(t, { 'CLAUDE.md': '# rules, see [ledger](docs/ledger.md)\n' }, { 'AGENTS.md': 'CLAUDE.md', 'docs/GEMINI.md': '../CLAUDE.md' });
+  const r = exemptWith(w);
+  assert.equal(r.exempt, true, r.reason);
+  // ... and what the target imports is judged through the link as well.
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/ledger.md\n' }, { 'AGENTS.md': 'CLAUDE.md' })), /imports docs\/ledger\.md/);
+});
+
+test('symlinks that cycle, dangle or leave the repo, on an instruction file or an import chain, are refused (fail closed)', (t) => {
+  const cases = {
+    'a cycle': [{ 'CLAUDE.md': '@a.md\n' }, { 'a.md': 'b.md', 'b.md': 'a.md' }],
+    'a dangling import': [{ 'CLAUDE.md': '@gone.md\n' }, { 'gone.md': 'nowhere.md' }],
+    'an import link out of the repo': [{ 'CLAUDE.md': '@out.md\n' }, { 'out.md': '../../outside.md' }],
+    'an import link to an absolute path': [{ 'CLAUDE.md': '@out.md\n' }, { 'out.md': '/etc/hosts' }],
+    'a directory link out of the repo': [{ 'CLAUDE.md': '@d/x.md\n' }, { d: '../../elsewhere' }],
+    'a dangling instruction file': [{}, { 'sub/AGENTS.md': 'nowhere.md' }],
+    'an instruction file linked out of the repo': [{}, { 'sub/AGENTS.md': '../../outside.md' }],
+  };
+  for (const [what, [files, links]] of Object.entries(cases)) {
+    const w = world(t, { baseFiles: files, baseLinks: links });
+    w.append(LEDGER, row(2));
+    w.repo.commit('ledger row');
+    const r = refused(exemptWith(w), /symlink|link/i);
+    assert.ok(r.reason, what);
+  }
+  // A plain missing import (no link involved) is nothing to follow.
+  assert.equal(exemptWith(importWorld(t, { 'CLAUDE.md': '@nothing/here.md\n' })).exempt, true);
+});
+
+test('@/absolute and @~/home imports resolve against the repo root and HOME: inside the repo they compare, outside they are ignored', (t) => {
+  const abs = (dir) => `see @${dir}/docs/ledger.md\n`;
+  const w = importWorld(t, { 'CLAUDE.md': (dir) => abs(dir) });
+  refused(exemptWith(w), /CLAUDE\.md imports docs\/ledger\.md/);
+  const home = importWorld(t, { 'CLAUDE.md': (dir) => `see @~/${dir.split('/').at(-1)}/docs/ledger.md\n` });
+  refused(exemptWith(home, { home: dirname(home.dir) }), /CLAUDE\.md imports docs\/ledger\.md/);
+  // a ../ walk that comes back into the repo through an absolute path
+  const back = importWorld(t, { 'CLAUDE.md': (dir) => `@${dir}/src/../docs/ledger.md\n` });
+  refused(exemptWith(back), /imports docs\/ledger\.md/);
+  // outside the repo: cannot be a listed document, so it does not matter
+  const out = importWorld(t, { 'CLAUDE.md': '@/etc/hosts @~/notes/x.md @../../elsewhere.md\n' });
+  const r = exemptWith(out, { home: '/home/nobody' });
+  assert.equal(r.exempt, true, r.reason);
+  // an @~ import with no HOME cannot be judged
+  refused(exemptWith(out, { home: '' }), /cannot be judged|HOME/);
+});
+
+test('an instruction file too large to read cannot be judged: refused', (t) => {
+  const w = importWorld(t, { 'CLAUDE.md': `${'x '.repeat(600_000)}\n` });
+  refused(exemptWith(w), /CLAUDE\.md.*(too large|cannot be (read|judged))/);
+});
+
 // ---- the final gate's review check, and review-complete ---------------------------------------------------------------
 
 const gateRoot = (w) => { saveState(w.dir, w.state); return w.dir; };

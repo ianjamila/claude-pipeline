@@ -230,6 +230,14 @@ function importProblem({ toHead, root, listed, tree, home, o }) {
   return null;
 }
 
+// A reviewed file with no final newline: appending a line rewrites its last line, which git reports as one removed and one added line.
+// Both blobs say so exactly (HEAD is the reviewed text plus a newline plus more). Still a round, but with the real reason.
+function newlineProblem(reviewed, head) {
+  if (typeof reviewed !== 'string' || typeof head !== 'string' || reviewed === '' || reviewed.endsWith('\n')) return null;
+  if (!head.startsWith(`${reviewed}\n`)) return null;
+  return 'the reviewed version has no final newline, so appending a line rewrote its last line (git sees an edited line); that needs a review round, and the file should end in a newline';
+}
+
 // Why the lines this file ADDS are not ledger rows laid out as the exemption allows, or null. `reviewed`: the file at the reviewed head
 // (null when it is new), `head`: the file at HEAD. The diff has no removed line here, so the added lines are the only change.
 function rowsProblem(file, f, reviewed, head, migrations) {
@@ -363,7 +371,8 @@ function decide(state, { root, config, hash, home }) {
       continue;
     }
     const file = f.newPath ?? f.path;
-    const why = fileProblem(f, modes.get(f.newPath ?? f.oldPath ?? f.path));
+    let why = fileProblem(f, modes.get(f.newPath ?? f.oldPath ?? f.path));
+    if (why && f.status === 'M') why = newlineProblem(showFile(toHead, file, o), showFile('HEAD', file, o)) ?? why;
     if (why) problems.push(`${paths.join(' -> ')}: ${why}`);
     else {
       const rows = rowsProblem(file, f, f.status === 'A' ? null : showFile(toHead, file, o), showFile('HEAD', file, o), migrations);
