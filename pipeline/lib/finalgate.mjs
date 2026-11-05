@@ -210,9 +210,11 @@ function behindBase({ info, diff, root, config, baseSha = null }) {
 export const validLabels = (labels) => Array.isArray(labels) && labels.every((l) => isObject(l) && typeof l.name === 'string');
 
 // A reply that does not carry a proper label list is not "no blocking labels": it is no answer.
-export function labelsCheck(info) {
+// `exemptHold` (--owner-go, an eligible needs-human hold the owner's "merge" lifts, lib/hold.mjs): needs-human alone is not counted; every other blocking label is.
+const withoutHold = (names, exemptHold) => (exemptHold === true ? names.filter((n) => n.toLowerCase() !== 'needs-human') : names);
+export function labelsCheck(info, { exemptHold = false } = {}) {
   if (!validLabels(info?.labels)) return check('labels', false, 'PR labels could not be read (labels is missing or malformed)');
-  const blocking = blockingLabelsOf(info.labels);
+  const blocking = withoutHold(blockingLabelsOf(info.labels), exemptHold);
   return blocking.length ? check('labels', false, `blocking label(s): ${blocking.join(', ')}`) : check('labels', true, 'no blocking labels');
 }
 
@@ -797,7 +799,8 @@ export function ownerItemsCheck({ items, hardstops, integrity, label }) {
   return check('owner-items', true, items.length === 0 ? 'none' : `${shown}: the owner's "merge" must be bound to them (items ${ownerItemsDigest(items)})`);
 }
 
-export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep }) {
+// `exemptHold` (Rev-4 8): the labels check ignores needs-human for the eligible hold the owner's "merge" names; nothing else does.
+export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep, exemptHold = false }) {
   const head = headSha({ cwd: root });
   const info = await readPrSettled({ gh, pr, fields: [...OWNER_GO_FIELDS], sleep, pauseMs: mergeablePause(env) });
   // The range is GitHub's: the PR's base commit and head, as read now. headRefOid must be the local HEAD (pr-open), baseRefOid a local object.
@@ -809,7 +812,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
   const items = [...(hardstops.ownerItems ?? []), ...(integrity.ownerItems ?? [])];
   const checks = [
     await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config, baseSha }) })),
-    await safely('labels', () => labelsCheck(info)),
+    await safely('labels', () => labelsCheck(info, { exemptHold })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
     await safely('scan-range', () => scanRangeCheck({ root, gh, pr, diff, info, explicit })),
     hardstops,
@@ -889,7 +892,8 @@ export function ownerGoBaseProblem(live) {
 // after that read, so a label, a pause issue or a new push can have landed since. Returns the reasons the merge
 // must not run (empty = go). An unreadable PR is a reason.
 // `base` (--owner-go): the base commit the scan was of; GitHub's baseRefOid must still be it.
-export async function preMergeProblems({ gh, pr, head, base = null }) {
+// `exemptHold` (--owner-go, only the look BEFORE the hold is lifted): needs-human is not counted. Once it is lifted the plain rule applies, and so does the wait.
+export async function preMergeProblems({ gh, pr, head, base = null, exemptHold = false }) {
   let view;
   try {
     view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft', ...(base !== null ? ['baseRefOid'] : [])]);
@@ -901,17 +905,18 @@ export async function preMergeProblems({ gh, pr, head, base = null }) {
   if (view?.isDraft !== false) problems.push('PR is a draft');
   if (view?.headRefOid !== head) problems.push(`PR head is now ${short(view?.headRefOid)}, the gate approved ${short(head)}`);
   if (base !== null && view?.baseRefOid !== base) problems.push(`PR base is now ${short(view?.baseRefOid)}, the scan was of ${short(base)}: scan again`);
-  problems.push(...(await waitBlockers(gh)(view)));
+  problems.push(...(await waitBlockers(gh, { exemptHold })(view)));
   return problems;
 }
 
 // What can stop a queued merge while we wait: a blocking label, or an open pause/rollback issue. Anything unreadable
 // counts as a blocker (the safe direction here is "disable auto-merge").
-export function waitBlockers(gh) {
+export function waitBlockers(gh, { exemptHold = false } = {}) {
   return async (view) => {
     const problems = [];
+    const blocking = validLabels(view?.labels) ? withoutHold(blockingLabelsOf(view.labels), exemptHold) : [];
     if (!validLabels(view?.labels)) problems.push('PR labels could not be read (labels is missing or malformed)');
-    else if (blockingLabelsOf(view.labels).length > 0) problems.push(`blocking label(s): ${blockingLabelsOf(view.labels).join(', ')}`);
+    else if (blocking.length > 0) problems.push(`blocking label(s): ${blocking.join(', ')}`);
     for (const label of ['pipeline-pause', 'pipeline-rollback']) {
       try {
         const issues = gh.listIssues({ label });
