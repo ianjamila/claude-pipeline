@@ -2,6 +2,7 @@
 // output, so a mocked git would prove nothing. Raw `git` (not the wrapper's forced config) so tests can set local
 // config such as diff.noprefix and check the wrapper still copes. Inherited GIT_DIR / GIT_INDEX_FILE are scrubbed so a
 // run from inside a git hook can never touch the outer repo. Every repo is removed when the test process exits.
+import { randomBytes } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -36,8 +37,12 @@ export function createTmpRepo() {
   };
 
   git(['init', '-q', '-b', 'main']);
+  // A per-repo random nonce in the identity (repo-local config, so it reaches commits made through git() directly too):
+  // identical fixtures committed in the same second must not share a head sha, or an approval record keyed on a head
+  // from one process could satisfy another process's negative assertion.
+  const nonce = randomBytes(6).toString('hex');
   git(['config', 'user.name', 'Pipeline Test']);
-  git(['config', 'user.email', 'test@example.invalid']);
+  git(['config', 'user.email', `test-${nonce}@example.invalid`]);
   git(['config', 'commit.gpgsign', 'false']);
   git(['config', 'tag.gpgsign', 'false']);
   git(['config', 'core.autocrlf', 'false']);
