@@ -425,7 +425,11 @@ test('commitTime ignores log.showSignature=true in the user\'s git config (a sig
   repo.git(['add', 'signed.txt']);
   try {
     repo.git(['commit', '-q', '-S', '-m', 'signed']);
-  } catch (err) { t.skip(`this git cannot make an SSH-signed commit (${err.message.split('\n')[0]})`); return; }
+  } catch (err) {
+    // A supported git (>= 2.34) must sign: a failure there is a real regression. Skip only when the version was unparseable.
+    if (gv) throw err;
+    t.skip(`could not parse the git version and this git cannot make an SSH-signed commit (${err.message.split('\n')[0]})`); return;
+  }
   const sha = repo.git(['rev-parse', 'HEAD']).trim();
   assert.match(repo.git(['show', '-s', '--format=%ct', sha]), /signature/i, 'git prints signature text under log.showSignature');
   const expected = Number(repo.git(['show', '-s', '--no-show-signature', '--format=%ct', sha]).trim()) * 1000;
