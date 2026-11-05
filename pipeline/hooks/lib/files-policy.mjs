@@ -2395,8 +2395,54 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   // program text in another language: the admin switch, the hook switch, or a write next to a protected path
   if (variantsOf(text).some((t) => setsAdmin(t, ctx.platform) || hasDisableAll(t))) return deny(`the program ${sf.file} sets PIPELINE_ADMIN or mentions disableAllHooks; only the owner may switch the pipeline guard off`);
   const m = makeMatchers(ctx);
-  if (text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true) && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})`);
+  if (text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true) && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})${programHitWhere(text, m, dir, ctx, sf.file)}`);
   return null;
+}
+
+// Why (#161): the rule above stays strict (a comment names a file as well as code does), but `the program refers to a protected pipeline file` gave no clue WHERE.
+// Called only AFTER the deny is decided, so it can only change the words of the reason, never the decision: it never throws, gives up quietly at its
+// caps (lines, line length, hits, a short time slice inside the evaluation's deadline) and leaves the shared budget as it found it. Each line is judged by the same
+// matcher as the whole text (rawHit, program mode); a reading that needs more than one line (a path joined by `' +` over a line break) has no such line.
+const LOCATE_MAX_LINES = 20_000;
+const LOCATE_MAX_LINE_CHARS = 4_000;
+const LOCATE_MAX_HITS = 5;
+const LOCATE_MS = 250;
+const LOCATE_EXCERPT = 100;
+function programHitWhere(text, m, dir, ctx, file) {
+  const b = ctx.budget;
+  const saved = { grown: b.grown, braceOver: ctx.braceOver };
+  try {
+    const stopAt = Math.min(b.deadline, b.now() + LOCATE_MS);
+    // (rawHit reads a home config folder in program text as a hit when the text holds a call anywhere: `(` `)` `[` `]`; a line is judged as the text would be, with that call added)
+    const hasCall = /[()[\]]/.test(text);
+    const hits = [];
+    let cut = false;
+    let from = 0;
+    for (let n = 1; from <= text.length; n++) {
+      if (n > LOCATE_MAX_LINES || ((n & 63) === 0 && b.now() > stopAt)) { cut = true; break; }
+      let to = text.indexOf('\n', from);
+      if (to < 0) to = text.length;
+      const line = text.slice(from, text[to - 1] === '\r' ? to - 1 : to);
+      from = to + 1;
+      if (line.length > LOCATE_MAX_LINE_CHARS) { cut = true; continue; } // (too long to re-read here; the old message stands unless another line shows it)
+      if (!m.rawHit(line, [dir], true) && !(hasCall && m.rawHit(`${line} ()`, [dir], true))) continue;
+      hits.push({ n, line });
+      if (hits.length >= LOCATE_MAX_HITS) { cut = true; break; }
+    }
+    if (!hits.length) return cut ? '; where it is could not be worked out in the time allowed' : '; no single line holds it (the reference spans lines)';
+    const first = hits[0];
+    let at = Math.max(0, first.line.search(/\.claude|\.codex|pipeline|\.review/i));
+    at = at <= 60 ? 0 : at - 40; // (a short lead-in is kept whole; a long line is cut around the reference)
+    const flat = first.line.slice(at, at + LOCATE_EXCERPT * 2).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').replace(/`/g, "'").trim();
+    const excerpt = (at > 0 ? '…' : '') + flat.slice(0, LOCATE_EXCERPT) + (flat.length > LOCATE_EXCERPT || first.line.length > at + LOCATE_EXCERPT * 2 ? '…' : '');
+    const more = hits.length > 1 ? ` (and ${hits.length - 1}${cut ? ' or more' : ''} more)` : cut ? ' (and possibly more)' : '';
+    return `; the reference is on line ${first.n}${more} of ${file}: \`${excerpt}\`. Reword that line so it does not spell the path (describe the file in words); a comment counts as a reference`;
+  } catch {
+    return '';
+  } finally {
+    b.grown = saved.grown;
+    ctx.braceOver = saved.braceOver;
+  }
 }
 
 // Why: an earlier command on the line wrote (or may have written) the script about to be judged (cp f.sh n.sh; bash n.sh): judge each content it may
