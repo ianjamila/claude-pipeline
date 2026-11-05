@@ -26,10 +26,17 @@ const neverDocsDir = (d) => {
   return l.startsWith('.') || NEVER_DOCS_DIRS.has(l) || ROUTE_DIRS.has(l);
 };
 
+// THE list of agent instruction files, by name at any depth and case. One definition: isDocPath (never a document) and the R4-config
+// hard stop (hardstops.mjs: a PR must not rewrite the rules of the agents that review it) both read it, so they cannot disagree.
+export function isAgentInstructionPath(p) {
+  const name = toPosix(p).split('/').at(-1);
+  return AGENT_INSTRUCTION_NAME.test(name) || AGENT_INSTRUCTION_FILES.has(name.toLowerCase());
+}
+
 export function isDocPath(p) {
   const parts = toPosix(p).replace(/^\.\//, '').split('/');
   const name = parts.at(-1);
-  if (AGENT_INSTRUCTION_NAME.test(name) || AGENT_INSTRUCTION_FILES.has(name.toLowerCase()) || parts.slice(0, -1).some(neverDocsDir)) return false;
+  if (isAgentInstructionPath(name) || parts.slice(0, -1).some(neverDocsDir)) return false;
   if (MARKDOWN.test(name) || DOC_NAMES.test(name)) return true;
   return parts.length > 1 && parts[0].toLowerCase() === 'docs' && DOCS_DIR_TEXT.test(name);
 }
