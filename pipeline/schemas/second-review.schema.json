@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Second review output",
+  "description": "What Codex returns for `triage second-review`: one verdict per requested finding, exactly once. validateSecondReview() in pipeline/lib/triage.mjs enforces it (every requested id exactly once, nothing else).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "decision", "confidence", "reasoning"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "description": "The finding id exactly as given in the packet." },
+          "decision": { "enum": ["ACCEPT", "FOLLOW-UP", "REJECT"], "description": "ACCEPT: the finding is real, fix it in this PR. FOLLOW-UP: real but out of scope for this PR. REJECT: not a real problem or not worth doing." },
+          "confidence": { "enum": ["high", "medium", "low"], "description": "How sure you are, after checking the claims in the code." },
+          "reasoning": { "type": "string", "minLength": 1, "description": "At most three sentences, citing file:line of the code you checked." }
+        }
+      }
+    }
+  }
+}

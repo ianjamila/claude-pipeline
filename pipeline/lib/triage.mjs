@@ -388,6 +388,23 @@ export function applyClaudeRuling(item, { decision, reason, ruledAt }) {
   return next;
 }
 
+// Codex's answer to the second-review packet: {items:[{id, decision, confidence, reasoning}]}, strict like second-review.schema.json (no extra keys; every
+// requested id exactly once; a real decision and confidence; a non-empty reasoning). Nothing is recorded unless this passes.
+export function validateSecondReview(json, itemIds) {
+  const errors = [];
+  if (!isObject(json) || !Array.isArray(json.items)) return { ok: false, errors: ['second review output must be an object {"items": [...]}'] };
+  for (const k of Object.keys(json)) if (k !== 'items') errors.push(`unexpected key "${k}"`);
+  checkIds(json.items, itemIds, 'items', errors);
+  for (const e of json.items) {
+    if (!isObject(e) || typeof e.id !== 'string') continue; // already reported by checkIds
+    for (const k of Object.keys(e)) if (!['id', 'decision', 'confidence', 'reasoning'].includes(k)) errors.push(`${e.id}: unexpected key "${k}"`);
+    if (!oneOf(e.decision, DECISIONS)) errors.push(`${e.id}: decision must be one of ${DECISIONS.join('|')}`);
+    if (!oneOf(e.confidence, CONFIDENCES)) errors.push(`${e.id}: confidence must be one of ${CONFIDENCES.join('|')}`);
+    if (typeof e.reasoning !== 'string' || e.reasoning.trim() === '') errors.push(`${e.id}: reasoning must be a non-empty string`);
+  }
+  return { ok: errors.length === 0, errors };
+}
+
 // Stores the second review's verdict ({decision, confidence, reasoning, model, effort, inputDigest, ranAt}). A Codex ACCEPT forces the final ACCEPT at
 // once (it only ever asks for more work); a dismissal leaves the final as it was: the item still waits for Claude's ruling or a human.
 export function settleSecondReview(item, verdict) {
