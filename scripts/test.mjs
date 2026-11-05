@@ -38,7 +38,7 @@ if (files.length === 0) {
   console.error(shard ? `no test files in shard ${shard.i}/${shard.n}` : 'no test files matched');
   process.exit(2);
 }
-// A fixed machine id keeps lock tests from creating ~/.claude/pipeline-state/machine-id on the developer's machine.
+// A fixed machine id keeps lock tests from creating a machine-id file in the developer's own pipeline state folder.
 const env = {
   ...process.env,
   PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id',
