@@ -579,6 +579,7 @@ test('second-review: an answer that is not exactly one valid verdict per id reco
   const withEntry = (over) => ({ items: [good.items[0], { ...good.items[1], ...over }] });
   const bad = {
     'duplicate id': answerOf(['R1-B1'], ['R1-B1']),
+    'duplicate id, every id present': answerOf(['R1-B1'], ['R1-S1'], ['R1-S1']),
     'unknown id': answerOf(['R1-B1'], ['R1-X9']),
     'missing id': answerOf(['R1-B1']),
     'extra id': answerOf(['R1-B1'], ['R1-S1'], ['R1-S2']),
