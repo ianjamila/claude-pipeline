@@ -9,6 +9,8 @@ import { parseYaml } from '../pipeline/lib/yaml.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(root, rel), 'utf8');
+// the review skill plus the reference file it sends the agent to (owner rulings, extra round, the 3.3 endings)
+const reviewText = () => `${read('skills/review/SKILL.md')}\n${read('skills/review/reference/owner-merge.md')}`;
 
 test('installer hook matchers are what the docs say', () => {
   assert.equal(GUARD_GIT_MATCHER, 'Bash|PowerShell|Monitor|mcp__.*');
@@ -60,17 +62,17 @@ test('a needs-human comment always carries --reason (the command exits 2 without
     }
     assert.ok(!/triage settle[^\n]*--evidence/.test(text), `${doc} still uses triage settle --evidence`);
   }
-  assert.ok(read('skills/review/SKILL.md').includes('--test-cmd') && read('skills/review/SKILL.md').includes('--test-file'));
+  assert.ok(reviewText().includes('--test-cmd') && reviewText().includes('--test-file'));
 });
 
 test('the review skill teaches reading the job exit code, and keeps the update-branch route for a PR whose base moved', () => {
-  const review = read('skills/review/SKILL.md');
+  const review = reviewText();
   assert.match(review, /exitCode/);
   assert.match(review, /update-branch/);
 });
 
 test('the owner-granted extra round: the review skill asks with round-request and never forges the owner; the docs name the grant, the gate machine and the nested-claude vector', () => {
-  const review = read('skills/review/SKILL.md');
+  const review = reviewText();
   assert.match(review, /`reachedMax`.*`owner_approval: chat`/s);
   assert.match(review, /P triage round-request --pr N/);
   assert.match(review, /ends with the exact `line`\*\*, nothing after it/);
@@ -112,7 +114,7 @@ test('the docs-only review exemption is documented where owners and agents look:
   const yml = read('pipeline/templates/pipeline.yml');
   assert.match(yml, /^ {2}docs_exempt_paths: \[\]/m);
   assert.ok(parseYaml(yml).review.docs_exempt_paths.length === 0, 'the template ships the feature off');
-  const skill = read('skills/review/SKILL.md');
+  const skill = reviewText();
   assert.match(skill, /review\.docs_exempt_paths/);
   assert.match(skill, /only add lines|ONLY ADD lines/);
   assert.match(skill, /Verification .*still owed/s);

@@ -117,6 +117,9 @@ for (const doc of docs) {
 const skillsDir = join(root, 'skills');
 const skillDocs = docs.filter((d) => d.startsWith(skillsDir));
 const reviewSkill = readFileSync(join(skillsDir, 'review', 'SKILL.md'), 'utf8');
+const reviewRef = readFileSync(join(skillsDir, 'review', 'reference', 'owner-merge.md'), 'utf8');
+// the skill first (the order test relies on it), then the reference file it sends the agent to for the owner rulings, extra round and 3.3 endings
+const reviewText = `${reviewSkill}\n${reviewRef}`;
 
 test('(a) every `P <name>` / `pipeline <name>` in a skill names a file in pipeline/commands (the per-doc tests above check the flags)', () => {
   const found = skillDocs.flatMap((d) => codeSpans(readFileSync(d, 'utf8')).flatMap(invocationsIn));
@@ -144,17 +147,22 @@ test('(c) the review skill stays short and keeps every step review-complete depe
     'P summary', 'agent-log publish', 'agentLogLine', 'merge.command', '--expect-head',
     // a high-risk PR gets the E2E label before CI; the CI wait is ci-wait (draft-era skips never pass); main's resolution-only rounds
     'ci.e2e_label', 'ci-wait --pr N', 'draft-era SKIPPED', '--dry-run', 'resolutionOnly', 'baseOnly',
-  ]) assert.ok(reviewSkill.includes(needle), `the review skill must mention ${needle}`);
+    // a hold-recovery error with prMerged means the PR did merge
+    'prMerged',
+  ]) assert.ok(reviewText.includes(needle), `the review skill must mention ${needle}`);
   for (const outcome of ['awaiting-owner-merge', 'needs-human', 'blocked', 'awaiting-review']) {
-    assert.match(reviewSkill, new RegExp(`outcome \`${outcome}\``), `the review skill must name the stop outcome ${outcome}`);
+    assert.match(reviewText, new RegExp(`outcome \`${outcome}\``), `the review skill must name the stop outcome ${outcome}`);
   }
   assert.match(reviewSkill, /^name: review$/m);
-  assert.match(reviewSkill, /Head <sha12> · items <digest> · repo <owner\/name>/);
+  assert.match(reviewText, /Head <sha12> · items <digest> · repo <owner\/name>/);
+  assert.match(reviewSkill, /Head <sha12> · items <digest> · repo <owner\/name>/, 'the closing lines stay in SKILL.md too');
+  assert.ok(reviewSkill.includes('reference/owner-merge.md'), 'SKILL.md must send the agent to reference/owner-merge.md');
+  for (const needle of ['## Owner rulings', 'Extra round', '3.3']) assert.ok(reviewRef.includes(needle), `reference/owner-merge.md must contain ${needle}`);
 });
 
 test('(c2) the review skill lists the steps in the order they must run: Codex, triage, comment, fix, mark-implemented, Codex check, review-complete, ready, merge request', () => {
   const at = (needle) => {
-    const i = reviewSkill.indexOf(needle);
+    const i = reviewText.indexOf(needle);
     assert.ok(i >= 0, `the review skill must mention ${needle}`);
     return i;
   };
