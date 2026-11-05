@@ -616,6 +616,8 @@ test('a path segment that ends in a dot is refused (Windows drops it), but sente
   // a segment left ending in a dot after the trailing punctuation is cut is never exempt: here it is cut to the listed document
   refused(exemptWith(importWorld(t, { 'CLAUDE.md': 'see @docs/ledger.md..\n' })), /a listed document/);
   refused(exemptWith(importWorld(t, { 'CLAUDE.md': 'see @docs/ledger.md.\n' })), /imports docs\/ledger\.md, a listed document/);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': 'see @docs/ledger.md.#a\n' })), /imports docs\/ledger\.md, a listed document/);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md.#x\n', 'docs/guide.md': '@ledger.md\n' })), /a listed document/);
   // plain `.` and `..` segments are fine
   for (const body of ['see @docs/guide.md.\n', '@docs/guide.md,\n', '@./docs/./guide.md\n', '@../docs/other.md\n']) {
     const r = exemptWith(importWorld(t, { 'docs/a.md': body, 'CLAUDE.md': '@docs/a.md\n' }));

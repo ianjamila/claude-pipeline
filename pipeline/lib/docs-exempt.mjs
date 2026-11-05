@@ -136,7 +136,8 @@ const dotted = (seg) => seg !== '.' && seg !== '..' && /[. ]$/.test(seg);
 function candidatesOf(token) {
   const out = new Set();
   for (const t of [token, token.replace(TRAILING_PUNCTUATION, '')]) {
-    for (const c of [t, t.split('#')[0]]) if (c !== '') out.add(c);
+    // The fragment can hide punctuation too (`ledger.md.#a`), so trim again after cutting it.
+    for (const c of [t, t.split('#')[0], t.split('#')[0].replace(TRAILING_PUNCTUATION, '')]) if (c !== '') out.add(c);
   }
   return [...out];
 }
