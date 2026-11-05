@@ -180,7 +180,9 @@ export function killTree(pid) {
 
 // Shared by runShellAsync and runAsync: a spawn whose timeout takes the whole process tree down, so no orphan keeps
 // working (or holding the pipes) after the caller has moved on. Resolves; never rejects.
-function spawnAsync(file, args, extra, { cwd, env, input, timeoutMs } = {}) {
+// `onStart(pid)` (optional) is told the child's pid once it is running (undefined when it could not start): a caller that may have to
+// kill the tree from a signal handler (killTree) needs it while the promise is still pending.
+function spawnAsync(file, args, extra, { cwd, env, input, timeoutMs, onStart } = {}) {
   return new Promise((resolve) => {
     const child = spawn(file, args, {
       cwd,
@@ -190,6 +192,7 @@ function spawnAsync(file, args, extra, { cwd, env, input, timeoutMs } = {}) {
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    if (typeof onStart === 'function') onStart(child.pid);
     let stdout = '';
     let stderr = '';
     let timedOut = false;

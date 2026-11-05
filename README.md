@@ -169,6 +169,13 @@ Commands the agent hands you to run (a merge command, `pipeline protect` lines) 
 `gh` is "command not found" there. To see whether a PR would merge without merging it, the agent runs `pipeline merge --pr N
 --dry-run`; it changes nothing and grants nothing.
 
+`pipeline merge --owner-go` (and its dry run) refuse a PR that lacks commits of its base, as does every merge route. A repo can opt in to
+merging such a PR as it is when main's new commits touch none of the PR's files: `merge.behind_base: disjoint` in `.claude/pipeline.yml`
+**on the base branch** (the PR's own copy is never read). Changes to CI and toolchain files on main (`.github/**`, the pipeline config,
+`scripts/verify*`, `.gitattributes`, `.nvmrc`, ...), the repo's `verify.ci_proof_inputs` and its `merge.behind_base_stale_paths` globs always force
+the update. Your "merge" is still for that exact head and items, not for main's commit; the request shown to you says the PR is behind.
+See [docs/cli.md](docs/cli.md) (`merge`).
+
 ## Enforcement — what stops what
 
 | Guarantee | GitHub (Pro) | CI | Global hook | Skill / CLI |

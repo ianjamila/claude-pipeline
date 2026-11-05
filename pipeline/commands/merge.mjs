@@ -10,16 +10,17 @@ import { fill } from '../lib/config.mjs';
 import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
-import { envWithGhDir, runShellAsync } from '../lib/proc.mjs';
+import { envWithGhDir, killTree, runShellAsync } from '../lib/proc.mjs';
 import { postEvent } from '../lib/run-events.mjs';
 import { proofLine } from '../lib/run-record.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { loadState } from '../lib/state.mjs';
-import { approvalConfigDirHint, approvalGap, areasBlock } from '../hooks/lib/owner-go.mjs';
+import { approvalConfigDirHint, approvalGap, areasBlock, holdBlock, readyLine } from '../hooks/lib/owner-go.mjs';
+import { findOrphanedLift, holdTiming, mergeInProgress, parkNoteOf, readEligibleHold, recoverOrphanedLift, withHoldLifted, withMergeLock } from '../lib/hold.mjs';
 import {
-  GATE_FILE, PR_FIELDS, abandonMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, preMergeProblems, readReviewJson,
+  GATE_FILE, PR_FIELDS, READABLE_MERGE_STATES, abandonMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, preMergeProblems, readReviewJson,
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
 import { tailLines } from '../lib/cmd-io.mjs';
@@ -27,7 +28,7 @@ import { checkHolds, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, 
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
-  usage: 'pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST | --owner-go] [--repo DIR]   -> {ok, merged, mergeSha, warning?, warnings?} ; pipeline merge --pr N --dry-run [--owner-go] [--repo DIR]   -> {ok, dryRun:true, wouldMerge, blockers:[{kind, detail}], ownerStep} : the verdict without merging or writing anything (see --dry-run below) ; --owner-go (work that never ran the review skill: no final-gate.json) merges the local HEAD when the PR is open, not a draft, MERGEABLE, not behind its base, without a blocking label, every required check is green on that head, the scan of GitHub\'s own range merge-base(baseRefOid, HEAD)..HEAD passes (check scan-range: base commit present locally, no replace ref / grafts / shallow clone, GitHub\'s pulls/N/files list matches the local diff) and the diff has no blocking hard-stop or test-integrity violation, AND the owner-go hook recorded the owner\'s "merge" for this PR, that head, the LIVE items digest (items none when the diff has no owner item; a diff with chat-mode owner items needs a record for exactly their digest) and, for protected areas, the `Areas <ids>` line shown directly above the Head line (error live-check / owner-go / pre-merge otherwise, naming the lines to show; the last look re-reads baseRefOid and headRefOid and refuses when either moved; output mode owner-go, nothing written); exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge|queued-behind|hold-unreadable; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable. For a repo with merge.hold_command / hold_release_command / hold_check_command (a cooperative merge lock of its own) the repo\'s read-only hold check runs first: another PR\'s active hold that would block this one is error queued-behind {verdict: hold:queued-behind, blockedBy:[PR numbers], holds, doNotUpdate:true, reason} (nothing is updated or merged; do NOT run update-branch; wait, or the owner merges the PR ahead; a fresh "merge" is needed afterwards), an unreadable check is error hold-unreadable (retry later); the check runs again before every branch update, and a merge command whose output says hold:queued-behind is mapped to queued-behind too (cooperative: only a hold-aware merge command catches a hold taken after the check). While it runs the run record of the PR shows inFlight {kind: merge} and step merge; for a repo with verify.deferrable_steps the proofs of the live gate (where each deferrable step was proved: the Mac, or a GitHub run and attempt) are recorded in the run record and in an append-only ci-proof-used event comment before the merge command, and when either write fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate\'s ownerItems, AND the owner-go hook recorded the owner\'s \"merge\" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems. --dry-run (an agent previewing the verdict; never run the repo\'s merge command for that; for a repo with the hold keys it DOES run the repo\'s read-only hold check, reports holds {readable, blockedBy} and names a blocking or unreadable hold as blocker merge-hold, and withdraws every "update the branch" advice from the blockers while a hold is ahead) runs the same checks as the real run (gate file, resumed-run guard, ownerMerge, behind base, the live gate, the --owner-go preconditions) and stops before anything that writes or merges: it never updates the branch (behind-ness is read from GitHub: mergeStateStatus BEHIND, or the compare API showing the head lacks the base tip; blocker behind-base; UNKNOWN / DIRTY or a compare error: behind-base-unverified), writes no run record, event, label, comment or file, and changes no git state (no fetch: for a repo with verify.deferrable_steps the base proof settings are read from the GitHub contents API at the PR\'s baseRefOid, which must exist locally, else blocker proof-settings-unverified). It collects every blocker it can find instead of stopping at the first, and names the owner step instead of refusing on it: ownerStep null (a low-risk review: P merges by itself; or a hardstops / integrity scan that could not run: fix that blocker first, nothing is handed off) | {kind: say-merge, line, areas?, areaIds?} (the exact "Head … · items … · repo …" line; for --owner-go the items are the LIVE scan\'s digest, and for protected areas `areas` is the `Areas <ids>` line to print directly above it) | {kind: owner-runs, command} (gated route: ownerMerge > 0; --owner-go: a blocking hard-stop / integrity violation, or any owner item under owner_approval: label; the repo\'s merge.command filled with PR and head, which the owner runs) | {kind: owner-approval-flags} (a resumed or unchecked run record); for a repo with the hold keys every non-null ownerStep also carries holdEligible: true only for a say-merge / owner-runs ending whose blockers are none, or only the owner-items check and the hardstops / integrity checks behind it when they are a real verdict (hits / violations; a scan that could not run, "could not evaluate" / "could not diff", leaves ownerStep null) (the hand-off may take the merge hold; any other blocker, a hold ahead or an unreadable hold check makes it false). It grants nothing: the real run re-checks the owner\'s record. Exit 0 wouldMerge (given the owner\'s word where ownerStep says so), 1 blockers, 2 --dry-run with --owner-approved-head / --owner-approved-items, 3 GitHub unavailable',
+  usage: 'pipeline merge --pr N [--owner-approved-head SHA --owner-approved-items DIGEST | --owner-go] [--repo DIR]   -> {ok, merged, mergeSha, warning?, warnings?, holdLifted?} ; pipeline merge --pr N --dry-run [--owner-go] [--repo DIR]   -> {ok, dryRun:true, wouldMerge, blockers:[{kind, detail}], ownerStep} : the verdict without merging or writing anything (see --dry-run below) ; --owner-go (work that never ran the review skill: no final-gate.json) merges the local HEAD when the PR is open, not a draft, MERGEABLE, not behind its base, without a blocking label, every required check is green on that head, the scan of GitHub\'s own range merge-base(baseRefOid, HEAD)..HEAD passes (check scan-range: base commit present locally, no replace ref / grafts / shallow clone, GitHub\'s pulls/N/files list matches the local diff) and the diff has no blocking hard-stop or test-integrity violation, AND the owner-go hook recorded the owner\'s "merge" for this PR, that head, the LIVE items digest (items none when the diff has no owner item; a diff with chat-mode owner items needs a record for exactly their digest) and, for protected areas, the `Areas <ids>` line shown directly above the Head line (error live-check / owner-go / pre-merge otherwise, naming the lines to show; the last look re-reads baseRefOid and headRefOid and refuses when either moved; output mode owner-go, nothing written); a needs-human hold the request named (Hold line, hold field, lift wording; see docs/cli.md Owner-go) is lifted by that same owner word and put back whenever nothing merged (output holdLifted on a merge; holdRestored + holdRestoredNote, holdKept + holdKeptNote, holdRestoreUnverified + holdRestoreNote or holdRemovedByOther otherwise; error hold | hold-recovery | hold-restore | merge-in-progress; hold-restore carries holdRestoreFailed: true and exit 1; hold-recovery disarms auto-merge first and adds autoMergeDisarmFailed: true when it could not (disable it by hand) or prMerged: true when the PR merged after all; merge-in-progress = another P merge for the same PR runs on this machine (per-PR lock; other machines are not seen), nothing changed); both routes first put right an earlier --owner-go run that lifted a hold and died (hold-recovery; the dry run lists it as blocker hold-lift-orphan, a lift that cannot be verified as hold-lift-unverified, a merge running now as merge-in-progress); exit 0 merged (mergeSha:null + warning when GitHub cannot name the merge commit), 1 not merged / refused (error: gate|behind-base|live-check|pre-merge|queued-behind|hold-unreadable; behind-base = the base moved: the branch was updated (or the update failed, see outcome), re-verify and run final-gate again), 3 GitHub unavailable. For a repo with merge.hold_command / hold_release_command / hold_check_command (a cooperative merge lock of its own) the repo\'s read-only hold check runs first: another PR\'s active hold that would block this one is error queued-behind {verdict: hold:queued-behind, blockedBy:[PR numbers], holds, doNotUpdate:true, reason} (nothing is updated or merged; do NOT run update-branch; wait, or the owner merges the PR ahead; a fresh "merge" is needed afterwards), an unreadable check is error hold-unreadable (retry later); the check runs again before every branch update, and a merge command whose output says hold:queued-behind is mapped to queued-behind too (cooperative: only a hold-aware merge command catches a hold taken after the check). While it runs the run record of the PR shows inFlight {kind: merge} and step merge; for a repo with verify.deferrable_steps the proofs of the live gate (where each deferrable step was proved: the Mac, or a GitHub run and attempt) are recorded in the run record and in an append-only ci-proof-used event comment before the merge command, and when either write fails nothing is merged (error pre-merge); warnings lists a run record write that failed (never fatal). A run record marked resumed (`P checkpoint --resumed`: a run taken over by ship resume) refuses with error pre-merge unless the owner approved it; so does a run record that cannot be checked (unreadable, invalid or unsupported: it may be a resumed one), and with owner_approval: chat a gate with ownerMerge > 0. Approved = --owner-approved-head names the full gate head, --owner-approved-items the gate\'s ownerItems, AND the owner-go hook recorded the owner\'s \"merge\" for exactly that PR, head and item set (the flags alone refuse); the live gate must still show those ownerItems. Behind its base (--owner-go only, real run and --dry-run; the gated route still updates the branch): refused as behind-base unless the BASE commit\'s .claude/pipeline.yml (never the PR\'s own copy) has merge.behind_base: disjoint AND mergeStateStatus is CLEAN|HAS_HOOKS|UNSTABLE|BLOCKED (never BEHIND / DIRTY / UNKNOWN) AND mergeable is MERGEABLE AND the paths main changed since the merge base (git diff -M, renames as both names, compared NFC and case-folded) share none with the PR\'s paths AND none matches .github/**, .claude/pipeline.yml, scripts/verify*, **/.gitattributes, **/.gitmodules, **/.nvmrc, **/.node-version, **/.tool-versions, the base\'s verify.ci_proof_inputs or its merge.behind_base_stale_paths AND main removed no directory the PR adds into; the output then carries behind {behindBy, mergeBase, baseRefOid, mainFiles, rule: disjoint} (null when up to date), the dry run\'s say-merge ownerStep gains behindNote (show it above the Areas / Head lines) and a compare-API behind whose base tip is not the checked baseRefOid stays a blocker. The owner\'s "merge" stays bound to head + items (+ Areas), not to main\'s commit: the real run re-checks all of this against the base it finds. Every --owner-go merge also pins GitHub\'s baseRefOid while it waits: a base that moved off the evaluated one disables auto-merge and the run exits 1 (not merged). --dry-run (an agent previewing the verdict; never run the repo\'s merge command for that; for a repo with the hold keys it DOES run the repo\'s read-only hold check, reports holds {readable, blockedBy} and names a blocking or unreadable hold as blocker merge-hold, and withdraws every "update the branch" advice from the blockers while a hold is ahead) runs the same checks as the real run (gate file, resumed-run guard, ownerMerge, behind base, the live gate, the --owner-go preconditions) and stops before anything that writes or merges: it never updates the branch (behind-ness is read from GitHub: mergeStateStatus BEHIND, or the compare API showing the head lacks the base tip; blocker behind-base; UNKNOWN / DIRTY or a compare error: behind-base-unverified), writes no run record, event, label, comment or file, and changes no git state (no fetch: for a repo with verify.deferrable_steps the base proof settings are read from the GitHub contents API at the PR\'s baseRefOid, which must exist locally, else blocker proof-settings-unverified). It collects every blocker it can find instead of stopping at the first, and names the owner step instead of refusing on it: ownerStep null (a low-risk review: P merges by itself; or a hardstops / integrity scan that could not run: fix that blocker first, nothing is handed off) | {kind: say-merge, line, areas?, areaIds?, hold?, holdInfo?, ready?, parkNote?} (the exact "Head … · items … · repo …" line; for --owner-go the items are the LIVE scan\'s digest, and for protected areas `areas` is the `Areas <ids>` line to print directly above it; with an eligible needs-human hold (--owner-go, owner_approval: chat, needs-human the only blocking label, a complete readable timeline) `line` carries `· hold <id>`, `hold` is the `Hold <id> by <login> at <ISO>` line to print between Areas and Head, `holdInfo` {id, login, at} the hold as the timeline event shows it (the account is shared: never call it the owner or the agent hold), `ready` the exact 🔀 line ending `and lift its needs-human hold` to close the reply with (without a hold there is no `ready`: print the plain 🔀 line), `parkNote` {label, text, updatedAt} the newest agent-written needs-human park comment as one line prefixed `quoted note: `, only when it was updated at or after the hold event) | {kind: owner-runs, command} (gated route: ownerMerge > 0; --owner-go: a blocking hard-stop / integrity violation, or any owner item under owner_approval: label; the repo\'s merge.command filled with PR and head, which the owner runs) | {kind: owner-approval-flags} (a resumed or unchecked run record); for a repo with the hold keys every non-null ownerStep also carries holdEligible: true only for a say-merge / owner-runs ending whose blockers are none, or only the owner-items check and the hardstops / integrity checks behind it when they are a real verdict (hits / violations; a scan that could not run, "could not evaluate" / "could not diff", leaves ownerStep null) (the hand-off may take the merge hold; any other blocker, a hold ahead or an unreadable hold check makes it false). It grants nothing: the real run re-checks the owner\'s record. Exit 0 wouldMerge (given the owner\'s word where ownerStep says so), 1 blockers, 2 --dry-run with --owner-approved-head / --owner-approved-items, 3 GitHub unavailable',
 };
 
 const APPROVAL_FLAGS = "--owner-approved-head <full head> --owner-approved-items <the gate's ownerItems>";
@@ -67,10 +68,14 @@ export const run = guarded(async (argv, ctx) => {
     if (values['owner-approved-head'] !== undefined || values['owner-approved-items'] !== undefined) {
       throw new UsageError('--owner-go takes no --owner-approved-head / --owner-approved-items: it is bound to the local HEAD and the owner-go record');
     }
-    return guardGh(() => ownerGoMerge({ root, config, pr, gh, ctx }));
+    // One merge per PR at a time on this machine: recovery below must never run under a live merge (lib/hold.mjs withMergeLock).
+    return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: (track) => ownerGoMerge({ root, config, pr, gh, ctx, track }) }));
   }
 
-  return guardGh(async () => {
+  return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: async (track) => {
+    // 0. A lift comment with no label and no merge (an `--owner-go` run that died after removing needs-human) is put right before anything else.
+    const recovered = await recoverOrphanedLift({ gh, pr, refuse, strict: false, env: ctx.env ?? process.env, disableAuto: () => disableAutoMerge({ pr, cwd: root, env: ctx.env }) });
+    if (recovered !== null) return recovered;
     // 1. The gate file must name this head and this patch, in this repo, and be fresh. It is only a binding: it proves nothing by itself.
     const gate = readReviewJson(root, GATE_FILE);
     const head = headSha({ cwd: root });
@@ -97,8 +102,8 @@ export const run = guarded(async (argv, ctx) => {
       else if (values['owner-approved-items'] !== gate.ownerItems) approvalProblem = `--owner-approved-items is not the gate's owner-item set (${gate.ownerItems})`;
       else if (gh.repo().host !== 'github.com') approvalProblem = hostProblem(gh);
       else {
-        const gap = approvalGap({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null }); // the gated route binds items only
-        if (gap !== 'ok') approvalProblem = missingApproval(gap, `${gh.repo().slug} #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}`, `show the request (Owner-merge approval in the review skill: \`Head ${gate.head.slice(0, 12)} · items ${gate.ownerItems} · repo ${gh.repo().slug}\`) and wait for the owner to type "merge"`, { repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null });
+        const gap = approvalGap({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null }); // the gated route binds items only
+        if (gap !== 'ok') approvalProblem = missingApproval(gap, `${gh.repo().slug} #${pr} head ${gate.head.slice(0, 12)} items ${gate.ownerItems}`, `show the request (Owner-merge approval in the review skill: \`${requestParts({ head: gate.head, items: gate.ownerItems, repo: gh.repo().slug }).line}\`) and wait for the owner to type "merge"`, { repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null });
       }
     }
     const ownerApproved = values['owner-approved-head'] !== undefined && approvalProblem === null;
@@ -194,7 +199,8 @@ export const run = guarded(async (argv, ctx) => {
       const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
       const command = fill(config.merge.command, { pr: String(pr), sha: gate.head }, { strict: true });
       // The project command (eaglewatch: scripts/merge-pr.mjs) spawns gh itself: give it the dir gh() would have found.
-      const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
+      const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000, onStart: track.started });
+      track.ended();
       const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
 
       // MERGED is MERGED: a merge commit GitHub cannot name yet is a warning, not a refusal (exit 1 means "nothing merged", and
@@ -250,7 +256,7 @@ export const run = guarded(async (argv, ctx) => {
     warnings.push(...recorder.warnings);
     if (warnings.length > 0) result.output.warnings = warnings;
     return result;
-  });
+  } }));
 });
 
 // `P merge --pr N --owner-go` (owner decision 2026-10-28): the merge route for work that never ran the review skill (no
@@ -275,62 +281,91 @@ const missingApproval = (gap, what, again, q) => (gap === 'provenance'
   : `no owner "merge" is recorded for ${what}: ${again}`);
 const hostProblem = (gh) => `gh resolves this repository on ${gh.repo().host ?? 'an unknown host'}, not github.com, and the owner's "merge" names a repository on github.com`;
 
-// The lines the owner is shown for a --owner-go merge: the Areas line (only when the diff has protected areas) directly above the Head line.
-const requestLines = ({ head, items, repo, areas }) => [areasBlock(areas), `Head ${head.slice(0, 12)} · items ${items} · repo ${repo}`].filter(Boolean);
+// The lines the owner is shown for a merge request, rendered in this ONE place: the Areas line (only when the diff has protected areas), the Hold
+// line (only when a needs-human hold is lifted by the merge; `hold` = {id, login, at}) and the Head line (carrying `· hold <id>` for that hold), in that order.
+const requestParts = ({ head, items, repo, areas, hold }) => ({
+  areas: areasBlock(areas),
+  hold: holdBlock(hold),
+  line: `Head ${head.slice(0, 12)} · items ${items}${hold ? ` · hold ${hold.id}` : ''} · repo ${repo}`,
+});
+const requestLines = (q) => Object.values(requestParts(q)).filter(Boolean);
 
-async function ownerGoMerge({ root, config, pr, gh, ctx }) {
+async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   const head = headSha({ cwd: root });
   const repo = gh.repo().slug;
   if (gh.repo().host !== 'github.com') {
     const reason = hostProblem(gh);
     return refuse('owner-go', [reason], { reason, head });
   }
-  // A merge hold ahead of this PR is answered before anything else: a stale PR behind an older hold would otherwise fail the live check
-  // below with "behind-base ... update the branch", which is exactly what the hold says NOT to do.
+  // Rev 4 item 4: an earlier run that lifted the hold and died is put right (label back, this run refused) before anything else.
+  const recovered = await recoverOrphanedLift({ gh, pr, refuse, env: ctx.env ?? process.env, disableAuto: () => disableAutoMerge({ pr, cwd: root, env: ctx.env }) });
+  if (recovered !== null) return recovered;
+  // A merge hold ahead of this PR is answered next, before the live check: a stale PR behind an older hold would otherwise fail it
+  // with "behind-base ... update the branch", which is exactly what the hold says NOT to do.
   const held = await holdGate({ config, pr, root, env: ctx.env });
   if (held) return holdRefuse(held, { head });
+  // The needs-human hold the owner's "merge" may lift (lib/hold.mjs; none = today's flow, the label stays a blocker). Only the labels check and the
+  // look BEFORE the lift ignore it (Rev-4 8).
+  const { hold } = await readEligibleHold({ gh, pr, config });
   // The live scan first: the owner's record is bound to the owner items and areas IT found (read-only; nothing is written).
-  const live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env });
+  const live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null });
   if (live.head !== head) return refuse('live-check', [`the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`], { head });
   if (!live.ok) return refuse('live-check', live.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`), { head });
   // A.4: never merge without the base re-read below, even if scan-range stops requiring a base sha.
   const noBase = ownerGoBaseProblem(live);
   if (noBase !== null) return refuse('live-check', [noBase], { head });
-  const gap = approvalGap({ repo, pr, head, items: live.ownerItems, areas: live.areas });
+  const asked = { repo, pr, head, items: live.ownerItems, areas: live.areas, hold: hold ?? undefined }; // (absent hold = none: a record that names a hold never approves a PR without one)
+  const gap = approvalGap(asked);
   if (gap !== 'ok') {
-    const lines = requestLines({ head, items: live.ownerItems, repo, areas: live.areas });
-    const reason = missingApproval(gap, `${repo} #${pr} head ${head.slice(0, 12)} items ${live.ownerItems}${live.areas.length > 0 ? ` areas ${live.areas.join(' ')}` : ''}`, `end the reply with ${lines.map((l) => `\`${l}\``).join(' and ')} (from \`P merge --pr ${pr} --dry-run --owner-go\`) and \`🔀 Ready to merge #${pr} — say "merge"\`, and wait for the owner to type "merge"`, { repo, pr, head, items: live.ownerItems, areas: live.areas });
+    const lines = requestLines({ head, items: live.ownerItems, repo, areas: live.areas, hold });
+    const reason = missingApproval(gap, `${repo} #${pr} head ${head.slice(0, 12)} items ${live.ownerItems}${live.areas.length > 0 ? ` areas ${live.areas.join(' ')}` : ''}${hold ? ` hold ${hold.id}` : ''}`, `end the reply with ${lines.map((l) => `\`${l}\``).join(' and ')} (from \`P merge --pr ${pr} --dry-run --owner-go\`) and \`${readyLine([pr], { lift: hold !== null })}\`, and wait for the owner to type "merge"`, asked);
     return refuse('owner-go', [reason], { reason, head });
   }
 
   // A.4: the scan was of GitHub's base and head as read by evaluateOwnerGo; the last look re-reads both and refuses if either moved since.
-  const late = await preMergeProblems({ gh, pr, head, base: live.baseRefOid });
+  const late = await preMergeProblems({ gh, pr, head, base: live.baseRefOid, exemptHold: hold !== null });
   if (late.length > 0) return refuse('pre-merge', late, { head });
 
-  const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
-  const command = fill(config.merge.command, { pr: String(pr), sha: head }, { strict: true });
-  const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000 });
-  const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
-  const merged = (mergeSha, extra = {}) => ({
-    exitCode: EXIT.OK,
-    output: mergeSha
-      ? { ok: true, merged: true, mode: 'owner-go', head, mergeSha, ...extra }
-      : { ok: true, merged: true, mode: 'owner-go', head, mergeSha: null, warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading', ...extra },
+  // `running.pid` (hold lift only) is the merge command's process id while it runs: a signal kills that group and disarms auto-merge before the label goes back.
+  const mergeAndWait = async (running = {}) => {
+    const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
+    const command = fill(config.merge.command, { pr: String(pr), sha: head }, { strict: true });
+    const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(ctx.env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000, onStart: (pid) => { running.pid = pid; track.started(pid); } });
+    running.pid = undefined; // (gone: its pid may be reused)
+    track.ended();
+    const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
+    const merged = (mergeSha, extra = {}) => ({
+      exitCode: EXIT.OK,
+      output: mergeSha
+        ? { ok: true, merged: true, mode: 'owner-go', head, behind: live.behind ?? null, mergeSha, ...extra }
+        : { ok: true, merged: true, mode: 'owner-go', head, behind: live.behind ?? null, mergeSha: null, warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading', ...extra },
+    });
+    // Every --owner-go merge (behind or not) waits with GitHub's baseRefOid pinned to the evaluated one: a queued merge (--auto) must not land on a base nobody checked.
+    const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh, { base: live.baseRefOid }) });
+    if (outcome.state === 'merged') return merged(outcome.mergeSha, ran.code === 0 ? {} : { commandExitCode: ran.code, note: 'the merge command exited non-zero but the PR is MERGED' });
+    const abandoned = await abandonMerge({ gh, pr, cwd: root, env: ctx.env, pollMs });
+    if (abandoned.merged) return merged(abandoned.mergeSha, { note: 'the PR merged while auto-merge was being disabled', autoMergeDisabled: abandoned.autoMergeDisabled });
+    const failure = { merged: false, mode: 'owner-go', head, behind: live.behind ?? null, autoMergeDisabled: abandoned.autoMergeDisabled, commandExitCode: ran.code, commandOutput };
+    const behindHold = queuedBehindOf(config, ran);
+    if (behindHold) return holdRefuse(queuedBehindRefusal(behindHold), failure);
+    if (ran.code !== 0) return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged`, ...failure } };
+    const base = {
+      timeout: 'not merged in time', closed: 'the PR was closed without merging', error: `could not read the PR state while waiting (${outcome.error})`,
+      blocked: `a blocker appeared while waiting: ${(outcome.problems ?? []).join('; ')}`,
+    }[outcome.state];
+    const tail = abandoned.autoMergeDisabled ? 'auto-merge disabled' : 'could not confirm auto-merge is disabled: check the PR by hand';
+    return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${base} — ${tail}`, ...failure } };
+  };
+
+  if (hold === null) return mergeAndWait();
+  // The hold is lifted on the owner's word just before the merge command and put back whenever nothing merges (lib/hold.mjs withHoldLifted).
+  return withHoldLifted({
+    gh, pr, hold, head, items: live.ownerItems, repo, env: ctx.env ?? process.env, refuse,
+    check: () => preMergeProblems({ gh, pr, head, base: live.baseRefOid }),
+    merge: mergeAndWait,
+    kill: killTree,
+    disableAuto: () => disableAutoMerge({ pr, cwd: root, env: ctx.env }),
   });
-  const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh) });
-  if (outcome.state === 'merged') return merged(outcome.mergeSha, ran.code === 0 ? {} : { commandExitCode: ran.code, note: 'the merge command exited non-zero but the PR is MERGED' });
-  const abandoned = await abandonMerge({ gh, pr, cwd: root, env: ctx.env, pollMs });
-  if (abandoned.merged) return merged(abandoned.mergeSha, { note: 'the PR merged while auto-merge was being disabled', autoMergeDisabled: abandoned.autoMergeDisabled });
-  const failure = { merged: false, mode: 'owner-go', head, autoMergeDisabled: abandoned.autoMergeDisabled, commandExitCode: ran.code, commandOutput };
-  const behindHold = queuedBehindOf(config, ran);
-  if (behindHold) return holdRefuse(queuedBehindRefusal(behindHold), failure);
-  if (ran.code !== 0) return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged`, ...failure } };
-  const base = {
-    timeout: 'not merged in time', closed: 'the PR was closed without merging', error: `could not read the PR state while waiting (${outcome.error})`,
-    blocked: `a blocker appeared while waiting: ${(outcome.problems ?? []).join('; ')}`,
-  }[outcome.state];
-  const tail = abandoned.autoMergeDisabled ? 'auto-merge disabled' : 'could not confirm auto-merge is disabled: check the PR by hand';
-  return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${base} — ${tail}`, ...failure } };
 }
 
 // `P merge --pr N --dry-run [--owner-go]`: the verdict of a real `P merge` without anything that writes or merges. Same checks, in the same
@@ -338,10 +373,12 @@ async function ownerGoMerge({ root, config, pr, gh, ctx }) {
 // refused on. Read-only means: no bringUpToDate (the branch is not touched; behind-ness is read), no run record / inFlight / ci-proof-used
 // event, no label or comment, no merge command, no file written, and no shared git state changed (evaluateGate readOnly: no `git fetch`).
 // It grants nothing: the owner's recorded "merge" is checked by the real run.
-const READABLE_MERGE_STATES = new Set(['CLEAN', 'HAS_HOOKS', 'UNSTABLE', 'BLOCKED']);
+// (READABLE_MERGE_STATES is finalgate's: the real --owner-go merge and this dry run accept exactly the same GitHub states.)
 
 // Behind-ness without the update: GitHub's own mergeStateStatus, then the compare API. Never "not behind" by default.
-function readBehind(gh, pr) {
+// `accepted` (--owner-go, merge.behind_base: disjoint): the behind summary the live evaluation accepted. A compare "behind" whose base tip is
+// the very baseRefOid that evaluation scanned is then no blocker; any other base tip (main moved in between) still is.
+function readBehind(gh, pr, { accepted = null } = {}) {
   const view = gh.prView(pr, [...PR_FIELDS, 'baseRefOid']);
   const state = view?.mergeStateStatus;
   if (state === 'BEHIND') return [{ kind: 'behind-base', detail: 'GitHub reports the PR is BEHIND its base (mergeStateStatus BEHIND): update the branch (P update-branch), re-verify and run final-gate again' }];
@@ -353,7 +390,8 @@ function readBehind(gh, pr) {
   }
   try {
     const cmp = gh.compare(view.baseRefName, view.headRefOid);
-    if (cmp.behindBy > 0) return [{ kind: 'behind-base', detail: `the PR head lacks ${cmp.behindBy} commit(s) of ${view.baseRefName} (compare API): update the branch (P update-branch), re-verify and run final-gate again` }];
+    if (cmp.behindBy > 0 && accepted !== null && cmp.baseSha === accepted.baseRefOid) return out;
+    if (cmp.behindBy > 0) return [{ kind: 'behind-base', detail: `the PR head lacks ${cmp.behindBy} commit(s) of ${view.baseRefName} (compare API${accepted !== null ? `; its base tip ${String(cmp.baseSha).slice(0, 8)} is not the ${accepted.baseRefOid.slice(0, 8)} that was checked` : ''}): update the branch (P update-branch), re-verify and run final-gate again` }];
   } catch (err) {
     return [{ kind: 'behind-base-unverified', detail: `could not compare the head with its base (${String(err?.message ?? err).slice(0, 200)})` }];
   }
@@ -377,9 +415,34 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   const scanCrashed = (checks) => checks.some((c) => !c.ok && ['hardstops', 'integrity'].includes(c.name) && c.verdict !== true);
   let crashed = false;
 
+  let hold = null; // --owner-go: the eligible needs-human hold the owner's "merge" would lift (lib/hold.mjs)
+
+  // Read-only: a lift comment with no label and no merge (an `--owner-go` run that died) is reported; the real run puts the label back first. A merge running right now
+  // (the per-PR lock, this machine) is reported instead and the orphan judgement is skipped: it would be wrong under a live merge. The unverified cases are the real run's
+  // refusals: --owner-go refuses when the comments stay unreadable, the gated route tolerates only that.
+  let orphan = null;
+  let busy = null;
+  try {
+    busy = mergeInProgress({ gh, pr, env: ctx.env ?? process.env });
+  } catch (err) {
+    add('merge-in-progress', `the merge lock for #${pr} could not be read (${String(err?.message ?? err).slice(0, 200)})`);
+  }
+  if (busy !== null) add('merge-in-progress', `${busy.why}: the real run refuses until it ends`);
+  else {
+    let found = findOrphanedLift({ gh, pr });
+    if (ownerGo && found.commentsUnreadable) { // (the real --owner-go run reads the comments once more after one pause)
+      await new Promise((resolve) => setTimeout(resolve, holdTiming(ctx.env ?? process.env).pauseMs));
+      found = findOrphanedLift({ gh, pr });
+    }
+    ({ orphan } = found);
+    if (found.unverified !== null && (ownerGo || !found.commentsUnreadable)) add('hold-lift-unverified', `could not check whether an earlier --owner-go run left a needs-human hold lifted (${found.unverified}): the real run refuses (hold-recovery)`);
+  }
+  if (orphan !== null) add('hold-lift-orphan', `an earlier \`P merge --owner-go\` lifted needs-human hold ${orphan.hold} and died before it merged; the real run puts the label back first and refuses (the owner then says "merge" again, for the new hold)`);
+
   if (ownerGo) {
     if (gh.repo().host !== 'github.com') add('owner-go', hostProblem(gh));
-    live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env });
+    ({ hold } = await readEligibleHold({ gh, pr, config }));
+    live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null });
     if (live.head !== head) add('live-check', `the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`);
     const failed = live.checks.filter((x) => !x.ok);
     crashed = scanCrashed(failed);
@@ -420,8 +483,9 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     ownerRuns = !crashed && (Number(live.ownerMerge) > 0 || Number(gate?.ownerMerge) > 0);
   }
 
-  for (const b of readBehind(gh, pr)) add(b.kind, b.detail);
-  for (const reason of await preMergeProblems({ gh, pr, head, base: ownerGo ? live.baseRefOid : null })) add('pre-merge', reason);
+  const behind = ownerGo ? (live.behind ?? null) : null;
+  for (const b of readBehind(gh, pr, { accepted: behind })) add(b.kind, b.detail);
+  for (const reason of await preMergeProblems({ gh, pr, head, base: ownerGo ? live.baseRefOid : null, exemptHold: hold !== null })) add('pre-merge', reason);
 
   // A repo with the hold keys: its read-only check (the only shell command a dry run runs). A hold ahead, or an answer that cannot be
   // read, is a blocker; a branch that is behind must then NOT be updated, so the update advice above is withdrawn.
@@ -460,8 +524,17 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     } catch { /* an unreadable review state is not a low-risk one */ }
     // --owner-go: the live scan's digest, and for protected areas the Areas line to print right above the Head line (areas: that line, areaIds: the ids).
     if (!lowRisk) {
-      ownerStep = { kind: 'say-merge', line: `Head ${head.slice(0, 12)} · items ${live.ownerItems ?? 'none'} · repo ${slug}` };
-      if (ownerGo && live.areas.length > 0) ownerStep = { ...ownerStep, areas: areasBlock(live.areas), areaIds: live.areas };
+      const parts = requestParts({ head, items: live.ownerItems ?? 'none', repo: slug, areas: ownerGo ? live.areas : [], hold });
+      ownerStep = { kind: 'say-merge', line: parts.line };
+      if (ownerGo && live.areas.length > 0) ownerStep = { ...ownerStep, areas: parts.areas, areaIds: live.areas };
+      // The hold the merge would lift (Rev-4 1, 2, 6): from the timeline EVENT (its id, the login that placed it, when) — never described as the owner's or the agent's.
+      // `hold` is the block to print right above the Head line, `ready` the 🔀 line to end with; `parkNote` the agent-written park comment, only when it is at least as new as the hold.
+      if (hold !== null) {
+        const parkNote = parkNoteOf({ gh, pr, hold });
+        ownerStep = { ...ownerStep, hold: parts.hold, holdInfo: hold, ready: readyLine([pr], { lift: true }), ...(parkNote ? { parkNote } : {}) };
+      }
+      // Behind its base but accepted (merge.behind_base: disjoint): the owner is told so in the request, above the Areas / Head lines.
+      if (behind !== null) ownerStep = { ...ownerStep, behindNote: `behind ${config.default_branch} by ${behind.behindBy} commit(s); ${config.default_branch}'s ${behind.mainFiles} new file(s) touch none of this PR's files` };
     }
   }
 
@@ -472,5 +545,5 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   }
 
   const wouldMerge = blockers.length === 0;
-  return { exitCode: wouldMerge ? EXIT.OK : EXIT.FAILED, output: { ok: wouldMerge, dryRun: true, wouldMerge, mode: ownerGo ? 'owner-go' : 'gate', head, blockers, ownerStep, ...(holds ? { holds } : {}) } };
+  return { exitCode: wouldMerge ? EXIT.OK : EXIT.FAILED, output: { ok: wouldMerge, dryRun: true, wouldMerge, mode: ownerGo ? 'owner-go' : 'gate', head, ...(ownerGo ? { behind } : {}), blockers, ownerStep, ...(holds ? { holds } : {}) } };
 }

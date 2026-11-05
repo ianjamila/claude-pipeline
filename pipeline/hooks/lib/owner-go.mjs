@@ -3,7 +3,8 @@
 // alone was the agent's own word: nothing proved the owner had said it (Codex + Fable design reviews, 2026-10-14). So the
 // owner-go recorder (the UserPromptSubmit hook hooks/owner-go.mjs, which fires for the owner's typed prompts and for harness turns, which #128 screens out) writes
 // down each owner prompt that STARTS with "merge", bound to what the reply right before it asked for:
-//   `Head <sha12> · items <digest> · repo <owner/name>` lines + `🔀 Ready to merge #N — say "merge"` (skills/ship, Owner-merge approval).
+//   `Head <sha12> · items <digest> · repo <owner/name>` lines + `🔀 Ready to merge #N — say "merge"` (skills/ship, Owner-merge approval). The block may also carry an
+//   `Areas …` line (protected areas) and a `Hold … by … at …` line with the lift wording on the 🔀 line (the needs-human hold the "merge" lifts): see presentedRequests.
 // `P merge` then needs a record for exactly that repository, PR, head and owner-item set; the guard needs one (for that repository and
 // PR, in that session) before a direct `gh pr merge` / the repo's merge command in an owner_approval: chat repo. Phase 3b: the repository
 // is part of the request, so a "merge" said for #N of one repository never approves #N of another (a fork, a mirror, a vendored copy
@@ -29,9 +30,8 @@
 // token is the owner's. A second GitHub identity + a ruleset is the server-side backstop (issue #65).
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, writeSync } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs } from '../../lib/paths.mjs';
+import { accountHome, isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
 export const MAX_AGE_MS = 24 * 60 * 60 * 1000; // a "merge" older than a day approves nothing
@@ -45,14 +45,10 @@ const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 export const HEAD_CHARS = 12; // the head is shown (and matched) by its first 12 characters at least
 
 // The account's home from the OS user database, NOT $HOME: `HOME=/tmp/x P merge …` must not point the check at a folder the agent
-// can write. (The `home` options below are for the unit tests, which call these functions in-process.)
-export function accountHome() {
-  try {
-    const h = os.userInfo().homedir;
-    if (typeof h === 'string' && h) return h;
-  } catch { /* no passwd entry: fall back */ }
-  return os.homedir();
-}
+// can write. (The `home` options below are for the unit tests, which call these functions in-process.) Defined in lib/paths.mjs, where isTranscriptFile needs the same home.
+// (The guard itself, hooks/lib/files-policy.mjs, builds its home from os.homedir(): where $HOME differs from the passwd home it protects the $HOME one, so a genuine transcript under the passwd home
+// is refused here. Fail closed, accepted.)
+export { accountHome };
 
 export const ownerGoDir = (home = accountHome()) => path.join(home, ...OWNER_GO_REL.split('/'));
 
@@ -79,22 +75,41 @@ export function parseApproval(prompt) {
 }
 
 // The merge request a reply ENDS with. The reply's last lines are the request (skills/ship): optional `Head <sha12> · items <digest> · repo <owner/name>`
-// lines (or, for several PRs, `#N head <sha12> · items <digest> · repo <owner/name>`) directly above the 🔀 line, which is the last non-blank line.
+// lines (or, for several PRs, `#N head <sha12> · items <digest> · repo <owner/name>`) directly above the 🔀 line, which is the last non-blank line. Blank (whitespace-only) lines
+// anywhere in the reply are transparent ("directly above" = the next non-blank line above; EW #1659: a blank line before the 🔀 line voided the owner's "merge"); prose is not.
 // Only that terminal block binds: an earlier block in the same reply, a Head line with prose between it and the 🔀 line, or any
 // text after the 🔀 line binds nothing, and a PR bound twice (two heads, or the same line twice) is ambiguous, so it binds nothing.
 // Protected areas (plan 2026-11-05-chat-merge-protected, rev 4 item 2b): a PR whose diff has owner items is shown with one more line DIRECTLY above its
-// Head line, `Areas <area ids, sorted, one space apart>` (areasBlock: the hard-stop rule ids / integrity kinds P merge --dry-run prints), and the record keeps
-// sha256 of that block (areasDigest). In the several-PR form it is `#N areas <ids>` above `#N head …`. Exactly that shape binds: an Areas line that is
-// not directly above its own Head line (two in a row, one against the 🔀 line, another PR's number) makes the whole block bind nothing. An Areas line with
+// Head line (or directly above the Hold line that sits directly above its Head line), `Areas <area ids, sorted, one space apart>` (areasBlock: the hard-stop rule ids / integrity kinds
+// P merge --dry-run prints), and the record keeps sha256 of that block (areasDigest). In the several-PR form it is `#N areas <ids>` above `#N head …`. Exactly that shape binds: an Areas
+// line that is not directly above its own Head line or Hold line (two in a row, one against the 🔀 line, another PR's number) makes the whole block bind nothing. An Areas line with
 // prose between it and the Head line is no part of the block: the request then binds WITHOUT areas, which approves no diff that has any.
-// Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items, repo, areas? }] } (repo: the
-// lower-cased owner/name, or null when the line names none: such a request approves nothing; areas: the block's digest, absent = no areas shown).
+// The needs-human hold (rev 4 items 2a, 5; review note 6): a PR whose hold the owner's "merge" lifts has the Head line carry ONE `· hold <event id>` field between
+// `items …` and `repo …`, and a canonical `Hold <id> by <login> at <ISO>` line (holdBlock) DIRECTLY above that Head line. Block order, top to bottom: Areas (optional),
+// Hold, Head; Areas binds above Head or above a Hold that sits above its Head. UNLIKE Areas, a Hold-shaped line (the canonical prefix `Hold <id> by `, HOLD_START; prose such as
+// "Hold on, …" is none) anywhere in the reply that is not consumed exactly so (prose between it and its Head, two in a row, against the 🔀 line, ahead of Areas, another PR's, an id
+// other than its Head's `hold` field, a malformed rest) makes the WHOLE reply bind nothing, and so does a Head line with `hold X` and no Hold line right above it; a hold field repeated
+// or after `repo` is no Head line at all. The record keeps the hold id and sha256 of the block (holdDigest). And a request with a hold binds only when the 🔀 line says it lifts the hold
+// (readyLine, LIFT_PHRASE) AND every request bound carries one (singular: the one PR; plural: all listed): the phrase with no hold in the bound requests, or a hold with no phrase, binds nothing.
+// Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items, repo, areas?, hold?, holdBlock? }] } (repo: the
+// lower-cased owner/name, or null when the line names none: such a request approves nothing; areas: the block's digest, absent = no areas shown; hold: the event id,
+// holdBlock: the Hold block's digest, both absent = no hold).
 const READY_LINE = /🔀\s*Ready to merge\s+([^\n]*)/;
+// The request's LAST line is anchored: nothing but spaces before the 🔀 (prose such as `Do not 🔀 Ready to merge …` is no request). READY_LINE stays unanchored: SURFACED_ASK and
+// lastRequestText only ask "does the reply mention a request anywhere".
+const READY_FULL_LINE = new RegExp(`^\\s*${READY_LINE.source}$`);
 const REPO_NAME = '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+';
-const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)(?:\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME}))?\\s*$`, 'i');
+const HOLD_ID = '[A-Za-z0-9_=+/-]{1,128}';
+const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)(?:\\s*(?:·|\\|)\\s*hold\\s+(${HOLD_ID}))?(?:\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME}))?\\s*$`, 'i');
 const AREAS_START = /^\s*(?:#\d+\s+)?areas\b/i;
 const AREA_ID = '[A-Za-z0-9_.-]{1,64}';
 const AREAS_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?areas((?:\\s+${AREA_ID})+)\\s*$`, 'i');
+// "Hold-shaped" is the canonical PREFIX only (`Hold <id> by `, an optional `#N ` before it, any case): prose that merely starts with the word ("Hold on, a second.") is no Hold line.
+const HOLD_START = /^\s*(?:#\d+\s+)?hold\s+\S+\s+by\s+/i;
+// (GitHub logins: letters, digits, hyphens, an optional `[bot]`. A `_` (an EMU login) is rejected on purpose: such a hold has no showable block, so the request fails closed.)
+const HOLD_LOGIN = '[A-Za-z0-9-]{1,39}(?:\\[bot\\])?';
+const HOLD_AT = '\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z';
+const HOLD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?hold\\s+(${HOLD_ID})\\s+by\\s+(${HOLD_LOGIN})\\s+at\\s+(${HOLD_AT})\\s*$`, 'i');
 // The canonical block the owner is shown for the areas of a diff: `Areas <sorted distinct ids>`; '' when there are none.
 export const areasBlock = (ids) => {
   const list = [...new Set((ids ?? []).map(String))].sort();
@@ -105,35 +120,78 @@ export const areasDigest = (ids) => {
   const block = areasBlock(ids);
   return block === '' ? 'none' : createHash('sha256').update(block).digest('hex');
 };
+// The canonical block the owner is shown for the needs-human hold their "merge" lifts: `Hold <event node id> by <actor login> at <created_at>` (the id and login as GitHub
+// spells them, the time exactly as GitHub's created_at: ISO-8601 UTC, whole seconds). '' for input of another shape: a caller treats '' as "no showable hold" and fails closed.
+export const holdBlock = (hold) => {
+  const { id, login, at } = hold ?? {};
+  return typeof id === 'string' && typeof login === 'string' && typeof at === 'string'
+    && new RegExp(`^${HOLD_ID}$`).test(id) && new RegExp(`^${HOLD_LOGIN}$`).test(login) && new RegExp(`^${HOLD_AT}$`).test(at)
+    ? `Hold ${id} by ${login} at ${at}` : '';
+};
+// What the record stores for it and P merge compares: sha256 of the block; 'none' for no hold (null / absent); 'invalid' for a hold with no showable block (it equals no record's value).
+export const holdDigest = (hold) => {
+  if (hold === null || hold === undefined) return 'none';
+  const block = holdBlock(hold);
+  return block === '' ? 'invalid' : createHash('sha256').update(block).digest('hex');
+};
+// The 🔀 line a request ends with. A request whose Head line has a hold ends with the lift phrase (rev 4 item 2a), exactly: `🔀 Ready to merge #N and lift its needs-human hold — say "merge"`,
+// or for several PRs `🔀 Ready to merge #1, #2 and lift their needs-human holds — say "merge"`. presentedRequests binds a hold only under that wording (a dash as `-` / `--` or a final full stop also read).
+export const LIFT_PHRASE = Object.freeze({ one: 'and lift its needs-human hold', many: 'and lift their needs-human holds' });
+export const readyLine = (prs, { lift = false } = {}) => `🔀 Ready to merge ${prs.map((n) => `#${n}`).join(', ')}${lift ? ` ${prs.length === 1 ? LIFT_PHRASE.one : LIFT_PHRASE.many}` : ''} — say "merge"`;
+const LIFT_LINE = new RegExp(`^(#\\d{1,6}(?:\\s*,\\s*#\\d{1,6})*)\\s+(${LIFT_PHRASE.one}|${LIFT_PHRASE.many})\\s*(?:—|\\s--?\\s)\\s*say\\s+"merge"\\.?\\s*$`);
+const liftsHold = (rest, prs) => {
+  const m = LIFT_LINE.exec(rest.trim());
+  return m !== null && m[2] === (prs.length === 1 ? LIFT_PHRASE.one : LIFT_PHRASE.many); // (the PR numbers in m[1] are the text `prs` was read from)
+};
 export function presentedRequests(text) {
-  const lines = String(text ?? '').split(/\r?\n/);
-  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
-  const r = READY_LINE.exec(lines[lines.length - 1] ?? '');
+  const none = (prs) => ({ prs, requests: [] });
+  // A whitespace-only line carries no content, so it is transparent: "directly above" means the next NON-BLANK line above (owner-reported miss, EW #1659: a blank line between the
+  // Head line and the 🔀 line made the owner's "merge" record nothing). Prose still ends the block, and every rule below is unchanged.
+  const lines = String(text ?? '').split(/\r?\n/).filter((l) => l.trim() !== '');
+  const r = READY_FULL_LINE.exec(lines[lines.length - 1] ?? '');
   if (!r) return { prs: [], requests: [] };
   const prs = [...new Set([...r[1].split(/—|\s--?\s|\bsay\b/)[0].matchAll(/#(\d{1,6})\b/g)].map((x) => Number(x[1])))];
   const block = [];
   let i = lines.length - 2;
   for (; i >= 0; i--) {
+    if (lines[i].includes('\r')) break; // a lone \r (CRLF was split off above) redraws the line on a terminal: what the owner sees is not what the parser would read, so it is prose
     const h = HEAD_LINE.exec(lines[i]);
     const a = h ? null : AREAS_LINE.exec(lines[i]);
-    if (!h && !a) break;
-    block.unshift({ h, a });
+    const o = h || a ? null : HOLD_LINE.exec(lines[i]);
+    if (!h && !a && !o) break;
+    block.unshift({ h, a, o });
   }
-  if (i >= 0 && AREAS_START.test(lines[i])) return { prs, requests: [] }; // an Areas line of any other shape against the block: malformed
+  if (i >= 0 && AREAS_START.test(lines[i])) return none(prs); // an Areas line of any other shape against the block: malformed
+  if (lines.slice(0, i + 1).some((l) => HOLD_START.test(l))) return none(prs); // a canonical-prefix Hold line outside the block (prose between it and its Head, an earlier block's): review note 6
   const bound = new Map();
   for (let j = 0; j < block.length; j++) {
     const { h } = block[j];
     if (!h) continue;
-    const above = j > 0 ? block[j - 1].a : null;
-    if (above && (above[1] ?? null) !== (h[1] ?? null)) return { prs, requests: [] }; // another PR's Areas line
+    const hold = h[4] ?? null;
+    const o = block[j - 1]?.o ?? null; // the Hold line right above (null: none)
+    if ((hold === null) !== (o === null)) return none(prs); // a hold field with no Hold line right above, or a Hold line above a Head line without the field
+    let hasHold = null;
+    if (o) {
+      if ((o[1] ?? null) !== (h[1] ?? null) || o[2] !== hold) return none(prs); // another PR's Hold line, or another hold's id
+      const rebuilt = { id: o[2], login: o[3], at: o[4] };
+      if (holdBlock(rebuilt) === '') return none(prs); // (the regex reads T / Z in any case; the block is canonical only in upper case)
+      hasHold = rebuilt;
+    }
+    const above = o ? block[j - 2]?.a ?? null : block[j - 1]?.a ?? null;
+    if (above && (above[1] ?? null) !== (h[1] ?? null)) return none(prs); // another PR's Areas line
     const pr = h[1] ? Number(h[1]) : prs.length === 1 ? prs[0] : null;
     if (pr === null || !prs.includes(pr)) continue;
     const areas = above ? createHash('sha256').update(`Areas ${above[2].trim().split(/\s+/).join(' ')}`).digest('hex') : null;
-    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[4] ? h[4].toLowerCase() : null, ...(areas ? { areas } : {}) });
+    bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[5] ? h[5].toLowerCase() : null, ...(areas ? { areas } : {}), ...(hasHold ? { hold: hasHold.id, holdBlock: holdDigest(hasHold) } : {}) });
   }
-  // An Areas line that no Head line below it takes (a second one in a row, one against the 🔀 line) is a malformed block.
-  if (block.some((b, j) => b.a && !block[j + 1]?.h)) return { prs, requests: [] };
-  return { prs, requests: [...bound.values()].filter(Boolean) };
+  // An Areas line that no Head line below it takes (a second one in a row, one against the 🔀 line) is a malformed block; so is a Hold line no Head line right below takes.
+  const takesHead = (j) => block[j + 1]?.h || (block[j + 1]?.o && block[j + 2]?.h);
+  if (block.some((b, j) => (b.a && !takesHead(j)) || (b.o && !block[j + 1]?.h))) return none(prs);
+  // rev 4 item 2a: a hold binds only under the lift wording, and the wording only when EVERY request bound carries a hold (singular: the one PR; plural: all listed). A Hold-bearing
+  // Head line that binds nothing itself (a PR not on the 🔀 line, an unprefixed Head in the several-PR form, a duplicate) neither makes the wording legitimate nor forbids it.
+  const requests = [...bound.values()].filter(Boolean);
+  if (liftsHold(r[1], prs) ? !prs.every((p) => bound.get(p)?.hold) : requests.some((x) => x.hold)) return none(prs);
+  return { prs, requests };
 }
 
 // Phase 3b: an owner ruling in chat (`P triage owner-ruling`) was the agent's word too: --owner-quote could be any text. A reply that
@@ -532,13 +590,15 @@ export const repoKey = (repo) => (typeof repo === 'string' && new RegExp(`^${REP
 // PROMPT entries only (a tool_result sharing the id is no prompt); two prompt entries with one id is a replayed or forged id: synthetic.
 // A record without prompt_id (a hook that sends none) is matched by its stored words within FALLBACK_WINDOW_MS of the record, same rule.
 // Returns 'owner', 'synthetic', or 'missing' (no such entry within PROVENANCE_CAP_BYTES of the end, or the transcript is not a readable regular
-// file, or one of a shape the guard does not write-protect: R1-B2, lib/paths.mjs isTranscriptFile, the ONE definition files-policy.mjs protects by: a file the
-// guard leaves writable is not evidence of who typed anything, so a transcript_path elsewhere, or in a config dir the environment does not name, is refused here).
+// file, or one of a shape the guard does not write-protect: R1-B2, lib/paths.mjs isTranscriptFile: a file the guard leaves writable is not evidence of who typed anything,
+// so a transcript_path elsewhere is refused here). Codex #145 P1: "protected" means under a config ROOT the guard protects as one AND this check can trust: a folder directly under the account's
+// home with the HOME_CONFIG_DIR_RE shape, NOT under any .claude* folder (a folder-level cp/tar/rsync into /tmp/.claude-x or ~/.claude.personal is not refused, so a forged transcript there would
+// otherwise pass for the owner's words) and NOT $CLAUDE_CONFIG_DIR (this runs in the agent's shell: `CLAUDE_CONFIG_DIR=/tmp/.claude-x P merge`). `home` is the account's home (accountHome, never $HOME); tests pass a temp one.
 // An entry of unknown source (no provenance field) counts as the owner's ONLY when no prompt in the scanned transcript carries any
 // such field (a genuinely old Claude Code); in a modern transcript it is untrusted, and so is an unknown one when the scan fell short of the start.
-export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, capBytes = PROVENANCE_CAP_BYTES, env = process.env } = {}) {
+export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, capBytes = PROVENANCE_CAP_BYTES, home = accountHome() } = {}) {
   const file = record?.transcript_path;
-  if (typeof file !== 'string' || file === '' || !path.isAbsolute(file) || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { env })) return 'missing';
+  if (typeof file !== 'string' || file === '' || !path.isAbsolute(file) || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { home })) return 'missing';
   let match;
   if (typeof record.prompt_id === 'string' && record.prompt_id !== '') {
     const id = record.prompt_id;
@@ -618,7 +678,9 @@ function scanBackwards(file, visit, wants, { chunkBytes, capBytes }) {
 // projects/<project>/<session>.jsonl with <project> in the guard's project-folder shape (R2-B1: below ~/.claude the guard protects only projects/ and a project-shaped folder in it by NAME,
 // so `ln -s ~/.claude/forged ~/.claude/projects/evil`, or a copy of it, is the agent's own file; the scan below lists only project-shaped names too, so the two agree).
 // De-duplicated by real path (one account's projects/ can be a link to the other's). None, or two different files, is null.
-// (Hook-written transcript_path records are different: isTranscriptFile / promptProvenance still honour $CLAUDE_CONFIG_DIR for those, the protected recorder wrote them.)
+// (A hook-written transcript_path record is judged the same way: isTranscriptFile / promptProvenance ignore $CLAUDE_CONFIG_DIR too, since the process that checks is the agent's shell.)
+// Codex #145 P1: the isTranscriptFile test below gets the SAME `home` as the scan, so it accepts exactly these roots and no more: every dir transcriptConfigDirs lists is
+// directly under that home with the HOME_CONFIG_DIR_RE shape, a root the guard protects (its home is the hook process's, the same account's).
 const protectedShape = (rel, session) => { // rel: a real path relative to a root's real path
   const parts = rel.split(/[\\/]/);
   return parts.length === 3 && parts[0] === 'projects' && TRANSCRIPT_PROJECT_RE.test(parts[1]) && parts[2] === `${session}.jsonl`;
@@ -636,7 +698,7 @@ export function legacyTranscriptOf(session, { home = accountHome() } = {}) {
       if (!TRANSCRIPT_PROJECT_RE.test(project)) continue;
       const file = path.join(dir, 'projects', project, `${session}.jsonl`);
       try {
-        if (!lstatSync(file).isFile() || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { env: {} })) continue;
+        if (!lstatSync(file).isFile() || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { home })) continue;
         const real = realpathSync(file);
         if (!roots.some((r) => isInside(real, r) && protectedShape(path.relative(r, real), session))) continue;
         if (!found.has(real)) found.set(real, file);
@@ -647,15 +709,15 @@ export function legacyTranscriptOf(session, { home = accountHome() } = {}) {
 }
 
 // The records of `list` whose prompt is the owner's (each distinct prompt is looked up once). grant: true (the extra-round readers) finds a pre-#128
-// record's transcript by its session (legacyTranscriptOf) when it names none, under `home` only (env never says where; it only reaches promptProvenance).
-function ownedBy(list, { grant = false, home, env } = {}) {
+// record's transcript by its session (legacyTranscriptOf) when it names none, under `home` only (the environment never says where).
+function ownedBy(list, { grant = false, home } = {}) {
   const memo = new Map();
   return list.filter((r) => {
     const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}\0${grant ? r.session : ''}`;
     if (!memo.has(key)) {
       const derive = grant && (typeof r.transcript_path !== 'string' || r.transcript_path === '');
       const file = derive ? legacyTranscriptOf(r.session, { home }) : r.transcript_path;
-      memo.set(key, derive && file === null ? 'missing' : promptProvenance(derive ? { ...r, transcript_path: file } : r, env ? { env } : undefined));
+      memo.set(key, derive && file === null ? 'missing' : promptProvenance(derive ? { ...r, transcript_path: file } : r, { home }));
     }
     return memo.get(key) === 'owner';
   });
@@ -668,42 +730,48 @@ function ownedBy(list, { grant = false, home, env } = {}) {
 // the owner was shown for them (areasDigest). A record without the field (shown before Areas lines, or none shown) means "no areas": it still approves a
 // diff without areas, exactly as before, and never one with areas. `areas: null` (only the gated route, bound by the gate's ownerItems) says "this route does
 // not bind areas" and compares nothing; `undefined` (a caller that forgot) compares as no areas, so it fails closed.
-const approvalsFor = ({ repo, pr, head, items, areas, ...opts }) => {
+// `hold` (rev 4 items 2a, 5; the same rule for the needs-human hold): `{ id, login, at }`, the LIVE hold P merge read from the PR timeline (null: no hold); the record must name exactly
+// that hold id AND carry the digest of the Hold block the owner was shown (holdDigest), compared both ways: an old record without them (shown before Hold lines) never lifts a hold, a
+// record for hold X never covers hold Y, a record with a hold never approves a PR that has none now. `hold: null` (only the gated route, which lifts no hold) compares nothing;
+// `undefined` (absent, a caller that forgot) means "no hold" and fails closed.
+const approvalsFor = ({ repo, pr, head, items, areas, hold, ...opts }) => {
   const key = repoKey(repo);
   if (key === null || !/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return [];
   const wantAreas = areas === null ? null : areasDigest(areas);
+  const wantHold = hold === null ? null : { id: hold ? hold.id : 'none', digest: holdDigest(hold) }; // (undefined = no hold)
   return readApprovals(opts).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items
-    && (wantAreas === null || (typeof q.areas === 'string' ? q.areas : 'none') === wantAreas)));
+    && (wantAreas === null || (typeof q.areas === 'string' ? q.areas : 'none') === wantAreas)
+    && (wantHold === null || ((typeof q.hold === 'string' ? q.hold : 'none') === wantHold.id && (typeof q.holdBlock === 'string' ? q.holdBlock : 'none') === wantHold.digest))));
 };
 export function approvalGap(q) {
   const matching = approvalsFor(q);
   if (matching.length === 0) return 'none';
-  return ownedBy(matching).length > 0 ? 'ok' : 'provenance';
+  return ownedBy(matching, { home: q.home }).length > 0 ? 'ok' : 'provenance';
 }
 export const approvedRequest = (q) => approvalGap(q) === 'ok';
 
-// R2-F3: promptProvenance takes the transcript root from the environment of the process that asks (the config-dir variable, lib/paths.mjs), so a genuine record refused for
-// "missing" may only mean the command runs where that variable is not set (a plain terminal, for an owner whose config dir is not ~/.claude*). That is likely when
-// the record's transcript has the shape of a session transcript (<dir>/projects/<project>/<session>.jsonl) yet is under no root this process knows; a record whose
-// transcript is simply gone, or is no transcript at all, gets no hint. Returns text to append to the refusal ('' when it does not apply).
-export const CONFIG_DIR_HINT = 'the transcript of that prompt is under a Claude Code config dir this process does not know (CLAUDE_CONFIG_DIR is not set here, or names another folder): run this command with CLAUDE_CONFIG_DIR set to the owner\'s config dir (the folder that holds projects/), or from inside the Claude Code session';
+// R2-F3 (fix round): promptProvenance trusts a transcript only under a `.claude*` folder directly under the account's home (isTranscriptFile; $CLAUDE_CONFIG_DIR names no root: it is the agent's
+// word). So a genuine record refused for "missing" may only mean the owner's Claude Code config dir is somewhere else. That is likely when the record's transcript has the shape of a session
+// transcript (<dir>/projects/<project>/<session>.jsonl) yet is under no such folder; a record whose transcript is simply gone, or is no transcript at all, gets no hint. The hint says what is
+// required (it cannot be satisfied by setting the variable). Returns text to append to the refusal ('' when it does not apply).
+export const CONFIG_DIR_HINT = 'the transcript of that prompt is not under a Claude Code config dir this check trusts: only a .claude* folder directly under the account\'s home (~/.claude, ~/.claude-work) counts, and CLAUDE_CONFIG_DIR is not consulted, so a config dir anywhere else cannot confirm the owner\'s words; move the owner\'s config dir to a .claude* folder directly under the home';
 const TRANSCRIPT_SHAPE = /[\\/]projects[\\/][^\\/]+[\\/][^\\/]+\.jsonl$/;
-export function configDirHint(records, { env = process.env } = {}) {
+export function configDirHint(records, { home = accountHome() } = {}) {
   const plausible = (r) => {
     const file = r?.transcript_path;
-    return typeof file === 'string' && path.isAbsolute(file) && TRANSCRIPT_SHAPE.test(file) && !/(?:^|[\\/])subagents[\\/]/.test(file) && !isTranscriptFile(file, { env });
+    return typeof file === 'string' && path.isAbsolute(file) && TRANSCRIPT_SHAPE.test(file) && !/(?:^|[\\/])subagents[\\/]/.test(file) && !isTranscriptFile(file, { home });
   };
   return (records ?? []).some(plausible) ? CONFIG_DIR_HINT : '';
 }
-export const approvalConfigDirHint = (q) => configDirHint(approvalsFor(q), { env: q.env });
-export const rulingConfigDirHint = (q) => configDirHint(rulingsFor(q), { env: q.env });
+export const approvalConfigDirHint = (q) => configDirHint(approvalsFor(q), { home: q.home });
+export const rulingConfigDirHint = (q) => configDirHint(rulingsFor(q), { home: q.home });
 
 // The guard, before a direct merge: did the owner say "merge" in this session (last 24 h) for a request about this repository and PR
 // whose head is this full head? (A PR merely named in the prompt, `merge #7`, is recorded in `prs` for the audit trail but approves no head.)
 export function approvedPr({ repo, pr, head, session, ...opts }) {
   const key = repoKey(repo);
   if (key === null || !Number.isInteger(pr) || !/^[0-9a-f]{40}$/.test(String(head)) || !SESSION_RE.test(String(session ?? ''))) return false;
-  return ownedBy(readApprovals({ ...opts, session }).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head)))).length > 0;
+  return ownedBy(readApprovals({ ...opts, session }).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head))), { home: opts.home }).length > 0;
 }
 
 // What an owner's answer to a ruling request decides, per item. Security reviews of f17b251, ff8090f and 009d435: reading decisions
@@ -749,7 +817,7 @@ function rulingsFor({ repo, pr, id, quote, decision, ...opts }) {
 // shape before #110) or no `contentOf` approves nothing.
 // #128: only a record whose prompt is the owner's (promptProvenance) counts.
 export function ownerRuled({ contentOf, ...q }) {
-  return typeof contentOf === 'function' && ownedBy(rulingsFor(q)).some((r) => typeof r.content === 'string' && r.content === contentOf(r.ids));
+  return typeof contentOf === 'function' && ownedBy(rulingsFor(q), { home: q.home }).some((r) => typeof r.content === 'string' && r.content === contentOf(r.ids));
 }
 
 // Why ownerRuled said no, for the message: 'none' (no such answer recorded), 'provenance' (answers exist but none is confirmed as typed by
@@ -758,7 +826,7 @@ export function ownerRuled({ contentOf, ...q }) {
 export function ownerRulingGap(q) {
   const found = rulingsFor(q);
   if (found.length === 0) return 'none';
-  const owned = ownedBy(found);
+  const owned = ownedBy(found, { home: q.home });
   if (owned.length === 0) return 'provenance';
   return owned.every((r) => typeof r.content !== 'string') ? 'no-content' : 'changed';
 }
@@ -885,18 +953,18 @@ function grantsFor({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
 // marker (a consumed, partial or unreadable marker is spent), newest first. All of them: a duplicate "extra round" must not outlive a claim.
 // anyHead: true drops the head test (head is then ignored): the caller compares the head itself, to tell a stale grant from none.
 // #128: only a record whose prompt is the owner's (promptProvenance) counts, as for a "merge".
-export const ownerGrantedRounds = (q = {}) => ownedBy(grantsFor(q), { grant: true, home: q.home, env: q.env });
+export const ownerGrantedRounds = (q = {}) => ownedBy(grantsFor(q), { grant: true, home: q.home });
 
 // Why ownerGrantedRounds found nothing, for the message: 'none' (no such record), 'provenance' (records exist but none is confirmed as typed
 // by the owner) or 'ok' (at least one is the owner's).
 export function ownerGrantGap(q = {}) {
   const found = grantsFor(q);
   if (found.length === 0) return 'none';
-  return ownedBy(found, { grant: true, home: q.home, env: q.env }).length > 0 ? 'ok' : 'provenance';
+  return ownedBy(found, { grant: true, home: q.home }).length > 0 ? 'ok' : 'provenance';
 }
 
 // R2-F3 for a grant: text to append to a refusal when the unconfirmed records' transcripts are under a config dir this process does not know ('' otherwise).
-export const ownerGrantConfigDirHint = (q = {}) => configDirHint(grantsFor(q), { env: q.env });
+export const ownerGrantConfigDirHint = (q = {}) => configDirHint(grantsFor(q), { home: q.home });
 
 // Consumes the grants: exclusively creates one marker per record (sorted by id, so two claimers meet on the same first marker). body =
 // { repo, pr, k, head (40 hex), checkout }; each marker holds { v:1, grantId, repo, pr, k, head, consumedAt, checkout }. The file is written
@@ -988,7 +1056,7 @@ export function verifyOwnerGrant({ repo, pr, k, toHead, ownerGrant } = {}, opts 
   const record = readRecords({ ...opts, maxAgeMs: Infinity, maxBytes: VERIFY_MAX_BYTES }).find((r) => isRoundRecord(r) && grantIdOf(r) === id);
   if (!record) return { ok: false, reason: 'no-record' };
   if (record.repo !== key || record.pr !== pr || record.k !== k || !toHead.startsWith(record.head)) return { ok: false, reason: 'mismatch' };
-  if (ownedBy([record], { grant: true, home: opts.home, env: opts.env }).length === 0) return { ok: false, reason: 'provenance' }; // (#128: the prompt is not the owner's, or is gone from the transcript)
+  if (ownedBy([record], { grant: true, home: opts.home }).length === 0) return { ok: false, reason: 'provenance' }; // (#128: the prompt is not the owner's, or is gone from the transcript)
   const m = readGrantMarker(id, { home: opts.home });
   if (!m.spent) return { ok: false, reason: 'no-marker' };
   if (!m.verifiable) return { ok: false, reason: 'unverifiable-marker' };

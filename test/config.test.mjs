@@ -534,6 +534,27 @@ test('merge.wait_minutes must be an integer 1..120', () => {
   assert.equal(validateConfig({ ...minimal(), merge: { wait_minutes: 120 } }).ok, true);
 });
 
+test('merge.behind_base is update|disjoint (default update); merge.behind_base_stale_paths is an array of valid non-empty globs (default [])', () => {
+  const ok = validateConfig(minimal());
+  assert.equal(ok.ok, true, ok.errors?.join(' | '));
+  assert.equal(ok.config.merge.behind_base, 'update');
+  assert.deepEqual(ok.config.merge.behind_base_stale_paths, []);
+  for (const bad of ['', 'Disjoint', 'always', true, 1, null, ['disjoint']]) {
+    const r = validateConfig({ ...minimal(), merge: { behind_base: bad } });
+    assert.ok(has(r, 'merge.behind_base must be update|disjoint'), `${JSON.stringify(bad)}: ${r.errors.join(' | ')}`);
+  }
+  for (const bad of ['package.json', {}, 5, null, [1], ['ok', null], [''], ['  ']]) {
+    const r = validateConfig({ ...minimal(), merge: { behind_base_stale_paths: bad } });
+    assert.ok(has(r, 'merge.behind_base_stale_paths'), `${JSON.stringify(bad)}: ${r.errors.join(' | ')}`);
+  }
+  const unknown = validateConfig({ ...minimal(), merge: { behind_base_stale_path: ['x'] } });
+  assert.ok(has(unknown, 'merge.behind_base_stale_path'), unknown.errors.join(' | '));
+  const good = validateConfig({ ...minimal(), merge: { behind_base: 'disjoint', behind_base_stale_paths: ['package.json', 'supabase/**', 'tsconfig*.json'] } });
+  assert.equal(good.ok, true, good.errors?.join(' | '));
+  assert.equal(good.config.merge.behind_base, 'disjoint');
+  assert.deepEqual(good.config.merge.behind_base_stale_paths, ['package.json', 'supabase/**', 'tsconfig*.json']);
+});
+
 test('risk.medium_lines <= risk.high_lines, and light_lane_max_lines <= risk.medium_lines', () => {
   const inverted = validateConfig({ ...minimal(), risk: { medium_lines: 700, high_lines: 600 } });
   assert.ok(has(inverted, 'risk.medium_lines must be <= risk.high_lines'), inverted.errors.join(' | '));

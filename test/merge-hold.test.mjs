@@ -27,7 +27,7 @@ test('config: the three hold keys are accepted together and kept', () => {
 test('config: without the keys nothing changes (no default, no error, not configured)', () => {
   const r = validateConfig(minimal());
   assert.equal(r.ok, true);
-  assert.deepEqual(Object.keys(r.config.merge).sort(), ['command', 'wait_minutes']);
+  assert.deepEqual(Object.keys(r.config.merge).sort(), ['behind_base', 'behind_base_stale_paths', 'command', 'wait_minutes']);
   assert.equal(holdsConfigured(r.config), false);
   assert.equal(holdsConfigured(withMerge(HOLD).config), true);
   assert.equal(withMerge({ wait_minutes: 5 }).ok, true);

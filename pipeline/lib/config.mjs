@@ -59,7 +59,10 @@ export const DEFAULTS = deepFreeze({
   // default: turn it on in the same change that applies branch protection with it, or every merge waits for a missing check.
   ci: { required_checks: [], e2e_label: null, draft_while_iterating: false, guard_checks: true, review_check: false, approvers: [] },
   // {sha} is required: the approved head is passed to the merge so a head that moved after review can never merge.
-  merge: { command: 'gh pr merge {pr} --squash --auto --delete-branch --match-head-commit {sha}', wait_minutes: 15 },
+  // behind_base (read from the BASE branch's copy only, and only by `P merge --owner-go`): 'update' (default) = a PR that lacks commits of its base
+  // must be updated and re-verified; 'disjoint' = it may merge as is when main's new commits touch none of the PR's files (and none of the
+  // toolchain / CI inputs). behind_base_stale_paths: extra globs whose change on main always forces the update (e.g. package.json, supabase/**).
+  merge: { command: 'gh pr merge {pr} --squash --auto --delete-branch --match-head-commit {sha}', wait_minutes: 15, behind_base: 'update', behind_base_stale_paths: [] },
   preview: null,
   production: null,
   smoke_checks: [],
@@ -150,6 +153,7 @@ export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 // Renewal starvation: a PR whose hold expires and is renewed goes to the back of the queue; the owner's exits are merging
 // the PR ahead, the provider's own release of that PR, or the provider's own override.
 export const MERGE_HOLD_KEYS = ['hold_command', 'hold_release_command', 'hold_check_command'];
+export const BEHIND_BASE_MODES = Object.freeze(['update', 'disjoint']);
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
@@ -158,7 +162,7 @@ const KEYS = {
   verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes', 'deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes'],
   ci_proof: ['workflow', 'job', 'event', 'steps'],
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'review_check', 'approvers'],
-  merge: ['command', 'wait_minutes', ...MERGE_HOLD_KEYS],
+  merge: ['command', 'wait_minutes', 'behind_base', 'behind_base_stale_paths', ...MERGE_HOLD_KEYS],
   preview: ['environment', 'smoke', 'provider'],
   production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback', 'watch'],
   rollback: ['command', 'notes'],
@@ -644,6 +648,18 @@ export function validateConfig(obj) {
     }
     if (!inRange(mergeSec.wait_minutes, 1, 120)) errors.push('merge.wait_minutes must be an integer 1..120');
     checkMergeHold(mergeSec, errors);
+    if (!BEHIND_BASE_MODES.includes(mergeSec.behind_base)) errors.push(`merge.behind_base must be ${BEHIND_BASE_MODES.join('|')}`);
+    const stale = mergeSec.behind_base_stale_paths;
+    if (!Array.isArray(stale) || !stale.every(isStr)) errors.push('merge.behind_base_stale_paths must be an array of non-empty globs');
+    else {
+      for (const g of stale) {
+        try {
+          globToRegExp(g);
+        } catch (err) {
+          errors.push(`merge.behind_base_stale_paths[${JSON.stringify(g)}]: ${err.message}`);
+        }
+      }
+    }
   }
 
   const review = section(config, 'review', errors);

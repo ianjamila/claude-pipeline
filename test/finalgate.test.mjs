@@ -377,9 +377,10 @@ function ownerWorld() {
   const home = mkdtempSync(join(tmpdir(), 'grant-home-'));
   const grant = ({ k, at, pr = PR, repo = REPO, prompt = 'extra round', claim = true, claimed = at, claimK = k }) => {
     const dir = mkdtempSync(join(tmpdir(), 'grant-tr-'));
-    // #128: the record counts only while its prompt is the owner's in a transcript of the shape Claude Code gives it (helpers/owner-go.mjs).
-    mkdirSync(join(dir, '.claude', 'projects', '-repo'), { recursive: true });
-    const transcript = join(dir, '.claude', 'projects', '-repo', 't.jsonl');
+    // #128: the record counts only while its prompt is the owner's in a transcript of the shape Claude Code gives it (helpers/owner-go.mjs); Codex #145 P1: in a root the guard protects,
+    // here the temp account home's own config folder (the verify calls below pass the same home).
+    mkdirSync(join(home, '.claude', 'projects', '-repo'), { recursive: true });
+    const transcript = join(home, '.claude', 'projects', '-repo', `t-${randomUUID()}.jsonl`);
     const promptId = `pid-${randomUUID()}`;
     const reply = `Round ${k - 1} left items open.\n🔁 Extra review round needed #${pr}: round ${k} · head ${at.slice(0, 12)} · repo ${repo}`;
     writeFileSync(transcript, `${[
