@@ -309,7 +309,7 @@ test('state show: a local second-review verdict or Claude ruling on top of what 
   }
 });
 
-test('state show: a truly superseded copy is still quarantined (other published state, owner ruling, or no baseline)', (t) => {
+test('state show: a truly superseded copy is still quarantined (other published state or no baseline); an owner ruling over a waiting item is local-ahead', (t) => {
   // 1. the baseline is not the published hash: another checkout published since
   const a = world(t);
   const s0 = waitingState();
@@ -318,12 +318,12 @@ test('state show: a truly superseded copy is still quarantined (other published 
   writeBaseline(a.A, 7, H('f'));
   saveState(a.A, change(s0, 'R1-B1', { secondReview: verdict() }));
   assert.equal(a.show(a.A).json.source, 'quarantined');
-  // 2. an owner ruling is local-only work that the published state does not have: restored without it (unchanged behaviour)
+  // 2. an owner ruling over an item still waiting for a human is local progress, like the owner's override of a Claude final (R2-F1): kept, not restored without it
   const b = world(t);
   saveState(b.A, s0);
   assertExit(b.comment(b.A), 0);
   saveState(b.A, change(s0, 'R1-B1', { final: { decision: 'ACCEPT', by: 'owner', needsHuman: false, reason: 'ok', ownerQuote: 'R1-B1: accept', overruled: waiting() } }));
-  assert.equal(b.show(b.A).json.source, 'quarantined');
+  assert.equal(b.show(b.A).json.source, 'local-ahead');
   // 3. no baseline file at all (a copy from an older CLI that does not extend the published one)
   const c = world(t);
   saveState(c.A, s0);
@@ -381,6 +381,58 @@ test('state show: the same local change is quarantined when the PR moved on, and
     const w = world(t);
     saveState(w.A, base);
     assertExit(w.comment(w.A), 0);
+    saveState(w.A, change(base, 'R1-B1', { final }));
+    assert.equal(w.show(w.A).json.source, 'quarantined', name);
+  }
+});
+
+// R2-B1: several unpublished steps nest the previous final (Claude REJECT -> FOLLOW-UP -> ACCEPT -> owner): the chain is walked back to the published final.
+const followedUp = () => claudeFinal({ decision: 'FOLLOW-UP', reason: 'worth a ticket', claude: { ruledAt: 'later', cause: 'low-confidence', critical: false, overruled: claudeFinal() } });
+const tightenedTwice = () => claudeFinal({ decision: 'ACCEPT', reason: 'real after all', claude: { ruledAt: 'later still', cause: 'low-confidence', critical: false, overruled: followedUp() } });
+const ownerOverTightened = () => ({ ...overridden(), overruled: tightened() });
+const ownerOverWaiting = () => ({ decision: 'ACCEPT', by: 'owner', needsHuman: false, reason: 'owner says fix', ownerQuote: 'R1-B1: accept', ruledAt: 'later', overruled: waiting() });
+
+test('state show: a chain of unpublished Claude / owner steps over the published final is kept (local-ahead) and publishes as is', (t) => {
+  for (const [name, base, final] of [
+    ['two Claude steps', claudeRejected(), tightenedTwice()],
+    ['Claude tightening then owner override', claudeRejected(), ownerOverTightened()],
+    ['two Claude steps then owner override', claudeRejected(), { ...overridden(), overruled: tightenedTwice() }],
+    ['owner over a waiting item', waitingState(), ownerOverWaiting()],
+  ]) {
+    const w = world(t);
+    saveState(w.A, base);
+    assertExit(w.comment(w.A), 0);
+    const ahead = change(base, 'R1-B1', { final });
+    saveState(w.A, ahead);
+    const r = w.show(w.A);
+    assertExit(r, 0, name + r.stdout + r.stderr);
+    assert.equal(r.json.source, 'local-ahead', name);
+    assert.match(r.json.warnings.join(' '), /comment --pr 7 --kind triage/, name);
+    assert.deepEqual(w.state(w.A), JSON.parse(JSON.stringify(ahead)), `${name}: the local decision is untouched`);
+    assert.equal(readdirSync(join(w.A, '.review')).filter((n) => n.startsWith('stale-')).length, 0, `${name}: nothing was quarantined`);
+    assertExit(w.comment(w.A), 0, name);
+    assert.equal(w.pub().rounds[0].items[0].final.decision, 'ACCEPT', `${name}: published now`);
+    assert.equal(w.show(w.A).json.source, 'local', name);
+  }
+});
+
+test('state show: a chain that does not reach the published final, loosens a protected ACCEPT without the owner, or sits on a moved PR is quarantined', (t) => {
+  const deep = (n) => { let f = claudeFinal(); for (let i = 0; i < n; i++) f = claudeFinal({ decision: 'FOLLOW-UP', reason: `step ${i}`, claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: f } }); return f; };
+  const foreign = claudeFinal({ decision: 'ACCEPT', claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: claudeFinal({ decision: 'FOLLOW-UP', reason: 'not the published one', claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: waiting() } }) } });
+  const loosened = claudeFinal({ decision: 'REJECT', reason: 'loosened', claude: { ruledAt: 'x', cause: 'low-confidence', critical: true, overruled: tightened() } });
+  const claudeOverOwner = claudeFinal({ decision: 'REJECT', reason: 'back again', claude: { ruledAt: 'x', cause: 'low-confidence', critical: true, overruled: overridden() } });
+  for (const [name, base, final, moved] of [
+    ['never reaches the published final', claudeRejected(), foreign, false],
+    ['loosens a protected ACCEPT mid-chain', claudeRejected(), loosened, false],
+    ['Claude over an owner ruling', claudeRejected(), claudeOverOwner, false],
+    ['deeper than the walk bound', claudeRejected(), deep(12), false],
+    ['two Claude steps on a moved PR', claudeRejected(), tightenedTwice(), true],
+    ['owner over a waiting item on a moved PR', waitingState(), ownerOverWaiting(), true],
+  ]) {
+    const w = world(t);
+    saveState(w.A, base);
+    assertExit(w.comment(w.A), 0);
+    if (moved) writeBaseline(w.A, 7, H('f'));
     saveState(w.A, change(base, 'R1-B1', { final }));
     assert.equal(w.show(w.A).json.source, 'quarantined', name);
   }
