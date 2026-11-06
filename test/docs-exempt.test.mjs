@@ -634,6 +634,7 @@ test('not a drive, not a home, not a climb: still just a relative path that does
 
 test('a symlink target that is absolute or has a backslash cannot be judged', (t) => {
   for (const [target, why] of [['C:\\x.md', /absolute path/], ['\\x.md', /backslash/], ['\\\\srv\\x.md', /backslash/], ['..\\x', /backslash/], ['docs\\ledger.md', /backslash/], ['C:/x.md', /absolute path/]]) {
+    if (process.platform === 'win32' && target.startsWith('\\\\')) continue; // Node stats a link's target on Windows, and a network path throws before the link exists
     const w = world(t, { baseFiles: { 'CLAUDE.md': '@out.md\n' }, baseLinks: { 'out.md': target } });
     w.append(LEDGER, row(2));
     w.repo.commit('ledger row');
