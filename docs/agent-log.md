@@ -114,3 +114,4 @@ full record.
 - 2026-11-06 · #184 · Claude rules on needs-human review items; one owner "merge" covers the listed rulings · risk high · rounds 10 · arbiter 6 · awaiting-owner-merge
 - 2026-11-06 · #192 · Rulings survive compaction; P merge names the worktree cleanup; Win32 aliases and overBuffer fail closed (#185 #188 #189) · risk high · rounds 5 · arbiter 2 · awaiting-owner-merge
 - 2026-11-06 · #193 · fix(ci-wait): date a failure by its own attempt; refresh a suite when its newest check run completes (#174, #176) · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge
+- 2026-11-06 · #204 · review skill: read the merge dry run whole, never a filtered key · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
