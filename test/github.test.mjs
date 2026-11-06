@@ -283,3 +283,17 @@ test('pagePullRequests: extra variables cannot override owner, name, first or af
   assert.ok(gql.includes('branch=feat/x'));
   assert.deepEqual(gql.filter((a) => /=evil$|^first=1$|^after=/.test(a)), [], gql.join(' '));
 });
+
+test('commitVerification: reads GitHub\'s verification of a commit and its committer; a reply without a verdict throws', () => {
+  const sha = 'a'.repeat(40);
+  const reply = { verified: true, reason: 'valid', committerEmail: 'noreply@github.com', committerLogin: 'web-flow' };
+  const { fake, gh } = mk([REPO, { match: `repos/acme/widgets/commits/${sha} --jq`, stdoutJson: reply }]);
+  assert.deepEqual(gh.commitVerification(sha), reply);
+  assert.match(fake.lines().find((l) => l.startsWith('api ')), /commit\.verification\.verified/);
+  const unsigned = mk([REPO, { match: 'commits/', stdoutJson: { verified: false, reason: 'unsigned', committerEmail: null, committerLogin: null } }]);
+  assert.deepEqual(unsigned.gh.commitVerification(sha), { verified: false, reason: 'unsigned', committerEmail: null, committerLogin: null });
+  for (const bad of [{ reason: 'valid' }, { verified: 'true' }, null, 'x']) {
+    assert.throws(() => mk([REPO, { match: 'commits/', stdoutJson: bad }]).gh.commitVerification(sha), GhError, JSON.stringify(bad));
+  }
+  assert.throws(() => mk([REPO]).gh.commitVerification('main'), TypeError, 'a ref name is not a commit sha');
+});

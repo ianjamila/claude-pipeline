@@ -328,6 +328,25 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       return parents;
     },
 
+    // How GitHub vouches for a commit: { verified, reason, committerEmail, committerLogin } from the REST commits API. A merge GitHub
+    // made itself (the Update branch button, a web merge) is signed by GitHub: committer web-flow / noreply@github.com, verified true.
+    // The approval carry (approval-carry.mjs) accepts only such merges. A reply that does not have this shape throws (never "verified").
+    commitVerification(commit) {
+      const sha = String(commit);
+      if (!/^[0-9a-f]{40}$/.test(sha)) throw new TypeError(`invalid commit sha: ${JSON.stringify(commit)}`);
+      const jq = '{verified: .commit.verification.verified, reason: .commit.verification.reason, committerEmail: .commit.committer.email, committerLogin: .committer.login}';
+      const text = self.apiText(`repos/${self.repo().slug}/commits/${sha}`, jq);
+      let info;
+      try {
+        info = JSON.parse(text);
+      } catch { /* reported below */ }
+      const str = (v) => (typeof v === 'string' ? v : null);
+      if (info === null || typeof info !== 'object' || typeof info.verified !== 'boolean') {
+        throw new GhError({ code: 0, stderr: `commit ${sha} has no readable verification: ${String(text).slice(0, 200)}`, args: ['api', 'commits', sha] });
+      }
+      return { verified: info.verified, reason: str(info.reason), committerEmail: str(info.committerEmail), committerLogin: str(info.committerLogin) };
+    },
+
     // The REST reads ci-wait polls. Each is a paginated list read to the end: with --jq the filter runs per page, so every page
     // prints as one array (`[..][..]`) that parseConcatenatedJson reads whole; a bare --paginate of an object reply would
     // print concatenated objects and lose page 2.
