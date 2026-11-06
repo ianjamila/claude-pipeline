@@ -10,10 +10,10 @@ import { grantIdOf, ownerGrantedRounds } from '../hooks/lib/owner-go.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { loadState, saveState, updateItems } from '../lib/state.mjs';
-import { isProtectedFinal, reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
+import { isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
 import { readBaseline, readPublished, writeBaseline } from '../lib/review-publish.mjs';
 import {
-  allItems, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
+  allItems, canonicalJson, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
   roundDir, stateExtends, withStateLock,
 } from '../lib/review-context.mjs';
 
@@ -26,7 +26,7 @@ export const meta = {
     '  equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,',
     '  quarantinedTo) and the published state is restored. source is local | published | quarantined | local-ahead | local-unverified',
     '  (local-ahead: the PR still holds what this copy last published, and the local copy holds a second-review verdict or a Claude / forced final that was',
-    '  never published: kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline',
+    '  never published, or a decision that continues the published Claude / forced final (a tightened ACCEPT, an owner override: its overruled final is the published one): kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline',
     '  (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)',
     '  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)',
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
@@ -62,14 +62,24 @@ function recoverState(root, pr, ctx) {
 }
 
 // The local copy holds a second-review verdict or a Claude / forced final that the published copy lacks for the same item (what a ruling saved while
-// GitHub was down, or a second review, leaves behind). With the published copy equal to this copy's baseline that is plain local progress, not
-// a superseded copy: it must be published, not quarantined.
+// GitHub was down, or a second review, leaves behind), or a decision that CONTINUES the published protected final: Claude tightening a published dismissal,
+// a second review forcing ACCEPT over it, or the owner's typed override (plan E6), each of which records the final it replaced (final.claude.overruled /
+// final.overruled). With the published copy equal to this copy's baseline that is plain local progress, not a superseded copy: it must be published,
+// not quarantined. Anything that does not name the published final as the one it replaced stays a superseded copy.
+const continuesPublished = (mine, theirs) => {
+  if (!isProtectedFinal(theirs) || mine.final === undefined || canonicalJson(mine.final) === canonicalJson(theirs.final)) return false;
+  if (theirs.final.decision === 'ACCEPT' && !isOwnerRuled(mine)) return false; // Claude cannot loosen an ACCEPT (only the owner's ruling can)
+  const replaced = isOwnerRuled(mine) ? mine.final.overruled : isProtectedFinal(mine) ? mine.final.claude?.overruled : undefined;
+  return replaced !== undefined && canonicalJson(replaced) === canonicalJson(theirs.final);
+};
+
 function localAheadOfPublished(local, published, baseline) {
   if (baseline === null || published.hash !== baseline) return false;
   const theirs = new Map((published.state.rounds ?? []).flatMap((r) => r.items ?? []).map((i) => [i.id, i]));
   return (local.rounds ?? []).flatMap((r) => r.items ?? []).some((i) => {
     const before = theirs.get(i.id);
-    return before !== undefined && ((i.secondReview !== undefined && before.secondReview === undefined) || (isProtectedFinal(i) && !isProtectedFinal(before)));
+    return before !== undefined && ((i.secondReview !== undefined && before.secondReview === undefined) || (isProtectedFinal(i) && !isProtectedFinal(before))
+      || continuesPublished(i, before));
   });
 }
 
