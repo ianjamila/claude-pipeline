@@ -381,6 +381,17 @@ test('toResult: a timeout is never exit 0, whatever status the child reported', 
   assert.equal(toResult({ status: null, error: new Error('spawn x ENOENT') }).stderr, 'spawn x ENOENT');
 });
 
+// A child that has already written its last bytes exits 0 before spawnSync's kill lands, so the status alone reads as success over a cut-off stdout.
+test('toResult: output past maxBuffer is never exit 0, whatever status the child reported', () => {
+  const over = Object.assign(new Error('spawnSync git ENOBUFS'), { code: 'ENOBUFS' });
+  const raced = toResult({ status: 0, signal: null, stdout: 'cut off', stderr: '', error: over });
+  assert.equal(raced.code, 1);
+  assert.equal(raced.stderr, 'spawnSync git ENOBUFS');
+  assert.equal(raced.signal, null);
+  assert.equal(toResult({ status: null, signal: 'SIGTERM', error: over }).code, 1);
+  assert.equal(toResult({ status: 3, error: over }).code, 3);
+});
+
 test('runShell honours input', () => {
   const r = runShell('node -e "process.stdin.pipe(process.stdout)"', { input: 'from stdin' });
   assert.equal(r.stdout, 'from stdin');
