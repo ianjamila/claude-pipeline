@@ -671,6 +671,19 @@ test('an empty segment before the colon, or a stream path that cannot be resolve
   refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@gone/x.md:y\n' }, { gone: 'nowhere/at/all' })), /cannot be judged: a symlink on the way/);
 });
 
+test('a short name followed by a colon is refused as a short name, whichever part of the segment holds it', (t) => {
+  // `~1:` does not match the short-name pattern on the whole segment, and the stream cut leaves `DOCUME~1`, which names nothing in the tree
+  for (const token of ['DOCUME~1::$INDEX_ALLOCATION/ledger.md', 'docs/LEDGER~1::$DATA', 'docs/LEDGER~1.MD:x', 'docs/LEDGER~1:x', 'DOCUME~1:x/ledger.md', 'docs/ledger.md:LEDGER~1']) {
+    const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': `see @${token}\n` })), SHORT);
+    assert.ok(r.reason.includes(`CLAUDE.md imports ${token},`), r.reason);
+  }
+  // a colon after a tilde that is no short name stays judged by the stream rule alone
+  for (const body of ['see @ab:c\n', 'see @note:later\n', 'see @foo~bar\n', 'see @foo~bar:x\n', 'see @README.md:\n']) {
+    const r = exemptWith(importWorld(t, { 'CLAUDE.md': body, 'README.md': 'readme\n' }));
+    assert.equal(r.exempt, true, `${body}: ${r.reason}`);
+  }
+});
+
 test('a colon after a name that does not exist in the tree, and sentence punctuation after a name that does, stay exempt', (t) => {
   for (const [body, files] of [
     ['see @ab:c\n', {}], ['see @note:later\n', {}], ['see @nothere.md:x\n', {}], ['see @nothere/dir::$DATA\n', {}],

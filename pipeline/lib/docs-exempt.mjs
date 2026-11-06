@@ -220,8 +220,10 @@ function importProblem({ listed, tree, o }) {
       // judged only after it is cut off (once with, once without the #fragment); every earlier segment is judged as written.
       const stripped = [m[1], m[1].split('#')[0]].map((x) => x.replace(TRAILING_PUNCTUATION, ''));
       if ([...m[1].split('/').slice(0, -1), ...stripped.flatMap((x) => x.split('/'))].some(dotted)) return `${path} imports ${m[1]}, which cannot be judged because a path segment ending in a dot or a space has two readings: this needs a review round`;
-      // A short name (`LEDGER~1.MD`) has two readings, so a segment that looks like one is refused, judged like the dotted check above.
-      if ([...m[1].split('/').slice(0, -1), ...stripped.flatMap((x) => x.split('/'))].some((seg) => SHORT_NAME.test(seg))) return `${path} imports ${m[1]}, which cannot be judged because a segment that looks like a Windows short name (8.3) has two readings: this needs a review round`;
+      // A short name (`LEDGER~1.MD`) has two readings, so a segment that looks like one is refused, judged like the dotted check above. Every
+      // part of a segment between colons is judged too: `LEDGER~1::$DATA` is a short name followed by a stream, and the stream rule below
+      // would cut it to `LEDGER~1`, which resolves to nothing.
+      if ([...m[1].split('/').slice(0, -1), ...stripped.flatMap((x) => x.split('/'))].flatMap((seg) => seg.split(':')).some((part) => SHORT_NAME.test(part))) return `${path} imports ${m[1]}, which cannot be judged because a segment that looks like a Windows short name (8.3) has two readings: this needs a review round`;
       // A `:` past the drive names an NTFS stream on Windows: `ledger.md::$DATA` and `docs::$INDEX_ALLOCATION/` ARE the file and the directory,
       // a named stream holds other bytes than the file. So when anything exists where the stream is cut off (the part up to the first segment
       // with a colon, that segment cut at it), the token is refused; a git checkout cannot carry a stream of a file it does not have.
