@@ -72,7 +72,7 @@ test('--owner-go, chat mode: a record for `items none` never covers a diff with 
   const r = goMerge(s);
   refused(r, 'owner-go', new RegExp(`items ${live.ownerItems}`), s);
   assert.ok(r.json.reason.includes(areasBlock(live.areas)), r.json.reason);
-  assert.ok(r.json.reason.includes(`Head ${s.head.slice(0, 12)} · items ${live.ownerItems} · repo acme/widgets`), r.json.reason);
+  assert.ok(r.json.reason.includes(`Head ${s.head.slice(0, 16)} · items ${live.ownerItems} · repo acme/widgets`), r.json.reason);
 });
 
 test('--owner-go, chat mode: a record for another digest (the items changed since the owner said "merge") is refused', async (t) => {
@@ -104,11 +104,11 @@ test('round trip: the dry run\'s printed ownerStep.areas + ownerStep.line, as th
   assertExit(d, 0, `${d.stderr}${d.stdout}`);
   const { ownerStep } = d.json;
   assert.equal(ownerStep.kind, 'say-merge');
-  const reply = `Protected areas listed above.\n${ownerStep.areas}\n${ownerStep.line}\n🔀 Ready to merge #${PR} — say "merge"`; // the exact printed text, nothing retyped
+  const reply = `Protected areas listed above.\n${ownerStep.carry}\n${ownerStep.areas}\n${ownerStep.line}\n🔀 Ready to merge #${PR} — say "merge"`; // the exact printed text, nothing retyped
   const live = await liveOf(s);
   const [request, ...rest] = presentedRequests(reply).requests;
   assert.equal(rest.length, 0);
-  assert.equal(request.head, s.head.slice(0, 12));
+  assert.equal(request.head, s.head.slice(0, 16));
   assert.equal(request.items, live.ownerItems);
   assert.equal(request.areas, areasDigest(live.areas));
   ownerSays(t, 'merge', reply);
