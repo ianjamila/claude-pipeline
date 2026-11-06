@@ -180,12 +180,12 @@ export function queuedBehindRefusal(found) {
 // one meanwhile, so the gate ALWAYS runs again after the take. Another hold ahead -> queued-behind and a hold-unreadable re-check
 // are returned with `holdTaken` (did the take confirm) so the caller can clean up; clear -> null (the PUT goes, held or not: the hold
 // is cooperative, a missing hold is not a safety loss). Later cycles of the same call only re-run the first gate.
-// -> { beforeUpdate, info }; `info` is filled as the calls happen: { taken, tookThisCall, take: { confirmed, code, lines, timedOut? } | null }.
+// -> { beforeUpdate, info }; `info` is filled as the calls happen: { taken, tookThisCall, mayHold (the take may have written the label: the auto-releases key on it), take: { confirmed, code, lines, timedOut? } | null }.
 // Not configured -> { beforeUpdate: null, info: null }.
 export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync }) {
   if (!holdsConfigured(config)) return { beforeUpdate: null, info: null };
   const args = { config, pr, root, env, run };
-  const info = { taken: false, tookThisCall: false, take: null };
+  const info = { taken: false, tookThisCall: false, mayHold: false, take: null };
   const beforeUpdate = async () => {
     const first = await holdGate(args);
     if (first) return first;
@@ -194,6 +194,9 @@ export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync })
     info.tookThisCall = true;
     info.take = { confirmed: took.confirmed, code: took.code, lines: took.lines, ...(took.timedOut ? { timedOut: true } : {}) };
     info.taken = took.confirmed;
+    // The take may have written the label: confirmed, timed out (unknown), or any exit but 0/1. A clean exit 1 is the provider refusing
+    // (a draft PR, say): no label was written, so there is nothing to give back.
+    info.mayHold = took.confirmed === true || took.timedOut === true || ![0, 1].includes(took.code);
     const again = await holdGate(args);
     return again ? { ...again, holdTaken: info.taken } : null;
   };

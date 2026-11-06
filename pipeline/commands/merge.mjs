@@ -149,9 +149,9 @@ export const run = guarded(async (argv, ctx) => {
       gh, pr, expectHead: gate.head, maxCycles: 1, waitChecks: false, beforeUpdate, onSuccessor: (x) => recordSuccessor(root, pr, x), ...updateTiming(ctx.env),
     });
     warnings.push(...(synced.successorWarnings ?? []));
-    // Gives back the hold THIS call took (a hold it did not take is never touched): { reason, confirmed, code, lines }; a release that is not confirmed is a warning.
+    // Gives back the hold THIS call may have written (holdInfo.mayHold; a hold it did not take, or a cleanly refused take, is never touched): { reason, confirmed, code, lines }; a release that is not confirmed is a warning.
     const releaseTaken = async (reason) => {
-      if (!holdInfo?.tookThisCall) return undefined;
+      if (!holdInfo?.mayHold) return undefined;
       const rel = await releaseHold({ config, pr, reason, root, env: ctx.env });
       const holdRelease = { reason, confirmed: rel.confirmed === true, code: rel.code ?? null, lines: rel.lines ?? [] };
       if (!holdRelease.confirmed) warnings.push(`the merge hold of #${pr} was NOT released (${reason}; exit ${holdRelease.code}): run \`pipeline merge-hold --pr ${pr} --release --reason ${reason}\``);

@@ -416,7 +416,7 @@ test('holdBeforeUpdate: a gate refusal is returned as is and nothing is taken', 
     assert.equal(r.error, error, name);
     assert.equal('holdTaken' in r, false, `${name}: nothing was taken, so nothing to report`);
     assert.deepEqual(sh.log, ['check'], name);
-    assert.deepEqual(info, { taken: false, tookThisCall: false, take: null }, name);
+    assert.deepEqual(info, { taken: false, tookThisCall: false, mayHold: false, take: null }, name);
   }
 });
 
@@ -453,6 +453,24 @@ test('holdBeforeUpdate: a take that exits 1 or times out, with a clear re-check,
     assert.equal(info.taken, false, name);
     assert.equal(info.tookThisCall, true, name);
     assert.deepEqual(info.take, expect, name);
+  }
+});
+
+test('holdBeforeUpdate: mayHold = the take may have written the label (exit 0, a timeout, an exit other than 0/1); a clean exit 1 is a refusal that wrote nothing (#198)', async () => {
+  for (const [name, take, expected] of [
+    ['exit 0', taken(), true],
+    ['exit 1', taken({ code: 1, stdout: 'refused: draft\n' }), false],
+    ['exit 1 + timed out', taken({ code: 1, timedOut: true }), true],
+    ['exit 0 + timed out', taken({ code: 0, timedOut: true }), true],
+    ['exit 2', taken({ code: 2 }), true],
+    ['exit 7', taken({ code: 7 }), true],
+  ]) {
+    const sh = shell({ take });
+    const { beforeUpdate, info } = before(sh);
+    assert.equal(info.mayHold, false, `${name}: nothing taken yet`);
+    assert.equal(await beforeUpdate(), null, name);
+    assert.equal(info.mayHold, expected, name);
+    assert.equal(info.tookThisCall, true, name);
   }
 });
 
