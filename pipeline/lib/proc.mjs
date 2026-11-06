@@ -117,7 +117,9 @@ export function toResult(r) {
   const overBuffer = r.error?.code === 'ENOBUFS';
   const code = timedOut ? (r.status || TIMEOUT_EXIT_CODE) : overBuffer ? (r.status || 1) : (r.status ?? 1);
   // `pid` is the child's process id (null when it never started): a caller that scans the process table must be able to exclude its own probes.
-  return { code, stdout: r.stdout ?? '', stderr, timedOut, signal: r.signal ?? null, pid: r.pid ?? null };
+  // `overBuffer` (ENOBUFS): stdout / stderr were cut at maxBuffer, so whatever they say, and any exit code, is not the child's own answer.
+  // A caller that turns an exit code or stderr text into a verdict (git's exit 1 = "no match") must check it before reading either.
+  return { code, stdout: r.stdout ?? '', stderr, timedOut, overBuffer, signal: r.signal ?? null, pid: r.pid ?? null };
 }
 
 // `env` is merged over process.env, unless `replaceEnv` is set: then `env` IS the child's whole environment (nothing is
@@ -202,12 +204,14 @@ function spawnAsync(file, args, extra, { cwd, env, input, timeoutMs, onStart } =
     let settled = false;
     let timer;
     let grace;
-    const finish = (code) => {
+    const finish = (code, signal = null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(grace);
-      resolve({ code: timedOut ? (code || TIMEOUT_EXIT_CODE) : (code ?? 1), stdout, stderr, timedOut });
+      // `signal` is how a caller tells a killed child from a plain `exit 1` (code falls back to 1 without a status). spawnAsync collects
+      // all output with no maxBuffer, so `overBuffer` can never be true here; it is returned only so every result has the same shape.
+      resolve({ code: timedOut ? (code || TIMEOUT_EXIT_CODE) : (code ?? 1), stdout, stderr, timedOut, overBuffer: false, signal });
     };
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
@@ -218,7 +222,7 @@ function spawnAsync(file, args, extra, { cwd, env, input, timeoutMs, onStart } =
       if (!stderr) stderr = err.message;
       finish(1);
     });
-    child.on('close', (code) => finish(code));
+    child.on('close', (code, signal) => finish(code, signal ?? null));
     child.stdin.end(input);
     if (timeoutMs) {
       timer = setTimeout(() => {
@@ -247,7 +251,7 @@ export function runAsync(cmd, args = [], opts = {}) {
   try {
     plan = planSpawn(cmd, args);
   } catch (err) {
-    return Promise.resolve({ code: 1, stdout: '', stderr: err.message, timedOut: false });
+    return Promise.resolve({ code: 1, stdout: '', stderr: err.message, timedOut: false, overBuffer: false, signal: null });
   }
   return spawnAsync(plan.file, plan.args, { windowsVerbatimArguments: plan.windowsVerbatimArguments }, opts);
 }

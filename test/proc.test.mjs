@@ -32,7 +32,7 @@ function fakeGhEnv(entries) {
 test('run captures stdout and exit code', () => {
   const r = run('node', ['-e', 'process.stdout.write("hi")']);
   assert.equal(typeof r.pid, 'number', 'the child pid is reported');
-  assert.deepEqual({ ...r, pid: undefined }, { code: 0, stdout: 'hi', stderr: '', timedOut: false, signal: null, pid: undefined });
+  assert.deepEqual({ ...r, pid: undefined }, { code: 0, stdout: 'hi', stderr: '', timedOut: false, overBuffer: false, signal: null, pid: undefined });
 });
 
 test('run reports a non-zero exit code and stderr', () => {
@@ -402,7 +402,7 @@ test('runShellAsync captures output, exit code, env, cwd and input', async () =>
   const ok = await runShellAsync('node -e "process.stdout.write(process.env.CP_A + \'|\' + process.cwd())"', {
     env: { CP_A: 'x' }, cwd: dir,
   });
-  assert.deepEqual(ok, { code: 0, stdout: `x|${dir}`, stderr: '', timedOut: false });
+  assert.deepEqual(ok, { code: 0, stdout: `x|${dir}`, stderr: '', timedOut: false, overBuffer: false, signal: null });
   const bad = await runShellAsync('node -e "process.stderr.write(\'e\'); process.exit(4)"');
   assert.equal(bad.code, 4);
   assert.equal(bad.stderr, 'e');
@@ -433,7 +433,7 @@ test('runAsync passes args verbatim (no shell), env, cwd and input', async () =>
   const r = await runAsync(process.execPath, ['-e', 'process.stdout.write(process.argv[1] + "|" + process.env.CP_A + "|" + process.cwd())', 'a b;"c"'], {
     env: { CP_A: 'x' }, cwd: dir,
   });
-  assert.deepEqual(r, { code: 0, stdout: `a b;"c"|x|${dir}`, stderr: '', timedOut: false });
+  assert.deepEqual(r, { code: 0, stdout: `a b;"c"|x|${dir}`, stderr: '', timedOut: false, overBuffer: false, signal: null });
   assert.equal((await runAsync(process.execPath, ['-e', 'process.stdin.pipe(process.stdout)'], { input: 'piped' })).stdout, 'piped');
   assert.equal((await runAsync(process.execPath, ['-e', 'process.exit(4)'])).code, 4);
 });
@@ -687,4 +687,38 @@ test('toResult: carries the child pid, null when the child never started', () =>
   assert.equal(toResult({ status: 0, pid: 4242 }).pid, 4242);
   assert.equal(toResult({ status: null, pid: 0, error: new Error('spawn x ENOENT') }).pid, 0, 'spawnSync reports pid 0 for a failed spawn; kept as given');
   assert.equal(toResult({ status: 0 }).pid, null);
+});
+
+// #188: past maxBuffer the child's stdout is cut and spawnSync reports ENOBUFS; `code` keeps its mapping (a raced exit 0 becomes 1) but a
+// caller needs the flag, because exit 1 plus a short stderr is what many git commands print for a real "no" answer.
+test('toResult: overBuffer is true for ENOBUFS whatever status the child reported, false otherwise', () => {
+  const over = Object.assign(new Error('spawnSync git ENOBUFS'), { code: 'ENOBUFS' });
+  assert.equal(toResult({ status: 0, error: over, stdout: 'cut' }).overBuffer, true);
+  assert.equal(toResult({ status: 1, error: over, stdout: 'cut' }).overBuffer, true);
+  assert.equal(toResult({ status: 0, error: over }).code, 1, 'the code mapping is unchanged');
+  assert.equal(toResult({ status: 1, error: over }).code, 1);
+  assert.equal(toResult({ status: 0 }).overBuffer, false);
+  assert.equal(toResult({ status: 1 }).overBuffer, false);
+  assert.equal(toResult({ status: 0, error: { code: 'ETIMEDOUT' } }).overBuffer, false);
+});
+
+test('run: a real child printing past a small maxBuffer reports overBuffer, a quiet one does not', () => {
+  const big = run('node', ['-e', "process.stdout.write('x'.repeat(200000))"], { maxBuffer: 1000 });
+  assert.equal(big.overBuffer, true);
+  assert.notEqual(big.code, 0);
+  assert.equal(run('node', ['-e', "process.stdout.write('ok')"], { maxBuffer: 1000 }).overBuffer, false);
+});
+
+// spawnAsync has no maxBuffer (it collects everything), so overBuffer can never be true there: the field is present only for one result shape.
+test('runAsync / runShellAsync: report the signal that killed the child, and overBuffer false (they have no cap)', { skip: process.platform === 'win32' }, async () => {
+  const killer = "process.stderr.write('printed first'); process.kill(process.pid, 'SIGKILL')";
+  const a = await runAsync('node', ['-e', killer]);
+  assert.equal(a.signal, 'SIGKILL');
+  assert.equal(a.code, 1);
+  assert.equal(a.overBuffer, false);
+  const s = await runShellAsync(`node -e "process.kill(process.pid, 'SIGKILL')"`);
+  assert.equal(s.signal, 'SIGKILL');
+  const ok = await runAsync('node', ['-e', 'process.exit(0)']);
+  assert.equal(ok.signal, null);
+  assert.equal(ok.code, 0);
 });
