@@ -1154,3 +1154,14 @@ test('outsideReport lists only Claude project dirs (name starts with "-") as ses
   const got = outsideReport(root, { PIPELINE_SCRATCH_DIR: scr }).map((o) => o.path).sort();
   assert.deepEqual(got, [join(scr, '-home-x-proj', 'sess1'), join(scr, '-home-x-proj', 'sess2')]);
 });
+
+test('applyLaunchd remove: a print that was cut at the buffer limit confirms nothing, even with "Could not find service" in it', () => {
+  const home = tmp('cp-wthome-');
+  const plistPath = join(home, 'x.plist');
+  writeFileSync(plistPath, '<plist/>');
+  const lc = fakeLaunchctl({ print: { code: 1, stderr: 'Could not find service', overBuffer: true } });
+  assert.throws(() => applyLaunchd({ action: 'remove', plistPath, label: 'l', launchctlFn: lc.fn, uid: 7 }), /could not confirm/);
+  assert.equal(existsSync(plistPath), true, 'the plist stays');
+  const st = applyLaunchd({ action: 'status', plistPath, label: 'l', launchctlFn: lc.fn, uid: 7 });
+  assert.match(st.warning, /could not tell/);
+});

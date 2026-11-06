@@ -373,3 +373,15 @@ test('bringUpToDate: an up-to-date branch never asks (nothing would be written)'
   const r = await upToDate(w, { beforeUpdate: () => assert.fail('no PUT, no question') });
   assert.equal(r.outcome, 'up-to-date');
 });
+
+// #188: runShellAsync returns the close event's signal: a killed hold command is code 1 plus `signal`, never the provider's own "no".
+test('takeHold / checkHolds: a hold command killed by a signal is reported with its signal (exit 1 alone looks like a refusal)', async () => {
+  const killed = async () => ({ code: 1, stdout: 'hold taken\n', stderr: '', timedOut: false, overBuffer: false, signal: 'SIGKILL' });
+  const taken = await takeHold({ config: CONFIG, pr: PR, root: '/repo', env: {}, run: killed });
+  assert.deepEqual([taken.confirmed, taken.code, taken.signal], [false, 1, 'SIGKILL']);
+  const plain = await takeHold({ config: CONFIG, pr: PR, root: '/repo', env: {}, run: async () => ({ code: 1, stdout: '', stderr: 'no', timedOut: false, signal: null }) });
+  assert.equal(plain.signal, undefined, 'a plain refusal carries no signal');
+  const checked = await check(killed);
+  assert.equal(checked.ok, false);
+  assert.match(checked.why, /SIGKILL/);
+});

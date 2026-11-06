@@ -7,7 +7,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
-import { ownerGoWiring } from '../pipeline/hooks/lib/git-wiring.mjs';
+import { ownerGoWiring, defaultResolved } from '../pipeline/hooks/lib/git-wiring.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
 
 // /chat is an owner_approval: chat repo whose merge command is `npm run merge -- {pr} --expect-head {sha}`; the owner said "merge" for
@@ -521,4 +521,14 @@ test('Phase 3b: a wrapper\'s -C / --chdir / -D directory is where the merge is j
   allow(`env -C /chat gh pr merge 7 --match-head-commit ${H7}`, '/tmp'); // (the PR the owner approved)
   allow(`env -C /tmp gh pr merge 8 ${pin8}`, '/chat'); // (runs outside the chat repository)
   allow(`env -C /chat gh pr view 8; gh pr merge 8 ${pin8}`, '/tmp'); // (the next command runs in the list's own directory again)
+});
+
+// #188: git config --get-regexp exits 1 for "no override set"; a killed or cut-off git also reports 1 and said nothing.
+test('defaultResolved: exit 1 is "no override" only from a git that finished; a signal, a timeout or output over the buffer limit is unknown', () => {
+  const res = (patch) => () => ({ code: 1, stdout: '', stderr: '', timedOut: false, signal: null, overBuffer: false, ...patch });
+  assert.equal(defaultResolved('/x', res({})), '');
+  assert.equal(defaultResolved('/x', res({ code: 0, stdout: 'remote.origin.gh-resolved base\n' })), 'remote.origin.gh-resolved base\n');
+  for (const patch of [{ overBuffer: true }, { signal: 'SIGKILL' }, { timedOut: true, code: 124 }, { code: 128 }]) {
+    assert.equal(defaultResolved('/x', res(patch)), null, JSON.stringify(patch));
+  }
 });

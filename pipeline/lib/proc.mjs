@@ -275,13 +275,14 @@ export function overrideCommand(name, fallback, env, opts) {
 }
 
 export class GhError extends Error {
-  constructor({ code, stderr, args, timedOut = false }) {
-    super(`gh ${args.join(' ')} ${timedOut ? 'timed out' : 'failed'} (exit ${code})${stderr ? `: ${stderr.trim()}` : ''}`);
+  constructor({ code, stderr, args, timedOut = false, overBuffer = false }) {
+    super(`gh ${args.join(' ')} ${timedOut ? 'timed out' : overBuffer ? 'printed past the buffer limit' : 'failed'} (exit ${code})${stderr ? `: ${stderr.trim()}` : ''}`);
     this.name = 'GhError';
     this.code = code;
     this.stderr = stderr;
     this.args = args;
     this.timedOut = timedOut;
+    this.overBuffer = overBuffer === true; // cut off: its text is not gh's whole answer, so no caller may classify it
   }
 }
 
