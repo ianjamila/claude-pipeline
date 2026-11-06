@@ -4,9 +4,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { bump, cli, ghEntries, scenario, ymlFor, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 import { EW_QUEUED_LINE, answer, blocker, holdCalls, holdFiles, holdYml, seq } from './helpers/merge-hold-env.mjs';
 
 const BLOCKED = answer(PR, [blocker(1400)]);
@@ -134,6 +138,48 @@ test('--owner-go, a repo WITHOUT the hold keys ignores the text: the generic rea
   assertExit(r, 1);
   assert.equal('error' in r.json, false);
   assert.match(r.json.reason, /merge command failed \(exit 1\)/);
+});
+
+// The two features meet: an eligible needs-human hold is lifted for the owner's "merge" (test/owner-go-hold-lift.test.mjs), the merge
+// command then refuses with EagleWatch's queued-behind line (a hold taken after the pre-check). The refusal must reach the caller as
+// queued-behind (blockedBy, doNotUpdate kept) AND needs-human must be put back (withHoldLifted wraps mergeAndWait).
+const fakeGhHold = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-hold.mjs');
+const LIFT = { id: 'LE_hold1', login: 'jamila', at: '2026-11-05T09:00:00Z' };
+const LIFT_EVENT = { event: 'labeled', id: 1, node_id: LIFT.id, created_at: LIFT.at, actor: { login: LIFT.login }, label: { name: 'needs-human' } };
+const liftWorld = () => {
+  const s = scenario({
+    yml: `${holdYml({ merge: goMergeCmd })}hard_stops:\n  paths: ['src/**']\nowner_approval: chat\n`, baseFiles: holdFiles, report: null, state: null, change: unique,
+    gh: { mergeStateStatus: 'CLEAN', labels: ['needs-human'], mergeView: { state: 'OPEN', mergeCommit: null } }, env: { PIPELINE_HOLD_RETRY_MS: '1' },
+  });
+  const file = join(s.fake.dir, 'hold-state.json');
+  writeFileSync(file, JSON.stringify({ labels: ['needs-human'], timeline: [LIFT_EVENT], comments: [], clock: 100, seq: 0, hooks: [], overrides: { timeline: {} }, fail: {} }));
+  s.fake.env.PIPELINE_GH = `node "${fakeGhHold}"`;
+  s.fake.env.PIPELINE_FAKE_GH_STATE = file;
+  s.st = () => JSON.parse(readFileSync(file, 'utf8'));
+  return s;
+};
+
+test('--owner-go, an eligible needs-human hold is lifted and the merge command then prints the queued-behind line: queued-behind kept AND needs-human put back', (t) => {
+  const s = liftWorld();
+  // The owner's reply is exactly what the dry run printed (nothing retyped), as in test/owner-go-hold-lift.test.mjs.
+  const d = cli(['merge', '--pr', String(PR), '--dry-run', '--owner-go'], { dir: s.repo.dir, fake: s.fake, env: { ...s.env, FAKE_HOLD_CHECK_SEQ: seq(CLEAR) } });
+  assertExit(d, 0, `${d.stderr}${d.stdout}`);
+  const step = d.json.ownerStep;
+  assert.equal(step.kind, 'say-merge');
+  ownerSays(t, 'merge', ['Protected areas and the hold are listed above.', step.areas, step.hold, step.line, step.ready ?? readyLine([PR])].filter(Boolean).join('\n'));
+  const dryChecks = checks(s).length;
+  const r = goMerge(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR), FAKE_MERGE_QUEUED: EW_QUEUED_LINE });
+  assertExit(r, 1, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.error, 'queued-behind', r.stdout);
+  assert.equal(r.json.merged, false);
+  assert.deepEqual(r.json.blockedBy, [1400]);
+  assert.equal(r.json.doNotUpdate, true);
+  assert.equal(r.json.holdRestored, true, 'the needs-human hold is back');
+  assert.equal(s.mergeCalls().length, 1, 'the merge command ran once (the hold was lifted for it)');
+  assert.ok(s.st().labels.includes('needs-human'), 'the label is on the PR again');
+  assert.ok(s.fake.lines().some((l) => /^pr edit 12 --add-label needs-human$/.test(l)), 'GitHub saw the label re-added');
+  assert.ok(s.st().timeline.some((e) => e.event === 'labeled' && e.label.name === 'needs-human' && e.node_id !== LIFT.id), 'a new labeled event exists: it really is a new hold');
+  assert.equal(checks(s).length - dryChecks, 1, 'the real run checked the hold once');
 });
 
 // ---- the gate path (step 1b) ---------------------------------------------------------------------------------------------------
