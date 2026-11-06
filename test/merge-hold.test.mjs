@@ -602,6 +602,26 @@ test('successor record: a file older than 30 days is pruned on the next write; a
   assert.ok(readSuccessor(repo.dir, 13, old.to), "another PR's directory is not touched");
 });
 
+test('successor record (#200): a crashed writer\'s *.tmp older than 1 hour is pruned on the next write; a fresh .tmp and an old-but-under-30-days .json stay', () => {
+  const repo = repoWithCommit();
+  const now = new Date('2026-11-06T08:00:00.000Z');
+  const kept = { from: H('4'), to: H('5'), baseSha: H('6') };
+  recordSuccessor(repo.dir, 12, kept, now);
+  const dir = successorDir(repo.dir, 12);
+  const touch = (name, ageMs) => {
+    writeFileSync(join(dir, name), 'x');
+    const t = new Date(now.getTime() - ageMs);
+    utimesSync(join(dir, name), t, t);
+  };
+  touch(`${H('a')}.123.abcd1234.tmp`, 2 * 3_600_000); // a crashed write, 2 h old
+  touch(`${H('b')}.124.efgh5678.tmp`, 59 * 60_000); // 59 min: could still be a live write
+  touch('notes.txt', 90 * 86_400_000); // not ours: never touched
+  const aged = new Date(now.getTime() - 10 * 86_400_000);
+  utimesSync(join(dir, `${kept.to}.json`), aged, aged); // 10 days: well under the 30-day limit
+  recordSuccessor(repo.dir, 12, { from: H('7'), to: H('8'), baseSha: H('9') }, now);
+  assert.deepEqual(readdirSync(dir).sort(), [`${H('b')}.124.efgh5678.tmp`, `${H('5')}.json`, `${H('8')}.json`, 'notes.txt'].sort());
+});
+
 test('successor record: it survives quarantineReviewDir (state recovery moves the review dir, not the git common dir)', () => {
   const repo = repoWithCommit();
   repo.write('.review/scratch.txt', 'x');

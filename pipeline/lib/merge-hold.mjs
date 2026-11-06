@@ -213,6 +213,8 @@ export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync })
 // from GitHub). A lost or unreadable record only means a release proceeds, the old behaviour.
 const SHA40 = /^[0-9a-f]{40}$/;
 const SUCCESSOR_KEEP_MS = 30 * 24 * 3_600_000;
+// A write takes milliseconds; a *.tmp this old is the leftover of a crashed writer (killed between writeFileSync and renameSync).
+const TMP_KEEP_MS = 3_600_000;
 
 export function successorDir(root, pr) {
   if (!posInt(pr)) throw new Error(`not a PR number: ${JSON.stringify(pr)}`);
@@ -220,7 +222,8 @@ export function successorDir(root, pr) {
 }
 
 // Writes the proof (tmp + rename, mkdir -p); throws on a bad sha or a write error (the caller catches: a missing record is not fatal).
-// Best-effort prune: this PR's *.json files older than 30 days are deleted (errors ignored; a race only loses an old proof).
+// Best-effort prune: this PR's *.json files older than 30 days and *.tmp files (a crashed write) older than 1 hour are deleted (errors
+// ignored; a race only loses an old proof).
 export function recordSuccessor(root, pr, { from, to, baseSha }, now = new Date()) {
   for (const [k, v] of Object.entries({ from, to, baseSha })) {
     if (typeof v !== 'string' || !SHA40.test(v)) throw new Error(`successor ${k} is not a 40-hex sha: ${JSON.stringify(v)}`);
@@ -233,9 +236,10 @@ export function recordSuccessor(root, pr, { from, to, baseSha }, now = new Date(
   renameSync(tmp, file);
   try {
     for (const name of readdirSync(dir)) {
-      if (!name.endsWith('.json') || name === `${to}.json`) continue;
+      const keepMs = name.endsWith('.json') ? SUCCESSOR_KEEP_MS : name.endsWith('.tmp') ? TMP_KEEP_MS : null;
+      if (keepMs === null || name === `${to}.json`) continue;
       try {
-        if (now.getTime() - statSync(path.join(dir, name)).mtimeMs > SUCCESSOR_KEEP_MS) unlinkSync(path.join(dir, name));
+        if (now.getTime() - statSync(path.join(dir, name)).mtimeMs > keepMs) unlinkSync(path.join(dir, name));
       } catch { /* best effort */ }
     }
   } catch { /* best effort */ }
