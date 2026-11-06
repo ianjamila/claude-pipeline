@@ -113,3 +113,4 @@ full record.
 - 2026-11-06 · #179 · Exemption takes only strict ledger rows; one instruction list for R4; refuse ＠-imported documents (#170 #171 #167) · risk high · rounds 9 · arbiter 5 · awaiting-owner-merge
 - 2026-11-06 · #184 · Claude rules on needs-human review items; one owner "merge" covers the listed rulings · risk high · rounds 10 · arbiter 6 · awaiting-owner-merge
 - 2026-11-06 · #192 · Rulings survive compaction; P merge names the worktree cleanup; Win32 aliases and overBuffer fail closed (#185 #188 #189) · risk high · rounds 5 · arbiter 2 · awaiting-owner-merge
+- 2026-11-06 · #193 · fix(ci-wait): date a failure by its own attempt; refresh a suite when its newest check run completes (#174, #176) · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge
