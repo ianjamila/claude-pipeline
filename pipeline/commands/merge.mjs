@@ -154,7 +154,7 @@ export const run = guarded(async (argv, ctx) => {
       if (!holdInfo?.mayHold) return undefined;
       const rel = await releaseHold({ config, pr, reason, root, env: ctx.env });
       const holdRelease = { reason, confirmed: rel.confirmed === true, code: rel.code ?? null, lines: rel.lines ?? [] };
-      if (!holdRelease.confirmed) warnings.push(`the merge hold of #${pr} was NOT released (${reason}; exit ${holdRelease.code}): run \`pipeline merge-hold --pr ${pr} --release --reason ${reason}\``);
+      if (!holdRelease.confirmed) warnings.push(`the merge hold of #${pr} was NOT released (${reason}; exit ${holdRelease.code}): run \`pipeline merge-hold --pr ${pr} --release --reason ${reason}\` from PR #${pr}'s own worktree, on its branch (the provider may refuse a release from another checkout or a detached HEAD)`);
       return holdRelease;
     };
     if (!synced.ok) {

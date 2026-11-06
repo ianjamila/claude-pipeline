@@ -418,7 +418,7 @@ test('merge, gate path: the update conflicts (rebase-needed) -> the hold THIS ca
   assert.equal(f.json.holdRelease.confirmed, false);
   assert.equal(f.json.holdRelease.code, 1);
   assert.equal(f.json.warnings.length, 1);
-  assert.match(f.json.warnings[0], /NOT released \(update-conflict; exit 1\).*merge-hold --pr 12 --release --reason update-conflict/);
+  assert.match(f.json.warnings[0], /NOT released \(update-conflict; exit 1\).*merge-hold --pr 12 --release --reason update-conflict. from PR #12's own worktree, on its branch \(the provider may refuse a release from another checkout or a detached HEAD\)/);
 });
 
 test('merge, gate path (#199): a race loss after a CONFIRMED take still releases queued-behind (unchanged: P merge stops, so it does not wait on the younger hold)', () => {
@@ -611,7 +611,7 @@ test('update-branch with holds: a release that is NOT confirmed shows holdReleas
   assert.equal(r.json.holdRelease.confirmed, false);
   assert.equal(r.json.holdRelease.code, 1);
   assert.equal(r.json.warnings.length, 1);
-  assert.match(r.json.warnings[0], /NOT released \(ci-failed; exit 1\).*merge-hold --pr 12 --release --reason ci-failed/);
+  assert.match(r.json.warnings[0], /NOT released \(ci-failed; exit 1\).*merge-hold --pr 12 --release --reason ci-failed. again from PR #12's own worktree, on its branch \(the provider may refuse a release from another checkout or a detached HEAD\)/);
 });
 
 test('update-branch with holds: the update conflicts (rebase-needed) -> released with update-conflict', () => {

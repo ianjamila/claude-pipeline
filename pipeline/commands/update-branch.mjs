@@ -54,7 +54,7 @@ export const run = guarded(async (argv, ctx) => {
     if (releaseReason !== undefined) {
       const rel = await releaseHold({ config, pr, reason: releaseReason, root, env: ctx.env });
       holdRelease = { reason: releaseReason, confirmed: rel.confirmed === true, code: rel.code ?? null, lines: rel.lines ?? [] };
-      if (!holdRelease.confirmed) warnings.push(`the merge hold of #${pr} was NOT released (${releaseReason}; exit ${holdRelease.code}): run \`pipeline merge-hold --pr ${pr} --release --reason ${releaseReason}\` again`);
+      if (!holdRelease.confirmed) warnings.push(`the merge hold of #${pr} was NOT released (${releaseReason}; exit ${holdRelease.code}): run \`pipeline merge-hold --pr ${pr} --release --reason ${releaseReason}\` again from PR #${pr}'s own worktree, on its branch (the provider may refuse a release from another checkout or a detached HEAD)`);
     }
     const { successorWarnings, ...result } = r;
     const head = r.head ?? null;
