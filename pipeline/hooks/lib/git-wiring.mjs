@@ -7,6 +7,7 @@ import path from 'node:path';
 import { run, gh } from '../../lib/proc.mjs';
 import { parseYaml } from '../../lib/yaml.mjs';
 import { approvedPr } from './owner-go.mjs';
+import { mergeJobOf } from './merge-job-lookup.mjs';
 
 const LOOKUP_TIMEOUT_MS = 5000;
 const PUSH_LOOKUP_TIMEOUT_MS = 3000;
@@ -39,7 +40,7 @@ export function realGitWiring() {
     return r.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   };
 
-  return { currentBranch, pushDestination, issueLabels };
+  return { currentBranch, pushDestination, issueLabels, mergeJobOf };
 }
 
 // #58: what the git policy asks before a direct merge (`gh pr merge`, the repo's merge command, auto-merge through the API).

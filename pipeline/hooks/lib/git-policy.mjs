@@ -668,8 +668,41 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
     ctx.envCfgDirty = [...Object.keys(env), ...assignedNames(ctx)].some((k) => GIT_ENV_CONFIG.test(k));
     return checkPush(args, g.d, g.gitDir, ctx, g.configs);
   }
+  const owned = mergeJobVerdict(sub, args, g, ctx);
+  if (owned) return owned;
   trackGit(sub, args, g, ctx);
   return null;
+}
+
+// ---- a running `P merge --owner-go` job owns its checkout (lib/merge-job.mjs) -----------------------------------
+
+// Why: the job moves the branch with `git merge --ff-only` between CI waits and checks, before and after, that nothing else moved
+// it. Anything that switches branch, rewrites the index or the worktree, or removes the checkout would race that. The marker
+// `.review/merge-job.json` (read by git-wiring.mjs mergeJobOf; a dead pid or a missing / garbled file means no job) is what
+// makes this checkout the job's. Read-only git and every `P ...` / node command stay allowed; the job's own git calls are child
+// processes, not tool calls, so this never sees them.
+const MERGE_JOB_VERBS = new Set(['checkout', 'switch', 'reset', 'commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'stash', 'pull', 'restore', 'am']);
+function mergeJobDeny(job, what) {
+  return deny(`a \`P merge --owner-go\` job (pid ${job.pid}, PR #${job.pr}) owns this checkout until it ends, so ${what} is refused here; wait for it or stop it (kill ${job.pid}). Read-only git (status, log, diff, show, fetch) and \`P …\` commands still work.`);
+}
+function mergeJobVerdict(sub, args, g, ctx) {
+  const verb = sub.toLowerCase();
+  const words = args.filter((a) => !a.startsWith('-'));
+  const second = String(words[0] ?? '').toLowerCase();
+  const worktreeMove = verb === 'worktree' && (second === 'remove' || second === 'move');
+  if (!MERGE_JOB_VERBS.has(verb) && !worktreeMove) return null;
+  if (verb === 'stash' && (second === 'list' || second === 'show')) return null;
+  const jobAt = (dir) => {
+    if (dir === null) return null;
+    try { return memoLookup(ctx, ['mergejob', dir], () => ctx.mergeJobOf(dir)) ?? null; } catch { return null; }
+  };
+  if (worktreeMove) {
+    // `worktree remove <path>` / `worktree move <path> <new>`: the checkout that goes away is the first path named
+    const job = jobAt(joinDir(g.d, words[1], ctx));
+    return job ? mergeJobDeny(job, `\`git worktree ${second}\` of it`) : null;
+  }
+  const job = jobAt(g.d);
+  return job ? mergeJobDeny(job, `\`git ${verb}\``) : null;
 }
 
 // ---- gh -------------------------------------------------------------------------------------------------
@@ -3048,13 +3081,14 @@ function evaluateGitOnce(command, {
   now = Date.now, // injectable clock (tests)
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
   nodePrefix, // #89 t3: where this node binary's npm keeps its global configuration (<nodePrefix>/etc/npmrc); undefined: from process.execPath, null: none (tests)
+  mergeJobOf = () => null, // (git-wiring.mjs) { pid, pr, root } when a live `P merge --owner-go` job owns the checkout holding a directory, else null
   ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), repoOf(dir), approvedHead(pr, head, repo) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
 } = {}, bashState) {
   const text = typeof command === 'string' ? command : String(command ?? '');
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
+    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, mergeJobOf, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };
