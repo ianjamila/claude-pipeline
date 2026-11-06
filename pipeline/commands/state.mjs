@@ -11,7 +11,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { loadState, saveState, updateItems } from '../lib/state.mjs';
 import { isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
-import { readBaseline, readPublished, writeBaseline } from '../lib/review-publish.mjs';
+import { readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
   roundDir, stateExtends, withStateLock,
@@ -165,6 +165,10 @@ async function showLocked(values, n, pr, root, ctx) {
         writeBaseline(root, pr, found.hash);
         source = 'quarantined';
       }
+    } else if (found?.state && found.hash === reviewContentHash(state) && readBaseline(root, pr) !== found.hash) {
+      // Local IS the published state: that is what this copy last saw, whatever the file says (none: a checkout from before the baseline existed). Without it the
+      // first decision on a published item would be quarantined here and refused as stale at publication (lib/review-publish.mjs#establishBaseline).
+      writeBaseline(root, pr, found.hash);
     }
   }
 

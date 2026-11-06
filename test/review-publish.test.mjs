@@ -333,6 +333,35 @@ test('state show: a truly superseded copy is still quarantined (other published 
   assert.equal(c.show(c.A).json.source, 'quarantined');
 });
 
+test('state show (R5-B2): with no baseline file and a local state equal to the published one it writes the baseline, so the first local decision is local-ahead, not quarantined', (t) => {
+  const w = world(t);
+  const s0 = waitingState();
+  saveState(w.A, s0);
+  assertExit(w.comment(w.A), 0);
+  rmSync(join(w.A, '.review', 'published-baseline.json')); // a checkout from before the baseline existed
+  const same = w.show(w.A);
+  assertExit(same, 0, same.stdout + same.stderr);
+  assert.equal(same.json.source, 'local');
+  assert.deepEqual(w.baseline(w.A), { pr: 7, hash: reviewContentHash(s0) });
+  saveState(w.A, change(s0, 'R1-B1', { secondReview: verdict() }));
+  assert.equal(w.show(w.A).json.source, 'local-ahead', 'the first decision on a published item is kept');
+  // a stale baseline of an equal state is refreshed too
+  const w2 = world(t);
+  saveState(w2.A, s0);
+  assertExit(w2.comment(w2.A), 0);
+  writeBaseline(w2.A, 7, H('f'));
+  assert.equal(w2.show(w2.A).json.source, 'local');
+  assert.equal(w2.baseline(w2.A).hash, reviewContentHash(s0));
+  // local != published with no baseline: no baseline is invented, and the copy is quarantined as before
+  const w3 = world(t);
+  saveState(w3.A, s0);
+  assertExit(w3.comment(w3.A), 0);
+  rmSync(join(w3.A, '.review', 'published-baseline.json'));
+  saveState(w3.A, change(s0, 'R1-B1', { secondReview: verdict() }));
+  assert.equal(readBaseline(w3.A, 7), null);
+  assert.equal(w3.show(w3.A).json.source, 'quarantined');
+});
+
 // A Claude ruling is published, then changed locally (tightened to ACCEPT, or overridden by the owner) and the publication failed or was never made: the PR
 // still holds the baseline, so the change is local progress (R1-B2, R1-F1). The same change on top of a PR that moved on is a superseded copy.
 const claudeRejected = () => mk([it('R1-B1', { final: claudeFinal() }), it('R1-S1', { bucket: 'SUGGESTION', category: 'design', final: decided() })]);

@@ -26,7 +26,7 @@ import {
 import {
   ensureRoundDir, findItem, findRound, readFileOrFail, requireState, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
-import { publishTriage } from '../lib/review-publish.mjs';
+import { establishBaseline, publishTriage } from '../lib/review-publish.mjs';
 
 export const meta = {
   summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane, ask for and record owner rulings made in chat, record Claude\'s own rulings, run the blind Codex second review',
@@ -337,6 +337,7 @@ async function ownerRuling(rest, ctx) {
       if (gap === 'changed') return refuse(`the finding text of ${id} (or of another item asked in the same request, or an item is gone) changed since the owner was asked, so the recorded ruling no longer applies; ${again}`);
       return refuse(`no owner ruling is recorded for ${slug} #${prNum} ${id} whose whole answer is --owner-quote and says ${decision.toLowerCase()} (an answer naming several decisions must also name ${id}): ${again}`);
     }
+    seedBaseline({ ctx, root, pr: prNum, state }); // the `comment --kind triage` that publishes this ruling needs the baseline too
     const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });
     saveState(root, updateItems(state, n, [ruled]));
     const next = `run \`pipeline comment --pr ${state.pr ?? pr ?? '<N>'} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it unless it overrules a published Claude or forced final, or a published final waiting for a human (then it is kept as local-ahead)`;
@@ -361,6 +362,16 @@ function publishRuling({ ctx, root, pr, state }) {
       return { published: false, next: `GitHub could not be reached, so the result is only local: run \`pipeline comment --pr ${pr} --kind triage\` when it is back (until then \`pipeline state show\` keeps a ruling that continues the published state, with a warning, and replaces one the PR has moved on from)` };
     }
     throw err;
+  }
+}
+
+// Before a decision changes the state: a copy with no baseline whose state equals the published one gets its baseline (review-publish.mjs#establishBaseline), so the
+// decision can publish. GitHub being unreachable leaves things as they are (the result is local and publishRuling says how to retry).
+function seedBaseline({ ctx, root, pr, state }) {
+  try {
+    establishBaseline({ gh: createGitHub({ cwd: root, env: ctx.env }), root, pr, state });
+  } catch (err) {
+    if (!(err instanceof GhError || err instanceof UnavailableError)) throw err;
   }
 }
 
@@ -390,6 +401,7 @@ async function claudeRuling(rest, ctx) {
     const item = findRound(state, n).items.find((i) => i.id === id);
     const why = item === undefined ? `no item ${id} in round ${n}` : claudeRulingRefusal(item, decision);
     if (why) return refuse(why);
+    seedBaseline({ ctx, root, pr, state });
     const ruled = applyClaudeRuling(item, { decision, reason, ruledAt: new Date().toISOString() });
     // Format version 2: an older pipeline must not read a state that holds a Claude ruling (state.mjs SUPPORTED_STATE_VERSION).
     const next = { ...updateItems(state, n, [ruled]), version: 2 };
@@ -519,6 +531,7 @@ async function secondReview(rest, ctx) {
     const now = askedSnapshot(items);
     if (now.digest !== asked.snapshot.digest) return refuse('a finding changed while Codex was reviewing; nothing was recorded, run second-review again');
     if (now.finals !== asked.snapshot.finals) return refuse('an item\'s final changed while Codex was reviewing; nothing was recorded, run second-review again');
+    seedBaseline({ ctx, root, pr, state });
     const ranAt = new Date().toISOString();
     const byId = new Map(answer.items.map((e) => [e.id, e]));
     const settled = items.map((item) => {

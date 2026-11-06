@@ -73,6 +73,18 @@ export function writeBaseline(root, pr, hash) {
   writeJson(baselineFile(root), { pr, hash });
 }
 
+/**
+ * A checkout with no baseline (it predates the file) whose state already IS what the PR holds: record that, BEFORE a decision changes the state. Without it the first
+ * decision on a published item can never publish (publishTriage's no-baseline fallback needs the state to extend the published one, and a decided item does not),
+ * and `state show` would quarantine it. Only when the two are equal; otherwise nothing is written and the rules stay as they are. -> true when a baseline was written.
+ * `published` is an already-read readPublished() result, or omitted to read it here (may throw GhError).
+ */
+export function establishBaseline({ gh, root, pr, state, published = readPublished(gh, pr) }) {
+  if (readBaseline(root, pr) !== null || published.state === null || published.hash !== reviewContentHash(state)) return false;
+  writeBaseline(root, pr, published.hash);
+  return true;
+}
+
 // ---- the swap -------------------------------------------------------------------------------------------------------------------------
 
 const RETRY_SHOW = (pr) => `run \`pipeline state show --pr ${pr}\` to restore the published state here, then redo this decision`;

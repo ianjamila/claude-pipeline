@@ -789,6 +789,66 @@ test('claude-ruling: a state published by someone else is reported as published:
   assert.equal(publishedState(w).rounds[0].items[1].final.reason, 'theirs', 'the PR was not touched');
 });
 
+// R5-B2: a checkout from before the baseline existed (no .review/published-baseline.json) whose state equals the published one: the first decision on a
+// published item must publish (it used to be refused as stale-publication, because the decided item no longer "extends" the published one).
+const baselineFile = (w) => join(w.repo.dir, '.review', 'published-baseline.json');
+test('claude-ruling / second-review with no baseline file and a state equal to the published one: the baseline is established first and the decision publishes', (t) => {
+  const w = world(t, { comments: true });
+  assertExit(w.codex(1, findingsOf([finding()], [sugg()])), 0);
+  w.wait('R1-B1');
+  w.wait('R1-S1');
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  rmSync(baselineFile(w));
+  const r = w.cli(ruling('R1-B1', 'ACCEPT', { reason: 'real bug' }));
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.published, true, r.stdout);
+  assert.equal(publishedState(w).rounds[0].items[0].final.by, 'claude');
+  assert.equal(JSON.parse(readFileSync(baselineFile(w), 'utf8')).hash, reviewContentHash(w.state()));
+
+  const v = world(t, { comments: true });
+  assertExit(v.codex(1, findingsOf([finding()])), 0);
+  v.wait('R1-B1');
+  assertExit(v.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  rmSync(baselineFile(v));
+  const sr = second(v, 'R1-B1', answerOf(['R1-B1', 'REJECT', 'high']));
+  assertExit(sr, 0, sr.stdout + sr.stderr);
+  assert.equal(sr.json.published, true, sr.stdout);
+  assert.equal(publishedState(v).rounds[0].items[0].secondReview.decision, 'REJECT');
+});
+
+test('owner-ruling with no baseline file and a state equal to the published one: the baseline is established, so the comment triage that publishes the ruling is not stale', (t) => {
+  const w = world(t, { comments: true, slug: `acme/widgets-${randomUUID()}` });
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  w.wait('R1-B1');
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  rmSync(baselineFile(w));
+  const content = / · content ([0-9a-f]{12}) · /.exec(w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', 'R1-B1']).json.line)[1];
+  ownerRules(t, 'R1-B1: accept', rulingRequest(7, ['R1-B1'], w.slug, content));
+  const r = w.cli(['triage', 'owner-ruling', '--round', '1', '--id', 'R1-B1', '--decision', 'ACCEPT', '--reason', 'owner confirmed', '--owner-quote', 'R1-B1: accept', '--pr', '7']);
+  assertExit(r, 0, r.stdout + r.stderr);
+  const pub = w.cli(['comment', '--pr', '7', '--kind', 'triage']);
+  assertExit(pub, 0, pub.stdout + pub.stderr);
+  assert.equal(publishedState(w).rounds[0].items[0].final.by, 'owner');
+});
+
+test('claude-ruling with no baseline file and a published state that is NOT the local one: no baseline is invented, the ruling stays local (stale-publication as before)', (t) => {
+  const w = world(t, { comments: true });
+  assertExit(w.codex(1, findingsOf([finding()], [sugg()])), 0);
+  w.wait('R1-B1');
+  w.wait('R1-S1');
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  rmSync(baselineFile(w));
+  const theirs = w.state();
+  theirs.rounds[0].items[1].final = { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'theirs' };
+  w.fake.addComment({ body: triageComment(theirs) });
+  const r = w.cli(ruling('R1-B1', 'ACCEPT', { reason: 'mine' }));
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.published, false);
+  assert.equal(r.json.publishError, 'stale-publication');
+  assert.equal(existsSync(baselineFile(w)), false, 'no baseline was written');
+  assert.equal(w.item('R1-B1').final.by, 'claude', 'saved locally');
+});
+
 test('second-review publishes by itself too, and says how to retry when GitHub is down', (t) => {
   const w = world(t, { comments: true });
   assertExit(w.codex(1, findingsOf([finding()])), 0);
