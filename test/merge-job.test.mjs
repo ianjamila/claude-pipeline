@@ -48,6 +48,7 @@ test('claim: writes the marker for a clean checkout on a branch', () => {
   const r = repo();
   const c = claimCheckout({ root: r.root, pr: 7, pid: process.pid, now: NOW });
   assert.equal(c.ok, true);
+  assert.equal(c.replaced, null);
   assert.deepEqual(c.marker, { pr: 7, pid: process.pid, branch: 'agent/x', expectedHead: r.base, startedAt: '2026-11-06T10:00:00.000Z' });
   assert.deepEqual(readMarker(r.root), c.marker);
   assert.equal(mergeJobOf(r.root)?.pr, 7); // the guard's lookup sees it (live pid)
@@ -104,7 +105,9 @@ test('claim: a stale marker (dead pid) is replaced; a garbled one too', () => {
   mkdirSync(join(r.root, '.review'), { recursive: true });
   writeFileSync(markerPath(r.root), JSON.stringify({ pr: 3, pid: deadPid(), branch: 'agent/x', expectedHead: r.base, startedAt: 'x' }));
   assert.equal(mergeJobOf(r.root), null); // a dead pid blocks nothing
-  assert.equal(claimCheckout({ root: r.root, pr: 7, now: NOW }).ok, true);
+  const c = claimCheckout({ root: r.root, pr: 7, now: NOW });
+  assert.equal(c.ok, true);
+  assert.equal(c.replaced?.pr, 3, 'the dead job\'s marker is reported, for the caller to reconcile');
   assert.equal(readMarker(r.root).pr, 7);
   rmSync(markerPath(r.root));
   writeFileSync(markerPath(r.root), '{ not json');

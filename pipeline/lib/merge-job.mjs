@@ -5,10 +5,11 @@
 // nothing else moved the branch or HEAD or dirtied the tree. A moved ref is terminal (the caller reports it); the job never
 // runs checkout / reset / stash to "fix" anything. No CLI wiring here: the merge loop calls these functions.
 //
-// claimCheckout   -> { ok: true, marker } | { ok: false, code: 'detached' | 'dirty' | 'busy' | 'git' | 'write', reason }
+// claimCheckout   -> { ok: true, marker, replaced } | { ok: false, code: 'detached' | 'dirty' | 'busy' | 'git' | 'write', reason }
 // advanceCheckout -> { ok: true, marker } | { ok: false, code: 'checkout-changed' | 'ff-refused' | 'bad-target' | 'write', reason }
 // verifyCheckout  -> { ok: true } | { ok: false, code: 'checkout-changed', reason }
 // releaseCheckout -> { released: boolean }
+// (claimCheckout's `replaced` is the dead job's marker this claim overwrote, or null: a caller that finds one reconciles GitHub for its PR first)
 import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { run } from './proc.mjs';
@@ -78,7 +79,7 @@ export function claimCheckout({ root, pr, pid = process.pid, now = () => new Dat
   } catch (err) {
     return { ok: false, code: 'write', reason: `could not write ${MERGE_JOB_FILE}: ${err?.code ?? err?.message}` };
   }
-  return { ok: true, marker };
+  return { ok: true, marker, replaced: existing };
 }
 
 // Everything that must still hold before the job relies on, or moves, the checkout.
