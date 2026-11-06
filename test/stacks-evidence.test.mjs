@@ -88,10 +88,10 @@ test('connections: listeners present and zero established sockets => ok([])', ()
   assert.deepEqual(r, { ok: true, value: [] });
 });
 
-test('connections: lsof exit 1 is fine when the control passes; signal, timeout and exit 2 are unknown', () => {
+test('connections: lsof exit 1 is fine when the control passes; signal, timeout, exit 2 and output over the buffer limit are unknown', () => {
   const out = text(HELPER);
   assert.deepEqual(connections(stack, connOpts(machine({ lsof: res({ code: 1, stdout: out }) }))), { ok: true, value: [] });
-  for (const bad of [{ signal: 'SIGKILL', code: 1 }, { timedOut: true, code: 124 }, { code: 2 }]) {
+  for (const bad of [{ signal: 'SIGKILL', code: 1 }, { timedOut: true, code: 124 }, { code: 2 }, { overBuffer: true, code: 1 }, { overBuffer: true, code: 0 }]) {
     const r = connections(stack, connOpts(machine({ lsof: res({ ...bad, stdout: out }) })));
     assert.equal(r.ok, false, JSON.stringify(bad));
   }

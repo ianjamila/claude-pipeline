@@ -338,6 +338,18 @@ test('any other inspect error stays unknown, even with a JSON array on stdout an
   assert.equal(readInventory({ run: killed, cfg, realpath: id }).ok, false);
 });
 
+// #188: a cut stderr of only "No such object" lines plus a whole-looking stdout array would otherwise read as the survivors
+test('output past the buffer limit is unknown: a valid-looking array with only "No such object" on stderr, and a cut ps', () => {
+  const body = JSON.stringify([survivor]);
+  const cut = scripted(res({ stdout: 'a\ngone\n' }), [res({ code: 1, stdout: body, stderr: 'Error: No such object: gone', overBuffer: true })]);
+  assert.equal(readInventory({ run: cut, cfg, realpath: id }).ok, false);
+  assert.deepEqual(cut.calls, ['ps', 'inspect'], 'no retry: the second answer could be cut too');
+  const raced = scripted(res({ stdout: 'a\n' }), [res({ code: 0, stdout: body, overBuffer: true })]);
+  assert.equal(readInventory({ run: raced, cfg, realpath: id }).ok, false, 'a raced exit 0 over the buffer');
+  const cutPs = scripted(res({ stdout: 'a\n', overBuffer: true }), [res({ stdout: body })]);
+  assert.equal(readInventory({ run: cutPs, cfg, realpath: id }).ok, false, 'ps cut off: the id list may be partial');
+});
+
 test('the retry stays inside the deadline', () => {
   let t = 0;
   const gone = res({ code: 1, stdout: '', stderr: 'Error: No such object: gone' });

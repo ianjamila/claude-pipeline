@@ -283,3 +283,15 @@ test('pagePullRequests: extra variables cannot override owner, name, first or af
   assert.ok(gql.includes('branch=feat/x'));
   assert.deepEqual(gql.filter((a) => /=evil$|^first=1$|^after=/.test(a)), [], gql.join(' '));
 });
+
+// #188: a gh reply cut at the buffer limit is not gh's answer: no HTTP 404 / 422 text in it may be classified.
+test('protection / updateBranch / checks: an overBuffer reply throws (its text is never classified), and the error says so', () => {
+  const cut = (stderr, extra = {}) => ({ code: 1, stdout: '', stderr, timedOut: false, overBuffer: true, signal: null, ...extra });
+  const mkGh = (reply) => createGitHub({ cwd, ghFn: (args) => (args[0] === 'repo' ? { code: 0, stdout: JSON.stringify(REPO_VIEW), stderr: '', timedOut: false } : reply) });
+  assert.throws(() => mkGh(cut('gh: Branch not protected (HTTP 404)')).protection('main'), (e) => e instanceof GhError && e.overBuffer === true);
+  assert.throws(() => mkGh(cut('gh: Not Found (HTTP 404)')).protection('main'), GhError);
+  assert.throws(() => mkGh(cut('HTTP 422 expected head sha didn\'t match')).updateBranch(3, 'a'.repeat(40)), GhError);
+  assert.throws(() => mkGh({ code: 0, stdout: '[]', stderr: '', timedOut: false, overBuffer: true }).checks(3), GhError);
+  // sanity: the same text without the flag is still an answer
+  assert.deepEqual(mkGh(cut('gh: Branch not protected (HTTP 404)', { overBuffer: false })).protection('main').reason, 'not-protected');
+});

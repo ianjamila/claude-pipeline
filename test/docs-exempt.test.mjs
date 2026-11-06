@@ -632,6 +632,95 @@ test('not a drive, not a home, not a climb: still just a relative path that does
   }
 });
 
+// ---- #185: Windows name aliases (NTFS streams, 8.3 short names) ------------------------------------------------------------------------
+// `docs/ledger.md::$DATA` and `docs::$INDEX_ALLOCATION/ledger.md` open the listed file on Windows, `docs/LEDGER~1.MD` too; a named stream
+// (`notes.md:instructions:$DATA`) holds other bytes. None can be judged as a plain relative path, so they are refused. Literal tokens only.
+const STREAM = /which cannot be judged because a `:` past the drive names an NTFS stream of /;
+const SHORT = /which cannot be judged because a segment that looks like a Windows short name \(8\.3\) has two readings: this needs a review round/;
+
+test('an NTFS stream of a listed document or of an existing file is refused, a directory alias too', (t) => {
+  for (const [token, named] of [
+    ['docs/ledger.md::$DATA', 'docs/ledger.md'],
+    ['docs/ledger.md:x', 'docs/ledger.md'],
+    ['docs/ledger.md:x.', 'docs/ledger.md'], // sentence punctuation after the stream name
+    ['docs/ledger.md::$DATA,', 'docs/ledger.md'],
+    ['docs/LEDGER.MD::$DATA', 'docs/ledger.md'], // a case-insensitive file system
+    ['notes.md:instructions:$DATA', 'notes.md'], // not listed, but a stream holds other bytes than the file
+    ['docs::$INDEX_ALLOCATION/ledger.md', 'docs'],
+    ['docs:x/ledger.md', 'docs'],
+    ['./docs/../docs/ledger.md::$DATA', 'docs/ledger.md'],
+  ]) {
+    const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': `see @${token}\n`, 'notes.md': 'notes\n' })), STREAM);
+    assert.ok(r.reason.includes(`CLAUDE.md imports ${token.replace(/[.,]$/, '')}`), r.reason);
+    assert.ok(r.reason.includes(`stream of ${named}:`), r.reason);
+  }
+  // a symlinked directory or file is followed first: the stream is of the link's target
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@linkdir::$INDEX_ALLOCATION/ledger.md\n' }, { linkdir: 'docs' })), /stream of docs:/);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@alias.md::$DATA\n' }, { 'alias.md': 'docs/ledger.md' })), /stream of docs\/ledger\.md:/);
+  // from an imported file too, relative to that file
+  const hop = refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'docs/guide.md': '@ledger.md::$DATA\n' })), STREAM);
+  assert.ok(hop.reason.includes('docs/guide.md imports ledger.md::$DATA'), hop.reason);
+});
+
+test('an empty segment before the colon, or a stream path that cannot be resolved, is refused', (t) => {
+  for (const token of [':x', 'docs/:y', 'docs/:$DATA/ledger.md', 'docs/::$INDEX_ALLOCATION/ledger.md']) {
+    refused(exemptWith(importWorld(t, { 'CLAUDE.md': `see @${token}\n` })), STREAM);
+  }
+  // a prefix that climbs above the repo, or through a dangling link, cannot be judged either
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@../x.md:y\n' })), /cannot be judged: the path leaves the repository/);
+  refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@gone/x.md:y\n' }, { gone: 'nowhere/at/all' })), /cannot be judged: a symlink on the way/);
+});
+
+test('a short name followed by a colon is refused as a short name, whichever part of the segment holds it', (t) => {
+  // `~1:` does not match the short-name pattern on the whole segment, and the stream cut leaves `DOCUME~1`, which names nothing in the tree
+  for (const token of ['DOCUME~1::$INDEX_ALLOCATION/ledger.md', 'docs/LEDGER~1::$DATA', 'docs/LEDGER~1.MD:x', 'docs/LEDGER~1:x', 'DOCUME~1:x/ledger.md', 'docs/ledger.md:LEDGER~1']) {
+    const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': `see @${token}\n` })), SHORT);
+    assert.ok(r.reason.includes(`CLAUDE.md imports ${token},`), r.reason);
+  }
+  // a colon after a tilde that is no short name stays judged by the stream rule alone
+  for (const body of ['see @ab:c\n', 'see @note:later\n', 'see @foo~bar\n', 'see @foo~bar:x\n', 'see @README.md:\n']) {
+    const r = exemptWith(importWorld(t, { 'CLAUDE.md': body, 'README.md': 'readme\n' }));
+    assert.equal(r.exempt, true, `${body}: ${r.reason}`);
+  }
+});
+
+test('a colon after a name that does not exist in the tree, and sentence punctuation after a name that does, stay exempt', (t) => {
+  for (const [body, files] of [
+    ['see @ab:c\n', {}], ['see @note:later\n', {}], ['see @nothere.md:x\n', {}], ['see @nothere/dir::$DATA\n', {}],
+    ['see @README.md: and more\n', { 'README.md': 'readme\n' }], ['see @README.md:\n', { 'README.md': 'readme\n' }],
+    ['see (@README.md).\n', { 'README.md': 'readme\n' }], ['see @docs/guide.md:\n', {}],
+  ]) {
+    const r = exemptWith(importWorld(t, { 'CLAUDE.md': body, ...files }));
+    assert.equal(r.exempt, true, `${body}: ${r.reason}`);
+  }
+});
+
+test('a path segment that looks like an 8.3 short name is refused, in any case and position', (t) => {
+  for (const token of ['docs/LEDGER~1.MD', 'docs/ledger~1.md', 'DOCS~1/ledger.md', 'docs~2/sub/x.md', 'docs/ledger~1.md.', 'docs/ledger~1.md,', 'docs/ledger~1.md#top',
+    'docs/LEDGER~1', 'docs/LEDGER~12.md', 'a~9/b.md', 'docs/ledger~1.md.#a', 'docs/ledger~1~']) {
+    const r = refused(exemptWith(importWorld(t, { 'CLAUDE.md': `see @${token}\n` })), SHORT);
+    assert.ok(r.reason.includes(`CLAUDE.md imports ${token},`), r.reason);
+  }
+  // through a hop
+  const hop = refused(exemptWith(importWorld(t, { 'CLAUDE.md': '@docs/guide.md\n', 'docs/guide.md': '@LEDGER~1.MD\n' })), SHORT);
+  assert.ok(hop.reason.includes('docs/guide.md imports LEDGER~1.MD,'), hop.reason);
+  // a tilde that is no short name stays a plain name
+  for (const token of ['@foo~bar', '@~foo', '@docs/a~b.md', '@docs/x~1y.md', '@docs/guide.md~']) {
+    const r = exemptWith(importWorld(t, { 'CLAUDE.md': `see ${token}\n` }));
+    assert.equal(r.exempt, true, `${token}: ${r.reason}`);
+  }
+});
+
+test('a symlink target with a colon or a short-name segment cannot be judged', (t) => {
+  for (const [target, why] of [['docs/LEDGER~1.MD', /symlink whose target has a segment that looks like a Windows short name/], ['DOCS~1/ledger.md', /short name/], ['docs/ledger.md::$DATA', /colon/], ['docs/ledger.md:x', /colon/], ['docs:x', /colon/]]) {
+    if (process.platform === 'win32' && target.includes(':')) continue; // Node stats a link's target on Windows; a colon names a stream there, not a missing file
+    const w = world(t, { baseFiles: { 'CLAUDE.md': '@out.md\n' }, baseLinks: { 'out.md': target } });
+    w.append(LEDGER, row(2));
+    w.repo.commit('ledger row');
+    refused(exemptWith(w), why);
+  }
+});
+
 test('a symlink target that is absolute or has a backslash cannot be judged', (t) => {
   for (const [target, why] of [['C:\\x.md', /absolute path/], ['\\x.md', /backslash/], ['\\\\srv\\x.md', /backslash/], ['..\\x', /backslash/], ['docs\\ledger.md', /backslash/], ['C:/x.md', /absolute path/]]) {
     if (process.platform === 'win32' && target.startsWith('\\\\')) continue; // Node stats a link's target on Windows, and a network path throws before the link exists

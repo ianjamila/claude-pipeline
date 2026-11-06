@@ -48,6 +48,7 @@ export function procIdentity(pid, { run = realRun, kill = defaultKill, platform 
   const r = run(ps, ['-o', 'lstart=', '-p', String(pid)], { env: psEnv(), timeoutMs });
   if (r.timedOut) return unknown('ps timed out');
   if (r.signal) return unknown(`ps ended by signal ${r.signal}`);
+  if (r.overBuffer) return unknown('ps output was over the buffer limit'); // checked before stdout / stderr are read
   if (r.code === 0) {
     const text = String(r.stdout ?? '').trim();
     const birth = parseLstart(text);
@@ -81,6 +82,7 @@ function lookupVia(pid, { run, ps, deadlineAt, now }) {
     const r = run(ps, ['-o', field, '-p', String(pid)], { env: psEnv(), timeoutMs });
     if (r.timedOut) return { reason: 'ps timed out' };
     if (r.signal) return { reason: `ps ended by signal ${r.signal}` };
+    if (r.overBuffer) return { reason: 'ps output was over the buffer limit' };
     if (r.code !== 0) return { reason: `ps exit ${r.code} for pid ${pid}` };
     return { text: String(r.stdout ?? '').trim() };
   };

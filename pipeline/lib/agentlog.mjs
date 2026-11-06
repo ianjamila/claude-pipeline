@@ -196,7 +196,7 @@ function readRegularFile(run, ref, rel, { strictRef = false } = {}) {
   try {
     run(['rev-parse', '--verify', '-q', `${ref}^{commit}`]);
   } catch (err) {
-    if (err instanceof GitError && err.code === 1 && !strictRef) return null; // strictRef: a missing ref is an error, not "no file"
+    if (err instanceof GitError && !err.abnormal && err.code === 1 && !strictRef) return null; // strictRef: a missing ref is an error, not "no file"
     throw err;
   }
   const entries = run(['ls-tree', '-z', '-l', ref, '--', rel]).split('\0').filter(Boolean);

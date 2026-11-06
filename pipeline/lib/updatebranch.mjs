@@ -40,7 +40,7 @@ function readChecks(gh, pr) {
       const rows = gh.checks(pr, { required });
       if (Array.isArray(rows) && rows.length > 0) return rows;
     } catch (err) {
-      if (err?.timedOut === true || !NO_CHECKS.test(`${err?.stderr ?? ''}\n${err?.stdout ?? ''}`)) throw err;
+      if (err?.timedOut === true || err?.overBuffer === true || !NO_CHECKS.test(`${err?.stderr ?? ''}\n${err?.stdout ?? ''}`)) throw err;
     }
   }
   return [];

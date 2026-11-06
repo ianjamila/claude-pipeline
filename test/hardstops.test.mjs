@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { classifyHardStops, collectHardStops, enclosingStatements, stripSqlComments, envNamesIn } from '../pipeline/lib/hardstops.mjs';
-import { diffFiles } from '../pipeline/lib/git.mjs';
+import { classifyHardStops, collectHardStops, enclosingStatements, stripSqlComments, envNamesIn, knownEnvNames } from '../pipeline/lib/hardstops.mjs';
+import { diffFiles, GitError } from '../pipeline/lib/git.mjs';
 import { isAgentInstructionPath, isDocPath } from '../pipeline/lib/doc-paths.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops.mjs';
@@ -753,4 +753,19 @@ test('IO: a large binary under migrations, deleted or moved out with an edit, is
   assert.ok(!of('supabase/migrations/20240101_gone.xlsx').includes('R0-unscannable'));
   assert.ok(of('exports/moved.xlsx').includes('R0-unscannable'));
   assert.ok(hits.some((h) => h.file === 'exports/moved.xlsx' && h.rule === 'R1-destructive' && /moved out of the migrations dir/.test(h.detail)));
+});
+
+// #188: knownEnvNames feeds "is this env var new?". A git grep cut off at the buffer limit (or killed) must fail, never read as "no match"
+// (which would call every name new).
+test('knownEnvNames: a no-match exit 1 skips the batch, but an overBuffer / signalled / noisy exit 1 throws', () => {
+  const res = (patch) => ({ run: () => ({ code: 1, stdout: '', stderr: '', timedOut: false, signal: null, overBuffer: false, ...patch }) });
+  assert.equal(knownEnvNames('main', new Set(['FOO']), res({})).size, 0, 'git grep: no match');
+  for (const [label, patch] of [
+    ['overBuffer', { overBuffer: true }],
+    ['overBuffer with a partial hit', { overBuffer: true, stdout: 'process.env.FOO\n' }],
+    ['signal', { signal: 'SIGKILL' }],
+    ['stderr text', { stderr: 'fatal: bad pattern' }],
+  ]) {
+    assert.throws(() => knownEnvNames('main', new Set(['FOO']), res(patch)), GitError, label);
+  }
 });
