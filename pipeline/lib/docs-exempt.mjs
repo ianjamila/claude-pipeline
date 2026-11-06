@@ -58,21 +58,26 @@ const REGULAR_MODES = new Set(['100644', '100755']);
 // `@path`: at the start of a line or after a character that cannot end a word (whitespace, a bracket, a quote, markup).
 const IMPORT_TOKEN = /(?:^|[^A-Za-z0-9.\-/@\\])@([^\s]+)/gm;
 const TRAILING_PUNCTUATION = /[)\]}>"'`.,;:!?*_~|]+$/;
+// A segment that looks like a Windows 8.3 short name (`LEDGER~1.MD`, `DOCS~1`). The volume decides what it names, so it is refused, never computed.
+const SHORT_NAME = /~\d+(?:\.|$)/;
 const lc = (s) => s.toLowerCase();
 class Unjudgeable extends Error {}
 
-// Every file in the tree at `toHead`: { entries: path -> { mode, oid }, lower: lowercased path -> [paths] }. The lowercase index is how a
-// case-insensitive file system (macOS, Windows) would resolve a name.
+// Every file in the tree at `toHead`: { entries: path -> { mode, oid }, lower: lowercased path -> [paths], dirs: lowercased directory paths }.
+// The lowercase index is how a case-insensitive file system (macOS, Windows) would resolve a name. The tree holds blobs and links only, so
+// `dirs` is how a directory is told from nothing.
 function readTree(toHead, o) {
   const entries = new Map();
   const lower = new Map();
+  const dirs = new Set();
   for (const raw of git(['ls-tree', '-r', '-z', '--full-tree', toHead], o).split('\0')) {
     const m = /^(\d+) (?:blob|commit) ([0-9a-f]+)\t(.+)$/s.exec(raw);
     if (!m) continue;
     entries.set(m[3], { mode: m[1], oid: m[2] });
     lower.set(lc(m[3]), [...(lower.get(lc(m[3])) ?? []), m[3]]);
+    for (let i = m[3].indexOf('/'); i !== -1; i = m[3].indexOf('/', i + 1)) dirs.add(lc(m[3].slice(0, i)));
   }
-  return { entries, lower };
+  return { entries, lower, dirs };
 }
 
 // File names of the regular files directly in a directory called migrations. Read on demand.
@@ -86,9 +91,11 @@ function migrationNames(tree) {
 }
 
 // Walks `rel` (a posix path from the repo root, `.` and `..` allowed) through the tree, following a symlink at every segment, directories
-// included. -> { path: canonical tree path | null (nothing there), entry } | throws Unjudgeable (a link that cycles, dangles, is absolute or
+// included. -> { path: canonical tree path | null (nothing there), entry, resolved: the path with every link followed (a directory, or
+// where nothing is, too; '' is the root) } | throws Unjudgeable (a link that cycles, dangles, is absolute or
 // ends outside the repo; ambiguous names; a path that climbs above the root).
-function resolveInTree(tree, rel, readBlob) {
+// `dirOk`: a path that ends in a directory (a link to one included) is an answer ({ path: null, resolved }), not a dangling link.
+function resolveInTree(tree, rel, readBlob, { dirOk = false } = {}) {
   let segs = rel.split('/').filter((s) => s !== '' && s !== '.');
   let done = [];
   let follows = 0;
@@ -111,17 +118,20 @@ function resolveInTree(tree, rel, readBlob) {
     if (target === '' || target.includes('\0')) throw new Unjudgeable(`${real} is a symlink with an unreadable target`);
     if (isAbsoluteOrHome(target)) throw new Unjudgeable(`${real} is a symlink to an absolute path`);
     if (target.includes('\\')) throw new Unjudgeable(`${real} is a symlink whose target has a backslash, which has two readings`);
+    // A colon past the drive names an NTFS stream on Windows, and a short name has two readings: neither can be judged in the tree.
+    if (target.includes(':')) throw new Unjudgeable(`${real} is a symlink whose target has a colon, which names an NTFS stream on Windows`);
+    if (target.split('/').some((seg) => SHORT_NAME.test(seg))) throw new Unjudgeable(`${real} is a symlink whose target has a segment that looks like a Windows short name (8.3), which has two readings`);
     segs = [...target.split('/').filter((s) => s !== '' && s !== '.'), ...segs];
     // `done` is the directory that holds the link, unchanged: the target is relative to it.
   }
   const full = done.join('/');
   const hit = tree.lower.get(lc(full));
   if (hit === undefined) {
-    if (follows > 0) throw new Unjudgeable(`a symlink on the way to ${full === '' ? rel : full} dangles`);
-    return { path: null, entry: null };
+    if (follows > 0 && !(dirOk && (full === '' || tree.dirs.has(lc(full))))) throw new Unjudgeable(`a symlink on the way to ${full === '' ? rel : full} dangles`);
+    return { path: null, entry: null, resolved: full };
   }
   if (hit.length > 1) throw new Unjudgeable(`${full} is ambiguous (two names that differ only in case)`);
-  return { path: hit[0], entry: tree.entries.get(hit[0]) };
+  return { path: hit[0], entry: tree.entries.get(hit[0]), resolved: hit[0] };
 }
 
 // A path that names a place outside the reviewed tree whatever the platform: rooted (`/x`), the home directory (`~`, `~/x`) or a drive
@@ -131,6 +141,13 @@ const isAbsoluteOrHome = (p) => /^(?:\/|~(?:\/|$)|[A-Za-z]:)/.test(p);
 
 // A path segment that ends in a dot or a space: Windows drops it, so it names another file there. `.` and `..` are the real ones.
 const dotted = (seg) => seg !== '.' && seg !== '..' && /[. ]$/.test(seg);
+
+// The candidates that have had sentence punctuation (and a #fragment) cut off, as written otherwise. The NTFS-stream rule judges only these,
+// so prose such as `@README.md:` is not mistaken for a stream, while `::$DATA` and `:x.` still are.
+function cutCandidatesOf(token) {
+  const cut = token.replace(TRAILING_PUNCTUATION, '');
+  return [...new Set([cut, cut.split('#')[0].replace(TRAILING_PUNCTUATION, ''), token.split('#')[0].replace(TRAILING_PUNCTUATION, '')].filter((c) => c !== ''))];
+}
 
 // The paths an `@token` may stand for, as written (trailing punctuation and a #fragment cut off in turn).
 function candidatesOf(token) {
@@ -203,6 +220,30 @@ function importProblem({ listed, tree, o }) {
       // judged only after it is cut off (once with, once without the #fragment); every earlier segment is judged as written.
       const stripped = [m[1], m[1].split('#')[0]].map((x) => x.replace(TRAILING_PUNCTUATION, ''));
       if ([...m[1].split('/').slice(0, -1), ...stripped.flatMap((x) => x.split('/'))].some(dotted)) return `${path} imports ${m[1]}, which cannot be judged because a path segment ending in a dot or a space has two readings: this needs a review round`;
+      // A short name (`LEDGER~1.MD`) has two readings, so a segment that looks like one is refused, judged like the dotted check above.
+      if ([...m[1].split('/').slice(0, -1), ...stripped.flatMap((x) => x.split('/'))].some((seg) => SHORT_NAME.test(seg))) return `${path} imports ${m[1]}, which cannot be judged because a segment that looks like a Windows short name (8.3) has two readings: this needs a review round`;
+      // A `:` past the drive names an NTFS stream on Windows: `ledger.md::$DATA` and `docs::$INDEX_ALLOCATION/` ARE the file and the directory,
+      // a named stream holds other bytes than the file. So when anything exists where the stream is cut off (the part up to the first segment
+      // with a colon, that segment cut at it), the token is refused; a git checkout cannot carry a stream of a file it does not have.
+      for (const written of cutCandidatesOf(m[1])) {
+        if (!written.includes(':') || isAbsoluteOrHome(written)) continue; // a drive is refused below as leaving the repository
+        const parts = written.split('/');
+        const at = parts.findIndex((seg) => seg.includes(':'));
+        const stem = parts[at].slice(0, parts[at].indexOf(':'));
+        const streamRefusal = (of) => `${path} imports ${m[1]}, which cannot be judged because a \`:\` past the drive names an NTFS stream of ${of}: this needs a review round`;
+        if (stem === '') return streamRefusal('an empty name');
+        const prefix = [...parts.slice(0, at), stem].join('/');
+        for (const dir of new Set([posix.dirname(path), posix.dirname(canonical)])) {
+          let r;
+          try {
+            r = resolveInTree(tree, `${dir === '.' ? '' : `${dir}/`}${prefix}`, readBlob, { dirOk: true });
+          } catch (e) {
+            if (!(e instanceof Unjudgeable)) throw e;
+            return `${path} imports ${written}, which cannot be judged: ${e.message}`;
+          }
+          if (r.path !== null || r.resolved === '' || tree.dirs.has(lc(r.resolved))) return streamRefusal(r.path ?? (r.resolved || '.'));
+        }
+      }
       for (const written of candidatesOf(m[1])) {
         // An absolute or home path is not a place inside the reviewed tree, so it cannot be judged there.
         if (isAbsoluteOrHome(written)) return leaves(path, written);

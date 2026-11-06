@@ -647,7 +647,6 @@ test('an NTFS stream of a listed document or of an existing file is refused, a d
     ['docs/LEDGER.MD::$DATA', 'docs/ledger.md'], // a case-insensitive file system
     ['notes.md:instructions:$DATA', 'notes.md'], // not listed, but a stream holds other bytes than the file
     ['docs::$INDEX_ALLOCATION/ledger.md', 'docs'],
-    ['docs/::$INDEX_ALLOCATION/ledger.md', 'docs'],
     ['docs:x/ledger.md', 'docs'],
     ['./docs/../docs/ledger.md::$DATA', 'docs/ledger.md'],
   ]) {
@@ -664,7 +663,7 @@ test('an NTFS stream of a listed document or of an existing file is refused, a d
 });
 
 test('an empty segment before the colon, or a stream path that cannot be resolved, is refused', (t) => {
-  for (const token of [':x', 'docs/:y', 'docs/:$DATA/ledger.md']) {
+  for (const token of [':x', 'docs/:y', 'docs/:$DATA/ledger.md', 'docs/::$INDEX_ALLOCATION/ledger.md']) {
     refused(exemptWith(importWorld(t, { 'CLAUDE.md': `see @${token}\n` })), STREAM);
   }
   // a prefix that climbs above the repo, or through a dangling link, cannot be judged either
