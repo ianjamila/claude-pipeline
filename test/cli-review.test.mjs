@@ -550,6 +550,53 @@ test('codex-review: a round that only merged the base branch in is recorded as b
   assert.equal(outcome.json.coverageValid, true);
 });
 
+test('codex-review --base-only: a pure main merge is recorded as the baseOnly round, Codex is not run', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' });
+  const calls = w.captured().length;
+  const r = w.codex(2, findingsOf([finding()]), { from: w.head, to: merged, extra: ['--base-only'] });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, true);
+  assert.equal(w.captured().length, calls, 'the Codex stub was not called');
+  assert.deepEqual([w.state().rounds[1].n, w.state().rounds[1].baseOnly, w.state().rounds[1].toHead], [2, true, merged]);
+});
+
+test('codex-review --base-only: the PR changed since the last round is refused not-base-only with no state change and no Codex call', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  w.repo.commit('own change');
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' });
+  const before = w.stateText();
+  const calls = w.captured().length;
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged, extra: ['--base-only'] });
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.error, 'not-base-only');
+  assert.match(r.json.reason, /round 1/);
+  assert.equal(w.stateText(), before, 'the state is untouched');
+  assert.equal(w.captured().length, calls, 'Codex was not run');
+  assert.equal(existsSync(w.roundFile(2, 'diff.patch')), false, 'nothing is written for the refused round');
+  // the same range without the flag is an ordinary reviewed round
+  const plain = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(plain, 0, plain.stderr + plain.stdout);
+  assert.equal(plain.json.baseOnly, undefined);
+});
+
+test('codex-review --base-only: main was not merged in (only an own commit) is refused', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const own = w.repo.commit('own change, main not merged in');
+  const before = w.stateText();
+  const r = w.codex(2, findingsOf(), { from: w.head, to: own, extra: ['--base-only'] });
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.equal(r.json.error, 'not-base-only');
+  assert.match(r.json.reason, /not merged in/);
+  assert.equal(w.stateText(), before);
+});
+
 test('codex-review: a base-only round past review.max_rounds is recorded (it does not count), a round with PR changes is still capped', (t) => {
   const w = worldIgnoringReview(t, { yml: `${pipelineYml()}review:\n  max_rounds: 1\n` });
   assertExit(w.codex(1, findingsOf()), 0);

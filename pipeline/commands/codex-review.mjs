@@ -40,7 +40,7 @@ import {
 export const meta = {
   summary: 'run one Codex review round over base..head and record its findings',
   usage: [
-    'pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]',
+    'pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--base-only] [--repo DIR]',
     '  -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, reviewer, reviewerReasons, path}',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
     '  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head, an empty commit,',
@@ -64,6 +64,9 @@ export const meta = {
     '    {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise',
     '    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not',
     '    taken alone',
+    '  --base-only: the round must be a base-only one (nothing but the PR\'s base branch merged in since the previous round). Otherwise exit 1 {ok:false, error:not-base-only,',
+    '    reason} before anything is written and without running Codex: the PR changed since round N, the merge conflicted (whole-pr), large binaries changed, or there is no',
+    '    previous round. Used by the merge job to refresh the review of a head main was merged into (it never runs a real review)',
     '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver',
     '  env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)',
   ].join('\n'),
@@ -82,12 +85,24 @@ const resolutionSummary = (r) => ({
   droppedTheirsTotal: r.droppedTheirsTotal,
 });
 
+// Why a round that --base-only was asked for is not one, in words the owner can act on.
+function notBaseOnlyReason({ state, review, patch, largeBinaries, resolutionOnly }) {
+  const last = state?.rounds.at(-1);
+  if (!last) return 'there is no earlier review round: a base-only round only carries a reviewed head forward';
+  if (resolutionOnly || review.kind === 'resolution') return `main was merged in with a conflict that was resolved by hand (a resolution round would need a real review) since round ${last.n}`;
+  if (review.kind === 'whole-pr') return `main was merged in since round ${last.n} in a way the merge-only check cannot prove (a conflict, or a merge that changed more than main's own commits)`;
+  if (largeBinaries.length > 0) return `large binary files changed since round ${last.n}: ${largeBinaries.length} file(s) the review cannot show`;
+  const changed = patch.split('\n').filter((l) => l.startsWith('diff --git')).length;
+  if (review.kind === 'previous') return `the PR's base branch was not merged in since round ${last.n}${patch === '' ? ' and the range is empty' : `; the PR's own commits changed ${changed} file(s)`}`;
+  return `the PR's own changes came in since round ${last.n} besides the merge of main (${changed} file(s) differ from the reviewed content plus main)`;
+}
+
 const unavailable = (reason, extra = {}) => new Fail(EXIT.UNAVAILABLE, { ok: false, unavailable: true, reason, ...extra });
 
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
     pr: { type: 'string' }, round: { type: 'string' }, base: { type: 'string' }, head: { type: 'string' },
-    effort: { type: 'string' }, model: { type: 'string' }, repo: { type: 'string' },
+    effort: { type: 'string' }, model: { type: 'string' }, repo: { type: 'string' }, 'base-only': { type: 'boolean' },
   }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const round = intOption(values, 'round', { required: true, min: 1 });
@@ -261,6 +276,11 @@ export const run = guarded(async (argv, ctx) => {
   const { patch, skipped: largeBinaries } = reviewPatch(review.base, head, o);
   // Only the base branch was merged in since the last round: there is nothing of the PR's own to review.
   const baseOnly = review.kind === 'synthetic' && patch === '' && largeBinaries.length === 0;
+  // --base-only (the merge job): anything but a pure base-branch merge is refused here, before the state, the round directory or Codex is touched.
+  if (values['base-only'] === true && !baseOnly) {
+    const reason = notBaseOnlyReason({ state, review, patch, largeBinaries, resolutionOnly });
+    throw new Fail(EXIT.FAILED, { ok: false, error: 'not-base-only', reason, message: reason, round });
+  }
   // A later round exists to review the fixes for what earlier rounds accepted. An empty range (or no change in the branch content
   // since the last round) reviews nothing, and would let an unfixed accepted item look resolved. It is judged HERE, once baseOnly
   // is known: a round that only merged the base branch in is never refused (it is recorded below, without Codex, and does not

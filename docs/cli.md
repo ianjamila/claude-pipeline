@@ -106,7 +106,7 @@ It decides WHEN CI is done, not whether to merge: `pipeline merge` re-proves gua
 run one Codex review round over base..head and record its findings.
 
 ```
-pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]
+pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--base-only] [--repo DIR]
   -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, reviewer, reviewerReasons, path}
   --base must be the PR's merge base for round 1 and the previous round's toHead after that, else exit 2 {error:base-mismatch}
   exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head, an empty commit,
@@ -130,6 +130,9 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
     {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise
     the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not
     taken alone
+  --base-only: the round must be a base-only one (nothing but the PR's base branch merged in since the previous round). Otherwise exit 1 {ok:false, error:not-base-only,
+    reason} before anything is written and without running Codex: the PR changed since round N, the merge conflicted (whole-pr), large binaries changed, or there is no
+    previous round. Used by the merge job to refresh the review of a head main was merged into (it never runs a real review)
   exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver
   env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)
 ```
