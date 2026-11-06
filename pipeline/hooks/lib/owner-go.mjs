@@ -4,9 +4,9 @@
 // owner-go recorder (the UserPromptSubmit hook hooks/owner-go.mjs, which fires for the owner's typed prompts and for harness turns, which #128 screens out) writes
 // down each owner prompt that STARTS with "merge", bound to what the reply right before it asked for:
 //   `Head <sha12> · items <digest> · repo <owner/name>` lines + `🔀 Ready to merge #N — say "merge"` (skills/ship, Owner-merge approval). The block may also carry an
-//   `Areas …` line (protected areas), a `Hold … by … at …` line with the lift wording on the 🔀 line (the needs-human hold the "merge" lifts) and, for one PR, a `Rulings <digest12>` header with
-//   its rows (the dismissals Claude or the arbiter made on BLOCKING / security items). The order, top to bottom: Rulings, Areas, Hold, Head, 🔀. See presentedRequests.
-// `P merge` then needs a record for exactly that repository, PR, head and owner-item set; the guard needs one (for that repository and
+//   `Areas …` line (protected areas), a `Carry: …` line first (the go also covers main-only updates of the head), a `Hold … by … at …` line with the lift wording on the 🔀 line (the needs-human hold the "merge" lifts) and, for one PR, a `Rulings <digest12>` header with
+//   its rows (the dismissals Claude or the arbiter made on BLOCKING / security items). The order, top to bottom: Carry, Rulings, Areas, Hold, Head, 🔀. See presentedRequests.
+// `P merge` then needs a record for exactly that repository, PR, head (or a main-only update of it, when the request carried the Carry line: see CARRY_LINE) and owner-item set; the guard needs one (for that repository and
 // PR, in that session) before a direct `gh pr merge` / the repo's merge command in an owner_approval: chat repo. Phase 3b: the repository
 // is part of the request, so a "merge" said for #N of one repository never approves #N of another (a fork, a mirror, a vendored copy
 // that shares the commit). A request line without it approves nothing. guard-files keeps
