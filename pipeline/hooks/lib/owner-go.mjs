@@ -150,6 +150,12 @@ const liftsHold = (rest, prs) => {
 const RULINGS_HEADER = /^\s*Rulings\s+[0-9a-f]{12}\s*$/;
 const RULINGS_ROW = /^\s*R\d+-[A-Za-z]\d+\s+·\s+.+$/;
 // What the record stores for the block and P merge compares: sha256 of its non-blank lines (each trimmed, runs of white space as one space) joined by a newline; 'none' for no block.
+// Merge-carry consent (plan 2026-11-05-merge-survives-main-reviewed R9/R13, C4, C5, C12): the owner's "merge" also covers main-only updates of the head only when the request shown to
+// them carried this exact line as the non-blank line directly above the FIRST line of the whole request block (the Rulings header when one bound, else the first of Areas / Hold / Head):
+// `Carry: …` → `Rulings …` + rows → `Areas …` → `Hold …` → `Head …` → 🔀. The request then gets `carry: true` (per request, record stays v1; an older reader stops at the line and ignores the field).
+export const CARRY_LINE = 'Carry: also covers main-only updates (clean merges of main, no other change)';
+export const CARRY_MIN_HEAD = 16; // a carry request needs a Head line of at least this many hex characters (C4)
+const isCarryLine = (l) => l !== undefined && !l.includes('\r') && l.trim() === CARRY_LINE;
 export const rulingsBlockDigest = (text) => {
   const lines = String(text ?? '').split(/\r?\n/).map((l) => l.trim().replace(/\s+/g, ' ')).filter((l) => l !== '');
   return lines.length === 0 ? 'none' : createHash('sha256').update(lines.join('\n')).digest('hex');
@@ -219,6 +225,11 @@ export function presentedRequests(text) {
   // Head line that binds nothing itself (a PR not on the 🔀 line, an unprefixed Head in the several-PR form, a duplicate) neither makes the wording legitimate nor forbids it.
   const requests = [...bound.values()].filter(Boolean);
   if (liftsHold(r[1], prs) ? !prs.every((p) => bound.get(p)?.hold) : requests.some((x) => x.hold)) return none(prs);
+  // Carry (C5): the line directly above the whole block (`i` is now the line above its first line). It binds only for ONE PR with ONE request, no hold (C12), a head of >= CARRY_MIN_HEAD hex,
+  // and not when another Carry line is directly above it (duplicate) or a rulings row / header / Areas / Hold / Head line is (a Carry line between the parts of a block: the part above did not bind, nor does the carry).
+  // Anywhere else the line is prose and changes nothing.
+  if (prs.length === 1 && requests.length === 1 && !requests[0].hold && requests[0].head.length >= CARRY_MIN_HEAD && isCarryLine(lines[i])
+    && !isCarryLine(lines[i - 1]) && !(lines[i - 1] !== undefined && (RULINGS_ROW.test(lines[i - 1]) || RULINGS_HEADER.test(lines[i - 1]) || AREAS_START.test(lines[i - 1]) || HOLD_START.test(lines[i - 1]) || HEAD_LINE.test(lines[i - 1])))) requests[0].carry = true;
   return { prs, requests };
 }
 
@@ -764,22 +775,76 @@ function ownedBy(list, { grant = false, home } = {}) {
 // `undefined` (absent, a caller that forgot) means "no hold" and fails closed.
 // `rulings` (plan 2026-11-05-claude-rulings E11): the sha256 the live scan holds for the Rulings block (rulingsBlockDigest, 'none' without one); the record's `rulings` must equal it, an absent
 // field reading as 'none', so a record without a block never covers a PR with rulings and the other way round. `rulings: null` (only the gated route) compares nothing.
-const approvalsFor = ({ repo, pr, head, items, areas, hold, rulings, ...opts }) => {
+// The query's side of the comparison, shared by the exact-head reader and the carry candidates: null when the query cannot match anything, else { key, restOk(q) } where restOk is every field but the head.
+const approvalQuery = ({ repo, head, items, areas, hold, rulings, pr }) => {
   const key = repoKey(repo);
-  if (key === null || !/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return [];
+  if (key === null || !/^[0-9a-f]{40}$/.test(String(head)) || typeof items !== 'string') return null;
   const wantAreas = areas === null ? null : areasDigest(areas);
   const wantRulings = rulings === null ? null : (rulings ?? 'none'); // null = this route does not bind the rulings block; absent / undefined = 'none' (fails closed against a live digest)
   const wantHold = hold === null ? null : { id: hold ? hold.id : 'none', digest: holdDigest(hold) }; // (undefined = no hold)
-  return readApprovals(opts).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items
+  const restOk = (q) => q.repo === key && q.pr === pr && q.items === items
     && (wantAreas === null || (typeof q.areas === 'string' ? q.areas : 'none') === wantAreas)
     && (wantRulings === null || (typeof q.rulings === 'string' ? q.rulings : 'none') === wantRulings)
-    && (wantHold === null || ((typeof q.hold === 'string' ? q.hold : 'none') === wantHold.id && (typeof q.holdBlock === 'string' ? q.holdBlock : 'none') === wantHold.digest))));
+    && (wantHold === null || ((typeof q.hold === 'string' ? q.hold : 'none') === wantHold.id && (typeof q.holdBlock === 'string' ? q.holdBlock : 'none') === wantHold.digest));
+  // A carry candidate: a request the owner approved WITH the Carry line, whose every other field matches, hold none on both sides (C12), a head of >= CARRY_MIN_HEAD hex that is not this head's prefix.
+  const carryOk = (q) => q.carry === true && q.head.length >= CARRY_MIN_HEAD && !head.startsWith(q.head) && restOk(q) && q.hold === undefined && q.holdBlock === undefined && (wantHold === null || wantHold.id === 'none');
+  return { restOk, exactOk: (q) => q.head.length >= HEAD_CHARS && head.startsWith(q.head) && restOk(q), carryOk };
 };
-export function approvalGap(q) {
-  const matching = approvalsFor(q);
-  if (matching.length === 0) return 'none';
-  return ownedBy(matching, { home: q.home }).length > 0 ? 'ok' : 'provenance';
+const queryOpts = ({ repo, pr, head, items, areas, hold, rulings, carry, carryMemo, ...opts }) => opts; // (what readApprovals takes)
+const approvalsFor = (q) => {
+  const m = approvalQuery(q);
+  return m === null ? [] : readApprovals(queryOpts(q)).filter((r) => r.requests.some(m.exactOk));
+};
+// The records the carry callback could cover, grouped by distinct prefix: Map(prefix → { request, records }).
+const carryCandidates = (q) => {
+  const m = approvalQuery(q);
+  const out = new Map();
+  if (m === null) return out;
+  for (const r of readApprovals(queryOpts(q))) {
+    for (const x of r.requests) {
+      if (!m.carryOk(x)) continue;
+      if (!out.has(x.head)) out.set(x.head, { request: x, records: [] });
+      out.get(x.head).records.push(r);
+    }
+  }
+  return out;
+};
+// F10: the optional `carry({ prefix, request, record }) → { ok, from?, reason? }` callback is consulted ONLY when no record matches the exact head, only for carry candidates (carryCandidates), once per
+// distinct prefix (memoised in `carryMemo`, a Map the caller may share between calls), and a throw (or a malformed answer) is a refusal.
+const carryResults = (q, candidates) => {
+  const memo = q.carryMemo instanceof Map ? q.carryMemo : new Map();
+  const out = new Map();
+  for (const [prefix, { request, records }] of candidates) {
+    if (!memo.has(prefix)) {
+      let v;
+      try { v = q.carry({ prefix, request, record: records[0] }); } catch (err) { v = { ok: false, reason: String(err?.message ?? err) }; }
+      memo.set(prefix, v !== null && typeof v === 'object' && v.ok === true ? { ok: true, from: v.from } : { ok: false, reason: typeof v?.reason === 'string' && v.reason !== '' ? v.reason : 'the check gave no reason' });
+    }
+    out.set(prefix, memo.get(prefix));
+  }
+  return out;
+};
+// The full answer: { gap: 'ok' | 'none' | 'provenance' | 'carry', reason?, carriedFrom?, carriedPrefix? }. 'ok' is an exact-head record or a carry the callback accepted, in both cases with an owner prompt behind
+// it (ownedBy; the 24 h age is already applied to the records); 'provenance' is a match with no owner prompt behind it; 'carry' means the only candidates were carry requests the callback refused (reason says why).
+export function approvalVerdict(q) {
+  const exact = approvalsFor(q);
+  if (exact.length > 0) return { gap: ownedBy(exact, { home: q.home }).length > 0 ? 'ok' : 'provenance' };
+  if (typeof q.carry !== 'function') return { gap: 'none' };
+  const candidates = carryCandidates(q);
+  if (candidates.size === 0) return { gap: 'none' };
+  const results = carryResults(q, candidates);
+  let accepted = false;
+  for (const [prefix, { records }] of candidates) {
+    const res = results.get(prefix);
+    if (!res.ok) continue;
+    accepted = true;
+    if (ownedBy(records, { home: q.home }).length > 0) return { gap: 'ok', carriedFrom: res.from, carriedPrefix: prefix };
+  }
+  if (accepted) return { gap: 'provenance' };
+  const reasons = [...candidates.keys()].map((prefix) => `the owner approved ${prefix.slice(0, 12)}…; this head is not a main-only update of it: ${results.get(prefix).reason}`);
+  return { gap: 'carry', reason: reasons.join('; ') };
 }
+export const approvalGap = (q) => approvalVerdict(q).gap;
 export const approvedRequest = (q) => approvalGap(q) === 'ok';
 
 // R2-F3 (fix round): promptProvenance trusts a transcript only under a `.claude*` folder directly under the account's home (isTranscriptFile; $CLAUDE_CONFIG_DIR names no root: it is the agent's
@@ -795,7 +860,13 @@ export function configDirHint(records, { home = accountHome() } = {}) {
   };
   return (records ?? []).some(plausible) ? CONFIG_DIR_HINT : '';
 }
-export const approvalConfigDirHint = (q) => configDirHint(approvalsFor(q), { home: q.home });
+export const approvalConfigDirHint = (q) => {
+  const exact = approvalsFor(q);
+  if (exact.length > 0 || typeof q.carry !== 'function') return configDirHint(exact, { home: q.home });
+  const candidates = carryCandidates(q);
+  const results = carryResults(q, candidates); // (memoised: a caller that passes the same carryMemo as to approvalVerdict does not run the check twice)
+  return configDirHint([...candidates].filter(([prefix]) => results.get(prefix).ok).flatMap(([, { records }]) => records), { home: q.home });
+};
 export const rulingConfigDirHint = (q) => configDirHint(rulingsFor(q), { home: q.home });
 
 // The guard, before a direct merge: did the owner say "merge" in this session (last 24 h) for a request about this repository and PR
