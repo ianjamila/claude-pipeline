@@ -4,17 +4,24 @@ import { existsSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { resolve, join } from 'node:path';
 import { EXIT, UsageError, parseCommandArgs, intOption, requireOption } from '../lib/cli.mjs';
+import { guarded } from '../lib/cmd-common.mjs';
 import { loadConfig, DEFAULTS } from '../lib/config.mjs';
 import { loadState } from '../lib/state.mjs';
-import { MARKERS, triageComment, summarySections, needsHumanComment, blockedComment, awaitingReviewComment } from '../lib/render.mjs';
+import { MARKERS, summarySections, needsHumanComment, blockedComment, awaitingReviewComment } from '../lib/render.mjs';
 import { recordForOutcome } from '../lib/run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 import { createGitHub, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
-import { readModelProofs } from '../lib/review-context.mjs';
+import { readModelProofs, withReviewLock } from '../lib/review-context.mjs';
+import { publishTriage } from '../lib/review-publish.mjs';
 
 export const meta = {
   summary: 'render and upsert a pipeline PR comment (triage, summary, needs-human, blocked, awaiting-review)',
-  usage: 'pipeline comment --pr N --kind triage|summary|needs-human|blocked|awaiting-review [--outcome O] [--built TEXT] [--reason TEXT] [--hits-file F] [--repo DIR]',
+  usage: [
+    'pipeline comment --pr N --kind triage|summary|needs-human|blocked|awaiting-review [--outcome O] [--built TEXT] [--reason TEXT] [--hits-file F] [--repo DIR]',
+    '  --kind triage publishes the review state under the review lock as a compare-and-swap on its content (lib/review-publish.mjs): it is refused',
+    '  (exit 1 {ok:false, error:\'stale-publication\', reason}) when the PR holds a state this copy neither published nor restored: run `pipeline state show --pr N`',
+    '  and redo the decision; {action:\'unchanged\'} when the PR already holds exactly this state. The other kinds take no lock.',
+  ].join('\n'),
 };
 
 const MARKER_OF = {
@@ -67,7 +74,7 @@ function summaryKind(gh, pr, sections, outcome) {
   return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: record.step, warnings } };
 }
 
-export async function run(argv, ctx) {
+export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
     pr: { type: 'string' },
     kind: { type: 'string' },
@@ -85,7 +92,8 @@ export async function run(argv, ctx) {
 
   let body;
   if (kind === 'triage') {
-    body = triageComment(requireState(root, kind));
+    const state = requireState(root, kind);
+    if (state.pr !== pr) throw new UsageError(`the local review state belongs to PR #${state.pr}, not #${pr}: the triage comment is rendered from it`);
   } else if (kind === 'summary') {
     const outcome = requireOption(values, 'outcome');
     const state = requireState(root, kind);
@@ -117,9 +125,16 @@ export async function run(argv, ctx) {
   }
 
   const gh = createGitHub({ cwd, env: ctx.env });
+  // The triage state is read again under the lock, so what is published is what the lock-holders before us left.
+  if (kind === 'triage') {
+    return guardGh(() => withReviewLock(root, pr, ctx, () => {
+      const r = publishTriage({ gh, root, pr, state: requireState(root, kind) });
+      return { exitCode: EXIT.OK, output: { ok: true, kind, pr, action: r.action, url: r.url, id: r.id } };
+    }));
+  }
   return guardGh(() => {
     if (kind === 'summary') return summaryKind(gh, pr, body, values.outcome);
     const r = gh.upsertComment(pr, MARKER_OF[kind], body);
     return { exitCode: EXIT.OK, output: { ok: true, kind, pr, action: r.action, url: r.url, id: r.id } };
   });
-}
+});

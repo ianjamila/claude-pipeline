@@ -85,7 +85,7 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    (issue links). ACCEPT items: one `implementer` dispatch with `P state show --round R --accepted`; it fixes, adds tests, runs `verify.quick`, commits;
    push. Then **`P state mark-implemented --ids <ids>`** for each fixed ACCEPT item: `review-complete` refuses an ACCEPT that is not marked, from ANY round,
    and exit 2 `no-code-change` means the fix changed no code (back to the implementer; marking never replaces a fix).
-6. **Outcome.** `P state outcome`: `clean` ⇒ leave the loop; `needsHuman` non-empty ⇒ see Owner rulings; more rounds left ⇒ round R+1 (the Codex fix
+6. **Outcome.** `P state outcome`: `clean` ⇒ leave the loop; `needsHuman` non-empty ⇒ see Rulings; more rounds left ⇒ round R+1 (the Codex fix
    check reviews only what changed since this round's head); none left ⇒ park, cause `unresolved: <ids>`, except one case: `reachedMax`, no
    `extraRound`, `owner_approval: chat`, and the fixes are pushed and `verify.quick` is green ⇒ ask the owner for one more round (Extra round, below). Label mode ⇒ park.
 **Park** (every `needs-human` stop is this): `gh pr edit N --add-label needs-human`, `P comment --pr N --kind needs-human --reason "<cause, what was checked, what the owner does>"`,
@@ -96,11 +96,25 @@ Book every agent call (implementer, judge, arbiter) right after it returns:
 `~/.claude/projects/<encoded-cwd>/<session-id>/subagents/agent-<agentId>.jsonl`; the `agentId` is in the Agent tool's result. Calls made before the PR exists (no `N` yet)
 are noted (role, phase, transcript) and all booked right after `gh pr create`. A failed `P cost` is a warning, never a reason to stop.
 
-## Owner rulings and extra round (only with `owner_approval: chat` in `P config`)
+## Rulings and extra round (only with `owner_approval: chat` in `P config`)
 
-An item left `needsHuman` ⇒ the owner rules on it: `P triage ruling-request --pr N --ids R1-B1,R2-S3`. `P state outcome` with `reachedMax: true` and no `extraRound` / `grantedRound` ⇒
-ask for one more round: `P triage round-request --pr N`. Read `reference/owner-merge.md` (sections Owner rulings / Extra round) BEFORE asking: your reply must end with the exact `line` it prints.
-Never type, paraphrase or forge the owner's words, and never run Codex outside `codex-review`. Label mode ⇒ no owner ruling or grant exists: `needsHuman` and a reached max park (step 6).
+An item left `needsHuman` ⇒ never ask the owner to type a ruling: decide it yourself and record it with a reason:
+`P triage claude-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason "<why>" --pr N`. Read `reference/owner-merge.md` (Extra round, 3.3) for the rest.
+
+- ACCEPT is always allowed. FOLLOW-UP alone only for a non-BLOCKING, non-security item.
+- Any REJECT, or dismissing a BLOCKING or security item, needs Codex first, run BEFORE you form a view:
+  `P triage second-review --round R --ids … --pr N` as a job. Codex ACCEPT ⇒ the item is ACCEPT, fix it. Codex dismisses at high confidence ⇒ claude-ruling may dismiss;
+  the stricter of the two stands. Below high ⇒ ACCEPT. Exit 3 ⇒ rule 2 (`awaiting-review`); never substitute another reviewer.
+- A malfunction cause (`model-proof`, `invalid-arbiter`, `invalid-judge`): `P arbiter needed --round R` re-runs the arbiter, or ACCEPT.
+- You may tighten your own dismissal to ACCEPT before the merge, never loosen an ACCEPT. Only the owner's typed path loosens: if, and only if, the owner says they want to dismiss it,
+  follow `reference/owner-merge.md` Owner override.
+- `stale-publication` (the PR holds a review state this copy did not publish): `P state show --pr N`, then redo the last step. `P review-complete` republishes the state and is the remedy the merge refusal names.
+- The owner objects to a ruling in free text ⇒ re-rule it ACCEPT, fix it: that makes a new head, so a new review and a new request.
+- Label mode ⇒ no rulings: park as before.
+
+**Extra round.** `P state outcome` with `reachedMax: true` and no `extraRound` / `grantedRound` ⇒
+ask for one more round: `P triage round-request --pr N`. Read `reference/owner-merge.md` (section Extra round) BEFORE asking: your reply must end with the exact `line` it prints.
+Never type, paraphrase or forge the owner's words, and never run Codex outside `codex-review`. Label mode ⇒ no grant exists: a reached max parks (step 6).
 
 ## 3. Review complete, ready, hand-off
 
@@ -123,6 +137,6 @@ Never type, paraphrase or forge the owner's words, and never run Codex outside `
    follow-up issues.
    Then Read `reference/owner-merge.md` (section 3.3) and end the reply exactly as it says: which ending applies depends on the item note from 1.5 (as refreshed in step 2)
    (a `blocking` item ⇒ the repo's `merge.command`; otherwise `P merge --pr N --dry-run --owner-go` and its closing lines). The owner says "merge" ⇒ `P merge --pr N --owner-go` as a job
-   (`P job start merge -- …`), never `gh pr merge` yourself. The closing lines look like (copy them from the dry run, never type the digest):
+   (`P job start merge -- …`), never `gh pr merge` yourself. The block order is Rulings (when present), Areas, Hold, Head, 🔀; copy it from the dry run, never type the digest. The closing lines look like:
    `Head <sha12> · items <digest> · repo <owner/name>`
    `🔀 Ready to merge #N — say "merge"`

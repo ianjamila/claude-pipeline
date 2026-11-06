@@ -15,20 +15,19 @@
 // read-modified-written under the per-PR lock, but the lock is NOT held while Codex runs (up to 30 minutes): the
 // state is read again under the lock once Codex has answered, and a round recorded in the meantime wins.
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import {
-  FINDINGS_SCHEMA_PATH, assignIds, buildCodexArgs, buildReviewPrompt, classifyCodexFailure, largeBinaryNote, renderFindingsMarkdown,
-  validateFindings,
+  FINDINGS_SCHEMA_PATH, assignIds, buildCodexArgs, buildReviewPrompt, largeBinaryNote, renderFindingsMarkdown, validateFindings,
 } from '../lib/codex.mjs';
+import { CODEX_TIMEOUT_MS, execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import {
   GitError, NETWORK_TIMEOUT_MS, diffFiles, effectiveReviewBase, git, headSha, mergeBase, resolutionReviewBase, reviewPatch, revParse, showFile,
 } from '../lib/git.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { createGitHub } from '../lib/github.mjs';
-import { GhError, codexCommand, runAsync } from '../lib/proc.mjs';
+import { GhError } from '../lib/proc.mjs';
 import { assessRisk, isLightLane, reviewLane } from '../lib/risk.mjs';
 import { addRound, emptyState, loadState, saveState } from '../lib/state.mjs';
 import { reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from '../lib/triage.mjs';
@@ -56,6 +55,9 @@ export const meta = {
     '    base-only rounds and resolution-only rounds (below) never count toward the cap',
     '  reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
     '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable',
+    '  confirm fixed: an accepted item that a forced or Claude ruling marked implemented through files other than the one it names (state mark-implemented,',
+    '    implementedVia other-files) is listed in the prompt of the next round that runs Codex (not a base-only one), with its original finding fenced as untrusted',
+    '    text: Codex says whether it is really fixed and raises it again as BLOCKING when it is not. The round records round.confirmFixed:[ids] (absent when none)',
     '  commits merged in from the PR\'s base branch since the previous round are left out of the reviewed diff; a round that only merged them in',
     '    is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}',
     '  when that merge conflicted and the resolution only chose lines the two sides already had, Codex reviews just the resolution:',
@@ -67,16 +69,7 @@ export const meta = {
   ].join('\n'),
 };
 
-export const CODEX_TIMEOUT_MS = 30 * 60 * 1000;
-// A file system may round mtimes down (1-2 s on some); the file was unlinked before the run, so this only has to
-// tell "written during this run" from "left over from long ago".
-const MTIME_SLACK_MS = 2000;
-const DETAIL_CHARS = 1000;
-
-const tail = (s) => {
-  const text = String(s ?? '').trim();
-  return text.length > DETAIL_CHARS ? text.slice(-DETAIL_CHARS) : text;
-};
+export { CODEX_TIMEOUT_MS };
 
 // What the prompt and the stored round carry of a proven resolution. The lists are cut to 50 (dropped blocks first, so a cut never
 // hides a drop); the totals are over ALL blocks and travel with them, so nothing downstream has to count a truncated list.
@@ -298,9 +291,15 @@ export const run = guarded(async (argv, ctx) => {
   const priorRulings = [...latestByFingerprint].map(([fp, item]) => ({
     id: item.id, title: item.title, ruling: `${cache[fp].decision ?? 'unknown'}: ${cache[fp].reason ?? ''}`,
   }));
+  // Accepted items a forced or Claude ruling marked fixed through OTHER files than the one they name (state mark-implemented, implementedVia
+  // 'other-files'), not yet asked about in an earlier round: this round's prompt asks whether they are really fixed, and the round records the ids
+  // (round.confirmFixed) so review-complete can see they were asked. A base-only round asks nothing, so it consumes none.
+  const confirmed = new Set((state?.rounds ?? []).flatMap((r) => (Array.isArray(r.confirmFixed) ? r.confirmFixed : [])));
+  const confirmItems = baseOnly ? [] : priorItems.filter((i) => i.implementedVia === 'other-files' && !confirmed.has(i.id));
   const prompt = buildReviewPrompt({
     pr, title: view.title, body: view.body, base: review.base, head, risk: level, round, lightLane, priorRulings, rulesRef: forkPoint, largeBinaries, baseKind: review.kind,
     sensitivePaths: lane.sensitivePaths,
+    ...(confirmItems.length > 0 ? { confirmFixed: confirmItems.map((i) => ({ id: i.id, title: i.title, file: i.file, detail: i.detail })) } : {}),
     ...(resolutionOnly ? { resolution: { from: base, forkPoint, ...resolutionView } } : {}),
   });
 
@@ -314,30 +313,17 @@ export const run = guarded(async (argv, ctx) => {
   const headMoved = () => new Fail(EXIT.USAGE, { ok: false, error: 'head-moved', message: 'HEAD moved while Codex was reviewing; run the round again' });
   // Runs Codex over the prepared prompt and returns its validated findings (every failure is an exit-3 Fail).
   const askCodex = async () => {
-    // Whatever is at the output path now was not written by this run; remove it so it can never be read as this
-    // run's answer. (The mtime check below is the second line of defence, the tree kill on timeout the third.)
-    rmSync(outPath, { force: true });
-    const startedAt = Date.now();
-    const { cmd, prefixArgs } = codexCommand(ctx.env);
-    const timeoutMs = Number(ctx.env?.PIPELINE_CODEX_TIMEOUT_MS) || CODEX_TIMEOUT_MS;
-    // On a timeout the whole process tree is killed, so a helper Codex started cannot write its answer afterwards.
+    // execCodex removes whatever is at the output path first (so it can never be read as this run's answer; the mtime check in
+    // readCodexAnswer is the second line of defence, the tree kill on timeout the third).
     writeFileAtomic(path.join(dir, 'prompt.md'), promptBytes);
-    const r = await runAsync(cmd, [...prefixArgs, ...args], { cwd: root, env: ctx.env, input: promptBytes, timeoutMs });
-    // A spawn failure is reported as stderr "spawn <cmd> ENOENT"; classify it as the missing binary it is.
-    const spawnError = /^spawn(?:Sync)? .*\bENOENT\b/.test(r.stderr) ? { code: 'ENOENT', message: r.stderr } : undefined;
-    if (r.code !== 0 || r.timedOut) {
-      rmSync(outPath, { force: true });
-      const reason = classifyCodexFailure({ code: r.code, stderr: r.stderr, stdout: r.stdout, timedOut: r.timedOut, spawnError });
-      throw unavailable(reason, { code: r.code, timedOut: r.timedOut, detail: tail(r.stderr || r.stdout) });
-    }
+    const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
+    if (!ran.ok) throw unavailable(ran.reason, { code: ran.code, timedOut: ran.timedOut, detail: ran.detail });
 
     if (headSha(o) !== head) throw headMoved();
 
     let findings;
     try {
-      if (!existsSync(outPath)) throw new Error('codex exited 0 but wrote no output file');
-      if (statSync(outPath).mtimeMs < startedAt - MTIME_SLACK_MS) throw new Error('codex output file predates this run');
-      findings = JSON.parse(readFileSync(outPath, 'utf8'));
+      findings = readCodexAnswer(outPath, ran.startedAt);
     } catch (err) {
       throw unavailable('malformed', { errors: [err.message] });
     }
@@ -413,6 +399,7 @@ export const run = guarded(async (argv, ctx) => {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: hashAtHead, items: ruled,
       reviewBase: review.base, reviewBaseKind: review.kind, forkPoint, codexModel: model, ...(promptSha256 === undefined ? {} : { promptSha256 }), ...(baseOnly ? { baseOnly: true } : {}),
       ...(admission === 'uncounted' ? {} : { admission }), ...(ownerGrant === undefined ? {} : { ownerGrant }),
+      ...(confirmItems.length > 0 ? { confirmFixed: confirmItems.map((i) => i.id) } : {}),
       ...(resolutionOnly ? { resolutionOnly: true, ...resolutionView } : {}),
       ...(reviewer === 'fable' && !baseOnly ? { fableRequired: true, fableReasons: reasons, sensitivePaths: lane.sensitivePaths.slice(0, 50) } : {}),
     });

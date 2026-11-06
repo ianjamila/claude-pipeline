@@ -26,6 +26,8 @@ const stubGh = (s) => ({
   checks: () => [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }],
   pullFiles: () => s.prFiles,
   repo: () => ({ slug: 'acme/widgets', host: 'github.com' }),
+  viewer: () => 'me', // review-complete: no comment of ours, no history
+  listComments: () => [],
 });
 // What the live scan of s finds: the digest and the areas the owner has to be shown.
 const liveOf = async (s) => {

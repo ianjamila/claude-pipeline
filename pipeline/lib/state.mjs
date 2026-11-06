@@ -20,6 +20,12 @@ const RENAME_WAIT_MS = 50;
 const STRAY_TMP = /^state\.json\..+\.tmp$/;
 const STRAY_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 
+// The newest state format this code understands. A state with a higher `version` was written by a newer pipeline (a Claude ruling or a
+// second review: those, and only those, write version 2; every other state stays 1): loadState refuses it and decodeFromComment reads it
+// as no state, so an older reader never rules from a state it cannot fully see.
+export const SUPPORTED_STATE_VERSION = 2;
+const newerThanSupported = (state) => Number.isFinite(state.version) && state.version > SUPPORTED_STATE_VERSION;
+
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
@@ -77,6 +83,9 @@ export function loadState(dir, { cleanup = true } = {}) {
     throw new Error(`corrupt review state at ${file}: ${err.message}`);
   }
   if (!isPlainObject(parsed)) throw new Error(`corrupt review state at ${file}: expected a JSON object`);
+  if (newerThanSupported(parsed)) {
+    throw new Error(`corrupt review state at ${file}: it is format version ${parsed.version}, this pipeline supports up to ${SUPPORTED_STATE_VERSION} (a newer pipeline wrote it): update the pipeline`);
+  }
   return parsed;
 }
 
@@ -132,7 +141,7 @@ export function decodeFromComment(body) {
     const state = JSON.parse(raw.toString('utf8'));
     // Anything that is not recognisably a review state (an array of rounds, a real PR number) is
     // treated as garbage, so a hand-edited comment cannot feed resume a half-made state.
-    return isPlainObject(state) && Array.isArray(state.rounds) && Number.isInteger(state.pr) && state.pr > 0 ? state : null;
+    return isPlainObject(state) && Array.isArray(state.rounds) && Number.isInteger(state.pr) && state.pr > 0 && !newerThanSupported(state) ? state : null;
   } catch {
     return null;
   }
@@ -150,8 +159,11 @@ export function decodeFromComment(body) {
 // admission: which rule let a COUNTED round start, 'normal' | 'auto-extra' | 'owner' (recorded on every new counted round, never on a
 // baseOnly / resolutionOnly one; an ownerGrant implies 'owner'). ownerGrant: { grantId, k, quote, ownerTs } of the owner's extra-round
 // record that admitted it (hooks/lib/owner-go.mjs claimGrantMarkers; the final gate re-verifies it against the record and its marker).
+// confirmFixed: the ids of accepted items marked implemented through other files (item.implementedVia 'other-files') that this round's prompt
+// asked Codex to confirm; recorded only when there are some, so an ordinary round is unchanged. review-complete needs every such item to appear
+// in the confirmFixed of a LATER round (triage.mjs#reviewEligibilityProblems).
 export function addRound(state, {
-  n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant,
+  n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant, confirmFixed,
 }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
@@ -164,6 +176,7 @@ export function addRound(state, {
       ...(forkPoint === undefined ? {} : { forkPoint }), ...(codexModel === undefined ? {} : { codexModel }),
       ...(promptSha256 === undefined ? {} : { promptSha256 }),
       ...(baseOnly === true ? { baseOnly: true } : {}),
+      ...(Array.isArray(confirmFixed) && confirmFixed.length > 0 ? { confirmFixed: [...confirmFixed] } : {}),
       ...(counted && how !== undefined ? { admission: how } : {}),
       ...(counted && ownerGrant !== undefined ? { ownerGrant: structuredClone(ownerGrant) } : {}),
       ...(resolutionOnly === true
