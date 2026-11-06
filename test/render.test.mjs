@@ -691,3 +691,33 @@ test('triageComment: a round\'s promptSha256 round-trips through the state marke
   s.rounds[0].promptSha256 = 'cd'.repeat(32);
   assert.equal(decodeFromComment(triageComment(s)).rounds[0].promptSha256, 'cd'.repeat(32));
 });
+
+// ---- Claude rulings in the triage comment ----------------------------------------------------
+
+test('triageComment: a Claude ruling shows who decided and a "Claude rulings" list; ordinary comments have neither', () => {
+  const ordinary = triageComment(stateWith([[item({ id: 'R1-B1', judge: judge('ACCEPT'), final: final('ACCEPT') })]]));
+  assert.ok(!ordinary.includes('Claude rulings'));
+  const alone = item({ id: 'R1-B2', final: final('FOLLOW-UP', 'claude', 'later is fine') });
+  const both = item({
+    id: 'R1-B3',
+    final: { ...final('REJECT', 'claude', 'not reachable'), claude: { ruledAt: 'x', cause: 'low-confidence', critical: true } },
+    secondReview: { decision: 'REJECT', confidence: 'high', reasoning: 'codex agrees' },
+  });
+  const body = triageComment(stateWith([[alone, both]]));
+  const rows = body.split('\n').filter((l) => l.startsWith('| 1 |'));
+  assert.match(rows[0], /\| claude \|/);
+  assert.match(rows[1], /\| claude\+codex \|/);
+  const list = body.split('\n').filter((l) => l.startsWith('- R1-B'));
+  assert.equal(list.length, 2);
+  assert.match(body, /\n#### Claude rulings\n/);
+  assert.ok(list[0].includes('R1-B2') && list[0].includes('FOLLOW-UP') && list[0].includes('later is fine'));
+  assert.ok(list[1].includes('R1-B3') && list[1].includes('REJECT') && list[1].includes('Codex REJECT, high') && list[1].includes('not reachable'));
+});
+
+test('triageComment: the Claude rulings list defuses the reason like any other comment text', () => {
+  const it = item({ id: 'R1-B1', final: final('ACCEPT', 'claude', bait('tokcr')) });
+  const body = triageComment(stateWith([[it]]));
+  const listLine = body.split('\n').find((l) => l.startsWith('- R1-B1'));
+  assert.ok(listLine && listLine.includes('tokcr'), 'reason missing from the list');
+  assert.ok(!listLine.includes('<!--') && !listLine.includes('-->') && !listLine.includes('@'), 'raw marker or @ survived in the list');
+});

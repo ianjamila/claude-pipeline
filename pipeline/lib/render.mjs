@@ -42,12 +42,16 @@ const ownerReason = (final) => (typeof final?.ownerQuote === 'string' && final.o
   ? `owner (chat): ${final.ownerQuote}${final.reason ? ` — ${final.reason}` : ''}`
   : null);
 
+// A Claude-ruled item names who decided: claude alone, or claude+codex when a second review (Codex) is stored in the item.
+const claudeRuled = (item) => item?.final?.by === 'claude';
+const claudeBy = (item) => (item.secondReview !== undefined ? 'claude+codex' : 'claude');
+
 function triageRow(n, item) {
   const { final, judge, arbiter } = item;
   let decision = 'pending';
   if (final) decision = `${final.decision ?? 'unknown'}${final.needsHuman ? ' (needs human)' : ''}`;
   else if (judge) decision = `${judge.decision} (pending)`;
-  const by = final?.by ?? '—';
+  const by = claudeRuled(item) ? claudeBy(item) : final?.by ?? '—';
   const conf = arbiter?.confidence ?? judge?.confidence ?? '—';
   const reason = ownerReason(final) ?? final?.reason ?? judge?.reason ?? '';
   const finding = item.title || item.file || '';
@@ -60,12 +64,23 @@ const grantedRounds = (state) => (state.rounds ?? [])
   .map((r) => ({ k: Number.isInteger(r.ownerGrant.k) ? r.ownerGrant.k : null, n: r.n, quote: r.ownerGrant.quote }));
 const grantLabel = (g) => `round ${line(g.k ?? g.n)}`;
 
+// One list item per Claude-ruled item: id, decision, the Codex verdict (when one exists) and Claude's reason.
+function claudeRulingLines(rounds) {
+  return rounds.flatMap((r) => (r.items ?? []).filter(claudeRuled).map((item) => {
+    const sr = item.secondReview;
+    const codex = sr ? `Codex ${line(sr.decision)}, ${line(sr.confidence)}` : 'no Codex check';
+    return `- ${line(item.id)}: ${line(item.final.decision ?? 'unknown')} (${claudeBy(item)}; ${codex}) - ${line(item.final.reason, 300)}`;
+  }));
+}
+
 export function triageComment(state) {
   const rounds = state.rounds ?? [];
   const rows = rounds.flatMap((r) => (r.items ?? []).map((item) => triageRow(r.n, item)));
   const out = [MARKERS.triage, '', '### Pipeline review triage', '', TRIAGE_HEADER, '|---|---|---|---|---|---|---|---|', ...rows];
   if (rounds.length === 0) out.push('', '_No review rounds recorded yet._');
   else if (rows.length === 0) out.push('', '_Codex raised no findings._');
+  const claudeLines = claudeRulingLines(rounds);
+  if (claudeLines.length > 0) out.push('', '#### Claude rulings', '', ...claudeLines);
   const granted = grantedRounds(state);
   if (granted.length > 0) out.push('', `Owner-granted extra round(s): ${granted.map((g) => `${grantLabel(g)} - "${line(g.quote, 300)}"`).join('; ')}`);
   out.push('', encodeForComment(state));

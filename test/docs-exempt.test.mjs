@@ -792,12 +792,18 @@ test('review-complete: a docs-only commit after the round posts the marker with 
   const r = complete(t, w);
   assert.equal(r.code, 0, r.stderr + JSON.stringify(r.json));
   assert.equal(r.json.ok, true);
+  // review-complete publishes the triage state first (compare-and-swap, one comment), then posts exactly one marker.
+  assert.equal(r.posted.length, 2);
+  assert.match(r.posted[0], /^<!-- claude-pipeline:triage -->/);
+  r.posted.splice(0, 1);
   assert.equal(r.posted.length, 1);
   const record = parseReviewRecord(r.posted[0]);
   assert.ok(record, 'the vendored marker parser still reads the body');
   assert.equal(record.contentHash, w.hash('HEAD'));
   assert.equal(record.head, r.head);
-  assert.deepEqual(Object.keys(JSON.parse(/```json\n(.*)\n```/.exec(r.posted[0])[1])), ['contentHash', 'base', 'head', 'rounds', 'codexModel', 'modelProofDigest']);
+  const raw = JSON.parse(/```json\n(.*)\n```/.exec(r.posted[0])[1]);
+  assert.deepEqual(Object.keys(raw), ['contentHash', 'base', 'head', 'rounds', 'codexModel', 'modelProofDigest', 'stateHash']);
+  assert.match(raw.stateHash, /^[0-9a-f]{64}$/);
   assert.match(r.posted[0], /docs\/ledger\.md/);
   assert.ok(r.posted[0].includes(w.head.slice(0, 12)), 'the reviewed head is named');
   assert.match(r.posted[0], /docs-only/i);

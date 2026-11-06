@@ -75,3 +75,25 @@ export const pipelineYml = (enforcement = 'github', checks = ['ci'], { guardChec
   `  guard_checks: ${guardChecks}`,
   '',
 ].join('\n');
+
+// Like createFakeGh, but the fake REMEMBERS the PR's comments (test/fixtures/fake-gh-comments.mjs): a comment posted or edited by one call is what the
+// next call lists, so publication can be tested end to end. `entries` answer everything that is not the viewer or the comment routes. Two checkouts that
+// use the same `env` see each other's publications.
+export function createCommentsGh(entries, { me = 'me', comments = [] } = {}) {
+  const base = createFakeGh(entries);
+  const state = join(base.dir, 'state.json');
+  writeFileSync(state, JSON.stringify({ me, comments, seq: 0, fail: {} }));
+  const read = () => JSON.parse(readFileSync(state, 'utf8'));
+  return {
+    ...base,
+    env: { ...base.env, PIPELINE_GH: `node "${join(fixtures, 'fake-gh-comments.mjs')}"`, PIPELINE_FAKE_GH_STATE: state },
+    // The PR's comments right now, and a way to change what the fake does next (fail: { write, list, writeAfter }).
+    comments: () => read().comments,
+    setFail(fail) { writeFileSync(state, JSON.stringify({ ...read(), fail })); },
+    addComment(c) {
+      const s = read();
+      s.comments.push({ id: 5000 + s.comments.length, user: { login: s.me }, created_at: '2026-11-05T09:00:00Z', updated_at: '2026-11-05T09:00:00Z', ...c });
+      writeFileSync(state, JSON.stringify(s));
+    },
+  };
+}

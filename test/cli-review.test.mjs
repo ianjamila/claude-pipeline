@@ -18,6 +18,7 @@ import { contentHash } from '../pipeline/lib/git.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { currentContentHash, excerptWindow, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
+import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
@@ -1639,7 +1640,8 @@ const REVIEW_COMMENT = [
   { match: 'issues/7/comments --paginate', stdoutJson: [] },
   { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 77, html_url: 'https://github.com/acme/widgets/pull/7#issuecomment-77' } },
 ];
-const postedBodies = (w) => w.fake.calls().filter((c) => c.argv.join(' ').startsWith(`api -X POST repos/${w.slug}/issues/7/comments `)).map((c) => JSON.parse(c.stdin).body);
+// review-complete now publishes the triage state first, so the bodies posted include a triage comment: these are the review-complete markers.
+const postedBodies = (w) => w.fake.calls().filter((c) => c.argv.join(' ').startsWith(`api -X POST repos/${w.slug}/issues/7/comments `)).map((c) => JSON.parse(c.stdin).body).filter((b) => b.startsWith('<!-- claude-pipeline:review-complete'));
 const reviewJson = (body) => JSON.parse(/```json\n(.*)\n```/.exec(body)[1]);
 
 test('review-complete: removes awaiting-review only when the review is valid for the current content', (t) => {
@@ -1696,7 +1698,7 @@ test('review-complete: a gh failure while removing the label is exit 3, not succ
   assertExit(w.cli(['review-complete', '--pr', '7']), 3);
 });
 
-test('review-complete: posts the marker comment with {contentHash, base, head, rounds, codexModel, modelProofDigest}; an identical one is reused', (t) => {
+test('review-complete: posts the marker comment with {contentHash, base, head, rounds, codexModel, modelProofDigest, stateHash}; an identical one is reused', (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
   assertExit(w.codex(1, findingsOf()), 0);
   const r = w.cli(['review-complete', '--pr', '7']);
@@ -1706,9 +1708,10 @@ test('review-complete: posts the marker comment with {contentHash, base, head, r
   const [body] = postedBodies(w);
   assert.ok(body.startsWith('<!-- claude-pipeline:review-complete v1 -->\n'), body);
   const record = reviewJson(body);
-  assert.deepEqual(Object.keys(record), ['contentHash', 'base', 'head', 'rounds', 'codexModel', 'modelProofDigest']);
+  assert.deepEqual(Object.keys(record), ['contentHash', 'base', 'head', 'rounds', 'codexModel', 'modelProofDigest', 'stateHash']);
   assert.deepEqual(record, {
     contentHash: w.state().rounds[0].contentHashAtToHead, base: w.base, head: w.head, rounds: 1, codexModel: 'gpt-6-astra', modelProofDigest: null,
+    stateHash: reviewContentHash(w.state()), // the state review-complete published: the owner-go check binds the marker to it
   });
   assert.deepEqual(r.json.review, record);
   // The hash is the one a guard can recompute from git alone: contentHash(base, head) minus the agent log.
@@ -1720,6 +1723,7 @@ test('review-complete: posts the marker comment with {contentHash, base, head, r
     REMOVE_LABEL,
     { match: '^api user', stdout: 'me\n' },
     { match: 'issues/7/comments --paginate', stdoutJson: [{ id: 76, user: { login: 'mallory' }, body: 'x' }, { id: 77, user: { login: 'me' }, body, html_url: 'u77' }] },
+    { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 91, html_url: 'u91' } }, // the triage state is published first: postedBodies counts markers only
   ]);
   const again = w.cli(['review-complete', '--pr', '7']);
   assertExit(again, 0, again.stdout);
@@ -3472,6 +3476,7 @@ test('triage owner-ruling: works on a published round, and a state rebuilt from 
     ...GH,
     { match: '^api user', stdout: 'me\n' },
     { match: 'issues/7/comments --paginate', stdoutJson: [{ id: 9, user: { login: 'me' }, body: triageComment(ruled) }] },
+    { match: '^api -X PATCH repos/acme/widgets/issues/comments/9 ', stdoutJson: { id: 9, html_url: 'u9' } }, // review-complete publishes the state first
   ];
   const w = ownerWorld(t, { gh, yml: CHAT_YML });
   const shown = w.cli(['state', 'show', '--pr', '7']);
@@ -3766,7 +3771,8 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   const published = w.state();
   const markerTree = published.rounds[1].reviewBase;
   const roundPatch = patchOf(w, 2);
-  w.fake.setScript([...JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')), REMOVE_LABEL, ...COMMENTS(mine(published)), REVIEW_COMMENT[2]]);
+  w.fake.setScript([...JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')), REMOVE_LABEL, ...COMMENTS(mine(published)), REVIEW_COMMENT[2],
+    { match: '^api -X PATCH repos/acme/widgets/issues/comments/9 ', stdoutJson: { id: 9, html_url: 'u9' } }]); // review-complete publishes the state first
 
   // A fresh clone (--no-local: a local clone would copy every object): only the objects reachable from a branch come along, so the marker tree is not there.
   const clone = join(w.scratch, 'clone');

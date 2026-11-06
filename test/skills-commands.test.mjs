@@ -157,7 +157,7 @@ test('(c) the review skill stays short and keeps every step review-complete depe
   assert.match(reviewText, /Head <sha12> · items <digest> · repo <owner\/name>/);
   assert.match(reviewSkill, /Head <sha12> · items <digest> · repo <owner\/name>/, 'the closing lines stay in SKILL.md too');
   assert.ok(reviewSkill.includes('reference/owner-merge.md'), 'SKILL.md must send the agent to reference/owner-merge.md');
-  for (const needle of ['## Owner rulings', 'Extra round', '3.3']) assert.ok(reviewRef.includes(needle), `reference/owner-merge.md must contain ${needle}`);
+  for (const needle of ['## Owner override', 'Extra round', '3.3', 'ownerStep.rulings']) assert.ok(reviewRef.includes(needle), `reference/owner-merge.md must contain ${needle}`);
 });
 
 test('(c2) the review skill lists the steps in the order they must run: Codex, triage, comment, fix, mark-implemented, Codex check, review-complete, ready, merge request', () => {
