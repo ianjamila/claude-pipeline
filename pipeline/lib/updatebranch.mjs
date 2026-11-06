@@ -7,6 +7,7 @@
 //   cycle-cap       main kept moving: after `maxCycles` updates the branch is still behind
 //   checks-failed / checks-timeout / head-timeout   the update was accepted but the new head did not turn green in time
 //   not-open        the PR is closed or merged
+//   queued-behind / hold-unreadable   the caller's `beforeUpdate` refused (a merge hold ahead of this PR, see lib/merge-hold.mjs)
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export const MAX_UPDATE_CYCLES = 3;
@@ -81,8 +82,11 @@ async function waitForNewHead({ gh, pr, from, waitMs, pollMs, now, sleep }) {
 // successor (an external push that raced the update) is `head-moved` and nothing more is written. Waiting for the new head's
 // checks is opt-in (`waitChecks: true`): the review flow marks the PR ready and labels it AFTER updating, and checks that only
 // start then (draft-skipped workflows, label-gated e2e) would otherwise be waited on forever. Merge needs no check wait either.
+// `beforeUpdate` (optional, may be async) is called immediately before EVERY update PUT: a non-null return is a refusal object
+// ({error, …extra}) that ends the loop with outcome = its `error` and its fields on the result, keeping `updated` (= cycles > 0),
+// `cycles`, `head` and `startHead`. Without it nothing changes. The read and the PUT are not atomic: it narrows the window, no more.
 export async function bringUpToDate({
-  gh, pr, expectHead = null, maxCycles = MAX_UPDATE_CYCLES, waitChecks = false,
+  gh, pr, expectHead = null, maxCycles = MAX_UPDATE_CYCLES, waitChecks = false, beforeUpdate = null,
   headWaitMs = HEAD_WAIT_MS, checksWaitMs = CHECKS_WAIT_MS, pollMs = POLL_MS, now = Date.now, sleep = defaultSleep,
 }) {
   let cycles = 0;
@@ -106,6 +110,13 @@ export async function bringUpToDate({
     if (cmp.behindBy === 0) return out('up-to-date', { head, behindBy: 0 });
     if (cycles >= maxCycles) {
       return out('cycle-cap', { head, behindBy: cmp.behindBy, message: `${base} kept moving: still ${cmp.behindBy} commit(s) behind after ${cycles} update(s)` });
+    }
+
+    if (beforeUpdate !== null) {
+      const refusal = await beforeUpdate();
+      if (refusal) {
+        return out(refusal.error, { head, ...refusal });
+      }
     }
 
     const baseSha = cmp.baseSha;

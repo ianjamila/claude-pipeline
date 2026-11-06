@@ -270,6 +270,18 @@ fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warni
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep
 one: a real-looking secret key literal (not marked fake inside the key itself) is still a `needs-human` hit there.
 
+### Merge hold (opt-in)
+
+For a repo whose merge command keeps a cooperative merge lock (EagleWatch's `merge-hold` label), `pipeline.yml` can carry three
+`merge` keys, all three or none: `hold_command` (take the hold; `{pr}`), `hold_release_command` (release it; `{pr}` and `{reason}`)
+and `hold_check_command` (a read-only check that prints one JSON line naming the PRs whose holds block this one; `{pr}`). EagleWatch:
+`npm run merge-hold -- {pr}`, `npm run merge-hold -- {pr} --release --reason {reason}`, `npm run merge-hold -- --status {pr} --json`.
+With them the review skill takes the hold when it hands you the merge request and releases it when the request is withdrawn; `pipeline merge`
+and `pipeline update-branch` refuse (`queued-behind`) instead of updating a branch that must wait for an older hold, and a dry run runs the
+read-only check. The pipeline-side check is cooperative (only a hold-aware merge command catches a hold taken after the check). Merge and
+install the pipeline change before adding the keys; to roll back, remove the keys first. A PR whose hold expires and is renewed goes to the
+back of the queue; your exits are merging the PR ahead, releasing its hold, or the provider's `--ignore-hold`. Details: `docs/cli.md`, Merge hold under `merge`.
+
 ### Smoke firewall bypass header (opt-in)
 
 If a firewall (for example Vercel's) answers 429 to CI runner IPs, the production smoke can send one secret header that a
