@@ -227,6 +227,7 @@ test('--owner-go: `gh pr merge --delete-branch` printing "\'main\' is already ch
   // the worktree case (test/merge-worktree-cleanup.test.mjs covers the rest): named, not an unexplained non-zero exit
   assert.deepEqual(r.json.localCleanup, { skipped: true, reason: 'worktree' });
   assert.match(r.json.note, /a worktree holds it/);
+  assert.match(r.json.note, /before deleting the remote branch.*delete_branch_on_merge/);
   assert.deepEqual(s.mergeCalls(), [`${PR} --match-head-commit ${s.head}`]);
 });
 
