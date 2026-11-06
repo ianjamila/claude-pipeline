@@ -253,7 +253,7 @@ test('conservative: behind AND a red check on H0 is not "behind only" - today\'s
 test('X1: main adds a protected-path rule that covers the PR: the rules are reloaded at the new head, the owner items change, the go is void and nothing merges', async (t) => {
   const w = world(t);
   const yml = readFileSync(join(w.root, '.claude', 'pipeline.yml'), 'utf8');
-  w.mainMoves({ '.claude/pipeline.yml': `${yml}owner_approval: chat\nhard_stops:\n  paths: ['src/**']\n` });
+  w.mainMoves({ '.claude/pipeline.yml': `${yml}hard_stops:\n  paths: ['src/**']\n` });
   go(t, w);
   const r = await w.merge();
   assert.equal(r.exitCode, 1);
@@ -350,4 +350,18 @@ test('R1-B1: the dry run reports a dead job marker for this PR as a blocker, rea
   assert.ok(r.output.blockers.some((b) => b.kind === 'merge-job-dead'), text(r));
   assert.equal(disarmed, 0);
   assert.equal(existsSync(join(w.root, MERGE_JOB_MARKER)), true);
+});
+
+// ---- review round 1 (R1-F2): label mode never carries, whatever the record says ----
+test('R1-F2: under owner_approval: label a Carry record is ignored: today\'s behind-base refusal, no Carry hint, nothing updated', async (t) => {
+  const w = world(t, { ownerApproval: 'label' });
+  w.mainMoves();
+  go(t, w);
+  const r = await w.merge();
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.error, 'live-check');
+  assert.match(r.output.reasons.join('\n'), /behind-base: GitHub reports the PR is BEHIND/);
+  assert.doesNotMatch(r.output.reasons.join('\n'), /Carry/);
+  assert.equal(w.updates, 0);
+  assert.deepEqual(w.mergeCalls(), []);
 });

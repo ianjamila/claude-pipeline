@@ -17,14 +17,15 @@ export const sh = (cwd, ...args) => {
   if (r.status !== 0) throw new Error(`git ${args.join(' ')} (${cwd}): ${r.stderr}`);
   return r.stdout.trim();
 };
-const goYml = (yml = ymlFor()) => yml.replace('{pr} {sha}', '{pr} --match-head-commit {sha}');
+// (merge-carry is for owner_approval: chat only: the world is a chat-mode repository unless a test asks for label mode)
+const goYml = (yml = ymlFor(), ownerApproval = 'chat') => `${yml.replace('{pr} {sha}', '{pr} --match-head-commit {sha}')}owner_approval: ${ownerApproval}\n`;
 
-export function carryWorld({ yml, change = bump, baseFiles } = {}) {
+export function carryWorld({ yml, change = bump, baseFiles, ownerApproval } = {}) {
   const salt = randomUUID();
   // ISOLATION: the approval records are shared by every test process and match on repository + PR; a repo name of its own keeps this world's Carry records from
   // ever being a candidate in another test's refusal (they would change its wording).
   const slug = `acme/carry-${salt.slice(0, 8)}`;
-  const s = scenario({ yml: goYml(yml), report: null, state: null, baseFiles, change: (repo) => { change(repo); repo.write('.salt', salt); } });
+  const s = scenario({ yml: goYml(yml, ownerApproval), report: null, state: null, baseFiles, change: (repo) => { change(repo); repo.write('.salt', salt); } });
   const root = s.repo.dir;
   const top = realpathSync.native(mkdtempSync(join(tmpdir(), 'carry-world-')));
   const bare = join(top, 'origin.git');

@@ -384,6 +384,8 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track, carried = null }
     const failed = live.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`);
     if (live.behindOnly === true && hold === null) {
       if (carried) return { baseMoved: true, ...refuse('live-check', failed, { head }) }; // main moved during the CI wait: the loop's next cycle
+      // R1-F2: merge-carry is for owner_approval: chat only (carryEligible, as the dry run decides): label mode keeps today's refusal, without the hint.
+      if (!carryEligible(config, hold)) return refuse('live-check', failed, { head });
       const consent = carryApprovalFor(asked) ?? await (async () => { const v = await carryVerdict(asked, proveCarry); return v.gap === 'ok' && v.carriedPrefix ? { prefix: v.carriedPrefix } : null; })();
       if (consent) return { enterCarry: { prefix: consent.prefix, head } };
       return refuse('live-check', [...failed, CARRY_HINT], { head });
