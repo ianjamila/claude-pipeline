@@ -17,13 +17,16 @@ import { MAX_BLOCKS, SearchCap, checkSelection, makeBudget, parseConflictBlocks,
 // Upper bound for a git call that talks to a remote (fetch, push, ls-remote): a hung one inside a lock cannot be reclaimed.
 export const NETWORK_TIMEOUT_MS = 120_000;
 
+// `abnormal: true` = the child did not finish on its own (timed out, killed by a signal, or its output went past the buffer limit): its
+// `code` is not git's answer (a SIGKILLed git reports 1, git's own "no match"), so a catch that maps a code to an answer must test it.
 export class GitError extends Error {
-  constructor({ args, code, stderr }) {
+  constructor({ args, code, stderr, abnormal = false }) {
     super(`git ${args.join(' ')} failed (exit ${code})${stderr && stderr.trim() ? `: ${stderr.trim()}` : ''}`);
     this.name = 'GitError';
     this.args = args;
     this.code = code;
     this.stderr = stderr;
+    this.abnormal = abnormal === true;
   }
 }
 
@@ -59,9 +62,10 @@ const SCRUBBED_ENV = Object.fromEntries([
 // `timeoutMs` bounds a call that can hang on the network (fetch, push); a timeout is a GitError like any other.
 function exec(args, { cwd, run: runFn = run, input, env, timeoutMs, maxBuffer } = {}) {
   const r = runFn('git', [...FORCED_CONFIG, ...args], { cwd, env: { ...SCRUBBED_ENV, ...GIT_ENV, ...env }, input, ...(timeoutMs ? { timeoutMs } : {}), ...(maxBuffer ? { maxBuffer } : {}) });
-  const abnormal = r.timedOut ? 'timed out' : r.signal ? `terminated by signal ${r.signal}` : null;
+  // overBuffer (ENOBUFS): stdout was cut, so exit 0 / 1 and an empty stderr no longer mean what git meant by them.
+  const abnormal = r.timedOut ? 'timed out' : r.signal ? `terminated by signal ${r.signal}` : r.overBuffer ? 'output over the buffer limit' : null;
   if (abnormal) {
-    throw new GitError({ args, code: r.code, stderr: [abnormal, (r.stderr ?? '').trim()].filter(Boolean).join(': ') });
+    throw new GitError({ args, code: r.code, stderr: [abnormal, (r.stderr ?? '').trim()].filter(Boolean).join(': '), abnormal: true });
   }
   return r;
 }
@@ -591,7 +595,7 @@ export function showFile(ref, path, o) {
   try {
     return git(['show', `${assertRef(ref, ['show', ref])}:${path}`], o);
   } catch (e) {
-    if (e instanceof GitError && e.code === 128 && MISSING_PATH.test(e.stderr)) return null;
+    if (e instanceof GitError && !e.abnormal && e.code === 128 && MISSING_PATH.test(e.stderr)) return null;
     throw e;
   }
 }

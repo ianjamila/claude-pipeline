@@ -877,3 +877,20 @@ test('ensureReviewBase: a missing synthetic base is rebuilt (same id); other kin
   assert.equal(ensureReviewBase({ reviewBase: 'c'.repeat(40), reviewBaseKind: 'whole-pr', fromHead: s.from }, s.o), 'c'.repeat(40));
   assert.equal(ensureReviewBase({ fromHead: s.from }, s.o), s.from);
 });
+
+// ---------- #188: output past the buffer limit is never a conflict ----------
+
+test('mergeTree / mergeTreeDetailed: an overBuffer run throws, never reports conflicts (exit 1) or a clean merge (a raced exit 0)', () => {
+  const tree = 'a'.repeat(40);
+  for (const [label, result] of [
+    ['exit 1', { code: 1, stdout: `${tree}\n`, stderr: '', timedOut: false, signal: null, overBuffer: true }],
+    ['raced exit 0', { code: 0, stdout: `${tree}\n`, stderr: '', timedOut: false, signal: null, overBuffer: true }],
+    ['killed child, exit 1', { code: 1, stdout: `${tree}\n`, stderr: '', timedOut: false, signal: 'SIGKILL', overBuffer: false }],
+  ]) {
+    const seam = { run: () => result };
+    assert.throws(() => mergeTree('main', 'feat', seam), (e) => e.name === 'GitError' && e.abnormal === true, `mergeTree ${label}`);
+    assert.throws(() => mergeTreeDetailed('main', 'feat', seam), (e) => e.name === 'GitError' && e.abnormal === true, `mergeTreeDetailed ${label}`);
+  }
+  // sanity: the same stdout without the flag still reads as conflicts, so the throw above is the flag's doing
+  assert.equal(mergeTree('main', 'feat', { run: () => ({ code: 1, stdout: `${'a'.repeat(40)}\n`, stderr: '', timedOut: false, signal: null }) }).clean, false);
+});

@@ -1250,3 +1250,22 @@ test('effectiveReviewBase: a conflicting merge, or a git too old for merge-tree 
   const oldGit = { ...clean.o, run: (cmd, args, opts) => (args.includes('--version') ? { code: 0, stdout: 'git version 2.30.0\n', stderr: '' } : run(cmd, args, opts)) };
   assert.deepEqual(effectiveReviewBase({ from: clean.from, forkPoint: cleanTip }, oldGit), { base: cleanTip, kind: 'whole-pr' });
 });
+
+// #188: output past the buffer limit is abnormal like a timeout or a signal. A run seam stands in for the 64 MiB child.
+test('exec: output over the buffer limit throws an abnormal GitError, and so do a signal and a timeout (never a plain exit code)', () => {
+  const cases = [
+    ['over the buffer limit, exit 1', { code: 1, overBuffer: true }, /output over the buffer limit/],
+    ['over the buffer limit, a raced exit 0', { code: 0, stdout: 'cut', overBuffer: true }, /output over the buffer limit/],
+    ['killed by a signal', { code: 1, signal: 'SIGKILL' }, /SIGKILL/],
+    ['timed out', { code: 124, timedOut: true }, /timed out/],
+  ];
+  for (const [label, patch, text] of cases) {
+    assert.throws(() => git(['grep', '-q', 'x'], { run: fakeRun(patch) }), (e) => e instanceof GitError && e.abnormal === true && text.test(e.stderr), label);
+    assert.throws(() => grepAtRef('HEAD', 'x', { run: fakeRun(patch) }), (e) => e instanceof GitError && e.abnormal === true, `grepAtRef: ${label}`);
+  }
+  // a plain git failure is not abnormal
+  assert.throws(() => git(['status'], { run: fakeRun({ code: 1, stderr: 'fatal: x' }) }), (e) => e instanceof GitError && e.abnormal === false);
+  // showFile maps a missing path to null only for a git that finished: a cut-off run whose text says "does not exist" throws
+  assert.throws(() => showFile('HEAD', 'p', { run: fakeRun({ code: 128, stderr: "fatal: path 'p' does not exist in 'HEAD'", overBuffer: true }) }), (e) => e instanceof GitError && e.abnormal);
+  assert.equal(showFile('HEAD', 'p', { run: fakeRun({ code: 128, stderr: "fatal: path 'p' does not exist in 'HEAD'" }) }), null);
+});
