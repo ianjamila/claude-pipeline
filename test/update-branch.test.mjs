@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { GhError } from '../pipeline/lib/proc.mjs';
 import { createGitHub } from '../pipeline/lib/github.mjs';
 import { bringUpToDate, updateTiming } from '../pipeline/lib/updatebranch.mjs';
+import { readSuccessor } from '../pipeline/lib/merge-hold.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { cli, scenario, ghEntries, PR, BASE_SHA } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
@@ -394,6 +395,23 @@ test('update-branch: by default it only updates and returns the new head: no che
   assert.equal(r.json.pullNeeded, true, 'the worktree must pull the new head before it is verified and gated');
   assert.equal(puts(s).length, 1);
   assert.deepEqual(s.fake.lines().filter((l) => l.startsWith('pr checks')), []);
+});
+
+test('update-branch, a repo WITHOUT the hold keys: no hold field, no hold call, but the accepted update is still recorded as the pipeline\'s own successor (a later hold config keeps its turn)', () => {
+  const s = scenario({ gh: { behindBy: 2 } });
+  const newHead = 'd'.repeat(40);
+  const swap = swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 0, commitParents: { [newHead]: [s.head, BASE_SHA] } }));
+  const r = updateCli(s, [], { PIPELINE_UPDATE_WAIT_MS: '2000', ...swap });
+  assertExit(r, 0, r.stdout);
+  assert.equal('hold' in r.json, false);
+  assert.equal('holdRelease' in r.json, false);
+  assert.equal('successorWarnings' in r.json, false);
+  assert.deepEqual(r.json.successors, [{ from: s.head, to: newHead, baseSha: BASE_SHA }]);
+  assert.deepEqual(readSuccessor(s.repo.dir, PR, newHead)?.baseSha, BASE_SHA, 'the record is in the git common dir');
+  const none = scenario();
+  const upToDate = updateCli(none);
+  assert.deepEqual(upToDate.json.successors, []);
+  assert.equal(readSuccessor(none.repo.dir, PR, none.head), null);
 });
 
 test('update-branch --wait-checks: an unexpected check-API failure is GitHub unavailable (exit 3), not success and not checks-timeout', () => {
