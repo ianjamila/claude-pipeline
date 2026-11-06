@@ -166,8 +166,15 @@ export async function runCarryLoop(a) {
       if (capped) { log('main moved again; next cycle'); continue; }
 
       // g: carry the review to the new head (base-only round + review-complete); never a real review.
-      const refreshed = await (seam.refreshReview ?? refreshReview)({ root, config, pr, head: cur, ctx });
-      if (!refreshed.ok) return stop(`The review could not be carried to ${short(cur)} (${refreshed.code}: ${refreshed.reason}); stop and ask rather than guess.`, { extra: { refresh: { code: refreshed.code } } });
+      // R1-B2: the base-only round is recorded before review-complete publishes it, so a failure of review-complete alone leaves the state half done. It is retried once here (the second call sees the round
+      // already at this head and runs review-complete only); a second failure stops with the manual recovery named, and a retry of `P merge --owner-go` resumes it too (commands/merge.mjs).
+      const refresh = () => (seam.refreshReview ?? refreshReview)({ root, config, pr, head: cur, ctx });
+      let refreshed = await refresh();
+      if (!refreshed.ok && refreshed.command === 'review-complete') refreshed = await refresh();
+      if (!refreshed.ok) {
+        const manual = refreshed.command === 'review-complete' ? ` The review round for ${short(cur)} is already recorded here; \`P review-complete --pr ${pr}\` finishes publishing it.` : '';
+        return stop(`The review could not be carried to ${short(cur)} (${refreshed.code}: ${refreshed.reason}); stop and ask rather than guess.${manual}`, { extra: { refresh: { code: refreshed.code } } });
+      }
 
       // h: CI of exactly this head.
       if (gh.prView(pr, ['headRefOid']).headRefOid !== cur) { log('the head moved before CI could be waited on; next cycle'); continue; }

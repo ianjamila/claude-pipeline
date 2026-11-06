@@ -21,6 +21,7 @@ import { loadState } from '../lib/state.mjs';
 import { CARRY_LINE, CARRY_MIN_HEAD, approvalConfigDirHint, approvalGap, areasBlock, carryApprovalFor, holdBlock, readyLine } from '../hooks/lib/owner-go.mjs';
 import { carryVerdict } from '../lib/carry-verdict.mjs';
 import { carriesApproval } from '../lib/approval-carry.mjs';
+import { refreshReview } from '../lib/review-refresh.mjs';
 import { commitInfoOf, recoverDeadJob, runCarryLoop } from '../lib/owner-go-carry-loop.mjs';
 import { readMarker as readMergeJob } from '../lib/merge-job.mjs';
 import { isPidAlive } from '../lib/locks.mjs';
@@ -329,7 +330,16 @@ async function ownerGoRoute({ root, config, pr, gh, ctx, track }) {
   if (dead?.busy) return refuse('carry-checkout', [`${dead.busy}; nothing was changed`], { checkout: 'busy' });
   if (dead?.stop) return refuse(dead.code, [dead.stop], {});
   if (dead?.merged) return { exitCode: EXIT.OK, output: { ok: true, merged: true, mode: 'owner-go', head: headSha({ cwd: root }), mergeSha: dead.mergeSha, note: dead.note } };
-  const first = await underReviewLock({ root, pr, ctx, fn: () => ownerGoMerge({ root, config, pr, gh, ctx, track }) });
+  let first = await underReviewLock({ root, pr, ctx, fn: () => ownerGoMerge({ root, config, pr, gh, ctx, track }) });
+  // R1-B2: an earlier run recorded the base-only round for this head and died (or failed) before review-complete published it. Finish that publication (it takes the review lock itself, so it runs outside it), then evaluate again.
+  if (first?.resumeReview !== undefined) {
+    const { head } = first.resumeReview;
+    const done = await (ctx.carry?.refreshReview ?? refreshReview)({ root, config, pr, head, ctx });
+    if (!done.ok) {
+      return refuse('review-refresh', [`the review refresh of an earlier run could not be finished (${done.code}: ${done.reason}); finish it by hand with \`P review-complete --pr ${pr}\`, then run \`P merge --pr ${pr} --owner-go\` again`], { head });
+    }
+    first = await underReviewLock({ root, pr, ctx, fn: () => ownerGoMerge({ root, config, pr, gh, ctx, track, resume: false }) });
+  }
   if (first?.enterCarry === undefined) return first;
   return runCarryLoop({
     root, config, pr, gh, ctx, head: first.enterCarry.head, prefix: first.enterCarry.prefix, refuse, holdRefuse,
@@ -339,10 +349,19 @@ async function ownerGoRoute({ root, config, pr, gh, ctx, track }) {
 
 const CARRY_HINT = `the PR is behind its base only: if the request shown to the owner had carried the line "${CARRY_LINE}" (print it directly above the first request line, from the dry run), the owner's "merge" would survive the update and \`P merge --owner-go\` would update, wait and merge on its own`;
 
+// Does this checkout's review state for #pr end with a base-only round at `head`? (an interrupted merge-carry refresh)
+const baseOnlyRoundAt = (root, pr, head) => {
+  try {
+    const state = loadState(root, { cleanup: false });
+    const last = state?.pr === pr ? state.rounds.at(-1) : null;
+    return last?.baseOnly === true && last.toHead === head;
+  } catch { return false; }
+};
+
 const hasCommit = (root, sha) => { try { git(['cat-file', '-e', `${sha}^{commit}`], { cwd: root }); return true; } catch { return false; } };
 
 // `carried` (set only by the merge-carry loop, for its final phase): { head: the head the loop expects, verify(): the checkout-ownership check }.
-async function ownerGoMerge({ root, config, pr, gh, ctx, track, carried = null }) {
+async function ownerGoMerge({ root, config, pr, gh, ctx, track, carried = null, resume = true }) {
   if (carried?.config) config = carried.config; // (the loop reloaded it from the updated checkout)
   const head = headSha({ cwd: root });
   const repo = gh.repo().slug;
@@ -381,7 +400,10 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track, carried = null }
   // The carry proof is made against the base the scan itself used (R12); it is asked for only when no record names this exact head.
   const proveCarry = ({ prefix }) => (ctx.carry?.prove ?? carriesApproval)({ root, baseRefOid: live.baseRefOid, head, prefix, commitInfo: commitInfoOf(gh), home: ctx.carry?.home });
   if (!live.ok) {
-    const failed = live.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`);
+    const failedChecks = live.checks.filter((c) => !c.ok);
+    const failed = failedChecks.map((c) => `${c.name}: ${c.detail}`);
+    // R1-B2: the only thing missing is the published review-complete, and this checkout's last round is a base-only one that ends at this very head: the route finishes it (ownerGoRoute), once.
+    if (resume && !carried && hold === null && failedChecks.length === 1 && failedChecks[0].name === 'review-complete' && baseOnlyRoundAt(root, pr, head)) return { resumeReview: { head } };
     if (live.behindOnly === true && hold === null) {
       if (carried) return { baseMoved: true, ...refuse('live-check', failed, { head }) }; // main moved during the CI wait: the loop's next cycle
       // R1-F2: merge-carry is for owner_approval: chat only (carryEligible, as the dry run decides): label mode keeps today's refusal, without the hint.

@@ -2,13 +2,13 @@
 // In process, against a stateful fake GitHub over a REAL bare origin (test/helpers/carry-world.mjs): real fetch, real fast-forward, real proof.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ownerSays } from './helpers/owner-go.mjs';
 import { carryWorld, sh } from './helpers/carry-world.mjs';
 import { MERGE_JOB_MARKER } from '../pipeline/lib/merge-job.mjs';
 import { runCarryLoop } from '../pipeline/lib/owner-go-carry-loop.mjs';
-import { saveState } from '../pipeline/lib/state.mjs';
+import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { run as mergeRun } from '../pipeline/commands/merge.mjs';
 import { PR, reviewState } from './helpers/gate-env.mjs';
 import { answer, blocker, holdFiles, holdYml, seq } from './helpers/merge-hold-env.mjs';
@@ -394,4 +394,70 @@ test('R1-F1: the checked-out branch is not the PR\'s head branch: carry-checkout
   assert.match(r.output.reasons.join(), /agent\/renamed/);
   assert.equal(w.updates, 0);
   assert.equal(existsSync(join(w.root, MERGE_JOB_MARKER)), false);
+});
+
+// ---- review round 1 (R1-B2): an interrupted review refresh (base-only round recorded locally, review-complete failed) can be resumed ----
+const rcFailed = { ok: false, code: 'review-complete-failed', reason: 'GitHub said no', command: 'review-complete', exitCode: 1 };
+const baseOnlyState = (w, { counted = false } = {}) => {
+  let s = emptyState({ repo: w.slug, pr: PR, branch: 'agent/feature', risk: 'low', maxRounds: 2 });
+  s.currentContentHash = 'a'.repeat(64);
+  s = addRound(s, { n: 1, fromHead: 'a', toHead: counted ? 'b' : 'c', contentHashAtToHead: 'a'.repeat(64), items: [] });
+  if (!counted) s = addRound(s, { n: 2, fromHead: 'c', toHead: w.h0, contentHashAtToHead: 'a'.repeat(64), items: [], baseOnly: true });
+  return s;
+};
+
+test('R1-B2: review-complete failing once inside the loop is retried once (the second call takes the review-complete-only branch) and the merge carries on', async (t) => {
+  const w = world(t);
+  w.mainMoves();
+  go(t, w);
+  const calls = [];
+  const r = await w.merge({ refreshReview: async ({ head }) => { calls.push(head); return calls.length === 1 ? rcFailed : { ok: true, kind: 'review-complete' }; } });
+  assert.equal(r.exitCode, 0, text(r));
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0], calls[1], 'the retry is for the same head');
+  assert.equal(calls[0], w.head());
+});
+
+test('R1-B2: review-complete failing twice stops the loop, and the message names the manual recovery', async (t) => {
+  const w = world(t);
+  w.mainMoves();
+  go(t, w);
+  let n = 0;
+  const r = await w.merge({ refreshReview: async () => { n += 1; return rcFailed; } });
+  assert.equal(r.exitCode, 1);
+  assert.equal(n, 2, 'one retry, no more');
+  assert.match(r.output.reasons.join(), /P review-complete --pr 12/);
+  assert.deepEqual(w.mergeCalls(), []);
+});
+
+test('R1-B2: a retry of --owner-go whose only failing check is review-complete, with a base-only round already recorded for this head, finishes the review first and then merges', async (t) => {
+  const w = world(t);
+  go(t, w);
+  saveState(w.root, baseOnlyState(w));
+  const calls = [];
+  const r = await w.merge({ refreshReview: async ({ head }) => { calls.push(head); rmSync(join(w.root, '.review', ['state', 'json'].join('.'))); return { ok: true, kind: 'review-complete' }; } });
+  assert.deepEqual(calls, [w.h0]);
+  assert.equal(r.exitCode, 0, text(r));
+  assert.equal(r.output.merged, true);
+});
+
+test('R1-B2: the route does not resume a review whose last round is not a base-only round at this head: today\'s review-complete refusal', async (t) => {
+  const w = world(t);
+  go(t, w);
+  saveState(w.root, baseOnlyState(w, { counted: true })); // the last round ends at 'b', a counted round
+  let called = 0;
+  const r = await w.merge({ refreshReview: async () => { called += 1; return { ok: true, kind: 'review-complete' }; } });
+  assert.equal(called, 0);
+  assert.equal(r.exitCode, 1);
+  assert.match(r.output.reasons.join('\n'), /review-complete/);
+});
+
+test('R1-B2: a resume whose review-complete fails again refuses with the manual recovery named; nothing merges', async (t) => {
+  const w = world(t);
+  go(t, w);
+  saveState(w.root, baseOnlyState(w));
+  const r = await w.merge({ refreshReview: async () => rcFailed });
+  assert.equal(r.exitCode, 1);
+  assert.match(r.output.reasons.join(), /P review-complete --pr 12/);
+  assert.deepEqual(w.mergeCalls(), []);
 });
