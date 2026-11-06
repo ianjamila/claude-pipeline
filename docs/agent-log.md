@@ -111,3 +111,4 @@ full record.
 - 2026-11-06 · #180 · Merge hold: take it at hand-off, honour hold:queued-behind in P merge / P update-branch · risk high · rounds 9 · arbiter 6 · awaiting-owner-merge
 2026-11-06 claude-pipeline #184 claude-rulings-v1: awaiting-owner-merge, 4 rounds (Codex+Fable), 6 fixed, 2 owner-rejected, 1 follow-up #186, CI green, $26.3
 - 2026-11-06 · #179 · Exemption takes only strict ledger rows; one instruction list for R4; refuse ＠-imported documents (#170 #171 #167) · risk high · rounds 9 · arbiter 5 · awaiting-owner-merge
+- 2026-11-06 · #184 · Claude rules on needs-human review items; one owner "merge" covers the listed rulings · risk high · rounds 10 · arbiter 6 · awaiting-owner-merge
