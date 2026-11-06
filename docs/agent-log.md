@@ -108,3 +108,4 @@ full record.
 - 2026-11-05 · #164 · fix(owner-go): prove a pre-#128 owner grant through its session's transcript · risk high · rounds 3 · arbiter 2 · awaiting-owner-merge
 - 2026-11-05 · #166 · review: lines added to listed documents after the last round need no new round · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge
 - 2026-11-05 · #172 · Unique test-repo heads, U+FFFD path refusal, old-git skip, guard deny names the line (#147 #151 #152 #161) · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
+- 2026-11-06 · #180 · Merge hold: take it at hand-off, honour hold:queued-behind in P merge / P update-branch · risk high · rounds 9 · arbiter 6 · awaiting-owner-merge
