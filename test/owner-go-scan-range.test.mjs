@@ -236,7 +236,7 @@ const stubGh = (s) => ({
   prView: () => ({ state: 'OPEN', headRefOid: s.head, baseRefName: 'main', baseRefOid: s.baseTip, isDraft: false, labels: [], mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' }),
   checks: () => [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }],
   pullFiles: () => s.prFiles,
-  repo: () => ({ slug: 'acme/widgets', host: 'github.com' }),
+  repo: () => ({ slug: 'acme/widgets', host: 'github.com', defaultBranch: 'main' }),
   viewer: () => 'me', // review-complete: no comment of ours, no history
   listComments: () => [],
 });
