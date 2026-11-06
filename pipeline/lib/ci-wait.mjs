@@ -116,14 +116,19 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   // created_at (ms) of the workflow runs of a check run's suite: [] for a non-Actions check run. Cached per suite; an unreadable
   // lookup throws and is not cached, so the next poll asks again. A re-run keeps its suite but moves the workflow run's
   // run_started_at, and its new check runs have higher ids: seeing an id above the one the entry was read for re-reads the suite
-  // (at most once per newer check run, never once per poll), so a re-run is not judged by a stale cached start.
+  // (at most once per newer check run, never once per poll), so a re-run is not judged by a stale cached start. The run read can
+  // lag a re-run's check runs (a new attempt's check run listed while the workflow run still shows the previous attempt), so the
+  // entry also remembers whether its newest check run was still pending when read: that run being seen completed re-reads the
+  // suite once more (#176). Each entry is refreshed at most twice per check run id.
   const suiteCreated = async (run) => {
     const suite = run.check_suite?.id;
     if (suite === undefined || suite === null) return [];
     let entry = suiteCache.get(suite);
-    if (entry === undefined || Number(run.id) > entry.maxId) {
+    const id = Number(run.id);
+    if (entry === undefined || id > entry.maxId || (id === entry.maxId && entry.pending && run.status === 'completed')) {
       const workflowRuns = await readers.suiteRuns(suite);
-      entry = { workflowRuns, maxId: Math.max(Number(run.id), entry?.maxId ?? -Infinity) };
+      const maxId = Math.max(id, entry?.maxId ?? -Infinity);
+      entry = { workflowRuns, maxId, pending: id === maxId && run.status !== 'completed' };
       suiteCache.set(suite, entry);
     }
     const workflowRuns = entry.workflowRuns;
@@ -140,12 +145,14 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   };
 
   // run_started_at (ms) of the workflow runs of a check run's suite, else created_at when a run has none: when this attempt of the
-  // run began. A re-run keeps created_at and moves run_started_at, so this is what dates a re-run's FAILURE.
+  // run began, with its run_attempt. A re-run keeps created_at and moves run_started_at, so this is what dates a re-run's FAILURE.
   const suiteStarted = async (run) => {
     const suite = run.check_suite?.id;
     if (suite === undefined || suite === null) return [];
     await suiteCreated(run); // fills the cache
-    return suiteCache.get(suite).workflowRuns.map((w) => { const s = Date.parse(w?.run_started_at); return Number.isFinite(s) ? s : Date.parse(w?.created_at); }).filter(Number.isFinite);
+    return suiteCache.get(suite).workflowRuns
+      .map((w) => { const s = Date.parse(w?.run_started_at); return { at: Number.isFinite(s) ? s : Date.parse(w?.created_at), attempt: Number(w?.run_attempt) }; })
+      .filter((d) => Number.isFinite(d.at));
   };
 
   // A skipped check run is only "done" when its workflow run was created at or after the ready event; a draft-era skip is not.
@@ -166,13 +173,22 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
 
   // Does a failed / cancelled check run predate the ready event? By its workflow run's start (run_started_at, which a re-run moves;
   // else created_at), else by its own timestamps. A re-run started after ready that then failed is a fresh, real failure of the
-  // ready-era code, unlike a re-run's skip (see skipState). Anything unreadable or unknown counts as fresh: a failure is
-  // reported rather than waited on.
+  // ready-era code, unlike a re-run's skip (see skipState). The check runs are read before the workflow runs, so a re-run that began
+  // in between moves run_started_at under a failure that belongs to the PREVIOUS attempt (#174): when the dating run is attempt 2
+  // or later and the check run's own completed/started time is readable and earlier than that start, the failure is dated by its
+  // own time (an old draft-era failure stays stale; a ready-era one still ends the wait). Anything else unreadable or unknown
+  // counts as fresh: a failure is reported rather than waited on.
   const runPredatesReady = async (run, pr) => {
     try {
       const readyAt = Date.parse(await getReadyAt(pr));
       const started = await suiteStarted(run);
-      if (started.length > 0) return Math.max(...started) < readyAt;
+      if (started.length > 0) {
+        const latest = started.reduce((a, b) => (b.at > a.at ? b : a));
+        let at = latest.at;
+        const own = Date.parse(run.completed_at ?? run.started_at);
+        if (latest.attempt > 1 && Number.isFinite(own) && own < at) at = own; // the failure is of an earlier attempt
+        return at < readyAt;
+      }
       const at = Date.parse(run.completed_at ?? run.started_at);
       return Number.isFinite(at) && at < readyAt;
     } catch {
