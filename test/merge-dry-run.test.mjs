@@ -17,6 +17,7 @@ import { loadConfig } from '../pipeline/lib/config.mjs';
 import { treeFingerprint } from '../pipeline/lib/git.mjs';
 import { verifyReportCheck } from '../pipeline/lib/finalgate.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
+import { CARRY_LINE, presentedRequests, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const scratch = mkdtempSync(join(tmpdir(), 'cp-dryrun-'));
 process.on('exit', () => rmSync(scratch, { recursive: true, force: true }));
@@ -319,7 +320,9 @@ test('dry run --owner-go, chat mode, a protected diff -> say-merge with the LIVE
   assert.equal(d.r.json.wouldMerge, true, JSON.stringify(d.r.json.blockers));
   const { ownerStep } = d.r.json;
   assert.equal(ownerStep.kind, 'say-merge');
-  assert.match(ownerStep.line, new RegExp(`^Head ${s.head.slice(0, 12)} · items [0-9a-f]{12} · repo acme/widgets$`));
+  // chat mode, no hold: a Carry request, so the Carry line comes first and the Head line shows 16 hex (C4, C5)
+  assert.equal(ownerStep.carry, CARRY_LINE);
+  assert.match(ownerStep.line, new RegExp(`^Head ${s.head.slice(0, 16)} · items [0-9a-f]{12} · repo acme/widgets$`));
   assert.doesNotMatch(ownerStep.line, /items none/);
   assert.equal(ownerStep.areaIds.length, 1);
   assert.equal(ownerStep.areas, `Areas ${ownerStep.areaIds.join(' ')}`);
@@ -438,4 +441,104 @@ test('dry run --owner-go, behind: mergeStateStatus BEHIND stays behind-base even
   assertExit(dirty.r, 1);
   const kinds = dirty.r.json.blockers.map((b) => b.kind);
   assert.ok(kinds.includes('conflicts') && kinds.includes('behind-base-unverified'), kinds.join());
+});
+
+// ---- --owner-go, merge-carry: the Carry line, the 16-hex Head line, where the go would land (C4, C5, C8) -----------------------------------------
+
+const carryScenario = (extra = {}) => scenario({ yml: chatYml(), report: null, state: null, ...extra });
+
+test('dry run --owner-go, chat, as-is: ownerStep carries the Carry line, a 16-hex Head line, path as-is and the as-is note; no updateFirst', () => {
+  const s = carryScenario({ gh: { mergeStateStatus: 'CLEAN' } });
+  s.fake.setScript(script(s));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  const { ownerStep } = d.r.json;
+  assert.equal(ownerStep.carry, CARRY_LINE);
+  assert.match(ownerStep.line, new RegExp(`^Head ${s.head.slice(0, 16)} · items [0-9a-f]{12} · repo acme/widgets$`));
+  assert.equal(ownerStep.path, 'as-is');
+  assert.equal(ownerStep.carryNote, 'eligible as-is now');
+  assert.equal('updateFirst' in d.r.json, false);
+  assert.deepEqual(d.writes, []);
+  noGitWrites(d);
+});
+
+test('dry run --owner-go, chat, behind only: the behind-base blockers move to updateFirst, wouldMerge is true (exit 0), path needs-update and the note says an update comes first', () => {
+  const s = carryScenario();
+  const tip = mainMoves(s, 'other.txt');
+  const before = s.repo.git(['for-each-ref']);
+  const d = behindDry(s, tip);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.deepEqual([d.r.json.wouldMerge, d.r.json.blockers], [true, []]);
+  assert.ok(d.r.json.updateFirst.length >= 1 && d.r.json.updateFirst.every((b) => /behind/.test(`${b.kind} ${b.detail}`)), JSON.stringify(d.r.json.updateFirst));
+  assert.ok(d.r.json.updateFirst.some((b) => b.kind === 'behind-base'));
+  const { ownerStep } = d.r.json;
+  assert.equal(ownerStep.carry, CARRY_LINE);
+  assert.equal(ownerStep.path, 'needs-update');
+  assert.match(ownerStep.carryNote, /^needs an update first; the go will carry if main merges in cleanly \(P merge --owner-go updates, re-proves, waits for CI and merges; it stops and asks if anything else changed\)$/);
+  assert.deepEqual(d.writes, []);
+  assert.deepEqual(s.mergeCalls(), []);
+  noGitWrites(d);
+  assert.equal(s.repo.git(['for-each-ref']), before);
+});
+
+test('dry run --owner-go, chat, behind AND another blocker: the blockers stay as they are, no updateFirst, no path', () => {
+  const s = carryScenario();
+  const tip = mainMoves(s, 'other.txt');
+  const d = behindDry(s, tip, { gh: { ci: [{ name: 'ci', state: 'FAILURE', bucket: 'fail' }] } });
+  assertExit(d.r, 1);
+  assert.equal(d.r.json.wouldMerge, false);
+  const k = kinds(d.r);
+  assert.ok(k.includes('behind-base') && k.includes('live-check'), k.join());
+  assert.match(d.r.json.blockers.map((b) => b.detail).join('\n'), /ci: /);
+  assert.equal('updateFirst' in d.r.json, false);
+  assert.equal('path' in d.r.json.ownerStep, false);
+  assert.equal('carryNote' in d.r.json.ownerStep, false);
+});
+
+test('dry run --owner-go, label mode (not chat): no carry field, a 12-hex Head line and no path, exactly as before', () => {
+  const s = scenario({ report: null, state: null, gh: { mergeStateStatus: 'CLEAN' } });
+  s.fake.setScript(script(s));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.deepEqual(d.r.json.ownerStep, { kind: 'say-merge', line: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets` });
+});
+
+test('dry run --owner-go, chat, the gated route and label-mode behind PRs are untouched: behind-base remains a blocker without carry eligibility', () => {
+  const s = scenario({ yml: `${ymlFor()}hard_stops:\n  paths: ['src/**']\n`, report: null, state: null });
+  const tip = mainMoves(s, 'other.txt');
+  const d = behindDry(s, tip);
+  assertExit(d.r, 1);
+  assert.ok(kinds(d.r).includes('behind-base'));
+  assert.equal('updateFirst' in d.r.json, false);
+  assert.equal('carry' in (d.r.json.ownerStep ?? {}), false);
+});
+
+// The block the owner is shown, exactly as the skill prints it (Carry, Rulings, Areas, Hold, Head, 🔀), read back by the owner-go recorder's parser.
+const printed = (step, pr) => [step.carry, step.rulings, step.areas, step.hold, step.line, step.ready ?? readyLine([pr])].filter(Boolean).join('\n');
+
+test('round trip: the printed block (Carry, areas, Head, 🔀) parses as ONE request with carry: true and the dry run\'s head and items', () => {
+  const s = carryScenario({ gh: { mergeStateStatus: 'CLEAN' } });
+  s.fake.setScript(script(s));
+  const { ownerStep } = dry(s, ['--owner-go']).r.json;
+  assert.ok(ownerStep.areas, 'a protected diff, so an Areas line is part of the block');
+  const parsed = presentedRequests(`Some prose first.\n${printed(ownerStep, PR)}`);
+  assert.deepEqual(parsed.prs, [PR]);
+  assert.equal(parsed.requests.length, 1);
+  assert.equal(parsed.requests[0].carry, true);
+  assert.equal(parsed.requests[0].head, s.head.slice(0, 16));
+  assert.equal(parsed.requests[0].items, ownerStep.line.match(/items ([0-9a-f]{12}|none)/)[1]);
+  assert.equal(parsed.requests[0].repo, 'acme/widgets');
+});
+
+test('round trip with a Rulings block above the Areas line: still one request with carry: true', () => {
+  const rows = ['R1-B1 · dismissed as not a defect · the arbiter agreed'];
+  const header = 'Rulings 0123456789ab';
+  const text = [CARRY_LINE, header, ...rows, 'Areas auth', 'Head 0123456789abcdef · items none · repo acme/widgets', readyLine([PR])].join('\n');
+  const parsed = presentedRequests(text);
+  assert.equal(parsed.requests.length, 1);
+  assert.equal(parsed.requests[0].carry, true);
+  assert.ok(parsed.requests[0].rulings && parsed.requests[0].areas);
+  // the same block with the Carry line moved below the Rulings header binds no carry
+  const moved = [header, ...rows, CARRY_LINE, 'Areas auth', 'Head 0123456789abcdef · items none · repo acme/widgets', readyLine([PR])].join('\n');
+  assert.notEqual(presentedRequests(moved).requests[0]?.carry, true);
 });

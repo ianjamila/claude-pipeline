@@ -400,6 +400,32 @@ test('dry run --owner-go, a stale PR behind a hold: no "update the branch" advic
   assert.doesNotMatch(JSON.stringify(d.json).replace(/do NOT update the branch/g, ''), /update the branch|P update-branch|re-verify before merging/i);
 });
 
+// merge-carry (C8): a merge-hold queue ahead keeps behind-base a blocker; with nothing ahead the behind-only PR moves it to updateFirst (and is not yet ready to take the hold).
+const carryHoldWorld = () => scenario({ yml: `${holdYml({ merge: goMergeCmd })}owner_approval: chat\n`, baseFiles: holdFiles, report: null, state: null, change: unique });
+
+test('dry run --owner-go, chat, behind with a merge-hold queue ahead: behind-base stays a blocker, no updateFirst, no path', () => {
+  const s = carryHoldWorld();
+  s.fake.setScript(dryScript(s, { merge: 'BEHIND' }));
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(BLOCKED) }, ['--owner-go']);
+  assertExit(d, 1);
+  assert.ok(kinds(d).includes('merge-hold') && kinds(d).includes('live-check'), JSON.stringify(d.json.blockers));
+  assert.ok(kinds(d).includes('behind-base'), JSON.stringify(d.json.blockers));
+  assert.equal('updateFirst' in d.json, false);
+  assert.equal('path' in d.json.ownerStep, false);
+  assert.equal(d.json.ownerStep.holdEligible, false);
+});
+
+test('dry run --owner-go, chat, behind with nothing ahead: updateFirst, wouldMerge true, path needs-update, holdEligible false', () => {
+  const s = carryHoldWorld();
+  s.fake.setScript(dryScript(s, { merge: 'BEHIND' }));
+  const d = dry(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }, ['--owner-go']);
+  assertExit(d, 0, `${d.stderr}${d.stdout}`);
+  assert.deepEqual([d.json.wouldMerge, d.json.blockers], [true, []]);
+  assert.ok(d.json.updateFirst.some((b) => b.kind === 'behind-base'), JSON.stringify(d.json.updateFirst));
+  assert.equal(d.json.ownerStep.path, 'needs-update');
+  assert.equal(d.json.ownerStep.holdEligible, false);
+});
+
 // ---- ownerStep.holdEligible: may this hand-off take the merge hold? Computed in code, read by the review skill -------------------
 
 const hardStopHoldYml = () => `${holdYml({ merge: goMergeCmd })}hard_stops:\n  paths: ['**']\n`;

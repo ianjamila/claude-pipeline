@@ -238,6 +238,20 @@ test('--owner-go: no owner "merge" recorded refuses with error owner-go and runs
   assert.deepEqual(s.mergeCalls(), []);
 });
 
+test('--owner-go, chat mode: the refusal names the same request block the dry run prints (Carry line first, 16-hex Head); label mode keeps the 12-hex line without it', () => {
+  const chat = scenario({ yml: chatYml(), report: null, state: null });
+  const r = goMerge(chat);
+  assertExit(r, 1);
+  const dry = cli(['merge', '--pr', String(PR), '--dry-run', '--owner-go'], { dir: chat.repo.dir, fake: chat.fake, env: chat.env });
+  const step = dry.json.ownerStep;
+  assert.ok(step.carry && step.line.startsWith(`Head ${chat.head.slice(0, 16)} `), JSON.stringify(step));
+  assert.ok(r.json.reason.includes(`\`${step.carry}\` and \`${step.areas}\` and \`${step.line}\``), r.json.reason);
+  const label = goScenario();
+  const l = goMerge(label);
+  assert.ok(l.json.reason.includes(`end the reply with \`Head ${label.head.slice(0, 12)} · items none · repo acme/widgets\` (from `), l.json.reason);
+  assert.ok(!l.json.reason.includes('Carry:'));
+});
+
 test('--owner-go: a recorded "merge" for this PR, the local HEAD and items none merges, pinned to the full head, writing nothing', (t) => {
   const s = goScenario();
   ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'));

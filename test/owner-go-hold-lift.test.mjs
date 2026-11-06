@@ -112,6 +112,7 @@ test('dry run, eligible hold, no record: say-merge with the Hold block, the hold
   assert.equal(step.ready, '🔀 Ready to merge #12 and lift its needs-human hold — say "merge"');
   assert.match(step.areas, /^Areas /, 'the Areas line still comes with a protected diff');
   assert.ok(!('parkNote' in step), 'no park comment, no park note');
+  assert.ok(!('carry' in step) && !('path' in step), 'a held PR never gets the Carry line (C12)');
   assert.deepEqual(s.wrote(), [], 'a dry run writes nothing');
   assert.deepEqual(s.st().labels, ['needs-human']);
   assert.deepEqual(s.st().comments, []);

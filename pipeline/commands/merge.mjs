@@ -18,7 +18,7 @@ import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { loadState } from '../lib/state.mjs';
-import { CARRY_LINE, approvalConfigDirHint, approvalGap, areasBlock, carryApprovalFor, holdBlock, readyLine } from '../hooks/lib/owner-go.mjs';
+import { CARRY_LINE, CARRY_MIN_HEAD, approvalConfigDirHint, approvalGap, areasBlock, carryApprovalFor, holdBlock, readyLine } from '../hooks/lib/owner-go.mjs';
 import { carryVerdict } from '../lib/carry-verdict.mjs';
 import { carriesApproval } from '../lib/approval-carry.mjs';
 import { commitInfoOf, runCarryLoop } from '../lib/owner-go-carry-loop.mjs';
@@ -283,15 +283,19 @@ export const run = guarded(async (argv, ctx) => {
 const missingApproval = (gap, what, again, q) => (gap === 'provenance'
   ? `a "merge" is recorded for ${what}, but it cannot be confirmed as typed by the owner (its prompt is not in the transcript as the owner's, or came from a notice, another session or a scheduled turn${approvalConfigDirHint(q) ? `; or ${approvalConfigDirHint(q)}` : ''}): ${again}, and ask the owner to type "merge" again`
   : `no owner "merge" is recorded for ${what}: ${again}`);
+// Merge-carry eligibility of a request (--owner-go, github.com checked by the callers): owner_approval: chat and no needs-human hold the go would lift (C12). The dry run and the refusal text both ask this.
+const carryEligible = (config, hold) => config.owner_approval === 'chat' && (hold ?? null) === null;
 const hostProblem = (gh) => `gh resolves this repository on ${gh.repo().host ?? 'an unknown host'}, not github.com, and the owner's "merge" names a repository on github.com`;
 
-// The lines the owner is shown for a merge request, rendered in this ONE place: the Rulings block (only when Claude or the arbiter dismissed a BLOCKING / security item; the header and its rows), the Areas line (only when the diff has protected areas), the Hold
-// line (only when a needs-human hold is lifted by the merge; `hold` = {id, login, at}) and the Head line (carrying `· hold <id>` for that hold), in that order (Rulings, Areas, Hold, Head).
-const requestParts = ({ head, items, repo, areas, hold, rulings = '' }) => ({
+// The lines the owner is shown for a merge request, rendered in this ONE place: the Carry line (only when `carry`: the request asks that the go also cover main-only updates, C5), the Rulings block (only when Claude or the arbiter dismissed a BLOCKING /
+// security item; the header and its rows), the Areas line (only when the diff has protected areas), the Hold line (only when a needs-human hold is lifted by the merge; `hold` = {id, login, at}) and the Head line (carrying `· hold <id>` for that hold),
+// in that order (Carry, Rulings, Areas, Hold, Head). A Carry request shows the head with CARRY_MIN_HEAD hex characters (C4), every other one with 12.
+const requestParts = ({ head, items, repo, areas, hold, rulings = '', carry = false }) => ({
+  carry: carry ? CARRY_LINE : '',
   rulings,
   areas: areasBlock(areas),
   hold: holdBlock(hold),
-  line: `Head ${head.slice(0, 12)} · items ${items}${hold ? ` · hold ${hold.id}` : ''} · repo ${repo}`,
+  line: `Head ${head.slice(0, carry ? CARRY_MIN_HEAD : 12)} · items ${items}${hold ? ` · hold ${hold.id}` : ''} · repo ${repo}`,
 });
 const requestLines = (q) => Object.values(requestParts(q)).filter(Boolean);
 
@@ -387,7 +391,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track, carried = null }
     return refuse('owner-go', [reason], { reason, head, carryRefused: true });
   }
   if (gap !== 'ok') {
-    const lines = requestLines({ head, items: live.ownerItems, repo, areas: live.areas, hold, rulings: live.rulings });
+    const lines = requestLines({ head, items: live.ownerItems, repo, areas: live.areas, hold, rulings: live.rulings, carry: carryEligible(config, hold) });
     const reason = missingApproval(gap, `${repo} #${pr} head ${head.slice(0, 12)} items ${live.ownerItems}${live.areas.length > 0 ? ` areas ${live.areas.join(' ')}` : ''}${hold ? ` hold ${hold.id}` : ''}${live.rulingCount > 0 ? ` rulings ${live.rulingsDigest.slice(0, 12)}` : ''}`, `end the reply with ${lines.map((l) => `\`${l}\``).join(' and ')} (from \`P merge --pr ${pr} --dry-run --owner-go\`) and \`${readyLine([pr], { lift: hold !== null })}\`, and wait for the owner to type "merge"`, asked);
     return refuse('owner-go', [reason], { reason, head });
   }
@@ -484,6 +488,8 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   // The blockers that ARE the owner-runs hand-off (the failed owner-items check and the hardstops / integrity checks that fail it): they do
   // not stop the hand-off from taking the merge hold; any other blocker does (ownerStep.holdEligible).
   const handOffBlockers = new Set();
+  // The blockers that are only "the branch lacks commits of its base" (--owner-go): the pr-open live check that evaluateOwnerGo marked behindOnly, and readBehind's behind-base. Merge-carry may turn them into updateFirst.
+  const behindBlockers = new Set();
   const slug = gh.repo().slug;
   const head = headSha({ cwd: root });
   let gate = null;
@@ -531,6 +537,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     for (const c of failed) {
       const b = add('live-check', `${c.name}: ${c.detail}`);
       // hardstops / integrity only as a real verdict (c.verdict): a scan that threw ("could not evaluate") or could not diff is no hand-off.
+      if (live.behindOnly === true && c.name === 'pr-open') behindBlockers.add(b);
       if (ownerRuns && (c.name === 'owner-items' || (['hardstops', 'integrity'].includes(c.name) && c.verdict === true))) handOffBlockers.add(b);
     }
     const noBase = ownerGoBaseProblem(live);
@@ -564,7 +571,10 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   }
 
   const behind = ownerGo ? (live.behind ?? null) : null;
-  for (const b of readBehind(gh, pr, { accepted: behind })) add(b.kind, b.detail);
+  for (const b of readBehind(gh, pr, { accepted: behind })) {
+    const added = add(b.kind, b.detail);
+    if (b.kind === 'behind-base') behindBlockers.add(added);
+  }
   for (const reason of await preMergeProblems({ gh, pr, head, base: ownerGo ? live.baseRefOid : null, exemptHold: hold !== null })) add('pre-merge', reason);
 
   // A repo with the hold keys: its read-only check (the only shell command a dry run runs). A hold ahead, or an answer that cannot be
@@ -587,6 +597,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   }
 
   let ownerStep = null;
+  let carrying = false;
   if (crashed) {
     // No owner step: the crashed scan is a blocker to fix first, not a merge to hand over.
   } else if (ownerRuns) {
@@ -604,8 +615,10 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     } catch { /* an unreadable review state is not a low-risk one */ }
     // --owner-go: the live scan's digest, and for protected areas the Areas line to print right above the Head line (areas: that line, areaIds: the ids).
     if (!lowRisk) {
-      const parts = requestParts({ head, items: live.ownerItems ?? 'none', repo: slug, areas: ownerGo ? live.areas : [], hold, rulings: ownerGo ? live.rulings : '' });
-      ownerStep = { kind: 'say-merge', line: parts.line };
+      // Merge-carry (C4, C5): the request asks that the go also cover main-only updates of the head; it then shows 16 hex of the head and the Carry line first.
+      carrying = ownerGo && gh.repo().host === 'github.com' && carryEligible(config, hold);
+      const parts = requestParts({ head, items: live.ownerItems ?? 'none', repo: slug, areas: ownerGo ? live.areas : [], hold, rulings: ownerGo ? live.rulings : '', carry: carrying });
+      ownerStep = { kind: 'say-merge', ...(carrying ? { carry: parts.carry } : {}), line: parts.line };
       // The block the owner must be shown above the Areas / Hold / Head lines (E11): only when something was dismissed, so an ordinary PR's output is unchanged.
       if (ownerGo && live.rulingCount > 0) ownerStep = { ...ownerStep, rulings: parts.rulings, rulingCount: live.rulingCount };
       if (ownerGo && live.areas.length > 0) ownerStep = { ...ownerStep, areas: parts.areas, areaIds: live.areas };
@@ -620,12 +633,23 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     }
   }
 
+  // C8: where the go would land. As-is: the live evaluation at this head passes (disjoint acceptance included). Needs an update: the ONLY blockers are the behind-base ones, so they move to updateFirst and the
+  // owner's word with the Carry line lets `P merge --owner-go` update and carry. Anything else (a merge-hold queue, another blocker) leaves the blockers as they are. The eventual path is never promised.
+  let updateFirst = null;
+  if (carrying) {
+    if (blockers.length === 0) ownerStep = { ...ownerStep, path: 'as-is', carryNote: 'eligible as-is now' };
+    else if (blockers.every((b) => behindBlockers.has(b))) {
+      updateFirst = blockers.splice(0);
+      ownerStep = { ...ownerStep, path: 'needs-update', carryNote: 'needs an update first; the go will carry if main merges in cleanly (P merge --owner-go updates, re-proves, waits for CI and merges; it stops and asks if anything else changed)' };
+    }
+  }
+
   // For a repo with the hold keys: may this hand-off take the merge hold now? Only a say-merge / owner-runs ending whose blockers are none, or
   // only the ones that make it owner-runs (a hold ahead, an unreadable check or any other blocker disqualifies). The review skill reads this.
   if (holdsConfigured(config) && ownerStep !== null) {
-    ownerStep = { ...ownerStep, holdEligible: ['say-merge', 'owner-runs'].includes(ownerStep.kind) && blockers.every((b) => handOffBlockers.has(b)) };
+    ownerStep = { ...ownerStep, holdEligible: ['say-merge', 'owner-runs'].includes(ownerStep.kind) && updateFirst === null && blockers.every((b) => handOffBlockers.has(b)) }; // (a branch that still needs its update is not ready to take the hold)
   }
 
   const wouldMerge = blockers.length === 0;
-  return { exitCode: wouldMerge ? EXIT.OK : EXIT.FAILED, output: { ok: wouldMerge, dryRun: true, wouldMerge, mode: ownerGo ? 'owner-go' : 'gate', head, ...(ownerGo ? { behind } : {}), blockers, ownerStep, ...(holds ? { holds } : {}) } };
+  return { exitCode: wouldMerge ? EXIT.OK : EXIT.FAILED, output: { ok: wouldMerge, dryRun: true, wouldMerge, mode: ownerGo ? 'owner-go' : 'gate', head, ...(ownerGo ? { behind } : {}), blockers, ...(updateFirst ? { updateFirst } : {}), ownerStep, ...(holds ? { holds } : {}) } };
 }
