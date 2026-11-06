@@ -10,7 +10,7 @@ import { fill } from '../lib/config.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { withReviewLock } from '../lib/review-context.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { headSha } from '../lib/git.mjs';
+import { NETWORK_TIMEOUT_MS, git, headSha } from '../lib/git.mjs';
 import { envWithGhDir, killTree, runShellAsync } from '../lib/proc.mjs';
 import { postEvent } from '../lib/run-events.mjs';
 import { proofLine } from '../lib/run-record.mjs';
@@ -18,7 +18,10 @@ import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { loadState } from '../lib/state.mjs';
-import { approvalConfigDirHint, approvalGap, areasBlock, holdBlock, readyLine } from '../hooks/lib/owner-go.mjs';
+import { CARRY_LINE, approvalConfigDirHint, approvalGap, areasBlock, carryApprovalFor, holdBlock, readyLine } from '../hooks/lib/owner-go.mjs';
+import { carryVerdict } from '../lib/carry-verdict.mjs';
+import { carriesApproval } from '../lib/approval-carry.mjs';
+import { commitInfoOf, runCarryLoop } from '../lib/owner-go-carry-loop.mjs';
 import { findOrphanedLift, holdTiming, mergeInProgress, parkNoteOf, readEligibleHold, recoverOrphanedLift, withHoldLifted, withMergeLock } from '../lib/hold.mjs';
 import {
   GATE_FILE, PR_FIELDS, READABLE_MERGE_STATES, abandonMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, preMergeProblems, readReviewJson,
@@ -56,7 +59,7 @@ export const run = guarded(async (argv, ctx) => {
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
-  const gh = createGitHub({ cwd: root, env: ctx.env });
+  const gh = ctx.carry?.gh ?? createGitHub({ cwd: root, env: ctx.env }); // (ctx.carry: the test seam of the merge-carry loop)
 
   if (values['dry-run'] === true) {
     if (values['owner-approved-head'] !== undefined || values['owner-approved-items'] !== undefined) {
@@ -70,7 +73,7 @@ export const run = guarded(async (argv, ctx) => {
       throw new UsageError('--owner-go takes no --owner-approved-head / --owner-approved-items: it is bound to the local HEAD and the owner-go record');
     }
     // One merge per PR at a time on this machine: recovery below must never run under a live merge (lib/hold.mjs withMergeLock).
-    return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: (track) => underReviewLock({ root, pr, ctx, fn: () => ownerGoMerge({ root, config, pr, gh, ctx, track }) }) }));
+    return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: (track) => ownerGoRoute({ root, config, pr, gh, ctx, track }) }));
   }
 
   return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: (track) => underReviewLock({ root, pr, ctx, fn: async () => {
@@ -310,7 +313,24 @@ async function underReviewLock({ root, pr, ctx, fn }) {
   }
 }
 
-async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
+// The --owner-go route: today's path (review lock, the local HEAD, exact-head approval) first. Only an unheld PR that is behind its base ALONE and whose owner record for this head carries the Carry line
+// enters the merge-carry loop (lib/owner-go-carry-loop.mjs), which works WITHOUT the review lock and takes it for the final phase only.
+async function ownerGoRoute({ root, config, pr, gh, ctx, track }) {
+  const first = await underReviewLock({ root, pr, ctx, fn: () => ownerGoMerge({ root, config, pr, gh, ctx, track }) });
+  if (first?.enterCarry === undefined) return first;
+  return runCarryLoop({
+    root, config, pr, gh, ctx, head: first.enterCarry.head, prefix: first.enterCarry.prefix, refuse, holdRefuse,
+    final: (carried) => underReviewLock({ root, pr, ctx, fn: () => ownerGoMerge({ root, config, pr, gh, ctx, track, carried }) }),
+  });
+}
+
+const CARRY_HINT = `the PR is behind its base only: if the request shown to the owner had carried the line "${CARRY_LINE}" (print it directly above the first request line, from the dry run), the owner's "merge" would survive the update and \`P merge --owner-go\` would update, wait and merge on its own`;
+
+const hasCommit = (root, sha) => { try { git(['cat-file', '-e', `${sha}^{commit}`], { cwd: root }); return true; } catch { return false; } };
+
+// `carried` (set only by the merge-carry loop, for its final phase): { head: the head the loop expects, verify(): the checkout-ownership check }.
+async function ownerGoMerge({ root, config, pr, gh, ctx, track, carried = null }) {
+  if (carried?.config) config = carried.config; // (the loop reloaded it from the updated checkout)
   const head = headSha({ cwd: root });
   const repo = gh.repo().slug;
   if (gh.repo().host !== 'github.com') {
@@ -327,15 +347,45 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   // The needs-human hold the owner's "merge" may lift (lib/hold.mjs; none = today's flow, the label stays a blocker). Only the labels check and the
   // look BEFORE the lift ignore it (Rev-4 8).
   const { hold } = await readEligibleHold({ gh, pr, config });
+  if (carried && hold !== null) return refuse('carry-hold', [`a needs-human hold appeared on #${pr} while the merge job was running: a held PR never carries the owner's go`], { head });
+  if (carried) {
+    const intact = carried.verify();
+    if (!intact.ok) return refuse('carry-checkout', [`the checkout changed under the merge job: ${intact.reason}`], { head });
+  }
   // The live scan first: the owner's record is bound to the owner items and areas IT found (read-only; nothing is written).
-  const live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null });
+  let live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null });
+  // A base commit this clone has never fetched fails the whole scan ("run git fetch origin main"). The real run is allowed that fetch (a dry run never does): once, then evaluate again.
+  // A fetch that fails (no origin, offline) leaves the first answer standing.
+  if (!live.ok && hold === null && /^[0-9a-f]{40}$/.test(String(live.baseRefOid)) && !hasCommit(root, live.baseRefOid)) {
+    try {
+      git(['fetch', '--no-tags', 'origin', `+refs/heads/${config.default_branch}:refs/remotes/origin/${config.default_branch}`], { cwd: root, timeoutMs: NETWORK_TIMEOUT_MS });
+      live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null });
+    } catch { /* the first answer stands */ }
+  }
   if (live.head !== head) return refuse('live-check', [`the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`], { head });
-  if (!live.ok) return refuse('live-check', live.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`), { head });
+  if (carried && (head !== carried.head || live.headRefOid !== head)) return refuse('carry-head', [`the PR head is ${String(live.headRefOid).slice(0, 12)}, the merge job holds ${head.slice(0, 12)}`], { head });
+  const asked = { repo, pr, head, items: live.ownerItems, areas: live.areas, hold: hold ?? undefined, rulings: live.rulingsBlockDigest }; // (absent hold = none: a record that names a hold never approves a PR without one)
+  // The carry proof is made against the base the scan itself used (R12); it is asked for only when no record names this exact head.
+  const proveCarry = ({ prefix }) => (ctx.carry?.prove ?? carriesApproval)({ root, baseRefOid: live.baseRefOid, head, prefix, commitInfo: commitInfoOf(gh), home: ctx.carry?.home });
+  if (!live.ok) {
+    const failed = live.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`);
+    if (live.behindOnly === true && hold === null) {
+      if (carried) return { baseMoved: true, ...refuse('live-check', failed, { head }) }; // main moved during the CI wait: the loop's next cycle
+      const consent = carryApprovalFor(asked) ?? await (async () => { const v = await carryVerdict(asked, proveCarry); return v.gap === 'ok' && v.carriedPrefix ? { prefix: v.carriedPrefix } : null; })();
+      if (consent) return { enterCarry: { prefix: consent.prefix, head } };
+      return refuse('live-check', [...failed, CARRY_HINT], { head });
+    }
+    return refuse('live-check', failed, { head });
+  }
   // A.4: never merge without the base re-read below, even if scan-range stops requiring a base sha.
   const noBase = ownerGoBaseProblem(live);
   if (noBase !== null) return refuse('live-check', [noBase], { head });
-  const asked = { repo, pr, head, items: live.ownerItems, areas: live.areas, hold: hold ?? undefined, rulings: live.rulingsBlockDigest }; // (absent hold = none: a record that names a hold never approves a PR without one)
-  const gap = approvalGap(asked);
+  const verdict = await carryVerdict(asked, proveCarry);
+  const gap = verdict.gap;
+  if (gap === 'carry') {
+    const reason = `${verdict.reason}: the owner's "merge" does not cover this head; show the request again and wait for the owner to say "merge"`;
+    return refuse('owner-go', [reason], { reason, head, carryRefused: true });
+  }
   if (gap !== 'ok') {
     const lines = requestLines({ head, items: live.ownerItems, repo, areas: live.areas, hold, rulings: live.rulings });
     const reason = missingApproval(gap, `${repo} #${pr} head ${head.slice(0, 12)} items ${live.ownerItems}${live.areas.length > 0 ? ` areas ${live.areas.join(' ')}` : ''}${hold ? ` hold ${hold.id}` : ''}${live.rulingCount > 0 ? ` rulings ${live.rulingsDigest.slice(0, 12)}` : ''}`, `end the reply with ${lines.map((l) => `\`${l}\``).join(' and ')} (from \`P merge --pr ${pr} --dry-run --owner-go\`) and \`${readyLine([pr], { lift: hold !== null })}\`, and wait for the owner to type "merge"`, asked);
@@ -343,8 +393,14 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   }
 
   // A.4: the scan was of GitHub's base and head as read by evaluateOwnerGo; the last look re-reads both and refuses if either moved since.
+  // (carried: main moving right here is not a failure of the go, only a reason for the loop's next cycle)
+  const baseMovedOnly = async (problems) => {
+    if (!carried || problems.length !== 1) return false;
+    try { return gh.prView(pr, ['baseRefOid']).baseRefOid !== live.baseRefOid; } catch { return false; }
+  };
   const late = await preMergeProblems({ gh, pr, head, base: live.baseRefOid, exemptHold: hold !== null });
-  if (late.length > 0) return refuse('pre-merge', late, { head });
+  if (late.length > 0) return (await baseMovedOnly(late)) ? { baseMoved: true, ...refuse('pre-merge', late, { head }) } : refuse('pre-merge', late, { head });
+  const carriedNote = verdict.carriedFrom ? { carried: { from: verdict.carriedFrom, to: head } } : {};
 
   // `running.pid` (hold lift only) is the merge command's process id while it runs: a signal kills that group and disarms auto-merge before the label goes back.
   const mergeAndWait = async (running = {}) => {
@@ -354,7 +410,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
     running.pid = undefined; // (gone: its pid may be reused)
     track.ended();
     const commandOutput = tailLines(`${ran.stdout}${ran.stderr ? `\n${ran.stderr}` : ''}`, 30);
-    const merged = (mergeSha, extra = {}) => ({
+    const merged = (mergeSha, given = {}, extra = { ...carriedNote, ...given }) => ({
       exitCode: EXIT.OK,
       output: mergeSha
         ? { ok: true, merged: true, mode: 'owner-go', head, behind: live.behind ?? null, mergeSha, ...extra }
@@ -363,8 +419,12 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
     // Every --owner-go merge (behind or not) waits with GitHub's baseRefOid pinned to the evaluated one: a queued merge (--auto) must not land on a base nobody checked.
     const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh, { base: live.baseRefOid }) });
     if (outcome.state === 'merged') return merged(outcome.mergeSha, ran.code === 0 ? {} : { commandExitCode: ran.code, note: 'the merge command exited non-zero but the PR is MERGED' });
-    const abandoned = await abandonMerge({ gh, pr, cwd: root, env: ctx.env, pollMs });
+    const abandoned = await abandonMerge({ gh, pr, cwd: root, env: ctx.env, pollMs, disable: ctx.carry?.disableAuto });
     if (abandoned.merged) return merged(abandoned.mergeSha, { note: 'the PR merged while auto-merge was being disabled', autoMergeDisabled: abandoned.autoMergeDisabled });
+    if (outcome.state === 'blocked' && await baseMovedOnly(outcome.problems ?? [])) {
+      // carried: only the base moved while the merge was armed. The loop retries ONLY after it re-checks the disarm itself (C10).
+      return { baseMoved: true, commandRan: true, abandoned, exitCode: EXIT.FAILED, output: { ok: false, reason: 'the base moved after the merge command ran', merged: false, mode: 'owner-go', head, autoMergeDisabled: abandoned.autoMergeDisabled, commandExitCode: ran.code, commandOutput } };
+    }
     const failure = { merged: false, mode: 'owner-go', head, behind: live.behind ?? null, autoMergeDisabled: abandoned.autoMergeDisabled, commandExitCode: ran.code, commandOutput };
     const behindHold = queuedBehindOf(config, ran);
     if (behindHold) return holdRefuse(queuedBehindRefusal(behindHold), failure);
