@@ -128,7 +128,7 @@ Never type, paraphrase or forge the owner's words, and never run Codex outside `
    `P job wait ci --run-id <runId> …` again until it is done. Never `gh pr checks --watch` here: right after `gh pr ready` a required
    check's only result is the draft-era SKIPPED one, which `gh` counts as passed (Phase 6: hand-off 14 min early); ci-wait waits for
    every required check of the base branch to report after the PR became ready. Its `verdict` when not ok: `failed` ⇒ implementer fix
-   (below); `head-moved` / `base-changed` ⇒ back to step 1 of this section; `missing` / `stale-skipped` (a required check never ran on the ready event),
+   (below); `head-moved` / `base-changed` ⇒ back to step 1 of this section; `missing` / `stale-skipped` (a required check never ran on the ready event: ci-wait only says so once nothing created or (re-)started after `gh pr ready` is still running on the head, since a `needs:`-gated aggregate appears late by design; `heldBy` in the output names the run it was waiting on),
    `unverified` (branch protection or rules unreadable), `no-required-checks`, `timeout` ⇒ tell the owner in plain English, with the
    check names, and wait. `owner_approval: label` with a blocking item noted at 1.5: run it with `--wait-all`; the guard checks
    reporting just those items are expected to be red — that is not a fix target: park (section 2) once ci-wait shows every other check

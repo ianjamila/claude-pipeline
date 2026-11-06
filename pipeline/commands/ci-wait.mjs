@@ -12,7 +12,7 @@ import { readClassicRequired } from '../lib/protection.mjs';
 
 export const meta = {
   summary: 'wait until the required CI of a ready PR is really done (ignores a draft-era skipped run), then report the verdict',
-  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url}], message?, failures?, configChecks?}; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
+  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url}], message?, failures?, statusEvidence?, heldBy?, configChecks?}; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
 };
 
 export const DEFAULT_APPEAR_SECONDS = 300;
@@ -51,6 +51,7 @@ export const run = guarded(async (argv, ctx) => {
     statuses: async (head) => gh.statusesOf(head),
     timeline: async () => gh.timelineOf(pr),
     suiteRuns: async (suiteId) => gh.workflowRunsOfSuite(suiteId),
+    headRuns: async (head) => gh.workflowRunsOfHead(head), // no fallback: a gh without it must fail the read, not silently end the late-aggregate hold
   };
   const result = await waitForCi({
     readers,
