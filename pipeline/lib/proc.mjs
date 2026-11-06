@@ -113,7 +113,9 @@ export function toResult(r) {
   if (r.error && !timedOut && !stderr) stderr = r.error.message; // e.g. ENOENT: surface why nothing ran
   // `signal` is how a caller tells "killed" from a plain `exit 1`: a signalled child has no exit status, so `code`
   // falls back to 1 and stderr is empty, which is exactly what git's "no match" answer looks like.
-  const code = timedOut ? (r.status || TIMEOUT_EXIT_CODE) : (r.status ?? 1);
+  // Past maxBuffer stdout is cut off, yet a child that already wrote its last bytes exits 0 before the kill lands (no signal either): never a success.
+  const overBuffer = r.error?.code === 'ENOBUFS';
+  const code = timedOut ? (r.status || TIMEOUT_EXIT_CODE) : overBuffer ? (r.status || 1) : (r.status ?? 1);
   // `pid` is the child's process id (null when it never started): a caller that scans the process table must be able to exclude its own probes.
   return { code, stdout: r.stdout ?? '', stderr, timedOut, signal: r.signal ?? null, pid: r.pid ?? null };
 }
@@ -138,7 +140,8 @@ function baseOptions({ cwd, env, timeoutMs, replaceEnv, maxBuffer = MAX_BUFFER }
 }
 
 // `maxBuffer` (bytes of stdout / stderr kept) is for the rare caller whose output is legitimately huge; past it the child is
-// killed (spawnSync's own rule), so a limit that is too small is a failure, never a truncated answer.
+// killed (spawnSync's own rule) and toResult reports a failure even if the child exited 0 first, so a limit that is too small
+// is a failure, never a truncated answer.
 export function run(cmd, args = [], { cwd, env, input, timeoutMs, maxBuffer, replaceEnv } = {}) {
   const plan = planSpawn(cmd, args);
   const r = spawnSync(plan.file, plan.args, {

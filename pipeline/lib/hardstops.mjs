@@ -69,6 +69,7 @@
 //  * Path rules test the old AND the new path, case-insensitively. Exclusions (docs, tests) match the path as written.
 import { posix } from 'node:path';
 import { matchAny } from './glob.mjs';
+import { isAgentInstructionPath } from './doc-paths.mjs';
 import { DEFAULTS, DISABLEABLE_HARD_STOP_RULES, REPORT_ONLY_HARD_STOP_RULES } from './config.mjs';
 import { diffFiles, diffModes, mergeBase, showFile, git, GitError } from './git.mjs';
 
@@ -173,14 +174,14 @@ const R4_PIPELINE_GLOBS = [
 const GITHUB_DIR_GLOBS = ['**/.github/**'];
 const MARKDOWN_FILE = /\.(?:md|mdx|markdown)$/i;
 const R4_CONFIG_GLOBS = [
-  // Agent-instruction files steer the agents that review and write code; a PR must not rewrite its own rules.
-  '**/CLAUDE.md', '**/AGENTS.md', '**/GEMINI.md', '**/.cursorrules', '**/AGENTS.override.md', '**/CLAUDE.local.md',
   // Local git hooks: they run on a developer machine, never in CI. (pre-commit / lefthook configs are core: CI often runs them.)
   '**/.githooks/**', '**/.husky/**',
 ];
 const isR4Pipeline = (p) => (inc(p, R4_PIPELINE_GLOBS.filter((g) => !GITHUB_DIR_GLOBS.includes(g))) ||
   (inc(p, GITHUB_DIR_GLOBS) && !MARKDOWN_FILE.test(p)));
-const isR4Config = (p) => inc(p, R4_CONFIG_GLOBS) || (inc(p, GITHUB_DIR_GLOBS) && MARKDOWN_FILE.test(p));
+// Agent-instruction files steer the agents that review and write code; a PR must not rewrite its own rules. Which names count is
+// doc-paths.mjs#isAgentInstructionPath (any depth and case), the same list that keeps them out of review.docs_exempt_paths.
+const isR4Config = (p) => isAgentInstructionPath(p) || inc(p, R4_CONFIG_GLOBS) || (inc(p, GITHUB_DIR_GLOBS) && MARKDOWN_FILE.test(p));
 // pgTAP tests are the RLS safety net: deleting or moving one weakens it (editing one is left to the test-integrity check).
 const TEST_DIR_GLOBS = ['**/supabase/tests/**'];
 const WORKFLOW_GLOBS = ['**/.github/workflows/**'];
