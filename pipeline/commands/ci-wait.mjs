@@ -7,17 +7,14 @@ import { intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { loadConfig, requiredChecks } from '../lib/config.mjs';
 import { createGitHub } from '../lib/github.mjs';
-import { waitForCi } from '../lib/ci-wait.mjs';
-import { readClassicRequired } from '../lib/protection.mjs';
+import { DEFAULT_APPEAR_SECONDS, DEFAULT_INTERVAL_SECONDS, DEFAULT_TIMEOUT_SECONDS, ciReaders, waitForCi } from '../lib/ci-wait.mjs';
 
 export const meta = {
   summary: 'wait until the required CI of a ready PR is really done (ignores a draft-era skipped run), then report the verdict',
   usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url}], message?, failures?, configChecks?}; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
 };
 
-export const DEFAULT_APPEAR_SECONDS = 300;
-export const DEFAULT_TIMEOUT_SECONDS = 3600;
-export const DEFAULT_INTERVAL_SECONDS = 15;
+export { DEFAULT_APPEAR_SECONDS, DEFAULT_INTERVAL_SECONDS, DEFAULT_TIMEOUT_SECONDS };
 
 const realClock = () => ({ now: () => Date.now(), sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)) });
 
@@ -40,18 +37,7 @@ export const run = guarded(async (argv, ctx) => {
   // `ctx.ciWait` is the test seam: a scripted gh and a simulated clock.
   const seam = ctx.ciWait ?? {};
   const gh = seam.gh ?? createGitHub({ cwd: root, env: ctx.env });
-  const readers = {
-    async pr() {
-      const v = gh.prView(pr, ['headRefOid', 'isDraft', 'createdAt', 'baseRefName']);
-      return { head: v.headRefOid, isDraft: v.isDraft === true, createdAt: v.createdAt, base: v.baseRefName };
-    },
-    classic: async (base) => readClassicRequired(gh, base),
-    rules: async (base) => gh.branchRules(base),
-    checkRuns: async (head) => gh.checkRunsOf(head),
-    statuses: async (head) => gh.statusesOf(head),
-    timeline: async () => gh.timelineOf(pr),
-    suiteRuns: async (suiteId) => gh.workflowRunsOfSuite(suiteId),
-  };
+  const readers = ciReaders(gh, pr);
   const result = await waitForCi({
     readers,
     options: { appearTimeoutMs: appear * 1000, timeoutMs: timeout * 1000, intervalMs: interval * 1000, waitAll: values['wait-all'] === true, configChecks },

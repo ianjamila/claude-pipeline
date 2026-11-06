@@ -20,7 +20,7 @@
 // keeps the wait open until that workflow's ready run exists, and the live gate re-reads CI before any merge. Requiring a
 // ready-era run for every identity would hang on checks whose workflows do not trigger on `ready_for_review`.
 import { EXIT } from './cli.mjs';
-import { requiredFromRules } from './protection.mjs';
+import { readClassicRequired, requiredFromRules } from './protection.mjs';
 
 // The bot a status of an app's check comes from. Statuses carry no app id, only creator.login, so a pinned identity accepts a
 // status only from its app's known bot (15368 = GitHub Actions; 8329 = Vercel, seen as `vercel[bot]` on EW heads). An app
@@ -314,4 +314,38 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if (outcome) return outcome;
     await clock.sleep(intervalMs);
   }
+}
+
+export const DEFAULT_APPEAR_SECONDS = 300;
+export const DEFAULT_TIMEOUT_SECONDS = 3600;
+export const DEFAULT_INTERVAL_SECONDS = 15;
+
+// The GitHub reads waitForCi polls, for PR `pr` (shared by `pipeline ci-wait` and the merge-carry loop of `P merge --owner-go`).
+export function ciReaders(gh, pr) {
+  return {
+    async pr() {
+      const v = gh.prView(pr, ['headRefOid', 'isDraft', 'createdAt', 'baseRefName']);
+      return { head: v.headRefOid, isDraft: v.isDraft === true, createdAt: v.createdAt, base: v.baseRefName };
+    },
+    classic: async (base) => readClassicRequired(gh, base),
+    rules: async (base) => gh.branchRules(base),
+    checkRuns: async (head) => gh.checkRunsOf(head),
+    statuses: async (head) => gh.statusesOf(head),
+    timeline: async () => gh.timelineOf(pr),
+    suiteRuns: async (suiteId) => gh.workflowRunsOfSuite(suiteId),
+  };
+}
+
+// Test hook for the merge-carry loop: PIPELINE_CI_APPEAR_MS / PIPELINE_CI_TIMEOUT_MS / PIPELINE_CI_INTERVAL_MS can only SHORTEN the defaults
+// (a shorter wait ends in a "missing" / "timeout" verdict, the safe direction), never stretch them.
+export function ciWaitTiming(env = {}) {
+  const cap = (name, limit) => {
+    const v = Number(env?.[name]);
+    return Number.isInteger(v) && v >= 0 ? Math.min(v, limit) : limit;
+  };
+  return {
+    appearTimeoutMs: cap('PIPELINE_CI_APPEAR_MS', DEFAULT_APPEAR_SECONDS * 1000),
+    timeoutMs: cap('PIPELINE_CI_TIMEOUT_MS', DEFAULT_TIMEOUT_SECONDS * 1000),
+    intervalMs: cap('PIPELINE_CI_INTERVAL_MS', DEFAULT_INTERVAL_SECONDS * 1000),
+  };
 }

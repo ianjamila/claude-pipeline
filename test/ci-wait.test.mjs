@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { KNOWN_APP_BOTS, MAX_READ_FAILURES, waitForCi } from '../pipeline/lib/ci-wait.mjs';
+import { KNOWN_APP_BOTS, MAX_READ_FAILURES, ciReaders, ciWaitTiming, waitForCi } from '../pipeline/lib/ci-wait.mjs';
 import { readClassicRequired, requiredFromRules } from '../pipeline/lib/protection.mjs';
 
 const fxDir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'ci-wait');
@@ -546,4 +546,14 @@ test('requiredFromRules: an empty list is absent (authoritative); a required_sta
   assert.deepEqual(requiredFromRules(sample), { kind: 'present', rows: [{ context: 'ci', appId: 15368 }, { context: 'lint', appId: null }, { context: 'e2e', appId: null }] });
   assert.equal(requiredFromRules({ message: 'x' }).kind, 'unreadable');
   assert.equal(requiredFromRules([{ type: 'required_status_checks', parameters: {} }]).kind, 'unreadable');
+});
+
+test('ciWaitTiming: the PIPELINE_CI_* hooks only SHORTEN the defaults; ciReaders reads the PR the way the command does', async () => {
+  assert.deepEqual(ciWaitTiming({}), { appearTimeoutMs: 300_000, timeoutMs: 3_600_000, intervalMs: 15_000 });
+  assert.deepEqual(ciWaitTiming({ PIPELINE_CI_APPEAR_MS: '5', PIPELINE_CI_TIMEOUT_MS: '40', PIPELINE_CI_INTERVAL_MS: '1' }), { appearTimeoutMs: 5, timeoutMs: 40, intervalMs: 1 });
+  assert.deepEqual(ciWaitTiming({ PIPELINE_CI_APPEAR_MS: '999999999', PIPELINE_CI_TIMEOUT_MS: 'x', PIPELINE_CI_INTERVAL_MS: '-1' }), { appearTimeoutMs: 300_000, timeoutMs: 3_600_000, intervalMs: 15_000 });
+  const asked = [];
+  const gh = { prView: (n, fields) => { asked.push([n, fields]); return { headRefOid: HEAD, isDraft: false, createdAt: 'c', baseRefName: 'main' }; } };
+  assert.deepEqual(await ciReaders(gh, 9).pr(), { head: HEAD, isDraft: false, createdAt: 'c', base: 'main' });
+  assert.deepEqual(asked, [[9, ['headRefOid', 'isDraft', 'createdAt', 'baseRefName']]]);
 });
