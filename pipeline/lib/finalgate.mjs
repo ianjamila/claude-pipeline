@@ -182,7 +182,9 @@ function assertBaseObject(explicit, o) {
 
 // ---- the checks ---------------------------------------------------------------------------------
 
-function prOpenCheck({ info, head, config, behind = null }) {
+// `defaultBranch` (--owner-go, F2): the default branch GitHub names for the repository. The PR's own config.default_branch is a file the PR can edit, so on that route the base is compared with GitHub's answer;
+// null (the gated route) keeps comparing with the config. An owner-go caller whose GitHub answer names no default branch passes ''.
+function prOpenCheck({ info, head, config, behind = null, defaultBranch = null }) {
   const problems = [];
   if (info.state !== 'OPEN') problems.push(`PR state is ${info.state}`);
   if (info.isDraft !== false) problems.push('PR is a draft');
@@ -193,7 +195,9 @@ function prOpenCheck({ info, head, config, behind = null }) {
   // base nobody verified it against. The branch must be updated (and re-verified) first.
   if (behind) problems.push(`behind-base: ${behind}; update the branch from ${config.default_branch} and re-verify before merging`);
   // The hard-stop, integrity and review diffs are taken against the default branch; any other base would be judged on the wrong diff.
-  if (info.baseRefName !== config.default_branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${config.default_branch}`);
+  if (defaultBranch === '') problems.push("GitHub did not name the repository's default branch, so the PR's base cannot be checked against it");
+  else if (defaultBranch !== null && info.baseRefName !== defaultBranch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not the default branch ${JSON.stringify(defaultBranch)} (GitHub's)`);
+  else if (defaultBranch === null && info.baseRefName !== config.default_branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${config.default_branch}`);
   // `behindOnly` (--owner-go merge-carry): the ONLY thing wrong is that the branch lacks commits of its base - an update from the base can clear it, nothing else here can.
   if (problems.length === 1 && behind) return { ...check('pr-open', false, problems[0]), behindOnly: true };
   return problems.length ? check('pr-open', false, problems.join('; ')) : check('pr-open', true, `open at ${short(head)}`);
@@ -1000,7 +1004,10 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     }
   }
   const checks = [
-    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindReason })),
+    await safely('pr-open', () => {
+      const named = gh.repo()?.defaultBranch;
+      return prOpenCheck({ info, head, config, behind: behindReason, defaultBranch: typeof named === 'string' && named !== '' ? named : '' });
+    }),
     await safely('labels', () => labelsCheck(info, { exemptHold })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
     await safely('scan-range', () => scanRangeCheck({ root, gh, pr, diff, info, explicit })),
