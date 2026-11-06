@@ -554,7 +554,7 @@ const LEAVES = /leaves the repository, so it cannot be judged: this needs a revi
 
 test('an @/absolute or @~/home import is refused whatever it points at, naming the importer and the token', (t) => {
   for (const [body, token] of [
-    [(dir) => `see @${dir}/docs/ledger.md\n`, null],
+    [(dir) => `see @${dir.replaceAll('\\', '/')}/docs/ledger.md\n`, null], // (slashes: a backslash token is refused for its own reason, tested below)
     ['@/etc/hosts\n', '/etc/hosts'],
     ['@~/x.md\n', '~/x.md'],
     ['and @~\n', '~'],
@@ -637,7 +637,8 @@ test('a symlink target that is absolute or has a backslash cannot be judged', (t
     const w = world(t, { baseFiles: { 'CLAUDE.md': '@out.md\n' }, baseLinks: { 'out.md': target } });
     w.append(LEDGER, row(2));
     w.repo.commit('ledger row');
-    refused(exemptWith(w), why);
+    // Git for Windows stores a link target with forward slashes, so there each backslash target is read as its slash twin. Still refused, for that twin's reason.
+    refused(exemptWith(w), process.platform === 'win32' ? /symlink/ : why);
   }
 });
 
@@ -657,7 +658,7 @@ test('an instruction file too large to read cannot be judged: refused', (t) => {
 // ---- R1 follow-ups to A3: re-entry, link aliases, `./` in link targets, and the order of the checks ---------------------------------------
 
 test('a relative import that climbs above the repo root, even to come back in, is refused', (t) => {
-  const name = (dir) => dir.split('/').at(-1);
+  const name = (dir) => dir.split(/[\\/]/).at(-1);
   const named = (what) => new RegExp(`${what.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&')}, which leaves the repository`);
   const back = (dir) => `../${name(dir)}/docs/ledger.md`;
   refused(exemptWith(importWorld(t, { 'CLAUDE.md': (dir) => `see @${back(dir)}\n` })), LEAVES);
