@@ -18,10 +18,12 @@ export const sh = (cwd, ...args) => {
   return r.stdout.trim();
 };
 const goYml = (yml = ymlFor()) => yml.replace('{pr} {sha}', '{pr} --match-head-commit {sha}');
-export const REPO_SLUG = 'acme/widgets';
 
 export function carryWorld({ yml, change = bump, baseFiles } = {}) {
   const salt = randomUUID();
+  // ISOLATION: the approval records are shared by every test process and match on repository + PR; a repo name of its own keeps this world's Carry records from
+  // ever being a candidate in another test's refusal (they would change its wording).
+  const slug = `acme/carry-${salt.slice(0, 8)}`;
   const s = scenario({ yml: goYml(yml), report: null, state: null, baseFiles, change: (repo) => { change(repo); repo.write('.salt', salt); } });
   const root = s.repo.dir;
   const top = realpathSync.native(mkdtempSync(join(tmpdir(), 'carry-world-')));
@@ -73,7 +75,7 @@ export function carryWorld({ yml, change = bump, baseFiles } = {}) {
   };
   const rows = () => [{ name: 'ci', state: 'SUCCESS', bucket: w.ci[w.head()] ?? 'pass' }];
   w.gh = {
-    repo: () => ({ slug: REPO_SLUG, host: 'github.com', defaultBranch: 'main' }),
+    repo: () => ({ slug, host: 'github.com', defaultBranch: 'main' }),
     viewer: () => 'me', prView, listIssues: () => [], listComments: () => [], timelineOf: () => [], pullFiles: () => {
       const mb = sh(bare, 'merge-base', w.tip(), w.head());
       return sh(bare, 'diff', '-M', '--name-status', mb, w.head()).split('\n').filter(Boolean).map((l) => { const [status, a, b] = l.split('\t'); return b === undefined ? { filename: a, status } : { filename: b, previous_filename: a, status }; });
@@ -105,8 +107,9 @@ export function carryWorld({ yml, change = bump, baseFiles } = {}) {
     PIPELINE_UPDATE_POLL_MS: '1', PIPELINE_UPDATE_WAIT_MS: '300', PIPELINE_CI_APPEAR_MS: '50', PIPELINE_CI_TIMEOUT_MS: '300', PIPELINE_CI_INTERVAL_MS: '1', PIPELINE_HOLD_RETRY_MS: '1',
   };
   w.log = [];
+  w.slug = slug;
   // the owner's request for H0 (with or without the Carry line), as the reply right before "merge"
-  w.request = ({ carry = true, items = 'none' } = {}) => `Request.\n${carry ? `${CARRY_LINE}\n` : ''}Head ${w.h0.slice(0, 16)} · items ${items} · repo ${REPO_SLUG}\n🔀 Ready to merge #${PR} — say "merge"`;
+  w.request = ({ carry = true, items = 'none' } = {}) => `Request.\n${carry ? `${CARRY_LINE}\n` : ''}Head ${w.h0.slice(0, 16)} · items ${items} · repo ${slug}\n🔀 Ready to merge #${PR} — say "merge"`;
   // P merge --pr N --owner-go, in process, against the world. `seam` overrides ctx.carry entries.
   w.merge = (seam = {}) => mergeRun(['--pr', String(PR), '--owner-go', '--repo', root], {
     cwd: root, env: w.env,
