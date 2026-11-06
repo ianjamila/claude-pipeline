@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { classifyHardStops, collectHardStops, enclosingStatements, stripSqlComments, envNamesIn } from '../pipeline/lib/hardstops.mjs';
 import { diffFiles } from '../pipeline/lib/git.mjs';
+import { isAgentInstructionPath, isDocPath } from '../pipeline/lib/doc-paths.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops.mjs';
 
@@ -361,6 +362,30 @@ test('R4 pipeline paths', () => {
     assert.deepEqual(rulesOf(run([file(p)])), ['R4-config'], p);
   }
   assert.deepEqual(rulesOf(run([file('src/app.ts')])), []);
+});
+
+// One list of agent instruction files (doc-paths.mjs), read by the document check and by R4-config: they cannot disagree.
+const INSTRUCTION_NAMES = [
+  'CLAUDE.md', 'AGENTS.md', 'GEMINI.md', 'AGENT.md', 'CLAUDE.local.md', 'CLAUDE.override.md', 'AGENTS.override.md', 'AGENTS.local.md', 'AGENT.local.md',
+  'GEMINI.local.md', '.cursorrules', 'copilot-instructions.md', 'docs/copilot-instructions.md', 'pkg/sub/AGENT.md', 'docs/gemini.override.md',
+];
+const caseVariants = (p) => [p, p.toLowerCase(), p.toUpperCase(), p.replace(/(^|\/)([a-z])/g, (_, s, c) => s + c.toUpperCase())];
+const NOT_INSTRUCTIONS = ['agent-guide.md', 'agents-guide.md', 'CLAUDE-notes.md', 'docs/agent-guide/prod-ledger.md', 'myagent.md', 'claude.md.txt', 'AGENTS.a.b.md', 'cursorrules'];
+
+test('R4-config names every agent instruction file, at any depth and case, and agrees with doc-paths', () => {
+  for (const base of INSTRUCTION_NAMES) {
+    for (const p of caseVariants(base)) {
+      assert.equal(isAgentInstructionPath(p), true, `doc-paths: ${p}`);
+      assert.equal(isDocPath(p), false, `isDocPath: ${p}`);
+      assert.ok(rulesOf(run([file(p, { status: 'A', added: ['be nice'] })])).includes('R4-config'), `R4-config: ${p}`);
+    }
+  }
+  for (const p of NOT_INSTRUCTIONS) {
+    assert.equal(isAgentInstructionPath(p), false, `doc-paths: ${p}`);
+    assert.equal(rulesOf(run([file(p, { status: 'A', added: ['hello'] })])).includes('R4-config'), false, `R4-config: ${p}`);
+  }
+  // Git hook directories stay R4-config in their own right.
+  for (const p of ['.githooks/pre-push', '.husky/pre-commit']) assert.ok(rulesOf(run([file(p)])).includes('R4-config'), p);
 });
 
 test('R4 old path counts on renames out of .github', () => {

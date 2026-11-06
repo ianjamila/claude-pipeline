@@ -17,8 +17,15 @@
 //    would still match after a main merge that discards an upstream change. A merge since the round always takes a round (the
 //    existing baseOnly / resolutionOnly paths deal with it);
 //  * toHead..HEAD changes at least one file, and every file, by BOTH rename sides, is listed, is a regular (100644) non-binary text
-//    file, and is only added to: no edited or removed line, no deletion, no rename, no mode change, no symlink or submodule.
+//    file, and is only added to: no edited or removed line, no deletion, no rename, no mode change, no symlink or submodule;
+//  * every ADDED line is a strict ledger row (LEDGER_ROW below): a four-digit number, the migration's name, a date, a PR number and
+//    an empty note, nothing else. The added rows are the last lines of the file (nothing after them), their numbers strictly
+//    increase and continue above the last row of the reviewed file, and each names a migration file (<number>_<name>.sql, a regular
+//    file in a directory called migrations) that exists in the REVIEWED head's tree. So a row carries no free text, and the only
+//    word in it that is not fixed was already reviewed as a file name. A row with a note, or any other line, needs a round.
+import { posix } from 'node:path';
 import { DEFAULTS, docsExemptProblem } from './config.mjs';
+import { isAgentInstructionPath } from './doc-paths.mjs';
 import { contentHash, diffFiles, diffModes, git, isAncestor, mergeBase, revParse, reviewBaseRef, showFile } from './git.mjs';
 import { reviewValidFor } from './triage.mjs';
 import { parseYaml } from './yaml.mjs';
@@ -28,6 +35,235 @@ const SHA = /^[0-9a-f]{40}$/;
 const REGULAR = '100644';
 const SHOWN = 5;
 const oneLine = (e) => String(e?.message ?? e).split('\n')[0].slice(0, 200);
+
+// | 0240 | `name` | 2026-11-05 | #1234 | |   The Note column must be empty: a row with a note takes a round.
+const LEDGER_ROW = /^\| (\d{4}) \| `([a-z0-9_]{1,63})` \| \d{4}-\d{2}-\d{2} \| #\d{1,6} \| \|$/;
+const ROW_NUMBER = /^\| (\d{4}) \| /;
+const quote = (text) => JSON.stringify(String(text).slice(0, 60));
+
+// ---- @-imports: an instruction file that pulls a listed document in --------------------------------------------------------------------
+// CLAUDE.md and its kin may `@path` other files, which are then read as instructions (Claude Code follows them up to 5 hops). A listed
+// document that is imported steers the agent like an instruction file, yet its added lines would skip review. The scan reads the REVIEWED
+// head's tree (instruction files cannot change after it: an unlisted file forces a round, and an instruction file can never be listed).
+// It over-matches on purpose (tokens in code spans, any case, both the importer's own and its target's directory), and fails closed:
+// whatever cannot be read or followed (a link that cycles, dangles or ends outside the repo, an oversized file) is "not exempt". So is an
+// import the scan cannot judge purely inside the reviewed tree: a relative path that climbs above the repo root (lexically or through a
+// symlink), and an absolute or home path. Nothing is compared against the checkout's location, so no spelling of it can matter.
+const MAX_HOPS = 5;
+const MAX_READS = 2000;
+const MAX_FILE_BYTES = 1024 * 1024;
+const MAX_TOKENS = 5000;
+const MAX_LINK_FOLLOWS = 40;
+const REGULAR_MODES = new Set(['100644', '100755']);
+// `@path`: at the start of a line or after a character that cannot end a word (whitespace, a bracket, a quote, markup).
+const IMPORT_TOKEN = /(?:^|[^A-Za-z0-9.\-/@\\])@([^\s]+)/gm;
+const TRAILING_PUNCTUATION = /[)\]}>"'`.,;:!?*_~|]+$/;
+const lc = (s) => s.toLowerCase();
+class Unjudgeable extends Error {}
+
+// Every file in the tree at `toHead`: { entries: path -> { mode, oid }, lower: lowercased path -> [paths] }. The lowercase index is how a
+// case-insensitive file system (macOS, Windows) would resolve a name.
+function readTree(toHead, o) {
+  const entries = new Map();
+  const lower = new Map();
+  for (const raw of git(['ls-tree', '-r', '-z', '--full-tree', toHead], o).split('\0')) {
+    const m = /^(\d+) (?:blob|commit) ([0-9a-f]+)\t(.+)$/s.exec(raw);
+    if (!m) continue;
+    entries.set(m[3], { mode: m[1], oid: m[2] });
+    lower.set(lc(m[3]), [...(lower.get(lc(m[3])) ?? []), m[3]]);
+  }
+  return { entries, lower };
+}
+
+// File names of the regular files directly in a directory called migrations. Read on demand.
+function migrationNames(tree) {
+  const names = new Set();
+  for (const [p, e] of tree.entries) {
+    const parts = p.split('/');
+    if (REGULAR_MODES.has(e.mode) && parts.length >= 2 && parts.at(-2) === 'migrations' && parts.at(-1).endsWith('.sql')) names.add(parts.at(-1));
+  }
+  return names;
+}
+
+// Walks `rel` (a posix path from the repo root, `.` and `..` allowed) through the tree, following a symlink at every segment, directories
+// included. -> { path: canonical tree path | null (nothing there), entry } | throws Unjudgeable (a link that cycles, dangles, is absolute or
+// ends outside the repo; ambiguous names; a path that climbs above the root).
+function resolveInTree(tree, rel, readBlob) {
+  let segs = rel.split('/').filter((s) => s !== '' && s !== '.');
+  let done = [];
+  let follows = 0;
+  while (segs.length > 0) {
+    const next = segs.shift();
+    if (next === '..') {
+      if (done.length === 0) throw new Unjudgeable(follows > 0 ? 'a symlink leads out of the repository' : 'the path leaves the repository');
+      done.pop();
+      continue;
+    }
+    const at = [...done, next].join('/');
+    const hits = tree.lower.get(lc(at));
+    if (hits === undefined) { done.push(next); continue; } // a directory, or nothing
+    if (hits.length > 1) throw new Unjudgeable(`${at} is ambiguous (two names that differ only in case)`);
+    const real = hits[0];
+    const entry = tree.entries.get(real);
+    if (entry.mode !== '120000') { done.push(real.split('/').at(-1)); continue; }
+    if (++follows > MAX_LINK_FOLLOWS) throw new Unjudgeable(`symlinks at ${real} cycle`);
+    const target = readBlob(entry.oid, real);
+    if (target === '' || target.includes('\0')) throw new Unjudgeable(`${real} is a symlink with an unreadable target`);
+    if (isAbsoluteOrHome(target)) throw new Unjudgeable(`${real} is a symlink to an absolute path`);
+    if (target.includes('\\')) throw new Unjudgeable(`${real} is a symlink whose target has a backslash, which has two readings`);
+    segs = [...target.split('/').filter((s) => s !== '' && s !== '.'), ...segs];
+    // `done` is the directory that holds the link, unchanged: the target is relative to it.
+  }
+  const full = done.join('/');
+  const hit = tree.lower.get(lc(full));
+  if (hit === undefined) {
+    if (follows > 0) throw new Unjudgeable(`a symlink on the way to ${full === '' ? rel : full} dangles`);
+    return { path: null, entry: null };
+  }
+  if (hit.length > 1) throw new Unjudgeable(`${full} is ambiguous (two names that differ only in case)`);
+  return { path: hit[0], entry: tree.entries.get(hit[0]) };
+}
+
+// A path that names a place outside the reviewed tree whatever the platform: rooted (`/x`), the home directory (`~`, `~/x`) or a drive
+// (`C:`, `c:/x`, `C:x`). The drive form counts on every platform: the same tree is reviewed on all of them, and over-matching is safe.
+// A backslash is not judged here: it is a separator on Windows and a filename character on POSIX, so a token or symlink target with one is refused.
+const isAbsoluteOrHome = (p) => /^(?:\/|~(?:\/|$)|[A-Za-z]:)/.test(p);
+
+// A path segment that ends in a dot or a space: Windows drops it, so it names another file there. `.` and `..` are the real ones.
+const dotted = (seg) => seg !== '.' && seg !== '..' && /[. ]$/.test(seg);
+
+// The paths an `@token` may stand for, as written (trailing punctuation and a #fragment cut off in turn).
+function candidatesOf(token) {
+  const out = new Set();
+  for (const t of [token, token.replace(TRAILING_PUNCTUATION, '')]) {
+    // The fragment can hide punctuation too (`ledger.md.#a`), so trim again after cutting it.
+    for (const c of [t, t.split('#')[0], t.split('#')[0].replace(TRAILING_PUNCTUATION, '')]) if (c !== '') out.add(c);
+  }
+  return [...out];
+}
+
+// Does any instruction file of the reviewed head import (directly or by up to 5 hops) a document of `listed`? -> a reason | null.
+function importProblem({ listed, tree, o }) {
+  const listedLower = new Set(listed.map(lc));
+  let reads = 0;
+  const readBlob = (oid, path) => {
+    if (++reads > MAX_READS) throw new Unjudgeable('too many files to read');
+    let text;
+    try {
+      text = git(['cat-file', 'blob', oid], { ...o, maxBuffer: MAX_FILE_BYTES });
+    } catch {
+      throw new Unjudgeable(`${path} is too large or cannot be read`);
+    }
+    return text;
+  };
+
+  // One entry per file AND directory it was reached in: the same file behind two symlinked directories is read from each, because an
+  // `@name` in it resolves against the directory it was reached in. The set of directories is bounded by the tree, the reads by MAX_READS.
+  const seen = new Set();
+  const queue = [];
+  const enqueue = (path, canonical, depth) => {
+    const key = `${lc(canonical)}\0${lc(posix.dirname(path))}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    queue.push({ path, canonical, depth });
+  };
+  // The instruction files are the roots. One that is itself a link is followed; one that ends in a listed document makes that document
+  // an instruction file, which it may never be.
+  for (const p of tree.entries.keys()) {
+    if (!isAgentInstructionPath(p)) continue;
+    let r;
+    try {
+      r = resolveInTree(tree, p, readBlob);
+    } catch (e) {
+      if (!(e instanceof Unjudgeable)) throw e;
+      return `${p} cannot be judged: ${e.message}`;
+    }
+    if (r.path === null) return `${p} is a symlink that dangles or leads out of the repository (symlink targets cannot be judged)`;
+    if (REGULAR_MODES.has(r.entry.mode) === false) continue;
+    if (listedLower.has(lc(r.path))) return `${p} is read as an instruction file but is a symlink to ${r.path}, a listed document`;
+    enqueue(p, r.path, 0);
+  }
+
+  const leaves = (importer, token) => `${importer} imports ${token}, which leaves the repository, so it cannot be judged: this needs a review round`;
+  const hit = (importer, lexical, canonical) => {
+    const direct = listedLower.has(lc(lexical));
+    if (!direct && !(canonical !== null && listedLower.has(lc(canonical)))) return null;
+    return `${importer} imports ${lexical}${direct ? '' : ` (a symlink to ${canonical})`}, a listed document: an imported document steers the agents like an instruction file`;
+  };
+  for (let i = 0; i < queue.length; i++) {
+    const { path, canonical, depth } = queue[i];
+    const text = readBlob(tree.entries.get(canonical).oid, path);
+    let tokens = 0;
+    for (const m of text.matchAll(IMPORT_TOKEN)) {
+      if (++tokens > MAX_TOKENS) return `${path} cannot be judged: too many @ tokens`;
+      // A backslash has two readings, a separator or a filename character, so judging one could miss the other; an escaped space is no
+      // exception (the space is then dropped on Windows). Judged on the whole token, before any trailing punctuation or #fragment is cut off.
+      if (m[1].includes('\\')) return `${path} imports ${m[1]}, which cannot be judged because a backslash has two readings: this needs a review round`;
+      // A segment ending in a dot or a space is refused the same way. Sentence punctuation after the path is not one: the last segment is
+      // judged only after it is cut off (once with, once without the #fragment); every earlier segment is judged as written.
+      const stripped = [m[1], m[1].split('#')[0]].map((x) => x.replace(TRAILING_PUNCTUATION, ''));
+      if ([...m[1].split('/').slice(0, -1), ...stripped.flatMap((x) => x.split('/'))].some(dotted)) return `${path} imports ${m[1]}, which cannot be judged because a path segment ending in a dot or a space has two readings: this needs a review round`;
+      for (const written of candidatesOf(m[1])) {
+        // An absolute or home path is not a place inside the reviewed tree, so it cannot be judged there.
+        if (isAbsoluteOrHome(written)) return leaves(path, written);
+        // Where the token may point, as paths from the repo root: the importer's directory as it was reached and as it really is.
+        for (const dir of new Set([posix.dirname(path), posix.dirname(canonical)])) {
+          const rel = `${dir === '.' ? '' : `${dir}/`}${written}`;
+          const lexical = posix.normalize(rel);
+          if (lexical === '..' || lexical.startsWith('../')) return leaves(path, written);
+          const direct = hit(path, lexical, null);
+          if (direct) return direct;
+          let r;
+          try {
+            r = resolveInTree(tree, rel, readBlob); // the path as written: a symlink is followed at every segment, `..` included
+          } catch (e) {
+            if (!(e instanceof Unjudgeable)) throw e;
+            return `${path} imports ${written}, which cannot be judged: ${e.message}`;
+          }
+          const found = hit(path, lexical, r.path);
+          if (found) return found;
+          // The file as it was reached (the importer's directory matters to what it imports), and where it really is.
+          if (r.path !== null && REGULAR_MODES.has(r.entry.mode) && depth < MAX_HOPS) enqueue(lexical, r.path, depth + 1);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// A reviewed file with no final newline: appending a line rewrites its last line, which git reports as one removed and one added line.
+// Both blobs say so exactly (HEAD is the reviewed text plus a newline plus more). Still a round, but with the real reason.
+function newlineProblem(reviewed, head) {
+  if (typeof reviewed !== 'string' || typeof head !== 'string' || reviewed === '' || reviewed.endsWith('\n')) return null;
+  if (!head.startsWith(`${reviewed}\n`)) return null;
+  return 'the reviewed version has no final newline, so appending a line rewrote its last line (git sees an edited line); that needs a review round, and the file should end in a newline';
+}
+
+// Why the lines this file ADDS are not ledger rows laid out as the exemption allows, or null. `reviewed`: the file at the reviewed head
+// (null when it is new), `head`: the file at HEAD. The diff has no removed line here, so the added lines are the only change.
+function rowsProblem(file, f, reviewed, head, migrations) {
+  const added = f.added ?? [];
+  if (added.length === 0) return null;
+  const lines = String(head).split('\n');
+  if (lines.pop() !== '') return `${file}: the file does not end in a newline`;
+  const bad = added.find((l) => !LEDGER_ROW.test(String(l.text)));
+  if (bad) return `${file} line ${bad.line}: ${quote(bad.text)} is not a ledger row (| NNNN | \`name\` | YYYY-MM-DD | #PR | |); any other added line needs a review round`;
+  const first = lines.length - added.length + 1;
+  const off = added.find((l, i) => l.line !== first + i);
+  if (off) return `${file} line ${off.line}: added rows must be the last lines of the file, with nothing after them`;
+  let previous = null;
+  for (const l of String(reviewed ?? '').split('\n').reverse()) {
+    const m = ROW_NUMBER.exec(l);
+    if (m) { previous = m[1]; break; }
+  }
+  for (const l of added) {
+    const [, number, name] = LEDGER_ROW.exec(l.text);
+    if (previous !== null && number <= previous) return `${file} line ${l.line}: row ${number} does not come after row ${previous}: row numbers must strictly increase, above the last row of the reviewed file`;
+    previous = number;
+    if (!migrations().has(`${number}_${name}.sql`)) return `${file} line ${l.line}: no regular file ${number}_${name}.sql in a migrations directory at the reviewed head (a row for a migration that is not there needs a review round)`;
+  }
+  return null;
+}
 
 const stringsOf = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []);
 const pathsOf = (f) => [...new Set([f.oldPath, f.newPath, f.path].filter((p) => typeof p === 'string'))];
@@ -113,9 +349,13 @@ function decide(state, { root, config, hash }) {
 
   const files = diffFiles(toHead, 'HEAD', o);
   if (files.length === 0) return no(`no file changed since the reviewed head ${toHead.slice(0, 12)}`);
+  let treeMemo = null;
+  const tree = () => (treeMemo ??= readTree(toHead, o));
   const modes = new Map(diffModes(toHead, 'HEAD', o).map((m) => [m.newPath ?? m.oldPath, m]));
   const problems = [];
   const changed = new Set();
+  let names = null;
+  const migrations = () => (names ??= migrationNames(tree()));
   for (const f of files) {
     const paths = pathsOf(f);
     const unlisted = paths.filter((p) => !allowed.has(p));
@@ -123,9 +363,26 @@ function decide(state, { root, config, hash }) {
       problems.push(`${unlisted.join(', ')} is not in review.docs_exempt_paths: it needs a review round`);
       continue;
     }
-    const why = fileProblem(f, modes.get(f.newPath ?? f.oldPath ?? f.path));
+    const file = f.newPath ?? f.path;
+    let why = fileProblem(f, modes.get(f.newPath ?? f.oldPath ?? f.path));
+    if (why && f.status === 'M') why = newlineProblem(showFile(toHead, file, o), showFile('HEAD', file, o)) ?? why;
     if (why) problems.push(`${paths.join(' -> ')}: ${why}`);
+    else {
+      const rows = rowsProblem(file, f, f.status === 'A' ? null : showFile(toHead, file, o), showFile('HEAD', file, o), migrations);
+      if (rows) problems.push(rows);
+    }
     for (const p of paths) changed.add(p);
+  }
+  // Only when nothing else is wrong: a code file is named before an import is, and the tree is read only for a commit that could pass.
+  if (problems.length === 0) {
+    let importWhy;
+    try {
+      importWhy = importProblem({ listed, tree: tree(), o });
+    } catch (e) {
+      if (!(e instanceof Unjudgeable)) throw e;
+      importWhy = e.message;
+    }
+    if (importWhy) return no(importWhy);
   }
   if (problems.length > 0) {
     const shown = problems.slice(0, SHOWN).join('; ');

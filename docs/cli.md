@@ -415,17 +415,24 @@ files, size or recorded risk call for the Fable pass is refused unless some roun
 
 Docs-only exemption (`review.docs_exempt_paths`, default empty = off): the one exception to "coverage = this content". When the last round
 is valid for its OWN content (nothing unresolved, every Fable pass proven) and its hash really is the hash of its `toHead`, and
-the only changes since `toHead` ADD lines to files listed in that list, the comment is posted for the CURRENT hash and head (the record's
+the only changes since `toHead` ADD ledger rows to files listed in that list, the comment is posted for the CURRENT hash and head (the record's
 shape is unchanged, so the vendored guards read it as ever) with a visible line naming the files and the reviewed head, and the output
 carries `docsExempt: {files, reviewedHead}`. The final gate's `review` check uses the same helper (`lib/docs-exempt.mjs`) and shows the files
 in its detail; verify/CI coverage of the docs head is NOT exempted. Every condition: the list is read from `.claude/pipeline.yml` AT `toHead`
 (a commit cannot widen its own exemption); every entry is an exact path of an ordinary document (`lib/doc-paths.mjs`: markdown anywhere,
-text/rst/adoc under `docs/`, LICENSE/CHANGELOG; never an agent-instruction file (`CLAUDE` / `AGENTS` / `AGENT` / `GEMINI` `.md` and their `.<variant>.md` forms, e.g. `AGENTS.override.md`, `CLAUDE.local.md`; `.cursorrules`; `copilot-instructions.md`), html, mdx, source, or anything under
+text/rst/adoc under `docs/`, LICENSE/CHANGELOG; never an agent-instruction file (`CLAUDE` / `AGENTS` / `AGENT` / `GEMINI` `.md` and their `.<variant>.md` forms, e.g. `AGENTS.override.md`, `CLAUDE.local.md`; `.cursorrules`; `copilot-instructions.md`; any depth and case: the same list, `isAgentInstructionPath`, makes them R4-config hard stops), html, mdx, source, or anything under
 any dot-directory (`.claude/ .github/ .cursor/ ...`), `app/`, `pages/`, `skills/ agents/ pipeline/ scripts/`) that no hard-stop path rule claims and that is not on `integrity.test_globs`,
 `hard_stops.paths`, `review.arbiter_always_paths`, `risk.high_risk_paths`, nor under `supabase/` or a `migrations` directory (validated by
 config AND re-checked at run time); `toHead` is an ancestor of HEAD, no merge commit and no merge-base change since; every changed file
 (both sides of a rename) is listed, a regular 100644 non-binary file, and only added to (no edited or removed line, deletion, rename, mode
-change, symlink). A refusal names the file that forces a round: `reason` ends with "the docs-only exemption does not apply: <file> ...".
+change, symlink). Every added line must be a strict ledger row, `` | NNNN | `name` | YYYY-MM-DD | #PR | | `` (four-digit number, the Note column empty: a row
+with a note, prose, a blank line or CRLF takes a round); the added rows are the last lines of the file, their numbers strictly increase and
+continue above the last row of the reviewed file, and `NNNN_name.sql` is a regular file in a directory called `migrations` in the tree at `toHead`.
+No instruction file of the reviewed head (and no file it `@`-imports, up to 5 hops, symlinks followed, case-insensitive) may import a listed document, and no
+symlink on the way may cycle, dangle or lead out of the repository. An import the scan cannot judge inside the reviewed tree also takes a round: a relative path that
+climbs above the repo root (lexically or through a symlink), `@/abs/path`, `@~/path` and `@~`, a drive on every platform (`@C:\x`, `@c:/x`, `@C:x`), and any token or symlink target with a backslash (`@docs\ledger.md`, `@..\x`, `@\\server\share`: a separator on Windows, a filename character on POSIX, so it cannot be judged; an escaped space `\ ` counts too), and any token with a path segment that ends in a dot or a space (`@docs./ledger.md`: Windows drops it; sentence punctuation after the path is not one). A path that only does not exist in the tree (`@supabase/ssr`) is ignored.
+A reviewed file with no final newline takes a round for any append (git sees its last line as edited); the reason says so.
+A refusal names the file that forces a round: `reason` ends with "the docs-only exemption does not apply: <file> ...".
 
 With `ci.review_check: true` the guard workflow turns this comment into the `Cross-model review` status (success only when
 the newest such comment by an allowed author names the content hash of the PR head). A comment starts no workflow, so
