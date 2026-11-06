@@ -685,26 +685,51 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
 // apply (unless it only checks or counts), add, rm, mv (unless a dry run). Their read-only forms stay allowed (symbolic-ref HEAD, branch / branch --list, apply --check, add -n).
 const MERGE_JOB_VERBS = new Set(['checkout', 'switch', 'reset', 'commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'stash', 'pull', 'restore', 'am',
   'update-ref', 'symbolic-ref', 'branch', 'clean', 'read-tree', 'checkout-index', 'apply', 'add', 'rm', 'mv']);
-// The options of a git command line (up to `--`): { longs: Set of '--name' (value dropped), shorts: Set of single letters of every -abc cluster }.
-function optionsOf(args) {
-  const longs = new Set();
-  const shorts = new Set();
-  for (const a of args) {
-    if (a === '--') break;
-    if (a.startsWith('--')) longs.add(a.split('=')[0]);
-    else if (/^-[^-]/.test(a)) for (const c of a.slice(1)) shorts.add(c);
-  }
-  return { longs, shorts };
+// The options of a git command line, parsed like git does (parseOpts): up to `--` or `--end-of-options`, a value-taking short
+// (`clean -e <pattern>`) swallows the rest of its cluster, and long options that take a value swallow the next word.
+// R2-B1 / R2-F1: presence alone is not enough (`clean -nd --no-dry-run`, `clean -fen .`, `add --end-of-options -n .`).
+function jobOptions(args, spec = {}) {
+  const end = args.findIndex((a) => a === '--' || a === '--end-of-options');
+  const { flags, positionals } = parseOpts(end < 0 ? args : args.slice(0, end), { abbrev: true, ...spec });
+  const longs = flags.filter((f) => !f.short).map((f) => f.name);
+  return {
+    positionals: end < 0 ? positionals : [...positionals, ...args.slice(end + 1)],
+    has: (long, short) => longs.includes(long) || (short !== undefined && flags.some((f) => f.short && f.name === short)),
+    short: (c) => flags.some((f) => f.short && f.name === c),
+    longs,
+    negated: longs.some((n) => n.startsWith('no-')), // any `--no-x` (or `--no-x` abbreviation) may undo what an earlier flag said: fail closed
+    // an unambiguous abbreviation of one of these long options (`--del` for `--delete`) means it too
+    abbrevOf: (...names) => longs.some((n) => n.length > 0 && names.some((x) => x.startsWith(n))),
+  };
 }
+const ADD_RM_MV_CLEAN = {
+  add: { longValue: ['chmod', 'pathspec-from-file'] },
+  rm: { longValue: ['pathspec-from-file'] },
+  mv: {},
+  clean: { shortValue: 'e', longValue: ['exclude'] },
+};
+// apply: only these options keep a run read-only (anything else, e.g. --apply, --reject, --index, an abbreviation, is treated as writing)
+const APPLY_SAFE_LONG = ['check', 'stat', 'numstat', 'summary', 'verbose', 'quiet', 'recount', 'unidiff-zero', 'inaccurate-eof', 'ignore-space-change', 'ignore-whitespace', 'whitespace', 'directory', 'exclude', 'include', 'reverse', 'allow-overlap', 'binary'];
 // True when this use of one of the extra verbs cannot move the branch, HEAD, the index or the worktree.
 function mergeJobReadOnly(verb, args, words) {
-  const { longs, shorts } = optionsOf(args);
-  const has = (long, short) => longs.has(long) || (short !== undefined && shorts.has(short));
   switch (verb) {
-    case 'symbolic-ref': return words.length < 2 && !has('--delete', 'd'); // `symbolic-ref HEAD` reads, `symbolic-ref HEAD refs/heads/x` writes
-    case 'branch': return !(has('--force', 'f') || has('--move', 'm') || shorts.has('M') || has('--delete', 'd') || shorts.has('D') || shorts.has('C')); // lists, creates, `-c` copies to a NEW name
-    case 'apply': return !has('--apply') && ['--check', '--stat', '--numstat', '--summary'].some((o) => longs.has(o));
-    case 'add': case 'rm': case 'mv': case 'clean': return has('--dry-run', 'n');
+    case 'symbolic-ref': { // `symbolic-ref HEAD` reads, `symbolic-ref HEAD refs/heads/x` writes
+      const o = jobOptions(args, { shortValue: 'm', longValue: ['message'] });
+      return words.length < 2 && !o.has('delete', 'd') && !o.abbrevOf('delete');
+    }
+    case 'branch': { // lists, creates, `-c` copies to a NEW name
+      const o = jobOptions(args, { shortValue: 'u', longValue: ['set-upstream-to', 'contains', 'no-contains', 'merged', 'no-merged', 'sort', 'format', 'points-at', 'abbrev', 'color', 'column'] });
+      return !(o.has('force', 'f') || o.has('move', 'm') || o.short('M') || o.has('delete', 'd') || o.short('D') || o.short('C') || o.abbrevOf('force', 'move', 'delete'));
+    }
+    case 'apply': {
+      const o = jobOptions(args, { shortValue: 'pC', longValue: ['directory', 'exclude', 'include', 'whitespace'] });
+      return o.longs.every((n) => APPLY_SAFE_LONG.includes(n)) && o.longs.some((n) => ['check', 'stat', 'numstat', 'summary'].includes(n))
+        && !o.negated;
+    }
+    case 'add': case 'rm': case 'mv': case 'clean': {
+      const o = jobOptions(args, ADD_RM_MV_CLEAN[verb]);
+      return o.has('dry-run', 'n') && !o.negated;
+    }
     default: return false; // update-ref, read-tree, checkout-index: no read-only form
   }
 }
@@ -718,7 +743,7 @@ function mergeJobVerdict(sub, args, g, ctx) {
   const worktreeMove = verb === 'worktree' && (second === 'remove' || second === 'move');
   if (!MERGE_JOB_VERBS.has(verb) && !worktreeMove) return null;
   if (verb === 'stash' && (second === 'list' || second === 'show')) return null;
-  if (['update-ref', 'symbolic-ref', 'branch', 'clean', 'read-tree', 'checkout-index', 'apply', 'add', 'rm', 'mv'].includes(verb) && mergeJobReadOnly(verb, args, words)) return null;
+  if (verb !== 'stash' && MERGE_JOB_VERBS.has(verb) && mergeJobReadOnly(verb, args, words)) return null;
   const jobAt = (dir) => {
     if (dir === null) return null;
     try { return memoLookup(ctx, ['mergejob', dir], () => ctx.mergeJobOf(dir)) ?? null; } catch { return null; }

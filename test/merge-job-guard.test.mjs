@@ -166,3 +166,60 @@ test('R1-B3: the read-only forms of those verbs stay allowed in a job\'s checkou
   assert.equal(decide('git update-ref refs/heads/other HEAD', other).decision, 'allow'); // another checkout
   assert.equal(decide('git add .', other).decision, 'allow');
 });
+
+// ---- review round 2 (R2-B1, R2-F1): the read-only forms are resolved by real option parsing, not by option presence ----
+test('R2-B1: a negated or abbreviated-negated dry run / check / stat still mutates, so it is refused in a job\'s checkout', () => {
+  const root = fakeRepo();
+  mark(root, process.pid, 12);
+  for (const command of [
+    'git clean -nd --no-dry-run',
+    'git clean -nd --no-dry',
+    'git clean --dry-run --no-dry-run -d',
+    'git add -n --no-dry-run .',
+    'git rm -n --no-dry-run a.txt',
+    'git mv -n --no-dry-run a b',
+    'git apply --stat --no-stat fix.patch',
+    'git apply --check --no-check fix.patch',
+    'git apply --stat --apply fix.patch',
+    'git apply --check --app fix.patch', // unambiguous abbreviation of --apply
+    'git apply --check --reject fix.patch', // --reject writes the hunks that do apply
+    'git branch --del other', // abbreviations of --delete / --force / --move
+    'git branch --forc other HEAD',
+    'git branch --mov other',
+    'git symbolic-ref --del HEAD',
+  ]) {
+    const v = decide(command, root);
+    assert.equal(v.decision, 'deny', command);
+    assert.match(v.reason, /owns this checkout until it ends/, command);
+  }
+});
+
+test('R2-F1: value-taking short options and --end-of-options do not hide the real flags', () => {
+  const root = fakeRepo();
+  mark(root, process.pid, 12);
+  for (const command of [
+    'git clean -fen .', // -f, -e <pattern "n">: not a dry run
+    'git clean -f -e n',
+    'git clean -en .',
+    'git clean -f --end-of-options -n',
+    'git add --end-of-options -n .',
+    'git rm --end-of-options -n a.txt',
+    'git add --pathspec-from-file -n', // -n is the file name
+    'git apply -p1 --end-of-options --check fix.patch',
+  ]) {
+    const v = decide(command, root);
+    assert.equal(v.decision, 'deny', command);
+  }
+  for (const command of [
+    'git clean -ne "*.log"', // -n and -e <pattern>
+    'git clean -n -e keep',
+    'git clean -nde keep',
+    'git apply --check -p1 fix.patch',
+    'git apply --stat --whitespace=nowarn fix.patch',
+    'git add -n -- .',
+    'git add -nv .',
+  ]) {
+    assert.equal(decide(command, root).decision, 'allow', command);
+  }
+});
+
