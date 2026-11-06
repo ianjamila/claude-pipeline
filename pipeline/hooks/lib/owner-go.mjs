@@ -319,20 +319,72 @@ const toolUseText = (input) => {
   return over ? null : out.join('\n');
 };
 const inputSurfacesAsk = (input) => { const text = toolUseText(input); return text === null || surfacesAsk(text); };
-export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
+// #189 (owner decision, plan docs/plans/2026-11-06-followups-185-188-ruling-compaction.md section 3): a context compaction is transparent. Claude Code writes the summary of the
+// earlier conversation as a `user` entry (string content, no promptSource / origin) after a `compact_boundary`; it is a prompt entry to isPromptEntry and of source 'unknown', so
+// it used to open a new, empty reply slot between an ask and the owner's answer, and the ask was lost. Such an entry is skipped by every reader: it opens no slot, adds no text and
+// changes neither `skipping` nor `lastIsPrompt`. Its text is model text (it may quote an old ruling line or 🔀 line), so counting it as a reply would revive an ask that was already answered.
+// Fable plan pass finding 3: skipped only when BOTH `isCompactSummary` and `isVisibleInTranscriptOnly` are exactly true (the owner never sees it as a turn); a summary missing either flag
+// is a prompt like any other (a boundary), which is today's behaviour. Nothing here lets a compaction ADD an owner word: the answer is still the typed prompt the hook records.
+const isHiddenSummary = (e) => e?.type === 'user' && e.isCompactSummary === true && e.isVisibleInTranscriptOnly === true;
+// The newest user/assistant entry when it is a prompt whose text is `prompt` (the submission being recorded, already in the transcript), else null.
+function currentPromptEntry(transcriptPath, prompt) {
+  const entries = tailEntries(transcriptPath, TRANSCRIPT_TAIL_BYTES);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if ((e?.type !== 'user' && e?.type !== 'assistant') || isHiddenSummary(e)) continue;
+    return isPromptEntry(e) && promptTextOf(e) === plain(prompt) ? e : null;
+  }
+  return null;
+}
+// The same reply as lastReplyText, with whether it is a PROMOTED synthetic-turn ask (see below): { text, promoted }.
+// #189 (Fable plan pass finding 1) synthetic-turn promotion, rulings only (skipSynthetic): the agent can write its ask inside a turn the harness started (a subagent hand-back, a task
+// notice): then the owner SAW the ask, since the interactive UI renders those turns, and answers it. R1-F3 ("any text in a dropped reply voids the slot") made that answer unrecordable.
+// The ordered rule, per synthetic turn, entries in transcript order (Codex plan review P1): state `text` (the turn's assistant text), `surfacedAfterText`, `anything`; an assistant text
+// block adds to `text` and clears `surfacedAfterText`; a tool_use input or tool_result that surfaces an ask (inputSurfacesAsk / surfacesAsk, unchanged) sets `surfacedAfterText`; either sets
+// `anything`. The turn ends at the next prompt entry of ANY source and at the end of the entries (so an answer not yet appended sees what an appended one does). At its end: when
+// presentedRuling(text) is not null and nothing surfaced after that text, the turn becomes a new reply slot holding the text, exactly as if the owner had started it; else when anything
+// was shown the slot before it is voided (R1-F3, R4-F3, R5-B2 unchanged); else (tool-only, nothing surfaced) the slot stands. So a `ruling-request` call, its result and then the canonical
+// line is promoted (the line came last), the line followed by a tool output asking about another PR is voided (the last thing shown was not the line), and a later synthetic turn
+// with text voids an earlier promoted slot while a tool-only one leaves it. Why this is no weaker: the ask was agent-written in either kind of turn; what binds is the owner's TYPED answer
+// (entrySource 'owner', promptProvenance at use time), the ids on the last line and the content digest owner-ruling recomputes. The slot binds only its own PR / ids / digest.
+// This narrows R1-F3; the PR calls it out for the owner.
+// Only a prompt entry with promptSource 'system' AND entrypoint 'cli' promotes (a notice the interactive UI renders). An 'sdk' / 'sdk-cli' turn (a headless `claude -p --resume` of this
+// session writes into the owner's transcript and shows nothing on screen), any other non-human origin and an unknown source keep R1-F3: ANY text voids the slot.
+// Fable plan pass finding 2 (queued answers): an owner prompt typed while the agent was busy (promptSource 'queued') can be delivered after a promoted ask the owner never saw. So the
+// result says which slot is promoted; recordRuling stamps `ask_turn: 'synthetic'` on that record and refuses a queued current entry, and promptProvenance refuses such a record whose prompt
+// entry is queued. (An owner-turn ask has a narrower, pre-existing form of this: a follow-up issue.)
+export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
   const replies = [''];
   const voided = new Set(); // slots (indexes of replies) whose ask a dropped reply replaced
+  const promoted = new Set(); // slots (indexes of replies) that are an ask promoted out of a synthetic turn
   let lastIsPrompt = false; // is the newest user/assistant entry a prompt (the owner's current one)?
   let lastPromptText = '';
   let skipping = false; // inside a synthetic turn: its prompt and the replies to it
+  let turn = null; // the synthetic turn being read (skipSynthetic): { promote, text, surfacedAfterText, anything }
+  const flush = () => {
+    if (turn === null) return;
+    const t = turn;
+    turn = null;
+    if (t.promote && !t.surfacedAfterText && presentedRuling(t.text) !== null) {
+      replies.push(t.text);
+      promoted.add(replies.length - 1);
+      lastIsPrompt = false;
+    } else if (t.anything) voided.add(replies.length - 1);
+  };
   for (const e of tailEntries(transcriptPath, tailBytes)) {
     const content = e?.message?.content;
     if (e?.type === 'user') {
+      if (isHiddenSummary(e)) continue;
       const isPrompt = isPromptEntry(e);
-      if (isPrompt && skipSynthetic && entrySource(e) === 'synthetic') { skipping = true; continue; }
+      if (isPrompt) flush();
+      if (isPrompt && skipSynthetic && entrySource(e) === 'synthetic') {
+        skipping = true;
+        turn = { promote: e.promptSource === 'system' && e.entrypoint === 'cli', text: '', surfacedAfterText: false, anything: false };
+        continue;
+      }
       if (isPrompt) skipping = false;
       else if (skipping) {
-        if (Array.isArray(content) && content.some((b) => b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content)))) voided.add(replies.length - 1);
+        if (Array.isArray(content) && content.some((b) => b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content)))) { turn.surfacedAfterText = true; turn.anything = true; }
         continue;
       }
       if (isPrompt) {
@@ -342,20 +394,25 @@ export function lastReplyText(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTE
       lastIsPrompt = isPrompt;
     } else if (e?.type === 'assistant' && Array.isArray(content)) {
       if (skipping) {
-        if (content.some((b) => (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) || (b?.type === 'tool_use' && inputSurfacesAsk(b.input)))) voided.add(replies.length - 1);
+        for (const b of content) {
+          if (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) { turn.text += `${b.text}\n`; turn.surfacedAfterText = false; turn.anything = true; }
+          else if (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) { turn.surfacedAfterText = true; turn.anything = true; }
+        }
         continue;
       }
       lastIsPrompt = false;
       for (const b of content) if (b?.type === 'text' && typeof b.text === 'string') replies[replies.length - 1] += `${b.text}\n`;
     }
   }
+  flush();
   // Only the reply right before the owner's prompt: when the newest entry is that prompt, its own (empty) slot is skipped, and that is
   // the ONLY slot that may be. A later prompt plus a text-less assistant turn (tool calls only) leaves the old request stale, and an
   // older request is never revived by a later "merge": the agent shows it again.
   const current = lastIsPrompt && (prompt === undefined || plain(prompt) === lastPromptText);
   const last = replies.length - 1 - (current && replies.length > 1 ? 1 : 0);
-  return voided.has(last) ? '' : (replies[last] ?? '');
+  return voided.has(last) ? { text: '', promoted: false } : { text: replies[last] ?? '', promoted: promoted.has(last) };
 }
+export const lastReplyText = (transcriptPath, opts = {}) => lastReply(transcriptPath, opts).text;
 
 // ---- #128: is this prompt the owner's words? --------------------------------------------------------------------------------------
 
@@ -383,13 +440,8 @@ const textEnvelope = (prompt) => {
 // Is the CURRENT submission already in the transcript as a synthetic entry? The newest user/assistant entry must be a prompt (no reply after
 // it: lastReplyText's `current`) whose text is this prompt. An older entry with the same text that has been answered lends nothing.
 function currentEntryIsSynthetic(transcriptPath, prompt) {
-  const entries = tailEntries(transcriptPath, TRANSCRIPT_TAIL_BYTES);
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    if (e?.type !== 'user' && e?.type !== 'assistant') continue;
-    return isPromptEntry(e) && promptTextOf(e) === plain(prompt) && entrySource(e) === 'synthetic';
-  }
-  return false;
+  const e = currentPromptEntry(transcriptPath, prompt); // (#189: a compaction summary in between is skipped, as in lastReply)
+  return e !== null && entrySource(e) === 'synthetic';
 }
 
 // "Never record this prompt" (both recorders; the safe side is to record less). True when the hook input itself says it is not typed
@@ -498,13 +550,17 @@ export function recordRuling(input, { home = accountHome(), now = Date.now } = {
     const session = String(input?.session_id ?? '');
     if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > RULING_PROMPT_MAX) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: a notice, a peer's or a scheduled turn's words)
-    const asked = presentedRuling(lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt, skipSynthetic: true }));
+    const reply = lastReply(String(input?.transcript_path ?? ''), { prompt: input.prompt, skipSynthetic: true });
+    const asked = presentedRuling(reply.text);
     if (!asked) return null;
+    // #189 (Fable plan pass finding 2): an ask promoted out of a synthetic turn may never have been seen by the owner, so an answer the owner QUEUED while the agent was busy is no answer to it
+    // (refused here when the entry is already in the transcript; promptProvenance refuses it later for a record written before the transcript had it). The record says which kind of ask it answers.
+    if (reply.promoted && currentPromptEntry(String(input?.transcript_path ?? ''), input.prompt)?.promptSource === 'queued') return null;
     return appendRecord(home, session, {
       v: 1, kind: 'ruling', ts: new Date(now()).toISOString(), session,
       prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
       cwd: typeof input.cwd === 'string' ? input.cwd : null,
-      repo: asked.repo, pr: asked.pr, ids: asked.ids, content: asked.content, ...promptRefs(input), prompt: input.prompt,
+      repo: asked.repo, pr: asked.pr, ids: asked.ids, content: asked.content, ...(reply.promoted ? { ask_turn: 'synthetic' } : {}), ...promptRefs(input), prompt: input.prompt,
     });
   } catch {
     return null;
@@ -615,6 +671,7 @@ export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, 
   const scan = scanBackwards(file, (e) => { if (match.is(e)) found.push(e); return found.length >= 2; }, match.wants, { chunkBytes, capBytes });
   if (scan === null || found.length === 0) return 'missing';
   if (found.length > 1) return 'synthetic';
+  if (record.ask_turn === 'synthetic' && found[0].promptSource === 'queued') return 'synthetic'; // (#189 Fable plan pass finding 2: a queued answer to an ask the owner may never have seen)
   const source = entrySource(found[0]);
   if (source !== 'unknown') return source;
   // unknown: legacy only if the whole transcript is free of provenance fields
@@ -713,7 +770,7 @@ export function legacyTranscriptOf(session, { home = accountHome() } = {}) {
 function ownedBy(list, { grant = false, home } = {}) {
   const memo = new Map();
   return list.filter((r) => {
-    const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}\0${grant ? r.session : ''}`;
+    const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}\0${r.ask_turn}\0${grant ? r.session : ''}`;
     if (!memo.has(key)) {
       const derive = grant && (typeof r.transcript_path !== 'string' || r.transcript_path === '');
       const file = derive ? legacyTranscriptOf(r.session, { home }) : r.transcript_path;
