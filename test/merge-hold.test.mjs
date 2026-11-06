@@ -3,10 +3,15 @@
 // merge-hold-merge.test.mjs and merge-hold-command.test.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { DEFAULTS, loadConfig, validateConfig } from '../pipeline/lib/config.mjs';
 import {
-  HOLD_QUEUED_BEHIND, HOLD_TIMEOUT_MS, RELEASE_REASONS, checkHolds, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal, quoteReason, releaseHold, takeHold,
+  HOLD_POLL_MS, HOLD_QUEUED_BEHIND, HOLD_TIMEOUT_MS, RELEASE_REASONS, checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, ownSuccessor, queuedBehindFrom, queuedBehindRefusal, quoteReason,
+  readSuccessor, recordSuccessor, releaseHold, successorDir, takeHold, waitForTurn,
 } from '../pipeline/lib/merge-hold.mjs';
+import { quarantineReviewDir } from '../pipeline/lib/review-context.mjs';
+import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { bringUpToDate } from '../pipeline/lib/updatebranch.mjs';
 import { EW_QUEUED_LINE } from './helpers/merge-hold-env.mjs';
 
@@ -210,12 +215,13 @@ test('releaseHold: the reason is a fixed sentence, shell-quoted; an unknown code
     const r = await releaseHold({ config: CONFIG, pr: PR, reason, root: '/r', env: {}, run: async (cmd) => { seen.push(cmd); return { code: 0, stdout: 'ok', stderr: '' }; } });
     assert.equal(r.confirmed, true);
   }
-  assert.equal(seen.length, 4);
+  assert.equal(seen.length, Object.keys(RELEASE_REASONS).length);
   for (const [i, reason] of Object.keys(RELEASE_REASONS).entries()) {
     assert.equal(seen[i], `npm run merge-hold -- 12 --release --reason ${quoteReason(RELEASE_REASONS[reason])}`);
     assert.match(seen[i], process.platform === 'win32' ? /--reason "[A-Za-z0-9 ,.-]+"$/ : /--reason '[A-Za-z0-9 ,.-]+'$/, 'quoted for this platform, plain words only');
   }
-  assert.deepEqual(Object.keys(RELEASE_REASONS), ['new-commits', 'parked', 'owner-declined', 'handoff-withdrawn']);
+  assert.deepEqual(Object.keys(RELEASE_REASONS), ['new-commits', 'parked', 'owner-declined', 'handoff-withdrawn', 'ci-failed', 'update-conflict', 'queued-behind', 'hold-unreadable']);
+  for (const code of ['ci-failed', 'update-conflict', 'queued-behind', 'hold-unreadable']) assert.match(RELEASE_REASONS[code], /^[A-Za-z0-9 ,.]+$/, `${code}: letters, digits, spaces, commas and full stops only`);
   await assert.rejects(releaseHold({ config: CONFIG, pr: PR, reason: 'x; rm -rf /', root: '/r', env: {}, run: async () => assert.fail('must not run') }), /unknown release reason/);
   assert.equal(quoteReason("it's", 'linux'), "'it'\\''s'");
   assert.equal(quoteReason('plain words', 'win32'), '"plain words"');
@@ -372,4 +378,322 @@ test('bringUpToDate: an up-to-date branch never asks (nothing would be written)'
   const w = world([0]);
   const r = await upToDate(w, { beforeUpdate: () => assert.fail('no PUT, no question') });
   assert.equal(r.outcome, 'up-to-date');
+});
+
+// ---- holdBeforeUpdate: take the hold right before the catch-up PUT -----------------------------------------------------------------------
+
+const CLEAR = json({ pr: PR, blockedBy: [] });
+const AHEAD = json({ pr: PR, blockedBy: [{ number: 1400, title: 'Roster card', since: '2026-11-05T06:05:00.000Z', expires: '2026-11-05T07:35:00.000Z' }] });
+const taken = (over = {}) => ({ code: 0, stdout: 'hold taken\n', stderr: '', timedOut: false, ...over });
+// A shell that tells the check, the take and the release apart by their command text. `checks` is the list of answers to successive
+// checks (the last repeats); `log` records the order of everything that ran.
+function shell({ checks = [{ stdout: CLEAR }], take = taken() } = {}) {
+  const log = [];
+  let n = 0;
+  const run = async (cmd) => {
+    if (cmd.includes('--status')) {
+      log.push('check');
+      const c = checks[Math.min(n, checks.length - 1)];
+      n += 1;
+      return { code: 0, stdout: '', stderr: '', timedOut: false, ...c };
+    }
+    log.push(cmd.includes('--release') ? 'release' : 'take');
+    return take;
+  };
+  return { run, log };
+}
+const before = (sh) => holdBeforeUpdate({ config: CONFIG, pr: PR, root: '/repo', env: {}, run: sh.run });
+
+test('holdBeforeUpdate: not configured -> no callback and no info', () => {
+  assert.deepEqual(holdBeforeUpdate({ config: validateConfig(minimal()).config, pr: PR, root: '/r', env: {}, run: async () => assert.fail('no run') }), { beforeUpdate: null, info: null });
+});
+
+test('holdBeforeUpdate: a gate refusal is returned as is and nothing is taken', async () => {
+  for (const [name, stdout, error] of [['queued', AHEAD, 'queued-behind'], ['unreadable', 'nope', 'hold-unreadable']]) {
+    const sh = shell({ checks: [{ stdout }] });
+    const { beforeUpdate, info } = before(sh);
+    const r = await beforeUpdate();
+    assert.equal(r.error, error, name);
+    assert.equal('holdTaken' in r, false, `${name}: nothing was taken, so nothing to report`);
+    assert.deepEqual(sh.log, ['check'], name);
+    assert.deepEqual(info, { taken: false, tookThisCall: false, take: null }, name);
+  }
+});
+
+test('holdBeforeUpdate: clear -> check, take, check again, PUT goes; across 2 cycles the take runs once and every cycle re-checks', async () => {
+  const sh = shell();
+  const { beforeUpdate, info } = before(sh);
+  assert.equal(await beforeUpdate(), null);
+  assert.deepEqual(sh.log, ['check', 'take', 'check'], 'the re-check follows the take');
+  assert.equal(info.taken, true);
+  assert.equal(info.tookThisCall, true);
+  assert.deepEqual(info.take, { confirmed: true, code: 0, lines: ['hold taken'] });
+  assert.equal(await beforeUpdate(), null);
+  assert.deepEqual(sh.log, ['check', 'take', 'check', 'check'], 'cycle 2 only runs the first gate, no second take');
+});
+
+test('holdBeforeUpdate: cycle 2 refusal after a taken hold is a plain gate refusal (no second take, no re-check)', async () => {
+  const sh = shell({ checks: [{ stdout: CLEAR }, { stdout: CLEAR }, { stdout: AHEAD }] });
+  const { beforeUpdate } = before(sh);
+  assert.equal(await beforeUpdate(), null);
+  const r = await beforeUpdate();
+  assert.equal(r.error, 'queued-behind');
+  assert.deepEqual(sh.log, ['check', 'take', 'check', 'check']);
+});
+
+test('holdBeforeUpdate: a take that exits 1 or times out, with a clear re-check, still lets the PUT go (info.taken false, the answer kept)', async () => {
+  for (const [name, take, expect] of [
+    ['exit 1', taken({ code: 1, stdout: 'refused: draft\n' }), { confirmed: false, code: 1, lines: ['refused: draft'] }],
+    ['timeout', taken({ code: 0, stdout: '', timedOut: true }), { confirmed: false, code: 0, lines: [], timedOut: true }],
+  ]) {
+    const sh = shell({ take });
+    const { beforeUpdate, info } = before(sh);
+    assert.equal(await beforeUpdate(), null, name);
+    assert.deepEqual(sh.log, ['check', 'take', 'check'], name);
+    assert.equal(info.taken, false, name);
+    assert.equal(info.tookThisCall, true, name);
+    assert.deepEqual(info.take, expect, name);
+  }
+});
+
+test('holdBeforeUpdate: take ok + re-check blocked -> queued-behind with holdTaken true; take failed + re-check blocked -> holdTaken false', async () => {
+  const win = shell({ checks: [{ stdout: CLEAR }, { stdout: AHEAD }] });
+  const a = before(win);
+  const lost = await a.beforeUpdate();
+  assert.equal(lost.error, 'queued-behind');
+  assert.deepEqual(lost.blockedBy, [1400]);
+  assert.equal(lost.holdTaken, true);
+  assert.equal(a.info.taken, true);
+
+  const failed = shell({ checks: [{ stdout: CLEAR }, { stdout: AHEAD }], take: taken({ code: 1 }) });
+  const b = before(failed);
+  const lost2 = await b.beforeUpdate();
+  assert.equal(lost2.error, 'queued-behind');
+  assert.equal(lost2.holdTaken, false);
+  assert.equal(b.info.tookThisCall, true);
+});
+
+test('holdBeforeUpdate: an unreadable re-check -> hold-unreadable with holdTaken (confirmed or not)', async () => {
+  for (const [take, expected] of [[taken(), true], [taken({ code: 1 }), false]]) {
+    const sh = shell({ checks: [{ stdout: CLEAR }, { stdout: 'garbage' }], take });
+    const { beforeUpdate, info } = before(sh);
+    const r = await beforeUpdate();
+    assert.equal(r.error, 'hold-unreadable');
+    assert.equal(r.holdTaken, expected);
+    assert.equal(info.tookThisCall, true);
+  }
+});
+
+// ---- the pipeline's own successor heads ----------------------------------------------------------------------------------------------------
+
+const H = (c) => c.repeat(40);
+const repoWithCommit = () => {
+  const repo = createTmpRepo();
+  repo.write('a.txt', 'a');
+  repo.commit('init');
+  return repo;
+};
+const triple = { from: H('1'), to: H('2'), baseSha: H('3') };
+
+test('successor record: write/read round trip in a real repo; a linked worktree sees the same record', () => {
+  const repo = repoWithCommit();
+  recordSuccessor(repo.dir, 12, triple, new Date('2026-11-06T08:00:00.000Z'));
+  assert.deepEqual(readSuccessor(repo.dir, 12, triple.to), { ...triple, at: '2026-11-06T08:00:00.000Z' });
+  const file = join(successorDir(repo.dir, 12), `${triple.to}.json`);
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { version: 1, pr: 12, ...triple, at: '2026-11-06T08:00:00.000Z' });
+  assert.ok(file.includes(join('.git', 'pipeline', 'merge-hold', 'pr-12')), file);
+  assert.deepEqual(readdirSync(successorDir(repo.dir, 12)), [`${triple.to}.json`], 'no temp file is left behind');
+
+  const wt = `${repo.dir}-wt`;
+  repo.git(['worktree', 'add', '-q', '-b', 'other', wt]);
+  try {
+    assert.deepEqual(readSuccessor(wt, 12, triple.to)?.from, triple.from, "the linked worktree reads the main one's record");
+    recordSuccessor(wt, 12, { from: H('4'), to: H('5'), baseSha: H('6') });
+    assert.ok(readSuccessor(repo.dir, 12, H('5')), "and the main one reads the worktree's");
+  } finally {
+    repo.git(['worktree', 'remove', '--force', wt]);
+  }
+});
+
+test('successor record: two interleaved writers for the same PR both stay readable (one file each, no read-modify-write)', () => {
+  const repo = repoWithCommit();
+  const one = { from: H('1'), to: H('2'), baseSha: H('3') };
+  const two = { from: H('2'), to: H('4'), baseSha: H('5') };
+  recordSuccessor(repo.dir, 12, one);
+  recordSuccessor(repo.dir, 12, two);
+  recordSuccessor(repo.dir, 12, one);
+  assert.equal(readSuccessor(repo.dir, 12, one.to).baseSha, one.baseSha);
+  assert.equal(readSuccessor(repo.dir, 12, two.to).baseSha, two.baseSha);
+  assert.equal(readdirSync(successorDir(repo.dir, 12)).length, 2, 'the same successor twice is one file');
+});
+
+test('successor record: invalid input throws before a path is built; corrupt / missing / other-pr / wrong-version / mismatched records read as null', () => {
+  const repo = repoWithCommit();
+  for (const bad of [{ ...triple, from: 'abc' }, { ...triple, to: '../../x' }, { ...triple, baseSha: H('G') }, { ...triple, to: H('A') }, { ...triple, from: undefined }]) {
+    assert.throws(() => recordSuccessor(repo.dir, 12, bad), /40-hex/, JSON.stringify(bad));
+  }
+  assert.throws(() => recordSuccessor(repo.dir, 0, triple), /not a PR number/);
+  assert.throws(() => recordSuccessor(repo.dir, '12; rm', triple), /not a PR number/);
+  assert.equal(existsSync(join(repo.dir, '.git', 'pipeline')), false, 'nothing was created for an invalid record');
+
+  recordSuccessor(repo.dir, 12, triple);
+  const file = join(successorDir(repo.dir, 12), `${triple.to}.json`);
+  const good = JSON.parse(readFileSync(file, 'utf8'));
+  assert.ok(readSuccessor(repo.dir, 12, triple.to));
+  assert.equal(readSuccessor(repo.dir, 12, H('9')), null, 'head not recorded');
+  assert.equal(readSuccessor(repo.dir, 13, triple.to), null, 'other PR (no file)');
+  for (const head of ['', 'xyz', H('A'), `../pr-12/${triple.to}`, null, undefined, 5]) assert.equal(readSuccessor(repo.dir, 12, head), null, JSON.stringify(head));
+  const put = (v) => writeFileSync(file, typeof v === 'string' ? v : JSON.stringify(v));
+  for (const [name, content] of Object.entries({
+    corrupt: '{"version":1,',
+    'not an object': '[1]',
+    'wrong version': { ...good, version: 2 },
+    'recorded for another PR': { ...good, pr: 13 },
+    'to is another head': { ...good, to: H('7') },
+    'from is malformed': { ...good, from: 'nope' },
+    'baseSha is missing': { ...good, baseSha: undefined },
+  })) {
+    put(content);
+    assert.equal(readSuccessor(repo.dir, 12, triple.to), null, name);
+  }
+  assert.equal(readSuccessor('/no/such/dir', 12, triple.to), null, 'not a repo: never throws');
+});
+
+test('successor record: a file older than 30 days is pruned on the next write; a recent one and other PRs are kept', () => {
+  const repo = repoWithCommit();
+  const old = { from: H('1'), to: H('2'), baseSha: H('3') };
+  const recent = { from: H('4'), to: H('5'), baseSha: H('6') };
+  const now = new Date('2026-11-06T08:00:00.000Z');
+  recordSuccessor(repo.dir, 12, old, now);
+  recordSuccessor(repo.dir, 12, recent, now);
+  recordSuccessor(repo.dir, 13, old, now);
+  const age = (pr, to, days) => {
+    const t = new Date(now.getTime() - days * 86_400_000);
+    utimesSync(join(successorDir(repo.dir, pr), `${to}.json`), t, t);
+  };
+  age(12, old.to, 31);
+  age(12, recent.to, 29);
+  age(13, old.to, 40);
+  recordSuccessor(repo.dir, 12, { from: H('7'), to: H('8'), baseSha: H('9') }, now);
+  assert.equal(readSuccessor(repo.dir, 12, old.to), null, '31 days old: pruned');
+  assert.ok(readSuccessor(repo.dir, 12, recent.to), '29 days old: kept');
+  assert.ok(readSuccessor(repo.dir, 12, H('8')), 'the new one');
+  assert.ok(readSuccessor(repo.dir, 13, old.to), "another PR's directory is not touched");
+});
+
+test('successor record: it survives quarantineReviewDir (state recovery moves the review dir, not the git common dir)', () => {
+  const repo = repoWithCommit();
+  repo.write('.review/scratch.txt', 'x');
+  recordSuccessor(repo.dir, 12, triple);
+  quarantineReviewDir(repo.dir);
+  assert.equal(existsSync(join(repo.dir, '.review', 'scratch.txt')), false, 'the review dir was quarantined');
+  assert.ok(readSuccessor(repo.dir, 12, triple.to), 'the record is still there');
+});
+
+test("ownSuccessor: true only when recorded AND the head's parents are exactly [from, baseSha] on GitHub; every failure is false", () => {
+  const repo = repoWithCommit();
+  recordSuccessor(repo.dir, 12, triple);
+  const gh = (parents) => ({ commitParents: (c) => { assert.equal(c, triple.to); return parents; } });
+  const own = (g, head = triple.to, pr = 12) => ownSuccessor({ root: repo.dir, pr, head, gh: g });
+  assert.equal(own(gh([triple.from, triple.baseSha])), true);
+  assert.equal(own(gh([triple.baseSha, triple.from])), false, 'order matters: [head it was made from, base]');
+  assert.equal(own(gh([triple.from])), false, 'a single-parent push');
+  assert.equal(own(gh([triple.from, H('7')])), false, 'another base');
+  assert.equal(own(gh([triple.from, triple.baseSha, H('7')])), false, 'an octopus');
+  assert.equal(own(gh(undefined)), false);
+  assert.equal(own({ commitParents: () => { throw new Error('gh down'); } }), false, 'gh throws');
+  assert.equal(own({ commitParents: () => assert.fail('no record, no gh call') }, H('9')), false, 'head not recorded');
+  assert.equal(own({ commitParents: () => assert.fail('no record, no gh call') }, 'nothex'), false, 'non-hex head');
+  assert.equal(own(gh([triple.from, triple.baseSha]), triple.to, 13), false, 'another PR');
+  assert.equal(ownSuccessor({ root: '/no/such/dir', pr: 12, head: triple.to, gh: gh([triple.from, triple.baseSha]) }), false, 'no repo');
+});
+
+// ---- waitForTurn ---------------------------------------------------------------------------------------------------------------------------
+
+const MIN = 60_000;
+// A fake clock: sleep advances it, a check may cost `cost` ms. `answers` are the check's answers in turn (the last repeats).
+function turn(answers, { maxMs, cost = 0 } = {}) {
+  const t = { now: 0, starts: [], slept: [] };
+  let i = 0;
+  const run = () => waitForTurn({
+    maxMs,
+    now: () => t.now,
+    sleep: async (ms) => { t.slept.push(ms); t.now += ms; },
+    check: async () => { t.starts.push(t.now); const a = answers[Math.min(i, answers.length - 1)]; i += 1; t.now += cost; return a; },
+  });
+  return { t, run };
+}
+const BLOCKED = { error: 'queued-behind', blockedBy: [1400] };
+const UNREAD = { error: 'hold-unreadable', reason: 'x' };
+
+test('waitForTurn: the default poll is 5 minutes; front at once is one poll and no sleep', async () => {
+  assert.equal(HOLD_POLL_MS, 5 * MIN);
+  const { t, run } = turn([null], { maxMs: 60 * MIN });
+  assert.deepEqual(await run(), { outcome: 'front', polls: 1, waitedMs: 0, last: null });
+  assert.deepEqual(t.slept, []);
+});
+
+test('waitForTurn: front after 2 blocked polls = 3 polls at 0, 5, 10 minutes', async () => {
+  const { t, run } = turn([BLOCKED, BLOCKED, null], { maxMs: 60 * MIN });
+  const r = await run();
+  assert.deepEqual([r.outcome, r.polls, r.waitedMs, r.last], ['front', 3, 10 * MIN, null]);
+  assert.deepEqual(t.starts, [0, 5 * MIN, 10 * MIN]);
+  assert.deepEqual(t.slept, [5 * MIN, 5 * MIN]);
+});
+
+test('waitForTurn: max 6 min -> polls at 0 and 5 only, then timeout (the 10-min poll could not start by the deadline)', async () => {
+  const { t, run } = turn([BLOCKED], { maxMs: 6 * MIN });
+  const r = await run();
+  assert.deepEqual([r.outcome, r.polls, r.waitedMs], ['timeout', 2, 5 * MIN]);
+  assert.equal(r.last, BLOCKED);
+  assert.deepEqual(t.starts, [0, 5 * MIN]);
+});
+
+test('waitForTurn: max 12 min -> polls at 0, 5, 10; max 10 -> the poll AT the deadline still runs; max 4 -> one poll', async () => {
+  const twelve = turn([BLOCKED], { maxMs: 12 * MIN });
+  const r = await twelve.run();
+  assert.deepEqual([r.outcome, r.polls], ['timeout', 3]);
+  assert.deepEqual(twelve.t.starts, [0, 5 * MIN, 10 * MIN]);
+  const ten = turn([BLOCKED], { maxMs: 10 * MIN });
+  assert.equal((await ten.run()).polls, 3);
+  const four = turn([BLOCKED], { maxMs: 4 * MIN });
+  const r4 = await four.run();
+  assert.deepEqual([r4.outcome, r4.polls, r4.waitedMs], ['timeout', 1, 0]);
+  assert.deepEqual(four.t.slept, [], 'no sleep when the next poll cannot start in time');
+});
+
+test('waitForTurn: a check that takes 2 minutes shifts the next start by 2 minutes (the sleep is pollMs after the check ENDS)', async () => {
+  const { t, run } = turn([BLOCKED, BLOCKED, null], { maxMs: 60 * MIN, cost: 2 * MIN });
+  const r = await run();
+  assert.deepEqual(t.starts, [0, 7 * MIN, 14 * MIN], 'starts are >= 5 min apart');
+  assert.deepEqual(t.slept, [5 * MIN, 5 * MIN]);
+  assert.equal(r.outcome, 'front');
+  assert.equal(r.waitedMs, 16 * MIN, 'the last check ran 2 minutes');
+  const tight = turn([BLOCKED], { maxMs: 11 * MIN, cost: 2 * MIN });
+  const rt = await tight.run();
+  assert.deepEqual(tight.t.starts, [0, 7 * MIN], 'at minute 9 the next start (14) would pass the deadline (11)');
+  assert.equal(rt.outcome, 'timeout');
+});
+
+test('waitForTurn: two unreadable answers in a row -> unreadable (fail closed); one unreadable then front -> front; unreadable between blocked polls resets', async () => {
+  const two = turn([UNREAD, UNREAD], { maxMs: 60 * MIN });
+  const r = await two.run();
+  assert.deepEqual([r.outcome, r.polls, r.waitedMs], ['unreadable', 2, 5 * MIN]);
+  assert.equal(r.last, UNREAD);
+
+  const recovered = turn([UNREAD, null], { maxMs: 60 * MIN });
+  assert.equal((await recovered.run()).outcome, 'front');
+
+  const reset = turn([UNREAD, BLOCKED, UNREAD, null], { maxMs: 60 * MIN });
+  const rr = await reset.run();
+  assert.deepEqual([rr.outcome, rr.polls], ['front', 4], 'never two in a row');
+
+  const lateTimeout = turn([UNREAD], { maxMs: 6 * MIN });
+  assert.equal((await lateTimeout.run()).outcome, 'unreadable', 'two in a row at 0 and 5 beats the deadline');
+  const once = turn([UNREAD], { maxMs: 4 * MIN });
+  assert.equal((await once.run()).outcome, 'timeout', 'one unreadable, no time for a second');
+});
+
+test('waitForTurn: a missing or non-finite maxMs is refused (an unbounded wait must be asked for in words)', async () => {
+  for (const maxMs of [undefined, NaN, Infinity, -1]) await assert.rejects(waitForTurn({ check: async () => BLOCKED, maxMs, sleep: async () => {} }), /finite maxMs/, String(maxMs));
 });

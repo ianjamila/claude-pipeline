@@ -480,3 +480,65 @@ test('merge: the update step is bounded to one cycle (a head that is still behin
   assert.equal(puts(s).length, 1);
   assert.deepEqual(s.mergeCalls(), []);
 });
+
+// ---- successors: the proof of each accepted cycle, handed over at once ----------------------------------------------------------------
+
+test('successors: one entry per accepted cycle, in order, with [from, to, baseSha]; onSuccessor gets the same triple once per cycle', async () => {
+  const w = world({ behind: [1, 1, 0] });
+  const seen = [];
+  const r = await run(w, { expectHead: A, onSuccessor: (s) => seen.push(s) });
+  assert.equal(r.outcome, 'up-to-date');
+  const expected = [{ from: A, to: B, baseSha: BASE_SHA }, { from: B, to: C, baseSha: BASE_SHA }];
+  assert.deepEqual(r.successors, expected);
+  assert.deepEqual(seen, expected);
+  assert.equal('successorWarnings' in r, false, 'no warnings when nothing failed');
+  const none = await run(world({ behind: [0] }), { expectHead: A, onSuccessor: () => assert.fail('nothing was updated') });
+  assert.deepEqual(none.successors, []);
+});
+
+test('successors: onSuccessor runs right after the parents proof, BEFORE the checks read and before the next cycle reads anything', async () => {
+  const w = world({ behind: [1, 0] });
+  const events = [];
+  const { checks, compare } = w.gh;
+  w.gh.checks = (...a) => { events.push('checks'); return checks(...a); };
+  w.gh.compare = (...a) => { events.push('compare'); return compare(...a); };
+  await run(w, { expectHead: A, onSuccessor: (s) => events.push(`record ${s.to}`) });
+  assert.deepEqual(events.slice(0, 3), ['compare', `record ${B}`, 'checks'], 'the record precedes the first checks read');
+  assert.ok(events.indexOf(`record ${B}`) < events.lastIndexOf('compare'), 'and the next cycle\'s compare');
+});
+
+test('successors: the record exists even when the checks read then throws (GitHub unavailable after an accepted update)', async () => {
+  const w = world({ behind: [1, 0] });
+  w.gh.checks = () => { throw new GhError({ code: 1, stderr: 'HTTP 502 bad gateway', args: ['pr', 'checks'] }); };
+  const seen = [];
+  await assert.rejects(run(w, { expectHead: A, onSuccessor: (s) => seen.push(s) }), GhError);
+  assert.deepEqual(seen, [{ from: A, to: B, baseSha: BASE_SHA }], 'the proof was handed over before the failing read');
+});
+
+test('successors: a checks-failed outcome still lists the accepted update', async () => {
+  const r = await run(world({ checks: [[{ name: 'ci', bucket: 'fail' }]] }), { expectHead: A });
+  assert.equal(r.outcome, 'checks-failed');
+  assert.deepEqual(r.successors, [{ from: A, to: B, baseSha: BASE_SHA }]);
+});
+
+test('successors: a head that is NOT the merge of the base into the old head is no successor (no record, no entry)', async () => {
+  const w = world({ race: true });
+  const r = await run(w, { expectHead: A, onSuccessor: () => assert.fail('a raced head must never be recorded') });
+  assert.equal(r.outcome, 'head-moved');
+  assert.deepEqual(r.successors, []);
+  const refused = await run(world({ update: 'conflict' }), { expectHead: A, onSuccessor: () => assert.fail('no update, no successor') });
+  assert.deepEqual(refused.successors, []);
+});
+
+test('successors: an onSuccessor that throws never changes the outcome; the failure is listed in successorWarnings, and later cycles still call it', async () => {
+  const w = world({ behind: [1, 1, 0] });
+  let calls = 0;
+  const r = await run(w, { expectHead: A, onSuccessor: () => { calls += 1; throw new Error('disk full'); } });
+  assert.equal(r.outcome, 'up-to-date');
+  assert.equal(r.ok, true);
+  assert.equal(r.cycles, 2);
+  assert.equal(calls, 2);
+  assert.equal(r.successors.length, 2);
+  assert.equal(r.successorWarnings.length, 2);
+  assert.match(r.successorWarnings[0], new RegExp(`${B}.*disk full`));
+});
