@@ -8,7 +8,7 @@
 // git.tree (nothing changed in the working tree since verify ran) and contentHash (the review covered exactly
 // this patch). Each one defeats a different mistake, so none is redundant.
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gh as ghRun } from './proc.mjs';
 import { checkGuardVerdict, GUARD_CONTEXT_CHECKS } from './guard-provenance.mjs';
@@ -27,7 +27,7 @@ import { readPublished, reviewContentHash as stateContentHash } from './review-p
 import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
 import { skipOf } from './verify-steps.mjs';
-import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
+import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, historyIntegrityProblems, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
 import { ownerItemsDigest, rulingsBlockDigest } from '../hooks/lib/owner-go.mjs';
 
 export const GATE_FILE = 'final-gate.json';
@@ -837,20 +837,7 @@ function scanRangeCheck({ root, gh, pr, diff, info, explicit }) {
   const problems = [];
   const d = diff();
   if (!d.ok) problems.push(d.error);
-  const inspect = (what, fn) => {
-    try {
-      return fn();
-    } catch (err) {
-      problems.push(`could not inspect ${what}: ${firstLine(err)}`);
-      return null;
-    }
-  };
-  const replaced = inspect('replace refs', () => git(['for-each-ref', '--count=1', '--format=%(refname)', 'refs/replace/'], o).trim());
-  if (replaced) problems.push(`this repository has replace refs (${replaced}): they can show a history other than GitHub's`);
-  const grafts = inspect('the grafts file', () => resolve(root, git(['rev-parse', '--git-path', 'info/grafts'], o).trim()));
-  if (grafts && existsSync(grafts)) problems.push('this repository has a grafts file (.git/info/grafts): it can show a history other than GitHub\'s');
-  const shallow = inspect('whether the clone is shallow', () => git(['rev-parse', '--is-shallow-repository'], o).trim());
-  if (shallow === 'true') problems.push('this repository is a shallow clone: its history is cut short, so the merge-base and the diff cannot be trusted (git fetch --unshallow)');
+  problems.push(...historyIntegrityProblems(o));
   if (d.ok) {
     let listed = null;
     let listFailed = false;

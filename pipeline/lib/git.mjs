@@ -8,8 +8,8 @@
 // Reads go through proc.run, so output is decoded as UTF-8: invalid UTF-8 inside a diffed text-looking file is not
 // byte-exact (binary files are: --binary emits ASCII).
 import { createHash } from 'node:crypto';
-import { openSync, readSync, closeSync, lstatSync, readlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, openSync, readSync, closeSync, lstatSync, readlinkSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { run } from './proc.mjs';
 import { parseUnifiedDiff } from './diff.mjs';
 import { MAX_BLOCKS, SearchCap, checkSelection, makeBudget, parseConflictBlocks, splitLines } from './resolution.mjs';
@@ -105,6 +105,29 @@ export function mergeBase(a, b, o) {
 // not know (exit 128) still throws, so a missing object can never read as "no".
 export const isAncestor = (a, b, o) => gitOrNull(['merge-base', '--is-ancestor', assertRef(a, ['merge-base', a, b]), assertRef(b, ['merge-base', a, b])], 1, o) !== null;
 
+// Can this clone show a different history than GitHub has? Replace refs, a grafts file and a shallow clone each can; the
+// --owner-go scan-range check and the approval carry (approval-carry.mjs) both refuse on any of them. -> an array of
+// plain-English problems (empty = none). A check that could not run is itself a problem (fail closed). `o` is the usual
+// { cwd } of the real repository. (GIT_NO_REPLACE_OBJECTS already makes our own reads ignore replace refs.)
+export function historyIntegrityProblems(o) {
+  const problems = [];
+  const inspect = (what, fn) => {
+    try {
+      return fn();
+    } catch (err) {
+      problems.push(`could not inspect ${what}: ${String(err?.message ?? err).split('\n')[0]}`);
+      return null;
+    }
+  };
+  const replaced = inspect('replace refs', () => git(['for-each-ref', '--count=1', '--format=%(refname)', 'refs/replace/'], o).trim());
+  if (replaced) problems.push(`this repository has replace refs (${replaced}): they can show a history other than GitHub's`);
+  const grafts = inspect('the grafts file', () => resolve(o.cwd, git(['rev-parse', '--git-path', 'info/grafts'], o).trim()));
+  if (grafts && existsSync(grafts)) problems.push('this repository has a grafts file (.git/info/grafts): it can show a history other than GitHub\'s');
+  const shallow = inspect('whether the clone is shallow', () => git(['rev-parse', '--is-shallow-repository'], o).trim());
+  if (shallow === 'true') problems.push('this repository is a shallow clone: its history is cut short, so the merge-base and the diff cannot be trusted (git fetch --unshallow)');
+  return problems;
+}
+
 // The installed git as [major, minor], or null when it prints something else. `merge-tree --write-tree` needs 2.38.
 export function gitVersion(o) {
   const m = /^git version (\d+)\.(\d+)/.exec(git(['--version'], o).trim());
@@ -119,7 +142,7 @@ export const supportsMergeTreeWrite = (o) => {
 // text) or merge.renormalize would change the tree, and the tree id is what a review round records as its base. So would the
 // settings merge-ort reads for rename detection (merge.renames, merge.directoryRenames, merge.renameLimit / diff.renameLimit):
 // they are pinned to git's own documented defaults, so a default-config machine gets the same tree id as before.
-const MERGE_CONFIG = [
+export const MERGE_CONFIG = [
   '-c', 'merge.conflictStyle=merge', '-c', 'merge.renormalize=false',
   '-c', 'merge.renames=true', '-c', 'merge.directoryRenames=conflict', '-c', 'merge.renameLimit=7000',
 ];
