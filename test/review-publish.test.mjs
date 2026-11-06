@@ -353,7 +353,7 @@ test('state show: a published Claude ruling tightened to ACCEPT, or overridden b
     assert.deepEqual(w.state(w.A), JSON.parse(JSON.stringify(ahead)), `${name}: the local decision is untouched`);
     assert.equal(readdirSync(join(w.A, '.review')).filter((n) => n.startsWith('stale-')).length, 0, `${name}: nothing was quarantined`);
     assertExit(w.comment(w.A), 0, name);
-    assert.equal(w.pub().rounds[0].items[0].final.decision, 'ACCEPT', `${name}: published now`);
+    assert.equal(w.pub().rounds[0].items[0].final.decision, ahead.rounds[0].items[0].final.decision, `${name}: published now`);
     assert.equal(w.show(w.A).json.source, 'local', name);
   }
 });
@@ -390,6 +390,8 @@ test('state show: the same local change is quarantined when the PR moved on, and
 const followedUp = () => claudeFinal({ decision: 'FOLLOW-UP', reason: 'worth a ticket', claude: { ruledAt: 'later', cause: 'low-confidence', critical: false, overruled: claudeFinal() } });
 const tightenedTwice = () => claudeFinal({ decision: 'ACCEPT', reason: 'real after all', claude: { ruledAt: 'later still', cause: 'low-confidence', critical: false, overruled: followedUp() } });
 const ownerOverTightened = () => ({ ...overridden(), overruled: tightened() });
+// `n` successive Claude re-rulings (FOLLOW-UP each time) nesting `bottom`: the writer has no limit on how often Claude may re-rule a published dismissal.
+const deepClaude = (n, bottom = claudeFinal()) => { let f = bottom; for (let i = 0; i < n; i++) f = claudeFinal({ decision: 'FOLLOW-UP', reason: `step ${i}`, claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: f } }); return f; };
 const ownerOverWaiting = () => ({ decision: 'ACCEPT', by: 'owner', needsHuman: false, reason: 'owner says fix', ownerQuote: 'R1-B1: accept', ruledAt: 'later', overruled: waiting() });
 
 test('state show: a chain of unpublished Claude / owner steps over the published final is kept (local-ahead) and publishes as is', (t) => {
@@ -398,6 +400,8 @@ test('state show: a chain of unpublished Claude / owner steps over the published
     ['Claude tightening then owner override', claudeRejected(), ownerOverTightened()],
     ['two Claude steps then owner override', claudeRejected(), { ...overridden(), overruled: tightenedTwice() }],
     ['owner over a waiting item', waitingState(), ownerOverWaiting()],
+    ['twelve Claude steps (no depth cap)', claudeRejected(), deepClaude(12)],
+    ['forty Claude steps then owner override', claudeRejected(), { ...overridden(), overruled: deepClaude(40) }],
   ]) {
     const w = world(t);
     saveState(w.A, base);
@@ -411,13 +415,12 @@ test('state show: a chain of unpublished Claude / owner steps over the published
     assert.deepEqual(w.state(w.A), JSON.parse(JSON.stringify(ahead)), `${name}: the local decision is untouched`);
     assert.equal(readdirSync(join(w.A, '.review')).filter((n) => n.startsWith('stale-')).length, 0, `${name}: nothing was quarantined`);
     assertExit(w.comment(w.A), 0, name);
-    assert.equal(w.pub().rounds[0].items[0].final.decision, 'ACCEPT', `${name}: published now`);
+    assert.equal(w.pub().rounds[0].items[0].final.decision, ahead.rounds[0].items[0].final.decision, `${name}: published now`);
     assert.equal(w.show(w.A).json.source, 'local', name);
   }
 });
 
 test('state show: a chain that does not reach the published final, loosens a protected ACCEPT without the owner, or sits on a moved PR is quarantined', (t) => {
-  const deep = (n) => { let f = claudeFinal(); for (let i = 0; i < n; i++) f = claudeFinal({ decision: 'FOLLOW-UP', reason: `step ${i}`, claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: f } }); return f; };
   const foreign = claudeFinal({ decision: 'ACCEPT', claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: claudeFinal({ decision: 'FOLLOW-UP', reason: 'not the published one', claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: waiting() } }) } });
   const loosened = claudeFinal({ decision: 'REJECT', reason: 'loosened', claude: { ruledAt: 'x', cause: 'low-confidence', critical: true, overruled: tightened() } });
   const claudeOverOwner = claudeFinal({ decision: 'REJECT', reason: 'back again', claude: { ruledAt: 'x', cause: 'low-confidence', critical: true, overruled: overridden() } });
@@ -425,7 +428,7 @@ test('state show: a chain that does not reach the published final, loosens a pro
     ['never reaches the published final', claudeRejected(), foreign, false],
     ['loosens a protected ACCEPT mid-chain', claudeRejected(), loosened, false],
     ['Claude over an owner ruling', claudeRejected(), claudeOverOwner, false],
-    ['deeper than the walk bound', claudeRejected(), deep(12), false],
+    ['a long chain that never reaches the published final', claudeRejected(), deepClaude(30, waiting()), false],
     ['two Claude steps on a moved PR', claudeRejected(), tightenedTwice(), true],
     ['owner over a waiting item on a moved PR', waitingState(), ownerOverWaiting(), true],
   ]) {

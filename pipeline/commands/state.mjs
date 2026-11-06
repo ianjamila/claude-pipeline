@@ -66,9 +66,9 @@ function recoverState(root, pr, ctx) {
 // review forcing ACCEPT over it, or the owner's typed override (plan E6) of a Claude final or of an item still waiting for a human, each of which records the
 // final it replaced (final.claude.overruled / final.overruled). Several such steps may be unpublished (a Claude REJECT re-ruled FOLLOW-UP, then ACCEPT, then
 // the owner), each nesting the previous final: the chain is walked back until it reaches the published final. With the published copy equal to this copy's
-// baseline that is plain local progress, not a superseded copy: it must be published, not quarantined. Anything that does not reach the published final
-// within MAX_CHAIN steps, or whose steps are not each a valid continuation, stays a superseded copy (fail closed).
-const MAX_CHAIN = 8;
+// baseline that is plain local progress, not a superseded copy: it must be published, not quarantined. The chain is a parsed JSON tree, so it cannot cycle and
+// the walk ends on its own, however many times Claude re-ruled (the writer sets no limit). Anything that ends without reaching the published final, or whose
+// steps are not each a valid continuation, stays a superseded copy (fail closed).
 // One step: `cur` replaced `prev`. The owner may rule over a Claude / forced final or a final waiting for a human; Claude may not loosen a protected
 // ACCEPT, and may not overrule the owner. The caller has checked that `prev` is the final `cur` names as the one it replaced.
 const validStep = (cur, prev) => {
@@ -84,13 +84,12 @@ const continuesPublished = (mine, theirs) => {
   if (!isProtectedFinal(theirs) && published.needsHuman !== true) return false;
   const target = canonicalJson(published);
   let cur = mine.final;
-  for (let depth = 0; depth < MAX_CHAIN; depth++) {
+  for (;;) {
     const prev = replacedBy(cur);
     if (!isObjectLike(prev) || !validStep(cur, prev)) return false;
     if (canonicalJson(prev) === target) return true;
     cur = prev;
   }
-  return false;
 };
 const isObjectLike = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
