@@ -109,3 +109,4 @@ full record.
 - 2026-11-05 · #166 · review: lines added to listed documents after the last round need no new round · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge
 - 2026-11-05 · #172 · Unique test-repo heads, U+FFFD path refusal, old-git skip, guard deny names the line (#147 #151 #152 #161) · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
 - 2026-11-06 · #180 · Merge hold: take it at hand-off, honour hold:queued-behind in P merge / P update-branch · risk high · rounds 9 · arbiter 6 · awaiting-owner-merge
+2026-11-06 claude-pipeline #184 claude-rulings-v1: awaiting-owner-merge, 4 rounds (Codex+Fable), 6 fixed, 2 owner-rejected, 1 follow-up #186, CI green, $26.3
