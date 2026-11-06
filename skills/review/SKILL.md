@@ -136,11 +136,12 @@ Never type, paraphrase or forge the owner's words, and never run Codex outside `
    Base moved ⇒ `P update-branch --pr N`, `git pull --ff-only`, review again if content changed. With `merge.hold_command`, update-branch takes this PR's merge hold right
    before the update (output `hold`), so another PR's merge cannot undo the catch-up's CI round. The hold stays through that pipeline-made head (`P merge-hold --release --reason new-commits`
    answers `kept: own-successor` for it, so run that release whenever you push; it decides). update-branch releases the hold itself on `checks-failed` (`ci-failed`) and `rebase-needed` (`update-conflict`):
-   `holdRelease` not `confirmed` ⇒ run that release once yourself. `head-timeout`, `checks-timeout`, `cycle-cap`, `head-moved` keep it (retry, or re-read: a PR-side push ⇒ the `new-commits` release).
+   `holdRelease` not `confirmed` ⇒ run that release once yourself, from this PR's own worktree on its branch (a provider may refuse a release from any other checkout or a detached HEAD: EagleWatch does). `head-timeout`, `checks-timeout`, `cycle-cap`, `head-moved` keep it (retry, or re-read: a PR-side push ⇒ the `new-commits` release).
    `outcome: "queued-behind"` (another PR's older merge hold is ahead; `blockedBy`, `doNotUpdate`) ⇒ never update past it; wait your turn:
    `P job start turn -- node ~/.claude/pipeline/bin/pipeline.mjs merge-hold --pr N --check --wait` (one check every 5 min, up to 120 min), `P job wait turn --run-id <runId> --timeout 540`
    until done. `outcome: "front"` ⇒ `P update-branch --pr N` again. `timeout` / `unreadable` ⇒ `P merge-hold --pr N --release --reason queued-behind`, report it as in 3's
-   **Queued behind** and stop. `hold-unreadable` ⇒ retry once after 60 s (a hold this call took is already released: `holdRelease`), then tell the owner and stop.
+   **Queued behind** and stop. `hold-unreadable` ⇒ retry once after 60 s (a confirmed hold is kept, `holdTaken: true`; a take that may have half-written one is already released: `holdRelease`), then tell the owner and stop
+   (with `holdTaken: true`, first `P merge-hold --pr N --release --reason hold-unreadable`).
 3. **STOP** (outcome `awaiting-owner-merge`; `owner_approval: label` with a blocking item parks instead, no merge request): run the stop ritual first, then tell the owner in plain English what changed, the PR link, the review outcome and
    follow-up issues.
    Then Read `reference/owner-merge.md` (section 3.3) and end the reply exactly as it says: which ending applies depends on the item note from 1.5 (as refreshed in step 2)
