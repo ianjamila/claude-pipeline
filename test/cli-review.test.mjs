@@ -18,6 +18,7 @@ import { contentHash } from '../pipeline/lib/git.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { currentContentHash, excerptWindow, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
+import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
@@ -1697,7 +1698,7 @@ test('review-complete: a gh failure while removing the label is exit 3, not succ
   assertExit(w.cli(['review-complete', '--pr', '7']), 3);
 });
 
-test('review-complete: posts the marker comment with {contentHash, base, head, rounds, codexModel, modelProofDigest}; an identical one is reused', (t) => {
+test('review-complete: posts the marker comment with {contentHash, base, head, rounds, codexModel, modelProofDigest, stateHash}; an identical one is reused', (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
   assertExit(w.codex(1, findingsOf()), 0);
   const r = w.cli(['review-complete', '--pr', '7']);
@@ -1707,9 +1708,10 @@ test('review-complete: posts the marker comment with {contentHash, base, head, r
   const [body] = postedBodies(w);
   assert.ok(body.startsWith('<!-- claude-pipeline:review-complete v1 -->\n'), body);
   const record = reviewJson(body);
-  assert.deepEqual(Object.keys(record), ['contentHash', 'base', 'head', 'rounds', 'codexModel', 'modelProofDigest']);
+  assert.deepEqual(Object.keys(record), ['contentHash', 'base', 'head', 'rounds', 'codexModel', 'modelProofDigest', 'stateHash']);
   assert.deepEqual(record, {
     contentHash: w.state().rounds[0].contentHashAtToHead, base: w.base, head: w.head, rounds: 1, codexModel: 'gpt-6-astra', modelProofDigest: null,
+    stateHash: reviewContentHash(w.state()), // the state review-complete published: the owner-go check binds the marker to it
   });
   assert.deepEqual(r.json.review, record);
   // The hash is the one a guard can recompute from git alone: contentHash(base, head) minus the agent log.
