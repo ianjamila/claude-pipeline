@@ -20,7 +20,7 @@ import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
 import { currentContentHash, refreshBaseRef, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
-import { publishTriage } from '../lib/review-publish.mjs';
+import { publishTriage, reviewContentHash } from '../lib/review-publish.mjs';
 
 export const meta = {
   summary: 'post the review-complete comment (and remove awaiting-review) once the review is valid for the current content',
@@ -89,6 +89,8 @@ export function reviewRecord(state, { contentHash, base, head, modelProofs, defa
     rounds: state.rounds.length,
     codexModel: typeof last?.codexModel === 'string' && last.codexModel !== '' ? last.codexModel : defaultCodexModel,
     modelProofDigest: modelProofs.length > 0 ? createHash('sha256').update(JSON.stringify(modelProofs)).digest('hex') : null,
+    // The review state this marker vouches for (the one just published): the owner-go check refuses a state republished after it.
+    stateHash: reviewContentHash(state),
     // Only when there are rulings, so the marker of an ordinary review is byte-identical to what it always was.
     ...(rulings === 'none' ? {} : { rulingsDigest: rulings }),
   };

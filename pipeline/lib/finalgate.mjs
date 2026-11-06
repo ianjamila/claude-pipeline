@@ -915,7 +915,8 @@ export function ownerItemsCheck({ items, hardstops, integrity, label }) {
 // ---- review-complete (plan 2026-11-05-claude-rulings E5) -------------------------------------------------------------------------------
 // The owner-go route never read the review state. Once the review skill ran for this PR it must have ENDED (review-complete), with this machine's state equal to the one the PR holds, and with every
 // dismissal the owner is shown. Work that never ran the review skill (no review comment by us, no local state for the PR) passes unchanged. Grants and the Fable lane are NOT re-proved here: the
-// marker for this very content plus state equality already prove review-complete checked them.
+// marker for this very content, issued for this very review state (its stateHash and round count), plus state equality already prove review-complete checked them on exactly what is judged here.
+// Equality of the local and the published state alone would not: a state republished after the marker (`comment --kind triage`) is equal on both sides but was never checked.
 const NO_RULINGS = Object.freeze({ block: '', digest: 'none', blockDigest: 'none', count: 0 });
 const stripRulings = ({ rulings, ...rest }) => rest;
 const rulingsOf = (state) => {
@@ -959,7 +960,9 @@ export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep 
     if (!m.found) return `the review has not been completed on this PR (no review-complete comment): ${RUN}`;
     if (m.record === null) return `${m.reason}: ${RUN}`;
     if (m.record.contentHash !== liveHash) return `the review-complete comment is for other content (${short(m.record.contentHash)}, now ${short(liveHash)}): ${RUN}`;
+    if (m.record.stateHash === 'none') return `the review-complete comment carries no review-state hash (written by an older pipeline), so it cannot show it covers this state: ${RUN}`;
     if (p.hash === null || p.hash !== mine) return `the review state on this machine differs from the one published on the PR: ${RUN} (it publishes this copy first), or restore the published one with \`pipeline state show --pr ${pr}\``;
+    if (m.record.stateHash !== mine || m.record.rounds !== local.rounds.length) return `the review-complete comment was issued for another review state (${short(m.record.stateHash)} with ${m.record.rounds} round(s) there, ${short(mine)} with ${local.rounds.length} now: the state was republished or changed after it): ${RUN}`;
     if (m.record.rulingsDigest !== rulings.digest) return `the review-complete comment does not carry the current rulings (${m.record.rulingsDigest === 'none' ? 'none' : short(m.record.rulingsDigest)} there, ${rulings.digest === 'none' ? 'none' : short(rulings.digest)} now): ${RUN}`;
     return null;
   };

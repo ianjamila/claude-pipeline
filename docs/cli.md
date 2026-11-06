@@ -397,8 +397,9 @@ pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused
   confirmed by a later round, then publishes the triage state when the PR holds a different one (exit 1 {error:stale-publication} when the PR holds a state this
   copy did not publish or restore: run `pipeline state show --pr N`), and only then posts the marker. The record carries rulingsDigest only when there are rulings
   the checked-out HEAD must be the head GitHub holds for the PR; the PR must have had every Fable pass its risk or paths need
-  the comment starts with the line `<!-- claude-pipeline:review-complete v1 -->` and carries the JSON {contentHash, base, head, rounds, codexModel, modelProofDigest}
-  (base = the merge base the content hash is measured from; modelProofDigest = sha256 of the Fable model proofs, null when no Fable pass ran);
+  the comment starts with the line `<!-- claude-pipeline:review-complete v1 -->` and carries the JSON {contentHash, base, head, rounds, codexModel, modelProofDigest, stateHash}
+  (base = the merge base the content hash is measured from; modelProofDigest = sha256 of the Fable model proofs, null when no Fable pass ran; stateHash = the hash of the review state the marker
+  was issued for: the owner-go review-complete check refuses a state republished after the marker, and a marker from before the field, until `review-complete` is run again);
   an identical latest comment of ours is reused, not posted again; exit 3 when GitHub is unavailable or the label is still on the PR after removal
   a round past review.max_rounds must carry the owner's extra-round grant (codex-review records it), re-proved here against the owner's record and its marker on THIS machine (the
   same check as the final gate's review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise

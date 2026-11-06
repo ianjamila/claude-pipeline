@@ -19,6 +19,7 @@ import { rulingsBlock } from '../pipeline/lib/triage.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { withReviewLock } from '../pipeline/lib/review-context.mjs';
+import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
@@ -270,7 +271,7 @@ test('review-complete: a legacy marker (no rulingsDigest) passes with no rulings
   assert.equal((await none.check()).ok, true);
   const arb = await checkWorld({ items: [arbiterItem()] });
   const legacy = arb.published();
-  legacy[1] = comment(2, markerBody({ contentHash: arb.hash, head: arb.head, base: arb.baseTip, digest: 'none' }), { at: '2026-11-05T10:05:00Z' });
+  legacy[1] = comment(2, markerBody({ contentHash: arb.hash, head: arb.head, base: arb.baseTip, digest: 'none', stateHash: reviewContentHash(arb.st) }), { at: '2026-11-05T10:05:00Z' });
   refusal(await arb.check(gh(legacy)), /rulings.*review-complete --pr 12/);
   assert.equal((await arb.check(gh(arb.published()))).ok, true, 'cured by the marker review-complete writes');
 });
@@ -290,6 +291,22 @@ test('review-complete: the local state must equal the published one (a late loca
   let always = 0;
   refusal(await w.check({ viewer: () => 'me', listComments: () => { always += 1; return [full[0]]; } }), /review-complete --pr 12/);
   assert.equal(always, 2, 'never more than one re-read');
+});
+
+test('review-complete (R5-B1): the marker is bound to the state it was issued for: a state republished after it refuses, as does a marker with no state hash or another round count', async () => {
+  const w = await checkWorld({ items: [claudeItem()] });
+  const ok = await w.check();
+  assert.equal(ok.ok, true, ok.detail);
+  // a state republished after the marker (comment --kind triage): local and published agree, but the marker was issued for the old one
+  const later = rulingState({ hash: w.hash, items: [claudeItem({ final: { ...claudeItem().final, reason: 'republished after the marker' } })] });
+  saveState(w.repo.dir, later);
+  const marker = { stateHash: reviewContentHash(w.st) };
+  refusal(await w.check(gh(w.published({ state: later, marker }))), /issued for another review state.*review-complete --pr 12/);
+  assert.equal((await w.check(gh(w.published({ state: later })))).ok, true, 'a marker issued for that very state passes');
+  // a marker from before the field cannot prove it
+  refusal(await w.check(gh(w.published({ state: later, marker: { stateHash: 'none' } }))), /no review-state hash.*review-complete --pr 12/);
+  // the round count is bound too
+  refusal(await w.check(gh(w.published({ state: later, marker: { rounds: 2 } }))), /2 round\(s\).*review-complete --pr 12/);
 });
 
 test('review-complete: an unimplemented ACCEPT, a forced ACCEPT not implemented and a Claude FOLLOW-UP without an issue refuse; the issue cures the last', async () => {

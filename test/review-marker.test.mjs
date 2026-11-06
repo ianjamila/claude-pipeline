@@ -19,12 +19,16 @@ test('one marker, one status name everywhere', () => {
 });
 
 // The reader adds the rulings digest ('none' when the marker has none: every marker written before rulings, and every review without any).
-const READ = { ...RECORD, rulingsDigest: 'none' };
+// Likewise stateHash ('none' for a marker written before the field: lib/review-marker.mjs).
+const READ = { ...RECORD, rulingsDigest: 'none', stateHash: 'none' };
 
 test('parseReviewRecord round-trips what review-complete posts, with or without a Fable digest', () => {
   assert.deepEqual(parseReviewRecord(reviewCompleteBody(RECORD)), READ);
   const fable = { ...RECORD, modelProofDigest: 'd'.repeat(64) };
-  assert.deepEqual(parseReviewRecord(reviewCompleteBody(fable)), { ...fable, rulingsDigest: 'none' });
+  assert.deepEqual(parseReviewRecord(reviewCompleteBody(fable)), { ...fable, rulingsDigest: 'none', stateHash: 'none' });
+  // the state hash the marker was issued for is read back as written
+  const bound = { ...RECORD, stateHash: 'e'.repeat(64) };
+  assert.equal(parseReviewRecord(reviewCompleteBody(bound)).stateHash, 'e'.repeat(64));
   assert.deepEqual(parseReviewRecord(reviewCompleteBody(RECORD).replace(/\n/g, '\r\n')), READ, 'CRLF line ends');
   // extra keys are dropped, not trusted
   assert.deepEqual(Object.keys(parseReviewRecord(reviewCompleteBody({ ...RECORD, approved: true }))), Object.keys(READ));
@@ -38,7 +42,7 @@ test('parseReviewRecord refuses anything that is not exactly the shape', () => {
     body.replace(JSON.stringify(RECORD), '[]'), body.replace(JSON.stringify(RECORD), 'null'),
     ...[
       { contentHash: 'c'.repeat(63) }, { contentHash: 'C'.repeat(64) }, { base: 'b'.repeat(39) }, { head: 'A'.repeat(40) }, { rounds: 0 }, { rounds: 1.5 },
-      { rounds: '2' }, { codexModel: '' }, { codexModel: 7 }, { modelProofDigest: 'd'.repeat(63) }, { modelProofDigest: undefined },
+      { rounds: '2' }, { codexModel: '' }, { codexModel: 7 }, { modelProofDigest: 'd'.repeat(63) }, { modelProofDigest: undefined }, { stateHash: 'E'.repeat(64) }, { stateHash: 'e'.repeat(63) }, { stateHash: null },
     ].map((over) => reviewCompleteBody({ ...RECORD, ...over })),
   ]) assert.equal(parseReviewRecord(bad), null, JSON.stringify(bad));
 });

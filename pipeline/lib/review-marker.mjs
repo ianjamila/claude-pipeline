@@ -4,11 +4,13 @@
 // from posting it any other way.
 //
 // The comment: the marker line, one line of prose, then a ```json fence holding ONE line of JSON
-//   { contentHash, base, head, rounds, codexModel, modelProofDigest[, rulingsDigest] }
+//   { contentHash, base, head, rounds, codexModel, modelProofDigest, stateHash[, rulingsDigest] }
 // contentHash is git.mjs#reviewContentHash of the reviewed head (merge base -> head, agent log excluded); base is that merge
 // base; modelProofDigest is the sha256 of the Fable model proofs, or null when no Fable pass ran. rulingsDigest (lib/triage.mjs#rulingsDigest,
 // the dismissed BLOCKING / security items and who decided them) is written only when there are some: an ordinary marker has no such field,
-// and a marker without it reads as 'none' (parseReviewRecord).
+// and a marker without it reads as 'none' (parseReviewRecord). stateHash (lib/review-publish.mjs#reviewContentHash) is the hash of the review state the marker was
+// issued for: the owner-go check (finalgate.mjs#reviewCompletionCheck) requires it to equal the state it is judging, so a state republished after the marker
+// does not ride on it. A marker written before the field reads as 'none' and is valid here (the CI status only judges the content) but refused there.
 //
 // Which comment counts (latestReviewComment): the NEWEST marker comment by an allowed author (the repo owner of a user-owned
 // repo, or a login in ci.approvers: the same rule as approval labels), and only if it was never edited. A newer comment
@@ -46,9 +48,12 @@ export function parseReviewRecord(body) {
   if (r.modelProofDigest !== null && !HASH.test(String(r.modelProofDigest))) return null;
   // Absent = 'none' (a marker written before rulings, or for a review with none); present must be a 64-hex digest.
   if (r.rulingsDigest !== undefined && !(typeof r.rulingsDigest === 'string' && HASH.test(r.rulingsDigest))) return null;
+  // Absent = 'none' (a marker written before the field); present must be a 64-hex hash.
+  if (r.stateHash !== undefined && !(typeof r.stateHash === 'string' && HASH.test(r.stateHash))) return null;
   return {
     contentHash: r.contentHash, base: r.base, head: r.head, rounds: r.rounds, codexModel: r.codexModel, modelProofDigest: r.modelProofDigest,
     rulingsDigest: r.rulingsDigest === undefined ? 'none' : r.rulingsDigest,
+    stateHash: r.stateHash === undefined ? 'none' : r.stateHash,
   };
 }
 
