@@ -189,7 +189,20 @@ test('establishBaseline (R6-F1): with a baseline already present it makes no Git
   reads = 0;
   assert.equal(establishBaseline({ gh, root, pr: 7, state: s }), false);
   assert.equal(reads, 0, 'baseline present: no comments read');
-  assert.equal(establishBaseline({ gh, root, pr: 7, state: s, published: readPublished(memGh([mine(s)]), 7) }), false, 'a passed published result is still honoured');
+});
+
+test('establishBaseline (R7-F1): a passed published result is used as is, with no baseline present and no GitHub read', (t) => {
+  const root = tmpRoot(t); // fresh: no baseline, so only `published` decides whether a read happens
+  const s = mk([it('R1-B1')]);
+  const gh = memGh([mine(s)]);
+  let reads = 0;
+  const listComments = gh.listComments;
+  gh.listComments = (...a) => { reads += 1; return listComments(...a); };
+  const published = readPublished(memGh([mine(s)]), 7);
+  assert.equal(readBaseline(root, 7), null);
+  assert.equal(establishBaseline({ gh, root, pr: 7, state: s, published }), true);
+  assert.equal(readBaseline(root, 7), reviewContentHash(s));
+  assert.equal(reads, 0, 'the passed result replaces the read');
 });
 
 // ---- CLI: two worktrees of one PR ---------------------------------------------------------------
