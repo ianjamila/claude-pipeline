@@ -93,3 +93,76 @@ test('job start consults the same policy', () => {
   assert.match(blocked.reason, /job \(pid \d+, PR #31\)/);
   assert.equal(guardVerdict('git status', { cwd: root, env: process.env }).allow, true);
 });
+
+// ---- review round 1 (R1-B3): the plumbing and porcelain that move a ref, HEAD, the index or the worktree without the verbs above ----
+test('R1-B3: update-ref, symbolic-ref with a target, branch -f/-m/-d/-C, clean, read-tree, checkout-index, apply, add, rm and mv are refused in a job\'s checkout', () => {
+  const root = fakeRepo();
+  mark(root, process.pid, 12);
+  for (const command of [
+    'git update-ref refs/heads/other HEAD',
+    'git update-ref -d refs/heads/other',
+    'git symbolic-ref HEAD refs/heads/other',
+    'git symbolic-ref -d HEAD',
+    'git branch -f other HEAD',
+    'git branch --force other HEAD',
+    'git branch -m other',
+    'git branch -M agent/x other',
+    'git branch --move other',
+    'git branch -d other',
+    'git branch -D other',
+    'git branch --delete other',
+    'git branch -fd other',
+    'git branch -C a b',
+    'git clean -fd',
+    'git read-tree HEAD',
+    'git checkout-index -a -f',
+    'git apply fix.patch',
+    'git apply --index fix.patch',
+    'git apply --cached fix.patch',
+    'git apply --check --apply fix.patch',
+    'git add .',
+    'git add -- -n',
+    'git rm a.txt',
+    'git rm -r --cached src',
+    'git mv a b',
+  ]) {
+    const v = decide(command, root);
+    assert.equal(v.decision, 'deny', command);
+    assert.match(v.reason, /P merge --owner-go.*job \(pid \d+, PR #12\) owns this checkout until it ends/s, command);
+  }
+});
+
+test('R1-B3: the read-only forms of those verbs stay allowed in a job\'s checkout', () => {
+  const root = fakeRepo();
+  const other = fakeRepo();
+  mark(root, process.pid, 12);
+  for (const command of [
+    'git symbolic-ref HEAD',
+    'git symbolic-ref -q HEAD',
+    'git symbolic-ref --short HEAD',
+    'git branch',
+    'git branch --list',
+    'git branch -a',
+    'git branch -vv',
+    'git branch -r --list "origin/*"',
+    'git branch --show-current',
+    'git branch --contains HEAD',
+    'git branch --sort=-committerdate',
+    'git branch -c a b', // a copy never overwrites
+    'git branch newname', // a new ref, nothing moved
+    'git apply --check fix.patch',
+    'git apply --stat fix.patch',
+    'git apply --numstat fix.patch',
+    'git add -n .',
+    'git add --dry-run .',
+    'git clean -n',
+    'git clean -nd',
+    'git clean --dry-run',
+    'git rm -n a.txt',
+    'git mv -n a b',
+  ]) {
+    assert.equal(decide(command, root).decision, 'allow', command);
+  }
+  assert.equal(decide('git update-ref refs/heads/other HEAD', other).decision, 'allow'); // another checkout
+  assert.equal(decide('git add .', other).decision, 'allow');
+});

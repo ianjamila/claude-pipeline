@@ -681,7 +681,33 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
 // `.review/merge-job.json` (read by git-wiring.mjs mergeJobOf; a dead pid or a missing / garbled file means no job) is what
 // makes this checkout the job's. Read-only git and every `P ...` / node command stay allowed; the job's own git calls are child
 // processes, not tool calls, so this never sees them.
-const MERGE_JOB_VERBS = new Set(['checkout', 'switch', 'reset', 'commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'stash', 'pull', 'restore', 'am']);
+// R1-B3: also the plumbing / porcelain that moves a ref, HEAD, the index or the worktree: update-ref, symbolic-ref (with a target or -d), branch (force / move / delete / force-copy), clean, read-tree, checkout-index,
+// apply (unless it only checks or counts), add, rm, mv (unless a dry run). Their read-only forms stay allowed (symbolic-ref HEAD, branch / branch --list, apply --check, add -n).
+const MERGE_JOB_VERBS = new Set(['checkout', 'switch', 'reset', 'commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'stash', 'pull', 'restore', 'am',
+  'update-ref', 'symbolic-ref', 'branch', 'clean', 'read-tree', 'checkout-index', 'apply', 'add', 'rm', 'mv']);
+// The options of a git command line (up to `--`): { longs: Set of '--name' (value dropped), shorts: Set of single letters of every -abc cluster }.
+function optionsOf(args) {
+  const longs = new Set();
+  const shorts = new Set();
+  for (const a of args) {
+    if (a === '--') break;
+    if (a.startsWith('--')) longs.add(a.split('=')[0]);
+    else if (/^-[^-]/.test(a)) for (const c of a.slice(1)) shorts.add(c);
+  }
+  return { longs, shorts };
+}
+// True when this use of one of the extra verbs cannot move the branch, HEAD, the index or the worktree.
+function mergeJobReadOnly(verb, args, words) {
+  const { longs, shorts } = optionsOf(args);
+  const has = (long, short) => longs.has(long) || (short !== undefined && shorts.has(short));
+  switch (verb) {
+    case 'symbolic-ref': return words.length < 2 && !has('--delete', 'd'); // `symbolic-ref HEAD` reads, `symbolic-ref HEAD refs/heads/x` writes
+    case 'branch': return !(has('--force', 'f') || has('--move', 'm') || shorts.has('M') || has('--delete', 'd') || shorts.has('D') || shorts.has('C')); // lists, creates, `-c` copies to a NEW name
+    case 'apply': return !has('--apply') && ['--check', '--stat', '--numstat', '--summary'].some((o) => longs.has(o));
+    case 'add': case 'rm': case 'mv': case 'clean': return has('--dry-run', 'n');
+    default: return false; // update-ref, read-tree, checkout-index: no read-only form
+  }
+}
 function mergeJobDeny(job, what) {
   return deny(`a \`P merge --owner-go\` job (pid ${job.pid}, PR #${job.pr}) owns this checkout until it ends, so ${what} is refused here; wait for it or stop it (kill ${job.pid}). Read-only git (status, log, diff, show, fetch) and \`P …\` commands still work.`);
 }
@@ -692,6 +718,7 @@ function mergeJobVerdict(sub, args, g, ctx) {
   const worktreeMove = verb === 'worktree' && (second === 'remove' || second === 'move');
   if (!MERGE_JOB_VERBS.has(verb) && !worktreeMove) return null;
   if (verb === 'stash' && (second === 'list' || second === 'show')) return null;
+  if (['update-ref', 'symbolic-ref', 'branch', 'clean', 'read-tree', 'checkout-index', 'apply', 'add', 'rm', 'mv'].includes(verb) && mergeJobReadOnly(verb, args, words)) return null;
   const jobAt = (dir) => {
     if (dir === null) return null;
     try { return memoLookup(ctx, ['mergejob', dir], () => ctx.mergeJobOf(dir)) ?? null; } catch { return null; }
