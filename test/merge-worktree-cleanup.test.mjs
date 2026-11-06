@@ -51,7 +51,7 @@ const ROUTES = {
 };
 
 for (const [route, go] of Object.entries(ROUTES)) {
-  const merged = (name, env, check) => test(`${route}: merged + ${name}`, (t) => {
+  const merged = (name, env, check, opts = {}) => test(`${route}: merged + ${name}`, opts, (t) => {
     const r = go(t, env);
     assertExit(r, 0);
     assert.equal(r.json.merged, true);
@@ -84,7 +84,9 @@ for (const [route, go] of Object.entries(ROUTES)) {
     unknown(j);
     assert.equal(j.commandExitCode, 2);
   });
-  merged('the diagnostic, then the command is killed (SIGKILL): unknown cause', { STUB_ERR: `failed to run git: ${CHECKOUT}`, STUB_SIGNAL: 'SIGKILL' }, unknown);
+  merged('the diagnostic, then the command is killed (SIGKILL): unknown cause', { STUB_ERR: `failed to run git: ${CHECKOUT}`, STUB_SIGNAL: 'SIGKILL' }, unknown,
+    // Windows has no signals (a killed process exits 1, no signal), so the stub cannot produce one through the CLI; the classifier unit test below covers the rule everywhere.
+    { skip: process.platform === 'win32' });
 
   test(`${route}: NOT merged + the checkout diagnostic is still a failure (and carries the output)`, (t) => {
     const r = go(t, { STUB_ERR: `failed to run git: ${CHECKOUT}` }, OPEN);

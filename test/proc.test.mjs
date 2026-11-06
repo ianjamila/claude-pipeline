@@ -716,7 +716,8 @@ test('runAsync / runShellAsync: report the signal that killed the child, and ove
   assert.equal(a.signal, 'SIGKILL');
   assert.equal(a.code, 1);
   assert.equal(a.overBuffer, false);
-  const s = await runShellAsync(`node -e "process.kill(process.pid, 'SIGKILL')"`);
+  // The shell kills itself: dash (Ubuntu sh) runs `node -e` as a child instead of exec'ing it, so the shell would exit 137 with no signal.
+  const s = await runShellAsync('kill -KILL $$');
   assert.equal(s.signal, 'SIGKILL');
   const ok = await runAsync('node', ['-e', 'process.exit(0)']);
   assert.equal(ok.signal, null);
