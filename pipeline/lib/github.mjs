@@ -342,6 +342,10 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     // The workflow runs of one check suite (their created_at tells a draft-era run from a ready-era one).
     workflowRunsOfSuite: (suiteId) => pagedList(`repos/${self.repo().slug}/actions/runs?check_suite_id=${encodeURIComponent(suiteId)}&per_page=100`, '.workflow_runs'),
 
+    // The workflow runs of a head commit (status queued / in_progress / completed ..., created_at): ci-wait uses the unfinished ones created
+    // after the ready event to keep waiting for a late `needs:`-gated check.
+    workflowRunsOfHead: (head) => pagedList(`repos/${self.repo().slug}/actions/runs?head_sha=${encodeURIComponent(head)}&per_page=100`, '.workflow_runs'),
+
     // The files of a PR as GitHub lists them (every page): [{ filename, previous_filename?, status, ... }]. GitHub computes this from its own
     // copy of the commits, so it is the cross-check for a local diff (--owner-go: an object graph altered here shows up as a difference).
     pullFiles: (n) => pagedList(`repos/${self.repo().slug}/pulls/${prNumber(n)}/files?per_page=100`),
