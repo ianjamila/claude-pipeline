@@ -25,7 +25,7 @@ import {
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
 import { tailLines } from '../lib/cmd-io.mjs';
-import { checkHolds, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal } from '../lib/merge-hold.mjs';
+import { checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal, recordSuccessor, releaseHold } from '../lib/merge-hold.mjs';
 
 export const meta = {
   summary: 'merge the PR if (and only if) the final gate passes again, live; waits for MERGED',
@@ -41,8 +41,10 @@ const refuse = (error, reasons, extra = {}) => ({
 });
 
 // A merge-hold refusal (lib/merge-hold.mjs holdGate / queuedBehindRefusal, or a bringUpToDate outcome carrying one) as a merge refusal.
+// holdTaken / holdRelease / hold (step 1b: this call took the hold before its update, and what became of it) are passed through.
 const holdRefuse = (r, extra = {}) => refuse(r.error, [r.reason], {
-  ...(r.verdict ? { verdict: r.verdict, blockedBy: r.blockedBy, doNotUpdate: true, ...(r.holds ? { holds: r.holds } : {}) } : {}), ...extra,
+  ...(r.verdict ? { verdict: r.verdict, blockedBy: r.blockedBy, doNotUpdate: true, ...(r.holds ? { holds: r.holds } : {}) } : {}),
+  ...(r.holdTaken !== undefined ? { holdTaken: r.holdTaken } : {}), ...(r.holdRelease ? { holdRelease: r.holdRelease } : {}), ...(r.hold ? { hold: r.hold } : {}), ...extra,
 });
 const HOLD_OUTCOMES = new Set(['queued-behind', 'hold-unreadable']);
 // A failed merge command whose full output says the PR is queued behind another's hold (repos with the hold keys only).
@@ -140,14 +142,35 @@ export const run = guarded(async (argv, ctx) => {
     // not be updated: that costs a CI round for nothing), and again before the update PUT itself.
     const heldBefore = await holdGate({ config, pr, root, env: ctx.env });
     if (heldBefore) return holdRefuse(heldBefore);
-    const beforeUpdate = holdsConfigured(config) ? () => holdGate({ config, pr, root, env: ctx.env }) : null;
-    const synced = await bringUpToDate({ gh, pr, expectHead: gate.head, maxCycles: 1, waitChecks: false, beforeUpdate, ...updateTiming(ctx.env) });
+    // The catch-up PUT runs under this PR's own hold (taken right before it, after the check; plan 2026-11-06-f1-lite-build), and the
+    // update's merge commit is recorded as the pipeline's own successor head so the later new-commits release keeps the hold.
+    const { beforeUpdate, info: holdInfo } = holdBeforeUpdate({ config, pr, root, env: ctx.env });
+    const synced = await bringUpToDate({
+      gh, pr, expectHead: gate.head, maxCycles: 1, waitChecks: false, beforeUpdate, onSuccessor: (x) => recordSuccessor(root, pr, x), ...updateTiming(ctx.env),
+    });
+    warnings.push(...(synced.successorWarnings ?? []));
     if (!synced.ok) {
-      if (HOLD_OUTCOMES.has(synced.outcome)) return holdRefuse({ ...synced, error: synced.outcome }, { outcome: synced.outcome, updated: synced.updated, cycles: synced.cycles, head: synced.head ?? null });
-      return refuse('behind-base', [synced.message ?? `could not bring the branch up to date (${synced.outcome})`], { outcome: synced.outcome, updated: synced.updated, head: synced.head ?? null });
+      if (HOLD_OUTCOMES.has(synced.outcome)) {
+        // This caller STOPS (a fresh owner "merge" is needed anyway), so a hold this call took is not kept while it waits for nothing:
+        // an older hold won the race (queued-behind) or the re-check could not be read (hold-unreadable; the take may have written the label).
+        let holdRelease;
+        if (holdInfo?.tookThisCall) {
+          const rel = await releaseHold({ config, pr, reason: synced.outcome, root, env: ctx.env });
+          holdRelease = { reason: synced.outcome, confirmed: rel.confirmed === true, code: rel.code ?? null, lines: rel.lines ?? [] };
+          if (!holdRelease.confirmed) warnings.push(`the merge hold of #${pr} was NOT released (${synced.outcome}; exit ${holdRelease.code}): run \`pipeline merge-hold --pr ${pr} --release --reason ${synced.outcome}\``);
+        }
+        return holdRefuse({ ...synced, error: synced.outcome, ...(holdRelease ? { holdRelease } : {}), ...(holdInfo ? { hold: holdInfo } : {}) }, {
+          outcome: synced.outcome, updated: synced.updated, cycles: synced.cycles, head: synced.head ?? null, successors: synced.successors, ...(warnings.length > 0 ? { warnings } : {}),
+        });
+      }
+      return refuse('behind-base', [synced.message ?? `could not bring the branch up to date (${synced.outcome})`], {
+        outcome: synced.outcome, updated: synced.updated, head: synced.head ?? null, successors: synced.successors, ...(holdInfo ? { hold: holdInfo } : {}), ...(warnings.length > 0 ? { warnings } : {}),
+      });
     }
     if (synced.updated) {
-      return refuse('behind-base', [`the base moved: the branch was updated to ${synced.head}; pull it, re-verify and run final-gate on that head`], { outcome: 'updated', updated: true, head: synced.head });
+      return refuse('behind-base', [`the base moved: the branch was updated to ${synced.head}; pull it, re-verify and run final-gate on that head`], {
+        outcome: 'updated', updated: true, head: synced.head, successors: synced.successors, ...(holdInfo ? { hold: holdInfo } : {}), ...(warnings.length > 0 ? { warnings } : {}),
+      });
     }
 
     // 2. The live gate, immediately before the merge: every check re-evaluated against GitHub and the worktree as they are NOW.

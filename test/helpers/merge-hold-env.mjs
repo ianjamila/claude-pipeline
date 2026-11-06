@@ -33,7 +33,7 @@ export const FAKE_HOLD = [
   "const before = existsSync(log) ? readFileSync(log, 'utf8').split('\\n').filter((l) => l.startsWith('check')).length : 0;",
   "appendFileSync(log, `${verb} ${rest.join(' ')}\\n`);",
   "const ghLog = process.env.PIPELINE_FAKE_GH_LOG;",
-  "const puts = ghLog && existsSync(ghLog) ? readFileSync(ghLog, 'utf8').split('\\n').filter((l) => l.includes('update-branch')).length : 0;",
+  "const puts = ghLog && existsSync(ghLog) ? readFileSync(ghLog, 'utf8').split('\\n').filter(Boolean).filter((l) => JSON.parse(l).argv.join(' ').includes('-X PUT')).length : 0;",
   "appendFileSync('.review/hold-puts.log', `${verb} ${puts}\\n`);",
   "const exit = (name) => process.exit(Number(process.env[name] ?? 0));",
   "if (verb === 'take') { console.log('hold taken'); exit('FAKE_HOLD_TAKE_EXIT'); }",
