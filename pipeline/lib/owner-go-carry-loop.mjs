@@ -93,6 +93,12 @@ export async function runCarryLoop(a) {
   if (!claim.ok) return stop(`The merge job could not take over this checkout (${claim.reason}); nothing was updated.`, { code: 'carry-checkout', extra: { checkout: claim.code } });
   let marker = claim.marker;
   try {
+    // R1-F1: the claim records whatever HEAD / branch the checkout has NOW, after the review lock was released. It must be the head the as-is evaluation judged (a.head) on the PR's own branch, or a
+    // checkout switched in that window (to a local main, say, which is an ancestor of the new head) would be fast-forwarded to the PR head. The go stands: nothing was touched.
+    if (marker.expectedHead !== a.head) return stop(`The checkout moved from ${short(a.head)} to ${short(marker.expectedHead)} after the request was checked; nothing was updated.`, { code: 'carry-checkout', extra: { checkout: 'checkout-changed' } });
+    let prBranch = null;
+    try { prBranch = gh.prView(pr, ['headRefName']).headRefName ?? null; } catch { /* unknown: the head check above still binds the claim */ }
+    if (typeof prBranch === 'string' && prBranch !== '' && prBranch !== marker.branch) return stop(`The checkout is on branch ${marker.branch}, not the PR's branch ${prBranch}; nothing was updated.`, { code: 'carry-checkout', extra: { checkout: 'checkout-changed' } });
     const mergedOut = (mergeSha, extra = {}) => ({
       exitCode: EXIT.OK,
       output: { ok: true, merged: true, mode: 'owner-go', head: stats.to, mergeSha: mergeSha ?? null, carried: { ...stats }, ...extra },

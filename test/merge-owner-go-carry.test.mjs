@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { ownerSays } from './helpers/owner-go.mjs';
 import { carryWorld, sh } from './helpers/carry-world.mjs';
 import { MERGE_JOB_MARKER } from '../pipeline/lib/merge-job.mjs';
+import { runCarryLoop } from '../pipeline/lib/owner-go-carry-loop.mjs';
 import { saveState } from '../pipeline/lib/state.mjs';
 import { run as mergeRun } from '../pipeline/commands/merge.mjs';
 import { PR, reviewState } from './helpers/gate-env.mjs';
@@ -364,4 +365,33 @@ test('R1-F2: under owner_approval: label a Carry record is ignored: today\'s beh
   assert.doesNotMatch(r.output.reasons.join('\n'), /Carry/);
   assert.equal(w.updates, 0);
   assert.deepEqual(w.mergeCalls(), []);
+});
+
+// ---- review round 1 (R1-F1): the claim is bound to the head the as-is evaluation saw and to the PR's own branch ----
+const loopArgs = (w, over = {}) => ({
+  root: w.root, config: {}, pr: PR, gh: w.gh, ctx: { env: w.env, carry: { log: () => {} } }, head: w.h0, prefix: w.h0.slice(0, 16),
+  refuse: (code, reasons, extra) => ({ exitCode: 1, output: { error: code, reasons, ...extra } }),
+  holdRefuse: (held) => ({ exitCode: 1, output: { error: 'hold', held } }),
+  final: async () => { throw new Error('final must not be reached'); }, ...over,
+});
+
+test('R1-F1: the checkout holds another head than the one the as-is evaluation saw: carry-checkout, the go stands, nothing updated, marker released', async (t) => {
+  const w = world(t);
+  w.mainMoves();
+  const r = await runCarryLoop(loopArgs(w, { head: 'f'.repeat(40) }));
+  assert.equal(r.output.error, 'carry-checkout');
+  assert.equal(r.output.goVoid, false);
+  assert.equal(w.updates, 0);
+  assert.equal(existsSync(join(w.root, MERGE_JOB_MARKER)), false);
+});
+
+test('R1-F1: the checked-out branch is not the PR\'s head branch: carry-checkout, nothing updated', async (t) => {
+  const w = world(t);
+  w.mainMoves();
+  sh(w.root, 'branch', '-m', 'agent/renamed');
+  const r = await runCarryLoop(loopArgs(w));
+  assert.equal(r.output.error, 'carry-checkout');
+  assert.match(r.output.reasons.join(), /agent\/renamed/);
+  assert.equal(w.updates, 0);
+  assert.equal(existsSync(join(w.root, MERGE_JOB_MARKER)), false);
 });
