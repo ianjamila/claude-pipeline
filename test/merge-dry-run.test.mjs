@@ -359,3 +359,83 @@ test('dry run, GitHub unavailable -> exit 3', () => {
   const d = dry(s);
   assertExit(d.r, 3, `${d.r.stderr}${d.r.stdout}`);
 });
+
+// ---- --owner-go, behind its base (merge.behind_base: disjoint in the BASE commit's config) -----------------------------------------------
+
+const disjointYml = () => ymlFor().replace('  wait_minutes: 1\n', '  wait_minutes: 1\n  behind_base: disjoint\n');
+// main moves by one commit that touches `file`; back on the PR branch. -> the new main tip.
+function mainMoves(s, file) {
+  s.repo.git(['checkout', '-q', 'main']);
+  s.repo.write(file, 'x\n');
+  const tip = s.repo.commit('main moves');
+  s.repo.git(['checkout', '-q', 'agent/feature']);
+  return tip;
+}
+const behindDry = (s, tip, o = {}) => {
+  s.fake.setScript(script(s, { baseRefOid: tip, behindBy: 1, gh: { compareBase: tip, ...o.gh }, ...o }));
+  return dry(s, ['--owner-go']);
+};
+
+test('dry run --owner-go, behind its base but disjoint: wouldMerge, `behind` set, behindNote above the request; nothing is written', () => {
+  const s = scenario({ yml: disjointYml(), report: null, state: null });
+  const tip = mainMoves(s, 'other.txt');
+  const before = s.repo.git(['for-each-ref']);
+  const d = behindDry(s, tip);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.wouldMerge, true, JSON.stringify(d.r.json.blockers));
+  assert.deepEqual(d.r.json.behind, { behindBy: 1, mergeBase: s.baseTip, baseRefOid: tip, mainFiles: 1, rule: 'disjoint' });
+  assert.equal(d.r.json.ownerStep.kind, 'say-merge');
+  assert.equal(d.r.json.ownerStep.behindNote, "behind main by 1 commit(s); main's 1 new file(s) touch none of this PR's files");
+  assert.deepEqual(d.writes, []);
+  assert.deepEqual(s.mergeCalls(), []);
+  noGitWrites(d);
+  assert.equal(s.repo.git(['for-each-ref']), before);
+});
+
+test('dry run --owner-go, up to date: behind is null and there is no behindNote', () => {
+  const s = scenario({ yml: disjointYml(), report: null, state: null, gh: { mergeStateStatus: 'CLEAN' } });
+  s.fake.setScript(script(s));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.behind, null);
+  assert.equal('behindNote' in d.r.json.ownerStep, false);
+});
+
+test('dry run --owner-go, behind: the compare API reporting a base tip other than the evaluated baseRefOid is still behind-base', () => {
+  const s = scenario({ yml: disjointYml(), report: null, state: null });
+  const tip = mainMoves(s, 'other.txt');
+  const d = behindDry(s, tip, { gh: { compareBase: 'e'.repeat(40) } });
+  assertExit(d.r, 1);
+  assert.equal(d.r.json.wouldMerge, false);
+  const hit = d.r.json.blockers.find((b) => b.kind === 'behind-base');
+  assert.ok(hit, JSON.stringify(d.r.json.blockers));
+  assert.match(hit.detail, /eeeeeeee is not the [0-9a-f]{8} that was checked/);
+});
+
+test('dry run --owner-go, behind, but main changed a PR file or the base has not opted in: behind-base as before', () => {
+  const touching = scenario({ yml: disjointYml(), report: null, state: null });
+  const a = mainMoves(touching, 'src/app.js');
+  const d1 = behindDry(touching, a);
+  assertExit(d1.r, 1);
+  assert.match(d1.r.json.blockers.map((b) => `${b.kind}: ${b.detail}`).join('\n'), /behind-base[\s\S]*changed 1 file\(s\) this PR also touches \(src\/app\.js\)/);
+  assert.equal(d1.r.json.behind, null);
+
+  const strict = scenario({ yml: ymlFor(), report: null, state: null });
+  const b = mainMoves(strict, 'other.txt');
+  const d2 = behindDry(strict, b);
+  assertExit(d2.r, 1);
+  assert.match(d2.r.json.blockers.map((x) => x.detail).join('\n'), /merge\.behind_base is "update"/);
+  assert.equal(d2.r.json.behind, null);
+});
+
+test('dry run --owner-go, behind: mergeStateStatus BEHIND stays behind-base even with disjoint; DIRTY is conflicts + behind-base-unverified', () => {
+  const s = scenario({ yml: disjointYml(), report: null, state: null });
+  const tip = mainMoves(s, 'other.txt');
+  const behind = behindDry(s, tip, { merge: 'BEHIND', gh: { mergeStateStatus: 'BEHIND' } });
+  assertExit(behind.r, 1);
+  assert.ok(behind.r.json.blockers.some((b) => b.kind === 'behind-base'), JSON.stringify(behind.r.json.blockers));
+  const dirty = behindDry(s, tip, { merge: 'DIRTY', gh: { mergeStateStatus: 'DIRTY' } });
+  assertExit(dirty.r, 1);
+  const kinds = dirty.r.json.blockers.map((b) => b.kind);
+  assert.ok(kinds.includes('conflicts') && kinds.includes('behind-base-unverified'), kinds.join());
+});

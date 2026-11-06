@@ -169,6 +169,13 @@ Commands the agent hands you to run (a merge command, `pipeline protect` lines) 
 `gh` is "command not found" there. To see whether a PR would merge without merging it, the agent runs `pipeline merge --pr N
 --dry-run`; it changes nothing and grants nothing.
 
+`pipeline merge --owner-go` (and its dry run) refuse a PR that lacks commits of its base, as does every merge route. A repo can opt in to
+merging such a PR as it is when main's new commits touch none of the PR's files: `merge.behind_base: disjoint` in `.claude/pipeline.yml`
+**on the base branch** (the PR's own copy is never read). Changes to CI and toolchain files on main (`.github/**`, the pipeline config,
+`scripts/verify*`, `.gitattributes`, `.nvmrc`, ...), the repo's `verify.ci_proof_inputs` and its `merge.behind_base_stale_paths` globs always force
+the update. Your "merge" is still for that exact head and items, not for main's commit; the request shown to you says the PR is behind.
+See [docs/cli.md](docs/cli.md) (`merge`).
+
 ## Enforcement — what stops what
 
 | Guarantee | GitHub (Pro) | CI | Global hook | Skill / CLI |
@@ -262,6 +269,18 @@ and `ci.approvers` (logins whose approval labels count; required for org-owned r
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep
 one: a real-looking secret key literal (not marked fake inside the key itself) is still a `needs-human` hit there.
+
+### Merge hold (opt-in)
+
+For a repo whose merge command keeps a cooperative merge lock (EagleWatch's `merge-hold` label), `pipeline.yml` can carry three
+`merge` keys, all three or none: `hold_command` (take the hold; `{pr}`), `hold_release_command` (release it; `{pr}` and `{reason}`)
+and `hold_check_command` (a read-only check that prints one JSON line naming the PRs whose holds block this one; `{pr}`). EagleWatch:
+`npm run merge-hold -- {pr}`, `npm run merge-hold -- {pr} --release --reason {reason}`, `npm run merge-hold -- --status {pr} --json`.
+With them the review skill takes the hold when it hands you the merge request and releases it when the request is withdrawn; `pipeline merge`
+and `pipeline update-branch` refuse (`queued-behind`) instead of updating a branch that must wait for an older hold, and a dry run runs the
+read-only check. The pipeline-side check is cooperative (only a hold-aware merge command catches a hold taken after the check). Merge and
+install the pipeline change before adding the keys; to roll back, remove the keys first. A PR whose hold expires and is renewed goes to the
+back of the queue; your exits are merging the PR ahead, releasing its hold, or the provider's `--ignore-hold`. Details: `docs/cli.md`, Merge hold under `merge`.
 
 ### Smoke firewall bypass header (opt-in)
 

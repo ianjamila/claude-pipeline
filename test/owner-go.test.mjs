@@ -7,15 +7,16 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, sy
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
+import { dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
   presentedRuling, recordRuling, ownerRuled, rulingsIn, entrySource, notOwnerWords, approvalGap, ownerRulingGap, promptProvenance, rulingNudge, RULING_NUDGE,
-  approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT, legacyTranscriptOf,
+  accountHome, approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT, legacyTranscriptOf,
   parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
-import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
+import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, isTranscriptFile, toPosix, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { OWNER_ENTRY, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
 
@@ -718,7 +719,7 @@ test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice void
   assert.deepEqual([rule([...head, notice, said(ask(59)), promptEntry('what is that?'), said(ask(59))])?.pr], [59], 'the owner asked again: a new slot');
 });
 
-test('#128 R1-B2: provenance is taken only from a transcript of the shape the guard protects (any .claude* folder, or $CLAUDE_CONFIG_DIR)', () => {
+test('#128 R1-B2: provenance is taken only from a transcript of the shape the guard protects (a ~/.claude* folder; $CLAUDE_CONFIG_DIR names no root)', () => {
   const root = tmp();
   const put = (rel) => {
     const f = join(root, rel);
@@ -727,15 +728,15 @@ test('#128 R1-B2: provenance is taken only from a transcript of the shape the gu
     return { transcript_path: f, prompt_id: 'pid-m' };
   };
   for (const rel of ['.claude/projects/-repo/s.jsonl', '.claude-eaglewatch/projects/-repo/s.jsonl', '.claude/projects/-repo/s/subagents/x.jsonl'.replace('/subagents', '/tool-results')]) {
-    assert.equal(promptProvenance(put(rel), { env: {} }), 'owner', rel);
+    assert.equal(promptProvenance(put(rel), { env: {}, home: root }), 'owner', rel);
   }
   for (const rel of ['t.jsonl', 'claude-config/projects/-repo/s.jsonl', '.claude/other/-repo/s.jsonl', '.claude/projects/s.jsonl', '.claude/projects/-repo/s.json', 'cfg/.claude/s.jsonl']) {
-    assert.equal(promptProvenance(put(rel), { env: {} }), 'missing', rel);
+    assert.equal(promptProvenance(put(rel), { env: {}, home: root }), 'missing', rel);
   }
-  // a config dir under another name is the guard's too once the environment names it
+  // a config dir under another name is evidence under NO environment: the use-time check runs in the agent's shell, where CLAUDE_CONFIG_DIR is the agent's own word
   const custom = put('claude-config/projects/-repo/s.jsonl');
-  assert.equal(promptProvenance(custom, { env: { CLAUDE_CONFIG_DIR: join(root, 'claude-config') } }), 'owner');
-  assert.equal(promptProvenance(custom, { env: { CLAUDE_CONFIG_DIR: join(root, 'elsewhere') } }), 'missing');
+  assert.equal(promptProvenance(custom, { env: { CLAUDE_CONFIG_DIR: join(root, 'claude-config') }, home: root }), 'missing');
+  assert.equal(promptProvenance(custom, { env: { CLAUDE_CONFIG_DIR: join(root, 'elsewhere') }, home: root }), 'missing');
   // …and a record whose transcript is outside never approves
   const w = mergeWorld(root, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] });
   assert.deepEqual(askedFor(w), [true, true, 'ok']);
@@ -746,8 +747,118 @@ test('#128 R1-B2: provenance is taken only from a transcript of the shape the gu
   assert.deepEqual(askedFor(w), [false, false, 'provenance'], 'a transcript the guard does not protect');
 });
 
-// R2-F3: a transcript in a custom config dir is judged by the checking process's CLAUDE_CONFIG_DIR; the refusal says so when that is the plausible cause.
-test('#128 R2-F3: a refusal for a transcript outside every known root names CLAUDE_CONFIG_DIR; an ordinary missing record does not', () => {
+// Codex #145 P1: the use-time check used to take a transcript under ANY .claude* folder anywhere, but the guard protects a config root only when it is $CLAUDE_CONFIG_DIR or a
+// folder directly under the account's home with the HOME_CONFIG_DIR_RE shape; a whole-folder cp/tar/rsync into /tmp/.claude-x or ~/.claude.personal is not refused, so a forged
+// "transcript" there was taken as the owner's words. Fix round: the environment names no root at all (the check runs in the agent's shell; `CLAUDE_CONFIG_DIR=/tmp/.claude-x P merge` would
+// turn an unprotected folder into evidence), so only <account home>/<HOME_CONFIG_DIR_RE>/ counts.
+test('#128 Codex #145 P1: a transcript is evidence only under ~/<HOME_CONFIG_DIR_RE>/ (CLAUDE_CONFIG_DIR is ignored), never under an unprotected .claude* folder', () => {
+  const home = '/home/u';
+  const leaf = 'projects/-a/s.jsonl';
+  const is = (p, over = {}) => isTranscriptFile(p, { env: {}, platform: 'linux', home, ...over });
+  for (const ok of [`${home}/.claude/${leaf}`, `${home}/.claude-eaglewatch/${leaf}`, `${home}/.claude2/${leaf}`, `${home}/.claude/projects/-a/s/tool-results/x.jsonl`]) assert.equal(is(ok), true, ok);
+  for (const bad of [
+    `/tmp/.claude-x/${leaf}`, `${home}/.claude.personal/${leaf}`, `${home}/.claude.forged/${leaf}`, `${home}/sub/.claude/${leaf}`, `${home}/.claude/sub/.claude/${leaf}`,
+    `/home/other/.claude/${leaf}`, `/.claude/${leaf}`, `${home}/.claude/other/-a/s.jsonl`, `${home}/.claude/projects/s.jsonl`, `${home}/claude/${leaf}`,
+  ]) assert.equal(is(bad), false, bad);
+  // $CLAUDE_CONFIG_DIR names no root, whatever the folder is called, wherever it is, however it is spelled (it is the calling process's word, not the guard's)
+  for (const dir of ['/opt/cfg', '/opt/cfg/', '~/cfg', '/tmp/.claude-x', `${home}/.claude.personal`]) {
+    const base = dir.replace(/^~/, home).replace(/\/+$/, '');
+    assert.equal(is(`${base}/${leaf}`, { env: { CLAUDE_CONFIG_DIR: dir } }), false, `env ${dir}`);
+  }
+  assert.equal(is(`${home}/.claude/${leaf}`, { env: { CLAUDE_CONFIG_DIR: '/opt/cfg' } }), true, 'the variable does not take the home-level roots away either');
+  // a `..` in the path is never evidence (it names a place other than the one it is written under)
+  for (const bad of [`${home}/.claude/x/../${leaf}`, `${home}/.claude/projects/-a/../-b/s.jsonl`, `${home}/../u/.claude/${leaf}`, `${home}\\.claude\\projects\\-a\\..\\-b\\s.jsonl`, `/tmp/..${home}/.claude/${leaf}`, `/tmp/../${home}/.claude/${leaf}`]) assert.equal(is(bad), false, bad);
+  assert.equal(is(`${home}/.claude/projects/-a/a..b.jsonl`), true, 'a dot run inside a name is not a parent step');
+  // case-insensitive where the file system is (darwin, win32), exact elsewhere; any slash flavour
+  assert.equal(is(`/Home/U/.CLAUDE/${leaf}`, { platform: 'darwin' }), true);
+  assert.equal(is(`/Home/U/.CLAUDE/${leaf}`), false);
+  assert.equal(is(`/tmp/.CLAUDE-x/${leaf}`, { platform: 'darwin' }), false, 'still not a protected root on darwin');
+  assert.equal(is('C:\\Users\\u\\.claude-b\\projects\\-a\\s.jsonl', { platform: 'win32', home: 'C:\\Users\\u' }), true);
+  assert.equal(is('C:\\Users\\u\\sub\\.claude\\projects\\-a\\s.jsonl', { platform: 'win32', home: 'C:\\Users\\u' }), false);
+  // the use-time check agrees: only a protected root's file is evidence, a copy in an unprotected .claude* folder is 'missing'
+  const root = tmp();
+  const acct = join(root, 'home');
+  const put = (rel) => {
+    const f = join(root, rel);
+    mkdirSync(join(f, '..'), { recursive: true });
+    writeFileSync(f, `${JSON.stringify(promptEntry('merge', OWNER_META, 'pid-m'))}\n`);
+    return { transcript_path: f, prompt_id: 'pid-m' };
+  };
+  for (const rel of ['.claude-x/projects/-a/s.jsonl', 'home/.claude.personal/projects/-a/s.jsonl', 'home/sub/.claude/projects/-a/s.jsonl']) {
+    assert.equal(promptProvenance(put(rel), { env: {}, home: acct }), 'missing', rel);
+  }
+  for (const rel of ['home/.claude-eaglewatch/projects/-a/s.jsonl', 'home/.claude/projects/-a/s.jsonl']) {
+    assert.equal(promptProvenance(put(rel), { env: {}, home: acct }), 'owner', rel);
+  }
+  const named = put('anywhere/cfg/projects/-a/s.jsonl');
+  assert.equal(promptProvenance(named, { env: { CLAUDE_CONFIG_DIR: join(root, 'anywhere', 'cfg') }, home: acct }), 'missing', 'the Codex scenario: CLAUDE_CONFIG_DIR=<a folder the agent wrote> is no evidence');
+  const unprotected = put('tmp/.claude-x/projects/-a/s.jsonl');
+  assert.equal(promptProvenance(unprotected, { env: { CLAUDE_CONFIG_DIR: join(root, 'tmp', '.claude-x') }, home: acct }), 'missing');
+  // the hint for a transcript under a folder the check does not trust says so: the config dir must be a .claude* folder directly under the home. It no longer advises setting CLAUDE_CONFIG_DIR
+  for (const p of [`/tmp/.claude-x/${leaf}`, `${home}/.claude.personal/${leaf}`, `${home}/sub/.claude/${leaf}`, `/opt/cfg/${leaf}`]) {
+    for (const env of [{}, { CLAUDE_CONFIG_DIR: '/opt/cfg' }, { CLAUDE_CONFIG_DIR: dirname(dirname(dirname(p))) }]) assert.equal(configDirHint([{ transcript_path: p }], { env, home }), CONFIG_DIR_HINT, p);
+  }
+  assert.equal(configDirHint([{ transcript_path: `${home}/.claude-eaglewatch/${leaf}` }], { env: {}, home }), '');
+  assert.match(CONFIG_DIR_HINT, /\.claude\* folder directly under the (?:account's )?home/);
+  assert.doesNotMatch(CONFIG_DIR_HINT, /(?:set|setting) CLAUDE_CONFIG_DIR|run this command with/i, 'no advice to set the variable');
+});
+
+// Fix round item 4: the default home is the ACCOUNT's (os.userInfo), never $HOME, which the agent can point at a folder it writes.
+test('#128 isTranscriptFile / promptProvenance / transcriptConfigDirs: the default home is the account home, not $HOME', () => {
+  const savedHome = process.env.HOME;
+  const savedProfile = process.env.USERPROFILE;
+  const fake = tmp();
+  try {
+    process.env.HOME = fake;
+    process.env.USERPROFILE = fake;
+    assert.equal(isTranscriptFile(`${fake}/.claude/projects/-a/s.jsonl`), false, 'a folder under the $HOME the agent set is no root');
+    assert.equal(isTranscriptFile(`${fake}/.claude/projects/-a/s.jsonl`, { env: {} }), false);
+    const acct = accountHome();
+    assert.equal(isTranscriptFile(`${acct}/.claude-x/projects/-a/s.jsonl`), true, 'a folder under the account home is');
+    // promptProvenance without `home` agrees (the account home's folder, a file this test writes and removes)
+    const cfg = join(acct, `.claude-ownergo-test-${randomUUID()}`);
+    const mk = (dir) => {
+      mkdirSync(join(dir, 'projects', '-a'), { recursive: true });
+      const f = join(dir, 'projects', '-a', 's.jsonl');
+      writeFileSync(f, `${JSON.stringify(promptEntry('merge', OWNER_META, 'pid-d'))}\n`);
+      return { transcript_path: f, prompt_id: 'pid-d' };
+    };
+    try {
+      assert.equal(promptProvenance(mk(cfg)), 'owner');
+      assert.equal(promptProvenance(mk(join(fake, '.claude'))), 'missing');
+    } finally { rmSync(cfg, { recursive: true, force: true }); }
+    // the derived lookup's default home is the same: a config folder under $HOME is not scanned
+    assert.deepEqual(transcriptConfigDirs().filter((d) => d.startsWith(fake)), []);
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile;
+  }
+});
+
+// Fix round item 5: the use-time check is NARROWER than the guard, never wider: whatever it takes as a transcript, the guard's file patterns (transcriptRes, built for the same home) match.
+test('#128 isTranscriptFile is a subset of what the guard protects (transcriptRes files), for a corpus of paths', () => {
+  const cases = [['/home/u', 'linux'], ['/home/u/', 'linux'], ['/home/u//', 'linux'], ['C:\\Users\\u', 'win32'], ['C:/Users/u/', 'win32'], ['/Users/u', 'darwin']];
+  const leaves = ['projects/-a/s.jsonl', 'projects/-a/s/tool-results/x.jsonl', 'projects/C--a/s.jsonl', 'projects/-a/s.json', 'projects/s.jsonl', 'other/-a/s.jsonl', 'projects/-a/x..y.jsonl'];
+  const dirs = ['.claude', '.claude-eaglewatch', '.claude.personal', '.claude.forged', 'sub/.claude', '.CLAUDE', 'claude', '.claude/sub/.claude'];
+  let accepted = 0;
+  for (const [homeRaw, platform] of cases) {
+    const ci = platform === 'win32' || platform === 'darwin';
+    const guard = transcriptRes([], ci, [toPosix(homeRaw)]).files;
+    const sep = homeRaw.includes('\\') ? '\\' : '/';
+    const base = homeRaw.replace(/[\\/]+$/, '');
+    for (const d of dirs) for (const l of leaves) for (const prefix of [base, `${base}/..`, '/tmp', 'D:\\x']) {
+      const p = `${prefix}/${d}/${l}`.replace(/\//g, sep);
+      if (!isTranscriptFile(p, { env: {}, platform, home: homeRaw })) continue;
+      accepted += 1;
+      assert.ok(guard.some((re) => re.test(toPosix(p))), `the guard does not protect what isTranscriptFile accepts: ${p} (home ${homeRaw})`);
+    }
+  }
+  assert.ok(accepted > 20, `the corpus must accept some paths (accepted ${accepted})`);
+});
+
+// R2-F3 (fix round): a transcript in a config dir that is not a .claude* folder directly under the home is no evidence whatever the checking process's CLAUDE_CONFIG_DIR says;
+// the refusal says so plainly (it no longer advises setting the variable) when that is the plausible cause.
+test('#128 R2-F3: a refusal for a transcript outside the trusted roots says the config dir must be a .claude* folder under the home; an ordinary missing record does not', () => {
   const saved = process.env.CLAUDE_CONFIG_DIR;
   delete process.env.CLAUDE_CONFIG_DIR;
   try {
@@ -766,11 +877,11 @@ test('#128 R2-F3: a refusal for a transcript outside every known root names CLAU
     const w = world('claude-config');
     assert.equal(approvalGap(w.q), 'provenance');
     assert.equal(approvalConfigDirHint(w.q), CONFIG_DIR_HINT);
-    assert.match(CONFIG_DIR_HINT, /CLAUDE_CONFIG_DIR[\s\S]*set to the owner's config dir/);
-    // …and once the process names it, the record is accepted and there is nothing to hint at
+    assert.match(CONFIG_DIR_HINT, /\.claude\* folder directly under the (?:account's )?home/);
+    // …and naming it in the environment changes nothing: the variable is the calling process's word, so the record stays unconfirmed and the hint stays
     process.env.CLAUDE_CONFIG_DIR = join(home, 'claude-config');
-    assert.equal(approvalGap(w.q), 'ok');
-    assert.equal(approvalConfigDirHint(w.q), '');
+    assert.equal(approvalGap(w.q), 'provenance');
+    assert.equal(approvalConfigDirHint(w.q), CONFIG_DIR_HINT);
     delete process.env.CLAUDE_CONFIG_DIR;
     // ordinary missing records: the entry never shows up, the transcript is gone, it is no session transcript, or it sits in a folder the process knows
     const ordinary = mergeWorld(home, { appended: [] });
@@ -786,7 +897,7 @@ test('#128 R2-F3: a refusal for a transcript outside every known root names CLAU
     assert.deepEqual([approvalGap(moved.q), approvalConfigDirHint(moved.q)], ['provenance', ''], 'no session transcript at all');
     assert.equal(configDirHint([{ transcript_path: null }, {}, { transcript_path: 'relative/projects/-r/s.jsonl' }]), '');
     assert.equal(configDirHint([{ transcript_path: '/x/projects/-r/s/subagents/a.jsonl' }]), '');
-    assert.equal(configDirHint([{ transcript_path: '/x/cfg/projects/-r/s.jsonl' }], { env: { CLAUDE_CONFIG_DIR: '/x/cfg' } }), '');
+    assert.equal(configDirHint([{ transcript_path: '/x/cfg/projects/-r/s.jsonl' }], { env: { CLAUDE_CONFIG_DIR: '/x/cfg' } }), CONFIG_DIR_HINT);
     assert.equal(configDirHint([{ transcript_path: '/x/cfg/projects/-r/s.jsonl' }], { env: {} }), CONFIG_DIR_HINT);
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = saved;
@@ -913,7 +1024,7 @@ test('#128 provenance: without a prompt_id the stored words are matched to a pro
   // a ruling carries its prompt as before
   const x = recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-9', cwd: home, prompt: 'R1-F1: accept', transcript_path: transcript(home, [promptEntry('go'), said(ASK_REPLY)]) }, { home, now: nowAt });
   assert.equal(x.prompt_id, null);
-  assert.equal(promptProvenance({ ...x, transcript_path: transcript(home, [promptEntry('go'), said(ASK_REPLY), at('R1-F1: accept', OWNER_META, 2000)]) }), 'owner');
+  assert.equal(promptProvenance({ ...x, transcript_path: transcript(home, [promptEntry('go'), said(ASK_REPLY), at('R1-F1: accept', OWNER_META, 2000)]) }, { home }), 'owner');
 });
 
 test('#128 provenance: the transcript is scanned from the end, 4 MB at a time, up to 64 MB back', () => {
@@ -926,18 +1037,18 @@ test('#128 provenance: the transcript is scanned from the end, 4 MB at a time, u
   assert.deepEqual(askedFor(w), [true, true, 'ok'], 'found 6 MB back');
   // a line that straddles a chunk boundary is read whole
   const wide = { ...promptEntry('merge', OWNER_META, 'pid-w'), pad: 'y'.repeat(5 * 1024 * 1024) };
-  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-w' }), 'missing');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-w' }, { home: w.g.home }), 'missing');
   writeFileSync(w.file, lines([promptEntry('go'), wide]) + filler(2));
-  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-w' }), 'owner', 'a 5 MB line across the 4 MB chunks');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-w' }, { home: w.g.home }), 'owner', 'a 5 MB line across the 4 MB chunks');
   // 70 MB of later lines: out of reach, so missing
   writeFileSync(w.file, lines([promptEntry('go'), said(REQUEST), owner]) + filler(70));
   assert.deepEqual(askedFor(w), [false, false, 'provenance'], 'more than 64 MB back');
   // a legacy 'unknown' entry whose scan stopped short of the start cannot be proven legacy
   const legacy = { type: 'user', message: { content: 'merge' }, promptId: 'pid-l' };
   writeFileSync(w.file, lines([{ type: 'user', message: { content: 'go' } }]) + filler(5) + lines([legacy]) + filler(1));
-  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }), 'owner', 'whole transcript scanned: legacy');
-  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { capBytes: 3 * 1024 * 1024 }), 'synthetic', 'found, but the scan fell short of the start');
-  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { capBytes: 512 * 1024 }), 'missing', 'not found within the cap');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { home: w.g.home }), 'owner', 'whole transcript scanned: legacy');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { home: w.g.home, capBytes: 3 * 1024 * 1024 }), 'synthetic', 'found, but the scan fell short of the start');
+  assert.equal(promptProvenance({ transcript_path: w.file, prompt_id: 'pid-l' }, { home: w.g.home, capBytes: 512 * 1024 }), 'missing', 'not found within the cap');
 });
 
 test('#128 provenance: rulings need the owner\'s prompt too, and "provenance" is the gap named first', () => {
@@ -1366,11 +1477,11 @@ test('#128 extra round: a grant whose prompt turns out synthetic, or is missing 
   ownerGrants(t, 'extra round', roundRequest(58, 4, head, REPO));
   assert.deepEqual([ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head }).length, ownerGrantGap({ repo: REPO, pr: 58, k: 4, head })], [1, 'ok']);
   assert.equal(ownerGrantGap({ repo: REPO, pr: 58, k: 4, head: freshHead() }), 'none');
-  // R2-F3: a transcript under a config dir this process does not know names CLAUDE_CONFIG_DIR in the refusal; an ordinary missing one does not
+  // R2-F3 (fix round): a transcript under a config dir that is no .claude* folder under the home gets the hint saying so; an ordinary missing one does not
   const elsewhere = freshHead();
   ownerGrants(t, 'extra round', roundRequest(58, 4, elsewhere, REPO), undefined, 'elsewhere');
   assert.equal(ownerGrantGap({ repo: REPO, pr: 58, k: 4, head: elsewhere }), 'provenance');
-  assert.match(ownerGrantConfigDirHint({ repo: REPO, pr: 58, k: 4, head: elsewhere, env: {} }), /CLAUDE_CONFIG_DIR/);
+  assert.equal(ownerGrantConfigDirHint({ repo: REPO, pr: 58, k: 4, head: elsewhere, env: {} }), CONFIG_DIR_HINT);
   const gone = freshHead();
   ownerGrants(t, 'extra round', roundRequest(58, 4, gone, REPO), undefined, 'missing');
   assert.equal(ownerGrantConfigDirHint({ repo: REPO, pr: 58, k: 4, head: gone, env: {} }), '');

@@ -19,12 +19,14 @@ import { reviewValidFor, roundOutcome } from '../lib/triage.mjs';
 import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
-import { currentContentHash, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
+import { currentContentHash, refreshBaseRef, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'post the review-complete comment (and remove awaiting-review) once the review is valid for the current content',
   usage: [
     'pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?}; exit 1 {ok:false, reason} when the review is not valid',
+    '  origin/<default_branch> is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated',
+    '  from its base branch and pulled is judged against the main that was merged in',
     '  the checked-out HEAD must be the head GitHub holds for the PR; the PR must have had every Fable pass its risk or paths need',
     `  the comment starts with the line ${'`<!-- claude-pipeline:review-complete v1 -->`'} and carries the JSON {contentHash, base, head, rounds, codexModel, modelProofDigest}`,
     '  (base = the merge base the content hash is measured from; modelProofDigest = sha256 of the Fable model proofs, null when no Fable pass ran);',
@@ -132,6 +134,9 @@ export const run = guarded(async (argv, ctx) => {
           output: { ok: false, reason: `local HEAD ${local} is not the head of PR #${pr} on GitHub (${remote ?? 'unknown'}): push or pull first`, localHead: local, prHead: remote ?? null },
         };
       }
+      // The hash is measured from origin/<default_branch>; after `update-branch` + `git pull --ff-only` that ref is older than the main that
+      // was merged in, so refresh it first (best effort: offline keeps the cached ref and the round's own hash is what it is compared to).
+      const refresh = refreshBaseRef(root, config);
       const hash = currentContentHash(root, config);
       // The review is valid for the content as it is, or (review.docs_exempt_paths) the content is the reviewed one plus lines added to
       // listed documents. The same helper decides it in the final gate; everything below (grants, Fable, the lane) runs either way.
@@ -141,7 +146,10 @@ export const run = guarded(async (argv, ctx) => {
         if (!ex?.exempt) {
           const why = whyNot(state, hash);
           const note = ex && !ex.off ? `; the docs-only exemption does not apply: ${ex.reason}` : '';
-          return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${why}${note}`, currentContentHash: hash } };
+          // A stale origin/<branch> is the one cause a person cannot see: say that the ref could not be refreshed.
+          const stale = !refresh.refreshed && refresh.usesRemoteRef && why.startsWith('no review round covers')
+            ? ` (origin/${config.default_branch} could not be refreshed: ${refresh.reason})` : '';
+          return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${why}${stale}${note}`, currentContentHash: hash } };
         }
         docsExempt = ex;
       }

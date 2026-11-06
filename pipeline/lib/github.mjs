@@ -176,6 +176,12 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       if (labels.length) ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--remove-label', l])]);
     },
 
+    // REST DELETE of one label of a PR (not `pr edit`): `P merge --owner-go` lifts the needs-human hold the owner's "merge" named with it
+    // (lib/hold.mjs). A label that is not on the PR answers 404 and throws, like any other failure.
+    deleteLabel(n, name) {
+      ok(['api', '-X', 'DELETE', `repos/${self.repo().slug}/issues/${prNumber(n)}/labels/${encodeURIComponent(name)}`]);
+    },
+
     // POST a GraphQL query through `gh api graphql`: strings go as -f (never type-coerced, so a repo called "123" stays a
     // string), numbers and booleans as -F. A reply with `errors` (or without `data`) is a failure, never partial data.
     graphql(query, variables = {}) {

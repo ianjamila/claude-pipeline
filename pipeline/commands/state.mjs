@@ -13,7 +13,7 @@ import { MARKERS } from '../lib/render.mjs';
 import { decodeFromComment, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
 import {
-  allItems, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, requireState, reviewBaseRef,
+  allItems, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
   roundDir, stateExtends, withStateLock,
 } from '../lib/review-context.mjs';
 
@@ -30,12 +30,15 @@ export const meta = {
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
     '     refused (exit 2) when the PR triage comment already holds round R',
     'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean',
+    '  first fetches origin/<default_branch> (best effort: offline keeps the cached ref), so a PR updated from its base branch is not read as changed',
     '  grantedRound {k, grantId, head, quote}: the owner\'s open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner',
     '  record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the',
     '  automatic extra round took, or null',
     'pipeline state mark-implemented --ids a,b [--repo DIR]',
     '  -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed',
     '     and a non-test file changed since (a test file counts for a testing finding or the finding\'s own file)',
+    '  -> exit 3 {ok:false, unavailable:true, reason:base-refresh} and nothing is marked when origin/<default_branch> cannot be fetched (offline, remote down) while the',
+    '     hash would be measured from it - also with no origin remote but a leftover origin/<default_branch> ref: a stale base would count the default branch\'s commits as the fix',
     'pipeline state record-followup --id ID --url URL [--repo DIR]',
     'pipeline state set-outcome --outcome TEXT [--repo DIR]',
   ].join('\n'),
@@ -176,6 +179,8 @@ async function outcome(rest, ctx) {
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
   const state = requireState(root);
+  // Best effort: a stale origin/<default_branch> (after update-branch + a plain pull) only makes coverage look invalid; offline keeps the cached ref.
+  refreshBaseRef(root, config);
   const hash = currentContentHash(root, config);
   // The owner's open extra-round grant for the next counted round, for the checked-out HEAD (chat mode only; codex-review is the authority).
   const head = headSha({ cwd: root });
@@ -213,7 +218,9 @@ function baseAfterConflictMerge({ root, config, toHead, forkPoint }) {
 // The records of `git diff --raw -z` / `git log --raw -z --format=`: `:<mode> <mode> <id> <id> <status>\0<path>\0`, repeated. Anything
 // that is not exactly that throws (the caller turns it into base-unresolved). Ids are 40 hex (SHA-1) or 64 hex (SHA-256); with
 // --no-renames the status is one of A, D, M, T. An empty field is accepted only where a record starts (git versions differ in
-// whether they put a NUL between the commits of a log). -> [{ path, id: the blob the path has after the change; all zeros = deleted }]
+// whether they put a NUL between the commits of a log). The output is decoded as UTF-8, so distinct non-UTF-8 file names would all become
+// the same U+FFFD string and ownAuthored could match a merge-only file against an ordinarily authored one: a path containing U+FFFD
+// throws (a real name that holds a literal U+FFFD is refused too, which is acceptable). -> [{ path, id: the blob the path has after the change; all zeros = deleted }]
 const RAW_META = /^:[0-7]{6} [0-7]{6} (?:[0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) [ADMT]$/;
 function parseRawZ(out) {
   const fields = out.split('\0');
@@ -223,6 +230,7 @@ function parseRawZ(out) {
     const m = RAW_META.exec(fields[i]);
     const file = fields[i + 1];
     if (!m || file === undefined || file === '') throw new Error(`unexpected git output: ${JSON.stringify(fields[i].slice(0, 80))}`);
+    if (file.includes('\uFFFD')) throw new Error(`a changed path is not valid UTF-8, so it cannot be told apart from other such paths: ${JSON.stringify(file.slice(0, 80))}`);
     records.push({ path: file, id: m[1] });
     i += 2;
   }
@@ -270,6 +278,18 @@ async function markImplemented(rest, ctx) {
       if (item.final?.decision !== 'ACCEPT') {
         throw new Fail(EXIT.USAGE, { ok: false, error: 'not-accepted', message: `${item.id} is not an accepted item, so it cannot be marked implemented` });
       }
+    }
+    // The hash must be measured from a FRESH origin/<default_branch>: a stale one makes the hash differ merely because main's new commits
+    // (merged into the PR by update-branch, pulled without a fetch of main) count as the PR's diff, and they would pass for the fix.
+    // So this fails CLOSED (exit 3, nothing marked) whenever the base ref used is origin/<branch> and it was not refreshed in this call:
+    // the fetch failed or timed out, or there is no origin remote but a leftover refs/remotes/origin/<branch>. Only a repo whose base
+    // resolves to the local <branch> (no origin/<branch> ref at all) has nothing to refresh and carries on.
+    const refresh = refreshBaseRef(root, config);
+    if (refresh.usesRemoteRef && !refresh.refreshed) {
+      throw new Fail(EXIT.UNAVAILABLE, {
+        ok: false, unavailable: true, reason: 'base-refresh',
+        message: `origin/${config.default_branch} could not be refreshed${refresh.reason ? ` (${refresh.reason})` : ''}, and a stale base would count the default branch's new commits as the fix: nothing was marked; retry when the remote is reachable`,
+      });
     }
     // An accepted item is only "implemented" by a change to the code: the branch content must differ from what the
     // round that accepted it reviewed. Otherwise an empty fix and an empty review round would clear a BLOCKING finding.

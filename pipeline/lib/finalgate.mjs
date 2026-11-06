@@ -59,6 +59,11 @@ const check = (name, ok, detail, ownerMerge = 0, ownerItems = []) => ({
   name, ok: ok === true, detail, ...(ownerMerge > 0 ? { ownerMerge } : {}), ...(ownerItems.length > 0 ? { ownerItems } : {}),
 });
 
+// A failing scan check that is a real VERDICT (hard-stop hits, integrity violations), as against one that could not run (a throw caught by
+// safely(), a diff that failed): carries verdict: true, which is how the merge dry run tells an owner-runs hand-off (the owner can act on a
+// verdict) from a crashed scan (no verdict at all, so nothing to hand off and no reason to take the merge hold).
+const verdictFail = (name, detail) => ({ ...check(name, false, detail), verdict: true });
+
 // ---- review-dir files ---------------------------------------------------------------------------
 
 export const reviewFile = (root, name) => join(root, '.review', name);
@@ -207,12 +212,109 @@ function behindBase({ info, diff, root, config, baseSha = null }) {
   return null;
 }
 
+// ---- --owner-go: "behind, but fresh enough" (merge.behind_base: disjoint) -------------------------------------------------------------
+
+// The mergeStateStatus values GitHub can report for a PR that is still mergeable as far as GitHub is concerned. ONE list for the real
+// `P merge --owner-go` and its --dry-run (merge.mjs imports it): never BEHIND (strict branch protection: GitHub itself refuses),
+// never DIRTY / UNKNOWN / DRAFT / anything else.
+export const READABLE_MERGE_STATES = new Set(['CLEAN', 'HAS_HOOKS', 'UNSTABLE', 'BLOCKED']);
+
+// Paths whose change on main changes how the PR's checks would run, over CI_PROOF_PROTECTED: attribute filters (nested files apply to their subtree;
+// `**/` also matches the root file), submodules, and the toolchain pins CI reads. The repo's own lists are added from the BASE branch.
+const BEHIND_TOOLCHAIN = Object.freeze(['**/.gitattributes', '**/.gitmodules', '**/.nvmrc', '**/.node-version', '**/.tool-versions']);
+const nfc = (s) => s.normalize('NFC');
+// Compared after NFC normalisation and lower-casing (case-insensitive and normalising file systems cannot tell these apart).
+const foldPath = (p) => nfc(p).toLowerCase();
+
+// merge.behind_base / behind_base_stale_paths / verify.ci_proof_inputs as the BASE commit has them (never the PR's own copy: a PR must not
+// loosen its own merge rule). { ok: false, reason } when the base has no usable config or has not opted in: strict, with the reason.
+function baseBehindSettings({ root, baseSha }) {
+  let parsed;
+  try {
+    const text = showFile(baseSha, '.claude/pipeline.yml', { cwd: root });
+    if (text === null) return { ok: false, reason: `the base commit ${short(baseSha)} has no .claude/pipeline.yml, so merge.behind_base is update` };
+    parsed = validateConfig(parseYaml(text));
+  } catch (err) {
+    return { ok: false, reason: `could not read the base commit's .claude/pipeline.yml: ${firstLine(err)}` };
+  }
+  if (!parsed.ok) return { ok: false, reason: `the base commit's .claude/pipeline.yml is not a valid config (${parsed.errors.slice(0, 2).join('; ')}), so merge.behind_base is update` };
+  const { merge, verify } = parsed.config;
+  if (merge.behind_base !== 'disjoint') return { ok: false, reason: `merge.behind_base is ${JSON.stringify(merge.behind_base)} in the base commit's .claude/pipeline.yml (set it to "disjoint" there to allow this)` };
+  return { ok: true, stale: [...merge.behind_base_stale_paths], inputs: [...(verify.ci_proof_inputs ?? [])] };
+}
+
+const namedFiles = (list) => `${list.slice(0, NAMED_SHOWN).join(', ')}${list.length > NAMED_SHOWN ? ', ...' : ''}`;
+
+// A PR that lacks commits of its base is "behind but fresh enough" only when ALL hold (plan 2026-11-05-small-fixes item 2):
+//   1. the BASE commit's config has merge.behind_base: disjoint;  2. GitHub says it can merge (a READABLE mergeStateStatus, MERGEABLE);
+//   3. the paths main changed since the merge base share none with the PR's paths (both read by diffFiles + pathsOf, compared folded);
+//   4. none of main's paths changes how the checks run (built-in list, the base's verify.ci_proof_inputs and merge.behind_base_stale_paths);
+//   4b. main did not remove a directory the PR adds into.
+// -> { ok: true, behindBy, mergeBase, mainFiles } or { ok: false, reason }. Never throws, never null: every doubt is a refusal.
+export function behindFreshEnough({ root, config, diff, baseSha, info }) {
+  const no = (reason) => ({ ok: false, reason });
+  const o = { cwd: root };
+  try {
+    if (typeof baseSha !== 'string' || !FULL_SHA.test(baseSha)) return no('GitHub did not name the base commit (baseRefOid)');
+    const settings = baseBehindSettings({ root, baseSha });
+    if (!settings.ok) return no(settings.reason);
+    const state = info?.mergeStateStatus;
+    if (!READABLE_MERGE_STATES.has(state)) return no(`GitHub's mergeStateStatus is ${JSON.stringify(state ?? null)}, not one of ${[...READABLE_MERGE_STATES].join('|')}`);
+    if (info?.mergeable !== 'MERGEABLE') return no(`GitHub's mergeable is ${JSON.stringify(info?.mergeable ?? null)}, not MERGEABLE`);
+    const d = diff();
+    if (!d.ok) return no(`the PR's diff could not be taken (${d.error})`);
+    const mb = d.mb;
+    if (typeof mb !== 'string' || !FULL_SHA.test(mb)) return no('the merge base of the PR could not be read');
+    const behindBy = Number(git(['rev-list', '--count', `HEAD..${baseSha}`], o).trim());
+    if (!Number.isInteger(behindBy) || behindBy < 1) return no('could not count the base commits the PR head lacks');
+
+    const mainPaths = [...new Set(diffFiles(mb, baseSha, o).flatMap(pathsOf))];
+    const prPaths = d.files.flatMap(pathsOf);
+    const prFolded = new Set(prPaths.map(foldPath));
+    const both = mainPaths.filter((p) => prFolded.has(foldPath(p)));
+    if (both.length > 0) return no(`${config.default_branch} changed ${both.length} file(s) this PR also touches (${namedFiles(both)})`);
+
+    const globs = [...CI_PROOF_PROTECTED, ...BEHIND_TOOLCHAIN, ...settings.inputs, ...settings.stale];
+    for (const p of mainPaths) {
+      const hit = globs.find((g) => matchGlob(p, g, { nocase: true }) || matchGlob(nfc(p), nfc(g), { nocase: true }));
+      if (hit !== undefined) return no(`${config.default_branch} changed ${p}, which changes how the checks run (matches ${hit})`);
+    }
+
+    // 4b: a path-level clash disjoint names cannot see (main moves src/foo/, the PR adds src/foo/new.js). Directories are compared folded,
+    // like the files above: main removing src/Foo/ while the PR adds src/foo/new.js is the same directory on a case-insensitive (or
+    // normalising) file system, so a literal tree lookup of the PR's spelling would miss it (Codex code review R1).
+    const foldedDirs = (rev) => {
+      const dirs = new Set();
+      for (const file of git(['ls-tree', '-r', '--name-only', '-z', rev], o).split('\0')) {
+        const parts = file.split('/');
+        for (let i = 1; i < parts.length; i += 1) dirs.add(foldPath(parts.slice(0, i).join('/')));
+      }
+      return dirs;
+    };
+    const atBase = foldedDirs(baseSha);
+    const removed = new Set([...foldedDirs(mb)].filter((dir) => !atBase.has(dir)));
+    for (const f of d.files) {
+      if ((f.status !== 'A' && f.status !== 'R') || typeof f.newPath !== 'string') continue;
+      const parts = f.newPath.split('/');
+      for (let i = 1; i < parts.length; i += 1) {
+        const dir = parts.slice(0, i).join('/');
+        if (removed.has(foldPath(dir))) return no(`${config.default_branch} removed ${dir}/, which this PR adds into (${f.newPath})`);
+      }
+    }
+    return { ok: true, behindBy, mergeBase: mb, mainFiles: mainPaths.length };
+  } catch (err) {
+    return no(`could not compare ${config.default_branch}'s new commits with the PR: ${firstLine(err)}`);
+  }
+}
+
 export const validLabels = (labels) => Array.isArray(labels) && labels.every((l) => isObject(l) && typeof l.name === 'string');
 
 // A reply that does not carry a proper label list is not "no blocking labels": it is no answer.
-export function labelsCheck(info) {
+// `exemptHold` (--owner-go, an eligible needs-human hold the owner's "merge" lifts, lib/hold.mjs): needs-human alone is not counted; every other blocking label is.
+const withoutHold = (names, exemptHold) => (exemptHold === true ? names.filter((n) => n.toLowerCase() !== 'needs-human') : names);
+export function labelsCheck(info, { exemptHold = false } = {}) {
   if (!validLabels(info?.labels)) return check('labels', false, 'PR labels could not be read (labels is missing or malformed)');
-  const blocking = blockingLabelsOf(info.labels);
+  const blocking = withoutHold(blockingLabelsOf(info.labels), exemptHold);
   return blocking.length ? check('labels', false, `blocking label(s): ${blocking.join(', ')}`) : check('labels', true, 'no blocking labels');
 }
 
@@ -488,7 +590,7 @@ async function hardstopsCheck({ root, config, diff }) {
   }
   const shown = blocking.slice(0, 5).map((h) => `${h.rule} ${h.file ?? ''}`.trim()).join('; ');
   const note = advisoryCount > 0 ? ` (+${advisoryCount} report-only)` : '';
-  return check('hardstops', false, `${blocking.length} hard-stop hit(s): ${shown}${blocking.length > 5 ? '; ...' : ''}${note}`);
+  return verdictFail('hardstops', `${blocking.length} hard-stop hit(s): ${shown}${blocking.length > 5 ? '; ...' : ''}${note}`);
 }
 
 function integrityCheck({ config, diff }) {
@@ -503,7 +605,7 @@ function integrityCheck({ config, diff }) {
       : check('integrity', true, 'no test weakening');
   }
   const shown = r.violations.slice(0, 5).map((v) => `${v.rule ?? v.type ?? 'violation'} ${v.file ?? ''}`.trim()).join('; ');
-  return check('integrity', false, `${r.violations.length} test-integrity violation(s): ${shown}`);
+  return verdictFail('integrity', `${r.violations.length} test-integrity violation(s): ${shown}`);
 }
 
 // How many owner-ruled items the review detail lists, and how much of each quote.
@@ -797,7 +899,8 @@ export function ownerItemsCheck({ items, hardstops, integrity, label }) {
   return check('owner-items', true, items.length === 0 ? 'none' : `${shown}: the owner's "merge" must be bound to them (items ${ownerItemsDigest(items)})`);
 }
 
-export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep }) {
+// `exemptHold` (Rev-4 8): the labels check ignores needs-human for the eligible hold the owner's "merge" names; nothing else does.
+export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep, exemptHold = false }) {
   const head = headSha({ cwd: root });
   const info = await readPrSettled({ gh, pr, fields: [...OWNER_GO_FIELDS], sleep, pauseMs: mergeablePause(env) });
   // The range is GitHub's: the PR's base commit and head, as read now. headRefOid must be the local HEAD (pr-open), baseRefOid a local object.
@@ -807,9 +910,21 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
   const hardstops = await safely('hardstops', () => hardstopsCheck({ root, config, diff }));
   const integrity = await safely('integrity', () => integrityCheck({ config, diff }));
   const items = [...(hardstops.ownerItems ?? []), ...(integrity.ownerItems ?? [])];
+  // Behind its base: refused as always, unless the BASE's merge.behind_base is "disjoint" and main's new commits are fresh enough (behindFreshEnough).
+  let behind = null;
+  let behindReason = behindBase({ info, diff, root, config, baseSha });
+  if (behindReason !== null) {
+    const fresh = behindFreshEnough({ root, config, diff, baseSha, info });
+    if (fresh.ok) {
+      behind = { behindBy: fresh.behindBy, mergeBase: fresh.mergeBase, baseRefOid: baseSha, mainFiles: fresh.mainFiles, rule: 'disjoint' };
+      behindReason = null;
+    } else {
+      behindReason = `${behindReason} (not accepted as behind-but-fresh-enough: ${fresh.reason})`;
+    }
+  }
   const checks = [
-    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config, baseSha }) })),
-    await safely('labels', () => labelsCheck(info)),
+    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindReason })),
+    await safely('labels', () => labelsCheck(info, { exemptHold })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
     await safely('scan-range', () => scanRangeCheck({ root, gh, pr, diff, info, explicit })),
     hardstops,
@@ -824,6 +939,8 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     // The range that was scanned, as GitHub named it: the final look before the merge command re-reads both and refuses if either moved.
     baseRefOid: baseSha,
     headRefOid: typeof info?.headRefOid === 'string' ? info.headRefOid : null,
+    // Set only when the PR lacks commits of its base and was accepted anyway (merge.behind_base: disjoint): what the owner is told and what the merge output carries.
+    behind,
     // The owner items of the diff, all from ONE list: their digest ('none' without items), the lines, and the areas they fall in.
     ownerItems: ownerItemsDigest(items),
     ownerItemLines: items,
@@ -889,7 +1006,8 @@ export function ownerGoBaseProblem(live) {
 // after that read, so a label, a pause issue or a new push can have landed since. Returns the reasons the merge
 // must not run (empty = go). An unreadable PR is a reason.
 // `base` (--owner-go): the base commit the scan was of; GitHub's baseRefOid must still be it.
-export async function preMergeProblems({ gh, pr, head, base = null }) {
+// `exemptHold` (--owner-go, only the look BEFORE the hold is lifted): needs-human is not counted. Once it is lifted the plain rule applies, and so does the wait.
+export async function preMergeProblems({ gh, pr, head, base = null, exemptHold = false }) {
   let view;
   try {
     view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft', ...(base !== null ? ['baseRefOid'] : [])]);
@@ -901,17 +1019,21 @@ export async function preMergeProblems({ gh, pr, head, base = null }) {
   if (view?.isDraft !== false) problems.push('PR is a draft');
   if (view?.headRefOid !== head) problems.push(`PR head is now ${short(view?.headRefOid)}, the gate approved ${short(head)}`);
   if (base !== null && view?.baseRefOid !== base) problems.push(`PR base is now ${short(view?.baseRefOid)}, the scan was of ${short(base)}: scan again`);
-  problems.push(...(await waitBlockers(gh)(view)));
+  problems.push(...(await waitBlockers(gh, { exemptHold })(view)));
   return problems;
 }
 
 // What can stop a queued merge while we wait: a blocking label, or an open pause/rollback issue. Anything unreadable
 // counts as a blocker (the safe direction here is "disable auto-merge").
-export function waitBlockers(gh) {
-  return async (view) => {
+// `base` (--owner-go): the base commit the merge was evaluated on; GitHub's baseRefOid moving off it is a blocker too (a queued merge
+// must not land on a base nobody checked). The blocker function lists the extra PR fields it needs in `fields` (waitForMerge reads them).
+export function waitBlockers(gh, { base = null, exemptHold = false } = {}) {
+  const blockers = async (view) => {
     const problems = [];
+    if (base !== null && view?.baseRefOid !== base) problems.push(`PR base is now ${short(view?.baseRefOid)}, the merge was evaluated on ${short(base)}`);
+    const blocking = validLabels(view?.labels) ? withoutHold(blockingLabelsOf(view.labels), exemptHold) : [];
     if (!validLabels(view?.labels)) problems.push('PR labels could not be read (labels is missing or malformed)');
-    else if (blockingLabelsOf(view.labels).length > 0) problems.push(`blocking label(s): ${blockingLabelsOf(view.labels).join(', ')}`);
+    else if (blocking.length > 0) problems.push(`blocking label(s): ${blocking.join(', ')}`);
     for (const label of ['pipeline-pause', 'pipeline-rollback']) {
       try {
         const issues = gh.listIssues({ label });
@@ -923,6 +1045,8 @@ export function waitBlockers(gh) {
     }
     return problems;
   };
+  blockers.fields = base !== null ? ['baseRefOid'] : [];
+  return blockers;
 }
 
 // Polls until the PR is MERGED, CLOSED, or the deadline passes. Transient gh errors are tolerated (a flaky call must
@@ -930,7 +1054,7 @@ export function waitBlockers(gh) {
 // it for problems and a non-empty answer ends the wait as 'blocked' (the caller disables auto-merge).
 export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sleep = defaultSleep, blockers = null }) {
   const deadline = now() + waitMs;
-  const fields = ['state', 'mergeCommit', ...(blockers ? ['labels'] : [])];
+  const fields = ['state', 'mergeCommit', ...(blockers ? ['labels', ...(blockers.fields ?? [])] : [])];
   let errors = 0;
   for (;;) {
     try {
@@ -957,11 +1081,20 @@ export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sle
   }
 }
 
-// No unattended queued merges: after a failed or timed-out merge, auto-merge must not be left armed. gh errors when
-// it was never enabled; that is expected and ignored.
+// No unattended queued merges: after a failed or timed-out merge, auto-merge must not be left armed. true = auto-merge is off.
+// gh errors when it was never enabled, so a failed --disable-auto is followed by one look at the PR: a clean read whose
+// `autoMergeRequest` is null proves nothing is armed (no false "check the PR by hand"). Anything else stays false.
 export function disableAutoMerge({ pr, cwd, env }) {
   const r = ghRun(['pr', 'merge', String(pr), '--disable-auto'], { cwd, env, timeoutMs: 60_000 });
-  return r.code === 0 && !r.timedOut;
+  if (r.code === 0 && !r.timedOut) return true;
+  const view = ghRun(['pr', 'view', String(pr), '--json', 'autoMergeRequest'], { cwd, env, timeoutMs: 60_000 });
+  if (view.code !== 0 || view.timedOut) return false;
+  try {
+    const json = JSON.parse(view.stdout);
+    return json !== null && typeof json === 'object' && Object.hasOwn(json, 'autoMergeRequest') && json.autoMergeRequest === null;
+  } catch {
+    return false;
+  }
 }
 
 // After a failed, blocked or timed-out wait: disarm auto-merge, then LOOK AT THE PR AGAIN. Auto-merge may have fired
