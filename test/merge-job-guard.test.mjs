@@ -223,3 +223,57 @@ test('R2-F1: value-taking short options and --end-of-options do not hide the rea
   }
 });
 
+// ---- review round 2 (R2-F2, #205): more verbs that move HEAD, a branch ref or the index ----
+test('R2-F2: bisect, update-index, fast-import, filter-branch and a fetch that can rewrite a local branch are refused in a job\'s checkout', () => {
+  const root = fakeRepo();
+  mark(root, process.pid, 12);
+  for (const command of [
+    'git bisect start HEAD HEAD~5',
+    'git bisect good',
+    'git bisect bad',
+    'git bisect reset',
+    'git bisect run ./t.sh',
+    'git bisect skip',
+    'git bisect replay log.txt',
+    'git update-index --add f',
+    'git update-index --remove f',
+    'git update-index --refresh',
+    'git fast-import',
+    'git filter-branch --env-filter true',
+    'git fetch -u origin +main:refs/heads/x',
+    'git fetch --update-head-ok origin +main:refs/heads/agent/x',
+    'git fetch --update-head origin main',
+    'git fetch origin +main:refs/heads/x',
+    'git fetch origin main:x', // an unqualified destination is guessed to be a branch
+    'git fetch -pu origin',
+    'git fetch origin -- main:refs/heads/x',
+  ]) {
+    const v = decide(command, root);
+    assert.equal(v.decision, 'deny', command);
+    assert.match(v.reason, /owns this checkout until it ends/, command);
+  }
+});
+
+test('R2-F2: plain fetch, a remote-tracking or tag destination and bisect log / view stay allowed in a job\'s checkout', () => {
+  const root = fakeRepo();
+  const other = fakeRepo();
+  mark(root, process.pid, 12);
+  for (const command of [
+    'git fetch',
+    'git fetch origin',
+    'git fetch origin main',
+    'git fetch --all --prune',
+    'git fetch -p origin',
+    'git fetch --depth 1 origin main',
+    'git fetch origin +refs/heads/*:refs/remotes/origin/*',
+    'git fetch origin refs/tags/v1:refs/tags/v1',
+    'git fetch git@github.com:o/r.git main',
+    'git bisect log',
+    'git bisect visualize',
+    'git bisect view',
+  ]) {
+    assert.equal(decide(command, root).decision, 'allow', command);
+  }
+  assert.equal(decide('git bisect start HEAD HEAD~5', other).decision, 'allow'); // another checkout
+  assert.equal(decide('git update-index --add f', other).decision, 'allow');
+});

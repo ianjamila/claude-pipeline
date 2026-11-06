@@ -684,7 +684,8 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
 // R1-B3: also the plumbing / porcelain that moves a ref, HEAD, the index or the worktree: update-ref, symbolic-ref (with a target or -d), branch (force / move / delete / force-copy), clean, read-tree, checkout-index,
 // apply (unless it only checks or counts), add, rm, mv (unless a dry run). Their read-only forms stay allowed (symbolic-ref HEAD, branch / branch --list, apply --check, add -n).
 const MERGE_JOB_VERBS = new Set(['checkout', 'switch', 'reset', 'commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'stash', 'pull', 'restore', 'am',
-  'update-ref', 'symbolic-ref', 'branch', 'clean', 'read-tree', 'checkout-index', 'apply', 'add', 'rm', 'mv']);
+  'update-ref', 'symbolic-ref', 'branch', 'clean', 'read-tree', 'checkout-index', 'apply', 'add', 'rm', 'mv',
+  'bisect', 'update-index', 'fast-import', 'filter-branch', 'fetch']);
 // The options of a git command line, parsed like git does (parseOpts): up to `--` or `--end-of-options`, a value-taking short
 // (`clean -e <pattern>`) swallows the rest of its cluster, and long options that take a value swallow the next word.
 // R2-B1 / R2-F1: presence alone is not enough (`clean -nd --no-dry-run`, `clean -fen .`, `add --end-of-options -n .`).
@@ -730,7 +731,18 @@ function mergeJobReadOnly(verb, args, words) {
       const o = jobOptions(args, ADD_RM_MV_CLEAN[verb]);
       return o.has('dry-run', 'n') && !o.negated;
     }
-    default: return false; // update-ref, read-tree, checkout-index: no read-only form
+    case 'bisect': return ['log', 'visualize', 'view', 'terms', 'help'].includes(String(words[0] ?? '').toLowerCase()); // everything else moves HEAD or only works mid-bisect
+    case 'fetch': { // plain `fetch` / `fetch origin main` only moves remote-tracking refs; `-u` / a refs/heads destination can move the checked-out branch
+      const o = jobOptions(args, { shortValue: 'j', longValue: ['depth', 'deepen', 'shallow-since', 'shallow-exclude', 'negotiation-tip', 'server-option', 'jobs', 'filter', 'recurse-submodules', 'refmap', 'upload-pack', 'submodule-prefix', 'recurse-submodules-default', 'negotiate-only'] });
+      if (o.has('update-head-ok', 'u') || o.abbrevOf('update-head-ok') || o.has('multiple')) return false;
+      return !o.positionals.slice(1).some((r) => { // the first positional is the repository; a colon inside it is just part of the URL
+        const colon = r.indexOf(':');
+        if (colon < 0) return false;
+        const dest = r.slice(colon + 1);
+        return dest !== '' && (dest.startsWith('refs/heads/') || !dest.startsWith('refs/'));
+      });
+    }
+    default: return false; // update-ref, read-tree, checkout-index, update-index, fast-import, filter-branch: no read-only form
   }
 }
 function mergeJobDeny(job, what) {
