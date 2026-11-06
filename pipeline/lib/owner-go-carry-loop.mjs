@@ -18,6 +18,7 @@ import { loadConfig, requiredChecks } from './config.mjs';
 import { abandonMerge, blockingLabelsOf, mergeTiming } from './finalgate.mjs';
 import { NETWORK_TIMEOUT_MS, git } from './git.mjs';
 import { EXIT } from './cli.mjs';
+import { githubDefaultBranchOf } from './repo.mjs';
 
 export const MAX_CARRY_CYCLES = 3;
 const HOLD_OUTCOMES = new Set(['queued-behind', 'hold-unreadable']);
@@ -88,7 +89,8 @@ export async function runCarryLoop(a) {
         return stop('A needs-human hold appeared while the merge job was running, and a held PR never carries the owner\'s go.', { voids: true, code: 'carry-hold' });
       }
       if (blockingLabelsOf(view.labels).length > 0) return stop(`A blocking label appeared (${blockingLabelsOf(view.labels).join(', ')}).`);
-      if (view.baseRefName !== gh.repo().defaultBranch) return stop(`The PR now targets ${view.baseRefName}, not the default branch ${gh.repo().defaultBranch}.`, { voids: true, code: 'carry-base' });
+      const defaultBranch = githubDefaultBranchOf(gh.repo());
+      if (defaultBranch === null || view.baseRefName !== defaultBranch) return stop(defaultBranch === null ? 'GitHub did not name the repository\'s default branch, so the PR\'s base cannot be checked against it.' : `The PR now targets ${view.baseRefName}, not the default branch ${defaultBranch}.`, { voids: true, code: 'carry-base' });
 
       const synced = await bringUpToDate({
         gh, pr, expectHead: cur, maxCycles: 1, waitChecks: false, beforeUpdate: holdsConfigured(config) ? () => holdGate({ config, pr, root, env }) : null, ...updateTiming(env),

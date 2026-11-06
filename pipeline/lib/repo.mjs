@@ -23,10 +23,14 @@ export function pipelineStateDir(cwd = process.cwd()) {
 // owner/name from GitHub (gh resolves the right remote, including forks and SSH remotes).
 // host (Phase 3b): the server gh resolved it on, from the repo's url (lower-case; null when gh gives none): GH_HOST, an ssh host
 // alias or a sole logged-in enterprise host can point gh at a server other than github.com, where owner/name is another repository.
+// GitHub's own default branch for F2 (merge-carry): never the 'main' fallback. A repo object without the field (a test double) answers with defaultBranch.
+export const githubDefaultBranchOf = (r) => (r && Object.hasOwn(r, 'githubDefaultBranch') ? r.githubDefaultBranch : r?.defaultBranch) || null;
+
 export function repoSlug(cwd = process.cwd(), { ghJsonFn = ghJson } = {}) {
   const r = ghJsonFn(['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,url'], { cwd });
   const [owner, name] = String(r.nameWithOwner || '').split('/');
   if (!owner || !name) throw new Error(`could not resolve GitHub repo for ${cwd}`);
   const host = /^https?:\/\/([^/]+)\//i.exec(String(r.url ?? ''))?.[1]?.toLowerCase() ?? null;
-  return { owner, name, slug: `${owner}/${name}`, host, defaultBranch: r.defaultBranchRef?.name || 'main' };
+  // githubDefaultBranch (F2): the default branch exactly as GitHub named it, null when it named none (defaultBranch falls back to 'main' for older callers).
+  return { owner, name, slug: `${owner}/${name}`, host, defaultBranch: r.defaultBranchRef?.name || 'main', githubDefaultBranch: r.defaultBranchRef?.name || null };
 }

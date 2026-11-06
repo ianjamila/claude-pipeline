@@ -19,6 +19,7 @@ import { blockingHits, collectHardStops, ownerMergeHits } from './hardstops.mjs'
 import { checkIntegrity } from './integrity.mjs';
 import { runPreflight } from './preflight.mjs';
 import { toPosix } from './paths.mjs';
+import { githubDefaultBranchOf } from './repo.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
@@ -1005,7 +1006,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
   }
   const checks = [
     await safely('pr-open', () => {
-      const named = gh.repo()?.defaultBranch;
+      const named = githubDefaultBranchOf(gh.repo());
       return prOpenCheck({ info, head, config, behind: behindReason, defaultBranch: typeof named === 'string' && named !== '' ? named : '' });
     }),
     await safely('labels', () => labelsCheck(info, { exemptHold })),

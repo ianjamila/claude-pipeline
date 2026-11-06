@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { repoRoot, gitCommonDir, pipelineStateDir, repoSlug } from '../pipeline/lib/repo.mjs';
+import { repoRoot, gitCommonDir, pipelineStateDir, repoSlug, githubDefaultBranchOf } from '../pipeline/lib/repo.mjs';
 
 test('repoRoot and gitCommonDir resolve for a repo and its worktree', () => {
   const r = createTmpRepo();
@@ -20,7 +20,12 @@ test('repoRoot and gitCommonDir resolve for a repo and its worktree', () => {
 
 test('repoSlug parses nameWithOwner and default branch', () => {
   const s = repoSlug('.', { ghJsonFn: () => ({ nameWithOwner: 'o/r', defaultBranchRef: { name: 'trunk' } }) });
-  assert.deepEqual(s, { owner: 'o', name: 'r', slug: 'o/r', host: null, defaultBranch: 'trunk' });
+  assert.deepEqual(s, { owner: 'o', name: 'r', slug: 'o/r', host: null, defaultBranch: 'trunk', githubDefaultBranch: 'trunk' });
+  const none = repoSlug('.', { ghJsonFn: () => ({ nameWithOwner: 'o/r' }) });
+  assert.equal(none.defaultBranch, 'main');
+  assert.equal(none.githubDefaultBranch, null, 'F2 never sees the main fallback');
+  assert.equal(githubDefaultBranchOf(none), null);
+  assert.equal(githubDefaultBranchOf({ defaultBranch: 'trunk' }), 'trunk');
   // (Phase 3b) the host gh resolved the repository on, from its url
   const at = (url) => repoSlug('.', { ghJsonFn: () => ({ nameWithOwner: 'o/r', url }) }).host;
   assert.equal(at('https://GitHub.com/o/r'), 'github.com');
