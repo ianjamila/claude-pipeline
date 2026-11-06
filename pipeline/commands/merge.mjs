@@ -21,7 +21,9 @@ import { loadState } from '../lib/state.mjs';
 import { CARRY_LINE, CARRY_MIN_HEAD, approvalConfigDirHint, approvalGap, areasBlock, carryApprovalFor, holdBlock, readyLine } from '../hooks/lib/owner-go.mjs';
 import { carryVerdict } from '../lib/carry-verdict.mjs';
 import { carriesApproval } from '../lib/approval-carry.mjs';
-import { commitInfoOf, runCarryLoop } from '../lib/owner-go-carry-loop.mjs';
+import { commitInfoOf, recoverDeadJob, runCarryLoop } from '../lib/owner-go-carry-loop.mjs';
+import { readMarker as readMergeJob } from '../lib/merge-job.mjs';
+import { isPidAlive } from '../lib/locks.mjs';
 import { findOrphanedLift, holdTiming, mergeInProgress, parkNoteOf, readEligibleHold, recoverOrphanedLift, withHoldLifted, withMergeLock } from '../lib/hold.mjs';
 import {
   GATE_FILE, PR_FIELDS, READABLE_MERGE_STATES, abandonMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, preMergeProblems, readReviewJson,
@@ -320,6 +322,13 @@ async function underReviewLock({ root, pr, ctx, fn }) {
 // The --owner-go route: today's path (review lock, the local HEAD, exact-head approval) first. Only an unheld PR that is behind its base ALONE and whose owner record for this head carries the Carry line
 // enters the merge-carry loop (lib/owner-go-carry-loop.mjs), which works WITHOUT the review lock and takes it for the final phase only.
 async function ownerGoRoute({ root, config, pr, gh, ctx, track }) {
+  // R1-B1: a merge job for this PR that died (marker with a dead pid) may have left auto-merge armed or even merged the PR. GitHub is reconciled before the first live evaluation, whatever that evaluation will say
+  // (a blocking label or a lapsed record would otherwise leave the queued merge to land on its own). A live job of another process owns the checkout: busy.
+  const env = ctx.env ?? process.env;
+  const dead = await recoverDeadJob({ gh, pr, root, config, env, disable: ctx.carry?.disableAuto, abandon: ctx.carry?.abandon, log: ctx.carry?.log ?? ((m) => process.stderr.write(`merge-carry: ${m}\n`)) });
+  if (dead?.busy) return refuse('carry-checkout', [`${dead.busy}; nothing was changed`], { checkout: 'busy' });
+  if (dead?.stop) return refuse(dead.code, [dead.stop], {});
+  if (dead?.merged) return { exitCode: EXIT.OK, output: { ok: true, merged: true, mode: 'owner-go', head: headSha({ cwd: root }), mergeSha: dead.mergeSha, note: dead.note } };
   const first = await underReviewLock({ root, pr, ctx, fn: () => ownerGoMerge({ root, config, pr, gh, ctx, track }) });
   if (first?.enterCarry === undefined) return first;
   return runCarryLoop({
@@ -522,6 +531,14 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     }
     ({ orphan } = found);
     if (found.unverified !== null && (ownerGo || !found.commentsUnreadable)) add('hold-lift-unverified', `could not check whether an earlier --owner-go run left a needs-human hold lifted (${found.unverified}): the real run refuses (hold-recovery)`);
+  }
+  // R1-B1: a merge job that died (dead pid in .review/merge-job.json) may have left auto-merge armed; the real run reconciles it first. Read-only here: reported, nothing disarmed.
+  if (ownerGo) {
+    const job = readMergeJob(root);
+    if (job !== null && job.pid !== process.pid) {
+      if (isPidAlive(job.pid)) add('merge-job-busy', `a \`P merge --owner-go\` job (pid ${job.pid}, PR #${job.pr}) owns this checkout: the real run refuses until it ends`);
+      else if (job.pr === pr) add('merge-job-dead', `an earlier \`P merge --owner-go\` job for #${pr} died holding this checkout (pid ${job.pid}); the real run first checks on GitHub whether it merged the PR or left auto-merge armed (and disables it) before anything else`);
+    }
   }
   if (orphan !== null) add('hold-lift-orphan', `an earlier \`P merge --owner-go\` lifted needs-human hold ${orphan.hold} and died before it merged; the real run puts the label back first and refuses (the owner then says "merge" again, for the new hold)`);
 

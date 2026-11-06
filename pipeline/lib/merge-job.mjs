@@ -29,7 +29,7 @@ const git = (root, args) => run('git', ['-C', root, ...args], { env: GIT_ENV, ti
 const out = (r) => r.stdout.trim();
 const failText = (r) => (r.stderr || r.stdout || `exit ${r.code}`).trim().split(/\r?\n/).slice(0, 3).join(' / ');
 
-function readMarker(root) {
+export function readMarker(root) {
   try { return parseMergeJobMarker(readFileSync(markerFile(root), 'utf8')); } catch { return null; }
 }
 

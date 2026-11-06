@@ -7,7 +7,8 @@
 //   the carry proof re-made against the scan's own base + merge, under the review lock.
 // Anything else than "the base moved" is terminal and says, in plain English, what stopped it and whether the owner's go is void (say "merge" again) or still stands (retry later).
 // C10(a): after ANY merge-command invocation a retry needs abandonMerge to confirm auto-merge is off AND a re-read PR that is OPEN with no auto-merge request.
-import { claimCheckout, advanceCheckout, verifyCheckout, releaseCheckout } from './merge-job.mjs';
+import { claimCheckout, advanceCheckout, verifyCheckout, releaseCheckout, readMarker } from './merge-job.mjs';
+import { isPidAlive } from './locks.mjs';
 import { bringUpToDate, updateTiming } from './updatebranch.mjs';
 import { holdGate, holdsConfigured } from './merge-hold.mjs';
 import { readEligibleHold } from './hold.mjs';
@@ -31,6 +32,45 @@ export const commitInfoOf = (gh) => async (sha) => {
   return { verified: v.verified, committerEmail: v.committerEmail };
 };
 
+/**
+ * R1-B1: a merge job for `pr` died holding the checkout (its marker's pid is gone). GitHub is reconciled before anything is evaluated, for ANY outcome of the run: merged? still open with
+ * auto-merge queued (it is disabled and must read back off)? Run by the --owner-go route before its first live evaluation and by the loop for a marker it replaced.
+ * @returns {Promise<null | {merged: true, mergeSha: string|null, note: string} | {stop: string, code: string}>} null: nothing left to do, go on.
+ */
+export async function reconcileDeadJob({ gh, pr, root, config, env, disable, abandon = abandonMerge, log = () => {} }) {
+  let view;
+  try {
+    view = gh.prView(pr, ['state', 'mergeCommit', 'autoMergeRequest']);
+  } catch (err) {
+    return { stop: `An earlier merge job for this PR died and GitHub could not be read to see what it left (${String(err?.message ?? err).slice(0, 160)}); nothing was updated.`, code: 'carry' };
+  }
+  if (view.state === 'MERGED') return { merged: true, mergeSha: view.mergeCommit?.oid ?? null, note: 'an earlier merge job for this PR had already merged it' };
+  if (view.state !== 'OPEN') return { stop: `An earlier merge job died and the PR is ${view.state}; nothing was updated.`, code: 'carry' };
+  if (view.autoMergeRequest) {
+    const ab = await abandon({ gh, pr, cwd: root, env, pollMs: mergeTiming(config, env).pollMs, disable });
+    if (ab.merged) return { merged: true, mergeSha: ab.mergeSha ?? null, note: 'an earlier merge job armed auto-merge and the PR merged while it was being disabled' };
+    if (ab.autoMergeDisabled !== true || ab.readError) return { stop: 'An earlier merge job died with auto-merge armed and it could not be confirmed off: disable it by hand; nothing was updated.', code: 'carry-disarm' };
+    log('an earlier job left auto-merge armed: disabled it');
+  }
+  return null;
+}
+
+/**
+ * The top of the --owner-go route (R1-B1). A live marker of another process owns this checkout: busy. A dead marker for this PR is reconciled (reconcileDeadJob) and, once GitHub is settled, removed.
+ * A dead marker of another PR is not this PR's to reconcile and is left for the next claim to replace.
+ * @returns {Promise<null | {busy: string} | {merged: true, mergeSha: string|null, note: string} | {stop: string, code: string}>} null: go on.
+ */
+export async function recoverDeadJob({ gh, pr, root, config, env, disable, abandon, log }) {
+  const marker = readMarker(root);
+  if (marker === null) return null;
+  if (marker.pid !== process.pid && isPidAlive(marker.pid)) return { busy: `another merge job (pid ${marker.pid}, PR #${marker.pr}) already owns this checkout` };
+  if (marker.pr !== pr) return null;
+  const dead = await reconcileDeadJob({ gh, pr, root, config, env, disable, abandon, log });
+  if (dead?.stop) return dead;
+  releaseCheckout({ root, marker }); // (GitHub is settled: merged, or open with nothing queued)
+  return dead;
+}
+
 const VOID_NOTE = 'The owner\'s "merge" no longer covers what is on the PR: show the request again and wait for the owner to say "merge".';
 const retryNote = (pr) => `The owner's "merge" still stands: run \`P merge --pr ${pr} --owner-go\` again later (the branch is already updated; nothing else changed).`;
 
@@ -48,7 +88,6 @@ export async function runCarryLoop(a) {
   const log = seam.log ?? ((m) => process.stderr.write(`merge-carry: ${m}\n`));
   const stats = { from: a.head, to: a.head, cycles: 0, updates: 0 };
   const stop = (reason, { voids = false, code = 'carry', extra = {} } = {}) => refuse(code, [`${reason} ${voids ? VOID_NOTE : retryNote(pr)}`], { head: stats.to, carry: { ...stats }, goVoid: voids, ...extra });
-  const abandon = (args) => (seam.abandon ?? abandonMerge)({ ...args, disable: seam.disableAuto });
 
   const claim = claimCheckout({ root, pr });
   if (!claim.ok) return stop(`The merge job could not take over this checkout (${claim.reason}); nothing was updated.`, { code: 'carry-checkout', extra: { checkout: claim.code } });
@@ -59,21 +98,11 @@ export async function runCarryLoop(a) {
       output: { ok: true, merged: true, mode: 'owner-go', head: stats.to, mergeSha: mergeSha ?? null, carried: { ...stats }, ...extra },
     });
     // §11.10: a previous job for this PR died holding the checkout: GitHub is reconciled before anything else (merged? auto-merge queued?).
+    // (commands/merge.mjs already did this at the top of the route, so this only catches a job that died in between.)
     if (claim.replaced && claim.replaced.pr === pr) {
-      let view;
-      try {
-        view = gh.prView(pr, ['state', 'mergeCommit', 'autoMergeRequest']);
-      } catch (err) {
-        return stop(`An earlier merge job for this PR died and GitHub could not be read to see what it left (${String(err?.message ?? err).slice(0, 160)}); nothing was updated.`);
-      }
-      if (view.state === 'MERGED') return mergedOut(view.mergeCommit?.oid, { note: 'an earlier merge job for this PR had already merged it' });
-      if (view.state !== 'OPEN') return stop(`An earlier merge job died and the PR is ${view.state}; nothing was updated.`);
-      if (view.autoMergeRequest) {
-        const ab = await abandon({ gh, pr, cwd: root, env, pollMs: mergeTiming(config, env).pollMs });
-        if (ab.merged) return mergedOut(ab.mergeSha, { note: 'an earlier merge job armed auto-merge and the PR merged while it was being disabled' });
-        if (ab.autoMergeDisabled !== true || ab.readError) return stop('An earlier merge job died with auto-merge armed and it could not be confirmed off: disable it by hand; nothing was updated.');
-        log('an earlier job left auto-merge armed: disabled it');
-      }
+      const dead = await reconcileDeadJob({ gh, pr, root, config, env, disable: seam.disableAuto, abandon: seam.abandon, log });
+      if (dead?.merged) return mergedOut(dead.mergeSha, { note: dead.note });
+      if (dead) return stop(dead.stop, { code: dead.code });
     }
 
     let cur = a.head; // the GitHub head the checkout holds (H(i-1))
