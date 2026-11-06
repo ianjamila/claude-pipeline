@@ -16,7 +16,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { addRound, decodeFromComment, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../pipeline/lib/review-marker.mjs';
-import { readBaseline, readPublished, publishTriage, reviewContentHash, writeBaseline } from '../pipeline/lib/review-publish.mjs';
+import { establishBaseline, readBaseline, readPublished, publishTriage, reviewContentHash, writeBaseline } from '../pipeline/lib/review-publish.mjs';
 import { reviewLockName } from '../pipeline/lib/review-context.mjs';
 import { reviewEligibilityProblems, rulingContentDigest, rulingsBlock, rulingsDigest, rulingsInventory } from '../pipeline/lib/triage.mjs';
 import { buildReviewPrompt } from '../pipeline/lib/codex.mjs';
@@ -174,6 +174,22 @@ test('publishTriage: a failed upsert leaves the baseline alone', (t) => {
   gh.fail = true;
   assert.throws(() => publishTriage({ gh, root, pr: 7, state: mk([it('R1-B1')]) }), /boom/);
   assert.equal(readBaseline(root, 7), null);
+});
+
+test('establishBaseline (R6-F1): with a baseline already present it makes no GitHub read; without one it reads once and writes it when the states are equal', (t) => {
+  const root = tmpRoot(t);
+  const s = mk([it('R1-B1')]);
+  const gh = memGh([mine(s)]);
+  let reads = 0;
+  const listComments = gh.listComments;
+  gh.listComments = (...a) => { reads += 1; return listComments(...a); };
+  assert.equal(establishBaseline({ gh, root, pr: 7, state: s }), true);
+  assert.equal(reads, 1, 'no baseline: one comments read');
+  assert.equal(readBaseline(root, 7), reviewContentHash(s));
+  reads = 0;
+  assert.equal(establishBaseline({ gh, root, pr: 7, state: s }), false);
+  assert.equal(reads, 0, 'baseline present: no comments read');
+  assert.equal(establishBaseline({ gh, root, pr: 7, state: s, published: readPublished(memGh([mine(s)]), 7) }), false, 'a passed published result is still honoured');
 });
 
 // ---- CLI: two worktrees of one PR ---------------------------------------------------------------
