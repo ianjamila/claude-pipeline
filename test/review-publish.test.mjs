@@ -333,6 +333,59 @@ test('state show: a truly superseded copy is still quarantined (other published 
   assert.equal(c.show(c.A).json.source, 'quarantined');
 });
 
+// A Claude ruling is published, then changed locally (tightened to ACCEPT, or overridden by the owner) and the publication failed or was never made: the PR
+// still holds the baseline, so the change is local progress (R1-B2, R1-F1). The same change on top of a PR that moved on is a superseded copy.
+const claudeRejected = () => mk([it('R1-B1', { final: claudeFinal() }), it('R1-S1', { bucket: 'SUGGESTION', category: 'design', final: decided() })]);
+const tightened = () => claudeFinal({ decision: 'ACCEPT', reason: 'real after all', claude: { ruledAt: 'later', cause: 'low-confidence', critical: false, overruled: claudeFinal() } });
+const overridden = () => ({ decision: 'ACCEPT', by: 'owner', needsHuman: false, reason: 'owner says fix', ownerQuote: 'R1-B1: accept', ruledAt: 'later', overruled: claudeFinal() });
+
+test('state show: a published Claude ruling tightened to ACCEPT, or overridden by the owner, locally is kept (local-ahead), not quarantined', (t) => {
+  for (const [name, final] of [['tightened', tightened()], ['owner override', overridden()]]) {
+    const w = world(t);
+    const s0 = claudeRejected();
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0);
+    const ahead = change(s0, 'R1-B1', { final });
+    saveState(w.A, ahead);
+    const r = w.show(w.A);
+    assertExit(r, 0, name + r.stdout + r.stderr);
+    assert.equal(r.json.source, 'local-ahead', name);
+    assert.deepEqual(w.state(w.A), JSON.parse(JSON.stringify(ahead)), `${name}: the local decision is untouched`);
+    assert.equal(readdirSync(join(w.A, '.review')).filter((n) => n.startsWith('stale-')).length, 0, `${name}: nothing was quarantined`);
+    assertExit(w.comment(w.A), 0, name);
+    assert.equal(w.pub().rounds[0].items[0].final.decision, 'ACCEPT', `${name}: published now`);
+    assert.equal(w.show(w.A).json.source, 'local', name);
+  }
+});
+
+test('state show: the same local change is quarantined when the PR moved on, and an unrelated local final change is never local-ahead', (t) => {
+  for (const [name, final] of [['tightened', tightened()], ['owner override', overridden()]]) {
+    const w = world(t);
+    const s0 = claudeRejected();
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0);
+    writeBaseline(w.A, 7, H('f')); // another checkout published since
+    saveState(w.A, change(s0, 'R1-B1', { final }));
+    const r = w.show(w.A);
+    assert.equal(r.json.source, 'quarantined', name);
+    assert.equal(w.state(w.A).rounds[0].items[0].final.by, 'claude', `${name}: the published ruling is restored`);
+    assert.equal(w.state(w.A).rounds[0].items[0].final.decision, 'REJECT', name);
+  }
+  // baseline equal, but the local final does not continue the published one: a loosened Claude ACCEPT, an owner final that overrules something else, a plain edit
+  const accepted = mk([it('R1-B1', { final: claudeFinal({ decision: 'ACCEPT' }) })]);
+  for (const [name, base, final] of [
+    ['loosened', accepted, claudeFinal({ decision: 'REJECT', claude: { ruledAt: 'later', cause: 'low-confidence', critical: true, overruled: claudeFinal({ decision: 'ACCEPT' }) } })],
+    ['foreign owner final', claudeRejected(), { ...overridden(), overruled: waiting() }],
+    ['plain edit', claudeRejected(), decided({ decision: 'REJECT', reason: 'loosened by hand' })],
+  ]) {
+    const w = world(t);
+    saveState(w.A, base);
+    assertExit(w.comment(w.A), 0);
+    saveState(w.A, change(base, 'R1-B1', { final }));
+    assert.equal(w.show(w.A).json.source, 'quarantined', name);
+  }
+});
+
 test('state discard-round: refused while the round holds a second-review verdict, allowed without one', (t) => {
   const w = world(t);
   saveState(w.A, change(waitingState(), 'R1-B1', { secondReview: verdict() }));
