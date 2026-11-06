@@ -26,7 +26,7 @@ export const meta = {
     '  equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,',
     '  quarantinedTo) and the published state is restored. source is local | published | quarantined | local-ahead | local-unverified',
     '  (local-ahead: the PR still holds what this copy last published, and the local copy holds a second-review verdict or a Claude / forced final that was',
-    '  never published, or a decision that continues the published Claude / forced final (a tightened ACCEPT, an owner override: its overruled final is the published one): kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline',
+    '  never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final): kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline',
     '  (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)',
     '  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)',
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
@@ -62,16 +62,37 @@ function recoverState(root, pr, ctx) {
 }
 
 // The local copy holds a second-review verdict or a Claude / forced final that the published copy lacks for the same item (what a ruling saved while
-// GitHub was down, or a second review, leaves behind), or a decision that CONTINUES the published protected final: Claude tightening a published dismissal,
-// a second review forcing ACCEPT over it, or the owner's typed override (plan E6), each of which records the final it replaced (final.claude.overruled /
-// final.overruled). With the published copy equal to this copy's baseline that is plain local progress, not a superseded copy: it must be published,
-// not quarantined. Anything that does not name the published final as the one it replaced stays a superseded copy.
-const continuesPublished = (mine, theirs) => {
-  if (!isProtectedFinal(theirs) || mine.final === undefined || canonicalJson(mine.final) === canonicalJson(theirs.final)) return false;
-  if (theirs.final.decision === 'ACCEPT' && !isOwnerRuled(mine)) return false; // Claude cannot loosen an ACCEPT (only the owner's ruling can)
-  const replaced = isOwnerRuled(mine) ? mine.final.overruled : isProtectedFinal(mine) ? mine.final.claude?.overruled : undefined;
-  return replaced !== undefined && canonicalJson(replaced) === canonicalJson(theirs.final);
+// GitHub was down, or a second review, leaves behind), or a decision that CONTINUES the published final: Claude tightening a published dismissal, a second
+// review forcing ACCEPT over it, or the owner's typed override (plan E6) of a Claude final or of an item still waiting for a human, each of which records the
+// final it replaced (final.claude.overruled / final.overruled). Several such steps may be unpublished (a Claude REJECT re-ruled FOLLOW-UP, then ACCEPT, then
+// the owner), each nesting the previous final: the chain is walked back until it reaches the published final. With the published copy equal to this copy's
+// baseline that is plain local progress, not a superseded copy: it must be published, not quarantined. Anything that does not reach the published final
+// within MAX_CHAIN steps, or whose steps are not each a valid continuation, stays a superseded copy (fail closed).
+const MAX_CHAIN = 8;
+// One step: `cur` replaced `prev`. The owner may rule over a Claude / forced final or a final waiting for a human; Claude may not loosen a protected
+// ACCEPT, and may not overrule the owner. The caller has checked that `prev` is the final `cur` names as the one it replaced.
+const validStep = (cur, prev) => {
+  const owner = isOwnerRuled({ final: cur });
+  if (owner) return isProtectedFinal({ final: prev }) || prev.needsHuman === true;
+  if (isOwnerRuled({ final: prev })) return false;
+  return !(isProtectedFinal({ final: prev }) && prev.decision === 'ACCEPT');
 };
+const replacedBy = (final) => (isOwnerRuled({ final }) ? final.overruled : isProtectedFinal({ final }) ? final.claude?.overruled : undefined);
+const continuesPublished = (mine, theirs) => {
+  const published = theirs.final;
+  if (mine.final === undefined || published === undefined || canonicalJson(mine.final) === canonicalJson(published)) return false;
+  if (!isProtectedFinal(theirs) && published.needsHuman !== true) return false;
+  const target = canonicalJson(published);
+  let cur = mine.final;
+  for (let depth = 0; depth < MAX_CHAIN; depth++) {
+    const prev = replacedBy(cur);
+    if (!isObjectLike(prev) || !validStep(cur, prev)) return false;
+    if (canonicalJson(prev) === target) return true;
+    cur = prev;
+  }
+  return false;
+};
+const isObjectLike = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 function localAheadOfPublished(local, published, baseline) {
   if (baseline === null || published.hash !== baseline) return false;
@@ -137,7 +158,7 @@ async function showLocked(values, n, pr, root, ctx) {
     if (found?.state && !stateExtends(state, found.state)) {
       if (localAheadOfPublished(state, found, readBaseline(root, pr))) {
         source = 'local-ahead';
-        warnings.push(`the local review state holds a second-review verdict or a Claude ruling that the published triage comment lacks (it was saved but not published): kept as is; publish it now with \`pipeline comment --pr ${pr} --kind triage\``);
+        warnings.push(`the local review state holds a second-review verdict, a Claude ruling (or a change to one) or an owner ruling that the published triage comment lacks (it was saved but not published): kept as is; publish it now with \`pipeline comment --pr ${pr} --kind triage\``);
       } else {
         quarantinedTo = path.relative(root, quarantineReviewDir(root)).split(path.sep).join('/');
         state = found.state;
