@@ -209,8 +209,8 @@ test('a record with no rulings field refuses a PR with rulings and approves one 
 // ---- the review-complete check (E5) -----------------------------------------------------------------------------------------------------
 
 const gh = (comments) => ({ viewer: () => 'me', listComments: () => comments });
-async function checkWorld({ items = [], marker = {}, local = 'state', state, yml = goYml(), later = null } = {}) {
-  const s = scenario({ yml, report: null, state: null, change: unique });
+async function checkWorld({ items = [], marker = {}, local = 'state', state, yml = goYml(), later = null, baseFiles = {} } = {}) {
+  const s = scenario({ yml, report: null, state: null, change: unique, baseFiles });
   const { config } = await loadConfig(s.repo.dir);
   const st = state ?? rulingState({ hash: s.hash, items, rounds: later ? later(s.hash) : [] });
   if (local === 'state') saveState(s.repo.dir, st);
@@ -353,11 +353,14 @@ test('review-complete: evaluateOwnerGo measures from GitHub\'s base, so a stale 
 });
 
 test('review-complete: the docs-only exemption keeps a PR whose only newer commit adds lines to a listed document', async () => {
-  const yml = `${goYml()}review:\n  docs_exempt_paths: ["docs/guide.md"]\n`;
-  const e = await checkWorld({ yml, items: [], local: 'none' });
+  // The exemption takes only strict ledger rows (the row's migration must exist at the reviewed head): the listed document is a ledger.
+  const yml = `${goYml()}review:\n  docs_exempt_paths: ["docs/ledger.md"]\n`;
+  const ledger = '# Ledger\n\n| Num | Name | Date | PR | Note |\n|---|---|---|---|---|\n| 0001 | `m1` | 2026-11-05 | #101 | |\n';
+  const baseFiles = { 'docs/ledger.md': ledger, 'supabase/migrations/0001_m1.sql': 'select 1;\n', 'supabase/migrations/0002_m2.sql': 'select 1;\n' };
+  const e = await checkWorld({ yml, items: [], local: 'none', baseFiles });
   const st = addRound(emptyState({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', risk: 'low', maxRounds: 2 }), { n: 1, fromHead: e.baseTip, toHead: e.head, contentHashAtToHead: e.hash, items: [] });
   st.currentContentHash = e.hash;
-  e.repo.write('docs/guide.md', '# Guide\n\nMore.\n');
+  e.repo.write('docs/ledger.md', `${ledger}| 0002 | \`m2\` | 2026-11-05 | #102 | |\n`);
   e.repo.commit('docs');
   const hash2 = localContentHash(e.repo.dir, e.config);
   assert.notEqual(hash2, e.hash);
