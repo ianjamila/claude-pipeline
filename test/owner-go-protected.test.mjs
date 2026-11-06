@@ -224,7 +224,9 @@ test('--owner-go: `gh pr merge --delete-branch` printing "\'main\' is already ch
   assertExit(r, 0);
   assert.equal(r.json.merged, true);
   assert.equal(r.json.commandExitCode, 1);
-  assert.match(r.json.note, /exited non-zero but the PR is MERGED/);
+  // the worktree case (test/merge-worktree-cleanup.test.mjs covers the rest): named, not an unexplained non-zero exit
+  assert.deepEqual(r.json.localCleanup, { skipped: true, reason: 'worktree' });
+  assert.match(r.json.note, /a worktree holds it/);
   assert.deepEqual(s.mergeCalls(), [`${PR} --match-head-commit ${s.head}`]);
 });
 
