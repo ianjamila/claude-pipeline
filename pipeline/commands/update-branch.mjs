@@ -7,10 +7,11 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { MAX_UPDATE_CYCLES, bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
+import { holdGate, holdsConfigured } from '../lib/merge-hold.mjs';
 
 export const meta = {
   summary: 'bring the PR branch up to date with its base on GitHub (update-branch with expected_head_sha), return the new head (checks are not waited for by default)',
-  usage: 'pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--wait-checks] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?, warnings?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`; checks are NOT waited for unless --wait-checks) | rebase-needed | head-moved | cycle-cap | head-timeout | not-open | (with --wait-checks) checks-failed | checks-timeout (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable. While it runs the run record of the PR shows inFlight {kind: update-branch}; warnings lists a record write that failed (never fatal)',
+  usage: 'pipeline update-branch --pr N [--expect-head SHA] [--max-cycles N=3] [--wait-checks] [--repo DIR]   -> {ok, outcome, updated, cycles, base, startHead, head, localHead, pullNeeded, message?, warnings?}; outcome up-to-date (exit 0; when updated: git pull --ff-only, then re-verify and run the gate on `head`; checks are NOT waited for unless --wait-checks) | rebase-needed | head-moved | cycle-cap | head-timeout | not-open | queued-behind | hold-unreadable | (with --wait-checks) checks-failed | checks-timeout (exit 1; rebase-needed = the update conflicts, needs-human), 3 GitHub unavailable. For a repo with the merge.hold_* keys the repo\'s read-only hold check runs before every update: queued-behind {verdict: hold:queued-behind, blockedBy:[PR numbers], holds, doNotUpdate:true, reason} = another PR\'s active hold is ahead (nothing is updated; do NOT retry: wait, or the owner merges the PR ahead), hold-unreadable = the check could not be read (retry later); both exit 1, and updated/cycles say what was done before. While it runs the run record of the PR shows inFlight {kind: update-branch}; warnings lists a record write that failed (never fatal)',
 };
 
 export const run = guarded(async (argv, ctx) => {
@@ -20,7 +21,7 @@ export const run = guarded(async (argv, ctx) => {
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const maxCycles = intOption(values, 'max-cycles', { min: 1, max: 10 }) ?? MAX_UPDATE_CYCLES;
   const root = resolveRepo(values, ctx);
-  await requireConfig(root);
+  const { config } = await requireConfig(root);
   const localHead = headSha({ cwd: root });
   // The head the caller has verified: the worktree's own HEAD unless it names another. GitHub is asked to update only that head.
   const expectHead = values['expect-head'] ?? localHead;
@@ -33,7 +34,9 @@ export const run = guarded(async (argv, ctx) => {
     recorder.update({ inFlight: inFlightSince(recorder, 'update-branch', 30) }, { initialStep: 'gate' });
     let r;
     try {
-      r = await bringUpToDate({ gh, pr, expectHead, maxCycles, waitChecks: values['wait-checks'] === true, ...updateTiming(ctx.env) });
+      // A repo with a merge hold: the hold is looked at before EVERY update PUT; one ahead of this PR (or an unreadable check) ends it.
+      const beforeUpdate = holdsConfigured(config) ? () => holdGate({ config, pr, root, env: ctx.env }) : null;
+      r = await bringUpToDate({ gh, pr, expectHead, maxCycles, waitChecks: values['wait-checks'] === true, beforeUpdate, ...updateTiming(ctx.env) });
     } finally {
       recorder.update({ inFlight: null });
     }

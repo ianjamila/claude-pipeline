@@ -145,6 +145,14 @@ export function isSmokePath(p) {
 }
 export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 
+// The cooperative merge-hold seam (all three or none; see checkMergeHold). Absent = no pipeline-side hold handling at all.
+// Rollout: a pipeline version that does not know these keys rejects the config (unknown key), so install the pipeline that
+// knows them BEFORE a repo sets them. Rollback: remove the three keys first. That also removes the pipeline-side enforcement
+// (the repo's own merge command, if it is hold-aware, still enforces). Enforcement is cooperative: the pipeline checks before
+// it updates or merges, and only a hold-aware merge command catches a hold placed between that check and the merge itself.
+// Renewal starvation: a PR whose hold expires and is renewed goes to the back of the queue; the owner's exits are merging
+// the PR ahead, the provider's own release of that PR, or the provider's own override.
+export const MERGE_HOLD_KEYS = ['hold_command', 'hold_release_command', 'hold_check_command'];
 export const BEHIND_BASE_MODES = Object.freeze(['update', 'disjoint']);
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
@@ -154,7 +162,7 @@ const KEYS = {
   verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes', 'deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes'],
   ci_proof: ['workflow', 'job', 'event', 'steps'],
   ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'review_check', 'approvers'],
-  merge: ['command', 'wait_minutes', 'behind_base', 'behind_base_stale_paths'],
+  merge: ['command', 'wait_minutes', 'behind_base', 'behind_base_stale_paths', ...MERGE_HOLD_KEYS],
   preview: ['environment', 'smoke', 'provider'],
   production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback', 'watch'],
   rollback: ['command', 'notes'],
@@ -394,6 +402,43 @@ function section(config, key, errors) {
   return v;
 }
 
+// merge.hold_command / hold_release_command / hold_check_command: all three or none. Each is a shell command template
+// filled by the pipeline: {pr} (the session's own PR) everywhere, {reason} (a fixed text, shell-quoted) in the release command
+// only, never {sha} (a hold is about the PR, not a head). The check command is read-only, so it must differ from the other two:
+// a copied take command would make every dry run write a label.
+const HOLD_PLACEHOLDERS = {
+  hold_command: ['pr'],
+  hold_release_command: ['pr', 'reason'],
+  hold_check_command: ['pr'],
+};
+function checkMergeHold(mergeSec, errors) {
+  const present = MERGE_HOLD_KEYS.filter((k) => mergeSec[k] !== undefined);
+  if (present.length === 0) return;
+  if (present.length !== MERGE_HOLD_KEYS.length) {
+    errors.push(`merge.hold_command, merge.hold_release_command and merge.hold_check_command are set all three or none (missing: ${MERGE_HOLD_KEYS.filter((k) => !present.includes(k)).map((k) => `merge.${k}`).join(', ')})`);
+  }
+  for (const k of present) {
+    const v = mergeSec[k];
+    if (!isStr(v)) {
+      errors.push(`merge.${k} must be a non-empty string`);
+      continue;
+    }
+    const wanted = HOLD_PLACEHOLDERS[k];
+    const used = new Set([...v.matchAll(/(?<!\$)\{([A-Za-z_][A-Za-z0-9_]*)\}/g)].map((m) => m[1]));
+    for (const name of wanted) if (!used.has(name)) errors.push(`merge.${k} must contain {${name}}`);
+    for (const name of used) {
+      if (wanted.includes(name)) continue;
+      errors.push(name === 'sha' ? `merge.${k} must not contain {sha} (a hold belongs to the PR, not to a head)` : `merge.${k} must not contain {${name}} (only ${wanted.map((w) => `{${w}}`).join(' and ')} are filled)`);
+    }
+  }
+  const check = mergeSec.hold_check_command;
+  if (isStr(check)) {
+    for (const k of ['hold_command', 'hold_release_command']) {
+      if (isStr(mergeSec[k]) && mergeSec[k].trim() === check.trim()) errors.push(`merge.hold_check_command must differ from merge.${k} (the check is read-only; a copy of a writing command would write on every dry run)`);
+    }
+  }
+}
+
 function checkStrArray(value, name, errors) {
   if (!isStrArray(value)) errors.push(`${name} must be an array of strings`);
 }
@@ -602,6 +647,7 @@ export function validateConfig(obj) {
       }
     }
     if (!inRange(mergeSec.wait_minutes, 1, 120)) errors.push('merge.wait_minutes must be an integer 1..120');
+    checkMergeHold(mergeSec, errors);
     if (!BEHIND_BASE_MODES.includes(mergeSec.behind_base)) errors.push(`merge.behind_base must be ${BEHIND_BASE_MODES.join('|')}`);
     const stale = mergeSec.behind_base_stale_paths;
     if (!Array.isArray(stale) || !stale.every(isStr)) errors.push('merge.behind_base_stale_paths must be an array of non-empty globs');

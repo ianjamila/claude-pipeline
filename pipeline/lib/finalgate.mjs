@@ -59,6 +59,11 @@ const check = (name, ok, detail, ownerMerge = 0, ownerItems = []) => ({
   name, ok: ok === true, detail, ...(ownerMerge > 0 ? { ownerMerge } : {}), ...(ownerItems.length > 0 ? { ownerItems } : {}),
 });
 
+// A failing scan check that is a real VERDICT (hard-stop hits, integrity violations), as against one that could not run (a throw caught by
+// safely(), a diff that failed): carries verdict: true, which is how the merge dry run tells an owner-runs hand-off (the owner can act on a
+// verdict) from a crashed scan (no verdict at all, so nothing to hand off and no reason to take the merge hold).
+const verdictFail = (name, detail) => ({ ...check(name, false, detail), verdict: true });
+
 // ---- review-dir files ---------------------------------------------------------------------------
 
 export const reviewFile = (root, name) => join(root, '.review', name);
@@ -585,7 +590,7 @@ async function hardstopsCheck({ root, config, diff }) {
   }
   const shown = blocking.slice(0, 5).map((h) => `${h.rule} ${h.file ?? ''}`.trim()).join('; ');
   const note = advisoryCount > 0 ? ` (+${advisoryCount} report-only)` : '';
-  return check('hardstops', false, `${blocking.length} hard-stop hit(s): ${shown}${blocking.length > 5 ? '; ...' : ''}${note}`);
+  return verdictFail('hardstops', `${blocking.length} hard-stop hit(s): ${shown}${blocking.length > 5 ? '; ...' : ''}${note}`);
 }
 
 function integrityCheck({ config, diff }) {
@@ -600,7 +605,7 @@ function integrityCheck({ config, diff }) {
       : check('integrity', true, 'no test weakening');
   }
   const shown = r.violations.slice(0, 5).map((v) => `${v.rule ?? v.type ?? 'violation'} ${v.file ?? ''}`.trim()).join('; ');
-  return check('integrity', false, `${r.violations.length} test-integrity violation(s): ${shown}`);
+  return verdictFail('integrity', `${r.violations.length} test-integrity violation(s): ${shown}`);
 }
 
 // How many owner-ruled items the review detail lists, and how much of each quote.
