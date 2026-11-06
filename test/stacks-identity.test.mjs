@@ -248,3 +248,14 @@ test('findClaudeOwner deadline: per-call timeout is min(3000, remaining); under 
   assert.ok(fresh.calls.every((c) => c.opts.timeoutMs === 3000));
   assert.equal(findClaudeOwner({ startPid: 50, run: fakePs({ tree: TREE }), platform: 'darwin', deadlineAt: 1_000_300, now: () => 1_000_000 }).reason, 'deadline');
 });
+
+// #188: output past the buffer limit is not ps's own answer
+test('identity: an overBuffer ps (exit 1, empty) is unknown, not dead; a walk hop that went over the buffer is unknown too', () => {
+  const run = fakePs({ fail: { 12: { code: 1, overBuffer: true } } });
+  const r = procIdentity(12, { run, platform: 'darwin', kill: esrch });
+  assert.equal(r.ok, false); assert.match(r.reason, /buffer/i);
+  const okButCut = fakePs({ lstart: { 12: LSTART }, fail: { 12: { code: 0, stdout: LSTART, overBuffer: true } } });
+  assert.equal(procIdentity(12, { run: okButCut, platform: 'darwin', kill: alive }).ok, false, 'a raced exit 0 over the buffer is not a birth time');
+  const over = fakePs({ tree: TREE, fail: { 40: { code: 0, overBuffer: true } } });
+  assert.equal(findClaudeOwner({ startPid: 50, run: over, platform: 'darwin', kill: alive }).ok, false);
+});

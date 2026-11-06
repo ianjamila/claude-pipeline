@@ -123,3 +123,9 @@ test('the docs-only review exemption is documented where owners and agents look:
   assert.match(cli, /docsExempt: \{files, reviewedHead\}/);
   assert.match(cli, /verify\/CI coverage of the docs head is NOT exempted/);
 });
+
+test('the review skill says one closing keyword per issue (GitHub links only the first number of `Closes #1, #2`)', () => {
+  const skill = read('skills/review/SKILL.md');
+  assert.match(skill, /one keyword per issue, `Closes #1\. Closes #2\.`/);
+  assert.match(skill, /one keyword per issue, `Closes #170\. Closes #171\.` \(GitHub closes only the first number of\s+`Closes #170, #171`\)/);
+});

@@ -455,13 +455,13 @@ test('worktree: inside .worktrees or a configured repo => git rev-parse --show-t
   assert.equal(calls.length, 2);
 });
 
-test('worktree: git "not a repository" => none; a git timeout or signal => exit 2', async () => {
+test('worktree: git "not a repository" => none; a git timeout, signal or output over the buffer limit => exit 2', async () => {
   const w = world();
   const command = `supabase status --workdir ${w.wd('sa-corrections.stack')}`;
   const notRepo = () => ({ code: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git', timedOut: false, signal: null });
   const r = await register(bash(command, w.wtCwd), deps(w, { worktree: undefined, run: notRepo }));
   assert.equal(r.events[0].worktree, 'none');
-  for (const bad of [{ code: 1, stdout: '', stderr: '', timedOut: true, signal: null }, { code: 1, stdout: '', stderr: '', timedOut: false, signal: 'SIGKILL' }, { code: 1, stdout: '', stderr: 'boom', timedOut: false, signal: null }]) {
+  for (const bad of [{ code: 1, stdout: '', stderr: '', timedOut: true, signal: null }, { code: 1, stdout: '', stderr: '', timedOut: false, signal: 'SIGKILL' }, { code: 1, stdout: '', stderr: 'boom', timedOut: false, signal: null }, { code: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git', timedOut: false, signal: null, overBuffer: true }]) {
     const f = await register(bash(command, w.wtCwd), deps(w, { worktree: undefined, run: () => bad }));
     assert.equal(f.exit, 2);
     assert.match(f.message, /worktree lookup failed/);
