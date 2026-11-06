@@ -376,7 +376,7 @@ test('merge, gate path: a refusal BEFORE this call took anything releases nothin
   assert.equal('holdRelease' in b.json, false);
 });
 
-test('merge, gate path: the update conflicts -> behind-base refusal keeps the hold (only update-branch auto-releases) and carries hold + successors []', () => {
+test('merge, gate path: the update conflicts (rebase-needed) -> the hold THIS call took is released with update-conflict; the behind-base refusal carries hold, holdRelease and successors []', () => {
   const s = gateWorld();
   staleScript(s, { update: 'conflict' });
   const r = gateMerge(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) });
@@ -385,7 +385,37 @@ test('merge, gate path: the update conflicts -> behind-base refusal keeps the ho
   assert.equal(r.json.outcome, 'rebase-needed');
   assert.equal(r.json.hold.taken, true);
   assert.deepEqual(r.json.successors, []);
-  assert.deepEqual(holdCalls(s).filter((l) => l.startsWith('release')), []);
+  assert.deepEqual(r.json.holdRelease, { reason: 'update-conflict', confirmed: true, code: 0, lines: ['hold released'] });
+  assert.deepEqual(holdCalls(s).filter((l) => l.startsWith('release')), [`release ${PR} ${RELEASE_REASONS['update-conflict']}`]);
+  assert.deepEqual(holdPuts(s).at(-1), 'release 1', 'released after the conflicting PUT');
+  assert.equal('warnings' in r.json, false);
+
+  const failing = gateWorld();
+  staleScript(failing, { update: 'conflict' });
+  const f = gateMerge(failing, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR), FAKE_HOLD_RELEASE_EXIT: '1' });
+  assert.equal(f.json.holdRelease.confirmed, false);
+  assert.equal(f.json.holdRelease.code, 1);
+  assert.equal(f.json.warnings.length, 1);
+  assert.match(f.json.warnings[0], /NOT released \(update-conflict; exit 1\).*merge-hold --pr 12 --release --reason update-conflict/);
+});
+
+test('merge, gate path: other failed catch-ups (head-timeout, head-moved) KEEP the hold this call took', () => {
+  const timeout = gateWorld();
+  staleScript(timeout);
+  const a = gateMerge(timeout, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) }); // the fake GitHub never shows a new head
+  assert.equal(a.json.error, 'behind-base');
+  assert.equal(a.json.outcome, 'head-timeout');
+  assert.equal(a.json.hold.taken, true);
+  assert.equal('holdRelease' in a.json, false);
+  assert.deepEqual(holdCalls(timeout).filter((l) => l.startsWith('release')), []);
+
+  const moved = gateWorld();
+  staleScript(moved, { update: 'head-moved' });
+  const b = gateMerge(moved, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR) });
+  assert.equal(b.json.outcome, 'head-moved');
+  assert.equal(b.json.hold.taken, true);
+  assert.equal('holdRelease' in b.json, false);
+  assert.deepEqual(holdCalls(moved).filter((l) => l.startsWith('release')), []);
 });
 
 test('merge, gate path, a repo WITHOUT the hold keys: the successor is still recorded, no hold field, no hold call', () => {
