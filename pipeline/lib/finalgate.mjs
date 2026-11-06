@@ -194,6 +194,8 @@ function prOpenCheck({ info, head, config, behind = null }) {
   if (behind) problems.push(`behind-base: ${behind}; update the branch from ${config.default_branch} and re-verify before merging`);
   // The hard-stop, integrity and review diffs are taken against the default branch; any other base would be judged on the wrong diff.
   if (info.baseRefName !== config.default_branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${config.default_branch}`);
+  // `behindOnly` (--owner-go merge-carry): the ONLY thing wrong is that the branch lacks commits of its base - an update from the base can clear it, nothing else here can.
+  if (problems.length === 1 && behind) return { ...check('pr-open', false, problems[0]), behindOnly: true };
   return problems.length ? check('pr-open', false, problems.join('; ')) : check('pr-open', true, `open at ${short(head)}`);
 }
 
@@ -1012,6 +1014,9 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     head,
     checks,
     failed: checks.filter((c) => !c.ok).map((c) => c.name),
+    // Merge-carry: true when pr-open is the ONLY failing check and it fails for being behind its base alone (not accepted as disjoint). Conservative on purpose: a red / missing / stale
+    // check on the old head, an owner item, a review-complete gap or any other pr-open problem (draft, conflicts, other base) is NOT expected to clear with an update, so it is refused as ever.
+    behindOnly: checks.filter((c) => !c.ok).length === 1 && checks.find((c) => !c.ok).name === 'pr-open' && checks.find((c) => !c.ok).behindOnly === true,
     // The range that was scanned, as GitHub named it: the final look before the merge command re-reads both and refuses if either moved.
     baseRefOid: baseSha,
     headRefOid: typeof info?.headRefOid === 'string' ? info.headRefOid : null,

@@ -845,6 +845,16 @@ export function approvalVerdict(q) {
   return { gap: 'carry', reason: reasons.join('; ') };
 }
 export const approvalGap = (q) => approvalVerdict(q).gap;
+// Merge-carry, the entry of the loop (P merge --owner-go on a PR that is only behind its base): did the owner say "merge" for EXACTLY this head with the Carry line shown (a carry request: head of >= CARRY_MIN_HEAD
+// hex, no hold on either side (C12), every other field equal to the query's) and is that prompt the owner's? -> { prefix } (the recorded head prefix, what carriesApproval proves from) or null. Never consults a callback.
+export function carryApprovalFor(q) {
+  const m = approvalQuery(q);
+  if (m === null || q.hold !== undefined) return null;
+  const carries = (x) => x.carry === true && x.head.length >= CARRY_MIN_HEAD && m.exactOk(x) && x.hold === undefined && x.holdBlock === undefined;
+  const owned = ownedBy(readApprovals(queryOpts(q)).filter((r) => r.requests.some(carries)), { home: q.home });
+  if (owned.length === 0) return null;
+  return { prefix: owned[0].requests.find(carries).head };
+}
 export const approvedRequest = (q) => approvalGap(q) === 'ok';
 
 // R2-F3 (fix round): promptProvenance trusts a transcript only under a `.claude*` folder directly under the account's home (isTranscriptFile; $CLAUDE_CONFIG_DIR names no root: it is the agent's
