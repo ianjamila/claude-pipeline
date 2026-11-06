@@ -492,12 +492,15 @@ test('holdBeforeUpdate: take ok + re-check blocked -> queued-behind with holdTak
 });
 
 test('holdBeforeUpdate: an unreadable re-check -> hold-unreadable with holdTaken (confirmed or not)', async () => {
-  for (const [take, expected] of [[taken(), true], [taken({ code: 1 }), false]]) {
+  // The caller keys on info: a confirmed hold (taken) is kept, an unconfirmed one that mayHold is released, a clean refusal is left alone (#199).
+  for (const [take, expected, mayHold] of [[taken(), true, true], [taken({ code: 1 }), false, false], [taken({ code: 2 }), false, true], [taken({ code: 0, timedOut: true }), false, true]]) {
     const sh = shell({ checks: [{ stdout: CLEAR }, { stdout: 'garbage' }], take });
     const { beforeUpdate, info } = before(sh);
     const r = await beforeUpdate();
     assert.equal(r.error, 'hold-unreadable');
     assert.equal(r.holdTaken, expected);
+    assert.equal(info.taken, expected);
+    assert.equal(info.mayHold, mayHold);
     assert.equal(info.tookThisCall, true);
   }
 });

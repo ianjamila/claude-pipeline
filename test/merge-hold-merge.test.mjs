@@ -338,22 +338,44 @@ test('merge, gate path: a RACE at step 1b (clear, clear, take, older hold shows)
   assert.equal('warnings' in r.json, false);
 });
 
-test('merge, gate path: the post-take re-check is UNREADABLE: released at once as hold-unreadable (holdTaken follows the take); a release that fails is a warning', () => {
-  for (const takeExit of ['0', '2']) {
-    const s = gateWorld();
-    staleScript(s);
-    const r = gateMerge(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, CLEAR, 'garbage'), FAKE_HOLD_TAKE_EXIT: takeExit });
-    assertExit(r, 1, r.stdout);
-    assert.equal(r.json.error, 'hold-unreadable');
-    assert.equal(r.json.holdTaken, takeExit === '0');
-    assert.equal(r.json.holdRelease.reason, 'hold-unreadable');
-    assert.equal(r.json.holdRelease.confirmed, true);
-    assert.deepEqual(holdCalls(s).at(-1), `release ${PR} ${RELEASE_REASONS['hold-unreadable']}`, `take exit ${takeExit}`);
-    assert.deepEqual(puts(s), []);
-  }
+test('merge, gate path (#199): the post-take re-check is UNREADABLE after a CONFIRMED take: the hold is KEPT (no release, holdTaken true)', () => {
   const s = gateWorld();
   staleScript(s);
-  const r = gateMerge(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, CLEAR, 'garbage'), FAKE_HOLD_RELEASE_EXIT: '1' });
+  const r = gateMerge(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, CLEAR, 'garbage') });
+  assertExit(r, 1, r.stdout);
+  assert.equal(r.json.error, 'hold-unreadable');
+  assert.equal(r.json.outcome, 'hold-unreadable');
+  assert.equal(r.json.holdTaken, true);
+  assert.equal(r.json.hold.taken, true);
+  assert.equal('holdRelease' in r.json, false);
+  assert.deepEqual(holdCalls(s).filter((l) => l.startsWith('release')), []);
+  assert.deepEqual(puts(s), []);
+  assert.equal('warnings' in r.json, false);
+});
+
+test('merge, gate path: the post-take re-check is UNREADABLE after an UNCONFIRMED take that may have written the label (exit 2): released at once as hold-unreadable; a cleanly refused take (exit 1) releases nothing; a release that fails is a warning', () => {
+  const s0 = gateWorld();
+  staleScript(s0);
+  const r0 = gateMerge(s0, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, CLEAR, 'garbage'), FAKE_HOLD_TAKE_EXIT: '2' });
+  assertExit(r0, 1, r0.stdout);
+  assert.equal(r0.json.error, 'hold-unreadable');
+  assert.equal(r0.json.holdTaken, false);
+  assert.equal(r0.json.holdRelease.reason, 'hold-unreadable');
+  assert.equal(r0.json.holdRelease.confirmed, true);
+  assert.deepEqual(holdCalls(s0).at(-1), `release ${PR} ${RELEASE_REASONS['hold-unreadable']}`);
+  assert.deepEqual(puts(s0), []);
+
+  const refused = gateWorld();
+  staleScript(refused);
+  const r1 = gateMerge(refused, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, CLEAR, 'garbage'), FAKE_HOLD_TAKE_EXIT: '1' });
+  assert.equal(r1.json.error, 'hold-unreadable');
+  assert.equal(r1.json.holdTaken, false);
+  assert.equal('holdRelease' in r1.json, false);
+  assert.deepEqual(holdCalls(refused).filter((l) => l.startsWith('release')), []);
+
+  const s = gateWorld();
+  staleScript(s);
+  const r = gateMerge(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, CLEAR, 'garbage'), FAKE_HOLD_TAKE_EXIT: '2', FAKE_HOLD_RELEASE_EXIT: '1' });
   assert.equal(r.json.holdRelease.confirmed, false);
   assert.equal(r.json.warnings.length, 1);
   assert.match(r.json.warnings[0], /NOT released \(hold-unreadable; exit 1\)/);
@@ -397,6 +419,16 @@ test('merge, gate path: the update conflicts (rebase-needed) -> the hold THIS ca
   assert.equal(f.json.holdRelease.code, 1);
   assert.equal(f.json.warnings.length, 1);
   assert.match(f.json.warnings[0], /NOT released \(update-conflict; exit 1\).*merge-hold --pr 12 --release --reason update-conflict/);
+});
+
+test('merge, gate path (#199): a race loss after a CONFIRMED take still releases queued-behind (unchanged: P merge stops, so it does not wait on the younger hold)', () => {
+  const s = gateWorld();
+  staleScript(s);
+  const r = gateMerge(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, CLEAR, BLOCKED) });
+  assert.equal(r.json.error, 'queued-behind');
+  assert.equal(r.json.holdTaken, true);
+  assert.equal(r.json.holdRelease.reason, 'queued-behind');
+  assert.deepEqual(holdCalls(s).filter((l) => l.startsWith('release')), [`release ${PR} ${RELEASE_REASONS['queued-behind']}`]);
 });
 
 test('merge, gate path (#198): a take the provider cleanly REFUSED (exit 1) wrote no label: a race loss and an update conflict release NOTHING; an exit-2 take is released', () => {
@@ -659,19 +691,38 @@ test('update-branch with holds, a RACE (clear, take, then an older hold shows): 
   assert.equal(r.json.hold.tookThisCall, true);
 });
 
-test('update-branch with holds, the re-check after the take is UNREADABLE: released at once with hold-unreadable, for a confirmed AND an unconfirmed take; a failing release is reported', () => {
-  for (const takeExit of ['0', '2']) {
-    const s = heldWorld();
-    const r = upd(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, 'garbage'), FAKE_HOLD_TAKE_EXIT: takeExit });
-    assertExit(r, 1);
-    assert.equal(r.json.outcome, 'hold-unreadable');
-    assert.equal(r.json.holdTaken, takeExit === '0');
-    assert.deepEqual(releases(s), [`release ${PR} ${RELEASE_REASONS['hold-unreadable']}`], `take exit ${takeExit}`);
-    assert.deepEqual(r.json.holdRelease, { reason: 'hold-unreadable', confirmed: true, code: 0, lines: ['hold released'] });
-    assert.deepEqual(puts(s), []);
-  }
+test('update-branch with holds (#199), the re-check after the take is UNREADABLE and the take was CONFIRMED: the hold is KEPT (no release), the refusal says holdTaken true', () => {
   const s = heldWorld();
-  const r = upd(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, 'garbage'), FAKE_HOLD_RELEASE_EXIT: '1' });
+  const r = upd(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, 'garbage') });
+  assertExit(r, 1);
+  assert.equal(r.json.outcome, 'hold-unreadable');
+  assert.equal(r.json.holdTaken, true);
+  assert.equal(r.json.hold.taken, true);
+  assert.deepEqual(releases(s), []);
+  assert.equal('holdRelease' in r.json, false);
+  assert.equal('warnings' in r.json, false);
+  assert.deepEqual(puts(s), []);
+});
+
+test('update-branch with holds, the re-check after the take is UNREADABLE and the take was NOT confirmed but may have written the label (exit 2): released at once with hold-unreadable; a cleanly refused take (exit 1) releases nothing; a failing release is reported', () => {
+  const s0 = heldWorld();
+  const r0 = upd(s0, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, 'garbage'), FAKE_HOLD_TAKE_EXIT: '2' });
+  assertExit(r0, 1);
+  assert.equal(r0.json.outcome, 'hold-unreadable');
+  assert.equal(r0.json.holdTaken, false);
+  assert.deepEqual(releases(s0), [`release ${PR} ${RELEASE_REASONS['hold-unreadable']}`]);
+  assert.deepEqual(r0.json.holdRelease, { reason: 'hold-unreadable', confirmed: true, code: 0, lines: ['hold released'] });
+  assert.deepEqual(puts(s0), []);
+
+  const refused = heldWorld();
+  const r1 = upd(refused, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, 'garbage'), FAKE_HOLD_TAKE_EXIT: '1' });
+  assert.equal(r1.json.outcome, 'hold-unreadable');
+  assert.equal(r1.json.holdTaken, false);
+  assert.deepEqual(releases(refused), []);
+  assert.equal('holdRelease' in r1.json, false);
+
+  const s = heldWorld();
+  const r = upd(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR, 'garbage'), FAKE_HOLD_TAKE_EXIT: '2', FAKE_HOLD_RELEASE_EXIT: '1' });
   assert.equal(r.json.holdRelease.confirmed, false);
   assert.match(r.json.warnings[0], /NOT released \(hold-unreadable/);
 });

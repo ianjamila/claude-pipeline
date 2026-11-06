@@ -178,7 +178,7 @@ export function queuedBehindRefusal(found) {
 // active). Before EVERY PUT: the gate (a refusal is returned as is, nothing taken). On the first call that passes it the hold is
 // taken, whatever the answer: a take that failed or timed out may still have written the label, and another session may have taken
 // one meanwhile, so the gate ALWAYS runs again after the take. Another hold ahead -> queued-behind and a hold-unreadable re-check
-// are returned with `holdTaken` (did the take confirm) so the caller can clean up; clear -> null (the PUT goes, held or not: the hold
+// are returned with `holdTaken` (did the take confirm) so the caller can clean up (a CONFIRMED hold is real and is kept when only the re-check could not be read; an unconfirmed take that mayHold is released); clear -> null (the PUT goes, held or not: the hold
 // is cooperative, a missing hold is not a safety loss). Later cycles of the same call only re-run the first gate.
 // -> { beforeUpdate, info }; `info` is filled as the calls happen: { taken, tookThisCall, mayHold (the take may have written the label: the auto-releases key on it), take: { confirmed, code, lines, timedOut? } | null }.
 // Not configured -> { beforeUpdate: null, info: null }.
