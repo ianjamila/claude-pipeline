@@ -43,6 +43,8 @@
 // Anything unreadable fails closed. What remains: the code of the genuine job is the trust anchor, and a workflow with
 // `actions: write` can DELETE an artifact (that only fails closed).
 // Shared by the ci-guards-run orchestrator (receipts) and the final gate (guard statuses); vendored with them.
+import { inflateRawSync } from 'node:zlib';
+
 export const GUARD_WORKFLOW_PATH = '.github/workflows/pipeline-guards.yml';
 export const TIME_SLACK_MS = 10_000;
 // The two human approval labels (same values as ci-guard.mjs, which this shared lib cannot import).
@@ -262,4 +264,134 @@ export function checkGuardVerdict({ read, repo, url, bind = {}, expect, cache = 
   if (!run.ok) return run;
   const artifact = checkVerdictArtifact({ read, repo, runId: parseRunUrl(url).runId, headSha: bind.headSha, expect, cache, final: run.completed });
   return artifact.ok ? run : artifact;
+}
+
+// ---- the queue verdict: the same idea for a merge-queue commit ---------------------------------------------------------------
+// On a queue commit the three guard statuses are posted by the vendored queue poster (queue-guards-run.mjs) from
+// `.github/workflows/queue-guards.yml`, which GitHub starts with `workflow_run` and ALWAYS runs from the default branch's copy
+// (never from the queue commit). A queue status therefore counts only when the run behind it is that workflow, `workflow_run`,
+// attempt 1 (a re-run may execute an older copy), whose own `head_branch` is the default branch and whose `head_sha` is the default
+// tip at run time or an ancestor of it (Phase 0, D8: that is how GitHub records such a run; the queue commit is only the trigger's
+// head_sha). It must carry a run-owned artifact `queue-verdict_v1_<queue sha>_<integrity>_<hardstops>_<review>` whose verdict.json
+// lists the member `{ pr, head }` and says `success` for the context. A copied URL of another group's run lists other members.
+export const QUEUE_WORKFLOW_PATH = '.github/workflows/queue-guards.yml';
+export const QUEUE_ARTIFACT_PREFIX = 'queue-verdict_v1_';
+const QUEUE_ARTIFACT_RE = new RegExp(`^${QUEUE_ARTIFACT_PREFIX}([0-9a-f]{40})_(${STATE})_(${STATE})_(${REVIEW_STATE})$`);
+const QUEUE_RUN_JQ = '{path: .path, event: .event, status: .status, head_sha: .head_sha, head_branch: .head_branch, run_attempt: .run_attempt, created_at: .created_at, updated_at: .updated_at}';
+const QUEUE_ARTIFACTS_JQ = '.artifacts[] | select(.expired | not) | "\\(.id) \\(.name)"';
+const MAX_VERDICT_BYTES = 1024 * 1024;
+
+/** `queue-verdict_v1_<queueSha>_<integrity>_<hardstops>_<review>` (review may be `off`). Throws on a value outside the format. */
+export function queueVerdictArtifactName({ queueSha, integrity, hardstops, review } = {}) {
+  const q = String(queueSha ?? '').toLowerCase();
+  if (!SHA.test(q)) throw new Error(`queue verdict artifact: queueSha is not a full commit sha: ${queueSha}`);
+  for (const [k, v] of [['integrity', integrity], ['hardstops', hardstops]]) {
+    if (!VERDICT_STATES.includes(v)) throw new Error(`queue verdict artifact: ${k} state is not success|failure|error: ${v}`);
+  }
+  if (!REVIEW_STATES.includes(review)) throw new Error(`queue verdict artifact: review state is not success|failure|error|off: ${review}`);
+  return `${QUEUE_ARTIFACT_PREFIX}${q}_${integrity}_${hardstops}_${review}`;
+}
+
+/** The inverse of queueVerdictArtifactName: { queueSha, integrity, hardstops, review }, or null for any other name. */
+export function parseQueueVerdictArtifactName(name) {
+  const m = QUEUE_ARTIFACT_RE.exec(String(name ?? ''));
+  return m ? { queueSha: m[1], integrity: m[2], hardstops: m[3], review: m[4] } : null;
+}
+
+/**
+ * The text of one entry of a zip (GitHub's artifact download is a zip). Pure: the caller fetches the bytes (binary-safe), this only
+ * parses them. Reads the central directory, handles stored and deflated entries, caps the result at 1 MiB, throws on anything else.
+ */
+export function zipEntryText(buffer, entryName) {
+  const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer ?? '');
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 22 - 65535); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('not a zip file (no end-of-directory record)');
+  const count = buf.readUInt16LE(eocd + 10);
+  let at = buf.readUInt32LE(eocd + 16);
+  for (let n = 0; n < count; n++) {
+    if (at + 46 > buf.length || buf.readUInt32LE(at) !== 0x02014b50) throw new Error('zip central directory is damaged');
+    const method = buf.readUInt16LE(at + 10);
+    const [compressed, size, local] = [20, 24, 42].map((o) => buf.readUInt32LE(at + o));
+    const [nameLen, extraLen, commentLen] = [28, 30, 32].map((o) => buf.readUInt16LE(at + o));
+    if (buf.toString('utf8', at + 46, at + 46 + nameLen) === entryName) {
+      if (size > MAX_VERDICT_BYTES) throw new Error(`zip entry ${entryName} is too large`);
+      if (local + 30 > buf.length || buf.readUInt32LE(local) !== 0x04034b50) throw new Error('zip local header is damaged');
+      const start = local + 30 + buf.readUInt16LE(local + 26) + buf.readUInt16LE(local + 28);
+      const data = buf.subarray(start, start + compressed);
+      if (data.length !== compressed) throw new Error('zip entry is cut off');
+      if (method === 0) return data.toString('utf8');
+      if (method === 8) return inflateRawSync(data, { maxOutputLength: MAX_VERDICT_BYTES }).toString('utf8');
+      throw new Error(`zip entry uses an unsupported compression method (${method})`);
+    }
+    at += 46 + nameLen + extraLen + commentLen;
+  }
+  throw new Error(`${entryName} is not in the zip`);
+}
+
+/**
+ * Provenance of a queue-commit verdict for member `pr` at `head`: read(apiPath, jq) -> text as above; readArtifact({ repo, id, name })
+ * -> the artifact's verdict.json text (binary-safe download + zipEntryText, supplied by the caller: `read` is text-only). `expect` is
+ * { check: 'integrity' | 'hardstops' | 'review' }, mandatory. Returns { ok: true } or { ok: false, reason }; everything unreadable
+ * fails closed. `cache` (a Map) keeps definitive reads (completed run, default branch, ancestry).
+ */
+export function checkQueueVerdict({ read, readArtifact, repo, url, queueSha, pr, head, expect, cache = new Map() }) {
+  const run = parseRunUrl(url);
+  if (!run) return { ok: false, reason: 'target_url is not an Actions run URL' };
+  const q = String(queueSha ?? '').toLowerCase();
+  const prNumber = Number(pr);
+  const headSha = String(head ?? '').toLowerCase();
+  if (!SHA.test(q) || !Number.isInteger(prNumber) || prNumber < 1 || !SHA.test(headSha)) return { ok: false, reason: 'no queue commit, PR number and head sha were supplied to check the queue verdict against' };
+  const check = expect?.check;
+  if (!['integrity', 'hardstops', 'review'].includes(check)) return { ok: false, reason: 'no valid expectation was supplied for the queue verdict' };
+  if (run.repo.toLowerCase() !== String(repo).toLowerCase() && !sameRepositoryById({ read, a: run.repo, b: repo, cache })) return { ok: false, reason: 'the run belongs to a different repository' };
+  try {
+    const key = `queue-run:${run.runId}`;
+    let info = cache.get(key);
+    if (!info) {
+      info = JSON.parse(read(`repos/${repo}/actions/runs/${run.runId}`, QUEUE_RUN_JQ));
+      if (info?.status === 'completed') cache.set(key, info);
+    }
+    const completed = info?.status === 'completed';
+    const workflow = String(info?.path ?? '').split('@')[0];
+    if (workflow !== QUEUE_WORKFLOW_PATH) return { ok: false, reason: `the run is workflow ${workflow || '(unknown)'}, not ${QUEUE_WORKFLOW_PATH}` };
+    if (info.event !== 'workflow_run') return { ok: false, reason: `the run was triggered by ${info.event}, not workflow_run` };
+    if (info.run_attempt !== 1) return { ok: false, reason: `the run is attempt ${info.run_attempt ?? '(unknown)'}: re-runs never count (a re-run can execute an older poster)` };
+
+    if (!cache.has('default-branch')) cache.set('default-branch', read(`repos/${repo}`, '.default_branch').trim());
+    const branch = cache.get('default-branch');
+    if (!branch || /\s/.test(branch)) return { ok: false, reason: 'the default branch could not be read' };
+    if (info.head_branch !== branch) return { ok: false, reason: `the run's head_branch is ${info.head_branch ?? '(unknown)'}, not the default branch ${branch}: the poster runs from the default branch's copy` };
+    const runHead = String(info.head_sha ?? '').toLowerCase();
+    if (!SHA.test(runHead)) return { ok: false, reason: 'the run has no head_sha' };
+    const ckey = `compare:${runHead}`;
+    if (!cache.has(ckey)) cache.set(ckey, read(`repos/${repo}/compare/${runHead}...${encodeURIComponent(branch)}`, '.status').trim());
+    const status = cache.get(ckey);
+    if (status !== 'identical' && status !== 'ahead') return { ok: false, reason: `the poster ran from ${runHead.slice(0, 7)}, which is not on the default branch (${status || 'unknown'})` };
+
+    const akey = `queue-artifacts:${run.runId}`;
+    let listing = cache.get(akey);
+    if (listing === undefined) {
+      listing = read(`repos/${repo}/actions/runs/${run.runId}/artifacts?per_page=100`, QUEUE_ARTIFACTS_JQ);
+      if (completed) cache.set(akey, listing);
+    }
+    const verdicts = String(listing).split('\n').map((l) => /^([0-9]+) (.+)$/.exec(l.trim())).filter(Boolean)
+      .map((m) => ({ id: m[1], name: m[2], parsed: parseQueueVerdictArtifactName(m[2]) })).filter((v) => v.parsed && v.parsed.queueSha === q);
+    if (verdicts.length === 0) return { ok: false, reason: `the run carries no queue verdict artifact for ${q.slice(0, 7)} (still running, cancelled before the upload, or deleted)` };
+    const bad = verdicts.find((v) => v.parsed[check] !== 'success');
+    if (bad) return { ok: false, reason: `the queue verdict for ${check} is ${bad.parsed[check]}, not success` };
+    if (typeof readArtifact !== 'function') return { ok: false, reason: 'cannot read the artifact: no artifact reader was supplied' };
+    for (const v of verdicts) {
+      const body = JSON.parse(readArtifact({ repo, id: v.id, name: v.name }));
+      if (body?.version !== 1 || String(body.queueSha ?? '').toLowerCase() !== q) return { ok: false, reason: 'the artifact\'s verdict does not describe this queue commit' };
+      if (body.checks?.[check]?.state !== 'success') return { ok: false, reason: `the artifact's own verdict for ${check} is not success` };
+      const listed = Array.isArray(body.members) && body.members.some((m) => Number(m?.pr) === prNumber && String(m?.head ?? '').toLowerCase() === headSha);
+      if (!listed) return { ok: false, reason: `the artifact's manifest does not list #${prNumber} at ${headSha.slice(0, 7)}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: `the queue verdict could not be verified (${String(err?.message ?? err).split('\n')[0].slice(0, 100)})` };
+  }
 }

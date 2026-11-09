@@ -1,0 +1,37 @@
+# queue-guards.yml — runs main's copy only (workflow_run); never checks out or runs the queue commit
+#
+# What it does: GitHub starts this when "Queue intake" completes for a merge-queue group, ALWAYS from the default branch's copy of
+# this file (a queued PR cannot swap in its own). The vendored poster (scripts/pipeline/queue-guards-run.mjs) maps the queue commit
+# to its member PRs through GitHub's queue-entry records and posts `Test integrity`, `Hard-stop scan` (and `Cross-model review` with
+# ci.review_check) as commit statuses on the queue commit, each green only when every member has that status green, from the real
+# pipeline-guards run, on its exact queued head. Evaluate writes a verdict and names it, the upload attaches it to THIS run as
+# queue-verdict_v1_<queue sha>_<integrity>_<hardstops>_<review>, and only then --publish posts the statuses (the merge audit and
+# guard-provenance.mjs#checkQueueVerdict accept a queue status only with that artifact from a run of this workflow).
+# A re-run (attempt > 1) posts nothing: re-queue the PR instead. Do not rename the artifact or the steps without changing
+# guard-provenance.mjs. Do not add steps that run code from the queue commit.
+name: Queue guards
+on: { workflow_run: { workflows: ["Queue intake"], types: [completed] } }
+permissions: { contents: read, pull-requests: read, issues: read, statuses: write, actions: read }
+jobs:
+  post:
+    name: Queue guards
+    if: github.event.workflow_run.event == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      QUEUE_SHA: ${{ github.event.workflow_run.head_sha }}
+      QUEUE_REF: ${{ github.event.workflow_run.head_branch }}
+      QUEUE_EVENT: ${{ github.event.workflow_run.event }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      PIPELINE_VERDICT_DIR: ${{ runner.temp }}/queue-verdict
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: "scripts/pipeline\n.claude/pipeline.yml", persist-credentials: false }
+      - id: eval
+        run: node scripts/pipeline/queue-guards-run.mjs
+      - uses: actions/upload-artifact@v4
+        with: { name: "${{ steps.eval.outputs.artifact }}", path: "${{ runner.temp }}/queue-verdict", if-no-files-found: error }
+      - run: node scripts/pipeline/queue-guards-run.mjs --publish
+      - if: failure()
+        run: node scripts/pipeline/queue-guards-run.mjs --publish --error "the poster failed"

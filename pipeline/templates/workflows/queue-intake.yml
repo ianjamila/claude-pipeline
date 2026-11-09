@@ -1,0 +1,8 @@
+# Queue intake — the one cheap job every merge-queue group runs, so that `workflow_run` has something to follow.
+# The trusted poster (queue-guards.yml) starts when this workflow completes. It carries no checks itself: the real required
+# checks run under their own names on `merge_group` (see the repo's own workflows).
+name: Queue intake
+on: { merge_group: { types: [checks_requested] } }
+permissions: { contents: read }
+jobs:
+  intake: { name: Queue intake, runs-on: ubuntu-latest, timeout-minutes: 2, steps: [ { run: 'echo "queue commit $GITHUB_SHA"' } ] }

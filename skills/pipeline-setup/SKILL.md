@@ -99,7 +99,7 @@ Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard cont
 
 ### e. Test-integrity + hard-stop checks
 
-`P vendor --repo .` copies `ci-guard`, `ci-guards-run`, `smoke` and `supabase-local`
+`P vendor --repo .` copies `ci-guard`, `ci-guards-run`, `queue-guards-run`, `smoke` and `supabase-local`
 (plus `lib/`, `vendor/js-yaml.mjs` and a `VERSION` file) into `scripts/pipeline/` (and removes a `stop-verify.mjs` an earlier vendor left there), and appends
 `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to `.gitattributes` so a Windows checkout cannot
 rewrite them (commit that file; `P vendor --repo . --check` reports drift and warns when the lines are
@@ -110,6 +110,12 @@ up-to-date, unedited install (`pipeline update` first); `--check` warns when the
 never executes PR code, posts the `Test integrity` and `Hard-stop scan` commit statuses). If the
 repo has a merge-gate registry of expected checks, register the workflow there as enforced by
 branch protection.
+
+A repo whose default branch uses GitHub's merge queue also copies `templates/workflows/queue-intake.yml` and
+`templates/workflows/queue-guards.yml` (vendored `queue-guards-run.mjs` and `lib/queue-members.mjs` come with `P vendor`).
+`Queue intake` runs on `merge_group`; `Queue guards` follows it with `workflow_run`, so GitHub runs the default branch's copy
+only, and posts the guard statuses on the queue commit for the member PRs' exact queued heads. Register `Queue guards` like
+`pipeline-guards.yml` and do not edit it from a PR.
 
 ### f. CODEOWNERS
 

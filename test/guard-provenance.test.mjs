@@ -3,8 +3,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { deflateRawSync } from 'node:zlib';
 import {
-  APPROVAL_LABELS, checkGuardVerdict, checkRunProvenance, checkVerdictArtifact, parseVerdictArtifactName, verdictArtifactName, withinRunWindow,
+  APPROVAL_LABELS, QUEUE_WORKFLOW_PATH, checkGuardVerdict, checkQueueVerdict, checkRunProvenance, checkVerdictArtifact, parseQueueVerdictArtifactName, parseVerdictArtifactName,
+  queueVerdictArtifactName, verdictArtifactName, withinRunWindow, zipEntryText,
 } from '../pipeline/lib/guard-provenance.mjs';
 
 const REPO = 'acme/app';
@@ -390,4 +392,160 @@ test('checkRunProvenance: a run URL of the same name never reads repository ids 
   const r = movedProv({}, { calls, url: 'https://github.com/ACME/App/actions/runs/1' });
   assert.equal(r.ok, true);
   assert.equal(calls.filter((c) => c.startsWith('id:')).length, 0);
+});
+
+// ---- the queue verdict (the poster's run-owned artifact on a merge-queue commit) --------------------------------------------
+
+const QSHA = 'b'.repeat(40);
+const Q_URL = 'https://github.com/acme/app/actions/runs/50';
+const QHEAD = '5'.repeat(40);
+const qname = (i = 'success', h = 'success', r = 'success', sha = QSHA) => queueVerdictArtifactName({ queueSha: sha, integrity: i, hardstops: h, review: r });
+const qverdict = (over = {}) => ({
+  version: 1, queueSha: QSHA, base: 'c'.repeat(40),
+  members: [{ pr: 3, head: '3'.repeat(40), entryId: 'E3', commit: 'a'.repeat(40) }, { pr: 5, head: QHEAD, entryId: 'E5', commit: QSHA }],
+  checks: { integrity: { state: 'success' }, hardstops: { state: 'success' }, review: { state: 'success' } },
+  ...over,
+});
+// A scripted queue-guards run on main: `run` overrides its fields, `artifacts` is [{ id, name }], `files` maps artifact id to verdict.json text.
+function qreader({ run = {}, artifacts = [{ id: 7001, name: qname() }], files = { 7001: JSON.stringify(qverdict()) }, ancestor = 'ahead', calls = [] } = {}) {
+  const read = (apiPath, jq) => {
+    calls.push(apiPath);
+    if (apiPath === 'repos/acme/app/actions/runs/50') {
+      return JSON.stringify({
+        path: '.github/workflows/queue-guards.yml@refs/heads/main', event: 'workflow_run', status: 'completed', head_sha: 'd'.repeat(40), head_branch: 'main',
+        run_attempt: 1, created_at: T('10:00:00'), updated_at: T('10:05:00'), ...run,
+      });
+    }
+    if (apiPath === 'repos/acme/app/actions/runs/50/artifacts?per_page=100') return artifacts.map((a) => `${a.id} ${a.name}`).join('\n');
+    if (apiPath === 'repos/acme/app') return 'main\n';
+    if (/^repos\/acme\/app\/compare\/[0-9a-f]{40}\.\.\.main$/.test(apiPath)) return `${ancestor}\n`;
+    throw new Error(`unscripted read ${apiPath} ${jq}`);
+  };
+  const readArtifact = ({ id }) => {
+    if (files[id] === undefined) throw new Error('no such artifact');
+    return files[id];
+  };
+  return { read, readArtifact, calls };
+}
+const qcheck = (r, over = {}) => checkQueueVerdict({ read: r.read, readArtifact: r.readArtifact, repo: REPO, url: Q_URL, queueSha: QSHA, pr: 5, head: QHEAD, expect: { check: 'hardstops' }, ...over });
+
+test('queueVerdictArtifactName: the exact format; parse is its inverse; anything else is refused', () => {
+  assert.equal(qname('success', 'failure', 'off'), `queue-verdict_v1_${QSHA}_success_failure_off`);
+  assert.equal(QUEUE_WORKFLOW_PATH, '.github/workflows/queue-guards.yml');
+  for (const i of ['success', 'failure', 'error']) {
+    for (const r of ['success', 'failure', 'error', 'off']) {
+      const n = qname(i, 'error', r);
+      assert.deepEqual(parseQueueVerdictArtifactName(n), { queueSha: QSHA, integrity: i, hardstops: 'error', review: r }, n);
+      assert.doesNotMatch(n, /[":<>|*?\\/\r\n]/);
+    }
+  }
+  const ok = { queueSha: QSHA, integrity: 'success', hardstops: 'success', review: 'off' };
+  for (const bad of [{ ...ok, queueSha: 'abc' }, { ...ok, integrity: 'off' }, { ...ok, hardstops: 'passed' }, { ...ok, review: 'skipped' }, { ...ok, review: undefined }]) {
+    assert.throws(() => queueVerdictArtifactName(bad), /queue verdict artifact/, JSON.stringify(bad));
+  }
+  const good = qname();
+  for (const bad of ['', null, `${good}_x`, ` ${good}`, good.replace('queue-verdict', 'pipeline-verdict'), good.replace('_v1_', '_v2_'), good.replace(QSHA, 'b'.repeat(39)), `pipeline-verdict_v2_${QSHA}_success_success_success`]) {
+    assert.equal(parseQueueVerdictArtifactName(bad), null, String(bad));
+  }
+});
+
+test('checkQueueVerdict: the right run + artifact for this PR and head => ok', () => {
+  const r = qreader();
+  const v = qcheck(r);
+  assert.equal(v.ok, true, v.reason);
+  for (const check of ['integrity', 'review']) assert.equal(qcheck(r, { expect: { check } }).ok, true, check);
+});
+
+test('checkQueueVerdict: a copied URL of a run whose manifest lacks the PR (or lists it at another head) => not ok', () => {
+  const lacks = qreader({ files: { 7001: JSON.stringify(qverdict({ members: [{ pr: 3, head: '3'.repeat(40), entryId: 'E3', commit: 'a'.repeat(40) }] })) } });
+  assert.match(qcheck(lacks).reason, /manifest/);
+  const other = qreader({ files: { 7001: JSON.stringify(qverdict({ members: [{ pr: 5, head: '9'.repeat(40), entryId: 'E5', commit: QSHA }] })) } });
+  assert.match(qcheck(other).reason, /manifest/);
+  assert.equal(qcheck(qreader(), { pr: 6 }).ok, false);
+  assert.equal(qcheck(qreader(), { head: '9'.repeat(40) }).ok, false);
+});
+
+test('checkQueueVerdict: other workflow, event, attempt, branch, or a head_sha off the default branch => not ok', () => {
+  assert.match(qcheck(qreader({ run: { path: '.github/workflows/pipeline-guards.yml@refs/heads/main' } })).reason, /queue-guards\.yml/);
+  assert.match(qcheck(qreader({ run: { event: 'merge_group' } })).reason, /workflow_run/);
+  assert.match(qcheck(qreader({ run: { run_attempt: 2 } })).reason, /attempt 2/);
+  assert.match(qcheck(qreader({ run: { head_branch: 'gh-readonly-queue/main/pr-5-x' } })).reason, /head_branch/);
+  assert.match(qcheck(qreader({ ancestor: 'diverged' })).reason, /not on the default branch/);
+  assert.equal(qcheck(qreader({ ancestor: 'identical' })).ok, true, 'head_sha may equal the default tip');
+  assert.equal(qcheck(qreader({ run: { head_sha: '' } })).ok, false);
+  assert.equal(qcheck(qreader(), { url: 'https://github.com/other/app/actions/runs/50' }).ok, false, 'a run of another repository');
+});
+
+test('checkQueueVerdict: the artifact must name this queue commit and say success for the context', () => {
+  assert.match(qcheck(qreader({ artifacts: [{ id: 7001, name: qname('success', 'success', 'success', 'e'.repeat(40)) }] })).reason, /no queue verdict artifact/);
+  assert.match(qcheck(qreader({ artifacts: [] })).reason, /no queue verdict artifact/);
+  assert.match(qcheck(qreader({ artifacts: [{ id: 7001, name: qname('success', 'failure', 'success') }] })).reason, /hardstops is failure/);
+  assert.equal(qcheck(qreader({ artifacts: [{ id: 7001, name: qname('success', 'failure', 'success') }] }), { expect: { check: 'integrity' } }).ok, true);
+  // the file says failure although the name says success (name and content must agree)
+  const liar = qreader({ files: { 7001: JSON.stringify(qverdict({ checks: { hardstops: { state: 'failure' } } })) } });
+  assert.equal(qcheck(liar).ok, false);
+  const otherQ = qreader({ files: { 7001: JSON.stringify(qverdict({ queueSha: 'e'.repeat(40) })) } });
+  assert.equal(qcheck(otherQ).ok, false);
+  assert.equal(qcheck(qreader(), { expect: {} }).ok, false);
+  assert.equal(qcheck(qreader(), { expect: { check: 'nonsense' } }).ok, false);
+});
+
+test('checkQueueVerdict: fails closed when the artifact cannot be read, has no reader, or is not the poster\'s JSON', () => {
+  assert.equal(qcheck(qreader({ files: {} })).ok, false);
+  assert.equal(qcheck(qreader({ files: { 7001: 'not json' } })).ok, false);
+  assert.equal(qcheck(qreader({ files: { 7001: JSON.stringify(qverdict({ version: 2 })) } })).ok, false);
+  const r = qreader();
+  assert.match(checkQueueVerdict({ read: r.read, repo: REPO, url: Q_URL, queueSha: QSHA, pr: 5, head: QHEAD, expect: { check: 'hardstops' } }).reason, /cannot read the artifact/);
+  assert.equal(checkQueueVerdict({ read: () => { throw new Error('HTTP 500'); }, readArtifact: r.readArtifact, repo: REPO, url: Q_URL, queueSha: QSHA, pr: 5, head: QHEAD, expect: { check: 'hardstops' } }).ok, false);
+  assert.equal(qcheck(r, { url: 'not a url' }).ok, false);
+  assert.equal(qcheck(r, { queueSha: 'abc' }).ok, false);
+});
+
+test('checkQueueVerdict: a run that has not completed is never cached (its artifact list still moves)', () => {
+  const cache = new Map();
+  const running = qreader({ run: { status: 'in_progress' }, artifacts: [] });
+  assert.equal(qcheck(running, { cache }).ok, false);
+  const done = qreader();
+  assert.equal(qcheck(done, { cache }).ok, true, 'the second read sees the finished run, not a cached early one');
+  assert.equal(qcheck(done, { cache }).ok, true);
+  assert.equal(done.calls.filter((c) => c.endsWith('/actions/runs/50')).length, 1, 'a completed run is read once');
+});
+
+test('zipEntryText: reads a stored or deflated entry from a zip; refuses a missing entry, garbage and an oversized entry', () => {
+  const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+  const u16 = (n) => { const b = Buffer.alloc(2); b.writeUInt16LE(n); return b; };
+  const zip = (entries) => {
+    let offset = 0;
+    const locals = [];
+    const centrals = [];
+    for (const { name: n, data, method } of entries) {
+      const body = method === 8 ? deflateRawSync(Buffer.from(data)) : Buffer.from(data);
+      const nameBuf = Buffer.from(n);
+      const local = Buffer.concat([u32(0x04034b50), u16(20), u16(0), u16(method), u16(0), u16(0), u32(0), u32(body.length), u32(Buffer.byteLength(data)), u16(nameBuf.length), u16(0), nameBuf, body]);
+      centrals.push(Buffer.concat([u32(0x02014b50), u16(20), u16(20), u16(0), u16(method), u16(0), u16(0), u32(0), u32(body.length), u32(Buffer.byteLength(data)), u16(nameBuf.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset), nameBuf]));
+      locals.push(local);
+      offset += local.length;
+    }
+    const cd = Buffer.concat(centrals);
+    return Buffer.concat([...locals, cd, u32(0x06054b50), u16(0), u16(0), u16(entries.length), u16(entries.length), u32(cd.length), u32(offset), u16(0)]);
+  };
+  const json = JSON.stringify(qverdict());
+  const z = zip([{ name: 'other.txt', data: 'x', method: 0 }, { name: 'verdict.json', data: json, method: 8 }]);
+  assert.equal(zipEntryText(z, 'verdict.json'), json);
+  assert.equal(zipEntryText(zip([{ name: 'verdict.json', data: json, method: 0 }]), 'verdict.json'), json);
+  assert.throws(() => zipEntryText(z, 'missing.json'), /not in the zip/);
+  assert.throws(() => zipEntryText(Buffer.from('not a zip at all'), 'verdict.json'), /zip/);
+  assert.throws(() => zipEntryText(zip([{ name: 'verdict.json', data: 'x'.repeat(2_000_000), method: 8 }]), 'verdict.json'), /too large|zip/);
+});
+
+test('the queue run jq filter works on a GitHub-shaped payload', { skip: !hasJq && 'jq not installed' }, () => {
+  const filters = [];
+  const r = qreader();
+  checkQueueVerdict({ read: (p, jq) => { filters.push([p, jq]); return r.read(p, jq); }, readArtifact: r.readArtifact, repo: REPO, url: Q_URL, queueSha: QSHA, pr: 5, head: QHEAD, expect: { check: 'hardstops' } });
+  const jq = (expr, payload) => spawnSync('jq', ['-rc', expr], { input: JSON.stringify(payload), encoding: 'utf8' }).stdout.replace(/\r\n/g, '\n');
+  const run = filters.find(([p]) => p.endsWith('/runs/50'))[1];
+  const list = filters.find(([p]) => p.includes('/artifacts'))[1];
+  const payload = { id: 50, path: '.github/workflows/queue-guards.yml@refs/heads/main', event: 'workflow_run', status: 'completed', head_sha: 'd'.repeat(40), head_branch: 'main', run_attempt: 1, created_at: T('10:00:00'), updated_at: T('10:05:00'), pull_requests: [] };
+  assert.deepEqual(JSON.parse(jq(run, payload)), { path: payload.path, event: 'workflow_run', status: 'completed', head_sha: 'd'.repeat(40), head_branch: 'main', run_attempt: 1, created_at: T('10:00:00'), updated_at: T('10:05:00') });
+  assert.equal(jq(list, { artifacts: [{ id: 7001, name: qname(), expired: false }, { id: 7002, name: qname(), expired: true }] }), `7001 ${qname()}\n`, 'an expired artifact is never listed');
 });
