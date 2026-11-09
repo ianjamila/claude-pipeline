@@ -199,7 +199,7 @@ export function unreleasedWarning({ pr, reason, code, notStarted = false, takeCo
 // one meanwhile, so the gate ALWAYS runs again after the take. Another hold ahead -> queued-behind and a hold-unreadable re-check
 // are returned with `holdTaken` (did the take confirm) so the caller can clean up (a CONFIRMED hold is real and is kept when only the re-check could not be read; an unconfirmed take is released); clear -> null (the PUT goes, held or not: the hold
 // is cooperative, a missing hold is not a safety loss). Later cycles of the same call only re-run the first gate (its refusal carries `holdTaken` too once this call has taken).
-// -> { beforeUpdate, info }; `info` is filled as the calls happen: { taken, tookThisCall, mayHold (the take ran, so it may have written the label: the auto-releases key on it), take: { confirmed, code, lines, timedOut?, notStarted? } | null }.
+// -> { beforeUpdate, info }; `info` is filled as the calls happen: { taken, tookThisCall, mayHold (the take ran and STARTED, so it may have written the label: the auto-releases key on it; a take that could not be started cannot have), take: { confirmed, code, lines, timedOut?, notStarted? } | null }.
 // Not configured -> { beforeUpdate: null, info: null }.
 export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync }) {
   if (!holdsConfigured(config)) return { beforeUpdate: null, info: null };
@@ -219,7 +219,8 @@ export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync })
     // Any take that ran may have written the label. Exit 1 means "refused OR not confirmed" (docs/cli.md): the same code covers a draft
     // PR refused before anything was written and a label that was added whose confirming event came late, and the two cannot be told
     // apart. Releasing a label that was never written is a harmless no-op, so every take that ran is released on the failure paths.
-    info.mayHold = info.tookThisCall;
+    // Except a take that could not even be STARTED (`notStarted`): nothing ran, so no label can exist and a release would only fail the same way.
+    info.mayHold = info.tookThisCall && took.notStarted !== true;
     const again = await holdGate(args);
     return again ? { ...again, holdTaken: info.taken } : null;
   };

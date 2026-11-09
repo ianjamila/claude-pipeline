@@ -490,6 +490,8 @@ test('holdBeforeUpdate: mayHold = the take ran (R2-F1: exit 1 is "refused OR not
     ['exit 0 + timed out', taken({ code: 0, timedOut: true }), true],
     ['exit 2', taken({ code: 2 }), true],
     ['exit 7', taken({ code: 7 }), true],
+    // #194: a take that never started cannot have written a label (R1-F1), so nothing is released afterwards
+    ['not started (spawnError)', { code: 1, spawnError: true, stdout: '', stderr: 'spawn /bin/sh ENOENT', timedOut: false, signal: null }, false],
   ]) {
     const sh = shell({ take });
     const { beforeUpdate, info } = before(sh);

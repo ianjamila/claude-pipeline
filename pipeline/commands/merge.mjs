@@ -149,7 +149,7 @@ export const run = guarded(async (argv, ctx) => {
       gh, pr, expectHead: gate.head, maxCycles: 1, waitChecks: false, beforeUpdate, onSuccessor: (x) => recordSuccessor(root, pr, x), ...updateTiming(ctx.env),
     });
     warnings.push(...(synced.successorWarnings ?? []));
-    // Gives back the hold THIS call may have written (holdInfo.mayHold = the take ran: exit 1 is "refused OR not confirmed" and may follow a written label, so any take that ran is released; a hold it did not take is never touched): { reason, confirmed, code, lines }; a release that is not confirmed is a warning.
+    // Gives back the hold THIS call may have written (holdInfo.mayHold = the take ran and started: exit 1 is "refused OR not confirmed" and may follow a written label, so any take that ran is released; a hold it did not take is never touched): { reason, confirmed, code, lines }; a release that is not confirmed is a warning.
     const releaseTaken = async (reason) => {
       if (!holdInfo?.mayHold) return undefined;
       const rel = await releaseHold({ config, pr, reason, root, env: ctx.env });
