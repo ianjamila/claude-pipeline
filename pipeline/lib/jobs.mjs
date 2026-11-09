@@ -87,7 +87,7 @@ function isRunning(jobDir, name) {
 }
 
 // mkdir is atomic, so whoever creates <name>.starting is the only starter of that job right now.
-function acquireStartLock(lock) {
+export function acquireStartLock(lock) {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       mkdirSync(lock);
