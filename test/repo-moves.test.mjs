@@ -85,7 +85,7 @@ test('readRepoMoves: a symlinked file, a linked or file folder and an oversize f
 const A = 'old/app';
 const B = 'mid/app';
 const C = 'new/app';
-const mv = (from, to, at) => ({ from, to, at, repoId: 1 });
+const mv = (from, to, at, repoId = 1) => ({ from, to, at, repoId });
 const BEFORE = '2026-11-01T00:00:00Z';
 const MOVED = '2026-11-05T00:00:00Z';
 const AFTER = '2026-11-09T00:00:00Z';
@@ -128,9 +128,31 @@ test('sameRepo: a cycle ends (never revisits a name) and a chain longer than the
   const cycle = [mv(A, B, MOVED), mv(B, A, AFTER), mv(B, 'x/y', AFTER)];
   assert.equal(same(A, BEFORE, C, cycle), false);
   assert.equal(same(A, BEFORE, 'x/y', cycle), true);
-  const long = (n) => Array.from({ length: n }, (_, i) => mv(`n${i}/app`, `n${i + 1}/app`, MOVED));
+  const long = (n) => Array.from({ length: n }, (_, i) => mv(`n${i}/app`, `n${i + 1}/app`, new Date(Date.parse(MOVED) + i * 1000).toISOString()));
   assert.equal(same('n0/app', BEFORE, `n${MAX_HOPS}/app`, long(MAX_HOPS)), true);
   assert.equal(same('n0/app', BEFORE, `n${MAX_HOPS + 1}/app`, long(MAX_HOPS + 1)), false);
+});
+
+test('sameRepo: a chain never crosses repository identities (every hop carries the first hop\'s repoId)', () => {
+  // Codex's repro: an approval for org/a, then org/b -> org/c (repository 2) and org/a -> org/b (repository 1), the later one second.
+  const crossed = [mv('org/b', 'org/c', '2026-11-09T10:00:00Z', 2), mv('org/a', 'org/b', '2026-11-09T11:00:00Z', 1)];
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', crossed), false);
+  // the same chain with one id is a valid, forwards-in-time chain
+  const one = [mv('org/a', 'org/b', '2026-11-09T10:00:00Z', 7), mv('org/b', 'org/c', '2026-11-09T11:00:00Z', 7)];
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', one), true);
+  // forwards in time but two ids
+  const ids = [mv('org/a', 'org/b', '2026-11-09T10:00:00Z', 7), mv('org/b', 'org/c', '2026-11-09T11:00:00Z', 8)];
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', ids), false);
+  // a single hop is unaffected by its id, but a move without an integer id never aliases
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/b', [mv('org/a', 'org/b', '2026-11-09T10:00:00Z', 7)]), true);
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/b', [{ from: 'org/a', to: 'org/b', at: '2026-11-09T10:00:00Z' }]), false);
+});
+
+test('sameRepo: a chain never walks backwards in time (each hop strictly later than the one before)', () => {
+  const back = [mv('org/b', 'org/c', '2026-11-09T10:00:00Z'), mv('org/a', 'org/b', '2026-11-09T11:00:00Z')];
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', back), false, 'same id, but the second hop predates the first');
+  const tie = [mv('org/a', 'org/b', '2026-11-09T10:00:00Z'), mv('org/b', 'org/c', '2026-11-09T10:00:00Z')];
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', tie), false, 'the same instant is not later');
 });
 
 test('sameRepo: an unparseable or missing recordedAt allows an exact match only', () => {

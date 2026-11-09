@@ -18,6 +18,7 @@ export const REPO_MOVES_DIR_REL = '.claude/pipeline-state/owner-go';
 export const REPO_MOVES_FILE = 'repo-moves.json';
 export const MAX_MOVES_BYTES = 64 * 1024;
 export const MAX_HOPS = 8;
+export const REPO_MOVES_LOCK = `${REPO_MOVES_FILE}.lock`;
 
 const NAME_RE = new RegExp(`^${REPO_NAME}$`);
 export const repoMovesPath = (home = accountHome()) => path.join(home, ...REPO_MOVES_DIR_REL.split('/'), REPO_MOVES_FILE);
@@ -90,6 +91,8 @@ export function readRepoMoves({ home = accountHome() } = {}) {
 
 // Does a record that names `recorded`, made at `recordedAt`, speak about `current`? Exact (case-insensitive) match, or a chain of moves
 // from `recorded` to `current` where every hop was made AFTER the record (it predates that move). One way; at most MAX_HOPS hops; no name twice.
+// One chain is ONE repository: every hop carries the same repoId (the first hop fixes it; a vacated name can be reused by another
+// repository) and each hop is strictly later than the one before it (history is walked forwards, never back).
 export function sameRepo({ recorded, recordedAt, current, moves } = {}) {
   if (typeof recorded !== 'string' || typeof current !== 'string') return false;
   const want = current.toLowerCase();
@@ -97,24 +100,24 @@ export function sameRepo({ recorded, recordedAt, current, moves } = {}) {
   if (start === want) return true;
   const madeAt = typeof recordedAt === 'string' ? Date.parse(recordedAt) : NaN;
   if (!Number.isFinite(madeAt) || !Array.isArray(moves)) return false;
-  const later = moves.filter((m) => typeof m?.from === 'string' && typeof m.to === 'string' && Date.parse(m.at) > madeAt)
-    .map((m) => ({ from: m.from.toLowerCase(), to: m.to.toLowerCase() }));
-  const walk = (name, seen) => {
+  const later = moves.filter((m) => typeof m?.from === 'string' && typeof m.to === 'string' && Number.isInteger(m.repoId) && Date.parse(m.at) > madeAt)
+    .map((m) => ({ from: m.from.toLowerCase(), to: m.to.toLowerCase(), at: Date.parse(m.at), repoId: m.repoId }));
+  // `last` is the time of the previous hop (the record's own time for the first); `id` the chain's repository id (null until the first hop).
+  const walk = (name, seen, last, id) => {
     if (seen.size > MAX_HOPS) return false;
-    return later.some((m) => m.from === name && !seen.has(m.to) && (m.to === want || walk(m.to, new Set([...seen, m.to]))));
+    return later.some((m) => m.from === name && m.at > last && (id === null || m.repoId === id) && !seen.has(m.to)
+      && (m.to === want || walk(m.to, new Set([...seen, m.to]), m.at, m.repoId)));
   };
-  return walk(start, new Set([start]));
+  return walk(start, new Set([start]), madeAt, null);
 }
 
 // The owner's writer (commands/repo-move.mjs). Appends `move` to the file, keeping every existing entry, with a temp file in the same
 // folder (0600) renamed over it. Refuses when the existing file is invalid (the owner fixes or removes it) or the folder is not a real
-// folder. A move with the same from and to already present is a no-op. Returns { ok: true, added, moves } or { ok: false, reason }.
+// folder. A move with the same from, to AND time already present is a no-op (a later A -> B after B -> A is a new fact and is appended).
+// Takes an exclusive lock file (repo-moves.json.lock, O_EXCL) around the read-validate-append-rename and refuses when it already exists (no waiting, no stealing). Returns { ok: true, added, moves } or { ok: false, reason }.
 export function appendRepoMove(move, { home = accountHome() } = {}) {
   const entry = validMove(move);
   if (!entry) return { ok: false, reason: 'not a valid move (names owner/name, different from each other; a real time; a positive repository id)' };
-  const existing = readRepoMoves({ home });
-  if (existing.error) return { ok: false, reason: existing.error };
-  if (existing.moves.some((m) => m.from === entry.from && m.to === entry.to)) return { ok: true, added: false, moves: existing.moves };
   let p = home;
   for (const part of REPO_MOVES_DIR_REL.split('/')) {
     p = path.join(p, part);
@@ -125,21 +128,36 @@ export function appendRepoMove(move, { home = accountHome() } = {}) {
       try { mkdirSync(p, { mode: 0o700 }); } catch (e) { return { ok: false, reason: `cannot create ${p} (${e?.code ?? 'error'})` }; }
     }
   }
-  const moves = [...existing.moves, entry];
   const target = repoMovesPath(home);
-  const temp = path.join(path.dirname(target), `.${REPO_MOVES_FILE}.${process.pid}.${Date.now()}.tmp`);
+  const lock = path.join(path.dirname(target), REPO_MOVES_LOCK);
   try {
-    const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
-    try {
-      writeSync(fd, `${JSON.stringify({ v: 1, moves }, null, 2)}\n`);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(temp, target);
+    closeSync(openSync(lock, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600));
   } catch (err) {
-    try { unlinkSync(temp); } catch { /* not created, or already renamed */ }
-    return { ok: false, reason: `could not write ${target} (${err?.code ?? 'error'})` };
+    return { ok: false, reason: err?.code === 'EEXIST'
+      ? `another repo-move is writing (or one died): ${lock} exists. Nothing was changed; remove that file if no repo-move is running, then try again`
+      : `could not take the lock ${lock} (${err?.code ?? 'error'})` };
   }
-  return { ok: true, added: true, moves };
+  try {
+    const existing = readRepoMoves({ home });
+    if (existing.error) return { ok: false, reason: existing.error };
+    if (existing.moves.some((m) => m.from === entry.from && m.to === entry.to && Date.parse(m.at) === Date.parse(entry.at))) return { ok: true, added: false, moves: existing.moves };
+    const moves = [...existing.moves, entry];
+    const temp = path.join(path.dirname(target), `.${REPO_MOVES_FILE}.${process.pid}.${Date.now()}.tmp`);
+    try {
+      const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+      try {
+        writeSync(fd, `${JSON.stringify({ v: 1, moves }, null, 2)}\n`);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temp, target);
+    } catch (err) {
+      try { unlinkSync(temp); } catch { /* not created, or already renamed */ }
+      return { ok: false, reason: `could not write ${target} (${err?.code ?? 'error'})` };
+    }
+    return { ok: true, added: true, moves };
+  } finally {
+    try { unlinkSync(lock); } catch { /* already gone */ }
+  }
 }

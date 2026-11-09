@@ -1,12 +1,12 @@
 // `pipeline repo-move` (commands/repo-move.mjs): the owner's record of a renamed / transferred repository. A fake gh, a temp home.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { run } from '../pipeline/commands/repo-move.mjs';
 import { main } from '../pipeline/bin/pipeline.mjs';
-import { readRepoMoves, repoMovesPath } from '../pipeline/hooks/lib/repo-moves.mjs';
+import { readRepoMoves, REPO_MOVES_LOCK, repoMovesPath, sameRepo } from '../pipeline/hooks/lib/repo-moves.mjs';
 
 const FROM = 'ianjamila/eaglewatch';
 const TO = 'eaglewatch-ph/eaglewatch';
@@ -22,8 +22,9 @@ const fakeGh = (answers, calls = []) => (args) => {
   return { code: 0, stdout: `${a[0]}\t${a[1]}\n`, stderr: '', timedOut: false };
 };
 const GOOD = { [FROM]: [TO, 77], [TO]: [TO, 77] };
+const NOW = Date.parse('2026-11-12T00:00:00Z'); // after every --at used below, whatever the machine clock says
 const go = (argv, { h = home(), env = {}, ancestor = false, answers = GOOD, calls = [], ...ctx } = {}) =>
-  run(argv, { env, home: h, hasClaudeCodeAncestor: () => ancestor, ghFn: fakeGh(answers, calls), cwd: h, ...ctx }).then((r) => ({ ...r, h, calls }));
+  run(argv, { env, home: h, now: () => NOW, hasClaudeCodeAncestor: () => ancestor, ghFn: fakeGh(answers, calls), cwd: h, ...ctx }).then((r) => ({ ...r, h, calls }));
 const ARGS = ['--from', FROM, '--to', TO, '--at', AT];
 
 test('repo-move: refuses inside Claude Code (CLAUDECODE=1 or an ancestor) without the admin switch, and writes nothing', async () => {
@@ -79,14 +80,65 @@ test('repo-move: refuses when GitHub does not answer the new full name, when the
   await bad('a non-integer id', { [FROM]: [TO, 'x'], [TO]: [TO, 'x'] });
 });
 
-test('repo-move: the same move twice is a no-op (the file is byte-identical)', async () => {
+test('repo-move: the same move (same names and time) twice is a no-op (the file is byte-identical); a later --at is appended', async () => {
   const h = home();
   await go(ARGS, { h });
   const before = readFileSync(repoMovesPath(h), 'utf8');
-  const again = await go(['--from', FROM.toUpperCase(), '--to', TO, '--at', '2026-11-11T00:00:00Z'], { h, answers: { [FROM.toUpperCase()]: [TO, 77], [TO]: [TO, 77] } });
+  const upper = { [FROM.toUpperCase()]: [TO, 77], [TO]: [TO, 77] };
+  const again = await go(['--from', FROM.toUpperCase(), '--to', TO, '--at', AT], { h, answers: upper });
   assert.equal(again.exitCode, 0);
   assert.equal(again.output.added, false);
   assert.equal(readFileSync(repoMovesPath(h), 'utf8'), before);
+  const later = await go(['--from', FROM, '--to', TO, '--at', '2026-11-11T00:00:00Z'], { h });
+  assert.equal(later.output.added, true, 'the same names at a later time are a new fact');
+  assert.deepEqual(readRepoMoves({ home: h }).moves.map((m) => m.at), ['2026-11-09T06:58:25.000Z', '2026-11-11T00:00:00.000Z']);
+});
+
+test('repo-move: A -> B, B -> A, an approval under A, then A -> B again: that approval counts under B', async () => {
+  const h = home();
+  const A = 'ianjamila/eaglewatch';
+  const B = 'eaglewatch-ph/eaglewatch';
+  const ids = { [A]: [B, 77], [B]: [B, 77] };
+  const back = { [A]: [A, 77], [B]: [A, 77] };
+  assert.equal((await go(['--from', A, '--to', B, '--at', '2026-11-09T01:00:00Z'], { h, answers: ids })).output.added, true);
+  assert.equal((await go(['--from', B, '--to', A, '--at', '2026-11-09T02:00:00Z'], { h, answers: back })).output.added, true);
+  const approvedAt = '2026-11-09T03:00:00Z';
+  assert.equal(sameRepo({ recorded: A, recordedAt: approvedAt, current: B, moves: readRepoMoves({ home: h }).moves }), false, 'not yet moved after the approval');
+  assert.equal((await go(['--from', A, '--to', B, '--at', '2026-11-09T04:00:00Z'], { h, answers: ids })).output.added, true, 'a later A -> B is not dropped');
+  assert.equal(sameRepo({ recorded: A, recordedAt: approvedAt, current: B, moves: readRepoMoves({ home: h }).moves }), true);
+});
+
+test('repo-move: an existing lock file refuses the write and leaves the file unchanged; the lock is gone after success and after a failure', async () => {
+  const h = home();
+  await go(ARGS, { h });
+  const dir = join(repoMovesPath(h), '..');
+  assert.deepEqual(readdirSync(dir), ['repo-moves.json'], 'no lock left after a success');
+  const before = readFileSync(repoMovesPath(h), 'utf8');
+  const lock = join(dir, REPO_MOVES_LOCK);
+  writeFileSync(lock, '');
+  const r = await go(['--from', FROM, '--to', TO, '--at', '2026-11-11T00:00:00Z'], { h });
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.error, 'not-written');
+  assert.ok(r.output.message.includes(lock), 'the message names the lock file');
+  assert.equal(readFileSync(repoMovesPath(h), 'utf8'), before);
+  assert.equal(readFileSync(lock, 'utf8'), '', 'a lock somebody else holds is not removed');
+  unlinkSync(lock);
+  // a failure while holding the lock (an invalid existing file) still releases it
+  writeFileSync(repoMovesPath(h), '{"v":1,"moves":[{"from":"bad"}]}');
+  const bad = await go(['--from', FROM, '--to', TO, '--at', '2026-11-11T00:00:00Z'], { h });
+  assert.equal(bad.exitCode, 1);
+  assert.deepEqual(readdirSync(dir), ['repo-moves.json'], 'no lock left after a failure');
+});
+
+test('repo-move: --at later than now + 5 minutes is a usage error, nothing written; within the slack it is accepted', async () => {
+  const h = home();
+  const calls = [];
+  const iso = (ms) => new Date(ms).toISOString();
+  await assert.rejects(go(['--from', FROM, '--to', TO, '--at', iso(NOW + 5 * 60 * 1000 + 1000)], { h, calls }), (e) => e.constructor.name === 'UsageError');
+  assert.equal(calls.length, 0, 'GitHub is not asked');
+  assert.deepEqual(readRepoMoves({ home: h }), { moves: [], error: null });
+  const ok = await go(['--from', FROM, '--to', TO, '--at', iso(NOW + 4 * 60 * 1000)], { h });
+  assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
 });
 
 test('repo-move: an invalid existing file is refused and left untouched; --list shows it', async () => {

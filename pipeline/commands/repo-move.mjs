@@ -14,13 +14,14 @@ export const meta = {
     'pipeline repo-move --list   -> {ok, file, moves, error}',
     'pipeline repo-move --from <owner/name> --to <owner/name> [--at <ISO time>]   -> {ok, added, move, moves, file}',
     '  Records the move in ~/.claude/pipeline-state/owner-go/repo-moves.json (agents cannot write it). GitHub must confirm it: the old name has to',
-    '  resolve to the new full name and to the same repository id. --at is when the move happened (default: now); only approvals, rulings and',
-    '  grants made BEFORE it count for the new name, never the other way round. Adding the same move twice is a no-op; an invalid existing file',
+    '  resolve to the new full name and to the same repository id. --at is when the move happened (default: now; at most 5 minutes ahead of now); only approvals, rulings and',
+    '  grants made BEFORE it count for the new name, never the other way round. Adding the same move (same time) twice is a no-op, the same names at a later time are appended (a move back and forth); an invalid existing file',
     '  is refused (fix or remove it).',
     '  Refuses inside Claude Code (run it in your own terminal) unless --list is given or the owner launched Claude Code with the admin switch.',
   ].join('\n'),
 };
 
+const FUTURE_SLACK_MS = 5 * 60 * 1000; // clock skew allowance for --at
 const NAME = new RegExp(`^${REPO_NAME}$`);
 
 // { fullName, id } of what GitHub answers for `repos/<name>` (id null when it is not a positive integer).
@@ -60,6 +61,8 @@ export async function run(argv, ctx = {}) {
   if (from.toLowerCase() === to.toLowerCase()) throw new UsageError('--from and --to are the same repository name');
   const atMs = values.at === undefined ? (ctx.now ?? Date.now)() : Date.parse(values.at);
   if (!Number.isFinite(atMs)) throw new UsageError('--at must be a time such as 2026-11-09T06:58:25Z');
+
+  if (atMs > (ctx.now ?? Date.now)() + FUTURE_SLACK_MS) throw new UsageError('--at is in the future: GitHub has already confirmed the move, so it cannot be later than now + 5 minutes (give the time it happened)');
 
   return guardGh(async () => {
     const gh = createGitHub({ cwd: ctx.cwd ?? process.cwd(), env, ghFn: ctx.ghFn });
