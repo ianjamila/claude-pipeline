@@ -456,10 +456,10 @@ test('holdBeforeUpdate: a take that exits 1 or times out, with a clear re-check,
   }
 });
 
-test('holdBeforeUpdate: mayHold = the take may have written the label (exit 0, a timeout, an exit other than 0/1); a clean exit 1 is a refusal that wrote nothing (#198)', async () => {
+test('holdBeforeUpdate: mayHold = the take ran (R2-F1: exit 1 is "refused OR not confirmed", it may follow a written label)', async () => {
   for (const [name, take, expected] of [
     ['exit 0', taken(), true],
-    ['exit 1', taken({ code: 1, stdout: 'refused: draft\n' }), false],
+    ['exit 1', taken({ code: 1, stdout: 'refused: draft\n' }), true],
     ['exit 1 + timed out', taken({ code: 1, timedOut: true }), true],
     ['exit 0 + timed out', taken({ code: 0, timedOut: true }), true],
     ['exit 2', taken({ code: 2 }), true],
@@ -492,8 +492,8 @@ test('holdBeforeUpdate: take ok + re-check blocked -> queued-behind with holdTak
 });
 
 test('holdBeforeUpdate: an unreadable re-check -> hold-unreadable with holdTaken (confirmed or not)', async () => {
-  // The caller keys on info: a confirmed hold (taken) is kept, an unconfirmed one that mayHold is released, a clean refusal is left alone (#199).
-  for (const [take, expected, mayHold] of [[taken(), true, true], [taken({ code: 1 }), false, false], [taken({ code: 2 }), false, true], [taken({ code: 0, timedOut: true }), false, true]]) {
+  // The caller keys on info: a confirmed hold (taken) is kept, any unconfirmed take (exit 1 included, R2-F1) is released (#199).
+  for (const [take, expected, mayHold] of [[taken(), true, true], [taken({ code: 1 }), false, true], [taken({ code: 2 }), false, true], [taken({ code: 0, timedOut: true }), false, true]]) {
     const sh = shell({ checks: [{ stdout: CLEAR }, { stdout: 'garbage' }], take });
     const { beforeUpdate, info } = before(sh);
     const r = await beforeUpdate();

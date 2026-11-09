@@ -173,14 +173,26 @@ export function queuedBehindRefusal(found) {
 
 // ---- taking the hold for the pipeline's own catch-up (plan 2026-11-06-f1-lite-build) -------------------------------------------------
 
+// The text of the warning for a release that was NOT confirmed. After a CONFIRMED take the hold is real: run the release again. After an
+// UNconfirmed take (exit 1 = refused OR not confirmed) there may be no label at all, so say so: nobody should retry blindly.
+// `again`: the caller already ran the release once on this path (update-branch's wording), not just a hint to run it (merge's).
+export function unreleasedWarning({ pr, reason, code, takeConfirmed, again = false }) {
+  const cmd = `\`pipeline merge-hold --pr ${pr} --release --reason ${reason}\``;
+  const where = `from PR #${pr}'s own worktree, on its branch (the provider may refuse a release from another checkout or a detached HEAD)`;
+  const head = `the merge hold of #${pr} was NOT released (${reason}; exit ${code})`;
+  return takeConfirmed
+    ? `${head}: run ${cmd}${again ? ' again' : ''} ${where}`
+    : `${head}; the take was not confirmed either, so there may be no hold to release: if the PR has a \`merge-hold\` label, run ${cmd} ${where}`;
+}
+
 // The `beforeUpdate` of bringUpToDate for a repo with holds: the catch-up PUT should run while THIS PR holds its turn, so the CI round
 // that follows cannot be invalidated by another session's merge (cooperatively: the repo's gate refuses other merges while the hold is
 // active). Before EVERY PUT: the gate (a refusal is returned as is, nothing taken). On the first call that passes it the hold is
 // taken, whatever the answer: a take that failed or timed out may still have written the label, and another session may have taken
 // one meanwhile, so the gate ALWAYS runs again after the take. Another hold ahead -> queued-behind and a hold-unreadable re-check
-// are returned with `holdTaken` (did the take confirm) so the caller can clean up (a CONFIRMED hold is real and is kept when only the re-check could not be read; an unconfirmed take that mayHold is released); clear -> null (the PUT goes, held or not: the hold
+// are returned with `holdTaken` (did the take confirm) so the caller can clean up (a CONFIRMED hold is real and is kept when only the re-check could not be read; an unconfirmed take is released); clear -> null (the PUT goes, held or not: the hold
 // is cooperative, a missing hold is not a safety loss). Later cycles of the same call only re-run the first gate.
-// -> { beforeUpdate, info }; `info` is filled as the calls happen: { taken, tookThisCall, mayHold (the take may have written the label: the auto-releases key on it), take: { confirmed, code, lines, timedOut? } | null }.
+// -> { beforeUpdate, info }; `info` is filled as the calls happen: { taken, tookThisCall, mayHold (the take ran, so it may have written the label: the auto-releases key on it), take: { confirmed, code, lines, timedOut? } | null }.
 // Not configured -> { beforeUpdate: null, info: null }.
 export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync }) {
   if (!holdsConfigured(config)) return { beforeUpdate: null, info: null };
@@ -194,9 +206,10 @@ export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync })
     info.tookThisCall = true;
     info.take = { confirmed: took.confirmed, code: took.code, lines: took.lines, ...(took.timedOut ? { timedOut: true } : {}) };
     info.taken = took.confirmed;
-    // The take may have written the label: confirmed, timed out (unknown), or any exit but 0/1. A clean exit 1 is the provider refusing
-    // (a draft PR, say): no label was written, so there is nothing to give back.
-    info.mayHold = took.confirmed === true || took.timedOut === true || ![0, 1].includes(took.code);
+    // Any take that ran may have written the label. Exit 1 means "refused OR not confirmed" (docs/cli.md): the same code covers a draft
+    // PR refused before anything was written and a label that was added whose confirming event came late, and the two cannot be told
+    // apart. Releasing a label that was never written is a harmless no-op, so every take that ran is released on the failure paths.
+    info.mayHold = info.tookThisCall;
     const again = await holdGate(args);
     return again ? { ...again, holdTaken: info.taken } : null;
   };
