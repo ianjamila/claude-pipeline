@@ -118,3 +118,4 @@ full record.
 - 2026-11-09 · #196 · Merge hold: a PR keeps its turn through its own catch-up (F1-lite) · risk high · rounds 5 · arbiter 3 · awaiting-owner-merge
 - 2026-11-09 · #204 · review skill: read the merge dry run whole, never a filtered key · risk high · rounds 2 · arbiter 0 · awaiting-owner-merge
 - 2026-11-09 · #213 · ci-wait waits for a re-run instead of failing on a superseded attempt (#195); Windows start-lock EPERM race · risk high · rounds 3 · arbiter 1 · awaiting-owner-merge
+- 2026-11-09 · #208 · Refuse "Closes #a, #b" PR bodies at review-complete and at the last look before merging · risk high · rounds 7 · arbiter 5 · awaiting-owner-merge
