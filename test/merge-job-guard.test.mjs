@@ -2,11 +2,12 @@
 // mutating git commands there (and only there), and `pipeline job start` gets the same answer.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
+import { evaluateGitCommand, resolvePrefixEnv } from '../pipeline/hooks/lib/git-policy.mjs';
+import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
 import { realGitWiring } from '../pipeline/hooks/lib/git-wiring.mjs';
 import { guardVerdict } from '../pipeline/lib/command-guard.mjs';
 
@@ -713,4 +714,121 @@ test('R6-B1: the same GIT_WORK_TREE / GIT_DIR commands are allowed with no marke
     `G=${elsewhere}/.git GIT_DIR=$G git reset --hard`,
     `WT=${wt} OTHER=$WT GIT_WORK_TREE=${elsewhere} git reset --hard`,
   ]) assert.equal(decide(c, container).decision, 'allow', `elsewhere: ${c}`);
+});
+
+// ---- review round 7 (R7-B1, R7-F1, R7-F2): a value that could be read more than one way is every one of them (a candidate set), never one confident guess ----
+// R7-B1: a name assigned twice in the prefix. R7-F1: `env NAME=v …` words are expanded by the shell BEFORE env runs, so `$NAME` there is the shell's own
+// variable (an earlier assignment on the line, or an earlier call), not the wrapper's. R7-F2: `'$WT'` / `\$WT` reach git as the literal text (a relative path).
+
+// the three ways a prefix reaches a checkout: GIT_WORK_TREE, GIT_DIR, and a core.worktree given as GIT_CONFIG_VALUE_0; `use(v)` is the assignment text
+const R7_KINDS = [
+  { name: 'GIT_WORK_TREE', v: 'WT', target: (p) => p, use: (v) => `GIT_WORK_TREE=${v}`, before: () => '' },
+  { name: 'GIT_DIR', v: 'G', target: (p) => `${p}/.git`, use: (v) => `GIT_DIR=${v}`, before: () => '' },
+  { name: 'GIT_CONFIG_VALUE_0', v: 'WT', target: (p) => p, use: (v) => `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${v}`, before: (at) => `GIT_DIR=${at}/gd ` },
+];
+const r7Setup = () => {
+  const { container, job } = containerWithJob();
+  mkdirSync(join(container, 'gd'));
+  // checkouts named by the literal text `$WT` / `$G`: what git finds when the shell hands it the unexpanded word
+  symlinkSync(job, join(container, '$WT'));
+  symlinkSync(join(job, '.git'), join(container, '$G'));
+  symlinkSync(job, join(container, 'gd', '$WT'));
+  return { container, job, at: fwd(container), wt: fwd(job), elsewhere: fwd(fakeRepo()), elsewhere2: fwd(fakeRepo()) };
+};
+const r7Verbs = ['git reset --hard', 'git checkout x'];
+const r7Denied = (command, cwd) => {
+  const v = decide(command, cwd);
+  assert.equal(v.decision, 'deny', command);
+  assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+};
+
+test('R7-B1: a name assigned twice in the prefix is both values, whichever comes last', () => {
+  const { container, job, at, wt, elsewhere } = r7Setup();
+  mark(job, process.pid, 12);
+  for (const k of R7_KINDS) {
+    for (const [a, b] of [[k.target(wt), k.target(elsewhere)], [k.target(elsewhere), k.target(wt)]]) {
+      for (const verb of r7Verbs) r7Denied(`${k.before(at)}${k.v}=${a} ${k.use(`$${k.v}`)} ${k.v}=${b} ${verb}`, container);
+    }
+  }
+});
+
+test('R7-F1: `env NAME=v … $NAME` reads the shell\'s NAME as well as the wrapper\'s: either one reaching the job is refused', () => {
+  const { container, job, at, wt, elsewhere } = r7Setup();
+  mark(job, process.pid, 12);
+  for (const k of R7_KINDS) {
+    const n = k.v;
+    for (const verb of r7Verbs) {
+      // the shell's variable is the job's (set earlier on the line, or exported): the "assigned more than once" gate refuses it first (another message)
+      for (const command of [
+        `${n}=${k.target(wt)}; ${k.before(at)}env ${n}=${k.target(elsewhere)} ${k.use(`$${n}`)} ${verb}`,
+        `export ${n}=${k.target(wt)}; ${k.before(at)}env ${n}=${k.target(elsewhere)} ${k.use(`$${n}`)} ${verb}`,
+        `${n}=${k.target(elsewhere)}; ${k.before(at)}env ${n}=${k.target(wt)} ${k.use(`$${n}`)} ${verb}`,
+      ]) assert.equal(decide(command, container).decision, 'deny', command);
+      for (const command of [
+        `${k.before(at)}env ${n}=${k.target(wt)} ${k.use(`$${n}`)} ${verb}`,
+        `${k.before(at)}env ${n}=${k.target(elsewhere)} ${n}=${k.target(wt)} ${k.use(`\${${n}}`)} ${verb}`,
+      ]) r7Denied(command, container);
+    }
+  }
+});
+
+test('R7-F2: a quoted or escaped `$` reaches git as the literal word: a relative path, which can be a link to the job\'s checkout', () => {
+  const { container, job, at, elsewhere } = r7Setup();
+  mark(job, process.pid, 12);
+  for (const k of R7_KINDS) {
+    const n = k.v;
+    for (const lit of [`'$${n}'`, `"\\$${n}"`, `\\$${n}`]) {
+      for (const verb of r7Verbs) r7Denied(`${k.before(at)}${n}=${k.target(elsewhere)} ${k.use(lit)} ${verb}`, container);
+    }
+  }
+});
+
+test('R7: the same commands are allowed with no marker, a dead marker, when read-only, or when every candidate points elsewhere', () => {
+  const { container, job, at, wt, elsewhere, elsewhere2 } = r7Setup();
+  const shapes = (k, a, b, dir) => [
+    `${k.before(dir)}${k.v}=${a} ${k.use(`$${k.v}`)} ${k.v}=${b} git reset --hard`,
+    `${k.before(dir)}env ${k.v}=${b} ${k.use(`$${k.v}`)} git reset --hard`,
+    `${k.before(dir)}${k.v}=${a} ${k.use(`'$${k.v}'`)} git reset --hard`,
+  ];
+  const cmds = R7_KINDS.flatMap((k) => shapes(k, k.target(wt), k.target(elsewhere), at));
+  for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `no marker: ${c}`);
+  mark(job, deadPid());
+  for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `dead marker: ${c}`);
+  mark(job, process.pid);
+  for (const c of cmds) {
+    assert.equal(decide(c.replace('git reset --hard', 'git status'), container).decision, 'allow', `read-only: ${c}`);
+    assert.equal(decide(c.replace('git reset --hard', 'git log --oneline'), container).decision, 'allow', `read-only: ${c}`);
+  }
+  // every candidate elsewhere (a container with a live job in it, but no link and nothing assigned that reaches it)
+  const { container: plain, job: plainJob } = containerWithJob();
+  mkdirSync(join(plain, 'gd'));
+  mark(plainJob, process.pid, 12);
+  for (const k of R7_KINDS) {
+    for (const c of shapes(k, k.target(elsewhere), k.target(elsewhere2), fwd(plain))) assert.equal(decide(c, plain).decision, 'allow', `elsewhere: ${c}`);
+  }
+});
+
+test('R7-F1: the candidates of `$NAME` in an env wrapper word are the wrapper\'s values, the line\'s own value, and (nothing shows the shell\'s) an unknown', () => {
+  const ctxWith = (vars) => ({ vars: Object.assign(Object.create(null), vars), unsureVars: new Set(), tainted: new Set() });
+  const resolve = (command, vars) => resolvePrefixEnv(simpleCommands(command, {})[0].env, ctxWith(vars), command);
+  const values = (r, k) => r.get(k).list.map((c) => c.v).sort();
+  // the shell's WT is /owned, the wrapper's is /elsewhere: git gets the shell's, so both are candidates and nothing is unknown
+  let r = resolve('env WT=/elsewhere GIT_WORK_TREE=$WT git reset --hard', { WT: '/owned' });
+  assert.deepEqual(values(r, 'GIT_WORK_TREE'), ['/elsewhere', '/owned']);
+  assert.equal(r.get('GIT_WORK_TREE').unknown, false);
+  // an earlier call may have set it: the line shows no value, so the target is unknown (the wrapper's value is still a candidate)
+  r = resolve('env WT=/elsewhere GIT_WORK_TREE=$WT git reset --hard', {});
+  assert.deepEqual(values(r, 'GIT_WORK_TREE'), ['/elsewhere']);
+  assert.equal(r.get('GIT_WORK_TREE').unknown, true);
+  // a prefix word reads the prefix assignments before it: nothing unknown; (B1) a later assignment of the name is a candidate too
+  r = resolve('WT=/a GIT_WORK_TREE=$WT WT=/b git reset --hard', {});
+  assert.deepEqual(values(r, 'GIT_WORK_TREE'), ['/a', '/b']);
+  assert.equal(r.get('GIT_WORK_TREE').unknown, false);
+  // F2: a quoted `$` is also the literal word
+  r = resolve("WT=/a GIT_WORK_TREE='$WT' git reset", {});
+  assert.deepEqual(r.get('GIT_WORK_TREE').list, [{ v: '$WT', lit: true }, { v: '/a', lit: false }]);
+  // nothing known: unknown, and no value to read
+  r = resolve('GIT_WORK_TREE=$WT git reset', {});
+  assert.equal(r.get('GIT_WORK_TREE').unknown, true);
+  assert.deepEqual(r.get('GIT_WORK_TREE').list, []);
 });

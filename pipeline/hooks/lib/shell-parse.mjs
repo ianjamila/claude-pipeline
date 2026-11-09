@@ -53,6 +53,23 @@ function setEnv(env, key, value) {
   // defineProperty so a variable literally named __proto__ is recorded instead of poisoning the prototype
   Object.defineProperty(env, key, { value, enumerable: true, writable: true, configurable: true });
 }
+// R7-B1 / R7-F1: the env object holds one value per name, but a command's prefix can assign a name twice (`WT=/a GIT_WORK_TREE=$WT WT=/b git …`) and an
+// `env` wrapper's words are expanded by the SHELL, not by the prefix before them. Every assignment word is also kept, in order and tagged with where it
+// stood ('prefix': `NAME=v git …`; 'env': a wrapper's `env NAME=v git …`), on the env object (not enumerable: the object still lists only what is set).
+// Read it with assignmentsOf; an env object that never went through the parser reads as one prefix assignment per name.
+const ASSIGNS = Symbol('assigns');
+function recordAssign(env, name, value, src) {
+  if (!env[ASSIGNS]) Object.defineProperty(env, ASSIGNS, { value: [], enumerable: false });
+  env[ASSIGNS].push({ name, value, src });
+}
+function setAssigned(env, key, value, src) {
+  setEnv(env, key, value);
+  recordAssign(env, key, value, src);
+}
+export function assignmentsOf(env) {
+  if (env?.[ASSIGNS]) return env[ASSIGNS].map((a) => ({ ...a }));
+  return Object.keys(env ?? {}).map((name) => ({ name, value: env[name], src: 'prefix' }));
+}
 
 // A leading NAME=value word is an assignment only when the `NAME=` part was written unquoted.
 function assignOf(w) {
@@ -304,7 +321,7 @@ function unwrapEnv(argv) {
     }
     const kv = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(t);
     if (!kv) break;
-    setEnv(env, kv[1], kv[2]);
+    setAssigned(env, kv[1], kv[2], 'env');
     i++;
   }
   const out = rest(a, i, env);
@@ -334,7 +351,7 @@ function unwrapSudo(shortVal, longVal) {
     for (; i < argv.length; i++) {
       const kv = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(argv[i]);
       if (!kv) break;
-      setEnv(env, kv[1], kv[2]);
+      setAssigned(env, kv[1], kv[2], 'env');
     }
     if (i >= argv.length) return null;
     const moved = seen.has('D') || seen.has('--chdir'); // (sudo -D DIR / --chdir: runs the command in DIR, not worked out here: unknown)
@@ -2859,13 +2876,13 @@ class Parser {
       let value = ps[3];
       if (nextEq) value = nextEq.length > 1 ? nextEq.slice(1) : (words[i + 2]?.text ?? '');
       else if (value === '') value = words[i + 1]?.text ?? '';
-      setEnv(env, ps[1], value);
+      setAssigned(env, ps[1], value, 'prefix');
       return emit(this.ctx, [], env, seg.raw, seg.depth, [], seg.sep);
     }
     for (; i < words.length; i++) {
       const a = assignOf(words[i]);
       if (!a) break;
-      setEnv(env, a[0], a[1]);
+      setAssigned(env, a[0], a[1], 'prefix');
     }
     for (let k = 0; k < words.length; k++) {
       // (the prefix assignments of a command are only in that command's environment, but `X=$(cat f) cmd` alone, `export X=$(cat f)` and `declare X=...` stay)
@@ -2925,10 +2942,12 @@ class Parser {
         this.ctx.envAlts = (this.ctx.envAlts ?? 0) + 1;
         if (this.ctx.envAlts > ALT_CAP) { this.ctx.truncated = true; break; }
         const altEnv = { ...env };
+        for (const a of assignmentsOf(env)) recordAssign(altEnv, a.name, a.value, a.src);
         applyEnvEdits(altEnv, { all: false, removed: [], unsure: true });
         this.process(alt, altEnv, seg, true, chdir);
       }
       applyEnvEdits(env, un.envEdits);
+      for (const a of assignmentsOf(un.env)) recordAssign(env, a.name, a.value, 'env');
       for (const k of Object.keys(un.env)) {
         setEnv(env, k, un.env[k]);
         env[ENV_UNSET]?.setAfter.add(k);
