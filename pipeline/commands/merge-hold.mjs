@@ -5,6 +5,7 @@
 import { EXIT, UsageError, parseCommandArgs, intOption } from '../lib/cli.mjs';
 import { requireConfig, resolveRepo, guarded } from '../lib/cmd-common.mjs';
 import { createGitHub } from '../lib/github.mjs';
+import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { HOLD_POLL_MS, RELEASE_REASONS, checkHolds, holdGate, holdGateFrom, holdsConfigured, ownSuccessor, releaseHold, takeHold, waitForTurn } from '../lib/merge-hold.mjs';
 
 const REASON_CODES = Object.keys(RELEASE_REASONS);
@@ -37,6 +38,22 @@ export const run = guarded(async (argv, ctx) => {
   const { config } = await requireConfig(root);
   // `ctx.runHold`: a test seam for the shell that runs the hold commands (default: runShellAsync).
   const args = { config, pr, root, env: ctx.env, run: ctx.runHold };
+
+  // Queue mode (GitHub's merge queue orders the merges itself): no hold to take or wait for, and none is taken. Only a repo with the hold keys asks
+  // (an unconfigured one stays a no-op with no GitHub read); --release is untouched.
+  if (!release && holdsConfigured(config)) {
+    try {
+      if (queueModeFor({ gh: createGitHub({ cwd: root, env: ctx.env }), pr }).queue) {
+        const front = { ok: true, configured: true };
+        if (wait) return { exitCode: EXIT.OK, output: { ...front, outcome: 'front', queueMode: true, polls: 0, waitedMinutes: 0, blockedBy: [] } };
+        return { exitCode: EXIT.OK, output: check ? { ...front, outcome: 'front', queueMode: true, readable: true, blockedBy: [] } : { ...front, taken: false, queueMode: true } };
+      }
+    } catch (err) {
+      // Unlike the merge routes this does NOT fail closed: merge-hold never merges, and taking or checking a hold while the queue state is
+      // unknown is just today's (stricter) behaviour, which is harmless. So an unreadable queue falls through to the queue-off path below.
+      if (!(err instanceof QueueUnreadable)) throw err;
+    }
+  }
 
   if (check && wait) {
     if (!holdsConfigured(config)) return { exitCode: EXIT.OK, output: { ok: true, configured: false } };
