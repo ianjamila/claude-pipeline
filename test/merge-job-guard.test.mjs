@@ -1472,3 +1472,56 @@ test('R12-F2: every -c definition of an alias name is judged (git uses the last)
   assert.equal(decide(`git -C ${at} -c alias.s=status -c alias.s=log s`, free).decision, 'allow');
 });
 
+test('R12-F1: a `!` alias body inherits the outer prefix env and selectors', () => {
+  const { job } = containerWithJob();
+  const free = containerWithJob().container;
+  const at = fwd(job);
+  const body = (b = 'git reset --hard') => `-c alias.s='!${b}' s`;
+  mark(job, process.pid, 12);
+  for (const c of [
+    `GIT_DIR=${at}/.git GIT_WORK_TREE=${at} git ${body()}`,
+    `GIT_WORK_TREE=${at} git ${body()}`,
+    `GIT_DIR=${at}/.git git ${body()}`,
+    `git --git-dir=${at}/.git ${body()}`,
+    `git --git-dir=${at}/.git --work-tree=${at} ${body()}`,
+    `git --work-tree=${at} ${body()}`,
+    `git -c core.worktree=${at} ${body()}`,
+    `env GIT_WORK_TREE=${at} git ${body()}`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${at} git ${body()}`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0='!git reset --hard' GIT_WORK_TREE=${at} git s`,
+    `git --work-tree=${at} -c alias.t=reset -c alias.s='!git t --hard' s`, // the body's `git t` sees the outer -c
+    `git config alias.s '!git reset --hard' && git --work-tree=${at} s`,
+  ]) jobDenied(c, free);
+  // and from the checkout itself, as before
+  jobDenied(`git ${body()}`, job);
+  // a selector that cannot be carried exactly (unreadable, or several values) refuses even a harmless body
+  for (const c of [
+    `git --work-tree=$W -c alias.s='!git status' s`,
+    `GIT_WORK_TREE=$W git -c alias.s='!git status' s`,
+    `GIT_DIR=$G git -c alias.s='!git status' s`,
+    `git --git-dir=$G -c alias.s='!git status' s`,
+    `W=${at}; W=/x; GIT_WORK_TREE=$W git -c alias.s='!git status' s`,
+  ]) assert.equal(decide(c, free).decision, 'deny', c);
+});
+
+test('R12-F1: a `!` alias body that is harmless, or whose selectors no job owns, stays allowed', () => {
+  const { job } = containerWithJob();
+  const free = containerWithJob().container;
+  const other = fakeRepo();
+  const o = fwd(other);
+  mark(job, process.pid, 12);
+  for (const c of [
+    `git --git-dir=${o}/.git --work-tree=${o} -c alias.s='!git status' s`,
+    `GIT_WORK_TREE=${o} git -c alias.s='!git status' s`,
+    `git --git-dir=${o}/.git --work-tree=${o} -c alias.s='!git reset --hard' s`,
+    `GIT_WORK_TREE=${o} GIT_DIR=${o}/.git git -c alias.s='!git reset --hard' s`,
+    `git -C ${o} -c alias.st='!git status' st`,
+    `git -c alias.st='!git status' st`,
+    `git -c alias.st='!git log --oneline' st`,
+  ]) assert.equal(decide(c, free).decision, 'allow', c);
+  // aliases that run themselves again are a loop git never leaves: nothing runs, so nothing to refuse (and the checker does not loop)
+  assert.equal(decide(`git -c alias.s='!git s' s`, free).decision, 'allow');
+  assert.equal(decide(`git -c alias.s='!git t' -c alias.t='!git s' s`, free).decision, 'allow');
+  jobDenied(`git -c alias.s='!git t' -c alias.t='!git s; git -C ${fwd(job)} reset --hard' s`, free);
+});
+

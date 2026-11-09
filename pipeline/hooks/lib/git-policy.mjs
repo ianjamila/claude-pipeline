@@ -843,7 +843,8 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   }
   // every value named is resolved, so one that cannot be (`--git-dir=$G`, a relative path with no known directory) is unknown, not absent
   const resolveOne = (r) => (r.lit ? litJoin(d, r.v) : joinDir(d, r.v, ctx));
-  if ([...gitDirRaws, ...workTreeRaws].some((r) => resolveOne(r) === null)) targetUnknown = true;
+  const selectorLost = [...gitDirRaws, ...workTreeRaws].some((r) => resolveOne(r) === null);
+  if (selectorLost) targetUnknown = true;
   // (an option given on the command line is the one git uses, the last of them; else every candidate the environment gave: R7)
   const chosen = (raws) => { const cli = raws.filter((r) => r.cli); return (cli.length ? cli.filter((r) => r.g === cli[cli.length - 1].g) : raws).map(resolveOne); };
   const gitDirs = chosen(gitDirRaws);
@@ -856,7 +857,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   // a GIT_DIR / GIT_WORK_TREE assigned earlier on the line may or may not reach this command (so it is "unknown"), but where it
   // points is still a checkout this command may act on
   const hint = (name) => (typeof ctx.vars[name] === 'string' && ctx.vars[name] !== '' ? joinDir(d, ctx.vars[name], ctx) : null);
-  return { d, gitDir, gitDirAll, gitDirUnknown, workTree, workTreeAll, targetUnknown, refused, hints: [hint('GIT_DIR'), hint('GIT_WORK_TREE')].filter((x) => x !== null), configs, wtConfigs, envAliases, envAliasUnknown: aliasUnknown, tokens: argv.slice(1, i), sub: argv[i], args: argv.slice(i + 1) };
+  return { d, selectorLost, gitDir, gitDirAll, gitDirUnknown, workTree, workTreeAll, targetUnknown, refused, hints: [hint('GIT_DIR'), hint('GIT_WORK_TREE')].filter((x) => x !== null), configs, wtConfigs, envAliases, envAliasUnknown: aliasUnknown, tokens: argv.slice(1, i), sub: argv[i], args: argv.slice(i + 1) };
 }
 
 // checkout / switch: which branch is the directory on afterwards?
@@ -963,8 +964,7 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
     for (const alias of aliasDefs) {
       let v;
       if (alias.startsWith('!')) {
-        const e = evalString(`${alias.slice(1)} ${args.map(shellQuote).join(' ')}`, g.d, ctx, level + 1);
-        v = e.decision === 'deny' ? e : null;
+        v = shellAliasVerdict(alias.slice(1), g, env, ctx, raw, level);
       } else {
         const words = splitArgs(alias);
         // (an alias that starts with its own name runs the command of that name: the command as written is checked below)
@@ -995,6 +995,43 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   if (owned) return owned;
   trackGit(sub, args, g, ctx);
   return null;
+}
+
+// R12-F1: a `!` alias runs in a shell that inherits what git exported: the outer prefix env and, from the global options, GIT_DIR / GIT_WORK_TREE /
+// GIT_CONFIG_PARAMETERS. The body is evaluated as `export …; body args` (in the directory -C produced) and the line's variables are put back afterwards.
+// A repository selector the outer command names that cannot be carried exactly (unreadable, several candidates) is refused: fail closed.
+const SHELL_ALIAS_ENV = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/i;
+function shellAliasVerdict(body, g, env, ctx, raw, level) {
+  if ((ctx.aliasShellDepth ?? 0) >= MAX_NESTING) return deny('a git shell alias that runs git again is nested too deeply (aliases running aliases) to verify.');
+  if (g.refused || g.selectorLost || g.gitDirAll.length > 1 || g.workTreeAll.length > 1) {
+    return deny('this git command names a repository (--git-dir / --work-tree / GIT_DIR / GIT_WORK_TREE / core.worktree) that a shell alias would inherit, and it cannot be read exactly (variables, quotes or several values), so what the alias runs on cannot be verified. Write the path out.');
+  }
+  const set = [];
+  const penv = resolvePrefixEnv(env, ctx, raw);
+  for (const [name, c] of penv) {
+    if (!SHELL_ALIAS_ENV.test(name) || c.refused || c.unknown || c.list.length !== 1) continue;
+    set.push([name, c.list[0].v]);
+  }
+  if (g.gitDirAll.length === 1) set.push(['GIT_DIR', g.gitDirAll[0]]);
+  if (g.workTreeAll.length === 1) set.push(['GIT_WORK_TREE', g.workTreeAll[0]]);
+  // (git appends each `-c` to GIT_CONFIG_PARAMETERS, in its own quoting, after what the prefix already set)
+  const sq = (t) => `'${String(t).replace(/'/g, "'\\''")}'`;
+  const prior = penv.get('GIT_CONFIG_PARAMETERS');
+  const params = [...(prior && !prior.refused && !prior.unknown && prior.list.length === 1 ? [prior.list[0].v] : []), ...g.configs.map((c) => sq(c.noValue ? c.key : `${c.key}=${c.value}`))];
+  if (params.length) set.push(['GIT_CONFIG_PARAMETERS', params.join(' ')]);
+  const text = `${set.length ? `export ${set.map(([n, v]) => `${n}=${shellQuote(v)}`).join(' ')}; ` : ''}${body} ${g.args.map(shellQuote).join(' ')}`;
+  const saved = lineState(ctx);
+  ctx.aliasShellDepth = (ctx.aliasShellDepth ?? 0) + 1;
+  const expanding = ctx.aliasExpanding;
+  ctx.aliasExpanding = new Set([...(expanding ?? []), g.sub.toLowerCase()]);
+  try {
+    const e = evalString(text, g.d, ctx, level + 1);
+    return e.decision === 'deny' ? e : null;
+  } finally {
+    ctx.aliasShellDepth -= 1;
+    ctx.aliasExpanding = expanding;
+    restoreLineState(ctx, saved);
+  }
 }
 
 // R11-F1: the commands compiled into git (git.c's commands[] table; an alias cannot shadow one): a name outside this list may be an alias a config
