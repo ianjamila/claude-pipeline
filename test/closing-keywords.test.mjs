@@ -96,6 +96,35 @@ test('multi-line HTML comments are skipped; text around the markers on the same 
   assert.equal(ctl[0].line, 'Fixes #12, #13');
 });
 
+test('a span or comment glued to the list is hidden, not read as part of a reference or keyword', () => {
+  for (const body of ['Closes #1, #2<!-- note -->', 'Closes #1, #2`code`', '<!-- note -->Closes #1, #2']) {
+    const found = multiIssueClosingLines(body);
+    assert.equal(found.length, 1, body);
+    assert.deepEqual([found[0].linked, found[0].unlinked], ['#1', ['#2']], body);
+  }
+  // controls: a span/comment between the references still breaks the list
+  assert.deepEqual(multiIssueClosingLines('Fixes #12, `see also` #13'), []);
+  assert.deepEqual(multiIssueClosingLines('Fixes #12, <!-- x --> #13'), []);
+});
+
+test('code spans and comments are read left to right: a backtick inside a comment does not pair with one outside', () => {
+  const line = "<!-- don't use ` --> Closes #1, #2 and `tests`";
+  const found = multiIssueClosingLines(line);
+  assert.equal(found.length, 1, 'its own list is flagged');
+  assert.deepEqual([found[0].linked, found[0].unlinked], ['#1', ['#2']]);
+  // the comment is closed, so a list on a later line is still read
+  const later = multiIssueClosingLines(line + '\nFixes #3, #4');
+  assert.deepEqual(later.map((f) => f.linked), ['#1', '#3']);
+  // a comment opener inside a code span is code, not a comment
+  assert.equal(multiIssueClosingLines('`<!--` Fixes #5, #6').length, 1);
+  assert.equal(multiIssueClosingLines('`<!--` Fixes #5, #6\nFixes #7, #8').length, 2);
+  // controls: a span or comment that really does contain the list hides it
+  assert.deepEqual(multiIssueClosingLines('<!-- Closes #1, ` --> #2'), []);
+  assert.deepEqual(multiIssueClosingLines('`<!-- Closes #1, #2 ` -->'), []);
+  // a lone backtick (no partner) is literal text
+  assert.equal(multiIssueClosingLines('it`s: Closes #1, #2').length, 1);
+});
+
 test('every offending line is reported, and the problem names the exact rewrite', () => {
   const found = multiIssueClosingLines('Closes #1, #2\r\nmiddle\r\nfixes #3 and #4');
   assert.equal(found.length, 2);

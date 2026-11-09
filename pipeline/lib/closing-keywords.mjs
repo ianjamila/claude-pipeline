@@ -16,9 +16,49 @@ const ONE_REF = new RegExp(REF, 'gi');
 // A fence is a run of 3+ backticks or tildes; it is closed only by a run of the same character at least as long, with no
 // info string (CommonMark). A backtick fence's info string cannot contain a backtick ("```code``` text" is inline code).
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-// Inline code spans and comments become this letter: unlike a space it is not a list separator, so "Fixes #1, `x` #2" is
-// not a list, and it cannot start a keyword or a reference, so the hidden text is never read.
-const HIDDEN = 'x';
+// Inline code spans and comments become this NUL character: unlike a space it is not a list separator, so "Fixes #1, `x` #2"
+// is not a list; unlike a letter it is not a word character, so "#2<!-- n -->" still ends the reference and "<!-- n -->Closes"
+// still starts a keyword at a word boundary. It cannot be part of a keyword or a reference, so hidden text is never read.
+const HIDDEN = '\u0000';
+
+// One line, read left to right in CommonMark order: whichever construct opens first wins. A comment opener hides through its
+// "-->" (or to the end of the line, leaving the comment open for the following lines); a backtick run hides through the next
+// run of exactly the same length (a run with no partner is literal text). Returns the visible text and whether a comment is
+// still open at the end of the line.
+function hide(line, startInComment) {
+  let out = '';
+  let i = 0;
+  if (startInComment) {
+    const end = line.indexOf('-->');
+    if (end === -1) return { text: '', inComment: true };
+    out = HIDDEN;
+    i = end + 3;
+  }
+  while (i < line.length) {
+    if (line.startsWith('<!--', i)) {
+      const end = line.indexOf('-->', i + 4);
+      out += HIDDEN;
+      if (end === -1) return { text: out, inComment: true };
+      i = end + 3;
+    } else if (line[i] === '`') {
+      let n = 1;
+      while (line[i + n] === '`') n++;
+      let j = i + n;
+      let close = -1;
+      while (j < line.length) {
+        if (line[j] !== '`') { j++; continue; }
+        let m = 1;
+        while (line[j + m] === '`') m++;
+        if (m === n) { close = j; break; }
+        j += m;
+      }
+      if (close === -1) { out += line.slice(i, i + n); i += n; } else { out += HIDDEN; i = close + n; }
+    } else {
+      out += line[i++];
+    }
+  }
+  return { text: out, inComment: false };
+}
 
 // [{ line, keyword, linked, unlinked: [refs] }] for every keyword followed by a list of references; [] for a clean body.
 export function multiIssueClosingLines(body) {
@@ -36,19 +76,9 @@ export function multiIssueClosingLines(body) {
       fence = f[1];
       continue;
     }
-    let line = raw;
-    if (inComment) {
-      const end = line.indexOf('-->');
-      if (end === -1) continue;
-      line = ' ' + line.slice(end + 3);
-      inComment = false;
-    }
-    line = line.replace(/(`+)[^`]*?\1/g, HIDDEN).replace(/<!--.*?-->/g, HIDDEN);
-    const open = line.indexOf('<!--');
-    if (open !== -1) {
-      line = line.slice(0, open) + HIDDEN;
-      inComment = true;
-    }
+    const seen = hide(raw, inComment);
+    inComment = seen.inComment;
+    const line = seen.text;
     for (const m of line.matchAll(LIST)) {
       found.push({ line: raw.trim(), keyword: m[1], linked: m[2], unlinked: m[3].match(ONE_REF) ?? [] });
     }
