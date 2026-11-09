@@ -564,7 +564,7 @@ test('an OLD attempt\'s failure is not dated by a re-run that started after the 
   assert.equal(passing.elapsed(), 30_000);
 });
 
-test('a failure whose own times are after its attempt\'s start (the re-run\'s own) is still fresh at once; so is a ready-era attempt-1 failure kept by a later re-run (#174)', async () => {
+test('a failure whose own times are after its attempt\'s start (the re-run\'s own) is still fresh at once (#174)', async () => {
   const own = sim({
     classic: present('ci'), timeline: readyTimeline,
     checkRuns: [cr('ci', 'failure', { check_suite: { id: 4 }, started_at: '2026-01-01T12:05:10Z', completed_at: '2026-01-01T12:06:00Z' })],
@@ -572,14 +572,66 @@ test('a failure whose own times are after its attempt\'s start (the re-run\'s ow
   });
   assert.equal((await own.run()).output.verdict, 'failed');
   assert.equal(own.elapsed(), 0);
-  const readyEra = sim({
+});
+
+// ---- a ready-era failure of a SUPERSEDED attempt waits for the newer attempt (#195) ---------------------------------------------
+
+// Attempt 1 failed after the ready event (own times 12:01-12:02); the owner re-ran it, so the suite's workflow run is now attempt 2,
+// started 12:05 after the check-runs read. The failure is not the final word on the head: the wait goes on until attempt 2 reports.
+const oldAttempt = { id: 1, name: 'ci', check_suite: { id: 4 }, started_at: '2026-01-01T12:01:00Z', completed_at: '2026-01-01T12:02:00Z' };
+const attempt2 = (status = 'in_progress', over = {}) => ({ id: 31, name: 'CI', status, created_at: '2026-01-01T11:00:00Z', run_started_at: '2026-01-01T12:05:00Z', run_attempt: 2, html_url: 'https://github.example/actions/31', ...over });
+const supersededWorld = (conclusion, { listedAt = 30, doneAt = 45 } = {}) => ({
+  classic: present('ci'), timeline: readyTimeline,
+  checkRuns: (t) => [t < listedAt ? cr('ci', 'failure', oldAttempt) : cr('ci', t < doneAt ? null : conclusion, { id: 2, check_suite: { id: 4 }, started_at: '2026-01-01T12:05:10Z', ...(t >= doneAt ? { completed_at: '2026-01-01T12:06:00Z' } : {}) })],
+  suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: '2026-01-01T12:05:00Z', run_attempt: 2 }],
+  headRuns: (t) => [attempt2(t < doneAt ? 'in_progress' : 'completed')],
+});
+
+test('a ready-era attempt-1 failure with attempt 2 already in flight keeps the wait open; attempt 2 passing ends it ok (#195)', async () => {
+  const s = sim(supersededWorld('success'));
+  const r = await s.run();
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(s.elapsed(), 45_000, 'not at t=0 on the superseded failure; when attempt 2 completed');
+  assert.ok(s.progress.some((l) => /ci=superseded/.test(l)), s.progress.join(' | '));
+});
+
+test('a superseded ready-era failure does not end the wait, and attempt 2 failing too is then reported as failed (#195)', async () => {
+  const s = sim(supersededWorld('failure'));
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'failed', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 45_000, 'the wait outlived the superseded failure; attempt 2\'s own failure decided');
+  assert.equal(r.output.checks[0].state, 'fail');
+  assert.doesNotMatch(r.output.message, /superseded|predates ready/);
+});
+
+test('a newer attempt that is listed but never reports a check run: still-running holds to --timeout (verdict timeout, never ok) (#195)', async () => {
+  const s = sim({
     classic: present('ci'), timeline: readyTimeline,
-    checkRuns: [cr('ci', 'failure', { check_suite: { id: 4 }, started_at: '2026-01-01T12:01:00Z', completed_at: '2026-01-01T12:02:00Z' })],
+    checkRuns: [cr('ci', 'failure', oldAttempt)],
     suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: '2026-01-01T12:05:00Z', run_attempt: 2 }],
+    headRuns: [attempt2()],
+  }, { timeoutMs: 900_000 });
+  const r = await s.run();
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.verdict, 'timeout', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 900_000);
+  assert.equal(r.output.heldBy.id, 31);
+});
+
+test('a superseded failure whose newer attempt is not running and never reports ends at --appear-timeout as failed, never ok (#195)', async () => {
+  const s = sim({
+    classic: present('ci'), timeline: readyTimeline,
+    checkRuns: [cr('ci', 'failure', oldAttempt)],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: '2026-01-01T12:05:00Z', run_attempt: 2 }],
+    headRuns: [attempt2('completed')],
   });
-  const r = await readyEra.run();
-  assert.equal(r.output.verdict, 'failed');
-  assert.equal(readyEra.elapsed(), 0, 'an old-attempt failure that is itself of the ready era is a real failure');
+  const r = await s.run();
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.verdict, 'failed', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 300_000);
+  assert.match(r.output.message, /ci=fail .*superseded by a newer attempt that never reported/);
+  assert.equal(r.output.checks[0].state, 'superseded');
 });
 
 test('a check run first seen pending and later completed refreshes the suite once: a re-run whose run read lagged is not judged by the stale start (#176, #168 R4-F1)', async () => {

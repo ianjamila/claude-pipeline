@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { startJob, waitJob, readJob } from '../pipeline/lib/jobs.mjs';
+import { startJob, waitJob, readJob, acquireStartLock } from '../pipeline/lib/jobs.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const jobsUrl = pathToFileURL(join(here, '..', 'pipeline', 'lib', 'jobs.mjs')).href;
@@ -471,6 +471,44 @@ test('four concurrent starts of the same name from separate processes: exactly o
   const r = await waitJob('race', { cwd, timeoutMs: 20_000, ...FAST });
   assert.equal(r.state, 'done');
   assert.equal(existsSync(join(cwd, '.review', 'jobs', 'race.starting')), false, 'the lock is released');
+});
+
+// On Windows a directory that was just removed while another process still holds a handle on it is "delete pending", and mkdir
+// of that name fails with EPERM (not EEXIST) until the handle closes. CI run 42191794419 (windows 1/3): a starter that hit the
+// winner's release window died with "EPERM: operation not permitted, mkdir ...\\race.starting" instead of being refused.
+const winErr = (code) => Object.assign(new Error(`${code}: simulated`), { code });
+const lockOps = (mkdirs) => {
+  const log = { mkdirs: 0, sleeps: [] };
+  return {
+    log,
+    ops: {
+      mkdir: () => { const e = mkdirs[Math.min(log.mkdirs++, mkdirs.length - 1)]; if (e) throw e; },
+      stat: () => ({ mtimeMs: Date.now() }),
+      rm: () => {},
+      sleep: (ms) => { log.sleeps.push(ms); },
+    },
+  };
+};
+
+test('a lock whose mkdir fails with EPERM/EACCES/EBUSY (a delete-pending lock on Windows) is waited for, then taken', () => {
+  for (const code of ['EPERM', 'EACCES', 'EBUSY']) {
+    const { ops, log } = lockOps([winErr(code), winErr(code), null]);
+    acquireStartLock('x.starting', ops);
+    assert.equal(log.mkdirs, 3, code);
+    assert.equal(log.sleeps.length, 2, `${code}: it paused between tries`);
+  }
+});
+
+test('a delete-pending lock that turns into a live one is refused as "already starting", not as an EPERM', () => {
+  const { ops } = lockOps([winErr('EPERM'), winErr('EEXIST')]);
+  assert.throws(() => acquireStartLock('x.starting', ops), /^Error: job already starting$/);
+});
+
+test('an EPERM that never clears is bounded and surfaces the original error (a real permission problem is not hidden)', () => {
+  const { ops, log } = lockOps([winErr('EPERM')]);
+  assert.throws(() => acquireStartLock('x.starting', ops), (err) => err.code === 'EPERM');
+  assert.ok(log.sleeps.length > 0 && log.sleeps.length <= 100, `slept ${log.sleeps.length} times`);
+  assert.ok(log.sleeps.reduce((a, b) => a + b, 0) <= 2000, 'under 2 s of waiting in total');
 });
 
 test('a fresh <name>.starting lock means another start is in progress', (t) => {
