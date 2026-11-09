@@ -13,6 +13,9 @@
 // draft-era (`stale-skip` / `stale-fail`): the check keeps waiting for its ready-era result, up to --appear-timeout. A stale
 // failure never re-posted then stands as `failed` (marked "result predates ready"); a fresh failure ends the wait at once. This
 // matters on EW, where the `Cross-model review` status is a draft-era FAILURE until it is re-posted after `gh pr ready`.
+// A ready-era failure of an attempt the suite has already superseded (a re-run of the workflow run started after it) is
+// `superseded`: the wait goes on for the newer attempt's own result (#195). If that attempt never reports, the same deadlines
+// as for a stale failure apply (--appear-timeout, or --timeout while a ready-era run holds the wait) and the old failure stands.
 // Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
 // created_at. Freshness that cannot be read counts as fresh (fail fast).
 // A needs:-gated aggregate (EW "Typecheck + Vitest") is only created when its shard jobs finish, ~8-12 min after ready, so a
@@ -36,13 +39,13 @@ export const MAX_READ_FAILURES = 5;
 
 const GOOD = new Set(['success', 'neutral']);
 const BAD = new Set(['failure', 'timed_out', 'action_required', 'startup_failure', 'stale']);
-// fail > cancelled > pending > missing / stale-skip / stale-fail > fresh-skip > pass: the worst producer decides the identity.
-const RANK = { fail: 7, cancelled: 6, pending: 5, missing: 4, 'stale-skip': 4, 'stale-fail': 4, 'fresh-skip': 2, pass: 1 };
+// fail > cancelled > pending > missing / stale-skip / stale-fail / superseded > fresh-skip > pass: the worst producer decides the identity.
+const RANK = { fail: 7, cancelled: 6, pending: 5, missing: 4, 'stale-skip': 4, 'stale-fail': 4, superseded: 4, 'fresh-skip': 2, pass: 1 };
 const isGood = (s) => s === 'pass' || s === 'fresh-skip';
 const isBad = (s) => s === 'fail' || s === 'cancelled';
 // A workflow run / check run that has not finished (GitHub's statuses: queued, in_progress, waiting, pending, requested).
 const ACTIVE_WORKFLOW_RUN = new Set(['queued', 'in_progress', 'waiting', 'pending', 'requested']);
-const isWaiting = (s) => s === 'pending' || s === 'missing' || s === 'stale-skip' || s === 'stale-fail';
+const isWaiting = (s) => s === 'pending' || s === 'missing' || s === 'stale-skip' || s === 'stale-fail' || s === 'superseded';
 
 const keyOf = (i) => `${i.name}\u0000${i.appId ?? ''}`;
 const byIdDesc = (a, b) => Number(b.id) - Number(a.id);
@@ -171,28 +174,29 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return Math.max(...created) >= readyAt ? 'fresh-skip' : 'stale-skip';
   };
 
-  // Does a failed / cancelled check run predate the ready event? By its workflow run's start (run_started_at, which a re-run moves;
+  // Which era is a failed / cancelled check run of: 'stale' (predates the ready event), 'superseded' or 'fresh'? By its workflow run's start (run_started_at, which a re-run moves;
   // else created_at), else by its own timestamps. A re-run started after ready that then failed is a fresh, real failure of the
   // ready-era code, unlike a re-run's skip (see skipState). The check runs are read before the workflow runs, so a re-run that began
   // in between moves run_started_at under a failure that belongs to the PREVIOUS attempt (#174): when the dating run is attempt 2
   // or later and the check run's own completed/started time is readable and earlier than that start, the failure is dated by its
-  // own time (an old draft-era failure stays stale; a ready-era one still ends the wait). Anything else unreadable or unknown
-  // counts as fresh: a failure is reported rather than waited on.
-  const runPredatesReady = async (run, pr) => {
+  // own time (an old draft-era failure stays stale). A ready-era failure of such an earlier attempt is 'superseded' (#195): a newer
+  // attempt of the same workflow run is in flight and will replace it (its check run has a higher id), so the wait goes on for the
+  // newer attempt's own result instead of reporting the old failure. Anything else unreadable or unknown counts as fresh: a
+  // failure is reported rather than waited on.
+  const failureEra = async (run, pr) => {
     try {
       const readyAt = Date.parse(await getReadyAt(pr));
       const started = await suiteStarted(run);
       if (started.length > 0) {
         const latest = started.reduce((a, b) => (b.at > a.at ? b : a));
-        let at = latest.at;
         const own = Date.parse(run.completed_at ?? run.started_at);
-        if (latest.attempt > 1 && Number.isFinite(own) && own < at) at = own; // the failure is of an earlier attempt
-        return at < readyAt;
+        if (latest.attempt > 1 && Number.isFinite(own) && own < latest.at) return own < readyAt ? 'stale' : 'superseded'; // an earlier attempt's failure
+        return latest.at < readyAt ? 'stale' : 'fresh';
       }
       const at = Date.parse(run.completed_at ?? run.started_at);
-      return Number.isFinite(at) && at < readyAt;
+      return Number.isFinite(at) && at < readyAt ? 'stale' : 'fresh';
     } catch {
-      return false;
+      return 'fresh';
     }
   };
   const statusPredatesReady = async (status, pr) => {
@@ -210,7 +214,8 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if (run.conclusion === 'skipped') return skipState(run, pr);
     // failure, timed_out, ... or a conclusion we do not know (never a pass); a draft-era one is stale and keeps waiting
     const bad = run.conclusion === 'cancelled' ? 'cancelled' : 'fail';
-    return (await runPredatesReady(run, pr)) ? 'stale-fail' : bad;
+    const era = await failureEra(run, pr);
+    return era === 'stale' ? 'stale-fail' : era === 'superseded' ? 'superseded' : bad;
   };
 
   const statusBasis = new WeakMap(); // evaluate() result -> the commit status it rests on (for the status re-read and its evidence)
@@ -359,7 +364,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     }
 
     if (waiting.length > 0) {
-      const absent = waiting.filter((s) => s.state === 'missing' || s.state === 'stale-skip' || s.state === 'stale-fail');
+      const absent = waiting.filter((s) => s.state === 'missing' || s.state === 'stale-skip' || s.state === 'stale-fail' || s.state === 'superseded');
       // Past --appear-timeout an absent identity is final only if nothing of the ready era is still running on the head: a
       // needs:-gated aggregate is created late by design (#159). Until --timeout the wait goes on, naming what holds it.
       const holder = absent.length > 0 && elapsed() >= appearTimeoutMs ? await findHolder(obs, pr) : null;
@@ -377,16 +382,18 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         if (!confirmed) return decide(await reread(), true);
         const missing = absent.filter((s) => s.state === 'missing');
         const stale = absent.filter((s) => s.state === 'stale-skip');
-        const staleFails = absent.filter((s) => s.state === 'stale-fail');
+        const staleFails = absent.filter((s) => s.state === 'stale-fail' || s.state === 'superseded');
         const skipNote = stale.length ? `only a draft-era skip for: ${stale.map((s) => s.name).join(', ')}` : '';
         if (missing.length > 0) {
-          const failNote = staleFails.length ? `a draft-era failure stands for: ${staleFails.map((s) => s.name).join(', ')}` : '';
-          const notes = [skipNote, failNote].filter(Boolean);
+          const named = (state) => staleFails.filter((s) => s.state === state).map((s) => s.name).join(', ');
+          const failNote = named('stale-fail') ? `a draft-era failure stands for: ${named('stale-fail')}` : '';
+          const supersededNote = named('superseded') ? `a superseded failure stands for: ${named('superseded')}` : '';
+          const notes = [skipNote, failNote, supersededNote].filter(Boolean);
           return result(EXIT.FAILED, 'missing', { message: `no result appeared for: ${missing.map((s) => s.name).join(', ')}${notes.length ? `; ${notes.join('; ')}` : ''}` });
         }
         if (staleFails.length > 0) {
           // The failure was never replaced by a ready-era result, so it stands (a draft-era skip, if any, is listed with it).
-          const listed = staleFails.map((s) => `${s.name}=fail${s.url ? ` (${s.url})` : ''} (result predates ready)`).join('; ');
+          const listed = staleFails.map((s) => `${s.name}=fail${s.url ? ` (${s.url})` : ''} (${s.state === 'superseded' ? 'superseded by a newer attempt that never reported' : 'result predates ready'})`).join('; ');
           const rechecked = await confirmStatusFailures(staleFails);
           if (rechecked !== undefined) return rechecked;
           return failedResult(`failed: ${listed}${skipNote ? `; ${skipNote}` : ''}`, staleFails);
