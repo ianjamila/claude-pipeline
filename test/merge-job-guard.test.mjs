@@ -28,6 +28,14 @@ const decide = (command, cwd) => evaluateGitCommand(command, { cwd, ...wiring })
 // R9: a mutating verb whose git dir / work tree value is not fully resolved is refused outright ("cannot be read one way", r8Refused below); one that is
 // resolved and reaches a job's checkout gets the job's own message (jobDenied). Each test names which group a command belongs to, so a resolver that
 // refuses a value it can read (or reads one it must refuse) fails the test.
+// owner rule: while a job runs, a git shortcut (alias, --config-env, a setting name or env config source the guard cannot read) and a command git does not
+// compile in are refused whatever the verb; one plain message
+const OWNER_RULE = /a merge job is running in .* \(PR #12\): while it runs, git shortcuts .*commands that are not built into git are refused/s;
+const ownerRefused = (command, cwd, why = command) => {
+  const v = decide(command, cwd);
+  assert.equal(v.decision, 'deny', why);
+  assert.match(v.reason, OWNER_RULE, why);
+};
 const jobDenied = (command, cwd) => {
   const v = decide(command, cwd);
   assert.equal(v.decision, 'deny', command);
@@ -263,7 +271,7 @@ test('R2-F2: bisect, update-index, fast-import, filter-branch and a fetch that c
   }
 });
 
-test('R2-F2: plain fetch, a remote-tracking or tag destination and bisect log / view stay allowed in a job\'s checkout', () => {
+test('R2-F2: plain fetch and a remote-tracking or tag destination stay allowed in a job\'s checkout (bisect log / view: not built into git, owner rule)', () => {
   const root = fakeRepo();
   const other = fakeRepo();
   mark(root, process.pid, 12);
@@ -277,12 +285,10 @@ test('R2-F2: plain fetch, a remote-tracking or tag destination and bisect log / 
     'git fetch origin +refs/heads/*:refs/remotes/origin/*',
     'git fetch origin refs/tags/v1:refs/tags/v1',
     'git fetch git@github.com:o/r.git main',
-    'git bisect log',
-    'git bisect visualize',
-    'git bisect view',
   ]) {
     assert.equal(decide(command, root).decision, 'allow', command);
   }
+  for (const command of ['git bisect log', 'git bisect visualize', 'git bisect view']) ownerRefused(command, root); // (a script, not a compiled-in command: it could be an alias)
   assert.equal(decide('git bisect start HEAD HEAD~5', other).decision, 'allow'); // another checkout
   assert.equal(decide('git update-index --add f', other).decision, 'allow');
 });
@@ -592,9 +598,9 @@ test('R5-B1 / R5-F1: the same commands are allowed with no marker, a dead marker
   for (const c of [
     `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${wt} git status`,
     `GIT_CONFIG_PARAMETERS="'core.worktree=${wt}'" git log --oneline`,
-    `WT=${wt} git --config-env=core.worktree=WT diff`,
-    `git -c "$(printf core.worktree)=${wt}" status`,
   ]) assert.equal(decide(c, container).decision, 'allow', `read-only: ${c}`);
+  // (owner rule: a --config-env, or a key built at run time, is a shortcut: refused even for a read-only verb)
+  for (const c of [`WT=${wt} git --config-env=core.worktree=WT diff`, `git -c "$(printf core.worktree)=${wt}" status`]) ownerRefused(c, container);
   // a literal value that does not reach the job's checkout (from a checkout no job owns), and keys that are not core.worktree
   const elsewhere = fwd(fakeRepo());
   for (const c of [
@@ -667,9 +673,9 @@ test('R6-B1 / R6-B2: the same commands are allowed with no marker, a dead marker
   for (const c of [
     `WT=${wt} GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=$WT git status`,
     `WT=${wt} GIT_CONFIG_PARAMETERS="'core.worktree=$WT'" git log --oneline`,
-    `WT=${wt} TARGET=$WT git --config-env=core.worktree=TARGET diff`,
-    `GIT_CONFIG_PARAMETERS="'user.name=$USER' 'core.worktree=${wt}'" git status`,
   ]) assert.equal(decide(c, container).decision, 'allow', `read-only: ${c}`);
+  ownerRefused(`GIT_CONFIG_PARAMETERS="'user.name=$USER' 'core.worktree=${wt}'" git status`, container); // (owner rule: `$USER` cannot be read literally)
+  ownerRefused(`WT=${wt} TARGET=$WT git --config-env=core.worktree=TARGET diff`, container); // (owner rule: any --config-env)
   // a value that does not reach the job's checkout (from a checkout no job owns), another key, or a name nothing assigned
   const elsewhere = fwd(fakeRepo());
   for (const c of [
@@ -1067,7 +1073,12 @@ test('R8-F2: an exported GIT_DIR / GIT_WORK_TREE / GIT_CONFIG_* value holding `$
   const { container: free } = containerWithJob();
   r8Refused("export GIT_WORK_TREE='$Y'; git reset --hard", free);
   // read-only verbs are unaffected; so are plain literal exports pointing elsewhere 
-  for (const verb of ['status', 'log --oneline', 'diff']) for (const c of shapes(verb)) assert.equal(decide(c, container).decision, 'allow', `read-only: ${c}`);
+  for (const verb of ['status', 'log --oneline', 'diff']) {
+    for (const c of shapes(verb)) {
+      if (c.includes("KEY_0='core.$k'")) ownerRefused(c, container); // (owner rule: a config key built at run time, aimed at the job's checkout)
+      else assert.equal(decide(c, container).decision, 'allow', `read-only: ${c}`);
+    }
+  }
   for (const c of [
     `export GIT_WORK_TREE=${elsewhere}; git reset --hard`,
     `export GIT_DIR=${elsewhere}/.git; git checkout x`,
@@ -1164,8 +1175,10 @@ test('R9-B1 / R9-F1: a selector value not fully resolved is refused for a mutati
 test('R9: read-only verbs, the -C / cd fallback and fully resolved line-local forms are not refused', () => {
   const { container, job, wt } = r9Layout();
   const other = fakeRepo();
-  for (const c of r9Shapes(wt, 'status')) assert.equal(decide(c, container).decision, 'allow', `read-only: ${c}`);
-  for (const c of r9Shapes(wt, 'log --oneline')) assert.equal(decide(c, job).decision, 'allow', `read-only (owned cwd): ${c}`);
+  // (owner rule: a GIT_CONFIG_PARAMETERS that cannot be read literally, and any --config-env where a job owns the cwd, are refused even for a read-only verb)
+  const r9ReadOnly = (c, cwd, label) => (/GIT_CONFIG_PARAMETERS=/.test(c) || (cwd === job && /--config-env/.test(c)) ? ownerRefused(c, cwd, label) : assert.equal(decide(c, cwd).decision, 'allow', label));
+  for (const c of r9Shapes(wt, 'status')) r9ReadOnly(c, container, `read-only: ${c}`);
+  for (const c of r9Shapes(wt, 'log --oneline')) r9ReadOnly(c, job, `read-only (owned cwd): ${c}`);
   // -C with a substitution keeps the unknown -> cwd check: read-only always, a mutating verb only where the cwd is the owned checkout
   assert.equal(decide('git -C "$(git rev-parse --show-toplevel)" status', container).decision, 'allow');
   assert.equal(decide('git -C "$(git rev-parse --show-toplevel)" checkout x', container).decision, 'allow'); // unowned cwd, no marker there
@@ -1244,6 +1257,164 @@ test('R10-B1: a GIT_CONFIG_VALUE_n whose key may be core.worktree (or cannot be 
   for (const cwd of [container, free]) for (const c of commands) r8Refused(c, cwd);
   // read-only verbs stay allowed
   assert.equal(decide(cfg('core.worktree', `${wt}$X`, 'status'), container).decision, 'allow');
+});
+
+// ---- owner rule: while a merge job runs, git shortcuts and commands git does not compile in are refused (read-only verbs too) ----
+// (a) defining or using a shortcut: -c alias.*, any --config-env, a -c key built from a variable, an environment config source that may define an alias
+// (GIT_CONFIG_KEY_n / GIT_CONFIG_PARAMETERS), a `git config alias.*` earlier on the line; (b) a subcommand that is not compiled into git (exact case), which also
+// covers an alias from the user's own ~/.gitconfig. "A job is running" for a command: it owns the checkout of the cwd, of any -C / --git-dir / --work-tree /
+// GIT_DIR / GIT_WORK_TREE / core.worktree target on the line, or of any OTHER worktree of the repository one of those belongs to.
+
+// a repository with a main checkout and two linked worktrees laid out the way `git worktree add` does (job: owned, free: not)
+const siblingRepo = () => {
+  const main = fakeRepo();
+  const job = linkedWorktree(main, 'job');
+  const free = linkedWorktree(main, 'free');
+  mkdirSync(join(free.wt, 'src'));
+  mark(job.wt, process.pid, 12);
+  return { main, job: job.wt, free: free.wt };
+};
+// every rule-(a) / (b) example as a function of the `git <global options>` head, so each can be aimed at the job by cwd, by -C or by --git-dir
+const SHORTCUTS = [
+  (g, job) => `${g} -c alias.s=reset s --hard`,
+  (g, job) => `${g} -c ALIAS.S=reset s --hard`,
+  (g, job) => `${g} -c alias.st=status st`,
+  (g, job) => `${g} --config-env=user.name=V status`,
+  (g, job) => `${g} --config-env user.name=V status`,
+  (g, job) => `K=alias.s; ${g} -c $K=reset s`,
+  (g, job) => `K=user.name; ${g} -c $K=x status`,
+  (g, job) => `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=reset ${g} s --hard`,
+  (g, job) => `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=status ${g} status`,
+  (g, job) => `env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=reset ${g} s --hard`,
+  (g, job) => `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=reset; ${g} s --hard`,
+  (g, job) => `GIT_CONFIG_PARAMETERS="'alias.s=reset'" ${g} s --hard`,
+  (g, job) => `GIT_CONFIG_PARAMETERS="'alias.s=reset'" ${g} status`,
+  (g, job) => `GIT_CONFIG_PARAMETERS=$P ${g} status`,
+  (g, job) => `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K GIT_CONFIG_VALUE_0=x ${g} status`,
+  (g, job) => `git config alias.s reset && ${g} s --hard`,
+  (g, job) => `git config alias.status log && ${g} status`,
+  (g, job) => `${g} st`, // no definition on the line: the user's own ~/.gitconfig may define it
+  (g, job) => `${g} RESET --hard`,
+  (g, job) => `${g} bisect log`,
+  (g, job) => `${g} -c alias.s='!git -C ${fwd(job)} reset --hard' s`,
+];
+// (a mutating verb that lands in the job's own checkout gets the job's message, everything else the owner rule's)
+const ownerRefusedOrJob = (command, cwd) => {
+  const v = decide(command, cwd);
+  assert.equal(v.decision, 'deny', command);
+  assert.ok(OWNER_RULE.test(v.reason) || /job \(pid \d+, PR #12\) owns this checkout/.test(v.reason), `${command}: ${v.reason}`);
+};
+const everyShortcut = (heads, job, cwd) => { for (const g of heads) for (const make of SHORTCUTS) ownerRefusedOrJob(make(g, job), cwd); };
+const ALLOWED = [
+  (g) => `${g} status`,
+  (g) => `${g} log --oneline`,
+  (g) => `${g} -c core.commentChar=- status`,
+  (g) => `${g} -c user.name=x log`,
+  (g) => `${g} -c user.name=$USER log`,
+  (g) => `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=- ${g} status`,
+  (g) => `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x ${g} diff`,
+];
+
+test('owner rule: with a live job in the cwd\'s checkout, shortcuts and commands that are not built into git are refused', () => {
+  const root = fakeRepo();
+  mark(root, process.pid, 12);
+  everyShortcut(['git'], root, root);
+  for (const c of ['git st', 'git -c alias.s=reset s --hard', 'git --config-env=user.name=V status', 'git status && git st']) ownerRefused(c, root);
+  // the message names the checkout and the PR
+  assert.match(decide('git st', root).reason, /^a merge job is running in .*mj-guard-.* \(PR #12\): while it runs, git shortcuts \(aliases, --config-env, -c alias\.\*, a setting name built from a variable\)/);
+  // the built-in command written out is fine
+  for (const make of ALLOWED) assert.equal(decide(make('git'), root).decision, 'allow', make('git'));
+  for (const c of ['git diff', 'git show HEAD', 'git fetch origin', 'git stash list', 'git branch --show-current', 'git worktree list']) assert.equal(decide(c, root).decision, 'allow', c);
+});
+
+test('owner rule: a job reached through -C, --git-dir, --work-tree, GIT_DIR, GIT_WORK_TREE or core.worktree counts, from a cwd that owns nothing', () => {
+  const job = fakeRepo();
+  const other = fakeRepo(); // an unrelated repository
+  mark(job, process.pid, 12);
+  const at = fwd(job);
+  everyShortcut([`git -C ${at}`, `git --git-dir=${at}/.git`, `git --git-dir ${at}/.git`, `git --work-tree=${at}`, `git -c core.worktree=${at}`, `GIT_DIR=${at}/.git git`, `GIT_WORK_TREE=${at} git`], job, other);
+  for (const make of ALLOWED) assert.equal(decide(make(`git -C ${at}`), other).decision, 'allow', make(`git -C ${at}`));
+  // another repository than the job's, with no job anywhere in it: not affected
+  const free = fakeRepo();
+  for (const make of SHORTCUTS) assert.equal(decide(make(`git -C ${fwd(free)}`, free), other).decision, 'allow', make(`git -C ${fwd(free)}`, free));
+});
+
+test('owner rule: a job in a SIBLING worktree of the cwd\'s repository counts, though the cwd owns nothing', () => {
+  const { main, job, free } = siblingRepo();
+  for (const cwd of [free, join(free, 'src'), main]) {
+    everyShortcut(['git'], job, cwd);
+    // a `!` shortcut aimed at the owned checkout from an unowned worktree
+    ownerRefused(`git -c alias.s='!git -C ${fwd(job)} reset --hard' s`, cwd);
+    for (const make of ALLOWED) assert.equal(decide(make('git'), cwd).decision, 'allow', `${make('git')} @ ${cwd}`);
+  }
+  // -C into one of the unowned checkouts from an unrelated cwd: the repository has a job
+  const other = fakeRepo();
+  everyShortcut([`git -C ${fwd(free)}`, `git -C ${fwd(main)}`], job, other);
+  // a mutating verb in the unowned sibling is the owner rule's business only when it uses a shortcut: the job owns its own checkout, not the repository
+  assert.equal(decide('git checkout x', free).decision, 'allow');
+  // the job's own checkout, cwd inside it
+  everyShortcut(['git'], job, job);
+});
+
+test('owner rule: the sibling lookup reads the repository through the ctx readers (git dir, commondir, worktrees/*/gitdir)', () => {
+  const files = new Map([
+    ['/r/main/.git/HEAD', 'ref: refs/heads/main\n'],
+    ['/r/main/.git/worktrees/a/gitdir', '/r/wt-a/.git\n'],
+    ['/r/main/.git/worktrees/a/commondir', '../..\n'],
+    ['/r/main/.git/worktrees/b/gitdir', '/r/wt-b/.git\n'],
+    ['/r/main/.git/worktrees/b/commondir', '../..\n'],
+    ['/r/wt-a/.git', 'gitdir: /r/main/.git/worktrees/a\n'],
+    ['/r/wt-b/.git', 'gitdir: /r/main/.git/worktrees/b\n'],
+  ]);
+  const dirs = new Map([['/r/main/.git/worktrees', ['a', 'b']]]);
+  const opts = (jobAt) => ({
+    cwd: '/r/wt-b',
+    readText: (p) => files.get(p) ?? null,
+    pathExists: (p) => files.has(p) || dirs.has(p) || p === '/r/main/.git',
+    readDir: (p) => dirs.get(p) ?? null,
+    realpath: (p) => p,
+    mergeJobOf: (d) => (d === jobAt ? { pid: 1, pr: 12, root: d } : null),
+  });
+  assert.equal(evaluateGitCommand('git st', opts('/r/wt-a')).decision, 'deny'); // wt-a's job, from wt-b
+  assert.match(evaluateGitCommand('git st', opts('/r/wt-a')).reason, /a merge job is running in \/r\/wt-a \(PR #12\)/);
+  assert.equal(evaluateGitCommand('git st', opts('/r/main')).decision, 'deny'); // the main checkout's
+  assert.equal(evaluateGitCommand('git st', opts('/elsewhere')).decision, 'allow'); // no job in this repository
+  assert.equal(evaluateGitCommand('git status', opts('/r/wt-a')).decision, 'allow');
+});
+
+test('owner rule: with no job anywhere the same shortcuts behave as before (a dead or missing marker, a calm repository)', () => {
+  const root = fakeRepo();
+  mark(root, deadPid());
+  const calm = siblingRepo();
+  mark(calm.job, deadPid());
+  for (const [cwd, job] of [[root, root], [calm.free, calm.job], [calm.main, calm.job], [calm.job, calm.job]]) {
+    for (const make of SHORTCUTS) assert.equal(decide(make('git', job), cwd).decision, 'allow', `${make('git', job)} @ ${cwd}`);
+    for (const make of ALLOWED) assert.equal(decide(make('git'), cwd).decision, 'allow', make('git'));
+  }
+});
+
+// what was already there before the job rule, and two stricter fixes the alias block keeps (no job anywhere)
+test('alias expansion for the push guard is unchanged with no job: an alias that runs a push is still a push', () => {
+  const root = fakeRepo();
+  for (const c of [
+    'git -c alias.p=push p origin main',
+    'git config alias.p push && git p origin main',
+    "git -c alias.pp='!git push origin main' pp",
+    // the command as written is checked too: an alias on a built-in's name does not hide it (git runs the built-in)
+    'git -c alias.push=status push origin main',
+    'git config alias.push status && git push origin main',
+  ]) {
+    const v = decide(c, root);
+    assert.equal(v.decision, 'deny', c);
+    assert.match(v.reason, /pushing to main is blocked/, c);
+  }
+  // a chain past the nesting limit (6 links) is refused, 5 links is followed to its end
+  const chain = (n, last) => `${['a', 'b', 'c', 'd', 'e', 'f'].slice(0, n).map((k, i, all) => `git config alias.${k} ${i + 1 < n ? all[i + 1] : last}`).join(' && ')} && git a`;
+  const six = decide(chain(6, 'status'), root);
+  assert.equal(six.decision, 'deny');
+  assert.match(six.reason, /nested too deeply/);
+  assert.equal(decide(chain(5, 'status'), root).decision, 'allow');
+  assert.equal(decide(chain(5, 'push origin main'), root).decision, 'deny');
 });
 
 // the selector work (R1-R10) reads a -c / --config-env key after expansion: the variable may hold `core.worktree=<path>` (key and value in one word)
