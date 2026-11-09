@@ -86,23 +86,39 @@ function isRunning(jobDir, name) {
   return runnerAlive(meta);
 }
 
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+// On Windows a lock the previous starter just removed is "delete pending" while another process still holds a handle on it, and
+// mkdir of that name fails with EPERM (sometimes EACCES / EBUSY), not EEXIST, until the handle closes (CI run 42191794419).
+// That is contention, not a fault: wait it out briefly, then surface the original error so a real permission problem is not hidden.
+const LOCK_PENDING_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const LOCK_PENDING_TRIES = 50;
+const LOCK_PENDING_WAIT_MS = 20;
+const lockOps = { mkdir: (p) => mkdirSync(p), stat: (p) => statSync(p), rm: (p) => rmSync(p, { recursive: true, force: true }), sleep: sleepSync };
+
 // mkdir is atomic, so whoever creates <name>.starting is the only starter of that job right now.
-export function acquireStartLock(lock) {
+export function acquireStartLock(lock, ops = lockOps) {
+  let pending = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      mkdirSync(lock);
+      ops.mkdir(lock);
       return;
     } catch (err) {
+      if (LOCK_PENDING_CODES.has(err.code)) {
+        if (pending++ >= LOCK_PENDING_TRIES) throw err;
+        ops.sleep(LOCK_PENDING_WAIT_MS);
+        attempt--; // not a lost round: the lock is still being removed
+        continue;
+      }
       if (err.code !== 'EEXIST') throw err;
     }
     let age;
     try {
-      age = Date.now() - statSync(lock).mtimeMs;
+      age = Date.now() - ops.stat(lock).mtimeMs;
     } catch {
       continue; // released between our mkdir and our stat: try again
     }
     if (age <= LOCK_STALE_MS) break;
-    rmSync(lock, { recursive: true, force: true }); // a crashed starter's leftover
+    ops.rm(lock); // a crashed starter's leftover
   }
   throw new Error('job already starting');
 }
