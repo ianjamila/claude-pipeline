@@ -931,6 +931,13 @@ test('mergeTreeDetailed: text / eol attributes and core.autocrlf do not change t
     assert.equal(baseline.clean, false);
     assert.equal(baseline.conflicts.length, 1);
     assert.equal(baseline.conflicts[0].path, 'f.txt');
+    // Positive control: merge-tree really reads .git/info/attributes here, so the equivalence assertions below are not vacuous.
+    infoAttributes(s.repo.dir, 'f.txt merge=union');
+    const withUnion = mergeTreeDetailed(fromFull, tipFull, s.o);
+    assert.equal(withUnion.clean, true, `${kind}: merge=union in info/attributes resolves the conflict`);
+    assert.notEqual(withUnion.tree, baseline.tree, `${kind}: the union attribute changes the trial tree`);
+    infoAttributes(s.repo.dir, null);
+    assert.equal(mergeTreeDetailed(fromFull, tipFull, s.o).tree, baseline.tree, `${kind}: emptying info/attributes brings the baseline back`);
     const shape = (m) => JSON.stringify({ tree: m.tree, clean: m.clean, conflicts: m.conflicts, messages: m.messages });
     for (const autocrlf of ['false', 'true', 'input']) {
       s.repo.git(['config', 'core.autocrlf', autocrlf]);
