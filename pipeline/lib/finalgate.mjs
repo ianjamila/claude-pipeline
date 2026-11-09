@@ -667,6 +667,31 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   return check('review', true, `review valid for content ${short(hash)}${exemptNote}${grantNote}`);
 }
 
+// The guard statuses among `names` (Test integrity, Hard-stop scan, Cross-model review) whose provenance does not hold: a guard status is only
+// believed when the pipeline-guards workflow from the default branch posted it, and that run's own verdict artifact says success for it
+// (guard-provenance). The row's link is not trusted (anyone posting a status picks it): the latest status of that context on the head is read
+// directly and bound to this PR, this head and its own creation time. -> ["<name> (<why>)", ...]; empty when all hold.
+export function forgedGuards({ gh, pr, head, names }) {
+  const forged = [];
+  const provenanceCache = new Map();
+  for (const name of names) {
+    let verdict;
+    try {
+      const slug = gh.repo().slug;
+      const read = (p, jq) => gh.apiText(p, jq);
+      const latest = JSON.parse(read(`repos/${slug}/commits/${head}/statuses?per_page=100`,
+        `[.[] | select(.context == "${name}")][0] | {state: .state, by: .creator.login, at: .created_at, url: .target_url}`));
+      if (!latest || latest.state !== 'success') verdict = { ok: false, reason: 'its latest status is not a success' };
+      else if (latest.by !== 'github-actions[bot]') verdict = { ok: false, reason: `posted by ${latest.by ?? 'an unknown creator'}, not github-actions[bot]` };
+      else verdict = checkGuardVerdict({ read, repo: slug, url: latest.url, bind: { prNumber: pr, headSha: head, createdAt: latest.at }, expect: { check: GUARD_CONTEXT_CHECKS[name] }, cache: provenanceCache });
+    } catch (err) {
+      verdict = { ok: false, reason: String(err?.message ?? err).split('\n')[0] };
+    }
+    if (!verdict.ok) forged.push(`${name} (${verdict.reason})`);
+  }
+  return forged;
+}
+
 // CI evidence. Judged: the checks GitHub itself requires (`gh pr checks --required`), or every reported check when it
 // requires none. On top of that every check NAMED in config.ci.required_checks must be reported and passing, so a
 // required check that never ran (renamed, workflow deleted, path-filtered away) cannot be mistaken for a green PR.
@@ -717,23 +742,7 @@ export function ciCheck({ gh, pr, head, diff, config, explicitEmpty }) {
   for (const r of used) {
     if (r && PROVENANCE_CHECKS.includes(r.name) && passing(r)) guardNames.add(r.name);
   }
-  const forged = [];
-  const provenanceCache = new Map();
-  for (const name of guardNames) {
-    let verdict;
-    try {
-      const slug = gh.repo().slug;
-      const read = (p, jq) => gh.apiText(p, jq);
-      const latest = JSON.parse(read(`repos/${slug}/commits/${head}/statuses?per_page=100`,
-        `[.[] | select(.context == "${name}")][0] | {state: .state, by: .creator.login, at: .created_at, url: .target_url}`));
-      if (!latest || latest.state !== 'success') verdict = { ok: false, reason: 'its latest status is not a success' };
-      else if (latest.by !== 'github-actions[bot]') verdict = { ok: false, reason: `posted by ${latest.by ?? 'an unknown creator'}, not github-actions[bot]` };
-      else verdict = checkGuardVerdict({ read, repo: slug, url: latest.url, bind: { prNumber: pr, headSha: head, createdAt: latest.at }, expect: { check: GUARD_CONTEXT_CHECKS[name] }, cache: provenanceCache });
-    } catch (err) {
-      verdict = { ok: false, reason: String(err?.message ?? err).split('\n')[0] };
-    }
-    if (!verdict.ok) forged.push(`${name} (${verdict.reason})`);
-  }
+  const forged = forgedGuards({ gh, pr, head, names: guardNames });
   const problems = [];
   if (forged.length) problems.push(`guard status not posted by the pipeline-guards workflow: ${forged.join('; ')}`);
   if (missing.length) problems.push(`required check(s) missing: ${missing.join(', ')}`);

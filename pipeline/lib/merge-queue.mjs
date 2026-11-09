@@ -6,8 +6,11 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { readRepoMoves, sameRepo } from '../hooks/lib/repo-moves.mjs';
-import { labelNames, readMergeSha, waitBlockers } from './finalgate.mjs';
+import { PROVENANCE_CHECKS } from './config.mjs';
+import { forgedGuards, labelNames, readMergeSha, validLabels, waitBlockers } from './finalgate.mjs';
+import { HOLD_LABEL, RESTORE_NOTE } from './hold.mjs';
 import { gitCommonDir } from './repo.mjs';
+import { holdDigest } from '../hooks/lib/owner-go.mjs';
 
 // The queue state could not be read. Callers refuse (final-gate / owner-go: a failing check; merge: `queue-unreadable`).
 export class QueueUnreadable extends Error {
@@ -256,8 +259,16 @@ const CLOCK_SLACK_MS = 60_000;
 // (GitHub emits one on every successful merge) reads as merged. A `pending` attempt that GitHub shows as not queued never happened: it is
 // dropped from the count (the enqueue failed, or died before it landed). Changes the record in that one case only.
 export async function reconcile({ gh, root, pr, head, sleep = defaultSleep, pollMs = 2000, log = () => {} }) {
+  const r = reconcileNow({ gh, root, pr, head, log });
+  if (r.kind !== 'merged' || r.lookup === undefined) return r;
+  return { kind: 'merged', mergeSha: await readMergeSha({ gh, pr, first: r.lookup.first, sleep, pollMs }) };
+}
+
+// reconcile's decision without any waiting, so a signal handler (which cannot await) can use it too. A merged answer whose merge commit
+// is not known yet carries `lookup` (what reconcile then reads again); all else is final.
+export function reconcileNow({ gh, root, pr, head, log = () => {} }) {
   const state = gh.queueState(pr);
-  if (state.state === 'MERGED') return { kind: 'merged', mergeSha: await readMergeSha({ gh, pr, first: state.mergeSha, sleep, pollMs }) };
+  if (state.state === 'MERGED') return { kind: 'merged', lookup: { first: state.mergeSha } };
   if (state.state === 'CLOSED') return { kind: 'closed' };
   if (state.head !== head) return { kind: 'head-moved', head: state.head };
   if (state.entry) return { kind: 'queued', entry: state.entry };
@@ -268,8 +279,7 @@ export async function reconcile({ gh, root, pr, head, sleep = defaultSleep, poll
   const mergedAt = after.find((e) => e.type === 'merged' || (e.type === 'removed' && e.reason === REASON_MERGED));
   const ours = rec?.pending ? Date.parse(events[lastAdded]?.at) >= Date.parse(rec.pending.at) - CLOCK_SLACK_MS : true;
   if (mergedAt && ours) {
-    const sha = mergedAt.beforeCommit && FULL_SHA.test(mergedAt.beforeCommit) ? mergedAt.beforeCommit : await readMergeSha({ gh, pr, first: null, sleep, pollMs });
-    return { kind: 'merged', mergeSha: sha };
+    return mergedAt.beforeCommit && FULL_SHA.test(mergedAt.beforeCommit) ? { kind: 'merged', mergeSha: mergedAt.beforeCommit } : { kind: 'merged', lookup: { first: null } };
   }
   const removal = [...after].reverse().find((e) => e.type === 'removed');
   if (removal && ours) {
@@ -369,5 +379,308 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
       return result;
     }
     return out;
+  }
+}
+
+// ---- the needs-human hold the entry owns ---------------------------------------------------------------------------------------------
+// In queue mode the owner's "merge" lifts a needs-human hold and the QUEUE ENTRY (through the record), not the `P merge` process, owns it from
+// the confirmed enqueue on: it stays lifted while the PR waits, and goes back once, at an unmerged terminal end. settleRecord is the ONE function
+// that decides this, for the next `P merge` (recoverOrphanedLift), `P queue-sweep` and `P final-gate`'s best-effort sweep.
+
+const msgOf = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 200);
+const FAILING_CONCLUSIONS = ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'];
+
+// What failed on the queue commit a removal ended: failed check runs and failed commit statuses (a status context counts once, newest first).
+export function failingChecksOn(gh, sha) {
+  if (typeof sha !== 'string' || sha === '') return [];
+  const out = [];
+  try {
+    for (const c of gh.checkRunsOf(sha)) {
+      if (FAILING_CONCLUSIONS.includes(c?.conclusion)) out.push(`${c.name}: ${c.conclusion}`);
+    }
+    const seen = new Set();
+    for (const s of gh.statusesOf(sha)) {
+      if (seen.has(s?.context)) continue;
+      seen.add(s?.context);
+      if (['failure', 'error'].includes(s?.state)) out.push(`${s.context}: ${s.state}`);
+    }
+  } catch (err) {
+    out.push(`could not read the checks of ${sha.slice(0, 12)} (${msgOf(err)})`);
+  }
+  return [...new Set(out)];
+}
+
+// The hold as a later re-queue must present it to the owner-go approval check ({ id, login, at }); null when the record owns none.
+export const recordedHold = (rec) => (rec?.hold ? { id: rec.hold.id, login: rec.hold.login, at: rec.hold.at } : null);
+
+// A record with nothing in it (no attempt, no entry, no hold) is dropped: there is nothing left to settle and a leftover "ended" one would
+// make the next plain `P merge` of the same head ask for a fresh owner word (Fable F10).
+export function removeRecord(root, pr) {
+  rmSync(queueRecordPath(root, pr), { force: true });
+}
+
+// Puts needs-human back, once. -> { status: 'restored' | 'already-on' | 'merged' | 'failed', why? }. A label that is ON already is a NEW hold
+// (the owner's lifted one is gone for good) and is left alone; a merged PR gets nothing.
+export function restoreHoldLabel({ gh, pr }) {
+  let view = null;
+  try {
+    view = gh.prView(pr, ['state', 'labels']);
+  } catch { /* unreadable: try the add; it is idempotent on GitHub's side */ }
+  if (view?.state === 'MERGED') return { status: 'merged' };
+  if (view && validLabels(view.labels) && labelNames(view.labels).some((n) => n.toLowerCase() === HOLD_LABEL)) return { status: 'already-on' };
+  try {
+    gh.addLabels(pr, [HOLD_LABEL]);
+    return { status: 'restored' };
+  } catch (err) {
+    return { status: 'failed', why: msgOf(err) };
+  }
+}
+
+// Decides what happens to ONE live record, now. Under the PR's merge lock (callers take it). One reconcile with GitHub, then:
+//   merged       -> record ends merged; the lifted label stays off.
+//   queued       -> the entry is adopted (pending / session -> entry); a live stop condition (needs-human, pipeline-blocked, pause / rollback
+//                   issue) dequeues with a confirmed look (watchQueue); otherwise nothing changes.
+//   removed      -> noted once. A group-check removal with a re-queue left: no `requeue` given => { outcome: 'requeue-due' } and NOTHING changes
+//                   (the hold stays lifted); `requeue` given => it runs (the caller's recheck + enqueue) and { outcome: 'requeued' } when it took.
+//                   Anything else is terminal: the owned hold goes back and the record ends.
+//   closed / head-moved / an attempt that never reached GitHub -> terminal as well.
+//   unreadable   -> { outcome: 'unsettled' }: nothing restored, nothing ended (fail closed).
+// Options: `requeue({ rec, removal })` -> { ok: true } | { ok: false, kind?: 'blocked', reasons } (4b: only from a live worktree; final-gate never passes it);
+// `notify(text)` is called once per terminal outcome; `blockers` is the stop-condition check (default: today's waitBlockers).
+// Returns { outcome, rec, ... }: outcome is one of none | idle | merged | queued | requeue-due | requeued | ended | restore-failed | unsettled.
+export async function settleRecord({ gh, root, pr, now = Date.now, sleep = defaultSleep, pollMs = 2000, log = () => {}, requeue = null, notify = null, blockers = null, restore = restoreHoldLabel }) {
+  let rec = readQueueRecord(root, pr);
+  if (rec === null || rec.terminal !== null) return { outcome: 'none', rec };
+  const say = (text) => {
+    try { notify?.(text); } catch { /* a notification failure must not undo a settled record */ }
+  };
+
+  // An unmerged end: the owned hold goes back (not when a label is on already = a new hold), then the record ends. A restore that fails
+  // keeps the record open, so the next settle tries again.
+  const finish = (kind, message, extra = {}) => {
+    const cur = readQueueRecord(root, pr);
+    let hold = 'none';
+    if (cur.terminal === null && cur.hold !== null) {
+      const res = restore({ gh, pr });
+      if (res.status === 'failed') return { outcome: 'restore-failed', terminal: kind, why: res.why, rec: cur, ...extra };
+      if (res.status === 'merged') {
+        endRecord(root, pr, 'merged', { now });
+        return { outcome: 'merged', mergeSha: null, rec: readQueueRecord(root, pr) };
+      }
+      hold = res.status;
+    }
+    if (cur.terminal === null) endRecord(root, pr, kind, { now });
+    const text = `PR #${pr} ${message}${hold === 'restored' ? `; needs-human is back on it (${RESTORE_NOTE})` : ''}`;
+    say(text);
+    return { outcome: 'ended', terminal: kind, hold, message: text, rec: readQueueRecord(root, pr), ...extra };
+  };
+  const mergedOut = (mergeSha, warning) => {
+    endRecord(root, pr, 'merged', { now });
+    say(`PR #${pr} merged through the merge queue`);
+    return { outcome: 'merged', mergeSha: mergeSha ?? null, ...(warning ? { warning } : {}), rec: readQueueRecord(root, pr) };
+  };
+
+  const gone = async (removal) => {
+    rec = readQueueRecord(root, pr);
+    const last = removal ?? rec.removals[rec.removals.length - 1] ?? null;
+    if (last !== null) {
+      const failing = failingChecksOn(gh, last.beforeCommit);
+      const what = `was removed from the merge queue (reason ${last.reason ?? 'unknown'})${failing.length > 0 ? `; failing: ${failing.join(', ')}` : ''}`;
+      if (mayRequeue(rec, rec.head, last.reason)) {
+        if (typeof requeue !== 'function') return { outcome: 'requeue-due', removal: last, rec };
+        const out = await requeue({ rec, removal: last });
+        if (out?.ok) return { outcome: 'requeued', removal: last, rec: readQueueRecord(root, pr) };
+        return finish(out?.kind === 'blocked' ? 'blocked' : 'removed', `${what} once and was not re-queued: ${(out?.reasons ?? ['the re-queue was not allowed']).join('; ')}`, { removal: last, failing });
+      }
+      return finish('removed', `${what}${rec.removals.length > 1 ? ' after one automatic re-queue' : ''}`, { removal: last, failing });
+    }
+    if (rec.attempts === 0 && rec.entryIds.length === 0) {
+      if (rec.hold !== null) return finish('removed', 'never reached the merge queue');
+      removeRecord(root, pr);
+      return { outcome: 'idle', rec: null };
+    }
+    return { outcome: 'unsettled', rec, why: 'GitHub shows no queue entry and no removal for an attempt the record counts' };
+  };
+
+  const fromWatch = async (w) => {
+    if (w.state === 'merged') return mergedOut(w.mergeSha, w.warning);
+    if (w.state === 'closed') return finish('closed', 'was closed without merging');
+    if (w.state === 'head-moved') return finish('head-moved', `head moved off the approved ${rec.head.slice(0, 12)}`);
+    if (w.state === 'removed') return gone(w.removal);
+    if (w.state === 'blocked') {
+      if (w.dequeued === false) return { outcome: 'unsettled', rec: readQueueRecord(root, pr), why: `a stop condition appeared (${(w.problems ?? []).join('; ')}) but the dequeue is not confirmed` };
+      return finish('blocked', `was dequeued: ${(w.problems ?? []).join('; ')}`, { problems: w.problems ?? [] });
+    }
+    return { outcome: 'queued', rec: readQueueRecord(root, pr), position: w.position ?? null };
+  };
+
+  let r;
+  try {
+    r = await reconcile({ gh, root, pr, head: rec.head, sleep, pollMs, log });
+  } catch (err) {
+    return { outcome: 'unsettled', rec, why: `could not read the merge queue (${msgOf(err)})` };
+  }
+  rec = readQueueRecord(root, pr);
+  switch (r.kind) {
+    case 'merged': return mergedOut(r.mergeSha, r.mergeSha ? undefined : 'GitHub did not report the merge commit');
+    case 'closed': return finish('closed', 'was closed without merging');
+    case 'head-moved': return finish('head-moved', `head moved off the approved ${rec.head.slice(0, 12)}`);
+    case 'removed':
+      noteRemoval(root, pr, r.removal);
+      return gone(r.removal);
+    case 'not-queued': return gone(null);
+    default: break;
+  }
+  // queued: adopt the entry, then look at the stop conditions.
+  if (rec.pending !== null || rec.hold?.owner === 'session' || rec.hold?.owner === 'pending' || !rec.entryIds.includes(r.entry.id)) confirmAttempt(root, pr, r.entry.id);
+  const check = blockers ?? waitBlockers(gh, { base: null });
+  let problems;
+  try {
+    problems = await check(gh.prView(pr, ['state', 'labels', ...(check.fields ?? [])]));
+  } catch (err) {
+    return { outcome: 'queued', rec: readQueueRecord(root, pr), position: r.entry.position ?? null, note: `the stop conditions could not be read (${msgOf(err)})` };
+  }
+  if (problems.length === 0) return { outcome: 'queued', rec: readQueueRecord(root, pr), position: r.entry.position ?? null };
+  return fromWatch(await watchQueue({ gh, root, pr, head: rec.head, budgetMs: 0, pollMs, blockers: check, now, sleep, log }));
+}
+
+// A signal reached `P merge` while a lifted hold is on the record: may this process put the label back? Synchronous (a signal handler cannot
+// wait). -> { restore: boolean, done?: () => void }. No record or hold, or `session` (no enqueue started): yes, as today. `entry`: no, the
+// entry owns it. `pending` (the enqueue may or may not have landed): ONE bounded look (<= budgetMs): queued at the head => owner 'entry', no
+// restore; confirmed not queued => restore (`done` then drops the unused hold); unreadable, out of time, or any other answer => nothing is
+// restored and the record stays as it is, for the next `P merge` / the sweep.
+export function holdOnSignal({ gh, root, pr, budgetMs = 10_000, retryMs = 1500, now = Date.now, sleepSync = defaultSleepSync }) {
+  let rec;
+  try {
+    rec = readQueueRecord(root, pr);
+  } catch {
+    return { restore: false };
+  }
+  const dropHold = () => { try { clearSessionHold(root, pr); } catch { /* the sweep ends an idle record */ } };
+  if (rec === null || rec.terminal !== null || rec.hold === null) return { restore: true };
+  if (rec.hold.owner === 'session') return { restore: true, done: dropHold };
+  if (rec.hold.owner === 'entry') return { restore: false };
+  const deadline = now() + budgetMs;
+  for (;;) {
+    try {
+      const r = reconcileNow({ gh, root, pr, head: rec.pending?.head ?? rec.head });
+      if (r.kind === 'queued') {
+        confirmAttempt(root, pr, r.entry.id);
+        return { restore: false };
+      }
+      if (r.kind === 'not-queued') {
+        const cur = readQueueRecord(root, pr);
+        // reconcileNow dropped the pending attempt (nothing was queued). A record that still shows an attempt had an older entry: leave it to the sweep.
+        return cur.attempts === 0 && cur.entryIds.length === 0 ? { restore: true, done: dropHold } : { restore: false };
+      }
+      return { restore: false }; // merged / removed / closed / head moved: the sweep settles it
+    } catch { /* unreadable: look again while there is time */ }
+    if (deadline - now() <= retryMs) return { restore: false };
+    sleepSync(retryMs);
+  }
+}
+
+function defaultSleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// The process put a lifted hold back itself, so the record no longer carries it (only a `session` hold: an `entry` / `pending` one is the record's).
+export function clearSessionHold(root, pr) {
+  const rec = readQueueRecord(root, pr);
+  if (rec !== null && rec.terminal === null && rec.hold !== null && rec.hold.owner === 'session') setHold(root, pr, null);
+}
+
+// Does the record (not a running process) own a lifted hold right now? True for an `entry` or `pending` owner; `session` (no enqueue
+// started) is the process's own to restore.
+export function recordOwnsHold(root, pr) {
+  const rec = readQueueRecord(root, pr);
+  return rec !== null && rec.terminal === null && rec.hold !== null && rec.hold.owner !== 'session';
+}
+
+// ---- no record (Fable F3) ---------------------------------------------------------------------------------------------------------
+// `recoverOrphanedLift` found a lift comment, the label gone and the PR open. In queue mode the answer comes from GitHub BEFORE anything is
+// disabled or restored: -> { action: 'proceed' | 'refuse' | 'today', ... }.
+//   proceed : this clone's record owns it and the run may go on (watch it, re-queue it, or report the merge).
+//   refuse  : { error, reasons, extra } (an unmerged end whose hold is back, a restore that failed, an entry elsewhere, a queue that cannot be read).
+//   today   : nothing is queued: the caller's own recovery (disarm auto-merge, put the label back) applies.
+// A live entry at the lift comment's head with no usable record here (another clone, machine, or a pruned dir): a record is written from the
+// comment (owner 'entry'), nothing is restored, auto-merge is never disabled, and the run is refused `queued-elsewhere` (the sweep owns it now).
+export async function recoverQueuedLift({ gh, root, pr, orphan, lift, now = Date.now, sleep = defaultSleep, pollMs = 2000, log = () => {}, notify = null }) {
+  const unreadable = (what, err) => ({ action: 'refuse', error: 'hold-recovery', reasons: [`#${pr}: ${what} (${msgOf(err)}): nothing was changed, and auto-merge was not touched`], extra: { queue: true, queued: null } });
+  let rec;
+  try {
+    rec = readQueueRecord(root, pr);
+  } catch (err) {
+    return unreadable('the merge-queue record could not be read', err);
+  }
+  if (rec !== null && rec.terminal === null && rec.hold !== null) {
+    let out;
+    try {
+      out = await settleRecord({ gh, root, pr, now, sleep, pollMs, log, notify });
+    } catch (err) {
+      return unreadable('the merge-queue record could not be settled', err);
+    }
+    switch (out.outcome) {
+      case 'merged': case 'queued': case 'requeue-due': case 'requeued': return { action: 'proceed' };
+      case 'ended':
+        return { action: 'refuse', error: 'hold-recovery', reasons: [`#${pr}: an earlier \`P merge --owner-go\` lifted needs-human hold ${orphan.hold} and queued the PR; ${out.message}. Nothing was merged`], extra: { queue: true, queued: false, holdRestored: out.hold === 'restored', ...(out.hold === 'restored' ? { holdRestoredNote: RESTORE_NOTE } : {}) } };
+      case 'restore-failed':
+        return { action: 'refuse', error: 'hold-restore', reasons: [`COULD NOT put needs-human back on PR #${pr} (${out.why}): an earlier --owner-go run lifted hold ${orphan.hold} and the PR left the merge queue unmerged. Add the label by hand; nothing was merged`], extra: { queue: true, holdRestored: false, holdRestoreFailed: true } };
+      default: return unreadable('the merge queue state could not be settled', out.why ?? out.outcome);
+    }
+  }
+  const head = lift?.head;
+  if (typeof head !== 'string' || !FULL_SHA.test(head)) return unreadable('the lift comment names no head, so the merge queue cannot be checked', 'no head');
+  let r;
+  try {
+    r = await reconcile({ gh, root, pr, head, sleep, pollMs, log });
+  } catch (err) {
+    return unreadable('the merge queue state could not be read', err);
+  }
+  if (r.kind === 'merged') return { action: 'proceed' };
+  if (r.kind !== 'queued') return { action: 'today' };
+  try {
+    const repo = gh.repo().slug;
+    const repoId = typeof gh.repoId === 'function' ? gh.repoId() : null;
+    openRecord(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now });
+    setHold(root, pr, { id: orphan.hold, login: lift.login ?? null, at: lift.at ?? null, holdBlock: lift.login && lift.at ? holdDigest({ id: orphan.hold, login: lift.login, at: lift.at }) : null, liftedAt: isoOf(now) });
+    beginAttempt(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now });
+    confirmAttempt(root, pr, r.entry.id);
+  } catch (err) {
+    return unreadable('the merge-queue record could not be written', err);
+  }
+  return { action: 'refuse', error: 'queued-elsewhere', reasons: [`PR #${pr} is already in the merge queue at ${head.slice(0, 12)}: an earlier \`P merge --owner-go\` (another checkout or machine) lifted needs-human hold ${orphan.hold} and queued it. A record is kept here now and \`P queue-sweep\` settles it (merge, or put the label back if it leaves unmerged); nothing was changed and auto-merge was not touched`], extra: { queue: true, queued: true } };
+}
+
+// ---- F7: the guards re-run after a hold lift ----------------------------------------------------------------------------------------
+// Removing needs-human fires `pull_request_target: unlabeled`, so pipeline-guards.yml posts the three guard statuses as `pending` again. Enqueueing
+// then would make the queue poster read `pending` and spend the one re-queue. Waits (up to `waitMs`) until none of them is pending, then they must
+// be green with the same provenance as before. -> [] when settled green, else the reasons to refuse (the caller puts the hold back).
+export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, now = Date.now, sleep = defaultSleep, provenance = forgedGuards }) {
+  const deadline = now() + waitMs;
+  let why = 'the checks were not read';
+  for (;;) {
+    let rows = null;
+    try {
+      rows = gh.checks(pr);
+      if (!Array.isArray(rows)) throw new Error('the checks reply is not a list');
+    } catch (err) {
+      why = `could not read the checks (${msgOf(err)})`;
+      rows = null;
+    }
+    if (rows !== null) {
+      const guards = rows.filter((r) => PROVENANCE_CHECKS.includes(r?.name));
+      const pending = guards.filter((r) => r.bucket === 'pending');
+      if (pending.length === 0) {
+        const bad = guards.filter((r) => r.bucket !== 'pass');
+        if (bad.length > 0) return [`guard check(s) not passing after the hold lift re-ran them: ${bad.map((r) => `${r.name}=${r.bucket ?? r.state}`).join(', ')}`];
+        const forged = guards.length > 0 ? provenance({ gh, pr, head, names: guards.map((r) => r.name) }) : [];
+        return forged.length > 0 ? [`guard status not posted by the pipeline-guards workflow: ${forged.join('; ')}`] : [];
+      }
+      why = `guard check(s) still pending: ${pending.map((r) => r.name).join(', ')}`;
+    }
+    const left = deadline - now();
+    if (left <= 0) return [`${why} after ${Math.round(waitMs / 1000)} s: lifting the hold re-runs the guards; run again once they have finished`];
+    await sleep(Math.min(pollMs, left));
   }
 }

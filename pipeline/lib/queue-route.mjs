@@ -8,7 +8,7 @@ import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
 import { waitBlockers } from './finalgate.mjs';
 import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
-import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, watchQueue } from './merge-queue.mjs';
+import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, watchQueue } from './merge-queue.mjs';
 import { envWithGhDir, runShellAsync } from './proc.mjs';
 import { approvalGap } from '../hooks/lib/owner-go.mjs';
 
@@ -46,31 +46,16 @@ export function approvalGapSince(q, since, gap = approvalGap) {
 const lastLines = (text, n = OUTPUT_LINES) => String(text ?? '').split('\n').map((l) => l.trimEnd()).filter(Boolean).slice(-n);
 const firstLine = (err) => String(err?.message ?? err).split('\n')[0];
 
-// What failed on the queue commit a removal ended: failed check runs and failed commit statuses (a status context counts once, newest first).
-export function failingChecksOn(gh, sha) {
-  if (typeof sha !== 'string' || sha === '') return [];
-  const out = [];
-  try {
-    for (const c of gh.checkRunsOf(sha)) {
-      if (['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(c?.conclusion)) out.push(`${c.name}: ${c.conclusion}`);
-    }
-    const seen = new Set();
-    for (const s of gh.statusesOf(sha)) {
-      if (seen.has(s?.context)) continue;
-      seen.add(s?.context);
-      if (['failure', 'error'].includes(s?.state)) out.push(`${s.context}: ${s.state}`);
-    }
-  } catch (err) {
-    out.push(`could not read the checks of ${sha.slice(0, 12)} (${firstLine(err)})`);
-  }
-  return [...new Set(out)];
-}
+// (failingChecksOn lives in merge-queue.mjs, next to settleRecord, which reports the same thing; re-exported for the callers of this file)
+export { failingChecksOn };
 
 // Everything the engine needs from the route that calls it:
 //   gh, root, config, pr, head (the approved full sha), env, refuse (merge.mjs's), track (the merge lock's child tracker),
 //   approval { items, areas, rulings } (stored on the record), extra (fields every output carries: mode, head, ...),
 //   recheck(): the route's live checks + owner approval + blockers for the SAME head, run before a re-queue -> { ok: true } | { ok: false, error, reasons },
-//   onBeforeAttempt({ rec }) / onTerminal({ kind, rec }): the two SEAMS for the needs-human hold (both no-ops here; see below).
+//   onBeforeAttempt({ rec }) / onTerminal({ kind, rec }): the two SEAMS for the needs-human hold (no-ops by default; merge.mjs wires them). onBeforeAttempt writes the
+//   lifted hold to the record before every attempt; onTerminal runs at an unmerged end (removed / blocked / closed / head-moved) BEFORE the record ends and may return
+//   { fields, keepOpen }: `fields` join the refusal (holdRestored ...), `keepOpen` leaves the record live (the label could not be put back: the next settle retries).
 export function createQueueRoute({
   gh, root, config, pr, head, env = process.env, refuse, track = { started() {}, ended() {} }, approval, extra = {}, recheck,
   onBeforeAttempt = async () => {}, onTerminal = async () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = () => {},
@@ -99,23 +84,25 @@ export function createQueueRoute({
     const rec = readQueueRecord(root, pr);
     return rec !== null && rec.terminal === null ? rec : null;
   };
-  // An unmerged end: the hold seam first (it may restore a lifted label and end the record itself), then the record is ended if it still is open.
+  // An unmerged end: the hold seam first (it puts a lifted label back), then the record ends if it still is open and the seam did not keep it.
+  // -> the fields the seam adds to the refusal.
   const terminal = async (kind) => {
-    await onTerminal({ kind, rec: readQueueRecord(root, pr) });
-    if (liveRecord() !== null) endRecord(root, pr, kind, { now });
+    const out = (await onTerminal({ kind, rec: readQueueRecord(root, pr) })) ?? {};
+    if (out.keepOpen !== true && liveRecord() !== null) endRecord(root, pr, kind, { now });
+    return out.fields ?? {};
   };
 
   const removedRefusal = async (removal, why) => {
     const failing = failingChecksOn(gh, removal?.beforeCommit);
-    await terminal('removed');
+    const holdFields = await terminal('removed');
     const reason = removal?.reason ?? 'unknown';
     return refusal('queue-removed', [`PR #${pr} was removed from the merge queue (reason ${reason})${requeued > 0 ? ' after one automatic re-queue' : ''}${failing.length > 0 ? `; failing: ${failing.join(', ')}` : ''}${why ? `; ${why}` : ''}`], {
-      removal: { reason: removal?.reason ?? null, beforeCommit: removal?.beforeCommit ?? null, actor: removal?.actor ?? null, at: removal?.at ?? null, failing },
+      removal: { reason: removal?.reason ?? null, beforeCommit: removal?.beforeCommit ?? null, actor: removal?.actor ?? null, at: removal?.at ?? null, failing }, ...holdFields,
     });
   };
   const unmergedEnd = async (kind) => {
-    await terminal(kind);
-    return refusal(kind, [kind === 'closed' ? `PR #${pr} was closed without merging` : `PR #${pr}'s head moved off the approved ${head.slice(0, 12)}: nothing was queued or merged for it`], { queued: false });
+    const holdFields = await terminal(kind);
+    return refusal(kind, [kind === 'closed' ? `PR #${pr} was closed without merging` : `PR #${pr}'s head moved off the approved ${head.slice(0, 12)}: nothing was queued or merged for it`], { queued: false, ...holdFields });
   };
 
   // ---- 1. GitHub first ----------------------------------------------------------------------------------------------------------
@@ -225,8 +212,7 @@ export function createQueueRoute({
             // Not a failure and never a stop: the entry stays queued, so no dequeue, no disable-auto, no hold restore (a later P merge reconciles).
             return { exitCode: EXIT.OK, output: { ok: true, merged: false, ...fields({ queued: true, stillQueued: true, ...(w.position === null || w.position === undefined ? {} : { position: w.position }) }) } };
           case 'blocked':
-            await terminal('blocked');
-            return refuse('blocked', w.problems ?? [], fields({ queued: w.dequeued === false, dequeued: w.dequeued === true }));
+            return refuse('blocked', w.problems ?? [], fields({ queued: w.dequeued === false, dequeued: w.dequeued === true, ...(w.dequeued === false ? {} : await terminal('blocked')) }));
           case 'closed': return await unmergedEnd('closed');
           case 'head-moved': return await unmergedEnd('head-moved');
           case 'removed': {

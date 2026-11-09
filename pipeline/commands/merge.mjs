@@ -18,14 +18,14 @@ import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { loadState } from '../lib/state.mjs';
-import { approvalConfigDirHint, approvalGap, areasBlock, holdBlock, readyLine } from '../hooks/lib/owner-go.mjs';
-import { findOrphanedLift, holdTiming, mergeInProgress, parkNoteOf, readEligibleHold, recoverOrphanedLift, withHoldLifted, withMergeLock } from '../lib/hold.mjs';
+import { approvalConfigDirHint, approvalGap, areasBlock, holdBlock, holdDigest, readyLine } from '../hooks/lib/owner-go.mjs';
+import { RESTORE_NOTE, findOrphanedLift, holdTiming, mergeInProgress, parkNoteOf, readEligibleHold, recoverOrphanedLift, withHoldLifted, withMergeLock } from '../lib/hold.mjs';
 import {
   GATE_FILE, PR_FIELDS, READABLE_MERGE_STATES, abandonMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, preMergeProblems, readReviewJson,
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
 import { classifyMergeCommand, commandTail } from '../lib/merge-cleanup.mjs';
-import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
+import { QueueUnreadable, clearSessionHold, endRecord, holdOnSignal, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
 import { approvalGapSince, createQueueRoute } from '../lib/queue-route.mjs';
 import { checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal, recordSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
 
@@ -61,6 +61,35 @@ function readQueueMode({ gh, pr }) {
     throw err;
   }
 }
+
+// The needs-human hold in queue mode (the plan's three-state machine; lib/merge-queue.mjs settleRecord is the one place that decides). The QUEUE ENTRY, through the
+// record, owns a hold the owner's "merge" lifted: it stays lifted while the PR waits and goes back once, at an unmerged terminal end.
+// `getHold()` = the hold THIS process lifted (null on the gated route and on a restart: the record already has it).
+function queueHoldSeams({ gh, root, pr, getHold }) {
+  return {
+    // After openRecord, before every attempt: the lifted hold is written to the record with its full binding, so a signal or a crash from here on knows about it.
+    onBeforeAttempt: async ({ rec }) => {
+      const hold = getHold();
+      if (hold === null || rec?.hold) return;
+      setHold(root, pr, { id: hold.id, login: hold.login, at: hold.at, holdBlock: holdDigest(hold), liftedAt: new Date().toISOString() });
+    },
+    // An unmerged end: the owned label goes back, once (a label that is on already is a new hold and is left). A failed restore keeps the record open.
+    onTerminal: async ({ rec }) => {
+      if (!rec || rec.terminal !== null || rec.hold === null) return {};
+      const res = restoreHoldLabel({ gh, pr });
+      if (res.status === 'failed') return { keepOpen: true, fields: { holdRestored: false, holdRestoreFailed: true, holdRestoreNote: `COULD NOT put needs-human back on PR #${pr} (${res.why}): add the label by hand` } };
+      return res.status === 'restored' ? { fields: { holdRestored: true, holdRestoredNote: RESTORE_NOTE } } : {};
+    },
+  };
+}
+// What lib/hold.mjs needs to stay out of the entry's way: recovery that asks GitHub first (F3) and the signal / ownership hooks of withHoldLifted.
+const queueRecovery = ({ gh, root, pr }) => ({ recover: ({ orphan, lift }) => recoverQueuedLift({ gh, root, pr, orphan, lift }) });
+const queueLiftHooks = ({ gh, root, pr }) => ({ onSignal: () => holdOnSignal({ gh, root, pr }), owns: () => recordOwnsHold(root, pr), restored: () => clearSessionHold(root, pr) });
+// The lifted hold a LIVE record still owns (a restart after the first removal): null when none. (precheck has read the record already, so a bad file refused before this.)
+const liveRecordHold = (root, pr) => {
+  const rec = readQueueRecord(root, pr);
+  return rec !== null && rec.terminal === null ? recordedHold(rec) : null;
+};
 
 // An entry already exists (a re-run, or a restarted job): watch it, with the run record showing it. Nothing is gated again and nothing is enqueued.
 async function watchOnly({ route, gh, pr, head }) {
@@ -121,7 +150,7 @@ export const run = guarded(async (argv, ctx) => {
     const queue = readQueueMode({ gh, pr });
     if (queue.refusal) return queue.refusal;
     // 0. A lift comment with no label and no merge (an `--owner-go` run that died after removing needs-human) is put right before anything else.
-    const recovered = await recoverOrphanedLift({ gh, pr, refuse, strict: false, env: ctx.env ?? process.env, disableAuto: () => disableAutoMerge({ pr, cwd: root, env: ctx.env }) });
+    const recovered = await recoverOrphanedLift({ gh, pr, refuse, strict: false, env: ctx.env ?? process.env, disableAuto: () => disableAutoMerge({ pr, cwd: root, env: ctx.env }), queue: queue.on ? queueRecovery({ gh, root, pr }) : null });
     if (recovered !== null) return recovered;
     // 1. The gate file must name this head and this patch, in this repo, and be fresh. It is only a binding: it proves nothing by itself.
     const gate = readReviewJson(root, GATE_FILE);
@@ -144,6 +173,7 @@ export const run = guarded(async (argv, ctx) => {
         gh, root, config, pr, head: gate.head, env: ctx.env ?? process.env, refuse, track,
         approval: { items: gate.ownerItems ?? null, areas: null, rulings: null },
         recheck: () => queueRecheckGated({ root, config, pr, gh, ctx, gate, ownerApproved: values['owner-approved-head'] !== undefined }),
+        ...queueHoldSeams({ gh, root, pr, getHold: () => null }),
       });
       pre = await route.precheck();
       if (pre.done) return pre.done;
@@ -415,7 +445,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   const queue = readQueueMode({ gh, pr });
   if (queue.refusal) return queue.refusal;
   // Rev 4 item 4: an earlier run that lifted the hold and died is put right (label back, this run refused) before anything else.
-  const recovered = await recoverOrphanedLift({ gh, pr, refuse, env: ctx.env ?? process.env, disableAuto: () => disableAutoMerge({ pr, cwd: root, env: ctx.env }) });
+  const recovered = await recoverOrphanedLift({ gh, pr, refuse, env: ctx.env ?? process.env, disableAuto: () => disableAutoMerge({ pr, cwd: root, env: ctx.env }), queue: queue.on ? queueRecovery({ gh, root, pr }) : null });
   if (recovered !== null) return recovered;
   // Queue mode: GitHub is asked first (see the gated route). `approval`, `extra.behind` and `rechecker` are filled in once the live scan below has run.
   let route = null;
@@ -424,7 +454,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   const extra = { mode: 'owner-go', head, behind: null };
   let rechecker = async () => ({ ok: false, error: 'live-check', reasons: ['the live scan has not run'] });
   if (queue.on) {
-    route = createQueueRoute({ gh, root, config, pr, head, env: ctx.env ?? process.env, refuse, track, extra, approval, recheck: () => rechecker() });
+    route = createQueueRoute({ gh, root, config, pr, head, env: ctx.env ?? process.env, refuse, track, extra, approval, recheck: () => rechecker(), ...queueHoldSeams({ gh, root, pr, getHold: () => hold }) });
     pre = await route.precheck();
     if (pre.done) return pre.done;
     if (pre.watch) return watchOnly({ route, gh, pr, head });
@@ -436,6 +466,13 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   // The needs-human hold the owner's "merge" may lift (lib/hold.mjs; none = today's flow, the label stays a blocker). Only the labels check and the
   // look BEFORE the lift ignore it (Rev-4 8).
   const { hold } = await readEligibleHold({ gh, pr, config });
+  // Queue mode, a restart: a LIVE record still owns the hold an earlier run lifted (the label is off), so a re-queue is judged against THAT hold. A needs-human on the PR
+  // now is a NEW hold: nothing is re-queued and the record ends (the label is on already, so nothing is restored on top of it).
+  const recHold = queue.on ? liveRecordHold(root, pr) : null;
+  if (recHold !== null && hold !== null) {
+    endRecord(root, pr, 'blocked');
+    return refuse('blocked', [`a new needs-human hold (${hold.id}) is on #${pr} after the one the owner lifted (${recHold.id}): the PR was not re-queued. The owner must say "merge" for the new hold`], { head, queue: true, queued: false });
+  }
   // The live scan first: the owner's record is bound to the owner items and areas IT found (read-only; nothing is written).
   const live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null, ...(queue.on ? { queueMode: true } : {}) });
   if (live.head !== head) return refuse('live-check', [`the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`], { head });
@@ -443,7 +480,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   // A.4: never merge without the base re-read below, even if scan-range stops requiring a base sha.
   const noBase = ownerGoBaseProblem(live);
   if (noBase !== null) return refuse('live-check', [noBase], { head });
-  const asked = { repo, pr, head, items: live.ownerItems, areas: live.areas, hold: hold ?? undefined, rulings: live.rulingsBlockDigest }; // (absent hold = none: a record that names a hold never approves a PR without one)
+  const asked = { repo, pr, head, items: live.ownerItems, areas: live.areas, hold: hold ?? recHold ?? undefined, rulings: live.rulingsBlockDigest }; // (absent hold = none: a record that names a hold never approves a PR without one)
   const gap = queue.on ? approvalGapSince(asked, pre.since) : approvalGap(asked);
   if (gap !== 'ok' && pre?.since !== undefined) return pre.staleTerminal(); // (the record of this head already ended: only a fresh "merge" re-queues it)
   if (gap !== 'ok') {
@@ -461,7 +498,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
     Object.assign(approval, { items: live.ownerItems, areas: live.areas, rulings: live.rulingsBlockDigest ?? null });
     extra.behind = live.behind ?? null;
     // Before a re-queue (the group's checks failed once): the same scan, the same owner approval, the blockers, for the SAME head.
-    rechecker = () => queueRecheckOwnerGo({ root, config, pr, gh, ctx, head, repo, hold });
+    rechecker = () => queueRecheckOwnerGo({ root, config, pr, gh, ctx, head, repo, hold: hold ?? recHold });
   }
 
   // `running.pid` (hold lift only) is the merge command's process id while it runs: a signal kills that group and disarms auto-merge before the label goes back.
@@ -496,8 +533,22 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   };
 
   // Queue mode: the enqueue replaces the merge command; the lift / restore wrapper below is unchanged (the hold builder's seam: lib/queue-route.mjs onBeforeAttempt / onTerminal).
-  const mergeStep = queue.on ? () => route.enqueueAndWatch({ requeue: pre.requeue === true }) : mergeAndWait;
-  if (hold === null) return mergeStep();
+  // Lifting needs-human fires `unlabeled`, so the guards re-post `pending` on the head: wait for them to settle green first (F7), else the poster would read `pending`
+  // and spend the one re-queue. Refused as today when they do not (withHoldLifted then puts the hold back). No wait on a restart re-queue: nothing was lifted just now.
+  const queueStep = async () => {
+    if (hold !== null) {
+      const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
+      const problems = await settleGuardStatuses({ gh, pr, head, waitMs, pollMs });
+      if (problems.length > 0) return refuse('pre-merge', problems, { head });
+    }
+    return route.enqueueAndWatch({ requeue: pre.requeue === true });
+  };
+  const mergeStep = queue.on ? queueStep : mergeAndWait;
+  if (hold === null) {
+    const result = await mergeStep();
+    if (recHold !== null && result.output?.merged === true) result.output.holdLifted = recHold.id;
+    return result;
+  }
   // The hold is lifted on the owner's word just before the merge command and put back whenever nothing merges (lib/hold.mjs withHoldLifted).
   return withHoldLifted({
     gh, pr, hold, head, items: live.ownerItems, repo, env: ctx.env ?? process.env, refuse,
@@ -505,6 +556,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
     merge: mergeStep,
     kill: killTree,
     disableAuto: () => disableAutoMerge({ pr, cwd: root, env: ctx.env }),
+    queue: queue.on ? queueLiftHooks({ gh, root, pr }) : null,
   });
 }
 
