@@ -147,6 +147,6 @@ Never type, paraphrase or forge the owner's words, and never run Codex outside `
    follow-up issues.
    Then Read `reference/owner-merge.md` (section 3.3) and end the reply exactly as it says: which ending applies depends on the item note from 1.5 (as refreshed in step 2)
    (a `blocking` item ⇒ the repo's `merge.command`; otherwise `P merge --pr N --dry-run --owner-go` and its closing lines). The owner says "merge" ⇒ `P merge --pr N --owner-go` as a job
-   (`P job start merge -- …`), never `gh pr merge` yourself. The block order is Rulings (when present), Areas, Hold, Head, 🔀; copy it from the dry run, never type the digest. The closing lines look like:
+   (`P job start merge -- …`), never `gh pr merge` yourself. The block order is Rulings (when present), Areas, Hold, Head, 🔀; copy it from the dry run, never type the digest. Read the dry run whole: grep or a single-key `jq` drops the Rulings block. The closing lines look like:
    `Head <sha12> · items <digest> · repo <owner/name>`
    `🔀 Ready to merge #N — say "merge"`
