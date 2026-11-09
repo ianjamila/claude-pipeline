@@ -1,11 +1,12 @@
 // `pipeline repo-move` (commands/repo-move.mjs): the owner's record of a renamed / transferred repository. A fake gh, a temp home.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { run } from '../pipeline/commands/repo-move.mjs';
-import { main } from '../pipeline/bin/pipeline.mjs';
 import { readRepoMoves, REPO_MOVES_LOCK, repoMovesPath, sameRepo } from '../pipeline/hooks/lib/repo-moves.mjs';
 
 const FROM = 'ianjamila/eaglewatch';
@@ -47,7 +48,7 @@ test('repo-move: records a move GitHub confirms (name and id), atomically, 0600,
   const want = { from: FROM, to: TO, at: '2026-11-09T06:58:25.000Z', repoId: 77 };
   assert.deepEqual(r.output.move, want);
   assert.deepEqual(readRepoMoves({ home: r.h }).moves, [want]);
-  assert.equal(statSync(repoMovesPath(r.h)).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') assert.equal(statSync(repoMovesPath(r.h)).mode & 0o777, 0o600); // (Windows has no POSIX mode bits)
   assert.deepEqual(readdirSync(join(repoMovesPath(r.h), '..')), ['repo-moves.json'], 'no temp file left');
 });
 
@@ -174,10 +175,9 @@ test('repo-move: bad arguments are usage errors', async () => {
   }
 });
 
-test('repo-move is registered with the dispatcher (help lists it)', async () => {
-  const chunks = [];
-  const orig = process.stdout.write;
-  process.stdout.write = (s) => { chunks.push(String(s)); return true; };
-  try { await main(['--help']); } finally { process.stdout.write = orig; }
-  assert.ok(JSON.parse(chunks.join('')).commands.includes('repo-move'));
+test('repo-move is registered with the dispatcher (help lists it)', () => {
+  // the real CLI as a subprocess (as test/cli.test.mjs does): patching process.stdout.write in-process also captures the test runner's own messages on Node 20
+  const bin = join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'bin', 'pipeline.mjs');
+  const r = spawnSync(process.execPath, [bin, '--help'], { encoding: 'utf8' });
+  assert.ok(JSON.parse(r.stdout).commands.includes('repo-move'), r.stderr);
 });

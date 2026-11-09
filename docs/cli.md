@@ -402,13 +402,13 @@ record that a GitHub repository was renamed or transferred, so your earlier owne
 pipeline repo-move --list   -> {ok, file, moves, error}
 pipeline repo-move --from <owner/name> --to <owner/name> [--at <ISO time>]   -> {ok, added, move, moves, file}
   Records the move in ~/.claude/pipeline-state/owner-go/repo-moves.json (agents cannot write it). GitHub must confirm it: the old name has to
-  resolve to the new full name and to the same repository id. --at is when the move happened (default: now); only approvals, rulings and
-  grants made BEFORE it count for the new name, never the other way round. Adding the same move twice is a no-op; an invalid existing file
+  resolve to the new full name and to the same repository id. --at is when the move happened (default: now; at most 5 minutes ahead of now); only approvals, rulings and
+  grants made BEFORE it count for the new name, never the other way round. Adding the same move (same time) twice is a no-op, the same names at a later time are appended (a move back and forth); an invalid existing file
   is refused (fix or remove it).
   Refuses inside Claude Code (run it in your own terminal) unless --list is given or the owner launched Claude Code with the admin switch.
 ```
 
-Exit: 0 recorded / already recorded / listed · 1 GitHub does not confirm the move (the old name must resolve to the new full name and the same repository id), the existing file is invalid, or `--list` found an invalid file · 2 usage, or refused inside Claude Code · 3 GitHub unavailable (a name that does not resolve counts as unavailable).
+Exit: 0 recorded / already recorded / listed · 1 GitHub does not confirm the move (the old name must resolve to the new full name and the same repository id), the existing file is invalid, or `--list` found an invalid file · 2 usage (including an `--at` more than 5 minutes ahead of now), or refused inside Claude Code · 3 GitHub unavailable (a name that does not resolve counts as unavailable).
 
 Why: the owner-go records (your chat "merge", `⚖️` rulings, `extra round` grants and their consumed markers) store the repository name as it was shown, and every check compares it with the current `origin`. After a rename or transfer an old record would stop verifying. The move is kept in `repo-moves.json`, inside the owner-go records folder the guards protect (an agent cannot write it). A record that names the old name counts for the new one only when it was made BEFORE the move; a record naming the new name never counts for the old, and one made at the old name after the move is a different repository's. A missing or invalid file means no aliasing. The guard-status provenance check likewise accepts a run URL under a former name when `repos/<former>` and `repos/<current>` answer the same repository id.
 
