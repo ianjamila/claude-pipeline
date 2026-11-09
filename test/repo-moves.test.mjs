@@ -124,7 +124,7 @@ test('sameRepo: a chain of moves, each hop after the record; a late hop or a gap
   assert.equal(same(A, BEFORE, C, [mv(A, 'other/app', MOVED), mv(A, B, MOVED), mv(B, C, AFTER)]), true, 'a branch that goes nowhere does not hide the right one');
 });
 
-test('sameRepo: a cycle ends (never revisits a name) and a chain longer than the hop limit is refused', () => {
+test('sameRepo: a cycle ends (time only moves forwards) and a chain longer than the hop limit is refused', () => {
   const cycle = [mv(A, B, MOVED), mv(B, A, AFTER), mv(B, 'x/y', AFTER)];
   assert.equal(same(A, BEFORE, C, cycle), false);
   assert.equal(same(A, BEFORE, 'x/y', cycle), true);
@@ -171,6 +171,19 @@ test('sameRepo: a chain never walks backwards in time (each hop strictly later t
   assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', back), false, 'same id, but the second hop predates the first');
   const tie = [mv('org/a', 'org/b', '2026-11-09T10:00:00Z'), mv('org/b', 'org/c', '2026-11-09T10:00:00Z')];
   assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', tie), false, 'the same instant is not later');
+});
+
+test('sameRepo: a chain may return to an earlier name (a -> b -> a -> c is one repository)', () => {
+  // R3-B1: a documented return move. The approval for org/a was recorded before every move; it still counts for org/c.
+  const ret = [mv('org/a', 'org/b', '2026-11-09T10:00:00Z'), mv('org/b', 'org/a', '2026-11-09T11:00:00Z'), mv('org/a', 'org/c', '2026-11-09T12:00:00Z')];
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', ret), true);
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/b', ret), true);
+  assert.equal(same('org/b', '2026-11-09T09:00:00Z', 'org/c', ret), true);
+  // still one way and still bound to the repository: a record made after the return only sees the later hop
+  assert.equal(same('org/a', '2026-11-09T11:30:00Z', 'org/b', ret), false);
+  assert.equal(same('org/a', '2026-11-09T11:30:00Z', 'org/c', ret), true);
+  // a return move alone does not make an unrelated name an alias
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/z', ret), false);
 });
 
 test('sameRepo: an unparseable or missing recordedAt allows an exact match only', () => {
