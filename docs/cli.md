@@ -394,6 +394,24 @@ Exit: 0 dry run printed, or applied with nothing missing or unpinned · 1 no adm
 
 Every required check is pinned to the GitHub Actions app (`app_id: 15368`): only a status a workflow posted with `GITHUB_TOKEN` satisfies it, never one posted with a person's token (which agents share), so `Test integrity`, `Hard-stop scan` and `Cross-model review` cannot be posted from a terminal. A check another app posts (a deploy provider's `Vercel`, say) cannot be satisfied by GitHub Actions, so before building the payload `protect` reads the branch's current protection and keeps such a check on the app it is already pinned to (a positive app id other than Actions; `-1`/null "any app" is not kept); `--pin NAME=APP_ID` names the app for a first setup or overrides a kept pin. Both are printed on stderr and listed in `pins`. The three guard contexts are always pinned to Actions: `--pin` refuses them and a foreign pin on them is not kept. A dry run that cannot read the current protection still prints the commands without kept pins and says so; `--apply` stops instead (exit 3), since applying without the current pins would move a deploy provider's check onto Actions and block every PR (a branch with no protection yet, or a 403, reads as "nothing to keep"). The read-back after `--apply` lists checks GitHub reports without their pin in `unpinned` and fails. The default list is `requiredChecks` (`ci.required_checks`, the guard contexts unless `ci.guard_checks: false`, and `Cross-model review` with `ci.review_check: true`). The `commands` it prints begin with the ABSOLUTE path of the `gh` it found (PATH, then `/opt/homebrew/bin`, `/usr/local/bin`, ...), quoted for sh, because the owner pastes them into a shell whose PATH can lack `gh`; on Windows, or when no `gh` is found, they begin with a bare `gh`.
 
+## repo-move
+
+record that a GitHub repository was renamed or transferred, so your earlier owner approvals still count (run in your own terminal); --list shows the records.
+
+```
+pipeline repo-move --list   -> {ok, file, moves, error}
+pipeline repo-move --from <owner/name> --to <owner/name> [--at <ISO time>]   -> {ok, added, move, moves, file}
+  Records the move in ~/.claude/pipeline-state/owner-go/repo-moves.json (agents cannot write it). GitHub must confirm it: the old name has to
+  resolve to the new full name and to the same repository id. --at is when the move happened (default: now); only approvals, rulings and
+  grants made BEFORE it count for the new name, never the other way round. Adding the same move twice is a no-op; an invalid existing file
+  is refused (fix or remove it).
+  Refuses inside Claude Code (run it in your own terminal) unless --list is given or the owner launched Claude Code with the admin switch.
+```
+
+Exit: 0 recorded / already recorded / listed · 1 GitHub does not confirm the move (the old name must resolve to the new full name and the same repository id), the existing file is invalid, or `--list` found an invalid file · 2 usage, or refused inside Claude Code · 3 GitHub unavailable (a name that does not resolve counts as unavailable).
+
+Why: the owner-go records (your chat "merge", `⚖️` rulings, `extra round` grants and their consumed markers) store the repository name as it was shown, and every check compares it with the current `origin`. After a rename or transfer an old record would stop verifying. The move is kept in `repo-moves.json`, inside the owner-go records folder the guards protect (an agent cannot write it). A record that names the old name counts for the new one only when it was made BEFORE the move; a record naming the new name never counts for the old, and one made at the old name after the move is a different repository's. A missing or invalid file means no aliasing. The guard-status provenance check likewise accepts a run URL under a former name when `repos/<former>` and `repos/<current>` answer the same repository id.
+
 ## review-complete
 
 post the review-complete comment (and remove awaiting-review) once the review is valid for the current content.

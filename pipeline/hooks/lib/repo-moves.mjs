@@ -7,7 +7,7 @@
 // folder guard-files protects (agents cannot write it). sameRepo then lets a record naming the OLD name count for the NEW one:
 // one way only, and only for a record made BEFORE the move (a repository created later at the old name is a different repository).
 // Fail closed: a missing, unreadable or in any way invalid file means no aliasing at all.
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { accountHome } from '../../lib/paths.mjs';
 
@@ -104,4 +104,42 @@ export function sameRepo({ recorded, recordedAt, current, moves } = {}) {
     return later.some((m) => m.from === name && !seen.has(m.to) && (m.to === want || walk(m.to, new Set([...seen, m.to]))));
   };
   return walk(start, new Set([start]));
+}
+
+// The owner's writer (commands/repo-move.mjs). Appends `move` to the file, keeping every existing entry, with a temp file in the same
+// folder (0600) renamed over it. Refuses when the existing file is invalid (the owner fixes or removes it) or the folder is not a real
+// folder. A move with the same from and to already present is a no-op. Returns { ok: true, added, moves } or { ok: false, reason }.
+export function appendRepoMove(move, { home = accountHome() } = {}) {
+  const entry = validMove(move);
+  if (!entry) return { ok: false, reason: 'not a valid move (names owner/name, different from each other; a real time; a positive repository id)' };
+  const existing = readRepoMoves({ home });
+  if (existing.error) return { ok: false, reason: existing.error };
+  if (existing.moves.some((m) => m.from === entry.from && m.to === entry.to)) return { ok: true, added: false, moves: existing.moves };
+  let p = home;
+  for (const part of REPO_MOVES_DIR_REL.split('/')) {
+    p = path.join(p, part);
+    try {
+      if (!lstatSync(p).isDirectory()) return { ok: false, reason: `${p} is not a real folder` };
+    } catch (err) {
+      if (err?.code !== 'ENOENT') return { ok: false, reason: `${p} cannot be read (${err?.code ?? 'error'})` };
+      try { mkdirSync(p, { mode: 0o700 }); } catch (e) { return { ok: false, reason: `cannot create ${p} (${e?.code ?? 'error'})` }; }
+    }
+  }
+  const moves = [...existing.moves, entry];
+  const target = repoMovesPath(home);
+  const temp = path.join(path.dirname(target), `.${REPO_MOVES_FILE}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+    try {
+      writeSync(fd, `${JSON.stringify({ v: 1, moves }, null, 2)}\n`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temp, target);
+  } catch (err) {
+    try { unlinkSync(temp); } catch { /* not created, or already renamed */ }
+    return { ok: false, reason: `could not write ${target} (${err?.code ?? 'error'})` };
+  }
+  return { ok: true, added: true, moves };
 }
