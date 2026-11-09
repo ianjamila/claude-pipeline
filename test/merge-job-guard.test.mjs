@@ -832,3 +832,44 @@ test('R7-F1: the candidates of `$NAME` in an env wrapper word are the wrapper\'s
   assert.equal(r.get('GIT_WORK_TREE').unknown, true);
   assert.deepEqual(r.get('GIT_WORK_TREE').list, []);
 });
+
+// R7-F2 (command line): `--work-tree='$WT'` / `--git-dir=\$G` / `-c core.worktree='$WT'` reach git as the literal word, a relative path (r7Setup has
+// real links named `$WT` / `$G` in the unowned container, and `gd/$WT` for core.worktree, that lead to the job's checkout)
+const r7Cli = (at, vars = '') => [
+  `${vars}git --work-tree='$WT' VERB`,
+  `${vars}git --work-tree=\\$WT VERB`,
+  `${vars}git --work-tree "\\$WT" VERB`,
+  `${vars}git --work-tree '$WT' VERB`,
+  `${vars}git --git-dir='$G' VERB`,
+  `${vars}git --git-dir=\\$G VERB`,
+  `${vars}git --git-dir "\\$G" VERB`,
+  `${vars}git --git-dir=${at}/gd -c core.worktree='$WT' VERB`,
+  `${vars}git --git-dir=${at}/gd -c 'core.worktree=$WT' VERB`,
+  `${vars}git --git-dir=${at}/gd -c core.worktree=\\$WT VERB`,
+];
+
+test('R7-F2: command-line --work-tree / --git-dir / -c core.worktree values with a quoted $ are candidates too', () => {
+  const { container, job, at, elsewhere } = r7Setup();
+  mark(job, process.pid, 12);
+  for (const vars of ['', `WT=${elsewhere}; G=${elsewhere}/.git; `]) {
+    for (const verb of r7Verbs) for (const t of r7Cli(at, vars)) r7Denied(t.replace('VERB', verb.slice(4)), container);
+  }
+});
+
+test('R7-F2: the same command-line forms are allowed with no marker, a dead marker, when read-only, or when every candidate points elsewhere', () => {
+  const { container, job, at, elsewhere } = r7Setup();
+  const cmds = r7Cli(at, `WT=${elsewhere}; G=${elsewhere}/.git; `).map((t) => t.replace('VERB', 'reset --hard'));
+  for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `no marker: ${c}`);
+  mark(job, deadPid());
+  for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `dead marker: ${c}`);
+  mark(job, process.pid);
+  for (const t of r7Cli(at)) assert.equal(decide(t.replace('VERB', 'status'), container).decision, 'allow', `read-only: ${t}`);
+  // a container with a live job but no link: the literal word is a path nothing owns, the expansion is elsewhere
+  const { container: plain, job: plainJob } = containerWithJob();
+  mkdirSync(join(plain, 'gd'));
+  mark(plainJob, process.pid, 12);
+  for (const t of r7Cli(fwd(plain), `WT=${elsewhere}; G=${elsewhere}/.git; `)) assert.equal(decide(t.replace('VERB', 'reset --hard'), plain).decision, 'allow', `elsewhere: ${t}`);
+  // plain unquoted literals are what they were
+  assert.equal(decide(`git --work-tree=${fwd(job)} reset --hard`, container).decision, 'deny');
+  assert.equal(decide(`git --work-tree=${elsewhere} reset --hard`, container).decision, 'allow');
+});

@@ -549,9 +549,11 @@ const mayBeWorkTreeKey = (key) => DYNAMIC.test(key) || /^core\.worktree$/i.test(
 const CAND_CAP = 64;
 const CAND_WORK = 500;
 const LIT_DYNAMIC = /\$\(|`/;
+// (R7-F2: the command's text holds a quote or a backslash, so a `$` in a value may have reached git unexpanded; no text to tell by: as if it did)
+const rawQuoted = (raw) => typeof raw !== 'string' || raw === '' || /['\\]/.test(raw);
 export function resolvePrefixEnv(env, ctx, raw) { // (exported for the unit test of the candidate sets)
   const assigns = assignmentsOf(env);
-  const quoted = typeof raw !== 'string' || raw === '' || /['\\]/.test(raw); // (no text to tell by: as if quoted)
+  const quoted = rawQuoted(raw);
   const st = { work: 0 };
   const textCands = (text, at, depth) => {
     const out = { list: [], unknown: false };
@@ -687,6 +689,16 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   // (`git --git-dir=a.git -C c status` is `git --git-dir=c/a.git status`), wherever they sit among the options. So the values are
   // kept as written here and resolved once, against the final directory, after the loop.
   const gitDirRaws = [];
+  // R7-F2: a command-line value is the expansion (the line's variables) and, when the text holds a quote or backslash and the value a `$`, also the
+  // literal word (a relative path); the last option given is one group of them
+  let cliGroup = 0;
+  const quotedText = rawQuoted(raw);
+  const cliValue = (v) => {
+    const g = ++cliGroup;
+    const out = [{ v, lit: false, cli: true, g }];
+    if (typeof v === 'string' && DYNAMIC.test(v) && quotedText) out.push({ v, lit: true, cli: true, g });
+    return out;
+  };
   const workTreeRaws = [];
   for (const c of envGitDir.list) if (c.v !== '') gitDirRaws.push(c);
   const envWorkTree = envNamed('GIT_WORK_TREE');
@@ -706,12 +718,14 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
       const kv = argv[++i] ?? '';
       const eq = splitIndex(kv, '=');
       configs.push({ raw: kv, key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1), noValue: eq < 0 });
+      // R7-F2: `-c core.worktree='$WT'`: the literal word is a target beside the expansion
+      if (eq >= 0 && DYNAMIC.test(kv.slice(eq + 1)) && quotedText) wtConfigs.push({ key: configs[configs.length - 1].key, value: kv.slice(eq + 1), noValue: false, lit: true });
       continue;
     }
-    if (t.startsWith('--git-dir=')) { gitDirRaws.push({ v: t.slice('--git-dir='.length), lit: false, cli: true }); gitDirUnknown = false; continue; }
-    if (t === '--git-dir') { gitDirRaws.push({ v: argv[++i], lit: false, cli: true }); gitDirUnknown = false; continue; }
-    if (t.startsWith('--work-tree=')) { workTreeRaws.push({ v: t.slice('--work-tree='.length), lit: false, cli: true }); continue; }
-    if (t === '--work-tree') { workTreeRaws.push({ v: argv[++i], lit: false, cli: true }); continue; }
+    if (t.startsWith('--git-dir=')) { gitDirRaws.push(...cliValue(t.slice('--git-dir='.length))); gitDirUnknown = false; continue; }
+    if (t === '--git-dir') { gitDirRaws.push(...cliValue(argv[++i])); gitDirUnknown = false; continue; }
+    if (t.startsWith('--work-tree=')) { workTreeRaws.push(...cliValue(t.slice('--work-tree='.length))); continue; }
+    if (t === '--work-tree') { workTreeRaws.push(...cliValue(argv[++i])); continue; }
     // R4-F1: `--config-env=core.worktree=NAME` sets core.worktree from an environment variable: unknown, and (R5-B1) the value NAME holds
     // here is a target; a key that may be core.worktree at run time (R5-F1) counts the same
     if (t.startsWith('--config-env=') || t === '--config-env') {
@@ -727,7 +741,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   const resolveOne = (r) => (r.lit ? litJoin(d, r.v) : joinDir(d, r.v, ctx));
   if ([...gitDirRaws, ...workTreeRaws].some((r) => resolveOne(r) === null)) targetUnknown = true;
   // (an option given on the command line is the one git uses, the last of them; else every candidate the environment gave: R7)
-  const chosen = (raws) => { const cli = raws.filter((r) => r.cli); return (cli.length ? cli.slice(-1) : raws).map(resolveOne); };
+  const chosen = (raws) => { const cli = raws.filter((r) => r.cli); return (cli.length ? cli.filter((r) => r.g === cli[cli.length - 1].g) : raws).map(resolveOne); };
   const gitDirs = chosen(gitDirRaws);
   const workTrees = chosen(workTreeRaws);
   const gitDirAll = [...new Set(gitDirs.filter((x) => x !== null))];
