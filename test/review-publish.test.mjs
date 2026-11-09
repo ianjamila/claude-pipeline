@@ -354,7 +354,7 @@ test('state show: an implementation mark or a follow-up issue link added after t
     assertExit(r, 0, name + r.stdout + r.stderr);
     assert.equal(r.json.source, 'local-ahead', name);
     assert.equal(r.json.quarantinedTo, undefined, name);
-    assert.match(r.json.warnings.join(' '), /implementation marks|follow-up issue/, name);
+    assert.match(r.json.warnings.join(' '), name === 'implemented' ? /implementation mark/ : /follow-up issue link/, name);
     assert.deepEqual(w.state(w.A), JSON.parse(JSON.stringify(ahead)), `${name}: the local marks are untouched`);
     assert.equal(readdirSync(join(w.A, '.review')).filter((n) => n.startsWith('stale-')).length, 0, `${name}: nothing was quarantined`);
     assertExit(w.comment(w.A), 0, name);
@@ -376,6 +376,38 @@ test('state show: an implementation mark or a follow-up issue link added after t
   assertExit(w.comment(w.A), 0);
   saveState(w.A, change(s1, 'R1-S1', { followupIssue: 'https://github.com/o/r/issues/10' }));
   assert.equal(w.show(w.A).json.source, 'quarantined');
+});
+
+test('state show (R1-B1): local-ahead needs every published round and item to survive; a removed item or round, or a mark plus an unrelated change, is quarantined', (t) => {
+  const two = () => mk([it('R1-B1'), it('R1-B2')]);
+  const drop = (state, id) => ({ ...state, rounds: state.rounds.map((r) => ({ ...r, items: r.items.filter((i) => i.id !== id) })) });
+  const quarantined = (name, s0, local) => {
+    const w = world(t);
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0);
+    saveState(w.A, local);
+    const r = w.show(w.A);
+    assertExit(r, 0, name + r.stdout + r.stderr);
+    assert.equal(r.json.source, 'quarantined', name);
+    assert.ok(r.json.quarantinedTo.startsWith('.review/stale-'), name);
+    assert.equal(reviewContentHash(w.state(w.A)), reviewContentHash(s0), `${name}: the published state is restored, R1-B2 and round 2 included`);
+  };
+  // a mark on R1-B1 while R1-B2 was removed: publishing it would drop R1-B2 from the PR
+  const s0 = two();
+  quarantined('removed item', s0, drop(change(s0, 'R1-B1', { implemented: true }), 'R1-B2'));
+  // a published round gone locally
+  const withRound2 = addRound(two(), { n: 2, fromHead: 'b'.repeat(40), toHead: 'd'.repeat(40), contentHashAtToHead: H('e'), items: [it('R2-B1')] });
+  quarantined('removed round', withRound2, change({ ...withRound2, rounds: withRound2.rounds.slice(0, 1) }, 'R1-B1', { implemented: true }));
+  // an implementation mark together with an unrelated changed decision on the same item
+  quarantined('mark plus changed decision', s0, change(s0, 'R1-B1', { implemented: true, final: decided({ reason: 'rewritten' }) }));
+  // a mark on one item and an unrelated changed decision on another
+  quarantined('mark plus changed other item', s0, change(change(s0, 'R1-B1', { implemented: true }), 'R1-B2', { final: decided({ reason: 'rewritten' }) }));
+  // control: the same mark with every published item kept (and an unpublished trailing round) is still local-ahead
+  const w = world(t);
+  saveState(w.A, s0);
+  assertExit(w.comment(w.A), 0);
+  saveState(w.A, addRound(change(s0, 'R1-B1', { implemented: true }), { n: 2, fromHead: 'b'.repeat(40), toHead: 'd'.repeat(40), contentHashAtToHead: H('e'), items: [it('R2-B1')] }));
+  assert.equal(w.show(w.A).json.source, 'local-ahead');
 });
 
 test('state show: a truly superseded copy is still quarantined (other published state or no baseline); an owner ruling over a waiting item is local-ahead', (t) => {

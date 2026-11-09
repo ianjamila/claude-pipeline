@@ -13,7 +13,7 @@ import { loadState, saveState, updateItems } from '../lib/state.mjs';
 import { isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
 import { readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
-  allItems, canonicalJson, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
+  allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
   roundDir, stateExtends, withStateLock,
 } from '../lib/review-context.mjs';
 
@@ -25,8 +25,8 @@ export const meta = {
     '  with --pr and a local state: the published (triage comment) state is authoritative. Local is kept (source local) when it',
     '  equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,',
     '  quarantinedTo) and the published state is restored. source is local | published | quarantined | local-ahead | local-unverified',
-    '  (local-ahead: the PR still holds what this copy last published, and the local copy holds a second-review verdict or a Claude / forced final that was',
-    '  never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final): kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline',
+    '  (local-ahead: the PR still holds what this copy last published, every published round and item is still in the local copy, and the local copy holds a second-review verdict or a Claude / forced final that was',
+    '  never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final), or an implementation mark or a follow-up issue link added after the last publish: kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline',
     '  (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)',
     '  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)',
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
@@ -93,16 +93,38 @@ const continuesPublished = (mine, theirs) => {
 };
 const isObjectLike = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
+// One item of the local copy against the published one: a permitted "ahead" change. A second-review verdict, a Claude / forced final, or a continuing decision
+// may sit next to other differences (they are the saved work); a mark added where the published item had none (`state mark-implemented`, `followups create`)
+// counts only when the item is otherwise unchanged, so a mark never carries an unrelated edit with it. A changed or removed mark is not ahead.
+const itemKey = (i) => decidedItemsKey({ items: [i] });
+function itemIsAhead(i, before) {
+  if ((i.secondReview !== undefined && before.secondReview === undefined) || (isProtectedFinal(i) && !isProtectedFinal(before)) || continuesPublished(i, before)) return true;
+  const addImplemented = Boolean(i.implemented) && before.implemented === undefined;
+  const addFollowup = Boolean(i.followupIssue) && before.followupIssue === undefined;
+  if (!addImplemented && !addFollowup) return false;
+  return itemKey({ ...i, ...(addImplemented ? { implemented: undefined } : {}), ...(addFollowup ? { followupIssue: undefined } : {}) }) === itemKey(before);
+}
+
+// Kept as local-ahead only when the local copy still holds EVERYTHING the PR holds (every published round with the same n, toHead and contentHashAtToHead, and
+// every published item of it), each item either unchanged or ahead by a permitted change, and at least one is ahead: the next publication replaces the PR's
+// state with this copy, so a copy that lost a published item or round would drop it from the PR. Extra local rounds and items (an unpublished trailing round) are fine.
 function localAheadOfPublished(local, published, baseline) {
   if (baseline === null || published.hash !== baseline) return false;
-  const theirs = new Map((published.state.rounds ?? []).flatMap((r) => r.items ?? []).map((i) => [i.id, i]));
-  return (local.rounds ?? []).flatMap((r) => r.items ?? []).some((i) => {
-    const before = theirs.get(i.id);
-    return before !== undefined && ((i.secondReview !== undefined && before.secondReview === undefined) || (isProtectedFinal(i) && !isProtectedFinal(before))
-      || continuesPublished(i, before)
-      // a mark added after the last publish (`state mark-implemented`, `followups create`) where the published item had none; a changed or removed value is not ahead
-      || (Boolean(i.implemented) && before.implemented === undefined) || (Boolean(i.followupIssue) && before.followupIssue === undefined));
-  });
+  const mine = new Map((local.rounds ?? []).map((r) => [r.n, r]));
+  let ahead = false;
+  for (const p of published.state.rounds ?? []) {
+    const r = mine.get(p.n);
+    if (r === undefined || r.toHead !== p.toHead || r.contentHashAtToHead !== p.contentHashAtToHead) return false;
+    const have = new Map((r.items ?? []).map((i) => [i.id, i]));
+    for (const before of p.items ?? []) {
+      const i = have.get(before.id);
+      if (i === undefined) return false;
+      if (itemKey(i) === itemKey(before)) continue;
+      if (!itemIsAhead(i, before)) return false;
+      ahead = true;
+    }
+  }
+  return ahead;
 }
 
 async function show(rest, ctx) {

@@ -526,8 +526,8 @@ pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr 
   with --pr and a local state: the published (triage comment) state is authoritative. Local is kept (source local) when it
   equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,
   quarantinedTo) and the published state is restored. source is local | published | quarantined | local-ahead | local-unverified
-  (local-ahead: the PR still holds what this copy last published, and the local copy holds a second-review verdict or a Claude / forced final that was
-  never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final): kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline
+  (local-ahead: the PR still holds what this copy last published, every published round and item is still in the local copy, and the local copy holds a second-review verdict or a Claude / forced final that was
+  never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final), or an implementation mark or a follow-up issue link added after the last publish: kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline
   (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)
   (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)
 pipeline state discard-round --round R [--pr N] [--repo DIR]
