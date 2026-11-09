@@ -1,0 +1,256 @@
+// `P merge` in queue mode (GitHub requires a merge queue on the base): the pipeline enqueues the approved head instead of merging it,
+// watches the entry with today's stop conditions, and re-queues the SAME head once after a group-check failure. Both merge routes
+// (gated and --owner-go) do their own gating and then hand over to this engine; they never branch on queue state anywhere else.
+//   precheck()         reads GitHub first (never enqueues twice, reports a merge that already happened) -> { done } | { watch } | { enqueue }
+//   enqueueAndWatch()  begin attempt, enqueue, confirm, watch, re-queue once -> { exitCode, output }
+// Nothing here ever disables auto-merge or dequeues for a time-out: `still-queued` leaves the entry exactly as it is.
+import { EXIT } from './cli.mjs';
+import { DEFAULTS, fill } from './config.mjs';
+import { waitBlockers } from './finalgate.mjs';
+import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
+import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, watchQueue } from './merge-queue.mjs';
+import { envWithGhDir, runShellAsync } from './proc.mjs';
+import { approvalGap } from '../hooks/lib/owner-go.mjs';
+
+const CONFIRM_MS = 60_000; // GitHub shows the entry within this long of an accepted enqueue, or the enqueue failed
+const OUTPUT_LINES = 20;
+
+// Test switches (they can only shorten a wait, like PIPELINE_MERGE_WAIT_MS): PIPELINE_QUEUE_POLL_MS (watch poll; production 90 s, the shared
+// GitHub API budget), PIPELINE_QUEUE_CONFIRM_MS / PIPELINE_QUEUE_CONFIRM_POLL_MS, PIPELINE_QUEUE_WAIT_MS (the watch budget).
+export function queueTiming(env = {}) {
+  const num = (key, min) => {
+    const n = Number(env[key]);
+    return env[key] !== undefined && env[key] !== '' && Number.isInteger(n) && n >= min ? n : null;
+  };
+  return {
+    pollMs: num('PIPELINE_QUEUE_POLL_MS', 1) ?? 90_000,
+    confirmMs: Math.min(num('PIPELINE_QUEUE_CONFIRM_MS', 0) ?? CONFIRM_MS, CONFIRM_MS),
+    confirmPollMs: num('PIPELINE_QUEUE_CONFIRM_POLL_MS', 1) ?? 5000,
+    waitCapMs: num('PIPELINE_QUEUE_WAIT_MS', 0),
+  };
+}
+
+// The built-in merge command fails on a queue branch (gh refuses --delete-branch there, Phase 0 D1), so only THAT exact text is replaced
+// by the pinned enqueue; a repo's own command is run as written and must enqueue itself.
+export const isDefaultMergeCommand = (config) => config?.merge?.command === DEFAULTS.merge.command;
+
+// approvalGap, counting only a "merge" the owner recorded AFTER `since` (epoch ms): the same head is re-queued after its record ended
+// only on a fresh word (Fable F10). Uses readRecords' maxAgeMs, so the owner-go library itself is not touched.
+export function approvalGapSince(q, since, gap = approvalGap) {
+  if (since === undefined) return gap(q);
+  const age = Date.now() - since - 1;
+  if (age <= 0) return 'none';
+  return gap({ ...q, maxAgeMs: age });
+}
+
+const lastLines = (text, n = OUTPUT_LINES) => String(text ?? '').split('\n').map((l) => l.trimEnd()).filter(Boolean).slice(-n);
+const firstLine = (err) => String(err?.message ?? err).split('\n')[0];
+
+// What failed on the queue commit a removal ended: failed check runs and failed commit statuses (a status context counts once, newest first).
+export function failingChecksOn(gh, sha) {
+  if (typeof sha !== 'string' || sha === '') return [];
+  const out = [];
+  try {
+    for (const c of gh.checkRunsOf(sha)) {
+      if (['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(c?.conclusion)) out.push(`${c.name}: ${c.conclusion}`);
+    }
+    const seen = new Set();
+    for (const s of gh.statusesOf(sha)) {
+      if (seen.has(s?.context)) continue;
+      seen.add(s?.context);
+      if (['failure', 'error'].includes(s?.state)) out.push(`${s.context}: ${s.state}`);
+    }
+  } catch (err) {
+    out.push(`could not read the checks of ${sha.slice(0, 12)} (${firstLine(err)})`);
+  }
+  return [...new Set(out)];
+}
+
+// Everything the engine needs from the route that calls it:
+//   gh, root, config, pr, head (the approved full sha), env, refuse (merge.mjs's), track (the merge lock's child tracker),
+//   approval { items, areas, rulings } (stored on the record), extra (fields every output carries: mode, head, ...),
+//   recheck(): the route's live checks + owner approval + blockers for the SAME head, run before a re-queue -> { ok: true } | { ok: false, error, reasons },
+//   onBeforeAttempt({ rec }) / onTerminal({ kind, rec }): the two SEAMS for the needs-human hold (both no-ops here; see below).
+export function createQueueRoute({
+  gh, root, config, pr, head, env = process.env, refuse, track = { started() {}, ended() {} }, approval, extra = {}, recheck,
+  onBeforeAttempt = async () => {}, onTerminal = async () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = () => {},
+}) {
+  const timing = queueTiming(env);
+  const repo = gh.repo().slug;
+  const repoId = typeof gh.repoId === 'function' ? gh.repoId() : null;
+  const opts = { repo, repoId, now };
+  let requeued = 0;
+  let rules = null;
+  try {
+    rules = queueRulesOf(gh.branchRules(config.default_branch));
+  } catch { /* unreadable: queueWaitMs falls back to its default */ }
+  const budgetMs = Math.min(queueWaitMs(rules), timing.waitCapMs ?? Infinity);
+
+  const fields = (over = {}) => ({ queue: true, ...extra, requeued, ...over });
+  const refusal = (error, reasons, over = {}) => refuse(error, reasons, fields({ queued: false, ...over }));
+  const unreadable = (what, err) => refusal('queue-unreadable', [`${what}: ${firstLine(err)}`], { queued: null });
+  const mergedOut = (mergeSha, over = {}) => ({
+    exitCode: EXIT.OK,
+    output: mergeSha
+      ? { ok: true, merged: true, ...fields({ queued: true, mergeSha }), ...over }
+      : { ok: true, merged: true, ...fields({ queued: true, mergeSha: null }), warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading', ...over },
+  });
+  const liveRecord = () => {
+    const rec = readQueueRecord(root, pr);
+    return rec !== null && rec.terminal === null ? rec : null;
+  };
+  // An unmerged end: the hold seam first (it may restore a lifted label and end the record itself), then the record is ended if it still is open.
+  const terminal = async (kind) => {
+    await onTerminal({ kind, rec: readQueueRecord(root, pr) });
+    if (liveRecord() !== null) endRecord(root, pr, kind, { now });
+  };
+
+  const removedRefusal = async (removal, why) => {
+    const failing = failingChecksOn(gh, removal?.beforeCommit);
+    await terminal('removed');
+    const reason = removal?.reason ?? 'unknown';
+    return refusal('queue-removed', [`PR #${pr} was removed from the merge queue (reason ${reason})${requeued > 0 ? ' after one automatic re-queue' : ''}${failing.length > 0 ? `; failing: ${failing.join(', ')}` : ''}${why ? `; ${why}` : ''}`], {
+      removal: { reason: removal?.reason ?? null, beforeCommit: removal?.beforeCommit ?? null, actor: removal?.actor ?? null, at: removal?.at ?? null, failing },
+    });
+  };
+  const unmergedEnd = async (kind) => {
+    await terminal(kind);
+    return refusal(kind, [kind === 'closed' ? `PR #${pr} was closed without merging` : `PR #${pr}'s head moved off the approved ${head.slice(0, 12)}: nothing was queued or merged for it`], { queued: false });
+  };
+
+  // ---- 1. GitHub first ----------------------------------------------------------------------------------------------------------
+  async function precheck() {
+    let rec;
+    let r;
+    try {
+      rec = readQueueRecord(root, pr);
+      r = await reconcile({ gh, root, pr, head, sleep, pollMs: Math.min(timing.pollMs, 2000), log });
+    } catch (err) {
+      return { done: unreadable(err instanceof QueueRecordUnreadable ? 'the merge-queue record could not be read' : `could not read the merge queue state of PR #${pr}`, err) };
+    }
+    if (r.kind === 'merged') {
+      if (rec !== null && rec.terminal === null) endRecord(root, pr, 'merged', { now });
+      return { done: mergedOut(r.mergeSha, { note: 'already merged through the queue' }) };
+    }
+    if (r.kind === 'closed' || r.kind === 'head-moved') return { done: await unmergedEnd(r.kind) };
+    if (r.kind === 'queued') return { watch: true };
+
+    // removed | not-queued. A record that already ended for this very head needs a fresh owner "merge" (checked by the route with `since`).
+    if (rec !== null && rec.terminal !== null && rec.terminal !== 'merged' && rec.head === head) {
+      const since = Date.parse(rec.terminalAt);
+      const last = rec.removals[rec.removals.length - 1] ?? null;
+      return {
+        enqueue: true,
+        since: Number.isFinite(since) ? since : Infinity,
+        staleTerminal: () => refusal('queue-removed', [`PR #${pr} at ${head.slice(0, 12)} already left the merge queue (${last?.reason ?? rec.terminal}) and its queue record ended: the owner must say "merge" again for this exact head (a fresh word re-queues it with a new one-retry budget)`], {
+          removal: last, recordTerminal: rec.terminal,
+        }),
+      };
+    }
+    if (r.kind === 'removed' && rec !== null && rec.head === head) {
+      noteRemoval(root, pr, r.removal);
+      if (!mayRequeue(readQueueRecord(root, pr), head, r.removal.reason)) return { done: await removedRefusal(r.removal) };
+      return { enqueue: true, requeue: true };
+    }
+    return { enqueue: true, requeue: rec !== null && rec.head === head && rec.removals.length > 0 };
+  }
+
+  // ---- 2. enqueue --------------------------------------------------------------------------------------------------------------
+  async function sendEnqueue() {
+    if (isDefaultMergeCommand(config)) {
+      try {
+        gh.enqueue(pr, head);
+        return { ok: true, lines: [] };
+      } catch (err) {
+        return { ok: false, lines: lastLines(err?.message ?? err) };
+      }
+    }
+    const command = fill(config.merge.command, { pr: String(pr), sha: head }, { strict: true });
+    const ran = await runShellAsync(command, { cwd: root, env: envWithGhDir(env), timeoutMs: (config.merge.wait_minutes + 5) * 60_000, onStart: track.started });
+    track.ended();
+    return { ok: ran.code === 0, ran, lines: lastLines(commandTail(ran)) };
+  }
+
+  // Did GitHub take it? A good exit gets the full window; a failed one a single look (the command may have queued it before it failed).
+  async function confirm(sent) {
+    const deadline = now() + (sent.ok ? timing.confirmMs : 0);
+    let readError = null;
+    for (;;) {
+      try {
+        const r = await reconcile({ gh, root, pr, head, sleep, pollMs: Math.min(timing.pollMs, 2000), log });
+        readError = null;
+        if (r.kind === 'queued') {
+          confirmAttempt(root, pr, r.entry.id);
+          return { ok: true };
+        }
+        if (r.kind === 'merged') {
+          if (liveRecord() !== null) endRecord(root, pr, 'merged', { now });
+          return { done: mergedOut(r.mergeSha, sent.ran ? classifyMergeCommand(sent.ran) : {}) };
+        }
+        if (r.kind === 'closed' || r.kind === 'head-moved') return { done: await unmergedEnd(r.kind) };
+        if (r.kind === 'removed') return { ok: true }; // queued and already out again: the watch reads that removal
+      } catch (err) {
+        readError = err;
+      }
+      const left = deadline - now();
+      if (left <= 0) break;
+      await sleep(Math.min(timing.confirmPollMs, left));
+    }
+    if (readError !== null) return { done: unreadable(`could not confirm the enqueue of PR #${pr} (it may have landed: run P merge again, it reconciles first)`, readError) };
+    const ranNote = sent.ran ? ` (the merge command exited ${sent.ran.code}${sent.ran.timedOut ? ', timed out' : ''})` : '';
+    return { done: refusal('enqueue-failed', [`GitHub's merge queue does not show PR #${pr} at ${head.slice(0, 12)} after the enqueue${ranNote}`], { enqueueOutput: sent.lines, ...(sent.ran ? { commandExitCode: sent.ran.code } : {}) }) };
+  }
+
+  // ---- 3. the whole route after the gating -----------------------------------------------------------------------------------------
+  // { watchOnly } (an entry already exists): never begins an attempt. { requeue } (a removal is already on the record) starts at the re-queue.
+  async function enqueueAndWatch({ watchOnly = false, requeue = false } = {}) {
+    if (requeue) requeued = 1;
+    let enqueueNow = !watchOnly;
+    try {
+      for (;;) {
+        if (enqueueNow) {
+          openRecord(root, pr, head, approval, opts);
+          // SEAM (hold): the record exists, no attempt yet. This is where a lifted needs-human hold is written to it (setHold, owner 'session'),
+          // so a signal or a crash between the lift and the enqueue is still known to the record.
+          await onBeforeAttempt({ rec: readQueueRecord(root, pr) });
+          beginAttempt(root, pr, head, approval, opts);
+          const confirmed = await confirm(await sendEnqueue());
+          if (confirmed.done) return confirmed.done;
+        }
+        enqueueNow = true;
+        const w = await watchQueue({ gh, root, pr, head, budgetMs, pollMs: timing.pollMs, blockers: waitBlockers(gh, { base: null }), now, sleep, log });
+        switch (w.state) {
+          case 'merged': return mergedOut(w.mergeSha, w.warning ? { warning: w.warning } : {});
+          case 'still-queued':
+            // Not a failure and never a stop: the entry stays queued, so no dequeue, no disable-auto, no hold restore (a later P merge reconciles).
+            return { exitCode: EXIT.OK, output: { ok: true, merged: false, ...fields({ queued: true, stillQueued: true, ...(w.position === null || w.position === undefined ? {} : { position: w.position }) }) } };
+          case 'blocked':
+            await terminal('blocked');
+            return refuse('blocked', w.problems ?? [], fields({ queued: w.dequeued === false, dequeued: w.dequeued === true }));
+          case 'closed': return await unmergedEnd('closed');
+          case 'head-moved': return await unmergedEnd('head-moved');
+          case 'removed': {
+            // (watchQueue already noted the removal on the record)
+            const rec = readQueueRecord(root, pr);
+            if (requeued === 0 && mayRequeue(rec, head, w.removal.reason)) {
+              const again = await recheck();
+              if (!again.ok) {
+                const removed = await removedRefusal(w.removal, `not re-queued: ${again.reasons.join('; ')}`);
+                return again.error === 'blocked' ? refuse('blocked', again.reasons, fields({ queued: false, removal: removed.output.removal })) : removed;
+              }
+              requeued = 1;
+              continue;
+            }
+            return await removedRefusal(w.removal);
+          }
+          default: return refusal('queue-unreadable', [`unexpected queue watch result ${JSON.stringify(w.state)}`], { queued: null });
+        }
+      }
+    } catch (err) {
+      if (err instanceof QueueRecordUnreadable) return unreadable('the merge-queue record could not be used', err);
+      throw err;
+    }
+  }
+
+  return { precheck, enqueueAndWatch, budgetMs, budgetMinutes: Math.ceil(budgetMs / 60_000) };
+}

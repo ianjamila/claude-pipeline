@@ -87,6 +87,7 @@ export function classifyApiError({ stdout = '', stderr = '' } = {}) {
 
 export function createGitHub({ cwd, env, ghFn = gh } = {}) {
   let repoCache = null;
+  let repoIdCache; // undefined = not read yet
   let viewerCache = null;
 
   const exec = (args, { input } = {}) => ghFn(args, { cwd, env, input, timeoutMs: CALL_TIMEOUT_MS });
@@ -344,6 +345,19 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     statusesOf: (head) => pagedList(`repos/${self.repo().slug}/commits/${encodeURIComponent(head)}/statuses?per_page=100`),
     // Rules that apply to a branch from repository rulesets; an empty list means none.
     branchRules: (branch) => pagedList(`repos/${self.repo().slug}/rules/branches/${encodePath(branch)}?per_page=100`),
+    // The numeric id of this repository (a rename or transfer keeps it; the queue record binds to it). Read once; null when GitHub does not
+    // answer a positive integer: callers then fall back to the repository name (recordIsFor).
+    repoId() {
+      if (repoIdCache !== undefined) return repoIdCache;
+      let id = null;
+      try {
+        const text = String(self.apiText(`repos/${self.repo().slug}`, '.id')).trim();
+        if (/^[1-9][0-9]{0,15}$/.test(text)) id = Number(text);
+      } catch { /* unreadable: null */ }
+      repoIdCache = id;
+      return id;
+    },
+
     // ---- merge queue (GraphQL only: REST has no queue reads). Replies are checked field by field and anything off throws
     // GhError: an unreadable queue is never read as "no queue" (the callers fail closed).
     // The GraphQL node id of a PR (enqueue / dequeue name the PR by it).

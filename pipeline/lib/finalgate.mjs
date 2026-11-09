@@ -1124,7 +1124,10 @@ export function ownerGoBaseProblem(live) {
 // must not run (empty = go). An unreadable PR is a reason.
 // `base` (--owner-go): the base commit the scan was of; GitHub's baseRefOid must still be it.
 // `exemptHold` (--owner-go, only the look BEFORE the hold is lifted): needs-human is not counted. Once it is lifted the plain rule applies, and so does the wait.
-export async function preMergeProblems({ gh, pr, head, base = null, exemptHold = false }) {
+// `queueMode` (merge queue): GitHub tests the PR on top of the current base itself, so the base moving is no problem and `base` is ignored;
+// the head moving still refuses.
+export async function preMergeProblems({ gh, pr, head, base: scanBase = null, exemptHold = false, queueMode = false }) {
+  const base = queueMode ? null : scanBase;
   let view;
   try {
     view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft', ...(base !== null ? ['baseRefOid'] : []), 'body']);
