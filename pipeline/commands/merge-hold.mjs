@@ -11,7 +11,7 @@ const REASON_CODES = Object.keys(RELEASE_REASONS);
 
 export const meta = {
   summary: 'take, check or release the repo\'s cooperative merge hold for this PR (repos with merge.hold_* keys; otherwise a no-op)',
-  usage: `pipeline merge-hold --pr N [--repo DIR]   -> {ok, configured, confirmed, code, lines} : take (or keep) PR N\'s own hold with merge.hold_command; exit 0 confirmed, 1 refused or NOT confirmed, 2 the command errored (any other exit code or a timeout); a repo without the keys: exit 0 {ok:true, configured:false}
+  usage: `pipeline merge-hold --pr N [--repo DIR]   -> {ok, configured, confirmed, code, lines} : take (or keep) PR N\'s own hold with merge.hold_command; exit 0 confirmed, 1 refused or NOT confirmed, 2 the command errored (any other exit code, a timeout, or a command that could not be started: \`code:null, notStarted:true\`); a repo without the keys: exit 0 {ok:true, configured:false}
 pipeline merge-hold --pr N --check [--repo DIR]   -> {ok, configured, readable, blockedBy:[PR numbers], holds, error?, verdict?, doNotUpdate?, reason?} : READ-ONLY, runs merge.hold_check_command; exit 0 nothing ahead of this PR, 1 error queued-behind (another PR\'s active hold is ahead: do NOT update the branch) or hold-unreadable
 pipeline merge-hold --pr N --check --wait [--max-minutes M=120] [--repo DIR]   -> {ok, configured, outcome: front|timeout|unreadable, polls, waitedMinutes, blockedBy, holds?, reason?} : polls the READ-ONLY check at once and then every 5 minutes (fixed: the repo\'s check costs ~15 API calls and the budget is shared) until nothing is ahead of this PR; M is an integer 5..240 and bounds when a poll may START (a running check keeps its own 5 min timeout); exit 0 front (retry the update now), 1 timeout (still queued behind blockedBy) or unreadable (two unreadable answers in a row); a repo without the keys: exit 0 {ok:true, configured:false}. Run it as \`pipeline job start turn -- pipeline merge-hold --pr N --check --wait\` (it runs longer than a tool call may)
 pipeline merge-hold --pr N --release --reason <${REASON_CODES.join('|')}> [--repo DIR]   -> {ok, configured, confirmed, code, lines, warnings?} : release PR N\'s own hold with merge.hold_release_command (the code maps to a fixed sentence; no free text reaches the shell); same exit codes as take. Exception: --reason new-commits on a PR head that THIS repo\'s \`pipeline update-branch\` / \`pipeline merge\` produced (a recorded successor whose parents GitHub still shows as exactly [the head it was made from, the base tip of that update]) runs nothing and keeps the hold: exit 0 {ok:true, configured:true, kept:true, why:'own-successor', head}; a PR-side push, an unrecorded head or a head that cannot be read releases as usual (the unreadable case with a warning). Codes added for the automatic cases: ci-failed (the required checks failed), update-conflict (the catch-up conflicts), queued-behind (an older hold is ahead and the wait ended), hold-unreadable (the check could not be read)
@@ -35,7 +35,8 @@ export const run = guarded(async (argv, ctx) => {
   const maxMinutes = intOption(values, 'max-minutes', { min: 5, max: 240 }) ?? 120;
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
-  const args = { config, pr, root, env: ctx.env };
+  // `ctx.runHold`: a test seam for the shell that runs the hold commands (default: runShellAsync).
+  const args = { config, pr, root, env: ctx.env, run: ctx.runHold };
 
   if (check && wait) {
     if (!holdsConfigured(config)) return { exitCode: EXIT.OK, output: { ok: true, configured: false } };
@@ -81,8 +82,8 @@ export const run = guarded(async (argv, ctx) => {
 
   const result = release ? await releaseHold({ ...args, reason: values.reason }) : await takeHold(args);
   if (!result.configured) return { exitCode: EXIT.OK, output: { ok: true, configured: false } };
-  // 0 = confirmed, 1 = refused / NOT confirmed (the provider said no), anything else = the command itself went wrong (a timeout, or a kill: runShellAsync
-  // reports a signalled child as code 1 plus `signal`). runShellAsync has no output cap (no maxBuffer), so overBuffer cannot occur here.
-  const exitCode = result.confirmed ? EXIT.OK : (result.code === 1 && result.timedOut !== true && !result.signal ? EXIT.FAILED : EXIT.USAGE);
+  // 0 = confirmed, 1 = refused / NOT confirmed (the provider said no), anything else = the command itself went wrong (a timeout, a command that could not be
+  // started (`notStarted`), or a kill: runShellAsync reports a signalled child as code 1 plus `signal`). runShellAsync has no output cap (no maxBuffer), so overBuffer cannot occur here.
+  const exitCode = result.confirmed ? EXIT.OK : (result.code === 1 && result.timedOut !== true && !result.signal && result.notStarted !== true ? EXIT.FAILED : EXIT.USAGE);
   return { exitCode, output: { ok: result.confirmed, ...result, ...(warnings.length > 0 ? { warnings } : {}) } };
 });

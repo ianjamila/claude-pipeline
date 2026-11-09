@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { DEFAULTS, loadConfig, validateConfig } from '../pipeline/lib/config.mjs';
 import {
   HOLD_POLL_MS, HOLD_QUEUED_BEHIND, HOLD_TIMEOUT_MS, RELEASE_REASONS, checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, ownSuccessor, queuedBehindFrom, queuedBehindRefusal, quoteReason,
-  readSuccessor, recordSuccessor, releaseHold, successorDir, takeHold, waitForTurn,
+  readSuccessor, recordSuccessor, releaseHold, successorDir, takeHold, unreleasedWarning, waitForTurn,
 } from '../pipeline/lib/merge-hold.mjs';
 import { quarantineReviewDir } from '../pipeline/lib/review-context.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -490,6 +490,8 @@ test('holdBeforeUpdate: mayHold = the take ran (R2-F1: exit 1 is "refused OR not
     ['exit 0 + timed out', taken({ code: 0, timedOut: true }), true],
     ['exit 2', taken({ code: 2 }), true],
     ['exit 7', taken({ code: 7 }), true],
+    // #194: a take that never started cannot have written a label (R1-F1), so nothing is released afterwards
+    ['not started (spawnError)', { code: 1, spawnError: true, stdout: '', stderr: 'spawn /bin/sh ENOENT', timedOut: false, signal: null }, false],
   ]) {
     const sh = shell({ take });
     const { beforeUpdate, info } = before(sh);
@@ -775,4 +777,52 @@ test('takeHold / checkHolds: a hold command killed by a signal is reported with 
   const checked = await check(killed);
   assert.equal(checked.ok, false);
   assert.match(checked.why, /SIGKILL/);
+});
+
+// ---- a hold command that could not be STARTED (issue #194) -----------------------------------------------------------------------
+
+test('takeHold / releaseHold: a run that throws (the command could not be started) is code null + notStarted, never a fake exit 1', async () => {
+  const run = async () => { throw new Error('spawn /bin/sh ENOENT'); };
+  const took = await takeHold({ config: CONFIG, pr: PR, root: '/r', env: {}, run });
+  assert.deepEqual([took.configured, took.confirmed, took.code, took.notStarted], [true, false, null, true]);
+  assert.match(took.lines.join(' '), /could not be started.*ENOENT/);
+  const released = await releaseHold({ config: CONFIG, pr: PR, reason: 'parked', root: '/r', env: {}, run });
+  assert.deepEqual([released.confirmed, released.code, released.notStarted], [false, null, true]);
+  const real = await takeHold({ config: CONFIG, pr: PR, root: '/r', env: {}, run: async () => ({ code: 1, stdout: '', stderr: 'no' }) });
+  assert.equal('notStarted' in real, false, 'a real exit 1 carries no notStarted');
+});
+
+test('holdBeforeUpdate: a take that could not be started is passed through on info.take', async () => {
+  const run = async (cmd) => {
+    if (cmd.includes('--status')) return { code: 0, stdout: `${JSON.stringify({ pr: PR, blockedBy: [] })}\n`, stderr: '' };
+    throw new Error('spawn /bin/sh ENOENT');
+  };
+  const { beforeUpdate, info } = holdBeforeUpdate({ config: CONFIG, pr: PR, root: '/r', env: {}, run });
+  await beforeUpdate();
+  assert.equal(info.take.notStarted, true);
+  assert.equal(info.take.code, null);
+  assert.equal(info.take.confirmed, false);
+});
+
+test('unreleasedWarning: a release that could not be started says so, never "exit null"', () => {
+  for (const takeConfirmed of [true, false]) {
+    const w = unreleasedWarning({ pr: PR, reason: 'parked', code: null, notStarted: true, takeConfirmed });
+    assert.doesNotMatch(w, /exit null/);
+    assert.match(w, /could not be started/);
+  }
+  assert.doesNotMatch(unreleasedWarning({ pr: PR, reason: 'parked', code: null, takeConfirmed: true }), /exit null/, 'code null alone is enough');
+  assert.match(unreleasedWarning({ pr: PR, reason: 'parked', code: 3, takeConfirmed: true }), /exit 3/);
+});
+
+test('a hold command that resolves with spawnError (runShellAsync: bad cwd, missing shell) is notStarted for a take and "could not be started" for a check', async () => {
+  const spawnFailed = async () => ({ code: 1, spawnError: true, stderr: 'spawn /bin/sh ENOENT', stdout: '', timedOut: false, signal: null });
+  const took = await takeHold({ config: CONFIG, pr: PR, root: '/r', env: {}, run: spawnFailed });
+  assert.deepEqual([took.configured, took.confirmed, took.code, took.notStarted], [true, false, null, true]);
+  assert.match(took.lines.join(' '), /could not be started.*ENOENT/);
+  const released = await releaseHold({ config: CONFIG, pr: PR, reason: 'parked', root: '/r', env: {}, run: spawnFailed });
+  assert.deepEqual([released.confirmed, released.code, released.notStarted], [false, null, true]);
+  const checked = await checkHolds({ config: CONFIG, pr: PR, root: '/r', env: {}, run: spawnFailed });
+  assert.equal(checked.ok, false);
+  assert.match(checked.why, /could not be started.*ENOENT/);
+  assert.doesNotMatch(checked.why, /exited/);
 });
