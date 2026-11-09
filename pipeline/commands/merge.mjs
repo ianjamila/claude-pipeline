@@ -153,8 +153,8 @@ export const run = guarded(async (argv, ctx) => {
     const releaseTaken = async (reason) => {
       if (!holdInfo?.mayHold) return undefined;
       const rel = await releaseHold({ config, pr, reason, root, env: ctx.env });
-      const holdRelease = { reason, confirmed: rel.confirmed === true, code: rel.code ?? null, lines: rel.lines ?? [] };
-      if (!holdRelease.confirmed) warnings.push(unreleasedWarning({ pr, reason, code: holdRelease.code, takeConfirmed: holdInfo.taken }));
+      const holdRelease = { reason, confirmed: rel.confirmed === true, code: rel.code ?? null, lines: rel.lines ?? [], ...(rel.notStarted ? { notStarted: true } : {}) };
+      if (!holdRelease.confirmed) warnings.push(unreleasedWarning({ pr, reason, code: holdRelease.code, notStarted: holdRelease.notStarted === true, takeConfirmed: holdInfo.taken }));
       return holdRelease;
     };
     if (!synced.ok) {

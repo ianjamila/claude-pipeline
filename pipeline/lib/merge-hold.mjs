@@ -90,14 +90,15 @@ export async function checkHolds({ config, pr, root, env, run = runShellAsync })
 }
 
 // { configured:false } | { configured:true, confirmed: exit 0, code, lines (last 5 of stdout+stderr) }. The commands are not
-// retried: a take that is NOT confirmed is reported, never repeated.
+// retried: a take that is NOT confirmed is reported, never repeated. A command that could not even be STARTED (run threw) has
+// `code: null` and `notStarted: true`: it is the command going wrong, not the provider's own exit 1 (issue #194).
 async function runWrite(template, vars, ctx) {
   if (!holdsConfigured(ctx.config)) return { configured: false };
   let ran;
   try {
     ran = await runHoldCommand(template(ctx.config), vars, ctx);
   } catch (err) {
-    return { configured: true, confirmed: false, code: 1, lines: [String(err?.message ?? err).slice(0, 200)] };
+    return { configured: true, confirmed: false, code: null, notStarted: true, lines: [`the hold command could not be started: ${String(err?.message ?? err).slice(0, 200)}`] };
   }
   return { configured: true, confirmed: ran.code === 0 && ran.timedOut !== true, code: ran.code, ...(ran.timedOut ? { timedOut: true } : {}), ...(ran.signal ? { signal: ran.signal } : {}), lines: lastLines(ran) };
 }
@@ -177,10 +178,11 @@ export function queuedBehindRefusal(found) {
 // The text of the warning for a release that was NOT confirmed. After a CONFIRMED take the hold is real: run the release again. After an
 // UNconfirmed take (exit 1 = refused OR not confirmed) there may be no label at all, so say so: nobody should retry blindly.
 // `again`: the caller already ran the release once on this path (update-branch's wording), not just a hint to run it (merge's).
-export function unreleasedWarning({ pr, reason, code, takeConfirmed, again = false }) {
+// `notStarted` (or a null `code`): the release command never ran, so there is no exit code to print.
+export function unreleasedWarning({ pr, reason, code, notStarted = false, takeConfirmed, again = false }) {
   const cmd = `\`pipeline merge-hold --pr ${pr} --release --reason ${reason}\``;
   const where = `from PR #${pr}'s own worktree, on its branch (the provider may refuse a release from another checkout or a detached HEAD)`;
-  const head = `the merge hold of #${pr} was NOT released (${reason}; exit ${code})`;
+  const head = `the merge hold of #${pr} was NOT released (${reason}; ${notStarted || code === null ? 'the release command could not be started' : `exit ${code}`})`;
   return takeConfirmed
     ? `${head}: run ${cmd}${again ? ' again' : ''} ${where}`
     : `${head}; the take was not confirmed either, so there may be no hold to release: if the PR has a \`merge-hold\` label, run ${cmd} ${where}`;
@@ -193,7 +195,7 @@ export function unreleasedWarning({ pr, reason, code, takeConfirmed, again = fal
 // one meanwhile, so the gate ALWAYS runs again after the take. Another hold ahead -> queued-behind and a hold-unreadable re-check
 // are returned with `holdTaken` (did the take confirm) so the caller can clean up (a CONFIRMED hold is real and is kept when only the re-check could not be read; an unconfirmed take is released); clear -> null (the PUT goes, held or not: the hold
 // is cooperative, a missing hold is not a safety loss). Later cycles of the same call only re-run the first gate (its refusal carries `holdTaken` too once this call has taken).
-// -> { beforeUpdate, info }; `info` is filled as the calls happen: { taken, tookThisCall, mayHold (the take ran, so it may have written the label: the auto-releases key on it), take: { confirmed, code, lines, timedOut? } | null }.
+// -> { beforeUpdate, info }; `info` is filled as the calls happen: { taken, tookThisCall, mayHold (the take ran, so it may have written the label: the auto-releases key on it), take: { confirmed, code, lines, timedOut?, notStarted? } | null }.
 // Not configured -> { beforeUpdate: null, info: null }.
 export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync }) {
   if (!holdsConfigured(config)) return { beforeUpdate: null, info: null };
@@ -208,7 +210,7 @@ export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync })
     if (info.tookThisCall) return null;
     const took = await takeHold(args);
     info.tookThisCall = true;
-    info.take = { confirmed: took.confirmed, code: took.code, lines: took.lines, ...(took.timedOut ? { timedOut: true } : {}) };
+    info.take = { confirmed: took.confirmed, code: took.code, lines: took.lines, ...(took.timedOut ? { timedOut: true } : {}), ...(took.notStarted ? { notStarted: true } : {}) };
     info.taken = took.confirmed;
     // Any take that ran may have written the label. Exit 1 means "refused OR not confirmed" (docs/cli.md): the same code covers a draft
     // PR refused before anything was written and a label that was added whose confirming event came late, and the two cannot be told
