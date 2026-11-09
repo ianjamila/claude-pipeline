@@ -536,13 +536,15 @@ function parseGitGlobal(argv, dir, env, ctx) {
   let d = dir;
   const envGitDir = envVar(env, ctx, 'GIT_DIR');
   let gitDirUnknown = !envGitDir.known; // exported twice: which repository the command acts on cannot be told
-  let gitDir = typeof envGitDir.value === 'string' && envGitDir.value ? joinDir(d, envGitDir.value, ctx) : null;
-  // R3-B1: a git dir / work tree that is named but cannot be resolved (`--git-dir=$G`) is unknown, not absent
-  let targetUnknown = typeof envGitDir.value === 'string' && envGitDir.value !== '' && gitDir === null;
+  // R4-B1: git resolves a relative --git-dir / --work-tree / GIT_DIR / GIT_WORK_TREE against the directory ALL the -C options produce
+  // (`git --git-dir=a.git -C c status` is `git --git-dir=c/a.git status`), wherever they sit among the options. So the values are
+  // kept as written here and resolved once, against the final directory, after the loop.
+  const gitDirRaws = [];
+  const workTreeRaws = [];
+  if (typeof envGitDir.value === 'string' && envGitDir.value !== '') gitDirRaws.push(envGitDir.value);
   const envWorkTree = envVar(env, ctx, 'GIT_WORK_TREE');
-  if (!envWorkTree.known) targetUnknown = true;
-  let workTree = typeof envWorkTree.value === 'string' && envWorkTree.value ? joinDir(d, envWorkTree.value, ctx) : null;
-  if (typeof envWorkTree.value === 'string' && envWorkTree.value !== '' && workTree === null) targetUnknown = true;
+  let targetUnknown = !envWorkTree.known;
+  if (typeof envWorkTree.value === 'string' && envWorkTree.value !== '') workTreeRaws.push(envWorkTree.value);
   const configs = [];
   let i = 1;
   for (; i < argv.length; i++) {
@@ -556,14 +558,21 @@ function parseGitGlobal(argv, dir, env, ctx) {
       configs.push({ raw: kv, key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
       continue;
     }
-    if (t.startsWith('--git-dir=')) { gitDir = joinDir(d, t.slice('--git-dir='.length), ctx); gitDirUnknown = false; targetUnknown ||= gitDir === null; continue; }
-    if (t === '--git-dir') { gitDir = joinDir(d, argv[++i], ctx); gitDirUnknown = false; targetUnknown ||= gitDir === null; continue; }
-    if (t.startsWith('--work-tree=')) { workTree = joinDir(d, t.slice('--work-tree='.length), ctx); targetUnknown ||= workTree === null; continue; }
-    if (t === '--work-tree') { workTree = joinDir(d, argv[++i], ctx); targetUnknown ||= workTree === null; continue; }
+    if (t.startsWith('--git-dir=')) { gitDirRaws.push(t.slice('--git-dir='.length)); gitDirUnknown = false; continue; }
+    if (t === '--git-dir') { gitDirRaws.push(argv[++i]); gitDirUnknown = false; continue; }
+    if (t.startsWith('--work-tree=')) { workTreeRaws.push(t.slice('--work-tree='.length)); continue; }
+    if (t === '--work-tree') { workTreeRaws.push(argv[++i]); continue; }
     if (GIT_GLOBAL_VALUE.includes(t)) { i++; continue; }
     if (t.startsWith('-')) continue; // boolean global option, or --opt=value
     break;
   }
+  // every value named is resolved, so one that cannot be (`--git-dir=$G`, a relative path with no known directory) is unknown, not absent
+  const resolveAll = (raws) => raws.map((r) => joinDir(d, r, ctx));
+  const gitDirs = resolveAll(gitDirRaws);
+  const workTrees = resolveAll(workTreeRaws);
+  if (gitDirs.includes(null) || workTrees.includes(null)) targetUnknown = true;
+  const gitDir = gitDirs.length ? gitDirs[gitDirs.length - 1] : null; // (the last one given is the one git uses)
+  const workTree = workTrees.length ? workTrees[workTrees.length - 1] : null;
   // a GIT_DIR / GIT_WORK_TREE assigned earlier on the line may or may not reach this command (so it is "unknown"), but where it
   // points is still a checkout this command may act on
   const hint = (name) => (typeof ctx.vars[name] === 'string' && ctx.vars[name] !== '' ? joinDir(d, ctx.vars[name], ctx) : null);

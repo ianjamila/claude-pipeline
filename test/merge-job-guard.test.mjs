@@ -360,3 +360,55 @@ test('R3-B1: the same commands are allowed with no marker, a dead marker, or whe
   // another session's own checkout is still free, even for an unresolved target
   assert.equal(decide('git -C $TARGET reset --hard', other).decision, 'allow');
 });
+
+// ---- review round 4 (R4-B1): a relative --git-dir / --work-tree / GIT_DIR / GIT_WORK_TREE is relative to the directory ALL the -C options produce ----
+
+test('R4-B1: a relative --git-dir / --work-tree / GIT_DIR / GIT_WORK_TREE before a later -C names the checkout git acts on', () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'mj-rel-')));
+  const free = join(base, 'free');
+  const group = join(base, 'group');
+  const owned = join(group, 'owned');
+  mkdirSync(free, { recursive: true });
+  mkdirSync(join(owned, '.git'), { recursive: true });
+  mark(owned, process.pid, 12);
+  // git's reading of `git --work-tree=../owned -C <group>/free` is <group>/owned; the guard used to read <base>/owned
+  const inner = join(group, 'free');
+  mkdirSync(inner, { recursive: true });
+  for (const command of [
+    `git --work-tree=../owned -C ${fwd(inner)} reset --hard`,
+    `git --work-tree ../owned -C ${fwd(inner)} reset --hard`,
+    `git --git-dir=../owned/.git -C ${fwd(inner)} update-ref HEAD ${'b'.repeat(40)}`,
+    `git --git-dir ../owned/.git --work-tree=../owned -C ${fwd(inner)} reset --hard`,
+    `git --work-tree=../owned -C ${fwd(group)} -C free reset --hard`,
+    `GIT_WORK_TREE=../owned git -C ${fwd(inner)} reset --hard`,
+    `GIT_DIR=../owned/.git git -C ${fwd(inner)} checkout x`,
+    `export GIT_WORK_TREE=../owned && git -C ${fwd(inner)} reset --hard`,
+  ]) {
+    const v = decide(command, free);
+    assert.equal(v.decision, 'deny', command);
+    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+  }
+});
+
+test('R4-B1: the same relative commands are allowed with no marker, a dead marker, or when read-only', () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'mj-rel-')));
+  const group = join(base, 'group');
+  const owned = join(group, 'owned');
+  const inner = join(group, 'free');
+  mkdirSync(inner, { recursive: true });
+  mkdirSync(join(owned, '.git'), { recursive: true });
+  const cmds = [
+    `git --work-tree=../owned -C ${fwd(inner)} reset --hard`,
+    `git --git-dir=../owned/.git -C ${fwd(inner)} update-ref HEAD ${'b'.repeat(40)}`,
+    `GIT_WORK_TREE=../owned git -C ${fwd(inner)} reset --hard`,
+  ];
+  for (const c of cmds) assert.equal(decide(c, base).decision, 'allow', `no marker: ${c}`);
+  mark(owned, deadPid());
+  for (const c of cmds) assert.equal(decide(c, base).decision, 'allow', `dead marker: ${c}`);
+  mark(owned, process.pid);
+  for (const c of [`git --work-tree=../owned -C ${fwd(inner)} status`, `git --git-dir=../owned/.git -C ${fwd(inner)} log --oneline`, `GIT_DIR=../owned/.git git -C ${fwd(inner)} diff`]) {
+    assert.equal(decide(c, base).decision, 'allow', `read-only: ${c}`);
+  }
+  // a relative value that, with -C applied, does NOT reach the owned checkout is not refused
+  assert.equal(decide(`git --work-tree=../elsewhere -C ${fwd(inner)} reset --hard`, base).decision, 'allow');
+});
