@@ -1274,6 +1274,8 @@ const siblingRepo = () => {
   mark(job.wt, process.pid, 12);
   return { main, job: job.wt, free: free.wt };
 };
+// an env-config alias source / --config-env / a built key, in front of an `s` that is not a built-in (the others in SHORTCUTS name a built-in or carry a literal -c alias)
+const UNREAD_NO_JOB = /^(?:K=alias\.s; git .*-c \$K=reset s$|(?:env |export )?GIT_CONFIG_(?:COUNT|PARAMETERS)=.*\bs --hard$)/;
 // every rule-(a) / (b) example as a function of the `git <global options>` head, so each can be aimed at the job by cwd, by -C or by --git-dir
 const SHORTCUTS = [
   (g, job) => `${g} -c alias.s=reset s --hard`,
@@ -1336,7 +1338,7 @@ test('owner rule: a job reached through -C, --git-dir, --work-tree, GIT_DIR, GIT
   for (const make of ALLOWED) assert.equal(decide(make(`git -C ${at}`), other).decision, 'allow', make(`git -C ${at}`));
   // another repository than the job's, with no job anywhere in it: not affected
   const free = fakeRepo();
-  for (const make of SHORTCUTS) assert.equal(decide(make(`git -C ${fwd(free)}`, free), other).decision, 'allow', make(`git -C ${fwd(free)}`, free));
+  for (const make of SHORTCUTS) assert.equal(decide(make(`git -C ${fwd(free)}`, free), other).decision, UNREAD_NO_JOB.test(make(`git -C ${fwd(free)}`, free)) ? 'deny' : 'allow', make(`git -C ${fwd(free)}`, free)); // (R13-B1: an unread source with an `s` is refused with no job too)
 });
 
 test('owner rule: a job in a SIBLING worktree of the cwd\'s repository counts, though the cwd owns nothing', () => {
@@ -1388,9 +1390,41 @@ test('owner rule: with no job anywhere the same shortcuts behave as before (a de
   const calm = siblingRepo();
   mark(calm.job, deadPid());
   for (const [cwd, job] of [[root, root], [calm.free, calm.job], [calm.main, calm.job], [calm.job, calm.job]]) {
-    for (const make of SHORTCUTS) assert.equal(decide(make('git', job), cwd).decision, 'allow', `${make('git', job)} @ ${cwd}`);
+    // (R13-B1: a source the alias block does not read with a command that is not built into git is refused with no job too; see the test below)
+    for (const make of SHORTCUTS) {
+      const c = make('git', job);
+      assert.equal(decide(c, cwd).decision, UNREAD_NO_JOB.test(c) ? 'deny' : 'allow', `${c} @ ${cwd}`);
+    }
     for (const make of ALLOWED) assert.equal(decide(make('git'), cwd).decision, 'allow', make('git'));
   }
+});
+
+// R13-B1: a shortcut source the alias block does not read (environment config, --config-env, a setting name built from a variable) with a command that is
+// not built into git is refused even when no merge job runs: git would run whatever the alias says (`push origin main`), which nothing here can see
+test('R13-B1: with no job, an unread shortcut source and a non-built-in command are refused; built-ins and literal -c aliases are not', () => {
+  const root = fakeRepo();
+  const UNREAD = /defined here in a way the guard does not read.*"p" is not a built-in git command/s;
+  for (const c of [
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=push git p origin main',
+    `GIT_CONFIG_PARAMETERS="'alias.p=push'" git p origin main`,
+    'env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=push git p origin main',
+    'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=push; git p origin main',
+    'V=push git --config-env=alias.p=V p origin main',
+    'K=alias.p; git -c $K=push p origin main',
+    'GIT_CONFIG_PARAMETERS=$P git p',
+  ]) {
+    const v = decide(c, root);
+    assert.equal(v.decision, 'deny', c);
+    assert.match(v.reason, UNREAD, c);
+  }
+  for (const c of [
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=- git status',
+    'GIT_CONFIG_PARAMETERS=$P git status',
+    'git --config-env=user.name=V log',
+    'git -c alias.st=status st', // (a literal -c alias is read by the alias block: main's behaviour)
+    'git config alias.st status && git st',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=push git status',
+  ]) assert.equal(decide(c, root).decision, 'allow', c);
 });
 
 // what was already there before the job rule, and two stricter fixes the alias block keeps (no job anywhere)

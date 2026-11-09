@@ -784,6 +784,8 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   if (envWt.unknown) targetUnknown = true;
   if (envWt.refused) refused = true;
   let shortcut = envWt.shortcut; // owner rule: a git shortcut (alias) source on this command
+  // R13-B1: ...and the sources among them the alias block does NOT read (environment config, --config-env, a setting name built from a variable)
+  let unreadShortcut = envWt.shortcut;
   const configs = [];
   const wtConfigs = [...envWt.entries];
   let i = 1;
@@ -804,6 +806,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
       configs.push({ raw: kv, key: expandVars(eq < 0 ? word : word.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : word.slice(eq + 1), noValue: eq < 0, dynKey });
       // owner rule: `-c alias.<x>=…`, or a key that is only known at run time (it may be one)
       if (dynKey || DYNAMIC.test(configs[configs.length - 1].key) || ALIAS_KEY.test(configs[configs.length - 1].key)) shortcut = true;
+      if (dynKey || DYNAMIC.test(configs[configs.length - 1].key)) unreadShortcut = true;
       if (eq >= 0 && (dynKey || mayBeWorkTreeKey(configs[configs.length - 1].key))) refuseCli(word.slice(eq + 1)); // R8-B2 / R8-F2
       // R7-F2: `-c core.worktree='$WT'`: the literal word is a target beside the expansion
       if (eq >= 0 && DYNAMIC.test(word.slice(eq + 1)) && quotedText) wtConfigs.push({ key: configs[configs.length - 1].key, value: word.slice(eq + 1), noValue: false, lit: true });
@@ -818,6 +821,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
     if (t.startsWith('--config-env=') || t === '--config-env') {
       const text = t === '--config-env' ? argv[++i] : t.slice('--config-env='.length);
       shortcut = true; // owner rule: any --config-env
+      unreadShortcut = true;
       const r = configEnvWorkTree(text, penv, ctx);
       if (r) { targetUnknown = true; wtConfigs.push(...r.entries); if (r.refused) refused = true; }
       continue;
@@ -851,7 +855,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   // a GIT_DIR / GIT_WORK_TREE assigned earlier on the line may or may not reach this command (so it is "unknown"), but where it
   // points is still a checkout this command may act on
   const hint = (name) => (typeof ctx.vars[name] === 'string' && ctx.vars[name] !== '' ? joinDir(d, ctx.vars[name], ctx) : null);
-  return { d, selectorLost, gitDir, gitDirAll, gitDirUnknown, workTree, workTreeAll, targetUnknown, refused, hints: [hint('GIT_DIR'), hint('GIT_WORK_TREE')].filter((x) => x !== null), configs, wtConfigs, shortcut, sub: argv[i], args: argv.slice(i + 1) };
+  return { d, selectorLost, gitDir, gitDirAll, gitDirUnknown, workTree, workTreeAll, targetUnknown, refused, hints: [hint('GIT_DIR'), hint('GIT_WORK_TREE')].filter((x) => x !== null), configs, wtConfigs, shortcut, unreadShortcut, sub: argv[i], args: argv.slice(i + 1) };
 }
 
 // checkout / switch: which branch is the directory on afterwards?
@@ -1121,7 +1125,11 @@ function shortcutVerdict(sub, args, g, ctx) {
   const notBuiltin = !GIT_COMPILED_BUILTINS.has(sub);
   if (!defined && !notBuiltin) return null;
   const job = runningMergeJob(g, ctx);
-  if (!job) return null;
+  if (!job) {
+    // R13-B1: no job, but a shortcut source the alias block does not read plus a command git does not compile in: what runs cannot be checked
+    if (notBuiltin && g.unreadShortcut) return deny(`a git shortcut is defined here in a way the guard does not read (environment config, --config-env, or a setting name built from a variable), and "${sub}" is not a built-in git command, so what it runs cannot be checked. Write the built-in command out.`);
+    return null;
+  }
   // (a verb the job refuses anyway in its own checkout keeps that message: `git reset --hard`, `git bisect`)
   const own = mergeJobVerdict(sub, args, g, ctx);
   if (own) return own;
