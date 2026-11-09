@@ -116,3 +116,4 @@ full record.
 - 2026-11-06 · #193 · fix(ci-wait): date a failure by its own attempt; refresh a suite when its newest check run completes (#174, #176) · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge
 - 2026-11-06 · #204 · review skill: read the merge dry run whole, never a filtered key · risk high · rounds 1 · arbiter 0 · awaiting-owner-merge
 - 2026-11-09 · #196 · Merge hold: a PR keeps its turn through its own catch-up (F1-lite) · risk high · rounds 5 · arbiter 3 · awaiting-owner-merge
+- 2026-11-09 · #204 · review skill: read the merge dry run whole, never a filtered key · risk high · rounds 2 · arbiter 0 · awaiting-owner-merge
