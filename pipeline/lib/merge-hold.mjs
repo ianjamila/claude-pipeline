@@ -10,8 +10,11 @@
 // the merge command is caught only by a hold-aware merge command (EagleWatch's gate re-checks right before `gh pr merge`). A
 // repo that opts in with the default `gh pr merge` command gets the pre-check only. Read-then-PUT of update-branch is not atomic
 // either. There is no override here: the owner's way past a hold is the provider's own (EagleWatch `--ignore-hold`).
+import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { fill } from './config.mjs';
 import { envWithGhDir, runShellAsync } from './proc.mjs';
+import { gitCommonDir } from './repo.mjs';
 
 // The stable verdict string of EagleWatch's merge gate (scripts/lib/merge-hold.mjs HOLD_QUEUED_BEHIND). Its full line is
 // `hold:queued-behind  queued behind #1400 — do NOT update this branch until #1400 merges (PR #1400 "…" holds …)`.
@@ -26,6 +29,10 @@ export const RELEASE_REASONS = Object.freeze({
   parked: 'The PR was parked, so its merge hold is released.',
   'owner-declined': 'The owner declined the merge or asked for changes, so the merge hold is released.',
   'handoff-withdrawn': 'The merge hand-off was withdrawn, so the merge hold is released.',
+  'ci-failed': 'The required checks failed on this PR, so its merge hold is released until a fix is reviewed.',
+  'update-conflict': 'Bringing this PR up to date with its base conflicts, so its merge hold is released until the conflict is resolved.',
+  'queued-behind': 'An older merge hold of another PR is ahead, so this PR gives up its place and waits.',
+  'hold-unreadable': 'The merge hold check could not be read, so this PR gives up its place until it can be.',
 });
 
 const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -163,4 +170,151 @@ export function queuedBehindRefusal(found) {
     doNotUpdate: true,
     reason: `${HOLD_QUEUED_BEHIND}: the merge command says this PR is queued behind ${list}: do NOT update this branch until ${found.prs.length === 1 ? 'it merges' : 'they merge'} (or the hold expires), then say "merge" again`,
   };
+}
+
+// ---- taking the hold for the pipeline's own catch-up (plan 2026-11-06-f1-lite-build) -------------------------------------------------
+
+// The text of the warning for a release that was NOT confirmed. After a CONFIRMED take the hold is real: run the release again. After an
+// UNconfirmed take (exit 1 = refused OR not confirmed) there may be no label at all, so say so: nobody should retry blindly.
+// `again`: the caller already ran the release once on this path (update-branch's wording), not just a hint to run it (merge's).
+export function unreleasedWarning({ pr, reason, code, takeConfirmed, again = false }) {
+  const cmd = `\`pipeline merge-hold --pr ${pr} --release --reason ${reason}\``;
+  const where = `from PR #${pr}'s own worktree, on its branch (the provider may refuse a release from another checkout or a detached HEAD)`;
+  const head = `the merge hold of #${pr} was NOT released (${reason}; exit ${code})`;
+  return takeConfirmed
+    ? `${head}: run ${cmd}${again ? ' again' : ''} ${where}`
+    : `${head}; the take was not confirmed either, so there may be no hold to release: if the PR has a \`merge-hold\` label, run ${cmd} ${where}`;
+}
+
+// The `beforeUpdate` of bringUpToDate for a repo with holds: the catch-up PUT should run while THIS PR holds its turn, so the CI round
+// that follows cannot be invalidated by another session's merge (cooperatively: the repo's gate refuses other merges while the hold is
+// active). Before EVERY PUT: the gate (a refusal is returned as is, nothing taken). On the first call that passes it the hold is
+// taken, whatever the answer: a take that failed or timed out may still have written the label, and another session may have taken
+// one meanwhile, so the gate ALWAYS runs again after the take. Another hold ahead -> queued-behind and a hold-unreadable re-check
+// are returned with `holdTaken` (did the take confirm) so the caller can clean up (a CONFIRMED hold is real and is kept when only the re-check could not be read; an unconfirmed take is released); clear -> null (the PUT goes, held or not: the hold
+// is cooperative, a missing hold is not a safety loss). Later cycles of the same call only re-run the first gate (its refusal carries `holdTaken` too once this call has taken).
+// -> { beforeUpdate, info }; `info` is filled as the calls happen: { taken, tookThisCall, mayHold (the take ran, so it may have written the label: the auto-releases key on it), take: { confirmed, code, lines, timedOut? } | null }.
+// Not configured -> { beforeUpdate: null, info: null }.
+export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync }) {
+  if (!holdsConfigured(config)) return { beforeUpdate: null, info: null };
+  const args = { config, pr, root, env, run };
+  const info = { taken: false, tookThisCall: false, mayHold: false, take: null };
+  const beforeUpdate = async () => {
+    const first = await holdGate(args);
+    // A later cycle of the same call: this call's cycle-1 take may have left a real hold, so its refusal carries holdTaken like the
+    // post-take one does (R4-S1: update-branch's usage promises it, and the review skill keys its hold-unreadable cleanup on it).
+    // Nothing taken yet (the first gate refused before any take ran) -> bare, as before.
+    if (first) return info.tookThisCall ? { ...first, holdTaken: info.taken } : first;
+    if (info.tookThisCall) return null;
+    const took = await takeHold(args);
+    info.tookThisCall = true;
+    info.take = { confirmed: took.confirmed, code: took.code, lines: took.lines, ...(took.timedOut ? { timedOut: true } : {}) };
+    info.taken = took.confirmed;
+    // Any take that ran may have written the label. Exit 1 means "refused OR not confirmed" (docs/cli.md): the same code covers a draft
+    // PR refused before anything was written and a label that was added whose confirming event came late, and the two cannot be told
+    // apart. Releasing a label that was never written is a harmless no-op, so every take that ran is released on the failure paths.
+    info.mayHold = info.tookThisCall;
+    const again = await holdGate(args);
+    return again ? { ...again, holdTaken: info.taken } : null;
+  };
+  return { beforeUpdate, info };
+}
+
+// ---- the pipeline's own successor heads ------------------------------------------------------------------------------------------------
+
+// When bringUpToDate accepts an update it has PROVEN the new head is GitHub's merge commit [the head it was made from, the base tip].
+// That proof is written down at once, one immutable file per successor, in the git common dir (shared by every worktree of the
+// repo, outside `.review/`, which state recovery quarantines): <common>/pipeline/merge-hold/pr-<N>/<to>.json =
+// { version: 1, pr, from, to, baseSha, at }. No read-modify-write, so two writers never lose each other's proof. Later,
+// `merge-hold --release --reason new-commits` keeps the hold when the head is such a successor (ownSuccessor re-reads the parents
+// from GitHub). A lost or unreadable record only means a release proceeds, the old behaviour.
+const SHA40 = /^[0-9a-f]{40}$/;
+const SUCCESSOR_KEEP_MS = 30 * 24 * 3_600_000;
+// A write takes milliseconds; a *.tmp this old is the leftover of a crashed writer (killed between writeFileSync and renameSync).
+const TMP_KEEP_MS = 3_600_000;
+
+export function successorDir(root, pr) {
+  if (!posInt(pr)) throw new Error(`not a PR number: ${JSON.stringify(pr)}`);
+  return path.join(gitCommonDir(root), 'pipeline', 'merge-hold', `pr-${pr}`);
+}
+
+// Writes the proof (tmp + rename, mkdir -p); throws on a bad sha or a write error (the caller catches: a missing record is not fatal).
+// Best-effort prune: this PR's *.json files older than 30 days and *.tmp files (a crashed write) older than 1 hour are deleted (errors
+// ignored; a race only loses an old proof).
+export function recordSuccessor(root, pr, { from, to, baseSha }, now = new Date()) {
+  for (const [k, v] of Object.entries({ from, to, baseSha })) {
+    if (typeof v !== 'string' || !SHA40.test(v)) throw new Error(`successor ${k} is not a 40-hex sha: ${JSON.stringify(v)}`);
+  }
+  const dir = successorDir(root, pr);
+  mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${to}.json`);
+  const tmp = path.join(dir, `${to}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`);
+  writeFileSync(tmp, `${JSON.stringify({ version: 1, pr, from, to, baseSha, at: now.toISOString() })}\n`);
+  renameSync(tmp, file);
+  try {
+    for (const name of readdirSync(dir)) {
+      const keepMs = name.endsWith('.json') ? SUCCESSOR_KEEP_MS : name.endsWith('.tmp') ? TMP_KEEP_MS : null;
+      if (keepMs === null || name === `${to}.json`) continue;
+      try {
+        if (now.getTime() - statSync(path.join(dir, name)).mtimeMs > keepMs) unlinkSync(path.join(dir, name));
+      } catch { /* best effort */ }
+    }
+  } catch { /* best effort */ }
+}
+
+// The recorded successor { from, to, baseSha, at } for PR N's head, or null: head not 40-hex (checked before it touches a path),
+// no file, unparseable, wrong version, another PR, a `to` that is not the head, a malformed sha. Never throws.
+export function readSuccessor(root, pr, head) {
+  try {
+    if (typeof head !== 'string' || !SHA40.test(head)) return null;
+    const rec = JSON.parse(readFileSync(path.join(successorDir(root, pr), `${head}.json`), 'utf8'));
+    if (!isPlain(rec) || rec.version !== 1 || rec.pr !== pr || rec.to !== head) return null;
+    if (![rec.from, rec.baseSha].every((v) => typeof v === 'string' && SHA40.test(v))) return null;
+    return { from: rec.from, to: rec.to, baseSha: rec.baseSha, at: typeof rec.at === 'string' ? rec.at : null };
+  } catch {
+    return null;
+  }
+}
+
+// true only if the pipeline recorded `head` as its own successor AND GitHub says its parents are exactly [from, baseSha]. Any failure
+// (no record, gh error) -> false: the release proceeds.
+export function ownSuccessor({ root, pr, head, gh }) {
+  try {
+    const rec = readSuccessor(root, pr, head);
+    if (!rec) return false;
+    const parents = gh.commitParents(head);
+    return Array.isArray(parents) && parents.length === 2 && parents[0] === rec.from && parents[1] === rec.baseSha;
+  } catch {
+    return false;
+  }
+}
+
+// ---- waiting for the turn ----------------------------------------------------------------------------------------------------------------
+
+// A queued session polls no faster than every 5 minutes: the repo's check costs ~15 API calls and the budget is shared.
+export const HOLD_POLL_MS = 5 * 60_000;
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// `check` is async () -> the holdGate answer: null = front of the queue, a queued-behind refusal, or a hold-unreadable refusal. Polls at
+// once, then while blocked: if the next poll could not START by the deadline (now + pollMs > deadline) -> timeout at once, else sleep
+// exactly pollMs (measured from the END of the previous check, so poll starts are >= pollMs apart) and poll again. `maxMs` bounds
+// when a poll may START; a running check keeps its own timeout (HOLD_TIMEOUT_MS), so the total runtime is at most maxMs plus one check.
+// Two unreadable answers IN A ROW -> 'unreadable' (fail closed); one unreadable followed by anything else resets the count.
+// -> { outcome: 'front' | 'timeout' | 'unreadable', polls, waitedMs, last } (last = the final answer).
+export async function waitForTurn({ check, pollMs = HOLD_POLL_MS, maxMs, now = Date.now, sleep = defaultSleep }) {
+  if (!Number.isFinite(maxMs) || maxMs < 0) throw new Error(`waitForTurn needs a finite maxMs, got ${JSON.stringify(maxMs)}`);
+  const start = now();
+  const deadline = start + maxMs;
+  let polls = 0;
+  let unreadable = 0;
+  for (;;) {
+    const last = (await check()) ?? null;
+    polls += 1;
+    const done = (outcome) => ({ outcome, polls, waitedMs: now() - start, last });
+    if (last === null) return done('front');
+    unreadable = last.error === 'hold-unreadable' ? unreadable + 1 : 0;
+    if (unreadable >= 2) return done('unreadable');
+    if (now() + pollMs > deadline) return done('timeout');
+    await sleep(pollMs);
+  }
 }
