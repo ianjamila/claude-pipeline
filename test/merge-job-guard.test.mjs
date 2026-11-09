@@ -25,12 +25,13 @@ const mark = (root, pid, pr = 12) => {
 const deadPid = () => spawnSync(process.execPath, ['-e', '']).pid;
 const wiring = realGitWiring();
 const decide = (command, cwd) => evaluateGitCommand(command, { cwd, ...wiring });
-// R9: a mutating verb whose git dir / work tree value is not fully resolved is refused outright ("cannot be read one way"); one that is resolved and
-// reaches a job's checkout gets the job's own message. Either way it is a deny: the tests that name a command in both groups accept the two reasons.
-const jobOrRefused = (command, cwd) => {
+// R9: a mutating verb whose git dir / work tree value is not fully resolved is refused outright ("cannot be read one way", r8Refused below); one that is
+// resolved and reaches a job's checkout gets the job's own message (jobDenied). Each test names which group a command belongs to, so a resolver that
+// refuses a value it can read (or reads one it must refuse) fails the test.
+const jobDenied = (command, cwd) => {
   const v = decide(command, cwd);
   assert.equal(v.decision, 'deny', command);
-  assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout|cannot be read one way/, command);
+  assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
 };
 
 test('a live job blocks mutating git in its checkout: cwd, -C and cd', () => {
@@ -463,19 +464,25 @@ test('R4-F1: a core.worktree that cannot be resolved, --config-env and GIT_CONFI
   const norepo = realpathSync(mkdtempSync(join(tmpdir(), 'mj-norepo-')));
   mark(root, process.pid, 12);
   const at = fwd(other);
+  // (a value or key the line does not resolve is refused outright, whoever owns the cwd)
   for (const command of [
     `git -C ${at} -c core.worktree=$W reset --hard`,
     `git -C ${at} -c "core.worktree=$(pwd)/.." checkout x`,
-    `git -C ${fwd(norepo)} -c core.worktree=../x reset --hard`, // relative, and no git dir can be found from a directory outside any repository
     `git -C ${at} --config-env=core.worktree=WT reset --hard`,
     `git -C ${at} --config-env core.worktree=WT reset --hard`,
     `git -C ${at} --config-env=Core.WorkTree=WT checkout x`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K GIT_CONFIG_VALUE_0=/elsewhere git -C ${at} reset --hard`,
+  ]) {
+    r8Refused(command, root);
+  }
+  // (a value that is fully resolved and unknowable only as a target keeps the unknown -> cwd check, and the cwd is the job's)
+  for (const command of [
+    `git -C ${fwd(norepo)} -c core.worktree=../x reset --hard`, // relative, and no git dir can be found from a directory outside any repository
     `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=/elsewhere git -C ${at} reset --hard`,
     `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=/elsewhere && git -C ${at} reset --hard`,
-    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K GIT_CONFIG_VALUE_0=/elsewhere git -C ${at} reset --hard`,
     `GIT_CONFIG_PARAMETERS="'core.worktree=/elsewhere'" git -C ${at} reset --hard`,
   ]) {
-    jobOrRefused(command, root);
+    jobDenied(command, root);
   }
 });
 
@@ -548,7 +555,7 @@ test('R5-F1: a -c / --config-env KEY that is dynamic may be core.worktree: its v
     `WT=${wt} git --config-env=$K=WT reset --hard`,
     `WT=${wt} git --config-env "$(printf core.worktree)=WT" reset --hard`,
   ]) {
-    jobOrRefused(command, container);
+    r8Refused(command, container); // (R9: a key that is dynamic may be core.worktree and is not resolved: refused before the job lookup)
   }
 });
 
@@ -613,15 +620,16 @@ test('R6-B1: a GIT_CONFIG_VALUE_n / GIT_CONFIG_KEY_n / GIT_CONFIG_PARAMETERS / -
     `WT=${wt} GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0="$WT" git -C ${at} checkout x`,
     `A=${wt} B=$A GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=$B git reset --hard`,
     `K=core.worktree WT=${wt} GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K GIT_CONFIG_VALUE_0=$WT git reset --hard`,
-    `env WT=${wt} GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=$WT git reset --hard`,
     `WT=${wt} GIT_CONFIG_PARAMETERS="'core.worktree=$WT'" git reset --hard`,
     `WT=${wt} GIT_CONFIG_PARAMETERS="'user.name=x' 'core.worktree'='\${WT}'" git reset --hard`,
     `WT=${wt} TARGET=$WT git --config-env=core.worktree=TARGET reset --hard`,
     `WT=${wt} TARGET=\${WT} git --config-env core.worktree=TARGET reset --hard`,
     `A=${wt} B=$A git --config-env=core.worktree=B checkout x`,
   ]) {
-    jobOrRefused(command, container);
+    jobDenied(command, container);
   }
+  // (an `env` word is expanded by the shell before env runs: its `$WT` is the shell's own, which the line never set)
+  r8Refused(`env WT=${wt} GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=$WT git reset --hard`, container);
 });
 
 test('R6-B2: a literal core.worktree entry in GIT_CONFIG_PARAMETERS is a target beside a dynamic entry', () => {
@@ -635,7 +643,7 @@ test('R6-B2: a literal core.worktree entry in GIT_CONFIG_PARAMETERS is a target 
     `GIT_CONFIG_PARAMETERS="'user.\${K}=x' 'core.worktree=${wt}'" git checkout x`,
     `GIT_CONFIG_PARAMETERS="'user.name=$USER' 'core.worktree=../.worktrees/slug'" git reset --hard`,
   ]) {
-    jobOrRefused(command, container);
+    r8Refused(command, container); // (R9: the `$USER` entry leaves the list not fully resolved)
   }
 });
 
@@ -686,16 +694,16 @@ test('R6-B1: GIT_WORK_TREE / GIT_DIR prefix values read the prefix assignments b
     `WT=${wt} GIT_WORK_TREE=\${WT} git checkout x`,
     `WT=${wt} GIT_WORK_TREE="$WT" git -C ${at} reset --hard`,
     `A=${wt} B=$A GIT_WORK_TREE=$B git reset --hard`,
-    `env WT=${wt} GIT_WORK_TREE=$WT git reset --hard`,
     `G=${wt}/.git GIT_DIR=$G git reset --hard`,
     `G=${wt}/.git GIT_DIR=\${G} git checkout x`,
     `A=${wt}/.git B=$A GIT_DIR=$B git reset --hard`,
-    `env G=${wt}/.git GIT_DIR=$G git reset --hard`,
     `G=${wt}/.git GIT_DIR=$G git -C ${at} commit -m x`,
     `WT=${wt} GIT_WORK_TREE=$WT git -C ${at} reset --hard`,
   ]) {
-    jobOrRefused(command, container);
+    jobDenied(command, container);
   }
+  // (an `env` word is expanded by the shell before env runs: its `$WT` / `$G` is the shell's own, which the line never set)
+  for (const command of [`env WT=${wt} GIT_WORK_TREE=$WT git reset --hard`, `env G=${wt}/.git GIT_DIR=$G git reset --hard`]) r8Refused(command, container);
   // R4-B1 ordering: a relative value is resolved against the directory the -C options produce
   assert.equal(decide(`W=.worktrees/slug GIT_WORK_TREE=$W git reset --hard`, container).decision, 'deny');
   assert.equal(decide(`W=slug GIT_WORK_TREE=$W git -C ${at}/.worktrees reset --hard`, container).decision, 'deny');
@@ -749,15 +757,13 @@ const r7Setup = () => {
   return { container, job, at: fwd(container), wt: fwd(job), elsewhere: fwd(fakeRepo()), elsewhere2: fwd(fakeRepo()) };
 };
 const r7Verbs = ['git reset --hard', 'git checkout x'];
-// (R9: a candidate set that is not fully resolved is refused before the job lookup, so a command that used to reach the job through one gets the refusal message)
-const r7Denied = (command, cwd) => jobOrRefused(command, cwd);
 
 test('R7-B1: a name assigned twice in the prefix is both values, whichever comes last', () => {
   const { container, job, at, wt, elsewhere } = r7Setup();
   mark(job, process.pid, 12);
   for (const k of R7_KINDS) {
     for (const [a, b] of [[k.target(wt), k.target(elsewhere)], [k.target(elsewhere), k.target(wt)]]) {
-      for (const verb of r7Verbs) r7Denied(`${k.before(at)}${k.v}=${a} ${k.use(`$${k.v}`)} ${k.v}=${b} ${verb}`, container);
+      for (const verb of r7Verbs) jobDenied(`${k.before(at)}${k.v}=${a} ${k.use(`$${k.v}`)} ${k.v}=${b} ${verb}`, container);
     }
   }
 });
@@ -777,7 +783,7 @@ test('R7-F1: `env NAME=v … $NAME` reads the shell\'s NAME as well as the wrapp
       for (const command of [
         `${k.before(at)}env ${n}=${k.target(wt)} ${k.use(`$${n}`)} ${verb}`,
         `${k.before(at)}env ${n}=${k.target(elsewhere)} ${n}=${k.target(wt)} ${k.use(`\${${n}}`)} ${verb}`,
-      ]) r7Denied(command, container);
+      ]) r8Refused(command, container); // (R9: the `$NAME` of an env word is the shell's own, which the line never set: not fully resolved)
     }
   }
 });
@@ -788,7 +794,7 @@ test('R7-F2: a quoted or escaped `$` reaches git as the literal word: a relative
   for (const k of R7_KINDS) {
     const n = k.v;
     for (const lit of [`'$${n}'`, `"\\$${n}"`, `\\$${n}`]) {
-      for (const verb of r7Verbs) r7Denied(`${k.before(at)}${n}=${k.target(elsewhere)} ${k.use(lit)} ${verb}`, container);
+      for (const verb of r7Verbs) jobDenied(`${k.before(at)}${n}=${k.target(elsewhere)} ${k.use(lit)} ${verb}`, container);
     }
   }
 });
@@ -869,8 +875,10 @@ const r7Cli = (at, vars = '') => [
 test('R7-F2: command-line --work-tree / --git-dir / -c core.worktree values with a quoted $ are candidates too', () => {
   const { container, job, at, elsewhere } = r7Setup();
   mark(job, process.pid, 12);
-  for (const vars of ['', `WT=${elsewhere}; G=${elsewhere}/.git; `]) {
-    for (const verb of r7Verbs) for (const t of r7Cli(at, vars)) r7Denied(t.replace('VERB', verb.slice(4)), container);
+  // (the line sets WT / G, so the quoted word is a relative path git finds as a link to the job's checkout; with no such assignment the `$` is not resolved: refused)
+  for (const verb of r7Verbs) {
+    for (const t of r7Cli(at, `WT=${elsewhere}; G=${elsewhere}/.git; `)) jobDenied(t.replace('VERB', verb.slice(4)), container);
+    for (const t of r7Cli(at, '')) r8Refused(t.replace('VERB', verb.slice(4)), container);
   }
 });
 
@@ -950,10 +958,10 @@ test('R8-F1: an unset name in a product contributes the empty string: `$WT$X` an
   mark(job, process.pid, 12);
   for (const k of R8_USES) {
     for (const verb of r7Verbs) {
-      for (const v of ['$WT$X', '$WT/$X', '${WT}${X}', '$X$WT', '$WT$X$Z']) r7Denied(`WT=${k.tgt(wt)} ${k.use(v)} ${verb}`, container);
+      for (const v of ['$WT$X', '$WT/$X', '${WT}${X}', '$X$WT', '$WT$X$Z']) r8Refused(`WT=${k.tgt(wt)} ${k.use(v)} ${verb}`, container); // (R9: $X is unset on the line)
     }
   }
-  for (const verb of r7Verbs) r7Denied(`GIT_DIR=${at}/gd GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree WT=${wt} GIT_CONFIG_VALUE_0=$WT$X ${verb}`, container);
+  for (const verb of r7Verbs) r8Refused(`GIT_DIR=${at}/gd GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree WT=${wt} GIT_CONFIG_VALUE_0=$WT$X ${verb}`, container);
 });
 
 test('R8-F2: a `$` that arrives through a substituted value is literal text (a relative path), not an expansion to drop', () => {
@@ -1179,7 +1187,7 @@ test('R9: read-only verbs, the -C / cd fallback and fully resolved line-local fo
     `git -C ${elsewhere} reset --hard`,
   ]) assert.equal(decide(c, container).decision, 'allow', c);
   // and a resolved one that does reach the owned checkout is still the job's deny
-  for (const c of [`W=${wt}; git --work-tree=$W reset --hard`, `WT=${wt} GIT_WORK_TREE=$WT git reset --hard`, `git --work-tree=${wt} reset --hard`]) r7Denied(c, container);
+  for (const c of [`W=${wt}; git --work-tree=$W reset --hard`, `WT=${wt} GIT_WORK_TREE=$WT git reset --hard`, `git --work-tree=${wt} reset --hard`]) jobDenied(c, container);
 });
 
 test('R9-F1: an earlier assignment on the line is what a command-line word reads, not the git command\'s own prefix', () => {
