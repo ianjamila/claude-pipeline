@@ -19,6 +19,7 @@ import { reviewEligibilityProblems, reviewValidFor, roundOutcome, rulingsDigest 
 import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
+import { closingKeywordProblem, multiIssueClosingLines } from '../lib/closing-keywords.mjs';
 import { currentContentHash, refreshBaseRef, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 import { publishTriage, reviewContentHash } from '../lib/review-publish.mjs';
 
@@ -28,7 +29,8 @@ export const meta = {
     'pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?}; exit 1 {ok:false, reason} when the review is not valid',
     '  origin/<default_branch> is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated',
     '  from its base branch and pulled is judged against the main that was merged in',
-    '  after the validity checks it also refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet',
+    '  after the validity checks it also refuses (exit 1 {error:closing-keywords}) a PR body that lists several issues after one closing keyword ("Closes #1, #2" closes only #1),',
+  '  and it refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet',
     '  confirmed by a later round, then publishes the triage state when the PR holds a different one (exit 1 {error:stale-publication} when the PR holds a state this',
     '  copy did not publish or restore: run `pipeline state show --pr N`), and only then posts the marker. The record carries rulingsDigest only when there are rulings',
     '  the checked-out HEAD must be the head GitHub holds for the PR; the PR must have had every Fable pass its risk or paths need',
@@ -136,7 +138,7 @@ export const run = guarded(async (argv, ctx) => {
       // The review covers the content of the local checkout; the comment and the label are on the PR GitHub holds. They
       // must be the same commit, or the review of one would be used to vouch for the other.
       const local = headSha({ cwd: root });
-      const view = gh.prView(pr, ['headRefOid', 'isDraft', 'labels']);
+      const view = gh.prView(pr, ['headRefOid', 'isDraft', 'labels', 'body']);
       const remote = view.headRefOid;
       if (remote !== local) {
         return {
@@ -173,6 +175,10 @@ export const run = guarded(async (argv, ctx) => {
       // later round confirmed (triage.mjs#reviewEligibilityProblems).
       const eligibility = reviewEligibilityProblems(state);
       if (eligibility.length > 0) return { exitCode: EXIT.FAILED, output: { ok: false, reason: eligibility.join('; '), currentContentHash: hash } };
+      // Last, once the review itself is valid: a body that names several issues after ONE closing keyword ("Closes #170, #171") closes only the
+      // first on merge. Fixing it is a body edit, not a code change, so no round is owed (lib/closing-keywords.mjs).
+      const closing = closingKeywordProblem(multiIssueClosingLines(view.body), pr);
+      if (closing) return { exitCode: EXIT.FAILED, output: { ok: false, reason: closing, error: 'closing-keywords', currentContentHash: hash } };
       // The marker vouches for the state the PR holds, so publish it first when it differs (a base-only round or a late mark-implemented leaves the
       // copies apart). A PR that holds a state this copy did not publish or restore is refused (stale-publication, exit 1); GitHub failing is exit 3.
       publishTriage({ gh, root, pr, state });
