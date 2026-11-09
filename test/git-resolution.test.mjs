@@ -894,3 +894,151 @@ test('mergeTree / mergeTreeDetailed: an overBuffer run throws, never reports con
   // sanity: the same stdout without the flag still reads as conflicts, so the throw above is the flag's doing
   assert.equal(mergeTree('main', 'feat', { run: () => ({ code: 1, stdout: `${'a'.repeat(40)}\n`, stderr: '', timedOut: false, signal: null }) }).clean, false);
 });
+
+// ---------- text / eol attributes do not make a resolution round ineligible ----------
+
+const infoAttributes = (dir, lines) => {
+  mkdirSync(join(dir, '.git', 'info'), { recursive: true });
+  writeFileSync(join(dir, '.git', 'info', 'attributes'), lines === null ? '' : `${lines}\n`);
+};
+const fileOf = (s, name) => ({
+  base: { [name]: T('top', 'x', 'bottom') }, ours: { [name]: T('top', 'o', 'bottom') }, theirs: { [name]: T('top', 't', 'bottom') },
+});
+const oneConflict = () => conflictRepo(fileOf(null, 'f.txt'));
+const catBlobs = (repo, rev, path) => repo.git(['cat-file', 'blob', `${rev}:${path}`]);
+
+test('mergeTreeDetailed: text / eol attributes and core.autocrlf do not change the trial merge (tree id and conflict list), for LF, CRLF and mixed blobs', () => {
+  const lf = (...ls) => ls.map((l) => `${l}\n`).join('');
+  const crlf = (...ls) => ls.map((l) => `${l}\r\n`).join('');
+  const mixed = (a, b, c) => `${a}\r\n${b}\n${c}\r\n`;
+  const inputs = {
+    lf: [lf('top', 'x', 'bottom'), lf('top', 'o', 'bottom'), lf('top', 't', 'bottom')],
+    crlf: [crlf('top', 'x', 'bottom'), crlf('top', 'o', 'bottom'), crlf('top', 't', 'bottom')],
+    mixed: [mixed('top', 'x', 'bottom'), mixed('top', 'o', 'bottom'), mixed('top', 't', 'bottom')],
+  };
+  const attrLines = ['* text', '* text eol=lf', '* text eol=crlf', '* eol=crlf', '* text=auto', '* -text'];
+  for (const [kind, [base, ours, theirs]] of Object.entries(inputs)) {
+    // The commits come first (repo.commit is `git add -A`, which would normalise at check-in), attributes / autocrlf after.
+    const s = conflictRepo({ base: { 'f.txt': base }, ours: { 'f.txt': ours }, theirs: { 'f.txt': theirs } });
+    const fromFull = revParse(s.from, s.o);
+    const tipFull = revParse('main', s.o);
+    for (const [rev, expected] of [[fromFull, ours], [tipFull, theirs]]) {
+      const blob = catBlobs(s.repo, rev, 'f.txt');
+      assert.equal(blob, expected, `${kind}: committed blob bytes`);
+      assert.equal(blob.includes('\r\n'), kind !== 'lf', `${kind}: CRLF presence in the committed blob`);
+    }
+    const baseline = mergeTreeDetailed(fromFull, tipFull, s.o);
+    assert.equal(baseline.clean, false);
+    assert.equal(baseline.conflicts.length, 1);
+    assert.equal(baseline.conflicts[0].path, 'f.txt');
+    // Positive control: merge-tree really reads .git/info/attributes here, so the equivalence assertions below are not vacuous.
+    infoAttributes(s.repo.dir, 'f.txt merge=union');
+    const withUnion = mergeTreeDetailed(fromFull, tipFull, s.o);
+    assert.equal(withUnion.clean, true, `${kind}: merge=union in info/attributes resolves the conflict`);
+    assert.notEqual(withUnion.tree, baseline.tree, `${kind}: the union attribute changes the trial tree`);
+    infoAttributes(s.repo.dir, null);
+    assert.equal(mergeTreeDetailed(fromFull, tipFull, s.o).tree, baseline.tree, `${kind}: emptying info/attributes brings the baseline back`);
+    const shape = (m) => JSON.stringify({ tree: m.tree, clean: m.clean, conflicts: m.conflicts, messages: m.messages });
+    for (const autocrlf of ['false', 'true', 'input']) {
+      s.repo.git(['config', 'core.autocrlf', autocrlf]);
+      for (const line of attrLines) {
+        infoAttributes(s.repo.dir, line);
+        assert.equal(shape(mergeTreeDetailed(fromFull, tipFull, s.o)), shape(baseline), `${kind}, autocrlf=${autocrlf}, attributes "${line}"`);
+        assert.equal(mergeTree(fromFull, tipFull, s.o).tree, baseline.tree, `${kind} mergeTree, autocrlf=${autocrlf}, attributes "${line}"`);
+      }
+      infoAttributes(s.repo.dir, null);
+    }
+    s.repo.git(['config', 'core.autocrlf', 'false']);
+  }
+});
+
+test('mergeTreeDetailed: the user\'s merge.default does not change the trial merge (pinned to text)', () => {
+  const s = oneConflict();
+  const fromFull = revParse(s.from, s.o);
+  const tipFull = revParse('main', s.o);
+  const baseline = mergeTreeDetailed(fromFull, tipFull, s.o);
+  assert.equal(baseline.clean, false);
+  for (const driver of ['union', 'binary']) {
+    s.repo.git(['config', 'merge.default', driver]);
+    const m = mergeTreeDetailed(fromFull, tipFull, s.o);
+    assert.equal(m.tree, baseline.tree, `merge.default=${driver}`);
+    assert.equal(m.clean, false, `merge.default=${driver}`);
+  }
+});
+
+for (const line of ['* text eol=lf', '* text', '* -text', '* text=auto', '* eol=crlf']) {
+  test(`resolutionReviewBase: a conflicted file under "${line}" resolved by choosing lines is eligible`, () => {
+    const s = oneConflict();
+    infoAttributes(s.repo.dir, line);
+    const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+    isOk(decide(s, head));
+  });
+}
+
+test('resolutionReviewBase: under "* text eol=lf", a resolution whose head blob has CRLF line endings (no check-in conversion) is ineligible', () => {
+  const s = oneConflict();
+  infoAttributes(s.repo.dir, '* text eol=lf');
+  try { s.repo.git(['merge', '--no-ff', '-q', '-m', 'merge main', 'main']); } catch { /* conflict */ }
+  const crlfText = 'top\r\no\r\nbottom\r\n';
+  const oid = s.repo.git(['hash-object', '-w', '--no-filters', '--stdin'], { input: crlfText }).trim();
+  s.repo.git(['update-index', '--add', '--cacheinfo', `100644,${oid},f.txt`]);
+  s.repo.git(['commit', '-q', '-m', 'merge main, resolved with CRLF']);
+  const head = revParse('HEAD', s.o);
+  const blob = catBlobs(s.repo, head, 'f.txt');
+  assert.equal(blob, crlfText);
+  assert.ok(blob.includes('\r\n'), 'the committed head blob must hold CRLF bytes');
+  const r = decide(s, head);
+  assert.ok(typeof r.ineligible === 'string' && !r.ineligible.startsWith('attributes'), JSON.stringify(r));
+  isNo(r, 'outside-edit');
+});
+
+for (const [attr, shown] of [['merge=text', 'merge=text'], ['conflict-marker-size=10', 'conflict-marker-size=10'], ['diff=foo', 'diff=foo']]) {
+  test(`resolutionReviewBase: ${attr} on an otherwise eligible conflict is ineligible with the attribute named`, () => {
+    const s = oneConflict();
+    const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+    isOk(decide(s, head)); // the same conflict is eligible without the attribute
+    infoAttributes(s.repo.dir, `f.txt ${attr}`);
+    const r = decide(s, head);
+    isNo(r, 'attributes');
+    assert.ok(r.ineligible.includes(`f.txt has attribute ${shown}`), JSON.stringify(r));
+  });
+}
+
+test('resolutionReviewBase: a strict attribute stays ineligible even next to tolerated text / eol ones', () => {
+  const s = oneConflict();
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  infoAttributes(s.repo.dir, '* text eol=lf\nf.txt merge=text');
+  isNo(decide(s, head), 'attributes');
+});
+
+test('ensureReviewBase: a resolution base is rebuilt on a clone whose info/attributes say "* text eol=lf" (same tree id)', () => {
+  const s = oneConflict();
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  const r = decide(s, head);
+  isOk(r);
+  const clone = cloneOf(s.repo);
+  try {
+    infoAttributes(clone.dir, '* text eol=lf');
+    run('git', ['config', 'core.autocrlf', 'true'], { cwd: clone.dir });
+    assert.equal(ensureReviewBase(roundOf(s, r, head), { cwd: clone.dir }), r.base);
+  } finally { clone.cleanup(); }
+});
+
+test('ensureReviewBase: merge=text on a conflicted path is unavailable, and the message names the pins and the strict attribute list', () => {
+  const s = oneConflict();
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  const r = decide(s, head);
+  const clone = cloneOf(s.repo);
+  try {
+    infoAttributes(clone.dir, 'f.txt merge=text');
+    assert.throws(() => ensureReviewBase(roundOf(s, r, head), { cwd: clone.dir }), (e) => {
+      assert.equal(e.code, 'review-base-unavailable');
+      assert.match(e.message, /f\.txt has attribute merge=text/);
+      assert.match(e.message, /core\.autocrlf/);
+      assert.match(e.message, /merge\.default/);
+      assert.match(e.message, /merge, conflict-marker-size, diff attributes/);
+      assert.doesNotMatch(e.message, /text, eol/);
+      return true;
+    });
+  } finally { clone.cleanup(); }
+});

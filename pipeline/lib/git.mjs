@@ -123,9 +123,15 @@ export const supportsMergeTreeWrite = (o) => {
 // text) or merge.renormalize would change the tree, and the tree id is what a review round records as its base. So would the
 // settings merge-ort reads for rename detection (merge.renames, merge.directoryRenames, merge.renameLimit / diff.renameLimit):
 // they are pinned to git's own documented defaults, so a default-config machine gets the same tree id as before.
+// core.autocrlf=false and merge.default=text are reproducibility pins of the same kind (git's defaults, so default-config
+// tree ids are unchanged): with merge.renormalize off the in-core merge never calls the conversion code that reads
+// core.autocrlf (nor the text / eol attributes), so no test can show that pin biting; merge.default names the driver git
+// uses for a path whose `merge` attribute is unspecified, the only case attributeProblem lets through, and a user's
+// merge.default=union would otherwise change the tree.
 const MERGE_CONFIG = [
   '-c', 'merge.conflictStyle=merge', '-c', 'merge.renormalize=false',
   '-c', 'merge.renames=true', '-c', 'merge.directoryRenames=conflict', '-c', 'merge.renameLimit=7000',
+  '-c', 'core.autocrlf=false', '-c', 'merge.default=text',
 ];
 
 // A trial merge of `head` into `base` that touches no ref, index or working tree (it only writes tree objects).
@@ -214,18 +220,23 @@ const shortList = (xs) => (xs.length > 5 ? `${xs.slice(0, 5).join(', ')} (+${xs.
 
 const MAX_RESOLUTION_HISTORY = 100;
 const TEXT_MODES = new Set(['100644', '100755']);
-// Attributes that change what a trial merge writes (merge driver, marker size) or how the content is read back.
-const MERGE_ATTRS = ['merge', 'conflict-marker-size', 'diff', 'text', 'eol'];
+// Attributes that change what a trial merge writes: the merge driver and marker size (the only two the in-core merge's
+// ll_merge reads) and `diff` (rename detection reads it). Any value other than unspecified makes the round ineligible.
+// `binary` is the macro -diff -merge -text, so a binary-marked path is refused through merge / diff.
+// `text` and `eol` are deliberately NOT here: they act only through renormalization (forced off) and through check-in /
+// checkout conversion, which merge-tree never does. Every blob compared afterwards is read raw with cat-file, so a conversion
+// in the user's real merge commit (CRLF where the trial merge has LF) shows up as a line nobody selected and fails closed.
+const STRICT_MERGE_ATTRS = ['merge', 'conflict-marker-size', 'diff'];
 
 // merge-tree reads attributes from the checkout (and the user's global ones), so a trial merge is only reproducible while
-// none of them is set on the conflicted paths. -> null, or a sentence naming the first attribute that is set.
+// none of STRICT_MERGE_ATTRS is set on the conflicted paths. -> null, or a sentence naming the first attribute that is set.
 function attributeProblem(paths, o) {
   if (paths.length === 0) return null;
   const top = git(['rev-parse', '--show-toplevel'], o).trim();
-  const out = git(['check-attr', '-z', '--stdin', ...MERGE_ATTRS], { ...o, cwd: top, input: paths.map((p) => `${p}\0`).join('') });
+  const out = git(['check-attr', '-z', '--stdin', ...STRICT_MERGE_ATTRS], { ...o, cwd: top, input: paths.map((p) => `${p}\0`).join('') });
   const parts = out.split('\0');
   if (parts.at(-1) === '') parts.pop();
-  if (parts.length !== paths.length * MERGE_ATTRS.length * 3) return 'git check-attr output did not parse';
+  if (parts.length !== paths.length * STRICT_MERGE_ATTRS.length * 3) return 'git check-attr output did not parse';
   for (let i = 0; i < parts.length; i += 3) {
     if (parts[i + 2] !== 'unspecified') return `${parts[i]} has attribute ${parts[i + 1]}=${parts[i + 2]}`;
   }
@@ -389,7 +400,7 @@ export function ensureReviewBase(round, o) {
   if (gitOrNull(['cat-file', '-e', assertRef(id, ['cat-file', '-e', id])], 1, o) !== null) return id;
   const unavailable = (why) => new ReviewBaseUnavailable(
     `review-base-unavailable: the ${kind} review base ${id} is not in this clone and could not be rebuilt (${why}). `
-    + 'A trial merge depends on merge.conflictStyle / merge.renormalize (forced here) and on .gitattributes merge, conflict-marker-size, diff, text, eol attributes of the conflicted paths.',
+    + 'A trial merge depends on merge.conflictStyle / merge.renormalize / core.autocrlf / merge.default (forced here) and on .gitattributes merge, conflict-marker-size, diff attributes of the conflicted paths.',
   );
   let rebuilt;
   try {
