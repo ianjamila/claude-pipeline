@@ -541,6 +541,18 @@ function candidateValue(env, ctx, name) {
   if (typeof env[name] === 'string') return env[name];
   return typeof ctx.vars[name] === 'string' ? ctx.vars[name] : null;
 }
+// R6-B1: this command's prefix with each value read against the assignments BEFORE it, in order, over the line's variables (the shell
+// does the same: `A=/x B=$A git …` gives git B=/x); a name nothing assigned stays as written, so it is dynamic where it is used
+function resolvePrefixEnv(env, ctx) {
+  const out = {};
+  const scope = { ...ctx, vars: { ...ctx.vars } };
+  for (const k of Object.keys(env)) {
+    const v = typeof env[k] === 'string' && env[k].includes('$') ? expandVars(env[k], scope) : env[k];
+    out[k] = v;
+    scope.vars[k] = typeof v === 'string' ? v : scope.vars[k];
+  }
+  return out;
+}
 // R5-B1: the entries a GIT_CONFIG_PARAMETERS value holds: `'key=value' 'key'='value'` (git's own quoting), or plain `key=value` words
 function parseConfigParameters(text) {
   const out = [];
@@ -567,7 +579,9 @@ function envConfigWorkTrees(env, ctx) {
     if (text === null) { unknown = true; continue; }
     const expanded = expandVars(text, ctx);
     if (/^GIT_CONFIG_PARAMETERS$/i.test(name)) {
-      if (DYNAMIC.test(expanded)) { unknown = true; continue; }
+      // R6-B2: the list is read entry by entry: a literal core.worktree is a target whatever else it holds; a dynamic part (which could
+      // be, or add, any entry) leaves the target unknown on top of that
+      if (DYNAMIC.test(expanded)) unknown = true;
       for (const e of parseConfigParameters(expanded)) {
         if (!mayBeWorkTreeKey(e.key)) continue;
         unknown = true;
@@ -610,7 +624,8 @@ function parseGitGlobal(argv, dir, env, ctx) {
   const envWorkTree = envVar(env, ctx, 'GIT_WORK_TREE');
   let targetUnknown = !envWorkTree.known;
   if (typeof envWorkTree.value === 'string' && envWorkTree.value !== '') workTreeRaws.push(envWorkTree.value);
-  const envWt = envConfigWorkTrees(env, ctx); // R4-F1, R5-B1
+  const penv = resolvePrefixEnv(env, ctx); // R6-B1
+  const envWt = envConfigWorkTrees(penv, ctx); // R4-F1, R5-B1
   if (envWt.unknown) targetUnknown = true;
   const configs = [];
   const wtConfigs = [...envWt.entries];
@@ -633,7 +648,7 @@ function parseGitGlobal(argv, dir, env, ctx) {
     // R4-F1: `--config-env=core.worktree=NAME` sets core.worktree from an environment variable: unknown, and (R5-B1) the value NAME holds
     // here is a target; a key that may be core.worktree at run time (R5-F1) counts the same
     if (t.startsWith('--config-env=') || t === '--config-env') {
-      const r = configEnvWorkTree(t === '--config-env' ? argv[++i] : t.slice('--config-env='.length), env, ctx);
+      const r = configEnvWorkTree(t === '--config-env' ? argv[++i] : t.slice('--config-env='.length), penv, ctx);
       if (r) { targetUnknown = true; if (r.entry) wtConfigs.push(r.entry); }
       continue;
     }
