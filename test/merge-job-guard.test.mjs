@@ -1368,3 +1368,107 @@ test('R11-F1 follow-through: an alias named like a built-in that is harmless, or
   // another checkout than the job's: the built-in is judged as written
   assert.equal(decide('git -c alias.reset=status reset --hard', free).decision, 'allow');
 });
+
+// ---- review round 12: git carries the outer global options and prefix env into an alias, then expands it ----
+// R12-B1: a plain alias is re-checked with the outer --git-dir / --work-tree / -c / -C (and the same prefix env), not with the bare expansion
+// R12-B2: a chain longer than the nesting limit is refused, not skipped; R12-F1: a `!` alias body inherits the outer selectors and prefix env
+// R12-F2: every -c definition of an alias name counts (git uses the last); R12-F3: an alias source the guard cannot read leaves the name unknown
+test('R12-B1: a plain alias keeps the outer --git-dir / --work-tree / -c / prefix env when it expands', () => {
+  const { job } = containerWithJob();
+  const free = containerWithJob().container;
+  const at = fwd(job);
+  const envAlias = 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=reset';
+  mark(job, process.pid, 12);
+  for (const c of [
+    `${envAlias} git --git-dir=${at}/.git --work-tree=${at} s --hard`,
+    `${envAlias} git --work-tree=${at} s --hard`,
+    `${envAlias} git --git-dir=${at}/.git s --hard`,
+    `${envAlias} git -c core.worktree=${at} s --hard`,
+    `${envAlias} GIT_DIR=${at}/.git GIT_WORK_TREE=${at} git s --hard`,
+    `${envAlias} GIT_WORK_TREE=${at} git s --hard`,
+    `git --git-dir=${at}/.git --work-tree=${at} -c alias.s=reset s --hard`,
+    `git --work-tree=${at} -c alias.s=reset s --hard`,
+    `GIT_WORK_TREE=${at} git -c alias.s=reset s --hard`,
+    `git -c core.worktree=${at} -c alias.s=reset s --hard`,
+    `git config alias.s reset && git --git-dir=${at}/.git --work-tree=${at} s --hard`,
+    `git config alias.s reset && git --work-tree=${at} s --hard`,
+    `git config alias.s reset && GIT_WORK_TREE=${at} git s --hard`,
+    `git -C ${at} -c alias.s=t -c alias.t=reset s --hard`, // a chain
+    `git --work-tree=${at} -c alias.s=t -c alias.t=reset s --hard`,
+  ]) {
+    jobDenied(c, free);
+  }
+  // -C is applied once: the alias runs where -C put it, not in a directory below it again
+  jobDenied(`git -C ${at} -c alias.s=reset s --hard`, free);
+  assert.equal(decide(`git -C ${fwd(free)} -c alias.s=reset s --hard`, job).decision, 'allow'); // cwd is the job, -C names another checkout
+  // (a relative -C: once, from the directory the command started in; applied twice it would land in a directory that does not exist)
+  const container = join(job, '..', '..');
+  jobDenied('git -C .worktrees/slug -c alias.s=reset s --hard', container);
+  jobDenied('git -C .worktrees -C slug -c alias.s=reset s --hard', container);
+  mkdirSync(join(job, 'src'), { recursive: true });
+  jobDenied('git -C .. -c alias.s=reset s --hard', join(job, 'src')); // (.. once is the checkout; twice would be .worktrees)
+  jobDenied('git -C .. -c alias.s=reset -c alias.t=s t --hard', join(job, 'src'));
+  jobDenied(`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=reset git -C .worktrees/slug s --hard`, container);
+});
+
+test('R12-B1: a plain alias whose outer selector names a checkout no job owns stays allowed', () => {
+  const { job } = containerWithJob();
+  const free = containerWithJob().container;
+  const other = fakeRepo();
+  const o = fwd(other);
+  mark(job, process.pid, 12);
+  for (const c of [
+    `git --git-dir=${o}/.git -c alias.s=reset s --hard`,
+    `git --git-dir=${o}/.git --work-tree=${o} -c alias.s=reset s --hard`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=reset git --git-dir=${o}/.git --work-tree=${o} s --hard`,
+    `git -C ${o} -c alias.st=status st`,
+    `git -C ${fwd(job)} -c alias.st=status st`,
+    `GIT_WORK_TREE=${o} git -c alias.s=reset s --hard`,
+    'git -c alias.status=log status',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.a GIT_CONFIG_VALUE_0=b git a',
+  ]) for (const cwd of [free, job]) {
+    if (cwd === job && /reset/.test(c)) continue; // (cwd is the job: the unresolved-selector cwd fallback is not what these name)
+    assert.equal(decide(c, cwd).decision, 'allow', `${c} @ ${cwd === job ? 'job' : 'free'}`);
+  }
+});
+
+test('R12-B2: an alias chain past the nesting limit is refused, a chain within it is judged', () => {
+  const { job } = containerWithJob();
+  const free = containerWithJob().container;
+  const at = fwd(job);
+  mark(job, process.pid, 12);
+  const chain = (names, last, rest) => {
+    const links = names.slice(0, -1).map((n, k) => [n, names[k + 1]]).concat([[names[names.length - 1], last]]);
+    const env = links.map(([k, v], n) => `GIT_CONFIG_KEY_${n}=alias.${k} GIT_CONFIG_VALUE_${n}=${v}`).join(' ');
+    return `GIT_CONFIG_COUNT=${links.length} ${env} ${rest}`;
+  };
+  const six = ['a', 'b', 'c', 'd', 'e', 'f'];
+  for (const c of [chain(six, 'reset', `git -C ${at} a --hard`), chain(six, 'status', 'git a'), chain(six, 'status', `git -C ${at} a`)]) {
+    const v = decide(c, free);
+    assert.equal(v.decision, 'deny', c);
+    assert.match(v.reason, /nested too deeply/, c);
+  }
+  // five links is still followed (and judged), however it ends
+  const five = ['a', 'b', 'c', 'd', 'e'];
+  jobDenied(chain(five, 'reset', `git -C ${at} a --hard`), free);
+  assert.equal(decide(chain(five, 'status', `git -C ${at} a`), free).decision, 'allow');
+  assert.equal(decide(chain(five, 'status', 'git a'), free).decision, 'allow');
+});
+
+test('R12-F2: every -c definition of an alias name is judged (git uses the last)', () => {
+  const { job } = containerWithJob();
+  const free = containerWithJob().container;
+  const at = fwd(job);
+  mark(job, process.pid, 12);
+  for (const c of [
+    `git -C ${at} -c alias.s=status -c alias.s=reset s --hard`,
+    `git -C ${at} -c alias.s=reset -c alias.s=status s --hard`,
+    `git -C ${at} -c alias.s=status -c alias.S=reset s --hard`,
+    `git -C ${at} -c alias.s=status -c alias.s='!git reset --hard' s`,
+    `git config alias.s status && git -C ${at} -c alias.s=reset s --hard`,
+    `git config alias.s reset && git -C ${at} -c alias.s=status s --hard`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=status git -C ${at} -c alias.s=reset s --hard`,
+  ]) jobDenied(c, free);
+  assert.equal(decide(`git -C ${at} -c alias.s=status -c alias.s=log s`, free).decision, 'allow');
+});
+
