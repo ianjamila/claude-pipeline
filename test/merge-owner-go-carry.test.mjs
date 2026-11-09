@@ -516,3 +516,73 @@ test('R2-F3: the dry run reports another PR\'s dead job marker as a blocker nami
   assert.equal(disarmed, 0);
   assert.equal(existsSync(join(w.root, MERGE_JOB_MARKER)), true);
 });
+
+// ---- review round 3 (R3-B2): an auto-merge that is still armed (after a carry-disarm stop, or armed by anyone) is read before every update ----
+
+test('R3-B2: auto-merge armed before the first update: carry-disarm, the go stands, nothing is updated or merged, the checkout is untouched', async (t) => {
+  const w = world(t);
+  w.mainMoves();
+  go(t, w);
+  const armed = { v: true };
+  let disarmed = 0;
+  const r = await w.merge({ gh: armedGh(w, armed), disableAuto: () => { disarmed += 1; return true; } });
+  assert.equal(r.exitCode, 1, text(r));
+  assert.equal(r.output.error, 'carry-disarm');
+  assert.equal(r.output.goVoid, false);
+  assert.match(r.output.reasons.join(), /auto-merge/);
+  assert.equal(w.updates, 0, 'no update was pushed');
+  assert.deepEqual(w.mergeCalls(), []);
+  assert.equal(w.log.some((l) => /cycle/.test(l)), false, 'the carry loop was never entered');
+  assert.equal(localHead(w), w.h0);
+  assert.equal(existsSync(join(w.root, MERGE_JOB_MARKER)), false);
+});
+
+test('R3-B2: auto-merge armed between two updates: the loop stops before the second one', async (t) => {
+  const w = world(t);
+  w.mainMoves();
+  go(t, w);
+  const armed = { v: false };
+  w.hooks.ci = () => { w.mainMoves(); armed.v = true; }; // main moves during the CI wait (-> a second update is due) and someone arms auto-merge
+  const r = await w.merge({ gh: armedGh(w, armed) });
+  assert.equal(r.exitCode, 1, text(r));
+  assert.equal(r.output.error, 'carry-disarm');
+  assert.equal(r.output.goVoid, false);
+  assert.equal(w.updates, 1, 'the first update was made, the second was not');
+  assert.deepEqual(w.mergeCalls(), []);
+});
+
+test('R3-B2: a stop after a merge command whose disable failed leaves nothing marked, and the retry still refuses while auto-merge is armed (a behind-only PR is not updated into it)', async (t) => {
+  const w = world(t);
+  w.mainMoves();
+  go(t, w);
+  w.mergeResult = 'arm';
+  w.hooks.afterMerge = () => w.mainMoves();
+  const r1 = await w.merge({ disableAuto: () => false });
+  assert.equal(r1.output.error, 'carry-disarm');
+  const updatesAfterFirst = w.updates;
+  const callsAfterFirst = w.mergeCalls().length;
+  // the retry: the marker is gone, the PR is behind again (the owner says merge for the head the checkout holds now), auto-merge is still armed on GitHub
+  w.mainMoves();
+  w.h0 = localHead(w);
+  go(t, w);
+  const r2 = await w.merge({ disableAuto: () => false });
+  assert.equal(r2.exitCode, 1, text(r2));
+  assert.equal(r2.output.error, 'carry-disarm', text(r2));
+  assert.equal(w.updates, updatesAfterFirst, 'no further update was pushed under the armed auto-merge');
+  assert.equal(w.mergeCalls().length, callsAfterFirst);
+});
+
+test('R3-B2: auto-merge not armed: the loop carries on as before and reads the request before each update', async (t) => {
+  const w = world(t);
+  w.mainMoves();
+  go(t, w);
+  const armed = { v: false };
+  const reads = [];
+  const base = armedGh(w, armed);
+  const gh = { ...base, prView: (n, f) => { if (f.includes('autoMergeRequest')) reads.push(w.updates); return base.prView(n, f); } };
+  const r = await w.merge({ gh });
+  assert.equal(r.exitCode, 0, text(r));
+  assert.equal(r.output.merged, true);
+  assert.equal(w.updates, 1);
+  assert.ok(reads.includes(0), 'auto-merge was read before the first update');
+});

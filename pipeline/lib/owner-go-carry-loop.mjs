@@ -89,6 +89,22 @@ export async function recoverDeadJob({ gh, pr, root, config, env, disable, aband
   return dead;
 }
 
+/**
+ * R3-B2: GitHub's own auto-merge request is the durable record of an armed merge (a carry-disarm stop, or anyone arming it): while one is queued, the branch is not updated, because
+ * the queued merge would land the new head before the proof, the review refresh and the final evaluation. Read before EVERY update and at the entry to the carry path.
+ * @returns {null | {stop: string, code: 'carry-disarm'}} null: nothing queued, go on.
+ */
+export function armedAutoMerge({ gh, pr }) {
+  let queued;
+  try {
+    queued = gh.prView(pr, ['autoMergeRequest']).autoMergeRequest;
+  } catch (err) {
+    return { stop: `GitHub could not be read to see whether auto-merge is queued (${String(err?.message ?? err).slice(0, 160)}), so the branch is not updated.`, code: 'carry-disarm' };
+  }
+  if (queued === null || queued === undefined) return null;
+  return { stop: 'Auto-merge is armed on this PR (a merge command or someone else queued it), and an update now would let it land the new head before the proof and the review are redone: nothing was updated. Disable auto-merge (gh pr merge --disable-auto), then run it again.', code: 'carry-disarm' };
+}
+
 const VOID_NOTE = 'The owner\'s "merge" no longer covers what is on the PR: show the request again and wait for the owner to say "merge".';
 const retryNote = (pr) => `The owner's "merge" still stands: run \`P merge --pr ${pr} --owner-go\` again later (the branch is already updated; nothing else changed).`;
 
@@ -142,6 +158,8 @@ export async function runCarryLoop(a) {
       if (held) return holdRefuse(held, { head: cur, carry: { ...stats } });
       const { hold } = await readEligibleHold({ gh, pr, config });
       let view = gh.prView(pr, ['state', 'labels', 'baseRefName']);
+      const armed = armedAutoMerge({ gh, pr });
+      if (armed) return stop(armed.stop, { code: armed.code, extra: { autoMergeDisabled: false } });
       if (hold !== null || blockingLabelsOf(view.labels).some((n) => n.toLowerCase() === 'needs-human')) {
         return stop('A needs-human hold appeared while the merge job was running, and a held PR never carries the owner\'s go.', { voids: true, code: 'carry-hold' });
       }
