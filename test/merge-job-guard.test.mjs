@@ -662,3 +662,55 @@ test('R6-B1 / R6-B2: the same commands are allowed with no marker, a dead marker
     `GIT_CONFIG_PARAMETERS="'user.name=${wt}' 'user.email=$USER'" git reset --hard`,
   ]) assert.equal(decide(c, container).decision, 'allow', `elsewhere: ${c}`);
 });
+
+test('R6-B1: GIT_WORK_TREE / GIT_DIR prefix values read the prefix assignments before them', () => {
+  const { container, job } = containerWithJob();
+  mark(job, process.pid, 12);
+  const wt = fwd(job);
+  const at = fwd(container);
+  for (const command of [
+    `WT=${wt} GIT_WORK_TREE=$WT git reset --hard`,
+    `WT=${wt} GIT_WORK_TREE=\${WT} git checkout x`,
+    `WT=${wt} GIT_WORK_TREE="$WT" git -C ${at} reset --hard`,
+    `A=${wt} B=$A GIT_WORK_TREE=$B git reset --hard`,
+    `env WT=${wt} GIT_WORK_TREE=$WT git reset --hard`,
+    `G=${wt}/.git GIT_DIR=$G git reset --hard`,
+    `G=${wt}/.git GIT_DIR=\${G} git checkout x`,
+    `A=${wt}/.git B=$A GIT_DIR=$B git reset --hard`,
+    `env G=${wt}/.git GIT_DIR=$G git reset --hard`,
+    `G=${wt}/.git GIT_DIR=$G git -C ${at} commit -m x`,
+    `WT=${wt} GIT_WORK_TREE=$WT git -C ${at} reset --hard`,
+  ]) {
+    const v = decide(command, container);
+    assert.equal(v.decision, 'deny', command);
+    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+  }
+  // R4-B1 ordering: a relative value is resolved against the directory the -C options produce
+  assert.equal(decide(`W=.worktrees/slug GIT_WORK_TREE=$W git reset --hard`, container).decision, 'deny');
+  assert.equal(decide(`W=slug GIT_WORK_TREE=$W git -C ${at}/.worktrees reset --hard`, container).decision, 'deny');
+});
+
+test('R6-B1: the same GIT_WORK_TREE / GIT_DIR commands are allowed with no marker, a dead marker, when read-only, or pointing elsewhere', () => {
+  const { container, job } = containerWithJob();
+  const wt = fwd(job);
+  const cmds = [
+    `WT=${wt} GIT_WORK_TREE=$WT git reset --hard`,
+    `A=${wt} B=$A GIT_WORK_TREE=\${B} git checkout x`,
+    `G=${wt}/.git GIT_DIR=$G git reset --hard`,
+    `env G=${wt}/.git GIT_DIR=$G git reset --hard`,
+  ];
+  for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `no marker: ${c}`);
+  mark(job, deadPid());
+  for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `dead marker: ${c}`);
+  mark(job, process.pid);
+  for (const c of [
+    `WT=${wt} GIT_WORK_TREE=$WT git status`,
+    `G=${wt}/.git GIT_DIR=$G git log --oneline`,
+  ]) assert.equal(decide(c, container).decision, 'allow', `read-only: ${c}`);
+  const elsewhere = fwd(fakeRepo());
+  for (const c of [
+    `WT=${elsewhere} GIT_WORK_TREE=$WT git reset --hard`,
+    `G=${elsewhere}/.git GIT_DIR=$G git reset --hard`,
+    `WT=${wt} OTHER=$WT GIT_WORK_TREE=${elsewhere} git reset --hard`,
+  ]) assert.equal(decide(c, container).decision, 'allow', `elsewhere: ${c}`);
+});

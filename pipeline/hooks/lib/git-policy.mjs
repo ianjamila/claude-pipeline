@@ -613,7 +613,8 @@ function configEnvWorkTree(text, env, ctx) {
 
 function parseGitGlobal(argv, dir, env, ctx) {
   let d = dir;
-  const envGitDir = envVar(env, ctx, 'GIT_DIR');
+  const penv = resolvePrefixEnv(env, ctx); // R6-B1: a prefix value reads the prefix assignments before it
+  const envGitDir = envVar(penv, ctx, 'GIT_DIR');
   let gitDirUnknown = !envGitDir.known; // exported twice: which repository the command acts on cannot be told
   // R4-B1: git resolves a relative --git-dir / --work-tree / GIT_DIR / GIT_WORK_TREE against the directory ALL the -C options produce
   // (`git --git-dir=a.git -C c status` is `git --git-dir=c/a.git status`), wherever they sit among the options. So the values are
@@ -621,10 +622,9 @@ function parseGitGlobal(argv, dir, env, ctx) {
   const gitDirRaws = [];
   const workTreeRaws = [];
   if (typeof envGitDir.value === 'string' && envGitDir.value !== '') gitDirRaws.push(envGitDir.value);
-  const envWorkTree = envVar(env, ctx, 'GIT_WORK_TREE');
+  const envWorkTree = envVar(penv, ctx, 'GIT_WORK_TREE');
   let targetUnknown = !envWorkTree.known;
   if (typeof envWorkTree.value === 'string' && envWorkTree.value !== '') workTreeRaws.push(envWorkTree.value);
-  const penv = resolvePrefixEnv(env, ctx); // R6-B1
   const envWt = envConfigWorkTrees(penv, ctx); // R4-F1, R5-B1
   if (envWt.unknown) targetUnknown = true;
   const configs = [];
