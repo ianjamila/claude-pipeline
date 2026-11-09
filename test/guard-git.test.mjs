@@ -848,7 +848,6 @@ const BYPASS_ALLOW = [
   ['gh alias set pv "pr view" && gh pv 5'],
   ['LABEL=bug; gh pr edit 3 --add-label $LABEL'],
   ['gh api graphql -f query=\'mutation { addComment(input:{subjectId:"X", body:"y"}) { clientMutationId } }\''],
-  ['gh api graphql -f query=\'mutation($id: ID!) { enablePullRequestAutoMerge(input:{pullRequestId:$id}) { clientMutationId } }\' -f id=X'],
   ['gh api graphql -f query=\'mutation { disablePullRequestAutoMerge(input:{pullRequestId:"X"}) { clientMutationId } }\''],
   ['gh api graphql -f query=\'mutation { resolveReviewThread(input:{threadId:"X"}) { clientMutationId } minimizeComment(input:{subjectId:"Y", classifier: RESOLVED}) { clientMutationId } }\''],
   ['gh api graphql -f query=\'mutation { markPullRequestReadyForReview(input:{pullRequestId:"X"}) { clientMutationId } }\''],
@@ -889,6 +888,30 @@ for (const [command, o] of BYPASS_ALLOW) {
     assert.equal(v.decision, 'allow', 'expected allow, got deny (' + v.reason + ') for: ' + command);
   });
 }
+
+// Merge queue (Fable F4, owner Q2): on a queue branch "merge when ready" IS an enqueue, so sessions queue or merge only through
+// `P merge --pr N` (it pins the approved head). `P merge` runs gh as a child process, which the hook never sees.
+const QUEUE_MUTATIONS = {
+  enqueuePullRequest: 'mutation{enqueuePullRequest(input:{pullRequestId:"X",expectedHeadOid:"0123456789012345678901234567890123456789"}){clientMutationId}}',
+  dequeuePullRequest: 'mutation{dequeuePullRequest(input:{id:"X"}){clientMutationId}}',
+  enablePullRequestAutoMerge: 'mutation($id: ID!) { enablePullRequestAutoMerge(input:{pullRequestId:$id}) { clientMutationId } }',
+};
+for (const [name, q] of Object.entries(QUEUE_MUTATIONS)) {
+  test(`DENY ${name} through the GraphQL API: queue or merge with P merge --pr N`, () => {
+    const v = evaluate(`gh api graphql -f query='${q}' -f id=X`, { branch: 'agent/x' });
+    assert.equal(v.decision, 'deny');
+    assert.match(v.reason, /P merge --pr/);
+    assert.match(v.reason, /pins the approved head/);
+    assert.ok(v.reason.includes(name), 'the message names the refused mutation');
+  });
+}
+
+test('disablePullRequestAutoMerge stays allowed, and the allowed list no longer names enablePullRequestAutoMerge', () => {
+  assert.equal(evaluate("gh api graphql -f query='mutation { disablePullRequestAutoMerge(input:{pullRequestId:\"X\"}) { clientMutationId } }'", { branch: 'agent/x' }).decision, 'allow');
+  const v = evaluate("gh api graphql -f query='mutation { mergePullRequest(input:{pullRequestId:\"X\"}) { clientMutationId } }'", { branch: 'agent/x' });
+  assert.ok(!v.reason.includes('enablePullRequestAutoMerge'));
+  assert.ok(v.reason.includes('disablePullRequestAutoMerge'));
+});
 
 test('an overridden branch is looked up by name, and only for the directory it changed', () => {
   let v = evaluate('git checkout agent/y && git push', { pushDest: () => null });
