@@ -43,6 +43,12 @@ or ambiguous test ⇒ today's behaviour exactly: `whole-pr` range, counted round
       paths>` must report `unspecified` for every conflicted path; otherwise ineligible (a `-merge`/`merge=binary`/
       `merge=union`/marker-size attribute changes the tree or hides a conflict). Every conflicted path must yield ≥ 1
       parsed conflict block (a conflicted file with no markers ⇒ ineligible).
+      *Amended 2026-11-09:* only `merge`, `conflict-marker-size` and `diff` must be `unspecified`; `text` and `eol` are
+      tolerated (a repo with `*.mjs text eol=lf` could never have a resolution-only round, #196). They act only through
+      renormalization (forced off) and check-in/checkout conversion, which merge-tree never does, and every blob compared
+      is read raw, so a conversion in the real merge commit shows up as an unselected line and fails closed (proof: the
+      equivalence and CRLF tests in test/git-resolution.test.mjs). The trial merge also pins `core.autocrlf=false` and
+      `merge.default=text` (git's defaults, so recorded tree ids stay rebuildable).
    c. **Only conflicted files changed.** `git diff --name-only --no-renames -z <markerTree>..head` is non-empty and every
       path is in `conflicted`. The full conflicted list is used for this check (not the 50-path reporting cap).
    d. **Every block resolved by SELECTING side lines only; nothing else changed.** (Codex plan R2: replacement text
