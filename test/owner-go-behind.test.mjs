@@ -9,7 +9,9 @@ import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { bump, cli, ghEntries, scenario, ymlFor, PR } from './helpers/gate-env.mjs';
 import { ymlWith } from './helpers/ci-proof-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { behindFreshEnough, READABLE_MERGE_STATES, waitBlockers, waitForMerge } from '../pipeline/lib/finalgate.mjs';
+import { behindFreshEnough, evaluateOwnerGo, READABLE_MERGE_STATES, waitBlockers, waitForMerge } from '../pipeline/lib/finalgate.mjs';
+import { loadConfig } from '../pipeline/lib/config.mjs';
+import { createGitHub } from '../pipeline/lib/github.mjs';
 
 const goYml = (yml = ymlFor()) => yml.replace('{pr} {sha}', '{pr} --match-head-commit {sha}');
 // The base's config: opted in (or not) and optionally more merge keys. The merge section is the last one, right after wait_minutes.
@@ -331,4 +333,40 @@ test('behindFreshEnough: with an opted-in base and a readable state, a failed PR
   const mainSide = behindFreshEnough({ ...args, diff: () => ({ ok: true, mb: missing, files: [] }) });
   assert.equal(mainSide.ok, false);
   assert.match(mainSide.reason, /could not (compare|count)/);
+});
+
+// ---- merge queue: the queue merges on a fresh base, so a behind PR is no problem there -------------------------------------------------
+
+test('owner-go evaluator on a behind PR: queue on => no behind-base problem; queue off => behind-base; unreadable => queue-state (fail closed)', async () => {
+  const s = fresh({ yml: goYml() }); // the base does not opt in to `disjoint`: only the queue can lift the behind refusal
+  const tip = mainMoves(s, (repo) => repo.write('other.txt', 'x\n'));
+  const { config } = await loadConfig(s.repo.dir);
+  const evaluate = (o) => {
+    behindScript(s, tip, o);
+    const gh = createGitHub({ cwd: s.repo.dir, env: s.fake.env });
+    return evaluateOwnerGo({ root: s.repo.dir, config, pr: PR, gh, env: {} });
+  };
+  const detail = (live, name) => live.checks.find((c) => c.name === name)?.detail ?? '';
+
+  const off = await evaluate({ queue: false });
+  assert.match(detail(off, 'pr-open'), /behind-base/);
+  assert.equal(off.behind, null);
+  assert.ok(!off.failed.includes('queue-state'));
+
+  const on = await evaluate({ queue: true });
+  assert.doesNotMatch(detail(on, 'pr-open'), /behind-base/);
+  assert.ok(!on.failed.includes('pr-open'), JSON.stringify(on.checks.filter((c) => !c.ok)));
+  assert.equal(on.behind, null, 'the disjoint report is for the direct path only');
+
+  const unreadable = await evaluate({ queue: 'error' });
+  assert.equal(unreadable.ok, false);
+  assert.ok(unreadable.failed.includes('queue-state'), unreadable.failed.join());
+  assert.match(detail(unreadable, 'pr-open'), /behind-base/, 'an unreadable queue never lifts the behind refusal');
+
+  // A PR that is not behind never needs the queue read (no extra GraphQL call, no new failure mode).
+  const calls = s.fake.calls().length;
+  s.fake.setScript(script(s, { baseOid: s.baseTip, queue: 'error' }));
+  const current = await evaluateOwnerGo({ root: s.repo.dir, config, pr: PR, gh: createGitHub({ cwd: s.repo.dir, env: s.fake.env }), env: {} });
+  assert.ok(!current.failed.includes('queue-state'));
+  assert.ok(!s.fake.calls().slice(calls).some((c) => c.argv[0] === 'api' && c.argv[1] === 'graphql'));
 });

@@ -123,6 +123,10 @@ export function ghEntries(o) {
         ? { match: '^pr checks 12 .*--required$', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
         : { match: '^pr checks 12 .*--required$', stdoutJson: o.requiredCi ?? ci },
     { match: '^pr checks 12 ', stdoutJson: ci },
+    // The live merge-queue read (gh.queueState): off unless a test says `queue: true`; `queue: 'error'` = GitHub cannot answer.
+    o.queue === 'error'
+      ? { match: 'QueueState', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
+      : { match: 'QueueState', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_node12', state: pr.state, headRefOid: o.prHead, isMergeQueueEnabled: o.queue === true, mergeCommit: null, mergeQueueEntry: null } } } } },
     { match: '^auth status', code: 0 },
     ME,
     REPO,

@@ -19,7 +19,14 @@ const MAX_PAGES = 100;
 
 const nodesOf = (conn) => (Array.isArray(conn?.nodes) ? conn.nodes.filter((n) => n !== null && typeof n === 'object') : []);
 
-export const encodePath = (p) => String(p).split('/').map(encodeURIComponent).join('/');
+// A merge-queue reply that does not have the shape we asked for is a failure, not an empty queue.
+const queueError = (message) => new GhError({ code: 0, stderr: `merge queue: ${message}`, args: ['api', 'graphql'] });
+function queueField(value, type, label) {
+  if (typeof value !== type || (type === 'string' && value === '')) throw queueError(`${label} is missing or malformed`);
+  return value;
+}
+
+export const encodePath =(p) => String(p).split('/').map(encodeURIComponent).join('/');
 
 function prNumber(n) {
   const v = typeof n === 'string' && /^\d+$/.test(n) ? Number(n) : n;
@@ -337,6 +344,93 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     statusesOf: (head) => pagedList(`repos/${self.repo().slug}/commits/${encodeURIComponent(head)}/statuses?per_page=100`),
     // Rules that apply to a branch from repository rulesets; an empty list means none.
     branchRules: (branch) => pagedList(`repos/${self.repo().slug}/rules/branches/${encodePath(branch)}?per_page=100`),
+    // ---- merge queue (GraphQL only: REST has no queue reads). Replies are checked field by field and anything off throws
+    // GhError: an unreadable queue is never read as "no queue" (the callers fail closed).
+    // The GraphQL node id of a PR (enqueue / dequeue name the PR by it).
+    prNodeId(n) {
+      const { owner, name } = self.repo();
+      const data = self.graphql('query PrNodeId($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id}}}', { owner, name, number: Number(prNumber(n)) });
+      return queueField(data?.repository?.pullRequest?.id, 'string', 'the PR node id');
+    },
+
+    // One query: is a queue required on the PR's base, is the PR in it (and where), and how did the PR end.
+    // -> { enabled, inQueue, state: OPEN|MERGED|CLOSED, head, mergeSha|null, entry: { id, state, position, enqueuedAt, headCommit|null }|null }
+    // `entry.headCommit` is null while the entry is only QUEUED: GitHub builds the queue commit later (Phase 0 D2).
+    queueState(n) {
+      const { owner, name } = self.repo();
+      const data = self.graphql(`query QueueState($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id state headRefOid isMergeQueueEnabled mergeCommit{oid} mergeQueueEntry{id state position enqueuedAt headCommit{oid}}}}}`, { owner, name, number: Number(prNumber(n)) });
+      const pr = data?.repository?.pullRequest;
+      if (!pr || typeof pr !== 'object') throw queueError('GraphQL reply has no pullRequest');
+      if (!['OPEN', 'MERGED', 'CLOSED'].includes(pr.state)) throw queueError(`unexpected PR state ${JSON.stringify(pr.state)}`);
+      const e = pr.mergeQueueEntry ?? null;
+      let entry = null;
+      if (e !== null) {
+        queueField(e.id, 'string', 'the queue entry id');
+        queueField(e.state, 'string', 'the queue entry state');
+        queueField(e.position, 'number', 'the queue entry position');
+        queueField(e.enqueuedAt, 'string', 'the queue entry time');
+        entry = { id: e.id, state: e.state, position: e.position, enqueuedAt: e.enqueuedAt, headCommit: e.headCommit?.oid ?? null };
+      }
+      return {
+        enabled: queueField(pr.isMergeQueueEnabled, 'boolean', 'isMergeQueueEnabled'),
+        inQueue: entry !== null,
+        state: pr.state,
+        head: queueField(pr.headRefOid, 'string', 'headRefOid'),
+        mergeSha: pr.mergeCommit?.oid ?? null,
+        entry,
+      };
+    },
+
+    // The PR's queue history in timeline order (the order is what matches a removal to its enqueue; timestamps can tie):
+    // -> [{ type: 'added'|'removed'|'merged', at, reason|null, actor|null, beforeCommit|null }]. `reason` is GitHub's own string
+    // (`failed_checks`, `manual`, `merged`, ...); `beforeCommit` is the queue commit a removal ended (D6: the merge commit on `merged`).
+    queueEvents(n) {
+      const { owner, name } = self.repo();
+      const query = `query QueueEvents($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){timelineItems(first:100,after:$after,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT,MERGED_EVENT]){nodes{__typename ... on AddedToMergeQueueEvent{createdAt actor{login}} ... on RemovedFromMergeQueueEvent{createdAt reason actor{login} beforeCommit{oid}} ... on MergedEvent{createdAt actor{login}}} pageInfo{hasNextPage endCursor}}}}}`;
+      const TYPES = { AddedToMergeQueueEvent: 'added', RemovedFromMergeQueueEvent: 'removed', MergedEvent: 'merged' };
+      const events = [];
+      let after = null;
+      const seen = new Set();
+      for (let page = 0; page < MAX_PAGES; page += 1) {
+        const conn = self.graphql(query, { owner, name, number: Number(prNumber(n)), after })?.repository?.pullRequest?.timelineItems;
+        if (!conn || !Array.isArray(conn.nodes)) throw queueError('GraphQL reply has no timelineItems');
+        for (const node of conn.nodes) {
+          const type = TYPES[node?.__typename];
+          if (type === undefined) throw queueError(`unexpected timeline event ${JSON.stringify(node?.__typename ?? null)}`);
+          events.push({
+            type,
+            at: queueField(node.createdAt, 'string', 'an event time'),
+            reason: type === 'removed' ? (node.reason ?? null) : null,
+            actor: node.actor?.login ?? null,
+            beforeCommit: type === 'removed' ? (node.beforeCommit?.oid ?? null) : null,
+          });
+        }
+        if (conn.pageInfo?.hasNextPage !== true) return events;
+        after = conn.pageInfo.endCursor;
+        if (typeof after !== 'string' || after === '' || seen.has(after)) throw queueError('GraphQL pagination did not advance');
+        seen.add(after);
+      }
+      throw queueError(`more than ${MAX_PAGES} pages of queue events`);
+    },
+
+    // Puts the PR in the queue, pinned to `sha`: GitHub refuses if the head moved ("expected head oid does not match", D1), so the
+    // owner's approval of one head can never queue another. -> { id, state, position }. Throws (GhError) on any refusal.
+    enqueue(n, sha) {
+      if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha)) throw new TypeError(`invalid head sha: ${JSON.stringify(sha)}`);
+      const id = self.prNodeId(n);
+      const data = self.graphql('mutation Enqueue($pullRequestId:ID!,$expectedHeadOid:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$pullRequestId,expectedHeadOid:$expectedHeadOid}){mergeQueueEntry{id state position}}}', { pullRequestId: id, expectedHeadOid: sha });
+      const e = data?.enqueuePullRequest?.mergeQueueEntry;
+      if (!e || typeof e !== 'object') throw queueError('enqueuePullRequest returned no queue entry');
+      return { id: queueField(e.id, 'string', 'the queue entry id'), state: queueField(e.state, 'string', 'the queue entry state'), position: queueField(e.position, 'number', 'the queue entry position') };
+    },
+
+    // Takes the PR out of the queue (the owner's stop conditions, the pipeline's confirmed dequeue).
+    dequeue(n) {
+      const id = self.prNodeId(n);
+      const data = self.graphql('mutation Dequeue($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', { id });
+      if (!data?.dequeuePullRequest || typeof data.dequeuePullRequest !== 'object') throw queueError('dequeuePullRequest returned no answer');
+    },
+
     // The timeline events of an issue or PR (ready_for_review, converted_to_draft, ...).
     timelineOf: (n) => pagedList(`repos/${self.repo().slug}/issues/${prNumber(n)}/timeline?per_page=100`),
     // The workflow runs of one check suite (their created_at tells a draft-era run from a ready-era one).
