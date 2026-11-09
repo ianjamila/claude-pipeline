@@ -754,6 +754,24 @@ function configEnvWorkTree(text, pe, ctx) {
   return { entries: src.list.map((c) => ({ key: 'core.worktree', value: c.v, noValue: false, lit: c.lit })), unknown: src.unknown, refused };
 }
 
+// R12-F3: the alias definitions a `--config-env=NAME=VAR` makes: { aliases: [{ name, value }], unknown }. Only a key that is (or may be) `alias.<name>` counts;
+// VAR must be a name written out, set by this command's prefix or on the line, with every candidate readable
+function configEnvAlias(text, pe, ctx) {
+  const t = String(text ?? '').trim();
+  const eq = splitIndex(t, '=');
+  const key = expandVars(eq < 0 ? t : t.slice(0, eq), ctx).trim();
+  const dyn = DYNAMIC.test(key);
+  const an = /^alias\.(.+)$/is.exec(key)?.[1].toLowerCase() ?? null;
+  if (!dyn && an === null) return { aliases: [], unknown: false };
+  if (eq < 0) return { aliases: [], unknown: dyn };
+  const varName = expandVars(t.slice(eq + 1), ctx);
+  if (DYNAMIC.test(varName) || dyn) return { aliases: [], unknown: true };
+  const av = envCands(pe, ctx, varName);
+  const aliases = av.list.map((c) => ({ name: an, value: c.v }));
+  const unknown = av.unknown || av.refused || av.list.length === 0 || (!pe.has(varName) && unsureVar(ctx, varName)) || av.list.some((c) => (c.lit ? LIT_DYNAMIC : DYNAMIC).test(c.v));
+  return { aliases, unknown };
+}
+
 function parseGitGlobal(argv, dir, env, ctx, raw) {
   let d = dir;
   const penv = resolvePrefixEnv(env, ctx, raw); // R7: every way a prefix value can be read (R6-B1: it reads the prefix assignments before it)
@@ -811,6 +829,8 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
       const kv = argv[++i] ?? '';
       const eq = splitIndex(kv, '=');
       configs.push({ raw: kv, key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1), noValue: eq < 0 });
+      // R12-F3: a key (or a whole word) that is only known at run time may be `alias.<name>`
+      if (DYNAMIC.test(configs[configs.length - 1].key)) aliasUnknown = true;
       if (eq >= 0 && mayBeWorkTreeKey(configs[configs.length - 1].key)) refuseCli(kv.slice(eq + 1)); // R8-B2 / R8-F2
       // R7-F2: `-c core.worktree='$WT'`: the literal word is a target beside the expansion
       if (eq >= 0 && DYNAMIC.test(kv.slice(eq + 1)) && quotedText) wtConfigs.push({ key: configs[configs.length - 1].key, value: kv.slice(eq + 1), noValue: false, lit: true });
@@ -824,6 +844,11 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
     // here is a target; a key that may be core.worktree at run time (R5-F1) counts the same
     if (t.startsWith('--config-env=') || t === '--config-env') {
       const text = t === '--config-env' ? argv[++i] : t.slice('--config-env='.length);
+      // R12-F3: `--config-env=alias.<name>=VAR` defines the alias from the environment variable VAR: its candidates are definitions of it, and a
+      // variable or key that cannot be read leaves the name unknown
+      const ce = configEnvAlias(text, penv, ctx);
+      envAliases.push(...ce.aliases);
+      if (ce.unknown) aliasUnknown = true;
       const r = configEnvWorkTree(text, penv, ctx);
       if (r) { targetUnknown = true; wtConfigs.push(...r.entries); if (r.refused) refused = true; }
       continue;

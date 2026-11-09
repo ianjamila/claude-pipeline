@@ -1455,23 +1455,6 @@ test('R12-B2: an alias chain past the nesting limit is refused, a chain within i
   assert.equal(decide(chain(five, 'status', 'git a'), free).decision, 'allow');
 });
 
-test('R12-F2: every -c definition of an alias name is judged (git uses the last)', () => {
-  const { job } = containerWithJob();
-  const free = containerWithJob().container;
-  const at = fwd(job);
-  mark(job, process.pid, 12);
-  for (const c of [
-    `git -C ${at} -c alias.s=status -c alias.s=reset s --hard`,
-    `git -C ${at} -c alias.s=reset -c alias.s=status s --hard`,
-    `git -C ${at} -c alias.s=status -c alias.S=reset s --hard`,
-    `git -C ${at} -c alias.s=status -c alias.s='!git reset --hard' s`,
-    `git config alias.s status && git -C ${at} -c alias.s=reset s --hard`,
-    `git config alias.s reset && git -C ${at} -c alias.s=status s --hard`,
-    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=status git -C ${at} -c alias.s=reset s --hard`,
-  ]) jobDenied(c, free);
-  assert.equal(decide(`git -C ${at} -c alias.s=status -c alias.s=log s`, free).decision, 'allow');
-});
-
 test('R12-F1: a `!` alias body inherits the outer prefix env and selectors', () => {
   const { job } = containerWithJob();
   const free = containerWithJob().container;
@@ -1525,3 +1508,51 @@ test('R12-F1: a `!` alias body that is harmless, or whose selectors no job owns,
   jobDenied(`git -c alias.s='!git t' -c alias.t='!git s; git -C ${fwd(job)} reset --hard' s`, free);
 });
 
+test('R12-F2: every -c definition of an alias name is judged (git uses the last)', () => {
+  const { job } = containerWithJob();
+  const free = containerWithJob().container;
+  const at = fwd(job);
+  mark(job, process.pid, 12);
+  for (const c of [
+    `git -C ${at} -c alias.s=status -c alias.s=reset s --hard`,
+    `git -C ${at} -c alias.s=reset -c alias.s=status s --hard`,
+    `git -C ${at} -c alias.s=status -c alias.S=reset s --hard`,
+    `git -C ${at} -c alias.s=status -c alias.s='!git reset --hard' s`,
+    `git config alias.s status && git -C ${at} -c alias.s=reset s --hard`,
+    `git config alias.s reset && git -C ${at} -c alias.s=status s --hard`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=status git -C ${at} -c alias.s=reset s --hard`,
+  ]) jobDenied(c, free);
+  assert.equal(decide(`git -C ${at} -c alias.s=status -c alias.s=log s`, free).decision, 'allow');
+});
+
+test('R12-F3: an alias source the guard cannot read makes a name that is no compiled-in command unknown', () => {
+  const { job } = containerWithJob();
+  const free = containerWithJob().container;
+  const at = fwd(job);
+  mark(job, process.pid, 12);
+  for (const c of [
+    `git -C ${at} -c alias.$K=reset s --hard`,
+    `git -C ${at} -c "$(printf alias.s=reset)" s --hard`,
+    `git -C ${at} -c $KV s --hard`,
+    `git -C ${at} --config-env=alias.s=V s --hard`,
+    `git -C ${at} --config-env alias.s=V s --hard`,
+    `git -C ${at} --config-env=alias.$K=V s --hard`,
+    `git -C ${at} --config-env=$KV s --hard`,
+    `V='$X' git -C ${at} --config-env=alias.s=V s --hard`,
+  ]) {
+    const v = decide(c, free);
+    assert.equal(v.decision, 'deny', c);
+    assert.match(v.reason, ALIAS_UNSURE, c);
+  }
+  // a readable VAR feeds the alias lookup
+  jobDenied(`V=reset git -C ${at} --config-env=alias.s=V s --hard`, free);
+  jobDenied(`export V=reset; git -C ${at} --config-env=alias.s=V s --hard`, free);
+  assert.equal(decide(`V=status git -C ${at} --config-env=alias.s=V s`, free).decision, 'allow');
+  // a built-in's own name is never an alias: reset is judged as written, status is harmless
+  assert.equal(decide(`git -C ${at} -c alias.$K=reset reset --hard`, free).decision, 'deny'); // (a -c key that may be core.worktree is refused already)
+  for (const c of [`git -C ${at} -c alias.$K=reset status`, `git -C ${at} --config-env=alias.s=V diff`, 'git -c alias.$K=reset log']) {
+    assert.equal(decide(c, free).decision, 'allow', c);
+  }
+  // an unrelated key that cannot be read does not matter to a name that is not an alias either way... but it may be one, so it is unknown
+  assert.equal(decide('git -c user.name=x status', free).decision, 'allow');
+});
