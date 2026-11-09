@@ -246,3 +246,24 @@ test('--check --wait, an unreadable answer that cannot be retried in time: exit 
   assert.deepEqual(r.json.blockedBy, []);
   assert.match(r.json.reason, /could not be read/);
 });
+
+// A hold command that could not be started (ENOENT, bad cwd) is the command going wrong (exit 2, notStarted:true), not the provider
+// refusing (exit 1) (issue #194). Run in-process so the shell can be replaced.
+test('take / release: a command that could not be started is exit 2 with notStarted:true; a real child exit 1 is still exit 1', async () => {
+  const { run: holdRun } = await import('../pipeline/commands/merge-hold.mjs');
+  const s = world();
+  const boom = async () => { throw new Error('spawn /bin/sh ENOENT'); };
+  for (const extra of [[], ['--release', '--reason', 'parked']]) {
+    const ctx = { cwd: s.repo.dir, env: {}, runHold: boom };
+    const r = await holdRun(['--pr', String(PR), '--repo', s.repo.dir, ...extra], ctx);
+    assert.equal(r.exitCode, 2, extra.join(' '));
+    assert.equal(r.output.ok, false);
+    assert.equal(r.output.confirmed, false);
+    assert.equal(r.output.code, null);
+    assert.equal(r.output.notStarted, true);
+    assert.match(r.output.lines.join(' '), /could not be started/);
+    const refused = await holdRun(['--pr', String(PR), '--repo', s.repo.dir, ...extra], { cwd: s.repo.dir, env: {}, runHold: async () => ({ code: 1, stdout: 'refused\n', stderr: '' }) });
+    assert.equal(refused.exitCode, 1, extra.join(' '));
+    assert.equal('notStarted' in refused.output, false);
+  }
+});
