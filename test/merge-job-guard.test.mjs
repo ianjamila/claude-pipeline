@@ -277,3 +277,86 @@ test('R2-F2: plain fetch, a remote-tracking or tag destination and bisect log / 
   assert.equal(decide('git bisect start HEAD HEAD~5', other).decision, 'allow'); // another checkout
   assert.equal(decide('git update-index --add f', other).decision, 'allow');
 });
+
+// ---- review round 3 (R3-B1): --git-dir / GIT_DIR / --work-tree / GIT_WORK_TREE and an unknown directory name the checkout too ----
+
+const linkedWorktree = (main, name) => { // a linked worktree of `main`: its git dir lives in <main>/.git/worktrees/<name>, and says where the checkout is
+  const wt = realpathSync(mkdtempSync(join(tmpdir(), 'mj-linked-')));
+  const gitDir = join(main, '.git', 'worktrees', name);
+  mkdirSync(gitDir, { recursive: true });
+  writeFileSync(join(gitDir, 'gitdir'), `${join(wt, '.git')}\n`);
+  writeFileSync(join(wt, '.git'), `gitdir: ${gitDir}\n`);
+  return { wt, gitDir };
+};
+
+test('R3-B1: --git-dir, GIT_DIR, --work-tree and GIT_WORK_TREE aimed at a job\'s checkout are refused wherever git is run from', () => {
+  const root = fakeRepo();
+  const other = fakeRepo();
+  mark(root, process.pid, 12);
+  for (const command of [
+    `git -C ${fwd(other)} --git-dir=${fwd(root)}/.git update-ref HEAD ${'b'.repeat(40)}`,
+    `git -C ${fwd(other)} --git-dir ${fwd(root)}/.git checkout x`,
+    `git --git-dir=${fwd(root)}/.git reset --hard`,
+    `GIT_DIR=${fwd(root)}/.git git checkout x`,
+    `export GIT_DIR=${fwd(root)}/.git && git checkout x`,
+    `git -C ${fwd(other)} --work-tree=${fwd(root)} checkout x`,
+    `git --work-tree ${fwd(root)} reset --hard`,
+    `GIT_WORK_TREE=${fwd(root)} git checkout x`,
+    `git -C ${fwd(other)} -c core.worktree=${fwd(root)} checkout x`,
+    `git --git-dir=${fwd(root)}/.git --work-tree=${fwd(root)} commit -m x`,
+  ]) {
+    const v = decide(command, other);
+    assert.equal(v.decision, 'deny', command);
+    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+  }
+});
+
+test('R3-B1: the git dir of a linked worktree resolves to that worktree\'s checkout', () => {
+  const main = fakeRepo();
+  const other = fakeRepo();
+  const { wt, gitDir } = linkedWorktree(main, 'feat');
+  mark(wt, process.pid, 13);
+  assert.equal(decide(`git -C ${fwd(other)} --git-dir=${fwd(gitDir)} update-ref HEAD ${'b'.repeat(40)}`, other).decision, 'deny');
+  assert.equal(decide(`GIT_DIR=${fwd(gitDir)} git checkout x`, other).decision, 'deny');
+  assert.equal(decide(`git -C ${fwd(other)} --git-dir=${fwd(gitDir)} status`, other).decision, 'allow'); // read-only
+});
+
+test('R3-B1: a target that cannot be resolved is refused while the session\'s own checkout is a job\'s', () => {
+  const root = fakeRepo();
+  mark(root, process.pid, 12);
+  for (const command of [
+    'git -C $TARGET reset --hard',
+    'git -C "$(pwd)/.." checkout x',
+    'git --git-dir=$G checkout x',
+    'GIT_DIR=$G git checkout x',
+    'cd $TARGET && git checkout x',
+    'export GIT_DIR=/a/.git; export GIT_DIR=/b/.git; git checkout x',
+    'GIT_WORK_TREE=$W git checkout x',
+  ]) {
+    const v = decide(command, root);
+    assert.equal(v.decision, 'deny', command);
+    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+  }
+});
+
+test('R3-B1: the same commands are allowed with no marker, a dead marker, or when read-only', () => {
+  const root = fakeRepo();
+  const other = fakeRepo();
+  const cmds = [
+    `git -C ${fwd(other)} --git-dir=${fwd(root)}/.git update-ref HEAD ${'b'.repeat(40)}`,
+    `GIT_DIR=${fwd(root)}/.git git checkout x`,
+    `git -C ${fwd(other)} --work-tree=${fwd(root)} checkout x`,
+    `GIT_WORK_TREE=${fwd(root)} git checkout x`,
+    'git -C $TARGET reset --hard',
+    'GIT_DIR=$G git checkout x',
+  ];
+  for (const c of cmds) assert.equal(decide(c, other).decision, 'allow', `no marker: ${c}`);
+  mark(root, deadPid());
+  for (const c of cmds) assert.equal(decide(c, other).decision, 'allow', `dead marker: ${c}`);
+  mark(root, process.pid);
+  for (const c of [`git --git-dir=${fwd(root)}/.git status`, `git -C ${fwd(other)} --git-dir=${fwd(root)}/.git log --oneline`, `GIT_DIR=${fwd(root)}/.git git diff`, `git --work-tree=${fwd(root)} show HEAD`, 'git -C $TARGET status']) {
+    assert.equal(decide(c, other).decision, 'allow', `read-only: ${c}`);
+  }
+  // another session's own checkout is still free, even for an unresolved target
+  assert.equal(decide('git -C $TARGET reset --hard', other).decision, 'allow');
+});

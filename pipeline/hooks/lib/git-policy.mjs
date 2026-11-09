@@ -537,6 +537,12 @@ function parseGitGlobal(argv, dir, env, ctx) {
   const envGitDir = envVar(env, ctx, 'GIT_DIR');
   let gitDirUnknown = !envGitDir.known; // exported twice: which repository the command acts on cannot be told
   let gitDir = typeof envGitDir.value === 'string' && envGitDir.value ? joinDir(d, envGitDir.value, ctx) : null;
+  // R3-B1: a git dir / work tree that is named but cannot be resolved (`--git-dir=$G`) is unknown, not absent
+  let targetUnknown = typeof envGitDir.value === 'string' && envGitDir.value !== '' && gitDir === null;
+  const envWorkTree = envVar(env, ctx, 'GIT_WORK_TREE');
+  if (!envWorkTree.known) targetUnknown = true;
+  let workTree = typeof envWorkTree.value === 'string' && envWorkTree.value ? joinDir(d, envWorkTree.value, ctx) : null;
+  if (typeof envWorkTree.value === 'string' && envWorkTree.value !== '' && workTree === null) targetUnknown = true;
   const configs = [];
   let i = 1;
   for (; i < argv.length; i++) {
@@ -550,13 +556,18 @@ function parseGitGlobal(argv, dir, env, ctx) {
       configs.push({ raw: kv, key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
       continue;
     }
-    if (t.startsWith('--git-dir=')) { gitDir = joinDir(d, t.slice('--git-dir='.length), ctx); gitDirUnknown = false; continue; }
-    if (t === '--git-dir') { gitDir = joinDir(d, argv[++i], ctx); gitDirUnknown = false; continue; }
+    if (t.startsWith('--git-dir=')) { gitDir = joinDir(d, t.slice('--git-dir='.length), ctx); gitDirUnknown = false; targetUnknown ||= gitDir === null; continue; }
+    if (t === '--git-dir') { gitDir = joinDir(d, argv[++i], ctx); gitDirUnknown = false; targetUnknown ||= gitDir === null; continue; }
+    if (t.startsWith('--work-tree=')) { workTree = joinDir(d, t.slice('--work-tree='.length), ctx); targetUnknown ||= workTree === null; continue; }
+    if (t === '--work-tree') { workTree = joinDir(d, argv[++i], ctx); targetUnknown ||= workTree === null; continue; }
     if (GIT_GLOBAL_VALUE.includes(t)) { i++; continue; }
     if (t.startsWith('-')) continue; // boolean global option, or --opt=value
     break;
   }
-  return { d, gitDir, gitDirUnknown, configs, sub: argv[i], args: argv.slice(i + 1) };
+  // a GIT_DIR / GIT_WORK_TREE assigned earlier on the line may or may not reach this command (so it is "unknown"), but where it
+  // points is still a checkout this command may act on
+  const hint = (name) => (typeof ctx.vars[name] === 'string' && ctx.vars[name] !== '' ? joinDir(d, ctx.vars[name], ctx) : null);
+  return { d, gitDir, gitDirUnknown, workTree, targetUnknown, hints: [hint('GIT_DIR'), hint('GIT_WORK_TREE')].filter((x) => x !== null), configs, sub: argv[i], args: argv.slice(i + 1) };
 }
 
 // checkout / switch: which branch is the directory on afterwards?
@@ -760,13 +771,47 @@ function mergeJobVerdict(sub, args, g, ctx) {
     if (dir === null) return null;
     try { return memoLookup(ctx, ['mergejob', dir], () => ctx.mergeJobOf(dir)) ?? null; } catch { return null; }
   };
+  // The first live job that owns any of `dirs`; `unknown` (a target that could not be resolved) adds the session's own directory,
+  // the one checkout whose marker can still be read, so an unresolvable -C / GIT_DIR cannot be used to slip past it (fail closed).
+  const jobOfAny = (dirs, unknown) => {
+    for (const dir of unknown ? [...dirs, ctx.cwd] : dirs) {
+      const job = jobAt(dir);
+      if (job) return job;
+    }
+    return null;
+  };
   if (worktreeMove) {
     // `worktree remove <path>` / `worktree move <path> <new>`: the checkout that goes away is the first path named
-    const job = jobAt(joinDir(g.d, words[1], ctx));
+    const named = joinDir(g.d, words[1], ctx);
+    const job = jobOfAny(named === null ? [] : [named], named === null);
     return job ? mergeJobDeny(job, `\`git worktree ${second}\` of it`) : null;
   }
-  const job = jobAt(g.d);
+  // R3-B1: the checkout a command acts on is not only the directory it runs in: --git-dir / GIT_DIR and --work-tree / GIT_WORK_TREE
+  // (or -c core.worktree=) move it
+  const dirs = [g.d, ...gitTargetCheckouts(g, ctx)].filter((x) => x !== null);
+  const job = jobOfAny(dirs, g.d === null || g.targetUnknown || g.gitDirUnknown);
   return job ? mergeJobDeny(job, `\`git ${verb}\``) : null;
+}
+// the checkouts that --git-dir / GIT_DIR, --work-tree / GIT_WORK_TREE and core.worktree point at: a main repository's `.git` is
+// inside its checkout, a linked worktree's git dir (<common>/worktrees/<name>) names its checkout in its `gitdir` file
+function gitTargetCheckouts(g, ctx) {
+  const out = [];
+  for (const gd of [g.gitDir, ...g.hints]) {
+    if (gd === null) continue;
+    out.push(gd); // the lookup walks up from here to the checkout root holding it (also right for a work tree)
+    try {
+      const text = ctx.readText(path.join(gd, 'gitdir'));
+      const line = typeof text === 'string' ? text.split(/\r?\n/)[0].trim() : '';
+      if (line !== '') out.push(path.dirname(path.resolve(gd, line))); // <worktree>/.git -> <worktree>
+    } catch { /* no gitdir file: not a linked worktree's git dir */ }
+  }
+  if (g.workTree !== null) out.push(g.workTree);
+  for (const c of g.configs) {
+    if (c.key !== 'core.worktree') continue;
+    const wt = joinDir(g.d, c.value, ctx);
+    if (wt !== null) out.push(wt);
+  }
+  return out;
 }
 
 // ---- gh -------------------------------------------------------------------------------------------------
