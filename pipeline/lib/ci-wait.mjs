@@ -16,8 +16,12 @@
 // Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
 // created_at. Freshness that cannot be read counts as fresh (fail fast).
 // A needs:-gated aggregate (EW "Typecheck + Vitest") is only created when its shard jobs finish, ~8-12 min after ready, so a
-// required identity that is still absent at --appear-timeout does not end the wait while any check run or workflow run of the
-// head, created or (re-)started at or after the ready event, is still queued / in progress (reported as `heldBy`); only --timeout bounds that.
+// required identity that is still absent at --appear-timeout does not end the wait while a check run or workflow run of the
+// head is still queued / in progress (reported as `heldBy`, with `predatesReady`); only --timeout bounds that. Which runs hold
+// depends on what is absent (findHolder): a run created or (re-)started at or after the ready event always holds; while an
+// identity is `missing` (no producer at all) a run that started before ready holds too, if it could produce that identity (PR #196:
+// the draft-era push already ran the tests and its aggregate appeared 20 min after ready); stale-skip / stale-fail alone need a
+// ready-era run, since a draft-era run's result would be stale as well.
 // A failure read from a commit status, and an absence verdict past --appear-timeout, are each confirmed by one more read of the
 // head's check runs and statuses before they are reported (#159, #168).
 // RESIDUAL (documented, not closed): a draft-era SUCCESS is not second-guessed. A draft-era success of a name whose ready-event
@@ -101,7 +105,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   let readFailures = 0;
   let lastError = null;
   let readyAtMemo;
-  let held = null; // the ready-era run that last kept an absent required check waiting past --appear-timeout
+  let held = null; // the run that last kept an absent required check waiting past --appear-timeout
   let heldSignature = null;
 
   const getReadyAt = async (pr) => {
@@ -236,27 +240,44 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return out;
   };
 
-  // The first check run or workflow run of the head that was created or (re-)started at or after the ready event and has not
-  // finished, else null. A check run is dated by its workflow run (else its own started_at); a workflow run by its created_at or,
-  // for a re-run, its run_started_at; a run whose age cannot be read does not hold the wait.
-  const findHolder = async (obs, pr) => {
+  // The run (check run or workflow run of the head, not finished) that keeps an absent required check waiting past
+  // --appear-timeout, else null. `missingIds` are the identities with no producer at all (may be empty).
+  //  - A run created or (re-)started at or after the ready event always holds (#159): a check run is dated by its workflow run
+  //    (else its own started_at); a workflow run by its created_at or, for a re-run, its run_started_at. predatesReady: false.
+  //  - While at least one identity is `missing`, a run that started BEFORE ready holds too (PR #196: the draft-era push already ran
+  //    the tests, and a needs:-gated aggregate is created only when its shards finish, long after ready), but only a run that could
+  //    produce a missing identity: for one pinned to an app, a check run of that app or (15368) a workflow run; an unpinned one
+  //    accepts any run. A run whose age cannot be read holds there as well (predatesReady: null). A ready-era run is preferred.
+  //  - With no missing identity (only stale-skip / stale-fail), only the ready-era rule applies: a draft-era run's result is stale too.
+  const ACTIONS_APP_ID = 15368;
+  const findHolder = async (obs, pr, missingIds) => {
     const readyAt = Date.parse(await getReadyAt(pr));
+    const couldProduce = (appId) => missingIds.some((i) => i.appId === null || i.appId === appId);
+    const iso = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString().replace('.000Z', 'Z') : null);
+    let predating = null; // the first accepted run that did not start at or after ready
     for (const run of obs.checkRuns) {
       if (!run || run.status === 'completed') continue;
       const active = await suiteActive(run);
       const at = active.length > 0 ? Math.max(...active) : Date.parse(run.started_at);
-      if (Number.isFinite(at) && at >= readyAt) return { kind: 'check-run', id: run.id ?? null, name: run.name ?? null, status: run.status ?? null, createdAt: Number.isFinite(at) ? new Date(at).toISOString().replace('.000Z', 'Z') : null, url: run.html_url ?? null };
+      const found = { kind: 'check-run', id: run.id ?? null, name: run.name ?? null, status: run.status ?? null, createdAt: iso(at), url: run.html_url ?? null };
+      if (Number.isFinite(at) && at >= readyAt) return { ...found, predatesReady: false };
+      if (predating === null && couldProduce(run.app?.id ?? null)) predating = { ...found, predatesReady: Number.isFinite(at) ? true : null };
     }
     if (readers.headRuns) {
       for (const w of await readers.headRuns(pr.head)) {
         if (!w || !ACTIVE_WORKFLOW_RUN.has(w.status)) continue;
         const created = Date.parse(w.created_at);
         const restarted = Date.parse(w.run_started_at);
+        const found = { kind: 'workflow-run', id: w.id ?? null, name: w.name ?? null, status: w.status, url: w.html_url ?? null };
         const when = Number.isFinite(created) && created >= readyAt ? w.created_at : Number.isFinite(restarted) && restarted >= readyAt ? w.run_started_at : null;
-        if (when !== null) return { kind: 'workflow-run', id: w.id ?? null, name: w.name ?? null, status: w.status, createdAt: when, url: w.html_url ?? null };
+        if (when !== null) return { ...found, createdAt: when, predatesReady: false };
+        if (predating === null && couldProduce(ACTIONS_APP_ID)) {
+          const known = Number.isFinite(created) || Number.isFinite(restarted);
+          predating = { ...found, createdAt: Number.isFinite(created) ? w.created_at : Number.isFinite(restarted) ? w.run_started_at : null, predatesReady: known ? true : null };
+        }
       }
     }
-    return null;
+    return predating;
   };
 
   const statusEvidenceOf = (failures) => failures.map((f) => statusBasis.get(f)).filter(Boolean).map((x) => ({ context: x.context, id: x.id ?? null, state: x.state, createdAt: x.created_at ?? null }));
@@ -360,12 +381,13 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
 
     if (waiting.length > 0) {
       const absent = waiting.filter((s) => s.state === 'missing' || s.state === 'stale-skip' || s.state === 'stale-fail');
-      // Past --appear-timeout an absent identity is final only if nothing of the ready era is still running on the head: a
-      // needs:-gated aggregate is created late by design (#159). Until --timeout the wait goes on, naming what holds it.
-      const holder = absent.length > 0 && elapsed() >= appearTimeoutMs ? await findHolder(obs, pr) : null;
+      // Past --appear-timeout an absent identity is final only if nothing that could still produce it is running on the head: a
+      // needs:-gated aggregate is created late by design (#159), also when the run started before ready (#196, see findHolder).
+      // Until --timeout the wait goes on, naming what holds it.
+      const holder = absent.length > 0 && elapsed() >= appearTimeoutMs ? await findHolder(obs, pr, absent.filter((s) => s.state === 'missing')) : null;
       if (holder !== null) {
         held = holder;
-        const note = `still running past the appear window: ${holder.kind} ${holder.name ?? holder.id} (${holder.status})`;
+        const note = `still running past the appear window: ${holder.kind} ${holder.name ?? holder.id} (${holder.status})${holder.predatesReady === true ? ', started before ready' : holder.predatesReady === null ? ', start time unknown' : ''}`;
         if (note !== heldSignature) {
           heldSignature = note;
           onProgress(note);

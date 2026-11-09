@@ -156,7 +156,7 @@ test('the same wait on a MISSING aggregate (no draft-era skip either) is held by
   const r = await s.run();
   assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
   assert.equal(s.elapsed(), 705_000);
-  assert.deepEqual(r.output.heldBy, { kind: 'workflow-run', id: 55, name: 'CI', status: 'queued', createdAt: '2026-01-01T12:00:05Z', url: 'https://github.example/actions/55' });
+  assert.deepEqual(r.output.heldBy, { kind: 'workflow-run', id: 55, name: 'CI', status: 'queued', createdAt: '2026-01-01T12:00:05Z', url: 'https://github.example/actions/55', predatesReady: false });
 });
 
 test('with nothing ready-era running, the appear deadline ends the wait with the old verdicts (stale-skipped / missing)', async () => {
@@ -171,15 +171,17 @@ test('with nothing ready-era running, the appear deadline ends the wait with the
   assert.equal(missing.elapsed(), 300_000);
 });
 
-test('an in-progress run created BEFORE the ready event does not hold the wait', async () => {
+test('an in-progress run created BEFORE the ready event does not hold a stale-skip, but does hold a MISSING identity (timeout, not missing)', async () => {
   const draftEra = sim(lateAggregate({ appearAt: 99999, shardSuiteCreated: '2026-01-01T11:30:00Z' }));
   const a = await draftEra.run();
   assert.equal(a.output.verdict, 'stale-skipped');
   assert.equal(draftEra.elapsed(), 300_000);
-  const wf = sim({ classic: present('ci'), timeline: readyTimeline, headRuns: [{ id: 9, name: 'Old', status: 'in_progress', created_at: '2026-01-01T11:59:59Z' }] });
+  // spec change (2026-11-09 plan B), not a loosening: a MISSING identity is now held by a pre-ready run that could produce it (the stale-skip half above is unchanged)
+  const wf = sim({ classic: present('ci'), timeline: readyTimeline, headRuns: [{ id: 9, name: 'Old', status: 'in_progress', created_at: '2026-01-01T11:59:59Z' }] }, { timeoutMs: 900_000 });
   const b = await wf.run();
-  assert.equal(b.output.verdict, 'missing');
-  assert.equal(wf.elapsed(), 300_000);
+  assert.equal(b.output.verdict, 'timeout');
+  assert.equal(wf.elapsed(), 900_000);
+  assert.equal(b.output.heldBy.predatesReady, true);
 });
 
 test('an in-progress ready-era run only extends the wait up to the overall --timeout (verdict `timeout`, heldBy reported)', async () => {
@@ -201,6 +203,149 @@ test('a draft-era failure also keeps waiting while a ready-era run is in progres
   const r = await s.run();
   assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
   assert.equal(s.elapsed(), 405_000);
+});
+
+// ---- a MISSING identity is held open by a run that started BEFORE ready (PR #196, 2026-11-09 plan B) ---------------------------
+// The draft-era push already ran the tests; `gh pr ready` came 4 min later; the needs:-gated aggregate `test (windows)` appeared 22
+// min after that. Only a missing identity relaxes the ready-era rule (a stale-skip / stale-fail needs a ready-era holder).
+
+const PRE = '2026-01-01T11:00:00Z'; // before READY (12:00:00Z)
+const HOLDER_SOURCES = ['check run', 'workflow run'];
+// An unfinished pre-ready run of the head, seen as a check run (suite 9, created before ready) or only as a workflow run.
+const holderRuns = (source, active = true) => (source === 'check run'
+  ? { checkRuns: [cr('test (windows shard 1/3)', active ? null : 'success', { check_suite: { id: 9 } })], headRuns: [] }
+  : { checkRuns: [], headRuns: active ? [{ id: 77, name: 'CI', status: 'in_progress', created_at: PRE, run_started_at: PRE, html_url: 'https://github.example/actions/77' }] : [] });
+const preReadySuites = () => () => [{ created_at: PRE, run_started_at: PRE }];
+
+for (const source of HOLDER_SOURCES) {
+  test(`#196 shape (${source}): a pre-ready run in progress holds a missing aggregate past --appear-timeout, then the aggregate passes`, async () => {
+    const aggregate = cr('test (windows)', 'success', { check_suite: { id: 9 } });
+    const s = sim({
+      classic: present('lint', 'test (windows)'), timeline: readyTimeline, suiteRuns: preReadySuites,
+      statuses: (t) => [st('lint', t < 900 ? 'pending' : 'success')],
+      checkRuns: (t) => [...holderRuns(source, t < 900).checkRuns, ...(t >= 900 ? [aggregate] : [])],
+      headRuns: (t) => holderRuns(source, t < 900).headRuns,
+    });
+    const r = await s.run();
+    assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+    assert.equal(r.output.verdict, 'passed');
+    assert.equal(s.elapsed(), 900_000, 'not at the 300s appear deadline');
+    assert.equal(r.output.heldBy.kind, source === 'check run' ? 'check-run' : 'workflow-run');
+    assert.equal(r.output.heldBy.predatesReady, true);
+    assert.ok(s.progress.some((l) => /still running/.test(l) && /started before ready/.test(l)), s.progress.join(' | '));
+  });
+
+  test(`(${source}) a missing identity with a pre-ready run that never ends: verdict timeout at --timeout`, async () => {
+    const s = sim({ classic: present('ci'), timeline: readyTimeline, suiteRuns: preReadySuites, ...holderRuns(source) }, { timeoutMs: 900_000 });
+    const r = await s.run();
+    assert.equal(r.output.verdict, 'timeout');
+    assert.equal(s.elapsed(), 900_000);
+    assert.equal(r.output.heldBy.predatesReady, true);
+  });
+
+  test(`(${source}) missing + only a COMPLETED pre-ready run: missing at the appear deadline, nothing holds`, async () => {
+    const s = sim({ classic: present('ci'), timeline: readyTimeline, suiteRuns: preReadySuites, ...holderRuns(source, false) });
+    const r = await s.run();
+    assert.equal(r.output.verdict, 'missing');
+    assert.equal(s.elapsed(), 300_000);
+    assert.equal(r.output.heldBy, undefined);
+  });
+
+  test(`(${source}) only a stale-skip / stale-fail absent: a pre-ready run in progress does NOT hold (ready-era rule unchanged)`, async () => {
+    const skip = sim({ classic: present('ci'), timeline: readyTimeline, suiteRuns: preReadySuites, ...holderRuns(source), checkRuns: [cr('ci', 'skipped', { check_suite: { id: 3 } }), ...holderRuns(source).checkRuns] });
+    const a = await skip.run();
+    assert.equal(a.output.verdict, 'stale-skipped');
+    assert.equal(skip.elapsed(), 300_000);
+    assert.equal(a.output.heldBy, undefined);
+    const fail = sim({ classic: present('ci'), timeline: readyTimeline, suiteRuns: preReadySuites, ...holderRuns(source), checkRuns: [cr('ci', 'failure', { check_suite: { id: 4 } }), ...holderRuns(source).checkRuns] });
+    const b = await fail.run();
+    assert.equal(b.output.verdict, 'failed');
+    assert.match(b.output.message, /ci=fail .*\(result predates ready\)/);
+    assert.equal(fail.elapsed(), 300_000);
+    assert.equal(b.output.heldBy, undefined);
+  });
+
+  for (const stale of ['skipped', 'failure']) {
+    test(`(${source}) transition: a missing identity becomes a draft-era ${stale} while the pre-ready run still runs => the relaxed hold ends`, async () => {
+      // `lint` is a draft-era skip throughout (mixed with the missing `ci`: the hold lasts while `ci` is missing); at 600s `ci` appears as a draft-era result
+      const s = sim({
+        classic: present('lint', 'ci'), timeline: readyTimeline, suiteRuns: preReadySuites, headRuns: holderRuns(source).headRuns,
+        checkRuns: (t) => [cr('lint', 'skipped', { check_suite: { id: 3 } }), ...holderRuns(source).checkRuns, ...(t >= 600 ? [cr('ci', stale, { check_suite: { id: 4 } })] : [])],
+      });
+      const r = await s.run();
+      assert.equal(s.elapsed(), 600_000, 'held past the 300s appear deadline while `ci` was missing, released when it stopped being missing');
+      if (stale === 'skipped') {
+        assert.equal(r.output.verdict, 'stale-skipped');
+      } else {
+        assert.equal(r.output.verdict, 'failed');
+        assert.match(r.output.message, /ci=fail .*\(result predates ready\)/);
+      }
+      assert.equal(r.output.heldBy.predatesReady, true, 'the output still names the run that held the wait until then');
+    });
+  }
+}
+
+test('app scoping: a missing identity pinned to a non-Actions app is not held by an Actions run; one pinned to Actions, or unpinned, is', async () => {
+  const VERCEL = 8329;
+  const actionsRun = holderRuns('check run');
+  const wfRun = holderRuns('workflow run');
+  const pinned = sim({ classic: present(pin('deploy', VERCEL)), timeline: readyTimeline, suiteRuns: preReadySuites, ...actionsRun });
+  const a = await pinned.run();
+  assert.equal(a.output.verdict, 'missing', 'an Actions check run cannot produce a Vercel check');
+  assert.equal(pinned.elapsed(), 300_000);
+  const pinnedWf = sim({ classic: present(pin('deploy', VERCEL)), timeline: readyTimeline, suiteRuns: preReadySuites, ...wfRun });
+  assert.equal((await pinnedWf.run()).output.verdict, 'missing', 'a workflow run is GitHub Actions');
+  for (const [label, row] of [['pinned to Actions', pin('ci', ACTIONS)], ['unpinned', 'ci']]) {
+    for (const holder of [actionsRun, wfRun]) {
+      const s = sim({ classic: present(row), timeline: readyTimeline, suiteRuns: preReadySuites, ...holder }, { timeoutMs: 900_000 });
+      const r = await s.run();
+      assert.equal(r.output.verdict, 'timeout', `${label}: ${JSON.stringify(r.output)}`);
+      assert.equal(r.output.heldBy.predatesReady, true);
+    }
+  }
+  const vercelRun = { checkRuns: [cr('Vercel build', null, { app: { id: VERCEL }, check_suite: { id: 9 } })], headRuns: [] };
+  const own = sim({ classic: present(pin('deploy', VERCEL)), timeline: readyTimeline, suiteRuns: preReadySuites, ...vercelRun }, { timeoutMs: 900_000 });
+  const b = await own.run();
+  assert.equal(b.output.verdict, 'timeout', 'a pre-ready run of the pinned app holds');
+  assert.equal(b.output.heldBy.predatesReady, true);
+});
+
+test('a run whose age cannot be read holds a MISSING identity (predatesReady null) but not a stale-skip', async () => {
+  const noAge = {
+    checkRuns: [cr('shard', null)], // no check_suite workflow run to date it by, no started_at
+    headRuns: [{ id: 80, name: 'CI', status: 'queued' }], // no created_at / run_started_at
+  };
+  const held = sim({ classic: present('ci'), timeline: readyTimeline, ...noAge, checkRuns: [{ ...noAge.checkRuns[0], check_suite: undefined }] }, { timeoutMs: 900_000 });
+  const a = await held.run();
+  assert.equal(a.output.verdict, 'timeout', JSON.stringify(a.output));
+  assert.equal(a.output.heldBy.kind, 'check-run');
+  assert.equal(a.output.heldBy.predatesReady, null);
+  assert.equal(a.output.heldBy.createdAt, null);
+  const wfOnly = sim({ classic: present('ci'), timeline: readyTimeline, headRuns: noAge.headRuns }, { timeoutMs: 900_000 });
+  const b = await wfOnly.run();
+  assert.equal(b.output.verdict, 'timeout');
+  assert.equal(b.output.heldBy.kind, 'workflow-run');
+  assert.equal(b.output.heldBy.predatesReady, null);
+  // the strict (stale-skip) path keeps refusing such a run
+  const strict = sim({ classic: present('ci'), timeline: readyTimeline, suiteRuns: preReadySuites, headRuns: noAge.headRuns, checkRuns: [cr('ci', 'skipped', { check_suite: { id: 3 } })] });
+  const c = await strict.run();
+  assert.equal(c.output.verdict, 'stale-skipped');
+  assert.equal(strict.elapsed(), 300_000);
+});
+
+test('the pre-ready holder completes and the aggregate appears only on the confirming re-read: passed, re-read exactly once', async () => {
+  const aggregate = cr('test (windows)', 'success', { check_suite: { id: 9 } });
+  // polls 1-21 (t = 0..300s) read the check runs once each; read 22 is the confirming re-read. The holder is in progress up to read 20
+  // (t = 285s, before the deadline) and completed from read 21, so the deadline poll sees no holder and no aggregate => re-read once.
+  const s = sim({
+    classic: present('test (windows)'), timeline: readyTimeline, suiteRuns: preReadySuites,
+    checkRuns: (t, n) => (n >= 22 ? [aggregate] : [cr('test (windows shard 1/3)', n >= 21 ? 'success' : null, { check_suite: { id: 9 } })]),
+  });
+  const r = await s.run();
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(s.elapsed(), 300_000);
+  assert.equal(s.reads.checkRuns, 22, '21 polls + exactly one confirming re-read');
 });
 
 // ---- the absence verdict is confirmed by a fresh read of the check runs and statuses (#168 R1-B1) ----------------------
@@ -231,20 +376,22 @@ test('the confirming re-read happens once: still nothing there => the old verdic
 
 // ---- a re-run keeps its run id and created_at: it is dated by run_started_at too (#168 R1-F2) ------------------------------
 
-test('a re-run of a draft-era workflow run (old created_at, ready-era run_started_at) in progress holds the wait; one started before ready does not', async () => {
+test('a re-run of a draft-era workflow run (old created_at, ready-era run_started_at) in progress holds the wait; one started before ready holds a MISSING identity too', async () => {
   const rerun = (startedAt) => ({ id: 31, name: 'CI', status: 'in_progress', created_at: '2026-01-01T11:00:00Z', run_started_at: startedAt, run_attempt: 2, html_url: 'https://github.example/actions/31' });
   const held = sim({ classic: present('ci'), timeline: readyTimeline, headRuns: [rerun('2026-01-01T12:05:00Z')] }, { timeoutMs: 900_000 });
   const a = await held.run();
   assert.equal(a.output.verdict, 'timeout', JSON.stringify(a.output));
   assert.equal(held.elapsed(), 900_000);
-  assert.deepEqual(a.output.heldBy, { kind: 'workflow-run', id: 31, name: 'CI', status: 'in_progress', createdAt: '2026-01-01T12:05:00Z', url: 'https://github.example/actions/31' });
-  const old = sim({ classic: present('ci'), timeline: readyTimeline, headRuns: [rerun('2026-01-01T11:30:00Z')] });
+  assert.deepEqual(a.output.heldBy, { kind: 'workflow-run', id: 31, name: 'CI', status: 'in_progress', createdAt: '2026-01-01T12:05:00Z', url: 'https://github.example/actions/31', predatesReady: false });
+  // spec change (2026-11-09 plan B), not a loosening: a MISSING identity is now held by a pre-ready run that could produce it
+  const old = sim({ classic: present('ci'), timeline: readyTimeline, headRuns: [rerun('2026-01-01T11:30:00Z')] }, { timeoutMs: 900_000 });
   const b = await old.run();
-  assert.equal(b.output.verdict, 'missing');
-  assert.equal(old.elapsed(), 300_000);
+  assert.equal(b.output.verdict, 'timeout');
+  assert.equal(old.elapsed(), 900_000);
+  assert.equal(b.output.heldBy.predatesReady, true);
 });
 
-test('a check run of a re-run workflow run (old created_at, ready-era run_started_at) in progress holds the wait; one started before ready does not', async () => {
+test('a check run of a re-run workflow run (old created_at, ready-era run_started_at) in progress holds the wait; one started before ready holds a MISSING identity too', async () => {
   const world = (startedAt) => ({
     classic: present('Typecheck + Vitest'), timeline: readyTimeline,
     checkRuns: [cr('Typecheck + Vitest (shard 1/2)', null, { check_suite: { id: 7 } })],
@@ -255,10 +402,13 @@ test('a check run of a re-run workflow run (old created_at, ready-era run_starte
   assert.equal(a.output.verdict, 'timeout');
   assert.equal(a.output.heldBy.kind, 'check-run');
   assert.equal(a.output.heldBy.name, 'Typecheck + Vitest (shard 1/2)');
-  const old = sim(world('2026-01-01T11:30:00Z'));
+  assert.equal(a.output.heldBy.predatesReady, false);
+  // spec change (2026-11-09 plan B), not a loosening: a MISSING identity is now held by a pre-ready run that could produce it
+  const old = sim(world('2026-01-01T11:30:00Z'), { timeoutMs: 900_000 });
   const b = await old.run();
-  assert.equal(b.output.verdict, 'missing');
-  assert.equal(old.elapsed(), 300_000);
+  assert.equal(b.output.verdict, 'timeout');
+  assert.equal(old.elapsed(), 900_000);
+  assert.equal(b.output.heldBy.predatesReady, true);
 });
 
 // ---- a failure read from a commit status is confirmed by a fresh read before it is reported (#159 part 2) -----------
