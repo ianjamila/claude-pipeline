@@ -99,7 +99,9 @@ function localAheadOfPublished(local, published, baseline) {
   return (local.rounds ?? []).flatMap((r) => r.items ?? []).some((i) => {
     const before = theirs.get(i.id);
     return before !== undefined && ((i.secondReview !== undefined && before.secondReview === undefined) || (isProtectedFinal(i) && !isProtectedFinal(before))
-      || continuesPublished(i, before));
+      || continuesPublished(i, before)
+      // a mark added after the last publish (`state mark-implemented`, `followups create`) where the published item had none; a changed or removed value is not ahead
+      || (Boolean(i.implemented) && before.implemented === undefined) || (Boolean(i.followupIssue) && before.followupIssue === undefined));
   });
 }
 
@@ -157,7 +159,7 @@ async function showLocked(values, n, pr, root, ctx) {
     if (found?.state && !stateExtends(state, found.state)) {
       if (localAheadOfPublished(state, found, readBaseline(root, pr))) {
         source = 'local-ahead';
-        warnings.push(`the local review state holds a second-review verdict, a Claude ruling (or a change to one) or an owner ruling that the published triage comment lacks (it was saved but not published): kept as is; publish it now with \`pipeline comment --pr ${pr} --kind triage\``);
+        warnings.push(`the local review state holds a second-review verdict, a Claude ruling (or a change to one), an owner ruling, an implementation mark or a follow-up issue link that the published triage comment lacks (it was saved but not published): kept as is; publish it now with \`pipeline comment --pr ${pr} --kind triage\``);
       } else {
         quarantinedTo = path.relative(root, quarantineReviewDir(root)).split(path.sep).join('/');
         state = found.state;

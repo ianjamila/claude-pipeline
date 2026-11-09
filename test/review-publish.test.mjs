@@ -338,6 +338,46 @@ test('state show: a local second-review verdict or Claude ruling on top of what 
   }
 });
 
+test('state show: an implementation mark or a follow-up issue link added after the last publish is kept (local-ahead), not quarantined; another publisher\'s PR still quarantines it', (t) => {
+  const accepted = () => mk([it('R1-B1', { final: decided() }), it('R1-S1', { bucket: 'SUGGESTION', category: 'design', final: { decision: 'FOLLOW-UP', by: 'claude', needsHuman: false, reason: 'later' } })]);
+  for (const [name, id, over] of [
+    ['implemented', 'R1-B1', { implemented: true }],
+    ['followupIssue', 'R1-S1', { followupIssue: 'https://github.com/o/r/issues/9' }],
+  ]) {
+    const w = world(t);
+    const s0 = accepted();
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0);
+    const ahead = change(s0, id, over);
+    saveState(w.A, ahead);
+    const r = w.show(w.A);
+    assertExit(r, 0, name + r.stdout + r.stderr);
+    assert.equal(r.json.source, 'local-ahead', name);
+    assert.equal(r.json.quarantinedTo, undefined, name);
+    assert.match(r.json.warnings.join(' '), /implementation marks|follow-up issue/, name);
+    assert.deepEqual(w.state(w.A), JSON.parse(JSON.stringify(ahead)), `${name}: the local marks are untouched`);
+    assert.equal(readdirSync(join(w.A, '.review')).filter((n) => n.startsWith('stale-')).length, 0, `${name}: nothing was quarantined`);
+    assertExit(w.comment(w.A), 0, name);
+    assert.equal(w.show(w.A).json.source, 'local', `${name}: published now`);
+    // the same mark on a copy whose baseline is not the PR's hash (someone else published since) is superseded
+    const other = world(t);
+    saveState(other.A, s0);
+    assertExit(other.comment(other.A), 0);
+    writeBaseline(other.A, 7, H('f'));
+    saveState(other.A, ahead);
+    const q = other.show(other.A);
+    assert.equal(q.json.source, 'quarantined', name);
+    assert.ok(q.json.quarantinedTo.startsWith('.review/stale-'), name);
+  }
+  // a CHANGED mark is not "ahead": only a mark added where the published item had none
+  const w = world(t);
+  const s1 = change(accepted(), 'R1-S1', { followupIssue: 'https://github.com/o/r/issues/9' });
+  saveState(w.A, s1);
+  assertExit(w.comment(w.A), 0);
+  saveState(w.A, change(s1, 'R1-S1', { followupIssue: 'https://github.com/o/r/issues/10' }));
+  assert.equal(w.show(w.A).json.source, 'quarantined');
+});
+
 test('state show: a truly superseded copy is still quarantined (other published state or no baseline); an owner ruling over a waiting item is local-ahead', (t) => {
   // 1. the baseline is not the published hash: another checkout published since
   const a = world(t);
