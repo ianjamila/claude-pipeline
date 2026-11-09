@@ -184,7 +184,9 @@ export function killTree(pid) {
 }
 
 // Shared by runShellAsync and runAsync: a spawn whose timeout takes the whole process tree down, so no orphan keeps
-// working (or holding the pipes) after the caller has moved on. Resolves; never rejects.
+// working (or holding the pipes) after the caller has moved on. Resolves; never rejects. A child that could not even be STARTED
+// (spawn error: missing binary or shell, a cwd that does not exist) resolves as code 1 with the error text on stderr AND `spawnError: true`
+// (the key exists only on that path), so a caller can tell it from a command that ran and exited 1.
 // `onStart(pid)` (optional) is told the child's pid once it is running (undefined when it could not start): a caller that may have to
 // kill the tree from a signal handler (killTree) needs it while the promise is still pending.
 function spawnAsync(file, args, extra, { cwd, env, input, timeoutMs, onStart } = {}) {
@@ -204,14 +206,14 @@ function spawnAsync(file, args, extra, { cwd, env, input, timeoutMs, onStart } =
     let settled = false;
     let timer;
     let grace;
-    const finish = (code, signal = null) => {
+    const finish = (code, signal = null, extra = {}) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(grace);
       // `signal` is how a caller tells a killed child from a plain `exit 1` (code falls back to 1 without a status). spawnAsync collects
       // all output with no maxBuffer, so `overBuffer` can never be true here; it is returned only so every result has the same shape.
-      resolve({ code: timedOut ? (code || TIMEOUT_EXIT_CODE) : (code ?? 1), stdout, stderr, timedOut, overBuffer: false, signal });
+      resolve({ code: timedOut ? (code || TIMEOUT_EXIT_CODE) : (code ?? 1), stdout, stderr, timedOut, overBuffer: false, signal, ...extra });
     };
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
@@ -220,7 +222,8 @@ function spawnAsync(file, args, extra, { cwd, env, input, timeoutMs, onStart } =
     child.stdin.on('error', () => {}); // EPIPE when the command exits without reading its input
     child.on('error', (err) => {
       if (!stderr) stderr = err.message;
-      finish(1);
+      // `error` also fires for a started child (a failed kill or send): only a child with no pid never started.
+      finish(1, null, child.pid === undefined ? { spawnError: true } : {});
     });
     child.on('close', (code, signal) => finish(code, signal ?? null));
     child.stdin.end(input);
@@ -245,13 +248,13 @@ export function runShellAsync(command, opts = {}) {
 }
 
 // Async `run` (no shell, Windows shims handled like `run`) with the same tree-killing timeout as runShellAsync. A
-// command that cannot be started resolves with a non-zero code and the spawn error ("spawn <cmd> ENOENT") on stderr.
+// command that cannot be started resolves with code 1, the spawn error ("spawn <cmd> ENOENT") on stderr and `spawnError: true`.
 export function runAsync(cmd, args = [], opts = {}) {
   let plan;
   try {
     plan = planSpawn(cmd, args);
   } catch (err) {
-    return Promise.resolve({ code: 1, stdout: '', stderr: err.message, timedOut: false, overBuffer: false, signal: null });
+    return Promise.resolve({ code: 1, stdout: '', stderr: err.message, timedOut: false, overBuffer: false, signal: null, spawnError: true });
   }
   return spawnAsync(plan.file, plan.args, { windowsVerbatimArguments: plan.windowsVerbatimArguments }, opts);
 }

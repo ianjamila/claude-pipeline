@@ -46,15 +46,15 @@ export const run = guarded(async (argv, ctx) => {
       recorder.update({ inFlight: null });
     }
     const warnings = [...recorder.warnings, ...(r.successorWarnings ?? [])];
-    // Only a hold THIS call may have written (info.mayHold = the take ran: exit 1 is "refused OR not confirmed" and may follow a written label, and releasing a label that was never written is a harmless no-op) is given back on its own. A failed catch-up the session must now fix by hand (the updated head's
+    // Only a hold THIS call may have written (info.mayHold = the take ran and started: exit 1 is "refused OR not confirmed" and may follow a written label, and releasing a label that was never written is a harmless no-op) is given back on its own. A failed catch-up the session must now fix by hand (the updated head's
     // required checks failed; the update conflicts) or a hold check that could not be read after an UNCONFIRMED take (the label may be written) releases it; a queued-behind race loss keeps the younger hold (the caller waits for its turn); every other outcome keeps it.
     // A hold-unreadable re-check after a CONFIRMED take keeps the (real) hold: only the check failed to read, a release would give away the turn.
     const releaseReason = info?.mayHold ? ({ 'checks-failed': 'ci-failed', 'rebase-needed': 'update-conflict', ...(info.taken ? {} : { 'hold-unreadable': 'hold-unreadable' }) })[r.outcome] : undefined;
     let holdRelease;
     if (releaseReason !== undefined) {
       const rel = await releaseHold({ config, pr, reason: releaseReason, root, env: ctx.env });
-      holdRelease = { reason: releaseReason, confirmed: rel.confirmed === true, code: rel.code ?? null, lines: rel.lines ?? [] };
-      if (!holdRelease.confirmed) warnings.push(unreleasedWarning({ pr, reason: releaseReason, code: holdRelease.code, takeConfirmed: info.taken, again: true }));
+      holdRelease = { reason: releaseReason, confirmed: rel.confirmed === true, code: rel.code ?? null, lines: rel.lines ?? [], ...(rel.notStarted ? { notStarted: true } : {}) };
+      if (!holdRelease.confirmed) warnings.push(unreleasedWarning({ pr, reason: releaseReason, code: holdRelease.code, notStarted: holdRelease.notStarted === true, takeConfirmed: info.taken, again: true }));
     }
     const { successorWarnings, ...result } = r;
     const head = r.head ?? null;
