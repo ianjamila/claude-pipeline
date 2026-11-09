@@ -120,3 +120,4 @@ full record.
 - 2026-11-09 · #213 · ci-wait waits for a re-run instead of failing on a superseded attempt (#195); Windows start-lock EPERM race · risk high · rounds 3 · arbiter 1 · awaiting-owner-merge
 - 2026-11-09 · #208 · Refuse "Closes #a, #b" PR bodies at review-complete and at the last look before merging · risk high · rounds 7 · arbiter 5 · awaiting-owner-merge
 - 2026-11-09 · #217 · merge-hold: a hold command that could not start is exit 2 (notStarted), not the provider's exit 1 · risk high · rounds 4 · arbiter 1 · awaiting-owner-merge
+- 2026-11-09 · #215 · Resolution-only review tolerates line-ending attributes; ci-wait waits for a late check from a pre-ready run · risk high · rounds 7 · arbiter 2 · awaiting-owner-merge
