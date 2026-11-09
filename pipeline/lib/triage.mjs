@@ -330,6 +330,8 @@ const STRICTNESS = { ACCEPT: 3, 'FOLLOW-UP': 2, REJECT: 1 };
 const strictest = (a, b) => (STRICTNESS[a] >= STRICTNESS[b] ? a : b);
 const claudeFinalIsAccept = (item) => isProtectedFinal(item) && item.final.decision === 'ACCEPT';
 const claudeDismissal = (item) => isClaudeRuled(item) && item.final.decision !== 'ACCEPT' && item.final.needsHuman !== true;
+// A final the writers may still reopen (a second review, a Claude ruling): one waiting for a human, or a Claude dismissal. Anything else is settled.
+export const finalIsReopenable = (item) => item.final?.needsHuman === true || claudeDismissal(item);
 const RERUN = 're-run the judge/arbiter (\`arbiter needed\`) so it answers again, or rule ACCEPT';
 
 // Why a second review (Codex) may not be run for this item, or null. Not for what is settled, built, already reviewed, or a malfunction.
@@ -337,7 +339,7 @@ export function secondReviewRefusal(item) {
   if (!isObject(item)) return 'no item given';
   if (item.implemented === true) return `${item.id} is already implemented`;
   if (item.secondReview !== undefined) return `${item.id} already has a second review`;
-  if (item.final?.needsHuman !== true && !claudeDismissal(item)) {
+  if (!finalIsReopenable(item)) {
     return `${item.id} is not waiting for a human decision and is not a Claude dismissal (settled finals are not reopened)`;
   }
   if (MALFUNCTION_CAUSES.includes(needsHumanCause(item))) return `${item.id} waits because of a ${needsHumanCause(item)} malfunction: ${RERUN}`;
@@ -355,7 +357,7 @@ export function claudeRulingRefusal(item, decision, { secondReview } = {}) {
       ? `${id} is already ACCEPT`
       : `${id} is ACCEPT by Claude or a second review: Claude cannot loosen it; only the owner's typed ruling can`;
   }
-  if (item.final?.needsHuman !== true && !claudeDismissal(item)) {
+  if (!finalIsReopenable(item)) {
     return `${id} is not waiting for a human decision and is not a Claude dismissal (settled finals are not reopened)`;
   }
   if (decision === 'ACCEPT') return null;

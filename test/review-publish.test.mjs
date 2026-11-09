@@ -444,8 +444,13 @@ test('state show (R2-F1): a Claude final over a published owner ruling, or a ver
   // controls: the genuine saved work is still kept
   ahead('real second-review forced ACCEPT', s0, change(s0, 'R1-B1', { secondReview: verdict('ACCEPT'), final: claudeFinal({ decision: 'ACCEPT', forcedBy: 'second-review', claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: waiting() } }) }));
   ahead('verdict then a Claude ruling', s0, change(s0, 'R1-B1', { secondReview: verdict(), final: claudeFinal() }));
-  const plain = mk([it('R1-B1')]);
-  ahead('Claude ruling over a non-owner published final', plain, change(plain, 'R1-B1', { final: claudeFinal({ claude: { ruledAt: 'x', cause: 'low-confidence', critical: true, overruled: decided() } }) }));
+  ahead('Claude ruling over a published final that waits for a human', s0, change(s0, 'R1-B1', { final: claudeFinal({ claude: { ruledAt: 'x', cause: 'low-confidence', critical: true, overruled: waiting() } }) }));
+  // R3-F1: the writers never reopen a settled final (only one waiting for a human, or a Claude dismissal), so a local ruling or verdict over one is not saved work
+  const settled = mk([it('R1-B1')]);
+  quarantined('Claude final over a settled published final', settled, change(settled, 'R1-B1', { final: claudeFinal({ claude: { ruledAt: 'x', cause: 'low-confidence', critical: true, overruled: decided() } }) }));
+  quarantined('legacy Claude final (no overruled) over a settled published final', settled, change(settled, 'R1-B1', { final: claudeFinal({ claude: undefined }) }));
+  quarantined('verdict only over a settled published final', settled, change(settled, 'R1-B1', { secondReview: verdict() }));
+  quarantined('forced ACCEPT over a settled published final', settled, change(settled, 'R1-B1', { secondReview: verdict('ACCEPT'), final: claudeFinal({ decision: 'ACCEPT', forcedBy: 'second-review', claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: decided() } }) }));
 });
 
 test('state show: a truly superseded copy is still quarantined (other published state or no baseline); an owner ruling over a waiting item is local-ahead', (t) => {

@@ -10,7 +10,7 @@ import { grantIdOf, ownerGrantedRounds } from '../hooks/lib/owner-go.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { loadState, saveState, updateItems } from '../lib/state.mjs';
-import { isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
+import { finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
 import { readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
@@ -96,7 +96,7 @@ const isObjectLike = (v) => v !== null && typeof v === 'object' && !Array.isArra
 const itemKey = (i) => decidedItemsKey({ items: [i] });
 // A second-review verdict and / or a Claude / forced final saved next to a published item that has none. It is the WHOLE local change: the rest of the decided
 // fields (everything but `final` and `secondReview`) are as published, the verdict is new (or unchanged), and the final is unchanged or a new protected final over
-// a final that is not the owner's (the owner's ruling is never replaced by Claude's) and, where it records what it overruled, overruled exactly the published final.
+// a final that is not the owner's (the owner's ruling is never replaced by Claude's) and can still be reopened (waits for a human, or is a Claude dismissal: finalIsReopenable) and, where it records what it overruled, overruled exactly the published final.
 // `triage second-review` writes the verdict and a forced ACCEPT final (overruling the final it found) together, so that pair is covered; so is a verdict followed by
 // a Claude ruling, and a final that CONTINUES the published one (continuesPublished) is accepted on the same terms. Anything else riding along (a flipped
 // `implemented`, a loosened final, a changed field) is not saved work.
@@ -105,9 +105,10 @@ function savedRulingIsAhead(i, before) {
   if (rest(i) !== rest(before)) return false;
   const verdictAdded = i.secondReview !== undefined && before.secondReview === undefined;
   if (!verdictAdded && canonicalJson(i.secondReview) !== canonicalJson(before.secondReview)) return false;
-  if (canonicalJson(i.final) === canonicalJson(before.final)) return verdictAdded;
+  // The writers never reopen a settled final (triage.mjs secondReviewRefusal / claudeRulingRefusal), so neither a verdict nor a ruling over one is saved work.
+  if (canonicalJson(i.final) === canonicalJson(before.final)) return verdictAdded && finalIsReopenable(before);
   if (continuesPublished(i, before)) return true;
-  if (!isProtectedFinal(i) || isProtectedFinal(before) || isOwnerRuled(before)) return false;
+  if (!isProtectedFinal(i) || isProtectedFinal(before) || isOwnerRuled(before) || !finalIsReopenable(before)) return false;
   const overruled = i.final.claude?.overruled;
   if (overruled !== undefined && canonicalJson(overruled) !== canonicalJson(before.final)) return false;
   return i.final.forcedBy === undefined || verdictAdded;
