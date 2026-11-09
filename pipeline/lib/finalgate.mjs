@@ -1100,7 +1100,7 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MAX_CONSECUTIVE_ERRORS = 3;
 
 // The merge commit of a MERGED PR is sometimes not readable in the same instant: look again a few times.
-async function readMergeSha({ gh, pr, first, sleep, pollMs }) {
+export async function readMergeSha({ gh, pr, first, sleep, pollMs }) {
   let sha = first ?? null;
   for (let i = 0; i < MERGE_SHA_RETRIES && !sha; i++) {
     await sleep(Math.min(pollMs, 2000));
