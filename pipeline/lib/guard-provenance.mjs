@@ -120,6 +120,10 @@ export function parseVerdictArtifactName(name) {
 // A run URL that names a FORMER name of the repository (renamed or transferred; GitHub redirects the old name) is the same repository when
 // both names resolve to one numeric repository id. Both reads must give a positive integer, else (or when a read throws) it is a different repository.
 function sameRepositoryById({ read, a, b, cache }) {
+  // run.repo comes from an attacker-chosen target_url and RUN_URL admits `.` / `..`: never build an API path from a dot segment or a name with no letter or digit.
+  for (const name of [a, b]) {
+    for (const seg of String(name).split('/')) if (seg === '.' || seg === '..' || !/[A-Za-z0-9]/.test(seg)) return false;
+  }
   const idOf = (name) => {
     const key = `repo-id:${String(name).toLowerCase()}`;
     if (!cache.has(key)) {

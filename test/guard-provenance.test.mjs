@@ -358,6 +358,17 @@ test('checkRunProvenance: a run URL that names the former repository name counts
   assert.equal(again.filter((c) => c.startsWith('id:')).length, 0);
 });
 
+test('checkRunProvenance: a run URL with a . or .. segment (or a name with no letter or digit) is refused and no repos/ path is built from it', () => {
+  for (const url of ['https://github.com/../user/actions/runs/1', 'https://github.com/./x/actions/runs/1', 'https://github.com/acme/../actions/runs/1', 'https://github.com/_/-/actions/runs/1', 'https://github.com/.../x/actions/runs/1']) {
+    const calls = [];
+    const r = movedProv({ 'acme/app': '4242' }, { calls, url });
+    assert.equal(r.ok, false, url);
+    assert.equal(r.reason, 'the run belongs to a different repository', url);
+    assert.deepEqual(calls.filter((c) => /\.\.?(\/|$)/.test(c) || c.includes('/_/') || c.includes('/-')), [], `${url}: nothing read from a path built from it`);
+    assert.equal(calls.length, 0, `${url}: nothing read at all`);
+  }
+});
+
 test('checkRunProvenance: a former-name run URL is refused when the ids differ, a read throws, or an id is missing or not a positive integer', () => {
   const refused = (why, ids) => {
     const r = movedProv(ids);
