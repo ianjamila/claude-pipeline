@@ -1189,3 +1189,51 @@ test('R9-F1: an earlier assignment on the line is what a command-line word reads
   // the name set on the line only by the command's own prefix is unset when the word expands: refused
   r8Refused(`X=-safe git --work-tree=${wt}$X reset --hard`, container);
 });
+
+// ---- review round 10 (R10-B1): a GIT_CONFIG_VALUE_n is a path only when its paired key may be core.worktree ----
+
+test('R10-B1: a GIT_CONFIG_VALUE_n whose key is not core.worktree is never a path, however it reads (same as -c)', () => {
+  const { container, job } = containerWithJob();
+  const free = containerWithJob().container;
+  const cfg = (key, value, verb) => `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=${key} GIT_CONFIG_VALUE_0=${value} git ${verb}`;
+  const commands = [
+    cfg('core.commentChar', '-', 'add file.txt'),
+    cfg('user.name', '$USER', 'commit -m x'),
+    cfg('user.name', '~someone', 'commit -m x'),
+    cfg('user.email', '${X:-a@b.c}', 'commit -m x'),
+    cfg('core.commentChar', '$(printf "#")', 'commit -m x'),
+    `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=- && git add file.txt`,
+    'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=$USER; git commit -m x',
+    'git -c core.commentChar=- add file.txt', // the -c path: allowed
+  ];
+  const check = (cwd, label) => { for (const c of commands) assert.equal(decide(c, cwd).decision, 'allow', `${label}: ${c}`); };
+  check(free, 'no marker');
+  check(container, 'unowned cwd, live job elsewhere');
+  mark(job, process.pid, 12);
+  check(container, 'live job in a sibling');
+  check(free, 'live job elsewhere');
+});
+
+test('R10-B1: a GIT_CONFIG_VALUE_n whose key may be core.worktree (or cannot be read) is refused when the value is not resolved', () => {
+  const { container, job } = containerWithJob();
+  const free = containerWithJob().container;
+  const wt = fwd(job);
+  const cfg = (key, value, verb = 'reset --hard') => `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=${key} GIT_CONFIG_VALUE_0=${value} git ${verb}`;
+  const commands = [
+    cfg('core.worktree', `${wt}$X`),
+    cfg('core.worktree', '$X'),
+    cfg('core.worktree', '-'),
+    cfg('Core.WorkTree', `${wt}$X`),
+    cfg('CORE.WORKTREE', '~someone'),
+    cfg('$K', '$X'), // a key that cannot be read stays fail closed
+    cfg('$K', '-'),
+    cfg('$(printf core.worktree)', '$X'),
+    `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x GIT_CONFIG_KEY_1=core.worktree GIT_CONFIG_VALUE_1=${wt}$X git reset --hard`,
+  ];
+  mark(job, process.pid, 12);
+  for (const cwd of [container, free, job]) for (const c of commands) r8Refused(c, cwd);
+  mark(job, deadPid());
+  for (const cwd of [container, free]) for (const c of commands) r8Refused(c, cwd);
+  // read-only verbs stay allowed
+  assert.equal(decide(cfg('core.worktree', `${wt}$X`, 'status'), container).decision, 'allow');
+});

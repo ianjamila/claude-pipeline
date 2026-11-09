@@ -555,6 +555,7 @@ const mayBeWorkTreeKey = (key) => DYNAMIC.test(key) || /^core\.worktree$/i.test(
 //     pieces (`'/r/$a'${T}`) is in neither the literal nor the expanded reading (R8-B2);
 //   - a substituted value (an assignment word's, an env wrapper's, the line's own variable) still holds a `$` or backtick: the shell does not
 //     expand it again, it is the literal text of a path (R8-F2).
+const CONFIG_VALUE_NAME = /^GIT_CONFIG_VALUE_\d+$/i;
 const GIT_SELECTOR_NAME = /^GIT_(?:DIR|WORK_TREE|CONFIG_PARAMETERS|CONFIG_KEY_\d+|CONFIG_VALUE_\d+)$/i; // (the names that select the repository or the work tree)
 const CAND_CAP = 64;
 const CAND_WORK = 500;
@@ -669,7 +670,17 @@ function envConfigWorkTrees(pe, ctx) {
   let unknown = false;
   let refused = false;
   const names = new Set([...pe.keys(), ...assignedNames(ctx)].filter((k) => /^GIT_CONFIG_(?:KEY_\d+|PARAMETERS)$/i.test(k)));
+  // R10-B1: a GIT_CONFIG_VALUE_n is a path only through its paired key. R9: its value must then be FULLY resolved: the resolver says it is not unknown /
+  // refused, and no candidate still holds a `$` / backtick (or is `~user`, `-`). A name the line assigned more than once is refused in parseGitGlobal.
+  // (A value paired with another key, `user.name` or `core.commentChar`, is not looked at: the same as `-c`. A KEY_n the resolver cannot read, or one
+  // that is dynamic, still fails closed: the first because parseGitGlobal refuses an unknown key, the second because it may be core.worktree here.)
+  const valueUnresolved = (valName) => {
+    const v = envCands(pe, ctx, valName);
+    if (v.refused || v.unknown || v.list.some((x) => unresolvedValue(x.v, x.lit, ctx))) return true;
+    return v.list.length === 0 && pe.has(valName);
+  };
   for (const name of names) {
+    const valName = name.replace(/KEY/i, 'VALUE');
     if (!pe.has(name) && (name in ctx.vars || unsureVar(ctx, name))) unknown = true; // (set earlier on the line: may not reach this command)
     const src = envCands(pe, ctx, name);
     if (src.unknown || src.list.length === 0) unknown = true;
@@ -689,10 +700,10 @@ function envConfigWorkTrees(pe, ctx) {
       }
       if (!mayBeWorkTreeCand(text, c.lit)) continue;
       unknown = true;
-      const value = envCands(pe, ctx, name.replace(/KEY/i, 'VALUE'));
+      const value = envCands(pe, ctx, valName);
       if (value.unknown) unknown = true;
-      if (value.refused) refused = true;
       for (const vc of value.list) entries.push({ key: 'core.worktree', value: vc.v, noValue: false, lit: vc.lit });
+      if (valueUnresolved(valName)) refused = true;
     }
   }
   return { entries, unknown, refused };
@@ -728,10 +739,12 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   // R8: a value of a name that selects the repository or the work tree that the resolver could not read one way (see resolvePrefixEnv)
   // R9: and (fail closed by construction) any such name whose candidate set is not FULLY resolved: the resolver says it is `unknown`, a candidate still
   // holds a `$` / backtick (or `~user`) after expansion, or no candidate is left (an unset name: its expansion is what bash passes, not what the line shows)
-  const pathLike = (name) => /^GIT_(?:DIR|WORK_TREE|CONFIG_VALUE_\d+)$/i.test(name);
-  let refused = [...penv].some(([name, c]) => GIT_SELECTOR_NAME.test(name) && (c.refused || c.unknown || c.list.some((x) => (pathLike(name) ? unresolvedValue(x.v, x.lit, ctx) : (x.lit ? LIT_DYNAMIC : DYNAMIC).test(x.v)))));
+  // (R10-B1: not a GIT_CONFIG_VALUE_n, which is judged with its paired key in envConfigWorkTrees)
+  const pathLike = (name) => /^GIT_(?:DIR|WORK_TREE)$/i.test(name);
+  const ownRefusal = (name) => GIT_SELECTOR_NAME.test(name) && !CONFIG_VALUE_NAME.test(name);
+  let refused = [...penv].some(([name, c]) => ownRefusal(name) && (c.refused || c.unknown || c.list.some((x) => (pathLike(name) ? unresolvedValue(x.v, x.lit, ctx) : (x.lit ? LIT_DYNAMIC : DYNAMIC).test(x.v)))));
   // (an `export` / assignment earlier on the line reaches git through hint() and ctx.vars: its value holding a `$` or backtick is refused like a prefix value's)
-  if (Object.keys(ctx.vars).some((k) => GIT_SELECTOR_NAME.test(k) && typeof ctx.vars[k] === 'string' && DYNAMIC.test(ctx.vars[k]))) refused = true;
+  if (Object.keys(ctx.vars).some((k) => ownRefusal(k) && typeof ctx.vars[k] === 'string' && DYNAMIC.test(ctx.vars[k]))) refused = true;
   // (a selector the line assigned or exported more than once has no value to read: which assignment ran is unknown, so it is refused too, unless this
   // command's own prefix sets it to a value that is not itself refused)
   if ([...ctx.unsureVars, ...ctx.tainted].some((k) => GIT_SELECTOR_NAME.test(k) && !(penv.has(k) && !penv.get(k).refused))) refused = true;
