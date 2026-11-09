@@ -1245,3 +1245,81 @@ test('R10-B1: a GIT_CONFIG_VALUE_n whose key may be core.worktree (or cannot be 
   // read-only verbs stay allowed
   assert.equal(decide(cfg('core.worktree', `${wt}$X`, 'status'), container).decision, 'allow');
 });
+
+// R11-F1: an alias defined through environment config (GIT_CONFIG_KEY_n / VALUE_n, GIT_CONFIG_PARAMETERS) is read like `-c alias.X=`
+const ALIAS_UNSURE = /may define the alias/;
+test('R11-F1: an alias defined through environment config that reaches a job\'s checkout is refused', () => {
+  const { container, job } = containerWithJob();
+  const free = containerWithJob().container;
+  const at = fwd(job);
+  const cfg = (key, value, rest) => `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=${key} GIT_CONFIG_VALUE_0=${value} ${rest}`;
+  mark(job, process.pid, 12);
+  // (cwd: the checkout) a plain alias to a mutating verb
+  for (const c of [
+    cfg('alias.s', 'reset', 'git s --hard'),
+    cfg('ALIAS.s', 'reset', 'git s --hard'),
+    cfg('alias.S', 'reset', 'git s --hard'),
+    cfg('alias.s', 'reset', 'git S --hard'),
+    cfg('alias.s', `'!git reset --hard'`, 'git s'),
+    `GIT_CONFIG_PARAMETERS="'alias.s=reset'" git s --hard`,
+    `GIT_CONFIG_PARAMETERS="'alias.s'='reset'" git s --hard`,
+    `GIT_CONFIG_PARAMETERS="'user.name=x' 'alias.s=reset'" git s --hard`,
+    `env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=reset git s --hard`,
+    `env GIT_CONFIG_PARAMETERS="'alias.s=reset'" git s --hard`,
+    `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=reset; git s --hard`,
+    `export GIT_CONFIG_PARAMETERS="'alias.s=reset'"; git s --hard`,
+    `export GIT_CONFIG_COUNT=1; export GIT_CONFIG_KEY_0=alias.s; export GIT_CONFIG_VALUE_0=reset; git s --hard`,
+    `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x GIT_CONFIG_KEY_1=alias.s GIT_CONFIG_VALUE_1=reset git s --hard`,
+  ]) jobDenied(c, job);
+  // (any cwd) a shell alias that names the checkout
+  for (const c of [
+    cfg('alias.s', `'!git -C ${at} reset --hard'`, 'git s'),
+    `GIT_CONFIG_PARAMETERS="'alias.s=!git -C ${at} reset --hard'" git s`,
+    `env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0='!git -C ${at} reset --hard' git s`,
+    `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0='!git -C ${at} reset --hard'; git s`,
+  ]) for (const cwd of [container, free, job]) jobDenied(c, cwd);
+  // a value or key that cannot be read leaves the alias unknown
+  for (const c of [
+    'GIT_CONFIG_PARAMETERS=$P git s',
+    'GIT_CONFIG_PARAMETERS=$(printf x) git s',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K GIT_CONFIG_VALUE_0=reset git s',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=$V git s',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0="!f() { git $X; }; f" git s',
+    `GIT_CONFIG_PARAMETERS="'alias.s=!git $X'" git s`,
+  ]) {
+    const v = decide(c, job);
+    assert.equal(v.decision, 'deny', c);
+    assert.match(v.reason, ALIAS_UNSURE, c);
+  }
+});
+
+test('R11-F1: environment aliases that are harmless, or that no job owns, stay allowed', () => {
+  const { container, job } = containerWithJob();
+  const free = containerWithJob().container;
+  const cfg = (key, value, rest) => `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=${key} GIT_CONFIG_VALUE_0=${value} ${rest}`;
+  mark(job, process.pid, 12);
+  for (const c of [
+    cfg('alias.st', 'status', 'git st'),
+    cfg('alias.st', 'status', 'git ST'),
+    cfg('alias.s', 'reset', 'git st --hard'), // another name
+    cfg('core.commentChar', '-', 'git status'), // R10-B1
+    `GIT_CONFIG_PARAMETERS="'alias.st=status'" git st`,
+    `export GIT_CONFIG_PARAMETERS="'alias.st=status'"; git st`,
+    'GIT_CONFIG_PARAMETERS=$P git status',
+    'GIT_CONFIG_PARAMETERS=$P git log --oneline',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=$V git status',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K GIT_CONFIG_VALUE_0=reset git diff',
+  ]) assert.equal(decide(c, job).decision, 'allow', c);
+  // R10-B1 stays: a non-path value under another key is not judged
+  assert.equal(decide('GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=- git add file.txt', free).decision, 'allow');
+  // no live job: the alias is evaluated and nothing owns the checkout
+  for (const cwd of [container, free, job]) {
+    mark(job, deadPid());
+    for (const c of [cfg('alias.s', 'reset', 'git s --hard'), cfg('alias.s', `'!git -C ${fwd(job)} reset --hard'`, 'git s'), `GIT_CONFIG_PARAMETERS="'alias.s=reset'" git s --hard`]) {
+      assert.equal(decide(c, cwd).decision, 'allow', c);
+    }
+  }
+  // another checkout than the job's
+  mark(job, process.pid, 12);
+  assert.equal(decide(cfg('alias.s', 'reset', 'git s --hard'), free).decision, 'allow');
+});

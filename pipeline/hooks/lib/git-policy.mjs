@@ -669,6 +669,11 @@ function envConfigWorkTrees(pe, ctx) {
   const entries = [];
   let unknown = false;
   let refused = false;
+  // R11-F1: the same entries also define aliases (`alias.<name>`), the way `-c alias.<name>=` does: { name, value }; `aliasUnknown`: a key or value
+  // that may define one cannot be read (an unreadable KEY_n / PARAMETERS, or an alias value that still holds a `$` / backtick)
+  const aliases = [];
+  let aliasUnknown = false;
+  const aliasName = (key) => /^alias\.(.+)$/is.exec(key.trim())?.[1].toLowerCase() ?? null;
   const names = new Set([...pe.keys(), ...assignedNames(ctx)].filter((k) => /^GIT_CONFIG_(?:KEY_\d+|PARAMETERS)$/i.test(k)));
   // R10-B1: a GIT_CONFIG_VALUE_n is a path only through its paired key. R9: its value must then be FULLY resolved: the resolver says it is not unknown /
   // refused, and no candidate still holds a `$` / backtick (or is `~user`, `-`). A name the line assigned more than once is refused in parseGitGlobal.
@@ -684,10 +689,18 @@ function envConfigWorkTrees(pe, ctx) {
     if (!pe.has(name) && (name in ctx.vars || unsureVar(ctx, name))) unknown = true; // (set earlier on the line: may not reach this command)
     const src = envCands(pe, ctx, name);
     if (src.unknown || src.list.length === 0) unknown = true;
+    if (src.unknown || src.refused || src.list.length === 0 || (!pe.has(name) && unsureVar(ctx, name))) aliasUnknown = true;
     if (src.refused) refused = true;
     for (const c of src.list) {
       const text = c.lit ? c.v : expandVars(c.v, ctx);
       if (/^GIT_CONFIG_PARAMETERS$/i.test(name)) {
+        if (c.lit ? LIT_DYNAMIC.test(text) : DYNAMIC.test(text)) aliasUnknown = true;
+        for (const e of parseConfigParameters(text)) {
+          const an = aliasName(e.key);
+          if (an === null) continue;
+          aliases.push({ name: an, value: e.value });
+          if (c.lit ? LIT_DYNAMIC.test(e.value) : DYNAMIC.test(e.value)) aliasUnknown = true;
+        }
         // R6-B2: the list is read entry by entry: a literal core.worktree is a target whatever else it holds; a dynamic part (which could
         // be, or add, any entry) leaves the target unknown on top of that
         if (c.lit ? LIT_DYNAMIC.test(text) : DYNAMIC.test(text)) unknown = true;
@@ -698,6 +711,16 @@ function envConfigWorkTrees(pe, ctx) {
         }
         continue;
       }
+      if (c.lit ? LIT_DYNAMIC.test(text) : DYNAMIC.test(text)) aliasUnknown = true; // (a key that is not read: it may be any alias)
+      const an = aliasName(text);
+      if (an !== null) {
+        const av = envCands(pe, ctx, valName);
+        if (av.unknown || av.refused || (av.list.length === 0 && pe.has(valName))) aliasUnknown = true;
+        for (const vc of av.list) {
+          aliases.push({ name: an, value: vc.v });
+          if (vc.lit ? LIT_DYNAMIC.test(vc.v) : DYNAMIC.test(vc.v)) aliasUnknown = true;
+        }
+      }
       if (!mayBeWorkTreeCand(text, c.lit)) continue;
       unknown = true;
       const value = envCands(pe, ctx, valName);
@@ -706,7 +729,7 @@ function envConfigWorkTrees(pe, ctx) {
       if (valueUnresolved(valName)) refused = true;
     }
   }
-  return { entries, unknown, refused };
+  return { entries, unknown, refused, aliases, aliasUnknown };
 }
 // R4-F1 / R5-B1 / R5-F1: `--config-env=NAME=VAR` (or `--config-env NAME=VAR`) sets config key NAME from environment variable VAR. When NAME is, or may be,
 // core.worktree the target is unknown, and VAR's values (when this command's prefix or an earlier assignment on the line gives any) are targets of their own.
@@ -774,6 +797,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   const envWt = envConfigWorkTrees(penv, ctx); // R4-F1, R5-B1
   if (envWt.unknown) targetUnknown = true;
   if (envWt.refused) refused = true;
+  const envAliases = envWt.aliases; // R11-F1
   const configs = [];
   const wtConfigs = [...envWt.entries];
   let i = 1;
@@ -830,7 +854,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   // a GIT_DIR / GIT_WORK_TREE assigned earlier on the line may or may not reach this command (so it is "unknown"), but where it
   // points is still a checkout this command may act on
   const hint = (name) => (typeof ctx.vars[name] === 'string' && ctx.vars[name] !== '' ? joinDir(d, ctx.vars[name], ctx) : null);
-  return { d, gitDir, gitDirAll, gitDirUnknown, workTree, workTreeAll, targetUnknown, refused, hints: [hint('GIT_DIR'), hint('GIT_WORK_TREE')].filter((x) => x !== null), configs, wtConfigs, sub: argv[i], args: argv.slice(i + 1) };
+  return { d, gitDir, gitDirAll, gitDirUnknown, workTree, workTreeAll, targetUnknown, refused, hints: [hint('GIT_DIR'), hint('GIT_WORK_TREE')].filter((x) => x !== null), configs, wtConfigs, envAliases, envAliasUnknown: envWt.aliasUnknown, sub: argv[i], args: argv.slice(i + 1) };
 }
 
 // checkout / switch: which branch is the directory on afterwards?
@@ -922,13 +946,23 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   // aliases defined on this very line (`git config alias.p push && git p …`, `git -c alias.p=push p …`)
   const aliasConfig = g.configs.find((c) => c.key === `alias.${sub.toLowerCase()}`);
   if (ctx.aliasUnsure.has(`git:${sub.toLowerCase()}`)) return deny(`the git alias "${sub}" may have been (re)defined by a script that may or may not run, so what it expands to cannot be verified. Write the command out.`);
-  const alias = aliasConfig ? aliasConfig.value : ctx.gitAliases[sub.toLowerCase()];
-  if (alias !== undefined && level < MAX_NESTING) {
-    if (alias.startsWith('!')) {
-      const v = evalString(`${alias.slice(1)} ${args.map(shellQuote).join(' ')}`, g.d, ctx, level + 1);
-      return v.decision === 'deny' ? v : null;
+  // R11-F1: an alias given through environment config (GIT_CONFIG_KEY_n / VALUE_n, GIT_CONFIG_PARAMETERS) is one more definition of it; git ignores an
+  // alias that shadows a built-in command, so only another name can be defined by a key or value the guard cannot read
+  const subName = sub.toLowerCase();
+  if (g.envAliasUnknown && !GIT_BUILTINS.has(subName)) return deny(`GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n may define the alias "${sub}" in a way that cannot be read here, so what it expands to cannot be verified. Write the command out.`);
+  const aliasDefs = [aliasConfig ? aliasConfig.value : ctx.gitAliases[subName], ...g.envAliases.filter((a) => a.name === subName).map((a) => a.value)].filter((a) => a !== undefined);
+  if (aliasDefs.length && level < MAX_NESTING) {
+    for (const alias of aliasDefs) {
+      let v;
+      if (alias.startsWith('!')) {
+        const e = evalString(`${alias.slice(1)} ${args.map(shellQuote).join(' ')}`, g.d, ctx, level + 1);
+        v = e.decision === 'deny' ? e : null;
+      } else {
+        v = checkGit(['git', ...splitArgs(alias), ...args], env, g.d, ctx, raw, level + 1);
+      }
+      if (v) return v;
     }
-    return checkGit(['git', ...splitArgs(alias), ...args], env, g.d, ctx, raw, level + 1);
+    return null;
   }
 
   if (sub === 'push' || sub === 'send-pack') { // send-pack is push without the remote configuration
@@ -947,6 +981,15 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   trackGit(sub, args, g, ctx);
   return null;
 }
+
+// R11-F1: git's own commands (an alias cannot shadow one): a name outside this list may be an alias a config source the guard cannot read defines
+const GIT_BUILTINS = new Set(('add am annotate apply archive bisect blame branch bundle cat-file check-attr check-ignore check-ref-format checkout checkout-index cherry cherry-pick ' +
+  'clean clone column commit commit-graph commit-tree config count-objects credential describe diff diff-files diff-index diff-tree difftool fast-export fast-import fetch ' +
+  'filter-branch fmt-merge-msg for-each-ref for-each-repo format-patch fsck gc grep hash-object help hook index-pack init interpret-trailers log ls-files ls-remote ' +
+  'ls-tree maintenance mailinfo mailsplit merge merge-base merge-file merge-index merge-tree mergetool mktag mktree multi-pack-index mv name-rev notes pack-objects ' +
+  'pack-refs patch-id prune prune-packed pull push range-diff read-tree rebase receive-pack reflog refs remote repack replace request-pull rerere reset restore rev-list ' +
+  'rev-parse revert rm send-email send-pack shortlog show show-branch show-index show-ref sparse-checkout stash status stripspace submodule switch symbolic-ref tag ' +
+  'unpack-file unpack-objects update-index update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack verify-tag version whatchanged worktree write-tree').split(' '));
 
 // ---- a running `P merge --owner-go` job owns its checkout (lib/merge-job.mjs) -----------------------------------
 
