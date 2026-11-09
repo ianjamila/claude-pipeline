@@ -622,6 +622,42 @@ export function rulingNudge(input) {
   }
 }
 
+// #202, the hook's merge nudge: the owner's "merge" left no request in the record (none written, or one with an empty `requests`). The agent gets the reason in plain words
+// (the opaque "no Head/items/repo request was shown" made a session blame the recorder). Two cases, read from the transcript only:
+//   open: the newest user/assistant entry (the owner's own prompt, once queued into the transcript, skipped) is an assistant tool call or a tool result, so Claude was
+//     still working when the owner typed, and the request, if one comes after, was not on screen yet (EW #1694: "merge" typed while a dry run was running).
+//   closed: anything else (the last reply finished, no transcript to read, an unreadable file): the last finished reply showed no Head/items/repo lines.
+// It records nothing and changes nothing that is recorded. null for what is no owner "merge" (a subagent, a harness turn, other words) and for a "merge" that recorded a request.
+export const MERGE_NUDGE_OPEN = '[claude-pipeline owner-go] your "merge" arrived while Claude was still working, before the merge request was shown: nothing was recorded; say "merge" again after the 🔀 line.';
+export const MERGE_NUDGE_CLOSED = '[claude-pipeline owner-go] nothing was recorded for the "merge": Claude\'s last finished reply showed no merge request (no Head/items/repo lines). Ask Claude to show the request, then say "merge" again.';
+function replySlotOpen(transcriptPath, prompt) {
+  let skippedCurrent = false;
+  const entries = tailEntries(transcriptPath, TRANSCRIPT_TAIL_BYTES);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if ((e?.type !== 'user' && e?.type !== 'assistant') || isHiddenSummary(e)) continue;
+    if (!skippedCurrent && isPromptEntry(e) && promptTextOf(e) === plain(prompt)) { skippedCurrent = true; continue; } // (the submission itself, already in the transcript)
+    if (e.type === 'user') return !isPromptEntry(e); // a tool result: the turn is still running; a prompt (even an unanswered one) is no open slot
+    const blocks = Array.isArray(e.message?.content) ? e.message.content : [];
+    const last = blocks[blocks.length - 1];
+    return !(last?.type === 'text' && typeof last.text === 'string' && last.text.trim() !== ''); // closing text ends the turn; a tool call (or thinking) does not
+  }
+  return false;
+}
+export function mergeNudge(input, record = null) {
+  try {
+    if (Array.isArray(record?.requests) && record.requests.length > 0) return null;
+    if (notOwnerPrompt(input) || !SESSION_RE.test(String(input?.session_id ?? '')) || !parseApproval(input?.prompt)) return null;
+    const transcriptPath = String(input?.transcript_path ?? '');
+    if (notOwnerWords(input, transcriptPath)) return null;
+    let open = false;
+    try { open = replySlotOpen(transcriptPath, String(input.prompt)); } catch { /* unreadable: the closed wording */ }
+    return open ? MERGE_NUDGE_OPEN : MERGE_NUDGE_CLOSED;
+  } catch {
+    return null;
+  }
+}
+
 // Every valid "merge" record younger than maxAgeMs, from one session's file or (session null) from all of them. Never throws.
 export function readApprovals(opts = {}) {
   return readRecords(opts).filter((r) => r.kind === undefined).map((r) => ({

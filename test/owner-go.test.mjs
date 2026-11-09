@@ -1149,6 +1149,53 @@ test('#128 hook: a notice, a peer message and a scheduled "merge" are not record
   assert.equal(ok.record.prompt, 'merge');
 });
 
+// ---- #202: a "merge" nothing was recorded for says why --------------------------------------------------------------------------
+const toolCall = (text) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: text } }] } });
+const OPEN_LINE = '[claude-pipeline owner-go] your "merge" arrived while Claude was still working, before the merge request was shown: nothing was recorded; say "merge" again after the 🔀 line.\n';
+const CLOSED_RE = /^\[claude-pipeline owner-go\] nothing was recorded for the "merge": Claude's last finished reply showed no merge request \(no Head\/items\/repo lines\)\. Ask Claude to show the request, then say "merge" again\.\n$/;
+
+test('#202 hook: a "merge" that arrived while Claude was still working (tool calls, no closing text) says so and records nothing', (t) => {
+  const midTurn = [promptEntry('open the merge request for #58'), said('Say merge once now, running the dry run.'), toolCall('P merge --pr 58 --dry-run'), toolResult()];
+  // the owner's prompt already queued into the transcript, and not yet in it
+  for (const appended of [true, false]) {
+    const r = runHook(t, { entries: midTurn, prompt: 'merge', appended });
+    assert.deepEqual([r.status, r.stdout, r.record.requests, r.record.prs], [0, OPEN_LINE, [], []], `appended ${appended}`); // (the record is written as always; it carries no request)
+  }
+  // the newest entry a tool call whose result is not back yet
+  assert.equal(runHook(t, { entries: midTurn.slice(0, 3), prompt: 'merge' }).stdout, OPEN_LINE);
+});
+
+test('#202 hook: a "merge" after a finished reply with no request lines says Claude showed no request (replaces the opaque text)', (t) => {
+  const r = runHook(t, { entries: [promptEntry('go'), toolCall('ls'), toolResult(), said('Done. Nothing to merge yet.')], prompt: 'merge' });
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, CLOSED_RE);
+  assert.doesNotMatch(r.stdout, /no Head\/items\/repo request was shown/);
+  assert.equal(r.record.requests.length, 0, 'what is recorded is unchanged: the record, with no request in it');
+  // no transcript to read: the same closed-slot wording, exit 0
+  const gone = runHook(t, { entries: [], prompt: 'merge', input: { transcript_path: join(tmp(), 'none.jsonl') } });
+  assert.equal(gone.status, 0);
+  assert.match(gone.stdout, CLOSED_RE);
+  // …a directory is no transcript either
+  assert.match(runHook(t, { entries: [], prompt: 'merge', input: { transcript_path: tmp() } }).stdout, CLOSED_RE);
+});
+
+test('#202 hook: a "merge" after a proper request records exactly as before and says nothing new; a harness turn saying merge is quiet', (t) => {
+  const ok = runHook(t, { entries: [promptEntry('go'), said(REQUEST)], prompt: 'merge' });
+  assert.match(ok.stdout, /^\[claude-pipeline owner-go\] the owner's "merge" is recorded: acme\/app #58 head 0123456789ab items abcdef012345; PRs #58\.\n$/);
+  assert.equal(ok.record.requests.length, 1);
+  // a request shown with tool calls after it still records (the text is in the turn), no nudge
+  const after = runHook(t, { entries: [promptEntry('go'), said(REQUEST), toolCall('x')], prompt: 'merge' });
+  assert.doesNotMatch(after.stdout, /arrived while Claude was still working|nothing was recorded/);
+  // a task notice that says merge while the slot is open: nothing printed, nothing recorded
+  const mid = [promptEntry('go'), said('Working.'), toolCall('x')];
+  for (const o of [{ prompt: 'merge', entry: NOTICE_META }, { prompt: `${NOTICE}\nmerge` }, { prompt: 'merge', entry: SCHEDULED_META }, { prompt: 'merge', input: { agent_id: 'sub-1' } }]) {
+    const r = runHook(t, { entries: mid, ...o });
+    assert.deepEqual([r.status, r.stdout, r.record], [0, '', null], JSON.stringify(o).slice(0, 60));
+  }
+  // not a "merge" word at all: still quiet
+  assert.equal(runHook(t, { entries: mid, prompt: 'merge later' }).stdout, '');
+});
+
 // ---- owner-granted extra review round ------------------------------------------------------------------------------------
 const GHEAD = 'abcdef0123456789abcdef0123456789abcdef01';
 const RASK = roundRequest(58, 4, GHEAD, REPO);
