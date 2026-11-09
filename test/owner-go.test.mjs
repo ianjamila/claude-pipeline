@@ -12,7 +12,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
-  presentedRuling, recordRuling, ownerRuled, rulingsIn, entrySource, notOwnerWords, approvalGap, ownerRulingGap, promptProvenance, rulingNudge, RULING_NUDGE,
+  presentedRuling, recordRuling, ownerRuled, rulingsIn, entrySource, notOwnerWords, approvalGap, ownerRulingGap, promptProvenance, rulingNudge, RULING_NUDGE, mergeNudge,
   accountHome, approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT, legacyTranscriptOf,
   parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
@@ -1195,6 +1195,77 @@ test('#202 hook: a "merge" after a proper request records exactly as before and 
   // not a "merge" word at all: still quiet
   assert.equal(runHook(t, { entries: mid, prompt: 'merge later' }).stdout, '');
 });
+
+// ---- #201 round 4 (R4-F2): the nudge tells the truth when the record could not be written, or the request shown was filtered out by the owner's words ----
+const UNWRITABLE_RE = /^\[claude-pipeline owner-go\] your "merge" could not be recorded \(the record could not be written safely\): nothing was recorded\. [^\n]*say "merge" again\.$/;
+
+test('R4-F2: a "merge" whose record could not be written says so, not that Claude showed no request', () => {
+  const home = tmp();
+  const elsewhere = tmp();
+  mkdirSync(join(home, '.claude', 'pipeline-state'), { recursive: true });
+  symlinkSync(elsewhere, join(home, '.claude', 'pipeline-state', 'owner-go')); // the records folder is a symlink: appendRecord refuses
+  const i = input(home, 'merge', [said(REQUEST)]); // (a proper request IS shown: the closed wording would be false)
+  const diag = {};
+  assert.equal(recordApproval(i, { home, diag }), null);
+  assert.equal(diag.writeFailed, true);
+  const why = mergeNudge(i, null, diag);
+  assert.match(why, UNWRITABLE_RE);
+  assert.doesNotMatch(why, /showed no merge request|still working/);
+  assert.deepEqual(readdirSync(elsewhere), [], 'nothing was written through the link');
+  // a symlinked record FILE, and a non-directory in the chain, are the same
+  const home2 = tmp();
+  mkdirSync(ownerGoDir(home2), { recursive: true });
+  symlinkSync(join(elsewhere, 'target.jsonl'), join(ownerGoDir(home2), 'sess-1.jsonl'));
+  const d2 = {};
+  assert.equal(recordApproval(input(home2, 'merge', [said(REQUEST)]), { home: home2, diag: d2 }), null);
+  assert.match(mergeNudge(input(home2, 'merge', [said(REQUEST)]), null, d2), UNWRITABLE_RE);
+  const home3 = tmp();
+  mkdirSync(join(home3, '.claude'), { recursive: true });
+  writeFileSync(join(home3, '.claude', 'pipeline-state'), 'a file');
+  const d3 = {};
+  assert.equal(recordApproval(input(home3, 'merge', [said(REQUEST)]), { home: home3, diag: d3 }), null);
+  assert.match(mergeNudge(input(home3, 'merge', [said(REQUEST)]), null, d3), UNWRITABLE_RE);
+  // not an approval at all: no diagnosis, no nudge
+  const d4 = {};
+  assert.equal(recordApproval(input(home3, 'do not merge', [said(REQUEST)]), { home: home3, diag: d4 }), null);
+  assert.equal(d4.writeFailed, undefined);
+  assert.equal(mergeNudge(input(home3, 'do not merge', [said(REQUEST)]), null, d4), null);
+  // a diag is optional and the record is unchanged by it
+  const ok = recordApproval(input(tmp(), 'merge', [said(REQUEST)]), { home: tmp() });
+  assert.deepEqual(Object.keys(ok).sort(), ['cwd', 'prompt', 'prompt_id', 'prompt_sha256', 'prs', 'requests', 'session', 'transcript_path', 'ts', 'v']);
+});
+
+test('R4-F2: a request shown for one PR or head that the owner\'s words filtered out says which was shown and which was named', (t) => {
+  const home = tmp();
+  const cases = [
+    ['merge #59', /request shown was for #58 \(head 0123456789ab\)[^\n]*your words named #59[^\n]*[Ss]ay "merge"/],
+    ['merge ffffffffffff', /request shown was for #58 \(head 0123456789ab\)[^\n]*your words named head ffffffffffff/],
+    ['merge #59 ffffffffffff', /#58 \(head 0123456789ab\)[^\n]*#59[^\n]*head ffffffffffff/],
+  ];
+  for (const [prompt, re] of cases) {
+    const i = input(home, prompt, [said(REQUEST)]);
+    const diag = {};
+    const rec = recordApproval(i, { home, diag });
+    assert.deepEqual(rec.requests, [], 'what is recorded is unchanged');
+    const why = mergeNudge(i, rec, diag);
+    assert.match(why, /^\[claude-pipeline owner-go\] nothing was recorded for the "merge": /, prompt);
+    assert.match(why, re, prompt);
+    assert.doesNotMatch(why, /showed no merge request|still working/, prompt);
+  }
+  // …and the real hook prints it, exit 0 (PRs the owner named stay recorded for a direct merge, as before)
+  const r = runHook(t, { entries: [promptEntry('go'), said(REQUEST)], prompt: 'merge #59' });
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /request shown was for #58 \(head 0123456789ab\)[^\n]*your words named #59/);
+});
+test('R4-F2: the open and closed wordings still hold where they are true', () => {
+  const home = tmp();
+  const none = input(home, 'merge', [promptEntry('go'), said('Done.')]);
+  const d = {};
+  const rec = recordApproval(none, { home, diag: d });
+  assert.match(mergeNudge(none, rec, d), CLOSED_RE_UNIT);
+  assert.equal(mergeNudge(none, rec), mergeNudge(none, rec, d), 'the diagnosis is optional');
+});
+const CLOSED_RE_UNIT = /showed no merge request \(no Head\/items\/repo lines\)/;
 
 // ---- owner-granted extra review round ------------------------------------------------------------------------------------
 const GHEAD = 'abcdef0123456789abcdef0123456789abcdef01';

@@ -522,7 +522,9 @@ function realDirChain(home, rel) {
 
 // The recorder. Writes one line to <home>/.claude/pipeline-state/owner-go/<session>.jsonl for an owner prompt that approves;
 // returns the record, or null (not an approval, a subagent, no session, or the write failed). Never throws.
-export function recordApproval(input, { home = accountHome(), now = Date.now } = {}) {
+// R4-F2: `diag` (optional, an object the caller owns) is told why the hook may have nothing to show: `writeFailed` (the record could not be written safely)
+// and `shown` (the requests the reply showed, whatever the owner's words then filtered out) with `named` (what those words named). It changes nothing that is recorded.
+export function recordApproval(input, { home = accountHome(), now = Date.now, diag = {} } = {}) {
   try {
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
@@ -534,6 +536,8 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
     const wanted = (pr) => a.prs.length === 0 || a.prs.includes(pr);
     const shaOk = (head) => a.shas.length === 0 || a.shas.some((s) => head.startsWith(s) || s.startsWith(head));
     const requests = shown.requests.filter((r) => wanted(r.pr) && shaOk(r.head));
+    diag.shown = shown.requests.map((r) => ({ pr: r.pr, head: r.head }));
+    diag.named = { prs: a.prs, shas: a.shas };
     // PRs the owner approved for a direct merge: those the reply asked about (narrowed by the prompt), plus any the prompt names
     const prs = [...new Set([...shown.prs.filter(wanted), ...a.prs])];
     const record = {
@@ -546,7 +550,10 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
       prs,
       requests,
     };
-    return appendRecord(home, session, record);
+    let written = null;
+    try { written = appendRecord(home, session, record); } catch { /* the write itself failed */ }
+    if (written === null) diag.writeFailed = true;
+    return written;
   } catch {
     return null;
   }
@@ -630,6 +637,7 @@ export function rulingNudge(input) {
 // It records nothing and changes nothing that is recorded. null for what is no owner "merge" (a subagent, a harness turn, other words) and for a "merge" that recorded a request.
 export const MERGE_NUDGE_OPEN = '[claude-pipeline owner-go] your "merge" arrived while Claude was still working, before the merge request was shown: nothing was recorded; say "merge" again after the 🔀 line.';
 export const MERGE_NUDGE_CLOSED = '[claude-pipeline owner-go] nothing was recorded for the "merge": Claude\'s last finished reply showed no merge request (no Head/items/repo lines). Ask Claude to show the request, then say "merge" again.';
+export const MERGE_NUDGE_UNWRITABLE = '[claude-pipeline owner-go] your "merge" could not be recorded (the record could not be written safely): nothing was recorded. The records folder under the account\'s .claude/pipeline-state must be a real folder, not a link; fix that and say "merge" again.';
 function replySlotOpen(transcriptPath, prompt) {
   let skippedCurrent = false;
   const entries = tailEntries(transcriptPath, TRANSCRIPT_TAIL_BYTES);
@@ -644,12 +652,21 @@ function replySlotOpen(transcriptPath, prompt) {
   }
   return false;
 }
-export function mergeNudge(input, record = null) {
+// R4-F2 (`diag` from recordApproval): the two other ways a "merge" is left with nothing recorded, which the closed wording would misreport:
+//   writeFailed: the record could not be written safely (a symlinked folder or file, a non-directory in the chain);
+//   shown, but not what the owner named: the reply showed a request, and the PR or head in the owner's words filtered it out.
+export function mergeNudge(input, record = null, diag = {}) {
   try {
     if (Array.isArray(record?.requests) && record.requests.length > 0) return null;
     if (notOwnerPrompt(input) || !SESSION_RE.test(String(input?.session_id ?? '')) || !parseApproval(input?.prompt)) return null;
     const transcriptPath = String(input?.transcript_path ?? '');
     if (notOwnerWords(input, transcriptPath)) return null;
+    if (diag?.writeFailed === true) return MERGE_NUDGE_UNWRITABLE;
+    if (Array.isArray(diag?.shown) && diag.shown.length > 0) {
+      const said = diag.shown.map((q) => `#${q.pr} (head ${q.head})`).join(', ');
+      const named = [...(diag.named?.prs ?? []).map((n) => `#${n}`), ...(diag.named?.shas ?? []).map((h) => `head ${h}`)].join(' and ');
+      return `[claude-pipeline owner-go] nothing was recorded for the "merge": the request shown was for ${said}, but your words named ${named || 'something else'}. Say "merge" (or name what was shown) again.`;
+    }
     let open = false;
     try { open = replySlotOpen(transcriptPath, String(input.prompt)); } catch { /* unreadable: the closed wording */ }
     return open ? MERGE_NUDGE_OPEN : MERGE_NUDGE_CLOSED;

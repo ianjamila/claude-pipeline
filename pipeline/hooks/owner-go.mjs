@@ -7,19 +7,20 @@
 // the owner's message). On UserPromptSubmit, stdout is added to the model's context: one line says what was recorded, so the
 // agent can run `P merge` with the matching flags; nothing is printed otherwise, except (#128) one line when the owner's prompt reads as a ruling
 // answer that nothing was recorded for (the agent must ask again), and (#202) one line when the owner's "merge" recorded no request (typed while Claude was
-// still working, or after a reply without the Head/items/repo lines).
+// still working, or after a reply without the Head/items/repo lines; R4-F2: or the record could not be written, or the request shown was filtered out by the PR/head the owner named).
 try {
   const { readHookInput } = await import('./lib/hook-io.mjs');
   const { recordApproval, recordRuling, recordRoundGrant, rulingNudge, mergeNudge } = await import('./lib/owner-go.mjs');
   const input = await readHookInput();
-  const record = recordApproval(input);
+  const diag = {};
+  const record = recordApproval(input, { diag });
   const ruling = recordRuling(input);
   const round = recordRoundGrant(input);
   const nudge = ruling || round ? null : rulingNudge(input);
   if (ruling) process.stdout.write(`[claude-pipeline owner-go] the owner's ruling is recorded for ${ruling.repo} #${ruling.pr}: ${ruling.ids.join(', ')} (pass words from it as --owner-quote).\n`);
   if (round) process.stdout.write(`[claude-pipeline owner-go] the owner's extra round is recorded for ${round.repo} #${round.pr} counted round ${round.k} head ${round.head.slice(0, 12)}: run P codex-review --pr ${round.pr} --round <the n from round-request>\n`);
   else if (nudge) process.stdout.write(`${nudge}\n`);
-  const why = record?.requests?.length ? null : mergeNudge(input, record);
+  const why = record?.requests?.length ? null : mergeNudge(input, record, diag);
   if (why) process.stdout.write(`${why}${record?.prs?.length ? ` (PRs ${record.prs.map((n) => `#${n}`).join(', ')} are recorded for a direct merge.)` : ''}\n`);
   else if (record) {
     const shown = record.requests.map((q) => `${q.repo ?? '(no repo: approves nothing)'} #${q.pr} head ${q.head} items ${q.items}${q.carry === true ? ' (carries over main-only updates)' : ''}`);
