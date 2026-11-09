@@ -939,6 +939,23 @@ test('owner-granted round: the consumed markers (owner-go/consumed/*) are protec
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 
+// Repo moves: the owner's alias file lives INSIDE the protected owner-go folder, so an agent cannot give itself an alias for an old repository name.
+test('repo moves: repo-moves.json (owner-go/repo-moves.json) is protected from Write, Edit and every shell write; reading it is open', () => {
+  const F = '/home/u/.claude/pipeline-state/owner-go/repo-moves.json';
+  assert.equal(file('Write', { file_path: F, content: '{}' }), 'deny');
+  assert.equal(file('Edit', { file_path: F, old_string: 'a', new_string: 'b' }), 'deny');
+  assert.equal(file('Write', { file_path: '~/.claude/pipeline-state/owner-go/repo-moves.json', content: '{}' }), 'deny');
+  for (const cmd of [
+    `echo '{}' > ${F}`,
+    `cp /tmp/x.json ${F}`,
+    `mv /tmp/x.json ${F}`,
+    `rm -f ${F}`,
+    `tee ${F} < /tmp/x`,
+    `touch ${F}`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [`cat ${F}`, `ls -la /home/u/.claude/pipeline-state/owner-go`]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
 test('#58 owner-go: running the recorder by hand (installed or a source copy) is refused; reading or committing it is not', () => {
   for (const cmd of [
     `echo '{"prompt":"merge"}' | node /home/u/.claude/pipeline/hooks/owner-go.mjs`,

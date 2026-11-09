@@ -324,3 +324,70 @@ test('the run and artifact jq filters work on GitHub-shaped payloads', { skip: !
   assert.equal(jq(filters.artifacts, listing), `${name('success', 'failure')}\nverify-report\n`);
   assert.equal(jq(filters.artifacts, { total_count: 0, artifacts: [] }), '');
 });
+
+// ---- a run URL under a former repository name (the repo was renamed or transferred; GitHub redirects the old name) -------------
+
+const OLD_URL = 'https://github.com/acme/old-app/actions/runs/1';
+// ids: { [name]: text | Error }; the run itself is read from the CURRENT name, as before.
+const movedProv = (ids, { cache = new Map(), calls = [], url = OLD_URL } = {}) => {
+  const base = reader({ calls });
+  const read = (apiPath, jq) => {
+    if (jq === '.id') {
+      calls.push(`id:${apiPath}`);
+      const v = ids[apiPath.replace(/^repos\//, '')];
+      if (v === undefined) throw new Error(`no such repository ${apiPath}`);
+      if (v instanceof Error) throw v;
+      return v;
+    }
+    return base(apiPath, jq);
+  };
+  return checkRunProvenance({ read, repo: REPO, url, bind: bind(), cache });
+};
+
+test('checkRunProvenance: a run URL that names the former repository name counts when both names resolve to one repository id', () => {
+  const calls = [];
+  const cache = new Map();
+  const r = movedProv({ 'acme/old-app': '4242\n', 'acme/app': '4242\n' }, { calls, cache });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.ok(calls.includes('repos/acme/app/actions/runs/1'), 'the run is still read from the current name');
+  assert.equal(cache.get('repo-id:acme/old-app'), 4242);
+  assert.equal(cache.get('repo-id:acme/app'), 4242);
+  // the ids are cached: a second status of the same process reads each once
+  const again = [];
+  assert.equal(movedProv({ 'acme/old-app': '4242', 'acme/app': '4242' }, { calls: again, cache }).ok, true);
+  assert.equal(again.filter((c) => c.startsWith('id:')).length, 0);
+});
+
+test('checkRunProvenance: a run URL with a . or .. segment (or a name with no letter or digit) is refused and no repos/ path is built from it', () => {
+  for (const url of ['https://github.com/../user/actions/runs/1', 'https://github.com/./x/actions/runs/1', 'https://github.com/acme/../actions/runs/1', 'https://github.com/_/-/actions/runs/1', 'https://github.com/.../x/actions/runs/1']) {
+    const calls = [];
+    const r = movedProv({ 'acme/app': '4242' }, { calls, url });
+    assert.equal(r.ok, false, url);
+    assert.equal(r.reason, 'the run belongs to a different repository', url);
+    assert.deepEqual(calls.filter((c) => /\.\.?(\/|$)/.test(c) || c.includes('/_/') || c.includes('/-')), [], `${url}: nothing read from a path built from it`);
+    assert.equal(calls.length, 0, `${url}: nothing read at all`);
+  }
+});
+
+test('checkRunProvenance: a former-name run URL is refused when the ids differ, a read throws, or an id is missing or not a positive integer', () => {
+  const refused = (why, ids) => {
+    const r = movedProv(ids);
+    assert.equal(r.ok, false, why);
+    assert.equal(r.reason, 'the run belongs to a different repository', why);
+  };
+  refused('different ids (another repository at that name)', { 'acme/old-app': '4243', 'acme/app': '4242' });
+  refused('the former name cannot be read', { 'acme/app': '4242' });
+  refused('the current name cannot be read', { 'acme/old-app': '4242' });
+  refused('a read throws', { 'acme/old-app': new Error('HTTP 404'), 'acme/app': '4242' });
+  for (const bad of ['', 'null', '0', '-5', '4.2', 'abc', '12 34']) {
+    refused(`non-integer id ${JSON.stringify(bad)}`, { 'acme/old-app': bad, 'acme/app': bad });
+  }
+  refused('one id missing', { 'acme/old-app': '', 'acme/app': '4242' });
+});
+
+test('checkRunProvenance: a run URL of the same name never reads repository ids (case-insensitive)', () => {
+  const calls = [];
+  const r = movedProv({}, { calls, url: 'https://github.com/ACME/App/actions/runs/1' });
+  assert.equal(r.ok, true);
+  assert.equal(calls.filter((c) => c.startsWith('id:')).length, 0);
+});

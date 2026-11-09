@@ -374,6 +374,8 @@ executable.
   If you want to dismiss something Claude or Codex would not, say so: the typed path stays as the override (`pipeline triage owner-ruling`; it asks with a `⚖️ Owner ruling needed` line, your whole answer
   is recorded on this machine and must be only the decisions, `R1-B1: accept` / `follow-up` / `reject` per item, reasons in another message; it is published in the triage comment). Then remove `needs-human`.
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
+- **Repo moved / transferred?** Your earlier "merge", ruling and `extra round` records name the old repository, so `P review-complete` / `P merge` can say an owner grant "cannot be verified". In your own terminal (not in Claude Code) record the move once; GitHub must confirm it, and only records made before the move then count for the new name:
+  `node ~/.claude/pipeline/bin/pipeline.mjs repo-move --from ianjamila/eaglewatch --to eaglewatch-ph/eaglewatch --at 2026-11-09T06:58:25Z` (`repo-move --list` shows what is recorded).
 - **`--check` reports drift:** someone edited an installed file (or an install did not finish); run `node ~/.claude/pipeline/bin/pipeline.mjs update`, or re-run `./install.sh`.
 - **A merge didn't happen:** `P merge` prints its refusal `reasons`, which say which check failed
   (head moved, a required check not green, a hard-stop or test-integrity item, a blocking label,

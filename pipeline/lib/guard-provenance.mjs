@@ -4,7 +4,8 @@
 // pipeline-guards.yml, open a PR into `x` whose head is the same sha as the real PR, and that run posts success statuses
 // and approval receipts as `github-actions[bot]` on the shared head. The creator login alone proves nothing, and neither
 // does a target_url (whoever posts the status chooses it, so a spoofing run can point at ANY genuine run). A status only
-// counts when its target_url is an Actions run of THIS repository that
+// counts when its target_url is an Actions run of THIS repository (a URL under a FORMER name of it, after a rename or transfer, counts when
+// both names resolve to the same numeric repository id; the run is still read from the current name) that
 //   * ran the workflow file `.github/workflows/pipeline-guards.yml` (any `@ref` suffix of the run's `path` is ignored),
 //   * was triggered by `pull_request_target`,
 //   * is attempt 1: a re-run (`gh run rerun`) can execute an OLDER guard revision (the workflow file of the old main tip)
@@ -116,6 +117,29 @@ export function parseVerdictArtifactName(name) {
   return { version: 1, head: l[1], integrity: l[2], hardstops: l[3], review: null, receipt: l[4] ? { label: l[4], login: l[5] } : null };
 }
 
+// A run URL that names a FORMER name of the repository (renamed or transferred; GitHub redirects the old name) is the same repository when
+// both names resolve to one numeric repository id. Both reads must give a positive integer, else (or when a read throws) it is a different repository.
+function sameRepositoryById({ read, a, b, cache }) {
+  // run.repo comes from an attacker-chosen target_url and RUN_URL admits `.` / `..`: never build an API path from a dot segment or a name with no letter or digit.
+  for (const name of [a, b]) {
+    for (const seg of String(name).split('/')) if (seg === '.' || seg === '..' || !/[A-Za-z0-9]/.test(seg)) return false;
+  }
+  const idOf = (name) => {
+    const key = `repo-id:${String(name).toLowerCase()}`;
+    if (!cache.has(key)) {
+      const text = String(read(`repos/${name}`, '.id')).trim();
+      if (!/^[1-9][0-9]{0,15}$/.test(text)) throw new Error(`no repository id for ${name}`);
+      cache.set(key, Number(text));
+    }
+    return cache.get(key);
+  };
+  try {
+    return idOf(a) === idOf(b);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * read(apiPath, jqFilter) -> stdout text; throws on any failure (a thrown error is a failed provenance check).
  * bind = { prNumber, headSha, createdAt }: what the status is about (PR, the sha it sits on, when it was posted); all
@@ -131,7 +155,7 @@ export function parseVerdictArtifactName(name) {
 export function checkRunProvenance({ read, repo, url, bind = {}, cache = new Map() }) {
   const run = parseRunUrl(url);
   if (!run) return { ok: false, reason: 'target_url is not an Actions run URL' };
-  if (run.repo.toLowerCase() !== String(repo).toLowerCase()) return { ok: false, reason: 'the run belongs to a different repository' };
+  if (run.repo.toLowerCase() !== String(repo).toLowerCase() && !sameRepositoryById({ read, a: run.repo, b: repo, cache })) return { ok: false, reason: 'the run belongs to a different repository' };
   const prNumber = Number(bind.prNumber);
   const headSha = String(bind.headSha ?? '').toLowerCase();
   if (!Number.isInteger(prNumber) || prNumber < 1 || !SHA.test(headSha) || !Number.isFinite(Date.parse(bind.createdAt ?? ''))) {
