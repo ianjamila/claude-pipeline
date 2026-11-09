@@ -873,3 +873,147 @@ test('R7-F2: the same command-line forms are allowed with no marker, a dead mark
   assert.equal(decide(`git --work-tree=${fwd(job)} reset --hard`, container).decision, 'deny');
   assert.equal(decide(`git --work-tree=${elsewhere} reset --hard`, container).decision, 'allow');
 });
+
+// ---- review round 8 (R8-B1, R8-B2, R8-F1, R8-F2): a value the resolver cannot read one way is REFUSED for a mutating verb, never dropped to a cwd-only check ----
+// R8-B1: a depth / work / candidate-count limit. R8-B2: a quoted word with two or more `$` pieces (the shell's per-piece mix is not in the set). R8-F1: an
+// unset name in a product (`$WT$X`) must not erase the resolved siblings. R8-F2: a `$` that arrives through a substituted value is literal text, not an expansion.
+const REFUSED = /cannot be read one way/;
+const r8Setup = () => {
+  const s = r7Setup();
+  symlinkSync(s.job, join(s.container, '$Y')); // the literal word `$Y`, as git finds it from the container
+  symlinkSync(s.job, join(s.container, 'gd', '$Y'));
+  return s;
+};
+const r8Refused = (command, cwd) => {
+  const v = decide(command, cwd);
+  assert.equal(v.decision, 'deny', command);
+  assert.match(v.reason, REFUSED, command);
+};
+const R8_USES = [ // the places the resolver feeds, with the value written as `v`
+  { use: (v) => `GIT_WORK_TREE=${v}`, tgt: (p) => p },
+  { use: (v) => `GIT_DIR=${v}`, tgt: (p) => `${p}/.git` },
+];
+
+test('R8-B1: a depth chain, 64+ candidate values or a runaway product is refused, not dropped to the raw text', () => {
+  const { container, job, wt } = r8Setup();
+  mark(job, process.pid, 12);
+  for (const k of R8_USES) {
+    for (const verb of r7Verbs) {
+      r8Refused(`A=${k.tgt(wt)} B=$A C=$B D=$C E=$D F=$E G=$F H=$G ${k.use('$H')} ${verb}`, container);
+      const many = Array.from({ length: 64 }, (_, i) => `WT=/safe/${i}`).join(' ');
+      r8Refused(`${many} WT=${k.tgt(wt)} ${k.use('$WT')} ${verb}`, container);
+      // a product of several names that is more than 64 candidates
+      const names = ['P', 'Q', 'R'].map((n) => Array.from({ length: 5 }, (_, i) => `${n}=/s${i}`).join(' ')).join(' ');
+      r8Refused(`${names} P=${k.tgt(wt)} ${k.use('$P$Q$R')} ${verb}`, container);
+    }
+  }
+  // the config-value place and the command line
+  r8Refused(`GIT_DIR=${fwd(container)}/gd GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree A=${wt} B=$A C=$B D=$C E=$D F=$E G=$F H=$G GIT_CONFIG_VALUE_0=$H git reset --hard`, container);
+});
+
+test('R8-B2: a quoted word with two or more `$` pieces is refused (the shell\'s per-piece mix is not in the candidate set)', () => {
+  const base = fakeRepo();
+  const owned = join(base, '$literal', 'owned');
+  mkdirSync(join(owned, '.git'), { recursive: true });
+  mark(owned, process.pid, 12);
+  const b = fwd(base);
+  for (const verb of r7Verbs) {
+    r8Refused(`TAIL=/owned GIT_WORK_TREE='${b}/$literal'\${TAIL} ${verb}`, base);
+    r8Refused(`TAIL=/owned GIT_WORK_TREE="${b}/\\$literal"\${TAIL} ${verb}`, base);
+    r8Refused(`TAIL=/.git GIT_DIR='${b}/$literal/owned'\${TAIL} ${verb}`, base);
+    r8Refused(`T=/owned git --work-tree='${b}/$literal'\${T} ${verb.slice(4)}`, base);
+    r8Refused(`T=/owned git --git-dir='${b}/$literal'\${T} ${verb.slice(4)}`, base);
+    r8Refused(`T=/owned git -c core.worktree='${b}/$literal'\${T} ${verb.slice(4)}`, base);
+  }
+});
+
+test('R8-F1: an unset name in a product contributes the empty string: `$WT$X` and `$WT/$X` keep the resolved value', () => {
+  const { container, job, at, wt } = r8Setup();
+  mark(job, process.pid, 12);
+  for (const k of R8_USES) {
+    for (const verb of r7Verbs) {
+      for (const v of ['$WT$X', '$WT/$X', '${WT}${X}', '$X$WT', '$WT$X$Z']) r7Denied(`WT=${k.tgt(wt)} ${k.use(v)} ${verb}`, container);
+    }
+  }
+  for (const verb of r7Verbs) r7Denied(`GIT_DIR=${at}/gd GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree WT=${wt} GIT_CONFIG_VALUE_0=$WT$X ${verb}`, container);
+});
+
+test('R8-F2: a `$` that arrives through a substituted value is literal text (a relative path), not an expansion to drop', () => {
+  const { container, job, at } = r8Setup();
+  mark(job, process.pid, 12);
+  for (const verb of r7Verbs) {
+    for (const c of [
+      `WT='$Y' GIT_WORK_TREE=$WT ${verb}`,
+      `X='$Y'; GIT_WORK_TREE=$X ${verb}`,
+      `X='$Y'; GIT_DIR=$X ${verb}`,
+      `X='$Y'; git --work-tree=$X ${verb.slice(4)}`,
+      `X='$Y'; git --git-dir=$X ${verb.slice(4)}`,
+      `X='$Y'; git --git-dir=${at}/gd -c core.worktree=$X ${verb.slice(4)}`,
+      `X='$Y'; git --git-dir=${at}/gd --config-env=core.worktree=X ${verb.slice(4)}`,
+      `X='$Y'; GIT_DIR=${at}/gd GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=$X ${verb}`,
+    ]) r8Refused(c, container);
+  }
+});
+
+test('R8: refusal applies to a mutating verb only, and plain or single-piece values are not refused', () => {
+  const { container, job, at, wt, elsewhere } = r8Setup();
+  mark(job, process.pid, 12);
+  const hard = [
+    `A=${wt} B=$A C=$B D=$C E=$D F=$E G=$F H=$G GIT_WORK_TREE=$H git %`,
+    `WT='$Y' GIT_WORK_TREE=$WT git %`,
+    `X='$Y'; GIT_WORK_TREE=$X git %`,
+    `X='$Y'; git --work-tree=$X %`,
+    `WT=${wt} GIT_WORK_TREE=$WT$X git %`,
+    `TAIL=/owned GIT_WORK_TREE='${at}/$literal'\${TAIL} git %`,
+  ];
+  for (const t of hard) for (const ro of ['status', 'log --oneline', 'diff', 'fetch']) {
+    const c = t.replace('%', ro);
+    // (`git --work-tree=$X git status` is not a shape; the command-line forms carry the verb after the option)
+    const v = decide(c.replace('git git', 'git'), container);
+    assert.equal(v.decision, 'allow', `read-only: ${c}`);
+  }
+  // single-piece or plain values that point elsewhere are allowed (no marker for them), as before
+  const { container: plain, job: plainJob } = containerWithJob();
+  mark(plainJob, process.pid, 12);
+  for (const c of [
+    `GIT_WORK_TREE=${elsewhere} git reset --hard`,
+    `WT=${elsewhere} GIT_WORK_TREE=$WT git reset --hard`,
+    `WT=${elsewhere} GIT_WORK_TREE=$WT$X git reset --hard`,
+    `WT=${elsewhere} GIT_WORK_TREE='$WT' git reset --hard`,
+    `git --work-tree=${elsewhere} reset --hard`,
+    `A=${elsewhere} B=$A C=$B GIT_WORK_TREE=$C git reset --hard`,
+  ]) assert.equal(decide(c, plain).decision, 'allow', c);
+  // no marker: a plain command is allowed, whatever it holds
+  const { container: free } = containerWithJob();
+  assert.equal(decide(`GIT_WORK_TREE=${elsewhere} git reset --hard`, free).decision, 'allow');
+});
+
+test('R8: the candidate sets say when they are refused, for each trigger', () => {
+  const ctxWith = (vars, extra = {}) => ({ vars: Object.assign(Object.create(null), vars), unsureVars: new Set(), tainted: new Set(), ...extra });
+  const resolve = (command, vars) => resolvePrefixEnv(simpleCommands(command, {})[0].env, ctxWith(vars), command);
+  const refused = (command, vars = {}) => resolve(command, vars).get('GIT_WORK_TREE').refused;
+  // (1) a depth chain, the candidate-count cap, the work cap
+  assert.equal(refused('A=/owned B=$A C=$B D=$C E=$D F=$E G=$F H=$G GIT_WORK_TREE=$H git reset --hard'), true);
+  assert.equal(refused(`${Array.from({ length: 64 }, (_, i) => `WT=/s${i}`).join(' ')} WT=/owned GIT_WORK_TREE=$WT git reset`), true);
+  assert.equal(refused(`${['P', 'Q', 'R'].map((n) => Array.from({ length: 5 }, (_, i) => `${n}=/s${i}`).join(' ')).join(' ')} GIT_WORK_TREE=$P$Q$R git reset`), true);
+  assert.equal(refused(`${Array.from({ length: 40 }, (_, i) => `A=$B B=$A C${i}=$A`).join(' ')} GIT_WORK_TREE=$A git reset`), true);
+  // (3) a quoted word with two `$` pieces
+  assert.equal(refused("TAIL=/owned GIT_WORK_TREE='/repo/$literal'${TAIL} git reset"), true);
+  assert.equal(refused('TAIL=/owned GIT_WORK_TREE="/repo/\\$literal"${TAIL} git reset'), true);
+  // (4) a substituted value that still holds `$` or a backtick: from a prefix assignment, an env word, the line's own variable
+  assert.equal(refused("WT='$Y' GIT_WORK_TREE=$WT git reset"), true);
+  assert.equal(refused("env WT='$Y' GIT_WORK_TREE=$WT git reset"), true);
+  assert.equal(refused('GIT_WORK_TREE=$X git reset', { X: '$Y' }), true);
+  assert.equal(refused('GIT_WORK_TREE=$X git reset', { X: '`pwd`' }), true);
+  // not refused: a plain literal, one piece (quoted or not), an unset name (the empty string: `$WT$X` keeps `/owned`)
+  assert.equal(refused('GIT_WORK_TREE=/owned git reset'), false);
+  assert.equal(refused("GIT_WORK_TREE='/repo/$literal' git reset"), false);
+  assert.equal(refused('WT=/a GIT_WORK_TREE=$WT git reset'), false);
+  assert.equal(refused('GIT_WORK_TREE=$WT git reset'), false);
+  assert.equal(refused('WT=/a B=$WT GIT_WORK_TREE=$B git reset'), false);
+  const r = resolve('WT=/owned GIT_WORK_TREE=$WT$X git reset', {}).get('GIT_WORK_TREE');
+  assert.deepEqual(r.list.map((c) => c.v), ['/owned']);
+  assert.equal(r.unknown, true);
+  assert.equal(r.refused, false);
+  assert.deepEqual(resolve('WT=/owned GIT_WORK_TREE=$WT/$X git reset', {}).get('GIT_WORK_TREE').list.map((c) => c.v), ['/owned/']);
+});

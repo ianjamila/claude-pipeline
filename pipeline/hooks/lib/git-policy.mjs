@@ -545,23 +545,38 @@ const mayBeWorkTreeKey = (key) => DYNAMIC.test(key) || /^core\.worktree$/i.test(
 //   - `$NAME` / ${NAME} is replaced, in turn, by EVERY value an assignment word of the command gives NAME (prefix or env wrapper, any order, each
 //     itself a candidate set) and by the line's own value of NAME;
 //   - a name nothing gives a value, or one the shell reads from outside what this command shows (an env wrapper's word, or a prefix word with no
-//     assignment of the name before it, and no value on the line), also makes the target unknown (today's fail-closed path).
+//     assignment of the name before it, and no value on the line), also makes the target unknown (today's fail-closed path); the name itself
+//     contributes the EMPTY string (what the shell expands an unset name to), so `$WT$X` keeps `$WT` (R8-F1).
+// R8: `unknown` only adds the session's own directory to the ownership check, which from an unowned checkout is an allow, so it is not enough for
+// a value the resolver may have read wrongly. Such a value is REFUSED (`refused`: a mutating verb is denied outright, see mergeJobVerdict) when
+//   - a limit was hit (depth, work, candidate count): the resolved path would be swapped for raw text (R8-B1);
+//   - the product of the candidates came out empty although the text held a `$` (R8-F1);
+//   - the command's text is quoted or escaped and the value has two or more `$` / backtick pieces: the shell's per-piece mix of kept and expanded
+//     pieces (`'/r/$a'${T}`) is in neither the literal nor the expanded reading (R8-B2);
+//   - a substituted value (an assignment word's, an env wrapper's, the line's own variable) still holds a `$` or backtick: the shell does not
+//     expand it again, it is the literal text of a path (R8-F2).
 const CAND_CAP = 64;
 const CAND_WORK = 500;
 const LIT_DYNAMIC = /\$\(|`/;
 // (R7-F2: the command's text holds a quote or a backslash, so a `$` in a value may have reached git unexpanded; no text to tell by: as if it did)
 const rawQuoted = (raw) => typeof raw !== 'string' || raw === '' || /['\\]/.test(raw);
+// (R8-B2: how many places in a value the shell may or may not have expanded)
+const dynamicPieces = (text) => (String(text).match(/[$`]/g) ?? []).length;
+// (R8-F2: a name in `text` whose value on the line already holds a `$` or backtick: substituted once, it stays as that text)
+const substitutesDynamic = (text, ctx) => [...String(text).matchAll(EXPAND_RE)].some((m) => { const v = ctx.vars[m[1] ?? m[2]]; return typeof v === 'string' && DYNAMIC.test(v); });
 export function resolvePrefixEnv(env, ctx, raw) { // (exported for the unit test of the candidate sets)
   const assigns = assignmentsOf(env);
   const quoted = rawQuoted(raw);
   const st = { work: 0 };
   const textCands = (text, at, depth) => {
-    const out = { list: [], unknown: false };
+    const out = { list: [], unknown: false, refused: false };
     const add = (v, lit) => { if (!out.list.some((c) => c.v === v && c.lit === lit)) out.list.push({ v, lit }); };
     if (typeof text !== 'string') { out.unknown = true; return out; }
     if (!DYNAMIC.test(text)) { add(text, false); return out; }
     // (a value that cannot be worked out stays as written: dynamic where it is used, as before)
-    if (LIT_DYNAMIC.test(text) || depth > 6 || ++st.work > CAND_WORK) { out.unknown = true; add(text, false); return out; }
+    if (depth > 6 || ++st.work > CAND_WORK) { out.unknown = true; out.refused = true; add(text, false); return out; }
+    if (LIT_DYNAMIC.test(text)) { out.unknown = true; add(text, false); return out; }
+    if (quoted && dynamicPieces(text) >= 2) out.refused = true;
     if (quoted) add(text, true);
     let parts = [''];
     let last = 0;
@@ -575,28 +590,39 @@ export function resolvePrefixEnv(env, ctx, raw) { // (exported for the unit test
       if (typeof p === 'string') { parts = parts.map((x) => x + p); continue; }
       const vals = valuesOf(p.name, at, depth);
       if (vals.unknown) out.unknown = true;
-      parts = parts.flatMap((x) => vals.list.map((v) => x + v));
-      if (parts.length > CAND_CAP) { out.unknown = true; parts = parts.slice(0, CAND_CAP); }
+      if (vals.refused) out.refused = true;
+      // (a name with no value contributes the empty string, as an unset one expands; with nothing unknown about it that is a gap: refused)
+      if (vals.list.length === 0 && !vals.unknown) out.refused = true;
+      parts = parts.flatMap((x) => (vals.list.length === 0 ? [x] : vals.list.map((v) => x + v)));
+      if (parts.length > CAND_CAP) { out.unknown = true; out.refused = true; parts = parts.slice(0, CAND_CAP); }
     }
-    for (const x of parts) { if (DYNAMIC.test(x)) out.unknown = true; add(x, false); }
+    if (parts.length === 0) out.refused = true;
+    for (const x of parts) {
+      if (DYNAMIC.test(x)) out.unknown = true;
+      if (x === '' && out.unknown) continue; // (only unset names: no candidate, the unknown says so)
+      add(x, false);
+    }
     return out;
   };
   const valuesOf = (name, at, depth) => {
     const list = [];
     let unknown = false;
+    let refused = false;
     let priorPrefix = false;
     assigns.forEach((a, j) => {
       if (a.name !== name || j === at) return;
       const sub = textCands(a.value, j, depth + 1);
       for (const c of sub.list) if (!list.includes(c.v)) list.push(c.v);
       if (sub.unknown) unknown = true;
+      if (sub.refused || sub.list.some((c) => DYNAMIC.test(c.v))) refused = true;
       if (assigns[at].src === 'prefix' && a.src === 'prefix' && j < at) priorPrefix = true;
     });
     const shell = ctx.vars[name];
     if (typeof shell === 'string' && !list.includes(shell)) list.push(shell);
+    if (typeof shell === 'string' && DYNAMIC.test(shell)) refused = true;
     // (the shell's own value is what an env word, or a prefix word with no assignment of the name before it, reads)
     if ((assigns[at].src === 'env' || !priorPrefix) && (typeof shell !== 'string' || unsureVar(ctx, name))) unknown = true;
-    return { list, unknown };
+    return { list, unknown, refused };
   };
   const out = new Map();
   for (const name of Object.keys(env)) {
@@ -610,7 +636,7 @@ export function resolvePrefixEnv(env, ctx, raw) { // (exported for the unit test
 // when it sets the name, else the value an earlier assignment / export on the line gave it. { list: [{ v, lit }], unknown }
 function envCands(pe, ctx, name) {
   if (pe.has(name)) return pe.get(name);
-  return typeof ctx.vars[name] === 'string' ? { list: [{ v: ctx.vars[name], lit: false }], unknown: false } : { list: [], unknown: false };
+  return typeof ctx.vars[name] === 'string' ? { list: [{ v: ctx.vars[name], lit: false }], unknown: false, refused: DYNAMIC.test(ctx.vars[name]) } : { list: [], unknown: false, refused: false };
 }
 // (a literal word: not expanded, and a `$` in it is just a character; relative to `dir`)
 function litJoin(dir, v) {
@@ -637,11 +663,13 @@ function parseConfigParameters(text) {
 function envConfigWorkTrees(pe, ctx) {
   const entries = [];
   let unknown = false;
+  let refused = false;
   const names = new Set([...pe.keys(), ...assignedNames(ctx)].filter((k) => /^GIT_CONFIG_(?:KEY_\d+|PARAMETERS)$/i.test(k)));
   for (const name of names) {
     if (!pe.has(name) && (name in ctx.vars || unsureVar(ctx, name))) unknown = true; // (set earlier on the line: may not reach this command)
     const src = envCands(pe, ctx, name);
     if (src.unknown || src.list.length === 0) unknown = true;
+    if (src.refused) refused = true;
     for (const c of src.list) {
       const text = c.lit ? c.v : expandVars(c.v, ctx);
       if (/^GIT_CONFIG_PARAMETERS$/i.test(name)) {
@@ -659,10 +687,11 @@ function envConfigWorkTrees(pe, ctx) {
       unknown = true;
       const value = envCands(pe, ctx, name.replace(/KEY/i, 'VALUE'));
       if (value.unknown) unknown = true;
+      if (value.refused) refused = true;
       for (const vc of value.list) entries.push({ key: 'core.worktree', value: vc.v, noValue: false, lit: vc.lit });
     }
   }
-  return { entries, unknown };
+  return { entries, unknown, refused };
 }
 // R4-F1 / R5-B1 / R5-F1: `--config-env=NAME=VAR` (or `--config-env NAME=VAR`) sets config key NAME from environment variable VAR. When NAME is, or may be,
 // core.worktree the target is unknown, and VAR's values (when this command's prefix or an earlier assignment on the line gives any) are targets of their own.
@@ -675,14 +704,17 @@ function configEnvWorkTree(text, pe, ctx) {
   const varName = expandVars(t.slice(eq + 1), ctx);
   if (DYNAMIC.test(varName)) return { entries: [], unknown: false };
   const src = envCands(pe, ctx, varName);
-  return { entries: src.list.map((c) => ({ key: 'core.worktree', value: c.v, noValue: false, lit: c.lit })), unknown: src.unknown };
+  return { entries: src.list.map((c) => ({ key: 'core.worktree', value: c.v, noValue: false, lit: c.lit })), unknown: src.unknown, refused: src.refused === true };
 }
 
 function parseGitGlobal(argv, dir, env, ctx, raw) {
   let d = dir;
   const penv = resolvePrefixEnv(env, ctx, raw); // R7: every way a prefix value can be read (R6-B1: it reads the prefix assignments before it)
   // (what envVar says of a name this command's prefix does not set: unknown when the line assigned it, else absent)
-  const envNamed = (name) => (penv.has(name) ? { known: true, ...penv.get(name) } : { ...envVar({}, ctx, name), list: [], unknown: false });
+  const envNamed = (name) => (penv.has(name) ? { known: true, ...penv.get(name) } : { ...envVar({}, ctx, name), list: [], unknown: false, refused: false });
+  // R8: a value of a name that selects the repository or the work tree that the resolver could not read one way (see resolvePrefixEnv)
+  let refused = [...penv].some(([name, c]) => c.refused && /^GIT_(?:DIR|WORK_TREE|CONFIG_PARAMETERS|CONFIG_KEY_\d+|CONFIG_VALUE_\d+)$/i.test(name));
+  const refuseCli = (v) => { if ((quotedText && dynamicPieces(v) >= 2) || substitutesDynamic(v, ctx)) refused = true; };
   const envGitDir = envNamed('GIT_DIR');
   let gitDirUnknown = !envGitDir.known; // exported twice: which repository the command acts on cannot be told
   // R4-B1: git resolves a relative --git-dir / --work-tree / GIT_DIR / GIT_WORK_TREE against the directory ALL the -C options produce
@@ -694,6 +726,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   let cliGroup = 0;
   const quotedText = rawQuoted(raw);
   const cliValue = (v) => {
+    refuseCli(v); // R8-B2 / R8-F2
     const g = ++cliGroup;
     const out = [{ v, lit: false, cli: true, g }];
     if (typeof v === 'string' && DYNAMIC.test(v) && quotedText) out.push({ v, lit: true, cli: true, g });
@@ -706,6 +739,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   for (const c of envWorkTree.list) if (c.v !== '') workTreeRaws.push(c);
   const envWt = envConfigWorkTrees(penv, ctx); // R4-F1, R5-B1
   if (envWt.unknown) targetUnknown = true;
+  if (envWt.refused) refused = true;
   const configs = [];
   const wtConfigs = [...envWt.entries];
   let i = 1;
@@ -718,6 +752,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
       const kv = argv[++i] ?? '';
       const eq = splitIndex(kv, '=');
       configs.push({ raw: kv, key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1), noValue: eq < 0 });
+      if (eq >= 0 && mayBeWorkTreeKey(configs[configs.length - 1].key)) refuseCli(kv.slice(eq + 1)); // R8-B2 / R8-F2
       // R7-F2: `-c core.worktree='$WT'`: the literal word is a target beside the expansion
       if (eq >= 0 && DYNAMIC.test(kv.slice(eq + 1)) && quotedText) wtConfigs.push({ key: configs[configs.length - 1].key, value: kv.slice(eq + 1), noValue: false, lit: true });
       continue;
@@ -730,7 +765,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
     // here is a target; a key that may be core.worktree at run time (R5-F1) counts the same
     if (t.startsWith('--config-env=') || t === '--config-env') {
       const r = configEnvWorkTree(t === '--config-env' ? argv[++i] : t.slice('--config-env='.length), penv, ctx);
-      if (r) { targetUnknown = true; wtConfigs.push(...r.entries); }
+      if (r) { targetUnknown = true; wtConfigs.push(...r.entries); if (r.refused) refused = true; }
       continue;
     }
     if (GIT_GLOBAL_VALUE.includes(t)) { i++; continue; }
@@ -752,7 +787,7 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   // a GIT_DIR / GIT_WORK_TREE assigned earlier on the line may or may not reach this command (so it is "unknown"), but where it
   // points is still a checkout this command may act on
   const hint = (name) => (typeof ctx.vars[name] === 'string' && ctx.vars[name] !== '' ? joinDir(d, ctx.vars[name], ctx) : null);
-  return { d, gitDir, gitDirAll, gitDirUnknown, workTree, workTreeAll, targetUnknown, hints: [hint('GIT_DIR'), hint('GIT_WORK_TREE')].filter((x) => x !== null), configs, wtConfigs, sub: argv[i], args: argv.slice(i + 1) };
+  return { d, gitDir, gitDirAll, gitDirUnknown, workTree, workTreeAll, targetUnknown, refused, hints: [hint('GIT_DIR'), hint('GIT_WORK_TREE')].filter((x) => x !== null), configs, wtConfigs, sub: argv[i], args: argv.slice(i + 1) };
 }
 
 // checkout / switch: which branch is the directory on afterwards?
@@ -971,6 +1006,9 @@ function mergeJobVerdict(sub, args, g, ctx) {
     const job = jobOfAny(named === null ? [] : [named], named === null);
     return job ? mergeJobDeny(job, `\`git worktree ${second}\` of it`) : null;
   }
+  // R8: a git dir / work tree value the resolver could not read one way (a limit, a quoted mix, a `$` through substitution, see resolvePrefixEnv) may
+  // name a checkout it dropped; "unknown" would only check the session's own directory, so a mutating verb is denied outright, marker or not
+  if (g.refused) return deny('the git directory / work tree of this command cannot be read one way (variables, quotes or limits), so whether it is a checkout that a `P merge --owner-go` job owns cannot be verified. Write the path out.');
   // R3-B1: the checkout a command acts on is not only the directory it runs in: --git-dir / GIT_DIR and --work-tree / GIT_WORK_TREE
   // (or -c core.worktree=) move it
   const targets = gitTargetCheckouts(g, ctx);
