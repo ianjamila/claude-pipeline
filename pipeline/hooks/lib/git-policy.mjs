@@ -555,6 +555,7 @@ const mayBeWorkTreeKey = (key) => DYNAMIC.test(key) || /^core\.worktree$/i.test(
 //     pieces (`'/r/$a'${T}`) is in neither the literal nor the expanded reading (R8-B2);
 //   - a substituted value (an assignment word's, an env wrapper's, the line's own variable) still holds a `$` or backtick: the shell does not
 //     expand it again, it is the literal text of a path (R8-F2).
+const GIT_SELECTOR_NAME = /^GIT_(?:DIR|WORK_TREE|CONFIG_PARAMETERS|CONFIG_KEY_\d+|CONFIG_VALUE_\d+)$/i; // (the names that select the repository or the work tree)
 const CAND_CAP = 64;
 const CAND_WORK = 500;
 const LIT_DYNAMIC = /\$\(|`/;
@@ -713,7 +714,9 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   // (what envVar says of a name this command's prefix does not set: unknown when the line assigned it, else absent)
   const envNamed = (name) => (penv.has(name) ? { known: true, ...penv.get(name) } : { ...envVar({}, ctx, name), list: [], unknown: false, refused: false });
   // R8: a value of a name that selects the repository or the work tree that the resolver could not read one way (see resolvePrefixEnv)
-  let refused = [...penv].some(([name, c]) => c.refused && /^GIT_(?:DIR|WORK_TREE|CONFIG_PARAMETERS|CONFIG_KEY_\d+|CONFIG_VALUE_\d+)$/i.test(name));
+  let refused = [...penv].some(([name, c]) => c.refused && GIT_SELECTOR_NAME.test(name));
+  // (an `export` / assignment earlier on the line reaches git through hint() and ctx.vars: its value holding a `$` or backtick is refused like a prefix value's)
+  if (Object.keys(ctx.vars).some((k) => GIT_SELECTOR_NAME.test(k) && typeof ctx.vars[k] === 'string' && DYNAMIC.test(ctx.vars[k]))) refused = true;
   const refuseCli = (v) => { if ((quotedText && dynamicPieces(v) >= 2) || substitutesDynamic(v, ctx)) refused = true; };
   const envGitDir = envNamed('GIT_DIR');
   let gitDirUnknown = !envGitDir.known; // exported twice: which repository the command acts on cannot be told

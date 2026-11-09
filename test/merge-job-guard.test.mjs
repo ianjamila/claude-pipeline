@@ -1017,3 +1017,33 @@ test('R8: the candidate sets say when they are refused, for each trigger', () =>
   assert.equal(r.refused, false);
   assert.deepEqual(resolve('WT=/owned GIT_WORK_TREE=$WT/$X git reset', {}).get('GIT_WORK_TREE').list.map((c) => c.v), ['/owned/']);
 });
+
+// R8-F2 (exported values): a GIT_* name an earlier `export` / assignment on the line gave a value reaches git too (hint()/ctx.vars); one still holding
+// `$` or a backtick is the literal text of a relative path (or something the line never resolved), so a mutating verb is refused like a prefix value
+test('R8-F2: an exported GIT_DIR / GIT_WORK_TREE / GIT_CONFIG_* value holding `$` or a backtick is refused for a mutating verb', () => {
+  const { container, job, at, wt, elsewhere } = r8Setup();
+  const shapes = (verb) => [
+    `export GIT_WORK_TREE='$Y'; git ${verb}`,
+    `export GIT_DIR=\\$G; git ${verb}`,
+    `export GIT_DIR='$G'; git ${verb}`,
+    `GIT_WORK_TREE='$Y'; export GIT_WORK_TREE; git ${verb}`,
+    `export GIT_WORK_TREE=\`pwd\`; git ${verb}`,
+    `export GIT_WORK_TREE=$(pwd); git ${verb}`,
+    `export GIT_WORK_TREE='${at}/$lit'\${T}; git ${verb}`,
+    `export GIT_CONFIG_PARAMETERS="'core.worktree=\\$Y'"; git ${verb}`,
+    `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0='$Y'; GIT_DIR=${at}/gd git ${verb}`,
+    `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='core.$k' GIT_CONFIG_VALUE_0=${wt}; GIT_DIR=${at}/gd git ${verb}`,
+  ];
+  mark(job, process.pid, 12);
+  for (const verb of ['reset --hard', 'checkout x']) for (const c of shapes(verb)) r8Refused(c, container);
+  // marker or not: the verdict does not depend on one
+  const { container: free } = containerWithJob();
+  r8Refused("export GIT_WORK_TREE='$Y'; git reset --hard", free);
+  // read-only verbs are unaffected; so are plain literal exports pointing elsewhere 
+  for (const verb of ['status', 'log --oneline', 'diff']) for (const c of shapes(verb)) assert.equal(decide(c, container).decision, 'allow', `read-only: ${c}`);
+  for (const c of [
+    `export GIT_WORK_TREE=${elsewhere}; git reset --hard`,
+    `export GIT_DIR=${elsewhere}/.git; git checkout x`,
+    `GIT_WORK_TREE=${elsewhere}; export GIT_WORK_TREE; git reset --hard`,
+  ]) assert.equal(decide(c, container).decision, 'allow', c);
+});
