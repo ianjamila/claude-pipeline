@@ -91,8 +91,10 @@ export function readRepoMoves({ home = accountHome() } = {}) {
 
 // Does a record that names `recorded`, made at `recordedAt`, speak about `current`? Exact (case-insensitive) match, or a chain of moves
 // from `recorded` to `current` where every hop was made AFTER the record (it predates that move). One way; at most MAX_HOPS hops; no name twice.
-// One chain is ONE repository: every hop carries the same repoId (the first hop fixes it; a vacated name can be reused by another
-// repository) and each hop is strictly later than the one before it (history is walked forwards, never back).
+// One chain is ONE repository: every hop carries the same repoId and each hop is strictly later than the one before it (history is
+// walked forwards, never back). A vacated name can be reused by another repository, so the chain is bound to the repository that held
+// the recorded name at recordedAt: the EARLIEST move departing from that name after the record fixes the repoId (two departures at that
+// same instant: unknown which repository, so no alias). Each later hop is likewise the earliest same-id departure from its name.
 export function sameRepo({ recorded, recordedAt, current, moves } = {}) {
   if (typeof recorded !== 'string' || typeof current !== 'string') return false;
   const want = current.toLowerCase();
@@ -102,13 +104,19 @@ export function sameRepo({ recorded, recordedAt, current, moves } = {}) {
   if (!Number.isFinite(madeAt) || !Array.isArray(moves)) return false;
   const later = moves.filter((m) => typeof m?.from === 'string' && typeof m.to === 'string' && Number.isInteger(m.repoId) && Date.parse(m.at) > madeAt)
     .map((m) => ({ from: m.from.toLowerCase(), to: m.to.toLowerCase(), at: Date.parse(m.at), repoId: m.repoId }));
-  // `last` is the time of the previous hop (the record's own time for the first); `id` the chain's repository id (null until the first hop).
+  const earliest = (name, last, id) => {
+    const out = later.filter((m) => m.from === name && m.at > last && (id === null || m.repoId === id));
+    const t = Math.min(...out.map((m) => m.at));
+    return out.filter((m) => m.at === t);
+  };
+  // `last` is the time of the previous hop (the record's own time for the first); `id` the chain's repository id.
   const walk = (name, seen, last, id) => {
     if (seen.size > MAX_HOPS) return false;
-    return later.some((m) => m.from === name && m.at > last && (id === null || m.repoId === id) && !seen.has(m.to)
-      && (m.to === want || walk(m.to, new Set([...seen, m.to]), m.at, m.repoId)));
+    return earliest(name, last, id).some((m) => !seen.has(m.to) && (m.to === want || walk(m.to, new Set([...seen, m.to]), m.at, id)));
   };
-  return walk(start, new Set([start]), madeAt, null);
+  const first = earliest(start, madeAt, null);
+  if (first.length === 0 || first.some((m) => m.repoId !== first[0].repoId)) return false;
+  return walk(start, new Set([start]), madeAt, first[0].repoId);
 }
 
 // The owner's writer (commands/repo-move.mjs). Appends `move` to the file, keeping every existing entry, with a temp file in the same

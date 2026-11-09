@@ -104,7 +104,10 @@ test('repo-move: A -> B, B -> A, an approval under A, then A -> B again: that ap
   assert.equal((await go(['--from', B, '--to', A, '--at', '2026-11-09T02:00:00Z'], { h, answers: back })).output.added, true);
   const approvedAt = '2026-11-09T03:00:00Z';
   assert.equal(sameRepo({ recorded: A, recordedAt: approvedAt, current: B, moves: readRepoMoves({ home: h }).moves }), false, 'not yet moved after the approval');
-  assert.equal((await go(['--from', A, '--to', B, '--at', '2026-11-09T04:00:00Z'], { h, answers: ids })).output.added, true, 'a later A -> B is not dropped');
+  const again = await go(['--from', A, '--to', B, '--at', '2026-11-09T04:00:00Z'], { h, answers: ids });
+  assert.equal(again.output.added, true, 'a later A -> B is not dropped');
+  assert.equal(again.output.move.at, '2026-11-09T04:00:00.000Z', 'the output reports the entry just added, not the first A -> B');
+  assert.deepEqual(again.output.move, { from: A.toLowerCase(), to: B.toLowerCase(), at: '2026-11-09T04:00:00.000Z', repoId: 77 });
   assert.equal(sameRepo({ recorded: A, recordedAt: approvedAt, current: B, moves: readRepoMoves({ home: h }).moves }), true);
 });
 

@@ -148,6 +148,24 @@ test('sameRepo: a chain never crosses repository identities (every hop carries t
   assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/b', [{ from: 'org/a', to: 'org/b', at: '2026-11-09T10:00:00Z' }]), false);
 });
 
+test('sameRepo: the chain is bound to the repository that held the recorded name at the record (a reused name is another repository)', () => {
+  // Codex's repro: org/a -> org/b (repository 1) at 10:00; later a NEW repository takes org/a and moves org/a -> org/c (repository 2) at 11:00.
+  const reused = [mv('org/a', 'org/b', '2026-11-09T10:00:00Z', 1), mv('org/a', 'org/c', '2026-11-09T11:00:00Z', 2)];
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', reused), false, 'the approval was for repository 1, which is now org/b');
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/b', reused), true);
+  // a record made between the two moves belongs to the second repository
+  assert.equal(same('org/a', '2026-11-09T10:30:00Z', 'org/c', reused), true);
+  assert.equal(same('org/a', '2026-11-09T10:30:00Z', 'org/b', reused), false);
+  // two departures at the earliest instant: which repository held the name is unknown, so nothing aliases
+  const tie = [mv('org/a', 'org/b', '2026-11-09T10:00:00Z', 1), mv('org/a', 'org/c', '2026-11-09T10:00:00Z', 2)];
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/b', tie), false);
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', tie), false);
+  // a later hop is the earliest same-id departure: a second repository's hop out of the intermediate name does not extend the chain
+  const mid = [mv('org/a', 'org/b', '2026-11-09T10:00:00Z', 1), mv('org/b', 'org/c', '2026-11-09T11:00:00Z', 2), mv('org/b', 'org/d', '2026-11-09T12:00:00Z', 1)];
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', mid), false);
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/d', mid), true);
+});
+
 test('sameRepo: a chain never walks backwards in time (each hop strictly later than the one before)', () => {
   const back = [mv('org/b', 'org/c', '2026-11-09T10:00:00Z'), mv('org/a', 'org/b', '2026-11-09T11:00:00Z')];
   assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', back), false, 'same id, but the second hop predates the first');

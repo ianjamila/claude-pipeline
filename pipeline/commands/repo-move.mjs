@@ -74,7 +74,9 @@ export async function run(argv, ctx = {}) {
     const move = { from, to, at: new Date(atMs).toISOString(), repoId: old.id };
     const r = appendRepoMove(move, { home });
     if (!r.ok) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'not-written', message: r.reason, file } };
+    // report this very entry (names lower-cased as stored, matched by time too), not the first same-name entry in the file: A -> B can recur.
+    const reported = r.moves.findLast((m) => m.from === from.toLowerCase() && m.to === to.toLowerCase() && Date.parse(m.at) === atMs);
     process.stderr.write(r.added ? `recorded: ${from} -> ${to} (${move.at}) in ${file}\n` : `already recorded: ${from} -> ${to}\n`);
-    return { exitCode: EXIT.OK, output: { ok: true, added: r.added, move: r.moves.find((m) => m.from === from.toLowerCase() && m.to === to.toLowerCase()), moves: r.moves, file } };
+    return { exitCode: EXIT.OK, output: { ok: true, added: r.added, move: reported, moves: r.moves, file } };
   });
 }
