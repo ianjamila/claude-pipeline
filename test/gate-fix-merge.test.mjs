@@ -100,7 +100,7 @@ test('7 preMergeProblems: flags a moved head, a non-open or draft PR, a blocking
 function flipAtMerge(s, patch) {
   const entries = rawEntries(s);
   const lateView = { state: 'OPEN', headRefOid: s.head, isDraft: false, labels: [], ...patch };
-  s.fake.setScript([{ match: '^pr view 12 --json state,headRefOid,labels,isDraft$', stdoutJson: lateView }, ...entries]);
+  s.fake.setScript([{ match: '^pr view 12 --json state,headRefOid,labels,isDraft,body$', stdoutJson: lateView }, ...entries]);
 }
 
 test('7 merge: a label flipped to needs-human after the live gate (before the merge command) refuses, exit 1, no merge', () => {
@@ -127,12 +127,30 @@ test('7 merge: the PR head moving after the live gate also refuses before mergin
 
 });
 
+test('7 merge: a "Closes #a, #b" body written after the live gate refuses before merging (#210); one keyword per issue merges', () => {
+  const s = scenario();
+  assert.equal(s.gate().code, 0);
+  flipAtMerge(s, { body: '## In plain English\nA fix.\n\nCloses #170, #171\n' });
+  const r = s.merge();
+  assert.equal(r.code, 1, r.stdout);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.match(r.json.reasons.join(), /closes only #170 on merge/);
+  assert.match(r.json.reasons.join(), /write "Closes #170\. Closes #171\."/);
+  assert.match(r.json.reasons.join(), /ask for the merge again; no new review round is needed/);
+  assert.deepEqual(s.mergeCalls(), [], 'the merge command must not run');
+
+  flipAtMerge(s, { body: '## In plain English\nA fix.\n\nCloses #170. Closes #171.\n' });
+  const ok = s.merge();
+  assert.equal(ok.code, 0, ok.stdout);
+  assert.equal(s.mergeCalls().length, 1);
+});
+
 test('7 merge: with nothing changed the extra read does not get in the way', () => {
   const s = scenario();
   assert.equal(s.gate().code, 0);
   const r = s.merge();
   assert.equal(r.code, 0, r.stdout);
-  assert.ok(s.fake.lines().some((l) => l === 'pr view 12 --json state,headRefOid,labels,isDraft'), 'the pre-merge read happened');
+  assert.ok(s.fake.lines().some((l) => l === 'pr view 12 --json state,headRefOid,labels,isDraft,body'), 'the pre-merge read happened');
   assert.equal(s.mergeCalls().length, 1);
 });
 

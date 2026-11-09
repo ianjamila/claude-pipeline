@@ -342,7 +342,7 @@ test('merge: a merge that does not happen clears inFlight and puts the step back
 
 test('merge: a refusal by the last look at GitHub (after inFlight was set) clears it too, and the merge command never ran', () => {
   // The live gate reads the PR with a longer field list; only the pre-merge look asks for exactly these fields.
-  const lastLook = { match: '^pr view 12 --json state,headRefOid,labels,isDraft$', stdoutJson: { state: 'OPEN', headRefOid: 'x', labels: [], isDraft: true } };
+  const lastLook = { match: '^pr view 12 --json state,headRefOid,labels,isDraft,body$', stdoutJson: { state: 'OPEN', headRefOid: 'x', labels: [], isDraft: true } };
   const s = mergeScenario();
   assertExit(s.gate(), 0);
   s.fake.setScript(ghEntries({ prHead: s.head, extra: [lastLook] }));
