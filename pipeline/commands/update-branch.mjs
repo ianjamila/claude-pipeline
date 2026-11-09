@@ -7,6 +7,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { MAX_UPDATE_CYCLES, bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
+import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { holdBeforeUpdate, recordSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
 
 export const meta = {
@@ -28,6 +29,13 @@ export const run = guarded(async (argv, ctx) => {
   const gh = createGitHub({ cwd: root, env: ctx.env });
 
   return guardGh(async () => {
+    // Queue mode (GitHub's merge queue tests the PR on top of the current base itself): a moved base needs no catch-up. Unreadable = refuse, never update.
+    try {
+      if (queueModeFor({ gh, pr }).queue) return { exitCode: EXIT.OK, output: { ok: true, outcome: 'queue-mode', updated: false, head: localHead, localHead, pullNeeded: false, message: 'the base branch has a merge queue: no catch-up is needed' } };
+    } catch (err) {
+      if (!(err instanceof QueueUnreadable)) throw err;
+      return { exitCode: EXIT.FAILED, output: { ok: false, outcome: 'queue-unreadable', updated: false, message: err.message } };
+    }
     // The run record shows the update as in flight (30 min cap), and it is cleared on every exit, a throw included.
     // The record is display: a failed write is a warning in the output, never a failure of the update.
     const recorder = createRunRecorder({ gh, pr });

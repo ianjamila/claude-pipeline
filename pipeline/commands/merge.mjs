@@ -52,10 +52,11 @@ const HOLD_OUTCOMES = new Set(['queued-behind', 'hold-unreadable']);
 // A failed merge command whose full output says the PR is queued behind another's hold (repos with the hold keys only).
 const queuedBehindOf = (config, ran) => (holdsConfigured(config) && ran.code !== 0 ? queuedBehindFrom(`${ran.stdout}\n${ran.stderr}`) : null);
 
-// Queue mode, read live: { on: boolean } or { refusal } (QueueUnreadable = queue-unreadable: refuse, never fall back to a direct merge).
+// Queue mode, read live: { on: boolean, state } (state = the one GraphQL read, for a caller that needs the entry) or { refusal } (QueueUnreadable = queue-unreadable: refuse, never fall back to a direct merge).
 function readQueueMode({ gh, pr }) {
   try {
-    return { on: queueModeFor({ gh, pr }).queue };
+    const { queue, state } = queueModeFor({ gh, pr });
+    return { on: queue, state };
   } catch (err) {
     if (err instanceof QueueUnreadable) return { refusal: refuse('queue-unreadable', [err.message]) };
     throw err;
@@ -581,9 +582,11 @@ async function queueRecheckOwnerGo({ root, config, pr, gh, ctx, head, repo, hold
 // Behind-ness without the update: GitHub's own mergeStateStatus, then the compare API. Never "not behind" by default.
 // `accepted` (--owner-go, merge.behind_base: disjoint): the behind summary the live evaluation accepted. A compare "behind" whose base tip is
 // the very baseRefOid that evaluation scanned is then no blocker; any other base tip (main moved in between) still is.
-function readBehind(gh, pr, { accepted = null } = {}) {
+function readBehind(gh, pr, { accepted = null, queueMode = false } = {}) {
   const view = gh.prView(pr, [...PR_FIELDS, 'baseRefOid']);
   const state = view?.mergeStateStatus;
+  // Queue mode: being behind is no problem (the queue builds on the current base), so only conflicts are asked, and nothing is compared.
+  if (queueMode) return state === 'DIRTY' ? [{ kind: 'conflicts', detail: 'GitHub reports merge conflicts (mergeStateStatus DIRTY)' }] : [];
   if (state === 'BEHIND') return [{ kind: 'behind-base', detail: 'GitHub reports the PR is BEHIND its base (mergeStateStatus BEHIND): update the branch (P update-branch), re-verify and run final-gate again' }];
   const out = [];
   if (state === 'DIRTY') out.push({ kind: 'conflicts', detail: 'GitHub reports merge conflicts (mergeStateStatus DIRTY)' });
@@ -620,6 +623,15 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
 
   let hold = null; // --owner-go: the eligible needs-human hold the owner's "merge" would lift (lib/hold.mjs)
 
+  // Queue mode, read live. Unreadable = a blocker (never an all-clear); the rest then runs as with the queue off. A PR already queued or merged is a blocker too.
+  const queue = readQueueMode({ gh, pr });
+  if (queue.refusal) add('queue-unreadable', queue.refusal.output.reasons?.[0] ?? 'the merge queue state could not be read');
+  else if (queue.on) {
+    if (queue.state.state === 'MERGED') add('queueState', `PR #${pr} is already merged`);
+    else if (queue.state.entry) add('queueState', `PR #${pr} is already queued at position ${queue.state.entry.position}`);
+  }
+  const qm = queue.on ? { queueMode: true } : {};
+
   // Read-only: a lift comment with no label and no merge (an `--owner-go` run that died) is reported; the real run puts the label back first. A merge running right now
   // (the per-PR lock, this machine) is reported instead and the orphan judgement is skipped: it would be wrong under a live merge. The unverified cases are the real run's
   // refusals: --owner-go refuses when the comments stay unreadable, the gated route tolerates only that.
@@ -645,7 +657,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   if (ownerGo) {
     if (gh.repo().host !== 'github.com') add('owner-go', hostProblem(gh));
     ({ hold } = await readEligibleHold({ gh, pr, config }));
-    live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null });
+    live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null, ...qm });
     if (live.head !== head) add('live-check', `the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`);
     const failed = live.checks.filter((x) => !x.ok);
     crashed = scanCrashed(failed);
@@ -676,7 +688,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
       flags = `the run record could not be read (${String(err?.message ?? err).slice(0, 200)})`;
     }
 
-    live = await evaluateGate({ root, config, pr, gh, env: ctx.env, readOnly: true });
+    live = await evaluateGate({ root, config, pr, gh, env: ctx.env, readOnly: true, ...qm });
     for (const c of live.checks.filter((x) => !x.ok)) {
       add(/proof-settings-unverified/.test(c.detail) ? 'proof-settings-unverified' : 'live-check', `${c.name}: ${c.detail}`);
     }
@@ -687,13 +699,13 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   }
 
   const behind = ownerGo ? (live.behind ?? null) : null;
-  for (const b of readBehind(gh, pr, { accepted: behind })) add(b.kind, b.detail);
-  for (const reason of await preMergeProblems({ gh, pr, head, base: ownerGo ? live.baseRefOid : null, exemptHold: hold !== null })) add('pre-merge', reason);
+  for (const b of readBehind(gh, pr, { accepted: behind, queueMode: queue.on })) add(b.kind, b.detail);
+  for (const reason of await preMergeProblems({ gh, pr, head, base: ownerGo ? live.baseRefOid : null, exemptHold: hold !== null, ...qm })) add('pre-merge', reason);
 
   // A repo with the hold keys: its read-only check (the only shell command a dry run runs). A hold ahead, or an answer that cannot be
   // read, is a blocker; a branch that is behind must then NOT be updated, so the update advice above is withdrawn.
   let holds = null;
-  if (holdsConfigured(config)) {
+  if (holdsConfigured(config) && !queue.on) { // (queue mode has no merge hold)
     const check = await checkHolds({ config, pr, root, env: ctx.env });
     holds = { readable: check.ok === true, blockedBy: check.ok ? check.blockedBy : [] };
     const held = holdGateFrom(check);
@@ -739,16 +751,17 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
         ownerStep = { ...ownerStep, hold: parts.hold, holdInfo: hold, ready: readyLine([pr], { lift: true }), ...(parkNote ? { parkNote } : {}) };
       }
       // Behind its base but accepted (merge.behind_base: disjoint): the owner is told so in the request, above the Areas / Head lines.
+      if (queue.on) ownerStep = { ...ownerStep, queueNote: 'GitHub\'s merge queue tests it on top of main and everything ahead of it, then merges it — one "merge" is enough.' };
       if (behind !== null) ownerStep = { ...ownerStep, behindNote: `behind ${config.default_branch} by ${behind.behindBy} commit(s); ${config.default_branch}'s ${behind.mainFiles} new file(s) touch none of this PR's files` };
     }
   }
 
   // For a repo with the hold keys: may this hand-off take the merge hold now? Only a say-merge / owner-runs ending whose blockers are none, or
   // only the ones that make it owner-runs (a hold ahead, an unreadable check or any other blocker disqualifies). The review skill reads this.
-  if (holdsConfigured(config) && ownerStep !== null) {
+  if (holdsConfigured(config) && !queue.on && ownerStep !== null) {
     ownerStep = { ...ownerStep, holdEligible: ['say-merge', 'owner-runs'].includes(ownerStep.kind) && blockers.every((b) => handOffBlockers.has(b)) };
   }
 
   const wouldMerge = blockers.length === 0;
-  return { exitCode: wouldMerge ? EXIT.OK : EXIT.FAILED, output: { ok: wouldMerge, dryRun: true, wouldMerge, mode: ownerGo ? 'owner-go' : 'gate', head, ...(ownerGo ? { behind } : {}), blockers, ownerStep, ...(holds ? { holds } : {}) } };
+  return { exitCode: wouldMerge ? EXIT.OK : EXIT.FAILED, output: { ok: wouldMerge, dryRun: true, wouldMerge, mode: ownerGo ? 'owner-go' : 'gate', head, ...(ownerGo ? { behind } : {}), ...(queue.on ? { queue: true } : {}), blockers, ownerStep, ...(holds ? { holds } : {}) } };
 }
