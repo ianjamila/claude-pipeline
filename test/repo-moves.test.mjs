@@ -1,0 +1,138 @@
+// hooks/lib/repo-moves.mjs: reading the owner's repo-moves file (fail closed) and the one-way, record-predates-the-move name match.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { MAX_HOPS, readRepoMoves, REPO_MOVES_DIR_REL, REPO_MOVES_FILE, repoMovesPath, sameRepo } from '../pipeline/hooks/lib/repo-moves.mjs';
+import { OWNER_GO_REL } from '../pipeline/hooks/lib/owner-go.mjs';
+
+const tmp = () => mkdtempSync(join(tmpdir(), 'repo-moves-'));
+const MOVE = { from: 'ianjamila/eaglewatch', to: 'eaglewatch-ph/eaglewatch', at: '2026-11-09T06:58:25Z', repoId: 77 };
+function homeWith(content) {
+  const home = tmp();
+  mkdirSync(join(home, ...REPO_MOVES_DIR_REL.split('/')), { recursive: true });
+  if (content !== undefined) writeFileSync(repoMovesPath(home), typeof content === 'string' ? content : JSON.stringify(content));
+  return home;
+}
+const file = (...moves) => ({ v: 1, moves });
+
+test('repo-moves: the file sits in the owner-go folder guard-files protects', () => {
+  assert.equal(REPO_MOVES_DIR_REL, OWNER_GO_REL);
+  assert.equal(repoMovesPath('/h'), join('/h', ...OWNER_GO_REL.split('/'), REPO_MOVES_FILE));
+});
+
+test('readRepoMoves: a missing folder or file is no moves and no error', () => {
+  assert.deepEqual(readRepoMoves({ home: tmp() }), { moves: [], error: null });
+  assert.deepEqual(readRepoMoves({ home: homeWith() }), { moves: [], error: null });
+});
+
+test('readRepoMoves: a valid file is read, names lower-cased', () => {
+  const r = readRepoMoves({ home: homeWith(file({ ...MOVE, from: 'IanJamila/EagleWatch' })) });
+  assert.equal(r.error, null);
+  assert.deepEqual(r.moves, [MOVE]);
+});
+
+test('readRepoMoves: invalid JSON, a wrong version, or ANY invalid entry voids every move', () => {
+  const bad = (why, content) => {
+    const r = readRepoMoves({ home: homeWith(content) });
+    assert.deepEqual(r.moves, [], why);
+    assert.equal(typeof r.error, 'string', why);
+  };
+  bad('not json', '{"v":1,');
+  bad('not an object', 'null');
+  bad('wrong version', { v: 2, moves: [MOVE] });
+  bad('moves not an array', { v: 1, moves: {} });
+  const good = MOVE;
+  for (const [why, patch] of [
+    ['from not a name', { from: 'nope' }], ['to has a space', { to: 'a b/c' }], ['from missing', { from: undefined }], ['to a number', { to: 5 }],
+    ['same name', { to: 'IANJAMILA/Eaglewatch' }], ['at unparseable', { at: 'yesterday' }], ['at missing', { at: undefined }],
+    ['repoId zero', { repoId: 0 }], ['repoId negative', { repoId: -1 }], ['repoId a float', { repoId: 1.5 }], ['repoId a string', { repoId: '77' }],
+  ]) bad(`one bad entry (${why}) voids the good one too`, file(good, { ...good, ...patch }));
+  bad('an entry that is not an object', file(good, 'a/b'));
+  bad('an array entry', file(good, []));
+});
+
+test('readRepoMoves: a symlinked file, a linked or file folder and an oversize file read as no moves with an error', () => {
+  const home = homeWith();
+  const target = join(tmp(), 'elsewhere.json');
+  writeFileSync(target, JSON.stringify(file(MOVE)));
+  symlinkSync(target, repoMovesPath(home));
+  const linked = readRepoMoves({ home });
+  assert.deepEqual(linked.moves, []);
+  assert.equal(typeof linked.error, 'string');
+  // a symlinked folder
+  const home2 = tmp();
+  mkdirSync(join(home2, '.claude', 'pipeline-state'), { recursive: true });
+  const real = tmp();
+  writeFileSync(join(real, REPO_MOVES_FILE), JSON.stringify(file(MOVE)));
+  symlinkSync(real, join(home2, ...OWNER_GO_REL.split('/')));
+  const viaFolder = readRepoMoves({ home: home2 });
+  assert.deepEqual(viaFolder.moves, []);
+  assert.equal(typeof viaFolder.error, 'string');
+  // a directory where the file goes
+  const home3 = homeWith();
+  mkdirSync(repoMovesPath(home3));
+  assert.equal(typeof readRepoMoves({ home: home3 }).error, 'string');
+  // oversize
+  const big = readRepoMoves({ home: homeWith(`${JSON.stringify(file(MOVE))}${' '.repeat(70 * 1024)}`) });
+  assert.deepEqual(big.moves, []);
+  assert.match(big.error, /larger than/);
+});
+
+// ---- sameRepo -----------------------------------------------------------------------------------------------------------------
+
+const A = 'old/app';
+const B = 'mid/app';
+const C = 'new/app';
+const mv = (from, to, at) => ({ from, to, at, repoId: 1 });
+const BEFORE = '2026-11-01T00:00:00Z';
+const MOVED = '2026-11-05T00:00:00Z';
+const AFTER = '2026-11-09T00:00:00Z';
+const same = (recorded, recordedAt, current, moves) => sameRepo({ recorded, recordedAt, current, moves });
+
+test('sameRepo: an exact match (case-insensitive) needs no move and no valid time', () => {
+  assert.equal(same('Acme/App', 'garbage', 'acme/app', []), true);
+  assert.equal(same('acme/app', undefined, 'ACME/APP', undefined), true);
+  assert.equal(same('acme/app', BEFORE, 'acme/other', []), false);
+  assert.equal(same(null, BEFORE, 'acme/app', []), false);
+  assert.equal(same('acme/app', BEFORE, null, []), false);
+});
+
+test('sameRepo: a record that predates the move counts for the new name', () => {
+  assert.equal(same(A, BEFORE, C, [mv(A, C, MOVED)]), true);
+  assert.equal(same('OLD/App', BEFORE, 'NEW/APP', [mv(A, C, MOVED)]), true);
+});
+
+test('sameRepo: a record made at or after the move never counts (a new repo created later at the old name)', () => {
+  assert.equal(same(A, MOVED, C, [mv(A, C, MOVED)]), false, 'at the same instant');
+  assert.equal(same(A, AFTER, C, [mv(A, C, MOVED)]), false);
+});
+
+test('sameRepo: one way only (a record naming the new name never counts for the old)', () => {
+  assert.equal(same(C, BEFORE, A, [mv(A, C, MOVED)]), false);
+  assert.equal(same(C, AFTER, A, [mv(A, C, MOVED)]), false);
+});
+
+test('sameRepo: a chain of moves, each hop after the record; a late hop or a gap breaks it', () => {
+  const chain = [mv(A, B, MOVED), mv(B, C, AFTER)];
+  assert.equal(same(A, BEFORE, C, chain), true);
+  assert.equal(same(B, BEFORE, C, chain), true);
+  assert.equal(same(A, '2026-11-07T00:00:00Z', C, chain), false, 'the first hop predates the record');
+  assert.equal(same(A, BEFORE, C, [mv(A, B, MOVED)]), false, 'no hop to the current name');
+  assert.equal(same(A, BEFORE, C, [mv(B, C, AFTER)]), false, 'no hop from the recorded name');
+  assert.equal(same(A, BEFORE, C, [mv(A, 'other/app', MOVED), mv(A, B, MOVED), mv(B, C, AFTER)]), true, 'a branch that goes nowhere does not hide the right one');
+});
+
+test('sameRepo: a cycle ends (never revisits a name) and a chain longer than the hop limit is refused', () => {
+  const cycle = [mv(A, B, MOVED), mv(B, A, AFTER), mv(B, 'x/y', AFTER)];
+  assert.equal(same(A, BEFORE, C, cycle), false);
+  assert.equal(same(A, BEFORE, 'x/y', cycle), true);
+  const long = (n) => Array.from({ length: n }, (_, i) => mv(`n${i}/app`, `n${i + 1}/app`, MOVED));
+  assert.equal(same('n0/app', BEFORE, `n${MAX_HOPS}/app`, long(MAX_HOPS)), true);
+  assert.equal(same('n0/app', BEFORE, `n${MAX_HOPS + 1}/app`, long(MAX_HOPS + 1)), false);
+});
+
+test('sameRepo: an unparseable or missing recordedAt allows an exact match only', () => {
+  for (const bad of ['yesterday', '', undefined, null, 5]) assert.equal(same(A, bad, C, [mv(A, C, MOVED)]), false, String(bad));
+});

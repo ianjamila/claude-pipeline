@@ -1,0 +1,107 @@
+// Repo moves: the owner's record that a GitHub repository was renamed or transferred (from -> to).
+//
+// Why: owner-go records (the owner's "merge", rulings, extra-round grants, consumed-grant markers) store the repository name as
+// it was shown when the owner said it. After a transfer every check compares that stored name to repoKey(current origin), so
+// grants made before the move no longer verified. The owner records the move once, in their own terminal
+// (`pipeline repo-move`, commands/repo-move.mjs), into <home>/.claude/pipeline-state/owner-go/repo-moves.json, a file inside the
+// folder guard-files protects (agents cannot write it). sameRepo then lets a record naming the OLD name count for the NEW one:
+// one way only, and only for a record made BEFORE the move (a repository created later at the old name is a different repository).
+// Fail closed: a missing, unreadable or in any way invalid file means no aliasing at all.
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
+import path from 'node:path';
+import { accountHome } from '../../lib/paths.mjs';
+
+// The same pattern owner-go.mjs matches a request's `repo` with (it imports it from here: this file imports nothing of owner-go, so there is no cycle).
+export const REPO_NAME = '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+';
+// Same folder as owner-go.mjs OWNER_GO_REL (test/repo-moves.test.mjs holds the two equal).
+export const REPO_MOVES_DIR_REL = '.claude/pipeline-state/owner-go';
+export const REPO_MOVES_FILE = 'repo-moves.json';
+export const MAX_MOVES_BYTES = 64 * 1024;
+export const MAX_HOPS = 8;
+
+const NAME_RE = new RegExp(`^${REPO_NAME}$`);
+export const repoMovesPath = (home = accountHome()) => path.join(home, ...REPO_MOVES_DIR_REL.split('/'), REPO_MOVES_FILE);
+
+// 'ok' (every folder from <home>/.claude down is a real directory), 'missing' or 'unsafe' (a link, a file, unreadable).
+function chainState(home, rel) {
+  let p = home;
+  for (const part of rel.split('/')) {
+    p = path.join(p, part);
+    try {
+      if (!lstatSync(p).isDirectory()) return 'unsafe';
+    } catch (err) {
+      return err?.code === 'ENOENT' ? 'missing' : 'unsafe';
+    }
+  }
+  return 'ok';
+}
+
+// One entry of the file, normalised (names lower case), or null when it is not a valid move.
+export function validMove(m) {
+  if (!m || typeof m !== 'object' || Array.isArray(m)) return null;
+  if (typeof m.from !== 'string' || typeof m.to !== 'string' || !NAME_RE.test(m.from) || !NAME_RE.test(m.to)) return null;
+  const from = m.from.toLowerCase();
+  const to = m.to.toLowerCase();
+  if (from === to || typeof m.at !== 'string' || !Number.isFinite(Date.parse(m.at))) return null;
+  if (!Number.isInteger(m.repoId) || m.repoId < 1) return null;
+  return { from, to, at: m.at, repoId: m.repoId };
+}
+
+// { moves, error }: a missing file is { moves: [], error: null }. Anything else wrong (a linked folder or file, too big, not JSON, not
+// version 1, ANY invalid entry) is { moves: [], error: <text> }: no aliasing at all. Never throws.
+export function readRepoMoves({ home = accountHome() } = {}) {
+  const none = (error) => ({ moves: [], error });
+  const file = repoMovesPath(home);
+  const chain = chainState(home, REPO_MOVES_DIR_REL);
+  if (chain === 'missing') return none(null);
+  if (chain === 'unsafe') return none(`${REPO_MOVES_DIR_REL} is not a real folder`);
+  try {
+    if (!lstatSync(file).isFile()) return none(`${file} is not a regular file`);
+  } catch (err) {
+    return err?.code === 'ENOENT' ? none(null) : none(`${file} cannot be read (${err?.code ?? 'error'})`);
+  }
+  let text;
+  try {
+    const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    try {
+      const st = fstatSync(fd);
+      if (!st.isFile()) return none(`${file} is not a regular file`);
+      if (st.size > MAX_MOVES_BYTES) return none(`${file} is larger than ${MAX_MOVES_BYTES} bytes`);
+      const buf = Buffer.alloc(st.size);
+      readSync(fd, buf, 0, st.size, 0);
+      text = buf.toString('utf8');
+    } finally {
+      closeSync(fd);
+    }
+  } catch (err) {
+    return none(`${file} cannot be read (${err?.code ?? 'error'})`);
+  }
+  let data;
+  try { data = JSON.parse(text); } catch { return none(`${file} is not valid JSON`); }
+  if (data?.v !== 1 || !Array.isArray(data.moves)) return none(`${file} is not a version 1 repo-moves file`);
+  const moves = [];
+  for (const [i, m] of data.moves.entries()) {
+    const ok = validMove(m);
+    if (!ok) return none(`${file}: entry ${i} is not a valid move`);
+    moves.push(ok);
+  }
+  return { moves, error: null };
+}
+
+// Does a record that names `recorded`, made at `recordedAt`, speak about `current`? Exact (case-insensitive) match, or a chain of moves
+// from `recorded` to `current` where every hop was made AFTER the record (it predates that move). One way; at most MAX_HOPS hops; no name twice.
+export function sameRepo({ recorded, recordedAt, current, moves } = {}) {
+  if (typeof recorded !== 'string' || typeof current !== 'string') return false;
+  const want = current.toLowerCase();
+  const start = recorded.toLowerCase();
+  if (start === want) return true;
+  const madeAt = typeof recordedAt === 'string' ? Date.parse(recordedAt) : NaN;
+  if (!Number.isFinite(madeAt) || !Array.isArray(moves)) return false;
+  const later = moves.filter((m) => typeof m?.from === 'string' && typeof m.to === 'string' && Date.parse(m.at) > madeAt)
+    .map((m) => ({ from: m.from.toLowerCase(), to: m.to.toLowerCase() }));
+  const walk = (name, seen) => {
+    if (seen.size > MAX_HOPS) return false;
+    return later.some((m) => m.from === name && !seen.has(m.to) && (m.to === want || walk(m.to, new Set([...seen, m.to]))));
+  };
+  return walk(start, new Set([start]));
+}

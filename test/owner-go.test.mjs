@@ -1758,3 +1758,71 @@ test('#128 legacy grant R2-B1: the accepted project-folder shape is the guard\'s
   }
   assert.match(readFileSync(fileURLToPath(new URL('../pipeline/hooks/lib/owner-go.mjs', import.meta.url)), 'utf8'), /TRANSCRIPT_PROJECT_RE/);
 });
+
+// ---- a repository moved (renamed / transferred): records naming the old name, made BEFORE the move, count for the new name ----
+// (hooks/lib/repo-moves.mjs; the owner records the move with `pipeline repo-move`. The tests hand the moves in as opts.repoMoves.)
+const NEW_NAME = 'acme/renamed';
+const moveAt = (ms) => [{ from: REPO, to: NEW_NAME, at: new Date(AT + ms).toISOString(), repoId: 9 }];
+const LATER_MOVE = moveAt(3_600_000); // the move happened an hour after the records below were made
+const EARLIER_MOVE = moveAt(-3_600_000); // the move happened an hour BEFORE them (a new repository created later at the old name)
+
+test('repo moved: a round grant and its consumed marker recorded under the old name before the move verify under the new name, and only with the moves', () => {
+  const home = tmp();
+  const [rec] = twoGrants(home);
+  assert.equal(claimGrantMarkers([rec], BODY, { home, now: () => AT + 3000 }).ok, true); // the marker names the OLD name
+  const q = { repo: NEW_NAME, pr: 58, k: 4, toHead: GHEAD, ownerGrant: { grantId: grantIdOf(rec), quote: rec.prompt } };
+  const late = { home, now: () => AT + 40 * 24 * 3600_000 };
+  assert.equal(verifyOwnerGrant(q, { ...late, repoMoves: LATER_MOVE }).ok, true);
+  assert.deepEqual(verifyOwnerGrant(q, { ...late, repoMoves: [] }), { ok: false, reason: 'mismatch' }, 'refused without the moves');
+  assert.deepEqual(verifyOwnerGrant(q, late), { ok: false, reason: 'mismatch' }, 'no moves file under this home: refused');
+  assert.equal(verifyOwnerGrant({ ...q, repo: REPO }, late).ok, true, 'the old name still verifies as before');
+  // the record made AFTER the move is a different repository's
+  assert.deepEqual(verifyOwnerGrant(q, { ...late, repoMoves: EARLIER_MOVE }), { ok: false, reason: 'mismatch' });
+  // the record is old enough but the MARKER (consumed after the move) is not: the marker's own time counts
+  const split = moveAt(1500); // after the record (AT .. AT+1000), before the marker (AT+3000)
+  assert.deepEqual(verifyOwnerGrant(q, { ...late, repoMoves: split }), { ok: false, reason: 'mismatch' });
+  // the reverse direction never counts: a record under the NEW name is not the old repository's
+  assert.equal(verifyOwnerGrant({ ...q, repo: 'acme/renamed' }, { ...late, repoMoves: [{ from: NEW_NAME, to: REPO, at: new Date(AT + 3_600_000).toISOString(), repoId: 9 }] }).ok, false);
+});
+
+test('repo moved: the moves file under the home is read (and a broken one aliases nothing)', () => {
+  const home = tmp();
+  const [rec] = twoGrants(home);
+  assert.equal(claimGrantMarkers([rec], BODY, { home, now: () => AT + 3000 }).ok, true);
+  const q = { repo: NEW_NAME, pr: 58, k: 4, toHead: GHEAD, ownerGrant: { grantId: grantIdOf(rec), quote: rec.prompt } };
+  const late = { home, now: () => AT + 40 * 24 * 3600_000 };
+  const movesFile = join(ownerGoDir(home), 'repo-moves.json');
+  writeFileSync(movesFile, JSON.stringify({ v: 1, moves: LATER_MOVE }));
+  assert.equal(verifyOwnerGrant(q, late).ok, true);
+  writeFileSync(movesFile, JSON.stringify({ v: 1, moves: [...LATER_MOVE, { from: 'bad', to: 'x/y', at: 'x', repoId: 1 }] }));
+  assert.equal(verifyOwnerGrant(q, late).ok, false, 'one invalid entry voids the file');
+});
+
+test('repo moved: ownerGrantedRounds (grantsFor) follows the same rule', () => {
+  const home = tmp();
+  twoGrants(home);
+  const ask = (repoMoves) => ownerGrantedRounds({ repo: NEW_NAME, pr: 58, k: 4, head: GHEAD, home, now: () => AT + 2000, repoMoves }).length;
+  assert.equal(ask(LATER_MOVE), 2);
+  assert.equal(ask([]), 0);
+  assert.equal(ask(EARLIER_MOVE), 0);
+});
+
+test('repo moved: a "merge" recorded under the old name before the move approves the new name (approvalGap / approvedRequest / approvedPr)', () => {
+  const w = mergeWorld(null, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] });
+  const asNew = (repoMoves) => ({ ...w.q, repo: NEW_NAME, repoMoves });
+  assert.deepEqual([approvedRequest(asNew(LATER_MOVE)), approvalGap(asNew(LATER_MOVE))], [true, 'ok']);
+  assert.deepEqual([approvedRequest(asNew([])), approvalGap(asNew([]))], [false, 'none'], 'without the moves');
+  assert.deepEqual([approvedRequest(asNew(EARLIER_MOVE)), approvalGap(asNew(EARLIER_MOVE))], [false, 'none'], 'recorded after the move');
+  const pr = (repoMoves) => approvedPr({ ...w.g, repo: NEW_NAME, repoMoves });
+  assert.deepEqual([pr(LATER_MOVE), pr([]), pr(EARLIER_MOVE)], [true, false, false]);
+  assert.equal(approvedPr({ ...w.g, repoMoves: [] }), true, 'the old name is unchanged');
+});
+
+test('repo moved: a ruling recorded under the old name before the move applies to the new name', () => {
+  const home = tmp();
+  const answer = 'R1-F1: follow-up';
+  const r = recordRuling(input(home, answer, [promptEntry('go'), said(ASK_REPLY)]), { home, now: NOW });
+  assert.equal(r?.repo, REPO);
+  const ruled = (repoMoves) => ownerRuled({ repo: NEW_NAME, pr: 58, id: 'R1-F1', quote: answer, decision: 'FOLLOW-UP', contentOf: () => 'abcdef012345', home, now: NOW, repoMoves });
+  assert.deepEqual([ruled(LATER_MOVE), ruled([]), ruled(EARLIER_MOVE)], [true, false, false]);
+});

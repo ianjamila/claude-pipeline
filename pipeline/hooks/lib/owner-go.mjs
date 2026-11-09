@@ -32,6 +32,7 @@
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, writeSync } from 'node:fs';
 import path from 'node:path';
+import { REPO_NAME, readRepoMoves, sameRepo } from './repo-moves.mjs';
 import { accountHome, isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
@@ -99,7 +100,6 @@ const READY_LINE = /🔀\s*Ready to merge\s+([^\n]*)/;
 // The request's LAST line is anchored: nothing but spaces before the 🔀 (prose such as `Do not 🔀 Ready to merge …` is no request). READY_LINE stays unanchored: SURFACED_ASK and
 // lastRequestText only ask "does the reply mention a request anywhere".
 const READY_FULL_LINE = new RegExp(`^\\s*${READY_LINE.source}$`);
-const REPO_NAME = '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+';
 const HOLD_ID = '[A-Za-z0-9_=+/-]{1,128}';
 const HEAD_LINE = new RegExp(`^\\s*(?:#(\\d+)\\s+)?head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*items\\s+([0-9a-f]{12}|none)(?:\\s*(?:·|\\|)\\s*hold\\s+(${HOLD_ID}))?(?:\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME}))?\\s*$`, 'i');
 const AREAS_START = /^\s*(?:#\d+\s+)?areas\b/i;
@@ -665,6 +665,10 @@ function readRecords({ home = accountHome(), session = null, now = Date.now, max
   return out;
 }
 
+// The owner's recorded repo moves (repo-moves.mjs), read once per call: opts.repoMoves (an array; tests) or the file under opts.home.
+// A record naming the old name counts for the new one only when it predates the move (sameRepo); nothing recorded changes.
+const movesOf = (opts) => (Array.isArray(opts?.repoMoves) ? opts.repoMoves : readRepoMoves({ home: opts?.home }).moves);
+
 // The repository as the records hold it (owner/name, lower case; GitHub names are case-insensitive), or null when `repo` is none.
 export const repoKey = (repo) => (typeof repo === 'string' && new RegExp(`^${REPO_NAME}$`).test(repo) ? repo.toLowerCase() : null);
 
@@ -827,7 +831,8 @@ const approvalsFor = ({ repo, pr, head, items, areas, hold, rulings, ...opts }) 
   const wantAreas = areas === null ? null : areasDigest(areas);
   const wantRulings = rulings === null ? null : (rulings ?? 'none'); // null = this route does not bind the rulings block; absent / undefined = 'none' (fails closed against a live digest)
   const wantHold = hold === null ? null : { id: hold ? hold.id : 'none', digest: holdDigest(hold) }; // (undefined = no hold)
-  return readApprovals(opts).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items
+  const moves = movesOf(opts);
+  return readApprovals(opts).filter((r) => r.requests.some((q) => sameRepo({ recorded: q.repo, recordedAt: r.ts, current: key, moves }) && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head) && q.items === items
     && (wantAreas === null || (typeof q.areas === 'string' ? q.areas : 'none') === wantAreas)
     && (wantRulings === null || (typeof q.rulings === 'string' ? q.rulings : 'none') === wantRulings)
     && (wantHold === null || ((typeof q.hold === 'string' ? q.hold : 'none') === wantHold.id && (typeof q.holdBlock === 'string' ? q.holdBlock : 'none') === wantHold.digest))));
@@ -860,7 +865,8 @@ export const rulingConfigDirHint = (q) => configDirHint(rulingsFor(q), { home: q
 export function approvedPr({ repo, pr, head, session, ...opts }) {
   const key = repoKey(repo);
   if (key === null || !Number.isInteger(pr) || !/^[0-9a-f]{40}$/.test(String(head)) || !SESSION_RE.test(String(session ?? ''))) return false;
-  return ownedBy(readApprovals({ ...opts, session }).filter((r) => r.requests.some((q) => q.repo === key && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head))), { home: opts.home }).length > 0;
+  const moves = movesOf(opts);
+  return ownedBy(readApprovals({ ...opts, session }).filter((r) => r.requests.some((q) => sameRepo({ recorded: q.repo, recordedAt: r.ts, current: key, moves }) && q.pr === pr && q.head.length >= HEAD_CHARS && head.startsWith(q.head))), { home: opts.home }).length > 0;
 }
 
 // What an owner's answer to a ruling request decides, per item. Security reviews of f17b251, ff8090f and 009d435: reading decisions
@@ -896,7 +902,8 @@ function rulingsFor({ repo, pr, id, quote, decision, ...opts }) {
   const words = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
   const q = words(quote);
   if (key === null || !Number.isInteger(pr) || q === '') return [];
-  return readRecords(opts).filter((r) => r.kind === 'ruling' && r.repo === key && r.pr === pr && Array.isArray(r.ids) && r.ids.includes(id)
+  const moves = movesOf(opts);
+  return readRecords(opts).filter((r) => r.kind === 'ruling' && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && Array.isArray(r.ids) && r.ids.includes(id)
     && typeof r.prompt === 'string' && words(r.prompt) === q && rulingsIn(r.prompt, r.ids).get(String(id).toUpperCase()) === decision);
 }
 
@@ -1032,8 +1039,9 @@ function chainState(home, rel) {
 function grantsFor({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
   const key = repoKey(repo);
   if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || (!anyHead && !FULL_HEAD.test(String(head)))) return [];
+  const moves = movesOf(opts);
   return readRecords(opts)
-    .filter((r) => isRoundRecord(r) && r.repo === key && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head))
+    .filter((r) => isRoundRecord(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head))
       && !readGrantMarker(grantIdOf(r), { home: opts.home }).spent)
     .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
 }
@@ -1144,12 +1152,13 @@ export function verifyOwnerGrant({ repo, pr, k, toHead, ownerGrant } = {}, opts 
   if (!GRANT_ID.test(String(id)) || typeof ownerGrant.quote !== 'string' || (ownerGrant.k !== undefined && ownerGrant.k !== k)) return { ok: false, reason: 'malformed' };
   const record = readRecords({ ...opts, maxAgeMs: Infinity, maxBytes: VERIFY_MAX_BYTES }).find((r) => isRoundRecord(r) && grantIdOf(r) === id);
   if (!record) return { ok: false, reason: 'no-record' };
-  if (record.repo !== key || record.pr !== pr || record.k !== k || !toHead.startsWith(record.head)) return { ok: false, reason: 'mismatch' };
+  const moves = movesOf(opts);
+  if (!sameRepo({ recorded: record.repo, recordedAt: record.ts, current: key, moves }) || record.pr !== pr || record.k !== k || !toHead.startsWith(record.head)) return { ok: false, reason: 'mismatch' };
   if (ownedBy([record], { grant: true, home: opts.home }).length === 0) return { ok: false, reason: 'provenance' }; // (#128: the prompt is not the owner's, or is gone from the transcript)
   const m = readGrantMarker(id, { home: opts.home });
   if (!m.spent) return { ok: false, reason: 'no-marker' };
   if (!m.verifiable) return { ok: false, reason: 'unverifiable-marker' };
-  if (m.marker.repo !== key || m.marker.pr !== pr || m.marker.k !== k || m.marker.head !== toHead) return { ok: false, reason: 'mismatch' };
+  if (!sameRepo({ recorded: m.marker.repo, recordedAt: m.marker.consumedAt, current: key, moves }) || m.marker.pr !== pr || m.marker.k !== k || m.marker.head !== toHead) return { ok: false, reason: 'mismatch' };
   if (ownerGrant.quote !== record.prompt) return { ok: false, reason: 'quote' };
   return { ok: true, quote: record.prompt, record };
 }
