@@ -187,7 +187,7 @@ export const systemLaunchctl = (args) => runProc(LAUNCHCTL, args);
 
 // `launchctl print` CONFIRMS a job is not loaded only by exit 113 or by saying "Could not find service". Any other non-zero
 // (launchctl missing, a permission or domain error) tells nothing about the job, so it is never read as "unloaded".
-const absentJob = (r) => r.code === 113 || /could not find service/i.test(`${r.stderr ?? ''}\n${r.stdout ?? ''}`);
+const absentJob = (r) => r.overBuffer !== true && (r.code === 113 || /could not find service/i.test(`${r.stderr ?? ''}\n${r.stdout ?? ''}`)); // cut-off output confirms nothing
 const why = (r) => r.stderr?.trim() || `exit ${r.code}`;
 
 // Install / remove / report the LaunchAgent. bootout and the `print` probe may fail for a job that is not loaded, so on install

@@ -92,6 +92,7 @@ function call(run, bin, args, { deadlineAt, now = Date.now, env } = {}) {
   if (!r || typeof r !== 'object') return { fail: unknown(`${path.basename(bin)} gave no result`) };
   if (r.timedOut) return { fail: unknown(`${path.basename(bin)} timed out`) };
   if (r.signal) return { fail: unknown(`${path.basename(bin)} ended by signal ${r.signal}`) };
+  if (r.overBuffer) return { fail: unknown(`${path.basename(bin)} output was over the buffer limit`) }; // cut off: neither its exit code nor its text is the whole answer
   return { r };
 }
 

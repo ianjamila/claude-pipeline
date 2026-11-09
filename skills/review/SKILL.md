@@ -1,7 +1,7 @@
 ---
 name: review
 description: Use for ANY request to build, add, implement, fix, change, or refactor code in a git repository that has .claude/pipeline.yml — features, bug fixes, UI tweaks, migrations, "make X do Y", "can you add…", "fix the bug where…". Builds on a branch with tests, opens a draft pull request, runs the cross-model review loop (Codex → judge → arbiter), then hands the owner the exact merge request. Repos without .claude/pipeline.yml never merge; offer pipeline-setup.
-when_to_use: Any code-changing request in a repo, unless the session was started with PIPELINE_OFF=1 or the user says not to use the pipeline. Also issues labelled agent-build ("build #123": read the issue, put `Closes #123` in the PR body).
+when_to_use: Any code-changing request in a repo, unless the session was started with PIPELINE_OFF=1 or the user says not to use the pipeline. Also issues labelled agent-build ("build #123": read the issue, put `Closes #123` in the PR body; one keyword per issue, `Closes #1. Closes #2.`).
 argument-hint: "[what to build]"
 ---
 
@@ -48,7 +48,8 @@ Picking up an existing `awaiting-review` PR (Codex was unavailable): `P state sh
    first `gh pr edit N --add-label pipeline-blocked` and `P comment --pr N --kind blocked`, then the stop ritual.
 4. Draft PR: `git push -u origin agent/<slug>`, `gh pr create --draft --title "<title>" --body-file <file>`. The body opens
    with `## In plain English` (2–4 jargon-free sentences: what changes for users and why), then what and why, tests added, the quick check
-   and its head sha, risk. UI change ⇒ `P artifacts push --pr N --dir .verify/screenshots`, put the returned image links in the body.
+   and its head sha, risk. Issues it closes: one keyword per issue, `Closes #170. Closes #171.` (GitHub closes only the first number of
+   `Closes #170, #171`). UI change ⇒ `P artifacts push --pr N --dir .verify/screenshots`, put the returned image links in the body.
 5. `mkdir -p .review`, then on the real diff: `P risk --base origin/<default_branch> --head HEAD`,
    `P hardstops --base origin/<default_branch> --head HEAD > .review/hardstops.json` (kept: 3.3 names its hits) and `P integrity --base origin/<default_branch> --head HEAD`.
    Note whether ANY item is `blocking` or `ownerMerge` (hard-stop) or a test-integrity `violations` / `ownerMerge` entry; 3.3 depends on it. The review below runs either way.
@@ -127,7 +128,7 @@ Never type, paraphrase or forge the owner's words, and never run Codex outside `
    `P job wait ci --run-id <runId> …` again until it is done. Never `gh pr checks --watch` here: right after `gh pr ready` a required
    check's only result is the draft-era SKIPPED one, which `gh` counts as passed (Phase 6: hand-off 14 min early); ci-wait waits for
    every required check of the base branch to report after the PR became ready. Its `verdict` when not ok: `failed` ⇒ implementer fix
-   (below); `head-moved` / `base-changed` ⇒ back to step 1 of this section; `missing` / `stale-skipped` (a required check never ran on the ready event),
+   (below); `head-moved` / `base-changed` ⇒ back to step 1 of this section; `missing` / `stale-skipped` (a required check never ran on the ready event: ci-wait only says so once nothing created or (re-)started after `gh pr ready` is still running on the head, since a `needs:`-gated aggregate appears late by design; `heldBy` in the output names the run it was waiting on),
    `unverified` (branch protection or rules unreadable), `no-required-checks`, `timeout` ⇒ tell the owner in plain English, with the
    check names, and wait. `owner_approval: label` with a blocking item noted at 1.5: run it with `--wait-all`; the guard checks
    reporting just those items are expected to be red — that is not a fix target: park (section 2) once ci-wait shows every other check

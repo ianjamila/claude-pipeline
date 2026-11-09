@@ -63,8 +63,10 @@ const defaultRemotes = (dir) => {
 };
 // (Fable attacker pass) gh's own choice of repository among the remotes: `gh repo set-default` writes remote.<name>.gh-resolved, which
 // is `base` or an owner/name gh then uses instead. '' when none is set (git config exits 1), null when it cannot be read.
-const defaultResolved = (dir) => {
-  const r = run('git', ['-C', dir, 'config', '--get-regexp', '^remote\\..*\\.gh-resolved$'], { timeoutMs: LOOKUP_TIMEOUT_MS });
+export const defaultResolved = (dir, runFn = run) => { // runFn: a test seam
+  const r = runFn('git', ['-C', dir, 'config', '--get-regexp', '^remote\\..*\\.gh-resolved$'], { timeoutMs: LOOKUP_TIMEOUT_MS });
+  // exit 1 is git's "nothing set"; a killed (signal) or cut-off (overBuffer) git also reports 1 but said nothing: unknown, not "no override"
+  if (r.signal || r.timedOut || r.overBuffer) return null;
   return r.code === 0 ? r.stdout : r.code === 1 ? '' : null;
 };
 // owner/name from a github.com remote URL (git@github.com:owner/name.git, https://github.com/owner/name, ssh://git@github.com/owner/name.git),

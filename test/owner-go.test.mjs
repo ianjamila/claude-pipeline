@@ -664,16 +664,18 @@ test('#128 rulings: nothing is skipped by its text, and an owner turn between th
   const r = rule(pasted, 'R1-F1: accept');
   assert.deepEqual([r?.pr], [59]);
   assert.equal(rule([...head, promptEntry(`${NOTICE}\nreview #59 instead`, OWNER_META), said('ok, switching')], 'R1-F1: accept'), null, 'and the old ask (#58) is not revived');
-  // a reply to a notice never binds a ruling or merge line it prints itself
+  // a reply to a notice never binds a merge line it prints itself …
+  // #189 (Fable plan pass finding 1; narrows R1-F3): … but a reply to a notice (system + cli) that ENDS with the ruling line IS the ask the owner last saw: it is promoted, and binds that PR / ids / digest only
+  // (test/owner-go-compaction.test.mjs has the full matrix, including the turns that are not promoted)
   const noticeReply = [promptEntry('go'), promptEntry(NOTICE, NOTICE_META), said(ASK_REPLY)];
-  for (const present of [true, false]) assert.equal(rule(noticeReply, 'R1-F1: accept', present), null, `a ruling line printed in the reply to a notice (${present})`);
+  for (const present of [true, false]) assert.deepEqual((({ pr, ids, content, ask_turn }) => ({ pr, ids, content, ask_turn }))(rule(noticeReply, 'R1-F1: accept', present) ?? {}), { pr: 58, ids: ['R1-F1'], content: 'abcdef012345', ask_turn: 'synthetic' }, `a ruling line ending the reply to a notice (${present})`);
   assert.equal(lastRequestText(transcript(home, [promptEntry('go'), promptEntry(NOTICE, NOTICE_META), said(REQUEST), promptEntry('merge')]), { prompt: 'merge', skipSynthetic: true }), '', '…nor a 🔀 line');
   // an ask made BEFORE a notice and answered after it still needs the line to be the last thing the agent said before the notice
   assert.equal(rule([promptEntry('go'), said(`${ASK_REPLY}\nand one more thing`), promptEntry(NOTICE, NOTICE_META), said('ok')]), null);
 });
 
 // R1-F3: a reply to a notice is dropped from the look-back, but what it SHOWED may be a newer ask: the owner's answer then belongs to that one.
-test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice voids the pending ruling ask (nothing is recorded for either PR)', () => {
+test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice voids the pending ruling ask (nothing is recorded for the old one; #189: a reply that ENDS with a ruling line is itself promoted)', () => {
   const home = tmp();
   const now = () => Date.parse('2026-11-03T10:00:00Z');
   const ask = (pr) => `R1-B1 waits for you.\n⚖️ Owner ruling needed #${pr}: R1-B1 · content ${pr === 58 ? 'aaaaaaaaaaaa' : 'bbbbbbbbbbbb'} · repo acme/app`;
@@ -684,9 +686,7 @@ test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice void
   const head = [promptEntry('go'), said(ask(58))];
   const notice = promptEntry(NOTICE, NOTICE_META);
   for (const [name, shown] of [
-    ['a ruling line for another PR', ask(59)],
     ['a ruling line, not the last line', `${ask(59)}\nSorry, one more thing.`],
-    ['the same ask shown again', ask(58)],
     ['a 🔀 request', REQUEST],
     // R2-F2: the agent chooses its wording, so a paraphrase of a new ask voids the slot too: a finding id, or a decision word beside a PR number
     ['a paraphrased ask naming a finding', 'For #59 please answer R1-B1: accept or reject'],
@@ -706,6 +706,14 @@ test('#128 R1-F3: a ruling line or a 🔀 line shown in a reply to a notice void
   }
   for (const pr of [58, 59]) assert.equal(ownerRuled({ repo: 'acme/app', pr, id: 'R1-B1', quote: 'R1-B1: reject', decision: 'REJECT', contentOf: () => (pr === 58 ? 'aaaaaaaaaaaa' : 'bbbbbbbbbbbb'), home, now }), false, `#${pr}`);
   assert.deepEqual(readApprovals({ home, now }), []);
+  // #189 (Fable plan pass finding 1; narrows R1-F3): a reply to a notice (system + cli) that ENDS with a canonical ruling line (another PR's, or the same ask again) is itself what the owner last saw:
+  // it is promoted to the pending ask and binds ONLY its own PR / ids / digest (the old ask is gone either way)
+  for (const [name, pr, content, shown] of [['a ruling line for another PR', 59, 'bbbbbbbbbbbb', ask(59)], ['the same ask shown again', 58, 'aaaaaaaaaaaa', ask(58)]]) {
+    for (const entries of [[...head, notice, said(shown)], [...head, notice, said('The build finished.'), said(shown)]]) {
+      const r = rule(entries);
+      assert.deepEqual([r?.pr, r?.ids, r?.content, r?.ask_turn], [pr, ['R1-B1'], content, 'synthetic'], name);
+    }
+  }
   // R3-B2 (owner decision): ANY text in the reply to a harness turn voids the pending ask, whatever it says (the agent picks its wording); only a reply without text leaves it standing
   for (const text of ['The build finished.', 'Build #1042 finished, 3 tests rerun.', 'Rejected the stale cache; all green.', 'Noted: the PR is still open.', 'I will accept the default.', 'ok', 'Tell me what to do about the first blocker.']) {
     assert.equal(rule([...head, notice, said(text)]), null, `any text voids the ask: ${text}`);

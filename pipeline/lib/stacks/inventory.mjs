@@ -58,6 +58,7 @@ function dockerCall(run, docker, args, { deadlineAt, now }) {
   if (!r || typeof r !== 'object') return { fail: unknown(`docker ${args[0]} returned nothing`) };
   if (r.timedOut) return { fail: unknown(`docker ${args[0]} timed out`) };
   if (r.signal) return { fail: unknown(`docker ${args[0]} ended by signal ${r.signal}`) };
+  if (r.overBuffer) return { fail: unknown(`docker ${args[0]} output was over the buffer limit`) }; // before stderr / stdout are read
   if (r.code !== 0) {
     const stderr = String(r.stderr ?? '');
     if (DOCKER_DOWN_RE.test(stderr)) return { down: true };
@@ -143,7 +144,7 @@ export function readInventory({ run = realRun, cfg, docker = 'docker', deadlineA
         out = String(ins.r.stdout ?? '');
         continue;
       }
-      if (!ins.exited || ins.exited.timedOut || ins.exited.signal || !onlyNoSuchObject(ins.exited.stderr)) return ins.fail;
+      if (!ins.exited || ins.exited.timedOut || ins.exited.signal || ins.exited.overBuffer || !onlyNoSuchObject(ins.exited.stderr)) return ins.fail;
       let survivors = null;
       try {
         survivors = JSON.parse(String(ins.exited.stdout ?? ''));

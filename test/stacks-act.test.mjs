@@ -320,6 +320,31 @@ test('post-check docker answers unknown => stopped with a post-check-unknown ale
   });
 });
 
+// #188: a cut-off docker answer must not read as "absent" / "missing" (a stop that then claims nothing is left to alert on)
+test('post-check: docker output over the buffer limit is unknown, not absent or missing', async () => {
+  for (const [what, stderr] of [['inspect', 'Error: No such object: x'], ['volume inspect', 'Error: No such volume: x']]) {
+    const w = makeWorld();
+    const run = (cmd, args, opts) => {
+      if (cmd === SUPA) { w.supabaseCalls.push([...args]); w.calls.push({ cmd, args }); w.onStop(w); w.postStop = true; return w.stopResult; }
+      if (w.postStop && (what === 'inspect' ? args[0] === 'inspect' : args[0] === 'volume')) return { code: 1, stdout: '', stderr, timedOut: false, signal: null, overBuffer: true };
+      return w.run(cmd, args, opts);
+    };
+    await check(w, { run }, (r) => {
+      assert.equal(r.action, 'stopped', JSON.stringify(r.reasons));
+      assert.equal(r.alert, 'post-check-unknown', what);
+    });
+  }
+});
+
+test('supabase stop that printed past the buffer limit => failed, whatever its exit code', async () => {
+  const w = makeWorld();
+  w.stopResult = { code: 0, stdout: 'cut', stderr: '', timedOut: false, signal: null, overBuffer: true };
+  await check(w, {}, (r) => {
+    assert.equal(r.action, 'failed');
+    assert.match(r.reasons[0], /buffer/);
+  });
+});
+
 test('workdir that does not exist => kept (report-only), no call', async () => {
   const w = makeWorld();
   rmSync(w.workdir, { recursive: true });

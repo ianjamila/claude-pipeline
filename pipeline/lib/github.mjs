@@ -84,7 +84,7 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
 
   const exec = (args, { input } = {}) => ghFn(args, { cwd, env, input, timeoutMs: CALL_TIMEOUT_MS });
   const failure = (r, args) => {
-    const err = new GhError({ code: r.code, stderr: r.stderr, args, timedOut: r.timedOut });
+    const err = new GhError({ code: r.code, stderr: r.stderr, args, timedOut: r.timedOut, overBuffer: r.overBuffer === true });
     err.stdout = r.stdout;
     return err;
   };
@@ -295,7 +295,7 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       const args = ['api', `repos/${self.repo().slug}/branches/${encodePath(branch)}/protection`];
       const r = exec(args);
       if (r.code === 0 && !r.timedOut) return { status: 200, json: parse(r, args) };
-      const known = r.timedOut ? null : classifyApiError(r);
+      const known = r.timedOut || r.overBuffer ? null : classifyApiError(r); // a cut-off body can still hold "HTTP 404"
       if (known) return known;
       throw failure(r, args);
     },
@@ -361,6 +361,10 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     // The workflow runs of one check suite (their created_at tells a draft-era run from a ready-era one).
     workflowRunsOfSuite: (suiteId) => pagedList(`repos/${self.repo().slug}/actions/runs?check_suite_id=${encodeURIComponent(suiteId)}&per_page=100`, '.workflow_runs'),
 
+    // The workflow runs of a head commit (status queued / in_progress / completed ..., created_at): ci-wait uses the unfinished ones created
+    // after the ready event to keep waiting for a late `needs:`-gated check.
+    workflowRunsOfHead: (head) => pagedList(`repos/${self.repo().slug}/actions/runs?head_sha=${encodeURIComponent(head)}&per_page=100`, '.workflow_runs'),
+
     // The files of a PR as GitHub lists them (every page): [{ filename, previous_filename?, status, ... }]. GitHub computes this from its own
     // copy of the commits, so it is the cross-check for a local diff (--owner-go: an object graph altered here shows up as a difference).
     pullFiles: (n) => pagedList(`repos/${self.repo().slug}/pulls/${prNumber(n)}/files?per_page=100`),
@@ -377,7 +381,7 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
         message = String(JSON.parse(r.stdout)?.message ?? '');
       } catch { /* not JSON: fall back to stderr */ }
       message ||= String(r.stderr ?? '').trim();
-      if (!r.timedOut && /HTTP 422|"status"\s*:\s*"?422/.test(`${r.stderr}\n${r.stdout}`)) {
+      if (!r.timedOut && !r.overBuffer && /HTTP 422|"status"\s*:\s*"?422/.test(`${r.stderr}\n${r.stdout}`)) {
         if (/expected head sha/i.test(message)) return { result: 'head-moved', message };
         if (/merge conflict/i.test(message)) return { result: 'conflict', message };
       }
@@ -389,7 +393,7 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     checks(n, { required = false } = {}) {
       const args = ['pr', 'checks', prNumber(n), '--json', 'name,state,bucket,link,workflow', ...(required ? ['--required'] : [])];
       const r = exec(args);
-      if (r.timedOut) throw failure(r, args);
+      if (r.timedOut || r.overBuffer) throw failure(r, args);
       let rows;
       try {
         rows = JSON.parse(r.stdout);

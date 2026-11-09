@@ -754,3 +754,9 @@ test('renderReport: one generation with two would-stop decisions and several RES
   const clean = renderReport({ now: L_NOW, decisions: [lStop(S1), lStop(S2), lObs('2026-10-20T05:14:13.119Z', S1), lObs('2026-10-20T05:16:22.749Z', S2)], uses: [], ledgerCoverage: COVER });
   assert.match(clean, /no unknown across 1 stack run \(2 would-stop decisions\)/);
 });
+
+test('memoryOfProject: output over the buffer limit is unknown, never a sum of the rows that fit', () => {
+  const r = memoryOfProject('p', { run: stats(['supabase_db_p\t1MiB / 2GiB'], { overBuffer: true }) });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /buffer/);
+});

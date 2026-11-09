@@ -138,6 +138,7 @@ test('listeners: lsof says nothing found (clean silent exit 1) => ok([]); every 
   const failures = {
     timeout: { code: 124, stdout: '', stderr: '', timedOut: true, signal: null },
     signal: { code: 1, stdout: '', stderr: '', timedOut: false, signal: 'SIGKILL' },
+    overBuffer: { code: 1, stdout: '', stderr: '', timedOut: false, signal: null, overBuffer: true }, // a cut-off silent exit 1 is not "nothing found"
     enoent: { code: 1, stdout: '', stderr: 'spawn LSOF ENOENT', timedOut: false, signal: null },
     exit2: { code: 2, stdout: '', stderr: 'lsof: bad option', timedOut: false, signal: null },
     exit1WithOutput: { code: 1, stdout: 'p300\nn*:3000\n', stderr: '', timedOut: false, signal: null },
