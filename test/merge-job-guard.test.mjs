@@ -412,3 +412,84 @@ test('R4-B1: the same relative commands are allowed with no marker, a dead marke
   // a relative value that, with -C applied, does NOT reach the owned checkout is not refused
   assert.equal(decide(`git --work-tree=../elsewhere -C ${fwd(inner)} reset --hard`, base).decision, 'allow');
 });
+
+// ---- review round 4 (R4-F1): core.worktree is relative to the .git directory; an unresolvable or env-supplied one is an unknown target ----
+
+// the real layout: an unowned container checkout holding the job's checkout at <container>/.worktrees/<slug>
+const containerWithJob = () => {
+  const container = fakeRepo();
+  const job = join(container, '.worktrees', 'slug');
+  mkdirSync(join(job, '.git'), { recursive: true });
+  return { container, job };
+};
+
+test('R4-F1: a relative core.worktree is resolved against the git dir, so the container root can reach the job\'s checkout', () => {
+  const { container, job } = containerWithJob();
+  const other = fakeRepo();
+  mark(job, process.pid, 12);
+  for (const command of [
+    `git -C ${fwd(container)} -c core.worktree=../.worktrees/slug reset --hard`,
+    `git -C ${fwd(container)} -c core.worktree=../.worktrees/slug checkout x`,
+    `git -c core.worktree=../.worktrees/slug -C ${fwd(container)} reset --hard`,
+    `git --git-dir=${fwd(container)}/.git -c core.worktree=../.worktrees/slug reset --hard`,
+    `GIT_DIR=${fwd(container)}/.git git -c core.worktree=../.worktrees/slug reset --hard`,
+  ]) {
+    const v = decide(command, other);
+    assert.equal(v.decision, 'deny', command);
+    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+  }
+  // from a subfolder of the container the git dir is still the container's
+  mkdirSync(join(container, 'src'), { recursive: true });
+  assert.equal(decide('git -c core.worktree=../.worktrees/slug reset --hard', join(container, 'src')).decision, 'deny');
+  // a linked worktree: its .git file names the git dir the value is relative to
+  const { wt, gitDir } = linkedWorktree(container, 'feat');
+  writeFileSync(join(gitDir, 'x'), '');
+  assert.equal(decide(`git -C ${fwd(wt)} -c core.worktree=${fwd(job)} reset --hard`, other).decision, 'deny'); // (absolute: unchanged)
+});
+
+test('R4-F1: a core.worktree that cannot be resolved, --config-env and GIT_CONFIG_* naming it are unknown targets: refused while the session\'s checkout is a job\'s', () => {
+  const root = fakeRepo();
+  const other = fakeRepo();
+  const norepo = realpathSync(mkdtempSync(join(tmpdir(), 'mj-norepo-')));
+  mark(root, process.pid, 12);
+  const at = fwd(other);
+  for (const command of [
+    `git -C ${at} -c core.worktree=$W reset --hard`,
+    `git -C ${at} -c "core.worktree=$(pwd)/.." checkout x`,
+    `git -C ${fwd(norepo)} -c core.worktree=../x reset --hard`, // relative, and no git dir can be found from a directory outside any repository
+    `git -C ${at} --config-env=core.worktree=WT reset --hard`,
+    `git -C ${at} --config-env core.worktree=WT reset --hard`,
+    `git -C ${at} --config-env=Core.WorkTree=WT checkout x`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=/elsewhere git -C ${at} reset --hard`,
+    `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=/elsewhere && git -C ${at} reset --hard`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K GIT_CONFIG_VALUE_0=/elsewhere git -C ${at} reset --hard`,
+    `GIT_CONFIG_PARAMETERS="'core.worktree=/elsewhere'" git -C ${at} reset --hard`,
+  ]) {
+    const v = decide(command, root);
+    assert.equal(v.decision, 'deny', command);
+    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+  }
+});
+
+test('R4-F1: the same commands are allowed with no marker, a dead marker, when read-only, or when the value reaches an unowned directory', () => {
+  const { container, job } = containerWithJob();
+  const other = fakeRepo();
+  const cmds = [
+    `git -C ${fwd(container)} -c core.worktree=../.worktrees/slug reset --hard`,
+    'git -c core.worktree=$W reset --hard',
+    'git --config-env=core.worktree=WT reset --hard',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=/elsewhere git reset --hard',
+  ]; // (run from a checkout no job owns, so an unknown target has nothing to fall back on)
+  for (const c of cmds) assert.equal(decide(c, other).decision, 'allow', `no marker: ${c}`);
+  mark(job, deadPid());
+  for (const c of cmds) assert.equal(decide(c, other).decision, 'allow', `dead marker: ${c}`);
+  mark(job, process.pid);
+  for (const c of [`git -C ${fwd(container)} -c core.worktree=../.worktrees/slug status`, 'git -c core.worktree=$W status', 'git --config-env=core.worktree=WT diff', 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=/elsewhere git log --oneline']) {
+    assert.equal(decide(c, other).decision, 'allow', `read-only: ${c}`);
+  }
+  // relative to the git dir, `..` is the container itself, not the job's checkout
+  assert.equal(decide(`git -C ${fwd(container)} -c core.worktree=.. reset --hard`, other).decision, 'allow');
+  assert.equal(decide(`git -C ${fwd(container)} -c core.worktree=../../elsewhere reset --hard`, other).decision, 'allow');
+  // other config keys are not core.worktree
+  assert.equal(decide('GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x git reset --hard', other).decision, 'allow');
+});

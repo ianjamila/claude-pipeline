@@ -532,6 +532,22 @@ function pushReading(args, dir, gitDir, ctx, configs) {
 
 // ---- git: global options, state tracking ------------------------------------------------------------------
 
+// R4-F1: does `name=envvar` (the text after --config-env) set core.worktree?
+const namesWorkTreeKey = (text) => /^core\.worktree(?:=|$)/i.test(String(text ?? '').trim());
+// R4-F1: GIT_CONFIG_KEY_n / GIT_CONFIG_PARAMETERS can set core.worktree like `-c` does. A key that names it, or one whose value cannot be
+// read here, is an unknown target (fail closed).
+function envConfigNamesWorkTree(env, ctx) {
+  const names = new Set([...Object.keys(env), ...assignedNames(ctx)].filter((k) => /^GIT_CONFIG_(?:KEY_\d+|PARAMETERS)$/i.test(k)));
+  for (const name of names) {
+    const v = envVar(env, ctx, name);
+    if (!v.known) return true;
+    if (typeof v.value !== 'string') continue;
+    const text = expandVars(v.value, ctx);
+    if (DYNAMIC.test(text) || /core\.worktree/i.test(text)) return true;
+  }
+  return false;
+}
+
 function parseGitGlobal(argv, dir, env, ctx) {
   let d = dir;
   const envGitDir = envVar(env, ctx, 'GIT_DIR');
@@ -545,6 +561,7 @@ function parseGitGlobal(argv, dir, env, ctx) {
   const envWorkTree = envVar(env, ctx, 'GIT_WORK_TREE');
   let targetUnknown = !envWorkTree.known;
   if (typeof envWorkTree.value === 'string' && envWorkTree.value !== '') workTreeRaws.push(envWorkTree.value);
+  if (envConfigNamesWorkTree(env, ctx)) targetUnknown = true; // R4-F1
   const configs = [];
   let i = 1;
   for (; i < argv.length; i++) {
@@ -562,6 +579,9 @@ function parseGitGlobal(argv, dir, env, ctx) {
     if (t === '--git-dir') { gitDirRaws.push(argv[++i]); gitDirUnknown = false; continue; }
     if (t.startsWith('--work-tree=')) { workTreeRaws.push(t.slice('--work-tree='.length)); continue; }
     if (t === '--work-tree') { workTreeRaws.push(argv[++i]); continue; }
+    // R4-F1: `--config-env=core.worktree=NAME` sets core.worktree from an environment variable that is not read here: unknown
+    if (t.startsWith('--config-env=')) { if (namesWorkTreeKey(t.slice('--config-env='.length))) targetUnknown = true; continue; }
+    if (t === '--config-env') { if (namesWorkTreeKey(argv[i + 1])) targetUnknown = true; i++; continue; }
     if (GIT_GLOBAL_VALUE.includes(t)) { i++; continue; }
     if (t.startsWith('-')) continue; // boolean global option, or --opt=value
     break;
@@ -797,14 +817,17 @@ function mergeJobVerdict(sub, args, g, ctx) {
   }
   // R3-B1: the checkout a command acts on is not only the directory it runs in: --git-dir / GIT_DIR and --work-tree / GIT_WORK_TREE
   // (or -c core.worktree=) move it
-  const dirs = [g.d, ...gitTargetCheckouts(g, ctx)].filter((x) => x !== null);
-  const job = jobOfAny(dirs, g.d === null || g.targetUnknown || g.gitDirUnknown);
+  const targets = gitTargetCheckouts(g, ctx);
+  const dirs = [g.d, ...targets.dirs].filter((x) => x !== null);
+  const job = jobOfAny(dirs, g.d === null || g.targetUnknown || g.gitDirUnknown || targets.unknown);
   return job ? mergeJobDeny(job, `\`git ${verb}\``) : null;
 }
 // the checkouts that --git-dir / GIT_DIR, --work-tree / GIT_WORK_TREE and core.worktree point at: a main repository's `.git` is
 // inside its checkout, a linked worktree's git dir (<common>/worktrees/<name>) names its checkout in its `gitdir` file
+// (`unknown`: a core.worktree that cannot be resolved)
 function gitTargetCheckouts(g, ctx) {
   const out = [];
+  let unknown = false;
   for (const gd of [g.gitDir, ...g.hints]) {
     if (gd === null) continue;
     out.push(gd); // the lookup walks up from here to the checkout root holding it (also right for a work tree)
@@ -817,10 +840,43 @@ function gitTargetCheckouts(g, ctx) {
   if (g.workTree !== null) out.push(g.workTree);
   for (const c of g.configs) {
     if (c.key !== 'core.worktree') continue;
-    const wt = joinDir(g.d, c.value, ctx);
-    if (wt !== null) out.push(wt);
+    // R4-F1: git resolves a relative core.worktree against the .git directory, not the working directory (git-config(1))
+    const raw = expandVars(c.value, ctx);
+    if (DYNAMIC.test(raw)) { unknown = true; continue; }
+    if (raw === '~' || raw.startsWith('~') || path.isAbsolute(raw)) {
+      const wt = joinDir(g.d, c.value, ctx);
+      if (wt === null) unknown = true; else out.push(wt);
+      continue;
+    }
+    const bases = [g.gitDir, ...g.hints, ...(g.gitDir === null ? [discoverGitDir(g.d, ctx)] : [])].filter((x) => x !== null);
+    if (bases.length === 0) { unknown = true; continue; } // no git dir to be relative to: cannot be told
+    for (const base of bases) {
+      const wt = joinDir(base, c.value, ctx);
+      if (wt === null) unknown = true; else out.push(wt);
+    }
   }
-  return out;
+  return { dirs: out, unknown };
+}
+// R4-F1: the git dir git finds from `dir`: a `.git` directory, a `.git` file's `gitdir:` target (a linked worktree), or the directory itself
+// when it is a bare repository, looking in each parent in turn. null when there is none (or `dir` is unknown).
+function discoverGitDir(dir, ctx) {
+  if (dir === null) return null;
+  let cur = dir;
+  try { cur = ctx.realpath(dir); } catch { /* not there: judged as written */ }
+  for (let n = 0; n < 64; n++) {
+    const dotGit = path.join(cur, '.git');
+    const text = ctx.readText(dotGit);
+    if (typeof text === 'string') {
+      const m = /^gitdir:\s*(.+?)\s*$/m.exec(text);
+      return m ? path.resolve(cur, m[1]) : null;
+    }
+    if (ctx.pathExists(dotGit)) return dotGit;
+    if (ctx.pathExists(path.join(cur, 'HEAD')) && ctx.pathExists(path.join(cur, 'objects'))) return cur;
+    const up = path.dirname(cur);
+    if (up === cur) return null;
+    cur = up;
+  }
+  return null;
 }
 
 // ---- gh -------------------------------------------------------------------------------------------------
