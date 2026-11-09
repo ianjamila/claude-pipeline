@@ -744,13 +744,14 @@ function configEnvWorkTree(text, pe, ctx) {
   const t = String(text ?? '').trim();
   const eq = splitIndex(t, '=');
   const key = expandVars(eq < 0 ? t : t.slice(0, eq), ctx);
-  if (!mayBeWorkTreeKey(key)) return null;
-  if (eq < 0) return { entries: [], unknown: false };
+  const dynKey = DYNAMIC.test(eq < 0 ? t : t.slice(0, eq)); // (read after expansion: it may be core.worktree whatever it expands to)
+  if (!dynKey && !mayBeWorkTreeKey(key)) return null;
+  if (eq < 0) return { entries: [], unknown: false, refused: dynKey };
   const varName = expandVars(t.slice(eq + 1), ctx);
   // R9: the key may be core.worktree and the value it takes from the environment must be fully known: the variable named, and every candidate of it
   if (DYNAMIC.test(varName)) return { entries: [], unknown: false, refused: true };
   const src = envCands(pe, ctx, varName);
-  const refused = DYNAMIC.test(key) || src.refused === true || src.unknown || src.list.length === 0 || src.list.some((c) => unresolvedValue(c.v, c.lit, ctx));
+  const refused = dynKey || DYNAMIC.test(key) || src.refused === true || src.unknown || src.list.length === 0 || src.list.some((c) => unresolvedValue(c.v, c.lit, ctx));
   return { entries: src.list.map((c) => ({ key: 'core.worktree', value: c.v, noValue: false, lit: c.lit })), unknown: src.unknown, refused };
 }
 
@@ -759,6 +760,8 @@ function configEnvWorkTree(text, pe, ctx) {
 function configEnvAlias(text, pe, ctx) {
   const t = String(text ?? '').trim();
   const eq = splitIndex(t, '=');
+  // R12 follow-through: a key written with a `$` / backtick is read after expansion (the variable may hold `alias.s=V`): unknown, whatever it expands to
+  if (DYNAMIC.test(eq < 0 ? t : t.slice(0, eq))) return { aliases: [], unknown: true };
   const key = expandVars(eq < 0 ? t : t.slice(0, eq), ctx).trim();
   const dyn = DYNAMIC.test(key);
   const an = /^alias\.(.+)$/is.exec(key)?.[1].toLowerCase() ?? null;
@@ -827,13 +830,19 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
       // Only the KEY is expanded (`-c $K=v`). The value stays as written: an alias body (`alias.p='!V=…; git push origin $V'`)
       // runs in its own shell, where the line's variables are not the ones it sees.
       const kv = argv[++i] ?? '';
-      const eq = splitIndex(kv, '=');
-      configs.push({ raw: kv, key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1), noValue: eq < 0 });
+      let eq = splitIndex(kv, '=');
+      // R12 follow-through: a key written with a `$` / backtick (before the first literal `=`, or anywhere when there is none) is read AFTER expansion: the
+      // variable may hold key and value (`KV=alias.s=reset; git -c $KV s`), so the whole word is expanded and then split at its first `=`; and whatever
+      // it expands to, the key counts as unknown (it may be an alias or core.worktree: dynKey, below)
+      const dynKey = DYNAMIC.test(eq < 0 ? kv : kv.slice(0, eq));
+      let word = kv;
+      if (dynKey) { word = expandVars(kv, ctx); eq = word.indexOf('='); }
+      configs.push({ raw: kv, key: expandVars(eq < 0 ? word : word.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : word.slice(eq + 1), noValue: eq < 0, dynKey });
       // R12-F3: a key (or a whole word) that is only known at run time may be `alias.<name>`
-      if (DYNAMIC.test(configs[configs.length - 1].key)) aliasUnknown = true;
-      if (eq >= 0 && mayBeWorkTreeKey(configs[configs.length - 1].key)) refuseCli(kv.slice(eq + 1)); // R8-B2 / R8-F2
+      if (dynKey || DYNAMIC.test(configs[configs.length - 1].key)) aliasUnknown = true;
+      if (eq >= 0 && (dynKey || mayBeWorkTreeKey(configs[configs.length - 1].key))) refuseCli(word.slice(eq + 1)); // R8-B2 / R8-F2
       // R7-F2: `-c core.worktree='$WT'`: the literal word is a target beside the expansion
-      if (eq >= 0 && DYNAMIC.test(kv.slice(eq + 1)) && quotedText) wtConfigs.push({ key: configs[configs.length - 1].key, value: kv.slice(eq + 1), noValue: false, lit: true });
+      if (eq >= 0 && DYNAMIC.test(word.slice(eq + 1)) && quotedText) wtConfigs.push({ key: configs[configs.length - 1].key, value: word.slice(eq + 1), noValue: false, lit: true });
       continue;
     }
     if (t.startsWith('--git-dir=')) { gitDirRaws.push(...cliValue(t.slice('--git-dir='.length))); gitDirUnknown = false; continue; }
@@ -862,8 +871,8 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   // `-c` whose key may be core.worktree and whose key or value is not fully resolved. (Not the `-C` / cd targets: those keep the unknown -> cwd check.)
   if ([...gitDirRaws, ...workTreeRaws].some((r) => unresolvedValue(r.v, r.lit, ctx))) refused = true;
   for (const c of [...configs, ...wtConfigs]) {
-    if (!mayBeWorkTreeKey(c.key)) continue;
-    if (DYNAMIC.test(c.key)) { refused = true; continue; }
+    if (!mayBeWorkTreeKey(c.key) && !c.dynKey) continue;
+    if (c.dynKey || DYNAMIC.test(c.key)) { refused = true; continue; }
     if (!c.noValue && unresolvedValue(c.lit ? c.value : expandVars(c.value, ctx), c.lit === true, ctx)) refused = true;
   }
   // every value named is resolved, so one that cannot be (`--git-dir=$G`, a relative path with no known directory) is unknown, not absent
@@ -983,13 +992,20 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   const aliasDefs = [...new Set([...g.configs.filter((c) => c.key === `alias.${subName}`).map((c) => c.value), ctx.gitAliases[subName], ...g.envAliases.filter((a) => a.name === subName).map((a) => a.value)].filter((a) => a !== undefined))];
   // (a `!` alias body that runs the alias again: git loops forever on a name that is no built-in and ignores the alias on one that is; the definitions are
   // all checked by the expansion that is running, and the command as written below)
-  if (aliasDefs.length && !ctx.aliasExpanding?.has(subName)) {
+  // R12 follow-through: unless the call brings ANOTHER definition of the name (git passes the outer -c down in GIT_CONFIG_PARAMETERS and a later one wins:
+  // `-c alias.s='!git -c alias.s=reset s' s` runs `reset`). Every definition the call can see is in aliasDefs (the outer one comes back through the
+  // exported GIT_CONFIG_PARAMETERS); any that is not exactly the one being expanded is refused, whichever way it was given.
+  const expandingDef = ctx.aliasExpanding?.get(subName);
+  if (expandingDef !== undefined && aliasDefs.some((a) => a !== expandingDef)) {
+    return deny(`the git alias "${sub}" is run again from its own \`!\` body with a different definition of it (-c / config / environment), so what it runs cannot be verified. Write the command out.`);
+  }
+  if (aliasDefs.length && expandingDef === undefined) {
     // R12-B2: a chain longer than the limit is not followed to its end, so it is refused (every other nesting site does the same)
     if (level >= MAX_NESTING) return deny(`the git alias "${sub}" is defined through too many other aliases (nested too deeply) to verify. Write the command out.`);
     for (const alias of aliasDefs) {
       let v;
       if (alias.startsWith('!')) {
-        v = shellAliasVerdict(alias.slice(1), g, env, ctx, raw, level);
+        v = shellAliasVerdict(alias.slice(1), g, env, ctx, raw, level, alias);
       } else {
         const words = splitArgs(alias);
         // (an alias that starts with its own name runs the command of that name: the command as written is checked below)
@@ -1026,7 +1042,7 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
 // GIT_CONFIG_PARAMETERS. The body is evaluated as `export …; body args` (in the directory -C produced) and the line's variables are put back afterwards.
 // A repository selector the outer command names that cannot be carried exactly (unreadable, several candidates) is refused: fail closed.
 const SHELL_ALIAS_ENV = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/i;
-function shellAliasVerdict(body, g, env, ctx, raw, level) {
+function shellAliasVerdict(body, g, env, ctx, raw, level, def) {
   if ((ctx.aliasShellDepth ?? 0) >= MAX_NESTING) return deny('a git shell alias that runs git again is nested too deeply (aliases running aliases) to verify.');
   if (g.refused || g.selectorLost || g.gitDirAll.length > 1 || g.workTreeAll.length > 1) {
     return deny('this git command names a repository (--git-dir / --work-tree / GIT_DIR / GIT_WORK_TREE / core.worktree) that a shell alias would inherit, and it cannot be read exactly (variables, quotes or several values), so what the alias runs on cannot be verified. Write the path out.');
@@ -1048,7 +1064,7 @@ function shellAliasVerdict(body, g, env, ctx, raw, level) {
   const saved = lineState(ctx);
   ctx.aliasShellDepth = (ctx.aliasShellDepth ?? 0) + 1;
   const expanding = ctx.aliasExpanding;
-  ctx.aliasExpanding = new Set([...(expanding ?? []), g.sub.toLowerCase()]);
+  ctx.aliasExpanding = new Map([...(expanding ?? []), [g.sub.toLowerCase(), def]]);
   try {
     const e = evalString(text, g.d, ctx, level + 1);
     return e.decision === 'deny' ? e : null;

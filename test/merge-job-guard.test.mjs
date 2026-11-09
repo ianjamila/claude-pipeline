@@ -1556,3 +1556,58 @@ test('R12-F3: an alias source the guard cannot read makes a name that is no comp
   // an unrelated key that cannot be read does not matter to a name that is not an alias either way... but it may be one, so it is unknown
   assert.equal(decide('git -c user.name=x status', free).decision, 'allow');
 });
+
+// ---- R12 follow-through: a `!` alias that calls itself, and a -c / --config-env key that only exists after expansion ----
+test('R12 follow-through: a `!` alias body that calls the alias it is expanding with another definition is refused', () => {
+  const { job } = containerWithJob();
+  const free = containerWithJob().container;
+  const at = fwd(job);
+  mark(job, process.pid, 12);
+  for (const c of [
+    `git -C ${at} -c alias.s='!git -c alias.s=reset s --hard' s`,
+    `git -C ${at} -c alias.s='!git --config-env=alias.s=V s --hard' s`,
+    `V=reset git -C ${at} -c alias.s='!git --config-env=alias.s=V s --hard' s`,
+    `git -C ${at} -c alias.s='!GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0=reset git s --hard' s`,
+    `git -C ${at} -c "alias.s=!GIT_CONFIG_PARAMETERS='alias.s=reset' git s --hard" s`,
+    `git -C ${at} -c alias.s='!git config alias.s reset && git s --hard' s`,
+    `git -C ${at} -c alias.s='!git -c alias.s=status s' s`, // (any other definition: the later one wins in git, so it is judged)
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0='!git -c alias.s=reset s --hard' git -C ${at} s`,
+  ]) {
+    const v = decide(c, free);
+    assert.equal(v.decision, 'deny', c);
+  }
+  // every definition the inner call sees is the one being expanded: git loops and nothing runs
+  assert.equal(decide(`git -C ${at} -c alias.s='!git s' s`, free).decision, 'allow');
+  assert.equal(decide(`git -C ${at} -c alias.s='!git -C ${at} s' s`, free).decision, 'allow');
+  assert.equal(decide(`git -c alias.s='!git t' -c alias.t='!git s' s`, free).decision, 'allow');
+});
+
+test('R12 follow-through: a -c / --config-env key read after expansion (the variable holds key and value)', () => {
+  const { job } = containerWithJob();
+  const free = containerWithJob().container;
+  const at = fwd(job);
+  mark(job, process.pid, 12);
+  for (const c of [
+    `KV=alias.s=reset; git -C ${at} -c $KV s --hard`,
+    `KV=alias.s=reset; git -C ${at} -c "$KV" s --hard`,
+    `K=alias.s; git -C ${at} -c $K=reset s --hard`,
+    `KV=alias.s=reset git -C ${at} -c $KV s --hard`,
+    `KV=core.worktree=${at}; git -c $KV reset --hard`,
+    `KV=core.worktree=${at}; git -c $KV add f`,
+    `X=alias.s=V V=reset; git -C ${at} --config-env=$X s --hard`,
+    `X=alias.s=V; V=reset; git -C ${at} --config-env=$X s --hard`,
+    `X=alias.s=V; V=reset; git -C ${at} --config-env $X s --hard`,
+    `X=core.worktree=V; V=${at}; git --config-env=$X reset --hard`,
+  ]) {
+    const v = decide(c, free);
+    assert.equal(v.decision, 'deny', c);
+  }
+  // a `$` in the VALUE of a literal key, or a prefix variable that is no key, changes nothing
+  for (const c of [
+    'git -c user.name=$USER commit -m x',
+    'WT=x git -c core.commentChar=- add f',
+    `git -C ${at} -c user.name=$USER status`,
+    'K=user.name; git -c $K=x status',
+  ]) assert.equal(decide(c, free).decision, 'allow', c);
+  assert.equal(decide('git -c user.name=$USER commit -m x', job).decision, 'deny'); // (commit in the job's own checkout: the job's, as before)
+});
