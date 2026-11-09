@@ -145,6 +145,7 @@ test('ci-wait: past --appear-timeout an absent check is held by an in-progress r
   const r = cli(['ci-wait', '--pr', '5', '--appear-timeout', '0', '--timeout', '1', '--interval', '1'], { repo: repoWith(), fake });
   assert.equal(r.code, 1, r.stdout + r.stderr);
   assert.equal(r.json.verdict, 'timeout');
-  assert.deepEqual(r.json.heldBy, { kind: 'workflow-run', id: 77, name: 'CI', status: 'in_progress', createdAt: '2026-01-01T12:00:10Z', url: 'https://github.example/actions/77' });
+  // predatesReady: the field every heldBy now carries (2026-11-09 plan B); a ready-era holder says false.
+  assert.deepEqual(r.json.heldBy, { kind: 'workflow-run', id: 77, name: 'CI', status: 'in_progress', createdAt: '2026-01-01T12:00:10Z', url: 'https://github.example/actions/77', predatesReady: false });
   assert.ok(fake.lines().includes(`api repos/acme/widgets/actions/runs?head_sha=${HEAD}&per_page=100 --paginate --jq .workflow_runs`));
 });
