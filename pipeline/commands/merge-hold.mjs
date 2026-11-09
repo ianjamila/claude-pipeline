@@ -81,7 +81,8 @@ export const run = guarded(async (argv, ctx) => {
 
   const result = release ? await releaseHold({ ...args, reason: values.reason }) : await takeHold(args);
   if (!result.configured) return { exitCode: EXIT.OK, output: { ok: true, configured: false } };
-  // 0 = confirmed, 1 = refused / NOT confirmed (the provider said no), anything else = the command itself went wrong.
-  const exitCode = result.confirmed ? EXIT.OK : (result.code === 1 && result.timedOut !== true ? EXIT.FAILED : EXIT.USAGE);
+  // 0 = confirmed, 1 = refused / NOT confirmed (the provider said no), anything else = the command itself went wrong (a timeout, or a kill: runShellAsync
+  // reports a signalled child as code 1 plus `signal`). runShellAsync has no output cap (no maxBuffer), so overBuffer cannot occur here.
+  const exitCode = result.confirmed ? EXIT.OK : (result.code === 1 && result.timedOut !== true && !result.signal ? EXIT.FAILED : EXIT.USAGE);
   return { exitCode, output: { ok: result.confirmed, ...result, ...(warnings.length > 0 ? { warnings } : {}) } };
 });

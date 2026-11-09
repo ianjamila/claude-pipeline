@@ -554,3 +554,14 @@ test('hardening 4: the landed-check matches lines exactly (a near-miss on the br
   assert.equal(r.json.dropped, 0);
   assert.deepEqual(r.json.lines, [L1, L2]);
 });
+
+// #188: rev-parse --verify exit 1 means "no such ref" (no file yet) only from a git that finished; a cut-off or killed one is an error.
+test('an abnormal GitError (code 1) from the ref check is never "no file": the publish throws', () => {
+  const w = world();
+  assertExit(w.run(['publish', '--line', L1]), 0);
+  const gitFn = (args, o) => {
+    if (args[0] === 'rev-parse' && args.some((x) => x.endsWith('^{commit}'))) throw new GitError({ args, code: 1, stderr: 'output over the buffer limit', abnormal: true }); // readRegularFile's check, not fetchLogBranch's
+    return gitRun(args, o);
+  };
+  assert.throws(() => publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L2], defaultBranch: 'main', gitFn }), (e) => e instanceof GitError && e.abnormal === true);
+});

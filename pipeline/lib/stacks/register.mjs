@@ -201,6 +201,7 @@ export async function register(input, deps = {}) {
     }
     if (r.timedOut) return (worktreeValue = unknown('git timed out'));
     if (r.signal) return (worktreeValue = unknown(`git ended by signal ${r.signal}`));
+    if (r.overBuffer) return (worktreeValue = unknown('git output was over the buffer limit')); // never the 'none' of a cut-off "not a git repository"
     const top = String(r.stdout ?? '').trim();
     if (r.code === 0 && top !== '') return (worktreeValue = ok(top));
     // git ran and said "not a repository": the cwd is in no worktree. Any other failure is unknown.

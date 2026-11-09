@@ -560,3 +560,9 @@ test('successors: an onSuccessor that throws never changes the outcome; the fail
   assert.equal(r.successorWarnings.length, 2);
   assert.match(r.successorWarnings[0], new RegExp(`${B}.*disk full`));
 });
+
+test('a "no checks reported" error that was cut at the buffer limit propagates instead of falling through', async () => {
+  const w = world({ behind: [1, 0] });
+  w.gh.checks = () => { throw new GhError({ code: 1, stderr: "no required checks reported on the 'main' branch", args: ['pr', 'checks'], overBuffer: true }); };
+  await assert.rejects(() => run(w, { expectHead: A }), (e) => e.overBuffer === true);
+});

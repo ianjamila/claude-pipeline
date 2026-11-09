@@ -738,3 +738,15 @@ test('waitForTurn: two unreadable answers in a row -> unreadable (fail closed); 
 test('waitForTurn: a missing or non-finite maxMs is refused (an unbounded wait must be asked for in words)', async () => {
   for (const maxMs of [undefined, NaN, Infinity, -1]) await assert.rejects(waitForTurn({ check: async () => BLOCKED, maxMs, sleep: async () => {} }), /finite maxMs/, String(maxMs));
 });
+
+// #188: runShellAsync returns the close event's signal: a killed hold command is code 1 plus `signal`, never the provider's own "no".
+test('takeHold / checkHolds: a hold command killed by a signal is reported with its signal (exit 1 alone looks like a refusal)', async () => {
+  const killed = async () => ({ code: 1, stdout: 'hold taken\n', stderr: '', timedOut: false, overBuffer: false, signal: 'SIGKILL' });
+  const taken = await takeHold({ config: CONFIG, pr: PR, root: '/repo', env: {}, run: killed });
+  assert.deepEqual([taken.confirmed, taken.code, taken.signal], [false, 1, 'SIGKILL']);
+  const plain = await takeHold({ config: CONFIG, pr: PR, root: '/repo', env: {}, run: async () => ({ code: 1, stdout: '', stderr: 'no', timedOut: false, signal: null }) });
+  assert.equal(plain.signal, undefined, 'a plain refusal carries no signal');
+  const checked = await check(killed);
+  assert.equal(checked.ok, false);
+  assert.match(checked.why, /SIGKILL/);
+});

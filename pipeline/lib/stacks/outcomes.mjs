@@ -315,7 +315,7 @@ export function memoryOfProject(project, { run = realRun, docker = 'docker', dea
   } catch (err) {
     return unknown(`docker stats could not run: ${err?.message ?? err}`);
   }
-  if (!r || r.timedOut || r.signal) return unknown('docker stats timed out or was killed');
+  if (!r || r.timedOut || r.signal || r.overBuffer) return unknown('docker stats timed out, was killed or printed past the buffer limit');
   if (r.code !== 0) return unknown(`docker stats exit ${r.code}: ${oneLine(r.stderr, 120)}`);
   const re = new RegExp(`^supabase_(?:${SERVICES})_${escapeRe(project)}$`, 'i');
   let total = 0;

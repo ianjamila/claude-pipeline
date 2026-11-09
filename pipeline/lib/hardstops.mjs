@@ -1652,7 +1652,8 @@ function accessPatterns(name) {
 
 // Which of `names` does the base tree already READ? ONE `git grep` per batch of names, patterns on stdin, outside
 // markdown and docs/. The matched text goes back through the same extractor the classifier uses.
-function knownEnvNames(ref, names, o) {
+// Exported for tests. "No match" is git's exit 1 with nothing on stderr from a git that finished: a killed or cut-off one (e.abnormal) throws.
+export function knownEnvNames(ref, names, o) {
   const known = new Set();
   const list = [...names].filter((n) => n !== UNKNOWN_ENV);
   for (let i = 0; i < list.length; i += 50) {
@@ -1661,7 +1662,7 @@ function knownEnvNames(ref, names, o) {
     try {
       out = git(['grep', '-E', '-o', '-h', '-I', '--no-color', '-f', '-', ref, '--', '.', ':!*.md', ':!docs/**'], { ...o, input });
     } catch (e) {
-      if (e instanceof GitError && e.code === 1) continue; // git grep: no match
+      if (e instanceof GitError && !e.abnormal && e.code === 1 && (e.stderr ?? '').trim() === '') continue; // git grep: no match
       throw e;
     }
     for (const line of out.split('\n')) for (const name of envNamesIn(line, { envObject: true })) known.add(name);
@@ -1711,7 +1712,7 @@ function filesMentioning(ref, names, o) {
     // `:(icase)`: the parser's language tests are case-insensitive (`Helper.RB`, `page.MDX`, `GEMFILE`), so the search must be too.
     out = git(['grep', '-I', '-F', '-l', '-z', '--no-color', ...names.flatMap((n) => ['-e', n]), ref, '--', ...CODE_PATHSPECS.map((s) => `:(icase)${s}`)], o);
   } catch (e) {
-    if (e instanceof GitError && e.code === 1 && (e.stderr ?? '').trim() === '') return []; // git grep: no match
+    if (e instanceof GitError && !e.abnormal && e.code === 1 && (e.stderr ?? '').trim() === '') return []; // git grep: no match
     throw e;
   }
   return out.split('\0').filter(Boolean).map((r) => r.slice(r.indexOf(':') + 1));
@@ -1725,7 +1726,7 @@ function readLines(ref, files, o) {
     try {
       out = git(['grep', '-I', '-n', '-z', '--no-color', '-e', '^', ref, '--', ...files.slice(i, i + READ_BATCH).map((p) => `:(literal)${p}`)], o);
     } catch (e) {
-      if (e instanceof GitError && e.code === 1 && (e.stderr ?? '').trim() === '') continue;
+      if (e instanceof GitError && !e.abnormal && e.code === 1 && (e.stderr ?? '').trim() === '') continue;
       throw e;
     }
     for (const rec of out.split('\n')) {

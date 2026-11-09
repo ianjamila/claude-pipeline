@@ -75,6 +75,8 @@ function call(run, bin, args, { deadlineAt, now = Date.now, env, replaceEnv, max
   if (!r || typeof r !== 'object') return { fail: unknown(`${name} returned nothing`) };
   if (r.timedOut) return { fail: unknown(`${name} timed out`) };
   if (r.signal) return { fail: unknown(`${name} ended by signal ${r.signal}`) };
+  // Cut at maxBuffer: the exit code (lsof exit 1 is believable) and every line read are not the whole answer.
+  if (r.overBuffer) return { fail: unknown(`${name} output was over the buffer limit`) };
   return { r };
 }
 

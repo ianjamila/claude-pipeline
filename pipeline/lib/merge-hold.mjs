@@ -66,6 +66,7 @@ export async function checkHolds({ config, pr, root, env, run = runShellAsync })
     return unreadable(`the hold check could not be started (${String(err?.message ?? err).slice(0, 200)})`);
   }
   if (ran.timedOut) return unreadable(`the hold check timed out after ${Math.round(HOLD_TIMEOUT_MS / 60_000)} min`);
+  if (ran.signal) return unreadable(`the hold check was killed by ${ran.signal}`);
   if (ran.code !== 0) return unreadable(`the hold check exited ${ran.code}`);
   const line = String(ran.stdout ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).at(-1);
   if (line === undefined) return unreadable('the hold check printed nothing');
@@ -98,7 +99,7 @@ async function runWrite(template, vars, ctx) {
   } catch (err) {
     return { configured: true, confirmed: false, code: 1, lines: [String(err?.message ?? err).slice(0, 200)] };
   }
-  return { configured: true, confirmed: ran.code === 0 && ran.timedOut !== true, code: ran.code, ...(ran.timedOut ? { timedOut: true } : {}), lines: lastLines(ran) };
+  return { configured: true, confirmed: ran.code === 0 && ran.timedOut !== true, code: ran.code, ...(ran.timedOut ? { timedOut: true } : {}), ...(ran.signal ? { signal: ran.signal } : {}), lines: lastLines(ran) };
 }
 
 // Takes (or keeps) PR N's own hold.

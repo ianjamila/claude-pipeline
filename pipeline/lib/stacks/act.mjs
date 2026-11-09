@@ -66,7 +66,7 @@ function containerState(run, docker, id) {
   } catch (err) {
     return { unknown: `docker inspect could not run: ${err?.message ?? err}` };
   }
-  if (!r || r.timedOut || r.signal) return { unknown: 'docker inspect timed out or was killed' };
+  if (!r || r.timedOut || r.signal || r.overBuffer) return { unknown: 'docker inspect timed out, was killed or printed past the buffer limit' }; // never read as 'absent'
   if (r.code !== 0) {
     return NO_SUCH_OBJECT.test(String(r.stderr ?? '')) ? 'absent' : { unknown: `docker inspect exit ${r.code}: ${firstLine(r.stderr)}` };
   }
@@ -90,7 +90,7 @@ function volumeState(run, docker, name) {
   } catch (err) {
     return { unknown: `docker volume inspect could not run: ${err?.message ?? err}` };
   }
-  if (!r || r.timedOut || r.signal) return { unknown: 'docker volume inspect timed out or was killed' };
+  if (!r || r.timedOut || r.signal || r.overBuffer) return { unknown: 'docker volume inspect timed out, was killed or printed past the buffer limit' }; // never read as 'missing'
   if (r.code === 0) return 'present';
   return NO_SUCH_VOLUME.test(String(r.stderr ?? '')) ? 'missing' : { unknown: `docker volume inspect exit ${r.code}: ${firstLine(r.stderr)}` };
 }
@@ -205,8 +205,8 @@ async function stopStackLocked({
     } catch (err) {
       return done('failed', [`supabase stop could not run: ${err?.message ?? err}`]);
     }
-    if (!s || s.timedOut || s.signal || s.code !== 0) {
-      const why = !s ? 'no result' : s.timedOut ? 'timed out' : s.signal ? `ended by signal ${s.signal}` : firstLine(s.stderr) || `exit ${s.code}`;
+    if (!s || s.timedOut || s.signal || s.overBuffer || s.code !== 0) {
+      const why = !s ? 'no result' : s.timedOut ? 'timed out' : s.signal ? `ended by signal ${s.signal}` : s.overBuffer ? 'output over the buffer limit' : firstLine(s.stderr) || `exit ${s.code}`;
       return done('failed', [`supabase stop failed: ${why}`]);
     }
 

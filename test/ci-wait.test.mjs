@@ -393,6 +393,62 @@ test('a re-run seen on a LATER poll refreshes the cached suite start: its failur
   assert.deepEqual(s.suiteCalls, [4, 4], 'one refresh when a newer check run of the suite appeared, not one per poll');
 });
 
+test('an OLD attempt\'s failure is not dated by a re-run that started after the check runs were read: the wait goes on and the re-run decides (#174, #168 R3-B1)', async () => {
+  // t=0: the check-runs read returns the draft-era failure (own times 11:00); the workflow-run read, taken afterwards, already shows
+  // attempt 2 started after ready. The failure belongs to attempt 1, so it is not a fresh failure of the ready-era code.
+  const old = { id: 1, name: 'ci', check_suite: { id: 4 }, started_at: '2026-01-01T11:00:10Z', completed_at: '2026-01-01T11:00:30Z' };
+  const rerun = (conclusion, t) => cr('ci', t >= 30 ? conclusion : null, { id: 2, check_suite: { id: 4 }, started_at: '2026-01-01T12:05:10Z', ...(t >= 30 ? { completed_at: '2026-01-01T12:06:00Z' } : {}) });
+  const world = (conclusion) => ({
+    classic: present('ci'), timeline: readyTimeline,
+    checkRuns: (t) => [t < 15 ? cr('ci', 'failure', old) : rerun(conclusion, t)],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: '2026-01-01T12:05:00Z', run_attempt: 2 }],
+  });
+  const failing = sim(world('failure'));
+  const a = await failing.run();
+  assert.equal(a.output.verdict, 'failed', JSON.stringify(a.output));
+  assert.equal(failing.elapsed(), 30_000, 'the old failure did not end the wait at t=0; the re-run\'s own failure did');
+  assert.equal(a.output.checks[0].state, 'fail');
+  const passing = sim(world('success'));
+  const b = await passing.run();
+  assert.equal(b.exitCode, 0, JSON.stringify(b.output));
+  assert.equal(passing.elapsed(), 30_000);
+});
+
+test('a failure whose own times are after its attempt\'s start (the re-run\'s own) is still fresh at once; so is a ready-era attempt-1 failure kept by a later re-run (#174)', async () => {
+  const own = sim({
+    classic: present('ci'), timeline: readyTimeline,
+    checkRuns: [cr('ci', 'failure', { check_suite: { id: 4 }, started_at: '2026-01-01T12:05:10Z', completed_at: '2026-01-01T12:06:00Z' })],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: '2026-01-01T12:05:00Z', run_attempt: 2 }],
+  });
+  assert.equal((await own.run()).output.verdict, 'failed');
+  assert.equal(own.elapsed(), 0);
+  const readyEra = sim({
+    classic: present('ci'), timeline: readyTimeline,
+    checkRuns: [cr('ci', 'failure', { check_suite: { id: 4 }, started_at: '2026-01-01T12:01:00Z', completed_at: '2026-01-01T12:02:00Z' })],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: '2026-01-01T12:05:00Z', run_attempt: 2 }],
+  });
+  const r = await readyEra.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(readyEra.elapsed(), 0, 'an old-attempt failure that is itself of the ready era is a real failure');
+});
+
+test('a check run first seen pending and later completed refreshes the suite once: a re-run whose run read lagged is not judged by the stale start (#176, #168 R4-F1)', async () => {
+  const s = sim({
+    classic: present('ci', 'other'), timeline: readyTimeline,
+    // t=0 the draft-era failure (attempt 1); t=15 the re-run's check run 2 is queued; t=30 the appear window is over and a
+    // running workflow run holds the wait, so findHolder reads the suite while the run read still shows attempt 1; t=45 check
+    // run 2 has failed and the run read now shows attempt 2 (started after ready).
+    checkRuns: (t) => [t < 15 ? cr('ci', 'failure', { id: 1, check_suite: { id: 4 } }) : cr('ci', t < 45 ? null : 'failure', { id: 2, check_suite: { id: 4 } })],
+    suiteRuns: (t) => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: t < 40 ? '2026-01-01T11:00:00Z' : '2026-01-01T12:05:00Z', run_attempt: t < 40 ? 1 : 2 }],
+    headRuns: [{ id: 9, name: 'CI', status: 'in_progress', created_at: '2026-01-01T12:00:10Z' }],
+  }, { appearTimeoutMs: 20_000 });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'failed', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 45_000, 'reported when check run 2 failed, not held on the stale cached start');
+  assert.equal(r.output.checks[0].state, 'fail');
+  assert.deepEqual(s.suiteCalls, [4, 4, 4], 'one refresh for the newer id, one when it completed; never one per poll');
+});
+
 test('a re-run (old created_at, ready-era run_started_at) that SKIPPED is still stale-skipped: it replays the draft payload (#173)', async () => {
   const s = sim({
     classic: present('lint'), timeline: readyTimeline,
