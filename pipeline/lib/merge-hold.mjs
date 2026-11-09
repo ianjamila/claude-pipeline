@@ -192,7 +192,7 @@ export function unreleasedWarning({ pr, reason, code, takeConfirmed, again = fal
 // taken, whatever the answer: a take that failed or timed out may still have written the label, and another session may have taken
 // one meanwhile, so the gate ALWAYS runs again after the take. Another hold ahead -> queued-behind and a hold-unreadable re-check
 // are returned with `holdTaken` (did the take confirm) so the caller can clean up (a CONFIRMED hold is real and is kept when only the re-check could not be read; an unconfirmed take is released); clear -> null (the PUT goes, held or not: the hold
-// is cooperative, a missing hold is not a safety loss). Later cycles of the same call only re-run the first gate.
+// is cooperative, a missing hold is not a safety loss). Later cycles of the same call only re-run the first gate (its refusal carries `holdTaken` too once this call has taken).
 // -> { beforeUpdate, info }; `info` is filled as the calls happen: { taken, tookThisCall, mayHold (the take ran, so it may have written the label: the auto-releases key on it), take: { confirmed, code, lines, timedOut? } | null }.
 // Not configured -> { beforeUpdate: null, info: null }.
 export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync }) {
@@ -201,7 +201,10 @@ export function holdBeforeUpdate({ config, pr, root, env, run = runShellAsync })
   const info = { taken: false, tookThisCall: false, mayHold: false, take: null };
   const beforeUpdate = async () => {
     const first = await holdGate(args);
-    if (first) return first;
+    // A later cycle of the same call: this call's cycle-1 take may have left a real hold, so its refusal carries holdTaken like the
+    // post-take one does (R4-S1: update-branch's usage promises it, and the review skill keys its hold-unreadable cleanup on it).
+    // Nothing taken yet (the first gate refused before any take ran) -> bare, as before.
+    if (first) return info.tookThisCall ? { ...first, holdTaken: info.taken } : first;
     if (info.tookThisCall) return null;
     const took = await takeHold(args);
     info.tookThisCall = true;

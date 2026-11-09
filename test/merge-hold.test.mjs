@@ -432,12 +432,38 @@ test('holdBeforeUpdate: clear -> check, take, check again, PUT goes; across 2 cy
   assert.deepEqual(sh.log, ['check', 'take', 'check', 'check'], 'cycle 2 only runs the first gate, no second take');
 });
 
-test('holdBeforeUpdate: cycle 2 refusal after a taken hold is a plain gate refusal (no second take, no re-check)', async () => {
+// R4-S1 spec change (not a loosening): this test used to assert only the error; a cycle-2 refusal after this call's confirmed take now
+// ALSO carries holdTaken true, like the post-take refusal, so the caller can tell a real hold from none.
+test('holdBeforeUpdate: cycle 2 refusal after a taken hold is a gate refusal carrying holdTaken (no second take, no re-check)', async () => {
   const sh = shell({ checks: [{ stdout: CLEAR }, { stdout: CLEAR }, { stdout: AHEAD }] });
   const { beforeUpdate } = before(sh);
   assert.equal(await beforeUpdate(), null);
   const r = await beforeUpdate();
   assert.equal(r.error, 'queued-behind');
+  assert.equal(r.holdTaken, true);
+  assert.deepEqual(sh.log, ['check', 'take', 'check', 'check']);
+});
+
+test('holdBeforeUpdate: confirmed take in cycle 1, cycle 2 gate unreadable -> hold-unreadable with holdTaken true (R4-S1)', async () => {
+  const sh = shell({ checks: [{ stdout: CLEAR }, { stdout: CLEAR }, { stdout: 'garbage' }] });
+  const { beforeUpdate, info } = before(sh);
+  assert.equal(await beforeUpdate(), null);
+  const r = await beforeUpdate();
+  assert.equal(r.error, 'hold-unreadable');
+  assert.equal(r.holdTaken, true);
+  assert.equal(info.taken, true);
+  assert.deepEqual(sh.log, ['check', 'take', 'check', 'check']);
+});
+
+test('holdBeforeUpdate: UNconfirmed take (exit 1) in cycle 1, cycle 2 refused -> holdTaken present and false (R4-S1)', async () => {
+  const sh = shell({ checks: [{ stdout: CLEAR }, { stdout: CLEAR }, { stdout: AHEAD }], take: taken({ code: 1, stdout: 'refused: draft\n' }) });
+  const { beforeUpdate, info } = before(sh);
+  assert.equal(await beforeUpdate(), null);
+  const r = await beforeUpdate();
+  assert.equal(r.error, 'queued-behind');
+  assert.equal('holdTaken' in r, true);
+  assert.equal(r.holdTaken, false);
+  assert.equal(info.mayHold, true);
   assert.deepEqual(sh.log, ['check', 'take', 'check', 'check']);
 });
 
