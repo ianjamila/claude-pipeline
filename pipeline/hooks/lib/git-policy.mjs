@@ -717,6 +717,9 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   let refused = [...penv].some(([name, c]) => c.refused && GIT_SELECTOR_NAME.test(name));
   // (an `export` / assignment earlier on the line reaches git through hint() and ctx.vars: its value holding a `$` or backtick is refused like a prefix value's)
   if (Object.keys(ctx.vars).some((k) => GIT_SELECTOR_NAME.test(k) && typeof ctx.vars[k] === 'string' && DYNAMIC.test(ctx.vars[k]))) refused = true;
+  // (a selector the line assigned or exported more than once has no value to read: which assignment ran is unknown, so it is refused too, unless this
+  // command's own prefix sets it to a value that is not itself refused)
+  if ([...ctx.unsureVars, ...ctx.tainted].some((k) => GIT_SELECTOR_NAME.test(k) && !(penv.has(k) && !penv.get(k).refused))) refused = true;
   const refuseCli = (v) => { if ((quotedText && dynamicPieces(v) >= 2) || substitutesDynamic(v, ctx)) refused = true; };
   const envGitDir = envNamed('GIT_DIR');
   let gitDirUnknown = !envGitDir.known; // exported twice: which repository the command acts on cannot be told

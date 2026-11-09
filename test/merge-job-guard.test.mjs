@@ -331,13 +331,16 @@ test('R3-B1: a target that cannot be resolved is refused while the session\'s ow
     'git --git-dir=$G checkout x',
     'GIT_DIR=$G git checkout x',
     'cd $TARGET && git checkout x',
-    'export GIT_DIR=/a/.git; export GIT_DIR=/b/.git; git checkout x',
     'GIT_WORK_TREE=$W git checkout x',
   ]) {
     const v = decide(command, root);
     assert.equal(v.decision, 'deny', command);
     assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
   }
+  // (R8-F2: a selector exported twice has no value to read: refused outright, whoever owns the session's checkout; it used to be an "unknown" cwd check)
+  const twice = decide('export GIT_DIR=/a/.git; export GIT_DIR=/b/.git; git checkout x', root);
+  assert.equal(twice.decision, 'deny');
+  assert.match(twice.reason, /cannot be read one way/);
 });
 
 test('R3-B1: the same commands are allowed with no marker, a dead marker, or when read-only', () => {
@@ -1046,4 +1049,32 @@ test('R8-F2: an exported GIT_DIR / GIT_WORK_TREE / GIT_CONFIG_* value holding `$
     `export GIT_DIR=${elsewhere}/.git; git checkout x`,
     `GIT_WORK_TREE=${elsewhere}; export GIT_WORK_TREE; git reset --hard`,
   ]) assert.equal(decide(c, container).decision, 'allow', c);
+});
+
+// R8-F2 (assigned more than once): a GIT_* selector the line assigned or exported more than once is "unsure" (which assignment ran is unknown), so the value
+// git gets cannot be read at all: refused for a mutating verb, unless this command's own prefix sets the name to a value that is not itself refused
+test('R8-F2: a GIT_* selector assigned or exported more than once on the line is refused for a mutating verb', () => {
+  const { container, job, wt, at, elsewhere } = r8Setup();
+  const twice = (verb) => [
+    `export GIT_WORK_TREE=${elsewhere}; export GIT_WORK_TREE=${wt}; git ${verb}`,
+    `export GIT_WORK_TREE=${wt}; export GIT_WORK_TREE=${elsewhere}; git ${verb}`,
+    `GIT_DIR=${elsewhere}/.git; GIT_DIR=${wt}/.git; export GIT_DIR; git ${verb}`,
+    `export GIT_DIR=${wt}/.git; GIT_DIR=${elsewhere}/.git; git ${verb}`,
+    `export GIT_CONFIG_PARAMETERS="'a.b=c'"; export GIT_CONFIG_PARAMETERS="'core.worktree=${wt}'"; git ${verb}`,
+    `export GIT_CONFIG_KEY_0=x.y; export GIT_CONFIG_KEY_0=core.worktree; GIT_DIR=${at}/gd git ${verb}`,
+    `GIT_CONFIG_VALUE_0=${elsewhere}; export GIT_CONFIG_VALUE_0=${wt}; GIT_DIR=${at}/gd git ${verb}`,
+    `export GIT_WORK_TREE=${elsewhere}; export GIT_WORK_TREE=${wt}; GIT_DIR='$G' git ${verb}`, // (a prefix value that is itself refused does not win)
+  ];
+  mark(job, process.pid, 12);
+  for (const verb of ['reset --hard', 'checkout x']) for (const c of twice(verb)) r8Refused(c, container);
+  const { container: free } = containerWithJob();
+  r8Refused(`export GIT_WORK_TREE=/a; export GIT_WORK_TREE=/b; git reset --hard`, free);
+  for (const verb of ['status', 'log --oneline', 'diff']) for (const c of twice(verb)) assert.equal(decide(c, container).decision, 'allow', `read-only: ${c}`);
+  // a single plain export is unchanged, and this command's own (not refused) prefix wins over the doubly assigned one
+  for (const c of [
+    `export GIT_WORK_TREE=${elsewhere}; git reset --hard`,
+    `export GIT_WORK_TREE=/a; export GIT_WORK_TREE=/b; GIT_WORK_TREE=${elsewhere} git reset --hard`,
+    `export GIT_DIR=/a/.git; GIT_DIR=/b/.git; GIT_DIR=${elsewhere}/.git git checkout x`,
+  ]) assert.equal(decide(c, container).decision, 'allow', c);
+  assert.equal(decide(`export GIT_WORK_TREE=/a; export GIT_WORK_TREE=/b; GIT_WORK_TREE=${wt} git reset --hard`, container).decision, 'deny');
 });
