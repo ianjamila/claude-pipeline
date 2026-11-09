@@ -85,16 +85,23 @@ async function waitForNewHead({ gh, pr, from, waitMs, pollMs, now, sleep }) {
 // `beforeUpdate` (optional, may be async) is called immediately before EVERY update PUT: a non-null return is a refusal object
 // ({error, …extra}) that ends the loop with outcome = its `error` and its fields on the result, keeping `updated` (= cycles > 0),
 // `cycles`, `head` and `startHead`. Without it nothing changes. The read and the PUT are not atomic: it narrows the window, no more.
+// `onSuccessor` (optional, SYNC) is called with { from, to, baseSha } for every accepted cycle, immediately after the parents check
+// proves the new head is the merge of baseSha into from: before any checks read and before the next cycle reads anything, so a
+// failure there cannot lose the proof. A throw is caught and listed in `successorWarnings`; it never changes the outcome. The result
+// carries `successors` (every accepted cycle, in order) whatever the outcome, and `successorWarnings` when there are any.
 export async function bringUpToDate({
-  gh, pr, expectHead = null, maxCycles = MAX_UPDATE_CYCLES, waitChecks = false, beforeUpdate = null,
+  gh, pr, expectHead = null, maxCycles = MAX_UPDATE_CYCLES, waitChecks = false, beforeUpdate = null, onSuccessor = null,
   headWaitMs = HEAD_WAIT_MS, checksWaitMs = CHECKS_WAIT_MS, pollMs = POLL_MS, now = Date.now, sleep = defaultSleep,
 }) {
   let cycles = 0;
   let startHead = null;
   let known = expectHead;
   let base = null;
+  const successors = [];
+  const successorWarnings = [];
   const out = (outcome, extra = {}) => ({
-    ok: outcome === 'up-to-date', outcome, updated: cycles > 0, cycles, base, startHead, ...extra,
+    ok: outcome === 'up-to-date', outcome, updated: cycles > 0, cycles, base, startHead,
+    successors: [...successors], ...(successorWarnings.length > 0 ? { successorWarnings: [...successorWarnings] } : {}), ...extra,
   });
 
   for (;;) {
@@ -134,6 +141,15 @@ export async function bringUpToDate({
     const parents = gh.commitParents(next);
     if (parents.length !== 2 || parents[0] !== head || parents[1] !== baseSha) {
       return out('head-moved', { head: next, message: `the PR head became ${next}, which is not the merge of ${baseSha} into ${head} (parents: ${parents.join(', ') || 'none'}): someone pushed during the update; re-read, nothing more was written` });
+    }
+    const successor = { from: head, to: next, baseSha };
+    successors.push(successor);
+    if (onSuccessor !== null) {
+      try {
+        onSuccessor({ ...successor });
+      } catch (err) {
+        successorWarnings.push(`could not record the successor ${next}: ${String(err?.message ?? err).slice(0, 200)}`);
+      }
     }
     known = next;
     if (waitChecks) {

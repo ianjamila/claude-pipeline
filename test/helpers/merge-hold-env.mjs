@@ -23,7 +23,8 @@ export const holdYml = ({ merge } = {}) => {
 };
 
 // check / take / release in one script. Env: FAKE_HOLD_CHECK_SEQ = JSON array of what the nth `check` prints (the last one repeats; a
-// non-string is JSON-encoded); FAKE_HOLD_CHECK_EXIT / FAKE_HOLD_TAKE_EXIT / FAKE_HOLD_RELEASE_EXIT = the exit code.
+// non-string is JSON-encoded); FAKE_HOLD_CHECK_EXIT / FAKE_HOLD_TAKE_EXIT / FAKE_HOLD_RELEASE_EXIT = the exit code. Every call also writes
+// `<verb> <n>` to .review/hold-puts.log, n = the update-branch PUTs the fake gh had logged by then (holdPuts: order of hold calls vs the PUT).
 export const FAKE_HOLD = [
   "import { appendFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';",
   "mkdirSync('.review', { recursive: true });",
@@ -31,6 +32,9 @@ export const FAKE_HOLD = [
   "const log = '.review/hold-calls.log';",
   "const before = existsSync(log) ? readFileSync(log, 'utf8').split('\\n').filter((l) => l.startsWith('check')).length : 0;",
   "appendFileSync(log, `${verb} ${rest.join(' ')}\\n`);",
+  "const ghLog = process.env.PIPELINE_FAKE_GH_LOG;",
+  "const puts = ghLog && existsSync(ghLog) ? readFileSync(ghLog, 'utf8').split('\\n').filter(Boolean).filter((l) => JSON.parse(l).argv.join(' ').includes('-X PUT')).length : 0;",
+  "appendFileSync('.review/hold-puts.log', `${verb} ${puts}\\n`);",
   "const exit = (name) => process.exit(Number(process.env[name] ?? 0));",
   "if (verb === 'take') { console.log('hold taken'); exit('FAKE_HOLD_TAKE_EXIT'); }",
   "if (verb === 'release') { console.log('hold released'); exit('FAKE_HOLD_RELEASE_EXIT'); }",
@@ -69,5 +73,11 @@ export const seq = (...answers) => JSON.stringify(answers);
 
 export const holdCalls = (s) => {
   const file = join(s.repo.dir, '.review', 'hold-calls.log');
+  return existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n') : [];
+};
+
+// `<verb> <PUTs made so far>` per hold call, oldest first.
+export const holdPuts = (s) => {
+  const file = join(s.repo.dir, '.review', 'hold-puts.log');
   return existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n') : [];
 };
