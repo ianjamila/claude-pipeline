@@ -282,6 +282,16 @@ read-only check. The pipeline-side check is cooperative (only a hold-aware merge
 install the pipeline change before adding the keys; to roll back, remove the keys first. A PR whose hold expires and is renewed goes to the
 back of the queue; your exits are merging the PR ahead, releasing its hold, or the provider's `--ignore-hold`. Details: `docs/cli.md`, Merge hold under `merge`.
 
+### Queue mode (GitHub merge queue; automatic)
+
+No setting: when GitHub reports a merge queue on a PR's base branch, `pipeline merge` enqueues the exact head you approved ("merge" once, no catch-up CI, no merge hold,
+no `pipeline update-branch`) and GitHub merges it after testing it on top of main and everything ahead of it. The pipeline keeps watching the usual stop conditions
+(`needs-human` / `pipeline-blocked`, pause and rollback issues) and re-queues the same head once if the group's checks removed it; a second removal is red CI. Sessions cannot
+enqueue, dequeue or enable auto-merge by hand (the guard points them to `P merge --pr N`). If the session ends, `pipeline queue-sweep` carries every queued PR to its end: on macOS the
+installer writes the LaunchAgent `com.claude-pipeline.queue-sweep` (every 10 minutes, exits at once when nothing is queued) and removes it on uninstall. Queue off: nothing changes.
+One gap stays: a stop condition set after the queue's last check but before GitHub merges the group is caught only while a `merge` job polls; otherwise the sweep reports it afterwards.
+Details: `docs/cli.md`, Queue mode under `merge`, and `queue-sweep`.
+
 ### Smoke firewall bypass header (opt-in)
 
 If a firewall (for example Vercel's) answers 429 to CI runner IPs, the production smoke can send one secret header that a

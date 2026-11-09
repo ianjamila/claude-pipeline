@@ -117,6 +117,23 @@ A repo whose default branch uses GitHub's merge queue also copies `templates/wor
 only, and posts the guard statuses on the queue commit for the member PRs' exact queued heads. Register `Queue guards` like
 `pipeline-guards.yml` and do not edit it from a PR.
 
+Queue mode itself needs no setting: `P merge`, `P final-gate`, the dry run, `P update-branch` and `P merge-hold` ask GitHub live
+whether the base branch has a merge queue, and with none they behave as before. In queue mode `P merge` enqueues the owner-approved head,
+and the queue sweep (`queue-sweep`, LaunchAgent `com.claude-pipeline.queue-sweep`, every 10 min, written and removed by the installer) carries a queued PR to its end
+when no session is watching. The repo's own queue settings, its `merge_group` triggers and its `Queue gate` check are the repo's workflow PR (EagleWatch's A2), not part of onboarding here.
+
+**Before moving a repo into a GitHub organization** (lessons from EagleWatch's move, 2026-11-09; do these first):
+
+1. Set `ci.approvers: [<owner login>]` in `.claude/pipeline.yml` and merge it while the repo is still user-owned. An org-owned repo with `approvers: []`
+   trusts nobody (`org-repo-needs-ci.approvers`): `Cross-model review` fails, approval labels get no receipt, and the fix cannot merge afterwards (base config plus required checks).
+2. Move CI runners off a third-party runner provider first (or install it on the org): the move cancels every running job.
+3. Guard statuses posted before the move are refused ("the run belongs to a different repository"). Re-judge each ready PR with a FRESH guard run (add, then remove
+   the `pipeline-recheck` label: a new `pull_request_target` run on current main). Never `gh run rerun`: a re-run reuses the old event's sha (old main config) and attempt 2 or later never counts.
+4. Owner-go grants and merge records are keyed by repo name. After the move the owner records it in a plain terminal:
+   `pipeline repo-move --from <old> --to <new> --at <move time UTC>`.
+5. Vercel's Git link silently dies on a transfer (no deploys, no statuses): the owner disconnects and reconnects the repo in the Vercel dashboard right after.
+   Also re-check secrets, variables, protection and labels, and re-show any in-flight merge request (its Head line names the repo).
+
 ### f. CODEOWNERS
 
 `templates/CODEOWNERS` → `.github/CODEOWNERS`. Replace `{{OWNER}}` with the repo owner's handle
