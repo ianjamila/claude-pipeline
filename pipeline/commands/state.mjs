@@ -93,12 +93,30 @@ const continuesPublished = (mine, theirs) => {
 };
 const isObjectLike = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-// One item of the local copy against the published one: a permitted "ahead" change. A second-review verdict, a Claude / forced final, or a continuing decision
-// may sit next to other differences (they are the saved work); a mark added where the published item had none (`state mark-implemented`, `followups create`)
-// counts only when the item is otherwise unchanged, so a mark never carries an unrelated edit with it. A changed or removed mark is not ahead.
 const itemKey = (i) => decidedItemsKey({ items: [i] });
+// A second-review verdict and / or a Claude / forced final saved next to a published item that has none. It is the WHOLE local change: the rest of the decided
+// fields (everything but `final` and `secondReview`) are as published, the verdict is new (or unchanged), and the final is unchanged or a new protected final over
+// a final that is not the owner's (the owner's ruling is never replaced by Claude's) and, where it records what it overruled, overruled exactly the published final.
+// `triage second-review` writes the verdict and a forced ACCEPT final (overruling the final it found) together, so that pair is covered; so is a verdict followed by
+// a Claude ruling, and a final that CONTINUES the published one (continuesPublished) is accepted on the same terms. Anything else riding along (a flipped
+// `implemented`, a loosened final, a changed field) is not saved work.
+const rest = (i) => itemKey({ ...i, final: undefined, secondReview: undefined });
+function savedRulingIsAhead(i, before) {
+  if (rest(i) !== rest(before)) return false;
+  const verdictAdded = i.secondReview !== undefined && before.secondReview === undefined;
+  if (!verdictAdded && canonicalJson(i.secondReview) !== canonicalJson(before.secondReview)) return false;
+  if (canonicalJson(i.final) === canonicalJson(before.final)) return verdictAdded;
+  if (continuesPublished(i, before)) return true;
+  if (!isProtectedFinal(i) || isProtectedFinal(before) || isOwnerRuled(before)) return false;
+  const overruled = i.final.claude?.overruled;
+  if (overruled !== undefined && canonicalJson(overruled) !== canonicalJson(before.final)) return false;
+  return i.final.forcedBy === undefined || verdictAdded;
+}
+// One item of the local copy against the published one: a permitted "ahead" change. Either saved ruling work on its own (savedRulingIsAhead above), or a mark
+// added where the published item had none (`state mark-implemented`, `followups create`) with the item otherwise unchanged, so neither carries an unrelated edit
+// with it. A changed or removed mark is not ahead.
 function itemIsAhead(i, before) {
-  if ((i.secondReview !== undefined && before.secondReview === undefined) || (isProtectedFinal(i) && !isProtectedFinal(before)) || continuesPublished(i, before)) return true;
+  if (savedRulingIsAhead(i, before)) return true;
   const addImplemented = Boolean(i.implemented) && before.implemented === undefined;
   const addFollowup = Boolean(i.followupIssue) && before.followupIssue === undefined;
   if (!addImplemented && !addFollowup) return false;

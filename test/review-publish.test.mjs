@@ -410,6 +410,44 @@ test('state show (R1-B1): local-ahead needs every published round and item to su
   assert.equal(w.show(w.A).json.source, 'local-ahead');
 });
 
+// R2-F1: a protected final or a second-review verdict is "ahead" only when it is the whole local change: the published final is not the owner's, the rest of the
+// item is as published, and a final that records what it overruled overruled exactly the published final.
+test('state show (R2-F1): a Claude final over a published owner ruling, or a verdict / protected final carrying another change, is quarantined; genuine ones stay local-ahead', (t) => {
+  const ownerFinal = () => ({ decision: 'ACCEPT', by: 'owner', needsHuman: false, reason: 'owner says fix', ownerQuote: 'R1-B1: accept', ruledAt: 'earlier', overruled: waiting() });
+  const run = (name, s0, local) => {
+    const w = world(t);
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0);
+    saveState(w.A, local);
+    const r = w.show(w.A);
+    assertExit(r, 0, name + r.stdout + r.stderr);
+    return { r, w };
+  };
+  const quarantined = (name, s0, local) => {
+    const { r } = run(name, s0, local);
+    assert.equal(r.json.source, 'quarantined', name);
+  };
+  const ahead = (name, s0, local) => {
+    const { r, w } = run(name, s0, local);
+    assert.equal(r.json.source, 'local-ahead', name);
+    assert.deepEqual(w.state(w.A), JSON.parse(JSON.stringify(local)), `${name}: the local state is untouched`);
+  };
+  const owned = mk([it('R1-B1', { final: ownerFinal() })]);
+  quarantined('Claude final over an owner ruling', owned, change(owned, 'R1-B1', { final: claudeFinal({ claude: { ruledAt: 'x', cause: 'low-confidence', critical: true, overruled: ownerFinal() } }) }));
+  quarantined('forced final over an owner ruling', owned, change(owned, 'R1-B1', { secondReview: verdict('ACCEPT'), final: claudeFinal({ decision: 'ACCEPT', forcedBy: 'second-review', claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: ownerFinal() } }) }));
+  const s0 = waitingState();
+  quarantined('verdict plus flipped implemented', s0, change(s0, 'R1-B1', { secondReview: verdict(), implemented: true }));
+  quarantined('verdict plus loosened final', s0, change(s0, 'R1-B1', { secondReview: verdict(), final: decided({ reason: 'loosened by hand' }) }));
+  quarantined('protected final plus an unrelated changed field', s0, change(s0, 'R1-B1', { final: claudeFinal(), judge: { disputedBug: true } }));
+  quarantined('protected final that overruled something else', s0, change(s0, 'R1-B1', { final: claudeFinal({ claude: { ruledAt: 'x', cause: 'low-confidence', critical: true, overruled: waiting('other') } }) }));
+  quarantined('forced final that overruled something else', s0, change(s0, 'R1-B1', { secondReview: verdict('ACCEPT'), final: claudeFinal({ decision: 'ACCEPT', forcedBy: 'second-review', claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: waiting('other') } }) }));
+  // controls: the genuine saved work is still kept
+  ahead('real second-review forced ACCEPT', s0, change(s0, 'R1-B1', { secondReview: verdict('ACCEPT'), final: claudeFinal({ decision: 'ACCEPT', forcedBy: 'second-review', claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: waiting() } }) }));
+  ahead('verdict then a Claude ruling', s0, change(s0, 'R1-B1', { secondReview: verdict(), final: claudeFinal() }));
+  const plain = mk([it('R1-B1')]);
+  ahead('Claude ruling over a non-owner published final', plain, change(plain, 'R1-B1', { final: claudeFinal({ claude: { ruledAt: 'x', cause: 'low-confidence', critical: true, overruled: decided() } }) }));
+});
+
 test('state show: a truly superseded copy is still quarantined (other published state or no baseline); an owner ruling over a waiting item is local-ahead', (t) => {
   // 1. the baseline is not the published hash: another checkout published since
   const a = world(t);
