@@ -594,7 +594,10 @@ export function resolvePrefixEnv(env, ctx, raw) { // (exported for the unit test
       if (vals.refused) out.refused = true;
       // (a name with no value contributes the empty string, as an unset one expands; with nothing unknown about it that is a gap: refused)
       if (vals.list.length === 0 && !vals.unknown) out.refused = true;
-      parts = parts.flatMap((x) => (vals.list.length === 0 ? [x] : vals.list.map((v) => x + v)));
+      // R9-B1: a name that may also be unset when the word expands (a value assigned later on the line, or set only by this command's prefix, is not yet there)
+      // reads as the empty string beside the values the line gave it
+      const readings = vals.list.length === 0 ? [''] : vals.unknown && !vals.list.includes('') ? [...vals.list, ''] : vals.list;
+      parts = parts.flatMap((x) => readings.map((v) => x + v));
       if (parts.length > CAND_CAP) { out.unknown = true; out.refused = true; parts = parts.slice(0, CAND_CAP); }
     }
     if (parts.length === 0) out.refused = true;
@@ -696,6 +699,13 @@ function envConfigWorkTrees(pe, ctx) {
 }
 // R4-F1 / R5-B1 / R5-F1: `--config-env=NAME=VAR` (or `--config-env NAME=VAR`) sets config key NAME from environment variable VAR. When NAME is, or may be,
 // core.worktree the target is unknown, and VAR's values (when this command's prefix or an earlier assignment on the line gives any) are targets of their own.
+// R9: a value of a git dir / work tree that is not fully resolved: it still holds a `$` / backtick (the line never gave the name a value, or the
+// expander does not handle the form: `${X:-…}`), or joinDir / litJoin cannot place it (`~user`, `-`). Judged against a dummy absolute directory:
+// a relative path under a `-C` the resolver could not read is the `unknown` -> cwd fallback, not this.
+function unresolvedValue(v, lit, ctx) {
+  if (typeof v !== 'string') return true;
+  return (lit ? litJoin('/', v) : joinDir('/', v, ctx)) === null;
+}
 function configEnvWorkTree(text, pe, ctx) {
   const t = String(text ?? '').trim();
   const eq = splitIndex(t, '=');
@@ -703,9 +713,11 @@ function configEnvWorkTree(text, pe, ctx) {
   if (!mayBeWorkTreeKey(key)) return null;
   if (eq < 0) return { entries: [], unknown: false };
   const varName = expandVars(t.slice(eq + 1), ctx);
-  if (DYNAMIC.test(varName)) return { entries: [], unknown: false };
+  // R9: the key may be core.worktree and the value it takes from the environment must be fully known: the variable named, and every candidate of it
+  if (DYNAMIC.test(varName)) return { entries: [], unknown: false, refused: true };
   const src = envCands(pe, ctx, varName);
-  return { entries: src.list.map((c) => ({ key: 'core.worktree', value: c.v, noValue: false, lit: c.lit })), unknown: src.unknown, refused: src.refused === true };
+  const refused = DYNAMIC.test(key) || src.refused === true || src.unknown || src.list.length === 0 || src.list.some((c) => unresolvedValue(c.v, c.lit, ctx));
+  return { entries: src.list.map((c) => ({ key: 'core.worktree', value: c.v, noValue: false, lit: c.lit })), unknown: src.unknown, refused };
 }
 
 function parseGitGlobal(argv, dir, env, ctx, raw) {
@@ -714,7 +726,10 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
   // (what envVar says of a name this command's prefix does not set: unknown when the line assigned it, else absent)
   const envNamed = (name) => (penv.has(name) ? { known: true, ...penv.get(name) } : { ...envVar({}, ctx, name), list: [], unknown: false, refused: false });
   // R8: a value of a name that selects the repository or the work tree that the resolver could not read one way (see resolvePrefixEnv)
-  let refused = [...penv].some(([name, c]) => c.refused && GIT_SELECTOR_NAME.test(name));
+  // R9: and (fail closed by construction) any such name whose candidate set is not FULLY resolved: the resolver says it is `unknown`, a candidate still
+  // holds a `$` / backtick (or `~user`) after expansion, or no candidate is left (an unset name: its expansion is what bash passes, not what the line shows)
+  const pathLike = (name) => /^GIT_(?:DIR|WORK_TREE|CONFIG_VALUE_\d+)$/i.test(name);
+  let refused = [...penv].some(([name, c]) => GIT_SELECTOR_NAME.test(name) && (c.refused || c.unknown || c.list.some((x) => (pathLike(name) ? unresolvedValue(x.v, x.lit, ctx) : (x.lit ? LIT_DYNAMIC : DYNAMIC).test(x.v)))));
   // (an `export` / assignment earlier on the line reaches git through hint() and ctx.vars: its value holding a `$` or backtick is refused like a prefix value's)
   if (Object.keys(ctx.vars).some((k) => GIT_SELECTOR_NAME.test(k) && typeof ctx.vars[k] === 'string' && DYNAMIC.test(ctx.vars[k]))) refused = true;
   // (a selector the line assigned or exported more than once has no value to read: which assignment ran is unknown, so it is refused too, unless this
@@ -777,6 +792,15 @@ function parseGitGlobal(argv, dir, env, ctx, raw) {
     if (GIT_GLOBAL_VALUE.includes(t)) { i++; continue; }
     if (t.startsWith('-')) continue; // boolean global option, or --opt=value
     break;
+  }
+  // R9-F1: bash expands a command's argument words before its own prefix assignments apply, and the line's earlier assignments are what they read: a
+  // --git-dir / --work-tree value still holding a `$` / backtick here (a name unset on the line, `${X:-…}`) is not one the resolver can read; so is a
+  // `-c` whose key may be core.worktree and whose key or value is not fully resolved. (Not the `-C` / cd targets: those keep the unknown -> cwd check.)
+  if ([...gitDirRaws, ...workTreeRaws].some((r) => unresolvedValue(r.v, r.lit, ctx))) refused = true;
+  for (const c of [...configs, ...wtConfigs]) {
+    if (!mayBeWorkTreeKey(c.key)) continue;
+    if (DYNAMIC.test(c.key)) { refused = true; continue; }
+    if (!c.noValue && unresolvedValue(c.lit ? c.value : expandVars(c.value, ctx), c.lit === true, ctx)) refused = true;
   }
   // every value named is resolved, so one that cannot be (`--git-dir=$G`, a relative path with no known directory) is unknown, not absent
   const resolveOne = (r) => (r.lit ? litJoin(d, r.v) : joinDir(d, r.v, ctx));

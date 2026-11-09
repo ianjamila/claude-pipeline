@@ -25,6 +25,13 @@ const mark = (root, pid, pr = 12) => {
 const deadPid = () => spawnSync(process.execPath, ['-e', '']).pid;
 const wiring = realGitWiring();
 const decide = (command, cwd) => evaluateGitCommand(command, { cwd, ...wiring });
+// R9: a mutating verb whose git dir / work tree value is not fully resolved is refused outright ("cannot be read one way"); one that is resolved and
+// reaches a job's checkout gets the job's own message. Either way it is a deny: the tests that name a command in both groups accept the two reasons.
+const jobOrRefused = (command, cwd) => {
+  const v = decide(command, cwd);
+  assert.equal(v.decision, 'deny', command);
+  assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout|cannot be read one way/, command);
+};
 
 test('a live job blocks mutating git in its checkout: cwd, -C and cd', () => {
   const root = fakeRepo();
@@ -328,15 +335,14 @@ test('R3-B1: a target that cannot be resolved is refused while the session\'s ow
   for (const command of [
     'git -C $TARGET reset --hard',
     'git -C "$(pwd)/.." checkout x',
-    'git --git-dir=$G checkout x',
-    'GIT_DIR=$G git checkout x',
     'cd $TARGET && git checkout x',
-    'GIT_WORK_TREE=$W git checkout x',
   ]) {
     const v = decide(command, root);
     assert.equal(v.decision, 'deny', command);
     assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
   }
+  // (R9: a --git-dir / GIT_DIR / GIT_WORK_TREE value that is not resolved is not the "unknown -> cwd" check any more: refused outright, see R9)
+  for (const command of ['git --git-dir=$G checkout x', 'GIT_DIR=$G git checkout x', 'GIT_WORK_TREE=$W git checkout x']) r8Refused(command, root);
   // (R8-F2: a selector exported twice has no value to read: refused outright, whoever owns the session's checkout; it used to be an "unknown" cwd check)
   const twice = decide('export GIT_DIR=/a/.git; export GIT_DIR=/b/.git; git checkout x', root);
   assert.equal(twice.decision, 'deny');
@@ -352,9 +358,9 @@ test('R3-B1: the same commands are allowed with no marker, a dead marker, or whe
     `git -C ${fwd(other)} --work-tree=${fwd(root)} checkout x`,
     `GIT_WORK_TREE=${fwd(root)} git checkout x`,
     'git -C $TARGET reset --hard',
-    'GIT_DIR=$G git checkout x',
   ];
   for (const c of cmds) assert.equal(decide(c, other).decision, 'allow', `no marker: ${c}`);
+  r8Refused('GIT_DIR=$G git checkout x', other); // (R9: was allowed with no marker; an unresolved GIT_DIR is refused for a mutating verb, marker or not)
   mark(root, deadPid());
   for (const c of cmds) assert.equal(decide(c, other).decision, 'allow', `dead marker: ${c}`);
   mark(root, process.pid);
@@ -469,9 +475,7 @@ test('R4-F1: a core.worktree that cannot be resolved, --config-env and GIT_CONFI
     `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K GIT_CONFIG_VALUE_0=/elsewhere git -C ${at} reset --hard`,
     `GIT_CONFIG_PARAMETERS="'core.worktree=/elsewhere'" git -C ${at} reset --hard`,
   ]) {
-    const v = decide(command, root);
-    assert.equal(v.decision, 'deny', command);
-    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+    jobOrRefused(command, root);
   }
 });
 
@@ -480,14 +484,17 @@ test('R4-F1: the same commands are allowed with no marker, a dead marker, when r
   const other = fakeRepo();
   const cmds = [
     `git -C ${fwd(container)} -c core.worktree=../.worktrees/slug reset --hard`,
-    'git -c core.worktree=$W reset --hard',
-    'git --config-env=core.worktree=WT reset --hard',
     'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=/elsewhere git reset --hard',
   ]; // (run from a checkout no job owns, so an unknown target has nothing to fall back on)
+  // (R9: a core.worktree value / --config-env variable that is not resolved is refused for a mutating verb, with a marker or without one)
+  const unresolved = ['git -c core.worktree=$W reset --hard', 'git --config-env=core.worktree=WT reset --hard'];
   for (const c of cmds) assert.equal(decide(c, other).decision, 'allow', `no marker: ${c}`);
+  for (const c of unresolved) r8Refused(c, other);
   mark(job, deadPid());
   for (const c of cmds) assert.equal(decide(c, other).decision, 'allow', `dead marker: ${c}`);
+  for (const c of unresolved) r8Refused(c, other);
   mark(job, process.pid);
+  for (const c of unresolved) r8Refused(c, other);
   for (const c of [`git -C ${fwd(container)} -c core.worktree=../.worktrees/slug status`, 'git -c core.worktree=$W status', 'git --config-env=core.worktree=WT diff', 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=/elsewhere git log --oneline']) {
     assert.equal(decide(c, other).decision, 'allow', `read-only: ${c}`);
   }
@@ -541,9 +548,7 @@ test('R5-F1: a -c / --config-env KEY that is dynamic may be core.worktree: its v
     `WT=${wt} git --config-env=$K=WT reset --hard`,
     `WT=${wt} git --config-env "$(printf core.worktree)=WT" reset --hard`,
   ]) {
-    const v = decide(command, container);
-    assert.equal(v.decision, 'deny', command);
-    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+    jobOrRefused(command, container);
   }
 });
 
@@ -552,7 +557,8 @@ test('R5-F1: a dynamic key whose value is hidden in the substitution is an unkno
   mark(job, process.pid, 12);
   const command = `git -c "$(printf core.worktree=${fwd(job)})" reset --hard`;
   assert.equal(decide(command, job).decision, 'deny');
-  assert.equal(decide(command, container).decision, 'allow'); // nothing there to fall back on
+  r8Refused(command, container); // (R9: was allowed "nothing there to fall back on"; a key that is not resolved is refused for a mutating verb, not left to the cwd check)
+  assert.equal(decide(command.replace('reset --hard', 'status'), container).decision, 'allow');
 });
 
 test('R5-B1 / R5-F1: the same commands are allowed with no marker, a dead marker, when read-only, or when the value does not reach the job', () => {
@@ -563,13 +569,18 @@ test('R5-B1 / R5-F1: the same commands are allowed with no marker, a dead marker
     `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x GIT_CONFIG_KEY_1=core.worktree GIT_CONFIG_VALUE_1=${wt} git reset --hard`,
     `GIT_CONFIG_PARAMETERS="'core.worktree=${wt}'" git reset --hard`,
     `WT=${wt} git --config-env=core.worktree=WT reset --hard`,
+  ];
+  // (R9: a key that may be core.worktree and is not resolved is refused for a mutating verb, whatever the marker says)
+  const dynamicKeys = [
     `git -c "$(printf core.worktree)=${wt}" reset --hard`,
     `git -c core.work\${X:-}tree=${wt} reset --hard`,
     `WT=${wt} git --config-env=$K=WT reset --hard`,
   ];
   for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `no marker: ${c}`);
+  for (const c of dynamicKeys) r8Refused(c, container);
   mark(job, deadPid());
   for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `dead marker: ${c}`);
+  for (const c of dynamicKeys) r8Refused(c, container);
   mark(job, process.pid);
   for (const c of [
     `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${wt} git status`,
@@ -583,7 +594,6 @@ test('R5-B1 / R5-F1: the same commands are allowed with no marker, a dead marker
     `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${elsewhere} git reset --hard`,
     `GIT_CONFIG_PARAMETERS="'core.worktree=${elsewhere}'" git reset --hard`,
     `WT=${elsewhere} git --config-env=core.worktree=WT reset --hard`,
-    `git -c "$(printf core.worktree)=${elsewhere}" reset --hard`,
     `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=${wt} git reset --hard`,
     `GIT_CONFIG_PARAMETERS="'user.name=${wt}'" git reset --hard`,
     `WT=${wt} git --config-env=user.name=WT reset --hard`,
@@ -610,9 +620,7 @@ test('R6-B1: a GIT_CONFIG_VALUE_n / GIT_CONFIG_KEY_n / GIT_CONFIG_PARAMETERS / -
     `WT=${wt} TARGET=\${WT} git --config-env core.worktree=TARGET reset --hard`,
     `A=${wt} B=$A git --config-env=core.worktree=B checkout x`,
   ]) {
-    const v = decide(command, container);
-    assert.equal(v.decision, 'deny', command);
-    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+    jobOrRefused(command, container);
   }
 });
 
@@ -627,9 +635,7 @@ test('R6-B2: a literal core.worktree entry in GIT_CONFIG_PARAMETERS is a target 
     `GIT_CONFIG_PARAMETERS="'user.\${K}=x' 'core.worktree=${wt}'" git checkout x`,
     `GIT_CONFIG_PARAMETERS="'user.name=$USER' 'core.worktree=../.worktrees/slug'" git reset --hard`,
   ]) {
-    const v = decide(command, container);
-    assert.equal(v.decision, 'deny', command);
-    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+    jobOrRefused(command, container);
   }
 });
 
@@ -641,11 +647,14 @@ test('R6-B1 / R6-B2: the same commands are allowed with no marker, a dead marker
     `A=${wt} B=$A GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=\${B} git reset --hard`,
     `WT=${wt} GIT_CONFIG_PARAMETERS="'core.worktree=$WT'" git reset --hard`,
     `WT=${wt} TARGET=$WT git --config-env=core.worktree=TARGET reset --hard`,
-    `GIT_CONFIG_PARAMETERS="'user.name=$USER' 'core.worktree=${wt}'" git reset --hard`,
   ];
+  // (R9: a dynamic entry beside the literal core.worktree one leaves the list not fully resolved: refused, marker or not)
+  const dynamicEntry = `GIT_CONFIG_PARAMETERS="'user.name=$USER' 'core.worktree=${wt}'" git reset --hard`;
   for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `no marker: ${c}`);
+  r8Refused(dynamicEntry, container);
   mark(job, deadPid());
   for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `dead marker: ${c}`);
+  r8Refused(dynamicEntry, container);
   mark(job, process.pid);
   for (const c of [
     `WT=${wt} GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=$WT git status`,
@@ -659,12 +668,12 @@ test('R6-B1 / R6-B2: the same commands are allowed with no marker, a dead marker
     `WT=${elsewhere} GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=$WT git reset --hard`,
     `WT=${elsewhere} GIT_CONFIG_PARAMETERS="'core.worktree=$WT'" git reset --hard`,
     `WT=${elsewhere} TARGET=$WT git --config-env=core.worktree=TARGET reset --hard`,
-    `GIT_CONFIG_PARAMETERS="'user.name=$USER' 'core.worktree=${elsewhere}'" git reset --hard`,
     `WT=${wt} GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=$WT git reset --hard`,
     `WT=${wt} GIT_CONFIG_PARAMETERS="'user.name=$WT'" git reset --hard`,
     `WT=${wt} TARGET=$WT git --config-env=user.name=TARGET reset --hard`,
-    `GIT_CONFIG_PARAMETERS="'user.name=${wt}' 'user.email=$USER'" git reset --hard`,
   ]) assert.equal(decide(c, container).decision, 'allow', `elsewhere: ${c}`);
+  // (R9: any `$` left in the list, even in an entry that is not core.worktree, leaves it not fully resolved: refused for a mutating verb)
+  r8Refused(`GIT_CONFIG_PARAMETERS="'user.name=${wt}' 'user.email=$USER'" git reset --hard`, container);
 });
 
 test('R6-B1: GIT_WORK_TREE / GIT_DIR prefix values read the prefix assignments before them', () => {
@@ -685,9 +694,7 @@ test('R6-B1: GIT_WORK_TREE / GIT_DIR prefix values read the prefix assignments b
     `G=${wt}/.git GIT_DIR=$G git -C ${at} commit -m x`,
     `WT=${wt} GIT_WORK_TREE=$WT git -C ${at} reset --hard`,
   ]) {
-    const v = decide(command, container);
-    assert.equal(v.decision, 'deny', command);
-    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+    jobOrRefused(command, container);
   }
   // R4-B1 ordering: a relative value is resolved against the directory the -C options produce
   assert.equal(decide(`W=.worktrees/slug GIT_WORK_TREE=$W git reset --hard`, container).decision, 'deny');
@@ -701,11 +708,14 @@ test('R6-B1: the same GIT_WORK_TREE / GIT_DIR commands are allowed with no marke
     `WT=${wt} GIT_WORK_TREE=$WT git reset --hard`,
     `A=${wt} B=$A GIT_WORK_TREE=\${B} git checkout x`,
     `G=${wt}/.git GIT_DIR=$G git reset --hard`,
-    `env G=${wt}/.git GIT_DIR=$G git reset --hard`,
   ];
+  // (R9: the `$G` of an env word is the shell's own, which the line never set: the value is not fully resolved, so it is refused, marker or not)
+  const envWord = `env G=${wt}/.git GIT_DIR=$G git reset --hard`;
   for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `no marker: ${c}`);
+  r8Refused(envWord, container);
   mark(job, deadPid());
   for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `dead marker: ${c}`);
+  r8Refused(envWord, container);
   mark(job, process.pid);
   for (const c of [
     `WT=${wt} GIT_WORK_TREE=$WT git status`,
@@ -739,11 +749,8 @@ const r7Setup = () => {
   return { container, job, at: fwd(container), wt: fwd(job), elsewhere: fwd(fakeRepo()), elsewhere2: fwd(fakeRepo()) };
 };
 const r7Verbs = ['git reset --hard', 'git checkout x'];
-const r7Denied = (command, cwd) => {
-  const v = decide(command, cwd);
-  assert.equal(v.decision, 'deny', command);
-  assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
-};
+// (R9: a candidate set that is not fully resolved is refused before the job lookup, so a command that used to reach the job through one gets the refusal message)
+const r7Denied = (command, cwd) => jobOrRefused(command, cwd);
 
 test('R7-B1: a name assigned twice in the prefix is both values, whichever comes last', () => {
   const { container, job, at, wt, elsewhere } = r7Setup();
@@ -793,10 +800,16 @@ test('R7: the same commands are allowed with no marker, a dead marker, when read
     `${k.before(dir)}env ${k.v}=${b} ${k.use(`$${k.v}`)} git reset --hard`,
     `${k.before(dir)}${k.v}=${a} ${k.use(`'$${k.v}'`)} git reset --hard`,
   ];
-  const cmds = R7_KINDS.flatMap((k) => shapes(k, k.target(wt), k.target(elsewhere), at));
+  const all = R7_KINDS.flatMap((k) => shapes(k, k.target(wt), k.target(elsewhere), at));
+  // (R9: the `$NAME` of an env word is the shell's own, which the line never set: not fully resolved, so refused for a mutating verb, marker or not)
+  const isEnv = (c) => / env [A-Z]/.test(c) || c.startsWith('env ');
+  const cmds = all.filter((c) => !isEnv(c));
+  assert.ok(all.length > cmds.length && cmds.length > 0);
   for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `no marker: ${c}`);
+  for (const c of all.filter(isEnv)) r8Refused(c, container);
   mark(job, deadPid());
   for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `dead marker: ${c}`);
+  for (const c of all.filter(isEnv)) r8Refused(c, container);
   mark(job, process.pid);
   for (const c of cmds) {
     assert.equal(decide(c.replace('git reset --hard', 'git status'), container).decision, 'allow', `read-only: ${c}`);
@@ -807,7 +820,9 @@ test('R7: the same commands are allowed with no marker, a dead marker, when read
   mkdirSync(join(plain, 'gd'));
   mark(plainJob, process.pid, 12);
   for (const k of R7_KINDS) {
-    for (const c of shapes(k, k.target(elsewhere), k.target(elsewhere2), fwd(plain))) assert.equal(decide(c, plain).decision, 'allow', `elsewhere: ${c}`);
+    for (const c of shapes(k, k.target(elsewhere), k.target(elsewhere2), fwd(plain))) {
+      if (isEnv(c)) r8Refused(c, plain); else assert.equal(decide(c, plain).decision, 'allow', `elsewhere: ${c}`);
+    }
   }
 });
 
@@ -981,11 +996,12 @@ test('R8: refusal applies to a mutating verb only, and plain or single-piece val
   for (const c of [
     `GIT_WORK_TREE=${elsewhere} git reset --hard`,
     `WT=${elsewhere} GIT_WORK_TREE=$WT git reset --hard`,
-    `WT=${elsewhere} GIT_WORK_TREE=$WT$X git reset --hard`,
     `WT=${elsewhere} GIT_WORK_TREE='$WT' git reset --hard`,
     `git --work-tree=${elsewhere} reset --hard`,
     `A=${elsewhere} B=$A C=$B GIT_WORK_TREE=$C git reset --hard`,
   ]) assert.equal(decide(c, plain).decision, 'allow', c);
+  // (R9: `$X` is a name the line never set, so the product is not fully resolved: refused for a mutating verb even where it points elsewhere)
+  r8Refused(`WT=${elsewhere} GIT_WORK_TREE=$WT$X git reset --hard`, plain);
   // no marker: a plain command is allowed, whatever it holds
   const { container: free } = containerWithJob();
   assert.equal(decide(`GIT_WORK_TREE=${elsewhere} git reset --hard`, free).decision, 'allow');
@@ -1077,4 +1093,99 @@ test('R8-F2: a GIT_* selector assigned or exported more than once on the line is
     `export GIT_DIR=/a/.git; GIT_DIR=/b/.git; GIT_DIR=${elsewhere}/.git git checkout x`,
   ]) assert.equal(decide(c, container).decision, 'allow', c);
   assert.equal(decide(`export GIT_WORK_TREE=/a; export GIT_WORK_TREE=/b; GIT_WORK_TREE=${wt} git reset --hard`, container).decision, 'deny');
+});
+
+// ---- review round 9 (R9-B1, R9-F1): a git dir / work tree / core.worktree value that is not FULLY resolved is refused for a mutating verb ----
+// Bash expands the words of a command before its own prefix assignments apply (`X=1 echo $X` prints nothing) and an unset name is the empty string,
+// so a value that holds a name the line shows as unset or set later is not one the resolver can read; only `-C` / `cd` keep the "unknown -> cwd" check.
+
+const r9Layout = () => {
+  const { container, job } = containerWithJob(); // the unowned container; the job owns <container>/.worktrees/slug
+  const wt = fwd(job);
+  mark(job, process.pid, 12);
+  return { container, job, wt, safe: `${wt}-safe` };
+};
+// the mutating forms of every selector, each with `$X` (unset on the line, or set only by the command's own prefix) inside the value
+const r9Shapes = (wt, verb = 'reset --hard') => [
+  `GIT_WORK_TREE=${wt}$X X=-safe git ${verb}`, // R9-B1
+  `GIT_WORK_TREE=${wt}$X git ${verb}`,
+  `GIT_DIR=${wt}$X/.git X=-safe git ${verb}`,
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${wt}$X X=-safe git ${verb}`,
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${wt}$X git ${verb}`,
+  `GIT_CONFIG_PARAMETERS="'core.worktree=${wt}$X'" X=-safe git ${verb}`,
+  `env GIT_WORK_TREE=${wt}$X X=-safe git ${verb}`,
+  `X=-safe git --work-tree=${wt}$X ${verb}`, // R9-F1
+  `X=-safe git --work-tree ${wt}$X ${verb}`,
+  `X=-safe git --git-dir=${wt}$X/.git ${verb}`,
+  `X=-safe git --git-dir ${wt}$X/.git ${verb}`,
+  `X=-safe git -c core.worktree=${wt}$X ${verb}`,
+  `X=-safe git --config-env=core.worktree=WT ${verb}`,
+  `git --work-tree=${wt}$X ${verb}`,
+  `git -c core.worktree=${wt}$X ${verb}`,
+  // `${X:-…}` forms the expander does not handle
+  `GIT_WORK_TREE=\${X:-${wt}} git ${verb}`,
+  `GIT_DIR=\${X:-${wt}/.git} git ${verb}`,
+  `git --work-tree=\${X:-${wt}} ${verb}`,
+  `git --git-dir=\${X:-${wt}/.git} ${verb}`,
+  `git -c core.worktree=\${X:-${wt}} ${verb}`,
+  // a substitution as the selector, from an unowned cwd
+  `GIT_DIR=$(git rev-parse --git-dir) git ${verb}`,
+  `GIT_WORK_TREE=$(pwd) git ${verb}`,
+  `git --git-dir="$(git rev-parse --git-dir)" ${verb}`,
+  `git --work-tree "$(pwd)" ${verb}`,
+];
+
+test('R9-B1 / R9-F1: a selector value not fully resolved is refused for a mutating verb, with a marker or without one', () => {
+  const { container, job, wt, safe } = r9Layout();
+  const { container: free } = containerWithJob(); // no marker anywhere
+  for (const verb of ['reset --hard', 'checkout x', 'commit -m x']) {
+    for (const c of r9Shapes(wt, verb)) {
+      r8Refused(c, container); // (unowned cwd: the owned checkout is named only through the unresolved value)
+      r8Refused(c, job);
+      r8Refused(c, free);
+    }
+  }
+  // the unset reading is a candidate of its own: `/owned` beside `/owned-safe` (R9-B1, in the candidate set itself)
+  const ctx = { vars: Object.create(null), unsureVars: new Set(), tainted: new Set() };
+  const cmd = `GIT_WORK_TREE=${wt}$X X=-safe git reset --hard`;
+  const cands = resolvePrefixEnv(simpleCommands(cmd, {})[0].env, ctx, cmd).get('GIT_WORK_TREE');
+  assert.deepEqual(cands.list.map((c) => c.v).sort(), [wt, safe].sort());
+  assert.equal(cands.unknown, true);
+});
+
+test('R9: read-only verbs, the -C / cd fallback and fully resolved line-local forms are not refused', () => {
+  const { container, job, wt } = r9Layout();
+  const other = fakeRepo();
+  for (const c of r9Shapes(wt, 'status')) assert.equal(decide(c, container).decision, 'allow', `read-only: ${c}`);
+  for (const c of r9Shapes(wt, 'log --oneline')) assert.equal(decide(c, job).decision, 'allow', `read-only (owned cwd): ${c}`);
+  // -C with a substitution keeps the unknown -> cwd check: read-only always, a mutating verb only where the cwd is the owned checkout
+  assert.equal(decide('git -C "$(git rev-parse --show-toplevel)" status', container).decision, 'allow');
+  assert.equal(decide('git -C "$(git rev-parse --show-toplevel)" checkout x', container).decision, 'allow'); // unowned cwd, no marker there
+  assert.equal(decide('git -C "$(git rev-parse --show-toplevel)" checkout x', other).decision, 'allow');
+  assert.equal(decide('cd "$(git rev-parse --show-toplevel)" && git checkout x', container).decision, 'allow');
+  const owned = decide('git -C "$(git rev-parse --show-toplevel)" checkout x', job);
+  assert.equal(owned.decision, 'deny'); // (the session sits in the owned checkout: the cwd check, not the refusal)
+  assert.match(owned.reason, /job \(pid \d+, PR #12\) owns this checkout/);
+  // fully resolved line-local forms: unchanged
+  const elsewhere = fwd(other);
+  for (const c of [
+    `WT=${elsewhere} GIT_WORK_TREE=$WT git reset --hard`,
+    `W=${elsewhere}; git --work-tree=$W reset --hard`,
+    `W=${elsewhere}; git --git-dir=$W/.git checkout x`,
+    `W=${elsewhere}; git -c core.worktree=$W reset --hard`,
+    `W=${elsewhere}; X=-safe git --work-tree=$W reset --hard`,
+    `GIT_WORK_TREE=${elsewhere} git reset --hard`,
+    `GIT_DIR=${elsewhere}/.git git checkout x`,
+    `git -C ${elsewhere} reset --hard`,
+  ]) assert.equal(decide(c, container).decision, 'allow', c);
+  // and a resolved one that does reach the owned checkout is still the job's deny
+  for (const c of [`W=${wt}; git --work-tree=$W reset --hard`, `WT=${wt} GIT_WORK_TREE=$WT git reset --hard`, `git --work-tree=${wt} reset --hard`]) r7Denied(c, container);
+});
+
+test('R9-F1: an earlier assignment on the line is what a command-line word reads, not the git command\'s own prefix', () => {
+  const { container, wt } = r9Layout();
+  // X=a on the line first: `$X` is `a` in the argument word (another name in the prefix changes nothing), so the target is /…/sluga: fully resolved, not the job's
+  assert.equal(decide(`X=a; Z=-safe git --work-tree=${wt}$X reset --hard`, container).decision, 'allow');
+  // the name set on the line only by the command's own prefix is unset when the word expands: refused
+  r8Refused(`X=-safe git --work-tree=${wt}$X reset --hard`, container);
 });
