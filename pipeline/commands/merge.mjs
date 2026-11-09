@@ -561,7 +561,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     const job = readMergeJob(root);
     if (job !== null && job.pid !== process.pid) {
       if (isPidAlive(job.pid)) add('merge-job-busy', `a \`P merge --owner-go\` job (pid ${job.pid}, PR #${job.pr}) owns this checkout: the real run refuses until it ends`);
-      else if (job.pr === pr) add('merge-job-dead', `an earlier \`P merge --owner-go\` job for #${pr} died holding this checkout (pid ${job.pid}); the real run first checks on GitHub whether it merged the PR or left auto-merge armed (and disables it) before anything else`);
+      else add('merge-job-dead', `an earlier \`P merge --owner-go\` job for #${job.pr}${job.pr === pr ? '' : ' (another PR)'} died holding this checkout (pid ${job.pid}); the real run first checks on GitHub whether it merged #${job.pr} or left auto-merge armed (and disables it) before anything else`);
     }
   }
   if (orphan !== null) add('hold-lift-orphan', `an earlier \`P merge --owner-go\` lifted needs-human hold ${orphan.hold} and died before it merged; the real run puts the label back first and refuses (the owner then says "merge" again, for the new hold)`);

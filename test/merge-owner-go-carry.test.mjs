@@ -10,7 +10,7 @@ import { MERGE_JOB_MARKER } from '../pipeline/lib/merge-job.mjs';
 import { runCarryLoop } from '../pipeline/lib/owner-go-carry-loop.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { run as mergeRun } from '../pipeline/commands/merge.mjs';
-import { PR, reviewState } from './helpers/gate-env.mjs';
+import { MERGE_SHA, PR, reviewState } from './helpers/gate-env.mjs';
 import { answer, blocker, holdFiles, holdYml, seq } from './helpers/merge-hold-env.mjs';
 
 const world = (t, opts) => { const w = carryWorld(opts); t.after(() => w.cleanup()); return w; };
@@ -325,7 +325,7 @@ test('R1-B1: a dead job\'s auto-merge that cannot be confirmed off refuses the w
   assert.deepEqual(w.mergeCalls(), []);
 });
 
-test('R1-B1: a LIVE marker of another process refuses busy before any evaluation; a dead marker of another PR is left alone', async (t) => {
+test('R1-B1: a LIVE marker of another process refuses busy before any evaluation; a dead marker of another PR with nothing armed does not block this PR (R2-F3 reconciles it)', async (t) => {
   const live = world(t);
   go(t, live);
   writeJobMarker(live, process.ppid);
@@ -460,4 +460,59 @@ test('R1-B2: a resume whose review-complete fails again refuses with the manual 
   assert.equal(r.exitCode, 1);
   assert.match(r.output.reasons.join(), /P review-complete --pr 12/);
   assert.deepEqual(w.mergeCalls(), []);
+});
+
+// ---- review round 2 (R2-F3, #206): a dead marker of ANOTHER PR is reconciled too, never silently overwritten ----
+const OTHER = 99;
+const OTHER_MERGE_SHA = 'e'.repeat(40);
+const armedFor = (w, armed, n = OTHER) => ({ ...w.gh, prView: (m, f) => { const v = w.gh.prView(m, f); return m === n && f.includes('autoMergeRequest') && armed.v ? { ...v, autoMergeRequest: { enabledAt: 'x' } } : v; } });
+
+test('R2-F3: a dead marker of another PR that armed auto-merge is disarmed through THAT PR, the marker goes, and this PR carries on', async (t) => {
+  const w = world(t);
+  go(t, w);
+  writeJobMarker(w, DEAD_PID, OTHER);
+  const armed = { v: true };
+  const disabled = [];
+  const r = await w.merge({ gh: armedFor(w, armed), disableAuto: ({ pr } = {}) => { disabled.push(pr); armed.v = false; return true; } });
+  assert.equal(r.exitCode, 0, text(r));
+  assert.deepEqual(disabled, [OTHER]);
+  assert.equal(r.output.mergeSha !== undefined && r.output.merged === true, true, 'this PR still merges');
+  assert.equal(existsSync(join(w.root, MERGE_JOB_MARKER)), false, 'the stale marker is gone');
+});
+
+test('R2-F3: the other PR\'s auto-merge cannot be confirmed off: the run is refused naming that PR, nothing merges, the marker stays', async (t) => {
+  const w = world(t);
+  go(t, w);
+  writeJobMarker(w, DEAD_PID, OTHER);
+  const r = await w.merge({ gh: armedFor(w, { v: true }), disableAuto: () => false });
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.error, 'carry-disarm');
+  assert.match(r.output.reasons.join(), new RegExp(`#${OTHER}\\b`));
+  assert.deepEqual(w.mergeCalls(), []);
+  assert.equal(existsSync(join(w.root, MERGE_JOB_MARKER)), true, 'the evidence is kept');
+});
+
+test('R2-F3: a dead marker of another PR that is already MERGED is dropped and this PR carries on', async (t) => {
+  const w = world(t);
+  go(t, w);
+  writeJobMarker(w, DEAD_PID, OTHER);
+  const gh = { ...w.gh, prView: (n, f) => (n === OTHER && f.includes('mergeCommit') ? { state: 'MERGED', mergeCommit: { oid: OTHER_MERGE_SHA }, autoMergeRequest: null } : w.gh.prView(n, f)) };
+  const r = await w.merge({ gh });
+  assert.equal(r.exitCode, 0, text(r));
+  assert.notEqual(OTHER_MERGE_SHA, MERGE_SHA, 'the two merge SHAs must differ for this test to bite');
+  assert.equal(r.output.mergeSha, MERGE_SHA, 'this PR reports its own merge, not the other PR\'s');
+  assert.equal(existsSync(join(w.root, MERGE_JOB_MARKER)), false);
+});
+
+test('R2-F3: the dry run reports another PR\'s dead job marker as a blocker naming it, read-only', async (t) => {
+  const w = world(t);
+  writeJobMarker(w, DEAD_PID, OTHER);
+  let disarmed = 0;
+  const r = await mergeRun(['--pr', String(PR), '--owner-go', '--dry-run', '--repo', w.root], { cwd: w.root, env: w.env, carry: { gh: w.gh, home: w.home, disableAuto: () => { disarmed += 1; return true; } } });
+  assert.equal(r.output.wouldMerge, false);
+  const b = r.output.blockers.find((x) => x.kind === 'merge-job-dead');
+  assert.ok(b, text(r));
+  assert.match(b.detail ?? b.reason ?? JSON.stringify(b), new RegExp(`#${OTHER}\\b`));
+  assert.equal(disarmed, 0);
+  assert.equal(existsSync(join(w.root, MERGE_JOB_MARKER)), true);
 });

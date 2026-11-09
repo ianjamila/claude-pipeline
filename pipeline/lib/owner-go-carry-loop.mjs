@@ -56,15 +56,33 @@ export async function reconcileDeadJob({ gh, pr, root, config, env, disable, aba
 }
 
 /**
+ * R2-F3: the dead marker belongs to ANOTHER PR (`dead`): reconcile that PR the same way, so an auto-merge it left armed is disarmed (or the run refuses naming it) instead of the marker being overwritten.
+ * A merge of that PR is only logged: it is not this run's merge.
+ * @returns {Promise<null | {stop: string, code: string}>}
+ */
+export async function reconcileOtherPrMarker({ gh, marker, root, config, env, disable, abandon, log = () => {} }) {
+  const other = marker.pr;
+  const r = await reconcileDeadJob({ gh, pr: other, root, config, env, disable, abandon, log });
+  if (r?.stop) return { stop: `The dead merge job of PR #${other} (the marker in this checkout): ${r.stop}`, code: r.code };
+  log(r?.merged ? `PR #${other}, whose merge job died here, is already merged` : `reconciled the dead merge job of PR #${other}`);
+  return null;
+}
+
+/**
  * The top of the --owner-go route (R1-B1). A live marker of another process owns this checkout: busy. A dead marker for this PR is reconciled (reconcileDeadJob) and, once GitHub is settled, removed.
- * A dead marker of another PR is not this PR's to reconcile and is left for the next claim to replace.
+ * A dead marker of another PR is reconciled the same way through that PR (R2-F3, reconcileOtherPrMarker) before this PR's job may replace it.
  * @returns {Promise<null | {busy: string} | {merged: true, mergeSha: string|null, note: string} | {stop: string, code: string}>} null: go on.
  */
 export async function recoverDeadJob({ gh, pr, root, config, env, disable, abandon, log }) {
   const marker = readMarker(root);
   if (marker === null) return null;
   if (marker.pid !== process.pid && isPidAlive(marker.pid)) return { busy: `another merge job (pid ${marker.pid}, PR #${marker.pr}) already owns this checkout` };
-  if (marker.pr !== pr) return null;
+  if (marker.pr !== pr) {
+    const other = await reconcileOtherPrMarker({ gh, marker, root, config, env, disable, abandon, log });
+    if (other?.stop) return other;
+    releaseCheckout({ root, marker });
+    return null;
+  }
   const dead = await reconcileDeadJob({ gh, pr, root, config, env, disable, abandon, log });
   if (dead?.stop) return dead;
   releaseCheckout({ root, marker }); // (GitHub is settled: merged, or open with nothing queued)
@@ -105,6 +123,10 @@ export async function runCarryLoop(a) {
     });
     // §11.10: a previous job for this PR died holding the checkout: GitHub is reconciled before anything else (merged? auto-merge queued?).
     // (commands/merge.mjs already did this at the top of the route, so this only catches a job that died in between.)
+    if (claim.replaced && claim.replaced.pr !== pr) { // R2-F3: only reachable when the marker died after the route's own check; the claim has already replaced it
+      const other = await reconcileOtherPrMarker({ gh, marker: claim.replaced, root, config, env, disable: seam.disableAuto, abandon: seam.abandon, log });
+      if (other) return stop(other.stop, { code: other.code });
+    }
     if (claim.replaced && claim.replaced.pr === pr) {
       const dead = await reconcileDeadJob({ gh, pr, root, config, env, disable: seam.disableAuto, abandon: seam.abandon, log });
       if (dead?.merged) return mergedOut(dead.mergeSha, { note: dead.note });
