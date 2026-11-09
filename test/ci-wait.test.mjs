@@ -634,6 +634,22 @@ test('a superseded failure whose newer attempt is not running and never reports 
   assert.equal(r.output.checks[0].state, 'superseded');
 });
 
+test('a superseded-only absence is not held by a pre-ready run in progress: failed at --appear-timeout, no heldBy (ready-era-only holder rule) (#195, #196)', async () => {
+  const s = sim({
+    classic: present('ci'), timeline: readyTimeline,
+    checkRuns: [cr('ci', 'failure', oldAttempt)],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: '2026-01-01T12:05:00Z', run_attempt: 2 }],
+    headRuns: [attempt2('completed'), { id: 77, name: 'CI', status: 'in_progress', created_at: PRE, run_started_at: PRE, html_url: 'https://github.example/actions/77' }],
+  });
+  const r = await s.run();
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.verdict, 'failed', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 300_000);
+  assert.match(r.output.message, /ci=fail .*superseded by a newer attempt that never reported/);
+  assert.equal(r.output.checks[0].state, 'superseded');
+  assert.equal(r.output.heldBy, undefined, 'a pre-ready run holds only a MISSING identity');
+});
+
 test('a check run first seen pending and later completed refreshes the suite once: a re-run whose run read lagged is not judged by the stale start (#176, #168 R4-F1)', async () => {
   const s = sim({
     classic: present('ci', 'other'), timeline: readyTimeline,

@@ -23,7 +23,7 @@
 // head is still queued / in progress (reported as `heldBy`, with `predatesReady`); only --timeout bounds that. Which runs hold
 // depends on what is absent (findHolder): a run created or (re-)started at or after the ready event always holds; while an
 // identity is `missing` (no producer at all) a run that started before ready holds too, if it could produce that identity (PR #196:
-// the draft-era push already ran the tests and its aggregate appeared 20 min after ready); stale-skip / stale-fail alone need a
+// the draft-era push already ran the tests and its aggregate appeared 20 min after ready); stale-skip / stale-fail / superseded alone need a
 // ready-era run, since a draft-era run's result would be stale as well.
 // A failure read from a commit status, and an absence verdict past --appear-timeout, are each confirmed by one more read of the
 // head's check runs and statuses before they are reported (#159, #168).
@@ -253,7 +253,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   //    the tests, and a needs:-gated aggregate is created only when its shards finish, long after ready), but only a run that could
   //    produce a missing identity: for one pinned to an app, a check run of that app or (15368) a workflow run; an unpinned one
   //    accepts any run. A run whose age cannot be read holds there as well (predatesReady: null). A ready-era run is preferred.
-  //  - With no missing identity (only stale-skip / stale-fail), only the ready-era rule applies: a draft-era run's result is stale too.
+  //  - With no missing identity (only stale-skip / stale-fail / superseded), only the ready-era rule applies: a draft-era run's result is stale too.
   const ACTIONS_APP_ID = 15368;
   const findHolder = async (obs, pr, missingIds) => {
     const readyAt = Date.parse(await getReadyAt(pr));
