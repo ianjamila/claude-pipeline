@@ -947,9 +947,10 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   const aliasConfig = g.configs.find((c) => c.key === `alias.${sub.toLowerCase()}`);
   if (ctx.aliasUnsure.has(`git:${sub.toLowerCase()}`)) return deny(`the git alias "${sub}" may have been (re)defined by a script that may or may not run, so what it expands to cannot be verified. Write the command out.`);
   // R11-F1: an alias given through environment config (GIT_CONFIG_KEY_n / VALUE_n, GIT_CONFIG_PARAMETERS) is one more definition of it; git ignores an
-  // alias that shadows a built-in command, so only another name can be defined by a key or value the guard cannot read
+  // alias that shadows a built-in command, so only another name can be defined by a key or value the guard cannot read. Command names are
+  // case-sensitive (alias names are not): `RESET` is not the built-in, so it is tested exactly as written
   const subName = sub.toLowerCase();
-  if (g.envAliasUnknown && !GIT_BUILTINS.has(subName)) return deny(`GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n may define the alias "${sub}" in a way that cannot be read here, so what it expands to cannot be verified. Write the command out.`);
+  if (g.envAliasUnknown && !GIT_COMPILED_BUILTINS.has(sub)) return deny(`GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n may define the alias "${sub}" in a way that cannot be read here, so what it expands to cannot be verified. Write the command out.`);
   const aliasDefs = [aliasConfig ? aliasConfig.value : ctx.gitAliases[subName], ...g.envAliases.filter((a) => a.name === subName).map((a) => a.value)].filter((a) => a !== undefined);
   if (aliasDefs.length && level < MAX_NESTING) {
     for (const alias of aliasDefs) {
@@ -962,7 +963,9 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
       }
       if (v) return v;
     }
-    return null;
+    // git tries a built-in (or an external git-<name>) before an alias, and ignores an alias that shadows one (`-c alias.reset=status reset --hard` resets),
+    // so what the alias expands to is not the whole answer: the command as written is checked too, whether or not git has a command of that name
+    // (fail closed; a name that is no verb the checks below know passes through them untouched)
   }
 
   if (sub === 'push' || sub === 'send-pack') { // send-pack is push without the remote configuration
@@ -982,13 +985,15 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   return null;
 }
 
-// R11-F1: git's own commands (an alias cannot shadow one): a name outside this list may be an alias a config source the guard cannot read defines
-const GIT_BUILTINS = new Set(('add am annotate apply archive bisect blame branch bundle cat-file check-attr check-ignore check-ref-format checkout checkout-index cherry cherry-pick ' +
+// R11-F1: the commands compiled into git (git.c's commands[] table; an alias cannot shadow one): a name outside this list may be an alias a config
+// source the guard cannot read defines. Script / external commands (bisect, filter-branch, mergetool, refs, request-pull, send-email, submodule) are
+// left out on purpose: they may be absent, and a name left out is only denied (fail closed) when such a source exists
+const GIT_COMPILED_BUILTINS = new Set(('add am annotate apply archive blame branch bundle cat-file check-attr check-ignore check-ref-format checkout checkout-index cherry cherry-pick ' +
   'clean clone column commit commit-graph commit-tree config count-objects credential describe diff diff-files diff-index diff-tree difftool fast-export fast-import fetch ' +
-  'filter-branch fmt-merge-msg for-each-ref for-each-repo format-patch fsck gc grep hash-object help hook index-pack init interpret-trailers log ls-files ls-remote ' +
-  'ls-tree maintenance mailinfo mailsplit merge merge-base merge-file merge-index merge-tree mergetool mktag mktree multi-pack-index mv name-rev notes pack-objects ' +
-  'pack-refs patch-id prune prune-packed pull push range-diff read-tree rebase receive-pack reflog refs remote repack replace request-pull rerere reset restore rev-list ' +
-  'rev-parse revert rm send-email send-pack shortlog show show-branch show-index show-ref sparse-checkout stash status stripspace submodule switch symbolic-ref tag ' +
+  'fmt-merge-msg for-each-ref for-each-repo format-patch fsck gc grep hash-object help hook index-pack init interpret-trailers log ls-files ls-remote ' +
+  'ls-tree maintenance mailinfo mailsplit merge merge-base merge-file merge-index merge-tree mktag mktree multi-pack-index mv name-rev notes pack-objects ' +
+  'pack-refs patch-id prune prune-packed pull push range-diff read-tree rebase receive-pack reflog remote repack replace rerere reset restore rev-list ' +
+  'rev-parse revert rm send-pack shortlog show show-branch show-index show-ref sparse-checkout stash status stripspace switch symbolic-ref tag ' +
   'unpack-file unpack-objects update-index update-ref update-server-info upload-archive upload-pack var verify-commit verify-pack verify-tag version whatchanged worktree write-tree').split(' '));
 
 // ---- a running `P merge --owner-go` job owns its checkout (lib/merge-job.mjs) -----------------------------------

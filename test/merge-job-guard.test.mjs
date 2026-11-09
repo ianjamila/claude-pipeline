@@ -1323,3 +1323,48 @@ test('R11-F1: environment aliases that are harmless, or that no job owns, stay a
   mark(job, process.pid, 12);
   assert.equal(decide(cfg('alias.s', 'reset', 'git s --hard'), free).decision, 'allow');
 });
+
+// R11-F1 follow-through: git runs a built-in before it looks at an alias (an alias that shadows one is ignored), and command names are case-sensitive
+// (alias lookup is not), so an alias on a built-in's name must not hide the built-in's own checks, and `RESET` is an alias name, not `reset`
+test('R11-F1 follow-through: an alias named like a built-in does not hide the built-in\'s own checks', () => {
+  const { container, job } = containerWithJob();
+  const free = containerWithJob().container;
+  const at = fwd(job);
+  mark(job, process.pid, 12);
+  for (const c of [
+    'git -c alias.reset=status reset --hard',
+    'git -c alias.Reset=status reset --hard',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.reset GIT_CONFIG_VALUE_0=status git reset --hard',
+    `GIT_CONFIG_PARAMETERS="'alias.reset=status'" git reset --hard`,
+    `export GIT_CONFIG_PARAMETERS="'alias.reset=status'"; git reset --hard`,
+    'git config alias.reset status && git reset --hard',
+    'git -c alias.checkout=status checkout other',
+  ]) jobDenied(c, job);
+  // the alias still runs when it is the name that is written and git has no command of that name
+  for (const c of [
+    `git -c alias.reset='!git -C ${at} reset --hard' RESET`,
+    `GIT_CONFIG_PARAMETERS="'alias.reset=!git -C ${at} reset --hard'" git RESET`,
+  ]) for (const cwd of [container, free, job]) jobDenied(c, cwd);
+  // an alias source that cannot be read: a name that is not (exactly, in case) a compiled-in command may be an alias
+  for (const c of ['GIT_CONFIG_PARAMETERS=$P git RESET --hard', 'GIT_CONFIG_PARAMETERS=$P git Status', 'GIT_CONFIG_PARAMETERS=$P git send-email', 'GIT_CONFIG_PARAMETERS=$P git filter-branch',
+    'GIT_CONFIG_PARAMETERS=$P git mergetool', 'GIT_CONFIG_PARAMETERS=$P git request-pull']) {
+    const v = decide(c, job);
+    assert.equal(v.decision, 'deny', c);
+    assert.match(v.reason, ALIAS_UNSURE, c);
+  }
+});
+
+test('R11-F1 follow-through: an alias named like a built-in that is harmless, or that no job owns, stays allowed', () => {
+  const { job } = containerWithJob();
+  const free = containerWithJob().container;
+  mark(job, process.pid, 12);
+  for (const c of [
+    'git -c alias.status=log status',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.status GIT_CONFIG_VALUE_0=log git status',
+    'GIT_CONFIG_PARAMETERS=$P git status',
+    'GIT_CONFIG_PARAMETERS=$P git diff',
+    'git -c alias.reset=status status',
+  ]) assert.equal(decide(c, job).decision, 'allow', c);
+  // another checkout than the job's: the built-in is judged as written
+  assert.equal(decide('git -c alias.reset=status reset --hard', free).decision, 'allow');
+});
