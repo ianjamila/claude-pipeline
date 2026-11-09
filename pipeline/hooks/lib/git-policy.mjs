@@ -940,6 +940,10 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
     return deny('GIT_DIR was assigned more than once on this line, so which repository this command acts on cannot be verified. Assign it once, or use -C / --git-dir.');
   }
 
+  // owner rule: while a `P merge --owner-go` job runs, git shortcuts and commands git does not compile in are refused (before any alias is expanded)
+  const refusal = shortcutVerdict(sub, args, g, ctx);
+  if (refusal) return refusal;
+
   // aliases defined on this very line (`git config alias.p push && git p …`, `git -c alias.p=push p …`)
   const aliasConfig = g.configs.find((c) => c.key === `alias.${sub.toLowerCase()}`);
   if (ctx.aliasUnsure.has(`git:${sub.toLowerCase()}`)) return deny(`the git alias "${sub}" may have been (re)defined by a script that may or may not run, so what it expands to cannot be verified. Write the command out.`);
@@ -1058,6 +1062,71 @@ function mergeJobReadOnly(verb, args, words) {
 function mergeJobDeny(job, what) {
   return deny(`a \`P merge --owner-go\` job (pid ${job.pid}, PR #${job.pr}) owns this checkout until it ends, so ${what} is refused here; wait for it or stop it (kill ${job.pid}). Read-only git (status, log, diff, show, fetch) and \`P …\` commands still work.`);
 }
+function jobAtDir(dir, ctx) {
+  if (dir === null) return null;
+  try { return memoLookup(ctx, ['mergejob', dir], () => ctx.mergeJobOf(dir)) ?? null; } catch { return null; }
+}
+// Every checkout of the repository holding `dir`: the main checkout and each linked worktree (`<common git dir>/worktrees/*/gitdir` names `<worktree>/.git`).
+// Read through the ctx readers (tests fake them); [] when `dir` is in no repository. Memoized per line.
+const MAX_SIBLINGS = 1000;
+function repoCheckouts(dir, ctx) {
+  if (dir === null) return [];
+  try {
+    return memoLookup(ctx, ['siblings', dir], () => {
+      const gd = discoverGitDir(dir, ctx);
+      if (gd === null) return [];
+      let common = gd;
+      const cd = ctx.readText(path.join(gd, 'commondir'));
+      if (typeof cd === 'string' && cd.trim() !== '') common = path.resolve(gd, cd.trim());
+      else if (path.basename(path.dirname(gd)) === 'worktrees') common = path.dirname(path.dirname(gd));
+      const out = new Set();
+      if (path.basename(common) === '.git') out.add(path.dirname(common));
+      const wtDir = path.join(common, 'worktrees');
+      const names = ctx.readDir(wtDir);
+      if (Array.isArray(names)) {
+        for (const n of names.slice(0, MAX_SIBLINGS)) {
+          const text = ctx.readText(path.join(wtDir, n, 'gitdir'));
+          const line = typeof text === 'string' ? text.split(/\r?\n/)[0].trim() : '';
+          if (line !== '') out.add(path.dirname(path.resolve(wtDir, n, line)));
+        }
+      }
+      return [...out];
+    });
+  } catch { return []; }
+}
+// OWNER RULE. "A merge job is running" for this command: a live job owns the checkout of the directory it runs in, of any -C / --git-dir / --work-tree /
+// GIT_DIR / GIT_WORK_TREE / core.worktree target on the line (the candidates gitTargetCheckouts computes; an unreadable selector adds the session's own
+// directory), or of ANY OTHER worktree of the repository one of those belongs to. (A `!` alias body aimed at a different repository is the #207 residual.)
+function runningMergeJob(g, ctx) {
+  const targets = gitTargetCheckouts(g, ctx);
+  const dirs = [g.d, ...targets.dirs].filter((x) => x !== null);
+  if (g.d === null || g.targetUnknown || g.gitDirUnknown || g.selectorLost || g.refused || targets.unknown) dirs.push(ctx.cwd);
+  for (const dir of dirs) {
+    const job = jobAtDir(dir, ctx);
+    if (job) return job;
+  }
+  for (const dir of dirs) {
+    for (const sibling of repoCheckouts(dir, ctx)) {
+      const job = jobAtDir(sibling, ctx);
+      if (job) return job;
+    }
+  }
+  return null;
+}
+// Refuses ANY git command (read-only verbs too) while a merge job runs when it (a) defines or uses a shortcut: -c alias.*, any --config-env, a -c key built
+// from a variable, an environment config source that may define an alias (GIT_CONFIG_KEY_n / GIT_CONFIG_PARAMETERS), or an alias `git config` wrote earlier
+// on the line; or (b) runs a subcommand git does not compile in (exact case; it may be an alias from the user's own ~/.gitconfig).
+function shortcutVerdict(sub, args, g, ctx) {
+  const defined = g.shortcut || Object.keys(ctx.gitAliases).length > 0 || [...ctx.aliasUnsure].some((k) => k.startsWith('git:'));
+  const notBuiltin = !GIT_COMPILED_BUILTINS.has(sub);
+  if (!defined && !notBuiltin) return null;
+  const job = runningMergeJob(g, ctx);
+  if (!job) return null;
+  // (a verb the job refuses anyway in its own checkout keeps that message: `git reset --hard`, `git bisect`)
+  const own = mergeJobVerdict(sub, args, g, ctx);
+  if (own) return own;
+  return deny(`a merge job is running in ${job.root} (PR #${job.pr}): while it runs, git shortcuts (aliases, --config-env, -c alias.*, a setting name built from a variable) and commands that are not built into git are refused. Write the built-in command out, or wait for the merge to finish.`);
+}
 function mergeJobVerdict(sub, args, g, ctx) {
   const verb = sub.toLowerCase();
   const words = args.filter((a) => !a.startsWith('-'));
@@ -1066,10 +1135,7 @@ function mergeJobVerdict(sub, args, g, ctx) {
   if (!MERGE_JOB_VERBS.has(verb) && !worktreeMove) return null;
   if (verb === 'stash' && (second === 'list' || second === 'show')) return null;
   if (verb !== 'stash' && MERGE_JOB_VERBS.has(verb) && mergeJobReadOnly(verb, args, words)) return null;
-  const jobAt = (dir) => {
-    if (dir === null) return null;
-    try { return memoLookup(ctx, ['mergejob', dir], () => ctx.mergeJobOf(dir)) ?? null; } catch { return null; }
-  };
+  const jobAt = (dir) => jobAtDir(dir, ctx);
   // The first live job that owns any of `dirs`; `unknown` (a target that could not be resolved) adds the session's own directory,
   // the one checkout whose marker can still be read, so an unresolvable -C / GIT_DIR cannot be used to slip past it (fail closed).
   const jobOfAny = (dirs, unknown) => {
