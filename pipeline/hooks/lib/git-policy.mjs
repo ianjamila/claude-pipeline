@@ -532,20 +532,69 @@ function pushReading(args, dir, gitDir, ctx, configs) {
 
 // ---- git: global options, state tracking ------------------------------------------------------------------
 
-// R4-F1: does `name=envvar` (the text after --config-env) set core.worktree?
-const namesWorkTreeKey = (text) => /^core\.worktree(?:=|$)/i.test(String(text ?? '').trim());
-// R4-F1: GIT_CONFIG_KEY_n / GIT_CONFIG_PARAMETERS can set core.worktree like `-c` does. A key that names it, or one whose value cannot be
-// read here, is an unknown target (fail closed).
-function envConfigNamesWorkTree(env, ctx) {
+// R4-F1 / R5-F1: the key of a config entry that is, or at run time may be, core.worktree (a key still holding `$` or a backtick after
+// expansion could be anything)
+const mayBeWorkTreeKey = (key) => DYNAMIC.test(key) || /^core\.worktree$/i.test(key.trim());
+// What a variable named on the line may hold, for a use that cannot be told apart from "set by an earlier command" (R5-B1): the value of this
+// command's own prefix assignment, else the value an earlier assignment / export on the line gave it. null when none is readable.
+function candidateValue(env, ctx, name) {
+  if (typeof env[name] === 'string') return env[name];
+  return typeof ctx.vars[name] === 'string' ? ctx.vars[name] : null;
+}
+// R5-B1: the entries a GIT_CONFIG_PARAMETERS value holds: `'key=value' 'key'='value'` (git's own quoting), or plain `key=value` words
+function parseConfigParameters(text) {
+  const out = [];
+  const unq = (q) => q.replace(/'\\''/g, "'");
+  for (const m of String(text).matchAll(/'((?:[^']|'\\'')*)'(?:=(?:'((?:[^']|'\\'')*)'))?|(\S+)/g)) {
+    if (m[2] !== undefined) { out.push({ key: unq(m[1]), value: unq(m[2]) }); continue; }
+    const kv = unq(m[1] ?? m[3]);
+    const eq = kv.indexOf('=');
+    out.push({ key: eq < 0 ? kv : kv.slice(0, eq), value: eq < 0 ? '' : kv.slice(eq + 1) });
+  }
+  return out;
+}
+// R4-F1 / R5-B1: GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n and GIT_CONFIG_PARAMETERS can set core.worktree like `-c` does. A key that names it
+// is an unknown target (fail closed) AND its value is a target of its own, resolved like `-c core.worktree=`; a key or value that cannot
+// be read is unknown.
+function envConfigWorkTrees(env, ctx) {
+  const entries = [];
+  let unknown = false;
   const names = new Set([...Object.keys(env), ...assignedNames(ctx)].filter((k) => /^GIT_CONFIG_(?:KEY_\d+|PARAMETERS)$/i.test(k)));
   for (const name of names) {
     const v = envVar(env, ctx, name);
-    if (!v.known) return true;
-    if (typeof v.value !== 'string') continue;
-    const text = expandVars(v.value, ctx);
-    if (DYNAMIC.test(text) || /core\.worktree/i.test(text)) return true;
+    if (!v.known) unknown = true;
+    const text = candidateValue(env, ctx, name);
+    if (text === null) { unknown = true; continue; }
+    const expanded = expandVars(text, ctx);
+    if (/^GIT_CONFIG_PARAMETERS$/i.test(name)) {
+      if (DYNAMIC.test(expanded)) { unknown = true; continue; }
+      for (const e of parseConfigParameters(expanded)) {
+        if (!mayBeWorkTreeKey(e.key)) continue;
+        unknown = true;
+        entries.push({ key: 'core.worktree', value: e.value, noValue: false });
+      }
+      continue;
+    }
+    if (!mayBeWorkTreeKey(expanded)) continue;
+    unknown = true;
+    const value = candidateValue(env, ctx, name.replace(/KEY/i, 'VALUE'));
+    if (value === null) continue; // unset or unreadable: the unknown flag above is all there is
+    entries.push({ key: 'core.worktree', value, noValue: false });
   }
-  return false;
+  return { entries, unknown };
+}
+// R4-F1 / R5-B1 / R5-F1: `--config-env=NAME=VAR` (or `--config-env NAME=VAR`) sets config key NAME from environment variable VAR. When NAME is, or may be,
+// core.worktree the target is unknown, and VAR's value (when this command's prefix or an earlier assignment on the line gives one) is a target of its own.
+function configEnvWorkTree(text, env, ctx) {
+  const t = String(text ?? '').trim();
+  const eq = splitIndex(t, '=');
+  const key = expandVars(eq < 0 ? t : t.slice(0, eq), ctx);
+  if (!mayBeWorkTreeKey(key)) return null;
+  if (eq < 0) return { entry: null };
+  const varName = expandVars(t.slice(eq + 1), ctx);
+  if (DYNAMIC.test(varName)) return { entry: null };
+  const value = candidateValue(env, ctx, varName);
+  return { entry: value === null ? null : { key: 'core.worktree', value, noValue: false } };
 }
 
 function parseGitGlobal(argv, dir, env, ctx) {
@@ -561,8 +610,10 @@ function parseGitGlobal(argv, dir, env, ctx) {
   const envWorkTree = envVar(env, ctx, 'GIT_WORK_TREE');
   let targetUnknown = !envWorkTree.known;
   if (typeof envWorkTree.value === 'string' && envWorkTree.value !== '') workTreeRaws.push(envWorkTree.value);
-  if (envConfigNamesWorkTree(env, ctx)) targetUnknown = true; // R4-F1
+  const envWt = envConfigWorkTrees(env, ctx); // R4-F1, R5-B1
+  if (envWt.unknown) targetUnknown = true;
   const configs = [];
+  const wtConfigs = [...envWt.entries];
   let i = 1;
   for (; i < argv.length; i++) {
     const t = argv[i];
@@ -572,16 +623,20 @@ function parseGitGlobal(argv, dir, env, ctx) {
       // runs in its own shell, where the line's variables are not the ones it sees.
       const kv = argv[++i] ?? '';
       const eq = splitIndex(kv, '=');
-      configs.push({ raw: kv, key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1) });
+      configs.push({ raw: kv, key: expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase(), value: eq < 0 ? '' : kv.slice(eq + 1), noValue: eq < 0 });
       continue;
     }
     if (t.startsWith('--git-dir=')) { gitDirRaws.push(t.slice('--git-dir='.length)); gitDirUnknown = false; continue; }
     if (t === '--git-dir') { gitDirRaws.push(argv[++i]); gitDirUnknown = false; continue; }
     if (t.startsWith('--work-tree=')) { workTreeRaws.push(t.slice('--work-tree='.length)); continue; }
     if (t === '--work-tree') { workTreeRaws.push(argv[++i]); continue; }
-    // R4-F1: `--config-env=core.worktree=NAME` sets core.worktree from an environment variable that is not read here: unknown
-    if (t.startsWith('--config-env=')) { if (namesWorkTreeKey(t.slice('--config-env='.length))) targetUnknown = true; continue; }
-    if (t === '--config-env') { if (namesWorkTreeKey(argv[i + 1])) targetUnknown = true; i++; continue; }
+    // R4-F1: `--config-env=core.worktree=NAME` sets core.worktree from an environment variable: unknown, and (R5-B1) the value NAME holds
+    // here is a target; a key that may be core.worktree at run time (R5-F1) counts the same
+    if (t.startsWith('--config-env=') || t === '--config-env') {
+      const r = configEnvWorkTree(t === '--config-env' ? argv[++i] : t.slice('--config-env='.length), env, ctx);
+      if (r) { targetUnknown = true; if (r.entry) wtConfigs.push(r.entry); }
+      continue;
+    }
     if (GIT_GLOBAL_VALUE.includes(t)) { i++; continue; }
     if (t.startsWith('-')) continue; // boolean global option, or --opt=value
     break;
@@ -596,7 +651,7 @@ function parseGitGlobal(argv, dir, env, ctx) {
   // a GIT_DIR / GIT_WORK_TREE assigned earlier on the line may or may not reach this command (so it is "unknown"), but where it
   // points is still a checkout this command may act on
   const hint = (name) => (typeof ctx.vars[name] === 'string' && ctx.vars[name] !== '' ? joinDir(d, ctx.vars[name], ctx) : null);
-  return { d, gitDir, gitDirUnknown, workTree, targetUnknown, hints: [hint('GIT_DIR'), hint('GIT_WORK_TREE')].filter((x) => x !== null), configs, sub: argv[i], args: argv.slice(i + 1) };
+  return { d, gitDir, gitDirUnknown, workTree, targetUnknown, hints: [hint('GIT_DIR'), hint('GIT_WORK_TREE')].filter((x) => x !== null), configs, wtConfigs, sub: argv[i], args: argv.slice(i + 1) };
 }
 
 // checkout / switch: which branch is the directory on afterwards?
@@ -838,8 +893,10 @@ function gitTargetCheckouts(g, ctx) {
     } catch { /* no gitdir file: not a linked worktree's git dir */ }
   }
   if (g.workTree !== null) out.push(g.workTree);
-  for (const c of g.configs) {
-    if (c.key !== 'core.worktree') continue;
+  for (const c of [...g.configs, ...g.wtConfigs]) {
+    // R5-F1: a key that still holds `$` / a backtick after expansion may be core.worktree at run time: its value is resolved like one
+    if (!mayBeWorkTreeKey(c.key)) continue;
+    if (c.noValue && DYNAMIC.test(c.key)) { unknown = true; continue; } // (`-c "$(printf core.worktree=/x)"`: the value is inside the substitution)
     // R4-F1: git resolves a relative core.worktree against the .git directory, not the working directory (git-config(1))
     const raw = expandVars(c.value, ctx);
     if (DYNAMIC.test(raw)) { unknown = true; continue; }

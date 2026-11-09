@@ -493,3 +493,95 @@ test('R4-F1: the same commands are allowed with no marker, a dead marker, when r
   // other config keys are not core.worktree
   assert.equal(decide('GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x git reset --hard', other).decision, 'allow');
 });
+
+// ---- review round 5 (R5-B1, R5-F1): an environment-supplied core.worktree VALUE is a target; a dynamic config KEY may be core.worktree ----
+
+test('R5-B1: GIT_CONFIG_KEY_n / GIT_CONFIG_PARAMETERS / --config-env naming core.worktree with a value that reaches the job are refused from an unowned container', () => {
+  const { container, job } = containerWithJob();
+  mark(job, process.pid, 12);
+  const wt = fwd(job);
+  const at = fwd(container);
+  for (const command of [
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${wt} git reset --hard`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${wt} git -C ${at} checkout x`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=Core.WorkTree GIT_CONFIG_VALUE_0=${wt} git reset --hard`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=../.worktrees/slug git reset --hard`, // relative: to the git dir
+    `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${wt} && git reset --hard`,
+    `export GIT_CONFIG_COUNT=1; export GIT_CONFIG_KEY_0=core.worktree; export GIT_CONFIG_VALUE_0=${wt}; git reset --hard`,
+    `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x GIT_CONFIG_KEY_1=core.worktree GIT_CONFIG_VALUE_1=${wt} git reset --hard`,
+    `GIT_CONFIG_PARAMETERS="'core.worktree=${wt}'" git reset --hard`,
+    `GIT_CONFIG_PARAMETERS="'user.name=x' 'core.worktree'='${wt}'" git reset --hard`,
+    `git --config-env=core.worktree=WT reset --hard`.replace('git ', `WT=${wt} git `),
+    `WT=${wt} git --config-env core.worktree=WT reset --hard`,
+    `export WT=${wt}; git --config-env=core.worktree=WT reset --hard`,
+    `WT=${wt} git --config-env=CORE.WORKTREE=WT checkout x`,
+  ]) {
+    const v = decide(command, container);
+    assert.equal(v.decision, 'deny', command);
+    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+  }
+});
+
+test('R5-F1: a -c / --config-env KEY that is dynamic may be core.worktree: its value is a target', () => {
+  const { container, job } = containerWithJob();
+  mark(job, process.pid, 12);
+  const wt = fwd(job);
+  for (const command of [
+    `git -c "$(printf core.worktree)=${wt}" reset --hard`,
+    `git -c "$(printf core.worktree)=../.worktrees/slug" reset --hard`,
+    `git -c core.work\${X:-}tree=${wt} reset --hard`,
+    'git -c "`printf core.worktree`=' + wt + '" checkout x',
+    `git -c $K=${wt} reset --hard`,
+    `git -C ${fwd(container)} -c "$(printf core.worktree)=${wt}" reset --hard`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$(printf core.worktree) GIT_CONFIG_VALUE_0=${wt} git reset --hard`,
+    `WT=${wt} git --config-env=$K=WT reset --hard`,
+    `WT=${wt} git --config-env "$(printf core.worktree)=WT" reset --hard`,
+  ]) {
+    const v = decide(command, container);
+    assert.equal(v.decision, 'deny', command);
+    assert.match(v.reason, /job \(pid \d+, PR #12\) owns this checkout/, command);
+  }
+});
+
+test('R5-F1: a dynamic key whose value is hidden in the substitution is an unknown target: refused only where the session\'s own checkout is a job\'s', () => {
+  const { container, job } = containerWithJob();
+  mark(job, process.pid, 12);
+  const command = `git -c "$(printf core.worktree=${fwd(job)})" reset --hard`;
+  assert.equal(decide(command, job).decision, 'deny');
+  assert.equal(decide(command, container).decision, 'allow'); // nothing there to fall back on
+});
+
+test('R5-B1 / R5-F1: the same commands are allowed with no marker, a dead marker, when read-only, or when the value does not reach the job', () => {
+  const { container, job } = containerWithJob();
+  const wt = fwd(job);
+  const cmds = [
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${wt} git reset --hard`,
+    `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x GIT_CONFIG_KEY_1=core.worktree GIT_CONFIG_VALUE_1=${wt} git reset --hard`,
+    `GIT_CONFIG_PARAMETERS="'core.worktree=${wt}'" git reset --hard`,
+    `WT=${wt} git --config-env=core.worktree=WT reset --hard`,
+    `git -c "$(printf core.worktree)=${wt}" reset --hard`,
+    `git -c core.work\${X:-}tree=${wt} reset --hard`,
+    `WT=${wt} git --config-env=$K=WT reset --hard`,
+  ];
+  for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `no marker: ${c}`);
+  mark(job, deadPid());
+  for (const c of cmds) assert.equal(decide(c, container).decision, 'allow', `dead marker: ${c}`);
+  mark(job, process.pid);
+  for (const c of [
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${wt} git status`,
+    `GIT_CONFIG_PARAMETERS="'core.worktree=${wt}'" git log --oneline`,
+    `WT=${wt} git --config-env=core.worktree=WT diff`,
+    `git -c "$(printf core.worktree)=${wt}" status`,
+  ]) assert.equal(decide(c, container).decision, 'allow', `read-only: ${c}`);
+  // a literal value that does not reach the job's checkout (from a checkout no job owns), and keys that are not core.worktree
+  const elsewhere = fwd(fakeRepo());
+  for (const c of [
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=${elsewhere} git reset --hard`,
+    `GIT_CONFIG_PARAMETERS="'core.worktree=${elsewhere}'" git reset --hard`,
+    `WT=${elsewhere} git --config-env=core.worktree=WT reset --hard`,
+    `git -c "$(printf core.worktree)=${elsewhere}" reset --hard`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=${wt} git reset --hard`,
+    `GIT_CONFIG_PARAMETERS="'user.name=${wt}'" git reset --hard`,
+    `WT=${wt} git --config-env=user.name=WT reset --hard`,
+  ]) assert.equal(decide(c, container).decision, 'allow', `elsewhere: ${c}`);
+});
