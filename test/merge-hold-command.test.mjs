@@ -253,8 +253,10 @@ test('take / release: a command that could not be started is exit 2 with notStar
   const { run: holdRun } = await import('../pipeline/commands/merge-hold.mjs');
   const s = world();
   const boom = async () => { throw new Error('spawn /bin/sh ENOENT'); };
-  for (const extra of [[], ['--release', '--reason', 'parked']]) {
-    const ctx = { cwd: s.repo.dir, env: {}, runHold: boom };
+  // what runShellAsync really resolves with for a bad cwd or a missing shell (the repo's own cwd cannot be made to fail through the CLI)
+  const spawnFailed = async () => ({ code: 1, spawnError: true, stdout: '', stderr: 'spawn /bin/sh ENOENT', timedOut: false, signal: null });
+  for (const [extra, runHold] of [[[], boom], [['--release', '--reason', 'parked'], boom], [[], spawnFailed], [['--release', '--reason', 'parked'], spawnFailed]]) {
+    const ctx = { cwd: s.repo.dir, env: {}, runHold };
     const r = await holdRun(['--pr', String(PR), '--repo', s.repo.dir, ...extra], ctx);
     assert.equal(r.exitCode, 2, extra.join(' '));
     assert.equal(r.output.ok, false);

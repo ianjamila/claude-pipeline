@@ -65,6 +65,7 @@ export async function checkHolds({ config, pr, root, env, run = runShellAsync })
   } catch (err) {
     return unreadable(`the hold check could not be started (${String(err?.message ?? err).slice(0, 200)})`);
   }
+  if (ran.spawnError) return unreadable(`the hold check could not be started (${String(ran.stderr ?? '').trim().slice(0, 200)})`);
   if (ran.timedOut) return unreadable(`the hold check timed out after ${Math.round(HOLD_TIMEOUT_MS / 60_000)} min`);
   if (ran.signal) return unreadable(`the hold check was killed by ${ran.signal}`);
   if (ran.code !== 0) return unreadable(`the hold check exited ${ran.code}`);
@@ -89,17 +90,20 @@ export async function checkHolds({ config, pr, root, env, run = runShellAsync })
   return { configured: true, ok: true, blockedBy };
 }
 
+const notStarted = (why) => ({ configured: true, confirmed: false, code: null, notStarted: true, lines: [`the hold command could not be started: ${String(why).trim().slice(0, 200)}`] });
+
 // { configured:false } | { configured:true, confirmed: exit 0, code, lines (last 5 of stdout+stderr) }. The commands are not
 // retried: a take that is NOT confirmed is reported, never repeated. A command that could not even be STARTED (run threw) has
-// `code: null` and `notStarted: true`: it is the command going wrong, not the provider's own exit 1 (issue #194).
+// `code: null` and `notStarted: true` (run threw, or resolved with `spawnError`: bad cwd, missing shell): it is the command going wrong, not the provider's own exit 1 (issue #194).
 async function runWrite(template, vars, ctx) {
   if (!holdsConfigured(ctx.config)) return { configured: false };
   let ran;
   try {
     ran = await runHoldCommand(template(ctx.config), vars, ctx);
   } catch (err) {
-    return { configured: true, confirmed: false, code: null, notStarted: true, lines: [`the hold command could not be started: ${String(err?.message ?? err).slice(0, 200)}`] };
+    return notStarted(err?.message ?? err);
   }
+  if (ran.spawnError) return notStarted(ran.stderr);
   return { configured: true, confirmed: ran.code === 0 && ran.timedOut !== true, code: ran.code, ...(ran.timedOut ? { timedOut: true } : {}), ...(ran.signal ? { signal: ran.signal } : {}), lines: lastLines(ran) };
 }
 

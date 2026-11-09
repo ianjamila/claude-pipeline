@@ -811,3 +811,16 @@ test('unreleasedWarning: a release that could not be started says so, never "exi
   assert.doesNotMatch(unreleasedWarning({ pr: PR, reason: 'parked', code: null, takeConfirmed: true }), /exit null/, 'code null alone is enough');
   assert.match(unreleasedWarning({ pr: PR, reason: 'parked', code: 3, takeConfirmed: true }), /exit 3/);
 });
+
+test('a hold command that resolves with spawnError (runShellAsync: bad cwd, missing shell) is notStarted for a take and "could not be started" for a check', async () => {
+  const spawnFailed = async () => ({ code: 1, spawnError: true, stderr: 'spawn /bin/sh ENOENT', stdout: '', timedOut: false, signal: null });
+  const took = await takeHold({ config: CONFIG, pr: PR, root: '/r', env: {}, run: spawnFailed });
+  assert.deepEqual([took.configured, took.confirmed, took.code, took.notStarted], [true, false, null, true]);
+  assert.match(took.lines.join(' '), /could not be started.*ENOENT/);
+  const released = await releaseHold({ config: CONFIG, pr: PR, reason: 'parked', root: '/r', env: {}, run: spawnFailed });
+  assert.deepEqual([released.confirmed, released.code, released.notStarted], [false, null, true]);
+  const checked = await checkHolds({ config: CONFIG, pr: PR, root: '/r', env: {}, run: spawnFailed });
+  assert.equal(checked.ok, false);
+  assert.match(checked.why, /could not be started.*ENOENT/);
+  assert.doesNotMatch(checked.why, /exited/);
+});

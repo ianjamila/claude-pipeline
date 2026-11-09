@@ -723,3 +723,18 @@ test('runAsync / runShellAsync: report the signal that killed the child, and ove
   assert.equal(ok.signal, null);
   assert.equal(ok.code, 0);
 });
+
+// issue #194: a command that could not be STARTED (bad cwd, missing binary) is told apart from one that ran and exited 1.
+test('runShellAsync / runAsync: a start failure carries spawnError:true; a plain exit 1 and a timeout carry no such key', async () => {
+  const gone = join(scratch(), 'no-such-dir');
+  const badCwd = await runShellAsync('echo hi', { cwd: gone });
+  assert.equal(badCwd.spawnError, true);
+  assert.equal(badCwd.code, 1);
+  assert.match(badCwd.stderr, /ENOENT/);
+  const missing = await runAsync(join(scratch(), 'no-such-binary'), ['x']);
+  assert.equal(missing.spawnError, true);
+  const plain = await runShellAsync('exit 1');
+  assert.equal(plain.code, 1);
+  assert.equal('spawnError' in plain, false);
+  assert.equal('spawnError' in await runAsync(process.execPath, ['-e', 'process.exit(1)']), false);
+});
