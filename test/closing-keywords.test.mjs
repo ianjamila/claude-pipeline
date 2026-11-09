@@ -56,6 +56,46 @@ test('one keyword per issue, prose after a reference, code and comments are not 
   assert.deepEqual(multiIssueClosingLines(null), []);
 });
 
+test('fences: a longer fence is closed only by an equal-or-longer run of the same character', () => {
+  // an inner ``` line does not close a ```` block, so the list inside stays hidden
+  assert.deepEqual(multiIssueClosingLines('````md\n```\nCloses #1, #2\n```\n````'), []);
+  assert.deepEqual(multiIssueClosingLines('````\nFixes #3 and #4\n````'), []);
+  // a different character does not close it either
+  assert.deepEqual(multiIssueClosingLines('```\n~~~\nCloses #1, #2\n~~~\n```'), []);
+  // a closing fence carries no info string: "```js" inside an open block is content
+  assert.deepEqual(multiIssueClosingLines('```\n```js\nCloses #1, #2\n```'), []);
+  // control: after the 4-backtick block is really closed, a list is flagged again
+  const found = multiIssueClosingLines('````md\n```\ninner\n```\n````\nFixes #12, #13');
+  assert.equal(found.length, 1);
+  assert.equal(found[0].line, 'Fixes #12, #13');
+});
+
+test('inline code spans and HTML comments between references break the list but stay invisible to the keyword', () => {
+  assert.deepEqual(multiIssueClosingLines('Fixes #12, `see also` #13'), []);
+  assert.deepEqual(multiIssueClosingLines('Fixes #12, <!-- x --> #13'), []);
+  // control: with nothing between, the list is flagged
+  assert.equal(multiIssueClosingLines('Fixes #12, #13').length, 1);
+  // control: a span/comment elsewhere in the line does not hide a real list
+  assert.equal(multiIssueClosingLines('`x` Fixes #12, #13 <!-- y -->').length, 1);
+});
+
+test('multi-line HTML comments are skipped; text around the markers on the same line is still read', () => {
+  assert.deepEqual(multiIssueClosingLines('<!--\nCloses #1, #2\n-->'), []);
+  assert.deepEqual(multiIssueClosingLines('Intro\n<!-- note\nFixes #3 and #4\nmore\n-->\nOutro'), []);
+  // text before <!-- on the opening line is read
+  const before = multiIssueClosingLines('Closes #5, #6 <!-- start\nhidden\n-->');
+  assert.equal(before.length, 1);
+  assert.equal(before[0].linked, '#5');
+  // text after --> on the closing line is read
+  const after = multiIssueClosingLines('<!--\nhidden\n--> Closes #7, #8');
+  assert.equal(after.length, 1);
+  assert.equal(after[0].linked, '#7');
+  // control: a list after a closed multi-line comment is flagged
+  const ctl = multiIssueClosingLines('<!--\nhidden\n-->\nFixes #12, #13');
+  assert.equal(ctl.length, 1);
+  assert.equal(ctl[0].line, 'Fixes #12, #13');
+});
+
 test('every offending line is reported, and the problem names the exact rewrite', () => {
   const found = multiIssueClosingLines('Closes #1, #2\r\nmiddle\r\nfixes #3 and #4');
   assert.equal(found.length, 2);
