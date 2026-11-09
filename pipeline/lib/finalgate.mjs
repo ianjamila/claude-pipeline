@@ -7,6 +7,7 @@
 // The evidence is bound to the head in three independent ways: git.head (the report is for this commit),
 // git.tree (nothing changed in the working tree since verify ran) and contentHash (the review covered exactly
 // this patch). Each one defeats a different mistake, so none is redundant.
+import { closingKeywordProblem, multiIssueClosingLines } from './closing-keywords.mjs';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -1104,11 +1105,14 @@ export function ownerGoBaseProblem(live) {
 export async function preMergeProblems({ gh, pr, head, base = null, exemptHold = false }) {
   let view;
   try {
-    view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft', ...(base !== null ? ['baseRefOid'] : [])]);
+    view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft', ...(base !== null ? ['baseRefOid'] : []), 'body']);
   } catch (err) {
     return [`could not re-read the PR before merging: ${String(err?.message ?? err)}`];
   }
   const problems = [];
+  // The body is not part of the reviewed content, so an edit after review-complete is only seen here: "Closes #a, #b" would close only #a (#210).
+  const closing = closingKeywordProblem(multiIssueClosingLines(view?.body), pr, { then: 'ask for the merge again; no new review round is needed' });
+  if (closing !== null) problems.push(closing);
   if (view?.state !== 'OPEN') problems.push(`PR state is ${view?.state}`);
   if (view?.isDraft !== false) problems.push('PR is a draft');
   if (view?.headRefOid !== head) problems.push(`PR head is now ${short(view?.headRefOid)}, the gate approved ${short(head)}`);

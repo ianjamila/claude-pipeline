@@ -11,6 +11,7 @@ import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { closingKeywordProblem, multiIssueClosingLines } from '../pipeline/lib/closing-keywords.mjs';
+import { preMergeProblems } from '../pipeline/lib/finalgate.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -200,4 +201,20 @@ test('review-complete: an invalid review is reported as such, not as a body prob
   assertExit(r, 1, r.stderr + r.stdout);
   assert.notEqual(r.json.error, 'closing-keywords', r.stdout);
   assert.match(r.json.reason, /no review state|no review round/);
+});
+
+// ---- the last look before a merge (#210): the body is not reviewed content, so an edit after review-complete is caught here ----
+
+test('preMergeProblems refuses a "Closes #a, #b" body with the merge-time wording; a clean, missing or one-keyword body adds nothing', async () => {
+  const head = 'a'.repeat(40);
+  const ghFor = (body) => ({ prView: () => ({ state: 'OPEN', headRefOid: head, isDraft: false, labels: [], body }), listIssues: () => [] });
+  const bad = await preMergeProblems({ gh: ghFor('Fixes #3 and #4'), pr: 9, head });
+  assert.equal(bad.length, 1, JSON.stringify(bad));
+  assert.match(bad[0], /closes only #3 on merge/);
+  assert.match(bad[0], /gh pr edit 9 --body-file/);
+  assert.match(bad[0], /ask for the merge again; no new review round is needed/);
+  assert.doesNotMatch(bad[0], /review-complete/);
+  for (const body of ['Fixes #3. Fixes #4.', '', undefined, null, '\`\`\`\nFixes #3 and #4\n\`\`\`']) {
+    assert.deepEqual(await preMergeProblems({ gh: ghFor(body), pr: 9, head }), [], String(body));
+  }
 });

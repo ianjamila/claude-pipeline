@@ -87,12 +87,13 @@ export function multiIssueClosingLines(body) {
 }
 
 // One refusal sentence a person (or the agent) can act on.
-export function closingKeywordProblem(found, pr) {
+// `then`: what to do after the body edit (review-complete and the last look before a merge say different things).
+export function closingKeywordProblem(found, pr, { then = 'run review-complete again; no new review round is needed' } = {}) {
   if (found.length === 0) return null;
   const lines = found.map((f) => {
     const kw = f.keyword[0].toUpperCase() + f.keyword.slice(1).toLowerCase();
     const fixed = [f.linked, ...f.unlinked].map((r) => `${kw} ${r}.`).join(' ');
     return `"${f.line}" closes only ${f.linked} on merge (GitHub links one issue per keyword; ${f.unlinked.join(', ')} would stay open): write "${fixed}"`;
   });
-  return `the PR body ${lines.join('; ')}. Update the body (gh pr edit ${pr} --body-file <file>) and run review-complete again; no new review round is needed`;
+  return `the PR body ${lines.join('; ')}. Update the body (gh pr edit ${pr} --body-file <file>) and ${then}`;
 }
