@@ -953,5 +953,8 @@ test('R9 double fault: a read error on the moved folder AND a failed restore nam
   }
   assert.equal(caught.code, 'model-floor-lock-unreadable');
   assert.match(caught.message, /could not be put back: it is now at .*\.stale-/);
+  // R10-F1: the path is taken by a new lock here, so the advice is to remove the stranded folder and leave the lock path alone, never "move it back".
+  assert.match(caught.message, /old lock this command was clearing, so remove it by hand; leave .* alone: a review has taken a new lock there/);
+  assert.doesNotMatch(caught.message, /move it back/);
   assert.equal(existsSync(caught.strandedAt), true, 'the named folder exists');
 });

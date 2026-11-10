@@ -250,7 +250,7 @@ function clearFloorLock(dir, opts, lockHooks) {
     r = clearUnheld(LOCK_NAME, { dir, machineId: readMachineId({ stateDir: path.join(opts.home ?? accountHome(), '.claude', 'pipeline-state') }), hooks: lockHooks });
   } catch (err) {
     if (err?.strandedAt) {
-      throw codeError('model-floor-lock-unreadable', `the floor lock ${lockDir} became unreadable after it was moved aside (${err.code ?? err.message}) and could not be put back: it is now at ${err.strandedAt}. When no review is running, remove that folder by hand; otherwise move it back to ${lockDir}`, { cause: err, strandedAt: err.strandedAt });
+      throw codeError('model-floor-lock-unreadable', `the floor lock ${lockDir} became unreadable after it was moved aside (${err.code ?? err.message}) and could not be put back: it is now at ${err.strandedAt}. That folder is the old lock this command was clearing, so remove it by hand; ${fs.existsSync(lockDir) ? `leave ${lockDir} alone: a review has taken a new lock there` : `${lockDir} is free, so nothing else is needed`}`, { cause: err, strandedAt: err.strandedAt });
     }
     throw codeError('model-floor-lock-unreadable', `the floor lock ${lockDir} cannot be inspected (${err.code ?? err.message}), so it is not cleared: a review that holds it could lose it. Fix the folder's permissions and run --clear-lock again, or, when no review is running, remove that folder by hand`, { cause: err });
   }
