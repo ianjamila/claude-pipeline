@@ -404,68 +404,119 @@ function currentPromptEntry(transcriptPath, prompt) {
 // Queued answers (#189 finding 2, widened by #191 Part B): the result says which slot is a promoted ask (recordRuling stamps `ask_turn: 'synthetic'` on its record). An owner prompt typed while the
 // agent was busy (promptSource 'queued') is delivered after a promoted ask the owner never saw, or after an owner-turn ask newer than what was on screen: the recorders refuse it (queuedAnswer) and
 // promptProvenance refuses its record at use time, for every kind of ask.
-export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
-  const replies = [''];
-  const voided = new Set(); // slots (indexes of replies) whose ask a dropped reply replaced
-  const promoted = new Set(); // slots (indexes of replies) that are an ask promoted out of a synthetic turn
-  let lastIsPrompt = false; // is the newest user/assistant entry a prompt (the owner's current one)?
-  let lastPromptText = '';
-  let skipping = false; // inside a synthetic turn: its prompt and the replies to it
-  let muted = false; // inside an invisible turn read without skipSynthetic (#191 A2): its assistant text is not added to its slot
-  let turn = null; // the synthetic turn being read (skipSynthetic): { promote, text, surfacedAfterText, anything }
-  const flush = () => {
-    if (turn === null) return;
-    const t = turn;
-    turn = null;
-    if (t.promote && !t.surfacedAfterText && presentedRuling(t.text) !== null) {
-      replies.push(t.text);
-      promoted.add(replies.length - 1);
-      lastIsPrompt = false;
-    } else if (t.anything) voided.add(replies.length - 1);
+// #191 R1-B1 (Codex round 1, arbiter ACCEPT): attribution by ORIGINATING PROMPT, not by position. A headless `claude -p --resume <session>` process (invisible) can still be running when
+// the owner types: what it appends AFTER the owner's prompt (or between the owner's interactive reply entries) used to join the owner's slot, and the LAST 🔀 / ⚖️ / 🔁 line won, so an
+// invisible request beat the one the owner was shown. Claude Code writes `uuid` and `parentUuid` on every entry (confirmed on test/fixtures/transcripts/*.jsonl, 8 of 8 files carry both),
+// and each process chains its entries to its own prompt, so originsOf walks parentUuid back from an assistant entry (or a tool_result user entry, which the ruling reader inspects) to the
+// first prompt entry and the text joins THAT prompt's slot:
+//  - the slot read is still the positional one: the newest slot before the owner's current prompt (older slots are never revived), but a slot is its prompt's own text wherever it sits
+//    (interleaving 1: an sdk prompt BEFORE the owner's, its text after the interactive reply; interleaving 2: an sdk prompt written during the interactive reply);
+//  - an invisible turn's text (merge / round mode) is never any slot's; in ruling mode it is that synthetic turn's content (it voids the slot before ITS prompt when it shows anything,
+//    never promotes unless it is a visibleSynthetic turn) and never the owner slot's;
+//  - an invisible turn that opens AFTER the last activity of the slot being read makes it stale (the strict A2 rule, unchanged: an older ask is not revived across a hidden turn); one that
+//    opened while the slot was still being written (interleaved) does not, because the owner's turn went on after it;
+//  - late text from an older VISIBLE turn that arrives after a newer prompt joins that older slot: it is not the slot right before the owner's prompt, so it binds nothing, and it voids
+//    nothing (a void needs a synthetic turn that shows something AFTER the slot's last activity, and the newest slot is the one read);
+//  - an entry whose chain does not resolve to a prompt entry inside the window (no parentUuid, a uuid not in the window, a cycle, a duplicate uuid on the way, a chain that ends at no prompt)
+//    is DROPPED in a modern transcript (fail closed; subsumes A3 for assistant text, whose prompt was cut off by the window). A compaction is transparent to the walk: a hidden summary and
+//    a `compact_boundary` system entry are stepped over (the boundary has parentUuid null and logicalParentUuid the entry before it); a boundary whose past is outside the window drops.
+//  - a LEGACY transcript, no entry of which has a uuid, keeps the positional attribution (text belongs to the newest prompt before it). The fallback is keyed on that absence only, never on
+//    anything the agent can print: one entry with a uuid anywhere in the window makes it modern.
+// Residual: a process that chains its entries to the owner's prompt on purpose would still be attributed to it; that takes writing the transcript file itself (guard-files refuses a tool write).
+function originsOf(entries) {
+  const origin = new Array(entries.length).fill(-1); // entry index -> index of its originating prompt entry (-1: none)
+  const isPrompt = (e) => isPromptEntry(e) && !isHiddenSummary(e);
+  if (!entries.some((e) => typeof e?.uuid === 'string')) {
+    let latest = -1;
+    entries.forEach((e, i) => { if (isPrompt(e)) latest = i; origin[i] = latest; });
+    return origin;
+  }
+  const at = new Map(); // uuid -> entry index
+  const twice = new Set(); // a uuid two entries claim: any chain through it is ambiguous
+  entries.forEach((e, i) => { if (typeof e?.uuid === 'string') { if (at.has(e.uuid)) twice.add(e.uuid); else at.set(e.uuid, i); } });
+  const memo = new Map(); // uuid -> origin found from there (-1: none)
+  const resolve = (first) => {
+    const path = [];
+    const seen = new Set();
+    let id = first;
+    let found = -1;
+    while (typeof id === 'string') {
+      if (memo.has(id)) { found = memo.get(id); break; }
+      if (seen.has(id) || twice.has(id) || !at.has(id)) break;
+      seen.add(id);
+      path.push(id);
+      const j = at.get(id);
+      const n = entries[j];
+      if (isPrompt(n)) { found = j; break; }
+      const compaction = isHiddenSummary(n) || (n?.type === 'system' && n.subtype === 'compact_boundary');
+      id = typeof n?.parentUuid === 'string' ? n.parentUuid : compaction && typeof n?.logicalParentUuid === 'string' ? n.logicalParentUuid : null;
+    }
+    for (const u of path) memo.set(u, found);
+    return found;
   };
-  for (const e of tailEntries(transcriptPath, tailBytes).entries) {
+  entries.forEach((e, i) => { origin[i] = isPrompt(e) ? i : resolve(e?.parentUuid); });
+  return origin;
+}
+
+export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
+  const entries = tailEntries(transcriptPath, tailBytes).entries;
+  const origin = originsOf(entries);
+  // The turns, one per prompt entry (a hidden compaction summary is none), each with the entries attributed to it, in transcript order. pos / lastPos: the entry index of its prompt / of its last entry.
+  const turns = [];
+  const turnAt = new Map(); // prompt entry index -> turn
+  entries.forEach((e, i) => {
     const content = e?.message?.content;
-    if (e?.type === 'user') {
-      if (isHiddenSummary(e)) continue;
-      const isPrompt = isPromptEntry(e);
-      if (isPrompt) flush();
-      if (isPrompt && skipSynthetic && (entrySource(e) === 'synthetic' || invisibleTurn(e))) { // (#191 F1: a provenance-bearing prompt of unknown source is skipped like a synthetic one, never promoted)
-        skipping = true;
-        turn = { promote: visibleSynthetic(e), text: '', surfacedAfterText: false, anything: false };
+    if (e?.type === 'user' && isHiddenSummary(e)) return;
+    if (e?.type === 'user' && isPromptEntry(e)) {
+      // skip (ruling reader): a turn whose prompt the owner did not type; mute (every other reader): an invisible turn, a boundary whose text is never added (#191 A2); slot: everything else
+      const kind = skipSynthetic ? (entrySource(e) === 'synthetic' || invisibleTurn(e) ? 'skip' : 'slot') : invisibleTurn(e) ? 'mute' : 'slot';
+      const t = { pos: i, e, kind, content: [], lastPos: i };
+      turns.push(t);
+      turnAt.set(i, t);
+    } else if ((e?.type === 'user' || e?.type === 'assistant') && Array.isArray(content)) {
+      const t = turnAt.get(origin[i]);
+      if (t) { t.content.push(e); t.lastPos = i; } // (no turn: an unresolved chain, or text before the window's first prompt: dropped)
+    }
+  });
+  // The reply slots: what the owner's "merge" / "extra round" / ruling can answer, in prompt order. A skipped turn (ruling reader) is promoted into one (#189) or voids the slot before it (R1-F3..R5-B2, below).
+  const slots = [];
+  const mutes = []; // positions of the invisible prompts (merge / round readers)
+  for (const t of turns) {
+    if (t.kind === 'mute') { mutes.push(t.pos); continue; }
+    if (t.kind === 'slot') {
+      let text = '';
+      for (const e of t.content) if (e.type === 'assistant') for (const b of e.message.content) if (b?.type === 'text' && typeof b.text === 'string') text += `${b.text}\n`;
+      slots.push({ turn: t, lastPos: t.lastPos, text, promoted: false, voided: false });
+      continue;
+    }
+    // a skipped turn: the order of its entries decides (see the promotion rule above)
+    let text = '';
+    let surfacedAfterText = false;
+    let anything = false;
+    for (const e of t.content) {
+      if (e.type === 'user') {
+        if (e.message.content.some((b) => b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content)))) { surfacedAfterText = true; anything = true; }
         continue;
       }
-      if (isPrompt) skipping = false;
-      else if (skipping) {
-        if (Array.isArray(content) && content.some((b) => b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content)))) { turn.surfacedAfterText = true; turn.anything = true; }
-        continue;
+      for (const b of e.message.content) {
+        if (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) { text += `${b.text}\n`; surfacedAfterText = false; anything = true; }
+        else if (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) { surfacedAfterText = true; anything = true; }
       }
-      if (isPrompt) {
-        replies.push('');
-        lastPromptText = promptTextOf(e);
-        muted = !skipSynthetic && invisibleTurn(e);
-      }
-      lastIsPrompt = isPrompt;
-    } else if (e?.type === 'assistant' && Array.isArray(content)) {
-      if (skipping) {
-        for (const b of content) {
-          if (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) { turn.text += `${b.text}\n`; turn.surfacedAfterText = false; turn.anything = true; }
-          else if (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) { turn.surfacedAfterText = true; turn.anything = true; }
-        }
-        continue;
-      }
-      lastIsPrompt = false;
-      if (muted) continue;
-      for (const b of content) if (b?.type === 'text' && typeof b.text === 'string') replies[replies.length - 1] += `${b.text}\n`;
+    }
+    if (visibleSynthetic(t.e) && !surfacedAfterText && presentedRuling(text) !== null) slots.push({ turn: t, lastPos: t.lastPos, text, promoted: true, voided: false });
+    else if (anything) {
+      const before = slots[slots.length - 1];
+      if (before && before.lastPos < t.pos) before.voided = true; // (a slot still being written when this turn opened was not replaced by it: interleaved, not later)
     }
   }
-  flush();
-  // Only the reply right before the owner's prompt: when the newest entry is that prompt, its own (empty) slot is skipped, and that is
-  // the ONLY slot that may be. A later prompt plus a text-less assistant turn (tool calls only) leaves the old request stale, and an
-  // older request is never revived by a later "merge": the agent shows it again.
-  const current = lastIsPrompt && (prompt === undefined || plain(prompt) === lastPromptText);
-  const last = replies.length - 1 - (current && replies.length > 1 ? 1 : 0);
-  if (last === 0) return { text: '', promoted: false }; // A3: slot 0 (text before the window's first prompt) has no known origin
-  return voided.has(last) ? { text: '', promoted: false } : { text: replies[last] ?? '', promoted: promoted.has(last) };
+  // Only the reply slot right before the owner's prompt: when the newest prompt IS that prompt (and nothing answered it yet), its own (empty) slot is skipped, and that is the ONLY slot that
+  // may be. A later prompt plus a text-less assistant turn (tool calls only) leaves the old request stale, and an older request is never revived by a later "merge": the agent shows it again.
+  const newest = [...turns].reverse().find((t) => t.kind !== 'skip');
+  const current = newest?.kind === 'slot' && newest.content.length === 0 && (prompt === undefined || plain(prompt) === promptTextOf(newest.e));
+  const candidates = current ? slots.filter((x) => x.turn !== newest) : slots;
+  const last = candidates[candidates.length - 1]; // (none: only text before the window's first prompt, which has no known origin, A3)
+  if (!last || last.voided || mutes.some((pos) => pos > last.lastPos)) return { text: '', promoted: false };
+  return { text: last.text, promoted: last.promoted };
 }
 export const lastReplyText = (transcriptPath, opts = {}) => lastReply(transcriptPath, opts).text;
 
