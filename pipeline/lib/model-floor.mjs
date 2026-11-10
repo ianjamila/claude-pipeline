@@ -249,6 +249,9 @@ function clearFloorLock(dir, opts, lockHooks) {
   try {
     r = clearUnheld(LOCK_NAME, { dir, machineId: readMachineId({ stateDir: path.join(opts.home ?? accountHome(), '.claude', 'pipeline-state') }), hooks: lockHooks });
   } catch (err) {
+    if (err?.strandedAt) {
+      throw codeError('model-floor-lock-unreadable', `the floor lock ${lockDir} became unreadable after it was moved aside (${err.code ?? err.message}) and could not be put back: it is now at ${err.strandedAt}. When no review is running, remove that folder by hand; otherwise move it back to ${lockDir}`, { cause: err, strandedAt: err.strandedAt });
+    }
     throw codeError('model-floor-lock-unreadable', `the floor lock ${lockDir} cannot be inspected (${err.code ?? err.message}), so it is not cleared: a review that holds it could lose it. Fix the folder's permissions and run --clear-lock again, or, when no review is running, remove that folder by hand`, { cause: err });
   }
   if (r.state === 'live') {
@@ -258,7 +261,7 @@ function clearFloorLock(dir, opts, lockHooks) {
     throw codeError('model-floor-lock-changed', `the floor lock ${lockDir} changed while it was being cleared (a review took it), so it was left in place${r.restored === false ? ' (the lock we moved aside could not be put back: look for a model-floor.lock.stale-* folder beside it)' : ''}. Run --clear-lock again if it is still stuck`);
   }
   if (r.state === 'busy') {
-    throw codeError('model-floor-lock-busy', `another process is recovering or reclaiming the floor lock ${lockDir} right now; nothing was cleared. Run --clear-lock again in a moment`);
+    throw codeError('model-floor-lock-busy', `the floor lock ${lockDir} is busy, so nothing was cleared: either another process is recovering or reclaiming it right now, or the folder is under a minute old and has no owner record yet (a review starting up, or one that died there). Run --clear-lock again within a minute. If it still refuses after a minute and no pipeline process is running (a folder dated in the future by a skewed clock never ages), remove that folder by hand`);
   }
   return r.state === 'cleared';
 }

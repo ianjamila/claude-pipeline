@@ -572,7 +572,8 @@ export function clearUnheld(name, { dir = defaultLockDir(), now = Date.now(), ho
       try {
         same = sameLock(moved, identity);
       } catch (err) {
-        restoreMoved(moved, lockPath); // a read error must not strand the lock off its path
+        // A read error must not strand the lock off its path; when even the restore fails, say where the lock went.
+        if (!restoreMoved(moved, lockPath)) err.strandedAt = moved;
         throw err;
       }
       if (same) {

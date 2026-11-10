@@ -878,7 +878,14 @@ test('R8-B1: a fresh lock folder with no owner record (an acquirer between mkdir
   let fired = 0;
   const lockHooks = { afterInspect: () => { fired += 1; }, insideGuard: () => { fired += 1; } };
   for (const keepFloor of [true, false]) {
-    await assert.rejects(resetFloor({ dir, clearLock: true, keepFloor, lockHooks, waitMs: 50 }), { code: 'model-floor-lock-busy' });
+    await assert.rejects(resetFloor({ dir, clearLock: true, keepFloor, lockHooks, waitMs: 50 }), (err) => {
+      assert.equal(err.code, 'model-floor-lock-busy');
+      // R9-F1: the message names both causes, the retry window and the by-hand fallback for a folder that never ages.
+      assert.match(err.message, /under a minute old and has no owner record yet/);
+      assert.match(err.message, /again within a minute/);
+      assert.match(err.message, new RegExp(`${lockOf(dir).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*remove that folder by hand`));
+      return true;
+    });
   }
   assert.deepEqual(clearUnheld(LOCK_NAME, { dir, machineId: null }), { state: 'busy' });
   assert.equal(fired, 0, 'refused before the guard');
@@ -925,4 +932,26 @@ test('R8-F1: a read error on the moved folder puts the lock back at its path and
   }
   assert.equal(ownerRunId(dir), 'other-host', 'back at its path, untouched');
   assert.deepEqual(readdirSync(dir).filter((n) => n.includes('.stale-')), [], 'nothing stranded aside');
+});
+
+test('R9 double fault: a read error on the moved folder AND a failed restore name where the lock now is', async (t) => {
+  const dir = stuckDir(t);
+  assert.equal(tryAcquire(LOCK_NAME, { dir, ...REMOTE, runId: 'other-host' }).acquired, true);
+  const real = fs.readFileSync;
+  const m = mock.method(fs, 'readFileSync', (file, ...rest) => {
+    if (String(file).includes('.stale-') && String(file).endsWith('owner.json')) {
+      mkdirSync(join(lockOf(dir), 'x'), { recursive: true }); // something took the path meanwhile, so the restore cannot rename back
+      throw Object.assign(new Error('EIO: injected'), { code: 'EIO' });
+    }
+    return real(file, ...rest);
+  });
+  let caught;
+  try {
+    await assert.rejects(resetFloor({ dir, clearLock: true, keepFloor: true }), (err) => { caught = err; return true; });
+  } finally {
+    m.mock.restore();
+  }
+  assert.equal(caught.code, 'model-floor-lock-unreadable');
+  assert.match(caught.message, /could not be put back: it is now at .*\.stale-/);
+  assert.equal(existsSync(caught.strandedAt), true, 'the named folder exists');
 });
