@@ -25,8 +25,8 @@ import {
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
 import { classifyMergeCommand, commandTail } from '../lib/merge-cleanup.mjs';
-import { QueueUnreadable, clearSessionHold, endRecord, holdOnSignal, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
-import { approvalGapSince, createQueueRoute, gateFreshSince, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
+import { QueueUnreadable, clearSessionHold, endRecord, holdOnSignal, predatesQueueMessage, queueCatchUpState, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
+import { approvalGapSince, createQueueRoute, isDefaultMergeCommand, gateFreshSince, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
 import { bestEffortSweep } from '../lib/queue-sweep.mjs';
 import { checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal, recordSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
 
@@ -636,6 +636,11 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   else if (queue.on) {
     if (queue.state.state === 'MERGED') add('queueState', `PR #${pr} is already merged`);
     else if (queue.state.entry) add('queueState', `PR #${pr} is already queued at position ${queue.state.entry.position}`);
+    // A repo's own merge command runs the branch's code: a branch older than the queue may carry a script that does not know it (the real run refuses; so no merge is asked for).
+    if (!isDefaultMergeCommand(config)) {
+      const old = queueCatchUpState({ gh, branch: config.default_branch, head });
+      if (old.needed) add('queue-branch-predates-switch', predatesQueueMessage({ pr, state: old }));
+    }
   }
   const qm = queue.on ? { queueMode: true } : {};
 

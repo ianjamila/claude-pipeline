@@ -448,10 +448,14 @@ const queueReply = (s, pr) => ({ match: 'QueueState', stdoutJson: { data: { repo
 const queued = (s, position = 3) => queueReply(s, { state: 'OPEN', mergeCommit: null, mergeQueueEntry: { id: 'MQE_1', state: 'QUEUED', position, enqueuedAt: '2026-11-09T01:00:00Z', headCommit: null } });
 const mergedState = (s) => queueReply(s, { state: 'MERGED', mergeCommit: { oid: 'c'.repeat(40) }, mergeQueueEntry: null });
 
+// The merge queue was switched on 2026-11-05; the fake's merge base is dated 2026-01-01 unless a test says otherwise.
+const SWITCHED_ON = '2026-11-05T10:00:00Z';
+const CURRENT = { queueSince: '2025-12-01T00:00:00Z' }; // a switch-on before the branch's merge base: a branch made after it
+
 test('dry run --owner-go, queue ON, branch BEHIND: queue:true, no behind-base blocker, ownerStep.queueNote (exact), no behindNote; nothing is written', () => {
   const s = scenario({ report: null, state: null });
   const tip = mainMoves(s, 'other.txt');
-  s.fake.setScript(script(s, { baseRefOid: tip, behindBy: 1, merge: 'BEHIND', gh: { compareBase: tip, mergeStateStatus: 'BEHIND', queue: true } }));
+  s.fake.setScript(script(s, { baseRefOid: tip, behindBy: 1, merge: 'BEHIND', gh: { compareBase: tip, mergeStateStatus: 'BEHIND', queue: true, ...CURRENT } }));
   const d = dry(s, ['--owner-go']);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.wouldMerge, true, JSON.stringify(d.r.json.blockers));
@@ -466,19 +470,53 @@ test('dry run --owner-go, queue ON, branch BEHIND: queue:true, no behind-base bl
   noGitWrites(d);
 });
 
-test('dry run (gate mode), queue ON and behind (compare shows lacking commits): no behind-base blocker, queueNote set, no compare call', () => {
+test('dry run (gate mode), queue ON and behind (compare shows lacking commits): no behind-base blocker, queueNote set, the base is compared only for its merge base', () => {
   const s = setup({});
   s.fake.setScript(script(s));
   assertExit(s.gate(), 0);
   const file = join(s.repo.dir, '.review', 'state.json');
   writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), risk: 'high' }));
-  s.fake.setScript(script(s, { behindBy: 2, gh: { queue: true } }));
+  s.fake.setScript(script(s, { behindBy: 2, gh: { queue: true, ...CURRENT } }));
   const d = dry(s);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.queue, true);
   assert.deepEqual(d.r.json.blockers, []);
   assert.equal(d.r.json.ownerStep.queueNote, QUEUE_NOTE);
-  assert.ok(!d.calls.some((l) => /compare\//.test(l)), 'the base is not compared: the queue builds on the current base');
+  // (no behind-base verdict: the queue builds on the current base. The one compare read is the merge base the queue-branch-predates-switch check needs for a custom merge command.)
+  assert.equal(d.calls.filter((l) => /compare\//.test(l)).length, 1, 'the base is compared once, for the merge base');
+});
+
+test('dry run --owner-go, queue ON, custom merge command, branch PREDATES the switch-on: a queue-branch-predates-switch blocker (no merge is asked for); nothing is written', () => {
+  const s = scenario({ report: null, state: null });
+  s.fake.setScript(script(s, { behindBy: 2, gh: { queue: true, queueSince: SWITCHED_ON, mergeBaseAt: '2026-10-20T08:00:00Z' } }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 1, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.wouldMerge, false);
+  assert.deepEqual(kinds(d.r), ['queue-branch-predates-switch']);
+  assert.match(d.r.json.blockers[0].detail, /before the merge queue was switched on \(2026-11-05\).*P update-branch --pr 12/s);
+  assert.deepEqual(d.writes, []);
+  assert.deepEqual(s.mergeCalls(), []);
+  noGitWrites(d);
+});
+
+test('dry run (gate mode), queue ON, custom merge command, switch-on time UNKNOWN: the same blocker (fail closed)', () => {
+  const s = setup({});
+  s.fake.setScript(script(s));
+  assertExit(s.gate(), 0);
+  s.fake.setScript(script(s, { behindBy: 2, gh: { queue: true } }));
+  const d = dry(s);
+  assertExit(d.r, 1, `${d.r.stderr}${d.r.stdout}`);
+  assert.deepEqual(kinds(d.r), ['queue-branch-predates-switch']);
+  assert.match(d.r.json.blockers[0].detail, /cannot be shown to be newer than the merge queue/);
+});
+
+test('dry run --owner-go, queue ON, DEFAULT merge command: never checked, so an old branch is no blocker (gh enqueues; no branch code runs)', () => {
+  const s = scenario({ report: null, state: null, yml: ymlFor().replace(/ {2}command: .*\n/, '') });
+  s.fake.setScript(script(s, { behindBy: 2, gh: { queue: true, queueSince: SWITCHED_ON, mergeBaseAt: '2026-10-20T08:00:00Z' } }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.wouldMerge, true);
+  assert.ok(!d.calls.some((l) => /compare\//.test(l)));
 });
 
 test('dry run, queue ON: conflicts (mergeStateStatus DIRTY) still block, and nothing about behind-ness is reported', () => {

@@ -112,7 +112,13 @@ export function ghEntries(o) {
     // `behindBy`: how many base commits the PR head lacks (compare); 0 = up to date, which is what merge's update step expects.
     // `update`: what PUT pulls/12/update-branch answers: accepted (default) | conflict | head-moved (the two 422s) | forbidden.
     UPDATE_REPLIES[o.update ?? 'accepted'],
-    { match: 'repos/acme/widgets/compare/', stdoutJson: { status: o.behindBy ? 'diverged' : 'ahead', behind_by: o.behindBy ?? 0, ahead_by: 1, base: o.compareBase ?? BASE_SHA } },
+    // (the same reply serves gh.compare and gh.mergeBaseOf: `sha` / `at` are the merge base commit and its committer date; `mergeBaseAt: null` = GitHub gives no date)
+    { match: 'repos/acme/widgets/compare/', stdoutJson: { status: o.behindBy ? 'diverged' : 'ahead', behind_by: o.behindBy ?? 0, ahead_by: 1, base: o.compareBase ?? BASE_SHA, sha: BASE_SHA, ...(o.mergeBaseAt === null ? {} : { at: o.mergeBaseAt ?? '2026-01-01T00:00:00Z' }) } },
+    // `queueSince`: when the base's merge_queue ruleset was created (gh.branchRules -> gh.ruleset); absent = GitHub's rules read answers nothing usable.
+    ...(o.queueSince ? [
+      { match: 'rules/branches/main', stdoutJson: [{ type: 'merge_queue', ruleset_id: 77, parameters: {} }] },
+      { match: 'repos/acme/widgets/rulesets/77', stdoutJson: { id: 77, created_at: o.queueSince } },
+    ] : []),
     // `commitParents`: { <sha>: [parent shas] } for GET commits/<sha> (the update-branch result is bound to its parents).
     ...Object.entries(o.commitParents ?? {}).map(([commit, parents]) => ({ match: `commits/${commit} --jq`, stdoutJson: parents })),
     // GET pulls/12/files (the --owner-go cross-check of the scanned file list): [{ filename, previous_filename?, status }]

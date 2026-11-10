@@ -323,6 +323,30 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       return { status: body.status ?? null, behindBy: body.behind_by, aheadBy: body.ahead_by, baseSha: body.base };
     },
 
+    // Where the branch left the base, from GitHub itself: the merge base of base...head (the newest commit both share), its committer
+    // date, and how far head is behind base. A separate read from compare(): that one's reply shape is fixed. Any field GitHub does not
+    // answer is a GhError (the caller reads that as "unknown" and fails closed).
+    mergeBaseOf(base, head) {
+      const args = ['api', `repos/${self.repo().slug}/compare/${encodePath(base)}...${encodeURIComponent(head)}?per_page=1`,
+        '--jq', '{behind_by: .behind_by, sha: .merge_base_commit.sha, at: .merge_base_commit.commit.committer.date}'];
+      const body = parse(ok(args), args);
+      const at = typeof body?.at === 'string' ? Date.parse(body.at) : NaN;
+      if (!Number.isInteger(body?.behind_by) || typeof body.sha !== 'string' || !/^[0-9a-f]{40}$/.test(body.sha) || !Number.isFinite(at)) {
+        throw new GhError({ code: 0, stderr: `compare reply has no readable merge base: ${JSON.stringify(body).slice(0, 200)}`, args });
+      }
+      return { behindBy: body.behind_by, sha: body.sha, committedAt: new Date(at).toISOString() };
+    },
+
+    // A repository ruleset (the merge_queue branch rule names its ruleset by id). created_at is when THIS ruleset was made: a queue switched
+    // off and on again is a new ruleset. A reply without a readable created_at is a GhError.
+    ruleset(id) {
+      const args = ['api', `repos/${self.repo().slug}/rulesets/${encodeURIComponent(id)}`, '--jq', '{id: .id, created_at: .created_at}'];
+      const body = parse(ok(args), args);
+      const at = typeof body?.created_at === 'string' ? Date.parse(body.created_at) : NaN;
+      if (!Number.isFinite(at)) throw new GhError({ code: 0, stderr: `ruleset ${id} has no readable created_at: ${JSON.stringify(body).slice(0, 200)}`, args });
+      return { id: body.id ?? null, createdAt: new Date(at).toISOString() };
+    },
+
     // The parent SHAs of a commit, in order (for a merge commit: first the branch it was made on, then what was merged in).
     commitParents(commit) {
       const text = self.apiText(`repos/${self.repo().slug}/commits/${encodeURIComponent(commit)}`, '[.parents[].sha]');

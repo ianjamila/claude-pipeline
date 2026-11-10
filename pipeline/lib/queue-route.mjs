@@ -10,7 +10,7 @@ import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
 import { GATE_FILE, GATE_MAX_AGE_MS, PR_FIELDS, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, preMergeProblems, readReviewJson, waitBlockers } from './finalgate.mjs';
 import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
-import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
+import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, predatesQueueMessage, queueCatchUpState, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
 import { RESTORE_NOTE } from './hold.mjs';
 import { headSha } from './git.mjs';
 import { envWithGhDir, runShellAsync } from './proc.mjs';
@@ -336,6 +336,22 @@ export function createQueueRoute({
     return { enqueue: true, requeue: rec !== null && rec.head === head && rec.removals.length > 0 };
   }
 
+  // ---- 1b. the branch's own merge script ----------------------------------------------------------------------------------------------
+  // A custom merge.command runs the PR BRANCH's code, and a branch made before the queue was switched on may carry a script that does not know it
+  // (eaglewatch #1735: it took "queued" for "merged" and deleted the head branch). The default command enqueues through gh and runs no branch code, so
+  // it is never asked. Not provably newer than the switch-on (or unreadable) = refused, nothing queued, nothing run. -> null | the refusal output.
+  // `closeRecord`: a live record (a re-queue after a removal) ends 'blocked' with the hold put back, as every other unmerged end does; the sweep's
+  // re-queue leaves that to settleRecord, which ends the record on the { ok: false } it gets back.
+  async function branchPredatesQueue({ closeRecord: ends = true } = {}) {
+    if (isDefaultMergeCommand(config)) return null;
+    const state = queueCatchUpState({ gh, branch: config.default_branch, head });
+    if (!state.needed) return null;
+    const holdFields = ends && liveRecord() !== null ? await terminal('blocked') : {};
+    return refusal('queue-branch-predates-switch', [predatesQueueMessage({ pr, state })], {
+      queued: false, branchState: state.kind, switchedOn: state.switchedOn, mergeBaseAt: state.mergeBaseAt, ...holdFields,
+    });
+  }
+
   // ---- 2. enqueue --------------------------------------------------------------------------------------------------------------
   async function sendEnqueue() {
     if (isDefaultMergeCommand(config)) {
@@ -390,6 +406,8 @@ export function createQueueRoute({
     try {
       for (;;) {
         if (enqueueNow) {
+          const old = await branchPredatesQueue();
+          if (old !== null) return old;
           openRecord(root, pr, head, approval, opts);
           // SEAM (hold): the record exists, no attempt yet. This is where a lifted needs-human hold is written to it (setHold, owner 'session'),
           // so a signal or a crash between the lift and the enqueue is still known to the record.
@@ -439,6 +457,8 @@ export function createQueueRoute({
   // -> { ok: true } | { done } (a refusal or a merge the confirm found).
   async function reenqueue() {
     requeued = 1;
+    const old = await branchPredatesQueue({ closeRecord: false });
+    if (old !== null) return { done: old };
     openRecord(root, pr, head, approval, opts);
     beginAttempt(root, pr, head, approval, opts);
     return confirm(await sendEnqueue());

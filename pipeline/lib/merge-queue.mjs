@@ -35,6 +35,62 @@ export function queueModeFor({ gh, pr }) {
   return { queue: state.enabled === true, state };
 }
 
+// ---- a branch made before the queue was switched on ------------------------------------------------------------------------------------
+// A repo's own merge command (merge.command, run from the PR's worktree) is the PR BRANCH's code. A branch cut before the queue existed carries
+// a script that does not know it: it "merges" directly, GitHub queues the PR instead, the old script reads that as merged and runs its
+// after-merge cleanup (it deleted the head branch of eaglewatch #1735, and GitHub closed the PR). The repo's own config cannot guard this,
+// because an old branch also carries the old config. So the pipeline asks GitHub WHEN the queue was switched on and whether the branch was made
+// before that.
+//
+// The switch-on time is the created_at of the ruleset that holds the merge_queue rule (rule.ruleset_id -> gh.ruleset). Not updated_at: a settings
+// edit (a wait time, a method) is not a switch-on, and would make every branch older than the edit look old. A queue switched off and on again
+// is a new ruleset, hence a new created_at: right, since the repo's script may have been taught the queue between the two.
+// "The branch was made before" = the merge base of the PR head and the base branch (the commit it left the base at) is older than that, by its
+// committer date from GitHub's compare. A branch that is not behind its base at all has the base's whole history, so there is nothing a catch-up could
+// add and it never counts as old (the merge base is the base tip itself).
+//
+// -> { needed, kind: 'current' | 'predates' | 'unknown', why, switchedOn, mergeBaseAt, behindBy }. Never throws; every read that fails or answers
+// nothing usable is 'unknown' (callers: P merge refuses, P update-branch catches up anyway - an update is harmless).
+export function queueRulesetIdOf(rules) {
+  const rule = Array.isArray(rules) ? rules.find((r) => r?.type === 'merge_queue') : undefined;
+  const id = rule?.ruleset_id;
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+export function queueCatchUpState({ gh, branch, head }) {
+  const reply = (kind, why, extra = {}) => ({ needed: kind !== 'current', kind, why, switchedOn: null, mergeBaseAt: null, behindBy: null, ...extra });
+  const oneLine = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 200);
+  let base;
+  try {
+    if (typeof gh?.mergeBaseOf !== 'function') throw new Error('this GitHub client cannot read the merge base');
+    base = gh.mergeBaseOf(branch, head);
+  } catch (err) {
+    return reply('unknown', `the commit ${String(head).slice(0, 12)} was compared with ${branch} on GitHub but the merge base could not be read (${oneLine(err)})`);
+  }
+  if (base.behindBy === 0) return reply('current', `the branch already holds every commit of ${branch}`, { mergeBaseAt: base.committedAt, behindBy: 0 });
+  let switchedOn;
+  try {
+    if (typeof gh?.ruleset !== 'function') throw new Error('this GitHub client cannot read rulesets');
+    const id = queueRulesetIdOf(gh.branchRules(branch));
+    if (id === null) throw new Error(`the merge_queue rule of ${branch} names no ruleset`);
+    switchedOn = gh.ruleset(id).createdAt;
+  } catch (err) {
+    return reply('unknown', `when the merge queue was switched on could not be read (${oneLine(err)})`, { mergeBaseAt: base.committedAt, behindBy: base.behindBy });
+  }
+  const extra = { switchedOn, mergeBaseAt: base.committedAt, behindBy: base.behindBy };
+  if (Date.parse(base.committedAt) < Date.parse(switchedOn)) return reply('predates', `the branch left ${branch} at ${base.sha.slice(0, 12)} (${base.committedAt}), before the merge queue was switched on (${switchedOn})`, extra);
+  return reply('current', `the branch left ${branch} after the merge queue was switched on`, extra);
+}
+
+// The refusal text of P merge for a branch whose merge script may not know the queue (kind predates | unknown).
+export function predatesQueueMessage({ pr, state }) {
+  const day = (iso) => String(iso).slice(0, 10);
+  const lead = state.kind === 'predates'
+    ? `PR #${pr}'s branch was made on ${day(state.mergeBaseAt)}, before the merge queue was switched on (${day(state.switchedOn)}), so the merge script on the branch may not know about the queue`
+    : `PR #${pr}'s branch cannot be shown to be newer than the merge queue (${state.why}), so the merge script on the branch may not know about the queue`;
+  return `${lead}: it could take the queue's "queued" answer for "merged" and delete the branch. Nothing was queued and the merge command was not run. Catch the branch up first: \`P update-branch --pr ${pr}\` from the PR's own worktree, run a review round (base-only), \`P review-complete\`, then ask the owner again.`;
+}
+
 // ---- the queue's own settings ------------------------------------------------------------------------------------------------------
 
 const numberOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
