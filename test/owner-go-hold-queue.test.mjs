@@ -907,3 +907,114 @@ test('R1-B3 a resumed --owner-go watch: the first failed_checks removal is re-qu
   assert.equal(s.rec().terminal, 'merged');
   assert.equal(s.rec().attempts, 2);
 });
+
+// ---- #237: the PR head moved H -> J while a live entry sits at J -------------------------------------------------------------------------
+// H's approval never covered J, so nothing here dequeues or re-queues on H's authority: H's record is replaced (one atomic write, so a crash leaves H's or J's, never
+// neither) by an orphan record for J that the sweep keeps settling, as recoverQueuedLift's does, until J's departure is confirmed.
+const J = 'f'.repeat(40);
+const entryAtJ = (position = 1) => st({ head: J, inQueue: true, entry: { id: 'MQE_J', state: 'AWAITING_CHECKS', position, enqueuedAt: '2026-11-10T08:00:00Z', headCommit: null } });
+const jGone = () => st({ head: J });
+const movedWorld = (over = {}) => {
+  const root = repoDir();
+  entryRecord(root); // H's record: a lifted hold owned by the entry
+  return { root, gh: stub({ states: [entryAtJ()], ...over }) };
+};
+
+test('#237 settleRecord: head moved with a live entry at J: the hold goes back, H\'s record is replaced by a live orphan record for J, and nothing is dequeued or enqueued', async () => {
+  const { root, gh } = movedWorld();
+  const out = await settleRecord({ gh, root, pr: 7 });
+  assert.equal(out.outcome, 'ended');
+  assert.equal(out.terminal, 'head-moved');
+  assert.equal(out.hold, 'restored');
+  assert.deepEqual(gh.labels, ['needs-human']);
+  assert.deepEqual(gh.calls, ['add needs-human'], 'no dequeue');
+  const rec = readQueueRecord(root, 7);
+  assert.equal(rec.terminal, null, 'J is tracked');
+  assert.equal(rec.head, J);
+  assert.deepEqual(rec.entryIds, ['MQE_J']);
+  assert.equal(rec.hold, null, 'H\'s hold is not carried over: the label on the PR is the hold now');
+  assert.equal(rec.approval.items, null, 'H\'s approval does not cover J');
+  assert.equal(rec.adopted.from, HEAD);
+  assert.deepEqual(liveRecords(root).map((r) => [r.pr, r.head]), [[7, J]]);
+});
+
+test('#237 the orphan record for J is settled by the sweep: a stop condition dequeues J; a failed dequeue or an unreadable confirmation leaves it live; once J is gone it ends removed', async () => {
+  const { root, gh } = movedWorld({ states: [entryAtJ()] });
+  await settleRecord({ gh, root, pr: 7 }); // adopt J (the label goes back)
+  const sweep = (g) => settleRecord({ gh: g, root, pr: 7, sleep: async () => {}, pollMs: 1 });
+  // a failed dequeue
+  let failing = true;
+  const g1 = { ...gh, queueState: () => entryAtJ(), queueEvents: () => [addedAt()], dequeue: (n) => { gh.calls.push(`dequeue ${n}`); if (failing) throw new Error('boom 502'); } };
+  const a = await sweep(g1);
+  assert.equal(a.outcome, 'unsettled', JSON.stringify(a));
+  assert.equal(readQueueRecord(root, 7).terminal, null, 'still tracked after a failed dequeue');
+  // the dequeue goes out (reads 1-2: the settle and the watch poll) but the confirmation cannot be read
+  failing = false;
+  let reads = 0;
+  const g2 = { ...g1, queueState: () => { reads += 1; if (reads > 2) throw new Error("HTTP 502"); return entryAtJ(); } };
+  const b = await sweep(g2);
+  assert.equal(b.outcome, 'unsettled', JSON.stringify(b));
+  assert.equal(readQueueRecord(root, 7).terminal, null, 'still tracked while the confirmation is unreadable');
+  // J is gone (the dequeue took)
+  let n = 0;
+  const g3 = { ...g1, queueState: () => (n++ === 0 ? entryAtJ() : jGone()), queueEvents: () => [addedAt(), evt('removed', '09:00:00', 'manual', QC1)] };
+  const c = await sweep(g3);
+  assert.equal(c.outcome, 'ended', JSON.stringify(c));
+  assert.equal(c.terminal, 'removed', 'J left (the dequeue took): reported as removed');
+  assert.equal(readQueueRecord(root, 7).terminal, 'removed');
+  assert.equal(gh.calls.filter((x) => x.startsWith('add')).length, 1, 'the label was put back once, at the adoption');
+});
+
+test('#237 the orphan record for J that merges under the restored veto is reported merged; one removed for failed checks is never re-queued (no approval of J)', async () => {
+  const merged = movedWorld();
+  await settleRecord({ gh: merged.gh, root: merged.root, pr: 7 });
+  const m = await settleRecord({ gh: stub({ states: [st({ head: J, state: 'MERGED', mergeSha: 'c'.repeat(40) })] }), root: merged.root, pr: 7 });
+  assert.equal(m.outcome, 'merged');
+  assert.equal(readQueueRecord(merged.root, 7).terminal, 'merged');
+
+  const removed = movedWorld();
+  await settleRecord({ gh: removed.gh, root: removed.root, pr: 7 });
+  let asked = 0;
+  const out = await settleRecord({
+    gh: stub({ states: [jGone()], events: [[addedAt(), removedAt('failed_checks')]] }), root: removed.root, pr: 7,
+    requeue: async () => { asked += 1; return { ok: true }; },
+  });
+  assert.equal(asked, 0, 'J is never re-queued');
+  assert.equal(out.outcome, 'ended');
+  assert.equal(out.terminal, 'removed');
+});
+
+test('#237 an interruption between putting the label back and replacing the record leaves H\'s record live: the next sweep finishes it (label already on)', async () => {
+  const { root, gh } = movedWorld();
+  const dying = ({ gh: g, pr }) => { g.addLabels(pr, ['needs-human']); throw new Error('killed'); };
+  await assert.rejects(settleRecord({ gh, root, pr: 7, restore: dying }), /killed/);
+  const mid = readQueueRecord(root, 7);
+  assert.equal(mid.terminal, null);
+  assert.equal(mid.head, HEAD, 'still H\'s record: nothing was lost');
+  const out = await settleRecord({ gh: stub({ states: [entryAtJ()], labels: ['needs-human'] }), root, pr: 7 });
+  assert.equal(out.outcome, 'ended');
+  assert.equal(out.hold, 'already-on');
+  const rec = readQueueRecord(root, 7);
+  assert.deepEqual([rec.terminal, rec.head], [null, J]);
+});
+
+test('#237 a head that moved with NO entry at J still just ends H\'s record (head-moved), as before', async () => {
+  const { root, gh } = movedWorld({ states: [jGone()] });
+  const out = await settleRecord({ gh, root, pr: 7 });
+  assert.equal(out.outcome, 'ended');
+  assert.equal(readQueueRecord(root, 7).terminal, 'head-moved');
+  assert.deepEqual(liveRecords(root), []);
+});
+
+test('#237 a head that moved whose entry cannot be read afterwards: nothing is ended or restored (the record stays live for the next sweep)', async () => {
+  const root = repoDir();
+  entryRecord(root);
+  let reads = 0;
+  const gh = stub({ states: [entryAtJ()] });
+  gh.queueState = () => { reads += 1; if (reads > 1) throw new Error('HTTP 502'); return entryAtJ(); };
+  const out = await settleRecord({ gh, root, pr: 7 });
+  assert.equal(out.outcome, 'unsettled');
+  assert.equal(readQueueRecord(root, 7).head, HEAD);
+  assert.equal(readQueueRecord(root, 7).terminal, null);
+  assert.deepEqual(gh.calls, []);
+});

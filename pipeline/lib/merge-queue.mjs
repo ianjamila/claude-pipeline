@@ -318,10 +318,26 @@ export function endRecord(root, pr, terminal, { now = Date.now } = {}) {
   });
 }
 
+// The PR head moved off a live record's head (H) to J while a live queue entry sits at J (#237). H's approval never covered J, so J is neither dequeued nor re-queued
+// on H's authority; but it must not go untracked either. H's record is REPLACED, in one atomic write (so a crash leaves H's record or J's, never neither), by an orphan
+// record for J with no approval, no hold (the label on the PR is the hold now: H's was put back first) and `adopted` set: the sweep keeps settling it, with the same
+// stop conditions and confirmed dequeue as any entry, until J's departure is confirmed; mayRequeue never re-queues it. Same shape as recoverQueuedLift's record.
+export function adoptHeadMoved(root, pr, { head, entryId, now = Date.now }) {
+  const old = readQueueRecord(root, pr);
+  if (old === null || old.terminal !== null) throw new QueueRecordUnreadable(`no live merge-queue record for PR #${pr}`);
+  return writeRecord(root, {
+    pr: Number(pr), repo: old.repo, repoId: old.repoId, root: old.root, head,
+    approval: { items: null, areas: null, rulings: null },
+    route: null, createdAt: isoOf(now), attempts: 1, pending: null, entryIds: typeof entryId === 'string' ? [entryId] : [], removals: [], hold: null, terminal: null, terminalAt: null,
+    adopted: { from: old.head, at: isoOf(now) },
+  });
+}
+
 // One automatic re-queue per head, and only after a CONFIRMED group-check failure: exactly one such removal on the record. The count
 // is of removals, not attempts, so an enqueue that never landed (dropped by reconcile) spends nothing.
 export function mayRequeue(rec, head, reason) {
-  return rec != null && rec.head === head && REQUEUE_REASONS.has(reason) && rec.removals.filter((r) => r.reason === REASON_GROUP_CHECKS).length === 1;
+  // (an adopted record, #237, is tracked for a head nobody approved: it is never re-queued)
+  return rec != null && !rec.adopted && rec.head === head && REQUEUE_REASONS.has(reason) && rec.removals.filter((r) => r.reason === REASON_GROUP_CHECKS).length === 1;
 }
 
 // ---- reconcile ---------------------------------------------------------------------------------------------------------------------
@@ -556,7 +572,8 @@ export async function settleRecord({ gh, root, pr, now = Date.now, sleep = defau
 
   // An unmerged end: the owned hold goes back (not when a label is on already = a new hold), then the record ends. A restore that fails
   // keeps the record open, so the next settle tries again.
-  const finish = (kind, message, extra = {}) => {
+  // `adopt` ({ head, entryId }, #237): instead of ending, the record is replaced by the orphan record for the live entry at the new head (adoptHeadMoved).
+  const finish = (kind, message, extra = {}, adopt = null) => {
     const cur = readQueueRecord(root, pr);
     let hold = 'none';
     if (cur.terminal === null && cur.hold !== null) {
@@ -568,7 +585,10 @@ export async function settleRecord({ gh, root, pr, now = Date.now, sleep = defau
       }
       hold = res.status;
     }
-    if (cur.terminal === null) endRecord(root, pr, kind, { now });
+    if (cur.terminal === null) {
+      if (adopt) adoptHeadMoved(root, pr, { ...adopt, now });
+      else endRecord(root, pr, kind, { now });
+    }
     const text = `PR #${pr} ${message}${hold === 'restored' ? `; needs-human is back on it (${RESTORE_NOTE})` : ''}`;
     say(text);
     return { outcome: 'ended', terminal: kind, hold, message: text, rec: readQueueRecord(root, pr), ...extra };
@@ -603,10 +623,25 @@ export async function settleRecord({ gh, root, pr, now = Date.now, sleep = defau
     return { outcome: 'unsettled', rec, why: 'GitHub shows no queue entry and no removal for an attempt the record counts' };
   };
 
+  // The PR head moved off the record's. A live entry at the new head is tracked from here on (never dequeued or re-queued on this record's approval): see adoptHeadMoved.
+  // GitHub is asked once more for it (reconcile's answer names only the new head); an unreadable answer leaves the record live (ending it could lose the entry).
+  const movedOff = () => {
+    const base = `head moved off the approved ${rec.head.slice(0, 12)}`;
+    let now1;
+    try {
+      now1 = gh.queueState(pr);
+    } catch (err) {
+      return { outcome: 'unsettled', rec: readQueueRecord(root, pr), why: `${base}, but the merge queue could not be read to see whether an entry sits at the new head (${msgOf(err)})` };
+    }
+    if (now1.state !== 'OPEN' || !now1.entry || typeof now1.head !== 'string' || now1.head === rec.head) return finish('head-moved', base);
+    const adopt = { head: now1.head, entryId: now1.entry.id ?? null };
+    return finish('head-moved', `${base} and the PR is in the merge queue at ${now1.head.slice(0, 12)}, which nobody approved: it is not dequeued or merged on the old approval, and \`queue-sweep\` keeps tracking that entry`, { adopted: adopt }, adopt);
+  };
+
   const fromWatch = async (w) => {
     if (w.state === 'merged') return mergedOut(w.mergeSha, w.warning);
     if (w.state === 'closed') return finish('closed', 'was closed without merging');
-    if (w.state === 'head-moved') return finish('head-moved', `head moved off the approved ${rec.head.slice(0, 12)}`);
+    if (w.state === 'head-moved') return movedOff();
     if (w.state === 'removed') return gone(w.removal);
     if (w.state === 'blocked') {
       if (w.dequeued === false) return { outcome: 'unsettled', rec: readQueueRecord(root, pr), why: `a stop condition appeared (${(w.problems ?? []).join('; ')}) but the dequeue is not confirmed` };
@@ -625,7 +660,7 @@ export async function settleRecord({ gh, root, pr, now = Date.now, sleep = defau
   switch (r.kind) {
     case 'merged': return mergedOut(r.mergeSha, r.mergeSha ? undefined : 'GitHub did not report the merge commit');
     case 'closed': return finish('closed', 'was closed without merging');
-    case 'head-moved': return finish('head-moved', `head moved off the approved ${rec.head.slice(0, 12)}`);
+    case 'head-moved': return movedOff();
     case 'removed':
       noteRemoval(root, pr, r.removal);
       return gone(r.removal);
