@@ -603,3 +603,34 @@ test('gated: a live record of another head is discharged by the precheck (label 
   assert.equal(r.json.holdRestored, true, r.stdout);
   assert.match(r.json.holdRestoredNote, /owner must say "merge" again/);
 });
+
+// R2-F1 / #238: the same precheck discharge, then a GitHub read of the live gate throws: exit 3 (unavailable), and the owner still hears the label went back.
+test('gated: the precheck put needs-human back, then the live gate read fails: the unavailable output (exit 3) still carries holdRestored + holdRestoredNote (#238)', () => {
+  const OLD = 'd'.repeat(40);
+  const s = world({ after: [], hold: true, gh: { extra: [{ match: '^pr edit 12 --add-label needs-human$', stdout: '' }] } });
+  const approval = { items: 'none', areas: [], rulings: null };
+  openRecord(s.repo.dir, PR, OLD, approval, { repo: 'acme/widgets', repoId: 4242, route: 'owner-go' });
+  setHold(s.repo.dir, PR, { id: 'LE_hold1', login: 'jamila', at: '2026-11-05T09:00:00Z', holdBlock: 'digest', liftedAt: '2026-11-09T07:59:00Z' });
+  beginAttempt(s.repo.dir, PR, OLD, approval, { repo: 'acme/widgets', repoId: 4242 });
+  confirmAttempt(s.repo.dir, PR, 'MQE_1');
+  const entryAtOld = () => reply(queuedNode(OLD), [added()]);
+  s.q.show([entryAtOld, OUT([])]);
+  // GitHub blips on the live gate's first read of the PR, once the label is back (a wrapper over the fake: the fake alone cannot tell the call before the restore from the one after).
+  const wrapper = join(mkdtempSync(join(tmpdir(), 'cp-blip-')), 'gh.mjs');
+  writeFileSync(wrapper, [
+    "import { spawnSync } from 'node:child_process';",
+    "import { existsSync, readFileSync } from 'node:fs';",
+    "const log = process.env.PIPELINE_FAKE_GH_LOG;",
+    "const restored = existsSync(log) && readFileSync(log, 'utf8').includes('--add-label');",
+    "const argv = process.argv.slice(2);",
+    "if (restored && argv.join(' ').startsWith('pr view 12 --json state,headRefOid,baseRefName')) { process.stderr.write('gh: Server Error (HTTP 502)'); process.exit(1); }",
+    "const r = spawnSync(process.execPath, [process.env.WRAPPED_FAKE, ...argv], { stdio: 'inherit' });",
+    "process.exit(r.status ?? 1);",
+  ].join('\n'));
+  const r = s.run({ PIPELINE_GH: `node "${wrapper}"`, WRAPPED_FAKE: FAKE });
+  assertExit(r, 3, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.error, 'unavailable');
+  assert.equal(r.json.holdRestored, true, r.stdout);
+  assert.match(r.json.holdRestoredNote, /owner must say "merge" again/);
+  assert.equal(s.record().terminal, 'head-moved', 'the old record was discharged by the precheck');
+});

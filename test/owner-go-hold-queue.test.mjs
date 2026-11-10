@@ -341,6 +341,34 @@ test('#232 GitHub shows the record\'s head during orphan recovery and a live ent
   never(s, /--disable-auto|auto-merge/, 'auto-merge is never touched');
 });
 
+// #238: the same discharge, then GitHub blips on the first read of the PR (the owner-go flow's live scan): exit 3 (unavailable), and the owner still hears the label went back.
+test('#238 the precheck puts needs-human back, then a GitHub read of the PR throws: the unavailable output (exit 3) still carries holdRestored + holdRestoredNote', () => {
+  const s = world({ after: [] });
+  s.patch((st) => Object.assign(st, orphanState(OLD)));
+  liveRecordAtOld(s);
+  s.q.show([entryAtOld, entryAtOld, (h) => reply(node(h), [])]);
+  const wrapper = join(mkdtempSync(join(tmpdir(), 'cp-blip-')), 'gh.mjs');
+  writeFileSync(wrapper, [
+    "import { spawnSync } from 'node:child_process';",
+    "import { existsSync, readFileSync } from 'node:fs';",
+    "const log = process.env.PIPELINE_FAKE_GH_LOG;",
+    "const restored = existsSync(log) && readFileSync(log, 'utf8').includes('--add-label');",
+    "const argv = process.argv.slice(2);",
+    "if (restored && argv.join(' ').startsWith('pr view 12')) { process.stderr.write('gh: Server Error (HTTP 502)'); process.exit(1); }",
+    "const r = spawnSync(process.execPath, [process.env.WRAPPED_FAKE, ...argv], { stdio: 'inherit' });",
+    "process.exit(r.status ?? 1);",
+  ].join('\n'));
+  Object.assign(s.fake.env, { PIPELINE_GH: `node "${wrapper}"`, WRAPPED_FAKE: FAKE_QUEUE });
+  const r = s.go();
+  assertExit(r, 3, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.error, 'unavailable');
+  assert.equal(r.json.holdRestored, true, r.stdout);
+  assert.match(r.json.holdRestoredNote, /owner must say "merge" again/);
+  assert.equal(s.rec().terminal, 'head-moved', 'the old record was discharged by the precheck');
+  assert.deepEqual(s.st().labels, ['needs-human']);
+  assert.equal(s.enqueues().length, 0);
+});
+
 test('#232 GitHub shows the record\'s head during orphan recovery and this head with NO entry at the precheck: the record is discharged first (label back once), the new hold is not lifted blindly', () => {
   const s = world({ after: [] });
   s.patch((st) => Object.assign(st, orphanState(OLD)));
