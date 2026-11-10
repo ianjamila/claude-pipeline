@@ -123,3 +123,4 @@ full record.
 - 2026-11-09 · #215 · Resolution-only review tolerates line-ending attributes; ci-wait waits for a late check from a pre-ready run · risk high · rounds 7 · arbiter 2 · awaiting-owner-merge
 - 2026-11-09 · #221 · feat: repo moves — owner grants made before a repo transfer count for the new name · risk high · rounds 5 · arbiter 4 · awaiting-owner-merge
 - 2026-11-10 · #224 · fix: repo-move ties fail closed (#223); state show keeps post-publish marks · risk high · rounds 5 · arbiter 3 · awaiting-owner-merge
+- 2026-11-10 · #226 · Merge-queue mode: one owner "merge" queues the approved head (A1) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge
