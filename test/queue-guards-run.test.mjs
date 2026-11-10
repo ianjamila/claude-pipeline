@@ -247,6 +247,19 @@ test('poster: a stop condition is overruled only for a SETTLED predecessor, neve
   assert.deepEqual(states(unmerged), ALL('error'), 'a labelled predecessor that left the queue unmerged is an error');
 });
 
+test('poster: a LISTED predecessor whose PR reads as open and unmerged stays live: a blocker label is a failure and a pending status settles to success, never an error (R4-F1)', async () => {
+  const OPEN = { 3: { state: 'open', merged: false, mergeCommit: null } }; // (GET pulls/3 is scripted: the readable-PR path, not "could not be read")
+  const labelled = await exec({ labels: { 3: ['needs-human'] }, prs: OPEN });
+  assert.equal(labelled.code, 0, labelled.phase1.stderr + (labelled.phase2?.stderr ?? ''));
+  assert.deepEqual(states(labelled), ALL('failure'));
+  assert.match(labelled.final(CTX.hardstops).description, /^#3: .*needs-human/);
+  const pending = { ...goodStatus(3), state: 'pending' };
+  const settles = await exec({ prs: OPEN, status: (pr) => (pr === 3 ? [pending, goodStatus(3)] : goodStatus(pr)) }, { env: { QUEUE_PENDING_WAIT_MS: '60000' } });
+  assert.equal(settles.code, 0, settles.phase1.stderr + (settles.phase2?.stderr ?? ''));
+  assert.deepEqual(states(settles), ALL('success'));
+  assert.match(settles.final(CTX.integrity).description, /^earned on their heads by #3, #5$/);
+});
+
 test('poster: the member lookup that could not be read keeps the member\'s own verdict (failure), never a success (eaglewatch#1769)', async () => {
   const r = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN } }); // (GET pulls/3 is not scripted: unreadable)
   assert.notEqual(r.final(CTX.integrity)?.state, 'success');

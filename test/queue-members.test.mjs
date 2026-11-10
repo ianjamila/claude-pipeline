@@ -245,3 +245,12 @@ test('memberStanding: live, settled (merged at its own entry commit on the defau
   assert.equal((await ask(world({ entries: only5 }), a)).kind, 'unknown', 'the PR cannot be read');
   assert.equal((await ask(world({ graphqlFails: true }), a)).kind, 'unknown', 'the queue cannot be read');
 });
+
+test('memberStanding: a predecessor whose entry is still LISTED goes by its PR: open => live, merged at its own commit => settled, merged elsewhere => live (R4-F1)', async () => {
+  const m = await manifestOf();
+  const a = m.members[0];
+  const ask = (w) => memberStanding({ ...args(w), member: a });
+  assert.deepEqual(await ask(world({ prs: { 3: { state: 'open', merged: false, mergeCommit: null } } })), { kind: 'live' }, 'listed, PR readable and unmerged');
+  assert.deepEqual(await ask(world({ prs: { 3: merged(A) } })), { kind: 'settled' }, 'listed, but merged at its own queue commit');
+  assert.deepEqual(await ask(world({ prs: { 3: merged(sha('c')) } })), { kind: 'live' }, 'listed, merged at another commit');
+});
