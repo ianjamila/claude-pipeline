@@ -2,7 +2,7 @@
 // (the D2 chain rule), cross-checked with git data. `read` / `graphql` are scripted fakes standing in for the GitHub API.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseQueueRef, queueManifest, recheckManifest } from '../pipeline/lib/queue-members.mjs';
+import { memberStanding, parseQueueRef, queueManifest, recheckManifest } from '../pipeline/lib/queue-members.mjs';
 
 const REPO = 'acme/app';
 const sha = (c) => c.repeat(40);
@@ -227,4 +227,21 @@ test('recheck: a predecessor still live but changed (head pushed elsewhere / re-
 test('recheck: unreadable queue => not ok', async () => {
   const m = await manifestOf();
   assert.equal((await recheckManifest({ ...args(world({ graphqlFails: true })), manifest: m })).ok, false);
+});
+
+// --- memberStanding: the poster's member check after a predecessor may have merged (eaglewatch#1769) ---
+
+test('memberStanding: live, settled (merged at its own entry commit on the default branch), gone, unknown', async () => {
+  const m = await manifestOf();
+  const [a, b] = m.members;
+  const only5 = [entry('E5', 5, HEAD5, B, A)];
+  const ask = (w, member) => memberStanding({ ...args(w), member });
+  assert.deepEqual(await ask(world(), a), { kind: 'live' }, 'still in the queue');
+  assert.deepEqual(await ask(world({ entries: only5, prs: { 3: merged(A) } }), a), { kind: 'settled' });
+  assert.deepEqual(await ask(world({ entries: [] }), b), { kind: 'live' }, 'the top entry owns the queue commit: never settled');
+  assert.equal((await ask(world({ entries: only5, prs: { 3: merged(sha('c')) } }), a)).kind, 'gone', 'merged at another commit');
+  assert.equal((await ask(world({ entries: only5, prs: { 3: { state: 'open', merged: false, mergeCommit: null } } }), a)).kind, 'gone', 'left unmerged');
+  assert.equal((await ask(world({ entries: only5, prs: { 3: merged(A) }, defaultStatus: 'diverged' }), a)).kind, 'gone', 'its commit is not on the default branch');
+  assert.equal((await ask(world({ entries: only5 }), a)).kind, 'unknown', 'the PR cannot be read');
+  assert.equal((await ask(world({ graphqlFails: true }), a)).kind, 'unknown', 'the queue cannot be read');
 });
