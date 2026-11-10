@@ -41,7 +41,7 @@ export const meta = {
     '  an identical latest comment of ours is reused, not posted again; exit 3 when GitHub is unavailable or the label is still on the PR after removal',
     '  a round past review.max_rounds must carry the owner\'s extra-round grant (codex-review records it), re-proved here against the owner\'s record and its marker on THIS machine (the',
     '  same check as the final gate\'s review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise',
-    '  a proven Fable round recorded with a Fable older than MIN_FABLE that no later whole-PR pass at or above it replaced is refused: exit 1 {ok:false, error:fable-refresh, reason, staleFableRounds:[{round, models}]},',
+    '  a proven Fable round recorded with a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) that no later whole-PR pass at or above it replaced is refused: exit 1 {ok:false, error:fable-refresh, reason, staleFableRounds:[{round, models}]},',
     '  the reason names the rounds and models and says `run `pipeline state fable-refresh --pr N``; the final gate\'s review check refuses the same PR the same way',
   ].join('\n'),
 };

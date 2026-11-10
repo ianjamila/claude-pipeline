@@ -508,7 +508,7 @@ pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused
   an identical latest comment of ours is reused, not posted again; exit 3 when GitHub is unavailable or the label is still on the PR after removal
   a round past review.max_rounds must carry the owner's extra-round grant (codex-review records it), re-proved here against the owner's record and its marker on THIS machine (the
   same check as the final gate's review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise
-  a proven Fable round recorded with a Fable older than MIN_FABLE that no later whole-PR pass at or above it replaced is refused: exit 1 {ok:false, error:fable-refresh, reason, staleFableRounds:[{round, models}]},
+  a proven Fable round recorded with a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) that no later whole-PR pass at or above it replaced is refused: exit 1 {ok:false, error:fable-refresh, reason, staleFableRounds:[{round, models}]},
   the reason names the rounds and models and says `run `pipeline state fable-refresh --pr N``; the final gate's review check refuses the same PR the same way
 ```
 
@@ -625,9 +625,9 @@ pipeline state mark-implemented --ids a,b [--repo DIR]
      hash would be measured from it - also with no origin remote but a leftover origin/<default_branch> ref: a stale base would count the default branch's commits as the fix
 pipeline state fable-refresh --pr N [--repo DIR]
   -> {ok, round, staleRounds, scope: "whole-pr"}: opens an uncounted Fable-only round (no Codex, not counted against review.max_rounds, allowed past it and with no new commit) on the pushed head, so a Fable pass proven with
-     a Fable older than MIN_FABLE is re-reviewed. Refused (exit 2) unless a proven Fable round is below MIN_FABLE and no later whole-PR pass at or above it replaced it (error nothing-stale), every earlier round is finished
+     a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) is re-reviewed. Refused (exit 2) unless a proven Fable round is below that and no later whole-PR pass at or above it replaced it (error nothing-stale), every earlier round is finished
      (error unfinished-round: a Fable pass owed, an undecided, human-owed, unimplemented or newly accepted item), HEAD is the head of PR N on GitHub (error head-not-pushed; exit 3 when GitHub is unreachable)
-     and the content is what the last round reviewed (error content-moved: run a normal codex-review round instead, its Fable pass already reads the whole PR). Then: arbiter needed --round R, the arbiter, arbiter apply
+     and the content is what the last round reviewed, or only ledger rows were added since (review.docs_exempt_paths; the round then stays pinned at the last reviewed head) (error content-moved: run a normal codex-review round instead, its Fable pass already reads the whole PR). Then: arbiter needed --round R, the arbiter, arbiter apply
 pipeline state record-followup --id ID --url URL [--repo DIR]
 pipeline state set-outcome --outcome TEXT [--repo DIR]
 ```
