@@ -207,6 +207,14 @@ test('poster: predecessor A merged between the manifest and the guard check (its
   assert.equal(r.artifact, `queue-verdict_v1_${Q}_success_success_success`);
 });
 
+test('poster: predecessor A merged at its own entry commit while its entry is STILL listed (its run lists no PR) => B still success (eaglewatch#1769, R3-F1)', async () => {
+  const r = await exec({ queue: [TWO(), TWO(), TWO()], runs: { 3: MERGED_RUN }, prs: { 3: { state: 'closed', merged: true, mergeCommit: A } } });
+  assert.equal(r.code, 0, r.phase1.stderr + (r.phase2?.stderr ?? ''));
+  assert.deepEqual(['integrity', 'hardstops', 'review'].map((k) => r.verdict.checks[k].state), ['success', 'success', 'success'], 'evaluate');
+  assert.deepEqual(states(r), ALL('success'), 'publish');
+  assert.match(r.final(CTX.integrity).description, /^earned on their heads by #3 \(merged\), #5$/);
+});
+
 test('poster: predecessor A merged at ANOTHER commit, or left unmerged, before the guard check => error in evaluate (and so in publish) (eaglewatch#1769)', async () => {
   const other = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: { state: 'closed', merged: true, mergeCommit: sha('c') } } });
   assert.deepEqual(states(other), ALL('error'));

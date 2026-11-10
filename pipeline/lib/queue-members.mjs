@@ -186,16 +186,17 @@ function unsettledReason({ read, repo, defaultBranch, member: m }) {
  * Where one manifest member stands NOW, for the poster's member check (eaglewatch#1769). GitHub empties `pull_requests` on the guard runs of a PR that merged
  * (the branch is deleted), so a predecessor that merged after the manifest was taken can no longer pass the provenance check; it does not need to, since it merged
  * on its own entry's green statuses. The same rule as recheckManifest's:
- *   { kind: 'live' }     the entry is still in the queue (or is the top entry, which owns the queue commit): the full guard check stands;
- *   { kind: 'settled' }  it left the queue, merged at its OWN queue commit, and that commit is on the default branch: its guard re-check is skipped;
+ *   { kind: 'live' }     the entry is still in the queue and not merged (or is the top entry, which owns the queue commit): the full guard check stands;
+ *   { kind: 'settled' }  it merged at its OWN queue commit, and that commit is on the default branch: its guard re-check is skipped;
  *   { kind: 'gone', reason }  it left the queue any other way (removed, merged at another commit): an error;
  *   { kind: 'unknown', reason }  the queue or the PR could not be read: the caller keeps its own verdict.
  */
 export function memberStanding({ read, graphql, repo, defaultBranch, queueSha, member }) {
   const got = readQueueEntries({ graphql, repo, defaultBranch });
   if (!got.ok) return { kind: 'unknown', reason: got.reason };
-  if (got.entries.some((e) => e.id === member.entryId) || member.commit === queueSha) return { kind: 'live' };
+  if (member.commit === queueSha) return { kind: 'live' }; // the top entry owns the queue commit: always judged live
   const why = unsettledReason({ read, repo, defaultBranch, member });
-  if (why === null) return { kind: 'settled' };
+  if (why === null) return { kind: 'settled' }; // merged at its own queue commit and on the default branch, whether or not its entry is still listed
+  if (got.entries.some((e) => e.id === member.entryId)) return { kind: 'live' };
   return why.includes('could not be read') ? { kind: 'unknown', reason: why } : { kind: 'gone', reason: why };
 }
