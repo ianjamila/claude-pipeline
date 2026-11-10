@@ -460,7 +460,12 @@ test('resetFloor --allow-id: stores the ids (deduplicated, kept by a later reset
   assert.equal(Object.hasOwn(JSON.parse(readFileSync(reg(dir), 'utf8')), 'allow'), false);
 
   const many = Array.from({ length: ALLOW_MAX + 1 }, (_, i) => `claude-fable-${i + 10}`);
-  await assert.rejects(resetFloor({ dir, allowId: many }), { code: 'model-floor-bad-allow' });
+  await assert.rejects(resetFloor({ dir, allowId: many }), (err) => {
+    assert.equal(err.code, 'model-floor-bad-allow');
+    // R5-F1: the cap refusal names the per-id removal first, never only the all-or-nothing clear.
+    assert.match(err.message, /remove one with --remove-allow <id> \(or all with --clear-allow\)/);
+    return true;
+  });
   assert.equal(Object.hasOwn(JSON.parse(readFileSync(reg(dir), 'utf8')), 'allow'), false, 'a refused reset writes nothing');
   assert.equal((await resetFloor({ dir, allowId: many.slice(0, ALLOW_MAX) })).registry.allow.length, ALLOW_MAX);
 });

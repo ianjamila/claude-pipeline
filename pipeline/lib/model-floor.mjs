@@ -294,7 +294,7 @@ export async function resetFloor({ hold, clearHold = false, allowId = [], remove
     const unknown = removeAllow.filter((id) => !listed.includes(id));
     if (unknown.length > 0) throw codeError('model-floor-bad-allow', `cannot remove ${unknown.join(', ')}: not on the allow list (${listed.length > 0 ? listed.join(', ') : 'it is empty'})`);
     const allow = clearAllow ? [] : [...new Set([...listed.filter((id) => !removeAllow.includes(id)), ...allowId])];
-    if (allow.length > ALLOW_MAX) throw codeError('model-floor-bad-allow', `at most ${ALLOW_MAX} allowed ids (${allow.length} asked): clear them with --clear-allow first`);
+    if (allow.length > ALLOW_MAX) throw codeError('model-floor-bad-allow', `at most ${ALLOW_MAX} allowed ids (${allow.length} asked): remove one with --remove-allow <id> (or all with --clear-allow) first`);
     const { allow: _dropped, ...learned } = current.ok && current.registry ? current.registry : {};
     const registry = allowOnly
       ? { version: 1, newest: canonical(MIN_FABLE), provenAt: null, claudeCode: null, transcript: null, history: [], hold: null, ...learned, ...(allow.length > 0 ? { allow } : {}) }
