@@ -232,6 +232,21 @@ test('poster: a LIVE member whose provenance fails is still a failure, even when
   assert.equal(live.artifact, `queue-verdict_v1_${Q}_failure_failure_failure`);
 });
 
+test('poster: a stop condition is overruled only for a SETTLED predecessor, never for the live top entry (eaglewatch#1769, R3-F2)', async () => {
+  const merged = { queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: { state: 'closed', merged: true, mergeCommit: A } } };
+  const paused = await exec({ ...merged, issues: { 'pipeline-pause': 41 } });
+  assert.deepEqual(states(paused), ALL('failure'), 'a pause issue holds the group: the top entry B is live');
+  assert.match(paused.final(CTX.integrity).description, /pipeline-pause/);
+  const topMerged = await exec({ ...merged, prs: { ...merged.prs, 5: { state: 'closed', merged: true, mergeCommit: Q } }, issues: { 'pipeline-pause': 41 } });
+  assert.deepEqual(states(topMerged), ALL('failure'), 'even a top entry that reads as merged at the queue commit is never settled');
+  const labelled = await exec({ ...merged, labels: { 3: ['needs-human'] } });
+  assert.equal(labelled.code, 0, labelled.phase1.stderr + (labelled.phase2?.stderr ?? ''));
+  assert.deepEqual(states(labelled), ALL('success'), 'a label on a merged predecessor is moot');
+  assert.match(labelled.final(CTX.integrity).description, /^earned on their heads by #3 \(merged\), #5$/);
+  const unmerged = await exec({ ...merged, labels: { 3: ['needs-human'] }, prs: { 3: { state: 'open', merged: false, mergeCommit: null } } });
+  assert.deepEqual(states(unmerged), ALL('error'), 'a labelled predecessor that left the queue unmerged is an error');
+});
+
 test('poster: the member lookup that could not be read keeps the member\'s own verdict (failure), never a success (eaglewatch#1769)', async () => {
   const r = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN } }); // (GET pulls/3 is not scripted: unreadable)
   assert.notEqual(r.final(CTX.integrity)?.state, 'success');
