@@ -269,11 +269,28 @@ export function entrySource(e) {
 // of 'unknown' source in it is not trusted (an interrupt marker, a compaction summary, a source this list does not know).
 const hasProvenanceField = (e) => e.promptSource !== undefined || e.origin !== undefined || e.entrypoint !== undefined || e.turnOrigin !== undefined;
 
-// The parsed entries of the transcript's last `tailBytes` (a cut first line dropped); [] when it cannot be read as a regular file.
+// #191 (A2/F1/F2): which prompt entries start a turn the owner SEES. A synthetic prompt with promptSource 'system' AND entrypoint 'cli' is a turn the interactive UI starts itself (a task
+// notice, an Agent hand-back, a peer or plugin message, a scheduled wake-up, auto-continuation) and renders: isMeta hides the PROMPT, never the assistant text of the reply. The agent
+// can cause each of these and fill it with a request line; that is no bypass, because what it prints is on the owner's screen when they answer (the premise of #189's promotion of a
+// ruling ask, written down here for every reader). A headless `claude -p --resume <session>` turn (promptSource sdk / entrypoint sdk-cli), any other non-human origin and anything else
+// that is not the owner's writes into the owner's transcript and shows NOTHING on screen.
+const visibleSynthetic = (e) => entrySource(e) === 'synthetic' && e.promptSource === 'system' && e.entrypoint === 'cli';
+// An INVISIBLE turn: a prompt entry that is not the owner's and not visibleSynthetic, with provenance to say so. F1: an entry carrying a provenance field whose source entrySource
+// cannot place ('unknown': a value Claude Code adds later) counts as invisible too (fail closed); a field-less 'unknown' entry (an interrupt marker, a legacy transcript) is a plain
+// boundary as before. Only prompt entries are turns: a tool_result user entry is never one (F7).
+const invisibleTurn = (e) => {
+  if (!isPromptEntry(e) || visibleSynthetic(e)) return false;
+  const source = entrySource(e);
+  return source === 'synthetic' || (source === 'unknown' && hasProvenanceField(e));
+};
+
+// The parsed entries of the transcript's last `tailBytes` (a cut first line dropped) and whether the read reached the file's start (#191 A3, F7: callers read `.entries`);
+// no entries when it cannot be read as a regular file.
 function tailEntries(transcriptPath, tailBytes) {
   let raw = '';
+  let reachedStart = true;
   try {
-    if (!lstatSync(transcriptPath).isFile()) return [];
+    if (!lstatSync(transcriptPath).isFile()) return { entries: [], reachedStart: false };
     const fd = openSync(transcriptPath, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
     try {
       const size = fstatSync(fd).size;
@@ -281,19 +298,19 @@ function tailEntries(transcriptPath, tailBytes) {
       const buf = Buffer.alloc(len);
       readSync(fd, buf, 0, len, size - len);
       raw = buf.toString('utf8');
-      if (len < size) raw = raw.slice(raw.indexOf('\n') + 1); // drop the cut first line
+      if (len < size) { raw = raw.slice(raw.indexOf('\n') + 1); reachedStart = false; } // drop the cut first line
     } finally {
       closeSync(fd);
     }
   } catch {
-    return [];
+    return { entries: [], reachedStart: false };
   }
-  const out = [];
+  const entries = [];
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
-    try { out.push(JSON.parse(line)); } catch { /* a torn line */ }
+    try { entries.push(JSON.parse(line)); } catch { /* a torn line */ }
   }
-  return out;
+  return { entries, reachedStart };
 }
 
 // The text of the last assistant reply in the transcript when it holds a 🔀 merge request ('' when none). Only the
@@ -356,7 +373,7 @@ const inputSurfacesAsk = (input) => { const text = toolUseText(input); return te
 const isHiddenSummary = (e) => e?.type === 'user' && e.isCompactSummary === true && e.isVisibleInTranscriptOnly === true;
 // The newest user/assistant entry when it is a prompt whose text is `prompt` (the submission being recorded, already in the transcript), else null.
 function currentPromptEntry(transcriptPath, prompt) {
-  const entries = tailEntries(transcriptPath, TRANSCRIPT_TAIL_BYTES);
+  const { entries } = tailEntries(transcriptPath, TRANSCRIPT_TAIL_BYTES);
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
     if ((e?.type !== 'user' && e?.type !== 'assistant') || isHiddenSummary(e)) continue;
@@ -376,8 +393,13 @@ function currentPromptEntry(transcriptPath, prompt) {
 // with text voids an earlier promoted slot while a tool-only one leaves it. Why this is no weaker: the ask was agent-written in either kind of turn; what binds is the owner's TYPED answer
 // (entrySource 'owner', promptProvenance at use time), the ids on the last line and the content digest owner-ruling recomputes. The slot binds only its own PR / ids / digest.
 // This narrows R1-F3; the PR calls it out for the owner.
-// Only a prompt entry with promptSource 'system' AND entrypoint 'cli' promotes (a notice the interactive UI renders). An 'sdk' / 'sdk-cli' turn (a headless `claude -p --resume` of this
+// Only a visibleSynthetic prompt entry (promptSource 'system' AND entrypoint 'cli': a notice the interactive UI renders) promotes. An 'sdk' / 'sdk-cli' turn (a headless `claude -p --resume` of this
 // session writes into the owner's transcript and shows nothing on screen), any other non-human origin and an unknown source keep R1-F3: ANY text voids the slot.
+// #191 A2 (every other reader, skipSynthetic false: merge, extra round): an invisible turn is a boundary as before (it opens a new EMPTY slot, so an older request stays stale) but its
+// assistant text is never added to that slot, so nothing an invisible turn prints can be bound by the owner's next "merge" / "extra round" (the owner never saw it); the owner is asked again.
+// #191 A3 (cut-off origin, all modes): the tail read starts at an arbitrary byte, so the text before the window's first prompt entry (slot 0) belongs to a turn whose prompt was cut off
+// and whose origin is unknown; slot 0 is never a reply (in a whole file it is text before any prompt, which a real transcript does not hold). Accepted cost: an ask turn longer than
+// the window is refused once and the re-ask recovers.
 // Fable plan pass finding 2 (queued answers): an owner prompt typed while the agent was busy (promptSource 'queued') can be delivered after a promoted ask the owner never saw. So the
 // result says which slot is promoted; recordRuling stamps `ask_turn: 'synthetic'` on that record and refuses a queued current entry, and promptProvenance refuses such a record whose prompt
 // entry is queued. (An owner-turn ask has a narrower, pre-existing form of this: a follow-up issue.)
@@ -388,6 +410,7 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
   let lastIsPrompt = false; // is the newest user/assistant entry a prompt (the owner's current one)?
   let lastPromptText = '';
   let skipping = false; // inside a synthetic turn: its prompt and the replies to it
+  let muted = false; // inside an invisible turn read without skipSynthetic (#191 A2): its assistant text is not added to its slot
   let turn = null; // the synthetic turn being read (skipSynthetic): { promote, text, surfacedAfterText, anything }
   const flush = () => {
     if (turn === null) return;
@@ -399,7 +422,7 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
       lastIsPrompt = false;
     } else if (t.anything) voided.add(replies.length - 1);
   };
-  for (const e of tailEntries(transcriptPath, tailBytes)) {
+  for (const e of tailEntries(transcriptPath, tailBytes).entries) {
     const content = e?.message?.content;
     if (e?.type === 'user') {
       if (isHiddenSummary(e)) continue;
@@ -407,7 +430,7 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
       if (isPrompt) flush();
       if (isPrompt && skipSynthetic && entrySource(e) === 'synthetic') {
         skipping = true;
-        turn = { promote: e.promptSource === 'system' && e.entrypoint === 'cli', text: '', surfacedAfterText: false, anything: false };
+        turn = { promote: visibleSynthetic(e), text: '', surfacedAfterText: false, anything: false };
         continue;
       }
       if (isPrompt) skipping = false;
@@ -418,6 +441,7 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
       if (isPrompt) {
         replies.push('');
         lastPromptText = promptTextOf(e);
+        muted = !skipSynthetic && invisibleTurn(e);
       }
       lastIsPrompt = isPrompt;
     } else if (e?.type === 'assistant' && Array.isArray(content)) {
@@ -429,6 +453,7 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
         continue;
       }
       lastIsPrompt = false;
+      if (muted) continue;
       for (const b of content) if (b?.type === 'text' && typeof b.text === 'string') replies[replies.length - 1] += `${b.text}\n`;
     }
   }
@@ -438,6 +463,7 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
   // older request is never revived by a later "merge": the agent shows it again.
   const current = lastIsPrompt && (prompt === undefined || plain(prompt) === lastPromptText);
   const last = replies.length - 1 - (current && replies.length > 1 ? 1 : 0);
+  if (last === 0) return { text: '', promoted: false }; // A3: slot 0 (text before the window's first prompt) has no known origin
   return voided.has(last) ? { text: '', promoted: false } : { text: replies[last] ?? '', promoted: promoted.has(last) };
 }
 export const lastReplyText = (transcriptPath, opts = {}) => lastReply(transcriptPath, opts).text;
