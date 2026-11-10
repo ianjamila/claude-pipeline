@@ -83,6 +83,11 @@ export function triageComment(state) {
   if (claudeLines.length > 0) out.push('', '#### Claude rulings', '', ...claudeLines);
   const granted = grantedRounds(state);
   if (granted.length > 0) out.push('', `Owner-granted extra round(s): ${granted.map((g) => `${grantLabel(g)} - "${line(g.quote, 300)}"`).join('; ')}`);
+  // A Fable pass that stopped on the floor or a stale terminal (arbiter.mjs): visible even when the round has no item to carry the cause.
+  for (const r of rounds) {
+    const f = r?.arbiter?.failure;
+    if (isObject(f) && f.cause && r.arbiter.proofOk !== true) out.push('', `Round ${line(r.n)} arbiter stopped: ${line(f.cause)}${f.advice ? ` — ${line(f.advice)}` : ''}`);
+  }
   out.push('', encodeForComment(state));
   return out.join('\n');
 }

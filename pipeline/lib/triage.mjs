@@ -151,6 +151,11 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
 // A round recorded with `fableRequired` (codex-review: risk.mjs#reviewLane said fable) is reviewed by ONE Fable pass that
 // rules on every Codex item and reviews the diff itself. Until that pass is PROVEN (`arbiter.proofOk === true`) the round
 // is not reviewed, even when Codex found nothing: the Fable pass is the second review, not a dispute tie-break.
+// The Fable steps that stopped on the floor or a stale terminal and have not been proven since (round.arbiter.failure, written by arbiter.mjs).
+export const arbiterFailures = (state) => (state?.rounds ?? [])
+  .filter((r) => r?.arbiter?.failure && typeof r.arbiter.failure === 'object' && r.arbiter.proofOk !== true)
+  .map((r) => ({ round: r.n, cause: r.arbiter.failure.cause, advice: r.arbiter.failure.advice ?? null }));
+
 export const fablePendingRounds = (state) => (state?.rounds ?? [])
   .filter((r) => r?.fableRequired === true && r.baseOnly !== true && r.arbiter?.proofOk !== true)
   .map((r) => r.n);
@@ -656,6 +661,7 @@ export function roundOutcome(state, { grants, head } = {}) {
   const grantedRound = open ? { k: reviewed + 1, grantId: open.grantId, head: open.head, quote: typeof open.quote === 'string' ? open.quote : null } : null;
   return {
     clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, extraRound, effectiveMaxRounds, coverageValid, fablePending,
+    arbiterFailures: arbiterFailures(state),
     grantedRound, autoExtraOrdinal: autoOrd,
   };
 }

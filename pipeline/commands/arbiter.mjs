@@ -14,6 +14,7 @@ import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { fingerprint, largeBinaryNote, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
 import { GitError, ReviewBaseUnavailable, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
+import { claudeCodeStatus } from '../lib/claude-code-version.mjs';
 import { floorOutput, floorPauseSeam, floorWaitMs, fableModelsOf, judgeFloor, mayRaiseFloor } from '../lib/floor-proof.mjs';
 import { compareVersions, parseModelId, raiseFloor, withFloorLock } from '../lib/model-floor.mjs';
 import { seamFlag } from '../lib/proc.mjs';
@@ -35,6 +36,9 @@ export const meta = {
     '  -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader[, diffPath, scope]}',
     '  mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied',
     '    (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that)',
+    '  mode review in a terminal whose Claude Code build is older than the installed one (stale): exit 1 {ok:false, error: stale-terminal, restartRequired: true,',
+    '    claudeCode: {running, installed, stale}, advice} BEFORE any input is written (no Fable spend); restart the terminal, then run needed again; unknown versions (stale null) do not stop it;',
+    '    the stop is saved as round.arbiter.failure {cause, advice, at}',
     '  a retry clears an unproven or malformed ruling (model-proof / invalid-arbiter, in either mode) so the arbiter answers again; the owner\'s and Claude\'s rulings are kept; an item the arbiter no longer needs is settled by the judge again',
     '  mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none',
     '  start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman',
@@ -44,6 +48,8 @@ export const meta = {
     '  any Fable on any line of the transcript must be at least this machine\'s floor (whatever --expect-model says): older => exit 1, error stale-model,',
     '    restartRequired: true, floor: {newest, seen}, advice (restart this terminal, or update Claude Code); the items wait with cause stale-model. A proven pass',
     '    with a newer Fable raises the floor (only a transcript under the account\'s own projects folder, no --projects-dir; exit 1 model-floor-busy / model-floor-unwritable otherwise unproven)',
+    '  an apply that fails on the floor (stale-model, model-floor-unreadable, unrecognised-fable, model-floor-busy, model-floor-unwritable) saves round.arbiter.failure {cause, advice, at}',
+    '    (a zero-item Fable round has no item to carry the cause); the next apply that proves clears it',
     '  mode review: the answer must also carry `findings` (Fable\'s own review, [] when clean); proven findings become items R<n>-F<k>;',
     '    unproven ones are kept in rulings.json as `unverifiedFindings` and the round stays Fable-pending (run needed + the arbiter again)',
   ].join('\n'),
@@ -126,6 +132,14 @@ function needed(rest, ctx) {
   return withStateLock(root, ctx, () => neededLocked(values, n, root, ctx));
 }
 
+// What the round records when its arbiter step stops (round.arbiter.failure): kept beside the other arbiter data so it travels in the triage comment.
+// A zero-item Fable round has no item to carry the cause, so this is the only place it is visible.
+const failureOf = (cause, advice) => ({ cause, advice: advice ?? null, at: new Date().toISOString() });
+const withFailure = (state, n, failure) => patchRound(state, n, { arbiter: { ...(findRound(state, n).arbiter ?? {}), failure } });
+
+// The advice a floor failure carries (judgeFloor gives one for a stale or unreadable floor; an unreadable Fable id has none).
+const floorAdviceFor = (judged) => judged.advice ?? (judged.error === 'unrecognised-fable' ? 'update the pipeline, then run the review again' : null);
+
 const isFableRound = (round) => round.fableRequired === true && round.baseOnly !== true;
 const FABLE_DIFF = 'fable-diff.patch';
 
@@ -206,6 +220,16 @@ function neededLocked(values, n, root, ctx) {
   const mode = review ? 'review' : 'dispute';
 
   if (review && round.arbiter?.proofOk === true) return { exitCode: EXIT.OK, output: { needed: false, items: [], mode, done: true } };
+  // A terminal that runs an older Claude Code than the installed one resolves the old `fable` alias: stop before anything is written or spent.
+  if (review) {
+    let claudeCode = { running: null, installed: null, stale: null };
+    try { claudeCode = claudeCodeStatus(ctx.env ?? process.env); } catch { /* unreadable: unknown, no stop */ }
+    if (claudeCode.stale === true) {
+      const advice = `this terminal runs Claude Code ${claudeCode.running} but ${claudeCode.installed} is installed: restart this terminal, then run \`arbiter needed\` again`;
+      saveState(root, withFailure(state, n, failureOf('stale-terminal', advice)));
+      return { exitCode: EXIT.FAILED, output: { ok: false, error: 'stale-terminal', restartRequired: true, claudeCode, advice } };
+    }
+  }
   if (review && round.arbiter) {
     // An earlier pass for this round was not proven, so its rulings never counted (they only parked items): clear them and
     // rule again. The owner's own rulings and Claude's stay (E10: a protected final is never reset).
@@ -250,7 +274,8 @@ function neededLocked(values, n, root, ctx) {
   const inputPath = path.join(ensureRoundDir(root, n), 'arbiter-input.md');
   writeFileAtomic(inputPath, `ROUND: ${n}\nINPUT-DIGEST: ${digest}\n\n${body}`);
   const ids = items.map((i) => i.id);
-  const stored = { inputDigest: digest, items: ids, tag, mode, ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}) };
+  const kept = round.arbiter?.failure;
+  const stored = { inputDigest: digest, items: ids, tag, mode, ...(kept ? { failure: kept } : {}), ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}) };
   saveState(root, patchRound(state, n, { arbiter: stored }));
   const promptHeader = `ROUND: ${n}\nINPUT-DIGEST: ${digest}`;
   return {
@@ -429,7 +454,10 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
     // The proof summary rides in the round, so the triage comment (which embeds the state) carries it to another machine.
     const efforts = proof.efforts && typeof proof.efforts === 'object' ? Object.keys(proof.efforts).join(', ') : '';
     const modelProof = proofOk ? { transcript: found.jsonlPath, models: proof.models, ...(efforts ? { effort: efforts } : {}) } : undefined;
-    saveState(root, patchRound(updateItems(state, n, items), n, { arbiter: { ...stored, proofOk, transcript: found.jsonlPath }, modelProof }));
+    // A floor failure is recorded on the round (a zero-item Fable round has no item to carry it); a proven or otherwise-failed apply clears the old one.
+    const { failure: _earlier, ...storedNow } = stored;
+    const failure = !proofOk && judged.applies === true && typeof judged.error === 'string' ? failureOf(judged.error, floorAdviceFor(judged)) : null;
+    saveState(root, patchRound(updateItems(state, n, items), n, { arbiter: { ...storedNow, proofOk, transcript: found.jsonlPath, ...(failure ? { failure } : {}) }, modelProof }));
 
     const byId = new Map(items.map((i) => [i.id, i]));
     return {
@@ -487,6 +515,10 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
   } catch (err) {
     // Fail closed, nothing published or saved: the retry proves again.
     if (err?.code === 'model-floor-busy' || err?.code === 'model-floor-unwritable') {
+      const advice = err.code === 'model-floor-busy'
+        ? 'another review holds the machine-wide floor lock: run `arbiter apply` again in a minute; if it persists, the owner runs `pipeline model-floor reset --clear-lock` in a plain terminal'
+        : 'the owner runs `pipeline model-floor reset` in a plain terminal';
+      saveState(root, withFailure(requireState(root), n, failureOf(err.code, advice)));
       throw new Fail(EXIT.FAILED, { ok: false, error: err.code, message: err.message });
     }
     throw err;
