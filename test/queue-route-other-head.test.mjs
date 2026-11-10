@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
 import { beginAttempt, confirmAttempt, noteRemoval, openRecord, queueRecordPath, readQueueRecord, setHold } from '../pipeline/lib/merge-queue.mjs';
+import { RESTORE_NOTE } from '../pipeline/lib/hold.mjs';
 import { createQueueRoute, restoreHoldOnTerminal } from '../pipeline/lib/queue-route.mjs';
 import { sweepRepo } from '../pipeline/lib/queue-sweep.mjs';
 
@@ -245,6 +246,7 @@ test('7b. GitHub at K, no entry, the record holds a lifted hold: H ends head-mov
   assert.equal(res.done, undefined, 'not refused');
   assert.equal(res.enqueue, true);
   assert.equal(res.requeue, false);
+  assert.deepEqual(res.holdFields, { holdRestored: true, holdRestoredNote: RESTORE_NOTE }, 'the caller is told the label went back (R1-F1)');
   assert.deepEqual(writes(gh), ['add needs-human'], 'the hold went back exactly once');
   const old = readQueueRecord(root, PR);
   assert.equal(old.terminal, 'head-moved');
@@ -263,6 +265,7 @@ test('7b\'. the same with NO hold on the record: H ends head-moved, no label cal
   const gh = stub({ states: [st({ head: K })], events: [[]] });
   const res = await routeFor(root, gh).precheck();
   assert.equal(res.enqueue, true);
+  assert.equal(res.holdFields, undefined, 'no label went back: nothing to report');
   assert.deepEqual(writes(gh), []);
   assert.equal(readQueueRecord(root, PR).terminal, 'head-moved');
 });
@@ -274,8 +277,21 @@ test('7c. GitHub at a third head J, no entry: H ends head-moved (restored once),
   const res = await routeFor(root, gh).precheck();
   assert.equal(res.enqueue, undefined);
   assert.equal(out(res).error, 'head-moved');
+  assert.equal(out(res).holdRestored, true, 'the refusal says the label went back (R1-F1)');
+  assert.equal(out(res).holdRestoredNote, RESTORE_NOTE);
   assert.deepEqual(writes(gh), ['add needs-human'], 'restored once, not twice');
   assert.equal(readQueueRecord(root, PR).terminal, 'head-moved');
+});
+
+test('7c\'. the same with NO hold on the record: the head-moved refusal reports no restore', async () => {
+  const root = repoDir();
+  recordAt(root, { hold: false });
+  const gh = stub({ states: [st({ head: J })], events: [[]] });
+  const res = await routeFor(root, gh).precheck();
+  assert.equal(out(res).error, 'head-moved');
+  assert.equal('holdRestored' in out(res), false);
+  assert.equal('holdRestoredNote' in out(res), false);
+  assert.deepEqual(writes(gh), []);
 });
 
 test('7d. GitHub at K, no entry, the restore FAILS: H\'s record stays live (nothing is lost), the caller is refused, nothing is enqueued', async () => {

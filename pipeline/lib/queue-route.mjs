@@ -2,6 +2,7 @@
 // watches the entry with today's stop conditions, and re-queues the SAME head once after a group-check failure. Both merge routes
 // (gated and --owner-go) do their own gating and then hand over to this engine; they never branch on queue state anywhere else.
 //   precheck()         reads GitHub first (never enqueues twice, reports a merge that already happened) -> { done } | { watch } | { enqueue }
+//                      (a result after a live record of another head was discharged may carry holdFields: the hold fields that discharge produced)
 //   enqueueAndWatch()  begin attempt, enqueue, confirm, watch, re-queue once -> { exitCode, output }
 // Nothing here ever disables auto-merge or dequeues for a time-out: `still-queued` leaves the entry exactly as it is.
 import { EXIT } from './cli.mjs';
@@ -244,7 +245,12 @@ export function createQueueRoute({
     if (liveRecord() !== null) {
       return { done: refusal('head-moved', [`PR #${pr}'s head is ${jHead.slice(0, 12)}, off the ${tag} the live queue record here is for; that record could not be closed${holdFields.holdRestoreNote ? ` (${holdFields.holdRestoreNote})` : ''}, so nothing was queued for this worktree`], { queued: false, ...holdFields }) };
     }
-    return precheck();
+    // The discharge put a label back (or failed to): the owner has to be told, whatever the caller's own head turns out to be (R1-F1). A refusal carries the fields
+    // itself; an { enqueue } / { watch } result carries them as `holdFields`, which the caller attaches to every refusal it makes after the precheck.
+    const next = await precheck();
+    if (Object.keys(holdFields).length === 0) return next;
+    if (next.done) return next.done.output?.ok === false ? { done: { ...next.done, output: { ...holdFields, ...next.done.output } } } : next;
+    return { ...next, holdFields };
   }
 
   async function precheck() {

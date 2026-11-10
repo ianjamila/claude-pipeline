@@ -350,6 +350,8 @@ test('#232 GitHub shows the record\'s head during orphan recovery and this head 
   assertExit(r, 1, `${r.stderr}${r.stdout}`);
   assert.equal(r.json.error, 'owner-go', 'the caller\'s flow runs from a clean slate and fails closed on the restored label (a hold the dry run never showed)');
   assert.match(r.json.reasons[0], /no owner "merge" is recorded/);
+  assert.equal(r.json.holdRestored, true, 'the refusal still tells the owner the label went back, though it comes from the caller\'s own gate (R1-F1)');
+  assert.match(r.json.holdRestoredNote, /owner must say "merge" again/);
   assert.equal(s.rec().head, OLD);
   assert.equal(s.rec().terminal, 'head-moved', 'the old record is over');
   assert.equal(s.readds().length, 1, 'its hold went back exactly once');

@@ -14,7 +14,7 @@ import { BASE_SHA, MERGE_SHA, PR, bump, cli, scenario, ymlFor } from './helpers/
 import { assertExit } from './helpers/assert-exit.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { holdFiles, holdYml, holdCalls } from './helpers/merge-hold-env.mjs';
-import { beginAttempt, confirmAttempt, endRecord, noteRemoval, readQueueRecord } from '../pipeline/lib/merge-queue.mjs';
+import { beginAttempt, confirmAttempt, endRecord, noteRemoval, openRecord, readQueueRecord, setHold } from '../pipeline/lib/merge-queue.mjs';
 import { preMergeProblems } from '../pipeline/lib/finalgate.mjs';
 import { gateFreshSince, recheckGated } from '../pipeline/lib/queue-route.mjs';
 
@@ -560,4 +560,24 @@ test('R2-F1: a watch-only resume of a record that stood on the owner\'s word doe
   assert.match(r.json.reasons.join(' '), /not re-queued: .*no longer on record/);
   assert.equal(s.enqueueCalls().length, 0, 'no second enqueue');
   assert.equal(s.record().terminal, 'removed');
+});
+
+// R1-F1, gated route: a live record of another head owns a lifted hold; GitHub is at this worktree's head with no entry. The record is discharged (label back once)
+// and this run goes on from a clean slate; whatever refuses it afterwards still tells the owner the label went back.
+test('gated: a live record of another head is discharged by the precheck (label back once) and a later refusal of this run carries holdRestored (R1-F1)', () => {
+  const OLD = 'd'.repeat(40);
+  const s = world({ after: [], hold: true, gh: { extra: [{ match: '^pr edit 12 --add-label needs-human$', stdout: '' }] } });
+  const approval = { items: 'none', areas: [], rulings: null };
+  openRecord(s.repo.dir, PR, OLD, approval, { repo: 'acme/widgets', repoId: 4242, route: 'owner-go' });
+  setHold(s.repo.dir, PR, { id: 'LE_hold1', login: 'jamila', at: '2026-11-05T09:00:00Z', holdBlock: 'digest', liftedAt: '2026-11-09T07:59:00Z' });
+  beginAttempt(s.repo.dir, PR, OLD, approval, { repo: 'acme/widgets', repoId: 4242 });
+  confirmAttempt(s.repo.dir, PR, 'MQE_1');
+  const entryAtOld = () => reply(queuedNode(OLD), [added()]);
+  s.editGate((g) => { g.ownerMerge = 1; }); // the gate left an item for the owner: this run refuses pre-merge on its own, after the precheck
+  s.q.show([entryAtOld, OUT([])]); // the mode read; then the precheck sees the PR at this head with no entry
+  const r = s.run();
+  assert.equal(r.json.error, 'pre-merge', r.stdout);
+  assert.equal(s.record().terminal, 'head-moved', 'the old record was discharged');
+  assert.equal(r.json.holdRestored, true, r.stdout);
+  assert.match(r.json.holdRestoredNote, /owner must say "merge" again/);
 });
