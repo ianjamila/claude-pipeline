@@ -18,98 +18,164 @@ import { parseYaml } from '../pipeline/lib/yaml.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-const CONTEXTS = ['github', 'env', 'vars', 'job', 'jobs', 'steps', 'runner', 'secrets', 'strategy', 'matrix', 'needs', 'inputs'];
+// Same rules as eaglewatch-ph/eaglewatch scripts/lib/workflow-contexts.mjs after its review (#1787, rounds 1-4):
+// steps / job outputs (no `jobs`; step if: no `secrets`), reusable-call with/secrets, container/services, workflow_call
+// defaults/outputs, bare + any-case names, a quote-aware linear-time expression pattern.
+const CONTEXTS = ['github', 'env', 'vars', 'job', 'jobs', 'steps', 'runner', 'secrets', 'strategy', 'matrix', 'needs', 'inputs']
+
+const JOB = ['github', 'needs', 'strategy', 'matrix', 'vars', 'inputs']
+const CONTAINER_ENV = ['github', 'needs', 'strategy', 'matrix', 'job', 'runner', 'env', 'vars', 'secrets', 'inputs']
+const ALL_BUT_JOBS = ['github', 'needs', 'strategy', 'matrix', 'job', 'runner', 'env', 'vars', 'secrets', 'steps', 'inputs']
+const CREDENTIALS = ['github', 'needs', 'strategy', 'matrix', 'env', 'vars', 'secrets', 'inputs']
 
 // Allowed contexts per key, from GitHub's context-availability table.
 const ALLOWED = {
   'env': ['github', 'secrets', 'inputs', 'vars'],
   'concurrency': ['github', 'inputs', 'vars'],
   'run-name': ['github', 'inputs', 'vars'],
+  'on.workflow_call.inputs.<id>.default': ['github', 'inputs', 'vars'],
+  'on.workflow_call.outputs.<id>.value': ['github', 'jobs', 'vars', 'inputs'],
   'jobs.<id>.if': ['github', 'needs', 'vars', 'inputs'],
   'jobs.<id>.env': ['github', 'needs', 'strategy', 'matrix', 'vars', 'secrets', 'inputs'],
-  'jobs.<id>.name': ['github', 'needs', 'strategy', 'matrix', 'vars', 'inputs'],
-  'jobs.<id>.runs-on': ['github', 'needs', 'strategy', 'matrix', 'vars', 'inputs'],
-  'jobs.<id>.timeout-minutes': ['github', 'needs', 'strategy', 'matrix', 'vars', 'inputs'],
-  'jobs.<id>.continue-on-error': ['github', 'needs', 'strategy', 'vars', 'matrix', 'inputs'],
-  'jobs.<id>.concurrency': ['github', 'needs', 'strategy', 'matrix', 'vars', 'inputs'],
-  'jobs.<id>.environment': ['github', 'needs', 'strategy', 'matrix', 'vars', 'inputs'],
-  'jobs.<id>.environment.url': ['github', 'needs', 'strategy', 'matrix', 'vars', 'inputs', 'job', 'runner', 'env', 'steps'],
+  'jobs.<id>.name': JOB,
+  'jobs.<id>.runs-on': JOB,
+  'jobs.<id>.timeout-minutes': JOB,
+  'jobs.<id>.continue-on-error': JOB,
+  'jobs.<id>.concurrency': JOB,
+  'jobs.<id>.environment': JOB,
+  'jobs.<id>.environment.url': ['github', 'needs', 'strategy', 'matrix', 'job', 'runner', 'env', 'vars', 'steps', 'inputs'],
   'jobs.<id>.strategy': ['github', 'needs', 'vars', 'inputs'],
-};
+  'jobs.<id>.with.<id>': JOB,
+  'jobs.<id>.secrets.<id>': ['github', 'needs', 'strategy', 'matrix', 'secrets', 'inputs', 'vars'],
+  'jobs.<id>.defaults.run': ['github', 'needs', 'strategy', 'matrix', 'env', 'vars', 'inputs'],
+  'jobs.<id>.container': JOB,
+  'jobs.<id>.container.credentials': CREDENTIALS,
+  'jobs.<id>.container.env.<id>': CONTAINER_ENV,
+  'jobs.<id>.services': JOB,
+  'jobs.<id>.services.<id>.credentials': CREDENTIALS,
+  'jobs.<id>.services.<id>.env.<id>': CONTAINER_ENV,
+  'jobs.<id>.outputs.<id>': ALL_BUT_JOBS,
+  'jobs.<id>.steps.if': ['github', 'needs', 'strategy', 'matrix', 'job', 'runner', 'env', 'vars', 'steps', 'inputs'],
+  'jobs.<id>.steps.<key>': ALL_BUT_JOBS,
+}
 
-const EXPR = /\$\{\{([\s\S]*?)\}\}/g;
+// Quote-aware: a `}}` inside a string literal does not end the expression (GitHub reads it the same way).
+// The three alternatives never overlap (a quote only starts a string; `}` only alone), so an unclosed `${{` fails in
+// linear time instead of backtracking over every pairing of the quotes after it (review R3). A `''` escape reads as
+// two adjacent strings: the same end as GitHub's quote toggle.
+const EXPR = /\$\{\{((?:'[^']*'|[^'}]|\}(?!\}))*)\}\}/g
 
-/** Context names used in one expression body: `runner.temp`, `runner['temp']` and a bare `toJSON(runner)` alike. */
+/** Context names used in one expression body (lower-cased; string literals removed first). */
 function contextsIn(expr) {
-  const bare = String(expr).replace(/'(?:[^']|'')*'/g, "''"); // string literals are not references
-  const out = new Set();
-  // An identifier not reached through `.` (a property such as `needs.runner.result` is not the context) and not a function call.
-  for (const m of bare.matchAll(/(?<![\w.-])([A-Za-z_][\w-]*)(?!\s*\()(?![\w-])/g)) {
-    if (CONTEXTS.includes(m[1])) out.add(m[1]);
+  const bare = String(expr).replace(/'(?:[^']|'')*'/g, "''")
+  const out = new Set()
+  // A name not preceded by a property dot / word char, and not a function call (followed by `(`).
+  for (const m of bare.matchAll(/(?<![\w.-])([A-Za-z_][\w-]*)(?![\w-])(?!\s*\()/g)) {
+    const name = m[1].toLowerCase()
+    if (CONTEXTS.includes(name)) out.add(name)
   }
-  return [...out];
+  return [...out]
 }
 
 /** Every string leaf under a value (env maps, concurrency objects, runs-on arrays). */
 function strings(value) {
-  if (typeof value === 'string') return [value];
-  if (Array.isArray(value)) return value.flatMap(strings);
-  if (value && typeof value === 'object') return Object.values(value).flatMap(strings);
-  return [];
+  if (typeof value === 'string') return [value]
+  if (Array.isArray(value)) return value.flatMap(strings)
+  if (value && typeof value === 'object') return Object.values(value).flatMap(strings)
+  return []
 }
 
-/** Context names a key's value uses. `if:` may be a bare expression without `${{ }}`. */
+/** Context names a value uses. `if:` may be a bare expression without `${{ }}`. */
 function used(value, { bareIf = false } = {}) {
-  const found = new Set();
+  const found = new Set()
   for (const s of strings(value)) {
-    const bodies = [...s.matchAll(EXPR)].map((m) => m[1]);
-    if (bareIf && bodies.length === 0) bodies.push(s);
-    for (const b of bodies) for (const c of contextsIn(b)) found.add(c);
+    const bodies = [...s.matchAll(EXPR)].map((m) => m[1])
+    if (bareIf && bodies.length === 0) bodies.push(s)
+    for (const b of bodies) for (const c of contextsIn(b)) found.add(c)
   }
-  return [...found];
+  return [...found]
 }
 
 function check(findings, file, where, key, value, opts) {
-  const allowed = ALLOWED[key];
+  if (value === undefined) return
+  const allowed = ALLOWED[key]
   for (const c of used(value, opts)) {
-    if (!allowed.includes(c)) findings.push(`${file}: ${where} uses \`${c}\`, GitHub allows only ${allowed.join(', ')} there, so it rejects the whole file`);
+    if (!allowed.includes(c)) {
+      findings.push(`${file}: ${where} uses \`${c}\` — GitHub allows only ${allowed.join(', ')} there, so it rejects the whole file`)
+    }
   }
 }
 
-/** @param {Map<string, string>|[string, string][]} files basename -> YAML text. @returns {string[]} findings; empty = clean. */
+const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
+
+/** container / one service: credentials and env have their own lists, every other key (image, options …) the base one. */
+function checkContainer(findings, file, where, keyBase, value) {
+  const base = keyBase === 'jobs.<id>.container' ? keyBase : 'jobs.<id>.services'
+  if (!isObj(value)) return check(findings, file, where, base, value)
+  for (const [k, v] of Object.entries(value)) {
+    if (k === 'credentials') check(findings, file, `${where}.credentials`, `${keyBase}.credentials`, v)
+    else if (k === 'env') check(findings, file, `${where}.env`, `${keyBase}.env.<id>`, v)
+    else check(findings, file, `${where}.${k}`, base, v)
+  }
+}
+
 function workflowContextFindings(files) {
-  const findings = [];
+  const findings = []
   for (const [file, text] of files) {
-    let doc;
+    let doc
     try {
-      doc = parseYaml(text);
+      doc = parseYaml(text)
     } catch (e) {
-      findings.push(`${file}: not valid YAML (${e.message.split('\n')[0]})`);
-      continue;
+      findings.push(`${file}: not valid YAML (${e.message.split('\n')[0]})`)
+      continue
     }
-    if (!doc || typeof doc !== 'object') continue;
-    for (const key of ['env', 'concurrency', 'run-name']) {
-      if (doc[key] !== undefined) check(findings, file, key, key, doc[key]);
-    }
-    const jobs = doc.jobs && typeof doc.jobs === 'object' ? doc.jobs : {};
-    for (const [id, job] of Object.entries(jobs)) {
-      if (!job || typeof job !== 'object') continue;
-      for (const k of ['if', 'env', 'name', 'runs-on', 'timeout-minutes', 'continue-on-error', 'concurrency', 'strategy']) {
-        if (job[k] === undefined) continue;
-        check(findings, file, `jobs.${id}.${k}`, `jobs.<id>.${k}`, job[k], { bareIf: k === 'if' });
+    if (!isObj(doc)) continue
+    for (const key of ['env', 'concurrency', 'run-name']) check(findings, file, key, key, doc[key])
+    const call = isObj(doc.on) && isObj(doc.on.workflow_call) ? doc.on.workflow_call : null
+    if (call) {
+      for (const [id, inp] of Object.entries(isObj(call.inputs) ? call.inputs : {})) {
+        if (isObj(inp)) check(findings, file, `on.workflow_call.inputs.${id}.default`, 'on.workflow_call.inputs.<id>.default', inp.default)
       }
-      const env = job.environment;
-      if (env === undefined) continue;
-      if (env && typeof env === 'object' && !Array.isArray(env)) {
-        for (const [k, v] of Object.entries(env)) {
-          // `url` sees more contexts than the environment's name does.
-          if (k === 'url') check(findings, file, `jobs.${id}.environment.url`, 'jobs.<id>.environment.url', v);
-          else check(findings, file, `jobs.${id}.environment.${k}`, 'jobs.<id>.environment', v);
+      for (const [id, out] of Object.entries(isObj(call.outputs) ? call.outputs : {})) {
+        if (isObj(out)) check(findings, file, `on.workflow_call.outputs.${id}.value`, 'on.workflow_call.outputs.<id>.value', out.value)
+      }
+    }
+    const jobs = isObj(doc.jobs) ? doc.jobs : {}
+    for (const [id, job] of Object.entries(jobs)) {
+      if (!isObj(job)) continue
+      const at = (k) => `jobs.${id}.${k}`
+      for (const k of ['if', 'env', 'name', 'runs-on', 'timeout-minutes', 'continue-on-error', 'concurrency', 'strategy']) {
+        check(findings, file, at(k), `jobs.<id>.${k}`, job[k], { bareIf: k === 'if' })
+      }
+      if (isObj(job.environment)) {
+        const { url, ...rest } = job.environment
+        check(findings, file, at('environment'), 'jobs.<id>.environment', rest)
+        check(findings, file, at('environment.url'), 'jobs.<id>.environment.url', url)
+      } else {
+        check(findings, file, at('environment'), 'jobs.<id>.environment', job.environment)
+      }
+      check(findings, file, at('with'), 'jobs.<id>.with.<id>', job.with)
+      check(findings, file, at('secrets'), 'jobs.<id>.secrets.<id>', job.secrets === 'inherit' ? undefined : job.secrets)
+      if (isObj(job.defaults)) check(findings, file, at('defaults.run'), 'jobs.<id>.defaults.run', job.defaults.run)
+      if (job.container !== undefined) checkContainer(findings, file, at('container'), 'jobs.<id>.container', job.container)
+      if (job.services !== undefined && !isObj(job.services)) check(findings, file, at('services'), 'jobs.<id>.services', job.services)
+      for (const [sid, svc] of Object.entries(isObj(job.services) ? job.services : {})) {
+        checkContainer(findings, file, at(`services.${sid}`), 'jobs.<id>.services.<id>', svc)
+      }
+      check(findings, file, at('outputs'), 'jobs.<id>.outputs.<id>', job.outputs)
+      const steps = Array.isArray(job.steps) ? job.steps : []
+      steps.forEach((step, i) => {
+        if (!isObj(step)) return
+        const name = `steps[${step.id ?? i}]`
+        check(findings, file, at(`${name}.if`), 'jobs.<id>.steps.if', step.if, { bareIf: true })
+        for (const [k, v] of Object.entries(step)) {
+          if (k === 'if' || k === 'uses' || k === 'id') continue
+          check(findings, file, at(`${name}.${k}`), 'jobs.<id>.steps.<key>', v)
         }
-      } else check(findings, file, `jobs.${id}.environment`, 'jobs.<id>.environment', env);
+      })
     }
   }
-  return findings;
+  return findings
 }
 
 const wf = (text) => workflowContextFindings([['x.yml', text]]);
@@ -178,4 +244,31 @@ test('contexts: string literals, function names, property names and step-level u
 
 test('contexts: invalid YAML is a finding, not a crash', () => {
   assert.match(wf('a: [')[0], /not valid YAML/);
+});
+
+test('contexts: steps and job outputs never read jobs; a step if: never reads secrets', () => {
+  const steps = (s) => `on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n${s}\n`;
+  assert.equal(wf(steps("      - if: secrets.T != ''\n        run: echo")).length, 1);
+  assert.deepEqual(wf(steps("      - if: ${{ runner.os == 'Linux' && steps.a.outputs.ok == 'true' }}\n        run: echo \"${{ secrets.T }}\"")), []);
+  assert.equal(wf(steps('      - run: echo "${{ jobs.x.result }}"')).length, 1);
+  assert.equal(wf(job('    outputs:\n      o: ${{ jobs.x.outputs.y }}')).length, 1);
+  assert.deepEqual(wf(job('    outputs:\n      o: ${{ steps.a.outputs.y }}')), []);
+});
+
+test('contexts: a reusable call\'s job-level with:/secrets:, defaults.run and services are checked', () => {
+  const call = (s) => `on: push\njobs:\n  c:\n    uses: ./.github/workflows/x.yml\n${s}\n`;
+  assert.equal(wf(call('    with:\n      dir: ${{ runner.temp }}')).length, 1);
+  assert.deepEqual(wf(call('    with:\n      sha: ${{ github.sha }}\n    secrets: inherit')), []);
+  assert.equal(wf(call('    secrets:\n      T: ${{ steps.a.outputs.t }}')).length, 1);
+  assert.equal(wf(job('    defaults:\n      run:\n        working-directory: ${{ runner.temp }}')).length, 1);
+  assert.equal(wf(job('    services: ${{ fromJSON(env.S) }}')).length, 1);
+});
+
+test('contexts: a }} inside a string literal does not end the expression, and an unclosed ${{ fails fast', () => {
+  assert.equal(wf(job("    env:\n      X: ${{ format('{{0}}', runner.temp) }}")).length, 1);
+  assert.deepEqual(wf(job("    strategy:\n      matrix: ${{ fromJSON('{\"i\":[{\"c\":{\"runner\":\"a\"}}]}') }}")), []);
+  const quotes = Array.from({ length: 60 }, (_, i) => `'q${i}'`).join(' ');
+  const t0 = Date.now();
+  assert.deepEqual(wf(`on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          echo "\${{ github.sha }"\n          echo ${quotes}\n`), []);
+  assert.ok(Date.now() - t0 < 1000);
 });
