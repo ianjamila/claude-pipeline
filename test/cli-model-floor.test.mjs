@@ -412,7 +412,8 @@ test('R1-B2: reset --clear-lock (plain and --keep-floor) exits 1 model-floor-loc
     assert.equal(r.exitCode, 1, args.join(' '));
     assert.equal(r.output.error, 'model-floor-lock-live');
     assert.match(r.output.message, new RegExp(`pid ${process.pid}\\b`));
-    assert.match(r.output.message, /stop that process/);
+    assert.match(r.output.message, /ps -p \d+ -o command=/);
+    assert.ok(r.output.message.includes(join(dir, 'model-floor.lock')), 'names the lock folder');
     assert.equal(existsSync(join(dir, 'model-floor.lock')), true);
     assert.equal(readFileSync(reg(dir), 'utf8'), bytes);
   }
@@ -424,5 +425,7 @@ test('R1-B2: reset --clear-lock (plain and --keep-floor) exits 1 model-floor-loc
 });
 
 test('R1-B2: the usage says --clear-lock refuses while the holder is running', () => {
-  assert.match(meta.usage, /--clear-lock .*refuses while the holder is a running process on this machine \(exit 1 model-floor-lock-live, naming the pid\)/);
+  assert.match(meta.usage, /--clear-lock .*refuses while the holder is a running process on this machine \(exit 1 model-floor-lock-live, naming the pid and the lock folder\)/);
+  assert.match(meta.usage, /confirm that pid is a pipeline process \(`ps -p <pid> -o command=`\).*remove the lock folder by hand/, 'R7-F2: how to tell a recycled pid');
+  assert.match(meta.usage, /removes only the lock it inspected .*model-floor-lock-changed.*model-floor-lock-unreadable/, 'R7-B1/F1');
 });

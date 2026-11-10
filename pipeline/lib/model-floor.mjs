@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { accountHome } from './paths.mjs';
-import { LockTimeoutError, liveLocalHolder, readMachineId, withLock } from './locks.mjs';
+import { LockTimeoutError, clearUnheld, readMachineId, withLock } from './locks.mjs';
 import { seamValue } from './seams.mjs';
 import { OWNER_GO_REL, realDirChain } from '../hooks/lib/owner-go.mjs';
 
@@ -238,22 +238,36 @@ export async function withFloorLock({ waitMs = LOCK_WAIT_MS, pollMs = 100, ...op
 }
 
 // --clear-lock never takes a lock from a process that is still using it: the holder would go on to write under a floor it no longer protects.
-// Refused (model-floor-lock-live) while the recorded holder is on this machine and its pid is running; a dead holder, another machine's holder
-// and a lock with no usable owner record may be removed.
-function refuseLiveHolder(dir, opts) {
-  let owner = null;
+// It inspects the lock and removes only that one (locks.mjs clearUnheld: reclaim guard, re-judged under it, the moved folder confirmed to be the
+// one inspected, anything else put back), so a lock a review takes after the look survives. No lock => nothing is touched. Refused (model-floor-lock-live)
+// while the recorded holder is on this machine and its pid is running; a dead holder, another machine's holder and a lock with no usable owner record
+// may be removed. A read error on the lock (anything but a missing or unparseable owner.json) refuses, fail closed like tryAcquire:
+// model-floor-lock-unreadable, naming the error code. Returns true when it removed the lock.
+function clearFloorLock(dir, opts, lockHooks) {
+  const lockDir = path.join(dir, `${LOCK_NAME}.lock`);
+  let r;
   try {
-    owner = liveLocalHolder(LOCK_NAME, { dir, machineId: readMachineId({ stateDir: path.join(opts.home ?? accountHome(), '.claude', 'pipeline-state') }) });
-  } catch { /* an owner record that cannot be read is an unreadable record: it may be cleared */ }
-  if (owner) {
-    throw codeError('model-floor-lock-live', `the floor lock is held by a running process (pid ${owner.pid}, since ${owner.startedAt}): stop that process (or wait for it to finish) first, then run --clear-lock again. Clearing a lock its holder still uses would let that review save a proof the floor no longer allows`, { holderPid: owner.pid });
+    r = clearUnheld(LOCK_NAME, { dir, machineId: readMachineId({ stateDir: path.join(opts.home ?? accountHome(), '.claude', 'pipeline-state') }), hooks: lockHooks });
+  } catch (err) {
+    throw codeError('model-floor-lock-unreadable', `the floor lock ${lockDir} cannot be inspected (${err.code ?? err.message}), so it is not cleared: a review that holds it could lose it. Fix the folder's permissions and run --clear-lock again, or, when no review is running, remove that folder by hand`, { cause: err });
   }
+  if (r.state === 'live') {
+    throw codeError('model-floor-lock-live', `the floor lock is held by a running process (pid ${r.owner.pid}, since ${r.owner.startedAt}). Confirm pid ${r.owner.pid} is a pipeline process (\`ps -p ${r.owner.pid} -o command=\`): if it is, stop it or wait for it to finish, then run --clear-lock again; if it is not (the pid was reused by an unrelated program), remove the lock folder ${lockDir} by hand. Clearing a lock its holder still uses would let that review save a proof the floor no longer allows`, { holderPid: r.owner.pid });
+  }
+  if (r.state === 'changed') {
+    throw codeError('model-floor-lock-changed', `the floor lock ${lockDir} changed while it was being cleared (a review took it), so it was left in place${r.restored === false ? ' (the lock we moved aside could not be put back: look for a model-floor.lock.stale-* folder beside it)' : ''}. Run --clear-lock again if it is still stuck`);
+  }
+  if (r.state === 'busy') {
+    throw codeError('model-floor-lock-busy', `another process is recovering or reclaiming the floor lock ${lockDir} right now; nothing was cleared. Run --clear-lock again in a moment`);
+  }
+  return r.state === 'cleared';
 }
 
 // Owner recovery (the CLI wrapper adds the owner-only check): rewrite the registry to the code constant. `hold` (a Fable id) sets the ceiling the
 // floor cannot rise above; `clearHold` removes it; with neither, an existing readable hold is kept. `clearLock` first removes the floor lock
-// folder (for a lock another host or an unreadable record left behind; a dead holder's lock is reclaimed by the lock itself). It refuses, with
-// model-floor-lock-live, while the holder is a running process on this machine (stop it or wait): that holds for the plain and the keepFloor form.
+// folder (for a lock another host or an unreadable record left behind; a dead holder's lock is reclaimed by the lock itself), only the one it inspected
+// (clearFloorLock above; `lockHooks` is its test-only seam). It refuses, with model-floor-lock-live, while the holder is a running process on this machine
+// (confirm it is a pipeline process, then stop it or wait; a recycled pid's folder is removed by hand): that holds for the plain and the keepFloor form.
 // `allowId` (Fable ids, exact names) adds to the registry's `allow` list (at most ALLOW_MAX): the review accepts those ids although the parser cannot
 // read them (an id the parser reads is judged by version like any other: the allowance never admits one below the floor); `clearAllow` empties it;
 // `removeAllow` removes exactly those ids (each must be on the list now, else model-floor-bad-allow naming the list; not with clearAllow, and not an id
@@ -264,7 +278,7 @@ function refuseLiveHolder(dir, opts) {
 // (newest, provenAt, claudeCode, transcript, history) and the hold, so allowing an unreadable id, and clearing it later, never forgets what proofs raised.
 // A corrupt registry has no floor worth keeping: that call throws model-floor-unreadable and the owner runs a plain reset first.
 // -> { floor, registry, file, clearedLock }.
-export async function resetFloor({ hold, clearHold = false, allowId = [], removeAllow = [], clearAllow = false, clearLock = false, keepFloor = false, now, waitMs = 5000, ...opts } = {}) {
+export async function resetFloor({ hold, clearHold = false, allowId = [], removeAllow = [], clearAllow = false, clearLock = false, keepFloor = false, lockHooks, now, waitMs = 5000, ...opts } = {}) {
   if (hold !== undefined && hold !== null && clearHold) throw codeError('model-floor-bad-hold', 'use --hold or --clear-hold, not both');
   if (hold !== undefined && hold !== null && !isFableId(hold)) throw codeError('model-floor-bad-hold', `cannot hold the floor at ${JSON.stringify(hold)}: not a Fable model id`);
   if (clearAllow && allowId.length > 0) throw codeError('model-floor-bad-allow', 'use --allow-id or --clear-allow, not both');
@@ -285,18 +299,12 @@ export async function resetFloor({ hold, clearHold = false, allowId = [], remove
     if (!current.ok) {
       throw codeError('model-floor-unreadable', `${current.message.replace(/; reviews are blocked until.*$/, '')}: --keep-floor keeps the learned floor and there is none to keep; run \`pipeline model-floor reset --clear-lock\` (a plain reset)`);
     }
-    const lockDir = path.join(dir, `${LOCK_NAME}.lock`);
-    refuseLiveHolder(dir, opts);
-    const clearedLock = fs.existsSync(lockDir);
-    fs.rmSync(lockDir, { recursive: true, force: true });
+    const clearedLock = clearFloorLock(dir, opts, lockHooks);
     return { floor: current.floor, registry: current.registry, file: registryFile(dir), clearedLock };
   }
   let clearedLock = false;
   if (clearLock) {
-    const lockDir = path.join(dir, `${LOCK_NAME}.lock`);
-    refuseLiveHolder(dir, opts);
-    clearedLock = fs.existsSync(lockDir);
-    fs.rmSync(lockDir, { recursive: true, force: true });
+    clearedLock = clearFloorLock(dir, opts, lockHooks);
   }
   return withFloorLock({ ...opts, waitMs }, () => {
     const current = readFloor(opts); // a corrupt file is exactly what reset replaces: its hold is lost with it
