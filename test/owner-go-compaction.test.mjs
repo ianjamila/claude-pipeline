@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import {
   lastReplyText, ownerGrantedRounds, ownerRuled, ownerRulingGap, approvedRequest, promptProvenance, recordApproval, recordRoundGrant, recordRuling, notOwnerWords,
 } from '../pipeline/hooks/lib/owner-go.mjs';
-import { OWNER_ENTRY, roundRequest } from './helpers/owner-go.mjs';
+import { OWNER_ENTRY, linesOf, roundRequest } from './helpers/owner-go.mjs';
 
 const AT = Date.parse('2026-11-03T10:00:00Z');
 const now = () => AT;
@@ -27,7 +27,7 @@ const HANDBACK = 'Another Claude session sent a message:\n<agent-message from="w
 const SUMMARY_TEXT = 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion.';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'owner-go-compact-'));
-const lines = (entries) => `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`;
+const lines = linesOf; // (#191 R1-B1: every fixture carries the uuid / parentUuid chain Claude Code writes; a compact_boundary keeps its logicalParentUuid)
 function transcript(dir, entries) {
   mkdirSync(join(dir, '.claude', 'projects', '-repo'), { recursive: true });
   const file = join(dir, '.claude', 'projects', '-repo', `t-${Math.random().toString(36).slice(2)}.jsonl`);

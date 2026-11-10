@@ -18,7 +18,7 @@ import {
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, isTranscriptFile, toPosix, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
-import { OWNER_ENTRY, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
+import { OWNER_ENTRY, linesOf, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
@@ -33,7 +33,7 @@ const withOpening = (entries) => (entries[0]?.type === 'assistant' ? [{ type: 'u
 function transcript(dir, entries) {
   mkdirSync(join(dir, '.claude', 'projects', '-repo'), { recursive: true });
   const file = join(dir, '.claude', 'projects', '-repo', `t-${Math.random().toString(36).slice(2)}.jsonl`);
-  writeFileSync(file, `${withOpening(entries).map((e) => JSON.stringify(e)).join('\n')}\n`);
+  writeFileSync(file, linesOf(withOpening(entries))); // (#191 R1-B1: with the uuid / parentUuid chain Claude Code writes)
   return file;
 }
 const user = (text) => ({ type: 'user', message: { content: text } });
@@ -948,7 +948,7 @@ test('#128 a synthetic "merge" or ruling word is never recorded, even when the t
 const AT = Date.parse('2026-11-03T10:00:00Z');
 const nowAt = () => AT;
 const stamp = (ms) => new Date(AT + ms).toISOString();
-const lines = (entries) => `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`;
+const lines = linesOf;
 // A "merge" the hook recorded at AT (before the transcript had it, as it may), then the transcript gets `appended`. Returns the pieces to ask with.
 function mergeWorld(_home, { appended, recordedId = 'pid-m', head = [promptEntry('go'), said(REQUEST)], raw = null } = {}) {
   const home = tmp(); // (a world of its own: records of the same session would answer for each other)
