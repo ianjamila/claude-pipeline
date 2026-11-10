@@ -296,6 +296,42 @@ test('reconcile: removal before our latest added event is ignored; one after it 
   assert.equal(r.removal.beforeCommit, QUEUE_COMMIT);
 });
 
+// #227: which events belong to a PENDING attempt is decided by the timeline, never by comparing this machine's clock with GitHub's.
+test('beginAttempt stores the count of added events seen; reconcile attributes only events after it, whatever the clocks say (#227)', async () => {
+  const before = [added('06:00:00'), removed(REASON_GROUP_CHECKS, '06:30:00')];
+  const ours = [...before, added('08:00:00'), removed(REASON_GROUP_CHECKS, '08:10:00')];
+  // The machine clock runs 10 minutes AHEAD of GitHub: the old wall-clock test read the genuine removal as "not ours" and dropped the attempt.
+  const ahead = repoDir();
+  const rec = beginAttempt(ahead, 7, HEAD, APPROVAL, { ...IDENT, gh: { queueEvents: () => before }, now: () => Date.parse('2026-11-09T08:20:00Z') });
+  assert.equal(rec.pending.addedSeen, 1);
+  const r = await reconcile({ gh: stubGh({ states: [st()], events: [ours] }), root: ahead, pr: 7, head: HEAD });
+  assert.equal(r.kind, 'removed');
+  assert.equal(r.removal.at, '2026-11-09T08:10:00Z');
+  assert.equal(readQueueRecord(ahead, 7).attempts, 1, 'the attempt stays counted');
+  // The machine clock runs far BEHIND GitHub's: the old removal (already on the timeline when the attempt began) was read as this attempt's.
+  const behind = repoDir();
+  beginAttempt(behind, 7, HEAD, APPROVAL, { ...IDENT, gh: { queueEvents: () => before }, now: () => Date.parse('2026-11-01T00:00:00Z') });
+  const logged = [];
+  assert.deepEqual(await reconcile({ gh: stubGh({ states: [st()], events: [before] }), root: behind, pr: 7, head: HEAD, log: (m) => logged.push(m) }), { kind: 'not-queued' });
+  assert.equal(readQueueRecord(behind, 7).attempts, 0, 'an enqueue that never landed is not counted');
+  assert.equal(logged.length, 1);
+});
+
+test('beginAttempt without a readable timeline stores no anchor; a pending record without one keeps the wall-clock reading (#227 back-compat)', async () => {
+  const root = repoDir();
+  const rec = beginAttempt(root, 7, HEAD, APPROVAL, { ...IDENT, gh: { queueEvents: () => { throw new Error('rate limited'); } } });
+  assert.deepEqual(Object.keys(rec.pending).sort(), ['at', 'head']);
+  assert.equal(beginAttempt(repoDir(), 7, HEAD, APPROVAL, IDENT).pending.addedSeen, undefined, 'no gh given: no anchor');
+  // A record written before the anchor existed: a removal newer than the attempt counts, an older one does not.
+  const mark = (dir, atMs) => beginAttempt(dir, 7, HEAD, APPROVAL, { ...IDENT, now: () => atMs });
+  const fresh = repoDir();
+  mark(fresh, Date.parse('2026-11-09T08:00:00Z'));
+  assert.equal((await reconcile({ gh: stubGh({ states: [st()], events: [[added('08:05:00'), removed(REASON_GROUP_CHECKS, '08:10:00')]] }), root: fresh, pr: 7, head: HEAD })).kind, 'removed');
+  const old = repoDir();
+  mark(old, Date.parse('2026-11-09T09:00:00Z'));
+  assert.deepEqual(await reconcile({ gh: stubGh({ states: [st()], events: [[added('06:00:00'), removed(REASON_GROUP_CHECKS, '06:30:00')]] }), root: old, pr: 7, head: HEAD }), { kind: 'not-queued' });
+});
+
 test('reconcile: a removal with reason merged (the PR not yet shown as merged) reads as merged', async () => {
   const root = repoDir();
   const gh = stubGh({ states: [st()], events: [[added(), removed(REASON_MERGED, '08:40:00', MERGE_SHA)]] });

@@ -193,13 +193,27 @@ export function openRecord(root, pr, head, approval, { repo = null, repoId = nul
   });
 }
 
-// Written BEFORE the enqueue mutation, so a crash between the mutation and the confirm still counts the attempt.
+// How many `added` events GitHub's timeline of the PR already shows: the anchor reconcile uses to tell this attempt's events from older ones
+// by timeline order, never by comparing this machine's clock with GitHub's (#227). null when the timeline cannot be read (or no `gh` was given).
+function addedEventsSeen(gh, pr) {
+  try {
+    if (typeof gh?.queueEvents !== 'function') return null;
+    const events = gh.queueEvents(pr);
+    return Array.isArray(events) ? events.filter((e) => e?.type === 'added').length : null;
+  } catch {
+    return null;
+  }
+}
+
+// Written BEFORE the enqueue mutation, so a crash between the mutation and the confirm still counts the attempt. With `opts.gh` the pending
+// attempt carries `addedSeen` (the anchor above); without it (an unreadable timeline) reconcile falls back to the wall-clock reading.
 export function beginAttempt(root, pr, head, approval, opts = {}) {
   const now = opts.now ?? Date.now;
   openRecord(root, pr, head, approval, opts);
+  const addedSeen = addedEventsSeen(opts.gh, pr);
   return mutate(root, pr, (rec) => {
     rec.attempts += 1;
-    rec.pending = { head, at: isoOf(now) };
+    rec.pending = { head, at: isoOf(now), ...(addedSeen === null ? {} : { addedSeen }) };
     if (rec.hold) rec.hold.owner = 'pending';
   });
 }
@@ -250,8 +264,9 @@ export function mayRequeue(rec, head, reason) {
 
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FULL_SHA = /^[0-9a-f]{40}$/;
-// A removal belongs to a PENDING attempt only if its enqueue happened after the attempt began (allowing for clock difference with GitHub).
-const CLOCK_SLACK_MS = 60_000;
+// Only for a pending attempt written before the `addedSeen` anchor existed (or one whose timeline could not be read when it began): its events
+// are attributed by time, allowing for the clock difference with GitHub. Any newer attempt is attributed by timeline order alone (#227).
+const LEGACY_CLOCK_SLACK_MS = 60_000;
 
 // Where does GitHub say the PR is, compared with what the record expects?
 //   merged / queued / removed / not-queued / head-moved / closed
@@ -262,6 +277,13 @@ export async function reconcile({ gh, root, pr, head, sleep = defaultSleep, poll
   const r = reconcileNow({ gh, root, pr, head, log });
   if (r.kind !== 'merged' || r.lookup === undefined) return r;
   return { kind: 'merged', mergeSha: await readMergeSha({ gh, pr, first: r.lookup.first, sleep, pollMs }) };
+}
+
+// Is the latest `added` event (index `lastAdded`, -1 = none) the pending attempt's enqueue? With the anchor: an `added` event came after the
+// ones the timeline showed when the attempt began. Without it (back-compat): the event is not older than the attempt, within the legacy slack.
+function attemptOwns(pending, events, lastAdded) {
+  if (Number.isInteger(pending.addedSeen)) return events.filter((e) => e.type === 'added').length > pending.addedSeen;
+  return Date.parse(events[lastAdded]?.at) >= Date.parse(pending.at) - LEGACY_CLOCK_SLACK_MS;
 }
 
 // reconcile's decision without any waiting, so a signal handler (which cannot await) can use it too. A merged answer whose merge commit
@@ -282,7 +304,7 @@ export function reconcileNow({ gh, root, pr, head, log = () => {} }) {
   const lastAdded = events.map((e) => e.type).lastIndexOf('added');
   const after = lastAdded === -1 ? [] : events.slice(lastAdded + 1);
   const mergedAt = after.find((e) => e.type === 'merged' || (e.type === 'removed' && e.reason === REASON_MERGED));
-  const ours = rec?.pending ? Date.parse(events[lastAdded]?.at) >= Date.parse(rec.pending.at) - CLOCK_SLACK_MS : true;
+  const ours = rec?.pending ? attemptOwns(rec.pending, events, lastAdded) : true;
   if (mergedAt && ours) {
     return mergedAt.beforeCommit && FULL_SHA.test(mergedAt.beforeCommit) ? { kind: 'merged', mergeSha: mergedAt.beforeCommit } : { kind: 'merged', lookup: { first: null } };
   }
@@ -652,7 +674,7 @@ export async function recoverQueuedLift({ gh, root, pr, orphan, lift, now = Date
     const repoId = typeof gh.repoId === 'function' ? gh.repoId() : null;
     openRecord(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now });
     setHold(root, pr, { id: orphan.hold, login: lift.login ?? null, at: lift.at ?? null, holdBlock: lift.login && lift.at ? holdDigest({ id: orphan.hold, login: lift.login, at: lift.at }) : null, liftedAt: isoOf(now) });
-    beginAttempt(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now });
+    beginAttempt(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now, gh });
     confirmAttempt(root, pr, r.entry.id);
   } catch (err) {
     return unreadable('the merge-queue record could not be written', err);

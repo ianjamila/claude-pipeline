@@ -84,7 +84,7 @@ export function createQueueRoute({
   const timing = queueTiming(env);
   const repo = gh.repo().slug;
   const repoId = typeof gh.repoId === 'function' ? gh.repoId() : null;
-  const opts = { repo, repoId, now };
+  const opts = { repo, repoId, now, gh }; // (gh: beginAttempt anchors the pending attempt to GitHub's timeline)
   let requeued = 0;
   let rules = null;
   try {
