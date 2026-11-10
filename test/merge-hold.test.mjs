@@ -220,8 +220,8 @@ test('releaseHold: the reason is a fixed sentence, shell-quoted; an unknown code
     assert.equal(seen[i], `npm run merge-hold -- 12 --release --reason ${quoteReason(RELEASE_REASONS[reason])}`);
     assert.match(seen[i], process.platform === 'win32' ? /--reason "[A-Za-z0-9 ,.-]+"$/ : /--reason '[A-Za-z0-9 ,.-]+'$/, 'quoted for this platform, plain words only');
   }
-  assert.deepEqual(Object.keys(RELEASE_REASONS), ['new-commits', 'parked', 'owner-declined', 'handoff-withdrawn', 'ci-failed', 'update-conflict', 'queued-behind', 'hold-unreadable']);
-  for (const code of ['ci-failed', 'update-conflict', 'queued-behind', 'hold-unreadable']) assert.match(RELEASE_REASONS[code], /^[A-Za-z0-9 ,.]+$/, `${code}: letters, digits, spaces, commas and full stops only`);
+  assert.deepEqual(Object.keys(RELEASE_REASONS), ['new-commits', 'parked', 'owner-declined', 'handoff-withdrawn', 'ci-failed', 'update-conflict', 'queued-behind', 'hold-unreadable', 'restart']);
+  for (const code of ['ci-failed', 'update-conflict', 'queued-behind', 'hold-unreadable', 'restart']) assert.match(RELEASE_REASONS[code], /^[A-Za-z0-9 ,.]+$/, `${code}: letters, digits, spaces, commas and full stops only`);
   await assert.rejects(releaseHold({ config: CONFIG, pr: PR, reason: 'x; rm -rf /', root: '/r', env: {}, run: async () => assert.fail('must not run') }), /unknown release reason/);
   assert.equal(quoteReason("it's", 'linux'), "'it'\\''s'");
   assert.equal(quoteReason('plain words', 'win32'), '"plain words"');

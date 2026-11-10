@@ -81,7 +81,7 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    with its `promptHeader` pasted verbatim, then `Read <inputPath> and rule on every item in it.` (Fable round: and review the diff it names). Then
    `P arbiter apply --round R --tag "<the same tag>"`; exit 2 `not-found`: wait, retry once, then park (cause `arbiter:not-found`);
    exit 1 with `restartRequired` (`stale-terminal` from `needed`, `stale-model` from `apply`; Fable round) ⇒ do NOT retry here and do NOT park: outcome `blocked`, with no `pipeline-blocked`
-   label and no `needs-human`. Post the CLI's `advice` text (`gh pr comment N --body "<advice>"`; `--kind blocked` renders only a verify failure), with `merge.hold_command` in `P config` `P merge-hold --pr N --release --reason handoff-withdrawn`,
+   label and no `needs-human`. Post the CLI's `advice` text (`P comment --pr N --kind blocked --reason "<advice>"`), with `merge.hold_command` in `P config` `P merge-hold --pr N --release --reason restart`,
    run the stop ritual, and tell the owner to restart the terminal (or update Claude Code / `pipeline model-floor reset`, as the advice says). After the restart: `P arbiter needed --round R` and the arbiter again.
    Any other exit 1 ⇒ the items are `needsHuman` (Fable round: run `needed` and the arbiter once more; failing twice ⇒ park, cause `arbiter:model-proof`).
 5. **Publish and fix.** `P comment --pr N --kind triage` FIRST, then `P followups create --round R` for FOLLOW-UP items, then the triage comment again

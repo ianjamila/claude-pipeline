@@ -251,6 +251,22 @@ function excerptOf(step) {
   return defuse(raw.split('\n').slice(0, MAX_EXCERPT_LINES).join('\n').slice(0, MAX_EXCERPT_CHARS));
 }
 
+// A review that stopped for a reason of its own, not a failed verification (e.g. a terminal that must be restarted before the Fable pass): the reason is
+// the text the CLI gave (arbiter advice), flattened to one line. `pipeline comment --kind blocked --reason TEXT` renders this; without --reason the
+// comment is rendered from the verify report (blockedComment).
+export function blockedReasonComment(reason) {
+  const why = line(reason).replace(/[.\s]+$/, '');
+  return [
+    MARKERS.blocked,
+    '',
+    '### Pipeline blocked — the review stopped',
+    '',
+    `The review stopped: ${why || 'no reason given'}.`,
+    '',
+    'The PR is not labelled pipeline-blocked and nothing else needs a decision. Do that step, then ask for the review to resume in a Claude Code session on this repository; it continues where it stopped.',
+  ].join('\n');
+}
+
 export function blockedComment(report) {
   const steps = Array.isArray(report?.steps) ? report.steps : [];
   const head = report?.git?.head ? ` at \`${line(String(report.git.head).slice(0, 7))}\`` : '';

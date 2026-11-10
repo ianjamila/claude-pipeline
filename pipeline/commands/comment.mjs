@@ -7,7 +7,7 @@ import { EXIT, UsageError, parseCommandArgs, intOption, requireOption } from '..
 import { guarded } from '../lib/cmd-common.mjs';
 import { loadConfig, DEFAULTS } from '../lib/config.mjs';
 import { loadState } from '../lib/state.mjs';
-import { MARKERS, summarySections, needsHumanComment, blockedComment, awaitingReviewComment } from '../lib/render.mjs';
+import { MARKERS, summarySections, needsHumanComment, blockedComment, blockedReasonComment, awaitingReviewComment } from '../lib/render.mjs';
 import { recordForOutcome } from '../lib/run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 import { createGitHub, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
@@ -21,6 +21,7 @@ export const meta = {
     '  --kind triage publishes the review state under the review lock as a compare-and-swap on its content (lib/review-publish.mjs): it is refused',
     '  (exit 1 {ok:false, error:\'stale-publication\', reason}) when the PR holds a state this copy neither published nor restored: run `pipeline state show --pr N`',
     '  and redo the decision; {action:\'unchanged\'} when the PR already holds exactly this state. The other kinds take no lock.',
+    '  --kind blocked renders the verify report\'s failure; with --reason TEXT it renders a "the review stopped: TEXT" comment instead (no report needed), e.g. the advice of a stop that waits for a terminal restart.',
   ].join('\n'),
 };
 
@@ -98,6 +99,8 @@ export const run = guarded(async (argv, ctx) => {
     const outcome = requireOption(values, 'outcome');
     const state = requireState(root, kind);
     body = summarySections(state, { outcome, built: values.built, modelProofs: readModelProofs(root, state) });
+  } else if (kind === 'blocked' && values.reason !== undefined) {
+    body = blockedReasonComment(values.reason);
   } else if (kind === 'blocked') {
     const file = await reportPath(root);
     if (!existsSync(file)) throw new UsageError(`no verify report at ${file}: the blocked comment is rendered from it`);
