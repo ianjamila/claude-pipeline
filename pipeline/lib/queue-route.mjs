@@ -96,12 +96,8 @@ export async function recheckGatedRecorded({ root, config, pr, gh, env, head, re
   if (gate.ok !== true || gate.head !== head || gate.pr !== pr) return stop('the gate file is not a passing gate for this PR and head');
   const at = Date.parse(gate.at);
   if (!Number.isFinite(at) || now() - at > GATE_MAX_AGE_MS) return stop('the gate file is too old');
-  let prHead;
-  try {
-    prHead = gh.prView(pr, [...PR_FIELDS]).headRefOid;
-  } catch (err) {
-    return stop(`could not read the PR head (${String(err?.message ?? err).split('\n')[0]})`);
-  }
+  // (a failed read throws, as evaluateGate's does a call later: the sweep leaves the record live for the next pass. A refusal would end it and spend the owner's word on a GitHub blip: R2-F2)
+  const prHead = gh.prView(pr, [...PR_FIELDS]).headRefOid;
   let hash = '';
   try {
     hash = localHash(root, config);

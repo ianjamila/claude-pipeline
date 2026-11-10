@@ -482,3 +482,20 @@ test('R1-F3: the sweep\'s gated recheck refuses what gateRefusals refuses: a fut
     assert.deepEqual(r.calls, [], `${why}: nothing is evaluated`);
   }
 });
+
+// ---- review round 2 ---------------------------------------------------------------------------------------------------------------------
+
+// R2-F2: a PR read that fails (a GitHub blip) is not a refusal: a refusal ends the record and spends the owner's word, so the error propagates and the sweep leaves the record live for the next pass.
+test('R2-F2: the sweep\'s gated recheck lets a failed PR read propagate instead of refusing for good', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-qsweep-gate-'));
+  mkdirSync(join(dir, '.review'));
+  writeFileSync(join(dir, '.review', 'final-gate.json'), JSON.stringify({
+    ok: true, repo: 'acme/widgets', pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'none', at: new Date().toISOString(),
+    checks: CANONICAL_CHECKS.map((name) => ({ name, ok: true, detail: '' })),
+  }));
+  const gh = { ...stub({ states: [st()] }), prView: () => { throw new Error('gh: Server Error (HTTP 502)'); } };
+  await assert.rejects(
+    recheckGatedRecorded({ root: dir, config: {}, pr: 7, gh, env: {}, head: HEAD, repo: 'acme/widgets', rec: { approval: APPROVAL }, localHash: () => 'hash1', evaluate: async () => { throw new Error('not reached'); }, problemsOf: async () => [] }),
+    /HTTP 502/,
+  );
+});
