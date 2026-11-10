@@ -34,7 +34,11 @@ function world({ entries = TWO(), compare = TWO_COMMITS(), defaultStatus = 'iden
       return `${JSON.stringify(compare)}\n`;
     }
     m = /^repos\/acme\/app\/pulls\/(\d+)$/.exec(path);
-    if (m && prs[m[1]]) return `${JSON.stringify(prs[m[1]])}\n`;
+    if (m && prs[m[1]]) {
+      // an array = one answer per read (the last repeats); a read counts in `calls` like any other
+      const body = Array.isArray(prs[m[1]]) ? prs[m[1]][Math.min(calls.filter((c) => c === path).length - 1, prs[m[1]].length - 1)] : prs[m[1]];
+      return `${JSON.stringify(body)}\n`;
+    }
     throw new Error(`unscripted read ${path} ${jq}`);
   };
   const graphql = () => {
@@ -212,6 +216,53 @@ test('recheck: predecessor removed (not merged), merged at another commit, or it
   assert.equal(off.ok, false);
   const unreadable = await recheckManifest({ ...args(world({ entries: only5 })), manifest: m });
   assert.equal(unreadable.ok, false, 'PR state unreadable');
+});
+
+// eaglewatch#1784: a predecessor the queue merged between evaluate and publish may not read as merged YET (GitHub lags, eaglewatch#1771). Publish gives it the same
+// one re-read evaluate has (queue and PR read again); only a PR that is still open and unmerged then counts as gone. Anything final is not re-read.
+const UNMERGED = { state: 'open', merged: false, mergeCommit: null };
+const pullReads = (w, pr) => w.calls.filter((c) => c === `repos/acme/app/pulls/${pr}`).length;
+const graphqlReads = (w) => { let n = 0; const g = w.graphql; w.graphql = (...a) => { n++; return g(...a); }; return () => n; };
+
+test('recheck: a predecessor that left the queue but whose PR is not merged YET is read once more, then ok when it merged at its own commit (eaglewatch#1784)', async () => {
+  const m = await manifestOf();
+  const w = world({ entries: [entry('E5', 5, HEAD5, B, A)], prs: { 3: [UNMERGED, merged(A)] } });
+  const queueReads = graphqlReads(w);
+  const r = await recheckManifest({ ...args(w), manifest: m });
+  assert.equal(r.ok, true, r.reason);
+  assert.equal(pullReads(w, 3), 2, 'one read, one re-read');
+  assert.equal(queueReads(), 2, 'the queue is read again between the two PR reads');
+});
+
+test('recheck: a predecessor whose PR is STILL open and unmerged on the re-read => not ok, with exactly one re-read (eaglewatch#1784)', async () => {
+  const m = await manifestOf();
+  const w = world({ entries: [entry('E5', 5, HEAD5, B, A)], prs: { 3: UNMERGED } });
+  const r = await recheckManifest({ ...args(w), manifest: m });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /^a member's head or entry moved \(#3 left the queue without merging/);
+  assert.equal(r.retry, undefined, 'the retry flag is internal');
+  assert.equal(pullReads(w, 3), 2);
+});
+
+test('recheck: a final departure (merged at another commit, closed without merging) is not re-read (eaglewatch#1784)', async () => {
+  const m = await manifestOf();
+  const w = world({ entries: [entry('E5', 5, HEAD5, B, A)], prs: { 3: merged(sha('c')) } });
+  assert.equal((await recheckManifest({ ...args(w), manifest: m })).ok, false);
+  assert.equal(pullReads(w, 3), 1, 'merged at another commit is final: no re-read');
+  const closed = world({ entries: [entry('E5', 5, HEAD5, B, A)], prs: { 3: { state: 'closed', merged: false, mergeCommit: null } } });
+  assert.equal((await recheckManifest({ ...args(closed), manifest: m })).ok, false);
+  assert.equal(pullReads(closed, 3), 1, 'closed without merging is final: no re-read');
+});
+
+test('recheck: when the re-read itself cannot be made, the first finding stands (eaglewatch#1784)', async () => {
+  const m = await manifestOf();
+  const w = world({ entries: [entry('E5', 5, HEAD5, B, A)], prs: { 3: UNMERGED } });
+  let n = 0;
+  const g = w.graphql;
+  w.graphql = (...a) => { if (++n > 1) throw new Error('GraphQL rate limited'); return g(...a); };
+  const r = await recheckManifest({ ...args(w), manifest: m });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /#3 left the queue without merging/, 'the first reason, not "queue unreadable"');
 });
 
 test('recheck: a predecessor still live but changed (head pushed elsewhere / re-created) => not ok', async () => {

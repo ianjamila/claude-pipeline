@@ -281,6 +281,20 @@ test('poster: predecessor A departed and its PR is STILL not merged on the re-re
   assert.equal(pullReads(r, 3), 2, 'one read, one re-read; the three contexts share the answer');
 });
 
+// eaglewatch#1784: the same lag between evaluate and publish: A is listed at evaluate, the queue merges it before publish re-reads, and its PR does not say merged YET.
+test('poster: predecessor A merged by the queue between evaluate and publish, its PR not merged YET at publish, merged on the re-read => B still success; one re-read (eaglewatch#1784)', async () => {
+  const r = await exec({ queue: [TWO(), ONLY_5()], prs: { 3: [UNMERGED, MERGED_AT_A] } });
+  assert.equal(r.code, 0, r.phase1.stderr + (r.phase2?.stderr ?? ''));
+  assert.deepEqual(states(r), ALL('success'));
+  assert.equal(pullReads(r, 3), 2, 'one read, one re-read at publish');
+});
+
+test('poster: predecessor A gone at publish and its PR is STILL not merged on the re-read => error (eaglewatch#1784)', async () => {
+  const r = await exec({ queue: [TWO(), ONLY_5()], prs: { 3: UNMERGED } });
+  assert.deepEqual(states(r), ALL('error'));
+  assert.equal(pullReads(r, 3), 2);
+});
+
 test('poster: predecessor A merged at ANOTHER commit is final at once: error, no re-read (eaglewatch#1771)', async () => {
   const r = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: { state: 'closed', merged: true, mergeCommit: sha('c') } } }, { publish: false });
   assert.deepEqual(['integrity', 'hardstops', 'review'].map((k) => r.verdict.checks[k].state), ['error', 'error', 'error']);
