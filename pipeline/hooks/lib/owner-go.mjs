@@ -419,6 +419,8 @@ function currentPromptEntry(transcriptPath, prompt) {
 //    round 2, arbiter ACCEPT): but the owner SAW it, and when it lands after the selected slot's last entry (and before the owner's prompt) the last thing displayed was not the selected
 //    request, so the selected slot is stale and the reply is '' (fail closed, like a mute). Text from any visible slot other than the selected one counts (assistant text only: a tool-only
 //    entry shows nothing); text that landed BEFORE the selected slot's last entry (interleaved) does not. A single interactive session cannot produce this order, so normal use is unchanged;
+//    R3-B1: "the selected slot's last entry" is its last SHOWN one (its last assistant text), so its own trailing tool-only entry cannot hide a later request; #241: a tool block of another visible slot
+//    that surfaces an ask counts as shown too; R3-F1: so does a visibleSynthetic skip turn's text or surfaced ask (ruling reader), whenever its prompt opened;
 //  - (a void by a synthetic turn that shows something after the slot's last activity is the separate ruling-mode rule above);
 //  - an entry whose chain does not resolve to a prompt entry inside the window (no parentUuid, a uuid not in the window, a cycle, a duplicate uuid on the way, a chain that ends at no prompt)
 //    is DROPPED in a modern transcript (fail closed; subsumes A3 for assistant text, whose prompt was cut off by the window). A compaction is transparent to the walk: a hidden summary and
@@ -473,17 +475,25 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
     if (e?.type === 'user' && isPromptEntry(e)) {
       // skip (ruling reader): a turn whose prompt the owner did not type; mute (every other reader): an invisible turn, a boundary whose text is never added (#191 A2); slot: everything else
       const kind = skipSynthetic ? (entrySource(e) === 'synthetic' || invisibleTurn(e) ? 'skip' : 'slot') : invisibleTurn(e) ? 'mute' : 'slot';
-      const t = { pos: i, e, kind, content: [], lastPos: i, textPos: -1 };
+      const t = { pos: i, e, kind, content: [], lastPos: i, textPos: -1, shownPos: -1 };
       turns.push(t);
       turnAt.set(i, t);
     } else if ((e?.type === 'user' || e?.type === 'assistant') && Array.isArray(content)) {
       const t = turnAt.get(origin[i]);
-      if (t) { t.content.push(e); t.lastPos = i; if (e.type === 'assistant' && e.message.content.some((b) => b?.type === 'text' && typeof b.text === 'string' && b.text.trim() !== '')) t.textPos = i; } // (no turn: an unresolved chain, or text before the window's first prompt: dropped)
+      if (t) { // (no turn: an unresolved chain, or text before the window's first prompt: dropped)
+        t.content.push(e);
+        t.lastPos = i;
+        const text = e.type === 'assistant' && content.some((b) => b?.type === 'text' && typeof b.text === 'string' && showsText(b.text));
+        if (text) t.textPos = i;
+        // #241: what the owner can read is the text AND a tool block that surfaces an ask (the detectors the ruling reader uses below)
+        if (text || content.some((b) => (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) || (b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content))))) t.shownPos = i;
+      }
     }
   });
   // The reply slots: what the owner's "merge" / "extra round" / ruling can answer, in prompt order. A skipped turn (ruling reader) is promoted into one (#189) or voids the slot before it (R1-F3..R5-B2, below).
   const slots = [];
   const mutes = []; // positions of the invisible prompts (merge / round readers)
+  const shownSkips = []; // R3-F1: the last shown position of each visibleSynthetic skip turn that was not promoted
   for (const t of turns) {
     if (t.kind === 'mute') { mutes.push(t.pos); continue; }
     if (t.kind === 'slot') {
@@ -510,6 +520,9 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
     else if (anything) {
       const before = slots[slots.length - 1];
       if (before && before.lastPos < t.pos) before.voided = true; // (a slot still being written when this turn opened was not replaced by it: interleaved, not later)
+      // R3-F1: ... but a VISIBLE synthetic turn's text or surfaced ask is on the owner's screen wherever its prompt opened: when it lands after the selected slot's last shown entry (checked below),
+      // that request is stale. An invisible turn (sdk, non-human origin, unknown source) is never shown, so the interleaved exemption above stays for it.
+      if (visibleSynthetic(t.e)) shownSkips.push(t.shownPos);
     }
   }
   // Only the reply slot right before the owner's prompt: when the newest prompt IS that prompt (and nothing answered it yet), its own (empty) slot is skipped, and that is the ONLY slot that
@@ -518,8 +531,10 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
   const current = newest?.kind === 'slot' && newest.content.length === 0 && (prompt === undefined || plain(prompt) === promptTextOf(newest.e));
   const candidates = current ? slots.filter((x) => x.turn !== newest) : slots;
   const last = candidates[candidates.length - 1]; // (none: only text before the window's first prompt, which has no known origin, A3)
-  // R2-B1: assistant text of ANY other visible slot after the selected slot's last entry was the last thing the owner was shown: the selected request is stale, exactly like a mute
-  const shownAfter = !last || candidates.some((x) => x !== last && x.turn.textPos > last.lastPos);
+  // R2-B1: assistant text of ANY other visible slot after the selected slot's last SHOWN entry was the last thing the owner was shown: the selected request is stale, exactly like a mute.
+  // R3-B1: the selected slot's last shown entry is its last assistant text (textPos), not lastPos: a tool-only entry or a tool result of the selected slot shows nothing and must not hide
+  // a later request of another slot. #241: a tool block of another visible slot that surfaces an ask (shownPos) counts as shown too, not the selected slot's own. R3-F1: so does a visibleSynthetic skip turn's.
+  const shownAfter = !last || candidates.some((x) => x !== last && x.turn.shownPos > last.turn.textPos) || shownSkips.some((pos) => pos > last.turn.textPos);
   if (!last || last.voided || shownAfter || mutes.some((pos) => pos > last.lastPos)) return { text: '', promoted: false };
   return { text: last.text, promoted: last.promoted };
 }
