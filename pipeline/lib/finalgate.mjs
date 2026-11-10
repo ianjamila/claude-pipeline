@@ -23,7 +23,7 @@ import { toPosix } from './paths.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
-import { claudeRulingRows, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory } from './triage.mjs';
+import { claudeRulingRows, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, staleFableReason, staleFableRounds } from './triage.mjs';
 import { readPublished, reviewContentHash as stateContentHash } from './review-publish.mjs';
 import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
@@ -641,6 +641,9 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   // What keeps a review from completing although its items read as resolved (a Claude-ruled follow-up with no issue, a fix made outside the named file nobody confirmed).
   const eligibility = reviewEligibilityProblems(state);
   if (eligibility.length > 0) return check('review', false, eligibility.join('; '));
+  // A Fable pass proven below MIN_FABLE is re-reviewed, not grandfathered: the same refusal as review-complete (plan 2026-11-10 A4b).
+  const staleFable = staleFableRounds(state);
+  if (staleFable.length > 0) return check('review', false, staleFableReason(staleFable, pr));
   const exemptNote = exempt ? `; docs-only exemption (review.docs_exempt_paths): ${exempt.files.join(', ')} added after the reviewed head ${exempt.reviewedHead.slice(0, 12)}` : '';
   // A round past review.max_rounds must carry the owner's extra-round grant, re-proved here from the owner's record and its marker (never
   // from the state alone). A grant lets a round run; it is no merge authority, so it is shown but never an owner-merge item.

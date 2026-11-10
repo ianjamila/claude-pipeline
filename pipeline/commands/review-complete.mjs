@@ -15,7 +15,7 @@ import { diffFiles, headSha, mergeBase } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, reviewLane } from '../lib/risk.mjs';
 import { loadState } from '../lib/state.mjs';
-import { reviewEligibilityProblems, reviewValidFor, roundOutcome, rulingsDigest } from '../lib/triage.mjs';
+import { reviewEligibilityProblems, reviewValidFor, roundOutcome, rulingsDigest, staleFableReason, staleFableRounds } from '../lib/triage.mjs';
 import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
@@ -164,6 +164,11 @@ export const run = guarded(async (argv, ctx) => {
           return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${why}${stale}${note}`, currentContentHash: hash } };
         }
         docsExempt = ex;
+      }
+      // A Fable pass proven below MIN_FABLE is re-reviewed, not grandfathered (plan 2026-11-10 A4b): the same refusal as the final gate's review check.
+      const staleFable = staleFableRounds(state);
+      if (staleFable.length > 0) {
+        return { exitCode: EXIT.FAILED, output: { ok: false, reason: staleFableReason(staleFable, pr), error: 'fable-refresh', staleFableRounds: staleFable, currentContentHash: hash } };
       }
       // The same proof as the final gate: a round past review.max_rounds must be backed by the owner's record and its marker.
       const grants = verifyOwnerGrants(state, { repo: gh.repo().slug, pr, maxRounds: config.review.max_rounds });

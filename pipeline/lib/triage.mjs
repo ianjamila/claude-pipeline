@@ -3,6 +3,7 @@
 // this file does. Everything is pure: functions return new values and never mutate their inputs.
 import { createHash } from 'node:crypto';
 import { CATEGORIES } from './codex.mjs';
+import { MIN_FABLE, compareVersions, parseModelId } from './model-floor.mjs';
 
 export const SECURITY_CATEGORIES = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
 export const BUCKETS = ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING'];
@@ -159,6 +160,53 @@ export const arbiterFailures = (state) => (state?.rounds ?? [])
 export const fablePendingRounds = (state) => (state?.rounds ?? [])
   .filter((r) => r?.fableRequired === true && r.baseOnly !== true && r.arbiter?.proofOk !== true)
   .map((r) => r.n);
+
+// ---- Fable proofs below the floor (plan 2026-11-10 A4b: old proofs are re-reviewed, not grandfathered) -------------------------
+// A proven Fable round: the Fable pass answered and its transcript was accepted (arbiter.mjs publishes modelProof only then).
+const isProvenFableRound = (r) => r?.fableRequired === true && r.baseOnly !== true && r.arbiter?.proofOk === true;
+// The Fable ids a round was proven with (modelProof.models is keyed by model id) split by MIN_FABLE. A `claude-fable-*` id the parser cannot read
+// is stale (fail closed, like the floor itself); an id of another family is not a Fable and is ignored.
+const fableModelsOf = (r) => {
+  const min = parseModelId(MIN_FABLE);
+  const stale = [];
+  const current = [];
+  for (const id of Object.keys(r?.modelProof?.models && typeof r.modelProof.models === 'object' ? r.modelProof.models : {})) {
+    const p = parseModelId(id);
+    if (p === null) {
+      if (/^claude-fable(-|$)/.test(id)) stale.push(id);
+    } else if (p.family === 'fable') {
+      (compareVersions(p, min) < 0 ? stale : current).push(id);
+    }
+  }
+  return { stale, current };
+};
+// A later proven pass that supersedes older ones: every Fable id in it is at or above MIN_FABLE, and it reviewed the WHOLE PR
+// (round.arbiter.scope 'whole-pr', stored when arbiter needed wrote the diff). A round without the stored scope is not one.
+const supersedes = (r) => {
+  const { stale, current } = fableModelsOf(r);
+  return isProvenFableRound(r) && stale.length === 0 && current.length > 0 && r.arbiter?.scope === 'whole-pr';
+};
+// The proven Fable rounds whose recorded Fable model is below MIN_FABLE and that no LATER whole-PR pass at or above MIN_FABLE replaced:
+// [{ round, models }] in round order. review-complete and the final gate refuse a PR while this is non-empty; `state fable-refresh` is the way out.
+export function staleFableRounds(state) {
+  const rounds = state?.rounds ?? [];
+  const out = [];
+  for (const r of rounds) {
+    if (!isProvenFableRound(r)) continue;
+    const { stale } = fableModelsOf(r);
+    if (stale.length === 0) continue;
+    if (rounds.some((later) => later.n > r.n && supersedes(later))) continue;
+    out.push({ round: r.n, models: [...stale].sort() });
+  }
+  return out;
+}
+// "rounds 1 (claude-fable-5-1), 3 (...)" for the refusal text.
+export const staleFableSummary = (stale) => stale.map((s) => `${s.round} (${s.models.join(', ')})`).join(', ');
+// Why review-complete and the final gate refuse such a PR, and the one command that fixes it.
+export const staleFableReason = (stale, pr) => `the Fable review pass of round ${staleFableSummary(stale)} was proven with a Fable older than ${MIN_FABLE}: run \`pipeline state fable-refresh --pr ${pr}\` (one extra Fable pass that re-reviews the whole PR with the current Fable; it is not counted against review.max_rounds)`;
+// A proven Fable pass that is not below MIN_FABLE (any scope; a proof that recorded no Fable id counts as it always did): the passes below it do
+// not count for arbiter.mjs#writeFableDiff's "the first pass reviews the whole PR" rule, so the first fresh-model pass after old ones reads everything.
+export const provenNotStale = (r) => isProvenFableRound(r) && fableModelsOf(r).stale.length === 0;
 
 // ---- judge, tests ---------------------------------------------------------------------------
 
@@ -543,8 +591,9 @@ export function markLightLane(items) {
 // A round that only merged the base branch in ("Update branch") reviewed nothing of the PR's own: it does not count toward
 // maxRounds. Nor does a round that is only the resolution of a merge conflict with the base branch (resolutionOnly: git.mjs#
 // resolutionReviewBase proved the resolver only chose lines the two sides already had). That one IS a real review (Codex, triage
-// and Fable all run), only the cap is waived. Only the other rounds are counted by the cap.
-export const countsTowardCap = (r) => r?.baseOnly !== true && r?.resolutionOnly !== true;
+// and Fable all run), only the cap is waived. Nor does a Fable refresh round (fableRefresh: state fable-refresh re-runs ONLY the Fable pass on a head
+// whose Fable proof is older than MIN_FABLE; it asks Codex nothing). Only the other rounds are counted by the cap.
+export const countsTowardCap = (r) => r?.baseOnly !== true && r?.resolutionOnly !== true && r?.fableRefresh !== true;
 export const reviewedRoundCount = (state) => (state?.rounds ?? []).filter(countsTowardCap).length;
 
 // ---- owner-granted rounds (the pure side; the owner's records are looked up by the caller and INJECTED) ---------------------------
@@ -665,13 +714,13 @@ export function roundOutcome(state, { grants, head } = {}) {
   };
 }
 
-// How may round `n` start? -> { admission, problem }. admission: 'uncounted' (baseOnly / resolutionOnly: never capped, never needs or uses a
+// How may round `n` start? -> { admission, problem }. admission: 'uncounted' (baseOnly / resolutionOnly / fableRefresh: never capped, never needs or uses a
 // grant), 'normal' (within maxRounds, or no finite maxRounds), 'auto-extra' (the one extra confirm round roundOutcome grants), 'owner' (an
 // open owner grant for counted ordinal reviewed + 1 that covers `head`), or null with `problem` (the reason it may not). The automatic
 // extra is checked first and wins; a grant only admits what ordinary admission does not cover.
-export function roundAdmission(state, n, { baseOnly = false, resolutionOnly = false, head, grants } = {}) {
+export function roundAdmission(state, n, { baseOnly = false, resolutionOnly = false, fableRefresh = false, head, grants } = {}) {
   const max = state?.maxRounds;
-  if (baseOnly || resolutionOnly) return { admission: 'uncounted', problem: null };
+  if (baseOnly || resolutionOnly || fableRefresh) return { admission: 'uncounted', problem: null };
   if (!Number.isFinite(max)) return { admission: 'normal', problem: null };
   const reviewed = reviewedRoundCount(state);
   const next = reviewed + 1;

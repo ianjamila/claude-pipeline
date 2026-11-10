@@ -5,12 +5,13 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { mkdirSync, existsSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { effectiveReviewBase, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
+import { GitError, effectiveReviewBase, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { grantIdOf, ownerGrantedRounds } from '../hooks/lib/owner-go.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
-import { loadState, saveState, updateItems } from '../lib/state.mjs';
-import { arbiterFailures, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
+import { MIN_FABLE } from '../lib/model-floor.mjs';
+import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
+import { arbiterFailures, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds } from '../lib/triage.mjs';
 import { readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
@@ -44,6 +45,11 @@ export const meta = {
     '     round asks Codex to confirm it (round.confirmFixed) and review-complete waits for that round. Ordinary ACCEPTs get no such field',
     '  -> exit 3 {ok:false, unavailable:true, reason:base-refresh} and nothing is marked when origin/<default_branch> cannot be fetched (offline, remote down) while the',
     '     hash would be measured from it - also with no origin remote but a leftover origin/<default_branch> ref: a stale base would count the default branch\'s commits as the fix',
+    'pipeline state fable-refresh --pr N [--repo DIR]',
+    '  -> {ok, round, staleRounds, scope: "whole-pr"}: opens an uncounted Fable-only round (no Codex, not counted against review.max_rounds, allowed past it and with no new commit) on the pushed head, so a Fable pass proven with',
+    '     a Fable older than MIN_FABLE is re-reviewed. Refused (exit 2) unless a proven Fable round is below MIN_FABLE and no later whole-PR pass at or above it replaced it (error nothing-stale), every earlier round is finished',
+    '     (error unfinished-round: a Fable pass owed, an undecided, human-owed, unimplemented or newly accepted item), HEAD is the head of PR N on GitHub (error head-not-pushed; exit 3 when GitHub is unreachable)',
+    '     and the content is what the last round reviewed (error content-moved: run a normal codex-review round instead, its Fable pass already reads the whole PR). Then: arbiter needed --round R, the arbiter, arbiter apply',
     'pipeline state record-followup --id ID --url URL [--repo DIR]',
     'pipeline state set-outcome --outcome TEXT [--repo DIR]',
   ].join('\n'),
@@ -489,8 +495,81 @@ function setOutcome(rest, ctx) {
   });
 }
 
+// ---- fable-refresh ------------------------------------------------------------------------
+
+// A proven Fable pass recorded with a Fable older than MIN_FABLE is re-reviewed (plan 2026-11-10 A4b), not grandfathered. This opens the round that does it: no
+// Codex, no items, the same code as the last round. It is uncounted (never capped: a PR at its last round, or past it, must still be able to refresh), and
+// Fable-pending until a proven pass, so review-complete waits for it exactly as for any Fable round.
+async function fableRefresh(rest, ctx) {
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const pr = intOption(values, 'pr', { required: true, min: 1 });
+  const root = resolveRepo(values, ctx);
+  const { config } = await requireConfig(root);
+  return withStateLock(root, ctx, async () => {
+    const state = requireState(root);
+    if (state.pr !== pr) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'state-pr-mismatch', message: `the review state belongs to PR #${state.pr}, not #${pr}` });
+    }
+    const stale = staleFableRounds(state);
+    if (stale.length === 0) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'nothing-stale', message: `no proven Fable round is below ${MIN_FABLE} (or a later whole-PR pass already replaced it): there is nothing to refresh` });
+    }
+    const last = state.rounds.at(-1);
+    const o = { cwd: root };
+    const head = headSha(o);
+    // As in state outcome: a stale origin/<default_branch> only makes the content look moved, and the refusal below says what to do then.
+    refreshBaseRef(root, config);
+    const hash = currentContentHash(root, config);
+    const outcome = roundOutcome({ ...state, currentContentHash: hash });
+    const unfinished = [
+      ...outcome.fablePending.map((n) => `the Fable pass of round ${n} is not proven`),
+      ...[...new Set([...outcome.pending, ...outcome.needsHuman, ...outcome.openBlocking, ...outcome.unimplemented, ...outcome.newAccepted])]
+        .map((id) => `${id} is undecided, waiting for a human, or an accepted fix not yet implemented and reviewed`),
+    ];
+    if (unfinished.length > 0) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'unfinished-round', message: `an earlier round is not finished: ${unfinished.join('; ')}`, unfinished });
+    }
+    // Only the head GitHub holds is refreshed: review-complete compares the reviewed head with the PR's.
+    const view = await guardGh(() => createGitHub({ cwd: root, env: ctx.env }).prView(pr, ['headRefOid', 'baseRefName']));
+    if (view.headRefOid !== head) {
+      throw new Fail(EXIT.USAGE, {
+        ok: false, error: 'head-not-pushed',
+        message: `local HEAD ${head} is not the head of PR #${pr} on GitHub (${view.headRefOid ?? 'unknown'}): push or pull first`, localHead: head, prHead: view.headRefOid ?? null,
+      });
+    }
+    if (!outcome.coverageValid) {
+      throw new Fail(EXIT.USAGE, {
+        ok: false, error: 'content-moved',
+        message: `the content changed since round ${last.n}: run a normal codex-review round instead (its Fable pass already reads the whole PR, so it replaces the old proof)`,
+        currentContentHash: hash,
+      });
+    }
+    // The whole-PR range starts at the PR's merge base now (a base branch merged in since the last round moves it).
+    let forkPoint = last.forkPoint ?? state.rounds[0]?.reviewBase;
+    try {
+      const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
+      forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
+    } catch (err) {
+      if (!(err instanceof GitError)) throw err;
+    }
+    const n = last.n + 1;
+    const models = [...new Set(stale.flatMap((s) => s.models))];
+    const next = addRound({ ...state, currentContentHash: hash }, {
+      n, fromHead: last.toHead, toHead: head, contentHashAtToHead: last.contentHashAtToHead, items: [],
+      ...(last.reviewBase === undefined ? {} : { reviewBase: last.reviewBase, reviewBaseKind: last.reviewBaseKind }),
+      ...(typeof forkPoint === 'string' && forkPoint !== '' ? { forkPoint } : {}),
+      ...(typeof last.codexModel === 'string' ? { codexModel: last.codexModel } : {}),
+      fableRefresh: true, fableRequired: true,
+      fableReasons: [`fable-refresh: rounds ${stale.map((s) => s.round).join(',')} proven with ${models.join(', ')} below ${MIN_FABLE}`],
+      sensitivePaths: Array.isArray(last.sensitivePaths) ? last.sensitivePaths : [],
+    });
+    saveState(root, next);
+    return { exitCode: EXIT.OK, output: { ok: true, round: n, staleRounds: stale, scope: 'whole-pr' } };
+  }, pr);
+}
+
 const SUBCOMMANDS = {
-  show, 'discard-round': discardRound, outcome, 'mark-implemented': markImplemented, 'record-followup': recordFollowup, 'set-outcome': setOutcome,
+  show, 'discard-round': discardRound, outcome, 'mark-implemented': markImplemented, 'fable-refresh': fableRefresh, 'record-followup': recordFollowup, 'set-outcome': setOutcome,
 };
 
 export const run = guarded(async (argv, ctx) => {

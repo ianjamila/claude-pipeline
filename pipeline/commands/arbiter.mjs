@@ -21,7 +21,7 @@ import { seamFlag } from '../lib/proc.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
 import { extractJsonBlock, findSubagentTranscript, proveModel } from '../lib/transcript.mjs';
 import {
-  MALFUNCTION_CAUSES, applyRulings, arbiterNeeded, fableFindingItems, finalizeWithoutArbiter, isOwnerRuled, isProtectedFinal, needsHumanCause, reuseRuled,
+  MALFUNCTION_CAUSES, applyRulings, arbiterNeeded, fableFindingItems, finalizeWithoutArbiter, isOwnerRuled, isProtectedFinal, needsHumanCause, provenNotStale, reuseRuled,
   ruledCacheFrom, validateRulings,
 } from '../lib/triage.mjs';
 import {
@@ -145,10 +145,12 @@ const FABLE_DIFF = 'fable-diff.patch';
 
 // The diff a Fable pass reviews, written next to its input and pinned by digest. The first proven Fable pass of a PR sees
 // the WHOLE PR (fork point..this round's head): a PR that only became medium in a later round must not have its first
-// rounds go unreviewed by Fable. After that, each round's own slice (what Codex saw), like Codex.
+// rounds go unreviewed by Fable. After that, each round's own slice (what Codex saw), like Codex. A pass proven below MIN_FABLE does not count
+// as earlier (the first fresh-model pass reads everything again), and a Fable refresh round always reads the whole PR. The scope is stored on
+// the round (arbiter.scope) because staleFableRounds only accepts a later whole-PR pass as the replacement of an old one.
 function writeFableDiff(state, round, root) {
-  const earlierProven = state.rounds.some((r) => r.n < round.n && isFableRound(r) && r.arbiter?.proofOk === true);
-  const scope = earlierProven ? 'round' : 'whole-pr';
+  const earlierProven = state.rounds.some((r) => r.n < round.n && isFableRound(r) && provenNotStale(r));
+  const scope = earlierProven && round.fableRefresh !== true ? 'round' : 'whole-pr';
   // A synthetic / resolution round's base is a tree that exists only where it was made: rebuilt here when this clone lacks it,
   // and never replaced by another range (a different review) when it cannot be.
   let from;
