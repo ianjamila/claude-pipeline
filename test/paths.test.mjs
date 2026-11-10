@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, safeTimestamp } from '../pipeline/lib/paths.mjs';
 
 test('toPosix replaces every backslash', () => {
@@ -102,6 +104,32 @@ test('samePath compares after normalisation', () => {
   assert.equal(samePath('/A/C', '/a/c', 'darwin'), true);
   assert.equal(samePath('/A/C', '/a/c', 'linux'), false);
   assert.equal(samePath('C:\\a\\b', 'c:/a/b', 'win32'), true);
+});
+
+// Folders that differ only in letter case are one folder on a case-insensitive volume and two on a case-sensitive one: ask the disk which this temp dir is
+// (run with TMPDIR on a case-sensitive volume to exercise the second branch on macOS; the default macOS volume is case-insensitive).
+test('samePath: folders differing only by case follow the file system, not the platform default', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cp-case-'));
+  try {
+    const lower = path.join(dir, 'work');
+    const upper = path.join(dir, 'WORK');
+    fs.mkdirSync(lower);
+    let caseSensitive = true;
+    try { fs.mkdirSync(upper); } catch (err) { if (err.code !== 'EEXIST') throw err; caseSensitive = false; }
+    if (caseSensitive) {
+      assert.equal(samePath(lower, upper), false, 'two distinct existing folders');
+      fs.rmSync(upper, { recursive: true });
+      assert.equal(samePath(lower, upper), false, 'one exists, the other does not: not the same place');
+    } else {
+      assert.equal(samePath(lower, upper), true, 'one folder, two spellings');
+    }
+    assert.equal(samePath(lower, path.join(dir, 'x', '..', 'work')), true, 'the same spelling after normalising, though a segment is absent');
+    assert.equal(samePath(lower, lower + path.sep), true);
+    assert.equal(samePath(path.join(dir, 'nope-a'), path.join(dir, 'nope-a')), true, 'neither exists: the spelling decides');
+    const link = path.join(dir, 'link');
+    fs.symlinkSync(lower, link);
+    assert.equal(samePath(lower, link), true, 'an alias reaches the same folder');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('safeTimestamp is UTC, colon-free, fixed width', () => {

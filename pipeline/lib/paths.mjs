@@ -29,8 +29,8 @@ export function expandHome(p, home = os.homedir()) {
 const isAbsolutePosix = (s, platform = process.platform) => s.startsWith('/') || (platform === 'win32' && /^[A-Za-z]:\//.test(s));
 
 // Normalised POSIX form: absolute, ".." resolved, no trailing slash (except a bare root), and
-// lower-cased on case-insensitive platforms.
-function normalise(p, platform) {
+// lower-cased on case-insensitive platforms (unless `fold` is false: the spelling to ask the disk about).
+function normalise(p, platform, fold = true) {
   let s = toPosix(p);
   if (!isAbsolutePosix(s, platform)) s = `${toPosix(process.cwd())}/${s}`;
   const unc = /^\/\/[^/]/.test(s); // keep a UNC prefix; posix.normalize would collapse "//" to "/"
@@ -38,10 +38,30 @@ function normalise(p, platform) {
   if (platform === 'win32' && (DRIVE.test(s) || UNC.test(s))) s = drivePosix.normalize(s);
   else { s = path.posix.normalize(s); if (unc) s = `/${s}`; }
   if (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
-  return platform === 'win32' || platform === 'darwin' ? s.toLowerCase() : s;
+  return fold && (platform === 'win32' || platform === 'darwin') ? s.toLowerCase() : s;
 }
 
+// What the disk says about a place: its identity (device + inode, bigint), 'missing' (ENOENT), or null (cannot tell: a permission error, or a file
+// system that reports no inode - then the caller keeps to the spelling).
+function identityOf(p) {
+  try {
+    const st = fs.statSync(p, { bigint: true });
+    return st.ino === 0n ? null : `${st.dev}:${st.ino}`;
+  } catch (err) {
+    return err?.code === 'ENOENT' ? 'missing' : null;
+  }
+}
+
+// Whether two paths name the same place. On macOS and Windows the spelling is folded to lower case, which is right on the default case-insensitive volumes
+// and wrong on a case-sensitive one (/repo/work and /repo/WORK are two folders there). So when `platform` is the running one and the disk can answer
+// for both, the disk decides: both there -> the same device + inode; exactly one there -> different (a case-insensitive volume would have found both).
+// Otherwise (nothing there yet, a platform other than the running one, an unreadable stat) the folded spelling decides, as before.
 export function samePath(a, b, platform = process.platform) {
+  if (platform === process.platform) {
+    const x = identityOf(normalise(a, platform, false));
+    const y = identityOf(normalise(b, platform, false));
+    if (x !== null && y !== null && !(x === 'missing' && y === 'missing')) return x === y;
+  }
   return normalise(a, platform) === normalise(b, platform);
 }
 

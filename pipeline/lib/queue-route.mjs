@@ -124,7 +124,8 @@ export async function recheckGatedRecorded({ root, config, pr, gh, env, head, re
 export const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
 // canonicalPath (realpath.native), not JS realpathSync: only the native one expands a Windows 8.3 short name (RUNNER~1), so a temp folder and `git rev-parse` spell the same place alike.
 export const canon = (p) => canonicalPath(p);
-// Two folders are the same place when their canonical spellings agree (samePath: slash-normalised, case-insensitive where the file system is).
+// Two folders are the same place when their canonical spellings agree and the disk does not say otherwise (samePath: slash-normalised; on macOS / Windows
+// folded to lower case, but when both exist - or one does - the file's device + inode decides, so /repo/work and /repo/WORK stay two folders on a case-sensitive volume).
 const samePlace = (a, b) => samePath(canon(a), canon(b));
 
 // Why the worktree a live record was opened in cannot do that record's one re-queue, or null when it can: gone, no longer at the recorded head, or not a worktree of
