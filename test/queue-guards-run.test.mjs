@@ -193,7 +193,7 @@ test('poster: predecessor A removed (not merged), or merged at another commit, b
 });
 
 // eaglewatch#1769: GitHub empties `pull_requests` on the guard runs of a PR that merged, so a predecessor that merged after the manifest was taken can no longer
-// pass the provenance check. A member that LEFT the queue merged at its OWN queue commit (on the default branch) is settled; a live member keeps the full check.
+// pass the provenance check. A predecessor is settled when it merged at its own queue commit and on the default branch, listed or not; the top entry is never settled; a live member keeps the full check.
 const MERGED_RUN = { pull_requests: [] }; // (what GitHub shows for the predecessor's guard run once it merged)
 const ONLY_5 = () => [TWO()[1]];
 

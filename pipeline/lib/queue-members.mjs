@@ -168,8 +168,8 @@ export function recheckManifest({ read, graphql, repo, defaultBranch, manifest }
   return { ok: true };
 }
 
-// A member that has left the queue is settled when its PR merged AT its own queue commit and that commit is on the default branch (D6). null = settled,
-// else why not. Shared by recheckManifest and memberStanding.
+// A member is settled when its PR merged AT its own queue commit and that commit is on the default branch (D6). null = settled, else why not. recheckManifest asks
+// it only for members whose entry has left the queue; memberStanding asks it for every predecessor, listed or not.
 function unsettledReason({ read, repo, defaultBranch, member: m }) {
   let pr;
   try {
@@ -185,9 +185,10 @@ function unsettledReason({ read, repo, defaultBranch, member: m }) {
 /**
  * Where one manifest member stands NOW, for the poster's member check (eaglewatch#1769). GitHub empties `pull_requests` on the guard runs of a PR that merged
  * (the branch is deleted), so a predecessor that merged after the manifest was taken can no longer pass the provenance check; it does not need to, since it merged
- * on its own entry's green statuses. The same rule as recheckManifest's:
- *   { kind: 'live' }     the entry is still in the queue and not merged (or is the top entry, which owns the queue commit): the full guard check stands;
- *   { kind: 'settled' }  it merged at its OWN queue commit, and that commit is on the default branch: its guard re-check is skipped;
+ * on its own entry's green statuses. Unlike recheckManifest, which never reads the PR of a listed entry, this reads it first:
+ *   { kind: 'live' }     the full guard check stands: the top entry (it owns the queue commit, so it is never settled), or an entry still in the queue that has not
+ *                        merged at its own queue commit;
+ *   { kind: 'settled' }  its PR merged at its OWN queue commit, and that commit is on the default branch, listed or not: its guard re-check is skipped;
  *   { kind: 'gone', reason }  it left the queue any other way (removed, merged at another commit): an error;
  *   { kind: 'unknown', reason }  the queue or the PR could not be read: the caller keeps its own verdict.
  */

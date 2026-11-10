@@ -201,8 +201,8 @@ export async function runEvaluate({ env = process.env, cwd = process.cwd(), deps
     }
   };
   // A predecessor that merged after the manifest was taken (eaglewatch#1769): GitHub empties pull_requests on its guard runs, so its provenance can no longer be
-  // checked, and it need not be. A member that has LEFT the queue merged at its OWN queue commit, with that commit on the default branch, is settled (it merged on its own
-  // entry's green statuses); one that left any other way is an error. A live member keeps the full check. Read only when the check did not already pass, and kept once settled.
+  // checked, and it need not be. A predecessor is settled when it merged at its own queue commit and on the default branch, listed or not (it merged on its own
+  // entry's green statuses); the top entry is never settled; one that left the queue any other way is an error. A live member keeps the full check. Read only when the check did not already pass, and kept once settled.
   const standings = new Map();
   const standingOf = (member) => {
     const known = standings.get(member.pr);
