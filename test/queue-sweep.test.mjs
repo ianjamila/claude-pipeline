@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
@@ -14,6 +14,7 @@ import {
 } from '../pipeline/lib/merge-queue.mjs';
 import { run as runQueueSweep } from '../pipeline/commands/queue-sweep.mjs';
 import { sweepRepo, bestEffortSweep } from '../pipeline/lib/queue-sweep.mjs';
+import { recheckGatedRecorded } from '../pipeline/lib/queue-route.mjs';
 import {
   QUEUE_SWEEP_LABEL, queueSweepPlistPath, queueSweepSchedule,
 } from '../pipeline/lib/queue-sweep-schedule.mjs';
@@ -194,6 +195,92 @@ test('F11: a removal that could be re-queued but whose worktree is gone, or at a
   const c = await sweep(stopped, wc, ghc, { recheckFn: async () => ({ ok: false, error: 'blocked', reasons: ['label needs-human is on the PR'] }) });
   assert.equal(c.settled[0].terminal, 'blocked');
   assert.deepEqual(ghc.calls.filter((x) => x.startsWith('enqueue')), []);
+});
+
+// #229: the sweep judges a re-queue the way the route that opened the record judged the first enqueue.
+test('#229: a gated-route record is re-checked with the gated recheck, an owner-go (or route-less, older) record with the owner-go one', async () => {
+  const events = [[addedAt(), removedAt('failed_checks')]];
+  const fail = async () => ({ ok: false, error: 'owner-go', reasons: ['the owner\'s "merge" for this head and scan is no longer on record'] });
+  const seen = [];
+  const gatedPasses = async (args) => { seen.push(args.rec?.route ?? null); return { ok: true }; };
+  const fresh = (route) => {
+    const root = repoDir();
+    openRecord(root, 7, HEAD, APPROVAL, { ...IDENT, ...(route ? { route } : {}) });
+    setHold(root, 7, HOLD);
+    beginAttempt(root, 7, HEAD, APPROVAL, IDENT);
+    confirmAttempt(root, 7, 'MQE_1');
+    return root;
+  };
+
+  const gated = fresh('gated');
+  assert.equal(readQueueRecord(gated, 7).route, 'gated');
+  const gg = stub({ states: [st(), inQ(1)], events });
+  const a = await sweep(gated, world(), gg, { recheckFn: fail, recheckGatedFn: gatedPasses });
+  assert.deepEqual(a.settled.map((s) => s.outcome), ['requeued'], 'the one automatic retry is delivered on the gated route');
+  assert.deepEqual(gg.calls, [`enqueue 7 ${HEAD.slice(0, 8)}`]);
+  assert.deepEqual(seen, ['gated']);
+
+  for (const route of ['owner-go', null]) {
+    const root = fresh(route);
+    assert.equal(readQueueRecord(root, 7).route ?? null, route);
+    const gh = stub({ states: [st()], events });
+    const out = await sweep(root, world(), gh, { recheckFn: fail, recheckGatedFn: async () => { throw new Error('the gated recheck must not judge this record'); } });
+    assert.equal(out.settled[0].terminal, 'removed', String(route));
+    assert.deepEqual(gh.calls, ['add needs-human'], `${route}: no enqueue, fails closed`);
+  }
+
+  // A gated record whose gated recheck refuses ends like any refused re-queue.
+  const refused = fresh('gated');
+  const gr = stub({ states: [st()], events });
+  const r = await sweep(refused, world(), gr, { recheckGatedFn: async () => ({ ok: false, error: 'blocked', reasons: ['label needs-human is on the PR'] }) });
+  assert.equal(r.settled[0].terminal, 'blocked');
+  assert.deepEqual(gr.calls.filter((x) => x.startsWith('enqueue')), []);
+});
+
+test('#229: the sweep\'s gated recheck needs a passing, recent gate file for the recorded head, then runs the same live checks as P merge', async () => {
+  const gateAt = (over = {}) => ({ ok: true, pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'none', at: new Date().toISOString(), ...over });
+  const worktree = (gate) => {
+    const dir = mkdtempSync(join(tmpdir(), 'cp-qsweep-gate-'));
+    if (gate !== undefined) {
+      mkdirSync(join(dir, '.review'));
+      writeFileSync(join(dir, '.review', 'final-gate.json'), JSON.stringify(gate));
+    }
+    return dir;
+  };
+  const live = (over = {}) => ({ head: HEAD, contentHash: 'hash1', checks: [{ name: 'ci', ok: true }], ...over });
+  const ask = (dir, { fresh = live(), problems = [], rec = { approval: APPROVAL }, now } = {}) => {
+    const calls = [];
+    return recheckGatedRecorded({
+      root: dir, config: {}, pr: 7, gh: stub({ states: [st()] }), env: {}, head: HEAD, repo: 'acme/widgets', rec, ...(now ? { now } : {}),
+      evaluate: async (args) => { calls.push(args.queueMode); return fresh; }, problemsOf: async () => problems,
+    }).then((out) => ({ out, calls }));
+  };
+
+  const ok = await ask(worktree(gateAt()));
+  assert.deepEqual(ok.out, { ok: true });
+  assert.deepEqual(ok.calls, [true], 'the live gate is evaluated in queue mode');
+  for (const [why, dir, re] of [
+    ['no gate file', worktree(), /gate file is gone/],
+    ['a failing gate', worktree(gateAt({ ok: false })), /not a passing gate/],
+    ['a gate of another head', worktree(gateAt({ head: 'c'.repeat(40) })), /not a passing gate/],
+    ['a gate of another PR', worktree(gateAt({ pr: 8 })), /not a passing gate/],
+    ['a gate older than a gate may be', worktree(gateAt({ at: new Date(Date.now() - 25 * 3_600_000).toISOString() })), /too old/],
+  ]) {
+    const r = await ask(dir);
+    assert.equal(r.out.ok, false, why);
+    assert.match(r.out.reasons[0], re, why);
+    assert.deepEqual(r.calls, [], `${why}: nothing is evaluated`);
+  }
+  const patch = await ask(worktree(gateAt()), { fresh: live({ contentHash: 'other' }) });
+  assert.equal(patch.out.error, 'live-check');
+  const failing = await ask(worktree(gateAt()), { fresh: live({ checks: [{ name: 'ci', ok: false, detail: 'red' }] }) });
+  assert.match(failing.out.reasons[0], /ci: red/);
+  const blocked = await ask(worktree(gateAt()), { problems: ['label needs-human is on the PR'] });
+  assert.deepEqual([blocked.out.ok, blocked.out.error], [false, 'blocked']);
+  // The gate left items for the owner and no "merge" for them is on record: not re-queued.
+  const items = await ask(worktree(gateAt({ ownerItems: 'zz9-no-such-owner-record' })), { fresh: live({ ownerMerge: 1 }) });
+  assert.equal(items.out.error, 'pre-merge');
+  assert.match(items.out.reasons[0], /no "merge" for this head and item set is on record/);
 });
 
 test('F11: P final-gate\'s sweep (requeue: false) only settles: a re-queueable removal is left as it is, nothing is enqueued, the hold stays lifted', async () => {

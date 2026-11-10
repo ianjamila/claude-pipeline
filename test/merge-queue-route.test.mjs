@@ -120,6 +120,16 @@ test('queue on, behind base, green: enqueued (pinned to the approved head), merg
   assert.equal(rec.head, s.head);
 });
 
+test('#229: the record carries the route that opened it (gated / owner-go), for the sweep\'s recheck', (t) => {
+  const gated = world({ after: [[Q(), M()]] });
+  assertExit(gated.run(), 0);
+  assert.equal(gated.record().route, 'gated');
+  const ownerGo = world({ route: 'owner-go', command: 'default', after: [[Q(), M()]] });
+  approve(t, ownerGo);
+  assertExit(ownerGo.run(), 0);
+  assert.equal(ownerGo.record().route, 'owner-go');
+});
+
 test('queue on, head moved since approval (--owner-go): head-moved, nothing enqueued', (t) => {
   const s = world({ route: 'owner-go' });
   approve(t, s);

@@ -26,7 +26,7 @@ import {
 } from '../lib/finalgate.mjs';
 import { classifyMergeCommand, commandTail } from '../lib/merge-cleanup.mjs';
 import { QueueUnreadable, clearSessionHold, endRecord, holdOnSignal, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
-import { approvalGapSince, createQueueRoute, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
+import { approvalGapSince, createQueueRoute, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
 import { bestEffortSweep } from '../lib/queue-sweep.mjs';
 import { checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal, recordSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
 
@@ -103,19 +103,9 @@ async function watchOnly({ route, gh, pr, head }) {
   return result;
 }
 
-// Before a re-queue (the group's checks failed once): the live gate, the owner's approval and the blockers, for the SAME head.
-async function queueRecheckGated({ root, config, pr, gh, ctx, gate, ownerApproved }) {
-  const fresh = await evaluateGate({ root, config, pr, gh, env: ctx.env, queueMode: true });
-  const failed = fresh.checks.filter((c) => !c.ok);
-  if (failed.length > 0) return { ok: false, error: 'live-check', reasons: failed.map((c) => `${c.name}: ${c.detail}`) };
-  if (fresh.head !== gate.head || fresh.contentHash !== gate.contentHash) return { ok: false, error: 'live-check', reasons: ['the live gate is for a different head or patch than final-gate.json approved'] };
-  if (Number(fresh.ownerMerge) > 0 && !ownerApproved) return { ok: false, error: 'pre-merge', reasons: [OWNER_MERGE_REASON] };
-  if (ownerApproved && approvalGap({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null, rulings: null }) !== 'ok') {
-    return { ok: false, error: 'pre-merge', reasons: ['the owner\'s "merge" for this head is no longer on record (it is valid for 24 hours): ask again'] };
-  }
-  const problems = await preMergeProblems({ gh, pr, head: gate.head, queueMode: true });
-  return problems.length > 0 ? { ok: false, error: 'blocked', reasons: problems } : { ok: true };
-}
+// Before a re-queue (the group's checks failed once): the live gate, the owner's approval and the blockers, for the SAME head (lib/queue-route.mjs recheckGated,
+// shared with the queue sweep).
+const queueRecheckGated = ({ ctx, ...rest }) => recheckGated({ ...rest, env: ctx.env, ownerMergeReason: OWNER_MERGE_REASON });
 
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
@@ -171,7 +161,7 @@ export const run = guarded(async (argv, ctx) => {
     let pre = null;
     if (queue.on) {
       route = createQueueRoute({
-        gh, root, config, pr, head: gate.head, env: ctx.env ?? process.env, refuse, track,
+        gh, root, config, pr, head: gate.head, route: 'gated', env: ctx.env ?? process.env, refuse, track,
         approval: { items: gate.ownerItems ?? null, areas: null, rulings: null },
         recheck: () => queueRecheckGated({ root, config, pr, gh, ctx, gate, ownerApproved: values['owner-approved-head'] !== undefined }),
         ...queueHoldSeams({ gh, root, pr, getHold: () => null }),
@@ -459,7 +449,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   // this run lifted, else the one a live record still owns, so a resumed watch (which returns before the live scan) can re-queue too.
   const rechecker = () => queueRecheckOwnerGo({ root, config, pr, gh, ctx, head, repo, hold: hold ?? liveRecordHold(root, pr) });
   if (queue.on) {
-    route = createQueueRoute({ gh, root, config, pr, head, env: ctx.env ?? process.env, refuse, track, extra, approval, recheck: () => rechecker(), ...queueHoldSeams({ gh, root, pr, getHold: () => hold }) });
+    route = createQueueRoute({ gh, root, config, pr, head, route: 'owner-go', env: ctx.env ?? process.env, refuse, track, extra, approval, recheck: () => rechecker(), ...queueHoldSeams({ gh, root, pr, getHold: () => hold }) });
     pre = await route.precheck();
     if (pre.done) return pre.done;
     if (pre.watch) return watchOnly({ route, gh, pr, head });

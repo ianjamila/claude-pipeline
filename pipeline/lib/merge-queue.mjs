@@ -79,6 +79,7 @@ export const REQUEUE_REASONS = Object.freeze(new Set([REASON_GROUP_CHECKS]));
 
 const TERMINALS = new Set(['merged', 'removed', 'blocked', 'closed', 'head-moved']);
 const HOLD_OWNERS = new Set(['session', 'pending', 'entry']);
+export const ROUTES = new Set(['owner-go', 'gated']);
 
 export class QueueRecordUnreadable extends Error {
   constructor(message) {
@@ -183,13 +184,15 @@ export function recordIsFor(rec, { repo, repoId = null, moves } = {}) {
 
 // Starts a record for `head`, or returns the live one for that head. A different head, or a record that already ended, starts over
 // (a fresh owner "merge" is a fresh budget). Nothing is queued yet: `attempts` stays 0 until beginAttempt.
-export function openRecord(root, pr, head, approval, { repo = null, repoId = null, now = Date.now } = {}) {
+// `route` ('owner-go' | 'gated') is the merge route that opened the record: the sweep re-checks a re-queue with that route's own recheck (#229).
+// A record without one (written before this field) is read as owner-go by the sweep, which fails closed.
+export function openRecord(root, pr, head, approval, { repo = null, repoId = null, now = Date.now, route = null } = {}) {
   const old = readQueueRecord(root, pr);
   if (old !== null && old.terminal === null && old.head === head) return old;
   return writeRecord(root, {
     pr: Number(pr), repo, repoId, root, head,
     approval: { items: approval?.items ?? null, areas: approval?.areas ?? null, rulings: approval?.rulings ?? null },
-    createdAt: isoOf(now), attempts: 0, pending: null, entryIds: [], removals: [], hold: null, terminal: null, terminalAt: null,
+    route: ROUTES.has(route) ? route : null, createdAt: isoOf(now), attempts: 0, pending: null, entryIds: [], removals: [], hold: null, terminal: null, terminalAt: null,
   });
 }
 
@@ -672,7 +675,7 @@ export async function recoverQueuedLift({ gh, root, pr, orphan, lift, now = Date
   try {
     const repo = gh.repo().slug;
     const repoId = typeof gh.repoId === 'function' ? gh.repoId() : null;
-    openRecord(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now });
+    openRecord(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now, route: 'owner-go' });
     setHold(root, pr, { id: orphan.hold, login: lift.login ?? null, at: lift.at ?? null, holdBlock: lift.login && lift.at ? holdDigest({ id: orphan.hold, login: lift.login, at: lift.at }) : null, liftedAt: isoOf(now) });
     beginAttempt(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now, gh });
     confirmAttempt(root, pr, r.entry.id);
