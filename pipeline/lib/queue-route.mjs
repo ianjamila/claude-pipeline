@@ -187,12 +187,76 @@ export function createQueueRoute({
     return refusal(kind, [kind === 'closed' ? `PR #${pr} was closed without merging` : `PR #${pr}'s head moved off the approved ${head.slice(0, 12)}: nothing was queued or merged for it`], { queued: false, ...holdFields });
   };
 
+  // A removal whose one automatic re-queue belongs to ANOTHER worktree (the record's head is not this worktree's): nothing is ended, restored, enqueued or dequeued.
+  // The record stays live, and `P queue-sweep` re-queues it from the worktree that queued it (makeRequeue needs rec.root at rec.head) (#232).
+  const requeueElsewhere = (removal) => {
+    const rec = readQueueRecord(root, pr);
+    const failing = failingChecksOn(gh, removal?.beforeCommit);
+    return refusal('requeue-due', [`PR #${pr} was removed from the merge queue (reason ${removal?.reason ?? 'unknown'}${failing.length > 0 ? `; failing: ${failing.join(', ')}` : ''}); its one automatic re-queue is due for ${rec.head.slice(0, 12)}, the head the worktree at ${rec.root} queued: \`P queue-sweep\` re-queues it from there (or run \`P merge --pr ${pr}\` in that worktree); this worktree is at ${head.slice(0, 12)}, so nothing was re-queued from here`], {
+      removal: { reason: removal?.reason ?? null, beforeCommit: removal?.beforeCommit ?? null, actor: removal?.actor ?? null, at: removal?.at ?? null, failing }, queuedHead: rec.head, recordRoot: rec.root,
+    });
+  };
+
   // ---- 1. GitHub first ----------------------------------------------------------------------------------------------------------
+  // A LIVE record for another head than this worktree's belongs to another approval (the worktree that queued it): GitHub is read for ITS head, and this run
+  // ends that record only where the record's own head says so (merged, closed, a removal that is not re-queueable, the PR head off it with no entry left).
+  // -> the same shapes as precheck. (#232)
+  async function followLiveRecord(rec) {
+    const tag = rec.head.slice(0, 12);
+    let r;
+    try {
+      r = await reconcile({ gh, root, pr, head: rec.head, sleep, pollMs: Math.min(timing.pollMs, 2000), log });
+      switch (r.kind) {
+        case 'merged':
+          // (reconcile answers MERGED before it compares heads: the note never says which head merged)
+          if (liveRecord() !== null) endRecord(root, pr, 'merged', { now });
+          return { done: mergedOut(r.mergeSha, { note: 'already merged through the queue' }) };
+        case 'queued': return { watch: true };
+        case 'closed': return { done: await unmergedEnd('closed') };
+        case 'removed': {
+          const noted = noteRemoval(root, pr, r.removal); // (judged on the record AFTER the removal is on it, never the copy read before)
+          if (mayRequeue(noted ?? readQueueRecord(root, pr), rec.head, r.removal.reason)) return { done: requeueElsewhere(r.removal) };
+          return { done: await removedRefusal(r.removal) };
+        }
+        case 'head-moved': return await movedOffRecord(rec, r.head);
+        default: // not-queued: the record's decision (settleRecord's gone(null)) is the sweep's
+          return { done: refusal('head-moved', [`PR #${pr} is at ${tag}, queued by the worktree at ${rec.root}; this worktree is at ${head.slice(0, 12)}; nothing was queued for it; the queue record is left to \`P queue-sweep\``], { queued: false }) };
+      }
+    } catch (err) {
+      if (err instanceof QueueRecordUnreadable) return { done: unreadable('the merge-queue record could not be used', err) };
+      return { done: unreadable(`could not read the merge queue state of PR #${pr}`, err) };
+    }
+  }
+
+  // GitHub's PR head is `jHead`, not the live record's. A live entry there (any head) is not this record's to end: nothing changes, the caller is refused.
+  // No entry: the record's approval was for its head only and its entry cannot exist any more, so it is discharged first exactly as the sweep would (the owned hold
+  // goes back once; a failed restore keeps it open), and only then is the caller's head judged from a clean slate.
+  async function movedOffRecord(rec, jHead) {
+    const tag = rec.head.slice(0, 12);
+    const cur = gh.queueState(pr);
+    if (cur.state !== 'OPEN' || cur.head !== jHead) {
+      return { done: refusal('head-moved', [`PR #${pr} changed while it was being read (it is now ${cur.state === 'OPEN' ? `at ${String(cur.head).slice(0, 12)}` : cur.state.toLowerCase()}); nothing was changed: run \`P merge\` again`], { queued: null }) };
+    }
+    if (cur.entry) {
+      return { done: refusal('head-moved', [`PR #${pr} is in the merge queue at ${jHead.slice(0, 12)}, but the live queue record here is for ${tag} (another approval); nothing was changed: \`P queue-sweep\` settles that record, then run \`P merge\` again`], { queued: true }) };
+    }
+    const holdFields = await terminal('head-moved');
+    if (liveRecord() !== null) {
+      return { done: refusal('head-moved', [`PR #${pr}'s head is ${jHead.slice(0, 12)}, off the ${tag} the live queue record here is for; that record could not be closed${holdFields.holdRestoreNote ? ` (${holdFields.holdRestoreNote})` : ''}, so nothing was queued for this worktree`], { queued: false, ...holdFields }) };
+    }
+    return precheck();
+  }
+
   async function precheck() {
     let rec;
     let r;
     try {
       rec = readQueueRecord(root, pr);
+    } catch (err) {
+      return { done: unreadable('the merge-queue record could not be read', err) };
+    }
+    if (rec !== null && rec.terminal === null && rec.head !== head) return followLiveRecord(rec);
+    try {
       r = await reconcile({ gh, root, pr, head, sleep, pollMs: Math.min(timing.pollMs, 2000), log });
     } catch (err) {
       return { done: unreadable(err instanceof QueueRecordUnreadable ? 'the merge-queue record could not be read' : `could not read the merge queue state of PR #${pr}`, err) };
@@ -314,7 +378,9 @@ export function createQueueRoute({
               requeued = 1;
               continue;
             }
-            // (a watch resumed from a worktree at another head than the queued one follows the record's head and is never re-queued from here: #230)
+            // (a watch resumed from a worktree at another head than the queued one follows the record's head and is never re-queued from here: #230. A removal that
+            // WOULD be re-queued for the record's head is left live for the sweep, which re-queues it from the worktree that queued it: #232)
+            if (rec !== null && rec.terminal === null && rec.head !== head && mayRequeue(rec, rec.head, w.removal.reason)) return requeueElsewhere(w.removal);
             return await removedRefusal(w.removal, rec !== null && rec.head !== head ? `not re-queued: this worktree is at ${head.slice(0, 12)}, the queued head was ${rec.head.slice(0, 12)}` : undefined);
           }
           default: return refusal('queue-unreadable', [`unexpected queue watch result ${JSON.stringify(w.state)}`], { queued: null });

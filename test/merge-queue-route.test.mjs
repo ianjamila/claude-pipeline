@@ -174,17 +174,45 @@ test('resumed watch at another head (--owner-go): the live entry\'s removal is n
   };
   const entryAtOld = () => reply(queuedNode(OLD), [added()]);
 
-  const removedOut = setup([[entryAtOld, entryAtOld, () => reply(node(OLD), [added(), removed('failed_checks')])]]);
+  // a removal that is NOT re-queueable for the record's head (not a group failure): the record's own head is done, so it ends removed
+  const removedOut = setup([[entryAtOld, entryAtOld, () => reply(node(OLD), [added(), removed('manual')])]]);
   const r = removedOut.run();
   assertExit(r, 1);
   assert.equal(r.json.error, 'queue-removed');
-  assert.equal(r.json.removal.reason, 'failed_checks');
+  assert.equal(r.json.removal.reason, 'manual');
   assert.deepEqual(r.json.removal.failing, ['ci: failure']);
   assert.equal(removedOut.enqueueCalls().length, 0, 'a worktree at another head never re-queues');
   const rec = removedOut.record();
   assert.equal(rec.head, OLD);
   assert.equal(rec.removals.length, 1, 'the removal is on the record');
   assert.equal(rec.terminal, 'removed');
+});
+
+// #232: the removal IS re-queueable for the record's head (the first group failure). The worktree that queued it owns that one re-queue, and the sweep delivers it
+// from there; this run (at another head) must not end the record or put the hold back, or the re-queue is lost.
+test('resumed watch at another head (--owner-go): a first group failure of the live entry is requeue-due; the record stays live and nothing is re-queued or restored from here (#232)', (t) => {
+  const OLD = 'd'.repeat(40);
+  const s = world({ route: 'owner-go', command: 'default', after: [] });
+  approve(t, s);
+  beginAttempt(s.repo.dir, PR, OLD, { items: 'none', areas: [], rulings: null }, { repo: 'acme/widgets', repoId: 4242 });
+  confirmAttempt(s.repo.dir, PR, 'MQE_1');
+  const entryAtOld = () => reply(queuedNode(OLD), [added()]);
+  s.q.show([entryAtOld, entryAtOld, () => reply(node(OLD), [added(), removed('failed_checks')])]);
+  const r = s.run();
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'requeue-due');
+  assert.equal(r.json.queued, false);
+  assert.equal(r.json.queuedHead, OLD);
+  assert.equal(r.json.recordRoot, s.repo.dir);
+  assert.equal(r.json.removal.reason, 'failed_checks');
+  assert.deepEqual(r.json.removal.failing, ['ci: failure']);
+  assert.equal(s.enqueueCalls().length, 0, 'a worktree at another head never re-queues');
+  assert.equal(s.dequeueCalls().length, 0);
+  never(s, /--add-label/, 'no label is put back');
+  const rec = s.record();
+  assert.equal(rec.head, OLD);
+  assert.equal(rec.removals.length, 1);
+  assert.equal(rec.terminal, null, 'the record stays live for the sweep');
 });
 
 test('removed twice: queue-removed naming the failing check; no third enqueue', () => {

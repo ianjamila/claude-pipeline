@@ -310,6 +310,68 @@ test('orphan recovery with NO record and the PR not queued: today\'s path (auto-
   assert.deepEqual(s.st().labels, ['needs-human']);
 });
 
+// #232: a live record for ANOTHER head (OLD: the worktree that queued it) while this checkout is at s.head. The CLI reads GitHub in this order: the mode read, orphan
+// recovery (settleRecord for the record's head), then the route's precheck.
+const OLD = 'd'.repeat(40);
+const liveRecordAtOld = (s) => {
+  const approval = { items: 'none', areas: [], rulings: null };
+  openRecord(s.repo.dir, PR, OLD, approval, { repo: 'acme/widgets', repoId: 4242, route: 'owner-go' });
+  setHold(s.repo.dir, PR, HOLD);
+  beginAttempt(s.repo.dir, PR, OLD, approval, { repo: 'acme/widgets', repoId: 4242 });
+  confirmAttempt(s.repo.dir, PR, 'MQE_1');
+};
+const entryAtOld = () => reply(queuedNode(OLD), [added()]);
+
+test('#232 GitHub shows the record\'s head during orphan recovery and a live entry at THIS head at the precheck: nothing is changed, refused head-moved naming both approvals', () => {
+  const s = world({ after: [] });
+  s.patch((st) => Object.assign(st, orphanState(OLD)));
+  liveRecordAtOld(s);
+  const before = JSON.stringify(s.rec());
+  s.q.show([entryAtOld, entryAtOld, Q(2)]); // mode read, recovery: the entry at OLD; the precheck: the PR now has an entry at this head
+  const r = s.go();
+  assertExit(r, 1, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.error, 'head-moved');
+  assert.equal(r.json.queued, true);
+  assert.deepEqual(r.json.reasons, [`PR #${PR} is in the merge queue at ${s.head.slice(0, 12)}, but the live queue record here is for ${OLD.slice(0, 12)} (another approval); nothing was changed: \`P queue-sweep\` settles that record, then run \`P merge\` again`]);
+  assert.equal(JSON.stringify(s.rec()), before, 'H\'s record is untouched');
+  assert.deepEqual(s.readds(), []);
+  assert.deepEqual(s.st().labels, []);
+  assert.equal(s.enqueues().length, 0);
+  assert.equal(s.dequeues().length, 0);
+  never(s, /--disable-auto|auto-merge/, 'auto-merge is never touched');
+});
+
+test('#232 GitHub shows the record\'s head during orphan recovery and this head with NO entry at the precheck: the record is discharged first (label back once), the new hold is not lifted blindly', () => {
+  const s = world({ after: [] });
+  s.patch((st) => Object.assign(st, orphanState(OLD)));
+  liveRecordAtOld(s);
+  s.q.show([entryAtOld, entryAtOld, (h) => reply(node(h), [])]); // mode read, recovery: queued at OLD; the precheck: the PR is at this head and not queued
+  const r = s.go();
+  assertExit(r, 1, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.error, 'owner-go', 'the caller\'s flow runs from a clean slate and fails closed on the restored label (a hold the dry run never showed)');
+  assert.match(r.json.reasons[0], /no owner "merge" is recorded/);
+  assert.equal(s.rec().head, OLD);
+  assert.equal(s.rec().terminal, 'head-moved', 'the old record is over');
+  assert.equal(s.readds().length, 1, 'its hold went back exactly once');
+  assert.deepEqual(s.st().labels, ['needs-human']);
+  assert.equal(s.enqueues().length, 0, 'the restored label is a hold the owner never saw: nothing is enqueued');
+  never(s, /--disable-auto|auto-merge/, 'auto-merge is never touched');
+});
+
+test('#232 GitHub is already at this head with no entry during orphan recovery: the existing early refusal (the record\'s hold goes back, hold-recovery)', () => {
+  const s = world({ after: [] });
+  s.patch((st) => Object.assign(st, orphanState(OLD)));
+  liveRecordAtOld(s);
+  s.q.show([(h) => reply(node(h), [])]); // every read: at this head, not queued
+  const r = s.go();
+  assertExit(r, 1, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.error, 'hold-recovery');
+  assert.equal(r.json.holdRestored, true);
+  assert.equal(s.rec().terminal, 'head-moved');
+  assert.equal(s.readds().length, 1);
+  assert.equal(s.enqueues().length, 0);
+});
+
 test('orphan recovery with NO record and an unreadable queue: refused, nothing disarmed, nothing restored', () => {
   const s = world({ after: [] });
   s.patch((st) => Object.assign(st, orphanState(s.head)));
