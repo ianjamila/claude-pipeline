@@ -375,7 +375,7 @@ test('#191 R1-B1 (c): a tool result inside an invisible turn, or with an unresol
   assert.deepEqual(pr('ruling', record('ruling', [owner, of(owner, said(RULING_ASK)), stray, prompt('R1-B1: accept')])), 58);
 });
 
-test('#191 R1-B1 (d): controls: a proper chain still binds; late text from an OLDER visible turn revives nothing and voids nothing', () => {
+test('#191 R1-B1 (d) / R2-B1: controls: a proper chain still binds; late text from an OLDER visible turn revives nothing, and after the selected request makes it stale', () => {
   for (const kind of Object.keys(KINDS)) {
     const first = prompt('ship it');
     const answer = prompt(KINDS[kind].answer);
@@ -383,8 +383,13 @@ test('#191 R1-B1 (d): controls: a proper chain still binds; late text from an OL
     // an older visible turn writes its (new) ask after a newer prompt: only the reply slot right before the owner's current prompt is read, and that one is empty
     const second = prompt('keep going');
     assert.equal(run(kind, [first, of(first, said(KINDS[kind].ask)), second, of(second, toolOnly()), of(first, said(ASK59[kind])), answer]), false, `${kind}: late text from an older turn does not bind`);
-    // ... and a visible ask in the newest turn still binds when an older turn's late text arrives after it
-    assert.deepEqual(pr(kind, record(kind, [first, of(first, said('x')), second, of(second, said(KINDS[kind].ask)), of(first, said(ASK59[kind])), answer])), bound58(kind), `${kind}: late text from an older turn voids nothing`);
+    // R2-B1: ... but a visible ask in the newest turn goes stale when an older VISIBLE turn then prints text after it (the owner was last shown that text, not the ask): nothing binds
+    assert.equal(run(kind, [first, of(first, said('x')), second, of(second, said(KINDS[kind].ask)), of(first, said(ASK59[kind])), answer]), false, `${kind}: late text from an older turn after the selected request voids it`);
+    // ... any text counts, not only a request; a tool-only entry from the older turn shows nothing and changes nothing
+    assert.equal(run(kind, [first, of(first, said('x')), second, of(second, said(KINDS[kind].ask)), of(first, said('one more thing')), answer]), false, `${kind}: late plain text from an older turn voids it too`);
+    assert.deepEqual(pr(kind, record(kind, [first, of(first, said('x')), second, of(second, said(KINDS[kind].ask)), of(first, toolOnly()), answer])), bound58(kind), `${kind}: late tool-only entry from an older turn shows nothing`);
+    // control: the older turn's text lands BEFORE the selected slot's last entry (interleaved) -> the selected request still binds
+    assert.deepEqual(pr(kind, record(kind, [first, of(first, said('x')), second, of(first, said(ASK59[kind])), of(second, said(KINDS[kind].ask)), answer])), bound58(kind), `${kind}: older turn's text before the selected slot's last entry still binds`);
   }
 });
 
