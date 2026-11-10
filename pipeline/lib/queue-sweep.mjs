@@ -4,7 +4,7 @@
 // A record with nothing live is found by reading a directory: no GitHub call at all.
 // Re-queueing is the one thing here that is not a plain settle, and it only ever happens from the worktree the owner approved (Fable F11).
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadConfig } from './config.mjs';
@@ -13,7 +13,7 @@ import { createGitHub } from './github.mjs';
 import { withMergeLock } from './hold.mjs';
 import { defaultLockDir } from './locks.mjs';
 import { liveRecords, recordIsFor, recordedHold, settleRecord } from './merge-queue.mjs';
-import { createQueueRoute, recheckGatedRecorded, recheckOwnerGo, restoreHoldOnTerminal } from './queue-route.mjs';
+import { canon, createQueueRoute, isDir, recheckGatedRecorded, recheckOwnerGo, recordedWorktreeProblem, restoreHoldOnTerminal } from './queue-route.mjs';
 import { gitCommonDir } from './repo.mjs';
 import { loadMachineConfig } from './stacks/config.mjs';
 import { stackFiles, stacksRoot } from './stacks/paths.mjs';
@@ -21,8 +21,6 @@ import { pruneLogDir } from './worktree-prune/run.mjs';
 
 const msg = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 300);
 const refuse = (error, reasons, extra = {}) => ({ exitCode: 1, output: { ok: false, merged: false, error, reasons, ...extra } });
-const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
-const canon = (p) => { try { return realpathSync(p); } catch { return path.resolve(p); } };
 
 // ---- the owner is told about each terminal outcome ---------------------------------------------------------------------------------
 // There is no other notification path in this pipeline, so a notice is: a line on stderr (a `P merge` session sees it; the LaunchAgent's log keeps it), a line in
@@ -116,19 +114,8 @@ export function makeRequeue({ gh, root, env, say, now, sleep, log, loadCfg = loa
   return async ({ rec }) => {
     const pr = rec.pr;
     const stop = (why) => ({ ok: false, reasons: [`${why} — re-run \`P merge --pr ${pr}\` to re-queue`] });
-    if (typeof rec.root !== 'string' || !isDir(rec.root)) return stop('worktree gone');
-    let current;
-    try {
-      current = headOf(rec.root);
-    } catch {
-      return stop('worktree gone');
-    }
-    if (current !== rec.head) return stop(`worktree at another head (${String(current).slice(0, 12)}, approved ${rec.head.slice(0, 12)})`);
-    try {
-      if (canon(gitCommonDir(rec.root)) !== canon(gitCommonDir(root))) return stop('worktree belongs to another repository');
-    } catch {
-      return stop('worktree gone');
-    }
+    const problem = recordedWorktreeProblem({ rec, root, headOf });
+    if (problem !== null) return stop(problem);
     const loaded = await loadCfg(rec.root);
     if (!loaded?.ok) return { ok: false, reasons: [`the pipeline config of ${rec.root} is not usable, so the re-queue was not checked`] };
     const config = loaded.config;

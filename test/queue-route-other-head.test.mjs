@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
@@ -91,22 +91,32 @@ const routeFor = (root, gh, head = K, over = {}) => createQueueRoute({
   gh, root, config: { merge: { ...DEFAULTS.merge }, default_branch: 'main' }, pr: PR, head, route: 'owner-go', env: { PIPELINE_QUEUE_POLL_MS: '1', PIPELINE_QUEUE_WAIT_MS: '5000' },
   refuse, approval: APPROVAL, recheck: async () => ({ ok: true }), onTerminal: restoreHoldOnTerminal({ gh, pr: PR }), sleep: async () => {}, ...over,
 });
+const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, '-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { encoding: 'utf8' }).trim();
+// Two worktrees of one clone (the records live in the shared git dir): `here` is where this run happens (at K), `recorded` is the worktree that queued H.
+// `headOf` stands for their HEADs (the route's seam): the recorded one is at H, this one at K, as in the real situation.
+function pair() {
+  const here = repoDir();
+  git(here, 'commit', '-q', '--allow-empty', '-m', 'one');
+  const recorded = join(mkdtempSync(join(tmpdir(), 'cp-otherhead-rec-')), 'w1');
+  git(here, 'worktree', 'add', '-q', '--detach', recorded);
+  return { here, recorded, headOf: (cwd) => (cwd === recorded ? H : K) };
+}
 const rawRecord = (root) => readFileSync(queueRecordPath(root, PR), 'utf8');
 const out = (res) => res.done.output;
 
 // ---- B + C: the watch path ----------------------------------------------------------------------------------------------------------------
 
 test('1. watch from K, the entry at H fails its group: requeue-due, the record stays live, the hold stays on it, the label is NOT re-added', async () => {
-  const root = repoDir();
-  recordAt(root);
+  const { here: root, recorded, headOf } = pair();
+  recordAt(recorded);
   const gh = stub({ states: [inQ(), st()], events: [FIRST] });
-  const route = routeFor(root, gh);
+  const route = routeFor(root, gh, K, { headOf });
   const res = await route.enqueueAndWatch({ watchOnly: true });
   assert.equal(res.exitCode, 1);
   assert.equal(res.output.error, 'requeue-due');
   assert.equal(res.output.queued, false);
   assert.equal(res.output.queuedHead, H);
-  assert.equal(res.output.recordRoot, root);
+  assert.equal(res.output.recordRoot, recorded);
   assert.equal(res.output.removal.reason, 'failed_checks');
   assert.deepEqual(res.output.removal.failing, ['ci: failure']);
   assert.match(res.output.reasons[0], /its one automatic re-queue is due for aaaaaaaaaaaa/);
@@ -138,15 +148,15 @@ test('2. watch from K, the removal is NOT re-queueable (a second group failure, 
 // ---- A: the precheck ----------------------------------------------------------------------------------------------------------------------
 
 test('3. precheck from K, the entry at H already left (re-queueable), removal not yet on the record: requeue-due, exactly one removal, never head-moved; 3b the same removal seen again is still one', async () => {
-  const root = repoDir();
-  recordAt(root);
+  const { here: root, recorded, headOf } = pair();
+  recordAt(recorded);
   const gh = stub({ states: [st()], events: [FIRST] });
-  const route = routeFor(root, gh);
+  const route = routeFor(root, gh, K, { headOf });
   for (const round of ['first', 'again']) {
     const res = await route.precheck();
     assert.equal(out(res).error, 'requeue-due', round);
     assert.equal(out(res).queuedHead, H, round);
-    assert.equal(out(res).recordRoot, root, round);
+    assert.equal(out(res).recordRoot, recorded, round);
     const rec = readQueueRecord(root, PR);
     assert.equal(rec.terminal, null, round);
     assert.equal(rec.removals.length, 1, `${round}: noteRemoval is once`);
@@ -308,6 +318,73 @@ test('7d. GitHub at K, no entry, the restore FAILS: H\'s record stays live (noth
   assert.equal(rec.head, H);
   assert.equal(rec.hold.id, HOLD.id);
   assert.deepEqual(gh.calls.filter((c) => c.startsWith('enqueue')), []);
+});
+
+// ---- 9. the recorded worktree cannot do the re-queue (R1-F2): the removal ends the record now, with the hold restored, instead of waiting for a sweep that cannot help ----
+
+// Both ways into the removal: the watch (resumed from this worktree) and the precheck (the entry already left).
+const viaWatch = (route) => route.enqueueAndWatch({ watchOnly: true }).then((res) => ({ out: res.output, exitCode: res.exitCode }));
+const viaPrecheck = (route) => route.precheck().then((res) => ({ out: res.done.output, exitCode: res.done.exitCode }));
+const ways = [['watch', viaWatch, () => stub({ states: [inQ(), st()], events: [FIRST] })], ['precheck', viaPrecheck, () => stub({ states: [st()], events: [FIRST] })]];
+
+test('9a. the SAME worktree moved from H to K (nothing pushed): queue-removed, the record ends removed, the hold is restored once; never requeue-due', async () => {
+  for (const [way, run, makeGh] of ways) {
+    const root = repoDir();
+    git(root, 'commit', '-q', '--allow-empty', '-m', 'one');
+    recordAt(root); // rec.root is this very worktree, whose HEAD is now K
+    const gh = makeGh();
+    const { out: o, exitCode } = await run(routeFor(root, gh, K, { headOf: () => K }));
+    assert.equal(exitCode, 1, way);
+    assert.equal(o.error, 'queue-removed', way);
+    assert.match(o.reasons[0], /not re-queued: the worktree that queued it is this one, now at cccccccccccc \(it queued aaaaaaaaaaaa\)/, way);
+    assert.equal(o.holdRestored, true, way);
+    assert.equal(readQueueRecord(root, PR).terminal, 'removed', way);
+    assert.deepEqual(writes(gh), ['add needs-human'], `${way}: the hold went back once`);
+  }
+});
+
+test('9b. the recorded worktree is GONE: queue-removed, the record ends removed, the hold is restored once', async () => {
+  for (const [way, run, makeGh] of ways) {
+    const { here, recorded, headOf } = pair();
+    recordAt(recorded);
+    rmSync(recorded, { recursive: true, force: true });
+    const gh = makeGh();
+    const { out: o, exitCode } = await run(routeFor(here, gh, K, { headOf }));
+    assert.equal(exitCode, 1, way);
+    assert.equal(o.error, 'queue-removed', way);
+    assert.match(o.reasons[0], /not re-queued: the worktree that queued it \(.*w1\) cannot re-queue it: worktree gone/, way);
+    assert.equal(readQueueRecord(here, PR).terminal, 'removed', way);
+    assert.deepEqual(writes(gh), ['add needs-human'], way);
+  }
+});
+
+test('9c. the recorded worktree sits at ANOTHER head: queue-removed, the record ends removed, the hold is restored once', async () => {
+  for (const [way, run, makeGh] of ways) {
+    const { here, recorded } = pair();
+    recordAt(recorded);
+    const gh = makeGh();
+    const { out: o, exitCode } = await run(routeFor(here, gh, K, { headOf: () => J }));
+    assert.equal(exitCode, 1, way);
+    assert.equal(o.error, 'queue-removed', way);
+    assert.match(o.reasons[0], /cannot re-queue it: worktree at another head \(dddddddddddd, approved aaaaaaaaaaaa\)/, way);
+    assert.equal(readQueueRecord(here, PR).terminal, 'removed', way);
+    assert.deepEqual(writes(gh), ['add needs-human'], way);
+  }
+});
+
+test('9d. the recorded root is a worktree of ANOTHER repository: queue-removed, the record ends removed, the hold is restored once', async () => {
+  const { here, recorded } = pair();
+  recordAt(recorded);
+  const stranger = repoDir();
+  git(stranger, 'commit', '-q', '--allow-empty', '-m', 'x');
+  const file = queueRecordPath(here, PR);
+  writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), root: stranger }));
+  const gh = stub({ states: [st()], events: [FIRST] });
+  const { out: o } = await viaPrecheck(routeFor(here, gh, K, { headOf: () => H }));
+  assert.equal(o.error, 'queue-removed');
+  assert.match(o.reasons[0], /cannot re-queue it: worktree belongs to another repository/);
+  assert.equal(readQueueRecord(here, PR).terminal, 'removed');
+  assert.deepEqual(writes(gh), ['add needs-human']);
 });
 
 // ---- 8. the hand-off through the real sweep -----------------------------------------------------------------------------------------------
