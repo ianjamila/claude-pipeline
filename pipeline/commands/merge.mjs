@@ -209,7 +209,8 @@ export const run = guarded(async (argv, ctx) => {
     const freshWord = () => approvalGapSince({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null, rulings: null }, pre.since) === 'ok';
     approval.ownerRequired = wordRequired; // (stored on the queue record: the sweep re-queues it only while the word is still on record)
     const staleEnd = (liveItems) => pre?.since !== undefined && (wordRequired || liveItems ? !freshWord() : !freshWord() && !gateFreshSince(gate, pre.since));
-    if (staleEnd(false)) return pre.staleTerminal();
+    const wordWhy = (existing?.status === 'ok' && Boolean(existing.record.resumed)) ? 'this is a resumed run' : unchecked !== null ? `${unchecked}, so the resumed-run guard cannot be checked` : 'the final gate left items for the owner';
+    if (staleEnd(false)) return pre.staleTerminal(wordRequired ? wordWhy : null);
     if (!ownerApproved) {
       if (existing?.status === 'ok' && existing.record.resumed) {
         const reason = withProblem(`resumed run: the owner must say "merge" for this exact head (then pass ${APPROVAL_FLAGS})`);
@@ -281,7 +282,7 @@ export const run = guarded(async (argv, ctx) => {
     }
     if (Number(fresh.ownerMerge) > 0 && !ownerApproved) return refuse('pre-merge', [withProblem(OWNER_MERGE_REASON)], { reason: withProblem(OWNER_MERGE_REASON) });
     if (Number(fresh.ownerMerge) > 0) approval.ownerRequired = true;
-    if (Number(fresh.ownerMerge) > 0 && staleEnd(true)) return pre.staleTerminal(); // (items for the owner the file did not show: the same fresh word is needed)
+    if (Number(fresh.ownerMerge) > 0 && staleEnd(true)) return pre.staleTerminal('the live gate left items for the owner'); // (items for the owner the file did not show: the same fresh word is needed)
     // (an item added or swapped since the owner said "merge", same head: the owner never saw it)
     if (ownerApproved && fresh.ownerItems !== gate.ownerItems) {
       const reason = `the owner items changed since the owner said "merge" (now ${fresh.ownerItems}, approved ${gate.ownerItems}): show them and ask again`;

@@ -211,7 +211,10 @@ export function createQueueRoute({
       return {
         enqueue: true,
         since: Number.isFinite(since) ? since : Infinity,
-        staleTerminal: () => refusal('queue-removed', [`PR #${pr} at ${head.slice(0, 12)} already left the merge queue (${last?.reason ?? rec.terminal}) and its queue record ended: ${route === 'gated'
+        // `wordWhy`: why only the owner's fresh "merge" re-queues it (a resumed run, a run record that cannot be checked, items for the owner); a final-gate run alone cannot (R2-F3)
+        staleTerminal: (wordWhy = null) => refusal('queue-removed', [`PR #${pr} at ${head.slice(0, 12)} already left the merge queue (${last?.reason ?? rec.terminal}) and its queue record ended: ${wordWhy
+          ? `${wordWhy}, so the owner must say "merge" again for this exact head (a new final-gate run alone does not re-queue it; a fresh word re-queues it with a new one-retry budget)`
+          : route === 'gated'
           ? 'run `P final-gate` again for this exact head (a gate that passes after the record ended re-queues it with a new one-retry budget; where the gate left items for the owner, the owner must say "merge" again)'
           : 'the owner must say "merge" again for this exact head (a fresh word re-queues it with a new one-retry budget)'}`], {
           removal: last, recordTerminal: rec.terminal,

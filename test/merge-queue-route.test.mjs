@@ -490,6 +490,10 @@ test('gated route, resumed run, record for head H ended: a final-gate run after 
   assertExit(refused, 1);
   assert.equal(refused.json.error, 'queue-removed');
   assert.match(refused.json.reasons[0], /already left the merge queue/);
+  // (R2-F3: the advice must not send a resumed run back to the final gate, which cannot re-queue it)
+  assert.match(refused.json.reasons[0], /resumed run/);
+  assert.match(refused.json.reasons[0], /the owner must say "merge" again for this exact head/);
+  assert.doesNotMatch(refused.json.reasons[0], /run `P final-gate` again/);
   assert.equal(stale.enqueueCalls().length, 0);
   assert.equal(stale.record().terminal, 'removed');
 
