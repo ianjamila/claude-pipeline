@@ -270,7 +270,7 @@ test('arbiter apply: a floor registry that cannot be written (model-floor-unwrit
   const home = join(w.scratch, 'home');
   const projects = join(home, '.claude', 'projects');
   w.install(needed.json, { models: ['claude-fable-5-3'], projects });
-  const own = { HOME: home, PIPELINE_ACCOUNT_PROJECTS_DIR: projects };
+  const own = { HOME: home, USERPROFILE: home, PIPELINE_ACCOUNT_PROJECTS_DIR: projects }; // (os.homedir() reads %USERPROFILE% on Windows)
   const preload = new URL('./fixtures/fail-floor-write-preload.mjs', import.meta.url).href;
   const r = w.cli(['arbiter', 'apply', '--round', '1'], { ...own, NODE_OPTIONS: `--import ${preload}` });
   assertExit(r, 1, r.stdout + r.stderr);

@@ -163,7 +163,7 @@ test('the suite-level registry check: absent stays absent; a created, removed or
   assert.match(registryChange(present, snapshotRegistry(file), file), /was modified/);
   fs.rmSync(file);
   assert.match(registryChange(present, snapshotRegistry(file), file), /was removed/);
-  assert.match(realRegistryFile('/home/x'), /\/home\/x\/\.claude\/pipeline-state\/owner-go\/model-floor\/fable\.json$/);
+  assert.equal(realRegistryFile('/home/x'), path.join('/home/x', '.claude', 'pipeline-state', 'owner-go', 'model-floor', 'fable.json'));
 });
 
 // ---- review round 1: R1-F1 (the owner's exact-id allowance) and R1-F2 (every floor failure carries advice) ----

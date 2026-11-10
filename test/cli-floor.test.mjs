@@ -142,7 +142,8 @@ function world(t) {
       const home = opts.home ?? w.home;
       const projects = join(home, '.claude', 'projects');
       w.install(projects, opts);
-      return { HOME: home, PIPELINE_ACCOUNT_PROJECTS_DIR: projects };
+      // (os.homedir() reads $HOME on POSIX but %USERPROFILE% on Windows, so the scratch account sets both)
+      return { HOME: home, USERPROFILE: home, PIPELINE_ACCOUNT_PROJECTS_DIR: projects };
     },
     // An arbitrary folder passed by --projects-dir.
     installLoose(opts = {}) {
