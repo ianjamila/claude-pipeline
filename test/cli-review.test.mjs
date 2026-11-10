@@ -24,6 +24,7 @@ import { floorEnv } from './helpers/floor-env.mjs';
 import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
+import { reviewCheck } from '../pipeline/lib/finalgate.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -4229,4 +4230,166 @@ test('codex-review: a base-only round (Codex not run) has no prompt.md and no pr
   assert.ok(!existsSync(w.roundFile(2, 'prompt.md')));
   assert.equal(Object.hasOwn(w.state().rounds[1], 'promptSha256'), false);
   assert.equal(w.state().rounds[0].promptSha256.length, 64);
+});
+
+// ---- old Fable proofs are re-reviewed: state fable-refresh, review-complete and the final gate (plan 2026-11-10 A4b) -------------------
+
+const OLD_FABLE = 'claude-fable-5-1';
+// Round 1 of a Fable PR, proven by a real 5.2 transcript, then rewritten so the state records the OLD Fable (a proof made before this pipeline knew the floor).
+function oldProofWorld(t, { models = { [OLD_FABLE]: 1 } } = {}) {
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT], yml: SENSITIVE_YML });
+  assertExit(w.codex(1, findingsOf()), 0);
+  assertExit(w.cli(['arbiter', 'needed', '--round', '1']), 0);
+  assertExit(arbiterRun(w, { text: fenced(FABLE_CLEAN) }), 0);
+  editState(w, (s) => { s.rounds[0].modelProof.models = models; });
+  return w;
+}
+const refreshOf = (w) => w.cli(['state', 'fable-refresh', '--pr', '7']);
+// `arbiter needed` + a proving transcript for round n (the model the transcript names decides what is recorded).
+function proveRound(w, n, { model, text = fenced(FABLE_CLEAN) } = {}) {
+  const needed = w.cli(['arbiter', 'needed', '--round', String(n)]);
+  assertExit(needed, 0, needed.stdout + needed.stderr);
+  const projects = installTranscript(w, {
+    agentId: `a${n}`, jsonl: transcript({ prompt: promptFor(needed.json.digest, n), text, model }), meta: { agentType: 'arbiter', description: needed.json.tag },
+  });
+  return { needed, applied: w.cli(['arbiter', 'apply', '--round', String(n), '--projects-dir', projects]) };
+}
+async function gateReview(w) {
+  const { config } = await loadConfig(w.repo.dir);
+  return reviewCheck({
+    root: w.repo.dir, config, pr: 7, repo: w.slug, readOnly: true, hash: currentContentHash(w.repo.dir, config), hashError: null,
+    diff: () => ({ ok: true, files: [{ path: 'src/a.js', oldPath: 'src/a.js', newPath: 'src/a.js', status: 'M', binary: false, added: [{ line: 1, text: 'x' }], removed: [] }] }),
+  });
+}
+
+test('review-complete and the final gate refuse a PR whose Fable round was proven with an old Fable; a proven refresh round clears both', async (t) => {
+  const w = oldProofWorld(t);
+  const refused = w.cli(['review-complete', '--pr', '7']);
+  assertExit(refused, 1, refused.stdout);
+  assert.equal(refused.json.error, 'fable-refresh');
+  assert.match(refused.json.reason, /round 1 \(claude-fable-5-1\) was proven with a Fable older than claude-fable-5-2/);
+  assert.match(refused.json.reason, /run `pipeline state fable-refresh --pr 7`/);
+  assert.deepEqual(refused.json.staleFableRounds, [{ round: 1, models: [OLD_FABLE] }]);
+  assert.equal(postedBodies(w).length, 0, 'no marker was posted');
+  const gate = await gateReview(w);
+  assert.equal(gate.ok, false);
+  assert.match(gate.detail, /round 1 \(claude-fable-5-1\) was proven with a Fable older than claude-fable-5-2: run `pipeline state fable-refresh --pr 7`/);
+
+  // the refresh round: uncounted, Fable-only, on the same head and content
+  const r = refreshOf(w);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.ok, r.json.round, r.json.scope, r.json.staleRounds], [true, 2, 'whole-pr', [{ round: 1, models: [OLD_FABLE] }]]);
+  const [r1, r2] = w.state().rounds;
+  assert.deepEqual([r2.fableRefresh, r2.fableRequired, r2.items, r2.fromHead, r2.toHead, r2.contentHashAtToHead], [true, true, [], w.head, w.head, r1.contentHashAtToHead]);
+  assert.deepEqual([r2.codexModel, r2.forkPoint, r2.admission, r2.sensitivePaths], [r1.codexModel, r1.forkPoint, undefined, ['src/a.js']]);
+  assert.deepEqual(r2.fableReasons, ['fable-refresh: rounds 1 proven with claude-fable-5-1 below claude-fable-5-2']);
+  const pending = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([pending.fablePending, pending.clean, pending.reviewedRounds], [[2], false, 1]);
+  const unproven = w.cli(['review-complete', '--pr', '7']);
+  assertExit(unproven, 1);
+  assert.match(unproven.json.reason, /Fable review pass has not been proven for round 2/, 'an unproven refresh round is Fable-pending');
+  assert.equal((await gateReview(w)).ok, false);
+
+  // its pass reads the whole PR, zero Codex items, and records the scope
+  const { needed, applied } = proveRound(w, 2);
+  assertExit(applied, 0, applied.stdout);
+  assert.deepEqual([needed.json.mode, needed.json.items, needed.json.scope], ['review', [], 'whole-pr']);
+  assert.match(readFileSync(needed.json.diffPath, 'utf8'), /compute\(x\.y\)/);
+  const proven = w.state().rounds[1];
+  assert.deepEqual([proven.arbiter.proofOk, proven.arbiter.scope, proven.modelProof.models], [true, 'whole-pr', { 'claude-fable-5-2': 1 }]);
+  assert.deepEqual(w.cli(['state', 'outcome']).json.fablePending, []);
+  const ok = w.cli(['review-complete', '--pr', '7']);
+  assertExit(ok, 0, ok.stdout);
+  assert.equal(reviewJson(postedBodies(w).at(-1)).rounds, 2);
+  const gateOk = await gateReview(w);
+  assert.equal(gateOk.ok, true, gateOk.detail);
+  assertExit(refreshOf(w), 2, 'nothing is stale any more');
+});
+
+test('state fable-refresh is refused with a named reason when nothing is stale, work is unfinished, the content moved or the head is not pushed', (t) => {
+  const fresh = oldProofWorld(t, { models: { 'claude-fable-5-2': 1 } });
+  const none = refreshOf(fresh);
+  assertExit(none, 2);
+  assert.equal(none.json.error, 'nothing-stale');
+  assert.equal(fresh.state().rounds.length, 1, 'nothing was added');
+
+  const w = oldProofWorld(t);
+  assertExit(refreshOf(w), 0);
+  const again = refreshOf(w);
+  assertExit(again, 2);
+  assert.equal(again.json.error, 'unfinished-round', 'the first refresh round is still waiting for its Fable pass');
+  assert.match(again.json.message, /the Fable pass of round 2 is not proven/);
+  assert.equal(w.state().rounds.length, 2);
+
+  const open = oldProofWorld(t);
+  editState(open, (s) => { s.rounds[0].items.push({ id: 'R1-B9', bucket: 'BLOCKING', title: 'x', file: 'src/a.js', line: 1, final: { decision: 'ACCEPT', by: 'arbiter' } }); });
+  const unfinished = refreshOf(open);
+  assertExit(unfinished, 2);
+  assert.equal(unfinished.json.error, 'unfinished-round');
+  assert.match(unfinished.json.message, /R1-B9/);
+
+  const moved = oldProofWorld(t);
+  moved.repo.write('src/b.js', `${bFile}export const extra = 1;\n`);
+  moved.prHead(moved.repo.commit('unreviewed change'));
+  const content = refreshOf(moved);
+  assertExit(content, 2);
+  assert.equal(content.json.error, 'content-moved');
+  assert.match(content.json.message, /run a normal codex-review round instead/);
+
+  const unpushed = oldProofWorld(t);
+  unpushed.prHead('0'.repeat(40));
+  const head = refreshOf(unpushed);
+  assertExit(head, 2);
+  assert.equal(head.json.error, 'head-not-pushed');
+  assert.equal(unpushed.state().rounds.length, 1);
+});
+
+test('state fable-refresh works past review.max_rounds with no new commit, and the refresh round does not count', (t) => {
+  const w = oldProofWorld(t);
+  // rounds 2..5 (cloned from round 1: same head and content, all proven with the old Fable) put the review well past review.max_rounds
+  editState(w, (s) => {
+    for (let n = 2; n <= 5; n += 1) s.rounds.push({ ...structuredClone(s.rounds[0]), n, admission: 'normal' });
+  });
+  const before = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([before.reviewedRounds, before.maxRounds, before.reachedMax], [5, 2, false], 'clean but stale: the cap is not what stops it');
+  const r = refreshOf(w);
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.round, 6);
+  assert.deepEqual(r.json.staleRounds.map((s) => s.round), [1, 2, 3, 4, 5]);
+  assert.equal(w.cli(['state', 'outcome']).json.reviewedRounds, 5, 'the refresh round is not counted');
+  assert.equal(w.state().rounds[5].admission, undefined);
+  assertExit(proveRound(w, 6).applied, 0);
+  assert.deepEqual(w.cli(['state', 'outcome']).json.fablePending, []);
+});
+
+test('Fable refresh: a later codex-review round starts at the refresh round\'s head, and its Fable pass reviews only its own slice', (t) => {
+  const w = oldProofWorld(t);
+  assertExit(refreshOf(w), 0);
+  assertExit(proveRound(w, 2).applied, 0);
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head2 = w.repo.commit('later change');
+  w.prHead(head2);
+  const wrongBase = w.codex(3, findingsOf(), { from: w.base, to: head2 });
+  assertExit(wrongBase, 2);
+  assert.equal(wrongBase.json.error, 'base-mismatch');
+  assertExit(w.codex(3, findingsOf(), { from: w.head, to: head2 }), 0);
+  assert.equal(w.state().rounds[2].fromHead, w.head);
+  const { needed, applied } = proveRound(w, 3);
+  assertExit(applied, 0, applied.stdout);
+  assert.equal(needed.json.scope, 'round', 'the refresh pass at 5.2 counts as the earlier pass');
+  assertExit(w.cli(['review-complete', '--pr', '7']), 0);
+});
+
+test('the first fresh-model Fable pass after an old one reads the WHOLE PR, and replaces the old proof without a refresh round', (t) => {
+  const w = oldProofWorld(t);
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head2 = w.repo.commit('later change');
+  w.prHead(head2);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0);
+  const { needed, applied } = proveRound(w, 2);
+  assertExit(applied, 0, applied.stdout);
+  assert.equal(needed.json.scope, 'whole-pr', 'a pass proven below MIN_FABLE does not count as an earlier one');
+  assert.equal(w.state().rounds[1].arbiter.scope, 'whole-pr');
+  const ok = w.cli(['review-complete', '--pr', '7']);
+  assertExit(ok, 0, ok.stdout);
 });
