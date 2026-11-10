@@ -27,10 +27,13 @@ const REQUEST = `Two items for you.\nHead ${HEAD.slice(0, 12)} · items ${ITEMS}
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'owner-go-unit-'));
 // (R1-B2: a transcript has the shape Claude Code gives it and the guard protects, <config dir>/projects/<project>/<session>.jsonl: the use-time check takes no other)
+// #191 A3: a reply is only read when its opening prompt is in the file (text before the first prompt has no known origin), so a fixture that starts with the agent's text gets a genuine
+// typed owner prompt in front of it. Dedicated orphan-text negatives write their file themselves (test/owner-go-visible-turns.test.mjs).
+const withOpening = (entries) => (entries[0]?.type === 'assistant' ? [{ type: 'user', message: { content: 'go' }, promptId: 'pid-open', ...OWNER_ENTRY }, ...entries] : entries);
 function transcript(dir, entries) {
   mkdirSync(join(dir, '.claude', 'projects', '-repo'), { recursive: true });
   const file = join(dir, '.claude', 'projects', '-repo', `t-${Math.random().toString(36).slice(2)}.jsonl`);
-  writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  writeFileSync(file, `${withOpening(entries).map((e) => JSON.stringify(e)).join('\n')}\n`);
   return file;
 }
 const user = (text) => ({ type: 'user', message: { content: text } });
