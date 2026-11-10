@@ -190,7 +190,10 @@ export function recordIsFor(rec, { repo, repoId = null, moves } = {}) {
 // such a record only while that word is still on record (R1-F2). The field is only written when true; a record without it (written before, or for an enqueue that needed no word) keeps the sweep's earlier behaviour.
 export function openRecord(root, pr, head, approval, { repo = null, repoId = null, now = Date.now, route = null } = {}) {
   const old = readQueueRecord(root, pr);
-  if (old !== null && old.terminal === null && old.head === head) return old;
+  if (old !== null && old.terminal === null && old.head === head) {
+    // (a live record is kept, but an enqueue that stands on the owner's word upgrades it, and nothing lowers it: R2-F4)
+    return approval?.ownerRequired === true && old.approval?.ownerRequired !== true ? writeRecord(root, { ...old, approval: { ...old.approval, ownerRequired: true } }) : old;
+  }
   return writeRecord(root, {
     pr: Number(pr), repo, repoId, root, head,
     approval: { items: approval?.items ?? null, areas: approval?.areas ?? null, rulings: approval?.rulings ?? null, ...(approval?.ownerRequired === true ? { ownerRequired: true } : {}) },

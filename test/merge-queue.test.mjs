@@ -604,3 +604,22 @@ test('R1-F1 reconcile: queued at the recorded head while the local worktree is e
   assert.deepEqual(await reconcile({ gh: stubGh({ states: [st()] }), root, pr: 7, head: other }), { kind: 'head-moved', head: HEAD });
   assert.deepEqual(await reconcile({ gh: stubGh({ states: [{ ...inQ(), head: 'f'.repeat(40) }] }), root, pr: 7, head: other }), { kind: 'head-moved', head: 'f'.repeat(40) });
 });
+
+// ---- review round 2 ---------------------------------------------------------------------------------------------------------------------
+
+// R2-F4: a live record for the head keeps what it was opened with, except that the owner's word becomes required when a later enqueue of the same head stands on it
+// (a first enqueue that never landed, then the run was taken over and the owner said "merge"). It is only ever upgraded: a later ordinary call never lowers it.
+test('R2-F4: openRecord upgrades a live record\'s approval.ownerRequired to true and never downgrades it', () => {
+  const root = repoDir();
+  const first = openRecord(root, 7, HEAD, APPROVAL, IDENT);
+  assert.notEqual(first.approval.ownerRequired, true);
+  const upgraded = openRecord(root, 7, HEAD, { ...APPROVAL, ownerRequired: true }, IDENT);
+  assert.equal(upgraded.approval.ownerRequired, true);
+  assert.equal(readQueueRecord(root, 7).approval.ownerRequired, true, 'written to disk');
+  assert.equal(upgraded.createdAt, first.createdAt, 'the same record, not a new one');
+  for (const approval of [APPROVAL, { ...APPROVAL, ownerRequired: false }, undefined]) {
+    openRecord(root, 7, HEAD, approval, IDENT);
+    assert.equal(readQueueRecord(root, 7).approval.ownerRequired, true, 'never downgraded');
+  }
+  assert.equal(beginAttempt(root, 7, HEAD, { ...APPROVAL, ownerRequired: false }, IDENT).approval.ownerRequired, true, 'nor by beginAttempt');
+});
