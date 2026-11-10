@@ -9,9 +9,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EXIT, parseCommandArgs } from '../lib/cli.mjs';
-import { hasClaudeCodeAncestor } from '../lib/claude-ancestry.mjs';
 import { installedIdentity } from '../lib/identity.mjs';
 import { readManifest } from '../lib/installer.mjs';
+import { insideClaudeCode } from '../lib/owner-only.mjs';
 import { expandHome } from '../lib/paths.mjs';
 import { run as runProcess } from '../lib/proc.mjs';
 import { makePrivateTmpDir } from '../lib/private-tmp.mjs';
@@ -117,10 +117,8 @@ export async function run(argv, ctx = {}) {
   }, { allowPositionals: false });
   const say = (line) => { if (!values.json) process.stderr.write(`${line}\n`); };
 
-  if (!values.check && env.PIPELINE_ADMIN !== '1') {
-    const inside = env.CLAUDECODE === '1'
-      ? 'CLAUDECODE=1'
-      : (ctx.hasClaudeCodeAncestor ?? hasClaudeCodeAncestor)() ? 'a Claude Code process is an ancestor of this one' : null;
+  if (!values.check) {
+    const inside = insideClaudeCode(env, ctx);
     if (inside) {
       const message = `pipeline update refuses to run inside a Claude Code session (${inside}): an update replaces the guard hooks. Run it in your own terminal (\`node ~/.claude/pipeline/bin/pipeline.mjs update\`); \`--check\` is allowed anywhere.`;
       say(message);

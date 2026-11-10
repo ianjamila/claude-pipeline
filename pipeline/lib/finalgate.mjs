@@ -23,10 +23,11 @@ import { toPosix } from './paths.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
-import { claudeRulingRows, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory } from './triage.mjs';
+import { claudeRulingRows, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
 import { readPublished, reviewContentHash as stateContentHash } from './review-publish.mjs';
 import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
+import { readReviewGate } from './model-floor.mjs';
 import { skipOf } from './verify-steps.mjs';
 import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
 import { ownerItemsDigest, rulingsBlockDigest } from '../hooks/lib/owner-go.mjs';
@@ -619,7 +620,8 @@ const OWNER_RULED_SHOWN = 5;
 const OWNER_QUOTE_SHOWN = 100;
 
 // `repo`: the PR's repository (the gh repo). `ownerGo`: { home, now } for the owner's records, tests only (default: the account's own folder).
-export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, ownerGo = {}, readOnly = false }) {
+// `floorOpts`: { env, dir, home } for reading the Fable floor registry (the owner's hold and exact-id allowances), tests only.
+export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, ownerGo = {}, readOnly = false, floorOpts = {} }) {
   const d = diff();
   if (!d.ok) return check('review', false, `could not diff against the base: ${d.error}`);
   if (isLogOnly(d.files, config.agent_log)) return check('review', true, 'log-only');
@@ -641,6 +643,12 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   // What keeps a review from completing although its items read as resolved (a Claude-ruled follow-up with no issue, a fix made outside the named file nobody confirmed).
   const eligibility = reviewEligibilityProblems(state);
   if (eligibility.length > 0) return check('review', false, eligibility.join('; '));
+  // A Fable pass proven below MIN_FABLE is re-reviewed, not grandfathered: the same refusal as review-complete (plan 2026-11-10 A4b).
+  const fableGate = readReviewGate(floorOpts);
+  const staleFable = staleFableRounds(state, fableGate);
+  if (staleFable.length > 0) return check('review', false, staleFableReason(staleFable, pr, fableGate.threshold));
+  const bypassText = fableBypassNote(fableBypassRounds(state, fableGate), fableGate);
+  const bypassNote = bypassText ? `; ${bypassText}` : '';
   const exemptNote = exempt ? `; docs-only exemption (review.docs_exempt_paths): ${exempt.files.join(', ')} added after the reviewed head ${exempt.reviewedHead.slice(0, 12)}` : '';
   // A round past review.max_rounds must carry the owner's extra-round grant, re-proved here from the owner's record and its marker (never
   // from the state alone). A grant lets a round run; it is no merge authority, so it is shown but never an owner-merge item.
@@ -656,15 +664,15 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
     const claudeItems = claudeRulings.map(({ id, row }) => `review-ruling ${id} ${createHash('sha256').update(row).digest('hex').slice(0, 12)}`);
     const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`);
     const ruledNote = ruled.length > 0 ? `; ${ruled.length} owner-ruled item(s), owner-merge: ${shown.join('; ')}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}` : '';
-    return check('review', true, `review valid for content ${short(hash)}${exemptNote}${ruledNote}; ${claudeRulings.length} Claude-made dismissal(s), owner-merge: ${claudeRulings.slice(0, OWNER_RULED_SHOWN).map((c) => c.id).join(', ')}${claudeRulings.length > OWNER_RULED_SHOWN ? ', ...' : ''}${grantNote}`,
+    return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}${ruledNote}; ${claudeRulings.length} Claude-made dismissal(s), owner-merge: ${claudeRulings.slice(0, OWNER_RULED_SHOWN).map((c) => c.id).join(', ')}${claudeRulings.length > OWNER_RULED_SHOWN ? ', ...' : ''}${grantNote}`,
       ruled.length + claudeRulings.length, [...ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`), ...claudeItems]);
   }
   if (ruled.length > 0) {
     const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('; ');
-    return check('review', true, `review valid for content ${short(hash)}${exemptNote}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}${grantNote}`, ruled.length,
+    return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}${grantNote}`, ruled.length,
       ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`));
   }
-  return check('review', true, `review valid for content ${short(hash)}${exemptNote}${grantNote}`);
+  return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}${grantNote}`);
 }
 
 // The guard statuses among `names` (Test integrity, Hard-stop scan, Cross-model review) whose provenance does not hold: a guard status is only
@@ -801,7 +809,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs, readOnly, baseSha: info?.baseRefOid ?? null })),
     await safely('hardstops', () => hardstopsCheck({ root, config, diff })),
     await safely('integrity', () => integrityCheck({ config, diff })),
-    await safely('review', () => reviewCheck({ root, config, pr, repo, diff, hash, hashError, readOnly })),
+    await safely('review', () => reviewCheck({ root, config, pr, repo, diff, hash, hashError, readOnly, floorOpts: { env } })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
     ...(queueError === null ? [] : [queueStateCheck(queueError)]),
   ];

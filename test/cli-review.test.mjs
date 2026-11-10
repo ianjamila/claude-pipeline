@@ -20,9 +20,12 @@ import { currentContentHash, excerptWindow, reviewBaseRef } from '../pipeline/li
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { SHARED_FLOOR_DIR, floorEnv, scratchFloorDir } from './helpers/floor-env.mjs';
+import { resetFloor } from '../pipeline/lib/model-floor.mjs';
 import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
+import { reviewCheck } from '../pipeline/lib/finalgate.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -63,7 +66,7 @@ const GH = [
   { match: '^repo view', stdoutJson: REPO_VIEW },
 ];
 
-function transcript({ prompt, text, model = 'claude-fable-5-1', effort = 'high' }) {
+function transcript({ prompt, text, model = 'claude-fable-5-2', effort = 'high' }) {
   const lines = [
     { type: 'user', isSidechain: true, agentId: 'a1', message: { role: 'user', content: prompt }, uuid: 'u-1', timestamp: '2026-10-01T09:00:00.000Z' },
     {
@@ -127,12 +130,14 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
     cli(args, env = {}) {
       const merged = {
         ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, FAKE_CODEX_CAPTURE: capture,
-        PIPELINE_LOCK_DIR: lockDir, ...env,
+        PIPELINE_LOCK_DIR: lockDir, ...floorEnv(), ...env,
       };
       for (const k of [
         'PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_ARBITER_MODEL_OVERRIDE', 'PIPELINE_TEST_MODE', 'PIPELINE_CODEX_TIMEOUT_MS',
         'PIPELINE_LOCK_WAIT_MS', 'FAKE_CODEX_EXIT', 'FAKE_CODEX_STDERR', 'FAKE_CODEX_NO_WRITE', 'FAKE_CODEX_OUTPUT',
         'FAKE_CODEX_HANG', 'FAKE_CODEX_DURING', 'FAKE_CODEX_DURING_OUTPUT',
+        // the suite runs inside Claude Code: a real terminal's versions must not decide whether a Fable round is stopped as stale (cli-stale-terminal pins that)
+        'AI_AGENT', 'CLAUDE_CODE_EXECPATH',
       ]) {
         if (!(k in env)) delete merged[k];
       }
@@ -954,12 +959,12 @@ test('arbiter apply: a Fable transcript for this round and digest is proven, its
   assert.equal(proof.ok, true);
   assert.equal(proof.round, 1);
   assert.equal(proof.tag, needed.json.tag);
-  assert.deepEqual(proof.models, { 'claude-fable-5-1': 1 });
+  assert.deepEqual(proof.models, { 'claude-fable-5-2': 1 });
   assert.deepEqual(proof.efforts, { high: 1 });
   assert.deepEqual(proof.errors, []);
   assert.match(proof.transcript, /agent-a1\.jsonl$/);
   assert.equal(w.state().rounds[0].arbiter.proofOk, true);
-  assert.deepEqual(w.state().rounds[0].modelProof, { transcript: proof.transcript, models: { 'claude-fable-5-1': 1 }, effort: 'high' }, 'the proof summary travels in the state');
+  assert.deepEqual(w.state().rounds[0].modelProof, { transcript: proof.transcript, models: { 'claude-fable-5-2': 1 }, effort: 'high' }, 'the proof summary travels in the state');
 
 });
 
@@ -2066,7 +2071,7 @@ test('a full round: codex -> judge -> arbiter -> implement -> follow-ups -> clea
   assertExit(w.cli(['comment', '--pr', '7', '--kind', 'summary', '--outcome', 'merged']), 0);
   const summary = posted().at(-1);
   assert.ok(summary.startsWith(MARKERS.summary));
-  assert.match(summary, /Fable proof: .*agent-a1\.jsonl, models claude-fable-5-1×1, effort high/);
+  assert.match(summary, /Fable proof: .*agent-a1\.jsonl, models claude-fable-5-2×1, effort high/);
   assert.ok(summary.includes(url), 'the follow-up issue recorded by followups create is listed');
 });
 
@@ -3785,7 +3790,8 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   const cloneCli = (args, env = {}) => {
     const r = spawnSync(process.execPath, [bin, ...args], {
       cwd: clone, encoding: 'utf8',
-      env: { ...process.env, ...w.fake.env, PIPELINE_LOCK_DIR: join(w.scratch, 'locks-clone'), ...env },
+      // (no AI_AGENT / CLAUDE_CODE_EXECPATH: a real terminal's versions must not stop this Fable round as stale)
+      env: { ...process.env, AI_AGENT: undefined, CLAUDE_CODE_EXECPATH: undefined, ...w.fake.env, PIPELINE_LOCK_DIR: join(w.scratch, 'locks-clone'), ...env },
     });
     let json = null;
     try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* the assertion on json will say so */ }
@@ -4225,4 +4231,315 @@ test('codex-review: a base-only round (Codex not run) has no prompt.md and no pr
   assert.ok(!existsSync(w.roundFile(2, 'prompt.md')));
   assert.equal(Object.hasOwn(w.state().rounds[1], 'promptSha256'), false);
   assert.equal(w.state().rounds[0].promptSha256.length, 64);
+});
+
+// ---- old Fable proofs are re-reviewed: state fable-refresh, review-complete and the final gate (plan 2026-11-10 A4b) -------------------
+
+const OLD_FABLE = 'claude-fable-5-1';
+// Round 1 of a Fable PR, proven by a real 5.2 transcript, then rewritten so the state records the OLD Fable (a proof made before this pipeline knew the floor).
+function oldProofWorld(t, { models = { [OLD_FABLE]: 1 }, yml = SENSITIVE_YML, baseFiles = {} } = {}) {
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT], yml, baseFiles });
+  assertExit(w.codex(1, findingsOf()), 0);
+  assertExit(w.cli(['arbiter', 'needed', '--round', '1']), 0);
+  assertExit(arbiterRun(w, { text: fenced(FABLE_CLEAN) }), 0);
+  editState(w, (s) => { s.rounds[0].modelProof.models = models; });
+  return w;
+}
+const refreshOf = (w) => w.cli(['state', 'fable-refresh', '--pr', '7']);
+// `arbiter needed` + a proving transcript for round n (the model the transcript names decides what is recorded).
+function proveRound(w, n, { model, text = fenced(FABLE_CLEAN), env = {} } = {}) {
+  const needed = w.cli(['arbiter', 'needed', '--round', String(n)], env);
+  assertExit(needed, 0, needed.stdout + needed.stderr);
+  const projects = installTranscript(w, {
+    agentId: `a${n}`, jsonl: transcript({ prompt: promptFor(needed.json.digest, n), text, model }), meta: { agentType: 'arbiter', description: needed.json.tag },
+  });
+  return { needed, applied: w.cli(['arbiter', 'apply', '--round', String(n), '--projects-dir', projects], env) };
+}
+async function gateReview(w, floor = SHARED_FLOOR_DIR) {
+  const { config } = await loadConfig(w.repo.dir);
+  return reviewCheck({
+    root: w.repo.dir, config, pr: 7, repo: w.slug, readOnly: true, hash: currentContentHash(w.repo.dir, config), hashError: null, floorOpts: { dir: floor },
+    diff: () => ({ ok: true, files: [{ path: 'src/a.js', oldPath: 'src/a.js', newPath: 'src/a.js', status: 'M', binary: false, added: [{ line: 1, text: 'x' }], removed: [] }] }),
+  });
+}
+
+test('review-complete and the final gate refuse a PR whose Fable round was proven with an old Fable; a proven refresh round clears both', async (t) => {
+  const w = oldProofWorld(t);
+  const refused = w.cli(['review-complete', '--pr', '7']);
+  assertExit(refused, 1, refused.stdout);
+  assert.equal(refused.json.error, 'fable-refresh');
+  assert.match(refused.json.reason, /round 1 \(claude-fable-5-1\) was proven with a Fable older than claude-fable-5-2/);
+  assert.match(refused.json.reason, /run `pipeline state fable-refresh --pr 7`/);
+  assert.deepEqual(refused.json.staleFableRounds, [{ round: 1, models: [OLD_FABLE] }]);
+  assert.equal(postedBodies(w).length, 0, 'no marker was posted');
+  const gate = await gateReview(w);
+  assert.equal(gate.ok, false);
+  assert.match(gate.detail, /round 1 \(claude-fable-5-1\) was proven with a Fable older than claude-fable-5-2: run `pipeline state fable-refresh --pr 7`/);
+
+  // the refresh round: uncounted, Fable-only, on the same head and content
+  const r = refreshOf(w);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.ok, r.json.round, r.json.scope, r.json.staleRounds], [true, 2, 'whole-pr', [{ round: 1, models: [OLD_FABLE] }]]);
+  const [r1, r2] = w.state().rounds;
+  assert.deepEqual([r2.fableRefresh, r2.fableRequired, r2.items, r2.fromHead, r2.toHead, r2.contentHashAtToHead], [true, true, [], w.head, w.head, r1.contentHashAtToHead]);
+  assert.deepEqual([r2.codexModel, r2.forkPoint, r2.admission, r2.sensitivePaths], [r1.codexModel, r1.forkPoint, undefined, ['src/a.js']]);
+  assert.deepEqual(r2.fableReasons, ['fable-refresh: rounds 1 proven with claude-fable-5-1 below claude-fable-5-2']);
+  const pending = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([pending.fablePending, pending.clean, pending.reviewedRounds], [[2], false, 1]);
+  const unproven = w.cli(['review-complete', '--pr', '7']);
+  assertExit(unproven, 1);
+  assert.match(unproven.json.reason, /Fable review pass has not been proven for round 2/, 'an unproven refresh round is Fable-pending');
+  assert.equal((await gateReview(w)).ok, false);
+
+  // its pass reads the whole PR, zero Codex items, and records the scope
+  const { needed, applied } = proveRound(w, 2);
+  assertExit(applied, 0, applied.stdout);
+  assert.deepEqual([needed.json.mode, needed.json.items, needed.json.scope], ['review', [], 'whole-pr']);
+  assert.match(readFileSync(needed.json.diffPath, 'utf8'), /compute\(x\.y\)/);
+  const proven = w.state().rounds[1];
+  assert.deepEqual([proven.arbiter.proofOk, proven.arbiter.scope, proven.modelProof.models], [true, 'whole-pr', { 'claude-fable-5-2': 1 }]);
+  assert.deepEqual(w.cli(['state', 'outcome']).json.fablePending, []);
+  const ok = w.cli(['review-complete', '--pr', '7']);
+  assertExit(ok, 0, ok.stdout);
+  assert.equal(reviewJson(postedBodies(w).at(-1)).rounds, 2);
+  const gateOk = await gateReview(w);
+  assert.equal(gateOk.ok, true, gateOk.detail);
+  assertExit(refreshOf(w), 2, 'nothing is stale any more');
+});
+
+test('state fable-refresh is refused with a named reason when nothing is stale, work is unfinished, the content moved or the head is not pushed', (t) => {
+  const fresh = oldProofWorld(t, { models: { 'claude-fable-5-2': 1 } });
+  const none = refreshOf(fresh);
+  assertExit(none, 2);
+  assert.equal(none.json.error, 'nothing-stale');
+  assert.equal(fresh.state().rounds.length, 1, 'nothing was added');
+
+  const w = oldProofWorld(t);
+  assertExit(refreshOf(w), 0);
+  const again = refreshOf(w);
+  assertExit(again, 2);
+  assert.equal(again.json.error, 'unfinished-round', 'the first refresh round is still waiting for its Fable pass');
+  assert.match(again.json.message, /the Fable pass of round 2 is not proven/);
+  assert.equal(w.state().rounds.length, 2);
+
+  const open = oldProofWorld(t);
+  editState(open, (s) => { s.rounds[0].items.push({ id: 'R1-B9', bucket: 'BLOCKING', title: 'x', file: 'src/a.js', line: 1, final: { decision: 'ACCEPT', by: 'arbiter' } }); });
+  const unfinished = refreshOf(open);
+  assertExit(unfinished, 2);
+  assert.equal(unfinished.json.error, 'unfinished-round');
+  assert.match(unfinished.json.message, /R1-B9/);
+
+  const moved = oldProofWorld(t);
+  moved.repo.write('src/b.js', `${bFile}export const extra = 1;\n`);
+  moved.prHead(moved.repo.commit('unreviewed change'));
+  const content = refreshOf(moved);
+  assertExit(content, 2);
+  assert.equal(content.json.error, 'content-moved');
+  assert.match(content.json.message, /run a normal codex-review round instead/);
+
+  const unpushed = oldProofWorld(t);
+  unpushed.prHead('0'.repeat(40));
+  const head = refreshOf(unpushed);
+  assertExit(head, 2);
+  assert.equal(head.json.error, 'head-not-pushed');
+  assert.equal(unpushed.state().rounds.length, 1);
+});
+
+test('state fable-refresh works past review.max_rounds with no new commit, and the refresh round does not count', (t) => {
+  const w = oldProofWorld(t);
+  // rounds 2..5 (cloned from round 1: same head and content, all proven with the old Fable) put the review well past review.max_rounds
+  editState(w, (s) => {
+    for (let n = 2; n <= 5; n += 1) s.rounds.push({ ...structuredClone(s.rounds[0]), n, admission: 'normal' });
+  });
+  const before = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([before.reviewedRounds, before.maxRounds, before.reachedMax], [5, 2, false], 'clean but stale: the cap is not what stops it');
+  const r = refreshOf(w);
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.round, 6);
+  assert.deepEqual(r.json.staleRounds.map((s) => s.round), [1, 2, 3, 4, 5]);
+  assert.equal(w.cli(['state', 'outcome']).json.reviewedRounds, 5, 'the refresh round is not counted');
+  assert.equal(w.state().rounds[5].admission, undefined);
+  assertExit(proveRound(w, 6).applied, 0);
+  assert.deepEqual(w.cli(['state', 'outcome']).json.fablePending, []);
+});
+
+test('Fable refresh: a later codex-review round starts at the refresh round\'s head, and its Fable pass reviews only its own slice', (t) => {
+  const w = oldProofWorld(t);
+  assertExit(refreshOf(w), 0);
+  assertExit(proveRound(w, 2).applied, 0);
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head2 = w.repo.commit('later change');
+  w.prHead(head2);
+  const wrongBase = w.codex(3, findingsOf(), { from: w.base, to: head2 });
+  assertExit(wrongBase, 2);
+  assert.equal(wrongBase.json.error, 'base-mismatch');
+  assertExit(w.codex(3, findingsOf(), { from: w.head, to: head2 }), 0);
+  assert.equal(w.state().rounds[2].fromHead, w.head);
+  const { needed, applied } = proveRound(w, 3);
+  assertExit(applied, 0, applied.stdout);
+  assert.equal(needed.json.scope, 'round', 'the refresh pass at 5.2 counts as the earlier pass');
+  assertExit(w.cli(['review-complete', '--pr', '7']), 0);
+});
+
+test('the first fresh-model Fable pass after an old one reads the WHOLE PR, and replaces the old proof without a refresh round', (t) => {
+  const w = oldProofWorld(t);
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head2 = w.repo.commit('later change');
+  w.prHead(head2);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0);
+  const { needed, applied } = proveRound(w, 2);
+  assertExit(applied, 0, applied.stdout);
+  assert.equal(needed.json.scope, 'whole-pr', 'a pass proven below MIN_FABLE does not count as an earlier one');
+  assert.equal(w.state().rounds[1].arbiter.scope, 'whole-pr');
+  const ok = w.cli(['review-complete', '--pr', '7']);
+  assertExit(ok, 0, ok.stdout);
+});
+
+// ---- review round 1: R1-B1 (the owner's hold), R1-F1 (allowed ids), R1-F3 (scope after a stale round), R1-F4 (docs-only exemption) ------
+
+test('R1-B1: an owner hold below MIN_FABLE lets a review proven with the held Fable complete (review-complete and the final gate); clearing the hold refuses it again', async (t) => {
+  const floor = scratchFloorDir();
+  const env = { PIPELINE_MODEL_FLOOR_DIR: floor };
+  const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT], yml: SENSITIVE_YML });
+  assertExit(w.codex(1, findingsOf()), 0);
+  await resetFloor({ dir: floor, hold: OLD_FABLE }); // alias rollback: the floor is now 5.1
+  const { applied } = proveRound(w, 1, { model: OLD_FABLE, env });
+  assertExit(applied, 0, applied.stdout + applied.stderr); // apply accepts a 5.1 pass under the hold
+  assert.deepEqual(w.state().rounds[0].modelProof.models, { [OLD_FABLE]: 1 });
+  assert.deepEqual(w.cli(['state', 'outcome'], env).json.fablePending, []);
+  const none = w.cli(['state', 'fable-refresh', '--pr', '7'], env);
+  assertExit(none, 2);
+  assert.equal(none.json.error, 'nothing-stale', 'the held model is current, so there is nothing to refresh');
+  assert.match(none.json.message, /below claude-fable-5-1 /);
+  assert.equal((await gateReview(w, floor)).ok, true, 'the final gate honours the hold');
+  const ok = w.cli(['review-complete', '--pr', '7'], env);
+  assertExit(ok, 0, ok.stdout);
+
+  await resetFloor({ dir: floor, clearHold: true });
+  const refused = w.cli(['review-complete', '--pr', '7'], env);
+  assertExit(refused, 1, refused.stdout);
+  assert.equal(refused.json.error, 'fable-refresh');
+  assert.match(refused.json.reason, /older than claude-fable-5-2/);
+  assert.equal((await gateReview(w, floor)).ok, false, 'cleared hold: refused again');
+});
+
+test('R1-B1: an unreadable registry falls back to MIN_FABLE (the stricter threshold)', async (t) => {
+  const floor = scratchFloorDir();
+  await resetFloor({ dir: floor, hold: OLD_FABLE });
+  writeFileSync(join(floor, 'fable.json'), '{ not json');
+  const w = oldProofWorld(t);
+  const refused = w.cli(['review-complete', '--pr', '7'], { PIPELINE_MODEL_FLOOR_DIR: floor });
+  assertExit(refused, 1, refused.stdout);
+  assert.equal(refused.json.error, 'fable-refresh');
+  assert.equal((await gateReview(w, floor)).ok, false);
+});
+
+test('R1-F1: a pass proven with an exact id the owner allowed is current for review-complete, and another unreadable id is not', async (t) => {
+  const floor = scratchFloorDir();
+  const env = { PIPELINE_MODEL_FLOOR_DIR: floor };
+  const NEW_ID = 'claude-fable-6-preview';
+  await resetFloor({ dir: floor, allowId: [NEW_ID] });
+  const w = oldProofWorld(t, { models: { [NEW_ID]: 1 } });
+  assertExit(w.cli(['review-complete', '--pr', '7'], env), 0);
+  const w2 = oldProofWorld(t, { models: { 'claude-fable-6-other': 1 } });
+  assert.equal(w2.cli(['review-complete', '--pr', '7'], env).json.error, 'fable-refresh');
+  assert.equal((await gateReview(w2, floor)).ok, false);
+  assert.equal((await gateReview(w, floor)).ok, true);
+});
+
+test('R2-F2 (b): review-complete (comment and output) and the final gate name a Fable round that counts only through the owner allowance; a plain pass says nothing', async (t) => {
+  const floor = scratchFloorDir();
+  const env = { PIPELINE_MODEL_FLOOR_DIR: floor };
+  const NEW_ID = 'claude-fable-6-preview';
+  const plain = oldProofWorld(t, { models: { 'claude-fable-5-2': 1 } });
+  const clean = plain.cli(['review-complete', '--pr', '7'], env);
+  assertExit(clean, 0, clean.stdout);
+  assert.equal(Object.hasOwn(clean.json, 'fableBypass'), false);
+  assert.doesNotMatch(postedBodies(plain)[0], /Standing Fable bypass/);
+  assert.doesNotMatch((await gateReview(plain, floor)).detail, /counted via/);
+
+  await resetFloor({ dir: floor, allowId: [NEW_ID] });
+  const w = oldProofWorld(t, { models: { [NEW_ID]: 1 } });
+  const ok = w.cli(['review-complete', '--pr', '7'], env);
+  assertExit(ok, 0, ok.stdout);
+  const note = `Fable round 1 counted via owner allowance ${NEW_ID}`;
+  assert.deepEqual(ok.json.fableBypass, { note, rounds: [{ round: 1, via: 'allow', id: NEW_ID }] });
+  const [body] = postedBodies(w);
+  assert.ok(body.includes(`**Standing Fable bypass:** ${note}.`), body);
+  assert.deepEqual(Object.keys(reviewJson(body)).sort(), ['base', 'contentHash', 'codexModel', 'head', 'modelProofDigest', 'rounds', 'stateHash'].sort(), 'the JSON record is unchanged');
+  const gate = await gateReview(w, floor);
+  assert.equal(gate.ok, true);
+  assert.ok(gate.detail.includes(`; ${note}`), gate.detail);
+});
+
+test('R2-F2 (b): a hold below MIN_FABLE is named by review-complete and the final gate; clearing the allowance refuses an unreadable id again', async (t) => {
+  const floor = scratchFloorDir();
+  const env = { PIPELINE_MODEL_FLOOR_DIR: floor };
+  await resetFloor({ dir: floor, hold: OLD_FABLE });
+  const w = oldProofWorld(t, { models: { [OLD_FABLE]: 1 } });
+  const ok = w.cli(['review-complete', '--pr', '7'], env);
+  assertExit(ok, 0, ok.stdout);
+  const note = 'Fable round 1 counted via owner hold claude-fable-5-1 (below claude-fable-5-2)';
+  assert.deepEqual(ok.json.fableBypass, { note, rounds: [{ round: 1, via: 'hold', id: OLD_FABLE }] });
+  assert.ok(postedBodies(w)[0].includes(`**Standing Fable bypass:** ${note}.`));
+  assert.ok((await gateReview(w, floor)).detail.includes(note));
+
+  // R2-F2 (d): an allowance of an id the parser reads that the threshold has passed no longer counts
+  await resetFloor({ dir: floor, clearHold: true, allowId: [OLD_FABLE] });
+  const refused = w.cli(['review-complete', '--pr', '7'], env);
+  assertExit(refused, 1, refused.stdout);
+  assert.equal(refused.json.error, 'fable-refresh');
+  assert.equal((await gateReview(w, floor)).ok, false);
+});
+
+test('R1-F3: a normal round after a stale round replaces it even when an older current-model pass exists (the pass reads the whole PR)', (t) => {
+  const w = oldProofWorld(t);
+  assertExit(refreshOf(w), 0);
+  assertExit(proveRound(w, 2).applied, 0);
+  // round 1 was proven by a current Fable, round 2 (a refresh) by a stale terminal's old one: round 2 is the stale one
+  editState(w, (s) => { s.rounds[0].modelProof.models = { 'claude-fable-5-2': 1 }; s.rounds[1].modelProof.models = { [OLD_FABLE]: 1 }; });
+  assert.deepEqual(w.cli(['review-complete', '--pr', '7']).json.staleFableRounds, [{ round: 2, models: [OLD_FABLE] }]);
+  w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
+  const head2 = w.repo.commit('later change');
+  w.prHead(head2);
+  assertExit(w.codex(3, findingsOf(), { from: w.head, to: head2 }), 0);
+  const { needed, applied } = proveRound(w, 3);
+  assertExit(applied, 0, applied.stdout);
+  assert.equal(needed.json.scope, 'whole-pr', 'a stale round is unreplaced, so this pass reads everything');
+  assert.equal(w.state().rounds[2].arbiter.scope, 'whole-pr');
+  const ok = w.cli(['review-complete', '--pr', '7']);
+  assertExit(ok, 0, ok.stdout);
+});
+
+test('R1-F4: state fable-refresh accepts a head that only added ledger rows (docs-only exemption), pins the round at the reviewed head, and review-complete then accepts with the exemption', async (t) => {
+  const LEDGER = 'docs/ledger.md';
+  const migrations = Object.fromEntries(Array.from({ length: 4 }, (_, i) => [`supabase/migrations/000${i + 1}_m${i + 1}.sql`, 'select 1;\n']));
+  const w = oldProofWorld(t, {
+    yml: `${SENSITIVE_YML}  docs_exempt_paths: ["${LEDGER}"]\n`,
+    baseFiles: { ...migrations, [LEDGER]: '# Ledger\n\n| Num | Name | Date | PR | Note |\n|---|---|---|---|---|\n| 0001 | `m1` | 2026-11-05 | #101 | |\n' },
+  });
+  const reviewed = w.head;
+  w.repo.write(LEDGER, `${readFileSync(join(w.repo.dir, LEDGER), 'utf8')}| 0002 | \`m2\` | 2026-11-06 | #102 | |\n`);
+  const head2 = w.repo.commit('ledger row');
+  w.prHead(head2);
+  // review-complete already accepts the head through the exemption and refuses only for the old Fable proof
+  const refused = w.cli(['review-complete', '--pr', '7']);
+  assertExit(refused, 1, refused.stdout);
+  assert.equal(refused.json.error, 'fable-refresh');
+
+  const r = refreshOf(w);
+  assertExit(r, 0, r.stdout + r.stderr);
+  const [r1, r2] = w.state().rounds;
+  assert.deepEqual([r2.fableRefresh, r2.fromHead, r2.toHead, r2.contentHashAtToHead], [true, reviewed, reviewed, r1.contentHashAtToHead], 'pinned at the last reviewed head');
+  assertExit(proveRound(w, 2).applied, 0);
+  const ok = w.cli(['review-complete', '--pr', '7']);
+  assertExit(ok, 0, ok.stdout);
+  assert.match(postedBodies(w).at(-1), /Docs-only exemption/);
+  assert.equal((await gateReview(w)).ok, true);
+
+  // a change to code (not a ledger row) is still content-moved
+  const moved = oldProofWorld(t);
+  moved.repo.write('src/b.js', `${bFile}export const extra = 1;\n`);
+  moved.prHead(moved.repo.commit('unreviewed change'));
+  assert.equal(refreshOf(moved).json.error, 'content-moved');
 });

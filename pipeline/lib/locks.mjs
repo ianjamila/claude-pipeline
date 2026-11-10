@@ -454,6 +454,142 @@ export async function withLock(name, fn, opts) {
   return result;
 }
 
+// Does this lock handle still own its lock? true only while owner.json carries OUR runId and pid. A lock removed by hand (or by an older
+// pipeline), and perhaps taken since by another holder, answers false. withLock learns the same only after fn returns; this lets fn ask first.
+export function holdsLock(lock) {
+  const owner = readOwner(lockPathFor(lock.dir, lock.name));
+  return owner !== null && owner.runId === lock.runId && owner.pid === lock.pid;
+}
+
+// assess() for an owner-clearing caller: an owner.json that is a directory is a provably damaged record (not a read failure that might hide a live
+// holder), so it is judged like a lock with no usable owner. Every other read error still throws.
+function assessDamageTolerant(lockPath, ctx) {
+  try {
+    return assess(lockPath, ctx);
+  } catch (err) {
+    if (err.code !== 'EISDIR') throw err;
+    return { state: 'stale', owner: incompleteOwner(nameOf(lockPath)), reason: 'owner record is a directory' };
+  }
+}
+
+function ownerRunIdOf(dirPath) {
+  try {
+    return readOwner(dirPath)?.runId ?? null;
+  } catch (err) {
+    if (err.code === 'EISDIR') return null;
+    throw err;
+  }
+}
+
+const isLiveLocal = (seen, ctx) => seen.state === 'held' && !seen.owner.incomplete && isLocalOwner(seen.owner, ctx);
+
+// A lock folder with no owner.json at all, younger than INCOMPLETE_STALE_MS: an acquirer is between its mkdir and its owner link, so it is not
+// ours to move (reclaim() applies the same rule through assess()). An owner.json that exists but cannot be parsed, or is a directory, is never an
+// acquire in progress (the owner file is published atomically by hard link), so those stay clearable.
+function isFreshUnfinished(seen, lockPath) {
+  if (seen.state !== 'held' || !seen.owner.incomplete) return false;
+  try {
+    fs.lstatSync(path.join(lockPath, 'owner.json'));
+    return false;
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return true;
+    throw err;
+  }
+}
+
+// The same lock we looked at: same inode and same owner runId. (A runId alone can be null for two different unfinished locks; an inode alone
+// can be recycled by the next mkdir.)
+function sameLock(lockPath, identity) {
+  try {
+    return fs.statSync(lockPath, { bigint: true }).ino === identity.ino && ownerRunIdOf(lockPath) === identity.runId;
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
+// Best-effort: put a moved-aside lock folder back at its path. false when it could not be (a new lock took the path).
+function restoreMoved(moved, lockPath) {
+  try {
+    retrying(() => fs.renameSync(moved, lockPath));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Owner recovery: remove a lock that is NOT held by a running process on this machine (a dead holder, another machine's holder, a lock with no usable
+// owner record), and only the very lock that was inspected. Same pattern as reclaim(): the reclaim guard serializes it with every acquirer's
+// reclaim, the lock is judged again while holding it, moved aside, and the moved directory confirmed to be the one inspected (same inode, same
+// owner runId); anything else is put back. A lock acquired (or replaced) after the first look is therefore never removed.
+// Returns { state }: 'absent' (nothing to clear: nothing is touched) | 'live' (owner: a running local holder, left alone) | 'cleared' (owner) |
+// 'changed' (the lock was replaced while clearing: left in place; restored: false when it could not be put back) | 'busy' (another recovery or
+// reclaim holds the guard, or the lock is a fresh folder with no owner.json yet: an acquirer is mid-way through creating it). Throws on any read error other than a missing or unparseable owner.json (fail closed, like tryAcquire).
+// `hooks` ({ afterInspect, insideGuard }) are test-only seams, like tryAcquire's.
+export function clearUnheld(name, { dir = defaultLockDir(), now = Date.now(), host = os.hostname(), machineId: machine = readMachineId(), isAlive = isPidAlive, hooks = {} } = {}) {
+  const lockPath = lockPathFor(dir, name);
+  const ctx = { now, host, machineId: machine, isAlive, hooks };
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    let identity;
+    try {
+      identity = { ino: fs.statSync(lockPath, { bigint: true }).ino, runId: ownerRunIdOf(lockPath) };
+    } catch (err) {
+      if (err.code === 'ENOENT') return { state: 'absent' };
+      throw err;
+    }
+    const seen = assessDamageTolerant(lockPath, ctx);
+    if (seen.state === 'absent') return { state: 'absent' };
+    if (isLiveLocal(seen, ctx)) return { state: 'live', owner: seen.owner };
+    if (isFreshUnfinished(seen, lockPath)) return { state: 'busy' };
+    hooks.afterInspect?.(lockPath);
+    const guard = `${lockPath}.reclaim`;
+    if (!tryMkdir(guard)) {
+      if (breakGuard(guard, ctx) === 'busy') return { state: 'busy' };
+      continue; // the abandoned guard is gone: look at the lock again
+    }
+    const me = {
+      pid: process.pid,
+      host,
+      ...(machine ? { machineId: machine } : {}),
+      runId: `${process.pid}-${randomUUID()}`,
+      createdAt: new Date(now).toISOString(),
+    };
+    let moved = null;
+    try {
+      if (!publishOwner(guard, me, hooks).ok) return { state: 'busy' };
+      const again = assessDamageTolerant(lockPath, ctx);
+      if (again.state === 'absent') return { state: 'absent' };
+      if (isLiveLocal(again, ctx)) return { state: 'live', owner: again.owner };
+      if (isFreshUnfinished(again, lockPath)) return { state: 'busy' };
+      if (!sameLock(lockPath, identity)) return { state: 'changed' };
+      hooks.insideGuard?.(guard, lockPath);
+      if (readOwner(guard)?.runId !== me.runId) return { state: 'busy' }; // the guard was taken from us: do not touch the lock
+      // The check-then-rename gap that remains here (a creator stalled past INCOMPLETE_STALE_MS, a remote holder releasing mid-clear) is the same
+      // one reclaim() has; it is not closed here.
+      moved = moveAside(lockPath);
+      if (moved === null) return { state: 'absent' };
+      let same;
+      try {
+        same = sameLock(moved, identity);
+      } catch (err) {
+        // A read error must not strand the lock off its path; when even the restore fails, say where the lock went.
+        if (!restoreMoved(moved, lockPath)) err.strandedAt = moved;
+        throw err;
+      }
+      if (same) {
+        const gone = moved;
+        moved = null;
+        removeQuietly(gone);
+        return { state: 'cleared', owner: seen.owner };
+      }
+      return { state: 'changed', restored: restoreMoved(moved, lockPath) }; // false: someone created a lock meanwhile; the one we moved stays aside
+    } finally {
+      releaseDir(guard, me.runId);
+    }
+  }
+  return { state: 'busy' };
+}
+
 // The current owner, or null when there is no lock. A lock directory without a usable owner.json (being created,
 // or abandoned) is reported as { incomplete: true, ... } so that "no lock" always means "free".
 export function inspect(name, { dir = defaultLockDir() } = {}) {

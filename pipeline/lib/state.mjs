@@ -153,21 +153,23 @@ export function decodeFromComment(body) {
 // real review but does not count toward the round cap. conflicted (at most 50 paths) / conflictedCount / blocks (at most 50:
 // { path, block, droppedTheirs }, dropped blocks first) describe that resolution, with blockCount / blocksWithDrops /
 // droppedTheirsTotal counted over ALL blocks (the stored list may be cut); ensureReviewBase needs conflicted to rebuild the base elsewhere.
+// fableRefresh: the round only re-runs the Fable pass on a head whose Fable proof is below MIN_FABLE (commands/state.mjs fable-refresh): no Codex, no items of its own
+// until Fable raises findings, and it never counts toward the round cap. Its Fable pass reviews the whole PR (arbiter.mjs#writeFableDiff).
 // fableRequired: the round's second reviewer is the Fable pass (triage.mjs#fablePendingRounds), with fableReasons and the
 // sensitivePaths it was told to attack. forkPoint: the PR's merge base at this round (the whole-PR range starts there).
 // codexModel: the model Codex was run with. promptSha256: sha256 (hex) of the exact prompt bytes sent to Codex (the round's prompt.md).
 // admission: which rule let a COUNTED round start, 'normal' | 'auto-extra' | 'owner' (recorded on every new counted round, never on a
-// baseOnly / resolutionOnly one; an ownerGrant implies 'owner'). ownerGrant: { grantId, k, quote, ownerTs } of the owner's extra-round
+// baseOnly / resolutionOnly / fableRefresh one; an ownerGrant implies 'owner'). ownerGrant: { grantId, k, quote, ownerTs } of the owner's extra-round
 // record that admitted it (hooks/lib/owner-go.mjs claimGrantMarkers; the final gate re-verifies it against the record and its marker).
 // confirmFixed: the ids of accepted items marked implemented through other files (item.implementedVia 'other-files') that this round's prompt
 // asked Codex to confirm; recorded only when there are some, so an ordinary round is unchanged. review-complete needs every such item to appear
 // in the confirmFixed of a LATER round (triage.mjs#reviewEligibilityProblems).
 export function addRound(state, {
-  n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant, confirmFixed,
+  n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant, confirmFixed, fableRefresh,
 }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
-  const counted = baseOnly !== true && resolutionOnly !== true;
+  const counted = baseOnly !== true && resolutionOnly !== true && fableRefresh !== true;
   const how = ownerGrant === undefined ? admission : 'owner';
   return {
     ...state,
@@ -176,6 +178,7 @@ export function addRound(state, {
       ...(forkPoint === undefined ? {} : { forkPoint }), ...(codexModel === undefined ? {} : { codexModel }),
       ...(promptSha256 === undefined ? {} : { promptSha256 }),
       ...(baseOnly === true ? { baseOnly: true } : {}),
+      ...(fableRefresh === true ? { fableRefresh: true } : {}),
       ...(Array.isArray(confirmFixed) && confirmFixed.length > 0 ? { confirmFixed: [...confirmFixed] } : {}),
       ...(counted && how !== undefined ? { admission: how } : {}),
       ...(counted && ownerGrant !== undefined ? { ownerGrant: structuredClone(ownerGrant) } : {}),

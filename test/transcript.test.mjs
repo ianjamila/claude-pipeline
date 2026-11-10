@@ -20,7 +20,7 @@ const prove = (name, extra = {}) =>
 
 // Small in-memory builders for shapes that would clutter the fixture directory.
 const userLine = (content, extra = {}) => JSON.stringify({ type: 'user', message: { role: 'user', content }, ...extra });
-const asstLine = ({ id = 'msg_1', model = 'claude-fable-5-1', effort = 'high', stop = 'end_turn', content, ...rest }) =>
+const asstLine = ({ id = 'msg_1', model = 'claude-fable-5-2', effort = 'high', stop = 'end_turn', content, ...rest }) =>
   JSON.stringify({ type: 'assistant', effort, message: { model, id, role: 'assistant', stop_reason: stop, content }, ...rest });
 const text = (t) => [{ type: 'text', text: t }];
 const GOOD_META = '{"agentType":"arbiter","description":"d"}';
@@ -40,7 +40,7 @@ test('fable-ok proves Fable at high effort and exposes prompt and ruling text', 
   assert.deepEqual(r.errors, []);
   assert.equal(r.ok, true);
   assert.equal(r.assistantLines, 2);
-  assert.deepEqual(r.models, { 'claude-fable-5-1': 2 });
+  assert.deepEqual(r.models, { 'claude-fable-5-2': 2 });
   assert.deepEqual(r.efforts, { high: 2 });
   assert.match(r.firstUserText, /^ROUND: 1\nINPUT-DIGEST: abc123def456/);
   assert.equal(r.finalStopReason, 'end_turn');
@@ -77,7 +77,7 @@ test('a fallback to another model mid-run is caught', () => {
   const r = prove('mixed-models');
   assert.equal(r.ok, false);
   assert.deepEqual(r.errors, ['unexpected model claude-opus-5-5 on line 4']);
-  assert.deepEqual(r.models, { 'claude-fable-5-1': 1, 'claude-opus-5-5': 1 });
+  assert.deepEqual(r.models, { 'claude-fable-5-2': 1, 'claude-opus-5-5': 1 });
   assert.equal(r.firstUserText.startsWith('ROUND: 1'), true, 'tool_result user lines are not the prompt');
 });
 
@@ -198,8 +198,8 @@ test('a final message ending in tool_use (no answer yet) is incomplete and not a
 });
 
 test('a final assistant line without a message id is treated as a group of one', () => {
-  const noId = JSON.stringify({ type: 'assistant', effort: 'high', message: { model: 'claude-fable-5-1', stop_reason: 'end_turn', content: text('only me') } });
-  const noId2 = JSON.stringify({ type: 'assistant', effort: 'high', message: { model: 'claude-fable-5-1', stop_reason: 'end_turn', content: text('and me') } });
+  const noId = JSON.stringify({ type: 'assistant', effort: 'high', message: { model: 'claude-fable-5-2', stop_reason: 'end_turn', content: text('only me') } });
+  const noId2 = JSON.stringify({ type: 'assistant', effort: 'high', message: { model: 'claude-fable-5-2', stop_reason: 'end_turn', content: text('and me') } });
   const r = proveText([userLine('p'), noId, noId2]);
   assert.equal(r.finalAssistantText, 'and me');
 });
@@ -449,7 +449,7 @@ test('a non-Fable MIDDLE assistant line fails even with Fable on the first and l
   ]);
   assert.equal(r.ok, false);
   assert.deepEqual(r.errors, ['unexpected model claude-opus-5-5 on line 4']);
-  assert.deepEqual(r.models, { 'claude-fable-5-1': 2, 'claude-opus-5-5': 1 });
+  assert.deepEqual(r.models, { 'claude-fable-5-2': 2, 'claude-opus-5-5': 1 });
 });
 
 test('a wrong-effort or API-error MIDDLE assistant line fails too', () => {
@@ -640,7 +640,7 @@ test('a null or absent stop_reason is accepted only for the last line of the tra
   assert.equal(nul.finalStopReason, null);
   assert.equal(nul.stopReasonMissing, true);
   assert.equal(nul.finalAssistantText, ANSWER);
-  const absent = JSON.stringify({ type: 'assistant', effort: 'high', message: { model: 'claude-fable-5-1', id: 'msg_1', role: 'assistant', content: text(ANSWER) } });
+  const absent = JSON.stringify({ type: 'assistant', effort: 'high', message: { model: 'claude-fable-5-2', id: 'msg_1', role: 'assistant', content: text(ANSWER) } });
   const r = proveText([userLine('p'), absent]);
   assert.deepEqual(r.errors, []);
   assert.equal(r.finalStopReason, null);
@@ -710,7 +710,7 @@ test('a real-shaped interactive (cli) transcript with a null stop_reason proves 
   const r = prove('fable-cli-null-stop', { expectAgentType: 'arbiter' });
   assert.deepEqual(r.errors, []);
   assert.equal(r.ok, true);
-  assert.deepEqual(r.models, { 'claude-fable-5-1': 2 });
+  assert.deepEqual(r.models, { 'claude-fable-5-2': 2 });
   assert.deepEqual(r.efforts, { high: 2 });
   assert.equal(r.finalStopReason, null);
   assert.match(r.firstUserText, /^ROUND: 2\nINPUT-DIGEST: 0123456789abcdef/);
@@ -823,7 +823,7 @@ test('hand-back rule 4: stop_reason must be null/absent or tool_use', () => {
   for (const stop of ['max_tokens', 'end_turn', 'refusal', '', 0, false]) {
     refused([userLine('p'), hbLine({ stop }), ackLine()], new RegExp(`final message incomplete \\(stop_reason ${String(stop)}\\)`));
   }
-  const absent = JSON.stringify({ type: 'assistant', effort: 'high', message: { model: 'claude-fable-5-1', id: 'msg_hb', role: 'assistant', content: hbBlock() } });
+  const absent = JSON.stringify({ type: 'assistant', effort: 'high', message: { model: 'claude-fable-5-2', id: 'msg_hb', role: 'assistant', content: hbBlock() } });
   assert.deepEqual(proveText([userLine('p'), absent, ackLine()]).errors, []);
 });
 

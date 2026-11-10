@@ -13,13 +13,14 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { quoteCommand } from '../pipeline/commands/job.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { floorEnv } from './helpers/floor-env.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
 const fixtures = join(here, 'fixtures');
 
 // PIPELINE_ADMIN would switch the file guard off and make the "refused" cases pass or fail by accident.
-const ENV = { ...process.env };
+const ENV = { ...process.env, ...floorEnv() };
 delete ENV.PIPELINE_ADMIN;
 
 function cli(cwd, args, env = ENV) {
@@ -317,7 +318,7 @@ test('model-proof: a clean fable transcript found by tag proves ok (exit 0)', (t
   assert.equal(r.json.ok, true);
   assert.equal(r.json.transcript, join(dir, 'agent-a1.jsonl'));
   assert.equal(r.json.meta.agentType, 'arbiter');
-  assert.deepEqual(r.json.models, { 'claude-fable-5-1': 2 });
+  assert.deepEqual(r.json.models, { 'claude-fable-5-2': 2 });
   assert.deepEqual(r.json.efforts, { high: 2 });
   assert.deepEqual(r.json.errors, []);
   assert.match(r.json.finalAssistantText, /"rulings"/);

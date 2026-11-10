@@ -9,7 +9,7 @@ import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import {
-  PHASES, ROLES, addCostEntry, listPriceUsd, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
+  PHASES, PRICE_TABLE_DATE, ROLES, addCostEntry, costShapeProblem, listPriceUsd, priceMessage, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
 } from '../pipeline/lib/run-cost.mjs';
 import {
   STEPS, applyCheckpoint, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
@@ -146,22 +146,25 @@ test('usageFromTranscript: sums message.usage, counting a streamed message id on
     line('m2', { input_tokens: 1, output_tokens: 2 }),
     'garbage', JSON.stringify({ type: 'user', message: { content: 'hi' } }),
   ].join('\n');
-  assert.deepEqual(usageFromTranscript(text), { input: 4, output: 11, cacheRead: 100, cacheWrite: 10, usd: 0, messages: 2, unpricedMessages: 2 });
+  assert.deepEqual(usageFromTranscript(text), {
+    input: 4, output: 11, cacheRead: 100, cacheWrite: 10, usd: 0, messages: 2, unpricedMessages: 2,
+    byPrice: { 'unknown|std|std': { input: 4, output: 11, cacheRead: 100, cacheWrite5m: 10, cacheWrite1h: 0, messages: 2 } },
+  });
 });
 
 test('list prices: each transcript message at its own model, unknown models add tokens and no USD', () => {
   const line = (id, model, u) => JSON.stringify({ type: 'assistant', message: { id, model, usage: u } });
   const text = [
-    line('a', 'claude-sonnet-5-5', { input_tokens: 1e6 }), // $3
-    line('b', 'claude-opus-5-5', { output_tokens: 1e6, cache_read_input_tokens: 1e6 }), // $25 + $0.5
-    line('c', 'claude-haiku-5-5', { cache_creation_input_tokens: 1e6 }), // $1.25
+    line('a', 'claude-sonnet-5-5', { input_tokens: 1e6 }), // $2
+    line('b', 'claude-opus-5-5', { output_tokens: 1e6, cache_read_input_tokens: 1e6 }), // $20 + $0.2
+    line('c', 'claude-haiku-5-5', { cache_creation_input_tokens: 1e6 }), // $0.625 (a prompt over 100K: the higher Haiku 5.5 row)
     line('d', 'some-other-model', { input_tokens: 1e6 }),
   ].join('\n');
   const u = usageFromTranscript(text);
-  assert.equal(u.usd, 29.75);
+  assert.equal(u.usd, 22.825);
   assert.equal(u.unpricedMessages, 1);
   assert.equal(u.input, 2e6);
-  assert.equal(listPriceUsd('fable', { input: 1e6, output: 1e6 }), 75);
+  assert.equal(listPriceUsd('fable', { input: 1e6, output: 1e6 }), 48, 'a bare family name is its newest row (Fable 5.2: 8 + 40)');
   assert.equal(listPriceUsd('gpt-5', { input: 1 }), null);
   assert.equal(modelFamily('Claude-Sonnet-5-5[1m]'), 'sonnet');
 });
@@ -219,7 +222,7 @@ test('P cost: USD from list prices (--model, transcript models); --usd wins; tok
   const s = scenario();
   const r = costCli(s, ['--phase', 'review', '--role', 'judge', '--input', '1000000', '--model', 'sonnet']);
   assertExit(r, 0);
-  assert.equal(r.json.cost.total.usd, 3);
+  assert.equal(r.json.cost.total.usd, 2);
   assert.deepEqual(r.json.warnings, []);
   s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', model: 'claude-opus-5-5', usage: { output_tokens: 1000000 } } })}\n`);
   const t = costCli(scenario(), ['--phase', 'build', '--role', 'implementer', '--input', '10']);
@@ -230,7 +233,7 @@ test('P cost: USD from list prices (--model, transcript models); --usd wins; tok
   s3.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', model: 'claude-opus-5-5', usage: { output_tokens: 1000000 } } })}\n`);
   const w = costCli(s3, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/t.jsonl']);
   assertExit(w, 0);
-  assert.equal(w.json.cost.total.usd, 25);
+  assert.equal(w.json.cost.total.usd, 20);
   const x = costCli(scenario(), ['--phase', 'build', '--role', 'judge', '--input', '1000000', '--model', 'sonnet', '--usd', '0.5']);
   assert.equal(x.json.cost.total.usd, 0.5);
   assertExit(costCli(scenario(), ['--phase', 'build', '--role', 'judge', '--input', '1', '--model', 'gpt']), 2);
@@ -301,9 +304,9 @@ test('usageFromTranscript: a message with no model is priced at the default mode
   const line = (id, model, u) => JSON.stringify({ type: 'assistant', message: { id, ...(model ? { model } : {}), usage: u } });
   const text = [line('a', undefined, { input_tokens: 1e6 }), line('b', 'claude-opus-5-5', { output_tokens: 1e6 }), line('c', 'some-other-model', { input_tokens: 1e6 })].join('\n');
   const none = usageFromTranscript(text);
-  assert.deepEqual([none.usd, none.unpricedMessages], [25, 2]);
+  assert.deepEqual([none.usd, none.unpricedMessages], [20, 2]);
   const dflt = usageFromTranscript(text, { defaultModel: 'sonnet' });
-  assert.deepEqual([dflt.usd, dflt.unpricedMessages], [28, 1], 'a: $3 at sonnet; b: $25 at its own opus; c: an unknown model of its own stays unpriced');
+  assert.deepEqual([dflt.usd, dflt.unpricedMessages], [22, 1], 'a: $2 at sonnet; b: $20 at its own opus; c: an unknown model of its own stays unpriced');
 });
 
 test('P cost --from-transcript --model: transcript messages without model metadata are priced at --model; --usd still overrides', () => {
@@ -311,7 +314,7 @@ test('P cost --from-transcript --model: transcript messages without model metada
   s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 1000000 } } })}\n${JSON.stringify({ message: { id: 'n', model: 'claude-opus-5-5', usage: { output_tokens: 1000000 } } })}\n`);
   const r = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/t.jsonl', '--model', 'sonnet']);
   assertExit(r, 0);
-  assert.equal(r.json.cost.total.usd, 28);
+  assert.equal(r.json.cost.total.usd, 22);
   assert.deepEqual(r.json.warnings, []);
   const u = costCli(scenario(), ['--phase', 'build', '--role', 'implementer', '--input', '10', '--usd', '0.5', '--model', 'sonnet']);
   assert.equal(u.json.cost.total.usd, 0.5);
@@ -355,4 +358,194 @@ test('P summary: the per-session guard denies are recorded and reported', () => 
   const absent = scenario();
   withComment(absent, existing(withCost({ entry: entry(), sessions: ['s1'] })));
   assert.equal(summary(absent, [], { PIPELINE_GUARD_LOG_FILE: join(tmp(), 'nope.jsonl') }).json.cost.guardBySession, null);
+});
+
+// ---- per-version prices (fable floor + prices, A5) -----------------------------------------------------------------
+
+const MTOK = (id, t, o) => listPriceUsd(id, t, o);
+const PRICE_ROWS = [
+  ['claude-fable-5-2', [8, 40, 0.2, 10, 16]], ['claude-fable-5-1', [10, 50, 0.25, 12.5, 20]], ['claude-fable-5', [10, 50, 1, 12.5, 20]],
+  ['claude-opus-5-5', [4, 20, 0.2, 5, 8]], ['claude-opus-5', [5, 25, 0.5, 6.25, 10]], ['claude-opus-4-8', [5, 25, 0.5, 6.25, 10]],
+  ['claude-opus-4-7', [5, 25, 0.5, 6.25, 10]], ['claude-opus-4-6', [5, 25, 0.5, 6.25, 10]],
+  ['claude-sonnet-5-5', [2, 10, 0.1, 2.5, 4]], ['claude-sonnet-5', [2, 10, 0.2, 2.5, 4]], ['claude-sonnet-4-6', [3, 15, 0.3, 3.75, 6]],
+  ['claude-haiku-5-5', [0.1, 0.5, 0.01, 0.125, 0.2]], ['claude-haiku-4-5', [1, 5, 0.1, 1.25, 2]],
+];
+const FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h'];
+
+test('price table: every row prices each of the five token kinds (1 MTok of one kind = the table figure)', () => {
+  assert.equal(PRICE_TABLE_DATE, '2026-11-03');
+  for (const [id, row] of PRICE_ROWS) {
+    FIELDS.forEach((f, i) => {
+      // (a Haiku 5.5 prompt of exactly 1 MTok of one kind is over 100K, so its std row is checked with 100K tokens instead)
+      const std = id === 'claude-haiku-5-5';
+      const n = std ? 1e5 : 1e6;
+      const usd = MTOK(id, { [f]: n });
+      assert.equal(usd, Math.round(((row[i] * n) / 1e6) * 1e6) / 1e6, `${id} ${f}`);
+    });
+  }
+  // dated ids price as the undated row
+  assert.equal(MTOK('claude-opus-4-8-20260101', { input: 1e6 }), 5);
+  assert.equal(MTOK('claude-sonnet-5-5[1m]', { input: 1e6 }), 2);
+});
+
+test('price table: Haiku 5.5 above 100K prompt tokens uses the higher row; exactly 100,000 is standard', () => {
+  assert.equal(MTOK('claude-haiku-5-5', { input: 100000 }), 0.01);
+  assert.equal(MTOK('claude-haiku-5-5', { input: 100001 }), 0.050001);
+  assert.equal(priceMessage('claude-haiku-5-5', { input: 100000 }).tier, 'std');
+  assert.equal(priceMessage('claude-haiku-5-5', { input: 100001 }).tier, '>100k');
+  // the prompt counts input + cache read + cache write (5 m + 1 h), not output
+  assert.equal(priceMessage('claude-haiku-5-5', { input: 50000, cacheRead: 30000, cacheWrite5m: 10000, cacheWrite1h: 10000 }).tier, 'std');
+  assert.equal(priceMessage('claude-haiku-5-5', { input: 50000, cacheRead: 30000, cacheWrite5m: 10000, cacheWrite1h: 10001 }).tier, '>100k');
+  assert.equal(priceMessage('claude-haiku-5-5', { input: 100000, output: 1e6 }).tier, 'std');
+  assert.equal(priceMessage('claude-haiku-4-5', { input: 500000 }).tier, 'std', 'only Haiku 5.5 is tiered');
+});
+
+test('price table: an unknown newer id prices as its family newest row; an unknown family is unpriced', () => {
+  assert.equal(MTOK('claude-fable-5-3', { input: 1e6, output: 1e6 }), 48);
+  assert.equal(MTOK('claude-opus-5-6', { input: 1e6 }), 4);
+  assert.equal(MTOK('claude-sonnet-5-9', { input: 1e6 }), 2);
+  assert.equal(MTOK('claude-haiku-5-6', { input: 1e6 }), 0.5, 'a newer Haiku keeps the 100K tiering of the newest row');
+  assert.equal(MTOK('claude-mystery-1', { input: 1e6 }), null);
+  assert.equal(MTOK('', { input: 1e6 }), null);
+  assert.equal(MTOK(undefined, { input: 1e6 }), null);
+});
+
+test('usageFromTranscript: cache writes are split by cache_creation ephemeral_1h / ephemeral_5m; no split means all 5 m', () => {
+  const line = (id, usage) => JSON.stringify({ type: 'assistant', message: { id, model: 'claude-fable-5-2', usage } });
+  const split = usageFromTranscript(line('a', { cache_creation_input_tokens: 3e6, cache_creation: { ephemeral_5m_input_tokens: 1e6, ephemeral_1h_input_tokens: 2e6 } }));
+  assert.equal(split.usd, 10 + 32);
+  assert.equal(split.cacheWrite, 3e6, 'cacheWrite stays the 5 m + 1 h total');
+  assert.deepEqual(split.byPrice['claude-fable-5-2|std|std'], { input: 0, output: 0, cacheRead: 0, cacheWrite5m: 1e6, cacheWrite1h: 2e6, messages: 1 });
+  const flat = usageFromTranscript(line('a', { cache_creation_input_tokens: 3e6 }));
+  assert.equal(flat.usd, 30);
+  assert.equal(flat.byPrice['claude-fable-5-2|std|std'].cacheWrite5m, 3e6);
+  // a total larger than its two parts: the rest is 5 m
+  const over = usageFromTranscript(line('a', { cache_creation_input_tokens: 4e6, cache_creation: { ephemeral_5m_input_tokens: 1e6, ephemeral_1h_input_tokens: 2e6 } }));
+  assert.deepEqual([over.byPrice['claude-fable-5-2|std|std'].cacheWrite5m, over.byPrice['claude-fable-5-2|std|std'].cacheWrite1h, over.cacheWrite], [2e6, 2e6, 4e6]);
+});
+
+test('usageFromTranscript: Haiku 5.5 tier boundary is per message and lands in its own byPrice bucket', () => {
+  const line = (id, usage) => JSON.stringify({ type: 'assistant', message: { id, model: 'claude-haiku-5-5', usage } });
+  const u = usageFromTranscript([line('a', { input_tokens: 100000 }), line('b', { input_tokens: 100001 }), line('c', { input_tokens: 1 })].join('\n'));
+  assert.deepEqual(Object.keys(u.byPrice).sort(), ['claude-haiku-5-5|>100k|std', 'claude-haiku-5-5|std|std']);
+  assert.equal(u.byPrice['claude-haiku-5-5|std|std'].messages, 2);
+  assert.equal(u.byPrice['claude-haiku-5-5|>100k|std'].input, 100001);
+  assert.equal(u.usd, 0.060001, "0.01 + 0.050001 + 1e-7, rounded to 6 places");
+});
+
+test('fast mode: input and output re-priced for Fable 5.2 and Opus 5.5; cache tokens make a fast message unpriced', () => {
+  assert.equal(MTOK('claude-fable-5-2', { input: 1e6, output: 1e6 }, { speed: 'fast' }), 96);
+  assert.equal(MTOK('claude-opus-5-5', { input: 1e6, output: 1e6 }, { speed: 'fast' }), 48);
+  for (const t of [{ input: 1, cacheRead: 1 }, { input: 1, cacheWrite: 1 }, { input: 1, cacheWrite1h: 1 }]) assert.equal(MTOK('claude-fable-5-2', t, { speed: 'fast' }), null);
+  assert.equal(MTOK('claude-sonnet-5-5', { input: 1e6 }, { speed: 'fast' }), null, 'no fast price known for this model');
+  assert.equal(MTOK('claude-fable-5-3', { input: 1e6 }, { speed: 'fast' }), 16, 'a newer Fable uses the Fable 5.2 fast row');
+  const line = (id, usage) => JSON.stringify({ type: 'assistant', message: { id, model: 'claude-fable-5-2', usage } });
+  const u = usageFromTranscript([
+    line('a', { input_tokens: 1e6, output_tokens: 1e6, speed: 'fast' }),
+    line('b', { input_tokens: 1e6, cache_read_input_tokens: 5, speed: 'fast' }),
+    line('c', { input_tokens: 1e6 }),
+  ].join('\n'));
+  assert.equal(u.usd, 96 + 8);
+  assert.equal(u.unpricedMessages, 1);
+  assert.deepEqual(Object.keys(u.byPrice).sort(), ['claude-fable-5-2|std|fast', 'claude-fable-5-2|std|std']);
+  assert.equal(u.byPrice['claude-fable-5-2|std|fast'].messages, 2, 'the unpriced fast message is still bucketed, so a later table can price it');
+});
+
+test('byPrice: addCostEntry sums buckets per key and counts price tables; costShapeProblem tolerates old records and rejects a bad byPrice', () => {
+  const b = (n) => ({ 'claude-fable-5-2|std|std': { input: n, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, messages: 1 } });
+  let c = addCostEntry(null, entry({ byPrice: b(5), priceTable: '2026-11-03' }));
+  c = addCostEntry(c, entry({ byPrice: { ...b(7), 'claude-haiku-5-5|>100k|std': { input: 1, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, messages: 1 } }, priceTable: '2026-11-03' }));
+  c = addCostEntry(c, entry({ byPrice: b(1), priceTable: '2027-01-01' }));
+  c = addCostEntry(c, entry()); // a hand entry: no byPrice, no table
+  assert.equal(c.byPrice['claude-fable-5-2|std|std'].input, 13);
+  assert.equal(c.byPrice['claude-fable-5-2|std|std'].messages, 3);
+  assert.deepEqual(c.priceTables, { '2026-11-03': 2, '2027-01-01': 1 });
+  assert.equal(costShapeProblem(c), null);
+  assert.equal(costShapeProblem(addCostEntry(null, entry())), null);
+  assert.equal(addCostEntry(null, entry()).byPrice, undefined);
+  assert.equal(costShapeProblem({ ...c, byPrice: [] }), 'bad cost');
+  assert.equal(costShapeProblem({ ...c, byPrice: 'x' }), 'bad cost');
+  assert.equal(costShapeProblem({ ...c, priceTables: 3 }), 'bad cost');
+  assert.throws(() => addCostEntry(null, entry({ byPrice: 'x' })), /byPrice/);
+  assert.throws(() => addCostEntry(null, entry({ byPrice: { 'no-tier': {} } })), /byPrice key/);
+  assert.throws(() => addCostEntry(null, entry({ byPrice: { 'm|std|std': { input: -1 } } })), /byPrice input/);
+  assert.throws(() => addCostEntry(null, entry({ priceTable: 'yesterday' })), /priceTable/);
+});
+
+test('costReport / costLines: byPrice and priceTables are reported when present; an old cost is unchanged', () => {
+  const old = addCostEntry(null, entry());
+  assert.deepEqual(Object.keys(costReport(old)).sort(), ['byPhase', 'byRole', 'guardBlocks', 'guardBySession', 'retries', 'sessions', 'total']);
+  assert.ok(!costLines(old).some((l) => /table/.test(l)));
+  const priced = addCostEntry(old, entry({ byPrice: { 'claude-fable-5-2|std|std': { input: 1, output: 1, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, messages: 1 } }, priceTable: '2026-11-03' }));
+  const report = costReport(priced);
+  assert.equal(report.byPrice['claude-fable-5-2|std|std'].messages, 1);
+  assert.deepEqual(report.priceTables, { '2026-11-03': 1 });
+  assert.ok(costLines(priced).includes('- **Priced with table:** 2026-11-03 (1)'));
+  assert.equal(costLines(old).length, costLines(priced).length - 1);
+});
+
+const transcriptLine = (id, model, usage) => JSON.stringify({ type: 'assistant', message: { id, model, usage } });
+
+test('byPrice round trip: P cost --from-transcript -> run record comment -> P summary JSON', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', `${[
+    transcriptLine('a', 'claude-fable-5-2', { input_tokens: 1000, output_tokens: 200, cache_creation_input_tokens: 300, cache_creation: { ephemeral_5m_input_tokens: 100, ephemeral_1h_input_tokens: 200 } }),
+    transcriptLine('b', 'claude-haiku-5-5', { input_tokens: 200000 }),
+  ].join('\n')}\n`);
+  const r = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/t.jsonl']);
+  assertExit(r, 0);
+  assert.equal(r.json.bucketed, true);
+  assert.deepEqual(r.json.cost.priceTables, { '2026-11-03': 1 });
+  const stored = written(s).cost;
+  assert.deepEqual(stored.byPrice['claude-fable-5-2|std|std'], { input: 1000, output: 200, cacheRead: 0, cacheWrite5m: 100, cacheWrite1h: 200, messages: 1 });
+  assert.equal(stored.byPrice['claude-haiku-5-5|>100k|std'].input, 200000);
+  withComment(s, existing(written(s)));
+  const sum = summary(s, []);
+  assertExit(sum, 0);
+  assert.deepEqual(sum.json.cost.byPrice, stored.byPrice);
+  assert.deepEqual(sum.json.cost.priceTables, { '2026-11-03': 1 });
+  assert.equal(sum.json.cost.total.usd, 0.1202);
+});
+
+test('byPrice: a hand entry is not bucketed; --model hand tokens are; --usd overrides bucketing; a second entry adds to the buckets', () => {
+  const hand = costCli(scenario(), ['--phase', 'build', '--role', 'judge', '--input', '10', '--usd', '0.5']);
+  assertExit(hand, 0);
+  assert.equal(hand.json.bucketed, false);
+  assert.equal(hand.json.cost.byPrice, undefined);
+  assert.equal(hand.json.cost.priceTables, undefined);
+  const noModel = costCli(scenario(), ['--phase', 'build', '--role', 'judge', '--input', '10']);
+  assert.equal(noModel.json.bucketed, false);
+  const retry = costCli(scenario(), ['--phase', 'build', '--role', 'judge', '--retry']);
+  assert.equal(retry.json.bucketed, false);
+  const s = scenario();
+  const m = costCli(s, ['--phase', 'build', '--role', 'judge', '--input', '1000000', '--cache-write', '10', '--model', 'sonnet']);
+  assert.equal(m.json.bucketed, true);
+  assert.deepEqual(m.json.cost.byPrice['sonnet|std|std'], { input: 1e6, output: 0, cacheRead: 0, cacheWrite5m: 10, cacheWrite1h: 0, messages: 1 });
+  withComment(s, existing(written(s)));
+  const m2 = costCli(s, ['--phase', 'review', '--role', 'judge', '--input', '5', '--model', 'sonnet']);
+  assert.equal(m2.json.cost.byPrice['sonnet|std|std'].input, 1e6 + 5);
+  assert.deepEqual(m2.json.cost.priceTables, { '2026-11-03': 2 });
+  const withUsd = costCli(scenario(), ['--phase', 'build', '--role', 'judge', '--input', '10', '--model', 'sonnet', '--usd', '0.5']);
+  assert.equal(withUsd.json.bucketed, false);
+  assert.equal(withUsd.json.cost.byPrice, undefined);
+});
+
+test('priceTables provenance: entries priced under two table dates show both; an old record without byPrice still renders and reports unchanged', () => {
+  const bucket = { 'claude-opus-5-5|std|std': { input: 1, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, messages: 1 } };
+  let r = applyCheckpoint(rec(), { cost: { entry: entry({ byPrice: bucket, priceTable: '2026-11-03' }) } }, { host: 'h', now: NOW });
+  r = applyCheckpoint(r, { cost: { entry: entry({ byPrice: bucket, priceTable: '2027-02-01' }) } }, { host: 'h', now: NOW });
+  const back = decodeRecord(`${MARKERS.summary}\n\n${encodeRecord(r)}`).record;
+  assert.deepEqual(back.cost.priceTables, { '2026-11-03': 1, '2027-02-01': 1 });
+  assert.equal(back.cost.byPrice['claude-opus-5-5|std|std'].input, 2);
+  assert.ok(renderStatusBlock(back).includes('Priced with table:** 2026-11-03 (1) · 2027-02-01 (1)'));
+  // an old record (cost without byPrice / priceTables) survives encode / decode and renders its old lines only
+  const oldRec = withCost({ entry: entry({ usd: 2 }), retries: 1 });
+  const oldBack = decodeRecord(`${MARKERS.summary}\n\n${encodeRecord(oldRec)}`).record;
+  assert.equal(oldBack.cost.byPrice, undefined);
+  assert.deepEqual(costReport(oldBack.cost).total, { input: 100, output: 50, cacheRead: 10, cacheWrite: 5, usd: 2, calls: 1 });
+  assert.ok(!renderStatusBlock(oldBack).includes('table'));
+  // a record whose byPrice is not an object is refused by the shape check
+  const bad = structuredClone(back);
+  bad.cost.byPrice = [];
+  assert.equal(decodeRecord(`${MARKERS.summary}\n\n${encodeRecord(bad)}`).status, 'invalid');
 });

@@ -6,7 +6,10 @@ import { runPreflight } from '../lib/preflight.mjs';
 
 export const meta = {
   summary: 'report whether the pipeline may merge (config, gh, protection, pause, Codex)',
-  usage: 'pipeline preflight [--repo DIR]   (exit 0 can merge, 1 cannot, 2 config missing/invalid)',
+  usage: [
+    'pipeline preflight [--repo DIR]   (exit 0 can merge, 1 cannot, 2 config missing/invalid)',
+    '  warnings (informational, never change canMerge): a stale terminal; an owner allowance (model-floor reset --allow-id) or a hold below MIN_FABLE still in force in the model floor registry; an allowed id the parser can read now (the allowance is no longer needed)',
+  ].join('\n'),
 };
 
 export async function run(argv, ctx) {

@@ -83,6 +83,11 @@ export function triageComment(state) {
   if (claudeLines.length > 0) out.push('', '#### Claude rulings', '', ...claudeLines);
   const granted = grantedRounds(state);
   if (granted.length > 0) out.push('', `Owner-granted extra round(s): ${granted.map((g) => `${grantLabel(g)} - "${line(g.quote, 300)}"`).join('; ')}`);
+  // A Fable pass that stopped on the floor or a stale terminal (arbiter.mjs): visible even when the round has no item to carry the cause.
+  for (const r of rounds) {
+    const f = r?.arbiter?.failure;
+    if (isObject(f) && f.cause && r.arbiter.proofOk !== true) out.push('', `Round ${line(r.n)} arbiter stopped: ${line(f.cause)}${f.advice ? ` — ${line(f.advice)}` : ''}`);
+  }
   out.push('', encodeForComment(state));
   return out.join('\n');
 }
@@ -244,6 +249,22 @@ const MAX_EXCERPT_CHARS = 6000;
 function excerptOf(step) {
   const raw = String(step.errorExcerpt ?? '').trimEnd();
   return defuse(raw.split('\n').slice(0, MAX_EXCERPT_LINES).join('\n').slice(0, MAX_EXCERPT_CHARS));
+}
+
+// A review that stopped for a reason of its own, not a failed verification (e.g. a terminal that must be restarted before the Fable pass): the reason is
+// the text the CLI gave (arbiter advice), flattened to one line. `pipeline comment --kind blocked --reason TEXT` renders this; without --reason the
+// comment is rendered from the verify report (blockedComment).
+export function blockedReasonComment(reason) {
+  const why = line(reason).replace(/[.\s]+$/, '');
+  return [
+    MARKERS.blocked,
+    '',
+    '### Pipeline blocked — the review stopped',
+    '',
+    `The review stopped: ${why || 'no reason given'}.`,
+    '',
+    'The PR is not labelled pipeline-blocked and nothing else needs a decision. Do that step, then ask for the review to resume in a Claude Code session on this repository; it continues where it stopped.',
+  ].join('\n');
 }
 
 export function blockedComment(report) {
