@@ -26,7 +26,8 @@ import {
 } from '../lib/finalgate.mjs';
 import { classifyMergeCommand, commandTail } from '../lib/merge-cleanup.mjs';
 import { QueueUnreadable, clearSessionHold, endRecord, holdOnSignal, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
-import { approvalGapSince, createQueueRoute } from '../lib/queue-route.mjs';
+import { approvalGapSince, createQueueRoute, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
+import { bestEffortSweep } from '../lib/queue-sweep.mjs';
 import { checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal, recordSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
 
 export const meta = {
@@ -75,12 +76,7 @@ function queueHoldSeams({ gh, root, pr, getHold }) {
       setHold(root, pr, { id: hold.id, login: hold.login, at: hold.at, holdBlock: holdDigest(hold), liftedAt: new Date().toISOString() });
     },
     // An unmerged end: the owned label goes back, once (a label that is on already is a new hold and is left). A failed restore keeps the record open.
-    onTerminal: async ({ rec }) => {
-      if (!rec || rec.terminal !== null || rec.hold === null) return {};
-      const res = restoreHoldLabel({ gh, pr });
-      if (res.status === 'failed') return { keepOpen: true, fields: { holdRestored: false, holdRestoreFailed: true, holdRestoreNote: `COULD NOT put needs-human back on PR #${pr} (${res.why}): add the label by hand` } };
-      return res.status === 'restored' ? { fields: { holdRestored: true, holdRestoredNote: RESTORE_NOTE } } : {};
-    },
+    onTerminal: restoreHoldOnTerminal({ gh, pr }),
   };
 }
 // What lib/hold.mjs needs to stay out of the entry's way: recovery that asks GitHub first (F3) and the signal / ownership hooks of withHoldLifted.
@@ -130,6 +126,10 @@ export const run = guarded(async (argv, ctx) => {
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
   const gh = createGitHub({ cwd: root, env: ctx.env });
+
+  // Other queued PRs of this repo are carried on first (best effort: a failure is logged, never changes this merge). The dry run writes nothing, so it does not sweep;
+  // this PR's own record is left to the merge below (its precheck reconciles it).
+  if (values['dry-run'] !== true) await bestEffortSweep({ root, exceptPr: pr, requeue: true, env: ctx.env ?? process.env, ...(ctx.home ? { home: ctx.home } : {}), ...(ctx.notify ? { notify: ctx.notify } : {}) });
 
   if (values['dry-run'] === true) {
     if (values['owner-approved-head'] !== undefined || values['owner-approved-items'] !== undefined) {
@@ -561,16 +561,8 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   });
 }
 
-// Before a re-queue on the --owner-go route: the live scan again, the owner's approval for what it found, and the blockers.
-async function queueRecheckOwnerGo({ root, config, pr, gh, ctx, head, repo, hold }) {
-  const again = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, queueMode: true });
-  if (again.head !== head) return { ok: false, error: 'live-check', reasons: ['the worktree moved while the PR was queued'] };
-  if (!again.ok) return { ok: false, error: 'live-check', reasons: again.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`) };
-  const gap = approvalGap({ repo, pr, head, items: again.ownerItems, areas: again.areas, hold: hold ?? undefined, rulings: again.rulingsBlockDigest });
-  if (gap !== 'ok') return { ok: false, error: 'owner-go', reasons: ['the owner\'s "merge" for this head and scan is no longer on record (it is valid for 24 hours): ask again'] };
-  const problems = await preMergeProblems({ gh, pr, head, queueMode: true });
-  return problems.length > 0 ? { ok: false, error: 'blocked', reasons: problems } : { ok: true };
-}
+// Before a re-queue on the --owner-go route: the live scan again, the owner's approval for what it found, and the blockers (lib/queue-route.mjs, shared with the sweep).
+const queueRecheckOwnerGo = ({ ctx, ...rest }) => recheckOwnerGo({ ...rest, env: ctx.env });
 
 // `P merge --pr N --dry-run [--owner-go]`: the verdict of a real `P merge` without anything that writes or merges. Same checks, in the same
 // spirit, but every independent one is collected (an agent wants the whole list at once) and the owner's step is reported instead of

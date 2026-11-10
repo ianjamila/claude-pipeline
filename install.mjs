@@ -24,6 +24,7 @@ import { tryAcquire, release } from './pipeline/lib/locks.mjs';
 import { fileProvenance } from './pipeline/lib/identity.mjs';
 import { stacksUninstall } from './pipeline/lib/stacks/uninstall.mjs';
 import { stacksSeam } from './pipeline/lib/stacks/paths.mjs';
+import { queueSweepSchedule } from './pipeline/lib/queue-sweep-schedule.mjs';
 
 class InstallError extends Error {
   constructor(message, exitCode = 1) {
@@ -340,6 +341,11 @@ function doInstall(ctx) {
     && isDeepStrictEqual(I.manifestWithoutTime({ ...manifest, complete: true }), I.manifestWithoutTime(finalObj));
   if (!alreadyFinal) writeFileAtomic(manifestFile, `${JSON.stringify(finalObj, null, 2)}\n`, I.lexists(manifestFile));
 
+  // The merge-queue sweep's LaunchAgent (macOS, the user's own ~/.claude only; anything else is left alone). A failure is a warning: the files are in place.
+  const queueSweep = queueSweepSchedule({ action: 'install', home, env: ctx.env });
+  if (queueSweep.error) warnings.push(`could not install the queue-sweep LaunchAgent: ${queueSweep.error}`);
+  if (queueSweep.notFound) warnings.push(`queue-sweep LaunchAgent: ${queueSweep.notFound.join(' and ')} not found on PATH, so the job cannot find it`);
+
   const allowBefore = new Set(current.settings.permissions?.allow ?? []);
   return {
     ok: true,
@@ -355,6 +361,7 @@ function doInstall(ctx) {
     foreignBackups,
     editBackups,
     retired,
+    queueSweep: { installed: queueSweep.installed === true, applicable: queueSweep.applicable },
     warnings,
     diagnostics: diagnostics(ctx, merged),
   };
@@ -383,6 +390,11 @@ function doCheck(ctx) {
     skipFileGuard: opts.skipFileGuard,
     retiredSkills: retiredSkillNames(ctx.env),
   });
+  // The merge-queue sweep's LaunchAgent must be written and loaded (macOS, the user's own ~/.claude).
+  const queueSweep = queueSweepSchedule({ action: 'status', home, env: ctx.env });
+  if (queueSweep.applicable && queueSweep.installed !== true) {
+    drift.push({ kind: 'schedule', path: queueSweep.plist ?? 'com.claude-pipeline.queue-sweep', message: `the queue-sweep LaunchAgent is not ${queueSweep.line ? 'loaded' : 'installed'}: re-run the installer` });
+  }
   return { ok: drift.length === 0, mode: 'check', home, source, version: plan.version, installedVersion: manifest?.version ?? null, drift, warnings: [...plan.warnings, ...warnings] };
 }
 
@@ -407,6 +419,9 @@ function doUninstall(ctx) {
   const waitMs = workerWaitMs(ctx.env);
   const stacks = stacksUninstall({ home, env: ctx.env, ...(waitMs !== undefined ? { waitMs } : {}) });
   warnings.push(...stacks.warnings);
+
+  const queueSweep = queueSweepSchedule({ action: 'remove', home, env: ctx.env });
+  if (queueSweep.error) warnings.push(`could not remove the queue-sweep LaunchAgent: ${queueSweep.error}`);
 
   const found = I.inspectHooks(current.settings, home);
   const hookCount = Object.values(found).reduce((n, list) => n + list.length, 0);
@@ -434,6 +449,7 @@ function doUninstall(ctx) {
     allow: { removed: allowRemoved },
     settings: { path: current.file, changed: settingsChanged, backup },
     stacks: { root: stacks.root, paused: stacks.paused, workersSurvived: stacks.workers.survivors, scheduleRemoved: stacks.schedule.removed },
+    queueSweep: { removed: queueSweep.removed === true },
     warnings,
   };
 }
@@ -475,6 +491,7 @@ function formatReport(r) {
       if (u.backup) lines.push(`    your edits in ${u.backedUp.join(', ')} were saved; the old copy is at ${u.backup}`);
       for (const k of u.kept) lines.push(`    kept ${k}: claude-pipeline did not install it`);
     }
+    if (r.queueSweep?.installed) lines.push('  queue:     sweep LaunchAgent com.claude-pipeline.queue-sweep installed (every 10 minutes)');
     lines.push(...formatDiagnostics(r.diagnostics));
   } else if (r.mode === 'uninstall') {
     lines.push(`claude-pipeline uninstalled from ${r.home}`);
@@ -483,6 +500,7 @@ function formatReport(r) {
     lines.push(`  allow:     ${r.allow.removed.length} entries removed`);
     if (r.stacks?.paused) lines.push(`  stacks:    paused (${r.stacks.root}/pause is left in place; delete it to resume)${r.stacks.scheduleRemoved ? ', sweep schedule removed' : ''}`);
     else if (r.stacks?.scheduleRemoved) lines.push('  stacks:    sweep schedule removed');
+    if (r.queueSweep?.removed) lines.push('  queue:     sweep LaunchAgent removed');
     lines.push(`  backup:    ${r.settings.backup ?? 'none (settings.json did not change)'}`);
   } else if (r.ok) {
     lines.push(`No drift: claude-pipeline ${r.installedVersion ?? r.version} in ${r.home} matches ${r.source} and settings.json.`);

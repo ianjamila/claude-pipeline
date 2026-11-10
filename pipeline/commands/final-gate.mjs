@@ -8,6 +8,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { GATE_FILE, evaluateGate, removeReviewFile } from '../lib/finalgate.mjs';
 import { writeReviewJson } from '../lib/cmd-io.mjs';
 import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
+import { bestEffortSweep } from '../lib/queue-sweep.mjs';
 
 export const meta = {
   summary: 'prove this PR head is verified, reviewed, and CI-green; writes .review/final-gate.json',
@@ -22,6 +23,8 @@ export const run = guarded(async (argv, ctx) => {
   const gh = createGitHub({ cwd: root, env: ctx.env });
 
   removeReviewFile(root, GATE_FILE);
+  // Queued PRs of this repo are settled first, best effort and WITHOUT enqueueing anything (only `P merge` and `P queue-sweep` re-queue): no live record = no GitHub call.
+  await bestEffortSweep({ root, requeue: false, env: ctx.env ?? process.env, ...(ctx.home ? { home: ctx.home } : {}), ...(ctx.notify ? { notify: ctx.notify } : {}) });
   return guardGh(async () => {
     // The merge queue is read live (never configured): with it on, a PR that is behind its base is no problem. Unreadable => the gate fails (queue-state).
     let queue = { queue: false };

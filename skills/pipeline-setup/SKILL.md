@@ -119,7 +119,7 @@ only, and posts the guard statuses on the queue commit for the member PRs' exact
 
 Queue mode itself needs no setting: `P merge`, `P final-gate`, the dry run, `P update-branch` and `P merge-hold` ask GitHub live
 whether the base branch has a merge queue, and with none they behave as before. In queue mode `P merge` enqueues the owner-approved head,
-and the queue sweep (`queue-sweep`, LaunchAgent `com.claude-pipeline.queue-sweep`, every 10 min, written and removed by the installer) carries a queued PR to its end
+and `P queue-sweep` (LaunchAgent `com.claude-pipeline.queue-sweep`, every 10 min, written and removed by the installer) carries a queued PR to its end
 when no session is watching. The repo's own queue settings, its `merge_group` triggers and its `Queue gate` check are the repo's workflow PR (EagleWatch's A2), not part of onboarding here.
 
 **Before moving a repo into a GitHub organization** (lessons from EagleWatch's move, 2026-11-09; do these first):

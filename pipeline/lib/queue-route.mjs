@@ -6,9 +6,10 @@
 // Nothing here ever disables auto-merge or dequeues for a time-out: `still-queued` leaves the entry exactly as it is.
 import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
-import { waitBlockers } from './finalgate.mjs';
+import { evaluateOwnerGo, preMergeProblems, waitBlockers } from './finalgate.mjs';
 import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
-import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, watchQueue } from './merge-queue.mjs';
+import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
+import { RESTORE_NOTE } from './hold.mjs';
 import { envWithGhDir, runShellAsync } from './proc.mjs';
 import { approvalGap } from '../hooks/lib/owner-go.mjs';
 
@@ -42,6 +43,26 @@ export function approvalGapSince(q, since, gap = approvalGap) {
   if (age <= 0) return 'none';
   return gap({ ...q, maxAgeMs: age });
 }
+
+// Before a re-queue on the --owner-go route: the live scan again, the owner's approval for what it found, and the blockers. Shared by `P merge` (its own watch)
+// and the queue sweep (an unattended re-queue), so both judge a re-queue exactly as the first enqueue was judged. `hold` = the lifted hold binding the record owns.
+export async function recheckOwnerGo({ root, config, pr, gh, env, head, repo, hold }) {
+  const again = await evaluateOwnerGo({ root, config, pr, gh, env, queueMode: true });
+  if (again.head !== head) return { ok: false, error: 'live-check', reasons: ['the worktree moved while the PR was queued'] };
+  if (!again.ok) return { ok: false, error: 'live-check', reasons: again.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`) };
+  const gap = approvalGap({ repo, pr, head, items: again.ownerItems, areas: again.areas, hold: hold ?? undefined, rulings: again.rulingsBlockDigest });
+  if (gap !== 'ok') return { ok: false, error: 'owner-go', reasons: ['the owner\'s "merge" for this head and scan is no longer on record (it is valid for 24 hours): ask again'] };
+  const problems = await preMergeProblems({ gh, pr, head, queueMode: true });
+  return problems.length > 0 ? { ok: false, error: 'blocked', reasons: problems } : { ok: true };
+}
+
+// The onTerminal seam that puts a lifted needs-human hold back (once) at an unmerged end; a failed restore keeps the record open for the next settle.
+export const restoreHoldOnTerminal = ({ gh, pr }) => async ({ rec }) => {
+  if (!rec || rec.terminal !== null || rec.hold === null) return {};
+  const res = restoreHoldLabel({ gh, pr });
+  if (res.status === 'failed') return { keepOpen: true, fields: { holdRestored: false, holdRestoreFailed: true, holdRestoreNote: `COULD NOT put needs-human back on PR #${pr} (${res.why}): add the label by hand` } };
+  return res.status === 'restored' ? { fields: { holdRestored: true, holdRestoredNote: RESTORE_NOTE } } : {};
+};
 
 const lastLines = (text, n = OUTPUT_LINES) => String(text ?? '').split('\n').map((l) => l.trimEnd()).filter(Boolean).slice(-n);
 const firstLine = (err) => String(err?.message ?? err).split('\n')[0];
@@ -238,5 +259,14 @@ export function createQueueRoute({
     }
   }
 
-  return { precheck, enqueueAndWatch, budgetMs, budgetMinutes: Math.ceil(budgetMs / 60_000) };
+  // The sweep's re-queue: one more attempt for the recorded head, confirmed with GitHub, no watching (the next sweep reads the entry).
+  // -> { ok: true } | { done } (a refusal or a merge the confirm found).
+  async function reenqueue() {
+    requeued = 1;
+    openRecord(root, pr, head, approval, opts);
+    beginAttempt(root, pr, head, approval, opts);
+    return confirm(await sendEnqueue());
+  }
+
+  return { precheck, enqueueAndWatch, reenqueue, budgetMs, budgetMinutes: Math.ceil(budgetMs / 60_000) };
 }
