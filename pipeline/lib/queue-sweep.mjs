@@ -13,7 +13,7 @@ import { createGitHub } from './github.mjs';
 import { withMergeLock } from './hold.mjs';
 import { defaultLockDir } from './locks.mjs';
 import { liveRecords, recordIsFor, recordedHold, settleRecord } from './merge-queue.mjs';
-import { createQueueRoute, recheckOwnerGo, restoreHoldOnTerminal } from './queue-route.mjs';
+import { createQueueRoute, recheckGatedRecorded, recheckOwnerGo, restoreHoldOnTerminal } from './queue-route.mjs';
 import { gitCommonDir } from './repo.mjs';
 import { loadMachineConfig } from './stacks/config.mjs';
 import { stackFiles, stacksRoot } from './stacks/paths.mjs';
@@ -110,7 +110,9 @@ export function knownRepos({ home = os.homedir(), env = process.env } = {}) {
 // ---- the re-queue, from a live worktree only (Fable F11) ------------------------------------------------------------------------------------
 // -> the `requeue` function settleRecord takes. ok:false ends the record `removed` (or `blocked`), puts an owned hold back and notifies;
 // { ok:false, unsettled:true } (the enqueue could not be confirmed) leaves the record as it is.
-export function makeRequeue({ gh, root, env, say, now, sleep, log, loadCfg = loadConfig, headOf = (cwd) => headSha({ cwd }), recheckFn = recheckOwnerGo }) {
+// The re-queue is judged the way the route that opened the record judged the first enqueue (#229): a `gated` record by the gated recheck,
+// an `owner-go` one by the owner-go recheck. A record without a route (written before it was recorded) is owner-go: the stricter reading, fail closed.
+export function makeRequeue({ gh, root, env, say, now, sleep, log, loadCfg = loadConfig, headOf = (cwd) => headSha({ cwd }), recheckFn = recheckOwnerGo, recheckGatedFn = recheckGatedRecorded }) {
   return async ({ rec }) => {
     const pr = rec.pr;
     const stop = (why) => ({ ok: false, reasons: [`${why} — re-run \`P merge --pr ${pr}\` to re-queue`] });
@@ -131,11 +133,13 @@ export function makeRequeue({ gh, root, env, say, now, sleep, log, loadCfg = loa
     if (!loaded?.ok) return { ok: false, reasons: [`the pipeline config of ${rec.root} is not usable, so the re-queue was not checked`] };
     const config = loaded.config;
     const hold = recordedHold(rec);
-    const recheck = () => recheckFn({ root: rec.root, config, pr, gh, env, head: rec.head, repo: gh.repo().slug, hold });
+    const recheck = () => (rec.route === 'gated'
+      ? recheckGatedFn({ root: rec.root, config, pr, gh, env, head: rec.head, repo: gh.repo().slug, rec })
+      : recheckFn({ root: rec.root, config, pr, gh, env, head: rec.head, repo: gh.repo().slug, hold }));
     const again = await recheck();
     if (!again.ok) return { ok: false, ...(again.error === 'blocked' ? { kind: 'blocked' } : {}), reasons: again.reasons };
     const route = createQueueRoute({
-      gh, root: rec.root, config, pr, head: rec.head, env, refuse, approval: rec.approval, recheck,
+      gh, root: rec.root, config, pr, head: rec.head, route: rec.route ?? null, env, refuse, approval: rec.approval, recheck,
       onTerminal: restoreHoldOnTerminal({ gh, pr }), now, sleep, log,
     });
     const out = await route.reenqueue();
@@ -155,7 +159,7 @@ export function makeRequeue({ gh, root, env, say, now, sleep, log, loadCfg = loa
 // -> { root, settled: [{ pr, outcome, ... }], skipped: [{ pr, why }], errors: [text] }. Never throws.
 export async function sweepRepo({
   root, env = process.env, requeue = true, exceptPr = null, notify = null, makeGh = (r) => createGitHub({ cwd: r, env }), now = Date.now,
-  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), pollMs = 2000, log = () => {}, alive, loadCfg, headOf, recheckFn,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), pollMs = 2000, log = () => {}, alive, loadCfg, headOf, recheckFn, recheckGatedFn,
 }) {
   const out = { root, settled: [], skipped: [], errors: [] };
   let records;
@@ -187,7 +191,7 @@ export async function sweepRepo({
         refuse: (error) => ({ busy: true, error }),
         fn: () => settleRecord({
           gh, root, pr: rec.pr, now, sleep, pollMs, log, notify: say,
-          requeue: requeue ? makeRequeue({ gh, root, env, say, now, sleep, log, ...(loadCfg ? { loadCfg } : {}), ...(headOf ? { headOf } : {}), ...(recheckFn ? { recheckFn } : {}) }) : null,
+          requeue: requeue ? makeRequeue({ gh, root, env, say, now, sleep, log, ...(loadCfg ? { loadCfg } : {}), ...(headOf ? { headOf } : {}), ...(recheckFn ? { recheckFn } : {}), ...(recheckGatedFn ? { recheckGatedFn } : {}) }) : null,
         }),
       });
       if (res.busy) {

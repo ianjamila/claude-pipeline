@@ -296,6 +296,42 @@ test('reconcile: removal before our latest added event is ignored; one after it 
   assert.equal(r.removal.beforeCommit, QUEUE_COMMIT);
 });
 
+// #227: which events belong to a PENDING attempt is decided by the timeline, never by comparing this machine's clock with GitHub's.
+test('beginAttempt stores the count of added events seen; reconcile attributes only events after it, whatever the clocks say (#227)', async () => {
+  const before = [added('06:00:00'), removed(REASON_GROUP_CHECKS, '06:30:00')];
+  const ours = [...before, added('08:00:00'), removed(REASON_GROUP_CHECKS, '08:10:00')];
+  // The machine clock runs 10 minutes AHEAD of GitHub: the old wall-clock test read the genuine removal as "not ours" and dropped the attempt.
+  const ahead = repoDir();
+  const rec = beginAttempt(ahead, 7, HEAD, APPROVAL, { ...IDENT, gh: { queueEvents: () => before }, now: () => Date.parse('2026-11-09T08:20:00Z') });
+  assert.equal(rec.pending.addedSeen, 1);
+  const r = await reconcile({ gh: stubGh({ states: [st()], events: [ours] }), root: ahead, pr: 7, head: HEAD });
+  assert.equal(r.kind, 'removed');
+  assert.equal(r.removal.at, '2026-11-09T08:10:00Z');
+  assert.equal(readQueueRecord(ahead, 7).attempts, 1, 'the attempt stays counted');
+  // The machine clock runs far BEHIND GitHub's: the old removal (already on the timeline when the attempt began) was read as this attempt's.
+  const behind = repoDir();
+  beginAttempt(behind, 7, HEAD, APPROVAL, { ...IDENT, gh: { queueEvents: () => before }, now: () => Date.parse('2026-11-01T00:00:00Z') });
+  const logged = [];
+  assert.deepEqual(await reconcile({ gh: stubGh({ states: [st()], events: [before] }), root: behind, pr: 7, head: HEAD, log: (m) => logged.push(m) }), { kind: 'not-queued' });
+  assert.equal(readQueueRecord(behind, 7).attempts, 0, 'an enqueue that never landed is not counted');
+  assert.equal(logged.length, 1);
+});
+
+test('beginAttempt without a readable timeline stores no anchor; a pending record without one keeps the wall-clock reading (#227 back-compat)', async () => {
+  const root = repoDir();
+  const rec = beginAttempt(root, 7, HEAD, APPROVAL, { ...IDENT, gh: { queueEvents: () => { throw new Error('rate limited'); } } });
+  assert.deepEqual(Object.keys(rec.pending).sort(), ['at', 'head']);
+  assert.equal(beginAttempt(repoDir(), 7, HEAD, APPROVAL, IDENT).pending.addedSeen, undefined, 'no gh given: no anchor');
+  // A record written before the anchor existed: a removal newer than the attempt counts, an older one does not.
+  const mark = (dir, atMs) => beginAttempt(dir, 7, HEAD, APPROVAL, { ...IDENT, now: () => atMs });
+  const fresh = repoDir();
+  mark(fresh, Date.parse('2026-11-09T08:00:00Z'));
+  assert.equal((await reconcile({ gh: stubGh({ states: [st()], events: [[added('08:05:00'), removed(REASON_GROUP_CHECKS, '08:10:00')]] }), root: fresh, pr: 7, head: HEAD })).kind, 'removed');
+  const old = repoDir();
+  mark(old, Date.parse('2026-11-09T09:00:00Z'));
+  assert.deepEqual(await reconcile({ gh: stubGh({ states: [st()], events: [[added('06:00:00'), removed(REASON_GROUP_CHECKS, '06:30:00')]] }), root: old, pr: 7, head: HEAD }), { kind: 'not-queued' });
+});
+
 test('reconcile: a removal with reason merged (the PR not yet shown as merged) reads as merged', async () => {
   const root = repoDir();
   const gh = stubGh({ states: [st()], events: [[added(), removed(REASON_MERGED, '08:40:00', MERGE_SHA)]] });
@@ -393,6 +429,38 @@ test('watchQueue: removed for failed_checks => removed with the removal, noted o
   assert.equal(readQueueRecord(root, 7).removals.length, 1);
   assert.equal(readQueueRecord(root, 7).terminal, null, 'the caller decides: re-queue or end');
   assert.equal(gh.calls.length, 0, 'a removal is never answered with a dequeue');
+});
+
+// #230: a watch started from a worktree at another head (OTHER) than the live record's (HEAD) follows the record's head.
+test('watchQueue: a live record\'s head is the one watched; a worktree at another head still sees a removal / confirmed dequeue of the entry (#230)', async () => {
+  const OTHER = 'd'.repeat(40);
+  const c = clock();
+  const removedRoot = repoDir();
+  beginAttempt(removedRoot, 7, HEAD, APPROVAL, IDENT);
+  confirmAttempt(removedRoot, 7, 'MQE_1');
+  const gone = stubGh({ states: [inQ(), st()], events: [[added(), removed(REASON_GROUP_CHECKS)]] });
+  const r = await watchQueue({ gh: gone, root: removedRoot, pr: 7, head: OTHER, budgetMs: 3_600_000, blockers: noBlockers, now: c.now, sleep: c.sleep });
+  assert.equal(r.state, 'removed', 'not head-moved');
+  assert.equal(r.removal.reason, REASON_GROUP_CHECKS);
+  assert.equal(readQueueRecord(removedRoot, 7).removals.length, 1);
+  assert.equal(mayRequeue(readQueueRecord(removedRoot, 7), OTHER, REASON_GROUP_CHECKS), false, 'the record is not re-queued for the other head');
+
+  const stoppedRoot = repoDir();
+  beginAttempt(stoppedRoot, 7, HEAD, APPROVAL, IDENT);
+  confirmAttempt(stoppedRoot, 7, 'MQE_1');
+  const stopped = stubGh({
+    states: [inQ(), inQ(), st()], events: [[added(), removed(REASON_MANUAL, '08:20:00', null)]],
+    views: [{ state: 'OPEN', labels: [], mergeCommit: null }, { state: 'OPEN', labels: [{ name: 'needs-human' }], mergeCommit: null }],
+  });
+  const b = await watchQueue({ gh: stopped, root: stoppedRoot, pr: 7, head: OTHER, budgetMs: 3_600_000, now: c.now, sleep: c.sleep });
+  assert.equal(b.state, 'blocked', 'not head-moved');
+  assert.equal(b.dequeued, true);
+  assert.equal(readQueueRecord(stoppedRoot, 7).terminal, 'blocked');
+
+  // No live record (or one that ended): the head the caller names is the one compared, as before.
+  const bare = repoDir();
+  const moved = stubGh({ states: [st()] });
+  assert.equal((await watchQueue({ gh: moved, root: bare, pr: 7, head: OTHER, budgetMs: 3_600_000, blockers: noBlockers, now: c.now, sleep: c.sleep })).state, 'head-moved');
 });
 
 test('watchQueue: needs-human added while queued => dequeue called, blocked', async () => {
@@ -535,4 +603,23 @@ test('R1-F1 reconcile: queued at the recorded head while the local worktree is e
   // not queued, or queued at some head the record does not know: still head-moved
   assert.deepEqual(await reconcile({ gh: stubGh({ states: [st()] }), root, pr: 7, head: other }), { kind: 'head-moved', head: HEAD });
   assert.deepEqual(await reconcile({ gh: stubGh({ states: [{ ...inQ(), head: 'f'.repeat(40) }] }), root, pr: 7, head: other }), { kind: 'head-moved', head: 'f'.repeat(40) });
+});
+
+// ---- review round 2 ---------------------------------------------------------------------------------------------------------------------
+
+// R2-F4: a live record for the head keeps what it was opened with, except that the owner's word becomes required when a later enqueue of the same head stands on it
+// (a first enqueue that never landed, then the run was taken over and the owner said "merge"). It is only ever upgraded: a later ordinary call never lowers it.
+test('R2-F4: openRecord upgrades a live record\'s approval.ownerRequired to true and never downgrades it', () => {
+  const root = repoDir();
+  const first = openRecord(root, 7, HEAD, APPROVAL, IDENT);
+  assert.notEqual(first.approval.ownerRequired, true);
+  const upgraded = openRecord(root, 7, HEAD, { ...APPROVAL, ownerRequired: true }, IDENT);
+  assert.equal(upgraded.approval.ownerRequired, true);
+  assert.equal(readQueueRecord(root, 7).approval.ownerRequired, true, 'written to disk');
+  assert.equal(upgraded.createdAt, first.createdAt, 'the same record, not a new one');
+  for (const approval of [APPROVAL, { ...APPROVAL, ownerRequired: false }, undefined]) {
+    openRecord(root, 7, HEAD, approval, IDENT);
+    assert.equal(readQueueRecord(root, 7).approval.ownerRequired, true, 'never downgraded');
+  }
+  assert.equal(beginAttempt(root, 7, HEAD, { ...APPROVAL, ownerRequired: false }, IDENT).approval.ownerRequired, true, 'nor by beginAttempt');
 });

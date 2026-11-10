@@ -12,9 +12,11 @@ import { fileURLToPath } from 'node:url';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { BASE_SHA, MERGE_SHA, PR, bump, cli, scenario, ymlFor } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { holdFiles, holdYml, holdCalls } from './helpers/merge-hold-env.mjs';
-import { beginAttempt, endRecord, noteRemoval, readQueueRecord } from '../pipeline/lib/merge-queue.mjs';
+import { beginAttempt, confirmAttempt, endRecord, noteRemoval, readQueueRecord } from '../pipeline/lib/merge-queue.mjs';
 import { preMergeProblems } from '../pipeline/lib/finalgate.mjs';
+import { gateFreshSince, recheckGated } from '../pipeline/lib/queue-route.mjs';
 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-queue.mjs');
 const QUEUE_COMMIT = 'b'.repeat(40);
@@ -120,6 +122,16 @@ test('queue on, behind base, green: enqueued (pinned to the approved head), merg
   assert.equal(rec.head, s.head);
 });
 
+test('#229: the record carries the route that opened it (gated / owner-go), for the sweep\'s recheck', (t) => {
+  const gated = world({ after: [[Q(), M()]] });
+  assertExit(gated.run(), 0);
+  assert.equal(gated.record().route, 'gated');
+  const ownerGo = world({ route: 'owner-go', command: 'default', after: [[Q(), M()]] });
+  approve(t, ownerGo);
+  assertExit(ownerGo.run(), 0);
+  assert.equal(ownerGo.record().route, 'owner-go');
+});
+
 test('queue on, head moved since approval (--owner-go): head-moved, nothing enqueued', (t) => {
   const s = world({ route: 'owner-go' });
   approve(t, s);
@@ -145,6 +157,34 @@ test('removed once (group checks): the same head is re-queued once, then merged;
   assert.equal(rec.removals.length, 1);
   assert.equal(rec.terminal, 'merged');
   never(s, /--disable-auto/, 'auto-merge is never touched');
+});
+
+// #230: a resumed watch from a worktree at another head than the live entry's. While the entry lives it is simply queued; when it leaves, the
+// removal belongs on the record (with its reason), not under a "head-moved" that says nothing was queued.
+test('resumed watch at another head (--owner-go): the live entry\'s removal is noted on the record, not head-moved; no re-queue from that worktree (#230)', (t) => {
+  const OLD = 'd'.repeat(40);
+  const setup = (phases) => {
+    const s = world({ route: 'owner-go', command: 'default', after: [] });
+    approve(t, s);
+    const approval = { items: 'none', areas: [], rulings: null };
+    beginAttempt(s.repo.dir, PR, OLD, approval, { repo: 'acme/widgets', repoId: 4242 });
+    confirmAttempt(s.repo.dir, PR, 'MQE_1');
+    s.q.show(...phases);
+    return s;
+  };
+  const entryAtOld = () => reply(queuedNode(OLD), [added()]);
+
+  const removedOut = setup([[entryAtOld, entryAtOld, () => reply(node(OLD), [added(), removed('failed_checks')])]]);
+  const r = removedOut.run();
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'queue-removed');
+  assert.equal(r.json.removal.reason, 'failed_checks');
+  assert.deepEqual(r.json.removal.failing, ['ci: failure']);
+  assert.equal(removedOut.enqueueCalls().length, 0, 'a worktree at another head never re-queues');
+  const rec = removedOut.record();
+  assert.equal(rec.head, OLD);
+  assert.equal(rec.removals.length, 1, 'the removal is on the record');
+  assert.equal(rec.terminal, 'removed');
 });
 
 test('removed twice: queue-removed naming the failing check; no third enqueue', () => {
@@ -354,4 +394,142 @@ test('preMergeProblems: queueMode ignores a moved base, a moved head still refus
   const direct = await preMergeProblems({ gh: gh(HEAD, BASE_SHA), pr: PR, head: HEAD, base: '2'.repeat(40) });
   assert.equal(direct.length, 1);
   assert.match(direct[0], /PR base is now/);
+});
+
+// ---- #228: the gated route's fresh decision after a terminal record ------------------------------------------------------------------
+
+// A record for the current head that ended at `terminalAtMs` after two group-check removals.
+const endedRecord = (s, terminalAtMs) => {
+  const approval = { items: 'none', areas: [], rulings: null };
+  beginAttempt(s.repo.dir, PR, s.head, approval, { repo: 'acme/widgets', repoId: 4242, now: () => terminalAtMs - 5000, route: 'gated' });
+  noteRemoval(s.repo.dir, PR, { reason: 'failed_checks', beforeCommit: QUEUE_COMMIT, at: STAMP });
+  noteRemoval(s.repo.dir, PR, { reason: 'failed_checks', beforeCommit: QUEUE_COMMIT_2, at: STAMP });
+  endRecord(s.repo.dir, PR, 'removed', { now: () => terminalAtMs });
+};
+
+test('gated route, record for head H ended: a final-gate run that passed BEFORE it ended is refused; one that passed AFTER re-queues H with a new budget (#228)', () => {
+  const stale = world({ after: [[Q(), M()]] });
+  endedRecord(stale, Date.now() + 3_600_000); // the record ended AFTER the gate on file was written
+  const refused = stale.run();
+  assertExit(refused, 1);
+  assert.equal(refused.json.error, 'queue-removed');
+  assert.match(refused.json.reasons[0], /run `P final-gate` again/);
+  assert.equal(refused.json.recordTerminal, 'removed');
+  assert.equal(stale.enqueueCalls().length, 0);
+  assert.equal(stale.record().terminal, 'removed');
+
+  const fresh = world({ after: [[Q(), M()]] });
+  endedRecord(fresh, Date.now() - 60_000); // the gate on file was written after the record ended
+  const r = fresh.run();
+  assertExit(r, 0);
+  assert.equal(r.json.merged, true);
+  assert.equal(fresh.enqueueCalls().length, 1);
+  const rec = fresh.record();
+  assert.equal(rec.attempts, 1, 'a new record with a new budget');
+  assert.equal(rec.removals.length, 0);
+  assert.equal(rec.route, 'gated');
+  assert.equal(rec.terminal, 'merged');
+});
+
+test('gateFreshSince: a passing gate with no owner items, written after the record ended, is a fresh decision; anything else is not (#228)', () => {
+  const since = Date.parse('2026-11-09T10:00:00Z');
+  const gate = (over = {}) => ({ ok: true, ownerMerge: 0, at: '2026-11-09T10:00:01Z', ...over });
+  assert.equal(gateFreshSince(gate(), since), true);
+  assert.equal(gateFreshSince(gate({ ownerMerge: undefined }), since), true);
+  assert.equal(gateFreshSince(gate({ at: '2026-11-09T10:00:00Z' }), since), false, 'not newer than the end');
+  assert.equal(gateFreshSince(gate({ at: '2026-11-09T09:00:00Z' }), since), false);
+  assert.equal(gateFreshSince(gate({ at: 'not a time' }), since), false);
+  assert.equal(gateFreshSince(gate({ ok: false }), since), false);
+  assert.equal(gateFreshSince(gate({ ownerMerge: 2 }), since), false, 'items for the owner need the owner\'s fresh word, not a gate run');
+  assert.equal(gateFreshSince(gate(), Infinity), false, 'an end time that cannot be read never lets a gate through');
+  assert.equal(gateFreshSince(null, since), false);
+});
+
+// ---- review round 1 ---------------------------------------------------------------------------------------------------------------------
+
+// R1-B1: recheckGated (P merge's own watch and the sweep) refuses whenever the live owner-item digest is not the one the gate was written with,
+// whether or not the owner's word is in play: the owner approved (or was shown) THAT set.
+test('recheckGated: the live owner-item digest differing from the gate\'s refuses, with the same head and patch (R1-B1)', async () => {
+  const gate = { head: 'a'.repeat(40), contentHash: 'h1', ownerItems: 'abc123', ownerMerge: 0 };
+  const live = (over = {}) => ({ head: gate.head, contentHash: 'h1', ownerItems: 'abc123', checks: [{ name: 'ci', ok: true }], ...over });
+  const ask = (fresh, ownerApproved) => recheckGated({
+    root: '/x', config: {}, pr: PR, gh: { repo: () => ({ slug: 'acme/widgets' }) }, env: {}, gate, ownerApproved, ownerMergeReason: 'owner first',
+    evaluate: async () => fresh, problemsOf: async () => [],
+  });
+  assert.deepEqual(await ask(live(), false), { ok: true }, 'the same set re-queues');
+  for (const ownerApproved of [false, true]) {
+    const r = await ask(live({ ownerItems: 'def456' }), ownerApproved);
+    assert.equal(r.ok, false, `ownerApproved ${ownerApproved}`);
+    assert.equal(r.error, 'pre-merge');
+    assert.match(r.reasons[0], /owner items changed/);
+    assert.match(r.reasons[0], /def456/);
+  }
+});
+
+// R1-F1: a fresh final-gate run revives an ended head only where the owner's word is NOT required. A resumed run (or an unchecked run record,
+// or items for the owner) needs a "merge" newer than the record's end, whatever the gate's age.
+test('gated route, resumed run, record for head H ended: a final-gate run after the end does not revive the owner\'s OLD "merge"; a newer word does (R1-F1)', (t) => {
+  const resumedRecord = {
+    v: 1, repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main', step: 'gate', outcome: null, next: '', detail: '', head: null,
+    request: '', tasks: [], verify: null, round: 0, mergeSha: null, inFlight: null, heartbeat: null, agentLogLine: null, cliVersion: null, history: [],
+    resumed: { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: 'a'.repeat(40) },
+  };
+  let body = '';
+  writeSummaryComment({ viewer: () => 'me', listComments: () => [], upsertComment: (n, m, b) => { body = b; return { id: 77, url: 'u', action: 'created' }; } }, PR, { record: resumedRecord });
+  const resumedWorld = () => world({
+    after: [[Q(), M()]],
+    gh: { comments: [{ id: 77, user: { login: 'me' }, body }], extra: [{ match: '-X PATCH repos/acme/widgets/issues/comments/77', stdoutJson: { id: 77, html_url: 'u' } }] },
+  });
+  const mergeFlags = (s) => cli(['merge', '--pr', String(PR), '--owner-approved-head', s.head, '--owner-approved-items', 'none'], { dir: s.repo.dir, fake: s.fake, env: s.env });
+
+  const stale = resumedWorld();
+  approve(t, stale); // the owner's word (T1) ...
+  endedRecord(stale, Date.now()); // ... the record ended (T2) ...
+  assertExit(stale.gate(), 0); // ... and the agent re-ran the final gate (T3): passing, no items for the owner
+  const refused = mergeFlags(stale);
+  assertExit(refused, 1);
+  assert.equal(refused.json.error, 'queue-removed');
+  assert.match(refused.json.reasons[0], /already left the merge queue/);
+  // (R2-F3: the advice must not send a resumed run back to the final gate, which cannot re-queue it)
+  assert.match(refused.json.reasons[0], /resumed run/);
+  assert.match(refused.json.reasons[0], /the owner must say "merge" again for this exact head/);
+  assert.doesNotMatch(refused.json.reasons[0], /run `P final-gate` again/);
+  assert.equal(stale.enqueueCalls().length, 0);
+  assert.equal(stale.record().terminal, 'removed');
+
+  const fresh = resumedWorld();
+  endedRecord(fresh, Date.now() - 1000);
+  approve(t, fresh); // a word newer than the record's end
+  assertExit(fresh.gate(), 0);
+  const r = mergeFlags(fresh);
+  assertExit(r, 0);
+  assert.equal(r.json.merged, true);
+  assert.equal(fresh.enqueueCalls().length, 1);
+  assert.equal(fresh.record().attempts, 1, 'a new record with a new budget');
+  assert.equal(fresh.record().approval.ownerRequired, true, 'the record keeps that the enqueue stood on the owner\'s word (the sweep re-checks it: R1-F2)');
+});
+
+test('gated route, ordinary run: the record says the owner\'s word was not required (R1-F2)', () => {
+  const s = world({ after: [[Q(), M()]] });
+  assertExit(s.run(), 0);
+  assert.notEqual(s.record().approval.ownerRequired, true);
+});
+
+// ---- review round 2 ---------------------------------------------------------------------------------------------------------------------
+
+// R2-F1: a watch-only resume (`P merge` again, no approval flags, while the entry is queued) re-checks a group-check removal with the same rule as the sweep:
+// a record whose enqueue stood on the owner's word is re-queued only while that word is on record.
+test('R2-F1: a watch-only resume of a record that stood on the owner\'s word does not re-queue when that word is not on record', () => {
+  const first = [added(), removed('failed_checks')];
+  const s = world({ after: [[Q(), Q(), Q(), OUT(first)], [Q(1, [...first, added()]), M()]] });
+  const approval = { items: 'none', areas: [], rulings: null, ownerRequired: true };
+  beginAttempt(s.repo.dir, PR, s.head, approval, { repo: 'acme/widgets', repoId: 4242, route: 'gated' });
+  confirmAttempt(s.repo.dir, PR, 'MQE_1');
+  s.q.set({ phase: 1 }); // the entry is already queued and leaves in the watch
+  const r = s.run(); // (no --owner-approved-head: nothing proves the word)
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'queue-removed');
+  assert.match(r.json.reasons.join(' '), /not re-queued: .*no longer on record/);
+  assert.equal(s.enqueueCalls().length, 0, 'no second enqueue');
+  assert.equal(s.record().terminal, 'removed');
 });

@@ -79,6 +79,7 @@ export const REQUEUE_REASONS = Object.freeze(new Set([REASON_GROUP_CHECKS]));
 
 const TERMINALS = new Set(['merged', 'removed', 'blocked', 'closed', 'head-moved']);
 const HOLD_OWNERS = new Set(['session', 'pending', 'entry']);
+export const ROUTES = new Set(['owner-go', 'gated']);
 
 export class QueueRecordUnreadable extends Error {
   constructor(message) {
@@ -183,23 +184,44 @@ export function recordIsFor(rec, { repo, repoId = null, moves } = {}) {
 
 // Starts a record for `head`, or returns the live one for that head. A different head, or a record that already ended, starts over
 // (a fresh owner "merge" is a fresh budget). Nothing is queued yet: `attempts` stays 0 until beginAttempt.
-export function openRecord(root, pr, head, approval, { repo = null, repoId = null, now = Date.now } = {}) {
+// `route` ('owner-go' | 'gated') is the merge route that opened the record: the sweep re-checks a re-queue with that route's own recheck (#229).
+// A record without one (written before this field) is read as owner-go by the sweep, which fails closed.
+// `approval.ownerRequired`: the first enqueue stood on the owner's word (gated route: a resumed run, an unchecked run record, items for the owner); the sweep re-queues
+// such a record only while that word is still on record (R1-F2). The field is only written when true; a record without it (written before, or for an enqueue that needed no word) keeps the sweep's earlier behaviour.
+export function openRecord(root, pr, head, approval, { repo = null, repoId = null, now = Date.now, route = null } = {}) {
   const old = readQueueRecord(root, pr);
-  if (old !== null && old.terminal === null && old.head === head) return old;
+  if (old !== null && old.terminal === null && old.head === head) {
+    // (a live record is kept, but an enqueue that stands on the owner's word upgrades it, and nothing lowers it: R2-F4)
+    return approval?.ownerRequired === true && old.approval?.ownerRequired !== true ? writeRecord(root, { ...old, approval: { ...old.approval, ownerRequired: true } }) : old;
+  }
   return writeRecord(root, {
     pr: Number(pr), repo, repoId, root, head,
-    approval: { items: approval?.items ?? null, areas: approval?.areas ?? null, rulings: approval?.rulings ?? null },
-    createdAt: isoOf(now), attempts: 0, pending: null, entryIds: [], removals: [], hold: null, terminal: null, terminalAt: null,
+    approval: { items: approval?.items ?? null, areas: approval?.areas ?? null, rulings: approval?.rulings ?? null, ...(approval?.ownerRequired === true ? { ownerRequired: true } : {}) },
+    route: ROUTES.has(route) ? route : null, createdAt: isoOf(now), attempts: 0, pending: null, entryIds: [], removals: [], hold: null, terminal: null, terminalAt: null,
   });
 }
 
-// Written BEFORE the enqueue mutation, so a crash between the mutation and the confirm still counts the attempt.
+// How many `added` events GitHub's timeline of the PR already shows: the anchor reconcile uses to tell this attempt's events from older ones
+// by timeline order, never by comparing this machine's clock with GitHub's (#227). null when the timeline cannot be read (or no `gh` was given).
+function addedEventsSeen(gh, pr) {
+  try {
+    if (typeof gh?.queueEvents !== 'function') return null;
+    const events = gh.queueEvents(pr);
+    return Array.isArray(events) ? events.filter((e) => e?.type === 'added').length : null;
+  } catch {
+    return null;
+  }
+}
+
+// Written BEFORE the enqueue mutation, so a crash between the mutation and the confirm still counts the attempt. With `opts.gh` the pending
+// attempt carries `addedSeen` (the anchor above); without it (an unreadable timeline) reconcile falls back to the wall-clock reading.
 export function beginAttempt(root, pr, head, approval, opts = {}) {
   const now = opts.now ?? Date.now;
   openRecord(root, pr, head, approval, opts);
+  const addedSeen = addedEventsSeen(opts.gh, pr);
   return mutate(root, pr, (rec) => {
     rec.attempts += 1;
-    rec.pending = { head, at: isoOf(now) };
+    rec.pending = { head, at: isoOf(now), ...(addedSeen === null ? {} : { addedSeen }) };
     if (rec.hold) rec.hold.owner = 'pending';
   });
 }
@@ -250,8 +272,9 @@ export function mayRequeue(rec, head, reason) {
 
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FULL_SHA = /^[0-9a-f]{40}$/;
-// A removal belongs to a PENDING attempt only if its enqueue happened after the attempt began (allowing for clock difference with GitHub).
-const CLOCK_SLACK_MS = 60_000;
+// Only for a pending attempt written before the `addedSeen` anchor existed (or one whose timeline could not be read when it began): its events
+// are attributed by time, allowing for the clock difference with GitHub. Any newer attempt is attributed by timeline order alone (#227).
+const LEGACY_CLOCK_SLACK_MS = 60_000;
 
 // Where does GitHub say the PR is, compared with what the record expects?
 //   merged / queued / removed / not-queued / head-moved / closed
@@ -262,6 +285,13 @@ export async function reconcile({ gh, root, pr, head, sleep = defaultSleep, poll
   const r = reconcileNow({ gh, root, pr, head, log });
   if (r.kind !== 'merged' || r.lookup === undefined) return r;
   return { kind: 'merged', mergeSha: await readMergeSha({ gh, pr, first: r.lookup.first, sleep, pollMs }) };
+}
+
+// Is the latest `added` event (index `lastAdded`, -1 = none) the pending attempt's enqueue? With the anchor: an `added` event came after the
+// ones the timeline showed when the attempt began. Without it (back-compat): the event is not older than the attempt, within the legacy slack.
+function attemptOwns(pending, events, lastAdded) {
+  if (Number.isInteger(pending.addedSeen)) return events.filter((e) => e.type === 'added').length > pending.addedSeen;
+  return Date.parse(events[lastAdded]?.at) >= Date.parse(pending.at) - LEGACY_CLOCK_SLACK_MS;
 }
 
 // reconcile's decision without any waiting, so a signal handler (which cannot await) can use it too. A merged answer whose merge commit
@@ -282,7 +312,7 @@ export function reconcileNow({ gh, root, pr, head, log = () => {} }) {
   const lastAdded = events.map((e) => e.type).lastIndexOf('added');
   const after = lastAdded === -1 ? [] : events.slice(lastAdded + 1);
   const mergedAt = after.find((e) => e.type === 'merged' || (e.type === 'removed' && e.reason === REASON_MERGED));
-  const ours = rec?.pending ? Date.parse(events[lastAdded]?.at) >= Date.parse(rec.pending.at) - CLOCK_SLACK_MS : true;
+  const ours = rec?.pending ? attemptOwns(rec.pending, events, lastAdded) : true;
   if (mergedAt && ours) {
     return mergedAt.beforeCommit && FULL_SHA.test(mergedAt.beforeCommit) ? { kind: 'merged', mergeSha: mergedAt.beforeCommit } : { kind: 'merged', lookup: { first: null } };
   }
@@ -312,9 +342,16 @@ const CONFIRM_TRIES = 6; // after a dequeue: look this many times (pollMs apart,
 // is simply retried on the next tick. Running out of budget is `still-queued` and touches nothing: no dequeue, no hold restore.
 // Ends the record only where nothing else is owed: merged, or blocked when no lifted label is left to restore. A removal is noted on the
 // record (once); what to do about it (re-queue, restore) stays with the caller.
+// The head compared with GitHub's is the LIVE record's head when there is one, else `head` (#230): a watch resumed from a worktree at another commit
+// than the one queued still sees the entry's removal or its confirmed dequeue and notes it on the record, instead of ending as `head-moved`. Nothing
+// is ever re-queued from the other head: mayRequeue compares the record's head with the caller's.
 export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000, blockers = null, now = Date.now, sleep = defaultSleep, log = () => {} }) {
   const check = blockers ?? waitBlockers(gh, { base: null });
   const deadline = now() + budgetMs;
+  const watched = () => {
+    const rec = root === undefined ? null : readQueueRecord(root, pr);
+    return rec !== null && rec.terminal === null ? rec.head : head;
+  };
   let position = null;
   for (;;) {
     let outcome = null;
@@ -331,7 +368,7 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
 
   // -> null (keep watching) or a result for finish()
   async function pollOnce() {
-    const r = await reconcile({ gh, root, pr, head, sleep, pollMs: Math.min(pollMs, 2000), log });
+    const r = await reconcile({ gh, root, pr, head: watched(), sleep, pollMs: Math.min(pollMs, 2000), log });
     if (r.kind === 'merged') return { state: 'merged', mergeSha: r.mergeSha };
     if (r.kind === 'closed') return { state: 'closed' };
     if (r.kind === 'head-moved') return { state: 'head-moved' };
@@ -353,7 +390,7 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
     for (let i = 0; i < CONFIRM_TRIES; i += 1) {
       let r;
       try {
-        r = await reconcile({ gh, root, pr, head, sleep, pollMs: Math.min(pollMs, 2000), log });
+        r = await reconcile({ gh, root, pr, head: watched(), sleep, pollMs: Math.min(pollMs, 2000), log });
       } catch {
         r = { kind: 'queued' }; // cannot tell: treat as still there and look again
       }
@@ -650,9 +687,9 @@ export async function recoverQueuedLift({ gh, root, pr, orphan, lift, now = Date
   try {
     const repo = gh.repo().slug;
     const repoId = typeof gh.repoId === 'function' ? gh.repoId() : null;
-    openRecord(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now });
+    openRecord(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now, route: 'owner-go' });
     setHold(root, pr, { id: orphan.hold, login: lift.login ?? null, at: lift.at ?? null, holdBlock: lift.login && lift.at ? holdDigest({ id: orphan.hold, login: lift.login, at: lift.at }) : null, liftedAt: isoOf(now) });
-    beginAttempt(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now });
+    beginAttempt(root, pr, head, { items: lift.items ?? null, areas: null, rulings: null }, { repo, repoId, now, gh });
     confirmAttempt(root, pr, r.entry.id);
   } catch (err) {
     return unreadable('the merge-queue record could not be written', err);

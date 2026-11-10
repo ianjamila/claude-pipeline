@@ -6,7 +6,7 @@
 // Nothing here ever disables auto-merge or dequeues for a time-out: `still-queued` leaves the entry exactly as it is.
 import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
-import { evaluateOwnerGo, preMergeProblems, waitBlockers } from './finalgate.mjs';
+import { GATE_FILE, GATE_MAX_AGE_MS, PR_FIELDS, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, preMergeProblems, readReviewJson, waitBlockers } from './finalgate.mjs';
 import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
 import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
 import { RESTORE_NOTE } from './hold.mjs';
@@ -44,6 +44,16 @@ export function approvalGapSince(q, since, gap = approvalGap) {
   return gap({ ...q, maxAgeMs: age });
 }
 
+// The gated route's fresh decision after a record of the same head ended (#228, mirroring approvalGapSince for the owner-go route): the gate file
+// (rewritten by every `P final-gate` run: the old file is removed first and the new one carries its own `at`) is a passing gate written after the
+// record ended, and it left no items for the owner. Items for the owner need the owner's fresh word instead (approvalGapSince). The caller has
+// already checked the gate against the PR, head, patch and age (gateRefusals); `since` is the record's end (Infinity when it cannot be read).
+export function gateFreshSince(gate, since) {
+  if (gate === null || typeof gate !== 'object' || gate.ok !== true || Number(gate.ownerMerge) > 0) return false;
+  const at = Date.parse(gate.at);
+  return Number.isFinite(at) && Number.isFinite(since) && at > since;
+}
+
 // Before a re-queue on the --owner-go route: the live scan again, the owner's approval for what it found, and the blockers. Shared by `P merge` (its own watch)
 // and the queue sweep (an unattended re-queue), so both judge a re-queue exactly as the first enqueue was judged. `hold` = the lifted hold binding the record owns.
 export async function recheckOwnerGo({ root, config, pr, gh, env, head, repo, hold }) {
@@ -54,6 +64,56 @@ export async function recheckOwnerGo({ root, config, pr, gh, env, head, repo, ho
   if (gap !== 'ok') return { ok: false, error: 'owner-go', reasons: ['the owner\'s "merge" for this head and scan is no longer on record (it is valid for 24 hours): ask again'] };
   const problems = await preMergeProblems({ gh, pr, head, queueMode: true });
   return problems.length > 0 ? { ok: false, error: 'blocked', reasons: problems } : { ok: true };
+}
+
+// Before a re-queue on the GATED route: the live gate again for the SAME head and patch the final gate approved, the owner's word where the gate left items
+// for the owner, and the blockers. `P merge` (its own watch) calls it with the gate it holds; the queue sweep through recheckGatedRecorded below.
+// `evaluate` / `problemsOf` are test seams.
+export async function recheckGated({ root, config, pr, gh, env, gate, ownerApproved, ownerMergeReason, evaluate = evaluateGate, problemsOf = preMergeProblems }) {
+  const fresh = await evaluate({ root, config, pr, gh, env, queueMode: true });
+  const failed = fresh.checks.filter((c) => !c.ok);
+  if (failed.length > 0) return { ok: false, error: 'live-check', reasons: failed.map((c) => `${c.name}: ${c.detail}`) };
+  if (fresh.head !== gate.head || fresh.contentHash !== gate.contentHash) return { ok: false, error: 'live-check', reasons: ['the live gate is for a different head or patch than final-gate.json approved'] };
+  // (an item added, dismissed or swapped since the gate ran, same head and patch: the owner was never shown that set. Unconditional, so it binds the sweep and P merge's own watch alike; R1-B1)
+  if (fresh.ownerItems !== gate.ownerItems) return { ok: false, error: 'pre-merge', reasons: [`the owner items changed since the final gate (now ${fresh.ownerItems}, gate ${gate.ownerItems}): run the final gate again${ownerApproved ? ' and show them to the owner' : ''}`] };
+  if (Number(fresh.ownerMerge) > 0 && !ownerApproved) return { ok: false, error: 'pre-merge', reasons: [ownerMergeReason] };
+  if (ownerApproved && approvalGap({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null, rulings: null }) !== 'ok') {
+    return { ok: false, error: 'pre-merge', reasons: ['the owner\'s "merge" for this head is no longer on record (it is valid for 24 hours): ask again'] };
+  }
+  const problems = await problemsOf({ gh, pr, head: gate.head, queueMode: true });
+  return problems.length > 0 ? { ok: false, error: 'blocked', reasons: problems } : { ok: true };
+}
+
+// The sweep's gated recheck (#229): no `P merge` process holds the gate, so it is read from the recorded worktree. It must still be a passing gate
+// for the recorded head and not older than a gate may be; otherwise nothing is re-queued (the owner re-runs the final gate and `P merge`).
+// The owner's word counts when the gate named owner items and a "merge" for exactly this head and item set is on record.
+// The file is then bound exactly as `P merge` binds it (gateRefusals: repo, canonical check list, PR head, patch hash, age, a future date), so the two cannot drift (R1-F3).
+// `localHash` is a test seam.
+export async function recheckGatedRecorded({ root, config, pr, gh, env, head, repo, rec, now = Date.now, localHash = localContentHash, ...seams }) {
+  const gate = readReviewJson(root, GATE_FILE);
+  const stop = (why) => ({ ok: false, error: 'live-check', reasons: [`${why}: run the final gate again`] });
+  if (gate === null) return stop('the gate file is gone');
+  if (gate.ok !== true || gate.head !== head || gate.pr !== pr) return stop('the gate file is not a passing gate for this PR and head');
+  const at = Date.parse(gate.at);
+  if (!Number.isFinite(at) || now() - at > GATE_MAX_AGE_MS) return stop('the gate file is too old');
+  // (a failed read throws, as evaluateGate's does a call later: the sweep leaves the record live for the next pass. A refusal would end it and spend the owner's word on a GitHub blip: R2-F2)
+  const prHead = gh.prView(pr, [...PR_FIELDS]).headRefOid;
+  let hash = '';
+  try {
+    hash = localHash(root, config);
+  } catch { /* gateRefusals reports the mismatch */ }
+  const refusals = gateRefusals({ gate, pr, head, prHead, hash, repo, now: now() });
+  if (refusals.length > 0) return { ok: false, error: 'live-check', reasons: refusals.map((why) => `${why}: run the final gate again`) };
+  const ownerApproved = typeof gate.ownerItems === 'string' && approvalGap({ repo, pr, head, items: gate.ownerItems, areas: null, hold: null, rulings: null }) === 'ok';
+  // The first enqueue stood on the owner's word even though the gate itself shows no owner items (a resumed run, an unchecked run record): the word must still be on record.
+  // (`ownerRequired` is absent on records written before the field, which keep the earlier behaviour: the word counts only where the live gate has owner items.)
+  if (rec?.approval?.ownerRequired === true && !ownerApproved) {
+    return { ok: false, error: 'pre-merge', reasons: ['the owner\'s "merge" for this head is no longer on record (it is valid for 24 hours; the enqueue stood on it): ask the owner again'] };
+  }
+  return recheckGated({
+    root, config, pr, gh, env, gate, ownerApproved, ...seams,
+    ownerMergeReason: `the final gate left items for the owner (owner_approval: chat) and no "merge" for this head and item set is on record${rec?.approval?.items ? ` (items ${rec.approval.items})` : ''}: ask the owner again`,
+  });
 }
 
 // The onTerminal seam that puts a lifted needs-human hold back (once) at an unmerged end; a failed restore keeps the record open for the next settle.
@@ -71,20 +131,21 @@ const firstLine = (err) => String(err?.message ?? err).split('\n')[0];
 export { failingChecksOn };
 
 // Everything the engine needs from the route that calls it:
-//   gh, root, config, pr, head (the approved full sha), env, refuse (merge.mjs's), track (the merge lock's child tracker),
+//   gh, root, config, pr, head (the approved full sha), route ('gated' | 'owner-go': stored on the record; the sweep re-checks with that route's recheck),
+//   env, refuse (merge.mjs's), track (the merge lock's child tracker),
 //   approval { items, areas, rulings } (stored on the record), extra (fields every output carries: mode, head, ...),
 //   recheck(): the route's live checks + owner approval + blockers for the SAME head, run before a re-queue -> { ok: true } | { ok: false, error, reasons },
 //   onBeforeAttempt({ rec }) / onTerminal({ kind, rec }): the two SEAMS for the needs-human hold (no-ops by default; merge.mjs wires them). onBeforeAttempt writes the
 //   lifted hold to the record before every attempt; onTerminal runs at an unmerged end (removed / blocked / closed / head-moved) BEFORE the record ends and may return
 //   { fields, keepOpen }: `fields` join the refusal (holdRestored ...), `keepOpen` leaves the record live (the label could not be put back: the next settle retries).
 export function createQueueRoute({
-  gh, root, config, pr, head, env = process.env, refuse, track = { started() {}, ended() {} }, approval, extra = {}, recheck,
+  gh, root, config, pr, head, route = null, env = process.env, refuse, track = { started() {}, ended() {} }, approval, extra = {}, recheck,
   onBeforeAttempt = async () => {}, onTerminal = async () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = () => {},
 }) {
   const timing = queueTiming(env);
   const repo = gh.repo().slug;
   const repoId = typeof gh.repoId === 'function' ? gh.repoId() : null;
-  const opts = { repo, repoId, now };
+  const opts = { repo, repoId, now, gh, route }; // (gh: beginAttempt anchors the pending attempt to GitHub's timeline)
   let requeued = 0;
   let rules = null;
   try {
@@ -150,7 +211,12 @@ export function createQueueRoute({
       return {
         enqueue: true,
         since: Number.isFinite(since) ? since : Infinity,
-        staleTerminal: () => refusal('queue-removed', [`PR #${pr} at ${head.slice(0, 12)} already left the merge queue (${last?.reason ?? rec.terminal}) and its queue record ended: the owner must say "merge" again for this exact head (a fresh word re-queues it with a new one-retry budget)`], {
+        // `wordWhy`: why only the owner's fresh "merge" re-queues it (a resumed run, a run record that cannot be checked, items for the owner); a final-gate run alone cannot (R2-F3)
+        staleTerminal: (wordWhy = null) => refusal('queue-removed', [`PR #${pr} at ${head.slice(0, 12)} already left the merge queue (${last?.reason ?? rec.terminal}) and its queue record ended: ${wordWhy
+          ? `${wordWhy}, so the owner must say "merge" again for this exact head (a new final-gate run alone does not re-queue it; a fresh word re-queues it with a new one-retry budget)`
+          : route === 'gated'
+          ? 'run `P final-gate` again for this exact head (a gate that passes after the record ended re-queues it with a new one-retry budget; where the gate left items for the owner, the owner must say "merge" again)'
+          : 'the owner must say "merge" again for this exact head (a fresh word re-queues it with a new one-retry budget)'}`], {
           removal: last, recordTerminal: rec.terminal,
         }),
       };
@@ -248,7 +314,8 @@ export function createQueueRoute({
               requeued = 1;
               continue;
             }
-            return await removedRefusal(w.removal);
+            // (a watch resumed from a worktree at another head than the queued one follows the record's head and is never re-queued from here: #230)
+            return await removedRefusal(w.removal, rec !== null && rec.head !== head ? `not re-queued: this worktree is at ${head.slice(0, 12)}, the queued head was ${rec.head.slice(0, 12)}` : undefined);
           }
           default: return refusal('queue-unreadable', [`unexpected queue watch result ${JSON.stringify(w.state)}`], { queued: null });
         }
