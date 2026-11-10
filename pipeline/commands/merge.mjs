@@ -168,9 +168,7 @@ export const run = guarded(async (argv, ctx) => {
       });
       pre = await route.precheck();
       if (pre.done) return pre.done;
-      // (the record of this head already ended: the same head re-queues only on a fresh decision newer than that end: the owner's word, or, where the gate left
-      // no items for the owner, a final-gate run that passed after it. Either starts a new record with a new one-retry budget.)
-      if (pre.since !== undefined && approvalGapSince({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null, rulings: null }, pre.since) !== 'ok' && !gateFreshSince(gate, pre.since)) return pre.staleTerminal();
+      // (the record of this head already ended: the decision is judged below, once the run record says whether the owner's word is required: staleEnd)
       if (pre.watch) return watchOnly({ route, gh, pr, head: gate.head });
     }
 
@@ -202,6 +200,13 @@ export const run = guarded(async (argv, ctx) => {
     } catch (err) {
       unchecked = `the run record could not be read (${String(err?.message ?? err).slice(0, 200)})`;
     }
+    // The record of this head already ended (pre.since): it re-queues only on a fresh decision newer than that end, and a new record starts with a new one-retry budget.
+    // Where the owner's word is required (a resumed run, a run record that cannot be checked, items for the owner) that decision is the owner's "merge" newer than the end:
+    // a final-gate run after the end never revives an older word (R1-F1). Otherwise a final-gate run that passed after the end is enough, or a fresh word.
+    const wordRequired = (existing?.status === 'ok' && Boolean(existing.record.resumed)) || unchecked !== null || Number(gate.ownerMerge) > 0;
+    const freshWord = () => approvalGapSince({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null, rulings: null }, pre.since) === 'ok';
+    const staleEnd = (liveItems) => pre?.since !== undefined && (wordRequired || liveItems ? !freshWord() : !freshWord() && !gateFreshSince(gate, pre.since));
+    if (staleEnd(false)) return pre.staleTerminal();
     if (!ownerApproved) {
       if (existing?.status === 'ok' && existing.record.resumed) {
         const reason = withProblem(`resumed run: the owner must say "merge" for this exact head (then pass ${APPROVAL_FLAGS})`);
@@ -272,6 +277,7 @@ export const run = guarded(async (argv, ctx) => {
       return refuse('live-check', ['the live gate is for a different head or patch than final-gate.json approved']);
     }
     if (Number(fresh.ownerMerge) > 0 && !ownerApproved) return refuse('pre-merge', [withProblem(OWNER_MERGE_REASON)], { reason: withProblem(OWNER_MERGE_REASON) });
+    if (Number(fresh.ownerMerge) > 0 && staleEnd(true)) return pre.staleTerminal(); // (items for the owner the file did not show: the same fresh word is needed)
     // (an item added or swapped since the owner said "merge", same head: the owner never saw it)
     if (ownerApproved && fresh.ownerItems !== gate.ownerItems) {
       const reason = `the owner items changed since the owner said "merge" (now ${fresh.ownerItems}, approved ${gate.ownerItems}): show them and ask again`;

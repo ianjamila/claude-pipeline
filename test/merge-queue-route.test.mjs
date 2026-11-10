@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { BASE_SHA, MERGE_SHA, PR, bump, cli, scenario, ymlFor } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { holdFiles, holdYml, holdCalls } from './helpers/merge-hold-env.mjs';
 import { beginAttempt, confirmAttempt, endRecord, noteRemoval, readQueueRecord } from '../pipeline/lib/merge-queue.mjs';
 import { preMergeProblems } from '../pipeline/lib/finalgate.mjs';
@@ -463,4 +464,42 @@ test('recheckGated: the live owner-item digest differing from the gate\'s refuse
     assert.match(r.reasons[0], /owner items changed/);
     assert.match(r.reasons[0], /def456/);
   }
+});
+
+// R1-F1: a fresh final-gate run revives an ended head only where the owner's word is NOT required. A resumed run (or an unchecked run record,
+// or items for the owner) needs a "merge" newer than the record's end, whatever the gate's age.
+test('gated route, resumed run, record for head H ended: a final-gate run after the end does not revive the owner\'s OLD "merge"; a newer word does (R1-F1)', (t) => {
+  const resumedRecord = {
+    v: 1, repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main', step: 'gate', outcome: null, next: '', detail: '', head: null,
+    request: '', tasks: [], verify: null, round: 0, mergeSha: null, inFlight: null, heartbeat: null, agentLogLine: null, cliVersion: null, history: [],
+    resumed: { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: 'a'.repeat(40) },
+  };
+  let body = '';
+  writeSummaryComment({ viewer: () => 'me', listComments: () => [], upsertComment: (n, m, b) => { body = b; return { id: 77, url: 'u', action: 'created' }; } }, PR, { record: resumedRecord });
+  const resumedWorld = () => world({
+    after: [[Q(), M()]],
+    gh: { comments: [{ id: 77, user: { login: 'me' }, body }], extra: [{ match: '-X PATCH repos/acme/widgets/issues/comments/77', stdoutJson: { id: 77, html_url: 'u' } }] },
+  });
+  const mergeFlags = (s) => cli(['merge', '--pr', String(PR), '--owner-approved-head', s.head, '--owner-approved-items', 'none'], { dir: s.repo.dir, fake: s.fake, env: s.env });
+
+  const stale = resumedWorld();
+  approve(t, stale); // the owner's word (T1) ...
+  endedRecord(stale, Date.now()); // ... the record ended (T2) ...
+  assertExit(stale.gate(), 0); // ... and the agent re-ran the final gate (T3): passing, no items for the owner
+  const refused = mergeFlags(stale);
+  assertExit(refused, 1);
+  assert.equal(refused.json.error, 'queue-removed');
+  assert.match(refused.json.reasons[0], /already left the merge queue/);
+  assert.equal(stale.enqueueCalls().length, 0);
+  assert.equal(stale.record().terminal, 'removed');
+
+  const fresh = resumedWorld();
+  endedRecord(fresh, Date.now() - 1000);
+  approve(t, fresh); // a word newer than the record's end
+  assertExit(fresh.gate(), 0);
+  const r = mergeFlags(fresh);
+  assertExit(r, 0);
+  assert.equal(r.json.merged, true);
+  assert.equal(fresh.enqueueCalls().length, 1);
+  assert.equal(fresh.record().attempts, 1, 'a new record with a new budget');
 });
