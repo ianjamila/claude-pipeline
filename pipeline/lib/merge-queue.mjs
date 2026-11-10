@@ -337,9 +337,16 @@ const CONFIRM_TRIES = 6; // after a dequeue: look this many times (pollMs apart,
 // is simply retried on the next tick. Running out of budget is `still-queued` and touches nothing: no dequeue, no hold restore.
 // Ends the record only where nothing else is owed: merged, or blocked when no lifted label is left to restore. A removal is noted on the
 // record (once); what to do about it (re-queue, restore) stays with the caller.
+// The head compared with GitHub's is the LIVE record's head when there is one, else `head` (#230): a watch resumed from a worktree at another commit
+// than the one queued still sees the entry's removal or its confirmed dequeue and notes it on the record, instead of ending as `head-moved`. Nothing
+// is ever re-queued from the other head: mayRequeue compares the record's head with the caller's.
 export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000, blockers = null, now = Date.now, sleep = defaultSleep, log = () => {} }) {
   const check = blockers ?? waitBlockers(gh, { base: null });
   const deadline = now() + budgetMs;
+  const watched = () => {
+    const rec = root === undefined ? null : readQueueRecord(root, pr);
+    return rec !== null && rec.terminal === null ? rec.head : head;
+  };
   let position = null;
   for (;;) {
     let outcome = null;
@@ -356,7 +363,7 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
 
   // -> null (keep watching) or a result for finish()
   async function pollOnce() {
-    const r = await reconcile({ gh, root, pr, head, sleep, pollMs: Math.min(pollMs, 2000), log });
+    const r = await reconcile({ gh, root, pr, head: watched(), sleep, pollMs: Math.min(pollMs, 2000), log });
     if (r.kind === 'merged') return { state: 'merged', mergeSha: r.mergeSha };
     if (r.kind === 'closed') return { state: 'closed' };
     if (r.kind === 'head-moved') return { state: 'head-moved' };
@@ -378,7 +385,7 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
     for (let i = 0; i < CONFIRM_TRIES; i += 1) {
       let r;
       try {
-        r = await reconcile({ gh, root, pr, head, sleep, pollMs: Math.min(pollMs, 2000), log });
+        r = await reconcile({ gh, root, pr, head: watched(), sleep, pollMs: Math.min(pollMs, 2000), log });
       } catch {
         r = { kind: 'queued' }; // cannot tell: treat as still there and look again
       }

@@ -282,7 +282,8 @@ export function createQueueRoute({
               requeued = 1;
               continue;
             }
-            return await removedRefusal(w.removal);
+            // (a watch resumed from a worktree at another head than the queued one follows the record's head and is never re-queued from here: #230)
+            return await removedRefusal(w.removal, rec !== null && rec.head !== head ? `not re-queued: this worktree is at ${head.slice(0, 12)}, the queued head was ${rec.head.slice(0, 12)}` : undefined);
           }
           default: return refusal('queue-unreadable', [`unexpected queue watch result ${JSON.stringify(w.state)}`], { queued: null });
         }

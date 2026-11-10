@@ -431,6 +431,38 @@ test('watchQueue: removed for failed_checks => removed with the removal, noted o
   assert.equal(gh.calls.length, 0, 'a removal is never answered with a dequeue');
 });
 
+// #230: a watch started from a worktree at another head (OTHER) than the live record's (HEAD) follows the record's head.
+test('watchQueue: a live record\'s head is the one watched; a worktree at another head still sees a removal / confirmed dequeue of the entry (#230)', async () => {
+  const OTHER = 'd'.repeat(40);
+  const c = clock();
+  const removedRoot = repoDir();
+  beginAttempt(removedRoot, 7, HEAD, APPROVAL, IDENT);
+  confirmAttempt(removedRoot, 7, 'MQE_1');
+  const gone = stubGh({ states: [inQ(), st()], events: [[added(), removed(REASON_GROUP_CHECKS)]] });
+  const r = await watchQueue({ gh: gone, root: removedRoot, pr: 7, head: OTHER, budgetMs: 3_600_000, blockers: noBlockers, now: c.now, sleep: c.sleep });
+  assert.equal(r.state, 'removed', 'not head-moved');
+  assert.equal(r.removal.reason, REASON_GROUP_CHECKS);
+  assert.equal(readQueueRecord(removedRoot, 7).removals.length, 1);
+  assert.equal(mayRequeue(readQueueRecord(removedRoot, 7), OTHER, REASON_GROUP_CHECKS), false, 'the record is not re-queued for the other head');
+
+  const stoppedRoot = repoDir();
+  beginAttempt(stoppedRoot, 7, HEAD, APPROVAL, IDENT);
+  confirmAttempt(stoppedRoot, 7, 'MQE_1');
+  const stopped = stubGh({
+    states: [inQ(), inQ(), st()], events: [[added(), removed(REASON_MANUAL, '08:20:00', null)]],
+    views: [{ state: 'OPEN', labels: [], mergeCommit: null }, { state: 'OPEN', labels: [{ name: 'needs-human' }], mergeCommit: null }],
+  });
+  const b = await watchQueue({ gh: stopped, root: stoppedRoot, pr: 7, head: OTHER, budgetMs: 3_600_000, now: c.now, sleep: c.sleep });
+  assert.equal(b.state, 'blocked', 'not head-moved');
+  assert.equal(b.dequeued, true);
+  assert.equal(readQueueRecord(stoppedRoot, 7).terminal, 'blocked');
+
+  // No live record (or one that ended): the head the caller names is the one compared, as before.
+  const bare = repoDir();
+  const moved = stubGh({ states: [st()] });
+  assert.equal((await watchQueue({ gh: moved, root: bare, pr: 7, head: OTHER, budgetMs: 3_600_000, blockers: noBlockers, now: c.now, sleep: c.sleep })).state, 'head-moved');
+});
+
 test('watchQueue: needs-human added while queued => dequeue called, blocked', async () => {
   const c = clock();
   const root = repoDir();

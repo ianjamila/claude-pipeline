@@ -13,7 +13,7 @@ import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { BASE_SHA, MERGE_SHA, PR, bump, cli, scenario, ymlFor } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { holdFiles, holdYml, holdCalls } from './helpers/merge-hold-env.mjs';
-import { beginAttempt, endRecord, noteRemoval, readQueueRecord } from '../pipeline/lib/merge-queue.mjs';
+import { beginAttempt, confirmAttempt, endRecord, noteRemoval, readQueueRecord } from '../pipeline/lib/merge-queue.mjs';
 import { preMergeProblems } from '../pipeline/lib/finalgate.mjs';
 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-queue.mjs');
@@ -155,6 +155,34 @@ test('removed once (group checks): the same head is re-queued once, then merged;
   assert.equal(rec.removals.length, 1);
   assert.equal(rec.terminal, 'merged');
   never(s, /--disable-auto/, 'auto-merge is never touched');
+});
+
+// #230: a resumed watch from a worktree at another head than the live entry's. While the entry lives it is simply queued; when it leaves, the
+// removal belongs on the record (with its reason), not under a "head-moved" that says nothing was queued.
+test('resumed watch at another head (--owner-go): the live entry\'s removal is noted on the record, not head-moved; no re-queue from that worktree (#230)', (t) => {
+  const OLD = 'd'.repeat(40);
+  const setup = (phases) => {
+    const s = world({ route: 'owner-go', command: 'default', after: [] });
+    approve(t, s);
+    const approval = { items: 'none', areas: [], rulings: null };
+    beginAttempt(s.repo.dir, PR, OLD, approval, { repo: 'acme/widgets', repoId: 4242 });
+    confirmAttempt(s.repo.dir, PR, 'MQE_1');
+    s.q.show(...phases);
+    return s;
+  };
+  const entryAtOld = () => reply(queuedNode(OLD), [added()]);
+
+  const removedOut = setup([[entryAtOld, entryAtOld, () => reply(node(OLD), [added(), removed('failed_checks')])]]);
+  const r = removedOut.run();
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'queue-removed');
+  assert.equal(r.json.removal.reason, 'failed_checks');
+  assert.deepEqual(r.json.removal.failing, ['ci: failure']);
+  assert.equal(removedOut.enqueueCalls().length, 0, 'a worktree at another head never re-queues');
+  const rec = removedOut.record();
+  assert.equal(rec.head, OLD);
+  assert.equal(rec.removals.length, 1, 'the removal is on the record');
+  assert.equal(rec.terminal, 'removed');
 });
 
 test('removed twice: queue-removed naming the failing check; no third enqueue', () => {
