@@ -171,6 +171,8 @@ function transcript({ prompt, models, effort, version, text }) {
 }
 
 const apply = (w, args = [], extra = {}) => w.cli(['arbiter', 'apply', '--round', '1', ...args], extra);
+// The state without the round's arbiter.failure record (written when an apply stops on the floor lock or the registry; nothing else is saved then).
+const minusFailure = (state) => { const copy = structuredClone(state); delete copy.rounds[0].arbiter.failure; return copy; };
 const registryExists = (w) => existsSync(join(w.floor, 'fable.json'));
 const itemCauses = (w) => ['R1-S1', 'R1-S2'].map((id) => w.item(id).final?.cause);
 
@@ -326,7 +328,8 @@ test('arbiter apply: a registry write failure fails the proof (model-floor-unwri
   assert.equal(r.json.ok, false);
   assert.equal(r.json.error, 'model-floor-unwritable');
   assert.match(r.json.message, /cannot write the model floor registry/);
-  assert.equal(w.stateText(), before, 'the state was not saved');
+  assert.deepEqual(minusFailure(w.state()), JSON.parse(before), 'nothing was saved but the failure record');
+  assert.equal(w.state().rounds[0].arbiter.failure.cause, 'model-floor-unwritable');
   assert.equal(existsSync(join(w.repo.dir, '.review', 'round-1', 'rulings.json')), false);
   assert.equal(existsSync(join(w.repo.dir, '.review', 'round-1', 'model-proof.json')), false);
   assert.equal(registryExists(w), false);
@@ -347,7 +350,8 @@ test('arbiter apply: a floor lock held by another process is a named error (mode
   assertExit(r, 1, r.stdout + r.stderr);
   assert.equal(r.json.error, 'model-floor-busy');
   assert.match(r.json.message, /another review is updating the model floor/);
-  assert.equal(w.stateText(), before);
+  assert.deepEqual(minusFailure(w.state()), JSON.parse(before), 'nothing was saved but the failure record');
+  assert.equal(w.state().rounds[0].arbiter.failure.cause, 'model-floor-busy');
   const retry = apply(w, [], own);
   assertExit(retry, 0, retry.stdout);
 });
