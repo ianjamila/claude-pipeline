@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import {
   ALLOW_MAX, FLOOR_REL, HISTORY_MAX, MIN_FABLE, checkFloor, compareVersions, floorDir, parseModelId, raiseFloor, readFloor, readReviewGate, reReviewThreshold, resetFloor, readableAllowedIds, standingBypasses, withFloorLock,
 } from '../pipeline/lib/model-floor.mjs';
-import { clearUnheld, holdsLock, liveLocalHolder, release, tryAcquire } from '../pipeline/lib/locks.mjs';
+import { clearUnheld, holdsLock, release, tryAcquire } from '../pipeline/lib/locks.mjs';
 import { spawn } from 'node:child_process';
 import { readApprovals } from '../pipeline/hooks/lib/owner-go.mjs';
 
@@ -706,12 +706,10 @@ for (const keepFloor of [false, true]) {
   });
 }
 
-test('R1-B2: liveLocalHolder: the owner of a running local holder, else null; holdsLock is true only for the handle that owns the lock', async (t) => {
+test('R1-B2: holdsLock is true only for the handle that owns the lock', async (t) => {
   const dir = join(tmp(t), 'f');
   mkdirSync(dir, { recursive: true });
-  assert.equal(liveLocalHolder('model-floor', { dir }), null, 'no lock');
   const mine = tryAcquire('model-floor', { dir, machineId: null });
-  assert.equal(liveLocalHolder('model-floor', { dir, machineId: null }).pid, process.pid);
   assert.equal(holdsLock(mine.lock), true);
   rmSync(join(dir, 'model-floor.lock'), { recursive: true });
   assert.equal(holdsLock(mine.lock), false, 'removed by hand');

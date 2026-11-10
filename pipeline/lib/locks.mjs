@@ -461,14 +461,6 @@ export function holdsLock(lock) {
   return owner !== null && owner.runId === lock.runId && owner.pid === lock.pid;
 }
 
-// The owner of a lock whose process is running on THIS machine (same hostname or machine id, PID alive), else null: no lock, a dead holder, another
-// machine's holder, or a lock with no usable owner record. Reads only; the same judgement tryAcquire makes before it refuses to reclaim.
-export function liveLocalHolder(name, { dir = defaultLockDir(), now = Date.now(), host = os.hostname(), machineId: machine = readMachineId(), isAlive = isPidAlive } = {}) {
-  const ctx = { now, host, machineId: machine, isAlive, hooks: {} };
-  const seen = assess(lockPathFor(dir, name), ctx);
-  return seen.state === 'held' && !seen.owner.incomplete && isLocalOwner(seen.owner, ctx) ? seen.owner : null;
-}
-
 // assess() for an owner-clearing caller: an owner.json that is a directory is a provably damaged record (not a read failure that might hide a live
 // holder), so it is judged like a lock with no usable owner. Every other read error still throws.
 function assessDamageTolerant(lockPath, ctx) {
