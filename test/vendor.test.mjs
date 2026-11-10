@@ -10,8 +10,8 @@ import { run as vendor, meta, vendorDrift } from '../pipeline/commands/vendor.mj
 import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths'];
-const ENTRIES = ['ci-guard', 'ci-guards-run', 'smoke', 'supabase-local'];
+const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths', 'queue-members'];
+const ENTRIES = ['ci-guard', 'ci-guards-run', 'queue-guards-run', 'smoke', 'supabase-local'];
 
 const vendorInto = (dir, extra = []) => vendor(['--repo', dir, ...extra], { cwd: dir, env: process.env });
 const sp = (dir) => join(dir, 'scripts', 'pipeline');
@@ -292,6 +292,15 @@ test('every vendored module actually loads from the project layout', async () =>
     const mod = await import(pathToFileURL(join(sp(repo.dir), `${n}.mjs`)).href);
     assert.ok(Object.keys(mod).length > 0, `${n} exports something`);
   }
+});
+
+test('vendor lists queue-members and queue-guards-run', async () => {
+  const repo = createTmpRepo();
+  const r = await vendorInto(repo.dir);
+  assert.ok(r.output.files.includes('scripts/pipeline/lib/queue-members.mjs'), 'the queue manifest lib ships to projects');
+  assert.ok(r.output.files.includes('scripts/pipeline/queue-guards-run.mjs'), 'the queue poster ships to projects');
+  assert.equal(readFileSync(join(sp(repo.dir), 'lib', 'queue-members.mjs'), 'utf8'), readFileSync(join(root, 'pipeline', 'lib', 'queue-members.mjs'), 'utf8'));
+  assert.equal(readFileSync(join(sp(repo.dir), 'queue-guards-run.mjs'), 'utf8'), readFileSync(join(root, 'pipeline', 'templates', 'scripts', 'pipeline', 'queue-guards-run.mjs'), 'utf8'));
 });
 
 test('vendor pins the vendored files in .gitattributes (-text, shim eol=lf): appended once, idempotent, keeps existing lines', async () => {

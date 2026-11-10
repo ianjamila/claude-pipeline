@@ -116,7 +116,8 @@ test('it never merges: no gh call is made by any form', () => {
   hold(s, []);
   hold(s, ['--check'], { FAKE_HOLD_CHECK_SEQ: seq(answer(PR, [])) });
   hold(s, ['--release', '--reason', 'owner-declined']);
-  assert.deepEqual(s.fake.calls(), []);
+  // Queue mode (plan Task 4) added a read: every gh call is the read-only QueueState GraphQL query (plus the `repo view` identity lookup it needs), no other call and no mutation.
+  assert.ok(s.fake.calls().every((c) => { const l = c.argv.join(' '); return (/^repo view /.test(l) || (/^api graphql /.test(l) && l.includes('query QueueState'))) && !/mutation/.test(l); }), JSON.stringify(s.fake.calls().map((c) => c.argv)));
   assert.deepEqual(s.mergeCalls(), []);
 });
 
@@ -268,4 +269,48 @@ test('take / release: a command that could not be started is exit 2 with notStar
     assert.equal(refused.exitCode, 1, extra.join(' '));
     assert.equal('notStarted' in refused.output, false);
   }
+});
+
+// ---- queue mode: GitHub's merge queue orders the merges itself, so there is no hold to take or wait for -----------------------------
+
+const qworld = (queue) => world({ gh: { queue } });
+
+test('queue ON: --check answers front/queueMode and runs no hold command; take answers taken:false; --release is unchanged', () => {
+  const s = qworld(true);
+  const check = hold(s, ['--check'], { FAKE_HOLD_CHECK_SEQ: seq(answer(PR, [blocker(1400)])) });
+  assertExit(check, 0, check.stdout);
+  assert.deepEqual(check.json, { ok: true, configured: true, outcome: 'front', queueMode: true, readable: true, blockedBy: [] });
+  const wait = hold(s, ['--check', '--wait'], { FAKE_HOLD_CHECK_SEQ: seq(answer(PR, [blocker(1400)])) });
+  assertExit(wait, 0, wait.stdout);
+  assert.deepEqual(wait.json, { ok: true, configured: true, outcome: 'front', queueMode: true, polls: 0, waitedMinutes: 0, blockedBy: [] });
+  const take = hold(s, []);
+  assertExit(take, 0, take.stdout);
+  assert.deepEqual(take.json, { ok: true, configured: true, taken: false, queueMode: true });
+  assert.deepEqual(holdCalls(s), [], 'no check, no take');
+  const rel = release(s, 'parked');
+  assertExit(rel, 0, rel.stdout);
+  assert.equal(rel.json.confirmed, true);
+  assert.deepEqual(released(s), [`release ${PR} ${RELEASE_REASONS.parked}`]);
+});
+
+test('queue OFF: --check and take behave as before (the provider is asked)', () => {
+  const s = qworld(false);
+  const check = hold(s, ['--check'], { FAKE_HOLD_CHECK_SEQ: seq(answer(PR, [blocker(1400)])) });
+  assertExit(check, 1, check.stdout);
+  assert.equal(check.json.error, 'queued-behind');
+  const take = hold(s, []);
+  assertExit(take, 0, take.stdout);
+  assert.equal(take.json.confirmed, true);
+  assert.deepEqual(holdCalls(s), [`check ${PR}`, `take ${PR}`]);
+});
+
+test('queue state UNREADABLE: merge-hold (which never merges) falls back to today\'s path - the provider is asked', () => {
+  const s = qworld('error');
+  const check = hold(s, ['--check'], { FAKE_HOLD_CHECK_SEQ: seq(answer(PR, [blocker(1400)])) });
+  assertExit(check, 1, check.stdout);
+  assert.equal(check.json.error, 'queued-behind');
+  const take = hold(s, []);
+  assertExit(take, 0, take.stdout);
+  assert.equal(take.json.confirmed, true);
+  assert.deepEqual(holdCalls(s), [`check ${PR}`, `take ${PR}`]);
 });

@@ -39,11 +39,17 @@ const OWNER_ONLY = 'This is reserved for the repository owner.';
 const COMMENT_EDIT_DENIED = 'editing or deleting an existing PR / issue comment is blocked: the pipeline keeps its run record, triage state and review in comments of this login, and a blanked or deleted one would read as "no record". Post a new comment instead (the pipeline commands update their own).';
 
 // The only graphql mutations an agent may run (comments, PR lifecycle, review threads). Everything else is denied.
+// (enablePullRequestAutoMerge is not one: on a merge-queue branch it IS an enqueue, see QUEUE_MUTATIONS; disabling auto-merge only takes a PR out.)
 // (Phase 3b: updateIssueComment is no longer one: an edit of an existing comment can blank the pipeline's run record, see COMMENT_EDIT_DENIED)
 const GRAPHQL_ALLOWED_MUTATIONS = new Set([
-  'addComment', 'createPullRequest', 'enablePullRequestAutoMerge', 'disablePullRequestAutoMerge',
+  'addComment', 'createPullRequest', 'disablePullRequestAutoMerge',
   'markPullRequestReadyForReview', 'convertPullRequestToDraft', 'addPullRequestReview', 'resolveReviewThread', 'minimizeComment',
 ]);
+// Merge queue (Fable F4, owner Q2): a session may not queue, unqueue or turn on auto-merge by hand. Only `P merge` does, and it
+// runs gh itself, out of the hook's sight, so its low-risk auto path is not touched.
+// Why (#58 round 3, still true): these name the PR by a node id, which says nothing about its repository (owner_approval: chat?),
+// its head, or whether the owner said "merge" for it, and the id can name a PR in another repo whatever directory this runs in.
+const QUEUE_MUTATIONS = new Set(['enqueuePullRequest', 'dequeuePullRequest', 'enablePullRequestAutoMerge']);
 const PUSH_LONG_VALUE = ['repo', 'receive-pack', 'exec', 'push-option', 'recurse-submodules'];
 const GIT_GLOBAL_VALUE = ['--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env', '--attr-source'];
 const API_LONG_VALUE = ['method', 'field', 'raw-field', 'header', 'input', 'jq', 'template', 'preview', 'hostname', 'cache'];
@@ -807,14 +813,10 @@ function checkGraphql(body, dir = null, ctx = null) {
     if (/^\s*(\$\(|`|\$\{?[A-Za-z_])/.test(q)) return deny('the graphql query is built at run time, so it cannot be verified. Pass the query text directly.');
     const names = graphqlMutations(q);
     if (names === null) return deny('the graphql query contains a mutation that cannot be parsed, so it cannot be verified.');
+    const queued = names.find((n) => QUEUE_MUTATIONS.has(n));
+    if (queued) return deny(`the graphql mutation ${queued} is refused: it names the PR by a node id, so its repository, its head and the owner's "merge" cannot be checked. Queue or merge a PR with \`P merge --pr N\` (it pins the approved head).`);
     const bad = names.find((n) => !GRAPHQL_ALLOWED_MUTATIONS.has(n));
     if (bad) return deny(`the graphql mutation ${bad} is not on the allowed list (${[...GRAPHQL_ALLOWED_MUTATIONS].join(', ')}). ${OWNER_ONLY}`);
-    // #58: auto-merge names the PR by its node id, which says nothing about whether the owner said "merge" for it, nor which repository it is in.
-    // Why (#58 round 3): the node id can name a PR in a chat repo whatever directory this runs in, so the target repository can never be resolved
-    // here: it is judged as a chat repo's (the owner's "merge" is needed, and a node id cannot match one), not as the current directory's.
-    if (names.includes('enablePullRequestAutoMerge') && ctx?.ownerGo) {
-      return deny('turning on auto-merge through the API skips the owner\'s "merge": it names the PR by a node id, so its repository (owner_approval: chat?) and head cannot be checked. Use `gh pr merge <N> --auto --match-head-commit <sha>` after the owner said "merge", or `P merge`.');
-    }
   }
   if (body.unknown) return deny('cannot verify the graphql body (--input - / unreadable file).');
   return null;

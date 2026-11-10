@@ -30,6 +30,7 @@ import { docsExemptFrom } from './docs-exempt.mjs';
 import { skipOf } from './verify-steps.mjs';
 import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
 import { ownerItemsDigest, rulingsBlockDigest } from '../hooks/lib/owner-go.mjs';
+import { QueueUnreadable, queueModeFor } from './merge-queue.mjs';
 
 export const GATE_FILE = 'final-gate.json';
 export const BLOCKING_LABELS = Object.freeze(['needs-human', 'awaiting-review', 'pipeline-blocked']);
@@ -183,7 +184,8 @@ function assertBaseObject(explicit, o) {
 
 // ---- the checks ---------------------------------------------------------------------------------
 
-function prOpenCheck({ info, head, config, behind = null }) {
+// `queueMode`: GitHub merges through its merge queue, which tests the PR on top of the base itself, so being behind is no problem.
+function prOpenCheck({ info, head, config, behind = null, queueMode = false }) {
   const problems = [];
   if (info.state !== 'OPEN') problems.push(`PR state is ${info.state}`);
   if (info.isDraft !== false) problems.push('PR is a draft');
@@ -192,7 +194,7 @@ function prOpenCheck({ info, head, config, behind = null }) {
   if (info.headRefOid !== head) problems.push(`PR head ${short(info.headRefOid)} is not the local HEAD ${short(head)}`);
   // Branch protection is not strict (spec 6.6), so GitHub will merge a PR that is behind its base: that would land code on a
   // base nobody verified it against. The branch must be updated (and re-verified) first.
-  if (behind) problems.push(`behind-base: ${behind}; update the branch from ${config.default_branch} and re-verify before merging`);
+  if (behind && !queueMode) problems.push(`behind-base: ${behind}; update the branch from ${config.default_branch} and re-verify before merging`);
   // The hard-stop, integrity and review diffs are taken against the default branch; any other base would be judged on the wrong diff.
   if (info.baseRefName !== config.default_branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${config.default_branch}`);
   return problems.length ? check('pr-open', false, problems.join('; ')) : check('pr-open', true, `open at ${short(head)}`);
@@ -202,7 +204,9 @@ function prOpenCheck({ info, head, config, behind = null }) {
 // with the base ref is not the base ref's own commit). The local ref can be stale, which only makes this check lenient;
 // GitHub's own mergeStateStatus is the authority.
 // `baseSha` (--owner-go): the base tip is the commit GitHub names, not the local ref.
-function behindBase({ info, diff, root, config, baseSha = null }) {
+// `queueMode`: never behind (the queue builds the PR on the current base before merging it).
+function behindBase({ info, diff, root, config, baseSha = null, queueMode = false }) {
+  if (queueMode) return null;
   if (info?.mergeStateStatus === 'BEHIND') return 'GitHub reports the PR is BEHIND its base (mergeStateStatus BEHIND)';
   const d = diff();
   if (!d.ok) return null; // the checks that need the diff report it themselves
@@ -663,6 +667,31 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   return check('review', true, `review valid for content ${short(hash)}${exemptNote}${grantNote}`);
 }
 
+// The guard statuses among `names` (Test integrity, Hard-stop scan, Cross-model review) whose provenance does not hold: a guard status is only
+// believed when the pipeline-guards workflow from the default branch posted it, and that run's own verdict artifact says success for it
+// (guard-provenance). The row's link is not trusted (anyone posting a status picks it): the latest status of that context on the head is read
+// directly and bound to this PR, this head and its own creation time. -> ["<name> (<why>)", ...]; empty when all hold.
+export function forgedGuards({ gh, pr, head, names }) {
+  const forged = [];
+  const provenanceCache = new Map();
+  for (const name of names) {
+    let verdict;
+    try {
+      const slug = gh.repo().slug;
+      const read = (p, jq) => gh.apiText(p, jq);
+      const latest = JSON.parse(read(`repos/${slug}/commits/${head}/statuses?per_page=100`,
+        `[.[] | select(.context == "${name}")][0] | {state: .state, by: .creator.login, at: .created_at, url: .target_url}`));
+      if (!latest || latest.state !== 'success') verdict = { ok: false, reason: 'its latest status is not a success' };
+      else if (latest.by !== 'github-actions[bot]') verdict = { ok: false, reason: `posted by ${latest.by ?? 'an unknown creator'}, not github-actions[bot]` };
+      else verdict = checkGuardVerdict({ read, repo: slug, url: latest.url, bind: { prNumber: pr, headSha: head, createdAt: latest.at }, expect: { check: GUARD_CONTEXT_CHECKS[name] }, cache: provenanceCache });
+    } catch (err) {
+      verdict = { ok: false, reason: String(err?.message ?? err).split('\n')[0] };
+    }
+    if (!verdict.ok) forged.push(`${name} (${verdict.reason})`);
+  }
+  return forged;
+}
+
 // CI evidence. Judged: the checks GitHub itself requires (`gh pr checks --required`), or every reported check when it
 // requires none. On top of that every check NAMED in config.ci.required_checks must be reported and passing, so a
 // required check that never ran (renamed, workflow deleted, path-filtered away) cannot be mistaken for a green PR.
@@ -713,23 +742,7 @@ export function ciCheck({ gh, pr, head, diff, config, explicitEmpty }) {
   for (const r of used) {
     if (r && PROVENANCE_CHECKS.includes(r.name) && passing(r)) guardNames.add(r.name);
   }
-  const forged = [];
-  const provenanceCache = new Map();
-  for (const name of guardNames) {
-    let verdict;
-    try {
-      const slug = gh.repo().slug;
-      const read = (p, jq) => gh.apiText(p, jq);
-      const latest = JSON.parse(read(`repos/${slug}/commits/${head}/statuses?per_page=100`,
-        `[.[] | select(.context == "${name}")][0] | {state: .state, by: .creator.login, at: .created_at, url: .target_url}`));
-      if (!latest || latest.state !== 'success') verdict = { ok: false, reason: 'its latest status is not a success' };
-      else if (latest.by !== 'github-actions[bot]') verdict = { ok: false, reason: `posted by ${latest.by ?? 'an unknown creator'}, not github-actions[bot]` };
-      else verdict = checkGuardVerdict({ read, repo: slug, url: latest.url, bind: { prNumber: pr, headSha: head, createdAt: latest.at }, expect: { check: GUARD_CONTEXT_CHECKS[name] }, cache: provenanceCache });
-    } catch (err) {
-      verdict = { ok: false, reason: String(err?.message ?? err).split('\n')[0] };
-    }
-    if (!verdict.ok) forged.push(`${name} (${verdict.reason})`);
-  }
+  const forged = forgedGuards({ gh, pr, head, names: guardNames });
   const problems = [];
   if (forged.length) problems.push(`guard status not posted by the pipeline-guards workflow: ${forged.join('; ')}`);
   if (missing.length) problems.push(`required check(s) missing: ${missing.join(', ')}`);
@@ -747,13 +760,18 @@ async function safely(name, fn) {
   }
 }
 
+// The queue read failed: a failing check, so the gate (or the owner-go evaluation) refuses. Only added on a failure, so a queue-off run is unchanged.
+const queueStateCheck = (message) => check('queue-state', false, `the merge queue state could not be read (${message}); refusing rather than guessing whether the PR merges directly or through the queue`);
+
 // ---- the gate -----------------------------------------------------------------------------------
 
 // Runs every check (no short-circuit, so one run reports every problem). A gh failure on the PR lookup itself throws:
 // the caller maps it to exit 3, because without the PR there is nothing to judge.
 // readOnly (P merge --dry-run): changes no shared git state. The only step that does is the deferred-CI proof's base-settings read
 // (a `git fetch` that moves origin/<base>); readOnly reads them from GitHub at the PR's baseRefOid instead.
-export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultSleep, ciProof = defaultCiProof, readOnly = false }) {
+// queueMode (P final-gate reads it live with queueModeFor): the PR merges through GitHub's queue, so no behind-base problem. queueError: the
+// queue could not be read; the gate then fails with a `queue-state` check (never passes as if the queue were off).
+export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultSleep, ciProof = defaultCiProof, readOnly = false, queueMode = false, queueError = null }) {
   const o = { cwd: root };
   const head = headSha(o);
   const info = await readPrSettled({ gh, pr, fields: readOnly ? [...PR_FIELDS, 'baseRefOid'] : [...PR_FIELDS], sleep, pauseMs: mergeablePause(env) });
@@ -777,7 +795,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
 
   const proofs = [];
   const checks = [
-    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config }) })),
+    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config, queueMode }), queueMode })),
     await safely('labels', () => labelsCheck(info)),
     await safely('preflight', () => preflightCheck({ root, env, gh })),
     await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs, readOnly, baseSha: info?.baseRefOid ?? null })),
@@ -785,6 +803,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     await safely('integrity', () => integrityCheck({ config, diff })),
     await safely('review', () => reviewCheck({ root, config, pr, repo, diff, hash, hashError, readOnly })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
+    ...(queueError === null ? [] : [queueStateCheck(queueError)]),
   ];
 
   const d = diff();
@@ -980,7 +999,9 @@ export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep 
 }
 
 // `exemptHold` (Rev-4 8): the labels check ignores needs-human for the eligible hold the owner's "merge" names; nothing else does.
-export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep, exemptHold = false }) {
+// `queueMode` (merge queue): true/false when the caller already read it, undefined = read it live HERE, but only for a PR that is behind (the one
+// case where it matters), with queueModeFor. An unreadable queue adds a failing `queue-state` check and keeps the behind refusal.
+export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep, exemptHold = false, queueMode }) {
   const head = headSha({ cwd: root });
   const info = await readPrSettled({ gh, pr, fields: [...OWNER_GO_FIELDS], sleep, pauseMs: mergeablePause(env) });
   // The range is GitHub's: the PR's base commit and head, as read now. headRefOid must be the local HEAD (pr-open), baseRefOid a local object.
@@ -1001,7 +1022,16 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
   }
   // Behind its base: refused as always, unless the BASE's merge.behind_base is "disjoint" and main's new commits are fresh enough (behindFreshEnough).
   let behind = null;
-  let behindReason = behindBase({ info, diff, root, config, baseSha });
+  let queueError = null;
+  let behindReason = behindBase({ info, diff, root, config, baseSha, queueMode: queueMode === true });
+  if (behindReason !== null && queueMode === undefined) {
+    try {
+      if (queueModeFor({ gh, pr }).queue) behindReason = null;
+    } catch (err) {
+      if (!(err instanceof QueueUnreadable)) throw err;
+      queueError = err.message;
+    }
+  }
   if (behindReason !== null) {
     const fresh = behindFreshEnough({ root, config, diff, baseSha, info });
     if (fresh.ok) {
@@ -1012,7 +1042,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     }
   }
   const checks = [
-    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindReason })),
+    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindReason, queueMode: queueMode === true })),
     await safely('labels', () => labelsCheck(info, { exemptHold })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
     await safely('scan-range', () => scanRangeCheck({ root, gh, pr, diff, info, explicit })),
@@ -1020,6 +1050,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     integrity,
     stripRulings(completion),
     ownerItemsCheck({ items, hardstops, integrity, label: config.owner_approval === 'label' }),
+    ...(queueError === null ? [] : [queueStateCheck(queueError)]),
   ];
   return {
     ok: checks.every((c) => c.ok),
@@ -1078,7 +1109,7 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MAX_CONSECUTIVE_ERRORS = 3;
 
 // The merge commit of a MERGED PR is sometimes not readable in the same instant: look again a few times.
-async function readMergeSha({ gh, pr, first, sleep, pollMs }) {
+export async function readMergeSha({ gh, pr, first, sleep, pollMs }) {
   let sha = first ?? null;
   for (let i = 0; i < MERGE_SHA_RETRIES && !sha; i++) {
     await sleep(Math.min(pollMs, 2000));
@@ -1102,7 +1133,10 @@ export function ownerGoBaseProblem(live) {
 // must not run (empty = go). An unreadable PR is a reason.
 // `base` (--owner-go): the base commit the scan was of; GitHub's baseRefOid must still be it.
 // `exemptHold` (--owner-go, only the look BEFORE the hold is lifted): needs-human is not counted. Once it is lifted the plain rule applies, and so does the wait.
-export async function preMergeProblems({ gh, pr, head, base = null, exemptHold = false }) {
+// `queueMode` (merge queue): GitHub tests the PR on top of the current base itself, so the base moving is no problem and `base` is ignored;
+// the head moving still refuses.
+export async function preMergeProblems({ gh, pr, head, base: scanBase = null, exemptHold = false, queueMode = false }) {
+  const base = queueMode ? null : scanBase;
   let view;
   try {
     view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft', ...(base !== null ? ['baseRefOid'] : []), 'body']);

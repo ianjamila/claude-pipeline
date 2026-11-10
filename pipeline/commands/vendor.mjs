@@ -17,8 +17,8 @@ export const meta = {
   usage: 'pipeline vendor --repo DIR [--check]',
 };
 
-const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths'];
-const ENTRIES = ['ci-guard', 'ci-guards-run', 'smoke', 'supabase-local'];
+const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths', 'queue-members'];
+const ENTRIES = ['ci-guard', 'ci-guards-run', 'queue-guards-run', 'smoke', 'supabase-local'];
 // Entries an earlier vendor copied and this one no longer does. A leftover scripts/pipeline/<name>.mjs is removed by vendor (that
 // exact file only) and is drift for --check.
 const RETIRED_ENTRIES = ['stop-verify'];

@@ -13,6 +13,7 @@ import {
 import { verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
 import { claimGrantMarkers, grantIdOf, recordRoundGrant } from '../pipeline/hooks/lib/owner-go.mjs';
 import { OWNER_ENTRY } from './helpers/owner-go.mjs';
+import { assertOnlyFails, named, scenario } from './helpers/gate-env.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { writeReviewJson } from '../pipeline/lib/cmd-io.mjs';
 import {
@@ -566,4 +567,47 @@ test('isDocsOnly: markdown under an app/ or pages/ route directory is code, dot-
   assert.equal(isDocsOnly([f('README.md'), f('.windsurf/rules/x.md')]), false);
   assert.equal(isDocsOnly([f('AGENTS.override.md')]), false);
   assert.equal(isDocsOnly([f('docs/agent-guide/prod-ledger.md')]), true);
+});
+
+// ---- merge queue: no catch-up for a PR that is behind -----------------------------------------------------------------
+
+test('P final-gate on a behind PR: queue on => gate ok; queue off => behind-base as today', () => {
+  // GitHub says BEHIND.
+  const off = scenario({ gh: { mergeStateStatus: 'BEHIND' } });
+  assertOnlyFails(off.gate(), 'pr-open', /behind-base/);
+  const on = scenario({ gh: { mergeStateStatus: 'BEHIND', queue: true } });
+  const r = on.gate();
+  assert.equal(r.code, 0, r.stdout);
+  assert.equal(named(r.json, 'pr-open').ok, true);
+  assert.ok(on.fake.lines().some((l) => l.startsWith('api graphql')), 'the queue was read live');
+
+  // The base moved past the branch although GitHub says CLEAN: same answer.
+  const moved = (queue) => {
+    const s = scenario({ gh: { mergeStateStatus: 'CLEAN', queue } });
+    s.repo.git(['checkout', '-q', 'main']);
+    s.repo.write('other.txt', 'later\n');
+    s.repo.commit('main moves on');
+    s.repo.git(['checkout', '-q', 'agent/feature']);
+    return s.gate();
+  };
+  assert.match(named(moved(false).json, 'pr-open').detail, /behind-base/);
+  assert.equal(moved(true).code, 0);
+});
+
+test('P final-gate: a queue state GitHub cannot answer fails closed (queue-state), never a pass or "queue off"', () => {
+  const s = scenario({ gh: { mergeStateStatus: 'BEHIND', queue: 'error' } });
+  const r = s.gate();
+  assert.equal(r.code, 1, r.stdout);
+  assert.equal(r.json.ok, false);
+  assert.match(named(r.json, 'queue-state').detail, /merge queue/i);
+  assert.equal(named(r.json, 'queue-state').ok, false);
+  // The unreadable read does not switch the behind-base refusal off.
+  assert.match(named(r.json, 'pr-open').detail, /behind-base/);
+});
+
+test('P final-gate: queue on does not change the other checks (a red CI still fails)', () => {
+  const s = scenario({ gh: { mergeStateStatus: 'BEHIND', queue: true, ci: [{ name: 'ci', state: 'FAILURE', bucket: 'fail' }] } });
+  const r = s.gate();
+  assert.equal(r.code, 1, r.stdout);
+  assert.deepEqual(r.json.failed, ['ci']);
 });

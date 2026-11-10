@@ -17,6 +17,7 @@ import { loadConfig } from '../pipeline/lib/config.mjs';
 import { treeFingerprint } from '../pipeline/lib/git.mjs';
 import { verifyReportCheck } from '../pipeline/lib/finalgate.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
+import { answer, blocker, holdCalls, holdFiles, holdYml, seq } from './helpers/merge-hold-env.mjs';
 
 const scratch = mkdtempSync(join(tmpdir(), 'cp-dryrun-'));
 process.on('exit', () => rmSync(scratch, { recursive: true, force: true }));
@@ -438,4 +439,108 @@ test('dry run --owner-go, behind: mergeStateStatus BEHIND stays behind-base even
   assertExit(dirty.r, 1);
   const kinds = dirty.r.json.blockers.map((b) => b.kind);
   assert.ok(kinds.includes('conflicts') && kinds.includes('behind-base-unverified'), kinds.join());
+});
+
+// ---- queue mode (GitHub merge queue): no catch-up, no merge hold; a PR already queued or merged is reported -------------------------------
+
+const QUEUE_NOTE = 'GitHub\'s merge queue tests it on top of main and everything ahead of it, then merges it — one "merge" is enough.';
+const queueReply = (s, pr) => ({ match: 'QueueState', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_node12', headRefOid: s.head, isMergeQueueEnabled: true, ...pr } } } } });
+const queued = (s, position = 3) => queueReply(s, { state: 'OPEN', mergeCommit: null, mergeQueueEntry: { id: 'MQE_1', state: 'QUEUED', position, enqueuedAt: '2026-11-09T01:00:00Z', headCommit: null } });
+const mergedState = (s) => queueReply(s, { state: 'MERGED', mergeCommit: { oid: 'c'.repeat(40) }, mergeQueueEntry: null });
+
+test('dry run --owner-go, queue ON, branch BEHIND: queue:true, no behind-base blocker, ownerStep.queueNote (exact), no behindNote; nothing is written', () => {
+  const s = scenario({ report: null, state: null });
+  const tip = mainMoves(s, 'other.txt');
+  s.fake.setScript(script(s, { baseRefOid: tip, behindBy: 1, merge: 'BEHIND', gh: { compareBase: tip, mergeStateStatus: 'BEHIND', queue: true } }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.wouldMerge, true, JSON.stringify(d.r.json.blockers));
+  assert.equal(d.r.json.queue, true);
+  assert.equal(d.r.json.behind, null);
+  assert.equal(d.r.json.ownerStep.kind, 'say-merge');
+  assert.equal(d.r.json.ownerStep.line, `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets`);
+  assert.equal(d.r.json.ownerStep.queueNote, QUEUE_NOTE);
+  assert.equal('behindNote' in d.r.json.ownerStep, false);
+  assert.deepEqual(d.writes, []);
+  assert.deepEqual(s.mergeCalls(), []);
+  noGitWrites(d);
+});
+
+test('dry run (gate mode), queue ON and behind (compare shows lacking commits): no behind-base blocker, queueNote set, no compare call', () => {
+  const s = setup({});
+  s.fake.setScript(script(s));
+  assertExit(s.gate(), 0);
+  const file = join(s.repo.dir, '.review', 'state.json');
+  writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), risk: 'high' }));
+  s.fake.setScript(script(s, { behindBy: 2, gh: { queue: true } }));
+  const d = dry(s);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.queue, true);
+  assert.deepEqual(d.r.json.blockers, []);
+  assert.equal(d.r.json.ownerStep.queueNote, QUEUE_NOTE);
+  assert.ok(!d.calls.some((l) => /compare\//.test(l)), 'the base is not compared: the queue builds on the current base');
+});
+
+test('dry run, queue ON: conflicts (mergeStateStatus DIRTY) still block, and nothing about behind-ness is reported', () => {
+  const s = scenario({ report: null, state: null });
+  s.fake.setScript(script(s, { merge: 'DIRTY', gh: { mergeStateStatus: 'DIRTY', queue: true } }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 1);
+  assert.deepEqual(kinds(d.r).filter((k) => /conflicts|behind/.test(k)), ['conflicts']);
+  assert.equal(d.r.json.queue, true);
+});
+
+test('dry run, queue ON: a PR already in the queue is a queueState blocker naming the position; a merged PR is "already merged"', () => {
+  const s = scenario({ report: null, state: null });
+  s.fake.setScript([queued(s, 3), ...script(s, { gh: { queue: true } })]);
+  const q = dry(s, ['--owner-go']);
+  assertExit(q.r, 1);
+  const hit = q.r.json.blockers.filter((b) => b.kind === 'queueState');
+  assert.equal(hit.length, 1);
+  assert.match(hit[0].detail, /already queued at position 3/);
+  assert.equal(q.r.json.wouldMerge, false);
+  assert.deepEqual(q.writes, []);
+
+  s.fake.setScript([mergedState(s), ...script(s, { gh: { queue: true } })]);
+  const m = dry(s, ['--owner-go']);
+  assertExit(m.r, 1);
+  assert.match(m.r.json.blockers.find((b) => b.kind === 'queueState')?.detail ?? '', /already merged/);
+});
+
+test('dry run, queue state UNREADABLE: fails closed with a queue-unreadable blocker (never an all-clear), no `queue` field', () => {
+  const s = scenario({ report: null, state: null });
+  s.fake.setScript(script(s, { gh: { queue: 'error' } }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 1, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.wouldMerge, false);
+  assert.ok(kinds(d.r).includes('queue-unreadable'), kinds(d.r).join());
+  assert.equal('queue' in d.r.json, false);
+});
+
+test('dry run, queue OFF: no `queue` field and no queueNote (today\'s output)', () => {
+  const s = scenario({ report: null, state: null });
+  s.fake.setScript(script(s));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal('queue' in d.r.json, false);
+  assert.equal('queueNote' in d.r.json.ownerStep, false);
+});
+
+test('dry run --owner-go with merge.hold_* keys: queue OFF reports a hold ahead; queue ON runs no hold check, lists no merge-hold blocker or `holds`', () => {
+  const ahead = { FAKE_HOLD_CHECK_SEQ: seq(answer(PR, [blocker(1400)])) };
+  const off = scenario({ yml: holdYml(), baseFiles: holdFiles, report: null, state: null });
+  off.fake.setScript(script(off));
+  const o = dry(off, ['--owner-go'], ahead);
+  assert.ok(kinds(o.r).includes('merge-hold'), kinds(o.r).join());
+  assert.ok('holds' in o.r.json);
+
+  const on = scenario({ yml: holdYml(), baseFiles: holdFiles, report: null, state: null });
+  on.fake.setScript(script(on, { gh: { queue: true } }));
+  const d = dry(on, ['--owner-go'], ahead);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.queue, true);
+  assert.ok(!kinds(d.r).includes('merge-hold'));
+  assert.equal('holds' in d.r.json, false);
+  assert.equal('holdEligible' in d.r.json.ownerStep, false);
+  assert.deepEqual(holdCalls(on), [], 'the hold provider was never asked');
 });

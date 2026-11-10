@@ -60,13 +60,19 @@ test('#58 chat repo: the repo\'s own merge command typed by hand is judged the s
 });
 
 test('#58 chat repo: auto-merge through the GraphQL API is refused (its node id cannot be checked)', () => {
+  // (merge queue, owner Q2: refused for every session, in every repo and directory, with or without the owner-go wiring; the answer is `P merge`)
   const q = "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input: {pullRequestId: \"PR_x\"}) { clientMutationId } }'";
-  assert.match(deny(q).reason, /auto-merge through the API skips the owner's "merge"/);
+  assert.match(deny(q).reason, /P merge --pr/);
   // (round 3: the node id may name a PR in a chat repo whatever the current directory is, so no directory makes it safe)
-  for (const cwd of ['/other', '/broken']) assert.match(deny(q, cwd).reason, /auto-merge through the API skips the owner's "merge".*P merge/s, cwd);
+  for (const cwd of ['/other', '/broken']) assert.match(deny(q, cwd).reason, /P merge --pr.*pins the approved head/s, cwd);
   deny(`cd /other && ${q}`, '/chat');
   deny(`false && cd /other; ${q}`, '/other');
-  assert.equal(evaluateGitCommand(q, { ...opts('/other'), ownerGo: null }).decision, 'allow', 'without the wiring nothing changes');
+  assert.equal(evaluateGitCommand(q, { ...opts('/other'), ownerGo: null }).decision, 'deny', 'without the wiring it is refused too');
+  for (const m of ['enqueuePullRequest(input: {pullRequestId: \"PR_x\", expectedHeadOid: \"abc\"})', 'dequeuePullRequest(input: {id: \"Q_x\"})']) {
+    const qq = `gh api graphql -f query='mutation { ${m} { clientMutationId } }'`;
+    for (const cwd of ['/chat', '/other']) assert.match(deny(qq, cwd).reason, /P merge --pr/, `${m} @ ${cwd}`);
+    assert.equal(evaluateGitCommand(qq, { ...opts('/other'), ownerGo: null }).decision, 'deny');
+  }
   allow("gh api graphql -f query='mutation { disablePullRequestAutoMerge(input: {pullRequestId: \"PR_x\"}) { clientMutationId } }'");
   allow("gh api graphql -f query='mutation { disablePullRequestAutoMerge(input: {pullRequestId: \"PR_x\"}) { clientMutationId } }'", '/other');
   allow("gh api graphql -f query='mutation { addComment(input: {subjectId: \"PR_x\", body: \"hi\"}) { clientMutationId } }'", '/other');

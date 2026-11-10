@@ -132,9 +132,11 @@ const LAUNCHD_PATH = ['/usr/bin', '/bin', '/usr/sbin', '/sbin']; // lsof is /usr
 
 // The LaunchAgent plist, generated deterministically so an unchanged install leaves the file alone. launchd's own PATH is
 // minimal, so the job gets the directories of node, git and gh as found at install time.
-export function schedulePlist({ nodePath, binPath, root, at, label, pathDirs, logFile, args = WORKTREES_PRUNE_ARGS }) {
-  const m = AT_RE.exec(at ?? '');
-  if (!m) throw new UsageError(`--at must be HH:MM (00-23:00-59), got ${JSON.stringify(at)}`);
+// `interval` (seconds) makes it a repeating job that also runs at load (the queue sweep); without it, a daily calendar job at `at` that does not.
+export function schedulePlist({ nodePath, binPath, root, at, label, pathDirs, logFile, args = WORKTREES_PRUNE_ARGS, interval = null }) {
+  const m = interval === null ? AT_RE.exec(at ?? '') : null;
+  if (interval !== null && !(Number.isInteger(interval) && interval >= 60)) throw new UsageError(`schedule: interval must be a whole number of seconds, at least 60, got ${JSON.stringify(interval)}`);
+  if (interval === null && !m) throw new UsageError(`--at must be HH:MM (00-23:00-59), got ${JSON.stringify(at)}`);
   const all = [nodePath, binPath, root, logFile, label, ...pathDirs, ...args];
   if (all.some((p) => /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(p))) throw new UsageError('schedule: a path contains a control character, which a plist cannot hold');
   const str = (v, pad) => `${pad}<string>${xmlEscape(v)}</string>`;
@@ -157,19 +159,23 @@ export function schedulePlist({ nodePath, binPath, root, at, label, pathDirs, lo
     '    <key>PATH</key>',
     str(searchPath, '    '),
     '  </dict>',
-    '  <key>StartCalendarInterval</key>',
-    '  <dict>',
-    '    <key>Hour</key>',
-    `    <integer>${Number(m[1])}</integer>`,
-    '    <key>Minute</key>',
-    `    <integer>${Number(m[2])}</integer>`,
-    '  </dict>',
+    ...(interval === null
+      ? [
+        '  <key>StartCalendarInterval</key>',
+        '  <dict>',
+        '    <key>Hour</key>',
+        `    <integer>${Number(m[1])}</integer>`,
+        '    <key>Minute</key>',
+        `    <integer>${Number(m[2])}</integer>`,
+        '  </dict>',
+      ]
+      : ['  <key>StartInterval</key>', `  <integer>${interval}</integer>`]),
     '  <key>StandardOutPath</key>',
     str(logFile, '  '),
     '  <key>StandardErrorPath</key>',
     str(logFile, '  '),
     '  <key>RunAtLoad</key>',
-    '  <false/>',
+    interval === null ? '  <false/>' : '  <true/>',
     '</dict>',
     '</plist>',
     '',
@@ -231,12 +237,14 @@ export function applyLaunchd({ action, plist, plistPath, label, launchctlFn, tzF
   bootout();
   const r = launchctlFn(['bootstrap', domain, plistPath]);
   if (r.code !== 0) throw new Fail(EXIT.USAGE, { ok: false, error: 'launchctl', message: `cannot load the LaunchAgent: ${r.stderr.trim() || `exit ${r.code}`}` });
+  const timed = plist.includes('<key>StartCalendarInterval</key>');
   const timezone = tzFn();
   const when = (() => {
     const m = /<key>Hour<\/key>\s*<integer>(\d+)<\/integer>\s*<key>Minute<\/key>\s*<integer>(\d+)<\/integer>/.exec(plist);
     return m ? `${m[1].padStart(2, '0')}:${m[2].padStart(2, '0')}` : 'the time';
   })();
   const result = { installed: true, line: plistPath, plist: plistPath, changed, timezone, note: 'launchd runs a missed run when the Mac wakes' };
+  if (!timed) return result; // an interval job has no clock time to qualify
   if (timezone === null) result.warning = `could not tell which time zone launchd runs in — ${when} is local time, not necessarily Asia/Manila`;
   else if (timezone !== 'Asia/Manila') result.warning = `launchd runs in ${timezone}, not Asia/Manila — ${when} is local time in that zone`;
   return result;

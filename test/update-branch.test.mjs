@@ -566,3 +566,34 @@ test('a "no checks reported" error that was cut at the buffer limit propagates i
   w.gh.checks = () => { throw new GhError({ code: 1, stderr: "no required checks reported on the 'main' branch", args: ['pr', 'checks'], overBuffer: true }); };
   await assert.rejects(() => run(w, { expectHead: A }), (e) => e.overBuffer === true);
 });
+
+// ---- queue mode: the merge queue tests the PR on top of the current base itself, so a moved base needs no catch-up ------------------
+
+test('update-branch, queue ON and the branch is behind: outcome queue-mode, updated:false, exit 0, no PUT', () => {
+  const s = scenario({ gh: { behindBy: 2, queue: true } });
+  const r = updateCli(s);
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.outcome, 'queue-mode');
+  assert.equal(r.json.updated, false);
+  assert.equal(r.json.head, s.head);
+  assert.deepEqual(puts(s), []);
+  assert.ok(!s.fake.lines().some((l) => l.includes('compare/')), 'the base is not even compared');
+});
+
+test('update-branch, queue state UNREADABLE: refuses (exit 1 queue-unreadable), never updates', () => {
+  const s = scenario({ gh: { behindBy: 2, queue: 'error' } });
+  const r = updateCli(s);
+  assertExit(r, 1, r.stdout);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.outcome, 'queue-unreadable');
+  assert.equal(r.json.updated, false);
+  assert.deepEqual(puts(s), []);
+});
+
+test('update-branch, queue OFF and behind: updates as before (one PUT)', () => {
+  const s = scenario({ gh: { behindBy: 2, queue: false } });
+  const r = updateCli(s);
+  assert.notEqual(r.json.outcome, 'queue-mode');
+  assert.equal(puts(s).length, 1);
+});

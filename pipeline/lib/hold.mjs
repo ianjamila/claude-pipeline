@@ -257,7 +257,7 @@ export async function withMergeLock({ gh, pr, env = {}, refuse, fn, alive = isPi
 // ---- recovery (rev 4 item 4) --------------------------------------------------------------------
 
 // A lift comment (ours, append-only) for the newest hold that is newer than that hold, with the PR open and the label gone: a run that lifted the hold died before
-// it finished. { orphan: {hold} | null, unverified: why | null, commentsUnreadable?: true }. Reads comments first (or takes the list the caller read); the timeline and
+// it finished. { orphan: {hold} | null, unverified: why | null, lift?: the lift comment's data, commentsUnreadable?: true }. Reads comments first (or takes the list the caller read); the timeline and
 // the PR only when a lift comment of ours exists. Fails closed: once a lift comment of ours is there, a timeline or PR that cannot be trusted is `unverified`, never "nothing".
 // The lift counts only when (a) no abort event of ours for that hold follows it, and (b) the first `unlabeled` event after the hold came within LIFT_WINDOW_MS of it
 // (a later one is somebody's manual removal).
@@ -296,7 +296,7 @@ export function findOrphanedLift({ gh, pr, comments: given }) {
     const gap = Date.parse(removal.at) - Date.parse(lifted.c.created_at);
     if (!Number.isFinite(gap)) return unverified('the lift comment has no usable time');
     if (gap < 0 || gap > LIFT_WINDOW_MS) return nothing; // a manual removal, not our delete
-    return { orphan: { hold: newest.id }, unverified: null };
+    return { orphan: { hold: newest.id }, unverified: null, lift: lifted.ev.data }; // (`lift`: what the lift comment recorded — head, items, the hold's login and time — for queue-mode recovery)
   } catch (err) {
     return unverified(`the lift could not be checked (${msg(err)})`);
   }
@@ -317,7 +317,11 @@ export function restoreLabel(gh, pr) {
 // The comments are read twice at most (strict only; one pause, shortened by PIPELINE_HOLD_RETRY_MS). `strict` (--owner-go): comments that stay unreadable refuse (an
 // interrupted lift cannot be ruled out). The gated route (strict false) tolerates ONLY a failed comments read (its run-record guard reads the same comments and fails closed by
 // itself); a lift comment present with a timeline / PR that cannot be verified refuses in BOTH routes.
-export async function recoverOrphanedLift({ gh, pr, refuse, strict = true, env = {}, sleep = defaultSleep, disableAuto = () => true }) {
+// Queue mode (`queue` given: { recover({ orphan, lift }) -> { action: 'proceed' | 'refuse' | 'today', error?, reasons?, extra? } }, merge-queue.mjs recoverQueuedLift): GitHub is asked
+// BEFORE anything is disarmed or restored, because a PR that is queued with its hold lifted looks exactly like an orphaned lift. 'proceed' = the record owns it
+// (the run goes on), 'refuse' = that refusal, 'today' = nothing is queued: the code below applies. A live entry is never disarmed (disablePullRequestAutoMerge is
+// never sent for it).
+export async function recoverOrphanedLift({ gh, pr, refuse, strict = true, env = {}, sleep = defaultSleep, disableAuto = () => true, queue = null }) {
   let comments;
   let readFailure = null;
   for (let attempt = 0; attempt < (strict ? 2 : 1); attempt += 1) {
@@ -334,9 +338,14 @@ export async function recoverOrphanedLift({ gh, pr, refuse, strict = true, env =
     if (!strict) return null;
     return refuse('hold-recovery', [`#${pr}: PR comments unreadable, so an interrupted hold lift cannot be ruled out: run again (${readFailure}). Nothing was merged`]);
   }
-  const { orphan, unverified } = findOrphanedLift({ gh, pr, comments });
+  const { orphan, unverified, lift } = findOrphanedLift({ gh, pr, comments });
   if (unverified !== null) return refuse('hold-recovery', [`#${pr}: could not check whether an earlier --owner-go run left a needs-human hold lifted (${unverified}): nothing was merged`]);
   if (orphan === null) return null;
+  if (queue !== null) {
+    const decision = await queue.recover({ orphan, lift });
+    if (decision.action === 'proceed') return null;
+    if (decision.action === 'refuse') return refuse(decision.error, decision.reasons, decision.extra ?? {});
+  }
   // The dead run may have armed auto-merge (the project's merge command can be `gh pr merge --auto`): disarm it, synchronously, BEFORE the label goes back, then look at the PR again.
   let disarmed = false;
   try {
@@ -394,7 +403,10 @@ function postAbort(gh, pr, hold, why) {
   }
 }
 
-export async function withHoldLifted({ gh, pr, hold, head, items, repo, env = {}, sleep = defaultSleep, proc = process, exit, refuse, check, merge, kill = killTree, disableAuto = () => {} }) {
+// Queue mode (`queue` given: { onSignal(), owns(), restored() }, merge-queue.mjs holdOnSignal / recordOwnsHold): the QUEUE ENTRY owns the lifted label once the
+// enqueue is confirmed, so a result that leaves the PR queued (`stillQueued`), or an enqueue whose outcome is not known yet, restores nothing and says the record
+// owns the lift; a signal asks `onSignal` (it never disarms auto-merge: there is none); a restore of a hold the record never owned clears it from the record.
+export async function withHoldLifted({ gh, pr, hold, head, items, repo, env = {}, sleep = defaultSleep, proc = process, exit, refuse, check, merge, kill = killTree, disableAuto = () => {}, queue = null }) {
   const base = { head };
   // 2. Still the bound hold, still applied: nothing has changed yet, so a mismatch just refuses.
   const again = readTimeline(gh, pr);
@@ -432,6 +444,15 @@ export async function withHoldLifted({ gh, pr, hold, head, items, repo, env = {}
   const running = { pid: undefined };
   const stopAndRestore = () => {
     try { kill(running.pid); } catch { /* the process is gone */ }
+    if (queue !== null) {
+      let verdict = { restore: false }; // the record cannot be read: leave the label and the entry alone
+      try { verdict = queue.onSignal(); } catch { /* as above */ }
+      if (verdict.restore) {
+        restoreSync();
+        try { verdict.done?.(); } catch { /* the sweep drops an idle record */ }
+      }
+      return;
+    }
     try { disableAuto(); } catch { /* expected when auto-merge was never enabled */ }
     restoreSync();
   };
@@ -503,8 +524,26 @@ export async function withHoldLifted({ gh, pr, hold, head, items, repo, env = {}
     removeSignals();
     return result;
   }
+  // Queue mode: a live entry (or an enqueue that may have landed) owns the lifted label now. Nothing is put back here; the record does it at a terminal end.
+  if (queue !== null) {
+    let owned = true; // an unreadable record counts as owning: never restore over a live entry
+    try { owned = queue.owns(); } catch { /* as above */ }
+    if (owned) {
+      removeSignals();
+      const note = { holdLifted: hold.id, holdRecordOwned: true, holdNote: 'needs-human stays lifted while the PR is in the merge queue (the queue record owns it); it is put back once if the PR leaves the queue unmerged — run P merge --pr again or P queue-sweep to settle it' };
+      if (threw) {
+        const error = thrown instanceof Error ? thrown : new Error(String(thrown));
+        error.message = `${error.message} (needs-human stays lifted: the merge-queue record owns it)`;
+        Object.assign(error, note);
+        throw error;
+      }
+      result.output = { ...result.output, ...note };
+      return result;
+    }
+  }
   // Nothing merged (command failure, timeout, closed, blocked, a refusal, an exception): the hold comes back, after abandonMerge (merge() did that).
   const back = await putBack({ gh, pr, hold, env, sleep });
+  if (queue !== null) { try { queue.restored(); } catch { /* the sweep drops an idle record */ } }
   if (back.status === 'kept' || back.status === 'unverified') postAbort(gh, pr, hold, back.status === 'kept' ? 'the label never left' : 'the label is on the PR but a new hold could not be confirmed');
   removeSignals();
   if (back.status === 'merged') {

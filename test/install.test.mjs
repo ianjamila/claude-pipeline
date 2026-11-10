@@ -2137,3 +2137,17 @@ test('the round-trip script fails when a stack hook stays registered after unins
   assert.equal(missing.status, 1, 'and "present" fails once they are gone');
   assert.match(missing.stderr, /stack-dev-bind \(PostToolUse, matcher Bash\): 0 entries, expected 1/);
 });
+
+test('the queue-sweep schedule belongs to the user\'s own claude-home: a scratch home installs, checks and uninstalls without writing a plist or touching launchctl', () => {
+  const home = newHome();
+  const r = install(home, ['--json']);
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  assert.deepEqual(JSON.parse(r.stdout).queueSweep, { installed: false, applicable: false });
+  assert.equal(existsSync(join(r.userHome, 'Library', 'LaunchAgents')), false, 'no LaunchAgent written for a scratch home');
+  const c = install(home, ['--check', '--json']);
+  assert.equal(c.status, 0, c.stderr + c.stdout);
+  assert.deepEqual(JSON.parse(c.stdout).drift, [], 'a scratch home has no schedule to be missing');
+  const u = install(home, ['--uninstall', '--json']);
+  assert.equal(u.status, 0, u.stderr + u.stdout);
+  assert.deepEqual(JSON.parse(u.stdout).queueSweep, { removed: false });
+});
