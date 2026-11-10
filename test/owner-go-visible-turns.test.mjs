@@ -10,12 +10,12 @@ import { tmpdir } from 'node:os';
 import {
   lastReply, recordApproval, recordRoundGrant, recordRuling, entrySource, queuedNudge, QUEUED_NUDGE, RULING_NUDGE, approvalGap, ownerGrantGap, ownerRuled, ownerRulingGap, promptProvenance,
 } from '../pipeline/hooks/lib/owner-go.mjs';
-import { OWNER_ENTRY, mergeRequest, roundRequest, rulingRequest, runHook } from './helpers/owner-go.mjs';
+import { OWNER_ENTRY, link, linesOf, mergeRequest, roundRequest, rulingRequest, runHook } from './helpers/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
 let pid = 0;
-const prompt = (text, meta = OWNER_ENTRY) => ({ type: 'user', message: { content: text }, promptId: `pid-${++pid}`, ...meta });
+const prompt = (text, meta = OWNER_ENTRY) => { const n = ++pid; return { type: 'user', message: { content: text }, promptId: `pid-${n}`, uuid: `u-prompt-${n}`, ...meta }; };
 const said = (text) => ({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
 const toolOnly = () => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] } });
 const toolResult = () => ({ type: 'user', message: { content: [{ type: 'tool_result', content: 'ok' }] } });
@@ -41,21 +41,21 @@ const KINDS = {
 const STRICT = ['merge', 'round']; // the kinds read without skipSynthetic
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'owner-go-visible-'));
-function run(kind, entries, answer = KINDS[kind].answer) {
+function record(kind, entries, answer = KINDS[kind].answer) {
   const home = tmp();
   mkdirSync(join(home, 'p'), { recursive: true });
   const file = join(home, 'p', 't.jsonl');
-  writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
-  const r = KINDS[kind].rec({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: answer, transcript_path: file }, { home });
-  return KINDS[kind].bound(r);
+  writeFileSync(file, linesOf(entries));
+  return KINDS[kind].rec({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: answer, transcript_path: file }, { home });
 }
+const run = (kind, entries, answer = KINDS[kind].answer) => KINDS[kind].bound(record(kind, entries, answer));
 const withOwner = (kind, entries) => [...entries, prompt(KINDS[kind].answer)];
 const filler = (mb) => `${JSON.stringify(said('x'.repeat(1024 * 1024 - 100)))}\n`.repeat(mb);
 function runFile(kind, lines, tailEntries = []) {
   const home = tmp();
   mkdirSync(join(home, 'p'), { recursive: true });
   const file = join(home, 'p', 't.jsonl');
-  writeFileSync(file, lines + `${[...tailEntries, prompt(KINDS[kind].answer)].map((e) => JSON.stringify(e)).join('\n')}\n`);
+  writeFileSync(file, lines + linesOf([...tailEntries, prompt(KINDS[kind].answer)]));
   const r = KINDS[kind].rec({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: KINDS[kind].answer, transcript_path: file }, { home });
   return KINDS[kind].bound(r);
 }
@@ -95,7 +95,7 @@ test('#191 A2: an owner-turn request still records (control)', () => {
 
 test('#191 A2: the invisible turn\'s text never reaches lastReply, whatever the mode', () => {
   const file = join(tmp(), 't.jsonl');
-  writeFileSync(file, [prompt('go'), said('mine'), prompt('poll', SDK), said('hidden'), prompt('done')].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  writeFileSync(file, linesOf([prompt('go'), said('mine'), prompt('poll', SDK), said('hidden'), prompt('done')]));
   assert.equal(lastReply(file, { prompt: 'done' }).text, '');
   assert.equal(lastReply(file, { prompt: 'done', skipSynthetic: true }).text, '');
 });
@@ -117,22 +117,24 @@ test('#191 F1: a future promptSource value (provenance field, source unknown) is
 test('#191 A3: a window that starts inside a turn (its prompt cut off) never yields that turn as a reply, for all three recorders', () => {
   for (const kind of Object.keys(KINDS)) {
     // the sdk prompt and 5 MB of its output precede the window; the ask is the turn's last text, then the owner's answer
-    const lines = `${JSON.stringify(prompt('poll', SDK))}\n${filler(5)}${JSON.stringify(said(KINDS[kind].ask))}\n`;
+    const cutOff = prompt('poll', SDK);
+    const lines = `${JSON.stringify(cutOff)}\n${filler(5)}${JSON.stringify({ ...said(KINDS[kind].ask), uuid: 'u-ask', parentUuid: cutOff.uuid })}\n`; // (the window starts after the prompt: the ask's parent is not in it)
     assert.equal(runFile(kind, lines), false, kind);
   }
 });
 
 test('#191 A3: a window that holds the opening owner prompt of the reply still records (control)', () => {
   for (const kind of Object.keys(KINDS)) {
-    const lines = `${filler(5)}${JSON.stringify(prompt('ship it'))}\n${JSON.stringify(said(KINDS[kind].ask))}\n`;
-    assert.equal(runFile(kind, lines), true, `${kind}: file larger than the window`);
-    assert.equal(runFile(kind, `${JSON.stringify(prompt('ship it'))}\n${JSON.stringify(said(KINDS[kind].ask))}\n`), true, `${kind}: small file`);
+    const opening = prompt('ship it');
+    const small = linesOf([opening, said(KINDS[kind].ask)]);
+    assert.equal(runFile(kind, `${filler(5)}${small}`), true, `${kind}: file larger than the window`);
+    assert.equal(runFile(kind, small), true, `${kind}: small file`);
   }
 });
 
 test('#191 A3: text before the first prompt (no known origin) is never a reply', () => {
   const file = join(tmp(), 't.jsonl');
-  writeFileSync(file, [said(MERGE_ASK), prompt('merge')].map((e) => JSON.stringify(e)).join('\n') + '\n');
+  writeFileSync(file, linesOf([said(MERGE_ASK), prompt('merge')]));
   assert.deepEqual(lastReply(file, { prompt: 'merge' }), { text: '', promoted: false });
   assert.deepEqual(lastReply(file, { prompt: 'merge', skipSynthetic: true }), { text: '', promoted: false });
 });
@@ -180,7 +182,7 @@ test('#191 F1 (rulings): a provenance-bearing prompt of unknown source is skippe
   // lastReply says the same: skipped, nothing promoted
   const file = join(tmp(), 't.jsonl');
   mkdirSync(join(file, '..'), { recursive: true });
-  writeFileSync(file, `${[prompt('go'), prompt('poll', FUTURE), said(RULING_ASK), prompt('done')].map((e) => JSON.stringify(e)).join('\n')}\n`);
+  writeFileSync(file, linesOf([prompt('go'), prompt('poll', FUTURE), said(RULING_ASK), prompt('done')]));
   assert.deepEqual(lastReply(file, { prompt: 'done', skipSynthetic: true }), { text: '', promoted: false });
 });
 
@@ -226,7 +228,7 @@ test('#191 F3/F6: the nudge text tells the agent what happened and what to do', 
 const hookInput = (entries, answer, extra = {}) => {
   const dir = tmp();
   const file = join(dir, 't.jsonl');
-  writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  writeFileSync(file, linesOf(entries));
   return { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', prompt: answer, transcript_path: file, ...extra };
 };
 test('#191 F3: queuedNudge applies to a merge, an extra round and a ruling answer whose entry is queued, and to nothing else', () => {
@@ -257,7 +259,7 @@ function recordedThen(kind, meta) {
   mkdirSync(dir, { recursive: true });
   const file = join(dir, 't.jsonl');
   const before = [prompt('ship it'), said(KINDS[kind].ask)];
-  const writeAll = (entries) => writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  const writeAll = (entries) => writeFileSync(file, linesOf(entries));
   writeAll(before);
   const answer = KINDS[kind].answer;
   const rec = KINDS[kind].rec({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: answer, prompt_id: 'pid-ans', transcript_path: file }, { home, now });
@@ -279,5 +281,145 @@ test('#191 B2: a record written before the transcript had the entry is refused a
     const typed = recordedThen(kind, OWNER_ENTRY);
     assert.equal(promptProvenance(typed.rec, { home: typed.home }), 'owner');
     assert.equal(GAPS[kind](typed), 'ok', `${kind}: typed`);
+  }
+});
+
+// ---- R1-B1: text belongs to the prompt it was written for (uuid / parentUuid), not to the prompt that happens to be newest ---------------------------
+// A headless `claude -p --resume <session>` process appends to the owner's transcript while the owner types and the interactive session answers. Its output interleaves with the
+// owner's turn, so "the assistant text after the last prompt" is no proof of who wrote it. Each assistant entry (and each tool result) is attributed to its originating prompt through
+// the parentUuid chain; text whose origin is an invisible turn is never the owner's reply, whatever its position.
+
+const ASK59 = { merge: mergeRequest(59, HEAD, ITEMS), round: roundRequest(59, 2, HEAD), ruling: rulingRequest(59, ['R1-B1']) };
+const of = (p, e) => ({ ...e, parentUuid: p.uuid }); // an entry written for prompt `p` (what its process chains it to)
+const pr = (kind, r) => (r === null ? null : kind === 'merge' ? r.requests.map((q) => q.pr) : r.pr); // the PR a record binds
+const bound58 = (kind) => (kind === 'merge' ? [58] : 58);
+
+test('#191 R1-B1 (interleaving 1): an sdk turn started BEFORE the owner\'s prompt appends its request after the interactive reply: only the owner-turn ask binds', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const sdk = prompt('poll', SDK);
+    const owner = prompt('ship it');
+    // sdk prompt, owner prompt, the interactive reply asks for #58, then the still-running sdk process writes its #59 request, then the owner answers
+    const entries = [sdk, owner, of(owner, said(KINDS[kind].ask)), of(sdk, said(ASK59[kind])), prompt(KINDS[kind].answer)];
+    assert.deepEqual(pr(kind, record(kind, entries)), bound58(kind), `${kind}: the request the owner saw`);
+    // the owner-turn reply asked for nothing: the sdk request binds nothing
+    const silent = [sdk, owner, of(owner, said('working on it')), of(sdk, said(ASK59[kind])), prompt(KINDS[kind].answer)];
+    assert.equal(run(kind, silent), false, `${kind}: nothing in the owner turn`);
+    // a tool-only sdk tail does not turn the owner-turn ask stale either
+    const quiet = [sdk, owner, of(owner, said(KINDS[kind].ask)), of(sdk, toolOnly()), of(sdk, toolResult()), prompt(KINDS[kind].answer)];
+    assert.deepEqual(pr(kind, record(kind, quiet)), bound58(kind), `${kind}: sdk tool calls after the ask`);
+  }
+});
+
+test('#191 R1-B1 (interleaving 2): an sdk prompt written DURING the interactive reply: its request binds nothing, the owner-turn ask (written last) binds', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const owner = prompt('ship it');
+    const sdk = prompt('poll', SDK);
+    const entries = [owner, of(owner, said('checking')), sdk, of(sdk, said(ASK59[kind])), of(owner, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)];
+    assert.deepEqual(pr(kind, record(kind, entries)), bound58(kind), `${kind}: the request the owner saw`);
+    const silent = [owner, of(owner, said('checking')), sdk, of(sdk, said(ASK59[kind])), of(owner, said('done')), prompt(KINDS[kind].answer)];
+    assert.equal(run(kind, silent), false, `${kind}: nothing in the owner turn`);
+    // the sdk turn is the last thing written: the strict A2 rule stays (an invisible turn after the owner's reply makes it stale)
+    const trailing = [owner, of(owner, said(KINDS[kind].ask)), sdk, of(sdk, said(ASK59[kind])), prompt(KINDS[kind].answer)];
+    assert.equal(run(kind, trailing), false, `${kind}: sdk turn opened after the owner's reply ended`);
+  }
+});
+
+test('#191 R1-B1: an sdk request appended after the owner\'s typed answer (and before the transcript caught up) binds nothing', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const sdk = prompt('poll', SDK);
+    const owner = prompt('ship it');
+    const entries = [sdk, owner, of(owner, said(KINDS[kind].ask)), prompt(KINDS[kind].answer), of(sdk, said(ASK59[kind]))];
+    // (the owner's answer is no longer the newest entry: the reply read is the owner-turn one, not the sdk text)
+    assert.deepEqual(pr(kind, record(kind, entries)), bound58(kind), `${kind}: never the sdk request`);
+  }
+});
+
+test('#191 R1-B1 (c): an assistant entry whose parent chain does not resolve inside the window is dropped (missing parent, unknown uuid, cycle, a chain ending at no prompt)', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const owner = prompt('ship it');
+    const good = of(owner, said(KINDS[kind].ask));
+    const answer = prompt(KINDS[kind].answer);
+    const orphans = {
+      'parentUuid null': { ...said(ASK59[kind]), parentUuid: null },
+      'parent outside the window': { ...said(ASK59[kind]), parentUuid: 'u-not-in-this-file' },
+      'no uuid at all': (() => { const e = { ...said(ASK59[kind]) }; delete e.parentUuid; return { ...e, uuid: undefined, parentUuid: undefined }; })(),
+      'self cycle': { ...said(ASK59[kind]), uuid: 'u-cycle', parentUuid: 'u-cycle' },
+    };
+    for (const [name, orphan] of Object.entries(orphans)) {
+      // after the owner-turn ask: the dropped entry changes nothing
+      assert.deepEqual(pr(kind, record(kind, [owner, good, orphan, answer])), bound58(kind), `${kind}: ${name}`);
+      // alone: nothing binds
+      assert.equal(run(kind, [owner, orphan, answer]), false, `${kind}: ${name} alone`);
+    }
+    const a = { ...said(ASK59[kind]), uuid: 'u-cyc-a', parentUuid: 'u-cyc-b' };
+    const b = { ...said(ASK59[kind]), uuid: 'u-cyc-b', parentUuid: 'u-cyc-a' };
+    assert.equal(run(kind, [owner, a, b, answer]), false, `${kind}: two-entry cycle`);
+    // a chain that ends at an assistant entry with no parent (not at a prompt)
+    const root = { ...said('x'), uuid: 'u-root', parentUuid: null };
+    assert.equal(run(kind, [owner, root, { ...said(KINDS[kind].ask), parentUuid: 'u-root' }, answer]), false, `${kind}: chain ends at a parentless assistant entry`);
+    // two entries claiming one uuid make the chain ambiguous
+    const twin1 = { ...said('x'), uuid: 'u-twin', parentUuid: owner.uuid };
+    const twin2 = { ...said('y'), uuid: 'u-twin', parentUuid: owner.uuid };
+    assert.equal(run(kind, [owner, twin1, twin2, { ...said(KINDS[kind].ask), parentUuid: 'u-twin' }, answer]), false, `${kind}: duplicate uuid`);
+  }
+});
+
+test('#191 R1-B1 (c): a tool result inside an invisible turn, or with an unresolved chain, never reaches the ruling slot as owner-turn content', () => {
+  // a ruling ask in the owner's turn; an sdk tool_result that surfaces an ask is the sdk turn's content: it never voids the owner's slot when the turn was written during it
+  const owner = prompt('ship it');
+  const sdk = prompt('poll', SDK);
+  const entries = [owner, of(owner, said('checking')), sdk, of(sdk, { type: 'user', message: { content: [{ type: 'tool_result', content: 'ruling-request R1-B1 for PR #59?' }] } }), of(owner, said(RULING_ASK)), prompt('R1-B1: accept')];
+  assert.deepEqual(pr('ruling', record('ruling', entries)), 58);
+  // a tool result nobody can place is dropped (it would void the slot if it were the owner's)
+  const stray = { type: 'user', message: { content: [{ type: 'tool_result', content: 'ruling-request R1-B1 for PR #59?' }] }, parentUuid: 'u-gone' };
+  assert.deepEqual(pr('ruling', record('ruling', [owner, of(owner, said(RULING_ASK)), stray, prompt('R1-B1: accept')])), 58);
+});
+
+test('#191 R1-B1 (d): controls: a proper chain still binds; late text from an OLDER visible turn revives nothing and voids nothing', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const first = prompt('ship it');
+    const answer = prompt(KINDS[kind].answer);
+    assert.deepEqual(pr(kind, record(kind, [first, of(first, said('one')), of(first, said(KINDS[kind].ask)), answer])), bound58(kind), `${kind}: a plain visible turn`);
+    // an older visible turn writes its (new) ask after a newer prompt: only the reply slot right before the owner's current prompt is read, and that one is empty
+    const second = prompt('keep going');
+    assert.equal(run(kind, [first, of(first, said(KINDS[kind].ask)), second, of(second, toolOnly()), of(first, said(ASK59[kind])), answer]), false, `${kind}: late text from an older turn does not bind`);
+    // ... and a visible ask in the newest turn still binds when an older turn's late text arrives after it
+    assert.deepEqual(pr(kind, record(kind, [first, of(first, said('x')), second, of(second, said(KINDS[kind].ask)), of(first, said(ASK59[kind])), answer])), bound58(kind), `${kind}: late text from an older turn voids nothing`);
+  }
+});
+
+const BOUNDARY = { type: 'system', subtype: 'compact_boundary' };
+const SUMMARY = { type: 'user', message: { role: 'user', content: 'This session is being continued from a previous conversation.' }, isCompactSummary: true, isVisibleInTranscriptOnly: true, entrypoint: 'cli' };
+
+test('#191 R1-B1 (d): a compaction in the chain is transparent: between the ask and the answer, and in the middle of a turn', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const owner = prompt('ship it');
+    // ask, compaction, answer (the summary opens no slot)
+    assert.deepEqual(pr(kind, record(kind, [owner, of(owner, said(KINDS[kind].ask)), BOUNDARY, SUMMARY, prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: compaction before the answer`);
+    // auto-compact in the middle of the owner's turn: the text after the summary chains through it (boundary: parentUuid null, logicalParentUuid the entry before) to the owner's prompt
+    assert.deepEqual(pr(kind, record(kind, [owner, of(owner, said('working')), BOUNDARY, SUMMARY, said(KINDS[kind].ask), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: compaction in the middle of the turn`);
+    // the same in an sdk turn: the compaction does not turn its text into the owner's
+    const sdk = prompt('poll', SDK);
+    assert.equal(run(kind, [owner, of(owner, said('x')), sdk, of(sdk, said('working')), BOUNDARY, SUMMARY, said(ASK59[kind]), prompt(KINDS[kind].answer)]), false, `${kind}: compaction inside an invisible turn`);
+    // a boundary whose logical parent is outside the window leaves the text unplaced: dropped
+    assert.equal(run(kind, [owner, { ...BOUNDARY, parentUuid: null, logicalParentUuid: 'u-gone' }, SUMMARY, said(KINDS[kind].ask), prompt(KINDS[kind].answer)]), false, `${kind}: compaction with its past outside the window`);
+  }
+});
+
+test('#191 R1-B1: a legacy transcript (no entry has a uuid) keeps the positional attribution; one uuid anywhere makes it a modern one', () => {
+  const strip = (entries) => entries.map(({ uuid, parentUuid, ...e }) => e);
+  for (const kind of Object.keys(KINDS)) {
+    const mk = (entries) => {
+      const home = tmp();
+      mkdirSync(join(home, 'p'), { recursive: true });
+      const file = join(home, 'p', 't.jsonl');
+      writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
+      return KINDS[kind].rec({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: KINDS[kind].answer, transcript_path: file }, { home });
+    };
+    const plain = [prompt('ship it'), said(KINDS[kind].ask), prompt(KINDS[kind].answer)];
+    assert.equal(KINDS[kind].bound(mk(strip(plain))), true, `${kind}: legacy, plain turn`);
+    assert.equal(KINDS[kind].bound(mk(strip([prompt('ship it'), prompt('poll', SDK), said(KINDS[kind].ask), prompt(KINDS[kind].answer)]))), false, `${kind}: legacy, invisible turn (A2 by position)`);
+    // the attacker cannot choose the fallback by wording; one entry with a uuid (a system line, say) makes the file modern and the unchained assistant entry is dropped
+    assert.equal(KINDS[kind].bound(mk([...strip(plain.slice(0, 2)), { type: 'system', subtype: 'turn_duration', uuid: 'u-sys' }, ...strip(plain.slice(2))])), false, `${kind}: one uuid anywhere -> modern`);
   }
 });
