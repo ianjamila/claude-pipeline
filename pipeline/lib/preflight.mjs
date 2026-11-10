@@ -8,6 +8,7 @@ import { repoRoot } from './repo.mjs';
 import { isClean } from './git.mjs';
 import { run, codexCommand } from './proc.mjs';
 import { createGitHub } from './github.mjs';
+import { claudeCodeStatus } from './claude-code-version.mjs';
 
 const CODEX_TIMEOUT_MS = 15_000;
 
@@ -129,6 +130,14 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
     clean = isClean({ cwd: root });
   } catch { /* not a repo, or git failed: not provably clean */ }
 
+  // The terminal's Claude Code build against the installed one (plan 2026-11-10, A3). Informational: it never changes canMerge.
+  let claudeCode = { running: null, installed: null, stale: null };
+  try { claudeCode = claudeCodeStatus(env); } catch { /* unreadable: unknown */ }
+  const warnings = [];
+  if (claudeCode.stale === true) {
+    warnings.push(`this terminal runs Claude Code ${claudeCode.running} but ${claudeCode.installed} is installed: restart it before a review's Fable pass`);
+  }
+
   const enforcementOk = declared === 'gate' || enforcement.mode === 'github';
   const reasons = [];
   if (!config.ok) reasons.push(`pipeline config is not usable: ${config.errors.join('; ')}`);
@@ -147,7 +156,9 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
     rollback,
     codex: codexState,
     clean,
+    claudeCode,
     canMerge: config.ok && authed && !off && !pause.open && !rollback.open && enforcementOk,
     reasons,
+    warnings,
   };
 }
