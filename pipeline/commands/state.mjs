@@ -10,10 +10,10 @@ import { grantIdOf, ownerGrantedRounds } from '../hooks/lib/owner-go.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { loadState, saveState, updateItems } from '../lib/state.mjs';
-import { isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
+import { finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome } from '../lib/triage.mjs';
 import { readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
-  allItems, canonicalJson, currentContentHash, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
+  allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
   roundDir, stateExtends, withStateLock,
 } from '../lib/review-context.mjs';
 
@@ -25,8 +25,8 @@ export const meta = {
     '  with --pr and a local state: the published (triage comment) state is authoritative. Local is kept (source local) when it',
     '  equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,',
     '  quarantinedTo) and the published state is restored. source is local | published | quarantined | local-ahead | local-unverified',
-    '  (local-ahead: the PR still holds what this copy last published, and the local copy holds a second-review verdict or a Claude / forced final that was',
-    '  never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final): kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline',
+    '  (local-ahead: the PR still holds what this copy last published, every published round and item is still in the local copy, and the local copy holds a second-review verdict or a Claude / forced final that was',
+    '  never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final), or an implementation mark or a follow-up issue link added after the last publish: kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline',
     '  (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)',
     '  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)',
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
@@ -93,14 +93,57 @@ const continuesPublished = (mine, theirs) => {
 };
 const isObjectLike = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
+const itemKey = (i) => decidedItemsKey({ items: [i] });
+// A second-review verdict and / or a Claude / forced final saved next to a published item that has none. It is the WHOLE local change: the rest of the decided
+// fields (everything but `final` and `secondReview`) are as published, the verdict is new (or unchanged), and the final is unchanged or a new protected final over
+// a final that is not the owner's (the owner's ruling is never replaced by Claude's) and can still be reopened (waits for a human, or is a Claude dismissal: finalIsReopenable) and, where it records what it overruled, overruled exactly the published final.
+// `triage second-review` writes the verdict and a forced ACCEPT final (overruling the final it found) together, so that pair is covered; so is a verdict followed by
+// a Claude ruling, and a final that CONTINUES the published one (continuesPublished) is accepted on the same terms. Anything else riding along (a flipped
+// `implemented`, a loosened final, a changed field) is not saved work.
+const rest = (i) => itemKey({ ...i, final: undefined, secondReview: undefined });
+function savedRulingIsAhead(i, before) {
+  if (rest(i) !== rest(before)) return false;
+  const verdictAdded = i.secondReview !== undefined && before.secondReview === undefined;
+  if (!verdictAdded && canonicalJson(i.secondReview) !== canonicalJson(before.secondReview)) return false;
+  // The writers never reopen a settled final (triage.mjs secondReviewRefusal / claudeRulingRefusal), so neither a verdict nor a ruling over one is saved work.
+  if (canonicalJson(i.final) === canonicalJson(before.final)) return verdictAdded && finalIsReopenable(before);
+  if (continuesPublished(i, before)) return true;
+  if (!isProtectedFinal(i) || isProtectedFinal(before) || isOwnerRuled(before) || !finalIsReopenable(before)) return false;
+  const overruled = i.final.claude?.overruled;
+  if (overruled !== undefined && canonicalJson(overruled) !== canonicalJson(before.final)) return false;
+  return i.final.forcedBy === undefined || verdictAdded;
+}
+// One item of the local copy against the published one: a permitted "ahead" change. Either saved ruling work on its own (savedRulingIsAhead above), or a mark
+// added where the published item had none (`state mark-implemented`, `followups create`) with the item otherwise unchanged, so neither carries an unrelated edit
+// with it. A changed or removed mark is not ahead.
+function itemIsAhead(i, before) {
+  if (savedRulingIsAhead(i, before)) return true;
+  const addImplemented = Boolean(i.implemented) && before.implemented === undefined;
+  const addFollowup = Boolean(i.followupIssue) && before.followupIssue === undefined;
+  if (!addImplemented && !addFollowup) return false;
+  return itemKey({ ...i, ...(addImplemented ? { implemented: undefined } : {}), ...(addFollowup ? { followupIssue: undefined } : {}) }) === itemKey(before);
+}
+
+// Kept as local-ahead only when the local copy still holds EVERYTHING the PR holds (every published round with the same n, toHead and contentHashAtToHead, and
+// every published item of it), each item either unchanged or ahead by a permitted change, and at least one is ahead: the next publication replaces the PR's
+// state with this copy, so a copy that lost a published item or round would drop it from the PR. Extra local rounds and items (an unpublished trailing round) are fine.
 function localAheadOfPublished(local, published, baseline) {
   if (baseline === null || published.hash !== baseline) return false;
-  const theirs = new Map((published.state.rounds ?? []).flatMap((r) => r.items ?? []).map((i) => [i.id, i]));
-  return (local.rounds ?? []).flatMap((r) => r.items ?? []).some((i) => {
-    const before = theirs.get(i.id);
-    return before !== undefined && ((i.secondReview !== undefined && before.secondReview === undefined) || (isProtectedFinal(i) && !isProtectedFinal(before))
-      || continuesPublished(i, before));
-  });
+  const mine = new Map((local.rounds ?? []).map((r) => [r.n, r]));
+  let ahead = false;
+  for (const p of published.state.rounds ?? []) {
+    const r = mine.get(p.n);
+    if (r === undefined || r.toHead !== p.toHead || r.contentHashAtToHead !== p.contentHashAtToHead) return false;
+    const have = new Map((r.items ?? []).map((i) => [i.id, i]));
+    for (const before of p.items ?? []) {
+      const i = have.get(before.id);
+      if (i === undefined) return false;
+      if (itemKey(i) === itemKey(before)) continue;
+      if (!itemIsAhead(i, before)) return false;
+      ahead = true;
+    }
+  }
+  return ahead;
 }
 
 async function show(rest, ctx) {
@@ -157,7 +200,7 @@ async function showLocked(values, n, pr, root, ctx) {
     if (found?.state && !stateExtends(state, found.state)) {
       if (localAheadOfPublished(state, found, readBaseline(root, pr))) {
         source = 'local-ahead';
-        warnings.push(`the local review state holds a second-review verdict, a Claude ruling (or a change to one) or an owner ruling that the published triage comment lacks (it was saved but not published): kept as is; publish it now with \`pipeline comment --pr ${pr} --kind triage\``);
+        warnings.push(`the local review state holds a second-review verdict, a Claude ruling (or a change to one), an owner ruling, an implementation mark or a follow-up issue link that the published triage comment lacks (it was saved but not published): kept as is; publish it now with \`pipeline comment --pr ${pr} --kind triage\``);
       } else {
         quarantinedTo = path.relative(root, quarantineReviewDir(root)).split(path.sep).join('/');
         state = found.state;

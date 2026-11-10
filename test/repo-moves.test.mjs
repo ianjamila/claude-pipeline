@@ -1,10 +1,10 @@
 // hooks/lib/repo-moves.mjs: reading the owner's repo-moves file (fail closed) and the one-way, record-predates-the-move name match.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { MAX_HOPS, readRepoMoves, REPO_MOVES_DIR_REL, REPO_MOVES_FILE, repoMovesPath, sameRepo } from '../pipeline/hooks/lib/repo-moves.mjs';
+import { appendRepoMove, MAX_HOPS, readRepoMoves, REPO_MOVES_DIR_REL, REPO_MOVES_FILE, repoMovesPath, sameRepo } from '../pipeline/hooks/lib/repo-moves.mjs';
 import { OWNER_GO_REL } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'repo-moves-'));
@@ -121,11 +121,12 @@ test('sameRepo: a chain of moves, each hop after the record; a late hop or a gap
   assert.equal(same(A, '2026-11-07T00:00:00Z', C, chain), false, 'the first hop predates the record');
   assert.equal(same(A, BEFORE, C, [mv(A, B, MOVED)]), false, 'no hop to the current name');
   assert.equal(same(A, BEFORE, C, [mv(B, C, AFTER)]), false, 'no hop from the recorded name');
-  assert.equal(same(A, BEFORE, C, [mv(A, 'other/app', MOVED), mv(A, B, MOVED), mv(B, C, AFTER)]), true, 'a branch that goes nowhere does not hide the right one');
+  assert.equal(same(A, BEFORE, C, [mv(A, 'other/app', '2026-11-06T00:00:00Z'), mv(A, B, MOVED), mv(B, C, AFTER)]), true, 'a later departure from the recorded name does not hide the earliest one');
+  assert.equal(same(A, BEFORE, C, [mv(A, 'other/app', MOVED), mv(A, B, MOVED), mv(B, C, AFTER)]), false, 'two departures at the same instant are ambiguous (#223): no alias');
 });
 
 test('sameRepo: a cycle ends (time only moves forwards) and a chain longer than the hop limit is refused', () => {
-  const cycle = [mv(A, B, MOVED), mv(B, A, AFTER), mv(B, 'x/y', AFTER)];
+  const cycle = [mv(A, B, MOVED), mv(B, A, AFTER), mv(A, 'x/y', '2026-11-10T00:00:00Z')];
   assert.equal(same(A, BEFORE, C, cycle), false);
   assert.equal(same(A, BEFORE, 'x/y', cycle), true);
   const long = (n) => Array.from({ length: n }, (_, i) => mv(`n${i}/app`, `n${i + 1}/app`, new Date(Date.parse(MOVED) + i * 1000).toISOString()));
@@ -188,4 +189,30 @@ test('sameRepo: a chain may return to an earlier name (a -> b -> a -> c is one r
 
 test('sameRepo: an unparseable or missing recordedAt allows an exact match only', () => {
   for (const bad of ['yesterday', '', undefined, null, 5]) assert.equal(same(A, bad, C, [mv(A, C, MOVED)]), false, String(bad));
+});
+
+test('sameRepo: two departures from one name at the same earliest instant are ambiguous even with the same repoId (first hop and later hop)', () => {
+  // #223: a mistyped --to then the corrected one at the same --at, both for repository 1.
+  const first = [mv('org/a', 'org/b', '2026-11-09T10:00:00Z', 1), mv('org/a', 'org/c', '2026-11-09T10:00:00Z', 1)];
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/b', first), false, 'first hop tie, the old target');
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', first), false, 'first hop tie, the corrected target');
+  const later = [mv('org/a', 'org/b', '2026-11-09T10:00:00Z', 1), mv('org/b', 'org/c', '2026-11-09T11:00:00Z', 1), mv('org/b', 'org/d', '2026-11-09T11:00:00Z', 1)];
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/c', later), false, 'later hop tie, one branch');
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/d', later), false, 'later hop tie, the other branch');
+  assert.equal(same('org/a', '2026-11-09T09:00:00Z', 'org/b', later), true, 'the hop before the tie still aliases');
+});
+
+test('appendRepoMove: a second record leaving the same name at the same instant for a different place is refused; an exact duplicate is a no-op', () => {
+  const home = homeWith();
+  const one = { from: 'org/a', to: 'org/b', at: '2026-11-09T10:00:00Z', repoId: 1 };
+  assert.equal(appendRepoMove(one, { home }).added, true);
+  const before = readFileSync(repoMovesPath(home), 'utf8');
+  const clash = appendRepoMove({ from: 'ORG/a', to: 'org/c', at: '2026-11-09T10:00:00.000Z', repoId: 1 }, { home });
+  assert.equal(clash.ok, false);
+  assert.match(clash.reason, /cannot leave one name for two places at once/);
+  assert.equal(readFileSync(repoMovesPath(home), 'utf8'), before, 'the file is unchanged');
+  const dupe = appendRepoMove({ ...one, at: '2026-11-09T10:00:00.000Z' }, { home });
+  assert.deepEqual([dupe.ok, dupe.added], [true, false]);
+  assert.equal(readFileSync(repoMovesPath(home), 'utf8'), before);
+  assert.equal(appendRepoMove({ from: 'org/a', to: 'org/c', at: '2026-11-09T10:00:01Z', repoId: 1 }, { home }).added, true, 'a different instant is a new fact');
 });

@@ -181,3 +181,15 @@ test('repo-move is registered with the dispatcher (help lists it)', () => {
   const r = spawnSync(process.execPath, [bin, '--help'], { encoding: 'utf8' });
   assert.ok(JSON.parse(r.stdout).commands.includes('repo-move'), r.stderr);
 });
+
+test('repo-move: a second move out of the same name at the same instant for a different place is refused with the reason; the file is unchanged', async () => {
+  const h = home();
+  await go(ARGS, { h });
+  const before = readFileSync(repoMovesPath(h), 'utf8');
+  const other = 'eaglewatch-ph/other';
+  const r = await go(['--from', FROM, '--to', other, '--at', AT], { h, answers: { [FROM]: [other, 77], [other]: [other, 77] } });
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.error, 'not-written');
+  assert.match(r.output.message, /cannot leave one name for two places at once/);
+  assert.equal(readFileSync(repoMovesPath(h), 'utf8'), before);
+});

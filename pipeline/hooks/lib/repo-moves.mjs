@@ -93,8 +93,10 @@ export function readRepoMoves({ home = accountHome() } = {}) {
 // from `recorded` to `current` where every hop was made AFTER the record (it predates that move). One way; at most MAX_HOPS hops. A name may appear twice (a -> b -> a -> c is a documented return move).
 // One chain is ONE repository: every hop carries the same repoId and each hop is strictly later than the one before it (history is
 // walked forwards, never back). That, plus the MAX_HOPS cap, is what ends the walk: no visited-name set (it would void a return move). A vacated name can be reused by another repository, so the chain is bound to the repository that held
-// the recorded name at recordedAt: the EARLIEST move departing from that name after the record fixes the repoId (two departures at that
-// same instant: unknown which repository, so no alias). Each later hop is likewise the earliest same-id departure from its name.
+// the recorded name at recordedAt: the EARLIEST move departing from that name after the record fixes the repoId. Each later hop is
+// likewise the earliest same-id departure from its name. Fail closed on a tie: two departures from one name at that earliest instant
+// (different repoIds: unknown which repository; the same repoId: a mistyped --to and its correction, unknown which is true) are
+// ambiguous, so no alias at the first hop, and a tie at a later hop ends that branch.
 export function sameRepo({ recorded, recordedAt, current, moves } = {}) {
   if (typeof recorded !== 'string' || typeof current !== 'string') return false;
   const want = current.toLowerCase();
@@ -113,16 +115,19 @@ export function sameRepo({ recorded, recordedAt, current, moves } = {}) {
   // for the first); `id` the chain's repository id.
   const walk = (name, depth, last, id) => {
     if (depth > MAX_HOPS) return false;
-    return earliest(name, last, id).some((m) => m.to === want || walk(m.to, depth + 1, m.at, id));
+    const next = earliest(name, last, id);
+    if (next.length > 1) return false;
+    return next.some((m) => m.to === want || walk(m.to, depth + 1, m.at, id));
   };
   const first = earliest(start, madeAt, null);
-  if (first.length === 0 || first.some((m) => m.repoId !== first[0].repoId)) return false;
+  if (first.length !== 1) return false;
   return walk(start, 1, madeAt, first[0].repoId);
 }
 
 // The owner's writer (commands/repo-move.mjs). Appends `move` to the file, keeping every existing entry, with a temp file in the same
 // folder (0600) renamed over it. Refuses when the existing file is invalid (the owner fixes or removes it) or the folder is not a real
 // folder. A move with the same from, to AND time already present is a no-op (a later A -> B after B -> A is a new fact and is appended).
+// A move with the same from AND time (same instant, names compared lower case) but a different to is refused: sameRepo treats such a tie as ambiguous, so the owner fixes or removes the earlier entry first.
 // Takes an exclusive lock file (repo-moves.json.lock, O_EXCL) around the read-validate-append-rename and refuses when it already exists (no waiting, no stealing). Returns { ok: true, added, moves } or { ok: false, reason }.
 export function appendRepoMove(move, { home = accountHome() } = {}) {
   const entry = validMove(move);
@@ -150,6 +155,10 @@ export function appendRepoMove(move, { home = accountHome() } = {}) {
     const existing = readRepoMoves({ home });
     if (existing.error) return { ok: false, reason: existing.error };
     if (existing.moves.some((m) => m.from === entry.from && m.to === entry.to && Date.parse(m.at) === Date.parse(entry.at))) return { ok: true, added: false, moves: existing.moves };
+    const at = Date.parse(entry.at);
+    if (existing.moves.some((m) => m.from === entry.from && m.to !== entry.to && Date.parse(m.at) === at)) {
+      return { ok: false, reason: `a repository cannot leave one name for two places at once: ${entry.from} already has a move recorded at ${entry.at} to another name. Fix or remove the earlier entry in ${target}, then try again` };
+    }
     const moves = [...existing.moves, entry];
     const temp = path.join(path.dirname(target), `.${REPO_MOVES_FILE}.${process.pid}.${Date.now()}.tmp`);
     try {

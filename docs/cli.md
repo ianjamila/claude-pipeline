@@ -403,7 +403,8 @@ pipeline repo-move --list   -> {ok, file, moves, error}
 pipeline repo-move --from <owner/name> --to <owner/name> [--at <ISO time>]   -> {ok, added, move, moves, file}
   Records the move in ~/.claude/pipeline-state/owner-go/repo-moves.json (agents cannot write it). GitHub must confirm it: the old name has to
   resolve to the new full name and to the same repository id. --at is when the move happened (default: now; at most 5 minutes ahead of now); only approvals, rulings and
-  grants made BEFORE it count for the new name, never the other way round. Adding the same move (same time) twice is a no-op, the same names at a later time are appended (a move back and forth); an invalid existing file
+  grants made BEFORE it count for the new name, never the other way round. Adding the same move (same time) twice is a no-op, the same names at a later time are appended (a move back and forth); a second move out of the same name at the same instant
+  but to a different name is refused (one name cannot lead to two places at once: fix or remove the earlier entry; such a tie never aliases); an invalid existing file
   is refused (fix or remove it).
   Refuses inside Claude Code (run it in your own terminal) unless --list is given or the owner launched Claude Code with the admin switch.
 ```
@@ -525,8 +526,8 @@ pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr 
   with --pr and a local state: the published (triage comment) state is authoritative. Local is kept (source local) when it
   equals or strictly EXTENDS the published one; otherwise .review/ moves to .review/stale-<UTC time>/ (source quarantined,
   quarantinedTo) and the published state is restored. source is local | published | quarantined | local-ahead | local-unverified
-  (local-ahead: the PR still holds what this copy last published, and the local copy holds a second-review verdict or a Claude / forced final that was
-  never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final): kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline
+  (local-ahead: the PR still holds what this copy last published, every published round and item is still in the local copy, and the local copy holds a second-review verdict or a Claude / forced final that was
+  never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final), or an implementation mark or a follow-up issue link added after the last publish: kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline
   (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)
   (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)
 pipeline state discard-round --round R [--pr N] [--repo DIR]
