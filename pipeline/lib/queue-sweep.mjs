@@ -94,7 +94,7 @@ export function knownRepos({ home = os.homedir(), env = process.env } = {}) {
     if (!isDir(dir)) continue;
     let key;
     try {
-      key = canon(gitCommonDir(dir));
+      key = canon(gitCommonDir(dir)); // canon is realpath.native: the on-disk spelling (short names expanded), so one repository reached two ways gets one key
     } catch {
       continue; // not a git repository (any more)
     }

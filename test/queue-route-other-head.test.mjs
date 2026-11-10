@@ -6,13 +6,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
 import { beginAttempt, confirmAttempt, noteRemoval, openRecord, queueRecordPath, readQueueRecord, setHold } from '../pipeline/lib/merge-queue.mjs';
 import { RESTORE_NOTE } from '../pipeline/lib/hold.mjs';
-import { createQueueRoute, restoreHoldOnTerminal } from '../pipeline/lib/queue-route.mjs';
+import { createQueueRoute, recordedWorktreeProblem, restoreHoldOnTerminal } from '../pipeline/lib/queue-route.mjs';
 import { sweepRepo } from '../pipeline/lib/queue-sweep.mjs';
 
 const H = 'a'.repeat(40); // the head the record (and the PR on GitHub) is at
@@ -385,6 +385,44 @@ test('9d. the recorded root is a worktree of ANOTHER repository: queue-removed, 
   assert.match(o.reasons[0], /cannot re-queue it: worktree belongs to another repository/);
   assert.equal(readQueueRecord(here, PR).terminal, 'removed');
   assert.deepEqual(writes(gh), ['add needs-human']);
+});
+
+// ---- 10. the same worktree under another spelling -----------------------------------------------------------------------------------------
+// The repository / this-worktree comparisons go through canonicalPath + samePath, so a different spelling of one folder is the same folder: a symlink to it anywhere,
+// the same name in another case on a case-insensitive disk (macOS, Windows), a Windows 8.3 short name (RUNNER~1; only the CI run on windows-latest can see that one).
+// The case spelling is the one the old JS realpathSync kept as given, so tests 10b and 10c fail on it; the symlink test (10a) holds for both and guards the meaning.
+const otherCase = (dir) => join(dirname(dir), basename(dir).toUpperCase());
+const caseInsensitive = (dir) => existsSync(otherCase(dir));
+
+test('10a. the recorded root is a SYMLINK to the recorded worktree: no problem (null), the same repository', () => {
+  const { recorded, here } = pair();
+  const alias = join(mkdtempSync(join(tmpdir(), 'cp-otherhead-link-')), 'alias');
+  try {
+    symlinkSync(recorded, alias, 'junction');
+  } catch (e) {
+    if (process.platform === 'win32') return; // no right to create links here
+    throw e;
+  }
+  assert.equal(recordedWorktreeProblem({ rec: { root: alias, head: H }, root: here, headOf: () => H }), null);
+  assert.equal(recordedWorktreeProblem({ rec: { root: recorded, head: H }, root: alias, headOf: () => H }), null, 'and the other way round');
+});
+
+test('10b. the recorded root and this root name one repository in another case: no problem (null), not "another repository"', (t) => {
+  const { recorded, here } = pair();
+  if (!caseInsensitive(recorded)) return t.skip('case-sensitive file system');
+  assert.equal(recordedWorktreeProblem({ rec: { root: otherCase(recorded), head: H }, root: here, headOf: () => H }), null);
+  assert.equal(recordedWorktreeProblem({ rec: { root: recorded, head: H }, root: otherCase(here), headOf: () => H }), null);
+});
+
+test('10c. the removal is run from the recorded worktree spelled in another case: it is THIS worktree (queue-removed, "is this one"), not an "other head" worktree', async (t) => {
+  const { recorded, here } = pair();
+  if (!caseInsensitive(recorded)) return t.skip('case-sensitive file system');
+  recordAt(recorded);
+  const gh = stub({ states: [st()], events: [FIRST] });
+  const { out: o } = await viaPrecheck(routeFor(otherCase(recorded), gh, K, { headOf: () => K }));
+  assert.equal(o.error, 'queue-removed');
+  assert.match(o.reasons[0], /not re-queued: the worktree that queued it is this one, now at cccccccccccc \(it queued aaaaaaaaaaaa\)/);
+  assert.equal(readQueueRecord(here, PR).terminal, 'removed');
 });
 
 // ---- 8. the hand-off through the real sweep -----------------------------------------------------------------------------------------------

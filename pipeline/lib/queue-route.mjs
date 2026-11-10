@@ -5,7 +5,7 @@
 //                      (a result after a live record of another head was discharged may carry holdFields: the hold fields that discharge produced)
 //   enqueueAndWatch()  begin attempt, enqueue, confirm, watch, re-queue once -> { exitCode, output }
 // Nothing here ever disables auto-merge or dequeues for a time-out: `still-queued` leaves the entry exactly as it is.
-import { realpathSync, statSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
@@ -15,6 +15,7 @@ import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failing
 import { RESTORE_NOTE } from './hold.mjs';
 import { headSha } from './git.mjs';
 import { envWithGhDir, runShellAsync } from './proc.mjs';
+import { canonicalPath, samePath } from './paths.mjs';
 import { gitCommonDir } from './repo.mjs';
 import { approvalGap } from '../hooks/lib/owner-go.mjs';
 
@@ -122,7 +123,10 @@ export async function recheckGatedRecorded({ root, config, pr, gh, env, head, re
 }
 
 export const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
-export const canon = (p) => { try { return realpathSync(p); } catch { return path.resolve(p); } };
+// canonicalPath (realpath.native), not JS realpathSync: only the native one expands a Windows 8.3 short name (RUNNER~1), so a temp folder and `git rev-parse` spell the same place alike.
+export const canon = (p) => canonicalPath(p);
+// Two folders are the same place when their canonical spellings agree (samePath: slash-normalised, case-insensitive where the file system is).
+const samePlace = (a, b) => samePath(canon(a), canon(b));
 
 // Why the worktree a live record was opened in cannot do that record's one re-queue, or null when it can: gone, no longer at the recorded head, or not a worktree of
 // `root`'s repository. One judgement for the sweep's re-queue (makeRequeue) and for a `P merge` at another head (requeueElsewhere), so the two cannot disagree (R1-F2).
@@ -136,7 +140,7 @@ export function recordedWorktreeProblem({ rec, root, headOf = (cwd) => headSha({
   }
   if (current !== rec.head) return `worktree at another head (${String(current).slice(0, 12)}, approved ${rec.head.slice(0, 12)})`;
   try {
-    if (canon(gitCommonDir(rec.root)) !== canon(gitCommonDir(root))) return 'worktree belongs to another repository';
+    if (!samePlace(gitCommonDir(rec.root), gitCommonDir(root))) return 'worktree belongs to another repository';
   } catch {
     return 'worktree gone';
   }
@@ -220,7 +224,7 @@ export function createQueueRoute({
   // sweep end the record anyway, so the removal ends it now (removed, hold restored, the reason says why) instead of leaving the hold lifted for nothing (R1-F2).
   const requeueElsewhere = async (removal) => {
     const rec = readQueueRecord(root, pr);
-    const thisOne = typeof rec.root === 'string' && canon(rec.root) === canon(root);
+    const thisOne = typeof rec.root === 'string' && samePlace(rec.root, root);
     const elsewhere = thisOne ? null : recordedWorktreeProblem({ rec, root, headOf });
     const why = thisOne
       ? `the worktree that queued it is this one, now at ${head.slice(0, 12)} (it queued ${rec.head.slice(0, 12)})`
