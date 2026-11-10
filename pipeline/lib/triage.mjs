@@ -164,13 +164,17 @@ export const fablePendingRounds = (state) => (state?.rounds ?? [])
 // ---- Fable proofs below the floor (plan 2026-11-10 A4b: old proofs are re-reviewed, not grandfathered) -------------------------
 // A proven Fable round: the Fable pass answered and its transcript was accepted (arbiter.mjs publishes modelProof only then).
 const isProvenFableRound = (r) => r?.fableRequired === true && r.baseOnly !== true && r.arbiter?.proofOk === true;
-// The Fable ids a round was proven with (modelProof.models is keyed by model id) split by MIN_FABLE. A `claude-fable-*` id the parser cannot read
-// is stale (fail closed, like the floor itself); an id of another family is not a Fable and is ignored.
-const fableModelsOf = (r) => {
-  const min = parseModelId(MIN_FABLE);
+// `gate` = { threshold, allow }: the version below which a proof is re-reviewed and the Fable ids the owner allowed by exact name. The commands read
+// it from the registry (model-floor.mjs#readReviewGate: the owner's hold when it is below MIN_FABLE, else MIN_FABLE) and pass it in; these helpers stay pure.
+const DEFAULT_GATE = { threshold: MIN_FABLE, allow: [] };
+// The Fable ids a round was proven with (modelProof.models is keyed by model id) split by the threshold. A `claude-fable-*` id the parser cannot read
+// is stale (fail closed, like the floor itself) unless the owner allowed it; an id of another family is not a Fable and is ignored.
+const fableModelsOf = (r, { threshold = MIN_FABLE, allow = [] } = DEFAULT_GATE) => {
+  const min = parseModelId(threshold);
   const stale = [];
   const current = [];
   for (const id of Object.keys(r?.modelProof?.models && typeof r.modelProof.models === 'object' ? r.modelProof.models : {})) {
+    if (allow.includes(id)) { current.push(id); continue; }
     const p = parseModelId(id);
     if (p === null) {
       if (/^claude-fable(-|$)/.test(id)) stale.push(id);
@@ -180,22 +184,22 @@ const fableModelsOf = (r) => {
   }
   return { stale, current };
 };
-// A later proven pass that supersedes older ones: every Fable id in it is at or above MIN_FABLE, and it reviewed the WHOLE PR
+// A later proven pass that supersedes older ones: every Fable id in it is at or above the threshold, and it reviewed the WHOLE PR
 // (round.arbiter.scope 'whole-pr', stored when arbiter needed wrote the diff). A round without the stored scope is not one.
-const supersedes = (r) => {
-  const { stale, current } = fableModelsOf(r);
+const supersedes = (r, gate) => {
+  const { stale, current } = fableModelsOf(r, gate);
   return isProvenFableRound(r) && stale.length === 0 && current.length > 0 && r.arbiter?.scope === 'whole-pr';
 };
-// The proven Fable rounds whose recorded Fable model is below MIN_FABLE and that no LATER whole-PR pass at or above MIN_FABLE replaced:
+// The proven Fable rounds whose recorded Fable model is below the threshold and that no LATER whole-PR pass at or above it replaced:
 // [{ round, models }] in round order. review-complete and the final gate refuse a PR while this is non-empty; `state fable-refresh` is the way out.
-export function staleFableRounds(state) {
+export function staleFableRounds(state, gate = DEFAULT_GATE) {
   const rounds = state?.rounds ?? [];
   const out = [];
   for (const r of rounds) {
     if (!isProvenFableRound(r)) continue;
-    const { stale } = fableModelsOf(r);
+    const { stale } = fableModelsOf(r, gate);
     if (stale.length === 0) continue;
-    if (rounds.some((later) => later.n > r.n && supersedes(later))) continue;
+    if (rounds.some((later) => later.n > r.n && supersedes(later, gate))) continue;
     out.push({ round: r.n, models: [...stale].sort() });
   }
   return out;
@@ -203,10 +207,10 @@ export function staleFableRounds(state) {
 // "rounds 1 (claude-fable-5-1), 3 (...)" for the refusal text.
 export const staleFableSummary = (stale) => stale.map((s) => `${s.round} (${s.models.join(', ')})`).join(', ');
 // Why review-complete and the final gate refuse such a PR, and the one command that fixes it.
-export const staleFableReason = (stale, pr) => `the Fable review pass of round ${staleFableSummary(stale)} was proven with a Fable older than ${MIN_FABLE}: run \`pipeline state fable-refresh --pr ${pr}\` (one extra Fable pass that re-reviews the whole PR with the current Fable; it is not counted against review.max_rounds)`;
-// A proven Fable pass that is not below MIN_FABLE (any scope; a proof that recorded no Fable id counts as it always did): the passes below it do
+export const staleFableReason = (stale, pr, threshold = MIN_FABLE) => `the Fable review pass of round ${staleFableSummary(stale)} was proven with a Fable older than ${threshold}: run \`pipeline state fable-refresh --pr ${pr}\` (one extra Fable pass that re-reviews the whole PR with the current Fable; it is not counted against review.max_rounds)`;
+// A proven Fable pass that is not below the threshold (any scope; a proof that recorded no Fable id counts as it always did): the passes below it do
 // not count for arbiter.mjs#writeFableDiff's "the first pass reviews the whole PR" rule, so the first fresh-model pass after old ones reads everything.
-export const provenNotStale = (r) => isProvenFableRound(r) && fableModelsOf(r).stale.length === 0;
+export const provenNotStale = (r, gate = DEFAULT_GATE) => isProvenFableRound(r) && fableModelsOf(r, gate).stale.length === 0;
 
 // ---- judge, tests ---------------------------------------------------------------------------
 

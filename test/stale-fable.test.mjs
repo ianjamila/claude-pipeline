@@ -123,3 +123,30 @@ test('a refresh round is Fable-pending until a proven pass, and then review is v
   assert.equal(roundOutcome({ ...proven, currentContentHash: 'c1' }).clean, true);
   assert.equal(reviewValidFor(proven, 'c1'), true);
 });
+
+// ---- review round 1: the threshold is passed in (R1-B1) and an allowed exact id is current (R1-F1) ----
+test('staleFableRounds / provenNotStale take the re-review threshold: an owner hold below MIN_FABLE makes the held Fable current', () => {
+  const state = stateOf(fable(1));
+  assert.deepEqual(staleFableRounds(state, { threshold: 'claude-fable-5-1', allow: [] }), []);
+  assert.equal(provenNotStale(state.rounds[0], { threshold: 'claude-fable-5-1', allow: [] }), true);
+  assert.deepEqual(staleFableRounds(state, { threshold: 'claude-fable-5-2', allow: [] }), [{ round: 1, models: [OLD] }]);
+  assert.deepEqual(staleFableRounds(state), [{ round: 1, models: [OLD] }], 'no gate: MIN_FABLE');
+  assert.match(staleFableReason(staleFableRounds(state), 7, 'claude-fable-5-3'), /older than claude-fable-5-3:/);
+  // an even older proof is still stale under the hold, unless a later whole-PR pass at the held version replaces it
+  const older = stateOf(fable(1, { models: { 'claude-fable-5': 1 } }), fable(2));
+  assert.deepEqual(staleFableRounds(older, { threshold: 'claude-fable-5-1', allow: [] }).map((s) => s.round), [1]);
+  assert.deepEqual(staleFableRounds(older, { threshold: 'claude-fable-5-1', allow: [] }).map((s) => s.models), [['claude-fable-5']]);
+  const replaced = stateOf(fable(1, { models: { 'claude-fable-5': 1 } }), fable(2, { scope: 'whole-pr', models: { [OLD]: 1 } }));
+  assert.deepEqual(staleFableRounds(replaced, { threshold: 'claude-fable-5-1', allow: [] }), []);
+  assert.deepEqual(staleFableRounds(replaced).map((s) => s.round), [1, 2], 'without the hold the 5.1 pass cannot replace anything');
+});
+
+test('an unparseable claude-fable-* id is stale unless the owner allowed that exact id; an allowed pass can supersede', () => {
+  const ID = 'claude-fable-6-preview';
+  const state = stateOf(fable(1, { models: { [ID]: 1 } }));
+  assert.deepEqual(staleFableRounds(state), [{ round: 1, models: [ID] }]);
+  assert.deepEqual(staleFableRounds(state, { threshold: MIN_FABLE, allow: [ID] }), []);
+  assert.deepEqual(staleFableRounds(state, { threshold: MIN_FABLE, allow: ['claude-fable-6'] }), [{ round: 1, models: [ID] }], 'exact match only');
+  const later = stateOf(fable(1), fable(2, { models: { [ID]: 1 }, scope: 'whole-pr' }));
+  assert.deepEqual(staleFableRounds(later, { threshold: MIN_FABLE, allow: [ID] }), []);
+});

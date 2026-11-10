@@ -9,7 +9,8 @@ import { GitError, effectiveReviewBase, git, headSha, isAncestor, mergeBase, rev
 import { grantIdOf, ownerGrantedRounds } from '../hooks/lib/owner-go.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
-import { MIN_FABLE } from '../lib/model-floor.mjs';
+import { docsExemptFrom } from '../lib/docs-exempt.mjs';
+import { readReviewGate } from '../lib/model-floor.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { arbiterFailures, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds } from '../lib/triage.mjs';
 import { readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
@@ -47,9 +48,9 @@ export const meta = {
     '     hash would be measured from it - also with no origin remote but a leftover origin/<default_branch> ref: a stale base would count the default branch\'s commits as the fix',
     'pipeline state fable-refresh --pr N [--repo DIR]',
     '  -> {ok, round, staleRounds, scope: "whole-pr"}: opens an uncounted Fable-only round (no Codex, not counted against review.max_rounds, allowed past it and with no new commit) on the pushed head, so a Fable pass proven with',
-    '     a Fable older than MIN_FABLE is re-reviewed. Refused (exit 2) unless a proven Fable round is below MIN_FABLE and no later whole-PR pass at or above it replaced it (error nothing-stale), every earlier round is finished',
+    '     a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) is re-reviewed. Refused (exit 2) unless a proven Fable round is below that and no later whole-PR pass at or above it replaced it (error nothing-stale), every earlier round is finished',
     '     (error unfinished-round: a Fable pass owed, an undecided, human-owed, unimplemented or newly accepted item), HEAD is the head of PR N on GitHub (error head-not-pushed; exit 3 when GitHub is unreachable)',
-    '     and the content is what the last round reviewed (error content-moved: run a normal codex-review round instead, its Fable pass already reads the whole PR). Then: arbiter needed --round R, the arbiter, arbiter apply',
+    '     and the content is what the last round reviewed, or only ledger rows were added since (review.docs_exempt_paths; the round then stays pinned at the last reviewed head) (error content-moved: run a normal codex-review round instead, its Fable pass already reads the whole PR). Then: arbiter needed --round R, the arbiter, arbiter apply',
     'pipeline state record-followup --id ID --url URL [--repo DIR]',
     'pipeline state set-outcome --outcome TEXT [--repo DIR]',
   ].join('\n'),
@@ -510,9 +511,10 @@ async function fableRefresh(rest, ctx) {
     if (state.pr !== pr) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'state-pr-mismatch', message: `the review state belongs to PR #${state.pr}, not #${pr}` });
     }
-    const stale = staleFableRounds(state);
+    const gate = readReviewGate({ env: ctx.env ?? process.env });
+    const stale = staleFableRounds(state, gate);
     if (stale.length === 0) {
-      throw new Fail(EXIT.USAGE, { ok: false, error: 'nothing-stale', message: `no proven Fable round is below ${MIN_FABLE} (or a later whole-PR pass already replaced it): there is nothing to refresh` });
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'nothing-stale', message: `no proven Fable round is below ${gate.threshold} (or a later whole-PR pass already replaced it): there is nothing to refresh` });
     }
     const last = state.rounds.at(-1);
     const o = { cwd: root };
@@ -537,10 +539,13 @@ async function fableRefresh(rest, ctx) {
         message: `local HEAD ${head} is not the head of PR #${pr} on GitHub (${view.headRefOid ?? 'unknown'}): push or pull first`, localHead: head, prHead: view.headRefOid ?? null,
       });
     }
-    if (!outcome.coverageValid) {
+    // A head that review-complete accepts through the docs-only exemption (only ledger rows added since the last round) is refreshed too: the round
+    // stays pinned at the last reviewed head, so the exemption still covers those commits afterwards.
+    const exempt = outcome.coverageValid ? null : docsExemptFrom(state, { root, config, hash });
+    if (!outcome.coverageValid && !exempt.exempt) {
       throw new Fail(EXIT.USAGE, {
         ok: false, error: 'content-moved',
-        message: `the content changed since round ${last.n}: run a normal codex-review round instead (its Fable pass already reads the whole PR, so it replaces the old proof)`,
+        message: `the content changed since round ${last.n}: run a normal codex-review round instead (its Fable pass already reads the whole PR, so it replaces the old proof)${exempt.off ? '' : `; the docs-only exemption does not apply: ${exempt.reason}`}`,
         currentContentHash: hash,
       });
     }
@@ -555,12 +560,12 @@ async function fableRefresh(rest, ctx) {
     const n = last.n + 1;
     const models = [...new Set(stale.flatMap((s) => s.models))];
     const next = addRound({ ...state, currentContentHash: hash }, {
-      n, fromHead: last.toHead, toHead: head, contentHashAtToHead: last.contentHashAtToHead, items: [],
+      n, fromHead: last.toHead, toHead: exempt?.exempt ? last.toHead : head, contentHashAtToHead: last.contentHashAtToHead, items: [],
       ...(last.reviewBase === undefined ? {} : { reviewBase: last.reviewBase, reviewBaseKind: last.reviewBaseKind }),
       ...(typeof forkPoint === 'string' && forkPoint !== '' ? { forkPoint } : {}),
       ...(typeof last.codexModel === 'string' ? { codexModel: last.codexModel } : {}),
       fableRefresh: true, fableRequired: true,
-      fableReasons: [`fable-refresh: rounds ${stale.map((s) => s.round).join(',')} proven with ${models.join(', ')} below ${MIN_FABLE}`],
+      fableReasons: [`fable-refresh: rounds ${stale.map((s) => s.round).join(',')} proven with ${models.join(', ')} below ${gate.threshold}`],
       sensitivePaths: Array.isArray(last.sensitivePaths) ? last.sensitivePaths : [],
     });
     saveState(root, next);
