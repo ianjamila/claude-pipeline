@@ -217,7 +217,7 @@ test('#191 F3/F6: the nudge text tells the agent what happened and what to do', 
   assert.match(QUEUED_NUDGE, /P merge --pr N --dry-run --owner-go/);
   assert.match(QUEUED_NUDGE, /P triage round-request/);
   assert.match(QUEUED_NUDGE, /P triage ruling-request/);
-  assert.match(QUEUED_NUDGE, /fresh closing lines/);
+  assert.match(QUEUED_NUDGE, /FRESH closing lines/);
   assert.match(QUEUED_NUDGE, /once more after the reply ends/);
   assert.equal(QUEUED_NUDGE.includes('\n'), false);
   assert.notEqual(QUEUED_NUDGE, RULING_NUDGE);

@@ -277,11 +277,12 @@ const hasProvenanceField = (e) => e.promptSource !== undefined || e.origin !== u
 const visibleSynthetic = (e) => entrySource(e) === 'synthetic' && e.promptSource === 'system' && e.entrypoint === 'cli';
 // An INVISIBLE turn: a prompt entry that is not the owner's and not visibleSynthetic, with provenance to say so. F1: an entry carrying a provenance field whose source entrySource
 // cannot place ('unknown': a value Claude Code adds later) counts as invisible too (fail closed); a field-less 'unknown' entry (an interrupt marker, a legacy transcript) is a plain
-// boundary as before. Only prompt entries are turns: a tool_result user entry is never one (F7).
+// boundary as before. Only prompt entries are turns: a tool_result user entry is never one (F7). A compaction-summary entry (it carries isCompactSummary or isVisibleInTranscriptOnly; only the
+// fully flagged one is hidden, isHiddenSummary) is no turn the agent started: a half-flagged one of unknown source stays the plain boundary #189 pinned, in every mode.
 const invisibleTurn = (e) => {
   if (!isPromptEntry(e) || visibleSynthetic(e)) return false;
   const source = entrySource(e);
-  return source === 'synthetic' || (source === 'unknown' && hasProvenanceField(e));
+  return source === 'synthetic' || (source === 'unknown' && hasProvenanceField(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined);
 };
 
 // The parsed entries of the transcript's last `tailBytes` (a cut first line dropped) and whether the read reached the file's start (#191 A3, F7: callers read `.entries`);
@@ -400,9 +401,9 @@ function currentPromptEntry(transcriptPath, prompt) {
 // #191 A3 (cut-off origin, all modes): the tail read starts at an arbitrary byte, so the text before the window's first prompt entry (slot 0) belongs to a turn whose prompt was cut off
 // and whose origin is unknown; slot 0 is never a reply (in a whole file it is text before any prompt, which a real transcript does not hold). Accepted cost: an ask turn longer than
 // the window is refused once and the re-ask recovers.
-// Fable plan pass finding 2 (queued answers): an owner prompt typed while the agent was busy (promptSource 'queued') can be delivered after a promoted ask the owner never saw. So the
-// result says which slot is promoted; recordRuling stamps `ask_turn: 'synthetic'` on that record and refuses a queued current entry, and promptProvenance refuses such a record whose prompt
-// entry is queued. (An owner-turn ask has a narrower, pre-existing form of this: a follow-up issue.)
+// Queued answers (#189 finding 2, widened by #191 Part B): the result says which slot is a promoted ask (recordRuling stamps `ask_turn: 'synthetic'` on its record). An owner prompt typed while the
+// agent was busy (promptSource 'queued') is delivered after a promoted ask the owner never saw, or after an owner-turn ask newer than what was on screen: the recorders refuse it (queuedAnswer) and
+// promptProvenance refuses its record at use time, for every kind of ask.
 export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
   const replies = [''];
   const voided = new Set(); // slots (indexes of replies) whose ask a dropped reply replaced
@@ -428,7 +429,7 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
       if (isHiddenSummary(e)) continue;
       const isPrompt = isPromptEntry(e);
       if (isPrompt) flush();
-      if (isPrompt && skipSynthetic && entrySource(e) === 'synthetic') {
+      if (isPrompt && skipSynthetic && (entrySource(e) === 'synthetic' || invisibleTurn(e))) { // (#191 F1: a provenance-bearing prompt of unknown source is skipped like a synthetic one, never promoted)
         skipping = true;
         turn = { promote: visibleSynthetic(e), text: '', surfacedAfterText: false, anything: false };
         continue;
@@ -508,6 +509,12 @@ export function notOwnerWords(input, transcriptPath) {
   return currentEntryIsSynthetic(transcriptPath, input?.prompt);
 }
 
+// #191 Part B: the owner typed this answer while the agent was still working (promptSource 'queued'). Claude Code delivers such a prompt after everything the agent printed meanwhile, so it
+// is read as the answer to the LAST ask of that reply, which may be newer than what the owner had on screen when typing; the transcript cannot tell (the queue-operation entries are no
+// record of when the owner typed). So it records nothing and approves nothing, for a "merge", an "extra round" and a ruling alike: the agent shows the request again, the owner answers once more.
+// True only when the transcript already holds the entry; for a hook that runs before it does, promptProvenance refuses the record at use time.
+const queuedAnswer = (input) => currentPromptEntry(String(input?.transcript_path ?? ''), input?.prompt)?.promptSource === 'queued';
+
 // Is this hook input a subagent's (or not a prompt at all)? Those never approve anything.
 function notOwnerPrompt(input) {
   if (input?.hook_event_name !== undefined && input.hook_event_name !== 'UserPromptSubmit') return true;
@@ -545,6 +552,7 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
     const a = parseApproval(input?.prompt);
     if (!a) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: a notice, a peer's or a scheduled turn's "merge")
+    if (queuedAnswer(input)) return null; // (#191 B1)
     const shown = presentedRequests(lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt) }));
     const wanted = (pr) => a.prs.length === 0 || a.prs.includes(pr);
     const shaOk = (head) => a.shas.length === 0 || a.shas.some((s) => head.startsWith(s) || s.startsWith(head));
@@ -604,12 +612,11 @@ export function recordRuling(input, { home = accountHome(), now = Date.now } = {
     const session = String(input?.session_id ?? '');
     if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > RULING_PROMPT_MAX) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: a notice, a peer's or a scheduled turn's words)
+    if (queuedAnswer(input)) return null; // (#191 B1)
     const reply = lastReply(String(input?.transcript_path ?? ''), { prompt: input.prompt, skipSynthetic: true });
     const asked = presentedRuling(reply.text);
     if (!asked) return null;
-    // #189 (Fable plan pass finding 2): an ask promoted out of a synthetic turn may never have been seen by the owner, so an answer the owner QUEUED while the agent was busy is no answer to it
-    // (refused here when the entry is already in the transcript; promptProvenance refuses it later for a record written before the transcript had it). The record says which kind of ask it answers.
-    if (reply.promoted && currentPromptEntry(String(input?.transcript_path ?? ''), input.prompt)?.promptSource === 'queued') return null;
+    // (#189 finding 2 refused a queued answer to a PROMOTED ask only; #191 B1 refuses every queued answer above. The record still says which kind of ask it answers: ask_turn is the audit trail.)
     return appendRecord(home, session, {
       v: 1, kind: 'ruling', ts: new Date(now()).toISOString(), session,
       prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
@@ -632,6 +639,25 @@ export function rulingNudge(input) {
     const answer = input?.prompt;
     if (typeof answer !== 'string' || answer.length > RULING_PROMPT_MAX || !PAIRS_ONLY.test(answer.replace(/\s+/g, ' ').trim())) return null;
     return notOwnerWords(input, String(input?.transcript_path ?? '')) ? null : RULING_NUDGE;
+  } catch {
+    return null;
+  }
+}
+
+// #191 F3/F6, the hook's second nudge: the owner's prompt reads as a "merge", an "extra round" or a ruling answer but its transcript entry is queued, so nothing was recorded. Said once to the
+// agent (plain text on stdout, never blocking): re-run the request command so the closing lines are FRESH (a stale Head line re-shown by hand would bind a stale head) and ask again. Said
+// whether or not an ask was shown (over-nudging is harmless); not for a prompt that is evidently not the owner's. Takes precedence over the ruling nudge.
+export const QUEUED_NUDGE = '[claude-pipeline owner-go] the owner\'s answer was typed while the agent was still working, so it was not recorded: re-run the dry run (`P merge --pr N --dry-run --owner-go`), `P triage round-request` or `P triage ruling-request`, show the FRESH closing lines, and ask the owner once more after the reply ends.';
+export function queuedNudge(input) {
+  try {
+    if (notOwnerPrompt(input)) return null;
+    const answer = input?.prompt;
+    if (typeof answer !== 'string') return null;
+    const readsAsAnswer = parseApproval(answer) !== null
+      || (answer.length <= ROUND_GRANT_PROMPT_MAX && parseRoundGrant(answer) !== null)
+      || (answer.length <= RULING_PROMPT_MAX && PAIRS_ONLY.test(answer.replace(/\s+/g, ' ').trim()));
+    if (!readsAsAnswer || notOwnerWords(input, String(input?.transcript_path ?? ''))) return null;
+    return queuedAnswer(input) ? QUEUED_NUDGE : null;
   } catch {
     return null;
   }
@@ -729,7 +755,7 @@ export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, 
   const scan = scanBackwards(file, (e) => { if (match.is(e)) found.push(e); return found.length >= 2; }, match.wants, { chunkBytes, capBytes });
   if (scan === null || found.length === 0) return 'missing';
   if (found.length > 1) return 'synthetic';
-  if (record.ask_turn === 'synthetic' && found[0].promptSource === 'queued') return 'synthetic'; // (#189 Fable plan pass finding 2: a queued answer to an ask the owner may never have seen)
+  if (found[0].promptSource === 'queued') return 'synthetic'; // (#191 B2, every record kind: a queued answer may land on an ask newer than what the owner had on screen; #189 refused only a promoted ask's)
   const source = entrySource(found[0]);
   if (source !== 'unknown') return source;
   // unknown: legacy only if the whole transcript is free of provenance fields
@@ -1014,6 +1040,7 @@ export function recordRoundGrant(input, { home = accountHome(), now = Date.now }
     const g = parseRoundGrant(input.prompt);
     if (!g) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: strict like a "merge" — a notice, a peer's or a scheduled turn's "extra round")
+    if (queuedAnswer(input)) return null; // (#191 B1)
     const asked = presentedRoundRequest(lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }));
     if (!asked) return null;
     if (!g.prs.every((n) => n === asked.pr) || !g.numbers.every((n) => n === asked.pr || n === asked.k)) return null;
