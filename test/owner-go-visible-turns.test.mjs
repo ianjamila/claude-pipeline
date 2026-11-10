@@ -428,3 +428,64 @@ test('#191 R1-B1: a legacy transcript (no entry has a uuid) keeps the positional
     assert.equal(KINDS[kind].bound(mk([...strip(plain.slice(0, 2)), { type: 'system', subtype: 'turn_duration', uuid: 'u-sys' }, ...strip(plain.slice(2))])), false, `${kind}: one uuid anywhere -> modern`);
   }
 });
+
+// ---- R3-B1 / #241 / R3-F1: what the owner was last SHOWN decides which request is current ---------------------------------------------
+// shownAfter compares another visible slot's shown position with the selected slot's last SHOWN entry (its text), never with its last entry of any kind (R3-B1), counts a surfaced tool
+// ask of another visible slot as shown (#241), and a visibleSynthetic turn that is not promoted voids the ruling by what it shows after the selected slot's last shown entry (R3-F1).
+
+const toolUse = (command) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't2', name: 'Bash', input: { command } }] } });
+const toolResultOf = (content) => ({ type: 'user', message: { content: [{ type: 'tool_result', content }] } });
+
+test('R3-B1: a trailing tool-only entry (or tool result) in the selected slot does not hide a later visible request of another slot', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const first = prompt('ship it');
+    const second = prompt('keep going');
+    const answer = prompt(KINDS[kind].answer);
+    for (const [name, tail] of [['tool_use', toolOnly()], ['tool_result', toolResult()]]) {
+      // selected #58 text (second), other slot's #59 text (first), then a tool-only entry in the selected slot: the owner was last shown #59
+      assert.equal(run(kind, [first, of(first, said('x')), second, of(second, said(KINDS[kind].ask)), of(first, said(ASK59[kind])), of(second, tail), answer]), false, `${kind}: ${name} after the other slot's request`);
+    }
+    // controls: the other slot's text came BEFORE the selected slot's last text, then the selected slot went tool-only: the selected request still binds
+    assert.deepEqual(pr(kind, record(kind, [first, of(first, said('x')), second, of(first, said(ASK59[kind])), of(second, said(KINDS[kind].ask)), of(second, toolOnly()), of(second, toolResult()), answer])), bound58(kind), `${kind}: older text before the selected text`);
+    assert.deepEqual(pr(kind, record(kind, [first, of(first, said('x')), second, of(second, said(KINDS[kind].ask)), of(second, toolOnly()), of(second, toolResult()), answer])), bound58(kind), `${kind}: tool-only tail alone`);
+  }
+});
+
+test('#241: a surfaced tool ask (tool_use input or tool_result) of ANOTHER visible slot after the selected request makes it stale; a tool block without an ask, or the selected slot\'s own, does not', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const first = prompt('ship it');
+    const second = prompt('keep going');
+    const answer = prompt(KINDS[kind].answer);
+    const base = [first, of(first, said('x')), second, of(second, said(KINDS[kind].ask))];
+    assert.equal(run(kind, [...base, of(first, toolUse(`echo '${ASK59[kind]}'`)), answer]), false, `${kind}: tool_use input prints the other request`);
+    assert.equal(run(kind, [...base, of(first, toolUse('ls')), of(first, toolResultOf(ASK59[kind])), answer]), false, `${kind}: tool_result prints the other request`);
+    assert.equal(run(kind, [...base, of(first, toolResultOf([{ type: 'text', text: ASK59[kind] }])), answer]), false, `${kind}: tool_result text blocks`);
+    // controls: no ask in the other slot's tool block; the surfaced ask lands BEFORE the selected request; the selected slot's own tool block
+    assert.deepEqual(pr(kind, record(kind, [...base, of(first, toolUse('ls')), of(first, toolResultOf('ok')), answer])), bound58(kind), `${kind}: tool block without an ask`);
+    assert.deepEqual(pr(kind, record(kind, [first, of(first, said('x')), second, of(first, toolUse(`echo '${ASK59[kind]}'`)), of(second, said(KINDS[kind].ask)), answer])), bound58(kind), `${kind}: other slot's surfaced ask before the selected request`);
+    assert.deepEqual(pr(kind, record(kind, [...base, of(second, toolUse(`echo '${ASK59[kind]}'`)), answer])), bound58(kind), `${kind}: the selected slot's own surfaced ask is not another slot`);
+  }
+});
+
+test('R3-F1 (rulings): a visibleSynthetic turn opened BEFORE the selected slot\'s last entry that shows text or a surfaced ask after it voids the ruling; an invisible one does not', () => {
+  const owner = prompt('ship it');
+  const answer = prompt('R1-B1: accept');
+  const surfaced = toolUse(`ruling-request R1-B1 for PR #59?`);
+  for (const [name, meta] of [['task notice', NOTICE], ['peer message', PEER], ['plugin message', PLUGIN]]) {
+    const synth = prompt('notice', meta);
+    const open = [owner, synth, of(owner, said(RULING_ASK))];
+    assert.equal(run('ruling', [...open, of(synth, said('plain text')), answer]), false, `${name}: plain text after the ask`);
+    assert.equal(run('ruling', [...open, of(synth, surfaced), answer]), false, `${name}: surfaced tool ask after the ask`);
+    assert.equal(run('ruling', [...open, of(synth, toolResultOf('ruling-request R1-B1 for PR #59?')), answer]), false, `${name}: surfaced tool result after the ask`);
+    // controls: it printed BEFORE the ask (interleaved, the ask is the last thing shown); it printed nothing shown
+    assert.equal(run('ruling', [owner, synth, of(synth, said('plain text')), of(owner, said(RULING_ASK)), answer]), true, `${name}: text before the ask`);
+    assert.equal(run('ruling', [...open, of(synth, toolOnly()), of(synth, toolResult()), answer]), true, `${name}: tool-only turn shows nothing`);
+  }
+  // an INVISIBLE interleaved turn doing the same: its output is never shown, the ask still binds
+  for (const [name, meta] of [['sdk', SDK], ['non-human origin', NON_HUMAN], ['future source', FUTURE]]) {
+    const hidden = prompt('poll', meta);
+    const open = [owner, hidden, of(owner, said(RULING_ASK))];
+    assert.equal(run('ruling', [...open, of(hidden, said('plain text')), answer]), true, `${name}: plain text`);
+    assert.equal(run('ruling', [...open, of(hidden, surfaced), answer]), true, `${name}: surfaced tool ask`);
+  }
+});
