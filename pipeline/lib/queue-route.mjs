@@ -6,7 +6,7 @@
 // Nothing here ever disables auto-merge or dequeues for a time-out: `still-queued` leaves the entry exactly as it is.
 import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
-import { GATE_FILE, GATE_MAX_AGE_MS, evaluateGate, evaluateOwnerGo, preMergeProblems, readReviewJson, waitBlockers } from './finalgate.mjs';
+import { GATE_FILE, GATE_MAX_AGE_MS, PR_FIELDS, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, preMergeProblems, readReviewJson, waitBlockers } from './finalgate.mjs';
 import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
 import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
 import { RESTORE_NOTE } from './hold.mjs';
@@ -87,13 +87,27 @@ export async function recheckGated({ root, config, pr, gh, env, gate, ownerAppro
 // The sweep's gated recheck (#229): no `P merge` process holds the gate, so it is read from the recorded worktree. It must still be a passing gate
 // for the recorded head and not older than a gate may be; otherwise nothing is re-queued (the owner re-runs the final gate and `P merge`).
 // The owner's word counts when the gate named owner items and a "merge" for exactly this head and item set is on record.
-export async function recheckGatedRecorded({ root, config, pr, gh, env, head, repo, rec, now = Date.now, ...seams }) {
+// The file is then bound exactly as `P merge` binds it (gateRefusals: repo, canonical check list, PR head, patch hash, age, a future date), so the two cannot drift (R1-F3).
+// `localHash` is a test seam.
+export async function recheckGatedRecorded({ root, config, pr, gh, env, head, repo, rec, now = Date.now, localHash = localContentHash, ...seams }) {
   const gate = readReviewJson(root, GATE_FILE);
   const stop = (why) => ({ ok: false, error: 'live-check', reasons: [`${why}: run the final gate again`] });
   if (gate === null) return stop('the gate file is gone');
   if (gate.ok !== true || gate.head !== head || gate.pr !== pr) return stop('the gate file is not a passing gate for this PR and head');
   const at = Date.parse(gate.at);
   if (!Number.isFinite(at) || now() - at > GATE_MAX_AGE_MS) return stop('the gate file is too old');
+  let prHead;
+  try {
+    prHead = gh.prView(pr, [...PR_FIELDS]).headRefOid;
+  } catch (err) {
+    return stop(`could not read the PR head (${String(err?.message ?? err).split('\n')[0]})`);
+  }
+  let hash = '';
+  try {
+    hash = localHash(root, config);
+  } catch { /* gateRefusals reports the mismatch */ }
+  const refusals = gateRefusals({ gate, pr, head, prHead, hash, repo, now: now() });
+  if (refusals.length > 0) return { ok: false, error: 'live-check', reasons: refusals.map((why) => `${why}: run the final gate again`) };
   const ownerApproved = typeof gate.ownerItems === 'string' && approvalGap({ repo, pr, head, items: gate.ownerItems, areas: null, hold: null, rulings: null }) === 'ok';
   // The first enqueue stood on the owner's word even though the gate itself shows no owner items (a resumed run, an unchecked run record): the word must still be on record.
   // (`ownerRequired` is absent on records written before the field, which keep the earlier behaviour: the word counts only where the live gate has owner items.)

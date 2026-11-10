@@ -15,6 +15,7 @@ import {
 import { run as runQueueSweep } from '../pipeline/commands/queue-sweep.mjs';
 import { sweepRepo, bestEffortSweep } from '../pipeline/lib/queue-sweep.mjs';
 import { recheckGatedRecorded } from '../pipeline/lib/queue-route.mjs';
+import { CANONICAL_CHECKS } from '../pipeline/lib/finalgate.mjs';
 import {
   QUEUE_SWEEP_LABEL, queueSweepPlistPath, queueSweepSchedule,
 } from '../pipeline/lib/queue-sweep-schedule.mjs';
@@ -238,7 +239,10 @@ test('#229: a gated-route record is re-checked with the gated recheck, an owner-
 });
 
 test('#229: the sweep\'s gated recheck needs a passing, recent gate file for the recorded head, then runs the same live checks as P merge', async () => {
-  const gateAt = (over = {}) => ({ ok: true, pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'none', at: new Date().toISOString(), ...over });
+  const gateAt = (over = {}) => ({
+    ok: true, repo: 'acme/widgets', pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'none', at: new Date().toISOString(),
+    checks: CANONICAL_CHECKS.map((name) => ({ name, ok: true, detail: '' })), ...over,
+  });
   const worktree = (gate) => {
     const dir = mkdtempSync(join(tmpdir(), 'cp-qsweep-gate-'));
     if (gate !== undefined) {
@@ -251,7 +255,7 @@ test('#229: the sweep\'s gated recheck needs a passing, recent gate file for the
   const ask = (dir, { fresh = live(), problems = [], rec = { approval: APPROVAL }, now } = {}) => {
     const calls = [];
     return recheckGatedRecorded({
-      root: dir, config: {}, pr: 7, gh: stub({ states: [st()] }), env: {}, head: HEAD, repo: 'acme/widgets', rec, ...(now ? { now } : {}),
+      root: dir, config: {}, pr: 7, gh: { ...stub({ states: [st()] }), prView: () => ({ state: 'OPEN', headRefOid: HEAD, labels: [] }) }, env: {}, head: HEAD, repo: 'acme/widgets', rec, localHash: () => 'hash1', ...(now ? { now } : {}),
       evaluate: async (args) => { calls.push(args.queueMode); return fresh; }, problemsOf: async () => problems,
     }).then((out) => ({ out, calls }));
   };
@@ -428,9 +432,12 @@ test('R1-F2: the sweep\'s gated recheck refuses a record whose enqueue needed th
   const dir = mkdtempSync(join(tmpdir(), 'cp-qsweep-gate-'));
   mkdirSync(join(dir, '.review'));
   // (ownerMerge 0 in the file and live: nothing but the record says the owner's word mattered; the item set has no "merge" on record)
-  writeFileSync(join(dir, '.review', 'final-gate.json'), JSON.stringify({ ok: true, pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'zz9-no-such-owner-record', at: new Date().toISOString() }));
+  writeFileSync(join(dir, '.review', 'final-gate.json'), JSON.stringify({
+    ok: true, repo: 'acme/widgets', pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'zz9-no-such-owner-record', at: new Date().toISOString(),
+    checks: CANONICAL_CHECKS.map((name) => ({ name, ok: true, detail: '' })),
+  }));
   const ask = (rec) => recheckGatedRecorded({
-    root: dir, config: {}, pr: 7, gh: stub({ states: [st()] }), env: {}, head: HEAD, repo: 'acme/widgets', rec,
+    root: dir, config: {}, pr: 7, gh: { ...stub({ states: [st()] }), prView: () => ({ state: 'OPEN', headRefOid: HEAD, labels: [] }) }, env: {}, head: HEAD, repo: 'acme/widgets', rec, localHash: () => 'hash1',
     evaluate: async () => ({ head: HEAD, contentHash: 'hash1', ownerItems: 'zz9-no-such-owner-record', checks: [{ name: 'ci', ok: true }] }), problemsOf: async () => [],
   });
   const required = await ask({ approval: { ...APPROVAL, ownerRequired: true } });
@@ -440,4 +447,38 @@ test('R1-F2: the sweep\'s gated recheck refuses a record whose enqueue needed th
   // records written before the field (or for an enqueue that needed no word) keep today's behaviour
   assert.deepEqual(await ask({ approval: APPROVAL }), { ok: true });
   assert.deepEqual(await ask({ approval: { ...APPROVAL, ownerRequired: false } }), { ok: true });
+});
+
+// R1-F3: the sweep binds the gate file exactly as P merge does (gateRefusals): repo, canonical check list, PR head, patch hash, age, and a future date.
+test('R1-F3: the sweep\'s gated recheck refuses what gateRefusals refuses: a future-dated gate, another repo, a short check list, a moved PR head, another patch', async () => {
+  const complete = (over = {}) => ({
+    ok: true, repo: 'acme/widgets', pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'none', at: new Date().toISOString(),
+    checks: CANONICAL_CHECKS.map((name) => ({ name, ok: true, detail: '' })), ...over,
+  });
+  const ask = async (gate, { prHead = HEAD, hash = 'hash1' } = {}) => {
+    const dir = mkdtempSync(join(tmpdir(), 'cp-qsweep-gate-'));
+    mkdirSync(join(dir, '.review'));
+    writeFileSync(join(dir, '.review', 'final-gate.json'), JSON.stringify(gate));
+    const calls = [];
+    const gh = { ...stub({ states: [st()] }), prView: () => ({ state: 'OPEN', headRefOid: prHead, labels: [] }) };
+    const out = await recheckGatedRecorded({
+      root: dir, config: {}, pr: 7, gh, env: {}, head: HEAD, repo: 'acme/widgets', rec: { approval: APPROVAL }, localHash: () => hash,
+      evaluate: async () => { calls.push('evaluate'); return { head: HEAD, contentHash: 'hash1', ownerItems: 'none', checks: [{ name: 'ci', ok: true }] }; }, problemsOf: async () => [],
+    });
+    return { out, calls };
+  };
+  assert.deepEqual((await ask(complete())).out, { ok: true });
+  for (const [why, gate, opts, re] of [
+    ['a gate dated in the future (it would never age out)', complete({ at: new Date(Date.now() + 3_600_000).toISOString() }), {}, /dated in the future/],
+    ['a gate of another repo', complete({ repo: 'other/widgets' }), {}, /not acme\/widgets/],
+    ['a gate with a short check list', complete({ checks: [{ name: 'ci', ok: true }] }), {}, /missing canonical check/],
+    ['a gate for a PR head that has moved', complete(), { prHead: 'c'.repeat(40) }, /PR head is/],
+    ['a gate for another patch', complete(), { hash: 'other' }, /content hash differs/],
+  ]) {
+    const r = await ask(gate, opts);
+    assert.equal(r.out.ok, false, why);
+    assert.equal(r.out.error, 'live-check', why);
+    assert.match(r.out.reasons.join('\n'), re, why);
+    assert.deepEqual(r.calls, [], `${why}: nothing is evaluated`);
+  }
 });
