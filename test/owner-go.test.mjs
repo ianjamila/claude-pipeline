@@ -965,7 +965,8 @@ test('#128 provenance: a record is used only when its transcript entry (found by
   const home = tmp();
   const head = [promptEntry('go'), said(REQUEST)];
   assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] })), [true, true, 'ok'], 'typed by the owner');
-  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', { ...OWNER_META, promptSource: 'queued' }, 'pid-m')] }))[0], true, 'queued while the agent worked');
+  // #191 B2: an answer typed while the agent was busy (promptSource queued) is delivered after whatever the agent printed meanwhile, so it approves nothing (it was 'owner' before)
+  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', { ...OWNER_META, promptSource: 'queued' }, 'pid-m')] })), [false, false, 'provenance'], 'queued while the agent worked');
   for (const [name, meta] of [['scheduled', SCHEDULED_META], ['peer', PEER_META], ['notice', NOTICE_META], ['headless sdk', SDK_META], ['sdk-cli entrypoint', { entrypoint: 'sdk-cli', origin: { kind: 'human' }, promptSource: 'typed' }]]) {
     assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', meta, 'pid-m')] })), [false, false, 'provenance'], name);
   }
@@ -1573,6 +1574,14 @@ test('#128 legacy grant: no transcript_path / prompt_id: the owner\'s typed word
   assert.equal(ownerGrantGap(w.q), 'ok');
   assert.deepEqual(w.verify(), [true, undefined]);
   assert.equal(readFileSync(join(ownerGoDir(w.home), `${LEGACY_SESSION}.jsonl`), 'utf8'), `${JSON.stringify(w.record)}\n`, 'the record is not rewritten');
+});
+
+test('#191 B2 legacy grant: a consumed grant (no prompt_id, matched by its words) whose entry is queued is refused at the final gate; the same words typed verify', () => {
+  const queued = legacyWorld({ entries: [promptEntry('go'), said(RASK), typed('extra round', { ...OWNER_META, promptSource: 'queued' })] });
+  assert.equal(ownerGrantGap(queued.q), 'provenance');
+  assert.deepEqual(ownerGrantedRounds(queued.q), []);
+  assert.deepEqual(queued.verify(), [false, 'provenance']);
+  assert.deepEqual(legacyWorld({ entries: legacyEntries }).verify(), [true, undefined], 'typed: unchanged');
 });
 
 test('#128 legacy grant: one real transcript reached through a symlinked second config dir counts once', () => {

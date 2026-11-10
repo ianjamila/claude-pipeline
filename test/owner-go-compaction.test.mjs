@@ -226,7 +226,7 @@ test('#189 promotion is for the ruling reader only: a merge or round-grant read 
   assert.equal(lastReplyText(transcript(tmp(), [promptEntry('go'), promptEntry(HANDBACK, PEER_META), said(ASK_REPLY), promptEntry('x')]), { prompt: 'x', skipSynthetic: true }), `${ASK_REPLY}\n`);
 });
 
-test('#189 queued answers (finding 2): a promoted ask is refused for a queued answer, at record time and at use time; owner-turn asks are unaffected', () => {
+test('#189 queued answers (finding 2): a queued answer is refused for a promoted ask and (#191 B) for an owner-turn ask, at record time and at use time', () => {
   const promoted = [promptEntry('go'), promptEntry(HANDBACK, PEER_META), said(ASK_REPLY)];
   // record time: the queued answer is already in the transcript
   assert.equal(rule(tmp(), promoted, 'R1-F1: accept', { meta: QUEUED_META }), null, 'recorder refuses a queued answer to a promoted ask');
@@ -245,15 +245,18 @@ test('#189 queued answers (finding 2): a promoted ask is refused for a queued an
   writeFileSync(file, lines([...promoted, promptEntry(answer, OWNER_ENTRY, 'pid-q')]));
   assert.equal(promptProvenance(r, { home }), 'owner');
   assert.equal(ownerRuled(q), true, 'the same words typed after the ask apply');
-  // an owner-turn ask: a queued answer is accepted as before (the narrower pre-existing form is a follow-up issue)
+  // an owner-turn ask: a typed answer is accepted; #191 B: a queued one is refused too (every kind of ask), at record time and at use time
   const home2 = tmp();
   const ownerAsk = [promptEntry('go'), said(ASK_REPLY)];
   const f2 = transcript(home2, ownerAsk);
   const r2 = recordRuling({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home2, prompt: answer, prompt_id: 'pid-q2', transcript_path: f2 }, { home: home2, now });
   assert.equal(r2.ask_turn, undefined);
+  writeFileSync(f2, lines([...ownerAsk, promptEntry(answer, OWNER_ENTRY, 'pid-q2')]));
+  assert.equal(ownerRuled({ ...q, home: home2 }), true, 'owner-turn ask, typed answer');
+  assert.ok(rule(tmp(), ownerAsk, answer, { meta: OWNER_ENTRY }), 'and the recorder takes it');
   writeFileSync(f2, lines([...ownerAsk, promptEntry(answer, QUEUED_META, 'pid-q2')]));
-  assert.equal(ownerRuled({ ...q, home: home2 }), true, 'owner-turn ask, queued answer');
-  assert.ok(rule(tmp(), ownerAsk, answer, { meta: QUEUED_META }), 'and the recorder takes it');
+  assert.deepEqual([ownerRuled({ ...q, home: home2 }), ownerRulingGap({ ...q, home: home2 })], [false, 'provenance'], 'owner-turn ask, queued answer: refused at use time');
+  assert.equal(rule(tmp(), ownerAsk, answer, { meta: QUEUED_META }), null, 'and the recorder refuses it');
 });
 
 test('#189 queued answers: a promoted ask whose answer is the owner\'s typed prompt, with a queued one only EARLIER, is not refused', () => {

@@ -7,8 +7,10 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { lastReply, recordApproval, recordRoundGrant, recordRuling, entrySource } from '../pipeline/hooks/lib/owner-go.mjs';
-import { OWNER_ENTRY, mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import {
+  lastReply, recordApproval, recordRoundGrant, recordRuling, entrySource, queuedNudge, QUEUED_NUDGE, RULING_NUDGE, approvalGap, ownerGrantGap, ownerRuled, ownerRulingGap, promptProvenance,
+} from '../pipeline/hooks/lib/owner-go.mjs';
+import { OWNER_ENTRY, mergeRequest, roundRequest, rulingRequest, runHook } from './helpers/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
@@ -160,5 +162,122 @@ test('#191 A4 (F4): the race, an sdk entry appended after the owner\'s typed ans
     // (rulings, A1/#189: a synthetic prompt opens no slot, so the owner's answer still reads the owner-turn ask right before it: unchanged)
     assert.equal(run(kind, [...asked, prompt('status', SDK)]), kind === 'ruling', `${kind}: other text`);
     assert.equal(run(kind, [...asked, prompt(answer, SDK)]), false, `${kind}: same text`);
+  }
+});
+
+// ---- item 0: one rule for every reader, the ruling reader (skipSynthetic) included -------------------------------------------------
+
+test('#191 F1 (rulings): a provenance-bearing prompt of unknown source is skipped like a synthetic turn: never promoted, and it voids the slot when it shows anything', () => {
+  const bare = { type: 'user', message: { content: '[Request interrupted by user]' } };
+  // it prints the ask itself: not promotable (only a visibleSynthetic turn promotes), so there is no ask
+  assert.equal(run('ruling', withOwner('ruling', [prompt('ship it'), prompt('poll', FUTURE), said(RULING_ASK)])), false, 'ask printed inside the unknown-source turn');
+  // it prints anything after the owner-turn ask: that voids the ask (as for any synthetic turn)
+  assert.equal(run('ruling', withOwner('ruling', [prompt('ship it'), said(RULING_ASK), prompt('poll', FUTURE), said('hello')])), false, 'text in the unknown-source turn voids the owner-turn ask');
+  // it shows nothing: the owner-turn ask stays (a skipped turn opens no slot)
+  assert.equal(run('ruling', withOwner('ruling', [prompt('ship it'), said(RULING_ASK), prompt('poll', FUTURE), toolOnly(), toolResult()])), true, 'a silent unknown-source turn leaves the ask');
+  // a field-less unknown entry (an interrupt marker, a legacy transcript) is a plain boundary as before
+  assert.equal(run('ruling', withOwner('ruling', [prompt('ship it'), bare, said(RULING_ASK)])), true, 'field-less unknown');
+  // lastReply says the same: skipped, nothing promoted
+  const file = join(tmp(), 't.jsonl');
+  mkdirSync(join(file, '..'), { recursive: true });
+  writeFileSync(file, `${[prompt('go'), prompt('poll', FUTURE), said(RULING_ASK), prompt('done')].map((e) => JSON.stringify(e)).join('\n')}\n`);
+  assert.deepEqual(lastReply(file, { prompt: 'done', skipSynthetic: true }), { text: '', promoted: false });
+});
+
+// ---- Part B: a queued answer never binds -------------------------------------------------------------------------------------------
+
+test('#191 B1: each recorder refuses an answer the owner typed while the agent was busy (promptSource queued); a typed one records (B3)', () => {
+  for (const kind of Object.keys(KINDS)) {
+    assert.equal(run(kind, [prompt('ship it'), said(KINDS[kind].ask), prompt(KINDS[kind].answer, QUEUED)]), false, `${kind}: queued`);
+    assert.equal(run(kind, [prompt('ship it'), said(KINDS[kind].ask), prompt(KINDS[kind].answer)]), true, `${kind}: typed`);
+  }
+});
+
+test('#191 B1: the hook prints the queued nudge and records nothing for a queued answer; a typed answer records and gets no nudge', (t) => {
+  for (const kind of Object.keys(KINDS)) {
+    const entries = [prompt('ship it'), said(KINDS[kind].ask)];
+    const queued = runHook(t, { entries, prompt: KINDS[kind].answer, entry: QUEUED });
+    assert.equal(queued.status, 0);
+    assert.equal(queued.record, null, `${kind}: nothing recorded`);
+    assert.equal(queued.stdout, `${QUEUED_NUDGE}\n`, `${kind}: the queued nudge, one line, and not the ruling nudge`);
+    const typed = runHook(t, { entries, prompt: KINDS[kind].answer });
+    assert.notEqual(typed.record, null, `${kind}: typed records`);
+    assert.doesNotMatch(typed.stdout, /typed while the agent was still working/, `${kind}: no nudge for a typed answer`);
+  }
+  // no ask was shown: still nudged (over-nudging is harmless), and the ruling nudge does not replace it
+  assert.equal(runHook(t, { entries: [prompt('ship it'), said('nothing to ask')], prompt: 'R1-B1: accept', entry: QUEUED }).stdout, `${QUEUED_NUDGE}\n`);
+  // a typed ruling-shaped prompt with no ask keeps the ruling nudge
+  assert.equal(runHook(t, { entries: [prompt('ship it'), said('nothing to ask')], prompt: 'R1-B1: accept' }).stdout, `${RULING_NUDGE}\n`);
+});
+
+test('#191 F3/F6: the nudge text tells the agent what happened and what to do', () => {
+  assert.match(QUEUED_NUDGE, /^\[claude-pipeline owner-go\]/);
+  assert.match(QUEUED_NUDGE, /typed while the agent was still working/);
+  assert.match(QUEUED_NUDGE, /not recorded/);
+  assert.match(QUEUED_NUDGE, /P merge --pr N --dry-run --owner-go/);
+  assert.match(QUEUED_NUDGE, /P triage round-request/);
+  assert.match(QUEUED_NUDGE, /P triage ruling-request/);
+  assert.match(QUEUED_NUDGE, /fresh closing lines/);
+  assert.match(QUEUED_NUDGE, /once more after the reply ends/);
+  assert.equal(QUEUED_NUDGE.includes('\n'), false);
+  assert.notEqual(QUEUED_NUDGE, RULING_NUDGE);
+});
+
+const hookInput = (entries, answer, extra = {}) => {
+  const dir = tmp();
+  const file = join(dir, 't.jsonl');
+  writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  return { hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', prompt: answer, transcript_path: file, ...extra };
+};
+test('#191 F3: queuedNudge applies to a merge, an extra round and a ruling answer whose entry is queued, and to nothing else', () => {
+  const asked = [prompt('ship it'), said(MERGE_ASK)];
+  for (const answer of ['merge', 'merge #58', 'extra round', 'R1-B1: accept', 'R1-B1: accept, R2-F1: follow-up']) {
+    assert.equal(queuedNudge(hookInput([...asked, prompt(answer, QUEUED)], answer)), QUEUED_NUDGE, answer);
+    assert.equal(queuedNudge(hookInput([...asked, prompt(answer)], answer)), null, `${answer}: typed`);
+  }
+  assert.equal(queuedNudge(hookInput([...asked, prompt('what is the status', QUEUED)], 'what is the status')), null, 'not an answer');
+  assert.equal(queuedNudge(hookInput([...asked, prompt('merge it later maybe', QUEUED)], 'merge it later maybe')), null, 'not an answer (words after merge)');
+  const notice = '<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>';
+  assert.equal(queuedNudge(hookInput([...asked, prompt(notice, SDK)], notice)), null, 'a notice');
+  assert.equal(queuedNudge(hookInput([...asked, prompt('merge', SDK)], 'merge')), null, 'a synthetic entry is not queued');
+  assert.equal(queuedNudge(hookInput([...asked, prompt('merge', QUEUED)], 'merge', { origin: { kind: 'peer' } })), null, 'the hook input itself says it is not typed');
+  assert.equal(queuedNudge(hookInput([...asked, prompt('merge', QUEUED)], 'merge', { agent_id: 'sub-1' })), null, 'a subagent');
+  assert.equal(queuedNudge(hookInput([...asked, prompt('merge', QUEUED)], 'merge', { hook_event_name: 'Stop' })), null, 'another event');
+  assert.equal(queuedNudge(hookInput([...asked, prompt('merge', QUEUED), said('ok')], 'merge')), null, 'the queued entry is not the newest');
+  assert.equal(queuedNudge(hookInput([...asked], 'merge')), null, 'the entry is not in the transcript yet');
+  for (const bad of [undefined, null, 5, { prompt: 7 }, { prompt: 'merge', transcript_path: 5 }, { prompt: 'merge', transcript_path: '/no/such/file' }]) assert.equal(queuedNudge(bad), null);
+});
+
+// B2: the hook ran BEFORE the transcript had the entry (it cannot tell), the entry then turned out to be queued. Each kind at use time.
+const NOW = Date.parse('2026-11-10T10:00:00Z');
+const now = () => NOW;
+function recordedThen(kind, meta) {
+  const home = tmp();
+  const dir = join(home, '.claude', 'projects', '-repo');
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, 't.jsonl');
+  const before = [prompt('ship it'), said(KINDS[kind].ask)];
+  const writeAll = (entries) => writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  writeAll(before);
+  const answer = KINDS[kind].answer;
+  const rec = KINDS[kind].rec({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', cwd: home, prompt: answer, prompt_id: 'pid-ans', transcript_path: file }, { home, now });
+  assert.ok(KINDS[kind].bound(rec), `${kind}: recorded while the transcript lacked the entry`);
+  writeAll([...before, { type: 'user', message: { content: answer }, promptId: 'pid-ans', ...meta }]);
+  return { home, rec };
+}
+const RULED = { repo: 'acme/widgets', pr: 58, id: 'R1-B1', quote: 'R1-B1: accept', decision: 'ACCEPT', contentOf: () => 'c0ffee000000' };
+const GAPS = {
+  merge: ({ home }) => approvalGap({ repo: 'acme/widgets', pr: 58, head: HEAD, items: ITEMS, home, now }),
+  round: ({ home }) => ownerGrantGap({ repo: 'acme/widgets', pr: 58, k: 2, head: HEAD, home, now }),
+  ruling: ({ home }) => (ownerRuled({ ...RULED, home, now }) ? 'ok' : ownerRulingGap({ ...RULED, home, now })),
+};
+test('#191 B2: a record written before the transcript had the entry is refused at use time when the entry is queued, for every kind; typed is unchanged (B3)', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const queued = recordedThen(kind, QUEUED);
+    assert.equal(promptProvenance(queued.rec, { home: queued.home }), 'synthetic', `${kind}: provenance of a queued entry`);
+    assert.equal(GAPS[kind](queued), 'provenance', `${kind}: queued`);
+    const typed = recordedThen(kind, OWNER_ENTRY);
+    assert.equal(promptProvenance(typed.rec, { home: typed.home }), 'owner');
+    assert.equal(GAPS[kind](typed), 'ok', `${kind}: typed`);
   }
 });
