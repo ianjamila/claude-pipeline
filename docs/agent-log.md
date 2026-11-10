@@ -125,3 +125,4 @@ full record.
 - 2026-11-10 · #224 · fix: repo-move ties fail closed (#223); state show keeps post-publish marks · risk high · rounds 5 · arbiter 3 · awaiting-owner-merge
 - 2026-11-10 · #226 · Merge-queue mode: one owner "merge" queues the approved head (A1) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge
 - 2026-11-10 · #231 · Merge-queue follow-ups: timeline attribution, route-aware sweep, removal reporting, gated same-head retry (#227–#230) · risk high · rounds 5 · arbiter 4 · awaiting-owner-merge
+- 2026-11-10 · #236 · Queue: P merge from a worktree at another head keeps the queued head's live record (#232) · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
