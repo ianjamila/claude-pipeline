@@ -3247,6 +3247,7 @@ test('triage owner-ruling: an answer whose prompt is synthetic or missing from t
     const r = w.cli(rule('R1-B1', 'FOLLOW-UP'));
     assertExit(r, 1);
     assert.match(r.json.reason, /an answer is recorded for acme\/widgets-[0-9a-f-]+ #7 R1-B1, but it cannot be confirmed as typed by the owner[\s\S]*ask again[\s\S]*ask the owner to answer again/);
+    assert.match(r.json.reason, /or was typed while the agent was still working[\s\S]*FRESH closing line[\s\S]*ruling-request/, '#191: a queued answer is named, with what to do');
     assert.equal(w.item('R1-B1').final.by, 'arbiter', 'state untouched');
   }
 });
@@ -3901,6 +3902,7 @@ test('codex-review owner grant: an "extra round" whose prompt is synthetic or mi
   assertExit(capped, 2, capped.stdout);
   assert.equal(capped.json.error, 'round-cap');
   assert.match(capped.json.message, /an extra round is recorded for this PR, but it cannot be confirmed as typed by the owner[\s\S]*ask the owner to type "extra round" again/);
+  assert.match(capped.json.message, /may have been typed while the agent was still working[\s\S]*P triage round-request[\s\S]*FRESH closing lines/, '#191: a queued answer is named, with what to do');
   assert.equal(w.captured().length, calls, 'Codex never ran');
   // the gate path: the owner's own words admit the round, as before
   ownerGrantsRound(w, t, { k: 3, head: h2 });

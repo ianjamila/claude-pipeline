@@ -162,7 +162,7 @@ export const run = guarded(async (argv, ctx) => {
       const q = { repo: ghRepo.slug, pr, k: reviewedRoundCount(st) + 1, anyHead: true };
       if (ownerGrantGap(q) !== 'provenance') return '';
       const hint = ownerGrantConfigDirHint(q);
-      return `; an extra round is recorded for this PR, but it cannot be confirmed as typed by the owner${hint ? ` (${hint})` : ''}: ask the owner to type "extra round" again after triage round-request`;
+      return `; an extra round is recorded for this PR, but it cannot be confirmed as typed by the owner (it may have been typed while the agent was still working)${hint ? ` (${hint})` : ''}: run \`P triage round-request\` again, show its FRESH closing lines, and ask the owner to type "extra round" again after the reply ends`;
     } catch {
       return '';
     }
