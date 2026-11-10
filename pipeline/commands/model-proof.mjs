@@ -5,6 +5,7 @@
 import { readFileSync } from 'node:fs';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded } from '../lib/cmd-common.mjs';
+import { floorOutput, judgeFloor } from '../lib/floor-proof.mjs';
 import { findSubagentTranscript, proveModel } from '../lib/transcript.mjs';
 
 export const meta = {
@@ -12,7 +13,9 @@ export const meta = {
   usage: [
     'pipeline model-proof (--tag TAG | --agent-id ID) [--expect-model claude-fable-] [--expect-effort high]',
     '                     [--expect-agent-type TYPE] [--expect-meta-model MODEL] [--projects-dir DIR] [--max-age-ms N]',
-    '  -> {ok, transcript, meta, models, efforts, errors, finalAssistantText, stopReasonMissing, finalVia}; exit 0 proven, 1 mismatch, 2 not found/unreadable',
+    '  -> {ok, transcript, meta, models, efforts, claudeCodeVersions, errors, finalAssistantText, stopReasonMissing, finalVia}; exit 0 proven, 1 mismatch, 2 not found/unreadable',
+    '  any Fable on any line must also be at least this machine\'s floor (read-only here, the floor is never raised): older => exit 1, error stale-model, restartRequired: true,',
+    '    floor: {newest, seen}, advice',
   ].join('\n'),
 };
 
@@ -33,7 +36,7 @@ function readOrFail(file, what) {
   }
 }
 
-export const run = guarded(async (argv) => {
+export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
     tag: { type: 'string' },
     'agent-id': { type: 'string' },
@@ -67,18 +70,23 @@ export const run = guarded(async (argv) => {
   // No meta file at all is a proof failure ("meta missing", exit 1), but one that exists and cannot be read is exit 2.
   const metaText = found.metaPath === null ? undefined : readOrFail(found.metaPath, 'meta');
   const proof = proveModel({ jsonlText, metaText, expectModelPrefix, expectEffort, expectMetaModel, expectAgentType });
+  // The Fable floor, whatever --expect-model says. Read-only: only `arbiter apply` ever raises it.
+  const judged = judgeFloor({ models: proof.models, claudeCodeVersions: proof.claudeCodeVersions, env: ctx?.env ?? process.env });
+  const errors = [...proof.errors, ...(judged.applies ? judged.errors : [])];
 
   let metaObject = null;
   try { metaObject = metaText === undefined ? null : JSON.parse(metaText); } catch { /* proveModel already reported it */ }
   return {
-    exitCode: proof.ok ? EXIT.OK : EXIT.FAILED,
+    exitCode: errors.length === 0 ? EXIT.OK : EXIT.FAILED,
     output: {
-      ok: proof.ok,
+      ok: errors.length === 0,
       transcript: found.jsonlPath,
       meta: metaObject,
       models: proof.models,
       efforts: proof.efforts,
-      errors: proof.errors,
+      claudeCodeVersions: proof.claudeCodeVersions,
+      errors,
+      ...floorOutput(judged),
       finalAssistantText: proof.finalAssistantText,
       stopReasonMissing: proof.stopReasonMissing,
       finalVia: proof.finalVia,

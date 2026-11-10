@@ -20,6 +20,7 @@ import { currentContentHash, excerptWindow, reviewBaseRef } from '../pipeline/li
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { floorEnv } from './helpers/floor-env.mjs';
 import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
@@ -63,7 +64,7 @@ const GH = [
   { match: '^repo view', stdoutJson: REPO_VIEW },
 ];
 
-function transcript({ prompt, text, model = 'claude-fable-5-1', effort = 'high' }) {
+function transcript({ prompt, text, model = 'claude-fable-5-2', effort = 'high' }) {
   const lines = [
     { type: 'user', isSidechain: true, agentId: 'a1', message: { role: 'user', content: prompt }, uuid: 'u-1', timestamp: '2026-10-01T09:00:00.000Z' },
     {
@@ -127,7 +128,7 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
     cli(args, env = {}) {
       const merged = {
         ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, FAKE_CODEX_CAPTURE: capture,
-        PIPELINE_LOCK_DIR: lockDir, ...env,
+        PIPELINE_LOCK_DIR: lockDir, ...floorEnv(), ...env,
       };
       for (const k of [
         'PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_ARBITER_MODEL_OVERRIDE', 'PIPELINE_TEST_MODE', 'PIPELINE_CODEX_TIMEOUT_MS',
@@ -954,12 +955,12 @@ test('arbiter apply: a Fable transcript for this round and digest is proven, its
   assert.equal(proof.ok, true);
   assert.equal(proof.round, 1);
   assert.equal(proof.tag, needed.json.tag);
-  assert.deepEqual(proof.models, { 'claude-fable-5-1': 1 });
+  assert.deepEqual(proof.models, { 'claude-fable-5-2': 1 });
   assert.deepEqual(proof.efforts, { high: 1 });
   assert.deepEqual(proof.errors, []);
   assert.match(proof.transcript, /agent-a1\.jsonl$/);
   assert.equal(w.state().rounds[0].arbiter.proofOk, true);
-  assert.deepEqual(w.state().rounds[0].modelProof, { transcript: proof.transcript, models: { 'claude-fable-5-1': 1 }, effort: 'high' }, 'the proof summary travels in the state');
+  assert.deepEqual(w.state().rounds[0].modelProof, { transcript: proof.transcript, models: { 'claude-fable-5-2': 1 }, effort: 'high' }, 'the proof summary travels in the state');
 
 });
 

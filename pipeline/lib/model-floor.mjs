@@ -20,6 +20,7 @@ export const HISTORY_MAX = 10;
 export const LOCK_WAIT_MS = 30_000;
 const REGISTRY_MAX_BYTES = 64 * 1024;
 const DIR_ENV = 'PIPELINE_MODEL_FLOOR_DIR';
+export const FLOOR_DIR_ENV = DIR_ENV;
 
 const FAMILIES = ['fable', 'mythos', 'opus', 'sonnet', 'haiku'];
 // claude-<family>-<major>[-<minor>][-YYYYMMDD]: the minor is at most 4 digits, so an 8-digit date is never read as one.

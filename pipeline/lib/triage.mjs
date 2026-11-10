@@ -240,7 +240,9 @@ export function finalizeWithoutArbiter(items, opts = {}) {
 // A ruling is final unless it must go to a human. Checked in this order; the first match wins.
 // `rulings` may be the arbiter's whole output ({rulings}) or just its array. A missing proofOk
 // fails closed.
-export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
+// `proofCause` names why an unproven answer is unproven when it is not the plain model-proof failure ('stale-model': the proof failed on the
+// Fable floor alone).
+export function applyRulings(items, rulings, { proofOk, transcript, proofCause } = {}) {
   const list = Array.isArray(rulings) ? rulings : (rulings?.rulings ?? []);
   const byId = new Map(list.map((r) => [r.id, r]));
   return items.map((item) => {
@@ -263,8 +265,8 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
         decision: validDecision(item.judge?.decision) ?? validDecision(r.ruling),
         by: 'arbiter',
         needsHuman: true,
-        reason: 'model-proof failed: ruling not provably from Fable',
-        cause: 'model-proof',
+        reason: proofCause === 'stale-model' ? 'stale-model: the ruling came from a Fable older than this machine\'s floor' : 'model-proof failed: ruling not provably from Fable',
+        cause: proofCause === 'stale-model' ? 'stale-model' : 'model-proof',
       };
     } else if (!rulingValid) {
       // Output a validator would have refused (wrong case, missing, wrong type): never act on it.
@@ -288,13 +290,16 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
 
 // ---- Claude's own rulings (plan 2026-11-05-claude-rulings.md section 10 and E1-E11) ----------------------------------------------
 
-// Why an item waits for a human: `final.cause` (set where the final is made). The first three are malfunctions (a judge or arbiter answer that
-// could not be used): Claude may not dismiss through them, only ACCEPT, or have the arbiter run again. The others are judgements a human may make.
-export const MALFUNCTION_CAUSES = ['model-proof', 'invalid-arbiter', 'invalid-judge'];
+// Why an item waits for a human: `final.cause` (set where the final is made). The first five are malfunctions (a judge or arbiter answer that
+// could not be used, or a terminal that cannot give the pinned Fable): Claude may not dismiss through them, only ACCEPT, or have the arbiter run again. The others are judgements a human may make.
+// stale-model (the Fable that answered is older than this machine's floor) and stale-terminal (this terminal runs an older Claude Code build than
+// the installed one) are malfunctions too: restart the terminal, update Claude Code, and run the review again.
+export const MALFUNCTION_CAUSES = ['model-proof', 'invalid-arbiter', 'invalid-judge', 'stale-model', 'stale-terminal'];
 const NEEDS_HUMAN_CAUSES = [...MALFUNCTION_CAUSES, 'low-confidence', 'security-dismissal', 'test-security'];
 // The reason strings of states written before `cause` existed.
 const LEGACY_CAUSES = [
   [/^model-proof failed/, 'model-proof'],
+  [/^stale-model:/, 'stale-model'],
   [/^invalid arbiter output$/, 'invalid-arbiter'],
   [/^invalid judge output$/, 'invalid-judge'],
   [/^arbiter low confidence$/, 'low-confidence'],
