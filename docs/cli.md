@@ -381,6 +381,26 @@ Default runs `merge.hold_command` for PR N; `lines` is the last 5 output lines. 
 
 `--release --reason new-commits` first reads the PR head (one `gh pr view`) and keeps the hold, running nothing, when it is the pipeline's own successor head (output `{ok: true, configured: true, kept: true, why: 'own-successor', head}`, exit 0; see Taking the hold for a catch-up under `merge`); a head that cannot be read releases with a `warnings` line. The new reason codes `ci-failed`, `update-conflict`, `queued-behind` and `hold-unreadable` are used by the automatic releases of `update-branch` and `merge` and by the skill (`ci-failed` before a fix, `queued-behind` when a wait ends). `--check --wait [--max-minutes M]` polls the read-only check at once and then every 5 minutes (fixed, no override: the repo's check costs about 15 API calls and the 5,000/hour budget is shared; `M` is an integer 5..240, default 120, and bounds when a poll may START: a poll starts only if it can start by the deadline, a running check keeps its own 5-minute timeout) and answers `outcome: front` (exit 0: nothing is ahead, update again), `timeout` (still queued, exit 1) or `unreadable` (two unreadable answers in a row, exit 1, fail closed). It runs longer than a tool call may: start it with `pipeline job start turn -- pipeline merge-hold --pr N --check --wait`.
 
+## model-floor
+
+show the Fable model floor; reset it (owner only, run in your own terminal): back to the shipped minimum, optionally holding it.
+
+```
+pipeline model-floor show   -> {ok, floor, MIN_FABLE, registry, file, error?} : READ-ONLY, runs anywhere; exit 0, or 1 when the registry file is unreadable (reviews are blocked until a reset)
+pipeline model-floor reset [--hold <fable model id> | --clear-hold] [--clear-lock]   -> {ok, floor, hold, file, clearedLock}
+  Owner only: refused inside Claude Code (exit 2 `refused`); run it in your own terminal (`node ~/.claude/pipeline/bin/pipeline.mjs model-floor reset`).
+  Rewrites the registry to the shipped minimum (a corrupt or unreadable registry is replaced); an existing hold is kept.
+  --hold <id>   also caps the floor at that Fable id (a claude-fable-* id) until `model-floor reset --clear-hold`. Use it to roll back an alias
+                (the `fable` alias moved to a model you do not want) or when the two accounts resolve different Fables. A claude-fable-* id
+                the parser cannot read blocks reviews, including the PR that fixes the parser: run `model-floor reset --hold <last good id>`, then merge the parser fix.
+  --clear-hold  lift the cap (not with --hold)
+  --clear-lock  first remove a floor lock left behind by a process that is still alive or on another host (a dead holder's lock clears itself)
+```
+
+Exit: 0 ok · 1 the registry is unreadable (`show`) or could not be written / is locked (`reset`) · 2 usage, or `reset` refused inside Claude Code.
+
+The floor is the oldest Fable model a review may be proven with on this machine: `max(MIN_FABLE, newest Fable proven here)`, capped by an owner hold. The registry lives under the account's `owner-go/model-floor/`, which the guard protects, so only the pipeline commands (never an agent's shell) write it. `reset` is the only way down: it writes the shipped minimum back and keeps (or sets with `--hold`, or clears with `--clear-hold`) the ceiling.
+
 ## model-proof
 
 prove a subagent ran on the expected model and effort.
