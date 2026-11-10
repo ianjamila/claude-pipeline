@@ -9,7 +9,8 @@ import { join } from 'node:path';
 import {
   ALLOW_MAX, FLOOR_REL, HISTORY_MAX, MIN_FABLE, checkFloor, compareVersions, floorDir, parseModelId, raiseFloor, readFloor, readReviewGate, reReviewThreshold, resetFloor, readableAllowedIds, standingBypasses, withFloorLock,
 } from '../pipeline/lib/model-floor.mjs';
-import { tryAcquire } from '../pipeline/lib/locks.mjs';
+import { holdsLock, liveLocalHolder, release, tryAcquire } from '../pipeline/lib/locks.mjs';
+import { spawn } from 'node:child_process';
 import { readApprovals } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const tmp = (t) => {
@@ -357,10 +358,13 @@ test('resetFloor rejects a bad hold, both flags together, and writes nothing', a
   assert.equal(readFileSync(reg(dir), 'utf8'), before);
 });
 
-test('resetFloor --clear-lock removes a lock a live holder left; without it reset reports busy', async (t) => {
+// Another machine's holder: its pid means nothing here, so the lock is never reclaimed by liveness and --clear-lock may remove it.
+const REMOTE = { host: 'another-host.invalid', machineId: 'another-machine-id' };
+
+test('resetFloor --clear-lock removes a lock another machine left; without it reset reports busy', async (t) => {
   const dir = join(tmp(t), 'f');
   mkdirSync(dir, { recursive: true });
-  assert.equal(tryAcquire('model-floor', { dir, machineId: null }).acquired, true); // this very process: alive, so never reclaimed
+  assert.equal(tryAcquire('model-floor', { dir, ...REMOTE }).acquired, true);
   await assert.rejects(resetFloor({ dir, waitMs: 100 }), { code: 'model-floor-busy' });
   const r = await resetFloor({ dir, clearLock: true });
   assert.equal(r.clearedLock, true);
@@ -632,8 +636,8 @@ test('R4-F2: resetFloor keepFloor with clearLock removes the lock and rewrites n
   assert.deepEqual([kept.clearedLock, kept.floor, existsSync(join(dir, 'model-floor.lock'))], [true, 'claude-fable-5-3', false]);
   assert.equal(readFileSync(reg(dir), 'utf8'), bytes, 'byte-identical registry');
   assert.equal((await resetFloor({ dir, clearLock: true, keepFloor: true })).clearedLock, false, 'nothing left to clear');
-  // A lock held by a live holder does not stop it: the lock is what it removes, and it never takes the lock.
-  const held = tryAcquire('model-floor', { dir, machineId: null });
+  // A lock held on another machine does not stop it: the lock is what it removes, and it never takes the lock.
+  const held = tryAcquire('model-floor', { dir, ...REMOTE });
   assert.equal(held.acquired, true);
   assert.equal((await resetFloor({ dir, clearLock: true, keepFloor: true, waitMs: 50 })).clearedLock, true);
   for (const extra of [{ hold: 'claude-fable-5-4' }, { clearHold: true }, { allowId: ['claude-fable-6-b'] }, { removeAllow: ['claude-fable-6-preview'] }, { clearAllow: true }, { clearLock: false }]) {
@@ -645,4 +649,70 @@ test('R4-F2: resetFloor keepFloor with clearLock removes the lock and rewrites n
   await assert.rejects(resetFloor({ dir, clearLock: true, keepFloor: true }), { code: 'model-floor-unreadable' });
   assert.equal(existsSync(join(dir, 'model-floor.lock')), true, 'refused before touching the lock');
   assert.equal((await resetFloor({ dir, clearLock: true })).registry.newest, MIN_FABLE, 'a bare clearLock is the plain reset that repairs it');
+});
+
+// ---- review round 1: R1-B2 (--clear-lock never takes a lock from a running holder on this machine) ----
+// A sleeping child process is a real, running holder with a pid that is not the test's own.
+const sleeper = (t) => {
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'], { stdio: 'ignore' });
+  t.after(() => child.kill());
+  return child;
+};
+const DEAD_PID = 2147483646;
+
+for (const keepFloor of [false, true]) {
+  const form = keepFloor ? '--clear-lock --keep-floor' : '--clear-lock';
+  test(`R1-B2: resetFloor ${form} is refused (model-floor-lock-live, naming the pid) while a running process on this machine holds the lock; nothing is removed or rewritten`, async (t) => {
+    const dir = join(tmp(t), 'f');
+    mkdirSync(dir, { recursive: true });
+    writeReg(dir, good());
+    const bytes = readFileSync(reg(dir), 'utf8');
+    for (const pid of [sleeper(t).pid, process.pid]) {
+      const lock = tryAcquire('model-floor', { dir, pid, runId: `r-${pid}` });
+      assert.equal(lock.acquired, true);
+      await assert.rejects(resetFloor({ dir, clearLock: true, keepFloor }), (err) => {
+        assert.equal(err.code, 'model-floor-lock-live');
+        assert.match(err.message, new RegExp(`pid ${pid}\\b`));
+        assert.match(err.message, /stop that process \(or wait/);
+        return true;
+      });
+      assert.equal(existsSync(join(dir, 'model-floor.lock')), true, 'the lock is still there');
+      assert.equal(holdsLock(lock.lock), true);
+      assert.equal(readFileSync(reg(dir), 'utf8'), bytes, 'the registry is untouched');
+      release(lock.lock);
+    }
+  });
+
+  test(`R1-B2: resetFloor ${form} still clears a dead holder's lock, another machine's lock and a lock with no readable owner record`, async (t) => {
+    const dir = join(tmp(t), 'f');
+    mkdirSync(dir, { recursive: true });
+    writeReg(dir, good());
+    const lockDir = join(dir, 'model-floor.lock');
+    const makers = {
+      'a dead pid': () => assert.equal(tryAcquire('model-floor', { dir, pid: DEAD_PID, machineId: null }).acquired, true),
+      'another machine, whose pid is alive here': () => assert.equal(tryAcquire('model-floor', { dir, ...REMOTE }).acquired, true),
+      'an unreadable owner record': () => { mkdirSync(lockDir); writeFileSync(join(lockDir, 'owner.json'), '{not json'); },
+      'no owner record': () => mkdirSync(lockDir),
+    };
+    for (const [what, make] of Object.entries(makers)) {
+      make();
+      const r = await resetFloor({ dir, clearLock: true, keepFloor });
+      assert.equal(r.clearedLock, true, what);
+      assert.equal(existsSync(lockDir), false, what);
+    }
+  });
+}
+
+test('R1-B2: liveLocalHolder: the owner of a running local holder, else null; holdsLock is true only for the handle that owns the lock', async (t) => {
+  const dir = join(tmp(t), 'f');
+  mkdirSync(dir, { recursive: true });
+  assert.equal(liveLocalHolder('model-floor', { dir }), null, 'no lock');
+  const mine = tryAcquire('model-floor', { dir, machineId: null });
+  assert.equal(liveLocalHolder('model-floor', { dir, machineId: null }).pid, process.pid);
+  assert.equal(holdsLock(mine.lock), true);
+  rmSync(join(dir, 'model-floor.lock'), { recursive: true });
+  assert.equal(holdsLock(mine.lock), false, 'removed by hand');
+  const other = tryAcquire('model-floor', { dir, machineId: null });
+  assert.equal(holdsLock(mine.lock), false, 'taken since by another holder');
+  assert.equal(holdsLock(other.lock), true);
 });

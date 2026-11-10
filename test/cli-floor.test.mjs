@@ -13,7 +13,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { scratchFloorDir } from './helpers/floor-env.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
-import { readFloor, resetFloor, withFloorLock } from '../pipeline/lib/model-floor.mjs';
+import { raiseFloor, readFloor, resetFloor, withFloorLock } from '../pipeline/lib/model-floor.mjs';
 
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id'; // the in-process floor lock must not create a machine-id file in the real pipeline state folder
 const here = dirname(fileURLToPath(import.meta.url));
@@ -499,6 +499,62 @@ test('interleaving: a 5.3 proof in another process (another HOME) cannot raise t
   assert.deepEqual(b.state().rounds[0].modelProof.models, { [NEWER]: 1 });
   assert.equal(a.registry().floor, NEWER, 'then B raised it');
   assert.ok(statSync(join(a.repo.dir, '.review', 'state.json')).mtimeMs <= statSync(join(a.floor, 'fable.json')).mtimeMs, 'A published before B raised');
+});
+
+// ---- review round 1: R1-B2 (a lock removed from under a running apply fences its publish) -------------------------------------------------
+
+// A pauses after its compare (the seam); the floor moves while it waits; when it resumes it must save nothing: no proofOk, no ok model-proof.json.
+const pausedApply = async (t) => {
+  const a = world(t).prepare();
+  const pause = join(a.scratch, 'pause');
+  const ownA = a.installOwn({ models: [FLOOR] });
+  const before = a.state();
+  const runA = a.spawnCli(['arbiter', 'apply', '--round', '1'], { ...ownA, PIPELINE_TEST_MODE: '1', PIPELINE_TEST_FLOOR_PAUSE: pause });
+  await until(() => existsSync(`${pause}.reached`), 20_000, 'process A to reach the pause');
+  return { a, before, runA, go: () => writeFileSync(`${pause}.go`, '') };
+};
+const assertNothingSaved = (a, before, cause) => {
+  const round = a.state().rounds[0];
+  assert.equal(Object.hasOwn(round.arbiter, 'proofOk'), false, 'no proofOk was persisted');
+  assert.equal(round.arbiter.failure.cause, cause);
+  assert.equal(round.modelProof, undefined);
+  assert.deepEqual(minusFailure(a.state()), before, 'nothing was saved but the failure record');
+  let proof = null;
+  try { proof = proofFile(a); } catch { /* never written: also fine */ }
+  assert.notEqual(proof?.ok, true, 'the proof file does not say ok');
+  assert.equal(existsSync(join(a.repo.dir, '.review', 'round-1', 'rulings.json')), false, 'no rulings were published');
+};
+
+test('R1-B2: a floor lock removed from under a paused apply, then a 5.3 proof by another process: the 5.2 apply fails model-floor-busy and saves nothing', async (t) => {
+  const { a, before, runA, go } = await pausedApply(t);
+  const b = world(t).prepare();
+  b.floor = a.floor; // two accounts' HOMEs, one registry and one lock
+  rmSync(join(a.floor, 'model-floor.lock'), { recursive: true, force: true }); // an older pipeline, or a manual rm
+  const resB = b.cli(['arbiter', 'apply', '--round', '1'], b.installOwn({ models: [NEWER] }));
+  assertExit(resB, 0, resB.stdout + resB.stderr);
+  assert.equal(a.registry().floor, NEWER, 'B raised the floor while A sat between its compare and its publish');
+
+  go();
+  const resA = await runA.done;
+  assertExit(resA, 1, resA.stdout + resA.stderr);
+  assert.equal(resA.json.error, 'model-floor-busy');
+  assert.match(resA.json.advice, /^another review holds the machine-wide floor lock/);
+  assertNothingSaved(a, before, 'model-floor-busy');
+  assert.equal(a.registry().floor, NEWER, 'A raised nothing');
+});
+
+test('R1-B2: the floor moved above the proof while the lock is still held (a registry written by hand): the apply fails stale-model after re-reading it and saves nothing', async (t) => {
+  const { a, before, runA, go } = await pausedApply(t);
+  raiseFloor({ dir: a.floor, model: NEWER });
+  go();
+  const resA = await runA.done;
+  assertExit(resA, 1, resA.stdout + resA.stderr);
+  assert.equal(resA.json.error, 'stale-model');
+  assert.equal(resA.json.restartRequired, true);
+  assert.deepEqual(resA.json.floor, { newest: NEWER, seen: [FLOOR] });
+  assert.ok(resA.json.advice);
+  assertNothingSaved(a, before, 'stale-model');
+  assert.equal(existsSync(join(a.floor, 'model-floor.lock')), false, 'the lock was released');
 });
 
 // ---- review round 2: R2-F2 (a standing bypass is visible; an allowance never admits an id the parser reads below the floor) --------------

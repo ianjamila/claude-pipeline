@@ -15,6 +15,7 @@ import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { fingerprint, largeBinaryNote, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
 import { GitError, ReviewBaseUnavailable, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
 import { claudeCodeStatus } from '../lib/claude-code-version.mjs';
+import { holdsLock } from '../lib/locks.mjs';
 import { floorBypass, floorOutput, floorPauseSeam, floorWaitMs, fableModelsOf, judgeFloor, mayRaiseFloor } from '../lib/floor-proof.mjs';
 import { compareVersions, parseModelId, raiseFloor, readReviewGate, withFloorLock } from '../lib/model-floor.mjs';
 import { seamFlag } from '../lib/proc.mjs';
@@ -48,6 +49,7 @@ export const meta = {
     '  any Fable on any line of the transcript must be at least this machine\'s floor (whatever --expect-model says): older => exit 1, error stale-model,',
     '    restartRequired: true, floor: {newest, seen}, advice (restart this terminal, or update Claude Code); the items wait with cause stale-model. A proven pass',
     '    with a newer Fable raises the floor (only a transcript under the account\'s own projects folder, no --projects-dir; exit 1 model-floor-busy / model-floor-unwritable otherwise unproven)',
+    '    just before it raises or saves anything, apply checks it still holds the floor lock and reads the floor again: lock gone => exit 1 model-floor-busy, floor now above the proof => exit 1 stale-model; either way nothing is saved but round.arbiter.failure',
     '  a proof that passed only through an owner allowance (an id the parser cannot read) or a hold below MIN_FABLE adds floor: {newest, allowed: [ids], heldBelowMin: <hold>|null} to the output',
     '    and allowed / heldBelowMin (each only when present) to round-N/model-proof.json and the round\'s stored modelProof summary',
     '  an apply that fails on the floor (stale-model, model-floor-unreadable, unrecognised-fable, model-floor-busy, model-floor-unwritable) saves round.arbiter.failure {cause, advice, at} and prints the same `advice` in its output;',
@@ -502,18 +504,33 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
     errors.push(...judged.errors);
     return publish(judged);
   }
+  // A floor failure that saves no proof: the round records why (arbiter.failure, like the other floor failures), the items and the proof files stay as they were.
+  const failFloor = (code, message, advice, extra = {}) => {
+    saveState(root, withFailure(requireState(root), n, failureOf(code, advice)));
+    throw new Fail(EXIT.FAILED, { ok: false, error: code, message, advice, ...extra });
+  };
+  const BUSY_ADVICE = 'another review holds the machine-wide floor lock: run `arbiter apply` again in a minute; if it persists, the owner runs `pipeline model-floor reset --clear-lock --keep-floor` in a plain terminal (it keeps the learned floor; a bare `--clear-lock` resets it to the shipped minimum)';
   // A proven pass: read floor, compare, raise, save, in one hold of the machine-wide lock (inside the per-PR lock; nothing takes them the other way round).
   try {
-    return await withFloorLock({ env, waitMs: floorWaitMs(env) }, async () => {
-      const judged = judgeFloor(judgeOpts);
+    return await withFloorLock({ env, waitMs: floorWaitMs(env) }, async ({ lock }) => {
+      let judged = judgeFloor(judgeOpts);
       errors.push(...judged.errors);
+      // The lock can be removed from under a running apply (an older pipeline, a manual rm) and the floor then moved by another review: the compare above
+      // is only good while the lock is ours. So just before anything is raised or saved: still ours? and does the floor, read again, still pass this proof?
+      const fenced = () => {
+        if (!holdsLock(lock)) failFloor('model-floor-busy', 'the floor lock was taken away while this review was being proven: nothing was saved', BUSY_ADVICE);
+      };
       if (judged.ok) {
         await floorPauseSeam(env);
+        fenced();
+        judged = judgeFloor(judgeOpts);
+        if (!judged.ok) failFloor(judged.error ?? 'stale-model', judged.errors.join(' '), judged.advice ?? null, floorOutput(judged));
         // An id the parser cannot read never raises the floor (an owner allowance does not change that); a readable one, allowed or not, is judged and may raise it.
         const raisable = fableModelsOf(proof.models).filter((id) => parseModelId(id) !== null);
         const top = raisable.length === 0 ? null : raisable.reduce((a, b) => (compareVersions(parseModelId(b), parseModelId(a)) > 0 ? b : a));
         if (top !== null && compareVersions(parseModelId(top), parseModelId(judged.floor)) > 0 && mayRaiseFloor({ transcript: found.jsonlPath, projectsDirGiven: projectsDir !== undefined, env }).ok) {
           try {
+            fenced();
             raiseFloor({ env, model: top, claudeCode: claudeCodeVersions.length > 0 ? claudeCodeVersions[claudeCodeVersions.length - 1] : null, transcript: found.jsonlPath });
           } catch (err) {
             if (err?.code !== 'model-floor-unreadable') throw err;
@@ -523,17 +540,14 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
             judged.error ??= err.code;
           }
         }
+        fenced();
       }
       return publish(judged);
     });
   } catch (err) {
     // Fail closed, nothing published or saved: the retry proves again.
     if (err?.code === 'model-floor-busy' || err?.code === 'model-floor-unwritable') {
-      const advice = err.code === 'model-floor-busy'
-        ? 'another review holds the machine-wide floor lock: run `arbiter apply` again in a minute; if it persists, the owner runs `pipeline model-floor reset --clear-lock --keep-floor` in a plain terminal (it keeps the learned floor; a bare `--clear-lock` resets it to the shipped minimum)'
-        : 'the owner runs `pipeline model-floor reset` in a plain terminal';
-      saveState(root, withFailure(requireState(root), n, failureOf(err.code, advice)));
-      throw new Fail(EXIT.FAILED, { ok: false, error: err.code, message: err.message, advice });
+      return failFloor(err.code, err.message, err.code === 'model-floor-busy' ? BUSY_ADVICE : 'the owner runs `pipeline model-floor reset` in a plain terminal');
     }
     throw err;
   }

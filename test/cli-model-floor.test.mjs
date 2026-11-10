@@ -154,10 +154,10 @@ test('a hold below the shipped minimum is a ceiling too (alias rollback to the l
   assert.equal(readFloor({ dir }).floor, 'claude-fable-5-1');
 });
 
-test('reset --clear-lock removes a lock a live holder left', async (t) => {
+test('reset --clear-lock removes a lock another machine left', async (t) => {
   const dir = scratch(t);
   mkdirSync(dir, { recursive: true });
-  assert.equal(tryAcquire('model-floor', { dir, machineId: null }).acquired, true); // this very process: alive, so never reclaimed
+  assert.equal(tryAcquire('model-floor', { dir, host: 'another-host.invalid', machineId: 'another-machine-id' }).acquired, true); // alive pid, but not on this machine: never reclaimed
   const lockDir = join(dir, 'model-floor.lock');
   assert.equal(existsSync(lockDir), true);
   const r = await run(['reset', '--clear-lock'], asOwner(dir));
@@ -399,4 +399,30 @@ test('R4-F2: reset --clear-lock --keep-floor removes the lock and keeps the lear
   assert.equal(readFileSync(reg(dir), 'utf8'), bytes);
   const bare = await run(['reset', '--clear-lock'], asOwner(dir));
   assert.equal(bare.output.floor, MIN_FABLE, 'a bare --clear-lock is still the plain reset');
+});
+
+test('R1-B2: reset --clear-lock (plain and --keep-floor) exits 1 model-floor-lock-live, naming the pid, while a running local process holds the lock; a dead holder clears', async (t) => {
+  const dir = scratch(t);
+  mkdirSync(dir, { recursive: true });
+  raiseFloor({ dir, model: 'claude-fable-5-3', now: NOW });
+  const bytes = readFileSync(reg(dir), 'utf8');
+  assert.equal(tryAcquire('model-floor', { dir, machineId: null }).acquired, true); // this very process: running
+  for (const args of [['reset', '--clear-lock'], ['reset', '--clear-lock', '--keep-floor'], ['reset', '--clear-lock', '--allow-id', 'claude-fable-6-preview']]) {
+    const r = await run(args, asOwner(dir));
+    assert.equal(r.exitCode, 1, args.join(' '));
+    assert.equal(r.output.error, 'model-floor-lock-live');
+    assert.match(r.output.message, new RegExp(`pid ${process.pid}\\b`));
+    assert.match(r.output.message, /stop that process/);
+    assert.equal(existsSync(join(dir, 'model-floor.lock')), true);
+    assert.equal(readFileSync(reg(dir), 'utf8'), bytes);
+  }
+  rmSync(join(dir, 'model-floor.lock'), { recursive: true });
+  assert.equal(tryAcquire('model-floor', { dir, pid: 2147483646, machineId: null }).acquired, true);
+  const r = await run(['reset', '--clear-lock', '--keep-floor'], asOwner(dir));
+  assert.deepEqual([r.exitCode, r.output.clearedLock], [0, true]);
+  assert.equal(readFileSync(reg(dir), 'utf8'), bytes);
+});
+
+test('R1-B2: the usage says --clear-lock refuses while the holder is running', () => {
+  assert.match(meta.usage, /--clear-lock .*refuses while the holder is a running process on this machine \(exit 1 model-floor-lock-live, naming the pid\)/);
 });

@@ -454,6 +454,21 @@ export async function withLock(name, fn, opts) {
   return result;
 }
 
+// Does this lock handle still own its lock? true only while owner.json carries OUR runId and pid. A lock removed by hand (or by an older
+// pipeline), and perhaps taken since by another holder, answers false. withLock learns the same only after fn returns; this lets fn ask first.
+export function holdsLock(lock) {
+  const owner = readOwner(lockPathFor(lock.dir, lock.name));
+  return owner !== null && owner.runId === lock.runId && owner.pid === lock.pid;
+}
+
+// The owner of a lock whose process is running on THIS machine (same hostname or machine id, PID alive), else null: no lock, a dead holder, another
+// machine's holder, or a lock with no usable owner record. Reads only; the same judgement tryAcquire makes before it refuses to reclaim.
+export function liveLocalHolder(name, { dir = defaultLockDir(), now = Date.now(), host = os.hostname(), machineId: machine = readMachineId(), isAlive = isPidAlive } = {}) {
+  const ctx = { now, host, machineId: machine, isAlive, hooks: {} };
+  const seen = assess(lockPathFor(dir, name), ctx);
+  return seen.state === 'held' && !seen.owner.incomplete && isLocalOwner(seen.owner, ctx) ? seen.owner : null;
+}
+
 // The current owner, or null when there is no lock. A lock directory without a usable owner.json (being created,
 // or abandoned) is reported as { incomplete: true, ... } so that "no lock" always means "free".
 export function inspect(name, { dir = defaultLockDir() } = {}) {

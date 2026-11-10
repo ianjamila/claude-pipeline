@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { accountHome } from './paths.mjs';
-import { LockTimeoutError, readMachineId, withLock } from './locks.mjs';
+import { LockTimeoutError, liveLocalHolder, readMachineId, withLock } from './locks.mjs';
 import { seamValue } from './seams.mjs';
 import { OWNER_GO_REL, realDirChain } from '../hooks/lib/owner-go.mjs';
 
@@ -223,12 +223,12 @@ export function raiseFloor({ model, claudeCode = null, transcript = null, now, .
 }
 
 // The machine-wide `model-floor` lock, kept in the registry's own folder (never PIPELINE_LOCK_DIR / the default lock dir), so processes with
-// different $HOME values share it. fn({ dir }) runs holding it. Waits up to waitMs, then throws code 'model-floor-busy'.
+// different $HOME values share it. fn({ dir, lock }) runs holding it (`lock` is the handle: holdsLock(lock) asks whether it is still ours). Waits up to waitMs, then throws code 'model-floor-busy'.
 export async function withFloorLock({ waitMs = LOCK_WAIT_MS, pollMs = 100, ...opts } = {}, fn) {
   const dir = ensureDir(opts);
   const stateDir = path.join(opts.home ?? accountHome(), '.claude', 'pipeline-state');
   try {
-    return await withLock(LOCK_NAME, () => fn({ dir }), { dir, waitMs, pollMs, machineId: readMachineId({ stateDir }) });
+    return await withLock(LOCK_NAME, (lock) => fn({ dir, lock }), { dir, waitMs, pollMs, machineId: readMachineId({ stateDir }) });
   } catch (err) {
     if (err instanceof LockTimeoutError) {
       throw codeError('model-floor-busy', `another review is updating the model floor (waited ${waitMs} ms): ${err.message.replace(/ To clear it by hand.*$/, '')}. Run the review again in a minute; if it persists, the owner runs \`pipeline model-floor reset --clear-lock --keep-floor\` (a bare \`--clear-lock\` also resets the learned floor to the shipped minimum)`, { cause: err });
@@ -237,9 +237,23 @@ export async function withFloorLock({ waitMs = LOCK_WAIT_MS, pollMs = 100, ...op
   }
 }
 
+// --clear-lock never takes a lock from a process that is still using it: the holder would go on to write under a floor it no longer protects.
+// Refused (model-floor-lock-live) while the recorded holder is on this machine and its pid is running; a dead holder, another machine's holder
+// and a lock with no usable owner record may be removed.
+function refuseLiveHolder(dir, opts) {
+  let owner = null;
+  try {
+    owner = liveLocalHolder(LOCK_NAME, { dir, machineId: readMachineId({ stateDir: path.join(opts.home ?? accountHome(), '.claude', 'pipeline-state') }) });
+  } catch { /* an owner record that cannot be read is an unreadable record: it may be cleared */ }
+  if (owner) {
+    throw codeError('model-floor-lock-live', `the floor lock is held by a running process (pid ${owner.pid}, since ${owner.startedAt}): stop that process (or wait for it to finish) first, then run --clear-lock again. Clearing a lock its holder still uses would let that review save a proof the floor no longer allows`, { holderPid: owner.pid });
+  }
+}
+
 // Owner recovery (the CLI wrapper adds the owner-only check): rewrite the registry to the code constant. `hold` (a Fable id) sets the ceiling the
 // floor cannot rise above; `clearHold` removes it; with neither, an existing readable hold is kept. `clearLock` first removes the floor lock
-// folder (for a lock a live-looking process or another host left behind; a dead holder's lock is reclaimed by the lock itself).
+// folder (for a lock another host or an unreadable record left behind; a dead holder's lock is reclaimed by the lock itself). It refuses, with
+// model-floor-lock-live, while the holder is a running process on this machine (stop it or wait): that holds for the plain and the keepFloor form.
 // `allowId` (Fable ids, exact names) adds to the registry's `allow` list (at most ALLOW_MAX): the review accepts those ids although the parser cannot
 // read them (an id the parser reads is judged by version like any other: the allowance never admits one below the floor); `clearAllow` empties it;
 // `removeAllow` removes exactly those ids (each must be on the list now, else model-floor-bad-allow naming the list; not with clearAllow, and not an id
@@ -272,6 +286,7 @@ export async function resetFloor({ hold, clearHold = false, allowId = [], remove
       throw codeError('model-floor-unreadable', `${current.message.replace(/; reviews are blocked until.*$/, '')}: --keep-floor keeps the learned floor and there is none to keep; run \`pipeline model-floor reset --clear-lock\` (a plain reset)`);
     }
     const lockDir = path.join(dir, `${LOCK_NAME}.lock`);
+    refuseLiveHolder(dir, opts);
     const clearedLock = fs.existsSync(lockDir);
     fs.rmSync(lockDir, { recursive: true, force: true });
     return { floor: current.floor, registry: current.registry, file: registryFile(dir), clearedLock };
@@ -279,6 +294,7 @@ export async function resetFloor({ hold, clearHold = false, allowId = [], remove
   let clearedLock = false;
   if (clearLock) {
     const lockDir = path.join(dir, `${LOCK_NAME}.lock`);
+    refuseLiveHolder(dir, opts);
     clearedLock = fs.existsSync(lockDir);
     fs.rmSync(lockDir, { recursive: true, force: true });
   }
