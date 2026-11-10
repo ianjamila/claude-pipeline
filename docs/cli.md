@@ -45,17 +45,27 @@ pipeline arbiter needed --round R [--force] [--repo DIR]
   -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader[, diffPath, scope]}
   mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied
     (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that)
+  mode review in a terminal whose Claude Code build is older than the installed one (stale): exit 1 {ok:false, error: stale-terminal, restartRequired: true,
+    claudeCode: {running, installed, stale}, advice} BEFORE any input is written (no Fable spend); restart the terminal, then run needed again; unknown versions (stale null) do not stop it;
+    the stop is saved as round.arbiter.failure {cause, advice, at}
   a retry clears an unproven or malformed ruling (model-proof / invalid-arbiter, in either mode) so the arbiter answers again; the owner's and Claude's rulings are kept; an item the arbiter no longer needs is settled by the judge again
   mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none
   start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman
 pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
   the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)
   -> {ok, round, tag, transcript, errors, items[, findings]}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript
+  any Fable on any line of the transcript must be at least this machine's floor (whatever --expect-model says): older => exit 1, error stale-model,
+    restartRequired: true, floor: {newest, seen}, advice (restart this terminal, or update Claude Code); the items wait with cause stale-model. A proven pass
+    with a newer Fable raises the floor (only a transcript under the account's own projects folder, no --projects-dir; exit 1 model-floor-busy / model-floor-unwritable otherwise unproven)
+  an apply that fails on the floor (stale-model, model-floor-unreadable, unrecognised-fable, model-floor-busy, model-floor-unwritable) saves round.arbiter.failure {cause, advice, at}
+    (a zero-item Fable round has no item to carry the cause); the next apply that proves clears it
   mode review: the answer must also carry `findings` (Fable's own review, [] when clean); proven findings become items R<n>-F<k>;
     unproven ones are kept in rulings.json as `unverifiedFindings` and the round stays Fable-pending (run needed + the arbiter again)
 ```
 
 Exit: `needed`: 0 (`needed:false` is also 0) · `apply`: 0 proven + applied, 1 proof failed (arbitrated items marked needsHuman), 2 no transcript found / usage.
+
+`needed` on a Fable round from a terminal that runs an older Claude Code than the installed one (`claudeCode.stale`) exits 1 `stale-terminal` with `restartRequired` before it writes anything: restart the terminal, then run `needed` again (an unknown version never stops it). That stop, and an `apply` that fails on the Fable floor (`stale-model`, `model-floor-unreadable`, `unrecognised-fable`, `model-floor-busy`, `model-floor-unwritable`), is saved as `round.arbiter.failure {cause, advice, at}`, shown by `state outcome` (`arbiterFailures`) and in the triage comment (`Round R arbiter stopped: <cause> — <advice>`); an `apply` that proves clears it.
 
 A Fable review round (`fableRequired`, set by `codex-review`) is not clean until `apply` proves a pass, even with zero
 Codex items: `state outcome` lists it in `fablePending` and `review-complete` refuses. A failed proof leaves it pending:
