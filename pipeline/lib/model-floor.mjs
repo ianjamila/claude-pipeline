@@ -243,14 +243,14 @@ export async function withFloorLock({ waitMs = LOCK_WAIT_MS, pollMs = 100, ...op
 // while the recorded holder is on this machine and its pid is running; a dead holder, another machine's holder and a lock with no usable owner record
 // may be removed. A read error on the lock (anything but a missing or unparseable owner.json) refuses, fail closed like tryAcquire:
 // model-floor-lock-unreadable, naming the error code. Returns true when it removed the lock.
-function clearFloorLock(dir, opts, lockHooks) {
+function clearFloorLock(dir, opts, lockHooks, keepFloor = false) {
   const lockDir = path.join(dir, `${LOCK_NAME}.lock`);
   let r;
   try {
     r = clearUnheld(LOCK_NAME, { dir, machineId: readMachineId({ stateDir: path.join(opts.home ?? accountHome(), '.claude', 'pipeline-state') }), hooks: lockHooks });
   } catch (err) {
     if (err?.strandedAt) {
-      throw codeError('model-floor-lock-unreadable', `the floor lock ${lockDir} became unreadable after it was moved aside (${err.code ?? err.message}) and could not be put back: it is now at ${err.strandedAt}. That folder is the old lock this command was clearing, so remove it by hand; ${fs.existsSync(lockDir) ? `leave ${lockDir} alone: a review has taken a new lock there` : `${lockDir} is free, so nothing else is needed`}`, { cause: err, strandedAt: err.strandedAt });
+      throw codeError('model-floor-lock-unreadable', `the floor lock ${lockDir} became unreadable after it was moved aside (${err.code ?? err.message}) and could not be put back: it is now at ${err.strandedAt}. That folder is the old lock this command was clearing, so remove it by hand; ${fs.existsSync(lockDir) ? `leave ${lockDir} alone: a review has taken a new lock there. Once that review has finished, run the same command again` : `${lockDir} is free, so the lock is out of the way. ${keepFloor ? 'Run the same command again to confirm it (it finds no lock and changes nothing)' : 'The rest of this command (the registry, hold or allow change you asked for) did not run: run the same command again to apply it'}`}`, { cause: err, strandedAt: err.strandedAt });
     }
     throw codeError('model-floor-lock-unreadable', `the floor lock ${lockDir} cannot be inspected (${err.code ?? err.message}), so it is not cleared: a review that holds it could lose it. Fix the folder's permissions and run --clear-lock again, or, when no review is running, remove that folder by hand`, { cause: err });
   }
@@ -302,7 +302,7 @@ export async function resetFloor({ hold, clearHold = false, allowId = [], remove
     if (!current.ok) {
       throw codeError('model-floor-unreadable', `${current.message.replace(/; reviews are blocked until.*$/, '')}: --keep-floor keeps the learned floor and there is none to keep; run \`pipeline model-floor reset --clear-lock\` (a plain reset)`);
     }
-    const clearedLock = clearFloorLock(dir, opts, lockHooks);
+    const clearedLock = clearFloorLock(dir, opts, lockHooks, true);
     return { floor: current.floor, registry: current.registry, file: registryFile(dir), clearedLock };
   }
   let clearedLock = false;

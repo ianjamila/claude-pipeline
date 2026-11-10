@@ -955,6 +955,42 @@ test('R9 double fault: a read error on the moved folder AND a failed restore nam
   assert.match(caught.message, /could not be put back: it is now at .*\.stale-/);
   // R10-F1: the path is taken by a new lock here, so the advice is to remove the stranded folder and leave the lock path alone, never "move it back".
   assert.match(caught.message, /old lock this command was clearing, so remove it by hand; leave .* alone: a review has taken a new lock there/);
+  // R11-F1: and once that review is done the command has to be run again, since the rest of it never ran.
+  assert.match(caught.message, /alone: a review has taken a new lock there.*run the same command again/i);
   assert.doesNotMatch(caught.message, /move it back/);
   assert.equal(existsSync(caught.strandedAt), true, 'the named folder exists');
 });
+
+// R11-F1: the same double fault, but the restore fails without anything taking the lock path. The lock is out of the way, yet every form but
+// --keep-floor stopped before it rewrote the registry / hold / allow list, so the advice is to run the same command again, never "nothing else is needed".
+for (const form of [{ keepFloor: true }, {}, { allowId: ['claude-fable-x-1'] }]) {
+  test(`R11-F1: double fault with the lock path free (${Object.keys(form).join(',') || 'plain'}): remove the stranded folder, then run the same command again`, async (t) => {
+    const dir = stuckDir(t);
+    assert.equal(tryAcquire(LOCK_NAME, { dir, ...REMOTE, runId: 'other-host' }).acquired, true);
+    const real = fs.readFileSync;
+    const realRename = fs.renameSync;
+    const m = mock.method(fs, 'readFileSync', (file, ...rest) => {
+      if (String(file).includes('.stale-') && String(file).endsWith('owner.json')) throw Object.assign(new Error('EIO: injected'), { code: 'EIO' });
+      return real(file, ...rest);
+    });
+    const r = mock.method(fs, 'renameSync', (from, to, ...rest) => {
+      if (String(from).includes('.stale-') && to === lockOf(dir)) throw Object.assign(new Error('EACCES: injected'), { code: 'EACCES' }); // the restore fails; nothing takes the path
+      return realRename(from, to, ...rest);
+    });
+    let caught;
+    try {
+      await assert.rejects(resetFloor({ dir, clearLock: true, ...form }), (err) => { caught = err; return true; });
+    } finally {
+      r.mock.restore();
+      m.mock.restore();
+    }
+    assert.equal(caught.code, 'model-floor-lock-unreadable');
+    assert.equal(existsSync(lockOf(dir)), false, 'the lock path is free');
+    assert.equal(existsSync(caught.strandedAt), true, 'the named folder exists');
+    assert.ok(caught.message.includes(caught.strandedAt), 'the stranded folder is named');
+    assert.match(caught.message, /remove it by hand/);
+    assert.match(caught.message, /is free/);
+    assert.match(caught.message, /run the same command again/i);
+    assert.doesNotMatch(caught.message, /nothing else is needed/);
+  });
+}
