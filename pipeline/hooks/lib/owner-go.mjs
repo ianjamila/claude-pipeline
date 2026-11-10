@@ -415,8 +415,11 @@ function currentPromptEntry(transcriptPath, prompt) {
 //    never promotes unless it is a visibleSynthetic turn) and never the owner slot's;
 //  - an invisible turn that opens AFTER the last activity of the slot being read makes it stale (the strict A2 rule, unchanged: an older ask is not revived across a hidden turn); one that
 //    opened while the slot was still being written (interleaved) does not, because the owner's turn went on after it;
-//  - late text from an older VISIBLE turn that arrives after a newer prompt joins that older slot: it is not the slot right before the owner's prompt, so it binds nothing, and it voids
-//    nothing (a void needs a synthetic turn that shows something AFTER the slot's last activity, and the newest slot is the one read);
+//  - late text from an older VISIBLE turn that arrives after a newer prompt joins that older slot: it is not the slot right before the owner's prompt, so it binds nothing. R2-B1 (Codex
+//    round 2, arbiter ACCEPT): but the owner SAW it, and when it lands after the selected slot's last entry (and before the owner's prompt) the last thing displayed was not the selected
+//    request, so the selected slot is stale and the reply is '' (fail closed, like a mute). Text from any visible slot other than the selected one counts (assistant text only: a tool-only
+//    entry shows nothing); text that landed BEFORE the selected slot's last entry (interleaved) does not. A single interactive session cannot produce this order, so normal use is unchanged;
+//  - (a void by a synthetic turn that shows something after the slot's last activity is the separate ruling-mode rule above);
 //  - an entry whose chain does not resolve to a prompt entry inside the window (no parentUuid, a uuid not in the window, a cycle, a duplicate uuid on the way, a chain that ends at no prompt)
 //    is DROPPED in a modern transcript (fail closed; subsumes A3 for assistant text, whose prompt was cut off by the window). A compaction is transparent to the walk: a hidden summary and
 //    a `compact_boundary` system entry are stepped over (the boundary has parentUuid null and logicalParentUuid the entry before it); a boundary whose past is outside the window drops.
@@ -470,12 +473,12 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
     if (e?.type === 'user' && isPromptEntry(e)) {
       // skip (ruling reader): a turn whose prompt the owner did not type; mute (every other reader): an invisible turn, a boundary whose text is never added (#191 A2); slot: everything else
       const kind = skipSynthetic ? (entrySource(e) === 'synthetic' || invisibleTurn(e) ? 'skip' : 'slot') : invisibleTurn(e) ? 'mute' : 'slot';
-      const t = { pos: i, e, kind, content: [], lastPos: i };
+      const t = { pos: i, e, kind, content: [], lastPos: i, textPos: -1 };
       turns.push(t);
       turnAt.set(i, t);
     } else if ((e?.type === 'user' || e?.type === 'assistant') && Array.isArray(content)) {
       const t = turnAt.get(origin[i]);
-      if (t) { t.content.push(e); t.lastPos = i; } // (no turn: an unresolved chain, or text before the window's first prompt: dropped)
+      if (t) { t.content.push(e); t.lastPos = i; if (e.type === 'assistant' && e.message.content.some((b) => b?.type === 'text' && typeof b.text === 'string' && b.text.trim() !== '')) t.textPos = i; } // (no turn: an unresolved chain, or text before the window's first prompt: dropped)
     }
   });
   // The reply slots: what the owner's "merge" / "extra round" / ruling can answer, in prompt order. A skipped turn (ruling reader) is promoted into one (#189) or voids the slot before it (R1-F3..R5-B2, below).
@@ -515,7 +518,9 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
   const current = newest?.kind === 'slot' && newest.content.length === 0 && (prompt === undefined || plain(prompt) === promptTextOf(newest.e));
   const candidates = current ? slots.filter((x) => x.turn !== newest) : slots;
   const last = candidates[candidates.length - 1]; // (none: only text before the window's first prompt, which has no known origin, A3)
-  if (!last || last.voided || mutes.some((pos) => pos > last.lastPos)) return { text: '', promoted: false };
+  // R2-B1: assistant text of ANY other visible slot after the selected slot's last entry was the last thing the owner was shown: the selected request is stale, exactly like a mute
+  const shownAfter = !last || candidates.some((x) => x !== last && x.turn.textPos > last.lastPos);
+  if (!last || last.voided || shownAfter || mutes.some((pos) => pos > last.lastPos)) return { text: '', promoted: false };
   return { text: last.text, promoted: last.promoted };
 }
 export const lastReplyText = (transcriptPath, opts = {}) => lastReply(transcriptPath, opts).text;
