@@ -43,6 +43,10 @@ const refuse = (error, reasons, extra = {}) => ({
   output: { ok: false, merged: false, error, reasons, message: error === 'gate' ? 'run final-gate again' : reasons.join('; '), ...extra },
 });
 
+// `refuse` for a run whose queue precheck discharged another head's live record and put its needs-human label back: every refusal this run makes afterwards
+// also carries `carried` (holdRestored + holdRestoredNote, or the failed-restore fields), filled in from the precheck's holdFields (R1-F1).
+const refuseCarrying = (carried) => (error, reasons, extra = {}) => refuse(error, reasons, { ...carried, ...extra });
+
 // A merge-hold refusal (lib/merge-hold.mjs holdGate / queuedBehindRefusal, or a bringUpToDate outcome carrying one) as a merge refusal.
 // holdTaken / holdRelease / hold (step 1b: this call took the hold before its update, and what became of it) are passed through.
 const holdRefuse = (r, extra = {}) => refuse(r.error, [r.reason], {
@@ -137,6 +141,8 @@ export const run = guarded(async (argv, ctx) => {
   }
 
   return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: (track) => underReviewLock({ root, pr, ctx, fn: async () => {
+    const carried = {};
+    const refuse = refuseCarrying(carried);
     // Queue mode (GitHub requires a merge queue on the base) is read live, once, after the locks; unreadable = refused, never a direct merge.
     const queue = readQueueMode({ gh, pr });
     if (queue.refusal) return queue.refusal;
@@ -170,6 +176,7 @@ export const run = guarded(async (argv, ctx) => {
       });
       pre = await route.precheck();
       if (pre.done) return pre.done;
+      Object.assign(carried, pre.holdFields);
       // (the record of this head already ended: the decision is judged below, once the run record says whether the owner's word is required: staleEnd)
       if (pre.watch) return watchOnly({ route, gh, pr, head: gate.head });
     }
@@ -439,6 +446,8 @@ async function underReviewLock({ root, pr, ctx, fn }) {
 }
 
 async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
+  const carried = {};
+  const refuse = refuseCarrying(carried);
   const head = headSha({ cwd: root });
   const repo = gh.repo().slug;
   if (gh.repo().host !== 'github.com') {
@@ -465,6 +474,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
     route = createQueueRoute({ gh, root, config, pr, head, route: 'owner-go', env: ctx.env ?? process.env, refuse, track, extra, approval, recheck: () => rechecker(), ...queueHoldSeams({ gh, root, pr, getHold: () => hold }) });
     pre = await route.precheck();
     if (pre.done) return pre.done;
+    Object.assign(carried, pre.holdFields);
     if (pre.watch) return watchOnly({ route, gh, pr, head });
   }
   // A merge hold ahead of this PR is answered next, before the live check: a stale PR behind an older hold would otherwise fail it

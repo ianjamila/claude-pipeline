@@ -4,6 +4,7 @@
 // merge tests, which stay unchanged.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -14,7 +15,7 @@ import { BASE_SHA, MERGE_SHA, PR, bump, cli, scenario, ymlFor } from './helpers/
 import { assertExit } from './helpers/assert-exit.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { holdFiles, holdYml, holdCalls } from './helpers/merge-hold-env.mjs';
-import { beginAttempt, confirmAttempt, endRecord, noteRemoval, readQueueRecord } from '../pipeline/lib/merge-queue.mjs';
+import { beginAttempt, confirmAttempt, endRecord, noteRemoval, openRecord, readQueueRecord, setHold } from '../pipeline/lib/merge-queue.mjs';
 import { preMergeProblems } from '../pipeline/lib/finalgate.mjs';
 import { gateFreshSince, recheckGated } from '../pipeline/lib/queue-route.mjs';
 
@@ -174,17 +175,66 @@ test('resumed watch at another head (--owner-go): the live entry\'s removal is n
   };
   const entryAtOld = () => reply(queuedNode(OLD), [added()]);
 
-  const removedOut = setup([[entryAtOld, entryAtOld, () => reply(node(OLD), [added(), removed('failed_checks')])]]);
+  // a removal that is NOT re-queueable for the record's head (not a group failure): the record's own head is done, so it ends removed
+  const removedOut = setup([[entryAtOld, entryAtOld, () => reply(node(OLD), [added(), removed('manual')])]]);
   const r = removedOut.run();
   assertExit(r, 1);
   assert.equal(r.json.error, 'queue-removed');
-  assert.equal(r.json.removal.reason, 'failed_checks');
+  assert.equal(r.json.removal.reason, 'manual');
   assert.deepEqual(r.json.removal.failing, ['ci: failure']);
   assert.equal(removedOut.enqueueCalls().length, 0, 'a worktree at another head never re-queues');
   const rec = removedOut.record();
   assert.equal(rec.head, OLD);
   assert.equal(rec.removals.length, 1, 'the removal is on the record');
   assert.equal(rec.terminal, 'removed');
+});
+
+// #232: the removal IS re-queueable for the record's head (the first group failure). The worktree that queued it owns that one re-queue, and the sweep delivers it
+// from there; this run (at another head) must not end the record or put the hold back, or the re-queue is lost.
+test('resumed watch at another head (--owner-go): a first group failure of the live entry is requeue-due; the record stays live and nothing is re-queued or restored from here (#232)', (t) => {
+  const s = world({ route: 'owner-go', command: 'default', after: [] });
+  approve(t, s);
+  // the worktree that queued OLD is a real second worktree of this clone, still at OLD: only then can the sweep re-queue from it (R1-F2)
+  const queuer = join(mkdtempSync(join(tmpdir(), 'cp-queuer-')), 'w1');
+  s.repo.git(['worktree', 'add', '-q', '--detach', queuer]);
+  execFileSync('git', ['-C', queuer, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'queued head'], { encoding: 'utf8' });
+  const OLD = execFileSync('git', ['-C', queuer, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  beginAttempt(queuer, PR, OLD, { items: 'none', areas: [], rulings: null }, { repo: 'acme/widgets', repoId: 4242 });
+  confirmAttempt(s.repo.dir, PR, 'MQE_1');
+  const entryAtOld = () => reply(queuedNode(OLD), [added()]);
+  s.q.show([entryAtOld, entryAtOld, () => reply(node(OLD), [added(), removed('failed_checks')])]);
+  const r = s.run();
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'requeue-due');
+  assert.equal(r.json.queued, false);
+  assert.equal(r.json.queuedHead, OLD);
+  assert.equal(r.json.recordRoot, queuer);
+  assert.equal(r.json.removal.reason, 'failed_checks');
+  assert.deepEqual(r.json.removal.failing, ['ci: failure']);
+  assert.equal(s.enqueueCalls().length, 0, 'a worktree at another head never re-queues');
+  assert.equal(s.dequeueCalls().length, 0);
+  never(s, /--add-label/, 'no label is put back');
+  const rec = s.record();
+  assert.equal(rec.head, OLD);
+  assert.equal(rec.removals.length, 1);
+  assert.equal(rec.terminal, null, 'the record stays live for the sweep');
+});
+
+// R1-F2: the worktree that queued OLD is THIS one (it moved on to a new head without pushing): the sweep could never re-queue OLD from here, so the removal ends the record now.
+test('resumed watch at another head (--owner-go) from the SAME worktree that queued the record: queue-removed with the reason, the record ends removed (R1-F2)', (t) => {
+  const OLD = 'd'.repeat(40);
+  const s = world({ route: 'owner-go', command: 'default', after: [] });
+  approve(t, s);
+  beginAttempt(s.repo.dir, PR, OLD, { items: 'none', areas: [], rulings: null }, { repo: 'acme/widgets', repoId: 4242 });
+  confirmAttempt(s.repo.dir, PR, 'MQE_1');
+  const entryAtOld = () => reply(queuedNode(OLD), [added()]);
+  s.q.show([entryAtOld, entryAtOld, () => reply(node(OLD), [added(), removed('failed_checks')])]);
+  const r = s.run();
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'queue-removed');
+  assert.match(r.json.reasons[0], /not re-queued: the worktree that queued it is this one/);
+  assert.equal(s.enqueueCalls().length, 0);
+  assert.equal(s.record().terminal, 'removed');
 });
 
 test('removed twice: queue-removed naming the failing check; no third enqueue', () => {
@@ -532,4 +582,24 @@ test('R2-F1: a watch-only resume of a record that stood on the owner\'s word doe
   assert.match(r.json.reasons.join(' '), /not re-queued: .*no longer on record/);
   assert.equal(s.enqueueCalls().length, 0, 'no second enqueue');
   assert.equal(s.record().terminal, 'removed');
+});
+
+// R1-F1, gated route: a live record of another head owns a lifted hold; GitHub is at this worktree's head with no entry. The record is discharged (label back once)
+// and this run goes on from a clean slate; whatever refuses it afterwards still tells the owner the label went back.
+test('gated: a live record of another head is discharged by the precheck (label back once) and a later refusal of this run carries holdRestored (R1-F1)', () => {
+  const OLD = 'd'.repeat(40);
+  const s = world({ after: [], hold: true, gh: { extra: [{ match: '^pr edit 12 --add-label needs-human$', stdout: '' }] } });
+  const approval = { items: 'none', areas: [], rulings: null };
+  openRecord(s.repo.dir, PR, OLD, approval, { repo: 'acme/widgets', repoId: 4242, route: 'owner-go' });
+  setHold(s.repo.dir, PR, { id: 'LE_hold1', login: 'jamila', at: '2026-11-05T09:00:00Z', holdBlock: 'digest', liftedAt: '2026-11-09T07:59:00Z' });
+  beginAttempt(s.repo.dir, PR, OLD, approval, { repo: 'acme/widgets', repoId: 4242 });
+  confirmAttempt(s.repo.dir, PR, 'MQE_1');
+  const entryAtOld = () => reply(queuedNode(OLD), [added()]);
+  s.editGate((g) => { g.ownerMerge = 1; }); // the gate left an item for the owner: this run refuses pre-merge on its own, after the precheck
+  s.q.show([entryAtOld, OUT([])]); // the mode read; then the precheck sees the PR at this head with no entry
+  const r = s.run();
+  assert.equal(r.json.error, 'pre-merge', r.stdout);
+  assert.equal(s.record().terminal, 'head-moved', 'the old record was discharged');
+  assert.equal(r.json.holdRestored, true, r.stdout);
+  assert.match(r.json.holdRestoredNote, /owner must say "merge" again/);
 });

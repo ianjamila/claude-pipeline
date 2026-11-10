@@ -2,15 +2,20 @@
 // watches the entry with today's stop conditions, and re-queues the SAME head once after a group-check failure. Both merge routes
 // (gated and --owner-go) do their own gating and then hand over to this engine; they never branch on queue state anywhere else.
 //   precheck()         reads GitHub first (never enqueues twice, reports a merge that already happened) -> { done } | { watch } | { enqueue }
+//                      (a result after a live record of another head was discharged may carry holdFields: the hold fields that discharge produced)
 //   enqueueAndWatch()  begin attempt, enqueue, confirm, watch, re-queue once -> { exitCode, output }
 // Nothing here ever disables auto-merge or dequeues for a time-out: `still-queued` leaves the entry exactly as it is.
+import { statSync } from 'node:fs';
 import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
 import { GATE_FILE, GATE_MAX_AGE_MS, PR_FIELDS, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, preMergeProblems, readReviewJson, waitBlockers } from './finalgate.mjs';
 import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
 import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
 import { RESTORE_NOTE } from './hold.mjs';
+import { headSha } from './git.mjs';
 import { envWithGhDir, runShellAsync } from './proc.mjs';
+import { canonicalPath, samePath } from './paths.mjs';
+import { gitCommonDir } from './repo.mjs';
 import { approvalGap } from '../hooks/lib/owner-go.mjs';
 
 const CONFIRM_MS = 60_000; // GitHub shows the entry within this long of an accepted enqueue, or the enqueue failed
@@ -116,6 +121,31 @@ export async function recheckGatedRecorded({ root, config, pr, gh, env, head, re
   });
 }
 
+export const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
+// canonicalPath (realpath.native), not JS realpathSync: only the native one expands a Windows 8.3 short name (RUNNER~1), so a temp folder and `git rev-parse` spell the same place alike.
+export const canon = (p) => canonicalPath(p);
+// Two folders are the same place when their canonical spellings agree (samePath: slash-normalised, case-insensitive where the file system is).
+const samePlace = (a, b) => samePath(canon(a), canon(b));
+
+// Why the worktree a live record was opened in cannot do that record's one re-queue, or null when it can: gone, no longer at the recorded head, or not a worktree of
+// `root`'s repository. One judgement for the sweep's re-queue (makeRequeue) and for a `P merge` at another head (requeueElsewhere), so the two cannot disagree (R1-F2).
+export function recordedWorktreeProblem({ rec, root, headOf = (cwd) => headSha({ cwd }) }) {
+  if (typeof rec.root !== 'string' || !isDir(rec.root)) return 'worktree gone';
+  let current;
+  try {
+    current = headOf(rec.root);
+  } catch {
+    return 'worktree gone';
+  }
+  if (current !== rec.head) return `worktree at another head (${String(current).slice(0, 12)}, approved ${rec.head.slice(0, 12)})`;
+  try {
+    if (!samePlace(gitCommonDir(rec.root), gitCommonDir(root))) return 'worktree belongs to another repository';
+  } catch {
+    return 'worktree gone';
+  }
+  return null;
+}
+
 // The onTerminal seam that puts a lifted needs-human hold back (once) at an unmerged end; a failed restore keeps the record open for the next settle.
 export const restoreHoldOnTerminal = ({ gh, pr }) => async ({ rec }) => {
   if (!rec || rec.terminal !== null || rec.hold === null) return {};
@@ -140,7 +170,7 @@ export { failingChecksOn };
 //   { fields, keepOpen }: `fields` join the refusal (holdRestored ...), `keepOpen` leaves the record live (the label could not be put back: the next settle retries).
 export function createQueueRoute({
   gh, root, config, pr, head, route = null, env = process.env, refuse, track = { started() {}, ended() {} }, approval, extra = {}, recheck,
-  onBeforeAttempt = async () => {}, onTerminal = async () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = () => {},
+  onBeforeAttempt = async () => {}, onTerminal = async () => {}, headOf, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = () => {},
 }) {
   const timing = queueTiming(env);
   const repo = gh.repo().slug;
@@ -187,12 +217,89 @@ export function createQueueRoute({
     return refusal(kind, [kind === 'closed' ? `PR #${pr} was closed without merging` : `PR #${pr}'s head moved off the approved ${head.slice(0, 12)}: nothing was queued or merged for it`], { queued: false, ...holdFields });
   };
 
+  // A removal whose one automatic re-queue belongs to ANOTHER worktree (the record's head is not this worktree's): nothing is ended, restored, enqueued or dequeued.
+  // The record stays live, and `P queue-sweep` re-queues it from the worktree that queued it (makeRequeue needs rec.root at rec.head) (#232).
+  // Only where that worktree CAN do it: this very worktree (it moved from H to K), a worktree that is gone, at another head or of another repository would make the
+  // sweep end the record anyway, so the removal ends it now (removed, hold restored, the reason says why) instead of leaving the hold lifted for nothing (R1-F2).
+  const requeueElsewhere = async (removal) => {
+    const rec = readQueueRecord(root, pr);
+    const thisOne = typeof rec.root === 'string' && samePlace(rec.root, root);
+    const elsewhere = thisOne ? null : recordedWorktreeProblem({ rec, root, headOf });
+    const why = thisOne
+      ? `the worktree that queued it is this one, now at ${head.slice(0, 12)} (it queued ${rec.head.slice(0, 12)})`
+      : elsewhere !== null ? `the worktree that queued it (${rec.root}) cannot re-queue it: ${elsewhere}` : null;
+    if (why !== null) return removedRefusal(removal, `not re-queued: ${why}`);
+    const failing = failingChecksOn(gh, removal?.beforeCommit);
+    return refusal('requeue-due', [`PR #${pr} was removed from the merge queue (reason ${removal?.reason ?? 'unknown'}${failing.length > 0 ? `; failing: ${failing.join(', ')}` : ''}); its one automatic re-queue is due for ${rec.head.slice(0, 12)}, the head the worktree at ${rec.root} queued: \`P queue-sweep\` re-queues it from there (or run \`P merge --pr ${pr}\` in that worktree); this worktree is at ${head.slice(0, 12)}, so nothing was re-queued from here`], {
+      removal: { reason: removal?.reason ?? null, beforeCommit: removal?.beforeCommit ?? null, actor: removal?.actor ?? null, at: removal?.at ?? null, failing }, queuedHead: rec.head, recordRoot: rec.root,
+    });
+  };
+
   // ---- 1. GitHub first ----------------------------------------------------------------------------------------------------------
+  // A LIVE record for another head than this worktree's belongs to another approval (the worktree that queued it): GitHub is read for ITS head, and this run
+  // ends that record only where the record's own head says so (merged, closed, a removal that is not re-queueable, the PR head off it with no entry left).
+  // -> the same shapes as precheck. (#232)
+  async function followLiveRecord(rec) {
+    const tag = rec.head.slice(0, 12);
+    let r;
+    try {
+      r = await reconcile({ gh, root, pr, head: rec.head, sleep, pollMs: Math.min(timing.pollMs, 2000), log });
+      switch (r.kind) {
+        case 'merged':
+          // (reconcile answers MERGED before it compares heads: the note never says which head merged)
+          if (liveRecord() !== null) endRecord(root, pr, 'merged', { now });
+          return { done: mergedOut(r.mergeSha, { note: 'already merged through the queue' }) };
+        case 'queued': return { watch: true };
+        case 'closed': return { done: await unmergedEnd('closed') };
+        case 'removed': {
+          const noted = noteRemoval(root, pr, r.removal); // (judged on the record AFTER the removal is on it, never the copy read before)
+          if (mayRequeue(noted ?? readQueueRecord(root, pr), rec.head, r.removal.reason)) return { done: await requeueElsewhere(r.removal) };
+          return { done: await removedRefusal(r.removal) };
+        }
+        case 'head-moved': return await movedOffRecord(rec, r.head);
+        default: // not-queued: the record's decision (settleRecord's gone(null)) is the sweep's
+          return { done: refusal('head-moved', [`PR #${pr} is at ${tag}, queued by the worktree at ${rec.root}; this worktree is at ${head.slice(0, 12)}; nothing was queued for it; the queue record is left to \`P queue-sweep\``], { queued: false }) };
+      }
+    } catch (err) {
+      if (err instanceof QueueRecordUnreadable) return { done: unreadable('the merge-queue record could not be used', err) };
+      return { done: unreadable(`could not read the merge queue state of PR #${pr}`, err) };
+    }
+  }
+
+  // GitHub's PR head is `jHead`, not the live record's. A live entry there (any head) is not this record's to end: nothing changes, the caller is refused.
+  // No entry: the record's approval was for its head only and its entry cannot exist any more, so it is discharged first exactly as the sweep would (the owned hold
+  // goes back once; a failed restore keeps it open), and only then is the caller's head judged from a clean slate.
+  async function movedOffRecord(rec, jHead) {
+    const tag = rec.head.slice(0, 12);
+    const cur = gh.queueState(pr);
+    if (cur.state !== 'OPEN' || cur.head !== jHead) {
+      return { done: refusal('head-moved', [`PR #${pr} changed while it was being read (it is now ${cur.state === 'OPEN' ? `at ${String(cur.head).slice(0, 12)}` : cur.state.toLowerCase()}); nothing was changed: run \`P merge\` again`], { queued: null }) };
+    }
+    if (cur.entry) {
+      return { done: refusal('head-moved', [`PR #${pr} is in the merge queue at ${jHead.slice(0, 12)}, but the live queue record here is for ${tag} (another approval); nothing was changed: \`P queue-sweep\` settles that record, then run \`P merge\` again`], { queued: true }) };
+    }
+    const holdFields = await terminal('head-moved');
+    if (liveRecord() !== null) {
+      return { done: refusal('head-moved', [`PR #${pr}'s head is ${jHead.slice(0, 12)}, off the ${tag} the live queue record here is for; that record could not be closed${holdFields.holdRestoreNote ? ` (${holdFields.holdRestoreNote})` : ''}, so nothing was queued for this worktree`], { queued: false, ...holdFields }) };
+    }
+    // The discharge put a label back (or failed to): the owner has to be told, whatever the caller's own head turns out to be (R1-F1). A refusal carries the fields
+    // itself; an { enqueue } / { watch } result carries them as `holdFields`, which the caller attaches to every refusal it makes after the precheck.
+    const next = await precheck();
+    if (Object.keys(holdFields).length === 0) return next;
+    if (next.done) return next.done.output?.ok === false ? { done: { ...next.done, output: { ...holdFields, ...next.done.output } } } : next;
+    return { ...next, holdFields };
+  }
+
   async function precheck() {
     let rec;
     let r;
     try {
       rec = readQueueRecord(root, pr);
+    } catch (err) {
+      return { done: unreadable('the merge-queue record could not be read', err) };
+    }
+    if (rec !== null && rec.terminal === null && rec.head !== head) return followLiveRecord(rec);
+    try {
       r = await reconcile({ gh, root, pr, head, sleep, pollMs: Math.min(timing.pollMs, 2000), log });
     } catch (err) {
       return { done: unreadable(err instanceof QueueRecordUnreadable ? 'the merge-queue record could not be read' : `could not read the merge queue state of PR #${pr}`, err) };
@@ -314,7 +421,9 @@ export function createQueueRoute({
               requeued = 1;
               continue;
             }
-            // (a watch resumed from a worktree at another head than the queued one follows the record's head and is never re-queued from here: #230)
+            // (a watch resumed from a worktree at another head than the queued one follows the record's head and is never re-queued from here: #230. A removal that
+            // WOULD be re-queued for the record's head is left live for the sweep, which re-queues it from the worktree that queued it: #232)
+            if (rec !== null && rec.terminal === null && rec.head !== head && mayRequeue(rec, rec.head, w.removal.reason)) return await requeueElsewhere(w.removal);
             return await removedRefusal(w.removal, rec !== null && rec.head !== head ? `not re-queued: this worktree is at ${head.slice(0, 12)}, the queued head was ${rec.head.slice(0, 12)}` : undefined);
           }
           default: return refusal('queue-unreadable', [`unexpected queue watch result ${JSON.stringify(w.state)}`], { queued: null });

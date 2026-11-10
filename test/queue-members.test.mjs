@@ -254,3 +254,24 @@ test('memberStanding: a predecessor whose entry is still LISTED goes by its PR: 
   assert.deepEqual(await ask(world({ prs: { 3: merged(A) } })), { kind: 'settled' }, 'listed, but merged at its own queue commit');
   assert.deepEqual(await ask(world({ prs: { 3: merged(sha('c')) } })), { kind: 'live' }, 'listed, merged at another commit');
 });
+
+// eaglewatch#1771: a departed member whose PR does not say `merged` YET (GitHub lags the queue's merge) is flagged `retry: true`, so the poster reads it once more
+// before it counts as gone (the same shape eaglewatch's classifyMembers uses). Only an OPEN, unmerged PR can be that: anything else is final.
+test('memberStanding: gone carries retry: true only for a departed member whose PR is still open and unmerged (eaglewatch#1771)', async () => {
+  const m = await manifestOf();
+  const a = m.members[0];
+  const only5 = [entry('E5', 5, HEAD5, B, A)];
+  const ask = (prs, extra = {}) => memberStanding({ ...args(world({ entries: only5, prs, ...extra })), member: a });
+  const open = await ask({ 3: { state: 'open', merged: false, mergeCommit: null } });
+  assert.equal(open.kind, 'gone');
+  assert.equal(open.retry, true, 'open and unmerged: may be GitHub lag');
+  for (const [why, prs, extra] of [
+    ['merged at another commit', { 3: { state: 'closed', merged: true, mergeCommit: sha('c') } }, {}],
+    ['closed without merging', { 3: { state: 'closed', merged: false, mergeCommit: null } }, {}],
+    ['merged, but its commit is not on the default branch', { 3: { state: 'closed', merged: true, mergeCommit: A } }, { defaultStatus: 'diverged' }],
+  ]) {
+    const st = await ask(prs, extra);
+    assert.equal(st.kind, 'gone', why);
+    assert.equal(st.retry, undefined, `${why}: final, no re-read`);
+  }
+});
