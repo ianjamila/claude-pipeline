@@ -4,7 +4,7 @@
 import { mock, test } from 'node:test';
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -19,6 +19,8 @@ const tmp = (t) => {
   t.after(() => { try { chmodSync(dir, 0o700); } catch { /* gone */ } rmSync(dir, { recursive: true, force: true }); });
   return dir;
 };
+// A lock folder with no owner record that is young might be an acquirer mid-way through creating it (clearUnheld refuses it as busy); age it to be abandoned.
+const ageOld = (p) => { const old = new Date(Date.now() - 10 * 60 * 1000); utimesSync(p, old, old); };
 const reg = (dir) => join(dir, 'fable.json');
 const writeReg = (dir, obj) => { mkdirSync(dir, { recursive: true }); writeFileSync(reg(dir), typeof obj === 'string' ? obj : JSON.stringify(obj)); };
 const good = (extra = {}) => ({ version: 1, newest: 'claude-fable-5-3', provenAt: '2026-11-10T00:00:00.000Z', claudeCode: '2.1.400', transcript: '/t.jsonl', history: [], hold: null, ...extra });
@@ -543,7 +545,7 @@ test('R3-F1: --clear-lock next to --allow-id / --clear-allow keeps the learned f
   await resetFloor({ dir, hold: 'claude-fable-5-4' });
   const before = await learned(dir);
   const lockDir = join(dir, 'model-floor.lock');
-  const leaveLock = () => { mkdirSync(lockDir, { recursive: true }); };
+  const leaveLock = () => { mkdirSync(lockDir, { recursive: true }); ageOld(lockDir); };
   leaveLock();
   const allowed = await resetFloor({ dir, allowId: ['claude-fable-6-preview'], clearLock: true });
   assert.equal(allowed.clearedLock, true, 'the lock folder was removed');
@@ -602,6 +604,7 @@ test('R4-F2: resetFloor removeAllow removes exactly those ids, keeps the learned
   assert.equal(removed.floor, 'claude-fable-5-3', 'the learned floor survives');
   assert.deepEqual(JSON.parse(readFileSync(reg(dir), 'utf8')), { ...before, allow: ['claude-fable-6-preview', 'claude-fable-6-b'] }, 'newest, history and hold untouched');
   mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  ageOld(join(dir, 'model-floor.lock'));
   const combined = await resetFloor({ dir, removeAllow: ['claude-fable-6-b'], allowId: ['claude-fable-6-c'], clearLock: true });
   assert.deepEqual([combined.registry.allow, combined.clearedLock, combined.floor], [['claude-fable-6-preview', 'claude-fable-6-c'], true, 'claude-fable-5-3']);
   const last = await resetFloor({ dir, removeAllow: ['claude-fable-6-preview', 'claude-fable-6-c'] });
@@ -633,6 +636,7 @@ test('R4-F2: resetFloor keepFloor with clearLock removes the lock and rewrites n
   await resetFloor({ dir, allowId: ['claude-fable-6-preview'] });
   const bytes = readFileSync(reg(dir), 'utf8');
   mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  ageOld(join(dir, 'model-floor.lock'));
   const kept = await resetFloor({ dir, clearLock: true, keepFloor: true });
   assert.deepEqual([kept.clearedLock, kept.floor, existsSync(join(dir, 'model-floor.lock'))], [true, 'claude-fable-5-3', false]);
   assert.equal(readFileSync(reg(dir), 'utf8'), bytes, 'byte-identical registry');
@@ -649,6 +653,7 @@ test('R4-F2: resetFloor keepFloor with clearLock removes the lock and rewrites n
   mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
   await assert.rejects(resetFloor({ dir, clearLock: true, keepFloor: true }), { code: 'model-floor-unreadable' });
   assert.equal(existsSync(join(dir, 'model-floor.lock')), true, 'refused before touching the lock');
+  ageOld(join(dir, 'model-floor.lock'));
   assert.equal((await resetFloor({ dir, clearLock: true })).registry.newest, MIN_FABLE, 'a bare clearLock is the plain reset that repairs it');
 });
 
@@ -695,7 +700,7 @@ for (const keepFloor of [false, true]) {
       'a dead pid': () => assert.equal(tryAcquire('model-floor', { dir, pid: DEAD_PID, machineId: null }).acquired, true),
       'another machine, whose pid is alive here': () => assert.equal(tryAcquire('model-floor', { dir, ...REMOTE }).acquired, true),
       'an unreadable owner record': () => { mkdirSync(lockDir); writeFileSync(join(lockDir, 'owner.json'), '{not json'); },
-      'no owner record': () => mkdirSync(lockDir),
+      'no owner record': () => { mkdirSync(lockDir); ageOld(lockDir); }, // old enough that no acquirer can still be creating it
     };
     for (const [what, make] of Object.entries(makers)) {
       make();
@@ -857,10 +862,67 @@ test('R7-B1: a lock whose owner record is rewritten in place (same folder, same 
 test('R7-B1: two unfinished locks have no runId to tell them apart: the inode is confirmed too, so a lock another acquirer is mid-way through creating survives', async (t) => {
   const dir = stuckDir(t);
   mkdirSync(lockOf(dir)); // an abandoned folder with no owner record
+  ageOld(lockOf(dir)); // old enough that no acquirer can still be creating it
   const lockHooks = {
     insideGuard: () => { renameSync(lockOf(dir), join(dir, 'kept-aside')); mkdirSync(lockOf(dir)); }, // a new acquirer's fresh folder (a different inode)
   };
   await assert.rejects(resetFloor({ dir, clearLock: true, keepFloor: true, lockHooks }), { code: 'model-floor-lock-changed' });
   assert.equal(existsSync(lockOf(dir)), true, 'the new folder is back');
   assert.equal(existsSync(join(dir, 'kept-aside')), true);
+});
+
+// ---- review round 8: R8-B1 (a fresh ownerless lock is an acquire in progress), R8-F1 (a throw after the move puts the lock back) ----
+test('R8-B1: a fresh lock folder with no owner record (an acquirer between mkdir and its owner link) refuses busy at the first look; an aged one clears', async (t) => {
+  const dir = stuckDir(t);
+  mkdirSync(lockOf(dir));
+  let fired = 0;
+  const lockHooks = { afterInspect: () => { fired += 1; }, insideGuard: () => { fired += 1; } };
+  for (const keepFloor of [true, false]) {
+    await assert.rejects(resetFloor({ dir, clearLock: true, keepFloor, lockHooks, waitMs: 50 }), { code: 'model-floor-lock-busy' });
+  }
+  assert.deepEqual(clearUnheld(LOCK_NAME, { dir, machineId: null }), { state: 'busy' });
+  assert.equal(fired, 0, 'refused before the guard');
+  assert.equal(existsSync(lockOf(dir)), true, 'not moved');
+  assert.deepEqual(readdirSync(dir).filter((n) => n.includes('.stale-') || n.endsWith('.reclaim')), []);
+  ageOld(lockOf(dir));
+  assert.equal((await resetFloor({ dir, clearLock: true, keepFloor: true })).clearedLock, true);
+  assert.equal(existsSync(lockOf(dir)), false);
+});
+
+test('R8-B1: an unparseable owner.json or an owner.json directory is never an acquire in progress: cleared even when fresh', async (t) => {
+  const dir = stuckDir(t);
+  mkdirSync(lockOf(dir));
+  writeFileSync(join(lockOf(dir), 'owner.json'), '{not json');
+  assert.deepEqual(clearUnheld(LOCK_NAME, { dir, machineId: null }).state, 'cleared');
+  mkdirSync(join(lockOf(dir), 'owner.json'), { recursive: true });
+  assert.deepEqual(clearUnheld(LOCK_NAME, { dir, machineId: null }).state, 'cleared');
+});
+
+test('R8-B1: the lock of a dead holder, replaced, between the two looks, by a fresh ownerless folder refuses busy at the second look and leaves it where it is', async (t) => {
+  const dir = stuckDir(t);
+  assert.equal(tryAcquire(LOCK_NAME, { dir, pid: DEAD_PID, runId: 'old-dead', machineId: null }).acquired, true);
+  const lockHooks = {
+    afterInspect: () => { rmSync(lockOf(dir), { recursive: true }); mkdirSync(lockOf(dir)); }, // a new acquirer got in after the first look
+  };
+  await assert.rejects(resetFloor({ dir, clearLock: true, keepFloor: true, lockHooks }), { code: 'model-floor-lock-busy' });
+  assert.equal(existsSync(lockOf(dir)), true, 'the new acquirer folder was never moved');
+  assert.deepEqual(readdirSync(dir).filter((n) => n.includes('.stale-')), []);
+  assert.equal(existsSync(`${lockOf(dir)}.reclaim`), false, 'the guard is released');
+});
+
+test('R8-F1: a read error on the moved folder puts the lock back at its path and surfaces the error', async (t) => {
+  const dir = stuckDir(t);
+  assert.equal(tryAcquire(LOCK_NAME, { dir, ...REMOTE, runId: 'other-host' }).acquired, true);
+  const real = fs.readFileSync;
+  const m = mock.method(fs, 'readFileSync', (file, ...rest) => {
+    if (String(file).includes('.stale-') && String(file).endsWith('owner.json')) throw Object.assign(new Error('EIO: injected'), { code: 'EIO' });
+    return real(file, ...rest);
+  });
+  try {
+    await assert.rejects(resetFloor({ dir, clearLock: true, keepFloor: true }), (err) => err.code === 'model-floor-lock-unreadable' && err.message.includes('EIO'));
+  } finally {
+    m.mock.restore();
+  }
+  assert.equal(ownerRunId(dir), 'other-host', 'back at its path, untouched');
+  assert.deepEqual(readdirSync(dir).filter((n) => n.includes('.stale-')), [], 'nothing stranded aside');
 });

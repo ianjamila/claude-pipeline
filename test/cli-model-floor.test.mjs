@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +13,14 @@ import { run, meta } from '../pipeline/commands/model-floor.mjs';
 import { MIN_FABLE, floorDir, raiseFloor, readFloor } from '../pipeline/lib/model-floor.mjs';
 import { tryAcquire } from '../pipeline/lib/locks.mjs';
 import { insideClaudeCode } from '../pipeline/lib/owner-only.mjs';
+
+// A lock folder with no owner record, old enough that no acquirer can still be creating it (a young one is refused as busy).
+const abandonedLock = (dir) => {
+  const lockDir = join(dir, 'model-floor.lock');
+  mkdirSync(lockDir, { recursive: true });
+  const old = new Date(Date.now() - 10 * 60 * 1000);
+  utimesSync(lockDir, old, old);
+};
 
 const bin = join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'bin', 'pipeline.mjs');
 const NOW = Date.parse('2026-11-11T08:00:00Z');
@@ -320,7 +328,7 @@ test('R3-F1: --allow-id / --clear-allow with --clear-lock keep the learned floor
   const dir = scratch(t);
   raiseFloor({ dir, model: 'claude-fable-5-3', claudeCode: '2.1.400', transcript: '/t.jsonl', now: NOW });
   const learned = readReg(dir);
-  const lock = () => mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  const lock = () => abandonedLock(dir);
   lock();
   const allowed = await run(['reset', '--allow-id', 'claude-fable-6-preview', '--clear-lock'], asOwner(dir));
   assert.deepEqual([allowed.exitCode, allowed.output.floor, allowed.output.clearedLock], [0, 'claude-fable-5-3', true]);
@@ -343,7 +351,7 @@ test('R4-F2: reset --remove-allow removes exactly the named ids and keeps the le
   assert.deepEqual([r.exitCode, r.output.floor, r.output.allow], [0, 'claude-fable-5-3', ['claude-fable-6-preview']]);
   assert.deepEqual(readReg(dir), { ...learned, allow: ['claude-fable-6-preview'] }, 'only allow changed');
   // repeatable, and combines with --allow-id and --clear-lock
-  mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  abandonedLock(dir);
   const both = await run(['reset', '--remove-allow', 'claude-fable-6-preview', '--allow-id', 'claude-fable-6-b', '--clear-lock'], asOwner(dir));
   assert.deepEqual([both.exitCode, both.output.allow, both.output.clearedLock, both.output.floor], [0, ['claude-fable-6-b'], true, 'claude-fable-5-3']);
 
@@ -369,7 +377,7 @@ test('R4-F2: reset --remove-allow and --keep-floor are refused inside Claude Cod
   raiseFloor({ dir, model: 'claude-fable-5-3', now: NOW });
   await run(['reset', '--allow-id', 'claude-fable-6-preview'], asOwner(dir));
   const before = readFileSync(reg(dir), 'utf8');
-  mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  abandonedLock(dir);
   for (const args of [['reset', '--remove-allow', 'claude-fable-6-preview'], ['reset', '--clear-lock', '--keep-floor']]) {
     for (const env of [{ ...ownerEnv(dir), CLAUDECODE: '1' }, ownerEnv(dir)]) {
       const r = await run(args, { env, hasClaudeCodeAncestor: () => env.CLAUDECODE === undefined });
@@ -387,7 +395,7 @@ test('R4-F2: reset --clear-lock --keep-floor removes the lock and keeps the lear
   raiseFloor({ dir, model: 'claude-fable-5-3', claudeCode: '2.1.400', transcript: '/t.jsonl', now: NOW });
   await run(['reset', '--allow-id', 'claude-fable-6-preview'], asOwner(dir));
   const bytes = readFileSync(reg(dir), 'utf8');
-  mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  abandonedLock(dir);
   const r = await run(['reset', '--clear-lock', '--keep-floor'], asOwner(dir));
   assert.deepEqual([r.exitCode, r.output.floor, r.output.hold, r.output.allow, r.output.clearedLock], [0, 'claude-fable-5-3', 'claude-fable-5-4', ['claude-fable-6-preview'], true]);
   assert.equal(readFileSync(reg(dir), 'utf8'), bytes, 'registry byte-identical');
@@ -428,4 +436,5 @@ test('R1-B2: the usage says --clear-lock refuses while the holder is running', (
   assert.match(meta.usage, /--clear-lock .*refuses while the holder is a running process on this machine \(exit 1 model-floor-lock-live, naming the pid and the lock folder\)/);
   assert.match(meta.usage, /confirm that pid is a pipeline process \(`ps -p <pid> -o command=`\).*remove the lock folder by hand/, 'R7-F2: how to tell a recycled pid');
   assert.match(meta.usage, /removes only the lock it inspected .*model-floor-lock-changed.*model-floor-lock-unreadable/, 'R7-B1/F1');
+  assert.match(meta.usage, /model-floor-lock-busy \(exit 1\); run it again in a moment/, 'R8-F2: a recovery or a starting review holds the lock');
 });
