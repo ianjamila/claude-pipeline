@@ -162,14 +162,47 @@ export function recheckManifest({ read, graphql, repo, defaultBranch, manifest }
       continue;
     }
     if (m.commit === manifest.queueSha) return moved(`#${m.pr} left the queue`);
-    let pr;
-    try {
-      pr = JSON.parse(read(`repos/${repo}/pulls/${m.pr}`, PR_JQ));
-    } catch (err) {
-      return moved(`#${m.pr} could not be read: ${message(err)}`);
-    }
-    if (pr?.merged !== true || String(pr.mergeCommit ?? '').toLowerCase() !== m.commit) return moved(`#${m.pr} left the queue without merging its queue commit`);
-    if (!onDefaultBranch({ read, repo, defaultBranch, sha: m.commit })) return moved(`#${m.pr}'s merge commit is not on the default branch`);
+    const why = unsettledReason({ read, repo, defaultBranch, member: m });
+    if (why !== null) return moved(why);
   }
   return { ok: true };
+}
+
+// A member is settled when its PR merged AT its own queue commit and that commit is on the default branch (D6). null = settled, else { reason, retry }: why not, and
+// whether the PR may only be lagging behind the queue's merge (still OPEN and not merged: `retry`, eaglewatch#1771). recheckManifest asks it only for members whose entry
+// has left the queue; memberStanding asks it for every predecessor, listed or not.
+function unsettled({ read, repo, defaultBranch, member: m }) {
+  let pr;
+  try {
+    pr = JSON.parse(read(`repos/${repo}/pulls/${m.pr}`, PR_JQ));
+  } catch (err) {
+    return { reason: `#${m.pr} could not be read: ${message(err)}`, retry: false };
+  }
+  if (pr?.merged !== true || String(pr.mergeCommit ?? '').toLowerCase() !== m.commit) {
+    return { reason: `#${m.pr} left the queue without merging its queue commit`, retry: pr?.merged !== true && pr?.state === 'open' };
+  }
+  if (!onDefaultBranch({ read, repo, defaultBranch, sha: m.commit })) return { reason: `#${m.pr}'s merge commit is not on the default branch`, retry: false };
+  return null;
+}
+const unsettledReason = (args) => unsettled(args)?.reason ?? null;
+
+/**
+ * Where one manifest member stands NOW, for the poster's member check (eaglewatch#1769). GitHub empties `pull_requests` on the guard runs of a PR that merged
+ * (the branch is deleted), so a predecessor that merged after the manifest was taken can no longer pass the provenance check; it does not need to, since it merged
+ * on its own entry's green statuses. Unlike recheckManifest, which never reads the PR of a listed entry, this reads it first:
+ *   { kind: 'live' }     the full guard check stands: the top entry (it owns the queue commit, so it is never settled), or an entry still in the queue that has not
+ *                        merged at its own queue commit;
+ *   { kind: 'settled' }  its PR merged at its OWN queue commit, and that commit is on the default branch, listed or not: its guard re-check is skipped;
+ *   { kind: 'gone', reason, retry? }  it left the queue any other way (removed, merged at another commit): an error. `retry: true` only when its PR is still OPEN and not
+ *                        merged (GitHub can lag the queue's merge): the caller reads it once more before it counts as gone (eaglewatch#1771, as eaglewatch's classifyMembers does);
+ *   { kind: 'unknown', reason }  the queue or the PR could not be read: the caller keeps its own verdict.
+ */
+export function memberStanding({ read, graphql, repo, defaultBranch, queueSha, member }) {
+  const got = readQueueEntries({ graphql, repo, defaultBranch });
+  if (!got.ok) return { kind: 'unknown', reason: got.reason };
+  if (member.commit === queueSha) return { kind: 'live' }; // the top entry owns the queue commit: always judged live
+  const why = unsettled({ read, repo, defaultBranch, member });
+  if (why === null) return { kind: 'settled' }; // merged at its own queue commit and on the default branch, whether or not its entry is still listed
+  if (got.entries.some((e) => e.id === member.entryId)) return { kind: 'live' };
+  return why.reason.includes('could not be read') ? { kind: 'unknown', reason: why.reason } : { kind: 'gone', reason: why.reason, ...(why.retry ? { retry: true } : {}) };
 }

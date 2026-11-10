@@ -45,7 +45,7 @@ const lines = (a) => (a.length ? `${a.join('\n')}\n` : '');
 // The scripted GitHub.
 //   queue: [at evaluate, at publish] entry lists (the last repeats); queueFail: the Nth read fails (0 = evaluate)
 //   status: (pr, check) -> a status object | an array (one per call) | null (none);  runs: (pr) -> run override (merged over guardRun)
-//   labels / issues: blockers; prs: GET pulls/N answers (the publish re-check of a member that left the queue)
+//   labels / issues: blockers; prs: GET pulls/N answers (the publish re-check of a member that left the queue); an array = one answer per call (the last repeats)
 //   post: 'fail' makes every status POST fail
 function script({ queue = [TWO()], queueFail = [], compare = COMPARE, status = goodStatus, runs = {}, artifacts = {}, labels = {}, issues = {}, prs = {}, defaultStatus = 'identical', post = 'ok' } = {}) {
   const ctxName = Object.entries(CTX);
@@ -67,7 +67,7 @@ function script({ queue = [TWO()], queueFail = [], compare = COMPARE, status = g
       { match: `^api repos/${REPO}/actions/runs/${pr}00 `, stdout: `${JSON.stringify({ ...guardRun(pr), ...(runs[pr] ?? {}) })}\n` },
       { match: `^api repos/${REPO}/actions/runs/${pr}00/artifacts\\?per_page=100 `, stdout: lines(artifacts[pr] ?? [verdictArtifactName({ head: heads[pr], integrity: 'success', hardstops: 'success', review: 'success' })]) },
     ]),
-    ...Object.entries(prs).map(([n, body]) => ({ match: `^api repos/${REPO}/pulls/${n} `, stdout: `${JSON.stringify(body)}\n` })),
+    ...Object.entries(prs).map(([n, body]) => ({ match: `^api repos/${REPO}/pulls/${n} `, ...(Array.isArray(body) ? { sequence: body.map((x) => ({ stdout: `${JSON.stringify(x)}\n` })) } : { stdout: `${JSON.stringify(body)}\n` }) })),
   ];
 }
 
@@ -190,6 +190,112 @@ test('poster: predecessor A removed (not merged), or merged at another commit, b
   assert.deepEqual(states(other), ALL('error'));
   const unreadable = await exec({ queue: [TWO(), [TWO()[1]]] });
   assert.deepEqual(states(unreadable), ALL('error'), 'the PR cannot be read');
+});
+
+// eaglewatch#1769: GitHub empties `pull_requests` on the guard runs of a PR that merged, so a predecessor that merged after the manifest was taken can no longer
+// pass the provenance check. A predecessor is settled when it merged at its own queue commit and on the default branch, listed or not; the top entry is never settled; a live member keeps the full check.
+const MERGED_RUN = { pull_requests: [] }; // (what GitHub shows for the predecessor's guard run once it merged)
+const ONLY_5 = () => [TWO()[1]];
+
+test('poster: predecessor A merged between the manifest and the guard check (its run lists no PR any more) at its own entry commit => B still success, in both phases (eaglewatch#1769)', async () => {
+  const r = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: { state: 'closed', merged: true, mergeCommit: A } } });
+  assert.equal(r.code, 0, r.phase1.stderr + (r.phase2?.stderr ?? ''));
+  assert.equal(r.phase1.code, 0);
+  assert.deepEqual(['integrity', 'hardstops', 'review'].map((k) => r.verdict.checks[k].state), ['success', 'success', 'success'], 'evaluate');
+  assert.deepEqual(states(r), ALL('success'), 'publish');
+  assert.match(r.final(CTX.integrity).description, /^earned on their heads by #3 \(merged\), #5$/);
+  assert.equal(r.artifact, `queue-verdict_v1_${Q}_success_success_success`);
+});
+
+test('poster: predecessor A merged at its own entry commit while its entry is STILL listed (its run lists no PR) => B still success (eaglewatch#1769, R3-F1)', async () => {
+  const r = await exec({ queue: [TWO(), TWO(), TWO()], runs: { 3: MERGED_RUN }, prs: { 3: { state: 'closed', merged: true, mergeCommit: A } } });
+  assert.equal(r.code, 0, r.phase1.stderr + (r.phase2?.stderr ?? ''));
+  assert.deepEqual(['integrity', 'hardstops', 'review'].map((k) => r.verdict.checks[k].state), ['success', 'success', 'success'], 'evaluate');
+  assert.deepEqual(states(r), ALL('success'), 'publish');
+  assert.match(r.final(CTX.integrity).description, /^earned on their heads by #3 \(merged\), #5$/);
+});
+
+test('poster: predecessor A merged at ANOTHER commit, or left unmerged, before the guard check => error in evaluate (and so in publish) (eaglewatch#1769)', async () => {
+  const other = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: { state: 'closed', merged: true, mergeCommit: sha('c') } } });
+  assert.deepEqual(states(other), ALL('error'));
+  assert.equal(other.verdict.checks.integrity.state, 'error', 'evaluate');
+  assert.match(other.verdict.checks.integrity.description, /^#3: .*without merging its queue commit/);
+  assert.equal(other.artifact, `queue-verdict_v1_${Q}_error_error_error`);
+  const removed = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: { state: 'open', merged: false, mergeCommit: null } } });
+  assert.deepEqual(states(removed), ALL('error'));
+});
+
+test('poster: a LIVE member whose provenance fails is still a failure, even when its run lists no PR (eaglewatch#1769)', async () => {
+  const live = await exec({ runs: { 3: MERGED_RUN } });
+  assert.deepEqual(states(live), ALL('failure'));
+  assert.match(live.final(CTX.integrity).description, /^#3: /);
+  assert.equal(live.artifact, `queue-verdict_v1_${Q}_failure_failure_failure`);
+});
+
+test('poster: a stop condition is overruled only for a SETTLED predecessor, never for the live top entry (eaglewatch#1769, R3-F2)', async () => {
+  const merged = { queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: { state: 'closed', merged: true, mergeCommit: A } } };
+  const paused = await exec({ ...merged, issues: { 'pipeline-pause': 41 } });
+  assert.deepEqual(states(paused), ALL('failure'), 'a pause issue holds the group: the top entry B is live');
+  assert.match(paused.final(CTX.integrity).description, /pipeline-pause/);
+  const topMerged = await exec({ ...merged, prs: { ...merged.prs, 5: { state: 'closed', merged: true, mergeCommit: Q } }, issues: { 'pipeline-pause': 41 } });
+  assert.deepEqual(states(topMerged), ALL('failure'), 'even a top entry that reads as merged at the queue commit is never settled');
+  const labelled = await exec({ ...merged, labels: { 3: ['needs-human'] } });
+  assert.equal(labelled.code, 0, labelled.phase1.stderr + (labelled.phase2?.stderr ?? ''));
+  assert.deepEqual(states(labelled), ALL('success'), 'a label on a merged predecessor is moot');
+  assert.match(labelled.final(CTX.integrity).description, /^earned on their heads by #3 \(merged\), #5$/);
+  const unmerged = await exec({ ...merged, labels: { 3: ['needs-human'] }, prs: { 3: { state: 'open', merged: false, mergeCommit: null } } });
+  assert.deepEqual(states(unmerged), ALL('error'), 'a labelled predecessor that left the queue unmerged is an error');
+});
+
+test('poster: a LISTED predecessor whose PR reads as open and unmerged stays live: a blocker label is a failure and a pending status settles to success, never an error (R4-F1)', async () => {
+  const OPEN = { 3: { state: 'open', merged: false, mergeCommit: null } }; // (GET pulls/3 is scripted: the readable-PR path, not "could not be read")
+  const labelled = await exec({ labels: { 3: ['needs-human'] }, prs: OPEN });
+  assert.equal(labelled.code, 0, labelled.phase1.stderr + (labelled.phase2?.stderr ?? ''));
+  assert.deepEqual(states(labelled), ALL('failure'));
+  assert.match(labelled.final(CTX.hardstops).description, /^#3: .*needs-human/);
+  const pending = { ...goodStatus(3), state: 'pending' };
+  const settles = await exec({ prs: OPEN, status: (pr) => (pr === 3 ? [pending, goodStatus(3)] : goodStatus(pr)) }, { env: { QUEUE_PENDING_WAIT_MS: '60000' } });
+  assert.equal(settles.code, 0, settles.phase1.stderr + (settles.phase2?.stderr ?? ''));
+  assert.deepEqual(states(settles), ALL('success'));
+  assert.match(settles.final(CTX.integrity).description, /^earned on their heads by #3, #5$/);
+});
+
+// eaglewatch#1771: a departed predecessor whose PR does not say `merged` YET (GitHub lags the queue's merge) is not cached as gone: the poster reads it once more, as the
+// Queue gate does, before it counts it as gone. Settled stays cached; a PR merged at another commit is final at once; at most one re-read per member per run.
+const pullReads = (r, pr) => r.calls.filter((c) => c.argv[0] === 'api' && c.argv[1] === `repos/${REPO}/pulls/${pr}`).length;
+const UNMERGED = { state: 'open', merged: false, mergeCommit: null };
+const MERGED_AT_A = { state: 'closed', merged: true, mergeCommit: A };
+
+test('poster: predecessor A departed, its PR not merged YET, then merged at its own entry commit on the re-read => success in both phases, one re-read (eaglewatch#1771)', async () => {
+  const r = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: [UNMERGED, MERGED_AT_A] } });
+  assert.equal(r.code, 0, r.phase1.stderr + (r.phase2?.stderr ?? ''));
+  assert.deepEqual(['integrity', 'hardstops', 'review'].map((k) => r.verdict.checks[k].state), ['success', 'success', 'success'], 'evaluate');
+  assert.deepEqual(states(r), ALL('success'), 'publish');
+  assert.match(r.final(CTX.integrity).description, /^earned on their heads by #3 \(merged\), #5$/);
+});
+
+test('poster: predecessor A departed and its PR is STILL not merged on the re-read => error; exactly one re-read for the whole run (eaglewatch#1771)', async () => {
+  const r = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: UNMERGED } }, { publish: false });
+  assert.deepEqual(['integrity', 'hardstops', 'review'].map((k) => r.verdict.checks[k].state), ['error', 'error', 'error']);
+  assert.match(r.verdict.checks.integrity.description, /^#3: .*without merging its queue commit/);
+  assert.equal(pullReads(r, 3), 2, 'one read, one re-read; the three contexts share the answer');
+});
+
+test('poster: predecessor A merged at ANOTHER commit is final at once: error, no re-read (eaglewatch#1771)', async () => {
+  const r = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: { state: 'closed', merged: true, mergeCommit: sha('c') } } }, { publish: false });
+  assert.deepEqual(['integrity', 'hardstops', 'review'].map((k) => r.verdict.checks[k].state), ['error', 'error', 'error']);
+  assert.equal(pullReads(r, 3), 1, 'no re-read');
+});
+
+test('poster: a settled predecessor is cached: one read for the three contexts, no re-read (eaglewatch#1771)', async () => {
+  const r = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: MERGED_AT_A } }, { publish: false });
+  assert.deepEqual(['integrity', 'hardstops', 'review'].map((k) => r.verdict.checks[k].state), ['success', 'success', 'success']);
+  assert.equal(pullReads(r, 3), 1);
+});
+
+test('poster: the member lookup that could not be read keeps the member\'s own verdict (failure), never a success (eaglewatch#1769)', async () => {
+  const r = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN } }); // (GET pulls/3 is not scripted: unreadable)
+  assert.notEqual(r.final(CTX.integrity)?.state, 'success');
 });
 
 test('poster: top entry re-created with the same PR (new id) between evaluate and publish => error', async () => {

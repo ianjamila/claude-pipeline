@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
@@ -14,6 +14,8 @@ import {
 } from '../pipeline/lib/merge-queue.mjs';
 import { run as runQueueSweep } from '../pipeline/commands/queue-sweep.mjs';
 import { sweepRepo, bestEffortSweep } from '../pipeline/lib/queue-sweep.mjs';
+import { recheckGatedRecorded } from '../pipeline/lib/queue-route.mjs';
+import { CANONICAL_CHECKS } from '../pipeline/lib/finalgate.mjs';
 import {
   QUEUE_SWEEP_LABEL, queueSweepPlistPath, queueSweepSchedule,
 } from '../pipeline/lib/queue-sweep-schedule.mjs';
@@ -196,6 +198,95 @@ test('F11: a removal that could be re-queued but whose worktree is gone, or at a
   assert.deepEqual(ghc.calls.filter((x) => x.startsWith('enqueue')), []);
 });
 
+// #229: the sweep judges a re-queue the way the route that opened the record judged the first enqueue.
+test('#229: a gated-route record is re-checked with the gated recheck, an owner-go (or route-less, older) record with the owner-go one', async () => {
+  const events = [[addedAt(), removedAt('failed_checks')]];
+  const fail = async () => ({ ok: false, error: 'owner-go', reasons: ['the owner\'s "merge" for this head and scan is no longer on record'] });
+  const seen = [];
+  const gatedPasses = async (args) => { seen.push(args.rec?.route ?? null); return { ok: true }; };
+  const fresh = (route) => {
+    const root = repoDir();
+    openRecord(root, 7, HEAD, APPROVAL, { ...IDENT, ...(route ? { route } : {}) });
+    setHold(root, 7, HOLD);
+    beginAttempt(root, 7, HEAD, APPROVAL, IDENT);
+    confirmAttempt(root, 7, 'MQE_1');
+    return root;
+  };
+
+  const gated = fresh('gated');
+  assert.equal(readQueueRecord(gated, 7).route, 'gated');
+  const gg = stub({ states: [st(), inQ(1)], events });
+  const a = await sweep(gated, world(), gg, { recheckFn: fail, recheckGatedFn: gatedPasses });
+  assert.deepEqual(a.settled.map((s) => s.outcome), ['requeued'], 'the one automatic retry is delivered on the gated route');
+  assert.deepEqual(gg.calls, [`enqueue 7 ${HEAD.slice(0, 8)}`]);
+  assert.deepEqual(seen, ['gated']);
+
+  for (const route of ['owner-go', null]) {
+    const root = fresh(route);
+    assert.equal(readQueueRecord(root, 7).route ?? null, route);
+    const gh = stub({ states: [st()], events });
+    const out = await sweep(root, world(), gh, { recheckFn: fail, recheckGatedFn: async () => { throw new Error('the gated recheck must not judge this record'); } });
+    assert.equal(out.settled[0].terminal, 'removed', String(route));
+    assert.deepEqual(gh.calls, ['add needs-human'], `${route}: no enqueue, fails closed`);
+  }
+
+  // A gated record whose gated recheck refuses ends like any refused re-queue.
+  const refused = fresh('gated');
+  const gr = stub({ states: [st()], events });
+  const r = await sweep(refused, world(), gr, { recheckGatedFn: async () => ({ ok: false, error: 'blocked', reasons: ['label needs-human is on the PR'] }) });
+  assert.equal(r.settled[0].terminal, 'blocked');
+  assert.deepEqual(gr.calls.filter((x) => x.startsWith('enqueue')), []);
+});
+
+test('#229: the sweep\'s gated recheck needs a passing, recent gate file for the recorded head, then runs the same live checks as P merge', async () => {
+  const gateAt = (over = {}) => ({
+    ok: true, repo: 'acme/widgets', pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'none', at: new Date().toISOString(),
+    checks: CANONICAL_CHECKS.map((name) => ({ name, ok: true, detail: '' })), ...over,
+  });
+  const worktree = (gate) => {
+    const dir = mkdtempSync(join(tmpdir(), 'cp-qsweep-gate-'));
+    if (gate !== undefined) {
+      mkdirSync(join(dir, '.review'));
+      writeFileSync(join(dir, '.review', 'final-gate.json'), JSON.stringify(gate));
+    }
+    return dir;
+  };
+  const live = (over = {}) => ({ head: HEAD, contentHash: 'hash1', ownerItems: 'none', checks: [{ name: 'ci', ok: true }], ...over });
+  const ask = (dir, { fresh = live(), problems = [], rec = { approval: APPROVAL }, now } = {}) => {
+    const calls = [];
+    return recheckGatedRecorded({
+      root: dir, config: {}, pr: 7, gh: { ...stub({ states: [st()] }), prView: () => ({ state: 'OPEN', headRefOid: HEAD, labels: [] }) }, env: {}, head: HEAD, repo: 'acme/widgets', rec, localHash: () => 'hash1', ...(now ? { now } : {}),
+      evaluate: async (args) => { calls.push(args.queueMode); return fresh; }, problemsOf: async () => problems,
+    }).then((out) => ({ out, calls }));
+  };
+
+  const ok = await ask(worktree(gateAt()));
+  assert.deepEqual(ok.out, { ok: true });
+  assert.deepEqual(ok.calls, [true], 'the live gate is evaluated in queue mode');
+  for (const [why, dir, re] of [
+    ['no gate file', worktree(), /gate file is gone/],
+    ['a failing gate', worktree(gateAt({ ok: false })), /not a passing gate/],
+    ['a gate of another head', worktree(gateAt({ head: 'c'.repeat(40) })), /not a passing gate/],
+    ['a gate of another PR', worktree(gateAt({ pr: 8 })), /not a passing gate/],
+    ['a gate older than a gate may be', worktree(gateAt({ at: new Date(Date.now() - 25 * 3_600_000).toISOString() })), /too old/],
+  ]) {
+    const r = await ask(dir);
+    assert.equal(r.out.ok, false, why);
+    assert.match(r.out.reasons[0], re, why);
+    assert.deepEqual(r.calls, [], `${why}: nothing is evaluated`);
+  }
+  const patch = await ask(worktree(gateAt()), { fresh: live({ contentHash: 'other' }) });
+  assert.equal(patch.out.error, 'live-check');
+  const failing = await ask(worktree(gateAt()), { fresh: live({ checks: [{ name: 'ci', ok: false, detail: 'red' }] }) });
+  assert.match(failing.out.reasons[0], /ci: red/);
+  const blocked = await ask(worktree(gateAt()), { problems: ['label needs-human is on the PR'] });
+  assert.deepEqual([blocked.out.ok, blocked.out.error], [false, 'blocked']);
+  // The gate left items for the owner and no "merge" for them is on record: not re-queued.
+  const items = await ask(worktree(gateAt({ ownerItems: 'zz9-no-such-owner-record' })), { fresh: live({ ownerMerge: 1, ownerItems: 'zz9-no-such-owner-record' }) });
+  assert.equal(items.out.error, 'pre-merge');
+  assert.match(items.out.reasons[0], /no "merge" for this head and item set is on record/);
+});
+
 test('F11: P final-gate\'s sweep (requeue: false) only settles: a re-queueable removal is left as it is, nothing is enqueued, the hold stays lifted', async () => {
   const root = repoDir();
   const w = world();
@@ -333,4 +424,102 @@ test('R1-B2: the re-queue is sent but every confirm read fails => unsettled: the
   assert.equal(rec.terminal, null);
   assert.notEqual(rec.pending, null, 'the attempt is still pending: the next sweep reconciles it');
   assert.deepEqual(w.said, []);
+});
+
+// R1-F2: a gated record whose first enqueue stood on the owner's word (a resumed run, an unchecked run record: the gate itself shows no owner items)
+// is re-queued by the unattended sweep only while that word is still on record.
+test('R1-F2: the sweep\'s gated recheck refuses a record whose enqueue needed the owner\'s word when that word is no longer on record', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-qsweep-gate-'));
+  mkdirSync(join(dir, '.review'));
+  // (ownerMerge 0 in the file and live: nothing but the record says the owner's word mattered; the item set has no "merge" on record)
+  writeFileSync(join(dir, '.review', 'final-gate.json'), JSON.stringify({
+    ok: true, repo: 'acme/widgets', pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'zz9-no-such-owner-record', at: new Date().toISOString(),
+    checks: CANONICAL_CHECKS.map((name) => ({ name, ok: true, detail: '' })),
+  }));
+  const ask = (rec) => recheckGatedRecorded({
+    root: dir, config: {}, pr: 7, gh: { ...stub({ states: [st()] }), prView: () => ({ state: 'OPEN', headRefOid: HEAD, labels: [] }) }, env: {}, head: HEAD, repo: 'acme/widgets', rec, localHash: () => 'hash1',
+    evaluate: async () => ({ head: HEAD, contentHash: 'hash1', ownerItems: 'zz9-no-such-owner-record', checks: [{ name: 'ci', ok: true }] }), problemsOf: async () => [],
+  });
+  const required = await ask({ approval: { ...APPROVAL, ownerRequired: true } });
+  assert.equal(required.ok, false);
+  assert.equal(required.error, 'pre-merge');
+  assert.match(required.reasons[0], /owner's "merge" for this head is no longer on record/);
+  // records written before the field (or for an enqueue that needed no word) keep today's behaviour
+  assert.deepEqual(await ask({ approval: APPROVAL }), { ok: true });
+  assert.deepEqual(await ask({ approval: { ...APPROVAL, ownerRequired: false } }), { ok: true });
+});
+
+// R1-F3: the sweep binds the gate file exactly as P merge does (gateRefusals): repo, canonical check list, PR head, patch hash, age, and a future date.
+test('R1-F3: the sweep\'s gated recheck refuses what gateRefusals refuses: a future-dated gate, another repo, a short check list, a moved PR head, another patch', async () => {
+  const complete = (over = {}) => ({
+    ok: true, repo: 'acme/widgets', pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'none', at: new Date().toISOString(),
+    checks: CANONICAL_CHECKS.map((name) => ({ name, ok: true, detail: '' })), ...over,
+  });
+  const ask = async (gate, { prHead = HEAD, hash = 'hash1' } = {}) => {
+    const dir = mkdtempSync(join(tmpdir(), 'cp-qsweep-gate-'));
+    mkdirSync(join(dir, '.review'));
+    writeFileSync(join(dir, '.review', 'final-gate.json'), JSON.stringify(gate));
+    const calls = [];
+    const gh = { ...stub({ states: [st()] }), prView: () => ({ state: 'OPEN', headRefOid: prHead, labels: [] }) };
+    const out = await recheckGatedRecorded({
+      root: dir, config: {}, pr: 7, gh, env: {}, head: HEAD, repo: 'acme/widgets', rec: { approval: APPROVAL }, localHash: () => hash,
+      evaluate: async () => { calls.push('evaluate'); return { head: HEAD, contentHash: 'hash1', ownerItems: 'none', checks: [{ name: 'ci', ok: true }] }; }, problemsOf: async () => [],
+    });
+    return { out, calls };
+  };
+  assert.deepEqual((await ask(complete())).out, { ok: true });
+  for (const [why, gate, opts, re] of [
+    ['a gate dated in the future (it would never age out)', complete({ at: new Date(Date.now() + 3_600_000).toISOString() }), {}, /dated in the future/],
+    ['a gate of another repo', complete({ repo: 'other/widgets' }), {}, /not acme\/widgets/],
+    ['a gate with a short check list', complete({ checks: [{ name: 'ci', ok: true }] }), {}, /missing canonical check/],
+    ['a gate for a PR head that has moved', complete(), { prHead: 'c'.repeat(40) }, /PR head is/],
+    ['a gate for another patch', complete(), { hash: 'other' }, /content hash differs/],
+  ]) {
+    const r = await ask(gate, opts);
+    assert.equal(r.out.ok, false, why);
+    assert.equal(r.out.error, 'live-check', why);
+    assert.match(r.out.reasons.join('\n'), re, why);
+    assert.deepEqual(r.calls, [], `${why}: nothing is evaluated`);
+  }
+});
+
+// ---- review round 2 ---------------------------------------------------------------------------------------------------------------------
+
+// R2-F2: a PR read that fails (a GitHub blip) is not a refusal: a refusal ends the record and spends the owner's word, so the error propagates and the sweep leaves the record live for the next pass.
+test('R2-F2: the sweep\'s gated recheck lets a failed PR read propagate instead of refusing for good', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-qsweep-gate-'));
+  mkdirSync(join(dir, '.review'));
+  writeFileSync(join(dir, '.review', 'final-gate.json'), JSON.stringify({
+    ok: true, repo: 'acme/widgets', pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'none', at: new Date().toISOString(),
+    checks: CANONICAL_CHECKS.map((name) => ({ name, ok: true, detail: '' })),
+  }));
+  const gh = { ...stub({ states: [st()] }), prView: () => { throw new Error('gh: Server Error (HTTP 502)'); } };
+  await assert.rejects(
+    recheckGatedRecorded({ root: dir, config: {}, pr: 7, gh, env: {}, head: HEAD, repo: 'acme/widgets', rec: { approval: APPROVAL }, localHash: () => 'hash1', evaluate: async () => { throw new Error('not reached'); }, problemsOf: async () => [] }),
+    /HTTP 502/,
+  );
+});
+
+// R3-F3: the throw must leave the record LIVE (not ended, no hold restored, no label, no notice) so the next sweep retries it; wrapping the re-queue in a catch would spend the owner's word on a blip.
+test('R3-F3: a gated recheck that throws leaves the record live and unspent (outcome error); the next sweep with a passing recheck re-queues', async () => {
+  const root = repoDir();
+  const w = world();
+  openRecord(root, 7, HEAD, APPROVAL, { ...IDENT, route: 'gated' });
+  setHold(root, 7, HOLD);
+  beginAttempt(root, 7, HEAD, APPROVAL, IDENT);
+  confirmAttempt(root, 7, 'MQE_1');
+  const events = [[addedAt(), removedAt('failed_checks')]];
+
+  const blip = stub({ states: [st()], events });
+  const first = await sweep(root, w, blip, { recheckGatedFn: async () => { throw new Error('gh: Server Error (HTTP 502)'); } });
+  assert.deepEqual(first.settled.map((s) => s.outcome), ['error']);
+  assert.equal(readQueueRecord(root, 7).terminal, null, 'the record is still live');
+  assert.deepEqual(blip.calls, [], 'no enqueue, no label');
+  assert.deepEqual(w.said, [], 'no notice');
+
+  const ok = stub({ states: [st(), inQ(1)], events });
+  const second = await sweep(root, w, ok, { recheckGatedFn: async () => ({ ok: true }) });
+  assert.deepEqual(second.settled.map((s) => s.outcome), ['requeued']);
+  assert.deepEqual(ok.calls, [`enqueue 7 ${HEAD.slice(0, 8)}`]);
+  assert.equal(readQueueRecord(root, 7).terminal, null);
 });

@@ -4,7 +4,7 @@
 // A record with nothing live is found by reading a directory: no GitHub call at all.
 // Re-queueing is the one thing here that is not a plain settle, and it only ever happens from the worktree the owner approved (Fable F11).
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadConfig } from './config.mjs';
@@ -13,7 +13,7 @@ import { createGitHub } from './github.mjs';
 import { withMergeLock } from './hold.mjs';
 import { defaultLockDir } from './locks.mjs';
 import { liveRecords, recordIsFor, recordedHold, settleRecord } from './merge-queue.mjs';
-import { createQueueRoute, recheckOwnerGo, restoreHoldOnTerminal } from './queue-route.mjs';
+import { canon, createQueueRoute, isDir, recheckGatedRecorded, recheckOwnerGo, recordedWorktreeProblem, restoreHoldOnTerminal } from './queue-route.mjs';
 import { gitCommonDir } from './repo.mjs';
 import { loadMachineConfig } from './stacks/config.mjs';
 import { stackFiles, stacksRoot } from './stacks/paths.mjs';
@@ -21,8 +21,6 @@ import { pruneLogDir } from './worktree-prune/run.mjs';
 
 const msg = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 300);
 const refuse = (error, reasons, extra = {}) => ({ exitCode: 1, output: { ok: false, merged: false, error, reasons, ...extra } });
-const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
-const canon = (p) => { try { return realpathSync(p); } catch { return path.resolve(p); } };
 
 // ---- the owner is told about each terminal outcome ---------------------------------------------------------------------------------
 // There is no other notification path in this pipeline, so a notice is: a line on stderr (a `P merge` session sees it; the LaunchAgent's log keeps it), a line in
@@ -96,7 +94,7 @@ export function knownRepos({ home = os.homedir(), env = process.env } = {}) {
     if (!isDir(dir)) continue;
     let key;
     try {
-      key = canon(gitCommonDir(dir));
+      key = canon(gitCommonDir(dir)); // canon is realpath.native: the on-disk spelling (short names expanded), so one repository reached two ways gets one key
     } catch {
       continue; // not a git repository (any more)
     }
@@ -110,32 +108,25 @@ export function knownRepos({ home = os.homedir(), env = process.env } = {}) {
 // ---- the re-queue, from a live worktree only (Fable F11) ------------------------------------------------------------------------------------
 // -> the `requeue` function settleRecord takes. ok:false ends the record `removed` (or `blocked`), puts an owned hold back and notifies;
 // { ok:false, unsettled:true } (the enqueue could not be confirmed) leaves the record as it is.
-export function makeRequeue({ gh, root, env, say, now, sleep, log, loadCfg = loadConfig, headOf = (cwd) => headSha({ cwd }), recheckFn = recheckOwnerGo }) {
+// The re-queue is judged the way the route that opened the record judged the first enqueue (#229): a `gated` record by the gated recheck,
+// an `owner-go` one by the owner-go recheck. A record without a route (written before it was recorded) is owner-go: the stricter reading, fail closed.
+export function makeRequeue({ gh, root, env, say, now, sleep, log, loadCfg = loadConfig, headOf = (cwd) => headSha({ cwd }), recheckFn = recheckOwnerGo, recheckGatedFn = recheckGatedRecorded }) {
   return async ({ rec }) => {
     const pr = rec.pr;
     const stop = (why) => ({ ok: false, reasons: [`${why} — re-run \`P merge --pr ${pr}\` to re-queue`] });
-    if (typeof rec.root !== 'string' || !isDir(rec.root)) return stop('worktree gone');
-    let current;
-    try {
-      current = headOf(rec.root);
-    } catch {
-      return stop('worktree gone');
-    }
-    if (current !== rec.head) return stop(`worktree at another head (${String(current).slice(0, 12)}, approved ${rec.head.slice(0, 12)})`);
-    try {
-      if (canon(gitCommonDir(rec.root)) !== canon(gitCommonDir(root))) return stop('worktree belongs to another repository');
-    } catch {
-      return stop('worktree gone');
-    }
+    const problem = recordedWorktreeProblem({ rec, root, headOf });
+    if (problem !== null) return stop(problem);
     const loaded = await loadCfg(rec.root);
     if (!loaded?.ok) return { ok: false, reasons: [`the pipeline config of ${rec.root} is not usable, so the re-queue was not checked`] };
     const config = loaded.config;
     const hold = recordedHold(rec);
-    const recheck = () => recheckFn({ root: rec.root, config, pr, gh, env, head: rec.head, repo: gh.repo().slug, hold });
+    const recheck = () => (rec.route === 'gated'
+      ? recheckGatedFn({ root: rec.root, config, pr, gh, env, head: rec.head, repo: gh.repo().slug, rec })
+      : recheckFn({ root: rec.root, config, pr, gh, env, head: rec.head, repo: gh.repo().slug, hold }));
     const again = await recheck();
     if (!again.ok) return { ok: false, ...(again.error === 'blocked' ? { kind: 'blocked' } : {}), reasons: again.reasons };
     const route = createQueueRoute({
-      gh, root: rec.root, config, pr, head: rec.head, env, refuse, approval: rec.approval, recheck,
+      gh, root: rec.root, config, pr, head: rec.head, route: rec.route ?? null, env, refuse, approval: rec.approval, recheck,
       onTerminal: restoreHoldOnTerminal({ gh, pr }), now, sleep, log,
     });
     const out = await route.reenqueue();
@@ -155,7 +146,7 @@ export function makeRequeue({ gh, root, env, say, now, sleep, log, loadCfg = loa
 // -> { root, settled: [{ pr, outcome, ... }], skipped: [{ pr, why }], errors: [text] }. Never throws.
 export async function sweepRepo({
   root, env = process.env, requeue = true, exceptPr = null, notify = null, makeGh = (r) => createGitHub({ cwd: r, env }), now = Date.now,
-  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), pollMs = 2000, log = () => {}, alive, loadCfg, headOf, recheckFn,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), pollMs = 2000, log = () => {}, alive, loadCfg, headOf, recheckFn, recheckGatedFn,
 }) {
   const out = { root, settled: [], skipped: [], errors: [] };
   let records;
@@ -187,7 +178,7 @@ export async function sweepRepo({
         refuse: (error) => ({ busy: true, error }),
         fn: () => settleRecord({
           gh, root, pr: rec.pr, now, sleep, pollMs, log, notify: say,
-          requeue: requeue ? makeRequeue({ gh, root, env, say, now, sleep, log, ...(loadCfg ? { loadCfg } : {}), ...(headOf ? { headOf } : {}), ...(recheckFn ? { recheckFn } : {}) }) : null,
+          requeue: requeue ? makeRequeue({ gh, root, env, say, now, sleep, log, ...(loadCfg ? { loadCfg } : {}), ...(headOf ? { headOf } : {}), ...(recheckFn ? { recheckFn } : {}), ...(recheckGatedFn ? { recheckGatedFn } : {}) }) : null,
         }),
       });
       if (res.busy) {

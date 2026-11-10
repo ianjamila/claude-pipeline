@@ -24,7 +24,7 @@ import { CONTEXTS, REVIEW_KEY, VERDICT_FILE } from './ci-guards-run.mjs';
 import { loadConfig } from './lib/config.mjs';
 import { GUARD_CONTEXT_CHECKS, REVIEW_STATES, VERDICT_STATES, checkGuardVerdict, queueVerdictArtifactName } from './lib/guard-provenance.mjs';
 import { gh as defaultGh, GhError } from './lib/proc.mjs';
-import { parseQueueRef, queueManifest, recheckManifest } from './lib/queue-members.mjs';
+import { memberStanding, parseQueueRef, queueManifest, recheckManifest } from './lib/queue-members.mjs';
 import { REVIEW_CONTEXT } from './lib/review-marker.mjs';
 
 // A member carrying one of these labels (the merge gate's blockers that stop a merge, see finalgate.mjs#BLOCKING_LABELS) or an open
@@ -200,11 +200,34 @@ export async function runEvaluate({ env = process.env, cwd = process.cwd(), deps
       return { state: 'error', reason: `${context} unreadable: ${first(err)}` };
     }
   };
+  // A predecessor that merged after the manifest was taken (eaglewatch#1769): GitHub empties pull_requests on its guard runs, so its provenance can no longer be
+  // checked, and it need not be. A predecessor is settled when it merged at its own queue commit and on the default branch, listed or not (it merged on its own
+  // entry's green statuses); the top entry is never settled; one that left the queue any other way is an error. A live member keeps the full check. Read only when the check did not already pass, and kept once settled.
+  // A departure whose PR does not say `merged` YET (`retry`: open and unmerged; GitHub can lag the queue's merge) is not kept as gone on the first read: it is read once more, as
+  // the Queue gate does, and only then counts (eaglewatch#1771). At most one re-read per member per run.
+  const standings = new Map();
+  const standingOf = (member) => {
+    const known = standings.get(member.pr);
+    if (known) return known;
+    const ask = () => memberStanding({ read: s.read, graphql: s.graphql, repo: e.repo, defaultBranch, queueSha: e.queueSha, member });
+    let st = ask();
+    if (st.kind === 'gone' && st.retry === true) st = ask();
+    if (st.kind === 'settled' || st.kind === 'gone') standings.set(member.pr, st);
+    return st;
+  };
+  const overruled = (member) => {
+    const st = standingOf(member);
+    if (st.kind === 'settled') return { state: 'success', settled: true };
+    return st.kind === 'gone' ? { state: 'error', reason: st.reason } : null;
+  };
   const judge = async (member, key) => {
     const blocker = blockers.get(member.pr) ?? issueBlocker;
-    if (blocker) return blocker;
+    if (blocker) return overruled(member) ?? blocker;
     for (;;) {
       const r = judgeOnce(member, key);
+      if (r.state === 'success') return r;
+      const settled = overruled(member);
+      if (settled) return settled;
       if (!r.pending) return r;
       if (now() + e.pollMs >= deadline) return { state: 'failure', reason: `${contextOf(key)} is still pending` };
       await sleep(e.pollMs);
@@ -216,7 +239,7 @@ export async function runEvaluate({ env = process.env, cwd = process.cwd(), deps
     for (const member of manifest.members) results.push({ member, ...(await judge(member, key)) });
     const state = worst(results);
     const description = state === 'success'
-      ? `earned on their heads by ${manifest.members.map((x) => `#${x.pr}`).join(', ')}`
+      ? `earned on their heads by ${manifest.members.map((x) => `#${x.pr}${standings.get(x.pr)?.kind === 'settled' ? ' (merged)' : ''}`).join(', ')}`
       : results.filter((r) => r.state !== 'success').map((r) => `#${r.member.pr}: ${clip(r.reason, REASON_MAX)}`).join('; ');
     checks[key] = { state, description: clip(description, MAX_DESCRIPTION) };
   }
