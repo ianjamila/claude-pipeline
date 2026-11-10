@@ -24,7 +24,8 @@ jobs:
       QUEUE_REF: ${{ github.event.workflow_run.head_branch }}
       QUEUE_EVENT: ${{ github.event.workflow_run.event }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      PIPELINE_VERDICT_DIR: ${{ runner.temp }}/queue-verdict
+      # No PIPELINE_VERDICT_DIR here: the runner context is not available in a job-level env (GitHub rejects the whole file). The poster falls back to
+      # $RUNNER_TEMP/queue-verdict, the same folder the upload step below names.
     steps:
       - uses: actions/checkout@v4
         with: { sparse-checkout: "scripts/pipeline\n.claude/pipeline.yml", persist-credentials: false }
