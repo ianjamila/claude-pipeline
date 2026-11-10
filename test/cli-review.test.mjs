@@ -2067,7 +2067,7 @@ test('a full round: codex -> judge -> arbiter -> implement -> follow-ups -> clea
   assertExit(w.cli(['comment', '--pr', '7', '--kind', 'summary', '--outcome', 'merged']), 0);
   const summary = posted().at(-1);
   assert.ok(summary.startsWith(MARKERS.summary));
-  assert.match(summary, /Fable proof: .*agent-a1\.jsonl, models claude-fable-5-1×1, effort high/);
+  assert.match(summary, /Fable proof: .*agent-a1\.jsonl, models claude-fable-5-2×1, effort high/);
   assert.ok(summary.includes(url), 'the follow-up issue recorded by followups create is listed');
 });
 
