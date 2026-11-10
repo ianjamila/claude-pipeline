@@ -93,6 +93,16 @@ test('queueCatchUpState: predates | current | unknown, with the dates it compare
   assert.equal(exactly.needed, false, 'a merge base made at the very moment of the switch-on is not before it');
 });
 
+test('queueCatchUpState: a switch-on time GitHub writes with an offset compares as the instant it is against a Z merge-base date', () => {
+  const offset = '2026-11-10T15:27:47.979+08:00'; // = 2026-11-10T07:27:47.979Z
+  const before = queueCatchUpState({ gh: stub({ ruleset: offset, base: { behindBy: 2, committedAt: '2026-11-10T07:27:47Z' } }), branch: 'main', head: H });
+  assert.deepEqual([before.needed, before.kind, before.switchedOn], [true, 'predates', offset], 'a base a fraction of a second before the instant predates it');
+  const after = queueCatchUpState({ gh: stub({ ruleset: offset, base: { behindBy: 2, committedAt: '2026-11-10T07:27:48Z' } }), branch: 'main', head: H });
+  assert.deepEqual([after.needed, after.kind], [false, 'current'], 'a base after the instant is current, not read as 08 hours later or earlier');
+  const wallClock = queueCatchUpState({ gh: stub({ ruleset: offset, base: { behindBy: 2, committedAt: '2026-11-10T14:00:00Z' } }), branch: 'main', head: H });
+  assert.equal(wallClock.kind, 'current', 'the local wall-clock digits (15:27) are not mistaken for UTC');
+});
+
 test('queueCatchUpState: a branch that is not behind its base holds all of it: current, and the switch-on time is not even read', () => {
   const gh = stub({ base: { behindBy: 0, committedAt: OLD }, ruleset: new Error('HTTP 500') });
   const r = queueCatchUpState({ gh, branch: 'main', head: H });
