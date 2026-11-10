@@ -502,4 +502,11 @@ test('gated route, resumed run, record for head H ended: a final-gate run after 
   assert.equal(r.json.merged, true);
   assert.equal(fresh.enqueueCalls().length, 1);
   assert.equal(fresh.record().attempts, 1, 'a new record with a new budget');
+  assert.equal(fresh.record().approval.ownerRequired, true, 'the record keeps that the enqueue stood on the owner\'s word (the sweep re-checks it: R1-F2)');
+});
+
+test('gated route, ordinary run: the record says the owner\'s word was not required (R1-F2)', () => {
+  const s = world({ after: [[Q(), M()]] });
+  assertExit(s.run(), 0);
+  assert.notEqual(s.record().approval.ownerRequired, true);
 });

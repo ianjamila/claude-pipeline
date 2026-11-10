@@ -421,3 +421,23 @@ test('R1-B2: the re-queue is sent but every confirm read fails => unsettled: the
   assert.notEqual(rec.pending, null, 'the attempt is still pending: the next sweep reconciles it');
   assert.deepEqual(w.said, []);
 });
+
+// R1-F2: a gated record whose first enqueue stood on the owner's word (a resumed run, an unchecked run record: the gate itself shows no owner items)
+// is re-queued by the unattended sweep only while that word is still on record.
+test('R1-F2: the sweep\'s gated recheck refuses a record whose enqueue needed the owner\'s word when that word is no longer on record', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-qsweep-gate-'));
+  mkdirSync(join(dir, '.review'));
+  // (ownerMerge 0 in the file and live: nothing but the record says the owner's word mattered; the item set has no "merge" on record)
+  writeFileSync(join(dir, '.review', 'final-gate.json'), JSON.stringify({ ok: true, pr: 7, head: HEAD, contentHash: 'hash1', ownerItems: 'zz9-no-such-owner-record', at: new Date().toISOString() }));
+  const ask = (rec) => recheckGatedRecorded({
+    root: dir, config: {}, pr: 7, gh: stub({ states: [st()] }), env: {}, head: HEAD, repo: 'acme/widgets', rec,
+    evaluate: async () => ({ head: HEAD, contentHash: 'hash1', ownerItems: 'zz9-no-such-owner-record', checks: [{ name: 'ci', ok: true }] }), problemsOf: async () => [],
+  });
+  const required = await ask({ approval: { ...APPROVAL, ownerRequired: true } });
+  assert.equal(required.ok, false);
+  assert.equal(required.error, 'pre-merge');
+  assert.match(required.reasons[0], /owner's "merge" for this head is no longer on record/);
+  // records written before the field (or for an enqueue that needed no word) keep today's behaviour
+  assert.deepEqual(await ask({ approval: APPROVAL }), { ok: true });
+  assert.deepEqual(await ask({ approval: { ...APPROVAL, ownerRequired: false } }), { ok: true });
+});

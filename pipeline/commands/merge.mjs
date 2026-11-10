@@ -159,10 +159,11 @@ export const run = guarded(async (argv, ctx) => {
     // a PR whose record already ended needs a fresh owner "merge" (pre.since), and a removed one is re-queued by the normal flow below.
     let route = null;
     let pre = null;
+    const approval = { items: gate.ownerItems ?? null, areas: null, rulings: null, ownerRequired: false };
     if (queue.on) {
       route = createQueueRoute({
         gh, root, config, pr, head: gate.head, route: 'gated', env: ctx.env ?? process.env, refuse, track,
-        approval: { items: gate.ownerItems ?? null, areas: null, rulings: null },
+        approval,
         recheck: () => queueRecheckGated({ root, config, pr, gh, ctx, gate, ownerApproved: values['owner-approved-head'] !== undefined }),
         ...queueHoldSeams({ gh, root, pr, getHold: () => null }),
       });
@@ -205,6 +206,7 @@ export const run = guarded(async (argv, ctx) => {
     // a final-gate run after the end never revives an older word (R1-F1). Otherwise a final-gate run that passed after the end is enough, or a fresh word.
     const wordRequired = (existing?.status === 'ok' && Boolean(existing.record.resumed)) || unchecked !== null || Number(gate.ownerMerge) > 0;
     const freshWord = () => approvalGapSince({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null, rulings: null }, pre.since) === 'ok';
+    approval.ownerRequired = wordRequired; // (stored on the queue record: the sweep re-queues it only while the word is still on record)
     const staleEnd = (liveItems) => pre?.since !== undefined && (wordRequired || liveItems ? !freshWord() : !freshWord() && !gateFreshSince(gate, pre.since));
     if (staleEnd(false)) return pre.staleTerminal();
     if (!ownerApproved) {
@@ -277,6 +279,7 @@ export const run = guarded(async (argv, ctx) => {
       return refuse('live-check', ['the live gate is for a different head or patch than final-gate.json approved']);
     }
     if (Number(fresh.ownerMerge) > 0 && !ownerApproved) return refuse('pre-merge', [withProblem(OWNER_MERGE_REASON)], { reason: withProblem(OWNER_MERGE_REASON) });
+    if (Number(fresh.ownerMerge) > 0) approval.ownerRequired = true;
     if (Number(fresh.ownerMerge) > 0 && staleEnd(true)) return pre.staleTerminal(); // (items for the owner the file did not show: the same fresh word is needed)
     // (an item added or swapped since the owner said "merge", same head: the owner never saw it)
     if (ownerApproved && fresh.ownerItems !== gate.ownerItems) {

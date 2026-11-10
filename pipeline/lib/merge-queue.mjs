@@ -186,12 +186,14 @@ export function recordIsFor(rec, { repo, repoId = null, moves } = {}) {
 // (a fresh owner "merge" is a fresh budget). Nothing is queued yet: `attempts` stays 0 until beginAttempt.
 // `route` ('owner-go' | 'gated') is the merge route that opened the record: the sweep re-checks a re-queue with that route's own recheck (#229).
 // A record without one (written before this field) is read as owner-go by the sweep, which fails closed.
+// `approval.ownerRequired`: the first enqueue stood on the owner's word (gated route: a resumed run, an unchecked run record, items for the owner); the sweep re-queues
+// such a record only while that word is still on record (R1-F2). The field is only written when true; a record without it (written before, or for an enqueue that needed no word) keeps the sweep's earlier behaviour.
 export function openRecord(root, pr, head, approval, { repo = null, repoId = null, now = Date.now, route = null } = {}) {
   const old = readQueueRecord(root, pr);
   if (old !== null && old.terminal === null && old.head === head) return old;
   return writeRecord(root, {
     pr: Number(pr), repo, repoId, root, head,
-    approval: { items: approval?.items ?? null, areas: approval?.areas ?? null, rulings: approval?.rulings ?? null },
+    approval: { items: approval?.items ?? null, areas: approval?.areas ?? null, rulings: approval?.rulings ?? null, ...(approval?.ownerRequired === true ? { ownerRequired: true } : {}) },
     route: ROUTES.has(route) ? route : null, createdAt: isoOf(now), attempts: 0, pending: null, entryIds: [], removals: [], hold: null, terminal: null, terminalAt: null,
   });
 }

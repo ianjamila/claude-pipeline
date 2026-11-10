@@ -95,6 +95,11 @@ export async function recheckGatedRecorded({ root, config, pr, gh, env, head, re
   const at = Date.parse(gate.at);
   if (!Number.isFinite(at) || now() - at > GATE_MAX_AGE_MS) return stop('the gate file is too old');
   const ownerApproved = typeof gate.ownerItems === 'string' && approvalGap({ repo, pr, head, items: gate.ownerItems, areas: null, hold: null, rulings: null }) === 'ok';
+  // The first enqueue stood on the owner's word even though the gate itself shows no owner items (a resumed run, an unchecked run record): the word must still be on record.
+  // (`ownerRequired` is absent on records written before the field, which keep the earlier behaviour: the word counts only where the live gate has owner items.)
+  if (rec?.approval?.ownerRequired === true && !ownerApproved) {
+    return { ok: false, error: 'pre-merge', reasons: ['the owner\'s "merge" for this head is no longer on record (it is valid for 24 hours; the enqueue stood on it): ask the owner again'] };
+  }
   return recheckGated({
     root, config, pr, gh, env, gate, ownerApproved, ...seams,
     ownerMergeReason: `the final gate left items for the owner (owner_approval: chat) and no "merge" for this head and item set is on record${rec?.approval?.items ? ` (items ${rec.approval.items})` : ''}: ask the owner again`,
