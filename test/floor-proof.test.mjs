@@ -214,7 +214,7 @@ test('judgeFloor: allowed lists only the ids that pass solely through the allowa
   assert.deepEqual([unreadable.allowed, unreadable.allowedSeen, unreadable.heldBelowMin], [[NEW_ID], [NEW_ID], null]);
   const atFloor = judge({ [NEWER]: 1, [FLOOR]: 1 });
   assert.equal(atFloor.ok, true, 'at or above the floor passes on its own');
-  assert.deepEqual([atFloor.allowed, atFloor.allowedSeen], [[], [NEWER]], 'it did not need the allowance, but it still never raises the floor');
+  assert.deepEqual([atFloor.allowed, atFloor.allowedSeen], [[], [NEWER]], 'it did not need the allowance: it is judged by its own version, which is what lets it raise the floor');
   const below = judge({ [OLD]: 1 });
   assert.equal(below.ok, false, 'the allowance does not cover an id the parser reads below the floor');
   assert.equal(below.error, 'stale-model');

@@ -9,7 +9,7 @@ import { isClean } from './git.mjs';
 import { run, codexCommand } from './proc.mjs';
 import { createGitHub } from './github.mjs';
 import { claudeCodeStatus } from './claude-code-version.mjs';
-import { MIN_FABLE, readFloor, standingBypasses } from './model-floor.mjs';
+import { MIN_FABLE, readFloor, readableAllowedIds, standingBypasses } from './model-floor.mjs';
 
 const CODEX_TIMEOUT_MS = 15_000;
 
@@ -143,11 +143,16 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
   // Informational like the build check: it never changes canMerge (an unreadable registry is for arbiter apply to report).
   try {
     const floor = readFloor({ env });
+    const readable = floor.ok ? readableAllowedIds(floor.registry) : [];
     for (const b of floor.ok ? standingBypasses(floor.registry) : []) {
+      // Only an id the parser cannot read is still bypassed by its allowance; a readable one is judged by version and is reported below.
+      const unreadable = b.kind === 'allow' ? b.ids.filter((id) => !readable.includes(id)) : [];
+      if (b.kind === 'allow' && unreadable.length === 0) continue;
       warnings.push(b.kind === 'allow'
-        ? `owner allowance in force: ${b.ids.join(', ')}; clear it with \`pipeline model-floor reset --clear-allow\` once the parser fix is installed`
+        ? `owner allowance in force: ${unreadable.join(', ')}; clear it with \`pipeline model-floor reset --clear-allow\` once the parser fix is installed`
         : `owner hold below ${MIN_FABLE} in force: ${b.hold}; clear it with \`pipeline model-floor reset --clear-hold\` once the model it holds back from is acceptable`);
     }
+    for (const id of readable) warnings.push(`allowance ${id} is readable now and no longer needed: clear it with \`pipeline model-floor reset --clear-allow\``);
   } catch { /* an unreadable folder: nothing to warn about here */ }
 
   const enforcementOk = declared === 'gate' || enforcement.mode === 'github';

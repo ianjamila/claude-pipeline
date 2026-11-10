@@ -509,8 +509,8 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
       errors.push(...judged.errors);
       if (judged.ok) {
         await floorPauseSeam(env);
-        // An id the owner allowed by name (possibly unparseable) never raises the floor.
-        const raisable = fableModelsOf(proof.models).filter((id) => parseModelId(id) !== null && !judged.allowedSeen.includes(id));
+        // An id the parser cannot read never raises the floor (an owner allowance does not change that); a readable one, allowed or not, is judged and may raise it.
+        const raisable = fableModelsOf(proof.models).filter((id) => parseModelId(id) !== null);
         const top = raisable.length === 0 ? null : raisable.reduce((a, b) => (compareVersions(parseModelId(b), parseModelId(a)) > 0 ? b : a));
         if (top !== null && compareVersions(parseModelId(top), parseModelId(judged.floor)) > 0 && mayRaiseFloor({ transcript: found.jsonlPath, projectsDirGiven: projectsDir !== undefined, env }).ok) {
           try {

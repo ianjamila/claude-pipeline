@@ -111,8 +111,10 @@ function floorOf(registry) {
 }
 
 // The Fable ids the owner allowed by exact name (reset --allow-id): accepted although the parser cannot read them (one it reads is judged by version
-// like any other). They never raise the floor.
+// like any other, and may raise the floor like any other). An allowance never raises the floor for an id the parser cannot read.
 export const allowedIds = (registry) => (Array.isArray(registry?.allow) ? registry.allow : []);
+// The allowed ids the parser can read now: their allowance does nothing any more (they are judged by version), so the owner should clear it.
+export const readableAllowedIds = (registry) => allowedIds(registry).filter((id) => parseModelId(id) !== null);
 
 // The version below which a recorded Fable proof is re-reviewed (staleness, supersession, fable-refresh): the registry's hold when it is set and
 // below MIN_FABLE (an owner rollback must let the older proofs it admits complete a review), else MIN_FABLE.
@@ -229,7 +231,7 @@ export async function withFloorLock({ waitMs = LOCK_WAIT_MS, pollMs = 100, ...op
     return await withLock(LOCK_NAME, () => fn({ dir }), { dir, waitMs, pollMs, machineId: readMachineId({ stateDir }) });
   } catch (err) {
     if (err instanceof LockTimeoutError) {
-      throw codeError('model-floor-busy', `another review is updating the model floor (waited ${waitMs} ms): ${err.message.replace(/ To clear it by hand.*$/, '')}. Run the review again in a minute; if it persists, the owner runs \`pipeline model-floor reset --clear-lock\``, { cause: err });
+      throw codeError('model-floor-busy', `another review is updating the model floor (waited ${waitMs} ms): ${err.message.replace(/ To clear it by hand.*$/, '')}. Run the review again in a minute; if it persists, the owner runs \`pipeline model-floor reset --clear-lock\` (add \`--allow-id\` or \`--clear-allow\` to it to keep the learned floor)`, { cause: err });
     }
     throw err;
   }
@@ -240,8 +242,9 @@ export async function withFloorLock({ waitMs = LOCK_WAIT_MS, pollMs = 100, ...op
 // folder (for a lock a live-looking process or another host left behind; a dead holder's lock is reclaimed by the lock itself).
 // `allowId` (Fable ids, exact names) adds to the registry's `allow` list (at most ALLOW_MAX): the review accepts those ids although the parser cannot
 // read them (an id the parser reads is judged by version like any other: the allowance never admits one below the floor); `clearAllow` empties it. An
-// existing readable list is kept otherwise. An allowance never raises the floor.
-// A call that carries ONLY allowId and/or clearAllow (no hold, clearHold or clearLock) is not a reset: it changes `allow` and keeps the learned floor
+// existing readable list is kept otherwise. An allowance never raises the floor for an id the parser cannot read.
+// A call that carries allowId and/or clearAllow and no hold or clearHold is not a reset (`clearLock` alongside is fine: it only removes a lock folder and
+// says nothing about wanting a reset; a bare clearLock stays a plain reset): it changes `allow` and keeps the learned floor
 // (newest, provenAt, claudeCode, transcript, history) and the hold, so allowing an unreadable id, and clearing it later, never forgets what proofs raised.
 // A corrupt registry has no floor worth keeping: that call throws model-floor-unreadable and the owner runs a plain reset first.
 // -> { floor, registry, file, clearedLock }.
@@ -252,7 +255,7 @@ export async function resetFloor({ hold, clearHold = false, allowId = [], clearA
   for (const id of allowId) {
     if (!isAllowableId(id)) throw codeError('model-floor-bad-allow', `cannot allow ${JSON.stringify(id)}: not a claude-fable-* model id (letters, digits, . _ - only)`);
   }
-  const allowOnly = (allowId.length > 0 || clearAllow) && (hold === undefined || hold === null) && !clearHold && !clearLock;
+  const allowOnly = (allowId.length > 0 || clearAllow) && (hold === undefined || hold === null) && !clearHold;
   const dir = ensureDir(opts);
   let clearedLock = false;
   if (clearLock) {

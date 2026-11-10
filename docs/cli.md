@@ -400,23 +400,23 @@ Default runs `merge.hold_command` for PR N; `lines` is the last 5 output lines. 
 show the Fable model floor; reset it (owner only, run in your own terminal): back to the shipped minimum, optionally holding it.
 
 ```
-pipeline model-floor show   -> {ok, floor, MIN_FABLE, registry, file, error?} : READ-ONLY, runs anywhere; exit 0, or 1 when the registry file is unreadable (reviews are blocked until a reset)
+pipeline model-floor show   -> {ok, floor, MIN_FABLE, registry, readableAllowed: [allowed ids the parser reads now: clear them with `reset --clear-allow`], file, error?} : READ-ONLY, runs anywhere; exit 0, or 1 when the registry file is unreadable (reviews are blocked until a reset)
 pipeline model-floor reset [--hold <fable model id> | --clear-hold] [--clear-lock]   -> {ok, floor, hold, file, clearedLock}
 pipeline model-floor reset [--allow-id <exact claude-fable-… id> ... | --clear-allow]   (also takes the options above; the output then carries allow: [ids] when any are set)
-  with ONLY --allow-id and/or --clear-allow it is not a reset: it changes the allow list and keeps the learned floor (newest, history) and the hold; a corrupt registry is refused
+  with --allow-id and/or --clear-allow (and no --hold / --clear-hold; --clear-lock alongside is fine) it is not a reset: it changes the allow list and keeps the learned floor (newest, history) and the hold; a corrupt registry is refused
   (exit 1 model-floor-unreadable): run a plain `model-floor reset` first.
   Owner only: refused inside Claude Code (exit 2 `refused`); run it in your own terminal (`node ~/.claude/pipeline/bin/pipeline.mjs model-floor reset`).
-  A plain reset (no --allow-id / --clear-allow, or together with --hold / --clear-hold / --clear-lock) rewrites the registry to the shipped minimum (a corrupt or unreadable registry is replaced); an existing hold and allowed ids are kept.
+  A plain reset (no --allow-id / --clear-allow, or together with --hold / --clear-hold; a bare --clear-lock too) rewrites the registry to the shipped minimum (a corrupt or unreadable registry is replaced); an existing hold and allowed ids are kept.
   --hold <id>   also caps the floor at that Fable id (a claude-fable-* id) until `model-floor reset --clear-hold`. Use it to roll back an alias
                 (the `fable` alias moved to a model you do not want) or when the two accounts resolve different Fables. It also lowers the version
                 below which a recorded Fable proof is re-reviewed, so a review proven with the held model can complete.
   --clear-hold  lift the cap (not with --hold)
-  --allow-id <id>  accept that exact claude-fable-* id although the parser cannot read it; repeatable, at most 10. It never raises the floor, and an id the parser reads that is below the floor is refused all the same.
+  --allow-id <id>  accept that exact claude-fable-* id although the parser cannot read it; repeatable, at most 10. An allowance never raises the floor for an id the parser cannot read, and an id the parser reads that is below the floor is refused all the same.
                 A claude-fable-* id the parser cannot read blocks reviews, including the PR that fixes the parser: run `model-floor reset --allow-id <the new id>` in your own
                 terminal, merge the parser fix, then `model-floor reset --clear-allow` (neither forgets the learned floor).
                 Until then `arbiter apply`, `model-proof`, `review-complete`, the final gate and `preflight` say the allowance is in force. (`--hold` does not unblock an unreadable id: it only caps the floor.)
   --clear-allow remove every allowed id (not with --allow-id)
-  --clear-lock  first remove a floor lock left behind by a process that is still alive or on another host (a dead holder's lock clears itself)
+  --clear-lock  first remove a floor lock left behind by a process that is still alive or on another host (a dead holder's lock clears itself); add --allow-id / --clear-allow to keep the learned floor
 ```
 
 Exit: 0 ok · 1 the registry is unreadable (`show`) or could not be written / is locked (`reset`) · 2 usage, or `reset` refused inside Claude Code.
@@ -444,7 +444,7 @@ report whether the pipeline may merge (config, gh, protection, pause, Codex).
 
 ```
 pipeline preflight [--repo DIR]   (exit 0 can merge, 1 cannot, 2 config missing/invalid)
-  warnings (informational, never change canMerge): a stale terminal; an owner allowance (model-floor reset --allow-id) or a hold below MIN_FABLE still in force in the model floor registry
+  warnings (informational, never change canMerge): a stale terminal; an owner allowance (model-floor reset --allow-id) or a hold below MIN_FABLE still in force in the model floor registry; an allowed id the parser can read now (the allowance is no longer needed)
 ```
 
 Exit: 0 pipeline may merge · 1 it may not (`reasons`) · 2 config missing or invalid.

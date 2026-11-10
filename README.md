@@ -136,9 +136,9 @@ only a fully proven pass (`arbiter apply`) raises it, and it starts at the pipel
   (your own terminal only) returns the floor to the code constant. `--hold <id>` also sets a ceiling the floor cannot rise above, for an alias
   rollback or for two accounts that resolve different Fables, until `--clear-hold`; it also lowers the version below which a recorded Fable proof is
   re-reviewed, so a review proven with the held model can complete. A Fable id the parser cannot read blocks reviews, including the PR that fixes the
-  parser (a hold does not help): run `model-floor reset --allow-id <the exact new id>` from a plain terminal (repeatable, at most 10; it never raises the
-  floor), merge the parser fix, then `model-floor reset --clear-allow`. Those two calls change only the allow list: the learned floor and any hold are kept
-  (a corrupt registry is refused; run a plain `model-floor reset` first), and an allowed id the parser can read is still refused when it is below the floor.
+  parser (a hold does not help): run `model-floor reset --allow-id <the exact new id>` from a plain terminal (repeatable, at most 10; an allowance never raises the
+  floor for an id the parser cannot read), merge the parser fix, then `model-floor reset --clear-allow`. Those two calls (with or without `--clear-lock`) change only the allow list: the learned floor and any hold are kept
+  (a corrupt registry is refused; run a plain `model-floor reset` first), and an allowed id the parser can read is judged by its version like any other (refused below the floor, able to raise it); once the parser reads an allowed id, `model-floor show` lists it under `readableAllowed` and `preflight` warns that the allowance is no longer needed.
   While an allowance or a hold below the shipped minimum is what lets a proof count, `arbiter apply` and `model-proof` print `floor: {newest, allowed, heldBelowMin}`,
   `review-complete` and the final gate's review check name the round, and `pipeline preflight` warns until you clear it. Every floor failure of `arbiter apply` carries an `advice` line saying which of these to do.
 - **Cost reports** price each call per model version, so a Fable bump does not reprice earlier PRs.

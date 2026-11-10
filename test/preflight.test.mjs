@@ -349,6 +349,26 @@ test('an owner allowance or a hold below MIN_FABLE adds a warning; clearing it r
   assert.deepEqual((await check()).warnings, []);
 });
 
+test('R3-F2: an allowance the parser can read now gets its own "no longer needed" warning, and is not listed as in force; canMerge never changes', async () => {
+  const repo = repoWith('github');
+  const dir = scratchFloorDir();
+  const check = async () => runPreflight({ cwd: repo.dir, env: world([], { env: floorEnv(dir) }).env });
+  const baseline = await check();
+  await resetFloor({ dir, allowId: ['claude-fable-5-3'] });
+  const readable = await check();
+  assert.deepEqual(readable.warnings, ['allowance claude-fable-5-3 is readable now and no longer needed: clear it with `pipeline model-floor reset --clear-allow`']);
+  assert.equal(readable.canMerge, baseline.canMerge);
+  assert.deepEqual(readable.reasons, baseline.reasons);
+  await resetFloor({ dir, allowId: ['claude-fable-6-preview'] });
+  const mixed = await check();
+  assert.deepEqual(mixed.warnings, [
+    'owner allowance in force: claude-fable-6-preview; clear it with `pipeline model-floor reset --clear-allow` once the parser fix is installed',
+    'allowance claude-fable-5-3 is readable now and no longer needed: clear it with `pipeline model-floor reset --clear-allow`',
+  ]);
+  await resetFloor({ dir, clearAllow: true });
+  assert.deepEqual((await check()).warnings, []);
+});
+
 test('a bypass warning never turns a blocked world into a mergeable one, and an unreadable registry adds none', async () => {
   const repo = repoWith('github');
   const dir = scratchFloorDir();

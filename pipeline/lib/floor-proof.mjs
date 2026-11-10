@@ -49,8 +49,8 @@ const fableOrder = (a, b) => compareVersions(parseModelId(a) ?? { major: 0, mino
 // Judge the Fable models of a proof against the floor (read-only).
 //   -> { applies: false }                                     no Fable on any line: the floor does not apply
 //   -> { applies: true, ok, floor, seen, older, errors[], error, restartRequired, advice, floorOpts, allowed, allowedSeen, heldBelowMin }
-// `allowed` = the seen ids that pass ONLY because the owner allowed them (the parser cannot read them); `allowedSeen` = every seen id on the allow list (none of
-// them raises the floor); `heldBelowMin` = the owner's hold when a seen id is below MIN_FABLE and passes only because the hold lowered the floor, else null.
+// `allowed` = the seen ids that pass ONLY because the owner allowed them (the parser cannot read them); `allowedSeen` = every seen id on the allow list (readable or not;
+// only a readable one can raise the floor, like any other); `heldBelowMin` = the owner's hold when a seen id is below MIN_FABLE and passes only because the hold lowered the floor, else null.
 // `error` is the machine-readable code of the first failure: 'stale-model' | 'unrecognised-fable' | 'model-floor-unreadable'; every failure carries
 // `advice`. Fails closed on an unreadable registry and on a claude-fable-* id the parser cannot read unless the owner allowed that exact id.
 export function judgeFloor({ models, claudeCodeVersions = [], env, floorOpts = {}, deps } = {}) {

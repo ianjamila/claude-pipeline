@@ -379,12 +379,21 @@ test('arbiter apply: an unparseable claude-fable-* id is refused, then proves on
   const proven = apply(w, [], own);
   assertExit(proven, 0, proven.stdout + proven.stderr);
   assert.equal(w.state().rounds[0].arbiter.proofOk, true);
-  assert.equal(w.registry().floor, OLD, 'an allowed id, even from the account\'s own folder, never raises the floor');
+  assert.equal(w.registry().floor, OLD, 'an unreadable allowed id, even from the account\'s own folder, never raises the floor');
   assert.deepEqual(w.registry().registry.allow, [NEW_ID]);
   await resetFloor({ dir: w.floor, clearAllow: true });
   const again = apply(w, ['--projects-dir', projects], { PIPELINE_TEST_MODE: '1' });
   assertExit(again, 1, again.stdout);
   assert.equal(again.json.error, 'unrecognised-fable');
+});
+
+test('R3-F2: a readable allowed id is judged by its version and raises the floor like any other id (an allowance never blocks the learning)', async (t) => {
+  const w = world(t).prepare();
+  await resetFloor({ dir: w.floor, allowId: [NEWER] });
+  const proven = apply(w, [], w.installOwn({ models: [NEWER] }));
+  assertExit(proven, 0, proven.stdout + proven.stderr);
+  assert.equal(w.registry().floor, NEWER, 'the readable allowed id raised the floor');
+  assert.deepEqual(w.registry().registry.allow, [NEWER], 'the allowance itself is left for the owner to clear');
 });
 
 // ---- retry and advice ----------------------------------------------------------------------------------------------------------------
