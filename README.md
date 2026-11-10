@@ -119,6 +119,25 @@ Two things tell you where an install stands:
   `pipeline vendor --check` warns that a vendored `VERSION` carrying one does not prove which commit its files came from.
 - **`pipeline update --check`** compares your install with upstream `main` on demand, with exit codes (see above).
 
+### The Fable floor
+
+The whole-PR review pass runs on Fable, and a proof from an older Fable is refused once a newer one has been proven on your machine.
+That lowest accepted version is the **floor**. It is stored in `~/.claude/pipeline-state/owner-go/model-floor/fable.json`, where agents cannot write:
+only a fully proven pass (`arbiter apply`) raises it, and it starts at the pipeline's `MIN_FABLE` constant. Bumping `MIN_FABLE` is a normal pipeline PR.
+
+- **A stale terminal stops, it does not park.** If the terminal's Claude Code build is older than the installed one, `arbiter needed` exits 1
+  `stale-terminal` before any Fable spend; if the pass ran on an older Fable than the floor, `arbiter apply` exits 1 `stale-model`. Both carry
+  `restartRequired` and an `advice` line. The agent stops (outcome `blocked`, no label), posts the advice and asks you to restart the
+  terminal (or update Claude Code). `pipeline preflight` shows a `claudeCode` warning up front; it never changes whether a PR can merge.
+- **Old proofs are re-reviewed, not grandfathered.** `review-complete` and the final gate refuse a PR whose Fable round was proven below the
+  newest Fable (the reason says `fable-refresh`); the agent runs `pipeline state fable-refresh --pr N`, which opens one uncounted Fable-only
+  round on the pushed head (no Codex, not counted against `review.max_rounds`) that reviews the whole PR diff.
+- **Owner commands.** `pipeline model-floor show` prints the floor, any hold and any lock. `pipeline model-floor reset [--hold <id> | --clear-hold] [--clear-lock]`
+  (your own terminal only) returns the floor to the code constant. `--hold <id>` also sets a ceiling the floor cannot rise above, for an alias
+  rollback or for two accounts that resolve different Fables, until `--clear-hold`. A Fable id the parser cannot read blocks reviews, including the PR
+  that fixes the parser: run `model-floor reset --hold <last good id>` from a plain terminal, then merge the parser fix.
+- **Cost reports** price each call per model version, so a Fable bump does not reprice earlier PRs.
+
 ## Using it
 
 Onboard a repo once, then just ask for work:
