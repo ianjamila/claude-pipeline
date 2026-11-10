@@ -1427,6 +1427,40 @@ test('R13-B1: with no job, an unread shortcut source and a non-built-in command 
   ]) assert.equal(decide(c, root).decision, 'allow', c);
 });
 
+// R14-F1: the `git config` twin of `-c $K=push p`: a write whose key is built from a variable may define any alias, and the alias block does not read it
+test('R14-F1: with no job, a git config write with a variable-built alias key plus a non-built-in command is refused', () => {
+  const root = fakeRepo();
+  const UNREAD = /defined here in a way the guard does not read.*"p" is not a built-in git command/s;
+  for (const c of [
+    'git config alias.$N push && git p origin main',
+    'K=alias.p; git config $K push && git p origin main',
+    'git config --add alias.$N push && git p origin main',
+    'git config set alias.$N push && git p origin main',
+    'if true; then git config alias.$N push; fi; git p origin main',
+    '(git config alias.$N push); git p origin main',
+    'git config alias.`echo p` push && git p origin main',
+  ]) {
+    const v = decide(c, root);
+    assert.equal(v.decision, 'deny', c);
+    assert.match(v.reason, UNREAD, c);
+  }
+  for (const c of [
+    'git config alias.$N push && git status',
+    'git config user.name $USER && git commit -m x',
+    'git config alias.st status && git st',
+  ]) assert.equal(decide(c, root).decision, 'allow', c);
+});
+
+test('R14-F1: with a job running, a variable-built alias key written by git config makes even a built-in git command refused', () => {
+  const root = fakeRepo();
+  mark(root, process.pid, 12);
+  for (const c of ['git config alias.$N push && git status', 'K=alias.p; git config $K push && git status']) {
+    const v = decide(c, root);
+    assert.equal(v.decision, 'deny', c);
+    assert.match(v.reason, /merge job is running.*git shortcuts/s, c);
+  }
+});
+
 // what was already there before the job rule, and two stricter fixes the alias block keeps (no job anywhere)
 test('alias expansion for the push guard is unchanged with no job: an alias that runs a push is still a push', () => {
   const root = fakeRepo();

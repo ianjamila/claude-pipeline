@@ -165,7 +165,7 @@ function expandVars(text, ctx) {
 
 // Everything a script judged here can depend on: the directory, the nesting level and the line's variable / branch / config / alias state.
 // (and the writes of the line that count for the command: a script the line wrote is judged on what was written)
-const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.cfgDirty, ctx.envCfgDirty, ctx.ghRepoDirty === true, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure], writeSignature(ctx.writeFrames)]);
+const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.cfgDirty, ctx.envCfgDirty, ctx.ghRepoDirty === true, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure], ctx.unreadAlias === true, writeSignature(ctx.writeFrames)]);
 
 // What the policy's own tracking knows about variable `n` for a use the command's prefix does not override: its value, and
 // `$n` when it is unsure or tainted (the callers read that as "run-time value").
@@ -902,6 +902,8 @@ function trackConfig(args, ctx) {
   if (['set', 'unset'].includes(positionals[0])) { writes = true; positionals = positionals.slice(1); }
   const key = String(positionals[0] ?? '').toLowerCase();
   if (key.startsWith('alias.') && positionals.length >= 2) ctx.gitAliases[key.slice('alias.'.length)] = positionals[1];
+  // R14-F1: a write whose key is built from a variable (`alias.$N`, `$K`) may define any alias, and the alias block cannot read which
+  if (writes && DYNAMIC.test(key) && (key.startsWith('alias.') || /^[$`]/.test(key))) ctx.unreadAlias = true;
   if (writes && RISKY_CONFIG(key, String(positionals[1] ?? ''))) ctx.cfgDirty = true;
   // (see directMergeVerdict; security review of de62b36: url.<base>.insteadOf rewrites a remote's URL, include / includeIf pull in other config)
   if (writes && (DYNAMIC.test(key) || key === '' || /^(?:remote|url|include|includeif|core)\./.test(key))) ctx.ghRepoDirty = true;
@@ -1121,13 +1123,13 @@ function runningMergeJob(g, ctx) {
 // from a variable, an environment config source that may define an alias (GIT_CONFIG_KEY_n / GIT_CONFIG_PARAMETERS), or an alias `git config` wrote earlier
 // on the line; or (b) runs a subcommand git does not compile in (exact case; it may be an alias from the user's own ~/.gitconfig).
 function shortcutVerdict(sub, args, g, ctx) {
-  const defined = g.shortcut || Object.keys(ctx.gitAliases).length > 0 || [...ctx.aliasUnsure].some((k) => k.startsWith('git:'));
+  const defined = g.shortcut || ctx.unreadAlias === true || Object.keys(ctx.gitAliases).length > 0 || [...ctx.aliasUnsure].some((k) => k.startsWith('git:'));
   const notBuiltin = !GIT_COMPILED_BUILTINS.has(sub);
   if (!defined && !notBuiltin) return null;
   const job = runningMergeJob(g, ctx);
   if (!job) {
     // R13-B1: no job, but a shortcut source the alias block does not read plus a command git does not compile in: what runs cannot be checked
-    if (notBuiltin && g.unreadShortcut) return deny(`a git shortcut is defined here in a way the guard does not read (environment config, --config-env, or a setting name built from a variable), and "${sub}" is not a built-in git command, so what it runs cannot be checked. Write the built-in command out.`);
+    if (notBuiltin && (g.unreadShortcut || ctx.unreadAlias === true)) return deny(`a git shortcut is defined here in a way the guard does not read (environment config, --config-env, or a setting name built from a variable), and "${sub}" is not a built-in git command, so what it runs cannot be checked. Write the built-in command out.`);
     return null;
   }
   // (a verb the job refuses anyway in its own checkout keeps that message: `git reset --hard`, `git bisect`)
@@ -2356,7 +2358,7 @@ function lineState(ctx) {
   return {
     vars: Object.assign(Object.create(null), ctx.vars), unsureVars: new Set(ctx.unsureVars), tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
     gitAliases: Object.assign(Object.create(null), ctx.gitAliases), ghAliases: Object.assign(Object.create(null), ctx.ghAliases),
-    branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), cfgDirty: ctx.cfgDirty, envCfgDirty: ctx.envCfgDirty,
+    branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), cfgDirty: ctx.cfgDirty, envCfgDirty: ctx.envCfgDirty, unreadAlias: ctx.unreadAlias === true,
   };
 }
 function restoreLineState(ctx, saved) {
@@ -2366,12 +2368,13 @@ function restoreLineState(ctx, saved) {
   for (const [d, e] of saved.branches) ctx.branches.set(d, { ...e });
   ctx.cfgDirty = saved.cfgDirty;
   ctx.envCfgDirty = saved.envCfgDirty;
+  ctx.unreadAlias = saved.unreadAlias;
 }
 function isolatedState(ctx, fn) {
   const saved = {
     vars: Object.assign(Object.create(null), ctx.vars), unsureVars: new Set(ctx.unsureVars), tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
     gitAliases: Object.assign(Object.create(null), ctx.gitAliases), ghAliases: Object.assign(Object.create(null), ctx.ghAliases),
-    branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), cfgDirty: ctx.cfgDirty, envCfgDirty: ctx.envCfgDirty,
+    branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), cfgDirty: ctx.cfgDirty, envCfgDirty: ctx.envCfgDirty, unreadAlias: ctx.unreadAlias === true,
   };
   try {
     return fn();
@@ -2382,6 +2385,7 @@ function isolatedState(ctx, fn) {
     for (const [d, e] of saved.branches) ctx.branches.set(d, e);
     ctx.cfgDirty = saved.cfgDirty;
     ctx.envCfgDirty = saved.envCfgDirty;
+    ctx.unreadAlias = saved.unreadAlias;
   }
 }
 
@@ -2530,6 +2534,7 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
     for (const [d, e] of r.branches) if (ctx.branches.get(d) !== e) ctx.branches.set(d, e);
     if (r.cfgDirty) ctx.cfgDirty = true;
     if (r.ghRepoDirty) ctx.ghRepoDirty = true;
+    if (r.unreadAlias) ctx.unreadAlias = true;
     Object.assign(ctx.gitAliases, r.git);
     Object.assign(ctx.ghAliases, r.gh);
     for (const n of r.unsure) ctx.aliasUnsure.add(n);
@@ -2540,13 +2545,13 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
   const known = memo.get(key);
   if (known && (!known.sens || known.flag === flag)) return carry(known);
   const seen0 = ctx.budget.unmodelledSeen ?? 0;
-  const pending = { verdict: null, branches: new Map(), cfgDirty: false, git: {}, gh: {}, unsure: [], sens: false, flag };
+  const pending = { verdict: null, branches: new Map(), cfgDirty: false, unreadAlias: false, git: {}, gh: {}, unsure: [], sens: false, flag };
   memo.set(key, pending); // marked first: a startup file that starts shells itself finds this entry, not itself again
   const text = ctx.readText(path.resolve(ctx.home, st.file.replace(/^~\/?/, '')));
   fresh.fullText = typeof text === 'string' ? text : '';
   const v = checkScriptFile(rec, dir, fresh, 0);
   const done = {
-    verdict: v, branches: new Map(fresh.branches), cfgDirty: fresh.cfgDirty, ghRepoDirty: fresh.ghRepoDirty === true, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure],
+    verdict: v, branches: new Map(fresh.branches), cfgDirty: fresh.cfgDirty, ghRepoDirty: fresh.ghRepoDirty === true, unreadAlias: fresh.unreadAlias === true, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure],
     sens: (ctx.budget.unmodelledSeen ?? 0) !== seen0, flag,
   };
   memo.set(key, done);
@@ -3614,7 +3619,7 @@ function evaluateGitOnce(command, {
   const base = cwd || process.cwd();
   const ctx = {
     cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, mergeJobOf, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
-    vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
+    vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null), unreadAlias: false,
     branches: new Map(), cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };
   if (bashState) bashState.budget = ctx.budget;
