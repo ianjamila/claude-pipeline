@@ -15,6 +15,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { holdFiles, holdYml, holdCalls } from './helpers/merge-hold-env.mjs';
 import { beginAttempt, confirmAttempt, endRecord, noteRemoval, readQueueRecord } from '../pipeline/lib/merge-queue.mjs';
 import { preMergeProblems } from '../pipeline/lib/finalgate.mjs';
+import { gateFreshSince } from '../pipeline/lib/queue-route.mjs';
 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-queue.mjs');
 const QUEUE_COMMIT = 'b'.repeat(40);
@@ -392,4 +393,53 @@ test('preMergeProblems: queueMode ignores a moved base, a moved head still refus
   const direct = await preMergeProblems({ gh: gh(HEAD, BASE_SHA), pr: PR, head: HEAD, base: '2'.repeat(40) });
   assert.equal(direct.length, 1);
   assert.match(direct[0], /PR base is now/);
+});
+
+// ---- #228: the gated route's fresh decision after a terminal record ------------------------------------------------------------------
+
+// A record for the current head that ended at `terminalAtMs` after two group-check removals.
+const endedRecord = (s, terminalAtMs) => {
+  const approval = { items: 'none', areas: [], rulings: null };
+  beginAttempt(s.repo.dir, PR, s.head, approval, { repo: 'acme/widgets', repoId: 4242, now: () => terminalAtMs - 5000, route: 'gated' });
+  noteRemoval(s.repo.dir, PR, { reason: 'failed_checks', beforeCommit: QUEUE_COMMIT, at: STAMP });
+  noteRemoval(s.repo.dir, PR, { reason: 'failed_checks', beforeCommit: QUEUE_COMMIT_2, at: STAMP });
+  endRecord(s.repo.dir, PR, 'removed', { now: () => terminalAtMs });
+};
+
+test('gated route, record for head H ended: a final-gate run that passed BEFORE it ended is refused; one that passed AFTER re-queues H with a new budget (#228)', () => {
+  const stale = world({ after: [[Q(), M()]] });
+  endedRecord(stale, Date.now() + 3_600_000); // the record ended AFTER the gate on file was written
+  const refused = stale.run();
+  assertExit(refused, 1);
+  assert.equal(refused.json.error, 'queue-removed');
+  assert.match(refused.json.reasons[0], /run `P final-gate` again/);
+  assert.equal(refused.json.recordTerminal, 'removed');
+  assert.equal(stale.enqueueCalls().length, 0);
+  assert.equal(stale.record().terminal, 'removed');
+
+  const fresh = world({ after: [[Q(), M()]] });
+  endedRecord(fresh, Date.now() - 60_000); // the gate on file was written after the record ended
+  const r = fresh.run();
+  assertExit(r, 0);
+  assert.equal(r.json.merged, true);
+  assert.equal(fresh.enqueueCalls().length, 1);
+  const rec = fresh.record();
+  assert.equal(rec.attempts, 1, 'a new record with a new budget');
+  assert.equal(rec.removals.length, 0);
+  assert.equal(rec.route, 'gated');
+  assert.equal(rec.terminal, 'merged');
+});
+
+test('gateFreshSince: a passing gate with no owner items, written after the record ended, is a fresh decision; anything else is not (#228)', () => {
+  const since = Date.parse('2026-11-09T10:00:00Z');
+  const gate = (over = {}) => ({ ok: true, ownerMerge: 0, at: '2026-11-09T10:00:01Z', ...over });
+  assert.equal(gateFreshSince(gate(), since), true);
+  assert.equal(gateFreshSince(gate({ ownerMerge: undefined }), since), true);
+  assert.equal(gateFreshSince(gate({ at: '2026-11-09T10:00:00Z' }), since), false, 'not newer than the end');
+  assert.equal(gateFreshSince(gate({ at: '2026-11-09T09:00:00Z' }), since), false);
+  assert.equal(gateFreshSince(gate({ at: 'not a time' }), since), false);
+  assert.equal(gateFreshSince(gate({ ok: false }), since), false);
+  assert.equal(gateFreshSince(gate({ ownerMerge: 2 }), since), false, 'items for the owner need the owner\'s fresh word, not a gate run');
+  assert.equal(gateFreshSince(gate(), Infinity), false, 'an end time that cannot be read never lets a gate through');
+  assert.equal(gateFreshSince(null, since), false);
 });

@@ -26,7 +26,7 @@ import {
 } from '../lib/finalgate.mjs';
 import { classifyMergeCommand, commandTail } from '../lib/merge-cleanup.mjs';
 import { QueueUnreadable, clearSessionHold, endRecord, holdOnSignal, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
-import { approvalGapSince, createQueueRoute, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
+import { approvalGapSince, createQueueRoute, gateFreshSince, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
 import { bestEffortSweep } from '../lib/queue-sweep.mjs';
 import { checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal, recordSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
 
@@ -168,7 +168,9 @@ export const run = guarded(async (argv, ctx) => {
       });
       pre = await route.precheck();
       if (pre.done) return pre.done;
-      if (pre.since !== undefined && approvalGapSince({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null, rulings: null }, pre.since) !== 'ok') return pre.staleTerminal();
+      // (the record of this head already ended: the same head re-queues only on a fresh decision newer than that end: the owner's word, or, where the gate left
+      // no items for the owner, a final-gate run that passed after it. Either starts a new record with a new one-retry budget.)
+      if (pre.since !== undefined && approvalGapSince({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null, rulings: null }, pre.since) !== 'ok' && !gateFreshSince(gate, pre.since)) return pre.staleTerminal();
       if (pre.watch) return watchOnly({ route, gh, pr, head: gate.head });
     }
 

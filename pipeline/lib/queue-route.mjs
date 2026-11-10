@@ -44,6 +44,16 @@ export function approvalGapSince(q, since, gap = approvalGap) {
   return gap({ ...q, maxAgeMs: age });
 }
 
+// The gated route's fresh decision after a record of the same head ended (#228, mirroring approvalGapSince for the owner-go route): the gate file
+// (rewritten by every `P final-gate` run: the old file is removed first and the new one carries its own `at`) is a passing gate written after the
+// record ended, and it left no items for the owner. Items for the owner need the owner's fresh word instead (approvalGapSince). The caller has
+// already checked the gate against the PR, head, patch and age (gateRefusals); `since` is the record's end (Infinity when it cannot be read).
+export function gateFreshSince(gate, since) {
+  if (gate === null || typeof gate !== 'object' || gate.ok !== true || Number(gate.ownerMerge) > 0) return false;
+  const at = Date.parse(gate.at);
+  return Number.isFinite(at) && Number.isFinite(since) && at > since;
+}
+
 // Before a re-queue on the --owner-go route: the live scan again, the owner's approval for what it found, and the blockers. Shared by `P merge` (its own watch)
 // and the queue sweep (an unattended re-queue), so both judge a re-queue exactly as the first enqueue was judged. `hold` = the lifted hold binding the record owns.
 export async function recheckOwnerGo({ root, config, pr, gh, env, head, repo, hold }) {
@@ -184,7 +194,9 @@ export function createQueueRoute({
       return {
         enqueue: true,
         since: Number.isFinite(since) ? since : Infinity,
-        staleTerminal: () => refusal('queue-removed', [`PR #${pr} at ${head.slice(0, 12)} already left the merge queue (${last?.reason ?? rec.terminal}) and its queue record ended: the owner must say "merge" again for this exact head (a fresh word re-queues it with a new one-retry budget)`], {
+        staleTerminal: () => refusal('queue-removed', [`PR #${pr} at ${head.slice(0, 12)} already left the merge queue (${last?.reason ?? rec.terminal}) and its queue record ended: ${route === 'gated'
+          ? 'run `P final-gate` again for this exact head (a gate that passes after the record ended re-queues it with a new one-retry budget; where the gate left items for the owner, the owner must say "merge" again)'
+          : 'the owner must say "merge" again for this exact head (a fresh word re-queues it with a new one-retry budget)'}`], {
           removal: last, recordTerminal: rec.terminal,
         }),
       };
