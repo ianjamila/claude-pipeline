@@ -974,7 +974,7 @@ for (const form of [{ keepFloor: true }, {}, { allowId: ['claude-fable-x-1'] }])
       return real(file, ...rest);
     });
     const r = mock.method(fs, 'renameSync', (from, to, ...rest) => {
-      if (String(from).includes('.stale-') && to === lockOf(dir)) throw Object.assign(new Error('EACCES: injected'), { code: 'EACCES' }); // the restore fails; nothing takes the path
+      if (String(from).includes('.stale-') && to === lockOf(dir)) throw Object.assign(new Error('EIO: injected'), { code: 'EIO' }); // the restore fails (a code outside BUSY_CODES, so restoreMoved does not retry-sleep); nothing takes the path
       return realRename(from, to, ...rest);
     });
     let caught;
@@ -992,5 +992,13 @@ for (const form of [{ keepFloor: true }, {}, { allowId: ['claude-fable-x-1'] }])
     assert.match(caught.message, /is free/);
     assert.match(caught.message, /run the same command again/i);
     assert.doesNotMatch(caught.message, /nothing else is needed/);
+    // R12-F2: --keep-floor ran everything it does (it keeps the floor), so it only confirms; every other form stopped before its rewrite and says so.
+    if (form.keepFloor) {
+      assert.match(caught.message, /changes nothing/);
+      assert.doesNotMatch(caught.message, /did not run/);
+    } else {
+      assert.match(caught.message, /did not run: run the same command again to apply it/);
+      assert.doesNotMatch(caught.message, /changes nothing/);
+    }
   });
 }
