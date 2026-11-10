@@ -3788,7 +3788,8 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   const cloneCli = (args, env = {}) => {
     const r = spawnSync(process.execPath, [bin, ...args], {
       cwd: clone, encoding: 'utf8',
-      env: { ...process.env, ...w.fake.env, PIPELINE_LOCK_DIR: join(w.scratch, 'locks-clone'), ...env },
+      // (no AI_AGENT / CLAUDE_CODE_EXECPATH: a real terminal's versions must not stop this Fable round as stale)
+      env: { ...process.env, AI_AGENT: undefined, CLAUDE_CODE_EXECPATH: undefined, ...w.fake.env, PIPELINE_LOCK_DIR: join(w.scratch, 'locks-clone'), ...env },
     });
     let json = null;
     try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* the assertion on json will say so */ }

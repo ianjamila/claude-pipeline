@@ -14,7 +14,7 @@ import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { scratchFloorDir } from './helpers/floor-env.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { withFloorLock } from '../pipeline/lib/model-floor.mjs';
-import { roundOutcome } from '../pipeline/lib/triage.mjs';
+import { arbiterFailures, roundOutcome } from '../pipeline/lib/triage.mjs';
 import { triageComment } from '../pipeline/lib/render.mjs';
 
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id';
@@ -316,11 +316,11 @@ test('roundOutcome: a Fable round with an arbiter failure and no proof is not cl
   const stopped = roundOutcome(fableState({ failure }));
   assert.equal(stopped.clean, false);
   assert.deepEqual(stopped.fablePending, [1]);
-  assert.deepEqual(stopped.arbiterFailures, [{ round: 1, cause: 'stale-terminal', advice: 'restart' }]);
+  assert.deepEqual(arbiterFailures(fableState({ failure })), [{ round: 1, cause: 'stale-terminal', advice: 'restart' }]);
   const proven = roundOutcome(fableState({ proofOk: true }));
   assert.equal(proven.clean, true);
-  assert.deepEqual(proven.arbiterFailures, []);
-  assert.deepEqual(roundOutcome({ rounds: [] }).arbiterFailures, []);
+  assert.deepEqual(arbiterFailures(fableState({ proofOk: true, failure })), [], 'a proof ends the failure');
+  assert.deepEqual(arbiterFailures({ rounds: [] }), []);
 });
 
 test('the triage comment says, in one line, that a round\'s arbiter stopped and why; nothing when there is no failure or it was proven', () => {

@@ -661,7 +661,6 @@ export function roundOutcome(state, { grants, head } = {}) {
   const grantedRound = open ? { k: reviewed + 1, grantId: open.grantId, head: open.head, quote: typeof open.quote === 'string' ? open.quote : null } : null;
   return {
     clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, extraRound, effectiveMaxRounds, coverageValid, fablePending,
-    arbiterFailures: arbiterFailures(state),
     grantedRound, autoExtraOrdinal: autoOrd,
   };
 }
