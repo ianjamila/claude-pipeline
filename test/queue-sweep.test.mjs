@@ -499,3 +499,27 @@ test('R2-F2: the sweep\'s gated recheck lets a failed PR read propagate instead 
     /HTTP 502/,
   );
 });
+
+// R3-F3: the throw must leave the record LIVE (not ended, no hold restored, no label, no notice) so the next sweep retries it; wrapping the re-queue in a catch would spend the owner's word on a blip.
+test('R3-F3: a gated recheck that throws leaves the record live and unspent (outcome error); the next sweep with a passing recheck re-queues', async () => {
+  const root = repoDir();
+  const w = world();
+  openRecord(root, 7, HEAD, APPROVAL, { ...IDENT, route: 'gated' });
+  setHold(root, 7, HOLD);
+  beginAttempt(root, 7, HEAD, APPROVAL, IDENT);
+  confirmAttempt(root, 7, 'MQE_1');
+  const events = [[addedAt(), removedAt('failed_checks')]];
+
+  const blip = stub({ states: [st()], events });
+  const first = await sweep(root, w, blip, { recheckGatedFn: async () => { throw new Error('gh: Server Error (HTTP 502)'); } });
+  assert.deepEqual(first.settled.map((s) => s.outcome), ['error']);
+  assert.equal(readQueueRecord(root, 7).terminal, null, 'the record is still live');
+  assert.deepEqual(blip.calls, [], 'no enqueue, no label');
+  assert.deepEqual(w.said, [], 'no notice');
+
+  const ok = stub({ states: [st(), inQ(1)], events });
+  const second = await sweep(root, w, ok, { recheckGatedFn: async () => ({ ok: true }) });
+  assert.deepEqual(second.settled.map((s) => s.outcome), ['requeued']);
+  assert.deepEqual(ok.calls, [`enqueue 7 ${HEAD.slice(0, 8)}`]);
+  assert.equal(readQueueRecord(root, 7).terminal, null);
+});
