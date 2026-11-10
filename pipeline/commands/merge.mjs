@@ -164,7 +164,8 @@ export const run = guarded(async (argv, ctx) => {
       route = createQueueRoute({
         gh, root, config, pr, head: gate.head, route: 'gated', env: ctx.env ?? process.env, refuse, track,
         approval,
-        recheck: () => queueRecheckGated({ root, config, pr, gh, ctx, gate, ownerApproved: values['owner-approved-head'] !== undefined }),
+        // (a watch-only resume returns before the run record is read: the live record says whether the enqueue stood on the owner's word, and then the word must still be on record, as for the sweep: R2-F1)
+        recheck: () => queueRecheckGated({ root, config, pr, gh, ctx, gate, ownerApproved: values['owner-approved-head'] !== undefined || readQueueRecord(root, pr)?.approval?.ownerRequired === true }),
         ...queueHoldSeams({ gh, root, pr, getHold: () => null }),
       });
       pre = await route.precheck();

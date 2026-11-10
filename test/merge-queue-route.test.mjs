@@ -510,3 +510,22 @@ test('gated route, ordinary run: the record says the owner\'s word was not requi
   assertExit(s.run(), 0);
   assert.notEqual(s.record().approval.ownerRequired, true);
 });
+
+// ---- review round 2 ---------------------------------------------------------------------------------------------------------------------
+
+// R2-F1: a watch-only resume (`P merge` again, no approval flags, while the entry is queued) re-checks a group-check removal with the same rule as the sweep:
+// a record whose enqueue stood on the owner's word is re-queued only while that word is on record.
+test('R2-F1: a watch-only resume of a record that stood on the owner\'s word does not re-queue when that word is not on record', () => {
+  const first = [added(), removed('failed_checks')];
+  const s = world({ after: [[Q(), Q(), Q(), OUT(first)], [Q(1, [...first, added()]), M()]] });
+  const approval = { items: 'none', areas: [], rulings: null, ownerRequired: true };
+  beginAttempt(s.repo.dir, PR, s.head, approval, { repo: 'acme/widgets', repoId: 4242, route: 'gated' });
+  confirmAttempt(s.repo.dir, PR, 'MQE_1');
+  s.q.set({ phase: 1 }); // the entry is already queued and leaves in the watch
+  const r = s.run(); // (no --owner-approved-head: nothing proves the word)
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'queue-removed');
+  assert.match(r.json.reasons.join(' '), /not re-queued: .*no longer on record/);
+  assert.equal(s.enqueueCalls().length, 0, 'no second enqueue');
+  assert.equal(s.record().terminal, 'removed');
+});
