@@ -331,7 +331,7 @@ test('an owner allowance or a hold below MIN_FABLE adds a warning; clearing it r
 
   await resetFloor({ dir, allowId: ['claude-fable-6-preview', 'claude-fable-6-b'] });
   const allowed = await check();
-  assert.deepEqual(allowed.warnings, ['owner allowance in force: claude-fable-6-preview, claude-fable-6-b; clear it with `pipeline model-floor reset --clear-allow` once the parser fix is installed']);
+  assert.deepEqual(allowed.warnings, ['owner allowance in force: claude-fable-6-preview, claude-fable-6-b; once the parser fix is installed, remove it with `pipeline model-floor reset --remove-allow claude-fable-6-preview --remove-allow claude-fable-6-b`']);
   assert.equal(allowed.canMerge, baseline.canMerge);
   assert.deepEqual(allowed.reasons, baseline.reasons);
 
@@ -356,15 +356,16 @@ test('R3-F2: an allowance the parser can read now gets its own "no longer needed
   const baseline = await check();
   await resetFloor({ dir, allowId: ['claude-fable-5-3'] });
   const readable = await check();
-  assert.deepEqual(readable.warnings, ['allowance claude-fable-5-3 is readable now and no longer needed: clear it with `pipeline model-floor reset --clear-allow`']);
+  assert.deepEqual(readable.warnings, ['allowance claude-fable-5-3 is readable now and no longer needed: remove it with `pipeline model-floor reset --remove-allow claude-fable-5-3`']);
   assert.equal(readable.canMerge, baseline.canMerge);
   assert.deepEqual(readable.reasons, baseline.reasons);
   await resetFloor({ dir, allowId: ['claude-fable-6-preview'] });
   const mixed = await check();
   assert.deepEqual(mixed.warnings, [
-    'owner allowance in force: claude-fable-6-preview; clear it with `pipeline model-floor reset --clear-allow` once the parser fix is installed',
-    'allowance claude-fable-5-3 is readable now and no longer needed: clear it with `pipeline model-floor reset --clear-allow`',
+    'owner allowance in force: claude-fable-6-preview; once the parser fix is installed, remove it with `pipeline model-floor reset --remove-allow claude-fable-6-preview`',
+    'allowance claude-fable-5-3 is readable now and no longer needed: remove it with `pipeline model-floor reset --remove-allow claude-fable-5-3`',
   ]);
+  for (const w of mixed.warnings) assert.doesNotMatch(w, /--clear-allow/, 'a warning never sends the owner to the all-or-nothing flag');
   await resetFloor({ dir, clearAllow: true });
   assert.deepEqual((await check()).warnings, []);
 });

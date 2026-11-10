@@ -530,7 +530,7 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
     // Fail closed, nothing published or saved: the retry proves again.
     if (err?.code === 'model-floor-busy' || err?.code === 'model-floor-unwritable') {
       const advice = err.code === 'model-floor-busy'
-        ? 'another review holds the machine-wide floor lock: run `arbiter apply` again in a minute; if it persists, the owner runs `pipeline model-floor reset --clear-lock` in a plain terminal'
+        ? 'another review holds the machine-wide floor lock: run `arbiter apply` again in a minute; if it persists, the owner runs `pipeline model-floor reset --clear-lock --keep-floor` in a plain terminal (it keeps the learned floor; a bare `--clear-lock` resets it to the shipped minimum)'
         : 'the owner runs `pipeline model-floor reset` in a plain terminal';
       saveState(root, withFailure(requireState(root), n, failureOf(err.code, advice)));
       throw new Fail(EXIT.FAILED, { ok: false, error: err.code, message: err.message, advice });

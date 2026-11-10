@@ -149,10 +149,10 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
       const unreadable = b.kind === 'allow' ? b.ids.filter((id) => !readable.includes(id)) : [];
       if (b.kind === 'allow' && unreadable.length === 0) continue;
       warnings.push(b.kind === 'allow'
-        ? `owner allowance in force: ${unreadable.join(', ')}; clear it with \`pipeline model-floor reset --clear-allow\` once the parser fix is installed`
+        ? `owner allowance in force: ${unreadable.join(', ')}; once the parser fix is installed, remove it with \`pipeline model-floor reset ${unreadable.map((id) => `--remove-allow ${id}`).join(' ')}\``
         : `owner hold below ${MIN_FABLE} in force: ${b.hold}; clear it with \`pipeline model-floor reset --clear-hold\` once the model it holds back from is acceptable`);
     }
-    for (const id of readable) warnings.push(`allowance ${id} is readable now and no longer needed: clear it with \`pipeline model-floor reset --clear-allow\``);
+    for (const id of readable) warnings.push(`allowance ${id} is readable now and no longer needed: remove it with \`pipeline model-floor reset --remove-allow ${id}\``);
   } catch { /* an unreadable folder: nothing to warn about here */ }
 
   const enforcementOk = declared === 'gate' || enforcement.mode === 'github';

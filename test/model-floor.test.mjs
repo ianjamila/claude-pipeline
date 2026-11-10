@@ -287,8 +287,8 @@ test('a lock held longer than the wait throws model-floor-busy', async (t) => {
   const started = Date.now();
   await assert.rejects(withFloorLock({ dir, waitMs: 150, pollMs: 20 }, () => assert.fail('must not run')), (err) => {
     assert.equal(err.code, 'model-floor-busy');
-    assert.match(err.message, /model-floor reset --clear-lock/);
-    assert.match(err.message, /--allow-id.*--clear-allow.*keep the learned floor/, 'R3-F1: the hint says how to keep the learned floor');
+    assert.match(err.message, /model-floor reset --clear-lock --keep-floor/, 'R4-F2: the hint keeps the learned floor without touching allowances');
+    assert.doesNotMatch(err.message, /--clear-allow/);
     return true;
   });
   assert.ok(Date.now() - started < 5000);
@@ -580,4 +580,64 @@ test('R3-F2: readableAllowedIds lists the allowed ids the parser reads now, in o
   assert.deepEqual(readableAllowedIds(null), []);
   assert.deepEqual(readableAllowedIds(good()), []);
   assert.deepEqual(readableAllowedIds(good({ allow: ['claude-fable-6-preview', 'claude-fable-5-3', 'claude-fable-x', 'claude-fable-6-20261101'] })), ['claude-fable-5-3', 'claude-fable-6-20261101']);
+});
+
+test('R4-F2: resetFloor removeAllow removes exactly those ids, keeps the learned floor, hold, history and the other ids; combines with allowId and clearLock', async (t) => {
+  const dir = join(tmp(t), 'f');
+  await resetFloor({ dir, hold: 'claude-fable-5-4' });
+  const before = await learned(dir);
+  await resetFloor({ dir, allowId: ['claude-fable-6-preview', 'claude-fable-6-b', 'claude-fable-5-3'] });
+  const removed = await resetFloor({ dir, removeAllow: ['claude-fable-5-3'] });
+  assert.deepEqual(removed.registry.allow, ['claude-fable-6-preview', 'claude-fable-6-b'], 'only the named id went');
+  assert.equal(removed.floor, 'claude-fable-5-3', 'the learned floor survives');
+  assert.deepEqual(JSON.parse(readFileSync(reg(dir), 'utf8')), { ...before, allow: ['claude-fable-6-preview', 'claude-fable-6-b'] }, 'newest, history and hold untouched');
+  mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  const combined = await resetFloor({ dir, removeAllow: ['claude-fable-6-b'], allowId: ['claude-fable-6-c'], clearLock: true });
+  assert.deepEqual([combined.registry.allow, combined.clearedLock, combined.floor], [['claude-fable-6-preview', 'claude-fable-6-c'], true, 'claude-fable-5-3']);
+  const last = await resetFloor({ dir, removeAllow: ['claude-fable-6-preview', 'claude-fable-6-c'] });
+  assert.equal(Object.hasOwn(last.registry, 'allow'), false, 'the list is gone once empty');
+  assert.deepEqual(JSON.parse(readFileSync(reg(dir), 'utf8')), before);
+});
+
+test('R4-F2: removeAllow of an id that is not on the list is refused naming the list and writes nothing; not with clearAllow, nor an id allowId adds; a corrupt registry is refused', async (t) => {
+  const dir = join(tmp(t), 'f');
+  await resetFloor({ dir, allowId: ['claude-fable-6-preview'] });
+  const before = readFileSync(reg(dir), 'utf8');
+  await assert.rejects(resetFloor({ dir, removeAllow: ['claude-fable-6-b'] }), (err) => err.code === 'model-floor-bad-allow' && /claude-fable-6-b/.test(err.message) && /claude-fable-6-preview/.test(err.message));
+  await assert.rejects(resetFloor({ dir, removeAllow: ['claude-fable-6-preview', 'claude-fable-6-b'] }), { code: 'model-floor-bad-allow' });
+  assert.equal(readFileSync(reg(dir), 'utf8'), before, 'nothing written, not even the id that was on the list');
+  await assert.rejects(resetFloor({ dir, removeAllow: ['claude-fable-6-preview'], clearAllow: true }), { code: 'model-floor-bad-allow' });
+  await assert.rejects(resetFloor({ dir, removeAllow: ['claude-fable-6-preview'], allowId: ['claude-fable-6-preview'] }), { code: 'model-floor-bad-allow' });
+  const empty = join(dir, 'empty');
+  await resetFloor({ dir: empty });
+  await assert.rejects(resetFloor({ dir: empty, removeAllow: ['claude-fable-6-b'] }), (err) => err.code === 'model-floor-bad-allow' && /it is empty/.test(err.message));
+  writeReg(dir, '{not json');
+  await assert.rejects(resetFloor({ dir, removeAllow: ['claude-fable-6-preview'] }), (err) => err.code === 'model-floor-unreadable' && /plain .*model-floor reset.* first/.test(err.message));
+  assert.equal(readFileSync(reg(dir), 'utf8'), '{not json');
+});
+
+test('R4-F2: resetFloor keepFloor with clearLock removes the lock and rewrites nothing (floor, history, hold and allowances stay); a bare clearLock still resets', async (t) => {
+  const dir = join(tmp(t), 'f');
+  await resetFloor({ dir, hold: 'claude-fable-5-4' });
+  await learned(dir);
+  await resetFloor({ dir, allowId: ['claude-fable-6-preview'] });
+  const bytes = readFileSync(reg(dir), 'utf8');
+  mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  const kept = await resetFloor({ dir, clearLock: true, keepFloor: true });
+  assert.deepEqual([kept.clearedLock, kept.floor, existsSync(join(dir, 'model-floor.lock'))], [true, 'claude-fable-5-3', false]);
+  assert.equal(readFileSync(reg(dir), 'utf8'), bytes, 'byte-identical registry');
+  assert.equal((await resetFloor({ dir, clearLock: true, keepFloor: true })).clearedLock, false, 'nothing left to clear');
+  // A lock held by a live holder does not stop it: the lock is what it removes, and it never takes the lock.
+  const held = tryAcquire('model-floor', { dir, machineId: null });
+  assert.equal(held.acquired, true);
+  assert.equal((await resetFloor({ dir, clearLock: true, keepFloor: true, waitMs: 50 })).clearedLock, true);
+  for (const extra of [{ hold: 'claude-fable-5-4' }, { clearHold: true }, { allowId: ['claude-fable-6-b'] }, { removeAllow: ['claude-fable-6-preview'] }, { clearAllow: true }, { clearLock: false }]) {
+    await assert.rejects(resetFloor({ dir, keepFloor: true, clearLock: true, ...extra }), { code: 'model-floor-bad-keep' }, JSON.stringify(extra));
+  }
+  assert.equal(readFileSync(reg(dir), 'utf8'), bytes);
+  writeReg(dir, '{not json');
+  mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  await assert.rejects(resetFloor({ dir, clearLock: true, keepFloor: true }), { code: 'model-floor-unreadable' });
+  assert.equal(existsSync(join(dir, 'model-floor.lock')), true, 'refused before touching the lock');
+  assert.equal((await resetFloor({ dir, clearLock: true })).registry.newest, MIN_FABLE, 'a bare clearLock is the plain reset that repairs it');
 });

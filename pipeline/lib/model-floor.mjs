@@ -231,7 +231,7 @@ export async function withFloorLock({ waitMs = LOCK_WAIT_MS, pollMs = 100, ...op
     return await withLock(LOCK_NAME, () => fn({ dir }), { dir, waitMs, pollMs, machineId: readMachineId({ stateDir }) });
   } catch (err) {
     if (err instanceof LockTimeoutError) {
-      throw codeError('model-floor-busy', `another review is updating the model floor (waited ${waitMs} ms): ${err.message.replace(/ To clear it by hand.*$/, '')}. Run the review again in a minute; if it persists, the owner runs \`pipeline model-floor reset --clear-lock\` (add \`--allow-id\` or \`--clear-allow\` to it to keep the learned floor)`, { cause: err });
+      throw codeError('model-floor-busy', `another review is updating the model floor (waited ${waitMs} ms): ${err.message.replace(/ To clear it by hand.*$/, '')}. Run the review again in a minute; if it persists, the owner runs \`pipeline model-floor reset --clear-lock --keep-floor\` (a bare \`--clear-lock\` also resets the learned floor to the shipped minimum)`, { cause: err });
     }
     throw err;
   }
@@ -241,22 +241,41 @@ export async function withFloorLock({ waitMs = LOCK_WAIT_MS, pollMs = 100, ...op
 // floor cannot rise above; `clearHold` removes it; with neither, an existing readable hold is kept. `clearLock` first removes the floor lock
 // folder (for a lock a live-looking process or another host left behind; a dead holder's lock is reclaimed by the lock itself).
 // `allowId` (Fable ids, exact names) adds to the registry's `allow` list (at most ALLOW_MAX): the review accepts those ids although the parser cannot
-// read them (an id the parser reads is judged by version like any other: the allowance never admits one below the floor); `clearAllow` empties it. An
-// existing readable list is kept otherwise. An allowance never raises the floor for an id the parser cannot read.
-// A call that carries allowId and/or clearAllow and no hold or clearHold is not a reset (`clearLock` alongside is fine: it only removes a lock folder and
+// read them (an id the parser reads is judged by version like any other: the allowance never admits one below the floor); `clearAllow` empties it;
+// `removeAllow` removes exactly those ids (each must be on the list now, else model-floor-bad-allow naming the list; not with clearAllow, and not an id
+// that allowId adds in the same call). An existing readable list is kept otherwise. An allowance never raises the floor for an id the parser cannot read.
+// `keepFloor` (only with clearLock, nothing else) removes the lock folder and rewrites nothing: the registry, floor and allowances stay as they are.
+// A call that carries allowId, removeAllow and/or clearAllow and no hold or clearHold is not a reset (`clearLock` alongside is fine: it only removes a lock folder and
 // says nothing about wanting a reset; a bare clearLock stays a plain reset): it changes `allow` and keeps the learned floor
 // (newest, provenAt, claudeCode, transcript, history) and the hold, so allowing an unreadable id, and clearing it later, never forgets what proofs raised.
 // A corrupt registry has no floor worth keeping: that call throws model-floor-unreadable and the owner runs a plain reset first.
 // -> { floor, registry, file, clearedLock }.
-export async function resetFloor({ hold, clearHold = false, allowId = [], clearAllow = false, clearLock = false, now, waitMs = 5000, ...opts } = {}) {
+export async function resetFloor({ hold, clearHold = false, allowId = [], removeAllow = [], clearAllow = false, clearLock = false, keepFloor = false, now, waitMs = 5000, ...opts } = {}) {
   if (hold !== undefined && hold !== null && clearHold) throw codeError('model-floor-bad-hold', 'use --hold or --clear-hold, not both');
   if (hold !== undefined && hold !== null && !isFableId(hold)) throw codeError('model-floor-bad-hold', `cannot hold the floor at ${JSON.stringify(hold)}: not a Fable model id`);
   if (clearAllow && allowId.length > 0) throw codeError('model-floor-bad-allow', 'use --allow-id or --clear-allow, not both');
   for (const id of allowId) {
     if (!isAllowableId(id)) throw codeError('model-floor-bad-allow', `cannot allow ${JSON.stringify(id)}: not a claude-fable-* model id (letters, digits, . _ - only)`);
   }
-  const allowOnly = (allowId.length > 0 || clearAllow) && (hold === undefined || hold === null) && !clearHold;
+  if (clearAllow && removeAllow.length > 0) throw codeError('model-floor-bad-allow', 'use --remove-allow or --clear-allow, not both');
+  const both = removeAllow.filter((id) => allowId.includes(id));
+  if (both.length > 0) throw codeError('model-floor-bad-allow', `${both.join(', ')} is in both --allow-id and --remove-allow`);
+  const hasHold = (hold !== undefined && hold !== null) || clearHold;
+  const allowOnly = (allowId.length > 0 || removeAllow.length > 0 || clearAllow) && !hasHold;
+  if (keepFloor && (!clearLock || hasHold || allowId.length > 0 || removeAllow.length > 0 || clearAllow)) {
+    throw codeError('model-floor-bad-keep', '--keep-floor goes with --clear-lock alone (it removes the lock and rewrites nothing)');
+  }
   const dir = ensureDir(opts);
+  if (keepFloor) {
+    const current = readFloor(opts);
+    if (!current.ok) {
+      throw codeError('model-floor-unreadable', `${current.message.replace(/; reviews are blocked until.*$/, '')}: --keep-floor keeps the learned floor and there is none to keep; run \`pipeline model-floor reset --clear-lock\` (a plain reset)`);
+    }
+    const lockDir = path.join(dir, `${LOCK_NAME}.lock`);
+    const clearedLock = fs.existsSync(lockDir);
+    fs.rmSync(lockDir, { recursive: true, force: true });
+    return { floor: current.floor, registry: current.registry, file: registryFile(dir), clearedLock };
+  }
   let clearedLock = false;
   if (clearLock) {
     const lockDir = path.join(dir, `${LOCK_NAME}.lock`);
@@ -266,12 +285,15 @@ export async function resetFloor({ hold, clearHold = false, allowId = [], clearA
   return withFloorLock({ ...opts, waitMs }, () => {
     const current = readFloor(opts); // a corrupt file is exactly what reset replaces: its hold is lost with it
     if (allowOnly && !current.ok) {
-      throw codeError('model-floor-unreadable', `${current.message.replace(/; reviews are blocked until.*$/, '')}: --allow-id / --clear-allow keep the learned floor and there is none to keep; run a plain \`pipeline model-floor reset\` first, then allow the id`);
+      throw codeError('model-floor-unreadable', `${current.message.replace(/; reviews are blocked until.*$/, '')}: --allow-id / --remove-allow / --clear-allow keep the learned floor and there is none to keep; run a plain \`pipeline model-floor reset\` first, then allow the id`);
     }
     let keep = current.ok ? current.registry?.hold ?? null : null;
     if (clearHold) keep = null;
     else if (hold) keep = canonical(hold);
-    const allow = clearAllow ? [] : [...new Set([...(current.ok ? allowedIds(current.registry) : []), ...allowId])];
+    const listed = current.ok ? allowedIds(current.registry) : [];
+    const unknown = removeAllow.filter((id) => !listed.includes(id));
+    if (unknown.length > 0) throw codeError('model-floor-bad-allow', `cannot remove ${unknown.join(', ')}: not on the allow list (${listed.length > 0 ? listed.join(', ') : 'it is empty'})`);
+    const allow = clearAllow ? [] : [...new Set([...listed.filter((id) => !removeAllow.includes(id)), ...allowId])];
     if (allow.length > ALLOW_MAX) throw codeError('model-floor-bad-allow', `at most ${ALLOW_MAX} allowed ids (${allow.length} asked): clear them with --clear-allow first`);
     const { allow: _dropped, ...learned } = current.ok && current.registry ? current.registry : {};
     const registry = allowOnly

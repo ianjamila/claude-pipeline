@@ -49,7 +49,7 @@ test('meta documents reset, the hold use and the owner-only rule', () => {
   assert.match(meta.usage, /model-floor reset \[--hold <fable model id> \| --clear-hold\] \[--clear-lock\]/);
   assert.match(meta.usage, /alias/);
   assert.match(meta.usage, /parser/);
-  assert.match(meta.usage, /--allow-id <exact claude-fable-… id> \.\.\. \| --clear-allow/);
+  assert.match(meta.usage, /--allow-id <exact claude-fable-… id> \.\.\. \| --remove-allow <id> \.\.\. \| --clear-allow/);
   assert.match(meta.usage, /model-floor reset --allow-id <the new id>/, 'the documented recovery for an unreadable id is the allowance, not a hold');
   assert.match(meta.usage, /--clear-allow/);
   assert.match(meta.usage, /refused inside Claude Code/);
@@ -307,11 +307,13 @@ test('R2-F1: reset --allow-id and --clear-allow alone keep a floor proofs raised
 });
 
 test('R2-F1: the usage text says an allowance-only call keeps the learned floor and a corrupt registry needs a plain reset first', () => {
-  assert.match(meta.usage, /with --allow-id and\/or --clear-allow \(and no --hold \/ --clear-hold; --clear-lock alongside is fine\) it is not a reset/);
+  assert.match(meta.usage, /with --allow-id, --remove-allow and\/or --clear-allow \(and no --hold \/ --clear-hold; --clear-lock alongside is fine\) it is not a reset/);
   assert.match(meta.usage, /plain `model-floor reset` first/);
   assert.match(meta.usage, /A plain reset .* rewrites the registry to the shipped minimum/);
   assert.match(meta.usage, /a bare --clear-lock too/);
-  assert.match(meta.usage, /add --allow-id \/ --clear-allow to keep the learned floor/);
+  assert.match(meta.usage, /add --keep-floor to clear the lock and keep the learned floor/);
+  assert.match(meta.usage, /pipeline model-floor reset --clear-lock --keep-floor/);
+  assert.match(meta.usage, /--remove-allow <id>  remove exactly that id/);
 });
 
 test('R3-F1: --allow-id / --clear-allow with --clear-lock keep the learned floor and clear the lock; a bare --clear-lock is a plain reset', async (t) => {
@@ -329,4 +331,72 @@ test('R3-F1: --allow-id / --clear-allow with --clear-lock keep the learned floor
   assert.deepEqual(readReg(dir), learned);
   const bare = await run(['reset', '--clear-lock'], asOwner(dir));
   assert.equal(bare.output.floor, MIN_FABLE, 'a bare --clear-lock is a plain reset');
+});
+
+// ---- review round 4: R4-F2 (--remove-allow, --keep-floor) ----
+test('R4-F2: reset --remove-allow removes exactly the named ids and keeps the learned floor and the other ids; an unknown id is refused naming the list', async (t) => {
+  const dir = scratch(t);
+  raiseFloor({ dir, model: 'claude-fable-5-3', claudeCode: '2.1.400', transcript: '/t.jsonl', now: NOW });
+  const learned = readReg(dir);
+  await run(['reset', '--allow-id', 'claude-fable-6-preview', '--allow-id', 'claude-fable-5-3'], asOwner(dir));
+  const r = await run(['reset', '--remove-allow', 'claude-fable-5-3'], asOwner(dir));
+  assert.deepEqual([r.exitCode, r.output.floor, r.output.allow], [0, 'claude-fable-5-3', ['claude-fable-6-preview']]);
+  assert.deepEqual(readReg(dir), { ...learned, allow: ['claude-fable-6-preview'] }, 'only allow changed');
+  // repeatable, and combines with --allow-id and --clear-lock
+  mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  const both = await run(['reset', '--remove-allow', 'claude-fable-6-preview', '--allow-id', 'claude-fable-6-b', '--clear-lock'], asOwner(dir));
+  assert.deepEqual([both.exitCode, both.output.allow, both.output.clearedLock, both.output.floor], [0, ['claude-fable-6-b'], true, 'claude-fable-5-3']);
+
+  const before = readFileSync(reg(dir), 'utf8');
+  const unknown = await run(['reset', '--remove-allow', 'claude-fable-6-zzz'], asOwner(dir));
+  assert.equal(unknown.exitCode, 2);
+  assert.equal(unknown.output.error, 'model-floor-bad-allow');
+  assert.match(unknown.output.message, /claude-fable-6-zzz/);
+  assert.match(unknown.output.message, /claude-fable-6-b/, 'names the current list');
+  assert.equal(readFileSync(reg(dir), 'utf8'), before, 'nothing written');
+  await assert.rejects(run(['reset', '--remove-allow', 'claude-fable-6-b', '--clear-allow'], asOwner(dir)), UsageError);
+  const notFable = await run(['reset', '--remove-allow', 'not-a-fable'], asOwner(dir));
+  assert.deepEqual([notFable.exitCode, notFable.output.error], [2, 'model-floor-bad-allow']);
+  assert.equal(readFileSync(reg(dir), 'utf8'), before);
+  await assert.rejects(run(['show', '--remove-allow', 'claude-fable-6-b'], asOwner(dir)), UsageError);
+  const emptied = await run(['reset', '--remove-allow', 'claude-fable-6-b'], asOwner(dir));
+  assert.deepEqual([emptied.exitCode, emptied.output.allow], [0, undefined]);
+  assert.deepEqual(readReg(dir), learned, 'back to exactly the learned registry');
+});
+
+test('R4-F2: reset --remove-allow and --keep-floor are refused inside Claude Code and change nothing', async (t) => {
+  const dir = scratch(t);
+  raiseFloor({ dir, model: 'claude-fable-5-3', now: NOW });
+  await run(['reset', '--allow-id', 'claude-fable-6-preview'], asOwner(dir));
+  const before = readFileSync(reg(dir), 'utf8');
+  mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  for (const args of [['reset', '--remove-allow', 'claude-fable-6-preview'], ['reset', '--clear-lock', '--keep-floor']]) {
+    for (const env of [{ ...ownerEnv(dir), CLAUDECODE: '1' }, ownerEnv(dir)]) {
+      const r = await run(args, { env, hasClaudeCodeAncestor: () => env.CLAUDECODE === undefined });
+      assert.equal(r.exitCode, 2, args.join(' '));
+      assert.equal(r.output.error, 'refused');
+    }
+  }
+  assert.equal(readFileSync(reg(dir), 'utf8'), before);
+  assert.equal(existsSync(join(dir, 'model-floor.lock')), true, 'the lock is still there');
+});
+
+test('R4-F2: reset --clear-lock --keep-floor removes the lock and keeps the learned floor, hold and allowances; --keep-floor alone or with other options is a usage error', async (t) => {
+  const dir = scratch(t);
+  await run(['reset', '--hold', 'claude-fable-5-4'], asOwner(dir));
+  raiseFloor({ dir, model: 'claude-fable-5-3', claudeCode: '2.1.400', transcript: '/t.jsonl', now: NOW });
+  await run(['reset', '--allow-id', 'claude-fable-6-preview'], asOwner(dir));
+  const bytes = readFileSync(reg(dir), 'utf8');
+  mkdirSync(join(dir, 'model-floor.lock'), { recursive: true });
+  const r = await run(['reset', '--clear-lock', '--keep-floor'], asOwner(dir));
+  assert.deepEqual([r.exitCode, r.output.floor, r.output.hold, r.output.allow, r.output.clearedLock], [0, 'claude-fable-5-3', 'claude-fable-5-4', ['claude-fable-6-preview'], true]);
+  assert.equal(readFileSync(reg(dir), 'utf8'), bytes, 'registry byte-identical');
+  assert.equal(existsSync(join(dir, 'model-floor.lock')), false);
+  for (const args of [['reset', '--keep-floor'], ['reset', '--keep-floor', '--clear-lock', '--clear-allow'], ['reset', '--keep-floor', '--clear-lock', '--allow-id', 'claude-fable-6-b'],
+    ['reset', '--keep-floor', '--clear-lock', '--remove-allow', 'claude-fable-6-preview'], ['reset', '--keep-floor', '--clear-lock', '--hold', 'claude-fable-5-4'], ['show', '--keep-floor']]) {
+    await assert.rejects(run(args, asOwner(dir)), UsageError, args.join(' '));
+  }
+  assert.equal(readFileSync(reg(dir), 'utf8'), bytes);
+  const bare = await run(['reset', '--clear-lock'], asOwner(dir));
+  assert.equal(bare.output.floor, MIN_FABLE, 'a bare --clear-lock is still the plain reset');
 });

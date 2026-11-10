@@ -357,6 +357,7 @@ test('arbiter apply: a floor lock held by another process is a named error (mode
   assert.match(r.json.message, /another review is updating the model floor/);
   assert.match(r.json.advice, /^another review holds the machine-wide floor lock: run `arbiter apply` again in a minute/, 'R1-F2: the output carries advice');
   assert.equal(r.json.advice, w.state().rounds[0].arbiter.failure.advice);
+  assert.equal(r.json.advice, 'another review holds the machine-wide floor lock: run `arbiter apply` again in a minute; if it persists, the owner runs `pipeline model-floor reset --clear-lock --keep-floor` in a plain terminal (it keeps the learned floor; a bare `--clear-lock` resets it to the shipped minimum)', 'R4-F1: the saved advice carries the keep-the-floor command');
   assert.deepEqual(minusFailure(w.state()), JSON.parse(before), 'nothing was saved but the failure record');
   assert.equal(w.state().rounds[0].arbiter.failure.cause, 'model-floor-busy');
   const retry = apply(w, [], own);
