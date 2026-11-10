@@ -247,7 +247,7 @@ test('#229: the sweep\'s gated recheck needs a passing, recent gate file for the
     }
     return dir;
   };
-  const live = (over = {}) => ({ head: HEAD, contentHash: 'hash1', checks: [{ name: 'ci', ok: true }], ...over });
+  const live = (over = {}) => ({ head: HEAD, contentHash: 'hash1', ownerItems: 'none', checks: [{ name: 'ci', ok: true }], ...over });
   const ask = (dir, { fresh = live(), problems = [], rec = { approval: APPROVAL }, now } = {}) => {
     const calls = [];
     return recheckGatedRecorded({
@@ -278,7 +278,7 @@ test('#229: the sweep\'s gated recheck needs a passing, recent gate file for the
   const blocked = await ask(worktree(gateAt()), { problems: ['label needs-human is on the PR'] });
   assert.deepEqual([blocked.out.ok, blocked.out.error], [false, 'blocked']);
   // The gate left items for the owner and no "merge" for them is on record: not re-queued.
-  const items = await ask(worktree(gateAt({ ownerItems: 'zz9-no-such-owner-record' })), { fresh: live({ ownerMerge: 1 }) });
+  const items = await ask(worktree(gateAt({ ownerItems: 'zz9-no-such-owner-record' })), { fresh: live({ ownerMerge: 1, ownerItems: 'zz9-no-such-owner-record' }) });
   assert.equal(items.out.error, 'pre-merge');
   assert.match(items.out.reasons[0], /no "merge" for this head and item set is on record/);
 });

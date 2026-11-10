@@ -15,7 +15,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { holdFiles, holdYml, holdCalls } from './helpers/merge-hold-env.mjs';
 import { beginAttempt, confirmAttempt, endRecord, noteRemoval, readQueueRecord } from '../pipeline/lib/merge-queue.mjs';
 import { preMergeProblems } from '../pipeline/lib/finalgate.mjs';
-import { gateFreshSince } from '../pipeline/lib/queue-route.mjs';
+import { gateFreshSince, recheckGated } from '../pipeline/lib/queue-route.mjs';
 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-gh-queue.mjs');
 const QUEUE_COMMIT = 'b'.repeat(40);
@@ -442,4 +442,25 @@ test('gateFreshSince: a passing gate with no owner items, written after the reco
   assert.equal(gateFreshSince(gate({ ownerMerge: 2 }), since), false, 'items for the owner need the owner\'s fresh word, not a gate run');
   assert.equal(gateFreshSince(gate(), Infinity), false, 'an end time that cannot be read never lets a gate through');
   assert.equal(gateFreshSince(null, since), false);
+});
+
+// ---- review round 1 ---------------------------------------------------------------------------------------------------------------------
+
+// R1-B1: recheckGated (P merge's own watch and the sweep) refuses whenever the live owner-item digest is not the one the gate was written with,
+// whether or not the owner's word is in play: the owner approved (or was shown) THAT set.
+test('recheckGated: the live owner-item digest differing from the gate\'s refuses, with the same head and patch (R1-B1)', async () => {
+  const gate = { head: 'a'.repeat(40), contentHash: 'h1', ownerItems: 'abc123', ownerMerge: 0 };
+  const live = (over = {}) => ({ head: gate.head, contentHash: 'h1', ownerItems: 'abc123', checks: [{ name: 'ci', ok: true }], ...over });
+  const ask = (fresh, ownerApproved) => recheckGated({
+    root: '/x', config: {}, pr: PR, gh: { repo: () => ({ slug: 'acme/widgets' }) }, env: {}, gate, ownerApproved, ownerMergeReason: 'owner first',
+    evaluate: async () => fresh, problemsOf: async () => [],
+  });
+  assert.deepEqual(await ask(live(), false), { ok: true }, 'the same set re-queues');
+  for (const ownerApproved of [false, true]) {
+    const r = await ask(live({ ownerItems: 'def456' }), ownerApproved);
+    assert.equal(r.ok, false, `ownerApproved ${ownerApproved}`);
+    assert.equal(r.error, 'pre-merge');
+    assert.match(r.reasons[0], /owner items changed/);
+    assert.match(r.reasons[0], /def456/);
+  }
 });

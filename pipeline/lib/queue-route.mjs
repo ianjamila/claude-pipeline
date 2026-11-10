@@ -74,6 +74,8 @@ export async function recheckGated({ root, config, pr, gh, env, gate, ownerAppro
   const failed = fresh.checks.filter((c) => !c.ok);
   if (failed.length > 0) return { ok: false, error: 'live-check', reasons: failed.map((c) => `${c.name}: ${c.detail}`) };
   if (fresh.head !== gate.head || fresh.contentHash !== gate.contentHash) return { ok: false, error: 'live-check', reasons: ['the live gate is for a different head or patch than final-gate.json approved'] };
+  // (an item added, dismissed or swapped since the gate ran, same head and patch: the owner was never shown that set. Unconditional, so it binds the sweep and P merge's own watch alike; R1-B1)
+  if (fresh.ownerItems !== gate.ownerItems) return { ok: false, error: 'pre-merge', reasons: [`the owner items changed since the final gate (now ${fresh.ownerItems}, gate ${gate.ownerItems}): run the final gate again${ownerApproved ? ' and show them to the owner' : ''}`] };
   if (Number(fresh.ownerMerge) > 0 && !ownerApproved) return { ok: false, error: 'pre-merge', reasons: [ownerMergeReason] };
   if (ownerApproved && approvalGap({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null, rulings: null }) !== 'ok') {
     return { ok: false, error: 'pre-merge', reasons: ['the owner\'s "merge" for this head is no longer on record (it is valid for 24 hours): ask again'] };
