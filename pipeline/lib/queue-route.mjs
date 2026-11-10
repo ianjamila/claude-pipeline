@@ -6,7 +6,6 @@
 //   enqueueAndWatch()  begin attempt, enqueue, confirm, watch, re-queue once -> { exitCode, output }
 // Nothing here ever disables auto-merge or dequeues for a time-out: `still-queued` leaves the entry exactly as it is.
 import { statSync } from 'node:fs';
-import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
 import { GATE_FILE, GATE_MAX_AGE_MS, PR_FIELDS, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, preMergeProblems, readReviewJson, waitBlockers } from './finalgate.mjs';
