@@ -799,3 +799,19 @@ test('settleGuardStatuses: waits out pending, then green with provenance => []; 
   const broken = await run([new Error('HTTP 502')], { waitMs: 15_000 });
   assert.match(broken.out[0], /could not read the checks \(HTTP 502\) after 15 s/);
 });
+
+test('R1-B3 a resumed --owner-go watch: the first failed_checks removal is re-queued once under the RECORDED hold binding (no placeholder refusal, no ReferenceError)', (t) => {
+  const first = [added(), removedEv('failed_checks')];
+  const s = world({ after: [[Q()]] });
+  approve(t, s);
+  assertExit(s.go(), 0); // run 1: queued, stillQueued; the record owns the lift
+  s.q.show([Q(), Q(), Q(), OUT(first)], [Q(1, [...first, added()]), M()]); // (reads: queue mode, orphan recovery, precheck, then the watch) run 2 finds the entry queued, then sees it fail its group; the re-queue merges
+  const r = s.go();
+  assertExit(r, 0, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.merged, true);
+  assert.equal(r.json.requeued, 1);
+  assert.equal(s.enqueues().length, 2);
+  assert.deepEqual(s.readds(), [], 'the lifted hold is not put back');
+  assert.equal(s.rec().terminal, 'merged');
+  assert.equal(s.rec().attempts, 2);
+});

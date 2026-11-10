@@ -453,7 +453,11 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   let pre = null;
   const approval = { items: null, areas: null, rulings: null };
   const extra = { mode: 'owner-go', head, behind: null };
-  let rechecker = async () => ({ ok: false, error: 'live-check', reasons: ['the live scan has not run'] });
+  // The needs-human hold the owner's "merge" may lift; declared up here because the route's seam reads it (null on a watch-only restart, where the record carries it).
+  let hold = null;
+  // Before a re-queue (the group's checks failed once): the same scan, the same owner approval, the blockers, for the SAME head. Judged against the hold
+  // this run lifted, else the one a live record still owns, so a resumed watch (which returns before the live scan) can re-queue too.
+  const rechecker = () => queueRecheckOwnerGo({ root, config, pr, gh, ctx, head, repo, hold: hold ?? liveRecordHold(root, pr) });
   if (queue.on) {
     route = createQueueRoute({ gh, root, config, pr, head, env: ctx.env ?? process.env, refuse, track, extra, approval, recheck: () => rechecker(), ...queueHoldSeams({ gh, root, pr, getHold: () => hold }) });
     pre = await route.precheck();
@@ -466,7 +470,7 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
   if (held) return holdRefuse(held, { head });
   // The needs-human hold the owner's "merge" may lift (lib/hold.mjs; none = today's flow, the label stays a blocker). Only the labels check and the
   // look BEFORE the lift ignore it (Rev-4 8).
-  const { hold } = await readEligibleHold({ gh, pr, config });
+  ({ hold } = await readEligibleHold({ gh, pr, config }));
   // Queue mode, a restart: a LIVE record still owns the hold an earlier run lifted (the label is off), so a re-queue is judged against THAT hold. A needs-human on the PR
   // now is a NEW hold: nothing is re-queued and the record ends (the label is on already, so nothing is restored on top of it).
   const recHold = queue.on ? liveRecordHold(root, pr) : null;
@@ -498,8 +502,6 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
     // The record keeps what the owner approved (the items / areas / rulings of THIS scan) so a restart judges the same approval.
     Object.assign(approval, { items: live.ownerItems, areas: live.areas, rulings: live.rulingsBlockDigest ?? null });
     extra.behind = live.behind ?? null;
-    // Before a re-queue (the group's checks failed once): the same scan, the same owner approval, the blockers, for the SAME head.
-    rechecker = () => queueRecheckOwnerGo({ root, config, pr, gh, ctx, head, repo, hold: hold ?? recHold });
   }
 
   // `running.pid` (hold lift only) is the merge command's process id while it runs: a signal kills that group and disarms auto-merge before the label goes back.

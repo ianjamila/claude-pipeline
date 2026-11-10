@@ -270,9 +270,14 @@ export function reconcileNow({ gh, root, pr, head, log = () => {} }) {
   const state = gh.queueState(pr);
   if (state.state === 'MERGED') return { kind: 'merged', lookup: { first: state.mergeSha } };
   if (state.state === 'CLOSED') return { kind: 'closed' };
-  if (state.head !== head) return { kind: 'head-moved', head: state.head };
-  if (state.entry) return { kind: 'queued', entry: state.entry };
   const rec = root === undefined ? null : readQueueRecord(root, pr);
+  if (state.head !== head) {
+    // A live entry at the head the record tracks is still queued, whichever commit this worktree is at now: ending the record would put the hold
+    // back over a live entry. Only a PR that is not queued (or is queued at some other head) has moved.
+    if (state.entry && rec !== null && rec.terminal === null && rec.head === state.head) return { kind: 'queued', entry: state.entry };
+    return { kind: 'head-moved', head: state.head };
+  }
+  if (state.entry) return { kind: 'queued', entry: state.entry };
   const events = gh.queueEvents(pr);
   const lastAdded = events.map((e) => e.type).lastIndexOf('added');
   const after = lastAdded === -1 ? [] : events.slice(lastAdded + 1);
@@ -373,9 +378,10 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
     }
     if (out.state === 'blocked') {
       const { view, ...result } = out;
-      // The record ends here only when no lifted needs-human label is owed back: none was lifted, or it is on the PR again (a new hold).
+      // The record ends here only when the dequeue is CONFIRMED (else the entry may be live and the sweep must find the record again) and no lifted
+      // needs-human label is owed back: none was lifted, or it is on the PR again (a new hold).
       const labelOn = labelNames(view?.labels).some((n) => n.toLowerCase() === 'needs-human');
-      if (rec && rec.terminal === null && (rec.hold === null || labelOn)) endRecord(root, pr, 'blocked');
+      if (out.dequeued === true && rec && rec.terminal === null && (rec.hold === null || labelOn)) endRecord(root, pr, 'blocked');
       return result;
     }
     return out;
@@ -490,6 +496,8 @@ export async function settleRecord({ gh, root, pr, now = Date.now, sleep = defau
         if (typeof requeue !== 'function') return { outcome: 'requeue-due', removal: last, rec };
         const out = await requeue({ rec, removal: last });
         if (out?.ok) return { outcome: 'requeued', removal: last, rec: readQueueRecord(root, pr) };
+        // The enqueue went out but GitHub could not be read to confirm it: the entry may be live, so nothing is restored or ended.
+        if (out?.unsettled) return { outcome: 'unsettled', removal: last, rec: readQueueRecord(root, pr), why: (out.reasons ?? ['the re-queue could not be confirmed']).join('; ') };
         return finish(out?.kind === 'blocked' ? 'blocked' : 'removed', `${what} once and was not re-queued: ${(out?.reasons ?? ['the re-queue was not allowed']).join('; ')}`, { removal: last, failing });
       }
       return finish('removed', `${what}${rec.removals.length > 1 ? ' after one automatic re-queue' : ''}`, { removal: last, failing });

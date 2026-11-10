@@ -108,7 +108,8 @@ export function knownRepos({ home = os.homedir(), env = process.env } = {}) {
 }
 
 // ---- the re-queue, from a live worktree only (Fable F11) ------------------------------------------------------------------------------------
-// -> the `requeue` function settleRecord takes. ok:false ends the record `removed` (or `blocked`), puts an owned hold back and notifies.
+// -> the `requeue` function settleRecord takes. ok:false ends the record `removed` (or `blocked`), puts an owned hold back and notifies;
+// { ok:false, unsettled:true } (the enqueue could not be confirmed) leaves the record as it is.
 export function makeRequeue({ gh, root, env, say, now, sleep, log, loadCfg = loadConfig, headOf = (cwd) => headSha({ cwd }), recheckFn = recheckOwnerGo }) {
   return async ({ rec }) => {
     const pr = rec.pr;
@@ -143,6 +144,8 @@ export function makeRequeue({ gh, root, env, say, now, sleep, log, loadCfg = loa
       say(`PR #${pr} merged through the merge queue`);
       return { ok: true };
     }
+    // queue-unreadable: the enqueue may have landed. Not a rejection (that would restore the hold and end the record over a live entry).
+    if (out.done?.output?.error === 'queue-unreadable') return { ok: false, unsettled: true, reasons: out.done.output.reasons ?? ['the re-queue could not be confirmed'] };
     return { ok: false, reasons: out.done?.output?.reasons ?? ['the re-queue did not go through'] };
   };
 }

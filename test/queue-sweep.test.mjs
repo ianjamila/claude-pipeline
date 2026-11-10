@@ -313,3 +313,24 @@ test('a launchctl failure on install is reported as an error, not thrown', () =>
   assert.equal(out.applicable, true);
   assert.match(out.error, /cannot load the LaunchAgent: denied/);
 });
+
+test('R1-B2: the re-queue is sent but every confirm read fails => unsettled: the record stays pending, the hold is not restored', async () => {
+  const root = repoDir();
+  const w = world();
+  entryRecord(root);
+  const gh = stub({ states: [st()], events: [[addedAt(), removedAt('failed_checks')]] });
+  const read = gh.queueState;
+  let reads = 0;
+  gh.queueState = () => { // (the settle's own read works; every read after the enqueue fails)
+    reads += 1;
+    if (reads > 1) throw new Error('gh: Server Error (HTTP 502)');
+    return read();
+  };
+  const out = await sweep(root, w, gh);
+  assert.equal(out.settled[0].outcome, 'unsettled');
+  assert.deepEqual(gh.calls, [`enqueue 7 ${HEAD.slice(0, 8)}`], 'the hold label is not put back over an entry that may be live');
+  const rec = readQueueRecord(root, 7);
+  assert.equal(rec.terminal, null);
+  assert.notEqual(rec.pending, null, 'the attempt is still pending: the next sweep reconciles it');
+  assert.deepEqual(w.said, []);
+});

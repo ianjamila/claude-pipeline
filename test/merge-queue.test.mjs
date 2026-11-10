@@ -504,3 +504,35 @@ test('watchQueue: blocked with a lifted hold and the label OFF leaves the record
   assert.equal(rec.terminal, null, 'the label has not been restored yet: settleRecord / the caller still owns that');
   assert.equal(rec.hold.owner, 'entry');
 });
+
+// ---- round-1 review fixes ----------------------------------------------------------------------------------------------------------
+
+test('R1-B1 watchQueue: a stop condition whose dequeue is NOT confirmed leaves the record live (the next sweep retries), even with no hold', async () => {
+  const c = clock();
+  const root = repoDir();
+  beginAttempt(root, 7, HEAD, APPROVAL, IDENT);
+  confirmAttempt(root, 7, 'MQE_1');
+  const gh = stubGh({ states: [inQ()], dequeueThrows: true });
+  const r = await watchQueue({ gh, root, pr: 7, head: HEAD, budgetMs: 3_600_000, blockers: async () => ['open pipeline-pause issue #9'], now: c.now, sleep: c.sleep });
+  assert.equal(r.state, 'blocked');
+  assert.equal(r.dequeued, false);
+  assert.equal(readQueueRecord(root, 7).terminal, null, 'the entry may still be live: settleRecord / final-gate must still find the record');
+  assert.equal(liveRecords(root).length, 1);
+  // the next settle retries the dequeue and, once confirmed, ends the record
+  const again = await watchQueue({ gh: stubGh({ states: [inQ(), st()], events: [[added(), removed(REASON_MANUAL, '08:20:00', null)]] }), root, pr: 7, head: HEAD, budgetMs: 3_600_000, blockers: async () => ['open pipeline-pause issue #9'], now: c.now, sleep: c.sleep });
+  assert.equal(again.dequeued, true);
+  assert.equal(readQueueRecord(root, 7).terminal, 'blocked');
+});
+
+test('R1-F1 reconcile: queued at the recorded head while the local worktree is elsewhere => queued (a live entry is never head-moved)', async () => {
+  const root = repoDir();
+  const other = 'd'.repeat(40);
+  beginAttempt(root, 7, HEAD, APPROVAL, IDENT);
+  confirmAttempt(root, 7, 'MQE_1');
+  const r = await reconcile({ gh: stubGh({ states: [inQ(3)] }), root, pr: 7, head: other });
+  assert.equal(r.kind, 'queued');
+  assert.equal(r.entry.position, 3);
+  // not queued, or queued at some head the record does not know: still head-moved
+  assert.deepEqual(await reconcile({ gh: stubGh({ states: [st()] }), root, pr: 7, head: other }), { kind: 'head-moved', head: HEAD });
+  assert.deepEqual(await reconcile({ gh: stubGh({ states: [{ ...inQ(), head: 'f'.repeat(40) }] }), root, pr: 7, head: other }), { kind: 'head-moved', head: 'f'.repeat(40) });
+});
