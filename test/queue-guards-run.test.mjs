@@ -45,7 +45,7 @@ const lines = (a) => (a.length ? `${a.join('\n')}\n` : '');
 // The scripted GitHub.
 //   queue: [at evaluate, at publish] entry lists (the last repeats); queueFail: the Nth read fails (0 = evaluate)
 //   status: (pr, check) -> a status object | an array (one per call) | null (none);  runs: (pr) -> run override (merged over guardRun)
-//   labels / issues: blockers; prs: GET pulls/N answers (the publish re-check of a member that left the queue); an array = one answer per call (the last repeats)
+//   labels / issues: blockers; prs: GET pulls/N answers (the publish re-check of a member that left the queue); an array = one answer per call (the last repeats; 'FAIL' = that call fails)
 //   post: 'fail' makes every status POST fail
 function script({ queue = [TWO()], queueFail = [], compare = COMPARE, status = goodStatus, runs = {}, artifacts = {}, labels = {}, issues = {}, prs = {}, defaultStatus = 'identical', post = 'ok' } = {}) {
   const ctxName = Object.entries(CTX);
@@ -67,7 +67,7 @@ function script({ queue = [TWO()], queueFail = [], compare = COMPARE, status = g
       { match: `^api repos/${REPO}/actions/runs/${pr}00 `, stdout: `${JSON.stringify({ ...guardRun(pr), ...(runs[pr] ?? {}) })}\n` },
       { match: `^api repos/${REPO}/actions/runs/${pr}00/artifacts\\?per_page=100 `, stdout: lines(artifacts[pr] ?? [verdictArtifactName({ head: heads[pr], integrity: 'success', hardstops: 'success', review: 'success' })]) },
     ]),
-    ...Object.entries(prs).map(([n, body]) => ({ match: `^api repos/${REPO}/pulls/${n} `, ...(Array.isArray(body) ? { sequence: body.map((x) => ({ stdout: `${JSON.stringify(x)}\n` })) } : { stdout: `${JSON.stringify(body)}\n` }) })),
+    ...Object.entries(prs).map(([n, body]) => ({ match: `^api repos/${REPO}/pulls/${n} `, ...(Array.isArray(body) ? { sequence: body.map((x) => (x === 'FAIL' ? { code: 1, stderr: 'HTTP 502' } : { stdout: `${JSON.stringify(x)}\n` })) } : { stdout: `${JSON.stringify(body)}\n` }) })),
   ];
 }
 
@@ -293,6 +293,14 @@ test('poster: predecessor A gone at publish and its PR is STILL not merged on th
   const r = await exec({ queue: [TWO(), ONLY_5()], prs: { 3: UNMERGED } });
   assert.deepEqual(states(r), ALL('error'));
   assert.equal(pullReads(r, 3), 2);
+});
+
+// eaglewatch#1785: a re-read that cannot be made (or says unknown) must not discard the first `gone`, and the member is still read at most once more per run.
+test('poster: predecessor A gone, then its re-read FAILS => the first gone stands: error on every context, one re-read for the whole run (eaglewatch#1785)', async () => {
+  const r = await exec({ queue: [TWO(), ONLY_5(), ONLY_5()], runs: { 3: MERGED_RUN }, prs: { 3: [UNMERGED, 'FAIL'] } }, { publish: false });
+  assert.deepEqual(['integrity', 'hardstops', 'review'].map((k) => r.verdict.checks[k].state), ['error', 'error', 'error']);
+  assert.match(r.verdict.checks.integrity.description, /^#3: .*without merging its queue commit/);
+  assert.equal(pullReads(r, 3), 2, 'one read, one re-read; the three contexts share the answer');
 });
 
 test('poster: predecessor A merged at ANOTHER commit is final at once: error, no re-read (eaglewatch#1771)', async () => {
