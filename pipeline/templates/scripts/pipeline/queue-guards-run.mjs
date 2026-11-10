@@ -203,11 +203,15 @@ export async function runEvaluate({ env = process.env, cwd = process.cwd(), deps
   // A predecessor that merged after the manifest was taken (eaglewatch#1769): GitHub empties pull_requests on its guard runs, so its provenance can no longer be
   // checked, and it need not be. A predecessor is settled when it merged at its own queue commit and on the default branch, listed or not (it merged on its own
   // entry's green statuses); the top entry is never settled; one that left the queue any other way is an error. A live member keeps the full check. Read only when the check did not already pass, and kept once settled.
+  // A departure whose PR does not say `merged` YET (`retry`: open and unmerged; GitHub can lag the queue's merge) is not kept as gone on the first read: it is read once more, as
+  // the Queue gate does, and only then counts (eaglewatch#1771). At most one re-read per member per run.
   const standings = new Map();
   const standingOf = (member) => {
     const known = standings.get(member.pr);
     if (known) return known;
-    const st = memberStanding({ read: s.read, graphql: s.graphql, repo: e.repo, defaultBranch, queueSha: e.queueSha, member });
+    const ask = () => memberStanding({ read: s.read, graphql: s.graphql, repo: e.repo, defaultBranch, queueSha: e.queueSha, member });
+    let st = ask();
+    if (st.kind === 'gone' && st.retry === true) st = ask();
     if (st.kind === 'settled' || st.kind === 'gone') standings.set(member.pr, st);
     return st;
   };
