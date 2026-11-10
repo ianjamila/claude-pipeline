@@ -83,6 +83,8 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    exit 1 with `restartRequired` (`stale-terminal` from `needed`, `stale-model` from `apply`; Fable round) ⇒ do NOT retry here and do NOT park: outcome `blocked`, with no `pipeline-blocked`
    label and no `needs-human`. Post the CLI's `advice` text (`P comment --pr N --kind blocked --reason "<advice>"`), with `merge.hold_command` in `P config` `P merge-hold --pr N --release --reason restart`,
    run the stop ritual, and tell the owner to restart the terminal (or update Claude Code / `pipeline model-floor reset`, as the advice says). After the restart: `P arbiter needed --round R` and the arbiter again.
+   Exit 1 `error: model-floor-busy` ⇒ run `P arbiter apply` once more after a minute (no new arbiter call). Exit 1 `unrecognised-fable`, `model-floor-unreadable` or
+   `model-floor-unwritable` ⇒ no new Fable pass can fix it: do NOT re-run the arbiter; stop `blocked` exactly like the `restartRequired` stop, posting the CLI's `advice`.
    Any other exit 1 ⇒ the items are `needsHuman` (Fable round: run `needed` and the arbiter once more; failing twice ⇒ park, cause `arbiter:model-proof`).
 5. **Publish and fix.** `P comment --pr N --kind triage` FIRST, then `P followups create --round R` for FOLLOW-UP items, then the triage comment again
    (issue links). ACCEPT items: one `implementer` dispatch with `P state show --round R --accepted`; it fixes, adds tests, runs `verify.quick`, commits;

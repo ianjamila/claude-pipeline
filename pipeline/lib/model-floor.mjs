@@ -17,6 +17,7 @@ export const FLOOR_REL = `${OWNER_GO_REL}/model-floor`;
 export const REGISTRY_FILE = 'fable.json';
 export const LOCK_NAME = 'model-floor';
 export const HISTORY_MAX = 10;
+export const ALLOW_MAX = 10;
 export const LOCK_WAIT_MS = 30_000;
 const REGISTRY_MAX_BYTES = 64 * 1024;
 const DIR_ENV = 'PIPELINE_MODEL_FLOOR_DIR';
@@ -39,6 +40,9 @@ export function compareVersions(a, b) {
 }
 
 const isFableId = (id) => parseModelId(id)?.family === 'fable';
+// An id the owner may allow by exact name (reset --allow-id): any claude-fable-* id, including one the parser cannot read yet.
+const ALLOW_RE = /^claude-fable-[A-Za-z0-9._-]{1,80}$/;
+export const isAllowableId = (id) => typeof id === 'string' && ALLOW_RE.test(id);
 // The id without its date suffix, in the shape the registry stores ("claude-fable-5-2"; minor 0 is left out: "claude-fable-5").
 const canonical = (id) => {
   const p = parseModelId(id);
@@ -94,6 +98,7 @@ function schemaProblem(r) {
   if (!strOrNull(r.provenAt) || !strOrNull(r.claudeCode) || !strOrNull(r.transcript)) return 'provenAt / claudeCode / transcript must be strings';
   if (!Array.isArray(r.history) || r.history.length > HISTORY_MAX || r.history.some((h) => !h || typeof h !== 'object' || !isFableId(h.model))) return 'history is malformed';
   if (r.hold !== undefined && r.hold !== null && !isFableId(r.hold)) return 'hold is not a Fable model id';
+  if (r.allow !== undefined && (!Array.isArray(r.allow) || r.allow.length > ALLOW_MAX || r.allow.some((id) => !isAllowableId(id)))) return 'allow is malformed';
   return null;
 }
 
@@ -103,6 +108,23 @@ function floorOf(registry) {
   if (registry && compareVersions(parseModelId(registry.newest), parseModelId(floor)) > 0) floor = registry.newest;
   if (registry?.hold && compareVersions(parseModelId(floor), parseModelId(registry.hold)) > 0) floor = registry.hold;
   return canonical(floor);
+}
+
+// The Fable ids the owner allowed by exact name (reset --allow-id): accepted although unparseable or below the floor. They never raise it.
+export const allowedIds = (registry) => (Array.isArray(registry?.allow) ? registry.allow : []);
+
+// The version below which a recorded Fable proof is re-reviewed (staleness, supersession, fable-refresh): the registry's hold when it is set and
+// below MIN_FABLE (an owner rollback must let the older proofs it admits complete a review), else MIN_FABLE.
+export function reReviewThreshold(registry) {
+  const hold = registry?.hold;
+  return hold && compareVersions(parseModelId(hold), parseModelId(MIN_FABLE)) < 0 ? canonical(hold) : canonical(MIN_FABLE);
+}
+
+// What review-complete, the final gate, fable-refresh and the Fable diff scope compare recorded proofs against: { threshold, allow }.
+// An unreadable registry falls back to the stricter MIN_FABLE with no allowed ids (the next apply reports the unreadable registry itself).
+export function readReviewGate(opts = {}) {
+  const read = readFloor(opts);
+  return read.ok ? { threshold: reReviewThreshold(read.registry), allow: allowedIds(read.registry) } : { threshold: canonical(MIN_FABLE), allow: [] };
 }
 
 // { ok: true, floor, registry } (registry null when the file is absent: floor = MIN_FABLE) | { ok: false, error: 'model-floor-unreadable', message }.
@@ -125,14 +147,15 @@ export function readFloor(opts = {}) {
   return { ok: true, floor: floorOf(registry), registry, error: null };
 }
 
-// { ok, older: [Fable ids below the floor], unparseable: [claude-fable-* ids that do not parse] }. Only the Fable family is judged.
-export function checkFloor({ models, floor }) {
+// { ok, older: [Fable ids below the floor], unparseable: [claude-fable-* ids that do not parse] }. Only the Fable family is judged. An id in `allow`
+// (the owner's exact-name allowance) is neither.
+export function checkFloor({ models, floor, allow = [] }) {
   const want = parseModelId(floor);
   if (want?.family !== 'fable') throw codeError('model-floor-bad-floor', `the floor ${JSON.stringify(floor)} is not a Fable model id`);
   const older = [];
   const unparseable = [];
   for (const id of new Set((models ?? []).filter((m) => typeof m === 'string'))) {
-    if (!id.startsWith('claude-fable-')) continue;
+    if (!id.startsWith('claude-fable-') || allow.includes(id)) continue;
     const p = parseModelId(id);
     if (!p) unparseable.push(id);
     else if (p.family === 'fable' && compareVersions(p, want) < 0) older.push(id);
@@ -178,6 +201,7 @@ export function raiseFloor({ model, claudeCode = null, transcript = null, now, .
     transcript: transcript ?? null,
     history: [...(current.registry?.history ?? []), { model: newest, at, claudeCode: claudeCode ?? null, transcript: transcript ?? null }].slice(-HISTORY_MAX),
     hold,
+    ...(allowedIds(current.registry).length > 0 ? { allow: allowedIds(current.registry) } : {}),
   };
   writeRegistry(opts, registry);
   return { raised: true, floor: floorOf(registry), registry };
@@ -201,10 +225,16 @@ export async function withFloorLock({ waitMs = LOCK_WAIT_MS, pollMs = 100, ...op
 // Owner recovery (the CLI wrapper adds the owner-only check): rewrite the registry to the code constant. `hold` (a Fable id) sets the ceiling the
 // floor cannot rise above; `clearHold` removes it; with neither, an existing readable hold is kept. `clearLock` first removes the floor lock
 // folder (for a lock a live-looking process or another host left behind; a dead holder's lock is reclaimed by the lock itself).
+// `allowId` (Fable ids, exact names) adds to the registry's `allow` list (at most ALLOW_MAX): the review accepts those ids although the parser cannot
+// read them or they are below the floor; `clearAllow` empties it. An existing readable list is kept otherwise. An allowance never raises the floor.
 // -> { floor, registry, file, clearedLock }.
-export async function resetFloor({ hold, clearHold = false, clearLock = false, now, waitMs = 5000, ...opts } = {}) {
+export async function resetFloor({ hold, clearHold = false, allowId = [], clearAllow = false, clearLock = false, now, waitMs = 5000, ...opts } = {}) {
   if (hold !== undefined && hold !== null && clearHold) throw codeError('model-floor-bad-hold', 'use --hold or --clear-hold, not both');
   if (hold !== undefined && hold !== null && !isFableId(hold)) throw codeError('model-floor-bad-hold', `cannot hold the floor at ${JSON.stringify(hold)}: not a Fable model id`);
+  if (clearAllow && allowId.length > 0) throw codeError('model-floor-bad-allow', 'use --allow-id or --clear-allow, not both');
+  for (const id of allowId) {
+    if (!isAllowableId(id)) throw codeError('model-floor-bad-allow', `cannot allow ${JSON.stringify(id)}: not a claude-fable-* model id (letters, digits, . _ - only)`);
+  }
   const dir = ensureDir(opts);
   let clearedLock = false;
   if (clearLock) {
@@ -217,7 +247,9 @@ export async function resetFloor({ hold, clearHold = false, clearLock = false, n
     let keep = current.ok ? current.registry?.hold ?? null : null;
     if (clearHold) keep = null;
     else if (hold) keep = canonical(hold);
-    const registry = { version: 1, newest: canonical(MIN_FABLE), provenAt: null, claudeCode: null, transcript: null, history: [], hold: keep };
+    const allow = clearAllow ? [] : [...new Set([...(current.ok ? allowedIds(current.registry) : []), ...allowId])];
+    if (allow.length > ALLOW_MAX) throw codeError('model-floor-bad-allow', `at most ${ALLOW_MAX} allowed ids (${allow.length} asked): clear them with --clear-allow first`);
+    const registry = { version: 1, newest: canonical(MIN_FABLE), provenAt: null, claudeCode: null, transcript: null, history: [], hold: keep, ...(allow.length > 0 ? { allow } : {}) };
     writeRegistry(opts, registry);
     return { floor: floorOf(registry), registry, file: registryFile(dir), clearedLock };
   });

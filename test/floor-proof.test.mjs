@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fableModelsOf, floorAdvice, floorOutput, floorPauseSeam, judgeFloor, mayRaiseFloor } from '../pipeline/lib/floor-proof.mjs';
-import { raiseFloor } from '../pipeline/lib/model-floor.mjs';
+import { raiseFloor, readFloor, resetFloor } from '../pipeline/lib/model-floor.mjs';
 import { proveModel } from '../pipeline/lib/transcript.mjs';
 import { realRegistryFile, registryChange, snapshotRegistry } from '../scripts/lib/registry-snapshot.mjs';
 
@@ -164,4 +164,41 @@ test('the suite-level registry check: absent stays absent; a created, removed or
   fs.rmSync(file);
   assert.match(registryChange(present, snapshotRegistry(file), file), /was removed/);
   assert.match(realRegistryFile('/home/x'), /\/home\/x\/\.claude\/pipeline-state\/owner-go\/model-floor\/fable\.json$/);
+});
+
+// ---- review round 1: R1-F1 (the owner's exact-id allowance) and R1-F2 (every floor failure carries advice) ----
+test('judgeFloor: an unparseable claude-fable-* id is refused until the owner allows that exact id; an allowed id never raises or fails the floor', async (t) => {
+  const dir = path.join(tmp(t), 'model-floor');
+  const judge = (models) => judgeFloor({ models, env: NO_ENV, floorOpts: { dir } });
+  const NEW_ID = 'claude-fable-6-preview';
+  assert.equal(judge({ [NEW_ID]: 1 }).error, 'unrecognised-fable');
+  await resetFloor({ dir, hold: OLD }); // a hold does not admit it
+  assert.equal(judge({ [NEW_ID]: 1 }).error, 'unrecognised-fable', '--hold does not unblock an unparseable id');
+  await resetFloor({ dir, allowId: [NEW_ID] });
+  const ok = judge({ [NEW_ID]: 1, [OLD]: 1 });
+  assert.equal(ok.ok, true, 'allowed (and 5.1 is the held floor)');
+  assert.deepEqual(ok.allowed, [NEW_ID]);
+  assert.equal(judge({ 'claude-fable-6-other': 1 }).error, 'unrecognised-fable', 'only the exact id');
+  assert.equal(readFloor({ dir }).floor, OLD, 'the floor stayed where the hold put it');
+  await resetFloor({ dir, clearAllow: true });
+  assert.equal(judge({ [NEW_ID]: 1 }).error, 'unrecognised-fable', 'cleared: refused again');
+});
+
+test('every floor failure carries advice, in judgeFloor and in floorOutput (stale, unrecognised, unreadable)', (t) => {
+  const dir = path.join(tmp(t), 'model-floor');
+  const judge = (models) => judgeFloor({ models, env: NO_ENV, floorOpts: { dir } });
+  const stale = judge({ [OLD]: 1 });
+  const odd = judge({ 'claude-fable-x': 1 });
+  assert.match(stale.advice, /update Claude Code|restart this terminal/);
+  assert.match(odd.advice, /^do not run the review again yet: update the pipeline, or the owner runs `pipeline model-floor reset --allow-id /);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'fable.json'), 'garbage');
+  const bad = judge({ [FLOOR]: 1 });
+  assert.match(bad.advice, /pipeline model-floor reset/);
+  for (const [j, error] of [[stale, 'stale-model'], [odd, 'unrecognised-fable'], [bad, 'model-floor-unreadable']]) {
+    const out = floorOutput(j);
+    assert.equal(out.error, error);
+    assert.equal(typeof out.advice, 'string', error);
+    assert.notEqual(out.advice, '', error);
+  }
 });

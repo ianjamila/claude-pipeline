@@ -132,10 +132,12 @@ only a fully proven pass (`arbiter apply`) raises it, and it starts at the pipel
 - **Old proofs are re-reviewed, not grandfathered.** `review-complete` and the final gate refuse a PR whose Fable round was proven below the
   newest Fable (the reason says `fable-refresh`); the agent runs `pipeline state fable-refresh --pr N`, which opens one uncounted Fable-only
   round on the pushed head (no Codex, not counted against `review.max_rounds`) that reviews the whole PR diff.
-- **Owner commands.** `pipeline model-floor show` prints the floor, any hold and any lock. `pipeline model-floor reset [--hold <id> | --clear-hold] [--clear-lock]`
+- **Owner commands.** `pipeline model-floor show` prints the floor, any hold and any lock. `pipeline model-floor reset [--hold <id> | --clear-hold] [--allow-id <id> | --clear-allow] [--clear-lock]`
   (your own terminal only) returns the floor to the code constant. `--hold <id>` also sets a ceiling the floor cannot rise above, for an alias
-  rollback or for two accounts that resolve different Fables, until `--clear-hold`. A Fable id the parser cannot read blocks reviews, including the PR
-  that fixes the parser: run `model-floor reset --hold <last good id>` from a plain terminal, then merge the parser fix.
+  rollback or for two accounts that resolve different Fables, until `--clear-hold`; it also lowers the version below which a recorded Fable proof is
+  re-reviewed, so a review proven with the held model can complete. A Fable id the parser cannot read blocks reviews, including the PR that fixes the
+  parser (a hold does not help): run `model-floor reset --allow-id <the exact new id>` from a plain terminal (repeatable, at most 10; it never raises the
+  floor), merge the parser fix, then `model-floor reset --clear-allow`. Every floor failure of `arbiter apply` carries an `advice` line saying which of these to do.
 - **Cost reports** price each call per model version, so a Fable bump does not reprice earlier PRs.
 
 ## Using it

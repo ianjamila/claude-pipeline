@@ -49,7 +49,9 @@ test('meta documents reset, the hold use and the owner-only rule', () => {
   assert.match(meta.usage, /model-floor reset \[--hold <fable model id> \| --clear-hold\] \[--clear-lock\]/);
   assert.match(meta.usage, /alias/);
   assert.match(meta.usage, /parser/);
-  assert.match(meta.usage, /last good id/);
+  assert.match(meta.usage, /--allow-id <exact claude-fable-… id> \.\.\. \| --clear-allow/);
+  assert.match(meta.usage, /model-floor reset --allow-id <the new id>/, 'the documented recovery for an unreadable id is the allowance, not a hold');
+  assert.match(meta.usage, /--clear-allow/);
   assert.match(meta.usage, /refused inside Claude Code/);
 });
 
@@ -214,4 +216,54 @@ test('the real binary runs show against the scratch registry and reports a usage
   const bad = spawnSync(process.execPath, [bin, 'model-floor', 'reset', '--hold', 'claude-opus-4-6'], { encoding: 'utf8', env: ownerEnv(dir) });
   assert.equal(bad.status, 2, bad.stderr);
   assert.equal(JSON.parse(bad.stdout).error, 'usage');
+});
+
+// ---- reset --allow-id / --clear-allow (review round 1: R1-F1) ----
+test('reset --allow-id stores exact ids (repeatable) and shows them in the output; --clear-allow removes them; a plain reset keeps them', async (t) => {
+  const dir = scratch(t);
+  const r = await run(['reset', '--allow-id', 'claude-fable-6-preview', '--allow-id', 'claude-fable-6-b'], asOwner(dir));
+  assert.equal(r.exitCode, 0);
+  assert.deepEqual(r.output, { ok: true, floor: MIN_FABLE, hold: null, allow: ['claude-fable-6-preview', 'claude-fable-6-b'], file: reg(dir), clearedLock: false });
+  assert.deepEqual(readReg(dir).allow, ['claude-fable-6-preview', 'claude-fable-6-b']);
+  assert.equal(readFloor({ dir }).floor, MIN_FABLE, 'it never raises the floor');
+  assert.deepEqual((await run(['show'], asOwner(dir))).output.registry.allow, ['claude-fable-6-preview', 'claude-fable-6-b']);
+  assert.deepEqual((await run(['reset'], asOwner(dir))).output.allow, ['claude-fable-6-preview', 'claude-fable-6-b']);
+  const cleared = await run(['reset', '--clear-allow'], asOwner(dir));
+  assert.equal(cleared.exitCode, 0);
+  assert.equal(Object.hasOwn(cleared.output, 'allow'), false);
+  assert.equal(Object.hasOwn(readReg(dir), 'allow'), false);
+});
+
+test('reset --allow-id is refused inside Claude Code (env and ancestor), registry untouched', async (t) => {
+  const dir = scratch(t);
+  raiseFloor({ dir, model: 'claude-fable-5-5', now: NOW });
+  const before = readFileSync(reg(dir), 'utf8');
+  const inEnv = await run(['reset', '--allow-id', 'claude-fable-6-preview'], { env: { ...ownerEnv(dir), CLAUDECODE: '1' }, hasClaudeCodeAncestor: () => false });
+  assert.equal(inEnv.exitCode, 2);
+  assert.equal(inEnv.output.error, 'refused');
+  for (const args of [['reset', '--allow-id', 'claude-fable-6-preview'], ['reset', '--clear-allow']]) {
+    const r = await run(args, { env: ownerEnv(dir), hasClaudeCodeAncestor: () => true });
+    assert.equal(r.exitCode, 2, args.join(' '));
+    assert.equal(r.output.error, 'refused');
+  }
+  const bin2 = spawnSync(process.execPath, [bin, 'model-floor', 'reset', '--allow-id', 'claude-fable-6-preview'], { encoding: 'utf8', env: { ...ownerEnv(dir), CLAUDECODE: '1' } });
+  assert.equal(bin2.status, 2, bin2.stderr);
+  assert.equal(JSON.parse(bin2.stdout).error, 'refused');
+  assert.equal(readFileSync(reg(dir), 'utf8'), before);
+});
+
+test('reset --allow-id usage errors: a non-claude-fable id, an empty one, both flags, more than ten; nothing is written', async (t) => {
+  const dir = scratch(t);
+  raiseFloor({ dir, model: 'claude-fable-5-5', now: NOW });
+  const before = readFileSync(reg(dir), 'utf8');
+  const eleven = ['reset', ...Array.from({ length: 11 }, (_, i) => ['--allow-id', `claude-fable-${i + 10}`]).flat()];
+  const cases = [
+    ['reset', '--allow-id', 'claude-opus-4-6'], ['reset', '--allow-id', 'fable'], ['reset', '--allow-id', ''], ['reset', '--allow-id'],
+    ['reset', '--allow-id', 'claude-fable-6', '--clear-allow'], ['show', '--allow-id', 'claude-fable-6'], ['show', '--clear-allow'],
+  ];
+  for (const args of cases) await assert.rejects(run(args, asOwner(dir)), UsageError, JSON.stringify(args));
+  const tooMany = await run(eleven, asOwner(dir));
+  assert.equal(tooMany.exitCode, 2);
+  assert.equal(tooMany.output.error, 'model-floor-bad-allow');
+  assert.equal(readFileSync(reg(dir), 'utf8'), before);
 });

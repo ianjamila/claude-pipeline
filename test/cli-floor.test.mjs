@@ -13,7 +13,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { scratchFloorDir } from './helpers/floor-env.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
-import { readFloor, withFloorLock } from '../pipeline/lib/model-floor.mjs';
+import { readFloor, resetFloor, withFloorLock } from '../pipeline/lib/model-floor.mjs';
 
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id'; // the in-process floor lock must not create a machine-id file in the real pipeline state folder
 const here = dirname(fileURLToPath(import.meta.url));
@@ -234,6 +234,8 @@ test('arbiter apply: an unparseable claude-fable-* id fails closed; an unreadabl
   assert.equal(odd.json.error, 'unrecognised-fable');
   assert.ok(odd.json.errors.includes('unrecognised Fable version id claude-fable-x: update the pipeline'), odd.json.errors.join('|'));
   assert.equal(odd.json.restartRequired, undefined, 'not "below the floor": a restart does not help');
+  assert.match(odd.json.advice, /^do not run the review again yet: update the pipeline, or the owner runs `pipeline model-floor reset --allow-id /, 'R1-F2: the output carries advice');
+  assert.equal(w.state().rounds[0].arbiter.failure.advice, odd.json.advice);
 
   const w2 = world(t).prepare();
   mkdirSync(w2.floor, { recursive: true });
@@ -243,6 +245,7 @@ test('arbiter apply: an unparseable claude-fable-* id fails closed; an unreadabl
   assert.equal(r.json.ok, false);
   assert.equal(r.json.error, 'model-floor-unreadable');
   assert.match(r.json.errors.join('|'), /fable\.json.*unreadable.*pipeline model-floor reset/s);
+  assert.match(r.json.advice, /^the owner runs `pipeline model-floor reset` in a plain terminal$/, 'R1-F2: the output carries advice');
   assert.equal(readFileSync(join(w2.floor, 'fable.json'), 'utf8'), '{ not json', 'nothing overwrote the corrupt registry');
 });
 
@@ -328,6 +331,8 @@ test('arbiter apply: a registry write failure fails the proof (model-floor-unwri
   assert.equal(r.json.ok, false);
   assert.equal(r.json.error, 'model-floor-unwritable');
   assert.match(r.json.message, /cannot write the model floor registry/);
+  assert.match(r.json.advice, /^the owner runs `pipeline model-floor reset` in a plain terminal$/, 'R1-F2: the output carries advice');
+  assert.equal(r.json.advice, w.state().rounds[0].arbiter.failure.advice);
   assert.deepEqual(minusFailure(w.state()), JSON.parse(before), 'nothing was saved but the failure record');
   assert.equal(w.state().rounds[0].arbiter.failure.cause, 'model-floor-unwritable');
   assert.equal(existsSync(join(w.repo.dir, '.review', 'round-1', 'rulings.json')), false);
@@ -350,10 +355,36 @@ test('arbiter apply: a floor lock held by another process is a named error (mode
   assertExit(r, 1, r.stdout + r.stderr);
   assert.equal(r.json.error, 'model-floor-busy');
   assert.match(r.json.message, /another review is updating the model floor/);
+  assert.match(r.json.advice, /^another review holds the machine-wide floor lock: run `arbiter apply` again in a minute/, 'R1-F2: the output carries advice');
+  assert.equal(r.json.advice, w.state().rounds[0].arbiter.failure.advice);
   assert.deepEqual(minusFailure(w.state()), JSON.parse(before), 'nothing was saved but the failure record');
   assert.equal(w.state().rounds[0].arbiter.failure.cause, 'model-floor-busy');
   const retry = apply(w, [], own);
   assertExit(retry, 0, retry.stdout);
+});
+
+// ---- the owner's exact-id allowance (review round 1: R1-F1) ----------------------------------------------------------------------------
+
+test('arbiter apply: an unparseable claude-fable-* id is refused, then proves once the owner allows that exact id (never raising the floor); --clear-allow refuses it again', async (t) => {
+  const NEW_ID = 'claude-fable-6-preview';
+  const w = world(t).prepare();
+  const projects = w.installLoose({ models: [NEW_ID] });
+  const refused = apply(w, ['--projects-dir', projects], { PIPELINE_TEST_MODE: '1' });
+  assertExit(refused, 1, refused.stdout);
+  assert.equal(refused.json.error, 'unrecognised-fable');
+  await resetFloor({ dir: w.floor, hold: OLD }); // a hold alone does not help
+  assert.equal(apply(w, ['--projects-dir', projects], { PIPELINE_TEST_MODE: '1' }).json.error, 'unrecognised-fable');
+  await resetFloor({ dir: w.floor, allowId: [NEW_ID] });
+  const own = w.installOwn({ models: [NEW_ID] });
+  const proven = apply(w, [], own);
+  assertExit(proven, 0, proven.stdout + proven.stderr);
+  assert.equal(w.state().rounds[0].arbiter.proofOk, true);
+  assert.equal(w.registry().floor, OLD, 'an allowed id, even from the account\'s own folder, never raises the floor');
+  assert.deepEqual(w.registry().registry.allow, [NEW_ID]);
+  await resetFloor({ dir: w.floor, clearAllow: true });
+  const again = apply(w, ['--projects-dir', projects], { PIPELINE_TEST_MODE: '1' });
+  assertExit(again, 1, again.stdout);
+  assert.equal(again.json.error, 'unrecognised-fable');
 });
 
 // ---- retry and advice ----------------------------------------------------------------------------------------------------------------

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { accountHome } from './paths.mjs';
 import { compareSemver, installedVersion, runningVersion } from './claude-code-version.mjs';
-import { FLOOR_DIR_ENV, checkFloor, compareVersions, parseModelId, readFloor } from './model-floor.mjs';
+import { FLOOR_DIR_ENV, allowedIds, checkFloor, compareVersions, parseModelId, readFloor } from './model-floor.mjs';
 import { isInstalledCopy, pipelineRoot, seamValue } from './seams.mjs';
 
 // Test-only seams (a repo checkout honours them, an installed copy ignores them, like PIPELINE_TEST_MODE):
@@ -42,13 +42,15 @@ export function floorAdvice({ claudeCodeVersions, env, deps } = {}) {
   return 'update Claude Code, or the owner runs `pipeline model-floor reset` in a plain terminal if the floor is wrong, then run the review again';
 }
 
+// A claude-fable-* id the parser cannot read: only a pipeline update, or the owner's exact-name allowance (model-floor reset --allow-id), clears it.
+export const UNRECOGNISED_ADVICE = 'do not run the review again yet: update the pipeline, or the owner runs `pipeline model-floor reset --allow-id <the exact claude-fable-… id>` in a plain terminal (then `--clear-allow` once the parser knows the id)';
 const fableOrder = (a, b) => compareVersions(parseModelId(a) ?? { major: 0, minor: 0 }, parseModelId(b) ?? { major: 0, minor: 0 });
 
 // Judge the Fable models of a proof against the floor (read-only).
 //   -> { applies: false }                                     no Fable on any line: the floor does not apply
 //   -> { applies: true, ok, floor, seen, older, errors[], error, restartRequired, advice, floorOpts }
-// `error` is the machine-readable code of the first failure: 'stale-model' | 'unrecognised-fable' | 'model-floor-unreadable'. Fails closed on an
-// unreadable registry and on a claude-fable-* id the parser cannot read.
+// `error` is the machine-readable code of the first failure: 'stale-model' | 'unrecognised-fable' | 'model-floor-unreadable'; every failure carries
+// `advice`. Fails closed on an unreadable registry and on a claude-fable-* id the parser cannot read unless the owner allowed that exact id.
 export function judgeFloor({ models, claudeCodeVersions = [], env, floorOpts = {}, deps } = {}) {
   const seen = fableModelsOf(models).sort(fableOrder);
   if (seen.length === 0) return { applies: false };
@@ -60,7 +62,8 @@ export function judgeFloor({ models, claudeCodeVersions = [], env, floorOpts = {
       advice: 'the owner runs `pipeline model-floor reset` in a plain terminal', unreadable: true,
     };
   }
-  const check = checkFloor({ models: seen, floor: read.floor });
+  const allow = allowedIds(read.registry);
+  const check = checkFloor({ models: seen, floor: read.floor, allow });
   const errors = [];
   let error = null;
   let restartRequired = false;
@@ -77,8 +80,9 @@ export function judgeFloor({ models, claudeCodeVersions = [], env, floorOpts = {
     errors.push(`unrecognised Fable version id ${id}: update the pipeline`);
     error ??= 'unrecognised-fable';
   }
+  if (check.unparseable.length > 0) advice ??= UNRECOGNISED_ADVICE;
   return {
-    applies: true, ok: check.ok, floor: read.floor, seen, older: check.older, unparseable: check.unparseable, errors, error, restartRequired,
+    applies: true, ok: check.ok, floor: read.floor, seen, allowed: seen.filter((id) => allow.includes(id)), older: check.older, unparseable: check.unparseable, errors, error, restartRequired,
     ...(advice ? { advice } : {}), floorOpts: opts,
   };
 }

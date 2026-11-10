@@ -16,13 +16,13 @@ import { fingerprint, largeBinaryNote, resolutionBaseNote, resolutionSection } f
 import { GitError, ReviewBaseUnavailable, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
 import { claudeCodeStatus } from '../lib/claude-code-version.mjs';
 import { floorOutput, floorPauseSeam, floorWaitMs, fableModelsOf, judgeFloor, mayRaiseFloor } from '../lib/floor-proof.mjs';
-import { compareVersions, parseModelId, raiseFloor, withFloorLock } from '../lib/model-floor.mjs';
+import { compareVersions, parseModelId, raiseFloor, readReviewGate, withFloorLock } from '../lib/model-floor.mjs';
 import { seamFlag } from '../lib/proc.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
 import { extractJsonBlock, findSubagentTranscript, proveModel } from '../lib/transcript.mjs';
 import {
   MALFUNCTION_CAUSES, applyRulings, arbiterNeeded, fableFindingItems, finalizeWithoutArbiter, isOwnerRuled, isProtectedFinal, needsHumanCause, provenNotStale, reuseRuled,
-  ruledCacheFrom, validateRulings,
+  ruledCacheFrom, staleFableRounds, validateRulings,
 } from '../lib/triage.mjs';
 import {
   ensureRoundDir, excerptWindow, findRound, oneLine, patchRound, readFileOrFail, requireState, roundDir, sha256,
@@ -48,7 +48,8 @@ export const meta = {
     '  any Fable on any line of the transcript must be at least this machine\'s floor (whatever --expect-model says): older => exit 1, error stale-model,',
     '    restartRequired: true, floor: {newest, seen}, advice (restart this terminal, or update Claude Code); the items wait with cause stale-model. A proven pass',
     '    with a newer Fable raises the floor (only a transcript under the account\'s own projects folder, no --projects-dir; exit 1 model-floor-busy / model-floor-unwritable otherwise unproven)',
-    '  an apply that fails on the floor (stale-model, model-floor-unreadable, unrecognised-fable, model-floor-busy, model-floor-unwritable) saves round.arbiter.failure {cause, advice, at}',
+    '  an apply that fails on the floor (stale-model, model-floor-unreadable, unrecognised-fable, model-floor-busy, model-floor-unwritable) saves round.arbiter.failure {cause, advice, at} and prints the same `advice` in its output;',
+    '    model-floor-busy: run apply again in a minute; the other causes are not fixed by another Fable pass',
     '    (a zero-item Fable round has no item to carry the cause); the next apply that proves clears it',
     '  mode review: the answer must also carry `findings` (Fable\'s own review, [] when clean); proven findings become items R<n>-F<k>;',
     '    unproven ones are kept in rulings.json as `unverifiedFindings` and the round stays Fable-pending (run needed + the arbiter again)',
@@ -137,20 +138,23 @@ function needed(rest, ctx) {
 const failureOf = (cause, advice) => ({ cause, advice: advice ?? null, at: new Date().toISOString() });
 const withFailure = (state, n, failure) => patchRound(state, n, { arbiter: { ...(findRound(state, n).arbiter ?? {}), failure } });
 
-// The advice a floor failure carries (judgeFloor gives one for a stale or unreadable floor; an unreadable Fable id has none).
-const floorAdviceFor = (judged) => judged.advice ?? (judged.error === 'unrecognised-fable' ? 'update the pipeline, then run the review again' : null);
+// The advice a floor failure carries (judgeFloor gives one for every cause: stale, unreadable registry, unrecognised id).
+const floorAdviceFor = (judged) => judged.advice ?? null;
 
 const isFableRound = (round) => round.fableRequired === true && round.baseOnly !== true;
 const FABLE_DIFF = 'fable-diff.patch';
 
 // The diff a Fable pass reviews, written next to its input and pinned by digest. The first proven Fable pass of a PR sees
 // the WHOLE PR (fork point..this round's head): a PR that only became medium in a later round must not have its first
-// rounds go unreviewed by Fable. After that, each round's own slice (what Codex saw), like Codex. A pass proven below MIN_FABLE does not count
-// as earlier (the first fresh-model pass reads everything again), and a Fable refresh round always reads the whole PR. The scope is stored on
-// the round (arbiter.scope) because staleFableRounds only accepts a later whole-PR pass as the replacement of an old one.
-function writeFableDiff(state, round, root) {
-  const earlierProven = state.rounds.some((r) => r.n < round.n && isFableRound(r) && provenNotStale(r));
-  const scope = earlierProven && round.fableRefresh !== true ? 'round' : 'whole-pr';
+// rounds go unreviewed by Fable. After that, each round's own slice (what Codex saw), like Codex. A pass proven below the re-review threshold (MIN_FABLE, or
+// the owner's lower hold) does not count as earlier (the first fresh-model pass reads everything again); a Fable refresh round, and any pass made while a stale
+// round is still unreplaced, read the whole PR. The scope is stored on the round (arbiter.scope) because staleFableRounds only accepts a later whole-PR
+// pass as the replacement of an old one.
+function writeFableDiff(state, round, root, gate) {
+  const earlierProven = state.rounds.some((r) => r.n < round.n && isFableRound(r) && provenNotStale(r, gate));
+  // Any stale round no whole-PR pass has replaced yet: this pass must read everything, or it could never replace it (staleFableRounds).
+  const replacesStale = staleFableRounds(state, gate).length > 0;
+  const scope = earlierProven && round.fableRefresh !== true && !replacesStale ? 'round' : 'whole-pr';
   // A synthetic / resolution round's base is a tree that exists only where it was made: rebuilt here when this clone lacks it,
   // and never replaced by another range (a different review) when it cannot be.
   let from;
@@ -265,7 +269,7 @@ function neededLocked(values, n, root, ctx) {
   const items = round.items.filter((item) => arbiterNeeded(item, { lightLane: state.lightLane, force }));
   if (!review && items.length === 0) return { exitCode: EXIT.OK, output: { needed: false, items: [], mode } };
 
-  const diff = review ? writeFableDiff(state, round, root) : null;
+  const diff = review ? writeFableDiff(state, round, root, readReviewGate({ env: ctx.env ?? process.env })) : null;
   const itemsPart = items.length > 0
     ? [`# Items to rule on (${items.length})`, '', ...items.map((item) => itemSection(item, root))]
     : ['# Items to rule on (0)', '', '_Codex raised nothing left to rule on in this round: your own review is the whole job._', ''];
@@ -499,8 +503,10 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
       errors.push(...judged.errors);
       if (judged.ok) {
         await floorPauseSeam(env);
-        const top = fableModelsOf(proof.models).reduce((a, b) => (compareVersions(parseModelId(b), parseModelId(a)) > 0 ? b : a));
-        if (compareVersions(parseModelId(top), parseModelId(judged.floor)) > 0 && mayRaiseFloor({ transcript: found.jsonlPath, projectsDirGiven: projectsDir !== undefined, env }).ok) {
+        // An id the owner allowed by name (possibly unparseable) never raises the floor.
+        const raisable = fableModelsOf(proof.models).filter((id) => parseModelId(id) !== null && !judged.allowed.includes(id));
+        const top = raisable.length === 0 ? null : raisable.reduce((a, b) => (compareVersions(parseModelId(b), parseModelId(a)) > 0 ? b : a));
+        if (top !== null && compareVersions(parseModelId(top), parseModelId(judged.floor)) > 0 && mayRaiseFloor({ transcript: found.jsonlPath, projectsDirGiven: projectsDir !== undefined, env }).ok) {
           try {
             raiseFloor({ env, model: top, claudeCode: claudeCodeVersions.length > 0 ? claudeCodeVersions[claudeCodeVersions.length - 1] : null, transcript: found.jsonlPath });
           } catch (err) {
@@ -521,7 +527,7 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
         ? 'another review holds the machine-wide floor lock: run `arbiter apply` again in a minute; if it persists, the owner runs `pipeline model-floor reset --clear-lock` in a plain terminal'
         : 'the owner runs `pipeline model-floor reset` in a plain terminal';
       saveState(root, withFailure(requireState(root), n, failureOf(err.code, advice)));
-      throw new Fail(EXIT.FAILED, { ok: false, error: err.code, message: err.message });
+      throw new Fail(EXIT.FAILED, { ok: false, error: err.code, message: err.message, advice });
     }
     throw err;
   }
