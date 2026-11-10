@@ -16,6 +16,7 @@ export const meta = {
     '  -> {ok, transcript, meta, models, efforts, claudeCodeVersions, errors, finalAssistantText, stopReasonMissing, finalVia}; exit 0 proven, 1 mismatch, 2 not found/unreadable',
     '  any Fable on any line must also be at least this machine\'s floor (read-only here, the floor is never raised): older => exit 1, error stale-model, restartRequired: true,',
     '    floor: {newest, seen}, advice',
+    '  a proof that passed only through an owner allowance (an id the parser cannot read) or a hold below MIN_FABLE adds floor: {newest, allowed: [ids], heldBelowMin: <hold>|null} to the output',
   ].join('\n'),
 };
 

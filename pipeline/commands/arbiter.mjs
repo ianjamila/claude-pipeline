@@ -15,7 +15,7 @@ import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { fingerprint, largeBinaryNote, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
 import { GitError, ReviewBaseUnavailable, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
 import { claudeCodeStatus } from '../lib/claude-code-version.mjs';
-import { floorOutput, floorPauseSeam, floorWaitMs, fableModelsOf, judgeFloor, mayRaiseFloor } from '../lib/floor-proof.mjs';
+import { floorBypass, floorOutput, floorPauseSeam, floorWaitMs, fableModelsOf, judgeFloor, mayRaiseFloor } from '../lib/floor-proof.mjs';
 import { compareVersions, parseModelId, raiseFloor, readReviewGate, withFloorLock } from '../lib/model-floor.mjs';
 import { seamFlag } from '../lib/proc.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
@@ -48,6 +48,8 @@ export const meta = {
     '  any Fable on any line of the transcript must be at least this machine\'s floor (whatever --expect-model says): older => exit 1, error stale-model,',
     '    restartRequired: true, floor: {newest, seen}, advice (restart this terminal, or update Claude Code); the items wait with cause stale-model. A proven pass',
     '    with a newer Fable raises the floor (only a transcript under the account\'s own projects folder, no --projects-dir; exit 1 model-floor-busy / model-floor-unwritable otherwise unproven)',
+    '  a proof that passed only through an owner allowance (an id the parser cannot read) or a hold below MIN_FABLE adds floor: {newest, allowed: [ids], heldBelowMin: <hold>|null} to the output',
+    '    and allowed / heldBelowMin (each only when present) to round-N/model-proof.json and the round\'s stored modelProof summary',
     '  an apply that fails on the floor (stale-model, model-floor-unreadable, unrecognised-fable, model-floor-busy, model-floor-unwritable) saves round.arbiter.failure {cause, advice, at} and prints the same `advice` in its output;',
     '    model-floor-busy: run apply again in a minute; the other causes are not fixed by another Fable pass',
     '    (a zero-item Fable round has no item to carry the cause); the next apply that proves clears it',
@@ -454,12 +456,16 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
       ...(review && proofOk ? { findings: rulings.findings } : {}),
       ...(!proofOk && rulings ? { unverified: rulings.rulings, ...(review ? { unverifiedFindings: rulings.findings } : {}) } : {}),
     });
+    // A proof that passed only through an owner allowance or a hold below MIN_FABLE says so (absent otherwise: old states and digests do not change).
+    const bypass = floorBypass(judged);
+    const bypassFields = { ...(bypass?.allowed.length > 0 ? { allowed: bypass.allowed } : {}), ...(bypass?.heldBelowMin ? { heldBelowMin: bypass.heldBelowMin } : {}) };
     writeJson(path.join(dir, 'model-proof.json'), {
       ok: proofOk, transcript: found.jsonlPath, models: proof.models, efforts: proof.efforts, stopReasonMissing: proof.stopReasonMissing, finalVia: proof.finalVia, claudeCodeVersions, errors, tag, round: n,
+      ...bypassFields,
     });
     // The proof summary rides in the round, so the triage comment (which embeds the state) carries it to another machine.
     const efforts = proof.efforts && typeof proof.efforts === 'object' ? Object.keys(proof.efforts).join(', ') : '';
-    const modelProof = proofOk ? { transcript: found.jsonlPath, models: proof.models, ...(efforts ? { effort: efforts } : {}) } : undefined;
+    const modelProof = proofOk ? { transcript: found.jsonlPath, models: proof.models, ...(efforts ? { effort: efforts } : {}), ...bypassFields } : undefined;
     // A floor failure is recorded on the round (a zero-item Fable round has no item to carry it); a proven or otherwise-failed apply clears the old one.
     const { failure: _earlier, ...storedNow } = stored;
     const failure = !proofOk && judged.applies === true && typeof judged.error === 'string' ? failureOf(judged.error, floorAdviceFor(judged)) : null;
@@ -504,7 +510,7 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
       if (judged.ok) {
         await floorPauseSeam(env);
         // An id the owner allowed by name (possibly unparseable) never raises the floor.
-        const raisable = fableModelsOf(proof.models).filter((id) => parseModelId(id) !== null && !judged.allowed.includes(id));
+        const raisable = fableModelsOf(proof.models).filter((id) => parseModelId(id) !== null && !judged.allowedSeen.includes(id));
         const top = raisable.length === 0 ? null : raisable.reduce((a, b) => (compareVersions(parseModelId(b), parseModelId(a)) > 0 ? b : a));
         if (top !== null && compareVersions(parseModelId(top), parseModelId(judged.floor)) > 0 && mayRaiseFloor({ transcript: found.jsonlPath, projectsDirGiven: projectsDir !== undefined, env }).ok) {
           try {

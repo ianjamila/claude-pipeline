@@ -16,7 +16,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, reviewLane } from '../lib/risk.mjs';
 import { loadState } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
-import { reviewEligibilityProblems, reviewValidFor, roundOutcome, rulingsDigest, staleFableReason, staleFableRounds } from '../lib/triage.mjs';
+import { fableBypassNote, fableBypassRounds, reviewEligibilityProblems, reviewValidFor, roundOutcome, rulingsDigest, staleFableReason, staleFableRounds } from '../lib/triage.mjs';
 import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
@@ -43,6 +43,9 @@ export const meta = {
     '  same check as the final gate\'s review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise',
     '  a proven Fable round recorded with a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) that no later whole-PR pass at or above it replaced is refused: exit 1 {ok:false, error:fable-refresh, reason, staleFableRounds:[{round, models}]},',
     '  the reason names the rounds and models and says `run `pipeline state fable-refresh --pr N``; the final gate\'s review check refuses the same PR the same way',
+    '  when a proven Fable round counts as current only because of the owner\'s allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line',
+    '  "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},',
+    '  and the final gate\'s review check detail carries the same note',
   ].join('\n'),
 };
 
@@ -104,7 +107,8 @@ export function reviewRecord(state, { contentHash, base, head, modelProofs, defa
 
 // docsExempt ({ files, reviewedHead }, lib/docs-exempt.mjs): the head is past the last reviewed one only by lines added to listed documents.
 // The record is unchanged (the guards read the same JSON); the extra line is for the people reading the PR.
-export function reviewCompleteBody(record, docsExempt = null) {
+// fableNote (triage.mjs#fableBypassNote): a Fable round counts as current only because of an owner allowance or hold; the line sits outside the JSON record.
+export function reviewCompleteBody(record, docsExempt = null, fableNote = null) {
   const fable = record.modelProofDigest ? `, Fable proof \`${record.modelProofDigest.slice(0, 8)}\`` : '';
   const docs = docsExempt
     ? [`**Docs-only exemption** (review.docs_exempt_paths): lines were added to ${docsExempt.files.map((f) => `\`${f}\``).join(', ')} after the last reviewed head \`${docsExempt.reviewedHead.slice(0, 12)}\`; no new review round.`]
@@ -113,6 +117,7 @@ export function reviewCompleteBody(record, docsExempt = null) {
     REVIEW_COMPLETE_MARKER,
     `**Cross-model review complete** for \`${record.head.slice(0, 12)}\`: ${record.rounds} round(s), Codex \`${record.codexModel}\`${fable}.`,
     ...docs,
+    ...(fableNote ? [`**Standing Fable bypass:** ${fableNote}.`] : []),
     '',
     '```json',
     JSON.stringify(record),
@@ -195,7 +200,9 @@ export const run = guarded(async (argv, ctx) => {
       const record = reviewRecord(state, {
         contentHash: hash, base, head: local, modelProofs: fableProofs(state), defaultCodexModel: config.review.codex_model,
       });
-      const body = reviewCompleteBody(record, docsExempt);
+      const bypass = fableBypassRounds(state, gate);
+      const fableNote = fableBypassNote(bypass, gate);
+      const body = reviewCompleteBody(record, docsExempt, fableNote);
       // Retrying after a crash must not stack identical comments: our own latest marker comment with this exact body stands.
       // It must also be what the guard workflow will judge (lib/review-marker.mjs#latestReviewComment): the newest marker comment
       // of ANY author, and never edited — an edited one, even if edited back to this text, fails there forever (Codex review of
@@ -235,6 +242,7 @@ export const run = guarded(async (argv, ctx) => {
         output: {
           ok: true, ...(reused ? { reused: true } : { posted: true }), comment, review: record, removed: true, recheck,
           ...(docsExempt ? { docsExempt: { files: docsExempt.files, reviewedHead: docsExempt.reviewedHead } } : {}),
+          ...(fableNote ? { fableBypass: { note: fableNote, rounds: bypass } } : {}),
           ...(recheckError ? { recheckError } : {}), pr, currentContentHash: hash,
         },
       };

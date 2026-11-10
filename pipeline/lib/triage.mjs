@@ -168,16 +168,17 @@ const isProvenFableRound = (r) => r?.fableRequired === true && r.baseOnly !== tr
 // it from the registry (model-floor.mjs#readReviewGate: the owner's hold when it is below MIN_FABLE, else MIN_FABLE) and pass it in; these helpers stay pure.
 const DEFAULT_GATE = { threshold: MIN_FABLE, allow: [] };
 // The Fable ids a round was proven with (modelProof.models is keyed by model id) split by the threshold. A `claude-fable-*` id the parser cannot read
-// is stale (fail closed, like the floor itself) unless the owner allowed it; an id of another family is not a Fable and is ignored.
+// is stale (fail closed, like the floor itself) unless the owner allowed it; an id of another family is not a Fable and is ignored. The allowance covers
+// only an id the parser cannot read: an allowed id that parses is judged by version like any other, so one a later threshold has passed is stale again.
 const fableModelsOf = (r, { threshold = MIN_FABLE, allow = [] } = DEFAULT_GATE) => {
   const min = parseModelId(threshold);
   const stale = [];
   const current = [];
   for (const id of Object.keys(r?.modelProof?.models && typeof r.modelProof.models === 'object' ? r.modelProof.models : {})) {
-    if (allow.includes(id)) { current.push(id); continue; }
     const p = parseModelId(id);
     if (p === null) {
-      if (/^claude-fable(-|$)/.test(id)) stale.push(id);
+      if (allow.includes(id)) current.push(id);
+      else if (/^claude-fable(-|$)/.test(id)) stale.push(id);
     } else if (p.family === 'fable') {
       (compareVersions(p, min) < 0 ? stale : current).push(id);
     }
@@ -211,6 +212,28 @@ export const staleFableReason = (stale, pr, threshold = MIN_FABLE) => `the Fable
 // A proven Fable pass that is not below the threshold (any scope; a proof that recorded no Fable id counts as it always did): the passes below it do
 // not count for arbiter.mjs#writeFableDiff's "the first pass reviews the whole PR" rule, so the first fresh-model pass after old ones reads everything.
 export const provenNotStale = (r, gate = DEFAULT_GATE) => isProvenFableRound(r) && fableModelsOf(r, gate).stale.length === 0;
+
+// The proven Fable rounds that count as current ONLY because of an owner allowance (an id the parser cannot read) or a hold below MIN_FABLE (an id older
+// than MIN_FABLE that the lowered threshold admits): [{ round, via: 'allow' | 'hold', id }] in round order. A round that is stale is not listed (the refusal
+// names it). Pure: `gate` = { threshold, allow } as for staleFableRounds.
+export function fableBypassRounds(state, gate = DEFAULT_GATE) {
+  const min = parseModelId(MIN_FABLE);
+  const out = [];
+  for (const r of state?.rounds ?? []) {
+    if (!provenNotStale(r, gate)) continue;
+    for (const id of fableModelsOf(r, gate).current) {
+      const p = parseModelId(id);
+      if (p === null) out.push({ round: r.n, via: 'allow', id });
+      else if (compareVersions(p, min) < 0) out.push({ round: r.n, via: 'hold', id });
+    }
+  }
+  return out;
+}
+// One short line for review-complete and the final gate: "Fable round 3 counted via owner allowance X; Fable round 4 counted via owner hold Y (below Z)". null when none.
+// The hold is named by the threshold it set (gate.threshold), which is the registry's hold whenever it is below MIN_FABLE.
+export const fableBypassNote = (bypass, gate = DEFAULT_GATE) => (bypass.length === 0 ? null : bypass
+  .map((b) => (b.via === 'allow' ? `Fable round ${b.round} counted via owner allowance ${b.id}` : `Fable round ${b.round} counted via owner hold ${gate.threshold} (below ${MIN_FABLE})`))
+  .join('; '));
 
 // ---- judge, tests ---------------------------------------------------------------------------
 

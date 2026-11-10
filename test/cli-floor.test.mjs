@@ -490,3 +490,57 @@ test('interleaving: a 5.3 proof in another process (another HOME) cannot raise t
   assert.equal(a.registry().floor, NEWER, 'then B raised it');
   assert.ok(statSync(join(a.repo.dir, '.review', 'state.json')).mtimeMs <= statSync(join(a.floor, 'fable.json')).mtimeMs, 'A published before B raised');
 });
+
+// ---- review round 2: R2-F2 (a standing bypass is visible; an allowance never admits an id the parser reads below the floor) --------------
+
+const proofFile = (w) => JSON.parse(readFileSync(join(w.repo.dir, '.review', 'round-1', 'model-proof.json'), 'utf8'));
+
+test('R2-F2 (a): arbiter apply, model-proof.json and the stored modelProof name the ids that passed only through the allowance; a plain pass carries none of it', async (t) => {
+  const NEW_ID = 'claude-fable-6-preview';
+  const plain = world(t).prepare();
+  const ok = apply(plain, ['--projects-dir', plain.installLoose({ models: [FLOOR] })]);
+  assertExit(ok, 0, ok.stdout);
+  assert.equal(Object.hasOwn(ok.json, 'floor'), false, 'a plain proof adds no floor field');
+  assert.equal(Object.hasOwn(proofFile(plain), 'allowed') || Object.hasOwn(proofFile(plain), 'heldBelowMin'), false);
+  assert.deepEqual(Object.keys(plain.state().rounds[0].modelProof ?? {}).filter((k) => k === 'allowed' || k === 'heldBelowMin'), []);
+
+  const w = world(t).prepare();
+  await resetFloor({ dir: w.floor, allowId: [NEW_ID] });
+  const r = apply(w, ['--projects-dir', w.installLoose({ models: [NEW_ID] })], { PIPELINE_TEST_MODE: '1' });
+  assertExit(r, 0, r.stdout);
+  assert.deepEqual(r.json.floor, { newest: FLOOR, allowed: [NEW_ID], heldBelowMin: null });
+  assert.deepEqual(proofFile(w).allowed, [NEW_ID]);
+  assert.equal(Object.hasOwn(proofFile(w), 'heldBelowMin'), false, 'absent when null');
+  assert.deepEqual(w.state().rounds[0].modelProof.allowed, [NEW_ID]);
+  assert.equal(w.state().rounds[0].arbiter.proofOk, true);
+});
+
+test('R2-F2 (a): a hold below MIN_FABLE that let the proof pass is named as heldBelowMin (apply and model-proof)', async (t) => {
+  const w = world(t).prepare();
+  await resetFloor({ dir: w.floor, hold: OLD });
+  const mp = w.cli(['model-proof', '--tag', w.needed.tag, '--projects-dir', w.installLoose({ models: [OLD] })]);
+  assertExit(mp, 0, mp.stdout);
+  assert.deepEqual(mp.json.floor, { newest: OLD, allowed: [], heldBelowMin: OLD });
+  const r = apply(w, ['--projects-dir', w.installLoose({ models: [OLD], agentId: 'a2' })]);
+  assertExit(r, 0, r.stdout);
+  assert.deepEqual(r.json.floor, { newest: OLD, allowed: [], heldBelowMin: OLD });
+  assert.equal(Object.hasOwn(proofFile(w), 'allowed'), false, 'no allowance involved: the field is absent');
+  assert.equal(proofFile(w).heldBelowMin, OLD);
+  assert.equal(w.state().rounds[0].modelProof.heldBelowMin, OLD);
+  assert.equal(Object.hasOwn(w.state().rounds[0].modelProof, 'allowed'), false);
+});
+
+test('R2-F2 (a): model-proof prints the allowance too; an allowed id the parser reads below the floor is refused (R2-F2 d)', async (t) => {
+  const NEW_ID = 'claude-fable-6-preview';
+  const w = world(t).prepare();
+  await resetFloor({ dir: w.floor, allowId: [NEW_ID, OLD] });
+  const mp = w.cli(['model-proof', '--tag', w.needed.tag, '--projects-dir', w.installLoose({ models: [NEW_ID] })]);
+  assertExit(mp, 0, mp.stdout);
+  assert.deepEqual(mp.json.floor, { newest: FLOOR, allowed: [NEW_ID], heldBelowMin: null });
+  // the forgotten allowance of 5.1, which the floor (5.2) has passed
+  const stale = apply(w, ['--projects-dir', w.installLoose({ models: [OLD], agentId: 'a2' })]);
+  assertExit(stale, 1, stale.stdout);
+  assert.equal(stale.json.error, 'stale-model');
+  assert.deepEqual(stale.json.floor, { newest: FLOOR, seen: [OLD] });
+  assert.equal(w.cli(['model-proof', '--tag', w.needed.tag, '--projects-dir', w.installLoose({ models: [OLD], agentId: 'a3' })]).json.error, 'stale-model');
+});

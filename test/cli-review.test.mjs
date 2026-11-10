@@ -4447,6 +4447,51 @@ test('R1-F1: a pass proven with an exact id the owner allowed is current for rev
   assert.equal((await gateReview(w, floor)).ok, true);
 });
 
+test('R2-F2 (b): review-complete (comment and output) and the final gate name a Fable round that counts only through the owner allowance; a plain pass says nothing', async (t) => {
+  const floor = scratchFloorDir();
+  const env = { PIPELINE_MODEL_FLOOR_DIR: floor };
+  const NEW_ID = 'claude-fable-6-preview';
+  const plain = oldProofWorld(t, { models: { 'claude-fable-5-2': 1 } });
+  const clean = plain.cli(['review-complete', '--pr', '7'], env);
+  assertExit(clean, 0, clean.stdout);
+  assert.equal(Object.hasOwn(clean.json, 'fableBypass'), false);
+  assert.doesNotMatch(postedBodies(plain)[0], /Standing Fable bypass/);
+  assert.doesNotMatch((await gateReview(plain, floor)).detail, /counted via/);
+
+  await resetFloor({ dir: floor, allowId: [NEW_ID] });
+  const w = oldProofWorld(t, { models: { [NEW_ID]: 1 } });
+  const ok = w.cli(['review-complete', '--pr', '7'], env);
+  assertExit(ok, 0, ok.stdout);
+  const note = `Fable round 1 counted via owner allowance ${NEW_ID}`;
+  assert.deepEqual(ok.json.fableBypass, { note, rounds: [{ round: 1, via: 'allow', id: NEW_ID }] });
+  const [body] = postedBodies(w);
+  assert.ok(body.includes(`**Standing Fable bypass:** ${note}.`), body);
+  assert.deepEqual(Object.keys(reviewJson(body)).sort(), ['base', 'contentHash', 'codexModel', 'head', 'modelProofDigest', 'rounds', 'stateHash'].sort(), 'the JSON record is unchanged');
+  const gate = await gateReview(w, floor);
+  assert.equal(gate.ok, true);
+  assert.ok(gate.detail.includes(`; ${note}`), gate.detail);
+});
+
+test('R2-F2 (b): a hold below MIN_FABLE is named by review-complete and the final gate; clearing the allowance refuses an unreadable id again', async (t) => {
+  const floor = scratchFloorDir();
+  const env = { PIPELINE_MODEL_FLOOR_DIR: floor };
+  await resetFloor({ dir: floor, hold: OLD_FABLE });
+  const w = oldProofWorld(t, { models: { [OLD_FABLE]: 1 } });
+  const ok = w.cli(['review-complete', '--pr', '7'], env);
+  assertExit(ok, 0, ok.stdout);
+  const note = 'Fable round 1 counted via owner hold claude-fable-5-1 (below claude-fable-5-2)';
+  assert.deepEqual(ok.json.fableBypass, { note, rounds: [{ round: 1, via: 'hold', id: OLD_FABLE }] });
+  assert.ok(postedBodies(w)[0].includes(`**Standing Fable bypass:** ${note}.`));
+  assert.ok((await gateReview(w, floor)).detail.includes(note));
+
+  // R2-F2 (d): an allowance of an id the parser reads that the threshold has passed no longer counts
+  await resetFloor({ dir: floor, clearHold: true, allowId: [OLD_FABLE] });
+  const refused = w.cli(['review-complete', '--pr', '7'], env);
+  assertExit(refused, 1, refused.stdout);
+  assert.equal(refused.json.error, 'fable-refresh');
+  assert.equal((await gateReview(w, floor)).ok, false);
+});
+
 test('R1-F3: a normal round after a stale round replaces it even when an older current-model pass exists (the pass reads the whole PR)', (t) => {
   const w = oldProofWorld(t);
   assertExit(refreshOf(w), 0);

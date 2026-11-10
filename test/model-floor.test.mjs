@@ -7,7 +7,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  ALLOW_MAX, FLOOR_REL, HISTORY_MAX, MIN_FABLE, checkFloor, compareVersions, floorDir, parseModelId, raiseFloor, readFloor, readReviewGate, reReviewThreshold, resetFloor, withFloorLock,
+  ALLOW_MAX, FLOOR_REL, HISTORY_MAX, MIN_FABLE, checkFloor, compareVersions, floorDir, parseModelId, raiseFloor, readFloor, readReviewGate, reReviewThreshold, resetFloor, standingBypasses, withFloorLock,
 } from '../pipeline/lib/model-floor.mjs';
 import { tryAcquire } from '../pipeline/lib/locks.mjs';
 import { readApprovals } from '../pipeline/hooks/lib/owner-go.mjs';
@@ -435,7 +435,11 @@ test('checkFloor: an allowed exact id is neither unparseable nor older; any othe
   const models = ['claude-fable-9-preview', 'claude-fable-5-1', 'claude-fable-x'];
   assert.deepEqual(checkFloor({ models, floor: MIN_FABLE }), { ok: false, older: ['claude-fable-5-1'], unparseable: ['claude-fable-9-preview', 'claude-fable-x'] });
   assert.deepEqual(checkFloor({ models, floor: MIN_FABLE, allow: ['claude-fable-9-preview'] }), { ok: false, older: ['claude-fable-5-1'], unparseable: ['claude-fable-x'] });
-  assert.equal(checkFloor({ models, floor: MIN_FABLE, allow: models }).ok, true);
+  // R2-F2 (d): the allowance covers an id the parser cannot read, not one that parses and is below the floor
+  assert.deepEqual(checkFloor({ models, floor: MIN_FABLE, allow: models }), { ok: false, older: ['claude-fable-5-1'], unparseable: [] }, 'an allowed id the parser reads is still older than the floor');
+  assert.equal(checkFloor({ models: ['claude-fable-9-preview', 'claude-fable-x'], floor: MIN_FABLE, allow: ['claude-fable-9-preview', 'claude-fable-x'] }).ok, true);
+  assert.equal(checkFloor({ models: ['claude-fable-5-3'], floor: MIN_FABLE, allow: ['claude-fable-5-3'] }).ok, true, 'at or above the floor passes with or without the allowance');
+  assert.deepEqual(checkFloor({ models: ['claude-fable-5-1'], floor: 'claude-fable-5-3', allow: ['claude-fable-5-1'] }).older, ['claude-fable-5-1'], 'a forgotten allowance of an id a later floor has passed is refused');
   assert.equal(checkFloor({ models: ['claude-fable-5-2-extra'], floor: MIN_FABLE, allow: ['claude-fable-5-2'] }).ok, false, 'exact match only');
 });
 
@@ -478,4 +482,74 @@ test('a registry with a malformed allow list is unreadable (fail closed)', (t) =
   }
   writeReg(dir, good({ allow: [] }));
   assert.equal(readFloor({ dir }).ok, true);
+});
+
+// ---- review round 2: R2-F1 (an allowance-only call keeps the learned floor) and R2-F2 (standing bypasses) ----
+const learned = async (dir) => {
+  raiseFloor({ dir, model: 'claude-fable-5-3', claudeCode: '2.1.400', transcript: '/t.jsonl', now: NOW });
+  return JSON.parse(readFileSync(reg(dir), 'utf8'));
+};
+
+test('R2-F1: reset --allow-id / --clear-allow alone keep the learned floor, provenAt, claudeCode, transcript, history and hold; they change only allow', async (t) => {
+  const dir = join(tmp(t), 'f');
+  await resetFloor({ dir, hold: 'claude-fable-5-4' });
+  const before = await learned(dir);
+  assert.equal(readFloor({ dir }).floor, 'claude-fable-5-3');
+  assert.equal(before.history.length, 1);
+  const allowed = await resetFloor({ dir, allowId: ['claude-fable-6-preview'] });
+  assert.equal(allowed.floor, 'claude-fable-5-3', 'the floor proofs raised survives an allowance');
+  assert.deepEqual(JSON.parse(readFileSync(reg(dir), 'utf8')), { ...before, allow: ['claude-fable-6-preview'] }, 'only allow changed');
+  const more = await resetFloor({ dir, allowId: ['claude-fable-6-b'] });
+  assert.deepEqual(more.registry.allow, ['claude-fable-6-preview', 'claude-fable-6-b']);
+  assert.equal(more.floor, 'claude-fable-5-3');
+  const cleared = await resetFloor({ dir, clearAllow: true });
+  assert.equal(cleared.floor, 'claude-fable-5-3', '--clear-allow keeps the floor too');
+  assert.deepEqual(JSON.parse(readFileSync(reg(dir), 'utf8')), before, 'back to exactly what it was');
+  assert.equal(Object.hasOwn(cleared.registry, 'allow'), false);
+});
+
+test('R2-F1: a plain reset still rewrites to MIN_FABLE (with or without --hold / --clear-hold / --clear-lock), and an allow flag next to one of them is a reset too', async (t) => {
+  const dir = join(tmp(t), 'f');
+  await learned(dir);
+  await resetFloor({ dir, allowId: ['claude-fable-6-preview'] });
+  const plain = await resetFloor({ dir });
+  assert.equal(plain.floor, MIN_FABLE);
+  assert.deepEqual([plain.registry.newest, plain.registry.provenAt, plain.registry.history], [MIN_FABLE, null, []]);
+  assert.deepEqual(plain.registry.allow, ['claude-fable-6-preview'], 'a plain reset keeps the allowance, as before');
+  for (const extra of [{ hold: 'claude-fable-5-4' }, { clearHold: true }, { clearLock: true }]) {
+    await learned(dir);
+    const r = await resetFloor({ dir, allowId: ['claude-fable-6-b'], ...extra });
+    assert.equal(r.registry.newest, MIN_FABLE, JSON.stringify(extra));
+    assert.deepEqual(r.registry.history, [], JSON.stringify(extra));
+    await resetFloor({ dir, clearAllow: true });
+  }
+  await learned(dir);
+  assert.equal((await resetFloor({ dir, clearLock: true })).registry.newest, MIN_FABLE, 'a plain reset with --clear-lock');
+});
+
+test('R2-F1: an allowance-only call on a corrupt registry is refused and writes nothing; a plain reset first repairs it; an absent registry is fine', async (t) => {
+  const dir = join(tmp(t), 'f');
+  const fresh = await resetFloor({ dir: join(dir, 'new'), allowId: ['claude-fable-6-preview'] });
+  assert.deepEqual([fresh.floor, fresh.registry.allow], [MIN_FABLE, ['claude-fable-6-preview']], 'no registry yet: there is no floor to lose');
+  for (const bad of ['{not json', JSON.stringify({ ...good(), version: 9 })]) {
+    writeReg(dir, bad);
+    for (const args of [{ allowId: ['claude-fable-6-preview'] }, { clearAllow: true }]) {
+      await assert.rejects(resetFloor({ dir, ...args }), (err) => err.code === 'model-floor-unreadable' && /plain .*model-floor reset.* first/.test(err.message), JSON.stringify(args));
+      assert.equal(readFileSync(reg(dir), 'utf8'), bad, 'the corrupt file is untouched');
+    }
+    await resetFloor({ dir });
+    assert.equal(readFloor({ dir }).ok, true);
+    assert.equal((await resetFloor({ dir, allowId: ['claude-fable-6-preview'] })).registry.allow.length, 1);
+  }
+});
+
+test('R2-F2: standingBypasses lists a non-empty allow list and a hold below MIN_FABLE, and nothing else', () => {
+  assert.deepEqual(standingBypasses(null), []);
+  assert.deepEqual(standingBypasses(good()), []);
+  assert.deepEqual(standingBypasses(good({ allow: [] })), []);
+  assert.deepEqual(standingBypasses(good({ hold: 'claude-fable-5-4' })), [], 'a hold at or above MIN_FABLE lowers nothing');
+  assert.deepEqual(standingBypasses(good({ hold: MIN_FABLE })), []);
+  assert.deepEqual(standingBypasses(good({ allow: ['claude-fable-6-preview'] })), [{ kind: 'allow', ids: ['claude-fable-6-preview'] }]);
+  assert.deepEqual(standingBypasses(good({ hold: 'claude-fable-5-1-20261001' })), [{ kind: 'hold', hold: 'claude-fable-5-1' }]);
+  assert.deepEqual(standingBypasses(good({ hold: 'claude-fable-5-1', allow: ['claude-fable-x'] })).map((b) => b.kind), ['allow', 'hold']);
 });

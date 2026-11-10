@@ -57,6 +57,8 @@ pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR
   any Fable on any line of the transcript must be at least this machine's floor (whatever --expect-model says): older => exit 1, error stale-model,
     restartRequired: true, floor: {newest, seen}, advice (restart this terminal, or update Claude Code); the items wait with cause stale-model. A proven pass
     with a newer Fable raises the floor (only a transcript under the account's own projects folder, no --projects-dir; exit 1 model-floor-busy / model-floor-unwritable otherwise unproven)
+  a proof that passed only through an owner allowance (an id the parser cannot read) or a hold below MIN_FABLE adds floor: {newest, allowed: [ids], heldBelowMin: <hold>|null} to the output
+    and allowed / heldBelowMin (each only when present) to round-N/model-proof.json and the round's stored modelProof summary
   an apply that fails on the floor (stale-model, model-floor-unreadable, unrecognised-fable, model-floor-busy, model-floor-unwritable) saves round.arbiter.failure {cause, advice, at} and prints the same `advice` in its output;
     model-floor-busy: run apply again in a minute; the other causes are not fixed by another Fable pass
     (a zero-item Fable round has no item to carry the cause); the next apply that proves clears it
@@ -401,22 +403,25 @@ show the Fable model floor; reset it (owner only, run in your own terminal): bac
 pipeline model-floor show   -> {ok, floor, MIN_FABLE, registry, file, error?} : READ-ONLY, runs anywhere; exit 0, or 1 when the registry file is unreadable (reviews are blocked until a reset)
 pipeline model-floor reset [--hold <fable model id> | --clear-hold] [--clear-lock]   -> {ok, floor, hold, file, clearedLock}
 pipeline model-floor reset [--allow-id <exact claude-fable-… id> ... | --clear-allow]   (also takes the options above; the output then carries allow: [ids] when any are set)
+  with ONLY --allow-id and/or --clear-allow it is not a reset: it changes the allow list and keeps the learned floor (newest, history) and the hold; a corrupt registry is refused
+  (exit 1 model-floor-unreadable): run a plain `model-floor reset` first.
   Owner only: refused inside Claude Code (exit 2 `refused`); run it in your own terminal (`node ~/.claude/pipeline/bin/pipeline.mjs model-floor reset`).
-  Rewrites the registry to the shipped minimum (a corrupt or unreadable registry is replaced); an existing hold and allowed ids are kept.
+  A plain reset (no --allow-id / --clear-allow, or together with --hold / --clear-hold / --clear-lock) rewrites the registry to the shipped minimum (a corrupt or unreadable registry is replaced); an existing hold and allowed ids are kept.
   --hold <id>   also caps the floor at that Fable id (a claude-fable-* id) until `model-floor reset --clear-hold`. Use it to roll back an alias
                 (the `fable` alias moved to a model you do not want) or when the two accounts resolve different Fables. It also lowers the version
                 below which a recorded Fable proof is re-reviewed, so a review proven with the held model can complete.
   --clear-hold  lift the cap (not with --hold)
-  --allow-id <id>  accept that exact claude-fable-* id although the parser cannot read it (or it is below the floor); repeatable, at most 10. It never raises the floor.
+  --allow-id <id>  accept that exact claude-fable-* id although the parser cannot read it; repeatable, at most 10. It never raises the floor, and an id the parser reads that is below the floor is refused all the same.
                 A claude-fable-* id the parser cannot read blocks reviews, including the PR that fixes the parser: run `model-floor reset --allow-id <the new id>` in your own
-                terminal, merge the parser fix, then `model-floor reset --clear-allow`. (`--hold` does not unblock an unreadable id: it only caps the floor.)
+                terminal, merge the parser fix, then `model-floor reset --clear-allow` (neither forgets the learned floor).
+                Until then `arbiter apply`, `model-proof`, `review-complete`, the final gate and `preflight` say the allowance is in force. (`--hold` does not unblock an unreadable id: it only caps the floor.)
   --clear-allow remove every allowed id (not with --allow-id)
   --clear-lock  first remove a floor lock left behind by a process that is still alive or on another host (a dead holder's lock clears itself)
 ```
 
 Exit: 0 ok · 1 the registry is unreadable (`show`) or could not be written / is locked (`reset`) · 2 usage, or `reset` refused inside Claude Code.
 
-The floor is the oldest Fable model a review may be proven with on this machine: `max(MIN_FABLE, newest Fable proven here)`, capped by an owner hold; a Fable id the owner allowed by exact name (`--allow-id`) is accepted whatever its version and never raises the floor. Recorded proofs are re-reviewed below the lower of `MIN_FABLE` and the hold. The registry lives under the account's `owner-go/model-floor/`, which the guard protects, so only the pipeline commands (never an agent's shell) write it. `reset` is the only way down: it writes the shipped minimum back and keeps (or sets with `--hold`, or clears with `--clear-hold`) the ceiling.
+The floor is the oldest Fable model a review may be proven with on this machine: `max(MIN_FABLE, newest Fable proven here)`, capped by an owner hold; a Fable id the parser cannot read, if the owner allowed it by exact name (`--allow-id`), is accepted and never raises the floor (an allowed id the parser reads and that is below the floor is refused like any other, so a forgotten allowance cannot pass an old model). A call with only `--allow-id` / `--clear-allow` changes the allow list and keeps the learned floor and the hold; only a plain `reset` goes back to the minimum. While an allowance, or a hold below `MIN_FABLE`, is what lets a proof count, `arbiter apply` and `model-proof` print `floor: {newest, allowed, heldBelowMin}`, `review-complete` and the final gate's review check add a note naming the round, and `preflight` warns. Recorded proofs are re-reviewed below the lower of `MIN_FABLE` and the hold. The registry lives under the account's `owner-go/model-floor/`, which the guard protects, so only the pipeline commands (never an agent's shell) write it. A plain `reset` is the only way down: it writes the shipped minimum back and keeps (or sets with `--hold`, or clears with `--clear-hold`) the ceiling.
 
 ## model-proof
 
@@ -428,6 +433,7 @@ pipeline model-proof (--tag TAG | --agent-id ID) [--expect-model claude-fable-] 
   -> {ok, transcript, meta, models, efforts, claudeCodeVersions, errors, finalAssistantText, stopReasonMissing, finalVia}; exit 0 proven, 1 mismatch, 2 not found/unreadable
   any Fable on any line must also be at least this machine's floor (read-only here, the floor is never raised): older => exit 1, error stale-model, restartRequired: true,
     floor: {newest, seen}, advice
+  a proof that passed only through an owner allowance (an id the parser cannot read) or a hold below MIN_FABLE adds floor: {newest, allowed: [ids], heldBelowMin: <hold>|null} to the output
 ```
 
 Exit: 0 proven · 1 mismatch · 2 transcript not found / usage.
@@ -438,6 +444,7 @@ report whether the pipeline may merge (config, gh, protection, pause, Codex).
 
 ```
 pipeline preflight [--repo DIR]   (exit 0 can merge, 1 cannot, 2 config missing/invalid)
+  warnings (informational, never change canMerge): a stale terminal; an owner allowance (model-floor reset --allow-id) or a hold below MIN_FABLE still in force in the model floor registry
 ```
 
 Exit: 0 pipeline may merge · 1 it may not (`reasons`) · 2 config missing or invalid.
@@ -510,6 +517,9 @@ pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused
   same check as the final gate's review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise
   a proven Fable round recorded with a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) that no later whole-PR pass at or above it replaced is refused: exit 1 {ok:false, error:fable-refresh, reason, staleFableRounds:[{round, models}]},
   the reason names the rounds and models and says `run `pipeline state fable-refresh --pr N``; the final gate's review check refuses the same PR the same way
+  when a proven Fable round counts as current only because of the owner's allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line
+  "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},
+  and the final gate's review check detail carries the same note
 ```
 
 Exit: 0 comment posted (or our identical one reused) and the label is off · 1 review not valid for this head (nothing posted) · 2 usage · 3 GitHub unavailable, or the label still on the PR after removal.

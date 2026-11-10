@@ -267,3 +267,36 @@ test('reset --allow-id usage errors: a non-claude-fable id, an empty one, both f
   assert.equal(tooMany.output.error, 'model-floor-bad-allow');
   assert.equal(readFileSync(reg(dir), 'utf8'), before);
 });
+
+// ---- review round 2: R2-F1 (an allowance-only call keeps the learned floor) ----
+test('R2-F1: reset --allow-id and --clear-allow alone keep a floor proofs raised; a plain reset drops it to MIN_FABLE; a corrupt registry refuses the allowance-only call', async (t) => {
+  const dir = scratch(t);
+  raiseFloor({ dir, model: 'claude-fable-5-3', claudeCode: '2.1.400', transcript: '/t.jsonl', now: NOW });
+  const learned = readReg(dir);
+  const allowed = await run(['reset', '--allow-id', 'claude-fable-6-preview'], asOwner(dir));
+  assert.deepEqual([allowed.exitCode, allowed.output.floor, allowed.output.allow], [0, 'claude-fable-5-3', ['claude-fable-6-preview']]);
+  assert.deepEqual(readReg(dir), { ...learned, allow: ['claude-fable-6-preview'] }, 'only allow changed');
+  const cleared = await run(['reset', '--clear-allow'], asOwner(dir));
+  assert.deepEqual([cleared.exitCode, cleared.output.floor], [0, 'claude-fable-5-3']);
+  assert.deepEqual(readReg(dir), learned);
+  await run(['reset', '--allow-id', 'claude-fable-6-preview'], asOwner(dir));
+  const plain = await run(['reset'], asOwner(dir));
+  assert.equal(plain.output.floor, MIN_FABLE, 'a plain reset still rewrites to the shipped minimum');
+  assert.equal(readReg(dir).newest, MIN_FABLE);
+
+  writeFileSync(reg(dir), '{ not json');
+  for (const args of [['reset', '--allow-id', 'claude-fable-6-preview'], ['reset', '--clear-allow']]) {
+    const refused = await run(args, asOwner(dir));
+    assert.equal(refused.exitCode, 1, args.join(' '));
+    assert.equal(refused.output.error, 'model-floor-unreadable');
+    assert.match(refused.output.message, /plain .*model-floor reset.* first/);
+    assert.equal(readFileSync(reg(dir), 'utf8'), '{ not json', 'nothing written');
+  }
+  assert.equal((await run(['reset'], asOwner(dir))).exitCode, 0, 'the plain reset repairs it');
+});
+
+test('R2-F1: the usage text says an allowance-only call keeps the learned floor and a corrupt registry needs a plain reset first', () => {
+  assert.match(meta.usage, /ONLY --allow-id and\/or --clear-allow it is not a reset/);
+  assert.match(meta.usage, /plain `model-floor reset` first/);
+  assert.match(meta.usage, /A plain reset .* rewrites the registry to the shipped minimum/);
+});

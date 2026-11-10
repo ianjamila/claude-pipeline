@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { emptyState, addRound } from '../pipeline/lib/state.mjs';
 import { MIN_FABLE } from '../pipeline/lib/model-floor.mjs';
 import {
-  countsTowardCap, fablePendingRounds, provenNotStale, reviewedRoundCount, reviewValidFor, roundAdmission, roundOutcome, staleFableReason, staleFableRounds,
+  countsTowardCap, fablePendingRounds, provenNotStale, reviewedRoundCount, fableBypassNote, fableBypassRounds, reviewValidFor, roundAdmission, roundOutcome, staleFableReason, staleFableRounds,
 } from '../pipeline/lib/triage.mjs';
 
 const OLD = 'claude-fable-5-1';
@@ -149,4 +149,35 @@ test('an unparseable claude-fable-* id is stale unless the owner allowed that ex
   assert.deepEqual(staleFableRounds(state, { threshold: MIN_FABLE, allow: ['claude-fable-6'] }), [{ round: 1, models: [ID] }], 'exact match only');
   const later = stateOf(fable(1), fable(2, { models: { [ID]: 1 }, scope: 'whole-pr' }));
   assert.deepEqual(staleFableRounds(later, { threshold: MIN_FABLE, allow: [ID] }), []);
+});
+
+// ---- review round 2: R2-F2 (d) the allowance covers only an id the parser cannot read; a standing bypass is named ----
+test('R2-F2 (d): an allowed id the parser reads and the threshold has passed is stale again; an unreadable allowed id and one at or above the threshold stay current', () => {
+  const state = stateOf(fable(1));
+  assert.deepEqual(staleFableRounds(state, { threshold: MIN_FABLE, allow: [OLD] }), [{ round: 1, models: [OLD] }], 'forgotten allowance of 5.1 under a 5.2 threshold');
+  assert.equal(provenNotStale(state.rounds[0], { threshold: MIN_FABLE, allow: [OLD] }), false);
+  assert.deepEqual(staleFableRounds(state, { threshold: OLD, allow: [OLD] }), [], 'at the threshold it is current with or without the allowance');
+  assert.deepEqual(staleFableRounds(stateOf(fable(1, { models: { 'claude-fable-6-preview': 1 } })), { threshold: MIN_FABLE, allow: ['claude-fable-6-preview'] }), []);
+  const later = stateOf(fable(1), fable(2, { models: { [OLD]: 1 }, scope: 'whole-pr' }));
+  assert.deepEqual(staleFableRounds(later, { threshold: MIN_FABLE, allow: [OLD] }).map((s) => s.round), [1, 2], 'an allowed older pass cannot replace anything');
+});
+
+test('R2-F2 (b): fableBypassRounds lists the proven rounds that count only through the allowance or a hold below MIN_FABLE; fableBypassNote words them', () => {
+  const ID = 'claude-fable-6-preview';
+  const state = stateOf(fable(1, { models: { [NEW]: 1 } }), fable(2, { models: { [ID]: 1 } }), fable(3, { models: { [OLD]: 1 } }), fable(4, { models: { [NEW]: 1 }, proven: false }));
+  assert.deepEqual(fableBypassRounds(state, { threshold: MIN_FABLE, allow: [] }), [], 'no bypass in force: nothing is current-by-bypass (rounds 2 and 3 are stale)');
+  const allow = { threshold: MIN_FABLE, allow: [ID] };
+  assert.deepEqual(fableBypassRounds(state, allow), [{ round: 2, via: 'allow', id: ID }]);
+  assert.equal(fableBypassNote(fableBypassRounds(state, allow), allow), `Fable round 2 counted via owner allowance ${ID}`);
+  const hold = { threshold: OLD, allow: [] };
+  assert.deepEqual(fableBypassRounds(state, hold), [{ round: 3, via: 'hold', id: OLD }]);
+  assert.equal(fableBypassNote(fableBypassRounds(state, hold), hold), 'Fable round 3 counted via owner hold claude-fable-5-1 (below claude-fable-5-2)');
+  const both = { threshold: OLD, allow: [ID] };
+  assert.equal(fableBypassNote(fableBypassRounds(state, both), both),
+    `Fable round 2 counted via owner allowance ${ID}; Fable round 3 counted via owner hold claude-fable-5-1 (below claude-fable-5-2)`);
+  assert.equal(fableBypassNote([], both), null);
+  assert.deepEqual(fableBypassRounds(stateOf(), both), []);
+  assert.deepEqual(fableBypassRounds(null, both), []);
+  // a stale round is never named as counted: an allowance for 5.1 does not make it current under a 5.2 threshold
+  assert.deepEqual(fableBypassRounds(stateOf(fable(1)), { threshold: MIN_FABLE, allow: [OLD] }), []);
 });

@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { runPreflight, probeCodex, protectionMissing } from '../pipeline/lib/preflight.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, createFakeCodex, fullProtection, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { floorEnv, scratchFloorDir } from './helpers/floor-env.mjs';
+import { resetFloor } from '../pipeline/lib/model-floor.mjs';
 
 function repoWith(enforcement = 'github', checks) {
   const repo = createTmpRepo();
@@ -25,7 +27,8 @@ function world(over = [], { codex = {}, env = {} } = {}) {
     { match: '^issue list --label pipeline-pause', stdoutJson: [] },
     { match: '^issue list --label pipeline-rollback', stdoutJson: [] },
   ]);
-  return { fake, env: { ...fake.env, ...createFakeCodex(codex).env, ...env } };
+  // The model floor registry is a scratch folder (a checkout honours PIPELINE_MODEL_FLOOR_DIR), never the account's own.
+  return { fake, env: { ...fake.env, ...createFakeCodex(codex).env, ...floorEnv(), ...env } };
 }
 
 const PLAN_403 = {
@@ -316,4 +319,44 @@ test('an up-to-date or newer terminal, and an unknown build, add no warning and 
     assert.deepEqual(r.warnings, [], JSON.stringify(extra));
     assert.equal(r.canMerge, true, JSON.stringify(extra));
   }
+});
+
+// ---- an owner allowance or a hold below MIN_FABLE still in force (review round 2: R2-F2 c) ----
+test('an owner allowance or a hold below MIN_FABLE adds a warning; clearing it removes the warning; canMerge and reasons never change', async () => {
+  const repo = repoWith('github');
+  const dir = scratchFloorDir();
+  const check = async () => runPreflight({ cwd: repo.dir, env: world([], { env: floorEnv(dir) }).env });
+  const baseline = await check();
+  assert.deepEqual(baseline.warnings, []);
+
+  await resetFloor({ dir, allowId: ['claude-fable-6-preview', 'claude-fable-6-b'] });
+  const allowed = await check();
+  assert.deepEqual(allowed.warnings, ['owner allowance in force: claude-fable-6-preview, claude-fable-6-b; clear it with `pipeline model-floor reset --clear-allow` once the parser fix is installed']);
+  assert.equal(allowed.canMerge, baseline.canMerge);
+  assert.deepEqual(allowed.reasons, baseline.reasons);
+
+  await resetFloor({ dir, hold: 'claude-fable-5-1-20261001' });
+  const both = await check();
+  assert.equal(both.warnings.length, 2);
+  assert.match(both.warnings[1], /^owner hold below claude-fable-5-2 in force: claude-fable-5-1; clear it with `pipeline model-floor reset --clear-hold`/);
+  assert.equal(both.canMerge, true);
+
+  await resetFloor({ dir, clearAllow: true });
+  assert.equal((await check()).warnings.length, 1, 'only the hold is left');
+  await resetFloor({ dir, hold: 'claude-fable-5-4' });
+  assert.deepEqual((await check()).warnings, [], 'a hold at or above MIN_FABLE lowers nothing: no warning');
+  await resetFloor({ dir, clearHold: true });
+  assert.deepEqual((await check()).warnings, []);
+});
+
+test('a bypass warning never turns a blocked world into a mergeable one, and an unreadable registry adds none', async () => {
+  const repo = repoWith('github');
+  const dir = scratchFloorDir();
+  await resetFloor({ dir, allowId: ['claude-fable-6-preview'] });
+  const paused = [{ match: '^issue list --label pipeline-pause', stdoutJson: [{ number: 7, title: 'pause', url: 'u' }] }];
+  const blocked = await runPreflight({ cwd: repo.dir, env: world(paused, { env: floorEnv(dir) }).env });
+  assert.equal(blocked.warnings.length, 1);
+  assert.equal(blocked.canMerge, false);
+  writeFileSync(join(dir, 'fable.json'), '{ not json');
+  assert.deepEqual((await runPreflight({ cwd: repo.dir, env: world([], { env: floorEnv(dir) }).env })).warnings, []);
 });

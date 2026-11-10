@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { accountHome } from './paths.mjs';
 import { compareSemver, installedVersion, runningVersion } from './claude-code-version.mjs';
-import { FLOOR_DIR_ENV, allowedIds, checkFloor, compareVersions, parseModelId, readFloor } from './model-floor.mjs';
+import { FLOOR_DIR_ENV, MIN_FABLE, allowedIds, checkFloor, compareVersions, parseModelId, readFloor } from './model-floor.mjs';
 import { isInstalledCopy, pipelineRoot, seamValue } from './seams.mjs';
 
 // Test-only seams (a repo checkout honours them, an installed copy ignores them, like PIPELINE_TEST_MODE):
@@ -48,7 +48,9 @@ const fableOrder = (a, b) => compareVersions(parseModelId(a) ?? { major: 0, mino
 
 // Judge the Fable models of a proof against the floor (read-only).
 //   -> { applies: false }                                     no Fable on any line: the floor does not apply
-//   -> { applies: true, ok, floor, seen, older, errors[], error, restartRequired, advice, floorOpts }
+//   -> { applies: true, ok, floor, seen, older, errors[], error, restartRequired, advice, floorOpts, allowed, allowedSeen, heldBelowMin }
+// `allowed` = the seen ids that pass ONLY because the owner allowed them (the parser cannot read them); `allowedSeen` = every seen id on the allow list (none of
+// them raises the floor); `heldBelowMin` = the owner's hold when a seen id is below MIN_FABLE and passes only because the hold lowered the floor, else null.
 // `error` is the machine-readable code of the first failure: 'stale-model' | 'unrecognised-fable' | 'model-floor-unreadable'; every failure carries
 // `advice`. Fails closed on an unreadable registry and on a claude-fable-* id the parser cannot read unless the owner allowed that exact id.
 export function judgeFloor({ models, claudeCodeVersions = [], env, floorOpts = {}, deps } = {}) {
@@ -81,21 +83,36 @@ export function judgeFloor({ models, claudeCodeVersions = [], env, floorOpts = {
     error ??= 'unrecognised-fable';
   }
   if (check.unparseable.length > 0) advice ??= UNRECOGNISED_ADVICE;
+  const hold = read.registry?.hold ?? null;
+  const heldBelowMin = hold && compareVersions(parseModelId(hold), parseModelId(MIN_FABLE)) < 0
+    && seen.some((id) => { const p = parseModelId(id); return p !== null && compareVersions(p, parseModelId(MIN_FABLE)) < 0 && !check.older.includes(id); })
+    ? hold : null;
   return {
-    applies: true, ok: check.ok, floor: read.floor, seen, allowed: seen.filter((id) => allow.includes(id)), older: check.older, unparseable: check.unparseable, errors, error, restartRequired,
+    applies: true, ok: check.ok, floor: read.floor, seen,
+    allowed: seen.filter((id) => allow.includes(id) && parseModelId(id) === null), allowedSeen: seen.filter((id) => allow.includes(id)), heldBelowMin, older: check.older, unparseable: check.unparseable, errors, error, restartRequired,
     ...(advice ? { advice } : {}), floorOpts: opts,
   };
 }
 
-// The fields a failed floor adds to a command's output.
-export const floorOutput = (judged) => (judged?.applies && (judged.restartRequired || judged.errors?.length > 0)
-  ? {
+// The fields a floor adds to a command's output: the failure fields on a failed floor; on a passed one, `floor: {newest, allowed, heldBelowMin}` only when
+// an owner allowance or a hold below MIN_FABLE is what let the proof pass (a standing bypass is never silent).
+export const floorOutput = (judged) => {
+  if (judged?.applies && (judged.restartRequired || judged.errors?.length > 0)) {
+    return {
       ...(judged.error ? { error: judged.error } : {}),
       ...(judged.restartRequired ? { restartRequired: true } : {}),
       ...(judged.floor ? { floor: { newest: judged.floor, seen: judged.seen } } : {}),
       ...(judged.advice ? { advice: judged.advice } : {}),
-    }
-  : {});
+    };
+  }
+  const bypass = floorBypass(judged);
+  return bypass ? { floor: { newest: judged.floor, ...bypass } } : {};
+};
+
+// { allowed: [ids], heldBelowMin: hold|null } when a passed floor judgement rests on an owner allowance or a hold below MIN_FABLE, else null.
+export const floorBypass = (judged) => (judged?.applies && judged.ok && (judged.allowed?.length > 0 || judged.heldBelowMin)
+  ? { allowed: judged.allowed ?? [], heldBelowMin: judged.heldBelowMin ?? null }
+  : null);
 
 const real = (p) => { try { return fs.realpathSync.native(p); } catch { return null; } };
 const inside = (child, parent) => child === parent || child.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep);

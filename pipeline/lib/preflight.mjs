@@ -9,6 +9,7 @@ import { isClean } from './git.mjs';
 import { run, codexCommand } from './proc.mjs';
 import { createGitHub } from './github.mjs';
 import { claudeCodeStatus } from './claude-code-version.mjs';
+import { MIN_FABLE, readFloor, standingBypasses } from './model-floor.mjs';
 
 const CODEX_TIMEOUT_MS = 15_000;
 
@@ -137,6 +138,17 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
   if (claudeCode.stale === true) {
     warnings.push(`this terminal runs Claude Code ${claudeCode.running} but ${claudeCode.installed} is installed: restart it before a review's Fable pass`);
   }
+
+  // A standing owner allowance or a hold below MIN_FABLE lets a Fable proof through that the shipped floor would refuse: say so until it is cleared.
+  // Informational like the build check: it never changes canMerge (an unreadable registry is for arbiter apply to report).
+  try {
+    const floor = readFloor({ env });
+    for (const b of floor.ok ? standingBypasses(floor.registry) : []) {
+      warnings.push(b.kind === 'allow'
+        ? `owner allowance in force: ${b.ids.join(', ')}; clear it with \`pipeline model-floor reset --clear-allow\` once the parser fix is installed`
+        : `owner hold below ${MIN_FABLE} in force: ${b.hold}; clear it with \`pipeline model-floor reset --clear-hold\` once the model it holds back from is acceptable`);
+    }
+  } catch { /* an unreadable folder: nothing to warn about here */ }
 
   const enforcementOk = declared === 'gate' || enforcement.mode === 'github';
   const reasons = [];

@@ -110,7 +110,8 @@ function floorOf(registry) {
   return canonical(floor);
 }
 
-// The Fable ids the owner allowed by exact name (reset --allow-id): accepted although unparseable or below the floor. They never raise it.
+// The Fable ids the owner allowed by exact name (reset --allow-id): accepted although the parser cannot read them (one it reads is judged by version
+// like any other). They never raise the floor.
 export const allowedIds = (registry) => (Array.isArray(registry?.allow) ? registry.allow : []);
 
 // The version below which a recorded Fable proof is re-reviewed (staleness, supersession, fable-refresh): the registry's hold when it is set and
@@ -118,6 +119,17 @@ export const allowedIds = (registry) => (Array.isArray(registry?.allow) ? regist
 export function reReviewThreshold(registry) {
   const hold = registry?.hold;
   return hold && compareVersions(parseModelId(hold), parseModelId(MIN_FABLE)) < 0 ? canonical(hold) : canonical(MIN_FABLE);
+}
+
+// The standing owner bypasses a registry holds, for `pipeline preflight`: [{ kind: 'allow', ids } | { kind: 'hold', hold }] (empty when there are none). An allowance
+// (a non-empty `allow` list) and a hold below MIN_FABLE (it lowers the re-review threshold) both let a proof through that the shipped floor would refuse.
+export function standingBypasses(registry) {
+  const out = [];
+  const ids = allowedIds(registry);
+  if (ids.length > 0) out.push({ kind: 'allow', ids });
+  const threshold = reReviewThreshold(registry);
+  if (registry?.hold && threshold !== canonical(MIN_FABLE)) out.push({ kind: 'hold', hold: threshold });
+  return out;
 }
 
 // What review-complete, the final gate, fable-refresh and the Fable diff scope compare recorded proofs against: { threshold, allow }.
@@ -148,16 +160,17 @@ export function readFloor(opts = {}) {
 }
 
 // { ok, older: [Fable ids below the floor], unparseable: [claude-fable-* ids that do not parse] }. Only the Fable family is judged. An id in `allow`
-// (the owner's exact-name allowance) is neither.
+// (the owner's exact-name allowance) is never "unparseable"; it is also never "older" if the parser cannot read it, but one that parses and is below
+// the floor is "older" all the same: the allowance covers what the parser cannot read, not a model a later floor has passed.
 export function checkFloor({ models, floor, allow = [] }) {
   const want = parseModelId(floor);
   if (want?.family !== 'fable') throw codeError('model-floor-bad-floor', `the floor ${JSON.stringify(floor)} is not a Fable model id`);
   const older = [];
   const unparseable = [];
   for (const id of new Set((models ?? []).filter((m) => typeof m === 'string'))) {
-    if (!id.startsWith('claude-fable-') || allow.includes(id)) continue;
+    if (!id.startsWith('claude-fable-')) continue;
     const p = parseModelId(id);
-    if (!p) unparseable.push(id);
+    if (!p) { if (!allow.includes(id)) unparseable.push(id); }
     else if (p.family === 'fable' && compareVersions(p, want) < 0) older.push(id);
   }
   return { ok: older.length === 0 && unparseable.length === 0, older, unparseable };
@@ -226,7 +239,11 @@ export async function withFloorLock({ waitMs = LOCK_WAIT_MS, pollMs = 100, ...op
 // floor cannot rise above; `clearHold` removes it; with neither, an existing readable hold is kept. `clearLock` first removes the floor lock
 // folder (for a lock a live-looking process or another host left behind; a dead holder's lock is reclaimed by the lock itself).
 // `allowId` (Fable ids, exact names) adds to the registry's `allow` list (at most ALLOW_MAX): the review accepts those ids although the parser cannot
-// read them or they are below the floor; `clearAllow` empties it. An existing readable list is kept otherwise. An allowance never raises the floor.
+// read them (an id the parser reads is judged by version like any other: the allowance never admits one below the floor); `clearAllow` empties it. An
+// existing readable list is kept otherwise. An allowance never raises the floor.
+// A call that carries ONLY allowId and/or clearAllow (no hold, clearHold or clearLock) is not a reset: it changes `allow` and keeps the learned floor
+// (newest, provenAt, claudeCode, transcript, history) and the hold, so allowing an unreadable id, and clearing it later, never forgets what proofs raised.
+// A corrupt registry has no floor worth keeping: that call throws model-floor-unreadable and the owner runs a plain reset first.
 // -> { floor, registry, file, clearedLock }.
 export async function resetFloor({ hold, clearHold = false, allowId = [], clearAllow = false, clearLock = false, now, waitMs = 5000, ...opts } = {}) {
   if (hold !== undefined && hold !== null && clearHold) throw codeError('model-floor-bad-hold', 'use --hold or --clear-hold, not both');
@@ -235,6 +252,7 @@ export async function resetFloor({ hold, clearHold = false, allowId = [], clearA
   for (const id of allowId) {
     if (!isAllowableId(id)) throw codeError('model-floor-bad-allow', `cannot allow ${JSON.stringify(id)}: not a claude-fable-* model id (letters, digits, . _ - only)`);
   }
+  const allowOnly = (allowId.length > 0 || clearAllow) && (hold === undefined || hold === null) && !clearHold && !clearLock;
   const dir = ensureDir(opts);
   let clearedLock = false;
   if (clearLock) {
@@ -244,12 +262,18 @@ export async function resetFloor({ hold, clearHold = false, allowId = [], clearA
   }
   return withFloorLock({ ...opts, waitMs }, () => {
     const current = readFloor(opts); // a corrupt file is exactly what reset replaces: its hold is lost with it
+    if (allowOnly && !current.ok) {
+      throw codeError('model-floor-unreadable', `${current.message.replace(/; reviews are blocked until.*$/, '')}: --allow-id / --clear-allow keep the learned floor and there is none to keep; run a plain \`pipeline model-floor reset\` first, then allow the id`);
+    }
     let keep = current.ok ? current.registry?.hold ?? null : null;
     if (clearHold) keep = null;
     else if (hold) keep = canonical(hold);
     const allow = clearAllow ? [] : [...new Set([...(current.ok ? allowedIds(current.registry) : []), ...allowId])];
     if (allow.length > ALLOW_MAX) throw codeError('model-floor-bad-allow', `at most ${ALLOW_MAX} allowed ids (${allow.length} asked): clear them with --clear-allow first`);
-    const registry = { version: 1, newest: canonical(MIN_FABLE), provenAt: null, claudeCode: null, transcript: null, history: [], hold: keep, ...(allow.length > 0 ? { allow } : {}) };
+    const { allow: _dropped, ...learned } = current.ok && current.registry ? current.registry : {};
+    const registry = allowOnly
+      ? { version: 1, newest: canonical(MIN_FABLE), provenAt: null, claudeCode: null, transcript: null, history: [], hold: null, ...learned, ...(allow.length > 0 ? { allow } : {}) }
+      : { version: 1, newest: canonical(MIN_FABLE), provenAt: null, claudeCode: null, transcript: null, history: [], hold: keep, ...(allow.length > 0 ? { allow } : {}) };
     writeRegistry(opts, registry);
     return { floor: floorOf(registry), registry, file: registryFile(dir), clearedLock };
   });

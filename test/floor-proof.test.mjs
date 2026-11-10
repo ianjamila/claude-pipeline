@@ -202,3 +202,53 @@ test('every floor failure carries advice, in judgeFloor and in floorOutput (stal
     assert.notEqual(out.advice, '', error);
   }
 });
+
+// ---- review round 2: R2-F2 (a standing bypass is visible; an allowance never admits an id the parser reads below the floor) ----
+test('judgeFloor: allowed lists only the ids that pass solely through the allowance; an allowed id the parser reads below the floor is refused', async (t) => {
+  const dir = path.join(tmp(t), 'model-floor');
+  const judge = (models) => judgeFloor({ models, env: NO_ENV, floorOpts: { dir } });
+  const NEW_ID = 'claude-fable-6-preview';
+  await resetFloor({ dir, allowId: [NEW_ID, OLD, NEWER] });
+  const unreadable = judge({ [NEW_ID]: 1, [FLOOR]: 1 });
+  assert.equal(unreadable.ok, true);
+  assert.deepEqual([unreadable.allowed, unreadable.allowedSeen, unreadable.heldBelowMin], [[NEW_ID], [NEW_ID], null]);
+  const atFloor = judge({ [NEWER]: 1, [FLOOR]: 1 });
+  assert.equal(atFloor.ok, true, 'at or above the floor passes on its own');
+  assert.deepEqual([atFloor.allowed, atFloor.allowedSeen], [[], [NEWER]], 'it did not need the allowance, but it still never raises the floor');
+  const below = judge({ [OLD]: 1 });
+  assert.equal(below.ok, false, 'the allowance does not cover an id the parser reads below the floor');
+  assert.equal(below.error, 'stale-model');
+  assert.deepEqual(below.older, [OLD]);
+  assert.equal(readFloor({ dir }).floor, FLOOR);
+});
+
+test('judgeFloor: heldBelowMin names the hold only when a seen id is below MIN_FABLE and passes through it', async (t) => {
+  const dir = path.join(tmp(t), 'model-floor');
+  const judge = (models) => judgeFloor({ models, env: NO_ENV, floorOpts: { dir } });
+  assert.equal(judge({ [FLOOR]: 1 }).heldBelowMin, null, 'no registry');
+  await resetFloor({ dir, hold: OLD });
+  assert.equal(judge({ [OLD]: 1 }).ok, true);
+  assert.equal(judge({ [OLD]: 1 }).heldBelowMin, OLD);
+  assert.equal(judge({ [FLOOR]: 1 }).heldBelowMin, null, 'a current Fable needed no hold');
+  assert.equal(judge({ 'claude-fable-5': 1 }).heldBelowMin, null, 'a model below the hold is refused, not held');
+  assert.equal(judge({ 'claude-fable-5': 1 }).ok, false);
+  await resetFloor({ dir, hold: 'claude-fable-5-4' });
+  assert.equal(judge({ [FLOOR]: 1 }).heldBelowMin, null, 'a hold at or above MIN_FABLE lowers nothing');
+});
+
+test('floorOutput: a passed floor adds floor {newest, allowed, heldBelowMin} only when an allowance or a hold below MIN_FABLE let it pass; nothing otherwise', async (t) => {
+  const dir = path.join(tmp(t), 'model-floor');
+  const judge = (models) => judgeFloor({ models, env: NO_ENV, floorOpts: { dir } });
+  const NEW_ID = 'claude-fable-6-preview';
+  assert.deepEqual(floorOutput(judge({ [FLOOR]: 1 })), {}, 'a plain pass says nothing');
+  assert.deepEqual(floorOutput({ applies: false }), {});
+  await resetFloor({ dir, allowId: [NEW_ID] });
+  assert.deepEqual(floorOutput(judge({ [FLOOR]: 1 })), {}, 'an allowance that was not needed says nothing');
+  assert.deepEqual(floorOutput(judge({ [NEW_ID]: 1 })), { floor: { newest: FLOOR, allowed: [NEW_ID], heldBelowMin: null } });
+  await resetFloor({ dir, hold: OLD });
+  assert.deepEqual(floorOutput(judge({ [NEW_ID]: 1, [OLD]: 1 })), { floor: { newest: OLD, allowed: [NEW_ID], heldBelowMin: OLD } });
+  await resetFloor({ dir, clearAllow: true });
+  assert.deepEqual(floorOutput(judge({ [OLD]: 1 })), { floor: { newest: OLD, allowed: [], heldBelowMin: OLD } });
+  // a failed floor keeps its old shape (no allowed / heldBelowMin)
+  assert.deepEqual(floorOutput(judge({ 'claude-fable-5': 1 })).floor, { newest: OLD, seen: ['claude-fable-5'] });
+});
