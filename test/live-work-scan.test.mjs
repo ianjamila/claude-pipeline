@@ -404,7 +404,7 @@ test('R3-B1 / R3-F2: a meta.json of {} / [] / 1, or an exit.json of {} next to a
     writeFileSync(join(dir, 'meta.json'), body);
     const live = w.scan({ repos: [repo] });
     assert.deepEqual(kinds(live), ['job'], `meta.json ${body}`);
-    assert.match(live[0].detail, /^job odd has an unreadable record \(meta\.json\), treated as running: remove .*odd.* if it is stale$/, body);
+    assert.match(live[0].detail, /^job odd has an unreadable record \(meta\.json\), treated as running: remove \.review\/jobs\/odd in that worktree if it is stale$/, body);
   }
   jobIn(repo, 'odd', { runnerPid: await deadPid() });
   assert.deepEqual(w.scan({ repos: [repo] }), [], 'well-formed meta, dead runner: not running');

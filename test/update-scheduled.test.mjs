@@ -464,15 +464,40 @@ test('normalizeLive / describeLive: repo, PR and worktree are named; unknown sha
 
 // R3-F2: an entry that names no PR (a job, a held state or merge lock) is told apart by its detail, not just "/repo (/worktree)" or a bare kind.
 test('R3-F2: describeLive shows the detail of job / state-lock / merge-lock entries that name no PR, and leaves entries with a PR as they were', () => {
-  const folder = '/work/app/.review/jobs/ci';
-  const job = { kind: 'job', repo: '/work/app', worktree: '/work/app', detail: `job ci has an unreadable record (meta.json), treated as running: remove ${folder} if it is stale` };
+  const job = { kind: 'job', repo: '/work/app', worktree: '/work/app', detail: 'job ci has an unreadable record (meta.json), treated as running: remove .review/jobs/ci in that worktree if it is stale' };
   const text = describeLive(normalizeLive([job]));
-  assert.match(text, /job ci has an unreadable record \(meta\.json\), treated as running: remove \/work\/app\/\.review\/jobs\/ci if it is stale/);
+  assert.match(text, /job ci has an unreadable record \(meta\.json\), treated as running: remove \.review\/jobs\/ci in that worktree if it is stale/);
   assert.match(text, /\/work\/app/);
   assert.match(describeLive(normalizeLive([{ kind: 'state-lock', detail: 'pr-state-acme-app-7 is held by pid 9 on host, since T' }])), /state-lock.*pr-state-acme-app-7 is held by pid 9/);
   assert.match(describeLive(normalizeLive([{ kind: 'merge-lock', detail: 'the merge command record merge-x.child.json is unreadable (not JSON), treated as running' }])), /merge-lock.*merge-x\.child\.json is unreadable/);
   const withPr = { kind: 'lease', repo: 'acme/app', pr: 12, worktree: '/w', detail: 'lease detail that stays out of the line' };
   assert.equal(describeLive(normalizeLive([withPr])), 'acme/app #12 (/w)');
+});
+
+// R4-F1: the remove hint is never cut: a long worktree path and job name must not produce a hint naming a different folder.
+test('R4-F1: a job hint for a long worktree and a long job name is whole or absent after normalizeLive, never a truncated path', async () => {
+  const { scanLiveWork } = await import('../pipeline/lib/live-work-scan.mjs');
+  const worktree = '/Users/someone/Claude/some-project/.worktrees/agent-a-rather-long-worktree-name-for-this-task-xx';
+  assert.ok(worktree.length >= 85);
+  const hintOf = (name) => `remove .review/jobs/${name} in that worktree if it is stale`;
+  const detailFor = (name) => `job ${name} has an unreadable record (meta.json), treated as running: ${hintOf(name)}`;
+  for (const name of ['codex-review-final-pass', 'a'.repeat(60)]) {
+    const [by] = normalizeLive([{ kind: 'job', repo: worktree, worktree, detail: detailFor(name) }]);
+    assert.ok(by.detail.includes(`job ${name} has an unreadable record (meta.json), treated as running`), 'the cause stays');
+    assert.ok(by.detail.endsWith(hintOf(name)) || !by.detail.includes('remove'), `hint whole or absent: ${by.detail}`);
+    const text = describeLive([by]);
+    assert.ok(text.includes(`(${worktree})`), 'the worktree is printed');
+    assert.ok(!/remove [^ ]*$/.test(text), `no dangling cut path: ${text}`);
+  }
+  // a name long enough that the whole hint cannot fit: dropped, not cut
+  const long = 'j'.repeat(70);
+  const [dropped] = normalizeLive([{ kind: 'job', repo: worktree, worktree, detail: detailFor(long) }]);
+  assert.ok(dropped.detail.length <= 200);
+  assert.ok(!dropped.detail.includes('remove'), `hint dropped, not cut: ${dropped.detail}`);
+  assert.ok(dropped.detail.startsWith(`job ${long} has an unreadable record (meta.json), treated as running`));
+  // and a name that fits keeps its whole hint
+  const [kept] = normalizeLive([{ kind: 'job', repo: worktree, worktree, detail: detailFor('codex-review-final-pass') }]);
+  assert.ok(kept.detail.endsWith(hintOf('codex-review-final-pass')));
 });
 
 test('defaultNotify with event pipeline-update: its own stderr prefix, notices log and banner title; the queue sweep keeps its own', () => {

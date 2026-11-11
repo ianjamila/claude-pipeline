@@ -98,7 +98,14 @@ function writeJsonAtomic(file, value) {
 // What the installer reported as live, in the status file's shape. An entry may name a repo / PR / worktree (a review lease, a live
 // merge-queue record) or only say what it is (a job, a held lock).
 const DETAIL_MAX = 200;
-const oneLine = (v) => String(v).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, DETAIL_MAX);
+const flat = (v) => String(v).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+// A "remove <folder> ... if it is stale" hint is an instruction to delete something: when the whole text does not fit the cap it is dropped, never cut (a cut
+// folder name can be another real folder).
+const REMOVE_HINT = /: remove \S+ in that worktree if it is stale$/;
+const oneLine = (v) => {
+  const s = flat(v);
+  return (s.length > DETAIL_MAX ? s.replace(REMOVE_HINT, '') : s).slice(0, DETAIL_MAX);
+};
 export function normalizeLive(live) {
   return (Array.isArray(live) ? live : []).map((l) => {
     if (!l || typeof l !== 'object') return { repo: null, pr: null, worktree: null, what: String(l) };

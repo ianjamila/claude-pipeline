@@ -72,7 +72,7 @@ function jobsIn(worktree, live) {
     if (!isDir) continue; // a stray file is not a job
     try {
       const job = jobMayBeRunning(name, { cwd: worktree });
-      if (job.running) out.push(job.why ? `job ${name} has an unreadable record (${job.why}), treated as running: remove ${path.join(dir, name)} if it is stale` : `job ${name} is running`);
+      if (job.running) out.push(job.why ? `job ${name} has an unreadable record (${job.why}), treated as running: remove .review/jobs/${name} in that worktree if it is stale` : `job ${name} is running`);
     } catch (err) { out.push(`job ${name} cannot be read (${msg(err)}), treated as running`); }
   }
   return out;
