@@ -15,8 +15,23 @@
 import { verifyOwnerGrant } from '../hooks/lib/owner-go.mjs';
 import { countsTowardCap } from './triage.mjs';
 
-// What to do when the owner's record cannot be read here.
-const cannotVerify = (n, pr) => `round ${n}: owner grant cannot be verified on this machine — run the gate on the machine that reviewed it (the only recovery once the round is published), or, for an unpublished trailing round only, \`P state discard-round --pr ${pr} --round ${n}\`, \`P triage round-request\`, and ask the owner again`;
+// Why verifyOwnerGrant said no (its `reason`), in plain words; the first check that failed is the one named.
+const WHY = {
+  provenance: "the owner's words for this grant were not found as typed by the owner in this session's transcript on this machine (a record from before transcript capture is proven through exactly one <config dir>/projects/*/<session>.jsonl in a Claude config folder under the home directory; none, or more than one, was found)",
+  'no-marker': 'this grant was never consumed on this machine',
+  'no-record': "no record of the owner's words for this grant exists on this machine",
+  mismatch: "the owner's record or the grant marker is for a different repository, PR, round or head",
+  'unverifiable-marker': "this grant's marker on this machine is unreadable or incomplete",
+  quote: "the quoted words differ from the owner's recorded words",
+  malformed: 'the grant recorded on the round is malformed',
+};
+
+// What to do when the owner's record cannot be read here, then why (`reason`: verifyOwnerGrant's, when it gave one).
+const cannotVerify = (n, pr, reason) => {
+  const base = `round ${n}: owner grant cannot be verified on this machine — run the gate on the machine that reviewed it (the only recovery once the round is published), or, for an unpublished trailing round only, \`P state discard-round --pr ${pr} --round ${n}\`, \`P triage round-request\`, and ask the owner again`;
+  const why = reason === undefined ? undefined : (WHY[reason] ?? `the owner's record failed the ${reason} check`);
+  return why === undefined ? base : `${base}. Why: ${why}`;
+};
 
 // -> { ok: true, granted: [{ n, k, quote }] } | { ok: false, problems: [string], granted }. `opts`: { repo, pr, maxRounds?, home?, now? }. Never throws.
 export function verifyOwnerGrants(state, { repo, pr, maxRounds, ...opts } = {}) {
@@ -41,7 +56,7 @@ export function verifyOwnerGrants(state, { repo, pr, maxRounds, ...opts } = {}) 
         if (counted) v = verifyOwnerGrant({ repo, pr, k, toHead: r.toHead, ownerGrant: r.ownerGrant }, opts);
       } catch { /* unverifiable */ }
       if (v.ok) granted.push({ n, k, quote: v.quote });
-      else problems.push(cannotVerify(n, pr));
+      else problems.push(cannotVerify(n, pr, v.reason));
       continue;
     }
     if (r?.admission === 'owner') {
