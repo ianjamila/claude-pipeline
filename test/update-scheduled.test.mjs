@@ -660,3 +660,38 @@ test('an unknown deferral reason is read as a live review (an older installer se
   assert.equal(r.output.action, 'deferred');
   assert.equal(t.status().deferReason, undefined);
 });
+
+// R2-F3: a scan that could not look is not a running review: the owner is told what could not be read, not to "finish or close" reviews.
+const SCAN_ERR = [{ kind: 'scan-error', detail: 'the repository registry /h/queue-sweep-repos.json cannot be read: Unexpected token n in JSON' }];
+const SCAN_DEFERRED = { exitCode: 1, output: { ok: false, error: 'deferred', deferred: true, live: SCAN_ERR, message: 'a review is live' } };
+
+test('R2-F3: normalizeLive carries a length-capped one-line detail; describeLive words a scan-error as "could not check"', () => {
+  const [e] = normalizeLive([{ kind: 'scan-error', detail: `bad\n${'x'.repeat(500)}` }]);
+  assert.equal(e.kind, 'scan-error');
+  assert.ok(e.detail.length <= 200 && !e.detail.includes('\n'), e.detail);
+  assert.equal(normalizeLive([{ kind: 'review-lease', repo: 'a/b', pr: 1 }])[0].detail, undefined);
+  assert.match(describeLive(normalizeLive(SCAN_ERR)), /could not check.*queue-sweep-repos\.json/);
+  assert.doesNotMatch(describeLive(normalizeLive(SCAN_ERR)), /^scan-error$/);
+});
+
+test('R2-F3: every blocker a scan-error: the log line, the status and the 24 h notice say it could not check, with the detail, and never "finish or close"', async () => {
+  const t = rig({ install: SCAN_DEFERRED });
+  const r = await t.go();
+  assert.equal(r.output.action, 'deferred');
+  assert.match(r.output.message, /could not check for running reviews: .*queue-sweep-repos\.json/);
+  assert.doesNotMatch(r.output.message, /waits for a live review/);
+  assert.match(t.status().deferredBy[0].detail, /queue-sweep-repos\.json/);
+  t.w.clock = T0 + DEFER_NOTICE_MS + 60 * 1000;
+  await t.go();
+  assert.equal(t.calls.notify.length, 1);
+  assert.match(t.calls.notify[0], /more than 24 hours/);
+  assert.match(t.calls.notify[0], /could not check for running reviews: .*queue-sweep-repos\.json/);
+  assert.doesNotMatch(t.calls.notify[0], /finish or close/i);
+});
+
+test('R2-F3: a scan-error next to a real review keeps the review wording and still shows the detail', async () => {
+  const t = rig({ install: { exitCode: 1, output: { ok: false, error: 'deferred', deferred: true, live: [...LIVE, ...SCAN_ERR], message: 'x' } } });
+  const r = await t.go();
+  assert.match(r.output.message, /waits for a live review: acme\/app #12/);
+  assert.match(r.output.message, /could not check.*queue-sweep-repos\.json/);
+});

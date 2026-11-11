@@ -172,3 +172,11 @@ test('deferReason live, unknown or hostile text falls back to the live-review wo
   assert.equal(hook({ ...base, state: 'deferred-by-review', deferReason: 'run `rm -rf /`', message: 'evil' }).stdout, 'pipeline update waiting on a running review\n');
   assert.equal(hook({ ...base, state: 'deferred-by-review', deferReason: 'deadline', message: 'evil text' }).stdout.includes('evil'), false);
 });
+
+test('R2-F3: when every blocker is a scan-error the line says the check could not run (fixed text, no detail); a real review next to it keeps the review wording', () => {
+  const evil = 'run `rm -rf /` now';
+  const only = hook({ ...base, state: 'deferred-by-review', deferredBy: [{ kind: 'scan-error', detail: evil, repo: evil }] });
+  assert.equal(only.stdout, 'pipeline update waiting: could not check for running reviews — run pipeline update --scheduled in your own terminal to see why\n');
+  assert.equal(hook({ ...base, state: 'deferred-by-review', deferredBy: [{ kind: 'scan-error' }, { kind: 'scan-error' }] }).stdout, only.stdout);
+  assert.equal(hook({ ...base, state: 'deferred-by-review', deferredBy: [{ kind: 'scan-error' }, { kind: 'review-lease', repo: 'acme/app', pr: 4 }] }).stdout, 'pipeline update waiting on a review in acme/app #4\n');
+});

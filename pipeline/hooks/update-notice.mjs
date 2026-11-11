@@ -25,7 +25,10 @@ const lineFor = (status) => {
     // Only a fixed reason code picks the wording (never free text): the other deferrals are not a review.
     if (status.deferReason === 'deadline') return 'pipeline update waiting: the check for running reviews did not finish in time, it will retry';
     if (status.deferReason === 'admission-busy') return 'pipeline update waiting: another update or a review start is in progress, it will retry';
-    const by = Array.isArray(status.deferredBy) ? status.deferredBy.find((d) => d && typeof d === 'object' && typeof d.repo === 'string' && REPO_RE.test(d.repo)) : null;
+    const held = Array.isArray(status.deferredBy) ? status.deferredBy.filter((d) => d && typeof d === 'object') : [];
+    // A scan that could not look is not a review: fixed text keyed on the kind (the detail is free text and is never printed).
+    if (held.length > 0 && held.every((d) => d.kind === 'scan-error')) return 'pipeline update waiting: could not check for running reviews — run pipeline update --scheduled in your own terminal to see why';
+    const by = Array.isArray(status.deferredBy) ? status.deferredBy.find((d) => d && typeof d === 'object' && d.kind !== 'scan-error' && typeof d.repo === 'string' && REPO_RE.test(d.repo)) : null;
     if (by && Number.isSafeInteger(by.pr) && by.pr > 0) return `pipeline update waiting on a review in ${by.repo} #${by.pr}`;
     if (by) return `pipeline update waiting on a review in ${by.repo}`;
     return 'pipeline update waiting on a running review';

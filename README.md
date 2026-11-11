@@ -192,6 +192,10 @@ working exactly as before.
     holds the install lock): only on the third run in a row; one good run ends the count;
   - waiting for a review for more than 24 hours: once per wait, naming what is live. The clock
     starts at the first deferral; if the system clock jumps backwards the count starts again.
+    When the installer could not look at all (an unreadable repository list, a jobs folder it cannot
+    list, git failing in a repository), every blocker is a scan error and the message reads "could not
+    check for running reviews: <what could not be read>" instead of naming a review; fix that file or
+    repository.
 - **The status file and the line at session start.** Every run writes
   `~/.claude/pipeline-state/update-status.json` (state `current`, `behind`, `deferred-by-review`,
   `blocked-modified` or `failed`; when it last checked; the installed and `main` shas; the command
@@ -199,6 +203,7 @@ working exactly as before.
   nothing when you are current:
   - `pipeline update available — installs automatically when no review is running`
   - `pipeline update waiting on a review in <repo> #N` (or just the repo, or `a running review`)
+  - `pipeline update waiting: could not check for running reviews — run pipeline update --scheduled in your own terminal to see why` (every blocker is a scan error, not a review)
   - `pipeline update needs you: run pupdate` (blocked or failed)
 - **A stated limit.** The swap replaces the guard hooks one by one. A guard hook that Claude Code
   starts in the instant its own file is being swapped is **refused** (the loader fails closed,

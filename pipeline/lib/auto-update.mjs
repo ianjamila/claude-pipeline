@@ -97,6 +97,8 @@ function writeJsonAtomic(file, value) {
 
 // What the installer reported as live, in the status file's shape. An entry may name a repo / PR / worktree (a review lease, a live
 // merge-queue record) or only say what it is (a job, a held lock).
+const DETAIL_MAX = 200;
+const oneLine = (v) => String(v).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, DETAIL_MAX);
 export function normalizeLive(live) {
   return (Array.isArray(live) ? live : []).map((l) => {
     if (!l || typeof l !== 'object') return { repo: null, pr: null, worktree: null, what: String(l) };
@@ -104,13 +106,22 @@ export function normalizeLive(live) {
       repo: l.repo ?? l.repoId ?? null, pr: l.pr ?? l.branch ?? null, worktree: l.worktree ?? null,
       ...(typeof l.kind === 'string' ? { kind: l.kind } : {}),
       ...(typeof l.what === 'string' ? { what: l.what } : {}),
+      ...(typeof l.detail === 'string' && l.detail.trim() ? { detail: oneLine(l.detail) } : {}),
     };
   });
 }
 
+// Every blocker is a scan that could not look (a corrupt registry, an unlistable jobs folder, git failing): nothing is known to be running.
+export const onlyScanErrors = (by) => by.length > 0 && by.every((b) => b.kind === 'scan-error');
+
+const scanDetail = (by) => {
+  const shown = by.slice(0, 3).map((b) => b.detail ?? b.repo ?? b.worktree ?? 'unknown cause').join('; ');
+  return by.length > 3 ? `${shown}; and ${by.length - 3} more` : shown;
+};
+
 export function describeLive(by) {
   if (!by.length) return 'a review is live';
-  const one = (b) => [b.repo ?? b.what ?? b.kind ?? 'a review', b.pr != null ? `#${b.pr}` : null, b.worktree ? `(${b.worktree})` : null].filter(Boolean).join(' ');
+  const one = (b) => (b.kind === 'scan-error' ? `could not check (${b.detail ?? b.repo ?? b.worktree ?? 'scan-error'})` : [b.repo ?? b.what ?? b.kind ?? 'a review', b.pr != null ? `#${b.pr}` : null, b.worktree ? `(${b.worktree})` : null].filter(Boolean).join(' '));
   const shown = by.slice(0, 5).map(one).join('; ');
   return by.length > 5 ? `${shown}; and ${by.length - 5} more` : shown;
 }
@@ -271,7 +282,9 @@ export async function runScheduled({ home, env, ctx = {}, say = () => {}, deps }
       const carried = state.deferNotified ? { deferNotified: state.deferNotified } : {};
       // 'deadline' / 'admission-busy' are not a review: they name their own cause, and like a busy install lock they tell the owner only on the 3rd run in a row.
       const cause = dreason === 'live' ? describeLive(by) : (o.message || dreason);
-      const message = dreason === 'live' ? `main ${sha7(sha)} waits for a live review: ${cause}` : `main ${sha7(sha)} deferred (${dreason}): ${cause}`;
+      const unchecked = dreason === 'live' && onlyScanErrors(by); // could not look: not a running review
+      const message = unchecked ? `main ${sha7(sha)} deferred: could not check for running reviews: ${scanDetail(by)}`
+        : dreason === 'live' ? `main ${sha7(sha)} waits for a live review: ${cause}` : `main ${sha7(sha)} deferred (${dreason}): ${cause}`;
       let streakTold;
       if (dreason === 'live') state = carried;
       else {
@@ -284,7 +297,9 @@ export async function runScheduled({ home, env, ctx = {}, say = () => {}, deps }
       let told = streakTold;
       if (nowDate.getTime() - Date.parse(since) > DEFER_NOTICE_MS && state.deferNotified !== since) {
         try {
-          await notifier(dreason === 'live'
+          await notifier(unchecked
+            ? `pipeline update to ${sha7(sha)} has been waiting more than 24 hours: could not check for running reviews: ${scanDetail(by)}. Fix that, or run in your own terminal: ${command}`
+            : dreason === 'live'
             ? `pipeline update to ${sha7(sha)} has been waiting more than 24 hours for live reviews: ${describeLive(by)}. Finish or close them, or run in your own terminal: ${command}`
             : `pipeline update to ${sha7(sha)} has been deferred for more than 24 hours (${dreason}): ${cause}. Run in your own terminal: ${command}`);
           state = { ...state, deferNotified: since };
