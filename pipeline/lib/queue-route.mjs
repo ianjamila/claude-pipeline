@@ -10,7 +10,7 @@ import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
 import { GATE_FILE, GATE_MAX_AGE_MS, PR_FIELDS, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, preMergeProblems, readReviewJson, waitBlockers } from './finalgate.mjs';
 import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
-import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, predatesQueueMessage, queueCatchUpState, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
+import { QueueRecordUnreadable, adoptHeadMoved, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, predatesQueueMessage, queueCatchUpState, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
 import { RESTORE_NOTE } from './hold.mjs';
 import { headSha } from './git.mjs';
 import { envWithGhDir, runShellAsync } from './proc.mjs';
@@ -199,9 +199,13 @@ export function createQueueRoute({
   };
   // An unmerged end: the hold seam first (it puts a lifted label back), then the record ends if it still is open and the seam did not keep it.
   // -> the fields the seam adds to the refusal.
-  const terminal = async (kind) => {
+  // `adopt` ({ head, entryId }, #237): instead of ending, the record is replaced by the orphan record for the live entry at the new head (adoptHeadMoved).
+  const terminal = async (kind, adopt = null) => {
     const out = (await onTerminal({ kind, rec: readQueueRecord(root, pr) })) ?? {};
-    if (out.keepOpen !== true && liveRecord() !== null) endRecord(root, pr, kind, { now });
+    if (out.keepOpen !== true && liveRecord() !== null) {
+      if (adopt !== null) adoptHeadMoved(root, pr, { ...adopt, now });
+      else endRecord(root, pr, kind, { now });
+    }
     return out.fields ?? {};
   };
 
@@ -214,7 +218,24 @@ export function createQueueRoute({
     });
   };
   const unmergedEnd = async (kind) => {
-    const holdFields = await terminal(kind);
+    // A head move over a live record: an entry at the new head (queued from another checkout or the GitHub UI) is tracked from here on, as settleRecord does for the
+    // sweep (#237), instead of being left with no record. GitHub is asked once more (reconcile's answer names only the new head); a read that fails leaves the record
+    // live and the hold alone (ending it could lose the entry; the next merge or sweep settles it).
+    let adopt = null;
+    const rec = kind === 'head-moved' ? liveRecord() : null;
+    if (rec !== null) {
+      let cur;
+      try {
+        cur = gh.queueState(pr);
+      } catch (err) {
+        return unreadable(`PR #${pr}'s head moved off the approved ${head.slice(0, 12)}, but the merge queue could not be read to see whether an entry sits at the new head`, err);
+      }
+      if (cur.state === 'OPEN' && cur.entry && typeof cur.head === 'string' && cur.head !== rec.head) adopt = { head: cur.head, entryId: cur.entry.id ?? null };
+    }
+    const holdFields = await terminal(kind, adopt);
+    if (adopt !== null && readQueueRecord(root, pr)?.adopted) {
+      return refusal(kind, [`PR #${pr}'s head moved off the approved ${head.slice(0, 12)} and the PR is in the merge queue at ${adopt.head.slice(0, 12)}, which nobody approved: it is not dequeued or merged on the old approval, and \`queue-sweep\` keeps tracking that entry`], { queued: false, adopted: adopt, ...holdFields });
+    }
     return refusal(kind, [kind === 'closed' ? `PR #${pr} was closed without merging` : `PR #${pr}'s head moved off the approved ${head.slice(0, 12)}: nothing was queued or merged for it`], { queued: false, ...holdFields });
   };
 
