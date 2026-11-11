@@ -1678,6 +1678,37 @@ function ghReadOnly(args, cmd, ctx) {
   if (words[0] === 'api') return !args.some((a) => /^(?:-o|--output|--cache)/.test(a));
   return Object.hasOwn(GH_PRINTERS, words[0] ?? '') && GH_PRINTERS[words[0]].includes(words[1]);
 }
+// #190 case 4 (T1.1, narrowed by the Fable plan pass F1 / F3): a plain `NAME=value` command is not itself a risk, only what later reads NAME is, and the redirect and writer rules already expand
+// NAME. So an assignment that names a protected path is harmless exactly when nothing on the line can hand the value to a program or change how it is read:
+//   - top level only: a sourced or startup file, a script and a `bash -c` string are judged as before (their later consumers are not visible to the evaluation);
+//   - (i) NAME is not in the hook's own environment (a plain assignment to an exported name changes what children see) and is no special name (a shell parameter the shell itself acts on
+//     (PATH, TMPDIR, TMPPREFIX, IFS ...), or a family the tools read: GIT_ LESS PAGER NODE_ RIPGREP_ GH_ XDG_ LD_ DYLD_);
+//   - (ii) the value, after expansion, is ONE path-shaped token (so it can be no option, program text, list or command: `O=-o<S>; sort $O p` stays refused);
+//   - (iii) nothing on the line exports, declares, evals, traps, aliases, defines a function, sources or sets an option (`set -a`);
+//   - (iv) every other command is an env-inert reader, so a later use can only read.
+const ENV_INERT = new Set(['cat', 'head', 'tail', 'wc', 'ls', 'stat', 'grep', 'cut', 'echo', 'printf', 'test', '[', 'shasum', 'cmp']);
+const SPECIAL_NAMES = new Set(['PATH', 'path', 'fpath', 'cdpath', 'CDPATH', 'HOME', 'TMPDIR', 'TMPPREFIX', 'IFS', 'NULLCMD', 'READNULLCMD', 'ZDOTDIR', 'ENV', 'BASH_ENV', 'PS4', 'PS1', 'PS2', 'PS3', 'PROMPT_COMMAND',
+  'HISTFILE', 'SHELLOPTS', 'BASHOPTS', 'GLOBIGNORE', 'FIGNORE', 'MAIL', 'MAILPATH', 'TMOUT', 'LANG', 'TZ', 'SHELL', 'EDITOR', 'VISUAL', 'PWD', 'OLDPWD', 'USER', 'LOGNAME', '_']);
+const SPECIAL_FAMILIES = /^(?:GIT_|LESS|PAGER|NODE_|RIPGREP_|GH_|GITHUB_|XDG_|LD_|DYLD_|LC_|ZSH|BASH_|SHELL|MANPAGER|PIPELINE_|CLAUDE)/;
+const PATH_VALUE = /^[A-Za-z0-9_@%+,./~${}-]+$/; // (no space, quote, backslash, glob or list character, `=`, `:`, `(`)
+// (a function, a `${NAME:=word}` default that assigns, an arithmetic expression: each can set a name the line never assigns)
+const FUNCTION_TEXT = /\bfunction\b|\w\s*\(\)|\$\{[A-Za-z_]\w*:?=|\(\(/;
+function assignmentOnlyHarmless(cmds, ctx, topLevel) {
+  const no = () => false;
+  if (!topLevel || cmds.dynamic || cmds.truncated || ctx.unknownAll) return no;
+  const isAssign = (c) => c.argv.length === 0 && Object.keys(c.env ?? {}).length > 0 && !(c.redirects ?? []).length;
+  const valueOk = (name, v) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || SPECIAL_NAMES.has(name) || SPECIAL_FAMILIES.test(name) || Object.hasOwn(ctx.env ?? {}, name)) return false;
+    if (typeof v !== 'string' || !PATH_VALUE.test(v) || /^-/.test(v)) return false;
+    const e = expandRefs(v, ctx);
+    return !/[$`{}]/.test(e) && /^(?:\/|~|\.)/.test(e);
+  };
+  const inert = (c) => (isAssign(c) ? Object.entries(c.env).every(([k, v]) => valueOk(k, v)) : c.argv.length > 0 && ENV_INERT.has(baseOf(c.argv[0])) && !Object.keys(c.env ?? {}).length && !(baseOf(c.argv[0]) === 'printf' && c.argv.some((a) => /^-v/.test(a)))); // (printf -v NAME assigns a shell variable)
+  if (!cmds.every(inert)) return no;
+  if (FUNCTION_TEXT.test(ctx.ghLine ?? '')) return no;
+  return (c) => isAssign(c);
+}
+
 // T1.7 (c) / (f): a tool that reads a variable to decide WHERE it writes (git's GIT_TRACE*, less's LESSHISTFILE / LESSOPEN, a pager, rg's config) or what it loads (node's NODE_OPTIONS / NODE_PATH) is
 // not read-only when the line sets one: as a prefix of the command, by an assignment or `export` / `declare -x` anywhere on the line, or through a name a sourced file may have changed.
 // (Same reading as ghEnvTouched; a name only the session's own environment holds is outside the line's control, as for every command here.)
@@ -3547,10 +3578,12 @@ function evaluateBashForFilesFrame(command, opts) {
   if (cmds.some((c) => FAN_OUT_RE.test(c.raw) || (SHELL_NAMES.has(baseOf(c.argv[0] ?? '')) && !isReadOnly(c, ctx)))) return deny('the command refers to a protected pipeline file and hands work to xargs or a shell, which could modify it');
 
   const pool = unaccounted ? cmds.filter((c) => c.argv.length) : mentioning;
-  const bad = pool.find((c) => !isReadOnly(c, ctx));
+  const harmless = assignmentOnlyHarmless(cmds, ctx, ctx.frames.indexOf(frame) === 0);
+  const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c));
   if (bad) {
     const name = bad.argv.length ? baseOf(bad.argv[0]) : '(assignment)';
-    return deny(`${name} refers to a protected pipeline file (or the directory that holds it) and is not a read-only command (${PROTECTED_MSG})`);
+    const literal = bad.argv.length ? '' : '; if the variable only holds a path, pass the path literally, or use it only with cat / head / tail / wc / ls / stat / grep / cut / echo / printf / test on a line without export, eval, source or another program';
+    return deny(`${name} refers to a protected pipeline file (or the directory that holds it) and is not a read-only command (${PROTECTED_MSG}${literal})`);
   }
   return allow();
 }
