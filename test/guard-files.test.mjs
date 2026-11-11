@@ -35,6 +35,8 @@ test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form
     '/home/u/.claude/agents/arbiter.md',
     '/home/u/.claude/pipeline',
     '/home/u/.claude/settings.json',
+    '/home/u/.claude/hooks', // (#261)
+    '/home/u/.claude/settings.local.json', // (#261)
     '/home/u/.claude/pipeline-state/owner-go',
   ]);
   assert.equal(protectedRoots('C:\\Users\\u\\')[0], 'C:/Users/u/.claude/skills/ship');
@@ -1232,6 +1234,9 @@ test('#128 R2-B1: ~/.claude-eaglewatch (any home-level .claude* folder) is a tra
     'rsync -a x/ /home/u/proj/.claude-eaglewatch/',
   ]) assert.equal(bash(cmd), 'allow', cmd);
   assert.equal(file('Edit', { file_path: '/repo/.claude/settings.local.json', old_string: 'a', new_string: 'b' }), 'allow');
+  // (#261: a permissions edit of the project's local settings stays allowed; one that adds hooks is denied, see guard-click-hooks.test.mjs)
+  assert.equal(file('Write', { file_path: '/repo/.claude/settings.local.json', content: '{"permissions":{"allow":["Bash(ls:*)"]}}' }), 'allow');
+  assert.equal(file('Write', { file_path: '/repo/.claude/settings.local.json', content: '{"hooks":{"PreToolUse":[]}}' }), 'deny');
 });
 
 // R2-B2: a wildcard segment is asked whether it can stand for ANY name that starts with .claude, not for two sample names.

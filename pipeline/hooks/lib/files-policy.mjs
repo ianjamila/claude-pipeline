@@ -48,6 +48,10 @@ const PROTECTED_REL = [
   '.claude/agents/arbiter.md',
   '.claude/pipeline',
   '.claude/settings.json',
+  // #261 (click-to-approve): a hook that runs on the owner's dialogs (AskUserQuestion) could answer one in the owner's name or hide a refusal, so the user-level hooks folder and the
+  // local settings file (where a hook can be declared) are held like settings.json. Every OTHER account config dir (~/.claude-<name>, $CLAUDE_CONFIG_DIR) gets the same three, see configRoots.
+  '.claude/hooks',
+  '.claude/settings.local.json',
   // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it, P merge and the guard read it
   '.claude/pipeline-state/owner-go',
 ];
@@ -247,7 +251,11 @@ function makeCtx(opts) {
   const darwin = platform === 'darwin';
   const unFirm = (p) => (darwin ? p.replace(FIRMLINK, '') : p);
   const base = homePosix === '/' ? '' : homePosix;
-  const lexRoots = protectedRoots(homePosix);
+  const lexRoots = unique([
+    ...protectedRoots(homePosix),
+    ...configRoots({ base, cfgDir: configDirOf(opts.env ?? process.env, homePosix), readDir: opts.readDir ?? defaultReadDir, home: homeNative }),
+    ...listedDialogScripts(base, defaultReadText), // (the real file, not opts.readText: a test's fake reader is a script-read counter and clock)
+  ]);
   const lexAncestors = ANCESTOR_REL.map((r) => `${base}/${r}`);
   const roots = unique([...withWindowsAliases(lexRoots, homePosix, platform), ...lexRoots.map((r) => realResolve(r, api))]);
   const ancestors = unique([...withWindowsAliases(lexAncestors, homePosix, platform), ...lexAncestors.map((r) => realResolve(r, api))]);
@@ -473,6 +481,80 @@ function writtenTexts(ti) {
 
 const SETTINGS_RE = /^settings(\.[\w-]+)?\.json$/i;
 
+// ---- #261: the places a hook that runs on AskUserQuestion can be declared, besides the account config dirs the protected set holds -------------------------------------------------
+// A project's .claude/settings.json and settings.local.json, a plugin's hooks/hooks.json under a config dir, and the `hooks:` front matter of a skill or an agent. The agent may edit these files for
+// other reasons (permissions, prose), so a file tool is judged by whether the change adds or alters hooks; a Bash line, whose effect is not evaluated, by the file's name plus the word "hooks".
+const HOOK_SURFACE = {
+  settings: /(?:^|\/)\.claude[^/]*\/settings(?:\.local)?\.json$/,
+  plugin: /(?:^|\/)\.claude[^/]*\/plugins\/(?:[^/]+\/)*hooks\/hooks\.json$/,
+  frontmatter: /(?:^|\/)\.claude[^/]*\/(?:skills\/[^/]+\/SKILL\.md|agents\/[^/]+\.md)$/,
+};
+// the same names inside command text (a word that is, or ends in, such a path)
+const HOOK_SURFACE_TEXT = /\.claude[^/\s'"`]*\/(?:settings(?:\.local)?\.json|skills\/[^/\s'"`]+\/SKILL\.md|agents\/[^/\s'"`]+\.md|plugins\/[^\s'"`]*hooks\/hooks\.json)(?![\w.\-])/i;
+const hookSurfaceKind = (p, ci) => {
+  const q = ci ? String(p).toLowerCase() : String(p);
+  for (const [kind, re] of Object.entries(HOOK_SURFACE)) if (re.test(q)) return kind;
+  return null;
+};
+const sortedJsonOf = (v) => JSON.stringify(v, (_k, x) => (x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x));
+// the `hooks:` block of a skill's or agent's front matter ('' when there is none)
+function frontmatterHooks(text) {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(String(text ?? ''));
+  if (!m) return '';
+  const lines = m[1].split(/\r?\n/);
+  const at = lines.findIndex((l) => /^hooks\s*:/.test(l));
+  if (at < 0) return '';
+  let end = lines.length;
+  for (let i = at + 1; i < lines.length; i++) if (/^[^\s#-]/.test(lines[i])) { end = i; break; }
+  return lines.slice(at, end).join('\n');
+}
+// The text a file tool would leave in the file (null when it cannot be worked out: an Edit whose old_string is not there is no change the tool will make, judged by its words).
+function textAfter(ti, before) {
+  if (typeof ti.content === 'string') return ti.content;
+  const apply = (text, e) => {
+    if (typeof e?.old_string !== 'string' || typeof e?.new_string !== 'string' || text === null || !text.includes(e.old_string)) return null;
+    return e.replace_all === true ? text.split(e.old_string).join(e.new_string) : text.replace(e.old_string, () => e.new_string);
+  };
+  if (Array.isArray(ti.edits)) { let t = before; for (const e of ti.edits) { t = apply(t, e); if (t === null) return null; } return t; }
+  return apply(before, ti);
+}
+// Does this file-tool call add or alter hooks in a hook surface file? -> a reason, or null.
+function hooksChangeReason(kind, ti, ctx, candidate, shown) {
+  if (kind === 'plugin') return `${shown} is a plugin's hooks file: a hook there could run on the owner's dialogs`;
+  const before = ctx.readText(candidate) ?? '';
+  const after = textAfter(ti, before);
+  const words = writtenTexts(ti).some((x) => /hooks/i.test(x));
+  if (after === null) return words ? `${shown}: the change mentions hooks and cannot be compared with the file` : null;
+  if (kind === 'frontmatter') return frontmatterHooks(before) !== frontmatterHooks(after) ? `${shown}: the change adds or alters hooks in the front matter` : null;
+  let a = null;
+  let b = null;
+  try { b = before.trim() === '' ? {} : JSON.parse(before); } catch { b = null; }
+  try { a = JSON.parse(after); } catch { a = null; }
+  if (a === null || typeof a !== 'object') return words ? `${shown}: the change mentions hooks and the result cannot be read as JSON` : null;
+  if (b === null || typeof b !== 'object') return /"hooks"/.test(after) ? `${shown}: the file could not be compared and now holds hooks` : null;
+  return sortedJsonOf(a.hooks ?? null) !== sortedJsonOf(b.hooks ?? null) ? `${shown}: the change adds or alters "hooks"` : null;
+}
+const HOOKS_MSG = 'a hook on AskUserQuestion could answer the owner\'s dialog in the owner\'s name or hide a refusal; permission edits stay allowed, hooks are the owner\'s to change, from a terminal';
+
+// The account config dirs besides ~/.claude (a folder directly under the home with the HOME_CONFIG_DIR_RE shape, and $CLAUDE_CONFIG_DIR): hooks/, settings.json and settings.local.json in each.
+function configRoots({ base, cfgDir, readDir, home }) {
+  const dirs = new Set();
+  const names = readDir(home);
+  if (Array.isArray(names)) for (const n of names) if (typeof n === 'string' && n !== '.claude' && HOME_CONFIG_DIR_RE.test(n)) dirs.add(`${base}/${n}`);
+  if (cfgDir && cfgDir !== `${base}/.claude`) dirs.add(cfgDir);
+  return [...dirs].flatMap((d) => ['hooks', 'settings.json', 'settings.local.json'].map((r) => `${d}/${r}`));
+}
+// The scripts of the dialog-hook list the owner approved (<home>/.claude/pipeline-state/owner-go/dialog-hooks.json, written by `P owner-go approve-dialog-hooks`): each one is a hook on
+// AskUserQuestion, so an edit to it changes what runs on the owner's dialogs. Read fail-safe: a missing or unreadable list adds nothing (the folder that holds it is protected already).
+function listedDialogScripts(base, readText) {
+  try {
+    const j = JSON.parse(readText(`${base}/.claude/pipeline-state/owner-go/dialog-hooks.json`) ?? '');
+    return (Array.isArray(j?.hooks) ? j.hooks : []).slice(0, 200).map((h) => (typeof h?.scriptPath === 'string' ? toPosix(h.scriptPath) : '')).filter((p) => isAbs(p)).map((p) => pathsFor().normalize(p));
+  } catch {
+    return [];
+  }
+}
+
 // ---- file tools -----------------------------------------------------------------------------------
 
 function lexicalTarget(target, ctx) {
@@ -576,6 +658,13 @@ function evaluateMcp(tool, ti, input, opts) {
       }
     }
     if (texts.some((x) => setsAdmin(x, ctx.platform))) return deny('this write sets PIPELINE_ADMIN; only the owner does that, when launching Claude Code');
+    // #261: what the tool will write cannot be compared with the file, so a hook surface file is refused when the content says "hooks" (a plugin's hooks file always)
+    for (const { t, candidates } of targets) {
+      for (const c of candidates) {
+        const kind = hookSurfaceKind(c, ctx.ci);
+        if (kind !== null && (kind === 'plugin' || texts.some((x) => /hooks/i.test(x)))) return deny(`${t} is a file that can declare hooks (${HOOKS_MSG})`);
+      }
+    }
   }
   // 2. anything else a tool that is not clearly read-only was given: a path anywhere, or code that builds one
   const matchers = makeMatchers(ctx);
@@ -612,6 +701,14 @@ function evaluateFileToolUnchecked(input, opts = {}) {
   });
   for (const { t, candidates } of resolved) {
     if (candidates.some((c) => ctx.hit(c) || ctx.hitInode(c))) return deny(`${t} is a protected pipeline file (${PROTECTED_MSG})`);
+  }
+  // #261: a hook declared in a project's settings, a plugin's hooks file or a skill's / agent's front matter
+  for (const { t, candidates } of resolved) {
+    for (const c of candidates) {
+      const kind = hookSurfaceKind(c, ctx.ci);
+      const why = kind === null ? null : hooksChangeReason(kind, ti, ctx, c, t);
+      if (why !== null) return deny(`${why} (${HOOKS_MSG})`);
+    }
   }
   if (texts.some(hasDisableAll)) {
     for (const { t, candidates } of resolved) {
@@ -895,7 +992,7 @@ function ancestorRegexes(ctx) {
 const SEP = "(?=[ \\t]*[/'\"`,+])[/'\"`,+ \\t]+"; // between pieces of a code-built path: '.claude', 'skills', 'ship'
 function suffixBody(sep) {
   const end = '(?![\\w.\\-])';
-  return `\\.claude${sep}(?:settings\\.json${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter)\\.md${end})`;
+  return `\\.claude${sep}(?:settings\\.json${end}|hooks${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter)\\.md${end})`;
 }
 // ...preceded by something only known at run time: a variable, a command substitution, a template `${...}`, a call
 // result `)`, a `+` or `,` joining pieces, `~user`, `.join(` / `.joinpath(`.
@@ -3032,6 +3129,15 @@ function evaluateBashForFilesFrame(command, opts) {
     const words = [c.argv.join(' '), ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)].join(' ');
     if (setsAdmin(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
     if (hasDisableAll(words)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
+  }
+  // #261: a write whose target is a file that can declare a hook on the owner's dialogs and whose line says "hooks" (its effect cannot be evaluated; a permission edit has no such word)
+  if (/hooks/i.test(scanRaw)) {
+    for (const c of cmds) {
+      const writes = (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) || (c.argv.length > 0 && !isReadOnly(c, ctx));
+      if (writes && [...c.argv, ...(c.redirects ?? []).map((r) => r.target ?? ''), rawOfCmd(c)].some((w) => HOOK_SURFACE_TEXT.test(String(w)))) {
+        return deny(`the command writes a file that can declare hooks and mentions hooks (${HOOKS_MSG})`);
+      }
+    }
   }
   if (changesClaudeCode(cmds, scanRaw)) return deny('the command unsets or overrides CLAUDECODE, the marker the installer uses to refuse to run inside Claude Code; only the owner may change it, from a terminal');
   if (setsSeamForPipeline(cmds)) return deny('the command sets a pipeline test seam (PIPELINE_GH, PIPELINE_CODEX, PIPELINE_VERCEL, PIPELINE_TEST_MODE, PIPELINE_UPDATE_REMOTE) for the pipeline CLI; a fake gh/codex/vercel could satisfy the merge gate, and a foreign update remote would install foreign code, so only the owner does that, from a terminal');

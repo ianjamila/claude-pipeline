@@ -173,11 +173,12 @@ table('redirect', [
   ['D=$HOME/.claude; cat /tmp/x > $D/settings.json'],
   ['cat /tmp/x > $X/.claude/settings.json'],
   ['echo x > /home/u/proj/../.claude/pipeline/x'],
+  ['echo x > .claude/settings.local.json', HOME_CWD], // (#261)
 ], 'deny');
 
 table('redirect', [
   ['echo x > .claude/settings.json', PROJ],
-  ['echo x > .claude/settings.local.json', HOME_CWD],
+  ['echo x > .claude/settings.local.json', PROJ], // (#261: the PROJECT's local settings stay open; the home's own is protected, see the deny table below)
   ['echo x > .claude/agents/new.md', HOME_CWD],
   ['echo x > .claude/skills/other/x.md', HOME_CWD],
   ['echo x > ~/.claude/skills/ship-it/SKILL.md'],
