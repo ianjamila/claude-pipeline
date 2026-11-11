@@ -653,3 +653,137 @@ test('R6-F1: the /clear preamble (SessionStart attachment root, isMeta caveat no
     assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), root2, m, of(m, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: a request printed under a note chained to a non-prompt root, after an older owner ask, binds nothing`);
   }
 });
+
+// ---- #246: a system turn (task notice, peer, plugin) inherits invisibility from the chain it is written under ----------------------------------
+// visibleSynthetic says what the entry is; whether the owner SAW it depends on the turn it chains to: a notice under a typed owner turn is on screen, a notice a headless (sdk) process wrote
+// under its own prompt is not, and an ancestry that does not resolve (outside the window, a duplicate uuid, a cycle) fails closed. A compaction boundary and a --resume link are transparent.
+
+const sdkTurn = () => {
+  const owner = prompt('ship it');
+  const sdk = prompt('poll', SDK);
+  const sdkSaid = { ...said('working'), uuid: `u-sdk-said-${sdk.uuid}`, parentUuid: sdk.uuid };
+  return { owner, sdk, sdkSaid, base: [owner, of(owner, said('x')), sdk, sdkSaid] };
+};
+
+test('#246: a task notice chained to an sdk turn is invisible: its ask binds nothing; two notices in a row likewise', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const { base, sdkSaid } = sdkTurn();
+    const n1 = prompt('notice', NOTICE);
+    assert.equal(run(kind, [...base, { ...n1, parentUuid: sdkSaid.uuid }, of(n1, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: one notice`);
+    const n2 = prompt('second notice', PEER);
+    const n1said = { ...said('seen'), uuid: `u-n1-said-${n1.uuid}`, parentUuid: n1.uuid };
+    assert.equal(run(kind, [...base, { ...n1, parentUuid: sdkSaid.uuid }, n1said, { ...n2, parentUuid: n1said.uuid }, of(n2, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: two notices`);
+    // the same notice written under the OWNER's turn is on screen: it binds
+    const owner = prompt('ship it');
+    const n = prompt('notice', NOTICE);
+    assert.deepEqual(pr(kind, record(kind, [owner, of(owner, said('x')), { ...n, parentUuid: owner.uuid }, of(n, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: notice under the owner turn`);
+    const m = prompt('second notice', PEER);
+    assert.deepEqual(pr(kind, record(kind, [owner, of(owner, said('x')), { ...n, parentUuid: owner.uuid }, { ...m, parentUuid: n.uuid }, of(m, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: notice under a notice under the owner turn`);
+  }
+});
+
+test('#246: an inherited-invisible notice does not promote a ruling ask and is no shown skip, exactly like an sdk turn', () => {
+  const { base, sdkSaid } = sdkTurn();
+  const n = prompt('notice', NOTICE);
+  const entries = [...base, { ...n, parentUuid: sdkSaid.uuid }, of(n, said(RULING_ASK))];
+  assert.equal(run('ruling', [...entries, prompt('R1-B1: accept')]), false, 'not promoted');
+  // R3-F1, interleaved: a notice that opened while the owner's turn was still being written shows text AFTER the owner-turn ask. Under the owner's turn that text was on screen, so the ask is stale;
+  // under an sdk turn nobody saw it, so it is no shown skip and the ask stands.
+  const sdk = prompt('poll', SDK);
+  const sdkSaid2 = { ...said('w'), uuid: 'u-sdk-said-2', parentUuid: sdk.uuid };
+  const owner = prompt('go');
+  const working = of(owner, said('working'));
+  const askSaid = { ...said(RULING_ASK), uuid: 'u-owner-ask', parentUuid: owner.uuid };
+  const mk = (parentUuid) => { const n = prompt('notice', NOTICE); return [{ ...n, parentUuid }, of(n, said('unrelated text'))]; };
+  const [hiddenNotice, hiddenSaid] = mk(sdkSaid2.uuid);
+  assert.deepEqual(pr('ruling', record('ruling', [sdk, sdkSaid2, owner, working, hiddenNotice, askSaid, hiddenSaid, prompt('R1-B1: accept')])), 58, 'a hidden notice shows nothing');
+  const [shownNotice, shownSaid] = mk(owner.uuid);
+  assert.equal(run('ruling', [sdk, sdkSaid2, owner, working, shownNotice, askSaid, shownSaid, prompt('R1-B1: accept')]), false, 'control: the same notice under the owner turn is shown and makes the ask stale');
+});
+
+test('#246: unresolved ancestry fails closed: the sdk ancestor outside the window, a duplicate ancestor uuid, a cycle through non-prompt entries', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const owner = prompt('ship it');
+    const n = prompt('notice', NOTICE);
+    const asked = (parentUuid) => [owner, of(owner, said('x')), { ...n, parentUuid }, of(n, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)];
+    assert.equal(run(kind, asked('u-sdk-ancestor-cut-off')), false, `${kind}: parent outside the window`);
+    const twin1 = { ...said('x'), uuid: 'u-twin-anc', parentUuid: owner.uuid };
+    const twin2 = { ...said('y'), uuid: 'u-twin-anc', parentUuid: owner.uuid };
+    assert.equal(run(kind, [owner, twin1, twin2, { ...n, parentUuid: 'u-twin-anc' }, of(n, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: duplicate ancestor uuid`);
+    const a = { ...said('x'), uuid: 'u-cyc-anc-a', parentUuid: 'u-cyc-anc-b' };
+    const b = { ...said('y'), uuid: 'u-cyc-anc-b', parentUuid: 'u-cyc-anc-a' };
+    assert.equal(run(kind, [owner, a, b, { ...n, parentUuid: 'u-cyc-anc-a' }, of(n, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: cycle through non-prompt entries`);
+    // a notice chain that loops on itself (two notices under each other)
+    const x = { ...prompt('x', NOTICE), uuid: 'u-nn-x', parentUuid: 'u-nn-y' };
+    const y = { ...prompt('y', NOTICE), uuid: 'u-nn-y', parentUuid: 'u-nn-x' };
+    assert.equal(run(kind, [owner, of(owner, said('x')), x, y, of(y, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: notices under each other`);
+  }
+});
+
+test('#246 / F6: a compaction is transparent: compaction, notice, ask, answer binds; the same in an sdk turn does not', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const owner = prompt('ship it');
+    const n = prompt('notice', NOTICE);
+    // (link() chains the notice to the summary, the summary to the boundary and the boundary, by logicalParentUuid, to the entry before it)
+    assert.deepEqual(pr(kind, record(kind, [owner, of(owner, said('x')), BOUNDARY, SUMMARY, n, of(n, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: compaction, notice, ask`);
+    const { base } = sdkTurn();
+    const m = prompt('notice', NOTICE);
+    assert.equal(run(kind, [...base, BOUNDARY, SUMMARY, m, of(m, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: compaction inside an sdk turn`);
+    const lost = { ...BOUNDARY, parentUuid: null, logicalParentUuid: 'u-gone' };
+    const k = prompt('notice', NOTICE);
+    assert.equal(run(kind, [owner, of(owner, said('x')), lost, SUMMARY, k, of(k, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: a compaction whose past is outside the window`);
+  }
+});
+
+// What Claude Code 2.1.3xx writes on `--resume` (probed on this machine's transcripts, 11-11): the SAME file continues, a SessionStart:resume hook attachment chains to the last entry before the
+// resume (here an away_summary system entry), further attachments hang off it, and the owner's next typed prompt chains through them to the old turn. No new sessionId, no boundary entry.
+const RESUME = () => [
+  { type: 'system', subtype: 'away_summary' },
+  { type: 'attachment', attachment: { type: 'hook_success', hookEvent: 'SessionStart', hookName: 'SessionStart:resume' }, entrypoint: 'cli' },
+  { type: 'attachment', attachment: { type: 'hook_additional_context' }, entrypoint: 'cli' },
+];
+test('#246 / F6: a --resume link is transparent: resume, notice, ask, answer binds; a SessionStart root with no typed prompt stays invisible', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const owner = prompt('ship it');
+    const n = prompt('notice', NOTICE);
+    assert.deepEqual(pr(kind, record(kind, [owner, of(owner, said('x')), ...RESUME(), n, of(n, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: resume, notice, ask`);
+    const typed = prompt('continue');
+    const n2 = prompt('notice', NOTICE);
+    assert.deepEqual(pr(kind, record(kind, [owner, of(owner, said('x')), ...RESUME(), typed, of(typed, said('ok')), n2, of(n2, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: resume, typed prompt, notice, ask`);
+    const { base } = sdkTurn();
+    const m = prompt('notice', NOTICE);
+    assert.equal(run(kind, [...base, ...RESUME(), m, of(m, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: resume into an sdk turn`);
+    // a session that started with a notice and no typed prompt yet: the chain ends at the SessionStart attachment, no prompt is behind it
+    const root = { type: 'attachment', attachment: { type: 'hook_success', hookEvent: 'SessionStart', hookName: 'SessionStart:startup' }, entrypoint: 'cli', parentUuid: null, uuid: `u-start-${kind}` };
+    const k = { ...prompt('notice', NOTICE), parentUuid: root.uuid };
+    assert.equal(run(kind, [root, k, of(k, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: SessionStart root, no typed prompt`);
+  }
+});
+
+test('#246: a re-ask in the owner\'s next typed turn binds after an invisible notice', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const { base, sdkSaid } = sdkTurn();
+    const n = prompt('notice', NOTICE);
+    const owner2 = prompt('what now');
+    assert.deepEqual(pr(kind, record(kind, [...base, { ...n, parentUuid: sdkSaid.uuid }, of(n, said(KINDS[kind].ask)), owner2, of(owner2, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), kind);
+  }
+});
+
+test('#246: the chain walk is bounded (a visited set) and memoised: a long run of notices resolves quickly', () => {
+  const owner = prompt('ship it');
+  const entries = [owner, of(owner, said('x'))];
+  let prev = entries[1].uuid;
+  for (let i = 0; i < 4000; i++) {
+    const n = { ...prompt('notice', NOTICE), parentUuid: prev };
+    const reply = { ...said('seen'), uuid: `u-run-${i}`, parentUuid: n.uuid };
+    entries.push(n, reply);
+    prev = reply.uuid;
+  }
+  const file = join(tmp(), 't.jsonl');
+  writeFileSync(file, linesOf([...entries, of({ uuid: prev }, said(MERGE_ASK)), prompt('merge')]));
+  const t0 = process.hrtime.bigint();
+  const r = lastReply(file, { prompt: 'merge' });
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.ok(r.text.includes('Ready to merge'), 'the ask under a long chain of owner-visible notices still binds');
+  assert.ok(ms < 4000, `${ms} ms`);
+});

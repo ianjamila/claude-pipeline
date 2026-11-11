@@ -309,17 +309,30 @@ const invisibleTurn = (e) => {
 // (invisible), and so does a chain that ends at a non-prompt root (e.g. the SessionStart attachment above the /clear caveat and command notes: they sit before the first owner prompt and carry no
 // assistant text, so what they mute is never an ask; pinned by R6-F1); only an entry with no parentUuid at all (a legacy transcript) leaves its own fields to decide (visible); a chain of notes
 // resolves transitively, a cycle fails closed.
-function invisibleNote(entries, parent, first) {
+// #246: a visibleSynthetic turn (a task notice, a peer or plugin message: system + cli) is no exception. Its own fields say the interactive UI renders it, but a headless process that was
+// started under an invisible turn (an sdk prompt) can write one under ITS prompt, and nothing of that is on the owner's screen. So it follows parent[] like an unplaced note: to a typed owner
+// prompt (or any other visible boundary): visible; to an invisible turn: invisible; and ancestry that does not resolve (a parent outside the window, a duplicate uuid, a cycle, a chain that ends
+// at a non-prompt root such as a SessionStart attachment with no typed prompt behind it) fails closed. Compaction and `--resume` need nothing here: resolve() in originsOf already steps over
+// a compact_boundary / hidden summary by logicalParentUuid, and a resumed session continues the SAME chain through its SessionStart attachments (probed on 2.1.3xx transcripts), so both reach
+// the typed prompt behind them. An entry with no parentUuid at all (not even null) leaves its own fields to decide, as an unplaced note does. The walk keeps a visited set and `memo` (index ->
+// verdict, shared across the calls of one lastReply), so n chained notes cost O(n), not O(n^2).
+function invisibleNote(entries, parent, first, memo = new Map()) {
+  const path = [];
   const seen = new Set();
-  for (let i = first; ; ) {
+  let verdict;
+  for (let i = first; verdict === undefined; ) {
+    if (memo.has(i)) { verdict = memo.get(i); break; }
     const e = entries[i];
-    if (invisibleTurn(e)) return true;
-    if (!unplacedNote(e)) return false; // the owner's prompt, a visibleSynthetic turn or a plain boundary of its own: its own fields said so
-    if (typeof e.parentUuid !== 'string') return false;
-    if (seen.has(i) || parent[i] < 0) return true; // a cycle, or a parent outside the window
+    path.push(i);
     seen.add(i);
-    i = parent[i];
+    if (invisibleTurn(e)) verdict = true;
+    else if (!unplacedNote(e) && !visibleSynthetic(e)) verdict = false; // the owner's prompt, or a plain boundary of its own: its own fields said so
+    else if (typeof e.parentUuid !== 'string') verdict = false;
+    else if (parent[i] < 0 || seen.has(parent[i])) verdict = true; // a parent outside the window / unresolved, or a cycle
+    else i = parent[i];
   }
+  for (const i of path) memo.set(i, verdict);
+  return verdict;
 }
 
 // The parsed entries of the transcript's last `tailBytes` (a cut first line dropped) and whether the read reached the file's start (#191 A3, F7: callers read `.entries`);
@@ -506,7 +519,8 @@ function originsOf(entries) {
 export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
   const entries = tailEntries(transcriptPath, tailBytes).entries;
   const { origin, parent } = originsOf(entries);
-  const hidden = (i) => invisibleNote(entries, parent, i);
+  const verdicts = new Map(); // memoised hidden(i), shared by every chain walk (#246)
+  const hidden = (i) => invisibleNote(entries, parent, i, verdicts);
   // The turns, one per prompt entry (a hidden compaction summary is none), each with the entries attributed to it, in transcript order. pos / lastPos: the entry index of its prompt / of its last entry.
   const turns = [];
   const turnAt = new Map(); // prompt entry index -> turn
@@ -557,13 +571,14 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
         else if (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) { surfacedAfterText = true; anything = true; }
       }
     }
-    if (visibleSynthetic(t.e) && !surfacedAfterText && presentedRuling(text) !== null) slots.push({ turn: t, lastPos: t.lastPos, text, promoted: true, voided: false });
+    const visible = visibleSynthetic(t.e) && !hidden(t.pos); // (#246: a system turn written under an invisible one is on nobody's screen)
+    if (visible && !surfacedAfterText && presentedRuling(text) !== null) slots.push({ turn: t, lastPos: t.lastPos, text, promoted: true, voided: false });
     else if (anything) {
       const before = slots[slots.length - 1];
       if (before && before.lastPos < t.pos) before.voided = true; // (a slot still being written when this turn opened was not replaced by it: interleaved, not later)
       // R3-F1: ... but a VISIBLE synthetic turn's text or surfaced ask is on the owner's screen wherever its prompt opened: when it lands after the selected slot's last shown entry (checked below),
       // that request is stale. An invisible turn (sdk, non-human origin, unknown source) is never shown, so the interleaved exemption above stays for it.
-      if (visibleSynthetic(t.e)) shownSkips.push(t.shownPos);
+      if (visible) shownSkips.push(t.shownPos);
     }
   }
   // Only the reply slot right before the owner's prompt: when the newest prompt IS that prompt (and nothing answered it yet), its own (empty) slot is skipped, and that is the ONLY slot that
