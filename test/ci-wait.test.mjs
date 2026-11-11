@@ -23,7 +23,7 @@ const at = (v, t, n) => (typeof v === 'function' ? v(t, n) : v);
 function sim(world, options = {}) {
   let t = 0;
   const calls = [];
-  const reads = { classic: [], rules: [], statuses: 0, checkRuns: 0, headRuns: [], markers: 0 }; // the base each policy read asked for
+  const reads = { classic: [], rules: [], statuses: 0, checkRuns: 0, headRuns: [], markers: 0, runs: [] }; // the base each policy read asked for
   const readers = {
     pr: async () => at(world.pr ?? PR, t / 1000),
     classic: async (base) => {
@@ -51,6 +51,12 @@ function sim(world, options = {}) {
       reviewMarkers: async () => {
         reads.markers += 1;
         return at(world.reviewMarkers, t / 1000, reads.markers);
+      },
+    }),
+    ...(world.workflowRun === undefined ? {} : {
+      workflowRun: async (id) => {
+        reads.runs.push(id);
+        return at(world.workflowRun, t / 1000, id);
       },
     }),
     suiteRuns: async (id) => {
@@ -1194,4 +1200,89 @@ test('a ready-era run still holds a stale review failure past the appear window 
   assert.equal(r.output.verdict, 'timeout');
   assert.equal(s.elapsed(), 600_000);
   assert.equal(r.output.heldBy.kind, 'check-run');
+});
+
+// ---- R1-F1 (#251): a failure posted just after the marker by a guards run that STARTED before it is still stale ----
+
+const RUN_URL = (id, tail = '') => `https://github.com/acme/widgets/actions/runs/${id}${tail}`;
+const reviewAt = (state, created_at, target_url, id) => ({ ...review(state, created_at), target_url, ...(id === undefined ? {} : { id }) });
+const T2_PLUS_3 = '2026-01-01T12:01:33Z';
+const BEFORE_MARKER = '2026-01-01T12:01:10Z';
+const AFTER_MARKER = '2026-01-01T12:01:40Z';
+const lateWorld = (over) => reviewWorld({
+  statuses: (t) => [reviewAt('failure', T2_PLUS_3, RUN_URL(555, '/job/9'), 1), ...(t >= 120 ? [{ ...review('success', T3), id: 2 }] : [])],
+  reviewMarkers: [marker(T2)],
+  ...over,
+});
+
+test('R1-F1: a failure created 3 s after the marker by a run that started before it is stale: the wait goes on to the re-post', async () => {
+  const s = sim(lateWorld({ workflowRun: { id: 555, run_started_at: BEFORE_MARKER, created_at: BEFORE_MARKER } }));
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 120_000);
+  assert.deepEqual([...new Set(s.reads.runs)], ['555'], 'the run id was parsed from the target url, job suffix ignored');
+  assert.ok(s.progress.some((l) => /Cross-model review=stale-fail/.test(l)));
+});
+
+test('R1-F1: the run read falls back to created_at when run_started_at is absent', async () => {
+  const s = sim(lateWorld({ workflowRun: { id: 555, created_at: BEFORE_MARKER } }));
+  assert.equal((await s.run()).output.verdict, 'passed');
+  assert.equal(s.elapsed(), 120_000);
+});
+
+test('R1-F1: the same failure whose run started after the marker is fresh: failed at once', async () => {
+  const s = sim(lateWorld({ workflowRun: { id: 555, run_started_at: AFTER_MARKER, created_at: AFTER_MARKER } }));
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(s.elapsed(), 0);
+});
+
+test('R1-F1: a run that started at the marker instant is not before it (strict <)', async () => {
+  const s = sim(lateWorld({ workflowRun: { id: 555, run_started_at: T2 } }));
+  assert.equal((await s.run()).output.verdict, 'failed');
+  assert.equal(s.elapsed(), 0);
+});
+
+test('R1-F1: an unreadable run, an unreadable start, or no run reader leaves the created_at verdict (failed at once)', async () => {
+  for (const workflowRun of [() => { throw new Error('HTTP 404'); }, { id: 555 }, { id: 555, run_started_at: 'not a date' }, null]) {
+    const s = sim(lateWorld({ workflowRun }));
+    assert.equal((await s.run()).output.verdict, 'failed', String(workflowRun));
+    assert.equal(s.elapsed(), 0);
+  }
+  const none = sim(lateWorld({}));
+  assert.equal((await none.run()).output.verdict, 'failed');
+  assert.equal(none.elapsed(), 0);
+});
+
+test('R1-F1: a target_url that is not an Actions run is not read: the created_at verdict stands', async () => {
+  for (const url of ['https://vercel.com/acme/deploy/abc', 'https://github.com/acme/widgets/actions', 'https://github.com/acme/widgets/actions/runs/abc', undefined, null]) {
+    const s = sim(lateWorld({
+      statuses: [reviewAt('failure', T2_PLUS_3, url)],
+      workflowRun: { id: 555, run_started_at: BEFORE_MARKER },
+    }));
+    assert.equal((await s.run()).output.verdict, 'failed', String(url));
+    assert.equal(s.elapsed(), 0);
+    assert.deepEqual(s.reads.runs, [], String(url));
+  }
+});
+
+test('R1-F1: the run is not read for another context, or without a marker, and a run-started stale failure never re-posted stands as failed at the deadline', async () => {
+  const other = sim({ classic: present(pin('Static guards', ACTIONS)), timeline: readyTimeline, statuses: [{ ...st('Static guards', 'failure'), created_at: T2_PLUS_3, target_url: RUN_URL(555) }], reviewMarkers: [marker(T2)], workflowRun: { run_started_at: BEFORE_MARKER } });
+  assert.equal((await other.run()).output.verdict, 'failed');
+  assert.deepEqual(other.reads.runs, []);
+  const noMarker = sim(reviewWorld({ statuses: [reviewAt('failure', T2_PLUS_3, RUN_URL(555))], reviewMarkers: [], workflowRun: { run_started_at: BEFORE_MARKER } }));
+  assert.equal((await noMarker.run()).output.verdict, 'failed');
+  assert.deepEqual(noMarker.reads.runs, []);
+  const never = sim(reviewWorld({ statuses: [reviewAt('failure', T2_PLUS_3, RUN_URL(555))], reviewMarkers: [marker(T2)], workflowRun: { run_started_at: BEFORE_MARKER } }));
+  const r = await never.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(never.elapsed(), 300_000);
+  assert.equal(r.output.checks[0].state, 'stale-fail');
+});
+
+test('R1-F1: the run is read once per poll (memoised), not once per status evaluation', async () => {
+  const s = sim(lateWorld({ workflowRun: { id: 555, run_started_at: BEFORE_MARKER } }));
+  assert.equal((await s.run()).output.verdict, 'passed');
+  // 8 polls to 120 s plus the pre-report re-read; never more than two reads per poll
+  assert.ok(s.reads.runs.length >= 1 && s.reads.runs.length <= 2 * (120 / 15 + 1), String(s.reads.runs.length));
 });
