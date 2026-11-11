@@ -159,10 +159,11 @@ function resolveHandler(h, { home, pluginRoot }) {
   if (!Array.isArray(args) || !args.every((a) => typeof a === 'string' && a !== '') || typeof h.command !== 'string') return null;
   const cmd = h.command.trim();
   if (!(INTERPRETERS.includes(cmd) || (path.isAbsolute(cmd) && INTERPRETERS.includes(path.basename(cmd)) && !/\s/.test(cmd)))) return null;
-  const expand = (t) => (pluginRoot ? t.replace(/\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g, () => pluginRoot) : t)
-    .replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, () => HOME_MARK).replace(/^~(?=\/)/, HOME_MARK);
-  if (/[$`]/.test(expand(args[0]).replaceAll(HOME_MARK, ''))) return null;
-  return scriptOf(['node', expand(args[0])], home);
+  // (R2-F8) an argument vector is not shell-expanded: `~` and $HOME in args[0] would reach the interpreter as literal text (a path relative to the hook's working folder), so only a literal path counts.
+  if (/^~(?:\/|$)|\$\{?HOME\b/.test(args[0])) return null;
+  const expanded = pluginRoot ? args[0].replace(/\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g, () => pluginRoot) : args[0];
+  if (/[$`]/.test(expanded)) return null;
+  return scriptOf(['node', expanded], home);
 }
 
 // ---- collecting the handlers ----------------------------------------------------------------------------------------------------------
@@ -237,29 +238,33 @@ function fromFrontmatter(file, errors) {
 }
 
 // The md files below `dir` (any depth up to 4): a command or an agent may sit in a namespace folder.
-const markdownFiles = (dir, depth = 0, out = []) => {
+// (R2-F5) a walk that stops at the depth or file cap is an errors[] entry (not ok), like every other source that cannot be read in full.
+const markdownFiles = (dir, errors, depth = 0, out = []) => {
   let names = [];
   try { names = readdirSync(dir, { withFileTypes: true }).sort((x, y) => (x.name < y.name ? -1 : 1)); } catch { return out; }
   for (const d of names) {
-    if (out.length >= 2000) break;
+    if (out.length >= 2000) { if (!out.capped) { out.capped = true; errors.push({ source: dir, why: 'too many files (more than 2000): the rest is not read' }); } break; }
     const p = path.join(dir, d.name);
     let st = d;
     if (d.isSymbolicLink()) { try { st = statSync(p); } catch { continue; } }
-    if (st.isDirectory()) { if (depth < 4) markdownFiles(p, depth + 1, out); } else if (d.name.endsWith('.md')) out.push(p);
+    if (st.isDirectory()) {
+      if (depth < 4) markdownFiles(p, errors, depth + 1, out);
+      else errors.push({ source: p, why: 'folders nested too deep (more than 4 below a commands or agents folder): not read' });
+    } else if (d.name.endsWith('.md')) out.push(p);
   }
   return out;
 };
 // The files whose front matter Claude Code reads under one component root (a config dir, a project's dot-claude folder, a plugin's install path): skills/*/SKILL.md, agents/**.md, commands/**.md.
-const componentFiles = (dir) => {
+const componentFiles = (dir, errors) => {
   const out = [];
   try {
     for (const n of readdirSync(path.join(dir, 'skills')).sort()) out.push(path.join(dir, 'skills', n, 'SKILL.md'));
   } catch { /* no skills folder */ }
-  out.push(...markdownFiles(path.join(dir, 'agents')), ...markdownFiles(path.join(dir, 'commands')));
+  out.push(...markdownFiles(path.join(dir, 'agents'), errors), ...markdownFiles(path.join(dir, 'commands'), errors));
   return out;
 };
 // The component locations a plugin manifest names (strings or lists of strings; `skills` are folders of skill folders, agents and commands are md files or folders of them): -> { files, odd } (odd: a form not followed).
-function manifestComponents(manifest, installPath) {
+function manifestComponents(manifest, installPath, errors) {
   const files = [];
   let odd = null;
   for (const key of ['skills', 'agents', 'commands']) {
@@ -275,7 +280,7 @@ function manifestComponents(manifest, installPath) {
       else if (key === 'skills') {
         files.push(path.join(p, 'SKILL.md'));
         try { for (const n of readdirSync(p).sort()) files.push(path.join(p, n, 'SKILL.md')); } catch { /* unreadable: no skills */ }
-      } else files.push(...markdownFiles(p));
+      } else files.push(...markdownFiles(p, errors));
     }
   }
   return { files, odd };
@@ -344,9 +349,9 @@ export function dialogHandlers({ home = accountHome(), cwd = null, projectDirs =
         if (isObj(m.value.hooks)) handlers.push(...tag(fromHooksObject(m.value.hooks, manifest, ctx, errors, installPath), layer));
         else handlers.push({ source: manifest, event: 'PreToolUse', matcher: '', command: '(plugin manifest hooks)', args: null, scriptPath: null, scriptSha256: null, trusted: false, layer });
       }
-      const components = new Set(componentFiles(installPath));
+      const components = new Set(componentFiles(installPath, errors));
       if (m.state === 'ok' && isObj(m.value)) {
-        const named = manifestComponents(m.value, installPath);
+        const named = manifestComponents(m.value, installPath, errors);
         for (const x of named.files) components.add(x);
         if (named.odd) errors.push({ source: manifest, why: named.odd });
       }
@@ -355,7 +360,7 @@ export function dialogHandlers({ home = accountHome(), cwd = null, projectDirs =
   }
 
   for (const [dir, layer] of [...configDirs.map((d) => [d, 'account']), ...projectDirList.map((d) => [d, 'project'])]) {
-    for (const file of componentFiles(dir)) handlers.push(...tag(fromFrontmatter(file, errors), layer));
+    for (const file of componentFiles(dir, errors)) handlers.push(...tag(fromFrontmatter(file, errors), layer));
   }
 
   return { ok: errors.length === 0, handlers, errors };

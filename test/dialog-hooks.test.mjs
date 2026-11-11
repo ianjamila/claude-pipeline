@@ -339,6 +339,45 @@ test('R1-B2/B3: front matter in quoted / flow forms and in commands and plugin s
   assert.ok(w.check().offenders.some((o) => o.kind === 'unreadable' && /commands/.test(o.why)), 'a manifest form that is not followed fails closed');
 });
 
+test('R2-F8: in the args form ~ and $HOME in args[0] are not expanded: unresolvable (only a literal absolute path is a script)', () => {
+  const w = world();
+  const f = w.script('.claude/hooks/a.mjs');
+  const withArgs = (args) => ({ hooks: { PreToolUse: [{ matcher: 'AskUserQuestion', hooks: [{ type: 'command', command: 'node', args }] }] } });
+  for (const a of ['~/.claude/hooks/a.mjs', '$HOME/.claude/hooks/a.mjs', '${HOME}/.claude/hooks/a.mjs']) {
+    w.settings(withArgs([a]));
+    assert.equal(w.handlers().handlers[0].scriptPath, null, a);
+    assert.equal(w.check().offenders[0].kind, 'unresolvable', a);
+  }
+  w.settings(withArgs([f]));
+  assert.equal(w.handlers().handlers[0].scriptPath, f, 'a literal absolute path still resolves');
+  w.settings(hookEntry('node ~/.claude/hooks/a.mjs'));
+  assert.equal(w.handlers().handlers[0].scriptPath, f, 'the shell-string command form keeps its home expansion');
+});
+
+test('R2-F5: a command / agent walk that hits the depth or file cap is an error (not ok), not a silent cut', () => {
+  const w = world();
+  w.script('.claude/commands/a/b/c/d/x.md', '---\nname: x\n---\n');
+  assert.equal(w.check().ok, true, 'four folders deep is read');
+  w.script('.claude/commands/a/b/c/d/e/x.md', '---\nname: x\nhooks:\n  PreToolUse:\n    - matcher: AskUserQuestion\n---\n');
+  let r = w.check();
+  assert.equal(r.ok, false);
+  assert.ok(r.offenders.some((o) => o.kind === 'unreadable' && /too deep/.test(o.why)), r.reason);
+  const w2 = world();
+  for (let i = 0; i < 2001; i++) w2.script(`.claude/agents/f${String(i).padStart(4, '0')}.md`, 'x');
+  r = w2.check();
+  assert.equal(r.ok, false);
+  assert.ok(r.offenders.some((o) => o.kind === 'unreadable' && /too many files/.test(o.why)), r.reason);
+});
+
+test('R2-B1 / R2-F4: the inventory reads an indented root mapping, a bare-CR hooks key and a hooks block after a `...` line as hooks', () => {
+  const w = world();
+  w.script('.claude/skills/ind/SKILL.md', '---\n  name: custom\n  hooks:\n    PreToolUse:\n      - matcher: AskUserQuestion\n---\n');
+  w.script('.claude/skills/cr/SKILL.md', '---\nname: x\rhooks:\r  PreToolUse:\r    - matcher: AskUserQuestion\n---\n');
+  w.script('.claude/skills/dots/SKILL.md', '---\nname: x\n...\nhooks:\n  PreToolUse:\n    - matcher: AskUserQuestion\n---\n');
+  const src = w.handlers().handlers.filter((h) => h.command === '(frontmatter hooks)').map((h) => h.source.replace(w.home, '~')).sort();
+  assert.deepEqual(src, ['~/.claude/skills/cr/SKILL.md', '~/.claude/skills/dots/SKILL.md', '~/.claude/skills/ind/SKILL.md']);
+});
+
 // ---- the command ------------------------------------------------------------------------------------------------------------------
 
 const go = (argv, w, { env = {}, ancestor = false } = {}) =>
