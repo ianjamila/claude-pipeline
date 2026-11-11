@@ -106,6 +106,44 @@ export function mergeManyAsk({ repo, entries, ready }) {
   };
 }
 
+// (R1-F4, Rev 6 B1: the ask file never supplies binding fields.) The dialog an ask MUST show is a function of installed code: the kind, the PR(s) / item ids the question itself names, and the
+// builders above. -> the parts a builder returns for this ask, or null when the ask's question is not a dialog one of them would build (an unknown title, a PR or ids the text does not carry).
+function installedParts(ask) {
+  const q = ask.dialog.question;
+  const cut = q.indexOf('\n\n');
+  if (cut < 0) return null;
+  const suffix = ` (${ask.askId})`;
+  const head = q.slice(0, cut);
+  if (!head.endsWith(suffix)) return null;
+  const title = head.slice(0, -suffix.length);
+  const block = q.slice(cut + 2);
+  const one = (re) => { const m = re.exec(title); return m ? Number(m[1]) : null; };
+  if (ask.kind === 'merge') { const pr = one(/^Merge #(\d{1,6})\?$/); return pr === null ? null : mergeAsk({ repo: ask.repo, pr, closing: block }); }
+  if (ask.kind === 'round') { const pr = one(/^One more review round for #(\d{1,6})\?$/); return pr === null ? null : roundAsk({ repo: ask.repo, pr, line: block }); }
+  if (ask.kind === 'ruling') {
+    const pr = one(/^Your ruling on #(\d{1,6})\?$/);
+    const asked = pr === null ? null : rulingBinding('x', q);
+    return asked === null || asked.pr !== pr ? null : rulingAsk({ repo: ask.repo, pr, ids: asked.ids, line: block });
+  }
+  const ready = /^🔀 Ready to merge (#\d{1,6}(?:, #\d{1,6}){1,3}) — say "merge"$/.exec(block.split('\n').at(-1));
+  if (ready === null) return null;
+  const entries = ready[1].split(', ').map((p) => ({ pr: Number(p.slice(1)), lines: [] }));
+  const parts = mergeManyAsk({ repo: ask.repo, entries, ready: '' });
+  return parts === null || title !== parts.title ? null : parts;
+}
+// True when the ask's dialog (header, multiSelect, options with their descriptions), its label -> answer map and its PRs are exactly what the installed builders make from its kind and question.
+export function matchesInstalledDialog(ask) {
+  try {
+    const parts = installedParts(ask);
+    if (parts === null || parts.kind !== ask.kind) return false;
+    const want = canonicalDialog({ question: ask.dialog.question, header: parts.header, multiSelect: parts.multiSelect ?? false, options: parts.options });
+    return want !== null && sortedJson(want) === sortedJson(ask.dialog) && sortedJson(parts.actions) === sortedJson(ask.actions)
+      && sortedJson([...parts.prs].sort((x, y) => x - y)) === sortedJson([...ask.prs].sort((x, y) => x - y));
+  } catch {
+    return false;
+  }
+}
+
 // ---- files ----------------------------------------------------------------------------------------------------------------------------
 
 export const asksDir = (home = accountHome()) => path.join(ownerGoDir(home), 'asks');
@@ -157,14 +195,14 @@ function readSmallJson(file) {
 }
 const marked = (askId, ext, home) => { const f = askFile(askId, ext, home); try { lstatSync(f); return true; } catch (err) { return err?.code !== 'ENOENT'; } }; // (any error but "absent" counts as present: fail closed)
 
-// The issued ask on disk, validated: { ok: true, ask } | { ok: false, reason: 'none' | 'invalid' }.
+// The issued ask on disk, validated (its dialog and answer map must be the installed builders' own, R1-F4): { ok: true, ask } | { ok: false, reason: 'none' | 'invalid' }.
 export function readAsk(askId, { home = accountHome() } = {}) {
   const r = readSmallJson(askFile(askId, 'json', home));
   if (r.state === 'none') return { ok: false, reason: 'none' };
   const a = r.value;
   if (r.state !== 'ok' || a?.v !== 1 || a.askId !== askId || !KINDS.includes(a.kind) || typeof a.repo !== 'string' || !Array.isArray(a.prs) || !isObj(a.actions) || !isObj(a.dialog)
     || typeof a.dialogSha256 !== 'string' || a.dialogSha256 !== dialogSha256(a.dialog) || typeof a.issuedAt !== 'string' || !Number.isFinite(Date.parse(a.issuedAt))
-    || (a.hookLayersSha256 !== null && typeof a.hookLayersSha256 !== 'string')) return { ok: false, reason: 'invalid' };
+    || (a.hookLayersSha256 !== null && typeof a.hookLayersSha256 !== 'string') || !matchesInstalledDialog(a)) return { ok: false, reason: 'invalid' };
   return { ok: true, ask: a };
 }
 
@@ -204,6 +242,7 @@ export function issueAsk({ kind, repo, prs, header, title, block, options, actio
       const bound = bindAnswer(ask, actions[label], dialog.question);
       if (bound.error) return { error: `unbindable: ${bound.error}` };
     }
+    if (!matchesInstalledDialog(ask)) return { error: 'unknown-dialog' }; // (R1-F4: readers refuse an ask the installed builders would not make, so never write one)
     const file = askFile(askId, 'json', home);
     if (writeExclusive(file, ask, home) !== 'ok') return { error: 'write-failed' };
     supersedeOlder(ask, home);

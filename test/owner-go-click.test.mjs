@@ -11,7 +11,7 @@ import {
   OWNER_GO_REL, approvalGap, approvedPr, claimGrantMarkers, grantIdOf, ownerGoDir, ownerGrantedRounds, ownerRuled, readApprovals, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import {
-  ASKS_REL, CLICK_BUILDS, asksDir, canonicalDialog, clickEvidence, clickProvenance, dialogSha256, issueAsk, mergeAsk, mergeManyAsk, recordClick, roundAsk, rulingAsk,
+  ASKS_REL, CLICK_BUILDS, asksDir, canonicalDialog, clickEvidence, clickProvenance, dialogSha256, issueAsk, mergeAsk, mergeManyAsk, readAsk, recordClick, roundAsk, rulingAsk,
 } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 
@@ -34,15 +34,24 @@ const manyParts = () => mergeManyAsk({
   ready: '🔀 Ready to merge #58, #59 — say "merge"',
 });
 
+// An ask file written by hand the way a copy of the lib minted outside the three commands would (R1-F4): any title, options and actions, a consistent dialog hash.
+function forgeAsk({ kind, repo, prs, header, title, block, options, actions, hookLayersSha256, home, issuedAt }) {
+  const askId = `ask-${'a1b2c3d4e5f6'}`;
+  mkdirSync(asksDir(home), { recursive: true });
+  const dialog = canonicalDialog({ question: `${title} (${askId})\n\n${block}`, header, multiSelect: kind === 'merge-many', options });
+  writeFileSync(join(asksDir(home), `${askId}.json`), `${JSON.stringify({ v: 1, askId, kind, repo, prs, dialog, dialogSha256: dialogSha256(dialog), actions, issuedAt: new Date(issuedAt).toISOString(), hookLayersSha256 })}\n`);
+  return { askId, questions: [dialog] };
+}
+
 // A world: a temp home, an issued ask and a transcript holding the fixture's entries rewritten to the ask's dialog and `answer` (default: the approving label). `tamper(dialog)` returns the dialog the
 // transcript shows instead of the issued one; `mutate({ prompt, use, result })` edits the entries (a metadata case); `fixture` picks the spike transcript; `write: false` leaves the transcript with
 // the prompt and the tool_use only (poll tests append the result themselves).
-function world(t, { parts = mergeParts(), answer = null, fixture = 'genuine-click', tamper = null, mutate = null, hookLayersSha256 = null, issueBeforeUseMs = 10000, write = true } = {}) {
+function world(t, { parts = mergeParts(), answer = null, fixture = 'genuine-click', tamper = null, mutate = null, hookLayersSha256 = null, issueBeforeUseMs = 10000, write = true, forge = false } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'owner-go-click-'));
   const entries = loadFixture(fixture);
   const [prompt, use, result] = entries;
   const issuedAt = Date.parse(use.timestamp) - issueBeforeUseMs;
-  const issued = issueAsk({ ...parts, hookLayersSha256, home, now: () => issuedAt });
+  const issued = forge ? forgeAsk({ ...parts, hookLayersSha256, home, issuedAt }) : issueAsk({ ...parts, hookLayersSha256, home, now: () => issuedAt });
   assert.ok(issued.askId, `issue failed: ${JSON.stringify(issued)}`);
   const dialog = tamper ? tamper(structuredClone(issued.questions[0])) : issued.questions[0];
   const chosen = answer ?? Object.keys(parts.actions).find((l) => parts.actions[l] !== null);
@@ -393,6 +402,31 @@ test('clickProvenance: a spent marker removed or declined is no proof', async (t
 });
 
 // ---- the pieces -------------------------------------------------------------------------------------------------------------------------
+
+test('R1-F4: an ask file with a relabelled dialog (\'Skip #58 for now?\', Yes => merge) records nothing and is no proof; the installed builders\' dialogs still read', async (t) => {
+  const real = mergeParts();
+  const relabelled = { ...real, title: 'Skip #58 for now?', options: [{ label: 'Not yet', description: 'Do nothing.' }, { label: 'Yes', description: 'Skip it.' }], actions: { 'Not yet': null, Yes: 'merge' } };
+  const w = world(t, { parts: relabelled, answer: 'Yes', forge: true });
+  assert.deepEqual(await w.click(), { refused: 'ask-invalid' });
+  assert.deepEqual(w.records(), []);
+  assert.equal(readAsk(w.askId, { home: w.home }).reason, 'invalid');
+  // an installed dialog whose option MEANING was changed in the file (same labels, Merge mapped to a decline-looking text / another text) is no installed dialog either
+  const swapped = world(t, { parts: { ...real, actions: { 'Not yet': 'merge', Merge: null } }, answer: 'Not yet', forge: true });
+  assert.deepEqual(await swapped.click(), { refused: 'ask-invalid' });
+  assert.deepEqual(swapped.records(), []);
+  // a hand-made spent marker + record cannot make it proof either
+  const rec = { v: 1, ts: new Date(w.answeredAt).toISOString(), session: w.session, via: 'ask', transcript_path: w.file, ask: { askId: w.askId, toolUseId: w.toolUseId, clickId: 'x'.repeat(16) }, prs: [58], requests: [] };
+  writeFileSync(join(asksDir(w.home), `${w.askId}.spent`), `${JSON.stringify({ v: 1, askId: w.askId, clickId: rec.ask.clickId, toolUseId: w.toolUseId, answeredAt: new Date(w.answeredAt).toISOString(), dialogSha256: w.issued.questions[0] && dialogSha256(w.dialog) })}\n`);
+  assert.equal(clickProvenance(rec, { home: w.home }), 'synthetic');
+  // the real builders' dialogs of every kind read back
+  for (const parts of [mergeParts(), roundParts(), rulingParts(), manyParts()]) {
+    const home = mkdtempSync(join(tmpdir(), 'owner-go-click-'));
+    const issued = issueAsk({ ...parts, home, now: () => 1 });
+    assert.equal(readAsk(issued.askId, { home }).ok, true, parts.kind);
+  }
+  // issueAsk itself refuses a dialog that is not one of the installed ones
+  assert.match(issueAsk({ ...relabelled, home: mkdtempSync(join(tmpdir(), 'owner-go-click-')) }).error, /unknown-dialog/);
+});
 
 test('canonicalDialog: fixed key order, multiSelect defaults to false, no preview, no unknown keys', () => {
   const c = canonicalDialog({ options: [{ description: 'd', label: 'l' }], header: 'h', question: 'q' });
