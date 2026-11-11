@@ -13,7 +13,7 @@ export function clickGate({ config, root, ctx = {} }) {
   if (config.owner_go?.click === 'off') return { ok: false, reason: 'owner_go.click is off in pipeline.yml' };
   let hooks;
   try {
-    hooks = checkDialogHooks({ home: ctx.home, cwd: root, managedPaths: ctx.managedPaths });
+    hooks = checkDialogHooks({ home: ctx.home, cwd: root, projectDirs: [process.env.CLAUDE_PROJECT_DIR], managedPaths: ctx.managedPaths });
   } catch (err) {
     return { ok: false, reason: `the dialog hooks could not be checked (${String(err?.message ?? err).slice(0, 200)})` };
   }

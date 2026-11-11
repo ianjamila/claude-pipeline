@@ -258,7 +258,85 @@ test('hookCheck (the default for recordClick) reads the hook input cwd', () => {
   const withCwd = hookCheck({ home: w.home, input: { cwd: w.cwd } });
   assert.equal(withCwd.ok, false);
   assert.match(withCwd.reason, /^unlisted dialog hook/);
-  assert.notEqual(withCwd.hookLayersSha256, without.hookLayersSha256);
+  assert.equal(withCwd.hookLayersSha256, without.hookLayersSha256, 'R1-F2: the project layer is judged (offender above) but is not in the fingerprint');
+});
+
+test('R1-F2: the project layer follows CLAUDE_PROJECT_DIR as well as cwd, and the fingerprint is the same whichever folder the issue and the click saw', () => {
+  const w = world();
+  const launch = join(w.home, 'launch');
+  const f = w.script('project/hooks/p.mjs');
+  w.json(join(launch, '.claude', 'settings.json'), hookEntry(`node ${f}`));
+  assert.equal(w.check().ok, true, 'cwd alone does not see the launch folder');
+  const seen = w.check({ projectDirs: [launch] });
+  assert.equal(seen.ok, false);
+  assert.match(seen.reason, /^unlisted dialog hook/);
+  assert.equal(hookCheck({ home: w.home, input: { cwd: w.cwd }, env: { CLAUDE_PROJECT_DIR: launch } }).ok, false, 'the click hook reads its own CLAUDE_PROJECT_DIR');
+  // approved once (from either side), every view of the project layers is ok and has one fingerprint
+  assert.equal(w.approve({ projectDirs: [launch] }).ok, true);
+  const a = w.check({ projectDirs: [launch] });
+  const b = w.check({ cwd: launch });
+  const c = w.check({ cwd: join(w.home, 'elsewhere'), projectDirs: [launch] });
+  assert.deepEqual([a.ok, b.ok, c.ok], [true, true, true]);
+  assert.equal(a.hookLayersSha256, b.hookLayersSha256);
+  assert.equal(a.hookLayersSha256, c.hookLayersSha256);
+  // an account-wide handler still changes it
+  const g = w.script('.claude/hooks/g.mjs');
+  w.settings(hookEntry(`node ${g}`));
+  assert.notEqual(w.check({ projectDirs: [launch] }).hookLayersSha256, a.hookLayersSha256);
+});
+
+test('R1-F3: handler args are resolved with the command, listed with it, and part of the fingerprint; other args shapes are unresolvable', () => {
+  const w = world();
+  const f = w.script('.claude/hooks/a.mjs');
+  const withArgs = (command, args) => ({ hooks: { PreToolUse: [{ matcher: 'AskUserQuestion', hooks: [{ type: 'command', command, ...(args === undefined ? {} : { args }) }] }] } });
+  w.settings(withArgs('node', [f, '--quiet']));
+  let r = w.handlers();
+  assert.equal(r.handlers[0].scriptPath, f);
+  assert.deepEqual(r.handlers[0].args, [f, '--quiet']);
+  assert.equal(w.check().offenders[0].kind, 'unlisted', 'an interpreter plus one script is resolvable, and not listed yet');
+  assert.equal(w.approve().ok, true);
+  assert.equal(w.check().ok, true);
+  const fp = w.check().hookLayersSha256;
+  assert.deepEqual(JSON.parse(readFileSync(dialogHooksFile(w.home), 'utf8')).hooks[0].args, [f, '--quiet']);
+  w.settings(withArgs('node', [f, '--other']));
+  assert.equal(w.check().ok, false, 'editing only the args is a change: the list entry no longer matches');
+  assert.notEqual(w.check().hookLayersSha256, fp);
+  const awk = w.script('bin/tool');
+  chmodSync(awk, 0o755);
+  for (const [command, args] of [[awk, ['--anything']], ['node', ['--eval', 'x']], ['node', [f, 5]], ['node', 'x.mjs'], ['node /abs/x.mjs', ['a']], ['sh', []]]) {
+    w.settings(withArgs(command, args));
+    const h = w.handlers().handlers;
+    if (Array.isArray(args) && args.length === 0) continue; // (empty args = none)
+    assert.equal(h[0].scriptPath, null, JSON.stringify([command, args]));
+    assert.equal(w.check().offenders[0].kind, 'unresolvable');
+  }
+});
+
+test('R1-B2/B3: front matter in quoted / flow forms and in commands and plugin skills, agents, commands, manifest locations is inventoried', () => {
+  const w = world();
+  const hooked = (key) => `---\nname: s\n${key}\n  PostToolUse:\n    - matcher: x\n---\nbody\n`;
+  const kinds = () => w.handlers().handlers.filter((h) => h.command === '(frontmatter hooks)').map((h) => h.source.replace(w.home, '~'));
+  w.script('.claude/skills/q/SKILL.md', hooked('"hooks":').replace('PostToolUse:', 'PreToolUse:'));
+  w.script('.claude/commands/c.md', '﻿--- \n{hooks: {PreToolUse: []}}\n---\n');
+  w.script('.claude/commands/ns/d.md', '---\n<<: *x\n---\n');
+  w.script('.claude/skills/ok/SKILL.md', hooked('hooks:')); // only a non-dialog event: no handler
+  w.script('project/.claude/agents/a.md', hooked("'hooks':").replace('PostToolUse:', 'Stop:'));
+  assert.deepEqual(kinds().sort(), ['~/.claude/commands/c.md', '~/.claude/commands/ns/d.md', '~/.claude/skills/q/SKILL.md']);
+  // an enabled plugin: its skills, agents, commands and the locations its manifest names
+  const install = join(w.home, '.claude', 'plugins', 'cache', 'm', 'p', '1.0');
+  w.json(join(w.home, '.claude', 'plugins', 'installed_plugins.json'), { plugins: { 'p@m': [{ installPath: install }] } });
+  w.settings({ enabledPlugins: { 'p@m': true } });
+  w.json(join(install, '.claude-plugin', 'plugin.json'), { name: 'p', skills: './extra', commands: ['./more/x.md'] });
+  w.script('.claude/plugins/cache/m/p/1.0/skills/s/SKILL.md', hooked('hooks:').replace('PostToolUse:', 'PreToolUse:'));
+  w.script('.claude/plugins/cache/m/p/1.0/agents/g.md', hooked('"hooks":').replace('PostToolUse:', 'PermissionRequest:'));
+  w.script('.claude/plugins/cache/m/p/1.0/commands/k.md', hooked('hooks:').replace('PostToolUse:', 'PreToolUse:'));
+  w.script('.claude/plugins/cache/m/p/1.0/extra/e/SKILL.md', hooked('hooks:').replace('PostToolUse:', 'PreToolUse:'));
+  w.script('.claude/plugins/cache/m/p/1.0/more/x.md', hooked('hooks:').replace('PostToolUse:', 'PreToolUse:'));
+  const plug = kinds().filter((k) => k.includes('/plugins/'));
+  assert.equal(plug.length, 5, plug.join(', '));
+  assert.equal(w.check().ok, false);
+  w.json(join(install, '.claude-plugin', 'plugin.json'), { name: 'p', commands: { x: { source: './x.md' } } });
+  assert.ok(w.check().offenders.some((o) => o.kind === 'unreadable' && /commands/.test(o.why)), 'a manifest form that is not followed fails closed');
 });
 
 // ---- the command ------------------------------------------------------------------------------------------------------------------

@@ -29,7 +29,7 @@ export async function run(argv, ctx = {}) {
   const managed = ctx.managedPaths ? { managedPaths: ctx.managedPaths } : {};
 
   if (sub === 'dialog-hooks') {
-    const r = checkDialogHooks({ home, cwd, ...managed });
+    const r = checkDialogHooks({ home, cwd, projectDirs: [process.env.CLAUDE_PROJECT_DIR], ...managed });
     return {
       exitCode: r.ok ? EXIT.OK : EXIT.FAILED,
       output: { ok: r.ok, reason: r.reason, hookLayersSha256: r.hookLayersSha256, handlers: r.handlers, offenders: r.offenders, approvedAt: r.approvedAt, file: dialogHooksFile(home) },
@@ -43,7 +43,7 @@ export async function run(argv, ctx = {}) {
       process.stderr.write(`${message}\n`);
       return { exitCode: EXIT.USAGE, output: { ok: false, error: 'refused', message } };
     }
-    const r = approveDialogHooks({ home, cwd, now: ctx.now, ...managed });
+    const r = approveDialogHooks({ home, cwd, projectDirs: [process.env.CLAUDE_PROJECT_DIR], now: ctx.now, ...managed });
     if (!r.ok) {
       process.stderr.write(`not approved: ${r.reason}\n`);
       return { exitCode: EXIT.FAILED, output: { ok: false, error: 'not-approved', message: r.reason, offenders: r.offenders } };

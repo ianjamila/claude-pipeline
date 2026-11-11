@@ -4,13 +4,16 @@
 //   - installed pipeline code (its real script path is inside <home>/.claude/pipeline/): trusted, or
 //   - listed by the owner in <home>/.claude/pipeline-state/owner-go/dialog-hooks.json ({ v: 1, hooks: [{ command, scriptPath, sha256 }] }) with today's bytes.
 // Anything else (an unlisted or changed handler, a command that does not resolve to ONE script, a settings / plugin / skill file that exists but cannot be read) refuses the click: the owner types.
-// `hookLayersSha256` fingerprints the whole list (issue time vs click time: a hook added between the two voids the ask).
+// `hookLayersSha256` fingerprints the list of the ACCOUNT-wide layers (issue time vs click time: a hook added between the two voids the ask). The PROJECT layer (settings, skills, agents, commands of the folder
+// the session was launched in, CLAUDE_PROJECT_DIR, and of the working directory) is inventoried and must pass the same trust check on both sides, but is left out of the fingerprint: the issuing command's root
+// and the click hook's cwd are different folders by construction, and a fingerprint over them would void every ask (R1-F2).
 // Never throws: a failure is an `errors[]` entry (=> ok: false).
 import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readdirSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { accountHome, transcriptConfigDirs } from '../../lib/paths.mjs';
 import { ownerGoDir, realDirChain } from './owner-go.mjs';
+import { readFrontmatter } from './frontmatter.mjs';
 
 export const DIALOG_HOOKS_FILE = 'dialog-hooks.json';
 export const OWNER_GO_STATE_REL = '.claude/pipeline-state/owner-go';
@@ -124,6 +127,11 @@ export function resolveCommand(command, { home, pluginRoot = null } = {}) {
   if (pluginRoot) text = text.replace(/\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g, () => pluginRoot);
   text = text.replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, () => HOME_MARK).replace(/(^|[\s"'])~(?=\/)/g, (_m, lead) => lead + HOME_MARK);
   const w = words(text); // (a $ left after the expansions above is not a home reference: words() refuses it)
+  return scriptOf(w, home);
+}
+
+// The script a list of words runs (see resolveCommand), or null.
+function scriptOf(w, home) {
   if (!w || w.length === 0) return null;
   const real = (s) => s.replaceAll(HOME_MARK, home);
   let target;
@@ -141,6 +149,20 @@ export function resolveCommand(command, { home, pluginRoot = null } = {}) {
     return null;
   }
   return target;
+}
+
+// (R1-F3) A handler of the form { command, args: [...] }: the command must be an interpreter (a bare name, or an absolute path of one) and args[0] the ONE script it runs, ahead of that script's own arguments.
+// Any other non-empty args shape (a program with arguments, a non-string argument, a command that already holds spaces) resolves to nothing: its arguments are code we do not hash.
+function resolveHandler(h, { home, pluginRoot }) {
+  const args = h.args;
+  if (args === undefined || args === null || (Array.isArray(args) && args.length === 0)) return resolveCommand(h.command, { home, pluginRoot });
+  if (!Array.isArray(args) || !args.every((a) => typeof a === 'string' && a !== '') || typeof h.command !== 'string') return null;
+  const cmd = h.command.trim();
+  if (!(INTERPRETERS.includes(cmd) || (path.isAbsolute(cmd) && INTERPRETERS.includes(path.basename(cmd)) && !/\s/.test(cmd)))) return null;
+  const expand = (t) => (pluginRoot ? t.replace(/\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g, () => pluginRoot) : t)
+    .replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, () => HOME_MARK).replace(/^~(?=\/)/, HOME_MARK);
+  if (/[$`]/.test(expand(args[0]).replaceAll(HOME_MARK, ''))) return null;
+  return scriptOf(['node', expand(args[0])], home);
 }
 
 // ---- collecting the handlers ----------------------------------------------------------------------------------------------------------
@@ -169,7 +191,9 @@ function fromHooksObject(hooksObj, source, ctx, errors, pluginRoot = null) {
           continue;
         }
         if (typeof h.command !== 'string') { errors.push({ source, why: `a "hooks.${event}" handler has no command` }); continue; }
-        const scriptPath = resolveCommand(h.command, { home: ctx.home, pluginRoot });
+        const noArgs = h.args === undefined || h.args === null || (Array.isArray(h.args) && h.args.length === 0);
+        const args = noArgs ? null : Array.isArray(h.args) ? h.args.map((a) => String(a)) : [`(unusable args: ${JSON.stringify(h.args).slice(0, 80)})`];
+        const scriptPath = resolveHandler(h, { home: ctx.home, pluginRoot });
         let scriptSha256 = null;
         let real = null;
         if (scriptPath !== null) {
@@ -181,7 +205,7 @@ function fromHooksObject(hooksObj, source, ctx, errors, pluginRoot = null) {
         }
         const resolved = scriptSha256 !== null && real !== null;
         out.push({
-          source, event, matcher, command: h.command, scriptPath: resolved ? scriptPath : null, scriptSha256: resolved ? scriptSha256 : null,
+          source, event, matcher, command: h.command, args, scriptPath: resolved ? scriptPath : null, scriptSha256: resolved ? scriptSha256 : null,
           trusted: resolved && ctx.pipelineReal !== null && (real === ctx.pipelineReal || real.startsWith(`${ctx.pipelineReal}${path.sep}`)),
         });
       }
@@ -190,74 +214,106 @@ function fromHooksObject(hooksObj, source, ctx, errors, pluginRoot = null) {
   return out;
 }
 
-// The `hooks:` block of a skill / agent file's YAML frontmatter. Without a YAML reader: a block naming only events that are not dialog events is no handler; any other `hooks:` key is ONE
-// unresolvable handler (fail closed).
+// The `hooks:` block of a skill / agent / command file's YAML front matter, read by the recognizer the guard uses (frontmatter.mjs). Without a YAML reader: a block naming only events that are not dialog
+// events is no handler; any other `hooks:` key, and any top-level construct that could be one in disguise (a quoted key with escapes, a flow mapping, a complex key, a merge key), is ONE unresolvable
+// handler (fail closed).
 function fromFrontmatter(file, errors) {
   const r = readBytes(file);
   if (r.state === 'none') return [];
   if (r.state === 'bad') { errors.push({ source: file, why: r.why }); return []; }
-  const text = r.bytes.toString('utf8').replace(/^\uFEFF/, '');
-  if (!/^---[ \t]*\r?\n/.test(text)) return [];
-  const lines = text.split(/\r?\n/).slice(1);
-  const end = lines.findIndex((l) => /^(?:---|\.\.\.)[ \t]*$/.test(l));
-  const fm = end === -1 ? lines : lines.slice(0, end);
-  const at = fm.findIndex((l) => /^["']?hooks["']?[ \t]*:/.test(l));
-  if (at === -1) return [];
-  const rest = fm[at].replace(/^["']?hooks["']?[ \t]*:/, '').replace(/#.*$/, '').trim();
-  const unresolvable = { source: file, event: 'PreToolUse', matcher: '', command: '(frontmatter hooks)', scriptPath: null, scriptSha256: null, trusted: false };
-  if (rest !== '') return [unresolvable];
-  const children = [];
-  for (const l of fm.slice(at + 1)) {
-    if (l.trim() === '' || /^\s*#/.test(l)) continue;
-    if (!/^\s/.test(l)) break;
-    children.push(l);
+  const fm = readFrontmatter(r.bytes.toString('utf8'));
+  if (fm === null) return [];
+  const unresolvable = { source: file, event: 'PreToolUse', matcher: '', command: '(frontmatter hooks)', args: null, scriptPath: null, scriptSha256: null, trusted: false };
+  if (fm.failClosed) return [unresolvable];
+  for (const block of fm.hooks) {
+    if (block.rest !== '') return [unresolvable];
+    const children = block.children.filter((l) => l.trim() !== '' && !/^\s*#/.test(l));
+    const indentOf = (l) => /^\s*/.exec(l)[0].length;
+    const top = Math.min(...children.map(indentOf));
+    const events = children.filter((l) => indentOf(l) === top).map((l) => /^\s*["']?([A-Za-z]+)["']?\s*:\s*(?:#.*)?$/.exec(l)?.[1] ?? null);
+    if (!(children.length > 0 && events.every((e) => e !== null && OTHER_EVENTS.includes(e)))) return [unresolvable];
   }
-  const indentOf = (l) => /^\s*/.exec(l)[0].length;
-  const top = Math.min(...children.map(indentOf));
-  const events = children.filter((l) => indentOf(l) === top).map((l) => /^\s*["']?([A-Za-z]+)["']?\s*:\s*(?:#.*)?$/.exec(l)?.[1] ?? null);
-  if (children.length > 0 && events.every((e) => e !== null && OTHER_EVENTS.includes(e))) return [];
-  return [unresolvable];
+  return [];
 }
 
-const skillAndAgentFiles = (dir) => {
+// The md files below `dir` (any depth up to 4): a command or an agent may sit in a namespace folder.
+const markdownFiles = (dir, depth = 0, out = []) => {
+  let names = [];
+  try { names = readdirSync(dir, { withFileTypes: true }).sort((x, y) => (x.name < y.name ? -1 : 1)); } catch { return out; }
+  for (const d of names) {
+    if (out.length >= 2000) break;
+    const p = path.join(dir, d.name);
+    let st = d;
+    if (d.isSymbolicLink()) { try { st = statSync(p); } catch { continue; } }
+    if (st.isDirectory()) { if (depth < 4) markdownFiles(p, depth + 1, out); } else if (d.name.endsWith('.md')) out.push(p);
+  }
+  return out;
+};
+// The files whose front matter Claude Code reads under one component root (a config dir, a project's dot-claude folder, a plugin's install path): skills/*/SKILL.md, agents/**.md, commands/**.md.
+const componentFiles = (dir) => {
   const out = [];
   try {
     for (const n of readdirSync(path.join(dir, 'skills')).sort()) out.push(path.join(dir, 'skills', n, 'SKILL.md'));
   } catch { /* no skills folder */ }
-  try {
-    for (const n of readdirSync(path.join(dir, 'agents')).sort()) if (n.endsWith('.md')) out.push(path.join(dir, 'agents', n));
-  } catch { /* no agents folder */ }
+  out.push(...markdownFiles(path.join(dir, 'agents')), ...markdownFiles(path.join(dir, 'commands')));
   return out;
 };
+// The component locations a plugin manifest names (strings or lists of strings; `skills` are folders of skill folders, agents and commands are md files or folders of them): -> { files, odd } (odd: a form not followed).
+function manifestComponents(manifest, installPath) {
+  const files = [];
+  let odd = null;
+  for (const key of ['skills', 'agents', 'commands']) {
+    const v = manifest[key];
+    if (v === undefined || v === null) continue;
+    const list = typeof v === 'string' ? [v] : Array.isArray(v) && v.every((x) => typeof x === 'string') ? v : null;
+    if (list === null) { odd = `its "${key}" entry is not a path or a list of paths`; continue; }
+    for (const rel of list) {
+      const p = path.resolve(installPath, rel);
+      let st = null;
+      try { st = statSync(p); } catch { continue; }
+      if (st.isFile()) files.push(p);
+      else if (key === 'skills') {
+        files.push(path.join(p, 'SKILL.md'));
+        try { for (const n of readdirSync(p).sort()) files.push(path.join(p, n, 'SKILL.md')); } catch { /* unreadable: no skills */ }
+      } else files.push(...markdownFiles(p));
+    }
+  }
+  return { files, odd };
+}
 
 // Every handler on PreToolUse / PermissionRequest that can match AskUserQuestion, from every place Claude Code reads hooks. -> { ok, handlers, errors }. `errors` holds { source, why }.
-export function dialogHandlers({ home = accountHome(), cwd = null, managedPaths = defaultManaged() } = {}) {
+// `cwd` and `projectDirs` name project folders (their dot-claude folders are the project layer; CLAUDE_PROJECT_DIR of the hook's environment belongs in `projectDirs`, R1-F2). Each handler carries `layer`:
+// 'account' (user config dirs, managed settings, plugins an account-wide layer enables) or 'project'.
+export function dialogHandlers({ home = accountHome(), cwd = null, projectDirs = [], managedPaths = defaultManaged() } = {}) {
   const errors = [];
   const handlers = [];
   let pipelineReal = null;
   try { pipelineReal = realpathSync(path.join(home, '.claude', 'pipeline')); } catch { /* not installed here: nothing is trusted */ }
   const ctx = { home, pipelineReal };
   const configDirs = transcriptConfigDirs({ home });
-  const projectDir = typeof cwd === 'string' && cwd !== '' ? path.join(cwd, '.claude') : null;
+  const projectDirList = [...new Set([cwd, ...(Array.isArray(projectDirs) ? projectDirs : [])].filter((d) => typeof d === 'string' && d !== '' && path.isAbsolute(d)).map((d) => path.join(d, '.claude')))].sort();
+  const tag = (list, layer) => list.map((h) => ({ ...h, layer }));
 
   const settingsFiles = [
-    ...configDirs.flatMap((d) => [path.join(d, 'settings.json'), path.join(d, 'settings.local.json')]),
-    ...(projectDir ? [path.join(projectDir, 'settings.json'), path.join(projectDir, 'settings.local.json')] : []),
-    ...managedPaths,
+    ...configDirs.flatMap((d) => [path.join(d, 'settings.json'), path.join(d, 'settings.local.json')]).map((file) => ({ file, layer: 'account' })),
+    ...projectDirList.flatMap((d) => [path.join(d, 'settings.json'), path.join(d, 'settings.local.json')]).map((file) => ({ file, layer: 'project' })),
+    ...managedPaths.map((file) => ({ file, layer: 'account' })),
   ];
   const enabled = new Set();
-  for (const file of settingsFiles) {
+  const enabledByAccount = new Set();
+  for (const { file, layer } of settingsFiles) {
     const r = readJson(file);
     if (r.state === 'none') continue;
     if (r.state === 'bad') { errors.push({ source: file, why: r.why }); continue; }
     if (!isObj(r.value)) { errors.push({ source: file, why: 'is not a JSON object' }); continue; }
-    handlers.push(...fromHooksObject(r.value.hooks, file, ctx, errors));
-    if (isObj(r.value.enabledPlugins)) for (const [name, on] of Object.entries(r.value.enabledPlugins)) if (on === true) enabled.add(name);
+    handlers.push(...tag(fromHooksObject(r.value.hooks, file, ctx, errors), layer));
+    if (isObj(r.value.enabledPlugins)) for (const [name, on] of Object.entries(r.value.enabledPlugins)) if (on === true) { enabled.add(name); if (layer === 'account') enabledByAccount.add(name); }
   }
 
-  // enabled plugins (enabled in ANY layer counts: a layer that switches one off cannot be trusted to be the one Claude Code obeys) -> their install paths -> hooks/hooks.json
+  // enabled plugins (enabled in ANY layer counts: a layer that switches one off cannot be trusted to be the one Claude Code obeys) -> their install paths -> hooks/hooks.json, the manifest, and (R1-B3) the
+  // front matter of their skills, agents and commands
   if (enabled.size > 0) {
-    const installs = new Set();
+    const installs = new Map(); // install path -> 'account' (an account-wide layer enables the plugin) | 'project' (only a project layer does)
     for (const d of configDirs) {
       const file = path.join(d, 'plugins', 'installed_plugins.json');
       const r = readJson(file);
@@ -268,30 +324,38 @@ export function dialogHandlers({ home = accountHome(), cwd = null, managedPaths 
         const entries = r.value.plugins[name];
         if (entries === undefined) continue;
         if (!Array.isArray(entries)) { errors.push({ source: file, why: `the entry for ${name} is not a list` }); continue; }
-        for (const e of entries) if (isObj(e) && typeof e.installPath === 'string' && path.isAbsolute(e.installPath)) installs.add(e.installPath);
+        for (const e of entries) if (isObj(e) && typeof e.installPath === 'string' && path.isAbsolute(e.installPath) && installs.get(e.installPath) !== 'account') installs.set(e.installPath, enabledByAccount.has(name) ? 'account' : 'project');
       }
     }
-    for (const installPath of [...installs].sort()) {
+    for (const installPath of [...installs.keys()].sort()) {
+      const layer = installs.get(installPath);
       const hooksFile = path.join(installPath, 'hooks', 'hooks.json');
       const r = readJson(hooksFile);
       if (r.state === 'bad') errors.push({ source: hooksFile, why: r.why });
       else if (r.state === 'ok') {
         if (!isObj(r.value)) errors.push({ source: hooksFile, why: 'is not a JSON object' });
-        else handlers.push(...fromHooksObject(r.value.hooks ?? r.value, hooksFile, ctx, errors, installPath));
+        else handlers.push(...tag(fromHooksObject(r.value.hooks ?? r.value, hooksFile, ctx, errors, installPath), layer));
       }
       const manifest = path.join(installPath, '.claude-plugin', 'plugin.json');
       const m = readJson(manifest);
       if (m.state === 'bad') errors.push({ source: manifest, why: m.why });
       else if (m.state === 'ok' && isObj(m.value) && m.value.hooks !== undefined && m.value.hooks !== null) {
         // a manifest that names hooks by path or list is not followed here: fail closed
-        if (isObj(m.value.hooks)) handlers.push(...fromHooksObject(m.value.hooks, manifest, ctx, errors, installPath));
-        else handlers.push({ source: manifest, event: 'PreToolUse', matcher: '', command: '(plugin manifest hooks)', scriptPath: null, scriptSha256: null, trusted: false });
+        if (isObj(m.value.hooks)) handlers.push(...tag(fromHooksObject(m.value.hooks, manifest, ctx, errors, installPath), layer));
+        else handlers.push({ source: manifest, event: 'PreToolUse', matcher: '', command: '(plugin manifest hooks)', args: null, scriptPath: null, scriptSha256: null, trusted: false, layer });
       }
+      const components = new Set(componentFiles(installPath));
+      if (m.state === 'ok' && isObj(m.value)) {
+        const named = manifestComponents(m.value, installPath);
+        for (const x of named.files) components.add(x);
+        if (named.odd) errors.push({ source: manifest, why: named.odd });
+      }
+      for (const file of [...components].sort()) handlers.push(...tag(fromFrontmatter(file, errors), layer));
     }
   }
 
-  for (const dir of [...configDirs, ...(projectDir ? [projectDir] : [])]) {
-    for (const file of skillAndAgentFiles(dir)) handlers.push(...fromFrontmatter(file, errors));
+  for (const [dir, layer] of [...configDirs.map((d) => [d, 'account']), ...projectDirList.map((d) => [d, 'project'])]) {
+    for (const file of componentFiles(dir)) handlers.push(...tag(fromFrontmatter(file, errors), layer));
   }
 
   return { ok: errors.length === 0, handlers, errors };
@@ -325,8 +389,8 @@ export function readApprovedList({ home = accountHome() } = {}) {
   if (!isObj(v) || v.v !== 1 || !Array.isArray(v.hooks)) return { ok: false, why: `${file} is not a version 1 dialog-hooks list` };
   const hooks = [];
   for (const h of v.hooks) {
-    if (!isObj(h) || typeof h.command !== 'string' || typeof h.scriptPath !== 'string' || !/^[0-9a-f]{64}$/.test(h.sha256 ?? '')) return { ok: false, why: `${file} has a malformed entry` };
-    hooks.push({ command: h.command, scriptPath: h.scriptPath, sha256: h.sha256 });
+    if (!isObj(h) || typeof h.command !== 'string' || typeof h.scriptPath !== 'string' || !/^[0-9a-f]{64}$/.test(h.sha256 ?? '') || (h.args !== undefined && !(Array.isArray(h.args) && h.args.every((a) => typeof a === 'string')))) return { ok: false, why: `${file} has a malformed entry` };
+    hooks.push({ command: h.command, scriptPath: h.scriptPath, sha256: h.sha256, ...(h.args === undefined ? {} : { args: h.args }) });
   }
   return { ok: true, hooks, approvedAt: typeof v.approvedAt === 'string' ? v.approvedAt : null };
 }
@@ -338,14 +402,17 @@ const matcherText = (h) => (h.matcher === '' ? '*' : h.matcher);
 const describe = (h, home) => `${h.scriptPath ? tilde(h.scriptPath, home) : h.command} (${h.event} ${matcherText(h)})`;
 
 const byJson = (a, b) => { const x = JSON.stringify(a); const y = JSON.stringify(b); return x < y ? -1 : x > y ? 1 : 0; };
-// sha256 over the sorted { source, event, matcher, command, scriptSha256 } list: any added, removed, re-pointed or edited handler changes it.
+// sha256 over the sorted { source, event, matcher, command, args, scriptSha256 } list of the account-wide layers: any added, removed, re-pointed or edited handler (arguments included) changes it.
+// The project layer is not in it (R1-F2: the issuing command and the click hook see different project folders); it is judged by checkDialogHooks on every side instead.
 export const fingerprint = (handlers) => sha256(JSON.stringify(handlers
-  .map((h) => ({ source: h.source, event: h.event, matcher: h.matcher, command: h.command, scriptSha256: h.scriptSha256 }))
+  .filter((h) => h.layer !== 'project')
+  .map((h) => ({ source: h.source, event: h.event, matcher: h.matcher, command: h.command, args: h.args ?? null, scriptSha256: h.scriptSha256 }))
   .sort(byJson)));
+const sameArgs = (x, y) => JSON.stringify(x ?? []) === JSON.stringify(y ?? []);
 
 // -> { ok, hookLayersSha256, reason, offenders, handlers, approvedAt }. ok only when every source read, every untrusted handler resolves to one script and is listed with today's bytes.
-export function checkDialogHooks({ home = accountHome(), cwd = null, managedPaths } = {}) {
-  const found = dialogHandlers({ home, cwd, ...(managedPaths ? { managedPaths } : {}) });
+export function checkDialogHooks({ home = accountHome(), cwd = null, projectDirs = [], managedPaths } = {}) {
+  const found = dialogHandlers({ home, cwd, projectDirs, ...(managedPaths ? { managedPaths } : {}) });
   const list = readApprovedList({ home });
   const hookLayersSha256 = fingerprint(found.handlers);
   const offenders = [];
@@ -357,7 +424,7 @@ export function checkDialogHooks({ home = accountHome(), cwd = null, managedPath
       offenders.push({ kind: 'unresolvable', ...h, text: `unresolvable dialog hook ${h.command} (${h.event} ${matcherText(h)}) in ${tilde(h.source, home)}` });
       continue;
     }
-    const listed = list.ok ? list.hooks.filter((x) => x.command === h.command && x.scriptPath === h.scriptPath) : [];
+    const listed = list.ok ? list.hooks.filter((x) => x.command === h.command && x.scriptPath === h.scriptPath && sameArgs(x.args, h.args)) : [];
     if (listed.length === 0) offenders.push({ kind: 'unlisted', ...h, text: `unlisted dialog hook ${describe(h, home)}` });
     else if (!listed.some((x) => x.sha256 === h.scriptSha256)) offenders.push({ kind: 'changed', ...h, text: `changed dialog hook ${describe(h, home)}: its bytes differ from the approved list` });
   }
@@ -366,8 +433,8 @@ export function checkDialogHooks({ home = accountHome(), cwd = null, managedPath
 }
 
 // The default for owner-go-click.mjs `recordClick({ hookCheck })`: the hook input's cwd is the project the dialog ran in.
-export const hookCheck = ({ home, input } = {}) => {
-  const r = checkDialogHooks({ home: home ?? accountHome(), cwd: typeof input?.cwd === 'string' ? input.cwd : null });
+export const hookCheck = ({ home, input, env = process.env } = {}) => {
+  const r = checkDialogHooks({ home: home ?? accountHome(), cwd: typeof input?.cwd === 'string' ? input.cwd : null, projectDirs: [env?.CLAUDE_PROJECT_DIR] });
   return { ok: r.ok, hookLayersSha256: r.hookLayersSha256, reason: r.reason };
 };
 
@@ -375,8 +442,8 @@ export const hookCheck = ({ home, input } = {}) => {
 
 // Writes the list from what is installed now. Refuses (nothing written) when any source cannot be read or any untrusted handler does not resolve to one script.
 // -> { ok: true, file, hooks, approvedAt } | { ok: false, reason, offenders }
-export function approveDialogHooks({ home = accountHome(), cwd = null, now = Date.now, managedPaths } = {}) {
-  const found = dialogHandlers({ home, cwd, ...(managedPaths ? { managedPaths } : {}) });
+export function approveDialogHooks({ home = accountHome(), cwd = null, projectDirs = [], now = Date.now, managedPaths } = {}) {
+  const found = dialogHandlers({ home, cwd, projectDirs, ...(managedPaths ? { managedPaths } : {}) });
   const bad = [
     ...found.errors.map((e) => ({ kind: 'unreadable', text: `dialog hook source ${tilde(e.source, home)} ${e.why}` })),
     ...found.handlers.filter((h) => !h.trusted && h.scriptPath === null)
@@ -387,10 +454,10 @@ export function approveDialogHooks({ home = accountHome(), cwd = null, now = Dat
   const seen = new Set();
   for (const h of found.handlers) {
     if (h.trusted) continue;
-    const key = `${h.command}\n${h.scriptPath}\n${h.scriptSha256}`;
+    const key = `${h.command}\n${h.scriptPath}\n${h.scriptSha256}\n${JSON.stringify(h.args ?? null)}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    hooks.push({ command: h.command, scriptPath: h.scriptPath, sha256: h.scriptSha256 });
+    hooks.push({ command: h.command, scriptPath: h.scriptPath, sha256: h.scriptSha256, ...(h.args ? { args: h.args } : {}) });
   }
   hooks.sort(byJson);
   if (!realDirChain(home, OWNER_GO_STATE_REL)) return { ok: false, reason: `${path.join(home, ...OWNER_GO_STATE_REL.split('/'))} is not a real folder`, offenders: [] };

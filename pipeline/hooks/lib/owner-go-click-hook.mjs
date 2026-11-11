@@ -31,7 +31,7 @@ export function clickHookOutput(line) {
 export async function dialogHookCheck({ home, input }, load = () => import('./dialog-hooks.mjs')) {
   try {
     const { checkDialogHooks } = await load();
-    return await checkDialogHooks({ home, cwd: input?.cwd });
+    return await checkDialogHooks({ home, cwd: input?.cwd, projectDirs: [process.env.CLAUDE_PROJECT_DIR] }); // (R1-F2: the hook's own environment names the folder the session was launched in)
   } catch {
     return { ok: false, reason: 'dialog-hooks-unavailable' };
   }
