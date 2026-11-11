@@ -413,7 +413,7 @@ export const run = guarded(async (argv, ctx) => {
 // Why no owner "merge" stands for `what` (approvalGap): none was recorded, or one was but the prompt behind it cannot be confirmed as typed by the owner (#128).
 // R2-F3: when the likely cause is the environment, not the prompt (the transcript is in a config dir this process does not know), `q` (the approval asked for) lets the reason say so.
 const missingApproval = (gap, what, again, q) => (gap === 'provenance'
-  ? `a "merge" is recorded for ${what}, but it cannot be confirmed as typed by the owner (its prompt is not in the transcript as the owner's, or came from a notice, another session or a scheduled turn${approvalConfigDirHint(q) ? `; or ${approvalConfigDirHint(q)}` : ''}): ${again}, and ask the owner to type "merge" again`
+  ? `a "merge" is recorded for ${what}, but it cannot be confirmed as typed by the owner (its prompt is not in the transcript as the owner's, or came from a notice, another session or a scheduled turn, or was typed while the agent was still working: re-run \`P merge --pr ${q?.pr ?? 'N'} --dry-run --owner-go\` and show its FRESH closing lines${approvalConfigDirHint(q) ? `; or ${approvalConfigDirHint(q)}` : ''}): ${again}, and ask the owner to type "merge" again`
   : `no owner "merge" is recorded for ${what}: ${again}`);
 const hostProblem = (gh) => `gh resolves this repository on ${gh.repo().host ?? 'an unknown host'}, not github.com, and the owner's "merge" names a repository on github.com`;
 
