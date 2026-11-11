@@ -18,7 +18,8 @@ import { posix } from 'node:path';
 
 // Calibrated on a 14-core Mac, 2026-11: test/cli.test.mjs 3.2 s local vs 3.3 s weighed, test/verify.test.mjs 83 s vs 188 s,
 // test/git-resolution.test.mjs 165 s vs 214 s (CI spanMs overstates; it never understates). 90 s of weight is about
-// 40-90 s of wall time, which keeps `verify.quick` to roughly a minute or two with the fixed five files (about 5 s).
+// 40-90 s of wall time. Measured: this feature's own 7-file diff selected 31 related tests (budget used) and `verify --quick`
+// took 105 s on a loaded machine, so quick stays at about one to two minutes at most; with nothing related it is about 5 s.
 export const DEFAULT_BUDGET_MS = 90_000;
 
 const MODULE_RE = /\.(?:mjs|js|cjs)$/;
