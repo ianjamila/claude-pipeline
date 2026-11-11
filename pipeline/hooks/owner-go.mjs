@@ -8,10 +8,12 @@
 // agent can run `P merge` with the matching flags; nothing is printed otherwise, except (#128) one line when the owner's prompt reads as a ruling
 // answer that nothing was recorded for (the agent must ask again), and (#191) one line when the owner's "merge", "extra round" or ruling answer was typed
 // while the agent was still working (a queued prompt records nothing).
-try {
-  const { readHookInput } = await import('./lib/hook-io.mjs');
+// (#261) The SAME script is also registered on PostToolUse for AskUserQuestion (click-to-approve, lib/owner-go-click.mjs): the owner's click on a dialog the pipeline
+// issued is verified against the transcript and recorded like the typed words (lib/owner-go-click-hook.mjs). PostToolUse stdout reaches the agent too: one line says the
+// click is recorded, declined (nothing approved) or could not be verified (the owner types the closing words instead); nothing is printed for an AskUserQuestion that is
+// not one of ours. The dialog-hook check (lib/dialog-hooks.mjs) is loaded lazily: if it cannot load, no click is admitted.
+async function onPrompt(input) {
   const { recordApproval, recordRuling, recordRoundGrant, rulingNudge, queuedNudge } = await import('./lib/owner-go.mjs');
-  const input = await readHookInput();
   const record = recordApproval(input);
   const ruling = recordRuling(input);
   const round = recordRoundGrant(input);
@@ -24,6 +26,18 @@ try {
     const shown = record.requests.map((q) => `${q.repo ?? '(no repo: approves nothing)'} #${q.pr} head ${q.head} items ${q.items}`);
     const prs = record.prs.map((n) => `#${n}`).join(', ');
     process.stdout.write(`[claude-pipeline owner-go] the owner's "merge" is recorded: ${shown.length ? shown.join('; ') : 'no Head/items/repo request was shown in the last merge request'}${prs ? `; PRs ${prs}` : ''}.\n`);
+  }
+}
+
+try {
+  const { readHookInput } = await import('./lib/hook-io.mjs');
+  const input = await readHookInput();
+  if (input?.hook_event_name === 'PostToolUse') {
+    const { clickHookLine } = await import('./lib/owner-go-click-hook.mjs');
+    const line = await clickHookLine(input);
+    if (line) process.stdout.write(`${line}\n`);
+  } else {
+    await onPrompt(input);
   }
 } catch { /* never block or break a prompt */ }
 process.exitCode = 0;
