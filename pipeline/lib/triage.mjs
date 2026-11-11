@@ -509,7 +509,7 @@ export function roundCapDeferRefusal(item) {
 export function applyRoundCapDefer(item, { reason, ruledAt, fixHead, reviewedHead }) {
   const refusal = roundCapDeferRefusal(item);
   if (refusal) throw new Error(refusal);
-  const { implementedVia: _via, ...rest } = structuredClone(item);
+  const { implementedVia: _via, implementedAfterRound: _mark, ...rest } = structuredClone(item);
   return {
     ...rest,
     implemented: false,
@@ -610,7 +610,8 @@ export const ownerRuledItems = (state) => allItems(state).filter(isOwnerRuled);
 // A dismissal (REJECT / FOLLOW-UP) of a security, auth, permissions or data category is never reused, whatever the
 // bucket: those are looked at every time, unless the OWNER ruled on it (its final keeps the ownerQuote): asking again would make
 // the owner rule twice on the same finding, and the copy still counts as ownerMerge at the final gate. An entry without bucket and category (a hand-built cache) is not reused.
-export function reuseRuled(items, ruledCache) {
+// `round` (the number of the round the copies belong to): a carried fix is recorded as made before that round (`implementedAfterRound` = round - 1), see markedBefore.
+export function reuseRuled(items, ruledCache, { round } = {}) {
   return items.map((item) => {
     const next = structuredClone(item);
     if (next.final || !next.fingerprint) return next;
@@ -628,7 +629,10 @@ export function reuseRuled(items, ruledCache) {
     // unimplemented ACCEPT that `mark-implemented` can never clear. Never for a BLOCKING or security / data finding: raised
     // again on unchanged code, that is evidence the fix may be missing, so it stays open (and parks for a human) instead.
     const carriesFix = next.bucket !== 'BLOCKING' && !SECURITY_CATEGORIES.includes(next.category);
-    if (final.decision === 'ACCEPT' && implemented === true && carriesFix) next.implemented = true;
+    if (final.decision === 'ACCEPT' && implemented === true && carriesFix) {
+      next.implemented = true;
+      if (Number.isInteger(round)) next.implementedAfterRound = round - 1;
+    }
     return next;
   });
 }
@@ -991,6 +995,11 @@ export function itemSeverity(item, { state, config, files } = {}) {
 }
 
 const idList = (ids) => ids.join(', ');
+// Was this implemented item's fix made before the last counted round? `implementedAfterRound` (the newest round number when it was marked) is below that round's number.
+const markedBefore = (item, rounds) => {
+  const counted = rounds.filter(countsTowardCap).at(-1);
+  return Number.isInteger(item.implementedAfterRound) && counted !== undefined && counted.n > item.implementedAfterRound;
+};
 
 // May the round limit be closed by taking the accepted fixes OUT and filing them as follow-ups? Refusals 1, 2 and 5 of `defer-fixes`, evaluated on this state as if the tree were
 // already back at the reviewed content (refusals 3 and 4 need git and are the command's). Pure. `grants` = k -> the owner's open extra-round records for counted round k at ANY head
@@ -1053,16 +1062,15 @@ export function deferEligibility(state, config, files, { grants, grantGap } = {}
     const why = roundCapDeferRefusal(item);
     if (why) refusals.push(why);
   }
-  // Refusal 2b: every other implemented accept of the rounds still awaiting a fix review: only a `by: 'cache'` copy is not in ids, and reuseRuled never carries a fix for a BLOCKING or
-  // security copy, so the agent fixed it AFTER the last reviewed head. Reverting every commit since that head takes such a fix out while the state still says implemented, and the
-  // review would read clean without it, so this refuses. (A carried low copy cannot be told from one fixed later; it refuses too.) Earlier rounds are not looked at: a round
-  // cannot start with an accept unimplemented, so their fixes were in a reviewed head.
+  // Refusal 2b: every OTHER implemented accept, in ANY round, must be provably fixed before the last reviewed (counted) round: the state records when it was marked
+  // (`implementedAfterRound`, the newest round number then; set by `state mark-implemented`, and by reuseRuled for a carried copy), and a later counted round reviewed a head that holds the fix.
+  // Nothing makes an earlier round's accept fixed before the next round starts (a final can turn ACCEPT after it, a judge's accept can be left open), so a fix marked AFTER the last reviewed
+  // round is out of the tree once every commit since that head is reverted while the state still says implemented, and the review would read clean without it. A mark with no
+  // record (a state from before the field) cannot be proven: it refuses, and the extra round runs as before.
   const asked = new Set(ids);
-  for (const r of roundsAwaitingFixReview(rounds)) {
-    for (const i of r.items ?? []) {
-      if (i.final?.decision === 'ACCEPT' && i.implemented === true && !asked.has(i.id)) {
-        refusals.push(`${i.id} is an accepted ${i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category) ? 'BLOCKING or security ' : ''}ruling copied from an earlier round and marked implemented: its fix may have been made after the last reviewed head, and taking the fixes out would drop it, so run the round`);
-      }
+  for (const i of allItems(state)) {
+    if (i.final?.decision === 'ACCEPT' && i.implemented === true && !asked.has(i.id) && !markedBefore(i, rounds)) {
+      refusals.push(`${i.id} is an accepted ${i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category) ? 'BLOCKING or security ' : ''}fix marked implemented that is not proven to be in the last reviewed head (it was marked after that round, or the state does not say when): taking the fixes out would drop it, so run the round`);
     }
   }
   // Refusal 5: the state with those fixes deferred must read as a clean review (nothing left but the issues still to file).

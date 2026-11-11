@@ -463,7 +463,8 @@ async function markImplemented(rest, ctx) {
     }
     for (const { round, item } of found) {
       const { implementedVia: _earlier, ...rest } = item; // an earlier mark is judged again: the named file may have been changed since
-      state = updateItems(state, round.n, [{ ...rest, implemented: true, ...(otherFiles.has(item.id) ? { implementedVia: 'other-files' } : {}) }]);
+      // implementedAfterRound: the newest round number at the time of the mark, so a later deferral can tell a fix made before the last reviewed round from one made after it (triage.mjs deferEligibility).
+      state = updateItems(state, round.n, [{ ...rest, implemented: true, implementedAfterRound: Math.max(...state.rounds.map((r) => r.n)), ...(otherFiles.has(item.id) ? { implementedVia: 'other-files' } : {}) }]);
     }
     saveState(root, state);
     return { exitCode: EXIT.OK, output: { ok: true, marked: ids } };

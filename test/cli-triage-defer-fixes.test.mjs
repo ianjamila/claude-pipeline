@@ -284,19 +284,21 @@ test('defer-fixes: refused when main was merged in after the last reviewed head 
 test('defer-fixes: a cached BLOCKING accept fixed after the last round (next to a low accept in another file) is refused, and round-request recommends the round (R1-F1)', (t) => {
   const w = roundWorld(t);
   const { h2 } = w.atCap();
-  // round 2 also holds a copy of a BLOCKING ACCEPT that reuseRuled carried over unimplemented; the agent fixed it in the round-2 fix commit and marked it
+  // round 2 also holds a copy of a BLOCKING ACCEPT that reuseRuled carried over unimplemented; the agent fixed it in the round-2 fix commit and marked it (the CLI records when)
   w.edit((s) => {
     const base = s.rounds[1].items[0];
     s.rounds[1].items.push({
       ...base, id: 'R2-B1', bucket: 'BLOCKING', category: 'bug', file: 'src/a.js', title: 'Cached bug', fingerprint: 'fp-cached-blocking',
-      final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'accepted in round 1' }, implemented: true,
+      final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'accepted in round 1' }, implemented: false,
     });
   });
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R2-B1']), 0);
+  assert.equal(w.item('R2-B1').implementedAfterRound, 2, 'the mark records the newest round at the time');
   const asked = w.cli(['triage', 'round-request', '--pr', '7']);
   assertExit(asked, 0, asked.stderr + asked.stdout);
   assert.equal(asked.json.recommend, 'extra-round', 'the ask agrees with the command');
   w.revert(h2);
-  refused(w, () => defer(w, 'R2-S1', h2), /R2-B1 is an accepted BLOCKING or security ruling copied from an earlier round and marked implemented/, 'cached BLOCKING accept');
+  refused(w, () => defer(w, 'R2-S1', h2), /R2-B1 is an accepted BLOCKING or security fix marked implemented that is not proven to be in the last reviewed head/, 'cached BLOCKING accept');
   assert.equal(w.item('R2-B1').implemented, true, 'the state still says it is in, and nothing was dropped');
 });
 
@@ -386,4 +388,26 @@ test('defer-fixes: a finding raised again in a later granted round links the fol
   const body = w.fake.comments().map((c) => c.body).find((b) => b.includes('Raised again after a deferral'));
   assert.ok(body, 'the triage comment has the section');
   assert.match(body, /- R3-S1: the same finding as R2-S1, whose fix was deferred past the round limit; follow-up issue https:\/\/github\.com\/[^ ]+\/issues\/31 is already filed, no new issue/);
+});
+
+test('defer-fixes: an EARLIER round\'s accept ruled and fixed after the last reviewed head is refused too, and round-request recommends the round (R2-F1)', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = w.atCap();
+  // round 1 holds a BLOCKING item that waited for a human; it was ruled ACCEPT after round 2, and fixed in the round-2 fix commit next to the low R2-S1
+  w.edit((s) => {
+    s.rounds[0].items.push({
+      ...s.rounds[0].items[0], id: 'R1-B9', bucket: 'BLOCKING', category: 'bug', file: 'src/a.js', title: 'Late bug', fingerprint: 'fp-late',
+      final: { decision: 'ACCEPT', by: 'claude', needsHuman: false, reason: 'ruled after round 2', claude: { ruledAt: 'x', cause: 'low-confidence', critical: true, overruled: {} } }, implemented: false,
+    });
+  });
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R1-B9']), 0);
+  assert.equal(w.item('R1-B9').implementedAfterRound, 2);
+  const asked = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(asked, 0, asked.stderr + asked.stdout);
+  assert.equal(asked.json.recommend, 'extra-round');
+  w.revert(h2);
+  refused(w, () => defer(w, 'R2-S1', h2), /R1-B9 is an accepted BLOCKING or security fix marked implemented that is not proven/, 'earlier-round accept fixed after the last review');
+  // a state from before the field (no record) falls back to the round as well
+  w.edit((s) => { delete s.rounds[0].items.find((i) => i.id === 'R1-B9').implementedAfterRound; });
+  refused(w, () => defer(w, 'R2-S1', h2), /R1-B9 is an accepted .*not proven/, 'no record of when it was marked');
 });

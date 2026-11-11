@@ -20,7 +20,7 @@ function item(over = {}) {
     id: `R1-S${seq}`, round: 1, bucket: 'SUGGESTION', category: 'maintainability', title: `finding ${seq}`, file: 'src/big.js', line: 10,
     detail: 'detail', codexReasoning: 'codex reasoning', testable: false, fingerprint: `fp-${seq}`,
     judge: null, test: { status: 'none', evidence: '' }, arbiter: null,
-    final: { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'worth doing' }, implemented: true, followupIssue: null, ...over,
+    final: { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'worth doing' }, implemented: true, implementedAfterRound: 1, followupIssue: null, ...over,
   };
 }
 const round = (n, items, over = {}) => ({ n, fromHead: 'f'.repeat(40), toHead: 'e'.repeat(40), contentHashAtToHead: HASH, items, ...over });
@@ -176,11 +176,11 @@ test('deferEligibility: an unspent owner grant for the next round (at any head) 
 
 test('deferEligibility: an implemented accept outside the ids (a cached BLOCKING copy fixed after the last round) refuses (R1-F1)', () => {
   const low = item({ id: 'R2-S1', file: 'src/a.js' });
-  const cached = item({ id: 'R2-B1', bucket: 'BLOCKING', category: 'bug', file: 'src/big.js', final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'same finding, accepted before' }, implemented: true });
+  const cached = item({ id: 'R2-B1', bucket: 'BLOCKING', category: 'bug', file: 'src/big.js', final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'same finding, accepted before' }, implemented: true, implementedAfterRound: 2 });
   const r = levels(stateOf([low, cached]));
   assert.equal(r.eligible, false);
   assert.deepEqual(r.ids, ['R2-S1'], 'the cached copy is not one of the accepts a round would be asked to review');
-  assert.match(r.refusals.join(';'), /R2-B1 is an accepted BLOCKING or security ruling copied from an earlier round and marked implemented: its fix may have been made after the last reviewed head/);
+  assert.match(r.refusals.join(';'), /R2-B1 is an accepted BLOCKING or security fix marked implemented that is not proven to be in the last reviewed head/);
   // a resolution-only round after the last counted one is part of the same wait
   const state = stateOf([low], { extra: [round(3, [{ ...cached, round: 3 }], { resolutionOnly: true })] });
   assert.match(levels(state).refusals.join(';'), /R2-B1 is an accepted BLOCKING/);
@@ -188,11 +188,42 @@ test('deferEligibility: an implemented accept outside the ids (a cached BLOCKING
   const open = levels(stateOf([low, { ...cached, implemented: false }]));
   assert.doesNotMatch(open.refusals.join(';'), /copied from an earlier round/);
   assert.match(open.refusals.join(';'), /not implemented|open BLOCKING/);
+  assert.doesNotMatch(open.refusals.join(';'), /not proven/);
+  // marked before the last counted round (a carried copy, or a fix a round reviewed): proven, so it does not refuse
+  assert.equal(levels(stateOf([low, { ...cached, bucket: 'SUGGESTION', category: 'maintainability', implementedAfterRound: 1 }])).eligible, true, 'marked after round 1, round 2 reviewed it');
+  // a mark with no record (a state from before the field) cannot be proven
+  const { implementedAfterRound: _gone, ...unrecorded } = { ...cached, bucket: 'SUGGESTION', category: 'maintainability' };
+  assert.match(levels(stateOf([low, unrecorded])).refusals.join(';'), /R2-B1 is an accepted fix marked implemented that is not proven/);
   // a cached copy of a settled dismissal is no accept at all
   const dismissed = item({ id: 'R2-S2', final: { decision: 'FOLLOW-UP', by: 'cache', needsHuman: false, reason: 'later' }, implemented: false });
   assert.equal(levels(stateOf([low, dismissed])).eligible, true);
-  // an earlier round's accept (fixed and reviewed by round 2) is not looked at
+  // an earlier round's accept (fixed and reviewed by round 2) is proven by its mark
   assert.equal(levels(stateOf([low])).eligible, true);
+});
+
+test('deferEligibility: an earlier-round BLOCKING accept ruled ACCEPT after the last round and fixed after its head refuses (R2-F1)', () => {
+  // max_rounds 3: R2-B1 (round 2) waited for a human; round 3 ran anyway and accepted the low R3-S1; then R2-B1 was ruled ACCEPT and BOTH fixes were made after the round-3 head and marked
+  const waited = item({ id: 'R2-B1', round: 2, bucket: 'BLOCKING', category: 'bug', file: 'src/big.js', final: { decision: 'ACCEPT', by: 'claude', needsHuman: false, reason: 'accepted' }, implementedAfterRound: 3 });
+  const low = item({ id: 'R3-S1', round: 3, file: 'src/a.js', implementedAfterRound: 3 });
+  const rounds = [round(1, [item({ id: 'R1-S0', round: 1, fingerprint: 'fp-0', file: 'src/a.js' })]), round(2, [waited]), round(3, [low])];
+  const r = levels({ pr: 7, maxRounds: 3, currentContentHash: HASH, rounds });
+  assert.equal(r.eligible, false);
+  assert.deepEqual(r.ids, ['R3-S1']);
+  assert.match(r.refusals.join(';'), /R2-B1 is an accepted BLOCKING or security fix marked implemented that is not proven/);
+  // the same BLOCKING fix made before round 3 began (marked after round 2) is in the reviewed head: nothing refuses it
+  const earlier = { ...waited, implementedAfterRound: 2 };
+  assert.equal(levels({ pr: 7, maxRounds: 3, currentContentHash: HASH, rounds: [rounds[0], round(2, [earlier]), rounds[2]] }).eligible, false, 'still refused: a BLOCKING ACCEPT sits in the state and its file is high');
+  assert.doesNotMatch(levels({ pr: 7, maxRounds: 3, currentContentHash: HASH, rounds: [rounds[0], round(2, [earlier]), rounds[2]] }).refusals.join(';'), /not proven/);
+});
+
+test('reuseRuled: a carried fix records the round it was carried into, and an item deferred loses the mark (R2-F1)', () => {
+  const entry = { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'r', bucket: 'SUGGESTION', category: 'maintainability', implemented: true };
+  const fresh = { id: 'R3-S1', fingerprint: 'fp', bucket: 'SUGGESTION', category: 'maintainability' };
+  assert.equal(reuseRuled([fresh], { fp: entry }, { round: 3 })[0].implementedAfterRound, 2);
+  assert.equal('implementedAfterRound' in reuseRuled([fresh], { fp: entry })[0], false, 'no round given: no claim');
+  const accepted = item({ id: 'R2-S1', file: 'src/a.js', implementedAfterRound: 2 });
+  const deferred = applyRoundCapDefer(accepted, { reason: 'r', ruledAt: new Date(0).toISOString(), fixHead: 'a'.repeat(40), reviewedHead: 'b'.repeat(40) });
+  assert.equal('implementedAfterRound' in deferred, false);
 });
 
 test('deferEligibility: each accept must be low, implemented, and the judge\'s or arbiter\'s (never a test, Claude, a second review, the owner or a cache copy)', () => {
