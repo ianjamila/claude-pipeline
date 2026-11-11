@@ -136,3 +136,4 @@ full record.
 - 2026-11-11 · #247 · Automatic pipeline update: review leases, installer gates, scheduled update, SessionStart notice · risk high · rounds 6 · arbiter 6 · awaiting-owner-merge
 - 2026-11-11 · #264 · Quick check names its test files exactly; an unmatched test name exits 2 (#257) · risk high · rounds 2 · arbiter 1 · awaiting-owner-merge
 - 2026-11-11 · #255 · Fix rounds get a narrow fix-verify Fable brief at medium effort · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
+- 2026-11-11 · #255 · Fix rounds get a narrow fix-verify Fable brief at medium effort · risk high · rounds 5 · arbiter 3 · awaiting-owner-merge
