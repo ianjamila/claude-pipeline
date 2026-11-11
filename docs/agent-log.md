@@ -140,3 +140,4 @@ full record.
 - 2026-11-11 · #255 · Fix rounds get a narrow fix-verify Fable brief at medium effort · risk high · rounds 5 · arbiter 3 · merged
 - 2026-11-11 · #271 · Pipeline tail: catch a draft up before CI, guard false refusal, arbiter --pr, quick-check self-test, workflow-check parity, prune on · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge
 - 2026-11-11 · #272 · Quick verify also runs the tests related to the branch's changes · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge
+- 2026-11-11 · #269 · Click to approve: merge, extra round and rulings as a choice dialog (#261) · risk high · rounds 5 · arbiter 4 · blocked
