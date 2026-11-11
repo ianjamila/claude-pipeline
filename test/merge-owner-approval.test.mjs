@@ -265,6 +265,7 @@ test('--owner-go and the gate flags: a "merge" whose prompt is synthetic or miss
     assertExit(r, 1);
     assert.equal(r.json.error, 'owner-go');
     assert.match(r.json.reason, /a "merge" is recorded for acme\/widgets #\d+ head [0-9a-f]{12} items none, but it cannot be confirmed as typed by the owner[\s\S]*ask the owner to type "merge" again/);
+    assert.match(r.json.reason, /or was typed while the agent was still working[\s\S]*P merge --pr \d+ --dry-run --owner-go[\s\S]*FRESH closing lines/, '#191: a queued answer is named, with what to do');
     assert.deepEqual(s.mergeCalls(), []);
   }
   // …and the same on the gate path (--owner-approved-head)

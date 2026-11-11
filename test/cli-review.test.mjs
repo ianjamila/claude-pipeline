@@ -26,6 +26,7 @@ import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } f
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
 import { reviewCheck } from '../pipeline/lib/finalgate.mjs';
+import { noClaudeSession } from './helpers/no-claude-session.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -2470,7 +2471,7 @@ test('arbiter apply: an installed copy ignores PIPELINE_TEST_MODE (with a warnin
   const w = readyForArbiter(t);
   w.cli(['arbiter', 'needed', '--round', '1']);
   const asked = ['--expect-model', 'claude-opus-', '--expect-effort', 'low'];
-  const r = arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs') } });
+  const r = arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs'), ...noClaudeSession() } });
   assertAllNeedHuman(w, r, /unexpected model claude-opus-5-1/);
   assert.match(r.stderr, /ignoring PIPELINE_TEST_MODE/);
 });
@@ -3252,6 +3253,7 @@ test('triage owner-ruling: an answer whose prompt is synthetic or missing from t
     const r = w.cli(rule('R1-B1', 'FOLLOW-UP'));
     assertExit(r, 1);
     assert.match(r.json.reason, /an answer is recorded for acme\/widgets-[0-9a-f-]+ #7 R1-B1, but it cannot be confirmed as typed by the owner[\s\S]*ask again[\s\S]*ask the owner to answer again/);
+    assert.match(r.json.reason, /or was typed while the agent was still working[\s\S]*FRESH closing line[\s\S]*ruling-request/, '#191: a queued answer is named, with what to do');
     assert.equal(w.item('R1-B1').final.by, 'arbiter', 'state untouched');
   }
 });
@@ -3907,6 +3909,7 @@ test('codex-review owner grant: an "extra round" whose prompt is synthetic or mi
   assertExit(capped, 2, capped.stdout);
   assert.equal(capped.json.error, 'round-cap');
   assert.match(capped.json.message, /an extra round is recorded for this PR, but it cannot be confirmed as typed by the owner[\s\S]*ask the owner to type "extra round" again/);
+  assert.match(capped.json.message, /may have been typed while the agent was still working[\s\S]*P triage round-request[\s\S]*FRESH closing lines/, '#191: a queued answer is named, with what to do');
   assert.equal(w.captured().length, calls, 'Codex never ran');
   // the gate path: the owner's own words admit the round, as before
   ownerGrantsRound(w, t, { k: 3, head: h2 });

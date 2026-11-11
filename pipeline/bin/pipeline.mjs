@@ -6,6 +6,7 @@ import { readdirSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { emit, errorResult, EXIT } from '../lib/cli.mjs';
+import { holdReviewLease, settleReviewLease } from '../lib/review-lease-wiring.mjs';
 
 const commandsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'commands');
 
@@ -54,7 +55,13 @@ export async function main(argv = process.argv.slice(2), ctx = {}) {
     return emit({ exitCode: EXIT.OK, output: { ok: true, usage: mod.meta?.usage ?? name } });
   }
   try {
-    const result = await mod.run(rest, { cwd: process.cwd(), env: process.env, ...ctx });
+    const runCtx = { cwd: process.cwd(), env: process.env, ...ctx };
+    // The review lease (lib/review-lease-wiring.mjs): taken HERE, before the command, so admission is never waited for while the command holds
+    // its per-PR state lock or the floor lock. A command that cannot get its lease does not run.
+    const lease = await holdReviewLease(name, rest, runCtx);
+    if (lease.failure) return emit(lease.failure);
+    const result = await mod.run(rest, runCtx);
+    await settleReviewLease(name, result, lease.held, runCtx);
     return emit(result);
   } catch (err) {
     return emit(errorResult(err));

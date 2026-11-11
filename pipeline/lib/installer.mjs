@@ -29,6 +29,9 @@ export const GUARD_GIT_MATCHER = 'Bash|PowerShell|Monitor|mcp__.*';
 export const GUARD_FILES_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor|mcp__.*';
 export const HOOK_TIMEOUT_S = 15;
 export const OWNER_GO_TIMEOUT_S = 10;
+// The update notice (plan 2026-11-10 B4): a lean SessionStart hook that only reads pipeline-state/update-status.json. Its own budget is 1 s; this is the
+// ceiling Claude Code enforces if the hook itself hangs.
+export const UPDATE_NOTICE_TIMEOUT_S = 5;
 // The stack-stop hooks (docs/specs/2026-10-19-stack-stop-design.md): stack-register (PreToolUse, fail-closed loader, one group per
 // matcher), stack-dev-bind (PostToolUse Bash) and stack-session-end (SessionEnd), the last two plain and non-blocking.
 export const STACK_REGISTER_MATCHERS = Object.freeze(['Bash', 'Edit|Write|MultiEdit|NotebookEdit']);
@@ -38,8 +41,8 @@ export const STACK_REGISTER_TIMEOUT_S = 30;
 export const STACK_HOOK_TIMEOUT_S = 10;
 export const STACK_DEV_BIND_MATCHER = 'Bash';
 // The events whose hooks this installer manages: guard hooks and stack-register on PreToolUse, stack-dev-bind on PostToolUse,
-// stack-session-end on SessionEnd, the owner-go recorder (#58: the owner's chat "merge") on UserPromptSubmit. SessionStart is
-// listed only so the retired version-status hook is found and removed there; nothing is written to it.
+// stack-session-end on SessionEnd, the owner-go recorder (#58: the owner's chat "merge") on UserPromptSubmit, the update notice on
+// SessionStart (the retired session-version script was found and removed there too; its name stays retired).
 export const HOOK_EVENTS = ['PreToolUse', 'PostToolUse', 'SessionStart', 'SessionEnd', 'UserPromptSubmit'];
 export const STAGING_REL = 'backups/.staging';
 export const TILDE_ALLOW_ENTRY = 'Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)';
@@ -55,6 +58,7 @@ const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArr
 // Arguments
 
 const USAGE = `usage: node install.mjs [--claude-home DIR] [--source DIR] [--check] [--uninstall] [--skip-file-guard] [--force] [--json]
+                          [--require-no-live-reviews [--deadline-ms N]] [--expect-installed SHA]
 
   --claude-home DIR   where to install (default: $CLAUDE_CONFIG_DIR, else ~/.claude)
   --source DIR        the claude-pipeline checkout to install from (default: the directory holding install.mjs)
@@ -62,13 +66,21 @@ const USAGE = `usage: node install.mjs [--claude-home DIR] [--source DIR] [--che
   --uninstall         remove what was installed (files in the manifest, our hook entries, our allow entries)
   --skip-file-guard   do not install the file-guard hook (guard-git is always installed)
   --force             overwrite a same-named skill/agent/pipeline dir this installer did not install (kept in backups/)
+  --require-no-live-reviews  the unattended update's mode (the account's own claude-home only): after taking the install lock, take the
+                      machine-wide admission lock, scan for live reviews (leases, P jobs, state/merge locks, merge-queue records) and install
+                      only if there are none; otherwise exit 3 with {ok:false, deferred:true, live:[...]} and write nothing. Admission is held
+                      through the swap and the installer's own --check pass. Exit 3 also covers deferred reason 'deadline' (the scan overran
+                      --deadline-ms) and 'admission-busy' (another update holds admission).
+  --deadline-ms N     with --require-no-live-reviews: give up before swapping (exit 3, reason 'deadline') if the scan is not done N ms after start (default 120000)
+  --expect-installed SHA  install only if the claude-home still holds a clean, complete install of commit SHA (checked under the install lock,
+                      before anything is written); otherwise exit 1 with error 'expect-installed-mismatch'
   --json              machine-readable report on stdout`;
 export const usageText = () => USAGE;
 
 export function parseArgs(argv) {
-  const opts = { claudeHome: null, source: null, check: false, uninstall: false, skipFileGuard: false, force: false, json: false };
-  const valued = { '--claude-home': 'claudeHome', '--source': 'source' };
-  const flags = { '--check': 'check', '--uninstall': 'uninstall', '--skip-file-guard': 'skipFileGuard', '--force': 'force', '--json': 'json' };
+  const opts = { claudeHome: null, source: null, check: false, uninstall: false, skipFileGuard: false, force: false, json: false, requireNoLiveReviews: false, expectInstalled: null, deadlineMs: null };
+  const valued = { '--claude-home': 'claudeHome', '--source': 'source', '--expect-installed': 'expectInstalled', '--deadline-ms': 'deadlineMs' };
+  const flags = { '--check': 'check', '--uninstall': 'uninstall', '--skip-file-guard': 'skipFileGuard', '--force': 'force', '--json': 'json', '--require-no-live-reviews': 'requireNoLiveReviews' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '-h' || arg === '--help') return { opts, help: true };
@@ -85,6 +97,15 @@ export function parseArgs(argv) {
     }
   }
   if (opts.check && opts.uninstall) return { opts, error: '--check and --uninstall cannot be combined' };
+  if (opts.deadlineMs !== null) {
+    if (!/^[1-9][0-9]{0,9}$/.test(opts.deadlineMs)) return { opts, error: '--deadline-ms needs a positive whole number of milliseconds' };
+    opts.deadlineMs = Number(opts.deadlineMs);
+    if (!opts.requireNoLiveReviews) return { opts, error: '--deadline-ms only applies with --require-no-live-reviews' };
+  }
+  if ((opts.requireNoLiveReviews || opts.expectInstalled) && (opts.check || opts.uninstall)) {
+    return { opts, error: `${opts.requireNoLiveReviews ? '--require-no-live-reviews' : '--expect-installed'} only applies to an install` };
+  }
+  if (opts.expectInstalled !== null && !/^[0-9a-f]{40}$/.test(opts.expectInstalled)) return { opts, error: '--expect-installed needs a full 40-character lower-case commit sha' };
   return { opts };
 }
 
@@ -157,7 +178,7 @@ export function buildPlan(source) {
     const entries = walkFiles(pipelineDir)
       .filter((r) => r !== 'INSTALLED.json')
       .map((r) => ({ rel: `pipeline/${r}`, abs: path.join(pipelineDir, ...r.split('/')) }));
-    for (const hook of ['guard-git.mjs', 'guard-files.mjs', 'owner-go.mjs', 'stack-register.mjs', 'stack-dev-bind.mjs', 'stack-session-end.mjs']) {
+    for (const hook of ['guard-git.mjs', 'guard-files.mjs', 'owner-go.mjs', 'update-notice.mjs', 'stack-register.mjs', 'stack-dev-bind.mjs', 'stack-session-end.mjs']) {
       if (!entries.some((e) => e.rel === `pipeline/hooks/${hook}`)) problems.push(`pipeline/hooks/${hook} is missing`);
     }
     if (isFile(path.join(source, 'VERSION'))) {
@@ -376,6 +397,20 @@ export function buildManifest({ plan, sourceSha, skipFileGuard, complete = false
   };
 }
 
+// The installer an unattended update runs is the DOWNLOADED one: it has no INSTALLED.json beside it, so seamValue reads every test seam as a checkout does.
+// Seams that only a test run may use (not already gated on PIPELINE_TEST_MODE by the installer itself) are therefore removed here unless `testMode`: from
+// `env` and from process.env (seamValue falls back to it). Mutates; returns the names that were dropped.
+export function dropSeamsWithoutTestMode(env, names, testMode) {
+  if (testMode) return [];
+  const dropped = [];
+  for (const name of names) {
+    if (env?.[name] !== undefined || process.env[name] !== undefined) dropped.push(name);
+    if (env) delete env[name];
+    delete process.env[name];
+  }
+  return dropped;
+}
+
 // { manifest, warnings }: manifest is null when absent or unusable (warnings say why).
 export function readManifest(home) {
   const file = fromRel(home, MANIFEST_REL);
@@ -502,6 +537,14 @@ const ownerGoHandlerFor = (home) => ({
   timeout: OWNER_GO_TIMEOUT_S,
 });
 
+// The update notice is plain too: it runs at SessionStart, and a broken notice must never block or delay a session.
+const updateNoticeHandlerFor = (home) => ({
+  type: 'command',
+  command: 'node',
+  args: [joinNative(home, 'pipeline', 'hooks', 'update-notice.mjs')],
+  timeout: UPDATE_NOTICE_TIMEOUT_S,
+});
+
 // A plain (non-blocking) handler for a stack hook: never the fail-closed loader, so a failure of a PostToolUse / SessionEnd hook
 // can never block anything.
 const stackPlainHandlerFor = (home, name) => ({
@@ -531,6 +574,8 @@ export function ourHookGroups(home, { skipFileGuard = false } = {}) {
 
 // Our own UserPromptSubmit group (no matcher: that event has none), appended after the owner's own.
 export const ourPromptGroups = (home) => [{ hooks: [ownerGoHandlerFor(home)] }];
+// Our own SessionStart group (no matcher): the update notice, appended after the owner's own.
+export const ourSessionStartGroups = (home) => [{ hooks: [updateNoticeHandlerFor(home)] }];
 
 function assertShape(settings) {
   if (!isPlainObject(settings)) throw new SettingsShapeError('settings.json must contain a JSON object');
@@ -587,6 +632,8 @@ export function mergeSettings(settings, { home, skipFileGuard = false }) {
   out.hooks.SessionEnd.push(...stack.SessionEnd);
   out.hooks.UserPromptSubmit ??= [];
   out.hooks.UserPromptSubmit.push(...ourPromptGroups(home));
+  out.hooks.SessionStart ??= [];
+  out.hooks.SessionStart.push(...ourSessionStartGroups(home));
   out.permissions ??= {};
   out.permissions.allow ??= [];
   for (const entry of ourAllowEntries(home)) if (!out.permissions.allow.includes(entry)) out.permissions.allow.push(entry);
@@ -624,6 +671,7 @@ const scriptOf = (handler) => {
   if (/\/guard-git\.mjs/.test(text)) return 'guard-git';
   if (/\/guard-files\.mjs/.test(text)) return 'guard-files';
   if (/\/owner-go\.mjs/.test(text)) return 'owner-go';
+  if (/\/update-notice\.mjs/.test(text)) return 'update-notice';
   if (/\/stack-register\.mjs/.test(text)) return 'stack-register';
   if (/\/stack-dev-bind\.mjs/.test(text)) return 'stack-dev-bind';
   if (/\/stack-session-end\.mjs/.test(text)) return 'stack-session-end';
@@ -636,12 +684,13 @@ const scriptOf = (handler) => {
 // hooks.SessionEnd; one of ours under the wrong event is `unknown`. `retired` holds what an earlier install wrote and this one
 // no longer does (a RETIRED_HOOKS script on any event, stack-register on a RETIRED_STACK_REGISTER_MATCHERS matcher): update drops it.
 export function inspectHooks(settings, home) {
-  const out = { 'guard-git': [], 'guard-files': [], 'owner-go': [], 'stack-register': [], 'stack-dev-bind': [], 'stack-session-end': [], retired: [], unknown: [] };
+  const out = { 'guard-git': [], 'guard-files': [], 'owner-go': [], 'update-notice': [], 'stack-register': [], 'stack-dev-bind': [], 'stack-session-end': [], retired: [], unknown: [] };
   const stack = ourStackGroups(home);
   const expected = {
     'guard-git': { event: 'PreToolUse', matcher: GUARD_GIT_MATCHER, handler: handlerFor(home, 'guard-git') },
     'guard-files': { event: 'PreToolUse', matcher: GUARD_FILES_MATCHER, handler: handlerFor(home, 'guard-files') },
     'owner-go': { event: 'UserPromptSubmit', matcher: undefined, handler: ownerGoHandlerFor(home) },
+    'update-notice': { event: 'SessionStart', matcher: undefined, handler: updateNoticeHandlerFor(home) },
     'stack-register': { event: 'PreToolUse', matchers: STACK_REGISTER_MATCHERS, handler: stack.PreToolUse[0].hooks[0] },
     'stack-dev-bind': { event: 'PostToolUse', matcher: STACK_DEV_BIND_MATCHER, handler: stack.PostToolUse[0].hooks[0] },
     'stack-session-end': { event: 'SessionEnd', matcher: undefined, handler: stack.SessionEnd[0].hooks[0] },
@@ -753,6 +802,7 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   hookCheck('guard-git', true);
   hookCheck('guard-files', expectGuardFiles);
   hookCheck('owner-go', true, 'UserPromptSubmit');
+  hookCheck('update-notice', true, 'SessionStart');
   hookCheck('stack-dev-bind', true, 'PostToolUse');
   hookCheck('stack-session-end', true, 'SessionEnd');
   // stack-register: once PER MATCHER, each exactly once and exact; an entry on any other matcher is not what install writes.

@@ -9,10 +9,14 @@ export function repoRoot(cwd = process.cwd()) {
   return resolve(git(['rev-parse', '--show-toplevel'], { cwd }).trim());
 }
 
+// Upper bound for the one git call every per-repo state path starts from: a hung git (a stalled mount) must not block a synchronous scan for ever.
+// Same bound as the live-work scan's own git call (live-work-scan.mjs GIT_TIMEOUT_MS).
+const GIT_TIMEOUT_MS = 20_000;
+
 // The common git dir is shared by all worktrees of a repo: right place for per-repo,
 // cross-worktree state such as the agent-log queue.
 export function gitCommonDir(cwd = process.cwd()) {
-  const out = git(['rev-parse', '--git-common-dir'], { cwd }).trim();
+  const out = git(['rev-parse', '--git-common-dir'], { cwd, timeoutMs: GIT_TIMEOUT_MS }).trim();
   return resolve(cwd, out);
 }
 

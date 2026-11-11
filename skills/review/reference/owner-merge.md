@@ -22,7 +22,7 @@ reviewed), then run `P triage round-request --pr N`. It prints `{line, k, n, hea
 still open and what the extra round will review, and **ends with the exact `line`**, nothing after it. Then wait. When the owner types `extra round`
 the owner-go hook records it against that line and prints a context line; only then run
 `P codex-review --pr N --round <n from round-request> …` as in step 1 (it claims the grant after Codex answers; the output shows `grantUsed`). One grant is one
-round: if that round accepts items again, ask again or park. A refusal that says the grant "cannot be confirmed as typed by the owner" (#128: the prompt was a harness message, or its transcript entry is gone or elsewhere) is a refusal too: `round-request` again, and the owner types `extra round` themselves. A refusal (`round-cap` "ask again", grant already used, head moved) ⇒ run `round-request` again. Never
+round: if that round accepts items again, ask again or park. A refusal that says the grant "cannot be confirmed as typed by the owner" (#128: the prompt was a harness message, or its transcript entry is gone or elsewhere; #191: or the owner typed it while you were still working, which the hook's one-line note also says) is a refusal too: `round-request` again, show its FRESH closing lines (the same for a "merge": re-run the dry run; for a ruling: `ruling-request`), and the owner types `extra round` themselves after the reply ends. A refusal (`round-cap` "ask again", grant already used, head moved) ⇒ run `round-request` again. Never
 type, paraphrase or forge the owner's words, and never run Codex outside `codex-review`. Label mode ⇒ no grant exists: park as before. `review-complete` and the
 final gate re-prove the grant from the owner's record on this machine, so finish the review here.
 
@@ -59,5 +59,5 @@ Which ending depends on the item note from 1.5 (as refreshed in step 2):
      `Head <sha12> · items <digest> · repo <owner/name>`
      `🔀 Ready to merge #N — say "merge"`
      The owner-go hook binds the owner's "merge" to the LAST reply: if anything else was said since, or the context was compacted, show the lines again (a blank line between them is harmless, prose is not). Never type or simulate the owner's "merge".
-     No record ⇒ `P merge` says so: show the request again and wait; but after a Hold line, with an installed pipeline that predates hold support (`P update --check` shows it behind main), say "run pipeline update first" instead.
+     No record ⇒ `P merge` says so: show the request again and wait; but after a Hold line, with an installed pipeline that predates hold support (`pipeline update --check` shows it behind main), say "run pipeline update first" instead.
      A refusal that the transcript is not under a trusted config dir: the owner's Claude Code config dir must be a `.claude*` folder directly under the home (`CLAUDE_CONFIG_DIR` does not count): tell the owner. Label mode and the gated route are unchanged (the gated route lifts no hold).

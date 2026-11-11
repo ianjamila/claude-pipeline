@@ -27,17 +27,20 @@ const refuse = (error, reasons, extra = {}) => ({ exitCode: 1, output: { ok: fal
 // <log dir>/queue-sweep-notices.log, and on macOS a banner. A failing notifier never undoes a settled record (settleRecord swallows it).
 const appleText = (text) => String(text).replace(/[\u0000-\u001f]/g, ' ').replace(/\\/g, '\\\\').replace(/"/g, '\\"').slice(0, 240);
 
-export function defaultNotify({ env = process.env, platform = process.platform, stderr = process.stderr, spawn = spawnSync } = {}) {
+// `event` names another kind of notice that uses the same three channels (`pipeline-update`: the auto-update job): its own stderr prefix,
+// log file (<event>-notices.log) and banner title, so it is not mistaken for a merge-queue notice. The default is the queue sweep's.
+export function defaultNotify({ env = process.env, platform = process.platform, stderr = process.stderr, spawn = spawnSync, event = 'queue-sweep' } = {}) {
+  const title = event === 'queue-sweep' ? 'claude-pipeline merge queue' : `claude-pipeline ${event.replace(/^pipeline-/, '')}`;
   return (text) => {
-    stderr.write(`queue-sweep: ${text}\n`);
+    stderr.write(`${event}: ${text}\n`);
     try {
       const dir = pruneLogDir(env);
       mkdirSync(dir, { recursive: true });
-      appendFileSync(path.join(dir, 'queue-sweep-notices.log'), `${new Date().toISOString()} ${String(text).replace(/\s+/g, ' ')}\n`);
+      appendFileSync(path.join(dir, `${event}-notices.log`), `${new Date().toISOString()} ${String(text).replace(/\s+/g, ' ')}\n`);
     } catch { /* the stderr line is the notice that matters */ }
     if (platform === 'darwin' && env.PIPELINE_NO_BANNER !== '1') {
       try {
-        spawn('/usr/bin/osascript', ['-e', `display notification "${appleText(text)}" with title "claude-pipeline merge queue"`], { timeout: 5000, stdio: 'ignore' });
+        spawn('/usr/bin/osascript', ['-e', `display notification "${appleText(text)}" with title "${title}"`], { timeout: 5000, stdio: 'ignore' });
       } catch { /* no banner is not a failure */ }
     }
   };
@@ -49,11 +52,13 @@ export function defaultNotify({ env = process.env, platform = process.platform, 
 const registryFile = (env) => path.join(env?.PIPELINE_LOCK_DIR || defaultLockDir(), 'queue-sweep-repos.json');
 const REGISTRY_MAX = 100;
 
-function readRegistry(env) {
+// `onError(text)` (optional) hears about a registry that EXISTS but cannot be read or parsed; an absent one is normal. The result is [] either way.
+function readRegistry(env, onError) {
   try {
     const j = JSON.parse(readFileSync(registryFile(env), 'utf8'));
     return Array.isArray(j?.repos) ? j.repos.filter((r) => typeof r === 'string' && r !== '') : [];
-  } catch {
+  } catch (err) {
+    if (err?.code !== 'ENOENT') onError?.(`the repository registry ${registryFile(env)} cannot be read: ${String(err?.message ?? err).split('\n')[0].slice(0, 160)}`);
     return [];
   }
 }
@@ -81,13 +86,16 @@ export function registerRepo({ root, env = process.env }) {
   }
 }
 
-export function knownRepos({ home = os.homedir(), env = process.env } = {}) {
+// `onError(text)` (optional, for the live-work scan, which must not read "could not look" as "nothing there"): called for a stacks config or a registry
+// that exists but cannot be parsed, and for a directory that exists where git fails for any reason but "not a git repository". The returned list is the same with or without it.
+export function knownRepos({ home = os.homedir(), env = process.env, onError } = {}) {
   const found = [];
   try {
     const cfg = loadMachineConfig(stackFiles(stacksRoot(env, home)).config, { home });
     if (cfg.status === 'ok') found.push(...cfg.repos);
+    else if (cfg.status === 'invalid') onError?.(`the stacks config cannot be read: ${cfg.error}`);
   } catch { /* no stacks config: only the registry */ }
-  found.push(...readRegistry(env));
+  found.push(...readRegistry(env, onError));
   const seen = new Set();
   const out = [];
   for (const dir of found) {
@@ -95,8 +103,11 @@ export function knownRepos({ home = os.homedir(), env = process.env } = {}) {
     let key;
     try {
       key = canon(gitCommonDir(dir)); // canon is realpath.native: the on-disk spelling (short names expanded), so one repository reached two ways gets one key
-    } catch {
-      continue; // not a git repository (any more)
+    } catch (err) {
+      // not a git repository (any more): skipped silently. Any other failure (dubious ownership, a corrupt repository, git killed or timed out) means
+      // this repository was NOT looked at, which the live-work scan must not read as "nothing running there".
+      if (!(err?.code === 128 && !err?.abnormal && /not a git repository/i.test(String(err?.stderr ?? '')))) onError?.(`cannot tell whether ${dir} is a git repository (git rev-parse --git-common-dir): ${msg(err)}`);
+      continue;
     }
     if (seen.has(key)) continue;
     seen.add(key);
