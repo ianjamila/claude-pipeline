@@ -54,13 +54,23 @@ export { accountHome };
 
 export const ownerGoDir = (home = accountHome()) => path.join(home, ...OWNER_GO_REL.split('/'));
 
+// #190.3b: the owner copies an answer out of a terminal and the prompt glyph comes with it ("❯ R4-B1: reject", "> merge"). answerBody is the words every answer parser reads: the prompt
+// trimmed, with at most ONE leading glyph from ❯ › > $ removed when at least one space follows it, and only on a single-line prompt. `>merge` and `$5 …` keep their first character, two glyphs
+// leave one (so the parser refuses it), a glyph mid-line is never touched, and the words after the glyph must still be the whole answer. promptProvenance still proves the owner typed the
+// entry, and the glyph adds no word, so it grants no authority the bare words did not have. Callers: parseApproval, parseRoundGrant, rulingsIn and the PAIRS_ONLY nudge sites. The stored
+// prompt and the --owner-quote comparison stay verbatim (the record is the audit trail); a length cap applies to the body, after the strip.
+export const answerBody = (s) => {
+  const t = String(s ?? '').trim();
+  return /[\r\n]/.test(t) ? t : t.replace(/^[❯›>$][ \t ]+/, '').trim();
+};
+
 // The words that may follow "merge" in an approval besides its targets (#N, N, a head prefix).
 const FILLER = /^(?:and|it|both|all|them|these|those|please|pls|now|go|ok|okay|thanks|thank|you|thx|ty)$/i;
 
 // A prompt that approves: "merge", "merge #58", "merge 1318 1319", "Merge it.", "merge a1b2c3d4e5f6". Anything else is not an
 // approval: "do not merge", "merge?", "merge later", "merge after CI", "why merge". Returns null or { prs, shas }.
 export function parseApproval(prompt) {
-  const t = String(prompt ?? '').trim();
+  const t = answerBody(prompt);
   const m = /^merge(?![A-Za-z0-9_-])([\s\S]*)$/i.exec(t);
   if (!m) return null;
   const rest = m[1];
@@ -739,7 +749,7 @@ export function rulingNudge(input) {
   try {
     if (notOwnerPrompt(input) || !SESSION_RE.test(String(input?.session_id ?? ''))) return null;
     const answer = input?.prompt;
-    if (typeof answer !== 'string' || answer.length > RULING_PROMPT_MAX || !PAIRS_ONLY.test(answer.replace(/\s+/g, ' ').trim())) return null;
+    if (typeof answer !== 'string' || answerBody(answer).length > RULING_PROMPT_MAX || !PAIRS_ONLY.test(answerBody(answer).replace(/\s+/g, ' ').trim())) return null;
     return notOwnerWords(input, String(input?.transcript_path ?? '')) ? null : RULING_NUDGE;
   } catch {
     return null;
@@ -755,9 +765,10 @@ export function queuedNudge(input) {
     if (notOwnerPrompt(input)) return null;
     const answer = input?.prompt;
     if (typeof answer !== 'string') return null;
+    const body = answerBody(answer); // (#190.3b: the caps apply to the words after a pasted glyph)
     const readsAsAnswer = parseApproval(answer) !== null
-      || (answer.length <= ROUND_GRANT_PROMPT_MAX && parseRoundGrant(answer) !== null)
-      || (answer.length <= RULING_PROMPT_MAX && PAIRS_ONLY.test(answer.replace(/\s+/g, ' ').trim()));
+      || (body.length <= ROUND_GRANT_PROMPT_MAX && parseRoundGrant(answer) !== null)
+      || (body.length <= RULING_PROMPT_MAX && PAIRS_ONLY.test(body.replace(/\s+/g, ' ').trim()));
     if (!readsAsAnswer || notOwnerWords(input, String(input?.transcript_path ?? ''))) return null;
     return queuedAnswer(input) ? QUEUED_NUDGE : null;
   } catch {
@@ -1037,7 +1048,7 @@ const SEP = '(?:\\s*[,;.]\\s*|\\s+and\\s+|\\s+)';
 const PAIR = `${ITEM}\\s*[:=–—-]?\\s*${DECISION}`;
 const PAIRS_ONLY = new RegExp(`^${PAIR}(?:${SEP}${PAIR})*[.!]?$`, 'i');
 export function rulingsIn(answer, askedIds) {
-  const a = String(answer ?? '').replace(/\s+/g, ' ').trim();
+  const a = answerBody(answer).replace(/\s+/g, ' ').trim();
   const asked = (askedIds ?? []).map((x) => String(x).toUpperCase());
   const out = new Map();
   if (!PAIRS_ONLY.test(a)) return out;
@@ -1115,7 +1126,7 @@ export function presentedRoundRequest(text) {
 // after the opener are targets (#N = a PR, a bare integer = the PR or the round, resolved against the request line by the recorder) and
 // filler only; "extra round?", "no extra round", "grant round 4 after CI", "why extra round" grant nothing. Returns null or { prs, numbers }.
 export function parseRoundGrant(prompt) {
-  const t = String(prompt ?? '').trim();
+  const t = answerBody(prompt);
   const m = /^(?:extra|grant)\s+(?:review\s+)?round(?![A-Za-z0-9_-])([\s\S]*)$/i.exec(t);
   if (!m) return null;
   const rest = m[1];
