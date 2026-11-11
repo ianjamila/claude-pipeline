@@ -1,8 +1,8 @@
 // Cross-version test runner: Node 20 has no --test globbing and cmd.exe does not expand globs,
 // so list the test files ourselves and hand them to node --test.
 //   node scripts/test.mjs [--shard I/N] [name-substring | exact-file.test.mjs ...]
-// A name ending in .test.mjs selects exactly that file (no substring match) and exits 2 when no such file exists;
-// any other name is a substring filter (scripts/lib/select-tests.mjs).
+// A name ending in .test.mjs selects exactly that file (no substring match); any other name is a substring filter
+// (scripts/lib/select-tests.mjs). A name of either kind that matches no file exits 2, so a rename cannot quietly shrink a check.
 // --shard I/N runs bin I of N (balanced by measured time, scripts/lib/test-weights.json, bytes for unmeasured files;
 // scripts/lib/shard.mjs); the Windows CI job uses 3 shards.
 // CP_TEST_TIMES=<path> also records each file's wall-clock time into <path> as { file: { spanMs } }
@@ -31,7 +31,8 @@ for (let k = 0; k < args.length; k++) {
 }
 const selected = selectTestFiles(readdirSync(testDir), only);
 if (selected.missing.length > 0) {
-  console.error(`no test file named ${selected.missing.join(', ')} in test/ (an argument ending in .test.mjs must match a file name exactly)`);
+  const describe = (o) => (o.endsWith('.test.mjs') ? `${o} (exact file name)` : `${o} (substring filter)`);
+  console.error(`no test file in test/ matches: ${selected.missing.map(describe).join(', ')}`);
   process.exit(2);
 }
 let names = selected.names;

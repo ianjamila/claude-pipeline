@@ -25,8 +25,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PROJECT = 'claude-pipeline'; // must match `project:` in .claude/pipeline.yml (names the dedicated Supabase and its lock)
 
 // ---- EDIT THIS: the steps for this project ----------------------------------------------------------------------------
-// claude-pipeline's own verify: the full node:test suite. Quick = the skills-commands, docs-facts and *config* test files
-// (substring match: config, stacks-config, worktree-prune-config-fallback) plus test/cli.test.mjs; about 6 s on a Mac.
+// claude-pipeline's own verify: the full node:test suite. Quick = exactly the files named in quickCmd (skills-commands,
+// docs-facts, config, stacks-config and cli, all by exact name; a name that matches no file exits 2); about 2 s on a Mac.
 // The installer round trip is CI-only (.github/scripts/installer-round-trip.sh): install.mjs refuses to run inside a
 // Claude Code session, which is where this script usually runs.
 // name      unique, letters/digits/./_/- (it names the log file)
@@ -43,7 +43,7 @@ const PROJECT = 'claude-pipeline'; // must match `project:` in .claude/pipeline.
 //           and `log` (default: the reason) is written to .verify/logs/<step>.log. `git` is the report's git block. It must
 //           fail closed: a throw or any other answer runs the step and records `skipCheck: skip check failed: <why>`.
 const STEPS = [
-  { name: 'tests', cmd: 'node scripts/test.mjs', quick: true, quickCmd: 'node scripts/test.mjs skills-commands docs-facts config cli.test.mjs' },
+  { name: 'tests', cmd: 'node scripts/test.mjs', quick: true, quickCmd: 'node scripts/test.mjs skills-commands.test.mjs docs-facts.test.mjs config.test.mjs stacks-config.test.mjs cli.test.mjs' },
 ];
 // ---- end of the project-specific part ---------------------------------------------------------------------------------
 

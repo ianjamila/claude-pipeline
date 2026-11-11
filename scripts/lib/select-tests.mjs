@@ -2,8 +2,8 @@
 // without starting a suite.
 //   an argument ending in .test.mjs names exactly that file (`cli.test.mjs` must not also pick ci-wait-cli.test.mjs);
 //   any other argument is a substring filter, as before.
-// `names` keeps the order of `all`; `missing` lists the exact arguments that matched no file (a typo must not quietly
-// shrink a check).
+// `names` keeps the order of `all`; `missing` lists, in argument order, every argument that matched no file, exact or
+// substring (a typo or a renamed file must not quietly shrink a check).
 export function selectTestFiles(all, only) {
   const files = all.filter((f) => f.endsWith('.test.mjs'));
   if (only.length === 0) return { names: files, missing: [] };
@@ -12,6 +12,6 @@ export function selectTestFiles(all, only) {
   const substrings = only.filter((o) => !isExact(o));
   return {
     names: files.filter((f) => exact.includes(f) || substrings.some((o) => f.includes(o))),
-    missing: exact.filter((o) => !files.includes(o)),
+    missing: only.filter((o) => (isExact(o) ? !files.includes(o) : !files.some((f) => f.includes(o)))),
   };
 }
