@@ -91,6 +91,13 @@ function world(t, { fable = true, findings = NO_FINDINGS } = {}) {
       writeFileSync(p, typeof content === 'string' ? content : JSON.stringify(content));
       return p;
     },
+    // Rewrites round 1's stored arbiter data (a test's way to put a fix-verify brief on the round, which this one-round world cannot reach by itself).
+    patchArbiter(over) {
+      const file = join(repo.dir, '.review', 'state.json');
+      const st = JSON.parse(readFileSync(file, 'utf8'));
+      st.rounds[0].arbiter = { ...st.rounds[0].arbiter, ...over };
+      writeFileSync(file, JSON.stringify(st, null, 2));
+    },
     state: () => JSON.parse(readFileSync(join(repo.dir, '.review', 'state.json'), 'utf8')),
     stateText: () => readFileSync(join(repo.dir, '.review', 'state.json'), 'utf8'),
     roundFile: (name) => join(repo.dir, '.review', 'round-1', name),
@@ -105,7 +112,7 @@ function world(t, { fable = true, findings = NO_FINDINGS } = {}) {
     },
     needed(extra = {}) { return w.cli(['arbiter', 'needed', '--round', '1'], extra); },
     // A Fable transcript under a loose folder (found with --projects-dir) that answers the input of the last successful `needed`.
-    install(needed, { models = [FLOOR], version, agentId = 'a1', answer, projects = join(scratch, `projects-${agentId}`) } = {}) {
+    install(needed, { models = [FLOOR], version, agentId = 'a1', answer, effort = 'high', agentType = 'arbiter', projects = join(scratch, `projects-${agentId}`) } = {}) {
       const dir = join(projects, '-tmp-work', 'session-1', 'subagents');
       mkdirSync(dir, { recursive: true });
       const text = fenced(answer ?? (fable ? { rulings: [], findings: [] } : { rulings: [{ id: 'R1-S1', ruling: 'ACCEPT', confidence: 'high', reasoning: 'src/a.js:12 really is wrong.' }] }));
@@ -114,13 +121,13 @@ function world(t, { fable = true, findings = NO_FINDINGS } = {}) {
       models.forEach((model, i) => {
         const last = i === models.length - 1;
         lines.push({
-          type: 'assistant', isSidechain: true, agentId: 'a1', requestId: `req_${i}`, effort: 'high', perTurnEffort: 'high', ...stamp,
+          type: 'assistant', isSidechain: true, agentId: 'a1', requestId: `req_${i}`, effort, perTurnEffort: effort, ...stamp,
           message: { model, id: `msg_${i}`, role: 'assistant', stop_reason: last ? 'end_turn' : 'tool_use', content: last ? [{ type: 'text', text }] : [{ type: 'thinking', thinking: 'weighing', signature: 'sig' }] },
           uuid: `a-${i}`,
         });
       });
       writeFileSync(join(dir, `agent-${agentId}.jsonl`), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
-      writeFileSync(join(dir, `agent-${agentId}.meta.json`), JSON.stringify({ toolUseId: 'toolu_01', spawnDepth: 1, agentType: 'arbiter', description: needed.tag }));
+      writeFileSync(join(dir, `agent-${agentId}.meta.json`), JSON.stringify({ toolUseId: 'toolu_01', spawnDepth: 1, agentType, description: needed.tag }));
       return projects;
     },
     apply(projects, extra = {}) { return w.cli(['arbiter', 'apply', '--round', '1', '--projects-dir', projects], extra); },
@@ -167,6 +174,47 @@ test('arbiter needed --full stopped by a stale terminal keeps the forced full br
   assertExit(retry, 0, retry.stdout + retry.stderr);
   assert.deepEqual([retry.json.brief, retry.json.effort, retry.json.agent, retry.json.briefReason], ['full', 'high', 'arbiter', 'forced by --full']);
   assert.equal(w.state().rounds[0].arbiter.forcedFull, true);
+});
+
+const FIX = { brief: 'fix-verify', effort: 'medium', agent: 'arbiter-fix' };
+
+test('arbiter needed --full stopped by a stale terminal on a fix-verify round drops the stored fix-verify input: the earlier arbiter-fix pass proves nothing, the retry is full and an arbiter@high pass proves it', (t) => {
+  const w = world(t).prepare();
+  const first = w.needed(claudeCode(w.scratch, FRESH));
+  assertExit(first, 0, first.stdout + first.stderr);
+  w.patchArbiter(FIX); // the round now stores a fix-verify brief, as a fix round does
+  const earlier = w.install(first.json, { effort: 'medium', agentType: 'arbiter-fix', agentId: 'fix1' });
+  const stopped = w.cli(['arbiter', 'needed', '--round', '1', '--full'], claudeCode(w.scratch, STALE));
+  assertExit(stopped, 1, stopped.stdout + stopped.stderr);
+  const kept = w.state().rounds[0].arbiter;
+  assert.equal(kept.forcedFull, true);
+  assert.deepEqual([kept.brief, kept.effort, kept.agent, kept.inputDigest, kept.tag, kept.items, kept.diffPath], new Array(7).fill(undefined), 'the stale fix-verify input is gone');
+  const refused = w.apply(earlier, claudeCode(w.scratch, FRESH));
+  assert.notEqual(refused.code, 0, refused.stdout);
+  assert.equal(w.state().rounds[0].arbiter.proofOk, undefined, 'the earlier arbiter-fix pass did not prove the round');
+  const retry = w.needed(claudeCode(w.scratch, FRESH));
+  assertExit(retry, 0, retry.stdout + retry.stderr);
+  assert.notEqual(retry.json.done, true);
+  assert.deepEqual([retry.json.brief, retry.json.effort, retry.json.agent, retry.json.briefReason], ['full', 'high', 'arbiter', 'forced by --full']);
+  const proven = w.apply(w.install(retry.json, { agentId: 'full1' }), claudeCode(w.scratch, FRESH));
+  assertExit(proven, 0, proven.stdout + proven.stderr);
+  assert.equal(w.state().rounds[0].arbiter.proofOk, true);
+});
+
+test('arbiter apply refuses a round that stores forcedFull beside a fix-verify brief (exit 1 forced-full-pending): the arbiter-fix proof is never recorded', (t) => {
+  const w = world(t).prepare();
+  const first = w.needed(claudeCode(w.scratch, FRESH));
+  assertExit(first, 0, first.stdout + first.stderr);
+  w.patchArbiter({ ...FIX, forcedFull: true });
+  const earlier = w.install(first.json, { effort: 'medium', agentType: 'arbiter-fix' });
+  const refused = w.apply(earlier, claudeCode(w.scratch, FRESH));
+  assertExit(refused, 1, refused.stdout + refused.stderr);
+  assert.equal(refused.json.error, 'forced-full-pending');
+  assert.equal(w.state().rounds[0].arbiter.proofOk, undefined);
+  const again = w.needed(claudeCode(w.scratch, FRESH));
+  assertExit(again, 0, again.stdout + again.stderr);
+  assert.notEqual(again.json.done, true, 'needed does not answer done for an unproven round');
+  assert.deepEqual([again.json.brief, again.json.agent], ['full', 'arbiter']);
 });
 
 test('arbiter needed without --full on a stale-stopped round stores no forced choice', (t) => {

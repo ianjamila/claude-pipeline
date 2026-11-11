@@ -47,7 +47,7 @@ export const meta = {
     '    `full` / `high` / `arbiter` (the whole review job). Fable still runs on every Fable round either way. The choice is stored on the round (arbiter.brief / briefReason / effort / agent) and `apply` proves against the',
     '    stored one; running `needed` again recomputes and re-stores it (the digest and tag change with the brief), except that a brief forced by --full is kept (below)',
     '  briefReason (mode review): why that brief, e.g. `fix round: round 1 accepted 1 item(s) ...`, `synthetic review base ...`, `the round\'s own range is medium risk ...`, or the message of an error caught while assessing the range',
-    '  --full: force the full brief (`full` / `high` / `arbiter`, briefReason `forced by --full`) on a Fable review round `needed` would class as fix-verify; the stored brief and the digest change with it. For when `arbiter-fix` cannot be started or the owner wants a full review. It sticks: the round stores arbiter.forcedFull, also when a stale terminal stops the call, so a later plain `needed` (the retry after a restart, or after an unproven or malformed pass) keeps the full brief, briefReason still `forced by --full`, until a pass is proven',
+    '  --full: force the full brief (`full` / `high` / `arbiter`, briefReason `forced by --full`) on a Fable review round `needed` would class as fix-verify; the stored brief and the digest change with it. For when `arbiter-fix` cannot be started or the owner wants a full review. It sticks: the round stores arbiter.forcedFull, also when a stale terminal stops the call, so a later plain `needed` (the retry after a restart, or after an unproven or malformed pass) keeps the full brief, briefReason still `forced by --full`, until a pass is proven. The stop drops the stored input (fix-verify brief, digest, tag), so an earlier arbiter-fix pass cannot prove the round and the retry writes a fresh full input; `apply` also refuses (exit 1 forced-full-pending) a round that stores forcedFull beside a fix-verify brief',
     '  mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied',
     '    (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that)',
     '  mode review in a terminal whose Claude Code build is older than the installed one (stale): exit 1 {ok:false, error: stale-terminal, restartRequired: true,',
@@ -154,6 +154,8 @@ function needed(rest, ctx) {
 // What the round records when its arbiter step stops (round.arbiter.failure): kept beside the other arbiter data so it travels in the triage comment.
 // A zero-item Fable round has no item to carry the cause, so this is the only place it is visible.
 const failureOf = (cause, advice) => ({ cause, advice: advice ?? null, at: new Date().toISOString() });
+// A stale-terminal stop that records a forced --full keeps only the failure and the forced choice: the earlier input (and the brief it was written for) is dropped.
+const forcedStop = (arbiter) => ({ forcedFull: true, ...(arbiter?.failure ? { failure: arbiter.failure } : {}) });
 const withFailure = (state, n, failure) => patchRound(state, n, { arbiter: { ...(findRound(state, n).arbiter ?? {}), failure } });
 
 // The advice a floor failure carries (judgeFloor gives one for every cause: stale, unreadable registry, unrecognised id).
@@ -327,7 +329,8 @@ async function neededLocked(values, n, root, ctx) {
       const advice = `this terminal runs Claude Code ${claudeCode.running} but ${claudeCode.installed} is installed: restart this terminal, then run \`arbiter needed\` again`;
       // A --full given to this call survives the stop: the retry after the restart is a plain `needed` and must still be full.
       const stopped = withFailure(state, n, failureOf('stale-terminal', advice));
-      saveState(root, forcedFull ? patchRound(stopped, n, { arbiter: { ...findRound(stopped, n).arbiter, forcedFull: true } }) : stopped);
+      // The stored fix-verify brief, digest, tag and input go: they belong to the choice --full overrules, so an earlier arbiter-fix pass must not prove this round and the retry writes a fresh full input.
+      saveState(root, forcedFull ? patchRound(stopped, n, { arbiter: forcedStop(findRound(stopped, n).arbiter) }) : stopped);
       return { exitCode: EXIT.FAILED, output: { ok: false, error: 'stale-terminal', restartRequired: true, claudeCode, advice } };
     }
   }
@@ -475,6 +478,10 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
   // swap a BLOCKING finding for a milder one). Re-reviewing means a new round.
   if (stored.mode === 'review' && stored.proofOk === true) {
     throw new Fail(EXIT.USAGE, { ok: false, error: 'already-applied', message: `round ${n} already has a proven Fable review; it is not applied again` });
+  }
+  // A forced --full overrules a stored fix-verify brief (state saved before the stop dropped it, or edited): an arbiter-fix pass must not prove the round.
+  if (stored.forcedFull === true && stored.brief === BRIEF_FIX_VERIFY) {
+    throw new Fail(EXIT.FAILED, { ok: false, error: 'forced-full-pending', message: `round ${n} was forced to the full brief (--full) but its stored input is a fix-verify one: run \`arbiter needed\` again, then prove the full pass` });
   }
   // What the round's STORED brief expects of the proof (never recomputed here): the agent, and the effort it ran at. A round stored without a brief is full.
   const expectation = expectationOf(stored);

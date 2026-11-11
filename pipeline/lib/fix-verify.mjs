@@ -19,9 +19,9 @@ export const BRIEFS = Object.freeze({
 export const EFFORT_LEVELS = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']);
 export const effortsAtLeast = (min) => (EFFORT_LEVELS.includes(min) ? EFFORT_LEVELS.slice(EFFORT_LEVELS.indexOf(min)) : [min]);
 
-// What a round's stored arbiter data expects. Legacy state (no `brief`), an unknown value or a brief on a dispute-mode input is `full`.
+// What a round's stored arbiter data expects. Legacy state (no `brief`), an unknown value a brief on a dispute-mode input or a forced --full (arbiter.forcedFull) is `full`.
 export function expectationOf(arbiter) {
-  return arbiter?.brief === BRIEF_FIX_VERIFY && arbiter.mode === 'review' ? BRIEFS[BRIEF_FIX_VERIFY] : BRIEFS[BRIEF_FULL];
+  return arbiter?.brief === BRIEF_FIX_VERIFY && arbiter.mode === 'review' && arbiter.forcedFull !== true ? BRIEFS[BRIEF_FIX_VERIFY] : BRIEFS[BRIEF_FULL];
 }
 
 // The effort(s) the proof accepts for an expectation: `high` exactly for full; `medium` or higher for fix-verify.

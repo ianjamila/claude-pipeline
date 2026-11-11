@@ -479,6 +479,7 @@ test('fix-verify lib: expectations, accepted efforts and the state-only conditio
   assert.equal(expectationOf({ brief: 'bogus', mode: 'review' }).brief, 'full');
   assert.equal(expectationOf({ brief: 'fix-verify', mode: 'dispute' }).brief, 'full', 'a dispute input is never a fix-verify one');
   assert.equal(expectationOf({ brief: 'fix-verify', mode: 'review' }).brief, 'fix-verify');
+  assert.equal(expectationOf({ brief: 'fix-verify', mode: 'review', forcedFull: true }).brief, 'full', 'a forced --full is never a fix-verify expectation');
 
   const acc = { final: { decision: 'ACCEPT', needsHuman: false } };
   const rounds = [
