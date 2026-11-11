@@ -285,3 +285,66 @@ test('R2-F7: an interpreter\'s inline code that writes a hook surface file is re
   assert.equal(bash(`python3 -c "print(open('.claude/settings.json').read())"`), 'allow');
   assert.equal(bash('git add .claude/settings.json'), 'allow');
 });
+
+// ---- round 3 (R3-B1, R3-B2, R3-F1, R3-F2) -----------------------------------------------------------------------------------------------
+
+test('R3-B1: inline code that names a hook surface file in its program text is refused whatever it does (link, copy, sendfile); a read, or a program that names none, stays allowed', () => {
+  for (const cmd of [
+    `python3 -c "import os; os.link('/tmp/payload','.claude/settings.local.json')"`,
+    `python3 -c "import os; fd=os.open('.claude/settings.local.json',os.O_WRONLY|os.O_CREAT|os.O_TRUNC,384); os.sendfile(fd,os.open('/tmp/payload',os.O_RDONLY),0,4096)"`,
+    `node -e "require('fs').linkSync('/tmp/payload','.claude/settings.json')"`,
+    `python3 -c "import shutil; shutil.copy('/tmp/payload', '.claude/settings.local.json')"`,
+    `python3 <<'PY'\nimport os\nos.link('/tmp/payload', '.claude/settings.local.json')\nPY`,
+    `echo "import os; os.link('/tmp/payload', '.claude/settings.local.json')" | python3`,
+    `python3 - <<< "import os; os.link('/tmp/payload', '.claude/skills/s/SKILL.md')"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `cat .claude/settings.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'`,
+    `python3 -c "print(open('.claude/settings.json').read())"`,
+    `python3 -c "import os; os.link('/tmp/a','/tmp/b')"`,
+    `node -e "console.log(1)"`,
+    `git add .claude/settings.json`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+test('R3-B2: a plugin install or manifest location past the old 500 / 50 / 100 limits is still a hook surface', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-click-hooks-'));
+  fs.mkdirSync(path.join(home, '.claude', 'plugins'), { recursive: true });
+  const hooked = '---\nname: n\nhooks:\n  Stop: []\n---\n';
+  const make = (name) => { const d = path.join(home, 'elsewhere', name); fs.mkdirSync(path.join(d, '.claude-plugin'), { recursive: true }); return d; };
+  const opts = { home, platform: 'linux', env: {}, realpath: (p) => p, existsSync: (p) => fs.existsSync(p), readText: () => null };
+  const write = (p) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: p, content: hooked }, cwd: '/repo' }, opts).decision;
+  const list = (plugins) => fs.writeFileSync(path.join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({ plugins }));
+  // the 56th installation of one plugin
+  const many = make('many');
+  const entries = Array.from({ length: 60 }, (_, i) => ({ installPath: i === 55 ? many : path.join(home, 'elsewhere', `none${i}`) }));
+  list({ 'p@m': entries });
+  assert.equal(write(path.join(many, 'skills', 's', 'SKILL.md')), 'deny', 'installation 56 of a plugin');
+  // the 511th plugin
+  const last = make('last');
+  list(Object.fromEntries(Array.from({ length: 520 }, (_, i) => [`p${i}@m`, [{ installPath: i === 510 ? last : path.join(home, 'elsewhere', `n${i}`) }]])));
+  assert.equal(write(path.join(last, 'skills', 's', 'SKILL.md')), 'deny', 'plugin 511 of the list');
+  // the 116th location a manifest names
+  const m = make('manifest');
+  list({ 'p@m': [{ installPath: m }] });
+  fs.writeFileSync(path.join(m, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'p', skills: Array.from({ length: 120 }, (_, i) => `./loc${i}`) }));
+  assert.equal(write(path.join(m, 'loc115', 'x', 'SKILL.md')), 'deny', 'location 116 of a manifest');
+  assert.equal(write(path.join(home, 'elsewhere', 'unlisted', 'SKILL.md')), 'allow');
+});
+
+test('R3-F1: git log / show / diff --output names a file it writes; a curl / wget option cluster with an attached value names it too', () => {
+  for (const cmd of [
+    'git log -1 --format=%B --output=.claude/settings.local.json', 'git show HEAD --output .claude/settings.json', 'git diff --output=.claude/skills/s/SKILL.md',
+    'curl -so.claude/settings.local.json https://example.test/x', 'wget -qO.claude/settings.json https://example.test/x', 'curl -fsSLo.claude/settings.local.json https://example.test/x',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of ['git log --oneline', 'git diff --stat', 'git log -1 --output=/tmp/out.txt', 'curl -so /tmp/x https://example.test/x', 'curl -so/tmp/x https://example.test/x', 'cp a.md docs/']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+test('R3-F2: a literal .claude-<name> folder, a substitution that is a whole file name, and a nested ${..${..}} are refused as possible hook surfaces', () => {
+  for (const cmd of [
+    'cp /tmp/h.md ~/.claude-eaglewatch/agents/revie?er.md', 'cp /tmp/h.md /home/u/.claude-eaglewatch/commands/n*/x.md', 'cp /tmp/c.json .claude-eaglewatch/settings.loca?.json',
+    'cp /tmp/c.json .claude/$(cat /tmp/name)', 'cp /tmp/c.json ".claude/$F"', 'cp /tmp/c.json "$(echo .claude/settings.local.json)"', 'cp /tmp/c.json .claude/`cat /tmp/name`',
+    'cp /tmp/c.json .claude/${A:-${B}}settings.json', 'cp /tmp/c.json ".claude/${A:-${B:-x}}"',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of ['cp /tmp/c.json "$DEST"', 'cp /tmp/c.json "$OUT/readme.md"', 'cp /tmp/c.json $(pwd)/settings.json', 'cp /tmp/c.json docs/${A:-${B}}x.md', 'cp a.md docs/', 'cp /tmp/c.json src/$F']) assert.equal(bash(cmd), 'allow', cmd);
+});
