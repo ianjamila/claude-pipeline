@@ -2948,15 +2948,22 @@ function snapshotShell(ctx) {
 // ---- Bash --------------------------------------------------------------------------------------------
 
 const evaluateBashForFilesChecked = failClosed(evaluateBashForFilesUnchecked);
-// The `shell` option names the TOOL's shell and belongs to the outermost call only. Every re-entry (a script, a startup file, a sourced file, a `bash -c` string, a cd re-run ...) is a call made while
-// another is running, so it is forced to Bash here, once, instead of at each call site (one of which, the implicit startup file, spreads the caller's options with `_depth: 0`).
-// Synchronous code, so a plain counter is exact; the same-text retries below call evaluateBashForFilesUnchecked directly and keep the tool's shell.
+// The `shell` option names the TOOL's shell and belongs to the outermost call only. Every re-entry that judges TEXT FROM ANOTHER SOURCE (a script, a startup file, a sourced file, a `bash -c` string ...) is a
+// call made while another is running, so it is forced to Bash here, once, instead of at each call site (one of which, the implicit startup file, spreads the caller's options with `_depth: 0`).
+// Synchronous code, so a plain counter is exact. A re-run of the SAME top-level text with another working directory (the unknown-cd run) is no such source: it goes through evaluateSameText
+// below, which keeps the tool's shell (R9-B1); the retries in evaluateBashForFilesUnchecked call it directly and keep it too.
 let evalNesting = 0;
 export const evaluateBashForFiles = (command, opts = {}) => {
   const nested = evalNesting > 0;
   evalNesting++;
   try { return evaluateBashForFilesChecked(command, nested && opts.shell !== 'bash' ? { ...opts, shell: 'bash' } : opts); } finally { evalNesting--; }
 };
+// The same text judged again with other options (a cwd assumed, writes only): what the tool's shell reads is unchanged, so `opts.shell` stays as the caller has it (the outermost call's tool shell, or
+// 'bash' already inside a nested one). Every nested call this makes still goes through evaluateBashForFiles and is forced to Bash.
+function evaluateSameText(command, opts) {
+  evalNesting++;
+  try { return evaluateBashForFilesChecked(command, opts); } finally { evalNesting--; }
+}
 // Why: see evaluateGitCommand: the first (outermost) call owns the BASH rewrite record; a text that binds BASH after another was rewritten makes the verdict stale, so the line is judged again with the rewrite off.
 function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (!opts._bashState) {
@@ -3452,7 +3459,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const at = ctx.frames.indexOf(frame);
     for (const d of unique([...assumedCwds(ctx), ...below])) {
       countCdRun(ctx.budget);
-      const r = evaluateBashForFiles(command, { ...opts, cwd: d, _assumedCwd: true, _writesOnly: true, _unknownCwd: false, _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
+      const r = evaluateSameText(command, { ...opts, cwd: d, _assumedCwd: true, _writesOnly: true, _unknownCwd: false, _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
       if (r.decision === 'deny') return deny(`after a cd into a directory known only at run time, ${r.reason} (judged as if the directory were ${d})`);
     }
   }
