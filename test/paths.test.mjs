@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { toPosix, expandHome, isInside, samePath, safeTimestamp } from '../pipeline/lib/paths.mjs';
+import { toPosix, expandHome, isInside, samePath, sameSpelling, safeTimestamp } from '../pipeline/lib/paths.mjs';
 
 test('toPosix replaces every backslash', () => {
   assert.equal(toPosix('a\\b\\c'), 'a/b/c');
@@ -129,6 +129,21 @@ test('samePath: folders differing only by case follow the file system, not the p
     const link = path.join(dir, 'link');
     fs.symlinkSync(lower, link);
     assert.equal(samePath(lower, link), true, 'an alias reaches the same folder');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// The hook guards compare thousands of pairs against a fake file system: sameSpelling is samePath without the disk (no stat, no symlink following).
+test('sameSpelling compares the normalised spelling only and never reads the disk', () => {
+  assert.equal(sameSpelling('/a/b/', '/a/x/../b', 'linux'), true);
+  assert.equal(sameSpelling('/a/B', '/a/b', 'linux'), false);
+  assert.equal(sameSpelling('/a/B', '/a/b', 'darwin'), true);
+  assert.equal(sameSpelling('C:\\a\\b', 'c:/a/b', 'win32'), true);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cp-spelling-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'work'));
+    fs.symlinkSync(path.join(dir, 'work'), path.join(dir, 'link'));
+    assert.equal(sameSpelling(path.join(dir, 'work'), path.join(dir, 'link')), false, 'an alias is another spelling here (samePath follows it)');
+    assert.equal(samePath(path.join(dir, 'work'), path.join(dir, 'link')), true);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

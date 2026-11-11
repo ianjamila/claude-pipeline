@@ -62,6 +62,12 @@ export function samePath(a, b, platform = process.platform) {
     const y = identityOf(normalise(b, platform, false));
     if (x !== null && y !== null && !(x === 'missing' && y === 'missing')) return x === y;
   }
+  return sameSpelling(a, b, platform);
+}
+
+// The spelling alone: the same normalised (on macOS / Windows also case-folded) path, no disk read. For a policy engine that judges text against a fake or
+// injected file system and compares many pairs (the hook guards make 500k+ comparisons in one test file; samePath's two stats each made them 3-5x slower on Linux).
+export function sameSpelling(a, b, platform = process.platform) {
   return normalise(a, platform) === normalise(b, platform);
 }
 
