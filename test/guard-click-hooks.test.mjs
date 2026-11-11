@@ -153,7 +153,8 @@ test('R1-B1: a staged copy onto a settings file (cp / mv / cat > from a file) is
     assert.equal(bash(cmd, files), 'allow', cmd);
   }
   // a source that cannot be read, or that the line itself builds with a program
-  assert.equal(bash('cp /tmp/missing.json /repo/.claude/settings.local.json', files), 'deny');
+  assert.equal(bash('cp /tmp/missing.json /repo/.claude/settings.local.json', files), 'allow', 'a source that is not there cannot be copied');
+  assert.equal(bash('echo \'{"hooks":{}}\' > /tmp/m.json && cp /tmp/m.json /repo/.claude/settings.local.json', files), 'deny', 'a source the line itself writes');
   assert.equal(bash("jq '.a=1' /tmp/p.json > /tmp/x && mv /tmp/x /repo/.claude/settings.local.json", files), 'deny');
   assert.equal(bash('node /tmp/gen.mjs > /repo/.claude/settings.local.json', files), 'deny');
   // another file type: the same for a skill's front matter, a folder target, a glob target

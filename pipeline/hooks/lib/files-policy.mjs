@@ -572,7 +572,7 @@ function hookSurfaceBashReason(cmds, frame, ctx, writesOf) {
       for (const w of words) {
         const e = frame.expand(w);
         if (e === null) {
-          if (HOOK_SURFACE_TEXT.test(w) && (writesOf(c) || (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)))) unpinned.push(w);
+          if (/^[^\s'"`()]+$/.test(w) && HOOK_SURFACE_TEXT.test(w) && (writesOf(c) || (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)))) unpinned.push(w);
           continue;
         }
         for (const q of frame.locate(e, idx).filter((x) => isAbs(x))) placed.push(q);
@@ -595,7 +595,9 @@ function hookSurfaceBashReason(cmds, frame, ctx, writesOf) {
       const kind = surfaceKind(P);
       if (kind === 'plugin') return `the command writes ${P}, a plugin's hooks file: a hook there could run on the owner's dialogs`;
       const disk = ctx.readText(P);
-      const cands = writtenCandidates(w, disk, (q) => ctx.readText(q));
+      // a source that is not on disk and that nothing on the line writes cannot be copied: that write fails and changes nothing (the same reading as for a script that is missing)
+      const present = { ...w, files: w.files.filter((x) => ctx.readText(x) !== null || ctx.api.existsSync(x) || writtenTo(ctx.frames, x, { exists: (y) => ctx.api.existsSync(y), readText: ctx.readText, ignoreUnmodelled: true }) !== null) };
+      const cands = writtenCandidates(present, disk, (q) => ctx.readText(q));
       if (cands === null) return `the command writes ${P}, a file that can declare hooks, with content only known when it runs, so it cannot be compared with the file`;
       for (const after of cands) {
         const why = hooksDifference(kind, typeof disk === 'string' ? disk : '', after, P, /hooks/i.test(after));
