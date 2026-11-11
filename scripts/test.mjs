@@ -19,7 +19,7 @@ import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MAX_SHARDS, parseShard, shardFiles, weigh } from './lib/shard.mjs';
-import { changedFiles, describeSelection, parseBudget, relatedTests } from './lib/related-tests.mjs';
+import { changedFiles, describeSelection, describeSelectionDetail, parseBudget, relatedTests } from './lib/related-tests.mjs';
 import { selectTestFiles } from './lib/select-tests.mjs';
 import { collectFileTimes } from './lib/file-times.mjs';
 import { realRegistryFile, registryChange, snapshotRegistry } from './lib/registry-snapshot.mjs';
@@ -76,6 +76,7 @@ function addRelated(named, allTests) {
       weights: weigh(sizes, loadWeights()), budgetMs, exclude: named,
     });
     console.log(describeSelection({ ...result, changedCount: changed.files.length, basis: changed.basis, budgetMs }));
+    for (const l of describeSelectionDetail(result)) console.log(l);
     const extra = new Set(result.selected.map((s) => s.name));
     return allTests.filter((f) => named.includes(f) || extra.has(f));
   } catch (e) {

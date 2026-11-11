@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_BUDGET_MS, changedFiles, describeSelection, importSpecs, mentionsPath, parseBudget, relatedTests, toPosix } from '../scripts/lib/related-tests.mjs';
+import { DEFAULT_BUDGET_MS, changedFiles, describeSelection, describeSelectionDetail, importSpecs, mentionsPath, parseBudget, relatedTests, toPosix } from '../scripts/lib/related-tests.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -154,10 +154,23 @@ test('describeSelection: counts, the skipped names (truncated) and the changed-f
   const line = describeSelection({
     selected: [sel('a.test.mjs', 0), sel('b.test.mjs', 1), sel('c.test.mjs', 2)],
     skipped: ['s1', 's2', 's3'].map((n) => sel(`${n}.test.mjs`, 2)),
-    changedCount: 7, basis: 'basis text', budgetMs: 90000, listMax: 2,
+    changedCount: 7, basis: 'basis text', budgetMs: 90000, estimatedMs: 188232.4, listMax: 2,
   });
   assert.equal(line.includes('\n'), false);
-  assert.match(line, /3 selected \(1 changed, 1 direct, 1 transitive\), 3 skipped over budget \(s1\.test\.mjs, s2\.test\.mjs, \+1 more\); 7 changed files \(basis text\)/);
+  assert.match(line, /3 selected \(1 changed, 1 direct, 1 transitive\), 3 skipped over budget \(s1\.test\.mjs, s2\.test\.mjs, \+1 more\); 7 changed files \(basis text\); estimated 188232 of budget 90000 ms$/);
+  const uncapped = describeSelection({ selected: [], skipped: [], changedCount: 0, basis: 'b', budgetMs: Infinity, estimatedMs: 5 });
+  assert.match(uncapped, /; estimated 5 ms, no budget cap$/);
+});
+
+test('describeSelectionDetail: every selected file with its tier and every skipped file, in full, no line ending in a bare test name', () => {
+  const sel = (name, tier) => ({ name, tier, distance: tier, ms: 1 });
+  const skipped = Array.from({ length: 10 }, (_, i) => sel(`s${i}.test.mjs`, 2));
+  const lines = describeSelectionDetail({ selected: [sel('a.test.mjs', 0), sel('b.test.mjs', 1), sel('c.test.mjs', 2)], skipped });
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0], 'related selected (3): a.test.mjs [changed], b.test.mjs [direct], c.test.mjs [transitive] (end)');
+  assert.match(lines[1], /^related skipped over budget \(10\): s0\.test\.mjs, .*, s9\.test\.mjs \(end\)$/);
+  assert.ok(lines.every((l) => !l.endsWith('.test.mjs')));
+  assert.deepEqual(describeSelectionDetail({ selected: [], skipped: [] }), []);
 });
 
 // ---- changedFiles (git injected) ------------------------------------------------------------------------------------
@@ -208,7 +221,8 @@ test('test.mjs --related --list: the named files plus the tests that import the 
   const out = listed(r);
   assert.ok(out.includes('config.test.mjs'));
   assert.ok(out.includes('glob.test.mjs'), 'glob.test.mjs imports pipeline/lib/glob.mjs');
-  assert.match(r.stdout.split('\n')[0], /^related tests: \d+ selected \(0 changed, \d+ direct, \d+ transitive\), \d+ skipped over budget.*; 1 changed files \(CP_RELATED_CHANGED\); budget 90000 ms$/);
+  assert.match(r.stdout.split('\n')[0], /^related tests: \d+ selected \(0 changed, \d+ direct, \d+ transitive\), \d+ skipped over budget.*; 1 changed files \(CP_RELATED_CHANGED\); estimated \d+ of budget 90000 ms$/);
+  assert.match(r.stdout, /^related selected \(\d+\): .*glob\.test\.mjs \[direct\].* \(end\)$/m);
 });
 
 test('test.mjs --related --list: a changed test file runs even with a tiny budget; the budget only limits the others', () => {
@@ -227,7 +241,7 @@ test('test.mjs --related --list: CP_QUICK_RELATED_BUDGET_MS=0 runs only the name
   assert.match(off.stdout, /related tests: off/);
   const all = cli(['--related', '--list', 'config.test.mjs'], { CP_RELATED_CHANGED: 'pipeline/lib/config.mjs', CP_QUICK_RELATED_BUDGET_MS: 'all' });
   assert.ok(listed(all).length > 20);
-  assert.match(all.stdout, /0 skipped over budget; 1 changed files \(CP_RELATED_CHANGED\); no budget cap/);
+  assert.match(all.stdout, /0 skipped over budget; 1 changed files \(CP_RELATED_CHANGED\); estimated \d+ ms, no budget cap/);
 });
 
 test('test.mjs --related: named files keep the exact-name rule and exit 2 when missing; related files are never "missing"', () => {

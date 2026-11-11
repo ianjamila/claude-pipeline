@@ -148,14 +148,28 @@ export function relatedTests({ tests, testDir = 'test', changed, files, read, we
   return { selected, skipped, estimatedMs };
 }
 
-// The one-line summary printed before the run (and so kept in .verify/logs/tests.log).
-export function describeSelection({ selected, skipped, changedCount, basis, budgetMs, listMax = 6 }) {
+// The one-line summary printed before the run (and so kept in .verify/logs/tests.log). It shows the estimated time the
+// selection used against the budget: changed test files always run and count too, so one heavy changed test can use the
+// whole budget, and the line must say so.
+export function describeSelection({ selected, skipped, changedCount, basis, budgetMs, estimatedMs = 0, listMax = 6 }) {
   const tiers = [0, 1, 2].map((t) => selected.filter((s) => s.tier === t).length);
-  const budget = budgetMs === Infinity ? 'no budget cap' : `budget ${budgetMs} ms`;
+  const used = Math.round(estimatedMs);
+  const budget = budgetMs === Infinity ? `estimated ${used} ms, no budget cap` : `estimated ${used} of budget ${budgetMs} ms`;
   const names = skipped.map((s) => s.name);
   const shown = names.slice(0, listMax).join(', ') + (names.length > listMax ? `, +${names.length - listMax} more` : '');
   return `related tests: ${selected.length} selected (${tiers[0]} changed, ${tiers[1]} direct, ${tiers[2]} transitive), `
     + `${skipped.length} skipped over budget${skipped.length ? ` (${shown})` : ''}; ${changedCount} changed files (${basis}); ${budget}`;
+}
+
+// The full record of what a quick run covered, printed after the summary: every selected related file with its tier and
+// every file skipped over budget, so a CI failure in a test quick passed can be told apart (skipped vs never related)
+// from the log alone. Each line ends with ')' so no line reads as a bare test-file name.
+export function describeSelectionDetail({ selected, skipped }) {
+  const tierName = ['changed', 'direct', 'transitive'];
+  const lines = [];
+  if (selected.length) lines.push(`related selected (${selected.length}): ${selected.map((s) => `${s.name} [${tierName[s.tier] ?? s.tier}]`).join(', ')} (end)`);
+  if (skipped.length) lines.push(`related skipped over budget (${skipped.length}): ${skipped.map((s) => s.name).join(', ')} (end)`);
+  return lines;
 }
 
 // ---- changed files ----------------------------------------------------------------------------------------------------
