@@ -9,7 +9,7 @@ import { createGitHub } from '../pipeline/lib/github.mjs';
 import { bringUpToDate, updateTiming } from '../pipeline/lib/updatebranch.mjs';
 import { readSuccessor } from '../pipeline/lib/merge-hold.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
-import { cli, scenario, ghEntries, PR, BASE_SHA, QUEUE_AWARE_SHA } from './helpers/gate-env.mjs';
+import { cli, scenario, ghEntries, ymlFor, PR, BASE_SHA, QUEUE_AWARE_SHA } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { holdCalls, holdFiles, holdYml } from './helpers/merge-hold-env.mjs';
 
