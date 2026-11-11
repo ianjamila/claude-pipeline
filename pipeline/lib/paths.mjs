@@ -65,6 +65,27 @@ export function samePath(a, b, platform = process.platform) {
   return sameSpelling(a, b, platform);
 }
 
+// samePath for an ALLOW check ("this is the trusted file"), where a false match fails open, so no fallback may be looser than exact. Only two
+// disk-confirmed files (both identities readable, both there) are decided by identity - the one way a differently-cased spelling may match.
+// Anything else (an unreadable stat, one or both missing, a platform other than the running one) falls back to the exact normalised spelling, NEVER case-folded.
+export function sameFileStrict(a, b, platform = process.platform) {
+  if (platform === process.platform) {
+    const x = identityOf(normalise(a, platform, false));
+    const y = identityOf(normalise(b, platform, false));
+    if (x !== null && y !== null && x !== 'missing' && y !== 'missing') return x === y;
+  }
+  return normalise(a, platform, false) === normalise(b, platform, false);
+}
+
+// isInside for an ALLOW check: the folded spelling only pre-filters; some ancestor of `child` (or child itself) must then be `dir` by sameFileStrict.
+export function insideStrict(child, dir, platform = process.platform) {
+  if (!isInside(child, dir, platform)) return false;
+  for (let c = normalise(child, platform, false); c.includes('/'); c = c.slice(0, c.lastIndexOf('/'))) {
+    if (sameFileStrict(c, dir, platform)) return true;
+  }
+  return false;
+}
+
 // The spelling alone: the same normalised (on macOS / Windows also case-folded) path, no disk read. For a policy engine that judges text against a fake or
 // injected file system and compares many pairs (the hook guards make 500k+ comparisons in one test file; samePath's two stats each made them 3-5x slower on Linux).
 export function sameSpelling(a, b, platform = process.platform) {

@@ -21,7 +21,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
-import { toPosix, expandHome, isInside, samePath, sameSpelling, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
+import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
@@ -1621,19 +1621,11 @@ function isPipelineTool(arg, ctx) {
   const e = expandRefs(arg, ctx);
   if (!isAbs(e)) return false;
   if (OWNER_GO_RECORDER.test(e)) return false;
-  // An ALLOW check, so a false match fails open: ask the disk (samePath), not the case-folded spelling. On a case-sensitive volume a
-  // differently-cased pipeline directory is another, agent-writable one. (The protect checks stay on sameSpelling: a false match there denies.)
-  return samePath(e, `${ctx.homePosix}/.claude/pipeline/bin/pipeline.mjs`, ctx.platform)
-    || insideOnDisk(e, `${ctx.homePosix}/.claude/pipeline/hooks`, ctx.platform);
-}
-
-// isInside, but a match that may rest on case-folding is confirmed against the disk: some ancestor of `child` must BE `dir` (samePath: same inode when both exist).
-function insideOnDisk(child, dir, platform) {
-  if (!isInside(child, dir, platform)) return false;
-  for (let c = toPosix(child); c.includes('/'); c = c.slice(0, c.lastIndexOf('/'))) {
-    if (samePath(c, dir, platform)) return true;
-  }
-  return false;
+  // An ALLOW check, so a false match fails open: ask the disk, not the case-folded spelling. On a case-sensitive volume a differently-cased
+  // pipeline directory is another, agent-writable one. When the disk cannot answer (a stat error, a missing file) only the EXACT spelling matches,
+  // never a fold (sameFileStrict / insideStrict). (The protect checks stay on sameSpelling: a false match there denies.)
+  return sameFileStrict(e, `${ctx.homePosix}/.claude/pipeline/bin/pipeline.mjs`, ctx.platform)
+    || insideStrict(e, `${ctx.homePosix}/.claude/pipeline/hooks`, ctx.platform);
 }
 
 // A Windows `node C:\...\pipeline.mjs` loses its backslashes in argv, so look at the raw text too.

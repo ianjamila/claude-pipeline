@@ -57,3 +57,40 @@ test('on a case-insensitive volume the other spelling is the same file and stays
     assert.equal(run(`node ${FAKE_HOOK}`), 'allow');
   });
 });
+
+// An ALLOW check must not be looser than exact when the disk cannot answer: a stat error, or nothing there, leaves only the exact (non-folded) spelling.
+const denies = (p) => (p.startsWith(`${CLAUDE}/PIPELINE`) ? Object.assign(new Error('EACCES'), { code: 'EACCES' }) : null);
+// everything real exists; any stat of a differently-cased spelling throws EACCES (identity unreadable)
+const realButFakeUnreadable = () => { const ok = caseSensitive(ALL); return (p) => { const e = denies(p); if (e) throw e; return ok(p); }; };
+
+test('a differently-cased pipeline.mjs whose stat throws EACCES is not trusted (no fold on a stat error)', () => {
+  onFakeVolume(realButFakeUnreadable(), () => {
+    assert.equal(run(`node ${REAL_CLI} preflight`), 'allow', 'the exact spelling stays trusted');
+    assert.equal(run(`node ${FAKE_CLI} preflight`), 'deny');
+    assert.equal(run(`${FAKE_CLI} preflight`), 'deny');
+  });
+});
+
+test('a differently-cased pipeline/hooks folder whose stat throws EACCES is not trusted', () => {
+  onFakeVolume(realButFakeUnreadable(), () => {
+    assert.equal(run(`node ${REAL_HOOK}`), 'allow');
+    assert.equal(run(`node ${FAKE_HOOK}`), 'deny');
+  });
+});
+
+test('a real pipeline.mjs whose own stat throws EACCES is still trusted by its exact spelling', () => {
+  const ok = caseSensitive(ALL);
+  onFakeVolume((p) => { if (p === REAL_CLI || p === REAL_HOOK) throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); return ok(p); }, () => {
+    assert.equal(run(`node ${REAL_CLI} preflight`), 'allow');
+    assert.equal(run(`node ${REAL_HOOK}`), 'allow');
+  });
+});
+
+test('when neither spelling exists, only the exact spelling is trusted, never a case-folded one', () => {
+  onFakeVolume(() => undefined, () => {
+    assert.equal(run(`node ${REAL_CLI} preflight`), 'allow');
+    assert.equal(run(`node ${FAKE_CLI} preflight`), 'deny');
+    assert.equal(run(`node ${REAL_HOOK}`), 'allow');
+    assert.equal(run(`node ${FAKE_HOOK}`), 'deny');
+  });
+});
