@@ -1722,7 +1722,9 @@ function ghReadOnly(args, cmd, ctx) {
 // literal text to it, while PowerShell reads the backslash as an ordinary character and the next one as syntax (`node hook.mjs \; Set-Content settings.json x` looks like ONE node command, R9-F3).
 // The commands the parser saw are not those PowerShell runs, so on such a line NO command is read-only. (Decided once per line, in isReadOnly, which every judgement of a command passes through: the final
 // protected-file check then sees node / echo as an ordinary command that names a protected file and refuses it. A line without the sequence is judged as before.)
-const PS_ESCAPED_SYNTAX = /\\(?:[;|&"'`\r\n]|$)/;
+// Deny by default: a backslash followed by anything but a plain path character [A-Za-z0-9._-], or by the end of the text, is a hazard. A denylist of escaped characters missed `\$(`, `\@(`, `\{`, `\<` and the rest.
+// That includes `\\` (UNC or a doubled separator) and `\/`: no trusted tool path or ordinary path in the tests needs them, and either can hide the same split, so they are refused too.
+const PS_ESCAPED_SYNTAX = /\\(?![A-Za-z0-9._-])/;
 function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
   if (!argv.length) return false;

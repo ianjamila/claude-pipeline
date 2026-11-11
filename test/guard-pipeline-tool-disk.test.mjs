@@ -331,3 +331,39 @@ test('R9-F3: a PowerShell line with a backslash before ; | & a quote, a backtick
   // Bash is untouched: there the backslash IS an escape and the parser reads the line as the shell does
   assert.equal(bashW('echo x \\; ls'), 'allow');
 });
+
+// A denylist of escaped characters missed `\$`: PowerShell runs `\$(Set-Content ...)` (the backslash is an ordinary character, `$(` a subexpression) while the Bash parser reads `\$` as a
+// literal `$`. Deny by default: on a PowerShell line a backslash must be followed by a plain path character, else no command on the line is read-only.
+test('a PowerShell line with a backslash before any character but a plain path character is refused', () => {
+  const S = 'C:\\Users\\u\\.claude\\settings.json';
+  const lines = [
+    `node ${WHOOKS}\\guard-files.mjs \\$(Set-Content ${S} x)`,
+    `echo \\$(Set-Content ${S} x)`,
+    `echo x \\@(Set-Content ${S} x)`,
+    `echo x \\{ Set-Content ${S} x }`,
+    `echo x \\< ${S}`,
+    `echo x \\> ${S}`,
+    `echo x \\(Set-Content ${S} x)`,
+    `echo x \\# ; Set-Content ${S} x`,
+    `echo x \\ ; Set-Content ${S} x`,
+    `echo x \\* ${S}`,
+    `echo x \\[0] ${S}`,
+    `echo x \\! ${S}`,
+    `echo x \\= ${S}`,
+    `echo x \\, ${S}`,
+    `echo x \\\\server\\share ${S}`,
+    `echo x \\/y ${S}`,
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  // ordinary backslash paths (CLI and hook, bare and ASCII-quoted, with arguments) stay allowed
+  assert.equal(psW(`node ${WCLI} preflight --json`), 'allow');
+  assert.equal(psW(`node "${WCLI}" preflight --json`), 'allow');
+  assert.equal(psW(`node '${WCLI}' preflight`), 'allow');
+  assert.equal(psW(`node ${WHOOKS}\\guard-files.mjs`), 'allow');
+  assert.equal(psW(`node "${WHOOKS}\\guard-files.mjs" --flag value`), 'allow');
+  assert.equal(psW(`node '${WHOOKS}\\guard-files.mjs' x`), 'allow');
+  assert.equal(psW('Get-Content C:\\Users\\u\\repo\\a-b_c.d\\x.txt | Select-Object -First 3'), 'allow');
+  // Bash is untouched: there `\$` is a literal dollar sign and the parser judges the line as the shell does
+  assert.equal(bashW('echo \\$HOME'), 'allow');
+  assert.equal(bashW('echo x \\( \\) \\{ \\<'), 'allow');
+});
