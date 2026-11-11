@@ -637,6 +637,7 @@ function maybeSurface(word, { ci, dirs, dot, surfaceDirs }) {
   for (const full of fulls) {
     const segs = full.split('/').filter((x) => x !== '' && x !== '.');
     for (const shape of SURFACE_SHAPES) {
+      if (folder && shape.length < 3) continue; // (a folder may be a place a file lands in only when it is inside a `.claude*` folder: a bare `.claud?/` names no file)
       if (folder ? shapeEndsAt(segs, segs.length - 1, shape.slice(0, -1), shape.length - 2, o) : shapeEndsAt(segs, segs.length - 1, shape, shape.length - 1, o)) return true;
     }
     // the folders a plugin's components live in (installed_plugins.json, manifests): a glob that can reach a name ending .md (or a hooks file) inside one
@@ -1681,7 +1682,8 @@ function resolveGlobCd(e, bases, ctx, cmds, idx) {
 // (one rerun of a line per assumed directory, counted across the evaluation: past the allowance the line is refused rather than slow.
 // Phase 3b: 200 → 256 with the two review folders assumedCwds added, which cost a psql line under an unfollowable startup file 168 → 224
 // reruns (guard-false-positives J); the CPU deadline still bounds the line)
-const MAX_CD_RERUNS = 256;
+// #261 T3: 256 → 320 with the hooks folder and local settings file (and each other account config dir's) added to the protected set: the same psql line then needs 257 reruns (the CPU deadline still bounds the line)
+const MAX_CD_RERUNS = 320;
 const MAKES_DIRS = new Set(['mkdir', 'cp', 'mv', 'tar', 'bsdtar', 'gtar', 'unzip', 'git', 'rsync', 'ditto', 'install', 'ln', 'curl', 'wget']);
 const MAX_BELOW_ROOT_DIRS = 64; // (subdirectories of the protected roots a rerun may add for a `..` write)
 function countCdRun(budget) {
