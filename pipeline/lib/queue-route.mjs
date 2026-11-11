@@ -365,15 +365,16 @@ export function createQueueRoute({
   // refused, nothing queued, nothing run. -> null | the refusal output.
   // `closeRecord`: a live record (a re-queue after a removal) ends 'blocked' with the hold put back, as every other unmerged end does; the sweep's
   // re-queue leaves that to settleRecord, which ends the record on the { ok: false } it gets back.
-  // `requeue`: the head already passed this check at its first enqueue, so a read that THREW (a GitHub blip: state.unreadable) must not spend the owner's word on a
-  // refusal: it answers queue-unreadable (nothing enqueued, the record kept, the next pass or the owner's `P merge` tries again, the sweep reads that as unsettled).
-  // Only a structural unknown (no usable marker) or a branch that lacks the commit ends it. A first enqueue has nothing to keep: it refuses either way.
+  // A read that THREW (a GitHub blip: state.unreadable) is not a verdict, whatever the call is: it must not spend the owner's word on a refusal, so it answers
+  // queue-unreadable (nothing enqueued, a live record and its hold kept, the next pass or the owner's `P merge` tries again, the sweep reads that as unsettled). That holds
+  // for a live record with no removal too (the retry after enqueue-failed, a crash before the enqueue landed), so it does not depend on a re-queue. Only a structural
+  // unknown (no usable marker, a sha the base does not have) or a branch that lacks the commit ends it.
   let branchChecked = false;
-  async function branchPredatesQueue({ closeRecord: ends = true, requeue: again = false } = {}) {
+  async function branchPredatesQueue({ closeRecord: ends = true } = {}) {
     if (isDefaultMergeCommand(config)) return null;
     const state = queueCatchUpState({ gh, branch: config.default_branch, head });
     if (!state.needed) return null;
-    if (again && state.unreadable) return unreadable('the commit the base names in .claude/merge-queue-aware could not be checked for the re-queue (nothing was enqueued, the record is kept; run `P merge` again or wait for the next `queue-sweep`)', state.why);
+    if (state.unreadable) return unreadable('the commit the base names in .claude/merge-queue-aware could not be checked (nothing was enqueued, a queue record and its hold are kept; run `P merge` again, or wait for the next `queue-sweep`)', state.why);
     const holdFields = ends && liveRecord() !== null ? await terminal('blocked') : {};
     return refusal('queue-branch-predates-switch', [predatesQueueMessage({ pr, state })], {
       queued: false, branchState: state.kind, queueAwareSha: state.queueAwareSha, ...holdFields,
@@ -382,8 +383,8 @@ export function createQueueRoute({
 
   // The same check, run by the merge command right after the precheck answers enqueue, before anything is written (the owner-go route's hold lift, the guard
   // wait): a refusal then costs no label event, comment or wait. A clean answer is remembered, so the first enqueue below does not read GitHub twice. -> null | the refusal.
-  async function checkBranch({ requeue: again = false } = {}) {
-    const old = await branchPredatesQueue({ requeue: again });
+  async function checkBranch() {
+    const old = await branchPredatesQueue();
     branchChecked = old === null;
     return old;
   }
@@ -444,7 +445,7 @@ export function createQueueRoute({
         if (enqueueNow) {
           if (branchChecked) branchChecked = false; // (checkBranch ran for this first enqueue)
           else {
-            const old = await branchPredatesQueue({ requeue: requeued === 1 });
+            const old = await branchPredatesQueue();
             if (old !== null) return old;
           }
           openRecord(root, pr, head, approval, opts);
@@ -496,7 +497,7 @@ export function createQueueRoute({
   // -> { ok: true } | { done } (a refusal or a merge the confirm found).
   async function reenqueue() {
     requeued = 1;
-    const old = await branchPredatesQueue({ closeRecord: false, requeue: true });
+    const old = await branchPredatesQueue({ closeRecord: false });
     if (old !== null) return { done: old };
     openRecord(root, pr, head, approval, opts);
     beginAttempt(root, pr, head, approval, opts);

@@ -172,12 +172,10 @@ test('3. the DEFAULT merge command never checks (gh enqueues; no branch code run
   assert.deepEqual(gh.reads, { marker: 0, compare: 0 });
 });
 
-test('4. no usable marker on the base, or a read that fails: refused (fail closed), the command never ran', async () => {
+test('4. no usable marker on the base: refused (fail closed), the command never ran', async () => {
   for (const [why, over] of [
     ['the base has no .claude/merge-queue-aware', { marker: NO_FILE }],
     ['the marker is malformed', { marker: 'soon\n' }],
-    ['the marker read fails', { marker: new Error('HTTP 502') }],
-    ['the ancestry compare fails', { rel: new Error('HTTP 502') }],
   ]) {
     const root = repoDir();
     const gh = stub(over);
@@ -328,9 +326,38 @@ test('11. the sweep\'s re-queue whose read THROWS leaves the record live for the
   }
 });
 
-test('12. the FIRST enqueue with a read that throws still refuses queue-branch-predates-switch (nothing to keep; the owner is told how to proceed)', async () => {
-  const root = repoDir();
-  const res = await routeFor(root, stub({ marker: new Error('HTTP 502') }), customConfig()).enqueueAndWatch();
-  assert.equal(res.output.error, 'queue-branch-predates-switch');
-  assert.equal(res.output.branchState, 'unknown');
+test('12. ANY read that throws is queue-unreadable, the first enqueue included (nothing to keep there, but a blip is not a verdict and the answer is not "update the branch")', async () => {
+  for (const [why, over] of [['the marker read throws', { marker: new Error('HTTP 502') }], ['the ancestry compare throws', { rel: new Error('HTTP 502') }]]) {
+    const root = repoDir();
+    const gh = stub(over);
+    const res = await routeFor(root, gh, customConfig()).enqueueAndWatch();
+    assert.equal(res.output.error, 'queue-unreadable', why);
+    assert.match(res.output.reasons[0], /HTTP 502/, why);
+    assert.doesNotMatch(res.output.reasons[0], /update-branch/, why);
+    assert.equal(ran(root), false, why);
+    assert.deepEqual(writes(gh), [], why);
+    assert.equal(readQueueRecord(root, PR), null, `${why}: no record was begun`);
+  }
+});
+
+test('13. a LIVE record without a removal (the retry after enqueue-failed, a crash before the enqueue landed) whose read throws: queue-unreadable, the record and its hold are kept (checkBranch and enqueueAndWatch alike)', async () => {
+  for (const [how, go] of [
+    ['checkBranch', async (route) => { const pre = await route.precheck(); assert.deepEqual([pre.enqueue, pre.requeue], [true, false], 'a live record with no removals is not a re-queue'); return route.checkBranch(); }],
+    ['enqueueAndWatch', (route) => route.enqueueAndWatch()],
+  ]) {
+    for (const [why, over] of [['the marker read throws', { marker: new Error('HTTP 502') }], ['the ancestry compare throws', { rel: new Error('HTTP 502') }]]) {
+      const root = repoDir();
+      openRecord(root, PR, H, APPROVAL, { ...IDENT, route: 'owner-go' });
+      setHold(root, PR, HOLD);
+      const gh = stub(over);
+      const res = await go(routeFor(root, gh, customConfig()));
+      const label = `${how}, ${why}`;
+      assert.equal(res.output.error, 'queue-unreadable', label);
+      assert.equal(readQueueRecord(root, PR).terminal, null, `${label}: the record is kept live`);
+      assert.equal(readQueueRecord(root, PR).hold?.id, HOLD.id, `${label}: the hold stays recorded`);
+      assert.deepEqual(gh.labels, [], `${label}: the hold was not put back`);
+      assert.deepEqual(writes(gh), [], label);
+      assert.equal(ran(root), false, label);
+    }
+  }
 });
