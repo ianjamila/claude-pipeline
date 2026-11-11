@@ -9,6 +9,15 @@ blocked · **2** usage or environment error (also: unknown command, unknown flag
 (Codex, GitHub, a deployment that never finished). Flags after a bare `--` belong to the command being run (`job start`).
 `--repo DIR` (default: the current directory) is accepted by every repo-scoped command and resolves to the repository top level.
 
+**Review leases.** Inside a Claude Code session, every command that reads or writes a worktree's review state (agent-log, arbiter, checkpoint, ci-wait,
+codex-review, comment, cost, final-gate, followups, job, merge, merge-hold, review-complete, smoke, state, summary, triage, update-branch, verify) first opens
+or renews that session's *review lease* on the worktree, so an unattended `pipeline update` never swaps the pipeline under a review. `summary` (once it
+succeeded) and a `checkpoint` that ends the run close it. The lease is taken before the command starts (so before its per-PR lock), and a command that cannot
+get it does not run: exit 2 `{ok: false, error: "update-in-progress", message}` while an update is swapping (retry in a minute), or `error: "review-lease-unwritable"
+| "review-lease-busy" | "review-lease"` when the lease folder cannot be written; nothing has been changed. A plain terminal takes no lease. The commands that only
+compute or only talk to the machine (preflight, config, labels, update, version, vendor, model-floor, model-proof, risk, hardstops, integrity, queue-sweep, stacks,
+worktrees, protect, repo-move, guard-log, artifacts) take none.
+
 ## agent-log
 
 queue a line for the agent log, publish queued lines to the `pipeline-agent-log` branch, or close pending prod-smoke lines. The log lives on that orphan branch (like `pipeline-artifacts`), never in a PR branch.
@@ -721,11 +730,87 @@ pipeline update [--claude-home DIR] [--check] [--json]
                      the install is complete, unmodified and identical to main (allowed inside Claude Code)
   --json             no progress text on stderr (the result is always one JSON object on stdout)
   Refuses inside Claude Code (run it in your own terminal) unless --check or PIPELINE_ADMIN=1.
+pipeline update --scheduled [--claude-home DIR] [--json]
+  What the unattended auto-update job runs (also refused inside Claude Code): nothing when current (silent); when behind, downloads
+  main and installs it only if no review is live (the installer decides under its lock: --require-no-live-reviews) and the
+  install is still the one it looked at (--expect-installed). A modified, incomplete, ahead or diverged install is never touched:
+  the owner is told once per (reason, main sha) with the exact command. Also writes <home>/.claude/pipeline-state/update-status.json.
+  One compact JSON line per run; exit 0 current / updated / deferred by a live review / paused, 1 failed.
+pipeline update schedule (--install [--every N] | --remove | --status)
+  The recurring job that runs `update --scheduled --json` of the installed pipeline: a LaunchAgent (com.claude-pipeline.auto-update) on
+  macOS, one crontab line on Linux/WSL, unsupported on native Windows. --every N: minutes between runs, 5, 10, 15, 20, 30 or 60
+  (default 15). --install refuses inside Claude Code (an unattended guard-hook swap is owner-only); --status and --remove run anywhere.
 ```
 
-Exit: 0 updated / up to date (`--check`: complete, unmodified and identical to main) · 1 not up to date (`--check`), upstream unreachable, or the fetch / install / verification failed · 2 usage, or refused inside Claude Code.
+Exit (`update`, `update --check`): 0 updated / up to date (`--check`: complete, unmodified and identical to main) · 1 not up to date (`--check`), upstream unreachable, or the fetch / install / verification failed · 2 usage, or refused inside Claude Code (`{ok: false, error: "refused", message}`). `--scheduled` and `--check` cannot be combined (2).
 
 Runs `install.mjs` from a clean, isolated download of exactly the commit main points to, then `install.mjs --check`; it succeeds only when that check passes and the installed stamp is that commit. It takes no install lock itself (the installer it runs does). A copy installed with `--skip-file-guard` stays that way.
+
+### `update --scheduled`
+
+The unattended run of the same flow, started by the job that `update schedule --install` sets up (logic in `lib/auto-update.mjs`). Also refused inside Claude Code. It prints ONE compact JSON line, `{mode: "scheduled", home, ok, action, …}`, except when nothing needs doing (`action: "none"`): that prints nothing at all. It decides, in this order:
+
+| Situation | `action` | Exit | Effect |
+|---|---|---|---|
+| installed copy is clean and identical to main | `none` (silent) | 0 | status `current`; every notice streak is forgotten |
+| behind main | `updated` | 0 | downloads main, runs the installer with `--require-no-live-reviews --expect-installed <installed sha>`, notifies "pipeline updated to <sha7> (<PR title>)", status `current` |
+| … but the installer reports a live review (exit 3, reason `live`) | `deferred` (`reason: live`, `live`, `deferredSince`) | 0 | nothing written; status `deferred-by-review`; retried every run; one notice after more than 24 h (wall clock from the first deferral; a first deferral in the future, i.e. the clock went backwards, restarts the count), naming what is live, once per streak. When every entry of `live` is a `scan-error` (the scan could not look: an unreadable registry or stacks config, an unlistable jobs folder, git failing in a repository), the log line and the 24 h notice read "could not check for running reviews: <detail>" (not "waits for a live review" / "finish or close them"), and each `deferredBy` entry carries its `detail` |
+| … or the installer defers for another reason (exit 3, reason `deadline`: the live-work scan overran its deadline; `admission-busy`: another update or a review start holds admission) | `deferred` (`reason`, the installer's `message`, no `live`) | 0 | nothing written; status `deferred-by-review` with `deferReason` and `message` instead of `deferredBy`; retried every run. It is not a review, so no line says one is running (the SessionStart line has its own wording per reason); like a busy install lock, ONE notice on the 3rd run in a row (a live-review deferral or a good run resets the count), and the 24 h notice names the real cause |
+| … but the installed copy changed during the download (an owner edit, a manual install: pre-check or the installer's `expect-installed-mismatch`) | `changed` | 0 | nothing written; status `behind`; judged again next run as if found that way |
+| modified, incomplete (an interrupted install's partial manifest), no recorded source commit, ahead of main or diverged | `blocked` (`reason`: `modified` / `incomplete` / `ahead` / `diverged`) | 0 | NEVER touched: drift alone cannot tell an interrupted install from an owner edit. Status `blocked-modified`; one notice per (reason, main sha) with the exact command |
+| the installer's own verification fails (exit 1, `error: verify-failed`, `verify.drift`), the install ran but `install.mjs --check` fails, or the installed stamp is not main | `failed` (`error`: `check-failed` / `unverified`, `drift`) | 1 | one notice with the first five drift lines; this main sha is NOT retried (`held` on later runs, exit 1). The hold ends only when the install is clean and identical to it AND a fresh installer `--check` of that sha (downloaded again, read-only) passes: the files alone cannot show a missing hook registration in `settings.json`; the next main sha is tried |
+| main cannot be resolved or compared, or the installer's own lock is busy (`install-lock-busy`) | `failed` (`transient`) | 1 | notice only on the 3rd run in a row for the same reason (`transientRuns`); until then the earlier status stays (only `checkedAt` moves); any good run ends the streak |
+| any other failure (`fetch-failed`, `install-failed`, `installer-too-old`, `crashed`, …) | `failed` | 1 | one notice per (reason, main sha); status `failed` |
+
+A notification that cannot be delivered is not counted as told and is tried again next run. Notices go through `defaultNotify` with event `pipeline-update`: a stderr line (the job's log), a line in `<log dir>/pipeline-update-notices.log` (`~/.local/state/pipeline`, or `$PIPELINE_PRUNE_LOG_DIR`) and, on macOS, a banner unless `PIPELINE_NO_BANNER=1`.
+
+**Status file** `<account home>/.claude/pipeline-state/update-status.json` (the passwd home, never `$HOME`), written atomically on every run; a failed write never fails the run. Version 1: `{version, state, checkedAt, installedSha, mainSha}` plus, when known, `mainTitle`, `deferredSince` and `deferredBy: [{repo, pr, worktree, kind?, what?, detail?}]` (`detail`: one line, at most 200 characters) (`deferred-by-review`), `reason`, `message` and `command` (`blocked-modified`, `failed`). `state` is `current`, `behind` (an update is available and not installed yet; also written while the download runs), `deferred-by-review`, `blocked-modified` (modified, incomplete, ahead or diverged) or `failed`. The notice bookkeeping (what was already told, the transient streak, the sha whose verify failed) sits next to it in `update-auto-state.json`.
+
+**The SessionStart line** (hook `update-notice`, a plain hook, never behind the fail-closed loader: it always exits 0). It only reads the status file (no network, no git, no process; hard 1 s budget; the hook entry's own limit is 5 s), prints nothing when the file is missing, unreadable, not version 1 or `current`, and otherwise one line: `behind` → `pipeline update available — installs automatically when no review is running`; `deferred-by-review` → `pipeline update waiting on a review in <repo> #N` (`… in <repo>` without a PR; `pipeline update waiting on a running review` when no entry has a valid repo name; `pipeline update waiting: could not check for running reviews — run pupdate --scheduled in your own terminal to see why` when every entry is a `scan-error`, whose detail is never printed); `blocked-modified` or `failed` → `pipeline update needs you: run pupdate`. The file is not protected, so the line shows only the state and a repo name / PR number that pass a strict shape check, never `mainTitle`, `reason` or `command`.
+
+### `update schedule`
+
+`pipeline update schedule (--install [--every N] | --remove | --status)` manages the recurring job that runs the installed `pipeline.mjs update --scheduled --json`. Exactly one of the three is required; `--every` only goes with `--install`, and N must be one of 5, 10, 15, 20, 30, 60 (minutes; default 15; each divides 60). All of these are exit 2 usage errors. Output is one JSON object:
+
+- `--install` → `{ok: true, installed: true, line, changed, every, note, …}`; macOS adds `plist`, `timezone`, `note` (the LaunchAgent `com.claude-pipeline.auto-update`, an interval job that also runs when loaded, so a Mac that slept catches up; the plist is `~/Library/LaunchAgents/com.claude-pipeline.auto-update.plist`), Linux/WSL writes one crontab line (found again by its marker comment; `--every 60` runs at minute 17). Running it again replaces the job. Refused inside Claude Code (`{ok: false, error: "refused"}`, exit 2: it arranges an unattended guard-hook swap, so owner only, once per machine). Also exit 2: `unsupported-platform` (native Windows), `not-installed` (no pipeline at `~/.claude/pipeline/bin/pipeline.mjs`: the job runs the installed copy), `tool-missing` (`git` or `gh` not on `PATH`: the job's own PATH is minimal, so their directories are baked in at install time), `launchctl` / `crontab` (the scheduler refused).
+- `--status` → `{ok: true, installed, line, plist?, loaded?, warning?}`; `--remove` → `{ok: true, removed}`. Both run anywhere, including inside Claude Code.
+- The job's output goes to `<log dir>/cron-auto-update.log`. `install.mjs --uninstall` removes the job itself, like the queue-sweep one (only when the home being uninstalled is the user's own `~/.claude` with no `PIPELINE_STACKS_HOME`, so a scratch home never removes the real job; none installed means nothing is done; a failure is a warning, and the uninstall still succeeds; the JSON report gains `autoUpdate: {removed}`). `update schedule --remove` still works on its own.
+
+Rollout: the first install of this feature is a manual `update` (the owner's `pupdate`); from then on every pipeline command is a fresh process running the installed code, so a command that loaded older modules cannot outlive an install and the job needs no restart.
+
+### The installer's gates (`install.mjs`)
+
+`install.mjs` (run through `install.sh` / `install.ps1`, or by `update` from the downloaded copy) takes two flags for the unattended update. Both apply only to an install (with `--check` or `--uninstall` they are a usage error).
+
+```
+node install.mjs [--claude-home DIR] [--source DIR] [--check] [--uninstall] [--skip-file-guard] [--force] [--json]
+                 [--require-no-live-reviews [--deadline-ms N]] [--expect-installed SHA]
+```
+
+- `--expect-installed SHA` (a full 40-character lower-case commit sha): after the install lock is taken and before anything is written, the claude-home must still hold a complete, clean install built from a clean checkout of exactly that commit, with nothing modified, missing or extra. Otherwise exit 1, nothing changed, stdout `{ok: false, error: "expect-installed-mismatch", installed, expected, message}`.
+- `--require-no-live-reviews [--deadline-ms N]`: only for the account's own claude-home (`<passwd home>/.claude`; any other `--claude-home` is a usage error, exit 2). Lock order: install lock, then the machine-wide `admission` lock (waits up to 20 s), then a read-only scan. Dead review leases are swept first. If anything is live the installer exits 3 and writes nothing; otherwise it installs and runs its own `--check` pass while still holding `admission`, so no review is admitted until the swap and the verification are over (the lock belongs to the installer process: a killed parent cannot release it early). A failed own verification is exit 1 with `error: "verify-failed"`.
+- Exit codes: 0 installed · 1 failed (including a failed own verification and `expect-installed-mismatch`) · 2 refused (usage, a `--claude-home` other than the account's own with `--require-no-live-reviews`, `--deadline-ms` without it or not a positive whole number, `--expect-installed` that is not a 40-character lower-case hex sha, either flag with `--check` / `--uninstall`, or run inside Claude Code) · 3 deferred.
+- Exit 3 prints `{ok: false, deferred: true, reason, live: [{kind, repo?, pr?, worktree?, sessionId?, detail}], message?}` on stdout and one line on stderr; nothing was changed. `reason` is `live` (the list is not empty), `admission-busy` (another update holds `admission` past the wait; `live` is empty), or `deadline` (the scan did not finish within `--deadline-ms`, default 120000, measured from the installer's start; `live` is empty, `deadlineMs` is set). Each entry's `kind`:
+
+| `kind` | Meaning |
+|---|---|
+| `lease` | a live review lease (see below); an unreadable lease file counts as live |
+| `job` | a `P job` still running, or being started (a `.starting` marker younger than 60 s), in a worktree of a known repo |
+| `state-lock` | a held per-repo-and-PR review state lock (`review-*` in the lock directory) |
+| `merge-lock` | a held `merge-*` lock, or a merge command that outlived its run (`<name>.child.json`, live or unreadable) |
+| `queue-lock` | a held `queue-*` lock (reserved: the queue sweep takes the merge lock per record, so none is reported today) |
+| `queue-record` | a merge-queue record whose work is not over (an unreadable one counts as live) |
+| `scan-error` | something could not be read or listed; counts as live (fail closed), `detail` says what |
+
+The repos scanned are the ones the machine knows (the stacks config plus every repo a merge told the registry about) and their `git worktree list`; the locks are in `$PIPELINE_LOCK_DIR` or the default lock directory.
+
+**Review leases** (`lib/review-lease.mjs`, `lib/review-lease-wiring.mjs`). Inside a Claude Code session, each of these 19 commands opens or renews that session's lease on the worktree before it runs (renew opens when absent, so a review begun on an older install gets one at its next command): `agent-log`, `arbiter`, `checkpoint`, `ci-wait`, `codex-review`, `comment`, `cost`, `final-gate`, `followups`, `job`, `merge`, `merge-hold`, `review-complete`, `smoke`, `state`, `summary`, `triage`, `update-branch`, `verify`. `summary` (when it succeeded) and `checkpoint` (when the run record it wrote says step `ended`) close it, naming the generation they just touched, so a lease reopened since is left alone; a failed close is a stderr warning, never a changed result. All other commands take none. The lease is the worktree of `--repo DIR` (default the current directory), the PR from `--pr N` or the review state (else the checked-out branch: a branch lease that the first command knowing the PR turns into the PR lease). Leases are one file per session, `<session id>.json`, in `<passwd home>/.claude/pipeline-state/owner-go/review-leases/` (inside the folder the guard protects: an agent cannot delete or forge one). A lease is **live** while its Claude Code process runs and started when the lease says (no pid reuse), the session record for that pid still has the lease's session id (a `/clear` or resume keeps the pid but changes the id: dead), and it was renewed within 6 hours; a detached `P job` still running in the worktree keeps a lease live regardless (age included). A command run INSIDE a job (`codex-review`, `ci-wait`, `merge-hold --wait`, `merge`) has no Claude ancestor: `job start` hands it the session's identity (`PIPELINE_LEASE_HOLDER`, JSON `{sessionId, pid, pidStart}`), which it trusts only when that session still checks out (same process start, same session record), so the job's lease is the session's own and `summary` / `ended` closes it; a close while a job still runs keeps the lease live only until that job ends; an identity that does not check out falls back to the TTL-only holder. What cannot be placed counts as live: an unreadable or malformed file, `ps` unavailable, a missing session record while the process runs. When the session cannot be looked up at all (`CLAUDECODE=1` without a record, Windows) the lease is TTL-only (live 6 h after its last renewal; one `ttl-<hash of the worktree>` holder per worktree). A plain terminal writes no lease.
+
+A command that cannot get its lease does not run: exit 2 `{ok: false, error, message}` with nothing read or written, where `error` is `update-in-progress` (an installer holds `admission` past the 20 s wait: "retry in a minute"), `review-lease-unwritable`, `review-lease-busy` or `review-lease`. Closing never takes `admission`, so ending a review cannot fail because of an update.
+
+Test seams (a repo checkout only; an installed copy ignores them): `PIPELINE_REVIEW_LEASE_DIR`, `PIPELINE_ADMISSION_WAIT_MS`, `PIPELINE_UPDATE_STATUS_FILE`, `PIPELINE_UPDATE_NOTICE_DELAY_MS`; the installer's own (checkout with `PIPELINE_TEST_MODE=1`) are `PIPELINE_INSTALL_ACCOUNT_HOME`, `PIPELINE_INSTALL_SCAN_DELAY_MS`, `PIPELINE_INSTALL_SWAP_GATE`.
+
+Stated limit: the swap replaces the guard units one by one, and a guard hook that starts in the instant its own unit is being swapped is refused (the fail-closed loader exits 2), never allowed.
 
 ## update-branch
 

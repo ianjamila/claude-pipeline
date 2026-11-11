@@ -59,5 +59,5 @@ Which ending depends on the item note from 1.5 (as refreshed in step 2):
      `Head <sha12> · items <digest> · repo <owner/name>`
      `🔀 Ready to merge #N — say "merge"`
      The owner-go hook binds the owner's "merge" to the LAST reply: if anything else was said since, or the context was compacted, show the lines again (a blank line between them is harmless, prose is not). Never type or simulate the owner's "merge".
-     No record ⇒ `P merge` says so: show the request again and wait; but after a Hold line, with an installed pipeline that predates hold support (`P update --check` shows it behind main), say "run pipeline update first" instead.
+     No record ⇒ `P merge` says so: show the request again and wait; but after a Hold line, with an installed pipeline that predates hold support (`pipeline update --check` shows it behind main), say "run pipeline update first" instead.
      A refusal that the transcript is not under a trusted config dir: the owner's Claude Code config dir must be a `.claude*` folder directly under the home (`CLAUDE_CONFIG_DIR` does not count): tell the owner. Label mode and the gated route are unchanged (the gated route lifts no hold).

@@ -24,13 +24,15 @@ const CRON_PATH = ['/usr/bin', '/bin'];
 // found at install time (plus those two), and appends all output to logFile so a startup failure leaves a trace. The root,
 // PATH and log file are always single-quoted; node and bin only when they need it. cron turns a bare % into a newline,
 // so each one is escaped; a newline in a path cannot be written to a crontab at all.
-export function scheduleLine({ nodePath, binPath, root, at, lockName, pathDirs, logFile, args = WORKTREES_PRUNE_ARGS, kind }) {
-  const m = AT_RE.exec(at ?? '');
-  if (!m) throw new UsageError(`--at must be HH:MM (00-23:00-59), got ${JSON.stringify(at)}`);
+// `cron` (five fields, e.g. `*/15 * * * *`) replaces the daily `at` time for a repeating job (the auto-update job).
+export function scheduleLine({ nodePath, binPath, root, at, cron, lockName, pathDirs, logFile, args = WORKTREES_PRUNE_ARGS, kind }) {
+  const m = cron === undefined ? AT_RE.exec(at ?? '') : null;
+  if (cron === undefined && !m) throw new UsageError(`--at must be HH:MM (00-23:00-59), got ${JSON.stringify(at)}`);
+  if (cron !== undefined && !/^(\S+ ){4}\S+$/.test(cron)) throw new UsageError(`schedule: cron must be five fields, got ${JSON.stringify(cron)}`);
   if ([nodePath, binPath, root, logFile, ...pathDirs, ...args].some((p) => /[\r\n]/.test(p))) throw new UsageError('schedule: a path contains a newline, which a crontab line cannot hold');
   const searchPath = [...new Set([...pathDirs, ...CRON_PATH])].join(':');
   const command = `cd ${shellQuote(root)} && PATH=${shellQuote(searchPath)} ${bareOrQuoted(nodePath)} ${bareOrQuoted(binPath)} ${args.map(bareOrQuoted).join(' ')} >>${shellQuote(logFile)} 2>&1`;
-  return `${m[2]} ${m[1]} * * * ${command.replace(/%/g, '\\%')} ${scheduleMarker(lockName, kind)}`;
+  return `${cron ?? `${m[2]} ${m[1]} * * *`} ${command.replace(/%/g, '\\%')} ${scheduleMarker(lockName, kind)}`;
 }
 
 // Install / remove / report the marker line in the crontab that crontabFn('read') returns. Every other line is kept

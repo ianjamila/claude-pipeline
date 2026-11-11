@@ -26,6 +26,7 @@ import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } f
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
 import { reviewCheck } from '../pipeline/lib/finalgate.mjs';
+import { noClaudeSession } from './helpers/no-claude-session.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -2470,7 +2471,7 @@ test('arbiter apply: an installed copy ignores PIPELINE_TEST_MODE (with a warnin
   const w = readyForArbiter(t);
   w.cli(['arbiter', 'needed', '--round', '1']);
   const asked = ['--expect-model', 'claude-opus-', '--expect-effort', 'low'];
-  const r = arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs') } });
+  const r = arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs'), ...noClaudeSession() } });
   assertAllNeedHuman(w, r, /unexpected model claude-opus-5-1/);
   assert.match(r.stderr, /ignoring PIPELINE_TEST_MODE/);
 });
