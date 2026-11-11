@@ -87,7 +87,7 @@ export function registerRepo({ root, env = process.env }) {
 }
 
 // `onError(text)` (optional, for the live-work scan, which must not read "could not look" as "nothing there"): called for a stacks config or a registry
-// that exists but cannot be parsed. The returned list is the same with or without it.
+// that exists but cannot be parsed, and for a directory that exists where git fails for any reason but "not a git repository". The returned list is the same with or without it.
 export function knownRepos({ home = os.homedir(), env = process.env, onError } = {}) {
   const found = [];
   try {
@@ -103,8 +103,11 @@ export function knownRepos({ home = os.homedir(), env = process.env, onError } =
     let key;
     try {
       key = canon(gitCommonDir(dir)); // canon is realpath.native: the on-disk spelling (short names expanded), so one repository reached two ways gets one key
-    } catch {
-      continue; // not a git repository (any more)
+    } catch (err) {
+      // not a git repository (any more): skipped silently. Any other failure (dubious ownership, a corrupt repository, git killed or timed out) means
+      // this repository was NOT looked at, which the live-work scan must not read as "nothing running there".
+      if (!(err?.code === 128 && !err?.abnormal && /not a git repository/i.test(String(err?.stderr ?? '')))) onError?.(`cannot tell whether ${dir} is a git repository (git rev-parse --git-common-dir): ${msg(err)}`);
+      continue;
     }
     if (seen.has(key)) continue;
     seen.add(key);

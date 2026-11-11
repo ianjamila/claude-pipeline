@@ -13,7 +13,7 @@ import {
   beginAttempt, confirmAttempt, openRecord, queueRecordPath, readQueueRecord, setHold,
 } from '../pipeline/lib/merge-queue.mjs';
 import { run as runQueueSweep } from '../pipeline/commands/queue-sweep.mjs';
-import { sweepRepo, bestEffortSweep } from '../pipeline/lib/queue-sweep.mjs';
+import { sweepRepo, bestEffortSweep, knownRepos } from '../pipeline/lib/queue-sweep.mjs';
 import { recheckGatedRecorded } from '../pipeline/lib/queue-route.mjs';
 import { CANONICAL_CHECKS } from '../pipeline/lib/finalgate.mjs';
 import {
@@ -522,4 +522,21 @@ test('R3-F3: a gated recheck that throws leaves the record live and unspent (out
   assert.deepEqual(second.settled.map((s) => s.outcome), ['requeued']);
   assert.deepEqual(ok.calls, [`enqueue 7 ${HEAD.slice(0, 8)}`]);
   assert.equal(readQueueRecord(root, 7).terminal, null);
+});
+
+test('R2-F2: knownRepos reports a directory whose git fails for another reason than "not a repository" through onError; a real non-repository stays silently skipped', () => {
+  const w = world();
+  const home = mkdtempSync(join(tmpdir(), 'cp-qsweep-home-'));
+  const env = { ...w.env, HOME: home, USERPROFILE: home };
+  const plain = mkdtempSync(join(tmpdir(), 'cp-qsweep-plain-')); // exists, not a repository
+  const broken = mkdtempSync(join(tmpdir(), 'cp-qsweep-broken-')); // a .git file git cannot read: a failure, not "not a repository"
+  writeFileSync(join(broken, '.git'), 'this is not a gitfile\n');
+  const good = repoDir();
+  writeFileSync(join(w.lockDir, 'queue-sweep-repos.json'), JSON.stringify({ repos: [plain, broken, good] }));
+  const errors = [];
+  assert.deepEqual(knownRepos({ home, env, onError: (e) => errors.push(e) }), [good]);
+  assert.equal(errors.length, 1, JSON.stringify(errors));
+  assert.ok(errors[0].includes(broken), errors[0]);
+  assert.ok(!errors.some((e) => e.includes(plain)), 'a genuine non-repository is skipped silently');
+  assert.deepEqual(knownRepos({ home, env }), [good], 'a caller with no onError sees the same list');
 });
