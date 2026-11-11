@@ -596,3 +596,67 @@ test('the default notifier is the pipeline-update one: the install notice reache
   assert.match(readFileSync(join(logDir, 'pipeline-update-notices.log'), 'utf8'), / pipeline updated to aaaaaaa \(Add the thing \(#99\)\)\n$/);
   assert.equal(existsSync(join(logDir, 'queue-sweep-notices.log')), false, 'not the queue sweep\'s log');
 });
+
+// ---- R1-F3: the installer's exit 3 carries a reason (live | deadline | admission-busy) and a message; none of them is "a review is live" except the first ----
+const deferredBy = (reason, message) => ({ exitCode: 1, output: { ok: false, error: 'deferred', deferred: true, live: [], deferReason: reason, message } });
+const DEADLINE = deferredBy('deadline', 'the live-work scan did not finish before its deadline');
+const BUSY_ADMISSION = deferredBy('admission-busy', 'pipeline update in progress, retry in a minute');
+
+test('a scan deadline overrun is deferred with its own reason and wording: never "a review is live"; retried every run, no notice before the 3rd in a row', async () => {
+  const t = rig({ install: DEADLINE });
+  for (let i = 1; i <= TRANSIENT_RUNS; i += 1) {
+    t.w.clock += 60 * 1000;
+    const r = await t.go();
+    assert.deepEqual([r.exitCode, r.output.action, r.output.reason], [0, 'deferred', 'deadline'], `run ${i}`);
+    assert.doesNotMatch(r.output.message, /review is live|waits for a live review/, `run ${i}`);
+    assert.match(r.output.message, /deadline/);
+    assert.equal(t.status().state, 'deferred-by-review');
+    assert.equal(t.status().deferReason, 'deadline');
+    assert.equal(t.status().deferredBy, undefined);
+    assert.equal(t.calls.notify.length, i < TRANSIENT_RUNS ? 0 : 1, `notices after run ${i}`);
+  }
+  assert.match(t.calls.notify[0], /3 runs in a row \(deadline\)/);
+  assert.doesNotMatch(t.calls.notify[0], /a review is live|running review/);
+  assert.ok(t.calls.notify[0].includes(ownerCommand(t.home)));
+  await t.go();
+  assert.equal(t.calls.notify.length, 1, 'one notice per streak');
+});
+
+test('admission-busy defers the same way, with its own wording; a live-review deferral in between breaks the streak; a good run ends it', async () => {
+  const t = rig({ install: BUSY_ADMISSION });
+  await t.go(); await t.go();
+  assert.equal(t.status().deferReason, 'admission-busy');
+  t.w.install = DEFERRED; // a real live review: the streak of "busy" runs is broken
+  await t.go();
+  assert.equal(t.status().deferReason, undefined);
+  assert.equal(t.status().deferredBy.length, 2);
+  t.w.install = BUSY_ADMISSION;
+  await t.go(); await t.go();
+  assert.equal(t.calls.notify.length, 0, 'the count started again');
+  await t.go();
+  assert.equal(t.calls.notify.length, 1);
+  assert.match(t.calls.notify[0], /\(admission-busy\)/);
+  t.w.install = OK_INSTALL;
+  assert.equal((await t.go()).output.action, 'updated');
+  assert.equal(t.status().state, 'current');
+  assert.equal(t.status().deferReason, undefined);
+});
+
+test('a deadline deferral longer than 24 hours earns ONE notice that names the real cause, not a review', async () => {
+  const t = rig({ install: DEADLINE });
+  await t.go();
+  t.w.clock = T0 + DEFER_NOTICE_MS + 60 * 1000;
+  await t.go();
+  const day = t.calls.notify.filter((n) => /more than 24 hours/.test(n));
+  assert.equal(day.length, 1);
+  assert.match(day[0], /live-work scan did not finish before its deadline/);
+  assert.doesNotMatch(day[0], /Finish or close them|a review is live/);
+  assert.equal(t.status().deferredSince, new Date(T0).toISOString());
+});
+
+test('an unknown deferral reason is read as a live review (an older installer sends none)', async () => {
+  const t = rig({ install: deferredBy('something-new', 'x') });
+  const r = await t.go();
+  assert.equal(r.output.action, 'deferred');
+  assert.equal(t.status().deferReason, undefined);
+});

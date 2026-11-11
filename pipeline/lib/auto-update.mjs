@@ -31,7 +31,9 @@
 //     mainSha: full sha of upstream main, or null when it could not be resolved,
 //     mainTitle?: subject of main's commit (the PR title), when known,
 //     deferredSince?: ISO time of the first deferral of this streak,          (deferred-by-review only)
-//     deferredBy?: [{ repo, pr, worktree, kind? }],  what is live           (deferred-by-review only)
+//     deferredBy?: [{ repo, pr, worktree, kind? }],  what is live           (deferred-by-review only; a live-review deferral)
+//     deferReason?: 'deadline' | 'admission-busy', the installer's other deferrals, which are not a review (the scan overran its deadline;
+//                   another update or a review start holds admission); `message` carries the installer's sentence. The 3rd run in a row notifies once.
 //     reason?: short code: modified | incomplete | ahead | diverged | check-failed | fetch-failed | install-failed | upstream-unresolved ...
 //     message?: one human sentence for `reason`,
 //     command?: the exact command the owner runs by hand }                   (blocked-modified and failed)
@@ -261,17 +263,30 @@ export async function runScheduled({ home, env, ctx = {}, say = () => {}, deps }
     }
 
     if (o.error === 'deferred') {
-      const by = normalizeLive(o.live);
+      const dreason = o.deferReason === 'deadline' || o.deferReason === 'admission-busy' ? o.deferReason : 'live';
+      const by = dreason === 'live' ? normalizeLive(o.live) : [];
       // The count starts at the first deferral of an unbroken streak; a first-deferral time in the future means the clock went backwards.
       const prevSince = prev?.state === 'deferred-by-review' ? Date.parse(prev.deferredSince) : NaN;
       const since = Number.isFinite(prevSince) && prevSince <= nowDate.getTime() ? prev.deferredSince : checkedAt;
-      state = state.deferNotified ? { deferNotified: state.deferNotified } : {};
-      const message = `main ${sha7(sha)} waits for a live review: ${describeLive(by)}`;
+      const carried = state.deferNotified ? { deferNotified: state.deferNotified } : {};
+      // 'deadline' / 'admission-busy' are not a review: they name their own cause, and like a busy install lock they tell the owner only on the 3rd run in a row.
+      const cause = dreason === 'live' ? describeLive(by) : (o.message || dreason);
+      const message = dreason === 'live' ? `main ${sha7(sha)} waits for a live review: ${cause}` : `main ${sha7(sha)} deferred (${dreason}): ${cause}`;
+      let streakTold;
+      if (dreason === 'live') state = carried;
+      else {
+        const runs = (state.transient?.reason === dreason ? Number(state.transient.runs) || 0 : 0) + 1;
+        state = { ...carried, ...(Array.isArray(state.notified) ? { notified: state.notified } : {}), transient: { reason: dreason, runs } };
+        persist();
+        if (runs >= TRANSIENT_RUNS) streakTold = await tell(`transient:${dreason}:${sha}`, `pipeline update to ${sha7(sha)} was deferred ${runs} runs in a row (${dreason}): ${cause}. It retries every run; to update by hand, run in your own terminal: ${command}`);
+      }
       say(`scheduled update deferred: ${message}`);
-      let told;
+      let told = streakTold;
       if (nowDate.getTime() - Date.parse(since) > DEFER_NOTICE_MS && state.deferNotified !== since) {
         try {
-          await notifier(`pipeline update to ${sha7(sha)} has been waiting more than 24 hours for live reviews: ${describeLive(by)}. Finish or close them, or run in your own terminal: ${command}`);
+          await notifier(dreason === 'live'
+            ? `pipeline update to ${sha7(sha)} has been waiting more than 24 hours for live reviews: ${describeLive(by)}. Finish or close them, or run in your own terminal: ${command}`
+            : `pipeline update to ${sha7(sha)} has been deferred for more than 24 hours (${dreason}): ${cause}. Run in your own terminal: ${command}`);
           state = { ...state, deferNotified: since };
           told = { sent: true };
         } catch (err) {
@@ -279,8 +294,11 @@ export async function runScheduled({ home, env, ctx = {}, say = () => {}, deps }
         }
       }
       persist();
-      writeStatus({ state: 'deferred-by-review', ...ids(), mainTitle: o.mainTitle, deferredSince: since, deferredBy: by });
-      return done(EXIT.OK, { ok: true, action: 'deferred', message, live: by, deferredSince: since, ...(told ? { notify: told } : {}) });
+      writeStatus({
+        state: 'deferred-by-review', ...ids(), mainTitle: o.mainTitle, deferredSince: since,
+        ...(dreason === 'live' ? { deferredBy: by } : { deferReason: dreason, message: cause }),
+      });
+      return done(EXIT.OK, { ok: true, action: 'deferred', reason: dreason, message, live: by, deferredSince: since, ...(told ? { notify: told } : {}) });
     }
 
     if (o.error === 'install-changed') {

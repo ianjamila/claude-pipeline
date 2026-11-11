@@ -22,6 +22,9 @@ const REPO_RE = /^[A-Za-z0-9._-]{1,100}(?:\/[A-Za-z0-9._-]{1,100}){0,2}$/;
 const lineFor = (status) => {
   if (status.state === 'behind') return 'pipeline update available — installs automatically when no review is running';
   if (status.state === 'deferred-by-review') {
+    // Only a fixed reason code picks the wording (never free text): the other deferrals are not a review.
+    if (status.deferReason === 'deadline') return 'pipeline update waiting: the check for running reviews did not finish in time, it will retry';
+    if (status.deferReason === 'admission-busy') return 'pipeline update waiting: another update or a review start is in progress, it will retry';
     const by = Array.isArray(status.deferredBy) ? status.deferredBy.find((d) => d && typeof d === 'object' && typeof d.repo === 'string' && REPO_RE.test(d.repo)) : null;
     if (by && Number.isSafeInteger(by.pr) && by.pr > 0) return `pipeline update waiting on a review in ${by.repo} #${by.pr}`;
     if (by) return `pipeline update waiting on a review in ${by.repo}`;

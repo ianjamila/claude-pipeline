@@ -159,3 +159,16 @@ test('a status file the process may not read is silent (exit 0), not an error', 
     chmodSync(file, 0o600);
   }
 });
+
+// R1-F3: a deferral that is not a live review must not say one is running; only the fixed reason codes pick the wording.
+test('deferred-by-review with deferReason deadline / admission-busy: its own plain line, no review named', () => {
+  const dl = hook({ ...base, state: 'deferred-by-review', deferReason: 'deadline' });
+  assert.equal(dl.stdout, 'pipeline update waiting: the check for running reviews did not finish in time, it will retry\n');
+  const ab = hook({ ...base, state: 'deferred-by-review', deferReason: 'admission-busy' });
+  assert.equal(ab.stdout, 'pipeline update waiting: another update or a review start is in progress, it will retry\n');
+});
+test('deferReason live, unknown or hostile text falls back to the live-review wording; the free-text message is never printed', () => {
+  assert.equal(hook({ ...base, state: 'deferred-by-review', deferReason: 'live' }).stdout, 'pipeline update waiting on a running review\n');
+  assert.equal(hook({ ...base, state: 'deferred-by-review', deferReason: 'run `rm -rf /`', message: 'evil' }).stdout, 'pipeline update waiting on a running review\n');
+  assert.equal(hook({ ...base, state: 'deferred-by-review', deferReason: 'deadline', message: 'evil text' }).stdout.includes('evil'), false);
+});

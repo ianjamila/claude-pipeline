@@ -44,6 +44,10 @@ if (mode === 'exit3-plain' && !process.argv.includes('--check')) {
   console.log(JSON.stringify({ ok: false, error: 'something-else' }));
   process.exit(3);
 }
+if ((mode === 'deadline' || mode === 'admission-busy') && process.argv.includes('--require-no-live-reviews') && !process.argv.includes('--check')) {
+  console.log(JSON.stringify({ ok: false, deferred: true, reason: mode, live: [], message: mode === 'deadline' ? 'the live-work scan did not finish before its deadline' : 'pipeline update in progress, retry in a minute' }));
+  process.exit(3);
+}
 if (mode === 'verify-failed' && !process.argv.includes('--check')) {
   console.log(JSON.stringify({ ok: false, error: 'verify-failed', verify: { ok: false, drift: [{ message: 'hook a is missing' }, { message: 'unit b differs' }] } }));
   process.exit(1);
@@ -205,4 +209,18 @@ test('a held (verify-failed) sha is released only when the downloaded installer 
   const fixed = await scheduledRun('ok', { dir, identity: [pristine(sha)] });
   assert.equal(fixed.r.silent, true);
   assert.equal(fixed.status.state, 'current');
+});
+
+// R1-F3 through the real child: exit 3 {deferred, reason, message} keeps its reason and message to the status file.
+test('installer exit 3 with reason deadline / admission-busy keeps the reason and the installer message; neither is reported as a live review', async () => {
+  for (const mode of ['deadline', 'admission-busy']) {
+    const t = await scheduledRun(mode);
+    assert.deepEqual([t.r.exitCode, t.r.output.action, t.r.output.reason], [0, 'deferred', mode], mode);
+    assert.equal(t.status.state, 'deferred-by-review');
+    assert.equal(t.status.deferReason, mode);
+    assert.match(t.status.message, mode === 'deadline' ? /scan did not finish/ : /update in progress/);
+    assert.doesNotMatch(t.r.output.message, /review is live|waits for a live review/);
+    assert.equal(t.argv.length, 1, 'no verify step');
+    assert.deepEqual(t.leftovers, []);
+  }
 });

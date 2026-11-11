@@ -278,7 +278,13 @@ async function performUpdate({ home, main, before, relation, env, say, expectIns
     result.install = { ok: install.ok, exitCode: install.code, error: install.json?.error ?? null };
     if (requireNoLiveReviews && install.code === 3 && install.json?.deferred === true) {
       const live = Array.isArray(install.json.live) ? install.json.live : [];
-      return fail('deferred', `a review is live, so the update waits (${live.length} live)`, { deferred: true, live });
+      // The installer says WHY it deferred: a live review, a scan that overran its deadline, or another update / a review start holding admission.
+      // Only 'live' is about a review; the others keep the installer's own message.
+      const deferReason = ['live', 'deadline', 'admission-busy'].includes(install.json.reason) ? install.json.reason : 'live';
+      const why = typeof install.json.message === 'string' ? install.json.message.slice(0, 300) : '';
+      const message = deferReason === 'live' ? `a review is live, so the update waits (${live.length} live)`
+        : `${why || (deferReason === 'deadline' ? 'the live-work scan did not finish before its deadline' : 'another update or a review start holds admission')}, so the update waits (${deferReason})`;
+      return fail('deferred', message, { deferred: true, live, deferReason });
     }
     if (expectInstalled && install.json?.error === 'expect-installed-mismatch') {
       return fail('install-changed', install.json.message || 'the installed copy changed while the update was downloading, so it was left alone');
