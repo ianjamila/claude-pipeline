@@ -19,6 +19,8 @@ import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
+import { askFields, clickGate } from '../lib/click-ask.mjs';
+import { roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs';
 import { grantIdOf, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, applyOwnerRuling, applyTestResult, claudeRulingRefusal, DECISIONS, finalizeWithoutArbiter, isOwnerRuled, isProtectedFinal,
@@ -39,14 +41,16 @@ export const meta = {
     '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented',
     '  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman',
     'pipeline triage light-lane --round R [--repo DIR]',
-    'pipeline triage ruling-request --pr N --ids ID[,ID…] [--repo DIR]',
+    'pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--repo DIR]',
     '  -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state\'s, or a repository off github.com)',
-    'pipeline triage round-request --pr N [--repo DIR]',
+    '  -> --ask (click-to-approve #261, owner_approval: chat): also {ask: {askId, questions}}: a choice question (Not now | Accept all | Follow-up all | Reject all) whose text is the item summaries and then exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click as the same ruling a typed `ID: accept|follow-up|reject` per asked id records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
+    'pipeline triage round-request --pr N [--ask] [--repo DIR]',
     '  -> {ok, line, k, n, head}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`',
     '     (k = the counted round it would be: reviewed rounds + 1, base-only and resolution-only rounds not counted; n = the round number to pass to codex-review --round; head = the checked-out HEAD)',
     '  -> commit, push and quick-verify first: the grant is for that head. The owner answers `extra round` (or `grant round K`, optionally with #N); the owner-go hook records it, and',
     '     `codex-review --round n` then claims it (see its usage). Exit 1 for label mode (no grant exists), a --pr that is not the review state\'s, a repository off github.com,',
     '     or a round that is already allowed (within review.max_rounds, the automatic extra round, or an open grant for this head)',
+    '  -> --ask (click-to-approve #261): also {ask: {askId, questions}}: a choice question (No | Yes, one more round) whose text is exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click on Yes as the same grant a typed `extra round` records; otherwise ask: null and askSkipped (owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
     'pipeline triage claude-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --pr N [--repo DIR]',
     '  -> {ok, round, id, final, published, next?}; records CLAUDE\'s decision (final.by claude, needsHuman false, the overruled final and the cause kept) for an item waiting for a human, or tightens a Claude dismissal',
     '  -> only with owner_approval: chat; exit 1 for label mode, a --pr that is not the review state\'s, an empty reason or one over 1000 characters, or a ruling the rules refuse (state untouched)',
@@ -573,13 +577,16 @@ const contentOfState = (state) => (ids) => {
   return items ? rulingContentDigest(items) : null;
 };
 
+const oneLine = (x) => String(x ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
+
 // The line that ends the reply asking the owner to rule: the CLI writes it, so the agent cannot state a digest of its own choosing.
 async function rulingRequest(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, ids: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, ids: { type: 'string' }, repo: { type: 'string' }, ask: { type: 'boolean' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean).map((id) => id.toUpperCase()))]; // (R1-B1 and r1-b1 are one item)
   if (ids.length === 0) throw new UsageError('--ids must name at least one item');
   const root = resolveRepo(values, ctx);
+  const config = values.ask === true ? (await requireConfig(root)).config : null;
   const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, reason } });
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => withStateLock(root, ctx, () => {
@@ -592,14 +599,19 @@ async function rulingRequest(rest, ctx) {
     }
     const { slug, host } = gh.repo();
     if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded ruling names a repository on github.com`);
-    return { exitCode: EXIT.OK, output: { ok: true, line: `⚖️ Owner ruling needed #${pr}: ${items.map((i) => i.id).join(', ')} · content ${rulingContentDigest(items)} · repo ${slug}` } };
+    const line = `⚖️ Owner ruling needed #${pr}: ${items.map((i) => i.id).join(', ')} · content ${rulingContentDigest(items)} · repo ${slug}`;
+    if (values.ask !== true) return { exitCode: EXIT.OK, output: { ok: true, line } };
+    // The question: one summary row per item, then exactly the printed line (presentedRuling reads the LAST line, so the rows bind nothing and the owner sees what is asked).
+    const block = [...items.map((i) => `${i.id} · ${i.bucket} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}`), line].join('\n');
+    const parts = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block });
+    return { exitCode: EXIT.OK, output: { ok: true, line, ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
   }, pr));
 }
 
 // The line that ends the reply asking the owner for one more review round: the CLI writes it (counted ordinal k, the checked-out head, the
 // repository gh resolves on github.com), so the agent cannot ask for a round or a head of its own choosing. Chat mode only.
 async function roundRequest(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, repo: { type: 'string' }, ask: { type: 'boolean' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
@@ -621,7 +633,9 @@ async function roundRequest(rest, ctx) {
         ? `round ${k} is already granted for this head: run codex-review --round ${n}`
         : `round ${k} is already allowed (${admission === 'auto-extra' ? 'the automatic extra round' : 'within review.max_rounds'}): run codex-review --round ${n}`);
     }
-    return { exitCode: EXIT.OK, output: { ok: true, line: `🔁 Extra review round needed #${pr}: round ${k} · head ${head.slice(0, 12)} · repo ${slug}`, k, n, head } };
+    const line = `🔁 Extra review round needed #${pr}: round ${k} · head ${head.slice(0, 12)} · repo ${slug}`;
+    const asked = values.ask === true ? askFields({ gate: clickGate({ config, root, ctx }), parts: roundAsk({ repo: slug, pr, line }), ctx }) : {};
+    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...asked } };
   }, pr));
 }
 
