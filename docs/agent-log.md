@@ -132,3 +132,4 @@ full record.
 - 2026-11-11 · #254 · Quick verify also checks docs/cli.md usage (exact test-file names in the runner) · risk unknown · rounds 0 · arbiter 0 · awaiting-review
 - 2026-11-11 · #240 · owner-go: invisible turns and typed-while-busy answers bind nothing (#191) · risk high · rounds 9 · arbiter 7 · awaiting-owner-merge
 - 2026-11-11 · #255 · Fix rounds get a narrow fix-verify Fable brief at medium effort · risk unknown · rounds 0 · arbiter 0 · awaiting-review
+- 2026-11-11 · #254 · Quick verify also checks docs/cli.md usage (exact test-file names in the runner) · risk high · rounds 2 · arbiter 1 · awaiting-owner-merge
