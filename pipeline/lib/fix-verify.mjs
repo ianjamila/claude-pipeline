@@ -39,6 +39,13 @@ export function previousAccepts(state, n) {
 // The state-only part of the decision. -> { ok: true, previous } | { ok: false, reason }. The caller adds the git part (hard stops, paths).
 export function fixRoundCandidate(state, round, { scope }) {
   if (scope !== 'round') return { ok: false, reason: 'whole-pr scope' };
+  // The scope label only says an earlier proven pass exists; what the round was diffed against is its review base kind. Allow-list: 'previous'
+  // (the plain from..head slice) and a round stored before the kind existed. 'whole-pr' (a conflicting base merge: the whole PR against the new
+  // base) is a broad review; 'synthetic' is a tree id (the base branch was merged in cleanly) that merge-base-driven hard-stop scanning cannot take;
+  // 'resolution' and anything unknown are not a plain fix slice either.
+  const kind = round.reviewBaseKind;
+  if (kind === 'synthetic') return { ok: false, reason: 'synthetic review base (the base branch was merged in since the previous round: its range cannot be hard-stop scanned against a tree)' };
+  if (kind !== undefined && kind !== 'previous') return { ok: false, reason: `review base kind ${JSON.stringify(kind)} (only a plain previous-round slice can be a fix round)` };
   if (round.fableRefresh === true) return { ok: false, reason: 'fable refresh round' };
   if (round.resolutionOnly === true) return { ok: false, reason: 'resolution-only round' };
   const previous = previousAccepts(state, round.n);

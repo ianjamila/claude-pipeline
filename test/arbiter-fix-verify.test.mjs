@@ -237,6 +237,105 @@ test('arbiter needed: a config that cannot be read is the full brief (fail close
   assert.deepEqual([r.json.scope, r.json.brief], ['round', 'full']);
 });
 
+// ---- eligibility: what the round was diffed against, the base-side config, size, --full ---------------------------------------------------------
+
+test('arbiter needed: a round-scoped round whose review base is whole-pr (conflicting base merge fallback) is the full brief, with the reason', (t) => {
+  const w = fixWorld(t);
+  w.edit((s) => { s.rounds[1].reviewBaseKind = 'whole-pr'; });
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.scope, r.json.brief, r.json.agent], ['round', 'full', 'arbiter']);
+  assert.match(r.json.briefReason, /review base kind "whole-pr"/);
+  assert.match(w.state().rounds[1].arbiter.briefReason, /whole-pr/);
+});
+
+test('arbiter needed: a fix round whose base is a synthetic tree (base branch merged in cleanly) is the full brief, and says why', (t) => {
+  const w = world(t);
+  w.round1('ACCEPT');
+  // main moves on (another PR's work), the branch takes it in with a clean merge, then the fix is committed
+  w.repo.checkout('main');
+  w.repo.write('src/other.js', 'export const other = 1;\n');
+  w.repo.commit('other work on main');
+  w.repo.checkout('feat/x');
+  w.repo.git(['merge', '--no-edit', '-q', 'main']);
+  w.round2();
+  assert.equal(w.state().rounds[1].reviewBaseKind, 'synthetic');
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.scope, r.json.brief, r.json.effort, r.json.agent], ['round', 'full', 'high', 'arbiter']);
+  assert.match(r.json.briefReason, /synthetic review base/);
+  assert.equal(w.state().rounds[1].arbiter.briefReason, r.json.briefReason);
+});
+
+test('arbiter needed: a sensitive file the BASE side config lists is the full brief even when the working-tree config no longer lists it', (t) => {
+  const w = fixWorld(t, { yml: YML('risk:\n  high_risk_paths: [src/b.js]\n'), files: { 'src/b.js': bFile(true) } });
+  // clear the list in the working tree after the fact: the config committed at the fork point still has it
+  writeFileSync(join(w.repo.dir, '.claude', 'pipeline.yml'), YML());
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.scope, r.json.brief], ['round', 'full']);
+  assert.match(r.json.briefReason, /sensitive path .*base config/);
+});
+
+test('arbiter needed: a base-side hard-stop rule the working-tree config dropped is the full brief', (t) => {
+  const w = fixWorld(t, { yml: YML('hard_stops:\n  paths: [src/hard.js]\n'), files: { 'src/b.js': bFile(true), 'src/hard.js': 'export const h = 1;\n' } });
+  writeFileSync(join(w.repo.dir, '.claude', 'pipeline.yml'), YML());
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.scope, r.json.brief], ['round', 'full']);
+  assert.match(r.json.briefReason, /hard-stop hit .*base config/);
+});
+
+test('arbiter needed: a base side config that cannot be read (no fork point, or one that holds no config) is the full brief, with the reason', (t) => {
+  const w = fixWorld(t);
+  w.edit((s) => { delete s.rounds[1].forkPoint; });
+  let r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.brief, r.json.briefReason], ['full', 'the round records no fork point']);
+  w.edit((s) => { s.rounds[1].forkPoint = '0'.repeat(40); });
+  r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.brief, 'full');
+  assert.match(r.json.briefReason, /fork point/);
+});
+
+test('arbiter needed: a fix round that adds many lines in files nobody calls sensitive is the full brief (risk level is not low)', (t) => {
+  const big = Array.from({ length: 200 }, (_, i) => `export const extra${i} = ${i};`).join('\n') + '\n';
+  const w = fixWorld(t, { files: { 'src/b.js': bFile(true), 'src/extra.js': big } });
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.scope, r.json.brief, r.json.agent], ['round', 'full', 'arbiter']);
+  assert.match(r.json.briefReason, /medium risk .*changed lines/);
+});
+
+test('arbiter needed: the fix-verify choice prints and stores its reason', (t) => {
+  const w = fixWorld(t);
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.brief, 'fix-verify');
+  assert.match(r.json.briefReason, /^fix round: round 1 accepted 1 item\(s\)/);
+  assert.equal(w.state().rounds[1].arbiter.briefReason, r.json.briefReason);
+});
+
+test('arbiter needed --full: forces the full brief (agent arbiter, effort high); the stored brief and the digest change, apply proves it as full', (t) => {
+  const w = fixWorld(t);
+  const auto = w.needed(2).json;
+  assert.equal(auto.brief, 'fix-verify');
+  const r = w.cli(['arbiter', 'needed', '--round', '2', '--full']);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.brief, r.json.effort, r.json.agent, r.json.briefReason], ['full', 'high', 'arbiter', 'forced by --full']);
+  assert.notEqual(r.json.digest, auto.digest);
+  assert.notEqual(r.json.tag, auto.tag);
+  assert.doesNotMatch(w.inputText(2), /FIX-VERIFY|Brief:/);
+  const stored = w.state().rounds[1].arbiter;
+  assert.deepEqual([stored.brief, stored.effort, stored.agent, stored.inputDigest], ['full', 'high', 'arbiter', r.json.digest]);
+  const refused = w.apply(2, r.json, { effort: 'medium', agentType: 'arbiter-fix' });
+  assert.notEqual(refused.code, 0);
+  const a = w.apply(2, r.json, { effort: 'high', agentType: 'arbiter' });
+  assertExit(a, 0, a.stdout);
+  assert.equal(w.state().rounds[1].arbiter.proofOk, true);
+});
+
 // ---- stored, not recomputed ------------------------------------------------------------------------------------------------------------------
 
 test('arbiter needed re-run recomputes and re-stores the brief; the digest and tag change with it', (t) => {
@@ -369,6 +468,11 @@ test('fix-verify lib: expectations, accepted efforts and the state-only conditio
   assert.equal(fixRoundCandidate(state, next, { scope: 'whole-pr' }).ok, false);
   assert.equal(fixRoundCandidate(state, { n: 4, fableRefresh: true }, { scope: 'round' }).ok, false);
   assert.equal(fixRoundCandidate(state, { n: 4, resolutionOnly: true }, { scope: 'round' }).ok, false);
+  // the review base kind is an allow-list: a plain previous-round slice, or a round stored before the kind existed
+  assert.equal(fixRoundCandidate(state, { n: 4, reviewBaseKind: 'previous' }, { scope: 'round' }).ok, true);
+  for (const kind of ['whole-pr', 'synthetic', 'resolution', 'bogus', null, '']) {
+    assert.equal(fixRoundCandidate(state, { n: 4, reviewBaseKind: kind }, { scope: 'round' }).ok, false, String(kind));
+  }
   assert.equal(fixRoundCandidate({ rounds: [{ n: 1, items: [] }] }, { n: 2 }, { scope: 'round' }).ok, false);
   assert.equal(fixRoundCandidate({ rounds: [] }, { n: 1 }, { scope: 'round' }).ok, false);
 });
