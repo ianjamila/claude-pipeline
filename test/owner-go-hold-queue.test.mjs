@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ownerSays } from './helpers/owner-go.mjs';
-import { bump, cli, scenario, ymlFor, MERGE_SHA, PR } from './helpers/gate-env.mjs';
+import { bump, cli, scenario, ymlFor, BASE_SHA, MERGE_SHA, PR, QUEUE_AWARE_SHA } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 import { renderEvent } from '../pipeline/lib/run-events.mjs';
@@ -44,15 +44,19 @@ const OUT = (events) => (h) => reply(node(h), events);
 
 const stateFile = () => join(mkdtempSync(join(tmpdir(), 'cp-queue-hold-')), 'queue.json');
 const goYml = () => ymlFor().replace(/ {2}command: .*\n/, '');
+const customYml = () => `${ymlFor()}hard_stops:
+  paths: ['src/**']
+owner_approval: chat
+`; // (the repo's own merge command: asked whether the branch knows the queue)
 const yml = () => `${goYml()}hard_stops:\n  paths: ['src/**']\nowner_approval: chat\n`;
 const unique = (repo) => { bump(repo); repo.write('.salt', randomUUID()); };
 
 // A PR held by needs-human with a merge queue on the base: the queue fake answers the GraphQL queue calls, the hold fake everything else.
-function world({ after = [], state = {}, gh = {}, env = {}, liftedChecks } = {}) {
+function world({ after = [], state = {}, gh = {}, env = {}, liftedChecks, custom = false } = {}) {
   const qfile = stateFile();
   const timing = { PIPELINE_HOLD_RETRY_MS: '1', PIPELINE_QUEUE_POLL_MS: '20', PIPELINE_QUEUE_CONFIRM_MS: '400', PIPELINE_QUEUE_CONFIRM_POLL_MS: '20', PIPELINE_QUEUE_WAIT_MS: '300', PIPELINE_MERGE_POLL_MS: '20', ...env };
   const s = scenario({
-    yml: yml(), report: null, state: null, change: unique,
+    yml: custom ? customYml() : yml(), report: null, state: null, change: unique,
     gh: {
       mergeStateStatus: 'CLEAN', labels: ['needs-human'], queue: true, ...gh,
       extra: [
@@ -1017,4 +1021,24 @@ test('#237 a head that moved whose entry cannot be read afterwards: nothing is e
   assert.equal(readQueueRecord(root, 7).head, HEAD);
   assert.equal(readQueueRecord(root, 7).terminal, null);
   assert.deepEqual(gh.calls, []);
+});
+
+// ---- a branch that predates the queue is refused before the hold is lifted (cp #242 R1-F4) ----------------------------------------------------
+
+test('custom merge command + a held PR whose branch lacks the marker commit: refused right after the precheck, BEFORE the hold lift: no label event, no comment, no guard wait, nothing enqueued or run', (t) => {
+  const s = world({ custom: true, gh: { queueAware: QUEUE_AWARE_SHA } });
+  approve(t, s); // (the dry run is clean: the branch contains the marker commit when the owner says "merge")
+  // ... then GitHub answers differently at the real run (a base that moved, a branch that was never caught up): the ancestry now says the branch lacks it
+  const script = join(s.fake.dir, 'script.json');
+  s.fake.setScript([{ match: `repos/acme/widgets/compare/${QUEUE_AWARE_SHA}\\.\\.\\.`, stdoutJson: { status: 'diverged', behind_by: 0, ahead_by: 1, base: BASE_SHA } }, ...JSON.parse(readFileSync(script, 'utf8'))]);
+  const before = s.lines().length;
+  const r = s.go();
+  assertExit(r, 1, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.error, 'queue-branch-predates-switch');
+  assert.equal(r.json.queued, false);
+  const lines = s.lines().slice(before);
+  assert.deepEqual(lines.filter((l) => /-X (POST|PUT|PATCH|DELETE)|--remove-label|--add-label|statuses|check-runs|mutation Enqueue/.test(l)), [], 'nothing was written or waited for');
+  assert.deepEqual(s.st().labels, ['needs-human'], 'the label was never lifted');
+  assert.equal(s.mergeCalls().length, 0, 'the merge command never ran');
+  assert.equal(s.rec(), null, 'no record was begun');
 });

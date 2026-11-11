@@ -190,6 +190,9 @@ export const run = guarded(async (argv, ctx) => {
       Object.assign(carried, pre.holdFields);
       // (the record of this head already ended: the decision is judged below, once the run record says whether the owner's word is required: staleEnd)
       if (pre.watch) return watchOnly({ route, gh, pr, head: gate.head });
+      // A branch whose merge script may not know the queue is refused here, before anything else is read or written (queue-branch-predates-switch).
+      const predates = await route.checkBranch({ requeue: pre.requeue === true });
+      if (predates !== null) return predates;
     }
 
     // 1a. A resumed run never merges on its own: the run record (viewer-authored, so not forgeable by a commenter) says whether this
@@ -490,6 +493,9 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
     if (pre.done) return pre.done;
     Object.assign(carried, pre.holdFields);
     if (pre.watch) return watchOnly({ route, gh, pr, head });
+    // A branch whose merge script may not know the queue is refused here, before the live scan, the hold lift and the guard wait (queue-branch-predates-switch).
+    const predates = await route.checkBranch({ requeue: pre.requeue === true });
+    if (predates !== null) return predates;
   }
   // A merge hold ahead of this PR is answered next, before the live check: a stale PR behind an older hold would otherwise fail it
   // with "behind-base ... update the branch", which is exactly what the hold says NOT to do.

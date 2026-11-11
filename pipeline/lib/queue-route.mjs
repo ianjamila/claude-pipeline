@@ -368,6 +368,7 @@ export function createQueueRoute({
   // `requeue`: the head already passed this check at its first enqueue, so a read that THREW (a GitHub blip: state.unreadable) must not spend the owner's word on a
   // refusal: it answers queue-unreadable (nothing enqueued, the record kept, the next pass or the owner's `P merge` tries again, the sweep reads that as unsettled).
   // Only a structural unknown (no usable marker) or a branch that lacks the commit ends it. A first enqueue has nothing to keep: it refuses either way.
+  let branchChecked = false;
   async function branchPredatesQueue({ closeRecord: ends = true, requeue: again = false } = {}) {
     if (isDefaultMergeCommand(config)) return null;
     const state = queueCatchUpState({ gh, branch: config.default_branch, head });
@@ -377,6 +378,14 @@ export function createQueueRoute({
     return refusal('queue-branch-predates-switch', [predatesQueueMessage({ pr, state })], {
       queued: false, branchState: state.kind, queueAwareSha: state.queueAwareSha, ...holdFields,
     });
+  }
+
+  // The same check, run by the merge command right after the precheck answers enqueue, before anything is written (the owner-go route's hold lift, the guard
+  // wait): a refusal then costs no label event, comment or wait. A clean answer is remembered, so the first enqueue below does not read GitHub twice. -> null | the refusal.
+  async function checkBranch({ requeue: again = false } = {}) {
+    const old = await branchPredatesQueue({ requeue: again });
+    branchChecked = old === null;
+    return old;
   }
 
   // ---- 2. enqueue --------------------------------------------------------------------------------------------------------------
@@ -433,8 +442,11 @@ export function createQueueRoute({
     try {
       for (;;) {
         if (enqueueNow) {
-          const old = await branchPredatesQueue({ requeue: requeued === 1 });
-          if (old !== null) return old;
+          if (branchChecked) branchChecked = false; // (checkBranch ran for this first enqueue)
+          else {
+            const old = await branchPredatesQueue({ requeue: requeued === 1 });
+            if (old !== null) return old;
+          }
           openRecord(root, pr, head, approval, opts);
           // SEAM (hold): the record exists, no attempt yet. This is where a lifted needs-human hold is written to it (setHold, owner 'session'),
           // so a signal or a crash between the lift and the enqueue is still known to the record.
@@ -491,5 +503,5 @@ export function createQueueRoute({
     return confirm(await sendEnqueue());
   }
 
-  return { precheck, enqueueAndWatch, reenqueue, budgetMs, budgetMinutes: Math.ceil(budgetMs / 60_000) };
+  return { precheck, checkBranch, enqueueAndWatch, reenqueue, budgetMs, budgetMinutes: Math.ceil(budgetMs / 60_000) };
 }
