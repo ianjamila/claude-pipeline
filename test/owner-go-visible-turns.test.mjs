@@ -627,7 +627,7 @@ test('R5-F1: notes chained to the owner\'s turn, a visibleSynthetic turn, or thr
   }
 });
 
-// ---- R6-F1: the two lines at the top of a session started after /clear are no invisible turn -------------------------------------------
+// ---- R6-F1: the two lines at the top of a session started after /clear ARE invisible (a chain ending at a non-prompt root fails closed) and harmlessly muted -------------------------------------------
 // Real shapes (Claude Code 2.1.318, a transcript's lines 4-8; keys only): a SessionStart hook `attachment` root (parentUuid null, no message), then an isMeta `<local-command-caveat>` user line
 // and a `<command-name>/clear` user line, both WITHOUT promptSource / origin / turnOrigin and chained by a string parentUuid to that attachment (a chain that ends at a non-prompt root).
 // They sit before the owner's first prompt and have no assistant text, so the ask printed after the owner's prompt still binds.
@@ -643,5 +643,13 @@ test('R6-F1: the /clear preamble (SessionStart attachment root, isMeta caveat no
     // the same without the local_command line (the typed prompt chained straight to the command note)
     const typed2 = { ...prompt('ship it'), parentUuid: command.uuid };
     assert.deepEqual(pr(kind, record(kind, [root, caveat, command, typed2, of(typed2, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: the ask binds without the local_command line`);
+    // the fail-closed branch itself (invisibleNote: parent[i] < 0): a note chained to a non-prompt root is invisible wherever it sits, so an ask it follows is muted
+    const caveatAsk = { ...caveat, parentUuid: root.uuid };
+    assert.equal(run(kind, [root, caveatAsk, of(caveatAsk, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: an ask written under a note chained to a non-prompt root binds nothing`);
+    // the same for a newer request printed by such a note after the owner's older, visible ask: it binds nothing (a text-less note alone is no proof: a visible one breaks the strict readers too)
+    const o = prompt('ship it');
+    const root2 = { ...root, uuid: 'u-session-start-root-2' };
+    const m = noteOf(root2);
+    assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), root2, m, of(m, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: a request printed under a note chained to a non-prompt root, after an older owner ask, binds nothing`);
   }
 });
