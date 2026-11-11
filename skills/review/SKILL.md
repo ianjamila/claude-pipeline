@@ -77,7 +77,7 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    with the `errors`; `not-found` / invalid twice ⇒ park, cause `judge:not-found` / `judge:invalid`). A disputed bug with a settle test: implementer writes and commits the test only, then
    `P triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd "<cmd>" --test-file <file>` (the CLI runs it itself). `bug-confirmed` makes the item
    ACCEPT: fixed and marked implemented in step 5, like any accepted item.
-4. **Arbiter** (when `P arbiter needed --round R` says `needed`). One call: the agent named in the `agent` field of its output (`arbiter`, or `arbiter-fix` when `brief` is `fix-verify`: a fix round, Fable at effort medium with a narrow verify-the-fixes input; use exactly the one named, `apply` refuses the other), description = the `tag` it printed, prompt starting
+4. **Arbiter** (when `P arbiter needed --round R` says `needed`). One call: the agent named in the `agent` field of its output (`arbiter`, or `arbiter-fix` when `brief` is `fix-verify`: a fix round, Fable at effort medium with a narrow verify-the-fixes input; use exactly the one named, `apply` refuses the other; if `arbiter-fix` cannot be started (an agent file the terminal has not loaded) or the owner wants a full review, run `P arbiter needed --round R --full` and use `arbiter` at effort high), description = the `tag` it printed, prompt starting
    with its `promptHeader` pasted verbatim, then `Read <inputPath> and rule on every item in it.` (Fable round: and review the diff it names). Then
    `P arbiter apply --round R --tag "<the same tag>"`; exit 2 `not-found`: wait, retry once, then park (cause `arbiter:not-found`);
    exit 1 with `restartRequired` (`stale-terminal` from `needed`, `stale-model` from `apply`; Fable round) ⇒ do NOT retry here and do NOT park: outcome `blocked`, with no `pipeline-blocked`
@@ -96,7 +96,7 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
 **Park** (every `needs-human` stop is this): `gh pr edit N --add-label needs-human`, `P comment --pr N --kind needs-human --reason "<cause, what was checked, what the owner does>"`,
 with `merge.hold_command` in `P config` `P merge-hold --pr N --release --reason parked` (a parked PR must not keep the merge line), then the stop ritual with outcome `needs-human`. The summary renders from the round state, so at least one Codex round must have run; before that a stop is `blocked` or `awaiting-review`. The park comment is your own text: 3.3 shows a later hold from GitHub's label event and quotes the comment only as agent-written.
 
-Book every agent call (implementer, judge, arbiter) right after it returns:
+Book every agent call (implementer, judge, arbiter; an `arbiter-fix` call is booked as role `arbiter`) right after it returns:
 `P cost --pr N --phase <build|review> --role <implementer|judge|arbiter> --from-transcript <the agent's transcript>` (add `--retry` on a fix retry). The transcript is
 `~/.claude/projects/<encoded-cwd>/<session-id>/subagents/agent-<agentId>.jsonl`; the `agentId` is in the Agent tool's result. Calls made before the PR exists (no `N` yet)
 are noted (role, phase, transcript) and all booked right after `gh pr create`. A failed `P cost` is a warning, never a reason to stop.
