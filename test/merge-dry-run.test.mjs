@@ -510,6 +510,32 @@ test('dry run (gate mode), queue ON, custom merge command, the base declares no 
   assert.match(d.r.json.blockers[0].detail, /cannot be shown to contain the commit that taught the merge script about the merge queue.*merge-queue-aware is missing/s);
 });
 
+test('dry run, queue ON, custom merge command: the blocker carries branchState (predates | unknown) and queueAwareSha; a failed marker read (a GitHub blip) is a queue-unreadable blocker, never queue-branch-predates-switch', () => {
+  for (const [why, gh, kind, state] of [
+    ['the branch predates', { queue: true, ...PREDATES }, 'queue-branch-predates-switch', 'predates'],
+    ['no marker on the base', { queue: true }, 'queue-branch-predates-switch', 'unknown'],
+  ]) {
+    const s = scenario({ report: null, state: null });
+    s.fake.setScript(script(s, { behindBy: 2, gh }));
+    const d = dry(s, ['--owner-go']);
+    assertExit(d.r, 1, `${d.r.stderr}${d.r.stdout}`);
+    assert.deepEqual(kinds(d.r), [kind], why);
+    assert.equal(d.r.json.blockers[0].branchState, state, why);
+    assert.equal(d.r.json.blockers[0].queueAwareSha, state === 'predates' ? QUEUE_AWARE_SHA : null, why);
+  }
+  for (const [why, gh] of [['the marker read answers 502', { queue: true, queueAwareFile: 'error' }], ['the ancestry compare answers 502', { queue: true, ...CURRENT, queueAwareIn: 'error' }]]) {
+    const s = scenario({ report: null, state: null });
+    s.fake.setScript(script(s, { behindBy: 2, gh }));
+    const d = dry(s, ['--owner-go']);
+    assertExit(d.r, 1, `${d.r.stderr}${d.r.stdout}`);
+    assert.equal(d.r.json.wouldMerge, false, why);
+    assert.deepEqual(kinds(d.r), ['queue-unreadable'], why);
+    assert.match(d.r.json.blockers[0].detail, /try again in a minute/, why);
+    assert.doesNotMatch(d.r.json.blockers[0].detail, /update-branch/, why);
+    assert.deepEqual(d.writes, [], why);
+  }
+});
+
 test('dry run --owner-go, queue ON, DEFAULT merge command: never checked, so an old branch is no blocker (gh enqueues; no branch code runs)', () => {
   const s = scenario({ report: null, state: null, yml: ymlFor().replace(/ {2}command: .*\n/, '') });
   s.fake.setScript(script(s, { behindBy: 2, gh: { queue: true, ...PREDATES } }));
