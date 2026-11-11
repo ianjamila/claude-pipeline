@@ -76,9 +76,8 @@ const OLD = 'c'.repeat(40);
 const pristine = (sourceSha) => ({ stamp: `1.0+${sourceSha.slice(0, 7)}`, sourceSha, complete: true, sourceDirty: false, modified: [], missing: [], extra: [], scanError: [] });
 
 // One scheduled run against the stub upstream. `identity` is what the installed copy reads as (before, then after the install).
-async function scheduledRun(mode, { identity = [pristine(OLD)] } = {}) {
+async function scheduledRun(mode, { identity = [pristine(OLD)], dir = scratch() } = {}) {
   const { bare, sha } = stubUpstream();
-  const dir = scratch();
   const home = join(dir, 'claude');
   mkdirSync(home, { recursive: true });
   const argvLog = join(dir, 'argv.log');
@@ -186,4 +185,24 @@ test('installer exit 1 {error: verify-failed, verify.drift}: a verification fail
   assert.match(t.notices[0], /will not be retried/);
   assert.deepEqual([t.status.state, t.status.reason], ['failed', 'check-failed']);
   assert.deepEqual(t.leftovers, []);
+});
+
+// R1-B4 through the real download: the hold on a sha whose check failed ends only when a fresh installer --check of that sha passes.
+test('a held (verify-failed) sha is released only when the downloaded installer --check passes for it; a still-failing check keeps the hold', async () => {
+  const dir = scratch();
+  const sha = stubUpstream().sha;
+  const first = await scheduledRun('verify-failed', { dir });
+  assert.equal(first.notices.length, 1);
+  // the files read as a clean main (the failure was settings only), but the check still reports the missing hook
+  const still = await scheduledRun('drift', { dir, identity: [pristine(sha)] });
+  assert.deepEqual([still.r.exitCode, still.r.output.action], [1, 'held']);
+  assert.deepEqual(still.r.output.drift, ['hook a is missing', 'unit b differs']);
+  assert.equal(still.status.state, 'failed');
+  assert.equal(still.notices.length, 0, 'not told again');
+  assert.ok(still.argv.slice(first.argv.length).every((a) => a.includes('--check')), 'only a --check ran, no install');
+  assert.deepEqual(still.leftovers, []);
+  // the owner fixed it: the same --check passes, the job is current
+  const fixed = await scheduledRun('ok', { dir, identity: [pristine(sha)] });
+  assert.equal(fixed.r.silent, true);
+  assert.equal(fixed.status.state, 'current');
 });

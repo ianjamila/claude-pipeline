@@ -131,6 +131,30 @@ function runInstaller(src, args, env) {
   return { code: r.code, ok: r.code === 0 && !r.timedOut, json, stderr: tail(r.stderr), timedOut: r.timedOut };
 }
 
+// Re-runs the installer's own --check of `main.sha` against the installed copy (download, then the downloaded installer's --check: the same check that
+// failed after an install). -> { ok, drift: [string], error? }; ok only when the check exits 0. Never throws; a download that cannot be made is not ok.
+// Used by the scheduled run before it lets go of a "this sha did not verify" hold.
+async function verifyInstalled({ home, main, env }) {
+  const flags = readManifest(home).manifest?.hooks?.guardFiles === false ? ['--skip-file-guard'] : [];
+  let tmp = null;
+  let isoDir = null;
+  try {
+    fs.mkdirSync(home, { recursive: true });
+    tmp = makePrivateTmpDir(home, 'claude-pipeline-verify-');
+    isoDir = makeIsoDir(home);
+    const remote = fetchRemote(env);
+    const src = fetchSource(tmp, isoDir, main.sha, remote);
+    if (!installerAcceptsPrivateTmpSource(src)) return { ok: false, drift: [], error: 'the downloaded installer cannot check from the private download folder' };
+    const check = runInstaller(src, ['--check', '--claude-home', home, '--source', src, '--json', ...flags], env);
+    return { ok: check.ok, drift: (check.json?.drift ?? []).map((d) => d?.message ?? String(d)), ...(check.ok ? {} : { error: check.stderr || `the installer --check exited ${check.code}` }) };
+  } catch (err) {
+    return { ok: false, drift: [], error: String(err?.message ?? err).slice(0, 300) };
+  } finally {
+    if (isoDir) removeTree(isoDir);
+    if (tmp) removeTree(tmp);
+  }
+}
+
 export async function run(argv, ctx = {}) {
   if (argv[0] === 'schedule') return runSchedule(argv.slice(1), ctx);
   const env = ctx.env ?? process.env;
@@ -153,7 +177,7 @@ export async function run(argv, ctx = {}) {
   }
 
   const home = path.resolve(expandHome(values['claude-home'] || path.join(os.homedir(), '.claude')));
-  if (values.scheduled) return runScheduled({ home, env, ctx, say, deps: { mainSha, installedIdentity, relate, performUpdate } });
+  if (values.scheduled) return runScheduled({ home, env, ctx, say, deps: { mainSha, installedIdentity, relate, performUpdate, verifyInstalled } });
   const main = mainSha({ timeoutMs: NETWORK_TIMEOUT_MS, env, home });
   const before = installedIdentity(home);
 

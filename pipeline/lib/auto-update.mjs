@@ -11,7 +11,8 @@
 //                                        naming the lease holders
 //     installed copy changed meanwhile (an owner edit, a manual install: the installer's expect-installed-mismatch) -> nothing written;
 //                                        judged again as if found that way
-//     verify failed (installer --check after the install) -> ONE notice with the drift list; this main sha is not retried
+//     verify failed (the installer's own verification, or its --check after the install) -> ONE notice with the drift list; this main sha is not
+//                                        retried. The hold ends only when the install reads clean AND a fresh --check of that sha passes (deps.verifyInstalled)
 //   modified, incomplete (an interrupted install's partial manifest), ahead of main or diverged -> NEVER touched automatically: drift alone cannot
 //                                        tell an interrupted install from an owner edit. Notice once per (reason, main sha) with the exact command
 //   transient failure (GitHub unreachable, an install lock busy) -> a notice only on the 3rd run in a row; any good run ends the streak
@@ -112,7 +113,7 @@ export function describeLive(by) {
   return by.length > 5 ? `${shown}; and ${by.length - 5} more` : shown;
 }
 
-// One scheduled run. `deps` = { mainSha, installedIdentity, relate, performUpdate } from commands/update.mjs. `ctx.auto` overrides any of them and
+// One scheduled run. `deps` = { mainSha, installedIdentity, relate, performUpdate, verifyInstalled } from commands/update.mjs. `ctx.auto` overrides any of them and
 // also { notify(text), now(), accountHome, statusFile, stateFile } (tests never fetch, install, notify or touch the real home).
 // -> { exitCode, compact: true, silent?, output }. Exit 0 for every outcome the owner does not have to fix at once (current, updated,
 // deferred, paused); 1 for a failure.
@@ -211,13 +212,25 @@ export async function runScheduled({ home, env, ctx = {}, say = () => {}, deps }
     const sha = main.sha;
     if (state.noRetry && state.noRetry.sha !== sha) { delete state.noRetry; persist(); }
 
-    // A main sha whose install did not verify is not tried again (the next main sha is). Unless the owner has since put it right.
+    // A main sha whose install did not verify is not tried again (the next main sha is). Unless the owner has since put it right: the install
+    // reads clean and is that sha AND the verification that failed passes again. "Clean" alone is not enough: isClean / installedIdentity read the
+    // installed files and the manifest, never settings.json, so a failure that was only a missing hook registration looks clean from the start.
     if (state.noRetry) {
-      if (isClean(before) && before.sourceSha === sha) return current(sha);
+      let drift = [];
+      if (isClean(before) && before.sourceSha === sha) {
+        let v;
+        try {
+          v = typeof auto.verifyInstalled === 'function' ? await auto.verifyInstalled({ home, main, env, say }) : { ok: false, drift: [], error: 'no verification available' };
+        } catch (err) {
+          v = { ok: false, drift: [], error: String(err?.message ?? err).slice(0, 200) };
+        }
+        if (v?.ok === true) return current(sha);
+        drift = Array.isArray(v?.drift) ? v.drift.slice(0, 5) : [];
+      }
       const { reason, message } = state.noRetry;
       say(`scheduled update held: ${sha7(sha)} did not verify last time (${reason})`);
       writeStatus({ state: 'failed', ...ids(), reason, message, command });
-      return done(EXIT.FAILED, { ok: false, action: 'held', error: reason, message, main: { sha } });
+      return done(EXIT.FAILED, { ok: false, action: 'held', error: reason, message, main: { sha }, ...(drift.length ? { drift } : {}) });
     }
 
     // Never overwrite what is not a pristine install of one known commit, whatever main is.

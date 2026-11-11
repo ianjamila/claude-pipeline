@@ -32,13 +32,14 @@ const DEFERRED = { exitCode: 1, output: { ok: false, error: 'deferred', deferred
 // A rig: the world (main, installed identity, relation, install result, clock) is mutable between runs.
 function rig(over = {}) {
   const dir = scratch();
-  const w = { main: { ok: true, sha: SHA_A, via: 'gh' }, id: pristine(), relation: { status: 'ahead' }, install: OK_INSTALL, clock: T0, ...over };
-  const calls = { install: [], relate: 0, notify: [] };
+  const w = { main: { ok: true, sha: SHA_A, via: 'gh' }, id: pristine(), relation: { status: 'ahead' }, install: OK_INSTALL, clock: T0, verify: { ok: true, drift: [] }, ...over };
+  const calls = { install: [], relate: 0, notify: [], verify: [] };
   const auto = {
     mainSha: () => w.main,
     installedIdentity: () => w.id,
     relate: () => { calls.relate += 1; return w.relation; },
     performUpdate: async (args) => { calls.install.push(args); return w.install; },
+    verifyInstalled: async (args) => { calls.verify.push(args); return w.verify; },
     notify: async (text) => { calls.notify.push(text); },
     now: () => new Date(w.clock),
     accountHome: join(dir, 'account'),
@@ -297,6 +298,36 @@ test('a failed verify: ONE notice with the drift list, exit 1, status failed; th
   await u.go();
   assert.equal(u.calls.install.length, 2);
   assert.equal(u.calls.notify.length, 2);
+});
+
+// R1-B4: isClean / installedIdentity never read settings.json, so a settings-only verify failure (a guard hook not registered) already reads "clean and
+// identical". Clearing the hold needs the check that failed to pass again, not just a clean-looking install.
+test('a failed verify on a settings-only problem is NOT cleared by a clean-looking install: it stays failed until the check passes', async () => {
+  const t = rig({ install: failInstall('check-failed', 'the install did not verify: guard hook not registered', { drift: ['guard-git hook is not registered in settings.json'] }) });
+  await t.go();
+  assert.equal(t.calls.notify.length, 1);
+  // the install files are pristine main (the failure was in settings.json), the hook is still missing
+  t.w.id = pristine(SHA_A);
+  t.w.verify = { ok: false, drift: ['guard-git hook is not registered in settings.json'] };
+  for (let i = 0; i < 2; i += 1) {
+    const held = await t.go();
+    assert.deepEqual([held.exitCode, held.output.action, held.silent], [1, 'held', undefined], `run ${i + 1}`);
+    assert.equal(t.status().state, 'failed');
+    assert.equal(t.status().reason, 'check-failed');
+    assert.equal(t.bookkeeping().noRetry.sha, SHA_A, 'the hold is kept');
+  }
+  assert.equal(t.calls.verify.length, 2, 'the failed check was re-run each time');
+  assert.equal(t.calls.install.length, 1, 'not retried');
+  assert.equal(t.calls.notify.length, 1, 'not told again');
+  // a verification that cannot run (offline) does not clear it either
+  t.w.verify = { ok: false, drift: [], error: 'fetch failed' };
+  assert.equal((await t.go()).output.action, 'held');
+  assert.equal(t.bookkeeping().noRetry.sha, SHA_A);
+  // the owner registers the hook: the same check passes, the job is current and forgets
+  t.w.verify = { ok: true, drift: [] };
+  assert.equal((await t.go()).silent, true);
+  assert.equal(t.status().state, 'current');
+  assert.equal(t.bookkeeping(), null);
 });
 
 test('an install that ends unverified (the installed stamp is not main) is treated like a failed verify', async () => {
