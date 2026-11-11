@@ -371,8 +371,8 @@ export async function openOrRenewLease({ worktree, repoId, pr, branch, ...opts }
   const holder = resolveHolder({ worktree: key, ...opts });
   if (holder.kind === 'none') return { skipped: 'no-session' };
   const dir = ensureDir(opts);
-  const now = nowOf(opts);
   return withAdmission(() => withFileLock(holder.sessionId, dir, opts, () => {
+    const now = nowOf(opts); // stamped once admission is held: a command that waited for an update must not carry a time from before the swap
     const read = readHolder(dir, holder.sessionId);
     if (!read.ok && !read.absent && /not a regular file/.test(read.why)) throw codeError('review-lease-unwritable', `${fileOf(dir, holder.sessionId)} is ${read.why}: refusing to write it`);
     const leases = read.ok ? { ...read.rec.leases } : {}; // a corrupt file of OUR OWN session id has nothing worth keeping
