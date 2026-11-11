@@ -127,9 +127,11 @@ export function realLookup(pid, platform = process.platform, spawn = spawnSync) 
 
 const finiteTime = (t) => (typeof t === 'number' && Number.isFinite(t) ? t : undefined);
 
-// True when a process above `startPid` is Claude Code. Cycle- and depth-safe; a failed lookup ends the walk with false. On
-// win32 the walk also stops (false) at a non-Claude parent created more than REUSE_SKEW_MS after its child (a recycled PID).
-export function hasClaudeCodeAncestor({ startPid = process.ppid, lookup = realLookup, platform = process.platform, maxHops = MAX_HOPS, ownPid = process.pid } = {}) {
+// The pid of the nearest process above `startPid` that is Claude Code, or null (none found, a failed lookup, a cycle, a long chain, a
+// recycled Windows PID). The one walk behind hasClaudeCodeAncestor and the review leases (lib/review-lease.mjs needs the pid to find
+// the session's own record). Cycle- and depth-safe; a failed lookup ends the walk with null. On win32 the walk also stops (null) at a
+// non-Claude parent created more than REUSE_SKEW_MS after its child (a recycled PID).
+export function claudeCodeAncestorPid({ startPid = process.ppid, lookup = realLookup, platform = process.platform, maxHops = MAX_HOPS, ownPid = process.pid } = {}) {
   let childCreated;
   if (platform === 'win32') {
     try { childCreated = finiteTime(lookup(ownPid, platform)?.created); } catch { childCreated = undefined; }
@@ -140,12 +142,15 @@ export function hasClaudeCodeAncestor({ startPid = process.ppid, lookup = realLo
     seen.add(pid);
     let info = null;
     try { info = lookup(pid, platform); } catch { info = null; }
-    if (!info) return false;
-    if (isClaudeCodeProcess(info)) return true;
+    if (!info) return null;
+    if (isClaudeCodeProcess(info)) return pid;
     const created = finiteTime(info.created);
-    if (created !== undefined && childCreated !== undefined && created - childCreated > REUSE_SKEW_MS) return false;
+    if (created !== undefined && childCreated !== undefined && created - childCreated > REUSE_SKEW_MS) return null;
     childCreated = created;
     pid = info.ppid;
   }
-  return false;
+  return null;
 }
+
+// True when a process above `startPid` is Claude Code (claudeCodeAncestorPid has the walk and its stop rules).
+export const hasClaudeCodeAncestor = (opts = {}) => claudeCodeAncestorPid(opts) !== null;
