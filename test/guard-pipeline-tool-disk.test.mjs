@@ -1,6 +1,6 @@
 // isPipelineTool is an ALLOW check ("this is the trusted pipeline CLI, run it freely"), so a false match fails open. On macOS / Windows the spelling is
 // case-folded, which is wrong on a case-sensitive volume: there a differently-cased pipeline folder is a different, agent-writable one and must not be trusted.
-// The disk decides (samePath / insideOnDisk); the protect checks (a false match denies) stay on the spelling.
+// The disk decides (sameFileStrict / insideStrict: identity when both stats answer, else the exact normalised spelling, never a fold); the protect checks (a false match denies) stay on the spelling.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -10,7 +10,7 @@ const HOME = '/home/u';
 const opts = { home: HOME, env: {}, platform: 'darwin', cwd: '/repo', realpath: (p) => p, existsSync: () => false };
 const run = (command) => evaluateBashForFiles(command, opts).decision;
 
-// A fake volume: statSync knows only what `inodeOf` answers for (a bigint inode, or undefined = absent). samePath asks the disk only when `platform` is
+// A fake volume: statSync knows only what `inodeOf` answers for (a bigint inode, or undefined = absent). sameFileStrict asks the disk only when `platform` is
 // the running one, so the test presents itself as darwin for its duration.
 function onFakeVolume(inodeOf, body) {
   const origStat = fs.statSync;
