@@ -24,6 +24,7 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge"), your typed ruling when you override one (a ruling request) and your `extra round` (a prompt that starts with `extra round` or `grant round`: one more review round past `review.max_rounds`) against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
 | hook `stack-register` (PreToolUse on `Bash` and the write tools `Edit\|Write\|MultiEdit\|NotebookEdit`, 30 s) | records which private Supabase stack a session is about to use, before the tool runs; **fail-closed** like the guards (an unloadable file blocks with exit 2) |
 | hook `stack-dev-bind` (PostToolUse on `Bash`, 10 s) | notes which stack a dev server you started is bound to; non-blocking |
+| hook `update-notice` (SessionStart, 5 s) | prints one line at the start of a session when the automatic update has something to say (see Automatic updates); it only reads a small status file, never touches the network, and never blocks a session; non-blocking |
 | hook `stack-session-end` (SessionEnd, 10 s) | when a session ends (not on `/clear`) it starts a detached worker that decides whether that session's stacks can be stopped; non-blocking |
 | settings allow entries | `Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)` so pipeline calls don't prompt |
 
@@ -33,7 +34,7 @@ refuse to overwrite skills or agents it didn't install, and lets `--check` repor
 - **Fail-closed guards.** The two guard hooks are started through a small loader, not directly. If
   the hook file cannot be loaded (deleted, half-written, a syntax error) the loader blocks the
   tool call with exit 2 instead of letting Claude Code treat the crash as "allowed". The
-  `owner-go` recorder and the `stack-dev-bind` and `stack-session-end` hooks are the exceptions: they never block anything. `stack-register` is fail-closed like the guards.
+  `owner-go` recorder and the `stack-dev-bind`, `stack-session-end` and `update-notice` hooks are the exceptions: they never block anything. `stack-register` is fail-closed like the guards.
 - **Complete-install marker.** The installer writes the manifest with `"complete": false` first and
   flips it to `true` as its very last step, so an install that was interrupted (or whose later
   steps failed) is never mistaken for a good one. `--check`, `pipeline version` and the session
@@ -58,8 +59,9 @@ cd ~/Claude/claude-pipeline
 ./install.sh --check               # drift report only; exit 1 if anything differs; never writes
 ```
 
-- **Update:** the install is a copy, so a merged change reaches your sessions only after you
-  update it. Once the pipeline is installed, the normal path is one command in your own terminal
+- **Update:** the install is a copy, so a merged change reaches your sessions only after it is
+  updated: by you, or by the optional scheduled job (see Automatic updates below). Once the
+  pipeline is installed, the manual path is one command in your own terminal
   (not a Claude session):
   ```sh
   node ~/.claude/pipeline/bin/pipeline.mjs update
@@ -118,6 +120,83 @@ Two things tell you where an install stands:
   A stamp with a flag or `+unknown` is never treated as "current": `update --check` exits 1, and
   `pipeline vendor --check` warns that a vendored `VERSION` carrying one does not prove which commit its files came from.
 - **`pipeline update --check`** compares your install with upstream `main` on demand, with exit codes (see above).
+
+### Automatic updates
+
+Optional. A small job on your machine checks `main` every few minutes and installs it for you, but
+only when no review is running, so a review is never cut off halfway. The manual `update` keeps
+working exactly as before.
+
+- **The `pupdate` shortcut.** Put this in your own `~/.zshrc` (the installer never edits your
+  dotfiles):
+  ```sh
+  alias pupdate='PATH="/opt/homebrew/bin:$PATH" node "$HOME/.claude/pipeline/bin/pipeline.mjs" update'
+  ```
+  `pupdate --check` reports, `pupdate` updates. Like `update`, it refuses inside a Claude session.
+- **Turning it on (once per machine, owner only).**
+  1. Run `pupdate` once, in a plain terminal, so the installed copy is the first one that has this
+     feature. Nothing can switch it on before that.
+  2. Run `node ~/.claude/pipeline/bin/pipeline.mjs update schedule --install`, again in your own
+     terminal: it is refused inside Claude Code, because it arranges for the guard hooks to be
+     replaced unattended. `--every N` sets the minutes between runs: 5, 10, 15, 20, 30 or 60
+     (default 15). Running it again with another `--every` replaces the job.
+  3. `update schedule --status` shows whether the job is installed; `update schedule --remove` takes
+     it away. Both run anywhere, including inside Claude Code. `./install.sh --uninstall` does not
+     remove the job: run `update schedule --remove` first.
+
+  On a Mac the job is the LaunchAgent `com.claude-pipeline.auto-update` (it also runs when loaded,
+  so a Mac that slept catches up). On Linux or WSL it is one crontab line. Native Windows is not
+  supported (`unsupported-platform`). The job runs the **installed** pipeline; `git` and `gh` must
+  be on your `PATH` when you install it, and its log is `~/.local/state/pipeline/cron-auto-update.log`.
+- **What one run does.**
+  - Up to date: nothing, and no message.
+  - Behind `main`: downloads it, then installs it **only if no review is running**. If one is, it
+    writes nothing, logs one line saying what is live, and tries again next run.
+  - If the installed copy changed while the download ran (an edit of yours, a manual update), it
+    installs nothing and looks again next run.
+  - **Never touched automatically:** an install that is modified, incomplete (an interrupted
+    install), ahead of `main` or diverged from it. The job cannot tell an interrupted install from
+    one you edited on purpose, so it leaves it alone and tells you the exact command to run
+    yourself.
+  - After an install it runs the installer's own check. If that fails you get one message with the
+    drift, and that version of `main` is not retried (the next `main` is).
+- **What counts as "a review is running".** The installer looks, under a lock, for any of these:
+  - a *review lease*: while you are in a Claude session, every pipeline command that touches a
+    worktree's review (`codex-review`, `merge`, `verify`, `summary` and so on; the list is in
+    `docs/cli.md`) records that the session is working on it. `summary` (the stop ritual) or an
+    ended run closes it. A lease stops counting when the session is gone, after `/clear` or a
+    resume (same process, new session id), or after 6 hours with no pipeline command; a detached
+    `P job` still running in the worktree keeps it alive. A plain terminal takes no lease;
+  - a `P job` that is still running (or just starting) in a worktree of a repo this machine knows;
+  - a held review, merge or queue lock, or a merge command that outlived its run;
+  - a merge-queue record that is not finished;
+  - anything it cannot read, or cannot finish looking at within two minutes: that counts as
+    "live", never as "safe".
+
+  While it swaps files it also holds a separate lock, so a review command that starts in that
+  moment waits (up to 20 seconds); if the swap is still going, the command stops without doing
+  anything: `update-in-progress`, "retry in a minute".
+- **When it tells you.** A banner on a Mac, a line in the job's log and a line in
+  `~/.local/state/pipeline/pipeline-update-notices.log`, only when you have to act or something was
+  installed:
+  - after an install: "pipeline updated to <sha7> (<PR title>)";
+  - a blocked install (modified, incomplete, ahead, diverged), a failed check, or any other
+    failure: once per reason and `main` sha, with the command to run;
+  - a temporary problem (GitHub cannot be reached to look up or compare `main`, or another install
+    holds the install lock): only on the third run in a row; one good run ends the count;
+  - waiting for a review for more than 24 hours: once per wait, naming what is live. The clock
+    starts at the first deferral; if the system clock jumps backwards the count starts again.
+- **The status file and the line at session start.** Every run writes
+  `~/.claude/pipeline-state/update-status.json` (state `current`, `behind`, `deferred-by-review`,
+  `blocked-modified` or `failed`; when it last checked; the installed and `main` shas; the command
+  to run). The `update-notice` hook reads only that file when a session starts and prints one line,
+  nothing when you are current:
+  - `pipeline update available — installs automatically when no review is running`
+  - `pipeline update waiting on a review in <repo> #N` (or just the repo, or `a running review`)
+  - `pipeline update needs you: run pupdate` (blocked or failed)
+- **A stated limit.** The swap replaces the guard hooks one by one. A guard hook that Claude Code
+  starts in the instant its own file is being swapped is **refused** (the loader fails closed,
+  exit 2), never allowed: the tool call that triggered it fails and can simply be retried.
 
 ### The Fable floor
 
