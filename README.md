@@ -362,7 +362,7 @@ head you did not review (the receipt names the head the event carried).
   `extra round` alike; no guard names the `claude` CLI yet (see #132 / PR #133).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
-- **Quick check locally, CI is the full proof.** The agent runs only `verify.quick` on the changed area (in this repo: five fixed test files plus the tests related to the branch's changes, within a time budget, `CP_QUICK_RELATED_BUDGET_MS`); CI runs the full verify, the
+- **Quick check locally, CI is the full proof.** The agent runs only `verify.quick` on the changed area (in this repo: six fixed test files plus the tests related to the branch's changes, within a time budget, `CP_QUICK_RELATED_BUDGET_MS`); CI runs the full verify, the
   repo's existing checks and the cheap guard jobs (E2E only for high-risk PRs). The owner merges, never the agent.
 - **Verify slots are per machine.** `verify.max_parallel_full` limits full verifies on one computer, not across your machines, and the
   `verify.max_load` check is skipped on Windows (with a warning).
