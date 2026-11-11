@@ -291,7 +291,9 @@ test('scripts/test.mjs: a substring that matches nothing is exit 2 naming it, ev
 test('verify --quick lists exact .test.mjs files only, each present in test/ (a renamed file must not quietly drop out)', () => {
   const src = readFileSync(join(root, 'scripts', 'verify.mjs'), 'utf8');
   const quick = /quickCmd: '([^']*)'/.exec(src)?.[1] ?? '';
-  const args = quick.split(/\s+/).slice(quick.split(/\s+/).indexOf('scripts/test.mjs') + 1).filter(Boolean);
+  const all = quick.split(/\s+/).slice(quick.split(/\s+/).indexOf('scripts/test.mjs') + 1).filter(Boolean);
+  assert.ok(all.includes('--related'), 'quick also runs the tests related to the branch changes');
+  const args = all.filter((a) => a !== '--related'); // the flag; every other argument is a named file
   assert.ok(args.length > 0, `no arguments after scripts/test.mjs in "${quick}"`);
   for (const a of args) {
     assert.ok(a.endsWith('.test.mjs'), `${a} must be an exact .test.mjs name, not a substring`);
