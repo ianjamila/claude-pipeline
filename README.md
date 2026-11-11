@@ -160,7 +160,12 @@ working exactly as before.
     one you edited on purpose, so it leaves it alone and tells you the exact command to run
     yourself.
   - After an install it runs the installer's own check. If that fails you get one message with the
-    drift, and that version of `main` is not retried (the next `main` is).
+    drift, and that version of `main` is not retried (the next `main` is). The hold only ends once
+    the install looks right and a fresh check of that version passes.
+  - If the installer cannot even look (its scan of live work overran its time limit, or another
+    update or a review start holds the admission lock) the update waits and retries; the session
+    line and the log say so, never "a review is running". You get one message if that happens three
+    runs in a row.
 - **What counts as "a review is running".** The installer looks, under a lock, for any of these:
   - a *review lease*: while you are in a Claude session, every pipeline command that touches a
     worktree's review (`codex-review`, `merge`, `verify`, `summary` and so on; the list is in
