@@ -8,7 +8,10 @@ project: claude-pipeline
 default_branch: main
 enforcement: github
 worktree_dir: .worktrees
-owner_approval: chat           # owner rule 2026-10-12: no approval labels (as in eaglewatch). Hard-stop hits become owner-merge
+worktrees:
+  mode: on                     # owner 2026-11-11: `pipeline worktrees prune` removes a finished worktree (PR merged >= 24 h, idle >= 24 h,
+                               # nothing only-here, no open session) on its daily schedule, so a removal never waits on a session's cron.
+owner_approval: chat          # owner rule 2026-10-12: no approval labels (as in eaglewatch). Hard-stop hits become owner-merge
                                # items; the review skill stops before EVERY merge and merges when the owner says "merge" for that head.
 
 verify:
