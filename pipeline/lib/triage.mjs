@@ -849,7 +849,7 @@ const TITLE_MAX = 60;
 const WHY_MAX = 140;
 // Printable ASCII only (anything else becomes ?), white space collapsed, cut with "..." at max: a row is one line of one fixed shape, and a
 // finding's text can never add a separator (the middle dot is not ASCII), a line or a quote of its own.
-const asciiLine = (s, max) => {
+export const asciiLine = (s, max) => {
   const text = String(s ?? '').replace(/\s+/g, ' ').trim().replace(/[^\x20-\x7e]/g, '?');
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 };
