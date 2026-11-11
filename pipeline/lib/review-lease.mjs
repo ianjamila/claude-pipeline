@@ -25,6 +25,8 @@
 // job's command trusts it only when verifiedSession() agrees (that pid still runs, same ps start, its record still names that sessionId). Then its lease is the
 // SESSION's, and the session's summary / ended closes it. Closing while a job still runs keeps the lease as `jobOnly: true` (live only while a job runs there,
 // dead the moment it ends, whatever the session or the TTL); a job's own renewals keep it job-scoped, a command of the session itself clears the flag.
+// The handed identity is only a public fact (any same-user process can read the three values), so a job holder can only STRENGTHEN: it renews, opens a jobOnly
+// lease where the session has none, or reopens / closes one that is already jobOnly; it never reopens, re-aims, clears or closes a normal lease (R2-F1).
 // A handed identity that does not check out (forged, the session gone or cleared) falls back to the TTL-only holder.
 // CLAUDECODE=1 (or a Claude ancestor) but the session cannot be looked up (no record, no ps, Windows) -> a TTL-ONLY lease: pid and pidStart null,
 // live for 6 h after the last renewal. Its holder id is `ttl-<hash of the worktree>`: stable across commands (each is a fresh process) and bounded
@@ -404,7 +406,10 @@ const canon = (worktree) => canonicalPath(worktree);
 //   same repo, and the PR matches or one side has none  -> renewed (generation kept); a first-known `pr` turns a branch lease into a PR lease (action 'migrated');
 //   another PR, another branch (no PR on either side), or another repo -> a new generation (action 'reopened': the worktree moved on to other work).
 // Takes admission briefly (code 'update-in-progress' when an update holds it past waitMs), then the per-file lock (code 'review-lease-busy').
-// -> { skipped: 'no-session' } | { ok: true, action: 'opened' | 'renewed' | 'migrated' | 'reopened', generation, sessionId, ttlOnly }.
+// A holder handed down to a job (viaJob; its identity is a public fact any same-user process can present) may only STRENGTHEN: renew a lease, or open a
+// jobOnly one where the session has none, or reopen one that is already jobOnly. Over a normal lease it only renews: it never reopens it (another PR / repo /
+// branch is left alone, action 'unchanged'; the worktree stays covered by the session's lease) and never rewrites its PR or branch.
+// -> { skipped: 'no-session' } | { ok: true, action: 'opened' | 'renewed' | 'migrated' | 'reopened' | 'unchanged', generation, sessionId, ttlOnly }.
 export async function openOrRenewLease({ worktree, repoId, pr, branch, ...opts } = {}) {
   if (typeof worktree !== 'string' || !worktree) throw codeError('review-lease-args', 'openOrRenewLease needs a worktree path');
   if (typeof repoId !== 'string' || !repoId) throw codeError('review-lease-args', 'openOrRenewLease needs a repoId');
@@ -435,6 +440,12 @@ export async function openOrRenewLease({ worktree, repoId, pr, branch, ...opts }
     } else {
       action = cur.pr === undefined && prNum !== undefined ? 'migrated' : 'renewed';
     }
+    if (holder.viaJob && cur && cur.jobOnly !== true) {
+      // Never reopen, re-aim or clear a normal lease from a job: renewal is all it may do (the session's own next command does the rest).
+      leases[key] = { ...cur, renewedAt: iso(now) };
+      writeHolder(dir, { version: 1, sessionId: holder.sessionId, pid: holder.pid, pidStart: holder.pidStart, ...(holder.kind === 'ttl' ? { ttlOnly: true } : {}), leases });
+      return { ok: true, action: action === 'renewed' || action === 'migrated' ? 'renewed' : 'unchanged', generation: cur.generation, sessionId: holder.sessionId, ttlOnly: false };
+    }
     if (action === 'opened' || action === 'reopened') {
       // A lease a job's command opens (the session had closed its own) lives only while a job runs: the job must not leave a lease behind.
       lease = { repoId, ...(prNum !== undefined ? { pr: prNum } : { branch: branchName }), generation: randomUUID(), openedAt: iso(now), renewedAt: iso(now), ...(holder.viaJob ? { jobOnly: true } : {}) };
@@ -450,7 +461,9 @@ export async function openOrRenewLease({ worktree, repoId, pr, branch, ...opts }
 }
 
 // Close this session's lease on `worktree`. With `generation`, only that generation closes: a stale one (the lease was reopened since) is ignored.
-// Does not take admission. -> { skipped: 'no-session' } | { closed: true, sessionId } | { closed: false, why: 'absent' | 'stale-generation' }.
+// Does not take admission. A holder handed down to a job (viaJob) may close only a lease that is already jobOnly: a normal lease (or a corrupt file) is left
+// as it is (why 'not-job-scoped'); the session's own summary / ended closes those.
+// -> { skipped: 'no-session' } | { closed: true, sessionId } | { closed: false, why: 'absent' | 'stale-generation' | 'not-job-scoped' }.
 export async function closeLease({ worktree, generation, ...opts } = {}) {
   if (typeof worktree !== 'string' || !worktree) throw codeError('review-lease-args', 'closeLease needs a worktree path');
   const key = canon(worktree);
@@ -464,12 +477,14 @@ export async function closeLease({ worktree, generation, ...opts } = {}) {
     if (!read.ok) {
       if (read.absent) return { closed: false, why: 'absent' };
       if (/not a regular file/.test(read.why)) throw codeError('review-lease-unwritable', `${fileOf(dir, holder.sessionId)} is ${read.why}: refusing to touch it`);
+      if (holder.viaJob) return { closed: false, why: 'not-job-scoped' };
       removeHolder(dir, holder.sessionId); // our own corrupt file: nothing in it can be trusted to keep
       return { closed: true, sessionId: holder.sessionId };
     }
     const cur = read.rec.leases[key];
     if (!cur) return { closed: false, why: 'absent' };
     if (generation !== undefined && cur.generation !== generation) return { closed: false, why: 'stale-generation' };
+    if (holder.viaJob && cur.jobOnly !== true) return { closed: false, why: 'not-job-scoped' };
     const leases = { ...read.rec.leases };
     // A detached job still running in the worktree (the review's own ci-wait / merge / codex-review) must stay covered until it ends: the lease is
     // kept as job-scoped (live only while a job runs, then dead whatever the session or the TTL says) instead of removed.

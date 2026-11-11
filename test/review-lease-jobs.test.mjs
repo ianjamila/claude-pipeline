@@ -257,3 +257,73 @@ test('R2-B1: a meta.json that cannot be read (chmod 000) keeps a jobOnly lease l
   fs.chmodSync(path.join(dir, 'meta.json'), 0o000);
   try { assert.equal(w.scan({ jobLive: undefined }).live.length, 1); } finally { fs.chmodSync(path.join(dir, 'meta.json'), 0o600); }
 });
+
+// ---- R2-F1: a handed (job) identity can only strengthen ----------------------------------------------------------------------------------
+// PIPELINE_LEASE_HOLDER is readable by any same-user process, so a detached process can present a live session's identity. A viaJob holder may renew a
+// lease or open a jobOnly one where the session has none; it never reopens over, clears, closes or deletes a lease that is not already jobOnly.
+const leaseOf = (w, sessionId, wt) => JSON.parse(fs.readFileSync(path.join(w.dir, `${sessionId}.json`), 'utf8')).leases[wt];
+
+test('R2-F1: a job holder naming another PR or repo for the worktree leaves the session\'s normal lease untouched (forged identity or the session\'s own job)', async (t) => {
+  const w = world(t);
+  w.session(700, 'sess-b');
+  const wt = w.wt('b');
+  const lease = await open(w.as(700), wt); // B's own, normal lease on PR 7
+  const before = leaseOf(w, 'sess-b', wt);
+  const handed = { [HOLDER_ENV]: JSON.stringify({ sessionId: 'sess-b', pid: 700, pidStart: START }) }; // anyone who can read the session facts can build this
+  assert.equal(resolveHolder({ worktree: wt, ...w.inJob(handed) }).viaJob, true, 'the identity checks out, so the guard against abuse must be in the lease rules');
+  w.now = T0 + HOUR;
+  for (const extra of [{ pr: 99999 }, { repoId: 'evil/other' }, { pr: undefined, branch: 'other-branch' }]) {
+    const r = await open(w.inJob(handed), wt, extra);
+    assert.equal(r.generation, lease.generation, JSON.stringify(extra));
+    const { renewedAt, ...rest } = leaseOf(w, 'sess-b', wt); // a renewal is all a job may do
+    const { renewedAt: was, ...restBefore } = before;
+    assert.deepEqual(rest, restBefore, `${JSON.stringify(extra)}: B's lease is exactly as it was`);
+    assert.ok(Date.parse(renewedAt) >= Date.parse(was));
+  }
+  assert.equal(blocking(w.scan()).length, 1);
+  assert.equal(w.scan().live[0].jobOnly ?? false, false, 'still a normal lease: it outlives the job');
+});
+
+test('R2-F1: a job holder\'s close (summary / ended) neither deletes nor downgrades a normal lease, with or without a job running', async (t) => {
+  const w = world(t);
+  w.session(700, 'sess-b');
+  const wt = w.wt('b');
+  const lease = await open(w.as(700), wt);
+  const before = leaseOf(w, 'sess-b', wt);
+  const handed = { [HOLDER_ENV]: JSON.stringify({ sessionId: 'sess-b', pid: 700, pidStart: START }) };
+  for (const running of [false, true]) {
+    if (running) w.jobs.add(wt);
+    for (const generation of [undefined, lease.generation]) {
+      const r = await closeLease({ worktree: wt, generation, ...w.inJob(handed) });
+      assert.equal(r.closed, false);
+      assert.deepEqual(leaseOf(w, 'sess-b', wt), before, `running=${running}: untouched`);
+    }
+  }
+  assert.deepEqual(files(w.dir), ['sess-b.json']);
+  // the session itself still closes it
+  assert.equal((await closeLease({ worktree: wt, ...w.as(700) })).closed, true);
+});
+
+test('R2-F1: what a job holder may still do: renew, open a jobOnly lease where the session has none, reopen and close a lease that is already jobOnly', async (t) => {
+  const w = world(t);
+  w.session(700, 'sess-b');
+  const wt = w.wt('b');
+  const handed = holderHandoff({ worktree: wt, ...w.as(700) });
+  const lease = await open(w.as(700), wt);
+  w.now = T0 + HOUR;
+  assert.equal((await open(w.inJob(handed), wt)).action, 'renewed');
+  assert.equal(leaseOf(w, 'sess-b', wt).renewedAt, new Date(w.now).toISOString(), 'a legit job renewal still lands');
+  assert.equal(leaseOf(w, 'sess-b', wt).generation, lease.generation);
+  // the session closed its lease; the job opens its own, job-scoped one
+  await closeLease({ worktree: wt, ...w.as(700) });
+  assert.deepEqual(files(w.dir), []);
+  const opened = await open(w.inJob(handed), wt);
+  assert.equal(opened.action, 'opened');
+  assert.equal(leaseOf(w, 'sess-b', wt).jobOnly, true);
+  // already jobOnly: a job may reopen it for other work, and the job path closes it
+  const again = await open(w.inJob(handed), wt, { pr: 8 });
+  assert.equal(again.action, 'reopened');
+  assert.equal(leaseOf(w, 'sess-b', wt).jobOnly, true);
+  assert.equal((await closeLease({ worktree: wt, generation: again.generation, ...w.inJob(handed) })).closed, true);
+  assert.deepEqual(files(w.dir), []);
+});
