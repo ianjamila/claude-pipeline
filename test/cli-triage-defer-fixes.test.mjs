@@ -16,8 +16,10 @@ function reverted(w, round2) {
   const { h1, h2 } = w.atCap(round2);
   return { h1, h2, h3: w.revert(h2) };
 }
-const refused = (w, r, re, label = '') => {
+// `run` is a function: the state is read BEFORE the command runs, so "untouched" compares against what the command was given.
+const refused = (w, run, re, label = '') => {
   const before = w.stateText();
+  const r = run();
   assert.equal(r.code, 1, `${label} exit ${r.code}: ${r.stdout}${r.stderr}`);
   assert.equal(r.json.ok, false, label);
   assert.match(r.json.reason, re, label);
@@ -74,20 +76,20 @@ test('defer-fixes: the Rulings block lists the deferral after filing (CLI-writte
 test('defer-fixes: refused while the fixes are still in the tree, or when the content moved since the reviewed head', (t) => {
   const w = roundWorld(t);
   const { h1, h2 } = w.atCap();
-  refused(w, defer(w, 'R2-S1', h2), /tree is not back at the last reviewed content.*revert every commit/, 'fix still in the tree');
+  refused(w, () => defer(w, 'R2-S1', h2), /tree is not back at the last reviewed content.*revert every commit/, 'fix still in the tree');
   w.revert(h2);
   w.repo.write('src/extra.js', 'export const extra = 1;\n');
   w.repo.commit('something else');
-  refused(w, defer(w, 'R2-S1', h2), /tree is not back at the last reviewed content/, 'other work since the reviewed head');
+  refused(w, () => defer(w, 'R2-S1', h2), /tree is not back at the last reviewed content/, 'other work since the reviewed head');
   assert.ok(h1);
 });
 
 test('defer-fixes: --ids must be exactly the unreviewed accepts: no partial defer, no extra id, no unknown id', (t) => {
   const w = roundWorld(t);
   const { h2 } = reverted(w, [low({ title: 'First' }), low({ title: 'Second', line: 5 })]);
-  refused(w, defer(w, 'R2-S1', h2), /exactly the accepted fixes no round has reviewed \(R2-S1, R2-S2\).*no partial defer/, 'partial');
-  refused(w, defer(w, 'R2-S1,R2-S2,R1-S1', h2), /exactly the accepted fixes/, 'an id that is no unreviewed accept');
-  refused(w, defer(w, 'R2-S1,R2-S9', h2), /exactly the accepted fixes/, 'unknown id');
+  refused(w, () => defer(w, 'R2-S1', h2), /exactly the accepted fixes no round has reviewed \(R2-S1, R2-S2\).*no partial defer/, 'partial');
+  refused(w, () => defer(w, 'R2-S1,R2-S2,R1-S1', h2), /exactly the accepted fixes/, 'an id that is no unreviewed accept');
+  refused(w, () => defer(w, 'R2-S1,R2-S9', h2), /exactly the accepted fixes/, 'unknown id');
   const ok = defer(w, 'R2-S2,R2-S1', h2);
   assertExit(ok, 0, ok.stdout);
   assert.deepEqual(ok.json.deferred, ['R2-S1', 'R2-S2']);
@@ -99,27 +101,27 @@ test('defer-fixes: refused for anything that is not low severity: a bug, an unkn
   ]) {
     const w = roundWorld(t);
     const { h2 } = reverted(w, [low(over)]);
-    refused(w, defer(w, 'R2-S1', h2), /not low severity/, label);
+    refused(w, () => defer(w, 'R2-S1', h2), /not low severity/, label);
   }
   const sens = roundWorld(t);
   const { h2 } = reverted(sens);
   sens.config({ yml: 'risk:\n  high_risk_paths: ["src/big.js"]\n' });
-  refused(sens, defer(sens, 'R2-S1', h2), /not low severity \(.*sensitive path/, 'high_risk_paths');
+  refused(sens, () => defer(sens, 'R2-S1', h2), /not low severity \(.*sensitive path/, 'high_risk_paths');
   const cat = roundWorld(t);
   const { h2: c2 } = reverted(cat);
   cat.edit((s) => { s.rounds[1].items[0].category = 'novel'; });
-  refused(cat, defer(cat, 'R2-S1', c2), /not low severity \(category novel/, 'unknown category');
+  refused(cat, () => defer(cat, 'R2-S1', c2), /not low severity \(category novel/, 'unknown category');
   const bucket = roundWorld(t);
   const { h2: b2 } = reverted(bucket);
   bucket.edit((s) => { s.rounds[1].items[0].bucket = 'NITPICK'; });
-  refused(bucket, defer(bucket, 'R2-S1', b2), /not low severity \(unknown bucket/, 'unknown bucket');
+  refused(bucket, () => defer(bucket, 'R2-S1', b2), /not low severity \(unknown bucket/, 'unknown bucket');
   // the file of a BLOCKING ACCEPT anywhere in the state is high
   const same = roundWorld(t);
   const { h2: s2 } = reverted(same);
   same.edit((s) => {
     s.rounds[0].items.push({ ...s.rounds[0].items[0], id: 'R1-B9', bucket: 'BLOCKING', category: 'bug', file: 'src/big.js', fingerprint: 'fp-b9' });
   });
-  refused(same, defer(same, 'R2-S1', s2), /not low severity \(src\/big\.js also holds an accepted BLOCKING/, 'same file as a BLOCKING accept');
+  refused(same, () => defer(same, 'R2-S1', s2), /not low severity \(src\/big\.js also holds an accepted BLOCKING/, 'same file as a BLOCKING accept');
 });
 
 test('defer-fixes: refused for an ACCEPT a test, Claude, a second review or the owner made, and one fixed through other files', (t) => {
@@ -133,12 +135,12 @@ test('defer-fixes: refused for an ACCEPT a test, Claude, a second review or the 
     const w = roundWorld(t);
     const { h2 } = reverted(w);
     w.edit((s) => { s.rounds[1].items[0].final = final; });
-    refused(w, defer(w, 'R2-S1', h2), re, label);
+    refused(w, () => defer(w, 'R2-S1', h2), re, label);
   }
   const via = roundWorld(t);
   const { h2 } = reverted(via);
   via.edit((s) => { s.rounds[1].items[0].implementedVia = 'other-files'; });
-  refused(via, defer(via, 'R2-S1', h2), /not low severity \(its fix was made in other files/, 'implementedVia');
+  refused(via, () => defer(via, 'R2-S1', h2), /not low severity \(its fix was made in other files/, 'implementedVia');
 });
 
 test('defer-fixes: refused when the round limit is not reached, the automatic extra round is available, or anything else is open', (t) => {
@@ -146,35 +148,35 @@ test('defer-fixes: refused when the round limit is not reached, the automatic ex
   const e1 = early.reviewAndFix(1, early.base, early.head, [low()]);
   const early2 = early.revert(e1);
   assert.ok(early2);
-  refused(early, defer(early, 'R1-S1', e1), /round limit \(3\) is not reached/, 'limit not reached');
+  refused(early, () => defer(early, 'R1-S1', e1), /round limit \(3\) is not reached/, 'limit not reached');
 
   const auto = roundWorld(t);
   const a1 = auto.reviewAndFix(1, auto.base, auto.head, [low()]);
   auto.revert(a1);
-  refused(auto, defer(auto, 'R1-S1', a1), /automatic extra round is still available/, 'automatic extra round');
+  refused(auto, () => defer(auto, 'R1-S1', a1), /automatic extra round is still available/, 'automatic extra round');
 
   const open = roundWorld(t);
   const { h2 } = reverted(open);
   open.edit((s) => { s.rounds[1].items.push({ ...s.rounds[1].items[0], id: 'R2-S2', fingerprint: 'fp-x', final: null, implemented: false }); });
-  refused(open, defer(open, 'R2-S1', h2), /items still pending: R2-S2/, 'pending');
+  refused(open, () => defer(open, 'R2-S1', h2), /items still pending: R2-S2/, 'pending');
   open.edit((s) => { s.rounds[1].items[1].final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'x', cause: 'low-confidence' }; });
-  refused(open, defer(open, 'R2-S1', h2), /wait for a human: R2-S2/, 'needs a human');
+  refused(open, () => defer(open, 'R2-S1', h2), /wait for a human: R2-S2/, 'needs a human');
   open.edit((s) => { s.rounds[1].items[1] = { ...s.rounds[1].items[1], bucket: 'BLOCKING', category: 'bug', final: { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'r' }, implemented: false }; });
-  refused(open, defer(open, 'R2-S1', h2), /not implemented: R2-S2/, 'unimplemented accept');
+  refused(open, () => defer(open, 'R2-S1', h2), /not implemented: R2-S2/, 'unimplemented accept');
   open.edit((s) => { s.rounds[1].items.pop(); s.rounds[1].fableRequired = true; });
-  refused(open, defer(open, 'R2-S1', h2), /Fable pass is owed/, 'Fable pass owed');
+  refused(open, () => defer(open, 'R2-S1', h2), /Fable pass is owed/, 'Fable pass owed');
 });
 
 test('defer-fixes: refused in label mode, for another PR, an empty or over-long reason, and a missing flag', (t) => {
   const label = roundWorld(t, { mode: 'label' });
   const { h2: l2 } = reverted(label);
-  refused(label, defer(label, 'R2-S1', l2), /owner_approval: chat/, 'label mode');
+  refused(label, () => defer(label, 'R2-S1', l2), /owner_approval: chat/, 'label mode');
 
   const w = roundWorld(t);
   const { h2 } = reverted(w);
-  refused(w, w.cli(['triage', 'defer-fixes', '--pr', '8', '--ids', 'R2-S1', '--fix-head', h2, '--reason', 'r']), /review state is for PR #7, not #8/, 'wrong PR');
-  refused(w, defer(w, 'R2-S1', h2, { reason: '   ' }), /must not be empty/, 'empty reason');
-  refused(w, defer(w, 'R2-S1', h2, { reason: 'x'.repeat(1001) }), /at most 1000/, 'long reason');
+  refused(w, () => w.cli(['triage', 'defer-fixes', '--pr', '8', '--ids', 'R2-S1', '--fix-head', h2, '--reason', 'r']), /review state is for PR #7, not #8/, 'wrong PR');
+  refused(w, () => defer(w, 'R2-S1', h2, { reason: '   ' }), /must not be empty/, 'empty reason');
+  refused(w, () => defer(w, 'R2-S1', h2, { reason: 'x'.repeat(1001) }), /at most 1000/, 'long reason');
   assertExit(w.cli(['triage', 'defer-fixes', '--pr', '7', '--ids', 'R2-S1', '--reason', 'r']), 2);
   assertExit(w.cli(['triage', 'defer-fixes', '--pr', '7', '--fix-head', h2, '--reason', 'r']), 2);
 });
@@ -182,15 +184,15 @@ test('defer-fixes: refused in label mode, for another PR, an empty or over-long 
 test('defer-fixes: --fix-head must be a commit that is an ancestor of HEAD with content other than the reviewed one', (t) => {
   const w = roundWorld(t);
   const { h1, h2, h3 } = reverted(w);
-  refused(w, defer(w, 'R2-S1', 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'), /not a commit in this repository/, 'unknown commit');
-  refused(w, w.cli(['triage', 'defer-fixes', '--pr', '7', '--ids', 'R2-S1', '--fix-head=--upload-pack=x', '--reason', 'r']), /not a commit in this repository/, 'an option-shaped value');
-  refused(w, defer(w, 'R2-S1', h1), /has the reviewed content/, 'the reviewed head itself');
-  refused(w, defer(w, 'R2-S1', h3), /has the reviewed content/, 'the reverted head');
+  refused(w, () => defer(w, 'R2-S1', 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'), /not a commit in this repository/, 'unknown commit');
+  refused(w, () => w.cli(['triage', 'defer-fixes', '--pr', '7', '--ids', 'R2-S1', '--fix-head=--upload-pack=x', '--reason', 'r']), /not a commit in this repository/, 'an option-shaped value');
+  refused(w, () => defer(w, 'R2-S1', h1), /has the reviewed content/, 'the reviewed head itself');
+  refused(w, () => defer(w, 'R2-S1', h3), /has the reviewed content/, 'the reverted head');
   w.repo.git(['checkout', '-q', '-b', 'other', h1]);
   w.repo.write('src/side.js', 'export const side = 1;\n');
   const side = w.repo.commit('side branch');
   w.repo.git(['checkout', '-q', 'feat/x']);
-  refused(w, defer(w, 'R2-S1', side), /not an ancestor of HEAD/, 'a commit on another branch');
+  refused(w, () => defer(w, 'R2-S1', side), /not an ancestor of HEAD/, 'a commit on another branch');
   assertExit(defer(w, 'R2-S1', h2.slice(0, 10)), 0);
   assert.equal(w.item('R2-S1').roundCapDeferral.fixHead, h2, 'an abbreviated head is stored in full');
 });
@@ -206,7 +208,7 @@ test('defer-fixes: a typed "extra round" always wins: ask -> owner grants -> rev
   cleanupAtExit(markerPath(grantIdOf(record)));
   t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
   w.revert(h2); // the head moved: only an any-head lookup still sees the grant
-  refused(w, defer(w, 'R2-S1', h2), /owner granted extra round 3 \(unspent\)/, 'grant at the old head');
+  refused(w, () => defer(w, 'R2-S1', h2), /owner granted extra round 3 \(unspent\)/, 'grant at the old head');
   // and the ask itself now stops recommending the follow-up path
   const again = w.cli(['triage', 'round-request', '--pr', '7']);
   assertExit(again, 0, again.stderr + again.stdout);
@@ -223,7 +225,7 @@ test('defer-fixes: accepts carried across a resolution-only round are included; 
     s.rounds.push({ ...r2, n: 3, items: [extra], resolutionOnly: true, admission: undefined });
   });
   w.revert(h2);
-  refused(w, defer(w, 'R2-S1', h2), /exactly the accepted fixes no round has reviewed \(R2-S1, R3-S1\)|\(R3-S1, R2-S1\)/, 'a partial set');
+  refused(w, () => defer(w, 'R2-S1', h2), /exactly the accepted fixes no round has reviewed \(R2-S1, R3-S1\)|\(R3-S1, R2-S1\)/, 'a partial set');
   const r = defer(w, 'R3-S1,R2-S1', h2);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual([r.json.deferred, r.json.rounds], [['R2-S1', 'R3-S1'], [2, 3]]);
@@ -247,7 +249,7 @@ test('defer-fixes: Claude cannot reopen a deferral (claude-ruling refuses, state
   assertExit(defer(w, 'R2-S1', h2), 0);
   assertExit(w.cli(['followups', 'create', '--round', '2']), 0);
   for (const decision of ['ACCEPT', 'FOLLOW-UP', 'REJECT']) {
-    refused(w, w.cli(['triage', 'claude-ruling', '--round', '2', '--id', 'R2-S1', '--decision', decision, '--reason', 'x', '--pr', '7']), /deferred past the round limit.*only the owner's typed ruling/, `claude ${decision}`);
+    refused(w, () => w.cli(['triage', 'claude-ruling', '--round', '2', '--id', 'R2-S1', '--decision', decision, '--reason', 'x', '--pr', '7']), /deferred past the round limit.*only the owner's typed ruling/, `claude ${decision}`);
   }
   const asked = w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', 'R2-S1']);
   assertExit(asked, 0, asked.stderr + asked.stdout);
@@ -264,5 +266,5 @@ test('defer-fixes: a second call finds nothing left to defer', (t) => {
   const w = roundWorld(t);
   const { h2 } = reverted(w);
   assertExit(defer(w, 'R2-S1', h2), 0);
-  refused(w, defer(w, 'R2-S1', h2), /nothing to defer/, 'again');
+  refused(w, () => defer(w, 'R2-S1', h2), /nothing to defer/, 'again');
 });
