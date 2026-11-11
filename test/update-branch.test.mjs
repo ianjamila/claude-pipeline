@@ -661,3 +661,27 @@ test('update-branch, queue OFF and behind: updates as before (one PUT)', () => {
   assert.notEqual(r.json.outcome, 'queue-mode');
   assert.equal(puts(s).length, 1);
 });
+
+// queue mode catches up only where `P merge` would refuse: a custom merge command, and a PR that is not queued (R1-F2)
+const NO_COMMAND_YML = () => ymlFor().replace(/ {2}command: .*\n/, '');
+const ENTRY = { id: 'MQE_1', state: 'AWAITING_CHECKS', position: 1, enqueuedAt: '2026-11-09T08:00:00Z', headCommit: null };
+
+test('update-branch, queue ON, DEFAULT merge command, a branch without the marker commit: queue-mode, no PUT, no marker read (P merge never asks there)', () => {
+  const s = scenario({ yml: NO_COMMAND_YML(), gh: { behindBy: 2, queue: true, ...QA, queueAwareIn: false } });
+  const r = updateCli(s);
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.outcome, 'queue-mode');
+  assert.equal('queueCatchUp' in r.json, false);
+  assert.deepEqual(puts(s), []);
+  assert.deepEqual(s.fake.lines().filter((l) => l.includes('contents/') || l.includes('compare/')), [], 'neither the marker nor the ancestry is read');
+});
+
+test('update-branch, queue ON, the PR is ALREADY QUEUED (a failed marker read would otherwise catch up): queue-mode, no PUT (an update would drop the entry)', () => {
+  for (const gh of [{ queueAwareFile: 'error' }, { ...QA, queueAwareIn: false }, {}]) {
+    const s = scenario({ gh: { behindBy: 2, queue: true, queueEntry: ENTRY, ...gh } });
+    const r = updateCli(s);
+    assertExit(r, 0, r.stdout);
+    assert.equal(r.json.outcome, 'queue-mode', JSON.stringify(gh));
+    assert.deepEqual(puts(s), [], JSON.stringify(gh));
+  }
+});

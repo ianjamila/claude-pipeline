@@ -135,10 +135,10 @@ export function ghEntries(o) {
         ? { match: '^pr checks 12 .*--required$', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
         : { match: '^pr checks 12 .*--required$', stdoutJson: o.requiredCi ?? ci },
     { match: '^pr checks 12 ', stdoutJson: ci },
-    // The live merge-queue read (gh.queueState): off unless a test says `queue: true`; `queue: 'error'` = GitHub cannot answer.
+    // The live merge-queue read (gh.queueState): off unless a test says `queue: true`; `queue: 'error'` = GitHub cannot answer; `queueEntry` = the PR's live entry ({ id, state, position, enqueuedAt, headCommit }).
     o.queue === 'error'
       ? { match: 'QueueState', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
-      : { match: 'QueueState', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_node12', state: pr.state, headRefOid: o.prHead, isMergeQueueEnabled: o.queue === true, mergeCommit: null, mergeQueueEntry: null } } } } },
+      : { match: 'QueueState', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_node12', state: pr.state, headRefOid: o.prHead, isMergeQueueEnabled: o.queue === true, mergeCommit: null, mergeQueueEntry: o.queueEntry ?? null } } } } },
     { match: '^auth status', code: 0 },
     ME,
     REPO,

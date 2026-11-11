@@ -122,6 +122,8 @@ whether the base branch has a merge queue, and with none they behave as before. 
 and `P queue-sweep` (LaunchAgent `com.claude-pipeline.queue-sweep`, every 10 min, written and removed by the installer) carries a queued PR to its end
 when no session is watching. The repo's own queue settings, its `merge_group` triggers and its `Queue gate` check are the repo's workflow PR (EagleWatch's A2), not part of onboarding here.
 
+A repo that turns the queue on AND has a custom `merge.command` (it runs the PR branch's own script) must first declare which commit made that script queue-aware: add the plain file `.claude/merge-queue-aware` to the BASE branch (first line that is not blank or a `#` comment = the full 40-hex sha of that commit). `P merge` reads it from the base branch through GitHub and refuses (`queue-branch-predates-switch`) any branch that does not contain the commit, or when the file is missing or unreadable. Order for the rollout: land the queue-aware script, add the file on the base branch, THEN install this pipeline version / switch the queue on. A repo on the default merge command needs no file.
+
 **Before moving a repo into a GitHub organization** (lessons from EagleWatch's move, 2026-11-09; do these first):
 
 1. Set `ci.approvers: [<owner login>]` in `.claude/pipeline.yml` and merge it while the repo is still user-owned. An org-owned repo with `approvers: []`
