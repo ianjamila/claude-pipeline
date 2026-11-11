@@ -2942,7 +2942,16 @@ function snapshotShell(ctx) {
 
 // ---- Bash --------------------------------------------------------------------------------------------
 
-export const evaluateBashForFiles = failClosed(evaluateBashForFilesUnchecked);
+const evaluateBashForFilesChecked = failClosed(evaluateBashForFilesUnchecked);
+// The `shell` option names the TOOL's shell and belongs to the outermost call only. Every re-entry (a script, a startup file, a sourced file, a `bash -c` string, a cd re-run ...) is a call made while
+// another is running, so it is forced to Bash here, once, instead of at each call site (one of which, the implicit startup file, spreads the caller's options with `_depth: 0`).
+// Synchronous code, so a plain counter is exact; the same-text retries below call evaluateBashForFilesUnchecked directly and keep the tool's shell.
+let evalNesting = 0;
+export const evaluateBashForFiles = (command, opts = {}) => {
+  const nested = evalNesting > 0;
+  evalNesting++;
+  try { return evaluateBashForFilesChecked(command, nested && opts.shell !== 'bash' ? { ...opts, shell: 'bash' } : opts); } finally { evalNesting--; }
+};
 // Why: see evaluateGitCommand: the first (outermost) call owns the BASH rewrite record; a text that binds BASH after another was rewritten makes the verdict stale, so the line is judged again with the rewrite off.
 function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (!opts._bashState) {

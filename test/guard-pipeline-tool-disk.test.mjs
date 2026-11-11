@@ -231,3 +231,14 @@ test('the real CLI and a real hook stay trusted through Bash forward-slash paths
   assert.equal(bashW('node C:/Users/u/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow', 'win32: CLI');
   assert.equal(bashW('node C:/Users/u/.claude/pipeline/hooks/guard-files.mjs'), 'allow', 'win32: hook');
 });
+
+// A text read from disk is never PowerShell input: the shell setting belongs to the top-level tool call only. The implicit startup file (~/.zshenv, run by `zsh -c :`) is judged with
+// `_depth: 0` and the line's options spread in, so a `shell: 'powershell'` that leaked there would trust a backslash CLI line that zsh itself reads as a drive-relative file.
+test('a startup file read from disk is judged as Bash even when the top-level tool is PowerShell', () => {
+  const startup = `node ${WCLI} preflight\n`;
+  const readText = (p) => (/\.zshenv$/.test(String(p)) ? startup : null);
+  const o = { ...WIN, readText, readHead: () => null };
+  assert.equal(evaluateBashForFiles('zsh -c :', { ...o, shell: 'bash' }).decision, 'deny', 'Bash: the startup line is a drive-relative file');
+  assert.equal(evaluateBashForFiles('zsh -c :', { ...o, shell: 'powershell' }).decision, 'deny', 'PowerShell top level: the startup text is still Bash');
+  assert.equal(evaluateBashForFiles(`node ${WCLI} preflight`, { ...o, shell: 'powershell' }).decision, 'allow', 'the top-level PowerShell line itself stays trusted');
+});
