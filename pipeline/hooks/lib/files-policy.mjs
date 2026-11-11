@@ -1456,7 +1456,7 @@ function modelledCd(t, cmds, idx, ctx) {
     if (cmds.some((c) => (c.redirects ?? []).some((q) => UP.test(q.target ?? '')) || c.argv.slice(1).some((a) => UP.test(a)))) return null;
     return pathsFor().join('/tmp/.mktemp', sub(m[3]));
   }
-  m = /^\$\{?TMPDIR\}?(\/[\w./-]*)?$/.exec(t); // (no default: \`\${TMPDIR:-x}\` and an unset or empty TMPDIR are unknown)
+  m = /^\$\{?TMPDIR\}?(\/[\w./-]*)?$/.exec(t); // (no default: \`${TMPDIR:-x}\` and an unset or empty TMPDIR are unknown)
   if (m && !touched(['TMPDIR'])) {
     const v = ctx.env.TMPDIR;
     if (typeof v === 'string' && v !== '' && isAbs(toPosix(v)) && !/[$`*?[{]/.test(v)) return pathsFor().normalize(pathsFor().join(toPosix(v), sub(m[1])));
@@ -1704,7 +1704,7 @@ function assignmentOnlyHarmless(cmds, ctx, topLevel) {
     const e = expandRefs(v, ctx);
     return !/[$`{}]/.test(e) && /^(?:\/|~|\.)/.test(e);
   };
-  const inert = (c) => (isAssign(c) ? Object.entries(c.env).every(([k, v]) => valueOk(k, v)) : c.argv.length > 0 && ENV_INERT.has(baseOf(c.argv[0])) && !Object.keys(c.env ?? {}).length && !(baseOf(c.argv[0]) === 'printf' && c.argv.some((a) => /^-v/.test(a))) && !evaluatesSubscript(baseOf(c.argv[0]), c.argv.slice(1), ctx)); // (printf -v NAME assigns a shell variable; test -v / a numeric comparison evaluates an array subscript)
+  const inert = (c) => (isAssign(c) ? Object.entries(c.env).every(([k, v]) => valueOk(k, v)) : c.argv.length > 0 && ENV_INERT.has(baseOf(c.argv[0])) && !Object.keys(c.env ?? {}).length && !(baseOf(c.argv[0]) === 'printf' && c.argv.some((a) => /^-v/.test(a))) && !evaluatesSubscript(baseOf(c.argv[0]), c.argv.slice(1), ctx, c.raw)); // (printf -v NAME assigns a shell variable; test -v / a numeric comparison evaluates an array subscript)
   if (!cmds.every(inert)) return no;
   if (FUNCTION_TEXT.test(ctx.ghLine ?? '')) return no;
   return (c) => isAssign(c);
@@ -1778,19 +1778,91 @@ function printfFormatEvaluates(fmt) {
   }
   return false;
 }
-function evaluatesSubscript(name, args, ctx) {
+// R4-F1 (#266): test / [ / [[ are read BY POSITION, not by hunting for a bracket. Strip the closing `]` / `]]` and a leading `!`; then one word is a plain string, two words are a unary
+// operator and its operand, three are an operand, a binary operator and an operand; every other shape (-a, -o, parentheses, more words) is unknown. The operator must be a LITERAL word (no `$`,
+// no backtick): a run-time operator can be -v, -t or -eq whatever the operands look like. A word that holds a run-time part and is not double-quoted is split by the shell into any number of
+// words (probed with zsh 5.9: `test -n $(printf 'x -a -v a\x5b'; …)` runs the subscript's substitution), so then no position can be trusted and the call is judged as an unknown shape.
+const TEST_UNARY = new Set(['-n', '-z', '-e', '-f', '-d', '-s', '-r', '-w', '-x', '-L', '-h', '-b', '-c', '-p', '-S', '-g', '-u', '-k', '-O', '-G', '-N']); // (read no operand as a name or arithmetic)
+const TEST_UNARY_EVAL = new Set(['-v', '-R', '-t']); // (a variable name, or arithmetic in zsh)
+const TEST_BINARY = new Set(['=', '==', '!=', '<', '>', '-nt', '-ot', '-ef']); // (string and file comparisons)
+const TEST_BINARY_EVAL = /^-(?:eq|ne|lt|le|gt|ge)$/; // (arithmetic)
+// Is there a `$` expansion or a backtick in `raw` outside double quotes? Single quotes and backslashes are honoured and a `$(…)` or a backtick pair is read as a unit; anything this scan cannot
+// follow (an unbalanced quote, `$'…'`) counts as unquoted. No `raw` is the same.
+function unquotedRuntime(raw) {
+  if (typeof raw !== 'string') return true;
+  const n = raw.length;
+  const skipTick = (i) => { for (; i < n; i++) { if (raw[i] === '\\') i++; else if (raw[i] === '`') return i + 1; } return -1; };
+  let skipSub, skipDq;
+  skipSub = (i) => { // just after `$(`: the index after the matching `)`
+    let depth = 1;
+    while (i < n) {
+      const c = raw[i];
+      if (c === '\\') i += 2;
+      else if (c === "'") { const j = raw.indexOf("'", i + 1); if (j < 0) return -1; i = j + 1; }
+      else if (c === '"') { i = skipDq(i + 1); if (i < 0) return -1; }
+      else if (c === '`') { i = skipTick(i + 1); if (i < 0) return -1; }
+      else if (c === '(') { depth++; i++; } else if (c === ')') { i++; if (--depth === 0) return i; } else i++;
+    }
+    return -1;
+  };
+  skipDq = (i) => { // just after an opening double quote: the index after the closing one
+    while (i < n) {
+      const c = raw[i];
+      if (c === '\\') i += 2;
+      else if (c === '"') return i + 1;
+      else if (c === '$' && raw[i + 1] === '(') { i = skipSub(i + 2); if (i < 0) return -1; }
+      else if (c === '`') { i = skipTick(i + 1); if (i < 0) return -1; }
+      else i++;
+    }
+    return -1;
+  };
+  for (let i = 0; i < n;) {
+    const c = raw[i];
+    if (c === '\\') i += 2;
+    else if (c === "'") { const j = raw.indexOf("'", i + 1); if (j < 0) return true; i = j + 1; }
+    else if (c === '"') { i = skipDq(i + 1); if (i < 0) return true; }
+    else if (c === '`' || (c === '$' && /[({'\w@*#?!$-]/.test(raw[i + 1] ?? ''))) return true;
+    else i++;
+  }
+  return false;
+}
+function testEvaluates(name, args, words, expand, raw) {
+  const rtWord = (a) => RUNTIME_PART.test(a) || SUBSCRIPT_EVAL.test(a) || RUNTIME_PART.test(expand(a)) || SUBSCRIPT_EVAL.test(expand(a));
+  const unknownShape = args.some(rtWord); // (an unknown shape is no read-only call when ANY word, as written or as expanded, is run-time or may hold a subscript)
+  if (!unknownShape) return false;
+  if (args.some((a) => RUNTIME_PART.test(expand(a))) && unquotedRuntime(raw)) return true; // (a word the shell splits: no position holds)
+  const w = [...args];
+  if (name === '[' && w.at(-1) === ']') w.pop();
+  else if (name === '[[' && w.at(-1) === ']]') w.pop();
+  while (w[0] === '!') w.shift();
+  const lit = (a) => !RUNTIME_PART.test(a);
+  const evalWord = () => words.some((a) => SUBSCRIPT_EVAL.test(a)); // (the known operators that evaluate: as before, any word that holds a subscript form)
+  if (w.length === 1) return false; // (a plain string, whatever it holds; a run-time word that is double-quoted stays one word)
+  if (w.length === 2) {
+    if (!lit(w[0])) return true;
+    if (TEST_UNARY_EVAL.has(w[0])) return evalWord();
+    return !TEST_UNARY.has(w[0]);
+  }
+  if (w.length === 3) {
+    if (!lit(w[1])) return true;
+    if (TEST_BINARY_EVAL.test(w[1])) return evalWord();
+    return !TEST_BINARY.has(w[1]);
+  }
+  return true;
+}
+// R4-F2 (#266): an expansion that ASSIGNS (`${y:=w}`, `${y::=w}`, `${y=w}`, `${(L)y:=w}`) inside any command plants the text of w as the value of y; when w holds a subscript form, a later
+// `printf '%d' y` / `(( y ))` / `let y` evaluates it (zsh reads the value of a name as arithmetic). Such a word is no read-only call, whatever the command (a plain-path default stays one).
+const ASSIGNING_EXPANSION = /\$\{(?:\([^)]*\))?[A-Za-z_]\w*(?:\[[^\]]*\])?::?=/;
+function plantsSubscript(argv, env) {
+  return [...argv, ...Object.values(env ?? {})].some((a) => typeof a === 'string' && ASSIGNING_EXPANSION.test(a) && SUBSCRIPT_FORM.test(a));
+}
+function evaluatesSubscript(name, args, ctx, raw) {
   const test = name === 'test' || name === '[' || name === '[[';
   if (!test && name !== 'printf') return false;
   const expand = (a) => (/[$`]/.test(a) ? expandRefs(a, ctx) : a);
   const words = [...args, ...args.map(expand)];
   if (words.some((a) => SUBSCRIPT_FORM.test(a))) return true; // (the class rule: whatever the operator or the format)
-  if (test) {
-    // an operator that is only known at run time (`test $(echo -v) 'a[…]'`, `[ 'a[…]' $(echo -eq) 1 ]`, `test -$(echo t) …`) can be -v, -t or a comparison
-    const operatorUnknown = args.some((a, i) => { const e = expand(a); return RUNTIME_PART.test(e) && /^[$`-]/.test(e) && args.some((b, j) => j !== i && /[\[`]/.test(expand(b))); });
-    if (operatorUnknown) return true;
-    if (!words.some((a) => a === '-v' || a === '-R' || a === '-t' || /^-(?:eq|ne|lt|le|gt|ge)$/.test(a))) return false;
-    return words.some((a) => SUBSCRIPT_EVAL.test(a));
-  }
+  if (test) return testEvaluates(name, args, words, expand, raw);
   if (!words.some((a) => SUBSCRIPT_EVAL.test(a))) return false;
   if (words.some((a) => /^-v/.test(a))) return true;
   // the format: the first word that is no option; `--` ends the options (the next word is the format, a dash word or not), a lone `-` is the format itself
@@ -1816,7 +1888,8 @@ function isReadOnly(cmd, ctx) {
   const judged = judgedWords(name, argv.slice(1), ctx);
   if (judged.unknown) return false;
   const args = judged.args;
-  if (evaluatesSubscript(name, argv.slice(1), ctx)) return false;
+  if (evaluatesSubscript(name, argv.slice(1), ctx, cmd.raw)) return false;
+  if (plantsSubscript(argv, cmd.env)) return false;
   // R1-B1 (#266): a sed / awk program is plain program text, and the expansion above rewrites a same-line name in it (`system=length; awk 'BEGIN { $system("rm S") }'` reads as length(...)
   // while awk runs system()). The program as written must be read-only too.
   if (PROGRAM_TOOLS.has(name) && !(name === 'sed' || name === 'gsed' ? sedReadOnly(argv.slice(1)) : awkReadOnly(argv.slice(1), cmd.env))) return false;
