@@ -255,7 +255,7 @@ function makeCtx(opts) {
   const lexRoots = unique([
     ...protectedRoots(homePosix),
     ...configRoots({ base, cfgDir: configDirOf(opts.env ?? process.env, homePosix), readDir: opts.readDir ?? defaultReadDir, home: homeNative }),
-    ...listedDialogScripts(base, defaultReadText), // (the real file, not opts.readText: a test's fake reader is a script-read counter and clock)
+    ...listedDialogScripts(base, (f) => (api.existsSync(f) ? defaultReadText(f) : null)), // (the real file, not opts.readText: a test's fake reader is a script-read counter and clock; no stat where the caller fakes the file system and has no such file: on macOS a stat under /home stalls on autofs)
   ]);
   const lexAncestors = ANCESTOR_REL.map((r) => `${base}/${r}`);
   const roots = unique([...withWindowsAliases(lexRoots, homePosix, platform), ...lexRoots.map((r) => realResolve(r, api))]);
@@ -395,6 +395,11 @@ function makeCtx(opts) {
   };
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
+    // (R2-B2) the plugin folders outside a .claude*/plugins folder, from the real installed_plugins.json of each account config dir (read once, when a path is first judged)
+    surfaceDirs: (() => {
+      let memo = null;
+      return () => (memo ??= surfaceDirsOf([`${base}/.claude`, ...accountConfigDirs({ base, cfgDir: configDirOf(opts.env ?? process.env, homePosix), readDir: opts.readDir ?? defaultReadDir, home: homeNative })], (f) => (api.existsSync(f) ? defaultReadText(f) : null)));
+    })(),
     hitReviewGlob,
     user: opts.user ?? posix.basename(homePosix),
     selfZero: opts._selfZero ?? null, selfBash: opts._selfBash ?? null, selfAbs: opts._selfAbs === true, selfZsh: opts._selfZsh === true, // the judged script file's own path (its $0 unless it was sourced; BASH_SOURCE[0])
@@ -484,22 +489,173 @@ const SETTINGS_RE = /^settings(\.[\w-]+)?\.json$/i;
 
 // ---- #261: the places a hook that runs on AskUserQuestion can be declared, besides the account config dirs the protected set holds -------------------------------------------------
 // A project's .claude/settings.json and settings.local.json, a plugin's hooks/hooks.json under a config dir, and the `hooks:` front matter of a skill or an agent. The agent may edit these files for
-// other reasons (permissions, prose), so a file tool is judged by whether the change adds or alters hooks; a Bash line, whose effect is not evaluated, by the file's name plus the word "hooks".
-// (R1-B3) also a command file (`.claude*/commands/*.md`), a plugin's skills / agents / commands under a config dir's plugins/ folder, and a plugin manifest (`.claude-plugin/plugin.json`, whose inline `hooks` and
-// component locations are read by the dialog-hook inventory).
+// other reasons (permissions, prose), so a file tool is judged by whether the change adds or alters hooks; a Bash line by its TARGETS (hookSurfaceBashReason), and by the file's name plus the word "hooks"
+// when the name sits inside a program or a quoted string.
+// (R1-B3) also a command file (`.claude*/commands/**.md`), a plugin's skills / agents / commands under a config dir's plugins/ folder, and a plugin manifest (`.claude-plugin/plugin.json`, whose inline `hooks` and
+// component locations are read by the dialog-hook inventory). (R2-B2) The guard reads what the inventory reads: agents and commands at any depth, any .md below a plugin folder, the install paths
+// installed_plugins.json lists (also outside a `.claude*/plugins` folder) and the locations their manifests name (surfaceDirs).
 const HOOK_SURFACE = {
-  settings: /(?:^|\/)\.claude[^/]*\/settings(?:\.local)?\.json$/,
-  plugin: /(?:^|\/)\.claude[^/]*\/plugins\/(?:[^/]+\/)*hooks\/hooks\.json$/,
-  manifest: /(?:^|\/)\.claude-plugin\/plugin\.json$/,
-  frontmatter: /(?:^|\/)\.claude[^/]*\/(?:plugins\/(?:[^/]+\/)*)?(?:skills\/[^/]+\/SKILL\.md|(?:agents|commands)\/[^/]+\.md)$/,
+  settings: /(?:^|\/)\.claude[^/]*\/settings(?:\.local)?\.json$/i,
+  plugin: /(?:^|\/)\.claude[^/]*\/plugins\/(?:[^/]+\/)*hooks\/hooks\.json$/i,
+  manifest: /(?:^|\/)\.claude-plugin\/plugin\.json$/i,
+  frontmatter: /(?:^|\/)\.claude[^/]*\/(?:plugins\/(?:[^/]+\/)*[^/]+\.md|skills\/[^/]+\/SKILL\.md|(?:agents|commands)\/(?:[^/]+\/)*[^/]+\.md)$/i,
 };
 // the same names inside command text (a word that is, or ends in, such a path)
-const HOOK_SURFACE_TEXT = /(?:\.claude[^/\s'"`]*\/(?:settings(?:\.local)?\.json|(?:plugins\/[^\s'"`]*)?(?:skills\/[^/\s'"`]+\/SKILL\.md|(?:agents|commands)\/[^/\s'"`]+\.md)|plugins\/[^\s'"`]*hooks\/hooks\.json)|\.claude-plugin\/plugin\.json)(?![\w.\-])/i;
-const hookSurfaceKind = (p, ci) => {
-  const q = ci ? String(p).toLowerCase() : String(p);
+const HOOK_SURFACE_TEXT = /(?:\.claude[^/\s'"`]*\/(?:settings(?:\.local)?\.json|skills\/[^/\s'"`]+\/SKILL\.md|(?:agents|commands)\/[^\s'"`]*\.md|plugins\/[^\s'"`]*(?:\.md|hooks\/hooks\.json))|\.claude-plugin\/plugin\.json)(?![\w.\-])/i;
+// The shapes of a surface path, from the folder that holds it to the file (a slot: a literal name, 'D' = a `.claude*` folder, 'ANY' = any name, 'MD' = a name ending .md, '*' = any number of folders);
+// the same set as HOOK_SURFACE, for a word that holds a glob or a substitution (maybeSurface).
+const SURFACE_SHAPES = [
+  ['D', 'settings.json'], ['D', 'settings.local.json'], ['.claude-plugin', 'plugin.json'],
+  ['D', 'plugins', '*', 'hooks', 'hooks.json'], ['D', 'plugins', '*', 'MD'],
+  ['D', 'skills', 'ANY', 'SKILL.md'], ['D', 'agents', '*', 'MD'], ['D', 'commands', '*', 'MD'],
+];
+const hookSurfaceKind = (p, ctx) => {
+  const q = String(p);
   for (const [kind, re] of Object.entries(HOOK_SURFACE)) if (re.test(q)) return kind;
+  const dirs = typeof ctx?.surfaceDirs === 'function' ? ctx.surfaceDirs() : null;
+  if (dirs) {
+    const inside = (d) => isInside(q, d, ctx.platform);
+    if (dirs.installs.some(inside) && /(?:^|\/)hooks\/hooks\.json$/i.test(q)) return 'plugin';
+    if ((dirs.installs.some(inside) || dirs.named.some(inside)) && /\.md$/i.test(q)) return 'frontmatter';
+  }
   return null;
 };
+// The folders a plugin keeps its components in, outside any `.claude*/plugins` folder: the install paths of the plugins the account config dirs list (installed_plugins.json, read the way the inventory does) and
+// the locations their manifests name (skills, agents, commands: strings or lists of strings, resolved against the install path). Read fail-safe: an unreadable file adds nothing.
+function surfaceDirsOf(configDirs, readText) {
+  const installs = [];
+  const named = [];
+  const json = (file) => { try { return JSON.parse(readText(file) ?? ''); } catch { return null; } };
+  for (const d of configDirs) {
+    const list = json(`${d}/plugins/installed_plugins.json`);
+    if (list === null || typeof list !== 'object' || list.plugins === null || typeof list.plugins !== 'object') continue;
+    for (const entries of Object.values(list.plugins).slice(0, 500)) {
+      if (!Array.isArray(entries)) continue;
+      for (const e of entries.slice(0, 50)) {
+        const ip = typeof e?.installPath === 'string' ? toPosix(e.installPath) : '';
+        if (!isAbs(ip)) continue;
+        installs.push(pathsFor().normalize(ip));
+      }
+    }
+  }
+  for (const ip of unique(installs)) {
+    const m = json(`${ip}/.claude-plugin/plugin.json`);
+    if (m === null || typeof m !== 'object') continue;
+    for (const key of ['skills', 'agents', 'commands']) {
+      const v = m[key];
+      for (const rel of (typeof v === 'string' ? [v] : Array.isArray(v) ? v : []).slice(0, 100)) if (typeof rel === 'string' && rel !== '') named.push(pathsFor().normalize(pathsFor().join(ip, toPosix(rel))));
+    }
+  }
+  return { installs: unique(installs), named: unique(named) };
+}
+
+// (R1-B1 / R2-F1) Can this word, which holds a glob or a substitution (so its place is only known at run time), name a hook surface file? Each part that is only known at run time stands for anything (a
+// substitution, a variable, a brace list: any text; `*` `?` `[..]`: a name part); the word's last folders and its file name are compared with every surface shape, slot by slot. A substitution that is a whole
+// folder of the word stands for a `.claude*` folder only when the word says `claude` somewhere (`$(echo ~/.claude)/settings.json`, `$(git rev-parse --show-toplevel)/.claude/settings.json`);
+// a bare `$DIR/x.md` names nothing. A word that ends in `/` is a folder a file may land in (cp, mv): its shape lacks the last slot.
+const SUBST = '\u0001';
+function maskRuntime(w) {
+  let out = '';
+  for (let i = 0; i < w.length; i++) {
+    const c = w[i];
+    if (c === '$' && w[i + 1] === '(') {
+      let depth = 0;
+      let j = i + 1;
+      for (; j < w.length; j++) { if (w[j] === '(') depth++; else if (w[j] === ')' && --depth === 0) break; }
+      out += SUBST; i = j; continue;
+    }
+    if (c === '$' && w[i + 1] === '{') { const j = w.indexOf('}', i); out += SUBST; i = j < 0 ? w.length : j; continue; }
+    if (c === '$') { const m = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[@*#?!$0-9-])/.exec(w.slice(i)); if (m) { out += SUBST; i += m[0].length - 1; continue; } }
+    if (c === '`') { const j = w.indexOf('`', i + 1); out += SUBST; i = j < 0 ? w.length : j; continue; }
+    if (c === '{') { const j = w.indexOf('}', i); if (j > i) { out += '*'; i = j; continue; } }
+    out += c;
+  }
+  return out;
+}
+function surfaceSegRe(seg, ci) {
+  let re = '';
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i];
+    if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '[^/]';
+    else if (c === SUBST) re += '.*';
+    else if (c === '[') { const j = seg.indexOf(']', i + 2); if (j < 0) re += '\\['; else { re += `[${seg.slice(i + 1, j).replace(/^[!^]/, '^').replace(/\\/g, '\\\\')}]`; i = j; } } else re += c.replace(/[.+^${}()|\\/\]]/g, '\\$&');
+  }
+  try { return new RegExp(`^${re}$`, ci ? 'i' : ''); } catch { return /^.*$/; }
+}
+// the literal text before the first wildcard of a segment, and after its last one ('' when it ends in one)
+function wildParts(seg) {
+  const first = seg.search(/[*?[\u0001]/);
+  if (first < 0) return { pre: seg, suf: seg, wild: false };
+  let last = -1;
+  let end = -1;
+  for (let i = 0; i < seg.length; i++) {
+    if (seg[i] === '*' || seg[i] === '?' || seg[i] === SUBST) { last = i; end = i; } else if (seg[i] === '[') { const j = seg.indexOf(']', i + 2); if (j > 0) { last = i; end = j; i = j; } }
+  }
+  return { pre: seg.slice(0, first), suf: end < 0 ? '' : seg.slice(end + 1), wild: true };
+}
+function slotOk(seg, slot, ci, pureSubstOk, dot) {
+  const low = (t) => (ci ? t.toLowerCase() : t);
+  if (seg === SUBST) return slot === 'ANY' || slot === 'MD' || pureSubstOk;
+  const re = surfaceSegRe(seg, ci);
+  if (slot === 'ANY') return seg !== '.' && seg !== '..';
+  const { pre, suf, wild } = wildParts(seg);
+  if (slot === 'D') {
+    if (['.claude', '.claude-x'].some((x) => re.test(x))) return true;
+    if (!wild) return false;
+    const lp = low(pre);
+    if (lp === '') return dot === true;
+    return lp.startsWith('.claude') || '.claude'.startsWith(lp);
+  }
+  if (slot === 'MD') {
+    if (!wild) return low(seg).endsWith('.md');
+    const ls = low(suf);
+    return ls.endsWith('.md') || '.md'.endsWith(ls);
+  }
+  return re.test(slot) || (ci && re.test(slot.toLowerCase()));
+}
+function shapeEndsAt(segs, gi, shape, si, o) {
+  if (si < 0) return true;
+  const slot = shape[si];
+  if (slot === '*') {
+    for (let k = gi; k >= -1; k--) if (shapeEndsAt(segs, k, shape, si - 1, o)) return true;
+    return false;
+  }
+  if (gi < 0) return false;
+  const seg = segs[gi];
+  return slotOk(seg, slot, o.ci, slot === 'D' && o.claude, o.dot) && shapeEndsAt(segs, gi - 1, shape, si - 1, o);
+}
+// `word` is one word of a command (the parser has removed its quotes); `dirs`: the folders the line may be working in (a relative word is joined to each)
+function maybeSurface(word, { ci, dirs, dot, surfaceDirs }) {
+  const masked = maskRuntime(String(word));
+  const folder = /\/$/.test(masked);
+  const claude = /claude/i.test(String(word));
+  const bare = masked.replace(/\/+$/, '');
+  if (bare === '') return false;
+  const fulls = isAbs(bare) || bare.startsWith(SUBST) || bare.startsWith('~') ? [bare] : dirs.map((d) => `${d}/${bare}`);
+  const o = { ci, dot, claude };
+  for (const full of fulls) {
+    const segs = full.split('/').filter((x) => x !== '' && x !== '.');
+    for (const shape of SURFACE_SHAPES) {
+      if (folder ? shapeEndsAt(segs, segs.length - 1, shape.slice(0, -1), shape.length - 2, o) : shapeEndsAt(segs, segs.length - 1, shape, shape.length - 1, o)) return true;
+    }
+    // the folders a plugin's components live in (installed_plugins.json, manifests): a glob that can reach a name ending .md (or a hooks file) inside one
+    const w = full.search(/[*?[\u0001]/);
+    if (w >= 0) {
+      const litDir = full.slice(0, Math.max(0, full.lastIndexOf('/', w))) || '/';
+      const after = full.slice(litDir.length).split('/').filter(Boolean).length;
+      const last = segs[segs.length - 1] ?? '';
+      if (folder || slotOk(last, 'MD', ci, true, dot) || slotOk(last, 'hooks.json', ci, true, dot)) {
+        for (const d of [...(surfaceDirs?.installs ?? []), ...(surfaceDirs?.named ?? [])]) {
+          if (isInside(litDir, d, ci ? 'darwin' : 'linux')) return true;
+          const below = isInside(d, litDir, ci ? 'darwin' : 'linux') ? d.slice(litDir === '/' ? 0 : litDir.length).split('/').filter(Boolean).length : -1;
+          if (below >= 0 && after >= below + 1) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
 const sortedJsonOf = (v) => JSON.stringify(v, (_k, x) => (x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x));
 // The text a file tool would leave in the file (null when it cannot be worked out: an Edit whose old_string is not there is no change the tool will make, judged by its words).
 function textAfter(ti, before) {
@@ -536,12 +692,15 @@ function hooksDifference(kind, before, after, shown, words) {
 const HOOKS_MSG = 'a hook on AskUserQuestion could answer the owner\'s dialog in the owner\'s name or hide a refusal; permission edits stay allowed, hooks are the owner\'s to change, from a terminal';
 
 // The account config dirs besides ~/.claude (a folder directly under the home with the HOME_CONFIG_DIR_RE shape, and $CLAUDE_CONFIG_DIR): hooks/, settings.json and settings.local.json in each.
-function configRoots({ base, cfgDir, readDir, home }) {
+function accountConfigDirs({ base, cfgDir, readDir, home }) {
   const dirs = new Set();
   const names = readDir(home);
   if (Array.isArray(names)) for (const n of names) if (typeof n === 'string' && n !== '.claude' && HOME_CONFIG_DIR_RE.test(n)) dirs.add(`${base}/${n}`);
   if (cfgDir && cfgDir !== `${base}/.claude`) dirs.add(cfgDir);
-  return [...dirs].flatMap((d) => ['hooks', 'settings.json', 'settings.local.json'].map((r) => `${d}/${r}`));
+  return [...dirs];
+}
+function configRoots(o) {
+  return accountConfigDirs(o).flatMap((d) => ['hooks', 'settings.json', 'settings.local.json'].map((r) => `${d}/${r}`));
 }
 // The scripts of the dialog-hook list the owner approved (<home>/.claude/pipeline-state/owner-go/dialog-hooks.json, written by `P owner-go approve-dialog-hooks`): each one is a hook on
 // AskUserQuestion, so an edit to it changes what runs on the owner's dialogs. Read fail-safe: a missing or unreadable list adds nothing (the folder that holds it is protected already).
@@ -554,46 +713,74 @@ function listedDialogScripts(base, readText) {
   }
 }
 
-// (R1-B1) A Bash write to a file that can declare hooks is judged by its resolved TARGET, not by whether the line says "hooks": `cp /tmp/c.json .claude/settings.local.json` and
-// `jq … > /tmp/x && mv /tmp/x <settings>` say none. Every word of the line that names such a file (or a folder a copied file would land in) is a target; the line's writes to it are asked
-// of the write model (writtenTo); what lands there must be a text the guard can read (a static text, a file on disk, the file itself) and none may add or change hooks, as for a file tool. A write whose
-// content is only known at run time (a program's output, a rewrite by jq / sed we cannot emulate, an inline program) is refused: permission edits go through Edit / Write. A plugin's hooks file is never
-// written from Bash. -> a reason or null. `writesOf(c)`: is the command not a read? (for a word that names such a file only through a glob or a variable)
-function hookSurfaceBashReason(cmds, frame, ctx, writesOf) {
-  const found = new Map(); // absolute path -> the word that named it
+// (R1-B1) A Bash write to a file that can declare hooks is judged by its resolved TARGET, not by whether the line says "hooks": `cp /tmp/c.json <settings>` and `jq … > /tmp/x && mv /tmp/x <settings>` say none.
+// The targets are found with the guard's own reading of a command, as for the protected files: a command that is read-only (isReadOnly), the words of a commit message / PR body / test name (the prose the
+// caller dropped) and the files a copy or move reads are no targets; what is deleted (rm) is none either (deleting removes hooks, never adds them). A copy / move / install names its destination (and a
+// folder a copied file lands in, `cp /tmp/SKILL.md <skills>/x/`); any other command that is not read-only names every word it is given (an unmodelled program handed the file's name is an unknown write,
+// genericAsUnknown); a write redirect names its target. Every such word is a target, none is skipped (R2-F2). A word whose place is only known at run time (a substitution, a variable, a glob in the folder
+// or in the file name) and that can resolve to a surface is refused (R2-F1, maybeSurface). The line's writes to a target are asked of the write model (writtenTo); what lands there must be a text the guard
+// can read (a static text, a file on disk, the file itself) and none may add or change hooks, as for a file tool. A write whose content is only known at run time (a program's output, a rewrite by jq / sed
+// we cannot emulate, an inline program, a copy after a command the guard does not model, R2-F3) is refused: permission edits go through Edit / Write. A plugin's hooks file is never written from Bash.
+// -> a reason or null. `io.wordsOf(c)`: the command's words without its prose; `io.dirs`: the folders the line may be working in.
+const DELETERS = new Set(['rm', 'rmdir', 'unlink', 'trash']);
+const MAX_SURFACE_WORDS = 4000;
+// git subcommands that stage, record or delete: they never put new text into a working-tree file (checkout, restore, reset, apply, stash, merge ... do, and stay targets)
+const GIT_NO_CONTENT = new Set(['add', 'rm', 'commit', 'status', 'diff', 'log', 'show', 'blame', 'ls-files', 'grep', 'tag', 'branch', 'notes']);
+const gitSubcommand = (argv) => {
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '-C' || a === '-c' || a === '--git-dir' || a === '--work-tree') { i++; continue; }
+    if (a.startsWith('-')) continue;
+    return a;
+  }
+  return '';
+};
+function hookSurfaceBashReason(cmds, frame, ctx, io) {
+  const found = new Map(); // absolute path -> { word, idx: the last command that names it }
   const unpinned = [];
-  const surfaceKind = (q) => hookSurfaceKind(q, ctx.ci);
+  const surfaceKind = (q) => hookSurfaceKind(q, ctx);
   const stash = frame.i;
   frame.i = cmds.length; // (judge the file as the WHOLE line leaves it)
   try {
-    cmds.forEach((c, idx) => {
-      const words = [...c.argv.slice(1), ...(c.redirects ?? []).map((r) => r.target ?? '')].filter((w) => typeof w === 'string' && w !== '');
-      const placed = [];
+    let total = 0;
+    for (const [idx, c] of cmds.entries()) {
+      const redirects = (c.redirects ?? []).filter((r) => WRITE_OPS.has(r.op) && typeof r.target === 'string' && r.target !== '' && !FD_DUP.test(r.target) && r.target !== '/dev/null').map((r) => r.target);
+      const name = c.argv.length > 0 ? baseOf(c.argv[0]) : '';
+      const writer = name !== '' && !NOT_WRITERS.has(name) && !isReadOnly(c, ctx);
+      if (!writer && redirects.length === 0) continue;
+      let words = [];
+      if (writer && !DELETERS.has(name) && !(name === 'git' && GIT_NO_CONTENT.has(gitSubcommand(c.argv)))) {
+        const own = io.wordsOf(c);
+        words = DEST_ONLY.has(name) || MOVERS.has(name) ? destsOf(own, name) : own.slice(1);
+      }
+      words = [...words, ...redirects];
+      // an option's attached value (`-ofile`, `--output=file`, `of=file`)
+      words = words.flatMap((w) => (typeof w !== 'string' ? [] : /^--?[A-Za-z][\w-]*=./.test(w) || /^[A-Za-z_]+=./.test(w) ? [w, w.slice(w.indexOf('=') + 1)] : /^-[A-Za-z]./.test(w) ? [w, w.slice(2)] : [w])).filter((w) => w !== '');
+      total += words.length;
+      if (total > MAX_SURFACE_WORDS) return 'the command line has too many words to check for writes to a file that can declare hooks';
       for (const w of words) {
         const e = frame.expand(w);
         if (e === null) {
-          if (/^[^\s'"`()]+$/.test(w) && HOOK_SURFACE_TEXT.test(w) && (writesOf(c) || (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)))) unpinned.push(w);
+          if (maybeSurface(w, { ci: ctx.ci, dirs: io.dirs, dot: ctx.dotGlob === true, surfaceDirs: ctx.surfaceDirs() })) unpinned.push(w);
           continue;
         }
-        for (const q of frame.locate(e, idx).filter((x) => isAbs(x))) placed.push(q);
-      }
-      for (const q of placed.slice(0, 64)) {
-        const lex = pathsFor().normalize(q);
-        const set = new Set([lex, realResolve(lex, ctx.api)]);
-        for (const x of set) if (surfaceKind(x) !== null) found.set(x, q);
-        // a folder the file lands in: `cp /tmp/SKILL.md .claude/skills/x/`
-        for (const other of placed.slice(0, 64)) {
-          const base = posix.basename(toPosix(other));
-          if (base && base !== '.' && base !== '..') for (const x of set) { const joined = pathsFor().join(x, base); if (surfaceKind(joined) !== null) found.set(joined, q); }
+        for (const q of frame.locate(e, idx).filter((x) => isAbs(x))) {
+          const lex = pathsFor().normalize(q);
+          for (const x of new Set([lex, realResolve(lex, ctx.api)])) if (surfaceKind(x) !== null) found.set(x, { word: q, idx });
         }
       }
-    });
-    if (unpinned.length > 0) return `the command writes ${unpinned[0]}, a file that can declare hooks, at a place only known at run time`;
-    for (const [P] of found) {
+    }
+    if (unpinned.length > 0) return `the command writes ${unpinned[0]}, which can be a file that can declare hooks, at a place only known at run time`;
+    for (const [P, at] of found) {
       const w = writtenTo(ctx.frames, P, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: true, genericAsUnknown: true });
       if (w === null) continue; // nothing on the line writes it (a read, or a command that only names it)
       const kind = surfaceKind(P);
       if (kind === 'plugin') return `the command writes ${P}, a plugin's hooks file: a hook there could run on the owner's dialogs`;
+      // (R2-F3) what a copy brings is read from the file as it is on disk: a command the guard does not model that runs before it may have written or rewritten that file
+      frame.i = at.idx;
+      const unmodelled = unmodelledBefore(ctx.frames);
+      frame.i = cmds.length;
+      if (unmodelled && w.files.length > 0) return `the command copies a file onto ${P}, a file that can declare hooks, after a command the guard cannot model, so what is copied is only known when it runs; run that step first, on its own`;
       const disk = ctx.readText(P);
       // a source that is not on disk and that nothing on the line writes cannot be copied: that write fails and changes nothing (the same reading as for a script that is missing)
       const present = { ...w, files: w.files.filter((x) => ctx.readText(x) !== null || ctx.api.existsSync(x) || writtenTo(ctx.frames, x, { exists: (y) => ctx.api.existsSync(y), readText: ctx.readText, ignoreUnmodelled: true }) !== null) };
@@ -716,7 +903,7 @@ function evaluateMcp(tool, ti, input, opts) {
     // #261: what the tool will write cannot be compared with the file, so a hook surface file is refused when the content says "hooks" (a plugin's hooks file always)
     for (const { t, candidates } of targets) {
       for (const c of candidates) {
-        const kind = hookSurfaceKind(c, ctx.ci);
+        const kind = hookSurfaceKind(c, ctx);
         if (kind !== null && (kind === 'plugin' || texts.some((x) => /hooks/i.test(x)))) return deny(`${t} is a file that can declare hooks (${HOOKS_MSG})`);
       }
     }
@@ -760,7 +947,7 @@ function evaluateFileToolUnchecked(input, opts = {}) {
   // #261: a hook declared in a project's settings, a plugin's hooks file or a skill's / agent's front matter
   for (const { t, candidates } of resolved) {
     for (const c of candidates) {
-      const kind = hookSurfaceKind(c, ctx.ci);
+      const kind = hookSurfaceKind(c, ctx);
       const why = kind === null ? null : hooksChangeReason(kind, ti, ctx, c, t);
       if (why !== null) return deny(`${why} (${HOOKS_MSG})`);
     }
@@ -3187,11 +3374,16 @@ function evaluateBashForFilesFrame(command, opts) {
   }
   // #261: a write whose text names a file that can declare a hook on the owner's dialogs inside a program or a quoted string, and whose line says "hooks" (its effect cannot be evaluated). A write whose TARGET is
   // such a file is judged by the target and what lands in it (R1-B1, hookSurfaceBashReason below, once the line's writes are known)
-  if (/hooks/i.test(scanRaw)) {
+  // (R2-F7) an interpreter's inline code (-e / -c, a program on stdin) that names such a file needs no "hooks" in the line: the program builds what it writes
+  {
+    const hooksWord = /hooks/i.test(scanRaw);
     for (const c of cmds) {
+      // (inline code that only reads the file, `print(open(f).read())`, is not a write)
+      const inline = runsInlineCode(c, ctx) && (new RegExp(WRITE_WORDS, 'i').test(scanRaw) || /open\s*\([^)]*['"][wax][+bt]*['"]/i.test(scanRaw));
+      if (!hooksWord && !inline) continue;
       const writes = (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) || (c.argv.length > 0 && !isReadOnly(c, ctx));
-      if (writes && [...c.argv, ...(c.redirects ?? []).map((r) => r.target ?? ''), rawOfCmd(c)].some((w) => HOOK_SURFACE_TEXT.test(String(w)))) {
-        return deny(`the command writes a file that can declare hooks and mentions hooks (${HOOKS_MSG})`);
+      if (writes && [...c.argv, ...(c.redirects ?? []).map((r) => r.target ?? ''), rawOfCmd(c), ...(inline ? [scanRaw] : [])].some((w) => HOOK_SURFACE_TEXT.test(String(w)))) {
+        return deny(inline && !hooksWord ? `an inline program names a file that can declare hooks, and what it writes cannot be checked (${HOOKS_MSG})` : `the command writes a file that can declare hooks and mentions hooks (${HOOKS_MSG})`);
       }
     }
   }
@@ -3227,7 +3419,7 @@ function evaluateBashForFilesFrame(command, opts) {
   });
   ctx.frames.push(frame);
   {
-    const why = hookSurfaceBashReason(cmds, frame, ctx, (c) => c.argv.length > 0 && !isReadOnly(c, ctx));
+    const why = hookSurfaceBashReason(cmds, frame, ctx, { wordsOf, dirs });
     if (why !== null) return deny(`${why} (${HOOKS_MSG})`);
   }
   // BASH_ENV / ENV / ZDOTDIR / HOME values this line (and the scripts that run it) assign: shells started by the scripts it runs see them

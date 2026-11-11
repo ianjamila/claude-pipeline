@@ -224,3 +224,64 @@ test('R2-F4: a lone CR is a line break; odd opening lines, NEL / LS / PS and a `
   assert.equal(w('---\r\nname: x\r\n---\r\nbody\r\n'), 'allow', 'CRLF without hooks');
   assert.equal(w('just a body\n---\nhooks:\n'), 'allow', 'no front matter');
 });
+
+test('R2-B2: the guard protects what the inventory reads: namespaced commands / agents, any .md below a plugin folder, installed plugin paths and manifest-named locations', () => {
+  const hooked = '---\nname: n\nhooks:\n  Stop: []\n---\n';
+  const plain = '---\nname: n\n---\n';
+  for (const p of ['/repo/.claude/commands/ns/action.md', '/repo/.claude/commands/a/b/c/d.md', '/home/u/.claude/agents/team/x/y.md', '/home/u/.claude/plugins/cache/m/p/1/anything/deep/README.md']) {
+    assert.equal(file('Write', { file_path: p, content: hooked }, reading({})), 'deny', p);
+    assert.equal(file('Write', { file_path: p, content: plain }, reading({})), 'allow', p);
+  }
+  // an install path outside any .claude*/plugins folder, and a location its manifest names (read from the real installed_plugins.json of the account)
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-click-hooks-'));
+  const install = path.join(home, 'elsewhere', 'myplugin');
+  fs.mkdirSync(path.join(home, '.claude', 'plugins'), { recursive: true });
+  fs.mkdirSync(path.join(install, '.claude-plugin'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({ plugins: { 'p@m': [{ installPath: install }] } }));
+  fs.writeFileSync(path.join(install, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'p', skills: './extra' }));
+  const opts = { home, platform: 'linux', env: {}, realpath: (p) => p, existsSync: (p) => fs.existsSync(p), readText: () => null };
+  const write = (p, content) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: p, content }, cwd: '/repo' }, opts).decision;
+  for (const p of [path.join(install, 'skills', 's', 'SKILL.md'), path.join(install, 'extra', 'example', 'SKILL.md'), path.join(install, 'commands', 'x', 'y.md')]) {
+    assert.equal(write(p, hooked), 'deny', p);
+    assert.equal(write(p, plain), 'allow', p);
+  }
+  assert.equal(write(path.join(install, 'hooks', 'hooks.json'), '{}'), 'deny', 'a plugin hooks file');
+  assert.equal(write(path.join(home, 'elsewhere', 'other', 'SKILL.md'), hooked), 'allow', 'a folder no plugin list names');
+});
+
+test('R2-F1: a Bash target built by a substitution, or holding a glob in the file name, is refused when it can resolve to a hook surface', () => {
+  for (const cmd of ['cp /tmp/c.json "$(git rev-parse --show-toplevel)/.claude/settings.local.json"', 'cp /tmp/c.json `git rev-parse --show-toplevel`/.claude/settings.local.json', 'cp /tmp/c.json .claude/settings.loca?.json',
+    'cp /tmp/c.json .cl*de/settings.local.json', 'cat /tmp/c.json > .claud[e]/settings.json', 'cp /tmp/c.json "$(echo ~/.claude)/settings.json"', 'cp /tmp/c.json .claude/commands/n*/x.md', 'cp /tmp/c.json .claude/agents/*.md', 'cp /tmp/c.json .claude/skills/*/']) {
+    assert.equal(bash(cmd), 'deny', cmd);
+  }
+  for (const cmd of ['cp /tmp/c.json "$DEST"', 'cp /tmp/c.json "$OUT/readme.md"', 'cp /tmp/c.json src/*/config.json', 'cp /tmp/c.json docs/*.md', 'cat .claude/settings.loca?.json', 'rm .claude/agents/other*.md']) {
+    assert.equal(bash(cmd), 'allow', cmd);
+  }
+});
+
+test('R2-F2: no word of the line is skipped: the target is found past the 64th word, after any number of cds', () => {
+  const many = (n) => Array.from({ length: n }, (_, i) => `/tmp/a${i}`).join(' ');
+  assert.equal(bash(`cat /dev/null ${many(70)} /tmp/c.json > /repo/.claude/settings.local.json`, onDisk({ '/tmp/c.json': '{"hooks":{"Stop":[]}}' })), 'deny');
+  assert.equal(bash(`cp ${many(70)} /tmp/SKILL.md /repo/.claude/skills/x/`, onDisk({ '/tmp/SKILL.md': '---\nname: x\nhooks:\n  Stop: []\n---\n' })), 'deny');
+  assert.equal(bash(`cat /dev/null ${many(70)} > /repo/notes.txt`), 'allow');
+});
+
+test('R2-F3: a copy onto a hook surface after a command the guard does not model is refused; a lone copy of a missing file stays allowed', () => {
+  for (const cmd of ['python3 /tmp/gen.py && cp /tmp/m.json .claude/settings.local.json', 'tar xf /tmp/a.tar && cp /tmp/m.json .claude/settings.local.json', 'node /tmp/gen.mjs; mv /tmp/m.json .claude/settings.json']) {
+    assert.equal(bash(cmd), 'deny', cmd);
+  }
+  assert.equal(bash('cp template.json .claude/settings.json'), 'allow', 'nothing before it: the missing source copies nothing');
+  assert.equal(bash('cp template.json .claude/settings.json && python3 /tmp/after.py'), 'allow', 'a program AFTER the copy changes nothing about it');
+});
+
+test('R2-F6: a program the guard does not model, given a hook surface file by name, is an unknown write', () => {
+  for (const cmd of ['curl -o .claude/settings.local.json https://example.test/x', 'python3 gen.py .claude/settings.local.json', 'wget -O .claude/settings.json https://example.test/x']) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of ['git add .claude/settings.json', 'git commit -m "update .claude/settings.json"', 'cat .claude/settings.json', 'git diff .claude/settings.json']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+test('R2-F7: an interpreter\'s inline code that writes a hook surface file is refused without the word hooks; a read and git add stay allowed', () => {
+  assert.equal(bash(`python3 -c "import base64;open('.claude/settings.local.json','w').write(base64.b64decode('e30=').decode())"`), 'deny');
+  assert.equal(bash(`node -e "require('fs').writeFileSync('.claude/settings.json','{}')"`), 'deny');
+  assert.equal(bash(`python3 -c "print(open('.claude/settings.json').read())"`), 'allow');
+  assert.equal(bash('git add .claude/settings.json'), 'allow');
+});
