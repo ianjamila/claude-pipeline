@@ -232,3 +232,51 @@ test('scripts/shard-weights.mjs: no run id, or a non-numeric one, is a usage err
   }
   assert.equal(readFileSync(file, 'utf8'), before);
 });
+
+// ---- name selection ------------------------------------------------------------------------------------------------
+// The quick check lists `cli.test.mjs`: an argument ending in .test.mjs names exactly one file (a substring `cli` would
+// also pick every *-cli test), other arguments stay substring filters.
+
+const pool = ['cli.test.mjs', 'ci-wait-cli.test.mjs', 'cli-review.test.mjs', 'config.test.mjs', 'docs-facts.test.mjs'];
+
+test('selectTestFiles: an argument ending in .test.mjs selects exactly that file, not the files that contain it', async () => {
+  const { selectTestFiles } = await import('../scripts/lib/select-tests.mjs');
+  assert.deepEqual(selectTestFiles(pool, ['cli.test.mjs']), { names: ['cli.test.mjs'], missing: [] });
+  assert.deepEqual(selectTestFiles(pool, ['ci-wait-cli.test.mjs']).names, ['ci-wait-cli.test.mjs']);
+});
+
+test('selectTestFiles: other arguments keep the substring match, and exact and substring arguments combine', async () => {
+  const { selectTestFiles } = await import('../scripts/lib/select-tests.mjs');
+  assert.deepEqual(selectTestFiles(pool, ['cli']).names, ['cli.test.mjs', 'ci-wait-cli.test.mjs', 'cli-review.test.mjs']);
+  assert.deepEqual(selectTestFiles(pool, ['config', 'cli.test.mjs']).names, ['cli.test.mjs', 'config.test.mjs']);
+  assert.deepEqual(selectTestFiles(pool, []).names, pool);
+});
+
+test('selectTestFiles: an exact .test.mjs argument that names no file is reported as missing', async () => {
+  const { selectTestFiles } = await import('../scripts/lib/select-tests.mjs');
+  assert.deepEqual(selectTestFiles(pool, ['config', 'clii.test.mjs']), { names: ['config.test.mjs'], missing: ['clii.test.mjs'] });
+  // a .test.mjs argument is never a substring: `ci.test.mjs` does not match ci-wait-cli.test.mjs
+  assert.deepEqual(selectTestFiles(pool, ['ci.test.mjs']), { names: [], missing: ['ci.test.mjs'] });
+});
+
+test('scripts/test.mjs: an unknown exact .test.mjs name is exit 2 naming it, even when other arguments match', () => {
+  for (const argv of [['no-such-file.test.mjs'], ['test-runner', 'no-such-file.test.mjs']]) {
+    const r = spawnSync(process.execPath, [runner, ...argv], { encoding: 'utf8', env: nestedEnv() });
+    assert.equal(r.status, 2, `${argv}: exit ${r.status}, stderr ${r.stderr}`);
+    assert.match(r.stderr, /no-such-file\.test\.mjs/);
+    assert.doesNotMatch(r.stdout, /^# tests/m, 'no test ran');
+  }
+});
+
+test('scripts/test.mjs: a substring that matches nothing is still "no test files matched" exit 2', () => {
+  const r = spawnSync(process.execPath, [runner, 'zzz-no-such-substring'], { encoding: 'utf8', env: nestedEnv() });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /no test files matched/);
+});
+
+test('verify --quick runs test/cli.test.mjs by exact name (docs/cli.md must match the usage text before CI)', () => {
+  const src = readFileSync(join(root, 'scripts', 'verify.mjs'), 'utf8');
+  const quick = /quickCmd: '([^']*)'/.exec(src)?.[1] ?? '';
+  assert.match(quick, /(^| )cli\.test\.mjs( |$)/);
+  assert.doesNotMatch(quick, /(^| )cli( |$)/, 'a bare `cli` would also run every *-cli test');
+});
