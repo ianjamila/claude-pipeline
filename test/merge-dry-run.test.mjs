@@ -13,6 +13,7 @@ import { cli, ghEntries, PR, ymlFor } from './helpers/gate-env.mjs';
 import { RUN, ciRow, setup, ymlWith } from './helpers/ci-proof-env.mjs';
 import { ciEntries, okGate } from './helpers/ci-proof-merge-env.mjs';
 import { scenario } from './helpers/gate-env.mjs';
+import { readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { treeFingerprint } from '../pipeline/lib/git.mjs';
 import { verifyReportCheck } from '../pipeline/lib/finalgate.mjs';
@@ -246,6 +247,7 @@ test('dry run, ownerMerge > 0 under owner_approval: chat -> ownerStep owner-runs
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.wouldMerge, true);
   assert.deepEqual(d.r.json.ownerStep, { kind: 'owner-runs', command: `node scripts/fake-merge.mjs ${PR} ${s.head}` });
+  assert.equal('closing' in d.r.json.ownerStep, false, 'owner-runs has no closing lines');
   assert.ok(!JSON.stringify(d.r.json).includes('Ready to merge'), 'no request line');
   assert.deepEqual(d.writes, []);
 });
@@ -258,7 +260,7 @@ test('dry run, clean PR with no owner item that is not a low-risk review -> owne
   writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), risk: 'high' }));
   const d = dry(s);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
-  assert.deepEqual(d.r.json.ownerStep, { kind: 'say-merge', line: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets` });
+  assert.deepEqual(d.r.json.ownerStep, { kind: 'say-merge', line: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets`, closing: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets\n${readyLine([PR])}` });
 });
 
 test('dry run, a resumed run record -> ownerStep owner-approval-flags (reported, not refused)', () => {
@@ -276,6 +278,7 @@ test('dry run, a resumed run record -> ownerStep owner-approval-flags (reported,
   const d = dry(s);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.ownerStep.kind, 'owner-approval-flags');
+  assert.equal('closing' in d.r.json.ownerStep, false, 'owner-approval-flags has no closing lines');
   assert.deepEqual(d.writes, []);
 });
 
@@ -288,7 +291,7 @@ test('dry run --owner-go: the owner-go route preconditions are checked live, the
   const d = dry(s, ['--owner-go']);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.deepEqual([d.r.json.wouldMerge, d.r.json.mode], [true, 'owner-go']);
-  assert.deepEqual(d.r.json.ownerStep, { kind: 'say-merge', line: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets` });
+  assert.deepEqual(d.r.json.ownerStep, { kind: 'say-merge', line: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets`, closing: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets\n${readyLine([PR])}` });
   assert.deepEqual(d.writes, []);
   assert.deepEqual(s.mergeCalls(), []);
   noGitWrites(d);
@@ -324,6 +327,7 @@ test('dry run --owner-go, chat mode, a protected diff -> say-merge with the LIVE
   assert.doesNotMatch(ownerStep.line, /items none/);
   assert.equal(ownerStep.areaIds.length, 1);
   assert.equal(ownerStep.areas, `Areas ${ownerStep.areaIds.join(' ')}`);
+  assert.equal(ownerStep.closing, [ownerStep.areas, ownerStep.line, readyLine([PR])].join('\n'), 'closing = the Areas line, the Head line, the 🔀 line, nothing else');
   assert.deepEqual(d.writes, []);
   assert.deepEqual(s.mergeCalls(), []);
   noGitWrites(d);
@@ -387,6 +391,7 @@ test('dry run --owner-go, behind its base but disjoint: wouldMerge, `behind` set
   assert.deepEqual(d.r.json.behind, { behindBy: 1, mergeBase: s.baseTip, baseRefOid: tip, mainFiles: 1, rule: 'disjoint' });
   assert.equal(d.r.json.ownerStep.kind, 'say-merge');
   assert.equal(d.r.json.ownerStep.behindNote, "behind main by 1 commit(s); main's 1 new file(s) touch none of this PR's files");
+  assert.doesNotMatch(d.r.json.ownerStep.closing, /behind main/, 'the behind note is prose above the block, not part of it');
   assert.deepEqual(d.writes, []);
   assert.deepEqual(s.mergeCalls(), []);
   noGitWrites(d);
@@ -460,6 +465,7 @@ test('dry run --owner-go, queue ON, branch BEHIND: queue:true, no behind-base bl
   assert.equal(d.r.json.ownerStep.kind, 'say-merge');
   assert.equal(d.r.json.ownerStep.line, `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets`);
   assert.equal(d.r.json.ownerStep.queueNote, QUEUE_NOTE);
+  assert.equal(d.r.json.ownerStep.closing, `${d.r.json.ownerStep.line}\n${readyLine([PR])}`, 'the queue note is prose above the block, not part of it');
   assert.equal('behindNote' in d.r.json.ownerStep, false);
   assert.deepEqual(d.writes, []);
   assert.deepEqual(s.mergeCalls(), []);
