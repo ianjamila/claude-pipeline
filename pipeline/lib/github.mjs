@@ -7,6 +7,7 @@ import { gh, GhError } from './proc.mjs';
 import { UnavailableError, UsageError } from './cli.mjs';
 import { repoRoot, repoSlug } from './repo.mjs';
 import { resolve } from 'node:path';
+import { makeRetrier } from './gh-retry.mjs';
 
 // A hung gh must never hang the pipeline: a call that outlives this is a failure.
 const CALL_TIMEOUT_MS = 60_000;
@@ -85,12 +86,14 @@ export function classifyApiError({ stdout = '', stderr = '' } = {}) {
   return null;
 }
 
-export function createGitHub({ cwd, env, ghFn = gh } = {}) {
+// `retry` ({sleep, now, maxMs, log}) is a test seam for gh.retrying(); nothing retries unless a caller opts in (see lib/gh-retry.mjs).
+export function createGitHub({ cwd, env, ghFn = gh, retry } = {}) {
   let repoCache = null;
   let repoIdCache; // undefined = not read yet
   let viewerCache = null;
 
   const exec = (args, { input } = {}) => ghFn(args, { cwd, env, input, timeoutMs: CALL_TIMEOUT_MS });
+  const retrying = makeRetrier({ exec: (args) => exec(args), env, retry });
   const failure = (r, args) => {
     const err = new GhError({ code: r.code, stderr: r.stderr, args, timedOut: r.timedOut, overBuffer: r.overBuffer === true });
     err.stdout = r.stdout;
@@ -151,6 +154,10 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
   const self = {
     api,
 
+    // Re-runs `fn` (a whole idempotent operation that re-reads before it writes) when GitHub answers with a rate limit.
+    // fn(attempt) counts from 1. Opt-in: merge, hold, queue, update-branch and the final gate never call this.
+    retrying,
+
     repo() {
       repoCache ??= repoSlug(cwd, { ghJsonFn: (args) => getJson(args) });
       return repoCache;
@@ -177,11 +184,14 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     prLabels: (n) => (getJson(['pr', 'view', prNumber(n), '--json', 'labels']).labels ?? []).map((l) => l.name),
 
     // The pipeline's own transitions. The global hook stops agents doing some of these directly; that is intended.
-    addLabels(n, labels) {
-      if (labels.length) ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--add-label', l])]);
+    // `{ retry: true }` waits out a rate limit (the edit is idempotent); the hold and merge paths leave it off.
+    addLabels(n, labels, { retry = false } = {}) {
+      const edit = () => ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--add-label', l])]);
+      if (labels.length) (retry ? retrying(edit) : edit());
     },
-    removeLabels(n, labels) {
-      if (labels.length) ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--remove-label', l])]);
+    removeLabels(n, labels, { retry = false } = {}) {
+      const edit = () => ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--remove-label', l])]);
+      if (labels.length) (retry ? retrying(edit) : edit());
     },
 
     // REST DELETE of one label of a PR (not `pr edit`): `P merge --owner-go` lifts the needs-human hold the owner's "merge" named with it
@@ -267,8 +277,10 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     createLabel: ({ name, color, description }) => ok(['label', 'create', name, '--color', color, '--description', description]),
     editLabel: ({ name, color, description }) => ok(['label', 'edit', name, '--color', color, '--description', description]),
 
-    listComments(n) {
-      return commentList(['api', `repos/${self.repo().slug}/issues/${prNumber(n)}/comments`, '--paginate']);
+    // `{ retry: true }`: a rate limit on any page re-runs the whole paged call (one `gh --paginate`), so a half list is never returned.
+    listComments(n, { retry = false } = {}) {
+      const read = () => commentList(['api', `repos/${self.repo().slug}/issues/${prNumber(n)}/comments`, '--paginate']);
+      return retry ? retrying(read) : read();
     },
 
     // Every issue/PR comment of the repo updated since `since` (an ISO instant); each carries its `issue_url`.
@@ -278,18 +290,21 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
 
     // Only our own (viewer's) newest comment that STARTS with the marker is edited: a quoted or forged
     // marker, or someone else's comment, must never be rewritten, and the next run must find it again.
+    // A rate limit re-runs the whole operation, re-listing first: a POST that landed before the limit answer is then PATCHed, not repeated.
     upsertComment(n, marker, body) {
       if (!String(body).startsWith(marker)) throw new Error('comment body must start with its marker, or the next run could not find it');
-      const me = self.viewer();
-      const mine = self.listComments(n)
-        .filter((c) => typeof c.body === 'string' && c.body.startsWith(marker) && c.user?.login === me)
-        .sort((a, b) => Number(a.id) - Number(b.id));
-      const existing = mine.at(-1);
-      const slug = self.repo().slug;
-      const r = existing
-        ? api('PATCH', `repos/${slug}/issues/comments/${existing.id}`, { body })
-        : api('POST', `repos/${slug}/issues/${prNumber(n)}/comments`, { body });
-      return { id: r.id, url: r.html_url, action: existing ? 'updated' : 'created' };
+      return retrying(() => {
+        const me = self.viewer();
+        const mine = self.listComments(n)
+          .filter((c) => typeof c.body === 'string' && c.body.startsWith(marker) && c.user?.login === me)
+          .sort((a, b) => Number(a.id) - Number(b.id));
+        const existing = mine.at(-1);
+        const slug = self.repo().slug;
+        const r = existing
+          ? api('PATCH', `repos/${slug}/issues/comments/${existing.id}`, { body })
+          : api('POST', `repos/${slug}/issues/${prNumber(n)}/comments`, { body });
+        return { id: r.id, url: r.html_url, action: existing ? 'updated' : 'created' };
+      });
     },
 
     // Always a NEW comment, never an edit: for append-only evidence (run events) that no later writer may overwrite.

@@ -216,7 +216,7 @@ export const run = guarded(async (argv, ctx) => {
         && String(latest.updated_at ?? '') === String(latest.created_at ?? '');
       const comment = reused ? { id: latest.id, url: latest.html_url ?? null } : gh.createComment(pr, body);
 
-      gh.removeLabels(pr, [AWAITING_REVIEW]);
+      gh.removeLabels(pr, [AWAITING_REVIEW], { retry: true });
       // gh exiting 0 is not the label being gone: read it back, and never report a removal that did not happen.
       if (gh.prLabels(pr).includes(AWAITING_REVIEW)) {
         return {
@@ -230,8 +230,8 @@ export const run = guarded(async (argv, ctx) => {
       let recheckError = null;
       if (recheck === 'triggered') {
         try {
-          gh.addLabels(pr, [RECHECK_LABEL]);
-          gh.removeLabels(pr, [RECHECK_LABEL]);
+          gh.addLabels(pr, [RECHECK_LABEL], { retry: true });
+          gh.removeLabels(pr, [RECHECK_LABEL], { retry: true });
         } catch (err) {
           recheck = 'failed';
           recheckError = `${String(err?.message ?? err).split('\n')[0].slice(0, 160)}; run \`P labels\` (creates ${RECHECK_LABEL}), then add and remove ${RECHECK_LABEL} by hand, so the guards post Cross-model review`;

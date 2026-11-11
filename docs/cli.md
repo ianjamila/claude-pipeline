@@ -9,6 +9,15 @@ blocked · **2** usage or environment error (also: unknown command, unknown flag
 (Codex, GitHub, a deployment that never finished). Flags after a bare `--` belong to the command being run (`job start`).
 `--repo DIR` (default: the current directory) is accepted by every repo-scoped command and resolves to the repository top level.
 
+**GitHub rate limits.** `comment` (and so the triage, summary and park comments), `followups create`, `labels ensure` and
+`review-complete`'s label edits wait out a GitHub rate limit and run again: the whole operation re-reads before it writes, so a
+write that landed before the limit answer is found, not repeated. Only a secondary or primary rate limit is retried (a plain 403, a
+timeout, a 5xx or a network error is not). The wait is `Retry-After` when gh shows it; else 60 s, then the rest of the cap, for a
+secondary limit; for a primary limit, until the earliest reset among the exhausted resources, and only when that fits the cap (else it
+fails at once and names the reset time). The total wait is capped at 100 s; `PIPELINE_GH_RETRY_MS` can only shorten it, and `0`
+turns retrying off. Each wait prints one stderr line. `merge`, the merge hold, the merge queue, `update-branch`, `final-gate` and
+the hooks never retry or sleep.
+
 ## agent-log
 
 queue a line for the agent log, publish queued lines to the `pipeline-agent-log` branch, or close pending prod-smoke lines. The log lives on that orphan branch (like `pipeline-artifacts`), never in a PR branch.

@@ -31,7 +31,8 @@ export async function run(argv, ctx) {
   if (positionals.length !== 1 || positionals[0] !== 'ensure') throw new UsageError('usage: pipeline labels ensure [--repo DIR]');
   const gh = createGitHub({ cwd: commandCwd(values, ctx), env: ctx.env });
 
-  return guardGh(() => {
+  // The whole ensure re-reads the label list, so a rate-limit retry (gh.retrying) never repeats a create that landed.
+  return guardGh(() => gh.retrying(() => {
     const existing = new Map(gh.listLabels().map((l) => [key(l.name), l]));
     const out = { created: [], updated: [], unchanged: [] };
     for (const want of LABELS) {
@@ -54,5 +55,5 @@ export async function run(argv, ctx) {
       }
     }
     return { exitCode: EXIT.OK, output: { ok: true, ...out } };
-  });
+  }));
 }

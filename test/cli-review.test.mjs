@@ -13,7 +13,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createFakeGh, fakeGhPath, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { contentHash } from '../pipeline/lib/git.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { currentContentHash, excerptWindow, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
@@ -60,6 +60,7 @@ const noIssues = (slug) => [
   { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=30 --paginate`, stdout: '[]' },
 ];
 const NO_ISSUES = noIssues('acme/widgets');
+const SEQ_GH = `node "${join(dirname(fakeGhPath), 'fake-gh-seq.mjs')}"`;
 
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x' } },
@@ -2021,6 +2022,32 @@ test('followups create: a gh failure is exit 3 and nothing is recorded as filed'
   const r = w.cli(['followups', 'create', '--round', '1']);
   assertExit(r, 3);
   assert.equal(w.item('R1-W1').followupIssue ?? null, null);
+});
+
+test('followups create: a rate limit on the issue POST that DID land is retried with a fresh lookup, so no duplicate issue is filed (#190)', (t) => {
+  const url = 'https://github.com/acme/widgets/issues/11';
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other' })])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  const marker = `<!-- claude-pipeline:followup pr=7 fp=${w.item('R1-W1').fingerprint} -->`;
+  const limited = { code: 1, stderr: 'gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)' };
+  w.fake.setScript([
+    { match: '^repo view', stdoutJson: REPO_VIEW },
+    { match: '^api user', stdout: 'me\n' },
+    // the lookup: empty the first time; the second time the issue the limited POST had actually created is there
+    { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=30 --paginate', sequence: [
+      { stdout: '[]' },
+      { stdoutJson: [{ number: 11, html_url: url, state: 'open', body: `${marker}\nbody`, user: { login: 'me' } }] },
+    ] },
+    { match: '^api -X POST repos/acme/widgets/issues ', sequence: [limited, { stdoutJson: { number: 12, html_url: 'https://github.com/acme/widgets/issues/12' } }] },
+  ]);
+  const r = w.cli(['followups', 'create', '--round', '1'], { PIPELINE_GH: SEQ_GH, PIPELINE_GH_RETRY_MS: '50' });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.created, []);
+  assert.deepEqual(r.json.reused.map((x) => x.number), [11]);
+  assert.equal(w.fake.calls().filter((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues ')).length, 1, 'one POST only');
+  assert.match(r.stderr, /secondary rate limit; retrying in/);
+  assert.equal(w.item('R1-W1').followupIssue, url);
 });
 
 // ---- a whole round, end to end ----------------------------------------------------------------
