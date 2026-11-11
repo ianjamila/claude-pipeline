@@ -402,7 +402,7 @@ test('telemetry: the agent-log line shows the Fable passes and how many were fix
   assert.equal(countArbiterCalls(state), 3, 'a proven zero-item Fable round is a pass too');
   assert.equal(countFixVerifyCalls(state), 2, 'only proven fix-verify passes');
   assert.equal(countFixVerifyCalls(null), 0);
-  assert.match(buildAgentLogLine({ state, pr: 9, title: 't', outcome: 'merged', now: new Date('2026-11-11T00:00:00Z') }), /rounds 5 · fable 3 \(fix-verify 2\) · merged$/);
+  assert.match(buildAgentLogLine({ state, pr: 9, title: 't', outcome: 'merged', now: new Date('2026-11-11T00:00:00Z') }), /rounds 5 · arbiter 3 \(fix-verify 2\) · merged$/);
   assert.equal(agentLogLine({ date: '2026-11-11', pr: 1, title: 't', risk: 'low', rounds: 2, arbiterCalls: 1, outcome: 'merged' }), '- 2026-11-11 · #1 · t · risk low · rounds 2 · arbiter 1 · merged');
-  assert.equal(agentLogLine({ date: '2026-11-11', pr: 1, title: 't', risk: 'low', rounds: 2, arbiterCalls: 2, fixVerifyCalls: 1, outcome: 'merged' }), '- 2026-11-11 · #1 · t · risk low · rounds 2 · fable 2 (fix-verify 1) · merged');
+  assert.equal(agentLogLine({ date: '2026-11-11', pr: 1, title: 't', risk: 'low', rounds: 2, arbiterCalls: 2, fixVerifyCalls: 1, outcome: 'merged' }), '- 2026-11-11 · #1 · t · risk low · rounds 2 · arbiter 2 (fix-verify 1) · merged');
 });

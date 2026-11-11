@@ -318,9 +318,10 @@ export function awaitingReviewComment(reason) {
 
 // Every field is sanitised: one line, markers and mentions defused, pipes escaped (the log is read
 // by people and may be pasted into a table).
-// A run with fix-verify Fable passes reads `fable F (fix-verify K)` (F = every Fable pass, K of them the narrow fix-verify brief); one without reads as it always did.
+// A run with fix-verify Fable passes reads `arbiter F (fix-verify K)` (F = every Fable pass, K of them the narrow fix-verify brief); one without reads
+// `arbiter F` as it always did, so old and new lines keep one label for the same count.
 export function agentLogLine({ date, pr, title, risk, rounds, arbiterCalls, fixVerifyCalls = 0, outcome }) {
   const f = (v) => line(v).replace(/\|/g, '&#124;');
-  const passes = Number(fixVerifyCalls) > 0 ? `fable ${f(arbiterCalls)} (fix-verify ${f(fixVerifyCalls)})` : `arbiter ${f(arbiterCalls)}`;
+  const passes = Number(fixVerifyCalls) > 0 ? `arbiter ${f(arbiterCalls)} (fix-verify ${f(fixVerifyCalls)})` : `arbiter ${f(arbiterCalls)}`;
   return `- ${f(date)} · #${f(pr)} · ${f(title)} · risk ${f(risk)} · rounds ${f(rounds)} · ${passes} · ${f(outcome)}`;
 }
