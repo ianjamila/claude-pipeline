@@ -1553,14 +1553,17 @@ function modelZshSelfDirs(cmds, raw, ctx) {
 }
 
 const PS_FILE_WRITERS = new Set(['set-content', 'add-content', 'clear-content', 'out-file', 'new-item', 'remove-item', 'copy-item', 'move-item', 'rename-item', 'set-item', 'tee-object', 'export-csv', 'export-clixml', 'sc', 'ac', 'ni', 'ri', 'cpi', 'mi', 'ren', 'rni', 'del', 'erase']);
-function impliesCwdWrite(c) {
+function impliesCwdWrite(c, ctx) {
   const name = baseOf(c.argv[0] ?? '');
   const args = c.argv.slice(1);
+  // R14-F1/F2: on the PowerShell route a directory only known at run time makes EVERY command that is not read-only a possible write there (deny by default: a parameter spelled `-Path:..\x` or `-OutFile`, an unlisted
+  // writer such as iwr / Expand-Archive / Start-Transcript, an alias, all write relative to the unknown folder). PS_FILE_WRITERS below is only the narrower reading for the other routes.
+  if (ctx?.shell === 'powershell') return c.argv.length > 0 && !isReadOnly(c, ctx);
   if (['tar', 'bsdtar', 'gtar', 'unzip', '7z', '7za', '7zz', 'cpio', 'bsdcpio', 'pax', 'ar', 'jar', 'unrar', 'unar', 'unxz', 'unzstd', 'bunzip2', 'gunzip', 'patch', 'ditto', 'wget', 'svn', 'hg'].includes(name)) return true;
   if (['gzip', 'xz', 'bzip2', 'zstd', 'lz4'].includes(name)) return true; // (compress or decompress, in place)
   const relOperand = args.some((a) => !a.startsWith('-') && !/^(?:\/|~)/.test(a.replace(/^\w+=/, '')));
   if (['touch', 'mkdir', 'tee', 'truncate', 'rm', 'rmdir', 'mkfifo', 'mknod', 'chmod', 'chown', 'dd'].includes(name)) return relOperand;
-  // R13-F2: PowerShell's file writers (and their aliases) write a relative operand into the directory they run in too: after a cd only known at run time (`Set-Location -Path:X`) they are judged in each assumed folder
+  // (PowerShell's file writers, and their aliases, write a relative operand into the directory they run in too)
   if (PS_FILE_WRITERS.has(name)) return args.some((a) => !a.startsWith('-') && !/^(?:\/|~|[A-Za-z]:[\\/])/.test(a));
   if (['sed', 'gsed'].includes(name) && args.some((a) => inPlaceFlag(a))) return relOperand;
   if (['perl', 'ruby'].includes(name) && args.some((a) => /^-[A-Za-z]*i/.test(a))) return relOperand; // (in-place edit)
@@ -1776,7 +1779,10 @@ const psOffender = (raw) => {
 // (`Microsoft.PowerShell.Management\Set-Location`) is one, and so are the .NET ways (`[IO.Directory]::SetCurrentDirectory`, `[Environment]::CurrentDirectory = ...`). On a not-plain line the Bash parse may read
 // a quote or a comment differently from PowerShell, so a directory change it did not read as a command can still run, and a count of the cd commands the parse found can be matched by a decoy: the line is
 // refused unless every such word sits in its plain leading part (psPlainPrefixEnd) and the parse of that part reads each one as a cd command (psCdUnreadable).
-const PS_CD_WORD = /(?<![A-Za-z0-9_-])(?:cd\.\.|cd\\|(?:set-location|push-location|pop-location|chdir|pushd|popd|cd|sl)(?![A-Za-z0-9_-]))/gi;
+// R14-F3: the same scan runs on a PLAIN line too: there the parse is trusted for what it read, but a cd word it did not read as a cd command (a module-qualified `Microsoft.PowerShell.Management\Set-Location`, one inside a
+// quoted string that is run, `iex 'cd X'`) makes the directory unknown, and the line is judged in each assumed protected folder (every command that is not read-only is then a possible write there, impliesCwdWrite).
+// (R14-F3: not the tail or head of a file name: `cd.txt`, `out.cd`, `a.sl` are names, not commands)
+const PS_CD_WORD = /(?<![A-Za-z0-9_.-])(?:cd\.\.|cd\\|(?:set-location|push-location|pop-location|chdir|pushd|popd|cd|sl)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_]))/gi;
 const PS_CD_DOTNET = /CurrentDirectory/i; // (SetCurrentDirectory too)
 const PS_PREFIX_STOP = /[^A-Za-z0-9 \t\n._:/\\|;=,-]|@["']|<#|#>|`|--%|\\(?![A-Za-z0-9._-])/;
 // The end of the text's leading run that PowerShell and the guard's parser read the same: plain characters only, NO quote (one opened there can swallow what follows), no escape, comment, here-string or backtick.
@@ -3256,10 +3262,11 @@ function evaluateBashForFilesFrame(command, opts) {
   // (a name the line never set, after a source nothing could follow: it may have come from that file)
   const newName = (n) => ctx.unknownAll && !Object.hasOwn(ctx.vars, n);
   const snaps = []; // per command: the names a sourced file may have changed / set at run time as that command runs (the checks after the loop would otherwise see the end state)
+  const psCdHidden = ctx.shell === 'powershell' && !psUnparsed(raw) && psCdUnreadable([raw]); // (R14-F3: a plain PowerShell line holding a directory change the parse did not read as one; a not-plain line is refused below)
   // Is the directory the line works in only known at run time? (a `cd` into an unset / substituted / maybe-changed name, `cd -`, `popd`; or the frame was started in one)
   const unknownCwd = () => {
     if (assumedCwd) return false; // (a rerun that already assumes a directory: the unknown cd is what it stands for)
-    if (opts._unknownCwd === true || ctx.sourcedCdUnknown) return true;
+    if (opts._unknownCwd === true || ctx.sourcedCdUnknown || psCdHidden) return true;
     const KNOWN = new Set(['HOME', 'USER', 'LOGNAME']);
     const closures = new Map();
     // (the state when the cd ran, or by the end of the line: a later plain assignment does not clean an earlier cd)
@@ -3653,7 +3660,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const name = baseOf(c.argv[0] ?? '');
     if (insideRoot) return true;
     // (inline interpreter code that writes can build any name there)
-    if (opts._writesOnly === true && (impliesCwdWrite(c) || (runsInlineCode(c, ctx) && WRITE_HINT.test(c.raw ?? c.argv.join(' '))))) return true;
+    if (opts._writesOnly === true && (impliesCwdWrite(c, ctx) || (runsInlineCode(c, ctx) && WRITE_HINT.test(c.raw ?? c.argv.join(' '))))) return true;
     // (a destination word is never filtered: a writer may create a protected name that does not exist yet)
     if (DEST_ONLY.has(name)) {
       if (destsOf(wordsOf(c), name).some(tokenHitAll)) return true;

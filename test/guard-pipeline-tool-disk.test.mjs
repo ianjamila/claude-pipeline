@@ -649,3 +649,50 @@ test('R13-F3: under PowerShell a tilde operand is not a trusted tool path (a nat
   assert.equal(bashW('node ~/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow');
   assert.equal(run('node ~/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow');
 });
+
+// R14 (push security review of b67aa0f): after a directory only known at run time, on the PowerShell route ANY command that is not read-only may write the unknown folder, and every line is scanned for directory changes.
+test('R14-F1/F2: after an unknown PowerShell directory every non-read-only command is a possible write there; reads stay allowed', () => {
+  const U = 'Set-Location -Path:C:/Users/u/.claude/plugins';
+  const lines = [
+    `${U}; Set-Content -Path:../settings.json x`,
+    `${U}; Set-Content -LiteralPath:../settings.json x`,
+    `${U}; Set-Content -FilePath ../settings.json x`,
+    `${U}; Invoke-WebRequest http://x -OutFile ../settings.json`,
+    `${U}; iwr http://x -OutFile ../settings.json`,
+    `${U}; Copy-Item a ../settings.json`,
+    `${U}; Move-Item a ../settings.json`,
+    `${U}; Rename-Item a ../settings.json`,
+    `${U}; Export-Csv -Path ../settings.json`,
+    `${U}; Expand-Archive a.zip -DestinationPath ../x`,
+    `${U}; Start-Transcript -Path ../settings.json`,
+    `${U}; Set-ItemProperty -Path ../settings.json -Name x -Value y`,
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  assert.equal(psW('Set-Location -Path:C:/repo; Get-Content ../x.txt'), 'allow', 'a read after an unknown cd stays allowed');
+  assert.equal(psW(`${U}; Get-ChildItem ../x`), 'allow');
+});
+
+test('R14-F3: every PowerShell line is scanned for directory changes (module-qualified, .NET); a plain cd and a file called cd.txt are not tripped', () => {
+  const P = 'C:/Users/u/.claude/plugins';
+  const lines = [
+    `Microsoft.PowerShell.Management\\Set-Location ${P}; Set-Content ../settings.json x`,
+    `Microsoft.PowerShell.Management\\Push-Location ${P}; Set-Content ../settings.json x`,
+    `[System.IO.Directory]::SetCurrentDirectory('${P}'); Set-Content ../settings.json x`,
+    `iex 'cd ${P}'; Set-Content ../settings.json x`,
+    // the folder is only named at run time, so the line spells no protected path: only the cd scan can refuse it
+    'Microsoft.PowerShell.Management\\Set-Location $env:CLAUDE_CONFIG_DIR; Set-Content settings.json x',
+    'Microsoft.PowerShell.Management\\Push-Location $env:CLAUDE_CONFIG_DIR; Add-Content -Path:settings.json x',
+    "iex 'cd $env:CLAUDE_CONFIG_DIR'; Set-Content settings.json x",
+    'Microsoft.PowerShell.Management\\Set-Location $env:CLAUDE_CONFIG_DIR; Set-Content out.txt x',
+    'Microsoft.PowerShell.Management\\Set-Location $env:CLAUDE_CONFIG_DIR; Invoke-WebRequest http://x -OutFile out.txt',
+    "iex 'cd $env:CLAUDE_CONFIG_DIR'; Set-Content out.txt x",
+    // a directory change the parse does not read as a cd command (run from a string): the folder is unknown, so a non-read-only command is refused
+    "iex 'cd C:/other'; Set-Content out.txt x",
+    'Invoke-Expression "Set-Location C:/other"; Invoke-WebRequest http://x -OutFile out.txt',
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  assert.equal(psW('cd C:/repo; Set-Content out.txt x'), 'allow', 'a plain known cd is modelled as before');
+  assert.equal(psW('Get-Content cd.txt'), 'allow');
+  assert.equal(psW('Set-Content cd.txt x'), 'allow', 'cd.txt is a file name, not a directory change');
+  assert.equal(psW('Set-Content out.cd x'), 'allow');
+});
