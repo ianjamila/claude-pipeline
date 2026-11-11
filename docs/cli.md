@@ -42,7 +42,11 @@ decide which items need the arbiter, then prove and apply its rulings.
 
 ```
 pipeline arbiter needed --round R [--force] [--repo DIR]
-  -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader[, diffPath, scope]}
+  -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader, brief, effort, agent[, diffPath, scope]}
+  brief / effort / agent: which Fable agent to call. `fix-verify` / `medium` / `arbiter-fix` for a FIX ROUND: mode review, scope round (never whole-pr, a Fable refresh or a resolution-only round),
+    the previous counted round had an ACCEPT item, and the round's own range has no hard-stop hit and no file matching review.arbiter_always_paths or risk.high_risk_paths; its input lists those ACCEPT items
+    and asks Fable to verify each fix and the round diff. Everything else is `full` / `high` / `arbiter` (the whole review job). Fable still runs on every Fable round either way. The choice is stored on the round
+    (arbiter.brief / effort / agent) and `apply` proves against the stored one; running `needed` again recomputes and re-stores it (the digest and tag change with the brief)
   mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied
     (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that)
   mode review in a terminal whose Claude Code build is older than the installed one (stale): exit 1 {ok:false, error: stale-terminal, restartRequired: true,
@@ -52,7 +56,8 @@ pipeline arbiter needed --round R [--force] [--repo DIR]
   mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none
   start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman
 pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
-  the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)
+  the proof is pinned to claude-fable- and to the round's STORED brief: agent `arbiter` at effort high (full; a round stored without a brief is full), agent `arbiter-fix` at effort medium or higher (fix-verify);
+    --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)
   -> {ok, round, tag, transcript, errors, items[, findings]}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript
   any Fable on any line of the transcript must be at least this machine's floor (whatever --expect-model says): older => exit 1, error stale-model,
     restartRequired: true, floor: {newest, seen}, advice (restart this terminal, or update Claude Code); the items wait with cause stale-model. A proven pass
@@ -70,6 +75,8 @@ pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR
 Exit: `needed`: 0 (`needed:false` is also 0) · `apply`: 0 proven + applied, 1 proof failed (arbitrated items marked needsHuman), 2 no transcript found / usage.
 
 `needed` on a Fable round from a terminal that runs an older Claude Code than the installed one (`claudeCode.stale`) exits 1 `stale-terminal` with `restartRequired` before it writes anything: restart the terminal, then run `needed` again (an unknown version never stops it). That stop, and an `apply` that fails on the Fable floor (`stale-model`, `model-floor-unreadable`, `unrecognised-fable`, `model-floor-busy`, `model-floor-unwritable`), is saved as `round.arbiter.failure {cause, advice, at}`, shown by `state outcome` (`arbiterFailures`) and in the triage comment (`Round R arbiter stopped: <cause> — <advice>`); an `apply` that proves clears it.
+
+Every Fable review round still gets a Fable pass; a FIX ROUND gets a narrower brief at lower effort (cost: later rounds cost as much as round 1, because Fable explores, so the brief is what is cut). `needed` prints `brief`, `effort` and `agent`: `fix-verify` / `medium` / `arbiter-fix` when the round is round-scoped (not whole-pr, not a Fable refresh, not resolution-only), the previous counted round had at least one ACCEPT item, and the round's own range has no hard-stop hit and no file under `review.arbiter_always_paths` or `risk.high_risk_paths`; otherwise `full` / `high` / `arbiter`. The fix-verify input lists those ACCEPT items (id, title, file:line, detail, the ruling's reason) and asks Fable to verify each fix, look for bugs or regressions in the round diff, raise findings as usual and not re-review code outside the diff. The brief is stored on the round (`arbiter.brief`, `effort`, `agent`); `apply` proves against the stored one (agent `arbiter-fix` at effort medium or higher, or agent `arbiter` at exactly high), never a recomputed one, and a round stored without these fields is `full`. Nothing else reads the effort: `fablePendingRounds`, `staleFableRounds`, `review-complete`, the final gate, the review marker and the vendored `ci-guards-run.mjs` look only at the proven model and the proof's presence, so a medium proof needs no re-vendor. Rollout: install the new pipeline (the CLI and the `arbiter-fix` agent file go together) before relying on fix-verify; an older install that runs `apply` on a stored fix-verify round expects effort high and refuses the proof. The agent-log line reads `fable F (fix-verify K)` once a run has a fix-verify pass (F = Fable passes, K of them fix-verify), `arbiter F` otherwise.
 
 A Fable review round (`fableRequired`, set by `codex-review`) is not clean until `apply` proves a pass, even with zero
 Codex items: `state outcome` lists it in `fablePending` and `review-complete` refuses. A failed proof leaves it pending:

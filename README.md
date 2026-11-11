@@ -17,7 +17,7 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | Piece | What it does |
 |---|---|
 | skills `review`, `verify`, `pipeline-setup` | the process: review builds the change and runs the cross-model review, then asks you to merge; verify runs the quick check; pipeline-setup onboards a repo |
-| agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `arbiter` (Fable) | the judgment; models are pinned in the agent files and proven from transcripts |
+| agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `arbiter` and `arbiter-fix` (Fable; `arbiter-fix` is the lower-effort variant `arbiter needed` picks for a fix round) | the judgment; models are pinned in the agent files and proven from transcripts |
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge) |
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |

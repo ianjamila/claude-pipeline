@@ -20,7 +20,7 @@ number, `R` a review round, `<slug>` 2–5 lowercase words from the request.
    `needs-human` / `pipeline-blocked` / `pipeline-pause` / `pipeline-rollback` yourself (`P merge --owner-go` lifts exactly the `needs-human` hold the owner's verified "merge" named, 3.3). The guards block these; don't route around them.
 2. No cross-model review, no merge. Codex unavailable (`exitCode: 3`) ⇒ `gh pr edit N --add-label awaiting-review`,
    `P comment --pr N --kind awaiting-review --reason "<reason from the JSON>"`, tell the owner, stop (outcome `awaiting-review`). A failed Codex run is never "no findings".
-3. Never pass a `model` parameter to `judge`, `arbiter` or `implementer`: their agent files pin the model (Sonnet, Fable, Sonnet).
+3. Never pass a `model` parameter to `judge`, `arbiter`, `arbiter-fix` or `implementer`: their agent files pin the model (Sonnet, Fable, Fable, Sonnet).
 4. Keep your context lean: work from `P` JSON, subagent summaries and file paths; hand paths, not logs or diffs, to subagents.
 5. Anything over 2 minutes runs as `P job start <name> -- <command>`, then `P job wait <name> --run-id <runId> --timeout 540`
    until `state` is `done` (`replaced`/`lost` ⇒ start it again once). Read `exitCode` (the command's own code) and the JSON in `tail`.
@@ -77,7 +77,7 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    with the `errors`; `not-found` / invalid twice ⇒ park, cause `judge:not-found` / `judge:invalid`). A disputed bug with a settle test: implementer writes and commits the test only, then
    `P triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd "<cmd>" --test-file <file>` (the CLI runs it itself). `bug-confirmed` makes the item
    ACCEPT: fixed and marked implemented in step 5, like any accepted item.
-4. **Arbiter** (when `P arbiter needed --round R` says `needed`). One call: the `arbiter` agent, description = the `tag` it printed, prompt starting
+4. **Arbiter** (when `P arbiter needed --round R` says `needed`). One call: the agent named in the `agent` field of its output (`arbiter`, or `arbiter-fix` when `brief` is `fix-verify`: a fix round, Fable at effort medium with a narrow verify-the-fixes input; use exactly the one named, `apply` refuses the other), description = the `tag` it printed, prompt starting
    with its `promptHeader` pasted verbatim, then `Read <inputPath> and rule on every item in it.` (Fable round: and review the diff it names). Then
    `P arbiter apply --round R --tag "<the same tag>"`; exit 2 `not-found`: wait, retry once, then park (cause `arbiter:not-found`);
    exit 1 with `restartRequired` (`stale-terminal` from `needed`, `stale-model` from `apply`; Fable round) ⇒ do NOT retry here and do NOT park: outcome `blocked`, with no `pipeline-blocked`
