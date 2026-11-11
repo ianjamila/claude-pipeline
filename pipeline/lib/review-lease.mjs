@@ -19,7 +19,13 @@
 // between stays covered because the session is alive and the TTL is long. Things that cannot be placed fail toward "live", never toward "dead":
 //   - an unreadable or malformed lease file counts as LIVE (listed in `unreadable`; blocking() merges it with `live`);
 //   - ps cannot be asked, or the session record is missing/unmatched while the pid runs: live until the TTL.
-// A lease whose session is gone is still live while a detached `P job` runs in its worktree (jobLive: <worktree>/.review/jobs/*, jobs.mjs).
+// A lease whose session is gone, or that is past the TTL, is still live while a detached `P job` runs in its worktree (jobLive: <worktree>/.review/jobs/*, jobs.mjs).
+// LEASED COMMANDS INSIDE A JOB (review round 1, R1-F1). codex-review, ci-wait, merge-hold --wait and merge run as `P job start NAME -- pipeline <cmd>`: no Claude
+// ancestor, CLAUDECODE=1. `job start` (which runs in the session) puts holderHandoff() into the job's env (HOLDER_ENV = JSON { sessionId, pid, pidStart }); the
+// job's command trusts it only when verifiedSession() agrees (that pid still runs, same ps start, its record still names that sessionId). Then its lease is the
+// SESSION's, and the session's summary / ended closes it. Closing while a job still runs keeps the lease as `jobOnly: true` (live only while a job runs there,
+// dead the moment it ends, whatever the session or the TTL); a job's own renewals keep it job-scoped, a command of the session itself clears the flag.
+// A handed identity that does not check out (forged, the session gone or cleared) falls back to the TTL-only holder.
 // CLAUDECODE=1 (or a Claude ancestor) but the session cannot be looked up (no record, no ps, Windows) -> a TTL-ONLY lease: pid and pidStart null,
 // live for 6 h after the last renewal. Its holder id is `ttl-<hash of the worktree>`: stable across commands (each is a fresh process) and bounded
 // in number; the cost is that two unidentifiable sessions on the same worktree share one lease. A plain terminal (no Claude ancestor, no CLAUDECODE)
@@ -49,6 +55,7 @@ import { OWNER_GO_REL, realDirChain } from '../hooks/lib/owner-go.mjs';
 
 export const LEASES_REL = `${OWNER_GO_REL}/review-leases`;
 export const LEASE_DIR_ENV = 'PIPELINE_REVIEW_LEASE_DIR';
+export const HOLDER_ENV = 'PIPELINE_LEASE_HOLDER';
 export const ADMISSION_LOCK = 'admission';
 export const LEASE_TTL_MS = 6 * 60 * 60 * 1000;
 export const ADMISSION_WAIT_MS = 20_000;
@@ -146,8 +153,34 @@ export function readSessionRecord(pid, { home, env = process.env } = {}) {
   return null;
 }
 
-// Who is asking? -> { kind: 'session', sessionId, pid, pidStart } | { kind: 'ttl', sessionId, pid: null, pidStart: null } | { kind: 'none' }.
-// `worktree` only seeds the id of a TTL-only holder.
+// The session that owns Claude Code process `pid`: ps start time + its own record must exist and agree. `expect` ({ sessionId, pidStart }, from an
+// identity handed to a job) must match them too. -> { kind: 'session', sessionId, pid, pidStart } | null.
+function verifiedSession(pid, opts, expect) {
+  let start;
+  try { start = (opts.starts ?? psStarts)([pid])?.get(pid); } catch { start = undefined; }
+  let rec = null;
+  try { rec = (opts.sessionRecord ?? ((p) => readSessionRecord(p, opts)))(pid); } catch { rec = null; }
+  if (!start || !rec || !SESSION_ID.test(rec.sessionId ?? '') || (rec.procStart && norm(rec.procStart) !== norm(start))) return null;
+  if (expect && (rec.sessionId !== expect.sessionId || norm(start) !== norm(expect.pidStart))) return null;
+  return { kind: 'session', sessionId: rec.sessionId, pid, pidStart: norm(start) };
+}
+
+// The identity `job start` handed to its job (HOLDER_ENV: JSON { sessionId, pid, pidStart }) -> that, or null when absent or malformed.
+function handedIdentity(env) {
+  const raw = env?.[HOLDER_ENV];
+  if (typeof raw !== 'string' || raw === '' || raw.length > 1024) return null;
+  let v;
+  try { v = JSON.parse(raw); } catch { return null; }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  if (!isPosInt(v.pid) || typeof v.sessionId !== 'string' || !SESSION_ID.test(v.sessionId) || typeof v.pidStart !== 'string' || v.pidStart === '') return null;
+  return { sessionId: v.sessionId, pid: v.pid, pidStart: v.pidStart };
+}
+
+// Who is asking? -> { kind: 'session', sessionId, pid, pidStart, viaJob? } | { kind: 'ttl', sessionId, pid: null, pidStart: null } | { kind: 'none' }.
+// `worktree` only seeds the id of a TTL-only holder. A command inside a detached `P job` has no Claude ancestor but CLAUDECODE=1: when `job start` handed
+// it the session's identity (HOLDER_ENV) and that session is still the real one (same ps start, same record: the checks a direct holder gets), it
+// is that session's holder (viaJob), so its lease lands in the session's own file and the session's summary / ended closes it. Anything that does
+// not check out (forged, stale, the session gone or cleared) is NOT trusted: the TTL-only holder below.
 export function resolveHolder({ worktree, ...opts } = {}) {
   const env = opts.env ?? process.env;
   let ancestor = null;
@@ -158,16 +191,25 @@ export function resolveHolder({ worktree, ...opts } = {}) {
   if (!isPosInt(ancestor)) ancestor = null;
   if (ancestor === null && env.CLAUDECODE !== '1') return { kind: 'none' };
   if (ancestor !== null) {
-    let start;
-    try { start = (opts.starts ?? psStarts)([ancestor])?.get(ancestor); } catch { start = undefined; }
-    let rec = null;
-    try { rec = (opts.sessionRecord ?? ((p) => readSessionRecord(p, opts)))(ancestor); } catch { rec = null; }
-    if (start && rec && SESSION_ID.test(rec.sessionId ?? '') && (!rec.procStart || norm(rec.procStart) === norm(start))) {
-      return { kind: 'session', sessionId: rec.sessionId, pid: ancestor, pidStart: norm(start) };
-    }
+    const direct = verifiedSession(ancestor, opts);
+    if (direct) return direct;
+  } else {
+    const handed = handedIdentity(env);
+    const viaJob = handed && verifiedSession(handed.pid, opts, handed);
+    if (viaJob) return { ...viaJob, viaJob: true };
   }
   const seed = canonicalPath(String(worktree ?? ''));
   return { kind: 'ttl', sessionId: `ttl-${createHash('sha256').update(seed).digest('hex').slice(0, 16)}`, pid: null, pidStart: null };
+}
+
+// The env `job start` gives its job so a leased command run inside it (codex-review, ci-wait, merge-hold --wait, merge) joins the SESSION's lease:
+// { [HOLDER_ENV]: JSON } for a verified session holder (a direct one, or one already handed down), {} otherwise (a plain terminal; a TTL-only holder is
+// derived the same way inside the job, so there is nothing to hand over).
+export function holderHandoff({ worktree, ...opts } = {}) {
+  let holder;
+  try { holder = resolveHolder({ worktree, ...opts }); } catch { return {}; }
+  if (holder.kind !== 'session') return {};
+  return { [HOLDER_ENV]: JSON.stringify({ sessionId: holder.sessionId, pid: holder.pid, pidStart: holder.pidStart }) };
 }
 
 // ---- reading and writing one holder's file ----------------------------------------------------------------------------------------------
@@ -179,7 +221,8 @@ function validLease(l) {
     && typeof l.generation === 'string' && l.generation !== ''
     && Number.isFinite(Date.parse(l.openedAt)) && Number.isFinite(Date.parse(l.renewedAt))
     && (l.pr === undefined || isPosInt(l.pr)) && (l.branch === undefined || (typeof l.branch === 'string' && l.branch !== ''))
-    && (l.pr !== undefined || l.branch !== undefined);
+    && (l.pr !== undefined || l.branch !== undefined)
+    && (l.jobOnly === undefined || l.jobOnly === true);
 }
 
 // -> { ok: true, rec } | { ok: false, absent: true } | { ok: false, why }. Anything but a plain regular file with a valid body is `why`.
@@ -250,9 +293,11 @@ function makeJudge(opts) {
     lease(rec, worktree, lease) {
       const ageMs = Math.max(0, now - Date.parse(lease.renewedAt)); // a clock set back counts as just renewed
       const minutes = Math.round(ageMs / 60000);
-      if (ageMs > ttlMs) return { live: false, why: `idle ${(ageMs / 3600000).toFixed(1)} h (limit ${ttlMs / 3600000} h)` };
       let holder;
-      if (rec.pid === null) holder = { live: true, why: `no session record, TTL-only: renewed ${minutes} min ago` };
+      // The job check below runs for EVERY dead verdict, the TTL one included: a job that outlives the limit is still a review in flight.
+      if (lease.jobOnly === true) holder = { live: false, why: 'closed by its session; live only while a detached job runs in the worktree' };
+      else if (ageMs > ttlMs) holder = { live: false, why: `idle ${(ageMs / 3600000).toFixed(1)} h (limit ${ttlMs / 3600000} h)` };
+      else if (rec.pid === null) holder = { live: true, why: `no session record, TTL-only: renewed ${minutes} min ago` };
       else if (starts === null || starts === undefined) holder = { live: true, why: `ps unavailable, treated as live: renewed ${minutes} min ago` };
       else {
         const start = starts.get(rec.pid);
@@ -391,9 +436,11 @@ export async function openOrRenewLease({ worktree, repoId, pr, branch, ...opts }
       action = cur.pr === undefined && prNum !== undefined ? 'migrated' : 'renewed';
     }
     if (action === 'opened' || action === 'reopened') {
-      lease = { repoId, ...(prNum !== undefined ? { pr: prNum } : { branch: branchName }), generation: randomUUID(), openedAt: iso(now), renewedAt: iso(now) };
+      // A lease a job's command opens (the session had closed its own) lives only while a job runs: the job must not leave a lease behind.
+      lease = { repoId, ...(prNum !== undefined ? { pr: prNum } : { branch: branchName }), generation: randomUUID(), openedAt: iso(now), renewedAt: iso(now), ...(holder.viaJob ? { jobOnly: true } : {}) };
     } else {
       lease = { ...cur, renewedAt: iso(now) };
+      if (!holder.viaJob) delete lease.jobOnly; // a command of the session itself: it is working on this worktree again
       if (prNum !== undefined) { lease.pr = prNum; delete lease.branch; }
     }
     leases[key] = lease;
@@ -424,6 +471,14 @@ export async function closeLease({ worktree, generation, ...opts } = {}) {
     if (!cur) return { closed: false, why: 'absent' };
     if (generation !== undefined && cur.generation !== generation) return { closed: false, why: 'stale-generation' };
     const leases = { ...read.rec.leases };
+    // A detached job still running in the worktree (the review's own ci-wait / merge / codex-review) must stay covered until it ends: the lease is
+    // kept as job-scoped (live only while a job runs, then dead whatever the session or the TTL says) instead of removed.
+    let jobRunning = false;
+    try { jobRunning = (opts.jobLive ?? liveJobIn)(key) === true; } catch { jobRunning = false; }
+    if (jobRunning) {
+      if (cur.jobOnly !== true) { leases[key] = { ...cur, jobOnly: true }; writeHolder(dir, { ...read.rec, leases }); }
+      return { closed: true, sessionId: holder.sessionId, jobRunning: true };
+    }
     delete leases[key];
     if (Object.keys(leases).length === 0) removeHolder(dir, holder.sessionId);
     else writeHolder(dir, { ...read.rec, leases });

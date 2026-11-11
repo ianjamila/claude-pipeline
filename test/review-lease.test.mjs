@@ -395,7 +395,9 @@ test('a session whose process is gone stays live while a detached job runs in it
   assert.equal(scan.live.length, 1);
   assert.match(scan.live[0].why, /detached job/);
   assert.deepEqual((await sweepDeadLeases(w.as(null))).removed, []);
-  assert.equal(w.scan({ now: T0 + 7 * HOUR }).live.length, 0, 'a job does not outlive the TTL');
+  assert.equal(w.scan({ now: T0 + 7 * HOUR }).live.length, 1, 'a running job keeps it live past the TTL too (R1-B2)');
+  w.jobs.delete(wt);
+  assert.equal(w.scan({ now: T0 + 7 * HOUR }).live.length, 0, 'once the job is gone the TTL applies');
 });
 
 test('sweep prunes only the dead leases of a holder that has live ones, and re-judges under the lock', async (t) => {

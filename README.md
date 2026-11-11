@@ -167,7 +167,7 @@ working exactly as before.
     `docs/cli.md`) records that the session is working on it. `summary` (the stop ritual) or an
     ended run closes it. A lease stops counting when the session is gone, after `/clear` or a
     resume (same process, new session id), or after 6 hours with no pipeline command; a detached
-    `P job` still running in the worktree keeps it alive. A plain terminal takes no lease;
+    `P job` still running in the worktree keeps it alive (whatever its age), and a lease closed while a job still runs ends with that job. A plain terminal takes no lease;
   - a `P job` that is still running (or just starting) in a worktree of a repo this machine knows;
   - a held review, merge or queue lock, or a merge command that outlived its run;
   - a merge-queue record that is not finished;
