@@ -189,6 +189,21 @@ test('#189 hand-back turn (Codex): a ruling-request call, its result, then the c
   }
 });
 
+// #190.3a (session 3a5849f9, answers "R1-F1: accept" and "R4-B1: reject" that were never recorded; fixed by #192): the SAME owner turn runs
+// `triage ruling-request` (its tool_result carries the canonical line) and then ends with the text ask. The owner's typed answer must bind.
+test('#190.3a an owner turn that surfaced the ask in a ruling-request tool result AND ends with the line: the typed answer is recorded; the line not last binds nothing', () => {
+  for (const present of [true, false]) {
+    const home = tmp();
+    const ok = rule(home, [promptEntry('go'), use('P triage ruling-request --pr 58'), result(ASK), said(ASK_REPLY)], 'R1-F1: accept', { present });
+    assert.deepEqual([ok?.kind, ok?.pr, ok?.ids, ok?.content, ok?.repo], ['ruling', 58, ['R1-F1'], 'abcdef012345', 'acme/app'], `recorded (present ${present})`);
+    assert.equal(ok.ask_turn, undefined, 'an owner-turn ask carries no ask_turn');
+    // (binding is read back from the transcript, which holds the answer's own entry only when the hook ran after it was written)
+    if (present) assert.equal(ownerRuled({ repo: REPO, pr: 58, id: 'R1-F1', quote: 'R1-F1: accept', decision: 'ACCEPT', contentOf: () => ITEMS, home, now }), true, 'binding');
+    const notLast = rule(tmp(), [promptEntry('go'), use('P triage ruling-request --pr 58'), result(ASK), said(`${ASK_REPLY}\nBy the way.`)], 'R1-F1: accept', { present });
+    assert.equal(notLast, null, `the line is not the last thing said (present ${present})`);
+  }
+});
+
 test('#189 hand-back turn: consecutive synthetic turns each flush on their own (text voids a promoted slot, a tool-only turn leaves it)', () => {
   for (const present of [true, false]) {
     const base = [promptEntry('go'), promptEntry(HANDBACK, PEER_META), said(ASK_REPLY), promptEntry(NOTICE, NOTICE_META)];
