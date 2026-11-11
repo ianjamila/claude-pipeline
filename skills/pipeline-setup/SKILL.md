@@ -45,6 +45,8 @@ Use implementer subagents for the file work; give each the exact template path +
   clean install → typecheck → lint/static guards → unit tests → database reset + all migrations
   + permission/policy tests → production build → Playwright E2E smoke (screenshots to
   `.verify/screenshots/`). `--quick` = typecheck + lint + tests related to changed files.
+  A script agents run (`verify.mjs`, and any script it starts) must not spell the config-root path, even in a comment: the guard refuses a script whose text names
+  it and which writes, and `pipeline preflight` warns about it. Describe the file in words.
 - Writes `.verify/report.json` (per step: status `pass|fail|not-run|skipped`, duration, error excerpt, `skipReason` when skipped; plus `mode`,
   `expectedSteps`, git head/tree/dirty). Fail fast.
 - Add missing tooling: Vitest (JS/TS unit), Playwright (`e2e/smoke/*.spec.ts`, own config +
