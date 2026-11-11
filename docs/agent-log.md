@@ -142,3 +142,4 @@ full record.
 - 2026-11-11 · #272 · Quick verify also runs the tests related to the branch's changes · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge
 - 2026-11-11 · #269 · Click to approve: merge, extra round and rulings as a choice dialog (#261) · risk high · rounds 5 · arbiter 4 · blocked
 - 2026-11-11 · #279 · Extra-round ask shows rounds, cost and severity; safe follow-up path; one implementer per PR · risk high · rounds 3 · arbiter 2 · blocked
+- 2026-11-11 · #266 · Guard false refusals + holes, owner-answer glyph/visibility, gh rate-limit retry, ci-wait status holder, worktree self-check (#190 #245 #244 + folds) · risk high · rounds 6 · arbiter 5 · blocked
