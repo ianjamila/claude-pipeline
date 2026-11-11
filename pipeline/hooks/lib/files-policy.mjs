@@ -1704,7 +1704,7 @@ function assignmentOnlyHarmless(cmds, ctx, topLevel) {
     const e = expandRefs(v, ctx);
     return !/[$`{}]/.test(e) && /^(?:\/|~|\.)/.test(e);
   };
-  const inert = (c) => (isAssign(c) ? Object.entries(c.env).every(([k, v]) => valueOk(k, v)) : c.argv.length > 0 && ENV_INERT.has(baseOf(c.argv[0])) && !Object.keys(c.env ?? {}).length && !(baseOf(c.argv[0]) === 'printf' && c.argv.some((a) => /^-v/.test(a)))); // (printf -v NAME assigns a shell variable)
+  const inert = (c) => (isAssign(c) ? Object.entries(c.env).every(([k, v]) => valueOk(k, v)) : c.argv.length > 0 && ENV_INERT.has(baseOf(c.argv[0])) && !Object.keys(c.env ?? {}).length && !(baseOf(c.argv[0]) === 'printf' && c.argv.some((a) => /^-v/.test(a))) && !evaluatesSubscript(baseOf(c.argv[0]), c.argv.slice(1), ctx)); // (printf -v NAME assigns a shell variable; test -v / a numeric comparison evaluates an array subscript)
   if (!cmds.every(inert)) return no;
   if (FUNCTION_TEXT.test(ctx.ghLine ?? '')) return no;
   return (c) => isAssign(c);
@@ -1754,6 +1754,19 @@ function judgedWords(name, args, ctx) {
   });
   return { args: out, unknown };
 }
+// R1-B2 (#266): `test` / `[` with -v, or a numeric comparison (-eq -ne -lt -le -gt -ge), and `printf -v` read an operand as a variable NAME or an arithmetic expression, and bash / zsh evaluate an
+// array subscript in it (`test -v 'a[$(rm "$T")]'` runs the substitution). So such a call with an operand holding `[`, `$(` or a backtick is no read-only call. Both the words as written and
+// as expanded are judged (a same-line name may carry the subscript).
+const SUBSCRIPT_EVAL = /[\[`]|\$[({]/;
+function evaluatesSubscript(name, args, ctx) {
+  const test = name === 'test' || name === '[' || name === '[[';
+  if (!test && name !== 'printf') return false;
+  const words = [...args, ...args.map((a) => (/[$`]/.test(a) ? expandRefs(a, ctx) : a))];
+  if (test) {
+    if (!words.some((a) => a === '-v' || a === '-R' || /^-(?:eq|ne|lt|le|gt|ge)$/.test(a))) return false;
+  } else if (!args.some((a) => /^-v/.test(a))) return false;
+  return words.some((a) => SUBSCRIPT_EVAL.test(a));
+}
 function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
   if (!argv.length) return false;
@@ -1761,6 +1774,10 @@ function isReadOnly(cmd, ctx) {
   const judged = judgedWords(name, argv.slice(1), ctx);
   if (judged.unknown) return false;
   const args = judged.args;
+  if (evaluatesSubscript(name, argv.slice(1), ctx)) return false;
+  // R1-B1 (#266): a sed / awk program is plain program text, and the expansion above rewrites a same-line name in it (`system=length; awk 'BEGIN { $system("rm S") }'` reads as length(...)
+  // while awk runs system()). The program as written must be read-only too.
+  if (PROGRAM_TOOLS.has(name) && !(name === 'sed' || name === 'gsed' ? sedReadOnly(argv.slice(1)) : awkReadOnly(argv.slice(1), cmd.env))) return false;
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
   if (READ_ONLY.has(name)) {
     if (name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre='))) return false;
@@ -3408,7 +3425,7 @@ function evaluateBashForFilesFrame(command, opts) {
     if (!c.argv.length) continue;
     const runs = RUNTIMES.has(baseOf(c.argv[0])) || OWNER_GO_RECORDER.test(toPosix(c.argv[0]));
     if (runs && c.argv.some((w) => /owner-go\.mjs/i.test(toPosix(expandRefs(w, ctx))))) {
-      return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types; to change its source, edit the source with the Edit tool (a program that runs or rewrites it is refused;PIPELINE_ADMIN=1 for the owner)');
+      return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types; to change its source, edit the source with the Edit tool (a program that runs or rewrites it is refused; PIPELINE_ADMIN=1 for the owner)');
     }
   }
 
