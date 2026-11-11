@@ -198,3 +198,53 @@ test('review-complete (behind_base: disjoint): a draft behind by a file the PR a
   assert.equal(r.json.error, 'behind-base');
   assert.deepEqual(w.posted(), []);
 });
+
+test('review-complete (behind_base: disjoint): a refusal carries the helper\'s reason as detail', (t) => {
+  const w = world(t, { disjoint: true });
+  w.mainMovesOn('src/a.js');
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.equal(r.json.error, 'behind-base');
+  assert.match(r.json.detail, /changed 1 file\(s\) this PR also touches \(src\/a\.js\)/);
+});
+
+test('review-complete (behind_base: disjoint): mergeable UNKNOWN (GitHub has not recomputed yet) on a disjoint draft posts, with a warning', (t) => {
+  const w = world(t, { disjoint: true, view: { mergeable: 'UNKNOWN' } });
+  w.mainMovesOn('src/from-main.js');
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.posted, true);
+  assert.equal(r.json.warnings.length, 1);
+  assert.match(r.json.warnings[0], /behind-base check skipped/);
+  assert.match(r.json.warnings[0], /mergeability/);
+});
+
+test('review-complete (behind_base: disjoint): mergeable UNKNOWN does not hide a real overlap: still refused, with the overlap as detail', (t) => {
+  const w = world(t, { disjoint: true, view: { mergeable: 'UNKNOWN' } });
+  w.mainMovesOn('src/a.js');
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.equal(r.json.error, 'behind-base');
+  assert.match(r.json.detail, /also touches/);
+  assert.deepEqual(w.posted(), []);
+});
+
+test('review-complete (behind_base: disjoint): mergeable CONFLICTING is refused (behind-base), with GitHub\'s answer as detail', (t) => {
+  const w = world(t, { disjoint: true, view: { mergeable: 'CONFLICTING' } });
+  w.mainMovesOn('src/from-main.js');
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.equal(r.json.error, 'behind-base');
+  assert.match(r.json.detail, /"CONFLICTING", not MERGEABLE/);
+  assert.deepEqual(w.posted(), []);
+});
+
+test('review-complete (default behind_base: update): mergeable UNKNOWN still refuses a behind draft (the warning is only for a check that could not be made)', (t) => {
+  const w = world(t, { view: { mergeable: 'UNKNOWN' } });
+  w.mainMovesOn();
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.equal(r.json.error, 'behind-base');
+  assert.ok(r.json.detail, 'the helper reason is carried');
+  assert.deepEqual(w.posted(), []);
+});

@@ -544,9 +544,9 @@ pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused
   when a proven Fable round counts as current only because of the owner's allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line
   "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},
   and the final gate's review check detail carries the same note
-  a DRAFT whose head lacks commits of origin/<default_branch> is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:'behind-base', error:'behind-base', base, behindBy, remedy},
+  a DRAFT whose head lacks commits of origin/<default_branch> is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:'behind-base', error:'behind-base', base, behindBy, detail (why the check refused it: the helper's reason), remedy},
   so the review skill catches it up BEFORE `gh pr ready` and CI runs once, on current main: the remedy is `pipeline update-branch --pr N`, `git pull --ff-only`, the next codex-review round (only main was merged in: baseOnly, Codex does not run,
-  nothing is counted), then review-complete again. merge.behind_base: update = behind when origin/<default_branch> is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`).
+  nothing is counted), then review-complete again. merge.behind_base: update = behind when origin/<default_branch> is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`; a `mergeable` GitHub has not computed yet, UNKNOWN, is not a conflict: if everything else passes, the draft posts with a warning).
   A ready PR is never refused for this; the check is skipped with a `warnings` entry when the base ref could not be refreshed (offline), the base has a merge queue (or it cannot be read), or the ancestry cannot be read
 ```
 

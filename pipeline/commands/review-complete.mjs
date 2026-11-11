@@ -48,9 +48,9 @@ export const meta = {
     '  when a proven Fable round counts as current only because of the owner\'s allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line',
     '  "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},',
     '  and the final gate\'s review check detail carries the same note',
-    '  a DRAFT whose head lacks commits of origin/<default_branch> is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:\'behind-base\', error:\'behind-base\', base, behindBy, remedy},',
+    '  a DRAFT whose head lacks commits of origin/<default_branch> is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:\'behind-base\', error:\'behind-base\', base, behindBy, detail (why the check refused it: the helper\'s reason), remedy},',
     '  so the review skill catches it up BEFORE `gh pr ready` and CI runs once, on current main: the remedy is `pipeline update-branch --pr N`, `git pull --ff-only`, the next codex-review round (only main was merged in: baseOnly, Codex does not run,',
-    '  nothing is counted), then review-complete again. merge.behind_base: update = behind when origin/<default_branch> is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`).',
+    '  nothing is counted), then review-complete again. merge.behind_base: update = behind when origin/<default_branch> is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`; a `mergeable` GitHub has not computed yet, UNKNOWN, is not a conflict: if everything else passes, the draft posts with a warning).',
     '  A ready PR is never refused for this; the check is skipped with a `warnings` entry when the base ref could not be refreshed (offline), the base has a merge queue (or it cannot be read), or the ancestry cannot be read',
   ].join('\n'),
 };
@@ -158,8 +158,17 @@ function draftBehindBase({ root, config, gh, pr, view, refresh }) {
     return { warning: `behind-base check skipped: ${err.message}` };
   }
   // The helper wants GitHub's mergeStateStatus, which is DRAFT here and would always refuse; GitHub's `mergeable` (conflicts) still counts.
-  const fresh = behindFreshEnough({ root, config, diff: lazyDiff(root, config, { sha: baseSha, branch }), baseSha, info: { mergeStateStatus: 'CLEAN', mergeable: view.mergeable } });
-  if (fresh.ok) return {};
+  // GitHub recomputes `mergeable` lazily after the base moves, so right then it can answer UNKNOWN (or nothing): that is "not known yet", not a
+  // conflict. The helper refuses anything but MERGEABLE, so ask it with MERGEABLE and warn when that is what made it pass; the conflict-free
+  // checks (mode, overlapping files, toolchain paths) still refuse as usual. Only CONFLICTING is a real answer.
+  const known = view.mergeable === 'MERGEABLE' || view.mergeable === 'CONFLICTING';
+  const fresh = behindFreshEnough({
+    root, config, diff: lazyDiff(root, config, { sha: baseSha, branch }), baseSha,
+    info: { mergeStateStatus: 'CLEAN', mergeable: known ? view.mergeable : 'MERGEABLE' },
+  });
+  if (fresh.ok) {
+    return known ? {} : { warning: `behind-base check skipped: GitHub had not computed the PR's mergeability yet (mergeable is ${JSON.stringify(view.mergeable ?? null)}), so conflicts were not ruled out; origin/${branch} changed no file this PR touches` };
+  }
   let behindBy = null;
   try {
     const n = Number(git(['rev-list', '--count', `HEAD..${baseSha}`], o).trim());
@@ -167,7 +176,7 @@ function draftBehindBase({ root, config, gh, pr, view, refresh }) {
   } catch { /* the count is a courtesy */ }
   return {
     refusal: {
-      ok: false, reason: 'behind-base', error: 'behind-base', base: branch, behindBy,
+      ok: false, reason: 'behind-base', error: 'behind-base', base: branch, behindBy, detail: fresh.reason,
       remedy: `this draft lacks commits of origin/${branch}; catch it up before it is marked ready, so CI runs once on current ${branch}: run \`pipeline update-branch --pr ${pr}\`, \`git pull --ff-only\`, `
         + 'then the next codex-review round (only main was merged in, so it is baseOnly: Codex does not run and nothing is counted), then review-complete again',
     },
