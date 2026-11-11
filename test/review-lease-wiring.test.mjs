@@ -5,9 +5,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, dirname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml } from './helpers/fakegh-env.mjs';
@@ -18,6 +18,7 @@ import { acquireAdmission, blocking, releaseAdmission, scanLeases } from '../pip
 import { tryAcquire, release } from '../pipeline/lib/locks.mjs';
 import { LEASED_COMMANDS, leaseArgs, leasesOffForTests } from '../pipeline/lib/review-lease-wiring.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { noClaudeSession } from './helpers/no-claude-session.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BIN = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -34,22 +35,7 @@ function scratch(label = 'cp-lw') {
   return d;
 }
 
-// A `ps` that knows no Claude Code anywhere (every pid is a plain shell whose parent is init): the CLI then sees no Claude ancestor, so a session is
-// identified by the environment marker alone (TTL-only holder) whether or not these tests themselves run inside Claude Code. Windows asks PowerShell
-// instead (not faked; its CI machines have no Claude Code above the tests).
-const FAKE_PS_DIR = (() => {
-  if (process.platform === 'win32') return null;
-  const dir = scratch('cp-lw-ps');
-  const file = join(dir, 'ps');
-  writeFileSync(file, [
-    '#!/usr/bin/env node',
-    "const args = process.argv.slice(2);",
-    "console.log(args.includes('args=') ? 'zsh' : '1 zsh');",
-  ].join('\n'));
-  chmodSync(file, 0o755);
-  return dir;
-})();
-const withFakePs = () => (FAKE_PS_DIR ? { PATH: `${FAKE_PS_DIR}${delimiter}${process.env.PATH}` } : {});
+const withFakePs = () => noClaudeSession();
 
 // One machine: a lease folder and a home, and the environment of a child CLI. `session: false` is a plain terminal (no session marker).
 function world({ session = true, extra = {} } = {}) {
@@ -58,8 +44,8 @@ function world({ session = true, extra = {} } = {}) {
   mkdirSync(home, { recursive: true });
   const dir = join(root, 'review-leases');
   const env = {
-    HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: undefined, PIPELINE_MACHINE_ID: MACHINE,
-    PIPELINE_REVIEW_LEASE_DIR: dir, [SESSION_VAR]: session ? '1' : undefined, ...withFakePs(), ...extra,
+    ...withFakePs(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: undefined, PIPELINE_MACHINE_ID: MACHINE,
+    PIPELINE_REVIEW_LEASE_DIR: dir, [SESSION_VAR]: session ? '1' : undefined, ...extra,
   };
   return { root, home, dir, env };
 }
