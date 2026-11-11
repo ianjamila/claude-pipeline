@@ -633,6 +633,23 @@ export function reuseRuled(items, ruledCache) {
   });
 }
 
+// A finding raised again after its fix was deferred past the round limit (same fingerprint as an item with roundCapDeferral whose follow-up issue is filed): the new
+// item links that issue (followupIssue) and says so (`reraisedDeferral`, shown in the triage comment), so `followups create` reuses the issue instead of filing a second one.
+// Only an item with no issue of its own is touched; the newest deferral wins. Pure: returns copies.
+export function linkDeferredFollowups(items, priorItems) {
+  const deferred = new Map();
+  for (const p of priorItems ?? []) {
+    if (!isRoundCapDeferral(p) || typeof p.fingerprint !== 'string' || p.fingerprint === '') continue;
+    const issue = typeof p.followupIssue === 'string' ? p.followupIssue : p.followupIssue?.url;
+    if (typeof issue === 'string' && issue !== '') deferred.set(p.fingerprint, { id: p.id, issue });
+  }
+  return items.map((item) => {
+    const hit = typeof item?.fingerprint === 'string' ? deferred.get(item.fingerprint) : undefined;
+    if (hit === undefined || item.followupIssue || isRoundCapDeferral(item)) return item;
+    return { ...structuredClone(item), followupIssue: hit.issue, reraisedDeferral: { id: hit.id, issue: hit.issue } };
+  });
+}
+
 // Only settled rulings are worth reusing; an item waiting for a human must be looked at again. Each entry is the
 // final plus the bucket and category it was ruled under and the follow-up issue filed for it (if any).
 export function ruledCacheFrom(items) {

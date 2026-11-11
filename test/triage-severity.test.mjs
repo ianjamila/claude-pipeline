@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import {
   applyClaudeRuling, applyOwnerRuling, applyRoundCapDefer, claudeRulingRefusal, claudeRulingRows, deferEligibility, deferItemsInState, isRoundCapDeferral,
   itemSeverity, needsHumanCause, reuseRuled, reviewEligibilityProblems, roundCapDeferRefusal, roundOutcome, ruledCacheFrom, rulingsBlock, rulingsDigest,
-  rulingsInventory, secondReviewRefusal,
+  linkDeferredFollowups, rulingsInventory, secondReviewRefusal,
 } from '../pipeline/lib/triage.mjs';
 
 // ---- fixtures -------------------------------------------------------------------------------
@@ -365,4 +365,20 @@ test('result cache: a round-cap deferral is never reused as a settled dismissal;
   assert.equal(again.final, null);
   const [reused] = reuseRuled([{ ...item({ id: 'R3-S2', fingerprint: 'fp-ord', final: null, implemented: false }) }], ruledCacheFrom([ordinary]));
   assert.equal(reused.final.by, 'cache');
+});
+
+test('linkDeferredFollowups: a finding raised again takes the open follow-up issue of its deferred twin; nothing else is touched', () => {
+  const twin = { ...deferred(), followupIssue: 'https://github.com/a/b/issues/31' };
+  const again = item({ id: 'R3-S1', fingerprint: 'fp-r2', final: null, implemented: false });
+  const other = item({ id: 'R3-S2', fingerprint: 'fp-other', final: null, implemented: false });
+  const own = item({ id: 'R3-S3', fingerprint: 'fp-r2', final: null, implemented: false, followupIssue: 'https://github.com/a/b/issues/40' });
+  const [a, o, w] = linkDeferredFollowups([again, other, own], [twin]);
+  assert.equal(a.followupIssue, 'https://github.com/a/b/issues/31');
+  assert.deepEqual(a.reraisedDeferral, { id: 'R2-S1', issue: 'https://github.com/a/b/issues/31' });
+  assert.equal(o, other, 'another fingerprint');
+  assert.equal(w, own, 'an item with an issue of its own');
+  assert.equal(again.followupIssue, null, 'the input is not mutated');
+  // a deferral whose issue is not filed yet, or an ordinary follow-up, links nothing
+  assert.equal(linkDeferredFollowups([again], [deferred()])[0], again);
+  assert.equal(linkDeferredFollowups([again], [{ ...item({ fingerprint: 'fp-r2' }), followupIssue: 'https://github.com/a/b/issues/9' }])[0], again);
 });

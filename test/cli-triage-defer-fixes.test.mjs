@@ -355,3 +355,35 @@ test('defer-fixes: a second review is refused for a deferral without running Cod
   assertExit(defer(w, 'R2-S1', h2), 0);
   refused(w, () => w.cli(['triage', 'second-review', '--round', '2', '--ids', 'R2-S1', '--pr', '7']), /deferred past the round limit.*only the owner's typed ruling/, 'second-review of a deferral');
 });
+
+test('defer-fixes: a finding raised again in a later granted round links the follow-up issue already filed for it, and the triage comment says so (no second issue)', (t) => {
+  const w = roundWorld(t);
+  const { h1, h2 } = reverted(w);
+  assertExit(defer(w, 'R2-S1', h2), 0);
+  assertExit(w.cli(['followups', 'create', '--round', '2']), 0);
+  w.repo.write('src/more.js', 'export const more = 1;\n'); // new work the granted round reviews
+  const h4 = w.repo.commit('more work');
+  const posts = () => w.fake.lines().filter((l) => l.startsWith(`api -X POST repos/${w.slug}/issues `)).length;
+  assert.equal(posts(), 1);
+  // the owner grants round 3 (for the head the ask named); Codex raises the deferred finding again
+  const record = ownerGrants(t, 'extra round', roundRequest(7, 3, h4, w.slug));
+  assert.ok(record, 'the recorder wrote the grant');
+  cleanupAtExit(markerPath(grantIdOf(record)));
+  t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+  const third = w.codex(3, { summary: 'Reviewed.', blocking: [], suggestions: [low({ title: 'Issue 2' })], worth_considering: [] }, { from: h1, to: h4 });
+  assertExit(third, 0, third.stderr + third.stdout);
+  const again = w.item('R3-S1');
+  assert.equal(again.followupIssue, w.issueUrl(31), 'linked to the open follow-up');
+  assert.deepEqual(again.reraisedDeferral, { id: 'R2-S1', issue: w.issueUrl(31) });
+  // it is ruled a follow-up again: no second issue is filed
+  w.edit((st) => { st.rounds[2].items[0].final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'already filed' }; });
+  const filed = w.cli(['followups', 'create', '--round', '3']);
+  assertExit(filed, 0, filed.stderr + filed.stdout);
+  assert.deepEqual([filed.json.created, filed.json.skipped], [[], ['R3-S1']]);
+  assert.equal(posts(), 1, 'no duplicate issue');
+  const published = w.cli(['comment', '--pr', '7', '--kind', 'triage']);
+  assertExit(published, 0, published.stderr + published.stdout);
+  const body = w.fake.comments().map((c) => c.body).find((b) => b.includes('Raised again after a deferral'));
+  assert.ok(body, 'the triage comment has the section');
+  assert.match(body, /- R3-S1: the same finding as R2-S1, whose fix was deferred past the round limit; follow-up issue https:\/\/github\.com\/[^ ]+\/issues\/31 is already filed, no new issue/);
+});
