@@ -20,3 +20,18 @@ for (const f of files) {
     assert.deepEqual(findings, []);
   });
 }
+
+// The Verify template is the project's required PR check: it runs the vendored context check before the full verify, so a PR that
+// breaks a workflow (even a workflow_run-only one, which never runs on the PR) fails its own check instead of jamming a queue.
+export const verifyRunsContextCheckFirst = (yml) => {
+  const check = yml.indexOf('node scripts/pipeline/workflow-contexts.mjs');
+  const verify = yml.indexOf('node scripts/verify.mjs');
+  return check !== -1 && verify !== -1 && check < verify;
+};
+
+test('verify.yml runs the workflow-context check before node scripts/verify.mjs', () => {
+  assert.equal(verifyRunsContextCheckFirst(readFileSync(new URL('verify.yml', DIR), 'utf8')), true);
+  // the helper is not vacuous: the order matters, and a template without the step fails it
+  assert.equal(verifyRunsContextCheckFirst('- run: node scripts/verify.mjs\n- run: node scripts/pipeline/workflow-contexts.mjs\n'), false);
+  assert.equal(verifyRunsContextCheckFirst('- run: node scripts/verify.mjs\n'), false);
+});
