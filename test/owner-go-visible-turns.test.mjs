@@ -489,3 +489,75 @@ test('R3-F1 (rulings): a visibleSynthetic turn opened BEFORE the selected slot\'
     assert.equal(run('ruling', [...open, of(hidden, surfaced), answer]), true, `${name}: surfaced tool ask`);
   }
 });
+
+// ---- R4-F1: a harness line inside the owner's own interactive turn is no invisible turn ---------------------------------------------
+// Claude Code 2.1.322 writes `entrypoint: "cli"` (and userType) on EVERY line of an interactive transcript, so that field alone is envelope, not provenance. Real user-line shapes:
+//   typed prompt: isMeta false, promptSource typed, origin {kind human}; skill body mid-turn (after the Skill tool_result): isMeta true, promptSource / origin / turnOrigin null;
+//   subagent hand-back: isMeta true, promptSource system, origin {kind peer}; headless note: entrypoint sdk-cli.
+const HARNESS_NOTE = { isMeta: true, promptSource: null, origin: null, turnOrigin: null, entrypoint: 'cli', userType: 'external' };
+const SYSTEM_REMINDER = { type: 'user', isMeta: true, message: { content: [{ type: 'text', text: '<system-reminder>\nSomething the harness injected.\n</system-reminder>' }] }, promptSource: null, origin: null, entrypoint: 'cli', userType: 'external' };
+const note = (meta = HARNESS_NOTE) => prompt('Base directory for this skill: /x/skills/ship\n\nFollow the steps.', meta);
+
+test('R4-F1: an interactive harness line (isMeta, no promptSource / origin, entrypoint cli) is no invisible turn: the request printed after it binds, M right after the prompt or mid-turn', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const o = prompt('ship it');
+    const m = note();
+    assert.deepEqual(pr(kind, record(kind, [o, m, of(m, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: M right after the prompt`);
+    const m2 = note();
+    assert.deepEqual(pr(kind, record(kind, [o, of(o, toolOnly()), of(o, toolResult()), m2, of(m2, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: M mid-turn, after the tool result`);
+    const m3 = note();
+    assert.deepEqual(pr(kind, record(kind, [o, of(o, said('working on it')), m3, of(m3, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: M after some text`);
+    // a system-reminder note written as a text-block array, and one with no provenance field but the envelope
+    const r = { ...SYSTEM_REMINDER, uuid: 'u-reminder-1' };
+    assert.deepEqual(pr(kind, record(kind, [o, r, of(r, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: system-reminder note`);
+    const bare = note({ entrypoint: 'cli', userType: 'external' });
+    assert.deepEqual(pr(kind, record(kind, [o, bare, of(bare, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: envelope only`);
+    // the note is still a boundary: an older request is not revived by it (as before #191)
+    const m4 = note();
+    assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), m4, of(m4, toolOnly()), prompt(KINDS[kind].answer)]), false, `${kind}: an older request stays stale across the note`);
+  }
+});
+
+test('R4-F1: with the owner prompt\'s tool result landing AFTER the harness line, the NEWEST visible request binds, not the older one', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const o = prompt('ship it');
+    const a1 = of(o, said(ASK59[kind])); // the older request (another PR), with a tool call still running
+    const m = note();
+    const a2 = of(m, said(KINDS[kind].ask)); // the newer request, after the harness line
+    const late = of(a1, toolResult()); // the tool result of the owner's turn lands after M (a parallel tool call)
+    assert.deepEqual(pr(kind, record(kind, [o, a1, m, a2, late, prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: newest request`);
+  }
+});
+
+test('R4-F1: a headless note (entrypoint sdk-cli, with or without null fields), an unknown promptSource / turnOrigin / entrypoint stay invisible', () => {
+  for (const [name, meta] of [
+    ['sdk-cli with the null envelope', { ...HARNESS_NOTE, entrypoint: 'sdk-cli' }],
+    ['sdk-cli alone', { entrypoint: 'sdk-cli' }],
+    ['unknown promptSource, other fields null', { ...HARNESS_NOTE, promptSource: 'brand-new-source' }],
+    ['unknown turnOrigin, other fields null', { ...HARNESS_NOTE, turnOrigin: 'brand-new-turn' }],
+    ['origin object without a kind', { ...HARNESS_NOTE, origin: {} }],
+    ['an entrypoint other than cli', { ...HARNESS_NOTE, entrypoint: 'brand-new-entry' }],
+  ]) {
+    for (const kind of Object.keys(KINDS)) {
+      const o = prompt('ship it');
+      const h = prompt('poll', meta);
+      assert.equal(run(kind, [o, h, of(h, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: ${name}`);
+    }
+  }
+  assert.equal(entrySource(prompt('x', HARNESS_NOTE)), 'unknown');
+});
+
+test('R4-F1: a `!` block and an interrupt marker (interactive, entrypoint cli) are plain boundaries in every reader, ruling included, as on main', () => {
+  const bang = (text) => prompt(text, { promptSource: null, origin: null, entrypoint: 'cli', userType: 'external' });
+  for (const kind of Object.keys(KINDS)) {
+    const o = prompt('ship it');
+    for (const [name, text] of [['`!` block', '<bash-input>git status</bash-input>\n<bash-stdout>clean</bash-stdout><bash-stderr></bash-stderr>'], ['interrupt marker', '[Request interrupted by user]']]) {
+      // a request printed after it binds ...
+      const b = bang(text);
+      assert.deepEqual(pr(kind, record(kind, [o, b, of(b, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: request after the ${name}`);
+      // ... and one printed before it is stale: the `!` block is a prompt of its own and nothing was asked after it (main's behaviour)
+      const b2 = bang(text);
+      assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), b2, prompt(KINDS[kind].answer)]), false, `${kind}: request before the ${name} is stale`);
+    }
+  }
+});
