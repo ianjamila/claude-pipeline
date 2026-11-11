@@ -444,6 +444,73 @@ test('R10: a plain PowerShell read of a protected file is still allowed', () => 
   assert.equal(psW('Set-Content C:/Users/u/.claude/settings.json x'), 'deny');
 });
 
+// R11-F1: `{` and `}` are not plain text: a script block glued to a read-only command (a delay-bind block, a calculated property) runs a write the parser reads as three ordinary words, and a `}#` starts a
+// comment PowerShell sees but the guard's lexer does not. The plain test is a character allowlist, so anything not listed is "not plain".
+test('R11-F1: a PowerShell script block glued to a read-only command that holds a protected write is refused', () => {
+  const S = 'C:/Users/u/.claude/settings.json';
+  const lines = [
+    `Get-ChildItem C:/repo | Get-Content -Path {Set-Content ${S} x}`,
+    `echo a | sort {Set-Content ${S} x}`,
+    `diff a b -Property {Set-Content ${S} x}`,
+    `echo {a}# '\nSet-Content ${S} x #'`,
+    `echo {a}# '\r\nSet-Content ${S} x #'`,
+    `Get-Content -Path { Set-Content ${S} x }`, // a spaced block refuses too (fail closed)
+    `echo $(Set-Content ${S} x)`,
+    `echo a & Set-Content ${S} x`,
+    `echo a > ${S}`,
+    `echo a * ${S} ?`,
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+});
+
+test('R11-F1: a PowerShell line with braces that names no protected path and runs in no protected directory is allowed; Bash is unchanged', () => {
+  const S = 'C:/Users/u/.claude/settings.json';
+  assert.equal(psW('Get-ChildItem C:/repo | sort {$_.Name}'), 'allow');
+  assert.equal(psW('echo a | sort {Get-Date}'), 'allow');
+  assert.equal(psW('Get-Content -Path {x}'), 'allow');
+  assert.equal(psW(`Get-Content ${S}`), 'allow'); // plain read still allowed
+  assert.equal(psW(`Get-Content ${S} | Select-Object -First 3`), 'allow');
+  // a bare variable name stays plain (the trusted `cd $DEST; node <CLI>` line); `${`, `$(` and `$$` do not
+  assert.equal(psW(`cd $DEST; Get-Content ${S}`), 'allow');
+  for (const c of [`echo \${a} ; Set-Content ${S} x`, `echo $(a) ; Set-Content ${S} x`, `echo $$ ; Set-Content ${S} x`]) assert.equal(psW(c), 'deny', c);
+  // the Bash route is untouched
+  assert.equal(bashW(`echo {a} ${S}`), 'allow');
+  assert.equal(bashW(`cat ${S} | sort {x}`), 'allow');
+  assert.equal(bashW(`echo a | sort {x} ; ls C:/repo`), 'allow');
+  assert.equal(bashW(`echo {a}# ' ${S}`), 'allow');
+});
+
+// R11-F2: the whole-line refusal must also fire when the raw text does not spell the protected path: a directory in play (cwd or a `cd` target) below ~/.claude, or a relative word that lands in
+// a protected file from one of the directories in play (`..\settings.json` after `cd .../plugins`).
+test('R11-F2: a PowerShell line that hides a relative write behind a cd below ~/.claude is refused', () => {
+  const P = 'C:/Users/u/.claude/plugins';
+  const lines = [
+    `cd ${P}; echo \u2018 " \u2019 ; Set-Content ../settings.json x ; echo \u2018 " \u2019`,
+    `cd ${P}; echo x <# #>; Set-Content ../settings.json x`,
+    `cd ${P}; echo @"\n" '\n"@ ; Set-Content ../settings.json x ; echo '' #'`,
+    `cd ${P}; echo @'\n" '\n'@ ; Set-Content ../settings.json x`,
+    `cd ${P}; cp a b \\; Set-Content ../settings.json x`,
+    `cd ${P}; echo a | sort {Set-Content ../settings.json x}`,
+    `cd ${P}; echo x <# #>; Set-Content ..\\settings.json x`,
+    `cd C:/repo; echo x <# #>; Set-Content C:/Users/u/.claude/plugins/../settings.json x`,
+    `cd C:/Users/u/.claude; cd plugins; echo x <# #>; Set-Content ../settings.json x`,
+    `cd C:/Users/u; echo x <# #>; Set-Content .claude/settings.json x`,
+    `cd C:/Users/u/repo; echo x <# #>; Set-Content ..\\.claude\\settings.json x`,
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  // the same line run from a cwd below ~/.claude
+  const inTree = { ...WIN, shell: 'powershell', cwd: 'C:\\Users\\u\\.claude\\plugins' };
+  assert.equal(evaluateBashForFiles('echo x <# #>; Set-Content ../settings.json x', inTree).decision, 'deny');
+});
+
+test('R11-F2: the same non-plain lines are allowed when no directory in play is protected and no word reaches a protected file; Bash is unchanged', () => {
+  assert.equal(psW('cd C:/repo; echo x <# #>; Set-Content ../out.txt x'), 'allow');
+  assert.equal(psW('echo \u2018 " \u2019 ; Set-Content out.txt x'), 'allow');
+  assert.equal(psW('cd C:/repo; echo x <# #>; Get-ChildItem sub'), 'allow');
+  // Bash: the same text is judged by the Bash parser only
+  assert.equal(bashW('cd C:/Users/u/.claude/plugins; echo x <# #>; ls ../settings.json'), 'allow');
+});
+
 // R10-F2: a glob in the operand is a part only known at run time too (zsh `**/` matches zero folders), so a trusted tool path holds none.
 test('R10-F2: a hooks path with a glob character is not a trusted tool on any platform', () => {
   for (const [platform, home, base] of [['darwin', '/home/u', '/home/u'], ['linux', '/home/u', '/home/u'], ['win32', 'C:\\Users\\u', 'C:/Users/u']]) {

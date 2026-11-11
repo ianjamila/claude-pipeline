@@ -1726,14 +1726,16 @@ function ghReadOnly(args, cmd, ctx) {
 // Deny by default: a backslash followed by anything but a plain path character [A-Za-z0-9._-], or by the end of the text, is a hazard. A denylist of escaped characters missed `\$(`, `\@(`, `\{`, `\<` and the rest.
 // That includes `\\` (UNC or a doubled separator) and `\/`: no trusted tool path or ordinary path in the tests needs them, and either can hide the same split, so they are refused too.
 const PS_ESCAPED_SYNTAX = /\\(?![A-Za-z0-9._-])/;
-// ... and the same decision for the whole line (R10-B1 / F1 / F3), deny by default: PLAIN text is printable ASCII, tab, newline (CRLF counts as one) and nothing PowerShell reads differently. Anything else is
-// not plain: another character (a typographic quote, a no-break space, a lone CR or other control character), a backtick (PowerShell's escape), a here-string `@"` / `@'`, a block comment `<#` / `#>`,
-// the stop-parsing token `--%`, or a backslash escape (PS_ESCAPED_SYNTAX). Used with a protected-path reference (step 5 of evaluateBashForFilesFrame), never alone.
-const PS_NOT_PLAIN_CHARS = /[^\x20-\x7E\t\n]/;
+// ... and the same decision for the whole line (R10-B1 / F1 / F3, R11-F1), deny by default: PLAIN text is a CHARACTER ALLOWLIST: letters, digits, space, tab, newline (CRLF counts as one) and `. _ - : / \ | ; = , " '`
+// (the backslash only when it passes PS_ESCAPED_SYNTAX). Everything else is not plain: `{ } # $ ( ) @ < > & ! ? * [ ] ~ % ^ +` (a script block glued to a read-only command, a `}#` comment the guard's lexer misses, a
+// subexpression, a redirection, a call operator ...), another character (a typographic quote, a no-break space, a lone CR or other control character), a backtick (PowerShell's escape), a here-string `@"` / `@'`,
+// a block comment `<#` / `#>`, the stop-parsing token `--%`, or a backslash escape (PS_ESCAPED_SYNTAX). Used with a protected-path reference (step 5 of evaluateBashForFilesFrame), never alone.
+const PS_NOT_PLAIN_CHARS = /[^A-Za-z0-9 \t\n._:/\\|;=,"'-]/;
 const PS_NOT_PLAIN_SYNTAX = /@["']|<#|#>|`|--%/;
 const psUnparsed = (raw) => {
   const text = raw.replace(/\r\n/g, '\n');
-  return PS_NOT_PLAIN_CHARS.test(text) || PS_NOT_PLAIN_SYNTAX.test(text) || PS_ESCAPED_SYNTAX.test(text);
+  // one exception to the allowlist: a bare variable name (`$DEST`, `$_`; never `${`, `$(`, `$$`), which the trusted `cd $DEST; node <CLI>` line of R9-B1 needs
+  return PS_NOT_PLAIN_CHARS.test(text.replace(/\$[A-Za-z_][A-Za-z0-9_]*/g, '')) || PS_NOT_PLAIN_SYNTAX.test(text) || PS_ESCAPED_SYNTAX.test(text);
 };
 // The text PowerShell sees once it has read its backtick escapes (R10 security review): `u{hex1-6} is that code point, `0 `a `b `e `f `n `r `t `v are control characters, a backtick before a line break
 // continues the line (nothing), a backtick before any other character is that character. Returns null when a `u{ is malformed (no closing brace, no or non-hex digits, more than six, past U+10FFFF):
@@ -3418,7 +3420,17 @@ function evaluateBashForFilesFrame(command, opts) {
   // unmasked; also with PowerShell's backticks removed, `.c`laude` is `.claude`; or runs inside a protected directory) and is not plain text is refused outright. See psUnparsed.
   // PowerShell reads a backtick escape as the character it spells (`u{2E} is '.'), so the text is also judged decoded (psDecodeBackticks); a `u{ that does not decode is refused (fail closed).
   const psDecoded = ctx.shell === 'powershell' && raw.includes('`') ? psDecodeBackticks(raw) : raw;
-  if (ctx.shell === 'powershell' && psUnparsed(raw) && (insideRoot || m.rawHit(raw, dirs) || psDecoded === null || (raw.includes('`') && (m.rawHit(psDecoded, dirs) || m.rawHit(raw.replace(/`/g, ''), dirs))))) {
+  // R11-F2: the raw text need not spell the protected path: a directory in play (cwd or a `cd` target) anywhere in the protected tree makes a relative word (`../settings.json`) reach it, so such a line is
+  // refused too, and so is one whose path-like words (split as aliasInText splits them; raw, decoded and backtick-stripped) land in a protected file from any directory in play (pathHit). Over the word cap: refused.
+  const psWordHit = () => {
+    const texts = [raw, ...(psDecoded !== null && psDecoded !== raw ? [psDecoded] : []), ...(raw.includes('`') ? [raw.replace(/`/g, '')] : [])];
+    const words = new Set();
+    for (const t of texts) for (const w of [...t.split(/[\s'"`;|&<>(){}[\]$\u2018-\u201F]+/), ...t.split(/[\s'"`;|&<>(){}[\],=*?$\u2018-\u201F]+/)]) if (w) { words.add(w); if (w.includes('\\')) words.add(w.replace(/\\/g, '/')); }
+    if (words.size * dirs.length > 20000) return true;
+    for (const w of words) if (m.pathHit(w, dirs, true)) return true;
+    return false;
+  };
+  if (ctx.shell === 'powershell' && psUnparsed(raw) && (insideRoot || dirs.some((d) => ctx.hitTree(d)) || m.rawHit(raw, dirs) || psDecoded === null || psWordHit() || (raw.includes('`') && (m.rawHit(psDecoded, dirs) || m.rawHit(raw.replace(/`/g, ''), dirs))))) {
     return deny(`the PowerShell command refers to a protected pipeline file (or the directory that holds it) and holds text PowerShell reads differently from the guard's parser (a non-ASCII character such as a typographic quote, a backtick, a here-string @" or @', a block comment <# #>, --%, a control character, or a backslash before a non-path character), so what it runs cannot be checked; write it as plain ASCII text with no such syntax (${PROTECTED_MSG})`);
   }
 
