@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { run as ciWait, meta } from '../pipeline/commands/ci-wait.mjs';
+import { REVIEW_COMPLETE_MARKER } from '../pipeline/lib/review-marker.mjs';
 
 const bin = join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'bin', 'pipeline.mjs');
 const HEAD = 'd'.repeat(40);
@@ -148,4 +149,88 @@ test('ci-wait: past --appear-timeout an absent check is held by an in-progress r
   // predatesReady: the field every heldBy now carries (2026-11-09 plan B); a ready-era holder says false.
   assert.deepEqual(r.json.heldBy, { kind: 'workflow-run', id: 77, name: 'CI', status: 'in_progress', createdAt: '2026-01-01T12:00:10Z', url: 'https://github.example/actions/77', predatesReady: false });
   assert.ok(fake.lines().includes(`api repos/acme/widgets/actions/runs?head_sha=${HEAD}&per_page=100 --paginate --jq .workflow_runs`));
+});
+
+test('ci-wait: the PR\'s comments (gh.listComments) date a Cross-model review failure: it waits for the re-post after the head\'s marker', async () => {
+  const repo = repoWith(['Cross-model review']);
+  let t = 0;
+  const calls = [];
+  const record = JSON.stringify({ contentHash: 'c'.repeat(64), base: 'b'.repeat(40), head: HEAD, rounds: 1, codexModel: 'gpt-x', modelProofDigest: null });
+  const status = (id, state, created_at) => ({ id, context: 'Cross-model review', state, creator: { login: 'github-actions[bot]' }, created_at });
+  const gh = {
+    prView: () => pr(),
+    protection: () => ({ status: 200, json: { required_status_checks: { checks: [{ context: 'Cross-model review', app_id: 15368 }] } } }),
+    branchRules: () => [], checkRunsOf: () => [], workflowRunsOfSuite: () => [], workflowRunsOfHead: () => [],
+    timelineOf: () => [{ event: 'ready_for_review', created_at: '2026-01-01T12:00:00Z' }],
+    statusesOf: () => [status(1, 'failure', '2026-01-01T12:01:00Z'), ...(t >= 120_000 ? [status(2, 'success', '2026-01-01T12:02:00Z')] : [])],
+    listComments: (n) => {
+      calls.push(n);
+      return [{ id: 9, created_at: '2026-01-01T12:01:30Z', body: `${REVIEW_COMPLETE_MARKER}\n\`\`\`json\n${record}\n\`\`\`\n` }];
+    },
+  };
+  const clock = { now: () => t, sleep: async (ms) => { t += ms; } };
+  const r = await ciWait(['--pr', '5'], { cwd: repo.dir, env: process.env, ciWait: { gh, clock, onProgress: () => {} } });
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(t, 120_000);
+  assert.ok(calls.length >= 1 && calls.every((n) => n === 5), 'the PR\'s comments were read');
+  // a gh without the comments reader is today's behaviour: the failure is fresh
+  t = 0;
+  const { listComments, ...bare } = gh;
+  const f = await ciWait(['--pr', '5'], { cwd: repo.dir, env: process.env, ciWait: { gh: bare, clock, onProgress: () => {} } });
+  assert.equal(f.output.verdict, 'failed');
+  assert.equal(t, 0);
+});
+
+test('ci-wait: gh.workflowRunOf dates a Cross-model review failure by the run that posted it: a run started before the marker is stale', async () => {
+  const repo = repoWith(['Cross-model review']);
+  let t = 0;
+  const runCalls = [];
+  const record = JSON.stringify({ contentHash: 'c'.repeat(64), base: 'b'.repeat(40), head: HEAD, rounds: 1, codexModel: 'gpt-x', modelProofDigest: null });
+  const status = (id, state, created_at, target_url) => ({ id, context: 'Cross-model review', state, creator: { login: 'github-actions[bot]' }, created_at, target_url });
+  const gh = {
+    prView: () => pr(),
+    protection: () => ({ status: 200, json: { required_status_checks: { checks: [{ context: 'Cross-model review', app_id: 15368 }] } } }),
+    branchRules: () => [], checkRunsOf: () => [], workflowRunsOfSuite: () => [], workflowRunsOfHead: () => [],
+    timelineOf: () => [{ event: 'ready_for_review', created_at: '2026-01-01T12:00:00Z' }],
+    statusesOf: () => [status(1, 'failure', '2026-01-01T12:01:33Z', 'https://github.com/acme/widgets/actions/runs/555/job/9'), ...(t >= 120_000 ? [status(2, 'success', '2026-01-01T12:02:00Z')] : [])],
+    listComments: () => [{ id: 9, created_at: '2026-01-01T12:01:30Z', body: `${REVIEW_COMPLETE_MARKER}\n\`\`\`json\n${record}\n\`\`\`\n` }],
+    workflowRunOf: (id) => {
+      runCalls.push(id);
+      return { id: 555, run_started_at: '2026-01-01T12:01:10Z' };
+    },
+  };
+  const clock = { now: () => t, sleep: async (ms) => { t += ms; } };
+  const r = await ciWait(['--pr', '5'], { cwd: repo.dir, env: process.env, ciWait: { gh, clock, onProgress: () => {} } });
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(t, 120_000);
+  assert.ok(runCalls.length >= 1 && runCalls.every((id) => id === '555'), 'the run named by the status target_url was read');
+  // a gh without the run reader (or one that throws) is today's created_at verdict: the failure is fresh
+  for (const workflowRunOf of [undefined, () => { throw new Error('HTTP 404'); }]) {
+    t = 0;
+    const f = await ciWait(['--pr', '5'], { cwd: repo.dir, env: process.env, ciWait: { gh: { ...gh, workflowRunOf }, clock, onProgress: () => {} } });
+    assert.equal(f.output.verdict, 'failed');
+    assert.equal(t, 0);
+  }
+});
+
+test('ci-wait (real gh args): the failing status\'s Actions run is read with `gh api repos/<slug>/actions/runs/<id>`; a run started before the marker marks the failure as predating', () => {
+  const record = JSON.stringify({ contentHash: 'c'.repeat(64), base: 'b'.repeat(40), head: HEAD, rounds: 1, codexModel: 'gpt-x', modelProofDigest: null });
+  const comment = { id: 9, created_at: '2026-01-01T12:01:30Z', body: `${REVIEW_COMPLETE_MARKER}\n\`\`\`json\n${record}\n\`\`\`\n` };
+  const failure = { id: 1, context: 'Cross-model review', state: 'failure', creator: { login: 'github-actions[bot]' }, created_at: '2026-01-01T12:01:33Z', target_url: 'https://github.com/acme/widgets/actions/runs/555/job/9' };
+  const fake = createFakeGh([
+    { match: '^repo view', stdoutJson: REPO_VIEW },
+    { match: '^pr view 5 ', stdoutJson: pr() },
+    { match: '^api repos/acme/widgets/branches/main/protection$', stdoutJson: { required_status_checks: { contexts: ['Cross-model review'], checks: [{ context: 'Cross-model review', app_id: 15368 }] } } },
+    { match: '^api repos/acme/widgets/rules/branches/main', stdout: '[]\n' },
+    { match: '/check-runs', stdout: '[]\n' },
+    { match: '/statuses', stdout: pages([failure]) },
+    { match: '/timeline', stdout: pages([{ event: 'ready_for_review', created_at: '2026-01-01T12:00:00Z' }]) },
+    { match: '/issues/5/comments', stdout: pages([comment]) },
+    { match: '^api repos/acme/widgets/actions/runs/555$', stdoutJson: { id: 555, run_started_at: '2026-01-01T12:01:10Z' } },
+    { match: '/actions/runs\\?head_sha=', stdout: '[]\n' },
+  ]);
+  const r = cli(['ci-wait', '--pr', '5', '--appear-timeout', '0', '--timeout', '1', '--interval', '1'], { repo: repoWith(['Cross-model review']), fake });
+  assert.equal(r.json.verdict, 'failed', r.stdout + r.stderr);
+  assert.match(r.json.message, /Cross-model review=fail .*\(result predates ready\)/);
+  assert.ok(fake.lines().includes('api repos/acme/widgets/actions/runs/555'), fake.lines().join('\n'));
 });

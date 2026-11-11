@@ -1,0 +1,37 @@
+// Every workflow template this pipeline ships passes the workflow-context check (lib/workflow-contexts.mjs). A template that
+// breaks it would be rejected whole by GitHub in every project that copies it: queue-guards.yml once read `runner.temp` in a
+// job-level env, so the Queue guards poster never ran and the merge queue jammed (2026-11-10).
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync, readdirSync } from 'node:fs';
+import { workflowContextFindings } from '../pipeline/lib/workflow-contexts.mjs';
+
+const DIR = new URL('../pipeline/templates/workflows/', import.meta.url);
+const files = readdirSync(DIR).filter((f) => /\.ya?ml$/.test(f)).sort();
+
+test('the template directory has the workflows this test is meant to cover', () => {
+  assert.ok(files.length >= 4, files.join(', '));
+  for (const n of ['pipeline-guards.yml', 'queue-guards.yml', 'queue-intake.yml', 'verify.yml']) assert.ok(files.includes(n), n);
+});
+
+for (const f of files) {
+  test(`workflow template ${f} uses only contexts GitHub allows at each key`, () => {
+    const findings = workflowContextFindings(new Map([[f, readFileSync(new URL(f, DIR), 'utf8')]]));
+    assert.deepEqual(findings, []);
+  });
+}
+
+// The Verify template is the project's required PR check: it runs the vendored context check before the full verify, so a PR that
+// breaks a workflow (even a workflow_run-only one, which never runs on the PR) fails its own check instead of jamming a queue.
+export const verifyRunsContextCheckFirst = (yml) => {
+  const check = yml.indexOf('node scripts/pipeline/workflow-contexts.mjs');
+  const verify = yml.indexOf('node scripts/verify.mjs');
+  return check !== -1 && verify !== -1 && check < verify;
+};
+
+test('verify.yml runs the workflow-context check before node scripts/verify.mjs', () => {
+  assert.equal(verifyRunsContextCheckFirst(readFileSync(new URL('verify.yml', DIR), 'utf8')), true);
+  // the helper is not vacuous: the order matters, and a template without the step fails it
+  assert.equal(verifyRunsContextCheckFirst('- run: node scripts/verify.mjs\n- run: node scripts/pipeline/workflow-contexts.mjs\n'), false);
+  assert.equal(verifyRunsContextCheckFirst('- run: node scripts/verify.mjs\n'), false);
+});

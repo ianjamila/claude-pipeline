@@ -5,7 +5,7 @@
 // Source paths are relative to this file only (<commandsDir>/../lib etc.), so the same code works from the git
 // checkout (pipeline/ is a child of the repo root) and from the installed copy under ~/.claude/pipeline/.
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXIT, UsageError, parseCommandArgs, requireOption } from '../lib/cli.mjs';
@@ -17,8 +17,8 @@ export const meta = {
   usage: 'pipeline vendor --repo DIR [--check]',
 };
 
-const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths', 'queue-members'];
-const ENTRIES = ['ci-guard', 'ci-guards-run', 'queue-guards-run', 'smoke', 'supabase-local'];
+const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths', 'queue-members', 'workflow-contexts'];
+const ENTRIES = ['ci-guard', 'ci-guards-run', 'queue-guards-run', 'smoke', 'supabase-local', 'workflow-contexts'];
 // Entries an earlier vendor copied and this one no longer does. A leftover scripts/pipeline/<name>.mjs is removed by vendor (that
 // exact file only) and is drift for --check.
 const RETIRED_ENTRIES = ['stop-verify'];
@@ -82,6 +82,19 @@ function stopVerifyWarnings(root) {
     } catch { /* missing, unreadable or not JSON: nothing to say */ }
   }
   return out;
+}
+// The vendored workflow-context check protects a project only when its CI runs it. Warn (never drift, never an exit code) when no
+// file directly under .github/workflows names it; a missing or unreadable directory counts as "no file".
+const WIRING = 'scripts/pipeline/workflow-contexts.mjs';
+function workflowWiringWarnings(root) {
+  const dir = join(root, '.github', 'workflows');
+  try {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (!e.isFile() || !/\.ya?ml$/.test(e.name)) continue;
+      try { if (readFileSync(join(dir, e.name), 'utf8').includes(WIRING)) return []; } catch { /* unreadable file: keep looking */ }
+    }
+  } catch { /* missing or unreadable directory: nothing wires it */ }
+  return [`workflow-contexts-unwired: no file in .github/workflows runs \`node ${WIRING}\`, so nothing stops a PR from adding a workflow GitHub rejects as a whole (a context not allowed at its key, e.g. runner.temp in a job-level env). Add that step to the workflow that runs on every PR and is a required check (the Verify template already has it)`];
 }
 // The retired entries still lying in <repo>/scripts/pipeline (a file or a symlink; a directory under that name is not ours).
 function retiredFiles(target) {
@@ -170,7 +183,7 @@ export async function run(argv) {
       const have = readFileSync(vfile, 'utf8').trim().split('+')[0];
       if (have !== base) drift.push({ file: repoRel(VERSION_FILE), reason: `version ${have} != pipeline ${base}` });
     }
-    const stopWarnings = stopVerifyWarnings(root);
+    const stopWarnings = [...stopVerifyWarnings(root), ...workflowWiringWarnings(root)];
     if (drift.length > 0) return { exitCode: EXIT.FAILED, output: { ok: false, drift, ...(stopWarnings.length ? { warnings: stopWarnings } : {}) } };
     const gaFile = join(root, '.gitattributes');
     const present = attributeLines(existsSync(gaFile) ? readFileSync(gaFile, 'utf8') : '');
@@ -193,7 +206,7 @@ export async function run(argv) {
   const removed = retiredFiles(target).map((f) => { unlinkSync(f.dest); return repoRel(f.rel); });
   writeFileSync(join(target, VERSION_FILE), `${version}\n`);
   const attributesAdded = ensureAttributes(root);
-  const warnings = stopVerifyWarnings(root);
+  const warnings = [...stopVerifyWarnings(root), ...workflowWiringWarnings(root)];
   return { exitCode: EXIT.OK, output: { ok: true, files: allFiles, version, gitattributes: attributesAdded, removed, ...(warnings.length ? { warnings } : {}) } };
 }
 

@@ -10,8 +10,8 @@ import { run as vendor, meta, vendorDrift } from '../pipeline/commands/vendor.mj
 import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths', 'queue-members'];
-const ENTRIES = ['ci-guard', 'ci-guards-run', 'queue-guards-run', 'smoke', 'supabase-local'];
+const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths', 'queue-members', 'workflow-contexts'];
+const ENTRIES = ['ci-guard', 'ci-guards-run', 'queue-guards-run', 'smoke', 'supabase-local', 'workflow-contexts'];
 
 const vendorInto = (dir, extra = []) => vendor(['--repo', dir, ...extra], { cwd: dir, env: process.env });
 const sp = (dir) => join(dir, 'scripts', 'pipeline');
@@ -294,6 +294,20 @@ test('every vendored module actually loads from the project layout', async () =>
   }
 });
 
+test('vendor lists the workflow-context lib and entry, copies them byte-for-byte, and --check is clean right after', async () => {
+  const repo = createTmpRepo();
+  const r = await vendorInto(repo.dir);
+  assert.ok(r.output.files.includes('scripts/pipeline/lib/workflow-contexts.mjs'), 'the rule set ships to projects');
+  assert.ok(r.output.files.includes('scripts/pipeline/workflow-contexts.mjs'), 'the CLI entry ships to projects');
+  assert.equal(readFileSync(join(sp(repo.dir), 'lib', 'workflow-contexts.mjs'), 'utf8'), readFileSync(join(root, 'pipeline', 'lib', 'workflow-contexts.mjs'), 'utf8'));
+  assert.equal(readFileSync(join(sp(repo.dir), 'workflow-contexts.mjs'), 'utf8'), readFileSync(join(root, 'pipeline', 'templates', 'scripts', 'pipeline', 'workflow-contexts.mjs'), 'utf8'));
+  const check = await vendorInto(repo.dir, ['--check']);
+  assert.equal(check.exitCode, 0);
+  assert.deepEqual(vendorDrift(repo.dir), []);
+  rmSync(join(sp(repo.dir), 'workflow-contexts.mjs'));
+  assert.deepEqual(vendorDrift(repo.dir), [{ file: 'scripts/pipeline/workflow-contexts.mjs', reason: 'missing' }]);
+});
+
 test('vendor lists queue-members and queue-guards-run', async () => {
   const repo = createTmpRepo();
   const r = await vendorInto(repo.dir);
@@ -449,4 +463,64 @@ test('vendorDrift(root): empty when identical, lists edited and missing files, i
   } finally {
     rmSync(plain, { recursive: true, force: true });
   }
+});
+
+// ---- workflow-contexts-unwired: the vendored check only protects a project whose CI runs it (warn only; never drift) ------------------
+
+const UNWIRED = 'workflow-contexts-unwired';
+const unwired = (res) => (res.output.warnings ?? []).filter((w) => w.startsWith(UNWIRED));
+const WIRED = 'name: Verify\non: pull_request\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node scripts/pipeline/workflow-contexts.mjs\n';
+
+test('vendor and vendor --check warn workflow-contexts-unwired when no workflow runs the check; exit codes are unchanged', async () => {
+  const repo = createTmpRepo();
+  repo.write('.github/workflows/ci.yml', 'name: CI\non: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node scripts/verify.mjs\n');
+  const plain = await vendorInto(repo.dir);
+  assert.equal(plain.exitCode, 0);
+  assert.equal(unwired(plain).length, 1, JSON.stringify(plain.output.warnings));
+  assert.match(unwired(plain)[0], /scripts\/pipeline\/workflow-contexts\.mjs/);
+  const check = await vendorInto(repo.dir, ['--check']);
+  assert.equal(check.exitCode, 0);
+  assert.equal(check.output.ok, true);
+  assert.equal(unwired(check).length, 1, JSON.stringify(check.output.warnings));
+  assert.equal(check.output.drift, undefined, 'a warning is not drift');
+  // also on the drift path
+  rmSync(join(sp(repo.dir), 'smoke.mjs'));
+  const drifted = await vendorInto(repo.dir, ['--check']);
+  assert.equal(drifted.exitCode, 1);
+  assert.equal(unwired(drifted).length, 1);
+});
+
+test('the unwired warning disappears when any workflow file (.yml or .yaml) runs the vendored check', async () => {
+  for (const name of ['verify.yml', 'ci.yaml']) {
+    const repo = createTmpRepo();
+    repo.write(`.github/workflows/${name}`, WIRED);
+    repo.write('.github/workflows/other.yml', 'name: Other\non: push\njobs: {}\n');
+    const plain = await vendorInto(repo.dir);
+    assert.equal(unwired(plain).length, 0, `${name}: ${JSON.stringify(plain.output.warnings)}`);
+    const check = await vendorInto(repo.dir, ['--check']);
+    assert.equal(check.exitCode, 0);
+    assert.equal(unwired(check).length, 0, name);
+  }
+});
+
+test('a workflow that only mentions a similar path does not count as wiring', async () => {
+  const repo = createTmpRepo();
+  repo.write('.github/workflows/ci.yml', 'name: CI\non: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node scripts/pipeline/ci-guard.mjs\n      - run: node scripts/workflow-contexts.mjs\n');
+  assert.equal(unwired(await vendorInto(repo.dir)).length, 1);
+});
+
+test('a missing or unreadable .github/workflows warns instead of crashing', async () => {
+  const none = createTmpRepo();
+  const r1 = await vendorInto(none.dir);
+  assert.equal(r1.exitCode, 0);
+  assert.equal(unwired(r1).length, 1, 'no workflows directory at all');
+  assert.equal((await vendorInto(none.dir, ['--check'])).exitCode, 0);
+  const odd = createTmpRepo();
+  odd.write('.github/workflows', 'a file where the directory should be');
+  const r2 = await vendorInto(odd.dir);
+  assert.equal(r2.exitCode, 0);
+  assert.equal(unwired(r2).length, 1, 'workflows path is not a directory');
+  const r3 = await vendorInto(odd.dir, ['--check']);
+  assert.equal(r3.exitCode, 0);
+  assert.equal(unwired(r3).length, 1);
 });
