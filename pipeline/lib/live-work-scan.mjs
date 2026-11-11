@@ -85,7 +85,9 @@ function locksIn(dir, live) {
 }
 
 // -> [entry]. Options (all optional): env, home (for knownRepos), lockDir, deadlineAt, repos (an explicit list instead of knownRepos), leaseOpts (review-lease options).
-export function scanLiveWork({ env = process.env, home, lockDir, deadlineAt = Infinity, repos, leaseOpts = {} } = {}) {
+export function scanLiveWork({ env: baseEnv = process.env, home, lockDir, deadlineAt = Infinity, repos, leaseOpts = {} } = {}) {
+  // `lockDir` wins over PIPELINE_LOCK_DIR for everything kept in the lock folder (the held locks and the registry of known repos).
+  const env = lockDir ? { ...baseEnv, PIPELINE_LOCK_DIR: lockDir } : baseEnv;
   const live = [];
   const tick = () => { if (Date.now() > deadlineAt) throw new ScanDeadline(); };
 
