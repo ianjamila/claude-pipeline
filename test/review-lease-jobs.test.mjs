@@ -217,3 +217,43 @@ test('R1-F1: `job start` run in a session passes the session identity to the job
   const plain = await startJob('plain', w.as(null, { env: {} }), { ...env, CLAUDECODE: undefined });
   assert.equal(plain, 'unset');
 });
+
+// ---- R2-B1 -------------------------------------------------------------------------------------------------------------------------------
+
+// A real `.review/jobs/<name>/` with a runner that is this process (alive). liveJobIn is the DEFAULT jobLive, so these tests do not inject one.
+function realJob(wt, name, meta = 'ok') {
+  const dir = path.join(wt, '.review', 'jobs', name);
+  fs.mkdirSync(dir, { recursive: true });
+  const body = meta === 'ok' ? JSON.stringify({ name, command: 'x', cwd: wt, tag: null, runId: 'r1', startedAt: new Date().toISOString(), runnerPid: process.pid }) : meta;
+  fs.writeFileSync(path.join(dir, 'meta.json'), body);
+  return dir;
+}
+
+test('R2-B1: a jobOnly lease stays live while its job folder has a corrupt meta.json, and is swept when the job has a readable exit.json or no meta.json', async (t) => {
+  const w = world(t);
+  w.session(500, 'sess-one');
+  const wt = w.wt('a');
+  const real = (extra = {}) => ({ ...w.as(500), jobLive: undefined, ...extra });
+  const dir = realJob(wt, 'j', '{ not json');
+  await open(real(), wt);
+  await closeLease({ worktree: wt, ...real(), jobLive: () => true }); // closed while a job runs: jobOnly
+  assert.equal(w.scan({ jobLive: undefined }).live.length, 1, 'corrupt meta.json: still a job in flight');
+  assert.deepEqual((await sweepDeadLeases({ ...w.as(null), jobLive: undefined })).removed, [], 'the sweep keeps it');
+  fs.writeFileSync(path.join(dir, 'exit.json'), JSON.stringify({ code: 0, finishedAt: new Date().toISOString() }));
+  assert.equal(w.scan({ jobLive: undefined }).live.length, 0, 'corrupt meta but a readable exit.json: finished');
+  fs.rmSync(path.join(dir, 'exit.json'));
+  fs.rmSync(path.join(dir, 'meta.json'));
+  assert.equal(w.scan({ jobLive: undefined }).live.length, 0, 'an empty job folder is not a job');
+  assert.equal((await sweepDeadLeases({ ...w.as(null), jobLive: undefined })).removed.length, 1);
+});
+
+test('R2-B1: a meta.json that cannot be read (chmod 000) keeps a jobOnly lease live', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, async (t) => {
+  const w = world(t);
+  w.session(500, 'sess-one');
+  const wt = w.wt('a');
+  const dir = realJob(wt, 'j');
+  await open({ ...w.as(500), jobLive: undefined }, wt);
+  await closeLease({ worktree: wt, ...w.as(500), jobLive: () => true });
+  fs.chmodSync(path.join(dir, 'meta.json'), 0o000);
+  try { assert.equal(w.scan({ jobLive: undefined }).live.length, 1); } finally { fs.chmodSync(path.join(dir, 'meta.json'), 0o600); }
+});
