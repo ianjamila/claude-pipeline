@@ -16,6 +16,16 @@
 // A ready-era failure of an attempt the suite has already superseded (a re-run of the workflow run started after it) is
 // `superseded`: the wait goes on for the newer attempt's own result (#195). If that attempt never reports, the same deadlines
 // as for a stale failure apply (--appear-timeout, or --timeout while a ready-era run holds the wait) and the old failure stands.
+// The `Cross-model review` status has a second freshness rule. On an already-READY PR a new head makes the guards run post it as
+// a FAILURE until `pipeline review-complete` posts the marker comment for that head; the recheck then re-posts it. That failure
+// postdates the ready event, so the ready rule alone calls it fresh and ends the wait before the re-post. With the optional reader
+// `readers.reviewMarkers()` (the PR's issue comments), a FAILED status of that context created strictly before
+// max(ready event, T_marker) is `stale-fail` too, T_marker = created_at of the newest comment that parses as a review-complete
+// record (parseReviewRecord) for the head being waited on. Equal instants are not stale. The comment's author and edit state are NOT
+// checked: this is freshness only, it can only turn a fail into a longer wait (the failure still stands at --appear-timeout) and
+// never makes a check pass. The reader is called lazily, only when such a failure needs dating, once per poll (and again in the
+// pre-report re-read, so a marker posted mid-wait is seen); absent, throwing, or a marker with an unreadable created_at: ignored,
+// the status is dated by the ready event alone, as before.
 // Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
 // created_at. Freshness that cannot be read counts as fresh (fail fast).
 // A needs:-gated aggregate (EW "Typecheck + Vitest") is only created when its shard jobs finish, ~8-12 min after ready, so a
@@ -33,6 +43,7 @@
 // ready-era run for every identity would hang on checks whose workflows do not trigger on `ready_for_review`.
 import { EXIT } from './cli.mjs';
 import { requiredFromRules } from './protection.mjs';
+import { REVIEW_CONTEXT, parseReviewRecord } from './review-marker.mjs';
 
 // The bot a status of an app's check comes from. Statuses carry no app id, only creator.login, so a pinned identity accepts a
 // status only from its app's known bot (15368 = GitHub Actions; 8329 = Vercel, seen as `vercel[bot]` on EW heads). An app
@@ -108,6 +119,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   let readFailures = 0;
   let lastError = null;
   let readyAtMemo;
+  let markerAtMemo; // ms of the newest review-complete marker of the head, or null; per poll, like readyAtMemo
   let held = null; // the run that last kept an absent required check waiting past --appear-timeout
   let heldSignature = null;
 
@@ -118,6 +130,26 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     ready.sort((x, y) => Date.parse(y.created_at) - Date.parse(x.created_at));
     readyAtMemo = ready.length > 0 ? ready[0].created_at : pr.createdAt;
     return readyAtMemo;
+  };
+
+  // created_at (ms) of the newest comment holding a review-complete record for `head`, else null (no reader, an unreadable read, or
+  // no such comment). Never throws: an unreadable marker only means the ready event alone dates the failure. Author not checked.
+  const getMarkerAt = async (head) => {
+    if (markerAtMemo !== undefined) return markerAtMemo;
+    let at = null;
+    if (readers.reviewMarkers) {
+      try {
+        for (const c of await readers.reviewMarkers()) {
+          if (parseReviewRecord(c?.body)?.head !== head) continue;
+          const t = Date.parse(c.created_at);
+          if (Number.isFinite(t) && (at === null || t > at)) at = t;
+        }
+      } catch {
+        at = null;
+      }
+    }
+    markerAtMemo = at;
+    return at;
   };
 
   // created_at (ms) of the workflow runs of a check run's suite: [] for a non-Actions check run. Cached per suite; an unreadable
@@ -203,10 +235,15 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       return 'fresh';
     }
   };
+  // A failed status is stale when it predates the ready event, or (the review context only) the head's review-complete marker.
   const statusPredatesReady = async (status, pr) => {
     try {
       const at = Date.parse(status.created_at);
-      return Number.isFinite(at) && at < Date.parse(await getReadyAt(pr));
+      if (!Number.isFinite(at)) return false;
+      if (at < Date.parse(await getReadyAt(pr))) return true;
+      if (status.context !== REVIEW_CONTEXT) return false;
+      const marker = await getMarkerAt(pr.head);
+      return marker !== null && at < marker;
     } catch {
       return false;
     }
@@ -313,6 +350,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
 
   const poll = async () => {
     readyAtMemo = undefined;
+    markerAtMemo = undefined;
     const pr = await readers.pr();
     last = { ...last, pr };
     if (head === null) {
@@ -343,7 +381,10 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     // Everything from the evaluation to the verdict. `confirmed` is true on the second pass, which a failure read from a commit
     // status, or an absence verdict past --appear-timeout, triggers: the head's check runs and statuses are read again first, so a
     // failure a newer status already replaced, or an aggregate that appeared after the snapshot, is not reported. Never a third pass.
-    const reread = async () => ({ checkRuns: await readers.checkRuns(pr.head), statuses: await readers.statuses(pr.head) });
+    const reread = async () => {
+      markerAtMemo = undefined; // a review marker posted since the snapshot must be seen
+      return { checkRuns: await readers.checkRuns(pr.head), statuses: await readers.statuses(pr.head) };
+    };
     const decide = async (obs, confirmed) => {
     const states = [];
     for (const identity of identities) states.push(await evaluate(identity, obs, pr));
