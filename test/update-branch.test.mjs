@@ -609,6 +609,7 @@ test('update-branch, queue ON and the base declares no usable marker (missing | 
   for (const [why, gh, text] of [
     ['no file', {}, /merge-queue-aware is missing/],
     ['a malformed marker', { queueAware: 'soon' }, /does not start with a full commit sha/],
+    ['a commit the base itself does not contain', { ...QA, queueAwareIn: false, queueAwareOnBase: false }, /names 555555555555, which is not on main: fix the marker/],
     ['a commit GitHub does not know', { ...QA, queueAwareIn: 'unknown' }, /names 555555555555, which GitHub does not know/],
   ]) {
     const s = scenario({ gh: { behindBy: 2, queue: true, ...gh } });

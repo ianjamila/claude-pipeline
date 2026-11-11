@@ -46,8 +46,8 @@ export function queueModeFor({ gh, pr }) {
 // own, not a pipeline.yml key, because the config rejects keys it does not know: a new key would break every installed pipeline on rollout.
 //
 // -> { needed, kind: 'current' | 'predates' | 'unknown', why, queueAwareSha, unreadable }. Never throws. `unknown` = the base declares no usable commit
-// (no file, not a sha) or a read failed; `unreadable: true` is the second kind only: a read that THREW (a GitHub blip) may well succeed next time, a
-// missing or malformed marker will not. Callers that can wait (a re-queue) keep the record on an unreadable read; every caller refuses on `needed`.
+// (no file, not a sha, a sha GitHub does not know or one the base itself does not contain) or a read failed; `unreadable: true` is the second kind only: a read that THREW (a GitHub blip) may well succeed next time, a
+// missing or malformed marker will not. merge and the sweep answer queue-unreadable on an unreadable read (any record is kept) and refuse on every other `needed`; update-branch catches up only for `predates`.
 export const QUEUE_AWARE_FILE = '.claude/merge-queue-aware';
 
 // The sha a marker file declares: the first line that is neither empty nor a `#` comment, which must be a full sha. -> string | null.
@@ -83,7 +83,20 @@ export function queueCatchUpState({ gh, branch, head }) {
     return reply('unknown', `the commit ${sha.slice(0, 12)} could not be compared with ${String(head).slice(0, 12)} on GitHub (${oneLine(err)})`, { queueAwareSha: sha, unreadable: true });
   }
   if (rel?.status === 'ahead' || rel?.status === 'identical') return reply('current', `the branch contains ${sha.slice(0, 12)}, the commit that taught the merge script about the queue`, { queueAwareSha: sha });
-  if (rel?.status === 'behind' || rel?.status === 'diverged') return reply('predates', `the branch does not contain ${sha.slice(0, 12)}, the commit that taught the merge script about the queue (compare: ${rel.status})`, { queueAwareSha: sha });
+  if (rel?.status === 'behind' || rel?.status === 'diverged') {
+    // GitHub's compare resolves ANY commit of the repository, a PR-branch commit that was squashed or rebased when it landed included, so a sha the BASE does not
+    // contain passes "GitHub knows it" and then every branch would read as predating, with a catch-up that can never clear it. One more read tells the two apart:
+    // the base lacking its own marker commit is the base's mistake (structural, no catch-up), a branch lacking a commit the base has is the branch's.
+    let onBase;
+    try {
+      onBase = gh.compare(sha, branch);
+    } catch (err) {
+      return reply('unknown', `the commit ${sha.slice(0, 12)} could not be compared with ${branch} on GitHub (${oneLine(err)})`, { queueAwareSha: sha, unreadable: true });
+    }
+    if (onBase?.status === 'behind' || onBase?.status === 'diverged') return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} names ${sha.slice(0, 12)}, which is not on ${branch}: fix the marker`, { queueAwareSha: sha });
+    if (onBase?.status !== 'ahead' && onBase?.status !== 'identical') return reply('unknown', `GitHub's comparison of ${sha.slice(0, 12)} with ${branch} answered ${JSON.stringify(onBase?.status ?? null)}`, { queueAwareSha: sha, unreadable: true });
+    return reply('predates', `the branch does not contain ${sha.slice(0, 12)}, the commit that taught the merge script about the queue (compare: ${rel.status})`, { queueAwareSha: sha });
+  }
   return reply('unknown', `GitHub's comparison of ${sha.slice(0, 12)} with the branch answered ${JSON.stringify(rel?.status ?? null)}`, { queueAwareSha: sha, unreadable: true });
 }
 

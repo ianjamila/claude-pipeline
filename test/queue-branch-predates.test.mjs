@@ -31,8 +31,8 @@ const evt = (type, at, reason = null, beforeCommit = null) => ({ type, at: `2026
 const FIRST = [evt('added', '08:00:00'), evt('removed', '08:30:00', 'failed_checks', QC1)];
 
 // A stub gh. `marker`: the text of .claude/merge-queue-aware on the base ({ found: false } for no file | an Error for a read that throws); `rel`: what comparing
-// the marker's commit with the PR head answers (a status string | an Error).
-function stub({ marker = `# taught the queue\n${QA}\n`, rel = 'ahead', states = [st()], events = [[]] } = {}) {
+// the marker's commit with the PR head answers (a status string | an Error); `relBase`: the same for comparing it with the BASE branch itself (default ahead = the base has it).
+function stub({ marker = `# taught the queue\n${QA}\n`, rel = 'ahead', relBase = 'ahead', states = [st()], events = [[]] } = {}) {
   let s = 0;
   const m = {
     calls: [], labels: [], reads: { marker: 0, compare: 0 },
@@ -47,8 +47,9 @@ function stub({ marker = `# taught the queue\n${QA}\n`, rel = 'ahead', states = 
     compare: (base, head) => {
       m.reads.compare += 1;
       m.calls.push(`compare ${base.slice(0, 8)} ${head.slice(0, 8)}`);
-      if (rel instanceof Error) throw rel;
-      return { status: rel, behindBy: 0, aheadBy: 1, baseSha: BASE };
+      const answer = head === 'main' ? relBase : rel;
+      if (answer instanceof Error) throw answer;
+      return { status: answer, behindBy: 0, aheadBy: 1, baseSha: BASE };
     },
     prView: () => ({ state: 'OPEN', labels: m.labels.map((name) => ({ name })), mergeCommit: null }),
     addLabels: (n, names) => { m.calls.push(`add ${names}`); for (const x of names) if (!m.labels.includes(x)) m.labels.push(x); },
@@ -190,6 +191,27 @@ test('4. no usable marker on the base: refused (fail closed), the command never 
   }
 });
 
+test('4c. a marker whose commit the BASE itself does not contain (the PR commit as it was before a squash): structural unknown naming the sha and the base, no catch-up advice, even though GitHub knows the sha', async () => {
+  for (const relBase of ['diverged', 'behind']) {
+    const gh = stub({ rel: 'diverged', relBase });
+    const r = queueCatchUpState({ gh, branch: 'main', head: H });
+    assert.deepEqual([relBase, r.needed, r.kind, r.unreadable, r.queueAwareSha], [relBase, true, 'unknown', false, QA]);
+    assert.match(r.why, /\.claude\/merge-queue-aware on main names cccccccccccc, which is not on main: fix the marker/);
+    assert.deepEqual(gh.calls, ['fileAt .claude/merge-queue-aware main', `compare ${QA.slice(0, 8)} ${H.slice(0, 8)}`, `compare ${QA.slice(0, 8)} main`], 'one more compare, of the marker sha with the base');
+    const root = repoDir();
+    const res = await routeFor(root, stub({ rel: 'diverged', relBase }), customConfig()).enqueueAndWatch();
+    assert.equal(res.output.error, 'queue-branch-predates-switch', relBase);
+    assert.equal(res.output.branchState, 'unknown', relBase);
+    assert.match(res.output.reasons[0], /which is not on main: fix the marker/, relBase);
+    assert.doesNotMatch(res.output.reasons[0], /update-branch|Catch the branch up/, relBase);
+    assert.equal(ran(root), false, relBase);
+  }
+  const blip = queueCatchUpState({ gh: stub({ rel: 'diverged', relBase: new Error('HTTP 502') }), branch: 'main', head: H });
+  assert.deepEqual([blip.needed, blip.kind, blip.unreadable], [true, 'unknown', true], 'a failed base compare is a blip, not a verdict');
+  const odd = queueCatchUpState({ gh: stub({ rel: 'diverged', relBase: 'weird' }), branch: 'main', head: H });
+  assert.deepEqual([odd.kind, odd.unreadable], ['unknown', true]);
+});
+
 test('4b. predatesQueueMessage: only a predating branch is sent to P update-branch; a structural unknown says the marker on the base must be added or fixed; an unreadable one says to try again', () => {
   const predates = predatesQueueMessage({ pr: 7, state: { kind: 'predates', queueAwareSha: QA, why: 'x', unreadable: false } });
   assert.match(predates, /P update-branch --pr 7/);
@@ -201,10 +223,10 @@ test('4b. predatesQueueMessage: only a predating branch is sent to P update-bran
   assert.doesNotMatch(blip, /update-branch/);
 });
 
-test('5. a branch at the base tip gets no shortcut: when the ancestry says it lacks the marker commit it predates (the base itself may lack it)', async () => {
+test('5. a branch at the base tip gets no shortcut: when the ancestry says it lacks the marker commit it predates (the base has it)', async () => {
   const root = repoDir();
   const gh = stub({ rel: 'diverged' });
-  gh.compare = (base) => { gh.reads.compare += 1; return { status: base === QA ? 'behind' : 'identical', behindBy: 0, aheadBy: 0, baseSha: BASE }; };
+  gh.compare = (base, head) => { gh.reads.compare += 1; return { status: head === 'main' ? 'ahead' : base === QA ? 'behind' : 'identical', behindBy: 0, aheadBy: 0, baseSha: BASE }; };
   const res = await routeFor(root, gh, customConfig()).enqueueAndWatch();
   assert.equal(res.output.error, 'queue-branch-predates-switch');
   assert.equal(ran(root), false);
