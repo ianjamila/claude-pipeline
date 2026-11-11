@@ -8,7 +8,7 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { run as update } from '../pipeline/commands/update.mjs';
-import { AUTO_UPDATE_ARGS, AUTO_UPDATE_LABEL, DEFAULT_EVERY, EVERY_CHOICES, cronExpression, parseEvery } from '../pipeline/lib/update-schedule.mjs';
+import { AUTO_UPDATE_ARGS, AUTO_UPDATE_LABEL, DEFAULT_EVERY, EVERY_CHOICES, autoUpdateRemove, cronExpression, parseEvery } from '../pipeline/lib/update-schedule.mjs';
 import { scheduleLine, scheduleMarker, schedulePlist } from '../pipeline/lib/schedule.mjs';
 
 const made = [];
@@ -303,4 +303,65 @@ test('macOS --status: installed means the plist exists AND the job is loaded', P
   rmSync(join(base, 'Library', 'LaunchAgents', 'com.claude-pipeline.auto-update.plist'));
   loaded = true; // loaded with no plist
   assert.equal((await st()).installed, false);
+});
+
+// ---- the installer's --uninstall removes the job (autoUpdateRemove), like the queue sweep's: machine-level, so only for the user's own ~/.claude ----
+
+const own = (base) => ({ home: join(base, '.claude'), userHome: base });
+const never = () => { throw new Error('the scheduler must not be touched'); };
+
+test('autoUpdateRemove on macOS: the user\'s own home loses the LaunchAgent (unloaded, plist deleted); a second call and an absent job do nothing', POSIX, async () => {
+  const { base, ctx } = ctxFor();
+  await update(['schedule', '--install'], ctx);
+  const plistPath = join(base, 'Library', 'LaunchAgents', 'com.claude-pipeline.auto-update.plist');
+  assert.equal(existsSync(plistPath), true);
+  const l = ctx.launchctlFn;
+  const r = autoUpdateRemove({ ...own(base), env: {}, platform: 'darwin', uid: 501, launchctlFn: l });
+  assert.deepEqual([r.applicable, r.removed, r.error], [true, true, undefined]);
+  assert.equal(existsSync(plistPath), false);
+  assert.ok(l.calls.some((c) => c[0] === 'bootout' && c[1] === `gui/501/${AUTO_UPDATE_LABEL}`));
+  const again = autoUpdateRemove({ ...own(base), env: {}, platform: 'darwin', uid: 501, launchctlFn: never });
+  assert.deepEqual([again.applicable, again.removed, again.error], [true, false, undefined], 'no plist: launchctl is not even asked');
+});
+
+test('autoUpdateRemove on Linux: only the marker line leaves the crontab; no line means no write and no error', POSIX, async () => {
+  const cron = fakeCrontab('0 5 * * * /usr/bin/backup\n');
+  const { base, ctx } = ctxFor({ platform: 'linux', crontabFn: cron.fn });
+  await update(['schedule', '--install'], ctx);
+  assert.ok(cron.text.includes('claude-pipeline update auto-update'));
+  const r = autoUpdateRemove({ ...own(base), env: {}, platform: 'linux', crontabFn: cron.fn });
+  assert.deepEqual([r.applicable, r.removed, r.error], [true, true, undefined]);
+  assert.equal(cron.text, '0 5 * * * /usr/bin/backup\n');
+  const writes = cron.writes;
+  const again = autoUpdateRemove({ ...own(base), env: {}, platform: 'linux', crontabFn: cron.fn });
+  assert.deepEqual([again.removed, again.error], [false, undefined]);
+  assert.equal(cron.writes, writes, 'nothing to remove: the crontab is not rewritten');
+});
+
+test('autoUpdateRemove leaves the machine job alone for another home, an isolated stacks root and native Windows', POSIX, async () => {
+  const { base, ctx } = ctxFor();
+  await update(['schedule', '--install'], ctx);
+  const plistPath = join(base, 'Library', 'LaunchAgents', 'com.claude-pipeline.auto-update.plist');
+  const gates = [
+    { home: join(base, 'scratch-home'), env: {}, platform: 'darwin' },
+    { home: join(base, '.claude'), env: { PIPELINE_STACKS_HOME: join(base, 'stacks') }, platform: 'darwin' },
+    { home: join(base, '.claude'), env: {}, platform: 'win32' },
+  ];
+  for (const g of gates) {
+    const r = autoUpdateRemove({ userHome: base, uid: 501, launchctlFn: never, crontabFn: never, ...g });
+    assert.equal(r.applicable, false, JSON.stringify(g));
+    assert.equal(r.error, undefined);
+  }
+  assert.equal(existsSync(plistPath), true, 'the real job is untouched');
+});
+
+test('autoUpdateRemove turns a scheduler failure into `error` (never throws), on both platforms', POSIX, async () => {
+  const mac = ctxFor();
+  await update(['schedule', '--install'], mac.ctx);
+  const stuck = (args) => (args[0] === 'print' ? { code: 0, stdout: '', stderr: '' } : { code: 5, stdout: '', stderr: 'Input/output error' });
+  const a = autoUpdateRemove({ ...own(mac.base), env: {}, platform: 'darwin', uid: 501, launchctlFn: stuck });
+  assert.equal(a.removed, undefined);
+  assert.match(a.error, /could not unload com\.claude-pipeline\.auto-update/);
+  const b = autoUpdateRemove({ ...own(mac.base), env: {}, platform: 'linux', crontabFn: () => { throw new Error('crontab is locked'); } });
+  assert.match(b.error, /crontab is locked/);
 });

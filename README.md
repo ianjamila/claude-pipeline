@@ -141,8 +141,9 @@ working exactly as before.
      replaced unattended. `--every N` sets the minutes between runs: 5, 10, 15, 20, 30 or 60
      (default 15). Running it again with another `--every` replaces the job.
   3. `update schedule --status` shows whether the job is installed; `update schedule --remove` takes
-     it away. Both run anywhere, including inside Claude Code. `./install.sh --uninstall` does not
-     remove the job: run `update schedule --remove` first.
+     it away. Both run anywhere, including inside Claude Code. `./install.sh --uninstall` removes the
+     job itself (when it uninstalls your own `~/.claude`), so nothing keeps firing against a missing
+     pipeline; `update schedule --remove` still works on its own.
 
   On a Mac the job is the LaunchAgent `com.claude-pipeline.auto-update` (it also runs when loaded,
   so a Mac that slept catches up). On Linux or WSL it is one crontab line. Native Windows is not

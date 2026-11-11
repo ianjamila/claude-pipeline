@@ -2173,3 +2173,14 @@ test('the queue-sweep schedule belongs to the user\'s own claude-home: a scratch
   assert.equal(u.status, 0, u.stderr + u.stdout);
   assert.deepEqual(JSON.parse(u.stdout).queueSweep, { removed: false });
 });
+
+test('the auto-update job is machine-wide like the queue sweep: a scratch home uninstalls without touching launchctl or crontab, and the report says nothing was removed', () => {
+  const home = newHome();
+  assert.equal(install(home, ['--json']).status, 0);
+  const u = install(home, ['--uninstall', '--json']);
+  assert.equal(u.status, 0, u.stderr + u.stdout);
+  const out = JSON.parse(u.stdout);
+  assert.deepEqual(out.autoUpdate, { removed: false });
+  assert.ok(!out.warnings.some((w) => /auto-update/.test(w)), `no warning for a job that was never ours: ${out.warnings}`);
+  assert.equal(existsSync(join(u.userHome, 'Library', 'LaunchAgents')), false);
+});

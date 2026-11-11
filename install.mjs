@@ -33,6 +33,7 @@ import { acquireAdmission, releaseAdmission, sweepDeadLeases } from './pipeline/
 import { stacksUninstall } from './pipeline/lib/stacks/uninstall.mjs';
 import { stacksSeam } from './pipeline/lib/stacks/paths.mjs';
 import { queueSweepSchedule } from './pipeline/lib/queue-sweep-schedule.mjs';
+import { autoUpdateRemove } from './pipeline/lib/update-schedule.mjs';
 
 class InstallError extends Error {
   constructor(message, exitCode = 1) {
@@ -446,6 +447,10 @@ function doUninstall(ctx) {
   const queueSweep = queueSweepSchedule({ action: 'remove', home, env: ctx.env });
   if (queueSweep.error) warnings.push(`could not remove the queue-sweep LaunchAgent: ${queueSweep.error}`);
 
+  // The automatic-update job would otherwise keep firing against a pipeline.mjs that is gone.
+  const autoUpdate = autoUpdateRemove({ home, env: ctx.env });
+  if (autoUpdate.error) warnings.push(`could not remove the automatic-update job (com.claude-pipeline.auto-update): ${autoUpdate.error}; remove it with \`pipeline update schedule --remove\` before the pipeline is gone`);
+
   const found = I.inspectHooks(current.settings, home);
   const hookCount = Object.values(found).reduce((n, list) => n + list.length, 0);
   const allowBefore = new Set(current.settings.permissions?.allow ?? []);
@@ -473,6 +478,7 @@ function doUninstall(ctx) {
     settings: { path: current.file, changed: settingsChanged, backup },
     stacks: { root: stacks.root, paused: stacks.paused, workersSurvived: stacks.workers.survivors, scheduleRemoved: stacks.schedule.removed },
     queueSweep: { removed: queueSweep.removed === true },
+    autoUpdate: { removed: autoUpdate.removed === true },
     warnings,
   };
 }
@@ -528,6 +534,7 @@ function formatReport(r) {
     if (r.stacks?.paused) lines.push(`  stacks:    paused (${r.stacks.root}/pause is left in place; delete it to resume)${r.stacks.scheduleRemoved ? ', sweep schedule removed' : ''}`);
     else if (r.stacks?.scheduleRemoved) lines.push('  stacks:    sweep schedule removed');
     if (r.queueSweep?.removed) lines.push('  queue:     sweep LaunchAgent removed');
+    if (r.autoUpdate?.removed) lines.push('  updates:   automatic-update job removed');
     lines.push(`  backup:    ${r.settings.backup ?? 'none (settings.json did not change)'}`);
   } else if (r.ok) {
     lines.push(`No drift: claude-pipeline ${r.installedVersion ?? r.version} in ${r.home} matches ${r.source} and settings.json.`);

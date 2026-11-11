@@ -13,6 +13,7 @@ import path from 'node:path';
 import { EXIT, UsageError, parseCommandArgs } from './cli.mjs';
 import { guarded } from './cmd-common.mjs';
 import { insideClaudeCode } from './owner-only.mjs';
+import { canonicalPath, samePath } from './paths.mjs';
 import {
   DARWIN_TZ_SOURCES, applyLaunchd, applySchedule, detectTimezone, findOnPath, scheduleLabel, scheduleLine, scheduleMarker, schedulePlist,
   systemCrontab, systemLaunchctl,
@@ -41,6 +42,47 @@ const NOTE = (every) => `runs every ${every} minutes: installs main when this ma
 // Every path built here is for cron or launchd (Linux/macOS), so it is POSIX-joined whatever host runs it.
 export const installedBin = (userHome = os.homedir()) => path.posix.join(userHome, '.claude', 'pipeline', 'bin', 'pipeline.mjs');
 
+export const autoUpdatePlistPath = (userHome = os.homedir()) => path.join(userHome, 'Library', 'LaunchAgents', `${AUTO_UPDATE_LABEL}.plist`);
+
+// The one place the job is installed, removed or asked about: launchd on macOS, one marker-found crontab line otherwise. Throws what applyLaunchd /
+// applySchedule throw; `wrote` says whether the crontab was rewritten.
+function applyJob({ action, darwin, userHome, plist, line, ctx }) {
+  if (darwin) {
+    const result = applyLaunchd({
+      action, plist, plistPath: autoUpdatePlistPath(userHome), label: AUTO_UPDATE_LABEL, launchctlFn: ctx.launchctlFn ?? systemLaunchctl,
+      tzFn: ctx.tzFn ?? (() => detectTimezone(DARWIN_TZ_SOURCES)), uid: ctx.uid ?? process.getuid(),
+    });
+    return { result, wrote: false };
+  }
+  const crontab = ctx.crontabFn ?? systemCrontab;
+  let wrote = false;
+  const crontabFn = (op, text) => { if (op === 'write') wrote = true; return crontab(op, text); };
+  const marker = scheduleMarker(AUTO_UPDATE_NAME, 'update');
+  const result = applySchedule({ action, line, marker, crontabFn, tzFn: ctx.tzFn ?? detectTimezone });
+  delete result.warning; // applySchedule's warning is about a fixed HH:MM; an every-N-minutes job has none
+  return { result, wrote };
+}
+
+const safeSame = (a, b) => { try { return samePath(canonicalPath(a), canonicalPath(b)); } catch { return false; } };
+
+// What the installer's --uninstall does about the job, the same way it removes the queue sweep's: the job belongs to the machine, not to a claude-home,
+// so it goes only when this home IS the user's own ~/.claude and no isolated stacks root is set (a scratch home never removes the real job). Native
+// Windows has no job. Nothing installed means nothing done (no launchctl call, no crontab write). Never throws: a failure is `error`.
+// -> { applicable: false, why } | { applicable: true, removed } | { applicable: true, error }
+export function autoUpdateRemove({ home, env = process.env, platform = process.platform, userHome = os.homedir(), uid = process.getuid?.(), launchctlFn = systemLaunchctl, crontabFn = systemCrontab }) {
+  if (platform !== 'darwin' && platform !== 'linux') return { applicable: false, why: 'the automatic-update job is only managed on macOS and Linux/WSL' };
+  if (env.PIPELINE_STACKS_HOME) return { applicable: false, why: 'an isolated run (PIPELINE_STACKS_HOME is set) never touches the machine schedule' };
+  if (!safeSame(home, path.join(userHome, '.claude'))) return { applicable: false, why: `${home} is not the user's own ~/.claude: the machine schedule is left alone` };
+  const darwin = platform === 'darwin';
+  try {
+    if (darwin && !existsSync(autoUpdatePlistPath(userHome))) return { applicable: true, removed: false };
+    const { result } = applyJob({ action: 'remove', darwin, userHome, ctx: { launchctlFn, crontabFn, uid } });
+    return { applicable: true, removed: result.removed === true };
+  } catch (err) {
+    return { applicable: true, error: err?.output?.message ?? err?.message ?? String(err) };
+  }
+}
+
 const fail = (error, message) => ({ exitCode: EXIT.USAGE, output: { ok: false, error, message } });
 
 export const runSchedule = guarded(async (rest, ctx = {}) => {
@@ -67,7 +109,6 @@ export const runSchedule = guarded(async (rest, ctx = {}) => {
   const darwin = platform === 'darwin';
   const userHome = ctx.home ?? os.homedir();
   const label = AUTO_UPDATE_LABEL;
-  const marker = scheduleMarker(AUTO_UPDATE_NAME, 'update');
   let line;
   let plist;
   if (action === 'install') {
@@ -90,21 +131,7 @@ export const runSchedule = guarded(async (rest, ctx = {}) => {
     else line = scheduleLine({ ...args, cron: cronExpression(every), lockName: AUTO_UPDATE_NAME, kind: 'update' });
   }
 
-  let result;
-  if (darwin) {
-    const plistPath = path.join(userHome, 'Library', 'LaunchAgents', `${label}.plist`);
-    result = applyLaunchd({
-      action, plist, plistPath, label, launchctlFn: ctx.launchctlFn ?? systemLaunchctl,
-      tzFn: ctx.tzFn ?? (() => detectTimezone(DARWIN_TZ_SOURCES)), uid: ctx.uid ?? process.getuid(),
-    });
-    if (action === 'install') result = { ...result, every, note: NOTE(every) };
-  } else {
-    const crontab = ctx.crontabFn ?? systemCrontab;
-    let wrote = false;
-    const crontabFn = (op, text) => { if (op === 'write') wrote = true; return crontab(op, text); };
-    result = applySchedule({ action, line, marker, crontabFn, tzFn: ctx.tzFn ?? detectTimezone });
-    delete result.warning; // applySchedule's warning is about a fixed HH:MM; an every-N-minutes job has none
-    if (action === 'install') result = { ...result, changed: wrote, every, note: NOTE(every) };
-  }
+  const applied = applyJob({ action, darwin, userHome, plist, line, ctx });
+  const result = action === 'install' ? { ...applied.result, ...(darwin ? {} : { changed: applied.wrote }), every, note: NOTE(every) } : applied.result;
   return { exitCode: EXIT.OK, output: { ok: true, ...result } };
 });
