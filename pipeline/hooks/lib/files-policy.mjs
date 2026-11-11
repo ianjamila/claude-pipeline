@@ -386,6 +386,7 @@ function makeCtx(opts) {
   };
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
+    shell: opts._depth ? 'bash' : opts.shell === 'powershell' ? 'powershell' : 'bash', // the tool's shell (PowerShell only at the top level, see pipelineToolInRaw)
     hitReviewGlob,
     user: opts.user ?? posix.basename(homePosix),
     selfZero: opts._selfZero ?? null, selfBash: opts._selfBash ?? null, selfAbs: opts._selfAbs === true, selfZsh: opts._selfZsh === true, // the judged script file's own path (its $0 unless it was sourced; BASH_SOURCE[0])
@@ -1619,7 +1620,7 @@ function gitReadOnly(args) {
 function isPipelineTool(arg, ctx) {
   if (typeof arg !== 'string') return false;
   // A backslash left in a shell-parsed word (quoted: `"hooks/\.\./x"`) is a name character off Windows, but expandRefs would read it as a separator: refuse (fail closed).
-  if (ctx.platform !== 'win32' && arg.includes('\\')) return false;
+  if (ctx.platform !== 'win32' && (arg.includes('\\') || expandKeepingBackslash(arg, ctx).includes('\\'))) return false; // (also one a same-line variable brings in: `D='a\b'; node .../hooks/$D/../../x.mjs`, R8-F2)
   const e = expandRefs(arg, ctx);
   if (!isAbs(e)) return false;
   if (OWNER_GO_RECORDER.test(e)) return false;
@@ -1630,20 +1631,37 @@ function isPipelineTool(arg, ctx) {
     || insideStrict(e, `${ctx.homePosix}/.claude/pipeline/hooks`, ctx.platform);
 }
 
-// A Windows `node C:\...\pipeline.mjs` loses its backslashes in argv, so look at the raw text too. WINDOWS ONLY: on any other platform a backslash is an ESCAPE
-// (`hooks/\.\./\.\./x.mjs` runs as `hooks/../../x.mjs`), while expandRefs reads it as a separator (`hooks//.//./`, inside hooks): a parser differential that
-// would turn an allow-list check into a bypass, so there only the shell-parsed argv word decides.
-// The regex only FINDS the path (case-folded where the platform is, no `..` handling); an ALLOW must not rest on that match, so the path it found goes
-// through isPipelineTool like an argv word does (disk identity, exact spelling when the disk cannot answer, `..` resolved), and a match with any `.` / `..`
-// segment is refused outright (a trusted tool path never needs one).
+// The PowerShell tool only: there a backslash is a path separator, but the shell-text parser below reads it as an escape and drops it from argv (`node C:\Users\u\x.mjs` arrives as
+// `C:Usersux.mjs`), so the raw text is looked at too. NEVER for Bash text, on any platform: Git Bash drops those backslashes for real and runs the drive-relative file, and off Windows a
+// backslash is an escape (`hooks/a\ ../..` is one word), so there only the shell-parsed argv word decides (R8-B1 / R8-F1 / R8-F2: one root cause, the raw text standing in for the operand).
+// The decision is on the WHOLE first operand as PowerShell reads it, not on a regex capture that can stop mid-word: a bare word of plain path characters, or a quote pair around such,
+// that ends at a word boundary; anything PowerShell would expand, escape, join or split (`$`, backtick, %, ~, parentheses, a quote inside the word, a separator ending the path) refuses. A `.` / `..`
+// segment is refused outright (a trusted tool path never needs one), and the path then goes through isPipelineTool like an argv word does (disk identity, exact spelling when the disk
+// cannot answer). Only the top-level command qualifies: a script or text read from a file (depth > 0) is judged as Bash.
+const PS_NODE_PREFIX = /^\s*(?:&\s*)?(?:[^\s"'`$%~]*[\\/])?node(?:\.exe)?\s+/i;
+const PS_PLAIN_PATH = /^[A-Za-z]:[\\/][^\s"'`$%~(){};|&<>,@#*?[\]]*[^\s"'`$%~(){};|&<>,@#*?[\]\\/]$/;
+function psOperand(raw) {
+  const m = PS_NODE_PREFIX.exec(raw);
+  if (m === null) return null;
+  const rest = raw.slice(m[0].length);
+  const q = rest[0];
+  if (q === '"' || q === "'") {
+    const end = rest.indexOf(q, 1);
+    if (end < 0) return null;
+    const after = rest[end + 1];
+    if (after !== undefined && !/\s/.test(after)) return null; // text glued to the closing quote (`''` doubling, `"x"y`) is the same word
+    return rest.slice(1, end);
+  }
+  const word = /^\S+/.exec(rest);
+  return word === null ? null : word[0];
+}
 function pipelineToolInRaw(raw, ctx) {
-  if (ctx.platform !== 'win32') return false;
-  const t = expandRefs(raw, ctx);
-  const root = escapeRe(`${ctx.homePosix}/.claude/pipeline`);
-  if (/owner-go/i.test(t)) return false;
-  const m = new RegExp(`^\\s*(?:\\S*/)?node(?:\\.exe)?\\s+["']?(${root}/(?:bin/pipeline\\.mjs|hooks/[^\\s'"]*))(?:["']?\\s|["']?$)`, ctx.ci ? 'i' : '').exec(t);
-  if (m === null || /(?:^|\/)\.{1,2}(?:\/|$)/.test(m[1])) return false;
-  return isPipelineTool(m[1], ctx);
+  if (ctx.platform !== 'win32' || ctx.shell !== 'powershell') return false;
+  if (/owner-go/i.test(raw)) return false;
+  const operand = psOperand(raw);
+  if (operand === null || !PS_PLAIN_PATH.test(operand)) return false;
+  if (/(?:^|[\\/])\.{1,2}(?:[\\/]|$)/.test(operand)) return false;
+  return isPipelineTool(operand, ctx);
 }
 
 function pwshReadOnly(argv) {
