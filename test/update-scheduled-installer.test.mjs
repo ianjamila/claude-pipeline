@@ -36,6 +36,18 @@ if (mode === 'mismatch' && process.argv.includes('--expect-installed') && !proce
   console.log(JSON.stringify({ ok: false, error: 'expect-installed-mismatch', message: 'the installed copy is not the one expected' }));
   process.exit(1);
 }
+if (mode === 'busy' && !process.argv.includes('--check')) {
+  console.error('install.mjs: another install is running in /somewhere. Wait for it to finish.');
+  process.exit(1);
+}
+if (mode === 'exit3-plain' && !process.argv.includes('--check')) {
+  console.log(JSON.stringify({ ok: false, error: 'something-else' }));
+  process.exit(3);
+}
+if (mode === 'drift' && process.argv.includes('--check')) {
+  console.log(JSON.stringify({ ok: false, drift: [{ message: 'hook a is missing' }, { message: 'unit b differs' }] }));
+  process.exit(1);
+}
 console.log(JSON.stringify({ ok: true }));
 `;
 
@@ -76,7 +88,7 @@ async function scheduledRun(mode, { identity = [pristine(OLD)] } = {}) {
     now: () => new Date(Date.UTC(2026, 10, 11)),
     accountHome: join(dir, 'account'),
   };
-  const env = { ...process.env, PIPELINE_UPDATE_REMOTE: bare, STUB_MODE: mode, STUB_ARGV_LOG: argvLog };
+  const env = { ...process.env, HOME: dir, USERPROFILE: dir, PIPELINE_UPDATE_REMOTE: bare, STUB_MODE: mode, STUB_ARGV_LOG: argvLog };
   delete env.CLAUDECODE;
   const r = await update(['--scheduled', '--json', '--claude-home', home], { env, hasClaudeCodeAncestor: () => false, auto });
   const argv = existsSync(argvLog) ? readFileSync(argvLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : [];
@@ -126,4 +138,35 @@ test('the copy changed BEFORE the installer starts (the pre-install re-check): t
   assert.equal(t.r.exitCode, 0);
   assert.deepEqual([t.r.output.action, t.r.output.reason], ['blocked', 'modified']);
   assert.equal(t.notices.length, 1);
+});
+
+// ---- more of the installer contract, through the same real download + child ------------------------------------------------------------
+
+test('installer exit 3 WITHOUT {deferred: true} is not a deferral: it is an install failure, told once, nothing marked live', async () => {
+  const t = await scheduledRun('exit3-plain');
+  assert.deepEqual([t.r.exitCode, t.r.output.error], [1, 'install-failed']);
+  assert.equal(t.status.state, 'failed');
+  assert.equal(t.notices.length, 1);
+  assert.equal(t.argv.length, 1, 'no verify step after a failed install');
+});
+
+test('installer exit 1 "another install is running": a busy lock is a transient failure (no notice on the first run, status failed), never a mismatch or a deferral', async () => {
+  const t = await scheduledRun('busy');
+  assert.deepEqual([t.r.exitCode, t.r.output.error, t.r.output.transientRuns], [1, 'install-lock-busy', 1]);
+  assert.equal(t.notices.length, 0);
+  assert.equal(t.status.state, 'failed');
+  assert.equal(t.status.reason, 'install-lock-busy');
+  assert.deepEqual(t.leftovers, []);
+});
+
+test('installer --check reporting drift after the install: ONE notice carrying the drift list, status failed check-failed, the download removed', async () => {
+  const t = await scheduledRun('drift');
+  assert.deepEqual([t.r.exitCode, t.r.output.error], [1, 'check-failed']);
+  assert.deepEqual(t.r.output.drift, ['hook a is missing', 'unit b differs']);
+  assert.equal(t.argv.length, 2, 'install, then --check');
+  assert.equal(t.notices.length, 1);
+  assert.match(t.notices[0], /did not verify: hook a is missing; unit b differs/);
+  assert.match(t.notices[0], /will not be retried/);
+  assert.deepEqual([t.status.state, t.status.reason], ['failed', 'check-failed']);
+  assert.deepEqual(t.leftovers, []);
 });
