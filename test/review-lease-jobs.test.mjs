@@ -349,3 +349,25 @@ test('R3-B1: a jobOnly lease stays live while its job meta.json is {} / [] / 1, 
   assert.equal(w.scan({ jobLive: undefined }).live.length, 0, 'well-formed meta, dead runner: lost');
   assert.equal((await sweepDeadLeases({ ...w.as(null), jobLive: undefined })).removed.length, 1);
 });
+
+// ---- R3-F1: a job holder's open leaves an unreadable holder file alone (closeLease's rule), instead of replacing it with a jobOnly lease -------
+test('R3-F1: a job holder opening where the session file is unreadable leaves the file untouched and the scan still counts it live; the session itself may replace it', async (t) => {
+  const w = world(t);
+  w.session(700, 'sess-b');
+  const wt = w.wt('b');
+  const handed = holderHandoff({ worktree: wt, ...w.as(700) });
+  const file = path.join(w.dir, 'sess-b.json');
+  fs.mkdirSync(w.dir, { recursive: true });
+  for (const body of ['{ not json', '{"version":1}']) {
+    fs.writeFileSync(file, body);
+    const r = await open(w.inJob(handed), wt);
+    assert.equal(r.ok, true);
+    assert.equal(r.action, 'unchanged', body);
+    assert.equal(fs.readFileSync(file, 'utf8'), body, `${body}: the file is exactly as it was`);
+    assert.equal(blocking(w.scan()).length, 1, `${body}: still blocks the installer`);
+    assert.deepEqual(files(w.dir), ['sess-b.json']);
+  }
+  // the session's own command may still replace its own corrupt file
+  assert.equal((await open(w.as(700), wt)).action, 'opened');
+  assert.equal(leaseOf(w, 'sess-b', wt).jobOnly, undefined);
+});

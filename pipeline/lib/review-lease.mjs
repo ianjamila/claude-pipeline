@@ -425,6 +425,8 @@ export async function openOrRenewLease({ worktree, repoId, pr, branch, ...opts }
     const now = nowOf(opts); // stamped once admission is held: a command that waited for an update must not carry a time from before the swap
     const read = readHolder(dir, holder.sessionId);
     if (!read.ok && !read.absent && /not a regular file/.test(read.why)) throw codeError('review-lease-unwritable', `${fileOf(dir, holder.sessionId)} is ${read.why}: refusing to write it`);
+    // A handed (job) identity may only strengthen: it never replaces a file the scan counts as live with a job-scoped lease (closeLease's rule).
+    if (!read.ok && !read.absent && holder.viaJob) return { ok: true, action: 'unchanged', sessionId: holder.sessionId, ttlOnly: false };
     const leases = read.ok ? { ...read.rec.leases } : {}; // a corrupt file of OUR OWN session id has nothing worth keeping
     const cur = leases[key];
     let action;
