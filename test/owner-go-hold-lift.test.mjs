@@ -13,9 +13,10 @@ import { fileURLToPath } from 'node:url';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { bump, cli, scenario, ymlFor, LOCK_DIR, MERGE_SHA, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { holdBlock, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
+import { areasDigest, holdBlock, holdDigest, presentedRequests, readyLine, rulingsBlockDigest } from '../pipeline/hooks/lib/owner-go.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
-import { comment as prComment, rulingState } from './helpers/rulings-world.mjs';
+import { claudeItem, comment as prComment, publishedComments, rulingState } from './helpers/rulings-world.mjs';
+import { saveState } from '../pipeline/lib/state.mjs';
 import { withReviewLock } from '../pipeline/lib/review-context.mjs';
 import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import { runShellAsync } from '../pipeline/lib/proc.mjs';
@@ -115,6 +116,32 @@ test('dry run, eligible hold, no record: say-merge with the Hold block, the hold
   assert.deepEqual(s.wrote(), [], 'a dry run writes nothing');
   assert.deepEqual(s.st().labels, ['needs-human']);
   assert.deepEqual(s.st().comments, []);
+});
+
+test('dry run, hold + protected areas + a dismissed item: ownerStep.closing is the whole closing block in the mandated order, and the hook binds the same request from it as from the separately printed lines', () => {
+  const s = world();
+  const state = rulingState({ hash: s.hash, items: [claudeItem()] });
+  saveState(s.repo.dir, state);
+  s.patch((st) => { st.comments = publishedComments(state, { hash: s.hash, head: s.head, base: s.baseTip }); });
+  const d = s.dry();
+  const step = d.json.ownerStep;
+  assert.equal(step.kind, 'say-merge', d.stdout);
+  assert.match(step.rulings, /^Rulings [0-9a-f]{12}\nR1-B1 · /);
+  assert.match(step.areas, /^Areas /);
+  assert.equal(step.hold, HOLD_BLOCK);
+  assert.equal(step.closing, [step.rulings, step.areas, step.hold, step.line, step.ready].join('\n'));
+  assert.doesNotMatch(step.closing, /behind|queue|park/i, 'no note is part of the block');
+  // the consumer: pasted as the reply's last lines it binds exactly what the separately printed lines bind
+  const closing = presentedRequests(`Here is the request.\n${step.closing}`);
+  assert.equal(closing.requests.length, 1);
+  assert.equal(closing.requests[0].hold, HOLD.id);
+  assert.equal(closing.requests[0].holdBlock, holdDigest(HOLD), 'the hold block is bound');
+  assert.equal(closing.requests[0].rulings, rulingsBlockDigest(step.rulings), 'the Rulings block is bound');
+  assert.equal(closing.requests[0].areas, areasDigest(step.areaIds), 'the Areas line is bound');
+  assert.equal(closing.requests[0].pr, PR);
+  assert.equal(closing.requests[0].head, s.head.slice(0, 12));
+  assert.deepEqual(closing.requests, presentedRequests(`Here is the request.\n${[step.rulings, step.areas, step.hold, step.line, step.ready].join('\n')}`).requests, 'the same binding as the lines printed one by one');
+  assert.deepEqual(s.wrote(), [], 'a dry run writes nothing');
 });
 
 test('dry run: the park note is quoted only when its last update is at or after the hold event, and is labelled as agent-written', () => {

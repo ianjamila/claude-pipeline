@@ -10,6 +10,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
+import { floorEnv } from './helpers/floor-env.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -58,7 +59,7 @@ function world(t) {
     cli(args, extraEnv = {}) {
       const env = {
         ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, FAKE_CODEX_CAPTURE: join(scratch, 'codex-capture.jsonl'),
-        PIPELINE_LOCK_DIR: join(scratch, 'locks'), ...extraEnv,
+        PIPELINE_LOCK_DIR: join(scratch, 'locks'), ...floorEnv(), ...extraEnv,
       };
       for (const k of ['PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_ARBITER_MODEL_OVERRIDE', 'PIPELINE_TEST_MODE', 'FAKE_CODEX_OUTPUT']) {
         if (!(k in extraEnv)) delete env[k];
@@ -170,7 +171,7 @@ test('arbiter apply: an arbiter that reports through SubagentHandback is proven 
   const needed = w.cli(['arbiter', 'needed', '--round', '1']);
   assertExit(needed, 0);
   const projects = installTranscript(w, {
-    jsonl: handbackTranscript({ prompt: promptFor(needed.json.digest), message: fenced(SORT_RULINGS), model: 'claude-fable-5-1' }),
+    jsonl: handbackTranscript({ prompt: promptFor(needed.json.digest), message: fenced(SORT_RULINGS), model: 'claude-fable-5-2' }),
     meta: { agentType: 'arbiter', description: needed.json.tag },
   });
   const r = w.cli(['arbiter', 'apply', '--round', '1', '--projects-dir', projects]);
@@ -191,7 +192,7 @@ test('arbiter apply: an unacknowledged hand-back is exit 1 and every arbitrated 
   assertExit(w.judge(1, STANDARD_JUDGE), 0);
   const needed = w.cli(['arbiter', 'needed', '--round', '1']);
   const projects = installTranscript(w, {
-    jsonl: handbackTranscript({ prompt: promptFor(needed.json.digest), message: fenced(SORT_RULINGS), model: 'claude-fable-5-1', ack: false }),
+    jsonl: handbackTranscript({ prompt: promptFor(needed.json.digest), message: fenced(SORT_RULINGS), model: 'claude-fable-5-2', ack: false }),
     meta: { agentType: 'arbiter', description: needed.json.tag },
   });
   const r = w.cli(['arbiter', 'apply', '--round', '1', '--projects-dir', projects]);
@@ -204,7 +205,7 @@ test('arbiter apply: an unacknowledged hand-back is exit 1 and every arbitrated 
 test('model-proof: reports finalVia handback with the delivered message', (t) => {
   const w = world(t);
   const projects = installTranscript(w, {
-    jsonl: handbackTranscript({ prompt: 'p', message: fenced(SORT_RULINGS), model: 'claude-fable-5-1' }),
+    jsonl: handbackTranscript({ prompt: 'p', message: fenced(SORT_RULINGS), model: 'claude-fable-5-2' }),
     meta: { agentType: 'arbiter', description: 'tag-x' },
   });
   const r = w.cli(['model-proof', '--tag', 'tag-x', '--projects-dir', projects]);

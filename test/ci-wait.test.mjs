@@ -9,6 +9,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { KNOWN_APP_BOTS, MAX_READ_FAILURES, waitForCi } from '../pipeline/lib/ci-wait.mjs';
 import { readClassicRequired, requiredFromRules } from '../pipeline/lib/protection.mjs';
+import { REVIEW_COMPLETE_MARKER } from '../pipeline/lib/review-marker.mjs';
 
 const fxDir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'ci-wait');
 const fx = (name) => JSON.parse(readFileSync(join(fxDir, name), 'utf8'));
@@ -22,7 +23,7 @@ const at = (v, t, n) => (typeof v === 'function' ? v(t, n) : v);
 function sim(world, options = {}) {
   let t = 0;
   const calls = [];
-  const reads = { classic: [], rules: [], statuses: 0, checkRuns: 0, headRuns: [] }; // the base each policy read asked for
+  const reads = { classic: [], rules: [], statuses: 0, checkRuns: 0, headRuns: [], markers: 0, runs: [] }; // the base each policy read asked for
   const readers = {
     pr: async () => at(world.pr ?? PR, t / 1000),
     classic: async (base) => {
@@ -46,6 +47,18 @@ function sim(world, options = {}) {
       return at(world.headRuns ?? [], t / 1000);
     },
     timeline: async () => at(world.timeline ?? [], t / 1000),
+    ...(world.reviewMarkers === undefined ? {} : {
+      reviewMarkers: async () => {
+        reads.markers += 1;
+        return at(world.reviewMarkers, t / 1000, reads.markers);
+      },
+    }),
+    ...(world.workflowRun === undefined ? {} : {
+      workflowRun: async (id) => {
+        reads.runs.push(id);
+        return at(world.workflowRun, t / 1000, id);
+      },
+    }),
     suiteRuns: async (id) => {
       calls.push(id);
       return at(world.suiteRuns ?? (() => () => []), t / 1000)(id);
@@ -1066,4 +1079,215 @@ test('requiredFromRules: an empty list is absent (authoritative); a required_sta
   assert.deepEqual(requiredFromRules(sample), { kind: 'present', rows: [{ context: 'ci', appId: 15368 }, { context: 'lint', appId: null }, { context: 'e2e', appId: null }] });
   assert.equal(requiredFromRules({ message: 'x' }).kind, 'unreadable');
   assert.equal(requiredFromRules([{ type: 'required_status_checks', parameters: {} }]).kind, 'unreadable');
+});
+
+// ---- a `Cross-model review` failure older than the head's review-complete marker is stale-fail (an already-ready PR, new head) ----
+
+const markerBody = (head = HEAD) => `${REVIEW_COMPLETE_MARKER}\n\`\`\`json\n${JSON.stringify({ contentHash: 'c'.repeat(64), base: 'b'.repeat(40), head, rounds: 1, codexModel: 'gpt-x', modelProofDigest: null })}\n\`\`\`\n`;
+const marker = (created_at, head = HEAD, over = {}) => ({ id: ++seq, created_at, body: markerBody(head), user: { login: 'someone' }, ...over });
+const review = (state, created_at) => st('Cross-model review', state, 'github-actions[bot]', { created_at });
+const reviewWorld = (over) => ({ classic: present(pin('Cross-model review', ACTIONS)), timeline: readyTimeline, ...over });
+// ready 12:00:00; the guards run posts the failure (T1) before the marker (T2) is posted; the guards recheck re-posts (T3)
+const T1 = '2026-01-01T12:01:00Z';
+const T2 = '2026-01-01T12:01:30Z';
+const T3 = '2026-01-01T12:02:00Z';
+
+test('a review failure older than the head\'s marker is stale-fail: the wait goes on until the guards re-post', async () => {
+  const s = sim(reviewWorld({
+    statuses: (t) => [{ ...review('failure', T1), id: 1 }, ...(t >= 120 ? [{ ...review('success', T3), id: 2 }] : [])],
+    reviewMarkers: [marker(T2)],
+  }));
+  const r = await s.run();
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(s.elapsed(), 120_000);
+  assert.ok(s.progress.some((l) => /Cross-model review=stale-fail/.test(l)));
+});
+
+test('a review failure posted after the marker is fresh: failed at once', async () => {
+  const s = sim(reviewWorld({ statuses: [review('failure', T3)], reviewMarkers: [marker(T2)] }));
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(s.elapsed(), 0);
+  assert.equal(r.output.checks[0].state, 'fail');
+});
+
+test('a marker for another head is ignored: the failure is fresh', async () => {
+  const s = sim(reviewWorld({ statuses: [review('failure', T1)], reviewMarkers: [marker(T2, 'd'.repeat(40))] }));
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(s.elapsed(), 0);
+});
+
+test('a comment that is not a review-complete record is ignored', async () => {
+  const s = sim(reviewWorld({ statuses: [review('failure', T1)], reviewMarkers: [{ id: 1, created_at: T2, body: 'looks good, ship it' }, { id: 2, created_at: T2, body: REVIEW_COMPLETE_MARKER + '\nno record' }] }));
+  assert.equal((await s.run()).output.verdict, 'failed');
+  assert.equal(s.elapsed(), 0);
+});
+
+test('an unreadable comments reader leaves today\'s verdict (ready time only)', async () => {
+  const s = sim(reviewWorld({ statuses: [review('failure', T1)], reviewMarkers: () => { throw new Error('HTTP 502'); } }));
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(s.elapsed(), 0);
+  assert.ok(s.reads.markers >= 1, 'the reader was asked');
+  // a reader that is absent altogether behaves the same
+  const none = sim({ classic: present(pin('Cross-model review', ACTIONS)), timeline: readyTimeline, statuses: [review('failure', T1)] });
+  assert.equal((await none.run()).output.verdict, 'failed');
+  assert.equal(none.elapsed(), 0);
+});
+
+test('a review failure never re-posted stands as failed at the appear deadline, marked as predating', async () => {
+  const s = sim(reviewWorld({ statuses: [review('failure', T1)], reviewMarkers: [marker(T2)] }));
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(s.elapsed(), 300_000);
+  assert.match(r.output.message, /Cross-model review=fail .*\(result predates ready\)/);
+  assert.equal(r.output.checks[0].state, 'stale-fail');
+});
+
+test('a marker first visible in the pre-report re-read is seen: the wait goes on, then passes on the re-post', async () => {
+  const s = sim(reviewWorld({
+    statuses: (t) => [{ ...review('failure', T1), id: 1 }, ...(t >= 120 ? [{ ...review('success', T3), id: 2 }] : [])],
+    reviewMarkers: (t, n) => (n >= 2 ? [marker(T2)] : []),
+  }));
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 120_000);
+});
+
+test('a failure created at the same instant as the marker is NOT stale (strict <)', async () => {
+  const s = sim(reviewWorld({ statuses: [review('failure', T2)], reviewMarkers: [marker(T2)] }));
+  assert.equal((await s.run()).output.verdict, 'failed');
+  assert.equal(s.elapsed(), 0);
+});
+
+test('a marker with an invalid created_at is ignored: the ready-time classification stands', async () => {
+  const fresh = sim(reviewWorld({ statuses: [review('failure', T1)], reviewMarkers: [marker('not a date')] }));
+  assert.equal((await fresh.run()).output.verdict, 'failed');
+  assert.equal(fresh.elapsed(), 0);
+  // an invalid NEWER marker does not turn the failure fresh or stale, and an older valid one still dates it
+  const older = sim(reviewWorld({ statuses: [review('failure', T1)], reviewMarkers: [marker(T2), marker(undefined)] }));
+  assert.equal((await older.run()).output.verdict, 'failed');
+  assert.equal(older.elapsed(), 300_000, 'the valid marker still makes it stale');
+  // an already-stale (pre-ready) failure stays stale whatever the markers say
+  const stale = sim(reviewWorld({ statuses: [review('failure', '2026-01-01T11:00:00Z')], reviewMarkers: [marker('garbage')] }));
+  assert.equal((await stale.run()).output.checks[0].state, 'stale-fail');
+});
+
+test('the marker only dates the review context: another status context, and a check run, are unaffected; no read is made for them', async () => {
+  const other = sim({ classic: present('Test integrity'), timeline: readyTimeline, statuses: [st('Test integrity', 'failure', 'github-actions[bot]', { created_at: T1 })], reviewMarkers: [marker(T2)] });
+  const a = await other.run();
+  assert.equal(a.output.verdict, 'failed');
+  assert.equal(other.elapsed(), 0);
+  assert.equal(other.reads.markers, 0, 'lazy: never read for another context');
+  const run = sim({ classic: present('ci'), timeline: readyTimeline, checkRuns: [cr('ci', 'failure', { check_suite: { id: 4 } })], suiteRuns: () => () => [{ created_at: T1 }], reviewMarkers: [marker(T2)] });
+  assert.equal((await run.run()).output.verdict, 'failed');
+  assert.equal(run.elapsed(), 0);
+  assert.equal(run.reads.markers, 0);
+  // a passing review status never reads the comments either
+  const ok = sim(reviewWorld({ statuses: [review('success', T1)], reviewMarkers: [marker(T2)] }));
+  assert.equal((await ok.run()).exitCode, 0);
+  assert.equal(ok.reads.markers, 0);
+});
+
+test('a ready-era run still holds a stale review failure past the appear window up to --timeout (existing holder rule)', async () => {
+  const s = sim(reviewWorld({
+    statuses: [review('failure', T1)], reviewMarkers: [marker(T2)],
+    checkRuns: [cr('other', 'in_progress', { status: 'in_progress', conclusion: null, started_at: '2026-01-01T12:00:05Z' })],
+  }), { timeoutMs: 600_000 });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'timeout');
+  assert.equal(s.elapsed(), 600_000);
+  assert.equal(r.output.heldBy.kind, 'check-run');
+});
+
+// ---- R1-F1 (#251): a failure posted just after the marker by a guards run that STARTED before it is still stale ----
+
+const RUN_URL = (id, tail = '') => `https://github.com/acme/widgets/actions/runs/${id}${tail}`;
+const reviewAt = (state, created_at, target_url, id) => ({ ...review(state, created_at), target_url, ...(id === undefined ? {} : { id }) });
+const T2_PLUS_3 = '2026-01-01T12:01:33Z';
+const BEFORE_MARKER = '2026-01-01T12:01:10Z';
+const AFTER_MARKER = '2026-01-01T12:01:40Z';
+const lateWorld = (over) => reviewWorld({
+  statuses: (t) => [reviewAt('failure', T2_PLUS_3, RUN_URL(555, '/job/9'), 1), ...(t >= 120 ? [{ ...review('success', T3), id: 2 }] : [])],
+  reviewMarkers: [marker(T2)],
+  ...over,
+});
+
+test('R1-F1: a failure created 3 s after the marker by a run that started before it is stale: the wait goes on to the re-post', async () => {
+  const s = sim(lateWorld({ workflowRun: { id: 555, run_started_at: BEFORE_MARKER, created_at: BEFORE_MARKER } }));
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 120_000);
+  assert.deepEqual([...new Set(s.reads.runs)], ['555'], 'the run id was parsed from the target url, job suffix ignored');
+  assert.ok(s.progress.some((l) => /Cross-model review=stale-fail/.test(l)));
+});
+
+test('R1-F1: the run read falls back to created_at when run_started_at is absent', async () => {
+  const s = sim(lateWorld({ workflowRun: { id: 555, created_at: BEFORE_MARKER } }));
+  assert.equal((await s.run()).output.verdict, 'passed');
+  assert.equal(s.elapsed(), 120_000);
+});
+
+test('R1-F1: the same failure whose run started after the marker is fresh: failed at once', async () => {
+  const s = sim(lateWorld({ workflowRun: { id: 555, run_started_at: AFTER_MARKER, created_at: AFTER_MARKER } }));
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(s.elapsed(), 0);
+});
+
+test('R1-F1: a run that started at the marker instant is not before it (strict <)', async () => {
+  const s = sim(lateWorld({ workflowRun: { id: 555, run_started_at: T2 } }));
+  assert.equal((await s.run()).output.verdict, 'failed');
+  assert.equal(s.elapsed(), 0);
+});
+
+test('R1-F1: an unreadable run, an unreadable start, or no run reader leaves the created_at verdict (failed at once)', async () => {
+  for (const workflowRun of [() => { throw new Error('HTTP 404'); }, { id: 555 }, { id: 555, run_started_at: 'not a date' }, null]) {
+    const s = sim(lateWorld({ workflowRun }));
+    assert.equal((await s.run()).output.verdict, 'failed', String(workflowRun));
+    assert.equal(s.elapsed(), 0);
+  }
+  const none = sim(lateWorld({}));
+  assert.equal((await none.run()).output.verdict, 'failed');
+  assert.equal(none.elapsed(), 0);
+});
+
+test('R1-F1: a target_url that is not an Actions run is not read: the created_at verdict stands', async () => {
+  for (const url of ['https://vercel.com/acme/deploy/abc', 'https://github.com/acme/widgets/actions', 'https://github.com/acme/widgets/actions/runs/abc', undefined, null]) {
+    const s = sim(lateWorld({
+      statuses: [reviewAt('failure', T2_PLUS_3, url)],
+      workflowRun: { id: 555, run_started_at: BEFORE_MARKER },
+    }));
+    assert.equal((await s.run()).output.verdict, 'failed', String(url));
+    assert.equal(s.elapsed(), 0);
+    assert.deepEqual(s.reads.runs, [], String(url));
+  }
+});
+
+test('R1-F1: the run is not read for another context, or without a marker, and a run-started stale failure never re-posted stands as failed at the deadline', async () => {
+  const other = sim({ classic: present(pin('Static guards', ACTIONS)), timeline: readyTimeline, statuses: [{ ...st('Static guards', 'failure'), created_at: T2_PLUS_3, target_url: RUN_URL(555) }], reviewMarkers: [marker(T2)], workflowRun: { run_started_at: BEFORE_MARKER } });
+  assert.equal((await other.run()).output.verdict, 'failed');
+  assert.deepEqual(other.reads.runs, []);
+  const noMarker = sim(reviewWorld({ statuses: [reviewAt('failure', T2_PLUS_3, RUN_URL(555))], reviewMarkers: [], workflowRun: { run_started_at: BEFORE_MARKER } }));
+  assert.equal((await noMarker.run()).output.verdict, 'failed');
+  assert.deepEqual(noMarker.reads.runs, []);
+  const never = sim(reviewWorld({ statuses: [reviewAt('failure', T2_PLUS_3, RUN_URL(555))], reviewMarkers: [marker(T2)], workflowRun: { run_started_at: BEFORE_MARKER } }));
+  const r = await never.run();
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(never.elapsed(), 300_000);
+  assert.equal(r.output.checks[0].state, 'stale-fail');
+});
+
+test('R1-F1: the run is read once per poll (memoised), not once per status evaluation', async () => {
+  // the pinned and the unpinned Cross-model review are two identities (keyOf), so each poll evaluates the same status twice
+  const s = sim(lateWorld({
+    classic: present(pin('Cross-model review', ACTIONS), 'Cross-model review'),
+    workflowRun: { id: 555, run_started_at: BEFORE_MARKER },
+  }));
+  assert.equal((await s.run()).output.verdict, 'passed');
+  // 8 polls (0..105 s) read the run once each with the memo; without it each poll reads twice (16)
+  assert.deepEqual([...new Set(s.reads.runs)], ['555']);
+  assert.equal(s.reads.runs.length, 8, String(s.reads.runs.length));
 });

@@ -50,6 +50,8 @@ export const run = guarded(async (argv, ctx) => {
     checkRuns: async (head) => gh.checkRunsOf(head),
     statuses: async (head) => gh.statusesOf(head),
     timeline: async () => gh.timelineOf(pr),
+    reviewMarkers: async () => gh.listComments(pr), // the PR's issue comments (paginated); only read to date a `Cross-model review` failure
+    workflowRun: async (id) => gh.workflowRunOf(id), // one Actions run (run_started_at); only read to date a `Cross-model review` failure
     suiteRuns: async (suiteId) => gh.workflowRunsOfSuite(suiteId),
     headRuns: async (head) => gh.workflowRunsOfHead(head), // no fallback: a gh without it must fail the read, not silently end the late-aggregate hold
   };

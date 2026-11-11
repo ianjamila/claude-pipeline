@@ -8,6 +8,8 @@ import { repoRoot } from './repo.mjs';
 import { isClean } from './git.mjs';
 import { run, codexCommand } from './proc.mjs';
 import { createGitHub } from './github.mjs';
+import { claudeCodeStatus } from './claude-code-version.mjs';
+import { MIN_FABLE, readFloor, readableAllowedIds, standingBypasses } from './model-floor.mjs';
 
 const CODEX_TIMEOUT_MS = 15_000;
 
@@ -129,6 +131,30 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
     clean = isClean({ cwd: root });
   } catch { /* not a repo, or git failed: not provably clean */ }
 
+  // The terminal's Claude Code build against the installed one (plan 2026-11-10, A3). Informational: it never changes canMerge.
+  let claudeCode = { running: null, installed: null, stale: null };
+  try { claudeCode = claudeCodeStatus(env); } catch { /* unreadable: unknown */ }
+  const warnings = [];
+  if (claudeCode.stale === true) {
+    warnings.push(`this terminal runs Claude Code ${claudeCode.running} but ${claudeCode.installed} is installed: restart it before a review's Fable pass`);
+  }
+
+  // A standing owner allowance or a hold below MIN_FABLE lets a Fable proof through that the shipped floor would refuse: say so until it is cleared.
+  // Informational like the build check: it never changes canMerge (an unreadable registry is for arbiter apply to report).
+  try {
+    const floor = readFloor({ env });
+    const readable = floor.ok ? readableAllowedIds(floor.registry) : [];
+    for (const b of floor.ok ? standingBypasses(floor.registry) : []) {
+      // Only an id the parser cannot read is still bypassed by its allowance; a readable one is judged by version and is reported below.
+      const unreadable = b.kind === 'allow' ? b.ids.filter((id) => !readable.includes(id)) : [];
+      if (b.kind === 'allow' && unreadable.length === 0) continue;
+      warnings.push(b.kind === 'allow'
+        ? `owner allowance in force: ${unreadable.join(', ')}; once the parser fix is installed, remove it with \`pipeline model-floor reset ${unreadable.map((id) => `--remove-allow ${id}`).join(' ')}\``
+        : `owner hold below ${MIN_FABLE} in force: ${b.hold}; clear it with \`pipeline model-floor reset --clear-hold\` once the model it holds back from is acceptable`);
+    }
+    for (const id of readable) warnings.push(`allowance ${id} is readable now and no longer needed: remove it with \`pipeline model-floor reset --remove-allow ${id}\``);
+  } catch { /* an unreadable folder: nothing to warn about here */ }
+
   const enforcementOk = declared === 'gate' || enforcement.mode === 'github';
   const reasons = [];
   if (!config.ok) reasons.push(`pipeline config is not usable: ${config.errors.join('; ')}`);
@@ -147,7 +173,9 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
     rollback,
     codex: codexState,
     clean,
+    claudeCode,
     canMerge: config.ok && authed && !off && !pause.open && !rollback.open && enforcementOk,
     reasons,
+    warnings,
   };
 }

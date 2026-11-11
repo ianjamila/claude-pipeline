@@ -3,6 +3,7 @@
 // this file does. Everything is pure: functions return new values and never mutate their inputs.
 import { createHash } from 'node:crypto';
 import { CATEGORIES } from './codex.mjs';
+import { MIN_FABLE, compareVersions, parseModelId } from './model-floor.mjs';
 
 export const SECURITY_CATEGORIES = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
 export const BUCKETS = ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING'];
@@ -151,9 +152,88 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
 // A round recorded with `fableRequired` (codex-review: risk.mjs#reviewLane said fable) is reviewed by ONE Fable pass that
 // rules on every Codex item and reviews the diff itself. Until that pass is PROVEN (`arbiter.proofOk === true`) the round
 // is not reviewed, even when Codex found nothing: the Fable pass is the second review, not a dispute tie-break.
+// The Fable steps that stopped on the floor or a stale terminal and have not been proven since (round.arbiter.failure, written by arbiter.mjs).
+export const arbiterFailures = (state) => (state?.rounds ?? [])
+  .filter((r) => r?.arbiter?.failure && typeof r.arbiter.failure === 'object' && r.arbiter.proofOk !== true)
+  .map((r) => ({ round: r.n, cause: r.arbiter.failure.cause, advice: r.arbiter.failure.advice ?? null }));
+
 export const fablePendingRounds = (state) => (state?.rounds ?? [])
   .filter((r) => r?.fableRequired === true && r.baseOnly !== true && r.arbiter?.proofOk !== true)
   .map((r) => r.n);
+
+// ---- Fable proofs below the floor (plan 2026-11-10 A4b: old proofs are re-reviewed, not grandfathered) -------------------------
+// A proven Fable round: the Fable pass answered and its transcript was accepted (arbiter.mjs publishes modelProof only then).
+const isProvenFableRound = (r) => r?.fableRequired === true && r.baseOnly !== true && r.arbiter?.proofOk === true;
+// `gate` = { threshold, allow }: the version below which a proof is re-reviewed and the Fable ids the owner allowed by exact name. The commands read
+// it from the registry (model-floor.mjs#readReviewGate: the owner's hold when it is below MIN_FABLE, else MIN_FABLE) and pass it in; these helpers stay pure.
+const DEFAULT_GATE = { threshold: MIN_FABLE, allow: [] };
+// The Fable ids a round was proven with (modelProof.models is keyed by model id) split by the threshold. A `claude-fable-*` id the parser cannot read
+// is stale (fail closed, like the floor itself) unless the owner allowed it; an id of another family is not a Fable and is ignored. The allowance covers
+// only an id the parser cannot read: an allowed id that parses is judged by version like any other, so one a later threshold has passed is stale again.
+const fableModelsOf = (r, { threshold = MIN_FABLE, allow = [] } = DEFAULT_GATE) => {
+  const min = parseModelId(threshold);
+  const stale = [];
+  const current = [];
+  for (const id of Object.keys(r?.modelProof?.models && typeof r.modelProof.models === 'object' ? r.modelProof.models : {})) {
+    const p = parseModelId(id);
+    if (p === null) {
+      if (allow.includes(id)) current.push(id);
+      else if (/^claude-fable(-|$)/.test(id)) stale.push(id);
+    } else if (p.family === 'fable') {
+      (compareVersions(p, min) < 0 ? stale : current).push(id);
+    }
+  }
+  return { stale, current };
+};
+// A later proven pass that supersedes older ones: every Fable id in it is at or above the threshold, and it reviewed the WHOLE PR
+// (round.arbiter.scope 'whole-pr', stored when arbiter needed wrote the diff). A round without the stored scope is not one.
+const supersedes = (r, gate) => {
+  const { stale, current } = fableModelsOf(r, gate);
+  return isProvenFableRound(r) && stale.length === 0 && current.length > 0 && r.arbiter?.scope === 'whole-pr';
+};
+// The proven Fable rounds whose recorded Fable model is below the threshold and that no LATER whole-PR pass at or above it replaced:
+// [{ round, models }] in round order. review-complete and the final gate refuse a PR while this is non-empty; `state fable-refresh` is the way out.
+export function staleFableRounds(state, gate = DEFAULT_GATE) {
+  const rounds = state?.rounds ?? [];
+  const out = [];
+  for (const r of rounds) {
+    if (!isProvenFableRound(r)) continue;
+    const { stale } = fableModelsOf(r, gate);
+    if (stale.length === 0) continue;
+    if (rounds.some((later) => later.n > r.n && supersedes(later, gate))) continue;
+    out.push({ round: r.n, models: [...stale].sort() });
+  }
+  return out;
+}
+// "rounds 1 (claude-fable-5-1), 3 (...)" for the refusal text.
+export const staleFableSummary = (stale) => stale.map((s) => `${s.round} (${s.models.join(', ')})`).join(', ');
+// Why review-complete and the final gate refuse such a PR, and the one command that fixes it.
+export const staleFableReason = (stale, pr, threshold = MIN_FABLE) => `the Fable review pass of round ${staleFableSummary(stale)} was proven with a Fable older than ${threshold}: run \`pipeline state fable-refresh --pr ${pr}\` (one extra Fable pass that re-reviews the whole PR with the current Fable; it is not counted against review.max_rounds)`;
+// A proven Fable pass that is not below the threshold (any scope; a proof that recorded no Fable id counts as it always did): the passes below it do
+// not count for arbiter.mjs#writeFableDiff's "the first pass reviews the whole PR" rule, so the first fresh-model pass after old ones reads everything.
+export const provenNotStale = (r, gate = DEFAULT_GATE) => isProvenFableRound(r) && fableModelsOf(r, gate).stale.length === 0;
+
+// The proven Fable rounds that count as current ONLY because of an owner allowance (an id the parser cannot read) or a hold below MIN_FABLE (an id older
+// than MIN_FABLE that the lowered threshold admits): [{ round, via: 'allow' | 'hold', id }] in round order. A round that is stale is not listed (the refusal
+// names it). Pure: `gate` = { threshold, allow } as for staleFableRounds.
+export function fableBypassRounds(state, gate = DEFAULT_GATE) {
+  const min = parseModelId(MIN_FABLE);
+  const out = [];
+  for (const r of state?.rounds ?? []) {
+    if (!provenNotStale(r, gate)) continue;
+    for (const id of fableModelsOf(r, gate).current) {
+      const p = parseModelId(id);
+      if (p === null) out.push({ round: r.n, via: 'allow', id });
+      else if (compareVersions(p, min) < 0) out.push({ round: r.n, via: 'hold', id });
+    }
+  }
+  return out;
+}
+// One short line for review-complete and the final gate: "Fable round 3 counted via owner allowance X; Fable round 4 counted via owner hold Y (below Z)". null when none.
+// The hold is named by the threshold it set (gate.threshold), which is the registry's hold whenever it is below MIN_FABLE.
+export const fableBypassNote = (bypass, gate = DEFAULT_GATE) => (bypass.length === 0 ? null : bypass
+  .map((b) => (b.via === 'allow' ? `Fable round ${b.round} counted via owner allowance ${b.id}` : `Fable round ${b.round} counted via owner hold ${gate.threshold} (below ${MIN_FABLE})`))
+  .join('; '));
 
 // ---- judge, tests ---------------------------------------------------------------------------
 
@@ -240,7 +320,9 @@ export function finalizeWithoutArbiter(items, opts = {}) {
 // A ruling is final unless it must go to a human. Checked in this order; the first match wins.
 // `rulings` may be the arbiter's whole output ({rulings}) or just its array. A missing proofOk
 // fails closed.
-export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
+// `proofCause` names why an unproven answer is unproven when it is not the plain model-proof failure ('stale-model': the proof failed on the
+// Fable floor alone).
+export function applyRulings(items, rulings, { proofOk, transcript, proofCause } = {}) {
   const list = Array.isArray(rulings) ? rulings : (rulings?.rulings ?? []);
   const byId = new Map(list.map((r) => [r.id, r]));
   return items.map((item) => {
@@ -263,8 +345,8 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
         decision: validDecision(item.judge?.decision) ?? validDecision(r.ruling),
         by: 'arbiter',
         needsHuman: true,
-        reason: 'model-proof failed: ruling not provably from Fable',
-        cause: 'model-proof',
+        reason: proofCause === 'stale-model' ? 'stale-model: the ruling came from a Fable older than this machine\'s floor' : 'model-proof failed: ruling not provably from Fable',
+        cause: proofCause === 'stale-model' ? 'stale-model' : 'model-proof',
       };
     } else if (!rulingValid) {
       // Output a validator would have refused (wrong case, missing, wrong type): never act on it.
@@ -288,13 +370,16 @@ export function applyRulings(items, rulings, { proofOk, transcript } = {}) {
 
 // ---- Claude's own rulings (plan 2026-11-05-claude-rulings.md section 10 and E1-E11) ----------------------------------------------
 
-// Why an item waits for a human: `final.cause` (set where the final is made). The first three are malfunctions (a judge or arbiter answer that
-// could not be used): Claude may not dismiss through them, only ACCEPT, or have the arbiter run again. The others are judgements a human may make.
-export const MALFUNCTION_CAUSES = ['model-proof', 'invalid-arbiter', 'invalid-judge'];
+// Why an item waits for a human: `final.cause` (set where the final is made). The first five are malfunctions (a judge or arbiter answer that
+// could not be used, or a terminal that cannot give the pinned Fable): Claude may not dismiss through them, only ACCEPT, or have the arbiter run again. The others are judgements a human may make.
+// stale-model (the Fable that answered is older than this machine's floor) and stale-terminal (this terminal runs an older Claude Code build than
+// the installed one) are malfunctions too: restart the terminal, update Claude Code, and run the review again.
+export const MALFUNCTION_CAUSES = ['model-proof', 'invalid-arbiter', 'invalid-judge', 'stale-model', 'stale-terminal'];
 const NEEDS_HUMAN_CAUSES = [...MALFUNCTION_CAUSES, 'low-confidence', 'security-dismissal', 'test-security'];
 // The reason strings of states written before `cause` existed.
 const LEGACY_CAUSES = [
   [/^model-proof failed/, 'model-proof'],
+  [/^stale-model:/, 'stale-model'],
   [/^invalid arbiter output$/, 'invalid-arbiter'],
   [/^invalid judge output$/, 'invalid-judge'],
   [/^arbiter low confidence$/, 'low-confidence'],
@@ -533,8 +618,9 @@ export function markLightLane(items) {
 // A round that only merged the base branch in ("Update branch") reviewed nothing of the PR's own: it does not count toward
 // maxRounds. Nor does a round that is only the resolution of a merge conflict with the base branch (resolutionOnly: git.mjs#
 // resolutionReviewBase proved the resolver only chose lines the two sides already had). That one IS a real review (Codex, triage
-// and Fable all run), only the cap is waived. Only the other rounds are counted by the cap.
-export const countsTowardCap = (r) => r?.baseOnly !== true && r?.resolutionOnly !== true;
+// and Fable all run), only the cap is waived. Nor does a Fable refresh round (fableRefresh: state fable-refresh re-runs ONLY the Fable pass on a head
+// whose Fable proof is older than MIN_FABLE; it asks Codex nothing). Only the other rounds are counted by the cap.
+export const countsTowardCap = (r) => r?.baseOnly !== true && r?.resolutionOnly !== true && r?.fableRefresh !== true;
 export const reviewedRoundCount = (state) => (state?.rounds ?? []).filter(countsTowardCap).length;
 
 // ---- owner-granted rounds (the pure side; the owner's records are looked up by the caller and INJECTED) ---------------------------
@@ -655,13 +741,13 @@ export function roundOutcome(state, { grants, head } = {}) {
   };
 }
 
-// How may round `n` start? -> { admission, problem }. admission: 'uncounted' (baseOnly / resolutionOnly: never capped, never needs or uses a
+// How may round `n` start? -> { admission, problem }. admission: 'uncounted' (baseOnly / resolutionOnly / fableRefresh: never capped, never needs or uses a
 // grant), 'normal' (within maxRounds, or no finite maxRounds), 'auto-extra' (the one extra confirm round roundOutcome grants), 'owner' (an
 // open owner grant for counted ordinal reviewed + 1 that covers `head`), or null with `problem` (the reason it may not). The automatic
 // extra is checked first and wins; a grant only admits what ordinary admission does not cover.
-export function roundAdmission(state, n, { baseOnly = false, resolutionOnly = false, head, grants } = {}) {
+export function roundAdmission(state, n, { baseOnly = false, resolutionOnly = false, fableRefresh = false, head, grants } = {}) {
   const max = state?.maxRounds;
-  if (baseOnly || resolutionOnly) return { admission: 'uncounted', problem: null };
+  if (baseOnly || resolutionOnly || fableRefresh) return { admission: 'uncounted', problem: null };
   if (!Number.isFinite(max)) return { admission: 'normal', problem: null };
   const reviewed = reviewedRoundCount(state);
   const next = reviewed + 1;

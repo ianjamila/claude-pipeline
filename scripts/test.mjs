@@ -11,6 +11,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MAX_SHARDS, parseShard, shardFiles } from './lib/shard.mjs';
 import { collectFileTimes } from './lib/file-times.mjs';
+import { realRegistryFile, registryChange, snapshotRegistry } from './lib/registry-snapshot.mjs';
 
 const libDir = join(dirname(fileURLToPath(import.meta.url)), 'lib');
 const testDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'test');
@@ -46,11 +47,15 @@ const env = {
 const timesOut = process.env.CP_TEST_TIMES;
 const nodeArgs = timesOut ? ['--import', pathToFileURL(join(libDir, 'file-times-preload.mjs')).href] : [];
 if (timesOut) rmSync(`${timesOut}.jsonl`, { force: true });
+// The suite must not touch the account's real Fable floor registry (tests use a scratch PIPELINE_MODEL_FLOOR_DIR): compare before and after.
+const registryBefore = snapshotRegistry();
 const r = spawnSync(process.execPath, [...nodeArgs, '--test', ...files], { stdio: 'inherit', env });
+const registryProblem = registryChange(registryBefore, snapshotRegistry(), realRegistryFile());
+if (registryProblem) console.error(`FAIL: ${registryProblem}`);
 if (timesOut) {
   let lines = [];
   try { lines = readFileSync(`${timesOut}.jsonl`, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { /* none recorded */ }
   writeFileSync(timesOut, JSON.stringify(collectFileTimes(lines)));
   rmSync(`${timesOut}.jsonl`, { force: true });
 }
-process.exit(r.status ?? 1);
+process.exit(registryProblem ? 1 : (r.status ?? 1));

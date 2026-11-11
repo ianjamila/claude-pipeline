@@ -39,7 +39,25 @@ function addTotals(into, add) {
   return t;
 }
 
-// entry: {phase, role, input, output, cacheRead, cacheWrite, usd}. Returns a NEW cost object (input is not touched).
+const BUCKET_KEY_RE = /^[^|]{1,100}\|(?:std|>100k)\|(?:std|fast)$/;
+const BUCKET_FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'messages'];
+const TABLE_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// Adds the entry's `byPrice` buckets into `into` (a plain object), summing per key.
+function mergeByPrice(into, add) {
+  if (!isPlainObject(add)) throw new Error('byPrice must be an object');
+  const out = isPlainObject(into) ? into : {};
+  for (const [key, v] of Object.entries(add)) {
+    if (!BUCKET_KEY_RE.test(key)) throw new Error(`byPrice key ${JSON.stringify(key.slice(0, 40))} is not "<model>|<std|>100k>|<std|fast>"`);
+    if (!isPlainObject(v)) throw new Error('byPrice entries must be objects');
+    const b = isPlainObject(out[key]) ? out[key] : {};
+    out[key] = Object.fromEntries(BUCKET_FIELDS.map((k) => [k, (Number(b[k]) || 0) + amount(v[k], `byPrice ${k}`, { integer: true })]));
+  }
+  return out;
+}
+
+// entry: {phase, role, input, output, cacheRead, cacheWrite, usd, byPrice?, priceTable?}. `byPrice` (see usageFromTranscript) is summed
+// into cost.byPrice; `priceTable` (a date) counts the entry in cost.priceTables. Returns a NEW cost object (input is not touched).
 export function addCostEntry(cost, entry) {
   const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
   const add = {
@@ -55,6 +73,13 @@ export function addCostEntry(cost, entry) {
   next.total = addTotals(next.total, add);
   next.byPhase[phase] = addTotals(next.byPhase[phase], add);
   next.byRole[role] = addTotals(next.byRole[role], add);
+  if (entry?.byPrice !== undefined) next.byPrice = mergeByPrice(next.byPrice, entry.byPrice);
+  if (entry?.priceTable !== undefined) {
+    if (typeof entry.priceTable !== 'string' || !TABLE_DATE_RE.test(entry.priceTable)) throw new Error('priceTable must be a date (YYYY-MM-DD)');
+    const tables = isPlainObject(next.priceTables) ? next.priceTables : {};
+    tables[entry.priceTable] = (Number(tables[entry.priceTable]) || 0) + 1;
+    next.priceTables = tables;
+  }
   return next;
 }
 
@@ -93,6 +118,9 @@ export function costShapeProblem(cost) {
   if (cost === undefined || cost === null) return null;
   if (!isPlainObject(cost)) return 'bad cost';
   if (!isPlainObject(cost.total) || !isPlainObject(cost.byPhase) || !isPlainObject(cost.byRole)) return 'bad cost';
+  // byPrice / priceTables are optional (records from before per-version prices have neither) but must be indexable when present
+  if (cost.byPrice !== undefined && !isPlainObject(cost.byPrice)) return 'bad cost';
+  if (cost.priceTables !== undefined && !isPlainObject(cost.priceTables)) return 'bad cost';
   return null;
 }
 
@@ -135,29 +163,84 @@ export function readGuardLog(file, sessions) {
 // ---- list prices ---------------------------------------------------------------------------------------------------
 
 // Why: an agent knows the tokens a subagent used but rarely its price, so USD was 0 unless passed by hand. List prices in
-// USD per million tokens [input, output, cache read, cache write (5 min)], the same proxy as the owner's weekly usage report.
-// An estimate, not a bill (plans and discounts differ); a model this table does not know adds tokens and no USD.
+// USD per million tokens [input, output, cache read, cache write 5 min, cache write 1 h] per model VERSION (the claude-api
+// skill table of PRICE_TABLE_DATE; a cache write costs 1.25x input for 5 min and 2x for 1 h). An estimate, not a bill
+// (plans and discounts differ); a model this table does not know adds tokens and no USD. Display only.
+export const PRICE_TABLE_DATE = '2026-11-03';
 export const PRICES = Object.freeze({
-  opus: [5, 25, 0.5, 6.25], sonnet: [3, 15, 0.3, 3.75], haiku: [1, 5, 0.1, 1.25], fable: [12.5, 62.5, 1.25, 15.6],
+  'claude-fable-5-2': [8, 40, 0.2, 10, 16],
+  'claude-fable-5-1': [10, 50, 0.25, 12.5, 20],
+  'claude-fable-5': [10, 50, 1, 12.5, 20],
+  'claude-opus-5-5': [4, 20, 0.2, 5, 8],
+  'claude-opus-5': [5, 25, 0.5, 6.25, 10],
+  'claude-opus-4-8': [5, 25, 0.5, 6.25, 10],
+  'claude-opus-4-7': [5, 25, 0.5, 6.25, 10],
+  'claude-opus-4-6': [5, 25, 0.5, 6.25, 10],
+  'claude-sonnet-5-5': [2, 10, 0.1, 2.5, 4],
+  'claude-sonnet-5': [2, 10, 0.2, 2.5, 4],
+  'claude-sonnet-4-6': [3, 15, 0.3, 3.75, 6],
+  'claude-haiku-5-5': [0.1, 0.5, 0.01, 0.125, 0.2],
+  'claude-haiku-4-5': [1, 5, 0.1, 1.25, 2],
 });
+// Haiku 5.5 prices a message by its own prompt size (input + cache read + cache write): above 100,000 tokens the higher row.
+export const TIER_THRESHOLD_TOKENS = 100000;
+export const PRICES_OVER_100K = Object.freeze({ 'claude-haiku-5-5': [0.5, 2.5, 0.05, 0.625, 1] });
+// Fast mode (usage.speed 'fast') re-prices input and output only; its cache prices are not known, so a fast message with any
+// cache tokens is left unpriced rather than guessed.
+export const FAST_PRICES = Object.freeze({ 'claude-fable-5-2': [16, 80], 'claude-opus-5-5': [8, 40] });
+// A family's newest row prices a version this table does not know yet (a newer Fable is priced like Fable 5.2).
+const FAMILY_NEWEST = Object.freeze({ fable: 'claude-fable-5-2', opus: 'claude-opus-5-5', sonnet: 'claude-sonnet-5-5', haiku: 'claude-haiku-5-5' });
+
 export const modelFamily = (model) => {
   const m = String(model ?? '').toLowerCase();
   return /fable/.test(m) ? 'fable' : /sonnet/.test(m) ? 'sonnet' : /haiku/.test(m) ? 'haiku' : /opus/.test(m) ? 'opus' : null;
 };
-// USD for a token count at a model's list price; null when the model is unknown.
-export function listPriceUsd(model, t) {
-  const p = PRICES[modelFamily(model)];
-  if (!p) return null;
-  const n = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0);
-  const usd = (n(t.input) * p[0] + n(t.output) * p[1] + n(t.cacheRead) * p[2] + n(t.cacheWrite) * p[3]) / 1e6;
-  return Math.round(usd * 1e6) / 1e6;
+// The table row id a model is priced as: the id itself (a `[1m]`-style suffix and an 8-digit date suffix dropped), else its
+// family's newest row, else null.
+export function priceRowId(model) {
+  const id = String(model ?? '').trim().toLowerCase().replace(/\[[^\]]*\]$/, '').replace(/-\d{8}$/, '');
+  if (Object.hasOwn(PRICES, id)) return id;
+  const family = modelFamily(id);
+  return family ? FAMILY_NEWEST[family] : null;
 }
+
+const tok = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0);
+// {input, output, cacheRead, cacheWrite5m, cacheWrite1h} from a token object; a bare `cacheWrite` (no split given) is 5 min.
+function splitTokens(t) {
+  const split = t.cacheWrite5m !== undefined || t.cacheWrite1h !== undefined;
+  return {
+    input: tok(t.input), output: tok(t.output), cacheRead: tok(t.cacheRead),
+    cacheWrite5m: split ? tok(t.cacheWrite5m) : tok(t.cacheWrite), cacheWrite1h: split ? tok(t.cacheWrite1h) : 0,
+  };
+}
+const promptTokens = (x) => x.input + x.cacheRead + x.cacheWrite5m + x.cacheWrite1h;
+const round6 = (v) => Math.round(v * 1e6) / 1e6;
+
+// {tier: 'std' | '>100k', speed: 'std' | 'fast', usd: number | null} for one message's tokens. `usd` is null when the model is
+// unknown, or the message is fast without a fast price (or with cache tokens).
+export function priceMessage(model, t, { speed } = {}) {
+  const x = splitTokens(t ?? {});
+  const row = priceRowId(model);
+  const fast = speed === 'fast' ? 'fast' : 'std';
+  const tier = row !== null && PRICES_OVER_100K[row] && promptTokens(x) > TIER_THRESHOLD_TOKENS ? '>100k' : 'std';
+  if (row === null) return { tier, speed: fast, usd: null };
+  if (fast === 'fast') {
+    const f = FAST_PRICES[row];
+    if (!f || x.cacheRead + x.cacheWrite5m + x.cacheWrite1h > 0) return { tier, speed: fast, usd: null };
+    return { tier, speed: fast, usd: round6((x.input * f[0] + x.output * f[1]) / 1e6) };
+  }
+  const p = tier === '>100k' ? PRICES_OVER_100K[row] : PRICES[row];
+  return { tier, speed: fast, usd: round6((x.input * p[0] + x.output * p[1] + x.cacheRead * p[2] + x.cacheWrite5m * p[3] + x.cacheWrite1h * p[4]) / 1e6) };
+}
+// USD for a token count at a model's list price; null when the model is unknown.
+export const listPriceUsd = (model, t, opts) => priceMessage(model, t, opts).usd;
 
 // ---- token usage from a Claude transcript (JSONL) ------------------------------------------------------------------
 
 // Sums message.usage over the assistant lines of one transcript. A streamed message may appear on several lines with
 // the same message id; each id is counted once (last line wins, it carries the final totals). `defaultModel` prices the messages that carry
-// no model of their own (a message's own model always wins).
+// no model of their own (a message's own model always wins). `byPrice` ("<model id>|<tier>|<speed>" -> token sums and a message count)
+// holds every dimension the price depends on, so a later table can re-price the run exactly; `cacheWrite` stays the 5 m + 1 h total.
 export function usageFromTranscript(text, { defaultModel } = {}) {
   const byId = new Map();
   let anon = 0;
@@ -173,20 +256,31 @@ export function usageFromTranscript(text, { defaultModel } = {}) {
     if (!isPlainObject(u)) continue;
     byId.set(e.message.id ?? `anon-${anon++}`, { u, model: e.message.model });
   }
-  // usd: each message at its own model's list price; unpricedMessages: messages whose model the price table does not know
-  const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, messages: byId.size, unpricedMessages: 0 };
+  // usd: each message at its own model's list price; unpricedMessages: messages the price table cannot price
+  const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, messages: byId.size, unpricedMessages: 0, byPrice: {} };
   const n = (v) => (Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
   for (const { u, model } of byId.values()) {
-    const t = { input: n(u.input_tokens), output: n(u.output_tokens), cacheRead: n(u.cache_read_input_tokens), cacheWrite: n(u.cache_creation_input_tokens) };
+    const cc = isPlainObject(u.cache_creation) ? u.cache_creation : {};
+    const total = n(u.cache_creation_input_tokens);
+    const split = cc.ephemeral_1h_input_tokens !== undefined || cc.ephemeral_5m_input_tokens !== undefined;
+    const w1h = split ? n(cc.ephemeral_1h_input_tokens) : 0;
+    // (a total larger than the two parts is booked as 5 min; no split at all means all 5 min)
+    const w5m = split ? n(cc.ephemeral_5m_input_tokens) + Math.max(0, total - n(cc.ephemeral_5m_input_tokens) - w1h) : total;
+    const t = { input: n(u.input_tokens), output: n(u.output_tokens), cacheRead: n(u.cache_read_input_tokens), cacheWrite5m: w5m, cacheWrite1h: w1h };
     sum.input += t.input;
     sum.output += t.output;
     sum.cacheRead += t.cacheRead;
-    sum.cacheWrite += t.cacheWrite;
-    const price = listPriceUsd(typeof model === 'string' && model !== '' ? model : defaultModel, t);
-    if (price === null) sum.unpricedMessages++;
-    else sum.usd += price;
+    sum.cacheWrite += w5m + w1h;
+    const id = (typeof model === 'string' && model !== '' ? model : typeof defaultModel === 'string' && defaultModel !== '' ? defaultModel : 'unknown').replaceAll('|', '_');
+    const priced = priceMessage(id, t, { speed: u.speed });
+    if (priced.usd === null) sum.unpricedMessages++;
+    else sum.usd += priced.usd;
+    const key = `${id}|${priced.tier}|${priced.speed}`;
+    const b = (sum.byPrice[key] ??= { input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, messages: 0 });
+    for (const k of ['input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h']) b[k] += t[k];
+    b.messages += 1;
   }
-  sum.usd = Math.round(sum.usd * 1e6) / 1e6;
+  sum.usd = round6(sum.usd);
   return sum;
 }
 
@@ -213,6 +307,8 @@ export function costLines(cost) {
   };
   rows('By phase', PHASES, cost.byPhase);
   rows('By role', ROLES, cost.byRole);
+  const tables = isPlainObject(cost.priceTables) ? Object.entries(cost.priceTables) : [];
+  if (tables.length) out.push(`- **Priced with table:** ${tables.map(([d, c]) => `${d} (${num(c)})`).join(' · ')}`);
   return out;
 }
 
@@ -227,5 +323,7 @@ export function costReport(cost) {
     guardBlocks: Number.isInteger(cost.guardBlocks) ? cost.guardBlocks : null,
     guardBySession: Number.isInteger(cost.guardBlocks) && isPlainObject(cost.guardBySession) ? cost.guardBySession : null,
     sessions: Array.isArray(cost.sessions) ? cost.sessions : [],
+    ...(isPlainObject(cost.byPrice) ? { byPrice: cost.byPrice } : {}),
+    ...(isPlainObject(cost.priceTables) ? { priceTables: cost.priceTables } : {}),
   };
 }

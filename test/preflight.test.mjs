@@ -1,8 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { runPreflight, probeCodex, protectionMissing } from '../pipeline/lib/preflight.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, createFakeCodex, fullProtection, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { floorEnv, scratchFloorDir } from './helpers/floor-env.mjs';
+import { resetFloor } from '../pipeline/lib/model-floor.mjs';
 
 function repoWith(enforcement = 'github', checks) {
   const repo = createTmpRepo();
@@ -22,7 +27,8 @@ function world(over = [], { codex = {}, env = {} } = {}) {
     { match: '^issue list --label pipeline-pause', stdoutJson: [] },
     { match: '^issue list --label pipeline-rollback', stdoutJson: [] },
   ]);
-  return { fake, env: { ...fake.env, ...createFakeCodex(codex).env, ...env } };
+  // The model floor registry is a scratch folder (a checkout honours PIPELINE_MODEL_FLOOR_DIR), never the account's own.
+  return { fake, env: { ...fake.env, ...createFakeCodex(codex).env, ...floorEnv(), ...env } };
 }
 
 const PLAN_403 = {
@@ -261,4 +267,117 @@ test('configured checks are required IN ADDITION to the guard contexts; ci.guard
   const r = await runPreflight({ cwd: off.dir, env: world([{ match: 'branches/main/protection', stdoutJson: fullProtection(['ci']) }]).env });
   assert.equal(r.enforcement.mode, 'github');
   assert.equal(r.canMerge, true);
+});
+
+// ---- the Claude Code build this terminal runs vs the installed one (plan 2026-11-10, A3) ----
+// <root>/claude-code/{package.json,bin/claude.exe}; the env that points at it.
+function claudeCodeInstall(t, version) {
+  const root = mkdtempSync(join(tmpdir(), 'cp-pre-cc-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'claude-code', 'bin'), { recursive: true });
+  writeFileSync(join(root, 'claude-code', 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-code', version }));
+  return { CLAUDE_CODE_EXECPATH: join(root, 'claude-code', 'bin', 'claude.exe') };
+}
+
+test('a stale terminal adds a warning, reports claudeCode, and leaves canMerge and reasons exactly as they were', async (t) => {
+  const repo = repoWith('github');
+  const install = claudeCodeInstall(t, '2.1.321');
+  const baseline = await runPreflight({ cwd: repo.dir, env: world().env });
+  const stale = await runPreflight({ cwd: repo.dir, env: world([], { env: { ...install, AI_AGENT: 'claude-code_2-1-318_agent' } }).env });
+  assert.deepEqual(stale.claudeCode, { running: '2.1.318', installed: '2.1.321', stale: true });
+  assert.equal(stale.warnings.length, 1);
+  assert.match(stale.warnings[0], /this terminal runs Claude Code 2\.1\.318 but 2\.1\.321 is installed: restart it before a review's Fable pass/);
+  assert.equal(stale.canMerge, true);
+  assert.equal(stale.canMerge, baseline.canMerge);
+  assert.equal(stale.ok, baseline.ok);
+  assert.deepEqual(stale.reasons, baseline.reasons);
+  assert.deepEqual(baseline.warnings, []);
+});
+
+test('a stale terminal never turns a blocked world into a mergeable one either', async (t) => {
+  const repo = repoWith('github');
+  const install = claudeCodeInstall(t, '2.1.321');
+  const paused = [{ match: '^issue list --label pipeline-pause', stdoutJson: [{ number: 7, title: 'pause', url: 'u' }] }];
+  const blocked = await runPreflight({ cwd: repo.dir, env: world(paused, { env: { ...install, AI_AGENT: 'claude-code_2-1-318_agent' } }).env });
+  assert.equal(blocked.claudeCode.stale, true);
+  assert.equal(blocked.canMerge, false);
+});
+
+test('an up-to-date or newer terminal, and an unknown build, add no warning and leave canMerge true', async (t) => {
+  const repo = repoWith('github');
+  const install = claudeCodeInstall(t, '2.1.321');
+  const cases = [
+    [{ ...install, AI_AGENT: 'claude-code_2-1-321_agent' }, { running: '2.1.321', installed: '2.1.321', stale: false }],
+    [{ ...install, AI_AGENT: 'claude-code_2-1-400_agent' }, { running: '2.1.400', installed: '2.1.321', stale: false }],
+    [{ ...install }, { running: null, installed: '2.1.321', stale: null }],
+    [{ AI_AGENT: 'claude-code_2-1-321_agent' }, { running: '2.1.321', installed: null, stale: null }],
+    [{}, { running: null, installed: null, stale: null }],
+  ];
+  for (const [extra, want] of cases) {
+    const r = await runPreflight({ cwd: repo.dir, env: world([], { env: extra }).env });
+    assert.deepEqual(r.claudeCode, want, JSON.stringify(extra));
+    assert.deepEqual(r.warnings, [], JSON.stringify(extra));
+    assert.equal(r.canMerge, true, JSON.stringify(extra));
+  }
+});
+
+// ---- an owner allowance or a hold below MIN_FABLE still in force (review round 2: R2-F2 c) ----
+test('an owner allowance or a hold below MIN_FABLE adds a warning; clearing it removes the warning; canMerge and reasons never change', async () => {
+  const repo = repoWith('github');
+  const dir = scratchFloorDir();
+  const check = async () => runPreflight({ cwd: repo.dir, env: world([], { env: floorEnv(dir) }).env });
+  const baseline = await check();
+  assert.deepEqual(baseline.warnings, []);
+
+  await resetFloor({ dir, allowId: ['claude-fable-6-preview', 'claude-fable-6-b'] });
+  const allowed = await check();
+  assert.deepEqual(allowed.warnings, ['owner allowance in force: claude-fable-6-preview, claude-fable-6-b; once the parser fix is installed, remove it with `pipeline model-floor reset --remove-allow claude-fable-6-preview --remove-allow claude-fable-6-b`']);
+  assert.equal(allowed.canMerge, baseline.canMerge);
+  assert.deepEqual(allowed.reasons, baseline.reasons);
+
+  await resetFloor({ dir, hold: 'claude-fable-5-1-20261001' });
+  const both = await check();
+  assert.equal(both.warnings.length, 2);
+  assert.match(both.warnings[1], /^owner hold below claude-fable-5-2 in force: claude-fable-5-1; clear it with `pipeline model-floor reset --clear-hold`/);
+  assert.equal(both.canMerge, true);
+
+  await resetFloor({ dir, clearAllow: true });
+  assert.equal((await check()).warnings.length, 1, 'only the hold is left');
+  await resetFloor({ dir, hold: 'claude-fable-5-4' });
+  assert.deepEqual((await check()).warnings, [], 'a hold at or above MIN_FABLE lowers nothing: no warning');
+  await resetFloor({ dir, clearHold: true });
+  assert.deepEqual((await check()).warnings, []);
+});
+
+test('R3-F2: an allowance the parser can read now gets its own "no longer needed" warning, and is not listed as in force; canMerge never changes', async () => {
+  const repo = repoWith('github');
+  const dir = scratchFloorDir();
+  const check = async () => runPreflight({ cwd: repo.dir, env: world([], { env: floorEnv(dir) }).env });
+  const baseline = await check();
+  await resetFloor({ dir, allowId: ['claude-fable-5-3'] });
+  const readable = await check();
+  assert.deepEqual(readable.warnings, ['allowance claude-fable-5-3 is readable now and no longer needed: remove it with `pipeline model-floor reset --remove-allow claude-fable-5-3`']);
+  assert.equal(readable.canMerge, baseline.canMerge);
+  assert.deepEqual(readable.reasons, baseline.reasons);
+  await resetFloor({ dir, allowId: ['claude-fable-6-preview'] });
+  const mixed = await check();
+  assert.deepEqual(mixed.warnings, [
+    'owner allowance in force: claude-fable-6-preview; once the parser fix is installed, remove it with `pipeline model-floor reset --remove-allow claude-fable-6-preview`',
+    'allowance claude-fable-5-3 is readable now and no longer needed: remove it with `pipeline model-floor reset --remove-allow claude-fable-5-3`',
+  ]);
+  for (const w of mixed.warnings) assert.doesNotMatch(w, /--clear-allow/, 'a warning never sends the owner to the all-or-nothing flag');
+  await resetFloor({ dir, clearAllow: true });
+  assert.deepEqual((await check()).warnings, []);
+});
+
+test('a bypass warning never turns a blocked world into a mergeable one, and an unreadable registry adds none', async () => {
+  const repo = repoWith('github');
+  const dir = scratchFloorDir();
+  await resetFloor({ dir, allowId: ['claude-fable-6-preview'] });
+  const paused = [{ match: '^issue list --label pipeline-pause', stdoutJson: [{ number: 7, title: 'pause', url: 'u' }] }];
+  const blocked = await runPreflight({ cwd: repo.dir, env: world(paused, { env: floorEnv(dir) }).env });
+  assert.equal(blocked.warnings.length, 1);
+  assert.equal(blocked.canMerge, false);
+  writeFileSync(join(dir, 'fable.json'), '{ not json');
+  assert.deepEqual((await runPreflight({ cwd: repo.dir, env: world([], { env: floorEnv(dir) }).env })).warnings, []);
 });

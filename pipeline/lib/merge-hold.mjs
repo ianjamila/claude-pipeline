@@ -33,6 +33,7 @@ export const RELEASE_REASONS = Object.freeze({
   'update-conflict': 'Bringing this PR up to date with its base conflicts, so its merge hold is released until the conflict is resolved.',
   'queued-behind': 'An older merge hold of another PR is ahead, so this PR gives up its place and waits.',
   'hold-unreadable': 'The merge hold check could not be read, so this PR gives up its place until it can be.',
+  restart: 'The review stopped until the terminal is restarted, so the merge hold is released.',
 });
 
 const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);

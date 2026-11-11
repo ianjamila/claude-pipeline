@@ -17,6 +17,7 @@ import { decodeFromComment } from '../pipeline/lib/state.mjs';
 import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
 import { reviewEligibilityProblems, rulingsDigest } from '../pipeline/lib/triage.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { floorEnv } from './helpers/floor-env.mjs';
 import { ownerRules, rulingRequest } from './helpers/owner-go.mjs';
 import { applyClaudeRuling, settleSecondReview } from '../pipeline/lib/triage.mjs';
 import { buildSecondReviewPrompt } from '../pipeline/lib/codex.mjs';
@@ -65,7 +66,7 @@ function world(t, { yml = CHAT_YML, slug = 'acme/widgets', comments = false } = 
   const w = {
     repo, base, head, scratch, slug, fake,
     cli(args, env = {}) {
-      const merged = { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...env };
+      const merged = { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...floorEnv(), ...env };
       for (const k of ['PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_TEST_MODE', 'FAKE_CODEX_OUTPUT']) if (!(k in env)) delete merged[k];
       const r = spawnSync(process.execPath, [bin, ...args], { cwd: repo.dir, env: merged, encoding: 'utf8' });
       let json = null;
@@ -260,7 +261,7 @@ function transcript({ prompt, text }) {
     { type: 'user', isSidechain: true, agentId: 'a1', message: { role: 'user', content: prompt }, uuid: 'u-1', timestamp: '2026-10-01T09:00:00.000Z' },
     {
       type: 'assistant', isSidechain: true, agentId: 'a1', requestId: 'req_1', effort: 'high', perTurnEffort: 'high',
-      message: { model: 'claude-fable-5-1', id: 'msg_1', role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text }] },
+      message: { model: 'claude-fable-5-2', id: 'msg_1', role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text }] },
       uuid: 'a-1', timestamp: '2026-10-01T09:00:06.000Z',
     },
   ];
