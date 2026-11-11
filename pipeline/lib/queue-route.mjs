@@ -338,9 +338,10 @@ export function createQueueRoute({
   }
 
   // ---- 1b. the branch's own merge script ----------------------------------------------------------------------------------------------
-  // A custom merge.command runs the PR BRANCH's code, and a branch made before the queue was switched on may carry a script that does not know it
-  // (eaglewatch #1735: it took "queued" for "merged" and deleted the head branch). The default command enqueues through gh and runs no branch code, so
-  // it is never asked. Not provably newer than the switch-on (or unreadable) = refused, nothing queued, nothing run. -> null | the refusal output.
+  // A custom merge.command runs the PR BRANCH's code, and a branch that lacks the commit which taught the repo's merge script the queue may carry a
+  // script that does not know it (eaglewatch #1735: it took "queued" for "merged" and deleted the head branch). The default command enqueues through gh
+  // and runs no branch code, so it is never asked. Not provably containing the commit the base declares in .claude/merge-queue-aware (or unreadable) =
+  // refused, nothing queued, nothing run. -> null | the refusal output.
   // `closeRecord`: a live record (a re-queue after a removal) ends 'blocked' with the hold put back, as every other unmerged end does; the sweep's
   // re-queue leaves that to settleRecord, which ends the record on the { ok: false } it gets back.
   async function branchPredatesQueue({ closeRecord: ends = true } = {}) {
@@ -349,7 +350,7 @@ export function createQueueRoute({
     if (!state.needed) return null;
     const holdFields = ends && liveRecord() !== null ? await terminal('blocked') : {};
     return refusal('queue-branch-predates-switch', [predatesQueueMessage({ pr, state })], {
-      queued: false, branchState: state.kind, switchedOn: state.switchedOn, mergeBaseAt: state.mergeBaseAt, ...holdFields,
+      queued: false, branchState: state.kind, queueAwareSha: state.queueAwareSha, ...holdFields,
     });
   }
 

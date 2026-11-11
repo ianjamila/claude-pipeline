@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
-import { BASE_SHA, MERGE_SHA, PR, bump, cli, scenario, ymlFor } from './helpers/gate-env.mjs';
+import { BASE_SHA, MERGE_SHA, PR, QUEUE_AWARE_SHA, bump, cli, scenario, ymlFor } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { holdFiles, holdYml, holdCalls } from './helpers/merge-hold-env.mjs';
@@ -344,7 +344,7 @@ test('crash window: an attempt on the record whose enqueue never reached GitHub 
 });
 
 test('default merge.command is replaced by the pinned enqueue; a custom command runs as written (and must enqueue)', () => {
-  const custom = world({ command: 'node scripts/fake-enqueue.mjs {pr} {sha}', after: [[Q(), M()]] });
+  const custom = world({ command: 'node scripts/fake-enqueue.mjs {pr} {sha}', gh: { queueAware: QUEUE_AWARE_SHA }, after: [[Q(), M()]] });
   const r = custom.run();
   assertExit(r, 0);
   assert.equal(r.json.merged, true);
@@ -359,7 +359,7 @@ test('default merge.command is replaced by the pinned enqueue; a custom command 
   assert.deepEqual(def.mergeCalls(), []);
 });
 test('enqueue-failed: the repo command exits 1 and nothing is queued; the built-in enqueue refused (stale head): the last output lines are reported, the attempt is not counted', () => {
-  const bad = world({ command: 'node scripts/fake-enqueue.mjs {pr} {sha}', after: [], env: { FAKE_ENQUEUE_FAIL: '1' } });
+  const bad = world({ command: 'node scripts/fake-enqueue.mjs {pr} {sha}', gh: { queueAware: QUEUE_AWARE_SHA }, after: [], env: { FAKE_ENQUEUE_FAIL: '1' } });
   const r = bad.run();
   assertExit(r, 1);
   assert.equal(r.json.error, 'enqueue-failed');

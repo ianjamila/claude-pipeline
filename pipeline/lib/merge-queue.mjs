@@ -35,59 +35,63 @@ export function queueModeFor({ gh, pr }) {
   return { queue: state.enabled === true, state };
 }
 
-// ---- a branch made before the queue was switched on ------------------------------------------------------------------------------------
-// A repo's own merge command (merge.command, run from the PR's worktree) is the PR BRANCH's code. A branch cut before the queue existed carries
-// a script that does not know it: it "merges" directly, GitHub queues the PR instead, the old script reads that as merged and runs its
-// after-merge cleanup (it deleted the head branch of eaglewatch #1735, and GitHub closed the PR). The repo's own config cannot guard this,
-// because an old branch also carries the old config. So the pipeline asks GitHub WHEN the queue was switched on and whether the branch was made
-// before that.
+// ---- a branch that does not hold the commit that taught the merge script the queue --------------------------------------------------------
+// A repo's own merge command (merge.command, run from the PR's worktree) is the PR BRANCH's code. A branch whose script does not know the queue
+// "merges" directly, GitHub queues the PR instead, the old script reads that as merged and runs its after-merge cleanup (it deleted the head
+// branch of eaglewatch #1735, and GitHub closed the PR). The repo's own config on the branch cannot guard this, because an old branch also carries
+// the old config. So the question is not WHEN the queue was switched on but whether the PR's branch contains the commit that made the merge script
+// queue-aware, and the BASE branch is what says which commit that is: the plain file `.claude/merge-queue-aware` (first line that is not a `#`
+// comment = the full 40-hex sha), read from the base branch through GitHub (never from the branch itself or the local checkout). Then GitHub's
+// compare answers whether that sha is an ancestor of the PR head (status ahead | identical = contained; behind | diverged = not). It is a file of its
+// own, not a pipeline.yml key, because the config rejects keys it does not know: a new key would break every installed pipeline on rollout.
 //
-// The switch-on time is the created_at of the ruleset that holds the merge_queue rule (rule.ruleset_id -> gh.ruleset). Not updated_at: a settings
-// edit (a wait time, a method) is not a switch-on, and would make every branch older than the edit look old. A queue switched off and on again
-// is a new ruleset, hence a new created_at: right, since the repo's script may have been taught the queue between the two.
-// "The branch was made before" = the merge base of the PR head and the base branch (the commit it left the base at) is older than that, by its
-// committer date from GitHub's compare. A branch that is not behind its base at all has the base's whole history, so there is nothing a catch-up could
-// add and it never counts as old (the merge base is the base tip itself).
-//
-// -> { needed, kind: 'current' | 'predates' | 'unknown', why, switchedOn, mergeBaseAt, behindBy }. Never throws; every read that fails or answers
-// nothing usable is 'unknown' (callers: P merge refuses, P update-branch catches up anyway - an update is harmless).
-export function queueRulesetIdOf(rules) {
-  const rule = Array.isArray(rules) ? rules.find((r) => r?.type === 'merge_queue') : undefined;
-  const id = rule?.ruleset_id;
-  return Number.isInteger(id) && id > 0 ? id : null;
+// -> { needed, kind: 'current' | 'predates' | 'unknown', why, queueAwareSha, unreadable }. Never throws. `unknown` = the base declares no usable commit
+// (no file, not a sha) or a read failed; `unreadable: true` is the second kind only: a read that THREW (a GitHub blip) may well succeed next time, a
+// missing or malformed marker will not. Callers that can wait (a re-queue) keep the record on an unreadable read; every caller refuses on `needed`.
+export const QUEUE_AWARE_FILE = '.claude/merge-queue-aware';
+
+// The sha a marker file declares: the first line that is neither empty nor a `#` comment, which must be a full sha. -> string | null.
+export function parseQueueAwareMarker(text) {
+  for (const raw of String(text ?? '').replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    return /^[0-9a-f]{40}$/i.test(line) ? line.toLowerCase() : null;
+  }
+  return null;
 }
 
 export function queueCatchUpState({ gh, branch, head }) {
-  const reply = (kind, why, extra = {}) => ({ needed: kind !== 'current', kind, why, switchedOn: null, mergeBaseAt: null, behindBy: null, ...extra });
+  const reply = (kind, why, extra = {}) => ({ needed: kind !== 'current', kind, why, queueAwareSha: null, unreadable: false, ...extra });
   const oneLine = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 200);
-  let base;
+  const notFound = (err) => /HTTP 404/.test(String(err?.stderr ?? err?.message ?? err));
+  let marker;
   try {
-    if (typeof gh?.mergeBaseOf !== 'function') throw new Error('this GitHub client cannot read the merge base');
-    base = gh.mergeBaseOf(branch, head);
+    if (typeof gh?.fileAt !== 'function') throw new Error('this GitHub client cannot read a file of the base branch');
+    marker = gh.fileAt(QUEUE_AWARE_FILE, branch);
   } catch (err) {
-    return reply('unknown', `the commit ${String(head).slice(0, 12)} was compared with ${branch} on GitHub but the merge base could not be read (${oneLine(err)})`);
+    return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} could not be read (${oneLine(err)})`, { unreadable: true });
   }
-  if (base.behindBy === 0) return reply('current', `the branch already holds every commit of ${branch}`, { mergeBaseAt: base.committedAt, behindBy: 0 });
-  let switchedOn;
+  if (marker?.found !== true) return reply('unknown', `${branch} declares no commit that taught the merge script about the queue (${QUEUE_AWARE_FILE} is missing on ${branch})`);
+  const sha = parseQueueAwareMarker(marker.text);
+  if (sha === null) return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} does not start with a full commit sha`);
+  let rel;
   try {
-    if (typeof gh?.ruleset !== 'function') throw new Error('this GitHub client cannot read rulesets');
-    const id = queueRulesetIdOf(gh.branchRules(branch));
-    if (id === null) throw new Error(`the merge_queue rule of ${branch} names no ruleset`);
-    switchedOn = gh.ruleset(id).createdAt;
+    if (typeof gh?.compare !== 'function') throw new Error('this GitHub client cannot compare commits');
+    rel = gh.compare(sha, head);
   } catch (err) {
-    return reply('unknown', `when the merge queue was switched on could not be read (${oneLine(err)})`, { mergeBaseAt: base.committedAt, behindBy: base.behindBy });
+    if (notFound(err)) return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} names ${sha.slice(0, 12)}, which GitHub does not know`, { queueAwareSha: sha });
+    return reply('unknown', `the commit ${sha.slice(0, 12)} could not be compared with ${String(head).slice(0, 12)} on GitHub (${oneLine(err)})`, { queueAwareSha: sha, unreadable: true });
   }
-  const extra = { switchedOn, mergeBaseAt: base.committedAt, behindBy: base.behindBy };
-  if (Date.parse(base.committedAt) < Date.parse(switchedOn)) return reply('predates', `the branch left ${branch} at ${base.sha.slice(0, 12)} (${base.committedAt}), before the merge queue was switched on (${switchedOn})`, extra);
-  return reply('current', `the branch left ${branch} after the merge queue was switched on`, extra);
+  if (rel?.status === 'ahead' || rel?.status === 'identical') return reply('current', `the branch contains ${sha.slice(0, 12)}, the commit that taught the merge script about the queue`, { queueAwareSha: sha });
+  if (rel?.status === 'behind' || rel?.status === 'diverged') return reply('predates', `the branch does not contain ${sha.slice(0, 12)}, the commit that taught the merge script about the queue (compare: ${rel.status})`, { queueAwareSha: sha });
+  return reply('unknown', `GitHub's comparison of ${sha.slice(0, 12)} with the branch answered ${JSON.stringify(rel?.status ?? null)}`, { queueAwareSha: sha, unreadable: true });
 }
 
 // The refusal text of P merge for a branch whose merge script may not know the queue (kind predates | unknown).
 export function predatesQueueMessage({ pr, state }) {
-  const day = (iso) => String(iso).slice(0, 10);
   const lead = state.kind === 'predates'
-    ? `PR #${pr}'s branch was made on ${day(state.mergeBaseAt)}, before the merge queue was switched on (${day(state.switchedOn)}), so the merge script on the branch may not know about the queue`
-    : `PR #${pr}'s branch cannot be shown to be newer than the merge queue (${state.why}), so the merge script on the branch may not know about the queue`;
+    ? `PR #${pr}'s branch does not contain ${state.queueAwareSha.slice(0, 12)}, the commit that taught the merge script about the merge queue (the base branch declares it in ${QUEUE_AWARE_FILE}), so the merge script on the branch may not know about the queue`
+    : `PR #${pr}'s branch cannot be shown to contain the commit that taught the merge script about the merge queue (${state.why}; the base branch declares that commit, a full sha, in ${QUEUE_AWARE_FILE}), so the merge script on the branch may not know about the queue`;
   return `${lead}: it could take the queue's "queued" answer for "merged" and delete the branch. Nothing was queued and the merge command was not run. Catch the branch up first: \`P update-branch --pr ${pr}\` from the PR's own worktree, run a review round (base-only), \`P review-complete\`, then ask the owner again.`;
 }
 

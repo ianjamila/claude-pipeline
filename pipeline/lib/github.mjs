@@ -323,28 +323,20 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       return { status: body.status ?? null, behindBy: body.behind_by, aheadBy: body.ahead_by, baseSha: body.base };
     },
 
-    // Where the branch left the base, from GitHub itself: the merge base of base...head (the newest commit both share), its committer
-    // date, and how far head is behind base. A separate read from compare(): that one's reply shape is fixed. Any field GitHub does not
-    // answer is a GhError (the caller reads that as "unknown" and fails closed).
-    mergeBaseOf(base, head) {
-      const args = ['api', `repos/${self.repo().slug}/compare/${encodePath(base)}...${encodeURIComponent(head)}?per_page=1`,
-        '--jq', '{behind_by: .behind_by, sha: .merge_base_commit.sha, at: .merge_base_commit.commit.committer.date}'];
-      const body = parse(ok(args), args);
-      const at = typeof body?.at === 'string' ? Date.parse(body.at) : NaN;
-      if (!Number.isInteger(body?.behind_by) || typeof body.sha !== 'string' || !/^[0-9a-f]{40}$/.test(body.sha) || !Number.isFinite(at)) {
-        throw new GhError({ code: 0, stderr: `compare reply has no readable merge base: ${JSON.stringify(body).slice(0, 200)}`, args });
+    // A file of the repository at a ref (a branch, tag or sha), from GitHub's contents API: never the local checkout and never the PR branch unless
+    // that is the ref asked. -> { found: true, text } | { found: false, why } (404: no such file or ref; a directory or a body that is not a base64 file
+    // is "not found" too: there is no file to read). Any other failure (5xx, network, timeout) THROWS: the caller must tell "absent" from "could not look".
+    fileAt(path, ref) {
+      const args = ['api', `repos/${self.repo().slug}/contents/${encodePath(path)}?ref=${encodeURIComponent(ref)}`, '--jq', '[.type, .encoding, .content]'];
+      const r = exec(args);
+      if (r.code !== 0 || r.timedOut) {
+        const known = r.timedOut || r.overBuffer ? null : classifyApiError(r);
+        if (known?.status === 404) return { found: false, why: `${path} does not exist at ${ref}` };
+        throw failure(r, args);
       }
-      return { behindBy: body.behind_by, sha: body.sha, committedAt: new Date(at).toISOString() };
-    },
-
-    // A repository ruleset (the merge_queue branch rule names its ruleset by id). created_at is when THIS ruleset was made: a queue switched
-    // off and on again is a new ruleset. A reply without a readable created_at is a GhError.
-    ruleset(id) {
-      const args = ['api', `repos/${self.repo().slug}/rulesets/${encodeURIComponent(id)}`, '--jq', '{id: .id, created_at: .created_at}'];
-      const body = parse(ok(args), args);
-      const at = typeof body?.created_at === 'string' ? Date.parse(body.created_at) : NaN;
-      if (!Number.isFinite(at)) throw new GhError({ code: 0, stderr: `ruleset ${id} has no readable created_at: ${JSON.stringify(body).slice(0, 200)}`, args });
-      return { id: body.id ?? null, createdAt: new Date(at).toISOString() };
+      const reply = parse(r, args);
+      if (!Array.isArray(reply) || reply[0] !== 'file' || reply[1] !== 'base64' || typeof reply[2] !== 'string') return { found: false, why: `${path} at ${ref} is not a readable file` };
+      return { found: true, text: Buffer.from(reply[2], 'base64').toString('utf8') };
     },
 
     // The parent SHAs of a commit, in order (for a merge commit: first the branch it was made on, then what was merged in).

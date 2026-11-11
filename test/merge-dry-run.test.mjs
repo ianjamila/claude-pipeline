@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { GIT_WRITES, gitCalls, gitSpyEnv } from './helpers/git-spy.mjs';
-import { cli, ghEntries, PR, ymlFor } from './helpers/gate-env.mjs';
+import { cli, ghEntries, PR, QUEUE_AWARE_SHA, ymlFor } from './helpers/gate-env.mjs';
 import { RUN, ciRow, setup, ymlWith } from './helpers/ci-proof-env.mjs';
 import { ciEntries, okGate } from './helpers/ci-proof-merge-env.mjs';
 import { scenario } from './helpers/gate-env.mjs';
@@ -448,9 +448,9 @@ const queueReply = (s, pr) => ({ match: 'QueueState', stdoutJson: { data: { repo
 const queued = (s, position = 3) => queueReply(s, { state: 'OPEN', mergeCommit: null, mergeQueueEntry: { id: 'MQE_1', state: 'QUEUED', position, enqueuedAt: '2026-11-09T01:00:00Z', headCommit: null } });
 const mergedState = (s) => queueReply(s, { state: 'MERGED', mergeCommit: { oid: 'c'.repeat(40) }, mergeQueueEntry: null });
 
-// The merge queue was switched on 2026-11-05; the fake's merge base is dated 2026-01-01 unless a test says otherwise.
-const SWITCHED_ON = '2026-11-05T10:00:00Z';
-const CURRENT = { queueSince: '2025-12-01T00:00:00Z' }; // a switch-on before the branch's merge base: a branch made after it
+// The base declares the commit that taught the merge script the queue (.claude/merge-queue-aware = QUEUE_AWARE_SHA): CURRENT = the PR head contains it, PREDATES = it does not.
+const CURRENT = { queueAware: QUEUE_AWARE_SHA };
+const PREDATES = { queueAware: QUEUE_AWARE_SHA, queueAwareIn: false };
 
 test('dry run --owner-go, queue ON, branch BEHIND: queue:true, no behind-base blocker, ownerStep.queueNote (exact), no behindNote; nothing is written', () => {
   const s = scenario({ report: null, state: null });
@@ -470,7 +470,7 @@ test('dry run --owner-go, queue ON, branch BEHIND: queue:true, no behind-base bl
   noGitWrites(d);
 });
 
-test('dry run (gate mode), queue ON and behind (compare shows lacking commits): no behind-base blocker, queueNote set, the base is compared only for its merge base', () => {
+test('dry run (gate mode), queue ON and behind (compare shows lacking commits): no behind-base blocker, queueNote set, the base is compared only for the marker commit', () => {
   const s = setup({});
   s.fake.setScript(script(s));
   assertExit(s.gate(), 0);
@@ -482,24 +482,24 @@ test('dry run (gate mode), queue ON and behind (compare shows lacking commits): 
   assert.equal(d.r.json.queue, true);
   assert.deepEqual(d.r.json.blockers, []);
   assert.equal(d.r.json.ownerStep.queueNote, QUEUE_NOTE);
-  // (no behind-base verdict: the queue builds on the current base. The one compare read is the merge base the queue-branch-predates-switch check needs for a custom merge command.)
-  assert.equal(d.calls.filter((l) => /compare\//.test(l)).length, 1, 'the base is compared once, for the merge base');
+  // (no behind-base verdict: the queue builds on the current base. The one compare read is the marker commit against the head, which the queue-branch-predates-switch check needs for a custom merge command.)
+  assert.equal(d.calls.filter((l) => /compare\//.test(l)).length, 1, 'the marker commit is compared with the head once, nothing else');
 });
 
-test('dry run --owner-go, queue ON, custom merge command, branch PREDATES the switch-on: a queue-branch-predates-switch blocker (no merge is asked for); nothing is written', () => {
+test('dry run --owner-go, queue ON, custom merge command, branch lacks the commit the base declares in .claude/merge-queue-aware: a queue-branch-predates-switch blocker (no merge is asked for); nothing is written', () => {
   const s = scenario({ report: null, state: null });
-  s.fake.setScript(script(s, { behindBy: 2, gh: { queue: true, queueSince: SWITCHED_ON, mergeBaseAt: '2026-10-20T08:00:00Z' } }));
+  s.fake.setScript(script(s, { behindBy: 2, gh: { queue: true, ...PREDATES } }));
   const d = dry(s, ['--owner-go']);
   assertExit(d.r, 1, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.wouldMerge, false);
   assert.deepEqual(kinds(d.r), ['queue-branch-predates-switch']);
-  assert.match(d.r.json.blockers[0].detail, /before the merge queue was switched on \(2026-11-05\).*P update-branch --pr 12/s);
+  assert.match(d.r.json.blockers[0].detail, /does not contain 555555555555, the commit that taught the merge script about the merge queue.*P update-branch --pr 12/s);
   assert.deepEqual(d.writes, []);
   assert.deepEqual(s.mergeCalls(), []);
   noGitWrites(d);
 });
 
-test('dry run (gate mode), queue ON, custom merge command, switch-on time UNKNOWN: the same blocker (fail closed)', () => {
+test('dry run (gate mode), queue ON, custom merge command, the base declares no .claude/merge-queue-aware: the same blocker (fail closed)', () => {
   const s = setup({});
   s.fake.setScript(script(s));
   assertExit(s.gate(), 0);
@@ -507,12 +507,12 @@ test('dry run (gate mode), queue ON, custom merge command, switch-on time UNKNOW
   const d = dry(s);
   assertExit(d.r, 1, `${d.r.stderr}${d.r.stdout}`);
   assert.deepEqual(kinds(d.r), ['queue-branch-predates-switch']);
-  assert.match(d.r.json.blockers[0].detail, /cannot be shown to be newer than the merge queue/);
+  assert.match(d.r.json.blockers[0].detail, /cannot be shown to contain the commit that taught the merge script about the merge queue.*merge-queue-aware is missing/s);
 });
 
 test('dry run --owner-go, queue ON, DEFAULT merge command: never checked, so an old branch is no blocker (gh enqueues; no branch code runs)', () => {
   const s = scenario({ report: null, state: null, yml: ymlFor().replace(/ {2}command: .*\n/, '') });
-  s.fake.setScript(script(s, { behindBy: 2, gh: { queue: true, queueSince: SWITCHED_ON, mergeBaseAt: '2026-10-20T08:00:00Z' } }));
+  s.fake.setScript(script(s, { behindBy: 2, gh: { queue: true, ...PREDATES } }));
   const d = dry(s, ['--owner-go']);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.wouldMerge, true);
@@ -573,7 +573,7 @@ test('dry run --owner-go with merge.hold_* keys: queue OFF reports a hold ahead;
   assert.ok('holds' in o.r.json);
 
   const on = scenario({ yml: holdYml(), baseFiles: holdFiles, report: null, state: null });
-  on.fake.setScript(script(on, { gh: { queue: true } }));
+  on.fake.setScript(script(on, { gh: { queue: true, ...CURRENT } }));
   const d = dry(on, ['--owner-go'], ahead);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.queue, true);

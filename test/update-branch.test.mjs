@@ -9,7 +9,7 @@ import { createGitHub } from '../pipeline/lib/github.mjs';
 import { bringUpToDate, updateTiming } from '../pipeline/lib/updatebranch.mjs';
 import { readSuccessor } from '../pipeline/lib/merge-hold.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
-import { cli, scenario, ghEntries, PR, BASE_SHA } from './helpers/gate-env.mjs';
+import { cli, scenario, ghEntries, PR, BASE_SHA, QUEUE_AWARE_SHA } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { holdCalls, holdFiles, holdYml } from './helpers/merge-hold-env.mjs';
 
@@ -570,14 +570,12 @@ test('a "no checks reported" error that was cut at the buffer limit propagates i
 
 // ---- queue mode: the merge queue tests the PR on top of the current base itself, so a moved base needs no catch-up ------------------
 
-// The queue was switched on 2026-11-05. A branch whose merge base is older than that may carry a merge script that does not know the queue (P merge
-// refuses it: queue-branch-predates-switch), so update-branch catches it up; a newer branch keeps the no-op answer.
-const SWITCHED_ON = '2026-11-05T10:00:00Z';
-const OLD_BASE = '2026-10-20T08:00:00Z';
-const NEW_BASE = '2026-11-08T08:00:00Z';
+// The base declares the commit that taught the merge script the queue (.claude/merge-queue-aware = QUEUE_AWARE_SHA). A branch that does not contain it may carry a
+// merge script that does not know the queue (P merge refuses it: queue-branch-predates-switch), so update-branch catches it up; one that contains it keeps the no-op answer.
+const QA = { queueAware: QUEUE_AWARE_SHA };
 
-test('update-branch, queue ON and the branch is behind but made after the switch-on: outcome queue-mode, updated:false, exit 0, no PUT', () => {
-  const s = scenario({ gh: { behindBy: 2, queue: true, queueSince: SWITCHED_ON, mergeBaseAt: NEW_BASE } });
+test('update-branch, queue ON and the branch is behind but contains the marker commit: outcome queue-mode, updated:false, exit 0, no PUT', () => {
+  const s = scenario({ gh: { behindBy: 2, queue: true, ...QA } });
   const r = updateCli(s);
   assertExit(r, 0, r.stdout);
   assert.equal(r.json.ok, true);
@@ -585,20 +583,20 @@ test('update-branch, queue ON and the branch is behind but made after the switch
   assert.equal(r.json.updated, false);
   assert.equal(r.json.head, s.head);
   assert.deepEqual(puts(s), []);
-  assert.equal(s.fake.lines().filter((l) => l.includes('compare/')).length, 1, 'the base is compared once, for the merge base only');
+  assert.equal(s.fake.lines().filter((l) => l.includes('compare/')).length, 1, 'only the marker commit is compared with the head');
 });
 
-test('update-branch, queue ON and the branch PREDATES the switch-on: it is caught up like a behind PR (one PUT, expected_head_sha), reported as queueCatchUp, and no hold is taken', () => {
-  const s = scenario({ yml: holdYml(), baseFiles: holdFiles, gh: { behindBy: 2, queue: true, queueSince: SWITCHED_ON, mergeBaseAt: OLD_BASE } });
+test('update-branch, queue ON and the branch does NOT contain the marker commit: it is caught up like a behind PR (one PUT, expected_head_sha), reported as queueCatchUp, and no hold is taken', () => {
+  const s = scenario({ yml: holdYml(), baseFiles: holdFiles, gh: { behindBy: 2, queue: true, ...QA, queueAwareIn: false } });
   const newHead = 'd'.repeat(40);
-  const swap = swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 0, queue: true, queueSince: SWITCHED_ON, mergeBaseAt: NEW_BASE, commitParents: { [newHead]: [s.head, BASE_SHA] } }));
+  const swap = swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 0, queue: true, ...QA, commitParents: { [newHead]: [s.head, BASE_SHA] } }));
   const r = updateCli(s, [], { PIPELINE_UPDATE_WAIT_MS: '2000', ...swap });
   assertExit(r, 0, r.stdout);
   assert.equal(r.json.ok, true);
   assert.equal(r.json.outcome, 'up-to-date');
   assert.equal(r.json.updated, true);
   assert.equal(r.json.queueCatchUp, true);
-  assert.match(r.json.queueCatchUpWhy, /before the merge queue was switched on/);
+  assert.match(r.json.queueCatchUpWhy, /does not contain 555555555555, the commit that taught the merge script about the queue/);
   assert.equal(r.json.head, newHead);
   assert.equal(r.json.pullNeeded, true);
   assert.equal(puts(s).length, 1);
@@ -607,41 +605,44 @@ test('update-branch, queue ON and the branch PREDATES the switch-on: it is caugh
   assert.equal('hold' in r.json, false);
 });
 
-test('update-branch, queue ON and the switch-on time is UNKNOWN: it still catches up (an update is harmless; the remedy is never refused)', () => {
+test('update-branch, queue ON and the base declares no marker commit: it still catches up (an update is harmless; the remedy is never refused)', () => {
   const s = scenario({ gh: { behindBy: 2, queue: true } });
   const r = updateCli(s);
   assert.notEqual(r.json.outcome, 'queue-mode');
   assert.equal(r.json.queueCatchUp, true);
-  assert.match(r.json.queueCatchUpWhy, /could not be read/);
+  assert.match(r.json.queueCatchUpWhy, /merge-queue-aware is missing/);
   assert.equal(puts(s).length, 1);
 });
 
-test('update-branch, queue ON, the merge base is unreadable: catches up too', () => {
-  const s = scenario({ gh: { behindBy: 2, queue: true, queueSince: SWITCHED_ON, mergeBaseAt: null } });
-  const r = updateCli(s);
-  assert.equal(r.json.queueCatchUp, true);
-  assert.equal(puts(s).length, 1);
+test('update-branch, queue ON, the marker or the ancestry compare is unreadable: catches up too', () => {
+  for (const gh of [{ queueAwareFile: 'error' }, { ...QA, queueAwareIn: 'error' }]) {
+    const s = scenario({ gh: { behindBy: 2, queue: true, ...gh } });
+    const r = updateCli(s);
+    assert.equal(r.json.queueCatchUp, true, JSON.stringify(gh));
+    assert.equal(puts(s).length, 1, JSON.stringify(gh));
+  }
 });
 
-test('update-branch, queue ON, a branch that already holds the whole base: queue-mode, nothing to update', () => {
-  const s = scenario({ gh: { behindBy: 0, queue: true, queueSince: SWITCHED_ON, mergeBaseAt: OLD_BASE } });
+test('update-branch, queue ON, a branch at the base tip that DOES contain the marker commit: queue-mode, nothing to update', () => {
+  const s = scenario({ gh: { behindBy: 0, queue: true, ...QA } });
   const r = updateCli(s);
   assertExit(r, 0, r.stdout);
   assert.equal(r.json.outcome, 'queue-mode');
   assert.deepEqual(puts(s), []);
 });
 
-test('mergeBaseOf / ruleset: read the merge base (sha, committer date, behind_by) and a ruleset\'s created_at from GitHub; anything unreadable throws', () => {
-  const { fake, gh } = mk([{ match: 'compare/main\\.\\.\\.', stdoutJson: { behind_by: 3, sha: BASE_SHA, at: '2026-10-20T08:00:00Z' } }]);
-  assert.deepEqual(gh.mergeBaseOf('main', A), { behindBy: 3, sha: BASE_SHA, committedAt: '2026-10-20T08:00:00.000Z' });
-  assert.match(fake.lines().find((l) => l.includes('compare')), new RegExp(`repos/acme/widgets/compare/main\\.\\.\\.${A}`));
-  for (const bad of [{ behind_by: 3, sha: BASE_SHA }, { behind_by: 3, sha: BASE_SHA, at: 'soon' }, { sha: BASE_SHA, at: '2026-10-20T08:00:00Z' }, { behind_by: 1, sha: 'abc', at: '2026-10-20T08:00:00Z' }]) {
-    assert.throws(() => mk([{ match: 'compare/', stdoutJson: bad }]).gh.mergeBaseOf('main', A), GhError, JSON.stringify(bad));
+test('fileAt: reads a file of the repository at a ref from GitHub (base64 contents); 404 and a non-file are "not found"; every other failure throws', () => {
+  const text = `# marker\n${A}\n`;
+  const { fake, gh } = mk([{ match: 'contents/.claude/merge-queue-aware', stdoutJson: ['file', 'base64', Buffer.from(text).toString('base64')] }]);
+  assert.deepEqual(gh.fileAt('.claude/merge-queue-aware', 'release/1'), { found: true, text });
+  assert.match(fake.lines().find((l) => l.includes('contents')), /repos\/acme\/widgets\/contents\/\.claude\/merge-queue-aware\?ref=release%2F1/);
+  assert.equal(mk([{ match: 'contents/', code: 1, stderr: 'gh: Not Found (HTTP 404)' }]).gh.fileAt('.claude/merge-queue-aware', 'main').found, false);
+  for (const odd of [['dir', null, null], ['file', 'none', 'x'], ['file', 'base64', 7], { type: 'file' }]) {
+    assert.equal(mk([{ match: 'contents/', stdoutJson: odd }]).gh.fileAt('x', 'main').found, false, JSON.stringify(odd));
   }
-  const rs = mk([{ match: 'repos/acme/widgets/rulesets/77', stdoutJson: { id: 77, created_at: '2026-11-05T10:00:00Z' } }]);
-  assert.deepEqual(rs.gh.ruleset(77), { id: 77, createdAt: '2026-11-05T10:00:00.000Z' });
-  assert.throws(() => mk([{ match: 'rulesets/77', stdoutJson: { id: 77 } }]).gh.ruleset(77), GhError, 'no created_at');
-  assert.throws(() => mk([{ match: 'rulesets/77', code: 1, stderr: 'HTTP 404' }]).gh.ruleset(77), GhError);
+  for (const stderr of ['gh: Server Error (HTTP 502)', 'gh: HTTP 403: Resource not accessible', 'dial tcp: i/o timeout']) {
+    assert.throws(() => mk([{ match: 'contents/', code: 1, stderr }]).gh.fileAt('x', 'main'), GhError, stderr);
+  }
 });
 
 test('update-branch, queue state UNREADABLE: refuses (exit 1 queue-unreadable), never updates', () => {
