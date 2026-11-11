@@ -610,7 +610,7 @@ test('update-branch, queue ON and the base declares no usable marker (missing | 
     ['no file', {}, /merge-queue-aware is missing/],
     ['a malformed marker', { queueAware: 'soon' }, /does not start with a full commit sha/],
     ['a commit the base itself does not contain', { ...QA, queueAwareIn: false, queueAwareOnBase: false }, /names 555555555555, which is not on main: fix the marker/],
-    ['a commit GitHub does not know', { ...QA, queueAwareIn: 'unknown' }, /names 555555555555, which GitHub does not know/],
+    ['a commit GitHub does not know', { ...QA, queueAwareIn: 'unknown', queueAwareOnBase: 'unknown' }, /names 555555555555, which GitHub does not know/],
   ]) {
     const s = scenario({ gh: { behindBy: 2, queue: true, ...gh } });
     const r = updateCli(s);
@@ -622,6 +622,18 @@ test('update-branch, queue ON and the base declares no usable marker (missing | 
     assert.match(r.json.message, /added or fixed/, why);
     assert.deepEqual(puts(s), [], why);
   }
+});
+
+test('update-branch, queue ON, a head GitHub does not have (an unpushed local HEAD: the compare 404s while the base HAS the marker commit): queue-unreadable (exit 1), the message says push the head and NOT that the marker is broken, NO PUT', () => {
+  const s = scenario({ gh: { behindBy: 2, queue: true, ...QA, queueAwareIn: 'unknown' } });
+  const r = updateCli(s);
+  assertExit(r, 1, r.stdout);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.outcome, 'queue-unreadable');
+  assert.equal(r.json.updated, false);
+  assert.match(r.json.message, new RegExp(`head ${s.head.slice(0, 12)} is not on GitHub: push it first`));
+  assert.doesNotMatch(r.json.message, /marker|try again/);
+  assert.deepEqual(puts(s), []);
 });
 
 test('update-branch, queue ON, the marker or the ancestry compare is unreadable (a GitHub blip): queue-unreadable (exit 1, retry later), NO PUT', () => {

@@ -111,7 +111,7 @@ test('queueCatchUpState: no usable marker is unknown and structural (unreadable 
     ['no file on the base', { marker: NO_FILE }],
     ['an empty file', { marker: '' }],
     ['a file with a short sha', { marker: 'abc1234\n' }],
-    ['a marker commit GitHub does not know (compare 404)', { rel: http(404) }],
+    ['a marker commit GitHub does not know (both compares 404)', { rel: http(404), relBase: http(404) }],
   ];
   for (const [why, over] of structural) {
     const r = queueCatchUpState({ gh: stub(over), branch: 'main', head: H });
@@ -223,6 +223,32 @@ test('4b. predatesQueueMessage: only a predating branch is sent to P update-bran
   assert.doesNotMatch(blip, /update-branch/);
 });
 
+test('4d. a 404 on the head compare is not always the marker fault: when the BASE has the marker commit the head is the unknown side (not pushed): unreadable-style, "push it first", never "fix the marker", never a catch-up', async () => {
+  const gh = stub({ rel: http(404), relBase: 'ahead' });
+  const r = queueCatchUpState({ gh, branch: 'main', head: H });
+  assert.deepEqual([r.needed, r.kind, r.unreadable, r.headUnknown, r.queueAwareSha], [true, 'unknown', true, true, QA]);
+  assert.match(r.why, /head aaaaaaaaaaaa is not on GitHub: push it first/);
+  assert.doesNotMatch(r.why, /marker/);
+  assert.deepEqual(gh.calls, ['fileAt .claude/merge-queue-aware main', `compare ${QA.slice(0, 8)} ${H.slice(0, 8)}`, `compare ${QA.slice(0, 8)} main`], 'one more compare, of the marker sha with the base');
+  const msg = predatesQueueMessage({ pr: 7, state: r });
+  assert.match(msg, /push/);
+  assert.doesNotMatch(msg, /update-branch|add or fix the marker|try again in a minute/);
+  // the base lacks the sha as well as GitHub answering 404 for the head: the marker is still the culprit
+  const both = queueCatchUpState({ gh: stub({ rel: http(404), relBase: 'diverged' }), branch: 'main', head: H });
+  assert.deepEqual([both.kind, both.unreadable, both.headUnknown ?? false], ['unknown', false, false]);
+  assert.match(both.why, /which is not on main: fix the marker/);
+  // a blip on the base compare is still a blip
+  const blip = queueCatchUpState({ gh: stub({ rel: http(404), relBase: new Error('HTTP 502') }), branch: 'main', head: H });
+  assert.deepEqual([blip.kind, blip.unreadable, blip.headUnknown ?? false], ['unknown', true, false]);
+  // fail closed on the route: nothing is enqueued or run
+  const root = repoDir();
+  const g2 = stub({ rel: http(404), relBase: 'ahead' });
+  const res = await routeFor(root, g2, customConfig()).enqueueAndWatch();
+  assert.equal(res.output.error, 'queue-unreadable');
+  assert.equal(ran(root), false);
+  assert.deepEqual(writes(g2), []);
+});
+
 test('5. a branch at the base tip gets no shortcut: when the ancestry says it lacks the marker commit it predates (the base has it)', async () => {
   const root = repoDir();
   const gh = stub({ rel: 'diverged' });
@@ -309,7 +335,7 @@ test('9. the in-process re-queue whose marker / ancestry read THROWS is queue-un
 });
 
 test('10. a re-queue where the base declares NO usable marker (structural, not a blip) still ends the record blocked and puts the hold back', async () => {
-  for (const [why, over] of [['no file', { marker: NO_FILE }], ['a malformed marker', { marker: 'soon\n' }], ['a marker commit GitHub does not know', { rel: http(404) }]]) {
+  for (const [why, over] of [['no file', { marker: NO_FILE }], ['a malformed marker', { marker: 'soon\n' }], ['a marker commit GitHub does not know', { rel: http(404), relBase: http(404) }]]) {
     const root = repoDir();
     openRecord(root, PR, H, APPROVAL, { ...IDENT, route: 'owner-go' });
     setHold(root, PR, HOLD);

@@ -46,7 +46,7 @@ export function queueModeFor({ gh, pr }) {
 // own, not a pipeline.yml key, because the config rejects keys it does not know: a new key would break every installed pipeline on rollout.
 //
 // -> { needed, kind: 'current' | 'predates' | 'unknown', why, queueAwareSha, unreadable }. Never throws. `unknown` = the base declares no usable commit
-// (no file, not a sha, a sha GitHub does not know or one the base itself does not contain) or a read failed; `unreadable: true` is the second kind only: a read that THREW (a GitHub blip) may well succeed next time, a
+// (no file, not a sha, a sha GitHub does not know or one the base itself does not contain) or a read failed; a head GitHub does not have (an unpushed local head: a 404 on the compare while the base has the sha) is unreadable with `headUnknown: true` (push it first, never a marker fix); `unreadable: true` is the second kind only: a read that THREW (a GitHub blip) may well succeed next time, a
 // missing or malformed marker will not. merge and the sweep answer queue-unreadable on an unreadable read (any record is kept) and refuse on every other `needed`; update-branch catches up only for `predates`.
 export const QUEUE_AWARE_FILE = '.claude/merge-queue-aware';
 
@@ -79,7 +79,23 @@ export function queueCatchUpState({ gh, branch, head }) {
     if (typeof gh?.compare !== 'function') throw new Error('this GitHub client cannot compare commits');
     rel = gh.compare(sha, head);
   } catch (err) {
-    if (notFound(err)) return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} names ${sha.slice(0, 12)}, which GitHub does not know`, { queueAwareSha: sha });
+    if (notFound(err)) {
+      // GitHub answers 404 for a compare when EITHER side is unknown to it, so the marker is not necessarily the culprit: an unpushed local head (update-branch and the
+      // dry run pass the worktree's own HEAD) 404s just the same. One more read tells them apart: if the base has the marker commit, the HEAD is the unknown side.
+      let onBase;
+      try {
+        onBase = gh.compare(sha, branch);
+      } catch (err2) {
+        if (notFound(err2)) return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} names ${sha.slice(0, 12)}, which GitHub does not know`, { queueAwareSha: sha });
+        return reply('unknown', `the commit ${sha.slice(0, 12)} could not be compared with ${branch} on GitHub (${oneLine(err2)})`, { queueAwareSha: sha, unreadable: true });
+      }
+      if (onBase?.status === 'ahead' || onBase?.status === 'identical') {
+        // Fail closed, and not the base's to fix: push the head (or correct --expect-head) and ask again, so it is unreadable-style (retry), never a catch-up.
+        return reply('unknown', `head ${String(head).slice(0, 12)} is not on GitHub: push it first`, { queueAwareSha: sha, unreadable: true, headUnknown: true });
+      }
+      if (onBase?.status === 'behind' || onBase?.status === 'diverged') return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} names ${sha.slice(0, 12)}, which is not on ${branch}: fix the marker`, { queueAwareSha: sha });
+      return reply('unknown', `GitHub's comparison of ${sha.slice(0, 12)} with ${branch} answered ${JSON.stringify(onBase?.status ?? null)}`, { queueAwareSha: sha, unreadable: true });
+    }
     return reply('unknown', `the commit ${sha.slice(0, 12)} could not be compared with ${String(head).slice(0, 12)} on GitHub (${oneLine(err)})`, { queueAwareSha: sha, unreadable: true });
   }
   if (rel?.status === 'ahead' || rel?.status === 'identical') return reply('current', `the branch contains ${sha.slice(0, 12)}, the commit that taught the merge script about the queue`, { queueAwareSha: sha });
@@ -103,6 +119,7 @@ export function queueCatchUpState({ gh, branch, head }) {
 // The refusal text of P merge for a branch whose merge script may not know the queue (kind predates | unknown). Only 'predates' is remedied by a catch-up: an
 // 'unknown' verdict is decided by the BASE's marker (or a failed read), so updating the branch cannot clear it, and the text must not send the agent to do that.
 export function predatesQueueMessage({ pr, state }) {
+  if (state.headUnknown === true) return `PR #${pr}'s branch could not be checked against the commit that taught the merge script about the merge queue: ${state.why} (GitHub does not have the head being checked; nothing was queued and the merge command was not run). Push the branch, then run \`P merge\` again; updating the branch or editing the marker does not help.`;
   const risk = 'it could take the queue\'s "queued" answer for "merged" and delete the branch. Nothing was queued and the merge command was not run.';
   if (state.kind === 'predates') {
     return `PR #${pr}'s branch does not contain ${state.queueAwareSha.slice(0, 12)}, the commit that taught the merge script about the merge queue (the base branch declares it in ${QUEUE_AWARE_FILE}), so the merge script on the branch may not know about the queue: ${risk} Catch the branch up first: \`P update-branch --pr ${pr}\` from the PR's own worktree, run a review round (base-only), \`P review-complete\`, then ask the owner again.`;
