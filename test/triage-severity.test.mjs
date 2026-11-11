@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import {
   applyClaudeRuling, applyOwnerRuling, applyRoundCapDefer, claudeRulingRefusal, claudeRulingRows, deferEligibility, deferItemsInState, isRoundCapDeferral,
   itemSeverity, needsHumanCause, reuseRuled, reviewEligibilityProblems, roundCapDeferRefusal, roundOutcome, ruledCacheFrom, rulingsBlock, rulingsDigest,
-  rulingsInventory,
+  rulingsInventory, secondReviewRefusal,
 } from '../pipeline/lib/triage.mjs';
 
 // ---- fixtures -------------------------------------------------------------------------------
@@ -32,7 +32,7 @@ const stateOf = (items, { maxRounds = 1, extra = [], rounds } = {}) => ({
 const FILES = [{ oldPath: 'src/a.js', newPath: 'src/a.js', path: 'src/a.js' }, { oldPath: 'src/big.js', newPath: 'src/big.js', path: 'src/big.js' }, { oldPath: 'src/old.js', newPath: 'src/new.js', path: 'src/new.js' }];
 const CONFIG = { risk: { high_risk_paths: ['src/payroll/**'] }, review: { arbiter_always_paths: [] } };
 const sev = (it, over = {}) => itemSeverity(it, { state: stateOf([it]), config: CONFIG, files: FILES, ...over });
-const levels = (state, grants) => deferEligibility(state, CONFIG, FILES, { grants });
+const levels = (state, grants, grantGap) => deferEligibility(state, CONFIG, FILES, { grants, grantGap });
 
 // ---- severity -------------------------------------------------------------------------------
 
@@ -61,6 +61,24 @@ test('severity: a fix made in other files, or a file that also holds an accepted
   // a dismissed BLOCKING finding in the same file does not count: only an ACCEPT
   const rejected = item({ bucket: 'BLOCKING', category: 'bug', file: 'src/big.js', final: { decision: 'REJECT', by: 'judge', needsHuman: false, reason: 'no' }, implemented: false });
   assert.equal(itemSeverity(low, { state: stateOf([low, rejected]), config: CONFIG, files: FILES }).level, 'low');
+});
+
+test('severity: the same-file rule compares across a rename (R1-B2): a BLOCKING ACCEPT at the old path makes a suggestion at the new path high, and the reverse', () => {
+  const blockingOld = item({ id: 'R1-B1', bucket: 'BLOCKING', category: 'bug', file: 'src/old.js' });
+  const sugNew = item({ id: 'R2-S1', file: 'src/new.js' });
+  const high = itemSeverity(sugNew, { state: stateOf([sugNew, blockingOld]), config: CONFIG, files: FILES });
+  assert.equal(high.level, 'high');
+  assert.match(high.reasons.join(';'), /src\/new\.js also holds an accepted BLOCKING/);
+  const sugOld = item({ id: 'R2-S2', file: 'src/old.js' });
+  const blockingNew = item({ id: 'R1-B2', bucket: 'BLOCKING', category: 'bug', file: 'src/new.js' });
+  assert.equal(itemSeverity(sugOld, { state: stateOf([sugOld, blockingNew]), config: CONFIG, files: FILES }).level, 'high');
+  const sec = item({ id: 'R1-S9', category: 'auth', file: 'src/old.js' });
+  assert.equal(itemSeverity(sugNew, { state: stateOf([sugNew, sec]), config: CONFIG, files: FILES }).level, 'high', 'a security accept at the other path');
+  // an unrelated BLOCKING accept elsewhere changes nothing; nor does a dismissed one at the other path
+  const elsewhere = item({ id: 'R1-B3', bucket: 'BLOCKING', category: 'bug', file: 'src/a.js' });
+  assert.equal(itemSeverity(sugNew, { state: stateOf([sugNew, elsewhere]), config: CONFIG, files: FILES }).level, 'low');
+  const dismissed = item({ id: 'R1-B4', bucket: 'BLOCKING', category: 'bug', file: 'src/old.js', final: { decision: 'REJECT', by: 'judge', needsHuman: false, reason: 'no' }, implemented: false });
+  assert.equal(itemSeverity(sugNew, { state: stateOf([sugNew, dismissed]), config: CONFIG, files: FILES }).level, 'low');
 });
 
 test('severity: the location must resolve to exactly one file of the reviewed diff', () => {
@@ -129,16 +147,47 @@ test('deferEligibility: anything else open refuses: pending, needs-human, an ope
   assert.match(levels(fable).refusals.join(';'), /Fable pass is owed/);
 });
 
-test('deferEligibility: an unspent owner grant for the next round (at any head) always wins; a throwing or malformed lookup is no grant', () => {
+test('deferEligibility: an unspent owner grant for the next round (at any head) always wins; a lookup that fails refuses (R1-F2)', () => {
   const state = stateOf([item({ id: 'R2-S1' })]);
   const seen = [];
   const r = levels(state, (k) => { seen.push(k); return [{ grantId: 'g', head: 'c'.repeat(12), quote: 'extra round' }]; });
   assert.deepEqual(seen, [3], 'asked for counted round reviewed + 1');
   assert.equal(r.eligible, false);
   assert.match(r.refusals.join(';'), /granted extra round 3/);
-  assert.equal(levels(state, () => { throw new Error('boom'); }).eligible, true);
-  assert.equal(levels(state, () => 'nope').eligible, true);
+  // the permissive reading of a lookup that fails is "no grant", which would defer over the owner's word: it refuses instead
+  const thrown = levels(state, () => { throw new Error('boom'); });
+  assert.equal(thrown.eligible, false);
+  assert.match(thrown.refusals.join(';'), /extra-round records for round 3 could not be read \(boom\)/);
+  assert.match(levels(state, () => 'nope').refusals.join(';'), /could not be read.*something other than a list/);
   assert.equal(levels(state, () => []).eligible, true);
+  assert.equal(levels(state).eligible, true, 'no lookup given (a state-only evaluation)');
+  // a record that exists but whose provenance cannot be confirmed (the owner may have typed it) refuses; none or ok does not
+  const gap = levels(state, () => [], () => 'provenance');
+  assert.equal(gap.eligible, false);
+  assert.match(gap.refusals.join(';'), /recorded for round 3 but cannot be confirmed as typed by the owner/);
+  for (const answer of ['none', 'ok']) assert.equal(levels(state, () => [], () => answer).eligible, true, answer);
+  assert.match(levels(state, () => [], () => { throw new Error('unreadable'); }).refusals.join(';'), /could not be checked \(unreadable\)/);
+});
+
+test('deferEligibility: an implemented accept outside the ids (a cached BLOCKING copy fixed after the last round) refuses (R1-F1)', () => {
+  const low = item({ id: 'R2-S1', file: 'src/a.js' });
+  const cached = item({ id: 'R2-B1', bucket: 'BLOCKING', category: 'bug', file: 'src/big.js', final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'same finding, accepted before' }, implemented: true });
+  const r = levels(stateOf([low, cached]));
+  assert.equal(r.eligible, false);
+  assert.deepEqual(r.ids, ['R2-S1'], 'the cached copy is not one of the accepts a round would be asked to review');
+  assert.match(r.refusals.join(';'), /R2-B1 is an accepted BLOCKING or security ruling copied from an earlier round and marked implemented: its fix may have been made after the last reviewed head/);
+  // a resolution-only round after the last counted one is part of the same wait
+  const state = stateOf([low], { extra: [round(3, [{ ...cached, round: 3 }], { resolutionOnly: true })] });
+  assert.match(levels(state).refusals.join(';'), /R2-B1 is an accepted BLOCKING/);
+  // an unimplemented cached copy is the existing refusal (an accepted item not implemented), not this one
+  const open = levels(stateOf([low, { ...cached, implemented: false }]));
+  assert.doesNotMatch(open.refusals.join(';'), /copied from an earlier round/);
+  assert.match(open.refusals.join(';'), /not implemented|open BLOCKING/);
+  // a cached copy of a settled dismissal is no accept at all
+  const dismissed = item({ id: 'R2-S2', final: { decision: 'FOLLOW-UP', by: 'cache', needsHuman: false, reason: 'later' }, implemented: false });
+  assert.equal(levels(stateOf([low, dismissed])).eligible, true);
+  // an earlier round's accept (fixed and reviewed by round 2) is not looked at
+  assert.equal(levels(stateOf([low])).eligible, true);
 });
 
 test('deferEligibility: each accept must be low, implemented, and the judge\'s or arbiter\'s (never a test, Claude, a second review, the owner or a cache copy)', () => {
@@ -297,6 +346,12 @@ test('claudeRulingRefusal: a deferral cannot be touched by Claude (ACCEPT, FOLLO
   // an owner re-ruled deferral is still refused for Claude (the mark outlives the ruling)
   const o = applyOwnerRuling(deferred(), { decision: 'REJECT', reason: 'r', ownerQuote: 'R2-S1: reject', ruledAt: PARAMS.ruledAt });
   assert.match(claudeRulingRefusal(o, 'ACCEPT'), /deferred past the round limit/);
+});
+
+test('secondReviewRefusal: a deferral cannot be reopened by a second review either (R1-F4); an ordinary Claude dismissal still can', () => {
+  assert.match(secondReviewRefusal(deferred()), /deferred past the round limit.*only the owner's typed ruling/);
+  const dismissed = item({ id: 'R2-S5', final: { decision: 'REJECT', by: 'claude', needsHuman: false, reason: 'r', claude: { ruledAt: 'x', cause: 'low-confidence', critical: false, overruled: {} } }, implemented: false });
+  assert.equal(secondReviewRefusal(dismissed), null);
 });
 
 test('result cache: a round-cap deferral is never reused as a settled dismissal; an ordinary non-critical Claude dismissal still is', () => {

@@ -425,6 +425,8 @@ const RERUN = 're-run the judge/arbiter (\`arbiter needed\`) so it answers again
 // Why a second review (Codex) may not be run for this item, or null. Not for what is settled, built, already reviewed, or a malfunction.
 export function secondReviewRefusal(item) {
   if (!isObject(item)) return 'no item given';
+  // A deferral is a Claude dismissal, but a second review must not reopen it (it would spend Codex on what only the owner's typed ruling can change).
+  if (isRoundCapDeferral(item)) return `${item.id} was deferred past the round limit (its fix is out of the PR and filed as a follow-up): only the owner's typed ruling can reopen it`;
   if (item.implemented === true) return `${item.id} is already implemented`;
   if (item.secondReview !== undefined) return `${item.id} already has a second review`;
   if (!finalIsReopenable(item)) {
@@ -962,7 +964,9 @@ export function itemSeverity(item, { state, config, files } = {}) {
   const hits = files.filter((f) => entryPaths(f).includes(item.file));
   if (hits.length === 0) return high(`${asciiLine(item.file, 60)} is not a file of the reviewed diff`);
   if (hits.length > 1) return high(`${asciiLine(item.file, 60)} is ambiguous in the reviewed diff`);
-  if (allItems(state).some((i) => i.final?.decision === 'ACCEPT' && i.file === item.file && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)))) {
+  // The same file under either side of a rename: the entry resolved above names both paths, and a finding at the other one is in this file too.
+  const sameFile = entryPaths(hits[0]);
+  if (allItems(state).some((i) => i.final?.decision === 'ACCEPT' && sameFile.includes(i.file) && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)))) {
     return high(`${asciiLine(item.file, 60)} also holds an accepted BLOCKING or security finding`);
   }
   if (isSensitivePath(hits[0], config)) return high(`${asciiLine(item.file, 60)} is on a sensitive path`);
@@ -973,9 +977,9 @@ const idList = (ids) => ids.join(', ');
 
 // May the round limit be closed by taking the accepted fixes OUT and filing them as follow-ups? Refusals 1, 2 and 5 of `defer-fixes`, evaluated on this state as if the tree were
 // already back at the reviewed content (refusals 3 and 4 need git and are the command's). Pure. `grants` = k -> the owner's open extra-round records for counted round k at ANY head
-// (a function, as roundOutcome takes it; a throwing or malformed lookup is no grant): an unspent grant for the next round always wins over a deferral.
+// (a function, as roundOutcome takes it): an unspent grant for the next round always wins over a deferral, and a lookup that fails (or a `grantGap` of 'provenance') refuses.
 // -> { eligible, refusals: [plain words], ids: [the accepts a round would have to review], severities: [{ id, level, reasons }] }. Throws (TypeError) on a config error.
-export function deferEligibility(state, config, files, { grants } = {}) {
+export function deferEligibility(state, config, files, { grants, grantGap } = {}) {
   const refusals = [];
   const rounds = state?.rounds ?? [];
   const last = rounds.at(-1);
@@ -991,12 +995,29 @@ export function deferEligibility(state, config, files, { grants } = {}) {
     if (list.length > 0) refusals.push(`${what} ${idList(list)}`);
   }
   const k = reviewed + 1;
+  // Unlike roundOutcome (no readable grant = no round), here the permissive reading is "no grant", so what cannot be read refuses: a lookup that throws or answers
+  // with anything but a list, and a record the owner may have typed but whose provenance could not be confirmed (`grantGap`: k -> 'none' | 'provenance' | 'ok').
+  // The round-request ask passes tolerant lookups (a failure there is a warning and an 'extra-round' recommendation, never a missing line).
   let granted = [];
-  try {
-    const found = typeof grants === 'function' ? grants(k) : [];
-    granted = Array.isArray(found) ? found : [];
-  } catch { /* a failing lookup is no grant */ }
+  if (typeof grants === 'function') {
+    try {
+      const found = grants(k);
+      if (Array.isArray(found)) granted = found;
+      else refusals.push(`the owner's extra-round records for round ${k} could not be read (the lookup answered with something other than a list): ask the owner for an extra round`);
+    } catch (err) {
+      refusals.push(`the owner's extra-round records for round ${k} could not be read (${asciiLine(err?.message, 120)}): ask the owner for an extra round`);
+    }
+  }
   if (granted.length > 0) refusals.push(`the owner granted extra round ${k} (unspent): run it, a typed "extra round" always wins`);
+  else if (typeof grantGap === 'function') {
+    let gap;
+    try {
+      gap = grantGap(k);
+    } catch (err) {
+      refusals.push(`the owner's extra-round records for round ${k} could not be checked (${asciiLine(err?.message, 120)}): ask the owner for an extra round`);
+    }
+    if (gap === 'provenance') refusals.push(`an extra round is recorded for round ${k} but cannot be confirmed as typed by the owner: it may still be the owner's, so ask the owner for an extra round instead of deferring`);
+  }
   // Refusal 2: exactly the accepts no round has reviewed, each low and each the judge's or the arbiter's.
   const ids = o.newAccepted;
   const byId = new Map(allItems(state).map((i) => [i.id, i]));
@@ -1009,6 +1030,18 @@ export function deferEligibility(state, config, files, { grants } = {}) {
     if (sev.level !== 'low') refusals.push(`${id} is not low severity (${sev.reasons.join('; ')})`);
     const why = roundCapDeferRefusal(item);
     if (why) refusals.push(why);
+  }
+  // Refusal 2b: every other implemented accept of the rounds still awaiting a fix review: only a `by: 'cache'` copy is not in ids, and reuseRuled never carries a fix for a BLOCKING or
+  // security copy, so the agent fixed it AFTER the last reviewed head. Reverting every commit since that head takes such a fix out while the state still says implemented, and the
+  // review would read clean without it, so this refuses. (A carried low copy cannot be told from one fixed later; it refuses too.) Earlier rounds are not looked at: a round
+  // cannot start with an accept unimplemented, so their fixes were in a reviewed head.
+  const asked = new Set(ids);
+  for (const r of roundsAwaitingFixReview(rounds)) {
+    for (const i of r.items ?? []) {
+      if (i.final?.decision === 'ACCEPT' && i.implemented === true && !asked.has(i.id)) {
+        refusals.push(`${i.id} is an accepted ${i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category) ? 'BLOCKING or security ' : ''}ruling copied from an earlier round and marked implemented: its fix may have been made after the last reviewed head, and taking the fixes out would drop it, so run the round`);
+      }
+    }
   }
   // Refusal 5: the state with those fixes deferred must read as a clean review (nothing left but the issues still to file).
   if (refusals.length === 0) {

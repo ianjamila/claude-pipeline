@@ -19,11 +19,11 @@ import { diffStats } from '../lib/diff.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
-import { saveState, updateItems } from '../lib/state.mjs';
+import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { askSummary, costFrom, notCleanReasons, openItems, roundsFrom } from '../lib/round-ask.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { grantIdOf, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
+import { grantIdOf, ownerGrantGap, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
   isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, rulingContentDigest, secondReviewRefusal, settleSecondReview, validateSecondReview, validateTriage,
@@ -59,26 +59,26 @@ export const meta = {
     '  -> {ok, deferred: [ids], rounds: [every round number holding a deferred item], published, next?}: closes the round limit without another round when the unreviewed fixes are all LOW severity. Each fix is taken out of the tree FIRST (the caller reverted',
     '     every commit since the last reviewed head, pushed and waited for CI); then those ACCEPTs become FOLLOW-UPs (final.by claude, cause round-cap, the overruled ACCEPT kept, the item-level roundCapDeferral {fixHead, reviewedHead, at}), published at once like claude-ruling.',
     '     Run `followups create --round R` for EACH returned round afterwards (a retry is safe: it de-duplicates by fingerprint). Every deferral is a labelled row of the merge Rulings block, so the owner\'s "merge" binds each one by name',
-    '  -> only with owner_approval: chat; exit 1 (state untouched) unless ALL hold: the round limit is reached and nothing is pending, waiting for a human, open BLOCKING, unimplemented or owed a Fable pass, and no unspent owner grant exists for the next round at any head;',
+    '  -> only with owner_approval: chat; exit 1 (state untouched) unless ALL hold: the round limit is reached and nothing is pending, waiting for a human, open BLOCKING, unimplemented or owed a Fable pass, and no unspent owner grant exists for the next round at any head (a lookup of the owner\'s records that fails, or a record whose provenance cannot be confirmed as the owner\'s, refuses too);',
     '     --ids is exactly the set of accepts no round has reviewed, each low severity (non-BLOCKING; category performance, maintainability, testing, design, docs or other; its file in the reviewed diff, on no risk.high_risk_paths / review.arbiter_always_paths glob,',
-    '     not the file of a BLOCKING or security ACCEPT) and each accepted by the judge or the arbiter (not the owner, Claude, a second review, a test or a cache copy); the tree equals the last reviewed content (every commit since reverted); --fix-head is an ancestor of HEAD with',
-    '     other content (it only points the follow-up issues at the removed fix); and the state with the fixes deferred reads as a clean review. A severity or config error refuses. Claude cannot reopen a deferral (claude-ruling refuses it); the owner\'s owner-ruling can',
+    '     not the file of a BLOCKING or security ACCEPT) and each accepted by the judge or the arbiter (not the owner, Claude, a second review, a test or a cache copy; and no other accepted fix of those rounds, such as a copy of an earlier ruling, is marked implemented, since its fix may be after the last reviewed head); the tree equals the last reviewed content (every commit since reverted); --fix-head is an ancestor of HEAD, a descendant of the last reviewed head, with',
+    '     other content (it only points the follow-up issues at the removed fix); and the state with the fixes deferred reads as a clean review. A severity or config error refuses. Claude cannot reopen a deferral (claude-ruling and second-review refuse it); it writes review state format version 3; the owner\'s owner-ruling can',
     'pipeline triage claude-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --pr N [--repo DIR]',
     '  -> {ok, round, id, final, published, next?}; records CLAUDE\'s decision (final.by claude, needsHuman false, the overruled final and the cause kept) for an item waiting for a human, or tightens a Claude dismissal',
     '  -> only with owner_approval: chat; exit 1 for label mode, a --pr that is not the review state\'s, an empty reason or one over 1000 characters, or a ruling the rules refuse (state untouched)',
     '  -> ACCEPT is always allowed (also for a judge/arbiter malfunction). FOLLOW-UP alone only for a non-BLOCKING, non-security item with a known cause; any REJECT, and any dismissal of a BLOCKING or security item,',
     '     needs a second review already on the item that also dismisses it at high confidence (the result is the stricter of the two). Refused: a dismissal through a model-proof / invalid-arbiter / invalid-judge',
     '     malfunction (re-run the judge/arbiter, or ACCEPT), a loosened ACCEPT (only the owner\'s typed ruling loosens), an implemented item, and anything settled by a test, the judge, the arbiter or the owner',
-    '  -> the ruling is published at once, under the review lock (published: true): the triage comment is updated as a compare-and-swap on the state\'s content (lib/review-publish.mjs). When GitHub cannot be reached the ruling stands locally (published: false, next = the retry, `pipeline comment --kind triage`); when the PR holds a state this copy did not publish or restore it is published: false, publishError: \'stale-publication\' (run `pipeline state show --pr N`, then redo). It writes review state format version 2',
+    '  -> the ruling is published at once, under the review lock (published: true): the triage comment is updated as a compare-and-swap on the state\'s content (lib/review-publish.mjs). When GitHub cannot be reached the ruling stands locally (published: false, next = the retry, `pipeline comment --kind triage`); when the PR holds a state this copy did not publish or restore it is published: false, publishError: \'stale-publication\' (run `pipeline state show --pr N`, then redo). It writes review state format version 2 (a state already at a higher version keeps it)',
     'pipeline triage second-review --round R --ids ID[,ID…] --pr N [--repo DIR]',
     '  -> {ok, round, verdicts:[{id, decision, confidence, reasoning, final}], forcedAccept:[ids], published, publishError?, next}; runs ONE Codex call (review.codex_model, effort high, read-only, fresh session) over a BLIND packet of the named items',
     '     and stores its verdict in each item (item.secondReview), for claude-ruling to read. The packet is built from the review state and git alone: the original finding (id, bucket, category, title, file, line, detail, the reviewer\'s reasoning),',
     '     the test evidence the CLI recorded, the pinned head, the PR title and risk, fenced as untrusted text; never the judge\'s, the arbiter\'s or Claude\'s reason or decision. Codex is told to verify the claims in the code, read-only',
-    '  -> only with owner_approval: chat; each id must be an item of round R that waits for a human (final.needsHuman) with a cause that is not a judge/arbiter malfunction, is not implemented and has no second review yet: anything else refuses the whole call naming the id (exit 1, state untouched)',
+    '  -> only with owner_approval: chat; each id must be an item of round R that waits for a human (final.needsHuman) with a cause that is not a judge/arbiter malfunction, is not implemented, is not a round-limit deferral and has no second review yet: anything else refuses the whole call naming the id (exit 1, state untouched)',
     '     (ONE second review per item: a second call refuses). Codex ACCEPT sets the final ACCEPT at once (final.forcedBy second-review; fix it); a dismissal leaves the final as it was: at high confidence claude-ruling may dismiss it (the stricter of the two stands), below high only ACCEPT (or the owner\'s typed ruling) is possible',
     '  -> the check runs under the review lock, Codex runs outside it, then the state is read again under the lock: nothing is recorded (exit 1) when HEAD moved, an item\'s final or finding text changed, or a verdict appeared meanwhile',
     '  -> exit 1 {ok:false, reason} for an answer that is not exactly one valid verdict per requested id (or no usable answer after Codex exited 0): nothing is stored, so run it again. exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|github} when Codex or GitHub could not deliver: state untouched, the PR waits (review-loop.md rule 2)',
-    '  -> the prompt and the raw answer are kept as .review/round-R/second-review-<first id>.md and .json; the result is published like a Claude ruling (published / publishError / next as for claude-ruling); it writes review state format version 2; env PIPELINE_CODEX_TIMEOUT_MS as for codex-review',
+    '  -> the prompt and the raw answer are kept as .review/round-R/second-review-<first id>.md and .json; the result is published like a Claude ruling (published / publishError / next as for claude-ruling); it writes review state format version 2 (a state already at a higher version keeps it); env PIPELINE_CODEX_TIMEOUT_MS as for codex-review',
     'pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]',
     '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
     '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human and has no unimplemented Claude ruling (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
@@ -420,8 +420,8 @@ async function claudeRuling(rest, ctx) {
     if (why) return refuse(why);
     seedBaseline({ ctx, root, pr, state });
     const ruled = applyClaudeRuling(item, { decision, reason, ruledAt: new Date().toISOString() });
-    // Format version 2: an older pipeline must not read a state that holds a Claude ruling (state.mjs SUPPORTED_STATE_VERSION).
-    const next = { ...updateItems(state, n, [ruled]), version: 2 };
+    // Format version 2 at least: an older pipeline must not read a state that holds a Claude ruling (state.mjs SUPPORTED_STATE_VERSION); a higher version stays.
+    const next = withStateVersion(updateItems(state, n, [ruled]), STATE_VERSION_CLAUDE);
     saveState(root, next);
     return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final, ...publishRuling({ ctx, root, pr, state: next }) } };
   }, pr);
@@ -555,8 +555,8 @@ async function secondReview(rest, ctx) {
       const e = byId.get(item.id);
       return settleSecondReview(item, { decision: e.decision, confidence: e.confidence, reasoning: clip(e.reasoning.trim(), REASONING_MAX), model, effort: SECOND_REVIEW_EFFORT, inputDigest, ranAt });
     });
-    // Format version 2: an older pipeline must not read a state that holds a second-review verdict (state.mjs SUPPORTED_STATE_VERSION).
-    const saved = { ...updateItems(state, n, settled), version: 2 };
+    // Format version 2 at least: an older pipeline must not read a state that holds a second-review verdict (state.mjs SUPPORTED_STATE_VERSION); a higher version stays.
+    const saved = withStateVersion(updateItems(state, n, settled), STATE_VERSION_CLAUDE);
     saveState(root, saved);
     const verdicts = settled.map((i) => ({ id: i.id, decision: i.secondReview.decision, confidence: i.secondReview.confidence, reasoning: i.secondReview.reasoning, final: i.final }));
     const { next: publishNext, ...published } = publishRuling({ ctx, root, pr, state: saved });
@@ -635,7 +635,8 @@ async function roundRequest(rest, ctx) {
     const warnings = [];
     let shown = {};
     try {
-      shown = roundAskFields({ root, config, state, pr, gh, head, grants, warnings });
+      const grantGap = (ordinal) => ownerGrantGap({ repo: slug, pr, k: ordinal, anyHead: true });
+      shown = roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, warnings });
     } catch (err) {
       warnings.push(`the ask could not be summarised (${asciiLine(err?.message, 160)}): the line above still stands`);
     }
@@ -671,8 +672,9 @@ function sinceLastReview(root, config, state, { withChanges }) {
   return { anchor: full.slice(0, 12), count: log.length, commits: log.slice(0, 20).map((l) => asciiLine(l, 100)), changed };
 }
 
-// The display fields of the ask. `grants` is the same lookup the admission check used (any head).
-function roundAskFields({ root, config, state, pr, gh, head, grants, warnings }) {
+// The display fields of the ask. `grants` is the same lookup the admission check used (any head); `grantGap` says why it found nothing ('provenance' = a record exists that cannot be
+// confirmed as the owner's). A lookup that fails here degrades to a warning and the extra-round recommendation: it never loses the ask (`defer-fixes` itself refuses on it).
+function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, warnings }) {
   refreshBaseRef(root, config);
   const hash = currentContentHash(root, config);
   const outcome = roundOutcome({ ...state, currentContentHash: hash });
@@ -696,7 +698,16 @@ function roundAskFields({ root, config, state, pr, gh, head, grants, warnings })
   const open = openItems(state, outcome, { config, files: diff.files }, warnings);
   let follow;
   try {
-    follow = deferEligibility(state, config, diff.files, { grants });
+    const readable = (lookup) => (ordinal) => {
+      try {
+        return lookup(ordinal);
+      } catch (err) {
+        const w = `the owner's extra-round records could not be read (${asciiLine(err?.message, 120)}): the follow-up path is not offered`;
+        if (!warnings.includes(w)) warnings.push(w);
+        throw err;
+      }
+    };
+    follow = deferEligibility(state, config, diff.files, { grants: readable(grants), grantGap: readable(grantGap) });
   } catch (err) {
     follow = { eligible: false, refusals: [`severity could not be judged (${asciiLine(err?.message, 120)})`], ids: [], severities: [] };
     if (!warnings.some((w) => w.startsWith('severity could not be judged'))) warnings.push(follow.refusals[0]);
@@ -736,11 +747,12 @@ async function deferFixes(rest, ctx) {
     const o = { cwd: root };
     // The owner's typed "extra round" always wins over a deferral, at whatever head it was typed for (the head moved when the fixes were reverted).
     const grants = (ordinal) => ownerGrantedRounds({ repo: slug, pr, k: ordinal, anyHead: true }).map((r) => ({ grantId: grantIdOf(r), head: r.head, quote: r.prompt }));
+    const grantGap = (ordinal) => ownerGrantGap({ repo: slug, pr, k: ordinal, anyHead: true });
     const diff = reviewedDiff(root, config, state);
     if (diff.files === null) return refuse(`the reviewed diff could not be read (${diff.problem}), so no item can be judged low severity`);
     let eligible;
     try {
-      eligible = deferEligibility(state, config, diff.files, { grants });
+      eligible = deferEligibility(state, config, diff.files, { grants, grantGap });
     } catch (err) {
       return refuse(`severity could not be judged (${asciiLine(err?.message, 160)}): fix the pipeline.yml lists, or ask the owner for an extra round`);
     }
@@ -764,14 +776,14 @@ async function deferFixes(rest, ctx) {
       return refuse(`--fix-head ${asciiLine(fixHead, 60)} is not a commit in this repository`);
     }
     if (!isAncestor(fixFull, 'HEAD', o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is not an ancestor of HEAD`);
+    // It is printed in the owner-bound Rulings row and in the issue's `git diff <reviewed> <fix>`: an older head would show the reviewed work in reverse.
+    if (!isAncestor(revParse(last.toHead, o), fixFull, o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is older than the last reviewed head ${String(last.toHead).slice(0, 12)}: pass the head that held the fixes (a descendant of the reviewed head)`);
     if (reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log, head: fixFull }, o) === last.contentHashAtToHead) {
       return refuse(`--fix-head ${fixFull.slice(0, 12)} has the reviewed content, so it is not the head that held the fixes: pass the head the round-request line named`);
     }
     seedBaseline({ ctx, root, pr, state });
-    const next = {
-      ...deferItemsInState(state, want, { reason, ruledAt: new Date().toISOString(), fixHead: fixFull, reviewedHead: last.toHead }),
-      version: 2, // (an older pipeline must not read a state that holds a Claude ruling or a deferral: state.mjs SUPPORTED_STATE_VERSION)
-    };
+    // Format version 3: a pre-deferral pipeline reads version 2 and would drop the deferral rows from the Rulings block and let Claude reopen them (state.mjs SUPPORTED_STATE_VERSION).
+    const next = withStateVersion(deferItemsInState(state, want, { reason, ruledAt: new Date().toISOString(), fixHead: fixFull, reviewedHead: last.toHead }), STATE_VERSION_DEFERRAL);
     saveState(root, next);
     const wanted = new Set(want);
     const rounds = next.rounds.filter((r) => (r.items ?? []).some((i) => wanted.has(i.id))).map((r) => r.n).sort((a, b) => a - b);

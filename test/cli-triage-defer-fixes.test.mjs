@@ -6,8 +6,8 @@ import assert from 'node:assert/strict';
 import { rmSync } from 'node:fs';
 import { grantIdOf, markerPath } from '../pipeline/hooks/lib/owner-go.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
-import { low, roundWorld } from './helpers/round-world.mjs';
+import { cleanupAtExit, OWNER_ENTRY, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { aFile, low, roundWorld } from './helpers/round-world.mjs';
 
 const defer = (w, ids, fixHead, { reason = 'minor, file it', extra = [] } = {}) =>
   w.cli(['triage', 'defer-fixes', '--pr', '7', '--ids', ids, '--fix-head', fixHead, '--reason', reason, ...extra]);
@@ -39,7 +39,7 @@ test('defer-fixes: the reverted fixes become FOLLOW-UPs, the review reads clean,
   assert.deepEqual([item.final.claude.fixHead, item.final.claude.reviewedHead], [h2, h1]);
   assert.deepEqual([item.implemented, 'implementedVia' in item], [false, false]);
   assert.deepEqual([item.roundCapDeferral.fixHead, item.roundCapDeferral.reviewedHead, typeof item.roundCapDeferral.at], [h2, h1, 'string']);
-  assert.equal(w.state().version, 2);
+  assert.equal(w.state().version, 3, 'a deferral writes format version 3: a pre-deferral pipeline would drop its Rulings row');
   assert.equal(w.cli(['state', 'outcome']).json.clean, true, 'after: nothing owed');
 
   // the issue says where the removed fix is
@@ -267,4 +267,91 @@ test('defer-fixes: a second call finds nothing left to defer', (t) => {
   const { h2 } = reverted(w);
   assertExit(defer(w, 'R2-S1', h2), 0);
   refused(w, () => defer(w, 'R2-S1', h2), /nothing to defer/, 'again');
+});
+
+test('defer-fixes: refused when main was merged in after the last reviewed head with no base-only round, and the merge moved the content hash', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  // main edits a line two above the one the PR changed (src/a.js line 12): the merge is clean, and the PR's own patch now has other context lines, so its content hash moves
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/a.js', aFile(false).replace('export const v10 = 10;', 'export const v10 = 1000;'));
+  w.repo.commit('main edits near the PR');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', 'main']);
+  refused(w, () => defer(w, 'R2-S1', h2), /tree is not back at the last reviewed content/, 'main merged in');
+});
+
+test('defer-fixes: a cached BLOCKING accept fixed after the last round (next to a low accept in another file) is refused, and round-request recommends the round (R1-F1)', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = w.atCap();
+  // round 2 also holds a copy of a BLOCKING ACCEPT that reuseRuled carried over unimplemented; the agent fixed it in the round-2 fix commit and marked it
+  w.edit((s) => {
+    const base = s.rounds[1].items[0];
+    s.rounds[1].items.push({
+      ...base, id: 'R2-B1', bucket: 'BLOCKING', category: 'bug', file: 'src/a.js', title: 'Cached bug', fingerprint: 'fp-cached-blocking',
+      final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'accepted in round 1' }, implemented: true,
+    });
+  });
+  const asked = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(asked, 0, asked.stderr + asked.stdout);
+  assert.equal(asked.json.recommend, 'extra-round', 'the ask agrees with the command');
+  w.revert(h2);
+  refused(w, () => defer(w, 'R2-S1', h2), /R2-B1 is an accepted BLOCKING or security ruling copied from an earlier round and marked implemented/, 'cached BLOCKING accept');
+  assert.equal(w.item('R2-B1').implemented, true, 'the state still says it is in, and nothing was dropped');
+});
+
+test('defer-fixes: an extra round recorded for this PR whose provenance cannot be confirmed refuses (it may be the owner\'s), and so does the ask\'s recommendation (R1-F2)', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = w.atCap();
+  const record = ownerGrants(t, 'extra round', roundRequest(7, 3, h2, w.slug), OWNER_ENTRY, 'missing');
+  assert.ok(record, 'the recorder wrote the grant');
+  cleanupAtExit(markerPath(grantIdOf(record)));
+  t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+  w.revert(h2);
+  refused(w, () => defer(w, 'R2-S1', h2), /recorded for round 3 but cannot be confirmed as typed by the owner/, 'unconfirmed grant');
+  const again = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(again, 0, again.stderr + again.stdout);
+  assert.equal(again.json.recommend, 'extra-round');
+});
+
+test('defer-fixes: --fix-head must descend from the last reviewed head: an older head (the original feature head, round 1\'s) is refused (R1-F3)', (t) => {
+  const w = roundWorld(t);
+  const { h1, h2 } = reverted(w);
+  refused(w, () => defer(w, 'R2-S1', w.head), /older than the last reviewed head/, 'an older head with other content');
+  assert.ok(h1);
+  const ok = defer(w, 'R2-S1', h2);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+});
+
+// A second item waiting for a human next to a deferral, to run the other writers of the state on it.
+const withWaiting = (w) => w.edit((s) => {
+  const { roundCapDeferral: _mark, ...rest } = s.rounds[1].items[0];
+  s.rounds[1].items.push({ ...rest, id: 'R2-S2', title: 'Another idea', fingerprint: 'fp-waiting', line: 7, final: { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'unsure', cause: 'low-confidence' }, implemented: false });
+});
+
+test('defer-fixes: a later claude-ruling or second-review keeps the state at version 3, never back at 2 (R1-B1)', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  assertExit(defer(w, 'R2-S1', h2), 0);
+  assert.equal(w.state().version, 3);
+  withWaiting(w);
+  const ruled = w.cli(['triage', 'claude-ruling', '--round', '2', '--id', 'R2-S2', '--decision', 'FOLLOW-UP', '--reason', 'later', '--pr', '7']);
+  assertExit(ruled, 0, ruled.stderr + ruled.stdout);
+  assert.equal(w.state().version, 3, 'claude-ruling');
+  // a second review on another waiting item
+  w.edit((s) => {
+    s.rounds[1].items.push({ ...s.rounds[1].items.find((i) => i.id === 'R2-S2'), id: 'R2-S3', title: 'A third idea', fingerprint: 'fp-third', line: 9, final: { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'unsure', cause: 'low-confidence' }, implemented: false });
+  });
+  const second = w.cli(['triage', 'second-review', '--round', '2', '--ids', 'R2-S3', '--pr', '7'], {
+    FAKE_CODEX_OUTPUT: w.file('second.json', { items: [{ id: 'R2-S3', decision: 'REJECT', confidence: 'high', reasoning: 'not worth it' }] }),
+  });
+  assertExit(second, 0, second.stderr + second.stdout);
+  assert.equal(w.state().version, 3, 'second-review');
+});
+
+test('defer-fixes: a second review is refused for a deferral without running Codex, state untouched (R1-F4)', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  assertExit(defer(w, 'R2-S1', h2), 0);
+  refused(w, () => w.cli(['triage', 'second-review', '--round', '2', '--ids', 'R2-S1', '--pr', '7']), /deferred past the round limit.*only the owner's typed ruling/, 'second-review of a deferral');
 });
