@@ -1854,7 +1854,9 @@ test('#128 R6-F1: program text naming a bare config root is refused whatever it 
     "python3 -c \"import shutil; shutil.rmtree('/mnt/home/u/claude-config')\"",
     "node -e \"require('fs').writeFileSync('/tmp/x',JSON.stringify({a:1}))\"",
     "python3 -c \"import shutil; shutil.rmtree('/repo/.claude/cache')\"",
-    "node -e \"require('fs').writeFileSync('.claude/settings.local.json','{}')\"",
+    // (#261 R2-F7: .claude/settings*.json can declare hooks, so an inline write to it is refused now — test/guard-click-hooks.test.mjs R2-F7;
+    // the point here, a repo's own .claude/ is not a config root, is kept with a file that declares nothing)
+    "node -e \"require('fs').writeFileSync('.claude/notes.json','{}')\"",
     "python3 -c \"import os,shutil; shutil.rmtree(os.path.join('/repo','.claude','cache'))\"",
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
   // (a literal root that is not configured is just a folder)
