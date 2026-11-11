@@ -411,6 +411,32 @@ test('R10-F3: a PowerShell backtick may spell a protected path, so a line with o
   assert.equal(bashW('echo `true` C:/Users/u/.claude/settings.json'), 'allow');
 });
 
+// R10 security review: inside a double-quoted string a backtick escape DECODES (`u{2E} is '.'), it is not simply dropped, so neither the raw text nor the backtick-stripped text holds `.claude`.
+test('R10 security review: PowerShell backtick escapes are decoded', () => {
+  const deny = [
+    'Set-Content "C:/Users/u/`u{2E}claude/settings.json" x', // `u{2E} = '.'
+    'Set-Content "C:/Users/u/.cl`u{61}ude/settings.json" x', // a letter
+    'Set-Content "C:/Users/u/.claude/settings.js`u{6f}n" x', // lower hex
+    'Set-Content "C:/Users/u/.claude/settings.js`u{6F}n" x', // upper hex
+    'Set-Content "C:/Users/u/`u{2e}claude/settings.json" x',
+    'Set-Content "C:/Users/u/`u{002E}claude/settings.json" x', // leading zeros
+    'Set-Content "C:/Users/u/`u{00002E}claude/settings.json" x', // six digits
+    'Set-Content "C:/Users/u/`u{2E}c`laude/set`u{74}ings.json" x', // mixed with a plain backtick letter escape
+    'Set-Content "C:/Users/u/.claude/`u{73}ettings.json" x',
+    'cp a "C:/Users/u/`u{2E}claude/settings.json"',
+    'Set-Content "C:/Users/u/`u{2E}claude/settings.json`0" x', // a control-character escape beside it
+    'Set-Content "C:/Users/u/`u{2E}claude`/settings.json" x',
+  ];
+  for (const c of deny) assert.equal(psW(c), 'deny', c);
+  // a `u{ with no closing brace or an invalid code point is refused with a protected path on the line
+  for (const c of ['Set-Content "C:/Users/u/.claude/`u{2E settings.json" x', 'Set-Content "C:/Users/u/.claude/`u{ZZ}.json" x', 'Set-Content "C:/Users/u/.claude/`u{110000}.json" x', 'Set-Content "C:/Users/u/.claude/`u{}.json" x']) assert.equal(psW(c), 'deny', c);
+  // a `u{..} line that names nothing protected is judged as before
+  assert.equal(psW('Write-Output "caf`u{E9}"'), 'allow');
+  assert.equal(psW('Set-Content "C:/repo/`u{61}.txt" x'), 'allow');
+  // Bash is untouched
+  assert.equal(bashW('echo "C:/Users/u/`u{2E}claude/settings.json"'), 'allow');
+});
+
 test('R10: a plain PowerShell read of a protected file is still allowed', () => {
   assert.equal(psW('Get-Content C:/Users/u/.claude/settings.json'), 'allow');
   assert.equal(psW('Get-Content C:\\Users\\u\\.claude\\settings.json | Select-Object -First 3'), 'allow');

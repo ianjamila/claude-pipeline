@@ -1735,6 +1735,25 @@ const psUnparsed = (raw) => {
   const text = raw.replace(/\r\n/g, '\n');
   return PS_NOT_PLAIN_CHARS.test(text) || PS_NOT_PLAIN_SYNTAX.test(text) || PS_ESCAPED_SYNTAX.test(text);
 };
+// The text PowerShell sees once it has read its backtick escapes (R10 security review): `u{hex1-6} is that code point, `0 `a `b `e `f `n `r `t `v are control characters, a backtick before a line break
+// continues the line (nothing), a backtick before any other character is that character. Returns null when a `u{ is malformed (no closing brace, no or non-hex digits, more than six, past U+10FFFF):
+// PowerShell would refuse it, and the caller fails closed.
+const PS_CONTROL_ESCAPES = { 0: '\0', a: '\x07', b: '\b', e: '\x1B', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v' };
+const psDecodeBackticks = (raw) => {
+  let bad = false;
+  const out = raw.replace(/`(u\{([^}\n]*)\}?|\r\n|[\s\S]|$)/gi, (all, rest) => {
+    if (rest === '') return ''; // a trailing backtick
+    if (rest === '\r\n' || rest === '\n') return '';
+    if (/^u\{/i.test(rest)) {
+      const hex = /^u\{([0-9A-Fa-f]{1,6})\}$/i.exec(rest)?.[1];
+      const cp = hex === undefined ? NaN : parseInt(hex, 16);
+      if (!(cp <= 0x10FFFF)) { bad = true; return all; }
+      return String.fromCodePoint(cp);
+    }
+    return Object.hasOwn(PS_CONTROL_ESCAPES, rest) ? PS_CONTROL_ESCAPES[rest] : rest;
+  });
+  return bad ? null : out;
+};
 function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
   if (!argv.length) return false;
@@ -3397,7 +3416,9 @@ function evaluateBashForFilesFrame(command, opts) {
   // The PowerShell tool only, decided once for the whole line (R10-B1 / F1 / F3): the commands the Bash parser cut the line into are not what PowerShell runs when the text holds anything PowerShell reads
   // differently, so neither a command's read-only judgement nor the destination-only filter of cp / rsync / install (which never asks it) can be relied on. A line that names a protected path (in the raw text,
   // unmasked; also with PowerShell's backticks removed, `.c`laude` is `.claude`; or runs inside a protected directory) and is not plain text is refused outright. See psUnparsed.
-  if (ctx.shell === 'powershell' && psUnparsed(raw) && (insideRoot || m.rawHit(raw, dirs) || (raw.includes('`') && m.rawHit(raw.replace(/`/g, ''), dirs)))) {
+  // PowerShell reads a backtick escape as the character it spells (`u{2E} is '.'), so the text is also judged decoded (psDecodeBackticks); a `u{ that does not decode is refused (fail closed).
+  const psDecoded = ctx.shell === 'powershell' && raw.includes('`') ? psDecodeBackticks(raw) : raw;
+  if (ctx.shell === 'powershell' && psUnparsed(raw) && (insideRoot || m.rawHit(raw, dirs) || psDecoded === null || (raw.includes('`') && (m.rawHit(psDecoded, dirs) || m.rawHit(raw.replace(/`/g, ''), dirs))))) {
     return deny(`the PowerShell command refers to a protected pipeline file (or the directory that holds it) and holds text PowerShell reads differently from the guard's parser (a non-ASCII character such as a typographic quote, a backtick, a here-string @" or @', a block comment <# #>, --%, a control character, or a backslash before a non-path character), so what it runs cannot be checked; write it as plain ASCII text with no such syntax (${PROTECTED_MSG})`);
   }
 
