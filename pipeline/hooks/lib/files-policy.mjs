@@ -1618,6 +1618,8 @@ function gitReadOnly(args) {
 // (not the owner-go recorder: run by hand with made-up input it would write an owner "merge" -- Codex design review of #58)
 function isPipelineTool(arg, ctx) {
   if (typeof arg !== 'string') return false;
+  // A backslash left in a shell-parsed word (quoted: `"hooks/\.\./x"`) is a name character off Windows, but expandRefs would read it as a separator: refuse (fail closed).
+  if (ctx.platform !== 'win32' && arg.includes('\\')) return false;
   const e = expandRefs(arg, ctx);
   if (!isAbs(e)) return false;
   if (OWNER_GO_RECORDER.test(e)) return false;
@@ -1628,15 +1630,20 @@ function isPipelineTool(arg, ctx) {
     || insideStrict(e, `${ctx.homePosix}/.claude/pipeline/hooks`, ctx.platform);
 }
 
-// A Windows `node C:\...\pipeline.mjs` loses its backslashes in argv, so look at the raw text too.
+// A Windows `node C:\...\pipeline.mjs` loses its backslashes in argv, so look at the raw text too. WINDOWS ONLY: on any other platform a backslash is an ESCAPE
+// (`hooks/\.\./\.\./x.mjs` runs as `hooks/../../x.mjs`), while expandRefs reads it as a separator (`hooks//.//./`, inside hooks): a parser differential that
+// would turn an allow-list check into a bypass, so there only the shell-parsed argv word decides.
 // The regex only FINDS the path (case-folded where the platform is, no `..` handling); an ALLOW must not rest on that match, so the path it found goes
-// through isPipelineTool like an argv word does (disk identity, exact spelling when the disk cannot answer, `..` resolved).
+// through isPipelineTool like an argv word does (disk identity, exact spelling when the disk cannot answer, `..` resolved), and a match with any `.` / `..`
+// segment is refused outright (a trusted tool path never needs one).
 function pipelineToolInRaw(raw, ctx) {
+  if (ctx.platform !== 'win32') return false;
   const t = expandRefs(raw, ctx);
   const root = escapeRe(`${ctx.homePosix}/.claude/pipeline`);
   if (/owner-go/i.test(t)) return false;
   const m = new RegExp(`^\\s*(?:\\S*/)?node(?:\\.exe)?\\s+["']?(${root}/(?:bin/pipeline\\.mjs|hooks/[^\\s'"]*))(?:["']?\\s|["']?$)`, ctx.ci ? 'i' : '').exec(t);
-  return m !== null && isPipelineTool(m[1], ctx);
+  if (m === null || /(?:^|\/)\.{1,2}(?:\/|$)/.test(m[1])) return false;
+  return isPipelineTool(m[1], ctx);
 }
 
 function pwshReadOnly(argv) {

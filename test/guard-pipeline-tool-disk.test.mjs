@@ -135,3 +135,41 @@ test('a backslash on the line, with a hooks path that climbs out with .., is not
     assert.equal(go(`node "${CLAUDE}/pipeline/hooks/../../../../tmp/x.mjs" a\\ b`), 'deny', `${platform}: quoted`);
   }
 });
+
+// Parser differential: on POSIX a backslash is an ESCAPE, not a separator. The shell runs `hooks/\.\./\.\./x.mjs` as `hooks/../../x.mjs`, but the raw-text fallback
+// (meant for a Windows `node C:\...\pipeline.mjs`) rewrites the backslashes to slashes and saw `hooks//.//./...`, inside the hooks folder. The fallback is win32 only,
+// and even there a `.` / `..` segment in the matched path is refused (a trusted tool path never needs one).
+test('on darwin and linux an escaped-dot path out of the hooks or bin folder is not trusted (a backslash is an escape there, not a separator)', () => {
+  const climbs = [
+    `${CLAUDE}/pipeline/hooks/\\.\\./\\.\\./\\.\\./tmp/x.mjs`,
+    `${CLAUDE}/pipeline/hooks/\\.\\./\\.\\./\\.\\./\\.\\./tmp/x.mjs`,
+    `${CLAUDE}/pipeline/hooks/.\\./.\\./.\\./tmp/x.mjs`,
+    `${CLAUDE}/pipeline/hooks/\\../\\../\\../tmp/x.mjs`,
+    `${CLAUDE}/pipeline/bin/\\.\\./\\.\\./x.mjs`,
+    `${CLAUDE}/pipeline/bin/\\.\\./\\.\\./\\.\\./tmp/x.mjs`,
+  ];
+  for (const platform of ['darwin', 'linux']) {
+    const go = (command) => evaluateBashForFiles(command, { ...opts, platform }).decision;
+    for (const p of climbs) {
+      assert.equal(go(`node ${p}`), 'deny', `${platform}: ${p}`);
+      assert.equal(go(`node "${p}"`), 'deny', `${platform}: double-quoted ${p}`);
+      assert.equal(go(`node '${p}'`), 'deny', `${platform}: single-quoted ${p}`);
+      assert.equal(go(`node ${p} preflight`), 'deny', `${platform}: with an argument ${p}`);
+    }
+    assert.equal(go(`node ${REAL_CLI} preflight a\\ b`), 'allow', `${platform}: the real CLI with a backslash elsewhere stays trusted`);
+  }
+});
+
+test('on win32 a genuine backslash path to the CLI or a hook stays trusted, one with a . or .. segment is not', () => {
+  const WIN = { home: 'C:\\Users\\u', env: {}, platform: 'win32', cwd: 'C:\\repo', realpath: (p) => p, existsSync: () => false };
+  const w = (command) => evaluateBashForFiles(command, WIN).decision;
+  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\bin\\pipeline.mjs preflight'), 'allow');
+  assert.equal(w('node "C:\\Users\\u\\.claude\\pipeline\\bin\\pipeline.mjs" preflight'), 'allow');
+  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\hooks\\guard-files.mjs'), 'allow');
+  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\hooks\\..\\..\\..\\tmp\\x.mjs'), 'deny');
+  assert.equal(w('node "C:\\Users\\u\\.claude\\pipeline\\hooks\\..\\..\\..\\tmp\\x.mjs"'), 'deny');
+  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\bin\\..\\..\\x.mjs'), 'deny');
+  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\hooks\\.\\.\\.\\tmp\\x.mjs'), 'deny');
+  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\hooks\\.\\guard-files.mjs'), 'deny');
+  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\hooks\\sub\\..\\guard-files.mjs'), 'deny');
+});
