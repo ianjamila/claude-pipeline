@@ -1821,13 +1821,17 @@ function unquotedRuntime(raw) {
     if (c === '\\') i += 2;
     else if (c === "'") { const j = raw.indexOf("'", i + 1); if (j < 0) return true; i = j + 1; }
     else if (c === '"') { i = skipDq(i + 1); if (i < 0) return true; }
-    else if (c === '`' || (c === '$' && /[({'\w@*#?!$-]/.test(raw[i + 1] ?? ''))) return true;
+    else if (c === '`' || (c === '$' && /[({'\w@*#?!$=~^+-]/.test(raw[i + 1] ?? ''))) return true;
     else i++;
   }
   return false;
 }
+// R5-F4 (#266): a word that splits into several words even inside double quotes: `"${(@f)$(cmd)}"` (any flag group), `"$@"`, `"$*"`, `"${@}"`, `"${arr[@]}"`, `"${arr[*]}"`. Probed with zsh 5.9: test
+// "${(@f)$(cat f)}", test "$@" and test "${arr[@]}" hand test several words, so no position can be trusted (quoted or not).
+const SPLITTING_WORD = /\$\{\(|\$[@*]|\$\{[@*]|\[[@*]\]/;
 function testEvaluates(name, args, words, expand, raw) {
   const rtWord = (a) => RUNTIME_PART.test(a) || SUBSCRIPT_EVAL.test(a) || RUNTIME_PART.test(expand(a)) || SUBSCRIPT_EVAL.test(expand(a));
+  if (args.some((a) => SPLITTING_WORD.test(a) || SPLITTING_WORD.test(expand(a)))) return true; // (the words it makes are unknown: no read-only call)
   const unknownShape = args.some(rtWord); // (an unknown shape is no read-only call when ANY word, as written or as expanded, is run-time or may hold a subscript)
   if (!unknownShape) return false;
   if (args.some((a) => RUNTIME_PART.test(expand(a))) && unquotedRuntime(raw)) return true; // (a word the shell splits: no position holds)
@@ -1850,11 +1854,24 @@ function testEvaluates(name, args, words, expand, raw) {
   }
   return true;
 }
-// R4-F2 (#266): an expansion that ASSIGNS (`${y:=w}`, `${y::=w}`, `${y=w}`, `${(L)y:=w}`) inside any command plants the text of w as the value of y; when w holds a subscript form, a later
-// `printf '%d' y` / `(( y ))` / `let y` evaluates it (zsh reads the value of a name as arithmetic). Such a word is no read-only call, whatever the command (a plain-path default stays one).
-const ASSIGNING_EXPANSION = /\$\{(?:\([^)]*\))?[A-Za-z_]\w*(?:\[[^\]]*\])?::?=/;
-function plantsSubscript(argv, env) {
-  return [...argv, ...Object.values(env ?? {})].some((a) => typeof a === 'string' && ASSIGNING_EXPANSION.test(a) && SUBSCRIPT_FORM.test(a));
+// R4-F2 / R5 (#266): an expansion that ASSIGNS (`${y:=w}`, `${y::=w}`, `${y=w}`, `${(L)y:=w}`, `${=y:=w}`, `${(j:):)y:=w}`) plants the text of w as the value of y; a later
+// `printf '%d' y` / `(( y ))` / `let y` reads that value as arithmetic and evaluates a subscript in it (zsh). Rounds 4-5 kept finding one more spelling (a flag, a prefix, the zero-colon form, a bracket
+// printed at run time, a here-string or heredoc), so the class is refused: a command is no read-only call when ANY of its words, its env values, its redirect targets or its own text (which holds a
+// here-string and a redirect word), or a heredoc body of the line, holds an assigning expansion whose default word is not plain path characters. The assignment is found loosely: `${`, then before the
+// closing `}` a name (optional subscript) and `=`, `:=` or `::=`, whatever sits between `${` and the name (a flag group may hold a `)`). Over-matching (`${x:-a=$(b)}`) fails closed.
+const ASSIGNING_LOOSE = [
+  /\$\{[^}]*?[A-Za-z_]\w*(?:\[[^\]]*\])?(?:::?)?=/g,
+  /\$\{\([^]{0,40}?\)[^}]*?[A-Za-z_]\w*(?:\[[^\]]*\])?(?:::?)?=/g, // (a flag group that holds a `}` or ends at a later `)`)
+];
+const PLAIN_DEFAULT = /^[A-Za-z0-9_./~+-]*\}/; // (the default word up to its closing brace: plain path characters only)
+function plantsInText(text) {
+  if (typeof text !== 'string' || !text.includes('${')) return false;
+  return ASSIGNING_LOOSE.some((re) => { for (const m of text.matchAll(re)) if (!PLAIN_DEFAULT.test(text.slice(m.index + m[0].length))) return true; return false; });
+}
+function plantsSubscript(cmd, ctx) {
+  const texts = [...cmd.argv, ...Object.values(cmd.env ?? {}), ...(cmd.redirects ?? []).map((r) => r.target), cmd.raw];
+  // (a heredoc body is on no command: ctx.heredocPlants says whether a body of this text holds one)
+  return ctx?.heredocPlants === true || texts.some(plantsInText);
 }
 function evaluatesSubscript(name, args, ctx, raw) {
   const test = name === 'test' || name === '[' || name === '[[';
@@ -1889,7 +1906,7 @@ function isReadOnly(cmd, ctx) {
   if (judged.unknown) return false;
   const args = judged.args;
   if (evaluatesSubscript(name, argv.slice(1), ctx, cmd.raw)) return false;
-  if (plantsSubscript(argv, cmd.env)) return false;
+  if (plantsSubscript(cmd, ctx)) return false;
   // R1-B1 (#266): a sed / awk program is plain program text, and the expansion above rewrites a same-line name in it (`system=length; awk 'BEGIN { $system("rm S") }'` reads as length(...)
   // while awk runs system()). The program as written must be read-only too.
   if (PROGRAM_TOOLS.has(name) && !(name === 'sed' || name === 'gsed' ? sedReadOnly(argv.slice(1)) : awkReadOnly(argv.slice(1), cmd.env))) return false;
@@ -3243,6 +3260,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
+  ctx.heredocPlants = /<</.test(raw) && plantsInText(raw); // (R5-F3: a heredoc body is on no command; the line's text is judged for an assigning expansion, a quoted body included)
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
   const proseValues = [...prose.values()].flatMap((p) => p.values);
