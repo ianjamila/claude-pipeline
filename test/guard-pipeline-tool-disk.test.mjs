@@ -569,7 +569,8 @@ test('R12-F1: a PowerShell cd hidden in text the guard parses as one quoted word
 // R12-F3: the trusted pipeline CLI keeps working under PowerShell; the refusal names the character that caused it.
 test('R12-F3: trusted pipeline CLI lines with ~, 2>&1, a redirection to a plain file and && are plain under PowerShell', () => {
   const CLI = 'C:/Users/u/.claude/pipeline/bin/pipeline.mjs';
-  assert.equal(psW('node ~/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow');
+  // R13-F3 reverses the former `allow` here: a native command (node) gets `~` literally under PowerShell, so a tilde operand is no longer a trusted tool path (see the R13-F3 test)
+  assert.equal(psW('node ~/.claude/pipeline/bin/pipeline.mjs preflight'), 'deny');
   assert.equal(psW(`node ${CLI} merge --pr 12 2>&1`), 'allow');
   assert.equal(psW(`node ${CLI} merge --pr 12 > out.txt`), 'allow');
   assert.equal(psW(`node ${CLI} merge --pr 12 >> out.txt`), 'allow');
@@ -600,4 +601,51 @@ test('R12-F3: the PowerShell refusal names the first offending character, a dire
   const below = why('cd C:/Users/u/.claude/plugins; echo x <# #>; Get-ChildItem sub');
   assert.equal(below.decision, 'deny');
   assert.match(below.reason, /runs in a folder below ~\/\.claude/, below.reason);
+});
+
+// R13 (push security review): a hidden directory change is refused outright on a not-plain PowerShell line, a location cmdlet with parameters is an unknown cd, and a tilde tool path is not trusted.
+test('R13-F1: a not-plain PowerShell line holding a directory-change word the guard cannot account for is refused (module-qualified, .NET, decoys)', () => {
+  const Q = '\u2018 " \u2019';
+  const P = 'C:/Users/u/.claude/plugins';
+  const lines = [
+    `echo ${Q} ; Microsoft.PowerShell.Management\\Set-Location ${P} ; Set-Content ../settings.json x ; echo ${Q}`,
+    `echo ${Q} ; Microsoft.PowerShell.Management\\Push-Location ${P} ; Set-Content ../settings.json x ; echo ${Q}`,
+    `echo ${Q} ; [IO.Directory]::SetCurrentDirectory('${P}') ; Set-Content ../settings.json x ; echo ${Q}`,
+    `echo ${Q} ; [Environment]::CurrentDirectory = '${P}' ; Set-Content ../settings.json x ; echo ${Q}`,
+    `echo ${Q} ; [system.io.directory]::setcurrentdirectory('${P}') ; Set-Content ../settings.json x ; echo ${Q}`,
+    // a decoy cd the parser reads as a command, so the old count matched: the real one hides in a quote the parser swallows
+    `cd C:/repo ; echo ${Q} ; cd ${P} ; Set-Content ../settings.json x ; echo ${Q}`,
+    `cd C:/repo ; echo <# ' #> ; Microsoft.PowerShell.Management\\Set-Location ${P} ; Set-Content ../settings.json x ; echo <# ' #>`,
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  const why = evaluateBashForFiles(lines[0], { ...WIN, shell: 'powershell' });
+  assert.match(why.reason, /a directory change the guard could not read/, why.reason);
+});
+
+test('R13-F2: a PowerShell location cmdlet with a parameter is an unknown cd, not a guessed target', () => {
+  const lines = [
+    'Set-Location -Path:C:/Users/u/.claude/plugins; Set-Content ../settings.json x',
+    'Push-Location -StackName s C:/Users/u/.claude/plugins; Set-Content ../settings.json x',
+    'Set-Location -LiteralPath C:/Users/u/.claude/plugins; Set-Content ../settings.json x',
+    'Set-Location -Pa C:/Users/u/.claude/plugins; Set-Content ../settings.json x',
+    'sl -Path:C:/Users/u/.claude/plugins; Set-Content ../settings.json x',
+    'Push-Location -PassThru -StackName s C:/Users/u/.claude/plugins; Set-Content ../settings.json x',
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  // a harmless switch alone keeps the target readable; no protected folder is involved
+  assert.equal(psW('Set-Location -PassThru C:/repo; Set-Content ../out.txt x'), 'allow');
+});
+
+test('R13-F3: under PowerShell a tilde operand is not a trusted tool path (a native command gets `~` literally); Bash keeps it', () => {
+  // `node ~/...` can run <cwd>/~/.claude/pipeline/bin/pipeline.mjs, an agent-writable look-alike, so it is NOT trusted: the line names a protected path and the command is not read-only.
+  assert.equal(psW('node ~/.claude/pipeline/bin/pipeline.mjs preflight'), 'deny');
+  assert.equal(psW("node '~/.claude/pipeline/bin/pipeline.mjs' preflight"), 'deny');
+  assert.equal(psW('node "~/.claude/pipeline/bin/pipeline.mjs" preflight'), 'deny');
+  // a tilde after a quote is literal in PowerShell, so the line is not plain
+  assert.equal(psW("Get-Content '~/.claude/settings.json'"), 'deny');
+  // the cmdlet read of the same file stays allowed (a cmdlet expands ~ to the home)
+  assert.equal(psW('Get-Content ~/.claude/settings.json'), 'allow');
+  // Bash / zsh route: unchanged
+  assert.equal(bashW('node ~/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow');
+  assert.equal(run('node ~/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow');
 });
