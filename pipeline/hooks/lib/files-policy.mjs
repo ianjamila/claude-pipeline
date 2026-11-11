@@ -1582,6 +1582,7 @@ const MOVERS = new Set(['mv', 'ln', 'ditto']); // any named protected path count
 const CDPATH_NAMES = ['CDPATH', 'cdpath'];
 const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'source', '.']);
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
+const LAST_WORD_RE = /\$_(?![A-Za-z0-9_])|\$\{_(?:[^A-Za-z0-9_}][^}]*)?\}/; // `$_` / `${_}`: the last word of the previous command (not `$_x`)
 const FD_DUP = /^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
 const FAN_OUT_RE = /(?:^|[\s;&|(`])(?:xargs|parallel)(?=\s|$)/;
@@ -1677,15 +1678,64 @@ function ghReadOnly(args, cmd, ctx) {
   if (words[0] === 'api') return !args.some((a) => /^(?:-o|--output|--cache)/.test(a));
   return Object.hasOwn(GH_PRINTERS, words[0] ?? '') && GH_PRINTERS[words[0]].includes(words[1]);
 }
+// T1.7 (c) / (f): a tool that reads a variable to decide WHERE it writes (git's GIT_TRACE*, less's LESSHISTFILE / LESSOPEN, a pager, rg's config) or what it loads (node's NODE_OPTIONS / NODE_PATH) is
+// not read-only when the line sets one: as a prefix of the command, by an assignment or `export` / `declare -x` anywhere on the line, or through a name a sourced file may have changed.
+// (Same reading as ghEnvTouched; a name only the session's own environment holds is outside the line's control, as for every command here.)
+const GIT_TOOL_ENV = 'GIT_|LESS|PAGER|MANPAGER|MORE|BAT_|RIPGREP_';
+const NODE_TOOL_ENV = 'NODE_OPTIONS|NODE_PATH';
+const envPatterns = new Map();
+function toolEnvTouched(cmd, ctx, src) {
+  let p = envPatterns.get(src);
+  if (!p) {
+    p = {
+      name: new RegExp(`^(?:${src})`),
+      assign: new RegExp(`(?:^|[\\s;&|(\`{])(?:${src})[A-Za-z0-9_]*\\s*(?:\\+?=|\\[)`),
+      declare: new RegExp(`\\b(?:export|declare|typeset|readonly|local|setenv)\\b[^;&|\\n]*(?<![A-Za-z0-9_])(?:${src})[A-Za-z0-9_]*`),
+    };
+    envPatterns.set(src, p);
+  }
+  const names = [...Object.keys(cmd.env ?? {}), ...Object.keys(ctx.vars ?? {}), ...(ctx.unknownVars ?? []), ...(ctx.pickUnknown ?? []), ...(ctx.srcChanged ?? []), ...(ctx.srcTouched ?? [])];
+  if (names.some((n) => p.name.test(n))) return true;
+  const line = ctx.ghLine ?? '';
+  return p.assign.test(line) || p.declare.test(line);
+}
+
+// T1.7 (a): isReadOnly judges the words the shell will pass. A same-line name is replaced by its value first (`D=-delete; find S $D`); a word whose value is still only known at run time
+// ($NAME no assignment gave, `$(…)`, a backtick) can be an option, so it is no read-only call. Where such a word can stand for an option: a word that starts with `$` or a backtick (the
+// unknown part can be the whole option, `$O` = `-o/x`) or with `-` (`-delet$X`); for sed and awk, whose program is a plain word, any run-time part of it (`$1` and `$NF` of a quoted
+// program are no shell variables and stay as they are).
+const OPTION_TOOLS = new Set(['find', 'git', 'jq', 'tree', 'xxd', 'openssl', 'sort', 'rg']);
+const PROGRAM_TOOLS = new Set(['sed', 'gsed', 'awk', 'gawk', 'mawk', 'nawk']);
+const RUNTIME_PART = /[$`]/;
+function judgedWords(name, args, ctx) {
+  if (!args.some((a) => RUNTIME_PART.test(a))) return { args, unknown: false };
+  const touched = (n) => Object.hasOwn(ctx.vars ?? {}, n) || ctx.unknownVars?.has(n) || ctx.pickUnknown?.has(n) || ctx.srcChanged?.has(n) || ctx.srcTouched?.has(n) || ctx.unknownAll === true;
+  let unknown = false;
+  const out = args.map((a) => {
+    if (!RUNTIME_PART.test(a)) return a;
+    const e = expandRefs(a, ctx);
+    if (RUNTIME_PART.test(e)) {
+      if (PROGRAM_TOOLS.has(name)) { if (/`|\$[({]/.test(e) || [...e.matchAll(/\$(\w+)/g)].some((m) => touched(m[1]))) unknown = true; }
+      else if (OPTION_TOOLS.has(name) && (/^[$`]/.test(e) || e.startsWith('-'))) unknown = true;
+    }
+    return e;
+  });
+  return { args: out, unknown };
+}
 function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
   if (!argv.length) return false;
   const name = baseOf(argv[0]);
-  const args = argv.slice(1);
+  const judged = judgedWords(name, argv.slice(1), ctx);
+  if (judged.unknown) return false;
+  const args = judged.args;
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
-  if (READ_ONLY.has(name)) return !(name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre=')));
+  if (READ_ONLY.has(name)) {
+    if (name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre='))) return false;
+    return !(['less', 'more', 'bat', 'rg'].includes(name) && toolEnvTouched(cmd, ctx, GIT_TOOL_ENV));
+  }
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
-  if (name === 'git') return gitReadOnly(args);
+  if (name === 'git') return gitReadOnly(args) && !toolEnvTouched(cmd, ctx, GIT_TOOL_ENV);
   if (name === 'gh') return ghReadOnly(args, cmd, ctx);
   if (name === 'jq') return !args.some((a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place');
   if (name === 'sed' || name === 'gsed') return sedReadOnly(args);
@@ -1695,8 +1745,9 @@ function isReadOnly(cmd, ctx) {
   if (name === 'xxd') return !args.includes('-r') && positional(args).length <= 1;
   if (name === 'openssl') return args[0] === 'dgst' && !args.some((a) => a === '-out' || a === '-sign' || a === '-prverify');
   if ((name === 'python' || name === 'python3') && args[0] === '-m' && args[1] === 'json.tool') return positional(args.slice(2)).length <= 1;
-  if (isPipelineTool(argv[0], ctx)) return true;
-  if (name === 'node') return isPipelineTool(argv[1], ctx) || (cmd.raw.includes('\\') && pipelineToolInRaw(cmd.raw, ctx));
+  // (T1.7 f: the trusted CLI runs foreign code when NODE_OPTIONS / NODE_PATH make node load it)
+  if (isPipelineTool(argv[0], ctx)) return !toolEnvTouched(cmd, ctx, NODE_TOOL_ENV);
+  if (name === 'node') return (isPipelineTool(argv[1], ctx) || (cmd.raw.includes('\\') && pipelineToolInRaw(cmd.raw, ctx))) && !toolEnvTouched(cmd, ctx, NODE_TOOL_ENV);
   if (name === 'pwsh' || name === 'powershell') return pwshReadOnly(argv);
   return PS_READ_ONLY.has(name);
 }
@@ -3422,7 +3473,7 @@ function evaluateBashForFilesFrame(command, opts) {
       for (const target of [r.target, ...(r.target.startsWith('&') ? [r.target.slice(1)] : []), ...braceExpand(expandRefs(r.target, ctx), ctx).split(/\s+/).filter((x) => x && x !== r.target)]) {
       const e = expandRefs(target, ctx);
       // Why: a target built at run time (`echo settings.json`, an unset name) inside a protected directory can be any file there
-      if (/[`$]/.test(e) && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTree(d))) return deny(`the command redirects output to ${target}, a name only known at run time, inside a protected pipeline directory, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
+      if ((/[`$]/.test(e) && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTree(d))) || (protectedInRaw && LAST_WORD_RE.test(e))) return deny(`the command redirects output to ${target}, a name only known at run time, inside a protected pipeline directory, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
       const abs = isAbs(e) ? [pathsFor().normalize(e)] : dirs.map((d) => pathsFor().join(d, e));
       const viaLink = abs.some((p) => !/[*?[]/.test(p) && (ctx.hit(realResolve(p, ctx.api)) || ctx.hitInode(p)));
       if (m.rawHit(target, dirs) || m.pathHit(target, dirs, true) || viaLink) return deny(`the command redirects output to ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
@@ -3454,7 +3505,10 @@ function evaluateBashForFilesFrame(command, opts) {
   const tokenHitAll = (t) => m.rawHit(t, dirs) || m.pathHit(t, dirs, true);
   // does the command name a protected file anywhere (source or destination)?
   // (anc 'pipeline': a repo's .review folder does not count as a holder, see mentions)
-  const names = (c, anc = true) => insideRoot
+  // T1.7 (b): `$_` is the last word of the previous command, a name only known at run time (`echo S; tee $_`, `cat TR; node x.mjs $_`): when the line names a protected file at all, a command that
+  // uses it (as a word, a prefix value or a redirect target) may be using that file
+  const usesLast = (c) => protectedInRaw && [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => LAST_WORD_RE.test(String(w)));
+  const names = (c, anc = true) => insideRoot || usesLast(c)
     || m.rawHit(rawOfCmd(c), dirs) || winAncestor(c)
     || Object.values(c.env).some((v) => m.rawHit(v, dirs))
     || (!tooMany && opts._writesOnly !== true && wordsOf(c).some((t) => tokenHit(t, anc))); // (a rerun that only assumes a directory judges writes: a bare word that resolves into it names nothing)
@@ -3466,6 +3520,7 @@ function evaluateBashForFilesFrame(command, opts) {
     if (opts._writesOnly === true && (impliesCwdWrite(c) || (runsInlineCode(c, ctx) && WRITE_HINT.test(c.raw ?? c.argv.join(' '))))) return true;
     // (a destination word is never filtered: a writer may create a protected name that does not exist yet)
     if (DEST_ONLY.has(name)) {
+      if (usesLast(c)) return true; // (T1.7 b)
       if (destsOf(wordsOf(c), name).some(tokenHitAll)) return true;
       if (makesHardLinks(c) && wordsOf(c).some(tokenHitAll)) return true; // (R1-F2: and its sources)
       // (#111: `cp x .review/{state,y}.json` -- the parser keeps only the last expansion as the destination, but a brace form is a family of targets: each expansion is judged as one)
