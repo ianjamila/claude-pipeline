@@ -12,7 +12,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { pathSpellings } from '../pipeline/lib/worktree-prune/inspect.mjs';
-import { claudeConfigDirs, lastCwd, liveSessionsIn, psStarts, scanLiveSessions } from '../pipeline/lib/worktree-prune/live-sessions.mjs';
+import { callerOf, claudeConfigDirs, lastCwd, liveSessionsIn, psAncestors, psStarts, scanLiveSessions } from '../pipeline/lib/worktree-prune/live-sessions.mjs';
 import { removeWorktree } from '../pipeline/lib/worktree-prune/act.mjs';
 import { inUseReasons, liveSessionReasons } from '../pipeline/lib/worktree-prune/rules.mjs';
 
@@ -679,4 +679,79 @@ test('liveSessionsIn strict: a logged alias behind an unreadable ancestor (chmod
   } finally {
     chmodSync(locked, 0o755);
   }
+});
+
+// ---- #245: one record per live process; the full session id and the live records for the caller check (opt-in `detail`) ----
+test('scan: records are one entry only when equivalent (same session id, pid AND start time); two live pids sharing an id are two entries, in either order', () => {
+  const sid = 'aaaaaaaa-1111';
+  for (const [firstPid, secondPid] of [[11, 12], [12, 11]]) {
+    const w = world();
+    w.addSession({ pid: firstPid, sid, lines: [w.wt] });
+    w.addSession({ config: '.claude-two', pid: secondPid, sid, lines: [w.wt] });
+    const scan = w.scan([11, 12], { detail: true });
+    assert.deepEqual(scan.sessions.map((s) => s.pid).sort(), [11, 12]);
+    assert.ok(scan.sessions.every((s) => s.sessionId === sid));
+    const hits = liveSessionsIn(scan, pathSpellings(w.wt), { full: true }).hits;
+    assert.deepEqual(hits.map((h) => [h.sessionId, h.pid]).sort(), [[sid, 11], [sid, 12]]);
+    assert.deepEqual(liveSessionsIn(scan, pathSpellings(w.wt)).hits.map((h) => h.pid).sort(), [11, 12], 'prune sees both too');
+  }
+  // the two-account copy of ONE record is still one entry
+  const copy = world();
+  copy.addSession({ pid: 11, sid, lines: [copy.wt] });
+  copy.addSession({ config: '.claude-two', pid: 11, sid, lines: [copy.wt] });
+  assert.equal(copy.scan([11]).sessions.length, 1);
+  // same id and pid but another start time: the record that does not match ps is not that process
+  const reuse = world();
+  reuse.addSession({ pid: 11, sid, lines: [reuse.wt] });
+  reuse.addSession({ config: '.claude-two', pid: 11, sid, procStart: 'Mon Jan 1 00:00:00 2024', lines: [reuse.wt] });
+  assert.equal(reuse.scan([11]).sessions.length, 1);
+});
+
+test('scan detail: sessions carry the full id and `live` lists every running record (placed or not, procStart checked); the default shape is unchanged', () => {
+  const w = world();
+  w.addSession({ pid: 11, sid: 'aaaaaaaa-1111', lines: [w.wt] });
+  w.addSession({ pid: 12, sid: 'bbbbbbbb-2222' }); // no transcript, start folder = home: placed there
+  w.addSession({ pid: 13, sid: 'cccccccc-3333', procStart: 'Mon Jan 1 00:00:00 2024' }); // a reused pid
+  w.addSession({ pid: 14, sid: 'dddddddd-4444' }); // not running
+  const plain = w.scan([11, 12, 13]);
+  assert.deepEqual(plain.sessions.map((s) => Object.keys(s).sort()), [['cwd', 'id', 'pid'], ['cwd', 'id', 'pid']]);
+  assert.equal('live' in plain, false);
+  const scan = w.scan([11, 12, 13], { detail: true });
+  assert.deepEqual(scan.live, [{ pid: 11, sessionId: 'aaaaaaaa-1111' }, { pid: 12, sessionId: 'bbbbbbbb-2222' }]);
+  assert.deepEqual(scan.sessions.map((s) => s.sessionId), ['aaaaaaaa-1111', 'bbbbbbbb-2222']);
+});
+
+test('callerOf: the nearest ancestor with a live record, and only when the env names exactly that record', () => {
+  const scan = { available: true, sessions: [], unplaced: [], live: [{ pid: 100, sessionId: 'aaaaaaaa-1111' }, { pid: 200, sessionId: 'bbbbbbbb-2222' }] };
+  const at = (env, chain) => callerOf(scan, env, () => chain);
+  const env = (sid, pid) => ({ CLAUDE_CODE_SESSION_ID: sid, CLAUDE_PID: String(pid) });
+  assert.deepEqual(at(env('bbbbbbbb-2222', 200), [900, 200, 100, 1]), { sessionId: 'bbbbbbbb-2222', pid: 200 });
+  assert.equal(at(env('aaaaaaaa-1111', 100), [900, 200, 100, 1]), null, 'the nearer record is another session');
+  assert.deepEqual(at(env('aaaaaaaa-1111', 100), [900, 100, 1]), { sessionId: 'aaaaaaaa-1111', pid: 100 });
+  assert.equal(at(env('aaaaaaaa-1111', 100), [900, 800, 1]), null, 'no record on the chain');
+  assert.equal(at(env('aaaaaaaa-1111', 100), null), null, 'no ancestry');
+  assert.equal(at({}, [100]), null);
+  assert.equal(at(env('aaaaaaaa-1111', 100), []), null);
+  assert.equal(callerOf({ available: false, reason: 'x' }, env('aaaaaaaa-1111', 100), () => [100]), null);
+  assert.equal(callerOf({ ...scan, live: undefined }, env('aaaaaaaa-1111', 100), () => [100]), null);
+  let asked = 0;
+  assert.equal(callerOf(scan, {}, () => { asked += 1; return [100]; }), null);
+  assert.equal(asked, 0, 'the process table is not read when the env cannot name a caller');
+  // two different sessions listed under one pid: ambiguous, fail closed
+  const twin = { ...scan, live: [{ pid: 100, sessionId: 'aaaaaaaa-1111' }, { pid: 100, sessionId: 'bbbbbbbb-2222' }] };
+  assert.equal(callerOf(twin, env('aaaaaaaa-1111', 100), () => [100]), null);
+});
+
+test('psAncestors: walks parent pids from the start pid up one process table; fails closed on a loop or an unreadable table', () => {
+  const table = '  900   800\n  800   100\n  100     1\n    1     0\n';
+  const ok = (stdout) => () => ({ status: 0, stdout });
+  assert.deepEqual(psAncestors(900, ok(table)), [900, 800, 100, 1]);
+  assert.deepEqual(psAncestors(100, ok(table)), [100, 1]);
+  assert.deepEqual(psAncestors(777, ok(table)), [777], 'a pid the table does not know ends the walk');
+  assert.deepEqual(psAncestors(5, ok('5 6\n6 5\n')), [5, 6], 'a loop ends the walk');
+  assert.equal(psAncestors(900, () => ({ status: 1, stdout: '' })), null);
+  assert.equal(psAncestors(900, () => ({ status: 0, stdout: 'garbage' })), null);
+  assert.equal(psAncestors(900, () => ({ status: 0, stdout: '', error: new Error('nope') })), null);
+  const real = psAncestors(process.pid);
+  if (!WIN) assert.ok(real?.[0] === process.pid && real.length >= 2, 'the real ps knows this process and its parent');
 });

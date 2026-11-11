@@ -84,6 +84,29 @@ export function psStarts(pids, run = runPs) {
   return out.size === 0 && r.status !== 1 ? null : out;
 }
 
+// The process chain of `startPid`: [startPid, its parent, that one's parent, ...] from ONE read of the process table (`ps -A -o
+// pid=,ppid=`), ending at pid 1, at a pid the table does not know, or at a loop. null when ps could not be asked or its answer
+// is not a table. `run` is a test seam. Used to tell which open session is the one running the command (callerOf).
+export function psAncestors(startPid, run = runPs) {
+  const r = run(['-A', '-o', 'pid=,ppid=']);
+  if (!r || r.error || r.signal || r.status !== 0) return null;
+  const parent = new Map();
+  for (const line of String(r.stdout ?? '').split('\n').filter((l) => l.trim())) {
+    const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (!m) return null;
+    parent.set(Number(m[1]), Number(m[2]));
+  }
+  if (parent.size === 0) return null;
+  const chain = [startPid];
+  const seen = new Set(chain);
+  for (let pid = parent.get(startPid); pid !== undefined && pid > 1 && !seen.has(pid) && chain.length < 256; pid = parent.get(pid)) {
+    chain.push(pid);
+    seen.add(pid);
+  }
+  if (parent.get(chain[chain.length - 1]) === 1 && !seen.has(1)) chain.push(1);
+  return chain;
+}
+
 // The `cwd` of the last transcript line that has one, reading from the end with a window that grows (1 MB, x4) until one is
 // found: a transcript can be tens of MB and its last line is where the session is now. null: the file has no cwd at all.
 // Throws when the file cannot be read, or the last cwd lies further back than MAX_WINDOW.
@@ -224,9 +247,12 @@ function readRecords(configs) {
 // elsewhere too), `starts(pids)` replaces the ps call (-> Map<pid, start> | null).
 // `deadlineAt` (epoch ms, with `now()`; both optional) is for callers with a time budget (stack-stop): the ps timeout becomes
 // min(30 s, time left), and under MIN_REMAINING_MS before ps or before placing a session the scan stops and lists
-// "deadline reached ..." in `unplaced` (the caller then fails closed). A transcript tail read already started is not
+// "deadline reached ..." in `unplaced` (the caller then fails closed). `detail` (`pipeline worktrees sessions`) adds the full
+// `sessionId` to every session and `live: [{ pid, sessionId }]`, every record whose process runs (start time checked), placed or not.
+// Records are one entry only when equivalent (same session id, pid and start time: the copy each account lists); two running
+// pids that share a session id are two entries. A transcript tail read already started is not
 // interrupted (bounded by lastCwd's window cap). Without `deadlineAt` nothing here changes: `starts(pids)` is called as before.
-export function scanLiveSessions({ home = os.homedir(), env = process.env, platform = process.platform, starts = psStarts, deadlineAt, now = Date.now } = {}) {
+export function scanLiveSessions({ home = os.homedir(), env = process.env, platform = process.platform, starts = psStarts, deadlineAt, now = Date.now, detail = false } = {}) {
   const timed = Number.isFinite(deadlineAt);
   const left = () => deadlineAt - now();
   const DEADLINE = 'deadline reached before every open session was placed';
@@ -260,10 +286,12 @@ export function scanLiveSessions({ home = os.homedir(), env = process.env, platf
       return { available: true, sessions: [], unplaced };
     }
     const sessions = [];
+    const live = [];
     const seen = new Set();
     for (const rec of records) {
       const start = running.get(rec.pid);
-      if (start === undefined || seen.has(rec.sessionId)) continue;
+      const identity = `${rec.sessionId}\0${rec.pid}\0${norm(rec.procStart)}`;
+      if (start === undefined || seen.has(identity)) continue;
       if (timed && left() < MIN_REMAINING_MS) {
         unplaced.push(DEADLINE);
         break;
@@ -273,21 +301,22 @@ export function scanLiveSessions({ home = os.homedir(), env = process.env, platf
         // A start time in a shape ps does not use cannot be compared: a lone session would look like a reused pid.
         if (typeof rec.procStart !== 'string' || !START_SHAPE.test(norm(rec.procStart))) {
           unplaced.push(`${label}: procStart is in an unrecognised format`);
-          seen.add(rec.sessionId);
+          seen.add(identity);
           continue;
         }
         if (norm(rec.procStart) !== start) continue; // the pid now belongs to another process
       }
-      seen.add(rec.sessionId); // both accounts list a session they share: count it once
+      seen.add(identity); // both accounts list a session they share: count it once
+      if (!live.some((l) => l.pid === rec.pid && l.sessionId === rec.sessionId)) live.push({ pid: rec.pid, sessionId: rec.sessionId });
       try {
         const cwds = placeSession(rec, configs);
         if (cwds.length === 0) unplaced.push(`${label}: working folder unknown`);
-        for (const cwd of cwds) sessions.push({ id: rec.sessionId.slice(0, 8), pid: rec.pid, cwd });
+        for (const cwd of cwds) sessions.push({ id: rec.sessionId.slice(0, 8), pid: rec.pid, cwd, ...(detail ? { sessionId: rec.sessionId } : {}) });
       } catch (err) {
         unplaced.push(`${label}: transcript unreadable (${err?.code ?? oneLine(err)})`);
       }
     }
-    return { available: true, sessions, unplaced };
+    return { available: true, sessions, unplaced, ...(detail ? { live } : {}) };
   } catch (err) {
     return { available: true, sessions: [], unplaced: [`scanning Claude sessions failed: ${oneLine(err)}`] };
   }
@@ -296,11 +325,12 @@ export function scanLiveSessions({ home = os.homedir(), env = process.env, platf
 // What a scan means for one worktree. `spellings` = every way the worktree's path may be written (pathSpellings, taken while
 // the worktree is still where it was). A session is in it when its working folder, as logged or resolved through symlinks,
 // equals or lies below one of them (case rules as isInside: folded on macOS and Windows; `platform` is a test seam).
-// -> { hits: [{ id, pid }], unplaced: string[] }. An unavailable scan says nothing.
+// -> { hits: [{ id, pid }], unplaced: string[] }. An unavailable scan says nothing. `full` (needs a `detail` scan) adds the
+// full `sessionId` to every hit and keeps hits of two pids that share one id apart.
 // `strict` (`pipeline worktrees sessions`; prune leaves it off): a working folder whose realpath fails, for any reason (denied,
 // gone, a loop), and that does not match by its logged spelling may be an alias of the folder (a symlink under an unreadable
 // ancestor, or one deleted since) and cannot be told from a folder elsewhere, so it goes to `unplaced` naming the session and folder.
-export function liveSessionsIn(scan, spellings, { platform = process.platform, strict = false } = {}) {
+export function liveSessionsIn(scan, spellings, { platform = process.platform, strict = false, full = false } = {}) {
   if (!scan?.available) return { hits: [], unplaced: [] };
   const roots = spellings.map(unFirm);
   const forms = (cwd) => {
@@ -318,11 +348,93 @@ export function liveSessionsIn(scan, spellings, { platform = process.platform, s
   for (const s of scan.sessions) {
     const { forms: seen, failed } = forms(s.cwd);
     if (seen.some((c) => roots.some((r) => isInside(c, r, platform)))) {
-      if (!hits.some((h) => h.id === s.id && h.pid === s.pid)) hits.push({ id: s.id, pid: s.pid });
+      if (!hits.some((h) => h.id === s.id && h.pid === s.pid && h.sessionId === (full ? s.sessionId : undefined))) hits.push({ id: s.id, pid: s.pid, ...(full ? { sessionId: s.sessionId } : {}) });
     } else if (strict && failed) {
       const note = `open session ${s.id} pid ${s.pid}: working folder ${JSON.stringify(s.cwd)} cannot be resolved (${failed}), so it cannot be told apart from an alias of this folder; close that session`;
       if (!unplaced.includes(note)) unplaced.push(note);
     }
   }
   return { hits, unplaced };
+}
+
+// Which open session is the one running this very command? The env of a Claude Code session names it (CLAUDE_CODE_SESSION_ID and
+// CLAUDE_PID), but a child session inherits its parent's env, so the env alone is not enough: the caller is the record of the
+// NEAREST ancestor process (`ancestors()` -> [pid, parent, ...] from this process's parent, or null) that has a live record in
+// `scan.live` (a `detail` scan), and only when the env names exactly that record. Anything else (no env, a malformed id, a nearer
+// record of another session, no record on the chain, two sessions under one pid, no ancestry) is null: nothing is "self".
+// -> { sessionId, pid } | null. The process table is read only when the env could name a caller.
+export function callerOf(scan, env, ancestors) {
+  const sessionId = env?.CLAUDE_CODE_SESSION_ID;
+  const pidText = env?.CLAUDE_PID;
+  if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId) || typeof pidText !== 'string' || !/^[1-9]\d*$/.test(pidText)) return null;
+  if (!scan?.available || !Array.isArray(scan.live)) return null;
+  const chain = ancestors();
+  if (!Array.isArray(chain)) return null;
+  for (const pid of chain) {
+    const ids = new Set(scan.live.filter((l) => l.pid === pid).map((l) => l.sessionId));
+    if (ids.size === 0) continue;
+    return ids.size === 1 && ids.has(sessionId) && pid === Number(pidText) ? { sessionId, pid } : null;
+  }
+  return null;
+}
+
+// ---- the per-session files of a dashboard (<dir>/<sessionId>.json: { sessionId, cwd, ts, ... }), advisory only ----------------
+// `pipeline worktrees sessions --session-files DIR`: a session that was busy in a worktree within `withinHours` and whose process
+// is no longer there to be seen (or never was: another tool) still counts as "someone worked here lately". The live scan stays the
+// gate; these files only add to it. Every readable file is parsed first. Its time is `ts` when that is an ISO 8601 date WITH `Z`
+// or an offset, else the file's mtime. Recent = age <= withinHours (the boundary counts; a time in the future is not old). A file
+// that cannot be read, parsed or has no string `cwd` is judged by its mtime: recent -> `unplaced` (we cannot tell where it was),
+// older -> skipped. A recent file whose cwd (as logged, or resolved) is inside one of `spellings` is listed; it is `self` when its
+// name AND its sessionId (when it has one) are `callerId`.
+// -> { files: [{ id, ageHours, self? }], unplaced: string[] }; a folder that cannot be listed is one `unplaced` entry.
+const TS_SHAPE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
+export function recentSessionFilesIn(dir, spellings, { withinHours = 24, now = Date.now(), callerId = null, platform = process.platform } = {}) {
+  const files = [];
+  const unplaced = [];
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    return { files, unplaced: [`cannot read the session files folder ${dir} (${err?.code ?? oneLine(err)})`] };
+  }
+  const withinMs = withinHours * 3.6e6;
+  const roots = spellings.map(unFirm);
+  for (const name of names.filter((n) => n.endsWith('.json')).sort()) {
+    const file = path.join(dir, name);
+    let mtimeMs;
+    try {
+      const st = statSync(file);
+      if (!st.isFile()) continue;
+      mtimeMs = st.mtimeMs;
+    } catch (err) {
+      if (!goneCode(err)) unplaced.push(`session file ${name}: unreadable`);
+      continue;
+    }
+    let rec = null;
+    let problem = null;
+    try {
+      rec = JSON.parse(readFileSync(file, 'utf8'));
+      if (!rec || typeof rec !== 'object' || Array.isArray(rec) || typeof rec.cwd !== 'string' || rec.cwd === '') problem = 'malformed';
+    } catch (err) {
+      if (err?.code === 'ENOENT') continue;
+      problem = err instanceof SyntaxError ? 'malformed' : 'unreadable';
+    }
+    const tsMs = !problem && typeof rec.ts === 'string' && TS_SHAPE.test(rec.ts) ? Date.parse(rec.ts) : Number.NaN;
+    const time = Number.isFinite(tsMs) ? tsMs : mtimeMs;
+    const age = now - time;
+    if (age > withinMs) continue;
+    if (problem) {
+      unplaced.push(`session file ${name}: ${problem}`);
+      continue;
+    }
+    let real = rec.cwd;
+    try {
+      real = realpathSync(rec.cwd);
+    } catch { /* gone or unreadable: its logged spelling only */ }
+    if (![rec.cwd, real].map(unFirm).some((c) => roots.some((r) => isInside(c, r, platform)))) continue;
+    const stem = name.slice(0, -'.json'.length);
+    const self = callerId !== null && stem === callerId && (!('sessionId' in rec) || rec.sessionId === callerId);
+    files.push({ id: stem.slice(0, 8), ageHours: Math.round(Math.max(0, age) / 3.6e4) / 100, ...(self ? { self: true } : {}) });
+  }
+  return { files, unplaced };
 }

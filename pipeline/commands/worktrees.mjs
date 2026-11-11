@@ -20,7 +20,7 @@ import {
 } from '../lib/schedule.mjs';
 import { holdingRoot, listHolding, purgeHoldingLocked } from '../lib/worktree-prune/act.mjs';
 import { pathSpellings } from '../lib/worktree-prune/inspect.mjs';
-import { liveSessionsIn, scanLiveSessions } from '../lib/worktree-prune/live-sessions.mjs';
+import { callerOf, liveSessionsIn, psAncestors, recentSessionFilesIn, scanLiveSessions } from '../lib/worktree-prune/live-sessions.mjs';
 import { KEEP_PREFIX, lockNameFor, modeAllows } from '../lib/worktree-prune/rules.mjs';
 import { loadRepo, prune, pruneLogDir, summaryOnly } from '../lib/worktree-prune/run.mjs';
 
@@ -31,14 +31,14 @@ export const meta = {
     'pipeline worktrees keep NAME [--reason TEXT] [--repo DIR]   -> {ok, slug, locked}',
     'pipeline worktrees unkeep NAME [--run ID] [--repo DIR]   -> {ok, slug, unlocked}',
     'pipeline worktrees holding [--purge] [--repo DIR]   -> {ok, batches:[...], purged:[...]}',
-    'pipeline worktrees sessions DIR   -> {ok, dir, available, open:[{id, pid}], unplaced:[...], reason?}   read-only, needs no repo, config or GitHub; exit 0 = the scan is complete and no session is open in DIR, 1 = a session is open there, 2 = usage, 3 = unsure (scan unavailable or partial, or a session folder that cannot be resolved): treat every non-zero as "keep"',
+    'pipeline worktrees sessions DIR [--self-ok] [--session-files FOLDER [--within HOURS]]   -> {ok, dir, available, caller, open:[{id, pid, self?}], unplaced:[...], onlySelf, recentSessionFiles?:[{id, ageHours, self?}], reason?}   read-only, needs no repo, config or GitHub; exit 0 = the scan is complete and no session is open in DIR, 1 = a session is open there (or another session\'s file in FOLDER was active there within HOURS, default 24; FOLDER may also come from PIPELINE_SESSION_FILES_DIR), 2 = usage, 3 = unsure (scan unavailable or partial, a session folder that cannot be resolved, a recent session file that cannot be read): treat every non-zero as "keep". caller = the session running this command (null when it cannot be told); --self-ok: exit 0 also when the only open session is the caller (self), exit 3 and exit 1 for anything else unchanged; it does not replace the lsof cwd check',
     'pipeline worktrees schedule (--install [--at HH:MM] | --remove | --status) [--repo DIR]   -> {ok, installed, line, timezone, warning?} | {ok, removed} | {ok, installed, line}   (macOS: a launchd LaunchAgent; adds plist, changed, loaded, note)',
   ].join('\n'),
 };
 
 export { KEEP_PREFIX };
 export { applyLaunchd, applySchedule, detectTimezone, findOnPath, scheduleLabel, scheduleLine, scheduleMarker, schedulePlist } from '../lib/schedule.mjs';
-const SUBS = 'prune [--dry-run] [--notify] [--summary-only] | keep NAME [--reason TEXT] | unkeep NAME [--run ID] | holding [--purge] | sessions DIR | schedule (--install [--at HH:MM] | --remove | --status)';
+const SUBS = 'prune [--dry-run] [--notify] [--summary-only] | keep NAME [--reason TEXT] | unkeep NAME [--run ID] | holding [--purge] | sessions DIR [--self-ok] [--session-files FOLDER [--within HOURS]] | schedule (--install [--at HH:MM] | --remove | --status)';
 
 // NAME is a direct child of <root>/<worktree_dir>: no separators, no dot-names (the quarantine), no control characters.
 function findWorktree(repo, positionals, sub) {
@@ -116,9 +116,15 @@ async function holding(rest, ctx) {
 // does not apply). Strict where prune is tolerant, because the answer gates a removal done by hand: exit 0 ONLY for an available,
 // complete scan with no match; a hit is exit 1 (and wins over an unplaced session); an unavailable scan, any unplaced session and,
 // in strict matching, any session folder that cannot be resolved (even ENOENT: a deleted alias looks like a deleted target) is exit 3.
-// ctx.sessionsDeps = { home, starts, platform } are test seams of the scan.
+// The caller's own session is told apart (`self`): the nearest ancestor process with a live session record, and only when CLAUDE_CODE_SESSION_ID
+// and CLAUDE_PID both name that record (callerOf); otherwise nothing is self. Exit codes stay as above, except `--self-ok`: self entries
+// then do not count, so exit 0 also when the caller is the only open session, and a self hit beside an unsure scan is 3, not 1. `--session-files
+// FOLDER` (or PIPELINE_SESSION_FILES_DIR) adds a dashboard's per-session files active within --within hours (default 24) in DIR: another
+// session's file is exit 1, one that cannot be read or listed is 3, the caller's own file never blocks. Both are advisory next to the scan
+// and the process check, and --self-ok does not replace the `lsof` cwd check a hand removal still needs.
+// ctx.sessionsDeps = { home, starts, platform, ancestors, now } are test seams (ancestors() -> pids from this process's parent, or null).
 async function sessions(rest, ctx) {
-  const { positionals } = parseCommandArgs(rest, {});
+  const { values, positionals } = parseCommandArgs(rest, { 'self-ok': { type: 'boolean' }, 'session-files': { type: 'string' }, within: { type: 'string' } });
   if (positionals.length !== 1) throw new UsageError('worktrees sessions takes exactly one DIR');
   const dir = path.resolve(ctx?.cwd ?? process.cwd(), positionals[0]);
   let isDir = false;
@@ -126,13 +132,42 @@ async function sessions(rest, ctx) {
     isDir = statSync(dir).isDirectory();
   } catch { /* reported below */ }
   if (!isDir) throw new UsageError(`not a directory: ${dir}`);
+  const env = ctx?.env ?? process.env;
+  const filesDir = values['session-files'] ?? (env.PIPELINE_SESSION_FILES_DIR || undefined);
+  if (values['session-files'] !== undefined && values['session-files'] === '') throw new UsageError('--session-files needs a folder');
+  let withinHours;
+  if (values.within !== undefined) {
+    withinHours = /^\d+(\.\d+)?$/.test(values.within) ? Number(values.within) : Number.NaN;
+    if (!(withinHours > 0)) throw new UsageError('--within must be a number of hours above 0');
+    if (filesDir === undefined) throw new UsageError('--within needs --session-files (or PIPELINE_SESSION_FILES_DIR)');
+  }
   const deps = ctx?.sessionsDeps ?? {};
-  const scan = scanLiveSessions({ home: deps.home ?? os.homedir(), env: ctx?.env ?? process.env, ...(deps.platform ? { platform: deps.platform } : {}), ...(deps.starts ? { starts: deps.starts } : {}) });
-  const { hits, unplaced } = liveSessionsIn(scan, pathSpellings(dir), { strict: true });
-  const exitCode = hits.length ? EXIT.FAILED : !scan.available || unplaced.length ? EXIT.UNAVAILABLE : EXIT.OK;
+  const scan = scanLiveSessions({ home: deps.home ?? os.homedir(), env, detail: true, ...(deps.platform ? { platform: deps.platform } : {}), ...(deps.starts ? { starts: deps.starts } : {}) });
+  const found = liveSessionsIn(scan, pathSpellings(dir), { strict: true, full: true });
+  const unplaced = [...found.unplaced];
+  const caller = callerOf(scan, env, deps.ancestors ?? (() => psAncestors(process.ppid)));
+  const isSelf = (h) => caller !== null && h.sessionId === caller.sessionId && h.pid === caller.pid;
+  const open = found.hits.map((h) => ({ id: h.id, pid: h.pid, ...(isSelf(h) ? { self: true } : {}) }));
+  let recent;
+  if (filesDir !== undefined) {
+    const r = recentSessionFilesIn(path.resolve(ctx?.cwd ?? process.cwd(), filesDir), pathSpellings(dir), {
+      withinHours: withinHours ?? 24, now: deps.now ? deps.now() : Date.now(), callerId: caller?.sessionId ?? null,
+    });
+    recent = r.files;
+    unplaced.push(...r.unplaced);
+  }
+  const others = open.filter((e) => !e.self).length + (recent ?? []).filter((f) => !f.self).length;
+  const onlySelf = Boolean(scan.available) && open.length > 0 && others === 0 && unplaced.length === 0;
+  const unsure = !scan.available || unplaced.length > 0;
+  // Default: any open session (the caller's too) or another session's recent file is 1; unsure is 3. --self-ok leaves the caller's own entries out of the verdict.
+  const blocked = values['self-ok'] ? others > 0 : open.length > 0 || (recent ?? []).some((f) => !f.self);
+  const exitCode = blocked ? EXIT.FAILED : unsure ? EXIT.UNAVAILABLE : EXIT.OK;
   return {
     exitCode,
-    output: { ok: exitCode === EXIT.OK, dir, available: Boolean(scan.available), ...(scan.available ? {} : { reason: scan.reason }), open: hits, unplaced },
+    output: {
+      ok: exitCode === EXIT.OK, dir, available: Boolean(scan.available), ...(scan.available ? {} : { reason: scan.reason }),
+      caller: caller === null ? null : caller.sessionId.slice(0, 8), open, unplaced, onlySelf, ...(recent === undefined ? {} : { recentSessionFiles: recent }),
+    },
   };
 }
 
