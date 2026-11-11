@@ -394,3 +394,24 @@ test('a registry or stacks config that exists but cannot be parsed is a scan-err
   rmSync(join(w.locks, 'queue-sweep-repos.json'));
   assert.deepEqual(scanLiveWork({ env, home: w.home, leaseOpts: w.leaseOpts }).filter((x) => x.kind === 'scan-error'), []);
 });
+
+// R3-B1: valid JSON that is not a proper record is as unusable as a corrupt file; R3-F2: the entry says which record and which folder to remove.
+test('R3-B1 / R3-F2: a meta.json of {} / [] / 1, or an exit.json of {} next to a dead runner, defers and names the unreadable record and the folder', async () => {
+  const w = world();
+  const repo = repoIn(w);
+  const dir = jobIn(repo, 'odd', { runnerPid: process.pid });
+  for (const body of ['{}', '[]', '1']) {
+    writeFileSync(join(dir, 'meta.json'), body);
+    const live = w.scan({ repos: [repo] });
+    assert.deepEqual(kinds(live), ['job'], `meta.json ${body}`);
+    assert.match(live[0].detail, /^job odd has an unreadable record \(meta\.json\), treated as running: remove .*odd.* if it is stale$/, body);
+  }
+  jobIn(repo, 'odd', { runnerPid: await deadPid() });
+  assert.deepEqual(w.scan({ repos: [repo] }), [], 'well-formed meta, dead runner: not running');
+  writeFileSync(join(dir, 'exit.json'), '{}');
+  const live = w.scan({ repos: [repo] });
+  assert.deepEqual(kinds(live), ['job'], 'exit.json {} proves nothing');
+  assert.match(live[0].detail, /^job odd has an unreadable record \(exit\.json\), treated as running: remove /);
+  writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 0, finishedAt: new Date().toISOString() }));
+  assert.deepEqual(w.scan({ repos: [repo] }), [], 'a well-formed exit.json: done');
+});

@@ -327,3 +327,25 @@ test('R2-F1: what a job holder may still do: renew, open a jobOnly lease where t
   assert.equal((await closeLease({ worktree: wt, generation: again.generation, ...w.inJob(handed) })).closed, true);
   assert.deepEqual(files(w.dir), []);
 });
+
+// ---- R3-B1: valid JSON that is not a record is unusable, not "lost" or "done" -----------------------------------------------------------------
+test('R3-B1: a jobOnly lease stays live while its job meta.json is {} / [] / 1, or its exit.json is {} next to a dead runner; a well-formed dead job is swept', async (t) => {
+  const w = world(t);
+  w.session(500, 'sess-one');
+  const wt = w.wt('a');
+  const real = (extra = {}) => ({ ...w.as(500), jobLive: undefined, ...extra });
+  const dir = realJob(wt, 'j');
+  await open(real(), wt);
+  await closeLease({ worktree: wt, ...real(), jobLive: () => true }); // closed while a job runs: jobOnly
+  for (const body of ['{}', '[]', '1']) {
+    fs.writeFileSync(path.join(dir, 'meta.json'), body);
+    assert.equal(w.scan({ jobLive: undefined }).live.length, 1, `meta.json ${body}: still a job in flight`);
+  }
+  const dead = spawnSync(process.execPath, ['-e', '']).pid;
+  fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r1', startedAt: new Date().toISOString(), runnerPid: dead }));
+  fs.writeFileSync(path.join(dir, 'exit.json'), '{}');
+  assert.equal(w.scan({ jobLive: undefined }).live.length, 1, 'exit.json {}: not finished');
+  fs.rmSync(path.join(dir, 'exit.json'));
+  assert.equal(w.scan({ jobLive: undefined }).live.length, 0, 'well-formed meta, dead runner: lost');
+  assert.equal((await sweepDeadLeases({ ...w.as(null), jobLive: undefined })).removed.length, 1);
+});

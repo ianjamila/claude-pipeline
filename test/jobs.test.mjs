@@ -696,23 +696,69 @@ test('jobMayBeRunning: a running job is live; corrupt or unreadable meta.json is
   const cwd = scratch(t);
   const dir = jobDirOf(cwd, 'j');
   mkdirSync(dir, { recursive: true });
-  assert.equal(jobMayBeRunning('j', { cwd }), false, 'an empty folder');
-  assert.equal(jobMayBeRunning('never', { cwd }), false, 'no folder');
+  assert.equal(jobMayBeRunning('j', { cwd }).running, false, 'an empty folder');
+  assert.equal(jobMayBeRunning('never', { cwd }).running, false, 'no folder');
   writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: new Date().toISOString(), runnerPid: process.pid }));
-  assert.equal(jobMayBeRunning('j', { cwd }), true, 'readable record, live runner');
+  assert.equal(jobMayBeRunning('j', { cwd }).running, true, 'readable record, live runner');
   writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 0, finishedAt: new Date().toISOString() }));
-  assert.equal(jobMayBeRunning('j', { cwd }), false, 'finished');
+  assert.equal(jobMayBeRunning('j', { cwd }).running, false, 'finished');
   rmSync(join(dir, 'exit.json'));
   writeFileSync(join(dir, 'meta.json'), '{ nope');
   assert.deepEqual(readJob('j', { cwd }), { state: 'missing' }, 'readJob keeps its behaviour');
-  assert.equal(jobMayBeRunning('j', { cwd }), true, 'corrupt meta.json');
+  assert.equal(jobMayBeRunning('j', { cwd }).running, true, 'corrupt meta.json');
   writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 0, finishedAt: new Date().toISOString() }));
-  assert.equal(jobMayBeRunning('j', { cwd }), false, 'corrupt meta.json, readable exit.json');
+  assert.equal(jobMayBeRunning('j', { cwd }).running, false, 'corrupt meta.json, readable exit.json');
   assert.throws(() => jobMayBeRunning('bad name!', { cwd }), /invalid job name/);
   if (process.platform !== 'win32' && process.getuid?.() !== 0) {
     rmSync(join(dir, 'exit.json'));
     writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: new Date().toISOString(), runnerPid: process.pid }));
     chmodSync(join(dir, 'meta.json'), 0o000);
-    try { assert.equal(jobMayBeRunning('j', { cwd }), true, 'unreadable meta.json'); } finally { chmodSync(join(dir, 'meta.json'), 0o600); }
+    try { assert.equal(jobMayBeRunning('j', { cwd }).running, true, 'unreadable meta.json'); } finally { chmodSync(join(dir, 'meta.json'), 0o600); }
   }
+});
+
+// R3-B1: jobMayBeRunning validates the SHAPE of both records: valid JSON that is not a record ({} / [] / 1) is as unusable as a corrupt file.
+const deadRunnerPid = () => spawnSync(process.execPath, ['-e', '']).pid; // a process that has run and exited
+const goodMeta = (extra = {}) => JSON.stringify({ name: 'j', runId: 'r', startedAt: new Date().toISOString(), runnerPid: process.pid, ...extra });
+
+test('R3-B1: a meta.json that is valid JSON but not a record (or lacks runnerPid and startedAt) may be running, and says why', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  for (const body of ['{}', '[]', '1', '"x"', 'true', JSON.stringify({ name: 'j', startedAt: 'not a date' }), JSON.stringify({ name: 'j', startedAt: 1 })]) {
+    writeFileSync(join(dir, 'meta.json'), body);
+    const r = jobMayBeRunning('j', { cwd });
+    assert.equal(r.running, true, `meta.json ${body}`);
+    assert.equal(r.why, 'meta.json', `meta.json ${body}`);
+  }
+});
+
+test('R3-B1: an exit.json that is not a record with a parseable finishedAt does not prove the job finished', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'meta.json'), goodMeta({ runnerPid: deadRunnerPid() }));
+  for (const body of ['{}', '[]', '1', 'null', '{ nope', JSON.stringify({ code: 0 }), JSON.stringify({ code: 0, finishedAt: 'never' })]) {
+    writeFileSync(join(dir, 'exit.json'), body);
+    const r = jobMayBeRunning('j', { cwd });
+    assert.equal(r.running, true, `exit.json ${body} (runner dead)`);
+    assert.equal(r.why, 'exit.json', `exit.json ${body}`);
+  }
+  writeFileSync(join(dir, 'meta.json'), '{}');
+  assert.equal(jobMayBeRunning('j', { cwd }).running, true, 'malformed meta and malformed exit');
+});
+
+test('R3-B1: well-formed records keep their meaning: a dead runner is not running, a well-formed exit.json is done, a live runner is running', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'meta.json'), goodMeta({ runnerPid: deadRunnerPid() }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: false }, 'well-formed meta, dead runner');
+  writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 1, finishedAt: new Date().toISOString() }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: false }, 'well-formed exit');
+  rmSync(join(dir, 'exit.json'));
+  writeFileSync(join(dir, 'meta.json'), goodMeta());
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: true }, 'live runner');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', startedAt: new Date().toISOString() }));
+  assert.equal(jobMayBeRunning('j', { cwd }).running, true, 'no runnerPid, started a moment ago: inside the grace period');
 });

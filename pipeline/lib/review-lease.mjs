@@ -266,7 +266,7 @@ export function liveJobIn(worktree) {
   let names;
   try { names = fs.readdirSync(path.join(worktree, '.review', 'jobs')); } catch { return false; }
   for (const name of names) {
-    try { if (jobMayBeRunning(name, { cwd: worktree })) return true; } catch { /* not a job name */ }
+    try { if (jobMayBeRunning(name, { cwd: worktree }).running) return true; } catch { /* not a job name */ }
   }
   return false;
 }

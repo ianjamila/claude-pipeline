@@ -252,17 +252,33 @@ export function readJob(name, opts = {}) {
 }
 
 // Could the job `name` still be running? For callers that must fail CLOSED (the installer's live-work scan, the lease judge). readJob answers
-// 'missing' for a meta.json it cannot read or parse, which is right for a poller but would let a running job's lease be swept: here a meta.json that
-// is PRESENT but unreadable or corrupt counts as running, unless a readable exit.json says it finished. A job folder with no meta.json at all (ENOENT /
-// ENOTDIR: an empty leftover, a stray file) is not a job. Throws on an invalid name, like readJob. -> boolean.
+// 'missing' for a meta.json it cannot read or parse, and trusts any truthy record, which is right for a poller but would let a running job's lease be swept:
+// here a record only counts when it has the SHAPE jobs.mjs writes (a plain object; meta.json with an integer runnerPid or a parseable startedAt; exit.json
+// with a parseable finishedAt). A usable exit.json says the job finished; otherwise a meta.json or exit.json that is PRESENT but unusable (unreadable,
+// corrupt, or valid JSON that is not a record: {} / [] / 1) counts as running. A well-formed meta.json whose runner is dead is not running. Forged
+// well-formed records are out of scope. A job folder with no meta.json at all (ENOENT / ENOTDIR: an empty leftover, a stray file) is not a job.
+// Throws on an invalid name, like readJob. -> { running: boolean, why?: 'meta.json' | 'exit.json' } (why only when the answer rests on an unusable record).
+const isRecord = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const parseable = (v) => typeof v === 'string' && Number.isFinite(Date.parse(v));
+const metaUsable = (m) => isRecord(m) && (Number.isInteger(m.runnerPid) || parseable(m.startedAt));
+const exitUsable = (e) => isRecord(e) && parseable(e.finishedAt);
+function present(file) {
+  try { statSync(file); return true; } catch (err) { return !(err?.code === 'ENOENT' || err?.code === 'ENOTDIR'); } // cannot even stat: treat as there
+}
+
 export function jobMayBeRunning(name, opts = {}) {
   const { jobDir } = locate(name, opts);
-  const state = snapshot(jobDir).state;
-  if (state !== 'missing') return state === 'running';
-  try { statSync(path.join(jobDir, 'meta.json')); } catch (err) {
-    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
-  }
-  return !readJson(path.join(jobDir, 'exit.json')); // meta.json is there but unusable (or cannot even be statted)
+  const metaFile = path.join(jobDir, 'meta.json');
+  const exitFile = path.join(jobDir, 'exit.json');
+  if (!present(metaFile)) return { running: false };
+  if (exitUsable(readJson(exitFile))) return { running: false };
+  if (present(exitFile)) return { running: true, why: 'exit.json' };
+  const meta = readJson(metaFile);
+  if (!metaUsable(meta)) return { running: true, why: 'meta.json' };
+  if (runnerAlive(meta)) return { running: true };
+  // the runner is gone: it may have finished between the reads
+  if (exitUsable(readJson(exitFile))) return { running: false };
+  return present(exitFile) ? { running: true, why: 'exit.json' } : { running: false };
 }
 
 // Resolves with 'running' when the job is still going at timeoutMs, so callers loop on it; keep
