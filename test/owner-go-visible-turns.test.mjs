@@ -787,3 +787,30 @@ test('#246: the chain walk is bounded (a visited set) and memoised: a long run o
   assert.ok(r.text.includes('Ready to merge'), 'the ask under a long chain of owner-visible notices still binds');
   assert.ok(ms < 4000, `${ms} ms`);
 });
+
+// ---- #253: pre-provenance transcripts are NOT supported (document-only, Fable plan pass F5) ------------------------------------------------------
+// A transcript in which no prompt carries promptSource / origin / entrypoint / turnOrigin (Claude Code older than 2.1.258) has no provenance to say who wrote a prompt, so the readers treat every
+// prompt as an unplaced note, whose chain ends at the unresolved SessionStart attachment: all of them are hidden and no request binds. That is deliberate (fail closed); the absence of provenance
+// fields must never become authority. No machine here runs such a client.
+const bare = (text, extra = {}) => ({ ...prompt(text, {}), ...extra });
+
+test('#253: a pre-provenance transcript (no provenance field on any prompt, unresolved SessionStart root) stays mute for every kind', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const first = bare('ship it', { parentUuid: 'u-session-start-attachment' }); // (the attachment that opens a session is not in the file / not a prompt)
+    assert.equal(run(kind, [first, of(first, said(KINDS[kind].ask)), bare(KINDS[kind].answer)]), false, `${kind}: legacy, unresolved root`);
+    // control: the same transcript with a typed owner prompt in front is a modern one and binds
+    assert.deepEqual(pr(kind, record(kind, [prompt('ship it', { ...OWNER_ENTRY, parentUuid: 'u-session-start-attachment' }), said(KINDS[kind].ask), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: control`);
+  }
+});
+
+test('#253: 20000 pre-provenance prompts under one unresolved root resolve in bounded time (the chain walk is memoised, not quadratic)', () => {
+  const entries = [bare('p0', { parentUuid: 'u-session-start-attachment' })];
+  for (let i = 1; i < 20000; i++) entries.push({ ...bare(`p${i}`), parentUuid: entries[i - 1].uuid });
+  const file = join(tmp(), 't.jsonl');
+  writeFileSync(file, linesOf([...entries, { ...said(MERGE_ASK), parentUuid: entries[19999].uuid }, bare('merge')]));
+  const t0 = process.hrtime.bigint();
+  const r = lastReply(file, { prompt: 'merge' });
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.equal(r.text, '', 'every prompt is hidden: nothing binds');
+  assert.ok(ms < 5000, `${ms} ms`);
+});
