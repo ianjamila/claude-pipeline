@@ -136,7 +136,7 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
       for (const k of [
         'PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_ARBITER_MODEL_OVERRIDE', 'PIPELINE_TEST_MODE', 'PIPELINE_CODEX_TIMEOUT_MS',
         'PIPELINE_LOCK_WAIT_MS', 'FAKE_CODEX_EXIT', 'FAKE_CODEX_STDERR', 'FAKE_CODEX_NO_WRITE', 'FAKE_CODEX_OUTPUT',
-        'FAKE_CODEX_HANG', 'FAKE_CODEX_DURING', 'FAKE_CODEX_DURING_OUTPUT',
+        'FAKE_CODEX_HANG', 'FAKE_CODEX_DURING', 'FAKE_CODEX_DURING_OUTPUT', 'FAKE_CODEX_TURN_FAILED',
         // the suite runs inside Claude Code: a real terminal's versions must not decide whether a Fable round is stopped as stale (cli-stale-terminal pins that)
         'AI_AGENT', 'CLAUDE_CODE_EXECPATH',
       ]) {
@@ -327,14 +327,14 @@ test('codex-review: --model overrides the configured model; a bad effort or mode
 
 test('codex-review: quota, auth and a missing binary are exit 3 with unavailable:true and a reason; no state is written', (t) => {
   const w = world(t);
-  const quota = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'ERROR: You hit your usage limit. Try again later.' } });
+  const quota = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'You hit your usage limit. Try again later.' } });
   assertExit(quota, 3);
   assert.equal(quota.json.ok, false);
   assert.equal(quota.json.unavailable, true);
   assert.equal(quota.json.reason, 'quota');
   assert.match(quota.json.detail, /usage limit/);
 
-  const auth = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'Not logged in. Run codex login.' } });
+  const auth = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'Not logged in. Run codex login.' } });
   assertExit(auth, 3);
   assert.equal(auth.json.reason, 'auth');
 
@@ -1689,7 +1689,7 @@ test('review-complete: unresolved items or an unimplemented ACCEPT keep the labe
 
 test('review-complete: Codex outage then recovery (exit 3, then a clean review, then the label comes off)', (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
-  const outage = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'usage limit reached' } });
+  const outage = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'usage limit reached' } });
   assertExit(outage, 3);
   assertExit(w.cli(['review-complete', '--pr', '7']), 1, 'nothing was reviewed yet');
 

@@ -624,7 +624,7 @@ test('second-review: a Codex outage is exit 3 {unavailable, reason} and leaves t
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   w.wait('R1-B1');
   const before = w.stateText();
-  const quota = second(w, 'R1-B1', answerOf(['R1-B1']), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'You hit your usage limit' } });
+  const quota = second(w, 'R1-B1', answerOf(['R1-B1']), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'You hit your usage limit' } });
   assertExit(quota, 3, quota.stdout + quota.stderr);
   assert.equal(quota.json.ok, false);
   assert.equal(quota.json.unavailable, true);
