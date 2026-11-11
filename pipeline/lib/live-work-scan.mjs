@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { git } from './git.mjs';
 import { readMergeChild } from './hold.mjs';
-import { readJob } from './jobs.mjs';
+import { jobMayBeRunning } from './jobs.mjs';
 import { defaultLockDir, peek } from './locks.mjs';
 import { liveRecords } from './merge-queue.mjs';
 import { knownRepos } from './queue-sweep.mjs';
@@ -58,13 +58,19 @@ function jobsIn(worktree, live) {
   const out = [];
   for (const name of names) {
     if (name.endsWith('.starting')) {
-      try { if (Date.now() - fs.statSync(path.join(dir, name)).mtimeMs <= STARTING_FRESH_MS) out.push(`job ${name.slice(0, -'.starting'.length)} is being started`); } catch { /* gone */ }
+      const job = name.slice(0, -'.starting'.length);
+      try { if (Date.now() - fs.statSync(path.join(dir, name)).mtimeMs <= STARTING_FRESH_MS) out.push(`job ${job} is being started`); } catch (err) {
+        if (err?.code !== 'ENOENT') out.push(`job ${job} start marker cannot be read (${msg(err)}), treated as being started`); // only a vanished marker is "gone"
+      }
       continue;
     }
     let isDir = false;
-    try { isDir = fs.statSync(path.join(dir, name)).isDirectory(); } catch { continue; /* gone */ }
+    try { isDir = fs.statSync(path.join(dir, name)).isDirectory(); } catch (err) {
+      if (err?.code !== 'ENOENT') out.push(`job ${name} cannot be inspected (${msg(err)}), treated as running`); // only a vanished entry is "gone"
+      continue;
+    }
     if (!isDir) continue; // a stray file is not a job
-    try { if (readJob(name, { cwd: worktree }).state === 'running') out.push(`job ${name} is running`); } catch (err) { out.push(`job ${name} cannot be read (${msg(err)}), treated as running`); }
+    try { if (jobMayBeRunning(name, { cwd: worktree })) out.push(`job ${name} is running`); } catch (err) { out.push(`job ${name} cannot be read (${msg(err)}), treated as running`); }
   }
   return out;
 }

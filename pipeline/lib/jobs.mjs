@@ -251,6 +251,20 @@ export function readJob(name, opts = {}) {
   return snapshot(locate(name, opts).jobDir, opts.expectRunId);
 }
 
+// Could the job `name` still be running? For callers that must fail CLOSED (the installer's live-work scan, the lease judge). readJob answers
+// 'missing' for a meta.json it cannot read or parse, which is right for a poller but would let a running job's lease be swept: here a meta.json that
+// is PRESENT but unreadable or corrupt counts as running, unless a readable exit.json says it finished. A job folder with no meta.json at all (ENOENT /
+// ENOTDIR: an empty leftover, a stray file) is not a job. Throws on an invalid name, like readJob. -> boolean.
+export function jobMayBeRunning(name, opts = {}) {
+  const { jobDir } = locate(name, opts);
+  const state = snapshot(jobDir).state;
+  if (state !== 'missing') return state === 'running';
+  try { statSync(path.join(jobDir, 'meta.json')); } catch (err) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false;
+  }
+  return !readJson(path.join(jobDir, 'exit.json')); // meta.json is there but unusable (or cannot even be statted)
+}
+
 // Resolves with 'running' when the job is still going at timeoutMs, so callers loop on it; keep
 // timeoutMs under the 10-minute tool limit (default 9 minutes). With expectRunId, a job directory that
 // now belongs to another run (checked on every poll) resolves as 'replaced'.

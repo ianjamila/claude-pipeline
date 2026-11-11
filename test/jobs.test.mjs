@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, utimesSync,
+  chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, utimesSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { startJob, waitJob, readJob, acquireStartLock } from '../pipeline/lib/jobs.mjs';
+import { startJob, waitJob, readJob, jobMayBeRunning, acquireStartLock } from '../pipeline/lib/jobs.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const jobsUrl = pathToFileURL(join(here, '..', 'pipeline', 'lib', 'jobs.mjs')).href;
@@ -689,4 +689,30 @@ test('tail edge cases: no trailing newline, empty log, no log', (t) => {
   assert.equal(readJob('nonl', { cwd }).tail, 'a\nb');
   assert.equal(readJob('empty', { cwd }).tail, '');
   assert.equal(readJob('nolog', { cwd }).tail, '');
+});
+
+// R2-B1: jobMayBeRunning fails closed on a meta.json that readJob reads as 'missing'.
+test('jobMayBeRunning: a running job is live; corrupt or unreadable meta.json is live unless exit.json is readable; no meta.json is not a job', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  assert.equal(jobMayBeRunning('j', { cwd }), false, 'an empty folder');
+  assert.equal(jobMayBeRunning('never', { cwd }), false, 'no folder');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: new Date().toISOString(), runnerPid: process.pid }));
+  assert.equal(jobMayBeRunning('j', { cwd }), true, 'readable record, live runner');
+  writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 0, finishedAt: new Date().toISOString() }));
+  assert.equal(jobMayBeRunning('j', { cwd }), false, 'finished');
+  rmSync(join(dir, 'exit.json'));
+  writeFileSync(join(dir, 'meta.json'), '{ nope');
+  assert.deepEqual(readJob('j', { cwd }), { state: 'missing' }, 'readJob keeps its behaviour');
+  assert.equal(jobMayBeRunning('j', { cwd }), true, 'corrupt meta.json');
+  writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 0, finishedAt: new Date().toISOString() }));
+  assert.equal(jobMayBeRunning('j', { cwd }), false, 'corrupt meta.json, readable exit.json');
+  assert.throws(() => jobMayBeRunning('bad name!', { cwd }), /invalid job name/);
+  if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+    rmSync(join(dir, 'exit.json'));
+    writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: new Date().toISOString(), runnerPid: process.pid }));
+    chmodSync(join(dir, 'meta.json'), 0o000);
+    try { assert.equal(jobMayBeRunning('j', { cwd }), true, 'unreadable meta.json'); } finally { chmodSync(join(dir, 'meta.json'), 0o600); }
+  }
 });

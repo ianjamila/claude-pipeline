@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ScanDeadline, scanLiveWork } from '../pipeline/lib/live-work-scan.mjs';
@@ -151,6 +151,50 @@ test('a running job defers; a finished job, a job whose runner died, and a folde
   mkdirSync(join(repo, '.review', 'jobs', 'not-a-job'), { recursive: true });
   writeFileSync(join(repo, '.review', 'jobs', 'stray-file.txt'), 'x');
   assert.deepEqual(w.scan({ repos: [repo] }), [], 'finished, lost and non-job entries never defer');
+});
+
+// R2-B1: jobs.mjs reads an unreadable or corrupt meta.json as "missing"; a job folder with such a record must still count as live (fail closed),
+// unless a readable exit.json says it finished. A folder with NO meta.json at all (an empty leftover) is not a job.
+test('R2-B1: a job folder whose meta.json is corrupt defers; with a readable exit.json, or with no meta.json at all, it does not', () => {
+  const w = world();
+  const repo = repoIn(w);
+  const dir = jobIn(repo, 'broken', { runnerPid: process.pid });
+  writeFileSync(join(dir, 'meta.json'), '{ this is not json');
+  let live = w.scan({ repos: [repo] });
+  assert.deepEqual(kinds(live), ['job']);
+  assert.match(live[0].detail, /job broken/);
+  writeFileSync(join(dir, 'meta.json'), 'null');
+  assert.deepEqual(kinds(w.scan({ repos: [repo] })), ['job'], 'valid JSON that is not a record is corrupt too');
+  writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 0, finishedAt: new Date().toISOString() }));
+  assert.deepEqual(w.scan({ repos: [repo] }), [], 'corrupt meta but a readable exit.json: it finished');
+  rmSync(join(repo, '.review'), { recursive: true, force: true });
+  mkdirSync(join(repo, '.review', 'jobs', 'empty'), { recursive: true });
+  assert.deepEqual(w.scan({ repos: [repo] }), [], 'an empty job folder is not a job');
+});
+
+test('R2-B1: a meta.json that cannot be read (chmod 000) defers', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, () => {
+  const w = world();
+  const repo = repoIn(w);
+  const dir = jobIn(repo, 'locked', { runnerPid: process.pid });
+  chmodSync(join(dir, 'meta.json'), 0o000);
+  try {
+    const live = w.scan({ repos: [repo] });
+    assert.deepEqual(kinds(live), ['job']);
+    assert.match(live[0].detail, /job locked/);
+  } finally { chmodSync(join(dir, 'meta.json'), 0o600); }
+});
+
+test('R2-B1: a job entry that cannot be statted (not "gone") defers instead of being skipped', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, () => {
+  const w = world();
+  const repo = repoIn(w);
+  jobIn(repo, 'j', { runnerPid: process.pid });
+  const jobs = join(repo, '.review', 'jobs');
+  chmodSync(jobs, 0o400); // listable, but its entries cannot be statted
+  try {
+    const live = w.scan({ repos: [repo] });
+    assert.deepEqual(kinds(live), ['job']);
+    assert.match(live[0].detail, /job j cannot be inspected/);
+  } finally { chmodSync(jobs, 0o700); }
 });
 
 test('a running job in a NON-root worktree is found, with that worktree named; the same repo listed twice is scanned once', (t) => {

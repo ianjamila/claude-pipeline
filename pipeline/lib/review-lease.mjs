@@ -50,7 +50,7 @@ import { LockTimeoutError, acquire, readMachineId, release, withLock } from './l
 import { seamValue } from './seams.mjs';
 import { claudeCodeAncestorPid } from './claude-ancestry.mjs';
 import { claudeConfigDirs, psStarts } from './worktree-prune/live-sessions.mjs';
-import { readJob } from './jobs.mjs';
+import { jobMayBeRunning } from './jobs.mjs';
 import { OWNER_GO_REL, realDirChain } from '../hooks/lib/owner-go.mjs';
 
 export const LEASES_REL = `${OWNER_GO_REL}/review-leases`;
@@ -264,7 +264,7 @@ export function liveJobIn(worktree) {
   let names;
   try { names = fs.readdirSync(path.join(worktree, '.review', 'jobs')); } catch { return false; }
   for (const name of names) {
-    try { if (readJob(name, { cwd: worktree }).state === 'running') return true; } catch { /* not a job folder */ }
+    try { if (jobMayBeRunning(name, { cwd: worktree })) return true; } catch { /* not a job name */ }
   }
   return false;
 }
