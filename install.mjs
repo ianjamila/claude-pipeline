@@ -29,7 +29,7 @@ import { hasClaudeCodeAncestor } from './pipeline/lib/claude-ancestry.mjs';
 import { tryAcquire, release } from './pipeline/lib/locks.mjs';
 import { fileProvenance, installedIdentity } from './pipeline/lib/identity.mjs';
 import { ScanDeadline, scanLiveWork } from './pipeline/lib/live-work-scan.mjs';
-import { acquireAdmission, releaseAdmission, sweepDeadLeases } from './pipeline/lib/review-lease.mjs';
+import { LEASE_DIR_ENV, acquireAdmission, releaseAdmission, sweepDeadLeases } from './pipeline/lib/review-lease.mjs';
 import { stacksUninstall } from './pipeline/lib/stacks/uninstall.mjs';
 import { stacksSeam } from './pipeline/lib/stacks/paths.mjs';
 import { queueSweepSchedule } from './pipeline/lib/queue-sweep-schedule.mjs';
@@ -626,6 +626,8 @@ async function main(argv, env) {
   const { opts, help, error } = I.parseArgs(argv);
   if (help) { process.stdout.write(`${I.usageText()}\n`); return 0; }
   if (error) { process.stderr.write(`install.mjs: ${error}\n\n${I.usageText()}\n`); return 2; }
+  // This process runs from a checkout or a download, so every seam reads as live. The review-lease folder is redirectable only in a test run.
+  I.dropSeamsWithoutTestMode(env, [LEASE_DIR_ENV], seamFlag('PIPELINE_TEST_MODE', env, seamOpts));
 
   if (env.PIPELINE_ADMIN !== '1' && !opts.check) {
     if (env.CLAUDECODE === '1') {
