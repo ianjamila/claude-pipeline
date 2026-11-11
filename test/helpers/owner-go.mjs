@@ -19,6 +19,22 @@ const HOOK = fileURLToPath(new URL('../../pipeline/hooks/owner-go.mjs', import.m
 // What Claude Code writes on a prompt entry the owner typed (#128): the use-time provenance check accepts a record only for such an entry.
 export const OWNER_ENTRY = { origin: { kind: 'human' }, promptSource: 'typed', entrypoint: 'cli' };
 
+// #191 R1-B1: Claude Code writes `uuid` and `parentUuid` on every transcript entry, and the readers (lastReply) attribute an assistant entry to its prompt through that chain.
+// link() gives a fixture the chain a sequential session has: an entry without a uuid gets one, an entry without a `parentUuid` key points at the entry before it. An entry that sets either
+// keeps it (a test of interleaved or cut-off output sets parentUuid itself: null, a uuid outside the file, another turn's). A compact_boundary system entry is written the way Claude Code
+// writes it: parentUuid null and logicalParentUuid the entry before it (the chain a mid-turn compaction keeps). Idempotent.
+export function link(entries) {
+  let prev = null;
+  return entries.map((e) => {
+    const uuid = e.uuid ?? `u-${randomUUID()}`;
+    const boundary = e.type === 'system' && e.subtype === 'compact_boundary';
+    const out = { ...e, uuid, parentUuid: 'parentUuid' in e ? e.parentUuid : boundary ? null : prev, ...(boundary && !('logicalParentUuid' in e) ? { logicalParentUuid: prev } : {}) };
+    prev = uuid;
+    return out;
+  });
+}
+export const linesOf = (entries) => `${link(entries).map((e) => JSON.stringify(e)).join('\n')}\n`;
+
 // Where a test transcript lives: <account home>/.claude-ownergo-test-<uuid>/projects/-repo/t.jsonl, a root the use-time provenance check accepts (R1-B2; lib/paths.mjs isTranscriptFile).
 // Codex #145 P1 / fix round: only a folder directly under the account's home with the guard's name shape is a root ($CLAUDE_CONFIG_DIR is none), so a temp dir's own .claude/ is not one.
 // NOTE: this writes a config-shaped folder into the REAL account home (like the owner-go records). Each is removed after its test and at exit; one a killed run left behind is swept at load
@@ -69,11 +85,11 @@ function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined
   const dir = mkdtempSync(join(tmpdir(), 'owner-go-'));
   const transcript = transcriptIn(t);
   const promptId = `pid-${randomUUID()}`;
-  writeFileSync(transcript, `${[
+  writeFileSync(transcript, linesOf([
     { type: 'user', message: { content: 'ship it' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
     { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
     { type: 'user', message: { content: prompt }, promptId, ...entry },
-  ].map((e) => JSON.stringify(e)).join('\n')}\n`);
+  ]));
   const session = `test-${randomUUID()}`;
   const file = join(ownerGoDir(), `${session}.jsonl`);
   cleanupAtExit(file);
@@ -89,7 +105,7 @@ function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined
       { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
     ];
     if (after !== 'missing') kept.push({ type: 'user', message: { content: prompt }, promptId, ...after });
-    writeFileSync(transcript, `${kept.map((e) => JSON.stringify(e)).join('\n')}\n`);
+    writeFileSync(transcript, linesOf(kept));
   }
   t.after(() => {
     rmSync(file, { force: true });
@@ -121,7 +137,7 @@ export function runHook(t, { entries, prompt, entry = OWNER_ENTRY, appended = tr
   const transcript = transcriptIn(t);
   const promptId = `pid-${randomUUID()}`;
   const all = appended ? [...entries, { type: 'user', message: { content: prompt }, promptId, ...entry }] : entries;
-  writeFileSync(transcript, `${all.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  writeFileSync(transcript, linesOf(all));
   const session = `test-${randomUUID()}`;
   const file = join(ownerGoDir(), `${session}.jsonl`);
   t.after(() => {

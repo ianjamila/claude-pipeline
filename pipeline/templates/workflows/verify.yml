@@ -18,6 +18,8 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
+      # Reads the workflow files as data: a PR that adds a context GitHub rejects at that key fails here, not after merge.
+      - run: node scripts/pipeline/workflow-contexts.mjs
       - run: node scripts/verify.mjs
       - if: always()
         uses: actions/upload-artifact@v4
