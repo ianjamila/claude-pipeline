@@ -129,3 +129,22 @@ test('the review skill says one closing keyword per issue (GitHub links only the
   assert.match(skill, /one keyword per issue, `Closes #1\. Closes #2\.`/);
   assert.match(skill, /one keyword per issue, `Closes #170\. Closes #171\.` \(GitHub closes only the first number of\s+`Closes #170, #171`\)/);
 });
+
+test('queue-branch-predates-switch: only branchState predates is sent to update-branch; a structural unknown goes to the base marker; a failed read retries (skill, merge-job reference, update-branch usage, CLI reference)', async () => {
+  const ref = read('skills/review/reference/owner-merge.md');
+  const para = ref.split('\n').find((l) => l.includes('`error: queue-branch-predates-switch`'));
+  assert.ok(para, 'the merge-job reference has the queue-branch-predates-switch paragraph');
+  assert.match(para, /branchState: predates/);
+  assert.match(para, /branchState: unknown/);
+  assert.match(para, /add or fix|must be added or fixed/);
+  assert.match(para, /queue-unreadable[^.]*(retry|try again)/);
+  assert.doesNotMatch(para, /or it could not be read/, 'an unreadable marker is not a catch-up case');
+  assert.doesNotMatch(para, /only while the re-queue re-checks/, 'queue-unreadable now answers on every path');
+  assert.match(read('skills/review/SKILL.md'), /names a commit that is not on the base/);
+  const { meta } = await import('../pipeline/commands/update-branch.mjs');
+  assert.doesNotMatch(meta.usage, /a missing or unreadable marker catches up too/);
+  assert.match(meta.usage, /queue-unreadable/);
+  const cli = read('docs/cli.md');
+  assert.match(cli, /`queue-unreadable` blocker/, 'the dry run names a failed marker read queue-unreadable');
+  assert.match(cli, /is not on GitHub: push it first/, 'a head GitHub does not have is named, not blamed on the marker');
+});
