@@ -67,7 +67,9 @@ const EXPR = /\$\{\{((?:'[^']*'|[^'}]|\}(?!\}))*)\}\}/g;
 
 /** Context names used in one expression body (lower-cased; string literals removed first). */
 export function contextsIn(expr) {
-  const bare = String(expr).replace(/'(?:[^']|'')*'/g, "''");
+  // GitHub ignores whitespace between tokens: `inputs. runner` reads the property `runner`, so a dot swallows the whitespace
+  // after it (starts only at a dot, so linear) before the lookbehind below judges the name.
+  const bare = String(expr).replace(/'(?:[^']|'')*'/g, "''").replace(/\.\s+/g, ".");
   const out = new Set();
   // A name not preceded by a property dot / word char, and not a function call (followed by `(`).
   for (const m of bare.matchAll(/(?<![\w.-])([A-Za-z_][\w-]*)(?![\w-])(?!\s*\()/g)) {
