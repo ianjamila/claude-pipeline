@@ -264,7 +264,10 @@ const removeHolder = (dir, sessionId) => fs.rmSync(fileOf(dir, sessionId), { for
 // The default jobLive: a detached `P job` still running in the worktree (jobs.mjs keeps its record under <worktree>/.review/jobs/<name>/).
 export function liveJobIn(worktree) {
   let names;
-  try { names = fs.readdirSync(path.join(worktree, '.review', 'jobs')); } catch { return false; }
+  try { names = fs.readdirSync(path.join(worktree, '.review', 'jobs')); } catch (err) {
+    // Only "no such folder" means no jobs; an unreadable one (EACCES, EIO ...) may hide a running job, so fail closed (live-work-scan does the same).
+    return err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR';
+  }
   for (const name of names) {
     try { if (jobMayBeRunning(name, { cwd: worktree }).running) return true; } catch { /* not a job name */ }
   }

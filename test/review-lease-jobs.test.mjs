@@ -258,6 +258,26 @@ test('R2-B1: a meta.json that cannot be read (chmod 000) keeps a jobOnly lease l
   try { assert.equal(w.scan({ jobLive: undefined }).live.length, 1); } finally { fs.chmodSync(path.join(dir, 'meta.json'), 0o600); }
 });
 
+test('R2-B1: a .review/jobs folder that cannot be listed (chmod 000) keeps a jobOnly lease live and unswept; a worktree with no jobs folder is dead as before', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, async (t) => {
+  const w = world(t);
+  w.session(500, 'sess-one');
+  const wt = w.wt('a');
+  const jobsDir = path.join(realJob(wt, 'j'), '..');
+  await open({ ...w.as(500), jobLive: undefined }, wt);
+  await closeLease({ worktree: wt, ...w.as(500), jobLive: () => true }); // closed while a job runs: jobOnly
+  fs.chmodSync(jobsDir, 0o000);
+  t.after(() => fs.chmodSync(jobsDir, 0o700));
+  assert.equal(w.scan({ jobLive: undefined }).live.length, 1, 'an unreadable jobs folder: a job may be running');
+  assert.deepEqual((await sweepDeadLeases({ ...w.as(null), jobLive: undefined })).removed, [], 'the sweep keeps it');
+  assert.deepEqual(files(w.dir), ['sess-one.json']);
+  // no jobs folder at all (ENOENT): no job, so the jobOnly lease is dead
+  fs.chmodSync(jobsDir, 0o700);
+  fs.rmSync(path.join(wt, '.review'), { recursive: true, force: true });
+  assert.equal(w.scan({ jobLive: undefined }).live.length, 0, 'no .review/jobs folder: no job');
+  assert.equal((await sweepDeadLeases({ ...w.as(null), jobLive: undefined })).removed.length, 1);
+  assert.deepEqual(files(w.dir), []);
+});
+
 // ---- R2-F1: a handed (job) identity can only strengthen ----------------------------------------------------------------------------------
 // PIPELINE_LEASE_HOLDER is readable by any same-user process, so a detached process can present a live session's identity. A viaJob holder may renew a
 // lease or open a jobOnly one where the session has none; it never reopens over, clears, closes or deletes a lease that is not already jobOnly.
