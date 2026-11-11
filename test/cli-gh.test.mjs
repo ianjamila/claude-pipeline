@@ -286,6 +286,17 @@ test('comment blocked: renders from .verify/report.json', () => {
   assertExit(cli(['comment', '--pr', '4', '--kind', 'blocked'], { repo: repoWith(), fake: commentWorld() }), 2);
 });
 
+test('comment blocked --reason: renders a "the review stopped" comment from the reason, no verify report needed', () => {
+  const fake = commentWorld();
+  const r = cli(['comment', '--pr', '4', '--kind', 'blocked', '--reason', 'this terminal runs Claude Code 2.1.318 but 2.1.322 is installed: restart this terminal.\n\nThen run `arbiter needed` again'], { repo: repoWith(), fake });
+  assertExit(r, 0, r.stdout + r.stderr);
+  const body = JSON.parse(fake.calls().find((c) => c.argv.includes('POST')).stdin).body;
+  assert.ok(body.startsWith(MARKERS.blocked), 'the same marker as the verify-failure comment, so one blocked comment is upserted');
+  assert.match(body, /### Pipeline blocked — the review stopped/);
+  assert.match(body, /The review stopped: this terminal runs Claude Code 2\.1\.318 but 2\.1\.322 is installed: restart this terminal\. Then run `arbiter needed` again\./);
+  assert.doesNotMatch(body, /verification failed|\| Step \|/);
+});
+
 test('comment needs-human: reason, hard-stop hits from --hits-file, and state', () => {
   const repo = stateRepo();
   const hits = join(repo.dir, 'hits.json');

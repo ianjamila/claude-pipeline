@@ -119,6 +119,30 @@ Two things tell you where an install stands:
   `pipeline vendor --check` warns that a vendored `VERSION` carrying one does not prove which commit its files came from.
 - **`pipeline update --check`** compares your install with upstream `main` on demand, with exit codes (see above).
 
+### The Fable floor
+
+The whole-PR review pass runs on Fable, and a proof from an older Fable is refused once a newer one has been proven on your machine.
+That lowest accepted version is the **floor**. It is stored in `~/.claude/pipeline-state/owner-go/model-floor/fable.json`, where agents cannot write:
+only a fully proven pass (`arbiter apply`) raises it, and it starts at the pipeline's `MIN_FABLE` constant. Bumping `MIN_FABLE` is a normal pipeline PR.
+
+- **A stale terminal stops, it does not park.** If the terminal's Claude Code build is older than the installed one, `arbiter needed` exits 1
+  `stale-terminal` before any Fable spend; if the pass ran on an older Fable than the floor, `arbiter apply` exits 1 `stale-model`. Both carry
+  `restartRequired` and an `advice` line. The agent stops (outcome `blocked`, no label), posts the advice and asks you to restart the
+  terminal (or update Claude Code). `pipeline preflight` shows a `claudeCode` warning up front; it never changes whether a PR can merge.
+- **Old proofs are re-reviewed, not grandfathered.** `review-complete` and the final gate refuse a PR whose Fable round was proven below the
+  newest Fable (the reason says `fable-refresh`); the agent runs `pipeline state fable-refresh --pr N`, which opens one uncounted Fable-only
+  round on the pushed head (no Codex, not counted against `review.max_rounds`) that reviews the whole PR diff.
+- **Owner commands.** `pipeline model-floor show` prints the floor, any hold and any lock. `pipeline model-floor reset [--hold <id> | --clear-hold] [--allow-id <id> | --remove-allow <id> | --clear-allow] [--clear-lock [--keep-floor]]`
+  (your own terminal only) returns the floor to the code constant. `--hold <id>` also sets a ceiling the floor cannot rise above, for an alias
+  rollback or for two accounts that resolve different Fables, until `--clear-hold`; it also lowers the version below which a recorded Fable proof is
+  re-reviewed, so a review proven with the held model can complete. A Fable id the parser cannot read blocks reviews, including the PR that fixes the
+  parser (a hold does not help): run `model-floor reset --allow-id <the exact new id>` from a plain terminal (repeatable, at most 10; an allowance never raises the
+  floor for an id the parser cannot read), merge the parser fix, then `model-floor reset --remove-allow <that id>` (`--clear-allow` drops every allowed id instead). Those calls (with or without `--clear-lock`) change only the allow list: the learned floor and any hold are kept
+  (a corrupt registry is refused; run a plain `model-floor reset` first), and an allowed id the parser can read is judged by its version like any other (refused below the floor, able to raise it); once the parser reads an allowed id, `model-floor show` lists it under `readableAllowed` and `preflight` warns that the allowance is no longer needed and names the `--remove-allow` command. A floor lock left behind by another host or an unreadable record is cleared with `model-floor reset --clear-lock --keep-floor` (it removes the lock and rewrites nothing; a bare `--clear-lock` is a plain reset, which also forgets the learned floor). Both refuse (`model-floor-lock-live`, naming the pid and the lock folder) while the lock's holder is a running process on this machine: confirm the pid is a pipeline process (`ps -p <pid> -o command=`) and stop it or wait for it; if it is not (a recycled pid), remove the lock folder by hand. They remove only the lock they inspected (one a review takes meanwhile survives), do nothing when there is no lock, and refuse a lock they cannot read (`model-floor-lock-unreadable`). When another recovery, or a review that is just starting up, holds the lock for a moment they refuse with `model-floor-lock-busy` (exit 1): run the command again in a moment. `arbiter apply` also re-checks that it still holds the lock, and re-reads the floor, just before it saves.
+  While an allowance or a hold below the shipped minimum is what lets a proof count, `arbiter apply` and `model-proof` print `floor: {newest, allowed, heldBelowMin}`,
+  `review-complete` and the final gate's review check name the round, and `pipeline preflight` warns until you clear it. Every floor failure of `arbiter apply` carries an `advice` line saying which of these to do.
+- **Cost reports** price each call per model version, so a Fable bump does not reprice earlier PRs.
+
 ## Using it
 
 Onboard a repo once, then just ask for work:

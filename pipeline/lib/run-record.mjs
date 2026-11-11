@@ -241,7 +241,7 @@ function normaliseInFlight(v) {
 
 // Returns a NEW record. `patch` keys (all optional): step, outcome, next, detail, head, request, tasks (the full list,
 // done kept for ids it omits `done` for), done (ids to mark done), verify, round, mergeSha, inFlight (object | null),
-// agentLogLine, cliVersion, proofs ([{step, source: 'local'} | {step, source: 'ci', run: {id, attempt, jobId, workflow, job, url}}], replaces the list; set by `P merge`), cost ({entry: {phase, role, input, output, cacheRead, cacheWrite, usd}, retries: n to add, sessions: [ids], guardBlocks: n | null, guardBySession: {id: n}; see run-cost.mjs), resumed ({at, host, head}: a run taken over by `ship resume`; set once, never cleared). Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
+// agentLogLine, cliVersion, proofs ([{step, source: 'local'} | {step, source: 'ci', run: {id, attempt, jobId, workflow, job, url}}], replaces the list; set by `P merge`), cost ({entry: {phase, role, input, output, cacheRead, cacheWrite, usd, byPrice?, priceTable?}, retries: n to add, sessions: [ids], guardBlocks: n | null, guardBySession: {id: n}; see run-cost.mjs), resumed ({at, host, head}: a run taken over by `ship resume`; set once, never cleared). Every call stamps the heartbeat and appends a history entry (capped, oldest dropped).
 export function applyCheckpoint(record, patch, { host, now }) {
   const next = structuredClone(record);
   if (patch.step !== undefined) {

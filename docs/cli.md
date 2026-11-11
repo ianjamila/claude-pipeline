@@ -45,17 +45,31 @@ pipeline arbiter needed --round R [--force] [--repo DIR]
   -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader[, diffPath, scope]}
   mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied
     (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that)
+  mode review in a terminal whose Claude Code build is older than the installed one (stale): exit 1 {ok:false, error: stale-terminal, restartRequired: true,
+    claudeCode: {running, installed, stale}, advice} BEFORE any input is written (no Fable spend); restart the terminal, then run needed again; unknown versions (stale null) do not stop it;
+    the stop is saved as round.arbiter.failure {cause, advice, at}
   a retry clears an unproven or malformed ruling (model-proof / invalid-arbiter, in either mode) so the arbiter answers again; the owner's and Claude's rulings are kept; an item the arbiter no longer needs is settled by the judge again
   mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none
   start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman
 pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
   the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)
   -> {ok, round, tag, transcript, errors, items[, findings]}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript
+  any Fable on any line of the transcript must be at least this machine's floor (whatever --expect-model says): older => exit 1, error stale-model,
+    restartRequired: true, floor: {newest, seen}, advice (restart this terminal, or update Claude Code); the items wait with cause stale-model. A proven pass
+    with a newer Fable raises the floor (only a transcript under the account's own projects folder, no --projects-dir; exit 1 model-floor-busy / model-floor-unwritable otherwise unproven)
+    just before it raises or saves anything, apply checks it still holds the floor lock and reads the floor again: lock gone => exit 1 model-floor-busy, floor now above the proof => exit 1 stale-model; either way nothing is saved but round.arbiter.failure
+  a proof that passed only through an owner allowance (an id the parser cannot read) or a hold below MIN_FABLE adds floor: {newest, allowed: [ids], heldBelowMin: <hold>|null} to the output
+    and allowed / heldBelowMin (each only when present) to round-N/model-proof.json and the round's stored modelProof summary
+  an apply that fails on the floor (stale-model, model-floor-unreadable, unrecognised-fable, model-floor-busy, model-floor-unwritable) saves round.arbiter.failure {cause, advice, at} and prints the same `advice` in its output;
+    model-floor-busy: run apply again in a minute; the other causes are not fixed by another Fable pass
+    (a zero-item Fable round has no item to carry the cause); the next apply that proves clears it
   mode review: the answer must also carry `findings` (Fable's own review, [] when clean); proven findings become items R<n>-F<k>;
     unproven ones are kept in rulings.json as `unverifiedFindings` and the round stays Fable-pending (run needed + the arbiter again)
 ```
 
 Exit: `needed`: 0 (`needed:false` is also 0) · `apply`: 0 proven + applied, 1 proof failed (arbitrated items marked needsHuman), 2 no transcript found / usage.
+
+`needed` on a Fable round from a terminal that runs an older Claude Code than the installed one (`claudeCode.stale`) exits 1 `stale-terminal` with `restartRequired` before it writes anything: restart the terminal, then run `needed` again (an unknown version never stops it). That stop, and an `apply` that fails on the Fable floor (`stale-model`, `model-floor-unreadable`, `unrecognised-fable`, `model-floor-busy`, `model-floor-unwritable`), is saved as `round.arbiter.failure {cause, advice, at}`, shown by `state outcome` (`arbiterFailures`) and in the triage comment (`Round R arbiter stopped: <cause> — <advice>`); an `apply` that proves clears it.
 
 A Fable review round (`fableRequired`, set by `codex-review`) is not clean until `apply` proves a pass, even with zero
 Codex items: `state outcome` lists it in `fablePending` and `review-complete` refuses. A failed proof leaves it pending:
@@ -147,6 +161,7 @@ pipeline comment --pr N --kind triage|summary|needs-human|blocked|awaiting-revie
   --kind triage publishes the review state under the review lock as a compare-and-swap on its content (lib/review-publish.mjs): it is refused
   (exit 1 {ok:false, error:'stale-publication', reason}) when the PR holds a state this copy neither published nor restored: run `pipeline state show --pr N`
   and redo the decision; {action:'unchanged'} when the PR already holds exactly this state. The other kinds take no lock.
+  --kind blocked renders the verify report's failure; with --reason TEXT it renders a "the review stopped: TEXT" comment instead (no report needed), e.g. the advice of a stop that waits for a terminal restart.
 ```
 
 Exit: 0 comment posted/updated · 2 usage · 3 GitHub (`gh`) unavailable.
@@ -173,13 +188,20 @@ pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implem
   -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount), 3 GitHub unavailable
   An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB);
   explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.
-  USD: --usd X as given; otherwise list price (opus / sonnet / haiku / fable) of each transcript message's own model (--model M prices the messages
-  that carry none) plus the explicit tokens at --model M. Tokens with no known model add no USD (a warning says so).
+  USD: --usd X as given; otherwise the list price of each transcript message's own model version (--model M prices the messages that carry none)
+  plus the explicit tokens at --model M. Tokens with no known model add no USD (a warning says so). Priced tokens are also booked in
+  cost.byPrice (keyed model|tier|speed) so a later price table can re-price them; output `bucketed` says whether this entry carries them.
 ```
 
 Exit: 0 booked · 1 the run record could not be written (`warnings` says why) · 2 usage · 3 GitHub (`gh`) unavailable.
 
 Cost attribution (issue #57): the run record gets a `cost` section {total, byPhase, byRole, retries, guardBlocks, sessions}, each of total / phase / role holding {input, output, cacheRead, cacheWrite, usd, calls}. Phases are the record steps; roles are implementer, judge, arbiter, verifier, controller and other (an unknown phase or role is booked as `other`). Records written before this have no `cost` section and everything that reads it treats that as "nothing booked". `P summary` shows the totals and both breakdowns in the status block and as `cost` in its JSON. `--session ID` (on `cost` or `summary`) names a Claude session of the run; `summary` counts the guard denies of those sessions in `<home>/.claude/pipeline-state/guard-log.jsonl` (override with `PIPELINE_GUARD_LOG_FILE`) into `guardBlocks` and keeps each session's own count in `guardBySession` ({sessionId: denies}, at most 20 sessions, `null` while the count is unknown; shown as `(s1 2 · s2 0)` after the status-line count). A missing log leaves the count unknown (shown as a dash), unreadable lines are skipped and reported in `warnings`. The numbers are display only: no command decides anything from them. The amounts are what the caller books (`--from-transcript` sums a transcript's own usage counts; the USD figure is whatever `--usd` says).
+
+List prices (USD per million tokens; the claude-api table of 2026-11-03, `PRICE_TABLE_DATE` in `lib/run-cost.mjs`), as [input, output, cache read, cache write 5 min, cache write 1 h]: `claude-fable-5-2` [8, 40, 0.20, 10, 16]; `claude-fable-5-1` [10, 50, 0.25, 12.5, 20]; `claude-fable-5` [10, 50, 1.00, 12.5, 20]; `claude-opus-5-5` [4, 20, 0.20, 5, 8]; `claude-opus-5`, `-4-8`, `-4-7`, `-4-6` [5, 25, 0.50, 6.25, 10]; `claude-sonnet-5-5` [2, 10, 0.10, 2.5, 4]; `claude-sonnet-5` [2, 10, 0.20, 2.5, 4]; `claude-sonnet-4-6` [3, 15, 0.30, 3.75, 6]; `claude-haiku-5-5` [0.10, 0.50, 0.01, 0.125, 0.20] for a prompt of at most 100,000 tokens and [0.50, 2.50, 0.05, 0.625, 1.00] above; `claude-haiku-4-5` [1, 5, 0.10, 1.25, 2]. A model id is looked up exactly (an 8-digit date suffix and a `[1m]` suffix are dropped), else it is priced as the newest row of its family (`claude-fable-5-3` as Fable 5.2; the bare names `fable`, `opus`, `sonnet`, `haiku` that `--model` takes mean that row), else it is unpriced. Prices are an estimate, not a bill, and old records are never re-priced.
+
+`usageFromTranscript` splits a message's cache writes by `usage.cache_creation.ephemeral_1h_input_tokens` / `ephemeral_5m_input_tokens` when the transcript has them (anything beyond the two parts, or the whole count when there is no split, is 5 min); `cacheWrite` in the totals stays the 5 min + 1 h sum. Haiku 5.5's tier is decided per message: input + cache read + cache write (5 min + 1 h) above 100,000 tokens takes the higher row, exactly 100,000 does not. **Fast mode** (`usage.speed: "fast"`) prices input and output at 16 / 80 for Fable 5.2 and 8 / 40 for Opus 5.5; the fast cache prices are not known, so a fast message with any cache tokens (or of a model with no fast price) is counted in `unpricedMessages` and adds no USD rather than a guess.
+
+**Repricing buckets.** A cost entry priced from a transcript (or from hand tokens given with `--model`) also carries `byPrice`, summed into `cost.byPrice` and shown in the `cost` JSON of `P cost` and `P summary`: keys `"<model id>|<tier std|>100k>|<speed std|fast>"`, each `{input, output, cacheRead, cacheWrite5m, cacheWrite1h, messages}`. Every dimension the price depends on is a key or a field, so a later table can re-price a record exactly; that holds while the tier boundaries are unchanged (a table that moves the 100,000 boundary cannot re-bucket old messages). Unpriced messages are bucketed too, so a later table can price them. `cost.priceTables` counts the bucketed entries per table date (`{"2026-11-03": 2}`; a record priced under two tables shows both, and `P summary` prints it as one `Priced with table` line). A hand entry (`--input` etc. with no `--model`) and any entry with `--usd` carry no buckets, and the `P cost` output says `"bucketed": false`; hand tokens without a model next to a transcript stay out of the buckets (also `bucketed: false`). Records written before this have neither field, and every reader treats that as "nothing bucketed".
 
 ## final-gate
 
@@ -320,7 +342,7 @@ For a repo whose merge command keeps a cooperative merge lock (EagleWatch: a `me
 | key | placeholders | what it does | EagleWatch |
 |---|---|---|---|
 | `hold_command` | `{pr}` required, `{sha}` not allowed | takes or keeps the hold for PR `{pr}`. Exit 0 = hold confirmed, 1 = refused or NOT confirmed (the label may already be written when the confirming event is late, so the pipeline releases after any take that ran), anything else = error | `npm run merge-hold -- {pr}` |
-| `hold_release_command` | `{pr}` and `{reason}` required, `{sha}` not allowed | releases PR `{pr}`'s own hold. The pipeline fills `{reason}` shell-quoted from fixed sentences only (codes `new-commits`, `parked`, `owner-declined`, `handoff-withdrawn`, `ci-failed`, `update-conflict`, `queued-behind`, `hold-unreadable`) | `npm run merge-hold -- {pr} --release --reason {reason}` |
+| `hold_release_command` | `{pr}` and `{reason}` required, `{sha}` not allowed | releases PR `{pr}`'s own hold. The pipeline fills `{reason}` shell-quoted from fixed sentences only (codes `new-commits`, `parked`, `owner-declined`, `handoff-withdrawn`, `ci-failed`, `update-conflict`, `queued-behind`, `hold-unreadable`, `restart`) | `npm run merge-hold -- {pr} --release --reason {reason}` |
 | `hold_check_command` | `{pr}` required, `{sha}` not allowed | READ-ONLY. Exit 0 and the LAST non-empty stdout line is one compact JSON object `{"pr":N,"blockedBy":[{"number":A,"title":"…","since":"<ISO>","expires":"<ISO>"}]}`; `blockedBy` lists the OTHER PRs' active holds that would block N, oldest first (the provider owns the TTL and the order). 5-minute timeout | `npm run merge-hold -- --status {pr} --json` |
 
 The check command must differ from both other commands (a copied take command would make every dry run write a label). The answer is unreadable, and refused (`hold-unreadable`, fail closed), unless the exit code is 0, the last line is a JSON object, `pr` is the requested PR, and every `blockedBy[].number` is a positive integer other than the PR itself.
@@ -364,7 +386,7 @@ take, check or release the repo's cooperative merge hold for this PR (repos with
 pipeline merge-hold --pr N [--repo DIR]   -> {ok, configured, confirmed, code, lines} : take (or keep) PR N's own hold with merge.hold_command; exit 0 confirmed, 1 refused or NOT confirmed, 2 the command errored (any other exit code, a timeout, or a command that could not be started: `code:null, notStarted:true`); a repo without the keys: exit 0 {ok:true, configured:false}
 pipeline merge-hold --pr N --check [--repo DIR]   -> {ok, configured, readable, blockedBy:[PR numbers], holds, error?, verdict?, doNotUpdate?, reason?} : READ-ONLY, runs merge.hold_check_command; exit 0 nothing ahead of this PR, 1 error queued-behind (another PR's active hold is ahead: do NOT update the branch) or hold-unreadable
 pipeline merge-hold --pr N --check --wait [--max-minutes M=120] [--repo DIR]   -> {ok, configured, outcome: front|timeout|unreadable, polls, waitedMinutes, blockedBy, holds?, reason?} : polls the READ-ONLY check at once and then every 5 minutes (fixed: the repo's check costs ~15 API calls and the budget is shared) until nothing is ahead of this PR; M is an integer 5..240 and bounds when a poll may START (a running check keeps its own 5 min timeout); exit 0 front (retry the update now), 1 timeout (still queued behind blockedBy) or unreadable (two unreadable answers in a row); a repo without the keys: exit 0 {ok:true, configured:false}. Run it as `pipeline job start turn -- pipeline merge-hold --pr N --check --wait` (it runs longer than a tool call may)
-pipeline merge-hold --pr N --release --reason <new-commits|parked|owner-declined|handoff-withdrawn|ci-failed|update-conflict|queued-behind|hold-unreadable> [--repo DIR]   -> {ok, configured, confirmed, code, lines, warnings?} : release PR N's own hold with merge.hold_release_command (the code maps to a fixed sentence; no free text reaches the shell); same exit codes as take. Exception: --reason new-commits on a PR head that THIS repo's `pipeline update-branch` / `pipeline merge` produced (a recorded successor whose parents GitHub still shows as exactly [the head it was made from, the base tip of that update]) runs nothing and keeps the hold: exit 0 {ok:true, configured:true, kept:true, why:'own-successor', head}; a PR-side push, an unrecorded head or a head that cannot be read releases as usual (the unreadable case with a warning). Codes added for the automatic cases: ci-failed (the required checks failed), update-conflict (the catch-up conflicts), queued-behind (an older hold is ahead and the wait ended), hold-unreadable (the check could not be read)
+pipeline merge-hold --pr N --release --reason <new-commits|parked|owner-declined|handoff-withdrawn|ci-failed|update-conflict|queued-behind|hold-unreadable|restart> [--repo DIR]   -> {ok, configured, confirmed, code, lines, warnings?} : release PR N's own hold with merge.hold_release_command (the code maps to a fixed sentence; no free text reaches the shell); same exit codes as take. Exception: --reason new-commits on a PR head that THIS repo's `pipeline update-branch` / `pipeline merge` produced (a recorded successor whose parents GitHub still shows as exactly [the head it was made from, the base tip of that update]) runs nothing and keeps the hold: exit 0 {ok:true, configured:true, kept:true, why:'own-successor', head}; a PR-side push, an unrecorded head or a head that cannot be read releases as usual (the unreadable case with a warning). Codes added for the automatic cases: ci-failed (the required checks failed), update-conflict (the catch-up conflicts), queued-behind (an older hold is ahead and the wait ended), hold-unreadable (the check could not be read)
 It never merges and acts only on the PR given (the session's own); use it to hold the merge queue at a merge hand-off and to release it when the hand-off ends without a merge.
 
 Queue mode (the base branch has a GitHub merge queue; see merge): no merge hold is needed. `--check` answers `{ok: true, outcome: 'front', queueMode: true}` and a take answers `{ok: true, taken: false, queueMode: true}`, running no hold command; `--release` is unchanged.
@@ -372,9 +394,40 @@ Queue mode (the base branch has a GitHub merge queue; see merge): no merge hold 
 
 Exit: 0 hold confirmed / released, or `--check` found no blockers, or the repo has no `merge.hold_*` keys (`{ok: true, configured: false}`) · 1 the hold was refused or not confirmed, or `--check` found `queued-behind` (a blocker is ahead: `blockedBy`, `doNotUpdate: true`, a reason naming #A, its title and its expiry in PHT) or `hold-unreadable` · 2 usage (an unknown `--reason` code) or environment error.
 
-Default runs `merge.hold_command` for PR N; `lines` is the last 5 output lines. `--check` runs `hold_check_command` only (read-only, same answer as the dry run's `holds`). `--release --reason <code>` runs `hold_release_command`; the code maps to a fixed sentence, so no free text reaches the shell. The review skill takes the hold at hand-off and releases it when the hand-off is withdrawn (a new commit, the PR parked, the owner declines or asks for changes); a successful merge needs no release (the repo's merge command removes the hold). Configuration, enforcement, rollout and rollback: see Merge hold under `merge`.
+Default runs `merge.hold_command` for PR N; `lines` is the last 5 output lines. `--check` runs `hold_check_command` only (read-only, same answer as the dry run's `holds`). `--release --reason <code>` runs `hold_release_command`; the code maps to a fixed sentence, so no free text reaches the shell. The review skill takes the hold at hand-off and releases it when the hand-off is withdrawn (a new commit, the PR parked, the owner declines or asks for changes); a review that stops for a terminal restart (`restartRequired`) releases it with `--reason restart`; a successful merge needs no release (the repo's merge command removes the hold). Configuration, enforcement, rollout and rollback: see Merge hold under `merge`.
 
 `--release --reason new-commits` first reads the PR head (one `gh pr view`) and keeps the hold, running nothing, when it is the pipeline's own successor head (output `{ok: true, configured: true, kept: true, why: 'own-successor', head}`, exit 0; see Taking the hold for a catch-up under `merge`); a head that cannot be read releases with a `warnings` line. The new reason codes `ci-failed`, `update-conflict`, `queued-behind` and `hold-unreadable` are used by the automatic releases of `update-branch` and `merge` and by the skill (`ci-failed` before a fix, `queued-behind` when a wait ends). `--check --wait [--max-minutes M]` polls the read-only check at once and then every 5 minutes (fixed, no override: the repo's check costs about 15 API calls and the 5,000/hour budget is shared; `M` is an integer 5..240, default 120, and bounds when a poll may START: a poll starts only if it can start by the deadline, a running check keeps its own 5-minute timeout) and answers `outcome: front` (exit 0: nothing is ahead, update again), `timeout` (still queued, exit 1) or `unreadable` (two unreadable answers in a row, exit 1, fail closed). It runs longer than a tool call may: start it with `pipeline job start turn -- pipeline merge-hold --pr N --check --wait`.
+
+## model-floor
+
+show the Fable model floor; reset it (owner only, run in your own terminal): back to the shipped minimum, optionally holding it.
+
+```
+pipeline model-floor show   -> {ok, floor, MIN_FABLE, registry, readableAllowed: [allowed ids the parser reads now: drop one with `reset --remove-allow <id>`], file, error?} : READ-ONLY, runs anywhere; exit 0, or 1 when the registry file is unreadable (reviews are blocked until a reset)
+pipeline model-floor reset [--hold <fable model id> | --clear-hold] [--clear-lock]   -> {ok, floor, hold, file, clearedLock}
+pipeline model-floor reset --clear-lock --keep-floor   (clear a stuck floor lock and nothing else: the registry, the learned floor, the hold and the allowances stay as they are)
+pipeline model-floor reset [--allow-id <exact claude-fable-… id> ... | --remove-allow <id> ... | --clear-allow]   (also takes the options above; the output then carries allow: [ids] when any are set)
+  with --allow-id, --remove-allow and/or --clear-allow (and no --hold / --clear-hold; --clear-lock alongside is fine) it is not a reset: it changes the allow list and keeps the learned floor (newest, history) and the hold; a corrupt registry is refused
+  (exit 1 model-floor-unreadable): run a plain `model-floor reset` first.
+  Owner only: refused inside Claude Code (exit 2 `refused`); run it in your own terminal (`node ~/.claude/pipeline/bin/pipeline.mjs model-floor reset`).
+  A plain reset (no --allow-id / --remove-allow / --clear-allow, or together with --hold / --clear-hold; a bare --clear-lock too, which also forgets the learned floor: use --clear-lock --keep-floor to keep it) rewrites the registry to the shipped minimum (a corrupt or unreadable registry is replaced); an existing hold and allowed ids are kept.
+  --hold <id>   also caps the floor at that Fable id (a claude-fable-* id) until `model-floor reset --clear-hold`. Use it to roll back an alias
+                (the `fable` alias moved to a model you do not want) or when the two accounts resolve different Fables. It also lowers the version
+                below which a recorded Fable proof is re-reviewed, so a review proven with the held model can complete.
+  --clear-hold  lift the cap (not with --hold)
+  --allow-id <id>  accept that exact claude-fable-* id although the parser cannot read it; repeatable, at most 10. An allowance never raises the floor for an id the parser cannot read, and an id the parser reads that is below the floor is refused all the same.
+                A claude-fable-* id the parser cannot read blocks reviews, including the PR that fixes the parser: run `model-floor reset --allow-id <the new id>` in your own
+                terminal, merge the parser fix, then `model-floor reset --remove-allow <that id>` (neither forgets the learned floor).
+                Until then `arbiter apply`, `model-proof`, `review-complete`, the final gate and `preflight` say the allowance is in force. (`--hold` does not unblock an unreadable id: it only caps the floor.)
+  --remove-allow <id>  remove exactly that id from the allow list (repeatable; the other ids stay). An id that is not on the list is refused (exit 2), naming the list. Not with --clear-allow, nor with --allow-id for the same id.
+  --clear-allow remove every allowed id (not with --allow-id or --remove-allow); to drop one id use --remove-allow
+  --clear-lock  first remove a floor lock left behind by another host or an unreadable owner record (a dead holder's lock clears itself). It removes only the lock it inspected (a lock a review takes meanwhile stays: exit 1 model-floor-lock-changed) and does nothing when there is none. It refuses while the holder is a running process on this machine (exit 1 model-floor-lock-live, naming the pid and the lock folder): confirm that pid is a pipeline process (`ps -p <pid> -o command=`) and stop it or wait for it; when it is not (the pid was reused by an unrelated program), remove the lock folder by hand. A lock that cannot be read (permissions, I/O error) is refused too (model-floor-lock-unreadable). Another recovery, or a review that is just starting up, holds the lock for a moment: it refuses with model-floor-lock-busy (exit 1); run it again in a moment. On its own it is a plain reset (the learned floor goes back to the minimum): add --keep-floor to clear the lock and keep the learned floor
+  --keep-floor  with --clear-lock and nothing else: remove the lock and rewrite nothing (a corrupt registry is refused: run `model-floor reset --clear-lock` first)
+```
+
+Exit: 0 ok · 1 the registry is unreadable (`show`) or could not be written / is locked (`reset`) · 2 usage, or `reset` refused inside Claude Code.
+
+The floor is the oldest Fable model a review may be proven with on this machine: `max(MIN_FABLE, newest Fable proven here)`, capped by an owner hold; a Fable id the parser cannot read, if the owner allowed it by exact name (`--allow-id`), is accepted and never raises the floor (an allowed id the parser reads and that is below the floor is refused like any other, so a forgotten allowance cannot pass an old model). A call with only `--allow-id` / `--remove-allow` / `--clear-allow` changes the allow list and keeps the learned floor and the hold (`--remove-allow <id>` drops one id and leaves the rest; `--clear-allow` drops them all); only a plain `reset` goes back to the minimum. A stuck floor lock is cleared with `reset --clear-lock --keep-floor`, which touches nothing else (it refuses, `model-floor-lock-live`, while the lock's holder is a running process on this machine: confirm the pid is a pipeline process with `ps -p <pid> -o command=` and stop it or wait, or, when it is not (a recycled pid), remove the lock folder it names by hand, so a review mid-proof never loses the lock it relies on; it removes only the lock it inspected and a lock taken meanwhile survives; `arbiter apply` also re-checks the lock and re-reads the floor just before it saves); a bare `--clear-lock` is a plain reset. While an allowance, or a hold below `MIN_FABLE`, is what lets a proof count, `arbiter apply` and `model-proof` print `floor: {newest, allowed, heldBelowMin}`, `review-complete` and the final gate's review check add a note naming the round, and `preflight` warns. Recorded proofs are re-reviewed below the lower of `MIN_FABLE` and the hold. The registry lives under the account's `owner-go/model-floor/`, which the guard protects, so only the pipeline commands (never an agent's shell) write it. A plain `reset` is the only way down: it writes the shipped minimum back and keeps (or sets with `--hold`, or clears with `--clear-hold`) the ceiling.
 
 ## model-proof
 
@@ -383,7 +436,10 @@ prove a subagent ran on the expected model and effort.
 ```
 pipeline model-proof (--tag TAG | --agent-id ID) [--expect-model claude-fable-] [--expect-effort high]
                      [--expect-agent-type TYPE] [--expect-meta-model MODEL] [--projects-dir DIR] [--max-age-ms N]
-  -> {ok, transcript, meta, models, efforts, errors, finalAssistantText, stopReasonMissing, finalVia}; exit 0 proven, 1 mismatch, 2 not found/unreadable
+  -> {ok, transcript, meta, models, efforts, claudeCodeVersions, errors, finalAssistantText, stopReasonMissing, finalVia}; exit 0 proven, 1 mismatch, 2 not found/unreadable
+  any Fable on any line must also be at least this machine's floor (read-only here, the floor is never raised): older => exit 1, error stale-model, restartRequired: true,
+    floor: {newest, seen}, advice
+  a proof that passed only through an owner allowance (an id the parser cannot read) or a hold below MIN_FABLE adds floor: {newest, allowed: [ids], heldBelowMin: <hold>|null} to the output
 ```
 
 Exit: 0 proven · 1 mismatch · 2 transcript not found / usage.
@@ -394,9 +450,12 @@ report whether the pipeline may merge (config, gh, protection, pause, Codex).
 
 ```
 pipeline preflight [--repo DIR]   (exit 0 can merge, 1 cannot, 2 config missing/invalid)
+  warnings (informational, never change canMerge): a stale terminal; an owner allowance (model-floor reset --allow-id) or a hold below MIN_FABLE still in force in the model floor registry; an allowed id the parser can read now (the allowance is no longer needed)
 ```
 
 Exit: 0 pipeline may merge · 1 it may not (`reasons`) · 2 config missing or invalid.
+
+The report also carries `claudeCode: {running, installed, stale}` (the Claude Code build this terminal runs, from `AI_AGENT`, against the installed one, from `CLAUDE_CODE_EXECPATH`; `stale` is `true` when the terminal is older, `null` when either is unknown) and a `warnings` array; a stale terminal adds a "restart it before a review's Fable pass" warning. Neither ever changes `canMerge` or the exit code.
 
 Branch protection must require `ci.required_checks` AND, unless `ci.guard_checks: false`, the guard contexts `Test integrity` and `Hard-stop scan` (plus `Cross-model review` with `ci.review_check: true`); `protect` sets that same list.
 
@@ -462,6 +521,11 @@ pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused
   an identical latest comment of ours is reused, not posted again; exit 3 when GitHub is unavailable or the label is still on the PR after removal
   a round past review.max_rounds must carry the owner's extra-round grant (codex-review records it), re-proved here against the owner's record and its marker on THIS machine (the
   same check as the final gate's review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise
+  a proven Fable round recorded with a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) that no later whole-PR pass at or above it replaced is refused: exit 1 {ok:false, error:fable-refresh, reason, staleFableRounds:[{round, models}]},
+  the reason names the rounds and models and says `run `pipeline state fable-refresh --pr N``; the final gate's review check refuses the same PR the same way
+  when a proven Fable round counts as current only because of the owner's allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line
+  "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},
+  and the final gate's review check detail carries the same note
 ```
 
 Exit: 0 comment posted (or our identical one reused) and the label is off · 1 review not valid for this head (nothing posted) · 2 usage · 3 GitHub unavailable, or the label still on the PR after removal.
@@ -563,7 +627,7 @@ pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr 
 pipeline state discard-round --round R [--pr N] [--repo DIR]
   -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;
      refused (exit 2) when the PR triage comment already holds round R, or (error round-has-verdict) when the round holds a second-review verdict
-pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean
+pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean
   first fetches origin/<default_branch> (best effort: offline keeps the cached ref), so a PR updated from its base branch is not read as changed
   grantedRound {k, grantId, head, quote}: the owner's open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner
   record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the
@@ -575,6 +639,11 @@ pipeline state mark-implemented --ids a,b [--repo DIR]
      round asks Codex to confirm it (round.confirmFixed) and review-complete waits for that round. Ordinary ACCEPTs get no such field
   -> exit 3 {ok:false, unavailable:true, reason:base-refresh} and nothing is marked when origin/<default_branch> cannot be fetched (offline, remote down) while the
      hash would be measured from it - also with no origin remote but a leftover origin/<default_branch> ref: a stale base would count the default branch's commits as the fix
+pipeline state fable-refresh --pr N [--repo DIR]
+  -> {ok, round, staleRounds, scope: "whole-pr"}: opens an uncounted Fable-only round (no Codex, not counted against review.max_rounds, allowed past it and with no new commit) on the pushed head, so a Fable pass proven with
+     a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) is re-reviewed. Refused (exit 2) unless a proven Fable round is below that and no later whole-PR pass at or above it replaced it (error nothing-stale), every earlier round is finished
+     (error unfinished-round: a Fable pass owed, an undecided, human-owed, unimplemented or newly accepted item), HEAD is the head of PR N on GitHub (error head-not-pushed; exit 3 when GitHub is unreachable)
+     and the content is what the last round reviewed, or only ledger rows were added since (review.docs_exempt_paths; the round then stays pinned at the last reviewed head) (error content-moved: run a normal codex-review round instead, its Fable pass already reads the whole PR). Then: arbiter needed --round R, the arbiter, arbiter apply
 pipeline state record-followup --id ID --url URL [--repo DIR]
 pipeline state set-outcome --outcome TEXT [--repo DIR]
 ```

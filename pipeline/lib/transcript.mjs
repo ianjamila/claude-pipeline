@@ -273,6 +273,7 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
   const errors = [];
   const models = new Map();
   const efforts = new Map();
+  const claudeCodeVersions = []; // distinct `version` fields (the Claude Code build that wrote each line), in order of first appearance
   const asst = []; // { line, n } for every assistant line, in file order
   const parsed = []; // { line, n } for every non-blank line (line is null when unparseable), in file order
   let lastLineN = 0; // 1-based number of the last non-blank line of the transcript
@@ -308,6 +309,7 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
         errors.push(`unparseable line ${n}`);
         continue;
       }
+      if (typeof line.version === 'string' && line.version !== '' && !claudeCodeVersions.includes(line.version)) claudeCodeVersions.push(line.version);
       if (line.type === 'user') {
         if (firstUserText === null && !isHarnessNote(line)) firstUserText = textBlocks(line.message?.content).join('\n');
         if (isPromptTurn(line)) promptTurns++;
@@ -440,6 +442,7 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
     assistantLines: asst.length,
     models: Object.fromEntries(models),
     efforts: Object.fromEntries(efforts),
+    claudeCodeVersions,
     firstUserText: firstUserText ?? '',
     finalAssistantText,
     finalStopReason,

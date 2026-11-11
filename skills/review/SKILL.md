@@ -33,7 +33,7 @@ Opt-out: `PIPELINE_OFF=1` or the user says not to use the pipeline ⇒ do the ta
 ## 0. Preflight
 
 `P preflight` (exit 2, no config ⇒ offer pipeline-setup; you may still open a PR but nothing merges), `P config` (note
-`verify.quick`, `default_branch`, `worktree_dir`, `review.max_rounds`, `merge.command`), `P labels ensure` (exit 3 ⇒ GitHub unreachable: say so, stop).
+`verify.quick`, `default_branch`, `worktree_dir`, `review.max_rounds`, `merge.command`), `P labels ensure` (exit 3 ⇒ GitHub unreachable: say so, stop). A `claudeCode` warning in the preflight JSON (this terminal's build is older than the installed one) ⇒ tell the owner to restart before a Fable round; it never blocks anything else.
 Picking up an existing `awaiting-review` PR (Codex was unavailable): `P state show --pr N`, then continue at section 2 with the round it shows.
 
 ## 1. Branch and build
@@ -80,7 +80,12 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
 4. **Arbiter** (when `P arbiter needed --round R` says `needed`). One call: the `arbiter` agent, description = the `tag` it printed, prompt starting
    with its `promptHeader` pasted verbatim, then `Read <inputPath> and rule on every item in it.` (Fable round: and review the diff it names). Then
    `P arbiter apply --round R --tag "<the same tag>"`; exit 2 `not-found`: wait, retry once, then park (cause `arbiter:not-found`);
-   exit 1 ⇒ the items are `needsHuman` (Fable round: run `needed` and the arbiter once more; failing twice ⇒ park, cause `arbiter:model-proof`).
+   exit 1 with `restartRequired` (`stale-terminal` from `needed`, `stale-model` from `apply`; Fable round) ⇒ do NOT retry here and do NOT park: outcome `blocked`, with no `pipeline-blocked`
+   label and no `needs-human`. Post the CLI's `advice` text (`P comment --pr N --kind blocked --reason "<advice>"`), with `merge.hold_command` in `P config` `P merge-hold --pr N --release --reason restart`,
+   run the stop ritual, and tell the owner to restart the terminal (or update Claude Code / `pipeline model-floor reset`, as the advice says). After the restart: `P arbiter needed --round R` and the arbiter again.
+   Exit 1 `error: model-floor-busy` ⇒ run `P arbiter apply` once more after a minute (no new arbiter call). Exit 1 `unrecognised-fable`, `model-floor-unreadable` or
+   `model-floor-unwritable` ⇒ no new Fable pass can fix it: do NOT re-run the arbiter; stop `blocked` exactly like the `restartRequired` stop, posting the CLI's `advice`.
+   Any other exit 1 ⇒ the items are `needsHuman` (Fable round: run `needed` and the arbiter once more; failing twice ⇒ park, cause `arbiter:model-proof`).
 5. **Publish and fix.** `P comment --pr N --kind triage` FIRST, then `P followups create --round R` for FOLLOW-UP items, then the triage comment again
    (issue links). ACCEPT items: one `implementer` dispatch with `P state show --round R --accepted`; it fixes, adds tests, runs `verify.quick`, commits;
    push. Then **`P state mark-implemented --ids <ids>`** for each fixed ACCEPT item: `review-complete` refuses an ACCEPT that is not marked, from ANY round,
@@ -119,7 +124,7 @@ Never type, paraphrase or forge the owner's words, and never run Codex outside `
 ## 3. Review complete, ready, hand-off
 
 1. `P review-complete --pr N` (HEAD pushed and equal to the PR head). Exit 0 posts the marker comment and takes `awaiting-review` off. Exit 1 ⇒ read
-   `reason` (a commit since the last round, an unmarked ACCEPT, a Fable pass owed) and go back to the round it names. Any later commit that changes
+   `reason` (a commit since the last round, an unmarked ACCEPT, a Fable pass owed) and go back to the round it names. A reason naming `fable-refresh` (a Fable proof below the newest Fable) ⇒ `P state fable-refresh --pr N` (an uncounted Fable-only round on the pushed head), then 2.4 for that round (the pass reviews the whole PR diff), 2.5 and 2.6 as usual, then `P review-complete` again. Any later commit that changes
    the code needs another round and another `review-complete`. One exception: commits after the last round that ONLY ADD lines to `review.docs_exempt_paths` documents (`P config`) need no round, and each added line must be a strict ledger row (`` | 0240 | `name` | YYYY-MM-DD | #PR | | ``, last in the file, numbers rising, for a migration at the reviewed head); anything else, or a listed document an instruction file `@`-imports, takes a round;
    `review-complete` posts for the current head (`docsExempt`), a refusal names the file that forces a round. Verification of that head is still owed.
 2. Only after that exit 0. If the head changed since 1.5 ran (any review fix), re-run 1.5 on it first: the label below, the CI reading and 3's ending use its notes.

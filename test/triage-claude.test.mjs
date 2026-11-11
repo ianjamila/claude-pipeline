@@ -63,6 +63,7 @@ test('every needs-human site records its cause', () => {
   const base = item({ id: 'R1-A1', bucket: 'BLOCKING', category: 'logic' });
   const ruled = (r, opts, it = base) => applyRulings([it], [{ id: it.id, ...r }], opts)[0].final;
   assert.equal(ruled({ ruling: 'ACCEPT', confidence: 'high', reasoning: 'r' }, { proofOk: false }).cause, 'model-proof');
+  assert.equal(ruled({ ruling: 'ACCEPT', confidence: 'high', reasoning: 'r' }, { proofOk: false, proofCause: 'stale-model' }).cause, 'stale-model', 'a proof that failed on the Fable floor alone');
   assert.equal(ruled({ ruling: 'nonsense', confidence: 'high', reasoning: 'r' }, { proofOk: true }).cause, 'invalid-arbiter');
   assert.equal(ruled({ ruling: 'ACCEPT', confidence: 'low', reasoning: 'r' }, { proofOk: true }).cause, 'low-confidence');
   const sb = item({ id: 'R1-A2', bucket: 'BLOCKING', category: 'security' });
@@ -74,6 +75,7 @@ test('needsHumanCause: the stored cause, else the legacy reason strings, else un
   const legacy = (reason, over = {}) => item({ final: { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason, ...over } });
   const table = [
     ['model-proof failed: ruling not provably from Fable', 'model-proof'],
+    ['stale-model: the ruling came from a Fable older than this machine\'s floor', 'stale-model'],
     ['invalid arbiter output', 'invalid-arbiter'],
     ['invalid judge output', 'invalid-judge'],
     ['arbiter low confidence', 'low-confidence'],
@@ -87,7 +89,8 @@ test('needsHumanCause: the stored cause, else the legacy reason strings, else un
   assert.equal(needsHumanCause(item({ final: null })), 'unknown');
   const ruled = rule(waiting('low-confidence'), 'ACCEPT');
   assert.equal(needsHumanCause(ruled), 'low-confidence', 'kept in final.claude after the ruling');
-  assert.deepEqual(MALFUNCTION_CAUSES, ['model-proof', 'invalid-arbiter', 'invalid-judge']);
+  assert.deepEqual(MALFUNCTION_CAUSES, ['model-proof', 'invalid-arbiter', 'invalid-judge', 'stale-model', 'stale-terminal']);
+  for (const cause of ['stale-model', 'stale-terminal']) assert.equal(needsHumanCause(item({ final: { decision: 'ACCEPT', by: 'arbiter', needsHuman: true, reason: 'r', cause } })), cause, `${cause} is a needs-human cause`);
 });
 
 // ---- critical dismissal -----------------------------------------------------------------------
