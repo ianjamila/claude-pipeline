@@ -9,6 +9,15 @@ blocked · **2** usage or environment error (also: unknown command, unknown flag
 (Codex, GitHub, a deployment that never finished). Flags after a bare `--` belong to the command being run (`job start`).
 `--repo DIR` (default: the current directory) is accepted by every repo-scoped command and resolves to the repository top level.
 
+**Review leases.** Inside a Claude Code session, every command that reads or writes a worktree's review state (agent-log, arbiter, checkpoint, ci-wait,
+codex-review, comment, cost, final-gate, followups, job, merge, merge-hold, review-complete, smoke, state, summary, triage, update-branch, verify) first opens
+or renews that session's *review lease* on the worktree, so an unattended `pipeline update` never swaps the pipeline under a review. `summary` (once it
+succeeded) and a `checkpoint` that ends the run close it. The lease is taken before the command starts (so before its per-PR lock), and a command that cannot
+get it does not run: exit 2 `{ok: false, error: "update-in-progress", message}` while an update is swapping (retry in a minute), or `error: "review-lease-unwritable"
+| "review-lease-busy" | "review-lease"` when the lease folder cannot be written; nothing has been changed. A plain terminal takes no lease. The commands that only
+compute or only talk to the machine (preflight, config, labels, update, version, vendor, model-floor, model-proof, risk, hardstops, integrity, queue-sweep, stacks,
+worktrees, protect, repo-move, guard-log, artifacts) take none.
+
 ## agent-log
 
 queue a line for the agent log, publish queued lines to the `pipeline-agent-log` branch, or close pending prod-smoke lines. The log lives on that orphan branch (like `pipeline-artifacts`), never in a PR branch.
