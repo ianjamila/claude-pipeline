@@ -560,7 +560,7 @@ function surfaceDirsOf(configDirs, readText) {
 
 // (R1-B1 / R2-F1) Can this word, which holds a glob or a substitution (so its place is only known at run time), name a hook surface file? Each part that is only known at run time stands for anything (a
 // substitution, a variable, a brace list: any text; `*` `?` `[..]`: a name part); the word's last folders and its file name are compared with every surface shape, slot by slot. A substitution that is a whole
-// folder of the word stands for a `.claude*` folder only when the word says `claude` somewhere (`$(echo ~/.claude)/settings.json`, `$(git rev-parse --show-toplevel)/.claude/settings.json`);
+// folder of the word stands for a `.claude*` folder, and one that is a whole segment stands for a literal folder or file name of a shape, only when the word says `claude` somewhere (`$(echo ~/.claude)/settings.json`, `$(git rev-parse --show-toplevel)/.claude/settings.json`);
 // a bare `$DIR/x.md` names nothing. A word that ends in `/` is a folder a file may land in (cp, mv): its shape lacks the last slot.
 const SUBST = '\u0001';
 function maskRuntime(w) {
@@ -573,7 +573,12 @@ function maskRuntime(w) {
       for (; j < w.length; j++) { if (w[j] === '(') depth++; else if (w[j] === ')' && --depth === 0) break; }
       out += SUBST; i = j; continue;
     }
-    if (c === '$' && w[i + 1] === '{') { const j = w.indexOf('}', i); out += SUBST; i = j < 0 ? w.length : j; continue; }
+    if (c === '$' && w[i + 1] === '{') { // (braces matched by depth: `${A:-${B}}` is one substitution, R3-F2)
+      let depth = 0;
+      let j = i + 1;
+      for (; j < w.length; j++) { if (w[j] === '{') depth++; else if (w[j] === '}' && --depth === 0) break; }
+      out += SUBST; i = j; continue;
+    }
     if (c === '$') { const m = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[@*#?!$0-9-])/.exec(w.slice(i)); if (m) { out += SUBST; i += m[0].length - 1; continue; } }
     if (c === '`') { const j = w.indexOf('`', i + 1); out += SUBST; i = j < 0 ? w.length : j; continue; }
     if (c === '{') { const j = w.indexOf('}', i); if (j > i) { out += '*'; i = j; continue; } }
@@ -611,7 +616,7 @@ function slotOk(seg, slot, ci, pureSubstOk, dot) {
   const { pre, suf, wild } = wildParts(seg);
   if (slot === 'D') {
     if (['.claude', '.claude-x'].some((x) => re.test(x))) return true;
-    if (!wild) return false;
+    if (!wild) return seg.toLowerCase().startsWith('.claude'); // (a literal folder: any `.claude*` name, as HOOK_SURFACE reads it, R3-F2)
     const lp = low(pre);
     if (lp === '') return dot === true;
     return lp.startsWith('.claude') || '.claude'.startsWith(lp);
@@ -632,7 +637,7 @@ function shapeEndsAt(segs, gi, shape, si, o) {
   }
   if (gi < 0) return false;
   const seg = segs[gi];
-  return slotOk(seg, slot, o.ci, slot === 'D' && o.claude, o.dot) && shapeEndsAt(segs, gi - 1, shape, si - 1, o);
+  return slotOk(seg, slot, o.ci, o.claude, o.dot) && shapeEndsAt(segs, gi - 1, shape, si - 1, o);
 }
 // `word` is one word of a command (the parser has removed its quotes); `dirs`: the folders the line may be working in (a relative word is joined to each)
 function maybeSurface(word, { ci, dirs, dot, surfaceDirs }) {
@@ -641,6 +646,7 @@ function maybeSurface(word, { ci, dirs, dot, surfaceDirs }) {
   const claude = /claude/i.test(String(word));
   const bare = masked.replace(/\/+$/, '');
   if (bare === '') return false;
+  if (bare === SUBST) return claude; // (a word that is one substitution and says claude: `$(echo .claude/settings.local.json)`, R3-F2)
   const fulls = isAbs(bare) || bare.startsWith(SUBST) || bare.startsWith('~') ? [bare] : dirs.map((d) => `${d}/${bare}`);
   const o = { ci, dot, claude };
   for (const full of fulls) {
