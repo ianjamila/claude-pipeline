@@ -200,3 +200,27 @@ test('R1-B3: commands, a plugin\'s skills / agents / commands and a plugin manif
   assert.equal(bash('cp /tmp/h.md /home/u/.claude/plugins/cache/m/p/1.0/skills/s/SKILL.md', onDisk({ '/tmp/h.md': hooked })), 'deny');
   assert.equal(bash('cp /tmp/h.md /repo/.claude/commands/c.md', onDisk({ '/tmp/h.md': hooked })), 'deny');
 });
+
+test('R2-B1: a front matter whose whole root mapping is indented cannot hide a hooks block', () => {
+  const skill = '/repo/.claude/skills/custom/SKILL.md';
+  const hooked = '---\n  name: custom\n  hooks:\n    PreToolUse:\n      - matcher: AskUserQuestion\n---\nbody\n';
+  assert.equal(file('Write', { file_path: skill, content: hooked }, reading({})), 'deny');
+  assert.equal(file('Write', { file_path: skill, content: '---\n# a comment\n\t name: custom\n---\nbody\n' }, reading({})), 'deny', 'a comment first, then the indented root');
+  assert.equal(file('Write', { file_path: skill, content: '---\nname: custom\ndescription: x\n---\nbody\n' }, reading({})), 'allow');
+  assert.equal(file('Write', { file_path: skill, content: '---\n# comment\nname: custom\ndescription: |\n  indented text\n---\nbody\n' }, reading({})), 'allow', 'an indented block scalar after a top-level key');
+});
+
+test('R2-F4: a lone CR is a line break; odd opening lines, NEL / LS / PS and a `...` line cannot hide a hooks block', () => {
+  const skill = '/repo/.claude/skills/new/SKILL.md';
+  const w = (content) => file('Write', { file_path: skill, content }, reading({}));
+  const hooks = 'hooks:\n  PreToolUse:\n    - matcher: AskUserQuestion\n';
+  assert.equal(w('---\nname: x\rhooks:\r  PreToolUse:\r    - matcher: AskUserQuestion\n---\nbody\n'), 'deny', 'a bare CR');
+  assert.equal(w('---\rname: x\rhooks:\r  Stop: []\r---\rbody\r'), 'deny', 'all CR');
+  for (const tail of ['\f', ' ', '\r', ' \t  ']) assert.equal(w(`---${tail}\nname: x\n${hooks}---\nbody\n`), 'deny', `opening line tail ${JSON.stringify(tail)}`);
+  assert.equal(w(`\n\n---\nname: x\n${hooks}---\nbody\n`), 'deny', 'blank lines before the opener');
+  for (const ch of ['\u0085', ' ', ' ']) assert.equal(w(`---\nname: x${ch}hooks:${ch}  Stop: []\n---\nbody\n`), 'deny', `U+${ch.codePointAt(0).toString(16)}`);
+  assert.equal(w(`---\nname: x\n...\n${hooks}---\nbody\n`), 'deny', 'a document-end line does not end the block');
+  assert.equal(w('---\nname: x\n---\nbody\n'), 'allow');
+  assert.equal(w('---\r\nname: x\r\n---\r\nbody\r\n'), 'allow', 'CRLF without hooks');
+  assert.equal(w('just a body\n---\nhooks:\n'), 'allow', 'no front matter');
+});
