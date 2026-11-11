@@ -231,7 +231,7 @@ export async function runScheduled({ home, env, ctx = {}, say = () => {}, deps }
 
     // An update is available. The status says so while the download runs (a deferred streak keeps its own line).
     if (prev?.state !== 'deferred-by-review') writeStatus({ state: 'behind', ...ids() });
-    const r = await auto.performUpdate({ home, main, before, relation, env, say, expectInstalled: before.sourceSha, requireNoLiveReviews: true });
+    const r = await auto.performUpdate({ home, main, before, relation, env, say, expectInstalled: before.sourceSha, requireNoLiveReviews: true, identityOf: auto.installedIdentity });
     const o = r.output;
 
     if (r.exitCode === EXIT.OK) {

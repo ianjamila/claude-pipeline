@@ -188,7 +188,8 @@ export async function run(argv, ctx = {}) {
 //     minutes, so the install can change meanwhile (an owner edit, a newer manual install); it is re-checked here just before the installer
 //     starts and again by the installer under its write lock, which exits 1 with JSON `{error: 'expect-installed-mismatch'}` and writes
 //     nothing. Both end as { error: 'install-changed' }.
-async function performUpdate({ home, main, before, relation, env, say, expectInstalled = null, requireNoLiveReviews = false }) {
+// `identityOf` is the installed-copy lookup (a test seam: the scheduled run hands in the one it was given).
+async function performUpdate({ home, main, before, relation, env, say, expectInstalled = null, requireNoLiveReviews = false, identityOf = installedIdentity }) {
   // The installer's guard-file choice survives an update: a copy installed with --skip-file-guard stays that way.
   const manifest = readManifest(home).manifest;
   const flags = manifest?.hooks?.guardFiles === false ? ['--skip-file-guard'] : [];
@@ -232,7 +233,7 @@ async function performUpdate({ home, main, before, relation, env, say, expectIns
       return fail('installer-too-old', `upstream main ${sha7(main.sha)} has an older installer that cannot install from the folder this command downloads into, so nothing was changed. Update from a clone of that version instead: run \`${posix}\` in it (on Windows: \`${windows}\`).`);
     }
     if (expectInstalled) {
-      const now = installedIdentity(home);
+      const now = identityOf(home);
       if (!now || !clean(now) || now.sourceSha !== expectInstalled) {
         return fail('install-changed', `the installed copy changed while the update was downloading (now ${now?.stamp ?? 'nothing'}), so it was left alone`);
       }
@@ -256,7 +257,7 @@ async function performUpdate({ home, main, before, relation, env, say, expectIns
       const lines = (check.json?.drift ?? []).slice(0, 5).map((d) => d.message);
       return fail('check-failed', `the install did not verify: ${lines.join('; ') || check.stderr || `install.mjs --check exited ${check.code}`}`, { stderr: check.stderr, drift: (check.json?.drift ?? []).map((d) => d.message ?? String(d)) });
     }
-    const after = installedIdentity(home);
+    const after = identityOf(home);
     result.after = after?.stamp ?? null;
     if (!after || !after.complete || after.sourceSha !== main.sha || !clean(after)) {
       return fail('unverified', `the installed copy reads ${after?.stamp ?? 'nothing'}, not a clean ${sha7(main.sha)}`);
