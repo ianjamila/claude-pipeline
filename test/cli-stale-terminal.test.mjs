@@ -156,6 +156,25 @@ test('arbiter needed on a Fable round in a stale terminal stops with stale-termi
   assert.deepEqual(outcome.json.arbiterFailures, [{ round: 1, cause: 'stale-terminal', advice: STALE_ADVICE }]);
 });
 
+test('arbiter needed --full stopped by a stale terminal keeps the forced full brief: the plain retry after the restart is still forced', (t) => {
+  const w = world(t).prepare();
+  const stopped = w.cli(['arbiter', 'needed', '--round', '1', '--full'], claudeCode(w.scratch, STALE));
+  assertExit(stopped, 1, stopped.stdout + stopped.stderr);
+  const kept = w.state().rounds[0].arbiter;
+  assert.equal(kept.forcedFull, true, 'the stop saved the forced choice');
+  assert.equal(kept.failure.cause, 'stale-terminal');
+  const retry = w.needed(claudeCode(w.scratch, FRESH));
+  assertExit(retry, 0, retry.stdout + retry.stderr);
+  assert.deepEqual([retry.json.brief, retry.json.effort, retry.json.agent, retry.json.briefReason], ['full', 'high', 'arbiter', 'forced by --full']);
+  assert.equal(w.state().rounds[0].arbiter.forcedFull, true);
+});
+
+test('arbiter needed without --full on a stale-stopped round stores no forced choice', (t) => {
+  const w = world(t).prepare();
+  assertExit(w.needed(claudeCode(w.scratch, STALE)), 1);
+  assert.equal(w.state().rounds[0].arbiter.forcedFull, undefined);
+});
+
 test('arbiter needed: a terminal that is not stale (same or newer build) goes ahead', (t) => {
   for (const [name, cc] of [['same', FRESH], ['newer', { running: '2.1.400', installed: '2.1.322' }]]) {
     const w = world(t).prepare();

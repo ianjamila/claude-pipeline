@@ -39,11 +39,15 @@ export const meta = {
   summary: 'decide which items need the arbiter, then prove and apply its rulings',
   usage: [
     'pipeline arbiter needed --round R [--force] [--full] [--repo DIR]',
-    '  -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader, brief, effort, agent[, diffPath, scope]}',
-    '  brief / effort / agent: which Fable agent to call. `fix-verify` / `medium` / `arbiter-fix` for a FIX ROUND: mode review, scope round (never whole-pr, a Fable refresh or a resolution-only round),',
-    '    the previous counted round had an ACCEPT item, and the round\'s own range has no hard-stop hit and no file matching review.arbiter_always_paths or risk.high_risk_paths; its input lists those ACCEPT items',
-    '    and asks Fable to verify each fix and the round diff. Everything else is `full` / `high` / `arbiter` (the whole review job). Fable still runs on every Fable round either way. The choice is stored on the round',
-    '    (arbiter.brief / effort / agent) and `apply` proves against the stored one; running `needed` again recomputes and re-stores it (the digest and tag change with the brief)',
+    '  -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader, brief[, briefReason], effort, agent[, diffPath, scope]}',
+    '  brief / effort / agent: which Fable agent to call. `fix-verify` / `medium` / `arbiter-fix` for a FIX ROUND: mode review, scope round (never whole-pr, a Fable refresh or a resolution-only round), a plain previous-round review base',
+    '    (never a whole-pr fallback base after a conflicting base merge, never a synthetic tree base after a clean base merge, never a resolution base), the previous counted round had an ACCEPT item, and the round\'s own range',
+    '    has no hard-stop hit, no file matching review.arbiter_always_paths or risk.high_risk_paths and assesses risk `low` (risk.medium_lines / medium_files), under the working-tree config AND the config committed at the',
+    '    round\'s fork point (a PR cannot loosen its own rule; an unreadable base config is full); its input lists those ACCEPT items and asks Fable to verify each fix and the round diff. Everything else is',
+    '    `full` / `high` / `arbiter` (the whole review job). Fable still runs on every Fable round either way. The choice is stored on the round (arbiter.brief / briefReason / effort / agent) and `apply` proves against the',
+    '    stored one; running `needed` again recomputes and re-stores it (the digest and tag change with the brief), except that a brief forced by --full is kept (below)',
+    '  briefReason (mode review): why that brief, e.g. `fix round: round 1 accepted 1 item(s) ...`, `synthetic review base ...`, `the round\'s own range is medium risk ...`, or the message of an error caught while assessing the range',
+    '  --full: force the full brief (`full` / `high` / `arbiter`, briefReason `forced by --full`) on a Fable review round `needed` would class as fix-verify; the stored brief and the digest change with it. For when `arbiter-fix` cannot be started or the owner wants a full review. It sticks: the round stores arbiter.forcedFull, also when a stale terminal stops the call, so a later plain `needed` (the retry after a restart, or after an unproven or malformed pass) keeps the full brief, briefReason still `forced by --full`, until a pass is proven',
     '  mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied',
     '    (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that)',
     '  mode review in a terminal whose Claude Code build is older than the installed one (stale): exit 1 {ok:false, error: stale-terminal, restartRequired: true,',
@@ -311,6 +315,8 @@ async function neededLocked(values, n, root, ctx) {
   let round = findRound(state, n);
   const review = isFableRound(round);
   const mode = review ? 'review' : 'dispute';
+  // --full sticks to the round until a pass is proven (the retries after a stale terminal or an unproven pass run a plain `needed`).
+  const forcedFull = review && (values.full === true || round.arbiter?.forcedFull === true);
 
   if (review && round.arbiter?.proofOk === true) return { exitCode: EXIT.OK, output: { needed: false, items: [], mode, done: true } };
   // A terminal that runs an older Claude Code than the installed one resolves the old `fable` alias: stop before anything is written or spent.
@@ -319,7 +325,9 @@ async function neededLocked(values, n, root, ctx) {
     try { claudeCode = claudeCodeStatus(ctx.env ?? process.env); } catch { /* unreadable: unknown, no stop */ }
     if (claudeCode.stale === true) {
       const advice = `this terminal runs Claude Code ${claudeCode.running} but ${claudeCode.installed} is installed: restart this terminal, then run \`arbiter needed\` again`;
-      saveState(root, withFailure(state, n, failureOf('stale-terminal', advice)));
+      // A --full given to this call survives the stop: the retry after the restart is a plain `needed` and must still be full.
+      const stopped = withFailure(state, n, failureOf('stale-terminal', advice));
+      saveState(root, forcedFull ? patchRound(stopped, n, { arbiter: { ...findRound(stopped, n).arbiter, forcedFull: true } }) : stopped);
       return { exitCode: EXIT.FAILED, output: { ok: false, error: 'stale-terminal', restartRequired: true, claudeCode, advice } };
     }
   }
@@ -357,7 +365,7 @@ async function neededLocked(values, n, root, ctx) {
   if (!review && items.length === 0) return { exitCode: EXIT.OK, output: { needed: false, items: [], mode } };
 
   const diff = review ? writeFableDiff(state, round, root, readReviewGate({ env: ctx.env ?? process.env })) : null;
-  const { expectation, fix, reason: briefReason } = review ? await chooseBrief(state, round, diff, root, { forceFull: values.full === true }) : { expectation: BRIEFS[BRIEF_FULL], fix: null, reason: null };
+  const { expectation, fix, reason: briefReason } = review ? await chooseBrief(state, round, diff, root, { forceFull: forcedFull }) : { expectation: BRIEFS[BRIEF_FULL], fix: null, reason: null };
   const itemsPart = items.length > 0
     ? [`# Items to rule on (${items.length})`, '', ...items.map((item) => itemSection(item, root))]
     : ['# Items to rule on (0)', '', '_Codex raised nothing left to rule on in this round: your own review is the whole job._', ''];
@@ -370,7 +378,7 @@ async function neededLocked(values, n, root, ctx) {
   const ids = items.map((i) => i.id);
   const kept = round.arbiter?.failure;
   // The brief rides with a Fable review round only: a dispute round (and any round stored before this existed) has none, which `apply` reads as full.
-  const stored = { inputDigest: digest, items: ids, tag, mode, ...(review ? { brief: expectation.brief, briefReason, effort: expectation.effort, agent: expectation.agent } : {}), ...(kept ? { failure: kept } : {}), ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}) };
+  const stored = { inputDigest: digest, items: ids, tag, mode, ...(review ? { brief: expectation.brief, briefReason, effort: expectation.effort, agent: expectation.agent } : {}), ...(forcedFull ? { forcedFull: true } : {}), ...(kept ? { failure: kept } : {}), ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}) };
   saveState(root, patchRound(state, n, { arbiter: stored }));
   const promptHeader = `ROUND: ${n}\nINPUT-DIGEST: ${digest}`;
   return {

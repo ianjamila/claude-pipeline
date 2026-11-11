@@ -336,6 +336,35 @@ test('arbiter needed --full: forces the full brief (agent arbiter, effort high);
   assert.equal(w.state().rounds[1].arbiter.proofOk, true);
 });
 
+test('arbiter needed --full is sticky: a plain needed afterwards (the retry paths) is still full / high / arbiter, forced by --full, until the round is proven', (t) => {
+  const w = fixWorld(t);
+  assert.equal(w.needed(2).json.brief, 'fix-verify');
+  const forced = w.cli(['arbiter', 'needed', '--round', '2', '--full']);
+  assertExit(forced, 0, forced.stdout + forced.stderr);
+  assert.equal(w.state().rounds[1].arbiter.forcedFull, true);
+  const again = w.needed(2);
+  assertExit(again, 0, again.stdout + again.stderr);
+  assert.deepEqual([again.json.brief, again.json.effort, again.json.agent, again.json.briefReason], ['full', 'high', 'arbiter', 'forced by --full']);
+  assert.equal(again.json.digest, forced.json.digest, 'the same input as the forced one');
+  assert.equal(w.state().rounds[1].arbiter.forcedFull, true);
+  // an unproven pass (model-proof) and the retry: still full
+  const bad = w.apply(2, again.json, { model: 'claude-sonnet-4-6', effort: 'high' });
+  assert.notEqual(bad.code, 0);
+  const retry = w.needed(2);
+  assertExit(retry, 0, retry.stdout + retry.stderr);
+  assert.deepEqual([retry.json.brief, retry.json.agent], ['full', 'arbiter']);
+  // the proven pass at the forced brief ends it
+  const ok = w.apply(2, retry.json, { effort: 'high', agentType: 'arbiter' });
+  assertExit(ok, 0, ok.stdout);
+  assert.equal(w.state().rounds[1].arbiter.proofOk, true);
+});
+
+test('arbiter needed without --full on a fresh fix round stores no forced choice', (t) => {
+  const w = fixWorld(t);
+  assert.equal(w.needed(2).json.brief, 'fix-verify');
+  assert.equal(w.state().rounds[1].arbiter.forcedFull, undefined);
+});
+
 // ---- stored, not recomputed ------------------------------------------------------------------------------------------------------------------
 
 test('arbiter needed re-run recomputes and re-stores the brief; the digest and tag change with it', (t) => {
