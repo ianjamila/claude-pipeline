@@ -1218,7 +1218,10 @@ function makeMatchers(ctx) {
 const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
 const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
-const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'set-location', 'sl']);
+// (R12-F2: `chdir` is a zsh builtin and a PowerShell alias, Push-Location / Pop-Location are pushd / popd, and `cd..` is the one-word PowerShell function for `cd ..`)
+const CD_CMDS = new Set(['cd', 'chdir', 'pushd', 'popd', 'set-location', 'sl', 'push-location', 'pop-location', 'cd..']);
+// The directory a cd command names (its first operand; `cd..` carries it in its name), undefined when it has none
+const cdOperand = (argv) => (baseOf(argv[0] ?? '') === 'cd..' ? '..' : argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d'));
 // Why: the directories an unknown `cd` may land in that matter: each protected directory (a file cannot be a cwd), each directory above one, and the home's parents.
 function assumedCwds(ctx) {
   const dirs = [...ctx.lexRoots.filter((r) => !/\.\w+$/.test(posix.basename(r))), ...ctx.lexAncestors];
@@ -1374,10 +1377,10 @@ function runsInlineCode(c, ctx) {
 function cdUnknownShape(argv) {
   const cn = baseOf(argv[0] ?? '');
   const args = argv.slice(1);
-  if (cn === 'popd' || args.includes('-')) return true;
-  const t = args.find((a) => !a.startsWith('-') && a !== '/d');
+  if (cn === 'popd' || cn === 'pop-location' || args.includes('-')) return true;
+  const t = cdOperand(argv);
   if (cn === 'pushd' && (t === undefined || args.some((a) => /^[+-]\d+$/.test(a)))) return true;
-  if (cn === 'cd' && args.filter((x) => !x.startsWith('-')).length > 1) return true;
+  if ((cn === 'cd' || cn === 'chdir') && args.filter((x) => !x.startsWith('-')).length > 1) return true;
   return t !== undefined && /^~(?:[-+]|[A-Za-z_])/.test(t);
 }
 // Why: a cd whose target a command computes is not always unknown. Modelled (an absolute directory, never a protected one unless the script / repo really is there; null = not one of these):
@@ -1726,17 +1729,43 @@ function ghReadOnly(args, cmd, ctx) {
 // Deny by default: a backslash followed by anything but a plain path character [A-Za-z0-9._-], or by the end of the text, is a hazard. A denylist of escaped characters missed `\$(`, `\@(`, `\{`, `\<` and the rest.
 // That includes `\\` (UNC or a doubled separator) and `\/`: no trusted tool path or ordinary path in the tests needs them, and either can hide the same split, so they are refused too.
 const PS_ESCAPED_SYNTAX = /\\(?![A-Za-z0-9._-])/;
-// ... and the same decision for the whole line (R10-B1 / F1 / F3, R11-F1), deny by default: PLAIN text is a CHARACTER ALLOWLIST: letters, digits, space, tab, newline (CRLF counts as one) and `. _ - : / \ | ; = , " '`
+// ... and the same decision for the whole line (R10-B1 / F1 / F3, R11-F1, R12-F3), deny by default: PLAIN text is a CHARACTER ALLOWLIST: letters, digits, space, tab, newline (CRLF counts as one) and `. _ - : / \ | ; = , " '`
 // (the backslash only when it passes PS_ESCAPED_SYNTAX). Everything else is not plain: `{ } # $ ( ) @ < > & ! ? * [ ] ~ % ^ +` (a script block glued to a read-only command, a `}#` comment the guard's lexer misses, a
 // subexpression, a redirection, a call operator ...), another character (a typographic quote, a no-break space, a lone CR or other control character), a backtick (PowerShell's escape), a here-string `@"` / `@'`,
 // a block comment `<#` / `#>`, the stop-parsing token `--%`, or a backslash escape (PS_ESCAPED_SYNTAX). Used with a protected-path reference (step 5 of evaluateBashForFilesFrame), never alone.
+// The exceptions (R12-F3, so the trusted pipeline CLI keeps working): a bare variable name (`$DEST`, `$_`; never `${`, `$(`, `$$`), which the trusted `cd $DEST; node <CLI>` line of R9-B1 needs; a word-initial `~/` or
+// `~\` (PowerShell gives `~` no lexical meaning there; the guard reads it as the home, the stricter reading); and the forms PowerShell and Bash read the same: `2>&1`, `>` / `>>` / `2>` / `2>>` followed by a plain
+// target word (the target is judged like any other word), and `&&` as a separator (`||` is plain already). A lone `&` stays not plain (PowerShell's call operator).
 const PS_NOT_PLAIN_CHARS = /[^A-Za-z0-9 \t\n._:/\\|;=,"'-]/;
 const PS_NOT_PLAIN_SYNTAX = /@["']|<#|#>|`|--%/;
+const psPlainView = (text) => text
+  .replace(/(?<![^\s'";|])~(?=[/\\])/g, '')
+  .replace(/(?<![^\s;|])[12]>&[12](?![^\s;|])/g, ' ')
+  .replace(/(?<![^\s;|])[12]?>>?(?=[ \t]*["']?[A-Za-z0-9._:/\\-])/g, ' ')
+  .replace(/(?<!&)&&(?!&)/g, ';')
+  .replace(/\$[A-Za-z_][A-Za-z0-9_]*/g, '');
 const psUnparsed = (raw) => {
   const text = raw.replace(/\r\n/g, '\n');
-  // one exception to the allowlist: a bare variable name (`$DEST`, `$_`; never `${`, `$(`, `$$`), which the trusted `cd $DEST; node <CLI>` line of R9-B1 needs
-  return PS_NOT_PLAIN_CHARS.test(text.replace(/\$[A-Za-z_][A-Za-z0-9_]*/g, '')) || PS_NOT_PLAIN_SYNTAX.test(text) || PS_ESCAPED_SYNTAX.test(text);
+  return PS_NOT_PLAIN_CHARS.test(psPlainView(text)) || PS_NOT_PLAIN_SYNTAX.test(text) || PS_ESCAPED_SYNTAX.test(text);
 };
+// The first thing that makes a line not plain, named for the deny message: the character (`(`, or U+2018 for one that is not printable ASCII), a here-string, block comment, stop-parsing token, backtick or backslash escape.
+const psOffender = (raw) => {
+  const text = raw.replace(/\r\n/g, '\n');
+  const view = psPlainView(text);
+  const found = [];
+  const ch = PS_NOT_PLAIN_CHARS.exec(view);
+  if (ch) found.push([ch.index, /^[\x21-\x7E]$/.test(ch[0]) ? `the character \`${ch[0]}\`` : `a character that is not plain ASCII text (U+${ch[0].codePointAt(0).toString(16).toUpperCase().padStart(4, '0')})`]);
+  const sy = PS_NOT_PLAIN_SYNTAX.exec(text);
+  if (sy) found.push([sy.index, sy[0] === '`' ? 'a backtick' : `\`${sy[0]}\``]);
+  const es = PS_ESCAPED_SYNTAX.exec(text);
+  if (es) found.push([es.index, `a backslash before ${text[es.index + 1] === undefined ? 'the end of the text' : `\`${text[es.index + 1]}\``}`]);
+  found.sort((a, b) => a[0] - b[0]);
+  return found[0]?.[1] ?? 'text PowerShell reads differently';
+};
+// R12-F1: the words that change PowerShell's directory (`cd..` and `cd\` are one word each; case-insensitive, not part of a longer name or path), counted in the raw text. On a not-plain line the Bash parse may
+// read a quote or a comment differently from PowerShell, so a directory change it did not read as a command can still run; the caller compares this count with the cd commands the parse found.
+const PS_CD_WORD = /(?<![\w.\\/$-])(?:cd\.\.|cd\\|(?:set-location|push-location|pop-location|chdir|pushd|popd|cd|sl)(?![\w.\\/-]))/gi;
+const psCdWords = (text) => (text.match(PS_CD_WORD) ?? []).length;
 // The text PowerShell sees once it has read its backtick escapes (R10 security review): `u{hex1-6} is that code point, `0 `a `b `e `f `n `r `t `v are control characters, a backtick before a line break
 // continues the line (nothing), a backtick before any other character is that character. Returns null when a `u{ is malformed (no closing brace, no or non-hex digits, more than six, past U+10FFFF):
 // PowerShell would refuse it, and the caller fails closed.
@@ -1778,7 +1807,7 @@ function isReadOnly(cmd, ctx) {
   if (isPipelineTool(argv[0], ctx)) return true;
   if (name === 'node') {
     // Under the PowerShell tool a backslash is a path separator, but the Bash parser dropped it from argv[1] (`hooks/x\..\..\repo\evil.mjs` arrives as one plain name inside hooks): when the text holds a
-    // backslash the argv word is NEVER the operand, only the raw text decides (R9-F1; pipelineToolInRaw refuses `..`). Without one, argv[1] is the word PowerShell reads too, so the tilde form stays trusted.
+    // backslash the argv word is NEVER the operand, only the raw text decides (R9-F1; pipelineToolInRaw refuses `..`). Without one, argv[1] is the word PowerShell reads too, so the tilde form stays trusted (a word-initial `~/` is plain text on a PowerShell line, psPlainView; any other `~` is not).
     if (ctx.shell === 'powershell' && cmd.raw.includes('\\')) return pipelineToolInRaw(cmd.raw, ctx);
     return isPipelineTool(argv[1], ctx) || (cmd.raw.includes('\\') && pipelineToolInRaw(cmd.raw, ctx));
   }
@@ -1958,10 +1987,10 @@ function collectDirs(cmds, ctx, cdOnly = false) {
     if (!cdOnly && typeof c.chdir === 'string') addDir(expandRefs(c.chdir, ctx));
     const cdName = baseOf(c.argv[0] ?? '');
     if (!CD_CMDS.has(cdName)) continue;
-    let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
-    if (!t && (cdName === 'cd' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
+    let t = cdOperand(c.argv);
+    if (!t && (cdName === 'cd' || cdName === 'chdir' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
     if (c.raw.includes('\\')) {
-      const m = /^\s*(?:cd|pushd|set-location|sl)\s+(?:\/d\s+)?["']?([^"';&|\n]+)/i.exec(c.raw);
+      const m = /^\s*(?:cd|chdir|pushd|push-location|set-location|sl)\s+(?:\/d\s+)?["']?([^"';&|\n]+)/i.exec(c.raw);
       if (m) t = m[1].trim();
     }
     if (!t) continue;
@@ -2850,7 +2879,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
     } else if (CD_CMDS.has(name)) {
       // (a target that stays a run-time value, a pattern or a brace list, `cd -`, popd, several operands: the directory is unknown from here on, not a literal; with CDPATH set -- the
       // line's, the hook's environment's, one this file set earlier or may have changed -- a relative name is searched along it)
-      const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
+      const t = cdOperand(c.argv);
       const v = t === undefined ? t : substVars(t, local, ctx.budget);
       const cdpath = (ctx.env?.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (ctx.vars[n] ?? '') !== '' || out.vars.has(n) || ctx.pickUnknown.has(n) || ctx.srcChanged.has(n) || (c.env?.[n] ?? '') !== '' || cmds.some((x) => x.argv.some((a) => a.startsWith(`${n}[`))));
       if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || (cdpath && v !== undefined && !isAbs(toPosix(v)) && !/^(?:\.\.?(?:[\\/]|$)|~)/.test(v))) out.unknownCd = true;
@@ -3227,7 +3256,7 @@ function evaluateBashForFilesFrame(command, opts) {
       if (!CD_CMDS.has(cn)) return false;
       const { unknownName } = stateAt(ci);
       if (cdUnknownShape(c.argv)) return true;
-      const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
+      const t = cdOperand(c.argv);
       if (t !== undefined && modelledCd(t, cmds, ci, ctx) !== null) return false;
       if (t === undefined || /^~(?:\/|$)|^\$\{?HOME\b/.test(t)) { if (homeMoved) return true; if (t === undefined) return false; } // (a bare cd goes home)
       const e = expandRefs(t, ctx);
@@ -3430,8 +3459,19 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const w of words) if (m.pathHit(w, dirs, true)) return true;
     return false;
   };
-  if (ctx.shell === 'powershell' && psUnparsed(raw) && (insideRoot || dirs.some((d) => ctx.hitTree(d)) || m.rawHit(raw, dirs) || psDecoded === null || psWordHit() || (raw.includes('`') && (m.rawHit(psDecoded, dirs) || m.rawHit(raw.replace(/`/g, ''), dirs))))) {
-    return deny(`the PowerShell command refers to a protected pipeline file (or the directory that holds it) and holds text PowerShell reads differently from the guard's parser (a non-ASCII character such as a typographic quote, a backtick, a here-string @" or @', a block comment <# #>, --%, a control character, or a backslash before a non-path character), so what it runs cannot be checked; write it as plain ASCII text with no such syntax (${PROTECTED_MSG})`);
+  if (ctx.shell === 'powershell' && psUnparsed(raw)) {
+    // R12-F1: on a not-plain line the cd list parsed above is not the one PowerShell runs (a quote the Bash parse opens can swallow a real `cd`: `echo ‘ " ’ ; cd ~/.claude/plugins ; Set-Content ../settings.json x`),
+    // so a directory-changing word in the text (also decoded and backtick-stripped) that the parse did not read as a cd command refuses the line, whatever it names.
+    const cdTexts = [raw, ...(psDecoded !== null && psDecoded !== raw ? [psDecoded] : []), ...(raw.includes('`') ? [raw.replace(/`/g, '')] : [])];
+    const parsedCds = cmds.filter((c) => CD_CMDS.has(baseOf(c.argv[0] ?? ''))).length;
+    if (Math.max(...cdTexts.map(psCdWords)) > parsedCds) {
+      return deny(`the PowerShell command holds a directory change the guard could not read (a cd, chdir, Set-Location, Push-Location, pushd, popd or the like, in text that PowerShell reads differently from the guard's parser: it holds ${psOffender(raw)}), so the folder the rest of the line runs in cannot be checked; write the directory change as its own plain command (${PROTECTED_MSG})`);
+    }
+    const namesFile = psDecoded === null || m.rawHit(raw, dirs) || psWordHit() || (raw.includes('`') && (m.rawHit(psDecoded, dirs) || m.rawHit(raw.replace(/`/g, ''), dirs)));
+    const inTree = insideRoot || dirs.some((d) => ctx.hitTree(d));
+    if (namesFile || inTree) {
+      return deny(`the PowerShell command ${namesFile ? 'refers to a protected pipeline file (or the directory that holds it)' : 'runs in a folder below ~/.claude'} and holds ${psDecoded === null ? 'a backtick `u{ escape that does not decode' : psOffender(raw)}, which PowerShell may read differently from the guard's parser, so what it runs cannot be checked; on such a line only letters, digits, blanks and . _ - : / \\ | ; = , " ' , a bare $NAME, a leading ~/ and the redirections 2>&1, > FILE, >> FILE and 2> FILE are accepted (${PROTECTED_MSG})`);
+    }
   }
 
   // #58: running the owner-go recorder (any copy) by hand would write an owner "merge" the owner never typed. Only Claude Code runs it,
@@ -3502,7 +3542,7 @@ function evaluateBashForFilesFrame(command, opts) {
         if (/[`$]/.test(e) && !isAbs(toPosix(e)) && !/^~(?:\/|$)/.test(e) && !FD_DUP.test(e)) return deny('the command redirects output to a relative path with a part only known at run time after a cd into a directory known only at run time, so the file it reaches cannot be checked; write the path out');
       }
       if (!c.argv.length) continue;
-      if (CD_CMDS.has(baseOf(c.argv[0]))) cdUps += Math.max(0, ...c.argv.slice(1).flatMap(ups));
+      if (CD_CMDS.has(baseOf(c.argv[0]))) cdUps += Math.max(baseOf(c.argv[0]) === 'cd..' ? 1 : 0, ...c.argv.slice(1).flatMap(ups));
       else if (!isReadOnly(c, ctx)) writeUps = Math.max(writeUps, ...c.argv.slice(1).flatMap((w) => ups(w.replace(/^-{0,2}[\w-]+=/, ''))));
     }
     const depth = writeUps > 0 || cdUps > 0 ? writeUps + cdUps : 0;

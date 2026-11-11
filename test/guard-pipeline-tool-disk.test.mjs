@@ -524,3 +524,80 @@ test('R10-F2: a hooks path with a glob character is not a trusted tool on any pl
     assert.equal(go(`node ${h}/guard-files.mjs ${rest}`), 'allow', `${platform}: the plain hook stays trusted`);
   }
 });
+
+// R12-F2: every directory-changing command is a cd to the guard: chdir (a zsh builtin too), Push-Location, Pop-Location and PowerShell's one-word `cd..` / `cd\`.
+test('R12-F2: chdir, Push-Location, Pop-Location and cd.. / cd\\ move the directory the later relative write is judged from', () => {
+  const P = 'C:/Users/u/.claude/plugins';
+  const lines = [
+    `Push-Location ${P}; Set-Content ../settings.json x`,
+    `PUSHD ${P}; Set-Content ../settings.json x`,
+    `Push-Location -Path ${P}; Set-Content ../settings.json x`,
+    `chdir ${P}; Set-Content ../settings.json x`,
+    'Pop-Location; echo x > ../settings.json', // (the directory popped to is only known at run time, like popd's)
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  const fromRepoUnderHome = { ...WIN, shell: 'powershell', cwd: 'C:\\Users\\u\\repo' };
+  assert.equal(evaluateBashForFiles('cd..; Set-Content .claude/settings.json x', fromRepoUnderHome).decision, 'deny', 'cd.. from C:/Users/u/repo');
+  assert.equal(evaluateBashForFiles('cd ..; Set-Content .claude/settings.json x', fromRepoUnderHome).decision, 'deny', 'cd .. (the spaced form)');
+  assert.equal(evaluateBashForFiles('CD..; Set-Content .claude/settings.json x', fromRepoUnderHome).decision, 'deny', 'CD..');
+  assert.equal(evaluateBashForFiles('cd\\; Set-Content Users/u/.claude/settings.json x', fromRepoUnderHome).decision, 'deny', 'cd\\ (the drive root)');
+  // darwin Bash: chdir is a zsh builtin
+  assert.equal(run('chdir ~/.claude/plugins; echo x > ../settings.json'), 'deny');
+  assert.equal(run(`chdir ${HOME}/.claude/plugins; echo x > ../settings.json`), 'deny');
+  // unrelated directories stay allowed
+  assert.equal(psW('Push-Location C:/repo; Set-Content ../out.txt x'), 'allow');
+  assert.equal(psW('chdir C:/repo; Set-Content out.txt x'), 'allow');
+  assert.equal(run('chdir /repo/sub; echo x > ../out.txt'), 'allow');
+});
+
+// R12-F1: on a non-plain PowerShell line the parsed cd list is not the one PowerShell runs (a quote the Bash parser opens swallows a real cd).
+test('R12-F1: a PowerShell cd hidden in text the guard parses as one quoted word is refused', () => {
+  const Q = '\u2018 " \u2019';
+  const lines = [
+    `echo ${Q} ; cd C:/Users/u/.claude/plugins ; Set-Content ../settings.json x ; echo ${Q}`,
+    `echo <# ' #> ; cd C:/Users/u/.claude/plugins ; Set-Content ../settings.json x ; echo <# ' #>`,
+    `echo ${Q} ; cd C:/Users/u ; Set-Content .claude/settings.json x ; echo ${Q}`,
+    `echo ${Q} ; chdir C:/Users/u ; Set-Content .claude/settings.json x ; echo ${Q}`,
+    `echo ${Q} ; SL C:/Users/u ; Set-Content .claude/settings.json x ; echo ${Q}`,
+    `echo ${Q} ; cd.. ; Set-Content .claude/settings.json x ; echo ${Q}`,
+    `echo ${Q} ; c\`d C:/Users/u ; Set-Content .claude/settings.json x ; echo ${Q}`,
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  assert.equal(psW(`echo ${Q} ; Set-Content out.txt x`), 'allow');
+});
+
+// R12-F3: the trusted pipeline CLI keeps working under PowerShell; the refusal names the character that caused it.
+test('R12-F3: trusted pipeline CLI lines with ~, 2>&1, a redirection to a plain file and && are plain under PowerShell', () => {
+  const CLI = 'C:/Users/u/.claude/pipeline/bin/pipeline.mjs';
+  assert.equal(psW('node ~/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow');
+  assert.equal(psW(`node ${CLI} merge --pr 12 2>&1`), 'allow');
+  assert.equal(psW(`node ${CLI} merge --pr 12 > out.txt`), 'allow');
+  assert.equal(psW(`node ${CLI} merge --pr 12 >> out.txt`), 'allow');
+  assert.equal(psW(`node ${CLI} merge --pr 12 2> err.txt`), 'allow');
+  assert.equal(psW(`node ${CLI} preflight && node ${CLI} config`), 'allow');
+  assert.equal(psW(`node ${CLI} preflight || node ${CLI} config`), 'allow');
+  assert.equal(psW('Get-Content ~/.claude/settings.json'), 'allow');
+  assert.equal(psW('Get-Content ~\\.claude\\settings.json'), 'allow');
+  // still refused: a write, a lone & (the call operator), a redirection to a protected file or to a non-plain target
+  assert.equal(psW('Set-Content ~/.claude/settings.json x'), 'deny');
+  assert.equal(psW(`node ${CLI} preflight & Set-Content C:/Users/u/.claude/settings.json x`), 'deny');
+  assert.equal(psW('Get-Content C:/Users/u/.claude/settings.json > C:/Users/u/.claude/settings.json'), 'deny');
+  assert.equal(psW(`node ${CLI} preflight > $x`), 'deny');
+  assert.equal(psW(`node ${CLI} preflight > ~/.claude/settings.json`), 'deny');
+  assert.equal(psW(`node ${CLI} merge --pr 12 2>&1 & Set-Content ${CLI} x`), 'deny');
+});
+
+test('R12-F3: the PowerShell refusal names the first offending character, a directory change it could not read, or the folder below ~/.claude', () => {
+  const CLI = 'C:/Users/u/.claude/pipeline/bin/pipeline.mjs';
+  const why = (c) => evaluateBashForFiles(c, { ...WIN, shell: 'powershell' });
+  const paren = why(`node ${CLI} merge --pr 12 --body "fixed (see #45)"`);
+  assert.equal(paren.decision, 'deny');
+  assert.match(paren.reason, /`\(`/, paren.reason);
+  assert.doesNotMatch(paren.reason, /typographic quote, a backtick/, 'the stale list of causes is gone');
+  const hidden = why(`echo \u2018 " \u2019 ; cd C:/Users/u ; Set-Content .claude/settings.json x ; echo \u2018 " \u2019`);
+  assert.equal(hidden.decision, 'deny');
+  assert.match(hidden.reason, /a directory change the guard could not read/, hidden.reason);
+  const below = why('cd C:/Users/u/.claude/plugins; echo x <# #>; Get-ChildItem sub');
+  assert.equal(below.decision, 'deny');
+  assert.match(below.reason, /runs in a folder below ~\/\.claude/, below.reason);
+});
