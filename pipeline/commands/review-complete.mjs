@@ -11,7 +11,9 @@
 import { createHash } from 'node:crypto';
 import { EXIT, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { diffFiles, headSha, mergeBase } from '../lib/git.mjs';
+import { diffFiles, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
+import { behindFreshEnough, lazyDiff } from '../lib/finalgate.mjs';
+import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, reviewLane } from '../lib/risk.mjs';
 import { loadState } from '../lib/state.mjs';
@@ -27,7 +29,7 @@ import { publishTriage, reviewContentHash } from '../lib/review-publish.mjs';
 export const meta = {
   summary: 'post the review-complete comment (and remove awaiting-review) once the review is valid for the current content',
   usage: [
-    'pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?}; exit 1 {ok:false, reason} when the review is not valid',
+    'pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?, warnings?}; exit 1 {ok:false, reason} when the review is not valid',
     '  origin/<default_branch> is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated',
     '  from its base branch and pulled is judged against the main that was merged in',
     '  after the validity checks it also refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet',
@@ -46,6 +48,10 @@ export const meta = {
     '  when a proven Fable round counts as current only because of the owner\'s allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line',
     '  "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},',
     '  and the final gate\'s review check detail carries the same note',
+    '  a DRAFT whose head lacks commits of origin/<default_branch> is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:\'behind-base\', error:\'behind-base\', base, behindBy, remedy},',
+    '  so the review skill catches it up BEFORE `gh pr ready` and CI runs once, on current main: the remedy is `pipeline update-branch --pr N`, `git pull --ff-only`, the next codex-review round (only main was merged in: baseOnly, Codex does not run,',
+    '  nothing is counted), then review-complete again. merge.behind_base: update = behind when origin/<default_branch> is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`).',
+    '  A ready PR is never refused for this; the check is skipped with a `warnings` entry when the base ref could not be refreshed (offline), the base has a merge queue (or it cannot be read), or the ancestry cannot be read',
   ].join('\n'),
 };
 
@@ -126,6 +132,48 @@ export function reviewCompleteBody(record, docsExempt = null, fableNote = null) 
   ].join('\n');
 }
 
+const oneLine = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 200);
+
+// A DRAFT that lacks commits of origin/<default_branch> is caught up BEFORE it is marked ready, so its required CI runs once, on current main (the
+// merge dry run sees behind-base only after CI, and the catch-up then costs a second full run). A ready PR is never judged here: the merge flow handles it.
+// -> { refusal } (the output of the exit-1 refusal) | { warning } (the check could not be made: offline refresh, a merge queue, an unreadable queue or
+// ancestry; never a block) | {} (not a draft, or not behind). merge.behind_base: 'update' = behind when origin/<branch> is not an ancestor of HEAD;
+// 'disjoint' = behind only when the merge path would refuse it too (finalgate.behindFreshEnough, which reads the mode from the BASE commit's config).
+function draftBehindBase({ root, config, gh, pr, view, refresh }) {
+  if (view.isDraft !== true) return {};
+  const branch = config.default_branch;
+  if (!refresh.refreshed) return { warning: `behind-base check skipped: origin/${branch} could not be refreshed (${refresh.reason ?? 'fetch failed'})` };
+  const o = { cwd: root };
+  let baseSha;
+  try {
+    baseSha = revParse(`origin/${branch}^{commit}`, o);
+    if (isAncestor(baseSha, 'HEAD', o)) return {};
+  } catch (err) {
+    return { warning: `behind-base check skipped: could not compare HEAD with origin/${branch} (${oneLine(err)})` };
+  }
+  try {
+    if (queueModeFor({ gh, pr }).queue) return { warning: `behind-base check skipped: ${branch} has a merge queue, which tests the PR on top of the current base itself` };
+  } catch (err) {
+    if (!(err instanceof QueueUnreadable)) throw err;
+    return { warning: `behind-base check skipped: ${err.message}` };
+  }
+  // The helper wants GitHub's mergeStateStatus, which is DRAFT here and would always refuse; GitHub's `mergeable` (conflicts) still counts.
+  const fresh = behindFreshEnough({ root, config, diff: lazyDiff(root, config, { sha: baseSha, branch }), baseSha, info: { mergeStateStatus: 'CLEAN', mergeable: view.mergeable } });
+  if (fresh.ok) return {};
+  let behindBy = null;
+  try {
+    const n = Number(git(['rev-list', '--count', `HEAD..${baseSha}`], o).trim());
+    if (Number.isInteger(n)) behindBy = n;
+  } catch { /* the count is a courtesy */ }
+  return {
+    refusal: {
+      ok: false, reason: 'behind-base', error: 'behind-base', base: branch, behindBy,
+      remedy: `this draft lacks commits of origin/${branch}; catch it up before it is marked ready, so CI runs once on current ${branch}: run \`pipeline update-branch --pr ${pr}\`, \`git pull --ff-only\`, `
+        + 'then the next codex-review round (only main was merged in, so it is baseOnly: Codex does not run and nothing is counted), then review-complete again',
+    },
+  };
+}
+
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, { pr: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
@@ -146,7 +194,7 @@ export const run = guarded(async (argv, ctx) => {
       // The review covers the content of the local checkout; the comment and the label are on the PR GitHub holds. They
       // must be the same commit, or the review of one would be used to vouch for the other.
       const local = headSha({ cwd: root });
-      const view = gh.prView(pr, ['headRefOid', 'isDraft', 'labels', 'body']);
+      const view = gh.prView(pr, ['headRefOid', 'isDraft', 'labels', 'body', 'mergeable']);
       const remote = view.headRefOid;
       if (remote !== local) {
         return {
@@ -193,6 +241,10 @@ export const run = guarded(async (argv, ctx) => {
       // first on merge. Fixing it is a body edit, not a code change, so no round is owed (lib/closing-keywords.mjs).
       const closing = closingKeywordProblem(multiIssueClosingLines(view.body), pr);
       if (closing) return { exitCode: EXIT.FAILED, output: { ok: false, reason: closing, error: 'closing-keywords', currentContentHash: hash } };
+      // A draft behind its base is refused BEFORE anything is published or posted (labels stay as they are); see draftBehindBase.
+      const behind = draftBehindBase({ root, config, gh, pr, view, refresh });
+      if (behind.refusal) return { exitCode: EXIT.FAILED, output: { ...behind.refusal, currentContentHash: hash } };
+      const warnings = behind.warning ? [behind.warning] : [];
       // The marker vouches for the state the PR holds, so publish it first when it differs (a base-only round or a late mark-implemented leaves the
       // copies apart). A PR that holds a state this copy did not publish or restore is refused (stale-publication, exit 1); GitHub failing is exit 3.
       publishTriage({ gh, root, pr, state });
@@ -243,7 +295,7 @@ export const run = guarded(async (argv, ctx) => {
           ok: true, ...(reused ? { reused: true } : { posted: true }), comment, review: record, removed: true, recheck,
           ...(docsExempt ? { docsExempt: { files: docsExempt.files, reviewedHead: docsExempt.reviewedHead } } : {}),
           ...(fableNote ? { fableBypass: { note: fableNote, rounds: bypass } } : {}),
-          ...(recheckError ? { recheckError } : {}), pr, currentContentHash: hash,
+          ...(recheckError ? { recheckError } : {}), ...(warnings.length > 0 ? { warnings } : {}), pr, currentContentHash: hash,
         },
       };
     });
