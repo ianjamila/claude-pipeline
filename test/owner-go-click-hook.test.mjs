@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { issueAsk, mergeAsk, roundAsk, rulingAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
-import { clickHookLine, clickLine, dialogHookCheck } from '../pipeline/hooks/lib/owner-go-click-hook.mjs';
+import { clickHookLine, clickHookOutput, clickLine, dialogHookCheck } from '../pipeline/hooks/lib/owner-go-click-hook.mjs';
 import { mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 
 const HOOK = fileURLToPath(new URL('../pipeline/hooks/owner-go.mjs', import.meta.url));
@@ -104,6 +104,36 @@ test('dialogHookCheck: a dialog-hooks lib that will not load refuses the click (
   assert.deepEqual(await dialogHookCheck({ home: '/h', input: {} }, async () => { throw new Error('no such module'); }), { ok: false, reason: 'dialog-hooks-unavailable' });
   assert.deepEqual(await dialogHookCheck({ home: '/h', input: { cwd: '/w' } }, async () => ({ checkDialogHooks: ({ home, cwd }) => ({ ok: true, hookLayersSha256: `${home}${cwd}` }) })), { ok: true, hookLayersSha256: '/h/w' });
   assert.deepEqual(await dialogHookCheck({ home: '/h', input: {} }, async () => ({ checkDialogHooks: () => { throw new Error('bad'); } })), { ok: false, reason: 'dialog-hooks-unavailable' });
+});
+
+// R1-F1: PostToolUse plain stdout is not model context; the documented channel is JSON hookSpecificOutput.additionalContext.
+test('clickHookOutput: the line goes out as one JSON object with hookSpecificOutput.additionalContext on PostToolUse; no line, no output', async () => {
+  const w = world('merge', 'Merge');
+  const line = await clickHookLine(w.input, w.opts);
+  const out = clickHookOutput(line);
+  assert.equal(out.endsWith('\n'), true);
+  assert.deepEqual(JSON.parse(out), { hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: line } });
+  assert.equal(clickHookOutput(null), '');
+  assert.equal(clickHookOutput(''), '');
+});
+
+test('the hook script prints the click line only through clickHookOutput (never plain stdout on PostToolUse)', () => {
+  const src = readFileSync(HOOK, 'utf8');
+  assert.match(src, /clickHookOutput\(line\)/);
+  assert.doesNotMatch(src, /stdout\.write\(`\$\{line\}\\n`\)/);
+});
+
+// R1-F5: the docs and the skill quote the line the hook really prints.
+test('docs/cli.md and the review skill quote the refusal line clickLine prints', () => {
+  const printed = clickLine({ refused: 'REASON' });
+  const [head, tail] = printed.split('REASON');
+  const prefix = head.replace('[claude-pipeline owner-go] ', '');
+  assert.equal(prefix, 'the click could not be verified (');
+  for (const rel of ['../docs/cli.md', '../skills/review/reference/owner-merge.md']) {
+    const text = readFileSync(new URL(rel, import.meta.url), 'utf8');
+    assert.ok(text.includes(prefix), `${rel} quotes the stable prefix`);
+    assert.ok(text.includes(tail), `${rel} quotes the printed ending`);
+  }
 });
 
 // ---- the script itself ------------------------------------------------------------------------------------------------------------------

@@ -20,6 +20,13 @@ export function clickLine(result) {
   return null;
 }
 
+// (R1-F1) What the hook script writes to stdout for that line. Claude Code adds plain exit-0 stdout to the model's context only on UserPromptSubmit / SessionStart; on PostToolUse the
+// channel is JSON `hookSpecificOutput.additionalContext`. '' (print nothing) when there is no line.
+export function clickHookOutput(line) {
+  if (typeof line !== 'string' || line === '') return '';
+  return `${JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: line } })}\n`;
+}
+
 // The dialog-hook check handed to the recorder, loaded lazily: a lib that will not load refuses the click ('dialog-hooks-unavailable') and breaks nothing else.
 export async function dialogHookCheck({ home, input }, load = () => import('./dialog-hooks.mjs')) {
   try {

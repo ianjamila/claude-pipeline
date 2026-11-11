@@ -9,7 +9,7 @@
 // answer that nothing was recorded for (the agent must ask again), and (#191) one line when the owner's "merge", "extra round" or ruling answer was typed
 // while the agent was still working (a queued prompt records nothing).
 // (#261) The SAME script is also registered on PostToolUse for AskUserQuestion (click-to-approve, lib/owner-go-click.mjs): the owner's click on a dialog the pipeline
-// issued is verified against the transcript and recorded like the typed words (lib/owner-go-click-hook.mjs). PostToolUse stdout reaches the agent too: one line says the
+// issued is verified against the transcript and recorded like the typed words (lib/owner-go-click-hook.mjs). PostToolUse plain stdout does NOT reach the model, so the line goes out as JSON hookSpecificOutput.additionalContext (R1-F1): one line says the
 // click is recorded, declined (nothing approved) or could not be verified (the owner types the closing words instead); nothing is printed for an AskUserQuestion that is
 // not one of ours. The dialog-hook check (lib/dialog-hooks.mjs) is loaded lazily: if it cannot load, no click is admitted.
 async function onPrompt(input) {
@@ -33,9 +33,9 @@ try {
   const { readHookInput } = await import('./lib/hook-io.mjs');
   const input = await readHookInput();
   if (input?.hook_event_name === 'PostToolUse') {
-    const { clickHookLine } = await import('./lib/owner-go-click-hook.mjs');
+    const { clickHookLine, clickHookOutput } = await import('./lib/owner-go-click-hook.mjs');
     const line = await clickHookLine(input);
-    if (line) process.stdout.write(`${line}\n`);
+    process.stdout.write(clickHookOutput(line));
   } else {
     await onPrompt(input);
   }
