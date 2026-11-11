@@ -25,7 +25,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PROJECT = 'claude-pipeline'; // must match `project:` in .claude/pipeline.yml (names the dedicated Supabase and its lock)
 
 // ---- EDIT THIS: the steps for this project ----------------------------------------------------------------------------
-// claude-pipeline's own verify: the full node:test suite (quick = the CLI/skills/docs/config agreement tests, < 1 s).
+// claude-pipeline's own verify: the full node:test suite. Quick = the skills-commands, docs-facts and *config* test files
+// (substring match: config, stacks-config, worktree-prune-config-fallback) plus test/cli.test.mjs; about 6 s on a Mac.
 // The installer round trip is CI-only (.github/scripts/installer-round-trip.sh): install.mjs refuses to run inside a
 // Claude Code session, which is where this script usually runs.
 // name      unique, letters/digits/./_/- (it names the log file)
