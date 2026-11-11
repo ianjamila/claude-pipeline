@@ -7,7 +7,7 @@ import { rmSync } from 'node:fs';
 import { grantIdOf, markerPath } from '../pipeline/hooks/lib/owner-go.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { cleanupAtExit, OWNER_ENTRY, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
-import { aFile, low, roundWorld } from './helpers/round-world.mjs';
+import { aFile, findingsOf, low, roundWorld } from './helpers/round-world.mjs';
 
 const defer = (w, ids, fixHead, { reason = 'minor, file it', extra = [] } = {}) =>
   w.cli(['triage', 'defer-fixes', '--pr', '7', '--ids', ids, '--fix-head', fixHead, '--reason', reason, ...extra]);
@@ -410,4 +410,27 @@ test('defer-fixes: an EARLIER round\'s accept ruled and fixed after the last rev
   // a state from before the field (no record) falls back to the round as well
   w.edit((s) => { delete s.rounds[0].items.find((i) => i.id === 'R1-B9').implementedAfterRound; });
   refused(w, () => defer(w, 'R2-S1', h2), /R1-B9 is an accepted .*not proven/, 'no record of when it was marked');
+});
+
+test('defer-fixes: main merged in after the revert, then recorded as a base-only round: the deferral goes through anchored at the last REVIEWED head, and the refusal names the remedy (R2-F2)', (t) => {
+  const w = roundWorld(t);
+  const { h1, h2 } = reverted(w);
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/a.js', aFile(false).replace('export const v10 = 10;', 'export const v10 = 1000;'));
+  w.repo.commit('main edits near the PR');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', 'main']);
+  const merged = w.repo.git(['rev-parse', 'HEAD']).trim();
+  refused(w, () => defer(w, 'R2-S1', h2), /tree is not back at the last reviewed content.*merged in since that head.*base-only round first/, 'main merged in, no base-only round yet');
+  // the update is recorded as a base-only round (Codex is not run): the anchor moves to the merged content
+  w.prHead(merged);
+  const base = w.codex(3, findingsOf(), { from: h1, to: merged });
+  assertExit(base, 0, base.stderr + base.stdout);
+  assert.equal(w.state().rounds.at(-1).baseOnly, true, 'the last round is a base-only one');
+  const ok = defer(w, 'R2-S1', h2);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  const item = w.item('R2-S1');
+  assert.deepEqual([item.final.claude.reviewedHead, item.roundCapDeferral.reviewedHead], [h1, h1], 'the issue compares against the reviewed head, not the base-only one');
+  assert.equal(item.roundCapDeferral.fixHead, h2);
+  assert.equal(w.cli(['state', 'outcome']).json.clean, true);
 });

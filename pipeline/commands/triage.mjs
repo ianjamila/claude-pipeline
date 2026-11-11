@@ -748,6 +748,8 @@ async function deferFixes(rest, ctx) {
     const { slug, host } = gh.repo();
     if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded grants name a repository on github.com`);
     const last = state.rounds.at(-1);
+    // The last round that REVIEWED something (a base-only round only carries that result to the merged-in content): its head is where the fixes were measured from and what the issues compare against.
+    const reviewed = [...state.rounds].reverse().find((r) => r.baseOnly !== true) ?? last;
     const o = { cwd: root };
     // The owner's typed "extra round" always wins over a deferral, at whatever head it was typed for (the head moved when the fixes were reverted).
     // STRICT lookups (hooks/lib/owner-go.mjs#ownerGrantLookups): a record that cannot be read refuses, it never reads as "no grant".
@@ -772,7 +774,9 @@ async function deferFixes(rest, ctx) {
     refreshBaseRef(root, config);
     const hash = currentContentHash(root, config);
     if (hash !== last.contentHashAtToHead) {
-      return refuse(`the tree is not back at the last reviewed content (head ${String(last.toHead).slice(0, 12)}): revert every commit made since then (fixes and anything else), push, run quick verify and wait for CI, then run defer-fixes again`);
+      let merged = false;
+      try { merged = Number(git(['rev-list', '--merges', '--count', `${revParse(last.toHead, o)}..HEAD`], o)) > 0; } catch { /* the hint is optional */ }
+      return refuse(`the tree is not back at the last reviewed content (head ${String(last.toHead).slice(0, 12)}): revert every commit made since then (fixes and anything else), push, run quick verify and wait for CI, then run defer-fixes again${merged ? '; the default branch was merged in since that head and moved the content: record that update as a base-only round first (codex-review for the new head, which runs no Codex), then run defer-fixes again' : ''}`);
     }
     // Refusal 4: --fix-head is a commit on this branch whose content is NOT the reviewed one (it points the follow-up issues at the removed fix; nothing else depends on it).
     let fixFull;
@@ -783,13 +787,14 @@ async function deferFixes(rest, ctx) {
     }
     if (!isAncestor(fixFull, 'HEAD', o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is not an ancestor of HEAD`);
     // It is printed in the owner-bound Rulings row and in the issue's `git diff <reviewed> <fix>`: an older head would show the reviewed work in reverse.
-    if (!isAncestor(revParse(last.toHead, o), fixFull, o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is older than the last reviewed head ${String(last.toHead).slice(0, 12)}: pass the head that held the fixes (a descendant of the reviewed head)`);
-    if (reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log, head: fixFull }, o) === last.contentHashAtToHead) {
+    if (!isAncestor(revParse(reviewed.toHead, o), fixFull, o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is older than the last reviewed head ${String(reviewed.toHead).slice(0, 12)}: pass the head that held the fixes (a descendant of the reviewed head)`);
+    const fixHash = reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log, head: fixFull }, o);
+    if (fixHash === last.contentHashAtToHead || fixHash === reviewed.contentHashAtToHead) {
       return refuse(`--fix-head ${fixFull.slice(0, 12)} has the reviewed content, so it is not the head that held the fixes: pass the head the round-request line named`);
     }
     seedBaseline({ ctx, root, pr, state });
     // Format version 3: a pre-deferral pipeline reads version 2 and would drop the deferral rows from the Rulings block and let Claude reopen them (state.mjs SUPPORTED_STATE_VERSION).
-    const next = withStateVersion(deferItemsInState(state, want, { reason, ruledAt: new Date().toISOString(), fixHead: fixFull, reviewedHead: last.toHead }), STATE_VERSION_DEFERRAL);
+    const next = withStateVersion(deferItemsInState(state, want, { reason, ruledAt: new Date().toISOString(), fixHead: fixFull, reviewedHead: reviewed.toHead }), STATE_VERSION_DEFERRAL);
     saveState(root, next);
     const wanted = new Set(want);
     const rounds = next.rounds.filter((r) => (r.items ?? []).some((i) => wanted.has(i.id))).map((r) => r.n).sort((a, b) => a - b);
