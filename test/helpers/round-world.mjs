@@ -48,13 +48,15 @@ export function roundWorld(t, { max = 1, review = '', yml = '', comments = [], s
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-round-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
   const issueUrl = (n) => `https://github.com/${slug}/issues/${n}`;
-  const fake = createCommentsGh([
-    { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: head } },
+  const script = (sha) => [
+    { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: sha } },
     { match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: slug, url: `https://github.com/${slug}` } },
     { match: '^pr edit 7 ', code: 0 },
     { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=30 --paginate`, stdout: '[]' },
     { match: `^api -X POST repos/${slug}/issues `, stdoutJson: { number: 31, html_url: issueUrl(31) } },
-  ], { comments });
+    { match: '^pr edit 7 --remove-label', code: 0 },
+  ];
+  const fake = createCommentsGh(script(head), { comments });
   const lockDir = join(scratch, 'locks');
   const w = {
     repo, base, head, scratch, slug, fake, issueUrl,
@@ -80,6 +82,8 @@ export function roundWorld(t, { max = 1, review = '', yml = '', comments = [], s
       }));
       return w.cli(['triage', 'validate', '--round', String(n), '--file', w.file(`judge-${n}.json`, { items })]);
     },
+    // Tell the fake GitHub which commit the PR head is (review-complete compares it with the checked-out one).
+    prHead: (sha) => fake.setScript(script(sha)),
     // Change pipeline.yml in the working tree only (a commit would add to the commits since the last review): the rounds were run under the old one.
     config(more) {
       writeFileSync(join(repo.dir, '.claude', 'pipeline.yml'), ymlOf(more));
