@@ -733,6 +733,35 @@ test('R3-B1: a meta.json that is valid JSON but not a record (or lacks runnerPid
   }
 });
 
+// R4-F2: a runnerPid counts only as a positive 32-bit integer; null / absent counts only with a parseable startedAt. Anything else is an unusable record.
+test('R4-F2: a meta.json whose runnerPid has the wrong type or range is unusable (running, why meta.json) even with an old, parseable startedAt', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  const old = new Date(Date.now() - 3600_000).toISOString();
+  for (const pid of ['4242', 1.5, -7, 0, 1099511627776, 2147483648, true, [], {}]) {
+    writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: old, runnerPid: pid }));
+    assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: true, why: 'meta.json' }, `runnerPid ${JSON.stringify(pid)}`);
+  }
+});
+
+test('R4-F2: a valid positive dead runnerPid is still not running; a null / absent runnerPid is judged by startedAt as before', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  const old = new Date(Date.now() - 3600_000).toISOString();
+  writeFileSync(join(dir, 'meta.json'), goodMeta({ runnerPid: deadRunnerPid(), startedAt: old }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: false }, 'valid dead pid');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: old, runnerPid: null }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: false }, 'null runnerPid, old startedAt: past the grace period');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: old }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: false }, 'absent runnerPid, old startedAt');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: new Date().toISOString(), runnerPid: null }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: true }, 'null runnerPid, started a moment ago: inside the grace period');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: 'never', runnerPid: null }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: true, why: 'meta.json' }, 'null runnerPid, unparseable startedAt');
+});
+
 test('R3-B1: an exit.json that is not a record with a parseable finishedAt does not prove the job finished', (t) => {
   const cwd = scratch(t);
   const dir = jobDirOf(cwd, 'j');

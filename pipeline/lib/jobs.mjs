@@ -253,14 +253,17 @@ export function readJob(name, opts = {}) {
 
 // Could the job `name` still be running? For callers that must fail CLOSED (the installer's live-work scan, the lease judge). readJob answers
 // 'missing' for a meta.json it cannot read or parse, and trusts any truthy record, which is right for a poller but would let a running job's lease be swept:
-// here a record only counts when it has the SHAPE jobs.mjs writes (a plain object; meta.json with an integer runnerPid or a parseable startedAt; exit.json
+// here a record only counts when it has the SHAPE jobs.mjs writes (a plain object; meta.json with a positive 32-bit integer runnerPid, or a null / absent one and a parseable startedAt; exit.json
 // with a parseable finishedAt). A usable exit.json says the job finished; otherwise a meta.json or exit.json that is PRESENT but unusable (unreadable,
 // corrupt, or valid JSON that is not a record: {} / [] / 1) counts as running. A well-formed meta.json whose runner is dead is not running. Forged
 // well-formed records are out of scope. A job folder with no meta.json at all (ENOENT / ENOTDIR: an empty leftover, a stray file) is not a job.
 // Throws on an invalid name, like readJob. -> { running: boolean, why?: 'meta.json' | 'exit.json' } (why only when the answer rests on an unusable record).
 const isRecord = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const parseable = (v) => typeof v === 'string' && Number.isFinite(Date.parse(v));
-const metaUsable = (m) => isRecord(m) && (Number.isInteger(m.runnerPid) || parseable(m.startedAt));
+// runnerPid is usable only as a positive 32-bit integer (what process.kill can probe); null / absent is usable only with a parseable startedAt. A pid of any other
+// type or range ("4242", 1.5, -7, 0, 2**40) is a record this code did not write.
+const validPid = (p) => Number.isInteger(p) && p >= 1 && p <= 2147483647;
+const metaUsable = (m) => isRecord(m) && (validPid(m.runnerPid) || ((m.runnerPid === null || m.runnerPid === undefined) && parseable(m.startedAt)));
 const exitUsable = (e) => isRecord(e) && parseable(e.finishedAt);
 function present(file) {
   try { statSync(file); return true; } catch (err) { return !(err?.code === 'ENOENT' || err?.code === 'ENOTDIR'); } // cannot even stat: treat as there
