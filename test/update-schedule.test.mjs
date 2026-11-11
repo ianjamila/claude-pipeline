@@ -8,7 +8,8 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { run as update } from '../pipeline/commands/update.mjs';
-import { AUTO_UPDATE_LABEL, DEFAULT_EVERY, EVERY_CHOICES, cronExpression, parseEvery } from '../pipeline/lib/update-schedule.mjs';
+import { AUTO_UPDATE_ARGS, AUTO_UPDATE_LABEL, DEFAULT_EVERY, EVERY_CHOICES, cronExpression, parseEvery } from '../pipeline/lib/update-schedule.mjs';
+import { scheduleLine, scheduleMarker, schedulePlist } from '../pipeline/lib/schedule.mjs';
 
 const made = [];
 process.on('exit', () => { for (const d of made) rmSync(d, { recursive: true, force: true }); });
@@ -178,4 +179,128 @@ test('native Windows is unsupported-platform for every action (nothing touched)'
     assert.deepEqual([r.exitCode, r.output.ok, r.output.error], [2, false, 'unsupported-platform'], JSON.stringify(argv));
     assert.equal(ctx.launchctlFn.calls.length, 0);
   }
+});
+
+// ---- gaps closed after auditing plan B3, and the cases of #67 that still apply (adapted to lib/schedule.mjs) ---------------------------------
+
+const LINE_ARGS = { nodePath: '/usr/bin/node', binPath: '/home/me/.claude/pipeline/bin/pipeline.mjs', root: '/home/me', args: [...AUTO_UPDATE_ARGS], pathDirs: ['/usr/bin', '/opt/gh/bin'], logFile: '/home/me/logs/cron-auto-update.log', lockName: 'auto-update', kind: 'update' };
+const ok = { code: 0, stdout: '', stderr: '' };
+const notLoaded = { code: 113, stdout: '', stderr: 'Could not find service' };
+
+test('cron line: interval, PATH, the log, the marker and `update --scheduled --json`; hourly is a fixed minute past the hour', () => {
+  const line = scheduleLine({ ...LINE_ARGS, cron: cronExpression(15) });
+  assert.equal(line, "*/15 * * * * cd '/home/me' && PATH='/usr/bin:/opt/gh/bin:/bin' /usr/bin/node /home/me/.claude/pipeline/bin/pipeline.mjs update --scheduled --json >>'/home/me/logs/cron-auto-update.log' 2>&1 # claude-pipeline update auto-update");
+  assert.equal(scheduleMarker('auto-update', 'update'), '# claude-pipeline update auto-update');
+  assert.match(scheduleLine({ ...LINE_ARGS, cron: cronExpression(60) }), /^17 \* \* \* \* /);
+  assert.match(scheduleLine({ ...LINE_ARGS, cron: cronExpression(5) }), /^\*\/5 \* \* \* \* /);
+});
+
+test('cron line: node and script are quoted only when they need it, a quote is escaped, every % becomes \\%, a newline is refused', () => {
+  const line = scheduleLine({ ...LINE_ARGS, cron: cronExpression(15), nodePath: '/Users/Jane Doe/node', binPath: "/h/it's/pipeline.mjs", logFile: '/logs/100%/au.log', pathDirs: ['/p%q'] });
+  assert.match(line, / '\/Users\/Jane Doe\/node' /);
+  assert.ok(line.includes("'/h/it'\\''s/pipeline.mjs'"), line);
+  assert.ok(line.includes('/logs/100\\%/au.log'), line);
+  assert.ok(line.includes('/p\\%q'), line);
+  assert.ok(!/[^\\]%/.test(line), 'no unescaped %');
+  assert.throws(() => scheduleLine({ ...LINE_ARGS, cron: cronExpression(15), logFile: '/a\nb' }), /newline/);
+  assert.throws(() => scheduleLine({ ...LINE_ARGS, cron: '*/15 * * *' }), /five fields/);
+});
+
+test('plist: StartInterval is minutes x 60, RunAtLoad, the update arguments, PATH, and one log for stdout and stderr', () => {
+  const text = schedulePlist({ ...LINE_ARGS, label: AUTO_UPDATE_LABEL, interval: 900, pathDirs: ['/opt/node/bin'] });
+  assert.match(text, /<key>StartInterval<\/key>\s*<integer>900<\/integer>/);
+  assert.match(text, /<key>RunAtLoad<\/key>\s*<true\/>/);
+  assert.doesNotMatch(text, /StartCalendarInterval/, 'an interval job has no clock time');
+  assert.match(text, /<string>update<\/string>\s*<string>--scheduled<\/string>\s*<string>--json<\/string>/);
+  assert.match(text, /<string>\/opt\/node\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin<\/string>/);
+  const out = /<key>StandardOutPath<\/key>\s*<string>([^<]+)<\/string>/.exec(text)[1];
+  assert.equal(out, LINE_ARGS.logFile);
+  assert.match(text, new RegExp(`<key>StandardErrorPath</key>\\s*<string>${out.replace(/\//g, '\\/')}</string>`));
+  for (const [minutes, seconds] of [[5, 300], [60, 3600]]) assert.match(schedulePlist({ ...LINE_ARGS, label: AUTO_UPDATE_LABEL, interval: minutes * 60, pathDirs: [] }), new RegExp(`<integer>${seconds}</integer>`));
+});
+
+test('the owner-admin variable lifts the Claude Code refusal for --install, like a manual update', POSIX, async () => {
+  const { ctx } = ctxFor({ env: { CLAUDECODE: '1', [`PIPELINE_${'ADMIN'}`]: '1', PATH: '/usr/bin' } });
+  const r = await update(['schedule', '--install'], ctx);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+});
+
+test('Linux --install --every N replaces the line IN PLACE: other lines keep their bytes and their order', POSIX, async () => {
+  const cron = fakeCrontab('MAILTO=me\n30 2 * * * /usr/local/bin/backup --all # nightly\n@reboot /home/me/start.sh\n');
+  const { ctx } = ctxFor({ platform: 'linux', crontabFn: cron.fn });
+  await update(['schedule', '--install'], ctx);
+  const withLine = cron.text.split('\n');
+  const at = withLine.findIndex((l) => l.includes('claude-pipeline update auto-update'));
+  await update(['schedule', '--install', '--every', '10'], ctx);
+  const after = cron.text.split('\n');
+  assert.equal(after.findIndex((l) => l.includes('claude-pipeline update auto-update')), at, 'same position');
+  assert.ok(after[at].startsWith('*/10 * * * * '));
+  assert.deepEqual(after.filter((_, i) => i !== at), withLine.filter((_, i) => i !== at), 'every other line is byte-identical');
+});
+
+test('macOS reinstall with nothing changed leaves the plist alone but still reloads the job (repairs one that was unloaded by hand)', POSIX, async () => {
+  const { base, ctx } = ctxFor();
+  await update(['schedule', '--install'], ctx);
+  const plistPath = join(base, 'Library', 'LaunchAgents', 'com.claude-pipeline.auto-update.plist');
+  const text = readFileSync(plistPath, 'utf8');
+  ctx.launchctlFn.calls.length = 0;
+  const r = await update(['schedule', '--install'], ctx);
+  assert.equal(r.output.changed, false);
+  assert.equal(readFileSync(plistPath, 'utf8'), text);
+  assert.deepEqual(ctx.launchctlFn.calls.map((c) => c[0]), ['bootout', 'bootstrap']);
+});
+
+test('macOS: a failing bootstrap is exit 2 {error: launchctl} with the launchctl message', POSIX, async () => {
+  const { ctx } = ctxFor({ launchctlFn: (args) => (args[0] === 'bootstrap' ? { code: 5, stdout: '', stderr: 'Bootstrap failed: 5: Input/output error' } : ok) });
+  const r = await update(['schedule', '--install'], ctx);
+  assert.deepEqual([r.exitCode, r.output.ok, r.output.error], [2, false, 'launchctl']);
+  assert.match(r.output.message, /Input\/output error/);
+});
+
+test('macOS --remove: boots out, CONFIRMS with print that the job is gone, then deletes the plist', POSIX, async () => {
+  let loaded = true;
+  const calls = [];
+  const launchctlFn = (args) => {
+    calls.push([...args]);
+    if (args[0] === 'bootout') { loaded = false; return ok; }
+    if (args[0] === 'print') return loaded ? ok : notLoaded;
+    return ok;
+  };
+  const { base, ctx } = ctxFor({ launchctlFn });
+  await update(['schedule', '--install'], ctx);
+  const plistPath = join(base, 'Library', 'LaunchAgents', 'com.claude-pipeline.auto-update.plist');
+  calls.length = 0;
+  const r = await update(['schedule', '--remove'], ctx);
+  assert.deepEqual([r.exitCode, r.output.removed], [0, true]);
+  assert.deepEqual(calls, [['bootout', `gui/501/${AUTO_UPDATE_LABEL}`], ['print', `gui/501/${AUTO_UPDATE_LABEL}`]]);
+  assert.equal(existsSync(plistPath), false);
+});
+
+test('macOS --remove keeps the plist (exit 2) when print still shows the job loaded, or cannot tell', POSIX, async () => {
+  for (const [launchctlFn, why] of [
+    [(args) => (args[0] === 'bootout' ? { code: 1, stdout: '', stderr: 'Operation not permitted' } : ok), 'still loaded'],
+    [(args) => (args[0] === 'print' ? { code: 1, stdout: '', stderr: 'spawn /bin/launchctl ENOENT' } : ok), 'print unreadable'],
+  ]) {
+    const { base, ctx } = ctxFor({ launchctlFn });
+    await update(['schedule', '--install'], ctx);
+    const r = await update(['schedule', '--remove'], ctx);
+    assert.deepEqual([r.exitCode, r.output.error], [2, 'launchctl'], why);
+    assert.ok(existsSync(join(base, 'Library', 'LaunchAgents', 'com.claude-pipeline.auto-update.plist')), `${why}: the plist stays so the job is not left running with no file to remove it by`);
+  }
+});
+
+test('macOS --status: installed means the plist exists AND the job is loaded', POSIX, async () => {
+  let loaded = false;
+  const { base, ctx } = ctxFor({ launchctlFn: (args) => (args[0] === 'print' ? (loaded ? ok : notLoaded) : ok) });
+  const st = async () => (await update(['schedule', '--status'], ctx)).output;
+  assert.deepEqual([(await st()).installed, (await st()).loaded], [false, false]);
+  await update(['schedule', '--install'], ctx);
+  loaded = true;
+  assert.deepEqual([(await st()).installed, (await st()).loaded], [true, true]);
+  loaded = false; // the plist is there but the job is not loaded
+  const half = await st();
+  assert.deepEqual([half.installed, half.loaded, half.warning], [false, false, undefined]);
+  rmSync(join(base, 'Library', 'LaunchAgents', 'com.claude-pipeline.auto-update.plist'));
+  loaded = true; // loaded with no plist
+  assert.equal((await st()).installed, false);
 });
