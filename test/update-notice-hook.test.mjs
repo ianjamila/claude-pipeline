@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,12 +19,12 @@ const scratch = () => {
   return d;
 };
 
-function hook(content, { env = {}, raw = false, file } = {}) {
+function hook(content, { env = {}, raw = false, file, input = '{"hook_event_name":"SessionStart"}' } = {}) {
   const dir = scratch();
   const target = file ?? join(dir, 'update-status.json');
   if (content !== undefined) writeFileSync(target, raw ? content : `${JSON.stringify(content)}\n`);
   const started = Date.now();
-  const r = spawnSync(process.execPath, [HOOK], { encoding: 'utf8', input: '{"hook_event_name":"SessionStart"}', env: { ...process.env, HOME: dir, USERPROFILE: dir, PIPELINE_UPDATE_STATUS_FILE: target, ...env }, timeout: 15_000 });
+  const r = spawnSync(process.execPath, [HOOK], { encoding: 'utf8', input, env: { ...process.env, HOME: dir, USERPROFILE: dir, PIPELINE_UPDATE_STATUS_FILE: target, ...env }, timeout: 15_000 });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr, ms: Date.now() - started };
 }
 const base = { version: 1, checkedAt: '2026-11-11T10:00:00Z', installedSha: 'a'.repeat(40), mainSha: 'b'.repeat(40) };
@@ -111,4 +111,51 @@ test('the hook source reads one file: no network, no git, no child process', () 
   assert.ok(!/child_process|node:net|node:http|node:https|node:dns|\bfetch\(|\bspawn|\bexec/.test(src), 'no way to reach the network or run a program');
   assert.ok(!/\bgit\b/.test(src));
   assert.equal((src.match(/update-status\.json/g) ?? []).length, 1, 'exactly one file is named');
+});
+
+// ---- gaps closed: what stdin, odd files and an unreadable file can do to a session start ----------------------------------------------
+
+const POSIX = { skip: process.platform === 'win32' };
+
+test('the hook never reads stdin as input: empty, garbage, an array or a large payload change nothing, and none of them fails the session start', () => {
+  for (const input of ['', 'not json at all', '[]', 'null', `{"pad":"${'x'.repeat(300_000)}"}`]) {
+    assert.equal(hook({ ...base, state: 'behind' }, { input }).stdout, 'pipeline update available — installs automatically when no review is running\n', input.slice(0, 20));
+    silent(hook({ ...base, state: 'current' }, { input }), `current with stdin ${input.slice(0, 20)}`);
+    const none = hook(undefined, { input });
+    assert.equal(none.status, 0, input.slice(0, 20));
+  }
+});
+
+test('a status file that starts with a byte-order mark is still read', () => {
+  assert.equal(hook(`﻿${JSON.stringify({ ...base, state: 'failed' })}`, { raw: true }).stdout, 'pipeline update needs you: run pupdate\n');
+});
+
+test('a status file that is a FIFO (nobody writes to it) cannot hold the session: silent, exit 0, inside the budget', POSIX, () => {
+  const dir = scratch();
+  const fifo = join(dir, 'update-status.json');
+  assert.equal(spawnSync('mkfifo', [fifo]).status, 0);
+  const r = hook(undefined, { file: fifo });
+  silent(r, 'fifo');
+  assert.ok(r.ms < 4000, `took ${r.ms} ms`);
+});
+
+test('a status file that is a symlink to /dev/zero is not read to the end: silent, exit 0, inside the budget', POSIX, () => {
+  const dir = scratch();
+  const link = join(dir, 'update-status.json');
+  symlinkSync('/dev/zero', link);
+  const r = hook(undefined, { file: link });
+  silent(r, '/dev/zero');
+  assert.ok(r.ms < 4000, `took ${r.ms} ms`);
+});
+
+test('a status file the process may not read is silent (exit 0), not an error', { skip: process.platform === 'win32' || (typeof process.getuid === 'function' && process.getuid() === 0) }, () => {
+  const dir = scratch();
+  const file = join(dir, 'update-status.json');
+  writeFileSync(file, JSON.stringify({ ...base, state: 'behind' }));
+  chmodSync(file, 0o000);
+  try {
+    silent(hook(undefined, { file }), 'unreadable');
+  } finally {
+    chmodSync(file, 0o600);
+  }
 });

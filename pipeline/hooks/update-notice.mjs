@@ -38,7 +38,9 @@ async function main() {
   const file = seamValue('PIPELINE_UPDATE_STATUS_FILE') || path.join(accountHome(), '.claude', 'pipeline-state', 'update-status.json');
   const delay = Number(seamValue('PIPELINE_UPDATE_NOTICE_DELAY_MS'));
   if (Number.isFinite(delay) && delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-  const handle = await fs.open(file, 'r');
+  // O_NONBLOCK: opening a FIFO nobody writes to would otherwise block in a thread that process.exit() then waits for, past the 1 s budget.
+  const { constants } = await import('node:fs');
+  const handle = await fs.open(file, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
   let text;
   try {
     const st = await handle.stat();
