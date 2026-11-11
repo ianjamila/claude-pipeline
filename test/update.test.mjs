@@ -868,6 +868,20 @@ test('the installer child does not inherit NODE_OPTIONS or NODE_PATH, and keeps 
   assert.deepEqual(env, { PIPELINE_ADMIN: '1', PIPELINE_LOCK_DIR: '/l', PIPELINE_INSTALL_NO_PROBES: '1', PATH: '/p' });
 });
 
+// R1-F2: `update --scheduled` runs the installer from the DOWNLOAD, which has no INSTALLED.json, so the installer would take every seam as a checkout does.
+// An installed caller must not hand them over; a checkout caller (the suite) still does.
+test('an installed copy strips every test seam from the installer child; a checkout caller keeps them', () => {
+  const seams = {
+    PIPELINE_REVIEW_LEASE_DIR: '/x', PIPELINE_TEST_MODE: '1', PIPELINE_INSTALL_ACCOUNT_HOME: '/a', PIPELINE_INSTALL_SWAP_GATE: '/g',
+    PIPELINE_INSTALL_SCAN_DELAY_MS: '5', PIPELINE_INSTALL_RETIRED_SKILLS: 'x', PIPELINE_INSTALL_WORKER_WAIT_MS: '1', PIPELINE_GH: '/gh', PIPELINE_UPDATE_REMOTE: '/r',
+    PIPELINE_MODEL_FLOOR_DIR: '/f', PIPELINE_ADMISSION_WAIT_MS: '1',
+  };
+  const base = { PATH: '/p', PIPELINE_LOCK_DIR: '/l', PIPELINE_INSTALL_NO_PROBES: '1', NODE_OPTIONS: '--require x' };
+  assert.deepEqual(installerEnv({ ...base, ...seams }, { installed: true }), { PATH: '/p', PIPELINE_LOCK_DIR: '/l', PIPELINE_INSTALL_NO_PROBES: '1' });
+  assert.deepEqual(installerEnv({ ...base, ...seams }, { installed: false }), { PATH: '/p', PIPELINE_LOCK_DIR: '/l', PIPELINE_INSTALL_NO_PROBES: '1', ...seams });
+  assert.equal(Object.keys(installerEnv({ ...seams })).length, Object.keys(seams).length, 'this suite runs as a checkout');
+});
+
 test('update: NODE_OPTIONS=--require in the caller environment does not run inside the installer', async () => {
   const dir = scratch('cp-upd-nodeopt');
   const marker = join(dir, 'loaded');

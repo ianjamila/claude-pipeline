@@ -397,6 +397,20 @@ export function buildManifest({ plan, sourceSha, skipFileGuard, complete = false
   };
 }
 
+// The installer an unattended update runs is the DOWNLOADED one: it has no INSTALLED.json beside it, so seamValue reads every test seam as a checkout does.
+// Seams that only a test run may use (not already gated on PIPELINE_TEST_MODE by the installer itself) are therefore removed here unless `testMode`: from
+// `env` and from process.env (seamValue falls back to it). Mutates; returns the names that were dropped.
+export function dropSeamsWithoutTestMode(env, names, testMode) {
+  if (testMode) return [];
+  const dropped = [];
+  for (const name of names) {
+    if (env?.[name] !== undefined || process.env[name] !== undefined) dropped.push(name);
+    if (env) delete env[name];
+    delete process.env[name];
+  }
+  return dropped;
+}
+
 // { manifest, warnings }: manifest is null when absent or unusable (warnings say why).
 export function readManifest(home) {
   const file = fromRel(home, MANIFEST_REL);

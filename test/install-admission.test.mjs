@@ -16,7 +16,7 @@ import { tryAcquire, release } from '../pipeline/lib/locks.mjs';
 import { acquireAdmission, openOrRenewLease, releaseAdmission } from '../pipeline/lib/review-lease.mjs';
 import { registerRepo } from '../pipeline/lib/queue-sweep.mjs';
 import { openRecord } from '../pipeline/lib/merge-queue.mjs';
-import { GUARD_FILES_MATCHER, HOOK_LOADER, installLockName, mergeSettings, ourHookGroups } from '../pipeline/lib/installer.mjs';
+import { GUARD_FILES_MATCHER, HOOK_LOADER, installLockName, mergeSettings, ourHookGroups, dropSeamsWithoutTestMode } from '../pipeline/lib/installer.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const INSTALL = join(REPO, 'install.mjs');
@@ -281,6 +281,26 @@ test('the test seams are ignored without PIPELINE_TEST_MODE: the home check then
   const r = run(w, ['--require-no-live-reviews'], { PIPELINE_TEST_MODE: '' });
   assert.equal(r.status, 2, r.stderr + r.stdout);
   assert.equal(installed(w), false);
+});
+
+// R1-F2: the unattended installer runs from the download (no INSTALLED.json), so seamValue treats it as a checkout; the lease folder must still not be redirectable
+// by a stray environment variable (launchctl setenv, a crontab line) unless this is a test run.
+test('the lease-folder seam is honoured only with PIPELINE_TEST_MODE=1: otherwise it is removed from the installer environment, and from process.env', () => {
+  const saved = process.env.PIPELINE_REVIEW_LEASE_DIR;
+  try {
+    process.env.PIPELINE_REVIEW_LEASE_DIR = '/elsewhere';
+    const env = { PIPELINE_REVIEW_LEASE_DIR: '/elsewhere', PATH: '/p' };
+    dropSeamsWithoutTestMode(env, ['PIPELINE_REVIEW_LEASE_DIR'], false);
+    assert.deepEqual(env, { PATH: '/p' });
+    assert.equal(process.env.PIPELINE_REVIEW_LEASE_DIR, undefined, 'seamValue falls back to process.env');
+    const testRun = { PIPELINE_REVIEW_LEASE_DIR: '/scratch' };
+    process.env.PIPELINE_REVIEW_LEASE_DIR = '/scratch';
+    dropSeamsWithoutTestMode(testRun, ['PIPELINE_REVIEW_LEASE_DIR'], true);
+    assert.deepEqual(testRun, { PIPELINE_REVIEW_LEASE_DIR: '/scratch' });
+    assert.equal(process.env.PIPELINE_REVIEW_LEASE_DIR, '/scratch');
+  } finally {
+    if (saved === undefined) delete process.env.PIPELINE_REVIEW_LEASE_DIR; else process.env.PIPELINE_REVIEW_LEASE_DIR = saved;
+  }
 });
 
 test('usage: --deadline-ms needs --require-no-live-reviews and a positive number; neither new flag combines with --check or --uninstall', () => {

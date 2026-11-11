@@ -17,6 +17,7 @@ import { readManifest } from '../lib/installer.mjs';
 import { insideClaudeCode } from '../lib/owner-only.mjs';
 import { expandHome } from '../lib/paths.mjs';
 import { runSchedule } from '../lib/update-schedule.mjs';
+import { SEAM_VARS, isInstalledCopy } from '../lib/seams.mjs';
 import { run as runProcess } from '../lib/proc.mjs';
 import { makePrivateTmpDir } from '../lib/private-tmp.mjs';
 import { compare, fetchRemote, isolatedGit, mainSha, makeIsoDir, removeTree } from '../lib/upstream.mjs';
@@ -95,9 +96,17 @@ function fetchSource(tmp, isoDir, sha, remote) {
 // The installer is code that was just downloaded, run as the owner. It gets the caller's environment minus the
 // variables that make Node load other code into it (NODE_OPTIONS `--require` / `--import`, NODE_PATH); the tests'
 // PIPELINE_ADMIN / PIPELINE_INSTALL_NO_PROBES / PIPELINE_LOCK_DIR pass through.
+// The downloaded installer has no INSTALLED.json beside it, so it would honour every checkout-only test seam; an INSTALLED caller therefore hands it none
+// (seams.mjs SEAM_VARS plus the seams of the installer, the review leases, the model floor and the update notice). The suite (a checkout) still passes them.
 const NODE_INJECTION_VARS = new Set(['NODE_OPTIONS', 'NODE_PATH']);
-export function installerEnv(env) {
-  return Object.fromEntries(Object.entries(env).filter(([k, v]) => v !== undefined && !NODE_INJECTION_VARS.has(k.toUpperCase())));
+export const INSTALLER_SEAM_VARS = new Set([
+  ...SEAM_VARS,
+  'PIPELINE_REVIEW_LEASE_DIR', 'PIPELINE_ADMISSION_WAIT_MS', 'PIPELINE_MODEL_FLOOR_DIR',
+  'PIPELINE_INSTALL_ACCOUNT_HOME', 'PIPELINE_INSTALL_SWAP_GATE', 'PIPELINE_INSTALL_SCAN_DELAY_MS', 'PIPELINE_INSTALL_RETIRED_SKILLS', 'PIPELINE_INSTALL_WORKER_WAIT_MS',
+  'PIPELINE_UPDATE_STATUS_FILE', 'PIPELINE_UPDATE_NOTICE_DELAY_MS',
+]);
+export function installerEnv(env, { installed = isInstalledCopy() } = {}) {
+  return Object.fromEntries(Object.entries(env).filter(([k, v]) => v !== undefined && !NODE_INJECTION_VARS.has(k.toUpperCase()) && !(installed && INSTALLER_SEAM_VARS.has(k))));
 }
 
 // The download lives under <home>/pipeline-state/tmp, and only an installer that knows that root (install.mjs imports
