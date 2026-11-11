@@ -1,0 +1,317 @@
+// hooks/lib/dialog-hooks.mjs + `pipeline owner-go` (#261, plan Rev 6 B5): which hooks could answer the choice dialog, and the owner's list of approved ones. Temp homes and project folders only.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { approveDialogHooks, checkDialogHooks, dialogHandlers, dialogHooksFile, hookCheck, matcherMatchesDialog, resolveCommand } from '../pipeline/hooks/lib/dialog-hooks.mjs';
+import { run } from '../pipeline/commands/owner-go.mjs';
+
+const ADMIN = { ['PIPELINE_' + 'ADMIN']: '1' }; // (the owner's switch, built here so this file does not itself look like a script that sets it)
+
+// A temp account home (with ~/.claude), an empty project folder, and helpers. managedPaths is always injected: the real machine's managed settings are never read.
+function world() {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'dialog-hooks-')));
+  const cwd = join(home, 'project');
+  mkdirSync(join(home, '.claude', 'hooks'), { recursive: true });
+  mkdirSync(join(cwd, '.claude'), { recursive: true });
+  const w = { home, cwd, managedPaths: [] };
+  w.script = (rel, body = 'process.exit(0)\n') => { const f = join(home, rel); mkdirSync(join(f, '..'), { recursive: true }); writeFileSync(f, body); return f; };
+  w.json = (file, value) => { mkdirSync(join(file, '..'), { recursive: true }); writeFileSync(file, typeof value === 'string' ? value : JSON.stringify(value)); return file; };
+  w.settings = (value, dir = join(home, '.claude'), name = 'settings.json') => w.json(join(dir, name), value);
+  w.check = (over = {}) => checkDialogHooks({ home, cwd, managedPaths: [], ...over });
+  w.handlers = () => dialogHandlers({ home, cwd, managedPaths: [] });
+  w.approve = (over = {}) => approveDialogHooks({ home, cwd, managedPaths: [], ...over });
+  return w;
+}
+const hookEntry = (command, matcher, event = 'PreToolUse') => ({ hooks: { [event]: [{ ...(matcher === undefined ? {} : { matcher }), hooks: [{ type: 'command', command }] }] } });
+
+test('matcher: absent, "", "*", a regex that matches the dialog, an invalid regex all match; Bash does not', () => {
+  for (const m of [undefined, null, '', '*', 'AskUserQuestion', 'AskUserQuestion|ExitPlanMode', 'Ask.*', '(', '[a-', 'Bash|AskUserQuestion']) assert.equal(matcherMatchesDialog(m), true, String(m));
+  for (const m of ['Bash', 'Ask', 'Question', 'Bash|Edit|Write', 'mcp__.*']) assert.equal(matcherMatchesDialog(m), false, m);
+});
+
+test('a handler whose matcher cannot match the dialog, or on another event, is not collected', () => {
+  const w = world();
+  const f = w.script('.claude/hooks/a.mjs');
+  w.settings({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `node ${f}` }] }], PostToolUse: [{ hooks: [{ type: 'command', command: `node ${f}` }] }] } });
+  const r = w.handlers();
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.handlers, []);
+  assert.equal(w.check().ok, true);
+});
+
+test('an unlisted handler is not ok and the reason names it in plain words', () => {
+  const w = world();
+  const f = w.script('.claude/hooks/notify.mjs');
+  w.settings(hookEntry(`node ${f}`, 'AskUserQuestion|ExitPlanMode'));
+  const r = w.check();
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'unlisted dialog hook ~/.claude/hooks/notify.mjs (PreToolUse AskUserQuestion|ExitPlanMode)');
+  assert.equal(r.offenders.length, 1);
+  assert.match(r.hookLayersSha256, /^[0-9a-f]{64}$/);
+});
+
+test('~ and $HOME / ${HOME} in the command are expanded with the account home', () => {
+  const w = world();
+  const f = w.script('.claude/hooks/x.mjs');
+  for (const cmd of ['node ~/.claude/hooks/x.mjs', 'node $HOME/.claude/hooks/x.mjs', 'node "${HOME}/.claude/hooks/x.mjs" --flag=1', '~/.claude/hooks/x.mjs']) {
+    if (cmd.startsWith('~')) chmodSync(f, 0o755);
+    assert.equal(resolveCommand(cmd, { home: w.home }), f, cmd);
+  }
+});
+
+test('listed with the same bytes => ok; the bytes changed => not ok; a different command for the same script => not ok', () => {
+  const w = world();
+  const f = w.script('.claude/hooks/notify.mjs', 'console.log(1)\n');
+  w.settings(hookEntry(`node ${f}`));
+  assert.equal(w.check().ok, false);
+  const a = w.approve();
+  assert.equal(a.ok, true);
+  assert.equal(a.hooks.length, 1);
+  assert.equal(JSON.parse(readFileSync(dialogHooksFile(w.home), 'utf8')).v, 1);
+  const ok = w.check();
+  assert.equal(ok.ok, true, ok.reason);
+  assert.equal(ok.reason, null);
+  const before = ok.hookLayersSha256;
+  writeFileSync(f, 'console.log(2)\n');
+  const changed = w.check();
+  assert.equal(changed.ok, false);
+  assert.match(changed.reason, /^changed dialog hook ~\/\.claude\/hooks\/notify\.mjs \(PreToolUse \*\)/);
+  assert.notEqual(changed.hookLayersSha256, before, 'the fingerprint follows the script bytes');
+  writeFileSync(f, 'console.log(1)\n');
+  assert.equal(w.check().ok, true);
+  w.settings(hookEntry(`node ${f} --other`));
+  assert.equal(w.check().ok, false, 'same script, other command: not the listed one');
+});
+
+test('an inline sh -c on the dialog is unresolvable: not ok, and approve refuses and writes nothing', () => {
+  const w = world();
+  w.settings(hookEntry(`sh -c 'echo "{}"'`, 'AskUserQuestion'));
+  const h = w.handlers().handlers;
+  assert.equal(h.length, 1);
+  assert.equal(h[0].scriptPath, null);
+  const r = w.check();
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /^unresolvable dialog hook sh -c/);
+  const a = w.approve();
+  assert.equal(a.ok, false);
+  assert.match(a.reason, /does not resolve to one script/);
+  assert.throws(() => readFileSync(dialogHooksFile(w.home)), /ENOENT/);
+});
+
+test('commands that are not one script are unresolvable: npx, inline node, pipes, env prefixes, relative paths, a missing file, an interpreter as the script, a non-command hook', () => {
+  const w = world();
+  const f = w.script('.claude/hooks/ok.mjs');
+  for (const cmd of ['npx some-tool', 'node -e "1"', `node ${f} | cat`, `FOO=1 node ${f}`, 'node ./hooks/x.mjs', `node ${w.home}/missing.mjs`, '/usr/bin/env node /x.mjs', `node ${f}; true`, `node $(echo ${f})`, 'node "unterminated', '']) {
+    assert.equal(resolveCommand(cmd, { home: w.home }), null, cmd);
+  }
+  assert.equal(resolveCommand(`node ${f}`, { home: w.home }), f);
+  w.settings({ hooks: { PermissionRequest: [{ hooks: [{ type: 'prompt', prompt: 'allow?' }] }] } });
+  const r = w.check();
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /^unresolvable dialog hook \(prompt hook\)/);
+});
+
+test('a handler installed with the pipeline (real path inside ~/.claude/pipeline) is trusted: ok without a list; a link out of it is not', () => {
+  const w = world();
+  const inside = w.script('.claude/pipeline/hooks/guard.mjs');
+  w.settings(hookEntry(`node ~/.claude/pipeline/hooks/guard.mjs`, '*'));
+  const r = w.check();
+  assert.equal(r.ok, true, r.reason);
+  assert.equal(r.handlers[0].trusted, true);
+  assert.equal(r.handlers[0].scriptPath, inside);
+  // a script outside, reached through a link that sits inside the pipeline folder, is judged by its real location
+  const outside = w.script('.claude/hooks/evil.mjs');
+  symlinkSync(outside, join(w.home, '.claude', 'pipeline', 'hooks', 'link.mjs'));
+  w.settings(hookEntry(`node ~/.claude/pipeline/hooks/link.mjs`, '*'));
+  const bad = w.check();
+  assert.equal(bad.ok, false);
+  assert.equal(bad.handlers[0].trusted, false);
+});
+
+test('settings.local.json and the project settings are sources too', () => {
+  const w = world();
+  const a = w.script('.claude/hooks/a.mjs');
+  const b = w.script('project/hooks/b.mjs');
+  const c = w.script('project/hooks/c.mjs');
+  w.settings(hookEntry(`node ${a}`), join(w.home, '.claude'), 'settings.local.json');
+  w.settings(hookEntry(`node ${b}`), join(w.cwd, '.claude'), 'settings.json');
+  w.settings(hookEntry(`node ${c}`), join(w.cwd, '.claude'), 'settings.local.json');
+  const h = w.handlers().handlers;
+  assert.deepEqual(h.map((x) => x.scriptPath).sort(), [a, b, c].sort());
+  assert.equal(w.check().ok, false);
+  assert.equal(w.approve().ok, true);
+  assert.equal(w.check().ok, true);
+  // another project folder has none of the project handlers (a different cwd is a different set)
+  assert.equal(checkDialogHooks({ home: w.home, cwd: null, managedPaths: [] }).handlers.length, 1);
+});
+
+test('the second account config dir (~/.claude-eaglewatch) is a source; a link to the shared settings is followed', () => {
+  const w = world();
+  const f = w.script('.claude/hooks/a.mjs');
+  mkdirSync(join(w.home, '.claude-eaglewatch'), { recursive: true });
+  w.settings(hookEntry(`node ${f}`));
+  symlinkSync(join(w.home, '.claude', 'settings.json'), join(w.home, '.claude-eaglewatch', 'settings.json'));
+  const h = w.handlers().handlers;
+  assert.equal(h.length, 2, 'one per config dir');
+  assert.deepEqual(new Set(h.map((x) => x.source)).size, 2);
+});
+
+test('managed settings are a source (injected path); an absent one is fine', () => {
+  const w = world();
+  const f = w.script('.claude/hooks/m.mjs');
+  const managed = w.json(join(w.home, 'managed', 'managed-settings.json'), hookEntry(`node ${f}`, 'AskUserQuestion'));
+  assert.equal(dialogHandlers({ home: w.home, cwd: w.cwd, managedPaths: [join(w.home, 'nope.json')] }).ok, true);
+  const r = dialogHandlers({ home: w.home, cwd: w.cwd, managedPaths: [managed] });
+  assert.equal(r.handlers.length, 1);
+  assert.equal(r.handlers[0].source, managed);
+});
+
+test('plugin hooks.json is found through enabledPlugins and installed_plugins.json (and only for enabled plugins)', () => {
+  const w = world();
+  const root = join(w.home, '.claude', 'plugins', 'cache', 'mk', 'pl', '1.0.0');
+  const script = w.script('.claude/plugins/cache/mk/pl/1.0.0/hooks/ask.mjs');
+  w.json(join(root, 'hooks', 'hooks.json'), { hooks: { PreToolUse: [{ matcher: 'AskUserQuestion', hooks: [{ type: 'command', command: 'node ${CLAUDE_PLUGIN_ROOT}/hooks/ask.mjs' }] }] } });
+  w.json(join(w.home, '.claude', 'plugins', 'installed_plugins.json'), { version: 2, plugins: { 'pl@mk': [{ scope: 'user', installPath: root, version: '1.0.0' }] } });
+  assert.deepEqual(w.handlers().handlers, [], 'installed but not enabled');
+  w.settings({ enabledPlugins: { 'pl@mk': true, 'other@mk': false } });
+  const h = w.handlers().handlers;
+  assert.equal(h.length, 1);
+  assert.equal(h[0].scriptPath, script);
+  assert.equal(w.check().ok, false);
+  assert.equal(w.approve().ok, true);
+  assert.equal(w.check().ok, true);
+  w.json(join(w.home, '.claude', 'plugins', 'installed_plugins.json'), '{ broken');
+  const bad = w.check();
+  assert.equal(bad.ok, false);
+  assert.match(bad.reason, /installed_plugins\.json is not valid JSON/);
+  // an enabled plugin with no installed_plugins.json at all is fine (nothing is installed)
+  const w2 = world();
+  w2.settings({ enabledPlugins: { 'pl@mk': true } });
+  assert.equal(w2.check().ok, true);
+});
+
+test('hooks: in skill / agent frontmatter (user and project) is a handler we cannot resolve: not ok; other events only are no handler', () => {
+  const w = world();
+  w.json(join(w.home, '.claude', 'skills', 'plain', 'SKILL.md'), '---\nname: plain\ndescription: x\n---\nbody\n');
+  w.json(join(w.home, '.claude', 'skills', 'other-event', 'SKILL.md'), '---\nname: o\nhooks:\n  PostToolUse:\n    - matcher: "Bash"\n      hooks:\n        - type: command\n          command: "x"\n---\n');
+  assert.equal(w.check().ok, true);
+  w.json(join(w.home, '.claude', 'skills', 'sneaky', 'SKILL.md'), '---\nname: s\nhooks:\n  PreToolUse:\n    - matcher: "AskUserQuestion"\n      hooks:\n        - type: command\n          command: "node /x.mjs"\n---\n');
+  const r = w.check();
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /^unresolvable dialog hook \(frontmatter hooks\)/);
+  assert.equal(w.approve().ok, false, 'approve refuses it');
+  const w2 = world();
+  w2.json(join(w2.cwd, '.claude', 'agents', 'a.md'), '---\nname: a\nhooks: { PermissionRequest: [] }\n---\n');
+  assert.equal(w2.check().ok, false);
+  const w3 = world();
+  w3.json(join(w3.cwd, '.claude', 'skills', 'p', 'SKILL.md'), '---\nname: a\nhooks:\n  PermissionRequest:\n    - hooks: []\n---\n');
+  assert.equal(w3.check().ok, false);
+});
+
+test('a settings file that exists but cannot be parsed makes the check not ok (and approve refuses)', () => {
+  for (const [name, content] of [['not json', '{ nope'], ['a list', '[]'], ['bad hooks shape', '{"hooks":{"PreToolUse":{"x":1}}}'], ['empty', '']]) {
+    const w = world();
+    w.settings(content);
+    const r = w.check();
+    assert.equal(r.ok, false, name);
+    assert.match(r.reason, /dialog hook source ~\/\.claude\/settings\.json /, name);
+    assert.equal(w.approve().ok, false, name);
+  }
+  const w = world();
+  w.json(join(w.cwd, '.claude', 'settings.local.json'), '{ nope');
+  assert.equal(w.check().ok, false, 'a broken project file counts too');
+});
+
+test('a malformed approved list is not ok', () => {
+  const w = world();
+  const f = w.script('.claude/hooks/a.mjs');
+  w.settings(hookEntry(`node ${f}`));
+  assert.equal(w.approve().ok, true);
+  writeFileSync(dialogHooksFile(w.home), '{ nope');
+  const r = w.check();
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /^the approved dialog-hook list is unusable/);
+});
+
+test('the fingerprint changes when a handler is added, and not when nothing changed', () => {
+  const w = world();
+  const a = w.script('.claude/hooks/a.mjs');
+  const b = w.script('.claude/hooks/b.mjs');
+  const none = w.check().hookLayersSha256;
+  assert.equal(w.check().hookLayersSha256, none);
+  w.settings(hookEntry(`node ${a}`));
+  const one = w.check().hookLayersSha256;
+  assert.notEqual(one, none);
+  assert.equal(w.check().hookLayersSha256, one);
+  w.settings({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: `node ${a}` }, { type: 'command', command: `node ${b}` }] }] } });
+  assert.notEqual(w.check().hookLayersSha256, one);
+});
+
+test('hookCheck (the default for recordClick) reads the hook input cwd', () => {
+  const w = world();
+  const f = w.script('project/hooks/p.mjs');
+  w.settings(hookEntry(`node ${f}`), join(w.cwd, '.claude'));
+  const without = hookCheck({ home: w.home, input: {} });
+  assert.equal(without.ok, true);
+  const withCwd = hookCheck({ home: w.home, input: { cwd: w.cwd } });
+  assert.equal(withCwd.ok, false);
+  assert.match(withCwd.reason, /^unlisted dialog hook/);
+  assert.notEqual(withCwd.hookLayersSha256, without.hookLayersSha256);
+});
+
+// ---- the command ------------------------------------------------------------------------------------------------------------------
+
+const go = (argv, w, { env = {}, ancestor = false } = {}) =>
+  run(argv, { env, home: w.home, cwd: w.cwd, managedPaths: [], hasClaudeCodeAncestor: () => ancestor });
+
+test('owner-go dialog-hooks: read-only status, allowed anywhere', async () => {
+  const w = world();
+  const f = w.script('.claude/hooks/a.mjs');
+  w.settings(hookEntry(`node ${f}`));
+  const r = await go(['dialog-hooks'], w, { env: { CLAUDECODE: '1' }, ancestor: true });
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.ok, false);
+  assert.equal(r.output.handlers.length, 1);
+  assert.equal(r.output.offenders.length, 1);
+  assert.equal(r.output.approvedAt, null);
+  assert.throws(() => readFileSync(dialogHooksFile(w.home)), /ENOENT/, 'nothing written');
+  assert.equal((await go(['approve-dialog-hooks'], w, { env: ADMIN })).exitCode, 0);
+  const after = await go(['dialog-hooks'], w);
+  assert.equal(after.exitCode, 0);
+  assert.equal(after.output.ok, true);
+  assert.equal(typeof after.output.approvedAt, 'string');
+});
+
+test('owner-go approve-dialog-hooks: refused inside Claude Code without the admin bypass, writes with it or outside', async () => {
+  const w = world();
+  const f = w.script('.claude/hooks/a.mjs');
+  w.settings(hookEntry(`node ${f}`));
+  for (const [env, ancestor] of [[{ CLAUDECODE: '1' }, false], [{}, true]]) {
+    const r = await go(['approve-dialog-hooks'], w, { env, ancestor });
+    assert.equal(r.exitCode, 2);
+    assert.equal(r.output.error, 'refused');
+    assert.throws(() => readFileSync(dialogHooksFile(w.home)), /ENOENT/, 'nothing written');
+  }
+  const ok = await go(['approve-dialog-hooks'], w, { env: { CLAUDECODE: '1', ...ADMIN }, ancestor: true });
+  assert.equal(ok.exitCode, 0);
+  assert.equal(ok.output.hooks.length, 1);
+  assert.equal(ok.output.hooks[0].scriptPath, f);
+  assert.equal(JSON.parse(readFileSync(dialogHooksFile(w.home), 'utf8')).hooks[0].sha256, ok.output.hooks[0].sha256);
+  // an owner's own terminal (no Claude Code around) needs no switch
+  const again = await go(['approve-dialog-hooks'], w);
+  assert.equal(again.exitCode, 0);
+});
+
+test('owner-go approve-dialog-hooks: an unresolvable hook is refused with the offender named; no subcommand or an unknown one is a usage error', async () => {
+  const w = world();
+  w.settings(hookEntry(`sh -c 'true'`));
+  const r = await go(['approve-dialog-hooks'], w);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.error, 'not-approved');
+  assert.match(r.output.message, /sh -c 'true'/);
+  await assert.rejects(go([], w), /subcommand/);
+  await assert.rejects(go(['nope'], w), /subcommand/);
+  await assert.rejects(go(['dialog-hooks', 'extra'], w), /unexpected argument/);
+});
