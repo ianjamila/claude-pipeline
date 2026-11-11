@@ -388,6 +388,14 @@ test('defer-fixes: a finding raised again in a later granted round links the fol
   const body = w.fake.comments().map((c) => c.body).find((b) => b.includes('Raised again after a deferral'));
   assert.ok(body, 'the triage comment has the section');
   assert.match(body, /- R3-S1: the same finding as R2-S1, whose fix was deferred past the round limit; follow-up issue https:\/\/github\.com\/[^ ]+\/issues\/31 is already filed, no new issue/);
+  // R2-F3: raised again and accepted (its fix is in this PR now), the line must not say "no new issue" about a fix that merges: it says to close the issue
+  w.edit((st) => { st.rounds[2].items[0].final = { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'still true' }; });
+  const again2 = w.cli(['comment', '--pr', '7', '--kind', 'triage']);
+  assertExit(again2, 0, again2.stderr + again2.stdout);
+  const bodies = w.fake.comments().map((c) => c.body).filter((b) => b.includes('Raised again after a deferral'));
+  const latest = bodies.at(-1);
+  assert.match(latest, /- R3-S1: the same finding as R2-S1, whose fix was deferred past the round limit; it is accepted again and is being fixed in this PR: close follow-up issue https:\/\/github\.com\/[^ ]+\/issues\/31 when this PR merges/);
+  assert.doesNotMatch(latest, /R3-S1: .*no new issue/);
 });
 
 test('defer-fixes: an EARLIER round\'s accept ruled and fixed after the last reviewed head is refused too, and round-request recommends the round (R2-F1)', (t) => {

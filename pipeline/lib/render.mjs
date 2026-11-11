@@ -76,10 +76,13 @@ function claudeRulingLines(rounds) {
 }
 
 // A finding raised again after its fix was deferred past the round limit (codex-review linked it to the follow-up issue already filed): say so, no second issue.
+// When the judge accepted it again its fix is made in THIS PR, so the issue is not the place it is tracked any more: say the issue is to be closed when the PR merges.
 function reraisedLines(rounds) {
   return rounds.flatMap((r) => (r.items ?? []).filter((item) => isObject(item.reraisedDeferral)).map((item) => {
     const d = item.reraisedDeferral;
-    return `- ${line(item.id)}: the same finding as ${line(d.id)}, whose fix was deferred past the round limit; follow-up issue ${line(d.issue, 120)} is already filed, no new issue`;
+    const head = `- ${line(item.id)}: the same finding as ${line(d.id)}, whose fix was deferred past the round limit; `;
+    if (item.final?.decision === 'ACCEPT') return `${head}it is accepted again and is being fixed in this PR: close follow-up issue ${line(d.issue, 120)} when this PR merges`;
+    return `${head}follow-up issue ${line(d.issue, 120)} is already filed, no new issue`;
   }));
 }
 
