@@ -1629,11 +1629,14 @@ function isPipelineTool(arg, ctx) {
 }
 
 // A Windows `node C:\...\pipeline.mjs` loses its backslashes in argv, so look at the raw text too.
+// The regex only FINDS the path (case-folded where the platform is, no `..` handling); an ALLOW must not rest on that match, so the path it found goes
+// through isPipelineTool like an argv word does (disk identity, exact spelling when the disk cannot answer, `..` resolved).
 function pipelineToolInRaw(raw, ctx) {
   const t = expandRefs(raw, ctx);
   const root = escapeRe(`${ctx.homePosix}/.claude/pipeline`);
   if (/owner-go/i.test(t)) return false;
-  return new RegExp(`^\\s*(?:\\S*/)?node(?:\\.exe)?\\s+["']?${root}/(?:bin/pipeline\\.mjs|hooks/[^\\s'"]*)(?:["']?\\s|["']?$)`, ctx.ci ? 'i' : '').test(t);
+  const m = new RegExp(`^\\s*(?:\\S*/)?node(?:\\.exe)?\\s+["']?(${root}/(?:bin/pipeline\\.mjs|hooks/[^\\s'"]*))(?:["']?\\s|["']?$)`, ctx.ci ? 'i' : '').exec(t);
+  return m !== null && isPipelineTool(m[1], ctx);
 }
 
 function pwshReadOnly(argv) {

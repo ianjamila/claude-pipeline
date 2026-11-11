@@ -94,3 +94,44 @@ test('when neither spelling exists, only the exact spelling is trusted, never a 
     assert.equal(run(`node ${FAKE_HOOK}`), 'deny');
   });
 });
+
+// The raw-text route (a backslash anywhere on the line, for a Windows `node C:\...\pipeline.mjs`) must reach the same strict decision: the path it matches
+// goes through the same check, it never trusts the case-folded regex match.
+test('a backslash on the line does not turn a differently-cased look-alike into the trusted CLI or hooks folder', () => {
+  onFakeVolume(caseSensitive([...ALL, ...ALL_FAKE]), () => {
+    assert.equal(run(`node ${REAL_CLI} preflight a\\ b`), 'allow', 'the real CLI with a backslash stays trusted');
+    assert.equal(run(`node ${REAL_HOOK} a\\ b`), 'allow');
+    assert.equal(run(`node ${FAKE_CLI} preflight a\\ b`), 'deny');
+    assert.equal(run(`node "${FAKE_CLI}" preflight a\\ b`), 'deny');
+    assert.equal(run(`node ${FAKE_HOOK} a\\ b`), 'deny');
+  });
+});
+
+test('a backslash on the line, with a differently-cased look-alike whose stat throws EACCES or is absent, is not trusted', () => {
+  onFakeVolume(realButFakeUnreadable(), () => {
+    assert.equal(run(`node ${REAL_CLI} preflight a\\ b`), 'allow');
+    assert.equal(run(`node ${FAKE_CLI} preflight a\\ b`), 'deny');
+    assert.equal(run(`node ${FAKE_HOOK} a\\ b`), 'deny');
+  });
+  onFakeVolume(() => undefined, () => {
+    assert.equal(run(`node ${REAL_CLI} preflight a\\ b`), 'allow');
+    assert.equal(run(`node ${FAKE_CLI} preflight a\\ b`), 'deny');
+    assert.equal(run(`node ${FAKE_HOOK} a\\ b`), 'deny');
+  });
+});
+
+test('a backslash on the line, on a case-insensitive volume, keeps the other spelling trusted', () => {
+  onFakeVolume(caseInsensitive(ALL), () => {
+    assert.equal(run(`node ${FAKE_CLI} preflight a\\ b`), 'allow');
+    assert.equal(run(`node ${FAKE_HOOK} a\\ b`), 'allow');
+  });
+});
+
+test('a backslash on the line, with a hooks path that climbs out with .., is not trusted on any platform', () => {
+  for (const platform of ['darwin', 'linux', 'win32']) {
+    const o = { ...opts, platform };
+    const go = (command) => evaluateBashForFiles(command, o).decision;
+    assert.equal(go(`node ${CLAUDE}/pipeline/hooks/../../../../tmp/x.mjs a\\ b`), 'deny', `${platform}: climbs out of the hooks folder`);
+    assert.equal(go(`node "${CLAUDE}/pipeline/hooks/../../../../tmp/x.mjs" a\\ b`), 'deny', `${platform}: quoted`);
+  }
+});
