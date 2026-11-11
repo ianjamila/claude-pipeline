@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { ScanDeadline, scanLiveWork } from '../pipeline/lib/live-work-scan.mjs';
 import { release, tryAcquire } from '../pipeline/lib/locks.mjs';
 import { openRecord } from '../pipeline/lib/merge-queue.mjs';
-import { registerRepo } from '../pipeline/lib/queue-sweep.mjs';
+import { knownRepos, registerRepo } from '../pipeline/lib/queue-sweep.mjs';
 import { openOrRenewLease } from '../pipeline/lib/review-lease.mjs';
 
 const MACHINE = 'test-machine-id';
@@ -174,8 +174,10 @@ test('a root that is not a git repository still has its own jobs scanned, and it
   mkdirSync(plain, { recursive: true });
   jobIn(plain, 'j', { runnerPid: sleeper(t).pid });
   const live = w.scan({ repos: [plain] });
-  assert.deepEqual(kinds(live), ['job', 'scan-error']);
-  assert.match(live[1].detail, /cannot read the merge-queue records/);
+  // (R1-F4: git cannot list the worktrees of a non-repository either, which is now said instead of silently falling back to the root)
+  assert.deepEqual(kinds(live), ['scan-error', 'job', 'scan-error']);
+  assert.match(live[0].detail, /git worktree list/);
+  assert.match(live[2].detail, /cannot read the merge-queue records/);
 });
 
 // ---- held locks ----------------------------------------------------------------------------------------------------------------------------
@@ -301,4 +303,50 @@ test('a deadline already in the past throws ScanDeadline before anything is read
 
 test('a deadline that is still ahead lets the scan finish', () => {
   assert.deepEqual(world().scan({ deadlineAt: Date.now() + 60_000 }), []);
+});
+
+// ---- R1-F4: "could not look" is never "nothing live" ----------------------------------------------------------------------------------------
+test('a repository whose `git worktree list` fails is a scan-error entry, not just the root alone', () => {
+  const w = world();
+  const notGit = join(w.root, 'not-a-repo');
+  mkdirSync(notGit, { recursive: true });
+  const live = w.scan({ repos: [notGit] });
+  const e = live.find((x) => x.kind === 'scan-error' && x.repo === notGit);
+  assert.ok(e, JSON.stringify(live));
+  assert.match(e.detail, /git worktree list/);
+});
+
+test('a jobs folder that cannot be listed (not ENOENT) is a scan-error; a missing one is simply no jobs', () => {
+  const w = world();
+  const a = repoIn(w, 'a');
+  const b = repoIn(w, 'b');
+  mkdirSync(join(a, '.review'), { recursive: true });
+  writeFileSync(join(a, '.review', 'jobs'), 'a file where the jobs folder should be');
+  const live = w.scan({ repos: [a, b] });
+  assert.equal(live.filter((x) => x.kind === 'scan-error' && x.worktree === a).length, 1, JSON.stringify(live));
+  assert.equal(live.some((x) => x.worktree === b), false, 'no jobs folder at all is not an error');
+});
+
+test('a job folder whose record cannot be read counts as live; a stray file in the jobs folder does not', () => {
+  const w = world();
+  const r = repoIn(w);
+  mkdirSync(join(r, '.review', 'jobs', 'bad name!'), { recursive: true });
+  writeFileSync(join(r, '.review', 'jobs', 'notes.txt'), 'x');
+  const live = w.scan({ repos: [r] });
+  const jobs = live.filter((x) => x.kind === 'job');
+  assert.equal(jobs.length, 1, JSON.stringify(live));
+  assert.match(jobs[0].detail, /bad name!.*cannot be read/);
+});
+
+test('a registry or stacks config that exists but cannot be parsed is a scan-error; absent ones are not; knownRepos itself still returns what it can', () => {
+  const w = world();
+  const env = { ...w.env };
+  writeFileSync(join(w.locks, 'queue-sweep-repos.json'), '{ not json');
+  const live = scanLiveWork({ env, home: w.home, leaseOpts: w.leaseOpts });
+  const e = live.find((x) => x.kind === 'scan-error' && /registry/.test(x.detail));
+  assert.ok(e, JSON.stringify(live));
+  assert.deepEqual(knownRepos({ home: w.home, env }), [], 'other callers keep the old behaviour');
+  // an absent registry is fine
+  rmSync(join(w.locks, 'queue-sweep-repos.json'));
+  assert.deepEqual(scanLiveWork({ env, home: w.home, leaseOpts: w.leaseOpts }).filter((x) => x.kind === 'scan-error'), []);
 });

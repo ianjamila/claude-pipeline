@@ -9,7 +9,7 @@
 //   queue-record   a merge-queue record whose work is not over                           (lib/merge-queue.mjs liveRecords)
 //   scan-error     something could not be read: counts as live (fail closed), the detail says what
 // The repos are the ones the machine knows (queue-sweep.mjs knownRepos: the stacks config plus every repo a merge told the registry about);
-// their worktrees come from `git worktree list`, plus the root. This is a read-only look: it takes no lock and changes nothing.
+// their worktrees come from `git worktree list`, plus the root. Anything it cannot look at (git failing, a jobs folder or the registry unreadable) is a scan-error. This is a read-only look: it takes no lock and changes nothing.
 // The caller passes `deadlineAt` (epoch ms): a scan that runs past it throws ScanDeadline so the installer can stop before swapping anything.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -32,28 +32,39 @@ const STARTING_FRESH_MS = 60_000; // jobs.mjs LOCK_STALE_MS: a `<name>.starting`
 const LOCK_PREFIXES = [['review-', 'state-lock'], ['merge-', 'merge-lock'], ['queue-', 'queue-lock']];
 const msg = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 200);
 
-// `git worktree list --porcelain` -> the worktree paths (the root is among them); the root alone when git cannot say.
-function worktreesOf(root) {
+const GIT_TIMEOUT_MS = 20_000;
+
+// `git worktree list --porcelain` -> the worktree paths (the root is among them). When git cannot say (a failure or the timeout) the root alone is
+// scanned AND a scan-error entry says the other worktrees were not looked at: jobs there would otherwise read as "none".
+function worktreesOf(root, live) {
   try {
-    const out = git(['worktree', 'list', '--porcelain'], { cwd: root });
+    const out = git(['worktree', 'list', '--porcelain'], { cwd: root, timeoutMs: GIT_TIMEOUT_MS });
     const found = out.split('\n').filter((l) => l.startsWith('worktree ')).map((l) => path.resolve(l.slice('worktree '.length).trim()));
     return found.length > 0 ? found : [root];
-  } catch {
+  } catch (err) {
+    live.push({ kind: 'scan-error', repo: root, detail: `cannot list the worktrees of ${root} (git worktree list): ${msg(err)}` });
     return [root];
   }
 }
 
-function jobsIn(worktree) {
+// -> [text] for what is running; scan-error entries for a jobs folder that cannot be listed (not just absent) go to `live`.
+function jobsIn(worktree, live) {
   const dir = path.join(worktree, '.review', 'jobs');
   let names;
-  try { names = fs.readdirSync(dir); } catch { return []; }
+  try { names = fs.readdirSync(dir); } catch (err) {
+    if (err?.code !== 'ENOENT') live.push({ kind: 'scan-error', worktree, detail: `cannot list the jobs folder ${dir}: ${msg(err)}` });
+    return [];
+  }
   const out = [];
   for (const name of names) {
     if (name.endsWith('.starting')) {
       try { if (Date.now() - fs.statSync(path.join(dir, name)).mtimeMs <= STARTING_FRESH_MS) out.push(`job ${name.slice(0, -'.starting'.length)} is being started`); } catch { /* gone */ }
       continue;
     }
-    try { if (readJob(name, { cwd: worktree }).state === 'running') out.push(`job ${name} is running`); } catch { /* not a job folder */ }
+    let isDir = false;
+    try { isDir = fs.statSync(path.join(dir, name)).isDirectory(); } catch { continue; /* gone */ }
+    if (!isDir) continue; // a stray file is not a job
+    try { if (readJob(name, { cwd: worktree }).state === 'running') out.push(`job ${name} is running`); } catch (err) { out.push(`job ${name} cannot be read (${msg(err)}), treated as running`); }
   }
   return out;
 }
@@ -104,17 +115,19 @@ export function scanLiveWork({ env: baseEnv = process.env, home, lockDir, deadli
   locksIn(env.PIPELINE_LOCK_DIR || defaultLockDir(), live);
 
   let roots;
-  try { roots = repos ?? knownRepos({ ...(home ? { home } : {}), env }); } catch (err) {
+  try {
+    roots = repos ?? knownRepos({ ...(home ? { home } : {}), env, onError: (why) => live.push({ kind: 'scan-error', detail: why }) });
+  } catch (err) {
     roots = [];
     live.push({ kind: 'scan-error', detail: `cannot list the known repositories: ${msg(err)}` });
   }
   for (const root of roots) {
     tick();
     const seen = new Set();
-    for (const wt of [root, ...worktreesOf(root)]) {
+    for (const wt of [root, ...worktreesOf(root, live)]) {
       if (seen.has(wt)) continue;
       seen.add(wt);
-      for (const detail of jobsIn(wt)) live.push({ kind: 'job', repo: root, worktree: wt, detail });
+      for (const detail of jobsIn(wt, live)) live.push({ kind: 'job', repo: root, worktree: wt, detail });
     }
     tick();
     try {

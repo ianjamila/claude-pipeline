@@ -52,11 +52,13 @@ export function defaultNotify({ env = process.env, platform = process.platform, 
 const registryFile = (env) => path.join(env?.PIPELINE_LOCK_DIR || defaultLockDir(), 'queue-sweep-repos.json');
 const REGISTRY_MAX = 100;
 
-function readRegistry(env) {
+// `onError(text)` (optional) hears about a registry that EXISTS but cannot be read or parsed; an absent one is normal. The result is [] either way.
+function readRegistry(env, onError) {
   try {
     const j = JSON.parse(readFileSync(registryFile(env), 'utf8'));
     return Array.isArray(j?.repos) ? j.repos.filter((r) => typeof r === 'string' && r !== '') : [];
-  } catch {
+  } catch (err) {
+    if (err?.code !== 'ENOENT') onError?.(`the repository registry ${registryFile(env)} cannot be read: ${String(err?.message ?? err).split('\n')[0].slice(0, 160)}`);
     return [];
   }
 }
@@ -84,13 +86,16 @@ export function registerRepo({ root, env = process.env }) {
   }
 }
 
-export function knownRepos({ home = os.homedir(), env = process.env } = {}) {
+// `onError(text)` (optional, for the live-work scan, which must not read "could not look" as "nothing there"): called for a stacks config or a registry
+// that exists but cannot be parsed. The returned list is the same with or without it.
+export function knownRepos({ home = os.homedir(), env = process.env, onError } = {}) {
   const found = [];
   try {
     const cfg = loadMachineConfig(stackFiles(stacksRoot(env, home)).config, { home });
     if (cfg.status === 'ok') found.push(...cfg.repos);
+    else if (cfg.status === 'invalid') onError?.(`the stacks config cannot be read: ${cfg.error}`);
   } catch { /* no stacks config: only the registry */ }
-  found.push(...readRegistry(env));
+  found.push(...readRegistry(env, onError));
   const seen = new Set();
   const out = [];
   for (const dir of found) {
