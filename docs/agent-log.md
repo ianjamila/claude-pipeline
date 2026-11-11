@@ -128,3 +128,4 @@ full record.
 - 2026-11-10 · #236 · Queue: P merge from a worktree at another head keeps the queued head's live record (#232) · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
 - 2026-11-10 · #233 · Fable floor: reviews must use the newest Fable; per-version prices · risk high · rounds 14 · arbiter 11 · awaiting-owner-merge
 - 2026-11-11 · #248 · ci-wait dates review failures by the marker; merge dry run closing block; workflow-context check for every project · risk high · rounds 4 · arbiter 2 · awaiting-owner-merge
+- 2026-11-11 · #247 · Automatic pipeline update: review leases, installer gates, scheduled update, SessionStart notice · risk high · rounds 4 · arbiter 4 · awaiting-review
