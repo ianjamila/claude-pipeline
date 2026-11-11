@@ -71,7 +71,7 @@ function summaryKind(gh, pr, sections, outcome) {
     repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
     outcome, host: hostname(), now: Date.now(),
   });
-  const r = writeSummaryComment(gh, pr, { record, sections, existing });
+  const r = writeSummaryComment(gh, pr, { record, sections, existing, retry: true });
   return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: record.step, warnings } };
 }
 
@@ -137,7 +137,7 @@ export const run = guarded(async (argv, ctx) => {
   }
   return guardGh(() => {
     if (kind === 'summary') return summaryKind(gh, pr, body, values.outcome);
-    const r = gh.upsertComment(pr, MARKER_OF[kind], body);
+    const r = gh.upsertComment(pr, MARKER_OF[kind], body, { retry: true });
     return { exitCode: EXIT.OK, output: { ok: true, kind, pr, action: r.action, url: r.url, id: r.id } };
   });
 });

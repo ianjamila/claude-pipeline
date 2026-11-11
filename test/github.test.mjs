@@ -329,7 +329,7 @@ test('upsertComment: a POST that failed with a rate limit but was stored is PATC
     if (line.startsWith('api -X PATCH')) return okJson({ id: 10, html_url: 'u' });
     throw new Error(`unexpected ${line}`);
   });
-  const r = gh.upsertComment(4, MARKER, `${MARKER}\nbody`);
+  const r = gh.upsertComment(4, MARKER, `${MARKER}\nbody`, { retry: true });
   assert.equal(r.action, 'updated');
   assert.equal(posts, 1);
   assert.equal(stored.length, 1);
@@ -344,7 +344,7 @@ test('upsertComment: secondary limit twice, then success: waits recorded (60 s, 
     n += 1;
     return n <= 2 ? limitedReply : okJson({ id: 1, html_url: 'u' });
   });
-  assert.equal(gh.upsertComment(4, MARKER, `${MARKER}\nx`).action, 'created');
+  assert.equal(gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }).action, 'created');
   assert.deepEqual(waits, [60_000, 40_000]);
   assert.equal(logs.length, 2);
   assert.match(logs[0], /100 s retry cap/);
@@ -364,7 +364,7 @@ test('retry: a rate limit on a later page restarts the whole paged list; a half 
     if (line.startsWith('api -X PATCH repos/acme/widgets/issues/comments/2 ')) return okJson({ id: 2, html_url: 'u' });
     throw new Error(`unexpected ${line}`);
   });
-  assert.equal(gh.upsertComment(4, MARKER, `${MARKER}\nnew`).action, 'updated');
+  assert.equal(gh.upsertComment(4, MARKER, `${MARKER}\nnew`, { retry: true }).action, 'updated');
   assert.equal(listCalls, 2);
   assert.ok(!calls.some((c) => c.line.startsWith('api -X POST')), 'the half list (page 1 only) did not make it create a duplicate');
   // and listComments itself, opted in, returns the full list
@@ -380,31 +380,31 @@ test('retry: Retry-After is honoured and a permission 403 / timeout is one call 
   assert.deepEqual(b.waits, [7000]);
   void a;
   const perm = mkRetry(() => ({ code: 1, stdout: '', stderr: 'gh: Resource not accessible by integration (HTTP 403)' }));
-  assert.throws(() => perm.gh.upsertComment(4, MARKER, `${MARKER}\nx`), GhError);
+  assert.throws(() => perm.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), GhError);
   assert.equal(perm.calls.filter((c) => c.line.includes('comments --paginate')).length, 1);
   assert.deepEqual(perm.waits, []);
   const slow = mkRetry(() => ({ code: 1, stdout: '', stderr: SECONDARY_LIMIT, timedOut: true }));
-  assert.throws(() => slow.gh.upsertComment(4, MARKER, `${MARKER}\nx`), GhError);
+  assert.throws(() => slow.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), GhError);
   assert.equal(slow.calls.filter((c) => c.line.includes('comments --paginate')).length, 1);
   assert.deepEqual(slow.waits, []);
 });
 
 test('retry: PIPELINE_GH_RETRY_MS=0 is off; a larger value cannot exceed the default; a smaller one shortens', () => {
   const off = mkRetry(() => limitedReply, { env: { PIPELINE_GH_RETRY_MS: '0' } });
-  assert.throws(() => off.gh.upsertComment(4, MARKER, `${MARKER}\nx`), GhError);
+  assert.throws(() => off.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), GhError);
   assert.deepEqual(off.waits, []);
   assert.equal(off.calls.filter((c) => c.line.includes('comments --paginate')).length, 1);
   const big = mkRetry(() => limitedReply, { env: { PIPELINE_GH_RETRY_MS: '9999999' } });
-  assert.throws(() => big.gh.upsertComment(4, MARKER, `${MARKER}\nx`), GhError);
+  assert.throws(() => big.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), GhError);
   assert.equal(big.waits.reduce((a, b) => a + b, 0), 100_000);
   const short = mkRetry(() => limitedReply, { env: { PIPELINE_GH_RETRY_MS: '5000' } });
-  assert.throws(() => short.gh.upsertComment(4, MARKER, `${MARKER}\nx`), GhError);
+  assert.throws(() => short.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), GhError);
   assert.deepEqual(short.waits, [5000]);
 });
 
 test('retry: cap exceeded surfaces the last stderr', () => {
   const { gh, waits } = mkRetry(() => limitedReply);
-  assert.throws(() => gh.upsertComment(4, MARKER, `${MARKER}\nx`), (e) => e instanceof GhError && /secondary rate limit/.test(e.stderr));
+  assert.throws(() => gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), (e) => e instanceof GhError && /secondary rate limit/.test(e.stderr));
   assert.deepEqual(waits, [60_000, 40_000]);
 });
 
@@ -412,7 +412,7 @@ test('retry: primary limit reads gh api rate_limit; a reset beyond the cap throw
   const primary = { code: 1, stdout: '', stderr: 'gh: API rate limit exceeded for user ID 1. (HTTP 403)' };
   const limits = (core, graphql) => okJson({ resources: { core: { remaining: 0, reset: core }, graphql: { remaining: 0, reset: graphql } } });
   const far = mkRetry((args) => (args[1] === 'rate_limit' ? limits(3600, 7200) : primary));
-  assert.throws(() => far.gh.upsertComment(4, MARKER, `${MARKER}\nx`), (e) => /resets at 1970-01-01T01:00:00\.000Z/.test(e.message));
+  assert.throws(() => far.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), (e) => /resets at 1970-01-01T01:00:00\.000Z/.test(e.message));
   assert.deepEqual(far.waits, []);
   // core resets in 3600 s, graphql in 30 s: the 30 s one is the earliest, it fits the cap, and the retry goes through
   let first = true;
@@ -424,7 +424,7 @@ test('retry: primary limit reads gh api rate_limit; a reset beyond the cap throw
     }
     return okJson({ id: 1, html_url: 'u' });
   });
-  assert.equal(near.gh.upsertComment(4, MARKER, `${MARKER}\nx`).action, 'created');
+  assert.equal(near.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }).action, 'created');
   assert.deepEqual(near.waits, [31_000]);
 });
 

@@ -290,10 +290,11 @@ export function createGitHub({ cwd, env, ghFn = gh, retry } = {}) {
 
     // Only our own (viewer's) newest comment that STARTS with the marker is edited: a quoted or forged
     // marker, or someone else's comment, must never be rewritten, and the next run must find it again.
-    // A rate limit re-runs the whole operation, re-listing first: a POST that landed before the limit answer is then PATCHed, not repeated.
-    upsertComment(n, marker, body) {
+    // `{ retry: true }` waits out a rate limit and re-runs the whole operation, re-listing first: a POST that landed before the limit answer is then PATCHed, not repeated.
+    // Off by default: the run recorder (merge, update-branch, cost) must never sleep on it.
+    upsertComment(n, marker, body, { retry = false } = {}) {
       if (!String(body).startsWith(marker)) throw new Error('comment body must start with its marker, or the next run could not find it');
-      return retrying(() => {
+      const run = () => {
         const me = self.viewer();
         const mine = self.listComments(n)
           .filter((c) => typeof c.body === 'string' && c.body.startsWith(marker) && c.user?.login === me)
@@ -304,7 +305,8 @@ export function createGitHub({ cwd, env, ghFn = gh, retry } = {}) {
           ? api('PATCH', `repos/${slug}/issues/comments/${existing.id}`, { body })
           : api('POST', `repos/${slug}/issues/${prNumber(n)}/comments`, { body });
         return { id: r.id, url: r.html_url, action: existing ? 'updated' : 'created' };
-      });
+      };
+      return retry ? retrying(run) : run();
     },
 
     // Always a NEW comment, never an edit: for append-only evidence (run events) that no later writer may overwrite.

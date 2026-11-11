@@ -115,7 +115,7 @@ export function publishTriage({ gh, root, pr, state }) {
   if (published.state !== null && published.hash === mine) {
     result = { action: 'unchanged' };
   } else {
-    const r = gh.upsertComment(pr, MARKERS.triage, triageComment(state));
+    const r = gh.upsertComment(pr, MARKERS.triage, triageComment(state), { retry: true });
     result = { action: r.action, url: r.url, id: r.id };
   }
   writeBaseline(root, pr, mine);

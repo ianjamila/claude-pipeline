@@ -141,7 +141,7 @@ export const run = guarded(async (argv, ctx) => {
     } catch (err) {
       throw new UsageError(err.message);
     }
-    const posted = writeSummaryComment(gh, pr, { record, existing });
+    const posted = writeSummaryComment(gh, pr, { record, existing, retry: true });
     return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, record, warnings } };
   });
 });

@@ -68,14 +68,14 @@ const seconds = (ms) => Math.ceil(ms / 1000);
 
 // Runs fn(attempt) (attempt counts from 1). On a rate-limit GhError waits and runs it again, spending at most `maxMs` of
 // waiting in total; then the last error is thrown. `probe()` returns the earliest reset (epoch ms) of an exhausted resource.
-export function retrying(fn, { sleep = sleepSync, now = Date.now, maxMs = DEFAULT_CAP_MS, log = (line) => process.stderr.write(`${line}\n`), probe = () => null } = {}) {
-  let waited = 0;
+// `budget` ({ waited }) is the waiting already spent: a caller that shares one object across calls (makeRetrier) makes the cap cumulative.
+export function retrying(fn, { sleep = sleepSync, now = Date.now, maxMs = DEFAULT_CAP_MS, log = (line) => process.stderr.write(`${line}\n`), probe = () => null, budget = { waited: 0 } } = {}) {
   for (let attempt = 1; ; attempt += 1) {
     try {
       return fn(attempt);
     } catch (err) {
       if (maxMs <= 0 || attempt >= MAX_ATTEMPTS || !isRateLimited(err)) throw err;
-      const left = maxMs - waited;
+      const left = maxMs - budget.waited;
       let wait;
       let why;
       const hinted = retryAfterMs(err);
@@ -96,25 +96,27 @@ export function retrying(fn, { sleep = sleepSync, now = Date.now, maxMs = DEFAUL
         }
       }
       if (wait > left || left <= 0) {
-        err.message = `${err.message}\n(${why}: a ${seconds(wait)} s wait does not fit the ${seconds(maxMs)} s retry cap, so it is not retried; ${seconds(waited)} s already waited)`;
+        err.message = `${err.message}\n(${why}: a ${seconds(wait)} s wait does not fit the ${seconds(maxMs)} s retry cap, so it is not retried; ${seconds(budget.waited)} s already waited)`;
         throw err;
       }
-      log(`gh: ${why}; retrying in ${seconds(wait)} s (${seconds(waited + wait)} of ${seconds(maxMs)} s retry cap)`);
+      log(`gh: ${why}; retrying in ${seconds(wait)} s (${seconds(budget.waited + wait)} of ${seconds(maxMs)} s retry cap)`);
       sleep(wait);
-      waited += wait;
+      budget.waited += wait;
     }
   }
 }
 
 // What createGitHub wires in: a retrying() bound to this gh runner. `exec` runs gh without retrying (for the rate_limit probe).
+// The cap is ONE budget per retrier (per createGitHub instance): two rate-limited operations of one command together wait at most the cap (#266 R1-F2).
 export function makeRetrier({ exec, env, retry = {} }) {
   const maxMs = retryCapMs(env, retry.maxMs);
+  const budget = { waited: 0 };
   let active = false; // a nested retrying() just runs: the outermost one owns the cap
   return (fn) => {
     if (active || maxMs <= 0) return fn(1);
     active = true;
     try {
-      return retrying(fn, { sleep: retry.sleep, now: retry.now, log: retry.log, maxMs, probe: () => earliestExhaustedReset(exec) });
+      return retrying(fn, { sleep: retry.sleep, now: retry.now, log: retry.log, maxMs, budget, probe: () => earliestExhaustedReset(exec) });
     } finally {
       active = false;
     }
