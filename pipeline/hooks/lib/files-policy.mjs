@@ -1754,18 +1754,41 @@ function judgedWords(name, args, ctx) {
   });
   return { args: out, unknown };
 }
-// R1-B2 (#266): `test` / `[` with -v, or a numeric comparison (-eq -ne -lt -le -gt -ge), and `printf -v` read an operand as a variable NAME or an arithmetic expression, and bash / zsh evaluate an
-// array subscript in it (`test -v 'a[$(rm "$T")]'` runs the substitution). So such a call with an operand holding `[`, `$(` or a backtick is no read-only call. Both the words as written and
-// as expanded are judged (a same-line name may carry the subscript).
+// R1-B2 / R2-B1 / R2-F1 (#266): bash and zsh read some operands as a variable NAME or an arithmetic expression, and evaluate an array subscript in it (`test -v 'a[$(rm "$T")]'` runs the
+// substitution). Such a call with an operand holding `[`, `$(` or a backtick is no read-only call. The forms: `test` / `[` with -v, -R, -t (zsh reads its operand as arithmetic) or a numeric
+// comparison (-eq -ne -lt -le -gt -ge); `printf -v`; and zsh's printf, which reads the argument of a numeric conversion (%d %i %u %o %x %X %e %E %f %g %G) and of a `*` width / precision as
+// arithmetic with no -v at all. Both the words as written and as expanded are judged (a same-line name may carry the subscript or the option); a printf option word that is still only known
+// at run time can be -v, and a format still only known at run time can hold a numeric conversion.
 const SUBSCRIPT_EVAL = /[\[`]|\$[({]/;
+const PRINTF_PLAIN_SPEC = /^%[-+ #0-9.]*[sbcq]/; // (a conversion whose argument is never read as arithmetic)
+function printfFormatEvaluates(fmt) {
+  if (/[$`]/.test(fmt)) return true; // (not known)
+  let rest = fmt.replace(/%%/g, '');
+  while (rest.includes('%')) {
+    rest = rest.slice(rest.indexOf('%'));
+    const m = PRINTF_PLAIN_SPEC.exec(rest);
+    if (!m) return true; // (a numeric conversion, a `*`, or a form this check does not know)
+    rest = rest.slice(m[0].length);
+  }
+  return false;
+}
 function evaluatesSubscript(name, args, ctx) {
   const test = name === 'test' || name === '[' || name === '[[';
   if (!test && name !== 'printf') return false;
-  const words = [...args, ...args.map((a) => (/[$`]/.test(a) ? expandRefs(a, ctx) : a))];
+  const expand = (a) => (/[$`]/.test(a) ? expandRefs(a, ctx) : a);
+  const words = [...args, ...args.map(expand)];
   if (test) {
-    if (!words.some((a) => a === '-v' || a === '-R' || /^-(?:eq|ne|lt|le|gt|ge)$/.test(a))) return false;
-  } else if (!args.some((a) => /^-v/.test(a))) return false;
-  return words.some((a) => SUBSCRIPT_EVAL.test(a));
+    if (!words.some((a) => a === '-v' || a === '-R' || a === '-t' || /^-(?:eq|ne|lt|le|gt|ge)$/.test(a))) return false;
+    return words.some((a) => SUBSCRIPT_EVAL.test(a));
+  }
+  if (!words.some((a) => SUBSCRIPT_EVAL.test(a))) return false;
+  if (words.some((a) => /^-v/.test(a))) return true;
+  if (args.length && RUNTIME_PART.test(expand(args[0]))) return true; // (a leading word that can still be -v)
+  const fmt = args.findIndex((a) => !/^-/.test(expand(a))); // (the format: the first word after the options)
+  if (fmt < 0) return false;
+  const operands = args.slice(fmt + 1);
+  if (!operands.some((a) => SUBSCRIPT_EVAL.test(a) || SUBSCRIPT_EVAL.test(expand(a)))) return false;
+  return printfFormatEvaluates(expand(args[fmt]));
 }
 function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
