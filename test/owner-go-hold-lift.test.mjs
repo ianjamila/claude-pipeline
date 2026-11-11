@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { bump, cli, scenario, ymlFor, LOCK_DIR, MERGE_SHA, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { holdBlock, presentedRequests, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
+import { areasDigest, holdBlock, holdDigest, presentedRequests, readyLine, rulingsBlockDigest } from '../pipeline/hooks/lib/owner-go.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { claudeItem, comment as prComment, publishedComments, rulingState } from './helpers/rulings-world.mjs';
 import { saveState } from '../pipeline/lib/state.mjs';
@@ -134,8 +134,10 @@ test('dry run, hold + protected areas + a dismissed item: ownerStep.closing is t
   // the consumer: pasted as the reply's last lines it binds exactly what the separately printed lines bind
   const closing = presentedRequests(`Here is the request.\n${step.closing}`);
   assert.equal(closing.requests.length, 1);
-  assert.equal(closing.requests[0].hold?.id, HOLD.id);
-  assert.ok(closing.requests[0].areas && closing.requests[0].rulings, 'areas and rulings are bound');
+  assert.equal(closing.requests[0].hold, HOLD.id);
+  assert.equal(closing.requests[0].holdBlock, holdDigest(HOLD), 'the hold block is bound');
+  assert.equal(closing.requests[0].rulings, rulingsBlockDigest(step.rulings), 'the Rulings block is bound');
+  assert.equal(closing.requests[0].areas, areasDigest(step.areaIds), 'the Areas line is bound');
   assert.equal(closing.requests[0].pr, PR);
   assert.equal(closing.requests[0].head, s.head.slice(0, 12));
   assert.deepEqual(closing.requests, presentedRequests(`Here is the request.\n${[step.rulings, step.areas, step.hold, step.line, step.ready].join('\n')}`).requests, 'the same binding as the lines printed one by one');

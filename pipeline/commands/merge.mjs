@@ -427,6 +427,10 @@ const requestParts = ({ head, items, repo, areas, hold, rulings = '' }) => ({
 });
 const requestLines = (q) => Object.values(requestParts(q)).filter(Boolean);
 
+// The reply's closing lines for a say-merge step, ready to paste as the LAST lines: Rulings block, Areas line, Hold line, Head line, then the 🔀 line (the lift form when a hold is lifted).
+// Exactly the parts ownerStep prints, joined by a newline; the notes (behindNote, queueNote, parkNote) are prose above the block and never part of it.
+export const closingBlock = (step, pr) => [step.rulings, step.areas, step.hold, step.line, step.ready ?? readyLine([pr])].filter(Boolean).join('\n');
+
 // E2 (plan 2026-11-05-claude-rulings): the review lock is held for the WHOLE merge, inside the merge lock (always merge -> review): from before the live read until MERGED, or until nothing merged and
 // auto-merge is confirmed disarmed (the hold put back included). Decisions are frozen while a merge is armed: a review writer waits LOCK_WAIT_MS, then fails lock-timeout. Live holders are never reclaimed.
 // Taken before the hold is read or lifted, so a lock this merge cannot get is a clean refusal that changed nothing. Locks are not re-entrant: nothing under here may take the review lock again.
@@ -760,6 +764,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
       // Behind its base but accepted (merge.behind_base: disjoint): the owner is told so in the request, above the Areas / Head lines.
       if (queue.on) ownerStep = { ...ownerStep, queueNote: 'GitHub\'s merge queue tests it on top of main and everything ahead of it, then merges it — one "merge" is enough.' };
       if (behind !== null) ownerStep = { ...ownerStep, behindNote: `behind ${config.default_branch} by ${behind.behindBy} commit(s); ${config.default_branch}'s ${behind.mainFiles} new file(s) touch none of this PR's files` };
+      ownerStep = { ...ownerStep, closing: closingBlock(ownerStep, pr) };
     }
   }
 
