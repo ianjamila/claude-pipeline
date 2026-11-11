@@ -502,14 +502,6 @@ const HOOK_SURFACE = {
 };
 // the same names inside command text (a word that is, or ends in, such a path)
 const HOOK_SURFACE_TEXT = /(?:\.claude[^/\s'"`]*\/(?:settings(?:\.local)?\.json|skills\/[^/\s'"`]+\/SKILL\.md|(?:agents|commands)\/[^\s'"`]*\.md|plugins\/[^\s'"`]*(?:\.md|hooks\/hooks\.json))|\.claude-plugin\/plugin\.json)(?![\w.\-])/i;
-// (R3-B1) the text of an inline program without its plain reads of a file named by a literal (`open('f')`, `open('f','r')`, `Path('f').read_text()`, `readFileSync('f'[, enc])`): those are no write
-const SURF_LIT = '[^\'"\\s]+';
-const PLAIN_READS = [
-  new RegExp(`(?<![\\w.])open\\(\\s*(['"])${SURF_LIT}\\1\\s*(?:,\\s*(['"])r[bt]?\\2\\s*)?\\)`, 'g'),
-  new RegExp(`Path\\(\\s*(['"])${SURF_LIT}\\1\\s*\\)\\.read_text\\(\\s*\\)`, 'g'),
-  new RegExp(`readFileSync\\(\\s*(['"])${SURF_LIT}\\1\\s*(?:,\\s*(?:(['"])[\\w-]+\\2|\\{[^{}]*\\}))?\\s*\\)`, 'g'),
-];
-const stripPlainReads = (t) => PLAIN_READS.reduce((x, re) => x.replace(re, ' '), t);
 // The shapes of a surface path, from the folder that holds it to the file (a slot: a literal name, 'D' = a `.claude*` folder, 'ANY' = any name, 'MD' = a name ending .md, '*' = any number of folders);
 // the same set as HOOK_SURFACE, for a word that holds a glob or a substitution (maybeSurface).
 const SURFACE_SHAPES = [
@@ -1713,6 +1705,26 @@ function countCdRun(budget) {
 // Does the command run interpreter code that is not a file (`node -e`, `python3 -c`, `perl -e`, a program on stdin, an awk program that is not read-only; every interpreter run that is not `interp FILE`)? It can build any file name at run time.
 const INLINE_RUNNERS = /^(?:node|nodejs|deno|bun|tsx|ts-node|python\d*(?:\.\d+)*|ruby|perl|php|lua|Rscript|awk|gawk|mawk|nawk)$/;
 const BENIGN_INTERP_OPTS = /^(?:--no-warnings|--trace-warnings|--enable-source-maps|--harmony|-B|-u|-O|-OO|-v|-w|-T|-t|-s)$/;
+// (R4-F1) Is the program of this interpreter given in its arguments? Only when a real code option carries a program word (python `-c X`; node / bun / tsx / ts-node `-e -p --eval --print X`; ruby / perl / lua / Rscript `-e X`
+// (perl `-E`); php `-r X`; `deno eval X`; an awk program). Any other option (`-E`, `-R`, `-rjson`, `-r fs`, `-Mstrict`) leaves the program on stdin. (runsInlineCode's pattern is a fail-closed guess; it is no proof of this.)
+const CODE_OPTS = [
+  [/^(?:python\d*(?:\.\d+)*)$/, /^-[bBdEiIOPqRsSuvx]*c(.*)$/s],
+  [/^(?:node|nodejs|bun|tsx|ts-node)$/, /^(?:-e|-p|-pe|-ep|--eval|--print)(?:=(.*))?$/s],
+  [/^ruby$/, /^-[nplaSsdwvy]*e(.*)$/s],
+  [/^perl$/, /^-[nplawsSCtTuUWXc0-9]*[eE](.*)$/s],
+  [/^(?:lua|Rscript)$/, /^-e(.*)$/s],
+  [/^php$/, /^-r(.*)$/s],
+];
+function programInArgv(argv) {
+  const runners = argv.map((w, i) => [baseOf(w), i]).filter(([b]) => INLINE_RUNNERS.test(b));
+  return runners.length > 0 && runners.every(([b, i]) => {
+    const rest = argv.slice(i + 1);
+    if (/^(?:awk|gawk|mawk|nawk)$/.test(b)) return true;
+    if (b === 'deno') return rest[0] === 'eval' && rest.length > 1;
+    const opt = CODE_OPTS.find(([name]) => name.test(b))?.[1];
+    return opt !== undefined && rest.some((a, k) => { const m = opt.exec(a); return m !== null && ((m[1] ?? '') !== '' || k + 1 < rest.length); });
+  });
+}
 function runsInlineCode(c, ctx) {
   if (!c.argv.length || isReadOnly(c, ctx)) return false;
   return c.argv.some((w, i) => {
@@ -3397,16 +3409,16 @@ function evaluateBashForFilesFrame(command, opts) {
   // such a file is judged by the target and what lands in it (R1-B1, hookSurfaceBashReason below, once the line's writes are known)
   // (R2-F7, R3-B1) an interpreter's inline code (-e / -c, a program on stdin) whose program text names such a file is refused without the word "hooks" and whatever it does with the file (a write word is no gate:
   // os.link, os.sendfile, shutil.copy, fs.linkSync ...): the program builds what lands there. The program text is the interpreter command's own words, a here-string, and (a heredoc or a program fed on stdin)
-  // the line; not the whole line for a program given by -e / -c (`cat <settings> | python3 -c '…json.load(sys.stdin)'` names none). A plain read of the file (`open(f).read()`) is no naming.
+  // the line; not the whole line for a program given by a real code option (-e / -c ...; programInArgv: `cat <settings> | python3 -c '…json.load(sys.stdin)'` names none). (R4-B1) A read is no exception: a program that names the file is refused.
   {
     const hooksWord = /hooks/i.test(scanRaw);
     for (const c of cmds) {
       if (runsInlineCode(c, ctx)) {
         const reds = c.redirects ?? [];
-        const codeInArgv = /^(?:awk|gawk|mawk|nawk)$/.test(baseOf(c.argv.find((w) => INLINE_RUNNERS.test(baseOf(w))) ?? '')) || c.argv.some((a) => /^--(?:eval|print|exec)(?:=|$)/.test(a) || /^-[A-Za-z]*[ecEprR]/.test(a));
+        const codeInArgv = programInArgv(c.argv);
         const onStdin = !codeInArgv || reds.some((r) => /^<<(?!<)/.test(r.op ?? ''));
         const text = [...wordsOf(c), ...reds.filter((r) => r.op === '<<<').map((r) => r.target ?? ''), ...(onStdin ? [scanRaw] : [])].join('\n');
-        if (HOOK_SURFACE_TEXT.test(stripPlainReads(text))) return deny(`an inline program names a file that can declare hooks, and what it does to it cannot be checked (${HOOKS_MSG})`);
+        if (HOOK_SURFACE_TEXT.test(text)) return deny(`an inline program names a file that can declare hooks, and what it does to it cannot be checked (${HOOKS_MSG})`);
       }
       if (!hooksWord) continue;
       const writes = (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) || (c.argv.length > 0 && !isReadOnly(c, ctx));

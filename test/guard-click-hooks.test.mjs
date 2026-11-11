@@ -279,16 +279,17 @@ test('R2-F6: a program the guard does not model, given a hook surface file by na
   for (const cmd of ['git add .claude/settings.json', 'git commit -m "update .claude/settings.json"', 'cat .claude/settings.json', 'git diff .claude/settings.json']) assert.equal(bash(cmd), 'allow', cmd);
 });
 
-test('R2-F7: an interpreter\'s inline code that writes a hook surface file is refused without the word hooks; a read and git add stay allowed', () => {
+test('R2-F7: an interpreter\'s inline code that names a hook surface file is refused without the word hooks (read or write); a read through a pipe and git add stay allowed', () => {
   assert.equal(bash(`python3 -c "import base64;open('.claude/settings.local.json','w').write(base64.b64decode('e30=').decode())"`), 'deny');
   assert.equal(bash(`node -e "require('fs').writeFileSync('.claude/settings.json','{}')"`), 'deny');
-  assert.equal(bash(`python3 -c "print(open('.claude/settings.json').read())"`), 'allow');
+  assert.equal(bash(`python3 -c "print(open('.claude/settings.json').read())"`), 'deny', 'R4-B1: no plain-read exemption: a program that names the file is refused');
+  assert.equal(bash(`cat .claude/settings.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'`), 'allow');
   assert.equal(bash('git add .claude/settings.json'), 'allow');
 });
 
 // ---- round 3 (R3-B1, R3-B2, R3-F1, R3-F2) -----------------------------------------------------------------------------------------------
 
-test('R3-B1: inline code that names a hook surface file in its program text is refused whatever it does (link, copy, sendfile); a read, or a program that names none, stays allowed', () => {
+test('R3-B1: inline code that names a hook surface file in its program text is refused whatever it does (link, copy, sendfile); a read through a pipe, or a program that names none, stays allowed', () => {
   for (const cmd of [
     `python3 -c "import os; os.link('/tmp/payload','.claude/settings.local.json')"`,
     `python3 -c "import os; fd=os.open('.claude/settings.local.json',os.O_WRONLY|os.O_CREAT|os.O_TRUNC,384); os.sendfile(fd,os.open('/tmp/payload',os.O_RDONLY),0,4096)"`,
@@ -300,7 +301,6 @@ test('R3-B1: inline code that names a hook surface file in its program text is r
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [
     `cat .claude/settings.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'`,
-    `python3 -c "print(open('.claude/settings.json').read())"`,
     `python3 -c "import os; os.link('/tmp/a','/tmp/b')"`,
     `node -e "console.log(1)"`,
     `git add .claude/settings.json`,
@@ -347,4 +347,37 @@ test('R3-F2: a literal .claude-<name> folder, a substitution that is a whole fil
     'cp /tmp/c.json .claude/${A:-${B}}settings.json', 'cp /tmp/c.json ".claude/${A:-${B:-x}}"',
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of ['cp /tmp/c.json "$DEST"', 'cp /tmp/c.json "$OUT/readme.md"', 'cp /tmp/c.json $(pwd)/settings.json', 'cp /tmp/c.json docs/${A:-${B}}x.md', 'cp a.md docs/', 'cp /tmp/c.json src/$F']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// ---- round 4 (R4-B1, R4-F1) ------------------------------------------------------------------------------------------------------------
+
+test('R4-B1: no plain-read exemption: an inline program that names a hook surface is refused when it only seems to read (rebound name, flag w, read then write the same path)', () => {
+  for (const cmd of [
+    `python3 -c "import shutil; shutil.copyfile('/tmp/payload',open('.claude/settings.local.json').name)"`,
+    `python3 -c "open=lambda p: shutil.copyfile('/tmp/payload',p); open('.claude/settings.local.json')"`,
+    `node -e "require('fs').readFileSync('.claude/settings.json',{flag:'w'})"`,
+    `python3 -c "open('.claude/settings.local.json'); open('.claude/settings.local.json','w').write('{}')"`,
+    `python3 -c "print(Path('.claude/settings.json').read_text())"`,
+    `node -e "console.log(require('fs').readFileSync('.claude/settings.json','utf8'))"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  assert.equal(bash(`cat .claude/settings.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'`), 'allow');
+});
+
+test('R4-F1: a program fed on stdin is judged whatever option the interpreter holds that carries no program (-E, -R, -rjson, -r fs, -Mstrict)', () => {
+  const prog = "import os; os.link('/tmp/payload','.claude/settings.local.json')";
+  for (const cmd of [
+    `echo "${prog}" | python3 -E`,
+    `echo "${prog}" | python3 -R`,
+    `echo "${prog}" | python3 -Werror`,
+    `echo "require 'fileutils'; FileUtils.ln('/tmp/payload','.claude/settings.local.json')" | ruby -rjson`,
+    `echo "require('fs').linkSync('/tmp/payload','.claude/settings.local.json')" | node -r fs`,
+    `echo "link '/tmp/payload','.claude/settings.local.json';" | perl -Mstrict`,
+    `python3 -E <<< "${prog}"`,
+    `ruby -rjson <<< "File.link('/tmp/payload','.claude/settings.local.json')"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `python3 -c "import os; os.link('/tmp/a','/tmp/b')" 2>&1`,
+    `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())'`,
+    `node -r fs -e "console.log(1)"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
 });
