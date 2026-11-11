@@ -42,7 +42,7 @@ const PROJECT = 'claude-pipeline'; // must match `project:` in .claude/pipeline.
 //           and `log` (default: the reason) is written to .verify/logs/<step>.log. `git` is the report's git block. It must
 //           fail closed: a throw or any other answer runs the step and records `skipCheck: skip check failed: <why>`.
 const STEPS = [
-  { name: 'tests', cmd: 'node scripts/test.mjs', quick: true, quickCmd: 'node scripts/test.mjs skills-commands docs-facts config' },
+  { name: 'tests', cmd: 'node scripts/test.mjs', quick: true, quickCmd: 'node scripts/test.mjs skills-commands docs-facts config cli.test.mjs' },
 ];
 // ---- end of the project-specific part ---------------------------------------------------------------------------------
 
