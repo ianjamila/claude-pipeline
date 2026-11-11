@@ -445,3 +445,123 @@ test('defaultNotify with event pipeline-update: its own stderr prefix, notices l
     assert.match(spawned[0][1][1], new RegExp(`with title "${title}"`));
   }
 });
+
+// ---- gaps closed after auditing plan B2/B4, and the cases of #67 that still apply --------------------------------------------------------
+
+test('status file while the download runs says behind; a deferred streak keeps its own line; a verify failure leaves the full failed record', async () => {
+  const t = rig();
+  let during = null;
+  await t.go({ performUpdate: async () => { during = t.status(); return OK_INSTALL; } });
+  assert.deepEqual(during, { version: 1, state: 'behind', checkedAt: new Date(T0).toISOString(), installedSha: OLD, mainSha: SHA_A });
+
+  const d = rig({ install: DEFERRED });
+  await d.go();
+  let streak = null;
+  d.w.clock = T0 + 60 * 1000;
+  await d.go({ performUpdate: async () => { streak = d.status(); return DEFERRED; } });
+  assert.equal(streak.state, 'deferred-by-review', 'an update waiting on a review is not relabelled behind');
+  assert.equal(streak.deferredSince, new Date(T0).toISOString());
+
+  const f = rig({ install: failInstall('check-failed', 'the install did not verify: a; b', { drift: ['a', 'b'] }) });
+  await f.go();
+  assert.deepEqual(f.status(), {
+    version: 1, state: 'failed', checkedAt: new Date(T0).toISOString(), installedSha: OLD, mainSha: SHA_A, reason: 'check-failed',
+    message: 'the install did not verify: a; b', command: ownerCommand(f.home),
+  });
+});
+
+test('every reason that blocks the job tells the owner the exact manual command and the main sha, and never installs', async () => {
+  for (const [over, reason, phrase] of [
+    [{ relation: { status: 'behind' } }, 'ahead', /ahead of main/],
+    [{ relation: { status: 'diverged' } }, 'diverged', /diverged from main/],
+    [{ id: { ...pristine(), modified: ['pipeline/lib/x.mjs'] } }, 'modified', /local changes/],
+    [{ id: { ...pristine(), complete: false, missing: ['pipeline/lib/y.mjs'] } }, 'incomplete', /incomplete/],
+  ]) {
+    const t = rig(over);
+    await t.go();
+    assert.equal(t.calls.install.length, 0, reason);
+    assert.equal(t.calls.notify.length, 1, reason);
+    assert.match(t.calls.notify[0], phrase, reason);
+    assert.match(t.calls.notify[0], /main aaaaaaa/, reason);
+    assert.ok(t.calls.notify[0].endsWith(`run in your own terminal: ${ownerCommand(t.home)}`), t.calls.notify[0]);
+    assert.deepEqual([t.status().state, t.status().reason, t.status().command], ['blocked-modified', reason, ownerCommand(t.home)]);
+  }
+});
+
+test('alternating failures at one main sha tell each (reason, main sha) exactly once until a good run (#67 R1-B2)', async () => {
+  const t = rig({ install: failInstall('fetch-failed', 'm') });
+  const order = ['fetch-failed', 'installer-too-old', 'fetch-failed', 'installer-too-old', 'fetch-failed'];
+  for (const error of order) { t.w.install = failInstall(error, 'm'); await t.go(); }
+  assert.equal(t.calls.notify.length, 2, 'the third and later runs repeat a failure the owner already heard');
+  assert.deepEqual(t.bookkeeping().notified, [`fetch-failed:${SHA_A}`, `installer-too-old:${SHA_A}`]);
+  t.w.install = OK_INSTALL;
+  await t.go();
+  t.w.install = failInstall('fetch-failed', 'm');
+  t.w.id = pristine();
+  await t.go();
+  assert.equal(t.calls.notify.length, 4, 'updated notice, then the same failure is news again');
+});
+
+test('only the quiet run prints nothing: every other outcome is exactly one compact JSON line for the job log', async () => {
+  const kinds = {
+    updated: rig(), deferred: rig({ install: DEFERRED }), blocked: rig({ id: { ...pristine(), modified: ['x'] } }),
+    failed: rig({ install: failInstall('fetch-failed') }), changed: rig({ install: failInstall('install-changed', 'c') }),
+  };
+  for (const [name, t] of Object.entries(kinds)) {
+    const { out, code } = printed(await t.go());
+    const lines = out.split('\n').filter(Boolean);
+    assert.equal(lines.length, 1, `${name}: ${out}`);
+    assert.equal(out.endsWith('\n'), true);
+    assert.equal(JSON.parse(lines[0]).mode, 'scheduled', name);
+    assert.equal(code, name === 'failed' ? 1 : 0, name);
+  }
+  assert.equal(printed(await rig({ id: pristine(SHA_A) }).go()).out, '');
+});
+
+test('a 24 hour notice that could not be delivered is retried on the next run; a good run ends the streak so a later deferral can earn a new notice', async () => {
+  const t = rig({ install: DEFERRED });
+  await t.go();
+  let down = true;
+  const notify = async (text) => { t.calls.notify.push(text); if (down) throw new Error('banner down'); };
+  t.w.clock = T0 + DEFER_NOTICE_MS + 60 * 1000;
+  const r = await t.go({ notify });
+  assert.deepEqual([r.exitCode, r.output.action, r.output.notify.sent], [0, 'deferred', false]);
+  down = false;
+  t.w.clock += 60 * 1000;
+  assert.equal((await t.go({ notify })).output.notify.sent, true);
+  t.w.clock += 60 * 1000;
+  await t.go({ notify });
+  assert.equal(t.calls.notify.length, 2, 'delivered once, then quiet');
+  // the review ends and the install goes through; the next deferral is a new streak with its own clock and notice
+  t.w.install = OK_INSTALL;
+  t.w.clock += 60 * 1000;
+  await t.go({ notify });
+  assert.equal(t.bookkeeping(), null);
+  t.w.install = DEFERRED;
+  t.w.id = pristine();
+  t.w.clock += 60 * 1000;
+  await t.go({ notify });
+  assert.equal(t.status().deferredSince, new Date(t.w.clock).toISOString());
+  t.w.clock += DEFER_NOTICE_MS + 60 * 1000;
+  await t.go({ notify });
+  assert.equal(t.calls.notify.length, 4, 'updated notice + the new streak\'s own 24 h notice');
+});
+
+test('the default notifier is the pipeline-update one: the install notice reaches stderr and pipeline-update-notices.log, with no banner when it is switched off', async () => {
+  const logDir = scratch();
+  const t = rig();
+  const { notify: _unused, ...auto } = t.auto;
+  let err = '';
+  const realWrite = process.stderr.write;
+  process.stderr.write = (chunk, ...rest) => { err += String(chunk); const cb = rest.find((a) => typeof a === 'function'); if (cb) cb(); return true; };
+  let r;
+  try {
+    r = await update(['--scheduled', '--json', '--claude-home', t.home], { env: { PIPELINE_PRUNE_LOG_DIR: logDir, PIPELINE_NO_BANNER: '1' }, hasClaudeCodeAncestor: () => false, auto });
+  } finally {
+    process.stderr.write = realWrite;
+  }
+  assert.deepEqual([r.exitCode, r.output.action, r.output.notify], [0, 'updated', { sent: true }]);
+  assert.equal(err, 'pipeline-update: pipeline updated to aaaaaaa (Add the thing (#99))\n');
+  assert.match(readFileSync(join(logDir, 'pipeline-update-notices.log'), 'utf8'), / pipeline updated to aaaaaaa \(Add the thing \(#99\)\)\n$/);
+  assert.equal(existsSync(join(logDir, 'queue-sweep-notices.log')), false, 'not the queue sweep\'s log');
+});
