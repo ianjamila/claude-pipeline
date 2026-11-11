@@ -276,13 +276,19 @@ const hasProvenanceField = (e) => e.promptSource !== undefined || e.origin !== u
 // that is not the owner's writes into the owner's transcript and shows NOTHING on screen.
 const visibleSynthetic = (e) => entrySource(e) === 'synthetic' && e.promptSource === 'system' && e.entrypoint === 'cli';
 // An INVISIBLE turn: a prompt entry that is not the owner's and not visibleSynthetic, with provenance to say so. F1: an entry carrying a provenance field whose source entrySource
-// cannot place ('unknown': a value Claude Code adds later) counts as invisible too (fail closed); a field-less 'unknown' entry (an interrupt marker, a legacy transcript) is a plain
-// boundary as before. Only prompt entries are turns: a tool_result user entry is never one (F7). A compaction-summary entry (it carries isCompactSummary or isVisibleInTranscriptOnly; only the
+// cannot place ('unknown': a value Claude Code adds later) counts as invisible too (fail closed); a 'unknown' entry with no such provenance (an interrupt marker, a harness note of the interactive
+// process, a legacy transcript; unplacedProvenance below says what counts) is a plain boundary as before. Only prompt entries are turns: a tool_result user entry is never one (F7). A compaction-summary entry (it carries isCompactSummary or isVisibleInTranscriptOnly; only the
 // fully flagged one is hidden, isHiddenSummary) is no turn the agent started: a half-flagged one of unknown source stays the plain boundary #189 pinned, in every mode.
+// R4-F1: does an entry of unknown source carry provenance that says "not the owner's"? Claude Code writes `entrypoint: "cli"` (and userType) on EVERY line of an interactive transcript, and a
+// harness line inside the owner's own visible turn (an isMeta skill body or system-reminder note, a `!` block's output, an interrupt marker) has promptSource / origin / turnOrigin null or
+// absent: none of that is provenance, so such a line is a plain boundary as before #191 and the request printed after it still binds. What counts: a promptSource, origin or turnOrigin that is
+// set (a value this list does not know stays invisible, fail closed) or an entrypoint other than "cli" (a headless sdk-cli is synthetic already, so that is an unknown future one).
+const isSet = (v) => v !== undefined && v !== null;
+const unplacedProvenance = (e) => isSet(e.promptSource) || isSet(e.origin) || isSet(e.turnOrigin) || (isSet(e.entrypoint) && e.entrypoint !== 'cli');
 const invisibleTurn = (e) => {
   if (!isPromptEntry(e) || visibleSynthetic(e)) return false;
   const source = entrySource(e);
-  return source === 'synthetic' || (source === 'unknown' && hasProvenanceField(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined);
+  return source === 'synthetic' || (source === 'unknown' && unplacedProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined);
 };
 
 // The parsed entries of the transcript's last `tailBytes` (a cut first line dropped) and whether the read reached the file's start (#191 A3, F7: callers read `.entries`);
