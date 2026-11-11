@@ -146,5 +146,10 @@ test('queue-branch-predates-switch: only branchState predates is sent to update-
   assert.match(meta.usage, /queue-unreadable/);
   const cli = read('docs/cli.md');
   assert.match(cli, /`queue-unreadable` blocker/, 'the dry run names a failed marker read queue-unreadable');
+  assert.match(cli, /does not contain the commit the base names in `\.claude\/merge-queue-aware`[^.]*`queue-branch-predates-switch` blocker carrying `branchState` \/ `queueAwareSha`; a failed marker or ancestry read[^.]*`queue-unreadable` blocker/, 'the dry-run paragraph describes the marker check');
+  // Scoped to the queue-mode dry-run paragraph: the `predatesReady` check elsewhere in the file also says "whose age cannot be read".
+  const dryRunQueue = cli.split('\n').find((l) => l.startsWith('`--dry-run` in queue mode'));
+  assert.ok(dryRunQueue, 'the queue-mode dry-run paragraph exists');
+  assert.doesNotMatch(dryRunQueue, /whose age cannot be read|switch-on/, 'the dry run no longer speaks of the queue switch-on age');
   assert.match(cli, /is not on GitHub: push it first/, 'a head GitHub does not have is named, not blamed on the marker');
 });
