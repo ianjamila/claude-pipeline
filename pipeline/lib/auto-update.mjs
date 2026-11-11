@@ -121,7 +121,9 @@ const scanDetail = (by) => {
 
 export function describeLive(by) {
   if (!by.length) return 'a review is live';
-  const one = (b) => (b.kind === 'scan-error' ? `could not check (${b.detail ?? b.repo ?? b.worktree ?? 'scan-error'})` : [b.repo ?? b.what ?? b.kind ?? 'a review', b.pr != null ? `#${b.pr}` : null, b.worktree ? `(${b.worktree})` : null].filter(Boolean).join(' '));
+  // An entry with no PR (a job, a held state or merge lock) is only told apart by its detail, so that follows it.
+  const named = (b) => [b.repo ?? b.what ?? b.kind ?? 'a review', b.pr != null ? `#${b.pr}` : null, b.worktree ? `(${b.worktree})` : null].filter(Boolean).join(' ');
+  const one = (b) => (b.kind === 'scan-error' ? `could not check (${b.detail ?? b.repo ?? b.worktree ?? 'scan-error'})` : b.pr == null && b.detail ? `${named(b)}: ${b.detail}` : named(b));
   const shown = by.slice(0, 5).map(one).join('; ');
   return by.length > 5 ? `${shown}; and ${by.length - 5} more` : shown;
 }

@@ -462,6 +462,19 @@ test('normalizeLive / describeLive: repo, PR and worktree are named; unknown sha
   assert.match(describeLive(normalizeLive(Array.from({ length: 7 }, (_, i) => ({ repo: `r${i}`, pr: i })))), /and 2 more$/);
 });
 
+// R3-F2: an entry that names no PR (a job, a held state or merge lock) is told apart by its detail, not just "/repo (/worktree)" or a bare kind.
+test('R3-F2: describeLive shows the detail of job / state-lock / merge-lock entries that name no PR, and leaves entries with a PR as they were', () => {
+  const folder = '/work/app/.review/jobs/ci';
+  const job = { kind: 'job', repo: '/work/app', worktree: '/work/app', detail: `job ci has an unreadable record (meta.json), treated as running: remove ${folder} if it is stale` };
+  const text = describeLive(normalizeLive([job]));
+  assert.match(text, /job ci has an unreadable record \(meta\.json\), treated as running: remove \/work\/app\/\.review\/jobs\/ci if it is stale/);
+  assert.match(text, /\/work\/app/);
+  assert.match(describeLive(normalizeLive([{ kind: 'state-lock', detail: 'pr-state-acme-app-7 is held by pid 9 on host, since T' }])), /state-lock.*pr-state-acme-app-7 is held by pid 9/);
+  assert.match(describeLive(normalizeLive([{ kind: 'merge-lock', detail: 'the merge command record merge-x.child.json is unreadable (not JSON), treated as running' }])), /merge-lock.*merge-x\.child\.json is unreadable/);
+  const withPr = { kind: 'lease', repo: 'acme/app', pr: 12, worktree: '/w', detail: 'lease detail that stays out of the line' };
+  assert.equal(describeLive(normalizeLive([withPr])), 'acme/app #12 (/w)');
+});
+
 test('defaultNotify with event pipeline-update: its own stderr prefix, notices log and banner title; the queue sweep keeps its own', () => {
   for (const [event, prefix, log, title] of [
     ['pipeline-update', 'pipeline-update', 'pipeline-update-notices.log', 'claude-pipeline update'],
