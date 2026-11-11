@@ -779,14 +779,21 @@ export function readApprovals(opts = {}) {
 }
 
 // Every valid record (any kind) younger than maxAgeMs, as written. Never throws.
-function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES } = {}) {
+// `problems` (an array; the strict lookup ownerGrantLookups passes one): each read that was skipped is described in it (the folder or a file that cannot be read, a
+// file that is not a regular file or is over maxBytes); an absent folder or a file that vanished is no problem. Without it a skipped read is silent, as before.
+function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES, problems = null } = {}) {
   const dir = ownerGoDir(home);
   const out = [];
   let names = [];
+  const note = (why) => { if (Array.isArray(problems)) problems.push(why); };
   try {
-    if (!lstatSync(dir).isDirectory()) return out;
+    if (!lstatSync(dir).isDirectory()) {
+      note(`${dir} is not a real folder`);
+      return out;
+    }
     names = session === null ? readdirSync(dir).filter((n) => n.endsWith('.jsonl')) : SESSION_RE.test(String(session)) ? [`${session}.jsonl`] : [];
-  } catch {
+  } catch (err) {
+    if (err?.code !== 'ENOENT') note(`${dir} cannot be read (${err?.code ?? 'error'})`);
     return out;
   }
   const t = now();
@@ -795,7 +802,10 @@ function readRecords({ home = accountHome(), session = null, now = Date.now, max
     let text = '';
     try {
       const st = lstatSync(file);
-      if (!st.isFile() || st.size > maxBytes) continue;
+      if (!st.isFile() || st.size > maxBytes) {
+        note(`${file} is ${st.isFile() ? 'over the size limit' : 'not a regular file'}`);
+        continue;
+      }
       const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
       try {
         const buf = Buffer.alloc(st.size);
@@ -804,7 +814,8 @@ function readRecords({ home = accountHome(), session = null, now = Date.now, max
       } finally {
         closeSync(fd);
       }
-    } catch {
+    } catch (err) {
+      if (err?.code !== 'ENOENT') note(`${file} cannot be read (${err?.code ?? 'error'})`);
       continue;
     }
     for (const line of text.split('\n')) {
@@ -1213,6 +1224,32 @@ export function ownerGrantGap(q = {}) {
   const found = grantsFor(q);
   if (found.length === 0) return 'none';
   return ownedBy(found, { grant: true, home: q.home }).length > 0 ? 'ok' : 'provenance';
+}
+
+// STRICT lookups for `triage defer-fixes` (and the follow-up recommendation of `triage round-request`), which must not defer past a grant it could not see: ownerGrantedRounds and
+// ownerGrantGap answer [] / 'none' when the records cannot be read (readRecords never throws), so here every skipped read makes a lookup THROW instead: the records folder present but
+// unreadable or not a real folder, a session file that cannot be read, is not a regular file or is over the size limit, a repo-moves file that is present but unreadable, and a
+// consumed-grants folder that is not a real folder (readGrantMarker would call every grant spent). An absent folder (nothing was ever recorded) is no grant, as before.
+// Returns { grants(k), grantGap(k) } for the repository and PR at counted round k and ANY head: grants -> the records the owner typed (provenance confirmed), grantGap -> 'none' | 'provenance' | 'ok'.
+export function ownerGrantLookups({ repo, pr, home = accountHome(), now = Date.now } = {}) {
+  const base = [];
+  const moves = readRepoMoves({ home });
+  if (moves.error) base.push(`the recorded repository moves cannot be read (${moves.error})`);
+  if (chainState(home, CONSUMED_REL) === 'unsafe') base.push('the consumed-grants folder is not a real folder');
+  const read = (k) => {
+    const problems = [...base];
+    const found = grantsFor({ repo, pr, k, anyHead: true, home, now, repoMoves: moves.moves, problems });
+    if (problems.length > 0) throw new Error(problems.slice(0, 3).join('; '));
+    return found;
+  };
+  return {
+    grants: (k) => ownedBy(read(k), { grant: true, home }),
+    grantGap(k) {
+      const found = read(k);
+      if (found.length === 0) return 'none';
+      return ownedBy(found, { grant: true, home }).length > 0 ? 'ok' : 'provenance';
+    },
+  };
 }
 
 // R2-F3 for a grant: text to append to a refusal when the unconfirmed records' transcripts are under a config dir this process does not know ('' otherwise).

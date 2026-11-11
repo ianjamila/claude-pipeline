@@ -167,6 +167,11 @@ test('deferEligibility: an unspent owner grant for the next round (at any head) 
   assert.match(gap.refusals.join(';'), /recorded for round 3 but cannot be confirmed as typed by the owner/);
   for (const answer of ['none', 'ok']) assert.equal(levels(state, () => [], () => answer).eligible, true, answer);
   assert.match(levels(state, () => [], () => { throw new Error('unreadable'); }).refusals.join(';'), /could not be checked \(unreadable\)/);
+  // R2-B1: a records lookup that failed is one refusal (the gap lookup is not asked again, it would fail the same way)
+  let asked = 0;
+  const failed = levels(state, () => { throw new Error('sess-a.jsonl cannot be read (EACCES)'); }, () => { asked += 1; throw new Error('again'); });
+  assert.deepEqual([failed.eligible, failed.refusals.length, asked], [false, 1, 0]);
+  assert.match(failed.refusals[0], /could not be read \(sess-a\.jsonl cannot be read \(EACCES\)\)/);
 });
 
 test('deferEligibility: an implemented accept outside the ids (a cached BLOCKING copy fixed after the last round) refuses (R1-F1)', () => {

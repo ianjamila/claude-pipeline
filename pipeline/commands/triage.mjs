@@ -23,7 +23,7 @@ import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, saveState, updateItems, w
 import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { askSummary, costFrom, notCleanReasons, openItems, roundsFrom } from '../lib/round-ask.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { grantIdOf, ownerGrantGap, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
+import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
   isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, rulingContentDigest, secondReviewRefusal, settleSecondReview, validateSecondReview, validateTriage,
@@ -605,6 +605,9 @@ async function rulingRequest(rest, ctx) {
   }, pr));
 }
 
+// A lookup of the owner's extra-round records, shaped the way roundOutcome / deferEligibility take grants.
+const asGrants = (lookup) => (ordinal) => lookup(ordinal).map((r) => ({ grantId: grantIdOf(r), head: r.head, quote: r.prompt }));
+
 // The line that ends the reply asking the owner for one more review round: the CLI writes it (counted ordinal k, the checked-out head, the
 // repository gh resolves on github.com), so the agent cannot ask for a round or a head of its own choosing. Chat mode only.
 async function roundRequest(rest, ctx) {
@@ -635,8 +638,9 @@ async function roundRequest(rest, ctx) {
     const warnings = [];
     let shown = {};
     try {
-      const grantGap = (ordinal) => ownerGrantGap({ repo: slug, pr, k: ordinal, anyHead: true });
-      shown = roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, warnings });
+      // The follow-up recommendation uses the STRICT lookups (an unreadable record refuses it, as defer-fixes does); the admission check above stays tolerant.
+      const strict = ownerGrantLookups({ repo: slug, pr });
+      shown = roundAskFields({ root, config, state, pr, gh, head, grants: asGrants(strict.grants), grantGap: strict.grantGap, warnings });
     } catch (err) {
       warnings.push(`the ask could not be summarised (${asciiLine(err?.message, 160)}): the line above still stands`);
     }
@@ -746,8 +750,10 @@ async function deferFixes(rest, ctx) {
     const last = state.rounds.at(-1);
     const o = { cwd: root };
     // The owner's typed "extra round" always wins over a deferral, at whatever head it was typed for (the head moved when the fixes were reverted).
-    const grants = (ordinal) => ownerGrantedRounds({ repo: slug, pr, k: ordinal, anyHead: true }).map((r) => ({ grantId: grantIdOf(r), head: r.head, quote: r.prompt }));
-    const grantGap = (ordinal) => ownerGrantGap({ repo: slug, pr, k: ordinal, anyHead: true });
+    // STRICT lookups (hooks/lib/owner-go.mjs#ownerGrantLookups): a record that cannot be read refuses, it never reads as "no grant".
+    const strict = ownerGrantLookups({ repo: slug, pr });
+    const grants = asGrants(strict.grants);
+    const grantGap = strict.grantGap;
     const diff = reviewedDiff(root, config, state);
     if (diff.files === null) return refuse(`the reviewed diff could not be read (${diff.problem}), so no item can be judged low severity`);
     let eligible;

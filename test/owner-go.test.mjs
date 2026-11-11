@@ -3,7 +3,7 @@
 // are stored and read (real folders and files only, a day at most). All in a temp home.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -14,7 +14,7 @@ import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
   presentedRuling, recordRuling, ownerRuled, rulingsIn, entrySource, notOwnerWords, approvalGap, ownerRulingGap, promptProvenance, rulingNudge, RULING_NUDGE,
   accountHome, approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT, legacyTranscriptOf,
-  parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
+  parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantLookups, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, isTranscriptFile, toPosix, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
@@ -1263,6 +1263,66 @@ test('owner-go round grant: ownerGrantedRounds returns ALL open matching records
   writeFileSync(join(ownerGoDir(home3), 'sess-9.jsonl'), line);
   writeFileSync(file, [line, `${JSON.stringify({ ...rec, v: 2 })}\n`, `${JSON.stringify({ ...rec, prompt: 'extra round, I mean it' })}\n`, `${JSON.stringify({ ...rec, kind: 'ruling' })}\n`].join(''));
   assert.equal(ownerGrantedRounds({ ...q, home: home3 }).length, 1, 'only the genuine line');
+});
+
+// R2-B1: the STRICT lookups `triage defer-fixes` uses. ownerGrantedRounds / ownerGrantGap read through a reader that never throws, so an unreadable record read as "no grant"
+// and a deferral could pass over the owner's extra round; the strict lookups throw on any skipped read and still answer "no grant" for a folder that was never created.
+test('owner-go round grant: ownerGrantLookups (strict) answers like the tolerant ones when everything is readable, and "none" for a folder that does not exist', () => {
+  const none = ownerGrantLookups({ repo: REPO, pr: 58, home: tmp(), now: () => AT });
+  assert.deepEqual([none.grants(4), none.grantGap(4)], [[], 'none']);
+  const home = tmp();
+  recordRoundGrant(input(home, 'extra round', [said(RASK)], { session_id: 'sess-a' }), { home, now: () => AT });
+  const strict = ownerGrantLookups({ repo: REPO, pr: 58, home, now: () => AT + 1000 });
+  assert.deepEqual(strict.grants(4).map((r) => r.session), ['sess-a']);
+  assert.equal(strict.grantGap(4), 'ok');
+  assert.deepEqual([strict.grants(5), strict.grantGap(5)], [[], 'none'], 'another round: none, not a failure');
+  assert.equal(ownerGrantLookups({ repo: REPO, pr: 58, home, now: () => AT + 25 * 3600_000 }).grantGap(4), 'none', 'a record older than a day is no grant, not a failure');
+});
+
+test('owner-go round grant: ownerGrantLookups throws when a read was skipped, where the tolerant lookups answer "none"', { skip: process.platform === 'win32' }, () => {
+  const seeded = () => {
+    const home = tmp();
+    recordRoundGrant(input(home, 'extra round', [said(RASK)], { session_id: 'sess-a' }), { home, now: () => AT });
+    return home;
+  };
+  const q = (home) => ({ repo: REPO, pr: 58, home, now: () => AT + 1000 });
+  const both = (home, re, why) => {
+    const strict = ownerGrantLookups(q(home));
+    assert.throws(() => strict.grants(4), re, `${why}: grants`);
+    assert.throws(() => strict.grantGap(4), re, `${why}: grantGap`);
+  };
+  // a session file the reader cannot read: the grant may be in it
+  const unreadable = seeded();
+  chmodSync(join(ownerGoDir(unreadable), 'sess-a.jsonl'), 0o000);
+  if (process.getuid?.() !== 0) {
+    both(unreadable, /cannot be read \(EACCES\)/, 'unreadable file');
+    assert.equal(ownerGrantGap({ repo: REPO, pr: 58, k: 4, anyHead: true, home: unreadable, now: () => AT + 1000 }), 'none', 'the tolerant lookup is blind to it');
+  }
+  chmodSync(join(ownerGoDir(unreadable), 'sess-a.jsonl'), 0o600);
+  // a record file over the size limit, and one that is not a regular file
+  const big = seeded();
+  writeFileSync(join(ownerGoDir(big), 'sess-big.jsonl'), Buffer.alloc(1024 * 1024 + 1, 0x20));
+  both(big, /sess-big\.jsonl is over the size limit/, 'oversized file');
+  const odd = seeded();
+  mkdirSync(join(ownerGoDir(odd), 'sess-dir.jsonl'));
+  both(odd, /sess-dir\.jsonl is not a regular file/, 'a folder named like a record file');
+  // the records folder is a file or a link
+  const asFile = tmp();
+  mkdirSync(join(asFile, '.claude', 'pipeline-state'), { recursive: true });
+  writeFileSync(ownerGoDir(asFile), '');
+  both(asFile, /is not a real folder/, 'records folder is a file');
+  const linked = tmp();
+  mkdirSync(join(linked, '.claude', 'pipeline-state'), { recursive: true });
+  symlinkSync(tmp(), ownerGoDir(linked));
+  both(linked, /is not a real folder/, 'records folder is a link');
+  // the consumed-grants folder is not a real folder: every marker would read as spent
+  const consumed = seeded();
+  writeFileSync(join(ownerGoDir(consumed), 'consumed'), '');
+  both(consumed, /consumed-grants folder is not a real folder/, 'consumed is a file');
+  // the recorded repository moves are present but unreadable
+  const moves = seeded();
+  writeFileSync(join(ownerGoDir(moves), 'repo-moves.json'), 'not json');
+  both(moves, /repository moves cannot be read/, 'repo-moves.json is garbage');
 });
 
 test('owner-go round grant: records are written and read only through real folders and files', { skip: process.platform === 'win32' }, () => {

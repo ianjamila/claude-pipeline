@@ -1014,19 +1014,24 @@ export function deferEligibility(state, config, files, { grants, grantGap } = {}
   const k = reviewed + 1;
   // Unlike roundOutcome (no readable grant = no round), here the permissive reading is "no grant", so what cannot be read refuses: a lookup that throws or answers
   // with anything but a list, and a record the owner may have typed but whose provenance could not be confirmed (`grantGap`: k -> 'none' | 'provenance' | 'ok').
-  // The round-request ask passes tolerant lookups (a failure there is a warning and an 'extra-round' recommendation, never a missing line).
+  // Both callers pass the STRICT lookups (owner-go.mjs ownerGrantLookups: any skipped read throws); in the round-request ask a failure there is a warning and an 'extra-round' recommendation, never a missing line.
   let granted = [];
+  let unreadable = false;
   if (typeof grants === 'function') {
     try {
       const found = grants(k);
       if (Array.isArray(found)) granted = found;
-      else refusals.push(`the owner's extra-round records for round ${k} could not be read (the lookup answered with something other than a list): ask the owner for an extra round`);
+      else {
+        unreadable = true;
+        refusals.push(`the owner's extra-round records for round ${k} could not be read (the lookup answered with something other than a list): ask the owner for an extra round`);
+      }
     } catch (err) {
+      unreadable = true;
       refusals.push(`the owner's extra-round records for round ${k} could not be read (${asciiLine(err?.message, 120)}): ask the owner for an extra round`);
     }
   }
   if (granted.length > 0) refusals.push(`the owner granted extra round ${k} (unspent): run it, a typed "extra round" always wins`);
-  else if (typeof grantGap === 'function') {
+  else if (typeof grantGap === 'function' && !unreadable) {
     let gap;
     try {
       gap = grantGap(k);
