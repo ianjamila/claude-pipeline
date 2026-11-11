@@ -50,7 +50,7 @@ Exit: 0 ok · 1 some PRs could not be read (close; the others are still processe
 decide which items need the arbiter, then prove and apply its rulings.
 
 ```
-pipeline arbiter needed --round R [--force] [--repo DIR]
+pipeline arbiter needed --round R [--pr N] [--force] [--repo DIR]
   -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader[, diffPath, scope]}
   mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied
     (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that)
@@ -60,7 +60,7 @@ pipeline arbiter needed --round R [--force] [--repo DIR]
   a retry clears an unproven or malformed ruling (model-proof / invalid-arbiter, in either mode) so the arbiter answers again; the owner's and Claude's rulings are kept; an item the arbiter no longer needs is settled by the judge again
   mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none
   start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman
-pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
+pipeline arbiter apply --round R [--pr N] [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
   the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)
   -> {ok, round, tag, transcript, errors, items[, findings]}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript
   any Fable on any line of the transcript must be at least this machine's floor (whatever --expect-model says): older => exit 1, error stale-model,
