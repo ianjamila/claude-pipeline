@@ -242,7 +242,9 @@ table('code-built path', [
   'cat ~/proj/.claude/settings.json',
   'echo x > /repo/.claude/settings.json',
   'cat "$X/.claude/settings.json"',
-  `python3 -c "print(open('.claude/settings.json').read())"`,
+  // (#261 R4-B1: program text naming a hook surface such as .claude/settings.json is refused read or not — guard-click-hooks R4-B1;
+  // the point here, a repo's own .claude/ is not a config root, is kept with a file that declares nothing)
+  `python3 -c "print(open('.claude/notes.json').read())"`,
 ], 'allow');
 
 // R6-F1: program text that writes under a config root is refused whatever the file (the program may build the path of a transcript at run time); a CLAUDE.md note is written with the Write tool or a shell cp
