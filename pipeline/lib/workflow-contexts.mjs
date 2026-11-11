@@ -22,7 +22,7 @@
 //    `working-directory`. A call anywhere else (any checked key not listed, e.g. a job-level env or `continue-on-error`) is
 //    "Unrecognized function". Other functions (format, toJSON, …) are allowed everywhere, so they are not scanned. Names match
 //    case-insensitively; a `.name(` property never counts.
-// 3. Syntax, any scalar anywhere in the file: a `${{` with no closing `}}` is a finding (GitHub: "The expression is not closed").
+// 3. Syntax, any scalar anywhere in the file (mapping keys included): a `${{` with no closing `}}` is a finding (GitHub: "The expression is not closed").
 // Real YAML parsing (vendored js-yaml, JSON schema).
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -178,7 +178,7 @@ export function findingKind(finding) {
 /** True when a scalar has an opening `${{` that no EXPR match covers: GitHub rejects the file ("The expression is not closed"). Each closed expression becomes a space, not nothing, so its neighbours never join into a `${{` (`$${{ x }}{{` is valid). Linear: EXPR cannot backtrack. */
 const hasUnclosed = (s) => s.replace(EXPR, ' ').includes('${{');
 
-/** Every string leaf in the whole document with its key path (arrays as [i]; a step as steps[<id or index>]). */
+/** Every string leaf in the whole document with its key path (arrays as [i]; a step as steps[<id or index>]), and every mapping key too (GitHub's reader parses keys as scalars: its own path, marked as a key). */
 function* leaves(value, where) {
   if (typeof value === 'string') yield [where, value];
   else if (Array.isArray(value)) {
@@ -186,7 +186,13 @@ function* leaves(value, where) {
       const label = isObj(v) && typeof v.id === 'string' && /\.steps$/.test(where) ? v.id : i;
       yield* leaves(v, `${where}[${label}]`);
     }
-  } else if (isObj(value)) for (const [k, v] of Object.entries(value)) yield* leaves(v, where ? `${where}.${k}` : k);
+  } else if (isObj(value)) {
+    for (const [k, v] of Object.entries(value)) {
+      const here = where ? `${where}.${k}` : k;
+      yield [`${here} (as a key)`, k];
+      yield* leaves(v, here);
+    }
+  }
 }
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);

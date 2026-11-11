@@ -268,6 +268,17 @@ test('unclosed expression: passes closed expressions, a }} or ${{ inside a strin
   assert.deepEqual(run(steps('      - run: echo "{{ x }} } {{"')), []);
 });
 
+test('unclosed expression: a mapping KEY is read the same way (GitHub rejects an unclosed ${{ in a key); a normal or closed key is clean', () => {
+  const f = run(job("    env:\n      '${{ github.ref': value"));
+  assert.equal(f.length, 1, f.join('\n'));
+  assert.ok(f[0].includes('jobs.j.env'), f[0]);
+  assert.ok(f[0].includes('not closed'), f[0]);
+  assert.equal(findingKind(f[0]), 'unclosed');
+  assert.equal(run("on: push\n'${{ github.ref': 1\njobs: {}\n").length, 1);
+  assert.deepEqual(run(job('    env:\n      NORMAL: value')), []);
+  assert.deepEqual(run(job("    env:\n      '${{ github.ref }}': value")), []);
+});
+
 test('unclosed expression: removing a closed expression never joins its neighbours into a false ${{ (GitHub accepts `$${{ x }}{{`)', () => {
   assert.deepEqual(run(steps("      - run: echo '$${{ github.sha }}{{'")), []);
   assert.deepEqual(run(steps("      - run: echo '$${{ github.sha }}{{ github.ref }}'")), []);
