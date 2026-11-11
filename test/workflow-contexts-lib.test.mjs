@@ -226,3 +226,18 @@ test('scanWorkflowDir reports a malformed file as a finding and keeps scanning t
     assert.match(r.findings[0], /^bad\.yml: not valid YAML/);
   });
 });
+
+test('review R1-B1: whitespace (or a newline) after a property dot does not turn the property into a root context', () => {
+  assert.deepEqual(contextsIn(' inputs. runner '), ['inputs']);
+  assert.deepEqual(contextsIn(' inputs.\n  runner '), ['inputs']);
+  assert.deepEqual(run(job('    env:\n      R: ${{ inputs. runner }}')), []);
+  assert.deepEqual(run(job('    env:\n      R: >-\n        ${{ github.event.inputs.\n        runner }}')), []);
+  // a real root use still counts, next to the same shapes
+  assert.equal(run(job('    env:\n      R: ${{ inputs. runner || runner.temp }}')).length, 1);
+  assert.equal(run(job('    env:\n      R: ${{ x || runner.os }}')).length, 1);
+  assert.deepEqual(contextsIn(' toJSON( runner ) '), ['runner']);
+  // linear time: a long whitespace run after a dot
+  const t = Date.now();
+  contextsIn(`a.${' '.repeat(200000)}b`);
+  assert.ok(Date.now() - t < 1000);
+});
