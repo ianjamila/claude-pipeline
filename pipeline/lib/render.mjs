@@ -69,6 +69,8 @@ function claudeRulingLines(rounds) {
   return rounds.flatMap((r) => (r.items ?? []).filter(claudeRuled).map((item) => {
     const sr = item.secondReview;
     const codex = sr ? `Codex ${line(sr.decision)}, ${line(sr.confidence)}` : 'no Codex check';
+    // A fix taken out at the round limit (triage defer-fixes) says so: it is a FOLLOW-UP whose fix is NOT in this merge.
+    if (item.roundCapDeferral) return `- ${line(item.id)}: ${line(item.final.decision ?? 'unknown')} (deferred past the round limit; its fix was taken out, NOT in this merge) - ${line(item.final.reason, 300)}`;
     return `- ${line(item.id)}: ${line(item.final.decision ?? 'unknown')} (${claudeBy(item)}; ${codex}) - ${line(item.final.reason, 300)}`;
   }));
 }

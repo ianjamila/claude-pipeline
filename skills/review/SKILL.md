@@ -40,10 +40,11 @@ Picking up an existing `awaiting-review` PR (Codex was unavailable): `P state sh
 
 1. `git fetch origin <default_branch>` and `git worktree add --no-track -b agent/<slug> <worktree_dir>/agent-<slug> origin/<default_branch>`
    (`--no-track`: a branch tracking `origin/main` can make a bare push target main). All work happens there; give subagents its absolute path.
-2. Split the work into small tasks. Per task dispatch the `implementer` agent with: the task, worktree path, acceptance criteria,
-   the tests to write (a bug ⇒ the failing test first, its failing output kept), `verify.quick`, and the commit trailer your system
-   context prescribes (pass it verbatim). Independent tasks may run in parallel only on different files.
-3. Quick check on the changed area (`verify.quick`) after each task and before every push. Red ⇒ implementer with the failing
+2. ONE `implementer` dispatch builds the whole change (task list in order, commits in small steps): hand it the tasks, worktree path, acceptance criteria, the tests to write
+   (a bug ⇒ the failing test first, its failing output kept), `verify.quick`, and the commit trailer your system context prescribes (pass it verbatim). More dispatches only when the
+   change is big: > ~500 changed non-test lines expected, more than one subsystem, or parts on disjoint files worth running in parallel (only on different files). An implementer that
+   stops before it is done (call budget, context) ⇒ continue THE SAME agent once (SendMessage with what is left; extend its budget once) before a fresh dispatch, which gets only the rest.
+3. Quick check on the changed area (`verify.quick`) after each dispatch and before every push. Red ⇒ implementer with the failing
    step and excerpt, max 3 fix cycles; still red ⇒ stop (outcome `blocked`): before the PR exists (step 4) only report to the owner; once it exists,
    first `gh pr edit N --add-label pipeline-blocked` and `P comment --pr N --kind blocked`, then the stop ritual.
 4. Draft PR: `git push -u origin agent/<slug>`, `gh pr create --draft --title "<title>" --body-file <file>`. The body opens
@@ -92,12 +93,12 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    and exit 2 `no-code-change` means the fix changed no code (back to the implementer; marking never replaces a fix).
 6. **Outcome.** `P state outcome`: `clean` ⇒ leave the loop; `needsHuman` non-empty ⇒ see Rulings; more rounds left ⇒ round R+1 (the Codex fix
    check reviews only what changed since this round's head); none left ⇒ park, cause `unresolved: <ids>`, except one case: `reachedMax`, no
-   `extraRound`, `owner_approval: chat`, and the fixes are pushed and `verify.quick` is green ⇒ ask the owner for one more round (Extra round, below). Label mode ⇒ park.
+   `extraRound`, `owner_approval: chat`, and the fixes are pushed and `verify.quick` is green ⇒ ask the owner for one more round (Extra round, below): the ask shows rounds, booked cost and open-item severity, and when only low-severity fixes are left it recommends filing them as follow-ups instead (`reference/owner-merge.md`, Follow up instead of a round). Label mode ⇒ park.
 **Park** (every `needs-human` stop is this): `gh pr edit N --add-label needs-human`, `P comment --pr N --kind needs-human --reason "<cause, what was checked, what the owner does>"`,
 with `merge.hold_command` in `P config` `P merge-hold --pr N --release --reason parked` (a parked PR must not keep the merge line), then the stop ritual with outcome `needs-human`. The summary renders from the round state, so at least one Codex round must have run; before that a stop is `blocked` or `awaiting-review`. The park comment is your own text: 3.3 shows a later hold from GitHub's label event and quotes the comment only as agent-written.
 
 Book every agent call (implementer, judge, arbiter; an `arbiter-fix` call is booked as role `arbiter`) right after it returns:
-`P cost --pr N --phase <build|review> --role <implementer|judge|arbiter> --from-transcript <the agent's transcript>` (add `--retry` on a fix retry). The transcript is
+`P cost --pr N --phase <build|review> --role <implementer|judge|arbiter> --from-transcript <the agent's transcript>` (add `--retry` on a fix retry). An implementer you continued is booked ONCE, after its last leg: the transcript sums the whole run, so booking each leg counts it twice. The transcript is
 `~/.claude/projects/<encoded-cwd>/<session-id>/subagents/agent-<agentId>.jsonl`; the `agentId` is in the Agent tool's result. Calls made before the PR exists (no `N` yet)
 are noted (role, phase, transcript) and all booked right after `gh pr create`. A failed `P cost` is a warning, never a reason to stop.
 

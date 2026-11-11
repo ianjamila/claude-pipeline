@@ -40,7 +40,8 @@ export function followupMarker(pr, item) {
 // (the marker is ours and goes in first, after the defusing).
 export function issueBody(item, pr) {
   const where = item.file ? (item.line > 0 ? `${item.file}:${item.line}` : item.file) : null;
-  const decidedBy = item.final?.by === 'owner' ? 'Owner' : item.arbiter && item.final?.by === 'arbiter' ? 'Arbiter' : 'Judge';
+  const deferral = item.roundCapDeferral;
+  const decidedBy = item.final?.by === 'owner' ? 'Owner' : deferral ? 'Claude (round limit)' : item.arbiter && item.final?.by === 'arbiter' ? 'Arbiter' : 'Judge';
   const lines = [
     String(item.detail ?? '').trim(),
     '',
@@ -52,6 +53,10 @@ export function issueBody(item, pr) {
     '',
   ];
   if (where) lines.push(`Location: \`${oneLine(where)}\``, '');
+  // A fix deferred past the round limit (triage defer-fixes) was written and taken out again: say where it is. No cherry-pick claim: the fix head may hold other work.
+  if (deferral && typeof deferral.fixHead === 'string' && typeof deferral.reviewedHead === 'string') {
+    lines.push(`A fix was written on PR #${pr} at ${deferral.fixHead} and taken out before merge to keep the review closed; compare it with the reviewed code: git diff ${deferral.reviewedHead} ${deferral.fixHead}`, '');
+  }
   lines.push(`From PR #${pr}, item ${item.id}.`, '', 'Promote this by relabelling `agent-suggestion` to `agent-build`.');
   return `${followupMarker(pr, item)}\n${defuseMarkdown(lines.join('\n'))}`;
 }
