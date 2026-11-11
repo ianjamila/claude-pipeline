@@ -160,16 +160,74 @@ test('on darwin and linux an escaped-dot path out of the hooks or bin folder is 
   }
 });
 
-test('on win32 a genuine backslash path to the CLI or a hook stays trusted, one with a . or .. segment is not', () => {
-  const WIN = { home: 'C:\\Users\\u', env: {}, platform: 'win32', cwd: 'C:\\repo', realpath: (p) => p, existsSync: () => false };
-  const w = (command) => evaluateBashForFiles(command, WIN).decision;
-  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\bin\\pipeline.mjs preflight'), 'allow');
-  assert.equal(w('node "C:\\Users\\u\\.claude\\pipeline\\bin\\pipeline.mjs" preflight'), 'allow');
-  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\hooks\\guard-files.mjs'), 'allow');
-  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\hooks\\..\\..\\..\\tmp\\x.mjs'), 'deny');
-  assert.equal(w('node "C:\\Users\\u\\.claude\\pipeline\\hooks\\..\\..\\..\\tmp\\x.mjs"'), 'deny');
-  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\bin\\..\\..\\x.mjs'), 'deny');
-  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\hooks\\.\\.\\.\\tmp\\x.mjs'), 'deny');
-  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\hooks\\.\\guard-files.mjs'), 'deny');
-  assert.equal(w('node C:\\Users\\u\\.claude\\pipeline\\hooks\\sub\\..\\guard-files.mjs'), 'deny');
+// The raw-text route exists for the PowerShell tool ONLY (where a backslash is a path separator). Git Bash drops an unquoted backslash and runs the drive-relative file
+// (R8-B1), a word cut short at an escaped space is not the operand the shell runs (R8-F1), and off Windows a backslash a variable carries is a name character (R8-F2).
+const WIN = { home: 'C:\\Users\\u', env: {}, platform: 'win32', cwd: 'C:\\repo', realpath: (p) => p, existsSync: () => false };
+const bashW = (command) => evaluateBashForFiles(command, WIN).decision; // the Bash tool (Git Bash) on Windows
+const psW = (command) => evaluateBashForFiles(command, { ...WIN, shell: 'powershell' }).decision; // the PowerShell tool
+const WCLI = 'C:\\Users\\u\\.claude\\pipeline\\bin\\pipeline.mjs';
+const WHOOKS = 'C:\\Users\\u\\.claude\\pipeline\\hooks';
+
+test('on win32 a genuine PowerShell backslash path to the CLI or a hook stays trusted, one with a . or .. segment is not', () => {
+  assert.equal(psW(`node ${WCLI} preflight`), 'allow');
+  assert.equal(psW(`node "${WCLI}" preflight`), 'allow');
+  assert.equal(psW(`node '${WCLI}' preflight`), 'allow');
+  assert.equal(psW(`node ${WHOOKS}\\guard-files.mjs`), 'allow');
+  assert.equal(psW(`node ${WHOOKS}\\..\\..\\..\\tmp\\x.mjs`), 'deny');
+  assert.equal(psW(`node "${WHOOKS}\\..\\..\\..\\tmp\\x.mjs"`), 'deny');
+  assert.equal(psW('node C:\\Users\\u\\.claude\\pipeline\\bin\\..\\..\\x.mjs'), 'deny');
+  assert.equal(psW(`node ${WHOOKS}\\.\\.\\.\\tmp\\x.mjs`), 'deny');
+  assert.equal(psW(`node ${WHOOKS}\\.\\guard-files.mjs`), 'deny');
+  assert.equal(psW(`node ${WHOOKS}\\sub\\..\\guard-files.mjs`), 'deny');
+});
+
+test('on win32 the PowerShell route decides on the whole operand: anything PowerShell would expand, join or end early is not trusted', () => {
+  assert.equal(psW(`node ${WCLI}x`), 'deny', 'a different file name');
+  assert.equal(psW(`node ${WCLI}"x`), 'deny', 'a quote inside the word');
+  assert.equal(psW(`node "${WCLI}"x`), 'deny', 'text glued to the closing quote');
+  assert.equal(psW(`node '${WCLI}''x'`), 'deny', 'a doubled single quote continues the word');
+  assert.equal(psW(`node "${WHOOKS}\\$env:X\\guard-files.mjs"`), 'deny', 'an interpolated variable');
+  assert.equal(psW(`node ${WHOOKS}\\g\`uard-files.mjs`), 'deny', 'a backtick escape');
+  assert.equal(psW(`node ${WHOOKS}\\`), 'deny', 'a folder, not a file');
+});
+
+test('R8-B1: on win32 under Bash an unquoted backslash path runs a drive-relative file, so it is not the trusted CLI or hook', () => {
+  assert.equal(bashW(`node ${WCLI}`), 'deny');
+  assert.equal(bashW(`node ${WCLI} preflight`), 'deny');
+  assert.equal(bashW(`node ${WHOOKS}\\guard-files.mjs`), 'deny');
+  assert.equal(bashW(`node ${WHOOKS}\\..\\..\\..\\tmp\\x.mjs`), 'deny');
+  // a quoted one keeps its backslashes (a real Windows path), and the forward-slash spelling is the normal Bash form
+  assert.equal(bashW(`node "${WCLI}" preflight`), 'allow');
+  assert.equal(bashW('node C:/Users/u/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow');
+  assert.equal(bashW('node C:/Users/u/.claude/pipeline/hooks/guard-files.mjs'), 'allow');
+});
+
+test('R8-F1: on win32 a path cut short at an escaped space is not the trusted tool (Bash and PowerShell)', () => {
+  const fwd = 'node C:/Users/u/.claude/pipeline/hooks/a\\ ../../../../../../repo/evil.mjs C:/Users/u/.claude/settings.json';
+  const back = `node ${WHOOKS}\\a\\ ..\\..\\..\\..\\..\\..\\repo\\evil.mjs C:\\Users\\u\\.claude\\settings.json`;
+  const hook = 'node C:/Users/u/.claude/pipeline/hooks/guard-files.mjs\\ /../../../repo/evil.mjs C:/Users/u/.claude/settings.json';
+  for (const c of [fwd, back, hook]) {
+    assert.equal(bashW(c), 'deny', `Bash: ${c}`);
+    assert.equal(psW(c), 'deny', `PowerShell: ${c}`);
+  }
+});
+
+test('R8-F2: off Windows a backslash a variable carries is a name character, so the path is not the trusted hooks folder', () => {
+  for (const platform of ['darwin', 'linux']) {
+    const go = (command) => evaluateBashForFiles(command, { ...opts, platform }).decision;
+    assert.equal(go("D='a\\b'; node /home/u/.claude/pipeline/hooks/$D/../../x.mjs"), 'deny', `${platform}: two levels`);
+    assert.equal(go("D='a\\b'; node /home/u/.claude/pipeline/hooks/$D/../../../../../../x.mjs"), 'deny', `${platform}: six levels`);
+    assert.equal(go("D='a\\b'; node \"/home/u/.claude/pipeline/hooks/${D}/../../x.mjs\""), 'deny', `${platform}: quoted, braced`);
+    assert.equal(go("D='a\\b'; node /home/u/.claude/pipeline/bin/pipeline.mjs preflight"), 'allow', `${platform}: a variable the operand does not use`);
+  }
+});
+
+test('the real CLI and a real hook stay trusted through Bash forward-slash paths on every platform', () => {
+  for (const platform of ['darwin', 'linux']) {
+    const go = (command) => evaluateBashForFiles(command, { ...opts, platform }).decision;
+    assert.equal(go(`node ${REAL_CLI} preflight`), 'allow', `${platform}: CLI`);
+    assert.equal(go(`node ${REAL_HOOK}`), 'allow', `${platform}: hook`);
+  }
+  assert.equal(bashW('node C:/Users/u/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow', 'win32: CLI');
+  assert.equal(bashW('node C:/Users/u/.claude/pipeline/hooks/guard-files.mjs'), 'allow', 'win32: hook');
 });
