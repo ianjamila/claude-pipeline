@@ -9,8 +9,9 @@ import { createGitHub } from '../pipeline/lib/github.mjs';
 import { bringUpToDate, updateTiming } from '../pipeline/lib/updatebranch.mjs';
 import { readSuccessor } from '../pipeline/lib/merge-hold.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
-import { cli, scenario, ghEntries, PR, BASE_SHA } from './helpers/gate-env.mjs';
+import { cli, scenario, ghEntries, ymlFor, PR, BASE_SHA, QUEUE_AWARE_SHA } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { holdCalls, holdFiles, holdYml } from './helpers/merge-hold-env.mjs';
 
 const sha = (c) => c.repeat(40);
 const A = sha('a');
@@ -569,8 +570,12 @@ test('a "no checks reported" error that was cut at the buffer limit propagates i
 
 // ---- queue mode: the merge queue tests the PR on top of the current base itself, so a moved base needs no catch-up ------------------
 
-test('update-branch, queue ON and the branch is behind: outcome queue-mode, updated:false, exit 0, no PUT', () => {
-  const s = scenario({ gh: { behindBy: 2, queue: true } });
+// The base declares the commit that taught the merge script the queue (.claude/merge-queue-aware = QUEUE_AWARE_SHA). A branch that does not contain it may carry a
+// merge script that does not know the queue (P merge refuses it: queue-branch-predates-switch), so update-branch catches it up; one that contains it keeps the no-op answer.
+const QA = { queueAware: QUEUE_AWARE_SHA };
+
+test('update-branch, queue ON and the branch is behind but contains the marker commit: outcome queue-mode, updated:false, exit 0, no PUT', () => {
+  const s = scenario({ gh: { behindBy: 2, queue: true, ...QA } });
   const r = updateCli(s);
   assertExit(r, 0, r.stdout);
   assert.equal(r.json.ok, true);
@@ -578,7 +583,92 @@ test('update-branch, queue ON and the branch is behind: outcome queue-mode, upda
   assert.equal(r.json.updated, false);
   assert.equal(r.json.head, s.head);
   assert.deepEqual(puts(s), []);
-  assert.ok(!s.fake.lines().some((l) => l.includes('compare/')), 'the base is not even compared');
+  assert.equal(s.fake.lines().filter((l) => l.includes('compare/')).length, 1, 'only the marker commit is compared with the head');
+});
+
+test('update-branch, queue ON and the branch does NOT contain the marker commit: it is caught up like a behind PR (one PUT, expected_head_sha), reported as queueCatchUp, and no hold is taken', () => {
+  const s = scenario({ yml: holdYml(), baseFiles: holdFiles, gh: { behindBy: 2, queue: true, ...QA, queueAwareIn: false } });
+  const newHead = 'd'.repeat(40);
+  const swap = swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 0, queue: true, ...QA, commitParents: { [newHead]: [s.head, BASE_SHA] } }));
+  const r = updateCli(s, [], { PIPELINE_UPDATE_WAIT_MS: '2000', ...swap });
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.outcome, 'up-to-date');
+  assert.equal(r.json.updated, true);
+  assert.equal(r.json.queueCatchUp, true);
+  assert.match(r.json.queueCatchUpWhy, /does not contain 555555555555, the commit that taught the merge script about the queue/);
+  assert.equal(r.json.head, newHead);
+  assert.equal(r.json.pullNeeded, true);
+  assert.equal(puts(s).length, 1);
+  assert.deepEqual(JSON.parse(s.fake.calls().find((c) => c.argv.includes('PUT')).stdin), { expected_head_sha: s.head });
+  assert.deepEqual(holdCalls(s), [], 'queue mode has no merge hold: none is checked, taken or released');
+  assert.equal('hold' in r.json, false);
+});
+
+test('update-branch, queue ON and the base declares no usable marker (missing | malformed | a commit GitHub does not know): queue-mode, NO PUT (nothing on the branch can fix the base\'s marker), and the message says to add or fix it', () => {
+  for (const [why, gh, text] of [
+    ['no file', {}, /merge-queue-aware is missing/],
+    ['a malformed marker', { queueAware: 'soon' }, /does not start with a full commit sha/],
+    ['a commit the base itself does not contain', { ...QA, queueAwareIn: false, queueAwareOnBase: false }, /names 555555555555, which is not on main: fix the marker/],
+    ['a commit GitHub does not know', { ...QA, queueAwareIn: 'unknown', queueAwareOnBase: 'unknown' }, /names 555555555555, which GitHub does not know/],
+  ]) {
+    const s = scenario({ gh: { behindBy: 2, queue: true, ...gh } });
+    const r = updateCli(s);
+    assertExit(r, 0, r.stdout);
+    assert.equal(r.json.outcome, 'queue-mode', why);
+    assert.equal(r.json.updated, false, why);
+    assert.equal('queueCatchUp' in r.json, false, why);
+    assert.match(r.json.message, text, why);
+    assert.match(r.json.message, /added or fixed/, why);
+    assert.deepEqual(puts(s), [], why);
+  }
+});
+
+test('update-branch, queue ON, a head GitHub does not have (an unpushed local HEAD: the compare 404s while the base HAS the marker commit): queue-unreadable (exit 1), the message says push the head and NOT that the marker is broken, NO PUT', () => {
+  const s = scenario({ gh: { behindBy: 2, queue: true, ...QA, queueAwareIn: 'unknown' } });
+  const r = updateCli(s);
+  assertExit(r, 1, r.stdout);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.outcome, 'queue-unreadable');
+  assert.equal(r.json.updated, false);
+  assert.match(r.json.message, new RegExp(`head ${s.head.slice(0, 12)} is not on GitHub: push it first`));
+  assert.doesNotMatch(r.json.message, /marker|try again/);
+  assert.deepEqual(puts(s), []);
+});
+
+test('update-branch, queue ON, the marker or the ancestry compare is unreadable (a GitHub blip): queue-unreadable (exit 1, retry later), NO PUT', () => {
+  for (const gh of [{ queueAwareFile: 'error' }, { ...QA, queueAwareIn: 'error' }]) {
+    const s = scenario({ gh: { behindBy: 2, queue: true, ...gh } });
+    const r = updateCli(s);
+    assertExit(r, 1, r.stdout);
+    assert.equal(r.json.ok, false, JSON.stringify(gh));
+    assert.equal(r.json.outcome, 'queue-unreadable', JSON.stringify(gh));
+    assert.equal(r.json.updated, false, JSON.stringify(gh));
+    assert.match(r.json.message, /try again/, JSON.stringify(gh));
+    assert.deepEqual(puts(s), [], JSON.stringify(gh));
+  }
+});
+
+test('update-branch, queue ON, a branch at the base tip that DOES contain the marker commit: queue-mode, nothing to update', () => {
+  const s = scenario({ gh: { behindBy: 0, queue: true, ...QA } });
+  const r = updateCli(s);
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.outcome, 'queue-mode');
+  assert.deepEqual(puts(s), []);
+});
+
+test('fileAt: reads a file of the repository at a ref from GitHub (base64 contents); 404 and a non-file are "not found"; every other failure throws', () => {
+  const text = `# marker\n${A}\n`;
+  const { fake, gh } = mk([{ match: 'contents/.claude/merge-queue-aware', stdoutJson: ['file', 'base64', Buffer.from(text).toString('base64')] }]);
+  assert.deepEqual(gh.fileAt('.claude/merge-queue-aware', 'release/1'), { found: true, text });
+  assert.match(fake.lines().find((l) => l.includes('contents')), /repos\/acme\/widgets\/contents\/\.claude\/merge-queue-aware\?ref=release%2F1/);
+  assert.equal(mk([{ match: 'contents/', code: 1, stderr: 'gh: Not Found (HTTP 404)' }]).gh.fileAt('.claude/merge-queue-aware', 'main').found, false);
+  for (const odd of [['dir', null, null], ['file', 'none', 'x'], ['file', 'base64', 7], { type: 'file' }]) {
+    assert.equal(mk([{ match: 'contents/', stdoutJson: odd }]).gh.fileAt('x', 'main').found, false, JSON.stringify(odd));
+  }
+  for (const stderr of ['gh: Server Error (HTTP 502)', 'gh: HTTP 403: Resource not accessible', 'dial tcp: i/o timeout']) {
+    assert.throws(() => mk([{ match: 'contents/', code: 1, stderr }]).gh.fileAt('x', 'main'), GhError, stderr);
+  }
 });
 
 test('update-branch, queue state UNREADABLE: refuses (exit 1 queue-unreadable), never updates', () => {
@@ -596,4 +686,28 @@ test('update-branch, queue OFF and behind: updates as before (one PUT)', () => {
   const r = updateCli(s);
   assert.notEqual(r.json.outcome, 'queue-mode');
   assert.equal(puts(s).length, 1);
+});
+
+// queue mode catches up only where `P merge` would refuse: a custom merge command, and a PR that is not queued (R1-F2)
+const NO_COMMAND_YML = () => ymlFor().replace(/ {2}command: .*\n/, '');
+const ENTRY = { id: 'MQE_1', state: 'AWAITING_CHECKS', position: 1, enqueuedAt: '2026-11-09T08:00:00Z', headCommit: null };
+
+test('update-branch, queue ON, DEFAULT merge command, a branch without the marker commit: queue-mode, no PUT, no marker read (P merge never asks there)', () => {
+  const s = scenario({ yml: NO_COMMAND_YML(), gh: { behindBy: 2, queue: true, ...QA, queueAwareIn: false } });
+  const r = updateCli(s);
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.outcome, 'queue-mode');
+  assert.equal('queueCatchUp' in r.json, false);
+  assert.deepEqual(puts(s), []);
+  assert.deepEqual(s.fake.lines().filter((l) => l.includes('contents/') || l.includes('compare/')), [], 'neither the marker nor the ancestry is read');
+});
+
+test('update-branch, queue ON, the PR is ALREADY QUEUED (a failed marker read would otherwise catch up): queue-mode, no PUT (an update would drop the entry)', () => {
+  for (const gh of [{ queueAwareFile: 'error' }, { ...QA, queueAwareIn: false }, {}]) {
+    const s = scenario({ gh: { behindBy: 2, queue: true, queueEntry: ENTRY, ...gh } });
+    const r = updateCli(s);
+    assertExit(r, 0, r.stdout);
+    assert.equal(r.json.outcome, 'queue-mode', JSON.stringify(gh));
+    assert.deepEqual(puts(s), [], JSON.stringify(gh));
+  }
 });

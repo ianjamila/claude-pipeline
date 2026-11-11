@@ -336,7 +336,8 @@ test('bash: job start unwraps the inner command', () => {
 // ---- Windows --------------------------------------------------------------------------------
 
 test('bash on win32: PowerShell and cmd forms of the home path', () => {
-  const w = (cmd) => evaluateBashForFiles(cmd, { ...WIN, cwd: 'C:\\repo' }).decision;
+  // (these are PowerShell lines: the raw-text route for a backslash CLI path is for the PowerShell tool only, so the tool is named; Git Bash drops those backslashes)
+  const w = (cmd) => evaluateBashForFiles(cmd, { ...WIN, cwd: 'C:\\repo', shell: 'powershell' }).decision;
   assert.equal(w('Set-Content $env:USERPROFILE\\.claude\\settings.json x'), 'deny');
   assert.equal(w('Set-Content $ENV:userprofile\\.claude\\settings.json x'), 'deny');
   assert.equal(w('del %USERPROFILE%\\.claude\\agents\\judge.md'), 'deny');

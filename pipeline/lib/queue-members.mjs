@@ -147,9 +147,18 @@ export function queueManifest({ read, graphql, repo, defaultBranch, queueSha, qu
  * progress, so the rule is: the TOP entry must be live with the same id, queue commit, base commit and PR head; every other member
  * is either live and unchanged, or gone with its PR merged AT its own queue commit (D6) and that commit on the default branch.
  * Anything else (removed, re-created, merged at another commit, unreadable) is `ok: false` "a member's head or entry moved".
+ * A predecessor the queue merged since evaluate may not read as merged YET (GitHub lags: its PR is still open and unmerged, `retry`;
+ * eaglewatch#1771/#1784): the whole check then runs ONCE more, queue and PRs read again, as evaluate does. The re-read can only turn a
+ * failure into ok; if it does not, or cannot be made, the first finding stands.
  */
-export function recheckManifest({ read, graphql, repo, defaultBranch, manifest }) {
-  const moved = (why) => ({ ok: false, reason: `a member's head or entry moved (${why})` });
+export function recheckManifest(args) {
+  const { retry, ...first } = recheckOnce(args);
+  if (first.ok || retry !== true) return first;
+  return recheckOnce(args).ok ? { ok: true } : first;
+}
+
+function recheckOnce({ read, graphql, repo, defaultBranch, manifest }) {
+  const moved = (why, retry = false) => ({ ok: false, reason: `a member's head or entry moved (${why})`, retry });
   const got = readQueueEntries({ graphql, repo, defaultBranch });
   if (!got.ok) return got;
   const live = new Map(got.entries.map((e) => [e.id, e]));
@@ -162,8 +171,8 @@ export function recheckManifest({ read, graphql, repo, defaultBranch, manifest }
       continue;
     }
     if (m.commit === manifest.queueSha) return moved(`#${m.pr} left the queue`);
-    const why = unsettledReason({ read, repo, defaultBranch, member: m });
-    if (why !== null) return moved(why);
+    const why = unsettled({ read, repo, defaultBranch, member: m });
+    if (why !== null) return moved(why.reason, why.retry === true);
   }
   return { ok: true };
 }
@@ -184,7 +193,6 @@ function unsettled({ read, repo, defaultBranch, member: m }) {
   if (!onDefaultBranch({ read, repo, defaultBranch, sha: m.commit })) return { reason: `#${m.pr}'s merge commit is not on the default branch`, retry: false };
   return null;
 }
-const unsettledReason = (args) => unsettled(args)?.reason ?? null;
 
 /**
  * Where one manifest member stands NOW, for the poster's member check (eaglewatch#1769). GitHub empties `pull_requests` on the guard runs of a PR that merged

@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ownerSays } from './helpers/owner-go.mjs';
-import { bump, cli, scenario, ymlFor, MERGE_SHA, PR } from './helpers/gate-env.mjs';
+import { bump, cli, scenario, ymlFor, BASE_SHA, MERGE_SHA, PR, QUEUE_AWARE_SHA } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 import { renderEvent } from '../pipeline/lib/run-events.mjs';
@@ -44,15 +44,19 @@ const OUT = (events) => (h) => reply(node(h), events);
 
 const stateFile = () => join(mkdtempSync(join(tmpdir(), 'cp-queue-hold-')), 'queue.json');
 const goYml = () => ymlFor().replace(/ {2}command: .*\n/, '');
+const customYml = () => `${ymlFor()}hard_stops:
+  paths: ['src/**']
+owner_approval: chat
+`; // (the repo's own merge command: asked whether the branch knows the queue)
 const yml = () => `${goYml()}hard_stops:\n  paths: ['src/**']\nowner_approval: chat\n`;
 const unique = (repo) => { bump(repo); repo.write('.salt', randomUUID()); };
 
 // A PR held by needs-human with a merge queue on the base: the queue fake answers the GraphQL queue calls, the hold fake everything else.
-function world({ after = [], state = {}, gh = {}, env = {}, liftedChecks } = {}) {
+function world({ after = [], state = {}, gh = {}, env = {}, liftedChecks, custom = false } = {}) {
   const qfile = stateFile();
   const timing = { PIPELINE_HOLD_RETRY_MS: '1', PIPELINE_QUEUE_POLL_MS: '20', PIPELINE_QUEUE_CONFIRM_MS: '400', PIPELINE_QUEUE_CONFIRM_POLL_MS: '20', PIPELINE_QUEUE_WAIT_MS: '300', PIPELINE_MERGE_POLL_MS: '20', ...env };
   const s = scenario({
-    yml: yml(), report: null, state: null, change: unique,
+    yml: custom ? customYml() : yml(), report: null, state: null, change: unique,
     gh: {
       mergeStateStatus: 'CLEAN', labels: ['needs-human'], queue: true, ...gh,
       extra: [
@@ -339,6 +343,34 @@ test('#232 GitHub shows the record\'s head during orphan recovery and a live ent
   assert.equal(s.enqueues().length, 0);
   assert.equal(s.dequeues().length, 0);
   never(s, /--disable-auto|auto-merge/, 'auto-merge is never touched');
+});
+
+// #238: the same discharge, then GitHub blips on the first read of the PR (the owner-go flow's live scan): exit 3 (unavailable), and the owner still hears the label went back.
+test('#238 the precheck puts needs-human back, then a GitHub read of the PR throws: the unavailable output (exit 3) still carries holdRestored + holdRestoredNote', () => {
+  const s = world({ after: [] });
+  s.patch((st) => Object.assign(st, orphanState(OLD)));
+  liveRecordAtOld(s);
+  s.q.show([entryAtOld, entryAtOld, (h) => reply(node(h), [])]);
+  const wrapper = join(mkdtempSync(join(tmpdir(), 'cp-blip-')), 'gh.mjs');
+  writeFileSync(wrapper, [
+    "import { spawnSync } from 'node:child_process';",
+    "import { existsSync, readFileSync } from 'node:fs';",
+    "const log = process.env.PIPELINE_FAKE_GH_LOG;",
+    "const restored = existsSync(log) && readFileSync(log, 'utf8').includes('--add-label');",
+    "const argv = process.argv.slice(2);",
+    "if (restored && argv.join(' ').startsWith('pr view 12')) { process.stderr.write('gh: Server Error (HTTP 502)'); process.exit(1); }",
+    "const r = spawnSync(process.execPath, [process.env.WRAPPED_FAKE, ...argv], { stdio: 'inherit' });",
+    "process.exit(r.status ?? 1);",
+  ].join('\n'));
+  Object.assign(s.fake.env, { PIPELINE_GH: `node "${wrapper}"`, WRAPPED_FAKE: FAKE_QUEUE });
+  const r = s.go();
+  assertExit(r, 3, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.error, 'unavailable');
+  assert.equal(r.json.holdRestored, true, r.stdout);
+  assert.match(r.json.holdRestoredNote, /owner must say "merge" again/);
+  assert.equal(s.rec().terminal, 'head-moved', 'the old record was discharged by the precheck');
+  assert.deepEqual(s.st().labels, ['needs-human']);
+  assert.equal(s.enqueues().length, 0);
 });
 
 test('#232 GitHub shows the record\'s head during orphan recovery and this head with NO entry at the precheck: the record is discharged first (label back once), the new hold is not lifted blindly', () => {
@@ -878,4 +910,135 @@ test('R1-B3 a resumed --owner-go watch: the first failed_checks removal is re-qu
   assert.deepEqual(s.readds(), [], 'the lifted hold is not put back');
   assert.equal(s.rec().terminal, 'merged');
   assert.equal(s.rec().attempts, 2);
+});
+
+// ---- #237: the PR head moved H -> J while a live entry sits at J -------------------------------------------------------------------------
+// H's approval never covered J, so nothing here dequeues or re-queues on H's authority: H's record is replaced (one atomic write, so a crash leaves H's or J's, never
+// neither) by an orphan record for J that the sweep keeps settling, as recoverQueuedLift's does, until J's departure is confirmed.
+const J = 'f'.repeat(40);
+const entryAtJ = (position = 1) => st({ head: J, inQueue: true, entry: { id: 'MQE_J', state: 'AWAITING_CHECKS', position, enqueuedAt: '2026-11-10T08:00:00Z', headCommit: null } });
+const jGone = () => st({ head: J });
+const movedWorld = (over = {}) => {
+  const root = repoDir();
+  entryRecord(root); // H's record: a lifted hold owned by the entry
+  return { root, gh: stub({ states: [entryAtJ()], ...over }) };
+};
+
+test('#237 settleRecord: head moved with a live entry at J: the hold goes back, H\'s record is replaced by a live orphan record for J, and nothing is dequeued or enqueued', async () => {
+  const { root, gh } = movedWorld();
+  const out = await settleRecord({ gh, root, pr: 7 });
+  assert.equal(out.outcome, 'ended');
+  assert.equal(out.terminal, 'head-moved');
+  assert.equal(out.hold, 'restored');
+  assert.deepEqual(gh.labels, ['needs-human']);
+  assert.deepEqual(gh.calls, ['add needs-human'], 'no dequeue');
+  const rec = readQueueRecord(root, 7);
+  assert.equal(rec.terminal, null, 'J is tracked');
+  assert.equal(rec.head, J);
+  assert.deepEqual(rec.entryIds, ['MQE_J']);
+  assert.equal(rec.hold, null, 'H\'s hold is not carried over: the label on the PR is the hold now');
+  assert.equal(rec.approval.items, null, 'H\'s approval does not cover J');
+  assert.equal(rec.adopted.from, HEAD);
+  assert.deepEqual(liveRecords(root).map((r) => [r.pr, r.head]), [[7, J]]);
+});
+
+test('#237 the orphan record for J is settled by the sweep: a stop condition dequeues J; a failed dequeue or an unreadable confirmation leaves it live; once J is gone it ends removed', async () => {
+  const { root, gh } = movedWorld({ states: [entryAtJ()] });
+  await settleRecord({ gh, root, pr: 7 }); // adopt J (the label goes back)
+  const sweep = (g) => settleRecord({ gh: g, root, pr: 7, sleep: async () => {}, pollMs: 1 });
+  // a failed dequeue
+  let failing = true;
+  const g1 = { ...gh, queueState: () => entryAtJ(), queueEvents: () => [addedAt()], dequeue: (n) => { gh.calls.push(`dequeue ${n}`); if (failing) throw new Error('boom 502'); } };
+  const a = await sweep(g1);
+  assert.equal(a.outcome, 'unsettled', JSON.stringify(a));
+  assert.equal(readQueueRecord(root, 7).terminal, null, 'still tracked after a failed dequeue');
+  // the dequeue goes out (reads 1-2: the settle and the watch poll) but the confirmation cannot be read
+  failing = false;
+  let reads = 0;
+  const g2 = { ...g1, queueState: () => { reads += 1; if (reads > 2) throw new Error("HTTP 502"); return entryAtJ(); } };
+  const b = await sweep(g2);
+  assert.equal(b.outcome, 'unsettled', JSON.stringify(b));
+  assert.equal(readQueueRecord(root, 7).terminal, null, 'still tracked while the confirmation is unreadable');
+  // J is gone (the dequeue took)
+  let n = 0;
+  const g3 = { ...g1, queueState: () => (n++ === 0 ? entryAtJ() : jGone()), queueEvents: () => [addedAt(), evt('removed', '09:00:00', 'manual', QC1)] };
+  const c = await sweep(g3);
+  assert.equal(c.outcome, 'ended', JSON.stringify(c));
+  assert.equal(c.terminal, 'removed', 'J left (the dequeue took): reported as removed');
+  assert.equal(readQueueRecord(root, 7).terminal, 'removed');
+  assert.equal(gh.calls.filter((x) => x.startsWith('add')).length, 1, 'the label was put back once, at the adoption');
+});
+
+test('#237 the orphan record for J that merges under the restored veto is reported merged; one removed for failed checks is never re-queued (no approval of J)', async () => {
+  const merged = movedWorld();
+  await settleRecord({ gh: merged.gh, root: merged.root, pr: 7 });
+  const m = await settleRecord({ gh: stub({ states: [st({ head: J, state: 'MERGED', mergeSha: 'c'.repeat(40) })] }), root: merged.root, pr: 7 });
+  assert.equal(m.outcome, 'merged');
+  assert.equal(readQueueRecord(merged.root, 7).terminal, 'merged');
+
+  const removed = movedWorld();
+  await settleRecord({ gh: removed.gh, root: removed.root, pr: 7 });
+  let asked = 0;
+  const out = await settleRecord({
+    gh: stub({ states: [jGone()], events: [[addedAt(), removedAt('failed_checks')]] }), root: removed.root, pr: 7,
+    requeue: async () => { asked += 1; return { ok: true }; },
+  });
+  assert.equal(asked, 0, 'J is never re-queued');
+  assert.equal(out.outcome, 'ended');
+  assert.equal(out.terminal, 'removed');
+});
+
+test('#237 an interruption between putting the label back and replacing the record leaves H\'s record live: the next sweep finishes it (label already on)', async () => {
+  const { root, gh } = movedWorld();
+  const dying = ({ gh: g, pr }) => { g.addLabels(pr, ['needs-human']); throw new Error('killed'); };
+  await assert.rejects(settleRecord({ gh, root, pr: 7, restore: dying }), /killed/);
+  const mid = readQueueRecord(root, 7);
+  assert.equal(mid.terminal, null);
+  assert.equal(mid.head, HEAD, 'still H\'s record: nothing was lost');
+  const out = await settleRecord({ gh: stub({ states: [entryAtJ()], labels: ['needs-human'] }), root, pr: 7 });
+  assert.equal(out.outcome, 'ended');
+  assert.equal(out.hold, 'already-on');
+  const rec = readQueueRecord(root, 7);
+  assert.deepEqual([rec.terminal, rec.head], [null, J]);
+});
+
+test('#237 a head that moved with NO entry at J still just ends H\'s record (head-moved), as before', async () => {
+  const { root, gh } = movedWorld({ states: [jGone()] });
+  const out = await settleRecord({ gh, root, pr: 7 });
+  assert.equal(out.outcome, 'ended');
+  assert.equal(readQueueRecord(root, 7).terminal, 'head-moved');
+  assert.deepEqual(liveRecords(root), []);
+});
+
+test('#237 a head that moved whose entry cannot be read afterwards: nothing is ended or restored (the record stays live for the next sweep)', async () => {
+  const root = repoDir();
+  entryRecord(root);
+  let reads = 0;
+  const gh = stub({ states: [entryAtJ()] });
+  gh.queueState = () => { reads += 1; if (reads > 1) throw new Error('HTTP 502'); return entryAtJ(); };
+  const out = await settleRecord({ gh, root, pr: 7 });
+  assert.equal(out.outcome, 'unsettled');
+  assert.equal(readQueueRecord(root, 7).head, HEAD);
+  assert.equal(readQueueRecord(root, 7).terminal, null);
+  assert.deepEqual(gh.calls, []);
+});
+
+// ---- a branch that predates the queue is refused before the hold is lifted (cp #242 R1-F4) ----------------------------------------------------
+
+test('custom merge command + a held PR whose branch lacks the marker commit: refused right after the precheck, BEFORE the hold lift: no label event, no comment, no guard wait, nothing enqueued or run', (t) => {
+  const s = world({ custom: true, gh: { queueAware: QUEUE_AWARE_SHA } });
+  approve(t, s); // (the dry run is clean: the branch contains the marker commit when the owner says "merge")
+  // ... then GitHub answers differently at the real run (a base that moved, a branch that was never caught up): the ancestry now says the branch lacks it
+  const script = join(s.fake.dir, 'script.json');
+  s.fake.setScript([{ match: `repos/acme/widgets/compare/${QUEUE_AWARE_SHA}\\.\\.\\.`, stdoutJson: { status: 'diverged', behind_by: 0, ahead_by: 1, base: BASE_SHA } }, ...JSON.parse(readFileSync(script, 'utf8'))]);
+  const before = s.lines().length;
+  const r = s.go();
+  assertExit(r, 1, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.error, 'queue-branch-predates-switch');
+  assert.equal(r.json.queued, false);
+  const lines = s.lines().slice(before);
+  assert.deepEqual(lines.filter((l) => /-X (POST|PUT|PATCH|DELETE)|--remove-label|--add-label|statuses|check-runs|mutation Enqueue/.test(l)), [], 'nothing was written or waited for');
+  assert.deepEqual(s.st().labels, ['needs-human'], 'the label was never lifted');
+  assert.equal(s.mergeCalls().length, 0, 'the merge command never ran');
+  assert.equal(s.rec(), null, 'no record was begun');
 });

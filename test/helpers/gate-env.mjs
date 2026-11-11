@@ -22,6 +22,7 @@ export const STEPS = ['install', 'typecheck', 'lint', 'unit', 'build'];
 export const MERGE_SHA = 'c'.repeat(40);
 // The base tip GitHub's compare reports (base_commit): update-branch's merge commit must have it as second parent.
 export const BASE_SHA = '9'.repeat(40);
+export const QUEUE_AWARE_SHA = '5'.repeat(40); // the commit a test base's .claude/merge-queue-aware names (ghEntries `queueAware`)
 export const ME = { match: '^api user', stdout: 'me\n' };
 export const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
 
@@ -112,6 +113,25 @@ export function ghEntries(o) {
     // `behindBy`: how many base commits the PR head lacks (compare); 0 = up to date, which is what merge's update step expects.
     // `update`: what PUT pulls/12/update-branch answers: accepted (default) | conflict | head-moved (the two 422s) | forbidden.
     UPDATE_REPLIES[o.update ?? 'accepted'],
+    // `queueAware`: the commit the base's .claude/merge-queue-aware names (GitHub's contents API); absent = no such file (404). `queueAwareFile: 'error'` = GitHub cannot answer (502).
+    // `queueAwareIn`: whether the PR head contains that commit (the compare of it with the head): true (default) = ahead, false = diverged, 'error' = GitHub cannot answer, 'unknown' = GitHub does not know the commit (404).
+    // `queueAwareOnBase`: whether the BASE branch itself contains it (the compare of it with the base): true (default) = ahead, false = diverged, 'error' = GitHub cannot answer, 'unknown' = GitHub does not know the commit (404).
+    // These come BEFORE the generic compare below, which would answer a compare of any pair alike.
+    o.queueAwareFile === 'error'
+      ? { match: 'contents/.claude/merge-queue-aware', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
+      : o.queueAware === undefined
+        ? { match: 'contents/.claude/merge-queue-aware', code: 1, stderr: 'gh: Not Found (HTTP 404)' }
+        : { match: 'contents/.claude/merge-queue-aware', stdoutJson: ['file', 'base64', Buffer.from(`# the commit that taught scripts/merge-pr.mjs the merge queue\n${o.queueAware}\n`).toString('base64')] },
+    ...(o.queueAware !== undefined ? [o.queueAwareOnBase === 'error'
+      ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.main\\?`, code: 1, stderr: 'gh: Server Error (HTTP 502)' }
+      : o.queueAwareOnBase === 'unknown'
+      ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.main\\?`, code: 1, stderr: 'gh: Not Found (HTTP 404)' }
+      : { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.main\\?`, stdoutJson: { status: o.queueAwareOnBase === false ? 'diverged' : 'ahead', behind_by: 0, ahead_by: 1, base: BASE_SHA } }] : []),
+    ...(o.queueAware !== undefined ? [o.queueAwareIn === 'error'
+      ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.`, code: 1, stderr: 'gh: Server Error (HTTP 502)' }
+      : o.queueAwareIn === 'unknown'
+      ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.`, code: 1, stderr: 'gh: Not Found (HTTP 404)' }
+      : { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.`, stdoutJson: { status: o.queueAwareIn === false ? 'diverged' : 'ahead', behind_by: 0, ahead_by: 1, base: BASE_SHA } }] : []),
     { match: 'repos/acme/widgets/compare/', stdoutJson: { status: o.behindBy ? 'diverged' : 'ahead', behind_by: o.behindBy ?? 0, ahead_by: 1, base: o.compareBase ?? BASE_SHA } },
     // `commitParents`: { <sha>: [parent shas] } for GET commits/<sha> (the update-branch result is bound to its parents).
     ...Object.entries(o.commitParents ?? {}).map(([commit, parents]) => ({ match: `commits/${commit} --jq`, stdoutJson: parents })),
@@ -123,10 +143,10 @@ export function ghEntries(o) {
         ? { match: '^pr checks 12 .*--required$', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
         : { match: '^pr checks 12 .*--required$', stdoutJson: o.requiredCi ?? ci },
     { match: '^pr checks 12 ', stdoutJson: ci },
-    // The live merge-queue read (gh.queueState): off unless a test says `queue: true`; `queue: 'error'` = GitHub cannot answer.
+    // The live merge-queue read (gh.queueState): off unless a test says `queue: true`; `queue: 'error'` = GitHub cannot answer; `queueEntry` = the PR's live entry ({ id, state, position, enqueuedAt, headCommit }).
     o.queue === 'error'
       ? { match: 'QueueState', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
-      : { match: 'QueueState', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_node12', state: pr.state, headRefOid: o.prHead, isMergeQueueEnabled: o.queue === true, mergeCommit: null, mergeQueueEntry: null } } } } },
+      : { match: 'QueueState', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_node12', state: pr.state, headRefOid: o.prHead, isMergeQueueEnabled: o.queue === true, mergeCommit: null, mergeQueueEntry: o.queueEntry ?? null } } } } },
     { match: '^auth status', code: 0 },
     ME,
     REPO,

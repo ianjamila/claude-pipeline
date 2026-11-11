@@ -323,6 +323,22 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       return { status: body.status ?? null, behindBy: body.behind_by, aheadBy: body.ahead_by, baseSha: body.base };
     },
 
+    // A file of the repository at a ref (a branch, tag or sha), from GitHub's contents API: never the local checkout and never the PR branch unless
+    // that is the ref asked. -> { found: true, text } | { found: false, why } (404: no such file or ref; a directory or a body that is not a base64 file
+    // is "not found" too: there is no file to read). Any other failure (5xx, network, timeout) THROWS: the caller must tell "absent" from "could not look".
+    fileAt(path, ref) {
+      const args = ['api', `repos/${self.repo().slug}/contents/${encodePath(path)}?ref=${encodeURIComponent(ref)}`, '--jq', '[.type, .encoding, .content]'];
+      const r = exec(args);
+      if (r.code !== 0 || r.timedOut) {
+        const known = r.timedOut || r.overBuffer ? null : classifyApiError(r);
+        if (known?.status === 404) return { found: false, why: `${path} does not exist at ${ref}` };
+        throw failure(r, args);
+      }
+      const reply = parse(r, args);
+      if (!Array.isArray(reply) || reply[0] !== 'file' || reply[1] !== 'base64' || typeof reply[2] !== 'string') return { found: false, why: `${path} at ${ref} is not a readable file` };
+      return { found: true, text: Buffer.from(reply[2], 'base64').toString('utf8') };
+    },
+
     // The parent SHAs of a commit, in order (for a merge commit: first the branch it was made on, then what was merged in).
     commitParents(commit) {
       const text = self.apiText(`repos/${self.repo().slug}/commits/${encodeURIComponent(commit)}`, '[.parents[].sha]');

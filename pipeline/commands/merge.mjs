@@ -5,13 +5,13 @@
 // SHA (so a head that moved can never merge). It then waits for GitHub to say MERGED, re-checking the blockers on every
 // poll; anything else ends with auto-merge disabled, because an unattended queued merge could land later on a base nobody
 // verified against.
-import { EXIT, UsageError, parseCommandArgs, intOption } from '../lib/cli.mjs';
+import { EXIT, UnavailableError, UsageError, parseCommandArgs, intOption } from '../lib/cli.mjs';
 import { fill } from '../lib/config.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { withReviewLock } from '../lib/review-context.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { headSha } from '../lib/git.mjs';
-import { envWithGhDir, killTree, runShellAsync } from '../lib/proc.mjs';
+import { GhError, envWithGhDir, killTree, runShellAsync } from '../lib/proc.mjs';
 import { postEvent } from '../lib/run-events.mjs';
 import { proofLine } from '../lib/run-record.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
@@ -25,8 +25,8 @@ import {
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
 import { classifyMergeCommand, commandTail } from '../lib/merge-cleanup.mjs';
-import { QueueUnreadable, clearSessionHold, endRecord, holdOnSignal, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
-import { approvalGapSince, createQueueRoute, gateFreshSince, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
+import { QueueUnreadable, clearSessionHold, endRecord, holdOnSignal, predatesQueueMessage, queueCatchUpState, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
+import { approvalGapSince, createQueueRoute, isDefaultMergeCommand, gateFreshSince, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
 import { bestEffortSweep } from '../lib/queue-sweep.mjs';
 import { checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal, recordSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
 
@@ -46,6 +46,18 @@ const refuse = (error, reasons, extra = {}) => ({
 // `refuse` for a run whose queue precheck discharged another head's live record and put its needs-human label back: every refusal this run makes afterwards
 // also carries `carried` (holdRestored + holdRestoredNote, or the failed-restore fields), filled in from the precheck's holdFields (R1-F1).
 const refuseCarrying = (carried) => (error, reasons, extra = {}) => refuse(error, reasons, { ...carried, ...extra });
+
+// Runs a merge flow with its `carried` object (filled from the precheck's holdFields as the flow goes). A GitHub read that throws after the precheck put the label back leaves
+// through guardGh as an unavailable (exit 3) result; the carried fields go with it, since the old record is already terminal and no later run would report the restore (#238).
+async function carryingGhFailure(body) {
+  const carried = {};
+  try {
+    return await body(carried);
+  } catch (err) {
+    if (err instanceof GhError && Object.keys(carried).length > 0) throw new UnavailableError(err.message, { ...carried });
+    throw err;
+  }
+}
 
 // A merge-hold refusal (lib/merge-hold.mjs holdGate / queuedBehindRefusal, or a bringUpToDate outcome carrying one) as a merge refusal.
 // holdTaken / holdRelease / hold (step 1b: this call took the hold before its update, and what became of it) are passed through.
@@ -140,8 +152,7 @@ export const run = guarded(async (argv, ctx) => {
     return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: (track) => underReviewLock({ root, pr, ctx, fn: () => ownerGoMerge({ root, config, pr, gh, ctx, track }) }) }));
   }
 
-  return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: (track) => underReviewLock({ root, pr, ctx, fn: async () => {
-    const carried = {};
+  return guardGh(() => withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse, fn: (track) => underReviewLock({ root, pr, ctx, fn: () => carryingGhFailure(async (carried) => {
     const refuse = refuseCarrying(carried);
     // Queue mode (GitHub requires a merge queue on the base) is read live, once, after the locks; unreadable = refused, never a direct merge.
     const queue = readQueueMode({ gh, pr });
@@ -179,6 +190,9 @@ export const run = guarded(async (argv, ctx) => {
       Object.assign(carried, pre.holdFields);
       // (the record of this head already ended: the decision is judged below, once the run record says whether the owner's word is required: staleEnd)
       if (pre.watch) return watchOnly({ route, gh, pr, head: gate.head });
+      // A branch whose merge script may not know the queue is refused here, before anything else is read or written (queue-branch-predates-switch).
+      const predates = await route.checkBranch();
+      if (predates !== null) return predates;
     }
 
     // 1a. A resumed run never merges on its own: the run record (viewer-authored, so not forgeable by a commenter) says whether this
@@ -392,7 +406,7 @@ export const run = guarded(async (argv, ctx) => {
     warnings.push(...recorder.warnings);
     if (warnings.length > 0) result.output.warnings = warnings;
     return result;
-  } }) }));
+  }) }) }));
 });
 
 // `P merge --pr N --owner-go` (owner decision 2026-10-28): the merge route for work that never ran the review skill (no
@@ -449,8 +463,11 @@ async function underReviewLock({ root, pr, ctx, fn }) {
   }
 }
 
-async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
-  const carried = {};
+async function ownerGoMerge(args) {
+  return carryingGhFailure((carried) => ownerGoMergeCarrying({ ...args, carried }));
+}
+
+async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried }) {
   const refuse = refuseCarrying(carried);
   const head = headSha({ cwd: root });
   const repo = gh.repo().slug;
@@ -480,6 +497,9 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
     if (pre.done) return pre.done;
     Object.assign(carried, pre.holdFields);
     if (pre.watch) return watchOnly({ route, gh, pr, head });
+    // A branch whose merge script may not know the queue is refused here, before the live scan, the hold lift and the guard wait (queue-branch-predates-switch).
+    const predates = await route.checkBranch();
+    if (predates !== null) return predates;
   }
   // A merge hold ahead of this PR is answered next, before the live check: a stale PR behind an older hold would otherwise fail it
   // with "behind-base ... update the branch", which is exactly what the hold says NOT to do.
@@ -640,6 +660,14 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   else if (queue.on) {
     if (queue.state.state === 'MERGED') add('queueState', `PR #${pr} is already merged`);
     else if (queue.state.entry) add('queueState', `PR #${pr} is already queued at position ${queue.state.entry.position}`);
+    // A repo's own merge command runs the branch's code: a branch older than the queue may carry a script that does not know it (the real run refuses; so no merge is asked for).
+    if (!isDefaultMergeCommand(config)) {
+      const old = queueCatchUpState({ gh, branch: config.default_branch, head });
+      // The same split as the real run (queue-route): a read that failed is queue-unreadable (try again; the branch may be current), every other verdict is the
+      // branch refusal, carrying the branchState the skill reads to choose between a catch-up (predates) and a fix of the base's marker (unknown).
+      if (old.needed && old.unreadable) add('queue-unreadable', predatesQueueMessage({ pr, state: old }));
+      else if (old.needed) Object.assign(add('queue-branch-predates-switch', predatesQueueMessage({ pr, state: old })), { branchState: old.kind, queueAwareSha: old.queueAwareSha });
+    }
   }
   const qm = queue.on ? { queueMode: true } : {};
 

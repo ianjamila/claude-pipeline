@@ -63,7 +63,7 @@ async function main() {
     const cwd = typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd();
     const opts = { home: os.homedir(), env: process.env, platform: process.platform };
     const verdict = isShell
-      ? evaluateBashForFiles(input.tool_input?.command, { ...opts, cwd })
+      ? evaluateBashForFiles(input.tool_input?.command, { ...opts, cwd, shell: tool === 'PowerShell' ? 'powershell' : 'bash' })
       : evaluateFileTool({ ...input, cwd }, opts);
     if (verdict?.decision === 'deny') {
       deny(verdict.reason);

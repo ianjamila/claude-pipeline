@@ -35,6 +35,101 @@ export function queueModeFor({ gh, pr }) {
   return { queue: state.enabled === true, state };
 }
 
+// ---- a branch that does not hold the commit that taught the merge script the queue --------------------------------------------------------
+// A repo's own merge command (merge.command, run from the PR's worktree) is the PR BRANCH's code. A branch whose script does not know the queue
+// "merges" directly, GitHub queues the PR instead, the old script reads that as merged and runs its after-merge cleanup (it deleted the head
+// branch of eaglewatch #1735, and GitHub closed the PR). The repo's own config on the branch cannot guard this, because an old branch also carries
+// the old config. So the question is not WHEN the queue was switched on but whether the PR's branch contains the commit that made the merge script
+// queue-aware, and the BASE branch is what says which commit that is: the plain file `.claude/merge-queue-aware` (first line that is not a `#`
+// comment = the full 40-hex sha), read from the base branch through GitHub (never from the branch itself or the local checkout). Then GitHub's
+// compare answers whether that sha is an ancestor of the PR head (status ahead | identical = contained; behind | diverged = not). It is a file of its
+// own, not a pipeline.yml key, because the config rejects keys it does not know: a new key would break every installed pipeline on rollout.
+//
+// -> { needed, kind: 'current' | 'predates' | 'unknown', why, queueAwareSha, unreadable }. Never throws. `unknown` = the base declares no usable commit
+// (no file, not a sha, a sha GitHub does not know or one the base itself does not contain) or a read failed; a head GitHub does not have (an unpushed local head: a 404 on the compare while the base has the sha) is unreadable with `headUnknown: true` (push it first, never a marker fix); `unreadable: true` is the second kind only: a read that THREW (a GitHub blip) may well succeed next time, a
+// missing or malformed marker will not. merge and the sweep answer queue-unreadable on an unreadable read (any record is kept) and refuse on every other `needed`; update-branch catches up only for `predates`.
+export const QUEUE_AWARE_FILE = '.claude/merge-queue-aware';
+
+// The sha a marker file declares: the first line that is neither empty nor a `#` comment, which must be a full sha. -> string | null.
+export function parseQueueAwareMarker(text) {
+  for (const raw of String(text ?? '').replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    return /^[0-9a-f]{40}$/i.test(line) ? line.toLowerCase() : null;
+  }
+  return null;
+}
+
+export function queueCatchUpState({ gh, branch, head }) {
+  const reply = (kind, why, extra = {}) => ({ needed: kind !== 'current', kind, why, queueAwareSha: null, unreadable: false, ...extra });
+  const oneLine = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 200);
+  const notFound = (err) => /HTTP 404/.test(String(err?.stderr ?? err?.message ?? err));
+  let marker;
+  try {
+    if (typeof gh?.fileAt !== 'function') throw new Error('this GitHub client cannot read a file of the base branch');
+    marker = gh.fileAt(QUEUE_AWARE_FILE, branch);
+  } catch (err) {
+    return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} could not be read (${oneLine(err)})`, { unreadable: true });
+  }
+  if (marker?.found !== true) return reply('unknown', `${branch} declares no commit that taught the merge script about the queue (${QUEUE_AWARE_FILE} is missing on ${branch})`);
+  const sha = parseQueueAwareMarker(marker.text);
+  if (sha === null) return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} does not start with a full commit sha`);
+  let rel;
+  try {
+    if (typeof gh?.compare !== 'function') throw new Error('this GitHub client cannot compare commits');
+    rel = gh.compare(sha, head);
+  } catch (err) {
+    if (notFound(err)) {
+      // GitHub answers 404 for a compare when EITHER side is unknown to it, so the marker is not necessarily the culprit: an unpushed local head (update-branch and the
+      // dry run pass the worktree's own HEAD) 404s just the same. One more read tells them apart: if the base has the marker commit, the HEAD is the unknown side.
+      let onBase;
+      try {
+        onBase = gh.compare(sha, branch);
+      } catch (err2) {
+        if (notFound(err2)) return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} names ${sha.slice(0, 12)}, which GitHub does not know`, { queueAwareSha: sha });
+        return reply('unknown', `the commit ${sha.slice(0, 12)} could not be compared with ${branch} on GitHub (${oneLine(err2)})`, { queueAwareSha: sha, unreadable: true });
+      }
+      if (onBase?.status === 'ahead' || onBase?.status === 'identical') {
+        // Fail closed, and not the base's to fix: push the head (or correct --expect-head) and ask again, so it is unreadable-style (retry), never a catch-up.
+        return reply('unknown', `head ${String(head).slice(0, 12)} is not on GitHub: push it first`, { queueAwareSha: sha, unreadable: true, headUnknown: true });
+      }
+      if (onBase?.status === 'behind' || onBase?.status === 'diverged') return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} names ${sha.slice(0, 12)}, which is not on ${branch}: fix the marker`, { queueAwareSha: sha });
+      return reply('unknown', `GitHub's comparison of ${sha.slice(0, 12)} with ${branch} answered ${JSON.stringify(onBase?.status ?? null)}`, { queueAwareSha: sha, unreadable: true });
+    }
+    return reply('unknown', `the commit ${sha.slice(0, 12)} could not be compared with ${String(head).slice(0, 12)} on GitHub (${oneLine(err)})`, { queueAwareSha: sha, unreadable: true });
+  }
+  if (rel?.status === 'ahead' || rel?.status === 'identical') return reply('current', `the branch contains ${sha.slice(0, 12)}, the commit that taught the merge script about the queue`, { queueAwareSha: sha });
+  if (rel?.status === 'behind' || rel?.status === 'diverged') {
+    // GitHub's compare resolves ANY commit of the repository, a PR-branch commit that was squashed or rebased when it landed included, so a sha the BASE does not
+    // contain passes "GitHub knows it" and then every branch would read as predating, with a catch-up that can never clear it. One more read tells the two apart:
+    // the base lacking its own marker commit is the base's mistake (structural, no catch-up), a branch lacking a commit the base has is the branch's.
+    let onBase;
+    try {
+      onBase = gh.compare(sha, branch);
+    } catch (err) {
+      return reply('unknown', `the commit ${sha.slice(0, 12)} could not be compared with ${branch} on GitHub (${oneLine(err)})`, { queueAwareSha: sha, unreadable: true });
+    }
+    if (onBase?.status === 'behind' || onBase?.status === 'diverged') return reply('unknown', `${QUEUE_AWARE_FILE} on ${branch} names ${sha.slice(0, 12)}, which is not on ${branch}: fix the marker`, { queueAwareSha: sha });
+    if (onBase?.status !== 'ahead' && onBase?.status !== 'identical') return reply('unknown', `GitHub's comparison of ${sha.slice(0, 12)} with ${branch} answered ${JSON.stringify(onBase?.status ?? null)}`, { queueAwareSha: sha, unreadable: true });
+    return reply('predates', `the branch does not contain ${sha.slice(0, 12)}, the commit that taught the merge script about the queue (compare: ${rel.status})`, { queueAwareSha: sha });
+  }
+  return reply('unknown', `GitHub's comparison of ${sha.slice(0, 12)} with the branch answered ${JSON.stringify(rel?.status ?? null)}`, { queueAwareSha: sha, unreadable: true });
+}
+
+// The refusal text of P merge for a branch whose merge script may not know the queue (kind predates | unknown). Only 'predates' is remedied by a catch-up: an
+// 'unknown' verdict is decided by the BASE's marker (or a failed read), so updating the branch cannot clear it, and the text must not send the agent to do that.
+export function predatesQueueMessage({ pr, state }) {
+  if (state.headUnknown === true) return `PR #${pr}'s branch could not be checked against the commit that taught the merge script about the merge queue: ${state.why} (GitHub does not have the head being checked; nothing was queued and the merge command was not run). Push the branch, then run \`P merge\` again; updating the branch or editing the marker does not help.`;
+  const risk = 'it could take the queue\'s "queued" answer for "merged" and delete the branch. Nothing was queued and the merge command was not run.';
+  if (state.kind === 'predates') {
+    return `PR #${pr}'s branch does not contain ${state.queueAwareSha.slice(0, 12)}, the commit that taught the merge script about the merge queue (the base branch declares it in ${QUEUE_AWARE_FILE}), so the merge script on the branch may not know about the queue: ${risk} Catch the branch up first: \`P update-branch --pr ${pr}\` from the PR's own worktree, run a review round (base-only), \`P review-complete\`, then ask the owner again.`;
+  }
+  const lead = `PR #${pr}'s branch cannot be shown to contain the commit that taught the merge script about the merge queue (${state.why}; the base branch declares that commit, a full sha, in ${QUEUE_AWARE_FILE}), so the merge script on the branch may not know about the queue: ${risk}`;
+  return state.unreadable
+    ? `${lead} GitHub could not be read just now: try again in a minute (updating the branch does not help).`
+    : `${lead} Updating the branch does not help, because the base decides this: add or fix the marker on the base branch (the plain file ${QUEUE_AWARE_FILE}, the full sha of the commit as it landed there), then run \`P merge\` again.`;
+}
+
 // ---- the queue's own settings ------------------------------------------------------------------------------------------------------
 
 const numberOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -262,10 +357,26 @@ export function endRecord(root, pr, terminal, { now = Date.now } = {}) {
   });
 }
 
+// The PR head moved off a live record's head (H) to J while a live queue entry sits at J (#237). H's approval never covered J, so J is neither dequeued nor re-queued
+// on H's authority; but it must not go untracked either. H's record is REPLACED, in one atomic write (so a crash leaves H's record or J's, never neither), by an orphan
+// record for J with no approval, no hold (the label on the PR is the hold now: H's was put back first) and `adopted` set: the sweep keeps settling it, with the same
+// stop conditions and confirmed dequeue as any entry, until J's departure is confirmed; mayRequeue never re-queues it. Same shape as recoverQueuedLift's record.
+export function adoptHeadMoved(root, pr, { head, entryId, now = Date.now }) {
+  const old = readQueueRecord(root, pr);
+  if (old === null || old.terminal !== null) throw new QueueRecordUnreadable(`no live merge-queue record for PR #${pr}`);
+  return writeRecord(root, {
+    pr: Number(pr), repo: old.repo, repoId: old.repoId, root: old.root, head,
+    approval: { items: null, areas: null, rulings: null },
+    route: null, createdAt: isoOf(now), attempts: 1, pending: null, entryIds: typeof entryId === 'string' ? [entryId] : [], removals: [], hold: null, terminal: null, terminalAt: null,
+    adopted: { from: old.head, at: isoOf(now) },
+  });
+}
+
 // One automatic re-queue per head, and only after a CONFIRMED group-check failure: exactly one such removal on the record. The count
 // is of removals, not attempts, so an enqueue that never landed (dropped by reconcile) spends nothing.
 export function mayRequeue(rec, head, reason) {
-  return rec != null && rec.head === head && REQUEUE_REASONS.has(reason) && rec.removals.filter((r) => r.reason === REASON_GROUP_CHECKS).length === 1;
+  // (an adopted record, #237, is tracked for a head nobody approved: it is never re-queued)
+  return rec != null && !rec.adopted && rec.head === head && REQUEUE_REASONS.has(reason) && rec.removals.filter((r) => r.reason === REASON_GROUP_CHECKS).length === 1;
 }
 
 // ---- reconcile ---------------------------------------------------------------------------------------------------------------------
@@ -500,7 +611,8 @@ export async function settleRecord({ gh, root, pr, now = Date.now, sleep = defau
 
   // An unmerged end: the owned hold goes back (not when a label is on already = a new hold), then the record ends. A restore that fails
   // keeps the record open, so the next settle tries again.
-  const finish = (kind, message, extra = {}) => {
+  // `adopt` ({ head, entryId }, #237): instead of ending, the record is replaced by the orphan record for the live entry at the new head (adoptHeadMoved).
+  const finish = (kind, message, extra = {}, adopt = null) => {
     const cur = readQueueRecord(root, pr);
     let hold = 'none';
     if (cur.terminal === null && cur.hold !== null) {
@@ -512,7 +624,10 @@ export async function settleRecord({ gh, root, pr, now = Date.now, sleep = defau
       }
       hold = res.status;
     }
-    if (cur.terminal === null) endRecord(root, pr, kind, { now });
+    if (cur.terminal === null) {
+      if (adopt) adoptHeadMoved(root, pr, { ...adopt, now });
+      else endRecord(root, pr, kind, { now });
+    }
     const text = `PR #${pr} ${message}${hold === 'restored' ? `; needs-human is back on it (${RESTORE_NOTE})` : ''}`;
     say(text);
     return { outcome: 'ended', terminal: kind, hold, message: text, rec: readQueueRecord(root, pr), ...extra };
@@ -547,10 +662,25 @@ export async function settleRecord({ gh, root, pr, now = Date.now, sleep = defau
     return { outcome: 'unsettled', rec, why: 'GitHub shows no queue entry and no removal for an attempt the record counts' };
   };
 
+  // The PR head moved off the record's. A live entry at the new head is tracked from here on (never dequeued or re-queued on this record's approval): see adoptHeadMoved.
+  // GitHub is asked once more for it (reconcile's answer names only the new head); an unreadable answer leaves the record live (ending it could lose the entry).
+  const movedOff = () => {
+    const base = `head moved off the approved ${rec.head.slice(0, 12)}`;
+    let now1;
+    try {
+      now1 = gh.queueState(pr);
+    } catch (err) {
+      return { outcome: 'unsettled', rec: readQueueRecord(root, pr), why: `${base}, but the merge queue could not be read to see whether an entry sits at the new head (${msgOf(err)})` };
+    }
+    if (now1.state !== 'OPEN' || !now1.entry || typeof now1.head !== 'string' || now1.head === rec.head) return finish('head-moved', base);
+    const adopt = { head: now1.head, entryId: now1.entry.id ?? null };
+    return finish('head-moved', `${base} and the PR is in the merge queue at ${now1.head.slice(0, 12)}, which nobody approved: it is not dequeued or merged on the old approval, and \`queue-sweep\` keeps tracking that entry`, { adopted: adopt }, adopt);
+  };
+
   const fromWatch = async (w) => {
     if (w.state === 'merged') return mergedOut(w.mergeSha, w.warning);
     if (w.state === 'closed') return finish('closed', 'was closed without merging');
-    if (w.state === 'head-moved') return finish('head-moved', `head moved off the approved ${rec.head.slice(0, 12)}`);
+    if (w.state === 'head-moved') return movedOff();
     if (w.state === 'removed') return gone(w.removal);
     if (w.state === 'blocked') {
       if (w.dequeued === false) return { outcome: 'unsettled', rec: readQueueRecord(root, pr), why: `a stop condition appeared (${(w.problems ?? []).join('; ')}) but the dequeue is not confirmed` };
@@ -569,7 +699,7 @@ export async function settleRecord({ gh, root, pr, now = Date.now, sleep = defau
   switch (r.kind) {
     case 'merged': return mergedOut(r.mergeSha, r.mergeSha ? undefined : 'GitHub did not report the merge commit');
     case 'closed': return finish('closed', 'was closed without merging');
-    case 'head-moved': return finish('head-moved', `head moved off the approved ${rec.head.slice(0, 12)}`);
+    case 'head-moved': return movedOff();
     case 'removed':
       noteRemoval(root, pr, r.removal);
       return gone(r.removal);

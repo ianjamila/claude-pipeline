@@ -5,7 +5,13 @@ import { parseArgs } from 'node:util';
 export const EXIT = Object.freeze({ OK: 0, FAILED: 1, USAGE: 2, UNAVAILABLE: 3 });
 
 export class UsageError extends Error {}
-export class UnavailableError extends Error {}
+// `extra`: fields a command wants in the exit-3 output besides the message (a notice that must not be lost when a read fails late: merge's holdRestored).
+export class UnavailableError extends Error {
+  constructor(message, extra = {}) {
+    super(message);
+    this.extra = extra;
+  }
+}
 
 // Parse argv for one command. `options` uses node:util parseArgs syntax; unknown flags are
 // usage errors rather than silently ignored, because a typo'd safety flag must not pass.
@@ -45,6 +51,6 @@ export function emit({ exitCode = EXIT.OK, output = {}, compact = false, silent 
 
 export function errorResult(err) {
   if (err instanceof UsageError) return { exitCode: EXIT.USAGE, output: { ok: false, error: 'usage', message: err.message } };
-  if (err instanceof UnavailableError) return { exitCode: EXIT.UNAVAILABLE, output: { ok: false, error: 'unavailable', message: err.message } };
+  if (err instanceof UnavailableError) return { exitCode: EXIT.UNAVAILABLE, output: { ...err.extra, ok: false, error: 'unavailable', message: err.message } };
   return { exitCode: EXIT.USAGE, output: { ok: false, error: 'internal', message: String(err?.stack || err) } };
 }
