@@ -9,19 +9,27 @@
 // All decisions live in pipeline/lib/installer.mjs; this file does the disk work, the report and the exit code.
 // PIPELINE_INSTALL_NO_PROBES=1 skips the claude/codex/gh version probes (tests and CI).
 // PIPELINE_INSTALL_RETIRED_SKILLS=a,b (a test seam: honoured only with PIPELINE_TEST_MODE=1, like the other seams) adds skill names to I.RETIRED_SKILLS.
+// --require-no-live-reviews (the unattended `pipeline update --scheduled`, plan 2026-11-10 B1): see "admission" below. Exit codes: 0 ok, 1 failed (also a
+// failed own verification, and an --expect-installed mismatch), 2 refused (usage, wrong home, inside Claude Code), 3 deferred (something is live, the scan
+// overran its deadline, or another update holds admission). Test seams, all honoured only by a checkout WITH PIPELINE_TEST_MODE=1:
+//   PIPELINE_INSTALL_ACCOUNT_HOME=DIR   stands in for the account's home in the --require-no-live-reviews home check
+//   PIPELINE_INSTALL_SCAN_DELAY_MS=N    sleep N ms before the live-work scan (proves the deadline)
+//   PIPELINE_INSTALL_SWAP_GATE=DIR      just before the first unit swap, write DIR/reached and wait (up to 60 s) for DIR/go
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { run, seamFlag, seamValue } from './pipeline/lib/proc.mjs';
-import { expandHome, isInside, safeTimestamp } from './pipeline/lib/paths.mjs';
+import { accountHome, canonicalPath, expandHome, isInside, safeTimestamp, samePath } from './pipeline/lib/paths.mjs';
 // `pipeline update` (commands/update.mjs installerAcceptsPrivateTmpSource) detects this import to know the installer accepts its download.
 import { TMP_ROOT_REL } from './pipeline/lib/private-tmp.mjs';
 import * as I from './pipeline/lib/installer.mjs';
 import { hasClaudeCodeAncestor } from './pipeline/lib/claude-ancestry.mjs';
 import { tryAcquire, release } from './pipeline/lib/locks.mjs';
-import { fileProvenance } from './pipeline/lib/identity.mjs';
+import { fileProvenance, installedIdentity } from './pipeline/lib/identity.mjs';
+import { ScanDeadline, scanLiveWork } from './pipeline/lib/live-work-scan.mjs';
+import { acquireAdmission, releaseAdmission, sweepDeadLeases } from './pipeline/lib/review-lease.mjs';
 import { stacksUninstall } from './pipeline/lib/stacks/uninstall.mjs';
 import { stacksSeam } from './pipeline/lib/stacks/paths.mjs';
 import { queueSweepSchedule } from './pipeline/lib/queue-sweep-schedule.mjs';
@@ -256,6 +264,20 @@ function loadPlan(source) {
   return plan;
 }
 
+// ---- test seams (PIPELINE_TEST_MODE=1 and a checkout only) ------------------------------------------------------
+
+const seamOpts = { root: fileURLToPath(new URL('./pipeline', import.meta.url)) };
+const testSeam = (name, env) => (seamFlag('PIPELINE_TEST_MODE', env, seamOpts) ? seamValue(name, env, seamOpts) : undefined);
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+// Lets a test hold the installer exactly where the swap would start: DIR/reached appears, the run waits for DIR/go (60 s at most).
+function testSwapGate(env) {
+  const dir = testSeam('PIPELINE_INSTALL_SWAP_GATE', env);
+  if (!dir) return;
+  fs.writeFileSync(path.join(dir, 'reached'), `${process.pid}\n`);
+  for (let i = 0; i < 1200 && !fs.existsSync(path.join(dir, 'go')); i++) sleepSync(50);
+}
+
 // ---- install -----------------------------------------------------------------------------------------------
 
 function doInstall(ctx) {
@@ -300,6 +322,7 @@ function doInstall(ctx) {
   let unchanged = 0;
   const foreignBackups = [];
   const editBackups = [];
+  testSwapGate(ctx.env);
   try {
     for (const unit of plan.units) {
       if (states.get(unit.rel) === 'same') {
@@ -492,6 +515,10 @@ function formatReport(r) {
       for (const k of u.kept) lines.push(`    kept ${k}: claude-pipeline did not install it`);
     }
     if (r.queueSweep?.installed) lines.push('  queue:     sweep LaunchAgent com.claude-pipeline.queue-sweep installed (every 10 minutes)');
+    if (r.verify) {
+      lines.push(`  verify:    ${r.verify.ok ? 'no drift' : `DRIFT after the install (${r.verify.drift.length})`}`);
+      for (const d of r.verify.drift.slice(0, MAX_DRIFT_LINES)) lines.push(`    - ${d.message}`);
+    }
     lines.push(...formatDiagnostics(r.diagnostics));
   } else if (r.mode === 'uninstall') {
     lines.push(`claude-pipeline uninstalled from ${r.home}`);
@@ -548,9 +575,47 @@ function prune(dirs) {
   }
 }
 
+// ---- --expect-installed ------------------------------------------------------------------------------------------
+
+// `pipeline update --scheduled` decides to install onto a clean install of one commit, then downloads for minutes. This is its re-check, made with the
+// install lock held and before anything is written (a check outside the lock leaves a window). Ported from #67, with the same identity rules as
+// pipeline/commands/update.mjs: only a complete install of exactly `sha`, built from a clean checkout and with nothing modified, missing or added, matches.
+// null when it still matches; otherwise { installed: <sha|null>, reason }.
+function installMismatch(home, sha) {
+  const id = installedIdentity(home);
+  if (!id) return { installed: null, reason: 'nothing is installed there any more' };
+  const unclean = !id.complete || id.sourceDirty || id.modified.length > 0 || id.missing.length > 0 || (id.extra?.length ?? 0) > 0 || (id.scanError?.length ?? 0) > 0;
+  if (id.sourceSha !== sha) return { installed: id.sourceSha, reason: `the installed commit is ${id.sourceSha ? id.sourceSha.slice(0, 7) : 'unknown'}, not the ${sha.slice(0, 7)} the update was planned for` };
+  if (unclean) return { installed: id.sourceSha, reason: `the installed copy ${id.stamp} was modified or is incomplete since the update was planned` };
+  return null;
+}
+
+// ---- admission ---------------------------------------------------------------------------------------------------
+
+// --require-no-live-reviews only ever targets the account's own claude-home (<accountHome()>/.claude, real paths compared): it is the unattended
+// path, and a home elsewhere has no review leases to protect. accountHome() is the passwd home, never $HOME.
+function accountClaudeHome(env) {
+  const base = testSeam('PIPELINE_INSTALL_ACCOUNT_HOME', env) || accountHome();
+  return path.join(base, '.claude');
+}
+
+const DEFAULT_DEADLINE_MS = 120_000;
+const ADMISSION_WAIT_MS = 20_000;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// What the exit-3 answer says. Always JSON on stdout (the updater parses it), one plain line on stderr.
+function deferred(reason, live, extra = {}) {
+  const body = { ok: false, deferred: true, reason, live, ...extra };
+  const what = live.length > 0 ? live.slice(0, 3).map((e) => `${e.kind}${e.repo ? ` ${e.repo}` : ''}${e.pr ? ` #${e.pr}` : ''}${e.worktree ? ` (${e.worktree})` : ''}`).join('; ') : reason;
+  process.stderr.write(`install.mjs: deferred (${reason}): ${what}${live.length > 3 ? ` and ${live.length - 3} more` : ''}. Nothing was changed.\n`);
+  process.stdout.write(`${JSON.stringify(body, null, 2)}\n`);
+  return 3;
+}
+
 // ---- main --------------------------------------------------------------------------------------------------
 
-function main(argv, env) {
+async function main(argv, env) {
+  const startedAt = Date.now();
   const { opts, help, error } = I.parseArgs(argv);
   if (help) { process.stdout.write(`${I.usageText()}\n`); return 0; }
   if (error) { process.stderr.write(`install.mjs: ${error}\n\n${I.usageText()}\n`); return 2; }
@@ -569,14 +634,59 @@ function main(argv, env) {
   const home = path.resolve(expandHome(opts.claudeHome || env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')));
   const source = path.resolve(expandHome(opts.source || path.dirname(fileURLToPath(import.meta.url))));
   const ctx = { opts, home, source, env };
+  if (opts.requireNoLiveReviews) {
+    const account = accountClaudeHome(env);
+    if (!samePath(canonicalPath(home), canonicalPath(account))) {
+      process.stderr.write(`install.mjs: --require-no-live-reviews only installs into the account's own claude-home (${account}); ${home} is not it. Nothing was changed.\n`);
+      return 2;
+    }
+  }
+  const deadlineAt = startedAt + (opts.deadlineMs ?? DEFAULT_DEADLINE_MS);
   let lock = null;
+  let admission = null;
   let created = [];
   try {
     if (!opts.check) {
       created = env.PIPELINE_LOCK_DIR ? [] : willCreate(home);
       lock = takeWriteLock(home, env);
     }
+    if (opts.expectInstalled) {
+      const mismatch = installMismatch(home, opts.expectInstalled);
+      if (mismatch) {
+        process.stderr.write(`install.mjs: expect-installed-mismatch: ${mismatch.reason}. Nothing was changed.\n`);
+        process.stdout.write(`${JSON.stringify({ ok: false, error: 'expect-installed-mismatch', installed: mismatch.installed, expected: opts.expectInstalled, message: mismatch.reason }, null, 2)}\n`);
+        return 1;
+      }
+    }
+    if (opts.requireNoLiveReviews) {
+      // Lock order: install lock (held) -> admission -> scan. Admission is taken by THIS process and released only in the finally below, so a killed
+      // parent (the scheduled `pipeline update`) cannot release it: no review is admitted until the swap and the verification are over.
+      try {
+        admission = await acquireAdmission({ env, waitMs: Math.max(0, Math.min(ADMISSION_WAIT_MS, deadlineAt - Date.now())) });
+      } catch (err) {
+        if (err?.code === 'update-in-progress') return deferred('admission-busy', [], { message: err.message });
+        throw err;
+      }
+      const delay = Number(testSeam('PIPELINE_INSTALL_SCAN_DELAY_MS', env));
+      if (Number.isFinite(delay) && delay > 0) await sleep(delay);
+      let live;
+      try {
+        await sweepDeadLeases({ env });
+        live = scanLiveWork({ env, deadlineAt });
+        if (Date.now() > deadlineAt) throw new ScanDeadline();
+      } catch (err) {
+        if (err instanceof ScanDeadline) return deferred('deadline', [], { message: err.message, deadlineMs: opts.deadlineMs ?? DEFAULT_DEADLINE_MS });
+        throw err;
+      }
+      if (live.length > 0) return deferred('live', live);
+    }
     const report = opts.check ? doCheck(ctx) : opts.uninstall ? doUninstall(ctx) : doInstall(ctx);
+    if (opts.requireNoLiveReviews && report.ok) {
+      // The installer's own verification runs while admission is still held.
+      const verify = doCheck(ctx);
+      report.verify = { ok: verify.ok, drift: verify.drift };
+      if (!verify.ok) { report.ok = false; report.error = 'verify-failed'; }
+    }
     process.stdout.write(opts.json ? `${JSON.stringify(report, null, 2)}\n` : formatReport(report));
     return report.ok ? 0 : 1;
   } catch (err) {
@@ -586,6 +696,9 @@ function main(argv, env) {
     if (opts.json) process.stdout.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
     return exitCode;
   } finally {
+    if (admission) {
+      try { releaseAdmission(admission); } catch { /* a stuck lock is reclaimed once this process is gone */ }
+    }
     if (lock) {
       try { release(lock); } catch { /* a stuck lock is reclaimed once this process is gone */ }
       prune(created);
@@ -593,4 +706,4 @@ function main(argv, env) {
   }
 }
 
-process.exitCode = main(process.argv.slice(2), process.env);
+process.exitCode = await main(process.argv.slice(2), process.env);

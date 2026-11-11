@@ -105,6 +105,10 @@ const guardFiles = (home) => ({
 const sessionVersion = (home) => ({
   hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'session-version.mjs')], timeout: 10 }],
 });
+// The update notice (B4): a plain SessionStart handler, own group, no matcher, never the fail-closed loader.
+const updateNotice = (home) => ({
+  hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'update-notice.mjs')], timeout: 5 }],
+});
 // #58: the owner-go recorder, on UserPromptSubmit, started without the fail-closed loader (it must never block a prompt)
 const ownerGo = (home) => ({
   hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'owner-go.mjs')], timeout: 10 }],
@@ -195,7 +199,7 @@ test('fresh install into an empty home (path with a space): files, manifest, hoo
   const s = readSettings(home);
   assert.deepEqual(s.hooks.PreToolUse, [...stackRegisters(home), guardGit(home), guardFiles(home)]);
   assert.deepEqual(s.hooks.PostToolUse, [stackDevBind(home)]);
-  assert.equal('SessionStart' in s.hooks, false, 'nothing is written to SessionStart');
+  assert.deepEqual(s.hooks.SessionStart, [updateNotice(home)], 'the update notice is the only SessionStart entry');
   assert.equal(existsSync(join(home, 'pipeline', 'hooks', 'session-version.mjs')), false);
   assert.deepEqual(s.hooks.SessionEnd, [stackSessionEnd(home)]);
   assert.deepEqual(s.permissions.allow, allowEntries(home));
@@ -235,6 +239,7 @@ test('existing settings: every other key survives unchanged, ours is appended on
   expected.hooks.PostToolUse.push(stackDevBind(home)); // (after the owner's tab-event.sh and memory-index.js)
   expected.hooks.SessionEnd.push(stackSessionEnd(home)); // (after the owner's heartbeat.mjs)
   expected.hooks.UserPromptSubmit.push(ownerGo(home)); // (after the owner's own)
+  expected.hooks.SessionStart.push(updateNotice(home)); // (after the owner's echo start)
   expected.permissions.allow.push(...allowEntries(home));
   assert.deepEqual(after, expected);
   assert.deepEqual(Object.keys(after), Object.keys(before), 'top-level key order is preserved');
@@ -313,6 +318,7 @@ test('an older install in the string command form is replaced, not duplicated', 
   expected.hooks.PostToolUse.push(stackDevBind(home));
   expected.hooks.SessionEnd.push(stackSessionEnd(home));
   expected.hooks.UserPromptSubmit.push(ownerGo(home)); // (after the owner's own)
+  expected.hooks.SessionStart.push(updateNotice(home));
   expected.permissions.allow.push(...allowEntries(home));
   assert.deepEqual(after, expected);
 });
@@ -864,7 +870,7 @@ test('renameWithRetry retries EPERM/EBUSY on Windows only, gives up after the at
 
 test('parseArgs reads every flag, both --flag value and --flag=value', () => {
   const a = parseArgs(['--claude-home', '/h', '--source=/s', '--check', '--skip-file-guard', '--force', '--json']);
-  assert.deepEqual(a.opts, { claudeHome: '/h', source: '/s', check: true, uninstall: false, skipFileGuard: true, force: true, json: true });
+  assert.deepEqual(a.opts, { claudeHome: '/h', source: '/s', check: true, uninstall: false, skipFileGuard: true, force: true, json: true, requireNoLiveReviews: false, expectInstalled: null, deadlineMs: null });
   assert.equal(parseArgs(['--uninstall']).opts.uninstall, true);
   assert.ok(parseArgs(['--nope']).error);
   assert.ok(parseArgs(['--source']).error);
@@ -1228,7 +1234,8 @@ function makeOldShape(home, before = {}) {
   manifest.files[SESSION_VERSION_FILE] = sha(file);
   writeFileSync(join(home, 'pipeline', 'INSTALLED.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   const s = readSettings(home);
-  s.hooks.SessionStart ??= [];
+  // The previous release had no update notice: take the one the install just wrote out of SessionStart again.
+  s.hooks.SessionStart = (s.hooks.SessionStart ?? []).filter((g) => !JSON.stringify(g).includes('update-notice.mjs'));
   s.hooks.SessionStart.push(sessionVersion(home));
   s.hooks.PreToolUse = s.hooks.PreToolUse.map((g) => (g.matcher === STACK_REGISTER_MATCHERS[1] ? { ...g, matcher: OLD_STACK_MATCHER } : g));
   writeSettings(home, s);
@@ -1259,7 +1266,7 @@ test('update from the previous release: session-version is gone, stack-register 
   const s = readSettings(home);
   assert.equal(JSON.stringify(s).includes('session-version'), false, 'no settings entry runs it');
   assert.deepEqual(s.hooks.PreToolUse, [...owner.hooks.PreToolUse, ...stackRegisters(home), guardGit(home), guardFiles(home)]);
-  assert.deepEqual(s.hooks.SessionStart, owner.hooks.SessionStart, 'the owner\'s SessionStart hook is byte-identical');
+  assert.deepEqual(s.hooks.SessionStart, [...owner.hooks.SessionStart, updateNotice(home)], 'the owner\'s SessionStart hook is byte-identical and the update notice follows it');
   for (const event of ['PostToolUse', 'SessionEnd', 'UserPromptSubmit', 'Stop']) {
     assert.deepEqual(s.hooks[event].slice(0, owner.hooks[event].length), owner.hooks[event], `${event}: the owner's groups come first, untouched`);
   }
@@ -1284,7 +1291,7 @@ test('update from the previous release into a settings.json whose only SessionSt
   makeOldShape(home, {});
   assert.deepEqual(readSettings(home).hooks.SessionStart, [sessionVersion(home)]);
   assert.equal(install(home).status, 0);
-  assert.equal('SessionStart' in readSettings(home).hooks, false);
+  assert.deepEqual(readSettings(home).hooks.SessionStart, [updateNotice(home)], 'the retired entry is replaced by the update notice');
   assert.deepEqual(driftOf(home), { status: 0, items: [] });
 });
 
@@ -1294,7 +1301,7 @@ test('--uninstall from the previous release\'s shape leaves no pipeline files an
   makeOldShape(home, owner);
   const r = install(home, ['--uninstall', '--json']);
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(JSON.parse(r.stdout).hooks.removed, 8, 'stack-register x2 (one on the old matcher), dev-bind, session-end, guard-git, guard-files, session-version, owner-go');
+  assert.equal(JSON.parse(r.stdout).hooks.removed, 8, 'stack-register x2 (one on the old matcher), dev-bind, session-end, guard-git, guard-files, session-version, owner-go (the old shape has no update notice)');
   assert.deepEqual(readSettings(home), owner);
   assert.deepEqual(listTree(home).filter((f) => !f.startsWith('backups/')), ['settings.json']);
 });
@@ -1319,12 +1326,12 @@ test('mergeSettings drops a session-version handler of ours from a shared Sessio
     { type: 'command', command: 'node', args: ['/h/.claude/pipeline/hooks/session-version.mjs'], timeout: 10 },
   ] }] } };
   const merged = mergeSettings(shared, { home });
-  assert.deepEqual(merged.hooks.SessionStart, [{ hooks: [{ type: 'command', command: 'echo mine' }] }]);
-  assert.equal('SessionStart' in mergeSettings({}, { home }).hooks, false, 'a fresh install writes nothing to SessionStart');
+  assert.deepEqual(merged.hooks.SessionStart, [{ hooks: [{ type: 'command', command: 'echo mine' }] }, updateNotice(home)]);
+  assert.deepEqual(mergeSettings({}, { home }).hooks.SessionStart, [updateNotice(home)], 'a fresh install writes only the update notice to SessionStart');
   assert.deepEqual(removeOurSettings(mergeSettings({}, { home }), { home }), {});
   assert.throws(() => mergeSettings({ hooks: { SessionStart: {} } }, { home }), /hooks\.SessionStart" is not an array/);
   const own = { hooks: { SessionStart: [] } };
-  assert.deepEqual(mergeSettings(own, { home }).hooks.SessionStart, [], 'an empty SessionStart the owner had stays');
+  assert.deepEqual(mergeSettings(own, { home }).hooks.SessionStart, [updateNotice(home)], 'the notice goes into an empty SessionStart the owner had');
 });
 
 test('buildPlan no longer asks for pipeline/hooks/session-version.mjs; the three stack hooks and the guards are still required', () => {
@@ -1998,7 +2005,7 @@ test('--uninstall removes our three stack hooks, drops the PostToolUse / Session
   assert.equal(install(home).status, 0);
   const r = install(home, ['--uninstall', '--json']);
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(JSON.parse(r.stdout).hooks.removed, 7, 'stack-register x2, dev-bind, session-end, guard-git, guard-files, owner-go');
+  assert.equal(JSON.parse(r.stdout).hooks.removed, 8, 'stack-register x2, dev-bind, session-end, guard-git, guard-files, owner-go, update-notice');
   assert.equal(existsSync(settingsPath(home)) ? JSON.stringify(readSettings(home)) : '{}', '{}');
 
   const home2 = newHome();
