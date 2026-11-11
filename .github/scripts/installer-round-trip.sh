@@ -78,7 +78,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 const home = process.argv[1];
 const left = ["pipeline", "skills/ship", "skills/review", "skills/verify", "skills/pipeline-setup",
-  "agents/implementer.md", "agents/verifier.md", "agents/judge.md", "agents/arbiter.md"]
+  "agents/implementer.md", "agents/verifier.md", "agents/judge.md", "agents/arbiter.md", "agents/arbiter-fix.md"]
   .filter((p) => existsSync(join(home, p)));
 const settingsFile = join(home, "settings.json");
 const settings = existsSync(settingsFile) ? readFileSync(settingsFile, "utf8") : "";

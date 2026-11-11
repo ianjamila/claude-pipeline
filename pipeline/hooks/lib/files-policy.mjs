@@ -46,6 +46,7 @@ const PROTECTED_REL = [
   '.claude/agents/verifier.md',
   '.claude/agents/judge.md',
   '.claude/agents/arbiter.md',
+  '.claude/agents/arbiter-fix.md',
   '.claude/pipeline',
   '.claude/settings.json',
   // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it, P merge and the guard read it
@@ -895,7 +896,7 @@ function ancestorRegexes(ctx) {
 const SEP = "(?=[ \\t]*[/'\"`,+])[/'\"`,+ \\t]+"; // between pieces of a code-built path: '.claude', 'skills', 'ship'
 function suffixBody(sep) {
   const end = '(?![\\w.\\-])';
-  return `\\.claude${sep}(?:settings\\.json${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter)\\.md${end})`;
+  return `\\.claude${sep}(?:settings\\.json${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter|arbiter-fix)\\.md${end})`;
 }
 // ...preceded by something only known at run time: a variable, a command substitution, a template `${...}`, a call
 // result `)`, a `+` or `,` joining pieces, `~user`, `.join(` / `.joinpath(`.

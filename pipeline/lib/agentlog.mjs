@@ -87,10 +87,15 @@ export function appendToQueue(cwd, line, at = new Date().toISOString(), { afterM
   return clean;
 }
 
-// How many rounds had the arbiter consulted. A round counts when it records `arbiter.called`, or when any of its items
-// carries an arbiter ruling (the review loop stores the ruling on the item).
+// How many rounds had the arbiter (Fable) consulted. A round counts when it records `arbiter.called`, when its Fable pass was proven (a Fable
+// round with zero items has no ruling to show for it), or when any of its items carries an arbiter ruling (the review loop stores the ruling on the item).
 export function countArbiterCalls(state) {
-  return (state?.rounds ?? []).filter((r) => r?.arbiter?.called === true || (r?.items ?? []).some((i) => i?.arbiter)).length;
+  return (state?.rounds ?? []).filter((r) => r?.arbiter?.called === true || r?.arbiter?.proofOk === true || (r?.items ?? []).some((i) => i?.arbiter)).length;
+}
+
+// How many of those were proven fix-verify passes (the narrow "verify these fixes" brief at lower effort: lib/fix-verify.mjs).
+export function countFixVerifyCalls(state) {
+  return (state?.rounds ?? []).filter((r) => r?.arbiter?.brief === 'fix-verify' && r.arbiter.proofOk === true).length;
 }
 
 export function buildAgentLogLine({ state, pr, title, outcome, now = new Date() }) {
@@ -101,6 +106,7 @@ export function buildAgentLogLine({ state, pr, title, outcome, now = new Date() 
     risk: state?.risk ?? 'unknown',
     rounds: state?.rounds?.length ?? 0,
     arbiterCalls: countArbiterCalls(state),
+    fixVerifyCalls: countFixVerifyCalls(state),
     outcome,
   });
 }

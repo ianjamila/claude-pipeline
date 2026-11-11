@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GUARD_FILES_MATCHER, GUARD_GIT_MATCHER } from '../pipeline/lib/installer.mjs';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
+import { BRIEFS } from '../pipeline/lib/fix-verify.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(root, rel), 'utf8');
@@ -101,6 +102,24 @@ test('agents: implementer and verifier inherit effort (spec 5.4); judge (Sonnet)
   assert.match(front('agents/Explore.md'), /^tools: Read, Grep, Glob$/m);
   assert.match(front('agents/arbiter.md'), /^effort: high$/m);
   assert.match(read('agents/judge.md'), /every pending item exactly once/);
+});
+
+test('agents: arbiter-fix is the arbiter (same Fable pin, same body) at the lower effort the fix-verify brief expects', () => {
+  const front = (doc) => read(doc).split('---')[1];
+  const body = (doc) => read(doc).split('---').slice(2).join('---');
+  assert.match(front('agents/arbiter-fix.md'), /^name: arbiter-fix$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^model: fable$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^effort: medium$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^tools: Read, Grep, Glob$/m);
+  assert.match(front('agents/arbiter-fix.md'), /fix-verify/);
+  assert.equal(body('agents/arbiter-fix.md'), body('agents/arbiter.md'), 'one instruction text for both: the brief comes from the input file');
+  assert.match(front('agents/arbiter.md'), /^name: arbiter$/m);
+  assert.match(front('agents/arbiter.md'), /^model: fable$/m);
+  // lib/fix-verify.mjs names the agent and effort each brief expects
+  assert.equal(BRIEFS['fix-verify'].agent, 'arbiter-fix');
+  assert.equal(BRIEFS['fix-verify'].effort, 'medium');
+  assert.equal(BRIEFS.full.agent, 'arbiter');
+  assert.equal(BRIEFS.full.effort, 'high');
 });
 
 test('pipeline-setup: ignores the worktree dir, pins verify.expected_steps, mentions the executable shim and the ci keys', () => {
