@@ -410,6 +410,7 @@ function makeCtx(opts) {
     // #128: a transcript folder (R1-B1) is a protected reference when a word IS it; a shell sitting in one (cwd, a cd target) may write only what is not a transcript
     // (hit), but runs of its own (tar -x, cp -R x .) land in it, so there ctx.hitTranscriptBelow counts like an ancestor (R8-B1: projects/ itself too; the same folders as hitTranscriptDir, see transcriptRes; notes stay writable in projects/<proj>/memory/)
     // (R4-B2 / R4-F2: a trailing zsh glob qualifier, `claude-config(/)`, is not part of the name: dropped, which can only widen the match)
+    hitTranscriptFile: (p) => withoutQualifier(p).some((q) => transcripts.files.some((re) => re.test(unFirm(q)))), // (a transcript file itself, no other protected path: the wording of the "pass a copy" advice)
     hitTranscriptDir: (p) => withoutQualifier(p).some((q) => transcripts.dirs.some((re) => re.test(unFirm(q)))),
     hitTranscriptBelow: (p) => withoutQualifier(p).some((q) => transcripts.below.some((re) => re.test(unFirm(q)))),
     hitPipelineAncestor: pipelineAncestor,
@@ -3407,7 +3408,7 @@ function evaluateBashForFilesFrame(command, opts) {
     if (!c.argv.length) continue;
     const runs = RUNTIMES.has(baseOf(c.argv[0])) || OWNER_GO_RECORDER.test(toPosix(c.argv[0]));
     if (runs && c.argv.some((w) => /owner-go\.mjs/i.test(toPosix(expandRefs(w, ctx))))) {
-      return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types (PIPELINE_ADMIN=1 for the owner)');
+      return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types; to change its source, edit the source with the Edit tool (a program that runs or rewrites it is refused;PIPELINE_ADMIN=1 for the owner)');
     }
   }
 
@@ -3589,7 +3590,14 @@ function evaluateBashForFilesFrame(command, opts) {
   if (bad) {
     const name = bad.argv.length ? baseOf(bad.argv[0]) : '(assignment)';
     const literal = bad.argv.length ? '' : '; if the variable only holds a path, pass the path literally, or use it only with cat / head / tail / wc / ls / stat / grep / cut / echo / printf / test on a line without export, eval, source or another program';
-    return deny(`${name} refers to a protected pipeline file (or the directory that holds it) and is not a read-only command (${PROTECTED_MSG}${literal})`);
+    // (#190 case 3, wording only: when the ONLY protected references are transcript paths, say how to get on: a copy is no protected file)
+    const isTranscriptWord = (w) => { const v = expandRefs(String(w), ctx); return new RegExp(TRANSCRIPT_TEXT_SRC, ctx.ci ? 'i' : '').test(v) || (isAbs(v) && ctx.hitTranscriptFile(v)); };
+    const trWords = bad.argv.slice(1).filter(isTranscriptWord);
+    const otherRef = () => insideRoot || usesLast(bad) || winAncestor(bad) || bad.argv.some((w, i) => (i === 0 || !isTranscriptWord(w)) && tokenHit(w))
+      || Object.values(bad.env ?? {}).some((v) => m.rawHit(v, dirs)) || (bad.redirects ?? []).some((r) => tokenHit(r.target ?? ''));
+    const copyAdvice = trWords.length && trWords.length <= 20 && !otherRef() // (cheap: no stats for a long word list)
+      ? '; the only protected reference is a transcript path: copy it first (cp <transcript> "$TMPDIR/x.jsonl"; reading a copy is allowed) and pass the copy' : '';
+    return deny(`${name} refers to a protected pipeline file (or the directory that holds it) and is not a read-only command (${PROTECTED_MSG}${literal})${copyAdvice}`);
   }
   return allow();
 }
