@@ -508,7 +508,7 @@ executable.
 ## Developing this repo
 
 ```sh
-npm test                          # node:test, no dependencies (node scripts/test.mjs [name-filter | exact.test.mjs …]; a name ending .test.mjs matches that file only)
+npm test                          # node:test, no dependencies (node scripts/test.mjs [name-filter | exact.test.mjs …]; a name ending .test.mjs matches that file only; a name of either kind that matches no file exits 2)
 node scripts/verify.mjs           # the pipeline's own verify; writes .verify/report.json
 node pipeline/bin/pipeline.mjs --help
 ```
