@@ -461,10 +461,19 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       // Past --appear-timeout an absent identity is final only if nothing that could still produce it is running on the head: a
       // needs:-gated aggregate is created late by design (#159), also when the run started before ready (#196, see findHolder).
       // Until --timeout the wait goes on, naming what holds it.
-      const holder = absent.length > 0 && elapsed() >= appearTimeoutMs ? await findHolder(obs, pr, absent.filter((s) => s.state === 'missing')) : null;
+      let holder = absent.length > 0 && elapsed() >= appearTimeoutMs ? await findHolder(obs, pr, absent.filter((s) => s.state === 'missing')) : null;
+      // A required identity still `pending` as a commit status (Vercel, an external CI) has no run for findHolder to find, yet it is
+      // exactly what the wait is for: it holds like a run does (#214), bounded by --timeout.
+      if (holder === null && absent.length > 0 && elapsed() >= appearTimeoutMs) {
+        const pending = waiting.find((s) => s.state === 'pending' && statusBasis.get(s)?.state === 'pending');
+        if (pending !== undefined) {
+          const basis = statusBasis.get(pending);
+          holder = { kind: 'status', id: basis.id ?? null, name: pending.name, status: 'pending', createdAt: basis.created_at ?? null, url: pending.url ?? null, predatesReady: null };
+        }
+      }
       if (holder !== null) {
         held = holder;
-        const note = `still running past the appear window: ${holder.kind} ${holder.name ?? holder.id} (${holder.status})${holder.predatesReady === true ? ', started before ready' : holder.predatesReady === null ? ', start time unknown' : ''}`;
+        const note = `still running past the appear window: ${holder.kind} ${holder.name ?? holder.id} (${holder.status})${holder.predatesReady === true ? ', started before ready' : holder.predatesReady === null && holder.kind !== 'status' ? ', start time unknown' : ''}`;
         if (note !== heldSignature) {
           heldSignature = note;
           onProgress(note);

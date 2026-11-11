@@ -1291,3 +1291,54 @@ test('R1-F1: the run is read once per poll (memoised), not once per status evalu
   assert.deepEqual([...new Set(s.reads.runs)], ['555']);
   assert.equal(s.reads.runs.length, 8, String(s.reads.runs.length));
 });
+
+// ---- a required check pending only as a commit status holds the wait (#214 residual, #190) ---------------------------------------
+
+test('a required check pending as a commit status (no run) holds an absent check past the appear window: timeout with heldBy.kind status, not missing', async () => {
+  const s = sim({
+    classic: present('check A', 'check B'), timeline: readyTimeline,
+    statuses: [st('check A', 'pending', 'github-actions[bot]', { id: 7, created_at: '2026-01-01T12:00:10Z', target_url: 'https://ci.example/a' })],
+  }, { timeoutMs: 900_000 });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'timeout', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 900_000, 'held to --timeout, not given up at the 300s appear deadline');
+  assert.equal(r.output.heldBy.kind, 'status');
+  assert.equal(r.output.heldBy.name, 'check A');
+  assert.equal(r.output.heldBy.status, 'pending');
+  assert.ok(s.progress.some((l) => /still running/.test(l) && /check A/.test(l)), s.progress.join(' | '));
+});
+
+test('the pending status turns success and the absent check appears: passed', async () => {
+  const s = sim({
+    classic: present('check A', 'check B'), timeline: readyTimeline,
+    statuses: (t) => [st('check A', t < 400 ? 'pending' : 'success', 'github-actions[bot]', { id: t < 400 ? 7 : 8, created_at: '2026-01-01T12:00:10Z' })],
+    checkRuns: (t) => (t >= 400 ? [cr('check B', 'success')] : []),
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  assert.equal(r.output.heldBy.kind, 'status');
+});
+
+test('control: nothing pending and nothing running still ends `missing` at the appear deadline', async () => {
+  const s = sim({
+    classic: present('check A', 'check B'), timeline: readyTimeline,
+    statuses: [st('check A', 'success', 'github-actions[bot]', { created_at: '2026-01-01T12:00:10Z' })],
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'missing');
+  assert.equal(s.elapsed(), 300_000);
+  assert.equal(r.output.heldBy, undefined);
+});
+
+test('#214 shape: queued shards plus a missing `test (windows)` aggregate are held by the check run, never `missing`', async () => {
+  const shards = [1, 2, 3].map((n) => cr(`test (windows ${n}/3)`, null, { status: 'queued', check_suite: { id: 9 } }));
+  const s = sim({
+    classic: present('test (ubuntu)', 'test (windows)'), timeline: readyTimeline,
+    checkRuns: [cr('test (ubuntu)', 'success'), ...shards],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T12:00:05Z' }],
+  }, { timeoutMs: 900_000 });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'timeout', JSON.stringify(r.output));
+  assert.equal(r.output.heldBy.kind, 'check-run');
+  assert.match(r.output.heldBy.name, /^test \(windows \d\/3\)$/);
+});
