@@ -12,8 +12,13 @@
 // (join(root, 'docs', 'cli.md')). Other test files are never followed through a mention (a test that writes
 // 'cli.test.mjs' into a fixture does not depend on cli.test.mjs), but a changed one that is mentioned still counts.
 //
-// Budget: related tests are added best-first (tier, then distance, then lightest, then name) while the summed estimated
-// time stays within `budgetMs`; one that does not fit is skipped and lighter ones after it may still fit.
+// A relation is weak when it rests only on a bare root-level name mention ('README.md'); every other one is strong.
+// Ranking, best first: changed tests (tier 0), then every strong relation by tier, distance, weight and name, and only then
+// the weak ones in the same order, so a weak mention never outranks a strong relation of a later tier.
+//
+// Budget: related tests are added in that order while the summed estimated time stays within `budgetMs`; one that does not
+// fit is skipped and lighter ones after it may still fit. Weak ones also have a cap of their own (see weakBudgetOf), so a
+// change to a common root file cannot spend the whole budget on tests that only write a fixture of that name.
 import { posix } from 'node:path';
 
 // Calibrated on a 14-core Mac, 2026-11: test/cli.test.mjs 3.2 s local vs 3.3 s weighed, test/verify.test.mjs 83 s vs 188 s,
@@ -21,6 +26,10 @@ import { posix } from 'node:path';
 // 40-90 s of wall time. Measured: this feature's own 7-file diff selected 31 related tests (budget used) and `verify --quick`
 // took 105 s on a loaded machine, so quick stays at about one to two minutes at most; with nothing related it is about 5 s.
 export const DEFAULT_BUDGET_MS = 90_000;
+// The most weak relations (a bare root-name mention) may use of the budget: DEFAULT_WEAK_BUDGET_MS, or the whole budget when
+// that is smaller (a custom CP_QUICK_RELATED_BUDGET_MS never gives weak ones more than the default share); `all` = no cap.
+export const DEFAULT_WEAK_BUDGET_MS = 15_000;
+export const weakBudgetOf = (budgetMs) => (budgetMs === Infinity ? Infinity : Math.min(DEFAULT_WEAK_BUDGET_MS, budgetMs));
 
 const MODULE_RE = /\.(?:mjs|js|cjs)$/;
 const TEST_RE = /\.test\.mjs$/;
@@ -143,7 +152,7 @@ function distanceToChange(graph, test) {
 }
 
 // tests: test/ file names (the `.test.mjs` ones); `testDir` is where they live. weights: Map name -> estimated ms (every test).
-// exclude: names that run anyway (the fixed list). Returns { selected, skipped, estimatedMs }: each entry { name, tier, distance, ms }.
+// exclude: names that run anyway (the fixed list). Returns { selected, skipped, estimatedMs }: each entry { name, tier, distance, weak, ms }.
 export function relatedTests({ tests, testDir = 'test', changed, files, read, weights, budgetMs, exclude = [] }) {
   const changedNorm = [...new Set(changed.map(toPosix).filter(Boolean))];
   const skip = new Set(exclude);
@@ -157,13 +166,19 @@ export function relatedTests({ tests, testDir = 'test', changed, files, read, we
     const { distance, weak } = found;
     ranked.push({ name, tier: Math.min(distance, 2), distance, weak, ms: Math.round(weights.get(name) ?? 0) });
   }
-  // Within a tier, strongly related tests (imports, path mentions) come before weak ones (a bare root-name mention).
-  ranked.sort((a, b) => a.tier - b.tier || Number(a.weak) - Number(b.weak) || a.distance - b.distance || a.ms - b.ms || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  // Changed tests first (never weak), then every strong relation of any tier, then the weak ones (a bare root-name mention).
+  ranked.sort((a, b) => (a.tier !== 0) - (b.tier !== 0) || Number(a.weak) - Number(b.weak) || a.tier - b.tier || a.distance - b.distance || a.ms - b.ms || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   const selected = [];
   const skipped = [];
+  const weakCap = weakBudgetOf(budgetMs);
   let estimatedMs = 0;
+  let weakMs = 0;
   for (const t of ranked) {
-    if (t.tier === 0 || estimatedMs + t.ms <= budgetMs) { selected.push(t); estimatedMs += t.ms; } else skipped.push(t);
+    if (t.tier === 0 || (estimatedMs + t.ms <= budgetMs && (!t.weak || weakMs + t.ms <= weakCap))) {
+      selected.push(t);
+      estimatedMs += t.ms;
+      if (t.weak) weakMs += t.ms;
+    } else skipped.push(t);
   }
   return { selected, skipped, estimatedMs };
 }
@@ -173,21 +188,22 @@ export function relatedTests({ tests, testDir = 'test', changed, files, read, we
 // whole budget, and the line must say so.
 export function describeSelection({ selected, skipped, changedCount, basis, budgetMs, estimatedMs = 0, listMax = 6 }) {
   const tiers = [0, 1, 2].map((t) => selected.filter((s) => s.tier === t).length);
+  const nameOnly = selected.filter((s) => s.weak).length;
   const used = Math.round(estimatedMs);
   const budget = budgetMs === Infinity ? `estimated ${used} ms, no budget cap` : `estimated ${used} of budget ${budgetMs} ms`;
   const names = skipped.map((s) => s.name);
   const shown = names.slice(0, listMax).join(', ') + (names.length > listMax ? `, +${names.length - listMax} more` : '');
-  return `related tests: ${selected.length} selected (${tiers[0]} changed, ${tiers[1]} direct, ${tiers[2]} transitive), `
+  return `related tests: ${selected.length} selected (${tiers[0]} changed, ${tiers[1]} direct, ${tiers[2]} transitive; ${nameOnly} name-only), `
     + `${skipped.length} skipped over budget${skipped.length ? ` (${shown})` : ''}; ${changedCount} changed files (${basis}); ${budget}`;
 }
 
-// The full record of what a quick run covered, printed after the summary: every selected related file with its tier and
-// every file skipped over budget, so a CI failure in a test quick passed can be told apart (skipped vs never related)
-// from the log alone. Each line ends with ')' so no line reads as a bare test-file name.
+// The full record of what a quick run covered, printed after the summary: every selected related file with its tier
+// (plus "name only" for a weak relation) and every file skipped over budget, so a CI failure in a test quick passed can be
+// told apart (skipped vs never related) from the log alone. Each line ends with ')' so no line reads as a bare test-file name.
 export function describeSelectionDetail({ selected, skipped }) {
   const tierName = ['changed', 'direct', 'transitive'];
   const lines = [];
-  if (selected.length) lines.push(`related selected (${selected.length}): ${selected.map((s) => `${s.name} [${tierName[s.tier] ?? s.tier}]`).join(', ')} (end)`);
+  if (selected.length) lines.push(`related selected (${selected.length}): ${selected.map((s) => `${s.name} [${tierName[s.tier] ?? s.tier}${s.weak ? ', name only' : ''}]`).join(', ')} (end)`);
   if (skipped.length) lines.push(`related skipped over budget (${skipped.length}): ${skipped.map((s) => s.name).join(', ')} (end)`);
   return lines;
 }

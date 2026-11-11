@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_BUDGET_MS, changedFiles, describeSelection, describeSelectionDetail, importSpecs, mentionsPath, parseBudget, relatedTests, toPosix } from '../scripts/lib/related-tests.mjs';
+import { DEFAULT_BUDGET_MS, DEFAULT_WEAK_BUDGET_MS, changedFiles, describeSelection, describeSelectionDetail, importSpecs, mentionsPath, parseBudget, relatedTests, toPosix } from '../scripts/lib/related-tests.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -125,8 +125,45 @@ test('relatedTests: a changed root file (README.md) is followed only from tests 
   const both = go(['README.md', 'lib/leaf.mjs'], 100);
   assert.deepEqual(names(both), ['imports-leaf.test.mjs']);
   assert.deepEqual(both.skipped.map((s) => s.name), ['fixture-readme.test.mjs']);
+  // Weak ranks after EVERY strong relation, whatever the tier: a two-step (tier 2) strong import beats a tier 1 name mention.
+  const far = { ...src, 'lib/mid.mjs': "import { x } from './leaf.mjs';\n", 'test/imports-mid.test.mjs': "import './../lib/mid.mjs';\n" };
+  const farFiles = Object.keys(far);
+  const farTests = farFiles.filter((f) => f.endsWith('.test.mjs')).map((f) => f.slice(5)).sort();
+  const farGo = relatedTests({
+    tests: farTests.filter((t) => t !== 'imports-leaf.test.mjs'), changed: ['README.md', 'lib/leaf.mjs'], files: farFiles, read: (p) => far[p] ?? null,
+    weights: new Map(farTests.map((t) => [t, 100])), budgetMs: 100,
+  });
+  assert.equal(farGo.selected[0].name, 'imports-mid.test.mjs');
+  assert.equal(farGo.selected[0].tier, 2);
+  assert.equal(farGo.selected[0].weak, false);
+  assert.deepEqual(farGo.skipped.map((s) => s.name), ['fixture-readme.test.mjs']);
   // A path with a directory stays a strong mention (docs/guide.md in the main fixture).
   assert.equal(run(['docs/guide.md']).selected.every((s) => s.weak === false), true);
+});
+
+test('relatedTests: weak relations have a cap of their own (DEFAULT_WEAK_BUDGET_MS); strong ones and "all" are not held to it', () => {
+  const src = { 'README.md': '# readme\n', 'lib/leaf.mjs': 'export {};\n' };
+  for (let i = 0; i < 20; i++) src[`test/w${String(i).padStart(2, '0')}.test.mjs`] = "writeFileSync(join(dir, 'README.md'), 'x');\n";
+  src['test/strong.test.mjs'] = "import '../lib/leaf.mjs';\n";
+  const fx = Object.keys(src);
+  const fxTests = fx.filter((f) => f.endsWith('.test.mjs')).map((f) => f.slice(5)).sort();
+  const go = (changed, budgetMs, ms = 4000) => relatedTests({
+    tests: fxTests, changed, files: fx, read: (p) => src[p] ?? null, weights: new Map(fxTests.map((t) => [t, ms])), budgetMs,
+  });
+  const weakMs = (r) => r.selected.filter((s) => s.weak).reduce((n, s) => n + s.ms, 0);
+  const r = go(['README.md'], DEFAULT_BUDGET_MS);
+  assert.equal(r.selected.length, 3, 'floor(15000 / 4000) weak tests');
+  assert.ok(weakMs(r) <= DEFAULT_WEAK_BUDGET_MS);
+  assert.equal(r.skipped.length, 17);
+  assert.ok(r.estimatedMs <= DEFAULT_BUDGET_MS);
+  // A small custom budget caps weak ones at that budget; a bigger one still at the weak cap; `all` lifts it.
+  assert.equal(go(['README.md'], 8000).selected.length, 2);
+  assert.equal(weakMs(go(['README.md'], 500_000)), 12_000);
+  assert.equal(go(['README.md'], Infinity).selected.length, 20);
+  // The weak cap does not hold strong ones back, and weak ones after them still get their own share.
+  const mixed = go(['README.md', 'lib/leaf.mjs'], DEFAULT_BUDGET_MS);
+  assert.equal(mixed.selected[0].name, 'strong.test.mjs');
+  assert.equal(mixed.selected.filter((s) => s.weak).length, 3);
 });
 
 test('relatedTests: a deleted file counts by path (importers and mentioners are related)', () => {
@@ -182,7 +219,9 @@ test('describeSelection: counts, the skipped names (truncated) and the changed-f
     changedCount: 7, basis: 'basis text', budgetMs: 90000, estimatedMs: 188232.4, listMax: 2,
   });
   assert.equal(line.includes('\n'), false);
-  assert.match(line, /3 selected \(1 changed, 1 direct, 1 transitive\), 3 skipped over budget \(s1\.test\.mjs, s2\.test\.mjs, \+1 more\); 7 changed files \(basis text\); estimated 188232 of budget 90000 ms$/);
+  assert.match(line, /3 selected \(1 changed, 1 direct, 1 transitive; 0 name-only\), 3 skipped over budget \(s1\.test\.mjs, s2\.test\.mjs, \+1 more\); 7 changed files \(basis text\); estimated 188232 of budget 90000 ms$/);
+  const weakSel = describeSelection({ selected: [{ name: 'w.test.mjs', tier: 1, distance: 1, weak: true, ms: 1 }, sel('b.test.mjs', 1)], skipped: [], changedCount: 1, basis: 'b', budgetMs: 10, estimatedMs: 2 });
+  assert.match(weakSel, /2 selected \(0 changed, 2 direct, 0 transitive; 1 name-only\), 0 skipped/);
   const uncapped = describeSelection({ selected: [], skipped: [], changedCount: 0, basis: 'b', budgetMs: Infinity, estimatedMs: 5 });
   assert.match(uncapped, /; estimated 5 ms, no budget cap$/);
 });
@@ -195,6 +234,8 @@ test('describeSelectionDetail: every selected file with its tier and every skipp
   assert.equal(lines[0], 'related selected (3): a.test.mjs [changed], b.test.mjs [direct], c.test.mjs [transitive] (end)');
   assert.match(lines[1], /^related skipped over budget \(10\): s0\.test\.mjs, .*, s9\.test\.mjs \(end\)$/);
   assert.ok(lines.every((l) => !l.endsWith('.test.mjs')));
+  const weak = describeSelectionDetail({ selected: [{ ...sel('w1.test.mjs', 1), weak: true }, { ...sel('w2.test.mjs', 2), weak: true }, sel('s.test.mjs', 1)], skipped: [] });
+  assert.equal(weak[0], 'related selected (3): w1.test.mjs [direct, name only], w2.test.mjs [transitive, name only], s.test.mjs [direct] (end)');
   assert.deepEqual(describeSelectionDetail({ selected: [], skipped: [] }), []);
 });
 
@@ -246,7 +287,7 @@ test('test.mjs --related --list: the named files plus the tests that import the 
   const out = listed(r);
   assert.ok(out.includes('config.test.mjs'));
   assert.ok(out.includes('glob.test.mjs'), 'glob.test.mjs imports pipeline/lib/glob.mjs');
-  assert.match(r.stdout.split('\n')[0], /^related tests: \d+ selected \(0 changed, \d+ direct, \d+ transitive\), \d+ skipped over budget.*; 1 changed files \(CP_RELATED_CHANGED\); estimated \d+ of budget 90000 ms$/);
+  assert.match(r.stdout.split('\n')[0], /^related tests: \d+ selected \(0 changed, \d+ direct, \d+ transitive; \d+ name-only\), \d+ skipped over budget.*; 1 changed files \(CP_RELATED_CHANGED\); estimated \d+ of budget 90000 ms$/);
   assert.match(r.stdout, /^related selected \(\d+\): .*glob\.test\.mjs \[direct\].* \(end\)$/m);
 });
 
@@ -285,7 +326,7 @@ test('test.mjs --related --list: when git cannot tell, it says why and lists jus
 test('test.mjs --related --list: nothing changed means just the named files, and the summary still prints', () => {
   const r = cli(['--related', '--list', 'config.test.mjs'], { CP_RELATED_CHANGED: '\n' });
   assert.deepEqual(listed(r), ['config.test.mjs']);
-  assert.match(r.stdout, /related tests: 0 selected \(0 changed, 0 direct, 0 transitive\), 0 skipped over budget; 0 changed files/);
+  assert.match(r.stdout, /related tests: 0 selected \(0 changed, 0 direct, 0 transitive; 0 name-only\), 0 skipped over budget; 0 changed files/);
 });
 
 test('test.mjs without --related is unchanged: --list names exactly the named files', () => {

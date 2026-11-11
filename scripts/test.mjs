@@ -4,8 +4,10 @@
 // A name ending in .test.mjs selects exactly that file (no substring match); any other name is a substring filter
 // (scripts/lib/select-tests.mjs). A name of either kind that matches no file exits 2, so a rename cannot quietly shrink a check.
 // --related ADDS the test files related to what the branch changed (scripts/lib/related-tests.mjs: changed test files, tests that
-// import or mention a changed file, directly or through the modules they use) to the named ones, best first, while their
-// estimated time fits CP_QUICK_RELATED_BUDGET_MS (default 90000; 0 = none; `all` = no cap; changed test files always run).
+// import or mention a changed file, directly or through the modules they use) to the named ones, best first (changed, then
+// strong relations by distance, then name-only mentions of a root file such as README.md, which have a 15000 ms cap of their
+// own), while their estimated time fits CP_QUICK_RELATED_BUDGET_MS (default 90000; 0 = none; `all` = no cap; changed test
+// files always run).
 // Names stay strict (exact .test.mjs, exit 2 when missing); related files are never "missing". It prints one summary line
 // first (kept in .verify/logs/tests.log) and falls back to just the named files, saying why, when git cannot tell.
 // CP_RELATED_CHANGED (test-only): a newline-separated list of repo-relative paths used INSTEAD OF git's changed files.
