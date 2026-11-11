@@ -762,10 +762,14 @@ function hookSurfaceBashReason(cmds, frame, ctx, io) {
       if (writer && !DELETERS.has(name) && !(name === 'git' && GIT_NO_CONTENT.has(gitSubcommand(c.argv)))) {
         const own = io.wordsOf(c);
         words = DEST_ONLY.has(name) || MOVERS.has(name) ? destsOf(own, name) : own.slice(1);
+      } else if (writer && name === 'git' && GIT_NO_CONTENT.has(gitSubcommand(c.argv))) {
+        // (R3-F1) log / show / diff ... write nothing into the tree except through --output: its value is a target
+        const own = io.wordsOf(c);
+        words = own.flatMap((w, i) => (w === '--output' && i + 1 < own.length ? [own[i + 1]] : typeof w === 'string' && w.startsWith('--output=') ? [w] : []));
       }
       words = [...words, ...redirects];
-      // an option's attached value (`-ofile`, `--output=file`, `of=file`)
-      words = words.flatMap((w) => (typeof w !== 'string' ? [] : /^--?[A-Za-z][\w-]*=./.test(w) || /^[A-Za-z_]+=./.test(w) ? [w, w.slice(w.indexOf('=') + 1)] : /^-[A-Za-z]./.test(w) ? [w, w.slice(2)] : [w])).filter((w) => w !== '');
+      // an option's attached value (`-ofile`, `--output=file`, `of=file`; after a cluster of flags, `-so.claude/x`: every tail of the word, R3-F1)
+      words = words.flatMap((w) => (typeof w !== 'string' ? [] : /^--?[A-Za-z][\w-]*=./.test(w) || /^[A-Za-z_]+=./.test(w) ? [w, w.slice(w.indexOf('=') + 1)] : /^-[A-Za-z]./.test(w) ? [w, ...Array.from({ length: w.length - 2 }, (_, i) => w.slice(i + 2))] : [w])).filter((w) => w !== '');
       total += words.length;
       if (total > MAX_SURFACE_WORDS) return 'the command line has too many words to check for writes to a file that can declare hooks';
       for (const w of words) {
