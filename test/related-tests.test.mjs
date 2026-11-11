@@ -104,6 +104,31 @@ test('relatedTests: import cycles terminate and still find a change inside the c
   assert.deepEqual(names(run(['lib/cycle-a.mjs'])), ['cycle.test.mjs']);
 });
 
+test('relatedTests: a changed root file (README.md) is followed only from tests that name it, ranks after strong relations, and never through a module (#281)', () => {
+  const src = {
+    'README.md': '# readme\n',
+    'lib/leaf.mjs': 'export const x = 1;\n',
+    'lib/policy.mjs': "export const PROTECTED = ['README.md', 'docs/'];\n", // a module that merely contains the name
+    'test/imports-policy.test.mjs': "import { PROTECTED } from '../lib/policy.mjs';\n",
+    'test/fixture-readme.test.mjs': "writeFileSync(join(dir, 'README.md'), 'x');\n",
+    'test/imports-leaf.test.mjs': "import { x } from '../lib/leaf.mjs';\n",
+  };
+  const fx = Object.keys(src);
+  const fxTests = fx.filter((f) => f.endsWith('.test.mjs')).map((f) => f.slice(5)).sort();
+  const go = (changed, budgetMs = Infinity) => relatedTests({
+    tests: fxTests, changed, files: fx, read: (p) => src[p] ?? null, weights: new Map(fxTests.map((t) => [t, 100])), budgetMs,
+  });
+  const onlyReadme = go(['README.md']);
+  assert.deepEqual(names(onlyReadme), ['fixture-readme.test.mjs'], 'a module containing the name does not make its importers related');
+  assert.equal(onlyReadme.selected[0].weak, true);
+  // README plus a real source change, room for one test: the importer of the changed module wins over the README mention.
+  const both = go(['README.md', 'lib/leaf.mjs'], 100);
+  assert.deepEqual(names(both), ['imports-leaf.test.mjs']);
+  assert.deepEqual(both.skipped.map((s) => s.name), ['fixture-readme.test.mjs']);
+  // A path with a directory stays a strong mention (docs/guide.md in the main fixture).
+  assert.equal(run(['docs/guide.md']).selected.every((s) => s.weak === false), true);
+});
+
 test('relatedTests: a deleted file counts by path (importers and mentioners are related)', () => {
   const gone = files.filter((f) => f !== 'lib/leaf.mjs' && f !== 'docs/guide.md');
   const r = relatedTests({ tests, changed: ['lib/leaf.mjs', 'docs/guide.md'], files: gone, read, weights: new Map(), budgetMs: Infinity });

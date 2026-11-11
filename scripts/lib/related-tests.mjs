@@ -84,18 +84,27 @@ function makeGraph({ files, changed, read }) {
     return null;
   };
   const sourceOf = (p) => { try { return read(p); } catch { return null; } };
-  // deps(p): the files p depends on directly, each with how ('import' | 'mention').
+  // deps(p): Map of the files p depends on directly -> 'strong' | 'weak'. An import is strong, and so is a mention of a path
+  // with a directory ('docs/cli.md', 'pipeline/bin/pipeline.mjs'). A mention of a bare root-level name ('README.md') is weak:
+  // tests write fixture files with such names far more often than they read the repo's own. A changed file that is not a
+  // module (a doc, a skill, an agent file) is followed only from a test file that names it itself, never through a module
+  // that happens to contain the name, so one changed README does not pull in every test that imports that module.
   const deps = (p) => {
     if (cache.has(p)) return cache.get(p);
-    const out = new Set();
+    const out = new Map();
     const src = MODULE_RE.test(p) ? sourceOf(p) : null;
+    const fromTest = TEST_RE.test(p);
     if (typeof src === 'string') {
       for (const spec of importSpecs(src)) {
         const r = resolve(p, spec);
-        if (r && r !== p) out.add(r);
+        if (r && r !== p) out.set(r, 'strong');
       }
       for (const tok of tokensOf(src)) {
-        for (const t of byBase.get(tok) ?? []) if (t !== p && !out.has(t) && mentionsPath(src, t)) out.add(t);
+        for (const t of byBase.get(tok) ?? []) {
+          if (t === p || out.has(t)) continue;
+          if (!MODULE_RE.test(t) && !fromTest) continue;
+          if (mentionsPath(src, t)) out.set(t, t.includes('/') ? 'strong' : 'weak');
+        }
       }
     }
     cache.set(p, out);
@@ -105,23 +114,32 @@ function makeGraph({ files, changed, read }) {
 }
 
 // Shortest distance from `test` to a changed file: 0 = the test is changed, 1 = a direct dependency, 2+ = further.
+// Strong edges only first; only when no strong path exists is a path through a weak edge (a bare root-name mention) used,
+// and then the result says `weak` so the ranking puts it after every strongly related test of its tier.
 function distanceToChange(graph, test) {
-  if (graph.changedSet.has(test)) return 0;
-  const seen = new Set([test]);
-  let frontier = [test];
-  for (let d = 1; frontier.length > 0; d++) {
-    const next = [];
-    for (const node of frontier) {
-      for (const dep of graph.deps(node)) {
-        if (seen.has(dep)) continue;
-        if (graph.changedSet.has(dep)) return d;
-        seen.add(dep);
-        next.push(dep);
+  if (graph.changedSet.has(test)) return { distance: 0, weak: false };
+  const search = (allowWeak) => {
+    const seen = new Set([test]);
+    let frontier = [test];
+    for (let d = 1; frontier.length > 0; d++) {
+      const next = [];
+      for (const node of frontier) {
+        for (const [dep, kind] of graph.deps(node)) {
+          if (kind === 'weak' && !allowWeak) continue;
+          if (seen.has(dep)) continue;
+          if (graph.changedSet.has(dep)) return d;
+          seen.add(dep);
+          next.push(dep);
+        }
       }
+      frontier = next;
     }
-    frontier = next;
-  }
-  return null;
+    return null;
+  };
+  const strong = search(false);
+  if (strong !== null) return { distance: strong, weak: false };
+  const any = search(true);
+  return any === null ? null : { distance: any, weak: true };
 }
 
 // tests: test/ file names (the `.test.mjs` ones); `testDir` is where they live. weights: Map name -> estimated ms (every test).
@@ -134,11 +152,13 @@ export function relatedTests({ tests, testDir = 'test', changed, files, read, we
   const ranked = [];
   for (const name of tests) {
     if (skip.has(name) || !TEST_RE.test(name)) continue;
-    const distance = distanceToChange(graph, `${dir}/${name}`);
-    if (distance === null) continue;
-    ranked.push({ name, tier: Math.min(distance, 2), distance, ms: Math.round(weights.get(name) ?? 0) });
+    const found = distanceToChange(graph, `${dir}/${name}`);
+    if (found === null) continue;
+    const { distance, weak } = found;
+    ranked.push({ name, tier: Math.min(distance, 2), distance, weak, ms: Math.round(weights.get(name) ?? 0) });
   }
-  ranked.sort((a, b) => a.tier - b.tier || a.distance - b.distance || a.ms - b.ms || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  // Within a tier, strongly related tests (imports, path mentions) come before weak ones (a bare root-name mention).
+  ranked.sort((a, b) => a.tier - b.tier || Number(a.weak) - Number(b.weak) || a.distance - b.distance || a.ms - b.ms || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   const selected = [];
   const skipped = [];
   let estimatedMs = 0;
