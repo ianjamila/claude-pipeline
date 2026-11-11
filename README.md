@@ -203,7 +203,7 @@ working exactly as before.
   nothing when you are current:
   - `pipeline update available — installs automatically when no review is running`
   - `pipeline update waiting on a review in <repo> #N` (or just the repo, or `a running review`)
-  - `pipeline update waiting: could not check for running reviews — run pipeline update --scheduled in your own terminal to see why` (every blocker is a scan error, not a review)
+  - `pipeline update waiting: could not check for running reviews — run pupdate --scheduled in your own terminal to see why` (every blocker is a scan error, not a review)
   - `pipeline update needs you: run pupdate` (blocked or failed)
 - **A stated limit.** The swap replaces the guard hooks one by one. A guard hook that Claude Code
   starts in the instant its own file is being swapped is **refused** (the loader fails closed,
