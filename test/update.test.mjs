@@ -995,3 +995,11 @@ test('scheduled, real installer: a live review lease defers (exit 0), names the 
   assert.equal(status.state, 'deferred-by-review');
   assert.equal(status.deferredBy[0].repo, 'acme/app');
 });
+
+// R2-F4: on Windows an environment name is case-insensitive, so a mixed-case spelling reaches the child's PIPELINE_TEST_MODE lookup all the same.
+test('R2-F4: an installed copy strips a seam whatever the case of its name; a checkout caller keeps it', () => {
+  const mixed = { Pipeline_Test_Mode: '1', pipeline_review_lease_dir: '/x', Pipeline_Install_Account_Home: '/a', PIPELINE_install_swap_gate: '/g' };
+  const base = { PATH: '/p', PIPELINE_LOCK_DIR: '/l' };
+  assert.deepEqual(installerEnv({ ...base, ...mixed }, { installed: true }), base);
+  assert.deepEqual(installerEnv({ ...base, ...mixed }, { installed: false }), { ...base, ...mixed });
+});

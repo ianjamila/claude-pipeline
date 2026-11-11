@@ -97,7 +97,8 @@ function fetchSource(tmp, isoDir, sha, remote) {
 // variables that make Node load other code into it (NODE_OPTIONS `--require` / `--import`, NODE_PATH); the tests'
 // PIPELINE_ADMIN / PIPELINE_INSTALL_NO_PROBES / PIPELINE_LOCK_DIR pass through.
 // The downloaded installer has no INSTALLED.json beside it, so it would honour every checkout-only test seam; an INSTALLED caller therefore hands it none
-// (seams.mjs SEAM_VARS plus the seams of the installer, the review leases, the model floor and the update notice). The suite (a checkout) still passes them.
+// (seams.mjs SEAM_VARS plus the seams of the installer, the review leases, the model floor and the update notice), matched without regard to case (on Windows an
+// environment name is case-insensitive). The suite (a checkout) still passes them.
 const NODE_INJECTION_VARS = new Set(['NODE_OPTIONS', 'NODE_PATH']);
 export const INSTALLER_SEAM_VARS = new Set([
   ...SEAM_VARS,
@@ -106,7 +107,7 @@ export const INSTALLER_SEAM_VARS = new Set([
   'PIPELINE_UPDATE_STATUS_FILE', 'PIPELINE_UPDATE_NOTICE_DELAY_MS',
 ]);
 export function installerEnv(env, { installed = isInstalledCopy() } = {}) {
-  return Object.fromEntries(Object.entries(env).filter(([k, v]) => v !== undefined && !NODE_INJECTION_VARS.has(k.toUpperCase()) && !(installed && INSTALLER_SEAM_VARS.has(k))));
+  return Object.fromEntries(Object.entries(env).filter(([k, v]) => v !== undefined && !NODE_INJECTION_VARS.has(k.toUpperCase()) && !(installed && INSTALLER_SEAM_VARS.has(k.toUpperCase()))));
 }
 
 // The download lives under <home>/pipeline-state/tmp, and only an installer that knows that root (install.mjs imports
