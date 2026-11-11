@@ -254,3 +254,71 @@ test('8. the sweep re-queue of a branch that contains the marker commit still go
   });
   assert.equal(ran(root), true, 'the command ran for the re-queue');
 });
+
+// ---- a failed read on a re-queue is a blip, not a verdict (R1-F5) ---------------------------------------------------------------------
+
+test('9. the in-process re-queue whose marker / ancestry read THROWS is queue-unreadable: nothing enqueued, the record stays live, the hold stays lifted', async () => {
+  for (const [why, over] of [['the marker read throws', { marker: new Error('HTTP 502') }], ['the ancestry compare throws', { rel: new Error('HTTP 502') }]]) {
+    const root = repoDir();
+    openRecord(root, PR, H, APPROVAL, { ...IDENT, route: 'owner-go' });
+    setHold(root, PR, HOLD);
+    beginAttempt(root, PR, H, APPROVAL, IDENT);
+    confirmAttempt(root, PR, 'MQE_1');
+    const gh = stub({ ...over, states: [inQ(), st()], events: [FIRST] });
+    const res = await routeFor(root, gh, customConfig()).enqueueAndWatch({ watchOnly: true });
+    assert.equal(res.output.error, 'queue-unreadable', why);
+    assert.match(res.output.reasons[0], /HTTP 502/, why);
+    assert.equal(readQueueRecord(root, PR).terminal, null, `${why}: the record is kept`);
+    assert.equal(readQueueRecord(root, PR).attempts, 1, `${why}: no second attempt`);
+    assert.deepEqual(gh.labels, [], `${why}: the hold was not put back`);
+    assert.deepEqual(writes(gh), [], why);
+    assert.equal(ran(root), false, why);
+  }
+});
+
+test('10. a re-queue where the base declares NO usable marker (structural, not a blip) still ends the record blocked and puts the hold back', async () => {
+  for (const [why, over] of [['no file', { marker: NO_FILE }], ['a malformed marker', { marker: 'soon\n' }], ['a marker commit GitHub does not know', { rel: http(404) }]]) {
+    const root = repoDir();
+    openRecord(root, PR, H, APPROVAL, { ...IDENT, route: 'owner-go' });
+    setHold(root, PR, HOLD);
+    beginAttempt(root, PR, H, APPROVAL, IDENT);
+    confirmAttempt(root, PR, 'MQE_1');
+    const gh = stub({ ...over, states: [inQ(), st()], events: [FIRST] });
+    const res = await routeFor(root, gh, customConfig()).enqueueAndWatch({ watchOnly: true });
+    assert.equal(res.output.error, 'queue-branch-predates-switch', why);
+    assert.equal(res.output.branchState, 'unknown', why);
+    assert.equal(readQueueRecord(root, PR).terminal, 'blocked', why);
+    assert.deepEqual(gh.labels, ['needs-human'], why);
+  }
+});
+
+test('11. the sweep\'s re-queue whose read THROWS leaves the record live for the next pass (unsettled): no end, no hold restore, nothing enqueued', async () => {
+  for (const [why, over] of [['the marker read throws', { marker: new Error('HTTP 502') }], ['the ancestry compare throws', { rel: new Error('HTTP 502') }]]) {
+    const root = repoDir();
+    execFileSync('git', ['-C', root, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'one']);
+    openRecord(root, PR, H, APPROVAL, { ...IDENT, route: 'owner-go' });
+    setHold(root, PR, HOLD);
+    beginAttempt(root, PR, H, APPROVAL, IDENT);
+    confirmAttempt(root, PR, 'MQE_1');
+    const gh = stub({ ...over, states: [st()], events: [FIRST] });
+    const said = [];
+    const res = await sweepRepo({
+      root, env: { PIPELINE_LOCK_DIR: mkdtempSync(join(tmpdir(), 'cp-predates-locks-')), ...ENV }, notify: (t) => said.push(t), makeGh: () => gh, sleep: async () => {}, headOf: () => H,
+      loadCfg: async () => ({ ok: true, config: customConfig() }), recheckFn: async () => ({ ok: true }),
+    });
+    assert.deepEqual(res.errors, [], why);
+    assert.equal(res.settled[0].outcome, 'unsettled', why);
+    assert.equal(readQueueRecord(root, PR).terminal, null, `${why}: the record is kept`);
+    assert.deepEqual(gh.labels, [], `${why}: no hold restore`);
+    assert.deepEqual(writes(gh), [], why);
+    assert.equal(ran(root), false, why);
+    assert.deepEqual(said, [], `${why}: the owner is not told of an end that did not happen`);
+  }
+});
+
+test('12. the FIRST enqueue with a read that throws still refuses queue-branch-predates-switch (nothing to keep; the owner is told how to proceed)', async () => {
+  const root = repoDir();
+  const res = await routeFor(root, stub({ marker: new Error('HTTP 502') }), customConfig()).enqueueAndWatch();
+  assert.equal(res.output.error, 'queue-branch-predates-switch');
+  assert.equal(res.output.branchState, 'unknown');
+});

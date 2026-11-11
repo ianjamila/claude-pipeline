@@ -365,10 +365,14 @@ export function createQueueRoute({
   // refused, nothing queued, nothing run. -> null | the refusal output.
   // `closeRecord`: a live record (a re-queue after a removal) ends 'blocked' with the hold put back, as every other unmerged end does; the sweep's
   // re-queue leaves that to settleRecord, which ends the record on the { ok: false } it gets back.
-  async function branchPredatesQueue({ closeRecord: ends = true } = {}) {
+  // `requeue`: the head already passed this check at its first enqueue, so a read that THREW (a GitHub blip: state.unreadable) must not spend the owner's word on a
+  // refusal: it answers queue-unreadable (nothing enqueued, the record kept, the next pass or the owner's `P merge` tries again, the sweep reads that as unsettled).
+  // Only a structural unknown (no usable marker) or a branch that lacks the commit ends it. A first enqueue has nothing to keep: it refuses either way.
+  async function branchPredatesQueue({ closeRecord: ends = true, requeue: again = false } = {}) {
     if (isDefaultMergeCommand(config)) return null;
     const state = queueCatchUpState({ gh, branch: config.default_branch, head });
     if (!state.needed) return null;
+    if (again && state.unreadable) return unreadable('the commit the base names in .claude/merge-queue-aware could not be checked for the re-queue (nothing was enqueued, the record is kept; run `P merge` again or wait for the next `queue-sweep`)', state.why);
     const holdFields = ends && liveRecord() !== null ? await terminal('blocked') : {};
     return refusal('queue-branch-predates-switch', [predatesQueueMessage({ pr, state })], {
       queued: false, branchState: state.kind, queueAwareSha: state.queueAwareSha, ...holdFields,
@@ -429,7 +433,7 @@ export function createQueueRoute({
     try {
       for (;;) {
         if (enqueueNow) {
-          const old = await branchPredatesQueue();
+          const old = await branchPredatesQueue({ requeue: requeued === 1 });
           if (old !== null) return old;
           openRecord(root, pr, head, approval, opts);
           // SEAM (hold): the record exists, no attempt yet. This is where a lifted needs-human hold is written to it (setHold, owner 'session'),
@@ -480,7 +484,7 @@ export function createQueueRoute({
   // -> { ok: true } | { done } (a refusal or a merge the confirm found).
   async function reenqueue() {
     requeued = 1;
-    const old = await branchPredatesQueue({ closeRecord: false });
+    const old = await branchPredatesQueue({ closeRecord: false, requeue: true });
     if (old !== null) return { done: old };
     openRecord(root, pr, head, approval, opts);
     beginAttempt(root, pr, head, approval, opts);
