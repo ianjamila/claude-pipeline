@@ -1626,6 +1626,11 @@ function isPipelineTool(arg, ctx) {
   if (ctx.platform !== 'win32' && (arg.includes('\\') || expandKeepingBackslash(arg, ctx).includes('\\'))) return false; // (also one a same-line variable brings in: `D='a\b'; node .../hooks/$D/../../x.mjs`, R8-F2)
   const e = expandRefs(arg, ctx);
   if (!isAbs(e)) return false;
+  // A trusted tool path never needs a part that is only known at run time. One left in the expanded operand (`$U`, `${U}`, `$(..)`, a backtick, `%U%` on Windows, a `~`) can be an EMPTY segment
+  // there, so `hooks/$U/$U/$U/../../../repo/x.mjs` climbs out of hooks although it normalises inside (R9-F2). (A `~` inside the home folder's own spelling, a Windows 8.3 name, is not one.)
+  const home = String(ctx.homePosix ?? '');
+  const tail = home && e.toLowerCase().startsWith(home.toLowerCase()) ? e.slice(home.length) : e;
+  if (/[$`~]/.test(tail) || (ctx.platform === 'win32' && /%[^%/\\]*%/.test(tail))) return false;
   if (OWNER_GO_RECORDER.test(e)) return false;
   // An ALLOW check, so a false match fails open: ask the disk, not the case-folded spelling. On a case-sensitive volume a differently-cased
   // pipeline directory is another, agent-writable one. When the disk cannot answer (a stat error, a missing file) only the EXACT spelling matches,
@@ -1713,9 +1718,15 @@ function ghReadOnly(args, cmd, ctx) {
   if (words[0] === 'api') return !args.some((a) => /^(?:-o|--output|--cache)/.test(a));
   return Object.hasOwn(GH_PRINTERS, words[0] ?? '') && GH_PRINTERS[words[0]].includes(words[1]);
 }
+// The PowerShell tool only: the Bash parser cuts the line into commands, and there a backslash ESCAPES the next character, so a backslash before `;` `|` `&` a quote or a backtick, or at a line end, is
+// literal text to it, while PowerShell reads the backslash as an ordinary character and the next one as syntax (`node hook.mjs \; Set-Content settings.json x` looks like ONE node command, R9-F3).
+// The commands the parser saw are not those PowerShell runs, so on such a line NO command is read-only. (Decided once per line, in isReadOnly, which every judgement of a command passes through: the final
+// protected-file check then sees node / echo as an ordinary command that names a protected file and refuses it. A line without the sequence is judged as before.)
+const PS_ESCAPED_SYNTAX = /\\(?:[;|&"'`\r\n]|$)/;
 function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
   if (!argv.length) return false;
+  if (ctx.psHazard) return false;
   const name = baseOf(argv[0]);
   const args = argv.slice(1);
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
@@ -1732,7 +1743,12 @@ function isReadOnly(cmd, ctx) {
   if (name === 'openssl') return args[0] === 'dgst' && !args.some((a) => a === '-out' || a === '-sign' || a === '-prverify');
   if ((name === 'python' || name === 'python3') && args[0] === '-m' && args[1] === 'json.tool') return positional(args.slice(2)).length <= 1;
   if (isPipelineTool(argv[0], ctx)) return true;
-  if (name === 'node') return isPipelineTool(argv[1], ctx) || (cmd.raw.includes('\\') && pipelineToolInRaw(cmd.raw, ctx));
+  if (name === 'node') {
+    // Under the PowerShell tool a backslash is a path separator, but the Bash parser dropped it from argv[1] (`hooks/x\..\..\repo\evil.mjs` arrives as one plain name inside hooks): when the text holds a
+    // backslash the argv word is NEVER the operand, only the raw text decides (R9-F1; pipelineToolInRaw refuses `..`). Without one, argv[1] is the word PowerShell reads too, so the tilde form stays trusted.
+    if (ctx.shell === 'powershell' && cmd.raw.includes('\\')) return pipelineToolInRaw(cmd.raw, ctx);
+    return isPipelineTool(argv[1], ctx) || (cmd.raw.includes('\\') && pipelineToolInRaw(cmd.raw, ctx));
+  }
   if (name === 'pwsh' || name === 'powershell') return pwshReadOnly(argv);
   return PS_READ_ONLY.has(name);
 }
@@ -3049,6 +3065,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (opts._assignPins && opts._assignPins.text === command) ctx.assignPins = opts._assignPins.pins; // (this text's assignment readings, see assignReadings)
   if (opts._loopPins && opts._loopPins.text === command) ctx.loopPins = opts._loopPins.pins; // (this text's loop readings; see evaluateBashForFilesUnchecked)
   ctx.lineDefs = definedNames(typeof command === 'string' ? command : '');
+  ctx.psHazard = ctx.shell === 'powershell' && typeof command === 'string' && PS_ESCAPED_SYNTAX.test(command); // (see PS_ESCAPED_SYNTAX)
   ctx.ghLine = typeof command === 'string' ? command : ''; // (ghReadOnly: what the line says about gh's variables and configuration)
   ctx.assigned = assigningDefaults(typeof command === 'string' ? command : ''); // (and those of the line this text was made from: `: ${X:=w}; G=bash; $G $X`)
   for (const [n, ws] of opts._assigned ?? []) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);

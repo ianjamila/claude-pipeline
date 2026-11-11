@@ -267,3 +267,67 @@ test('on win32 the PowerShell route refuses typographic quotes and any non-ASCII
   assert.equal(psW(`node "${WHOOKS}\\guard-files.mjs"`), 'allow');
   assert.equal(psW('node C:/Users/u/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow', 'forward slashes');
 });
+
+// R9-B1: the unknown-directory re-run (`cd $DEST; ...`) judges the SAME top-level text with another working directory, so it keeps the tool's shell; only text read from disk is forced to Bash.
+test('R9-B1: on win32 a PowerShell `cd $DEST; node <CLI>` line stays trusted (the cd re-run keeps the PowerShell shell)', () => {
+  assert.equal(psW(`cd $DEST; node ${WCLI} preflight`), 'allow');
+  assert.equal(psW(`cd $DEST; node "${WCLI}" preflight`), 'allow');
+  assert.equal(psW(`cd $DEST; node ${WHOOKS}\\guard-files.mjs`), 'allow');
+  assert.equal(bashW(`cd $DEST; node ${WCLI} preflight`), 'deny', 'Bash: still a drive-relative file');
+  assert.equal(psW(`cd $DEST; node ${WHOOKS}\\..\\..\\..\\tmp\\x.mjs`), 'deny', 'a climbing path is still refused after the cd');
+});
+
+// R9-F1: under PowerShell the Bash-parsed argv word is never the operand (that parser drops unquoted backslashes, so `hooks/x\..\..\repo\evil.mjs` reads as one plain name inside hooks).
+test('R9-F1: on win32 a mixed-separator PowerShell path that climbs out of hooks with backslash .. segments is not trusted', () => {
+  const up = '\\..\\..\\..\\..\\..\\..\\repo\\evil.mjs';
+  const bare = `node C:/Users/u/.claude/pipeline/hooks/x${up} C:/Users/u/.claude/settings.json`;
+  const quoted = `node "C:/Users/u/.claude/pipeline/hooks/x${up}" C:/Users/u/.claude/settings.json`;
+  const single = `node 'C:/Users/u/.claude/pipeline/hooks/x${up}' C:/Users/u/.claude/settings.json`;
+  for (const c of [bare, quoted, single]) assert.equal(psW(c), 'deny', c);
+  assert.equal(psW('node C:/Users/u/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow', 'forward slashes');
+  assert.equal(psW('node "C:/Users/u/.claude/pipeline/hooks/guard-files.mjs"'), 'allow', 'quoted forward slashes');
+  assert.equal(psW(`node ${WCLI} preflight`), 'allow');
+});
+
+// R9-F2: an operand that still holds a run-time part is not a trusted tool path (an unset variable is an empty segment, so `$U/$U/$U/../../..` climbs out of hooks).
+test('R9-F2: a hooks path with an unexpanded $VAR, ${VAR}, $( ), backtick or mid-path ~ is not trusted on any platform', () => {
+  for (const [platform, home, base] of [['darwin', '/home/u', '/home/u'], ['linux', '/home/u', '/home/u'], ['win32', 'C:\\Users\\u', 'C:/Users/u']]) {
+    const go = (command) => evaluateBashForFiles(command, { ...opts, home, platform, cwd: platform === 'win32' ? 'C:\\repo' : '/repo' }).decision;
+    const h = `${base}/.claude/pipeline/hooks`;
+    const rest = `${base}/.claude/settings.json`;
+    assert.equal(go(`node ${h}/$U/$U/$U/../../../repo/evil.mjs ${rest}`), 'deny', `${platform}: $U`);
+    assert.equal(go(`node ${h}/\${U}/\${U}/\${U}/../../../repo/evil.mjs ${rest}`), 'deny', `${platform}: \${U}`);
+    assert.equal(go(`node "${h}/$U/$U/$U/../../../repo/evil.mjs" ${rest}`), 'deny', `${platform}: quoted $U`);
+    assert.equal(go(`node ${h}/$(true)/../../repo/evil.mjs ${rest}`), 'deny', `${platform}: $( )`);
+    assert.equal(go(`node ${h}/\`true\`/../../repo/evil.mjs ${rest}`), 'deny', `${platform}: backtick`);
+    assert.equal(go(`node ${h}/~/../../repo/evil.mjs ${rest}`), 'deny', `${platform}: ~ mid-path`);
+    assert.equal(go(`node ${h}/guard-files.mjs`), 'allow', `${platform}: the plain hook stays trusted`);
+  }
+  assert.equal(evaluateBashForFiles('node C:/Users/u/.claude/pipeline/hooks/%U%/%U%/%U%/../../../repo/evil.mjs C:/Users/u/.claude/settings.json', WIN).decision, 'deny', 'win32: %VAR%');
+});
+
+// R9-F3: PowerShell text is cut into commands by the Bash parser, where a backslash escapes. A backslash directly before ; | & a quote, a backtick or a line end hides a PowerShell
+// statement inside one apparently read-only command, so such a PowerShell line is refused whole.
+test('R9-F3: a PowerShell line with a backslash before ; | & a quote, a backtick or a line end is refused', () => {
+  const S = 'C:\\Users\\u\\.claude\\settings.json';
+  const lines = [
+    `node ${WHOOKS}\\guard-files.mjs \\; Set-Content ${S} x`,
+    `echo x \\; Set-Content ${S} x`,
+    `echo "a\\" ; Set-Content ${S} x ; \\"b"`,
+    `echo x \\| Set-Content ${S}`,
+    `echo x \\& Set-Content ${S} x`,
+    `echo 'a\\' ; Set-Content ${S} x ; \\'b'`,
+    `echo x \\\`; Set-Content ${S} x`,
+    `echo x \\\nSet-Content ${S} x`,
+    `echo x \\\r\nSet-Content ${S} x`,
+    `node ${WHOOKS}\\guard-files.mjs ${S} \\`,
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  assert.equal(psW(`node ${WHOOKS}\\guard-files.mjs ${S}`), 'allow', 'the same line without the trailing backslash');
+  // ordinary backslash paths with no such sequence are judged as before
+  assert.equal(psW(`node ${WCLI} preflight`), 'allow');
+  assert.equal(psW('echo C:\\Users\\u\\repo\\x.txt; ls C:\\Users\\u\\repo'), 'allow');
+  assert.equal(psW('Get-Content C:\\Users\\u\\repo\\x.txt | Select-Object -First 3'), 'allow');
+  // Bash is untouched: there the backslash IS an escape and the parser reads the line as the shell does
+  assert.equal(bashW('echo x \\; ls'), 'allow');
+});
