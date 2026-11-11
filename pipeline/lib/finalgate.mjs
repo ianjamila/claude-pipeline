@@ -155,7 +155,7 @@ export const localContentHash = (root, config) =>
 
 // `explicit` ({ sha, branch }, --owner-go): scan merge-base(sha, HEAD)..HEAD for the base commit GitHub names (baseRefOid), never a local
 // ref. The commit must be a local object already (no fetch here, and no fallback to origin/<branch> or the local branch).
-function lazyDiff(root, config, explicit = null) {
+export function lazyDiff(root, config, explicit = null) {
   let cached = null;
   return () => {
     if (cached) return cached;
