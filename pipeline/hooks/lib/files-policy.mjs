@@ -1754,15 +1754,21 @@ function judgedWords(name, args, ctx) {
   });
   return { args: out, unknown };
 }
-// R1-B2 / R2-B1 / R2-F1 (#266): bash and zsh read some operands as a variable NAME or an arithmetic expression, and evaluate an array subscript in it (`test -v 'a[$(rm "$T")]'` runs the
+// R1-B2 / R2-B1 / R2-F1 / R3 (#266): bash and zsh read some operands as a variable NAME or an arithmetic expression, and evaluate an array subscript in it (`test -v 'a[$(rm "$T")]'` runs the
 // substitution). Such a call with an operand holding `[`, `$(` or a backtick is no read-only call. The forms: `test` / `[` with -v, -R, -t (zsh reads its operand as arithmetic) or a numeric
 // comparison (-eq -ne -lt -le -gt -ge); `printf -v`; and zsh's printf, which reads the argument of a numeric conversion (%d %i %u %o %x %X %e %E %f %g %G) and of a `*` width / precision as
 // arithmetic with no -v at all. Both the words as written and as expanded are judged (a same-line name may carry the subscript or the option); a printf option word that is still only known
 // at run time can be -v, and a format still only known at run time can hold a numeric conversion.
+// Rounds 1-3 kept finding one more spelling, so the check fails closed for the class (R3): test, `[`, `[[` and printf are no read-only call when ANY word, as written or as expanded, holds a
+// subscript-evaluation form (SUBSCRIPT_FORM: a `[` followed later in the word by `$(`, `${`, `$[` or a backtick), whatever the operator or the format. The precise analysis below stays for the words
+// that only hold a run-time part (`"$(cmd)"`, whose output may be such a form). A same-line assignment whose value holds the form is refused by assignmentOnlyHarmless (PATH_VALUE has no `[`),
+// which matters because zsh evaluates the VALUE of a name read as arithmetic (`y='a[$(…)]'; printf '%d' y`).
 const SUBSCRIPT_EVAL = /[\[`]|\$[({]/;
+const SUBSCRIPT_FORM = /\[[^]*(?:\$[({[]|`)/;
 const PRINTF_PLAIN_SPEC = /^%[-+ #0-9.]*[sbcq]/; // (a conversion whose argument is never read as arithmetic)
+const PRINTF_PERCENT_ESCAPE = /\\(?:[xuU]|[0-7][0-7])/; // (a hex, unicode or octal escape can spell a %: zsh decodes \u0025d to a live %d; a lone \0 or a \n stays plain)
 function printfFormatEvaluates(fmt) {
-  if (/[$`]/.test(fmt)) return true; // (not known)
+  if (/[$`]/.test(fmt) || PRINTF_PERCENT_ESCAPE.test(fmt)) return true; // (not known)
   let rest = fmt.replace(/%%/g, '');
   while (rest.includes('%')) {
     rest = rest.slice(rest.indexOf('%'));
@@ -1777,18 +1783,31 @@ function evaluatesSubscript(name, args, ctx) {
   if (!test && name !== 'printf') return false;
   const expand = (a) => (/[$`]/.test(a) ? expandRefs(a, ctx) : a);
   const words = [...args, ...args.map(expand)];
+  if (words.some((a) => SUBSCRIPT_FORM.test(a))) return true; // (the class rule: whatever the operator or the format)
   if (test) {
+    // an operator that is only known at run time (`test $(echo -v) 'a[…]'`, `[ 'a[…]' $(echo -eq) 1 ]`, `test -$(echo t) …`) can be -v, -t or a comparison
+    const operatorUnknown = args.some((a, i) => { const e = expand(a); return RUNTIME_PART.test(e) && /^[$`-]/.test(e) && args.some((b, j) => j !== i && /[\[`]/.test(expand(b))); });
+    if (operatorUnknown) return true;
     if (!words.some((a) => a === '-v' || a === '-R' || a === '-t' || /^-(?:eq|ne|lt|le|gt|ge)$/.test(a))) return false;
     return words.some((a) => SUBSCRIPT_EVAL.test(a));
   }
   if (!words.some((a) => SUBSCRIPT_EVAL.test(a))) return false;
   if (words.some((a) => /^-v/.test(a))) return true;
-  if (args.length && RUNTIME_PART.test(expand(args[0]))) return true; // (a leading word that can still be -v)
-  const fmt = args.findIndex((a) => !/^-/.test(expand(a))); // (the format: the first word after the options)
-  if (fmt < 0) return false;
+  // the format: the first word that is no option; `--` ends the options (the next word is the format, a dash word or not), a lone `-` is the format itself
+  let fmt = -1;
+  for (let i = 0; i < args.length; i++) {
+    const e = expand(args[i]);
+    if (RUNTIME_PART.test(e)) return true; // (an option or a format only known at run time)
+    if (e !== args[i] && (/^-/.test(args[i]) || /^-/.test(e))) return true; // (a name rewrites a dash word: unknown)
+    if (e === '--') { fmt = i + 1; break; }
+    if (/^-./.test(e)) continue;
+    fmt = i;
+    break;
+  }
+  if (fmt < 0 || fmt >= args.length) return true; // (all options, or `--` and nothing after it)
   const operands = args.slice(fmt + 1);
   if (!operands.some((a) => SUBSCRIPT_EVAL.test(a) || SUBSCRIPT_EVAL.test(expand(a)))) return false;
-  return printfFormatEvaluates(expand(args[fmt]));
+  return printfFormatEvaluates(args[fmt]) || printfFormatEvaluates(expand(args[fmt])); // (the format as written and as expanded)
 }
 function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
