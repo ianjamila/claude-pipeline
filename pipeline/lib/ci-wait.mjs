@@ -26,6 +26,11 @@
 // never makes a check pass. The reader is called lazily, only when such a failure needs dating, once per poll (and again in the
 // pre-report re-read, so a marker posted mid-wait is seen); absent, throwing, or a marker with an unreadable created_at: ignored,
 // the status is dated by the ready event alone, as before.
+// A run that started BEFORE the marker can still publish its failure a few seconds AFTER it (the label changes that follow the
+// marker start the recheck run, which cancels the old one only then). So such a failure is ALSO stale when its target_url is a
+// GitHub Actions run (`.../actions/runs/<id>`, job suffix ignored) whose run_started_at (else created_at) is strictly before
+// T_marker. The run is read lazily through the optional `readers.workflowRun(id)`, once per run per poll; an absent reader, an
+// unreadable run, an unreadable time or a url that is not an Actions run falls back to the created_at rule alone (never a pass).
 // Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
 // created_at. Freshness that cannot be read counts as fresh (fail fast).
 // A needs:-gated aggregate (EW "Typecheck + Vitest") is only created when its shard jobs finish, ~8-12 min after ready, so a
@@ -120,6 +125,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   let lastError = null;
   let readyAtMemo;
   let markerAtMemo; // ms of the newest review-complete marker of the head, or null; per poll, like readyAtMemo
+  let runStartMemo = new Map(); // Actions run id -> ms the run started, or null (unreadable); per poll, like markerAtMemo
   let held = null; // the run that last kept an absent required check waiting past --appear-timeout
   let heldSignature = null;
 
@@ -149,6 +155,24 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       }
     }
     markerAtMemo = at;
+    return at;
+  };
+
+  // ms a GitHub Actions run started (run_started_at, else created_at) for a status's target_url, or null: no run reader, a url
+  // that is not `.../actions/runs/<id>` (a job suffix is ignored), an unreadable run, or an unreadable time. Never throws.
+  const getRunStartedAt = async (targetUrl) => {
+    const id = /\/actions\/runs\/(\d+)(?:[/?#]|$)/.exec(String(targetUrl ?? ''))?.[1];
+    if (!id || !readers.workflowRun) return null;
+    if (runStartMemo.has(id)) return runStartMemo.get(id);
+    let at = null;
+    try {
+      const run = await readers.workflowRun(id);
+      const t = Date.parse(run?.run_started_at ?? run?.created_at);
+      at = Number.isFinite(t) ? t : null;
+    } catch {
+      at = null;
+    }
+    runStartMemo.set(id, at);
     return at;
   };
 
@@ -243,7 +267,12 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       if (at < Date.parse(await getReadyAt(pr))) return true;
       if (status.context !== REVIEW_CONTEXT) return false;
       const marker = await getMarkerAt(pr.head);
-      return marker !== null && at < marker;
+      if (marker === null) return false;
+      if (at < marker) return true;
+      // A guards run that started before the marker can publish its failure after it (the recheck cancels it only later):
+      // dated by when the run that posted it started, strictly before the marker.
+      const started = await getRunStartedAt(status.target_url);
+      return started !== null && started < marker;
     } catch {
       return false;
     }
@@ -351,6 +380,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   const poll = async () => {
     readyAtMemo = undefined;
     markerAtMemo = undefined;
+    runStartMemo = new Map();
     const pr = await readers.pr();
     last = { ...last, pr };
     if (head === null) {
@@ -383,6 +413,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     // failure a newer status already replaced, or an aggregate that appeared after the snapshot, is not reported. Never a third pass.
     const reread = async () => {
       markerAtMemo = undefined; // a review marker posted since the snapshot must be seen
+      runStartMemo = new Map();
       return { checkRuns: await readers.checkRuns(pr.head), statuses: await readers.statuses(pr.head) };
     };
     const decide = async (obs, confirmed) => {
