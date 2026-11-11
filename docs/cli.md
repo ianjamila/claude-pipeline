@@ -9,14 +9,15 @@ blocked · **2** usage or environment error (also: unknown command, unknown flag
 (Codex, GitHub, a deployment that never finished). Flags after a bare `--` belong to the command being run (`job start`).
 `--repo DIR` (default: the current directory) is accepted by every repo-scoped command and resolves to the repository top level.
 
-**GitHub rate limits.** `comment` (and so the triage, summary and park comments), `followups create`, `labels ensure` and
-`review-complete`'s label edits wait out a GitHub rate limit and run again: the whole operation re-reads before it writes, so a
-write that landed before the limit answer is found, not repeated. Only a secondary or primary rate limit is retried (a plain 403, a
+**GitHub rate limits.** Retrying is opt-in per caller. These wait out a GitHub rate limit and run again: `comment` (every kind), `summary`,
+`checkpoint` and the triage publication of `review-complete` and of `triage claude-ruling` / `triage second-review` (the triage and summary
+comments), `review-complete`'s label edits (awaiting-review, recheck), `followups create` and `labels ensure`. The whole operation re-reads before it
+writes, so a write that landed before the limit answer is found, not repeated. Only a secondary or primary rate limit is retried (a plain 403, a
 timeout, a 5xx or a network error is not). The wait is `Retry-After` when gh shows it; else 60 s, then the rest of the cap, for a
 secondary limit; for a primary limit, until the earliest reset among the exhausted resources, and only when that fits the cap (else it
 fails at once and names the reset time). The total wait of one command is capped at 100 s (one budget for all its retried operations); `PIPELINE_GH_RETRY_MS` can only shorten it, and `0`
-turns retrying off. Each wait prints one stderr line. `merge`, the merge hold, the merge queue, `update-branch`, `final-gate` and
-the hooks never retry or sleep.
+turns retrying off. Each wait prints one stderr line. `merge`, the merge hold, the merge queue, `update-branch`, `cost` (its run record is written
+without retry, as `merge` and `update-branch` write theirs), `final-gate` and the hooks never retry or sleep.
 
 ## agent-log
 
