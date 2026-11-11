@@ -1281,8 +1281,13 @@ test('R1-F1: the run is not read for another context, or without a marker, and a
 });
 
 test('R1-F1: the run is read once per poll (memoised), not once per status evaluation', async () => {
-  const s = sim(lateWorld({ workflowRun: { id: 555, run_started_at: BEFORE_MARKER } }));
+  // the pinned and the unpinned Cross-model review are two identities (keyOf), so each poll evaluates the same status twice
+  const s = sim(lateWorld({
+    classic: present(pin('Cross-model review', ACTIONS), 'Cross-model review'),
+    workflowRun: { id: 555, run_started_at: BEFORE_MARKER },
+  }));
   assert.equal((await s.run()).output.verdict, 'passed');
-  // 8 polls to 120 s plus the pre-report re-read; never more than two reads per poll
-  assert.ok(s.reads.runs.length >= 1 && s.reads.runs.length <= 2 * (120 / 15 + 1), String(s.reads.runs.length));
+  // 8 polls (0..105 s) read the run once each with the memo; without it each poll reads twice (16)
+  assert.deepEqual([...new Set(s.reads.runs)], ['555']);
+  assert.equal(s.reads.runs.length, 8, String(s.reads.runs.length));
 });
