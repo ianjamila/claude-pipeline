@@ -18,7 +18,7 @@ import {
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, isTranscriptFile, toPosix, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
-import { OWNER_ENTRY, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
+import { OWNER_ENTRY, linesOf, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
@@ -27,10 +27,13 @@ const REQUEST = `Two items for you.\nHead ${HEAD.slice(0, 12)} · items ${ITEMS}
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'owner-go-unit-'));
 // (R1-B2: a transcript has the shape Claude Code gives it and the guard protects, <config dir>/projects/<project>/<session>.jsonl: the use-time check takes no other)
+// #191 A3: a reply is only read when its opening prompt is in the file (text before the first prompt has no known origin), so a fixture that starts with the agent's text gets a genuine
+// typed owner prompt in front of it. Dedicated orphan-text negatives write their file themselves (test/owner-go-visible-turns.test.mjs).
+const withOpening = (entries) => (entries[0]?.type === 'assistant' ? [{ type: 'user', message: { content: 'go' }, promptId: 'pid-open', ...OWNER_ENTRY }, ...entries] : entries);
 function transcript(dir, entries) {
   mkdirSync(join(dir, '.claude', 'projects', '-repo'), { recursive: true });
   const file = join(dir, '.claude', 'projects', '-repo', `t-${Math.random().toString(36).slice(2)}.jsonl`);
-  writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  writeFileSync(file, linesOf(withOpening(entries))); // (#191 R1-B1: with the uuid / parentUuid chain Claude Code writes)
   return file;
 }
 const user = (text) => ({ type: 'user', message: { content: text } });
@@ -945,7 +948,7 @@ test('#128 a synthetic "merge" or ruling word is never recorded, even when the t
 const AT = Date.parse('2026-11-03T10:00:00Z');
 const nowAt = () => AT;
 const stamp = (ms) => new Date(AT + ms).toISOString();
-const lines = (entries) => `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`;
+const lines = linesOf;
 // A "merge" the hook recorded at AT (before the transcript had it, as it may), then the transcript gets `appended`. Returns the pieces to ask with.
 function mergeWorld(_home, { appended, recordedId = 'pid-m', head = [promptEntry('go'), said(REQUEST)], raw = null } = {}) {
   const home = tmp(); // (a world of its own: records of the same session would answer for each other)
@@ -962,7 +965,8 @@ test('#128 provenance: a record is used only when its transcript entry (found by
   const home = tmp();
   const head = [promptEntry('go'), said(REQUEST)];
   assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] })), [true, true, 'ok'], 'typed by the owner');
-  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', { ...OWNER_META, promptSource: 'queued' }, 'pid-m')] }))[0], true, 'queued while the agent worked');
+  // #191 B2: an answer typed while the agent was busy (promptSource queued) is delivered after whatever the agent printed meanwhile, so it approves nothing (it was 'owner' before)
+  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', { ...OWNER_META, promptSource: 'queued' }, 'pid-m')] })), [false, false, 'provenance'], 'queued while the agent worked');
   for (const [name, meta] of [['scheduled', SCHEDULED_META], ['peer', PEER_META], ['notice', NOTICE_META], ['headless sdk', SDK_META], ['sdk-cli entrypoint', { entrypoint: 'sdk-cli', origin: { kind: 'human' }, promptSource: 'typed' }]]) {
     assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', meta, 'pid-m')] })), [false, false, 'provenance'], name);
   }
@@ -1570,6 +1574,14 @@ test('#128 legacy grant: no transcript_path / prompt_id: the owner\'s typed word
   assert.equal(ownerGrantGap(w.q), 'ok');
   assert.deepEqual(w.verify(), [true, undefined]);
   assert.equal(readFileSync(join(ownerGoDir(w.home), `${LEGACY_SESSION}.jsonl`), 'utf8'), `${JSON.stringify(w.record)}\n`, 'the record is not rewritten');
+});
+
+test('#191 B2 legacy grant: a consumed grant (no prompt_id, matched by its words) whose entry is queued is refused at the final gate; the same words typed verify', () => {
+  const queued = legacyWorld({ entries: [promptEntry('go'), said(RASK), typed('extra round', { ...OWNER_META, promptSource: 'queued' })] });
+  assert.equal(ownerGrantGap(queued.q), 'provenance');
+  assert.deepEqual(ownerGrantedRounds(queued.q), []);
+  assert.deepEqual(queued.verify(), [false, 'provenance']);
+  assert.deepEqual(legacyWorld({ entries: legacyEntries }).verify(), [true, undefined], 'typed: unchanged');
 });
 
 test('#128 legacy grant: one real transcript reached through a symlinked second config dir counts once', () => {

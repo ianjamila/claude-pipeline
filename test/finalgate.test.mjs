@@ -12,7 +12,7 @@ import {
 } from '../pipeline/lib/finalgate.mjs';
 import { verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
 import { claimGrantMarkers, grantIdOf, recordRoundGrant } from '../pipeline/hooks/lib/owner-go.mjs';
-import { OWNER_ENTRY } from './helpers/owner-go.mjs';
+import { OWNER_ENTRY, linesOf } from './helpers/owner-go.mjs';
 import { assertOnlyFails, named, scenario } from './helpers/gate-env.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { writeReviewJson } from '../pipeline/lib/cmd-io.mjs';
@@ -384,11 +384,11 @@ function ownerWorld() {
     const transcript = join(home, '.claude', 'projects', '-repo', `t-${randomUUID()}.jsonl`);
     const promptId = `pid-${randomUUID()}`;
     const reply = `Round ${k - 1} left items open.\n🔁 Extra review round needed #${pr}: round ${k} · head ${at.slice(0, 12)} · repo ${repo}`;
-    writeFileSync(transcript, `${[
+    writeFileSync(transcript, linesOf([
       { type: 'user', message: { content: 'go' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
       { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
       { type: 'user', message: { content: prompt }, promptId, ...OWNER_ENTRY },
-    ].map((e) => JSON.stringify(e)).join('\n')}\n`);
+    ]));
     const record = recordRoundGrant({ hook_event_name: 'UserPromptSubmit', session_id: `test-${randomUUID()}`, transcript_path: transcript, cwd: dir, prompt, prompt_id: promptId }, { home });
     assert.ok(record, 'the recorder wrote the grant');
     if (claim) assert.equal(claimGrantMarkers([record], { repo, pr, k: claimK, head: claimed, checkout: dir }, { home }).ok, true);
