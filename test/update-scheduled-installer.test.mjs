@@ -44,6 +44,10 @@ if (mode === 'exit3-plain' && !process.argv.includes('--check')) {
   console.log(JSON.stringify({ ok: false, error: 'something-else' }));
   process.exit(3);
 }
+if (mode === 'verify-failed' && !process.argv.includes('--check')) {
+  console.log(JSON.stringify({ ok: false, error: 'verify-failed', verify: { ok: false, drift: [{ message: 'hook a is missing' }, { message: 'unit b differs' }] } }));
+  process.exit(1);
+}
 if (mode === 'drift' && process.argv.includes('--check')) {
   console.log(JSON.stringify({ ok: false, drift: [{ message: 'hook a is missing' }, { message: 'unit b differs' }] }));
   process.exit(1);
@@ -164,6 +168,19 @@ test('installer --check reporting drift after the install: ONE notice carrying t
   assert.deepEqual([t.r.exitCode, t.r.output.error], [1, 'check-failed']);
   assert.deepEqual(t.r.output.drift, ['hook a is missing', 'unit b differs']);
   assert.equal(t.argv.length, 2, 'install, then --check');
+  assert.equal(t.notices.length, 1);
+  assert.match(t.notices[0], /did not verify: hook a is missing; unit b differs/);
+  assert.match(t.notices[0], /will not be retried/);
+  assert.deepEqual([t.status.state, t.status.reason], ['failed', 'check-failed']);
+  assert.deepEqual(t.leftovers, []);
+});
+
+// R1-B3: with --require-no-live-reviews the installer verifies its own install and answers exit 1 {error: 'verify-failed', verify: {drift}}.
+test('installer exit 1 {error: verify-failed, verify.drift}: a verification failure with its drift (one notice, not retried), not a generic install-failed', async () => {
+  const t = await scheduledRun('verify-failed');
+  assert.deepEqual([t.r.exitCode, t.r.output.error], [1, 'check-failed']);
+  assert.deepEqual(t.r.output.drift, ['hook a is missing', 'unit b differs']);
+  assert.equal(t.argv.length, 1, 'the installer already verified: no second --check');
   assert.equal(t.notices.length, 1);
   assert.match(t.notices[0], /did not verify: hook a is missing; unit b differs/);
   assert.match(t.notices[0], /will not be retried/);

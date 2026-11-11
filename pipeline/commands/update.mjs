@@ -250,6 +250,13 @@ async function performUpdate({ home, main, before, relation, env, say, expectIns
     if (expectInstalled && install.json?.error === 'expect-installed-mismatch') {
       return fail('install-changed', install.json.message || 'the installed copy changed while the update was downloading, so it was left alone');
     }
+    // The gated installer verifies its own install before it lets go of admission: exit 1 {error: 'verify-failed', verify: {drift}}. That is a
+    // verification failure (the same record as a failed --check below: the drift is kept and the scheduled run does not retry this sha), not an install failure.
+    if (install.json?.error === 'verify-failed') {
+      const drift = (Array.isArray(install.json.verify?.drift) ? install.json.verify.drift : []).map((d) => d?.message ?? String(d));
+      result.check = { ok: false, exitCode: install.code, drift };
+      return fail('check-failed', `the install did not verify: ${drift.slice(0, 5).join('; ') || 'the installer reported verify-failed'}`, { stderr: install.stderr, drift });
+    }
     if (!install.ok) return fail('install-failed', install.json?.error || install.stderr || `install.mjs exited ${install.code}`, { stderr: install.stderr });
     const check = runInstaller(src, ['--check', ...common], env);
     result.check = { ok: check.ok, exitCode: check.code, drift: check.json?.drift ?? [] };
