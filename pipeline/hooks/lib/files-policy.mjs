@@ -1630,7 +1630,8 @@ function isPipelineTool(arg, ctx) {
   // there, so `hooks/$U/$U/$U/../../../repo/x.mjs` climbs out of hooks although it normalises inside (R9-F2). (A `~` inside the home folder's own spelling, a Windows 8.3 name, is not one.)
   const home = String(ctx.homePosix ?? '');
   const tail = home && e.toLowerCase().startsWith(home.toLowerCase()) ? e.slice(home.length) : e;
-  if (/[$`~]/.test(tail) || (ctx.platform === 'win32' && /%[^%/\\]*%/.test(tail))) return false;
+  // A glob is such a part too (zsh `**/` matches zero folders, so `hooks/**/**/**/../../../tmp/x.mjs` normalises inside hooks and expands outside, R10-F2): refused with the other shell-special characters.
+  if (/[$`~*?[\](){}#^]/.test(tail) || (ctx.platform === 'win32' && /%[^%/\\]*%/.test(tail))) return false;
   if (OWNER_GO_RECORDER.test(e)) return false;
   // An ALLOW check, so a false match fails open: ask the disk, not the case-folded spelling. On a case-sensitive volume a differently-cased
   // pipeline directory is another, agent-writable one. When the disk cannot answer (a stat error, a missing file) only the EXACT spelling matches,
@@ -1725,6 +1726,15 @@ function ghReadOnly(args, cmd, ctx) {
 // Deny by default: a backslash followed by anything but a plain path character [A-Za-z0-9._-], or by the end of the text, is a hazard. A denylist of escaped characters missed `\$(`, `\@(`, `\{`, `\<` and the rest.
 // That includes `\\` (UNC or a doubled separator) and `\/`: no trusted tool path or ordinary path in the tests needs them, and either can hide the same split, so they are refused too.
 const PS_ESCAPED_SYNTAX = /\\(?![A-Za-z0-9._-])/;
+// ... and the same decision for the whole line (R10-B1 / F1 / F3), deny by default: PLAIN text is printable ASCII, tab, newline (CRLF counts as one) and nothing PowerShell reads differently. Anything else is
+// not plain: another character (a typographic quote, a no-break space, a lone CR or other control character), a backtick (PowerShell's escape), a here-string `@"` / `@'`, a block comment `<#` / `#>`,
+// the stop-parsing token `--%`, or a backslash escape (PS_ESCAPED_SYNTAX). Used with a protected-path reference (step 5 of evaluateBashForFilesFrame), never alone.
+const PS_NOT_PLAIN_CHARS = /[^\x20-\x7E\t\n]/;
+const PS_NOT_PLAIN_SYNTAX = /@["']|<#|#>|`|--%/;
+const psUnparsed = (raw) => {
+  const text = raw.replace(/\r\n/g, '\n');
+  return PS_NOT_PLAIN_CHARS.test(text) || PS_NOT_PLAIN_SYNTAX.test(text) || PS_ESCAPED_SYNTAX.test(text);
+};
 function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
   if (!argv.length) return false;
@@ -3383,6 +3393,13 @@ function evaluateBashForFilesFrame(command, opts) {
   if (tooMany) ctx.dynamic = true;
   const insideRoot = opts._writesOnly !== true && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTranscriptBelow(d) || (/[*?[]/.test(d) && m.configDirGlob(d))); // cwd or a `cd` target is a protected dir (or its parent): relative words and bare commands reach it
   const protectedInRaw = m.rawHit(scanRaw, dirs);
+
+  // The PowerShell tool only, decided once for the whole line (R10-B1 / F1 / F3): the commands the Bash parser cut the line into are not what PowerShell runs when the text holds anything PowerShell reads
+  // differently, so neither a command's read-only judgement nor the destination-only filter of cp / rsync / install (which never asks it) can be relied on. A line that names a protected path (in the raw text,
+  // unmasked; also with PowerShell's backticks removed, `.c`laude` is `.claude`; or runs inside a protected directory) and is not plain text is refused outright. See psUnparsed.
+  if (ctx.shell === 'powershell' && psUnparsed(raw) && (insideRoot || m.rawHit(raw, dirs) || (raw.includes('`') && m.rawHit(raw.replace(/`/g, ''), dirs)))) {
+    return deny(`the PowerShell command refers to a protected pipeline file (or the directory that holds it) and holds text PowerShell reads differently from the guard's parser (a non-ASCII character such as a typographic quote, a backtick, a here-string @" or @', a block comment <# #>, --%, a control character, or a backslash before a non-path character), so what it runs cannot be checked; write it as plain ASCII text with no such syntax (${PROTECTED_MSG})`);
+  }
 
   // #58: running the owner-go recorder (any copy) by hand would write an owner "merge" the owner never typed. Only Claude Code runs it,
   // on the owner's prompt. Reading, diffing or committing the file stays allowed: only a runtime (or the file run by path) is refused.

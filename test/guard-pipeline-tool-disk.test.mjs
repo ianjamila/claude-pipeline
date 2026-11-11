@@ -367,3 +367,67 @@ test('a PowerShell line with a backslash before any character but a plain path c
   assert.equal(bashW('echo \\$HOME'), 'allow');
   assert.equal(bashW('echo x \\( \\) \\{ \\<'), 'allow');
 });
+
+// R10-B1 / R10-F1 / R10-F3: the Bash parser can miss a statement PowerShell runs, and the destination-only filter (cp / rsync / install) and the early allow never ask isReadOnly. So on a PowerShell line the
+// decision is made once, for the whole line: it names a protected path (also with PowerShell's backticks removed) AND holds anything outside a plain ASCII allowlist = refused outright.
+test('R10-B1: a PowerShell cp / rsync / install line with an escaped `;` and a protected write is refused', () => {
+  const S = 'C:/Users/u/.claude/settings.json';
+  for (const c of [`cp a b \\; Set-Content ${S} x`, `rsync a b \\; Set-Content ${S} x`, `install a b \\; Set-Content ${S} x`, `cp -t d a \\| Set-Content ${S} x`]) assert.equal(psW(c), 'deny', c);
+});
+
+test('R10-F1: a PowerShell line that hides a statement behind typographic quotes, a here-string or a block comment is refused', () => {
+  const S = 'C:/Users/u/.claude/settings.json';
+  const lines = [
+    `echo \u2018 " \u2019 ; Set-Content ${S} x ; echo \u2018 " \u2019`,
+    `echo \u201C ' \u201D ; Set-Content ${S} x ; echo \u201C ' \u201D`,
+    `echo @"\n" '\n"@ ; Set-Content ${S} x ; echo '' #'`,
+    `echo @'\n" '\n'@ ; Set-Content ${S} x`,
+    `echo x <# #>; Set-Content ${S} x`,
+    `echo x <#\n#>; Set-Content ${S} x`,
+    `echo x --% ; Set-Content ${S} x`,
+    `echo x\r Set-Content ${S} x`,
+    `echo x\u00A0; Set-Content ${S} x`,
+    `cp a b <# #>; Set-Content ${S} x`,
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  // the same lines without the protected path are judged as before
+  assert.equal(psW('echo \u2018 " \u2019 ; Get-ChildItem C:/repo ; echo \u2018 " \u2019'), 'allow');
+  assert.equal(psW('echo x <# #>; Get-ChildItem C:/repo'), 'allow');
+  // Bash is untouched
+  assert.equal(bashW(`echo \u2018 x \u2019 ${S}`), 'allow');
+  assert.equal(bashW(`echo x <# #>; echo ${S}`), 'allow');
+});
+
+test('R10-F3: a PowerShell backtick may spell a protected path, so a line with one that names it (backticks removed) is refused', () => {
+  const lines = [
+    'Set-Content C:/Users/u/.c`laude/settings.json x',
+    'Set-Content C:/Users/u/.claude/set`tings.json x',
+    'cp a C:/Users/u/.cl`aude/settings.json',
+    'echo x ; Set-Content "C:/Users/u/.c`laude/settings.json" x',
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', c);
+  // a backtick on a line that names nothing protected is judged as before; so is Bash with a backtick and a protected read
+  assert.equal(psW('Write-Output "a`nb"'), 'allow');
+  assert.equal(bashW('echo `true` C:/Users/u/.claude/settings.json'), 'allow');
+});
+
+test('R10: a plain PowerShell read of a protected file is still allowed', () => {
+  assert.equal(psW('Get-Content C:/Users/u/.claude/settings.json'), 'allow');
+  assert.equal(psW('Get-Content C:\\Users\\u\\.claude\\settings.json | Select-Object -First 3'), 'allow');
+  assert.equal(psW('cat C:/Users/u/.claude/settings.json; ls C:/repo'), 'allow');
+  assert.equal(psW('Set-Content C:/Users/u/.claude/settings.json x'), 'deny');
+});
+
+// R10-F2: a glob in the operand is a part only known at run time too (zsh `**/` matches zero folders), so a trusted tool path holds none.
+test('R10-F2: a hooks path with a glob character is not a trusted tool on any platform', () => {
+  for (const [platform, home, base] of [['darwin', '/home/u', '/home/u'], ['linux', '/home/u', '/home/u'], ['win32', 'C:\\Users\\u', 'C:/Users/u']]) {
+    const go = (command) => evaluateBashForFiles(command, { ...opts, home, platform, cwd: platform === 'win32' ? 'C:\\repo' : '/repo' }).decision;
+    const h = `${base}/.claude/pipeline/hooks`;
+    const rest = `${base}/.claude/settings.json`;
+    assert.equal(go(`node ${h}/**/**/**/../../../tmp/evil.mjs ${rest}`), 'deny', `${platform}: **/`);
+    assert.equal(go(`node "${h}/**/**/**/../../../tmp/evil.mjs" ${rest}`), 'deny', `${platform}: quoted **/`);
+    for (const g of ['*', '?', '[a]', '{a,b}', '(x)', '#x', '^x']) assert.equal(go(`node ${h}/${g}/../../../tmp/evil.mjs ${rest}`), 'deny', `${platform}: ${g}`);
+    for (const g of ['*', '**', '?', '[a-z]']) assert.equal(go(`node ${h}/${g}/../guard-files.mjs ${rest}`), 'deny', `${platform}: ${g} then .. (stays inside hooks lexically)`);
+    assert.equal(go(`node ${h}/guard-files.mjs ${rest}`), 'allow', `${platform}: the plain hook stays trusted`);
+  }
+});
