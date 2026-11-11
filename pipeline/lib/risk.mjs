@@ -104,6 +104,14 @@ export function isLightLane({ level, changedLines, hits, config }) {
   return level === 'low' && hits.length === 0 && changedLines < cap;
 }
 
+// Is this changed file (one entry of diffFiles) on a sensitive path: risk.high_risk_paths or review.arbiter_always_paths, old OR new path, matched
+// like reviewLane does. Throws a TypeError for a config list that is not an array of strings (the callers fail closed on it).
+export function isSensitivePath(file, config) {
+  const { high_risk_paths: highRisk } = thresholds(config);
+  const always = globList(config?.review?.arbiter_always_paths, 'review.arbiter_always_paths', DEFAULTS.review.arbiter_always_paths);
+  return pathsOf(file).some((p) => matches(p, highRisk) || matches(p, always));
+}
+
 // Which reviewer follows Codex. `fable`: one Fable pass per round that rules on every Codex item AND reviews the diff itself
 // (agents/arbiter.md), for a medium or high PR or one touching a sensitive path (risk.high_risk_paths or
 // review.arbiter_always_paths, matched like high_risk_paths). `judge`: the Sonnet judge, for everything else.

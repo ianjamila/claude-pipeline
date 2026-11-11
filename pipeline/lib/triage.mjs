@@ -4,6 +4,7 @@
 import { createHash } from 'node:crypto';
 import { CATEGORIES } from './codex.mjs';
 import { MIN_FABLE, compareVersions, parseModelId } from './model-floor.mjs';
+import { isSensitivePath } from './risk.mjs';
 
 export const SECURITY_CATEGORIES = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
 export const BUCKETS = ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING'];
@@ -375,7 +376,9 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause }
 // stale-model (the Fable that answered is older than this machine's floor) and stale-terminal (this terminal runs an older Claude Code build than
 // the installed one) are malfunctions too: restart the terminal, update Claude Code, and run the review again.
 export const MALFUNCTION_CAUSES = ['model-proof', 'invalid-arbiter', 'invalid-judge', 'stale-model', 'stale-terminal'];
-const NEEDS_HUMAN_CAUSES = [...MALFUNCTION_CAUSES, 'low-confidence', 'security-dismissal', 'test-security'];
+// 'round-cap': an accepted fix taken out of the PR at the round limit and filed as a follow-up (applyRoundCapDefer). A judgement the owner can re-make, not a malfunction.
+export const ROUND_CAP_CAUSE = 'round-cap';
+const NEEDS_HUMAN_CAUSES = [...MALFUNCTION_CAUSES, 'low-confidence', 'security-dismissal', 'test-security', ROUND_CAP_CAUSE];
 // The reason strings of states written before `cause` existed.
 const LEGACY_CAUSES = [
   [/^model-proof failed/, 'model-proof'],
@@ -436,6 +439,8 @@ export function claudeRulingRefusal(item, decision, { secondReview } = {}) {
   if (!isObject(item)) return 'no item given';
   const id = item.id;
   if (!DECISIONS.includes(decision)) return `decision must be one of ${DECISIONS.join('|')}`;
+  // A fix deferred past the round limit is the owner's to reopen (owner-ruling); Claude's own ruling never touches it.
+  if (isRoundCapDeferral(item)) return `${id} was deferred past the round limit (its fix is out of the PR and filed as a follow-up): only the owner's typed ruling can reopen it`;
   if (item.implemented === true) return `${id} is already implemented`;
   if (claudeFinalIsAccept(item)) {
     return decision === 'ACCEPT'
@@ -473,6 +478,51 @@ export function applyClaudeRuling(item, { decision, reason, ruledAt }) {
     claude: { ruledAt, cause: needsHumanCause(item), critical: isCriticalDismissal(item, decision), overruled: structuredClone(item.final) },
   };
   return next;
+}
+
+// ---- deferring accepted fixes past the round limit (plan 2026-11-11-round-discipline-one-implementer.md, Item 1b) ---------------------------------
+// The item-level mark `roundCapDeferral` ({ fixHead, reviewedHead, at }) outlives any later ruling (an owner ruling replaces `final`, not this), so the Rulings
+// inventory keeps listing the item and the result cache never reuses it.
+export const isRoundCapDeferral = (item) => isObject(item?.roundCapDeferral);
+// Still the deferral Claude's CLI wrote (not yet re-ruled by the owner).
+const isDeferralFinal = (item) => item?.final?.claude?.cause === ROUND_CAP_CAUSE;
+// Only an ACCEPT the judge or the arbiter made may be deferred: never a test result, Claude's or a second review's final, the owner's word, or a cached copy.
+export const DEFERRABLE_BY = Object.freeze(['judge', 'arbiter']);
+
+// Why this item's accepted fix may not be deferred, or null (the item-level rules; the severity and the state-wide rules are deferEligibility's).
+export function roundCapDeferRefusal(item) {
+  if (!isObject(item)) return 'no item given';
+  const id = item.id;
+  if (item.final?.decision !== 'ACCEPT' || item.final.needsHuman === true) return `${id} is not an accepted fix`;
+  if (item.implemented !== true) return `${id} is accepted but its fix is not implemented`;
+  if (isOwnerRuled(item)) return `${id} was ruled by the owner: only the owner's typed ruling can loosen it`;
+  if (isProtectedFinal(item)) return `${id} was ruled by Claude or forced by a second review: it cannot be loosened`;
+  if (!DEFERRABLE_BY.includes(item.final.by)) return `${id} was accepted by ${item.final.by ?? 'unknown'}, not by the judge or the arbiter`;
+  if (isRoundCapDeferral(item)) return `${id} was already deferred`;
+  return null;
+}
+
+// The deferral: the accepted fix is out of the tree, so the item is a FOLLOW-UP again (the issue is filed by `followups create`). `implemented` and
+// `implementedVia` go: nothing was built that a round would have to confirm. Throws on anything refused.
+export function applyRoundCapDefer(item, { reason, ruledAt, fixHead, reviewedHead }) {
+  const refusal = roundCapDeferRefusal(item);
+  if (refusal) throw new Error(refusal);
+  const { implementedVia: _via, ...rest } = structuredClone(item);
+  return {
+    ...rest,
+    implemented: false,
+    final: {
+      decision: 'FOLLOW-UP', by: 'claude', needsHuman: false, reason,
+      claude: { ruledAt, cause: ROUND_CAP_CAUSE, critical: false, overruled: structuredClone(item.final), fixHead, reviewedHead },
+    },
+    roundCapDeferral: { fixHead, reviewedHead, at: ruledAt },
+  };
+}
+
+// The state with those items deferred (each in its own round), nothing else touched.
+export function deferItemsInState(state, ids, params) {
+  const wanted = new Set(ids);
+  return { ...state, rounds: (state.rounds ?? []).map((r) => ({ ...r, items: (r.items ?? []).map((i) => (wanted.has(i.id) ? applyRoundCapDefer(i, params) : i)) })) };
 }
 
 // Codex's answer to the second-review packet: {items:[{id, decision, confidence, reasoning}]}, strict like second-review.schema.json (no extra keys; every
@@ -565,6 +615,7 @@ export function reuseRuled(items, ruledCache) {
     if (!Object.hasOwn(ruledCache, next.fingerprint)) return next;
     const { bucket, category, followupIssue, implemented, ...final } = structuredClone(ruledCache[next.fingerprint]);
     if (bucket !== next.bucket || category !== next.category) return next;
+    if (final.claude?.cause === ROUND_CAP_CAUSE) return next; // (a cache written by hand, or by a copy that kept it)
     const dismissal = final.decision === 'REJECT' || final.decision === 'FOLLOW-UP';
     if (dismissal && SECURITY_CATEGORIES.includes(next.category) && !isOwnerRuled({ final })) return next;
     next.final = { ...final, by: 'cache' };
@@ -587,6 +638,8 @@ export function ruledCacheFrom(items) {
   for (const item of items) {
     // A light-lane rejection is a default ("not triaged"), not a ruling: nobody looked at it.
     if (item.fingerprint && item.final && !item.final.needsHuman && item.final.by !== 'light-lane') {
+      // A fix deferred past the round limit is never reused as a settled dismissal: the same text in a later round is looked at again.
+      if (isDeferralFinal(item)) continue;
       // A Claude or forced dismissal of a BLOCKING or security item (or one that was critical when ruled) is looked at again, never reused (E10).
       if (isProtectedFinal(item) && item.final.decision !== 'ACCEPT'
         && (item.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(item.category) || item.final.claude?.critical === true)) continue;
@@ -800,8 +853,19 @@ const asciiLine = (s, max) => {
   const text = String(s ?? '').replace(/\s+/g, ' ').trim().replace(/[^\x20-\x7e]/g, '?');
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 };
+// The issue number of a filed follow-up (a URL ending /issues/N), or null.
+const issueNumber = (issue) => /\/issues\/(\d{1,9})$/.exec(typeof issue === 'string' ? issue : issue?.url ?? '')?.[1] ?? null;
+// The "why" of a row. A deferral Claude's CLI wrote says what happened in the CLI's own words (never the agent's reason, which stays in the state and the triage
+// comment): who accepted the fix, that it is out of this merge, and the issue. Anything else, and a deferral the owner re-ruled, shows the final's reason.
+function rowWhy(item) {
+  if (!(isRoundCapDeferral(item) && isDeferralFinal(item))) return item.final.reason;
+  const accepted = item.final.claude.overruled?.by;
+  const issue = issueNumber(item.followupIssue);
+  return `deferred past the round limit; accepted by ${accepted === 'arbiter' ? 'arbiter' : 'judge'}; fix ${String(item.roundCapDeferral.fixHead ?? '').slice(0, 12)} removed, NOT in this merge; ${issue ? `issue #${issue}` : 'issue not filed yet'}`;
+}
 const byLabel = (item) => {
   const by = item.final?.by;
+  if (by === 'claude' && isRoundCapDeferral(item)) return 'claude (round limit)';
   if (by === 'claude') return item.secondReview !== undefined ? 'claude+codex' : 'claude';
   return typeof by === 'string' && by !== '' ? by : 'unknown';
 };
@@ -812,7 +876,7 @@ const byIdAsc = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 // that was carried into later rounds is one dismissal, not several).
 function inventoryEntries(state) {
   const dismissed = allItems(state)
-    .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && isCriticalItem(i))
+    .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && (isCriticalItem(i) || isRoundCapDeferral(i)))
     .map((i) => ({ item: i, id: String(i.id) }))
     .sort(byIdAsc);
   const listed = new Set();
@@ -823,9 +887,11 @@ function inventoryEntries(state) {
     if (fp !== null) listed.add(fp);
     kept.push(entry);
   }
-  return kept.sort(byIdAsc).map(({ item, id }) => ({ item, id, row: [
+  // Deferral rows (a fix taken out at the round limit) are their own group, after the critical rows; within a group by id.
+  const group = (item) => (isRoundCapDeferral(item) ? 1 : 0);
+  return kept.sort((a, b) => group(a.item) - group(b.item) || byIdAsc(a, b)).map(({ item, id }) => ({ item, id, row: [
     id, item.final.decision, item.bucket, asciiLine(item.category, 40) || '-', `by ${byLabel(item)}`, `content ${rulingContentDigest([item])}`,
-    `"${asciiLine(String(item.title ?? '').replace(/"/g, "'"), TITLE_MAX)}"`, `why: ${asciiLine(item.final.reason, WHY_MAX)}`,
+    `"${asciiLine(String(item.title ?? '').replace(/"/g, "'"), TITLE_MAX)}"`, `why: ${asciiLine(rowWhy(item), WHY_MAX)}`,
   ].join(' · ') }));
 }
 
@@ -863,4 +929,95 @@ export function reviewEligibilityProblems(state) {
     .map((i) => i.id));
   if (unconfirmed.length > 0) problems.push(`fix(es) made outside the file the finding names, not yet confirmed by a later review round: ${unconfirmed.join(', ')} (run another codex-review round)`);
   return problems;
+}
+
+// ---- severity of an open item, and whether the round limit may be closed by deferring the fixes (plan Item 1a / 1b) ---------------------------------------
+// ONE predicate for the ask (`triage round-request`, display only) and the command (`triage defer-fixes`, which decides). An item is LOW only when ALL hold, else HIGH
+// (fail closed): a known non-BLOCKING bucket and a category on the allowlist (a bug is never low); not marked fixed through other files; not in the file of any BLOCKING or
+// security ACCEPT; its location resolves to exactly one file of the reviewed diff; and that file (old and new path) is on no risk.high_risk_paths / review.arbiter_always_paths
+// glob. hard_stops.paths is NOT consulted (owner 2026-11-11: with it a repository whose hard stops cover everything could never defer). A config error throws (TypeError):
+// defer-fixes refuses on it, round-request shows the items as high with a warning.
+export const LOW_SEVERITY_CATEGORIES = Object.freeze(['performance', 'maintainability', 'testing', 'design', 'docs', 'other']);
+
+// A location the review can trust: repo-relative POSIX, nothing that climbs out, no drive letter, no leading ./ (git prints none).
+const locationProblem = (file) => {
+  if (typeof file !== 'string' || file === '') return 'it names no file';
+  if (file.includes('\\') || file.startsWith('/') || /^[A-Za-z]:/.test(file)) return `its location (${asciiLine(file, 60)}) is not repo-relative`;
+  if (file.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) return `its location (${asciiLine(file, 60)}) is not a clean repo path`;
+  return null;
+};
+const entryPaths = (f) => [...new Set([f?.oldPath, f?.newPath, f?.path].filter((p) => typeof p === 'string' && p !== ''))];
+
+// -> { level: 'low' | 'high', reasons: [why it is high] }. `files` = the PR's reviewed diff (git.mjs#diffFiles entries); null/undefined = unknown, so high.
+export function itemSeverity(item, { state, config, files } = {}) {
+  const high = (reason) => ({ level: 'high', reasons: [reason] });
+  if (!isObject(item)) return high('not a review item');
+  if (!BUCKETS.includes(item.bucket)) return high(`unknown bucket ${asciiLine(item.bucket, 30)}`);
+  if (item.bucket === 'BLOCKING') return high('it is a BLOCKING finding');
+  if (!LOW_SEVERITY_CATEGORIES.includes(item.category)) return high(`category ${asciiLine(item.category, 30) || 'unknown'} is not a low-severity kind`);
+  if (item.implementedVia === 'other-files') return high('its fix was made in other files than the one it names');
+  const bad = locationProblem(item.file);
+  if (bad) return high(bad);
+  if (!Array.isArray(files)) return high('the reviewed diff is not known');
+  const hits = files.filter((f) => entryPaths(f).includes(item.file));
+  if (hits.length === 0) return high(`${asciiLine(item.file, 60)} is not a file of the reviewed diff`);
+  if (hits.length > 1) return high(`${asciiLine(item.file, 60)} is ambiguous in the reviewed diff`);
+  if (allItems(state).some((i) => i.final?.decision === 'ACCEPT' && i.file === item.file && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)))) {
+    return high(`${asciiLine(item.file, 60)} also holds an accepted BLOCKING or security finding`);
+  }
+  if (isSensitivePath(hits[0], config)) return high(`${asciiLine(item.file, 60)} is on a sensitive path`);
+  return { level: 'low', reasons: [] };
+}
+
+const idList = (ids) => ids.join(', ');
+
+// May the round limit be closed by taking the accepted fixes OUT and filing them as follow-ups? Refusals 1, 2 and 5 of `defer-fixes`, evaluated on this state as if the tree were
+// already back at the reviewed content (refusals 3 and 4 need git and are the command's). Pure. `grants` = k -> the owner's open extra-round records for counted round k at ANY head
+// (a function, as roundOutcome takes it; a throwing or malformed lookup is no grant): an unspent grant for the next round always wins over a deferral.
+// -> { eligible, refusals: [plain words], ids: [the accepts a round would have to review], severities: [{ id, level, reasons }] }. Throws (TypeError) on a config error.
+export function deferEligibility(state, config, files, { grants } = {}) {
+  const refusals = [];
+  const rounds = state?.rounds ?? [];
+  const last = rounds.at(-1);
+  if (last === undefined) return { eligible: false, refusals: ['no review round is recorded'], ids: [], severities: [] };
+  if (!hasContentHash(last.contentHashAtToHead)) refusals.push('the last review round records no content hash');
+  const o = roundOutcome({ ...state, currentContentHash: last.contentHashAtToHead });
+  const reviewed = reviewedRoundCount(state);
+  // Refusal 1: the limit is reached for good, and nothing else is open.
+  if (!Number.isFinite(state?.maxRounds)) refusals.push('review.max_rounds is not set, so there is no limit to defer past');
+  else if (reviewed < state.maxRounds) refusals.push(`the round limit (${state.maxRounds}) is not reached yet`);
+  else if (o.extraRound) refusals.push('the automatic extra round is still available: run it');
+  for (const [list, what] of [[o.fablePending.map(String), 'a Fable pass is owed for round(s)'], [o.pending, 'items still pending:'], [o.needsHuman, 'items wait for a human:'], [o.openBlocking, 'open BLOCKING items:'], [o.unimplemented, 'accepted items not implemented:']]) {
+    if (list.length > 0) refusals.push(`${what} ${idList(list)}`);
+  }
+  const k = reviewed + 1;
+  let granted = [];
+  try {
+    const found = typeof grants === 'function' ? grants(k) : [];
+    granted = Array.isArray(found) ? found : [];
+  } catch { /* a failing lookup is no grant */ }
+  if (granted.length > 0) refusals.push(`the owner granted extra round ${k} (unspent): run it, a typed "extra round" always wins`);
+  // Refusal 2: exactly the accepts no round has reviewed, each low and each the judge's or the arbiter's.
+  const ids = o.newAccepted;
+  const byId = new Map(allItems(state).map((i) => [i.id, i]));
+  if (ids.length === 0) refusals.push('no accepted fix is waiting for a review round, so there is nothing to defer');
+  const severities = [];
+  for (const id of ids) {
+    const item = byId.get(id);
+    const sev = itemSeverity(item, { state, config, files });
+    severities.push({ id, ...sev });
+    if (sev.level !== 'low') refusals.push(`${id} is not low severity (${sev.reasons.join('; ')})`);
+    const why = roundCapDeferRefusal(item);
+    if (why) refusals.push(why);
+  }
+  // Refusal 5: the state with those fixes deferred must read as a clean review (nothing left but the issues still to file).
+  if (refusals.length === 0) {
+    const proposed = deferItemsInState(state, ids, { reason: 'dry run', ruledAt: new Date(0).toISOString(), fixHead: 'dry', reviewedHead: 'dry' });
+    const filed = { ...proposed, rounds: proposed.rounds.map((r) => ({ ...r, items: (r.items ?? []).map((i) => (isRoundCapDeferral(i) && !i.followupIssue ? { ...i, followupIssue: 'dry-run' } : i)) })) };
+    const after = roundOutcome({ ...filed, currentContentHash: last.contentHashAtToHead });
+    if (!after.clean) refusals.push('the review would still not be clean after the fixes are taken out');
+    const problems = reviewEligibilityProblems(filed);
+    if (problems.length > 0) refusals.push(problems.join('; '));
+  }
+  return { eligible: refusals.length === 0, refusals, ids, severities };
 }
