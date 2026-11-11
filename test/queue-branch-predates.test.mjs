@@ -11,7 +11,7 @@ import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
-import { beginAttempt, confirmAttempt, noteRemoval, openRecord, parseQueueAwareMarker, queueCatchUpState, readQueueRecord, setHold } from '../pipeline/lib/merge-queue.mjs';
+import { beginAttempt, confirmAttempt, noteRemoval, openRecord, parseQueueAwareMarker, predatesQueueMessage, queueCatchUpState, readQueueRecord, setHold } from '../pipeline/lib/merge-queue.mjs';
 import { createQueueRoute, restoreHoldOnTerminal } from '../pipeline/lib/queue-route.mjs';
 import { sweepRepo } from '../pipeline/lib/queue-sweep.mjs';
 import { RESTORE_NOTE } from '../pipeline/lib/hold.mjs';
@@ -186,9 +186,21 @@ test('4. no usable marker on the base, or a read that fails: refused (fail close
     assert.equal(res.output.branchState, 'unknown', why);
     assert.match(res.output.reasons[0], /cannot be shown to contain the commit that taught the merge script about the merge queue/, why);
     assert.match(res.output.reasons[0], /\.claude\/merge-queue-aware/, why);
+    assert.doesNotMatch(res.output.reasons[0], /update-branch|Catch the branch up/, `${why}: a catch-up cannot fix the base's marker or a read failure`);
     assert.equal(ran(root), false, why);
     assert.deepEqual(writes(gh), [], why);
   }
+});
+
+test('4b. predatesQueueMessage: only a predating branch is sent to P update-branch; a structural unknown says the marker on the base must be added or fixed; an unreadable one says to try again', () => {
+  const predates = predatesQueueMessage({ pr: 7, state: { kind: 'predates', queueAwareSha: QA, why: 'x', unreadable: false } });
+  assert.match(predates, /P update-branch --pr 7/);
+  const structural = predatesQueueMessage({ pr: 7, state: { kind: 'unknown', queueAwareSha: null, why: '.claude/merge-queue-aware is missing on main', unreadable: false } });
+  assert.match(structural, /add or fix the marker/);
+  assert.doesNotMatch(structural, /update-branch/);
+  const blip = predatesQueueMessage({ pr: 7, state: { kind: 'unknown', queueAwareSha: null, why: 'could not be read (HTTP 502)', unreadable: true } });
+  assert.match(blip, /try again/);
+  assert.doesNotMatch(blip, /update-branch/);
 });
 
 test('5. a branch at the base tip gets no shortcut: when the ancestry says it lacks the marker commit it predates (the base itself may lack it)', async () => {

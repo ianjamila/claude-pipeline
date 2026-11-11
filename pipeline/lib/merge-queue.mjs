@@ -87,12 +87,17 @@ export function queueCatchUpState({ gh, branch, head }) {
   return reply('unknown', `GitHub's comparison of ${sha.slice(0, 12)} with the branch answered ${JSON.stringify(rel?.status ?? null)}`, { queueAwareSha: sha, unreadable: true });
 }
 
-// The refusal text of P merge for a branch whose merge script may not know the queue (kind predates | unknown).
+// The refusal text of P merge for a branch whose merge script may not know the queue (kind predates | unknown). Only 'predates' is remedied by a catch-up: an
+// 'unknown' verdict is decided by the BASE's marker (or a failed read), so updating the branch cannot clear it, and the text must not send the agent to do that.
 export function predatesQueueMessage({ pr, state }) {
-  const lead = state.kind === 'predates'
-    ? `PR #${pr}'s branch does not contain ${state.queueAwareSha.slice(0, 12)}, the commit that taught the merge script about the merge queue (the base branch declares it in ${QUEUE_AWARE_FILE}), so the merge script on the branch may not know about the queue`
-    : `PR #${pr}'s branch cannot be shown to contain the commit that taught the merge script about the merge queue (${state.why}; the base branch declares that commit, a full sha, in ${QUEUE_AWARE_FILE}), so the merge script on the branch may not know about the queue`;
-  return `${lead}: it could take the queue's "queued" answer for "merged" and delete the branch. Nothing was queued and the merge command was not run. Catch the branch up first: \`P update-branch --pr ${pr}\` from the PR's own worktree, run a review round (base-only), \`P review-complete\`, then ask the owner again.`;
+  const risk = 'it could take the queue\'s "queued" answer for "merged" and delete the branch. Nothing was queued and the merge command was not run.';
+  if (state.kind === 'predates') {
+    return `PR #${pr}'s branch does not contain ${state.queueAwareSha.slice(0, 12)}, the commit that taught the merge script about the merge queue (the base branch declares it in ${QUEUE_AWARE_FILE}), so the merge script on the branch may not know about the queue: ${risk} Catch the branch up first: \`P update-branch --pr ${pr}\` from the PR's own worktree, run a review round (base-only), \`P review-complete\`, then ask the owner again.`;
+  }
+  const lead = `PR #${pr}'s branch cannot be shown to contain the commit that taught the merge script about the merge queue (${state.why}; the base branch declares that commit, a full sha, in ${QUEUE_AWARE_FILE}), so the merge script on the branch may not know about the queue: ${risk}`;
+  return state.unreadable
+    ? `${lead} GitHub could not be read just now: try again in a minute (updating the branch does not help).`
+    : `${lead} Updating the branch does not help, because the base decides this: add or fix the marker on the base branch (the plain file ${QUEUE_AWARE_FILE}, the full sha of the commit as it landed there), then run \`P merge\` again.`;
 }
 
 // ---- the queue's own settings ------------------------------------------------------------------------------------------------------

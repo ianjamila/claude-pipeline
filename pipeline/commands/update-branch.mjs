@@ -33,7 +33,8 @@ export const run = guarded(async (argv, ctx) => {
     // Queue mode (GitHub's merge queue tests the PR on top of the current base itself): a moved base needs no catch-up. Unreadable = refuse, never update.
     // One exception, only for a custom merge command and a PR that is not queued: a branch that does not contain the commit the base names in .claude/merge-queue-aware may carry a merge script that does not know the queue
     // (P merge refuses such a branch: queue-branch-predates-switch), and this update is the remedy. So there the catch-up runs as for a behind PR, with no merge hold
-    // (queue mode has none). Unknown (no usable marker, or a read failed) catches up too: an update is harmless, and refusing the remedy would strand the PR.
+    // (queue mode has none). An unknown verdict (no usable marker, or a read failed) is decided by the BASE, never by the branch, so no update can clear it: a missing,
+    // malformed or unknown marker answers queue-mode (no PUT; the message says the base's marker must be added or fixed), a failed read answers queue-unreadable (try again).
     let queueCatchUp = null;
     try {
       const q = queueModeFor({ gh, pr });
@@ -42,7 +43,11 @@ export const run = guarded(async (argv, ctx) => {
         // no live queue entry (an update moves the head and GitHub drops the entry, so a queued PR keeps the no-op answer even when the marker cannot be read).
         const queued = q.state.inQueue === true || Boolean(q.state.entry);
         const old = isDefaultMergeCommand(config) || queued ? null : queueCatchUpState({ gh, branch: config.default_branch, head: expectHead });
-        if (old === null || !old.needed) return { exitCode: EXIT.OK, output: { ok: true, outcome: 'queue-mode', updated: false, head: localHead, localHead, pullNeeded: false, message: 'the base branch has a merge queue: no catch-up is needed' } };
+        if (old !== null && old.needed && old.kind === 'unknown' && old.unreadable) return { exitCode: EXIT.FAILED, output: { ok: false, outcome: 'queue-unreadable', updated: false, message: `the merge-queue marker could not be checked (${old.why}): try again in a minute; nothing was updated` } };
+        if (old === null || old.kind !== 'predates') {
+          const fix = old !== null && old.needed ? `; but ${old.why}, so \`P merge\` will refuse this PR until the marker on ${config.default_branch} is added or fixed (updating the branch does not help)` : '';
+          return { exitCode: EXIT.OK, output: { ok: true, outcome: 'queue-mode', updated: false, head: localHead, localHead, pullNeeded: false, message: `the base branch has a merge queue: no catch-up is needed${fix}` } };
+        }
         queueCatchUp = old;
       }
     } catch (err) {

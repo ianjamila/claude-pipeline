@@ -605,21 +605,34 @@ test('update-branch, queue ON and the branch does NOT contain the marker commit:
   assert.equal('hold' in r.json, false);
 });
 
-test('update-branch, queue ON and the base declares no marker commit: it still catches up (an update is harmless; the remedy is never refused)', () => {
-  const s = scenario({ gh: { behindBy: 2, queue: true } });
-  const r = updateCli(s);
-  assert.notEqual(r.json.outcome, 'queue-mode');
-  assert.equal(r.json.queueCatchUp, true);
-  assert.match(r.json.queueCatchUpWhy, /merge-queue-aware is missing/);
-  assert.equal(puts(s).length, 1);
+test('update-branch, queue ON and the base declares no usable marker (missing | malformed | a commit GitHub does not know): queue-mode, NO PUT (nothing on the branch can fix the base\'s marker), and the message says to add or fix it', () => {
+  for (const [why, gh, text] of [
+    ['no file', {}, /merge-queue-aware is missing/],
+    ['a malformed marker', { queueAware: 'soon' }, /does not start with a full commit sha/],
+    ['a commit GitHub does not know', { ...QA, queueAwareIn: 'unknown' }, /names 555555555555, which GitHub does not know/],
+  ]) {
+    const s = scenario({ gh: { behindBy: 2, queue: true, ...gh } });
+    const r = updateCli(s);
+    assertExit(r, 0, r.stdout);
+    assert.equal(r.json.outcome, 'queue-mode', why);
+    assert.equal(r.json.updated, false, why);
+    assert.equal('queueCatchUp' in r.json, false, why);
+    assert.match(r.json.message, text, why);
+    assert.match(r.json.message, /added or fixed/, why);
+    assert.deepEqual(puts(s), [], why);
+  }
 });
 
-test('update-branch, queue ON, the marker or the ancestry compare is unreadable: catches up too', () => {
+test('update-branch, queue ON, the marker or the ancestry compare is unreadable (a GitHub blip): queue-unreadable (exit 1, retry later), NO PUT', () => {
   for (const gh of [{ queueAwareFile: 'error' }, { ...QA, queueAwareIn: 'error' }]) {
     const s = scenario({ gh: { behindBy: 2, queue: true, ...gh } });
     const r = updateCli(s);
-    assert.equal(r.json.queueCatchUp, true, JSON.stringify(gh));
-    assert.equal(puts(s).length, 1, JSON.stringify(gh));
+    assertExit(r, 1, r.stdout);
+    assert.equal(r.json.ok, false, JSON.stringify(gh));
+    assert.equal(r.json.outcome, 'queue-unreadable', JSON.stringify(gh));
+    assert.equal(r.json.updated, false, JSON.stringify(gh));
+    assert.match(r.json.message, /try again/, JSON.stringify(gh));
+    assert.deepEqual(puts(s), [], JSON.stringify(gh));
   }
 });
 

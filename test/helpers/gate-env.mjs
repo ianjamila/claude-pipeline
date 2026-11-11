@@ -114,15 +114,21 @@ export function ghEntries(o) {
     // `update`: what PUT pulls/12/update-branch answers: accepted (default) | conflict | head-moved (the two 422s) | forbidden.
     UPDATE_REPLIES[o.update ?? 'accepted'],
     // `queueAware`: the commit the base's .claude/merge-queue-aware names (GitHub's contents API); absent = no such file (404). `queueAwareFile: 'error'` = GitHub cannot answer (502).
-    // `queueAwareIn`: whether the PR head contains that commit (the compare of it with the head): true (default) = ahead, false = diverged, 'error' = GitHub cannot answer.
+    // `queueAwareIn`: whether the PR head contains that commit (the compare of it with the head): true (default) = ahead, false = diverged, 'error' = GitHub cannot answer, 'unknown' = GitHub does not know the commit (404).
+    // `queueAwareOnBase`: whether the BASE branch itself contains it (the compare of it with the base): true (default) = ahead, false = diverged, 'error' = GitHub cannot answer.
     // These come BEFORE the generic compare below, which would answer a compare of any pair alike.
     o.queueAwareFile === 'error'
       ? { match: 'contents/.claude/merge-queue-aware', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
       : o.queueAware === undefined
         ? { match: 'contents/.claude/merge-queue-aware', code: 1, stderr: 'gh: Not Found (HTTP 404)' }
         : { match: 'contents/.claude/merge-queue-aware', stdoutJson: ['file', 'base64', Buffer.from(`# the commit that taught scripts/merge-pr.mjs the merge queue\n${o.queueAware}\n`).toString('base64')] },
+    ...(o.queueAware !== undefined ? [o.queueAwareOnBase === 'error'
+      ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.main\\?`, code: 1, stderr: 'gh: Server Error (HTTP 502)' }
+      : { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.main\\?`, stdoutJson: { status: o.queueAwareOnBase === false ? 'diverged' : 'ahead', behind_by: 0, ahead_by: 1, base: BASE_SHA } }] : []),
     ...(o.queueAware !== undefined ? [o.queueAwareIn === 'error'
       ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.`, code: 1, stderr: 'gh: Server Error (HTTP 502)' }
+      : o.queueAwareIn === 'unknown'
+      ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.`, code: 1, stderr: 'gh: Not Found (HTTP 404)' }
       : { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.`, stdoutJson: { status: o.queueAwareIn === false ? 'diverged' : 'ahead', behind_by: 0, ahead_by: 1, base: BASE_SHA } }] : []),
     { match: 'repos/acme/widgets/compare/', stdoutJson: { status: o.behindBy ? 'diverged' : 'ahead', behind_by: o.behindBy ?? 0, ahead_by: 1, base: o.compareBase ?? BASE_SHA } },
     // `commitParents`: { <sha>: [parent shas] } for GET commits/<sha> (the update-branch result is bound to its parents).
