@@ -271,17 +271,19 @@ test('scripts/test.mjs: an unknown exact .test.mjs name is exit 2 naming it, eve
   for (const argv of [['no-such-file.test.mjs'], ['test-runner', 'no-such-file.test.mjs']]) {
     const r = spawnSync(process.execPath, [runner, ...argv], { encoding: 'utf8', env: nestedEnv() });
     assert.equal(r.status, 2, `${argv}: exit ${r.status}, stderr ${r.stderr}`);
-    assert.match(r.stderr, /no-such-file\.test\.mjs/);
+    assert.match(r.stderr, /no-such-file\.test\.mjs \(exact file name\)/);
     assert.doesNotMatch(r.stdout, /^# tests/m, 'no test ran');
   }
 });
 
 test('scripts/test.mjs: a substring that matches nothing is exit 2 naming it, even when other arguments match', () => {
-  for (const argv of [['zzz-no-such-substring'], ['config.test.mjs', 'no-such-substring-xyz']]) {
+  for (const [argv, label] of [
+    [['zzz-no-such-substring'], /zzz-no-such-substring \(substring filter\)/],
+    [['config.test.mjs', 'no-such-substring-xyz'], /no-such-substring-xyz \(substring filter\)/],
+  ]) {
     const r = spawnSync(process.execPath, [runner, ...argv], { encoding: 'utf8', env: nestedEnv() });
     assert.equal(r.status, 2, `${argv}: exit ${r.status}, stderr ${r.stderr}`);
-    assert.match(r.stderr, /no-such-substring-xyz|zzz-no-such-substring/);
-    assert.match(r.stderr, /substring/);
+    assert.match(r.stderr, label);
     assert.doesNotMatch(r.stdout, /^# tests/m, 'no test ran');
   }
 });
