@@ -529,7 +529,8 @@ const hookSurfaceKind = (p, ctx) => {
   return null;
 };
 // The folders a plugin keeps its components in, outside any `.claude*/plugins` folder: the install paths of the plugins the account config dirs list (installed_plugins.json, read the way the inventory does) and
-// the locations their manifests name (skills, agents, commands: strings or lists of strings, resolved against the install path). Read fail-safe: an unreadable file adds nothing.
+// the locations their manifests name (skills, agents, commands: strings or lists of strings, resolved against the install path). Read fail-safe: an unreadable file adds nothing. No entry is dropped for its
+// place in a list (R3-B2): the inventory (dialog-hooks.mjs) walks every one, so the guard holds every one.
 function surfaceDirsOf(configDirs, readText) {
   const installs = [];
   const named = [];
@@ -537,9 +538,9 @@ function surfaceDirsOf(configDirs, readText) {
   for (const d of configDirs) {
     const list = json(`${d}/plugins/installed_plugins.json`);
     if (list === null || typeof list !== 'object' || list.plugins === null || typeof list.plugins !== 'object') continue;
-    for (const entries of Object.values(list.plugins).slice(0, 500)) {
+    for (const entries of Object.values(list.plugins)) {
       if (!Array.isArray(entries)) continue;
-      for (const e of entries.slice(0, 50)) {
+      for (const e of entries) {
         const ip = typeof e?.installPath === 'string' ? toPosix(e.installPath) : '';
         if (!isAbs(ip)) continue;
         installs.push(pathsFor().normalize(ip));
@@ -551,7 +552,7 @@ function surfaceDirsOf(configDirs, readText) {
     if (m === null || typeof m !== 'object') continue;
     for (const key of ['skills', 'agents', 'commands']) {
       const v = m[key];
-      for (const rel of (typeof v === 'string' ? [v] : Array.isArray(v) ? v : []).slice(0, 100)) if (typeof rel === 'string' && rel !== '') named.push(pathsFor().normalize(pathsFor().join(ip, toPosix(rel))));
+      for (const rel of (typeof v === 'string' ? [v] : Array.isArray(v) ? v : [])) if (typeof rel === 'string' && rel !== '') named.push(pathsFor().normalize(pathsFor().join(ip, toPosix(rel))));
     }
   }
   return { installs: unique(installs), named: unique(named) };
