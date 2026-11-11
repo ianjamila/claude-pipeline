@@ -1619,6 +1619,9 @@ function gitReadOnly(args) {
 // (not the owner-go recorder: run by hand with made-up input it would write an owner "merge" -- Codex design review of #58)
 function isPipelineTool(arg, ctx) {
   if (typeof arg !== 'string') return false;
+  // Under the PowerShell tool the shell-text parser is not PowerShell: it reads a typographic quote (U+2018-U+201E, quote characters to PowerShell) as a name character, so a quoted `‘..’` segment
+  // looks like a plain folder there. Trust no non-ASCII operand for that tool (a home path with such a character is simply not auto-trusted).
+  if (ctx.shell === 'powershell' && /[^\x00-\x7F]/.test(arg)) return false;
   // A backslash left in a shell-parsed word (quoted: `"hooks/\.\./x"`) is a name character off Windows, but expandRefs would read it as a separator: refuse (fail closed).
   if (ctx.platform !== 'win32' && (arg.includes('\\') || expandKeepingBackslash(arg, ctx).includes('\\'))) return false; // (also one a same-line variable brings in: `D='a\b'; node .../hooks/$D/../../x.mjs`, R8-F2)
   const e = expandRefs(arg, ctx);
@@ -1634,12 +1637,14 @@ function isPipelineTool(arg, ctx) {
 // The PowerShell tool only: there a backslash is a path separator, but the shell-text parser below reads it as an escape and drops it from argv (`node C:\Users\u\x.mjs` arrives as
 // `C:Usersux.mjs`), so the raw text is looked at too. NEVER for Bash text, on any platform: Git Bash drops those backslashes for real and runs the drive-relative file, and off Windows a
 // backslash is an escape (`hooks/a\ ../..` is one word), so there only the shell-parsed argv word decides (R8-B1 / R8-F1 / R8-F2: one root cause, the raw text standing in for the operand).
-// The decision is on the WHOLE first operand as PowerShell reads it, not on a regex capture that can stop mid-word: a bare word of plain path characters, or a quote pair around such,
-// that ends at a word boundary; anything PowerShell would expand, escape, join or split (`$`, backtick, %, ~, parentheses, a quote inside the word, a separator ending the path) refuses. A `.` / `..`
+// The decision is on the WHOLE first operand as PowerShell reads it, not on a regex capture that can stop mid-word: a bare word of plain path characters, or an ASCII quote pair around such,
+// that ends at a word boundary. The characters are an ALLOWLIST (a drive, then segments of ASCII letters, digits, `.`, `_`, `-` joined by `\` or `/`; no space, so a home path with one is not trusted
+// here): a denylist missed the typographic quotes U+2018-U+201E, which PowerShell reads as quote characters (`‘..’` is `..`). Anything else, every non-ASCII character included, refuses. A `.` / `..`
 // segment is refused outright (a trusted tool path never needs one), and the path then goes through isPipelineTool like an argv word does (disk identity, exact spelling when the disk
 // cannot answer). Only the top-level command qualifies: a script or text read from a file (depth > 0) is judged as Bash.
 const PS_NODE_PREFIX = /^\s*(?:&\s*)?(?:[^\s"'`$%~]*[\\/])?node(?:\.exe)?\s+/i;
-const PS_PLAIN_PATH = /^[A-Za-z]:[\\/][^\s"'`$%~(){};|&<>,@#*?[\]]*[^\s"'`$%~(){};|&<>,@#*?[\]\\/]$/;
+const PS_PLAIN_PATH = /^[A-Za-z]:[\\/](?:[A-Za-z0-9._-]+[\\/])*[A-Za-z0-9._-]+$/; // (no trailing separator: a folder, not a file)
+const PS_BLANK = /[ \t\r\n]/; // (PowerShell's word break as far as the guard trusts it: a no-break space or any other Unicode blank is NOT one, so it stays inside the word and fails the allowlist)
 function psOperand(raw) {
   const m = PS_NODE_PREFIX.exec(raw);
   if (m === null) return null;
@@ -1649,10 +1654,10 @@ function psOperand(raw) {
     const end = rest.indexOf(q, 1);
     if (end < 0) return null;
     const after = rest[end + 1];
-    if (after !== undefined && !/\s/.test(after)) return null; // text glued to the closing quote (`''` doubling, `"x"y`) is the same word
+    if (after !== undefined && !PS_BLANK.test(after)) return null; // text glued to the closing quote (`''` doubling, `"x"y`) is the same word
     return rest.slice(1, end);
   }
-  const word = /^\S+/.exec(rest);
+  const word = /^[^ \t\r\n]+/.exec(rest);
   return word === null ? null : word[0];
 }
 function pipelineToolInRaw(raw, ctx) {

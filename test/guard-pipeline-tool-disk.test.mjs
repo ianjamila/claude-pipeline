@@ -242,3 +242,28 @@ test('a startup file read from disk is judged as Bash even when the top-level to
   assert.equal(evaluateBashForFiles('zsh -c :', { ...o, shell: 'powershell' }).decision, 'deny', 'PowerShell top level: the startup text is still Bash');
   assert.equal(evaluateBashForFiles(`node ${WCLI} preflight`, { ...o, shell: 'powershell' }).decision, 'allow', 'the top-level PowerShell line itself stays trusted');
 });
+
+// PowerShell reads the typographic quotes U+2018-U+201E as quote characters, so `‘..’` is `..` to it. The operand is therefore judged by an ALLOWLIST of plain ASCII path characters
+// (anything else, every non-ASCII character included, is refused), not by a list of characters known to be special.
+const SMART = ['\u2018', '\u2019', '\u201A', '\u201B', '\u201C', '\u201D', '\u201E', '\u201F'];
+test('on win32 the PowerShell route refuses typographic quotes and any non-ASCII character in the operand', () => {
+  for (const q of SMART) {
+    assert.equal(psW(`node ${WHOOKS}\\${q}..${q}\\${q}..${q}\\${q}..${q}\\tmp\\x.mjs`), 'deny', `U+${q.codePointAt(0).toString(16)} dot segments`);
+    assert.equal(psW(`node "${WHOOKS}\\${q}..${q}\\${q}..${q}\\tmp\\x.mjs"`), 'deny', `U+${q.codePointAt(0).toString(16)} dot segments, ASCII-quoted`);
+    assert.equal(psW(`node ${q}${WCLI}${q} preflight`), 'deny', `U+${q.codePointAt(0).toString(16)} around the operand`);
+    assert.equal(psW(`node ${WHOOKS}\\guard${q}files.mjs`), 'deny', `U+${q.codePointAt(0).toString(16)} inside a name`);
+  }
+  assert.equal(psW(`node ${WHOOKS}\\\u2018..\u2019\\guard-files.mjs`), 'deny', 'mixed quotes');
+  assert.equal(psW(`node ${WHOOKS}\\\u201C..\u201D\\guard-files.mjs`), 'deny', 'double typographic quotes');
+  assert.equal(psW(`node ${WHOOKS}\\\u201A..\u201B\\guard-files.mjs`), 'deny', 'low and reversed quotes');
+  assert.equal(psW(`node ${WHOOKS}\\gu\u00E4rd-files.mjs`), 'deny', 'a non-ASCII letter in a segment');
+  assert.equal(psW(`node ${WHOOKS}\\guard-files.mjs\u00A0x`), 'deny', 'a no-break space ends no word');
+  assert.equal(psW(`node "${WHOOKS}\\guard-files.mjs"\u00A0x`), 'deny', 'a no-break space after the closing quote');
+  // genuine plain ASCII spellings (bare, single- or double-quoted, both separators) stay trusted
+  assert.equal(psW(`node ${WCLI} preflight`), 'allow');
+  assert.equal(psW(`node "${WCLI}" preflight`), 'allow');
+  assert.equal(psW(`node '${WCLI}' preflight`), 'allow');
+  assert.equal(psW(`node ${WHOOKS}\\guard-files.mjs`), 'allow');
+  assert.equal(psW(`node "${WHOOKS}\\guard-files.mjs"`), 'allow');
+  assert.equal(psW('node C:/Users/u/.claude/pipeline/bin/pipeline.mjs preflight'), 'allow', 'forward slashes');
+});
