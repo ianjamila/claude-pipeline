@@ -626,3 +626,22 @@ test('R5-F1: notes chained to the owner\'s turn, a visibleSynthetic turn, or thr
     assert.deepEqual(pr(kind, record(kind, [o4, m5, m6, of(m6, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: M2 -> M -> owner prompt`);
   }
 });
+
+// ---- R6-F1: the two lines at the top of a session started after /clear are no invisible turn -------------------------------------------
+// Real shapes (Claude Code 2.1.318, a transcript's lines 4-8; keys only): a SessionStart hook `attachment` root (parentUuid null, no message), then an isMeta `<local-command-caveat>` user line
+// and a `<command-name>/clear` user line, both WITHOUT promptSource / origin / turnOrigin and chained by a string parentUuid to that attachment (a chain that ends at a non-prompt root).
+// They sit before the owner's first prompt and have no assistant text, so the ask printed after the owner's prompt still binds.
+test('R6-F1: the /clear preamble (SessionStart attachment root, isMeta caveat note, /clear command note, local_command system line) before the owner\'s first prompt does not mute the ask, in every reader', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const root = { type: 'attachment', uuid: 'u-session-start-root', parentUuid: null, isSidechain: false, attachment: { type: 'hook_success', hookName: 'SessionStart:clear', hookEvent: 'SessionStart', exitCode: 0 }, entrypoint: 'cli', userType: 'external' };
+    const caveat = { type: 'user', uuid: 'u-clear-caveat', parentUuid: root.uuid, isSidechain: false, promptId: 'pid-clear', isMeta: true, message: { role: 'user', content: '<local-command-caveat>The command below was run directly in Claude Code.</local-command-caveat>' }, entrypoint: 'cli', userType: 'external' };
+    const command = { type: 'user', uuid: 'u-clear-command', parentUuid: caveat.uuid, isSidechain: false, promptId: 'pid-clear', message: { role: 'user', content: '<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>' }, entrypoint: 'cli', userType: 'external' };
+    const local = { type: 'system', subtype: 'local_command', uuid: 'u-clear-local', parentUuid: command.uuid, content: '<local-command-stdout></local-command-stdout>', entrypoint: 'cli', userType: 'external' };
+    const typed = { ...prompt('ship it'), parentUuid: local.uuid, isMeta: false, userType: 'external' };
+    const entries = [root, caveat, command, local, typed, of(typed, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)];
+    assert.deepEqual(pr(kind, record(kind, entries)), bound58(kind), `${kind}: the ask after the /clear preamble binds`);
+    // the same without the local_command line (the typed prompt chained straight to the command note)
+    const typed2 = { ...prompt('ship it'), parentUuid: command.uuid };
+    assert.deepEqual(pr(kind, record(kind, [root, caveat, command, typed2, of(typed2, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: the ask binds without the local_command line`);
+  }
+});

@@ -296,7 +296,9 @@ const invisibleTurn = (e) => {
 // Probe, Claude Code 2.1.322, 2026-11-11: `CLAUDE_CODE_ENTRYPOINT=cli claude -p "..."` still wrote entrypoint "sdk-cli" (promptSource "sdk") on all 20 lines, so that override is NOT honoured today;
 // the chain rule is defence in depth, so the guarantee does not rest on a field the writing process sets. Machine-wide transcripts carry only entrypoint cli / sdk-cli / sdk-py.
 // parent[i] (originsOf): the index of the prompt entry that prompt entry i's parentUuid chain resolves to (-1: it does not). A string parentUuid that resolves nowhere in the window fails closed
-// (invisible); no parentUuid (a first prompt, a legacy transcript) leaves the entry's own fields to decide (visible); a chain of notes resolves transitively, a cycle fails closed.
+// (invisible), and so does a chain that ends at a non-prompt root (e.g. the SessionStart attachment above the /clear caveat and command notes: they sit before the first owner prompt and carry no
+// assistant text, so what they mute is never an ask; pinned by R6-F1); only an entry with no parentUuid at all (a legacy transcript) leaves its own fields to decide (visible); a chain of notes
+// resolves transitively, a cycle fails closed.
 function invisibleNote(entries, parent, first) {
   const seen = new Set();
   for (let i = first; ; ) {
