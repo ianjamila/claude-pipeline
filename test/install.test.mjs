@@ -880,6 +880,21 @@ test('parseArgs reads every flag, both --flag value and --flag=value', () => {
   assert.equal(parseArgs(['-h']).help, true);
 });
 
+// Ported from #67 (adapted: the sha is now validated, and the installer's mismatch answer is exit 1, see install-admission.test.mjs).
+test('parseArgs: --expect-installed takes a full sha in both spellings, is null unless given, and refuses a missing value, junk, --check and --uninstall', () => {
+  const sha = 'a'.repeat(40);
+  assert.equal(parseArgs(['--expect-installed', sha]).opts.expectInstalled, sha);
+  assert.equal(parseArgs([`--expect-installed=${'b'.repeat(40)}`]).opts.expectInstalled, 'b'.repeat(40));
+  assert.equal(parseArgs([]).opts.expectInstalled, null, 'a plain install carries no expectation');
+  assert.equal(parseArgs(['--require-no-live-reviews']).opts.expectInstalled, null);
+  assert.ok(parseArgs(['--expect-installed']).error);
+  assert.ok(parseArgs(['--expect-installed', '--json']).error);
+  for (const bad of ['x', 'abc', 'A'.repeat(40), 'a'.repeat(39), 'a'.repeat(41)]) assert.ok(parseArgs(['--expect-installed', bad]).error, bad);
+  assert.ok(parseArgs(['--expect-installed', sha, '--check']).error);
+  assert.ok(parseArgs(['--expect-installed', sha, '--uninstall']).error);
+  assert.equal(parseArgs(['--expect-installed', sha, '--require-no-live-reviews']).error, undefined, 'the two gates combine');
+});
+
 test('safeManifestKey accepts only relative posix keys under skills/, agents/ or pipeline/', () => {
   for (const ok of ['skills/review/SKILL.md', 'agents/judge.md', 'pipeline/VERSION', 'pipeline/a/b.mjs']) assert.equal(safeManifestKey(ok), true, ok);
   for (const bad of ['', '/etc/passwd', 'C:/x', '../x', 'skills/../../x', 'skills//x', 'skills/./x', 'skills\\ship', 'settings.json', 'projects/x', 'pipeline', 'skills', 42, null]) {

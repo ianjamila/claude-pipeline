@@ -16,7 +16,7 @@ import { tryAcquire, release } from '../pipeline/lib/locks.mjs';
 import { acquireAdmission, openOrRenewLease, releaseAdmission } from '../pipeline/lib/review-lease.mjs';
 import { registerRepo } from '../pipeline/lib/queue-sweep.mjs';
 import { openRecord } from '../pipeline/lib/merge-queue.mjs';
-import { GUARD_FILES_MATCHER, HOOK_LOADER, mergeSettings, ourHookGroups } from '../pipeline/lib/installer.mjs';
+import { GUARD_FILES_MATCHER, HOOK_LOADER, installLockName, mergeSettings, ourHookGroups } from '../pipeline/lib/installer.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const INSTALL = join(REPO, 'install.mjs');
@@ -381,6 +381,44 @@ test('--expect-installed with --require-no-live-reviews: a mismatch is answered 
   assert.equal(r.status, 1, r.stderr + r.stdout);
   assert.equal(r.json.error, 'expect-installed-mismatch', 'not a deferral, although a lease is live');
   assert.equal(await admissionFree(w), true);
+});
+
+// Ported from #67 (install.test.mjs): the plain-text answer, the lock ordering and the unchanged behaviour of an install without the flag.
+test('--expect-installed: nothing installed any more is a mismatch in plain text too (stderr names it, nothing is written)', () => {
+  const w = world();
+  const r = spawnSync(process.execPath, [INSTALL, '--claude-home', w.home, '--source', w.src, '--expect-installed', SHA_A], { encoding: 'utf8', env: childEnv(w), timeout: 60_000 });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /expect-installed-mismatch/);
+  assert.equal(existsSync(join(w.home, 'pipeline')), false);
+});
+
+test('--expect-installed is checked under the install lock: a busy lock is reported as busy (exit 1), never as a changed install', () => {
+  const w = world();
+  installedAs(w, SHA_A);
+  bump(w);
+  const got = tryAcquire(installLockName(w.home), lockOpts(w));
+  assert.ok(got.acquired);
+  try {
+    const r = run(w, ['--expect-installed', SHA_A]);
+    assert.equal(r.status, 1, r.stderr + r.stdout);
+    assert.match(r.stderr, /another install is running in /);
+    assert.doesNotMatch(r.stdout + r.stderr, /expect-installed-mismatch/);
+    assert.equal(installedVersion(w), '9.9.9', 'nothing was written');
+  } finally {
+    release(got.lock);
+  }
+});
+
+test('without --expect-installed the installer still replaces an edited install, exactly as before the flag existed', () => {
+  const w = world();
+  installedAs(w, SHA_A);
+  bump(w);
+  const edited = join(w.home, 'skills', 'review', 'SKILL.md');
+  writeFileSync(edited, `${readFileSync(edited, 'utf8')}\nmy edit\n`);
+  const r = run(w);
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  assert.equal(installedVersion(w), '10.0.0');
+  assert.doesNotMatch(readFileSync(edited, 'utf8'), /my edit/);
 });
 
 // ---- hooks during the swap (Fable P2-6) ---------------------------------------------------------------------------------------------------
