@@ -575,9 +575,9 @@ test('R5-F1: a null-provenance note chained to a headless (sdk) prompt is invisi
     const m = noteOf(h);
     assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), h, m, of(m, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: M chained to the sdk prompt`);
     // the same through a system-reminder shaped note and an entry between H and M
-    const r = { ...SYSTEM_REMINDER, uuid: 'u-reminder-r5', parentUuid: of(h, toolResult()).parentUuid };
+    const r = { ...SYSTEM_REMINDER, uuid: 'u-reminder-r5', parentUuid: h.uuid };
     assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), h, r, of(r, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: system-reminder note chained to the sdk prompt`);
-    const hm = of(h, said('working'));
+    const hm = { ...of(h, said('working')), uuid: 'u-headless-reply' };
     const m2 = noteOf(hm);
     assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), h, hm, m2, of(m2, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: M chained through the headless reply`);
   }

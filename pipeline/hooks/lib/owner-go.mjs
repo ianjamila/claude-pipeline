@@ -285,11 +285,30 @@ const visibleSynthetic = (e) => entrySource(e) === 'synthetic' && e.promptSource
 // set (a value this list does not know stays invisible, fail closed) or an entrypoint other than "cli" (a headless sdk-cli is synthetic already, so that is an unknown future one).
 const isSet = (v) => v !== undefined && v !== null;
 const unplacedProvenance = (e) => isSet(e.promptSource) || isSet(e.origin) || isSet(e.turnOrigin) || (isSet(e.entrypoint) && e.entrypoint !== 'cli');
+const unplacedNote = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && !unplacedProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined;
 const invisibleTurn = (e) => {
   if (!isPromptEntry(e) || visibleSynthetic(e)) return false;
   const source = entrySource(e);
   return source === 'synthetic' || (source === 'unknown' && unplacedProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined);
 };
+// R5-F1 (Fable): a note of unknown source WITHOUT unplaced provenance (unplacedNote) is visible or not as the turn it ORIGINATES from, the principle of R1-B1 below: a headless run (top prompt
+// promptSource sdk, invisible) can write a skill body or system-reminder note whose own fields look interactive (isMeta, null provenance, entrypoint cli), and what it prints after it must not bind.
+// Probe, Claude Code 2.1.322, 2026-11-11: `CLAUDE_CODE_ENTRYPOINT=cli claude -p "..."` still wrote entrypoint "sdk-cli" (promptSource "sdk") on all 20 lines, so that override is NOT honoured today;
+// the chain rule is defence in depth, so the guarantee does not rest on a field the writing process sets. Machine-wide transcripts carry only entrypoint cli / sdk-cli / sdk-py.
+// parent[i] (originsOf): the index of the prompt entry that prompt entry i's parentUuid chain resolves to (-1: it does not). A string parentUuid that resolves nowhere in the window fails closed
+// (invisible); no parentUuid (a first prompt, a legacy transcript) leaves the entry's own fields to decide (visible); a chain of notes resolves transitively, a cycle fails closed.
+function invisibleNote(entries, parent, first) {
+  const seen = new Set();
+  for (let i = first; ; ) {
+    const e = entries[i];
+    if (invisibleTurn(e)) return true;
+    if (!unplacedNote(e)) return false; // the owner's prompt, a visibleSynthetic turn or a plain boundary of its own: its own fields said so
+    if (typeof e.parentUuid !== 'string') return false;
+    if (seen.has(i) || parent[i] < 0) return true; // a cycle, or a parent outside the window
+    seen.add(i);
+    i = parent[i];
+  }
+}
 
 // The parsed entries of the transcript's last `tailBytes` (a cut first line dropped) and whether the read reached the file's start (#191 A3, F7: callers read `.entries`);
 // no entries when it cannot be read as a regular file.
@@ -436,11 +455,12 @@ function currentPromptEntry(transcriptPath, prompt) {
 // Residual: a process that chains its entries to the owner's prompt on purpose would still be attributed to it; that takes writing the transcript file itself (guard-files refuses a tool write).
 function originsOf(entries) {
   const origin = new Array(entries.length).fill(-1); // entry index -> index of its originating prompt entry (-1: none)
+  const parent = new Array(entries.length).fill(-1); // prompt entry index -> index of the prompt its parentUuid chain resolves to (-1: none; R5-F1)
   const isPrompt = (e) => isPromptEntry(e) && !isHiddenSummary(e);
   if (!entries.some((e) => typeof e?.uuid === 'string')) {
     let latest = -1;
     entries.forEach((e, i) => { if (isPrompt(e)) latest = i; origin[i] = latest; });
-    return origin;
+    return { origin, parent };
   }
   const at = new Map(); // uuid -> entry index
   const twice = new Set(); // a uuid two entries claim: any chain through it is ambiguous
@@ -465,13 +485,16 @@ function originsOf(entries) {
     for (const u of path) memo.set(u, found);
     return found;
   };
-  entries.forEach((e, i) => { origin[i] = isPrompt(e) ? i : resolve(e?.parentUuid); });
-  return origin;
+  entries.forEach((e, i) => {
+    if (isPrompt(e)) { origin[i] = i; parent[i] = resolve(e?.parentUuid); } else origin[i] = resolve(e?.parentUuid);
+  });
+  return { origin, parent };
 }
 
 export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
   const entries = tailEntries(transcriptPath, tailBytes).entries;
-  const origin = originsOf(entries);
+  const { origin, parent } = originsOf(entries);
+  const hidden = (i) => invisibleNote(entries, parent, i);
   // The turns, one per prompt entry (a hidden compaction summary is none), each with the entries attributed to it, in transcript order. pos / lastPos: the entry index of its prompt / of its last entry.
   const turns = [];
   const turnAt = new Map(); // prompt entry index -> turn
@@ -480,7 +503,7 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
     if (e?.type === 'user' && isHiddenSummary(e)) return;
     if (e?.type === 'user' && isPromptEntry(e)) {
       // skip (ruling reader): a turn whose prompt the owner did not type; mute (every other reader): an invisible turn, a boundary whose text is never added (#191 A2); slot: everything else
-      const kind = skipSynthetic ? (entrySource(e) === 'synthetic' || invisibleTurn(e) ? 'skip' : 'slot') : invisibleTurn(e) ? 'mute' : 'slot';
+      const kind = skipSynthetic ? (entrySource(e) === 'synthetic' || hidden(i) ? 'skip' : 'slot') : hidden(i) ? 'mute' : 'slot';
       const t = { pos: i, e, kind, content: [], lastPos: i, textPos: -1, shownPos: -1 };
       turns.push(t);
       turnAt.set(i, t);
