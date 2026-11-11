@@ -17,6 +17,7 @@
 // Backstop for installer runs: the installer itself refuses to run inside a Claude Code process (CLAUDECODE set, or a Claude Code
 // ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
+import { frontmatterHooksValue } from './frontmatter.mjs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
@@ -484,30 +485,22 @@ const SETTINGS_RE = /^settings(\.[\w-]+)?\.json$/i;
 // ---- #261: the places a hook that runs on AskUserQuestion can be declared, besides the account config dirs the protected set holds -------------------------------------------------
 // A project's .claude/settings.json and settings.local.json, a plugin's hooks/hooks.json under a config dir, and the `hooks:` front matter of a skill or an agent. The agent may edit these files for
 // other reasons (permissions, prose), so a file tool is judged by whether the change adds or alters hooks; a Bash line, whose effect is not evaluated, by the file's name plus the word "hooks".
+// (R1-B3) also a command file (`.claude*/commands/*.md`), a plugin's skills / agents / commands under a config dir's plugins/ folder, and a plugin manifest (`.claude-plugin/plugin.json`, whose inline `hooks` and
+// component locations are read by the dialog-hook inventory).
 const HOOK_SURFACE = {
   settings: /(?:^|\/)\.claude[^/]*\/settings(?:\.local)?\.json$/,
   plugin: /(?:^|\/)\.claude[^/]*\/plugins\/(?:[^/]+\/)*hooks\/hooks\.json$/,
-  frontmatter: /(?:^|\/)\.claude[^/]*\/(?:skills\/[^/]+\/SKILL\.md|agents\/[^/]+\.md)$/,
+  manifest: /(?:^|\/)\.claude-plugin\/plugin\.json$/,
+  frontmatter: /(?:^|\/)\.claude[^/]*\/(?:plugins\/(?:[^/]+\/)*)?(?:skills\/[^/]+\/SKILL\.md|(?:agents|commands)\/[^/]+\.md)$/,
 };
 // the same names inside command text (a word that is, or ends in, such a path)
-const HOOK_SURFACE_TEXT = /\.claude[^/\s'"`]*\/(?:settings(?:\.local)?\.json|skills\/[^/\s'"`]+\/SKILL\.md|agents\/[^/\s'"`]+\.md|plugins\/[^\s'"`]*hooks\/hooks\.json)(?![\w.\-])/i;
+const HOOK_SURFACE_TEXT = /(?:\.claude[^/\s'"`]*\/(?:settings(?:\.local)?\.json|(?:plugins\/[^\s'"`]*)?(?:skills\/[^/\s'"`]+\/SKILL\.md|(?:agents|commands)\/[^/\s'"`]+\.md)|plugins\/[^\s'"`]*hooks\/hooks\.json)|\.claude-plugin\/plugin\.json)(?![\w.\-])/i;
 const hookSurfaceKind = (p, ci) => {
   const q = ci ? String(p).toLowerCase() : String(p);
   for (const [kind, re] of Object.entries(HOOK_SURFACE)) if (re.test(q)) return kind;
   return null;
 };
 const sortedJsonOf = (v) => JSON.stringify(v, (_k, x) => (x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x));
-// the `hooks:` block of a skill's or agent's front matter ('' when there is none)
-function frontmatterHooks(text) {
-  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(String(text ?? ''));
-  if (!m) return '';
-  const lines = m[1].split(/\r?\n/);
-  const at = lines.findIndex((l) => /^hooks\s*:/.test(l));
-  if (at < 0) return '';
-  let end = lines.length;
-  for (let i = at + 1; i < lines.length; i++) if (/^[^\s#-]/.test(lines[i])) { end = i; break; }
-  return lines.slice(at, end).join('\n');
-}
 // The text a file tool would leave in the file (null when it cannot be worked out: an Edit whose old_string is not there is no change the tool will make, judged by its words).
 function textAfter(ti, before) {
   if (typeof ti.content === 'string') return ti.content;
@@ -525,14 +518,20 @@ function hooksChangeReason(kind, ti, ctx, candidate, shown) {
   const after = textAfter(ti, before);
   const words = writtenTexts(ti).some((x) => /hooks/i.test(x));
   if (after === null) return words ? `${shown}: the change mentions hooks and cannot be compared with the file` : null;
-  if (kind === 'frontmatter') return frontmatterHooks(before) !== frontmatterHooks(after) ? `${shown}: the change adds or alters hooks in the front matter` : null;
+  return hooksDifference(kind, before, after, shown, words);
+}
+// What a text that REPLACES a hook surface file's text (`before` -> `after`) does to its hooks: a reason, or null. `words`: the change mentions hooks (decides when the result cannot be read as JSON).
+// A settings file is compared by its `hooks` object, a plugin manifest by `hooks` and the component locations (skills, agents, commands), a front matter by the shared recognizer.
+function hooksDifference(kind, before, after, shown, words) {
+  if (kind === 'frontmatter') return frontmatterHooksValue(before) !== frontmatterHooksValue(after) ? `${shown}: the change adds or alters hooks in the front matter` : null;
+  const keys = kind === 'manifest' ? ['hooks', 'skills', 'agents', 'commands'] : ['hooks'];
   let a = null;
   let b = null;
   try { b = before.trim() === '' ? {} : JSON.parse(before); } catch { b = null; }
   try { a = JSON.parse(after); } catch { a = null; }
   if (a === null || typeof a !== 'object') return words ? `${shown}: the change mentions hooks and the result cannot be read as JSON` : null;
   if (b === null || typeof b !== 'object') return /"hooks"/.test(after) ? `${shown}: the file could not be compared and now holds hooks` : null;
-  return sortedJsonOf(a.hooks ?? null) !== sortedJsonOf(b.hooks ?? null) ? `${shown}: the change adds or alters "hooks"` : null;
+  return keys.some((k) => sortedJsonOf(a[k] ?? null) !== sortedJsonOf(b[k] ?? null)) ? `${shown}: the change adds or alters ${keys.map((k) => `"${k}"`).join(' / ')}` : null;
 }
 const HOOKS_MSG = 'a hook on AskUserQuestion could answer the owner\'s dialog in the owner\'s name or hide a refusal; permission edits stay allowed, hooks are the owner\'s to change, from a terminal';
 
@@ -552,6 +551,60 @@ function listedDialogScripts(base, readText) {
     return (Array.isArray(j?.hooks) ? j.hooks : []).slice(0, 200).map((h) => (typeof h?.scriptPath === 'string' ? toPosix(h.scriptPath) : '')).filter((p) => isAbs(p)).map((p) => pathsFor().normalize(p));
   } catch {
     return [];
+  }
+}
+
+// (R1-B1) A Bash write to a file that can declare hooks is judged by its resolved TARGET, not by whether the line says "hooks": `cp /tmp/c.json .claude/settings.local.json` and
+// `jq … > /tmp/x && mv /tmp/x <settings>` say none. Every word of the line that names such a file (or a folder a copied file would land in) is a target; the line's writes to it are asked
+// of the write model (writtenTo); what lands there must be a text the guard can read (a static text, a file on disk, the file itself) and none may add or change hooks, as for a file tool. A write whose
+// content is only known at run time (a program's output, a rewrite by jq / sed we cannot emulate, an inline program) is refused: permission edits go through Edit / Write. A plugin's hooks file is never
+// written from Bash. -> a reason or null. `writesOf(c)`: is the command not a read? (for a word that names such a file only through a glob or a variable)
+function hookSurfaceBashReason(cmds, frame, ctx, writesOf) {
+  const found = new Map(); // absolute path -> the word that named it
+  const unpinned = [];
+  const surfaceKind = (q) => hookSurfaceKind(q, ctx.ci);
+  const stash = frame.i;
+  frame.i = cmds.length; // (judge the file as the WHOLE line leaves it)
+  try {
+    cmds.forEach((c, idx) => {
+      const words = [...c.argv.slice(1), ...(c.redirects ?? []).map((r) => r.target ?? '')].filter((w) => typeof w === 'string' && w !== '');
+      const placed = [];
+      for (const w of words) {
+        const e = frame.expand(w);
+        if (e === null) {
+          if (HOOK_SURFACE_TEXT.test(w) && (writesOf(c) || (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)))) unpinned.push(w);
+          continue;
+        }
+        for (const q of frame.locate(e, idx).filter((x) => isAbs(x))) placed.push(q);
+      }
+      for (const q of placed.slice(0, 64)) {
+        const lex = pathsFor().normalize(q);
+        const set = new Set([lex, realResolve(lex, ctx.api)]);
+        for (const x of set) if (surfaceKind(x) !== null) found.set(x, q);
+        // a folder the file lands in: `cp /tmp/SKILL.md .claude/skills/x/`
+        for (const other of placed.slice(0, 64)) {
+          const base = posix.basename(toPosix(other));
+          if (base && base !== '.' && base !== '..') for (const x of set) { const joined = pathsFor().join(x, base); if (surfaceKind(joined) !== null) found.set(joined, q); }
+        }
+      }
+    });
+    if (unpinned.length > 0) return `the command writes ${unpinned[0]}, a file that can declare hooks, at a place only known at run time`;
+    for (const [P] of found) {
+      const w = writtenTo(ctx.frames, P, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: true, genericAsUnknown: true });
+      if (w === null) continue; // nothing on the line writes it (a read, or a command that only names it)
+      const kind = surfaceKind(P);
+      if (kind === 'plugin') return `the command writes ${P}, a plugin's hooks file: a hook there could run on the owner's dialogs`;
+      const disk = ctx.readText(P);
+      const cands = writtenCandidates(w, disk, (q) => ctx.readText(q));
+      if (cands === null) return `the command writes ${P}, a file that can declare hooks, with content only known when it runs, so it cannot be compared with the file`;
+      for (const after of cands) {
+        const why = hooksDifference(kind, typeof disk === 'string' ? disk : '', after, P, /hooks/i.test(after));
+        if (why !== null) return why;
+      }
+    }
+    return null;
+  } finally {
+    frame.i = stash;
   }
 }
 
@@ -3130,7 +3183,8 @@ function evaluateBashForFilesFrame(command, opts) {
     if (setsAdmin(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
     if (hasDisableAll(words)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
   }
-  // #261: a write whose target is a file that can declare a hook on the owner's dialogs and whose line says "hooks" (its effect cannot be evaluated; a permission edit has no such word)
+  // #261: a write whose text names a file that can declare a hook on the owner's dialogs inside a program or a quoted string, and whose line says "hooks" (its effect cannot be evaluated). A write whose TARGET is
+  // such a file is judged by the target and what lands in it (R1-B1, hookSurfaceBashReason below, once the line's writes are known)
   if (/hooks/i.test(scanRaw)) {
     for (const c of cmds) {
       const writes = (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) || (c.argv.length > 0 && !isReadOnly(c, ctx));
@@ -3170,6 +3224,10 @@ function evaluateBashForFilesFrame(command, opts) {
     tick: () => checkDeadline(ctx.budget),
   });
   ctx.frames.push(frame);
+  {
+    const why = hookSurfaceBashReason(cmds, frame, ctx, (c) => c.argv.length > 0 && !isReadOnly(c, ctx));
+    if (why !== null) return deny(`${why} (${HOOKS_MSG})`);
+  }
   // BASH_ENV / ENV / ZDOTDIR / HOME values this line (and the scripts that run it) assign: shells started by the scripts it runs see them
   const startupEnv = opts.env ?? process.env;
   const inheritedStartup = (n) => opts._startup?.[n] ?? [];

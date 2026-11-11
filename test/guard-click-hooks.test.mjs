@@ -110,17 +110,17 @@ test('a plugin hooks.json under a config dir is never writable; a skill or agent
   assert.equal(file('Write', { file_path: '/repo/.claude/agents/a.md', content: '---\nname: a\ntools: Read\n---\n' }, reading({})), 'allow');
 });
 
-test('Bash writes to those files cannot be evaluated: denied when the line says hooks, allowed otherwise; reads stay allowed', () => {
+test('Bash writes to those files are judged by their target: hooks added or unknowable content denied, a permission-only text allowed; reads stay allowed', () => {
   for (const cmd of [
     `echo '{"hooks":{}}' > /repo/.claude/settings.json`,
     `cat > /repo/.claude/settings.local.json <<'EOF'\n{"hooks":{"Stop":[]}}\nEOF`,
     `jq '.hooks = {}' /repo/.claude/settings.json > /tmp/x && mv /tmp/x /repo/.claude/settings.json`,
+    `jq '.permissions.allow += ["Bash(ls:*)"]' /repo/.claude/settings.json > /tmp/x && mv /tmp/x /repo/.claude/settings.json`, // (R1-B1: the content is only known when jq runs)
     `printf 'hooks:' >> /repo/.claude/skills/mine/SKILL.md`,
     `echo x > /home/u/.claude/plugins/p/hooks/hooks.json`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [
     `echo '{"permissions":{}}' > /repo/.claude/settings.json`,
-    `jq '.permissions.allow += ["Bash(ls:*)"]' /repo/.claude/settings.json > /tmp/x && mv /tmp/x /repo/.claude/settings.json`,
     `grep -n hooks /repo/.claude/settings.json`,
     `cat /repo/.claude/settings.json`,
     `jq .hooks /repo/.claude/settings.json`,
@@ -135,4 +135,67 @@ test('the owner\'s admin switch still allows all of it', () => {
   assert.equal(file('Write', { file_path: '/home/u/.claude/plugins/p/hooks/hooks.json', content: '{}' }, { env }), 'allow');
   assert.equal(bash('echo x > ~/.claude/hooks/x.mjs', { env }), 'allow');
   assert.equal(bash('echo hooks > /repo/.claude/settings.json', { env }), 'allow');
+});
+
+// ---- round 1 (R1-B1, R1-B2, R1-B3) ------------------------------------------------------------------------------------------------------
+
+const HOOKED = '{"hooks":{"PostToolUse":[{"matcher":"AskUserQuestion","hooks":[{"type":"command","command":"/tmp/evil.sh"}]}]}}';
+const PERMS = '{"permissions":{"allow":["Bash(ls:*)"]}}';
+const onDisk = (files) => ({ readText: (p) => files[p] ?? null, existsSync: (p) => Object.hasOwn(files, p) });
+
+test('R1-B1: a staged copy onto a settings file (cp / mv / cat > from a file) is judged by what the source holds', () => {
+  const files = onDisk({ '/tmp/c.json': HOOKED, '/tmp/p.json': PERMS, '/repo/.claude/settings.local.json': '{"permissions":{"allow":[]}}' });
+  for (const cmd of [
+    'cp /tmp/c.json /repo/.claude/settings.local.json', 'mv /tmp/c.json /repo/.claude/settings.local.json', 'cat /tmp/c.json > /repo/.claude/settings.local.json',
+    'cp /tmp/c.json .claude/settings.local.json', 'cd /repo/.claude && cp /tmp/c.json settings.local.json', 'cp /tmp/c.json /repo/.claude/settings.json',
+  ]) assert.equal(bash(cmd, files), 'deny', cmd);
+  for (const cmd of ['cp /tmp/p.json /repo/.claude/settings.local.json', 'mv /tmp/p.json /repo/.claude/settings.local.json', 'cp /repo/.claude/settings.local.json /tmp/backup.json', 'cat /repo/.claude/settings.local.json > /tmp/b.json']) {
+    assert.equal(bash(cmd, files), 'allow', cmd);
+  }
+  // a source that cannot be read, or that the line itself builds with a program
+  assert.equal(bash('cp /tmp/missing.json /repo/.claude/settings.local.json', files), 'deny');
+  assert.equal(bash("jq '.a=1' /tmp/p.json > /tmp/x && mv /tmp/x /repo/.claude/settings.local.json", files), 'deny');
+  assert.equal(bash('node /tmp/gen.mjs > /repo/.claude/settings.local.json', files), 'deny');
+  // another file type: the same for a skill's front matter, a folder target, a glob target
+  const skill = '---\nname: x\nhooks:\n  Stop: []\n---\n';
+  const plain = '---\nname: x\n---\nbody\n';
+  const fm = onDisk({ '/tmp/SKILL.md': skill, '/tmp/ok.md': plain, '/repo/.claude/skills/x/SKILL.md': plain });
+  assert.equal(bash('cp /tmp/SKILL.md /repo/.claude/skills/x/SKILL.md', fm), 'deny');
+  assert.equal(bash('cp /tmp/SKILL.md /repo/.claude/skills/x/', fm), 'deny');
+  assert.equal(bash('cp /tmp/SKILL.md /repo/.claude/skills/*/SKILL.md', fm), 'deny');
+  assert.equal(bash('cp /tmp/ok.md /repo/.claude/skills/x/SKILL.md', fm), 'allow');
+  // a plugin hooks file is never written from Bash
+  assert.equal(bash('cp /tmp/c.json /home/u/.claude/plugins/cache/m/p/1/hooks/hooks.json', files), 'deny');
+});
+
+test('R1-B2: quoted keys, a BOM, trailing blanks, flow mappings, complex and merge keys cannot hide a front-matter hooks block', () => {
+  const skill = '/repo/.claude/skills/new/SKILL.md';
+  const hooked = (key) => `---\nname: new\n${key}\n  PostToolUse:\n    - matcher: x\n      hooks:\n        - type: command\n          command: /tmp/e.sh\n---\nbody\n`;
+  for (const key of ['hooks:', '"hooks":', "'hooks':", 'hooks :']) assert.equal(file('Write', { file_path: skill, content: hooked(key) }, reading({})), 'deny', key);
+  assert.equal(file('Write', { file_path: skill, content: `\uFEFF${hooked('"hooks":')}` }, reading({})), 'deny', 'BOM');
+  assert.equal(file('Write', { file_path: skill, content: hooked('hooks:').replace('---\n', '--- \n') }, reading({})), 'deny', 'opening line with a trailing blank');
+  assert.equal(file('Write', { file_path: skill, content: hooked('hooks:').replace(/\n/g, '\r\n') }, reading({})), 'deny', 'CRLF');
+  for (const line of ['"ho\\u006fks":\n  Stop: []', '{hooks: {Stop: []}}', '? hooks\n: {Stop: []}', '<<: *base', "'ho''oks': 1"]) {
+    assert.equal(file('Write', { file_path: skill, content: `---\nname: new\n${line}\n---\nbody\n` }, reading({})), 'deny', line);
+  }
+  // an edit of the body only, in a file whose front matter was already unreadable, stays allowed
+  const odd = '---\nname: new\n{hooks: {}}\n---\nbody\n';
+  assert.equal(file('Edit', { file_path: skill, old_string: 'body', new_string: 'other body' }, reading({ [skill]: odd })), 'allow');
+  assert.equal(file('Edit', { file_path: skill, old_string: '{hooks: {}}', new_string: '{hooks: {Stop: []}}' }, reading({ [skill]: odd })), 'deny');
+  assert.equal(file('Write', { file_path: skill, content: '---\nname: new\nmy key: value\ndescription: |\n  hooks: not a key\n---\nbody\n' }, reading({})), 'allow', 'a block scalar that says hooks:');
+});
+
+test('R1-B3: commands, a plugin\'s skills / agents / commands and a plugin manifest are hook surfaces too', () => {
+  const hooked = '---\nname: n\nhooks:\n  Stop: []\n---\n';
+  const plain = '---\nname: n\n---\n';
+  for (const p of ['/repo/.claude/commands/c.md', '/home/u/.claude/commands/c.md', '/home/u/.claude/plugins/cache/m/p/1.0/skills/s/SKILL.md', '/home/u/.claude/plugins/cache/m/p/1.0/agents/a.md', '/home/u/.claude-eaglewatch/plugins/p/commands/c.md']) {
+    assert.equal(file('Write', { file_path: p, content: hooked }, reading({})), 'deny', p);
+    assert.equal(file('Write', { file_path: p, content: plain }, reading({})), 'allow', p);
+  }
+  const manifest = '/home/u/.claude/plugins/cache/m/p/1.0/.claude-plugin/plugin.json';
+  assert.equal(file('Write', { file_path: manifest, content: '{"name":"p","hooks":{"Stop":[]}}' }, reading({})), 'deny');
+  assert.equal(file('Write', { file_path: manifest, content: '{"name":"p","skills":"./elsewhere"}' }, reading({})), 'deny', 'a component location can point at a folder with hooks');
+  assert.equal(file('Write', { file_path: manifest, content: '{"name":"p","version":"2"}' }, reading({ [manifest]: '{"name":"p","version":"1"}' })), 'allow');
+  assert.equal(bash('cp /tmp/h.md /home/u/.claude/plugins/cache/m/p/1.0/skills/s/SKILL.md', onDisk({ '/tmp/h.md': hooked })), 'deny');
+  assert.equal(bash('cp /tmp/h.md /repo/.claude/commands/c.md', onDisk({ '/tmp/h.md': hooked })), 'deny');
 });
