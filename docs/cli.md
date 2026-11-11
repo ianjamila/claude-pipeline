@@ -145,6 +145,8 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
     the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not
     taken alone
   exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver
+  every real Codex run (not a base-only round), answered or failed, adds one line to <home>/.claude/pipeline-state/codex-usage.jsonl (the weekly figure `pipeline summary` prints);
+    a ledger that cannot be written never fails the round: it adds warnings:[…] to the reply
   env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)
 ```
 
@@ -653,10 +655,12 @@ Exit: 0 · 2 no state / usage (`outcome` is 0 whether or not `clean`).
 upsert the PR summary comment and print the agent-log line.
 
 ```
-pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")
+pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost, codexUsage}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending"; both lines end with " · Codex 7d: N runs (H high[, X xhigh])" when the pipeline ran Codex in the last 7 days, any repo: codexUsage {runs, high, xhigh, failed}, from <home>/.claude/pipeline-state/codex-usage.jsonl)
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
+
+**Weekly Codex figure.** `codex-review` and `triage second-review` append one line per real Codex run (answered or failed; not a base-only round) to `<home>/.claude/pipeline-state/codex-usage.jsonl`: `{v:1, ts, kind:'review'|'second-review', repo, pr, round, effort, model, ok, resolutionOnly?}` (`ok` = Codex exited 0). `summary` counts the lines of the last 7 days over every repository and ends the agent-log line (and `pendingLogLine`) with ` · Codex 7d: N runs (H high)` (`, X xhigh` only when X > 0), nothing when no run is recorded; the counts are also `codexUsage` {runs, high, xhigh, failed} in its JSON. The figure is display only: a ledger that cannot be written is a `warnings` entry on the command that ran Codex, never a failure; bad lines and a missing file read as nothing. `agent-log close` still treats a pending line with the figure as pending. `PIPELINE_CODEX_USAGE_FILE` moves the ledger (a repo checkout only, like the other test seams; `scripts/test.mjs` sets it).
 
 Without `.review/state.json` only `--outcome blocked`, `awaiting-review`, `stopped`, `closed` and `merged-externally` are accepted (the early-stop paths: verify red three times, Codex out in round 1, a stop on a gate or merge refusal, the owner closing the PR, a merge made outside the pipeline): the comment is rendered with no rounds (a `blocked` one names the failing step from the verify report) and `agentLogLine` is still printed. Any other outcome without state is exit 2.
 
@@ -697,6 +701,7 @@ pipeline triage second-review --round R --ids ID[,ID…] --pr N [--repo DIR]
   -> the check runs under the review lock, Codex runs outside it, then the state is read again under the lock: nothing is recorded (exit 1) when HEAD moved, an item's final or finding text changed, or a verdict appeared meanwhile
   -> exit 1 {ok:false, reason} for an answer that is not exactly one valid verdict per requested id (or no usable answer after Codex exited 0): nothing is stored, so run it again. exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|github} when Codex or GitHub could not deliver: state untouched, the PR waits (review-loop.md rule 2)
   -> the prompt and the raw answer are kept as .review/round-R/second-review-<first id>.md and .json; the result is published like a Claude ruling (published / publishError / next as for claude-ruling); it writes review state format version 2; env PIPELINE_CODEX_TIMEOUT_MS as for codex-review
+  -> the Codex run is logged like a review round (kind second-review, <home>/.claude/pipeline-state/codex-usage.jsonl, see codex-review); a ledger that cannot be written adds warnings:[…] to the reply
 pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]
   -> {ok, round, id, final, published: false, next}; records the OWNER's decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human
   -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human and has no unimplemented Claude ruling (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state's

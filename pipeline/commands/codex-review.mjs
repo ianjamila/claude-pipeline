@@ -21,6 +21,7 @@ import {
   FINDINGS_SCHEMA_PATH, assignIds, buildCodexArgs, buildReviewPrompt, largeBinaryNote, renderFindingsMarkdown, validateFindings,
 } from '../lib/codex.mjs';
 import { CODEX_TIMEOUT_MS, execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
+import { recordCodexRun } from '../lib/codex-usage.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import {
   GitError, NETWORK_TIMEOUT_MS, diffFiles, effectiveReviewBase, git, headSha, mergeBase, resolutionReviewBase, reviewPatch, revParse, showFile,
@@ -65,6 +66,8 @@ export const meta = {
     '    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not',
     '    taken alone',
     '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver',
+    '  every real Codex run (not a base-only round), answered or failed, adds one line to <home>/.claude/pipeline-state/codex-usage.jsonl (the weekly figure `pipeline summary` prints);',
+    '    a ledger that cannot be written never fails the round: it adds warnings:[…] to the reply',
     '  env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)',
   ].join('\n'),
 };
@@ -312,12 +315,19 @@ export const run = guarded(async (argv, ctx) => {
 
   const headMoved = () => new Fail(EXIT.USAGE, { ok: false, error: 'head-moved', message: 'HEAD moved while Codex was reviewing; run the round again' });
   // Runs Codex over the prepared prompt and returns its validated findings (every failure is an exit-3 Fail).
+  const usageWarnings = [];
+  const repoSlugOrNull = () => { try { return gh.repo().slug; } catch { return null; } };
   const askCodex = async () => {
     // execCodex removes whatever is at the output path first (so it can never be read as this run's answer; the mtime check in
     // readCodexAnswer is the second line of defence, the tree kill on timeout the third).
     writeFileAtomic(path.join(dir, 'prompt.md'), promptBytes);
     const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
-    if (!ran.ok) throw unavailable(ran.reason, { code: ran.code, timedOut: ran.timedOut, detail: ran.detail });
+    // One line per real Codex run, kept or not (the weekly figure in the agent-log line); a ledger that cannot be written is a warning.
+    const logged = recordCodexRun({
+      kind: 'review', repo: state?.repo || slug || repoSlugOrNull(), pr, round, effort, model, ok: ran.ok, resolutionOnly,
+    }, { env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });
+    if (!logged.ok) usageWarnings.push(logged.warning);
+    if (!ran.ok) throw unavailable(ran.reason, { code: ran.code, timedOut: ran.timedOut, detail: ran.detail, ...(usageWarnings.length ? { warnings: usageWarnings } : {}) });
 
     if (headSha(o) !== head) throw headMoved();
 
@@ -431,6 +441,7 @@ export const run = guarded(async (argv, ctx) => {
       reviewer: state.reviewer,
       reviewerReasons: state.rounds.at(-1)?.fableReasons ?? [],
       path: dir,
+      ...(usageWarnings.length ? { warnings: usageWarnings } : {}),
     },
   };
 });

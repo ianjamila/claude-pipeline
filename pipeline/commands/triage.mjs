@@ -12,6 +12,7 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
+import { recordCodexRun } from '../lib/codex-usage.mjs';
 import { git, headSha, showFile } from '../lib/git.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
@@ -62,6 +63,7 @@ export const meta = {
     '  -> the check runs under the review lock, Codex runs outside it, then the state is read again under the lock: nothing is recorded (exit 1) when HEAD moved, an item\'s final or finding text changed, or a verdict appeared meanwhile',
     '  -> exit 1 {ok:false, reason} for an answer that is not exactly one valid verdict per requested id (or no usable answer after Codex exited 0): nothing is stored, so run it again. exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|github} when Codex or GitHub could not deliver: state untouched, the PR waits (review-loop.md rule 2)',
     '  -> the prompt and the raw answer are kept as .review/round-R/second-review-<first id>.md and .json; the result is published like a Claude ruling (published / publishError / next as for claude-ruling); it writes review state format version 2; env PIPELINE_CODEX_TIMEOUT_MS as for codex-review',
+    '  -> the Codex run is logged like a review round (kind second-review, <home>/.claude/pipeline-state/codex-usage.jsonl, see codex-review); a ledger that cannot be written adds warnings:[…] to the reply',
     'pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]',
     '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
     '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human and has no unimplemented Claude ruling (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
@@ -476,7 +478,7 @@ async function secondReview(rest, ctx) {
       if (why) return refuse(why);
       items.push(item);
     }
-    return { head: headSha(o), risk: state.risk, items: items.map(packetItem), snapshot: askedSnapshot(items) };
+    return { head: headSha(o), repo: state.repo, risk: state.risk, items: items.map(packetItem), snapshot: askedSnapshot(items) };
   }, pr);
   if (asked.exitCode !== undefined) return asked;
 
@@ -503,8 +505,13 @@ async function secondReview(rest, ctx) {
   // Codex runs WITHOUT the lock (it can take minutes). The prompt is kept before it starts, so a crashed run still leaves what it was asked.
   writeFileAtomic(path.join(dir, `second-review-${ids[0]}.md`), promptBytes);
   const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
+  // The weekly Codex figure (codex-usage.mjs): one ledger line per real run; a ledger that cannot be written is only a warning.
+  const logged = recordCodexRun({
+    kind: 'second-review', repo: asked.repo || (() => { try { return gh.repo().slug; } catch { return null; } })(), pr, round: n, effort: SECOND_REVIEW_EFFORT, model, ok: ran.ok,
+  }, { env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });
+  const usageWarnings = logged.ok ? [] : [logged.warning];
   if (!ran.ok) {
-    throw new Fail(EXIT.UNAVAILABLE, { ok: false, unavailable: true, reason: ran.reason, code: ran.code, timedOut: ran.timedOut, detail: ran.detail });
+    throw new Fail(EXIT.UNAVAILABLE, { ok: false, unavailable: true, reason: ran.reason, code: ran.code, timedOut: ran.timedOut, detail: ran.detail, ...(usageWarnings.length ? { warnings: usageWarnings } : {}) });
   }
   // From here on a bad answer stores nothing, so the call can simply be run again.
   let answer;
@@ -547,6 +554,7 @@ async function secondReview(rest, ctx) {
       exitCode: EXIT.OK,
       output: {
         ok: true, round: n, verdicts, forcedAccept: verdicts.filter((v) => v.decision === 'ACCEPT').map((v) => v.id), ...published,
+        ...(usageWarnings.length ? { warnings: usageWarnings } : {}),
         next: [secondReviewNext(verdicts), publishNext].filter(Boolean).join('. '),
       },
     };
