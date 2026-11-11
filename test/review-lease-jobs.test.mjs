@@ -22,7 +22,8 @@ const T0 = Date.UTC(2026, 10, 11, 12, 0, 0);
 const START = 'Wed Nov 11 02:23:52 2026';
 const tmp = (t) => {
   const d = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'cp-lease-job-')));
-  t.after(() => fs.rmSync(d, { recursive: true, force: true }));
+  // Windows may still hold a just-finished job's folder for a moment: retry, and never fail a test on cleanup.
+  t.after(() => { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 3 }); } catch { /* ignore */ } });
   return d;
 };
 
@@ -208,7 +209,12 @@ test('R1-F1: `job start` run in a session passes the session identity to the job
     assert.equal(res.exitCode, 0, JSON.stringify(res.output));
     const deadline = Date.now() + 20_000;
     while (!fs.existsSync(path.join(repo, `${name}.txt`)) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
-    return fs.readFileSync(path.join(repo, `${name}.txt`), 'utf8');
+    const seen = fs.readFileSync(path.join(repo, `${name}.txt`), 'utf8');
+    // The runner writes exit.json last: once it exists the detached runner is done with the folder (Windows cannot delete a folder a live process uses).
+    const exitFile = path.join(repo, '.review', 'jobs', name, 'exit.json');
+    while (!fs.existsSync(exitFile) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(fs.existsSync(exitFile), `${name}: the job runner wrote exit.json`);
+    return seen;
   };
   const env = { ...process.env, CLAUDECODE: '1', HOME: repo, USERPROFILE: repo };
   delete env[HOLDER_ENV];
