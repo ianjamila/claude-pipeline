@@ -33,6 +33,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { REPO_NAME, readRepoMoves, sameRepo } from './repo-moves.mjs';
+import { clickProvenance } from './owner-go-click.mjs';
 import { accountHome, isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
@@ -43,7 +44,7 @@ const PROVENANCE_CHUNK_BYTES = 4 * 1024 * 1024; // promptProvenance reads the tr
 const PROVENANCE_CAP_BYTES = 64 * 1024 * 1024; // … and gives up (missing) this far back
 const FALLBACK_WINDOW_MS = 120 * 1000; // a record with no prompt_id is matched to a transcript entry by its text within this much time
 const MAX_RECORD_BYTES = 1024 * 1024; // one session file; a bigger one is not read
-const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+export const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 export const HEAD_CHARS = 12; // the head is shown (and matched) by its first 12 characters at least
 
 // The account's home from the OS user database, NOT $HOME: `HOME=/tmp/x P merge …` must not point the check at a folder the agent
@@ -644,6 +645,20 @@ export function realDirChain(home, rel) {
   return true;
 }
 
+// The binding a "merge" answer makes, as one pure function of the answer and the text it answers (#261: the typed recorder runs it on the owner's prompt and the reply's last request; the
+// click recorder, owner-go-click.mjs, on the chosen answer and the dialog's question, which carries the same closing lines). Returns { prs, requests } or null (the answer is no approval).
+export function approvalBinding(answer, shownText) {
+  const a = parseApproval(answer);
+  if (!a) return null;
+  const shown = presentedRequests(shownText);
+  const wanted = (pr) => a.prs.length === 0 || a.prs.includes(pr);
+  const shaOk = (head) => a.shas.length === 0 || a.shas.some((s) => head.startsWith(s) || s.startsWith(head));
+  const requests = shown.requests.filter((r) => wanted(r.pr) && shaOk(r.head));
+  // PRs the owner approved for a direct merge: those the reply asked about (narrowed by the prompt), plus any the prompt names
+  const prs = [...new Set([...shown.prs.filter(wanted), ...a.prs])];
+  return { prs, requests };
+}
+
 // The recorder. Writes one line to <home>/.claude/pipeline-state/owner-go/<session>.jsonl for an owner prompt that approves;
 // returns the record, or null (not an approval, a subagent, no session, or the write failed). Never throws.
 export function recordApproval(input, { home = accountHome(), now = Date.now } = {}) {
@@ -655,12 +670,7 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
     if (!a) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: a notice, a peer's or a scheduled turn's "merge")
     if (queuedAnswer(input)) return null; // (#191 B1)
-    const shown = presentedRequests(lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt) }));
-    const wanted = (pr) => a.prs.length === 0 || a.prs.includes(pr);
-    const shaOk = (head) => a.shas.length === 0 || a.shas.some((s) => head.startsWith(s) || s.startsWith(head));
-    const requests = shown.requests.filter((r) => wanted(r.pr) && shaOk(r.head));
-    // PRs the owner approved for a direct merge: those the reply asked about (narrowed by the prompt), plus any the prompt names
-    const prs = [...new Set([...shown.prs.filter(wanted), ...a.prs])];
+    const { prs, requests } = approvalBinding(String(input.prompt), lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt) }));
     const record = {
       v: 1,
       ts: new Date(now()).toISOString(),
@@ -686,7 +696,7 @@ const promptRefs = (input) => ({
 });
 
 // Appends one record to <home>/.claude/pipeline-state/owner-go/<session>.jsonl; the record, or null when it cannot be written safely.
-function appendRecord(home, session, record) {
+export function appendRecord(home, session, record) {
   if (!realDirChain(home, OWNER_GO_REL)) return null;
   const file = path.join(ownerGoDir(home), `${session}.jsonl`);
   try {
@@ -706,6 +716,13 @@ function appendRecord(home, session, record) {
 
 export const RULING_PROMPT_MAX = 1000; // a ruling answer is only decisions (rulingsIn); a longer prompt is no answer and is not recorded (never cut)
 
+// The binding a ruling answer makes: the ruling line the text ENDS with (presentedRuling) when the answer is a plausible one (non-empty, at most RULING_PROMPT_MAX; what it decides per item is
+// rulingsIn's job at use time). Pure, shared with the click recorder (#261). Returns { repo, pr, ids, content } or null.
+export function rulingBinding(answer, shownText) {
+  if (typeof answer !== 'string' || answer.trim() === '' || answer.length > RULING_PROMPT_MAX) return null;
+  return presentedRuling(shownText);
+}
+
 // Phase 3b, the ruling recorder (same hook, same folder): when the reply right before the owner's prompt ends with the ruling line
 // (presentedRuling), writes the prompt's words, bound to that repository, PR and those item ids. Returns the record, or null. Never throws.
 export function recordRuling(input, { home = accountHome(), now = Date.now } = {}) {
@@ -716,7 +733,7 @@ export function recordRuling(input, { home = accountHome(), now = Date.now } = {
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: a notice, a peer's or a scheduled turn's words)
     if (queuedAnswer(input)) return null; // (#191 B1)
     const reply = lastReply(String(input?.transcript_path ?? ''), { prompt: input.prompt, skipSynthetic: true });
-    const asked = presentedRuling(reply.text);
+    const asked = rulingBinding(input.prompt, reply.text);
     if (!asked) return null;
     // (#189 finding 2 refused a queued answer to a PROMOTED ask only; #191 B1 refuses every queued answer above. The record still says which kind of ask it answers: ask_turn is the audit trail.)
     return appendRecord(home, session, {
@@ -773,13 +790,14 @@ export function readApprovals(opts = {}) {
     prompt_id: typeof r.prompt_id === 'string' ? r.prompt_id : null,
     transcript_path: typeof r.transcript_path === 'string' ? r.transcript_path : null,
     prompt: typeof r.prompt === 'string' ? r.prompt : null,
+    ...(r.via === 'ask' ? { via: 'ask', ask: r.ask } : {}),
     prs: Array.isArray(r.prs) ? r.prs.filter(Number.isInteger) : [],
     requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string').map((q) => ({ ...q, repo: typeof q.repo === 'string' ? q.repo : null })) : [],
   }));
 }
 
 // Every valid record (any kind) younger than maxAgeMs, as written. Never throws.
-function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES } = {}) {
+export function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES } = {}) {
   const dir = ownerGoDir(home);
   const out = [];
   let names = [];
@@ -790,6 +808,7 @@ function readRecords({ home = accountHome(), session = null, now = Date.now, max
     return out;
   }
   const t = now();
+  const clicks = new Set(); // #261: a click's record is written after its marker, so a crash-and-retry can leave two of one click: readers keep the first (the click id is the identity)
   for (const name of names) {
     const file = path.join(dir, name);
     let text = '';
@@ -813,6 +832,7 @@ function readRecords({ home = accountHome(), session = null, now = Date.now, max
       if (r?.v !== 1 || `${r.session}.jsonl` !== name) continue;
       const at = Date.parse(r.ts);
       if (!Number.isFinite(at) || at > t + FUTURE_SKEW_MS || t - at > maxAgeMs) continue;
+      if (r.via === 'ask' && typeof r.ask?.clickId === 'string') { if (clicks.has(r.ask.clickId)) continue; clicks.add(r.ask.clickId); }
       out.push(r);
     }
   }
@@ -868,7 +888,7 @@ export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, 
 
 // Visits the parsed lines of a file newest first, in chunk-sized reads, at most capBytes back from the end; `wants(line)` filters before the
 // parse and `visit(entry)` returns true to stop. Returns { reachedStart } (did the scan cover the whole file?) or null when it cannot be read.
-function scanBackwards(file, visit, wants, { chunkBytes, capBytes }) {
+export function scanBackwards(file, visit, wants, { chunkBytes, capBytes }) {
   let fd;
   try {
     if (!lstatSync(file).isFile()) return null;
@@ -956,8 +976,12 @@ export function legacyTranscriptOf(session, { home = accountHome() } = {}) {
 function ownedBy(list, { grant = false, home } = {}) {
   const memo = new Map();
   return list.filter((r) => {
-    const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}\0${r.ask_turn}\0${grant ? r.session : ''}`;
+    const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}\0${r.ask_turn}\0${grant ? r.session : ''}\0${r.via}\0${r.ask?.clickId}`;
     if (!memo.has(key)) {
+      if (r.via === 'ask') { // #261: the answer to a click dialog, not a typed prompt: its proof is the dialog's tool_result entry (clickProvenance)
+        memo.set(key, clickProvenance(r, { home }));
+        return memo.get(key) === 'owner';
+      }
       const derive = grant && (typeof r.transcript_path !== 'string' || r.transcript_path === '');
       const file = derive ? legacyTranscriptOf(r.session, { home }) : r.transcript_path;
       memo.set(key, derive && file === null ? 'missing' : promptProvenance(derive ? { ...r, transcript_path: file } : r, { home }));
@@ -1131,6 +1155,18 @@ export function parseRoundGrant(prompt) {
   return { prs: [...new Set(prs)], numbers: [...new Set(numbers)] };
 }
 
+// The binding an "extra round" answer makes (pure, shared with the click recorder, #261): the request line the text ENDS with, when the answer is a grant (parseRoundGrant, at most
+// ROUND_GRANT_PROMPT_MAX) and every PR or round it names is the line's. Returns { pr, k, head, repo } or null.
+export function roundBinding(answer, shownText) {
+  if (typeof answer !== 'string' || answer.trim() === '' || answer.length > ROUND_GRANT_PROMPT_MAX) return null;
+  const g = parseRoundGrant(answer);
+  if (!g) return null;
+  const asked = presentedRoundRequest(shownText);
+  if (!asked) return null;
+  if (!g.prs.every((n) => n === asked.pr) || !g.numbers.every((n) => n === asked.pr || n === asked.k)) return null;
+  return asked;
+}
+
 // The extra-round recorder (same hook, same folder): when the reply right before the owner's prompt ends with the request line, writes the
 // prompt verbatim, bound to that repository, PR, counted round and head. A PR or round the prompt names must be the line's; anything else
 // records nothing. Returns the record, or null. Never throws.
@@ -1139,13 +1175,11 @@ export function recordRoundGrant(input, { home = accountHome(), now = Date.now }
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
     if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > ROUND_GRANT_PROMPT_MAX) return null;
-    const g = parseRoundGrant(input.prompt);
-    if (!g) return null;
+    if (!parseRoundGrant(input.prompt)) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: strict like a "merge" — a notice, a peer's or a scheduled turn's "extra round")
     if (queuedAnswer(input)) return null; // (#191 B1)
-    const asked = presentedRoundRequest(lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }));
+    const asked = roundBinding(input.prompt, lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }));
     if (!asked) return null;
-    if (!g.prs.every((n) => n === asked.pr) || !g.numbers.every((n) => n === asked.pr || n === asked.k)) return null;
     return appendRecord(home, session, {
       v: 1, kind: 'extra-round', ts: new Date(now()).toISOString(), session,
       prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
