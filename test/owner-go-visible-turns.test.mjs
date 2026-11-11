@@ -561,3 +561,68 @@ test('R4-F1: a `!` block and an interrupt marker (interactive, entrypoint cli) a
     }
   }
 });
+
+// ---- R5-F1: a null-provenance note takes the visibility of its ORIGINATING turn (parentUuid chain), not of its own fields ----------------
+// A note M of a headless run (top prompt H: promptSource sdk, invisible) can carry the interactive-looking fields (HARNESS_NOTE: entrypoint cli, nulls). Claude Code 2.1.322 writes
+// entrypoint "sdk-cli" on every line of `CLAUDE_CODE_ENTRYPOINT=cli claude -p` (probed 2026-11-11), so today the override is not honoured, but the guarantee must not rest on a field
+// the writing process sets: M is invisible when the turn its parentUuid chain resolves to is.
+const noteOf = (p, meta = HARNESS_NOTE) => ({ ...note(meta), parentUuid: typeof p === 'string' ? p : p.uuid });
+
+test('R5-F1: a null-provenance note chained to a headless (sdk) prompt is invisible: the request printed after it binds nothing, in every reader', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const o = prompt('ship it');
+    const h = prompt('poll', SDK);
+    const m = noteOf(h);
+    assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), h, m, of(m, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: M chained to the sdk prompt`);
+    // the same through a system-reminder shaped note and an entry between H and M
+    const r = { ...SYSTEM_REMINDER, uuid: 'u-reminder-r5', parentUuid: of(h, toolResult()).parentUuid };
+    assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), h, r, of(r, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: system-reminder note chained to the sdk prompt`);
+    const hm = of(h, said('working'));
+    const m2 = noteOf(hm);
+    assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), h, hm, m2, of(m2, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: M chained through the headless reply`);
+  }
+});
+
+test('R5-F1: a chain of notes resolves transitively: M2 chained to M chained to a headless prompt is invisible, also with the older request before them', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const o = prompt('ship it');
+    const h = prompt('poll', SDK);
+    const m = noteOf(h);
+    const m2 = noteOf(m);
+    assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), h, m, m2, of(m2, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: M2 -> M -> H`);
+    const m3 = noteOf(m2);
+    assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), h, m, m2, m3, of(m3, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: three notes deep`);
+  }
+});
+
+test('R5-F1: a note whose parentUuid does not resolve inside the window is invisible (fail closed); a cycle of notes is too', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const o = prompt('ship it');
+    const m = noteOf('u-not-in-this-window');
+    assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), m, of(m, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: unresolved parent`);
+    const a = { ...note(), uuid: 'u-cycle-a', parentUuid: 'u-cycle-b' };
+    const b = { ...note(), uuid: 'u-cycle-b', parentUuid: 'u-cycle-a' };
+    assert.equal(run(kind, [o, of(o, said(KINDS[kind].ask)), a, b, of(b, said(ASK59[kind])), prompt(KINDS[kind].answer)]), false, `${kind}: cycle of notes`);
+  }
+});
+
+test('R5-F1: notes chained to the owner\'s turn, a visibleSynthetic turn, or through a chain of notes to either still bind (interactive)', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const o = prompt('ship it');
+    const m = noteOf(o);
+    assert.deepEqual(pr(kind, record(kind, [o, of(o, toolOnly()), m, of(m, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: M chained to the owner prompt`);
+    const o2 = prompt('ship it');
+    const r = of(o2, toolResult());
+    const m2 = noteOf(r);
+    assert.deepEqual(pr(kind, record(kind, [o2, of(o2, toolOnly()), r, m2, of(m2, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: M chained to the tool result`);
+    const o3 = prompt('ship it');
+    const n = prompt('a task finished', NOTICE);
+    const m3 = noteOf(n);
+    const m4 = noteOf(m3);
+    assert.deepEqual(pr(kind, record(kind, [o3, of(o3, said('ok')), n, m3, m4, of(m4, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: M2 -> M -> visibleSynthetic notice`);
+    const o4 = prompt('ship it');
+    const m5 = noteOf(o4);
+    const m6 = noteOf(m5);
+    assert.deepEqual(pr(kind, record(kind, [o4, m5, m6, of(m6, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: M2 -> M -> owner prompt`);
+  }
+});
