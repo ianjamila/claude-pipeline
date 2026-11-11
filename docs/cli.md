@@ -730,6 +730,16 @@ pipeline update [--claude-home DIR] [--check] [--json]
                      the install is complete, unmodified and identical to main (allowed inside Claude Code)
   --json             no progress text on stderr (the result is always one JSON object on stdout)
   Refuses inside Claude Code (run it in your own terminal) unless --check or PIPELINE_ADMIN=1.
+pipeline update --scheduled [--claude-home DIR] [--json]
+  What the unattended auto-update job runs (also refused inside Claude Code): nothing when current (silent); when behind, downloads
+  main and installs it only if no review is live (the installer decides under its lock: --require-no-live-reviews) and the
+  install is still the one it looked at (--expect-installed). A modified, incomplete, ahead or diverged install is never touched:
+  the owner is told once per (reason, main sha) with the exact command. Also writes <home>/.claude/pipeline-state/update-status.json.
+  One compact JSON line per run; exit 0 current / updated / deferred by a live review / paused, 1 failed.
+pipeline update schedule (--install [--every N] | --remove | --status)
+  The recurring job that runs `update --scheduled --json` of the installed pipeline: a LaunchAgent (com.claude-pipeline.auto-update) on
+  macOS, one crontab line on Linux/WSL, unsupported on native Windows. --every N: minutes between runs, 5, 10, 15, 20, 30 or 60
+  (default 15). --install refuses inside Claude Code (an unattended guard-hook swap is owner-only); --status and --remove run anywhere.
 ```
 
 Exit: 0 updated / up to date (`--check`: complete, unmodified and identical to main) · 1 not up to date (`--check`), upstream unreachable, or the fetch / install / verification failed · 2 usage, or refused inside Claude Code.

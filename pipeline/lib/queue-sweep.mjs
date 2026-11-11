@@ -27,17 +27,20 @@ const refuse = (error, reasons, extra = {}) => ({ exitCode: 1, output: { ok: fal
 // <log dir>/queue-sweep-notices.log, and on macOS a banner. A failing notifier never undoes a settled record (settleRecord swallows it).
 const appleText = (text) => String(text).replace(/[\u0000-\u001f]/g, ' ').replace(/\\/g, '\\\\').replace(/"/g, '\\"').slice(0, 240);
 
-export function defaultNotify({ env = process.env, platform = process.platform, stderr = process.stderr, spawn = spawnSync } = {}) {
+// `event` names another kind of notice that uses the same three channels (`pipeline-update`: the auto-update job): its own stderr prefix,
+// log file (<event>-notices.log) and banner title, so it is not mistaken for a merge-queue notice. The default is the queue sweep's.
+export function defaultNotify({ env = process.env, platform = process.platform, stderr = process.stderr, spawn = spawnSync, event = 'queue-sweep' } = {}) {
+  const title = event === 'queue-sweep' ? 'claude-pipeline merge queue' : `claude-pipeline ${event.replace(/^pipeline-/, '')}`;
   return (text) => {
-    stderr.write(`queue-sweep: ${text}\n`);
+    stderr.write(`${event}: ${text}\n`);
     try {
       const dir = pruneLogDir(env);
       mkdirSync(dir, { recursive: true });
-      appendFileSync(path.join(dir, 'queue-sweep-notices.log'), `${new Date().toISOString()} ${String(text).replace(/\s+/g, ' ')}\n`);
+      appendFileSync(path.join(dir, `${event}-notices.log`), `${new Date().toISOString()} ${String(text).replace(/\s+/g, ' ')}\n`);
     } catch { /* the stderr line is the notice that matters */ }
     if (platform === 'darwin' && env.PIPELINE_NO_BANNER !== '1') {
       try {
-        spawn('/usr/bin/osascript', ['-e', `display notification "${appleText(text)}" with title "claude-pipeline merge queue"`], { timeout: 5000, stdio: 'ignore' });
+        spawn('/usr/bin/osascript', ['-e', `display notification "${appleText(text)}" with title "${title}"`], { timeout: 5000, stdio: 'ignore' });
       } catch { /* no banner is not a failure */ }
     }
   };

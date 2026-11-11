@@ -5,14 +5,18 @@
 // Why it refuses inside Claude Code: an update replaces the guard hooks, which is the one thing an agent must not do to
 // itself (install.mjs makes the same refusal). It takes no install lock of its own: install.mjs, which it runs as a
 // child, holds the per-claude-home lock for the write, so there is exactly one owner and no deadlock.
+// `--scheduled` is the unattended run of the same flow (logic: lib/auto-update.mjs, which calls performUpdate below through
+// the `deps` seam); `update schedule` installs the recurring job that runs it (lib/update-schedule.mjs).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { EXIT, parseCommandArgs } from '../lib/cli.mjs';
-import { installedIdentity } from '../lib/identity.mjs';
+import { runScheduled } from '../lib/auto-update.mjs';
+import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
+import { installedIdentity, isClean as clean } from '../lib/identity.mjs';
 import { readManifest } from '../lib/installer.mjs';
 import { insideClaudeCode } from '../lib/owner-only.mjs';
 import { expandHome } from '../lib/paths.mjs';
+import { runSchedule } from '../lib/update-schedule.mjs';
 import { run as runProcess } from '../lib/proc.mjs';
 import { makePrivateTmpDir } from '../lib/private-tmp.mjs';
 import { compare, fetchRemote, isolatedGit, mainSha, makeIsoDir, removeTree } from '../lib/upstream.mjs';
@@ -28,6 +32,16 @@ export const meta = {
     '                     the install is complete, unmodified and identical to main (allowed inside Claude Code)',
     '  --json             no progress text on stderr (the result is always one JSON object on stdout)',
     '  Refuses inside Claude Code (run it in your own terminal) unless --check or PIPELINE_ADMIN=1.',
+    'pipeline update --scheduled [--claude-home DIR] [--json]',
+    '  What the unattended auto-update job runs (also refused inside Claude Code): nothing when current (silent); when behind, downloads',
+    '  main and installs it only if no review is live (the installer decides under its lock: --require-no-live-reviews) and the',
+    '  install is still the one it looked at (--expect-installed). A modified, incomplete, ahead or diverged install is never touched:',
+    '  the owner is told once per (reason, main sha) with the exact command. Also writes <home>/.claude/pipeline-state/update-status.json.',
+    '  One compact JSON line per run; exit 0 current / updated / deferred by a live review / paused, 1 failed.',
+    'pipeline update schedule (--install [--every N] | --remove | --status)',
+    '  The recurring job that runs `update --scheduled --json` of the installed pipeline: a LaunchAgent (com.claude-pipeline.auto-update) on',
+    '  macOS, one crontab line on Linux/WSL, unsupported on native Windows. --every N: minutes between runs, 5, 10, 15, 20, 30 or 60',
+    '  (default 15). --install refuses inside Claude Code (an unattended guard-hook swap is owner-only); --status and --remove run anywhere.',
   ].join('\n'),
 };
 
@@ -58,8 +72,6 @@ function relate(id, main, env) {
   if (!id.sourceSha) return { status: 'unresolved', reason: 'the installed copy records no source commit' };
   return compare(id.sourceSha, main.sha, { timeoutMs: NETWORK_TIMEOUT_MS, env });
 }
-
-const clean = (id) => Boolean(id && id.complete && !id.sourceDirty && id.modified.length === 0 && id.missing.length === 0 && (id.extra?.length ?? 0) === 0 && (id.scanError?.length ?? 0) === 0);
 
 // Fetches exactly `sha` into <tmp>/src with an isolated git (its private config/hooks directory is `isoDir`) and checks it out detached. Returns the source directory;
 // throws an Error with a plain-language message when any step fails or the checked-out HEAD is not `sha`.
@@ -101,6 +113,17 @@ export function installerAcceptsPrivateTmpSource(src) {
   }
 }
 
+// The commit subject of the downloaded main (the PR title: "Title (#123)"), for the "pipeline updated" notice. Best effort.
+function commitSubject(src, isoDir, tmp, remote) {
+  try {
+    const r = isolatedGit(['-C', src, 'log', '-1', '--format=%s'], { isoDir, cwd: tmp, allowFile: remote.local, timeoutMs: 30000 });
+    const s = r.code === 0 ? r.stdout.trim().split(/\r?\n/)[0].slice(0, 200) : '';
+    return s || null;
+  } catch {
+    return null;
+  }
+}
+
 function runInstaller(src, args, env) {
   const r = runProcess(process.execPath, [path.join(src, 'install.mjs'), ...args], { cwd: src, env: installerEnv(env), replaceEnv: true, timeoutMs: INSTALL_TIMEOUT_MS });
   let json = null;
@@ -109,12 +132,15 @@ function runInstaller(src, args, env) {
 }
 
 export async function run(argv, ctx = {}) {
+  if (argv[0] === 'schedule') return runSchedule(argv.slice(1), ctx);
   const env = ctx.env ?? process.env;
   const { values } = parseCommandArgs(argv, {
     'claude-home': { type: 'string' },
     check: { type: 'boolean' },
+    scheduled: { type: 'boolean' },
     json: { type: 'boolean' },
   }, { allowPositionals: false });
+  if (values.scheduled && values.check) throw new UsageError('--scheduled and --check cannot be combined');
   const say = (line) => { if (!values.json) process.stderr.write(`${line}\n`); };
 
   if (!values.check) {
@@ -127,6 +153,7 @@ export async function run(argv, ctx = {}) {
   }
 
   const home = path.resolve(expandHome(values['claude-home'] || path.join(os.homedir(), '.claude')));
+  if (values.scheduled) return runScheduled({ home, env, ctx, say, deps: { mainSha, installedIdentity, relate, performUpdate } });
   const main = mainSha({ timeoutMs: NETWORK_TIMEOUT_MS, env, home });
   const before = installedIdentity(home);
 
@@ -150,6 +177,18 @@ export async function run(argv, ctx = {}) {
     };
   }
 
+  return performUpdate({ home, main, before, relation, env, say });
+}
+
+// The install itself: fetch exactly main's commit, run its installer, prove the result. Shared by `update` and `update --scheduled`.
+// The scheduled run adds two things (contract of the installer flags, built in install.mjs):
+//   `requireNoLiveReviews`: passes `--require-no-live-reviews`. The installer takes its locks and scans for live reviews; when one is live
+//     it writes nothing and exits 3 with JSON `{deferred: true, live: [...]}`, which comes back here as { error: 'deferred', deferred, live }.
+//   `expectInstalled` (the sha of the clean install the caller decided to replace): passes `--expect-installed <sha>`. The download takes
+//     minutes, so the install can change meanwhile (an owner edit, a newer manual install); it is re-checked here just before the installer
+//     starts and again by the installer under its write lock, which exits 1 with JSON `{error: 'expect-installed-mismatch'}` and writes
+//     nothing. Both end as { error: 'install-changed' }.
+async function performUpdate({ home, main, before, relation, env, say, expectInstalled = null, requireNoLiveReviews = false }) {
   // The installer's guard-file choice survives an update: a copy installed with --skip-file-guard stays that way.
   const manifest = readManifest(home).manifest;
   const flags = manifest?.hooks?.guardFiles === false ? ['--skip-file-guard'] : [];
@@ -179,27 +218,43 @@ export async function run(argv, ctx = {}) {
     }
     say(`fetching upstream main ${sha7(main.sha)} ...`);
     let src;
+    const remote = fetchRemote(env);
     try {
-      src = fetchSource(tmp, isoDir, main.sha, fetchRemote(env));
+      src = fetchSource(tmp, isoDir, main.sha, remote);
     } catch (err) {
       return fail('fetch-failed', err.message);
     }
+    result.mainTitle = commitSubject(src, isoDir, tmp, remote);
     if (!installerAcceptsPrivateTmpSource(src)) {
       const rest = flags.map((f) => ` ${f}`).join('');
       const posix = `./install.sh --claude-home ${shQuote(home)}${rest}`;
       const windows = `.\\install.ps1 --claude-home ${psQuote(home)}${rest}`;
       return fail('installer-too-old', `upstream main ${sha7(main.sha)} has an older installer that cannot install from the folder this command downloads into, so nothing was changed. Update from a clone of that version instead: run \`${posix}\` in it (on Windows: \`${windows}\`).`);
     }
+    if (expectInstalled) {
+      const now = installedIdentity(home);
+      if (!now || !clean(now) || now.sourceSha !== expectInstalled) {
+        return fail('install-changed', `the installed copy changed while the update was downloading (now ${now?.stamp ?? 'nothing'}), so it was left alone`);
+      }
+    }
     say(`installing into ${home} ...`);
     const common = ['--claude-home', home, '--source', src, '--json', ...flags];
-    const install = runInstaller(src, common, env);
+    const gates = [...(requireNoLiveReviews ? ['--require-no-live-reviews'] : []), ...(expectInstalled ? ['--expect-installed', expectInstalled] : [])];
+    const install = runInstaller(src, [...common, ...gates], env);
     result.install = { ok: install.ok, exitCode: install.code, error: install.json?.error ?? null };
+    if (requireNoLiveReviews && install.code === 3 && install.json?.deferred === true) {
+      const live = Array.isArray(install.json.live) ? install.json.live : [];
+      return fail('deferred', `a review is live, so the update waits (${live.length} live)`, { deferred: true, live });
+    }
+    if (expectInstalled && install.json?.error === 'expect-installed-mismatch') {
+      return fail('install-changed', install.json.message || 'the installed copy changed while the update was downloading, so it was left alone');
+    }
     if (!install.ok) return fail('install-failed', install.json?.error || install.stderr || `install.mjs exited ${install.code}`, { stderr: install.stderr });
     const check = runInstaller(src, ['--check', ...common], env);
     result.check = { ok: check.ok, exitCode: check.code, drift: check.json?.drift ?? [] };
     if (!check.ok) {
       const lines = (check.json?.drift ?? []).slice(0, 5).map((d) => d.message);
-      return fail('check-failed', `the install did not verify: ${lines.join('; ') || check.stderr || `install.mjs --check exited ${check.code}`}`, { stderr: check.stderr });
+      return fail('check-failed', `the install did not verify: ${lines.join('; ') || check.stderr || `install.mjs --check exited ${check.code}`}`, { stderr: check.stderr, drift: (check.json?.drift ?? []).map((d) => d.message ?? String(d)) });
     }
     const after = installedIdentity(home);
     result.after = after?.stamp ?? null;
