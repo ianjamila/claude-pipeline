@@ -2461,9 +2461,13 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
     if (!r) done.add(k);
     return r;
   };
+  // Why (codex-review job line with $(git rev-parse HEAD)): a write whose target is only known at run time (a word with a command substitution) may reach the installed pipeline CLI, and
+  // the text the file then holds includes what it holds now. That text is the trusted file itself (never judged on its content, see judgeFoundScript): left out; any other text it may hold, and the
+  // line's own words (the w.unknown rule below), are still judged.
+  const trustedDisk = ctx.trusted(abs) || ctx.trusted(realResolve(abs, ctx.api)) ? ctx.readText(abs) : null;
   for (const text of w.texts) {
     for (const v of new Set([text, substVars(text, ctx.vars, ctx.budget)])) {
-      const r = once(`T${v}`, () => judgeScriptText(v, sf, abs, dir, ctx, opts));
+      const r = (typeof trustedDisk === 'string' && v === trustedDisk ? null : once(`T${v}`, () => judgeScriptText(v, sf, abs, dir, ctx, opts)));
       if (r) return r;
     }
   }
@@ -2476,7 +2480,7 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
   // the whole text several writes build together (appends, cat A B): no piece holds what the file runs
   for (const text of w.joined) {
     for (const v of new Set([text, substVars(text, ctx.vars, ctx.budget)])) {
-      const r = once(`T${v}`, () => judgeScriptText(v, sf, abs, dir, ctx, opts));
+      const r = (typeof trustedDisk === 'string' && v === trustedDisk ? null : once(`T${v}`, () => judgeScriptText(v, sf, abs, dir, ctx, opts)));
       if (r) return r;
     }
   }
