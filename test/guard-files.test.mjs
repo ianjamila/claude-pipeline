@@ -33,6 +33,7 @@ test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form
     '/home/u/.claude/agents/verifier.md',
     '/home/u/.claude/agents/judge.md',
     '/home/u/.claude/agents/arbiter.md',
+    '/home/u/.claude/agents/arbiter-fix.md',
     '/home/u/.claude/pipeline',
     '/home/u/.claude/settings.json',
     '/home/u/.claude/pipeline-state/owner-go',
@@ -45,6 +46,8 @@ test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form
 const FILE_DENY = [
   ['Edit ship skill via ~', 'Edit', { file_path: '~/.claude/skills/ship/SKILL.md', old_string: 'a', new_string: 'b' }],
   ['Write arbiter agent', 'Write', { file_path: '/home/u/.claude/agents/arbiter.md', content: 'x' }],
+  ['Write arbiter-fix agent', 'Write', { file_path: '/home/u/.claude/agents/arbiter-fix.md', content: 'x' }],
+  ['Edit arbiter-fix agent via ~', 'Edit', { file_path: '~/.claude/agents/arbiter-fix.md', old_string: 'a', new_string: 'b' }],
   ['Edit installed hook', 'Edit', { file_path: '/home/u/.claude/pipeline/hooks/guard-git.mjs', old_string: 'a', new_string: 'b' }],
   ['Write global settings', 'Write', { file_path: '/home/u/.claude/settings.json', content: '{}' }],
   ['MultiEdit verify skill', 'MultiEdit', { file_path: '/home/u/.claude/skills/verify/SKILL.md', edits: [{ old_string: 'a', new_string: 'b' }] }],

@@ -13,7 +13,12 @@ import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { fingerprint, largeBinaryNote, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
-import { GitError, ReviewBaseUnavailable, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
+import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
+import { loadConfig, validateConfig } from '../lib/config.mjs';
+import { parseYaml } from '../lib/yaml.mjs';
+import { collectHardStops } from '../lib/hardstops.mjs';
+import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, expectationOf, fixRoundCandidate } from '../lib/fix-verify.mjs';
+import { assessRisk, reviewLane } from '../lib/risk.mjs';
 import { claudeCodeStatus } from '../lib/claude-code-version.mjs';
 import { holdsLock } from '../lib/locks.mjs';
 import { floorBypass, floorOutput, floorPauseSeam, floorWaitMs, fableModelsOf, judgeFloor, mayRaiseFloor } from '../lib/floor-proof.mjs';
@@ -33,8 +38,16 @@ import {
 export const meta = {
   summary: 'decide which items need the arbiter, then prove and apply its rulings',
   usage: [
-    'pipeline arbiter needed --round R [--force] [--repo DIR]',
-    '  -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader[, diffPath, scope]}',
+    'pipeline arbiter needed --round R [--force] [--full] [--repo DIR]',
+    '  -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader, brief[, briefReason], effort, agent[, diffPath, scope]}',
+    '  brief / effort / agent: which Fable agent to call. `fix-verify` / `medium` / `arbiter-fix` for a FIX ROUND: mode review, scope round (never whole-pr, a Fable refresh or a resolution-only round), a plain previous-round review base',
+    '    (never a whole-pr fallback base after a conflicting base merge, never a synthetic tree base after a clean base merge, never a resolution base), the previous counted round had an ACCEPT item, and the round\'s own range',
+    '    has no hard-stop hit, no file matching review.arbiter_always_paths or risk.high_risk_paths and assesses risk `low` (risk.medium_lines / medium_files), under the working-tree config AND the config committed at the',
+    '    round\'s fork point (a PR cannot loosen its own rule; an unreadable base config is full); its input lists those ACCEPT items and asks Fable to verify each fix and the round diff. Everything else is',
+    '    `full` / `high` / `arbiter` (the whole review job). Fable still runs on every Fable round either way. The choice is stored on the round (arbiter.brief / briefReason / effort / agent) and `apply` proves against the',
+    '    stored one; running `needed` again recomputes and re-stores it (the digest and tag change with the brief), except that a brief forced by --full is kept (below)',
+    '  briefReason (mode review): why that brief, e.g. `fix round: round 1 accepted 1 item(s) ...`, `synthetic review base ...`, `the round\'s own range is medium risk ...`, or the message of an error caught while assessing the range',
+    '  --full: force the full brief (`full` / `high` / `arbiter`, briefReason `forced by --full`) on a Fable review round `needed` would class as fix-verify; the stored brief and the digest change with it. For when `arbiter-fix` cannot be started or the owner wants a full review. It sticks: the round stores arbiter.forcedFull, also when a stale terminal stops the call, so a later plain `needed` (the retry after a restart, or after an unproven or malformed pass) keeps the full brief, briefReason still `forced by --full`, until a pass is proven. The stop drops the stored input (fix-verify brief, digest, tag), so an earlier arbiter-fix pass cannot prove the round and the retry writes a fresh full input; `apply` also refuses (exit 1 forced-full-pending) a round that stores forcedFull beside a fix-verify brief',
     '  mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied',
     '    (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that)',
     '  mode review in a terminal whose Claude Code build is older than the installed one (stale): exit 1 {ok:false, error: stale-terminal, restartRequired: true,',
@@ -44,7 +57,8 @@ export const meta = {
     '  mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none',
     '  start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman',
     'pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
-    '  the proof is pinned to claude-fable- at effort high; --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)',
+    '  the proof is pinned to claude-fable- and to the round\'s STORED brief: agent `arbiter` at effort high (full; a round stored without a brief is full), agent `arbiter-fix` at effort medium or higher (fix-verify);',
+    '    --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)',
     '  -> {ok, round, tag, transcript, errors, items[, findings]}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript',
     '  any Fable on any line of the transcript must be at least this machine\'s floor (whatever --expect-model says): older => exit 1, error stale-model,',
     '    restartRequired: true, floor: {newest, seen}, advice (restart this terminal, or update Claude Code); the items wait with cause stale-model. A proven pass',
@@ -61,7 +75,7 @@ export const meta = {
 };
 
 export const DEFAULT_EXPECT_MODEL = 'claude-fable-';
-export const DEFAULT_EXPECT_EFFORT = 'high';
+export const DEFAULT_EXPECT_EFFORT = BRIEFS[BRIEF_FULL].effort;
 
 const forceArbiter = (env) => (env ?? process.env).PIPELINE_TEST_FORCE_ARBITER === '1';
 // Only the test suite may point the proof at another model or effort; a normal run is always pinned (spec R13).
@@ -130,7 +144,7 @@ function itemSection(item, root) {
 
 function needed(rest, ctx) {
   const { values } = parseCommandArgs(rest, {
-    round: { type: 'string' }, force: { type: 'boolean' }, repo: { type: 'string' },
+    round: { type: 'string' }, force: { type: 'boolean' }, full: { type: 'boolean' }, repo: { type: 'string' },
   }, { allowPositionals: false });
   const n = intOption(values, 'round', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
@@ -140,6 +154,8 @@ function needed(rest, ctx) {
 // What the round records when its arbiter step stops (round.arbiter.failure): kept beside the other arbiter data so it travels in the triage comment.
 // A zero-item Fable round has no item to carry the cause, so this is the only place it is visible.
 const failureOf = (cause, advice) => ({ cause, advice: advice ?? null, at: new Date().toISOString() });
+// A stale-terminal stop that records a forced --full keeps only the failure and the forced choice: the earlier input (and the brief it was written for) is dropped.
+const forcedStop = (arbiter) => ({ forcedFull: true, ...(arbiter?.failure ? { failure: arbiter.failure } : {}) });
 const withFailure = (state, n, failure) => patchRound(state, n, { arbiter: { ...(findRound(state, n).arbiter ?? {}), failure } });
 
 // The advice a floor failure carries (judgeFloor gives one for every cause: stale, unreadable registry, unrecognised id).
@@ -180,7 +196,7 @@ function writeFableDiff(state, round, root, gate) {
 }
 
 // The instructions part of a Fable review input. Everything a model wrote earlier (titles, reasons) is flattened to one line.
-function reviewSection(state, round, diff) {
+function reviewSection(state, round, diff, fix = null) {
   const prior = state.rounds.filter((r) => r.n < round.n).flatMap((r) => r.items ?? []).filter((i) => i.final);
   // Reasons name changed files (a path is author-chosen): only the level part is shown here, the paths go in the fence below.
   const given = Array.isArray(round.fableReasons) ? round.fableReasons : [];
@@ -197,6 +213,15 @@ function reviewSection(state, round, diff) {
     `Diff sha256: ${diff.diffDigest}`,
     `Range: ${diff.from}..${round.toHead}`,
   ];
+  // A FIX ROUND (chooseBrief): the narrow brief. Same mode, same diff, same JSON contract: only what to spend the effort on changes.
+  if (fix) {
+    out.push(
+      '',
+      `Brief: FIX-VERIFY. Round ${fix.round} (the previous counted round) accepted the items under "Fixes to verify" below; the diff above is what changed in round ${round.n}, mostly to fix them.`,
+      'Verify each fix is correct and complete. Then look for bugs or regressions the round diff introduces, and raise any finding in the round diff as usual (same JSON, `findings`).',
+      'Do not re-review code outside the round diff unless a fix depends on it.',
+    );
+  }
   // File names, reasons and earlier titles come from the change author or a model that read the change: data in a fence
   // no line of them can close, never instructions.
   const dataBlock = (label, lines) => {
@@ -216,6 +241,15 @@ function reviewSection(state, round, diff) {
     const resolution = { ...round, from: round.fromHead };
     out.push('', ...resolutionBaseNote(resolution), ...resolutionSection(resolution, { base: diff.from, head: round.toHead }));
   }
+  if (fix) {
+    const fixes = fix.accepted.slice(0, 40).flatMap((i) => [
+      `${oneLine(i.id)}: ${oneLine(i.title).slice(0, 160)}`,
+      `  at: ${oneLine(i.file ? (i.line > 0 ? `${i.file}:${i.line}` : i.file) : '(no file)')}`,
+      `  detail: ${oneLine(i.detail).slice(0, 600)}`,
+      `  ruling: ${oneLine(i.final?.reason).slice(0, 300)}`,
+    ]);
+    out.push('', `Fixes to verify (the ACCEPT items of round ${fix.round}):`, ...dataBlock('fixes to verify', fixes));
+  }
   if (prior.length > 0) {
     out.push('', 'Already ruled in earlier rounds (do not raise again unless the cited code changed):');
     out.push(...dataBlock('prior rulings', prior.slice(-40).map((i) => `${oneLine(i.id)}: ${oneLine(i.title).slice(0, 120)} (${oneLine(i.final.decision ?? 'unknown')})`)));
@@ -223,11 +257,68 @@ function reviewSection(state, round, diff) {
   return out.join('\n');
 }
 
-function neededLocked(values, n, root, ctx) {
+// The brief of a Fable review round: `fix-verify` only when it is clearly a fix round (lib/fix-verify.mjs#fixRoundCandidate: round scope, a plain
+// previous-round base, an ACCEPT in the previous counted round) AND the round's own range is clean under BOTH the working-tree config and the config
+// COMMITTED at the base side (round.forkPoint; a PR must not loosen its own rule, as lib/finalgate.mjs does for merge.behind_base): no hard-stop hit, no
+// file matching review.arbiter_always_paths or risk.high_risk_paths, and risk level `low` (risk.medium_lines / medium_files). `full` forces the full brief
+// (arbiter needed --full). Anything unreadable (config, base config, range) is `full`: the fallback is today's behaviour, never a cheaper review by accident.
+// -> { expectation, fix, reason }: `reason` says why (also the message of an error that was caught on the way), printed and stored as briefReason.
+const msgOf = (err) => String(err?.message ?? err).split('\n')[0];
+
+// The config as the base side (the PR's fork point) has it: { ok: true, config } | { ok: false, reason }.
+function baseConfigAt(forkPoint, root) {
+  if (typeof forkPoint !== 'string' || forkPoint === '') return { ok: false, reason: 'the round records no fork point' };
+  let text;
+  try {
+    text = showFile(forkPoint, '.claude/pipeline.yml', { cwd: root });
+  } catch (err) {
+    return { ok: false, reason: `could not read .claude/pipeline.yml at the fork point: ${msgOf(err)}` };
+  }
+  if (text === null) return { ok: false, reason: 'the fork point has no .claude/pipeline.yml' };
+  let parsed;
+  try {
+    parsed = validateConfig(parseYaml(text));
+  } catch (err) {
+    return { ok: false, reason: `the fork point's .claude/pipeline.yml cannot be parsed: ${msgOf(err)}` };
+  }
+  if (!parsed.ok) return { ok: false, reason: `the fork point's .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
+  return { ok: true, config: parsed.config };
+}
+
+async function chooseBrief(state, round, diff, root, { forceFull = false } = {}) {
+  const full = (reason) => ({ expectation: BRIEFS[BRIEF_FULL], fix: null, reason });
+  if (forceFull) return full('forced by --full');
+  const candidate = fixRoundCandidate(state, round, { scope: diff.scope });
+  if (!candidate.ok) return full(candidate.reason);
+  try {
+    const loaded = await loadConfig(root);
+    if (!loaded.ok) return full(`config unreadable: ${loaded.errors?.[0] ?? 'unknown'}`);
+    const base = baseConfigAt(round.forkPoint, root);
+    if (!base.ok) return full(base.reason);
+    // The same config twice is checked once (the usual case: nobody touched pipeline.yml).
+    const same = JSON.stringify(loaded.config) === JSON.stringify(base.config);
+    const configs = same ? [['working-tree and base', loaded.config]] : [['working-tree', loaded.config], ['base', base.config]];
+    const files = diffFiles(diff.from, round.toHead, { cwd: root });
+    for (const [label, config] of configs) {
+      const hits = await collectHardStops({ base: diff.from, head: round.toHead, cwd: root, config });
+      if (hits.length > 0) return full(`hard-stop hit in the round range (${label} config)`);
+      if (reviewLane({ level: 'low', files, config }).sensitivePaths.length > 0) return full(`sensitive path in the round range (${label} config)`);
+      const risk = assessRisk({ files, hits, config });
+      if (risk.level !== 'low') return full(`the round's own range is ${risk.level} risk (${label} config): ${risk.reasons.join('; ')}`);
+    }
+  } catch (err) {
+    return full(`could not assess the round range: ${msgOf(err)}`);
+  }
+  return { expectation: BRIEFS[BRIEF_FIX_VERIFY], fix: candidate.previous, reason: `fix round: round ${candidate.previous.round} accepted ${candidate.previous.accepted.length} item(s) and the round's own range is clean and low risk` };
+}
+
+async function neededLocked(values, n, root, ctx) {
   let state = requireState(root);
   let round = findRound(state, n);
   const review = isFableRound(round);
   const mode = review ? 'review' : 'dispute';
+  // --full sticks to the round until a pass is proven (the retries after a stale terminal or an unproven pass run a plain `needed`).
+  const forcedFull = review && (values.full === true || round.arbiter?.forcedFull === true);
 
   if (review && round.arbiter?.proofOk === true) return { exitCode: EXIT.OK, output: { needed: false, items: [], mode, done: true } };
   // A terminal that runs an older Claude Code than the installed one resolves the old `fable` alias: stop before anything is written or spent.
@@ -236,7 +327,10 @@ function neededLocked(values, n, root, ctx) {
     try { claudeCode = claudeCodeStatus(ctx.env ?? process.env); } catch { /* unreadable: unknown, no stop */ }
     if (claudeCode.stale === true) {
       const advice = `this terminal runs Claude Code ${claudeCode.running} but ${claudeCode.installed} is installed: restart this terminal, then run \`arbiter needed\` again`;
-      saveState(root, withFailure(state, n, failureOf('stale-terminal', advice)));
+      // A --full given to this call survives the stop: the retry after the restart is a plain `needed` and must still be full.
+      const stopped = withFailure(state, n, failureOf('stale-terminal', advice));
+      // The stored fix-verify brief, digest, tag and input go: they belong to the choice --full overrules, so an earlier arbiter-fix pass must not prove this round and the retry writes a fresh full input.
+      saveState(root, forcedFull ? patchRound(stopped, n, { arbiter: forcedStop(findRound(stopped, n).arbiter) }) : stopped);
       return { exitCode: EXIT.FAILED, output: { ok: false, error: 'stale-terminal', restartRequired: true, claudeCode, advice } };
     }
   }
@@ -274,10 +368,11 @@ function neededLocked(values, n, root, ctx) {
   if (!review && items.length === 0) return { exitCode: EXIT.OK, output: { needed: false, items: [], mode } };
 
   const diff = review ? writeFableDiff(state, round, root, readReviewGate({ env: ctx.env ?? process.env })) : null;
+  const { expectation, fix, reason: briefReason } = review ? await chooseBrief(state, round, diff, root, { forceFull: forcedFull }) : { expectation: BRIEFS[BRIEF_FULL], fix: null, reason: null };
   const itemsPart = items.length > 0
     ? [`# Items to rule on (${items.length})`, '', ...items.map((item) => itemSection(item, root))]
     : ['# Items to rule on (0)', '', '_Codex raised nothing left to rule on in this round: your own review is the whole job._', ''];
-  const body = [...(review ? [reviewSection(state, round, diff), ''] : []), ...itemsPart].join('\n');
+  const body = [...(review ? [reviewSection(state, round, diff, fix), ''] : []), ...itemsPart].join('\n');
   const digest = sha256(body);
   const digest8 = digest.slice(0, 8);
   const tag = `pipeline-arbiter R${n} ${digest8}`;
@@ -285,12 +380,13 @@ function neededLocked(values, n, root, ctx) {
   writeFileAtomic(inputPath, `ROUND: ${n}\nINPUT-DIGEST: ${digest}\n\n${body}`);
   const ids = items.map((i) => i.id);
   const kept = round.arbiter?.failure;
-  const stored = { inputDigest: digest, items: ids, tag, mode, ...(kept ? { failure: kept } : {}), ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}) };
+  // The brief rides with a Fable review round only: a dispute round (and any round stored before this existed) has none, which `apply` reads as full.
+  const stored = { inputDigest: digest, items: ids, tag, mode, ...(review ? { brief: expectation.brief, briefReason, effort: expectation.effort, agent: expectation.agent } : {}), ...(forcedFull ? { forcedFull: true } : {}), ...(kept ? { failure: kept } : {}), ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}) };
   saveState(root, patchRound(state, n, { arbiter: stored }));
   const promptHeader = `ROUND: ${n}\nINPUT-DIGEST: ${digest}`;
   return {
     exitCode: EXIT.OK,
-    output: { needed: true, mode, items: ids, inputPath, digest, digest8, tag, promptHeader, ...(diff ? { diffPath: diff.diffPath, scope: diff.scope } : {}) },
+    output: { needed: true, mode, items: ids, inputPath, digest, digest8, tag, promptHeader, brief: expectation.brief, ...(review ? { briefReason } : {}), effort: expectation.effort, agent: expectation.agent, ...(diff ? { diffPath: diff.diffPath, scope: diff.scope } : {}) },
   };
 }
 
@@ -360,18 +456,18 @@ function apply(rest, ctx) {
   // The expectation is the whole point of the proof: a flag (or an env var) that could change it would let a ruling
   // from any model count. Only the test suite (PIPELINE_TEST_MODE=1) may; otherwise the flags are ignored.
   const expectModelPrefix = (testMode(env) ? asked.model : undefined) ?? DEFAULT_EXPECT_MODEL;
-  const expectEffort = (testMode(env) ? asked.effort : undefined) ?? DEFAULT_EXPECT_EFFORT;
+  const askedEffort = testMode(env) ? asked.effort : undefined;
   const maxAgeMs = intOption(values, 'max-age-ms', { min: 0 });
   const projectsDir = nonEmpty(values, 'projects-dir');
 
   const root = resolveRepo(values, ctx);
   return withStateLock(root, ctx, () => applyLocked({
-    n, agentId, givenTag, expectModelPrefix, expectEffort, maxAgeMs, projectsDir, env, root,
+    n, agentId, givenTag, expectModelPrefix, askedEffort, maxAgeMs, projectsDir, env, root,
     ignoredExpectations: !testMode(env) && (asked.model !== undefined || asked.effort !== undefined),
   }));
 }
 
-async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffort, maxAgeMs, projectsDir, env, root, ignoredExpectations }) {
+async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffort, maxAgeMs, projectsDir, env, root, ignoredExpectations }) {
   const state = requireState(root);
   const round = findRound(state, n);
   const stored = round.arbiter;
@@ -383,6 +479,13 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
   if (stored.mode === 'review' && stored.proofOk === true) {
     throw new Fail(EXIT.USAGE, { ok: false, error: 'already-applied', message: `round ${n} already has a proven Fable review; it is not applied again` });
   }
+  // A forced --full overrules a stored fix-verify brief (state saved before the stop dropped it, or edited): an arbiter-fix pass must not prove the round.
+  if (stored.forcedFull === true && stored.brief === BRIEF_FIX_VERIFY) {
+    throw new Fail(EXIT.FAILED, { ok: false, error: 'forced-full-pending', message: `round ${n} was forced to the full brief (--full) but its stored input is a fix-verify one: run \`arbiter needed\` again, then prove the full pass` });
+  }
+  // What the round's STORED brief expects of the proof (never recomputed here): the agent, and the effort it ran at. A round stored without a brief is full.
+  const expectation = expectationOf(stored);
+  const expectEffort = askedEffort ?? acceptedEfforts(expectation);
   const tag = givenTag ?? stored.tag;
 
   const found = findSubagentTranscript({ agentId, tag: agentId === undefined ? tag : undefined, projectsDir, maxAgeMs });
@@ -397,7 +500,7 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
   // The arbiter is invoked without a per-call model, so ANY override in the meta is an error. That holds even when
   // PIPELINE_ARBITER_MODEL_OVERRIDE is set: that switch only lets the proof-6 test start an agent on a bad model, and
   // the proof must fail for it (the ruling goes to a human), never be relaxed to accept it.
-  const proof = proveModel({ jsonlText, metaText, expectModelPrefix, expectEffort, expectMetaModel: null, expectAgentType: 'arbiter' });
+  const proof = proveModel({ jsonlText, metaText, expectModelPrefix, expectEffort, expectMetaModel: null, expectAgentType: expectation.agent });
 
   const errors = [...proof.errors];
   const asksRound = new RegExp(`^ROUND: ${n}[ \\t]*$`, 'm');
@@ -486,10 +589,11 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, expectEffo
         claudeCodeVersions,
         errors,
         ...floorOutput(judged),
-        ...(ignoredExpectations ? { note: '--expect-model / --expect-effort ignored: the proof is pinned to claude-fable- at effort high' } : {}),
+        ...(ignoredExpectations ? { note: `--expect-model / --expect-effort ignored: the proof is pinned to claude-fable- at effort ${expectation.brief === BRIEF_FIX_VERIFY ? 'medium or higher (fix-verify)' : expectation.effort}` } : {}),
         items: stored.items.map((id) => ({
           id, ruling: byId.get(id)?.final?.decision ?? null, needsHuman: byId.get(id)?.final?.needsHuman ?? null,
         })),
+        ...(expectation.brief === BRIEF_FIX_VERIFY ? { brief: expectation.brief } : {}),
         ...(review ? { mode: 'review', findings: findingItems.map((i) => ({ id: i.id, bucket: i.bucket, ruling: i.final.decision, needsHuman: i.final.needsHuman })) } : {}),
       },
     };
