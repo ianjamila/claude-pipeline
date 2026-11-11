@@ -457,7 +457,7 @@ report whether the pipeline may merge (config, gh, protection, pause, Codex).
 
 ```
 pipeline preflight [--repo DIR]   (exit 0 can merge, 1 cannot, 2 config missing/invalid)
-  warnings (informational, never change canMerge): the guard would refuse `verify.quick` as an agent runs it (a script whose text spells the config-root path, even in a comment, and which writes: the warning carries the guard's line number and reword advice); a stale terminal; an owner allowance (model-floor reset --allow-id) or a hold below MIN_FABLE still in force in the model floor registry; an allowed id the parser can read now (the allowance is no longer needed)
+  warnings (informational, never change canMerge): the guard would refuse verify.quick as an agent runs it (the reason names the script line to reword); a stale terminal; an owner allowance (model-floor reset --allow-id) or a hold below MIN_FABLE still in force in the model floor registry; an allowed id the parser can read now (the allowance is no longer needed)
 ```
 
 Exit: 0 pipeline may merge · 1 it may not (`reasons`) · 2 config missing or invalid.
