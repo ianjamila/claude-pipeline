@@ -9,14 +9,21 @@
 // ("This run likely failed because of a workflow file issue"). That is how the queue-guards.yml template jammed
 // a project's merge queue on 2026-11-10: its job-level env read `runner.temp`, so the Queue guards poster never ran.
 //
-// Scope: every key in GitHub's table whose availability is narrower than a step's: workflow-level env /
+// Rules (ported from the EagleWatch checker, four review rounds; findings name the file and the key path):
+// 1. Contexts (ALLOWED): every key in GitHub's table whose availability is narrower than a step's: workflow-level env /
 // concurrency / run-name, on.workflow_call input defaults and output values, and the job-level keys below,
 // including a reusable-workflow call's job-level `with:` and `secrets:` (narrower than a step's `with:`) and
 // container / services; plus steps and job `outputs`, which allow every context EXCEPT `jobs` (only a
-// workflow_call output value may read it), and a step `if:`, which does not allow `secrets` either. Only the named contexts below count (case-insensitive, as GitHub resolves them), with or
-// without a property access (`runner.temp`, `runner['temp']`, `toJSON(runner)`); function names, string
-// literals and property names never count. Not covered: special functions outside their keys (e.g.
-// `hashFiles` outside steps) — a separate rule set. Real YAML parsing (vendored js-yaml, JSON schema).
+// workflow_call output value may read it), and a step `if:`, which does not allow `secrets` either. Only the named contexts below
+// count (case-insensitive, as GitHub resolves them), with or without a property access (`runner.temp`, `runner['temp']`,
+// `toJSON(runner)`); function names, string literals and property names never count.
+// 2. Special functions (FUNCTIONS_ALLOWED): `always` / `cancelled` / `success` / `failure` only in a job `if:` or a step `if:`;
+//    `hashFiles` only in a step `if` / `continue-on-error` / `env` / `name` / `run` / `timeout-minutes` / `with` /
+//    `working-directory`. A call anywhere else (any checked key not listed, e.g. a job-level env or `continue-on-error`) is
+//    "Unrecognized function". Other functions (format, toJSON, …) are allowed everywhere, so they are not scanned. Names match
+//    case-insensitively; a `.name(` property never counts.
+// 3. Syntax, any scalar anywhere in the file: a `${{` with no closing `}}` is a finding (GitHub: "The expression is not closed").
+// Real YAML parsing (vendored js-yaml, JSON schema).
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseYaml } from './yaml.mjs';
@@ -59,6 +66,23 @@ export const ALLOWED = {
   'jobs.<id>.steps.<key>': ALL_BUT_JOBS,
 };
 
+// Special functions per key, from the same table (its "Special functions" column). A function not listed there is usable anywhere;
+// the five below are usable ONLY where listed, and a key absent from this table allows none of them. Names compare lower-case
+// (GitHub resolves function names case-insensitively).
+const STATUS = ['always', 'cancelled', 'success', 'failure'];
+export const SPECIAL_FUNCTIONS = [...STATUS, 'hashfiles'];
+export const FUNCTIONS_ALLOWED = {
+  'jobs.<id>.if': STATUS,
+  'jobs.<id>.steps.if': [...STATUS, 'hashfiles'],
+  'jobs.<id>.steps.continue-on-error': ['hashfiles'],
+  'jobs.<id>.steps.env': ['hashfiles'],
+  'jobs.<id>.steps.name': ['hashfiles'],
+  'jobs.<id>.steps.run': ['hashfiles'],
+  'jobs.<id>.steps.timeout-minutes': ['hashfiles'],
+  'jobs.<id>.steps.with': ['hashfiles'],
+  'jobs.<id>.steps.working-directory': ['hashfiles'],
+};
+
 // Quote-aware: a `}}` inside a string literal does not end the expression (GitHub reads it the same way).
 // The three alternatives never overlap (a quote only starts a string; `}` only alone), so an unclosed `${{` fails in
 // linear time instead of backtracking over every pairing of the quotes after it (review R3). A `''` escape reads as
@@ -79,6 +103,17 @@ export function contextsIn(expr) {
   return [...out];
 }
 
+/** Special functions called in one expression body (lower-cased; string literals removed first; a `.name(` property is not a call). */
+export function functionsIn(expr) {
+  const bare = String(expr).replace(/'(?:[^']|'')*'/g, "''");
+  const out = new Set();
+  for (const m of bare.matchAll(/(?<![\w.-])([A-Za-z_][\w-]*)\s*\(/g)) {
+    const name = m[1].toLowerCase();
+    if (SPECIAL_FUNCTIONS.includes(name)) out.add(name);
+  }
+  return [...out];
+}
+
 /** Every string leaf under a value (env maps, concurrency objects, runs-on arrays). */
 function strings(value) {
   if (typeof value === 'string') return [value];
@@ -87,16 +122,33 @@ function strings(value) {
   return [];
 }
 
-/** Context names a value uses. `if:` may be a bare expression without `${{ }}`. */
-function used(value, { bareIf = false } = {}) {
-  const found = new Set();
+/** Expression bodies in a value. `if:` may be a bare expression without `${{ }}`. */
+function bodiesOf(value, { bareIf = false } = {}) {
+  const out = [];
   for (const s of strings(value)) {
     const bodies = [...s.matchAll(EXPR)].map((m) => m[1]);
     if (bareIf && bodies.length === 0) bodies.push(s);
-    for (const b of bodies) for (const c of contextsIn(b)) found.add(c);
+    out.push(...bodies);
   }
+  return out;
+}
+
+/** Context names a value uses. */
+function used(value, opts) {
+  const found = new Set();
+  for (const b of bodiesOf(value, opts)) for (const c of contextsIn(b)) found.add(c);
   return [...found];
 }
+
+/** Special functions a value calls. */
+function usedFunctions(value, opts) {
+  const found = new Set();
+  for (const b of bodiesOf(value, opts)) for (const f of functionsIn(b)) found.add(f);
+  return [...found];
+}
+
+/** Function names are stored lower-case for matching; print them as GitHub documents them. */
+const display = (f) => (f === 'hashfiles' ? 'hashFiles' : f);
 
 function check(findings, file, where, key, value, opts) {
   if (value === undefined) return;
@@ -106,6 +158,35 @@ function check(findings, file, where, key, value, opts) {
       findings.push(`${file}: ${where} uses \`${c}\` — GitHub allows only ${allowed.join(', ')} there, so it rejects the whole file`);
     }
   }
+  const fns = FUNCTIONS_ALLOWED[opts?.fnKey ?? key] ?? [];
+  for (const f of usedFunctions(value, opts)) {
+    if (!fns.includes(f)) {
+      const allow = fns.length ? `only ${fns.map(display).join(', ')}` : 'no special function';
+      findings.push(`${file}: ${where} calls \`${display(f)}()\` — GitHub allows ${allow} there, so it rejects the whole file ("Unrecognized function")`);
+    }
+  }
+}
+
+/** Which rule a finding string came from: 'yaml' (a syntax error: nothing else in the file was checked), 'function', 'unclosed', or 'context' (a disallowed context). Lets the CLI print the right remedy. */
+export function findingKind(finding) {
+  if (finding.includes(': not valid YAML (')) return 'yaml';
+  if (finding.includes('("Unrecognized function")')) return 'function';
+  if (finding.includes('("The expression is not closed")')) return 'unclosed';
+  return 'context';
+}
+
+/** True when a scalar has an opening `${{` that no EXPR match covers: GitHub rejects the file ("The expression is not closed"). Each closed expression becomes a space, not nothing, so its neighbours never join into a `${{` (`$${{ x }}{{` is valid). Linear: EXPR cannot backtrack. */
+const hasUnclosed = (s) => s.replace(EXPR, ' ').includes('${{');
+
+/** Every string leaf in the whole document with its key path (arrays as [i]; a step as steps[<id or index>]). */
+function* leaves(value, where) {
+  if (typeof value === 'string') yield [where, value];
+  else if (Array.isArray(value)) {
+    for (const [i, v] of value.entries()) {
+      const label = isObj(v) && typeof v.id === 'string' && /\.steps$/.test(where) ? v.id : i;
+      yield* leaves(v, `${where}[${label}]`);
+    }
+  } else if (isObj(value)) for (const [k, v] of Object.entries(value)) yield* leaves(v, where ? `${where}.${k}` : k);
 }
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -132,6 +213,9 @@ export function workflowContextFindings(files) {
       continue;
     }
     if (!isObj(doc)) continue;
+    for (const [where, scalar] of leaves(doc, '')) {
+      if (hasUnclosed(scalar)) findings.push(`${file}: ${where} has a '\${{' with no closing '}}' — GitHub rejects the whole file ("The expression is not closed")`);
+    }
     for (const key of ['env', 'concurrency', 'run-name']) check(findings, file, key, key, doc[key]);
     const call = isObj(doc.on) && isObj(doc.on.workflow_call) ? doc.on.workflow_call : null;
     if (call) {
@@ -172,7 +256,7 @@ export function workflowContextFindings(files) {
         check(findings, file, at(`${name}.if`), 'jobs.<id>.steps.if', step.if, { bareIf: true });
         for (const [k, v] of Object.entries(step)) {
           if (k === 'if' || k === 'uses' || k === 'id') continue;
-          check(findings, file, at(`${name}.${k}`), 'jobs.<id>.steps.<key>', v);
+          check(findings, file, at(`${name}.${k}`), 'jobs.<id>.steps.<key>', v, { fnKey: `jobs.<id>.steps.${k}` });
         }
       });
     }

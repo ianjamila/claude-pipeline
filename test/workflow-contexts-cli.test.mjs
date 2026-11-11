@@ -73,3 +73,23 @@ test('usage errors and an unreadable workflows directory exit 2, never 0 or 1', 
   assert.equal(notDir.code, 2, notDir.stdout + notDir.stderr);
   assert.match(notDir.stderr, /workflow-contexts: /);
 });
+
+test('each finding kind prints its own remedy: context, special function, unclosed expression, YAML (exit 1 each)', async () => {
+  const wf = (env, run = 'echo hi') => `name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n${env}    steps:\n      - run: ${run}\n`;
+  const cases = [
+    ['context', wf('    env:\n      D: ${{ runner.temp }}\n'), /Move the value into the step that needs it/],
+    ['function', wf("    env:\n      H: ${{ hashFiles('x') }}\n"), /Special functions work only where GitHub lists them/],
+    ['unclosed', wf('', 'echo "${{ github.sha }"'), /Close every "\$\{\{" with "\}\}"/],
+    ['yaml', 'jobs: [unclosed', /Fix the YAML syntax error first/],
+  ];
+  for (const [kind, text, remedy] of cases) {
+    const repo = await project();
+    repo.write('.github/workflows/w.yml', text);
+    const r = await check(repo);
+    assert.equal(r.code, 1, `${kind}: ${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, remedy, kind);
+    for (const [other, , otherRemedy] of cases) {
+      if (other !== kind) assert.doesNotMatch(r.stderr, otherRemedy, `${kind} run must not print the ${other} remedy`);
+    }
+  }
+});

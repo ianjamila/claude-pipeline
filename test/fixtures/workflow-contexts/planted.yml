@@ -1,4 +1,4 @@
-# Planted fixture for test/workflow-contexts-lib.test.mjs: EXACTLY 4 violations. Never copy this into .github/workflows.
+# Planted fixture for test/workflow-contexts-lib.test.mjs: EXACTLY 6 violations (4 contexts, 1 special function, 1 unclosed expression). Never copy this into .github/workflows.
 name: planted
 on: push
 env:
@@ -11,9 +11,11 @@ jobs:
     env:
       VERDICT_DIR: ${{ runner.temp }}/verdict
       FINE: ${{ github.sha }}-${{ needs.a.outputs.b }}-${{ secrets.TOKEN != '' }}
+      HASH: ${{ hashFiles('**/package-lock.json') }}
       QUOTED: ${{ format('runner.{0}', github.run_id) }}
     concurrency: ${{ env.GROUP }}
     steps:
       - run: echo "${{ runner.temp }} ${{ steps.x.outputs.y }} is fine in a step"
         env:
           DIR: ${{ runner.temp }}/also-fine
+      - run: echo "${{ github.sha }"
