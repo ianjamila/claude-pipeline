@@ -266,7 +266,7 @@ test('R2-B1: a .review/jobs folder that cannot be listed (chmod 000) keeps a job
   await open({ ...w.as(500), jobLive: undefined }, wt);
   await closeLease({ worktree: wt, ...w.as(500), jobLive: () => true }); // closed while a job runs: jobOnly
   fs.chmodSync(jobsDir, 0o000);
-  t.after(() => fs.chmodSync(jobsDir, 0o700));
+  t.after(() => { try { fs.chmodSync(jobsDir, 0o700); } catch { /* already removed */ } });
   assert.equal(w.scan({ jobLive: undefined }).live.length, 1, 'an unreadable jobs folder: a job may be running');
   assert.deepEqual((await sweepDeadLeases({ ...w.as(null), jobLive: undefined })).removed, [], 'the sweep keeps it');
   assert.deepEqual(files(w.dir), ['sess-one.json']);
