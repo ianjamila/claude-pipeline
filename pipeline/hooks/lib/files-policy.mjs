@@ -3927,11 +3927,17 @@ function evaluateBashForFilesFrame(command, opts) {
   }
   const maybePath = /[/~$`\\*?[{]|claude|^\.\.?$/i;
   // R4-B2: a glob word is matched against each member of the chain (a glob that globToRe cannot read is a hit); R4-F2: ~NAME spellings, see homeWord
+  const globMemo = new Map(); // (a long line repeats the same words and directories: each glob is built once)
   const hitChain = (path) => {
     const e = pathsFor().normalize(path).replace(/(.)\/+$/, '$1');
     if (/[*?[]/.test(e)) {
-      const re = globToRe(e, ctx.ci);
-      return !re || [...homeChain].some((h) => re.test(h));
+      let hit = globMemo.get(e);
+      if (hit === undefined) {
+        const re = globToRe(e, ctx.ci);
+        hit = !re || [...homeChain].some((h) => re.test(h));
+        globMemo.set(e, hit);
+      }
+      return hit;
     }
     return homeChain.has(ctx.ci ? e.toLowerCase() : e);
   };
@@ -3983,11 +3989,11 @@ function evaluateBashForFilesFrame(command, opts) {
       chain = c.sep !== '||' && c.sep !== '|' && top[k + 1]?.sep === '&&' ? reach : null;
     }
   }
-  // the command's own working directory: git -C DIR / make -C DIR, each relative to the one before it
+  // the command's own working directory: git -C DIR / make -C DIR / tar -C DIR, each relative to the one before it
   const dirsOf = (c) => {
     const base = narrowDirs.get(c) ?? dirs;
     const name = baseOf(c.argv[0] ?? '');
-    if (name !== 'git' && name !== 'make' && name !== 'gmake') return base;
+    if (!['git', 'make', 'gmake', 'tar', 'bsdtar', 'gtar'].includes(name)) return base;
     let cur = base;
     for (const v of baseDirsOf(c.argv)) {
       const e = expandRefs(v, ctx);
@@ -4009,17 +4015,17 @@ function evaluateBashForFilesFrame(command, opts) {
     if (/^~\+(?:\/|$)/.test(wu)) return hits(wdirs.map((d) => pathsFor().join(d, wu.slice(2) || '.')));
     let x = expandRefs(w, ctx);
     const plus = ctx.homePosix + '+'; // (expandRefs reads ~+ as the home directory and a plus: a variable that holds it, too)
-    if (x === plus || x.startsWith(plus + '/')) return hits(wdirs.map((d) => pathsFor().join(d, x.slice(plus.length) || '.')));
+    if (x.startsWith(plus)) { // (and ~+2, a directory-stack entry: only known at run time)
+      const rest = x.slice(plus.length);
+      return rest !== '' && rest[0] !== '/' ? true : hits(wdirs.map((d) => pathsFor().join(d, rest || '.')));
+    }
     if (x[0] === '~' && !isAbs(x)) {
       const m = /^~([^/]*)(.*)$/.exec(x);
       if (!(ctx.ci ? m[1].toLowerCase() === ctx.user.toLowerCase() : m[1] === ctx.user)) return true;
       x = ctx.homePosix + m[2];
     }
     // a relative word is resolved against the directories the command can run in and normalized (`.`, `..`)
-    for (const piece of x.includes('{') ? braceExpand(x, ctx).split(/\s+/).filter(Boolean) : [x]) {
-      if (isAbs(piece) ? hitChain(piece) : hits(wdirs.map((d) => pathsFor().join(d, piece)))) return true;
-    }
-    return false;
+    return isAbs(x) ? hitChain(x) : hits(wdirs.map((d) => pathsFor().join(d, x)));
   };
   // what a command is given as operands: the value of a URL-prefix option is none
   const operandsOf = (c) => {
