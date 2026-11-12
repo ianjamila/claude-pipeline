@@ -127,3 +127,13 @@ test('stats rounds: usage errors exit 2; an unreachable GitHub on the list exits
   const bad = spawnSync(process.execPath, [bin, 'stats'], { encoding: 'utf8' });
   assert.equal(bad.status, 2);
 });
+
+// ---- round 1 review fixes ------------------------------------------------------------------------------------------
+
+test('R1-B1 analysePr: a cached accept (an already-fixed suggestion re-raised) is not a new accept, nor an accepted BLOCKING, of the round', () => {
+  const cached = (id, bucket = 'SUGGESTION') => acc(id, bucket, { final: { decision: 'ACCEPT', by: 'cache' } });
+  const p = analysePr({ repo: 'acme/widgets', pr: 7, state: stateOf([round(1, [acc('R1-S1')]), round(2, [cached('R2-S1'), cached('R2-B1', 'BLOCKING')], { admission: 'auto-extra' })]), record: null });
+  assert.deepEqual([p.rounds[1].found, p.rounds[1].acceptedBlocking], ['nothing-accepted', false]);
+  const mixed = analysePr({ repo: 'acme/widgets', pr: 7, state: stateOf([round(1, []), round(2, [cached('R2-S1'), acc('R2-S2')], { admission: 'auto-extra' })]), record: null });
+  assert.equal(mixed.rounds[1].found, 'accepts');
+});

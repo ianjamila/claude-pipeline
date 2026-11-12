@@ -8,6 +8,8 @@ const SEC = /secur|auth|permission|rls|grant|policy|privilege|role|token|secret|
 export const isSecurityItem = (item) => SECURITY_CATEGORIES.includes(item?.category) || SEC.test(`${item?.title ?? ''} ${item?.category ?? ''} ${item?.file ?? ''} ${item?.codexReasoning || item?.detail || ''}`);
 
 const decisionOf = (item) => item?.final?.decision ?? null;
+// The rule roundOutcome uses for a NEW accept (triage.mjs isNewAccept): a ruling copied from the cache is an already-accepted, already-fixed finding raised again, not something this round found.
+const isNewAccept = (item) => decisionOf(item) === 'ACCEPT' && item.final.by !== 'cache';
 const accepted = (round) => (round?.items ?? []).filter((i) => decisionOf(i) === 'ACCEPT');
 const money = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : null);
 const share = (n, d) => (d > 0 ? Math.round((n / d) * 1000) / 1000 : null);
@@ -35,13 +37,13 @@ export function analysePr({ repo, pr, state, record }) {
     }
     k += 1;
     const items = r.items ?? [];
-    const row = { n: r.n, k, pastCap: max !== null && k > max, usd: money(byRound[String(r.n)]?.usd), acceptedBlocking: items.some((i) => i.bucket === 'BLOCKING' && decisionOf(i) === 'ACCEPT') };
+    const row = { n: r.n, k, pastCap: max !== null && k > max, usd: money(byRound[String(r.n)]?.usd), acceptedBlocking: items.some((i) => i.bucket === 'BLOCKING' && isNewAccept(i)) };
     if (row.pastCap) {
       const prevAccepts = accepted(prev);
       row.admission = admissionOf(r, k, max);
       // what the round before it had to re-check: nothing, only fixes of non-BLOCKING non-security items ("low"), or something heavier
       row.previous = prevAccepts.length === 0 ? 'no-accepts' : prevAccepts.every((i) => i.bucket !== 'BLOCKING' && !isSecurityItem(i)) ? 'only-low-fixes' : 'blocking-or-security';
-      row.found = row.acceptedBlocking ? 'new-blocking' : items.some((i) => decisionOf(i) === 'ACCEPT') ? 'accepts' : 'nothing-accepted';
+      row.found = row.acceptedBlocking ? 'new-blocking' : items.some(isNewAccept) ? 'accepts' : 'nothing-accepted';
     }
     rows.push(row);
     prev = r;
