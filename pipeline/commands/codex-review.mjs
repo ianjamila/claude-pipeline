@@ -75,6 +75,8 @@ export const meta = {
     '    {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise',
     '    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not',
     '    taken alone',
+    '  redraftAdvice: a COUNTED round of a repo with ci.draft_while_iterating on a PR that is READY adds {redraftAdvice:true, warnings:[...]}: run `pipeline redraft --pr N` before',
+    '    the first fix push (never a failure; a draft PR, a base-only or resolution-only round, or a PR that cannot be read gets no advice)',
     '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver. A Codex failure also carries',
     '    substitute:{eligible, why, agent, resetAt, waitUntil?}: eligible only for a real quota stop (Codex\'s own turn.failed event, confirmed by its session log when found) with',
     '    review.substitute.mode auto; agent is substitute-fable once the PR was ever high risk (maxRisk), else substitute-opus; review.substitute.min_wait_minutes above 0 and a',
@@ -97,6 +99,15 @@ const planOutput = (p) => ({
   budget: p.budget, governor: p.governor === null ? null : { usedPct: p.governor.usedPct, soft: p.governor.soft, hard: p.governor.hard, observedAt: p.governor.observedAt },
   facts: { changedLines: Number.isFinite(p.facts.changedLines) ? p.facts.changedLines : null, newFile: p.facts.newFile, sensitive: p.facts.sensitive },
 });
+
+// true only when GitHub says the PR is a ready (non-draft) PR; a failed read, or any other answer, is false.
+function prIsReady(gh, pr) {
+  try {
+    return gh.prView(pr, ['isDraft']).isDraft === false;
+  } catch {
+    return false;
+  }
+}
 
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
@@ -271,6 +282,10 @@ export const run = guarded(async (argv, ctx) => {
   // Codex answered: the PR is no longer waiting for it and its last outage is over (best effort).
   const warnings = baseOnly ? [] : await noteCodexAnswered({ pr, repo: repoSlug, env: ctx.env });
 
+  // A COUNTED round of a repo that iterates in draft (ci.draft_while_iterating): if the PR is READY, every fix push of this round would re-run the heavy
+  // CI, so say so now (the review skill's Rule 8: `pipeline redraft` before the first fix push). Advice only: an unreadable PR is no advice, never a failure.
+  const redraftAdvice = config.ci.draft_while_iterating === true && !baseOnly && !resolutionOnly && prIsReady(createGitHub({ cwd: root, env: ctx.env }), pr);
+
   return {
     exitCode: EXIT.OK,
     output: {
@@ -292,6 +307,9 @@ export const run = guarded(async (argv, ctx) => {
       reviewer: state.reviewer,
       reviewerReasons: state.rounds.at(-1)?.fableReasons ?? [],
       path: dir,
+      ...(redraftAdvice
+        ? { redraftAdvice: true, warnings: [...warnings, `PR #${pr} is ready and this repo iterates in draft (ci.draft_while_iterating): run \`pipeline redraft --pr ${pr}\` BEFORE you push any fix from this round, so CI waits for the re-ready instead of running on every fix push`] }
+        : {}),
     },
   };
 });

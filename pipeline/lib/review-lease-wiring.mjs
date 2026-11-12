@@ -3,7 +3,7 @@
 // no command (and no later command someone adds to LEASED_COMMANDS) calls the library itself.
 //
 // WHICH COMMANDS. Every command that reads or writes a worktree's review state or the run that goes with it: the review loop (codex-review, triage,
-// arbiter, state, comment, followups, review-complete, verify), the gate and merge steps (final-gate, merge, merge-hold, update-branch, ci-wait, smoke),
+// arbiter, state, comment, followups, review-complete, verify), the gate and merge steps (final-gate, merge, merge-hold, redraft, update-branch, ci-wait, smoke),
 // the run record (checkpoint, cost, summary, agent-log) and the detached jobs (job). A lease is opened-or-renewed by each of them (renew opens when
 // absent, so a review begun on an older install gets one at its next command). NOT leased: commands that only compute or only talk to the machine
 // (preflight, config, labels, update, version, vendor, model-floor, model-proof, risk, hardstops, integrity, queue-sweep, stacks, worktrees, protect,
@@ -20,9 +20,16 @@
 //
 // ERRORS fail CLOSED: a command that cannot get its lease does not run (exit 2, one JSON object with a coded `error`): `update-in-progress` while an update holds
 // admission past the wait ("retry in a minute"), `review-lease-unwritable` / `review-lease-busy` / anything else from the lease I/O. Nothing has been read or
-// written by then, so a review's state stays exactly as it was. A plain terminal (no Claude Code session) gets { skipped: 'no-session' } and proceeds silently.
+// written by then, so a review's state stays exactly as it was.
 //
-// CLOSING. `P summary` (the stop ritual) closes the lease after it succeeds; `P checkpoint` does when the run record it wrote says step `ended` (the only
+// PLAIN TERMINALS. A command with no Claude Code session above it takes a PROCESS lease (plan 2026-11-12): the same admission, the same wait and refusal, a file
+// of its own (proc-<pid>-<8 hex>) that lives only while the command runs. It is closed after EVERY command whatever the result (a usage error, a failure, a throw:
+// bin/pipeline.mjs settles from a finally), by a synchronous 'exit' handler when the command leaves through process.exit, and by a signal handler for SIGINT /
+// SIGTERM / SIGHUP that closes and then lets the signal kill the process as it would have without a lease (R4-2). Only SIGKILL (or a crash of the machine)
+// leaves the file; the judge reads it dead once its pid is gone and the next terminal command's cleanup (or the installer's sweep) removes it. A detached
+// `P job` still running at the close keeps the worktree covered through the shared job-<hash> file (review-lease.mjs closeLease).
+//
+// CLOSING (a session's lease). `P summary` (the stop ritual) closes the lease after it succeeds; `P checkpoint` does when the run record it wrote says step `ended` (the only
 // two writers of an ended run, run-record.mjs). The close names the generation this very invocation just opened or renewed, so a lease that was reopened
 // for other work since is left alone. A failed close is a stderr warning, never a changed result: ending a review must not fail because of a lease.
 //
@@ -33,10 +40,11 @@
 import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { isInstalledCopy, seamValue } from './seams.mjs';
+import { claudeCodeAncestorPid } from './claude-ancestry.mjs';
 
 export const LEASED_COMMANDS = new Set([
   'agent-log', 'arbiter', 'checkpoint', 'ci-wait', 'codex-review', 'comment', 'cost', 'final-gate', 'followups', 'job', 'merge', 'merge-hold',
-  'review-complete', 'smoke', 'state', 'substitute', 'summary', 'triage', 'update-branch', 'verify',
+  'redraft', 'review-complete', 'smoke', 'state', 'substitute', 'summary', 'triage', 'update-branch', 'verify',
 ]);
 export const ADMISSION_WAIT_ENV = 'PIPELINE_ADMISSION_WAIT_MS';
 
@@ -83,6 +91,22 @@ function failureOf(err) {
   return { exitCode: EXIT.USAGE, output: { ok: false, error: code, message } };
 }
 
+// ONE walk of the process tree per command. Finding the Claude Code ancestor costs one `ps` per hop on POSIX (milliseconds) and one PowerShell process-table query per walk on Windows (1-3 s), and the
+// library asks for it at every step of a command: the early plain-terminal check, the take, the exit / signal close, the settle (and `job start`'s hand-off).
+// So the wiring answers it once, lazily, and every step reuses that answer through `ancestorPid` (null, "no Claude ancestor", is an answer too). An
+// `ancestorPid` the caller injected (the tests' seam) is left alone. The memo is published as `ctx.leaseAncestorPid` for the command's own run().
+function withSharedAncestor(leaseOpts, ctx) {
+  if (leaseOpts.ancestorPid !== undefined) return leaseOpts;
+  let done = false;
+  let answer = null;
+  const ancestorPid = () => {
+    if (!done) { answer = claudeCodeAncestorPid(leaseOpts.ancestry ?? {}); done = true; }
+    return answer;
+  };
+  ctx.leaseAncestorPid = ancestorPid;
+  return { ...leaseOpts, ancestorPid };
+}
+
 // Take (open or renew) the lease for `name`. -> { held: null | { worktree, generation, action } } or { failure: { exitCode, output } }.
 export async function holdReviewLease(name, argv, ctx = {}) {
   if (!isLeasedCommand(name)) return { held: null };
@@ -113,21 +137,115 @@ export async function holdReviewLease(name, argv, ctx = {}) {
     }
     const rawWait = seamValue(ADMISSION_WAIT_ENV, env);
     const waitMs = rawWait === undefined ? NaN : Number(rawWait);
-    const result = await openOrRenewLease({ worktree: root, repoId: repoLockKey(root), ...(pr !== undefined ? { pr } : { branch }), env, ...(waitMs >= 0 ? { waitMs } : {}) });
+    const leaseOpts = withSharedAncestor(ctx.leaseOpts ?? {}, ctx); // in-process seams of the tests (an injected holder, ps ...); never from the environment
+    // A plain terminal's exit / signal close is registered BEFORE the file is written (a signal between the write and a later registration would leave the file
+    // behind). The generation is not known yet: until it is, the close takes this process's lease whatever its generation (the file is this process's own).
+    const held = { worktree: root, generation: undefined, action: undefined, sessionId: undefined, process: false, leaseOpts, undo: () => {} };
+    const { isProcessHolderCase } = await import('./review-lease.mjs');
+    const early = isProcessHolderCase({ env, ...leaseOpts }) ? await registerExitClose(held, env) : null;
+    let result;
+    try {
+      result = await openOrRenewLease({ worktree: root, repoId: repoLockKey(root), command: name, ...(pr !== undefined ? { pr } : { branch }), env, ...(waitMs >= 0 ? { waitMs } : {}), ...leaseOpts });
+    } catch (err) {
+      early?.();
+      throw err;
+    }
+    if (result.skipped || !PROCESS_ID.test(result.sessionId)) early?.(); // no lease, or not a process lease after all: nothing to close on exit
     if (result.skipped) return { held: null };
-    return { held: { worktree: root, generation: result.generation, action: result.action } };
+    Object.assign(held, { generation: result.generation, action: result.action, sessionId: result.sessionId, process: PROCESS_ID.test(result.sessionId) });
+    if (held.process) held.undo = early ?? (await registerExitClose(held, env));
+    return { held };
   } catch (err) {
     return { failure: failureOf(err) };
   }
 }
 
-// After the command ran: close the lease when this command's result ended the review.
+const PROCESS_ID = /^proc-[1-9][0-9]*-[0-9a-f]{8}$/;
+const SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+
+// The paths that skip bin/pipeline.mjs's finally (R4-2): an 'exit' listener (process.exit anywhere) and, for each of SIGINT / SIGTERM / SIGHUP that has NO listener
+// yet, one that, only while it is the sole listener, closes synchronously, removes itself and re-raises the signal (default death, the same status as without a
+// lease). When the command installed a handler of its own meanwhile (verify slot --run, hold.mjs installRestoreOnSignal) it does nothing: the command keeps running
+// and keeps its lease, and ends it through process.exit (the 'exit' close) or main's finally. -> the function that unregisters them all (called only after a successful close).
+async function registerExitClose(held, env) {
+  const { closeLeaseSync } = await import('./review-lease.mjs');
+  const close = () => {
+    try { closeLeaseSync({ worktree: held.worktree, generation: held.generation, env, ...held.leaseOpts }); } catch { /* the file stays; its pid is gone, so the next sweep removes it */ }
+  };
+  const handlers = [];
+  process.once('exit', close);
+  handlers.push(['exit', close]);
+  for (const sig of SIGNALS) {
+    if (process.listenerCount(sig) > 0) continue;
+    const onSignal = () => {
+      if (process.listenerCount(sig) === 1 && process.listeners(sig)[0] === onSignal) {
+        close();
+        process.removeListener(sig, onSignal);
+        process.kill(process.pid, sig);
+      }
+      // Another listener (verify slot --run forwards the signal to its child tree and waits; hold.mjs restores and exits) means the command keeps running: the
+      // lease stays until that path ends the process (the 'exit' close) or main's finally settles it (R4-F1).
+    };
+    process.on(sig, onSignal);
+    handlers.push([sig, onSignal]);
+  }
+  return () => { for (const [event, fn] of handlers) process.removeListener(event, fn); };
+}
+
+// After the command ran (or threw: `result` is undefined). A PROCESS lease is closed after EVERY command, whatever the result; then its exit / signal handlers are
+// unregistered (only after a close that did not throw) and the dead proc- / job- files of earlier commands are swept, best effort. A session's lease is closed when
+// this command's result ended the review (CLOSES). A failure is a stderr warning, never a changed result. Safe to call twice.
 export async function settleReviewLease(name, result, held, ctx = {}) {
-  if (!held || !CLOSES[name]?.(result)) return;
+  if (!held || held.settled) return;
+  const env = ctx.env ?? process.env;
+  if (!held.process) {
+    if (!result || !CLOSES[name]?.(result)) return;
+    held.settled = true;
+    try {
+      const { closeLease } = await import('./review-lease.mjs');
+      await closeLease({ worktree: held.worktree, generation: held.generation, env, ...held.leaseOpts });
+    } catch (err) {
+      process.stderr.write(`pipeline: could not close this session's review lease (${err?.message ?? err}); it expires by itself\n`);
+    }
+    return;
+  }
+  try {
+    const { closeLease, sweepDeadLeases } = await import('./review-lease.mjs');
+    await closeLease({ worktree: held.worktree, generation: held.generation, env, ...held.leaseOpts });
+    held.settled = true;
+    held.undo();
+    try {
+      await sweepDeadLeases({ env, ...held.leaseOpts, only: ['proc-', 'job-'] });
+    } catch (err) {
+      process.stderr.write(`pipeline: could not clean up finished review leases (${err?.message ?? err}); the next update does\n`);
+    }
+  } catch (err) {
+    process.stderr.write(`pipeline: could not close this command's review lease (${err?.message ?? err}); it is removed once this process has ended\n`);
+  }
+}
+
+// The command must not run (the install changed while it started): give back the lease just taken. A process lease always; a session's only when this very
+// call opened it (a renewal belongs to the session's review and stays).
+export async function releaseHeldLease(held, ctx = {}) {
+  if (!held || held.settled) return;
+  if (!held.process && held.action !== 'opened') { held.settled = true; return; }
   try {
     const { closeLease } = await import('./review-lease.mjs');
-    await closeLease({ worktree: held.worktree, generation: held.generation, env: ctx.env ?? process.env });
+    await closeLease({ worktree: held.worktree, generation: held.generation, env: ctx.env ?? process.env, ...held.leaseOpts });
+    held.settled = true;
+    held.undo();
   } catch (err) {
-    process.stderr.write(`pipeline: could not close this session's review lease (${err?.message ?? err}); it expires by itself\n`);
+    process.stderr.write(`pipeline: could not give back the review lease (${err?.message ?? err})\n`);
   }
+}
+
+// Fingerprint of the installed copy (the manifest the installer writes last), or null for a checkout / nothing readable. Cheap on purpose: it is read twice per
+// leased command and must not hash the install (lib/identity.mjs installedIdentity does, for `version`). Two reads that differ mean an update ran in between.
+export async function readInstalledStamp() {
+  if (!isInstalledCopy()) return null;
+  try {
+    const [{ readManifest }, { pipelineRoot }] = await Promise.all([import('./installer.mjs'), import('./seams.mjs')]);
+    const { manifest } = readManifest(path.dirname(pipelineRoot()));
+    return manifest ? JSON.stringify(manifest) : 'unreadable';
+  } catch { return 'unreadable'; }
 }

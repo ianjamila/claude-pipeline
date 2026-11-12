@@ -96,8 +96,10 @@ async function start(rest, ctx) {
 
   try {
     // A leased command run inside the job has no Claude ancestor: hand it this session's identity so its lease joins the session's (review-lease.mjs).
-    // `ctx.leaseHolderOpts` is a test seam (an injected ancestor / ps / session record).
-    const handoff = holderHandoff({ worktree: root, env, ...(ctx?.leaseHolderOpts ?? {}) });
+    // `ctx.leaseAncestorPid` is the walk this command's lease already made (review-lease-wiring.mjs); `ctx.leaseHolderOpts` is a test seam (an injected ancestor / ps / session record).
+    const holderOpts = ctx?.leaseHolderOpts ?? {};
+    const walked = ctx?.leaseAncestorPid && holderOpts.ancestry === undefined ? { ancestorPid: ctx.leaseAncestorPid } : {};
+    const handoff = holderHandoff({ worktree: root, env, ...walked, ...holderOpts });
     const started = startJob(name, quoteCommand(args, platform), { cwd: root, policy, tag: values.tag ?? headOrNull(root), env: handoff });
     return { exitCode: EXIT.OK, output: { ok: true, ...started } };
   } catch (err) {
