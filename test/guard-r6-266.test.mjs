@@ -79,10 +79,86 @@ const ALLOW = [
   ['echo "${X:-default}"', `cat ${S}; echo "${OB}X:-default}"`],
   ['cat "$1" on a judged line', `cat ${S} "${D}1"`],
   ['echo of a default that assigns a plain path', `echo ${OB}X:=./f.sh}; echo ${D}X`],
-  ['a [ test of two expansions', `[ "${OB}a}" = "${OB}b}" ] && cat ${S}`],
+  ['two expansions around a plain = word', `[ "${OB}a}" = "${OB}b}" ] && cat ${S}`],
 ];
 for (const [label, line] of ALLOW) {
   test(`#266 R6 still allows: ${label}`, () => {
+    const r = run(line);
+    assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
+  });
+}
+
+// PR #266 post-push security review of 010ac7c: two more holes in the same class, closed fail-closed.
+//   PP-1  zsh also evaluates a subscript as arithmetic in a `${name:offset:length}` offset, in a subscript on a bare `$name[…]` and in `${x[…]}` with a nested subscript; any `${…}` or `$name[` whose
+//         span holds a `[`, `$(` or a backtick is refused, and so is a `${name:` offset or length that is not plain digits (`${x: -1}` and the `:-` `:+` `:=` `:?` operators keep their handling).
+//   PP-2  zsh with MULTIBYTE allows non-ASCII letters in a parameter name (`${é:=…}`): every `=` after a non-ASCII char counts as an assignment, not only one after `]` or an ASCII word char.
+const SUB = `path[${BSL}${D}(rm ${S})]`; // a subscript that runs a substitution
+const PP = [
+  ['PP-1 offset holding a subscript', (q) => `echo ${q}${OB}x:${SUB}}${q}`],
+  ['PP-1 length holding a subscript', (q) => `echo ${q}${OB}x:1:${SUB}}${q}`],
+  ['PP-1 offset after a space holding a subscript', (q) => `echo ${q}${OB}x: ${SUB}}${q}`],
+  ['PP-1 bare $name[ subscript', (q) => `echo ${q}${D}x[${SUB}]${q}`],
+  ['PP-1 bare $1[ subscript', (q) => `echo ${q}${D}1[${SUB}]${q}`],
+  ['PP-1 ${x[nested subscript]}', (q) => `echo ${q}${OB}x[${SUB}]}${q}`],
+  ['PP-1 ${x}[subscript]', (q) => `echo ${q}${OB}x}[${SUB}]${q}`],
+  ['PP-1 offset from a parameter', (q) => `echo ${S} ${q}${OB}x:${D}y}${q}`],
+  ['PP-1 length from a parameter', (q) => `echo ${S} ${q}${OB}x:1:${D}y}${q}`],
+  ['PP-1 offset from a substitution', (q) => `echo ${S} ${q}${OB}x:${BSL}${D}(echo 1)}${q}`],
+  ['PP-1 offset from a backtick', (q) => `echo ${S} ${q}${OB}x:${BSL}\`echo 1${BSL}\`}${q}`],
+  ['PP-1 offset hiding behind a decoy brace', (q) => `echo ${q}${OB}x:'}'${SUB}}${q}`],
+  ['PP-2 non-ASCII name :=', (q) => `echo ${q}${OB}é:=${SUB}}${q}`],
+  ['PP-2 non-ASCII name =', (q) => `echo ${q}${OB}é=${SUB}}${q}`],
+  ['PP-2 non-ASCII name ::=', (q) => `echo ${q}${OB}日本::=${SUB}}${q}`],
+  ['PP-2 combining mark in the name', (q) => `echo ${q}${OB}é:=${SUB}}${q}`],
+];
+for (const [label, mk] of PP) {
+  for (const [qn, q] of [['double-quoted', '"'], ['unquoted', '']]) {
+    test(`#266 post-push denies: ${label}, ${qn}`, () => {
+      const line = mk(q);
+      const r = run(line);
+      assert.equal(r.decision, 'deny', `${line.slice(0, 200)} -> ${r.decision}`);
+    });
+  }
+}
+test('#266 post-push denies: an offset subscript in an env value, a redirect word and a heredoc body', () => {
+  for (const line of [`X="${OB}x:${SUB}}" echo hi`, `echo x < "${D}x[${SUB}]"`, `cat <<EOF\n${OB}x:${SUB}}\nEOF`, `cat <<'EOF'\n${D}x[${SUB}]\nEOF`]) {
+    const r = run(line);
+    assert.equal(r.decision, 'deny', `${line.slice(0, 200)} -> ${r.decision}`);
+  }
+});
+
+// the new checks stay linear: a hook past the host's 15 s is ALLOWED
+const PP_TIMED = [
+  ['`${x:` then 190 kB of digits and no }', `echo '{}' > ${S}; : '<<' '${OB}x:${'1'.repeat(190000)}'`],
+  ['`${x:` repeated 40000 times, never closed', `echo '{}' > ${S}; : '<<' '${(OB + 'x:').repeat(40000)}'`],
+  ['`${` repeated 100000 times then a [ at the end', `echo '{}' > ${S}; : '<<' '${OB.repeat(100000)}['`],
+  ['`$a` repeated 60000 times then a [', `echo '{}' > ${S}; : '<<' '${(D + 'a').repeat(60000)}['`],
+  ['`$` and 190 kB of name chars with no [', `echo '{}' > ${S}; : '<<' '${D}${'a'.repeat(190000)}'`],
+  ['`${é` and a run of = after non-ASCII', `echo '{}' > ${S}; : '<<' '${OB}é${'='.repeat(190000)}'`],
+];
+for (const [label, line] of PP_TIMED) {
+  test(`#266 post-push timing: ${label} is denied in under 2 s`, () => {
+    const t0 = performance.now();
+    const r = run(line);
+    const ms = performance.now() - t0;
+    assert.equal(r.decision, 'deny', `${r.decision}`);
+    assert.ok(ms < 2000, `took ${Math.round(ms)} ms`);
+  });
+}
+
+const PP_ALLOW = [
+  ['echo "${HOME}"', `cat ${S} "${OB}HOME}"`],
+  ['echo "${X:-default}"', `cat ${S} "${OB}X:-default}"`],
+  ['echo "${x:1:2}"', `cat ${S} "${OB}x:1:2}"`],
+  ['echo "${x: -1}"', `cat ${S} "${OB}x: -1}"`],
+  ['echo "${x:+alt}"', `cat ${S} "${OB}x:+alt}"`],
+  ['echo of a plain path default that assigns', `cat ${S} ${OB}X:=./f.sh}`],
+  ['a [ test of two expansions', `cat ${S} "${OB}a}" = "${OB}b}"`],
+  ['a non-ASCII word beside a plain = word', `cat ${S} "é" = "${OB}b}"`],
+  ['echo "$HOME/x" with a [ elsewhere', `cat ${S} "${D}HOME/x" [a]`],
+];
+for (const [label, line] of PP_ALLOW) {
+  test(`#266 post-push still allows: ${label}`, () => {
     const r = run(line);
     assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
   });

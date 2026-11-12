@@ -1863,19 +1863,39 @@ function testEvaluates(name, args, words, expand, raw) {
 //   (b) an `=` (so `=`, `:=`, `::=`) after a name char or a `]`, between the first `${` and the last `}` of the text, whose word is not plain path characters up to a closing brace (R6-F2: a
 //       positional name counts). One linear pass: the first head and the last `}` are found once and each `=` is judged where it stands, so no decoy `}` ends the region early and no head is
 //       rescanned (R6-F1: a hook past the host's 15 s is ALLOWED, and the two lazy patterns of round 5 backtracked quadratically: 16 s at 190 kB). Over-matching (`${x:-a=$(b)}`, `echo ${A} k=$(b)`) fails closed.
-const EVALUATING_WORD = /\$\{\(|\$\(\(|\$\[/;
+const EVALUATING_WORD = /\$\{\(|\$\(\(|\$\[|\$[\p{L}\p{N}_]+\[|\}\[/u; // (post-push: `$name[…]` and `${name}[…]` are subscripts too; each alternative stops at the next `$`, so the scan is linear)
 const PLAIN_DEFAULT = /[A-Za-z0-9_./~+-]*\}/y; // (the default word up to its closing brace: plain path characters only; sticky, so it is matched where the `=` ends and nowhere else)
+const SPAN_RISK = /\[|\$\(|`/g; // (post-push: what inside a `${…}` can run a substitution or evaluate a subscript)
+const EXPANSION_NAME = /[=~^+!#]*[\p{L}\p{N}_@*?$!-]*:/uy; // (the name up to the colon of a `${name:…}`; sticky, matched at one place)
+const OFFSET_OK = /\s*-?\d+(?:\s*:\s*-?\d+)?\s*\}|[-+=?#|^:]/y; // (what may follow that colon: plain digits (a negative one too, `: -1`) or an operator `:- :+ := :? :# :| :^ ::`)
 function plantsInText(text) {
   if (typeof text !== 'string') return false;
   if (EVALUATING_WORD.test(text)) return true;
-  if (!text.includes('${')) return false;
+  const first = text.indexOf('${');
+  if (first === -1) return false;
   const end = text.lastIndexOf('}');
-  let at = text.indexOf('=', text.indexOf('${') + 2);
+  // post-push (#266): every `${…}` is judged once, left to right, with remembered positions (the next `}`, the next risky char), so the pass stays linear however many `${` the text holds.
+  // zsh evaluates a subscript as arithmetic in a `${name:offset:length}` and in `${x[…]}`: a span (up to the next `}`) holding a `[`, `$(` or a backtick is refused, and so is an offset or length that is not plain digits.
+  let close = -2; // (index of the next `}` at or after the current head; -1 = none, the span runs to the end)
+  let risk = -2; // (index of the next risky char at or after the current head; -1 = none)
+  for (let h = first; h !== -1; h = text.indexOf('${', h + 2)) {
+    if (close !== -1 && close < h) close = text.indexOf('}', h);
+    if (risk !== -1 && risk < h) { SPAN_RISK.lastIndex = h; const m = SPAN_RISK.exec(text); risk = m ? m.index : -1; }
+    const stop = close === -1 ? text.length : close;
+    if (risk !== -1 && risk < stop) return true;
+    EXPANSION_NAME.lastIndex = h + 2;
+    if (EXPANSION_NAME.test(text) && EXPANSION_NAME.lastIndex <= stop) {
+      OFFSET_OK.lastIndex = EXPANSION_NAME.lastIndex;
+      if (!OFFSET_OK.test(text)) return true;
+    }
+  }
+  // an `=` after a name char, a `]` or any non-ASCII char (zsh with MULTIBYTE allows letters like `é` in a name; a mark or a surrogate half is above 127 too) assigns when its word is not plain
+  let at = text.indexOf('=', first + 2);
   while (at !== -1 && at < end) {
     let k = at - 1;
     if (text[k] === ':') k--; // (`:=`)
     if (text[k] === ':') k--; // (`::=`)
-    if (k >= 0 && (text[k] === ']' || /\w/.test(text[k]))) {
+    if (k >= 0 && (text[k] === ']' || /\w/.test(text[k]) || text.charCodeAt(k) > 127)) {
       PLAIN_DEFAULT.lastIndex = at + 1;
       if (!PLAIN_DEFAULT.test(text)) return true;
     }
