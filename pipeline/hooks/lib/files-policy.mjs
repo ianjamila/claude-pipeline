@@ -23,7 +23,7 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { STDIN_FILES, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+import { isStdinPath, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, awkStdinProgram, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -1720,13 +1720,20 @@ const CODE_WALK = [
   [/^Rscript$/, /^-e(.*)$/s, /^--(?:verbose|vanilla|no-environ|no-site-file|no-init-file|no-restore|no-save|quiet|silent|slave)$/, null, /^-$/],
   [/^php$/, /^-r(.*)$/s, /^-[nqCH]$/, null, /^(?:-|-a|--interactive)$/],
 ];
-// (R6-B1, R6-F1) A word that names stdin as a file: `-`, /dev/stdin, /dev/fd/0, /proc/self/fd/0 (the parser's own list), or an option / assignment value of that kind (`--require=/dev/stdin`, `=@/dev/stdin`)
-const STDIN_PATH_TAIL = [...STDIN_FILES].filter((f) => f !== '-').map((f) => f.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')).join('|');
-const STDIN_WORD = (a) => STDIN_FILES.has(a) || new RegExp(`=@?(?:${STDIN_PATH_TAIL})$`).test(a);
-// (an assignment anywhere on the line whose value holds such a path -- `LUA_INIT=@/dev/stdin lua -e ''` -- lets the interpreter read its startup code from stdin)
-const STDIN_ASSIGN = new RegExp(`(?:^|[^\\w])[A-Za-z_][A-Za-z0-9_]*\\+?=[^\\s]*(?:${STDIN_PATH_TAIL})`);
+// (R6-B1, R6-F1, R6 security review) A word that names stdin as a file -- `-`, /dev/stdin, /dev/fd/N, /proc/<pid>/fd/N, in any spelling isStdinPath resolves (`//dev/stdin`, `/dev/./stdin`) -- or an option / assignment
+// value of that kind (`--require=/dev/stdin`, `=@/dev/stdin`, any text after an `=`)
+const STDIN_WORD = (a) => isStdinPath(a) || a.split('=').slice(1).some((v) => isStdinPath(v.startsWith('@') ? v.slice(1) : v));
+// (an assignment anywhere on the raw line (prefix, export, declare, quoted value with spaces) whose value holds a /dev/ or /proc/ path -- `NODE_OPTIONS="--require /dev/stdin" node -e 0` -- lets the interpreter read its startup code
+// from stdin; so does ANY assignment of a variable that carries startup code, whatever its value. A redirect (`2>/dev/null`) has no NAME= in front and is not one.)
+const ASSIGN_VALUE = /(?:^|[^\w])[A-Za-z_]\w*\+?=((?:"(?:[^"\\]|\\.)*"|'[^']*'|\\.|[^\s"'\\])*)/g;
+const STARTUP_VAR_ASSIGN = /\b(?:NODE_OPTIONS|LUA_INIT\w*|RUBYOPT|PERL5OPT|PERL5LIB|PYTHONSTARTUP|PYTHONINSPECT)\s*\+?=/;
+function stdinAssign(line) {
+  if (STARTUP_VAR_ASSIGN.test(line)) return true;
+  for (const m of line.matchAll(ASSIGN_VALUE)) if (/\/(?:dev|proc)\//.test(m[1].replace(/\/{2,}/g, '/'))) return true;
+  return false;
+}
 function programInArgv(argv, line = '') {
-  if (STDIN_ASSIGN.test(line)) return false;
+  if (stdinAssign(line)) return false;
   const runners = argv.map((w, i) => [baseOf(w), i]).filter(([b]) => INLINE_RUNNERS.test(b));
   return runners.length > 0 && runners.every(([b, i]) => {
     const rest = argv.slice(i + 1);
@@ -1758,7 +1765,7 @@ function runsInlineCode(c, ctx) {
     // (it may take a value, so what follows is not known to be the file: `node -r x.js -e ..`, `perl -I lib -e ..`, `python3 -W ignore -c ..`))
     if (rest.some((a) => /^--(?:eval|print|exec)(?:=|$)/.test(a) || /^-[A-Za-z]*[ecEprR]/.test(a))) return true;
     const file = rest.findIndex((a) => !a.startsWith('-') || a === '-');
-    return file < 0 || STDIN_FILES.has(rest[file]) || rest.slice(0, file).some((a) => !BENIGN_INTERP_OPTS.test(a));
+    return file < 0 || isStdinPath(rest[file]) || rest.slice(0, file).some((a) => !BENIGN_INTERP_OPTS.test(a));
   });
 }
 // Why: a cd whose target cannot be named from its words: `cd -` (OLDPWD), `popd`, a bare `pushd`, `pushd +1`, several operands (a brace list the parser split; zsh `cd old new`),

@@ -10,6 +10,7 @@
 // A shell / source / eval fed script text from files (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`) carries them in a
 // non-enumerable `feeds`; scriptFeedsOf turns it into script-file records for the callers.
 
+import { posix as posixPath } from 'node:path';
 import { sqlShellEscapes, sqlFamilyOf, sqlClientPlan, SQL_CLIENT_NAMES, SQL_RC_MENTION } from './sql-clients.mjs';
 const MAX_COMMANDS = 500;
 const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up on the line
@@ -35,6 +36,19 @@ const TMUX_RUNNERS = new Set(['new-session', 'new', 'new-window', 'neww', 'split
 const TMUX_KEY_RE = /^(Enter|Space|Tab|Escape|BSpace|Up|Down|Left|Right|Home|End|PageUp|PageDown|[CMS]-.+|F[0-9]+|KP.+)$/;
 const PS_START_VALUED = ['workingdirectory', 'verb', 'windowstyle', 'redirectstandardinput', 'redirectstandardoutput', 'redirectstandarderror', 'credential', 'environment'];
 export const STDIN_FILES = new Set(['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0']);
+// (R6 security review) Could this word name stdin (or another process's / device's stream) once the shell and the kernel have resolved it? `-`, or -- after dropping surrounding quotes, collapsing repeated
+// slashes and resolving `.` / `..` segments (`//dev/stdin`, `/dev/./stdin`, `/dev/fd/../fd/0`) -- ANY path under /dev/ or /proc/ (/dev/stdin, /dev/fd/N, /proc/self/fd/N, /proc/<pid>/fd/N). Fails closed on other device paths.
+export function isStdinPath(word) {
+  if (typeof word !== 'string') return false;
+  let w = word.trim();
+  if (w === '-') return true;
+  const q = /^(["'])(.*)\1$/s.exec(w);
+  if (q) w = q[2];
+  if (w === '-') return true;
+  if (!w.startsWith('/')) return false;
+  const n = posixPath.normalize(w);
+  return n.startsWith('/dev/') || n.startsWith('/proc/');
+}
 const DYN_AFTER_DOLLAR = /[A-Za-z_{0-9@*#?!$[-]/;
 const WIN_PATH_RE = /[^\\]\\[^\\]|^\\\\/; // C:\Git\git.exe, .\git.exe, \\server\share\git.exe
 const ANSI_C = { n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', v: '\v', '\\': '\\', "'": "'", '"': '"', '?': '?' };

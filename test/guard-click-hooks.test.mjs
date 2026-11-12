@@ -457,3 +457,40 @@ test('R6-B1, R6-F1: a program on stdin named by a path or a program-file option 
     `node -r fs -e "console.log(1)"`,
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
+
+test('R6 security review: non-canonical stdin paths and spaced assignments', () => {
+  const py = "import os; os.link('/tmp/payload','.claude/settings.local.json')";
+  const js = "require('fs').linkSync('/tmp/payload','.claude/settings.local.json')";
+  const lua = "os.execute('ln /tmp/payload .claude/settings.local.json')";
+  const awk = 'BEGIN { system("ln /tmp/payload .claude/settings.local.json") }';
+  const rb = "File.link('/tmp/payload','.claude/settings.local.json')";
+  const failures = [];
+  for (const cmd of [
+    `echo '${awk}' | awk -f //dev/stdin`,
+    `echo '${awk}' | awk -f /dev/./stdin`,
+    `echo '${awk}' | awk -E /dev//fd/0`,
+    `echo '${awk}' | awk -f /proc/1234/fd/0`,
+    `echo '${awk}' | awk -f /dev/fd/../fd/0`,
+    `echo '${awk}' | gawk -i /dev/fd/../fd/0 'BEGIN{}'`,
+    `echo '${awk}' | gawk --include=/dev/fd/../fd/0 'BEGIN{}'`,
+    `echo '${awk}' | gawk -l //dev/stdin 'BEGIN{}'`,
+    `echo "${js}" | node -r //dev/stdin -e 0`,
+    `echo "${js}" | node --require=/dev/./stdin -e 0`,
+    `echo "${py}" | python3 /proc/42/fd/0`,
+    `echo "${py}" | python3 /proc/self/../self/fd/0`,
+    `echo "${py}" | python3 //dev/stdin`,
+    `echo "${js}" | NODE_OPTIONS="--require /dev/stdin" node -e 0`,
+    `export NODE_OPTIONS='-r /dev/stdin'; echo "${js}" | node -e 0`,
+    `echo "${lua}" | LUA_INIT="@ /dev/stdin" lua -e ''`,
+    `echo "${rb}" | RUBYOPT=-r/dev/stdin ruby -e 0`,
+    `echo "${js}" | NODE_OPTIONS="--require ./x.js" node -e 0`,
+    `echo "${lua}" | LUA_INIT_5_4=@/dev/stdin lua -e ''`,
+  ]) if (bash(cmd) !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these lines were not refused');
+  for (const cmd of [
+    `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())' 2>/dev/null`,
+    `echo ".claude/settings.json" | awk '{print}' > /dev/null`,
+    `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())' > /dev/null 2>&1`,
+    `FOO=bar node -r fs -e "console.log(1)"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
