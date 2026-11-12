@@ -130,9 +130,10 @@ describe('R12-F2: a `\\r` on a terminator candidate or on the delimiter word', (
     ['EOF\\r', `cat <<EOF\nEOF\r\nfind . -delete\nEOF\n`],
     ['quoted, EOF\\r', `cat <<'EOF'\nEOF\r\nfind . -delete\nEOF\n`],
   ]);
-  test('#288 R12 F2: a body line that only contains a \\r elsewhere is fine', () => {
+  // (R13-F2: the case that stood here, a \r after the delimiter word and on the terminator line, is undecidable, not fine; the decidable boundary, a \r only inside the body, is in guard-r13-288.test.mjs)
+  test('#288 R12 F2: a \\r after the delimiter word and on the terminator line is undecidable', () => {
     const cmds = simpleCommands('cat <<EOF\r\nx\r\nEOF\r\nls\n');
-    assert.ok(cmds.length >= 1);
+    assert.equal(cmds.undecidable, true);
   });
 });
 
