@@ -1316,6 +1316,7 @@ function resolveGlobDir(full, ctx, wide) {
 // The one directory a glob-looking cd target `e` names from any of `bases` (null: none, several, or not modelled).
 // Could a command before `upto` change which paths exist (create, remove, rename, link: anything not read-only, a write redirect, a sourced file, a startup file)?
 function mayChangeListing(cmds, upto, ctx) {
+  checkDeadline(ctx.budget); // (called for every command, and each call judges every earlier one: the shared deadline bounds the n^2)
   return cmds.slice(0, upto).some((c) => (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) || Object.keys(c.env ?? {}).some((k) => /^(?:BASH_ENV|ENV|ZDOTDIR)$/.test(k))
     || (c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !VAR_COMMANDS.has(baseOf(c.argv[0])) && (!isReadOnly(c, ctx) || ['source', '.', 'eval'].includes(baseOf(c.argv[0])))));
 }
@@ -1584,7 +1585,8 @@ const MOVERS = new Set(['mv', 'ln', 'ditto']); // any named protected path count
 const CDPATH_NAMES = ['CDPATH', 'cdpath'];
 const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'source', '.']);
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
-const LAST_WORD_RE = /\$_(?![A-Za-z0-9_])|\$\{_(?:[^A-Za-z0-9_}][^}]*)?\}/; // `$_` / `${_}`: the last word of the previous command (not `$_x`)
+// (R1-F1 #288: `${_` not followed by a name character, with no search for the closing brace: the old `${_:…}` alternative backtracked quadratically on a repeated `${_:`; this over-matches (`${_x}` stays out, `${_:-w}` is in) and is linear)
+const LAST_WORD_RE = /\$(?:_|\{_)(?![A-Za-z0-9_])/; // `$_` / `${_}`: the last word of the previous command (not `$_x`)
 // R7-F3 (#266): an arithmetic context on a line that names a protected file: `$((`, `((`, `$[`, a `let` word, a numeric test operator word (`-eq`, `-lt` ...), an integer declaration (`typeset -i`, `declare -i`, `local -i`, `integer`) and a lone `_` in ANY spelling (bare, quoted, escaped or assigned:
 // `${x:_}`, `$a[_]`, `printf %d "_"`, `n=_`, `[ "_" -gt 0 ]` read it as arithmetic; any `_` not touching a letter, digit or `_` fails closed; `$_` and `${_}` are expansions of the last word, not a name, and are judged by LAST_WORD_RE). Each alternative is a literal, a lookaround or a one-class run, so the scan is linear.
 const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])(?:let|integer)(?=\s)|(?:^|[\s;&|(){`])(?:typeset|declare|local)\s+-[A-Za-z]*i|\s-(?:eq|ne|lt|gt|le|ge)(?=\s)|(?<![$\p{L}\p{N}_]|\$\{)_(?![\p{L}\p{N}_])/u;
@@ -1726,14 +1728,31 @@ function toolEnvTouched(cmd, ctx, src) {
     p = {
       name: new RegExp(`^(?:${src})`),
       assign: new RegExp(`(?:^|[\\s;&|(\`{])(?:${src})[A-Za-z0-9_]*\\s*(?:\\+?=|\\[)`),
-      declare: new RegExp(`\\b(?:export|declare|typeset|readonly|local|setenv)\\b[^;&|\\n]*(?<![A-Za-z0-9_])(?:${src})[A-Za-z0-9_]*`),
+      keyword: /\b(?:export|declare|typeset|readonly|local|setenv)\b/,
+      declared: new RegExp(`(?<![A-Za-z0-9_])(?:${src})`),
     };
     envPatterns.set(src, p);
   }
   const names = [...Object.keys(cmd.env ?? {}), ...Object.keys(ctx.vars ?? {}), ...(ctx.unknownVars ?? []), ...(ctx.pickUnknown ?? []), ...(ctx.srcChanged ?? []), ...(ctx.srcTouched ?? [])];
   if (names.some((n) => p.name.test(n))) return true;
+  return lineTouchesToolEnv(ctx, src, p);
+}
+// R1-F2 (#288): what the LINE says is the same for every command, so it is computed once per (line, pattern) and cached on ctx; it is linear too: the line is cut at `;`, `&`, `|` and a newline, and a
+// segment is touched when its first declaring keyword is followed by a name of the family (the old single pattern backtracked from every keyword, and ran again for every isReadOnly call).
+function lineTouchesToolEnv(ctx, src, p) {
   const line = ctx.ghLine ?? '';
-  return p.assign.test(line) || p.declare.test(line);
+  const memo = (ctx.envLineMemo ??= new Map());
+  const hit = memo.get(src);
+  if (hit && hit.line === line) return hit.touched;
+  let touched = p.assign.test(line);
+  if (!touched) {
+    for (const seg of line.split(/[;&|\n]/)) {
+      const k = p.keyword.exec(seg);
+      if (k && p.declared.test(seg.slice(k.index + k[0].length))) { touched = true; break; }
+    }
+  }
+  memo.set(src, { line, touched });
+  return touched;
 }
 
 // T1.7 (a): isReadOnly judges the words the shell will pass. A same-line name is replaced by its value first (`D=-delete; find S $D`); a word whose value is still only known at run time
@@ -1747,15 +1766,23 @@ function judgedWords(name, args, ctx) {
   if (!args.some((a) => RUNTIME_PART.test(a))) return { args, unknown: false };
   const touched = (n) => Object.hasOwn(ctx.vars ?? {}, n) || ctx.unknownVars?.has(n) || ctx.pickUnknown?.has(n) || ctx.srcChanged?.has(n) || ctx.srcTouched?.has(n) || ctx.unknownAll === true;
   let unknown = false;
-  const out = args.map((a) => {
-    if (!RUNTIME_PART.test(a)) return a;
+  const out = [];
+  for (const a of args) {
+    if (!RUNTIME_PART.test(a)) { out.push(a); continue; }
     const e = expandRefs(a, ctx);
     if (RUNTIME_PART.test(e)) {
       if (PROGRAM_TOOLS.has(name)) { if (/`|\$[({]/.test(e) || [...e.matchAll(/\$(\w+)/g)].some((m) => touched(m[1]))) unknown = true; }
       else if (OPTION_TOOLS.has(name) && (/^[$`]/.test(e) || e.startsWith('-'))) unknown = true;
     }
-    return e;
-  });
+    // R1-F3 (#288): the shell splits an unquoted expansion into words (bash on whitespace, zsh an array `D=(-true -delete)` into its elements), so a value that holds whitespace or starts with `(`
+    // is several words: `D='-true -delete'; find S $D`. A program word (sed, awk) is unknown then; for the option tools every piece is judged as a word of its own. (A double-quoted use is one word in
+    // the shell; judging the pieces is the safe reading of it. A word that was written with whitespace in it stays one word.)
+    if (e !== a && !/\s/.test(a) && (/\s/.test(e) || e.startsWith('('))) {
+      if (PROGRAM_TOOLS.has(name)) unknown = true;
+      else if (OPTION_TOOLS.has(name)) { out.push(...e.replace(/^\(|\)$/g, ' ').split(/\s+/).filter(Boolean)); continue; }
+    }
+    out.push(e);
+  }
   return { args: out, unknown };
 }
 // R1-B2 / R2-B1 / R2-F1 / R3 (#266): bash and zsh read some operands as a variable NAME or an arithmetic expression, and evaluate an array subscript in it (`test -v 'a[$(rm "$T")]'` runs the
@@ -1768,7 +1795,9 @@ function judgedWords(name, args, ctx) {
 // that only hold a run-time part (`"$(cmd)"`, whose output may be such a form). A same-line assignment whose value holds the form is refused by assignmentOnlyHarmless (PATH_VALUE has no `[`),
 // which matters because zsh evaluates the VALUE of a name read as arithmetic (`y='a[$(…)]'; printf '%d' y`).
 const SUBSCRIPT_EVAL = /[\[`]|\$[({]/;
-const SUBSCRIPT_FORM = /\[[^]*(?:\$[({[]|`)/;
+// (R1-B1 #288: one linear scan, the first `[` and then one search after it; the old pattern rescanned to the end of the word from every `[`: 190 kB of `[` took 28 s)
+const AFTER_BRACKET = /\$[({[]|`/;
+const SUBSCRIPT_FORM = { test(w) { const i = String(w).indexOf('['); return i !== -1 && AFTER_BRACKET.test(String(w).slice(i + 1)); } };
 const PRINTF_PLAIN_SPEC = /^%[-+ #0-9.]*[sbcq]/; // (a conversion whose argument is never read as arithmetic)
 const PRINTF_PERCENT_ESCAPE = /\\(?:[xuU]|[0-7][0-7])/; // (a hex, unicode or octal escape can spell a %: zsh decodes \u0025d to a live %d; a lone \0 or a \n stays plain)
 function printfFormatEvaluates(fmt) {
@@ -1950,11 +1979,13 @@ function plantsInText(text) {
   return false;
 }
 function plantsSubscript(cmd, ctx) {
+  if (ctx?.budget) checkDeadline(ctx.budget);
   const texts = [...cmd.argv, ...Object.values(cmd.env ?? {}), ...(cmd.redirects ?? []).map((r) => r.target), cmd.raw];
   // (a heredoc body is on no command: ctx.heredocPlants says whether a body of this text holds one)
   return ctx?.heredocPlants === true || texts.some(plantsInText);
 }
 function evaluatesSubscript(name, args, ctx, raw) {
+  if (ctx?.budget) checkDeadline(ctx.budget);
   const test = name === 'test' || name === '[' || name === '[[';
   if (!test && name !== 'printf') return false;
   const expand = (a) => (/[$`]/.test(a) ? expandRefs(a, ctx) : a);
@@ -1980,6 +2011,7 @@ function evaluatesSubscript(name, args, ctx, raw) {
   return printfFormatEvaluates(args[fmt]) || printfFormatEvaluates(expand(args[fmt])); // (the format as written and as expanded)
 }
 function isReadOnly(cmd, ctx) {
+  if (ctx?.budget) checkDeadline(ctx.budget); // (the shared deadline: every read-only judgement is a checkpoint)
   const argv = cmd.argv;
   if (!argv.length) return false;
   const name = baseOf(argv[0]);
@@ -3353,6 +3385,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const rawOfCmd = (c) => maskProse(c.raw, prose.get(c).values);
   const wordsOf = (c) => { const d = prose.get(c).drop; return d.size ? c.argv.filter((_, i) => !d.has(i)) : c.argv; };
   for (const c of cmds) {
+    checkDeadline(ctx.budget); // (the one wall-clock deadline of the evaluation, checked at every command: a hook past its timeout is ALLOWED)
     const words = [c.argv.join(' '), ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)].join(' ');
     if (setsAdmin(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
     if (hasDisableAll(words)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
@@ -3401,6 +3434,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // 6: the job runner executes its inner command on the agent's behalf
   if ((opts._depth ?? 0) < 4) {
     for (const c of cmds) {
+      checkDeadline(ctx.budget); // (the evaluation deadline)
       const inner = jobInner(c);
       if (!inner) continue;
       const r = evaluateBashForFiles(inner, { ...opts, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
@@ -3532,6 +3566,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const sdirsNow = () => (unknownCwd() ? unique([...dirs, ...assumedCwds(ctx)]) : dirs); // (a sourced file may make the directory unknown part-way through the line)
   if ((opts._depth ?? 0) < 4) {
     for (const [idx, c] of cmds.entries()) {
+      checkDeadline(ctx.budget); // (the evaluation deadline)
       frame.i = idx;
       if (ctx.srcChanged.size || ctx.unknownVars.size) snaps[idx] = { changed: new Set(ctx.srcChanged), unknownV: new Set(ctx.unknownVars) }; // (what is true when this command runs: a later plain assignment must not clean it)
       opts._fsChanged = ctx.parentFsChanged || mayChangeListing(cmds, idx, ctx); // (a script or -c text this command runs sees the listing after the earlier commands)
@@ -3620,6 +3655,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // at the depth limit nothing is followed any further: a named script, a fed file or a startup file the line names is refused; the
     // implicit one (the real home's, which no word names) is judged here, once per evaluation like at the top level
     for (const c of cmds) {
+      checkDeadline(ctx.budget); // (the evaluation deadline)
       if (scriptFileOf(c.argv) || scriptFeedsOf(c).length || pmCall(c.argv)) return deny('scripts run scripts too deeply to check');
       for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup })) {
         if (!st.implicit) return deny('scripts run scripts too deeply to check');
@@ -3643,6 +3679,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // #58: running the owner-go recorder (any copy) by hand would write an owner "merge" the owner never typed. Only Claude Code runs it,
   // on the owner's prompt. Reading, diffing or committing the file stays allowed: only a runtime (or the file run by path) is refused.
   for (const c of cmds) {
+    checkDeadline(ctx.budget); // (the evaluation deadline)
     if (!c.argv.length) continue;
     const runs = RUNTIMES.has(baseOf(c.argv[0])) || OWNER_GO_RECORDER.test(toPosix(c.argv[0]));
     if (runs && c.argv.some((w) => /owner-go\.mjs/i.test(toPosix(expandRefs(w, ctx))))) {
@@ -3653,6 +3690,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // a path built from a name whose value is only known at run time (typeset -L4 D=...) may be anywhere: a writer or a redirection that uses it is refused
   if (ctx.unknownVars.size || snaps.some((x) => x?.unknownV.size)) {
     for (const [ci, c] of cmds.entries()) {
+      checkDeadline(ctx.budget); // (the evaluation deadline)
       const refs = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => ctx.unknownVars.has(x[1]) || snaps[ci]?.unknownV.has(x[1]));
       if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
         return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute, a loop word and another value on the line, or a binder such as `export $N=…` / `printf -v $N` / `${(P)N::=…}` whose name is only known at run time), so the file it reaches cannot be checked; write the path out');
@@ -3673,6 +3711,7 @@ function evaluateBashForFilesFrame(command, opts) {
     };
     const PATH_LISTS = new Set(['PATH', 'CDPATH', 'MANPATH', 'INFOPATH', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'NODE_PATH', 'PYTHONPATH']); // (search lists only: go writes under GOPATH)
     for (const [ci, c] of cmds.entries()) {
+      checkDeadline(ctx.budget); // (the evaluation deadline)
       const taint = taintFor(ci);
       const maybeChanged = (n) => taint.has(n) || newName(n);
       const changed = (w) => /\$\{!/.test(String(w)) || [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => maybeChanged(x[1])); // (`${!X}` names a variable by the value of X)
@@ -3700,6 +3739,7 @@ function evaluateBashForFilesFrame(command, opts) {
     let cdUps = 0;
     let writeUps = 0;
     for (const c of cmds) {
+      checkDeadline(ctx.budget); // (the evaluation deadline)
       for (const r of c.redirects ?? []) {
         if (!WRITE_OPS.has(r.op)) continue;
         writeUps = Math.max(writeUps, ...ups(r.target));
@@ -3743,6 +3783,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // every cd target, with ~ and variables expanded) and deny on a protected one. A symlink already pointing into
   // a protected root counts too.
   for (const c of cmds) {
+    checkDeadline(ctx.budget); // (the evaluation deadline)
     for (const r of c.redirects ?? []) {
       if (!WRITE_OPS.has(r.op) || typeof r.target !== 'string' || !r.target || FD_DUP.test(r.target) || r.target === '/dev/null') continue;
       // (a brace list is several targets: `> settings.{json,x}`; only `&N` / `&-` duplicate a descriptor, any other `&NAME` is the file NAME as well)
@@ -3759,6 +3800,7 @@ function evaluateBashForFilesFrame(command, opts) {
 
   // sed's `w FILE` (and the w flag of s) writes a file too, whatever the program word looks like
   for (const c of cmds) {
+    checkDeadline(ctx.budget); // (the evaluation deadline)
     if (!['sed', 'gsed'].includes(baseOf(c.argv[0] ?? ''))) continue;
     for (const target of sedWriteTargets(c.argv.slice(1))) {
       const e = expandRefs(target, ctx);

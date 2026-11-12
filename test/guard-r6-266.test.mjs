@@ -347,3 +347,81 @@ describe('post-push 3', () => {
     });
   }
 });
+
+// PR #288 round 1 (R1-B1, R1-F1, R1-F2, R1-F3): three more quadratic scans (a hook past the host's 15 s is ALLOWED, so the time is a security property), a multi-word value judged as one word,
+// and the class fix: the whole evaluation honours ONE wall-clock deadline (EVAL_DEADLINE_MS, a third of the hook timeout) and a line that outlasts it is denied.
+describe('#288 R1', () => {
+  const T = (label, line, extra = {}) => test(`timing: ${label} is denied in under 2 s`, () => {
+    const t0 = performance.now();
+    const r = run(line, extra);
+    const ms = performance.now() - t0;
+    assert.equal(r.decision, 'deny', `${r.decision}`);
+    assert.ok(ms < 2000, `took ${Math.round(ms)} ms`);
+  });
+  // R1-B1: SUBSCRIPT_FORM rescanned to the end of the word from every `[`
+  T('R1-B1 printf of 190000 [ then a write', `printf '%s' '${'['.repeat(190000)}'; echo x > ${S}`);
+  T('R1-B1 test with 190000 [ then a write', `test '${'['.repeat(190000)}'; echo x > ${S}`);
+  // R1-F1: LAST_WORD_RE's `${_` alternative backtracked on a repeated `${_:` with no `}`
+  T('R1-F1 ${_: repeated, then a write through cp', `echo '${(OB + '_:').repeat(47000)}'; cp /tmp/p ${S}`);
+  T('R1-F1 ${_: repeated in a redirect target', `echo x > ${OB}_:${(OB + '_:').repeat(47000)}`.replace('echo x', `cat ${S}; echo x`));
+  // R1-F2: toolEnvTouched's declare pattern ran from every keyword, once per isReadOnly call
+  T('R1-F2 long local-run line, many git status, then a write', `git status '${'local '.repeat(30000)}'; git status; git status; git status; echo x > ${S}`);
+  T('R1-F2 long export-run line, many git status, then a write', `git status '${'export '.repeat(30000)}'; git status; git status; git status; echo x > ${S}`);
+  T('R1-F2 many commands on a long local-run line', `${'git status; '.repeat(2000)}echo '${'local '.repeat(20000)}'; echo x > ${S}`);
+
+  // R1-F3: an expanded multi-word value is several words (bash splits it, zsh splits an array)
+  const F3 = [
+    ['find with -true -delete', `D='-true -delete'; find ${S} $D`],
+    ['find with -delete in a longer value', `D='-name x -delete'; find ${S} $D`],
+    ['openssl dgst -sha256 -out', `O='-sha256 -out'; openssl dgst $O ${S} /tmp/x`],
+    ['tree -a -o', `O='-a -o'; tree $O ${S}`],
+    ['sort -o', `O='-o /tmp/x'; sort $O ${S}`],
+    ['sed -i', `O='-i s/a/b/'; sed $O ${S}`],
+    ['zsh array: find', `D=(-true -delete); find ${S} $D`],
+    ['zsh array: tree', `O=(-a -o); tree $O ${S}`],
+    ['zsh array: openssl', `O=(-sha256 -out); openssl dgst $O ${S} /tmp/x`],
+    ['quoted use of a multi-word value', `D='-true -delete'; find ${S} "$D"`],
+  ];
+  for (const [label, line] of F3) {
+    test(`denies: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'deny', `${line} -> ${r.decision}`);
+    });
+  }
+  for (const [label, line] of [
+    ['a one-word option value', `D=-L; find ${S} $D`],
+    ['a multi-word value that is no option for a reader', `W='a b'; cat ${S} $W`],
+    ['a name value with a space for find -name', `N='x y'; find . -name "$N"`],
+  ]) {
+    test(`allows: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
+    });
+  }
+
+  // The class fix: one deadline, checked at the heads of the per-command loops and in isReadOnly / mayChangeListing / plantsInText / evaluatesSubscript.
+  const CHAIN = `${'git status; ls; cat data.txt; '.repeat(10)}echo done`;
+  test('deadline: a line whose checks run past the deadline is denied with the "took too long" reason', () => {
+    let t = 0;
+    const r = run(CHAIN, { now: () => (t += 1000) });
+    assert.equal(r.decision, 'deny', `${r.decision}: ${r.reason}`);
+    assert.match(r.reason, /took too long/);
+  });
+  test('deadline: the same line is allowed while the clock stands still', () => {
+    const r = run(CHAIN, { now: () => 0 });
+    assert.equal(r.decision, 'allow', `${r.decision}: ${r.reason}`);
+  });
+  test('deadline: the clock is read at every command, not just at the top', () => {
+    let n = 0;
+    run(CHAIN, { now: () => { n++; return 0; } });
+    assert.ok(n >= 30, `the clock was read ${n} times for 31 commands`);
+  });
+  test('deadline: a clock that runs out at any point never lets the line through after the read that saw it', () => {
+    for (const stop of [1, 2, 3, 5, 8, 13, 21, 34, 55, 89]) {
+      let n = 0;
+      let seen = false;
+      const r = run(CHAIN, { now: () => { n++; if (n > stop) { seen = true; return 1e9; } return 0; } });
+      if (seen) assert.equal(r.decision, 'deny', `stop ${stop}: ${r.decision}`);
+    }
+  });
+});
