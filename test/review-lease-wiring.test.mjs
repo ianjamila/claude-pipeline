@@ -37,7 +37,7 @@ function scratch(label = 'cp-lw') {
 
 const withFakePs = () => noClaudeSession();
 
-// One machine: a lease folder and a home, and the environment of a child CLI. `session: false` is a plain terminal (no session marker).
+// One machine: a lease folder and a home, and the environment of a child CLI. `session: false` is a plain terminal (no session marker): its commands take a process lease for the length of the command.
 function world({ session = true, extra = {} } = {}) {
   const root = scratch();
   const home = join(root, 'home');
@@ -203,12 +203,12 @@ test('an ended run closes the lease; a checkpoint of a run that goes on only ren
 
 // ---- no session, read-only commands, errors ------------------------------------------------------------------------------------------
 
-test('a plain terminal (no Claude Code session) writes no lease and its commands run as before; read-only commands take none either', () => {
+test('a plain terminal (no Claude Code session) takes a process lease only while its command runs (test/review-lease-terminal.test.mjs holds one open); read-only commands take none', () => {
   const plain = world({ session: false });
   const repo = reviewRepo();
   assertExit(P(plain, repo, ['state', 'show']), 0);
-  assert.deepEqual(leaseFiles(plain), []);
-  assert.equal(existsSync(plain.dir), false, 'not even the folder');
+  assert.deepEqual(leaseFiles(plain), [], 'the process lease was closed when the command ended');
+  assert.equal(existsSync(plain.dir), true, 'the folder was used (admission and the lease file)');
 
   const w = world();
   assertExit(P(w, repo, ['config']), 0);
