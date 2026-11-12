@@ -91,7 +91,7 @@ function failureOf(err) {
   return { exitCode: EXIT.USAGE, output: { ok: false, error: code, message } };
 }
 
-// ONE walk of the process tree per command. Finding the Claude Code ancestor costs one `ps` per hop (on Windows one PowerShell per hop, seconds each), and the
+// ONE walk of the process tree per command. Finding the Claude Code ancestor costs one `ps` per hop on POSIX (milliseconds) and one PowerShell process-table query per walk on Windows (1-3 s), and the
 // library asks for it at every step of a command: the early plain-terminal check, the take, the exit / signal close, the settle (and `job start`'s hand-off).
 // So the wiring answers it once, lazily, and every step reuses that answer through `ancestorPid` (null, "no Claude ancestor", is an answer too). An
 // `ancestorPid` the caller injected (the tests' seam) is left alone. The memo is published as `ctx.leaseAncestorPid` for the command's own run().
