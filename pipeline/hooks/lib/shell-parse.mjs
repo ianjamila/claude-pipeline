@@ -2233,13 +2233,15 @@ class Parser {
   //   raw   every physical line is compared with the delimiter as written (a quoted delimiter; the <<- tab strip is per line)
   //   bash  an UNQUOTED body: backslash-newline joins the lines, then <<- strips the tabs of the joined line (bash: make_here_document)
   //   zsh   as bash, but <<- strips the tabs of the FIRST physical line of a logical line before the join (zsh: gethere)
-  // Returns { end (just past the terminator line, or the end of the text), found, lines, odd, bodyEnd (where the terminator line starts) }.
+  // Returns { end (just past the terminator line, or the end of the text), found, lines, odd (a body line ends in a backslash), cr (a candidate terminator line is the delimiter plus a \r:
+  // the shell compares the line with the delimiter exactly, this parser tolerates the \r), bodyEnd (where the terminator line starts) }.
   hdReading(from, h, mode) {
     const s = this.src;
     const n = s.length;
     let pos = from;
     const lines = [];
     let odd = false;
+    let cr = false;
     while (pos < n) {
       const logicalAt = pos;
       const parts = [];
@@ -2263,46 +2265,40 @@ class Parser {
       }
       if (parts.length) { parts.push(line); line = parts.join(''); }
       if (h.strip && mode === 'bash') line = line.replace(/^\t+/, '');
-      if (line.replace(/\r$/, '') === h.delim) {
-        if (line.endsWith('\r')) odd = true; // (the shell does not end a body at `EOF\r`: the two disagree)
-        return { end: pos, found: true, lines, odd, bodyEnd: logicalAt };
-      }
+      if (line.endsWith('\r') && line.slice(0, -1) === h.delim) cr = true;
+      if (line.replace(/\r$/, '') === h.delim) return { end: pos, found: true, lines, odd, cr, bodyEnd: logicalAt };
       lines.push(line);
     }
-    return { end: n, found: false, lines, odd, bodyEnd: n };
+    return { end: n, found: false, lines, odd, cr, bodyEnd: n };
   }
 
   // this.i is at the start of the lines after a command line that opened heredocs: consume the bodies.
-  // R11: bash and zsh part over backslash-newline inside a body (the join, and where the <<- tab strip falls), so no single reading is safe. An UNQUOTED body that has a
-  // backslash-ended line is read every plausible way; the parse continues after the LATEST terminator, every reading's body is scanned for substitutions, and the lines
-  // between the earliest terminator and the latest are ALSO parsed as commands (as written): a command is seen whichever reading the shell takes.
+  // R12: bash and zsh part over backslash-newline inside an unquoted body (the join, and where the <<- tab strip falls), and over a \r on the terminator line or the delimiter. The body is read
+  // every plausible way (raw, bash, zsh); when the readings end it at different places, or a \r touches the delimiter or a terminator candidate, no single reading can be trusted for the
+  // commands that follow (they may be body in one reading and code in another, with quote state to match): the parse is UNDECIDABLE (ctx.undecidable, also truncated), which the git and
+  // files policies refuse. When the readings agree, their body texts are all scanned for substitutions.
   readHeredocs() {
     const s = this.src;
     let pos = this.i;
     for (const h of this.hd) {
       const bodyAt = pos;
       const rs = [this.hdReading(bodyAt, h, h.quoted ? 'raw' : 'bash')];
-      if (!h.quoted) {
-        if (rs[0].odd) {
-          this.ctx.hdOdd = true;
-          rs.push(this.hdReading(bodyAt, h, 'raw'));
-          if (h.strip) rs.push(this.hdReading(bodyAt, h, 'zsh'));
-        }
+      if (!h.quoted && rs[0].odd) {
+        this.ctx.hdOdd = true; // (R10-F1: a body with a backslash-ended line is never a plain sequence, whatever the readings say)
+        rs.push(this.hdReading(bodyAt, h, 'raw'));
+        if (h.strip) rs.push(this.hdReading(bodyAt, h, 'zsh'));
       }
-      const found = rs.filter((r) => r.found);
-      const last = rs.reduce((m, r) => (r.end > m.end ? r : m), rs[0]);
-      const agree = rs.every((r) => r.end === rs[0].end && r.found === rs[0].found);
-      const first = found.length ? found.reduce((m, r) => (r.end < m.end ? r : m), found[0]) : null;
+      const r0 = rs[0];
+      if (h.crDelim || rs.some((r) => r.cr || r.end !== r0.end || r.found !== r0.found)) { this.ctx.undecidable = true; this.ctx.truncated = true; }
       // the texts the command reads (one per distinct reading): `<<-` strips the tabs before the command reads the body (`bash <<-'EOF'` + `\tgit pu\` + `\tsh origin main`: one push the tabs hid)
       const byText = new Map(rs.map((r) => [r.lines.join('\n'), r.lines.length]));
       const texts = [...byText.keys()];
       for (const [text, lines] of byText) h.seg.heredocs.push({ text, quoted: h.quoted, lines });
-      // where the body sits in the line (see heredocSpans in simpleCommands): only for a body this parser read out of the line itself that every reading ended at the same
-      // terminator; one read out of another text (backticks, bash -c, a body's own substitution), that ran to the end or that the readings part over is not located.
-      // The span covers the raw body as written (tabs included), not the stripped text
-      if (agree && rs[0].found && this.src === this.ctx.rootSrc) this.ctx.hdSpans.push([bodyAt, bodyAt + Math.max(0, rs[0].bodyEnd - bodyAt - 1), h.quoted]);
+      // where the body sits in the line (see heredocSpans in simpleCommands): only for a body this parser read out of the line itself and found a terminator for; one read out of
+      // another text (backticks, bash -c, a body's own substitution) or that ran to the end is not located. The span covers the raw body as written (tabs included), not the stripped text
+      if (r0.found && this.src === this.ctx.rootSrc) this.ctx.hdSpans.push([bodyAt, bodyAt + Math.max(0, r0.bodyEnd - bodyAt - 1), h.quoted]);
       else this.ctx.hdForeign = true;
-      pos = last.end;
+      pos = r0.end;
       h.seg.pending--;
       if (h.seg.muted) continue;
       const grp = this.ctx.grp;
@@ -2310,10 +2306,8 @@ class Parser {
       try {
         // An unquoted heredoc still expands $(...) and backticks, so a body can run commands (whatever the text around them: a `#` or single quotes are plain body text). Quoted ones are inert data.
         if (!h.quoted) for (const text of texts) this.scanExpansions(text, h.seg.depth);
-        // The lines the readings part over (after the earliest terminator, up to the latest) are commands under another reading. No terminator at all: either a malformed
-        // command or a `<<` we mistook for a heredoc that then swallowed the rest of the line: the body, as written, is parsed as script (a false positive at worst, never a miss).
-        const from = first ? first.end : bodyAt;
-        if (from < last.end) this.subParse(s.slice(from, last.end), h.seg.depth + 1);
+        // No terminator at all: either a malformed command or a `<<` we mistook for a heredoc that then swallowed the rest of the line: the body, as written, is parsed as script (a false positive at worst, never a miss).
+        if (!r0.found && bodyAt < r0.end) this.subParse(s.slice(bodyAt, r0.end), h.seg.depth + 1);
       } finally { this.ctx.grp = grp; }
     }
     this.hd = [];
@@ -2453,7 +2447,7 @@ class Parser {
         seg.pending++;
         // (the parser and the shell must end the body at the same line: a delimiter is trusted only when it is plain text and its spelling is that text with some quotes / backslashes added; anything else is odd)
         if (!/^[A-Za-z0-9_.-]+$/.test(text) || s.slice(from, Math.min(this.i, n)).replace(/['"\\]/g, '') !== text) ctx.hdOdd = true;
-        this.hd.push({ delim: text, strip, quoted: q >= 0, seg });
+        this.hd.push({ delim: text, strip, quoted: q >= 0, seg, crDelim: s[Math.min(this.i, n)] === '\r' }); // (a \r right after the delimiter word: the shell's delimiter ends in \r, this parser's does not)
         return;
       }
       let win;
@@ -3326,7 +3320,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, ansiC: false, notPlain: false, hdOdd: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, ansiC: false, notPlain: false, hdOdd: false, undecidable: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -3343,6 +3337,9 @@ function withoutComments(src, maxDepth, expired) {
   for (const [a, b] of p.comments) { out += src.slice(at, a) + ' '.repeat(b - a); at = b; }
   return out + src.slice(at);
 }
+
+// The reason a policy gives for a line whose parse is undecidable (see readHeredocs)
+export const UNDECIDABLE_HEREDOC = 'the line has a heredoc whose end the shells read differently (a backslash-newline or a carriage return in its body or delimiter), so it cannot be said what is body text and what is a command. Rewrite it with a plain delimiter and no trailing backslash or carriage return in the body (or write the text to a file first).';
 
 export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
@@ -3366,6 +3363,8 @@ export function simpleCommands(str, opts) {
     try { parser?.drain(true); } catch { /* best effort */ }
   }
   Object.defineProperty(ctx.out, 'truncated', { value: ctx.truncated, enumerable: false });
+  // undecidable: a heredoc whose end the shells read differently (see readHeredocs); truncated is set with it, so a caller that refuses a cut-short parse refuses this one too, and one that wants the cause can ask
+  Object.defineProperty(ctx.out, 'undecidable', { value: ctx.undecidable, enumerable: false });
   Object.defineProperty(ctx.out, 'dynamic', { value: ctx.dynamic || ctx.dynamicHead, enumerable: false });
   // dynamicOther: dynamic for a reason other than a command word that starts with `$` or holds a substitution (#81 t8: such a head is resolved per reading by the git policy's onceAssignedNames;
   // a stdin feed of that command, a process substitution, an unknown descriptor ... still count here)

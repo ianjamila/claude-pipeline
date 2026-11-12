@@ -22,7 +22,7 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
@@ -3702,6 +3702,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const cmds = simpleCommands(raw, { env: opts.env ?? process.env, bashState: opts._bashState, expired: () => opts._budget.now() > opts._budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
+  if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
   ctx.heredocPlants = /<</.test(raw) && plantsInText(raw); // (R5-F3: a heredoc body is on no command; the line's text is judged for an assigning expansion, a quoted body included)
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
