@@ -176,7 +176,7 @@ working exactly as before.
     `proc-<pid>-…` file that is removed when the command ends, fails, is interrupted (Ctrl-C) or is terminated. Such a lease counts as dead only when the process is
     proven gone (`ps` shows no such pid, or another process started under it, or the pid no longer exists); if that cannot be checked (no `ps`, a lease from
     another machine) it counts as live, never as "old", so a stuck one needs you: the 24-hour message names the file to delete once you know no pipeline command is running
-    in a terminal, or points at `pipeline leases` (read only: lists what is live, unreadable and, with `--all`, dead). A command typed in a terminal while an update is
+    in a terminal, or points at the `leases` command (read only: lists what is live, unreadable and, with `--all`, dead). A command typed in a terminal while an update is
     swapping waits up to 20 seconds, then stops with "retry in a minute"; one that started across the swap stops with `updated-while-starting`; a read-only home stops
     leased commands with `review-lease-unwritable`. Rolling back to an older pipeline makes these files unreadable to it, which counts as live (it waits until the
     command ends or you delete the file). Programs a command started (Codex, a verify step) are not tracked: they load nothing from the install;

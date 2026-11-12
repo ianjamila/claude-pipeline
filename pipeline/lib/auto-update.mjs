@@ -72,6 +72,13 @@ export function ownerCommand(home, userHome = os.homedir()) {
   return `node ${shQuote(path.join(home, 'pipeline', 'bin', 'pipeline.mjs'))} update --claude-home ${shQuote(home)}`;
 }
 
+// `leases` the same way: a standard install has no `pipeline` executable, so the owner gets the node command of the configured install dir.
+// `leases` reads the lease folder of the machine, so it takes no --claude-home.
+export function leasesCommand(home, userHome = os.homedir()) {
+  if (samePath(home, path.join(userHome, '.claude'))) return 'node ~/.claude/pipeline/bin/pipeline.mjs leases';
+  return `node ${shQuote(path.join(home, 'pipeline', 'bin', 'pipeline.mjs'))} leases`;
+}
+
 function readJson(file) {
   try {
     const j = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -138,12 +145,23 @@ const scanDetail = (by) => {
 // The hints of what is live, each once, in order. describeLive never prints them: the notice adds them to its action (below).
 export const hintsOf = (by) => [...new Set(by.map((b) => b.hint).filter((h) => typeof h === 'string' && h))];
 
+// Where the notice sends the owner for the hints: `leases` lists review leases only (not unreadable JOB records, merge locks ...), so it is offered only when EVERY
+// hint comes from a lease entry (a live lease or one that could not be judged). Any other hint leads to the status file, which lists all of them.
+// -> { pointer, fallbacks }: fallbacks are the shortest wordings, tried in order when the pointer does not fit; the last one always holds the status file path.
+const LEASE_KINDS = new Set(['lease', 'scan-error']);
+export function recoveryPointer(by, { leases, statusPath }) {
+  const leasesOnly = by.filter((b) => typeof b.hint === 'string' && b.hint).every((b) => LEASE_KINDS.has(b.kind));
+  if (!leasesOnly) return { pointer: `see ${statusPath}`, fallbacks: [] };
+  return { pointer: `run: ${leases} (or see ${statusPath})`, fallbacks: [`run: ${leases}`, `see ${statusPath}`] };
+}
+
 // A notice for the owner, composed by budget (R4-1): `head` and the ACTION are reserved first, the CAUSE gets what is left of BANNER_MAX (cut with an ellipsis, never inside the
 // action, so an instruction is never half a path). -> { text, banner }: `text` (stderr and the notices log) is whole, with every hint; `banner` is the budgeted display text.
 //   action     = { plain }                                           the wording when there is nothing to point at
-//              | { lead, hintLead, hints, tail, pointer }            no hints: `<lead>, or <tail>`. Hints: the first of these that leaves MIN_CAUSE of cause room:
+//              | { lead, hintLead, hints, tail, pointer, fallbacks }  no hints: `<lead>, or <tail>`. Hints: the first of these that leaves MIN_CAUSE of cause room:
 //                                                                    `<hintLead><every hint>. Or <tail>`, `<hintLead><every hint>.`, `<hintLead><pointer>. Or <tail>`, `<hintLead><pointer>.`
-//                                                                    (the tail and the pointer's path are always in the log line); with no room even for that, the pointer without its path.
+//                                                                    (the tail and the pointer's path are always in the log line); with no room even for that, the first of `fallbacks`
+//                                                                    (shorter pointers, see recoveryPointer) that fits at all, else the last one.
 const MIN_CAUSE = 40;
 export function composeNotice({ head: head0, cause: cause0, action }) {
   const head = flat(head0);
@@ -152,12 +170,13 @@ export function composeNotice({ head: head0, cause: cause0, action }) {
   const cut = (room) => (cause.length <= room ? cause : room >= 2 ? `${cause.slice(0, room - 1).trimEnd()}…` : '');
   const fit = (a) => join(cut(BANNER_MAX - head.length - 3 - a.length), a);
   if (action.plain !== undefined) return { text: join(cause, action.plain), banner: fit(action.plain) };
-  const { lead, hintLead, hints, tail, pointer } = action;
+  const { lead, hintLead, hints, tail, pointer, fallbacks = [] } = action;
   if (!hints.length) return { text: join(cause, `${lead}, or ${tail}`), banner: fit(`${lead}, or ${tail}`) };
   const roomy = (a) => head.length + 3 + MIN_CAUSE + a.length <= BANNER_MAX;
   const all = hints.join('; ');
   const tiers = [`${hintLead}${all}. Or ${tail}`, `${hintLead}${all}.`, `${hintLead}${pointer}. Or ${tail}`, `${hintLead}${pointer}.`];
-  const shown = tiers.find(roomy) ?? (head.length + 3 + tiers[3].length <= BANNER_MAX ? tiers[3] : `${hintLead}run: pipeline leases.`);
+  const bare = [tiers[3], ...fallbacks.map((f) => `${hintLead}${f}.`)];
+  const shown = tiers.find(roomy) ?? bare.find((a) => head.length + 3 + a.length <= BANNER_MAX) ?? bare.at(-1);
   return { text: join(cause, tiers[0]), banner: fit(shown) };
 }
 
@@ -346,10 +365,10 @@ export async function runScheduled({ home, env, ctx = {}, say = () => {}, deps }
         try {
           const waiting = `pipeline update to ${sha7(sha)} has been waiting more than 24 hours`;
           const hints = hintsOf(by);
-          const pointer = `run: pipeline leases (or see ${statusPath})`;
+          const { pointer, fallbacks } = recoveryPointer(by, { leases: leasesCommand(home), statusPath });
           const tail = `run in your own terminal: ${command}`;
-          const n = unchecked ? composeNotice({ head: `${waiting}: could not check for running reviews:`, cause: scanDetail(by), action: { lead: 'Fix that', hintLead: 'Fix that: ', hints, tail, pointer } })
-            : dreason === 'live' ? composeNotice({ head: `${waiting} for live reviews:`, cause, action: { lead: 'Finish or close them', hintLead: 'Finish or close them; ', hints, tail, pointer } })
+          const n = unchecked ? composeNotice({ head: `${waiting}: could not check for running reviews:`, cause: scanDetail(by), action: { lead: 'Fix that', hintLead: 'Fix that: ', hints, tail, pointer, fallbacks } })
+            : dreason === 'live' ? composeNotice({ head: `${waiting} for live reviews:`, cause, action: { lead: 'Finish or close them', hintLead: 'Finish or close them; ', hints, tail, pointer, fallbacks } })
             : composeNotice({ head: `pipeline update to ${sha7(sha)} has been deferred for more than 24 hours (${dreason}):`, cause, action: { plain: `Run in your own terminal: ${command}` } });
           await notifier(n.text, { banner: n.banner });
           state = { ...state, deferNotified: since };

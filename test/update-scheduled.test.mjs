@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { run as update, meta } from '../pipeline/commands/update.mjs';
 import { emit } from '../pipeline/lib/cli.mjs';
 import {
-  DEFER_NOTICE_MS, STATE_FILE, STATUS_FILE, TRANSIENT_RUNS, composeNotice, describeLive, normalizeLive, ownerCommand, pipelineStateDir,
+  DEFER_NOTICE_MS, STATE_FILE, STATUS_FILE, TRANSIENT_RUNS, composeNotice, describeLive, leasesCommand, normalizeLive, ownerCommand, pipelineStateDir,
 } from '../pipeline/lib/auto-update.mjs';
 import { scanLiveWork } from '../pipeline/lib/live-work-scan.mjs';
 import { BANNER_MAX, defaultNotify } from '../pipeline/lib/queue-sweep.mjs';
@@ -796,9 +796,9 @@ function recordingNotify(dir) {
 }
 const deferredWith = (live) => ({ exitCode: 1, output: { ok: false, error: 'deferred', deferred: true, live, message: 'a review is live' } });
 // Two runs a day apart, with the default account (the owner's command is the short `node ~/.claude/pipeline/bin/pipeline.mjs update`); -> the rig.
-async function dayLater(live, extra = {}) {
+async function dayLater(live, extra = {}, installHome = join(homedir(), '.claude')) {
   const t = rig({ install: deferredWith(live) });
-  const go = () => update(['--scheduled', '--json', '--claude-home', join(homedir(), '.claude')], { env: {}, hasClaudeCodeAncestor: () => false, auto: { ...t.auto, ...extra } });
+  const go = () => update(['--scheduled', '--json', '--claude-home', installHome], { env: {}, hasClaudeCodeAncestor: () => false, auto: { ...t.auto, ...extra } });
   await go();
   t.w.clock = T0 + DEFER_NOTICE_MS + 60 * 1000;
   await go();
@@ -838,13 +838,14 @@ test('R4-1: an uncertain process lease with a real lease path in a long worktree
   const hint = `delete ${lease.file} if no pipeline command is running in a terminal`;
   assert.equal(live[0].hint, hint);
   const rec = recordingNotify(dir);
-  const statusFile = join(dir, 'update-status.json'); // a short path: the pointer carries it whole
+  const statusFile = join(dir, 'update-status.json');
   const t = await dayLater(live, { notify: rec.notify, statusFile });
-  const pointer = `run: pipeline leases (or see ${statusFile})`;
+  // the runnable command is longer than the old bare word: with a head and a status path this long the banner keeps the command (never a cut path)
   const banner = bannerOf(rec.seen.spawned);
   assert.ok(banner.length <= BANNER_MAX, `${banner.length}: ${banner}`);
-  assert.ok(banner.includes(pointer), banner);
-  assert.ok(!banner.includes('proc-4242') && !banner.includes('review-leases'), `no part of the lease path in the banner: ${banner}`);
+  assert.ok(banner.endsWith(`Fix that: run: ${leasesCommand(join(homedir(), '.claude'))}.`), banner);
+  // the cause may now name the session (it gets the room the shorter status path used to take); the delete hint's file path is still never in the banner, whole or cut
+  assert.ok(!banner.includes('delete ') && !banner.includes('review-leases') && !banner.includes('proc-4242-0123abcd.json'), `no part of the lease path in the banner: ${banner}`);
   assert.ok(banner.includes('could not check for running reviews'), banner);
   assert.ok(rec.seen.stderr.includes(hint), 'stderr carries the whole hint');
   assert.ok(rec.log().includes(hint), 'the notices log carries the whole hint');
@@ -914,7 +915,7 @@ test('R4-1: composeNotice reserves head + action, gives the cause the rest, and 
   const cause = 'c'.repeat(400);
   const small = 'remove .review/jobs/x in that worktree if it is stale';
   const big = `delete /${'h'.repeat(140)} if no pipeline command is running in a terminal`;
-  const ptr = (n) => `run: pipeline leases (or see /${'p'.repeat(n)}/s.json)`;
+  const ptr = (n) => `run: node ~/p leases (or see /${'p'.repeat(n)}/s.json)`;
   const run = (hint, pointer, h = head) => {
     const n = composeNotice({ head: h, cause, action: action(hint, pointer) });
     assert.ok(n.banner.length <= BANNER_MAX, `${n.banner.length}`);
@@ -931,7 +932,80 @@ test('R4-1: composeNotice reserves head + action, gives the cause the rest, and 
   assert.ok(t3.endsWith(`${ptr(0)}. Or ${tail}`) && !t3.includes('hhh'), `pointer + tail: ${t3}`);
   const t4 = run(big, ptr(80));
   assert.ok(t4.endsWith(`${ptr(80)}.`) && !t4.includes('Or run in your own'), `the whole pointer: ${t4}`);
-  const t5 = run(big, ptr(300));
-  assert.ok(t5.endsWith('Finish or close them; run: pipeline leases.') && !t5.includes('ppp'), `no cut path: ${t5}`);
+  const t5 = composeNotice({ head, cause, action: { ...action(big, ptr(300)), fallbacks: ['run: node ~/p leases', 'see /s.json'] } }).banner;
+  assert.ok(t5.length <= BANNER_MAX && t5.endsWith('Finish or close them; run: node ~/p leases.') && !t5.includes('ppp'), `no cut path: ${t5}`);
   assert.ok([t2, t3, t4, t5].every((b) => b.includes('…')), 'the cause is cut with an ellipsis');
+});
+
+// ---- R1-B1 / R1-F1: the banner's recovery pointer runs on a standard install, and only leads to `leases` when every hint is a lease ----------------------------------
+
+const oddHome = '/opt/my pipe'; // a configured install dir, short enough for the command to fit
+const longJob = 'j'.repeat(150); // a job hint of ~200 characters: too long for the hint tiers, so the banner falls to the pointer
+const longWorktree = (dir) => join(dir, 'Claude', 'some-project', '.worktrees', 'agent-a-rather-long-worktree-name-for-this-task-xx-and-some-more-to-be-sure');
+
+test('R1-B1: leasesCommand spells the full node command like ownerCommand: the default home as ~/.claude, another install dir quoted (there is no bare `pipeline` executable)', () => {
+  const user = '/Users/x';
+  assert.equal(leasesCommand(join(user, '.claude'), user), 'node ~/.claude/pipeline/bin/pipeline.mjs leases');
+  assert.equal(leasesCommand("/opt/my 'pipe'/c", user), "node '/opt/my '\\''pipe'\\''/c/pipeline/bin/pipeline.mjs' leases");
+});
+
+test('R1-B1: the 24 h banner for an uncertain lease points at the full node command of the CONFIGURED install dir and still fits BANNER_MAX', async () => {
+  const dir = scratch();
+  const lease = await uncertainLease(dir, longWorktree(dir));
+  const rec = recordingNotify(dir);
+  const statusFile = join(dir, 'update-status.json');
+  const home = oddHome;
+  await dayLater(lease.scan(), { notify: rec.notify, statusFile }, home);
+  const banner = bannerOf(rec.seen.spawned);
+  assert.ok(banner.length <= BANNER_MAX, `${banner.length}: ${banner}`);
+  assert.equal(leasesCommand(home), "node '/opt/my pipe/pipeline/bin/pipeline.mjs' leases");
+  assert.ok(banner.endsWith("Fix that: run: node '/opt/my pipe/pipeline/bin/pipeline.mjs' leases."), banner);
+  assert.doesNotMatch(banner, /run: pipeline leases/);
+});
+
+test('R1-B1: the shortest fallbacks keep a runnable command, then the status file path, inside BANNER_MAX', () => {
+  const head = 'pipeline update to aaaaaaa has been waiting more than 24 hours for live reviews:';
+  const cmd = leasesCommand('/Users/x/.claude', '/Users/x');
+  const hint = `delete /${'h'.repeat(140)} if no pipeline command is running in a terminal`;
+  const status = '/Users/x/.claude/pipeline-state/update-status.json';
+  const base = { lead: 'Finish or close them', hintLead: 'Finish or close them; ', hints: [hint], tail: `run in your own terminal: ${cmd}` };
+  // the pointer (command + a long status path) does not fit; the command alone does
+  const long = composeNotice({ head, cause: 'c'.repeat(300), action: { ...base, pointer: `run: ${cmd} (or see /${'p'.repeat(200)}.json)`, fallbacks: [`run: ${cmd}`, `see ${status}`] } });
+  assert.ok(long.banner.length <= BANNER_MAX && long.banner.endsWith(`Finish or close them; run: ${cmd}.`), long.banner);
+  assert.ok(!/ppp/.test(long.banner), 'no cut path');
+  // a command too long for the budget (a long install dir): the status file path is the last fallback
+  const hugeCmd = `node '/${'d'.repeat(180)}/pipeline/bin/pipeline.mjs' leases`;
+  const last = composeNotice({ head, cause: 'c'.repeat(300), action: { ...base, pointer: `run: ${hugeCmd} (or see ${status})`, fallbacks: [`run: ${hugeCmd}`, `see ${status}`] } });
+  assert.ok(last.banner.length <= BANNER_MAX && last.banner.endsWith(`Finish or close them; see ${status}.`), last.banner);
+  assert.ok(last.text.includes('c'.repeat(300)) && last.text.includes(hint), 'the log text stays whole');
+});
+
+test('R1-F1: an unreadable JOB record is not a lease: the banner points at the status file, not at `leases`; the log keeps the whole hint', async () => {
+  const dir = scratch();
+  const live = scanOf(dir, [brokenJobRepo(dir, 'wt', longJob)]);
+  assert.equal(live[0].kind, 'job', JSON.stringify(live));
+  const rec = recordingNotify(dir);
+  const statusFile = join(dir, 'update-status.json');
+  await dayLater(live, { notify: rec.notify, statusFile });
+  const banner = bannerOf(rec.seen.spawned);
+  assert.ok(banner.length <= BANNER_MAX, `${banner.length}: ${banner}`);
+  assert.ok(banner.includes(`see ${statusFile}`), banner);
+  assert.doesNotMatch(banner, /leases/);
+  assert.ok(rec.seen.stderr.includes(hintOf(longJob)) && rec.log().includes(hintOf(longJob)), 'the whole hint is in the log');
+});
+
+test('R1-F1: a job hint and a lease hint together: the pointer leads with the status file and `leases` is not offered for the lot', async () => {
+  const dir = scratch();
+  const lease = await uncertainLease(dir, longWorktree(dir));
+  const base = { env: LEASE_ENV(dir), home: join(dir, 'home'), ancestorPid: null, now: Date.now(), kill: () => {}, jobLive: () => false, starts: () => null };
+  const live = scanOf(dir, [brokenJobRepo(dir, 'wt', longJob)], base);
+  assert.deepEqual([...new Set(live.map((e) => e.kind))].sort(), ['job', 'scan-error'], JSON.stringify(live));
+  const rec = recordingNotify(dir);
+  const statusFile = join(dir, 'update-status.json');
+  await dayLater(live, { notify: rec.notify, statusFile });
+  const banner = bannerOf(rec.seen.spawned);
+  assert.ok(banner.length <= BANNER_MAX, `${banner.length}: ${banner}`);
+  assert.ok(banner.includes(`see ${statusFile}`), banner);
+  assert.doesNotMatch(banner, /run: .*leases/);
+  assert.ok(rec.seen.stderr.includes(lease.file) && rec.seen.stderr.includes(hintOf(longJob)), 'the log has both hints');
 });
