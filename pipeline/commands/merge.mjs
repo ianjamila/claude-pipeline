@@ -18,10 +18,11 @@ import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { loadState } from '../lib/state.mjs';
+import { substituteInventory } from '../lib/triage.mjs';
 import { approvalConfigDirHint, approvalGap, areasBlock, holdBlock, holdDigest, readyLine } from '../hooks/lib/owner-go.mjs';
 import { RESTORE_NOTE, findOrphanedLift, holdTiming, mergeInProgress, parkNoteOf, readEligibleHold, recoverOrphanedLift, withHoldLifted, withMergeLock } from '../lib/hold.mjs';
 import {
-  GATE_FILE, PR_FIELDS, READABLE_MERGE_STATES, abandonMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, preMergeProblems, readReviewJson,
+  GATE_FILE, PR_FIELDS, READABLE_MERGE_STATES, abandonMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, substituteRouteProblem, preMergeProblems, readReviewJson,
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
 import { classifyMergeCommand, commandTail } from '../lib/merge-cleanup.mjs';
@@ -160,6 +161,9 @@ export const run = guarded(async (argv, ctx) => {
       gate, pr, head, prHead: gh.prView(pr, [...PR_FIELDS]).headRefOid, hash, repo: gh.repo().slug,
     });
     if (refusals.length > 0) return refuse('gate', refusals);
+    // A PR a Claude stand-in reviewed never merges on this route (owner-go only; label mode: by hand), whatever approval flags are passed.
+    const substituteRefusal = substituteRouteProblem({ root, config, pr, route: 'gated' });
+    if (substituteRefusal !== null) return refuse(substituteRefusal.error, [substituteRefusal.reason], { reason: substituteRefusal.reason });
 
     // Queue mode: GitHub is asked first. A merged / queued PR is reported or watched without gating again (nothing here can enqueue),
     // a PR whose record already ended needs a fresh owner "merge" (pre.since), and a removed one is re-queued by the normal flow below.
@@ -458,6 +462,8 @@ async function ownerGoMerge({ root, config, pr, gh, ctx, track }) {
     const reason = hostProblem(gh);
     return refuse('owner-go', [reason], { reason, head });
   }
+  const substituteRefusal = substituteRouteProblem({ root, config, pr, route: 'owner-go' });
+  if (substituteRefusal !== null) return refuse(substituteRefusal.error, [substituteRefusal.reason], { reason: substituteRefusal.reason, head });
   // Queue mode (GitHub requires a merge queue on the base): read live, once, after the locks; unreadable = refused, never a direct merge.
   const queue = readQueueMode({ gh, pr });
   if (queue.refusal) return queue.refusal;
@@ -732,9 +738,23 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     }
   }
 
+  // A PR a Claude stand-in reviewed (finalgate.mjs#substituteRouteProblem): the gated route cannot merge it (its blocker says to ask with --owner-go) and label mode never does; the
+  // --owner-go request carries the `substitute` area and, below, a plain-language summary of the substitute reviews for the owner.
+  const substituteProblem = substituteRouteProblem({ root, config, pr, route: ownerGo ? 'owner-go' : 'gated' });
+  if (substituteProblem !== null) add(substituteProblem.error, substituteProblem.reason);
+  let substituteNote = null;
+  if (ownerGo) {
+    try {
+      const inventory = substituteInventory(loadState(root, { cleanup: false }) ?? {});
+      if (inventory.length > 0) substituteNote = inventory;
+    } catch { /* an unreadable review state fails the review-complete check on its own */ }
+  }
+
   let ownerStep = null;
   if (crashed) {
     // No owner step: the crashed scan is a blocker to fix first, not a merge to hand over.
+  } else if (substituteProblem !== null && !ownerGo) {
+    // No owner step on the gated route: the blocker names the route that can ask for it.
   } else if (ownerRuns) {
     try {
       ownerStep = { kind: 'owner-runs', command: fill(config.merge.command, { pr: String(pr), sha: head }, { strict: true }) };
@@ -755,6 +775,8 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
       // The block the owner must be shown above the Areas / Hold / Head lines (E11): only when something was dismissed, so an ordinary PR's output is unchanged.
       if (ownerGo && live.rulingCount > 0) ownerStep = { ...ownerStep, rulings: parts.rulings, rulingCount: live.rulingCount };
       if (ownerGo && live.areas.length > 0) ownerStep = { ...ownerStep, areas: parts.areas, areaIds: live.areas };
+      // The substitute reviews behind the `substitute` area: [{ round | item, agent, evidence, models }], for the reply that explains them above the closing block (no Rulings row: the hook binds only R<n>-<x><n> rows).
+      if (substituteNote !== null) ownerStep = { ...ownerStep, substitute: substituteNote };
       // The hold the merge would lift (Rev-4 1, 2, 6): from the timeline EVENT (its id, the login that placed it, when) — never described as the owner's or the agent's.
       // `hold` is the block to print right above the Head line, `ready` the 🔀 line to end with; `parkNote` the agent-written park comment, only when it is at least as new as the hold.
       if (hold !== null) {

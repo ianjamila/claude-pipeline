@@ -16,9 +16,9 @@ import { behindFreshEnough, lazyDiff } from '../lib/finalgate.mjs';
 import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, reviewLane } from '../lib/risk.mjs';
-import { loadState } from '../lib/state.mjs';
+import { isSubstituteRound, loadState } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
-import { fableBypassNote, fableBypassRounds, reviewEligibilityProblems, reviewValidFor, roundOutcome, rulingsDigest, staleFableReason, staleFableRounds } from '../lib/triage.mjs';
+import { fableBypassNote, fableBypassRounds, reviewEligibilityProblems, reviewValidFor, roundOutcome, rulingsDigest, staleFableReason, staleFableRounds, substituteDigest, substituteRefusal, substituteSummary } from '../lib/triage.mjs';
 import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
@@ -96,24 +96,37 @@ export const fableProofs = (state) => (state?.rounds ?? [])
 
 export function reviewRecord(state, { contentHash, base, head, modelProofs, defaultCodexModel }) {
   const rulings = rulingsDigest(state);
-  const last = state.rounds.at(-1);
+  const substitute = substituteSummary(state);
+  // The newest round Codex itself reviewed: its model is the marker's codexModel. A PR whose rounds were ALL reviewed by a substitute has none: the field then says so
+  // (`none-substitute:<model>`, still a non-empty string for an older parser) instead of naming a Codex model that never ran. Mixed history: the newest Codex round's model, plus `substitute`.
+  const last = substitute === null ? state.rounds.at(-1) : state.rounds.findLast((r) => !isSubstituteRound(r) && typeof r?.codexModel === 'string' && r.codexModel !== '');
   return {
     contentHash,
     base,
     head,
     rounds: state.rounds.length,
-    codexModel: typeof last?.codexModel === 'string' && last.codexModel !== '' ? last.codexModel : defaultCodexModel,
+    codexModel: typeof last?.codexModel === 'string' && last.codexModel !== '' ? last.codexModel : substitute === null ? defaultCodexModel : `none-substitute:${substitute.models[0] ?? substitute.agents[0]}`,
     modelProofDigest: modelProofs.length > 0 ? createHash('sha256').update(JSON.stringify(modelProofs)).digest('hex') : null,
     // The review state this marker vouches for (the one just published): the owner-go check refuses a state republished after it.
     stateHash: reviewContentHash(state),
     // Only when there are rulings, so the marker of an ordinary review is byte-identical to what it always was.
     ...(rulings === 'none' ? {} : { rulingsDigest: rulings }),
+    // Only when a substitute reviewed (triage.mjs#substituteInventory): the final gate compares the digest with the live inventory.
+    ...(substitute === null ? {} : { substitute, substituteDigest: substituteDigest(state) }),
   };
 }
 
 // docsExempt ({ files, reviewedHead }, lib/docs-exempt.mjs): the head is past the last reviewed one only by lines added to listed documents.
 // The record is unchanged (the guards read the same JSON); the extra line is for the people reading the PR.
 // fableNote (triage.mjs#fableBypassNote): a Fable round counts as current only because of an owner allowance or hold; the line sits outside the JSON record.
+// "Codex <model>" for an ordinary review; with a substitute: "Codex <model>, substitute review of round(s) 2-3 by substitute-opus (Claude ...)" or, when no Codex round ran, "no Codex round, substitute review ...".
+const reviewerWords = (record) => {
+  const sub = record.substitute;
+  if (!sub) return `Codex \`${record.codexModel}\``;
+  const rounds = sub.rounds.length > 0 ? ` of round(s) ${sub.rounds.join(', ')}` : '';
+  const who = `substitute review${rounds} by ${sub.agents.join(', ')} (Claude ${sub.models.join(', ') || 'model unrecorded'}) while Codex was out of quota`;
+  return record.codexModel.startsWith('none-substitute:') ? `no Codex round, ${who}` : `Codex \`${record.codexModel}\` and ${who}`;
+};
 export function reviewCompleteBody(record, docsExempt = null, fableNote = null) {
   const fable = record.modelProofDigest ? `, Fable proof \`${record.modelProofDigest.slice(0, 8)}\`` : '';
   const docs = docsExempt
@@ -121,7 +134,7 @@ export function reviewCompleteBody(record, docsExempt = null, fableNote = null) 
     : [];
   return [
     REVIEW_COMPLETE_MARKER,
-    `**Cross-model review complete** for \`${record.head.slice(0, 12)}\`: ${record.rounds} round(s), Codex \`${record.codexModel}\`${fable}.`,
+    `**Cross-model review complete** for \`${record.head.slice(0, 12)}\`: ${record.rounds} round(s), ${reviewerWords(record)}${fable}.`,
     ...docs,
     ...(fableNote ? [`**Standing Fable bypass:** ${fableNote}.`] : []),
     '',
@@ -242,6 +255,9 @@ export const run = guarded(async (argv, ctx) => {
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
       const lane = laneProblem(state, root, config, base);
       if (lane) return { exitCode: EXIT.FAILED, output: { ok: false, reason: lane, currentContentHash: hash } };
+      // A Claude stand-in reviewed instead of Codex (plan 2026-11-11-codex-substitute-reviewer): a high-risk PR it covered with Opus alone, or a substitute round whose proof does not hold, is refused.
+      const subRefusal = substituteRefusal(state, gate);
+      if (subRefusal) return { exitCode: EXIT.FAILED, output: { ok: false, reason: subRefusal.reason, error: subRefusal.error, currentContentHash: hash } };
       // Items that read as resolved but are not yet: a Claude-ruled follow-up with no issue, a fix made outside the file the finding names that no
       // later round confirmed (triage.mjs#reviewEligibilityProblems).
       const eligibility = reviewEligibilityProblems(state);
