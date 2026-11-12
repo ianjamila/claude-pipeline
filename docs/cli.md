@@ -680,6 +680,22 @@ pipeline state set-outcome --outcome TEXT [--repo DIR]
 
 Exit: 0 · 2 no state / usage (`outcome` is 0 whether or not `clean`).
 
+## stats
+
+review rounds of merged PRs: how many went past the limit, what they found and cost.
+
+```
+pipeline stats rounds [--repo-slug owner/name]... [--since YYYY-MM-DD] [--pr N]... [--json] [--repo DIR]
+  -> {ok, since, repos, totals, prs, warnings}: for the PRs merged since the date (default 7 days ago) in each --repo-slug (default: the repository gh resolves from the current directory), the PR's comments are
+     read (run record, triage state) and counted: totals {prs, prsPastCap, countedRounds, pastCapRounds, pastCapShare, admission {auto-extra|owner-granted|unknown}, previous (what the round before a past-limit round had
+     to re-check: no-accepts | only-low-fixes = non-BLOCKING non-security accepts | blocking-or-security), found (new-blocking | accepts | nothing-accepted), blockingLoopPrs, usd, pastCapUsd}; prs [{repo, pr, id, maxRounds,
+     countedRounds, pastCapRounds, usd, blockingLoop, rounds: [{n, k, pastCap, usd (cost.byRound, `cost --round R`), acceptedBlocking, admission?, previous?, found?}]}]. --pr N limits it to those PRs (merged or not listed by date).
+     Without --json the same numbers print as a plain-text table. A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.
+     Read-only. Severity is judged from the recorded item (BLOCKING, a security category or a security word is not low), since a PR comment does not carry the reviewed diff `itemSeverity` needs.
+```
+
+Exit: 0 · 2 usage (a bad `--since`, `--pr` or `--repo-slug`) · 3 GitHub unavailable.
+
 ## summary
 
 upsert the PR summary comment and print the agent-log line.
