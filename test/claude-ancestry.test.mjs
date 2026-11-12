@@ -173,6 +173,32 @@ test('processTable (win32) is one bounded PowerShell query over ALL processes', 
   assert.equal(opts.windowsHide, true);
 });
 
+test('processTable (win32): an enumeration error terminates the script with a non-zero exit (R1-B1)', () => {
+  const spawn = spawnOf(jsonOut([]));
+  processTable('win32', spawn);
+  const script = spawn.seen[0].args.at(-1);
+  assert.match(script, /Get-CimInstance Win32_Process -ErrorAction Stop/, 'a non-terminating enumeration error becomes terminating');
+  assert.match(script, /\$ErrorActionPreference='Stop'/);
+  assert.match(script, /try \{[\s\S]*\} catch \{ exit 1 \}/, 'a terminating error ends with exit code 1, not the last command\'s 0');
+});
+
+test('win32: the status-1 result of an errored table query falls back to per-hop lookups (R1-B1)', () => {
+  const rows = {
+    900: { ParentProcessId: 800, Name: 'node.exe', Created: T },
+    800: { ParentProcessId: 700, Name: 'cmd.exe', Created: T - 1000 },
+    700: { ParentProcessId: 1, Name: 'claude.exe', Created: T - 2000 },
+  };
+  const perPid = [];
+  const spawn = (cmd, args) => {
+    const m = /ProcessId=(\d+)/.exec(args.at(-1));
+    if (!m) return { status: 1, stdout: '[]' };
+    perPid.push(Number(m[1]));
+    return rows[m[1]] ? jsonOut(rows[m[1]]) : { status: 1, stdout: '' };
+  };
+  assert.equal(claudeCodeAncestorPid({ startPid: 800, ownPid: 900, platform: 'win32', spawn }), 700);
+  assert.deepEqual(perPid, [900, 800, 700]);
+});
+
 test('processTable returns null on any failure, and off win32 without spawning', () => {
   for (const r of [
     { status: 1, stdout: '[]' }, { status: 0, stdout: '' }, { status: 0, stdout: 'not json' }, { status: 0, stdout: '42' },
@@ -185,6 +211,13 @@ test('processTable returns null on any failure, and off win32 without spawning',
     assert.equal(processTable(platform, spawn), null);
     assert.equal(spawn.seen.length, 0);
   }
+});
+
+test('processTable returns null for an empty or wrong-shaped snapshot (R1-F1)', () => {
+  const row = { ProcessId: 5, ParentProcessId: 1, Name: 'a.exe', CommandLine: 'x', Created: 7 };
+  for (const out of [
+    '{}', '[]', JSON.stringify({ value: [row], Count: 1 }), JSON.stringify([{ ...row, ProcessId: '5' }]), JSON.stringify([{ ParentProcessId: 1, Name: 'noid.exe' }]),
+  ]) assert.equal(processTable('win32', spawnOf({ status: 0, stdout: out })), null, out);
 });
 
 const snap = (rows) => new Map(Object.entries(rows).map(([k, v]) => [Number(k), v]));
@@ -247,6 +280,29 @@ test('win32: a failed snapshot falls back to the per-hop PowerShell lookup and g
   assert.equal(claudeCodeAncestorPid({ startPid: 800, ownPid: 900, platform: 'win32', spawn }), 700);
   assert.equal(tableQueries, 1, 'the snapshot was tried once');
   assert.deepEqual(perPid, [900, 800, 700], 'then the old per-hop path ran');
+});
+
+test('win32: a snapshot that lacks the running process is not trusted; the walk falls back to per-hop lookups (R1-F1)', () => {
+  const rows = {
+    900: { ParentProcessId: 800, Name: 'node.exe', Created: T },
+    800: { ParentProcessId: 700, Name: 'cmd.exe', Created: T - 1000 },
+    700: { ParentProcessId: 1, Name: 'claude.exe', Created: T - 2000 },
+  };
+  const perPid = [];
+  const spawn = (cmd, args) => {
+    const m = /ProcessId=(\d+)/.exec(args.at(-1));
+    if (!m) throw new Error('the table query must not run: table seam is injected');
+    perPid.push(Number(m[1]));
+    return rows[m[1]] ? jsonOut(rows[m[1]]) : { status: 1, stdout: '' };
+  };
+  // a plausible-looking table that does not contain ownPid 900
+  const table = () => snap({ 800: { ppid: 700, comm: 'cmd.exe', created: T - 1000 }, 700: { ppid: 1, comm: 'claude.exe', created: T - 2000 } });
+  assert.equal(claudeCodeAncestorPid({ startPid: 800, ownPid: 900, platform: 'win32', spawn, table }), 700);
+  assert.deepEqual(perPid, [900, 800, 700]);
+  // an empty Map is the same
+  perPid.length = 0;
+  assert.equal(claudeCodeAncestorPid({ startPid: 800, ownPid: 900, platform: 'win32', spawn, table: () => new Map() }), 700);
+  assert.deepEqual(perPid, [900, 800, 700]);
 });
 
 test('win32: with the snapshot working the default path spawns PowerShell exactly once for the whole walk', () => {

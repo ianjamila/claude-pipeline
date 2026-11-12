@@ -16,8 +16,9 @@
 // WHOLE process table once (processTable: one Get-CimInstance over every process) and answers the own-process lookup and every hop
 // from that Map. A pid absent from the snapshot means "cannot be looked up" and ends the walk (null), exactly as a process that is
 // already gone does today. The reuse rule above applies unchanged; the snapshot is one point-in-time view, which is if anything
-// stricter than lookups made seconds apart. If the snapshot itself fails the walk falls back to the per-hop realLookup, so it degrades
-// to the old cost, never to a different answer. A caller-injected `lookup` always wins (tests, the seam): it is used as is and no
+// stricter than lookups made seconds apart. If the snapshot itself fails (or lacks the running process, so it cannot be a correct table) the walk falls back to the per-hop
+// realLookup, so it never gives a different answer; the fallback runs AFTER the failed table query, so the worst case is the old
+// per-hop cost plus that one query (at most 12 s). A caller-injected `lookup` always wins (tests, the seam): it is used as is and no
 // snapshot is taken. POSIX keeps the per-hop `ps`, which costs milliseconds, so there is nothing to batch.
 //
 // Accepted residuals (Fable ruling 11-04: the time rule must not fail closed, that would bring #25 back with no security gain):
@@ -123,11 +124,15 @@ function winRowInfo(j) {
 // without an integer ProcessId is skipped. The script always emits a JSON array (@(...) + -InputObject; PowerShell would otherwise
 // unroll a one-element array to a bare object, which is also accepted here). Timeout: twice realLookup's 6 s, because this one start
 // also enumerates every process and serialises their command lines (typically 1-3 s on a busy machine); it replaces several
-// starts, so even the worst case is bounded well below the old 4-hop total. maxBuffer 32 MB: a few thousand processes with long
-// command lines is a few MB; an overflow is an error and reads as null (fallback), never a truncated table.
+// starts. A failed query is followed by the per-hop fallback, so the worst case is the old per-hop cost plus up to this 12 s.
+// maxBuffer 32 MB: a few thousand processes with long command lines is a few MB; an overflow is an error and reads as null (fallback), never a truncated table.
 export function processTable(platform = process.platform, spawn = spawnSync) {
   if (platform !== 'win32') return null;
-  const script = `ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,@{n='Created';e={if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }}})`;
+  // An enumeration error must END the process non-zero: under `-Command` the exit code is that of the LAST command (ConvertTo-Json),
+  // so a non-terminating Get-CimInstance error (access denied on some processes, a WMI hiccup) would still exit 0 with `[]` or a partial
+  // array. `-ErrorAction Stop` makes the error terminating, the `catch { exit 1 }` turns that into an explicit exit code 1 whatever
+  // the host's error handling does, and `$ErrorActionPreference='Stop'` covers the remaining cmdlets: a failed query reads as null here.
+  const script = `$ErrorActionPreference='Stop'; try { ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,Name,CommandLine,@{n='Created';e={if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }}}) } catch { exit 1 }`;
   try {
     const r = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: LOOKUP_TIMEOUT_MS * 4, maxBuffer: 32 * 1024 * 1024, windowsHide: true });
     if (!r || r.error || r.status !== 0 || typeof r.stdout !== 'string' || !r.stdout.trim()) return null;
@@ -136,7 +141,9 @@ export function processTable(platform = process.platform, spawn = spawnSync) {
     if (!rows.every((j) => j !== null && typeof j === 'object' && !Array.isArray(j))) return null;
     const table = new Map();
     for (const j of rows) if (Number.isInteger(j.ProcessId)) table.set(j.ProcessId, winRowInfo(j));
-    return table;
+    // A real table is never empty: `{}`, `[]` and Windows PowerShell 5.1's `{"value":[...],"Count":N}` wrapper (no ProcessId on the
+    // bare object) all end up here with zero rows and must read as a failed snapshot, not as "nobody is running".
+    return table.size > 0 ? table : null;
   } catch {
     return null;
   }
@@ -175,7 +182,8 @@ export function claudeCodeAncestorPid({ startPid = process.ppid, lookup: injecte
   if (injected === undefined && platform === 'win32') {
     let snapshot = null;
     try { snapshot = table(); } catch { snapshot = null; }
-    if (snapshot instanceof Map) lookup = (pid) => snapshot.get(pid) ?? null;
+    // The running process is in any correct table: a snapshot without ownPid is empty or wrong-shaped, so it is not trusted.
+    if (snapshot instanceof Map && snapshot.has(ownPid)) lookup = (pid) => snapshot.get(pid) ?? null;
   }
   let childCreated;
   if (platform === 'win32') {
