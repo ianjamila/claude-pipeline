@@ -95,7 +95,7 @@ const fenced = (obj) => `Done.\n\n\`\`\`json\n${JSON.stringify(obj)}\n\`\`\``;
 // baseFiles / featFiles: extra { path: content } committed in the base commit / the feature commit.
 // slug: the repository name the fake gh reports (`repo view`). Tests that record the owner's chat words use ownerWorld (below).
 function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {}, featFiles = {}, slug = 'acme/widgets' } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
   // As pipeline-setup leaves a real repo: the review's own files are never part of a commit (a fix commit would

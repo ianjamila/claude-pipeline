@@ -57,7 +57,7 @@ const FRESH = { running: '2.1.322', installed: '2.1.322' };
 
 // fable: the only changed path is one the config sends to Fable every round (a Fable round with the given Codex findings); else a plain dispute round.
 function world(t, { fable = true, findings = NO_FINDINGS } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', fable ? SENSITIVE_YML : pipelineYml());
   repo.write('.gitignore', '.review/\n');

@@ -59,7 +59,7 @@ const leaseOn = (w, repo) => leasesOf(w).find((l) => l.worktree === realpathSync
 
 // A repo with a review state for PR 12 and a valid config; the state names its PR, so state-only commands get a PR lease.
 function reviewRepo({ state = true } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   repo.write('.claude/pipeline.yml', pipelineYml());
   repo.write('.gitignore', '.review/\n.verify/\n');
   repo.write('src/app.js', 'export const a = 1;\n');

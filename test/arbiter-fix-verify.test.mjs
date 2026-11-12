@@ -38,7 +38,7 @@ const GH = [
 const YML = (extra = '') => `${pipelineYml()}review:\n  arbiter_always_paths: [src/a.js]\n${extra}`;
 
 function world(t, { yml = YML() } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
   repo.write('.gitignore', '.review/\n');

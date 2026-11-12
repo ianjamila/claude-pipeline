@@ -200,11 +200,12 @@ export function decodeFromComment(body) {
 // in the confirmFixed of a LATER round (triage.mjs#reviewEligibilityProblems).
 // firstReviewer: 'substitute' when the Claude stand-in reviewed the round instead of Codex; substitute: { agent, models, reason, resetAt, outageAt, proof ... }
 // (no codexModel then). wholePr: the round reviewed the whole PR (reviewBase is its merge base), patchSha256: sha256 of the patch it reviewed. risk: this round's
-// risk assessment (the state's maxRisk is the highest of them). governor / budget: the Codex-spend decision that sent the round to the substitute.
+// risk assessment (the state's maxRisk is the highest of them). governor / budget: the Codex-spend decision that sent the round to the substitute, or (governor)
+// that lowered a Codex round's effort. effort: the effort a Codex round ran at.
 // Any of substitute / governor / budget makes the saved state version 4 (STATE_VERSION_SUBSTITUTE).
 export function addRound(state, {
   n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant, confirmFixed, fableRefresh,
-  firstReviewer, substitute, wholePr, patchSha256, risk, governor, budget,
+  firstReviewer, substitute, wholePr, patchSha256, risk, governor, budget, effort,
 }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
@@ -225,6 +226,7 @@ export function addRound(state, {
       ...(substitute === undefined ? {} : { substitute: structuredClone(substitute) }),
       ...(wholePr === true ? { wholePr: true } : {}),
       ...(patchSha256 === undefined ? {} : { patchSha256 }),
+      ...(typeof effort === 'string' ? { effort } : {}),
       ...(governor === undefined ? {} : { governor: structuredClone(governor) }),
       ...(budget === undefined ? {} : { budget: structuredClone(budget) }),
       ...(baseOnly === true ? { baseOnly: true } : {}),

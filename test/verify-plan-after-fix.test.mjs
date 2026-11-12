@@ -34,7 +34,7 @@ ${slots === undefined ? '' : `  max_parallel_full: ${slots}\n`}  after_fix_steps
 
 // main has the config and some files; returns the repo with HEAD at the "reviewed" commit (recorded as round 1's toHead).
 function project(opts) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   repo.write('.claude/pipeline.yml', yml(opts));
   repo.write('app/page.ts', 'export {};\n');
   repo.write('supabase/migrations/001.sql', 'select 1;\n');

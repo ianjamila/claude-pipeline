@@ -62,7 +62,7 @@ const NEWER = 'claude-fable-5-3';
 const SCRUBBED = ['AI_AGENT', 'CLAUDE_CODE_EXECPATH', 'PIPELINE_TEST_MODE', 'PIPELINE_TEST_FLOOR_PAUSE', 'PIPELINE_TEST_FLOOR_WAIT_MS', 'PIPELINE_ACCOUNT_PROJECTS_DIR', 'NODE_OPTIONS'];
 
 function world(t) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', pipelineYml());
   repo.write('.gitignore', '.review/\n');

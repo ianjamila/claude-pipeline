@@ -41,7 +41,7 @@ const GH = [
 ];
 
 function world(t) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', pipelineYml());
   repo.write('src/a.js', aFile(false));

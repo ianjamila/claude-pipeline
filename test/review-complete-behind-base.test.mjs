@@ -27,7 +27,7 @@ const queueReply = (enabled) => ({ match: 'QueueState', stdoutJson: { data: { re
 // A PR repo whose "origin" is a bare repository, on feat/x (src/a.js changed, one 60-line file), with round 1 recorded clean.
 // `view` overrides what `gh pr view 7` answers (isDraft, mergeable); `disjoint` puts merge.behind_base: disjoint in the base's config.
 function world(t, { view = {}, queue = false, disjoint = false } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-rcbehind-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));

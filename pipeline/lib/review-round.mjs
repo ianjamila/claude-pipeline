@@ -24,8 +24,10 @@ import {
 import { collectHardStops } from './hardstops.mjs';
 import { createGitHub } from './github.mjs';
 import { GhError } from './proc.mjs';
-import { assessRisk, isLightLane, reviewLane } from './risk.mjs';
-import { addRound, emptyState, loadState, maxRiskOf, saveState } from './state.mjs';
+import { assessRisk, isLightLane, isSensitivePath, reviewLane } from './risk.mjs';
+import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } from './state.mjs';
+import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
+import { readWeeklyUsage } from './codex-usage.mjs';
 import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from './triage.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
@@ -75,13 +77,17 @@ export const checkRound = (st, { pr, round }) => {
 };
 
 // Round 1 starts at the PR's merge base; every later round starts where the previous one ended.
+// When a whole-PR round is owed (review-route.mjs#wholePrOwed: an Opus substitute round came before the PR's risk rose to high) it starts at the merge base too.
 export const checkBase = (st, { round, base, forkPoint }) => {
   const last = st?.rounds.at(-1);
-  const required = last ? last.toHead : forkPoint;
+  const owed = last !== undefined && wholePrOwed(st);
+  const required = last && !owed ? last.toHead : forkPoint;
   if (base !== required) {
     throw new Fail(EXIT.USAGE, {
       ok: false, error: 'base-mismatch',
-      message: last
+      message: owed
+        ? `round ${round} must review the whole PR (an Opus substitute reviewed an earlier round, then the PR's risk rose to high): --base must be its merge base ${required}, not ${base}`
+        : last
         ? `round ${round} must start at the previous round's toHead ${required}, not ${base}`
         : `round 1 must review the whole PR: --base must be its merge base ${required}, not ${base}`,
     });
@@ -164,6 +170,8 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   const forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
   c.forkPoint = forkPoint;
   checkBase(state, c);
+  const wholePr = state !== null && state.rounds.length > 0 && wholePrOwed(state);
+  c.wholePr = wholePr;
 
   // Risk and light lane describe the whole PR (merge base..head), whatever slice this round reviews. A later round can
   // only take a PR off the light lane, never put it on.
@@ -187,7 +195,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   c.tryResolution = () => resolutionReviewBase({ from: base, forkPoint, head, baseRef: baseBranchRef }, o);
   let review = { base: forkPoint, kind: 'merge-base' };
   let resolution = null;
-  if (state?.rounds.length > 0) {
+  if (state?.rounds.length > 0 && !wholePr) {
     review = prBase === config.default_branch
       ? effectiveReviewBase({ from: base, forkPoint }, o)
       : { base, kind: 'previous' };
@@ -213,7 +221,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   // merge that leaves the content hash alone is exactly that case, so refusing it as empty-range (#1658) was wrong. Still before
   // checkCap and before anything is written. base == head is kind 'previous' with an empty patch, so never baseOnly.
   const hasAccepted = allItems(state ?? { rounds: [] }).some((i) => i.final?.decision === 'ACCEPT');
-  if (state && hasAccepted && !baseOnly && (base === head || currentContentHash(root, config) === state.rounds.at(-1)?.contentHashAtToHead)) {
+  if (state && hasAccepted && !baseOnly && !wholePr && (base === head || currentContentHash(root, config) === state.rounds.at(-1)?.contentHashAtToHead)) {
     const last = state.rounds.at(-1).n;
     const waiting = roundOutcome(state).newAccepted;
     throw new Fail(EXIT.USAGE, {
@@ -256,6 +264,51 @@ export const roundPrompt = (adm) => buildReviewPrompt({
   ...(adm.confirmItems.length > 0 ? { confirmFixed: adm.confirmItems.map((i) => ({ id: i.id, title: i.title, file: i.file, detail: i.detail })) } : {}),
   ...(adm.resolutionOnly ? { resolution: { from: adm.base, forkPoint: adm.forkPoint, ...adm.resolutionView } } : {}),
 });
+
+// The facts of the reviewed range that decide "a small fix-check" (review-route.mjs): changed lines (binary = unbounded), whether it adds a file, whether it
+// touches a sensitive path. A range git or the config cannot answer for is "not small" (fail toward the normal effort and Codex). Renames count as delete + add.
+export function rangeFacts(from, to, config, o) {
+  const flags = ['--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', '-z', `${from}..${to}`];
+  try {
+    const stat = git(['diff', '--numstat', ...flags], o).split('\0').filter(Boolean);
+    const status = git(['diff', '--name-status', ...flags], o).split('\0').filter(Boolean);
+    let changedLines = 0;
+    const paths = [];
+    for (const rec of stat) {
+      const [added, deleted, ...rest] = rec.split('\t');
+      paths.push(rest.join('\t'));
+      changedLines += added === '-' || deleted === '-' ? Number.POSITIVE_INFINITY : Number(added) + Number(deleted);
+    }
+    const newFile = status.some((tok, i) => i % 2 === 0 && tok.startsWith('A'));
+    const sensitive = paths.some((p) => isSensitivePath({ path: p, oldPath: p, newPath: p }, config));
+    return { changedLines, newFile, sensitive };
+  } catch (err) {
+    if (err instanceof GitError || err instanceof TypeError) return { changedLines: Number.POSITIVE_INFINITY, newFile: true, sensitive: true };
+    throw err;
+  }
+}
+
+// Who reviews this admitted round and at what effort (review-route.mjs has the table; this gathers its facts). A base-only round is never planned.
+// -> { route, evidence, effort, why, protected, small, lowered?, round, base, wholePr, spend, budget, governor, facts }
+export function planRound(adm, { env = process.env, now = Date.now() } = {}) {
+  const { config, state, round, root } = adm;
+  const effort = config.review.effort;
+  const maxRisk = state ? maxRiskOf(state) : undefined;
+  const risen = state ? higherRisk(maxRisk, adm.level) !== maxRisk : false;
+  const kinds = protectedKindsFor({ state, round, resolutionOnly: adm.resolutionOnly, confirmCount: adm.confirmItems.length, risen });
+  const facts = rangeFacts(adm.review.base, adm.head, config, { cwd: root });
+  const small = facts.changedLines <= effort.small_fix_lines && !facts.newFile && !facts.sensitive;
+  const usage = readWeeklyUsage({ env, now });
+  const readable = usage.source === 'codex-sessions' && Number.isFinite(usage.weeklyUsedPct);
+  const { soft, hard } = config.review.codex_budget;
+  const governor = readable ? { usedPct: usage.weeklyUsedPct, soft, hard, observedAt: usage.observedAt } : null;
+  const budget = { used: codexSpend(state), budget: config.review.codex_round_budget };
+  const decision = decideRoute({
+    mode: config.review.substitute.mode, protectedKinds: kinds, small, governor, budget,
+    normal: baseEffort({ effort, firstOrWholePr: round === 1 || adm.wholePr === true, level: adm.level }), smallFix: effort.small_fix,
+  });
+  return { ...decision, round, base: adm.review.base, wholePr: adm.wholePr === true, budget, governor, facts };
+}
 
 // A base-merge-only round has nothing to ask about: zero findings, and the round says why.
 export const baseOnlyFindings = () => ({
@@ -337,6 +390,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
       reviewBase: adm.review.base, reviewBaseKind: adm.review.kind, forkPoint: adm.forkPoint, ...roundFields, ...(adm.baseOnly ? { baseOnly: true } : {}),
       ...(admission === 'uncounted' ? {} : { admission }), ...(ownerGrant === undefined ? {} : { ownerGrant }),
       ...(adm.confirmItems.length > 0 ? { confirmFixed: adm.confirmItems.map((i) => i.id) } : {}),
+      ...(adm.wholePr ? { wholePr: true } : {}),
       ...(adm.resolutionOnly ? { resolutionOnly: true, ...adm.resolutionView } : {}),
       ...(reviewer === 'fable' && !adm.baseOnly ? { fableRequired: true, fableReasons: reasons, sensitivePaths: adm.lane.sensitivePaths.slice(0, 50) } : {}),
     });

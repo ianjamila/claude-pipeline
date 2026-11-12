@@ -44,7 +44,7 @@ const DISPUTED = { disputedBug: true, settleTest: { possible: true, plan: 'write
 
 // comments: true swaps in a gh that remembers the PR's comments (test/fixtures/fake-gh-comments.mjs), so a publication can be read back.
 function world(t, { yml = CHAT_YML, slug = 'acme/widgets', comments = false } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
   repo.write('.gitignore', '.review/\n');

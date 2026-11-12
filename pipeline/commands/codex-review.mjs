@@ -25,7 +25,7 @@ import { FINDINGS_SCHEMA_PATH, buildCodexArgs, validateFindings } from '../lib/c
 import { CODEX_TIMEOUT_MS, execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { headSha, revParse } from '../lib/git.mjs';
-import { admitRound, baseOnlyFindings, headMoved, recordRound, roundPrompt, unavailable } from '../lib/review-round.mjs';
+import { admitRound, baseOnlyFindings, headMoved, planRound, recordRound, roundPrompt, unavailable } from '../lib/review-round.mjs';
 import { roundDir, writeFileAtomic } from '../lib/review-context.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { noteCodexAnswered, noteQuotaStop } from '../lib/codex-usage.mjs';
@@ -77,16 +77,25 @@ export const meta = {
 
 export { CODEX_TIMEOUT_MS };
 
+// The plan as the command prints it (an unbounded line count, binary, is null).
+const planOutput = (p) => ({
+  route: p.route, evidence: p.evidence, effort: p.effort, why: p.why, round: p.round, base: p.base, wholePrOwed: p.wholePr, protected: p.protected, small: p.small,
+  ...(p.lowered === undefined ? {} : { lowered: p.lowered }),
+  budget: p.budget, governor: p.governor === null ? null : { usedPct: p.governor.usedPct, soft: p.governor.soft, hard: p.governor.hard, observedAt: p.governor.observedAt },
+  facts: { changedLines: Number.isFinite(p.facts.changedLines) ? p.facts.changedLines : null, newFile: p.facts.newFile, sensitive: p.facts.sensitive },
+});
+
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
     pr: { type: 'string' }, round: { type: 'string' }, base: { type: 'string' }, head: { type: 'string' },
-    effort: { type: 'string' }, model: { type: 'string' }, repo: { type: 'string' },
+    effort: { type: 'string' }, model: { type: 'string' }, repo: { type: 'string' }, plan: { type: 'boolean' },
   }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const round = intOption(values, 'round', { required: true, min: 1 });
   const baseRef = requireOption(values, 'base');
   const headRef = requireOption(values, 'head');
-  const effort = requireOption(values, 'effort');
+  const planOnly = values.plan === true;
+  const effort = planOnly && values.effort === undefined ? 'medium' : requireOption(values, 'effort'); // --plan runs nothing: the effort is only echoed back checked
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
   const o = { cwd: root };
@@ -116,6 +125,15 @@ export const run = guarded(async (argv, ctx) => {
   const { baseOnly, resolutionOnly, resolutionView, resolution, resolutionIneligible } = adm;
   const prompt = roundPrompt(adm);
 
+  // Who reviews this round and at what effort (lib/review-route.mjs table). A base-only round asks nothing: no plan.
+  const plan = adm.baseOnly ? null : planRound(adm, { env: ctx.env });
+  if (planOnly) {
+    return {
+      exitCode: EXIT.OK,
+      output: { ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base } : planOutput(plan), expectedEffort: plan?.effort ?? null },
+    };
+  }
+
   // The exact bytes Codex gets on stdin. Saved as round-<R>/prompt.md BEFORE Codex starts (so a timed-out or crashed round keeps it)
   // from this same buffer, and its sha256 goes into the round record: the hash is of what was sent, not of a re-serialisation.
   // A base-only round asks nothing, so it has neither.
@@ -134,6 +152,15 @@ export const run = guarded(async (argv, ctx) => {
   };
   const sub = config.review.substitute;
 
+  // The effort is the configuration's, not the caller's: a round that is a small fix-check (or runs while the weekly Codex governor is soft) is cheaper,
+  // every other round keeps the normal effort. A round the budget / governor sends to the substitute never runs Codex, so the effort is not asked about.
+  if (plan !== null && plan.route === 'codex' && effort !== plan.effort) {
+    throw new Fail(EXIT.USAGE, {
+      ok: false, error: 'effort-mismatch', expected: plan.effort, why: plan.why,
+      message: `--effort ${effort} is not the configured effort for round ${round}: use --effort ${plan.effort} (${plan.why}; \`pipeline codex-review --plan\` prints it)`,
+    });
+  }
+
   // One attempt: route.json says 'pending' (and the attempt's files live in round-R/attempt-<id>/) before Codex starts. A base-only round asks nothing: no attempt.
   let attempt = null;
   let outPath;
@@ -143,6 +170,18 @@ export const run = guarded(async (argv, ctx) => {
     const risk = adm.state ? higherRisk(maxRiskOf(adm.state), adm.level) : adm.level;
     const patchSha256 = createHash('sha256').update(readFileSync(path.join(dir, 'diff.patch'))).digest('hex');
     attempt = await startAttempt({ root, round, base, head, patchSha256, risk, agent: substituteAgentFor(risk) });
+    // Budget / governor: Codex is not run; the evidence (valid for this attempt only) says why, and a substitute may stand in.
+    if (plan.route === 'substitute') {
+      const evidence = plan.evidence === 'budget'
+        ? { evidence: 'budget', budget: { used: plan.budget.used, budget: plan.budget.budget } }
+        : { evidence: 'governor', governor: { usedPct: plan.governor.usedPct, threshold: plan.governor.hard, observedAt: plan.governor.observedAt } };
+      await finishAttempt({ root, pr, ctx, round, attempt, final: { ...evidence, outcome: 'withheld', reason: 'withheld', why: plan.why } });
+      throw unavailable('withheld', {
+        message: `Codex was not run: ${plan.why === 'budget-spent' ? `this PR has used its Codex budget (${plan.budget.used} of ${plan.budget.budget})` : `the weekly Codex quota is at ${plan.governor.usedPct}% (hard limit ${plan.governor.hard}%)`} and round ${round} is a small fix-check`,
+        substitute: { eligible: true, why: plan.why, evidence: plan.evidence, agent: attempt.route.agent, resetAt: null },
+        plan: planOutput(plan),
+      });
+    }
     outPath = path.join(attempt.dir, 'codex-raw.json');
     args = argsFor(outPath);
   }
@@ -201,7 +240,13 @@ export const run = guarded(async (argv, ctx) => {
   // The round is recorded only while route.json still holds this attempt (compare-and-swap under the review lock): else exit 2 superseded and nothing is written.
   let pendingRoute;
   const { items, state, grantUsed } = await recordRound({
-    adm, findings, roundFields: { codexModel: model, ...(promptSha256 === undefined ? {} : { promptSha256 }) },
+    adm, findings, roundFields: {
+      codexModel: model, ...(promptSha256 === undefined ? {} : { promptSha256 }),
+      ...(plan === null ? {} : { effort }),
+      // the governor lowered this round's effort: the decision is part of the round (and makes the state version 4)
+      ...(plan?.lowered === 'governor-soft' ? { governor: { usedPct: plan.governor.usedPct, threshold: plan.governor.soft, observedAt: plan.governor.observedAt } } : {}),
+      ...(adm.wholePr && attempt !== null ? { patchSha256: attempt.route.patchSha256 } : {}),
+    },
     ...(attempt === null ? {} : {
       gate: () => {
         pendingRoute = assertCurrentAttempt(root, round, attempt.attemptId);
