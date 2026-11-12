@@ -147,12 +147,14 @@ export const hintsOf = (by) => [...new Set(by.map((b) => b.hint).filter((h) => t
 
 // Where the notice sends the owner for the hints: `leases` lists review leases only (not unreadable JOB records, merge locks ...), so it is offered only when EVERY
 // hint comes from a lease entry (a live lease or one that could not be judged). Any other hint leads to the status file, which lists all of them.
-// -> { pointer, fallbacks }: fallbacks are the shortest wordings, tried in order when the pointer does not fit; the last one always holds the status file path.
+// -> { pointer, fallbacks }: fallbacks are the shortest wordings, tried in order when the pointer does not fit. The last one carries NO path (the log line and the
+// status file name it), so a bounded candidate always exists and the banner never cuts a path, however long the status file's path is.
 const LEASE_KINDS = new Set(['lease', 'scan-error']);
+export const PATH_FREE_POINTER = 'see the update status file';
 export function recoveryPointer(by, { leases, statusPath }) {
   const leasesOnly = by.filter((b) => typeof b.hint === 'string' && b.hint).every((b) => LEASE_KINDS.has(b.kind));
-  if (!leasesOnly) return { pointer: `see ${statusPath}`, fallbacks: [] };
-  return { pointer: `run: ${leases} (or see ${statusPath})`, fallbacks: [`run: ${leases}`, `see ${statusPath}`] };
+  if (!leasesOnly) return { pointer: `see ${statusPath}`, fallbacks: [PATH_FREE_POINTER] };
+  return { pointer: `run: ${leases} (or see ${statusPath})`, fallbacks: [`run: ${leases}`, `see ${statusPath}`, PATH_FREE_POINTER] };
 }
 
 // A notice for the owner, composed by budget (R4-1): `head` and the ACTION are reserved first, the CAUSE gets what is left of BANNER_MAX (cut with an ellipsis, never inside the

@@ -7,11 +7,11 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { run as update, meta } from '../pipeline/commands/update.mjs';
 import { emit } from '../pipeline/lib/cli.mjs';
 import {
-  DEFER_NOTICE_MS, STATE_FILE, STATUS_FILE, TRANSIENT_RUNS, composeNotice, describeLive, leasesCommand, normalizeLive, ownerCommand, pipelineStateDir,
+  DEFER_NOTICE_MS, STATE_FILE, STATUS_FILE, TRANSIENT_RUNS, composeNotice, describeLive, leasesCommand, normalizeLive, ownerCommand, pipelineStateDir, recoveryPointer,
 } from '../pipeline/lib/auto-update.mjs';
 import { scanLiveWork } from '../pipeline/lib/live-work-scan.mjs';
 import { BANNER_MAX, defaultNotify } from '../pipeline/lib/queue-sweep.mjs';
@@ -838,7 +838,7 @@ test('R4-1: an uncertain process lease with a real lease path in a long worktree
   const hint = `delete ${lease.file} if no pipeline command is running in a terminal`;
   assert.equal(live[0].hint, hint);
   const rec = recordingNotify(dir);
-  const statusFile = join(dir, 'update-status.json');
+  const statusFile = paddedStatusFile(dir); // a status path of 200+ characters, whatever the tmpdir: the whole pointer cannot fit
   const t = await dayLater(live, { notify: rec.notify, statusFile });
   // the runnable command is longer than the old bare word: with a head and a status path this long the banner keeps the command (never a cut path)
   const banner = bannerOf(rec.seen.spawned);
@@ -941,25 +941,30 @@ test('R4-1: composeNotice reserves head + action, gives the cause the rest, and 
 
 const oddHome = '/opt/my pipe'; // a configured install dir, short enough for the command to fit
 const longJob = 'j'.repeat(150); // a job hint of ~200 characters: too long for the hint tiers, so the banner falls to the pointer
+// A status file path long whatever the machine's tmpdir is (a 200-character sub-folder), so the whole pointer deterministically does not fit the banner.
+const paddedStatusFile = (dir) => join(dir, 'p'.repeat(200), 'update-status.json');
 const longWorktree = (dir) => join(dir, 'Claude', 'some-project', '.worktrees', 'agent-a-rather-long-worktree-name-for-this-task-xx-and-some-more-to-be-sure');
 
 test('R1-B1: leasesCommand spells the full node command like ownerCommand: the default home as ~/.claude, another install dir quoted (there is no bare `pipeline` executable)', () => {
   const user = '/Users/x';
   assert.equal(leasesCommand(join(user, '.claude'), user), 'node ~/.claude/pipeline/bin/pipeline.mjs leases');
-  assert.equal(leasesCommand("/opt/my 'pipe'/c", user), "node '/opt/my '\\''pipe'\\''/c/pipeline/bin/pipeline.mjs' leases");
+  const odd = join(user, "my 'pipe'", 'c');
+  assert.equal(leasesCommand(odd, user), `node '${join(odd, 'pipeline', 'bin', 'pipeline.mjs').replace(/'/g, `'\\''`)}' leases`);
 });
 
 test('R1-B1: the 24 h banner for an uncertain lease points at the full node command of the CONFIGURED install dir and still fits BANNER_MAX', async () => {
   const dir = scratch();
   const lease = await uncertainLease(dir, longWorktree(dir));
   const rec = recordingNotify(dir);
-  const statusFile = join(dir, 'update-status.json');
+  const statusFile = paddedStatusFile(dir);
   const home = oddHome;
   await dayLater(lease.scan(), { notify: rec.notify, statusFile }, home);
   const banner = bannerOf(rec.seen.spawned);
   assert.ok(banner.length <= BANNER_MAX, `${banner.length}: ${banner}`);
-  assert.equal(leasesCommand(home), "node '/opt/my pipe/pipeline/bin/pipeline.mjs' leases");
-  assert.ok(banner.endsWith("Fix that: run: node '/opt/my pipe/pipeline/bin/pipeline.mjs' leases."), banner);
+  // `update` resolves --claude-home with path.resolve, and the command is built with path.join: expect the platform's separators, not POSIX slashes
+  const expected = `node '${join(resolve(home), 'pipeline', 'bin', 'pipeline.mjs')}' leases`;
+  assert.equal(leasesCommand(resolve(home)), expected);
+  assert.ok(banner.endsWith(`Fix that: run: ${expected}.`), banner);
   assert.doesNotMatch(banner, /run: pipeline leases/);
 });
 
@@ -1008,4 +1013,60 @@ test('R1-F1: a job hint and a lease hint together: the pointer leads with the st
   assert.ok(banner.includes(`see ${statusFile}`), banner);
   assert.doesNotMatch(banner, /run: .*leases/);
   assert.ok(rec.seen.stderr.includes(lease.file) && rec.seen.stderr.includes(hintOf(longJob)), 'the log has both hints');
+});
+
+const PATH_FREE = 'see the update status file';
+
+test('R2-B1: a status file path too long for the banner is never cut: a job blocker ends on the path-free fallback', async () => {
+  const dir = scratch();
+  const live = scanOf(dir, [brokenJobRepo(dir, 'wt', longJob)]);
+  assert.equal(live[0].kind, 'job', JSON.stringify(live));
+  const rec = recordingNotify(dir);
+  const statusFile = paddedStatusFile(dir);
+  await dayLater(live, { notify: rec.notify, statusFile });
+  const banner = bannerOf(rec.seen.spawned);
+  assert.ok(banner.length <= BANNER_MAX, `${banner.length}: ${banner}`);
+  assert.ok(banner.endsWith(`Finish or close them; ${PATH_FREE}.`), banner);
+  assert.ok(!banner.includes('ppp'), `no cut path: ${banner}`);
+  assert.ok(rec.log().includes(hintOf(longJob)), 'the log line keeps the whole hint');
+});
+
+test('R2-B1: a status file path too long for the banner is never cut: a lease blocker ends on the bare command, or on the path-free fallback when the command is too long too', async () => {
+  const dir = scratch();
+  const lease = await uncertainLease(dir, longWorktree(dir));
+  const rec = recordingNotify(dir);
+  await dayLater(lease.scan(), { notify: rec.notify, statusFile: paddedStatusFile(dir) });
+  const banner = bannerOf(rec.seen.spawned);
+  assert.ok(banner.length <= BANNER_MAX, `${banner.length}: ${banner}`);
+  assert.ok(banner.endsWith(`Fix that: run: ${leasesCommand(join(homedir(), '.claude'))}.`), banner);
+  assert.ok(!banner.includes('ppp'), `no cut path: ${banner}`);
+  const rec2 = recordingNotify(scratch());
+  await dayLater(lease.scan(), { notify: rec2.notify, statusFile: paddedStatusFile(dir) }, resolve('/', 'd'.repeat(200)));
+  const banner2 = bannerOf(rec2.seen.spawned);
+  assert.ok(banner2.length <= BANNER_MAX && banner2.endsWith(`Fix that: ${PATH_FREE}.`), `${banner2.length}: ${banner2}`);
+  assert.ok(!banner2.includes('ppp') && !banner2.includes('ddd'), `no cut path: ${banner2}`);
+});
+
+test('R2-B1: with every wording too long for the budget, the last tier is the path-free fallback, whatever the hint kind', () => {
+  const head = 'pipeline update to aaaaaaa has been waiting more than 24 hours for live reviews:';
+  const hint = `delete /${'h'.repeat(140)} if no pipeline command is running in a terminal`;
+  const longStatus = `/${'s'.repeat(200)}/update-status.json`;
+  const hugeCmd = `node '/${'d'.repeat(200)}/pipeline/bin/pipeline.mjs' leases`;
+  for (const kind of ['job', 'lease']) {
+    const { pointer, fallbacks } = recoveryPointer([{ kind, hint }], { leases: hugeCmd, statusPath: longStatus });
+    const n = composeNotice({ head, cause: 'c'.repeat(300), action: { lead: 'Finish or close them', hintLead: 'Finish or close them; ', hints: [hint], tail: 'run it', pointer, fallbacks } });
+    assert.ok(n.banner.length <= BANNER_MAX && n.banner.endsWith(`Finish or close them; ${PATH_FREE}.`), `${kind}: ${n.banner}`);
+    assert.ok(!/sss|ddd/.test(n.banner), `${kind}: no cut path`);
+  }
+});
+
+test('R2-F1: with a short, fixed-length status path the whole pointer fits (command and path), whatever the machine tmpdir is', () => {
+  const head = 'pipeline update to aaaaaaa has been waiting more than 24 hours: could not check for running reviews:';
+  const cmd = leasesCommand('/Users/x/.claude', '/Users/x');
+  const statusPath = '/s/update-status.json';
+  const hint = `delete /${'h'.repeat(140)} if no pipeline command is running in a terminal`;
+  const { pointer, fallbacks } = recoveryPointer([{ kind: 'scan-error', hint }], { leases: cmd, statusPath });
+  const n = composeNotice({ head, cause: 'c'.repeat(300), action: { lead: 'Fix that', hintLead: 'Fix that: ', hints: [hint], tail: 'run it', pointer, fallbacks } });
+  assert.ok(n.banner.length <= BANNER_MAX, `${n.banner.length}`);
+  assert.ok(n.banner.endsWith(`Fix that: run: ${cmd} (or see ${statusPath}).`), n.banner);
 });
