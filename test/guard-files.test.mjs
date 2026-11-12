@@ -37,6 +37,8 @@ test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form
     '/home/u/.claude/pipeline',
     '/home/u/.claude/settings.json',
     '/home/u/.claude/pipeline-state/owner-go',
+    '/home/u/.claude/pipeline-state/codex',
+    '/home/u/.codex/sessions',
   ]);
   assert.equal(protectedRoots('C:\\Users\\u\\')[0], 'C:/Users/u/.claude/skills/ship');
 });
@@ -1921,4 +1923,43 @@ test('#128 R5-F1: a glob root or projects segment followed by a literal session 
     'cp -R /tmp/forged/. ~/.cache/*/projects/-repo/abc',
     'cat ~/.claud?/projects/-repo/abc/subagents/agent-1.jsonl',
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+});
+
+// ---- cp #256: the substitute reviewer's evidence is written by pipeline commands only ------------------------------------------------------------
+
+test('#256 route.json, attempt folders, substitute packets and second-review inputs under .review/round-N are protected from every write; reading them is open', () => {
+  const names = [
+    'route.json', 'route-2nd-0a1b2c3d.json', 'attempt-0123456789abcdef/codex-raw.json', 'attempt-0123456789abcdef/prompt.md', 'substitute/diff.patch',
+    'substitute/rules/AGENTS.md', 'substitute-input.md', 'second-review-input.md', 'second-review-0a1b2c3d.md',
+  ];
+  for (const n of names) {
+    const p = `/repo/.review/round-2/${n}`;
+    assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', `Write ${n}`);
+    assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', `Edit ${n}`);
+    for (const cmd of [`echo '{}' > ${p}`, `cp /tmp/forged.json ${p}`, `rm ${p}`, `tee ${p} < /tmp/x`]) assert.equal(bash(cmd), 'deny', cmd);
+    assert.equal(bash(`cat ${p}`), 'allow', `cat ${n}`);
+  }
+  // a hand-written route.json (plan test 17), relative and through a glob spelling of the folder
+  for (const cmd of [
+    'echo \'{"evidence":"quota"}\' > .review/round-1/route.json',
+    "printf '{}' > .review/round-1/route.json",
+    'cp /tmp/forged.json .rev*/round-1/route.json',
+    "sed -i 's/pending/quota/' .review/round-1/route.json",
+    'rm -rf .review/round-1/attempt-0123456789abcdef',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
+test('#256 the machine-wide Codex record and Codex\'s session logs are protected from every write; reading them stays open', () => {
+  const R = '/home/u/.claude/pipeline-state/codex';
+  const S = '/home/u/.codex/sessions';
+  for (const p of [`${R}/status.json`, `${S}/2026/11/11/rollout-a.jsonl`]) {
+    assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', p);
+    assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', p);
+  }
+  for (const cmd of [
+    `echo '{}' > ${R}/status.json`, `cp /tmp/forged.json ${R}/status.json`, `rm -rf ${R}`, `rm ${R}/status.json`,
+    `cp /tmp/forged.jsonl ${S}/2026/11/11/rollout-a.jsonl`, `echo x >> ${S}/2026/11/11/rollout-a.jsonl`, `rm -rf ${S}`, 'rm -rf ~/.codex/sessions',
+    "echo '{}' > ~/.claude/pipeline-state/codex/status.json",
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [`cat ${R}/status.json`, `ls ${S}`, `grep token_count ${S}/2026/11/11/rollout-a.jsonl`, 'ls ~/.codex', 'cat ~/.codex/config.toml']) assert.equal(bash(cmd), 'allow', cmd);
 });

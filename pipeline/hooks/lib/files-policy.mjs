@@ -51,6 +51,10 @@ const PROTECTED_REL = [
   '.claude/settings.json',
   // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it, P merge and the guard read it
   '.claude/pipeline-state/owner-go',
+  // cp #256: the machine-wide Codex outage record (status.json: the last quota stop and the PRs waiting for Codex; only pipeline commands write it) and Codex's own session
+  // logs (the weekly-usage figure is read from them, so an agent may not write them)
+  '.claude/pipeline-state/codex',
+  '.codex/sessions',
 ];
 
 // The directories that hold them. Writing INTO them is fine (history, projects, CLAUDE.md, other skills), but
