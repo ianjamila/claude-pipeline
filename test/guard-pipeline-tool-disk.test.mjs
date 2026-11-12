@@ -877,3 +877,19 @@ test('R15-F1: a # inside a typographic-quoted string (a comment to the guard, te
   // Bash route unchanged
   assert.equal(bashW('cd C:/repo; echo \u2018a #b\u2019; echo y > out.txt'), 'allow');
 });
+
+// R15 push security review on c3919bf: a quoted `<#` and `#>` must not let the block-comment cut swallow a write between them; block comments are cut only from text with no quote character at all.
+test('R15 push review: a quoted <# ... #> pair hides a write', () => {
+  const q = ['\u2018', '\u2019', '\u201C', '\u201D', "'", '"', '\u201A', '\u201E'];
+  const lines = [];
+  for (const a of q) {
+    for (const b of q) {
+      lines.push(`cd C:/x; echo ${a}<#${b}; Set-Content ..\\Users\\u\\.cl"aude"\\settings.json x; echo ${a}#>${b}`);
+      lines.push(`echo ${a}<#${b}; Set-Content ..\\Users\\u\\.cl'aude'\\settings.json x; echo ${a}#>${b}`);
+    }
+  }
+  lines.push('cd C:/x; echo `<#`; Set-Content ..\\Users\\u\\.cl"aude"\\settings.json x; echo `#>`');
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  // an unquoted terminated block comment on a line of reads/plain writes is still cut and allowed (R11-F2)
+  assert.equal(psW('cd C:/repo; echo x <# #>; Get-ChildItem sub'), 'allow');
+});

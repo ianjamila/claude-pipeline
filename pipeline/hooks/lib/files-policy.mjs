@@ -3562,7 +3562,8 @@ function evaluateBashForFilesFrame(command, opts) {
   // R14-B1 / F1 / F2 / F3: the one fail-closed rule for a PowerShell line that can write (see psChangesDirectory). Placed after the not-plain refusals above so their more specific messages keep winning.
   if (ctx.shell === 'powershell') {
     // (the Bash parse reads a block comment `<# ... #>` as a line comment and drops the rest of the line, so the commands are also read from the text with its block comments cut out; an unterminated `<#` counts as a write)
-    const stripped = raw.replace(/<#[\s\S]*?#>/g, ' ');
+    // (the cut ignores quotes, so a quoted `<#` and `#>` could swallow a write between them: block comments are cut only from text with no quote character at all, else the raw text is judged as it stands, where `<` and `>` already count as a write)
+    const stripped = /['"`‘-‟]/.test(raw) ? raw : raw.replace(/<#[\s\S]*?#>/g, ' ');
     const nonReadOnly = (c) => c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !PS_DRIVE_WORD.test(c.argv[0]) && !isReadOnly(c, ctx);
     // R15-B1 / F1: on a line PowerShell reads differently from the guard's parser (psUnparsed: a backslash escape, a typographic quote, any not-plain text) the parsed list is not trusted: it writes unless provably read-only from the raw text
     const writes = cmds.some(nonReadOnly) || psRedirects(stripped) || stripped.includes('<#') || (stripped !== raw && simpleCommands(stripped).some(nonReadOnly)) || ((ctx.psHazard || psUnparsed(raw)) && !psRawReadOnly(stripped));
