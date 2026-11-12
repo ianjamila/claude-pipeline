@@ -31,7 +31,8 @@
 # re-evaluates everything. The exception follows from the receipt rule below: an approval counts only if its `labeled` run
 # posted a receipt on the head, so skipping that run would let an approval given on a draft be removed at ready.
 # `converted_to_draft` is listed so that it lands in the PR's real concurrency group (below) and cancels an evaluation still
-# running on the head the PR just left; its own run skips because the PR is a draft by then. The cancelled run's last step marks
+# running on the head the PR just left; its own run skips because the PR is a draft by then. Every OTHER event the job skips on
+# a draft goes to the `-noop` group, so it can never cancel an approval-label evaluation running on that draft. The cancelled run's last step marks
 # a still-pending guard status `error` ("guard did not finish"); `ready_for_review` replaces it, and a draft cannot merge meanwhile.
 #
 # Approvals: a `labeled` run by an allowed approver first posts a receipt status (`pipeline-approval: <label>`) on the
@@ -61,10 +62,16 @@ permissions:
 concurrency:
   # An edit that does not change the base (title, body), and a label event for a label the pipeline does not act on, are
   # no-ops below; they get their own group so they can never cancel a real evaluation that is still running for the same PR.
+  # So is every event the job skips on a draft (all but converted_to_draft and an approval-label event): it must not cancel an
+  # approval-label evaluation running on that draft. converted_to_draft stays in the real group on purpose: it cancels the
+  # evaluation still running from when the PR was ready.
   group: >-
     pipeline-guards-${{ github.event.pull_request.number }}${{ ((github.event.action == 'edited' && !github.event.changes.base)
     || ((github.event.action == 'labeled' || github.event.action == 'unlabeled')
-    && !contains(fromJSON('["human-approved","test-change-approved","pipeline-recheck","awaiting-review","needs-human","pipeline-blocked","pipeline-pause","pipeline-rollback"]'), github.event.label.name)))
+    && !contains(fromJSON('["human-approved","test-change-approved","pipeline-recheck","awaiting-review","needs-human","pipeline-blocked","pipeline-pause","pipeline-rollback"]'), github.event.label.name))
+    || (github.event.pull_request.draft && github.event.action != 'converted_to_draft'
+    && !((github.event.action == 'labeled' || github.event.action == 'unlabeled')
+    && (github.event.label.name == 'human-approved' || github.event.label.name == 'test-change-approved'))))
     && '-noop' || '' }}
   cancel-in-progress: true
 

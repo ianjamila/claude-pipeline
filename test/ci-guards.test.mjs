@@ -547,6 +547,19 @@ test('pipeline-guards.yml skips drafts except approval-label events, and convert
   assert.equal(group(ev('ready_for_review', false)), 'pipeline-guards-7');
   assert.equal(wf.concurrency['cancel-in-progress'], true);
 
+  // Every event the job skips on a draft goes to -noop, so it cannot cancel an approval-label evaluation running on the draft;
+  // the events that run (approval labels) and the conversion stay in the real group; a ready PR is unchanged.
+  const at = (github) => ({ group: group(github), runs: Boolean(runs(github)) });
+  assert.deepEqual(at(ev('synchronize', true)), { group: 'pipeline-guards-7-noop', runs: false });
+  assert.deepEqual(at(ev('opened', true)), { group: 'pipeline-guards-7-noop', runs: false });
+  assert.deepEqual(at(ev('labeled', true, { label: { name: 'pipeline-recheck' } })), { group: 'pipeline-guards-7-noop', runs: false });
+  assert.deepEqual(at(ev('unlabeled', true, { label: { name: 'needs-human' } })), { group: 'pipeline-guards-7-noop', runs: false });
+  assert.deepEqual(at(ev('labeled', true, { label: { name: 'human-approved' } })), { group: 'pipeline-guards-7', runs: true });
+  assert.deepEqual(at(ev('unlabeled', true, { label: { name: 'test-change-approved' } })), { group: 'pipeline-guards-7', runs: true });
+  assert.deepEqual(at(ev('converted_to_draft', true)), { group: 'pipeline-guards-7', runs: false });
+  assert.deepEqual(at(ev('synchronize', false)), { group: 'pipeline-guards-7', runs: true });
+  assert.deepEqual(at(ev('ready_for_review', false)), { group: 'pipeline-guards-7', runs: true });
+
   // The draft exception names exactly the two approval labels the guard reads, and adds no second label list (the
   // concurrency/if list equality above stays a single list).
   const guardSrc = readFileSync(join(root, 'pipeline', 'templates', 'scripts', 'pipeline', 'ci-guard.mjs'), 'utf8');
