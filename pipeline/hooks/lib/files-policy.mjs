@@ -1322,7 +1322,9 @@ const PLAIN_CD = {
   },
 };
 // ...and the commands that can change the shell's directory (or what a command name means) without being a cd we model
-const DIR_CHANGERS = new Set([...CD_CMDS, 'chdir', 'eval', 'source', '.', 'builtin', 'command', 'exec', 'alias', 'unalias', 'setopt', 'shopt', 'enable', 'emulate']);
+const DIR_CHANGERS = new Set([...CD_CMDS, 'chdir', 'eval', 'source', '.', 'builtin', 'command', 'exec', 'alias', 'unalias', 'setopt', 'unsetopt', 'shopt', 'enable', 'emulate']);
+// ...and the ones that take a directory NAME, which CDABLE_VARS turns into a variable's value (`chdir` is zsh's own spelling of cd)
+const CD_NAMED = new Set(['cd', 'pushd', 'chdir']);
 // Why: the directories an unknown `cd` may land in that matter: each protected directory (a file cannot be a cwd), each directory above one, and the home's parents.
 function assumedCwds(ctx) {
   const dirs = [...ctx.lexRoots.filter((r) => !/\.\w+$/.test(posix.basename(r))), ...ctx.lexAncestors];
@@ -1487,34 +1489,48 @@ function cdUnknownShape(argv) {
   if (cn === 'cd' && args.filter((x) => !x.startsWith('-')).length > 1) return true;
   return t !== undefined && /^~(?:[-+]|[A-Za-z_])/.test(t);
 }
-// R10-F4: what `set -o NAME` / `set +o NAME` (also `-oNAME`, `-eo NAME`) names: the option words of a `set` line, or null for a `set` that names none (`set -o` alone lists them).
-// Why: the options with no effect on what `cd` means are a short list; every other name (and any name only known at run time) counts as a directory changer.
+// R11-F2: `set` is safe (no effect on what `cd` means) only as a WHITELIST: every flag word is literal letters from SAFE_SET_FLAGS, or `-o` / `+o` (also `-eo NAME`, `-oNAME`) with a name in SAFE_SET_OPTIONS,
+// up to the first word that is not a flag (the positional parameters) or `--`. Anything else -- zsh's `-T` (CDABLE_VARS), other letters, `-$F` (letters only known at run time), a bare `-o`, an unknown name -- is a switch.
 const SAFE_SET_OPTIONS = new Set(['errexit', 'nounset', 'pipefail', 'xtrace', 'verbose', 'noclobber']);
-function setOptionNames(argv) {
-  const out = [];
+const SAFE_SET_FLAGS = new Set(['e', 'u', 'x', 'v', 'f', 'C', 'a']);
+const optionWord = (w) => w.toLowerCase().replace(/[_-]/g, '');
+function setIsSafe(argv) {
   const args = argv.slice(1);
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--') break;
-    const m = /^[-+][A-Za-z]*?o(.*)$/.exec(args[i]);
-    if (!m || !/^[-+][A-Za-z]+$/.test(args[i].slice(0, args[i].length - m[1].length))) continue;
-    out.push(m[1] !== '' ? m[1] : (args[i + 1] ?? ''));
-    if (m[1] === '') i++;
+    const a = args[i];
+    if (a === '--') return true;
+    if (!/^[-+]/.test(a)) return true; // (the positional parameters start here)
+    const m = /^[-+]([A-Za-z]*?)o(.*)$/.exec(a);
+    if (m && [...m[1]].every((ch) => SAFE_SET_FLAGS.has(ch))) {
+      if (!/^[A-Za-z]*$/.test(m[2])) return false;
+      const name = m[2] !== '' ? m[2] : args[i + 1];
+      if (name === undefined || !SAFE_SET_OPTIONS.has(optionWord(name))) return false;
+      if (m[2] === '') i++;
+      continue;
+    }
+    if (!/^[-+][A-Za-z]+$/.test(a) || ![...a.slice(1)].every((ch) => SAFE_SET_FLAGS.has(ch))) return false;
   }
-  return out;
+  return true;
 }
-// `set -o NAME` with a NAME outside the safe list, or a bare `set -o`; and any assignment to zsh's `options[...]` (or `options+=`)
+// The command a line word really runs, past `builtin` / `command` / `noglob` / `nocorrect` (and their flags): `builtin set -T`
+function unwrapBuiltin(argv) {
+  let k = 0;
+  while (k < argv.length && ['builtin', 'command', 'noglob', 'nocorrect'].includes(baseOf(argv[k]))) { k++; while (k < argv.length && /^-[A-Za-z]*$/.test(argv[k])) k++; }
+  return k === 0 ? argv : argv.slice(k);
+}
+// A `set` outside the whitelist, and any assignment to zsh's `options[...]` (or `options+=`): the line may change what a command means
 function optionSwitch(c) {
-  const name = baseOf(c.argv[0] ?? '');
-  if (name === 'set' && setOptionNames(c.argv).some((n) => !SAFE_SET_OPTIONS.has(optionWord(n)))) return true;
+  const argv = unwrapBuiltin(c.argv);
+  if (baseOf(argv[0] ?? '') === 'set' && !setIsSafe(argv)) return true;
   return Object.hasOwn(c.env ?? {}, 'options') || c.argv.some((a) => /^options(?:\[|\+?=)/.test(a));
 }
 // Is this a command that may turn on CDABLE_VARS (`cd NAME` then goes to $NAME) or is it a switch whose name cannot be read? Then a cd of the line leads to a directory only known at run time.
-const optionWord = (w) => w.toLowerCase().replace(/[_-]/g, '');
+// `set` outside the whitelist; `setopt` / `unsetopt` / `emulate` / `shopt` with ANY word (an option name, a flag such as `-T`, a run-time word): one spelling is as good as another (`unsetopt nocdablevars`).
 function cdMeaningSwitch(c) {
-  const name = baseOf(c.argv[0] ?? '');
-  const words = (name === 'set' ? setOptionNames(c.argv) : name === 'setopt' || name === 'shopt' ? c.argv.slice(1) : []).map(optionWord);
-  if (name === 'set' && words.some((w) => w === '')) return true;
-  if (words.some((w) => w.includes('cdablevars') || /[$`*?[{(]/.test(w))) return true;
+  const argv = unwrapBuiltin(c.argv);
+  const name = baseOf(argv[0] ?? '');
+  if (name === 'set' && !setIsSafe(argv)) return true;
+  if (['setopt', 'unsetopt', 'emulate', 'shopt'].includes(name) && argv.length > 1) return true;
   const sub = (w) => /^options\[(.*)\]/.exec(w)?.[1];
   const opts = c.argv.map(sub).filter((x) => x !== undefined).map(optionWord);
   return opts.some((w) => w.includes('cdablevars') || /[$`*?[{(]/.test(w)) || (Object.hasOwn(c.env ?? {}, 'options'));
@@ -3395,10 +3411,10 @@ function setPositionals(argv) {
   return null;
 }
 function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
-  const out = { vars: new Map(), cds: [], all: false, unknownCd: false };
+  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, cdSwitch: false };
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
-  const cdSwitched = cmds.some(cdMeaningSwitch);
+  let cdSwitched = cmds.some(cdMeaningSwitch); // (R11-F3: a source below that switches it on counts from there on)
   const from = flowStart(cmds);
   const seen = new Map();
   const local = Object.create(null);
@@ -3430,7 +3446,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
       const v = t === undefined ? t : substVars(t, local, ctx.budget);
       const cdpath = (ctx.env?.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (ctx.vars[n] ?? '') !== '' || out.vars.has(n) || ctx.pickUnknown.has(n) || ctx.srcChanged.has(n) || (c.env?.[n] ?? '') !== '' || cmds.some((x) => x.argv.some((a) => a.startsWith(`${n}[`))));
-      if (cdUnknownShape(c.argv) || (cdSwitched && name === 'cd') || (v !== undefined && /[`$*?[{]/.test(v)) || (cdpath && v !== undefined && !isAbs(toPosix(v)) && !/^(?:\.\.?(?:[\\/]|$)|~)/.test(v))) out.unknownCd = true;
+      if (cdUnknownShape(c.argv) || (cdSwitched && CD_NAMED.has(name)) || (v !== undefined && /[`$*?[{]/.test(v)) || (cdpath && v !== undefined && !isAbs(toPosix(v)) && !/^(?:\.\.?(?:[\\/]|$)|~)/.test(v))) out.unknownCd = true;
       else out.cds.push(t ?? '~');
       set('PWD', null, false); set('OLDPWD', null, false); // (cd rebinds both)
     }
@@ -3460,6 +3476,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
         out.cds.push(...sub.cds);
         if (sub.all) out.all = true;
         if (sub.unknownCd) out.unknownCd = true;
+        if (sub.cdSwitch) cdSwitched = true;
         if (sub.home) out.home = true;
       }
     }
@@ -3471,6 +3488,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   for (const m of text.matchAll(/\$\{([^}]*)\}/g)) if (m[1].includes('=')) bind(m[1].match(/[A-Za-z_]\w*/g) ?? []);
   for (const m of text.matchAll(/\(\(([^)]*)\)\)/g)) if (/(?<![=!<>])=(?!=)/.test(m[1])) bind(m[1].match(/[A-Za-z_]\w*/g) ?? []);
   for (const m of text.matchAll(/\{([A-Za-z_]\w*)\}\s*(?:[<>]|&>)/g)) bind([m[1]]);
+  out.cdSwitch = cdSwitched;
   return out;
 }
 
@@ -3537,6 +3555,7 @@ function absorbSourced(rec, dirs, ctx) {
     const eff = sourcedEffects(t, ctx);
     if (eff.all) poison();
     if (eff.home) ctx.homeSourced = true; // (a bare `cd` / `cd ~` / `~/x` then goes elsewhere)
+    if (eff.cdSwitch) ctx.sourcedCdSwitch = true; // (R11-F3: the file may turn cdablevars on: the line's own `cd NAME` can then go to $NAME)
     if (eff.unknownCd) ctx.sourcedCdUnknown = true; // (a cd the file does into a directory only known at run time: the line's directory is unknown from here)
     effs.push(eff);
     for (const [k, v] of eff.vars) merged.set(k, merged.has(k) && merged.get(k) !== v ? null : v); // (the file may be one of several: a name they set differently is unknown)
@@ -3785,12 +3804,13 @@ function evaluateBashForFilesFrame(command, opts) {
     const homeMoved = ctx.unknownAll || ctx.homeSourced === true || moved('HOME') || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[|$)/.test(a)));
     // Why: with CDPATH set a relative `cd sub` goes to the first CDPATH entry that has `sub` (the line's, the environment's, one a source may have set)
     const cdpathSet = (startupEnv.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (Object.hasOwn(ctx.vars, n) && ctx.vars[n] !== '') || moved(n) || cmds.some((c) => (c.env?.[n] ?? '') !== '' || c.argv.some((a) => a.startsWith(`${n}[`))));
-    const cdSwitched = cmds.some(cdMeaningSwitch); // (R10-F4: cdablevars may be on, so `cd NAME` can go to $NAME)
+    const cdSwitched = ctx.sourcedCdSwitch === true || cmds.some(cdMeaningSwitch); // (R10-F4, R11-F3: cdablevars may be on -- by the line or a sourced file -- so `cd NAME` can go to $NAME)
     return cmds.some((c, ci) => {
       const cn = baseOf(c.argv[0] ?? '');
+      if (cdSwitched && CD_NAMED.has(cn)) return true; // (R11-B2: pushd and zsh's chdir take the same fallback)
       if (!CD_CMDS.has(cn)) return false;
       const { unknownName } = stateAt(ci);
-      if (cdUnknownShape(c.argv) || (cdSwitched && cn === 'cd')) return true;
+      if (cdUnknownShape(c.argv)) return true;
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
       if (t !== undefined && modelledCd(t, cmds, ci, ctx) !== null) return false;
       if (t === undefined || /^~(?:\/|$)|^\$\{?HOME\b/.test(t)) { if (homeMoved) return true; if (t === undefined) return false; } // (a bare cd goes home)
