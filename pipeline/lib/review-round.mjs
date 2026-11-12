@@ -23,6 +23,7 @@ import {
 } from './git.mjs';
 import { collectHardStops } from './hardstops.mjs';
 import { createGitHub } from './github.mjs';
+import { assertPublishedHistory } from './review-publish.mjs';
 import { GhError } from './proc.mjs';
 import { assessRisk, isLightLane, isSensitivePath, reviewLane } from './risk.mjs';
 import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } from './state.mjs';
@@ -47,6 +48,19 @@ export const resolutionSummary = (r) => ({
 
 // Exit 3: the reviewer or GitHub could not deliver. Never "found nothing".
 export const unavailable = (reason, extra = {}) => new Fail(EXIT.UNAVAILABLE, { ok: false, unavailable: true, reason, ...extra });
+
+// A COUNTED round builds on the PUBLISHED history: refuse before the reviewer runs (and again under the final lock) when this copy lacks a published round
+// or grant (stale-history), holds rounds the PR lacks (unpublished-history), or the triage comment cannot be read (history-unreadable). A PR with no triage
+// comment passes; a base-only or resolution-only round (it does not count) is not checked.
+export const checkPublished = ({ gh, pr, state, flags }) => {
+  if (flags.baseOnly || flags.resolutionOnly) return;
+  try {
+    assertPublishedHistory({ gh, pr, state });
+  } catch (err) {
+    if (err instanceof GhError) throw unavailable('github', { error: 'unavailable', message: err.message });
+    throw err;
+  }
+};
 
 export const headMoved = () => new Fail(EXIT.USAGE, { ok: false, error: 'head-moved', message: 'HEAD moved while Codex was reviewing; run the round again' });
 
@@ -232,6 +246,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
     });
   }
   const preAdmission = checkCap(c, state, { baseOnly, resolutionOnly });
+  checkPublished({ gh, pr, state, flags: { baseOnly, resolutionOnly } });
   const resolutionView = resolutionOnly ? resolutionSummary(resolution) : null;
   ensureRoundDir(root, round);
   const note = largeBinaryNote(largeBinaries);
@@ -358,6 +373,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
     // A grant that admitted the round before the reviewer ran but is gone now (another checkout claimed it meanwhile) says so.
     const admission = checkCap(adm, fresh, flags, { already: adm.preAdmission === 'owner' });
     checkBase(fresh, adm);
+    checkPublished({ gh: createGitHub({ cwd: root, env: ctx.env }), pr, state: fresh, flags });
     if (headSha(o) !== head) throw headMoved();
     // The cap waiver rests on the proof above. from (checkBase), head and forkPoint are pinned, but origin/<default> may have moved
     // while the reviewer ran, and it is one of the proof's inputs: prove it again, and only accept the very range it was shown.

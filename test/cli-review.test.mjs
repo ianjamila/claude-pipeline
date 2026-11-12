@@ -23,7 +23,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { SHARED_FLOOR_DIR, floorEnv, scratchFloorDir } from './helpers/floor-env.mjs';
 import { resetFloor } from '../pipeline/lib/model-floor.mjs';
 import { leasesDir } from '../pipeline/lib/review-lease.mjs';
-import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { cleanupAtExit, ownerApprovesPast, ownerGrants, ownerRules, pastRoundRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
 import { reviewCheck } from '../pipeline/lib/finalgate.mjs';
@@ -62,6 +62,13 @@ const noIssues = (slug) => [
   { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=100 --paginate`, stdout: '[]' },
 ];
 const NO_ISSUES = noIssues('acme/widgets');
+
+// codex-review reads the PR's triage comment before it admits a counted round (published history): a world answers "no comment" unless a test
+// scripts the comments itself (these entries come LAST, so a test's own entries win).
+const NO_COMMENTS = [
+  { match: '^api user', stdout: 'me\n' },
+  { match: '^api repos/\\S+/issues/\\d+/comments --paginate', stdoutJson: [] },
+];
 
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x' } },
@@ -116,7 +123,7 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
   // The PR as GitHub reports it: its base branch and the head commit it holds (what review-complete compares to).
   // (a world with its own slug: every API path the scripts match on names that repository instead of acme/widgets)
   const forSlug = (e) => (slug === 'acme/widgets' || e.match.includes(slug) ? e : { ...e, match: e.match.split('acme/widgets').join(slug) });
-  const withPr = (sha) => gh.map((e) => {
+  const withPr = (sha, list = gh) => [...list, ...NO_COMMENTS].map((e) => {
     if (e.match === '^pr view 7') return { ...e, stdoutJson: { baseRefName: 'main', headRefOid: sha, ...e.stdoutJson } };
     if (e.match === '^repo view' && slug !== 'acme/widgets') return { ...e, stdoutJson: { ...e.stdoutJson, nameWithOwner: slug, url: `https://github.com/${slug}` } };
     return forSlug(e);
@@ -129,6 +136,8 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
     repo, base, head, scratch, fake, capture, lockDir, slug,
     // Tell the fake GitHub the PR's head moved (after a new commit).
     prHead: (sha) => fake.setScript(withPr(sha)),
+    // Swap the scripted gh entries (e.g. the PR's comments) for the rest of the test; the PR head stays where the world put it.
+    setGh: (list, sha = head) => fake.setScript(withPr(sha, list)),
     cli(args, env = {}) {
       const merged = {
         ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, FAKE_CODEX_CAPTURE: capture,
@@ -440,6 +449,75 @@ test('codex-review: GitHub being unreachable is exit 3 with unavailable:true, re
   assert.equal(r.json.unavailable, true);
   assert.equal(r.json.reason, 'github');
   assert.equal(w.captured().length, 0);
+});
+
+// ---- codex-review reads the published history before it admits a counted round (plan 2026-11-12-legacy-round-grants.md, A) -------------
+
+const commentsEntry = (comments) => ({ match: '^api repos/\\S+/issues/\\d+/comments --paginate', stdoutJson: comments });
+const triageNote = (state, over = {}) => ({ id: 9, user: { login: 'me' }, body: triageComment(state), created_at: '2026-11-05T10:00:00Z', updated_at: '2026-11-05T10:00:00Z', ...over });
+const noRoundWritten = (w, n) => !existsSync(join(w.repo.dir, '.review', `round-${n}`));
+
+test('codex-review: a counted round needs the local history to match the published one (stale-history, unpublished-history, unreadable); no comment passes', (t) => {
+  const w = worldIgnoringReview(t, { yml: `${pipelineYml()}review:\n  max_rounds: 5\n` });
+  const advance = (n) => {
+    w.repo.write(`src/h${n}.js`, `export const h${n} = ${n};\n`);
+    return w.repo.commit(`more ${n}`);
+  };
+  const refuse = (n, from, to, error, re) => {
+    const stateBefore = w.stateText();
+    const calls = w.captured().length;
+    const r = w.codex(n, findingsOf(), { from, to });
+    assertExit(r, 2, r.stdout + r.stderr);
+    assert.equal(r.json.error, error);
+    assert.match(r.json.message, re);
+    assert.equal(w.stateText(), stateBefore, 'the state is unchanged');
+    assert.equal(w.captured().length, calls, 'Codex was not started');
+    assert.ok(noRoundWritten(w, n), 'no round folder was left behind');
+  };
+
+  // no triage comment (a new PR): round 1 runs
+  assertExit(w.codex(1, findingsOf()), 0);
+  const s1 = w.state();
+  const head2 = advance(2);
+  // the PR holds exactly what this copy has: in sync, the round runs
+  w.setGh([...GH, commentsEntry([triageNote(s1)])]);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0);
+  const s2 = w.state();
+  const head3 = advance(3);
+
+  // an earlier publish failed: local holds round 2, the PR only round 1
+  refuse(3, head2, head3, 'unpublished-history', /pipeline comment --pr 7 --kind triage/);
+  // the PR holds a grant on round 2 that this copy lacks / another round 1 / a longer history
+  const withGrant = { ...s2, rounds: s2.rounds.map((r) => (r.n === 2 ? { ...r, admission: 'owner', ownerGrant: { grantId: 'g', k: 2, quote: 'extra round', ownerTs: '2026-11-05T10:00:00.000Z' } } : r)) };
+  w.setGh([...GH, commentsEntry([triageNote(withGrant)])]);
+  refuse(3, head2, head3, 'stale-history', /owner grant on round 2.*pipeline state show --pr 7/);
+  const other = { ...s2, rounds: s2.rounds.map((r) => (r.n === 1 ? { ...r, toHead: 'e'.repeat(40) } : r)) };
+  w.setGh([...GH, commentsEntry([triageNote(other)])]);
+  refuse(3, head2, head3, 'stale-history', /pipeline state show --pr 7/);
+  const longer = { ...s2, rounds: [...s2.rounds, { ...s2.rounds[1], n: 3 }] };
+  w.setGh([...GH, commentsEntry([triageNote(longer)])]);
+  refuse(3, head2, head3, 'stale-history', /round 3.*pipeline state show --pr 7/);
+  // a comment with no readable state
+  w.setGh([...GH, commentsEntry([triageNote(s2, { body: `${MARKERS.triage}\nnot a state` })])]);
+  refuse(3, head2, head3, 'history-unreadable', /pipeline comment --pr 7 --kind triage/);
+  // somebody else's triage comment is no history
+  w.setGh([...GH, commentsEntry([triageNote(longer, { user: { login: 'mallory' } })])]);
+  const ok = w.codex(3, findingsOf(), { from: head2, to: head3 });
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+  assert.equal(w.state().rounds.length, 3);
+});
+
+test('codex-review: a fresh worktree (no local state) cannot start round 1 over a published history', (t) => {
+  const donor = worldIgnoringReview(t);
+  assertExit(donor.codex(1, findingsOf()), 0);
+  const published = donor.state();
+  const w = worldIgnoringReview(t, { gh: [...GH, commentsEntry([triageNote(published)])] });
+  const r = w.codex(1, findingsOf());
+  assertExit(r, 2, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'stale-history');
+  assert.match(r.json.message, /round 1.*pipeline state show --pr 7/);
+  assert.equal(w.captured().length, 0, 'Codex was not started');
+  assert.ok(!existsSync(join(w.repo.dir, '.review')), 'a refused round leaves nothing behind');
 });
 
 test('codex-review: rulings from earlier rounds go into the next prompt and pre-rule an unchanged finding (cache)', (t) => {
@@ -2865,7 +2943,8 @@ function publishedWorld(t) {
   assertExit(w.judge(1, STANDARD_JUDGE), 0);
   const published = w.state();
   const script = JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8'));
-  w.fake.setScript([...script, ...COMMENTS(mine(published))]);
+  // (the comments come FIRST: the world's own script ends with the empty-comments fallback, and the first match wins)
+  w.fake.setScript([...COMMENTS(mine(published)), ...script]);
   return { w, published };
 }
 const staleDirs = (w) => readdirSync(join(w.repo.dir, '.review')).filter((n) => n.startsWith('stale-'));
@@ -3890,7 +3969,7 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   const published = w.state();
   const markerTree = published.rounds[1].reviewBase;
   const roundPatch = patchOf(w, 2);
-  w.fake.setScript([...JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')), REMOVE_LABEL, ...COMMENTS(mine(published)), REVIEW_COMMENT[2],
+  w.fake.setScript([...COMMENTS(mine(published)), ...JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')), REMOVE_LABEL, REVIEW_COMMENT[2],
     { match: '^api -X PATCH repos/acme/widgets/issues/comments/9 ', stdoutJson: { id: 9, html_url: 'u9' } }]); // review-complete publishes the state first
 
   // A fresh clone (--no-local: a local clone would copy every object): only the objects reachable from a branch come along, so the marker tree is not there.
@@ -4007,6 +4086,22 @@ test('codex-review owner grant: no grant is the same round-cap as before, and th
   assert.equal(capped.json.error, 'round-cap');
   assert.match(capped.json.message, /review\.max_rounds \(1\) and its one extra round, or an owner-granted round/);
   assert.equal(w.captured().length, calls, 'Codex never ran');
+});
+
+test('codex-review owner grant: a recorded owner approval of a PAST round admits nothing: the refusal is the plain round-cap and Codex never runs', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  const record = ownerApprovesPast(t, 'approve past round', pastRoundRequest(7, 3, h2, w.slug));
+  assert.ok(record, 'the hook recorded the past-round approval');
+  assert.equal(record.kind, 'past-round');
+  t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+  const calls = w.captured().length;
+  const capped = codexThree(w, h1, h2);
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+  assert.match(capped.json.message, /review\.max_rounds \(1\) and its one extra round, or an owner-granted round/);
+  assert.doesNotMatch(capped.json.message, /is recorded for this PR/, 'not even named as a grant that cannot be confirmed');
+  assert.equal(w.captured().length, calls, 'Codex never ran');
+  assert.equal(existsSync(markerPath(grantIdOf(record))), false, 'no marker was claimed');
 });
 
 test('codex-review owner grant: an "extra round" whose prompt is synthetic or missing from the transcript admits nothing, and the refusal says it cannot be confirmed as typed by the owner (#128)', (t) => {

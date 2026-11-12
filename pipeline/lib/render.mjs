@@ -61,7 +61,7 @@ function triageRow(n, item) {
 // The rounds an owner's chat words admitted past the cap (the quote is the owner record's own prompt, kept on the round by codex-review).
 const grantedRounds = (state) => (state.rounds ?? [])
   .filter((r) => typeof r?.ownerGrant?.quote === 'string' && r.ownerGrant.quote !== '')
-  .map((r) => ({ k: Number.isInteger(r.ownerGrant.k) ? r.ownerGrant.k : null, n: r.n, quote: r.ownerGrant.quote }));
+  .map((r) => ({ k: Number.isInteger(r.ownerGrant.k) ? r.ownerGrant.k : null, n: r.n, quote: r.ownerGrant.quote, past: r.ownerGrant.past === true }));
 const grantLabel = (g) => `round ${line(g.k ?? g.n)}`;
 
 // One list item per Claude-ruled item: id, decision, the Codex verdict (when one exists) and Claude's reason.
@@ -116,7 +116,10 @@ export function triageComment(state) {
   const reraised = reraisedLines(rounds);
   if (reraised.length > 0) out.push('', '#### Raised again after a deferral', '', ...reraised);
   const granted = grantedRounds(state);
-  if (granted.length > 0) out.push('', `Owner-granted extra round(s): ${granted.map((g) => `${grantLabel(g)} - "${line(g.quote, 300)}"`).join('; ')}`);
+  const shownGrants = (list) => list.map((g) => `${grantLabel(g)} - "${line(g.quote, 300)}"`).join('; ');
+  if (granted.some((g) => !g.past)) out.push('', `Owner-granted extra round(s): ${shownGrants(granted.filter((g) => !g.past))}`);
+  // The owner's approval of a round that had ALREADY run (no grant was recorded then): it admitted nothing.
+  if (granted.some((g) => g.past)) out.push('', `Owner-approved past round(s) (already run): ${shownGrants(granted.filter((g) => g.past))}`);
   // A Fable pass that stopped on the floor or a stale terminal (arbiter.mjs): visible even when the round has no item to carry the cause.
   for (const r of rounds) {
     const f = r?.arbiter?.failure;

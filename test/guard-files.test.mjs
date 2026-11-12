@@ -987,7 +987,7 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
 // Phase 3b (Fable attacker pass on #107): review-complete trusts .review/state.json, so a repo's review state and the proofs beside it
 // are written only by the pipeline commands (their own process, which the hook never sees), in any checkout or worktree.
 test('Phase 3b: a repo\'s review state is protected from every write, wherever the checkout is', () => {
-  for (const p of ['/repo/.review/state.json', '.review/state.json', '/other/wt/.review/round-2/codex.json', '.review/round-1/model-proof.json', '.review/final-gate.json', '.review/preview-smoke.json', '.review/prod-before.json', '.review/state.json.123.tmp', '.review/substitute-attempts.json', '/repo/.review/substitute-attempts.json.9.tmp']) {
+  for (const p of ['/repo/.review/state.json', '.review/state.json', '/other/wt/.review/round-2/codex.json', '.review/round-1/model-proof.json', '.review/final-gate.json', '.review/preview-smoke.json', '.review/prod-before.json', '.review/published-baseline.json', '.review/published-baseline.json.123.tmp', '/other/wt/.review/published-baseline.json', '.review/state.json.123.tmp', '.review/substitute-attempts.json', '/repo/.review/substitute-attempts.json.9.tmp']) {
     assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', p);
     assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', p);
   }
@@ -1002,6 +1002,12 @@ test('Phase 3b: a repo\'s review state is protected from every write, wherever t
     "sed -i 's/needs-human/ACCEPT/' .review/round-1/codex.json",
     'mkdir -p .review/round-3',
     'touch .review/final-gate.json',
+    // (the published-history anchor: a forged baseline lets a shorter history replace the published one)
+    `echo '{"pr":7,"hash":"${'a'.repeat(64)}"}' > .review/published-baseline.json`,
+    'cp /tmp/forged.json /other/wt/.review/published-baseline.json',
+    'rm .review/published-baseline.json',
+    'cp /tmp/x .review/published-*.json',
+    'cd .review && echo x > published-baseline.json',
     'ln -s /tmp/forged.json .review/state.json',
     'mv /tmp/forged .review',
     'rm -rf .review',
@@ -1026,6 +1032,7 @@ test('Phase 3b: a repo\'s review state is protected from every write, wherever t
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [
     'cat .review/state.json',
+    'cat .review/published-baseline.json',
     'jq .rounds .review/state.json',
     'ls -la .review .review/round-1',
     'mkdir -p .review', // (the ship skill, before it writes hardstops.json: an empty folder holds nothing)

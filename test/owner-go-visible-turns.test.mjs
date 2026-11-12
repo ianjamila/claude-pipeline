@@ -8,9 +8,9 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
-  lastReply, recordApproval, recordRoundGrant, recordRuling, entrySource, queuedNudge, QUEUED_NUDGE, RULING_NUDGE, approvalGap, ownerGrantGap, ownerRuled, ownerRulingGap, promptProvenance,
+  lastReply, recordApproval, recordPastRoundGrant, recordRoundGrant, recordRuling, entrySource, queuedNudge, QUEUED_NUDGE, RULING_NUDGE, approvalGap, ownerGrantGap, ownerPastRoundRecords, pastRoundGrantsFor, ownerRuled, ownerRulingGap, promptProvenance,
 } from '../pipeline/hooks/lib/owner-go.mjs';
-import { OWNER_ENTRY, link, linesOf, mergeRequest, roundRequest, rulingRequest, runHook } from './helpers/owner-go.mjs';
+import { OWNER_ENTRY, link, linesOf, mergeRequest, pastRoundRequest, roundRequest, rulingRequest, runHook } from './helpers/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
@@ -31,14 +31,16 @@ const QUEUED = { origin: { kind: 'human' }, promptSource: 'queued', entrypoint: 
 
 const MERGE_ASK = mergeRequest(58, HEAD, ITEMS);
 const ROUND_ASK = roundRequest(58, 2, HEAD);
+const PAST_ASK = pastRoundRequest(58, 2, HEAD);
 const RULING_ASK = rulingRequest(58, ['R1-B1']);
 // The three recorders: what the owner types, the reply that asks for it, and whether the recorder wrote anything BOUND to that ask.
 const KINDS = {
   merge: { ask: MERGE_ASK, answer: 'merge', bound: (r) => r !== null && r.requests.length > 0, rec: recordApproval },
   round: { ask: ROUND_ASK, answer: 'extra round', bound: (r) => r !== null, rec: recordRoundGrant },
+  past: { ask: PAST_ASK, answer: 'approve past round', bound: (r) => r !== null, rec: recordPastRoundGrant },
   ruling: { ask: RULING_ASK, answer: 'R1-B1: accept', bound: (r) => r !== null, rec: recordRuling },
 };
-const STRICT = ['merge', 'round']; // the kinds read without skipSynthetic
+const STRICT = ['merge', 'round', 'past']; // the kinds read without skipSynthetic
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'owner-go-visible-'));
 function record(kind, entries, answer = KINDS[kind].answer) {
@@ -271,6 +273,7 @@ const RULED = { repo: 'acme/widgets', pr: 58, id: 'R1-B1', quote: 'R1-B1: accept
 const GAPS = {
   merge: ({ home }) => approvalGap({ repo: 'acme/widgets', pr: 58, head: HEAD, items: ITEMS, home, now }),
   round: ({ home }) => ownerGrantGap({ repo: 'acme/widgets', pr: 58, k: 2, head: HEAD, home, now }),
+  past: ({ home }) => { const q = { repo: 'acme/widgets', pr: 58, k: 2, head: HEAD, home, now }; return ownerPastRoundRecords(q).length > 0 ? 'ok' : (pastRoundGrantsFor(q).length > 0 ? 'provenance' : 'none'); },
   ruling: ({ home }) => (ownerRuled({ ...RULED, home, now }) ? 'ok' : ownerRulingGap({ ...RULED, home, now })),
 };
 test('#191 B2: a record written before the transcript had the entry is refused at use time when the entry is queued, for every kind; typed is unchanged (B3)', () => {
@@ -289,7 +292,7 @@ test('#191 B2: a record written before the transcript had the entry is refused a
 // owner's turn, so "the assistant text after the last prompt" is no proof of who wrote it. Each assistant entry (and each tool result) is attributed to its originating prompt through
 // the parentUuid chain; text whose origin is an invisible turn is never the owner's reply, whatever its position.
 
-const ASK59 = { merge: mergeRequest(59, HEAD, ITEMS), round: roundRequest(59, 2, HEAD), ruling: rulingRequest(59, ['R1-B1']) };
+const ASK59 = { merge: mergeRequest(59, HEAD, ITEMS), round: roundRequest(59, 2, HEAD), past: pastRoundRequest(59, 2, HEAD), ruling: rulingRequest(59, ['R1-B1']) };
 const of = (p, e) => ({ ...e, parentUuid: p.uuid }); // an entry written for prompt `p` (what its process chains it to)
 const pr = (kind, r) => (r === null ? null : kind === 'merge' ? r.requests.map((q) => q.pr) : r.pr); // the PR a record binds
 const bound58 = (kind) => (kind === 'merge' ? [58] : 58);

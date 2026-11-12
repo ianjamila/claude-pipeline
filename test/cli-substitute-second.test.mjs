@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { floorEnv } from './helpers/floor-env.mjs';
 import { readStatus } from '../pipeline/lib/codex-usage.mjs';
@@ -49,6 +49,7 @@ function world(t, { yml = CHAT_YML, items = 2 } = {}) {
     { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: head } },
     { match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: 'acme/widgets', url: 'https://github.com/acme/widgets' } },
     { match: '^pr edit 7 ', code: 0 },
+    ...NO_COMMENTS,
   ]);
   const lockDir = join(scratch, 'locks');
   const w = {

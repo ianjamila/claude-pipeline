@@ -756,7 +756,7 @@ export function queuedNudge(input) {
     const answer = input?.prompt;
     if (typeof answer !== 'string') return null;
     const readsAsAnswer = parseApproval(answer) !== null
-      || (answer.length <= ROUND_GRANT_PROMPT_MAX && parseRoundGrant(answer) !== null)
+      || (answer.length <= ROUND_GRANT_PROMPT_MAX && (parseRoundGrant(answer) !== null || parsePastRoundGrant(answer) !== null))
       || (answer.length <= RULING_PROMPT_MAX && PAIRS_ONLY.test(answer.replace(/\s+/g, ' ').trim()));
     if (!readsAsAnswer || notOwnerWords(input, String(input?.transcript_path ?? ''))) return null;
     return queuedAnswer(input) ? QUEUED_NUDGE : null;
@@ -1110,6 +1110,11 @@ export function ownerItemsDigest(items) {
 // #128: the grant is as strict as a "merge": a harness-injected turn is never recorded (notOwnerWords), and a record counts only while its prompt
 // is still the owner's in the transcript (promptProvenance, ownedBy) — at the cap lookup (ownerGrantedRounds) and at the final gate (verifyOwnerGrant).
 // Residual: as for "merge" and rulings (see the top of this file), plus a nested `claude -p --resume` the guards do not name (cp issue).
+// A second, distinct line approves a round that ALREADY RAN (before cp #104, so it carries no grant): `P triage round-request --past` prints
+//   `🔂 Approve past review round #N: round <k> · head <sha12> · repo <owner/name>`
+// and the same recorder stores the owner's words as a kind 'past-round' record. The two kinds never cross: a past-round record is invisible to
+// every extra-round reader (isRoundRecord: codex-review, ownerGrantedRounds, round-request), an extra-round record to the past-round readers
+// (isPastRoundRecord, pastRoundGrantsFor), and verifyOwnerGrant takes a past-round record only for an `ownerGrant` with `past: true`.
 const ROUND_LINE = new RegExp(`^\\s*(?:🔁)?\\s*Extra review round needed\\s+#(\\d{1,6})\\s*:\\s*round\\s+(\\d{1,3})\\s*(?:·|\\|)\\s*head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME})\\s*$`, 'i');
 export const ROUND_GRANT_PROMPT_MAX = 300; // a grant is a few words; a longer prompt is not one and is not recorded (never cut)
 
@@ -1122,12 +1127,33 @@ export function presentedRoundRequest(text) {
   return { pr: Number(m[1]), k: Number(m[2]), head: m[3].toLowerCase(), repo: m[4].toLowerCase() };
 }
 
+// The past-round line (same head / repo rules as ROUND_LINE; a different sentence, so neither parser accepts the other's line).
+const PAST_ROUND_LINE = new RegExp(`^\\s*(?:🔂)?\\s*Approve past review round\\s+#(\\d{1,6})\\s*:\\s*round\\s+(\\d{1,3})\\s*(?:·|\\|)\\s*head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME})\\s*$`, 'i');
+
+// The past-round request a reply ENDS with (its last non-blank line). Returns { pr, k, head (lower case, 12..40), repo (lower case) } or null.
+export function presentedPastRoundRequest(text) {
+  const lines = String(text ?? '').split(/\r?\n/);
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  const m = PAST_ROUND_LINE.exec(lines[lines.length - 1] ?? '');
+  if (!m) return null;
+  return { pr: Number(m[1]), k: Number(m[2]), head: m[3].toLowerCase(), repo: m[4].toLowerCase() };
+}
+
 // A prompt that grants: "extra round", "grant round 4 #1544", "extra review round, please". Same strictness as parseApproval: the words
 // after the opener are targets (#N = a PR, a bare integer = the PR or the round, resolved against the request line by the recorder) and
 // filler only; "extra round?", "no extra round", "grant round 4 after CI", "why extra round" grant nothing. Returns null or { prs, numbers }.
 export function parseRoundGrant(prompt) {
+  return parseRoundWords(prompt, /^(?:extra|grant)\s+(?:review\s+)?round(?![A-Za-z0-9_-])([\s\S]*)$/i);
+}
+
+// The owner's words for a past round: the same openers plus "approve" ("approve round", "approve past round 5 #1448"), same target rules.
+export function parsePastRoundGrant(prompt) {
+  return parseRoundWords(prompt, /^(?:extra|grant|approve)\s+(?:past\s+)?(?:review\s+)?round(?![A-Za-z0-9_-])([\s\S]*)$/i);
+}
+
+function parseRoundWords(prompt, opener) {
   const t = String(prompt ?? '').trim();
-  const m = /^(?:extra|grant)\s+(?:review\s+)?round(?![A-Za-z0-9_-])([\s\S]*)$/i.exec(t);
+  const m = opener.exec(t);
   if (!m) return null;
   const rest = m[1];
   if (rest.includes('?')) return null;
@@ -1145,20 +1171,29 @@ export function parseRoundGrant(prompt) {
 // The extra-round recorder (same hook, same folder): when the reply right before the owner's prompt ends with the request line, writes the
 // prompt verbatim, bound to that repository, PR, counted round and head. A PR or round the prompt names must be the line's; anything else
 // records nothing. Returns the record, or null. Never throws.
-export function recordRoundGrant(input, { home = accountHome(), now = Date.now } = {}) {
+export function recordRoundGrant(input, opts = {}) {
+  return recordRoundKind(input, opts, { kind: 'extra-round', parse: parseRoundGrant, present: presentedRoundRequest });
+}
+
+// The past-round recorder: the same checks, for a reply that ends with the 🔂 line; writes a kind 'past-round' record. Returns the record, or null. Never throws.
+export function recordPastRoundGrant(input, opts = {}) {
+  return recordRoundKind(input, opts, { kind: 'past-round', parse: parsePastRoundGrant, present: presentedPastRoundRequest });
+}
+
+function recordRoundKind(input, { home = accountHome(), now = Date.now } = {}, { kind, parse, present }) {
   try {
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
     if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > ROUND_GRANT_PROMPT_MAX) return null;
-    const g = parseRoundGrant(input.prompt);
+    const g = parse(input.prompt);
     if (!g) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: strict like a "merge" — a notice, a peer's or a scheduled turn's "extra round")
     if (queuedAnswer(input)) return null; // (#191 B1)
-    const asked = presentedRoundRequest(lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }));
+    const asked = present(lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }));
     if (!asked) return null;
     if (!g.prs.every((n) => n === asked.pr) || !g.numbers.every((n) => n === asked.pr || n === asked.k)) return null;
     return appendRecord(home, session, {
-      v: 1, kind: 'extra-round', ts: new Date(now()).toISOString(), session,
+      v: 1, kind, ts: new Date(now()).toISOString(), session,
       prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
       cwd: typeof input.cwd === 'string' ? input.cwd : null,
       repo: asked.repo, pr: asked.pr, k: asked.k, head: asked.head, ...promptRefs(input), prompt: input.prompt,
@@ -1169,9 +1204,11 @@ export function recordRoundGrant(input, { home = accountHome(), now = Date.now }
 }
 
 const FULL_HEAD = /^[0-9a-f]{40}$/;
-// Is this a well-formed extra-round record (the hook's own shape)? A hand-edited prompt no longer hashes to prompt_sha256.
-function isRoundRecord(r) {
-  return r?.kind === 'extra-round' && typeof r.session === 'string' && typeof r.ts === 'string' && typeof r.prompt_sha256 === 'string'
+// Is this a well-formed record of that kind (the hook's own shape)? A hand-edited prompt no longer hashes to prompt_sha256.
+const isRoundRecord = (r) => isGrantRecord(r, 'extra-round');
+const isPastRoundRecord = (r) => isGrantRecord(r, 'past-round');
+function isGrantRecord(r, kind) {
+  return r?.kind === kind && typeof r.session === 'string' && typeof r.ts === 'string' && typeof r.prompt_sha256 === 'string'
     && repoKey(r.repo) === r.repo && Number.isInteger(r.pr) && Number.isInteger(r.k) && /^[0-9a-f]{12,40}$/.test(String(r.head))
     && typeof r.prompt === 'string' && r.prompt.trim() !== '' && r.prompt.length <= ROUND_GRANT_PROMPT_MAX
     && createHash('sha256').update(r.prompt).digest('hex') === r.prompt_sha256;
@@ -1210,12 +1247,13 @@ function spentMarker(record, { home, problems = null } = {}) {
 }
 
 // The unspent records (before the provenance check) for this repository, PR, counted round k, newest first (see ownerGrantedRounds).
-function grantsFor({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
+const grantsFor = (q = {}) => grantRecordsFor(isRoundRecord, q);
+function grantRecordsFor(isKind, { repo, pr, k, head, anyHead = false, ...opts } = {}) {
   const key = repoKey(repo);
   if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || (!anyHead && !FULL_HEAD.test(String(head)))) return [];
   const moves = movesOf(opts);
   return readRecords(opts)
-    .filter((r) => isRoundRecord(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head))
+    .filter((r) => isKind(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head))
       && !spentMarker(r, opts))
     .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
 }
@@ -1225,6 +1263,22 @@ function grantsFor({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
 // anyHead: true drops the head test (head is then ignored): the caller compares the head itself, to tell a stale grant from none.
 // #128: only a record whose prompt is the owner's (promptProvenance) counts, as for a "merge".
 export const ownerGrantedRounds = (q = {}) => ownedBy(grantsFor(q), { grant: true, home: q.home });
+
+// The same lookup for the owner's approval of a PAST round (kind 'past-round'): unspent, < 24 h, bound to (repo, pr, k, head); pastRoundGrantsFor is before the provenance check,
+// ownerPastRoundRecords after it (the owner's own prompts only). Nothing in the extra-round path reads these.
+export const pastRoundGrantsFor = (q = {}) => grantRecordsFor(isPastRoundRecord, q);
+export const ownerPastRoundRecords = (q = {}) => ownedBy(pastRoundGrantsFor(q), { grant: true, home: q.home });
+// Every past-round record the owner typed for (repo, pr, k, full head), at ANY age and whatever its marker says, newest first: `state past-round-grant` resumes from a
+// record whose marker an earlier, interrupted run already spent (the lookups above skip spent records).
+export function ownerPastRoundHistory({ repo, pr, k, head, ...opts } = {}) {
+  const key = repoKey(repo);
+  if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || !FULL_HEAD.test(String(head))) return [];
+  const moves = movesOf(opts);
+  const found = readRecords({ ...opts, maxAgeMs: Infinity, maxBytes: VERIFY_MAX_BYTES })
+    .filter((r) => isPastRoundRecord(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && head.startsWith(r.head))
+    .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
+  return ownedBy(found, { grant: true, home: opts.home });
+}
 
 // Why ownerGrantedRounds found nothing, for the message: 'none' (no such record), 'provenance' (records exist but none is confirmed as typed
 // by the owner) or 'ok' (at least one is the owner's).
@@ -1351,7 +1405,9 @@ export function verifyOwnerGrant({ repo, pr, k, toHead, ownerGrant } = {}, opts 
   const id = ownerGrant?.grantId;
   if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || !FULL_HEAD.test(String(toHead))) return { ok: false, reason: 'malformed' };
   if (!GRANT_ID.test(String(id)) || typeof ownerGrant.quote !== 'string' || (ownerGrant.k !== undefined && ownerGrant.k !== k)) return { ok: false, reason: 'malformed' };
-  const record = readRecords({ ...opts, maxAgeMs: Infinity, maxBytes: VERIFY_MAX_BYTES }).find((r) => isRoundRecord(r) && grantIdOf(r) === id);
+  if (ownerGrant.past !== undefined && typeof ownerGrant.past !== 'boolean') return { ok: false, reason: 'malformed' };
+  const isKind = ownerGrant.past === true ? isPastRoundRecord : isRoundRecord; // a past-round approval backs only a `past` grant, an extra-round grant only a non-past one
+  const record = readRecords({ ...opts, maxAgeMs: Infinity, maxBytes: VERIFY_MAX_BYTES }).find((r) => isKind(r) && grantIdOf(r) === id);
   if (!record) return { ok: false, reason: 'no-record' };
   const moves = movesOf(opts);
   if (!sameRepo({ recorded: record.repo, recordedAt: record.ts, current: key, moves }) || record.pr !== pr || record.k !== k || !toHead.startsWith(record.head)) return { ok: false, reason: 'mismatch' };

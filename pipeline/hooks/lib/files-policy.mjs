@@ -33,7 +33,7 @@ const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its r
 const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
-const SENSITIVE_WORDS = /\.claude|\.codex(?:\/*(?![\w.\-\/])|\W+sessions)|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|substitute-attempts|prod-before|[\w.-]*smoke)/i;
+const SENSITIVE_WORDS = /\.claude|\.codex(?:\/*(?![\w.\-\/])|\W+sessions)|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|substitute-attempts|prod-before|published-baseline|[\w.-]*smoke)/i;
 
 // ---- the protected set ------------------------------------------------------------------------
 
@@ -71,11 +71,12 @@ const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents', '.claude/pi
 // process, which this hook never sees; an agent that hand-wrote them would get a genuine comment for a review that never ran.
 // Protected in ANY directory (each checkout and worktree has its own .review/), by name: state.json (and its tmp files), every
 // round-<n>/ folder (codex.json, diff.patch, arbiter-input.md, model-proof.json …), final-gate.json, substitute-attempts.json (the substitute
-// reviewer's attempt count and tags, which must outlive a discarded round: cp #256 R3-B1), <target>-smoke.json and
-// prod-before.json. The .review folder itself is the directory that holds them (replacing or moving it reaches them); `mkdir` of it
+// reviewer's attempt count and tags, which must outlive a discarded round: cp #256 R3-B1), <target>-smoke.json,
+// prod-before.json and published-baseline.json (the hash `publishTriage` trusts as "what this copy last published": a forged one would let a
+// shorter history replace the published one). The .review folder itself is the directory that holds them (replacing or moving it reaches them); `mkdir` of it
 // stays allowed, as it only makes an empty folder (the ship skill runs `mkdir -p .review`, then writes hardstops.json, which the
 // agent produces itself and is not protected). The state's other source, the PR triage comment, is guarded in git-policy.mjs.
-const REVIEW_FILE_SRC = String.raw`(?:^|/)\.review/(?:state\.json(?:\.[^/]*)?|round-\d+(?:/.*)?|final-gate\.json(?:\.[^/]*)?|substitute-attempts\.json(?:\.[^/]*)?|[^/]+-smoke\.json(?:\.[^/]*)?|prod-before\.json(?:\.[^/]*)?)$`;
+const REVIEW_FILE_SRC = String.raw`(?:^|/)\.review/(?:state\.json(?:\.[^/]*)?|round-\d+(?:/.*)?|final-gate\.json(?:\.[^/]*)?|substitute-attempts\.json(?:\.[^/]*)?|[^/]+-smoke\.json(?:\.[^/]*)?|prod-before\.json(?:\.[^/]*)?|published-baseline\.json(?:\.[^/]*)?)$`;
 const REVIEW_DIR_SRC = String.raw`(?:^|/)\.review/*$`;
 // #128: Claude Code's own session transcripts (<config dir>/projects/<project>/<session>.jsonl, subagents/ below it; every config dir, `.claude*`,
 // as the stacks' default transcriptDirs). The owner-go check reads them to learn who typed a prompt (hooks/lib/owner-go.mjs promptProvenance), so a
@@ -85,7 +86,7 @@ const REVIEW_DIR_SRC = String.raw`(?:^|/)\.review/*$`;
 // (the file and folder patterns live in lib/paths.mjs, the one place the use-time check reads too: R1-B2)
 const TRANSCRIPT_TEXT_SRC = String.raw`(?<![\w.\-])\.claude[^/\s'"]*/projects/[^\s'"]*\.jsonl(?![\w.\-])`;
 // One name of each kind, for globs: a glob that can match one of them can match a protected file.
-const REVIEW_SAMPLES = ['state.json', 'state.json.1.tmp', 'round-1', 'final-gate.json', 'preview-smoke.json', 'production-smoke.json', 'prod-before.json', 'substitute-attempts.json'];
+const REVIEW_SAMPLES = ['state.json', 'state.json.1.tmp', 'round-1', 'final-gate.json', 'preview-smoke.json', 'production-smoke.json', 'prod-before.json', 'substitute-attempts.json', 'published-baseline.json'];
 // A wildcard matches a name that starts with a dot (the .review folder) only when the line may switch that on: bash dotglob (shopt, or
 // BASHOPTS), zsh globdots / GLOB_DOTS, GLOBIGNORE (bash then matches dot names), a zsh (D) glob qualifier. Otherwise only a segment that
 // itself starts with a dot can match it (`.r*`, `.review`), as in every shell.
@@ -97,7 +98,7 @@ const zshDotQualifier = (s) => String(s).split(/\s/).some((tok) => tok.split(')'
 }));
 const DOT_GLOB = { test: (s) => /dotglob|glob_?dots|GLOBIGNORE/i.test(s) || zshDotQualifier(s) };
 // The same names in command or program text, wherever they sit (a literal path, or one built from pieces: '.review', 'state.json').
-const reviewTextBody = (sep) => `(?<![\\w.\\-])\\.review${sep}(?:state\\.json|round-\\d+(?![\\w.\\-])|final-gate\\.json|substitute-attempts\\.json|[\\w.\\-]*-smoke\\.json|prod-before\\.json)`;
+const reviewTextBody = (sep) => `(?<![\\w.\\-])\\.review${sep}(?:state\\.json|round-\\d+(?![\\w.\\-])|final-gate\\.json|substitute-attempts\\.json|[\\w.\\-]*-smoke\\.json|prod-before\\.json|published-baseline\\.json)`;
 
 // Why: a name assigned from a changed name is changed too (`X=$D; echo x > $X/s`, `E=$D bash w.sh`): the assignments of the line (a bare `NAME=value`, a declaration's
 // `NAME=value`) and `extra` (the prefix values of the command a child frame is started by) taint the name they set, until nothing new is added.
@@ -516,7 +517,7 @@ function physicalTargets(target, ctx) {
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
 const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go\.mjs$/i;
 
-const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, substitute-attempts.json, *-smoke.json, prod-before.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
+const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, substitute-attempts.json, *-smoke.json, prod-before.json, published-baseline.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
 
 // MCP servers (a filesystem server, any other server's write tools, a browser or IDE that runs code) reach the
 // same files without Edit/Write. Their tool_input has no fixed shape, so values are picked out by key name.

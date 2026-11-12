@@ -7,7 +7,7 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { Fail } from '../pipeline/lib/cmd-common.mjs';
 import { EXIT } from '../pipeline/lib/cli.mjs';
@@ -16,6 +16,7 @@ import { admitRound, recordRound, roundPrompt } from '../pipeline/lib/review-rou
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main' } },
   { match: '^repo view', stdoutJson: REPO_VIEW },
+  ...NO_COMMENTS,
 ];
 const file = (n) => Array.from({ length: 30 }, (_, i) => `export const v${i + 1} = ${i + 1 === 12 ? n : i + 1};`).join('\n') + '\n';
 const finding = {

@@ -115,13 +115,13 @@ An item left `needsHuman` ⇒ never ask the owner to type a ruling: decide it yo
 - A malfunction cause (`model-proof`, `invalid-arbiter`, `invalid-judge`): `P arbiter needed --round R` re-runs the arbiter, or ACCEPT.
 - You may tighten your own dismissal to ACCEPT before the merge (the fix push: Rule 8), never loosen an ACCEPT. Only the owner's typed path loosens: if, and only if, the owner says they want to dismiss it,
   follow `reference/owner-merge.md` Owner override.
-- `stale-publication` (the PR holds a review state this copy did not publish): `P state show --pr N`, then redo the last step. `P review-complete` republishes the state and is the remedy the merge refusal names.
+- `stale-publication` (the PR holds a review state this copy did not publish): `P state show --pr N`, then redo the last step. `P review-complete` republishes the state and is the remedy the merge refusal names. `history-loss` (publishing would drop rounds or grants the PR holds) and `stale-history` (this copy lacks the published history): `P state show --pr N`, then redo the step. `unpublished-history` (this copy holds history the PR lacks): `P comment --pr N --kind triage`, then redo it.
 - The owner objects to a ruling in free text ⇒ re-rule it ACCEPT, fix it (Rule 8): that makes a new head, so a new review and a new request.
 - Label mode ⇒ no rulings: park as before.
 
 **Extra round.** `P state outcome` with `reachedMax: true` and no `extraRound` / `grantedRound` ⇒
 ask for one more round: `P triage round-request --pr N`. Read `reference/owner-merge.md` (section Extra round) BEFORE asking: your reply must end with the exact `line` it prints.
-Never type, paraphrase or forge the owner's words, and never run Codex outside `codex-review`. Label mode ⇒ no grant exists: a reached max parks (step 6).
+Never type, paraphrase or forge the owner's words, and never run Codex outside `codex-review`. Label mode ⇒ no grant exists: a reached max parks (step 6). **Past rounds.** `review-complete` or the gate names a round that "ran before owner grants were recorded" ⇒ `P triage round-request --pr N --past`; say in plain English that it approves round n, which ALREADY RAN at head <sha12> (its review date is not recorded), and end the reply with its exact `line`; the owner types `approve round`; then `P state past-round-grant --pr N --round n`. Repeat while `remaining` is non-empty, then `P review-complete`. Never for a new round (see `reference/owner-merge.md`).
 
 ## 3. Review complete, ready, hand-off
 

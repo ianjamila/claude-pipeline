@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { SHARED_FLOOR_DIR, floorEnv } from './helpers/floor-env.mjs';
-import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { BRIEFS, acceptedEfforts, effortsAtLeast, expectationOf, fixRoundCandidate, previousAccepts } from '../pipeline/lib/fix-verify.mjs';
 import { proveModel } from '../pipeline/lib/transcript.mjs';
 import { buildAgentLogLine, countArbiterCalls, countFixVerifyCalls } from '../pipeline/lib/agentlog.mjs';
@@ -32,6 +32,7 @@ const fenced = (obj) => `Done.\n\n\`\`\`json\n${JSON.stringify(obj)}\n\`\`\``;
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x' } },
   { match: '^repo view', stdoutJson: REPO_VIEW },
+  ...NO_COMMENTS,
 ];
 
 // Every Fable round here comes from src/a.js being a path the config sends to Fable each round; src/b.js is the "fix" file.
