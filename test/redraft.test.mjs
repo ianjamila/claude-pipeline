@@ -215,6 +215,21 @@ test('8. a mutation that answers isDraft:false, or errors, is exit 1 convert-fai
   assert.deepEqual(mutations(queueFails), []);
 });
 
+test('8b. the repo read that names the merge lock fails before the lock exists: exit 3 stage:read, nothing changed, no lock left behind', () => {
+  const s = world({ entries: [{ match: '^repo view', code: 1, stderr: 'gh: Server Error (HTTP 502)' }, mutation()] });
+  const r = redraft(s);
+  assertExit(r, 3, r.stdout);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.unavailable, true);
+  assert.equal(r.json.stage, 'read', 'Rule 8: stage read means do NOT push');
+  assert.notEqual(r.json.error, 'internal');
+  assert.deepEqual(holdCalls(s), []);
+  assert.deepEqual(writes(s), []);
+  const after = tryAcquire(mergeLockName('acme/widgets', PR), { dir: LOCK_DIR, machineId: 'gate-env-test-machine' });
+  assert.equal(after.acquired, true, 'no merge lock left behind');
+  releaseLock(after.lock);
+});
+
 test('9. a release that is NOT confirmed is still exit 0 with holdRelease.confirmed:false and a warning; the conversion is done', () => {
   const s = world({ entries: [mutation()] });
   const r = redraft(s, [], { FAKE_HOLD_RELEASE_EXIT: '1' });
