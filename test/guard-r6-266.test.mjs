@@ -163,3 +163,98 @@ for (const [label, line] of PP_ALLOW) {
     assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
   });
 }
+
+// PR #266 round 7 (+ post-push review of c2c088f): the per-`${` judging still skipped heads it did not recognise.
+//   R7-B1   EXPANSION_NAME had two overlapping `*` classes: `${` + 190,000 `!` backtracked quadratically. One hand-written depth-tracking scan now judges every `${…}` against its TRUE closing brace.
+//   R7-F1 / PP3-a  a nested head (`${${x}:path[…]}`, `${${:-a}:1:path[…]}`, a decoy `'}'`) hid the offset and the risky chars from the old next-`}` span.
+//   PP3-b   a combining mark (or any non-ASCII char) in the name skipped the offset check.   PP3-c  a nested `}` followed by `:` is refused (like `}[`).
+//   R7-F2   a bare subscript on a one-character special parameter (`$@[…]`, `$*[…]`, `$#[…]`, `$?[…]`, `$$[…]`, `$![…]`, `$-[…]`) is evaluated as arithmetic; `${x::len}` is no operator.
+//   R7-F3   a bare `_` read as arithmetic is the last word of the previous command: on a line that names a protected file an arithmetic context (`$((`, `$[`, `((`, `let`, a numeric test operator,
+//           a lone `_` word) denies the line, since the reader names no protected file and is never judged.
+// (zsh 5.9 could not be run from the guarded shell, so none of the spellings is probed.)
+const R7_SUB = `path[${BSL}${D}(rm ${S})]`;
+const R7 = [
+  ['F1 ${${x}:path[$(cmd)]}', (q) => `echo ${q}${OB}${OB}x}:${R7_SUB}}${q}`],
+  ['F1 ${${:-a}:1:path[$(cmd)]}', (q) => `echo ${q}${OB}${OB}:-a}:1:${R7_SUB}}${q}`],
+  ['PP3-a a } decoy inside the inner expansion', (q) => `echo ${q}${OB}${OB}x:-'}'}:${R7_SUB}}${q}`],
+  ['PP3-a a } decoy, then an offset parameter', (q) => `echo ${S} ${q}${OB}${OB}x:-'}'}:${D}y}${q}`],
+  ['PP3-a nested head with a non-digit offset', (q) => `echo ${S} ${q}${OB}${OB}x}:y}${q}`],
+  ['PP3-a nested head three deep', (q) => `echo ${S} ${q}${OB}${OB}${OB}x}}:y}${q}`],
+  ['PP3-c ${x:-${y}:z} nested close then a colon', (q) => `echo ${S} ${q}${OB}x:-${OB}y}:z}${q}`],
+  ['F1 ${x::path[$(cmd)]}', (q) => `echo ${q}${OB}x::${R7_SUB}}${q}`],
+  ['F1 ${x::len} is no operator', (q) => `echo ${S} ${q}${OB}x::y}${q}`],
+  ['F2 $@[…]', (q) => `echo ${q}${D}@[${R7_SUB}]${q}`],
+  ['F2 $*[…]', (q) => `echo ${q}${D}*[${R7_SUB}]${q}`],
+  ['F2 $#[…]', (q) => `echo ${q}${D}#[${R7_SUB}]${q}`],
+  ['F2 $?[…]', (q) => `echo ${q}${D}?[${R7_SUB}]${q}`],
+  ['F2 $$[…]', (q) => `echo ${q}${D}${D}[${R7_SUB}]${q}`],
+  ['F2 $![…]', (q) => `echo ${q}${D}![${R7_SUB}]${q}`],
+  ['F2 $-[…]', (q) => `echo ${q}${D}-[${R7_SUB}]${q}`],
+  ['PP3-b combining mark in the name, arithmetic offset', (q) => `echo ${S} ${q}${OB}x́:y}${q}`],
+  ['PP3-b non-ASCII name, offset from a parameter', (q) => `echo ${S} ${q}${OB}é:${D}y}${q}`],
+  ['PP3-b non-ASCII name, subscript offset', (q) => `echo ${q}${OB}日本:${R7_SUB}}${q}`],
+  ['PP3-c ${x}:… after a nested close', (q) => `echo ${S} ${q}${OB}${OB}x}:1}${q}`],
+  ['a quote inside a span', (q) => `echo ${S} ${q}${OB}x:-'}'${D}y:path}${q}`],
+];
+for (const [label, mk] of R7) {
+  for (const [qn, q] of [['double-quoted', '"'], ['unquoted', '']]) {
+    test(`#266 R7 denies: ${label}, ${qn}`, () => {
+      const line = mk(q);
+      const r = run(line);
+      assert.equal(r.decision, 'deny', `${line.slice(0, 200)} -> ${r.decision}`);
+    });
+  }
+}
+const PLANT = `echo 'path[${D}(rm ${S})]'`; // names the protected file, a plain echo of a literal
+for (const [label, line] of [
+  ['$((_))', `${PLANT}; echo ${D}((_))`], ['(( _ ))', `${PLANT}; (( _ ))`], ['let _', `${PLANT}; let _`], ['$[_]', `${PLANT}; echo ${D}[_]`],
+  ['[ _ -eq 1 ]', `${PLANT}; [ _ -eq 1 ]`], ['[[ _ -gt 0 ]]', `${PLANT}; [[ _ -gt 0 ]]`], ['printf %d _', `${PLANT}; printf '%d' _`],
+  ['echo ${x:_}', `${PLANT}; echo ${OB}x:_}`], ['echo $a[_]', `${PLANT}; echo ${D}a[_]`], ['reader first', `echo ${D}((_)); ${PLANT}`],
+]) {
+  test(`#266 R7-F3 denies: ${label} beside a line that names a protected file`, () => {
+    const r = run(line);
+    assert.equal(r.decision, 'deny', `${line} -> ${r.decision}`);
+  });
+}
+
+const R7_TIMED = [
+  ['`${` then 190,000 !', `echo '{}' > ${S}; : '<<' '${OB}${'!'.repeat(190000)}'`],
+  ['`${` then 190,000 $', `echo '{}' > ${S}; : '<<' '${OB}${D.repeat(190000)}'`],
+  ['190,000 $ then [', `echo '{}' > ${S}; : '<<' '${D.repeat(190000)}['`],
+  ['`${${${` x 100k', `echo '{}' > ${S}; : '<<' '${OB.repeat(100000)}'`],
+  ['`${x:` then 190k digits', `echo '{}' > ${S}; : '<<' '${OB}x:${'1'.repeat(190000)}'`],
+  ['`${é` then 190k combining marks', `echo '{}' > ${S}; : '<<' '${OB}é${'́'.repeat(190000)}'`],
+  ['`${x:-` then 90k of `}:`', `echo '{}' > ${S}; : '<<' '${OB}x:-${'}:'.repeat(90000)}'`],
+  ['`${` then 190k flag chars #', `echo '{}' > ${S}; : '<<' '${OB}${'#'.repeat(190000)}'`],
+  ['`$@` x 90k then [', `echo '{}' > ${S}; : '<<' '${(D + '@').repeat(90000)}['`],
+];
+for (const [label, line] of R7_TIMED) {
+  test(`#266 R7 timing: ${label} is denied in under 2 s`, () => {
+    const t0 = performance.now();
+    const r = run(line);
+    const ms = performance.now() - t0;
+    assert.equal(r.decision, 'deny', `${r.decision}`);
+    assert.ok(ms < 2000, `took ${Math.round(ms)} ms`);
+  });
+}
+
+const R7_ALLOW = [
+  ['echo "${HOME}"', `cat ${S} "${OB}HOME}"`],
+  ['${X:-default}', `cat ${S} "${OB}X:-default}"`],
+  ['${x:1:2}', `cat ${S} "${OB}x:1:2}"`],
+  ['${x: -1}', `cat ${S} "${OB}x: -1}"`],
+  ['${x:+alt}', `cat ${S} "${OB}x:+alt}"`],
+  ['${X:=./f.sh}', `cat ${S} ${OB}X:=./f.sh}`],
+  ['${#x} and ${!x} and ${@}', `cat ${S} "${OB}#x}" "${OB}!x}" "${OB}@}" "${OB}#}"`],
+  ['${PATH#*:} pattern with a colon', `cat ${S} "${OB}PATH#*:}"`],
+  ['${x%.txt} and ${x/a/b}', `cat ${S} "${OB}x%.txt}" "${OB}x/a/b}"`],
+  ['two top-level expansions around a colon', `cat ${S} "${OB}HOME}:${OB}PATH}"`],
+  ['${x:-${y}} nested default', `cat ${S} "${OB}x:-${OB}y}}"`],
+  ['words with an underscore inside', `cat ${S} a_b _x`],
+];
+for (const [label, line] of R7_ALLOW) {
+  test(`#266 R7 still allows: ${label}`, () => {
+    const r = run(line);
+    assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
+  });
+}

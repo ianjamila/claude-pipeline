@@ -1584,7 +1584,10 @@ const CDPATH_NAMES = ['CDPATH', 'cdpath'];
 const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'source', '.']);
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
 const LAST_WORD_RE = /\$_(?![A-Za-z0-9_])|\$\{_(?:[^A-Za-z0-9_}][^}]*)?\}/; // `$_` / `${_}`: the last word of the previous command (not `$_x`)
-const FD_DUP = /^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
+// R7-F3 (#266): an arithmetic context on a line that names a protected file: `$((`, `((`, `$[`, a `let` word, a numeric test operator word (`-eq`, `-lt` ...) and a lone `_` word (whitespace-delimited;
+// `${x:_}`, `$a[_]`, `printf %d _`, `[ _ ... ]` read it as arithmetic). Each alternative is a literal or a one-class run, so the scan is linear.
+const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])let(?=\s)|\s-(?:eq|ne|lt|gt|le|ge)(?=\s)|(?:^|[\s:[(])_(?=[\s\])}:;&|]|$)/;
+const FD_DUP =/^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
 const FAN_OUT_RE = /(?:^|[\s;&|(`])(?:xargs|parallel)(?=\s|$)/;
 
@@ -1863,32 +1866,74 @@ function testEvaluates(name, args, words, expand, raw) {
 //   (b) an `=` (so `=`, `:=`, `::=`) after a name char or a `]`, between the first `${` and the last `}` of the text, whose word is not plain path characters up to a closing brace (R6-F2: a
 //       positional name counts). One linear pass: the first head and the last `}` are found once and each `=` is judged where it stands, so no decoy `}` ends the region early and no head is
 //       rescanned (R6-F1: a hook past the host's 15 s is ALLOWED, and the two lazy patterns of round 5 backtracked quadratically: 16 s at 190 kB). Over-matching (`${x:-a=$(b)}`, `echo ${A} k=$(b)`) fails closed.
-const EVALUATING_WORD = /\$\{\(|\$\(\(|\$\[|\$[\p{L}\p{N}_]+\[|\}\[/u; // (post-push: `$name[…]` and `${name}[…]` are subscripts too; each alternative stops at the next `$`, so the scan is linear)
+const EVALUATING_WORD = /\$\{\(|\$\(\(|\$\[|\$(?:[\p{L}\p{N}_]+|[@*#?$!-])\[|\}\[/u; // (`$name[…]`, `${name}[…]` and (R7-F2) `$@[` `$*[` `$#[` `$?[` `$$[` `$![` `$-[` are subscripts too; each alternative is anchored on its `$` and holds at most one repetition of a class that excludes `$`, so the scan is linear)
 const PLAIN_DEFAULT = /[A-Za-z0-9_./~+-]*\}/y; // (the default word up to its closing brace: plain path characters only; sticky, so it is matched where the `=` ends and nowhere else)
-const SPAN_RISK = /\[|\$\(|`/g; // (post-push: what inside a `${…}` can run a substitution or evaluate a subscript)
-const EXPANSION_NAME = /[=~^+!#]*[\p{L}\p{N}_@*?$!-]*:/uy; // (the name up to the colon of a `${name:…}`; sticky, matched at one place)
-const OFFSET_OK = /\s*-?\d+(?:\s*:\s*-?\d+)?\s*\}|[-+=?#|^:]/y; // (what may follow that colon: plain digits (a negative one too, `: -1`) or an operator `:- :+ := :? :# :| :^ ::`)
+const SPAN_STOP = /[[`'"\\{]/; // (inside a `${…}`: what can run a substitution, evaluate a subscript, hide a `}` or open a brace of its own; with `$(` it makes the span unjudgeable, so the text is refused)
+const isDigit = (c) => c >= '0' && c <= '9';
+const isNameChar = (c) => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || isDigit(c) || c === '_' || c.charCodeAt(0) > 127; // (non-ASCII: a letter, a mark or a surrogate half; zsh with MULTIBYTE allows them in a name)
+// The `:` of a `${name:…}` at text[i] (R7-F1 / PP3): `:- :+ := :? :# :| :^` are operators (their word is scanned by the caller for what can run); `::=` is the assigning operator (`::` alone is NOT one: zsh may read
+// `${x::len}` as an offset plus an arithmetic length). Anything else is an offset (and length): zsh evaluates it as arithmetic, so only plain digits are accepted (`:1`, `:1:2`, `: -1`; `:-1` is the default
+// operator). Returns true when the colon is acceptable. Linear: it only walks forward.
+function colonOk(text, i) {
+  const n = text.length;
+  const c = text[i + 1];
+  if (c === '-' || c === '+' || c === '=' || c === '?' || c === '#' || c === '|' || c === '^') return true;
+  if (c === ':') return text[i + 2] === '=';
+  let j = i + 1;
+  for (let part = 0; part < 2; part++) {
+    while (j < n && (text[j] === ' ' || text[j] === '\t')) j++;
+    if (text[j] === '-') j++;
+    const d = j;
+    while (j < n && isDigit(text[j])) j++;
+    if (j === d) return false;
+    while (j < n && (text[j] === ' ' || text[j] === '\t')) j++;
+    if (text[j] === ':' && part === 0) { j++; continue; }
+    break;
+  }
+  return text[j] === '}';
+}
+// One linear pass with a stack depth of open `${` (R7-B1, R7-F1, PP3-a/b/c): every `${…}` is judged against its TRUE closing brace, however deep, and no regex with overlapping repetitions is used.
+//   - the head: flag chars `= ~ ^ + ! #`, then a plain name (letters, digits, `_`, non-ASCII) or ONE special char `@ * ? $ ! -`; a head that goes on with `$`, `{`, `(`, `[` or a quote is refused (a nested head);
+//   - the char after the head: `}` ends, `:` must be a known operator or a plain-digit offset / length, anything else (`%`, `#`, `/`, `-`, `=`, a space ...) starts a pattern or default word;
+//   - inside any open span a `[`, a backtick, a quote, a backslash, a bare `{` or a `$(` (also `$((`) refuses the text: the span may run a substitution or evaluate a subscript, or hide a `}`;
+//   - a `}` that closes an inner span and is followed by `:` or `[` is refused (a nested head with an offset). Over-matching fails closed (`${x:-${y}:z}`, `${x:-"a"}`, a lone `{` in a default word).
+function scanExpansions(text, first) {
+  const n = text.length;
+  let depth = 0;
+  for (let i = first; i < n;) {
+    const c = text[i];
+    if (c === '$' && text[i + 1] === '{') {
+      depth++;
+      let j = i + 2;
+      while (j < n && '=~^+!#'.includes(text[j])) j++;
+      if (j < n && isNameChar(text[j])) { while (j < n && isNameChar(text[j])) j++; }
+      else if (j < n && '@*?$!-'.includes(text[j])) {
+        if (text[j] === '$' && (text[j + 1] === '{' || text[j + 1] === '(' || text[j + 1] === '$' || (j + 1 < n && isNameChar(text[j + 1])))) return true; // (a head that is itself an expansion)
+        j++;
+      }
+      const h = text[j];
+      if (h === undefined) return false; // (the text ends in a head: nothing more to judge)
+      if (h === '[' || h === '$' || h === '{' || h === '(' || h === '`' || h === "'" || h === '"' || h === '\\') return true;
+      if (h === ':' && !colonOk(text, j)) return true;
+      i = j;
+    } else if (c === '}') {
+      if (depth > 0) {
+        depth--;
+        if (depth > 0 && (text[i + 1] === ':' || text[i + 1] === '[')) return true; // (PP3-c: a nested head with an offset)
+      }
+      i++;
+    } else if (depth > 0 && (SPAN_STOP.test(c) || (c === '$' && text[i + 1] === '('))) return true;
+    else i++;
+  }
+  return false;
+}
 function plantsInText(text) {
   if (typeof text !== 'string') return false;
   if (EVALUATING_WORD.test(text)) return true;
   const first = text.indexOf('${');
   if (first === -1) return false;
   const end = text.lastIndexOf('}');
-  // post-push (#266): every `${…}` is judged once, left to right, with remembered positions (the next `}`, the next risky char), so the pass stays linear however many `${` the text holds.
-  // zsh evaluates a subscript as arithmetic in a `${name:offset:length}` and in `${x[…]}`: a span (up to the next `}`) holding a `[`, `$(` or a backtick is refused, and so is an offset or length that is not plain digits.
-  let close = -2; // (index of the next `}` at or after the current head; -1 = none, the span runs to the end)
-  let risk = -2; // (index of the next risky char at or after the current head; -1 = none)
-  for (let h = first; h !== -1; h = text.indexOf('${', h + 2)) {
-    if (close !== -1 && close < h) close = text.indexOf('}', h);
-    if (risk !== -1 && risk < h) { SPAN_RISK.lastIndex = h; const m = SPAN_RISK.exec(text); risk = m ? m.index : -1; }
-    const stop = close === -1 ? text.length : close;
-    if (risk !== -1 && risk < stop) return true;
-    EXPANSION_NAME.lastIndex = h + 2;
-    if (EXPANSION_NAME.test(text) && EXPANSION_NAME.lastIndex <= stop) {
-      OFFSET_OK.lastIndex = EXPANSION_NAME.lastIndex;
-      if (!OFFSET_OK.test(text)) return true;
-    }
-  }
+  if (scanExpansions(text, first)) return true;
   // an `=` after a name char, a `]` or any non-ASCII char (zsh with MULTIBYTE allows letters like `é` in a name; a mark or a surrogate half is above 127 too) assigns when its word is not plain
   let at = text.indexOf('=', first + 2);
   while (at !== -1 && at < end) {
@@ -3718,6 +3763,9 @@ function evaluateBashForFilesFrame(command, opts) {
   // A scan that was cut short (parse caps, dynamic commands, sizes) cannot prove a command harmless: fail closed
   // when the raw text names a protected file at all.
   if ((cmds.dynamic || ctx.dynamic) && protectedInRaw) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
+  // R7-F3 (#266): in arithmetic zsh reads a bare name `_` (the last word of the previous command) and evaluates its text again, a subscript with a substitution included. `echo 'path[$(cmd)]'; echo $((_))`
+  // plants nothing a rule can refuse, and the reader names no protected file, so it is never judged: on a line that names a protected file an arithmetic context anywhere denies the line.
+  if (protectedInRaw && ARITH_CONTEXT.test(raw)) return deny(`the command line refers to a protected pipeline file and holds an arithmetic context ($(( )), $[ ], (( )), let, a numeric test operator or a lone _ word), which can evaluate text planted by an earlier command; split it so the arithmetic is on its own line (${PROTECTED_MSG})`);
 
   const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(rawOfCmd(c));
   // Why: in a rerun that assumes the directory (after a cd only known at run time) every relative word resolves inside the assumed protected directory (`npm`, `test`), so a word counts only when it can name
