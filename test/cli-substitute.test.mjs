@@ -149,7 +149,6 @@ test('a reset that passed between prepare and apply does not matter (R5-8): appl
 });
 
 test('apply refusals: every way the transcript can differ from the prepared run is exit 1, recorded invalid, and records no round', (t) => {
-  const w = world(t);
   const variations = [
     ['Sonnet', { models: ['claude-sonnet-4-6'] }, /unexpected model/],
     ['one turn on Sonnet', { models: [OPUS, 'claude-sonnet-4-6'] }, /unexpected model/],
@@ -164,6 +163,8 @@ test('apply refusals: every way the transcript can differ from the prepared run 
     ['schema error', { answer: { summary: '', blocking: [], suggestions: [], worth_considering: [] } }, /findings: summary/],
   ];
   for (const [label, over, expected] of variations) {
+    // one world per variation: attempts are kept per packet (R1-F1), so a second invalid attempt in one world would read retry:park
+    const w = world(t);
     const prep = w.ready();
     const o = { ...over };
     if (typeof o.prompt === 'function') o.prompt = o.prompt(`${prep.promptHeader}\nRead ${prep.inputPath} and review the pull request.\n`);
@@ -282,7 +283,8 @@ test('a high-risk PR: substitute-fable, Opus is refused, an old Fable is stale-m
   assert.equal(old.json.error, 'stale-model');
   assert.equal(old.json.retry, 'prepare');
   const next = w.prepare().json;
-  assert.equal(next.attempt, 2);
+  // attempts are kept per packet (R1-F1): 1 = the Opus transcript (counted), 2 = the old Fable (not counted), so this is the third
+  assert.equal(next.attempt, 3);
   const ok = w.apply(install(w, next, { models: [FABLE] }));
   assertExit(ok, 0, ok.stdout);
   assert.equal(w.state().rounds[0].substitute.agent, 'substitute-fable');

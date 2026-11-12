@@ -4,13 +4,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { addWaiting, backAtMs, clearOutage, readStatus, readWeeklyUsage, recordOutage, removeWaiting, resumePrompt, statusFile } from '../pipeline/lib/codex-usage.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+// Real worktree folders: a parked PR whose worktree is gone is dropped from the notice and on the next write (R1-F3), so fixtures name folders that exist.
+const WT = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-wt-')));
+process.on('exit', () => rmSync(WT, { recursive: true, force: true }));
+const wt = (name) => { const p = join(WT, name); mkdirSync(p, { recursive: true }); return p; };
 const FIXTURE = join(here, 'fixtures', 'codex-0.154', 'codex-0.154-token-count-codex.jsonl');
 const REAL_LINE = readFileSync(FIXTURE, 'utf8').trim();
 const REAL = JSON.parse(REAL_LINE);
@@ -167,10 +172,10 @@ test('the record is empty until something is written, and an unreadable file rea
 
 test('recordOutage stores the outage; clearOutage removes it and keeps the waiting list', async (t) => {
   const o = rec(t);
-  await addWaiting({ repo: 'ianjamila/claude-pipeline', pr: 256, worktree: '/w/a', round: 2, since: '2026-11-11T08:00:00Z' }, o);
-  await recordOutage({ at: '2026-11-11T08:21:00Z', resetAt: '2026-11-11T16:21:00+08:00', resetText: '4:21 PM', repo: 'ianjamila/claude-pipeline', pr: 256, round: 2, worktree: '/w/a' }, o);
+  await addWaiting({ repo: 'ianjamila/claude-pipeline', pr: 256, worktree: wt('a'), round: 2, since: '2026-11-11T08:00:00Z', now: Date.parse('2026-11-11T09:00:00Z') }, o);
+  await recordOutage({ at: '2026-11-11T08:21:00Z', resetAt: '2026-11-11T16:21:00+08:00', resetText: '4:21 PM', repo: 'ianjamila/claude-pipeline', pr: 256, round: 2, worktree: wt('a') }, o);
   const s = readStatus(o);
-  assert.deepEqual(s.lastOutage, { at: '2026-11-11T08:21:00.000Z', resetAt: '2026-11-11T08:21:00.000Z', resetText: '4:21 PM', repo: 'ianjamila/claude-pipeline', pr: 256, round: 2, worktree: '/w/a' });
+  assert.deepEqual(s.lastOutage, { at: '2026-11-11T08:21:00.000Z', resetAt: '2026-11-11T08:21:00.000Z', resetText: '4:21 PM', repo: 'ianjamila/claude-pipeline', pr: 256, round: 2, worktree: wt('a') });
   await recordOutage({ at: '2026-11-11T09:00:00Z', resetAt: null, resetText: null }, o);
   assert.deepEqual(readStatus(o).lastOutage, { at: '2026-11-11T09:00:00.000Z', resetAt: null, resetText: null, repo: null, pr: null, round: null, worktree: null }, 'a later outage replaces it; unknown fields are null');
   await clearOutage(o);
@@ -181,21 +186,21 @@ test('recordOutage stores the outage; clearOutage removes it and keeps the waiti
 
 test('addWaiting upserts by repo+PR, carries the resume sentence, and removeWaiting removes only that PR', async (t) => {
   const o = rec(t);
-  const a = { repo: 'ianjamila/claude-pipeline', pr: 255, worktree: '/w/a', round: 1 };
-  await addWaiting({ ...a, since: '2026-11-11T08:00:00Z' }, o);
-  await addWaiting({ repo: 'ianjamila/eaglewatch', pr: 1818, worktree: '/w/b', round: 3, since: '2026-11-11T08:05:00Z' }, o);
+  const a = { repo: 'ianjamila/claude-pipeline', pr: 255, worktree: wt('a'), round: 1 };
+  await addWaiting({ ...a, since: '2026-11-11T08:00:00Z', now: Date.parse('2026-11-11T09:00:00Z') }, o);
+  await addWaiting({ repo: 'ianjamila/eaglewatch', pr: 1818, worktree: wt('b'), round: 3, since: '2026-11-11T08:05:00Z', now: Date.parse('2026-11-11T09:00:00Z') }, o);
   let s = readStatus(o);
   assert.deepEqual(s.waiting.map((w) => [w.repo, w.pr, w.round, w.since]), [['ianjamila/claude-pipeline', 255, 1, '2026-11-11T08:00:00.000Z'], ['ianjamila/eaglewatch', 1818, 3, '2026-11-11T08:05:00.000Z']]);
-  assert.equal(s.waiting[0].resume, 'resume the review of ianjamila/claude-pipeline#255 from round 1 in /w/a');
+  assert.equal(s.waiting[0].resume, `resume the review of ianjamila/claude-pipeline#255 from round 1 in ${wt('a')}`);
   assert.equal(resumePrompt({ ...a, pr: 7, round: 4, worktree: '/x' }), 'resume the review of ianjamila/claude-pipeline#7 from round 4 in /x');
   // a second add for the same PR updates round/worktree and keeps the first `since`
-  await addWaiting({ ...a, round: 2, worktree: '/w/a2', now: Date.parse('2026-11-11T09:00:00Z') }, o);
+  await addWaiting({ ...a, round: 2, worktree: wt('a2'), now: Date.parse('2026-11-11T09:00:00Z') }, o);
   s = readStatus(o);
   assert.equal(s.waiting.length, 2);
-  assert.deepEqual([s.waiting[0].round, s.waiting[0].worktree, s.waiting[0].since], [2, '/w/a2', '2026-11-11T08:00:00.000Z']);
-  assert.equal(s.waiting[0].resume, 'resume the review of ianjamila/claude-pipeline#255 from round 2 in /w/a2');
+  assert.deepEqual([s.waiting[0].round, s.waiting[0].worktree, s.waiting[0].since], [2, wt('a2'), '2026-11-11T08:00:00.000Z']);
+  assert.equal(s.waiting[0].resume, `resume the review of ianjamila/claude-pipeline#255 from round 2 in ${wt('a2')}`);
   // `since` defaults to now
-  await addWaiting({ repo: 'r/x', pr: 1, worktree: '/w/c', round: 1, now: Date.parse('2026-11-11T09:30:00Z') }, o);
+  await addWaiting({ repo: 'r/x', pr: 1, worktree: wt('c'), round: 1, now: Date.parse('2026-11-11T09:30:00Z') }, o);
   assert.equal(readStatus(o).waiting.at(-1).since, '2026-11-11T09:30:00.000Z');
   await removeWaiting({ repo: 'ianjamila/claude-pipeline', pr: 255 }, o);
   await removeWaiting({ repo: 'no/such', pr: 9 }, o); // nothing there: a no-op
@@ -230,15 +235,15 @@ test('concurrent writers in separate processes lose no entry and leave one valid
   const lib = join(here, '..', 'pipeline', 'lib', 'codex-usage.mjs');
   const script = `
     const { addWaiting, recordOutage, removeWaiting } = await import(${JSON.stringify(`file://${lib}`)});
-    const [dir, who] = process.argv.slice(1);
+    const [dir, who, wtRoot] = process.argv.slice(1);
     for (let i = 0; i < 6; i++) {
-      await addWaiting({ repo: 'o/r' + who, pr: i + 1, worktree: '/w/' + who, round: 1 }, { dir });
-      await addWaiting({ repo: 'o/gone' + who, pr: i + 1, worktree: '/w/' + who, round: 1 }, { dir });
+      await addWaiting({ repo: 'o/r' + who, pr: i + 1, worktree: wtRoot + '/' + who, round: 1 }, { dir });
+      await addWaiting({ repo: 'o/gone' + who, pr: i + 1, worktree: wtRoot + '/' + who, round: 1 }, { dir });
       await removeWaiting({ repo: 'o/gone' + who, pr: i + 1 }, { dir });
     }
-    await recordOutage({ at: '2026-11-11T08:00:00Z', repo: 'o/r' + who, pr: 1, round: 1, worktree: '/w/' + who }, { dir });`;
+    await recordOutage({ at: '2026-11-11T08:00:00Z', repo: 'o/r' + who, pr: 1, round: 1, worktree: wtRoot + '/' + who }, { dir });`;
   const runOne = (who) => new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['--input-type=module', '-e', script, o.dir, who], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, o.dir, who, wt(who) + "/.."], { stdio: ['ignore', 'pipe', 'pipe'] });
     let err = '';
     child.stderr.on('data', (d) => { err += d; });
     child.on('error', reject);
