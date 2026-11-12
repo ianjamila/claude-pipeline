@@ -1480,10 +1480,44 @@ function cdUnknownShape(argv) {
   const cn = baseOf(argv[0] ?? '');
   const args = argv.slice(1);
   if (cn === 'popd' || args.includes('-')) return true;
+  // R10-F3: zsh reads `cd +N` / `cd -N` as entry N of the directory stack (entry 0 is the current directory), not as a directory name
+  if (cn === 'cd' && args.some((a) => /^[+-]\d+$/.test(a))) return true;
   const t = args.find((a) => !a.startsWith('-') && a !== '/d');
   if (cn === 'pushd' && (t === undefined || args.some((a) => /^[+-]\d+$/.test(a)))) return true;
   if (cn === 'cd' && args.filter((x) => !x.startsWith('-')).length > 1) return true;
   return t !== undefined && /^~(?:[-+]|[A-Za-z_])/.test(t);
+}
+// R10-F4: what `set -o NAME` / `set +o NAME` (also `-oNAME`, `-eo NAME`) names: the option words of a `set` line, or null for a `set` that names none (`set -o` alone lists them).
+// Why: the options with no effect on what `cd` means are a short list; every other name (and any name only known at run time) counts as a directory changer.
+const SAFE_SET_OPTIONS = new Set(['errexit', 'nounset', 'pipefail', 'xtrace', 'verbose', 'noclobber']);
+function setOptionNames(argv) {
+  const out = [];
+  const args = argv.slice(1);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--') break;
+    const m = /^[-+][A-Za-z]*?o(.*)$/.exec(args[i]);
+    if (!m || !/^[-+][A-Za-z]+$/.test(args[i].slice(0, args[i].length - m[1].length))) continue;
+    out.push(m[1] !== '' ? m[1] : (args[i + 1] ?? ''));
+    if (m[1] === '') i++;
+  }
+  return out;
+}
+// `set -o NAME` with a NAME outside the safe list, or a bare `set -o`; and any assignment to zsh's `options[...]` (or `options+=`)
+function optionSwitch(c) {
+  const name = baseOf(c.argv[0] ?? '');
+  if (name === 'set' && setOptionNames(c.argv).some((n) => !SAFE_SET_OPTIONS.has(optionWord(n)))) return true;
+  return Object.hasOwn(c.env ?? {}, 'options') || c.argv.some((a) => /^options(?:\[|\+?=)/.test(a));
+}
+// Is this a command that may turn on CDABLE_VARS (`cd NAME` then goes to $NAME) or is it a switch whose name cannot be read? Then a cd of the line leads to a directory only known at run time.
+const optionWord = (w) => w.toLowerCase().replace(/[_-]/g, '');
+function cdMeaningSwitch(c) {
+  const name = baseOf(c.argv[0] ?? '');
+  const words = (name === 'set' ? setOptionNames(c.argv) : name === 'setopt' || name === 'shopt' ? c.argv.slice(1) : []).map(optionWord);
+  if (name === 'set' && words.some((w) => w === '')) return true;
+  if (words.some((w) => w.includes('cdablevars') || /[$`*?[{(]/.test(w))) return true;
+  const sub = (w) => /^options\[(.*)\]/.exec(w)?.[1];
+  const opts = c.argv.map(sub).filter((x) => x !== undefined).map(optionWord);
+  return opts.some((w) => w.includes('cdablevars') || /[$`*?[{(]/.test(w)) || (Object.hasOwn(c.env ?? {}, 'options'));
 }
 // Why: a cd whose target a command computes is not always unknown. Modelled (an absolute directory, never a protected one unless the script / repo really is there; null = not one of these):
 // the directory of the judged script file itself (`$(dirname "$0")`, `${0%/*}`, `$(dirname "${BASH_SOURCE[0]}")`, each also in `$(cd ... && pwd)`), the repo root a `.git` walk finds
@@ -3364,6 +3398,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false };
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
+  const cdSwitched = cmds.some(cdMeaningSwitch);
   const from = flowStart(cmds);
   const seen = new Map();
   const local = Object.create(null);
@@ -3395,7 +3430,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
       const v = t === undefined ? t : substVars(t, local, ctx.budget);
       const cdpath = (ctx.env?.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (ctx.vars[n] ?? '') !== '' || out.vars.has(n) || ctx.pickUnknown.has(n) || ctx.srcChanged.has(n) || (c.env?.[n] ?? '') !== '' || cmds.some((x) => x.argv.some((a) => a.startsWith(`${n}[`))));
-      if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || (cdpath && v !== undefined && !isAbs(toPosix(v)) && !/^(?:\.\.?(?:[\\/]|$)|~)/.test(v))) out.unknownCd = true;
+      if (cdUnknownShape(c.argv) || (cdSwitched && name === 'cd') || (v !== undefined && /[`$*?[{]/.test(v)) || (cdpath && v !== undefined && !isAbs(toPosix(v)) && !/^(?:\.\.?(?:[\\/]|$)|~)/.test(v))) out.unknownCd = true;
       else out.cds.push(t ?? '~');
       set('PWD', null, false); set('OLDPWD', null, false); // (cd rebinds both)
     }
@@ -3750,11 +3785,12 @@ function evaluateBashForFilesFrame(command, opts) {
     const homeMoved = ctx.unknownAll || ctx.homeSourced === true || moved('HOME') || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[|$)/.test(a)));
     // Why: with CDPATH set a relative `cd sub` goes to the first CDPATH entry that has `sub` (the line's, the environment's, one a source may have set)
     const cdpathSet = (startupEnv.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (Object.hasOwn(ctx.vars, n) && ctx.vars[n] !== '') || moved(n) || cmds.some((c) => (c.env?.[n] ?? '') !== '' || c.argv.some((a) => a.startsWith(`${n}[`))));
+    const cdSwitched = cmds.some(cdMeaningSwitch); // (R10-F4: cdablevars may be on, so `cd NAME` can go to $NAME)
     return cmds.some((c, ci) => {
       const cn = baseOf(c.argv[0] ?? '');
       if (!CD_CMDS.has(cn)) return false;
       const { unknownName } = stateAt(ci);
-      if (cdUnknownShape(c.argv)) return true;
+      if (cdUnknownShape(c.argv) || (cdSwitched && cn === 'cd')) return true;
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
       if (t !== undefined && modelledCd(t, cmds, ci, ctx) !== null) return false;
       if (t === undefined || /^~(?:\/|$)|^\$\{?HOME\b/.test(t)) { if (homeMoved) return true; if (t === undefined) return false; } // (a bare cd goes home)
@@ -4159,7 +4195,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // (R9-F4: only a fully literal word is narrowed: no `$`, backtick, glob, bracket or brace, and `~` only as home itself or `~/…`, never `~NAME`, `~+`, `~-`; a variable can hold anything, from a branch or a loop that never ran)
     if (/[$`*?[\]{}()\\!]/.test(word) || (word[0] === '~' && word !== '~' && !word.startsWith('~/'))) return null;
     const e = expandRefs(word, ctx);
-    if (!e || e.startsWith('-') || e.startsWith('~') || /[$`*?[(){}\\]/.test(e)) return null;
+    if (!e || /^[+-]/.test(word) || /^[+-]/.test(e) || e.startsWith('~') || /[$`*?[(){}\\]/.test(e)) return null;
     if (!isAbs(e) && (/cdpath/i.test(raw) || (opts.env ?? process.env).CDPATH)) return null; // (a relative name may lead anywhere through CDPATH)
     return e;
   };
@@ -4169,7 +4205,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // too: `cd /tmp/link && find ..` is the link target's parent). Otherwise the command is read against every directory of the line (`dirs`).
   const withReal = (list) => unique([...list, ...list.map(realOf)]);
   const staticName = (c) => { const n = c.argv[0] ?? ''; return n === '[' || n === '[[' || (n !== '' && !/[$`*?[\](){}~'"\\<>=]/.test(n)); };
-  const changesDir = (c) => c.argv.length > 0 && (!staticName(c) || DIR_CHANGERS.has(baseOf(c.argv[0])));
+  const changesDir = (c) => (c.argv.length > 0 && (!staticName(c) || DIR_CHANGERS.has(baseOf(c.argv[0])))) || optionSwitch(c); // (R10-F4: `set -o NAME`, `options[...]=`)
   // Narrowing needs a plain sequence (cmds.plainSeq: it also covers a cut-short parse, a closer with no opener, a heredoc not located, a group, a subshell, a function, a `!`), no `$'…'` / `$"…"` string on the
   // line (R6-F2), and no command that changes the directory (a cd, eval, source, ...) in a trap action: it runs in this shell, but later. (Any other command inside a substitution or a `-c` string is
   // another shell's, and a plain sequence has no loop, branch or group to run a command out of turn.)

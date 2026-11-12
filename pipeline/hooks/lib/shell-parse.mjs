@@ -2234,22 +2234,39 @@ class Parser {
     const s = this.src;
     let pos = this.i;
     for (const h of this.hd) {
-      const lines = [];
+      const lines = []; // (the body's lines as the command reads them: for an unquoted delimiter, joined where a line ends in a backslash)
+      const rawLines = []; // (and as written)
       const bodyAt = pos;
       let found = false;
       while (pos < s.length) {
-        const eol = s.indexOf('\n', pos);
-        const end = eol < 0 ? s.length : eol;
-        const line = s.slice(pos, end);
-        pos = eol < 0 ? s.length : eol + 1;
-        let cmp = line.replace(/\r$/, '');
-        if (h.strip) cmp = cmp.replace(/^\t+/, '');
-        if (cmp === h.delim) { found = true; if (line.endsWith('\r')) this.ctx.hdOdd = true; break; } // (the shell does not end a body at `EOF\r`: the two disagree)
+        // R10-F1/F2: with an UNQUOTED delimiter bash and zsh remove backslash-newline before they compare a line with the delimiter (the <<- tab strip is per physical line, before the join): a line ending in an odd run of
+        // backslashes joins the next one. A quoted delimiter compares raw lines. The parts are collected and joined once per logical line (a long run of continued lines stays linear).
+        const parts = [];
+        let line;
+        for (;;) {
+          const eol = s.indexOf('\n', pos);
+          const end = eol < 0 ? s.length : eol;
+          line = s.slice(pos, end);
+          pos = eol < 0 ? s.length : eol + 1;
+          rawLines.push(line);
+          if (h.strip) line = line.replace(/^\t+/, ''); // (<<- strips the tabs of every physical line, a continuation too)
+          if (h.quoted) break;
+          let b = line.length;
+          while (b > 0 && line.charCodeAt(b - 1) === 92) b--;
+          const run = line.length - b;
+          if (run === 0) break;
+          this.ctx.hdOdd = true; // (fail closed: whatever the join does, a body line ending in a backslash is where the two readings may part)
+          if (run % 2 === 0 || pos >= s.length) break;
+          parts.push(line.slice(0, -1));
+        }
+        if (parts.length) { parts.push(line); line = parts.join(''); }
+        const cmp = line.replace(/\r$/, '');
+        if (cmp === h.delim) { found = true; if (line.endsWith('\r')) this.ctx.hdOdd = true; rawLines.length = rawLines.length - (parts.length || 1); break; } // (the shell does not end a body at `EOF\r`: the two disagree)
         lines.push(line);
       }
       // Why: `<<-` strips the leading tabs of the body before the command reads it (`bash <<-'EOF'` + `\tgit pu\` + `\tsh origin main`: one push the tabs hid)
-      const raw = lines.join('\n');
-      const text = h.strip ? lines.map((l) => l.replace(/^\t+/, '')).join('\n') : raw;
+      const raw = rawLines.join('\n');
+      const text = lines.join('\n');
       h.seg.heredocs.push({ text, quoted: h.quoted, lines: lines.length });
       // where the body sits in the line (see heredocSpans in simpleCommands): only for a body this parser read out of the line itself and that ended at
       // its terminator; one read out of another text (backticks, bash -c, a body's own substitution) or that ran to the end is not located.
@@ -2841,8 +2858,16 @@ class Parser {
     seg.final = { argv: [] };
     let last = null;
     for (const g of groups) last = this.finalizeGroup(g, seg) ?? last;
-    if (seg.depth === 0 && (!last || seg.words.length === 0 || seg.words.some((w, k) => w.qa < 0 && (w.text === '{' || w.text === '}' || w.text === '[[' || (NOT_PLAIN_HEAD.has(w.text) && seg.words.slice(0, k).every((x) => x.qa < 0 && NOT_PLAIN_HEAD.has(x.text)))))))
-      this.ctx.notPlain = true; // (plainSeq: a segment that is no plain simple command: it emits none, or opens / closes a group, or starts with a keyword)
+    if (seg.depth === 0) { // (plainSeq: a segment that is no plain simple command: it emits none, or opens / closes a group, or starts with a keyword)
+      let plain = !!last && seg.words.length > 0;
+      let headOnly = true; // (every word so far is an unquoted keyword: one running flag, a prefix rescan per word is quadratic)
+      for (const w of seg.words) {
+        if (w.qa >= 0) { headOnly = false; continue; }
+        if (w.text === '{' || w.text === '}' || w.text === '[[' || (headOnly && NOT_PLAIN_HEAD.has(w.text))) { plain = false; break; }
+        headOnly = headOnly && NOT_PLAIN_HEAD.has(w.text);
+      }
+      if (!plain) this.ctx.notPlain = true;
+    }
     if (seg.outSubs.length || seg.words.some((w) => w.subs.length && w.text.includes('>('))) this.feedOutSubs(seg);
     // Redirections belong to the command they were written on; a redirect with no command of its own
     // (`> file`, `{ a; } > file`, `(a) > file`) still has to reach the caller.
