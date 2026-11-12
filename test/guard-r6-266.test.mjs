@@ -537,3 +537,52 @@ describe('#288 R3', () => {
     });
   }
 });
+
+// #288 (found while fixing R3): a line of more than 5,000 words skips the per-token scans, and the raw-text scan does not match a BARE protected directory or an ancestor of one
+// (`find <config dir> x x x … -delete` was allowed). A line that long fails closed now when a word names a protected path, a directory above one, or the home directory and its parents.
+describe('#288 R3 long lines', () => {
+  const MANY = 'x '.repeat(5100);
+  const HOME_CFG = ['$HOME', '.claude'].join('/');
+  const HOME_BRACE_CFG = ['${HOME}', '.claude'].join('/');
+  const ABS_CFG = ['/home/u', '.claude'].join('/');
+  for (const [label, line] of [
+    ['find <config dir> … -delete', `find ${CFG} ${MANY}-delete`],
+    ['find $HOME/<config dir> … -delete', `find ${HOME_CFG} ${MANY}-delete`],
+    ['find ${HOME}/<config dir> … -delete', `find ${HOME_BRACE_CFG} ${MANY}-delete`],
+    ['find /home/u/<config dir> … -delete', `find ${ABS_CFG} ${MANY}-delete`],
+    ['find <config dir>/ … -delete', `find ${CFG}/ ${MANY}-delete`],
+    ['find ~ … -delete', `find ~ ${MANY}-delete`],
+    ['find ~/ … -delete', `find ~/ ${MANY}-delete`],
+    ['find $HOME … -delete', `find $HOME ${MANY}-delete`],
+    ['find /home/u … -delete', `find /home/u ${MANY}-delete`],
+    ['rm -rf <config dir> …', `rm -rf ${CFG} ${MANY}`],
+    ['rm -rf $HOME/<config dir>/ …', `rm -rf ${HOME_CFG}/ ${MANY}`],
+    ['the protected word after the filler', `find ${MANY}${CFG} -delete`],
+  ]) {
+    test(`denies within 2 s: ${label}`, () => {
+      const t0 = performance.now();
+      const r = run(line);
+      const ms = performance.now() - t0;
+      assert.equal(r.decision, 'deny', `-> ${r.decision}`);
+      assert.ok(ms < 2000, `took ${ms.toFixed(0)} ms`);
+    });
+  }
+  // the short forms were already refused (regression pins)
+  for (const [label, line] of [
+    ['find <config dir> -delete', `find ${CFG} -delete`],
+    ['rm -rf <config dir>', `rm -rf ${CFG}`],
+    ['rm -rf <config dir>/', `rm -rf ${CFG}/`],
+  ]) {
+    test(`denies (short form): ${label}`, () => assert.equal(run(line).decision, 'deny'));
+  }
+  for (const [label, line] of [
+    ['a long line that names no protected path or ancestor', `echo ${MANY}`],
+    ['a long line of relative project paths', `ls ${'data.txt '.repeat(5100)}`],
+    ['a long line of paths below the project', `ls ${'/home/u/proj/a.txt '.repeat(5100)}`],
+  ]) {
+    test(`allows: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'allow', `${r.decision}: ${r.reason}`);
+    });
+  }
+});

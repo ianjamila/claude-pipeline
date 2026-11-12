@@ -3838,6 +3838,28 @@ function evaluateBashForFilesFrame(command, opts) {
   // A scan that was cut short (parse caps, dynamic commands, sizes) cannot prove a command harmless: fail closed
   // when the raw text names a protected file at all.
   if ((cmds.dynamic || ctx.dynamic) && protectedAnywhere) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
+  // #288 (found while fixing R3): a line of more than 5,000 words skips the per-token scans (tooMany), and the raw-text scan above matches a protected FILE, not the bare directory that holds it
+  // (`find <config dir> x x x … -delete`). Fail closed: on such a line a word that resolves to a protected path, a directory above one (pathHit with ancestors, as the ordinary scan reads a word),
+  // or the home directory or one of its parents denies. A cheap filter first: a word with no `/`, `~`, `$`, backtick, glob or brace character, no `claude` and not `.` / `..` cannot name any of them
+  // (a bare relative word reaches a protected root only from a cwd that is inside or above one, which insideRoot already covers).
+  if (tooMany && opts._writesOnly !== true) {
+    const homeChain = new Set();
+    for (let d = ctx.homePosix, n = 0; n < 32; n++) {
+      homeChain.add(ctx.ci ? d.toLowerCase() : d);
+      const up = pathsFor().dirname(d);
+      if (up === d || up === '.') break;
+      d = up;
+    }
+    const maybePath = /[/~$`\\*?[{]|claude|^\.\.?$/i;
+    for (const c of cmds) {
+      for (const t of wordsOf(c)) {
+        checkDeadline(ctx.budget); // (the evaluation deadline)
+        if (!maybePath.test(t)) continue;
+        const e = pathsFor().normalize(expandRefs(t, ctx)).replace(/(.)\/+$/, '$1');
+        if (m.rawHit(t, dirs) || m.pathHit(t, dirs, true) || homeChain.has(ctx.ci ? e.toLowerCase() : e)) return deny('the command line has more than 5,000 words, so it is not scanned word by word, and a word names a protected pipeline file, a directory that holds one, or the home directory; split the command up');
+      }
+    }
+  }
   // R7-F3 (#266): in arithmetic zsh reads a bare name `_` (the last word of the previous command) and evaluates its text again, a subscript with a substitution included. `echo 'path[$(cmd)]'; echo $((_))`
   // plants nothing a rule can refuse, and the reader names no protected file, so it is never judged: on a line that names a protected file an arithmetic context anywhere denies the line. The gate reads the UNMASKED line (post-push review of #288): a path inside a prose value
   // (a quoted echo argument, a commit message) is masked out of protectedInRaw, but the planted text can sit anywhere.
