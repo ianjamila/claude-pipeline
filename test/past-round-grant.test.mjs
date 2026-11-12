@@ -323,3 +323,67 @@ test('state show: another checkout published only a grant; this copy keeps its u
   assert.deepEqual(local.rounds.find((r) => r.n === 3).ownerGrant, grant);
   assert.equal(readBaseline(w.repo.dir, 7), reviewContentHash(theirs), 'this copy has now seen everything the PR holds');
 });
+
+// Another checkout applied Fable to a round with no items (a round-level modelProof, in the content hash) and published it; this copy never saw that.
+const proof = { transcript: '/tmp/t.jsonl', models: ['claude-fable-5'] };
+const withProof = (spec) => spec.map((r) => (r.n === 2 ? { ...r, modelProof: proof } : r));
+function staleWorld(t, { grant } = {}) {
+  const w = world(t);
+  const theirs = build(w.slug, SPEC).rounds.map((r) => (r.n === 2 ? { ...r, modelProof: proof } : r.n === 3 && grant ? { ...r, ownerGrant: grant, admission: 'owner' } : r));
+  writeBaseline(w.repo.dir, 7, reviewContentHash(build(w.slug))); // this copy last saw the PR before the other checkout published
+  w.fake.addComment({ body: triageComment({ ...build(w.slug), rounds: theirs }) });
+  return w;
+}
+
+test('state show: a copy that lacks a published round-level proof does not move its baseline onto the PR (adopting a grant included), so it cannot erase the proof', (t) => {
+  const grant = { grantId: 'a'.repeat(16), k: 3, quote: 'approve round', ownerTs: '2026-11-01T00:00:00.000Z', past: true };
+  const w = staleWorld(t, { grant });
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stderr + show.stdout);
+  assert.deepEqual([show.json.source, show.json.grantsRestored], ['local', [3]]);
+  assert.notEqual(readBaseline(w.repo.dir, 7), reviewContentHash(w.published()), 'the baseline still differs from the PR');
+  const pub = w.cli(['comment', '--pr', '7', '--kind', 'triage']);
+  assert.notEqual(pub.status, 0, pub.stderr + pub.stdout);
+  assert.deepEqual(w.published().rounds.find((r) => r.n === 2).modelProof, proof, 'the PR keeps the proof');
+});
+
+test('past-round-grant: a stale copy that lacks a published round-level proof is refused BEFORE the claim (nothing spent), and the PR keeps the proof', (t) => {
+  const w = staleWorld(t);
+  const rec = w.approve(3);
+  const r = unchanged(w, [rec], () => w.grant(3));
+  assertExit(r, 2);
+  assert.equal(r.json.error, 'stale-publication');
+  assert.match(r.json.message, /state show --pr 7/);
+  assert.deepEqual(w.published().rounds.find((x) => x.n === 2).modelProof, proof);
+});
+
+test('state show: a local-only grant that verifies is KEPT (no grantsDropped), and the retried past-round-grant publishes it without a new claim', (t) => {
+  const w = world(t);
+  const rec = w.approve(3);
+  w.fake.setFail({ write: true });
+  const failed = w.grant(3);
+  assertExit(failed, 3, failed.stderr + failed.stdout);
+  assert.equal(failed.json.saved, true);
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stderr + show.stdout);
+  assert.equal(show.json.grantsDropped, undefined, JSON.stringify(show.json));
+  const round3 = w.state().rounds.find((x) => x.n === 3);
+  assert.deepEqual([round3.ownerGrant.grantId, round3.admission], [grantIdOf(rec), 'owner']);
+  w.fake.setFail({});
+  const again = w.grant(3);
+  assertExit(again, 0, again.stderr + again.stdout);
+  assert.deepEqual([again.json.published, again.json.claimed], [true, []]);
+  assert.equal(w.published().rounds.find((x) => x.n === 3).ownerGrant.grantId, grantIdOf(rec));
+});
+
+test('state show: a saved grant is verified against the gh repository, not the slug the state recorded (after a repository move they differ)', (t) => {
+  const w = world(t);
+  const rec = w.approve(3);
+  w.fake.setFail({ write: true });
+  assertExit(w.grant(3), 3);
+  saveState(w.repo.dir, { ...w.state(), repo: 'old-org/old-name' }); // the state predates the move
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stderr + show.stdout);
+  assert.equal(show.json.grantsDropped, undefined, JSON.stringify(show.json));
+  assert.equal(w.state().rounds.find((x) => x.n === 3).ownerGrant.grantId, grantIdOf(rec));
+});

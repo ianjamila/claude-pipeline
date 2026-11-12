@@ -32,7 +32,7 @@ export const meta = {
     '  (local-ahead: the PR still holds what this copy last published, every published round and item is still in the local copy, and the local copy holds a second-review verdict or a Claude / forced final that was',
     '  never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final), or an implementation mark or a follow-up issue link added after the last publish: kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline',
     '  (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)',
-    '  owner grants the PR holds on rounds this copy has (and it lacks or holds differently) are copied onto them, nothing is quarantined and local rounds / decisions are kept: grantsRestored:[round numbers]. This also holds when the PR moved off this copy\'s baseline by such a grant alone (another checkout published it) while this copy has unpublished decisions or a trailing round. A local-only owner grant (the PR\'s round has none) that does not verify on this machine is dropped, with the admission it set: grantsDropped:[round numbers] (the refusal `unverified-grant` of `state past-round-grant` names this remedy)',
+    '  owner grants the PR holds on rounds this copy has (and it lacks or holds differently) are copied onto them, nothing is quarantined and local rounds / decisions are kept: grantsRestored:[round numbers]. This also holds when the PR moved off this copy\'s baseline by such a grant alone (another checkout published it) while this copy has unpublished decisions or a trailing round. A local-only owner grant (the PR\'s round has none) that does not verify on this machine is dropped, with the admission it set: grantsDropped:[round numbers] (the refusal `unverified-grant` of `state past-round-grant` names this remedy); it is checked against the gh repository, like `past-round-grant` does, and a check that failed with an error (not a "no") keeps the grant with a warning. After adopting grants the baseline follows the PR only when this copy equals the PR apart from grants and trailing local rounds (a copy that lacks a published decision or round-level proof keeps its baseline, so it cannot publish over it)',
     '  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)',
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
@@ -63,7 +63,7 @@ export const meta = {
     '     the owner-go hook records it as kind past-round, any session, last 24 h, never usable for a new round). Saves ownerGrant {grantId, k, quote, ownerTs, past: true} and admission owner on round n, then publishes the state. Under the review lock',
     '  -> before anything is claimed or saved (state and markers untouched on a refusal, exit 2 {ok:false, error, message}): label-mode (needs owner_approval: chat), no-max-rounds, host (the gh repo is not on github.com), state-pr-mismatch;',
     '     the history check against the PR\'s triage comment: history-unreadable | no-published-history | stale-history (run `pipeline state show --pr N`) | unpublished-history (run `pipeline comment --pr N --kind triage`); this copy may be ahead',
-    '     only by owner-grant metadata that verifies (unverified-grant otherwise); not-eligible (round n is not one `triage round-request --pr N --past` would pick: a counted round past review.max_rounds + 1, held by the PR with a later counted round,',
+    '     only by owner-grant metadata that verifies (unverified-grant otherwise), and a stale baseline is refreshed only when it equals the PR apart from grants and trailing rounds (stale-publication otherwise: the PR holds a decision or round-level proof this copy lacks, run `pipeline state show --pr N`); not-eligible (round n is not one `triage round-request --pr N --past` would pick: a counted round past review.max_rounds + 1, held by the PR with a later counted round,',
     '     with no owner grant or one whose record is gone), already-approved (the PR already holds a verified grant on it); no-grant (no past-round record for this repository, PR, counted round and head, younger than 24 h, typed by the owner)',
     '  -> every matching unspent record is claimed together (one machine-global marker each, like codex-review), the newest is recorded. An interrupted run is resumed by running the command again: a record whose marker is already spent and verifies is',
     '     used without a new claim (at any age), leftovers are claimed. claim-failed | save-failed (exit 1) keep the markers; a failed publication keeps the saved state: exit 3 {unavailable:true, saved:true, published:false, next} for GitHub, exit 1',
@@ -183,24 +183,58 @@ function publishedAtLocalGrants(published, local) {
   };
 }
 
+// True when this copy equals what the PR holds apart from owner grant metadata (ownerGrant, admission) and trailing local-only rounds: every published round is here with the
+// same content (items, the round-level arbiter / modelProof, everything the content hash covers) once the grant metadata is taken from the PR's round, and every extra local
+// round comes after the newest published one. Only then has this copy "seen everything the PR holds", so its publication baseline may follow the PR (a stale copy that lacks
+// a published item decision or round-level proof must keep its old baseline, or its next publication would erase it).
+function equalsPublishedApartFromGrants(local, published) {
+  const theirs = new Map((published.rounds ?? []).map((p) => [p.n, p]));
+  const newest = Math.max(0, ...theirs.keys());
+  const kept = [];
+  for (const r of local.rounds ?? []) {
+    const p = theirs.get(r.n);
+    if (p === undefined) {
+      if (r.n < newest) return false; // a gap in the PR's history, not a trailing round
+      continue;
+    }
+    const { ownerGrant: _g, admission: _a, ...bare } = r;
+    kept.push({ ...bare, ...(p.ownerGrant === undefined ? {} : { ownerGrant: p.ownerGrant }), ...(p.admission === undefined ? {} : { admission: p.admission }) });
+  }
+  return kept.length === theirs.size && canonicalJson(kept) === canonicalJson(published.rounds ?? []);
+}
+
+// The repository identity the owner's recorded approval is checked against: the gh slug (what past-round-grant and the gates use), else the one the state recorded.
+function repoForGrants(root, ctx, local) {
+  try {
+    const { slug, host } = createGitHub({ cwd: root, env: ctx.env }).repo();
+    if (host === 'github.com' && typeof slug === 'string' && slug !== '') return slug;
+  } catch { /* fall back to the recorded repository */ }
+  return local.repo;
+}
+
 // A local owner grant on a round the PR holds WITHOUT one, that does not verify on this machine (its record, marker or transcript is gone), is dropped, together with the
 // admission it set: the PR is the published history and the grant never was part of it, so it is only a refusal that would repeat (\`state past-round-grant\`).
-function dropUnverifiedLocalGrants(local, published) {
+// Only a verification that ran and said no drops a grant: one that threw is kept (`errored`), the caller warns.
+function dropUnverifiedLocalGrants(local, published, repo) {
   const theirs = new Map((published.rounds ?? []).map((p) => [p.n, p]));
   const dropped = [];
+  const errored = [];
   const rounds = (local.rounds ?? []).map((r) => {
     const p = theirs.get(r.n);
     if (r.ownerGrant === undefined || p === undefined || p.ownerGrant !== undefined || r.toHead !== p.toHead || r.contentHashAtToHead !== p.contentHashAtToHead) return r;
-    let v = { ok: false };
+    let v;
     try {
-      v = verifyOwnerGrant({ repo: local.repo, pr: local.pr, k: ordinalOf(local, r.n), toHead: r.toHead, ownerGrant: r.ownerGrant });
-    } catch { /* unverifiable */ }
+      v = verifyOwnerGrant({ repo, pr: local.pr, k: ordinalOf(local, r.n), toHead: r.toHead, ownerGrant: r.ownerGrant });
+    } catch (err) {
+      errored.push({ n: r.n, message: String(err?.message ?? err).split('\n')[0].slice(0, 160) });
+      return r;
+    }
     if (v.ok) return r;
     dropped.push(r.n);
     const { ownerGrant: _g, admission: _a, ...bare } = r;
     return { ...bare, ...(p.admission === undefined ? {} : { admission: p.admission }) };
   });
-  return { state: dropped.length === 0 ? local : { ...local, rounds }, dropped };
+  return { state: dropped.length === 0 ? local : { ...local, rounds }, dropped, errored };
 }
 
 async function show(rest, ctx) {
@@ -278,7 +312,8 @@ async function showLocked(values, n, pr, root, ctx) {
     // Grant metadata is add-only history: a local copy that lacks (or holds another) owner grant the PR holds on a round it has takes the PR's,
     // keeping its own decisions and trailing rounds, instead of being quarantined or later refused as history-loss at publication.
     if (found?.state && (source === 'local' || source === 'local-ahead')) {
-      const dropped = dropUnverifiedLocalGrants(state, found.state);
+      const dropped = dropUnverifiedLocalGrants(state, found.state, repoForGrants(root, ctx, state));
+      for (const e of dropped.errored) warnings.push(`could not check the owner grant on round ${e.n} (${e.message}): kept`);
       if (dropped.dropped.length > 0) {
         state = dropped.state;
         saveState(root, state);
@@ -289,7 +324,9 @@ async function showLocked(values, n, pr, root, ctx) {
       if (adopted.restored.length > 0) {
         state = adopted.state;
         saveState(root, state);
-        writeBaseline(root, pr, found.hash); // this copy has now seen everything the PR holds
+        // The baseline follows the PR only when this copy has now seen everything the PR holds: local-ahead was proved above by the baseline hash check (the PR moved by grants alone);
+        // a copy that merely extends the PR may still lack a round-level proof or a decision the PR holds, and its next publication would erase it.
+        if (source === 'local-ahead' || equalsPublishedApartFromGrants(state, found.state)) writeBaseline(root, pr, found.hash);
         grantsRestored = adopted.restored;
       }
     }
@@ -707,9 +744,13 @@ async function pastRoundGrant(rest, ctx) {
     if (resumed === undefined && fresh.length === 0) {
       throw refuse('no-grant', `no approval of past round ${n} (counted round ${k}, head ${toHead.slice(0, 12)}) is recorded for ${slug} #${pr}: run \`P triage round-request --pr ${pr} --past\`, show its closing line, and ask the owner to type "approve round" (within 24 h, typed by the owner, not while the agent is working)`);
     }
-    // This copy holds what the PR holds (it may only carry grants ahead): record that as its baseline BEFORE the claim. A stale baseline (a crash between an earlier
-    // publication's upsert and its baseline write) would refuse the publication below as stale-publication after the owner's approval is spent, with no way out.
-    if (stateExtends(local, found.state) && readBaseline(root, pr) !== found.hash) writeBaseline(root, pr, found.hash);
+    // This copy holds what the PR holds (it may only carry grants and trailing rounds ahead): record that as its baseline BEFORE the claim. A stale baseline (a crash between
+    // an earlier publication's upsert and its baseline write) would refuse the publication below as stale-publication after the owner's approval is spent, with no way out.
+    // A copy that differs in anything else (a decision or round-level proof the PR holds) keeps its baseline, and is refused here for the same reason, before the claim.
+    if (readBaseline(root, pr) !== found.hash && equalsPublishedApartFromGrants(local, found.state)) writeBaseline(root, pr, found.hash);
+    if (readBaseline(root, pr) !== found.hash) {
+      throw refuse('stale-publication', `the PR's triage comment holds a review state this copy did not publish or restore (another checkout or machine published since): publishing the approval now would erase it, so it is not claimed: run \`pipeline state show --pr ${pr}\` to restore the published state here, then ask again`);
+    }
     const chosen = resumed ?? fresh[0];
     const claimed = [];
     // Every matching record is consumed together (a duplicate "approve round" must not outlive the claim); on resume only the leftovers are.
