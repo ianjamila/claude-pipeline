@@ -146,3 +146,4 @@ full record.
 - 2026-11-12 · #266 · Owner-answer glyph and visibility, gh rate-limit retry, ci-wait status holder, worktree self-session (#190 non-guard items, #245, #214, #246, #253, #243; #244 pending) · risk high · rounds 8 · arbiter 8 · blocked
 - 2026-11-12 · #242 · Queue: refuse pre-switch branches (+ update-branch catch-up), fix queue-guards template, fold #237 #238 #239 and EW #1784 #1785 · risk high · rounds 16 · arbiter 15 · needs-human
 - 2026-11-12 · #299 · Terminal review leases + lease hardening (#249 #258 #259 #260 #268) · risk high · rounds 9 · arbiter 9 · awaiting-owner-merge
+- 2026-11-12 · #316 · Windows ancestry walk: one process-table query instead of one PowerShell per hop · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge
