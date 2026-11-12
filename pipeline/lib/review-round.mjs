@@ -318,8 +318,10 @@ export const baseOnlyFindings = () => ({
 // Phase two. `findings` are the reviewer's validated findings (validateFindings ok). `roundFields` are stored on the round as given.
 // `gate()` runs inside the lock right after the round-order check, before anything is written (throw to abort: codex-review's compare-and-swap on route.json, exit 2 superseded);
 // `afterSave()` runs inside the lock once the state is saved.
+// `locked: true`: the caller already holds the per-PR review lock (the substitute's apply holds it across its whole proof, so the lock order stays review -> floor);
+// the body then runs as it is, everything else is the same.
 // Returns { items (the round's items after reuse of prior rulings), state (the saved state), grantUsed: {grantId} | undefined }.
-export async function recordRound({ adm, findings, roundFields = {}, gate, afterSave }) {
+export async function recordRound({ adm, findings, roundFields = {}, gate, afterSave, locked = false }) {
   const { root, ctx, pr, round, base, head, config, dir } = adm;
   const o = { cwd: root };
   const flags = { baseOnly: adm.baseOnly, resolutionOnly: adm.resolutionOnly };
@@ -340,7 +342,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
   };
   let grantUsed;
   let saved;
-  const items = await withReviewLock(root, pr, ctx, async () => {
+  const items = await (locked ? (fn) => fn() : (fn) => withReviewLock(root, pr, ctx, fn))(async () => {
     // The reviewer took a while: whatever happened to the review meanwhile (another session recorded this round, the PR's
     // state was replaced) is read again, and what is there now wins.
     const fresh = readReviewState(root);

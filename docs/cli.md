@@ -715,6 +715,41 @@ pipeline state set-outcome --outcome TEXT [--repo DIR]
 
 Exit: 0 · 2 no state / usage (`outcome` is 0 whether or not `clean`).
 
+## substitute
+
+prepare the input for the Claude substitute reviewer of a round Codex could not review, then prove and record its answer.
+
+```
+pipeline substitute prepare --pr N --round R [--repo DIR]
+  -> {ok, round, agent, tag, promptHeader, inputPath, digest, digest8, attempt, evidence, files, bytes}
+  agent: substitute-opus (the PR's highest risk, ever, is low or medium) or substitute-fable (it was ever high); the tag is `pipeline-substitute R<R> <digest8>` (`... a<k>` for attempt k > 1)
+  needs the evidence of THIS round: .review/round-R/route.json from a codex-review attempt that ended with evidence quota (Codex's own usage-limit stop), budget or governor (a small fix-check
+    Codex was not run for), for the same attempt, round, base, head and patch digest (and, for quota, the same Codex prompt digest); the checked-out HEAD must be that head;
+    review.substitute.mode is not off; a quota stop with a reset time is evidence only until that time (a stop with none: 2 hours): the reset is judged HERE and nowhere else (apply does not re-judge it)
+  refuses (exit 1) no-route | no-evidence (route.json holds pending / none) | route-mismatch | agent-changed | mode-off | reset-passed (run codex-review again) |
+    packet-too-large (the evidence passes review.substitute.max_packet_mb: not eligible, park as without a substitute) | attempts-exhausted (two invalid attempts) | new-attempt-not-allowed;
+    exit 2 for the shared round admission: round-order, state-pr-mismatch, base-mismatch (a whole-PR round owed after an Opus substitute round must start at the merge base), round-cap, empty-range, head-moved
+  writes .review/round-R/substitute-input.md (header ROUND: R / INPUT-DIGEST: <sha256 of the rest>, then the exact prompt Codex would have got, then an evidence map) and the files the agent cannot fetch with
+    Read/Grep/Glob under .review/round-R/substitute/: diff.patch (the range the prompt names), rules/AGENTS.md and rules/CLAUDE.md (git show <merge base>:..., when present) and, for a resolution round,
+    sides/ours/<path> and sides/base/<path> for each conflicted file; the input lists every file with its sha256, so the digest covers them all; .review/round-R/substitute-attempts.json keeps the attempts
+  a second attempt (tag `... a2`) is allowed only after `apply` recorded the first one invalid (a re-run of prepare before that returns the same attempt); two invalid attempts: park (substitute:invalid).
+    An attempt that failed only because the terminal runs an older Fable than the floor (restartRequired) does not count against the two
+  start the agent with promptHeader + "\nRead <inputPath> and review the pull request.\n", pasted exactly, description = tag, and no model argument
+pipeline substitute apply --pr N --round R [--tag TAG] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
+  proves the transcript tagged TAG (default: the open attempt's tag): exactly ONE transcript carries the tag (else rerolled); agent type = the one prepare named; every assistant turn on claude-opus- (substitute-opus)
+    or on claude-fable- at or above this machine's floor (substitute-fable: stale-model + restartRequired exactly like `arbiter apply`; Opus where Fable is required is refused); effort high; tools only
+    Read/Grep/Glob; the first prompt is EXACTLY promptHeader + "\nRead <inputPath> and review the pull request.\n" (nothing added); the transcript shows a successful Read of the input, diff.patch and every exported file;
+    the input and exported files on disk are still what prepare wrote (same digest); route.json still holds the same attempt, round, base, head and digests (resetAt is NOT judged here); the final JSON block
+    is Codex's findings schema (summary, blocking, suggestions, worth_considering)
+  proven: the round is recorded through the shared recorder (round order, base rule, round cap / owner grants, head-moved, resolution proof, prior rulings reused, ids R<n>-B/S/W<k>) with
+    firstReviewer substitute and substitute {agent, models, evidence, resetAt, outageAt, attempts, proof: {transcript, models, effort}} (no codexModel), the state saved as version 4, route.json ends
+    {evidence none, outcome recorded, via substitute}; -> {ok, round, tag, attempt, transcript, counts, preRuled, ...}
+  unproven or malformed: exit 1 {ok:false, errors, attempt, retry: prepare|park}, the attempt recorded invalid in substitute-attempts.json, no round recorded; no transcript with the tag: exit 2 not-found (nothing recorded)
+  a Fable floor failure (stale-model, model-floor-unreadable, unrecognised-fable, model-floor-busy, model-floor-unwritable) is reported like `arbiter apply` does (restartRequired, floor, advice)
+```
+
+The substitute is a Claude stand-in for a round Codex could not review (a real quota stop proven from Codex's own events, or a small fix-check withheld by the Codex budget or weekly governor): `prepare` re-checks the round's route.json evidence and writes one input (the exact Codex prompt, an evidence map and the exported files a read-only agent cannot fetch itself); the review skill runs the named agent (`substitute-opus`, or `substitute-fable` once the PR was ever high risk) with the printed header; `apply` proves the transcript the way `arbiter apply` does (model, effort, agent type, Fable floor, one prompt) plus the substitute's own rules (exact first prompt, only Read/Grep/Glob, every packet file read, one transcript per tag) and records the round through the same code as `codex-review`.
+
 ## summary
 
 upsert the PR summary comment and print the agent-log line.

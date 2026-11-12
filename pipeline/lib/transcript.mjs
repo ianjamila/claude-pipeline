@@ -490,3 +490,49 @@ export function extractJsonBlock(text) {
     throw new Error('no JSON found', { cause });
   }
 }
+
+// ---------- what a run did (the substitute reviewer's proof) ----------
+
+// Every transcript (any age, none from the future) whose meta description IS the tag: a tag is the one run's name, so a second run under it is a re-roll.
+// -> [jsonlPath]
+export function findTaggedTranscripts({ tag, projectsDir = path.join(os.homedir(), '.claude', 'projects'), now = Date.now() } = {}) {
+  if (typeof tag !== 'string' || tag === '' || typeof projectsDir !== 'string' || projectsDir === '') return [];
+  const found = [];
+  for (const dir of subagentDirs(projectsDir)) {
+    for (const name of listDir(dir)) {
+      if (!name.endsWith('.meta.json')) continue;
+      const file = path.join(dir, name);
+      const st = statOrNull(file);
+      if (!st?.isFile() || st.mtimeMs > now + FUTURE_SKEW_MS) continue;
+      if (readMetaObject(file)?.description === tag) found.push(file.replace(/\.meta\.json$/, '.jsonl'));
+    }
+  }
+  return found.sort();
+}
+
+// The tool calls of a transcript, in order, from its assistant lines: [{name, input, id, answered, isError}]. `answered` = a tool_result for the call id came back;
+// `isError` = that result was flagged as an error. A line that does not parse is skipped here (proveModel already fails the transcript for it).
+export function toolCallsOf(jsonlText) {
+  const calls = [];
+  const byId = new Map();
+  if (typeof jsonlText !== 'string') return calls;
+  for (const row of jsonlText.split(/\r?\n/)) {
+    if (row.trim() === '') continue;
+    let line;
+    try { line = JSON.parse(row); } catch { continue; }
+    if (!isPlainObject(line) || !isPlainObject(line.message)) continue;
+    for (const b of blocksOf(line.message.content)) {
+      if (!isPlainObject(b)) continue;
+      if (line.type === 'assistant' && b.type === 'tool_use') {
+        const call = { name: String(b.name), input: isPlainObject(b.input) ? b.input : {}, id: typeof b.id === 'string' ? b.id : null, answered: false, isError: false };
+        calls.push(call);
+        if (call.id !== null) byId.set(call.id, call);
+      } else if (line.type === 'user' && b.type === 'tool_result' && byId.has(b.tool_use_id)) {
+        const call = byId.get(b.tool_use_id);
+        call.answered = true;
+        call.isError = b.is_error === true;
+      }
+    }
+  }
+  return calls;
+}
