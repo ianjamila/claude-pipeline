@@ -770,6 +770,11 @@ test('R10: [[ .. && .. ]] pieces, function definitions, loop / match variables a
     'for in (echo ~/.claude/settings.json) cp /tmp/payload $in',
     'foreach in (echo ~/.claude/settings.json) cp /tmp/payload $in; end',
     'set -- ~/.claude/settings.json; for in; do cp /tmp/payload $in; done',
+    // R12-F2: a loop name that is not an identifier (a digit: a positional parameter; a subscripted word) is only known at run time too
+    'for 1 in .claude/settings.local.json; do cp /tmp/payload $1; done',
+    'for a 1 in x .claude/settings.local.json; do cp /tmp/payload $1; done',
+    'foreach 1 (echo ~/.claude/settings.json) cp /tmp/payload $1; end',
+    'for a[1] in .claude/settings.local.json; do cp /tmp/payload $a; done',
     // R10-F5: a prefix assignment hands the path to the program
     'F=.claude/settings.local.json python3 -c \'import os; os.link("/tmp/payload", os.environ["F"])\'',
   ];
@@ -797,12 +802,27 @@ test('R11-F1: a quoted ]] in a [[ condition does not hide the command after the 
     'if [[ -n a ]] cd ~/.claude/plans; cp /tmp/payload ../settings.json',
     "if [[ -n ']]' ]] cd ~/.claude/plans; cp /tmp/payload ../settings.json",
     "if [[ ']]' != x ]] cd ~/.claude/plans; cp /tmp/payload ../settings.json",
-    // (past the cap of ]] words in one piece the line is refused as too complex, whatever follows)
+    // (R12-F1: a ]] that is not the last word next to a [[ is refused whatever follows, so these over-cap lines are plain denies)
     `if [[ ${"-n ']]' ".repeat(9)}]] cd .claude/plans; cp /tmp/payload ../settings.json`,
     `if [[ ${"-n ']]' ".repeat(9)}]] cd sub; ls`,
   ];
   for (const cmd of closers) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
   assert.deepEqual(failures, [], 'these R11-F1 lines were not refused');
+});
+
+test('R12-F1: a ]] that is not the last word of a piece, on a line with a [[, is refused; ]] without a [[ and a closing ]] at the end of a piece stay allowed', () => {
+  const failures = [];
+  // R12-F1 (owner decision 2026-11-12): the words after a ]] are not normalised; the guard refuses instead of guessing which ]] closes the test. Run from the home folder.
+  for (const cmd of [
+    'if [[ -n a ]] then cd .claude/plans; cp /tmp/payload ../settings.json; fi',
+    'while [[ -n a ]] do cd .claude/plans; break; done; cp /tmp/payload ../settings.json',
+    'if [[ -n a ]] { cd .claude/plans }; cp /tmp/payload ../settings.json',
+    'if [[ -n a ]] builtin cd .claude/plans; cp /tmp/payload ../settings.json',
+    'if [[ -n a ]] X=1 cd .claude/plans; cp /tmp/payload ../settings.json',
+    'if [[ -n a ]] then for f (echo ~/.claude/settings.json) cp /tmp/payload $f; fi',
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R12-F1 lines were not refused');
+  for (const cmd of ["grep ']]' notes.md", '[[ -f a ]] && cp a b', 'if [[ -n a ]]; then echo ok; fi']) assert.equal(bash(cmd, {}, '/home/u'), 'allow', cmd);
 });
 
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------

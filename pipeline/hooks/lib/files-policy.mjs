@@ -1565,31 +1565,13 @@ function makeMatchers(ctx) {
 
 // ---- Bash: command classification -----------------------------------------------------------------
 
-// (#269 R10-F1) The parser ends a segment at every `&&` / `||` with no `[[` state, so zsh's `if [[ -n a && echo == echo ]] cp x FILE` arrives as the pieces `[[ -n a` and `echo == echo ]] cp x FILE`: the
-// second one would be judged as `echo`. A `]]` that is not the last word of a piece may close a condition: what follows it is then the command. The piece is split there into a `[[ .. ]]` header (an ordinary,
-// non-read-only `[[`) and that command, which carries the piece's redirects, prefix assignments and place in the line. Done once per piece, in place (the array keeps the parser's non-enumerable fields).
-// (#269 scan S3) The parser has lost the quotes, so a quoted argument -- `bash -s ']]' x`, `python3 - ']]' x` -- looks the same. The split is therefore ADDITIVE: the original piece stays, judged as written (a
-// fed `bash` is still seen), and the header and the command after it are added behind it. A `cd` is applied once per `]]`: the original is the only piece that can start with it (a header starts with `[[`).
-// (#269 R11-F1) For the same reason a quoted `]]` INSIDE the condition (`[[ -n ']]' ]] cd DIR`) cannot be told from the closer: the piece is split at EVERY non-final `]]`, one header and one command per
-// `]]`, so the command after the real one is among them (a `cd` keyed on argv[0] is seen). More than MAX_CLOSE_BRACKETS of them in one piece is refused (returns true: the caller denies the line).
-const MAX_CLOSE_BRACKETS = 8;
-function splitCloseBrackets(cmds) {
-  for (let i = 0; i < cmds.length; i++) {
-    const c = cmds[i];
-    const ks = [];
-    for (let j = 0; j < c.argv.length - 1; j++) if (c.argv[j] === ']]') ks.push(j);
-    if (!ks.length) continue;
-    if (ks.length > MAX_CLOSE_BRACKETS) return true;
-    const clone = (over) => Object.create(Object.getPrototypeOf(c), { ...Object.getOwnPropertyDescriptors(c), ...Object.fromEntries(Object.entries(over).map(([n, value]) => [n, { value, enumerable: true, writable: true, configurable: true }])) });
-    const added = [];
-    for (const k of ks) {
-      const argv = c.argv[0] === '[[' ? c.argv.slice(0, k + 1) : ['[[', ...c.argv.slice(0, k + 1)];
-      added.push(clone({ argv, env: {}, redirects: [], raw: argv.join(' ') }), clone({ argv: c.argv.slice(k + 1) }));
-    }
-    cmds.splice(i + 1, 0, ...added);
-    i += added.length; // (the original and the pieces added are done; a later `]]` in an added command is covered by its own split)
-  }
-  return false;
+// (#269 R10-F1, R11-F1, R12-F1) The parser ends a segment at every `&&` / `||` with no `[[` state, so zsh's `if [[ -n a && echo == echo ]] cp x FILE` arrives as the pieces `[[ -n a` and
+// `echo == echo ]] cp x FILE`; zsh also takes a command (or a keyword, `{`, an assignment, a wrapper) right after `]]` with no separator. The parser has lost the quotes, so a quoted `]]` argument looks
+// like the closer, and the words after a `]]` do not go through the parser's group handling. Splitting there was tried (R10-F1, R11-F1) and left holes (R12-F1), so the line is REFUSED instead (owner
+// decision 2026-11-12): when it holds a `[[` word and any piece has a `]]` that is not its last word, the guard cannot tell which `]]` closes the test. Without a `[[` a `]]` closes nothing.
+function closeBracketNotLast(cmds) {
+  if (!cmds.some((c) => c.argv.includes('[['))) return false;
+  return cmds.some((c) => c.argv.slice(0, -1).includes(']]'));
 }
 
 const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
@@ -2225,8 +2207,9 @@ function collectVars(cmds, ctx) {
     if (LOOP_HEADS.has(c.argv[0])) {
       // (the first word is always a name, even when it is spelled `in`: `for in (echo FILE) cp x $in`, `for in; do`; the keyword is looked for after it -- #269 scan)
       const inAt = c.argv.indexOf('in', 2);
-      const names = c.argv.slice(1, inAt < 0 ? undefined : inAt).filter((w) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(w));
-      if (c.argv[0] === 'for' && inAt === 2 && names.length === 1) {
+      // (#269 R12-F2) no identifier filter: zsh accepts a digit name (a positional parameter, `for 1 in LIST` binds $1) and a subscripted one (`a[1]` marks `a`)
+      const names = c.argv.slice(1, inAt < 0 ? undefined : inAt).map((w) => w.replace(/\[.*$/s, '') || w);
+      if (c.argv[0] === 'for' && inAt === 2 && names.length === 1 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1])) {
         if (pins !== undefined) { if (pins === null || !pins.has(names[0])) unknown.add(names[0]); else if (pins.get(names[0]) !== LOOP_NOT_RUN) set(names[0], pins.get(names[0]), true); }
       } else for (const n of names) unknown.add(n);
     }
@@ -3488,7 +3471,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
-  if (splitCloseBrackets(cmds)) return deny('the command line has too many ]] words in one command to check (a [[ condition cannot hold that many); split it into simpler commands');
+  if (closeBracketNotLast(cmds)) return deny('a command follows a closing ]] on the same piece (zsh\'s short `if [[ … ]] cmd` form), or ]] is an argument next to a [[: the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`');
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
   const proseValues = [...prose.values()].flatMap((p) => p.values);
