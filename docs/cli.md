@@ -154,7 +154,10 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
     leave the grant open (a failure after the claim spends it: ask again). Success adds grantUsed:{grantId}; the round records admission and ownerGrant {grantId, k, quote, ownerTs}
     base-only rounds and resolution-only rounds (below) never count toward the cap
   reviewer: fable (medium/high risk, except medium for size only, or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired
-    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker's brief for the sensitive files; judge otherwise. Once fable, always fable
+    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker's brief for the sensitive files; judge otherwise. Once fable, always fable.
+    The judge also reviews a medium PR that is medium ONLY for its size (no hard-stop hit of any kind, no sensitive path, base branch = the default branch) unless
+    review.size_only_medium_reviewer is fable; the output then has sizeOnly:true and laneNote. The rating uses the working-tree config AND the one committed at the
+    default branch's fork point (stricter wins; an unreadable one means fable). A PR that goes from judge to fable reviews the WHOLE PR in that round (kind whole-pr)
   confirm fixed: an accepted item that a forced or Claude ruling marked implemented through files other than the one it names (state mark-implemented,
     implementedVia other-files) is listed in the prompt of the next round that runs Codex (not a base-only one), with its original finding fenced as untrusted
     text: Codex says whether it is really fixed and raises it again as BLOCKING when it is not. The round records round.confirmFixed:[ids] (absent when none)
@@ -628,7 +631,9 @@ since the review": fetch, re-run the review, and post again.
 assess the risk level of a branch diff.
 
 ```
-pipeline risk --base REF --head REF [--repo DIR]   -> {ok, level, reasons, lightLane, changedLines, fileCount, hardStops, base, head, mergeBase}
+pipeline risk --base REF --head REF [--repo DIR]   -> {ok, level, reasons, lightLane, changedLines, fileCount, hardStops, sizeOnly, drivers, reviewer, laneReasons, sensitivePaths, note?, base, head, mergeBase}
+  the rating uses the working-tree config AND the one committed at the default branch's fork point (stricter wins; an unreadable one means reviewer fable)
+  sizeOnly: medium for size alone (no hit, no high-risk path); drivers {hardStop, advisory, path, size}; reviewer: who follows Codex (judge|fable); note says why a medium PR has the judge
 ```
 
 Exit: 0 whenever a level could be computed (it is a report, not a gate) · 2 usage / config / git.

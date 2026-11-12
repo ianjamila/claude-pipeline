@@ -12,7 +12,7 @@ export const meta = {
     'pipeline risk --base REF --head REF [--repo DIR]   -> {ok, level, reasons, lightLane, changedLines, fileCount, hardStops, sizeOnly, drivers, reviewer, laneReasons, sensitivePaths, note?, base, head, mergeBase}',
     '  the rating uses the working-tree config AND the one committed at the default branch\'s fork point (stricter wins; an unreadable one means reviewer fable)',
     '  sizeOnly: medium for size alone (no hit, no high-risk path); drivers {hardStop, advisory, path, size}; reviewer: who follows Codex (judge|fable); note says why a medium PR has the judge',
-  ],
+  ].join('\n'),
 };
 
 export const run = guarded(async (argv, ctx) => {
