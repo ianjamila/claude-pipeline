@@ -326,3 +326,69 @@ test('a packet over review.substitute.max_packet_mb is not eligible (exit 1 pack
   assert.equal(p.json.error, 'packet-too-large');
   assert.ok(!existsSync(join(w.dir(), 'substitute-input.md')));
 });
+
+test('a resolution-only round: the packet exports sides/ours and sides/base for the conflicted file and the evidence map names them; a proven answer is recorded as the resolution round', (t) => {
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  // main edits the very line the PR changed; the resolver keeps the PR's side
+  const ours = readFileSync(join(w.repo.dir, 'src/a.js'), 'utf8');
+  w.repo.checkout('main');
+  w.repo.write('src/a.js', ours.replace('compute(x.y)', '1200'));
+  const mainHead = w.repo.commit('main edits the line');
+  w.repo.checkout('feat/x');
+  try { w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']); } catch { /* the conflict: resolved below */ }
+  w.repo.write('src/a.js', ours);
+  w.repo.git(['add', '-A']);
+  w.repo.git(['commit', '-q', '--no-edit']);
+  const merged = w.repo.git(['rev-parse', 'HEAD']).trim();
+  w.prHead(merged);
+  assertExit(w.run(2, w.quota(), { from: w.head, to: merged }), 3);
+  const p = w.prepare(2);
+  assertExit(p, 0, p.stdout + p.stderr);
+  const files = p.json.files;
+  assert.ok(files.includes('sides/ours/src/a.js') && files.includes('sides/base/src/a.js'), `both sides exported: ${files.join(', ')}`);
+  const sub = join(w.dir(2), 'substitute');
+  assert.equal(readFileSync(join(sub, 'sides', 'ours', 'src/a.js'), 'utf8'), ours, 'ours = the reviewed branch (the base of the resolution round)');
+  assert.equal(readFileSync(join(sub, 'sides', 'base', 'src/a.js'), 'utf8').includes('1200'), true, 'base = the base branch\'s side');
+  const input = readFileSync(p.json.inputPath, 'utf8');
+  assert.ok(input.includes('sides/ours/<path>') && input.includes('sides/base/<path>'), 'the map explains the side files');
+  assert.ok(input.includes(join(sub, 'sides', 'ours', 'src/a.js')) && input.includes(join(sub, 'sides', 'base', 'src/a.js')), 'the exported list names each side file with its digest');
+  const r = w.cli(['substitute', 'apply', '--pr', '7', '--round', '2', '--projects-dir', install(w, p.json)]);
+  assertExit(r, 0, r.stdout + r.stderr);
+  const round = w.state().rounds[1];
+  assert.deepEqual([round.firstReviewer, round.resolutionOnly, round.reviewBaseKind], ['substitute', true, 'resolution']);
+});
+
+test('risk rises after an Opus substitute round: the next substitute is substitute-fable and the whole-PR round (merge base) is owed, exported and recorded', (t) => {
+  const w = world(t);
+  const opus = w.ready();
+  assert.equal(opus.agent, 'substitute-opus');
+  assertExit(w.apply(install(w, opus)), 0);
+  w.config({ yml: 'risk:\n  high_risk_paths: ["src/big.js"]\n' });
+  // round 2: an increment that touches the now-sensitive file; the rise is seen here (a protected post-rise round, evidence quota)
+  w.repo.write('src/big.js', `${readFileSync(join(w.repo.dir, 'src/big.js'), 'utf8')}export const more = 1;\n`);
+  const h2 = w.repo.commit('touch the sensitive file');
+  w.prHead(h2);
+  assertExit(w.run(2, w.quota(), { from: w.head, to: h2 }), 3);
+  const p2 = w.prepare(2);
+  assertExit(p2, 0, p2.stdout + p2.stderr);
+  assert.equal(p2.json.agent, 'substitute-fable', 'the PR was high risk: the cheaper reviewer never comes back');
+  assertExit(w.cli(['substitute', 'apply', '--pr', '7', '--round', '2', '--projects-dir', install(w, p2.json, { models: [FABLE], agentId: 'r2' })]), 0);
+  assert.equal(w.state().rounds[1].risk, 'high');
+  // round 3: the whole PR is owed (an Opus substitute round came before the rise): the base is the merge base
+  const owed = w.cli(['state', 'outcome']).json;
+  assert.deepEqual([owed.wholePrOwed, owed.base], [true, w.base]);
+  w.repo.write('src/b.js', 'export const w1 = 2;\n');
+  const h3 = w.repo.commit('small fix');
+  w.prHead(h3);
+  assertExit(w.run(3, w.quota(), { from: w.base, to: h3 }), 3);
+  const p3 = w.prepare(3);
+  assertExit(p3, 0, p3.stdout + p3.stderr);
+  assert.equal(p3.json.agent, 'substitute-fable');
+  const patch = readFileSync(join(w.dir(3), 'substitute', 'diff.patch'), 'utf8');
+  assert.ok(patch.includes('src/a.js') && patch.includes('src/big.js'), 'the exported diff is the whole PR from the merge base');
+  assertExit(w.cli(['substitute', 'apply', '--pr', '7', '--round', '3', '--projects-dir', install(w, p3.json, { models: [FABLE], agentId: 'r3' })]), 0);
+  const round3 = w.state().rounds[2];
+  assert.deepEqual([round3.wholePr, round3.reviewBase, round3.substitute.agent], [true, w.base, 'substitute-fable']);
+  assert.equal(w.cli(['state', 'outcome']).json.wholePrOwed, false, 'the whole-PR round cleared it');
+});
