@@ -43,7 +43,7 @@ export async function run(argv, ctx = {}) {
       process.stderr.write(`${message}\n`);
       return { exitCode: EXIT.USAGE, output: { ok: false, error: 'refused', message } };
     }
-    const r = approveDialogHooks({ home, cwd, projectDirs: [process.env.CLAUDE_PROJECT_DIR], now: ctx.now, ...managed });
+    const r = approveDialogHooks({ home, cwd, projectDirs: [process.env.CLAUDE_PROJECT_DIR], now: ctx.now, env, ctx, ...managed });
     if (!r.ok) {
       process.stderr.write(`not approved: ${r.reason}\n`);
       return { exitCode: EXIT.FAILED, output: { ok: false, error: 'not-approved', message: r.reason, offenders: r.offenders } };

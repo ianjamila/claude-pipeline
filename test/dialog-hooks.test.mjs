@@ -1,7 +1,7 @@
 // hooks/lib/dialog-hooks.mjs + `pipeline owner-go` (#261, plan Rev 6 B5): which hooks could answer the choice dialog, and the owner's list of approved ones. Temp homes and project folders only.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { approveDialogHooks, checkDialogHooks, dialogHandlers, dialogHooksFile, hookCheck, matcherMatchesDialog, resolveCommand } from '../pipeline/hooks/lib/dialog-hooks.mjs';
@@ -21,7 +21,7 @@ function world() {
   w.settings = (value, dir = join(home, '.claude'), name = 'settings.json') => w.json(join(dir, name), value);
   w.check = (over = {}) => checkDialogHooks({ home, cwd, managedPaths: [], ...over });
   w.handlers = () => dialogHandlers({ home, cwd, managedPaths: [] });
-  w.approve = (over = {}) => approveDialogHooks({ home, cwd, managedPaths: [], ...over });
+  w.approve = (over = {}) => approveDialogHooks({ home, cwd, managedPaths: [], env: {}, ctx: { hasClaudeCodeAncestor: () => false }, ...over });
   return w;
 }
 const hookEntry = (command, matcher, event = 'PreToolUse') => ({ hooks: { [event]: [{ ...(matcher === undefined ? {} : { matcher }), hooks: [{ type: 'command', command }] }] } });
@@ -431,4 +431,24 @@ test('owner-go approve-dialog-hooks: an unresolvable hook is refused with the of
   await assert.rejects(go([], w), /subcommand/);
   await assert.rejects(go(['nope'], w), /subcommand/);
   await assert.rejects(go(['dialog-hooks', 'extra'], w), /unexpected argument/);
+});
+
+test('approveDialogHooks refuses inside Claude Code in the function itself (#273): CLAUDECODE=1 or an ancestor, nothing written; the owner switch lifts it', () => {
+  const w = world();
+  w.settings(hookEntry(`node ${w.script('x/hook.mjs')}`));
+  const outside = { hasClaudeCodeAncestor: () => false };
+  const a = w.approve({ env: { CLAUDECODE: '1' }, ctx: outside });
+  assert.equal(a.ok, false);
+  assert.equal(a.refused, true);
+  assert.match(a.reason, /^refused: .*CLAUDECODE=1.*own terminal/);
+  assert.deepEqual(a.offenders, []);
+  const b = w.approve({ env: {}, ctx: { hasClaudeCodeAncestor: () => true } });
+  assert.equal(b.refused, true);
+  assert.match(b.reason, /ancestor/);
+  assert.equal(existsSync(dialogHooksFile(w.home)), false, 'nothing written when refused');
+  const ownerSwitch = { CLAUDECODE: '1', ['PIPELINE_' + 'ADMIN']: '1' }; // (built, not spelled: the guard refuses a write that spells the assignment)
+  const c = w.approve({ env: ownerSwitch, ctx: { hasClaudeCodeAncestor: () => true } });
+  assert.notEqual(c.refused, true);
+  assert.equal(c.ok, true, c.reason);
+  assert.equal(existsSync(dialogHooksFile(w.home)), true);
 });

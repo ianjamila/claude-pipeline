@@ -12,6 +12,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readdirSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { accountHome, transcriptConfigDirs } from '../../lib/paths.mjs';
+import { insideClaudeCode } from '../../lib/owner-only.mjs';
 import { ownerGoDir, realDirChain } from './owner-go.mjs';
 import { readFrontmatter } from './frontmatter.mjs';
 
@@ -446,8 +447,11 @@ export const hookCheck = ({ home, input, env = process.env } = {}) => {
 // ---- approving --------------------------------------------------------------------------------------------------------------------------
 
 // Writes the list from what is installed now. Refuses (nothing written) when any source cannot be read or any untrusted handler does not resolve to one script.
-// -> { ok: true, file, hooks, approvedAt } | { ok: false, reason, offenders }
-export function approveDialogHooks({ home = accountHome(), cwd = null, projectDirs = [], now = Date.now, managedPaths } = {}) {
+// Also refuses (nothing written, `refused: true`) inside Claude Code: an agent must not approve its own hooks (#273; the owner's admin switch lifts it). `ctx.hasClaudeCodeAncestor` is the process-tree test seam.
+// -> { ok: true, file, hooks, approvedAt } | { ok: false, reason, offenders, refused? }
+export function approveDialogHooks({ home = accountHome(), cwd = null, projectDirs = [], now = Date.now, managedPaths, env = process.env, ctx = {} } = {}) {
+  const inside = insideClaudeCode(env, ctx);
+  if (inside) return { ok: false, reason: `refused: approving the dialog hooks decides which hooks may sit on the approval dialog, so it does not run inside a Claude Code session (${inside}); run it in your own terminal`, offenders: [], refused: true };
   const found = dialogHandlers({ home, cwd, projectDirs, ...(managedPaths ? { managedPaths } : {}) });
   const bad = [
     ...found.errors.map((e) => ({ kind: 'unreadable', text: `dialog hook source ${tilde(e.source, home)} ${e.why}` })),
