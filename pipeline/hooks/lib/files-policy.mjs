@@ -1535,10 +1535,10 @@ function optionSwitch(c) {
 }
 // Is this a command that may turn on CDABLE_VARS (`cd NAME` then goes to $NAME) or is it a switch whose name cannot be read? Then a cd of the line leads to a directory only known at run time.
 // `set` outside the whitelist; `setopt` / `unsetopt` / `emulate` / `shopt` with ANY word (an option name, a flag such as `-T`, a run-time word): one spelling is as good as another (`unsetopt nocdablevars`).
-// R12-F3: a command word only known at run time with arguments (`S=shopt; $S -s cdable_vars`), or behind a wrapper, is one too.
+// R12-F3 / R13-B1: a command word only known at run time (`S=shopt; $S -s cdable_vars`, or the whole command in one word, `S="shopt -s cdable_vars"; $S`), or behind a wrapper, is one too, whatever the argument count.
 function cdMeaningSwitch(c) {
   const { argv, blind } = unwrapBuiltin(c.argv);
-  if (blind || (argv.length > 1 && !literalCommand(argv[0]))) return true;
+  if (blind || (argv.length > 0 && !literalCommand(argv[0]))) return true; // (no command word at all, `A=1`, is no switch)
   const name = baseOf(argv[0] ?? '');
   if (name === 'set' && !setIsSafe(argv)) return true;
   if (['setopt', 'unsetopt', 'emulate', 'shopt'].includes(name) && argv.length > 1) return true;
