@@ -494,3 +494,48 @@ test('R6 security review: non-canonical stdin paths and spaced assignments', () 
     `FOO=bar node -r fs -e "console.log(1)"`,
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
+
+// ---- round 7 (R7-B1, R7-F1, R7-F2) -----------------------------------------------------------------------------------------------------
+
+test('R7: -W options, non-literal stdin paths, startup variables without NAME=', () => {
+  const py = "import os; os.link('/tmp/payload','.claude/settings.local.json')";
+  const js = "require('fs').linkSync('/tmp/payload','.claude/settings.local.json')";
+  const lua = "os.execute('ln /tmp/payload .claude/settings.local.json')";
+  const awk = 'BEGIN { system("ln /tmp/payload .claude/settings.local.json") }';
+  const failures = [];
+  const dollar = '$';
+  for (const cmd of [
+    `echo '${awk}' | gawk -W exec=-`,
+    `echo '${awk}' | gawk -Wexec=-`,
+    `echo '${awk}' | gawk -W exec -`,
+    `echo '${awk}' | gawk -W file=-`,
+    `echo '${awk}' | gawk -W include=/dev/stdin 'BEGIN{}'`,
+    `echo '${awk}' | gawk -W exe=-`,
+    `echo '${awk}' | mawk -W exec /dev/stdin`,
+    `echo "${py}" | python3 ../../../../../../../../../../dev/stdin`,
+    `echo '${awk}' | gawk -E ../../../../../../../../dev/stdin`,
+    `echo "${js}" | node -r ../../../../../../dev/stdin -e 0`,
+    `echo "${js}" | node -r /de?/stdin -e 0`,
+    `echo '${awk}' | gawk -E /de?/stdin`,
+    `d=/dev; echo "${js}" | node -r ${dollar}d/stdin -e 0`,
+    `echo "${js}" | node -r ${dollar}{HOME:0:1}dev/stdin -e 0`,
+    `echo "${js}" | node -r ~/../../dev/stdin -e 0`,
+    `echo "${py}" | python3 /Volumes/Macintosh\\ HD/dev/stdin`,
+    `echo "${py}" | python3 "/Volumes/Macintosh HD/dev/stdin"`,
+    `X=/d\\ev/stdin; echo "${js}" | node -r ${dollar}X -e 0`,
+    `: "${dollar}{NODE_OPTIONS:=-r /dev/stdin}"; export NODE_OPTIONS; echo "${js}" | node -e 0`,
+    `read -r NODE_OPTIONS <<< '-r /dev/stdin'; export NODE_OPTIONS; echo "${js}" | node -e 0`,
+    `printf -v NODE_OPTIONS '%s' '-r /dev/stdin'; export NODE_OPTIONS; echo "${js}" | node -e 0`,
+    `read -r LUA_INIT <<< '@/dev/stdin'; export LUA_INIT; echo "${lua}" | lua -e ''`,
+  ]) if (bash(cmd) !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these lines were not refused');
+  for (const cmd of [
+    `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())'`,
+    `node -r fs -e "require('fs').readFileSync('README.md','utf8')"`,
+    `echo ".claude/settings.json" | awk '{print}' > /dev/null`,
+    `echo ".claude/settings.json" | node -r ./lib/x.js -e 0`,
+    `echo ".claude/settings.json" | awk -f prog.awk`,
+    `echo ".claude/settings.json" | python3 script.py`,
+    `python3 script.py < input.txt`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});

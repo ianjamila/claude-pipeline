@@ -1039,7 +1039,8 @@ function awkScan(args, env = {}, read = null) {
         if (ch === 'e') { progOpt = true; program(val()); break; }
         if (ch === 'i') { const v = val(); if (isStdinPath(v)) r.stdinProgram = true; if (isInplaceLib(v)) r.inPlace = true; bad(); break; }
         if (ch === 'f' || ch === 'E') { progOpt = true; programFile(val()); break; }
-        if ('lW'.includes(ch)) { if (isStdinPath(val())) r.stdinProgram = true; bad(); break; }
+        if (ch === 'W') { val(); r.stdinProgram = true; bad(); break; } // (R7-B1) -W is gawk/mawk's implementation-option switch (-W exec=-, -Wexec=-, -W exec -, -W file=-, -W include=..., abbreviations): the value can name stdin in more spellings than we parse, so any -W counts as a program on stdin
+        if (ch === 'l') { if (isStdinPath(val())) r.stdinProgram = true; bad(); break; }
         if (!'bcCMnNOPrsStVh'.includes(ch)) { bad(); break; } // (-d -D -o -p -g -L write or run, and so does anything we do not know)
       }
       continue;

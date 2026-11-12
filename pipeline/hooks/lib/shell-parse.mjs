@@ -36,8 +36,9 @@ const TMUX_RUNNERS = new Set(['new-session', 'new', 'new-window', 'neww', 'split
 const TMUX_KEY_RE = /^(Enter|Space|Tab|Escape|BSpace|Up|Down|Left|Right|Home|End|PageUp|PageDown|[CMS]-.+|F[0-9]+|KP.+)$/;
 const PS_START_VALUED = ['workingdirectory', 'verb', 'windowstyle', 'redirectstandardinput', 'redirectstandardoutput', 'redirectstandarderror', 'credential', 'environment'];
 export const STDIN_FILES = new Set(['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0']);
-// (R6 security review) Could this word name stdin (or another process's / device's stream) once the shell and the kernel have resolved it? `-`, or -- after dropping surrounding quotes, collapsing repeated
-// slashes and resolving `.` / `..` segments (`//dev/stdin`, `/dev/./stdin`, `/dev/fd/../fd/0`) -- ANY path under /dev/ or /proc/ (/dev/stdin, /dev/fd/N, /proc/self/fd/N, /proc/<pid>/fd/N). Fails closed on other device paths.
+// (R6 security review, R7-F1) Could this word name stdin (or another process's / device's stream) once the shell and the kernel have resolved it? The hook stays pure (no filesystem lookups), so it fails closed on anything it
+// cannot prove is an ordinary file name: `-`; a word still holding an expansion, a glob or an escape (`$`, backtick, `*`, `?`, `[`, `{`, a leading `~`, a backslash, a quote, `<(` / `>(`); a `..` segment anywhere (relative
+// climbing to /dev); or ANY path segment named dev, proc, fd or Volumes (`/dev/stdin`, `//dev/./stdin`, `/proc/self/fd/0`, `/Volumes/<disk>/dev/stdin`, `a/dev/stdin`), in any letter case.
 export function isStdinPath(word) {
   if (typeof word !== 'string') return false;
   let w = word.trim();
@@ -45,9 +46,8 @@ export function isStdinPath(word) {
   const q = /^(["'])(.*)\1$/s.exec(w);
   if (q) w = q[2];
   if (w === '-') return true;
-  if (!w.startsWith('/')) return false;
-  const n = posixPath.normalize(w);
-  return n.startsWith('/dev/') || n.startsWith('/proc/');
+  if (/[$`*?[{\\'"]/.test(w) || w.startsWith('~') || /[<>]\(/.test(w)) return true;
+  return w.split('/').some((seg) => seg === '..' || /^(?:dev|proc|fd|Volumes)$/i.test(seg));
 }
 const DYN_AFTER_DOLLAR = /[A-Za-z_{0-9@*#?!$[-]/;
 const WIN_PATH_RE = /[^\\]\\[^\\]|^\\\\/; // C:\Git\git.exe, .\git.exe, \\server\share\git.exe

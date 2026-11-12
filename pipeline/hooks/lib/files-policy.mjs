@@ -1726,10 +1726,12 @@ const STDIN_WORD = (a) => isStdinPath(a) || a.split('=').slice(1).some((v) => is
 // (an assignment anywhere on the raw line (prefix, export, declare, quoted value with spaces) whose value holds a /dev/ or /proc/ path -- `NODE_OPTIONS="--require /dev/stdin" node -e 0` -- lets the interpreter read its startup code
 // from stdin; so does ANY assignment of a variable that carries startup code, whatever its value. A redirect (`2>/dev/null`) has no NAME= in front and is not one.)
 const ASSIGN_VALUE = /(?:^|[^\w])[A-Za-z_]\w*\+?=((?:"(?:[^"\\]|\\.)*"|'[^']*'|\\.|[^\s"'\\])*)/g;
-const STARTUP_VAR_ASSIGN = /\b(?:NODE_OPTIONS|LUA_INIT\w*|RUBYOPT|PERL5OPT|PERL5LIB|PYTHONSTARTUP|PYTHONINSPECT)\s*\+?=/;
+// (R7-F2) ANY mention of a startup-code variable on the line, however it gets its value (`: "${NODE_OPTIONS:=...}"`, `read -r NODE_OPTIONS`, `printf -v`, `declare`, `mapfile`, `export`) -- no `=` needed
+const STARTUP_VAR_ASSIGN = /\b(?:NODE_OPTIONS|LUA_INIT\w*|RUBYOPT|RUBYLIB|PERL5OPT|PERL5LIB|PERLLIB|PYTHONSTARTUP|PYTHONINSPECT|PYTHONPATH|NODE_PATH)\b/;
 function stdinAssign(line) {
   if (STARTUP_VAR_ASSIGN.test(line)) return true;
-  for (const m of line.matchAll(ASSIGN_VALUE)) if (/\/(?:dev|proc)\//.test(m[1].replace(/\/{2,}/g, '/'))) return true;
+  // (R7 note A) fail closed on a value that could be, or build, a /dev or /proc path: an escape or expansion in it (`X=/d\ev/stdin`, `d=$(...)`), or a dev / proc segment anywhere, with or without a trailing slash (`d=/dev`)
+  for (const m of line.matchAll(ASSIGN_VALUE)) if (/[\\$`]/.test(m[1]) || /(?:^|\/)(?:dev|proc)(?:\/|$)/i.test(m[1].replace(/["'\\]/g, '').replace(/\/{2,}/g, '/'))) return true;
   return false;
 }
 function programInArgv(argv, line = '') {
@@ -1743,7 +1745,10 @@ function programInArgv(argv, line = '') {
     if (row === undefined) return false;
     const [, code, plain, valueOpt, onStdinWord] = row;
     if (/^python/.test(b) && /PYTHONINSPECT/i.test(line)) return false;
-    if (rest.some((a) => (onStdinWord.test(a) && !code.test(a)) || STDIN_WORD(a))) return false;
+    // (R7-F1) the program text itself (`-e <text>`, `-pe<text>`, `--eval=<text>`) is not a file name: quotes, `$` and `/` in it are ordinary code, so it is left out of the stdin-path test
+    const text = new Set();
+    for (let k = 0; k < rest.length; k++) { const m = code.exec(rest[k]); if (m !== null) { text.add((m[1] ?? '') !== '' ? k : k + 1); break; } }
+    if (rest.some((a, k) => (onStdinWord.test(a) && !code.test(a)) || (!text.has(k) && STDIN_WORD(a)))) return false;
     for (let k = 0; k < rest.length; k++) {
       const m = code.exec(rest[k]);
       if (m !== null) return (m[1] ?? '') !== '' || k + 1 < rest.length;
