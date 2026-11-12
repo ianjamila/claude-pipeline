@@ -25,6 +25,7 @@ import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, con
 import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
+import { SETS_BY_NAME } from './git-policy.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
@@ -1762,28 +1763,44 @@ function lineTouchesToolEnv(ctx, src, p) {
 const OPTION_TOOLS = new Set(['find', 'git', 'jq', 'tree', 'xxd', 'openssl', 'sort', 'rg']);
 const PROGRAM_TOOLS = new Set(['sed', 'gsed', 'awk', 'gawk', 'mawk', 'nawk']);
 const RUNTIME_PART = /[$`]/;
+// A run-time part: a backtick, `$(`, `${`, `$@`, `$*`, `$NAME`, a positional or special parameter. (A lone `$`, as in the regex `foo$` or `$/`, is the text itself.)
+const RUN_TIME = /`|\$[({\w@*#?!$-]/;
+// Can the shell split a value on something other than blanks? IFS written anywhere on the line (assignment, export / declare / typeset / local / read / printf -v, a name built at run time: git-policy's
+// SETS_BY_NAME), tracked as a variable, or possibly changed by a sourced file or an unreadable part of the line. (Mirrors git-policy's ifsMayBeSet.)
+function ifsMayBeSet(ctx) {
+  if (ctx.unknownAll === true || Object.hasOwn(ctx.vars ?? {}, 'IFS') || Object.hasOwn(ctx.env ?? {}, 'IFS')) return true;
+  if (ctx.unknownVars?.has('IFS') || ctx.pickUnknown?.has('IFS') || ctx.srcChanged?.has('IFS') || ctx.srcTouched?.has('IFS')) return true;
+  const line = String(ctx.ghLine ?? '');
+  return [line, line.replace(/['"\\]/g, '')].some((x) => /IFS/.test(x) || SETS_BY_NAME.test(x));
+}
+// Returns { readings, unknown }: the argument lists isReadOnly must judge. An expanded word is judged BOTH whole (as a quoted use passes it) and split (as an unquoted use does: bash on blanks, zsh an
+// array `D=(-true -delete)` into its elements; a leading `(` and a trailing `)` dropped), and the call is read-only only when every reading is (R2-F1: the whole reading keeps `-C 'x status'` one operand,
+// so `clean` stays git's subcommand). Unknown (no read-only call) for these tools: any word that still holds a run-time part anywhere (R2-F3), and any expanded word where IFS may be set (R2-F2).
+// A sed / awk program keeps its exemption: `$1` and `$NF` of a quoted program are no shell variables, so only a substitution, `${`, `$@`, `$*` or a name the line touches counts.
 function judgedWords(name, args, ctx) {
-  if (!args.some((a) => RUNTIME_PART.test(a))) return { args, unknown: false };
+  if (!args.some((a) => RUNTIME_PART.test(a))) return { readings: [args], unknown: false };
   const touched = (n) => Object.hasOwn(ctx.vars ?? {}, n) || ctx.unknownVars?.has(n) || ctx.pickUnknown?.has(n) || ctx.srcChanged?.has(n) || ctx.srcTouched?.has(n) || ctx.unknownAll === true;
+  const tool = OPTION_TOOLS.has(name) || PROGRAM_TOOLS.has(name);
   let unknown = false;
-  const out = [];
+  let changed = false;
+  const whole = [];
+  const split = [];
   for (const a of args) {
-    if (!RUNTIME_PART.test(a)) { out.push(a); continue; }
+    if (!RUNTIME_PART.test(a)) { whole.push(a); split.push(a); continue; }
     const e = expandRefs(a, ctx);
     if (RUNTIME_PART.test(e)) {
-      if (PROGRAM_TOOLS.has(name)) { if (/`|\$[({]/.test(e) || [...e.matchAll(/\$(\w+)/g)].some((m) => touched(m[1]))) unknown = true; }
-      else if (OPTION_TOOLS.has(name) && (/^[$`]/.test(e) || e.startsWith('-'))) unknown = true;
+      if (PROGRAM_TOOLS.has(name)) { if (/`|\$[({@*]/.test(e) || [...e.matchAll(/\$(\w+)/g)].some((m) => touched(m[1]))) unknown = true; }
+      else if (OPTION_TOOLS.has(name) && RUN_TIME.test(e)) unknown = true;
     }
-    // R1-F3 (#288): the shell splits an unquoted expansion into words (bash on whitespace, zsh an array `D=(-true -delete)` into its elements), so a value that holds whitespace or starts with `(`
-    // is several words: `D='-true -delete'; find S $D`. A program word (sed, awk) is unknown then; for the option tools every piece is judged as a word of its own. (A double-quoted use is one word in
-    // the shell; judging the pieces is the safe reading of it. A word that was written with whitespace in it stays one word.)
-    if (e !== a && !/\s/.test(a) && (/\s/.test(e) || e.startsWith('('))) {
-      if (PROGRAM_TOOLS.has(name)) unknown = true;
-      else if (OPTION_TOOLS.has(name)) { out.push(...e.replace(/^\(|\)$/g, ' ').split(/\s+/).filter(Boolean)); continue; }
-    }
-    out.push(e);
+    whole.push(e);
+    if (e !== a && tool) {
+      if (ifsMayBeSet(ctx)) unknown = true;
+      const pieces = e.replace(/^\(|\)$/g, ' ').split(/\s+/).filter(Boolean);
+      if (pieces.length !== 1 || pieces[0] !== e) changed = true;
+      split.push(...pieces);
+    } else split.push(e);
   }
-  return { args: out, unknown };
+  return { readings: changed ? [whole, split] : [whole], unknown };
 }
 // R1-B2 / R2-B1 / R2-F1 / R3 (#266): bash and zsh read some operands as a variable NAME or an arithmetic expression, and evaluate an array subscript in it (`test -v 'a[$(rm "$T")]'` runs the
 // substitution). Such a call with an operand holding `[`, `$(` or a backtick is no read-only call. The forms: `test` / `[` with -v, -R, -t (zsh reads its operand as arithmetic) or a numeric
@@ -2017,12 +2034,14 @@ function isReadOnly(cmd, ctx) {
   const name = baseOf(argv[0]);
   const judged = judgedWords(name, argv.slice(1), ctx);
   if (judged.unknown) return false;
-  const args = judged.args;
   if (evaluatesSubscript(name, argv.slice(1), ctx, cmd.raw)) return false;
   if (plantsSubscript(cmd, ctx)) return false;
   // R1-B1 (#266): a sed / awk program is plain program text, and the expansion above rewrites a same-line name in it (`system=length; awk 'BEGIN { $system("rm S") }'` reads as length(...)
   // while awk runs system()). The program as written must be read-only too.
   if (PROGRAM_TOOLS.has(name) && !(name === 'sed' || name === 'gsed' ? sedReadOnly(argv.slice(1)) : awkReadOnly(argv.slice(1), cmd.env))) return false;
+  return judged.readings.every((args) => readOnlyWith(name, args, cmd, ctx, argv));
+}
+function readOnlyWith(name, args, cmd, ctx, argv) {
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
   if (READ_ONLY.has(name)) {
     if (name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre='))) return false;

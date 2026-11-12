@@ -425,3 +425,60 @@ describe('#288 R1', () => {
     }
   });
 });
+
+// #288 round 2: judgedWords split an expanded multi-word value (R1-F3) but only a word written without whitespace, only for the option tools, and without the whole reading; the class is closed
+// by judging an expanded word BOTH whole (a quoted use) and split (an unquoted use), refusing a run-time part anywhere in a word, and refusing any expanded word where IFS may be set.
+//   R2-B1  a written word with whitespace (quotes lost by the parser) skipped the split: `D=' -delete'; find S '/tmp/a b'$D`
+//   R2-F1  the split alone let a piece become git's subcommand after -C / --git-dir / --work-tree / --namespace
+//   R2-F2  a custom IFS splits elsewhere: `IFS=:; D='-true:-delete'; find S $D`
+//   R2-F3  a run-time part in the middle of a word: `find S x${D[@]}`, `x$@`, `x$(…)`, zsh `x${=D}`
+describe('#288 R2', () => {
+  const DENIED = [
+    ['R2-B1 written word with a space, then an expanded option', `D=' -delete'; find ${S} '/tmp/nonexistent space'$D`],
+    ['R2-B1 tree', `O=' -a -o'; tree '/tmp/a b'$O ${S}`],
+    ['R2-F1 git --namespace "$N" clean', `N='x status'; git --namespace "$N" clean -fdx .review`],
+    ['R2-F1 git --git-dir "$G" checkout', `G='/tmp/r log'; git --git-dir "$G" --work-tree ~ checkout HEAD -- ${S}`],
+    ['R2-F1 git -C "$C" clean', `C='/tmp/r status'; git -C "$C" clean -fdx .review`],
+    ['R2-F1 git -C "$C" checkout', `C='/tmp/r log'; git -C "$C" checkout HEAD -- ${S}`],
+    ['R2-F1 git --work-tree "$W" clean', `W='/tmp/r status'; git --work-tree "$W" clean -fdx .review`],
+    ['R2-F2 IFS=: find', `IFS=:; D='-true:-delete'; find ${S} $D`],
+    ['R2-F2 IFS=, tree', `IFS=,; O='-a,-o'; tree $O ${S}`],
+    ['R2-F2 export IFS', `export IFS=:; D='-true:-delete'; find ${S} $D`],
+    ['R2-F2 declare IFS', `declare IFS=:; D='-true:-delete'; find ${S} $D`],
+    ['R2-F2 local IFS', `f() { local IFS=:; D='-true:-delete'; find ${S} $D; }; f`],
+    ['R2-F2 read IFS', `read -r IFS <<< ':'; D='-true:-delete'; find ${S} $D`],
+    ['R2-F2 printf -v IFS', `printf -v IFS ':'; D='-true:-delete'; find ${S} $D`],
+    ['R2-F2 IFS with a one-word value', `IFS=x; D=-name; find ${S} $D y`],
+    ['R2-F2 sed with IFS', `IFS=:; O='-i:s/a/b/'; sed $O ${S}`],
+    ['R2-F3 zsh array element, mid-word', `D=(-true -delete); find ${S} x\${D[@]}`],
+    ['R2-F3 positional $@', `set -- y -delete; find ${S} x$@`],
+    ['R2-F3 positional $*', `set -- y -delete; find ${S} x$*`],
+    ['R2-F3 command substitution mid-word', `find ${S} x$(printf ' -delete')`],
+    ['R2-F3 backtick mid-word', `find ${S} x\`printf ' -delete'\``],
+    ['R2-F3 zsh ${=D}', `D='-true -delete'; find ${S} x\${=D}`],
+    ['R2-F3 unknown name mid-word, find', `find ${S} x$UNKNOWN`],
+    ['R2-F3 unknown name mid-word, git', `git status x$UNKNOWN ${S}`],
+    ['R2-F3 mid-word substitution, tree', `tree x$(printf ' -o') ${S}`],
+  ];
+  for (const [label, line] of DENIED) {
+    test(`denies: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'deny', `${line} -> ${r.decision}`);
+    });
+  }
+  for (const [label, line] of [
+    ['a same-line one-word option value (find .)', 'D=-name; find . $D x'],
+    ['a same-line one-word option value on a protected path (as at 71a1e70)', `D=-name; find ${S} $D x`],
+    ['a one-word option value, no IFS change', `D=-L; find ${S} $D`],
+    ['git -C "$PWD" status', 'git -C "$PWD" status'],
+    ['a quoted name value with a space for find -name', `N='x y'; find . -name "$N"`],
+    ['IFS changed, no expanded word', `IFS=:; find . -name x; cat ${S}`],
+    ['a regex ending in a dollar for rg', `rg 'foo$' ${S}`],
+    ['an awk program with $1 and $NF', `awk '{print $1, $NF}' ${S}`],
+  ]) {
+    test(`allows: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
+    });
+  }
+});
