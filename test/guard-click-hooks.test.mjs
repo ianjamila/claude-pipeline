@@ -685,3 +685,53 @@ test('R9: feeds through >( =( and functions, quote-split names on a fed interpre
     'while read -r l; do echo "$l"; done < .claude/settings.json',
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
+
+// ---- round 9 security review: for / select / case / [[ are harmless only as a bare header ---------------------------------------------------
+
+test('R9 security review: loop keywords are exempt only as bare headers', () => {
+  const py = "import os; os.link('/tmp/payload','.claude/settings.local.json')";
+  const failures = [];
+  // (the targets the bare `cp` / `tee` is itself refused on; a project settings file is judged by what lands in it, see the hook-adding lines below)
+  for (const target of ['~/.claude/settings.json', '~/.claude/hooks/notify.mjs', '~/.claude/settings.local.json']) {
+    for (const cmd of [
+      // zsh short loop form: the body stays in the keyword's segment
+      `for f (x) cp /tmp/payload ${target}`,
+      `for f (x) tee ${target} < /tmp/p`,
+      `select f (x) cp /tmp/p ${target}`,
+      `select f (x) tee ${target}`,
+      `for f in a b; cp /tmp/p ${target}`,
+      `for ((i=0;i<1;i++)) cp /tmp/p ${target}`,
+      `case x in x) cp /tmp/p ${target};; esac`,
+      `case x in x) tee ${target} < /tmp/p;; esac`,
+      `[[ -f a ]] cp /tmp/p ${target}`,
+      `if [[ -f a ]] cp /tmp/p ${target}`,
+      `[[ -f a ]] && cp /tmp/p ${target}`,
+    ]) if (bash(cmd) !== 'deny') failures.push(cmd);
+  }
+  for (const cmd of [
+    'for f (x) cp /tmp/payload .claude/settings.json',
+    'for f (x) cp /tmp/payload .claude/settings.local.json',
+    'select f (x) cp /tmp/p .claude/settings.json',
+    'for ((i=0;i<1;i++)) cp /tmp/p .claude/settings.json',
+    `for f (x) python3 -; echo "${py}"`,
+    `for f (x) python3 - <<< "${py}"`,
+    `select f (x) node -; echo "${py}"`,
+    `for f (x) python3 -; cat .claude/settings.local.json`,
+    `[[ -f a ]] python3 -; cat .claude/settings.local.json`,
+  ]) if (bash(cmd) !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these lines were not refused');
+  // a bare header (or a header whose body the parser split off) stays harmless
+  for (const cmd of [
+    'if [[ -f .claude/settings.json ]]; then jq .hooks .claude/settings.json | head; fi',
+    'for f in ~/.claude/skills/*/SKILL.md; do [[ -s $f ]] && head -3 "$f" | grep name; done',
+    'for t in node python3; do which $t; done | cat',
+    'for t in node python3; do command -v $t; done | cat; ls .claude/settings.json',
+    'type python3 | cat; cat .claude/settings.json',
+    'export P=python3; cat .claude/settings.json | head',
+    'case $x in node) cat .claude/settings.json | head;; esac',
+    'while read -r l; do echo "$l"; done < .claude/settings.json',
+    'for f in .claude/settings.json; do head -3 "$f"; done',
+    'for f in a b\ndo head -3 "$f"; done; cat .claude/settings.json',
+    '[[ -f a && -s b ]] && head x; ls .claude/settings.json',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});

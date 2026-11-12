@@ -754,7 +754,7 @@ function hookSurfaceBashReason(cmds, frame, ctx, io) {
     for (const [idx, c] of cmds.entries()) {
       const redirects = (c.redirects ?? []).filter((r) => WRITE_OPS.has(r.op) && typeof r.target === 'string' && r.target !== '' && !FD_DUP.test(r.target) && r.target !== '/dev/null').map((r) => r.target);
       const name = c.argv.length > 0 ? baseOf(c.argv[0]) : '';
-      const writer = name !== '' && !NOT_WRITERS.has(name) && !isReadOnly(c, ctx);
+      const writer = name !== '' && !notWriter(c.argv) && !isReadOnly(c, ctx);
       if (!writer && redirects.length === 0) continue;
       let words = [];
       if (writer && !DELETERS.has(name) && !(name === 'git' && GIT_NO_CONTENT.has(gitSubcommand(c.argv)))) {
@@ -1565,7 +1565,26 @@ function makeMatchers(ctx) {
 
 // ---- Bash: command classification -----------------------------------------------------------------
 
-const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', '[[', 'for', 'case', 'select', 'cut', 'du', 'hexdump', 'bat']);
+const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
+// (#269 R9 security review) `for` / `select` / `case` / `[[` are harmless only as a bare HEADER the parser has already cut the body off: zsh's short loop form keeps the body in the same segment
+// (`for f (x) cp /tmp/p FILE`, `[[ -f a ]] cp /tmp/p FILE`), so these words are never exempt by name. -> the keyword when argv is such a header, else ''.
+const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+function bareKeywordHeader(argv) {
+  const kw = argv[0];
+  if (kw === 'for' || kw === 'select') {
+    if (argv.length < 2 || !IDENT.test(argv[1])) return ''; // (`for ((..))`, `for a b in ..`: classified as any command)
+    if (argv.length === 2) return kw;
+    if (argv[2] !== 'in') return '';
+    return argv.slice(3).some((w) => /[()]/.test(w) || /^(?:do|then|done|else|elif|fi|esac|\{|\}|end)$/.test(w)) ? '' : kw;
+  }
+  if (kw === 'case') return (argv.length === 2 || (argv.length === 3 && argv[2] === 'in')) ? kw : '';
+  if (kw === '[[') { // the parser cuts `&&` / `||` apart, so a piece is `[[ words`, `words ]]` or a whole `[[ .. ]]`; a `]]` before the last word is followed by a command
+    const close = argv.indexOf(']]');
+    return close === -1 || close === argv.length - 1 ? kw : '';
+  }
+  return '';
+}
+const notWriter = (argv) => NOT_WRITERS.has(baseOf(argv[0])) || bareKeywordHeader(argv) !== '';
 const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
 const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'set-location', 'sl']);
@@ -1709,13 +1728,13 @@ const INLINE_RUNNERS = new RegExp(`^(?:node|nodejs|deno|bun|tsx|ts-node|python|p
 // (#269 R8, owner decision 2026-11-12) Every program that reads and runs text: the inline runners above, the other scripting languages, and the shells. A generous, fail-closed name list.
 const INTERPRETERS = new RegExp(`^(?:node|nodejs|deno|bun|tsx|ts-node|python|pypy|ruby|perl|php|lua|luajit|rscript|r|awk|gawk|mawk|nawk|wish|osascript|jjs|groovy|julia|sh|bash|zsh|dash|ash|ksh|ksh93|mksh|fish|busybox|csh|tcsh)${VERSION}$|^tclsh`);
 // (commands that only print or search their arguments: an interpreter's name among their words is a pattern or a file name, not a program)
-const NEVER_RUNS_ARGS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'echo', 'printf', 'cat', 'ls', 'which', 'type', 'whereis', 'man', 'wc', 'head', 'tail', 'sort', 'uniq', 'tr', 'cut', 'jq', 'diff', 'cmp', 'test', '[', '[[', ']]', 'stat', 'basename', 'dirname', 'realpath', 'readlink',
-  // (R9-F4) keywords and builtins that never run their words: `for t in node python3`, `[[ -f x ]]`, `export P=python3`, `read -r V`, `cd /dev`
-  'for', 'case', 'select', 'while', 'until', 'if', 'then', 'do', 'true', 'false', ':', 'cd', 'pushd', 'popd', 'export', 'local', 'declare', 'typeset', 'readonly', 'read', 'hash', 'whence', 'where']);
+const NEVER_RUNS_ARGS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'echo', 'printf', 'cat', 'ls', 'which', 'type', 'whereis', 'man', 'wc', 'head', 'tail', 'sort', 'uniq', 'tr', 'cut', 'jq', 'diff', 'cmp', 'test', '[', 'stat', 'basename', 'dirname', 'realpath', 'readlink',
+  // (R9-F4) builtins that never run their words: `export P=python3`, `read -r V`, `cd /dev`. `for` / `case` / `select` / `[[` count only as a bare header (bareKeywordHeader); `while` / `if` / `then` / `do` are cut away by the parser
+  'true', 'false', ':', 'cd', 'pushd', 'popd', 'export', 'local', 'declare', 'typeset', 'readonly', 'read', 'hash', 'whence', 'where']);
 // Is this command an interpreter (its name, past any wrapper the parser did not unwrap -- `timeout 5 python3`, `stdbuf -oL node` -- is one of INTERPRETERS), or a command whose name is only known at run time (`$PY`, `${X}`, a glob)?
 function isInterpreterCmd(argv) {
   if (!argv.length) return false;
-  if (NEVER_RUNS_ARGS.has(baseOf(argv[0]))) return false;
+  if (NEVER_RUNS_ARGS.has(baseOf(argv[0])) || bareKeywordHeader(argv)) return false;
   if (baseOf(argv[0]) === 'command' && /^-[pP]*[vV]/.test(argv[1] ?? '')) return false; // (`command -v python3` is a lookup; `command python3 -` still runs it)
   if (/[$`*?[{]/.test(argv[0])) return true;
   return argv.some((w) => INTERPRETERS.test(baseOf(w)));
@@ -1981,7 +2000,7 @@ const makesHardLinks = (c) => {
 const MOVERS = new Set(['mv', 'ln', 'ditto']); // any named protected path counts, and so does DEST/basename(SRC)
 // (zsh's lowercase `cdpath` array is tied to CDPATH: setting either sets both)
 const CDPATH_NAMES = ['CDPATH', 'cdpath'];
-const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'for', 'case', 'select', 'source', '.']);
+const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', 'source', '.']);
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
 const FD_DUP = /^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
@@ -2084,6 +2103,7 @@ function isReadOnly(cmd, ctx) {
   const name = baseOf(argv[0]);
   const args = argv.slice(1);
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
+  if (bareKeywordHeader(argv)) return true;
   if (READ_ONLY.has(name)) return !(name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre=')));
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
   if (name === 'git') return gitReadOnly(args);
@@ -3916,7 +3936,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // Why: below ~/.claude (projects/, skills/other) nothing is protected by name, yet a destination built at run time (`cp x "$V"`, `tee $(echo ../settings.json)`) can climb back to a protected file:
   // refused for every command that is not read-only (FP: a command with a run-time word, run from inside ~/.claude/**)
   if (!insideRoot && opts._writesOnly !== true && dirs.some((d) => ctx.hitTree(d))) {
-    const w = cmds.find((c) => c.argv.length && !NOT_WRITERS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && c.argv.slice(1).some((a) => /[`$]/.test(expandRefs(a, ctx))));
+    const w = cmds.find((c) => c.argv.length && !notWriter(c.argv) && !isReadOnly(c, ctx) && c.argv.slice(1).some((a) => /[`$]/.test(expandRefs(a, ctx))));
     if (w) return deny(`${baseOf(w.argv[0])} is given a name only known at run time inside the protected pipeline tree, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
   }
   // A reference no single command names lives in a heredoc body or in program text the shell parser cut into
