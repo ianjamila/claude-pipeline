@@ -288,14 +288,19 @@ export function rangeFacts(from, to, config, o) {
   }
 }
 
+// The protected kinds (review-route.mjs) the admitted round has NOW: planRound's, and what `substitute prepare|apply` asks again for budget / governor evidence (R5-F2).
+export function protectedKindsOf(adm) {
+  const { state, round } = adm;
+  const risen = state ? higherRisk(maxRiskOf(state), adm.level) !== maxRiskOf(state) : false;
+  return protectedKindsFor({ state, round, resolutionOnly: adm.resolutionOnly, confirmCount: adm.confirmItems.length, risen });
+}
+
 // Who reviews this admitted round and at what effort (review-route.mjs has the table; this gathers its facts). A base-only round is never planned.
 // -> { route, evidence, effort, why, protected, small, lowered?, round, base, wholePr, spend, budget, governor, facts }
 export function planRound(adm, { env = process.env, now = Date.now() } = {}) {
   const { config, state, round, root } = adm;
   const effort = config.review.effort;
-  const maxRisk = state ? maxRiskOf(state) : undefined;
-  const risen = state ? higherRisk(maxRisk, adm.level) !== maxRisk : false;
-  const kinds = protectedKindsFor({ state, round, resolutionOnly: adm.resolutionOnly, confirmCount: adm.confirmItems.length, risen });
+  const kinds = protectedKindsOf(adm);
   const facts = rangeFacts(adm.review.base, adm.head, config, { cwd: root });
   const small = facts.changedLines <= effort.small_fix_lines && !facts.newFile && !facts.sensitive;
   const usage = readWeeklyUsage({ env, now });

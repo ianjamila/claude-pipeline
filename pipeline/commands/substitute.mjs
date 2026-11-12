@@ -12,7 +12,7 @@ import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs
 import { validateFindings } from '../lib/codex.mjs';
 import { headSha, showFile } from '../lib/git.mjs';
 import { accountProjectsRoot, floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
-import { admitRound, headMoved, recordRound, roundPrompt } from '../lib/review-round.mjs';
+import { admitRound, headMoved, protectedKindsOf, recordRound, roundPrompt } from '../lib/review-round.mjs';
 import { quotaValidUntilMs, readRoute, superseded, writeFinalRoute } from '../lib/route-record.mjs';
 import { codexSpend } from '../lib/review-route.mjs';
 import { MAX_AGE_MS, readWeeklyUsage } from '../lib/codex-usage.mjs';
@@ -128,6 +128,12 @@ function checkAgainstRound(route, adm, packet, root) {
   if (route.patchSha256 !== patch) throw mismatch('patch digest');
   if (route.evidence === 'quota' && route.promptSha256 !== packet.promptSha256) throw mismatch('prompt digest');
   if (route.evidence === 'budget' && route.budget?.used !== codexSpend(adm.state)) throw mismatch('Codex budget spent');
+  // Only Codex's own quota stop sends a protected round to a substitute: a budget or governor withholding is for a small, unprotected fix-check, and the round may have become protected
+  // since (an item marked implemented in other files is now a confirm-fixed round; a risk rise; a whole-PR round owed): Codex is asked again for it (R5-F2).
+  if (route.evidence !== 'quota') {
+    const kinds = protectedKindsOf(adm);
+    if (kinds.length > 0) throw mismatch(`the round is now protected (${kinds.join(', ')}), which only Codex's own quota stop may send to a substitute`);
+  }
   const risk = adm.state ? higherRisk(maxRiskOf(adm.state), adm.level) : adm.level;
   const agent = substituteAgentFor(risk);
   if (route.agent !== agent) throw refuse('agent-changed', `route.json names ${route.agent} but the PR's highest risk (${risk}) needs ${agent}: run \`pipeline codex-review\` for the round again`);

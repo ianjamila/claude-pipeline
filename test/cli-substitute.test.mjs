@@ -331,27 +331,27 @@ test('R1-F2 / R2-B1: governor evidence written by codex-review expires: a readin
   }
 });
 
-test('#331: an evidence-kind flip or a moved worktree changes the packet text but not the content: the attempt counter, the invalid count and the tag stay', (t) => {
+test('#331: a moved worktree changes the packet text but not the content: the attempt counter, the invalid count and the tag stay', (t) => {
+  // (an evidence-kind flip also changed the text, but a round-1 route can only be a quota stop: budget / governor evidence on a protected round is route-mismatch, R5-F2)
   const w = world(t);
   const prep = w.ready();
   install(w, prep, { agentId: 'a1', models: ['claude-sonnet-4-6'] });
   assertExit(w.apply(w.projects), 1); // attempt 1 is recorded invalid (counts)
-  // the same range, now withheld by the governor instead of a quota stop: the packet text differs ("Codex evidence ...")
-  w.editRoute((r) => { r.evidence = 'governor'; r.governor = { usedPct: 95, soft: 75, threshold: 90, observedAt: new Date().toISOString() }; r.at = new Date().toISOString(); });
-  const flipped = w.prepare();
-  assertExit(flipped, 0, flipped.stdout + flipped.stderr);
-  assert.notEqual(flipped.json.digest, prep.digest, 'the packet differs');
-  assert.equal(flipped.json.attempt, 2, 'the invalid attempt still counts: not a fresh attempt 1');
-  assert.equal(flipped.json.tag, `${prep.tag} a2`, 'same tag lineage');
-  assert.deepEqual(w.attempts().attempts.map((a) => [a.k, a.status]), [[1, 'invalid'], [2, 'prepared']]);
-  install(w, flipped.json, { agentId: 'b1', models: ['claude-sonnet-4-6'] });
-  assertExit(w.apply(w.projects), 1);
-  // a moved worktree (the exported files have other absolute paths): the cap still holds
+  // a moved worktree (the exported files have other absolute paths): the packet text differs
   const oldDir = w.repo.dir;
   const movedDir = join(w.scratch, 'moved-checkout');
   renameSync(oldDir, movedDir);
   w.repo.dir = movedDir;
   try {
+    const moved = w.prepare();
+    assertExit(moved, 0, moved.stdout + moved.stderr);
+    assert.notEqual(moved.json.digest, prep.digest, 'the packet differs');
+    assert.equal(moved.json.attempt, 2, 'the invalid attempt still counts: not a fresh attempt 1');
+    assert.equal(moved.json.tag, `${prep.tag} a2`, 'same tag lineage');
+    assert.deepEqual(w.attempts().attempts.map((a) => [a.k, a.status]), [[1, 'invalid'], [2, 'prepared']]);
+    install(w, moved.json, { agentId: 'b1', models: ['claude-sonnet-4-6'] });
+    assertExit(w.apply(w.projects), 1);
+    // the cap still holds
     const exhausted = w.prepare();
     assertExit(exhausted, 1, exhausted.stdout + exhausted.stderr);
     assert.equal(exhausted.json.error, 'attempts-exhausted');
@@ -360,7 +360,6 @@ test('#331: an evidence-kind flip or a moved worktree changes the packet text bu
     w.repo.dir = oldDir;
   }
 });
-
 test('#331: a moved worktree on an OPEN attempt is the same attempt (same tag, rewritten files), not a fresh attempt 1', (t) => {
   const w = world(t);
   const prep = w.ready();
@@ -731,4 +730,29 @@ test('apply without the flags searches only the account projects folder, and ref
   install(w, prep2.json, { projects: account, agentId: 'a2' });
   const ok = w.cli(['substitute', 'apply', '--pr', '7', '--round', '1'], env);
   assertExit(ok, 0, ok.stdout + ok.stderr);
+});
+
+test('R5-F2: budget / governor evidence is judged against the protected-round rule again at prepare and apply: a round that became a confirm-fixed round (an item marked implemented since) is route-mismatch', (t) => {
+  const w = world(t);
+  const home = usageHome(w, 95);
+  const first = w.codex(1, findingsOf([], [low()]));
+  assertExit(first, 0, first.stdout + first.stderr);
+  w.repo.write('src/a.js', readFileSync(join(w.repo.dir, 'src', 'a.js'), 'utf8').replace('compute(x.y)', 'compute(x.z)'));
+  const small = w.repo.commit('small tweak');
+  const r2 = w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', small, '--effort', 'high'], { PIPELINE_CODEX_HOME: home });
+  assertExit(r2, 3, r2.stdout + r2.stderr);
+  assert.equal(r2.json.substitute.evidence, 'governor');
+  const prep = () => w.cli(['substitute', 'prepare', '--pr', '7', '--round', '2'], { PIPELINE_CODEX_HOME: home });
+  const open = prep();
+  assertExit(open, 0, open.stdout + open.stderr); // withheld, small, nothing to confirm: fine
+  // an accepted item is now marked implemented in another file: the round asks Codex to confirm it, a protected kind that only Codex's own quota stop may send to a substitute
+  w.edit((s) => Object.assign(s.rounds[0].items[0], { final: { decision: 'ACCEPT', by: 'claude', needsHuman: false, reason: 'real' }, implemented: true, implementedVia: 'other-files' }));
+  const refused = prep();
+  assertExit(refused, 1, refused.stdout + refused.stderr);
+  assert.equal(refused.json.error, 'route-mismatch');
+  assert.match(refused.json.message, /confirm-fixed/);
+  const applied = w.cli(['substitute', 'apply', '--pr', '7', '--round', '2', '--projects-dir', w.projects], { PIPELINE_CODEX_HOME: home });
+  assertExit(applied, 1, applied.stdout + applied.stderr);
+  assert.equal(applied.json.error, 'route-mismatch');
+  assert.equal(w.state().rounds.length, 1, 'no substitute round recorded');
 });
