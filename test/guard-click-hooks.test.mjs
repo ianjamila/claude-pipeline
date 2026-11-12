@@ -1060,6 +1060,36 @@ test('R17: a line continuation after $ / ${ / <, and a substitution in single qu
     "cat <<'E'\n$\\\n(x)\nE",
   ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
   assert.deepEqual(blocked, [], 'these R17 lines were refused');
+  // R18: arithmetic the guard cannot prove plain (a quote, backtick, backslash, `((` that may be subshells) is refused, and so is a `#` in proven arithmetic
+  const arith = [];
+  for (const cmd of [
+    "echo $(( 1 + $'$(" + cp + ")' ))", // R18-B1
+    "echo $(\\\n( 1 + '$(" + cp + ")' ))", // R18-B2
+    "(\\\n( 1 + '$(" + cp + ")' ))", // R18-F1
+    "for (\\\n( i = 0; i < '$(" + cp + ")'; i++ )); do :; done",
+    "echo $(( ${x:-'`" + cp + "`'} ))", // R18-F2
+    "echo $(( ${x:-'${ " + cp + "; }'} ))",
+    "(( ${x:-'`" + cp + "`'} ))",
+    'echo $(( 1 << E \\\n))\n' + cp + '\nE', // R18-F3
+    'echo $(( "1" << E ))\n' + cp + '\nE',
+    '(( "1" << E ))\n' + cp + '\nE',
+    'echo $(( 1 + # $(' + cp + ')\n 2 ))', // R18-F4
+    '(( 1 + # `' + cp + '`\n 2 ))',
+    'echo $((' + cp + ') )', // a $(( that is a subshell: refused too (a false refusal at worst)
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') arith.push(cmd);
+  assert.deepEqual(arith, [], 'these R18 lines were not refused');
+  const arithOk = [];
+  for (const cmd of [
+    'echo $(( 1 << 2 ))',
+    'echo $(( $# + 1 ))',
+    'echo $(( 16#ff ))',
+    'i=0; (( i++ )); echo $i',
+    'for (( i = 0; i < 3; i++ )); do echo $i; done',
+    'echo $(( (1 + 2) - 3 ))', // (a bare `*` in arithmetic is refused already, before #269 R18: the files guard reads it as a wildcard)
+    'x=$( (cd /tmp && ls) )',
+    'echo $(( $(wc -l < /tmp/a) + 1 ))',
+  ]) if (bash(cmd, {}, '/home/u') !== 'allow') arithOk.push(cmd);
+  assert.deepEqual(arithOk, [], 'these R18 lines were refused');
   // R17-F3: the refusal names the form and what to do instead (not "split it into simpler commands")
   for (const cmd of ['x=${ date; }', 'echo "${ echo a; }"', 'git commit -m "use ${ x; } here"']) {
     const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/home/u' });
