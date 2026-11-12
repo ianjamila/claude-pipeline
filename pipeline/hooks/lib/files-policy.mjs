@@ -1352,7 +1352,10 @@ function resolveGlobCd(e, bases, ctx, cmds, idx) {
 // (one rerun of a line per assumed directory, counted across the evaluation: past the allowance the line is refused rather than slow.
 // Phase 3b: 200 → 256 with the two review folders assumedCwds added, which cost a psql line under an unfollowable startup file 168 → 224
 // reruns (guard-false-positives J); the CPU deadline still bounds the line)
-const MAX_CD_RERUNS = 256;
+// cp #256 R5 regression (guard-false-positives J): the count grows with the SQUARE of the assumed directories (n reruns of the line, each rerunning the unfollowable startup file in n+1 more:
+// 15 directories = 255, 18 = 360 since pipeline-state/codex, .codex/sessions and .codex joined the protected set), so 256 refused every psql line under an unfollowable startup file again.
+// 512 holds 22 directories; a refusal past it stays fail-closed, and the CPU deadline still bounds the time (the J line takes ~0.2 s at 360 reruns).
+const MAX_CD_RERUNS = 512;
 const MAKES_DIRS = new Set(['mkdir', 'cp', 'mv', 'tar', 'bsdtar', 'gtar', 'unzip', 'git', 'rsync', 'ditto', 'install', 'ln', 'curl', 'wget']);
 const MAX_BELOW_ROOT_DIRS = 64; // (subdirectories of the protected roots a rerun may add for a `..` write)
 function countCdRun(budget) {
