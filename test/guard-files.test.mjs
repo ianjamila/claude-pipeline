@@ -987,7 +987,7 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
 // Phase 3b (Fable attacker pass on #107): review-complete trusts .review/state.json, so a repo's review state and the proofs beside it
 // are written only by the pipeline commands (their own process, which the hook never sees), in any checkout or worktree.
 test('Phase 3b: a repo\'s review state is protected from every write, wherever the checkout is', () => {
-  for (const p of ['/repo/.review/state.json', '.review/state.json', '/other/wt/.review/round-2/codex.json', '.review/round-1/model-proof.json', '.review/final-gate.json', '.review/preview-smoke.json', '.review/prod-before.json', '.review/state.json.123.tmp']) {
+  for (const p of ['/repo/.review/state.json', '.review/state.json', '/other/wt/.review/round-2/codex.json', '.review/round-1/model-proof.json', '.review/final-gate.json', '.review/preview-smoke.json', '.review/prod-before.json', '.review/state.json.123.tmp', '.review/substitute-attempts.json', '/repo/.review/substitute-attempts.json.9.tmp']) {
     assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', p);
     assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', p);
   }

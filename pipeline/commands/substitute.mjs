@@ -5,30 +5,29 @@
 // (lib/review-round.mjs). Anything unproven or unparseable records the attempt as invalid and records nothing: a review that cannot be shown to come from the
 // pinned model must never read as "nothing found". The model, effort, agent-type, floor and final-answer proofs are the arbiter's (lib/transcript.mjs,
 // lib/floor-proof.mjs), not copies of them.
-import { randomBytes } from 'node:crypto';
 import { readFileSync, rmSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { validateFindings } from '../lib/codex.mjs';
 import { headSha, showFile } from '../lib/git.mjs';
-import { floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
+import { accountProjectsRoot, floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
 import { admitRound, headMoved, recordRound, roundPrompt } from '../lib/review-round.mjs';
 import { quotaValidUntilMs, readRoute, superseded, writeFinalRoute } from '../lib/route-record.mjs';
 import { codexSpend } from '../lib/review-route.mjs';
 import { MAX_AGE_MS, readWeeklyUsage } from '../lib/codex-usage.mjs';
 import { higherRisk, maxRiskOf } from '../lib/state.mjs';
 import { substituteAgentFor } from '../lib/triage.mjs';
-import { extractJsonBlock } from '../lib/transcript.mjs';
+import { extractJsonBlock, findTaggedTranscripts } from '../lib/transcript.mjs';
 import { proveSubstituteRun, refuseTestOnlyFlags } from '../lib/substitute-proof.mjs';
-import { roundDir, sha256, withReviewLock, writeFileAtomic, writeJson } from '../lib/review-context.mjs';
+import { reviewDir, roundDir, sha256, withReviewLock, writeFileAtomic, writeJson } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'prepare the input for the Claude substitute reviewer of a round Codex could not review, then prove and record its answer',
   usage: [
     'pipeline substitute prepare --pr N --round R [--repo DIR]',
     '  -> {ok, round, agent, tag, promptHeader, inputPath, digest, digest8, attempt, reused, evidence, files, bytes}',
-    '  agent: substitute-opus (the PR\'s highest risk, ever, is low or medium) or substitute-fable (it was ever high); the tag is `pipeline-substitute R<R> <id8>` (`... a<k>` for attempt k > 1; id8 is minted when the attempts record of the round is created, so it survives a new codex-review attempt, an evidence kind or path change, and is new after `state discard-round`)',
+    '  agent: substitute-opus (the PR\'s highest risk, ever, is low or medium) or substitute-fable (it was ever high); the tag is `pipeline-substitute R<R> <id8>` (`... a<k>` for attempt k > 1; id8 is the first 8 hex digits of the digest of the round content (round, base, head, patch digest) - nothing random - so it survives a new codex-review attempt, an evidence kind or path change and `state discard-round`)',
     '  needs the evidence of THIS round: .review/round-R/route.json from a codex-review attempt that ended with evidence quota (Codex\'s own usage-limit stop), budget or governor (a small fix-check',
     '    Codex was not run for), for the same attempt, round, base, head and patch digest (and, for quota, the same Codex prompt digest); the checked-out HEAD must be that head;',
     '    review.substitute.mode is not off; a quota stop with a reset time is evidence only until that time (a stop with none: 2 hours): the reset is judged HERE and nowhere else (apply does not re-judge it); governor evidence is re-checked here too (the weekly figure must still be at or above the hard limit, else an evidence older than 6 h with no readable figure) and the attempts are kept per round content (round, base, head, patch digest: a new codex-review attempt, another evidence kind or a moved worktree neither resets the attempt counter / the two-invalid cap nor changes the tag)',
@@ -37,10 +36,10 @@ export const meta = {
     '    exit 2 for the shared round admission: round-order, state-pr-mismatch, base-mismatch (a whole-PR round owed after an Opus substitute round must start at the merge base), round-cap, empty-range, head-moved',
     '  writes .review/round-R/substitute-input.md (header ROUND: R / INPUT-DIGEST: <sha256 of the rest>, then the exact prompt Codex would have got, then an evidence map) and the files the agent cannot fetch with',
     '    Read/Grep/Glob under .review/round-R/substitute/: diff.patch (the range the prompt names), rules/AGENTS.md and rules/CLAUDE.md (git show <merge base>:..., when present) and, for a resolution round,',
-    '    sides/ours/<path> and sides/base/<path> for each conflicted file; the input lists every file with its sha256, so the digest covers them all; .review/round-R/substitute-attempts.json keeps the attempts',
+    '    sides/ours/<path> and sides/base/<path> for each conflicted file; the input lists every file with its sha256, so the digest covers them all; .review/substitute-attempts.json (outside every round-R/ folder, so `state discard-round` cannot reset the count or the tag; protected review state: only this command writes it) keeps the attempts',
     '  a second attempt (tag `... a2`) is allowed only after `apply` recorded the first one invalid (a re-run of prepare before that returns the same attempt, with reused:true); two invalid attempts: park (substitute:invalid).',
     '    An attempt that failed only because the terminal runs an older Fable than the floor (restartRequired) does not count against the two',
-    '  reused:true = prepare handed back an attempt that is already open (a resumed session, or a second codex-review for unchanged content): an agent may already have run under its tag, so run `apply` FIRST (exit 2 not-found recorded nothing: only then start the agent); a second agent under the same tag would be rejected as rerolled and count as invalid',
+    '  reused:true = prepare handed back an attempt that is already open (a resumed session, a second codex-review for unchanged content, a round thrown away with `state discard-round` after its attempt ran) or a transcript anywhere under the account\'s projects folder already carries the tag: an agent may already have run under it, so run `apply` FIRST (exit 2 not-found recorded nothing: only then start the agent); a second agent under the same tag would be rejected as rerolled and count as invalid',
     '  start the agent with promptHeader + "\\nRead <inputPath> and review the pull request.\\n", pasted exactly, description = tag, and no model argument',
     'pipeline substitute apply --pr N --round R [--tag TAG] [--repo DIR]   (--projects-dir DIR and --max-age-ms N exist for the test suite only: without PIPELINE_TEST_MODE they exit 2 test-only-flag)',
     '  proves the transcript tagged TAG (default: the open attempt\'s tag), searched only under the account\'s own projects folder (a transcript that is not really inside it is unproven): exactly ONE transcript carries the tag (else rerolled); agent type = the one prepare named; every assistant turn on claude-opus- (substitute-opus)',
@@ -75,24 +74,36 @@ function fence(label, text) {
 
 const sub = (root, round) => path.join(roundDir(root, round), SUBSTITUTE_DIR);
 const inputPathOf = (root, round) => path.join(roundDir(root, round), INPUT_FILE);
-const attemptsPathOf = (root, round) => path.join(roundDir(root, round), ATTEMPTS_FILE);
+// NOT inside round-R/: `state discard-round` moves that folder away, and the attempts (their count, and the tag a left-behind run carries) must outlive it (R3-B1).
+const attemptsPathOf = (root) => path.join(reviewDir(root), ATTEMPTS_FILE);
 
 // ---- the attempts at one round's content ------------------------------------------------------------------------------------------------------
 
 // Keyed by the CONTENT of the round - its number, base, head and patch digest - not by the Codex attempt and not by the packet text. A fresh codex-review attempt for unchanged
 // content must neither reset the two-invalid cap nor mint a new tag, or the first review could be re-rolled until its answer pleased (R1-F1); and the packet text also holds
 // things that change without the content (the evidence kind, the absolute paths of the exported files), which must not reset it either (#331). Changed content is a new record.
-// The tag carries a `lineage` minted when the record is created, not a digest of the packet: the record lives in the round folder, so `state discard-round` takes it away with the
-// round, and the next record's tag then differs from any transcript the discarded one left behind (a second agent under an old tag would be rejected as rerolled).
+// The tag id is the first 8 hex digits of this identity (and the attempt number), nothing random: the same content always gets the same tag, so a run a lost session left behind
+// is found by its tag whatever happened to the round folder in between. The record is ONE file for the repo's review (.review/substitute-attempts.json: { records: { <identity>:
+// { round, attempts } } }), outside every round-N/ folder, so `state discard-round` (which moves a round folder away) cannot reset the count or the tag (R3-B1: discard-round + prepare
+// was an unlimited re-roll). It is protected review state like final-gate.json (hooks/lib/files-policy.mjs): only this command writes it.
 const identityOf = (round, route) => sha256(JSON.stringify([round, route.base, route.head, route.patchSha256]));
-function readAttempts(root, round, identity) {
+const idOf = (identity) => identity.slice(0, 8);
+function readRecords(root) {
   try {
-    const parsed = JSON.parse(readFileSync(attemptsPathOf(root, round), 'utf8'));
-    if (parsed && parsed.identity === identity && /^[0-9a-f]{8}$/.test(parsed.lineage ?? '') && Array.isArray(parsed.attempts)) return parsed;
+    const parsed = JSON.parse(readFileSync(attemptsPathOf(root), 'utf8'));
+    if (parsed && typeof parsed.records === 'object' && parsed.records !== null && !Array.isArray(parsed.records)) return parsed.records;
   } catch { /* none, or unreadable: start fresh */ }
-  return { identity, lineage: randomBytes(4).toString('hex'), attempts: [] };
+  return {};
 }
-const saveAttempts = (root, round, record) => writeJson(attemptsPathOf(root, round), record);
+function readAttempts(root, round, identity) {
+  const rec = readRecords(root)[identity];
+  return { identity, attempts: rec && Array.isArray(rec.attempts) ? rec.attempts : [] };
+}
+function saveAttempts(root, round, record) {
+  const records = readRecords(root);
+  records[record.identity] = { round, attempts: record.attempts };
+  writeJson(attemptsPathOf(root), { records });
+}
 // Invalid attempts that count against the two: a restartRequired failure (an older terminal) is not the agent's fault.
 const countedInvalid = (record) => record.attempts.filter((a) => a.status === 'invalid' && a.restartRequired !== true).length;
 
@@ -210,7 +221,7 @@ function buildPacket(adm, route, root, maxBytes) {
   return { prompt, promptSha256: sha256(prompt), files, body, digest, text: `ROUND: ${adm.round}\nINPUT-DIGEST: ${digest}\n\n${body}`, bytes, dir };
 }
 
-const tagFor = (round, lineage, k) => `pipeline-substitute R${round} ${lineage}${k > 1 ? ` a${k}` : ''}`;
+const tagFor = (round, identity, k) => `pipeline-substitute R${round} ${idOf(identity)}${k > 1 ? ` a${k}` : ''}`;
 const headerFor = (round, digest) => `ROUND: ${round}\nINPUT-DIGEST: ${digest}`;
 const firstPromptFor = (round, digest, inputPath) => `${headerFor(round, digest)}\nRead ${inputPath} and review the pull request.\n`;
 
@@ -244,15 +255,21 @@ async function prepareLocked({ root, pr, round, ctx }) {
     k = 1;
   } else if (last.status === 'prepared') {
     k = last.k;
+  } else if (last.status === 'applied') {
+    // Only a round that is NOT in the review state gets here (admitRound refused otherwise): it was recorded and then thrown away with `state discard-round`. The same attempt is
+    // opened again so apply records the SAME run; a new agent for unchanged content would be a re-roll of the verdict (R3-B1).
+    k = last.k;
   } else if (last.status === 'invalid') {
     if (countedInvalid(record) >= MAX_INVALID_ATTEMPTS) throw refuse('attempts-exhausted', `${MAX_INVALID_ATTEMPTS} substitute attempts for this evidence were recorded invalid: park the round (substitute:invalid)`);
     k = last.k + 1;
   } else {
     throw refuse('new-attempt-not-allowed', `attempt ${last.k} is ${last.status}: a new attempt needs the previous one recorded invalid`);
   }
-  const tag = tagFor(round, record.lineage, k);
+  const tag = tagFor(round, record.identity, k);
   const inputPath = inputPathOf(root, round);
 
+  // A run may already carry this tag (a lost session; a round discarded after its agent ran): it is proven with apply first, never answered by a second agent (R3-B1).
+  const left = findTaggedTranscripts({ tag, projectsDir: accountProjectsRoot({ env: ctx.env ?? process.env }) }).length > 0;
   rmSync(sub(root, round), { recursive: true, force: true });
   for (const f of packet.files) {
     const target = path.join(packet.dir, f.rel);
@@ -261,9 +278,10 @@ async function prepareLocked({ root, pr, round, ctx }) {
   }
   writeFileAtomic(inputPath, packet.text);
   // An open attempt handed back (reused): the agent may already have run under this tag, so the caller proves it with `apply` before starting another (R2-F1).
-  const reused = last?.status === 'prepared';
-  const entry = { k, tag, digest: packet.digest, agent, status: 'prepared', preparedAt: reused ? last.preparedAt : new Date().toISOString() };
-  saveAttempts(root, round, { identity: record.identity, lineage: record.lineage, attempts: [...record.attempts.filter((a) => a.k !== k), entry].sort((a, b) => a.k - b.k) });
+  const open = last?.k === k && (last.status === 'prepared' || last.status === 'applied');
+  const reused = open || left;
+  const entry = { k, tag, digest: packet.digest, agent, status: 'prepared', preparedAt: open ? last.preparedAt : new Date().toISOString() };
+  saveAttempts(root, round, { identity: record.identity, attempts: [...record.attempts.filter((a) => a.k !== k), entry].sort((a, b) => a.k - b.k) });
   return {
     exitCode: EXIT.OK,
     output: {

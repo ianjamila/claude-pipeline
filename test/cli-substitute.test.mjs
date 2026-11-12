@@ -31,7 +31,12 @@ function world(t, opts = {}) {
   w.routeFile = (round = 1) => join(w.dir(round), 'route.json');
   w.route = (round = 1) => JSON.parse(readFileSync(w.routeFile(round), 'utf8'));
   w.editRoute = (fn, round = 1) => { const r = w.route(round); fn(r); writeFileSync(w.routeFile(round), JSON.stringify(r, null, 2)); };
-  w.attempts = (round = 1) => JSON.parse(readFileSync(join(w.dir(round), 'substitute-attempts.json'), 'utf8'));
+  // R3-B1: the attempts live in ONE file beside the rounds (.review/substitute-attempts.json, one record per round content), not inside a round folder that `state discard-round` moves away
+  Object.defineProperty(w, 'attemptsFile', { get: () => join(w.repo.dir, '.review','substitute-attempts.json') });
+  w.attempts = (round = 1) => {
+    const all = Object.values(JSON.parse(readFileSync(w.attemptsFile, 'utf8')).records).filter((r) => r.round === round);
+    return all.at(-1);
+  };
   w.prepare = (round = 1) => w.cli(['substitute', 'prepare', '--pr', '7', '--round', String(round)]);
   w.apply = (projects, extra = [], round = 1) => w.cli(['substitute', 'apply', '--pr', '7', '--round', String(round), '--projects-dir', projects, ...extra]);
   // Codex quota stop + prepare: the printed prepare result
@@ -42,6 +47,9 @@ function world(t, opts = {}) {
     return p.json;
   };
   w.projects = join(w.scratch, 'projects');
+  // prepare looks under the account's projects folder for a run that already carries the tag it would hand out (R3-B1): in the tests that is the loose folder
+  const cli2 = w.cli;
+  w.cli = (args, env = {}) => cli2(args, { PIPELINE_ACCOUNT_PROJECTS_DIR: w.projects, ...env });
   return w;
 }
 
@@ -81,7 +89,7 @@ test('prepare then apply: the input holds the exact Codex prompt, the evidence m
   assert.ok(input.includes(readFileSync(join(w.dir(), 'prompt.md'), 'utf8')), 'the exact bytes Codex was sent');
   assert.ok(input.includes('Evidence map') && input.includes(join(w.dir(), 'substitute', 'diff.patch')));
   assert.equal(readFileSync(join(w.dir(), 'substitute', 'diff.patch'), 'utf8'), readFileSync(join(w.dir(), 'diff.patch'), 'utf8'));
-  assert.equal(JSON.parse(readFileSync(join(w.dir(), 'substitute-attempts.json'), 'utf8')).attempts[0].status, 'prepared');
+  assert.equal(w.attempts().attempts[0].status, 'prepared');
   assert.equal(w.prepare().json.tag, prep.tag, 'prepare again before an invalid attempt is the same attempt');
 
   const r = w.apply(install(w, prep));
@@ -279,11 +287,11 @@ test('R2-F1: reused attempt with no agent run yet: apply first is exit 2 not-fou
   const prep = w.ready();
   const again = w.prepare().json;
   assert.equal(again.reused, true);
-  const before = readFileSync(join(w.dir(), 'substitute-attempts.json'), 'utf8');
+  const before = readFileSync(w.attemptsFile, 'utf8');
   const nf = w.apply(w.projects, []);
   assertExit(nf, 2, nf.stdout + nf.stderr);
   assert.equal(nf.json.error, 'not-found');
-  assert.equal(readFileSync(join(w.dir(), 'substitute-attempts.json'), 'utf8'), before, 'nothing recorded');
+  assert.equal(readFileSync(w.attemptsFile, 'utf8'), before, 'nothing recorded');
   install(w, again, { agentId: 'a1', models: ['claude-sonnet-4-6'] });
   assertExit(w.apply(w.projects), 1); // invalid
   const next = w.prepare().json;
@@ -373,22 +381,86 @@ test('#331: a moved worktree on an OPEN attempt is the same attempt (same tag, r
   }
 });
 
-test('R2-F1: state discard-round moves the attempts away with the round: the next prepare gets a tag no earlier transcript carries', (t) => {
+test('R3-B1: state discard-round does not reset a started substitute attempt: the tag and the invalid count survive, the left-behind run is proven first, and a second agent is a re-roll', (t) => {
   const w = world(t);
   const small = smallFixAfterRound1(w);
   const run2 = () => w.run(2, w.quota(), { from: w.head, to: small });
   assertExit(run2(), 3);
   const first = w.prepare(2);
   assertExit(first, 0, first.stdout + first.stderr);
+  assert.equal(first.json.reused, false);
   install(w, first.json, { agentId: 'old' }); // an agent ran under the tag, then the session was lost before apply
   assertExit(w.cli(['state', 'discard-round', '--round', '2', '--pr', '7']), 0);
   assertExit(run2(), 3);
   const second = w.prepare(2);
   assertExit(second, 0, second.stdout + second.stderr);
+  assert.equal(second.json.tag, first.json.tag, 'the tag comes from the round content and the attempt number only');
   assert.equal(second.json.attempt, 1);
-  assert.notEqual(second.json.tag, first.json.tag, 'the old transcript is not under this tag');
+  assert.equal(second.json.reused, true, 'a run already carries the tag: prove it with apply first');
+  // the second agent run (the re-roll) is rejected: two transcripts under one tag
   const r = w.apply(install(w, second.json, { agentId: 'new' }), [], 2);
-  assertExit(r, 0, r.stdout + r.stderr); // one transcript under the tag: not rerolled
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.match(r.json.errors.join('\n'), /rerolled: 2 transcripts/);
+  assert.equal(w.attempts(2).attempts[0].status, 'invalid');
+});
+
+test('R3-B1: after a discard the earlier run is proven first (apply), and that run is the one recorded', (t) => {
+  const w = world(t);
+  const small = smallFixAfterRound1(w);
+  const run2 = () => w.run(2, w.quota(), { from: w.head, to: small });
+  assertExit(run2(), 3);
+  const first = w.prepare(2).json;
+  install(w, first, { agentId: 'old' });
+  assertExit(w.cli(['state', 'discard-round', '--round', '2', '--pr', '7']), 0);
+  assertExit(run2(), 3);
+  const second = w.prepare(2).json;
+  assert.equal(second.reused, true);
+  const r = w.apply(w.projects, [], 2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.match(r.json.transcript, /agent-old\.jsonl$/);
+});
+
+test('R3-B1: an attempt recorded invalid before a discard still counts after it: the next prepare is attempt 2, then the cap holds', (t) => {
+  const w = world(t);
+  const small = smallFixAfterRound1(w);
+  const run2 = () => w.run(2, w.quota(), { from: w.head, to: small });
+  assertExit(run2(), 3);
+  const first = w.prepare(2).json;
+  install(w, first, { agentId: 'bad1', models: ['claude-sonnet-4-6'] });
+  assertExit(w.apply(w.projects, [], 2), 1);
+  assertExit(w.cli(['state', 'discard-round', '--round', '2', '--pr', '7']), 0);
+  assertExit(run2(), 3);
+  const next = w.prepare(2).json;
+  assert.equal(next.attempt, 2, 'the discard did not give a fresh attempt 1');
+  assert.equal(next.tag, `${first.tag} a2`);
+  assert.equal(next.reused, false);
+  install(w, next, { agentId: 'bad2', models: ['claude-sonnet-4-6'] });
+  assertExit(w.apply(w.projects, [], 2), 1);
+  assertExit(w.cli(['state', 'discard-round', '--round', '2', '--pr', '7']), 0);
+  assertExit(run2(), 3);
+  const exhausted = w.prepare(2);
+  assertExit(exhausted, 1, exhausted.stdout + exhausted.stderr);
+  assert.equal(exhausted.json.error, 'attempts-exhausted');
+});
+
+test('R3-B1: a discarded round that had been applied is not a fresh attempt either: prepare reopens the same attempt and apply records the same run', (t) => {
+  const w = world(t);
+  const small = smallFixAfterRound1(w);
+  const run2 = () => w.run(2, w.quota(), { from: w.head, to: small });
+  assertExit(run2(), 3);
+  const first = w.prepare(2).json;
+  install(w, first, { agentId: 'old' });
+  assertExit(w.apply(w.projects, [], 2), 0);
+  assertExit(w.cli(['state', 'discard-round', '--round', '2', '--pr', '7']), 0);
+  assertExit(run2(), 3);
+  const again = w.prepare(2);
+  assertExit(again, 0, again.stdout + again.stderr);
+  assert.equal(again.json.tag, first.tag);
+  assert.equal(again.json.attempt, 1);
+  assert.equal(again.json.reused, true);
+  const r = w.apply(w.projects, [], 2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.match(r.json.transcript, /agent-old\.jsonl$/, 'the same run, not a second one');
 });
 
 test('apply: no transcript with the tag is exit 2 not-found and records nothing; no prepared attempt is no-prepare', (t) => {
