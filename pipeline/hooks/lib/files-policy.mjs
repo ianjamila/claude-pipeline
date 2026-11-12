@@ -168,6 +168,12 @@ function withWindowsAliases(paths, home, platform) {
   return [...paths, ...extra];
 }
 
+// R6-F1 (#288): the text without its trailing slashes (at least `keep` characters stay), in one pass. `s.replace(/\/+$/, '')` retries from every slash of a long run of them: quadratic.
+function trimSlashes(s, keep = 0) {
+  let e = s.length;
+  while (e > keep && s[e - 1] === '/') e--;
+  return e === s.length ? s : s.slice(0, e);
+}
 // ---- path resolution (symlinks) -----------------------------------------------------------------
 
 // Real location of `p`: the realpath when it exists, else the realpath of the nearest existing ancestor with
@@ -973,16 +979,34 @@ function globElements(g) {
   }
   return out;
 }
+// R6-F1 (#288): a matcher with a `test(string)` like a RegExp, but NOT a RegExp. The pattern `/**?**?…Z` as a regular expression (`.*[^/].*[^/]…`) backtracks over every split of the string: ten pairs took 12 s, and
+// a hook that outlasts its timeout fails open. This one keeps the set of pattern positions the text read so far can have reached (the usual NFA walk): O(text × pattern), whatever the pattern. A deep `*` also matches a newline.
 function globToRe(g, ci) {
   const els = globElements(g);
-  if (els === null) return null;
-  let re = '';
-  for (const e of els) {
-    if (e.k === '*') re += e.deep ? '.*' : '[^/]*';
-    else if (e.k === '?') re += '[^/]';
-    else re += escapeRe(e.c);
-  }
-  try { return new RegExp(`^${re}$`, ci ? 'i' : ''); } catch { return null; } // (a pattern V8 refuses as too large: unreadable, the callers fail closed)
+  if (els === null || els.length > 20000) return null; // (as before: a pattern too large to read -- V8 refused the regexp -- is unreadable, and the callers fail closed)
+  const n = els.length;
+  const fold = (c) => (ci ? c.toLowerCase() : c);
+  const lits = els.map((e) => (e.k === 'c' ? fold(e.c) : null));
+  const settle = (at) => { for (let j = 0; j < n; j++) if (at[j] && els[j].k === '*') at[j + 1] = 1; return at; }; // (a `*` may match nothing)
+  return {
+    test(str) {
+      const s = fold(String(str));
+      let cur = settle(Uint8Array.from({ length: n + 1 }, (_, j) => (j === 0 ? 1 : 0)));
+      for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        const next = new Uint8Array(n + 1);
+        let any = false;
+        for (let j = 0; j < n; j++) {
+          if (!cur[j]) continue;
+          const e = els[j];
+          if (e.k === '*') { if (e.deep || ch !== '/') { next[j] = 1; any = true; } } else if (e.k === '?' ? ch !== '/' : lits[j] === ch) { next[j + 1] = 1; any = true; }
+        }
+        if (!any) return false;
+        cur = settle(next);
+      }
+      return cur[n] === 1;
+    },
+  };
 }
 
 // Every protected root plus the directories between it and the home directory, for globs like `~/.claude/*`.
@@ -1093,9 +1117,9 @@ function makeMatchers(ctx) {
   // once the shell expands it, and transcriptGlob above only sees globs that reach projects/ below one.
   const configDirGlob = (g) => withoutQualifier(g).some(configDirGlobOf);
   const configDirGlobOf = (g) => {
-    const gp = g.replace(/\/+$/, ''); // (R4-B2: before both the pattern test and the split at the last slash, which would land inside `(/)`)
+    const gp = trimSlashes(g); // (R4-B2: before both the pattern test and the split at the last slash, which would land inside `(/)`)
     const re = globToRe(gp, ctx.ci);
-    if (re && ctx.transcriptRoots.some((r) => re.test(r.replace(/\/+$/, '')))) return true;
+    if (re && ctx.transcriptRoots.some((r) => re.test(trimSlashes(r)))) return true;
     const at = gp.lastIndexOf('/');
     const last = gp.slice(at + 1);
     const parent = gp.slice(0, at);
@@ -1214,6 +1238,7 @@ function makeMatchers(ctx) {
   // A word that, resolved against any directory the command line has been in, lands inside a protected root (or is
   // exactly an ancestor dir when `withAncestors`). Catches what the textual scan cannot: `..` segments and relative
   // paths after `cd`.
+  const realMemoPath = new Map(); // (R6-F4: the real reading of an absolute word, once per word)
   const pathHit = (tok, dirs, withAncestors = true, plausible = null) => {
     let parts = [tok];
     if (tok.startsWith('-')) {
@@ -1235,8 +1260,13 @@ function makeMatchers(ctx) {
           // R5-F5 (#288): a `..` after a symlink is the physical parent of the link's target (`/tmp/link/../.claude/x`), which the lexical join above has already dropped: the physical reading is judged too
           const fulls = [full];
           if (/(?:^|\/)\.\.(?:\/|$)/.test(e)) {
-            const ph = physicalDots(isAbs(e) ? e : `${d.replace(/\/+$/, '')}/${e}`, ctx.api);
+            const ph = physicalDots(isAbs(e) ? e : `${trimSlashes(d)}/${e}`, ctx.api);
             if (ph !== null && ph !== full) fulls.push(ph, realResolve(ph, ctx.api));
+          } else if (isAbs(e) && !/[*?[]/.test(e)) {
+            // R6-F4: an absolute word that reaches a protected place through a symlink with no `..` (`/tmp/link/settings.json`, the link being the home directory) is read the way the kernel resolves it too
+            let rl = realMemoPath.get(full);
+            if (rl === undefined) { rl = realResolve(full, ctx.api); realMemoPath.set(full, rl); }
+            if (rl !== full) fulls.push(rl);
           }
           for (const fl of fulls) {
             if (/[*?[]/.test(fl) ? globHit(fl) : (ctx.hit(fl) || (withAncestors === 'pipeline' ? ctx.hitPipelineAncestor(fl) : withAncestors && (ctx.hitAncestor(fl) || ctx.hitTranscriptDir(fl)))) && (!plausible || plausible(fl, e))) return true;
@@ -1256,7 +1286,27 @@ const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
 const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'set-location', 'sl']);
 // R5-F1 (#288): the builtin cd, written as the command itself (after only NAME=value words): not behind `env`, `sudo`, `time`, `builtin`, `command`
-const PLAIN_CD = /^\s*(?:[A-Za-z_]\w*=(?:'[^']*'|"[^"]*"|\S*)\s+)*cd(?=\s|$|[;&|])/;
+// (R6-F1: a hand scan, one pass. The regex it replaces matched a quoted value two ways -- `'x'` is both `'[^']*'` and `\S*` -- and backtracked exponentially: 40 assignments before a failing `cd` outlasted the hook timeout)
+const PLAIN_CD = {
+  test(raw) {
+    const s = String(raw);
+    const n = s.length;
+    const isBlank = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v';
+    let i = 0;
+    for (;;) {
+      while (i < n && isBlank(s[i])) i++;
+      // NAME=value, the value one run of unquoted characters and quoted strings
+      const m = /^[A-Za-z_]\w*=/.exec(s.slice(i, i + 256));
+      if (!m) { const c = s[i + 2]; return s.startsWith('cd', i) && (c === undefined || isBlank(c) || c === ';' || c === '&' || c === '|'); }
+      i += m[0].length;
+      while (i < n && !isBlank(s[i])) {
+        const q = s[i];
+        if (q === "'" || q === '"') { const j = s.indexOf(q, i + 1); if (j < 0) return false; i = j + 1; } else i++;
+      }
+      if (i >= n) return false; // (an assignment is not followed by a cd)
+    }
+  },
+};
 // ...and the commands that can change the shell's directory (or what a command name means) without being a cd we model
 const DIR_CHANGERS = new Set([...CD_CMDS, 'chdir', 'eval', 'source', '.', 'builtin', 'command', 'exec', 'alias', 'unalias', 'setopt', 'shopt', 'enable', 'emulate']);
 // Why: the directories an unknown `cd` may land in that matter: each protected directory (a file cannot be a cwd), each directory above one, and the home's parents.
@@ -1842,10 +1892,14 @@ const GLOB_PATTERNS = {
 for (const n of ['sort', 'tree', 'jq', 'sed', 'gsed', 'awk', 'gawk', 'mawk', 'nawk']) GLOB_PATTERNS[n] = [OPT_ANY];
 // rsync (R5-B3): the options that delete (at the destination, or the sources); the same engine
 const RSYNC_DELETE_PATTERNS = ['--del', '--delete', '--delete-before', '--delete-during', '--delete-delay', '--delete-after', '--delete-excluded', '--delete-missing-args', '--remove-source-files', '--remove-sent-files'].map((o) => optLit(o, false));
-const GLOB_CHARS = /[*?[]/;
+// (R6-F3: and the characters of a zsh glob group, qualifier, numeric range or extended glob: `(a|b)`, `name(.)`, `<1-3>`, `^x`, `a~b`, `a#`. A `#` or `~` first in a word is no glob; `|` only stands in a word inside a group)
+const GLOB_CHARS = /[*?[()^<>]|.[#~]/;
 // Can the glob word `w` become a word that matches the token pattern `toks` (every token one character: {c} that character, {any} any character but `/`; {star} zero or more of it)?
 // A product of the glob's elements and the pattern positions: linear in the word (the pattern is a few characters long). A glob element (`*`, `?`, a bracket) never matches `/`; a literal `/` of the word is part of a path the pattern spans.
 function globMeets(w, toks) {
+  // R6-F3: a group, qualifier, range or extended glob is not read, it is too tangled: a word that begins with `-` or with a glob (it can match a string that starts with `-`) is a possible option. A word that begins
+  // with another plain character (`print(x)`, `s/(a)/b/`) cannot start with `-` whatever follows, and is judged below.
+  if (/[()^<>]|.[#~]/.test(w) && /^[-*?[(^<]/.test(w)) return true;
   const els = globElements(w);
   if (els === null) return true; // (too tangled to read: it may be anything)
   const m = toks.length;
@@ -1868,19 +1922,52 @@ function globMeets(w, toks) {
   }
   return at.has(m);
 }
-// Is there an unquoted glob character in the raw text of the command? A quoted `'*.ts'` or an escaped `\*` is never expanded against the files; no raw, an unbalanced quote: yes.
-function unquotedGlob(raw) {
-  if (typeof raw !== 'string') return true;
+// R6-F1 / F2 (#288): the command line with its quoted strings removed, in ONE pass (the regexes this replaces were quadratic on an unterminated quote). An escaped character stays as written (`\\x`).
+// null: cannot be told -- no text, an unterminated quote, or an ANSI-C / locale string (`$'…'`, `$"…"`: a backslash-quote in it does not end the string, and the parser keeps no per-word quoting to ask), so
+// every reader of this fails closed on it.
+function withoutQuotes(raw) {
+  if (typeof raw !== 'string' || raw.includes("$'") || raw.includes('$"')) return null;
   const n = raw.length;
+  const out = [];
+  let from = 0;
   for (let i = 0; i < n; i++) {
     const c = raw[i];
     if (c === '\\') i++;
-    else if (c === "'") { const j = raw.indexOf("'", i + 1); if (j < 0) return true; i = j; } else if (c === '"') {
+    else if (c === "'") {
+      const j = raw.indexOf("'", i + 1);
+      if (j < 0) return null;
+      out.push(raw.slice(from, i));
+      i = j;
+      from = j + 1;
+    } else if (c === '"') {
       let j = i + 1;
       while (j < n && raw[j] !== '"') j += raw[j] === '\\' ? 2 : 1;
-      if (j >= n) return true;
+      if (j >= n) return null;
+      out.push(raw.slice(from, i));
       i = j;
-    } else if (c === '*' || c === '?' || c === '[') return true;
+      from = j + 1;
+    }
+  }
+  out.push(raw.slice(from));
+  return out.join('');
+}
+// Is there an unquoted glob character in the raw text of the command? A quoted `'*.ts'` or an escaped `\*` is never expanded against the files; a line withoutQuotes cannot read: yes.
+// (R6-F3: a zsh group `(`, a numeric range `<->`, `^`, and a `#` or `~` inside a word count too.)
+function unquotedGlob(raw) {
+  const t = withoutQuotes(raw);
+  return t === null || /[*?[(^]|\S[#~]|<[\d-]*>/.test(t.replace(/\\[\s\S]/g, ''));
+}
+// R6-F1: is there a `!` at a command position (after the start of the line, `;`, `&`, `|`, `(` or a newline, then only blanks and followed by a blank) in text withoutQuotes has read? One pass.
+function bangAtCommandStart(t) {
+  let start = true;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (c === ';' || c === '&' || c === '|' || c === '(' || c === '\n') start = true;
+    else if (/\s/.test(c)) continue;
+    else {
+      if (start && c === '!' && i + 1 < t.length && /\s/.test(t[i + 1])) return true;
+      start = false;
+    }
   }
   return false;
 }
@@ -1889,12 +1976,17 @@ const DASHDASH_ENDS = new Set(['git', 'rg', 'sort', 'tree', 'jq', 'xxd', 'sed', 
 function globWordMeets(a, pats) {
   return GLOB_CHARS.test(a) && pats.some((p) => globMeets(a, p));
 }
-function globOptionRisky(name, args, raw) {
+// `orig`: the words as written. R6-B1: a word that expansion changed (`D="--[d]elete"; find DIR $D`) is matched against the files after the expansion, so each blank-split piece of it is tested, whatever the raw text says.
+function globOptionRisky(name, args, raw, orig = args) {
   const pats = GLOB_PATTERNS[name];
-  if (!pats || !args.some((a) => GLOB_CHARS.test(a)) || !unquotedGlob(raw)) return false;
-  for (const a of args) {
+  if (!pats || !args.some((a) => GLOB_CHARS.test(a))) return false;
+  const globs = unquotedGlob(raw);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
     if (a === '--' && DASHDASH_ENDS.has(name)) break;
-    if (globWordMeets(a, pats)) return true;
+    if (!GLOB_CHARS.test(a)) continue;
+    if (globs && globWordMeets(a, pats)) return true;
+    if (orig[i] !== a && a.split(/\s+/).some((piece) => globWordMeets(piece, pats))) return true;
   }
   return false;
 }
@@ -2161,7 +2253,7 @@ function isReadOnly(cmd, ctx) {
 }
 function readOnlyWith(name, args, cmd, ctx, argv) {
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
-  if (globOptionRisky(name, args, cmd.raw)) return false; // (R4-F3 / R5-B2: a glob-spelled option)
+  if (globOptionRisky(name, args, cmd.raw, argv.slice(1))) return false; // (R4-F3 / R5-B2: a glob-spelled option)
   if (READ_ONLY.has(name)) {
     if (name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre='))) return false;
     return !(['less', 'more', 'bat', 'rg'].includes(name) && toolEnvTouched(cmd, ctx, GIT_TOOL_ENV));
@@ -2210,8 +2302,8 @@ function splitOperands(argv, name) {
   if (target) { dests = [target]; sources = pos; } else if (dirMode) { dests = pos; sources = []; } else if (pos.length >= 2) { dests = [pos[pos.length - 1]]; sources = pos.slice(0, -1); } else { dests = []; sources = []; }
   const written = [...dests];
   for (const d of dests) for (const src of sources) {
-    const b = posix.basename(toPosix(src).replace(/\/+$/, ''));
-    if (b && b !== '.' && b !== '..' && !/[*?[]/.test(b)) written.push(`${d.replace(/\/+$/, '')}/${b}`);
+    const b = posix.basename(trimSlashes(toPosix(src)));
+    if (b && b !== '.' && b !== '..' && !/[*?[]/.test(b)) written.push(`${trimSlashes(d)}/${b}`);
   }
   return { written, dests, sources };
 }
@@ -2231,6 +2323,7 @@ function rsyncFlags(argv, ctx, raw) {
     if (e !== a && ifs) out.unknown = true;
     if (RUN_TIME.test(e) && /^[-$`]/.test(e)) out.unknown = true;
     for (const piece of e.split(/\s+/)) {
+      if (e !== a && globWordMeets(piece, RSYNC_DELETE_PATTERNS)) out.unknown = true; // (R6-B1: a glob a variable holds is matched after the expansion, whatever the raw text says)
       if (/^--del/.test(piece)) out.del = true;
       else if (/^--remove-/.test(piece)) out.rm = true;
     }
@@ -3997,7 +4090,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // R4-B2: a glob word is matched against each member of the chain (a glob that globToRe cannot read is a hit); R4-F2: ~NAME spellings, see homeWord
   const globMemo = new Map(); // (a long line repeats the same words and directories: each glob is built once)
   const hitChain = (path) => {
-    const e = pathsFor().normalize(path).replace(/(.)\/+$/, '$1');
+    const e = trimSlashes(pathsFor().normalize(path), 1);
     if (/[*?[]/.test(e)) {
       let hit = globMemo.get(e);
       if (hit === undefined) {
@@ -4010,16 +4103,21 @@ function evaluateBashForFilesFrame(command, opts) {
     return homeChain.has(ctx.ci ? e.toLowerCase() : e);
   };
   // R5-F5: a `..` after a symlink is the PHYSICAL parent of the link's target, which the lexical reading above has already dropped: the word is also read the way the kernel resolves it
+  // R6-F4: and a word that reaches home through a symlink with no `..` at all (`/tmp/link/` where the link is home) is read the way the kernel resolves it too: every absolute, glob-free word, memoised
+  const realMemo = new Map();
+  const realOf = (p) => { let r = realMemo.get(p); if (r === undefined) { r = realResolve(p, ctx.api); realMemo.set(p, r); } return r; };
   const hitPath = (p) => {
     if (hitChain(p)) return true;
-    if (!/(?:^|\/)\.\.(?:\/|$)/.test(p)) return false;
+    if (!/(?:^|\/)\.\.(?:\/|$)/.test(p)) return isAbs(p) && !/[*?[]/.test(p) && hitChain(realOf(p));
     const ph = physicalDots(p, ctx.api);
-    return ph !== null && (hitChain(ph) || hitChain(realResolve(ph, ctx.api)));
+    return ph !== null && (hitChain(ph) || hitChain(realOf(ph)));
   };
   // R4-F1: the directories a command can run in. Without a ( ) { } or a compound keyword on the line, a command that follows a cd to a directory known now by && only (and by && only, up to it) runs in that
   // directory alone: the cd ran and succeeded. Any other join (; || | &) keeps the cd that may have failed or run elsewhere in view, so such a command is read against every directory of the line (`dirs`).
   const cdOf = (c) => CD_CMDS.has(baseOf(c.argv[0] ?? ''));
-  const keywordLine = cmds.subshell === true || /(?:^|[\s;&|])(?:[({}]|(?:if|then|else|elif|fi|for|while|until|do|done|case|esac|select|function|coproc)(?![\w./-]))/.test(raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, ''));
+  // R6-F1 / F2: ONE linear reading of the quotes (withoutQuotes); a line it cannot read (an unterminated quote, `$'…'`, `$"…"`) is read as holding a keyword and a `!`, and so is never narrowed
+  const unquoted = withoutQuotes(raw);
+  const keywordLine = cmds.subshell === true || unquoted === null || /(?:^|[\s;&|])(?:[({}]|(?:if|then|else|elif|fi|for|while|until|do|done|case|esac|select|function|coproc)(?![\w./-]))/.test(unquoted);
   const landings = (e, base) => { // (where the cd target leads from each directory of base; a '..' after a symlink also reads as the target's parent, see collectDirs)
     const out = [];
     for (const d of base) {
@@ -4049,10 +4147,8 @@ function evaluateBashForFilesFrame(command, opts) {
   // command that cannot change the shell's directory), there is no `!` at a command position on the line (`! cd X && cmd` runs cmd when the cd FAILS), nothing earlier can change the directory behind our
   // back (chdir, eval, source, `.`, builtin / command / exec, an alias, a name that is only known at run time), and the cd target is read both lexically and through its symlinks (the real directory
   // too: `cd /tmp/link && find ..` is the link target's parent). Otherwise the command is read against every directory of the line (`dirs`).
-  const realMemo = new Map();
-  const realOf = (p) => { let r = realMemo.get(p); if (r === undefined) { r = realResolve(p, ctx.api); realMemo.set(p, r); } return r; };
   const withReal = (list) => unique([...list, ...list.map(realOf)]);
-  const bangLine = /(?:^|[;&|(\n])\s*!(?=\s)/.test(raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, ''));
+  const bangLine = unquoted === null || bangAtCommandStart(unquoted);
   const staticName = (c) => { const n = c.argv[0] ?? ''; return n === '[' || n === '[[' || (n !== '' && !/[$`*?[\](){}~'"\\<>=]/.test(n)); };
   const changesDir = (c) => c.argv.length > 0 && (!staticName(c) || DIR_CHANGERS.has(baseOf(c.argv[0])));
   const narrowDirs = new Map();
@@ -4102,7 +4198,7 @@ function evaluateBashForFilesFrame(command, opts) {
     if (!w || w.startsWith('-')) return false; // (an option, or a lone `-`)
     if (w === '/' && ((opt && NON_PATH_OPTIONS.has(opt[1])) || SLASH_NOT_A_PATH.has(cname))) return false;
     const hits = (paths) => paths.some(hitPath);
-    const under = (d, x) => `${d.replace(/\/+$/, '')}/${x}`; // (not normalized: a `..` is read lexically and physically, see hitPath)
+    const under = (d, x) => `${trimSlashes(d)}/${x}`; // (not normalized: a `..` is read lexically and physically, see hitPath)
     const wu = w.replace(USER_RE, ctx.user);
     if (/^~\+(?:\/|$)/.test(wu)) return unknownWd || hits(wdirs.map((d) => under(d, wu.slice(2) || '.')));
     let x = expandRefs(w, ctx);
@@ -4112,9 +4208,10 @@ function evaluateBashForFilesFrame(command, opts) {
       return rest !== '' && rest[0] !== '/' ? true : unknownWd || hits(wdirs.map((d) => under(d, rest || '.')));
     }
     if (x[0] === '~' && !isAbs(x)) {
-      const m = /^~([^/]*)(.*)$/.exec(x);
-      if (!(ctx.ci ? m[1].toLowerCase() === ctx.user.toLowerCase() : m[1] === ctx.user)) return true;
-      x = ctx.homePosix + m[2];
+      const slash = x.indexOf('/'); // (R6-F1: not /^~([^/]*)(.*)$/, which retries from every character when the rest holds a newline)
+      const who = slash < 0 ? x.slice(1) : x.slice(1, slash);
+      if (!(ctx.ci ? who.toLowerCase() === ctx.user.toLowerCase() : who === ctx.user)) return true;
+      x = ctx.homePosix + (slash < 0 ? '' : x.slice(slash));
     }
     // a relative word is resolved against the directories the command can run in and normalized (`.`, `..`)
     if (isAbs(x)) return hitPath(x);
@@ -4139,12 +4236,14 @@ function evaluateBashForFilesFrame(command, opts) {
     return ws.filter((w, i) => !(i > 0 && /^--[\w-]+$/.test(ws[i - 1]) && NON_PATH_OPTIONS.has(ws[i - 1].slice(2))));
   };
   // R5-B4: a dry run is a literal -n / --dry-run that stands as its own option (or a short cluster of letters without e) before `--`, and is not the value of -e / --exclude (`-e -n`, `-enode_modules`, `--exclude=-n`, `--exclude -n`)
+  // R6-B2: the options are read in order and the last one wins: any `--no-…` word (`--no-dry-run` and every abbreviation of it) is not a dry run
   const gitCleanDryRun = (rest) => {
     let dry = false;
     for (let k = 0; k < rest.length; k++) {
       const a = rest[k];
       if (a === '--') break;
       if (a === '--dry-run') dry = true;
+      else if (a.startsWith('--no-')) dry = false;
       else if (a.startsWith('--')) { if (a.length >= 3 && !a.includes('=') && '--exclude'.startsWith(a)) k++; } // (--exclude and its abbreviations take the next word)
       else if (/^-[A-Za-z]+$/.test(a)) {
         if (a.includes('e')) { if (a.indexOf('e') === a.length - 1) k++; } // (-e takes the rest of the cluster, or the next word: the value is no option either way)
