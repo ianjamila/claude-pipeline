@@ -356,17 +356,16 @@ test('overlapping and disjoint requests: each packet has its own record, tag and
   const w = world(t, { items: 3 });
   const a = w.ready('R1-B1');
   const b = w.ready('R1-B2,R1-B3');
-  const c = w.ready('R1-B1,R1-B2');
-  assert.equal(new Set([a.tag, b.tag, c.tag]).size, 3, 'three packets, three tags');
-  assert.equal(new Set([a.inputPath, b.inputPath, c.inputPath]).size, 3);
-  // disjoint: A and B are independent
+  assert.equal(new Set([a.tag, b.tag]).size, 2, 'two packets, two tags');
+  assert.notEqual(a.inputPath, b.inputPath);
+  // a packet that overlaps an open one is not handed to a second agent (R5-F1: see the test of that name); disjoint packets are independent
+  const c = w.second('R1-B1,R1-B2');
+  assertExit(c, 3, c.stdout);
+  assert.equal(c.json.substitute.eligible, false);
+  assert.equal(c.json.substitute.why, 'overlapping-packet');
   assertExit(w.apply(a.tag, install(w, a, ['R1-B1'], { agentId: 'p' })), 0);
   assertExit(w.apply(b.tag, install(w, b, ['R1-B2', 'R1-B3'], { agentId: 'q' })), 0);
-  // overlapping: C asks about B1 and B2, which have a second review by now
-  const r = w.apply(c.tag, install(w, c, ['R1-B1', 'R1-B2'], { agentId: 'r' }));
-  assertExit(r, 1, r.stdout);
-  assert.equal(r.json.error, 'item-changed');
-  assert.match(r.json.message, /already has a second review/);
+  // overlapping: asking about B1 and B2, which have a second review by now
   const again = w.second('R1-B1');
   assertExit(again, 1, again.stdout);
   assert.match(again.json.reason, /already has a second review/);
@@ -471,4 +470,67 @@ test('apply refuses --projects-dir and --max-age-ms outside test mode (exit 2 te
   assertExit(linked, 1, linked.stdout + linked.stderr);
   assert.ok(linked.json.errors.some((e) => e.includes("not under the account's projects folder")), linked.stdout);
   assert.equal(w.item('R1-B1').secondReview, undefined, 'nothing stored');
+});
+
+test('R5-F1: a second review cannot be re-rolled by asking again with another id set: a packet that shares an item with an unsettled packet of the same head gets no attempt', (t) => {
+  const w = world(t, { items: 2 });
+  const ab = w.ready('R1-B1,R1-B2');
+  const id8 = ab.tag.split(' ')[2];
+  const before = readdirSync(w.dir()).sort();
+  // the agent ran for {B1,B2} (its verdict is visible to the controller before --apply); asking about {B1} alone must not mint a new tag
+  install(w, ab, ['R1-B1', 'R1-B2'], { agentId: 'first' });
+  for (const ids of ['R1-B1', 'R1-B2']) {
+    const one = w.second(ids);
+    assertExit(one, 3, one.stdout);
+    assert.equal(one.json.substitute.eligible, false, `${ids}: ${one.stdout}`);
+    assert.equal(one.json.substitute.why, 'overlapping-packet');
+    assert.equal(one.json.substitute.packet, id8);
+    assert.equal(one.json.substitute.tag, undefined, 'no tag, no input, no attempt');
+  }
+  const same = w.second('R1-B2,R1-B1');
+  assertExit(same, 3, same.stdout);
+  assert.equal(same.json.substitute.tag, ab.tag, 'the same ids (any order) are the same packet');
+  assert.equal(readdirSync(w.dir()).filter((f) => /^second-review-attempts-/.test(f)).length, 1, 'only the {B1,B2} attempts record exists');
+  assert.ok(before.includes(`second-review-attempts-${id8}.json`));
+  // an invalid attempt of {B1,B2} still blocks the subset (apply or park that packet first); the same packet may retry
+  const bad = w.apply(ab.tag, install(w, ab, ['R1-B1', 'R1-B2'], { agentId: 'second', answer: answerOf(['R1-B1']) }));
+  assert.ok(bad.code === 1 || bad.code === 2, bad.stdout);
+  const sub = w.second('R1-B1');
+  assertExit(sub, 3, sub.stdout);
+  assert.equal(sub.json.substitute.eligible, false);
+  assert.equal(sub.json.substitute.why, 'overlapping-packet');
+  // a disjoint packet is unaffected
+  const w3 = world(t, { items: 3 });
+  const x = w3.ready('R1-B1,R1-B2');
+  const y = w3.ready('R1-B3');
+  assert.notEqual(x.tag, y.tag);
+});
+
+test('R5-F3: a second review prepared again while its attempt is open, or after an agent already ran under the tag, says reused: true; the skill keys on substitute.eligible and runs --apply first', (t) => {
+  const w = world(t, { items: 1 });
+  const account = join(w.scratch, 'account-projects');
+  mkdirSync(account, { recursive: true });
+  const env = { ...w.quota(), PIPELINE_ACCOUNT_PROJECTS_DIR: account };
+  const first = w.second('R1-B1', env);
+  assertExit(first, 3, first.stdout);
+  assert.equal(first.json.substitute.reused, false, 'a first attempt is new');
+  const again = w.second('R1-B1', env);
+  assert.equal(again.json.substitute.reused, true, 'the open attempt handed back');
+  assert.equal(again.json.substitute.tag, first.json.substitute.tag);
+  const none = w.cli(['triage', 'second-review', '--apply', '--pr', '7', '--tag', first.json.substitute.tag], { ...env, PIPELINE_TEST_MODE: '0' });
+  assertExit(none, 2, none.stdout + none.stderr);
+  assert.equal(none.json.error, 'not-found');
+  // the agent ran (a transcript of any age carries the tag) but the session was lost before apply: the attempt is still the same one
+  install(w, first.json.substitute, ['R1-B1'], { projects: account });
+  const resumed = w.second('R1-B1', env);
+  assert.equal(resumed.json.substitute.reused, true);
+  const r = w.cli(['triage', 'second-review', '--apply', '--pr', '7', '--tag', first.json.substitute.tag], { ...env, PIPELINE_TEST_MODE: '0' });
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(w.item('R1-B1').secondReview.by, 'substitute-opus');
+
+  const skill = readFileSync(new URL('../skills/review/SKILL.md', import.meta.url), 'utf8');
+  const tail = skill.split('\n').find((l) => l.includes('Exit 3 ⇒ rule 2') && l.includes('second-review'));
+  assert.ok(tail, 'the second-review step');
+  assert.match(tail, /`substitute\.eligible: true`/, 'keys on eligible, not on the presence of substitute');
+  assert.match(tail, /substitute\.reused[^]*--apply --pr N --tag[^]*FIRST[^]*not-found[^]*ONE call of the agent/);
 });

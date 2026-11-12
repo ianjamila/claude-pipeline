@@ -6,10 +6,12 @@
 //   packetId  sha256 of { ids (sorted), head, findings (the digest of the asked items' text), finals (their finals) }: the same question about the same state, nothing else.
 //   tag       `pipeline-substitute-2nd R<R> <packetId8>` (`... a<k>` for attempt k > 1): a first review's tag (`pipeline-substitute R<R> <digest8>`), mode header and input digest all differ.
 //   header    `MODE: SECOND-REVIEW` / `ROUND: R` / `INPUT-DIGEST: <sha256 of the rest>`; the agent's first prompt is the header + a fixed line that is NOT the first review's.
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { readFileOrFail, roundDir, sha256, writeFileAtomic, writeJson } from './review-context.mjs';
+import { accountProjectsRoot } from './floor-proof.mjs';
+import { findTaggedTranscripts } from './transcript.mjs';
 
 export const SECOND_MODE = 'SECOND-REVIEW';
 export const SECOND_EVIDENCE_KINDS = Object.freeze(['quota', 'budget', 'governor']);
@@ -61,11 +63,32 @@ export const saveSecondAttempts = (root, round, record) => writeJson(attemptsPat
 // An attempt that failed only because the terminal runs an older Fable than the floor (restartRequired) does not count against the two.
 export const countedSecondInvalid = (record) => record.attempts.filter((a) => a.status === 'invalid' && a.restartRequired !== true).length;
 
-// Writes the input and opens (or reopens) the attempt. -> { ok: true, k, tag, digest, header, inputPath } | { ok: false, why }.
+// Another packet of the round that asks about one of these items at this head and has not been settled (cp #256 R5-F1). The packet id hashes the caller's --ids, so `--ids A,B` and
+// then `--ids A` are two packets with two tags: without this, the verdict for A could be drawn again until it pleased. An unsettled packet is one with an attempt that is open
+// (prepared: its agent may have run), recorded invalid, or that exhausted the two; apply it, or park it, before asking about the same item another way. (A packet whose items all
+// have a verdict is settled and never reaches here: secondReviewCheck refuses an item that has one. A moved head is new content: its own packets.) -> the packet's 8-digit id | null
+function overlappingPacket(root, round, packetId, ids, head) {
+  let names;
+  try { names = readdirSync(roundDir(root, round)); } catch { return null; }
+  for (const name of names.sort()) {
+    if (!/^second-review-attempts-[0-9a-f]{8}\.json$/.test(name)) continue;
+    let other;
+    try { other = JSON.parse(readFileSync(path.join(roundDir(root, round), name), 'utf8')); } catch { continue; }
+    if (!other || other.packetId === packetId || other.head !== head || !Array.isArray(other.ids) || !Array.isArray(other.attempts)) continue;
+    if (!other.ids.some((id) => ids.includes(id))) continue;
+    if (other.attempts.some((a) => a.status !== 'applied')) return String(other.packetId).slice(0, 8);
+  }
+  return null;
+}
+
+// Writes the input and opens (or reopens) the attempt. -> { ok: true, k, tag, digest, header, inputPath, reused } | { ok: false, why, packet? }.
 // The first attempt, the open one again (a re-run before `apply` is the same attempt), or the next after one recorded invalid; two invalid attempts exhaust.
-export function prepareSecondAttempt({ root, round, packetId, agent, prompt, head, evidence, resetText, now = new Date() }) {
+// `reused`: the open attempt is handed back, or an agent already ran under the tag (a lost session): the caller proves that run with `apply` before starting another (R5-F3, as `substitute prepare`).
+export function prepareSecondAttempt({ root, round, packetId, ids, agent, prompt, head, evidence, resetText, env = process.env, now = new Date() }) {
   const record = readSecondAttempts(root, round, packetId);
   const last = record.attempts.at(-1);
+  const blocker = overlappingPacket(root, round, packetId, ids, head);
+  if (blocker !== null) return { ok: false, why: 'overlapping-packet', packet: blocker };
   let k;
   if (last === undefined) k = 1;
   else if (last.status === 'prepared') k = last.k;
@@ -76,10 +99,11 @@ export function prepareSecondAttempt({ root, round, packetId, agent, prompt, hea
   const input = buildSecondInput({ round, prompt, root, head, evidence, resetText });
   const inputPath = inputPathOf(root, round, packetId);
   const tag = tagFor(round, packetId, k);
+  const reused = (last?.k === k && last.status === 'prepared') || findTaggedTranscripts({ tag, projectsDir: accountProjectsRoot({ env }) }).length > 0;
   writeFileAtomic(inputPath, input.text);
   const entry = { k, tag, digest: input.digest, fileSha256: sha256(input.text), agent, status: 'prepared', preparedAt: now.toISOString() };
-  saveSecondAttempts(root, round, { packetId, attempts: [...record.attempts.filter((a) => a.k !== k), entry].sort((a, b) => a.k - b.k) });
-  return { ok: true, k, tag, digest: input.digest, header: headerFor(round, input.digest), inputPath };
+  saveSecondAttempts(root, round, { packetId, ids: [...ids].sort(), head, attempts: [...record.attempts.filter((a) => a.k !== k), entry].sort((a, b) => a.k - b.k) });
+  return { ok: true, k, tag, digest: input.digest, header: headerFor(round, input.digest), inputPath, reused };
 }
 
 // The input on disk is still what prepare wrote: the file's bytes, and the digest its header names against the body below it. -> [error strings]

@@ -600,11 +600,11 @@ async function secondReview(rest, ctx) {
     let substitute = verdict;
     if (verdict.eligible) {
       const prepared = await withStateLock(root, ctx, () => prepareSecondAttempt({
-        root, round: n, packetId, agent: asked.agent, prompt, head: asked.head, evidence: 'quota', resetText: ran.quota.resetText,
+        root, round: n, packetId, ids, agent: asked.agent, prompt, head: asked.head, evidence: 'quota', resetText: ran.quota.resetText, env: ctx.env ?? process.env,
       }), pr);
       substitute = prepared.ok
-        ? { ...verdict, packetId, attempt: prepared.k, tag: prepared.tag, promptHeader: prepared.header, inputPath: prepared.inputPath, digest: prepared.digest }
-        : { ...verdict, eligible: false, why: prepared.why };
+        ? { ...verdict, packetId, attempt: prepared.k, tag: prepared.tag, promptHeader: prepared.header, inputPath: prepared.inputPath, digest: prepared.digest, reused: prepared.reused }
+        : { ...verdict, eligible: false, why: prepared.why, ...(prepared.packet === undefined ? {} : { packet: prepared.packet }) };
     }
     // The facts of the run are forwarded as codex-review does (a timeout was retried once; a quota stop carries its proof and reset time).
     throw new Fail(EXIT.UNAVAILABLE, {
