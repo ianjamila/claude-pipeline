@@ -61,7 +61,7 @@ export const meta = {
     '     Run `followups create --round R` for EACH returned round afterwards (a retry is safe: it de-duplicates by fingerprint). Every deferral is a labelled row of the merge Rulings block, so the owner\'s "merge" binds each one by name',
     '  -> only with owner_approval: chat; exit 1 (state untouched) unless ALL hold: the round limit is reached and nothing is pending, waiting for a human, open BLOCKING, unimplemented or owed a Fable pass, and no unspent owner grant exists for the next round at any head (the lookup is STRICT: a records folder or session file that cannot be read, a record file over the size limit or not a regular file, an unreadable repo-moves file, an unsafe consumed-grants folder, or a record whose provenance cannot be confirmed as the owner\'s, refuses too; a records folder that does not exist is no grant; round-request applies the same lookup to its follow-up recommendation);',
     '     --ids is exactly the set of accepts no round has reviewed, each low severity (non-BLOCKING; category performance, maintainability, testing, design, docs or other; its file in the reviewed diff, on no risk.high_risk_paths / review.arbiter_always_paths glob,',
-    '     not the file of a BLOCKING or security ACCEPT) and each accepted by the judge or the arbiter (not the owner, Claude, a second review, a test or a cache copy; and no other accepted fix of ANY round is marked implemented unless it was marked before the last counted round began: `state mark-implemented` records the newest round number at the time as the item\'s implementedAfterRound, and a carried copy records the round before the one it sits in; a fix marked after that round, or a mark with no record, may be out of the reviewed head and refuses, so the round runs); the tree equals the last round\'s content (every commit since reverted; when the default branch was merged in and moved the content, record that update as a base-only round first: codex-review runs no Codex for it); --fix-head is an ancestor of HEAD, a descendant of the last REVIEWED head (the last round that is not a base-only one; it is also the reviewedHead the issues compare against), with',
+    '     not the file of a BLOCKING or security ACCEPT) and each accepted by the judge or the arbiter (not the owner, Claude, a second review, a test or a cache copy; and no other accepted fix of ANY round is marked implemented unless it was marked before the last counted round began: `state mark-implemented` records the newest round number at the time as the item\'s implementedAfterRound, and a carried copy records the round before the one it sits in; a fix marked after that round, or a mark with no record, may be out of the reviewed head and refuses, so the round runs); the tree equals the last round\'s content (every commit since reverted; when the default branch was merged in and moved the content, record that update as a base-only round first: codex-review runs no Codex for it); --fix-head is an ancestor of HEAD, a descendant of the last REVIEWED head (the last round that is not a base-only one); the reviewedHead the issues compare against is the NEWEST recorded round, base-only or not, whose head --fix-head descends from (the base-only round recorded before the fix was made, or the last reviewed head when the update is recorded only after the revert), with',
     '     other content (it only points the follow-up issues at the removed fix); and the state with the fixes deferred reads as a clean review. A severity or config error refuses. Claude cannot reopen a deferral (claude-ruling and second-review refuse it); it writes review state format version 3; the owner\'s owner-ruling can',
     'pipeline triage claude-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --pr N [--repo DIR]',
     '  -> {ok, round, id, final, published, next?}; records CLAUDE\'s decision (final.by claude, needsHuman false, the overruled final and the cause kept) for an item waiting for a human, or tightens a Claude dismissal',
@@ -748,8 +748,8 @@ async function deferFixes(rest, ctx) {
     const { slug, host } = gh.repo();
     if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded grants name a repository on github.com`);
     const last = state.rounds.at(-1);
-    // The last round that REVIEWED something (a base-only round only carries that result to the merged-in content): its head is where the fixes were measured from and what the issues compare against.
-    const reviewed = [...state.rounds].reverse().find((r) => r.baseOnly !== true) ?? last;
+    // The last round that REVIEWED something (a base-only round only carries that result to the merged-in content): the fallback anchor (see below).
+    const lastReviewed = [...state.rounds].reverse().find((r) => r.baseOnly !== true) ?? last;
     const o = { cwd: root };
     // The owner's typed "extra round" always wins over a deferral, at whatever head it was typed for (the head moved when the fixes were reverted).
     // STRICT lookups (hooks/lib/owner-go.mjs#ownerGrantLookups): a record that cannot be read refuses, it never reads as "no grant".
@@ -786,15 +786,19 @@ async function deferFixes(rest, ctx) {
       return refuse(`--fix-head ${asciiLine(fixHead, 60)} is not a commit in this repository`);
     }
     if (!isAncestor(fixFull, 'HEAD', o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is not an ancestor of HEAD`);
-    // It is printed in the owner-bound Rulings row and in the issue's `git diff <reviewed> <fix>`: an older head would show the reviewed work in reverse.
-    if (!isAncestor(revParse(reviewed.toHead, o), fixFull, o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is older than the last reviewed head ${String(reviewed.toHead).slice(0, 12)}: pass the head that held the fixes (a descendant of the reviewed head)`);
+    // The fix descends from the last REVIEWED head: an older head would show the reviewed work in reverse in the issue's `git diff <anchor> <fix>` and the owner-bound Rulings row.
+    if (!isAncestor(revParse(lastReviewed.toHead, o), fixFull, o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is older than the last reviewed head ${String(lastReviewed.toHead).slice(0, 12)}: pass the head that held the fixes (a descendant of the reviewed head)`);
+    // The anchor (the reviewedHead the issue compares against): the NEWEST round, base-only or not, whose head the fix descends from, so the issue shows just the fix whether the default branch
+    // was merged in before the fix (that base-only round) or only after the revert (a base-only round the fix does not descend from, so an older one). A head that no longer resolves is skipped.
+    const descends = (r) => { try { return isAncestor(revParse(r.toHead, o), fixFull, o); } catch { return false; } };
+    const anchor = [...state.rounds].reverse().find(descends) ?? lastReviewed;
     const fixHash = reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log, head: fixFull }, o);
-    if (fixHash === last.contentHashAtToHead || fixHash === reviewed.contentHashAtToHead) {
+    if ([last, anchor, lastReviewed].some((r) => fixHash === r.contentHashAtToHead)) {
       return refuse(`--fix-head ${fixFull.slice(0, 12)} has the reviewed content, so it is not the head that held the fixes: pass the head the round-request line named`);
     }
     seedBaseline({ ctx, root, pr, state });
     // Format version 3: a pre-deferral pipeline reads version 2 and would drop the deferral rows from the Rulings block and let Claude reopen them (state.mjs SUPPORTED_STATE_VERSION).
-    const next = withStateVersion(deferItemsInState(state, want, { reason, ruledAt: new Date().toISOString(), fixHead: fixFull, reviewedHead: reviewed.toHead }), STATE_VERSION_DEFERRAL);
+    const next = withStateVersion(deferItemsInState(state, want, { reason, ruledAt: new Date().toISOString(), fixHead: fixFull, reviewedHead: anchor.toHead }), STATE_VERSION_DEFERRAL);
     saveState(root, next);
     const wanted = new Set(want);
     const rounds = next.rounds.filter((r) => (r.items ?? []).some((i) => wanted.has(i.id))).map((r) => r.n).sort((a, b) => a - b);

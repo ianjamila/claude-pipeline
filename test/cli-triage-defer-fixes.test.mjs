@@ -442,3 +442,38 @@ test('defer-fixes: main merged in after the revert, then recorded as a base-only
   assert.equal(item.roundCapDeferral.fixHead, h2);
   assert.equal(w.cli(['state', 'outcome']).json.clean, true);
 });
+
+test('defer-fixes: main merged in BEFORE the fix was made (a base-only round recorded before it): the anchor is that base-only round, so the issue compares just the fix (R3-F1)', (t) => {
+  const w = roundWorld(t);
+  const h1 = w.reviewAndFix(1, w.base, w.head, [low({ title: 'Issue 1' })]);
+  // round 2 (the automatic extra round) reviews h1 and accepts a low-severity suggestion, but the fix is not made yet
+  const found = w.codex(2, findingsOf([], [low({ title: 'Issue 2' })]), { from: w.head, to: h1 });
+  assertExit(found, 0, found.stderr + found.stdout);
+  assertExit(w.judge(2, { 'R2-S1': ['ACCEPT'] }), 0);
+  // main moves and is merged in; that update is recorded as base-only round 3
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/a.js', aFile(false).replace('export const v10 = 10;', 'export const v10 = 1000;'));
+  w.repo.commit('main edits near the PR');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', 'main']);
+  const merged = w.repo.git(['rev-parse', 'HEAD']).trim();
+  w.prHead(merged);
+  const base = w.codex(3, findingsOf(), { from: h1, to: merged });
+  assertExit(base, 0, base.stderr + base.stdout);
+  assert.equal(w.state().rounds.at(-1).baseOnly, true);
+  // the fix is committed on top of the merge, then taken out
+  w.repo.write('src/fix2.js', 'export const fix2 = 2;\n');
+  const h2 = w.repo.commit('fix 2');
+  assertExit(w.cli(['state', 'mark-implemented', '--ids', 'R2-S1']), 0);
+  w.revert(h2);
+  const ok = defer(w, 'R2-S1', h2);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  const item = w.item('R2-S1');
+  assert.deepEqual([item.final.claude.reviewedHead, item.roundCapDeferral.reviewedHead], [merged, merged], 'anchored at the base-only round the fix sits on, not the older reviewed head');
+  assert.equal(item.roundCapDeferral.fixHead, h2);
+  const filed = w.cli(['followups', 'create', '--round', '2']);
+  assertExit(filed, 0, filed.stderr + filed.stdout);
+  const post = w.fake.calls().find((c) => c.argv.join(' ').startsWith(`api -X POST repos/${w.slug}/issues `));
+  assert.ok(JSON.parse(post.stdin).body.includes(`git diff ${merged} ${h2}`), 'the compare command shows just the fix');
+  assert.equal(w.cli(['state', 'outcome']).json.clean, true);
+});
