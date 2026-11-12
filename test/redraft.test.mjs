@@ -262,19 +262,27 @@ test('9. a release that is NOT confirmed is still exit 0 with holdRelease.confir
   assert.equal(mutations(s).length, 1);
 });
 
-test('10. auto-merge armed in the mutation answer is disabled and reported (autoMergeDisabled:true)', () => {
+test('10. auto-merge armed in the mutation answer is disabled and ALWAYS reported: exit 0, a warning that the owner\'s merge was cancelled, do NOT push (#303)', () => {
   const s = world({ entries: [mutation({ isDraft: true, autoMergeRequest: { enabledAt: '2026-11-12T01:00:00Z' } })] });
   const r = redraft(s);
   assertExit(r, 0, r.stdout);
   assert.equal(r.json.changed, true);
   assert.equal(r.json.autoMergeDisabled, true);
+  assert.equal(r.json.warnings.length, 1);
+  assert.match(r.json.warnings[0], /cancelled/);
+  assert.match(r.json.warnings[0], /do NOT push/);
+  assert.match(r.json.warnings[0], /tell the owner/);
   assert.ok(s.fake.lines().some((l) => /^pr merge 12 --disable-auto/.test(l)));
 
   const stuck = world({ gh: { disableAutoCode: 1 }, entries: [mutation({ isDraft: true, autoMergeRequest: { enabledAt: '2026-11-12T01:00:00Z' } })] });
   const k = redraft(stuck);
   assertExit(k, 0, k.stdout);
   assert.equal(k.json.autoMergeDisabled, false);
-  assert.match(k.json.warnings.join(' '), /could not be disabled/);
+  assert.equal(k.json.warnings.length, 1);
+  assert.match(k.json.warnings[0], /could not be disabled/);
+  assert.match(k.json.warnings[0], new RegExp(`gh pr merge ${PR} --disable-auto`));
+  assert.match(k.json.warnings[0], /do NOT push/);
+  assert.match(k.json.warnings[0], /tell the owner/);
 });
 
 test('11. exit 3 vs convert-failed is judged on gh\'s stderr: a "network" in the gh arguments or GitHub\'s "Could not resolve to a node" refusal is convert-failed; "could not resolve host" is exit 3', () => {
