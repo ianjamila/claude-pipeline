@@ -1967,3 +1967,23 @@ test('#256 the machine-wide Codex record and Codex\'s session logs are protected
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [`cat ${R}/status.json`, `ls ${S}`, `grep token_count ${S}/2026/11/11/rollout-a.jsonl`, 'ls ~/.codex', 'cat ~/.codex/config.toml']) assert.equal(bash(cmd), 'allow', cmd);
 });
+
+test('#256 R5-B1 the ~/.codex folder itself is a protected reference: a recursive copy, move, remove or cd+relative write into it is denied, plain reads stay open', () => {
+  for (const cmd of [
+    'cp -R /tmp/forged/. ~/.codex', 'cp -r /tmp/forged/. /home/u/.codex/', 'cp -a /tmp/forged/sessions ~/.codex/',
+    'mv ~/.codex /tmp/x && mv /tmp/forged ~/.codex', 'rm -rf ~/.codex', 'rsync -a /tmp/forged/ ~/.codex/',
+    'cd ~/.codex && cp -R /tmp/forged/sessions .', 'cd /home/u/.codex && tar -xf /tmp/forged.tar',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of ['ls ~/.codex', 'ls -la /home/u/.codex/', 'cat ~/.codex/config.toml', 'cd ~/.codex && ls', 'cd ~/.codex && cat config.toml', 'echo x > ~/.codex/notes.txt']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+test('#256 R5-F4 a Codex session-log write whose home prefix is only known at run time is denied', () => {
+  for (const cmd of [
+    `echo x >> "$(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"`,
+    'echo x >> "$(printenv HOME)/.codex/sessions/2026/11/12/rollout-x.jsonl"',
+    'echo x >> $H/.codex/sessions/2026/11/12/rollout-x.jsonl',
+    'cp /tmp/f.jsonl `echo ~`/.codex/sessions/2026/11/12/rollout-x.jsonl',
+    'bash -c "echo x >> $(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of ['cat "$(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"', 'echo ".codex is a folder"']) assert.equal(bash(cmd), 'allow', cmd);
+});

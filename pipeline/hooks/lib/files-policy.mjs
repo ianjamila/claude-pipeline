@@ -33,7 +33,7 @@ const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its r
 const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
-const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|substitute-attempts|prod-before|[\w.-]*smoke)/i;
+const SENSITIVE_WORDS = /\.claude|\.codex\W+sessions|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|substitute-attempts|prod-before|[\w.-]*smoke)/i;
 
 // ---- the protected set ------------------------------------------------------------------------
 
@@ -62,7 +62,8 @@ const PROTECTED_REL = [
 // The directories that hold them. Writing INTO them is fine (history, projects, CLAUDE.md, other skills), but
 // replacing, deleting, moving or running a repo command in them reaches the protected files, so for a
 // non-read-only command a word that IS one of these (exactly, not a child) counts as a protected reference.
-const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents', '.claude/pipeline-state'];
+// (cp #256 R5-B1: also ~/.codex, which holds the session logs the weekly-usage figure is read from: `cp -R /tmp/forged/. ~/.codex` reaches them)
+const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents', '.claude/pipeline-state', '.codex'];
 
 // Phase 3b (Fable attacker pass on #107): a repo's review state and the proofs beside it. `pipeline review-complete` trusts
 // .review/state.json (a clean review of the current content there is what lets it post the review-complete comment that the
@@ -903,7 +904,7 @@ function ancestorRegexes(ctx) {
 const SEP = "(?=[ \\t]*[/'\"`,+])[/'\"`,+ \\t]+"; // between pieces of a code-built path: '.claude', 'skills', 'ship'
 function suffixBody(sep) {
   const end = '(?![\\w.\\-])';
-  return `\\.claude${sep}(?:settings\\.json${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter|arbiter-fix|substitute-opus|substitute-fable)\\.md${end})`;
+  return `(?:\\.codex${sep}sessions${end}|\\.claude${sep}(?:settings\\.json${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter|arbiter-fix|substitute-opus|substitute-fable)\\.md${end}))`;
 }
 // ...preceded by something only known at run time: a variable, a command substitution, a template `${...}`, a call
 // result `)`, a `+` or `,` joining pieces, `~user`, `.join(` / `.joinpath(`.
@@ -1164,7 +1165,8 @@ function makeMatchers(ctx) {
       if (reviewText.test(v)) return true; // (a repo's review state: protected wherever it is, so the name alone is the reference)
       if (transcriptText.test(v) || rootTranscriptText.some((re) => re.test(v)) || envTranscriptText(v)) return true; // (#128: a session transcript, in any config dir; R2-F1: also under $CLAUDE_CONFIG_DIR)
       if (aliasInText(v, dirs)) return true;
-      if (!(ctx.ci ? v.toLowerCase() : v).includes('.claude')) continue;
+      const lv = ctx.ci ? v.toLowerCase() : v;
+      if (!lv.includes('.claude') && !lv.includes('.codex')) continue;
       if (suffix.nonlit.test(v)) return true;
       if (dirs) {
         suffix.rel.lastIndex = 0;
