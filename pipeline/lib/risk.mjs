@@ -9,7 +9,9 @@
 // not a finite number (a string compares wrongly, NaN never trips) must never quietly downgrade a PR to "low".
 import { diffStats } from './diff.mjs';
 import { matchAny } from './glob.mjs';
-import { DEFAULTS, RISK_IGNORABLE_RULES } from './config.mjs';
+import { DEFAULTS, RISK_IGNORABLE_RULES, baseConfigAt } from './config.mjs';
+import { collectHardStops } from './hardstops.mjs';
+import { diffFiles, mergeBase, reviewBaseRef } from './git.mjs';
 
 const LEVELS = ['low', 'medium', 'high'];
 export const SIZE_ONLY_NOTE = 'medium for size only: Sonnet judge (review.size_only_medium_reviewer)';
@@ -161,4 +163,77 @@ export function reviewLane({ level, files, config, sizeOnly = false }) {
   if (level !== 'low') reasons.push(`${level} risk`);
   if (sensitivePaths.length > 0) reasons.push(`sensitive path: ${listed(sensitivePaths)}`);
   return { reviewer: reasons.length > 0 ? 'fable' : 'judge', reasons, sensitivePaths };
+}
+
+// ---- the whole decision, under the working-tree config AND the trusted base config ------------------------------------------------
+//
+// One shared function for codex-review, review-complete and `pipeline risk`: the hard-stop scan, the level and the lane are worked out twice, once with
+// the working-tree config and once with the config COMMITTED at mergeBase(origin/<default_branch>, head) (never the PR's own base branch), and the
+// stricter result wins on every axis. A PR (committed, staged or unstaged edits of .claude/pipeline.yml) therefore cannot loosen the thresholds, the
+// sensitive paths, the hard-stop paths, the ignore list or the size-only reviewer that rate it. The same config twice is evaluated once. A base config
+// that is missing, unreadable or invalid means the rating cannot be trusted: the reviewer is Fable, whatever the level.
+// A PR whose base branch is not the default branch (a stack) never gets the size-only judge: it is rated from the default branch's fork point by
+// review-complete, and from its own base by codex-review, and the two must agree.
+// `base` (optional) is the ref the diff starts from; it defaults to the trusted fork point (codex-review passes its own, stack-aware, fork point).
+// Throws what the scan throws (the callers decide how to fail closed). -> {
+//   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
+//   trustedFork, baseConfig: { ok, reason? }, stacked }
+export async function rateBranch({ root, head, config, defaultBranch = config.default_branch, prBase = defaultBranch, base }) {
+  const o = { cwd: root };
+  const trustedFork = mergeBase(reviewBaseRef(defaultBranch, o), head, o);
+  const from = base ?? trustedFork;
+  const stacked = prBase !== defaultBranch;
+  const trusted = baseConfigAt(trustedFork, root);
+  const sameConfig = trusted.ok && JSON.stringify(trusted.config) === JSON.stringify(config);
+  const configs = [['', config], ...(trusted.ok && !sameConfig ? [['base config: ', trusted.config]] : [])];
+  const files = diffFiles(from, head, o);
+
+  const rated = [];
+  for (const [label, cfg] of configs) {
+    const hits = await collectHardStops({ base: from, head, cwd: root, config: cfg });
+    const risk = assessRisk({ files, hits, config: cfg });
+    const lane = reviewLane({ level: risk.level, files, config: cfg, sizeOnly: risk.sizeOnly && !stacked });
+    const lightLane = isLightLane({ level: risk.level, changedLines: risk.changedLines, hits, config: cfg });
+    rated.push({ label, hits, risk, lane, lightLane });
+  }
+
+  const level = LEVELS[Math.max(...rated.map((r) => LEVELS.indexOf(r.risk.level)))];
+  const ordered = (pick) => {
+    const seen = new Set();
+    const out = [];
+    for (const r of rated) {
+      for (const x of pick(r)) {
+        if (seen.has(x)) continue;
+        seen.add(x);
+        out.push(r.label + x);
+      }
+    }
+    return out;
+  };
+  const reasons = ordered((r) => r.risk.reasons);
+  const laneReasons = ordered((r) => r.lane.reasons);
+  const sizeCandidate = rated.some((r) => r.risk.sizeOnly);
+  if (stacked && sizeCandidate) reasons.push(`stacked PR: base is ${prBase} (no size-only judge)`);
+  if (!trusted.ok) laneReasons.push(`trusted base config unreadable: ${trusted.reason}`);
+  const hitKey = new Set();
+  const hits = rated.flatMap((r) => r.hits).filter((h) => {
+    const key = `${h?.rule}\u0000${h?.file}`;
+    if (hitKey.has(key)) return false;
+    hitKey.add(key);
+    return true;
+  });
+  const sensitivePaths = [...new Set(rated.flatMap((r) => r.lane.sensitivePaths))];
+  const sizeOnly = trusted.ok && !stacked && rated.every((r) => r.risk.sizeOnly);
+  const reviewer = !trusted.ok || rated.some((r) => r.lane.reviewer === 'fable') ? 'fable' : 'judge';
+  const sizeOnlyJudge = reviewer === 'judge' && rated.some((r) => r.lane.sizeOnlyJudge === true);
+  const first = rated[0].risk;
+  return {
+    level, reasons, changedLines: first.changedLines, fileCount: first.fileCount,
+    drivers: {
+      hardStop: rated.some((r) => r.risk.drivers.hardStop), advisory: rated.some((r) => r.risk.drivers.advisory),
+      path: rated.some((r) => r.risk.drivers.path), size: rated.some((r) => r.risk.drivers.size),
+    },
+    sizeOnly, reviewer, laneReasons, sensitivePaths, ...(sizeOnlyJudge ? { sizeOnlyJudge: true, note: SIZE_ONLY_NOTE } : {}),
+    hits, files, lightLane: rated.every((r) => r.lightLane), trustedFork, baseConfig: trusted.ok ? { ok: true, same: sameConfig } : { ok: false, reason: trusted.reason }, stacked,
+  };
 }
