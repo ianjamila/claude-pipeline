@@ -141,7 +141,7 @@ run one Codex review round over base..head and record its findings.
 
 ```
 pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]
-  pipeline codex-review --pr N --round R --base SHA --head SHA --plan [--repo DIR]   -> {ok, plan, expectedEffort}
+pipeline codex-review --pr N --round R --base SHA --head SHA --plan [--repo DIR]   -> {ok, plan, expectedEffort}
   -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, reviewer, reviewerReasons, path}
   --effort must be the configured effort for the round, else exit 2 {error:effort-mismatch, expected}: round 1 and a whole-PR round use review.effort.<risk> (low|medium|high), every later round review.effort.followup,
     except that a small fix-check (the reviewed range is at most review.effort.small_fix_lines changed lines, adds no new file and touches no risk.high_risk_paths / review.arbiter_always_paths path) and, while the weekly Codex quota used is
@@ -689,8 +689,8 @@ pipeline state discard-round --round R [--pr N] [--repo DIR]
   -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;
      refused (exit 2) when the PR triage comment already holds round R, or (error round-has-verdict) when the round holds a second-review verdict
 pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures, followupsPending, rounds, reviewedRounds, maxRounds, wholePrOwed, nextRound:{round, base, wholePrOwed}[, base]}; exit 0 whether or not clean
-  wholePrOwed: true (with base: the PR's merge base) when an Opus substitute round came before the PR's risk rose to high and no whole-PR round has run since; the next round must start at that base (nextRound.base is the base to pass).
-  The effort and route of that round: `pipeline codex-review --plan`
+  wholePrOwed: true (with base: the PR's merge base) when an Opus substitute round came before the PR's risk rose to high and no whole-PR round since: the next round must start at that base and reviews the whole PR
+    (codex-review rejects any other base). nextRound.base is the base to pass (the merge base when wholePrOwed, else the last round's toHead); the effort and route of that round: pipeline codex-review --plan
   roundOutcome carries substituteRounds:[n] (rounds a Claude substitute reviewed first, while Codex was out of quota) and maxRisk (the highest risk the PR ever had: low|medium|high)
   first fetches origin/<default_branch> (best effort: offline keeps the cached ref), so a PR updated from its base branch is not read as changed
   grantedRound {k, grantId, head, quote}: the owner's open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner
