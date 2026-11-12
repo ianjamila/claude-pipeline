@@ -477,3 +477,17 @@ test('defer-fixes: main merged in BEFORE the fix was made (a base-only round rec
   assert.ok(JSON.parse(post.stdin).body.includes(`git diff ${merged} ${h2}`), 'the compare command shows just the fix');
   assert.equal(w.cli(['state', 'outcome']).json.clean, true);
 });
+
+test('defer-fixes: refused when the trusted base config cannot be read (the fork point has no .claude/pipeline.yml), state untouched (R1-F2)', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  // main drops the config and is merged into the PR, which keeps its own copy: the fork point (main's tip) has no pipeline.yml, the working tree does
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.git(['rm', '-q', '.claude/pipeline.yml']);
+  w.repo.commit('main drops the config');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', '--no-commit', 'main']);
+  w.repo.git(['checkout', 'HEAD', '--', '.claude/pipeline.yml']);
+  w.repo.commit('merge main, keep the config');
+  refused(w, () => defer(w, 'R2-S1', h2), /severity could not be judged: the trusted base config is unreadable/, 'no fork point config');
+});

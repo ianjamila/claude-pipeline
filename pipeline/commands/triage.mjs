@@ -722,9 +722,13 @@ async function deferFixes(rest, ctx) {
     const grantGap = strict.grantGap;
     const diff = reviewedDiff(root, config, state);
     if (diff.files === null) return refuse(`the reviewed diff could not be read (${diff.problem}), so no item can be judged low severity`);
+    // Without the trusted base config the union of the sensitive-path lists is just the working tree's, which the PR may have shrunk: rateBranch
+    // treats that as untrusted too (Fable), so severity cannot be judged here either.
+    const trusted = trustedBaseConfig(root, config);
+    if (trusted.problem) return refuse(`severity could not be judged: the trusted base config is unreadable (${asciiLine(trusted.problem, 160)}): fix .claude/pipeline.yml at the default branch's fork point, or ask the owner for an extra round`);
     let eligible;
     try {
-      eligible = deferEligibility(state, config, diff.files, { grants, grantGap, baseConfig: trustedBaseConfig(root, config).config });
+      eligible = deferEligibility(state, config, diff.files, { grants, grantGap, baseConfig: trusted.config });
     } catch (err) {
       return refuse(`severity could not be judged (${asciiLine(err?.message, 160)}): fix the pipeline.yml lists, or ask the owner for an extra round`);
     }
