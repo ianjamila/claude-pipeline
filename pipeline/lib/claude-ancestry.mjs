@@ -105,6 +105,10 @@ export function isClaudeCodeProcess(info) {
   return RUNTIME.test(basename(info.comm ?? '')) && typeof info.args === 'string' && CLAUDE_ARGS.test(withoutClaudeHomeOperand(info.args));
 }
 
+// Windows PowerShell 5.1 writes redirected stdout in the OEM code page; on CJK pages a 0x5C trail byte in a process name or command line
+// then decodes to U+FFFD plus a stray backslash and JSON.parse throws. Both scripts start with this so stdout is UTF-8 (no BOM) like { encoding: 'utf8' } expects.
+const UTF8_STDOUT = '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ';
+
 const psOut = (args) => {
   const r = spawnSync('ps', args, { encoding: 'utf8', timeout: LOOKUP_TIMEOUT_MS, windowsHide: true });
   return r.status === 0 && typeof r.stdout === 'string' ? r.stdout.trim() : null;
@@ -132,7 +136,7 @@ export function processTable(platform = process.platform, spawn = spawnSync) {
   // so a non-terminating Get-CimInstance error (access denied on some processes, a WMI hiccup) would still exit 0 with `[]` or a partial
   // array. `-ErrorAction Stop` makes the error terminating, the `catch { exit 1 }` turns that into an explicit exit code 1 whatever
   // the host's error handling does, and `$ErrorActionPreference='Stop'` covers the remaining cmdlets: a failed query reads as null here.
-  const script = `$ErrorActionPreference='Stop'; try { ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,Name,CommandLine,@{n='Created';e={if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }}}) } catch { exit 1 }`;
+  const script = `${UTF8_STDOUT}$ErrorActionPreference='Stop'; try { ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,Name,CommandLine,@{n='Created';e={if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }}}) } catch { exit 1 }`;
   try {
     const r = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: LOOKUP_TIMEOUT_MS * 4, maxBuffer: 32 * 1024 * 1024, windowsHide: true });
     if (!r || r.error || r.status !== 0 || typeof r.stdout !== 'string' || !r.stdout.trim()) return null;
@@ -152,7 +156,7 @@ export function processTable(platform = process.platform, spawn = spawnSync) {
 // { ppid, comm, args, created? } for `pid`, or null when it cannot be looked up. `created` is win32 only (see winRowInfo).
 export function realLookup(pid, platform = process.platform, spawn = spawnSync) {
   if (platform === 'win32') {
-    const script = `Get-CimInstance Win32_Process -Filter 'ProcessId=${Number(pid)}' | Select-Object ParentProcessId,Name,CommandLine,@{n='Created';e={([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()}} | ConvertTo-Json -Compress`;
+    const script = `${UTF8_STDOUT}Get-CimInstance Win32_Process -Filter 'ProcessId=${Number(pid)}' | Select-Object ParentProcessId,Name,CommandLine,@{n='Created';e={([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()}} | ConvertTo-Json -Compress`;
     const r = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: LOOKUP_TIMEOUT_MS * 2, windowsHide: true });
     if (r.status !== 0 || !r.stdout) return null;
     try {

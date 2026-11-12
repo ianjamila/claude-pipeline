@@ -182,6 +182,18 @@ test('processTable (win32): an enumeration error terminates the script with a no
   assert.match(script, /try \{[\s\S]*\} catch \{ exit 1 \}/, 'a terminating error ends with exit code 1, not the last command\'s 0');
 });
 
+test('both PowerShell scripts switch stdout to UTF-8 (no BOM) first, so CJK code pages cannot corrupt the JSON (#317)', () => {
+  const prefix = '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ';
+  const table = spawnOf(jsonOut([]));
+  processTable('win32', table);
+  assert.ok(table.seen[0].args.at(-1).startsWith(prefix), 'whole-table script');
+  const perPid = spawnOf(jsonOut({ ParentProcessId: 5, Name: 'cmd.exe' }));
+  realLookup(77, 'win32', perPid);
+  assert.ok(perPid.seen[0].args.at(-1).startsWith(prefix), 'per-pid script');
+  assert.equal(table.seen[0].opts.encoding, 'utf8');
+  assert.equal(perPid.seen[0].opts.encoding, 'utf8');
+});
+
 test('win32: the status-1 result of an errored table query falls back to per-hop lookups (R1-B1)', () => {
   const rows = {
     900: { ParentProcessId: 800, Name: 'node.exe', Created: T },
