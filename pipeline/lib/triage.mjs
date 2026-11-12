@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { CATEGORIES } from './codex.mjs';
 import { MIN_FABLE, compareVersions, parseModelId } from './model-floor.mjs';
 import { isSensitivePath } from './risk.mjs';
+import { RISK_LEVELS, isSubstituteRound, maxRiskOf } from './state.mjs';
 
 export const SECURITY_CATEGORIES = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
 export const BUCKETS = ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING'];
@@ -754,6 +755,11 @@ const unresolved = (item) => !item.final || item.final.needsHuman || isOpenBlock
 // Clean needs: nothing pending, needing a human, open, or accepted-but-unfixed anywhere; nothing
 // newly accepted in the LAST round (its fixes still need a round to review them); and the last
 // round reviewed exactly the content that exists now (coverageValid).
+// Which Claude stands in for Codex on a round Codex refused: Fable when the PR EVER had high risk (maxRisk; a shrinking diff never brings Opus back), else
+// Opus. An unreadable risk fails toward the stronger reviewer.
+export const substituteAgentFor = (maxRisk) => (RISK_LEVELS.includes(maxRisk) && maxRisk !== 'high' ? 'substitute-opus' : 'substitute-fable');
+
+// substituteRounds: the rounds a substitute reviewed first (state.mjs isSubstituteRound); maxRisk: the highest risk the PR ever had (state.mjs maxRiskOf).
 export function roundOutcome(state, { grants, head } = {}) {
   const rounds = state?.rounds ?? [];
   const last = rounds.at(-1);
@@ -814,6 +820,7 @@ export function roundOutcome(state, { grants, head } = {}) {
   return {
     clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, extraRound, effectiveMaxRounds, coverageValid, fablePending,
     grantedRound, autoExtraOrdinal: autoOrd,
+    substituteRounds: rounds.filter(isSubstituteRound).map((r) => r.n), maxRisk: maxRiskOf(state),
   };
 }
 

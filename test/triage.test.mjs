@@ -31,6 +31,7 @@ import {
   reviewedRoundCount,
   FABLE_FINDINGS_MAX,
   rulingContentDigest,
+  substituteAgentFor,
 } from '../pipeline/lib/triage.mjs';
 import { assignIds } from '../pipeline/lib/codex.mjs';
 
@@ -618,7 +619,25 @@ test('roundOutcome: clean when every item is settled, nothing accepted, and the 
   const o = roundOutcome(stateOf([round(1, []), round(2, items)]));
   assert.deepEqual(o, {
     clean: true, openBlocking: [], newAccepted: [], needsHuman: [], pending: [], unimplemented: [], reachedMax: false, extraRound: false, effectiveMaxRounds: 3, coverageValid: true, fablePending: [], grantedRound: null, autoExtraOrdinal: null,
+    substituteRounds: [], maxRisk: 'high', // (no risk recorded in this fixture: fail toward high)
   });
+});
+
+test('roundOutcome: substituteRounds lists the rounds a substitute reviewed first; maxRisk is the highest risk ever recorded', () => {
+  const sub = { firstReviewer: 'substitute', substitute: { agent: 'substitute-opus' } };
+  const o = roundOutcome(stateOf([round(1, [], 'h1', { risk: 'medium' }), round(2, [], 'h2', { ...sub, risk: 'high' }), round(3, [], 'h-final', { risk: 'low' })], { risk: 'low' }));
+  assert.deepEqual(o.substituteRounds, [2]);
+  assert.equal(o.maxRisk, 'high', 'a smaller later diff does not lower it');
+  assert.deepEqual(roundOutcome(stateOf([round(1, [])], { risk: 'low' })).substituteRounds, []);
+  assert.equal(roundOutcome(stateOf([round(1, [])], { risk: 'low' })).maxRisk, 'low');
+  assert.equal(roundOutcome(stateOf([round(1, [])], { risk: 'low', maxRisk: 'medium' })).maxRisk, 'medium');
+});
+
+test('substituteAgentFor: high maxRisk needs substitute-fable, anything lower substitute-opus', () => {
+  assert.equal(substituteAgentFor('high'), 'substitute-fable');
+  assert.equal(substituteAgentFor('medium'), 'substitute-opus');
+  assert.equal(substituteAgentFor('low'), 'substitute-opus');
+  assert.equal(substituteAgentFor(undefined), 'substitute-fable', 'unreadable: fail toward the stronger reviewer');
 });
 
 test('roundOutcome: a round with no findings at all is clean when coverage is valid', () => {

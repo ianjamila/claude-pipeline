@@ -23,15 +23,44 @@ const STRAY_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 // The newest state format this code understands. A state with a higher `version` was written by a newer pipeline: loadState refuses it and
 // decodeFromComment reads it as no state, so an older reader never rules from a state it cannot fully see. Version 2: a Claude ruling or a
 // second review wrote it. Version 3: `triage defer-fixes` wrote it (a deferral is a Claude dismissal an installation from before this change
-// would leave out of the Rulings block and let Claude reopen). Every other state stays 1.
-export const SUPPORTED_STATE_VERSION = 3;
+// would leave out of the Rulings block and let Claude reopen). Version 4: the state holds a substitute-reviewed round or second review (a Claude stand-in for
+// Codex while its quota was spent) or a budget / governor decision: a pipeline from before the substitute would read it as an ordinary Codex review.
+// Every other state stays 1. (The plan 2026-11-11-codex-substitute-reviewer called this "3"; main had already used 3 for the deferral.)
+export const SUPPORTED_STATE_VERSION = 4;
 export const STATE_VERSION_CLAUDE = 2;
 export const STATE_VERSION_DEFERRAL = 3;
+export const STATE_VERSION_SUBSTITUTE = 4;
 // The state at (at least) `version`: a writer never lowers the version a state already carries.
 export const withStateVersion = (state, version) => ({ ...state, version: Math.max(Number.isFinite(state?.version) ? state.version : 1, version) });
 const newerThanSupported = (state) => Number.isFinite(state.version) && state.version > SUPPORTED_STATE_VERSION;
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// ---- substitute rounds and the sticky risk --------------------------------------------------------------------------------------------------
+// A round reviewed first by the substitute (Claude) instead of Codex.
+export const isSubstituteRound = (round) => round?.firstReviewer === 'substitute' || isPlainObject(round?.substitute);
+const isSubstituteSecondReview = (item) => typeof item?.secondReview?.by === 'string' && item.secondReview.by.startsWith('substitute');
+// The lowest version that may hold this state: 4 when it holds a substitute round / second review or a governor / budget decision.
+export function requiredStateVersion(state) {
+  const rounds = Array.isArray(state?.rounds) ? state.rounds : [];
+  const needs = rounds.some((r) => isSubstituteRound(r) || isPlainObject(r?.governor) || isPlainObject(r?.budget) || (Array.isArray(r?.items) && r.items.some(isSubstituteSecondReview)));
+  return needs ? STATE_VERSION_SUBSTITUTE : 1;
+}
+const withRequiredVersion = (state) => {
+  const need = requiredStateVersion(state);
+  return need > 1 ? withStateVersion(state, need) : state;
+};
+
+export const RISK_LEVELS = Object.freeze(['low', 'medium', 'high']);
+const isRisk = (v) => RISK_LEVELS.includes(v);
+export const higherRisk = (a, b) => (RISK_LEVELS.indexOf(b) > RISK_LEVELS.indexOf(a) ? b : a);
+// The highest risk the PR ever had (it only goes up, so a shrinking diff never brings the cheaper reviewer back). `state.risk` is overwritten each round
+// and shown as-is; agent choice and every gate use this. A state from before `maxRisk` existed starts it from state.risk and every round's recorded
+// risk, and from 'high' when none of them is readable (fail toward the stronger reviewer).
+export function maxRiskOf(state) {
+  const known = [state?.maxRisk, state?.risk, ...(Array.isArray(state?.rounds) ? state.rounds.map((r) => r?.risk) : [])].filter(isRisk);
+  return known.length === 0 ? 'high' : known.reduce(higherRisk);
+}
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 export function emptyState({ repo, pr, branch, risk, lightLane = false, maxRounds = 3 }) {
@@ -114,7 +143,7 @@ export function saveState(dir, state, { rename = renameSync, sleep = sleepSync }
   const file = stateFile(dir);
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   try {
-    const data = `${JSON.stringify(state, null, 2)}\n`;
+    const data = `${JSON.stringify(withRequiredVersion(state), null, 2)}\n`;
     const fd = openSync(tmp, 'w');
     try {
       writeSync(fd, data);
@@ -131,7 +160,7 @@ export function saveState(dir, state, { rename = renameSync, sleep = sleepSync }
 
 // base64 never contains "--", so the payload cannot terminate the HTML comment early.
 export function encodeForComment(state) {
-  return `<!-- claude-pipeline:state:${gzipSync(Buffer.from(JSON.stringify(state))).toString('base64')} -->`;
+  return `<!-- claude-pipeline:state:${gzipSync(Buffer.from(JSON.stringify(withRequiredVersion(state)))).toString('base64')} -->`;
 }
 
 // Bad data of any kind yields null, never an exception: resume must fall back to a fresh review,
@@ -169,19 +198,35 @@ export function decodeFromComment(body) {
 // confirmFixed: the ids of accepted items marked implemented through other files (item.implementedVia 'other-files') that this round's prompt
 // asked Codex to confirm; recorded only when there are some, so an ordinary round is unchanged. review-complete needs every such item to appear
 // in the confirmFixed of a LATER round (triage.mjs#reviewEligibilityProblems).
+// firstReviewer: 'substitute' when the Claude stand-in reviewed the round instead of Codex; substitute: { agent, models, reason, resetAt, outageAt, proof ... }
+// (no codexModel then). wholePr: the round reviewed the whole PR (reviewBase is its merge base), patchSha256: sha256 of the patch it reviewed. risk: this round's
+// risk assessment (the state's maxRisk is the highest of them). governor / budget: the Codex-spend decision that sent the round to the substitute.
+// Any of substitute / governor / budget makes the saved state version 4 (STATE_VERSION_SUBSTITUTE).
 export function addRound(state, {
   n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant, confirmFixed, fableRefresh,
+  firstReviewer, substitute, wholePr, patchSha256, risk, governor, budget,
 }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
   const counted = baseOnly !== true && resolutionOnly !== true && fableRefresh !== true;
   const how = ownerGrant === undefined ? admission : 'owner';
-  return {
+  // maxRisk: what the state knew (legacy states: maxRiskOf, fail toward high) raised by this round; a brand-new state with no risk anywhere records none.
+  const seen = state.rounds.length > 0 || isRisk(state.maxRisk) || isRisk(state.risk) ? maxRiskOf(state) : undefined;
+  const maxRisk = [seen, risk].filter(isRisk).reduce((a, b) => higherRisk(a, b), undefined) ?? undefined;
+  return withRequiredVersion({
     ...state,
+    ...(maxRisk === undefined ? {} : { maxRisk }),
     rounds: [...state.rounds, {
       n, fromHead, toHead, ...(reviewBase === undefined ? {} : { reviewBase, reviewBaseKind }), contentHashAtToHead,
       ...(forkPoint === undefined ? {} : { forkPoint }), ...(codexModel === undefined ? {} : { codexModel }),
       ...(promptSha256 === undefined ? {} : { promptSha256 }),
+      ...(isRisk(risk) ? { risk } : {}),
+      ...(firstReviewer === undefined ? {} : { firstReviewer }),
+      ...(substitute === undefined ? {} : { substitute: structuredClone(substitute) }),
+      ...(wholePr === true ? { wholePr: true } : {}),
+      ...(patchSha256 === undefined ? {} : { patchSha256 }),
+      ...(governor === undefined ? {} : { governor: structuredClone(governor) }),
+      ...(budget === undefined ? {} : { budget: structuredClone(budget) }),
       ...(baseOnly === true ? { baseOnly: true } : {}),
       ...(fableRefresh === true ? { fableRefresh: true } : {}),
       ...(Array.isArray(confirmFixed) && confirmFixed.length > 0 ? { confirmFixed: [...confirmFixed] } : {}),
@@ -197,7 +242,7 @@ export function addRound(state, {
       ...(fableRequired === true ? { fableRequired: true, fableReasons: [...(fableReasons ?? [])], sensitivePaths: [...(sensitivePaths ?? [])] } : {}),
       items: structuredClone(items),
     }],
-  };
+  });
 }
 
 // Replace items of round n by id and keep the rest, so a caller can pass either the whole
@@ -217,5 +262,5 @@ export function updateItems(state, n, items) {
     }
   }
   const rounds = state.rounds.map((r, i) => (i === at ? { ...r, items: merged } : r));
-  return { ...state, rounds };
+  return withRequiredVersion({ ...state, rounds });
 }

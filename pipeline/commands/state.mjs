@@ -35,6 +35,7 @@ export const meta = {
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
     '     refused (exit 2) when the PR triage comment already holds round R, or (error round-has-verdict) when the round holds a second-review verdict',
     'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean',
+    '  roundOutcome carries substituteRounds:[n] (rounds a Claude substitute reviewed first, while Codex was out of quota) and maxRisk (the highest risk the PR ever had: low|medium|high)',
     '  first fetches origin/<default_branch> (best effort: offline keeps the cached ref), so a PR updated from its base branch is not read as changed',
     '  grantedRound {k, grantId, head, quote}: the owner\'s open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner',
     '  record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the',
