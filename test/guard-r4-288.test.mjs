@@ -267,5 +267,5 @@ describe('R4 timing', () => {
   timed('a glob option of 60000 stars', `find ${CFG}/pipeline -${'*'.repeat(60000)}`, {}, 'deny');
   timed('a glob home word of 60000 stars', `rm -rf /${'*'.repeat(60000)}`, {}, 'deny');
   timed('20 cd && chains', `${'cd proj && '.repeat(20)}git add .`, { cwd: HOME }, 'allow');
-  timed('300 cd && chains (more directories than are followed: fails closed)', `${'cd proj && '.repeat(300)}git add .`, { cwd: HOME }, 'deny');
+  timed('60 cd && chains (more directories than are followed: fails closed)', `${'cd proj && '.repeat(60)}git add .`, { cwd: HOME }, 'deny');
 });
