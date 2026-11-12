@@ -56,7 +56,8 @@ function mergeByPrice(into, add) {
   return out;
 }
 
-// entry: {phase, role, input, output, cacheRead, cacheWrite, usd, byPrice?, priceTable?}. `byPrice` (see usageFromTranscript) is summed
+// entry: {phase, role, input, output, cacheRead, cacheWrite, usd, round?, byPrice?, priceTable?}. `round` (a positive integer: the review round the call served) also
+// adds the entry into cost.byRound[round]. `byPrice` (see usageFromTranscript) is summed
 // into cost.byPrice; `priceTable` (a date) counts the entry in cost.priceTables. Returns a NEW cost object (input is not touched).
 export function addCostEntry(cost, entry) {
   const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
@@ -73,6 +74,13 @@ export function addCostEntry(cost, entry) {
   next.total = addTotals(next.total, add);
   next.byPhase[phase] = addTotals(next.byPhase[phase], add);
   next.byRole[role] = addTotals(next.byRole[role], add);
+  if (entry?.round !== undefined) {
+    const round = entry.round;
+    if (!Number.isInteger(round) || round < 1) throw new Error('round must be a whole number of at least 1');
+    const byRound = isPlainObject(next.byRound) ? next.byRound : {};
+    byRound[String(round)] = addTotals(byRound[String(round)], add);
+    next.byRound = byRound;
+  }
   if (entry?.byPrice !== undefined) next.byPrice = mergeByPrice(next.byPrice, entry.byPrice);
   if (entry?.priceTable !== undefined) {
     if (typeof entry.priceTable !== 'string' || !TABLE_DATE_RE.test(entry.priceTable)) throw new Error('priceTable must be a date (YYYY-MM-DD)');
@@ -121,6 +129,11 @@ export function costShapeProblem(cost) {
   // byPrice / priceTables are optional (records from before per-version prices have neither) but must be indexable when present
   if (cost.byPrice !== undefined && !isPlainObject(cost.byPrice)) return 'bad cost';
   if (cost.priceTables !== undefined && !isPlainObject(cost.priceTables)) return 'bad cost';
+  // byRound (cost booked per review round) is optional too: plain object, keys positive integer strings, values plain objects
+  if (cost.byRound !== undefined) {
+    if (!isPlainObject(cost.byRound)) return 'bad cost';
+    for (const [k, v] of Object.entries(cost.byRound)) if (!/^[1-9]\d{0,8}$/.test(k) || !isPlainObject(v)) return 'bad cost';
+  }
   return null;
 }
 
@@ -307,6 +320,10 @@ export function costLines(cost) {
   };
   rows('By phase', PHASES, cost.byPhase);
   rows('By role', ROLES, cost.byRole);
+  if (isPlainObject(cost.byRound)) {
+    const keys = Object.keys(cost.byRound).filter((k) => isPlainObject(cost.byRound[k])).sort((a, b) => Number(a) - Number(b));
+    if (keys.length) out.push(`- **By round:** ${keys.map((k) => `round ${k} ${usd(cost.byRound[k].usd)} (${num((Number(cost.byRound[k].input) || 0) + (Number(cost.byRound[k].output) || 0))} tok)`).join(' · ')}`);
+  }
   const tables = isPlainObject(cost.priceTables) ? Object.entries(cost.priceTables) : [];
   if (tables.length) out.push(`- **Priced with table:** ${tables.map(([d, c]) => `${d} (${num(c)})`).join(' · ')}`);
   return out;
@@ -323,6 +340,7 @@ export function costReport(cost) {
     guardBlocks: Number.isInteger(cost.guardBlocks) ? cost.guardBlocks : null,
     guardBySession: Number.isInteger(cost.guardBlocks) && isPlainObject(cost.guardBySession) ? cost.guardBySession : null,
     sessions: Array.isArray(cost.sessions) ? cost.sessions : [],
+    ...(isPlainObject(cost.byRound) ? { byRound: cost.byRound } : {}),
     ...(isPlainObject(cost.byPrice) ? { byPrice: cost.byPrice } : {}),
     ...(isPlainObject(cost.priceTables) ? { priceTables: cost.priceTables } : {}),
   };

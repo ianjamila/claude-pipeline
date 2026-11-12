@@ -44,7 +44,7 @@ test('round-request: the cost comes from the PR\'s run record (read-only); no re
   const before = w.fake.comments().map((c) => c.body);
   const r = ask(w);
   assertExit(r, 0, r.stderr + r.stdout);
-  assert.deepEqual(r.json.cost, { bookedUsd: 23.4, reviewUsd: 18.1, fableUsd: 6.2, perRoundUsd: 9.05 });
+  assert.deepEqual(r.json.cost, { bookedUsd: 23.4, reviewUsd: 18.1, fableUsd: 6.2, perRoundUsd: 9.05, lastRound: null, lastRoundUsd: null });
   assert.match(r.json.summary, /Booked agent cost so far: \$23\.40, review \$18\.10 \(about \$9\.05 per round\)\./);
   assert.deepEqual(w.fake.comments().map((c) => c.body), before, 'nothing was written to the PR');
   assert.equal(w.fake.lines().filter((l) => /POST|PATCH/.test(l)).length, 0);
