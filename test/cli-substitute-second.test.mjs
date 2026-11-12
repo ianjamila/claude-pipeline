@@ -12,6 +12,7 @@ import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { floorEnv } from './helpers/floor-env.mjs';
+import { readStatus } from '../pipeline/lib/codex-usage.mjs';
 import { rulingsDigest, rulingsInventory, substituteDigest, substituteInventory } from '../pipeline/lib/triage.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -395,4 +396,41 @@ test('a failure that is not a real quota stop is not eligible (no input); a reco
   assert.equal(o.json.substitute.eligible, false);
   assert.equal(o.json.substitute.why, 'mode-off');
   assert.ok(existsSync(join(off.dir(), 'second-review-R1-B1.md')));
+});
+
+test('the Codex waiting record (P codex-status): a second-review quota stop parks the PR and records the outage, the next Codex second-review answer clears both; a broken record folder is only a warning', (t) => {
+  const w = world(t);
+  const status = join(w.scratch, 'status', 'codex');
+  const env = { PIPELINE_CODEX_STATUS_DIR: status };
+  const record = () => readStatus({ dir: status });
+  assert.deepEqual(record().waiting, []);
+
+  const stop = w.second('R1-B1', { ...w.quota(), ...env });
+  assertExit(stop, 3, stop.stdout + stop.stderr);
+  assert.equal(stop.json.substitute.eligible, true);
+  assert.equal(stop.json.warnings, undefined, 'a recorded stop has nothing to warn about');
+  const parked = record();
+  assert.deepEqual(parked.waiting.map((e) => [e.repo, e.pr, e.round, e.worktree]), [['acme/widgets', 7, 1, w.repo.dir]]);
+  assert.deepEqual([parked.lastOutage.repo, parked.lastOutage.pr, parked.lastOutage.round], ['acme/widgets', 7, 1]);
+
+  // a failure that is not a quota stop records nothing new
+  const other = w.second('R1-B2', { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'The model is overloaded, try again', ...env });
+  assertExit(other, 3, other.stdout);
+  assert.equal(record().waiting.length, 1);
+
+  // the next Codex answer for this PR (a second review that Codex gave) ends the wait and the outage
+  const ok = w.cli(['triage', 'second-review', '--round', '1', '--ids', 'R1-B2', '--pr', '7'], { FAKE_CODEX_OUTPUT: w.file('ok.json', answerOf(['R1-B2', 'REJECT', 'high'])), ...env });
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+  assert.equal(ok.json.warnings, undefined);
+  assert.deepEqual(record().waiting, []);
+  assert.equal(record().lastOutage, null);
+
+  // best effort: a record folder that cannot be written is a warning, never a failed second review
+  const broken = world(t);
+  const bad = { PIPELINE_CODEX_STATUS_DIR: join(broken.scratch, 'not-a-dir', 'codex') };
+  writeFileSync(join(broken.scratch, 'not-a-dir'), 'a file, not a folder');
+  const q = broken.second('R1-B1', { ...broken.quota(), ...bad });
+  assertExit(q, 3, q.stdout + q.stderr);
+  assert.equal(q.json.substitute.eligible, true, 'the hand-off to the substitute still stands');
+  assert.ok(q.json.warnings.some((x) => /could not record the Codex outage/.test(x)), q.stdout);
 });

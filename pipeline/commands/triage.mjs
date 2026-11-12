@@ -33,6 +33,7 @@ import {
 } from '../lib/review-context.mjs';
 import { assertCurrentAttempt, finishAttempt, readRoute, startAttempt, substituteEligibility, superseded, writeFinalRoute } from '../lib/route-record.mjs';
 import { headMoved } from '../lib/review-round.mjs';
+import { noteCodexAnswered, noteQuotaStop } from '../lib/codex-usage.mjs';
 import { floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
 import { PROOF_EFFORT, proveSubstituteRun } from '../lib/substitute-proof.mjs';
 import {
@@ -568,6 +569,14 @@ async function secondReview(rest, ctx) {
     extra: { kind: 'second-review', ids: [...ids].sort(), packetId, findingsDigest: asked.snapshot.digest, finalsSha256: sha256(asked.snapshot.finals) },
   });
   const failAttempt = (final) => finishAttempt({ root, pr, ctx, round: n, attempt, final, files: [], file: routeFile });
+  // The repository's slug for the machine-wide Codex record (best effort: null when GitHub cannot say), as codex-review does.
+  const repoSlug = () => {
+    try {
+      return gh.repo().slug;
+    } catch {
+      return null;
+    }
+  };
 
   // Codex runs WITHOUT the lock (it can take minutes). The prompt is kept before it starts, so a crashed run still leaves what it was asked.
   writeFileAtomic(path.join(dir, `second-review-${ids[0]}.md`), promptBytes);
@@ -583,6 +592,10 @@ async function secondReview(rest, ctx) {
         errorEvent: { type: 'turn.failed', message: ran.quota.message }, threadId: ran.quota.threadId ?? null, promptSha256: inputDigest, proof: ran.quota.proof,
       }
       : { evidence: 'none', outcome: 'failed', reason: ran.reason, ...(ran.timedOut ? { timedOut: true } : {}), ...(ran.detail === undefined ? {} : { detail: ran.detail }) });
+    // The PR now waits for Codex, like a first review that hit the quota (best effort: a failure is a warning).
+    const warnings = quotaStop
+      ? await noteQuotaStop({ at: new Date(), resetAt: ran.quota.resetAt, resetText: ran.quota.resetText, repo: repoSlug(), pr, round: n, worktree: root, env: ctx.env })
+      : [];
     // A real quota stop: the same blind packet, for the risk's substitute agent (opened under the lock: the attempts file is shared by later runs).
     let substitute = verdict;
     if (verdict.eligible) {
@@ -599,6 +612,7 @@ async function secondReview(rest, ctx) {
       ...(ran.retried ? { retried: ran.retried } : {}),
       ...(ran.reason === 'quota' && ran.quota ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
       substitute,
+      ...(warnings.length > 0 ? { warnings } : {}),
     });
   }
   // From here on a bad answer stores nothing, so the call can simply be run again.
@@ -615,7 +629,7 @@ async function secondReview(rest, ctx) {
     return refuse(`the Codex answer is not one valid verdict per item: ${checked.errors.join('; ')}; nothing was recorded, run second-review again`, { errors: checked.errors });
   }
 
-  return withStateLock(root, ctx, () => {
+  const recorded = await withStateLock(root, ctx, () => {
     const state = requireState(root);
     if (state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`);
     if (headSha(o) !== asked.head) return refuse('HEAD moved while Codex was reviewing; nothing was recorded, run second-review again');
@@ -646,6 +660,10 @@ async function secondReview(rest, ctx) {
     const { next: publishNext, ...published } = publishRuling({ ctx, root, pr, state: saved });
     return secondReviewOutput({ n, settled, published, publishNext });
   }, pr);
+  // Codex answered: the PR is no longer waiting for it and its last outage is over (best effort, as after a first review).
+  if (recorded.exitCode !== EXIT.OK) return recorded;
+  const warnings = await noteCodexAnswered({ pr, repo: repoSlug, env: ctx.env });
+  return warnings.length === 0 ? recorded : { ...recorded, output: { ...recorded.output, warnings } };
 }
 
 // `triage second-review --apply --tag TAG`: the substitute's answer to a second review Codex could not give. The proof is `substitute apply`'s (lib/substitute-proof.mjs); the
