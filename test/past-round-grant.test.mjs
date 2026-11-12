@@ -387,3 +387,41 @@ test('state show: a saved grant is verified against the gh repository, not the s
   assert.equal(show.json.grantsDropped, undefined, JSON.stringify(show.json));
   assert.equal(w.state().rounds.find((x) => x.n === 3).ownerGrant.grantId, grantIdOf(rec));
 });
+
+test('state show: reads the repository once (the client that read the PR comments), not a second `gh repo view`', (t) => {
+  const bogus = { grantId: 'c'.repeat(16), k: 3, quote: 'approve round', ownerTs: '2026-11-01T00:00:00.000Z', past: true };
+  const w = world(t, { localSpec: SPEC.map((r) => (r.n === 3 ? { ...r, ownerGrant: bogus, admission: 'owner' } : r)) });
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stderr + show.stdout);
+  assert.deepEqual(show.json.grantsDropped, [3], 'the check ran against the gh repository');
+  assert.equal(w.fake.calls().filter((c) => c.argv[0] === 'repo' && c.argv[1] === 'view').length, 1, 'one repository lookup');
+});
+
+test('state show: when the repository identity cannot be resolved (not github.com), a saved grant is KEPT and the output warns; nothing is dropped on a guess', (t) => {
+  const bogus = { grantId: 'c'.repeat(16), k: 3, quote: 'approve round', ownerTs: '2026-11-01T00:00:00.000Z', past: true };
+  const w = world(t, { localSpec: SPEC.map((r) => (r.n === 3 ? { ...r, ownerGrant: bogus, admission: 'owner' } : r)) });
+  w.fake.setScript([{ match: '^repo view', stdoutJson: { nameWithOwner: w.slug, url: `https://ghe.example.com/${w.slug}`, defaultBranchRef: { name: 'main' } } }]);
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stderr + show.stdout);
+  assert.equal(show.json.grantsDropped, undefined, JSON.stringify(show.json));
+  assert.ok(show.json.warnings.some((x) => /repository/.test(x) && /kept/.test(x)), JSON.stringify(show.json.warnings));
+  assert.deepEqual(w.state().rounds.find((x) => x.n === 3).ownerGrant, bogus, 'the grant is still there');
+});
+
+test('state show: a copy AHEAD of the PR only in a round-level proof, while the PR moved by a grant alone, adopts the grant and its baseline follows the PR; `comment --kind triage` then publishes both', (t) => {
+  const grant = { grantId: 'a'.repeat(16), k: 3, quote: 'approve round', ownerTs: '2026-11-01T00:00:00.000Z', past: true };
+  const w = world(t);
+  const before = build(w.slug);
+  saveState(w.repo.dir, { ...before, rounds: before.rounds.map((r) => (r.n === 2 ? { ...r, modelProof: proof } : r)) }); // the Fable pass, saved and not yet published
+  writeBaseline(w.repo.dir, 7, reviewContentHash(before)); // this copy last saw the PR before the other checkout published the grant
+  const theirs = { ...before, rounds: before.rounds.map((r) => (r.n === 3 ? { ...r, ownerGrant: grant, admission: 'owner' } : r)) };
+  w.fake.addComment({ body: triageComment(theirs) });
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stderr + show.stdout);
+  assert.deepEqual(show.json.grantsRestored, [3], JSON.stringify(show.json));
+  assert.equal(readBaseline(w.repo.dir, 7), reviewContentHash(theirs), 'the baseline follows the PR');
+  const pub = w.cli(['comment', '--pr', '7', '--kind', 'triage']);
+  assertExit(pub, 0, pub.stderr + pub.stdout);
+  const out = w.published();
+  assert.deepEqual([out.rounds.find((r) => r.n === 2).modelProof, out.rounds.find((r) => r.n === 3).ownerGrant], [proof, grant], 'the PR holds the proof and the grant');
+});

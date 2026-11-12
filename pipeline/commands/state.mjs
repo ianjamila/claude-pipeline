@@ -79,8 +79,8 @@ const needsHuman = (i) => i.final?.needsHuman === true;
 
 // The published review state: the newest comment of ours that STARTS with the triage marker (a quoted or forged marker in someone else's comment,
 // or in the middle of ours, must never become the state). -> { state, hash, ... } (lib/review-publish.mjs#readPublished); state is null when there is none.
-function recoverState(root, pr, ctx) {
-  return guardGh(() => readPublished(createGitHub({ cwd: root, env: ctx.env }), pr));
+function recoverState(root, pr, ctx, gh = createGitHub({ cwd: root, env: ctx.env })) {
+  return guardGh(() => readPublished(gh, pr));
 }
 
 // The local copy holds a second-review verdict or a Claude / forced final that the published copy lacks for the same item (what a ruling saved while
@@ -203,13 +203,15 @@ function equalsPublishedApartFromGrants(local, published) {
   return kept.length === theirs.size && canonicalJson(kept) === canonicalJson(published.rounds ?? []);
 }
 
-// The repository identity the owner's recorded approval is checked against: the gh slug (what past-round-grant and the gates use), else the one the state recorded.
-function repoForGrants(root, ctx, local) {
+// The repository identity the owner's recorded approval is checked against: the gh slug (what past-round-grant and the gates use), read from the client that already
+// read the PR (it caches the lookup: no second `gh repo view`). null when it cannot be resolved: the state's recorded slug may predate a repository move, and a
+// verification against it would answer "mismatch" for a valid approval, so the caller keeps the grants instead of guessing.
+function repoForGrants(gh) {
   try {
-    const { slug, host } = createGitHub({ cwd: root, env: ctx.env }).repo();
+    const { slug, host } = gh.repo();
     if (host === 'github.com' && typeof slug === 'string' && slug !== '') return slug;
-  } catch { /* fall back to the recorded repository */ }
-  return local.repo;
+  } catch { /* unresolved: null */ }
+  return null;
 }
 
 // A local owner grant on a round the PR holds WITHOUT one, that does not verify on this machine (its record, marker or transcript is gone), is dropped, together with the
@@ -250,6 +252,7 @@ async function show(rest, ctx) {
 }
 
 async function showLocked(values, n, pr, root, ctx) {
+  const gh = createGitHub({ cwd: root, env: ctx.env }); // one client for the whole command: its repository lookup is cached
   let state;
   try {
     state = loadState(root);
@@ -266,7 +269,7 @@ async function showLocked(values, n, pr, root, ctx) {
     if (pr === undefined) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'no-state', message: 'no review state here: pass --pr N to rebuild it from the PR triage comment' });
     }
-    const found = await recoverState(root, pr, ctx);
+    const found = await recoverState(root, pr, ctx, gh);
     state = found.state;
     if (!state) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'no-state', message: `no local review state and no triage comment with state on PR #${pr}` });
@@ -284,16 +287,17 @@ async function showLocked(values, n, pr, root, ctx) {
     // triage comment, so the caller must not treat it as proven current.
     let found;
     try {
-      found = await recoverState(root, pr, ctx);
+      found = await recoverState(root, pr, ctx, gh);
     } catch (err) {
       if (!(err instanceof UnavailableError)) throw err;
       warnings.push(`GitHub unavailable: the local review state was not compared with the published triage comment (${String(err.message).split('\n')[0].slice(0, 200)})`);
       source = 'local-unverified';
     }
+    // The PR moving off this copy's baseline by owner grants alone (another checkout published one) is not a change of decisions: the grants are adopted below,
+    // and, whatever else this copy holds that the PR lacks, the PR then differs from what this copy last saw by those grants only.
+    const seen = found?.state ? readBaseline(root, pr) : null;
+    const grantsOnly = seen !== null && found.hash !== seen && reviewContentHash(publishedAtLocalGrants(found.state, state)) === seen;
     if (found?.state && !stateExtends(state, found.state)) {
-      // The PR moving off this copy's baseline by owner grants alone (another checkout published one) is not a change of decisions: the grants are adopted below.
-      const seen = readBaseline(root, pr);
-      const grantsOnly = seen !== null && found.hash !== seen && reviewContentHash(publishedAtLocalGrants(found.state, state)) === seen;
       if (localAheadOfPublished(state, found, grantsOnly ? found.hash : seen)) {
         source = 'local-ahead';
         warnings.push(`the local review state holds a second-review verdict, a Claude ruling (or a change to one), an owner ruling, an implementation mark or a follow-up issue link that the published triage comment lacks (it was saved but not published): kept as is; publish it now with \`pipeline comment --pr ${pr} --kind triage\``);
@@ -312,7 +316,9 @@ async function showLocked(values, n, pr, root, ctx) {
     // Grant metadata is add-only history: a local copy that lacks (or holds another) owner grant the PR holds on a round it has takes the PR's,
     // keeping its own decisions and trailing rounds, instead of being quarantined or later refused as history-loss at publication.
     if (found?.state && (source === 'local' || source === 'local-ahead')) {
-      const dropped = dropUnverifiedLocalGrants(state, found.state, repoForGrants(root, ctx, state));
+      const repo = repoForGrants(gh);
+      if (repo === null) warnings.push('could not resolve the GitHub repository: the owner grants this copy holds were not checked against the PR, and are kept');
+      const dropped = repo === null ? { state, dropped: [], errored: [] } : dropUnverifiedLocalGrants(state, found.state, repo);
       for (const e of dropped.errored) warnings.push(`could not check the owner grant on round ${e.n} (${e.message}): kept`);
       if (dropped.dropped.length > 0) {
         state = dropped.state;
@@ -324,9 +330,10 @@ async function showLocked(values, n, pr, root, ctx) {
       if (adopted.restored.length > 0) {
         state = adopted.state;
         saveState(root, state);
-        // The baseline follows the PR only when this copy has now seen everything the PR holds: local-ahead was proved above by the baseline hash check (the PR moved by grants alone);
-        // a copy that merely extends the PR may still lack a round-level proof or a decision the PR holds, and its next publication would erase it.
-        if (source === 'local-ahead' || equalsPublishedApartFromGrants(state, found.state)) writeBaseline(root, pr, found.hash);
+        // The baseline follows the PR only when this copy has now seen everything the PR holds: the PR moved off the baseline by grants alone (proved above by the baseline
+        // hash check, whether this copy is ahead in decisions or in round-level content), or this copy equals the PR apart from grants; a copy that merely extends the PR may
+        // still lack a round-level proof or a decision the PR holds, and its next publication would erase it.
+        if (source === 'local-ahead' || grantsOnly || equalsPublishedApartFromGrants(state, found.state)) writeBaseline(root, pr, found.hash);
         grantsRestored = adopted.restored;
       }
     }
