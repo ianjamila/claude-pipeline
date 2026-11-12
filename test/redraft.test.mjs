@@ -1,7 +1,7 @@
 // `pipeline redraft --pr N [--reason CODE]` through the real CLI against the scripted fake gh and the fake hold provider
 // (test/helpers/merge-hold-env.mjs): release the merge hold, then (ci.draft_while_iterating) turn a ready PR back to draft.
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { BASE_SHA, LOCK_DIR, PR, cli, scenario, ymlFor } from './helpers/gate-env.mjs';
@@ -9,7 +9,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { FAKE_HOLD, holdCalls, holdFiles, holdPuts, holdYml } from './helpers/merge-hold-env.mjs';
 import { RELEASE_REASONS, recordSuccessor } from '../pipeline/lib/merge-hold.mjs';
 import { mergeLockName } from '../pipeline/lib/hold.mjs';
-import { openRecord } from '../pipeline/lib/merge-queue.mjs';
+import { openRecord, queueRecordPath } from '../pipeline/lib/merge-queue.mjs';
 import { release as releaseLock, tryAcquire } from '../pipeline/lib/locks.mjs';
 
 const VIEW = '^pr view 12 --json number,state,isDraft,headRefOid,autoMergeRequest$';
@@ -175,6 +175,24 @@ test('7. merge-in-progress, each trigger (queue entry, armed auto-merge, local m
   const recorded = world({ entries: [mutation()] });
   openRecord(recorded.repo.dir, PR, recorded.head, {}, { repo: 'acme/widgets', repoId: 1 });
   refused(recorded, 'live queue record', /merge-queue record/);
+});
+
+test('7b. an unreadable local merge-queue record (malformed JSON) fails closed: exit 1 merge-in-progress, no release, no mutation, nothing written', () => {
+  for (const [label, text] of [['invalid JSON', '{"pr": 12, "head": '], ['not a record', '[]']]) {
+    const s = world({ entries: [mutation()] });
+    const file = queueRecordPath(s.repo.dir, PR);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, text);
+    const r = redraft(s);
+    assertExit(r, 1, `${label}: ${r.stdout}`);
+    assert.equal(r.json.ok, false, label);
+    assert.equal(r.json.reason, 'merge-in-progress', label);
+    assert.match(r.json.message, /unreadable/, label);
+    assert.match(r.json.message, /do NOT push/, label);
+    assert.deepEqual(holdCalls(s), [], `${label}: a corrupt record may own a lifted hold, so no release`);
+    assert.deepEqual(writes(s), [], `${label}: no conversion, no other write`);
+    assert.equal(readFileSync(file, 'utf8'), text, `${label}: the record is left as found`);
+  }
 });
 
 test('8. a mutation that answers isDraft:false, or errors, is exit 1 convert-failed; an unreachable GitHub (read, queue read, mutation) is exit 3', () => {
