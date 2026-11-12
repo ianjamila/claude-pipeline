@@ -4129,21 +4129,12 @@ function evaluateBashForFilesFrame(command, opts) {
     const ph = physicalDots(p, ctx.api);
     return ph !== null && (hitChain(ph) || hitChain(realOf(ph)));
   };
-  // R4-F1: the directories a command can run in. Without a ( ) { } or a compound keyword on the line, a command that follows a cd to a directory known now by && only (and by && only, up to it) runs in that
-  // directory alone: the cd ran and succeeded. Any other join (; || | &) keeps the cd that may have failed or run elsewhere in view, so such a command is read against every directory of the line (`dirs`).
+  // R4-F1: the directories a command can run in. A command that follows a cd to a directory known now by && only (and by && only, up to it) runs in that directory alone: the cd ran and succeeded.
+  // Any other join (; || | &) keeps the cd that may have failed or run elsewhere in view, so such a command is read against every directory of the line (`dirs`).
   const cdOf = (c) => CD_CMDS.has(baseOf(c.argv[0] ?? ''));
-  // R8 (#288): whether a cd surely ran before the next command is read from the PARSER, which lexes nested substitutions, heredocs, comments and control constructs as the shell does -- no second, flat
-  // quote reader any more (it disagreed with the shell inside `"$( )"`, backticks and `$'…'`, and each round found a new flip that hid a loop or a `!` from it).
-  // markedOut: the command may not run, may run again, or runs in another shell (a loop, a branch, a function body, a trap action, a ( ) / $( ) / backtick subshell).
-  const markedOut = (c) => !c.ctl || !c.grp || c.grp.length > 0 || Object.values(c.ctl).some(Boolean);
-  // negated: a `!` before the command word (the parser drops it from argv and keeps it in the raw text): `! cd X && cmd` runs cmd when the cd FAILS. Not found in its own raw text: read as negated.
-  const negated = (c) => {
-    const text = String(c.raw ?? '');
-    if (/^\s*!/.test(text)) return true;
-    if (c.argv.length === 0) return false;
-    const at = text.indexOf(c.argv[0]);
-    return at < 0 || text.slice(0, at).includes('!');
-  };
+  // R9 (#288): a WHITELIST. Whether a cd surely ran before the next command is read from the PARSER and from nothing else: the line must be a plain sequence of simple commands joined by && ; or a newline
+  // (`cmds.plainSeq`, see simpleCommands). Any group, subshell, `!`, coprocess, always block, function, compound command, `[[`, || | |& &, command-less segment, cut-short parse or heredoc the parser and the
+  // shell may read differently turns the narrowing off for the whole line: its commands are read against every directory of the line. (Rounds 5 to 8 listed what to refuse, and each found a construct not on the list.)
   const landings = (e, base) => { // (where the cd target leads from each directory of base; a '..' after a symlink also reads as the target's parent, see collectDirs)
     const out = [];
     for (const d of base) {
@@ -4164,23 +4155,26 @@ function evaluateBashForFilesFrame(command, opts) {
     if (baseOf(c.argv[0] ?? '') !== 'cd' || c.raw.includes('\\') || !PLAIN_CD.test(c.raw)) return null; // (R5-F1: `env cd`, `sudo cd`, `time cd` run no builtin in this shell)
     const rest = c.argv.slice(1).filter((a) => a !== '--' && !/^-[LPe@]+$/.test(a));
     if (rest.length > 1) return null;
-    const e = expandRefs(rest.length ? rest[0] : '~', ctx);
+    const word = rest.length ? rest[0] : '~';
+    // (R9-F4: only a fully literal word is narrowed: no `$`, backtick, glob, bracket or brace, and `~` only as home itself or `~/…`, never `~NAME`, `~+`, `~-`; a variable can hold anything, from a branch or a loop that never ran)
+    if (/[$`*?[\]{}()\\!]/.test(word) || (word[0] === '~' && word !== '~' && !word.startsWith('~/'))) return null;
+    const e = expandRefs(word, ctx);
     if (!e || e.startsWith('-') || e.startsWith('~') || /[$`*?[(){}\\]/.test(e)) return null;
     if (!isAbs(e) && (/cdpath/i.test(raw) || (opts.env ?? process.env).CDPATH)) return null; // (a relative name may lead anywhere through CDPATH)
     return e;
   };
-  // R5 (#288): the narrowing fails closed. A command is read against fewer directories ONLY when everything before it is positively known: every step of its &&-chain is a plain `cd` to a literal path (or a
-  // command that cannot change the shell's directory), there is no `!` at a command position on the line (`! cd X && cmd` runs cmd when the cd FAILS), nothing earlier can change the directory behind our
+  // R5 (#288): the narrowing fails closed. A command is read against fewer directories ONLY when everything before it is positively known: the line is a plain sequence (see R9 above), every step of its
+  // &&-chain is a plain `cd` to a literal path (or a command that cannot change the shell's directory), nothing earlier can change the directory behind our
   // back (chdir, eval, source, `.`, builtin / command / exec, an alias, a name that is only known at run time), and the cd target is read both lexically and through its symlinks (the real directory
   // too: `cd /tmp/link && find ..` is the link target's parent). Otherwise the command is read against every directory of the line (`dirs`).
   const withReal = (list) => unique([...list, ...list.map(realOf)]);
   const staticName = (c) => { const n = c.argv[0] ?? ''; return n === '[' || n === '[[' || (n !== '' && !/[$`*?[\](){}~'"\\<>=]/.test(n)); };
   const changesDir = (c) => c.argv.length > 0 && (!staticName(c) || DIR_CHANGERS.has(baseOf(c.argv[0])));
-  // Narrowing needs a parse whose marks can be trusted (not cut short, no closer without its opener, every heredoc located, no ( ) subshell, function or `$'…'` / `$"…"` string on the line: R6-F2 keeps
-  // those lines un-narrowed), no `!` before any command, and no command that changes the directory (a cd, eval, source, ...) that is marked out, or sits in a trap action: such a cd may run in a later pass
-  // or not at all, so nothing is read as having a known directory. (A command inside a substitution is another shell's: its marks say so, except a trap action, which runs in this one.)
-  const unsureChange = (c) => c.argv.length > 0 && (cdOf(c) || changesDir(c)) && (c.depth > 0 ? c.ctl?.trap !== false : markedOut(c));
-  const cdUnsure = cmds.truncated === true || cmds.ctlBroken === true || cmds.subshell === true || cmds.ansiC === true || cmds.heredocSpans == null || (cmds.fns?.size ?? 0) > 0 || cmds.some((c) => negated(c) || unsureChange(c));
+  // Narrowing needs a plain sequence (cmds.plainSeq: it also covers a cut-short parse, a closer with no opener, a heredoc not located, a group, a subshell, a function, a `!`), no `$'…'` / `$"…"` string on the
+  // line (R6-F2), and no command that changes the directory (a cd, eval, source, ...) in a trap action: it runs in this shell, but later. (Any other command inside a substitution or a `-c` string is
+  // another shell's, and a plain sequence has no loop, branch or group to run a command out of turn.)
+  const unsureChange = (c) => c.argv.length > 0 && (cdOf(c) || changesDir(c)) && c.depth > 0 && c.ctl?.trap !== false;
+  const cdUnsure = cmds.plainSeq !== true || cmds.ansiC === true || cmds.some(unsureChange);
   const narrowDirs = new Map();
   if (opts._writesOnly !== true && !cdUnsure && cmds.some(cdOf) && !unknownCwd()) {
     let known = [ctx.cwd]; // where the shell can be so far
@@ -4190,7 +4184,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const [k, c] of top.entries()) {
       checkDeadline(ctx.budget);
       if (c.sep !== '&&') chain = null;
-      if (chain && !markedOut(c)) narrowDirs.set(c, chain);
+      if (chain) narrowDirs.set(c, chain);
       if (!cdOf(c)) {
         if (changesDir(c)) { lost = true; chain = null; }
         continue;

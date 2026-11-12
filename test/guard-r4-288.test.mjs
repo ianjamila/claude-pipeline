@@ -120,6 +120,8 @@ describe('R4-F1: a relative word resolves where the command can run', () => {
     ['cwd home: git -C .. add .  from proj', 'git -C .. rm -r .'],
     ['cwd home: cd proj && cd .. && rm -rf .', 'cd proj && cd .. && rm -rf .', { cwd: HOME }],
     ['cwd home: make -C . clean-all style', 'make -C .. install', { cwd: PROJ }],
+    // (R9 whitelist: a `||` anywhere on the line turns the narrowing off, so this R4 allow case is now a deny)
+    ['cwd home: cd proj && git add . || echo failed', 'cd proj && git add . || echo failed', { cwd: HOME }],
   ]);
   allows('F1', [
     ['cwd home: cd ~/Claude/proj && git add .', 'cd ~/Claude/proj && git add .', { cwd: HOME }],
@@ -130,7 +132,6 @@ describe('R4-F1: a relative word resolves where the command can run', () => {
     ['cwd home: cd proj && docker build .', 'cd proj && docker build .', { cwd: HOME }],
     ['cwd home: cd proj && cd src && git add .', 'cd proj && cd src && git add .', { cwd: HOME }],
     ['cwd home: cd proj && git add . && git commit -m x', 'cd proj && git add . && git commit -m x', { cwd: HOME }],
-    ['cwd home: cd proj && git add . || echo failed', 'cd proj && git add . || echo failed', { cwd: HOME }],
     ['cwd home: cd proj && git commit -m "$(cat msg)" && git add .', 'cd proj && git commit -m "$(cat msg)" && git add .', { cwd: HOME }],
     ['cwd home: mkdir build && cd build && cmake .. (from proj)', 'mkdir build && cd build && cmake ..', { cwd: PROJ }],
     ['cwd proj: cd build && cmake ..', 'cd build && cmake ..', { cwd: PROJ }],

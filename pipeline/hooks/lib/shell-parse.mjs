@@ -21,6 +21,8 @@ const CTL_COUNTER = { loop: 'loop', fn: 'fn', if: 'cond', case: 'cond', cbrace: 
 const ctlMarks = (c) => ({ loop: c.loop > 0, fn: c.fn > 0, trap: c.trap > 0, cond: c.cond > 0 });
 const LOOP_WORDS = new Set(['while', 'until', 'for', 'select', 'repeat', 'foreach']);
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
+// plainSeq (see simpleCommands): the words that, at the start of a command, are shell syntax and no plain simple command (a compound command, a keyword, a group, a coprocess, a function, `[[`)
+const NOT_PLAIN_HEAD = new Set([...KEYWORDS, ...LOOP_WORDS, 'case', 'select', 'function', 'time', 'always', '{', '}', '[[']);
 // A word right before a ( that opens a subshell, a condition or arithmetic (`if(true)`, `for((i=0;;))`), not a glob qualifier group.
 const LEAD_WORDS = new Set([...KEYWORDS, 'for', 'case', 'select', 'in', 'time', 'function', 'foreach', 'switch', 'catch', 'elseif', 'param', 'trap', 'return', 'exit', 'throw']);
 // A group on a glob word that holds nothing but qualifier characters (`*(.)`, `*(^/)`, `*(om[1,3])`, `*(N)`) is not also read as a subshell.
@@ -2242,7 +2244,7 @@ class Parser {
         pos = eol < 0 ? s.length : eol + 1;
         let cmp = line.replace(/\r$/, '');
         if (h.strip) cmp = cmp.replace(/^\t+/, '');
-        if (cmp === h.delim) { found = true; break; }
+        if (cmp === h.delim) { found = true; if (line.endsWith('\r')) this.ctx.hdOdd = true; break; } // (the shell does not end a body at `EOF\r`: the two disagree)
         lines.push(line);
       }
       // Why: `<<-` strips the leading tabs of the body before the command reads it (`bash <<-'EOF'` + `\tgit pu\` + `\tsh origin main`: one push the tabs hid)
@@ -2401,6 +2403,8 @@ class Parser {
       if (mode === 'heredoc') {
         seg.redirects.push({ op: '<<', target: null, fd: rfd });
         seg.pending++;
+        // (the parser and the shell must end the body at the same line: a delimiter is trusted only when it is plain text and its spelling is that text with some quotes / backslashes added; anything else is odd)
+        if (!/^[A-Za-z0-9_.-]+$/.test(text) || s.slice(from, Math.min(this.i, n)).replace(/['"\\]/g, '') !== text) ctx.hdOdd = true;
         this.hd.push({ delim: text, strip, quoted: q >= 0, seg });
         return;
       }
@@ -2570,7 +2574,7 @@ class Parser {
       } else if (c === '&') {
         const nx = s[this.i + 1];
         if (nx === '&') { endSeg(this.i); lastSep = '&&'; this.i += 2; }
-        else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; endSeg(this.i); this.markClosedOut(closed); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
+        else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; endSeg(this.i); this.markClosedOut(closed); lastSep = '&'; this.i++; if (depth === 0) ctx.notPlain = true; } // a background job: the command before it ran in a subshell
         else if (nx === '>' && !noRedir) {
           flushWord(); startSeg();
           redir = 'file'; rfd = null;
@@ -2579,6 +2583,7 @@ class Parser {
       } else if (c === '|') {
         const nx = s[this.i + 1];
         flushWord(); // (`}|cat`: the closing word first)
+        if (depth === 0) ctx.notPlain = true; // (| |& ||)
         const closed = seg?.closesFrom;
         endSeg(this.i);
         if (nx !== '|') this.markClosedOut(closed);
@@ -2633,6 +2638,7 @@ class Parser {
           // (a subshell after && / || runs only when that holds, and one that is a pipeline stage runs apart: its commands may not run, as for a { } group (cbrace).
           // `{ cat a; true || (cat x); cat c; } | bash` runs a+c, which the join a+x+c hid)
           const cond = !body && !(seg && seg.words.length) && ['&&', '||', '|'].includes(lastSep);
+          if (depth === 0) ctx.notPlain = true; // (a subshell, a function body, `((`)
           endSeg(this.i);
           lastSep = ';';
           this.i++;
@@ -2650,6 +2656,7 @@ class Parser {
           this.lastStage = this.log.slice(mark0).filter((x) => x.depth === depth);
         }
       } else if (c === ')') {
+        if (depth === 0) ctx.notPlain = true;
         endSeg(this.i);
         lastSep = ';';
         this.i++;
@@ -2834,6 +2841,8 @@ class Parser {
     seg.final = { argv: [] };
     let last = null;
     for (const g of groups) last = this.finalizeGroup(g, seg) ?? last;
+    if (seg.depth === 0 && (!last || seg.words.length === 0 || seg.words.some((w, k) => w.qa < 0 && (w.text === '{' || w.text === '}' || w.text === '[[' || (NOT_PLAIN_HEAD.has(w.text) && seg.words.slice(0, k).every((x) => x.qa < 0 && NOT_PLAIN_HEAD.has(x.text)))))))
+      this.ctx.notPlain = true; // (plainSeq: a segment that is no plain simple command: it emits none, or opens / closes a group, or starts with a keyword)
     if (seg.outSubs.length || seg.words.some((w) => w.subs.length && w.text.includes('>('))) this.feedOutSubs(seg);
     // Redirections belong to the command they were written on; a redirect with no command of its own
     // (`> file`, `{ a; } > file`, `(a) > file`) still has to reach the caller.
@@ -3261,7 +3270,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, ansiC: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, ansiC: false, notPlain: false, hdOdd: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -3312,6 +3321,11 @@ export function simpleCommands(str, opts) {
   Object.defineProperty(ctx.out, 'ctlBroken', { value: ctx.ctlBroken, enumerable: false });
   // ansiC: the text holds a `$'…'` or `$"…"` string anywhere (a caller that wants to fail closed on strings whose quoting rules differ from a plain one)
   Object.defineProperty(ctx.out, 'ansiC', { value: ctx.ansiC, enumerable: false });
+  // plainSeq: the whole text is a plain sequence of simple commands joined by && ; or a newline, and nothing else (comments and heredoc bodies aside). Set false for any { } ( ) group or subshell,
+  // `!`, coproc, always, function, compound command (if / for / while / until / select / case), `[[`, `time`, `||`, `|`, `|&`, `&`, a segment that emits no command, a cut-short parse (truncated, ctlBroken),
+  // a heredoc whose body the parser cannot locate or whose delimiter spelling or terminator line the shell may read differently. A caller that needs to know a command surely ran after the one before it
+  // (the cd narrowing of the files policy) trusts the order of the commands only for such a text. Only the text's own level counts: what a substitution or a `-c` string holds runs in another shell.
+  Object.defineProperty(ctx.out, 'plainSeq', { value: !ctx.notPlain && !ctx.hdOdd && !ctx.truncated && !ctx.ctlBroken && !ctx.hdForeign, enumerable: false });
   // heredocSpans: [start, end, quoted] of every heredoc body in the text (quoted: its delimiter was quoted, so nothing in it expands), or null when one cannot be located (read out of other text, no terminator, a parse that gave up)
   Object.defineProperty(ctx.out, 'heredocSpans', { value: ctx.hdForeign || ctx.truncated ? null : ctx.hdSpans, enumerable: false });
   return ctx.out;

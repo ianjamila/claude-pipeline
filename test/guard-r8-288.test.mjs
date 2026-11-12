@@ -100,8 +100,15 @@ describe('R8-F3 (#315): everyday lines narrow to the project', () => {
     ['git commit -F - with a heredoc', "cd proj && git add . && git commit -F - <<'EOF'\nfix: the thing\n\nbody\nEOF", AT],
     ['git commit -m with a heredoc in a substitution', "cd proj && git add . && git commit -m \"$(cat <<'EOF'\nfix: the thing\nEOF\n)\"", AT],
     ['a plain cd narrowing', 'cd proj && git add .', AT],
-    ['an if before the cd, none in its way', 'if true; then :; fi\ncd proj && git add .', AT],
-    ['a loop that ended before the cd', 'for i in 1 2; do echo $i; done\ncd proj && git add .', AT],
+  ]);
+});
+
+// R9: the narrowing is a whitelist (a plain sequence of simple commands only), so these two R8 extras are no longer narrowed: an if / a loop anywhere on the line turns it off, and the git add is read against home
+describe('R8-F3 extras under the R9 whitelist', () => {
+  const AT = { cwd: HOME };
+  denies('F3 extras', [
+    ['an if before the cd (the whitelist excludes it)', 'if true; then :; fi\ncd proj && git add .', AT],
+    ['a loop that ended before the cd (the whitelist excludes it)', 'for i in 1 2; do echo $i; done\ncd proj && git add .', AT],
   ]);
 });
 
