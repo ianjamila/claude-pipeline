@@ -213,6 +213,44 @@ test('one tag, one run: two transcripts under the tag are rerolled; a new attemp
   assert.equal(third.json.error, 'attempts-exhausted');
 });
 
+test('R1-F1: a fresh codex-review attempt for the same content does not reset the substitute attempts or mint a new tag (no re-rolling the first review)', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  assertExit(w.run(), 3); // a new Codex attempt, same range, quota again
+  const again = w.prepare();
+  assertExit(again, 0, again.stdout + again.stderr);
+  assert.equal(again.json.tag, prep.tag, 'the tag does not depend on the Codex attempt id');
+  assert.equal(again.json.attempt, 1);
+  assert.equal(w.attempts().attempts.length, 1, 'the attempts are kept by the packet, not by the Codex attempt');
+  // an invalid first attempt still counts after a new Codex attempt: the second is a2, not a fresh a1
+  install(w, prep, { agentId: 'a1', models: ['claude-sonnet-4-6'] });
+  assertExit(w.apply(w.projects), 1);
+  assertExit(w.run(), 3);
+  assert.equal(w.prepare().json.attempt, 2);
+});
+
+test('R1-F2: governor evidence expires: a reading that is back under the hard limit, or an old route with no readable figure, is reset-passed', (t) => {
+  const w = world(t);
+  assertExit(w.run(), 3);
+  const gov = (at) => w.editRoute((r) => { r.evidence = 'governor'; r.governor = { usedPct: 95, soft: 70, hard: 90, observedAt: at }; r.at = at; });
+  gov(new Date().toISOString());
+  assertExit(w.prepare(), 0); // fresh, nothing readable to contradict it
+  gov(new Date(Date.now() - 7 * 3600_000).toISOString());
+  const old = w.prepare();
+  assertExit(old, 1, old.stdout);
+  assert.equal(old.json.error, 'reset-passed');
+  // a readable current figure under the hard limit: the weekly quota has room again
+  const home = join(w.scratch, 'gov-home');
+  const day = new Date();
+  const dir = join(home, 'sessions', String(day.getUTCFullYear()), String(day.getUTCMonth() + 1).padStart(2, '0'), String(day.getUTCDate()).padStart(2, '0'));
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'rollout-t.jsonl'), `${JSON.stringify({ type: 'event_msg', timestamp: day.toISOString(), payload: { type: 'token_count', rate_limits: { limit_id: 'codex', primary: { used_percent: 5, window_minutes: 10080, resets_at: Math.floor(Date.now() / 1000) + 2 * 86400 } } } })}\n`);
+  gov(new Date().toISOString());
+  const low = w.cli(['substitute', 'prepare', '--pr', '7', '--round', '1'], { PIPELINE_CODEX_HOME: home });
+  assertExit(low, 1, low.stdout);
+  assert.equal(low.json.error, 'reset-passed');
+});
+
 test('apply: no transcript with the tag is exit 2 not-found and records nothing; no prepared attempt is no-prepare', (t) => {
   const w = world(t);
   assertExit(w.run(), 3);

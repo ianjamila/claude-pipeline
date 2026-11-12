@@ -7,7 +7,7 @@
 //      parked until Codex is back. Written under a lock (locks.mjs withLock, as the model floor registry is) with write-then-rename, so concurrent
 //      sessions never lose each other's entries and a reader never sees half a file.
 // Nothing in here decides a review; it only reports. Wiring into codex-review / review-complete / hooks is a later task.
-import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { withLock } from './locks.mjs';
 import { accountHome } from './paths.mjs';
@@ -254,6 +254,7 @@ export async function addWaiting({ repo, pr, worktree, round, since, now } = {},
   const w = need('worktree', text(worktree));
   const rd = need('round (a positive integer)', posInt(round));
   return update(opts, (s) => {
+    s.waiting = s.waiting.filter((x) => (x.repo === r && x.pr === n) || !waitingStale(x, toMs(now)));
     const at = s.waiting.findIndex((x) => x.repo === r && x.pr === n);
     const kept = at >= 0 ? s.waiting[at].since : null;
     const entry = cleanWaiting({ repo: r, pr: n, worktree: w, round: rd, since: since === undefined ? (kept ?? isoOf(toMs(now))) : stamp(since, now) });
@@ -263,6 +264,19 @@ export async function addWaiting({ repo, pr, worktree, round, since, now } = {},
 }
 
 // The PR is no longer waiting (reviewed, or Codex answered). Removing one that is not there changes nothing.
+// Owner command (`codex-status --forget --pr N [--repo slug]`): drop the entries for a PR number (of one repo when given); -> how many were removed.
+export async function forgetWaiting({ repo, pr } = {}, opts = {}) {
+  const n = need('pr (a positive integer)', posInt(pr));
+  const r = text(repo);
+  let removed = 0;
+  await update(opts, (s) => {
+    const keep = s.waiting.filter((x) => !(x.pr === n && (r === null || x.repo === r)));
+    removed = s.waiting.length - keep.length;
+    s.waiting = keep;
+  });
+  return removed;
+}
+
 export async function removeWaiting({ repo, pr } = {}, opts = {}) {
   const r = need('repo', text(repo));
   const n = need('pr (a positive integer)', posInt(pr));
@@ -352,8 +366,14 @@ export async function noteReviewed({ pr, repo, env } = {}) {
 // free text in a session's context). [] when nothing waits or Codex is still out.
 const SAFE_REPO = /^[A-Za-z0-9._-]{1,100}(?:\/[A-Za-z0-9._-]{1,100}){0,2}$/;
 const SAFE_PATH = /^(?:\/|[A-Za-z]:[\\/])[^\x00-\x1f\x7f\u2028\u2029]{0,300}$/;
+// A parked PR whose worktree is gone, or that has waited longer than this, is not told to every new session for ever (R1-F3); `codex-status --forget --pr N` removes one by hand.
+export const MAX_WAITING_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+export const waitingStale = (w, nowMs, exists = existsSync) => {
+  const since = Date.parse(w?.since);
+  return (Number.isFinite(since) && nowMs - since > MAX_WAITING_AGE_MS) || !exists(w?.worktree);
+};
 export function backNoticeLines(status, nowMs = Date.now()) {
-  const waiting = (status?.waiting ?? []).filter((w) => SAFE_REPO.test(w.repo) && SAFE_PATH.test(w.worktree));
+  const waiting = (status?.waiting ?? []).filter((w) => SAFE_REPO.test(w.repo) && SAFE_PATH.test(w.worktree) && !waitingStale(w, nowMs));
   if (waiting.length === 0) return [];
   // the weekly figure is not read here (it scans session files): only the outage record decides, which is what holds a parked PR
   if (backAtMs({ lastOutage: status.lastOutage ?? null }, nowMs) !== null) return [];

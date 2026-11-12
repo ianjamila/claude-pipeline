@@ -1,7 +1,7 @@
 // `pipeline codex-status [--wait [--timeout-minutes N]]`: how much of Codex's WEEKLY quota is used, when it resets, the last quota outage and the PRs
 // waiting for Codex. READ-ONLY (it never writes the record; codex-review and review-complete will, later). Logic and the record: lib/codex-usage.mjs.
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
-import { backAtMs, codexStatus } from '../lib/codex-usage.mjs';
+import { backAtMs, codexStatus, forgetWaiting } from '../lib/codex-usage.mjs';
 import { seamValue } from '../lib/seams.mjs';
 import { summariseUsage } from '../lib/codex-usage-kinds.mjs';
 
@@ -9,6 +9,7 @@ export const meta = {
   summary: 'show how much of Codex\'s weekly quota is used and when it resets, the last quota outage, and the PRs waiting for Codex; --wait blocks until Codex is back',
   usage: [
     'pipeline codex-status   -> {ok, weeklyUsedPct, windowMinutes, resetsAt, observedAt, source: \'codex-sessions\'|\'unknown\', lastOutage: {at, resetAt, resetText, repo, pr, round, worktree}|null, waiting: [{repo, pr, worktree, round, since, resume}]} : READ-ONLY, exit 0',
+    'pipeline codex-status --forget --pr N [--repo OWNER/NAME]   -> {ok, forgot, pr[, repo]} : owner command, the one writer here: removes the waiting entries for PR N (of that repo when given) from the record. An entry whose worktree is gone, or that waited more than 14 days, is never listed in the session notice and is dropped on the next write',
     'pipeline codex-status --usage [--since ISO]   -> {ok, since, sessions, totalTokens, byKind: {<kind>: {sessions, tokens}}, line} : Codex tokens from the session logs since ISO (default 7 days), by kind (pipeline round 1, pipeline fix-check, pipeline second review, plan review, code review, other; the kind comes from the prompt header the pipeline writes, anything else is `other`); `line` is one agent-log line: P agent-log publish --line "<line>"',
     'pipeline codex-status --wait [--timeout-minutes N]   -> the same object plus {waited: {outage, backAt, waitedMs, timedOut}} : returns at once when nothing is out, else polls every 60 s until Codex is back; exit 0 back, 1 timed out (default 600)',
     '  weeklyUsedPct / resetsAt / observedAt come from the newest `codex` weekly reading (window 10080 min) in Codex\'s own session logs (<account home>/.codex/sessions; a CODEX_HOME naming any other folder turns the governor off), only when it is under 6 h old and its reset is still ahead;',
@@ -23,12 +24,19 @@ const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function run(argv, ctx = {}) {
   const env = ctx.env ?? process.env;
-  const { values } = parseCommandArgs(argv, { wait: { type: 'boolean' }, 'timeout-minutes': { type: 'string' }, usage: { type: 'boolean' }, since: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(argv, { wait: { type: 'boolean' }, 'timeout-minutes': { type: 'string' }, usage: { type: 'boolean' }, since: { type: 'string' }, forget: { type: 'boolean' }, pr: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const timeoutMinutes = intOption(values, 'timeout-minutes', { min: 1, max: 24 * 60 * 14 });
   if (timeoutMinutes !== undefined && !values.wait) throw new UsageError('--timeout-minutes needs --wait');
   if (values.since !== undefined && !values.usage) throw new UsageError('--since needs --usage');
   if (values.usage && (values.wait || timeoutMinutes !== undefined)) throw new UsageError('--usage cannot be combined with --wait');
   const clock = ctx.now ?? Date.now;
+  if (values.forget) {
+    if (values.wait || values.usage || values.since !== undefined || timeoutMinutes !== undefined) throw new UsageError('--forget cannot be combined with --wait, --usage, --since or --timeout-minutes');
+    const pr = intOption(values, 'pr', { required: true, min: 1 });
+    const removed = await forgetWaiting({ pr, repo: values.repo }, { env, ...(ctx.record ?? {}) });
+    return { exitCode: EXIT.OK, output: { ok: true, forgot: removed, pr, ...(values.repo === undefined ? {} : { repo: values.repo }) } };
+  }
+  if (values.pr !== undefined || values.repo !== undefined) throw new UsageError('--pr and --repo go with --forget');
   if (values.usage) {
     if (values.since !== undefined && !Number.isFinite(Date.parse(values.since))) throw new UsageError('--since must be an ISO date');
     return { exitCode: EXIT.OK, output: { ok: true, ...summariseUsage({ env, now: clock(), since: values.since }) } };

@@ -186,3 +186,29 @@ test('meta: summary and usage are text, and the usage names the two forms', () =
   assert.match(meta.usage, /^pipeline codex-status /m);
   assert.match(meta.usage, /^pipeline codex-status --wait/m);
 });
+
+// ---- R1-F3: a parked PR that can no longer be resumed must not be announced for ever -------------------------------------------------------------
+test('--forget --pr N removes the waiting entries of that PR (of one repo when --repo is given) and nothing else', async (t) => {
+  const w = world(t);
+  for (const [repo, pr] of [['o/r', 5], ['o/q', 5], ['o/r', 6]]) await addWaiting({ repo, pr, worktree: w.root, round: 1, since: '2026-11-11T08:21:00Z' }, w.record);
+  const one = await run(['--forget', '--pr', '5', '--repo', 'o/q'], { env: w.env, record: w.record, now: () => NOW });
+  assert.deepEqual([one.exitCode, one.output.forgot], [0, 1]);
+  const all = await run(['--forget', '--pr', '5'], { env: w.env, record: w.record, now: () => NOW });
+  assert.equal(all.output.forgot, 1);
+  assert.deepEqual((await run([], { env: w.env, record: w.record, now: () => NOW })).output.waiting.map((e) => `${e.repo}#${e.pr}`), ['o/r#6']);
+  await assert.rejects(() => run(['--forget'], { env: w.env, record: w.record }), UsageError);
+  await assert.rejects(() => run(['--pr', '5'], { env: w.env, record: w.record }), UsageError);
+});
+
+test('the session notice leaves out an entry whose worktree is gone or that is older than 14 days; a write drops it', async (t) => {
+  const { backNoticeLines, readStatus } = await import('../pipeline/lib/codex-usage.mjs');
+  const w = world(t);
+  await addWaiting({ repo: 'o/live', pr: 1, worktree: w.root, round: 1, since: new Date(NOW - 86400_000).toISOString() }, w.record);
+  await addWaiting({ repo: 'o/gone', pr: 2, worktree: join(w.root, 'removed-worktree'), round: 1, since: new Date(NOW - 86400_000).toISOString() }, w.record);
+  await addWaiting({ repo: 'o/old', pr: 3, worktree: w.root, round: 1, since: new Date(NOW - 15 * 86400_000).toISOString() }, w.record);
+  const lines = backNoticeLines(readStatus({ ...w.record }), NOW);
+  assert.match(lines[0], /^Codex is back: o\/live#1 \(round 1\) is waiting$/);
+  assert.equal(lines.length, 2);
+  await addWaiting({ repo: 'o/new', pr: 4, worktree: w.root, round: 1, since: new Date(NOW).toISOString(), now: NOW }, w.record);
+  assert.deepEqual(readStatus({ ...w.record }).waiting.map((e) => e.repo).sort(), ['o/live', 'o/new']);
+});
