@@ -1783,8 +1783,54 @@ function ifsMayBeSet(ctx) {
 // the shell reads it: a value with a blank (`N='x status'`: quoted it stays one operand, unquoted it is two; the same name next to another expansion or text, `"$A"$B`, is a third reading), a
 // leading `(` (a zsh array value), an empty value (unquoted it drops the word and shifts every later one) or IFS possibly set (it splits on other characters, or on letters) is no read-only call.
 // Rounds 1-3 enumerated the readings (whole, split) and each round found one more; no enumeration is left. A one-word value (`D=-name; find . $D x`) is judged on its value as before.
+// R4-F3 (#288): and without a glob character: an unquoted result is also matched against the files of the directory (`D='-[d]elete'; find DIR $D`, with a file named -delete there, runs -delete).
 function singleToken(e, ctx) {
-  return e !== '' && !/\s/.test(e) && e[0] !== '(' && !ifsMayBeSet(ctx);
+  return e !== '' && !/\s/.test(e) && !/[*?[]/.test(e) && e[0] !== '(' && !ifsMayBeSet(ctx);
+}
+// R4-F3 (#288): the shell expands a glob-spelled option word against the files of the directory (`find DIR -[d]elete` with a file named -delete there runs -delete; a file of that name is easy to
+// make), so the word is judged by what it can turn into. A word that starts with `-` and holds a glob character is no read-only call when it can become one of the tool's refused options: an exact
+// option ({exact}: the whole word) or an option with an attached value or a longer spelling ({prefix}: any word that begins with it). The tools whose refusal is a pattern over the letters of a cluster
+// (sort, tree, jq, sed, awk) refuse any such word. (`rg --glob=*.mjs` and `rg -g*.ts` cannot become --pre and stay read-only.)
+const GLOB_OPTIONS = {
+  find: { exact: ['-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprint0', '-fprintf', '-fls'] },
+  rg: { prefix: ['--pre'] },
+  git: { prefix: ['-c', '-C', '--config-env', '--exec-path', '--git-dir', '--work-tree', '--namespace', '--output', '--ext-diff'] },
+  xxd: { prefix: ['-r'] },
+  openssl: { exact: ['-out', '-sign', '-prverify'] },
+};
+const GLOB_ANY_OPTION = new Set(['sort', 'tree', 'jq', 'sed', 'gsed', 'awk', 'gawk', 'mawk', 'nawk']);
+// Can the glob word `w` become `opt` (whole word), or a word that begins with `opt` (prefix)? One pass over the glob's characters with the set of positions of `opt` reached: linear in the word.
+function globCanBecome(w, opt, prefix) {
+  const m = opt.length;
+  let at = new Set([0]);
+  for (let i = 0; i < w.length; i++) {
+    const c = w[i];
+    const next = new Set();
+    if (c === '*') {
+      for (const j of at) for (let k = j; k <= m; k++) { next.add(k); if (k < m && opt[k] === '/') break; }
+    } else {
+      let test;
+      if (c === '?') test = () => true;
+      else if (c === '[' && w.indexOf(']', i + 2) > 0) {
+        const close = w.indexOf(']', i + 2);
+        let re = null;
+        try { re = new RegExp(`[${w.slice(i + 1, close).replace(/^!/, '^').replace(/\\/g, '\\\\')}]`); } catch { /* any one character */ }
+        i = close;
+        test = (ch) => !re || re.test(ch);
+      } else test = (ch) => ch === c;
+      for (const j of at) { if (j === m) { if (prefix) next.add(m); } else if (test(opt[j])) next.add(j + 1); }
+    }
+    if (prefix && next.has(m)) return true; // (whatever the rest of the glob stands for follows the option)
+    if (!next.size) return false;
+    at = next;
+  }
+  return at.has(m);
+}
+function globOptionRisky(name, args) {
+  const spec = GLOB_OPTIONS[name];
+  const any = GLOB_ANY_OPTION.has(name);
+  if (!spec && !any) return false;
+  return args.some((a) => a.length > 1 && a[0] === '-' && /[*?[]/.test(a) && (any || (spec.exact ?? []).some((o) => globCanBecome(a, o, false)) || (spec.prefix ?? []).some((o) => globCanBecome(a, o, true))));
 }
 // Returns { args, unknown }: the words isReadOnly judges (every word with a same-line name replaced by its value) and whether the call is unknown (no read-only call): a word of one of these tools that
 // still holds a run-time part anywhere (R2-F3), or an expanded word that is not one plain token (above).
@@ -2049,6 +2095,7 @@ function isReadOnly(cmd, ctx) {
 }
 function readOnlyWith(name, args, cmd, ctx, argv) {
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
+  if (globOptionRisky(name, args)) return false; // (R4-F3: a glob-spelled option)
   if (READ_ONLY.has(name)) {
     if (name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre='))) return false;
     return !(['less', 'more', 'bat', 'rg'].includes(name) && toolEnvTouched(cmd, ctx, GIT_TOOL_ENV));
