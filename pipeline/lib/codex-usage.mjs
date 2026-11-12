@@ -311,3 +311,33 @@ export async function noteCodexAnswered({ pr, repo, env } = {}) {
   }
   return warnings;
 }
+
+// The PR was reviewed (review-complete posted the marker, by Codex or by a Claude stand-in): it is no longer waiting for Codex. Unlike noteCodexAnswered
+// the last outage is left alone (a substitute round does not prove Codex is back). Best effort, never throws; reads first, so a PR that is not parked costs no write.
+export async function noteReviewed({ pr, repo, env } = {}) {
+  const warnings = [];
+  try {
+    if (!readStatus({ env }).waiting.some((w) => w.pr === pr)) return warnings;
+    const slug = typeof repo === 'function' ? repo() : repo;
+    if (typeof slug === 'string' && slug !== '') await removeWaiting({ repo: slug, pr }, { env });
+    else warnings.push('could not tell which repository the waiting PR belongs to; it stays in the Codex waiting list');
+  } catch (err) {
+    warnings.push(`could not update the Codex waiting list: ${err.message}`);
+  }
+  return warnings;
+}
+
+// ---- the SessionStart notice (B2) ----------------------------------------------------------------------------------------------------------
+// Lines for a session that starts while PRs wait for Codex and Codex is back (the outage's reset has passed): "Codex is back: <repo>#N (round R) ... waiting",
+// then each entry's resume sentence. The record is agent-writable, so an entry whose repo or worktree is not a plain slug / absolute path is left out (never
+// free text in a session's context). [] when nothing waits or Codex is still out.
+const SAFE_REPO = /^[A-Za-z0-9._-]{1,100}(?:\/[A-Za-z0-9._-]{1,100}){0,2}$/;
+const SAFE_PATH = /^(?:\/|[A-Za-z]:[\\/])[^\x00-\x1f\x7f\u2028\u2029]{0,300}$/;
+export function backNoticeLines(status, nowMs = Date.now()) {
+  const waiting = (status?.waiting ?? []).filter((w) => SAFE_REPO.test(w.repo) && SAFE_PATH.test(w.worktree));
+  if (waiting.length === 0) return [];
+  // the weekly figure is not read here (it scans session files): only the outage record decides, which is what holds a parked PR
+  if (backAtMs({ lastOutage: status.lastOutage ?? null }, nowMs) !== null) return [];
+  const names = waiting.map((w) => `${w.repo}#${w.pr} (round ${w.round})`).join(', ');
+  return [`Codex is back: ${names} ${waiting.length === 1 ? 'is' : 'are'} waiting`, ...waiting.map((w) => `  ${resumePrompt(w)}`)];
+}

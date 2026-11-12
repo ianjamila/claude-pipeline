@@ -18,6 +18,7 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, reviewLane } from '../lib/risk.mjs';
 import { isSubstituteRound, loadState } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
+import { noteReviewed } from '../lib/codex-usage.mjs';
 import { fableBypassNote, fableBypassRounds, reviewEligibilityProblems, reviewValidFor, roundOutcome, rulingsDigest, staleFableReason, staleFableRounds, substituteDigest, substituteRefusal, substituteSummary } from '../lib/triage.mjs';
 import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
@@ -202,7 +203,7 @@ export const run = guarded(async (argv, ctx) => {
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
-  return withReviewLock(root, pr, ctx, () => {
+  const result = await withReviewLock(root, pr, ctx, () => {
     let state;
     try {
       state = loadState(root);
@@ -326,4 +327,8 @@ export const run = guarded(async (argv, ctx) => {
       };
     });
   });
+  // The PR is reviewed: it no longer waits for Codex (best effort: a failure here is a warning, never a failed review).
+  if (result.exitCode !== EXIT.OK || result.output?.ok !== true) return result;
+  const parked = await noteReviewed({ pr, repo: () => createGitHub({ cwd: root, env: ctx.env }).repo().slug, env: ctx.env });
+  return parked.length === 0 ? result : { ...result, output: { ...result.output, warnings: [...(result.output.warnings ?? []), ...parked] } };
 });
