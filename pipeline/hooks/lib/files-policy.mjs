@@ -1828,7 +1828,7 @@ function unquotedRuntime(raw) {
 }
 // R5-F4 (#266): a word that splits into several words even inside double quotes: `"${(@f)$(cmd)}"` (any flag group), `"$@"`, `"$*"`, `"${@}"`, `"${arr[@]}"`, `"${arr[*]}"`. Probed with zsh 5.9: test
 // "${(@f)$(cat f)}", test "$@" and test "${arr[@]}" hand test several words, so no position can be trusted (quoted or not).
-const SPLITTING_WORD = /\$\{\(|\$[@*]|\$\{[@*]|\[[@*]\]/;
+const SPLITTING_WORD = /\$\{\(|\$\{=|\$=|\$[@*]|\$\{[@*]|\[[@*]\]/; // (R6-F4: `"${=x}"` and `"$=x"` split inside double quotes too)
 function testEvaluates(name, args, words, expand, raw) {
   const rtWord = (a) => RUNTIME_PART.test(a) || SUBSCRIPT_EVAL.test(a) || RUNTIME_PART.test(expand(a)) || SUBSCRIPT_EVAL.test(expand(a));
   if (args.some((a) => SPLITTING_WORD.test(a) || SPLITTING_WORD.test(expand(a)))) return true; // (the words it makes are unknown: no read-only call)
@@ -1854,19 +1854,34 @@ function testEvaluates(name, args, words, expand, raw) {
   }
   return true;
 }
-// R4-F2 / R5 (#266): an expansion that ASSIGNS (`${y:=w}`, `${y::=w}`, `${y=w}`, `${(L)y:=w}`, `${=y:=w}`, `${(j:):)y:=w}`) plants the text of w as the value of y; a later
-// `printf '%d' y` / `(( y ))` / `let y` reads that value as arithmetic and evaluates a subscript in it (zsh). Rounds 4-5 kept finding one more spelling (a flag, a prefix, the zero-colon form, a bracket
-// printed at run time, a here-string or heredoc), so the class is refused: a command is no read-only call when ANY of its words, its env values, its redirect targets or its own text (which holds a
-// here-string and a redirect word), or a heredoc body of the line, holds an assigning expansion whose default word is not plain path characters. The assignment is found loosely: `${`, then before the
-// closing `}` a name (optional subscript) and `=`, `:=` or `::=`, whatever sits between `${` and the name (a flag group may hold a `)`). Over-matching (`${x:-a=$(b)}`) fails closed.
-const ASSIGNING_LOOSE = [
-  /\$\{[^}]*?[A-Za-z_]\w*(?:\[[^\]]*\])?(?:::?)?=/g,
-  /\$\{\([^]{0,40}?\)[^}]*?[A-Za-z_]\w*(?:\[[^\]]*\])?(?:::?)?=/g, // (a flag group that holds a `}` or ends at a later `)`)
-];
-const PLAIN_DEFAULT = /^[A-Za-z0-9_./~+-]*\}/; // (the default word up to its closing brace: plain path characters only)
+// R4-F2 / R5 / R6 (#266): an expansion that ASSIGNS (`${y:=w}`, `${y::=w}`, `${y=w}`, `${1:=w}`, `${=y:=w}`) plants the text of w as the value of y; a later `printf '%d' y` / `(( y ))` /
+// `let y` reads that value as arithmetic and evaluates a subscript in it (zsh). Rounds 4-6 kept finding one more spelling (a flag, a prefix, the zero-colon form, a positional name, a flag group long or
+// decoyed enough to hide the name, a here-string or heredoc), so the class is refused: a command is no read-only call when ANY of its words, its env values, its redirect targets or its own text (which
+// holds a here-string and a redirect word), or a heredoc body of the line, holds
+//   (a) a `${(` flag group, a `$((` or a `$[`: each can run a substitution or evaluate a subscript with no assignment at all (the `(e)` flag, `$((path[\$(cmd)]))`), and a flag group may hold quotes,
+//       substitutions and a `}` that does not close the expansion, so nothing between its `${(` and its name can be trusted (R6-B1, R6-F3, R6-F5);
+//   (b) an `=` (so `=`, `:=`, `::=`) after a name char or a `]`, between the first `${` and the last `}` of the text, whose word is not plain path characters up to a closing brace (R6-F2: a
+//       positional name counts). One linear pass: the first head and the last `}` are found once and each `=` is judged where it stands, so no decoy `}` ends the region early and no head is
+//       rescanned (R6-F1: a hook past the host's 15 s is ALLOWED, and the two lazy patterns of round 5 backtracked quadratically: 16 s at 190 kB). Over-matching (`${x:-a=$(b)}`, `echo ${A} k=$(b)`) fails closed.
+const EVALUATING_WORD = /\$\{\(|\$\(\(|\$\[/;
+const PLAIN_DEFAULT = /[A-Za-z0-9_./~+-]*\}/y; // (the default word up to its closing brace: plain path characters only; sticky, so it is matched where the `=` ends and nowhere else)
 function plantsInText(text) {
-  if (typeof text !== 'string' || !text.includes('${')) return false;
-  return ASSIGNING_LOOSE.some((re) => { for (const m of text.matchAll(re)) if (!PLAIN_DEFAULT.test(text.slice(m.index + m[0].length))) return true; return false; });
+  if (typeof text !== 'string') return false;
+  if (EVALUATING_WORD.test(text)) return true;
+  if (!text.includes('${')) return false;
+  const end = text.lastIndexOf('}');
+  let at = text.indexOf('=', text.indexOf('${') + 2);
+  while (at !== -1 && at < end) {
+    let k = at - 1;
+    if (text[k] === ':') k--; // (`:=`)
+    if (text[k] === ':') k--; // (`::=`)
+    if (k >= 0 && (text[k] === ']' || /\w/.test(text[k]))) {
+      PLAIN_DEFAULT.lastIndex = at + 1;
+      if (!PLAIN_DEFAULT.test(text)) return true;
+    }
+    at = text.indexOf('=', at + 1);
+  }
+  return false;
 }
 function plantsSubscript(cmd, ctx) {
   const texts = [...cmd.argv, ...Object.values(cmd.env ?? {}), ...(cmd.redirects ?? []).map((r) => r.target), cmd.raw];
