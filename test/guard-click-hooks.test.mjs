@@ -877,6 +877,65 @@ test('R13-F1: a ]] followed by a word on a line with a [[ is refused when judged
   ]) assert.equal(bash(cmd, {}, '/home/u'), 'allow', cmd);
 });
 
+test('R14: the [[ / ]] and loop-name text checks judge the line as written: no heredoc, quote or comment reading can hide a line; each stays linear', () => {
+  const tail = 'cd .claude/plans; cp /tmp/payload ../settings.json';
+  const failures = [];
+  // R14 (owner decision 2026-11-12: judge the line as written; false refusals over bypasses): maskLines is gone
+  for (const cmd of [
+    // R14-B1: the $(...) of an unquoted heredoc body runs
+    'cat <<EOF\n$(if [[ 1 == <-> ]] ' + tail + ')\nEOF',
+    // R14-F2: a lone quote in a heredoc body (the heredoc line holds a [[, a (( or a delimiter that is not a plain word) hid the lines after it
+    "cat <<E; [[ -n a ]] && true\n'\nE\nif [[ 1 == <-> ]] " + tail,
+    "cat <<E; ((1))\n'\nE\nif [[ 1 == <-> ]] " + tail,
+    "cat <<'E+'\n'\nE+\nif [[ 1 == <-> ]] " + tail,
+    // R14-F3: a '#' inside ${...} / $((...)) is no comment; a '#' after a backtick is
+    ": ${x:- #} '\n' ; if [[ 1 == <-> ]] " + tail,
+    ": $((##x)) '\n' ; if [[ 1 == <-> ]] " + tail,
+    ": $(( #a )) '\n' ; if [[ 1 == <-> ]] " + tail,
+    "echo `# '\nif [[ 1 == <-> ]] " + tail,
+    // R14-F4: a delimiter with an escaped blank; an arithmetic << on a later line of a multi-line $(( ))
+    'cat <<E\\ F\nE F\nif [[ 1 == <-> ]] ' + tail + '\nE',
+    'cat <<"E F"\nE F\nif [[ 1 == <-> ]] ' + tail + '\nE',
+    'echo $((1\n<<E))\nif [[ 1 == <-> ]] ' + tail + '\nE',
+    // R14-F5: a backslash-newline after a double-quoted $( ) still joins the brackets
+    'v="$(date)"; if [\\\n[ 1 == <-> ]] ' + tail,
+    'v="$(date)"; if [[ 1 == <-> ]\\\n] ' + tail,
+    // (an escaped backslash before the newline does not join: the next line starts with [[)
+    'echo a \\\\\n[[ 1 == <-> ]] ' + tail,
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R14 lines were not refused');
+  // still allowed: a [[ after a quote, a wiki link in a heredoc (no blank after the [[)
+  for (const cmd of ['echo "[[ a ]] b"', "cat > /tmp/n.md <<'EOF'\nsee [[other-note]] here\nEOF", "cat > /tmp/n.md <<EOF\nsee [[other-note]] here\nEOF"]) assert.equal(bash(cmd, {}, '/home/u'), 'allow', cmd);
+  // (the LOOP check leaves out a heredoc body, unless an unquoted one runs commands; the ]] check reads every body)
+  for (const cmd of ["psql <<'SQL'\nselect 1;\nSQL", 'psql <<SQL\nselect 1;\nselect 2;\nSQL']) assert.equal(bash(cmd, {}, '/home/u'), 'allow', cmd);
+  const loop = 'for 1 in .claude/settings.local.json; do cp /tmp/payload $@; done';
+  const loopFailures = [];
+  for (const cmd of [
+    'cat <<EOF\n$(' + loop + ')\nEOF',
+    'cat <<EOF\n`' + loop + '`\nEOF',
+    'cat <<EOF\n<(' + loop + ')\nEOF',
+    "cat <<'EOF'\nbody\nEOF\n" + loop,
+    "cat <<'EOF'\nselect 1;\nEOF\n" + loop,
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') loopFailures.push(cmd);
+  assert.deepEqual(loopFailures, [], 'these loop lines were not refused');
+  // R14-F1: both text checks are linear. A quoted heredoc of 49,900 '<<a' lines, then a protected write; a 200 kB line of loop headers
+  const t0 = Date.now();
+  const many = "cat <<'E+'\n" + '<<a\n'.repeat(49_900) + 'E+\ncp /tmp/payload ~/.claude/settings.json';
+  assert.ok(many.length < 200_000);
+  assert.equal(bash(many, {}, '/home/u'), 'deny');
+  const t1 = Date.now();
+  bash('for a in b; '.repeat(16_000), {}, '/home/u');
+  const t2 = Date.now();
+  bash('do for '.repeat(28_000), {}, '/home/u');
+  const t3 = Date.now();
+  bash('[[ a ]] '.repeat(24_000), {}, '/home/u');
+  const t4 = Date.now();
+  assert.ok(t1 - t0 < 3000, 'heredoc lines took ' + (t1 - t0) + ' ms');
+  assert.ok(t2 - t1 < 3000, 'loop headers took ' + (t2 - t1) + ' ms');
+  assert.ok(t3 - t2 < 3000, 'do-for headers took ' + (t3 - t2) + ' ms');
+  assert.ok(t4 - t3 < 3000, 'closing brackets took ' + (t4 - t3) + ' ms');
+});
+
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------
 
 test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] argument no longer hide a fed interpreter', () => {

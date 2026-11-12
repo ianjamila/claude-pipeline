@@ -23,7 +23,7 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { simpleCommands, maskLines, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -1575,25 +1575,29 @@ function closeBracketNotLast(cmds) {
 }
 
 // (#269 R13-F1, owner decision 2026-11-12: TEXT-LEVEL refusals) Rounds 11-13 kept finding shapes the parser reads differently from zsh (R13-F1: the number pattern `<->` makes the parser take
-// `]]` for a redirect target, so no argv holds it), so the line is also judged AS WRITTEN. The text is masked (quotes, escapes; heredoc bodies left out; every line: maskLines); on a text with a
+// `]]` for a redirect target, so no argv holds it), so the line is also judged AS WRITTEN. (#269 R14, owner decision 2026-11-12) "As written" is the raw text with the backslash-newline pairs removed (asWritten) and nothing else:
+// no quote, comment or heredoc reading (every earlier reading of those differed from the shell's somewhere and hid a line), so a quoted or heredoc `[[ x ]] y` is refused too. A `[[` that follows a quote or has no
+// blank after it (`echo "[[ a ]]"`, a wiki link `[[note]]`) is no test. On a text with a
 // `[[` word, any `]]` must be followed (after blanks) by `&&` `||` `;` `|` `&` `)` `}` a newline, a comment (`#` after a blank) or the end of the text; `&>` is a redirect, so it is refused.
 // False refusals are accepted (`[[ -f a ]] 2>/dev/null`, `[[ -n ${a[b[1]]} ]]`); the parser-based closeBracketNotLast stays as well.
 const TEST_OPEN = /(?:^|[\s;&|({!])\[\[(?=\s)/;
+// (a backslash-newline is removed -- the shell joins the lines -- but a pair `\\` is skipped as a unit, so `\\` + newline stays two lines; one linear pass)
+const asWritten = (text) => text.replace(/\\(\r?\n|[\s\S])/g, (m, g1) => (g1.endsWith('\n') ? '' : m));
 function closeBracketFollowedByWord(text) {
-  const m = maskLines(text);
+  const m = asWritten(text);
   if (!TEST_OPEN.test(m)) return false;
   for (let at = m.indexOf(']]'); at >= 0; at = m.indexOf(']]', at + 1)) {
-    const rest = m.slice(at + 2);
-    const nx = rest.replace(/^[ \t]+/, '');
-    if (nx === '' || /^[\n;|)}]/.test(nx)) continue;
-    if (nx[0] === '&') { if (nx[1] === '>') return true; continue; }
-    if (nx[0] === '#' && nx.length < rest.length) continue;
+    let j = at + 2;
+    while (m[j] === ' ' || m[j] === '\t') j++; // (no slice of the rest: a text of many `]]` stays linear)
+    if (j >= m.length || '\n;|)}'.includes(m[j])) continue;
+    if (m[j] === '&') { if (m[j + 1] === '>') return true; continue; }
+    if (m[j] === '#' && j > at + 2) continue;
     return true;
   }
   return false;
 }
 // (#269 R13-F2) A loop name that is a positional parameter (`for 1 in LIST` binds $1, which `$@`, `$*` and `$argv` hold too), `argv`, or a subscripted / odd word cannot be followed by the guard (the
-// writer rule finds names with \w+): refuse any loop header whose name is not a plain identifier. The text pass reads the masked line (the keyword, then its names up to `in`, `(`, `;` or a newline);
+// writer rule finds names with \w+): refuse any loop header whose name is not a plain identifier. The text pass reads the line as written (asWritten: the keyword, then its names up to `in`, `(`, `;` or a newline);
 // the parser pass reads the header's argv. A C-style `for ((…))` names nothing.
 const PLAIN_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const badLoopName = (n) => !PLAIN_NAME.test(n) || n === 'argv' || n === 'ARGV';
@@ -1601,10 +1605,29 @@ const badLoopName = (n) => !PLAIN_NAME.test(n) || n === 'argv' || n === 'ARGV';
 // precommand word (do then else elif if while until time nocorrect noglob coproc exec builtin command `-`, zsh `repeat N`). Generous on purpose; a `select` that is an ARGUMENT -- `man select 2`, the SQL
 // `select 1::int -- a note` of a psql input read as shell text -- is no loop.)
 const LOOP_HEAD_TEXT = /(?:^|[;&|(){}!`\n]|(?:^|[\s;&|(){}!`])(?:do|then|else|elif|if|while|until|time|nocorrect|noglob|coproc|exec|builtin|command|-|repeat[ \t]+\S+))[ \t]*(?:for|foreach|select)(?=[ \t])/g;
-function loopNameRefusedText(text) {
-  const m = maskLines(text);
+const LOOP_HEADER_WINDOW = /[^;\n]{0,2000}/y; // (the header: up to the next `;` / newline, at most 2000 characters, found without slicing the rest of the text)
+// (#269 R14, owner decision 2026-11-12) The text the LOOP check reads: as written, except that a here-document body is data (a psql input `select 1;` is no loop). The parser's body spans (heredocSpans) say
+// where each body is: a body whose delimiter was quoted is left out; an unquoted one too, unless it holds `$(`, a backtick or `<(` / `>(` (the only places the shell runs commands in it), which keeps it whole.
+// Any doubt (no spans, a span that overlaps, runs past the text or does not start a line) keeps the whole text. One linear pass; the `]]` check does not use this and reads every body.
+function loopCheckText(text, cmds) {
+  if (!/<</.test(text)) return asWritten(text);
+  const spans = cmds?.heredocSpans;
+  if (!Array.isArray(spans)) return asWritten(text);
+  let out = '';
+  let at = 0;
+  for (const [a, b, quoted] of [...spans].sort((x, y) => x[0] - y[0])) {
+    if (!(a >= at && b >= a && b <= text.length && (a === 0 || text[a - 1] === '\n'))) return asWritten(text);
+    if (!quoted && /\$\(|`|[<>]\(/.test(asWritten(text.slice(a, b)))) continue; // (kept: the body runs commands)
+    out += text.slice(at, a);
+    at = b;
+  }
+  return asWritten(out + text.slice(at));
+}
+function loopNameRefusedText(text, cmds) {
+  const m = loopCheckText(text, cmds);
   for (const h of m.matchAll(LOOP_HEAD_TEXT)) {
-    const head = m.slice(h.index + h[0].length, h.index + h[0].length + 2000).split(/[;\n]/, 1)[0].trim(); // (a window: a line of headers stays linear)
+    LOOP_HEADER_WINDOW.lastIndex = h.index + h[0].length;
+    const head = LOOP_HEADER_WINDOW.exec(m)[0].trim();
     if (head.startsWith('((')) continue;
     const words = head.split(/\s+/).filter(Boolean);
     for (let i = 0; i < words.length; i++) {
@@ -3526,7 +3549,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (closeBracketNotLast(cmds)) return deny('a command follows a closing ]] on the same piece (zsh\'s short `if [[ … ]] cmd` form), or ]] is an argument next to a [[: the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`');
   // (#269 R13-F1, R13-F2; owner decision 2026-11-12: text-level refusals, on top of the parser-based checks)
   if (closeBracketFollowedByWord(raw)) return deny('a word follows a closing ]] on a line with a [[ (zsh\'s short `if [[ … ]] cmd` form, `<->` number patterns, a redirect): the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`');
-  if (loopNameRefused(cmds) || loopNameRefusedText(raw)) return deny('a loop variable that is a positional parameter, argv, or a subscripted name cannot be followed by the guard; use a plain name');
+  if (loopNameRefused(cmds) || loopNameRefusedText(raw, cmds)) return deny('a loop variable that is a positional parameter, argv, or a subscripted name cannot be followed by the guard; use a plain name');
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
   const proseValues = [...prose.values()].flatMap((p) => p.values);
