@@ -1492,7 +1492,9 @@ function cdUnknownShape(argv) {
 // R12: a word is provably literal when nothing in it is settled at run time. R13: a POSITIVE shape (letters, digits and `_ . , : / = @ % + -`), not a list of bad characters: zsh's `^ # ~ < > !`
 // (extendedglob, redirections, history) and whatever else a shell may read as more than the characters themselves make a word non-literal
 const literalWord = (w) => /^[A-Za-z0-9_.,:\/=@%+-]+$/.test(w);
-const literalCommand = (w) => w === '[' || literalWord(w); // (the test builtin `[` is a name, not a glob)
+// R14-F3: a command word may also be `~/` + the literal shape (a path under HOME; never `~x` / `~+` / `~-`), and a literal-shape word with spaces that holds a `/` (a dequoted path such as `/Applications/Some App.app/.../tool`): neither can be a builtin or a modifier
+const spacedPath = (w) => w.includes('/') && /^[A-Za-z0-9_.,:\/=@%+ -]+$/.test(w);
+const literalCommand = (w) => w === '[' || literalWord(w) || spacedPath(w) || (w.startsWith('~/') && (literalWord(w.slice(2)) || spacedPath(w.slice(2)))); // (the test builtin `[` is a name, not a glob)
 // R11-F2: `set` is safe (no effect on what `cd` means) only as a WHITELIST: every flag word is literal letters from SAFE_SET_FLAGS, or `-o` / `+o` (also `-eo NAME`, `-oNAME`) with a name in SAFE_SET_OPTIONS,
 // up to the first word that is not a flag (the positional parameters) or `--`. R12-B2: that word must be literal (`set "$F"`, `set $(echo -T)`, `set *` may be `set -T`); a word after a literal `--` is positional whatever it is. Anything else -- zsh's `-T` (CDABLE_VARS), other letters, `-$F` (letters only known at run time), a bare `-o`, an unknown name -- is a switch.
 const SAFE_SET_OPTIONS = new Set(['errexit', 'nounset', 'pipefail', 'xtrace', 'verbose', 'noclobber']);
@@ -1539,7 +1541,35 @@ function optionSwitch(c) {
 // R12-F3 / R13-B1: a command word only known at run time (`S=shopt; $S -s cdable_vars`, or the whole command in one word, `S="shopt -s cdable_vars"; $S`), or behind a wrapper, is one too, whatever the argument count.
 // The one run-time command word that is no switch: a whole command that is a single double-quoted word of plain parameter references and literal text (`"$HERE/build.sh"`), with no argument.
 // Inside double quotes the value is not split or globbed (no `$S` that holds `shopt -s cdable_vars`; `"${=S}"`, `"${(z)S}"`, `"$@"` and `"$(..)"` do not match), and a program run without arguments cannot set an option.
-const loneQuotedRef = (c) => c.argv.length === 1 && /^"(?:[^"$`\\]|\$[A-Za-z_]\w*|\$\{[A-Za-z_]\w*\})*"$/.test((c.raw ?? '').trim());
+// R14-B1: a linear scanner (the regex it replaces backtracked exponentially on `"` + `$aa` x40 + `\x"`). R14-F1: a `[` right after a reference (`"$argv[@]"`, `"$X[*]"`, `"${X}[1]"`) is a zsh subscript,
+// which splits into one word per element: not accepted, whatever follows.
+function quotedRefOnly(raw) {
+  const n = raw.length;
+  if (n < 2 || raw[0] !== '"' || raw[n - 1] !== '"') return false;
+  const isNameStart = (ch) => (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch === '_';
+  const isName = (ch) => isNameStart(ch) || (ch >= '0' && ch <= '9');
+  let i = 1;
+  while (i < n - 1) {
+    const ch = raw[i];
+    if (ch === '"' || ch === '`' || ch === '\\') return false;
+    if (ch !== '$') { i++; continue; }
+    i++;
+    if (raw[i] === '{') {
+      if (!isNameStart(raw[i + 1] ?? '')) return false;
+      i += 2;
+      while (i < n - 1 && isName(raw[i])) i++;
+      if (raw[i] !== '}') return false;
+      i++;
+    } else {
+      if (i >= n - 1 || !isNameStart(raw[i])) return false;
+      i++;
+      while (i < n - 1 && isName(raw[i])) i++;
+    }
+    if (raw[i] === '[') return false;
+  }
+  return i === n - 1; // (the closing quote is the last character: nothing was skipped past it)
+}
+const loneQuotedRef = (c) => c.argv.length === 1 && quotedRefOnly((c.raw ?? '').trim());
 function cdMeaningSwitch(c) {
   const { argv, blind } = unwrapBuiltin(c.argv);
   if (blind || (argv.length > 0 && !literalCommand(argv[0]) && !loneQuotedRef(c))) return true; // (no command word at all, `A=1`, is no switch)
@@ -3746,7 +3776,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
   ctx.pickUnknown = new Set(opts._unknown ?? []); // (a name the line gave a run-time value: only a script it picks is refused; the writer rule is for the names above)
-  ctx.lineCdSwitch = cmds.some(cdMeaningSwitch); // (R13: whether the line itself may turn cdablevars on; computed before any source is evaluated and handed to sourcedEffects)
+  ctx.lineCdSwitch = opts._lineCdSwitch === true || cmds.some(cdMeaningSwitch); // (R14-F2: also a switch the line that sourced this text had; R13: whether the line itself may turn cdablevars on; computed before any source is evaluated and handed to sourcedEffects)
   ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
   ctx.unknownAll = opts._unknownAll === true || ctx.arith.dynamic; // (an arithmetic that assigns through a name may set any name, also one the line never gave. Defence in depth for the names the line gave: collectVars marks every one when arith.dynamic)
   ctx.srcChanged = new Set(opts._srcChanged ?? []); // names an unfollowable sourced file may have changed (a write target that uses one is refused)
@@ -3825,7 +3855,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const homeMoved = ctx.unknownAll || ctx.homeSourced === true || moved('HOME') || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[|$)/.test(a)));
     // Why: with CDPATH set a relative `cd sub` goes to the first CDPATH entry that has `sub` (the line's, the environment's, one a source may have set)
     const cdpathSet = (startupEnv.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (Object.hasOwn(ctx.vars, n) && ctx.vars[n] !== '') || moved(n) || cmds.some((c) => (c.env?.[n] ?? '') !== '' || c.argv.some((a) => a.startsWith(`${n}[`))));
-    const cdSwitched = cmds.some(cdMeaningSwitch); // (R10-F4: cdablevars may be on, so `cd NAME` can go to $NAME. A source that turned it on made the whole cwd unknown above, R12-F4)
+    const cdSwitched = ctx.lineCdSwitch === true || cmds.some(cdMeaningSwitch); // (R14-F2: lineCdSwitch also holds the switch of the line that sourced this text; R10-F4: cdablevars may be on, so `cd NAME` can go to $NAME. A source that turned it on made the whole cwd unknown above, R12-F4)
     if (ctx.sourcedCdSwitch === true) return true; // (R12-F4: a source turned cdablevars on, and a cd it ran may have moved the shell anywhere: the line's own writes are relative to an unknown directory)
     return cmds.some((c, ci) => {
       const cn = baseOf(c.argv[0] ?? '');
@@ -3843,7 +3873,8 @@ function evaluateBashForFilesFrame(command, opts) {
       return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
     });
   };
-  const withLineVars = (o, c = null) => ({ ...o, _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
+  // R14-F2: `sameShell`: the text runs in THIS shell (source / . / eval), so a switch of the line (before or after the source) or of an earlier source decides what its own `cd NAME` means too
+  const withLineVars = (o, c = null, sameShell = false) => ({ ...o, _lineCdSwitch: sameShell && (ctx.lineCdSwitch === true || ctx.sourcedCdSwitch === true), _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -3965,7 +3996,7 @@ function evaluateBashForFilesFrame(command, opts) {
         const sfj = sf;
         let v;
         try {
-          v = judgeScriptFile(sfj, sdirsNow(), ctx, { ...withLineVars(opts, c) }, scanRaw);
+          v = judgeScriptFile(sfj, sdirsNow(), ctx, { ...withLineVars(opts, c, sf.kind === 'shell' && ['source', '.', 'eval'].includes(baseOf(c.argv[0] ?? ''))) }, scanRaw);
         } finally {
           ctx.execCmd = outer;
         }
@@ -3980,7 +4011,7 @@ function evaluateBashForFilesFrame(command, opts) {
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
       for (const fd of scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx))) {
         withPath(fd);
-        const v = judgeScriptFile(fd, sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
+        const v = judgeScriptFile(fd, sdirsNow(), ctx, withLineVars(opts, c, baseOf(c.argv[0] ?? '') === 'eval'), scanRaw);
         if (v) return v;
       }
       // #81 t9: and a bare name a package runner started is the bin node_modules/.bin/NAME

@@ -75,10 +75,12 @@ describe('R14-F2: the line\'s own switch reaches the frame that judges a sourced
     ['setopt cdablevars; . /home/u/proj/a.sh (absolute)', 'setopt cdablevars; export proj=/home/u; . /home/u/proj/a.sh', stub({ '/home/u/proj/a.sh': body })],
     ['a nested source (a.sh sources b.sh, which holds the cd and the find)', 'set -T; export proj=/home/u; source ./a.sh', stub({ '/home/u/proj/a.sh': 'source /home/u/proj/b.sh\n', '/home/u/proj/b.sh': body })],
     ['the switch after the source in the text', 'export proj=/home/u; source ./a.sh; setopt cdablevars', stub({ '/home/u/proj/a.sh': body })],
-    ['eval of a file text is not needed: source with a leading wrapper', 'set -T; export proj=/home/u; builtin source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
+    ['eval of the file text (same shell)', 'set -T; export proj=/home/u; eval "$(cat ./a.sh)"', stub({ '/home/u/proj/a.sh': body })],
+    ['builtin source', 'set -T; export proj=/home/u; builtin source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
   ]);
   allows('F2', [
     ['no switch: the same file is judged against the literal cd', 'export proj=/home/u; source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
+    ['a separate shell (bash FILE) does not inherit the line\'s switch', 'set -T; export proj=/home/u; bash ./a.sh', stub({ '/home/u/proj/a.sh': body })],
     ['a switch, but the file only holds a harmless command', 'set -T; source ./a.sh', stub({ '/home/u/proj/a.sh': 'echo hi\n' })],
   ]);
 });
