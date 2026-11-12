@@ -11,6 +11,7 @@ import { cleanupAtExit, ownerApprovesPast, ownerGrants, pastRoundRequest, roundR
 import { addRound, decodeFromComment, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { triageComment } from '../pipeline/lib/render.mjs';
 import { roundOutcome } from '../pipeline/lib/triage.mjs';
+import { readBaseline, reviewContentHash, writeBaseline } from '../pipeline/lib/review-publish.mjs';
 import { pastRoundsNeedingApproval, verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
 import { claimGrantMarkers, grantIdOf, markerPath, ownerGoDir, presentedPastRoundRequest } from '../pipeline/hooks/lib/owner-go.mjs';
 
@@ -257,4 +258,68 @@ test('past-round-grant: re-approval of a round whose published grant no longer v
   assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(w.published().rounds.find((x) => x.n === 3).ownerGrant.grantId, grantIdOf(rec));
   assert.equal(w.state().rounds.find((x) => x.n === 3).ownerGrant.grantId, grantIdOf(rec));
+});
+
+test('past-round-grant: a stale baseline while this copy equals the PR is refreshed before the claim, so the approval publishes', (t) => {
+  const w = world(t);
+  writeBaseline(w.repo.dir, 7, 'e'.repeat(64)); // e.g. a crash between the PR upsert and the baseline write of an earlier publication
+  const rec = w.approve(3);
+  const r = w.grant(3);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.saved, r.json.published], [true, true]);
+  assert.equal(w.published().rounds.find((x) => x.n === 3).ownerGrant.grantId, grantIdOf(rec));
+  assert.equal(readBaseline(w.repo.dir, 7), reviewContentHash(w.published()), 'the baseline follows the publication');
+});
+
+test('past-round-grant: re-approval whose publication fails does not offer `pipeline comment` (it cannot publish a replacement); a first approval still does', (t) => {
+  const gone = { grantId: 'd'.repeat(16), k: 3, quote: 'approve round', ownerTs: '2026-10-01T00:00:00.000Z', past: true };
+  const w = world(t, { spec: SPEC.map((r) => (r.n === 3 ? { ...r, ownerGrant: gone, admission: 'owner' } : r)) });
+  w.approve(3);
+  w.fake.setFail({ write: true });
+  const r = w.grant(3);
+  assertExit(r, 3, r.stderr + r.stdout);
+  assert.match(r.json.next, /past-round-grant --pr 7 --round 3/);
+  assert.doesNotMatch(r.json.next, /pipeline comment/);
+  const first = world(t);
+  first.approve(3);
+  first.fake.setFail({ write: true });
+  const f = first.grant(3);
+  assertExit(f, 3, f.stderr + f.stdout);
+  assert.match(f.json.next, /pipeline comment --pr 7 --kind triage/);
+});
+
+test('state show: a local-only owner grant that does not verify is dropped (the PR is the history), so past-round-grant is not refused forever', (t) => {
+  const bogus = { grantId: 'c'.repeat(16), k: 3, quote: 'approve round', ownerTs: '2026-11-01T00:00:00.000Z', past: true };
+  const w = world(t, { localSpec: SPEC.map((r) => (r.n === 3 ? { ...r, ownerGrant: bogus, admission: 'owner' } : r)) });
+  const rec = w.approve(5);
+  const refused = w.grant(5);
+  assert.equal(refused.json.error, 'unverified-grant');
+  assert.match(refused.json.message, /state show/);
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stderr + show.stdout);
+  assert.deepEqual([show.json.grantsDropped, show.json.source, show.json.quarantinedTo], [[3], 'local', undefined]);
+  const round3 = w.state().rounds.find((x) => x.n === 3);
+  assert.deepEqual([round3.ownerGrant, round3.admission], [undefined, undefined], 'back to what the PR holds');
+  const r = w.grant(5);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.published, r.json.claimed], [true, [grantIdOf(rec)]]);
+});
+
+test('state show: another checkout published only a grant; this copy keeps its unpublished mark and trailing round, adopts the grant, is not quarantined', (t) => {
+  const item = { id: 'R1-B1', round: 1, bucket: 'BLOCKING', category: 'bug', title: 'x', file: 'src/a.js', line: 1, detail: 'd', fingerprint: 'f'.repeat(40), final: { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'r' } };
+  const withItem = (spec, extra = {}) => spec.map((r) => (r.n === 1 ? { ...r, items: [{ ...item, ...extra }] } : r));
+  const w = world(t, { spec: withItem(SPEC), localSpec: [...withItem(SPEC, { implemented: true }), { n: 7 }] });
+  writeBaseline(w.repo.dir, 7, reviewContentHash(build(w.slug, withItem(SPEC)))); // this copy last saw the PR before the other checkout published
+  const grant = { grantId: 'a'.repeat(16), k: 3, quote: 'approve round', ownerTs: '2026-11-01T00:00:00.000Z', past: true };
+  const theirs = build(w.slug, withItem(SPEC.map((r) => (r.n === 3 ? { ...r, ownerGrant: grant, admission: 'owner' } : r))));
+  w.fake.addComment({ body: triageComment(theirs) });
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stderr + show.stdout);
+  assert.equal(show.json.quarantinedTo, undefined, JSON.stringify(show.json));
+  assert.deepEqual([show.json.source, show.json.grantsRestored], ['local-ahead', [3]]);
+  const local = w.state();
+  assert.equal(local.rounds[0].items[0].implemented, true, 'the unpublished mark is kept');
+  assert.ok(local.rounds.some((r) => r.n === 7), 'so is the trailing round');
+  assert.deepEqual(local.rounds.find((r) => r.n === 3).ownerGrant, grant);
+  assert.equal(readBaseline(w.repo.dir, 7), reviewContentHash(theirs), 'this copy has now seen everything the PR holds');
 });
