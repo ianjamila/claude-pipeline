@@ -91,7 +91,12 @@ const run = (t, repo, args, env = {}) => {
   const r = spawnSync(process.execPath, [BIN, ...args], { cwd: repo.dir, env: { ...t.env, ...env }, encoding: 'utf8' });
   return { code: r.status, signal: r.signal, stdout: r.stdout, stderr: r.stderr };
 };
-async function until(cond, what, ms = 15_000) {
+// How long a wait may cover a CLI start. On Windows a start can take many seconds (the Claude-ancestor walk starts PowerShell per hop, once per command), so
+// every wait that covers a spawned CLI's lease gets a long budget there; the held command's lock wait stays well above it so it does not give up first.
+const WIN = process.platform === 'win32';
+const CLI_START_MS = WIN ? 60_000 : 15_000;
+const LOCK_WAIT_MS = WIN ? '90000' : '30000';
+async function until(cond, what, ms = CLI_START_MS) {
   const end = Date.now() + ms;
   while (!cond()) {
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
@@ -102,7 +107,7 @@ async function until(cond, what, ms = 15_000) {
 async function holdOpen(tc, t, repo, args = ['state', 'set-outcome', '--outcome', 'needs-human']) {
   const lock = tryAcquire(reviewLockName(repo.dir, PR), { dir: LOCK_DIR, machineId: MACHINE });
   assert.equal(lock.acquired, true);
-  const cmd = start(tc, t, repo, args, { PIPELINE_LOCK_WAIT_MS: '30000' });
+  const cmd = start(tc, t, repo, args, { PIPELINE_LOCK_WAIT_MS: LOCK_WAIT_MS });
   await until(() => procFiles(t).length === 1, 'the lease of the waiting command');
   return { cmd, unlock: () => release(lock.lock) };
 }
@@ -163,6 +168,41 @@ test('settleReviewLease closes a process lease after a throw (no result at all)'
   await settleReviewLease('state', undefined, lease.held, ctx);
   assert.deepEqual(files(t), [], 'closed with result === undefined');
   await settleReviewLease('state', undefined, lease.held, ctx); // a second settle is a no-op, never a throw
+});
+
+// The Claude-ancestor walk is slow where `ps` is PowerShell (Windows: one process per hop), so a leased command walks ONCE and the take, the exit / signal close,
+// the settle and `job start`'s hand-off (ctx.leaseAncestorPid) all reuse that answer. The walk's own seam (ancestry.lookup) counts the walks.
+test('a plain terminal command walks the process tree once across hold and settle (and job start reuses it)', async () => {
+  const t = terminal();
+  const repo = reviewRepo();
+  const looked = [];
+  const ancestry = { startPid: 4242, platform: 'linux', lookup: (pid) => { looked.push(pid); return null; } }; // no parent found: a plain terminal
+  const leaseOpts = { ancestry, processHolder: { sessionId: 'proc-4242-0a0b0c0d', pid: process.pid, pidStart: null }, machineId: MACHINE };
+  const ctx = { env: { ...t.env }, cwd: repo.dir, leaseOpts };
+  const lease = await holdReviewLease('state', ['show'], ctx);
+  assert.ok(lease.held, JSON.stringify(lease));
+  assert.deepEqual(files(t), ['proc-4242-0a0b0c0d.json']);
+  await settleReviewLease('state', { exitCode: 0, output: {} }, lease.held, ctx);
+  assert.deepEqual(files(t), [], 'closed');
+  assert.deepEqual(looked, [4242], 'one lookup = one walk (before the fix: the early check, the take and the close each walked)');
+  assert.equal(ctx.leaseAncestorPid(), null, 'the answer job start gets is the walk already made');
+  assert.deepEqual(looked, [4242], 'asking again does not walk again');
+});
+
+test('an injected ancestorPid wins over the walk: no lookup runs, and a function is asked as before', async () => {
+  const t = terminal();
+  const repo = reviewRepo();
+  let looked = 0;
+  let asked = 0;
+  const ancestry = { startPid: 4242, platform: 'linux', lookup: () => { looked++; return null; } };
+  const leaseOpts = { ancestry, ancestorPid: () => { asked++; return null; }, processHolder: { sessionId: 'proc-4242-0a0b0c0d', pid: process.pid, pidStart: null }, machineId: MACHINE };
+  const ctx = { env: { ...t.env }, cwd: repo.dir, leaseOpts };
+  const lease = await holdReviewLease('state', ['show'], ctx);
+  assert.ok(lease.held, JSON.stringify(lease));
+  await settleReviewLease('state', { exitCode: 0, output: {} }, lease.held, ctx);
+  assert.equal(looked, 0, 'the injected answer replaces the walk');
+  assert.ok(asked >= 1);
+  assert.equal(ctx.leaseAncestorPid, undefined, 'nothing memoised over an injected answer');
 });
 
 test('process.exit inside the command still closes the lease (the exit handler), and the handlers are gone after a normal settle', async () => {
@@ -240,7 +280,7 @@ function spawnFixture(tc, t, repo, script, mode, extraArgs = []) {
   return {
     child, done,
     ready: () => until(() => stdout.includes('ready') || /\S/.test(stderr), 'the fixture to hold its lease'),
-    saw: (text, what) => until(() => stdout.includes(text) || /\S/.test(stderr), what, 10_000).then(() => assert.ok(stdout.includes(text), `${what}: ${stdout} ${stderr}`)),
+    saw: (text, what) => until(() => stdout.includes(text) || /\S/.test(stderr), what, WIN ? CLI_START_MS : 10_000).then(() => assert.ok(stdout.includes(text), `${what}: ${stdout} ${stderr}`)),
   };
 }
 

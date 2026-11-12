@@ -40,6 +40,7 @@
 import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { isInstalledCopy, seamValue } from './seams.mjs';
+import { claudeCodeAncestorPid } from './claude-ancestry.mjs';
 
 export const LEASED_COMMANDS = new Set([
   'agent-log', 'arbiter', 'checkpoint', 'ci-wait', 'codex-review', 'comment', 'cost', 'final-gate', 'followups', 'job', 'merge', 'merge-hold',
@@ -90,6 +91,22 @@ function failureOf(err) {
   return { exitCode: EXIT.USAGE, output: { ok: false, error: code, message } };
 }
 
+// ONE walk of the process tree per command. Finding the Claude Code ancestor costs one `ps` per hop (on Windows one PowerShell per hop, seconds each), and the
+// library asks for it at every step of a command: the early plain-terminal check, the take, the exit / signal close, the settle (and `job start`'s hand-off).
+// So the wiring answers it once, lazily, and every step reuses that answer through `ancestorPid` (null, "no Claude ancestor", is an answer too). An
+// `ancestorPid` the caller injected (the tests' seam) is left alone. The memo is published as `ctx.leaseAncestorPid` for the command's own run().
+function withSharedAncestor(leaseOpts, ctx) {
+  if (leaseOpts.ancestorPid !== undefined) return leaseOpts;
+  let done = false;
+  let answer = null;
+  const ancestorPid = () => {
+    if (!done) { answer = claudeCodeAncestorPid(leaseOpts.ancestry ?? {}); done = true; }
+    return answer;
+  };
+  ctx.leaseAncestorPid = ancestorPid;
+  return { ...leaseOpts, ancestorPid };
+}
+
 // Take (open or renew) the lease for `name`. -> { held: null | { worktree, generation, action } } or { failure: { exitCode, output } }.
 export async function holdReviewLease(name, argv, ctx = {}) {
   if (!isLeasedCommand(name)) return { held: null };
@@ -120,7 +137,7 @@ export async function holdReviewLease(name, argv, ctx = {}) {
     }
     const rawWait = seamValue(ADMISSION_WAIT_ENV, env);
     const waitMs = rawWait === undefined ? NaN : Number(rawWait);
-    const leaseOpts = ctx.leaseOpts ?? {}; // in-process seams of the tests (an injected holder, ps ...); never from the environment
+    const leaseOpts = withSharedAncestor(ctx.leaseOpts ?? {}, ctx); // in-process seams of the tests (an injected holder, ps ...); never from the environment
     // A plain terminal's exit / signal close is registered BEFORE the file is written (a signal between the write and a later registration would leave the file
     // behind). The generation is not known yet: until it is, the close takes this process's lease whatever its generation (the file is this process's own).
     const held = { worktree: root, generation: undefined, action: undefined, sessionId: undefined, process: false, leaseOpts, undo: () => {} };
