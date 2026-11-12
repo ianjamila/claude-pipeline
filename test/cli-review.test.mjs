@@ -23,7 +23,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { SHARED_FLOOR_DIR, floorEnv, scratchFloorDir } from './helpers/floor-env.mjs';
 import { resetFloor } from '../pipeline/lib/model-floor.mjs';
 import { leasesDir } from '../pipeline/lib/review-lease.mjs';
-import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { cleanupAtExit, ownerApprovesPast, ownerGrants, ownerRules, pastRoundRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
 import { reviewCheck } from '../pipeline/lib/finalgate.mjs';
@@ -4083,6 +4083,22 @@ test('codex-review owner grant: no grant is the same round-cap as before, and th
   assert.equal(capped.json.error, 'round-cap');
   assert.match(capped.json.message, /review\.max_rounds \(1\) and its one extra round, or an owner-granted round/);
   assert.equal(w.captured().length, calls, 'Codex never ran');
+});
+
+test('codex-review owner grant: a recorded owner approval of a PAST round admits nothing: the refusal is the plain round-cap and Codex never runs', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  const record = ownerApprovesPast(t, 'approve past round', pastRoundRequest(7, 3, h2, w.slug));
+  assert.ok(record, 'the hook recorded the past-round approval');
+  assert.equal(record.kind, 'past-round');
+  t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+  const calls = w.captured().length;
+  const capped = codexThree(w, h1, h2);
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+  assert.match(capped.json.message, /review\.max_rounds \(1\) and its one extra round, or an owner-granted round/);
+  assert.doesNotMatch(capped.json.message, /is recorded for this PR/, 'not even named as a grant that cannot be confirmed');
+  assert.equal(w.captured().length, calls, 'Codex never ran');
+  assert.equal(existsSync(markerPath(grantIdOf(record))), false, 'no marker was claimed');
 });
 
 test('codex-review owner grant: an "extra round" whose prompt is synthetic or missing from the transcript admits nothing, and the refusal says it cannot be confirmed as typed by the owner (#128)', (t) => {
