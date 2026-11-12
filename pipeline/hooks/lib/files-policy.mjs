@@ -914,6 +914,19 @@ const REL_PREFIX = '(?<![\\w$.~/\\\\-])(?:[\\w.\\-]+/+)*';
 
 // (cp #256 R6-F1: the ~/.codex folder itself behind a prefix only known at run time, `cp -R /tmp/forged/. "$(echo ~)/.codex"`; a relative one is judged by the resolved-path checks)
 const CODEX_DIR = '\\.codex/*(?![\\w.\\-/])|';
+// (cp #256 R6-F1 hardening: the same path spelled with `.`, `//` or `x/..` segments, `$H/./.codex`, `$H/.codex/.`, `$H/.codex/x/..`: collapsed here, so the matchers do not list spellings)
+const DOT_SEGMENTS = [[/\/{2,}/g, "/"], [/\/\.(?=\/)/g, ""], [/\/\.(?=$|[\s'"`;|&)])/g, ""], [/\/(?!\.\.?(?:\/|$))[^/\s'"`;|&()]+\/\.\.(?=\/|$|[\s'"`;|&)])/g, ""]];
+function collapseDots(text) {
+  let cur = text;
+  for (let k = 0; k < 20; k++) {
+    let next = cur;
+    for (const [re, to] of DOT_SEGMENTS) next = next.replace(re, to);
+    if (next === cur) break;
+    cur = next;
+  }
+  return cur;
+}
+const sensitive = (text) => SENSITIVE_WORDS.test(text) || SENSITIVE_WORDS.test(collapseDots(text));
 function suffixRegexes(ci) {
   const flags = ci ? 'i' : '';
   return {
@@ -1170,6 +1183,8 @@ function makeMatchers(ctx) {
       const lv = ctx.ci ? v.toLowerCase() : v;
       if (!lv.includes('.claude') && !lv.includes('.codex')) continue;
       if (suffix.nonlit.test(v)) return true;
+      const cv = collapseDots(v);
+      if (cv !== v && suffix.nonlit.test(cv)) return true;
       if (dirs) {
         suffix.rel.lastIndex = 0;
         for (const mm of v.matchAll(suffix.rel)) for (const d of dirs) if (ctx.hit(pathsFor().join(d, mm[0]))) return true;
@@ -1209,7 +1224,7 @@ function makeMatchers(ctx) {
       const rs = hitReadings(part); // (#81 t8b: the words an operator or array assignment gives, see rawHit)
       if (rs.over) return true;
       // Why: a target built by a command substitution (`"$(echo ~/.claude)"/settings.json`) is only known at run time: when its own text names a protected thing it is refused
-      if (/\$\(|`/.test(part) && SENSITIVE_WORDS.test(part)) return true;
+      if (/\$\(|`/.test(part) && sensitive(part)) return true;
       for (const reading of rs) {
         const e = expandRefs(reading, ctx);
         const bases = isAbs(e) ? [''] : dirs;
