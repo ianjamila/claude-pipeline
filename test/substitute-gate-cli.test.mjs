@@ -37,7 +37,7 @@ function stateOf(hash, rounds, { risk = 'low' } = {}) {
 const subRound = (agent = 'substitute-opus', risk = 'low', over = {}) => ({ firstReviewer: 'substitute', substitute: sub(agent), risk, ...over });
 const FABLE = { fableRequired: true, fableReasons: ['test'], modelProof: { transcript: '/t/f.jsonl', models: { 'claude-fable-5-2': 2 }, effort: 'high' } };
 const proven = (over = {}) => ({ ...FABLE, arbiter: { proofOk: true, scope: 'whole-pr' }, ...over });
-const secondReview = () => ({ id: 'R1-B1', bucket: 'BLOCKING', category: 'bug', title: 't', fingerprint: 'fp', secondReview: { by: 'substitute-opus', decision: 'REJECT', evidence: 'quota', models: ['claude-opus-4-8'] }, judge: { decision: 'REJECT' }, final: { decision: 'REJECT', by: 'judge', needsHuman: false } });
+const secondReview = () => ({ id: 'R1-B1', bucket: 'BLOCKING', category: 'bug', title: 't', fingerprint: 'fp', secondReview: { by: 'substitute-opus', decision: 'REJECT', evidence: 'quota', models: ['claude-opus-4-8'], proof: { transcript: '/t/2nd.jsonl', models: { 'claude-opus-4-8': 3 }, effort: 'high' } }, judge: { decision: 'REJECT' }, final: { decision: 'REJECT', by: 'judge', needsHuman: false } });
 
 // ---- P review-complete ------------------------------------------------------------------------------------------------------------------
 
@@ -87,6 +87,33 @@ test('review-complete: an unproven substitute round (no transcript / a transcrip
   assertExit(c, 1, `${c.stderr}${c.stdout}`);
   assert.equal(c.json.error, 'substitute-unproven');
   assert.match(c.json.reason, /not a Fable/);
+});
+
+// A Codex first review whose finding a substitute (not Codex) gave the second review of: the second review carries the same proof a round does.
+const secondReviewed = (proofOver = {}, by = 'substitute-opus') => ({
+  id: 'R1-B1', bucket: 'BLOCKING', category: 'bug', title: 't', fingerprint: 'fp', judge: { decision: 'REJECT' }, final: { decision: 'REJECT', by: 'judge', needsHuman: false },
+  secondReview: { by, decision: 'REJECT', evidence: 'quota', models: { [MODELS[by]]: 3 }, proof: { transcript: '/t/2nd.jsonl', models: { [MODELS[by]]: 3 }, effort: 'high', ...proofOver } },
+});
+
+test('review-complete: an unproven substitute SECOND review is refused substitute-unproven (nothing is posted); a proven one posts the marker', () => {
+  const noTranscript = completeWorld((h) => stateOf(h, [[1, { codexModel: 'gpt-x', risk: 'low', items: [secondReviewed({ transcript: '' })] }]]));
+  const a = noTranscript.complete();
+  assertExit(a, 1, `${a.stderr}${a.stdout}`);
+  assert.equal(a.json.error, 'substitute-unproven');
+  assert.match(a.json.reason, /second review of R1-B1: no proof transcript/);
+  assert.deepEqual(noTranscript.markers(), []);
+  const wrongFamily = completeWorld((h) => stateOf(h, [[1, { codexModel: 'gpt-x', risk: 'low', items: [secondReviewed({ models: { 'claude-sonnet-4-5': 1 } })] }]]));
+  const b = wrongFamily.complete();
+  assertExit(b, 1, `${b.stderr}${b.stdout}`);
+  assert.equal(b.json.error, 'substitute-unproven');
+  assert.match(b.json.reason, /second review of R1-B1: .*not a Opus/);
+  assert.deepEqual(wrongFamily.markers(), []);
+  const proved = completeWorld((h) => stateOf(h, [[1, { codexModel: 'gpt-x', risk: 'low', items: [secondReviewed()] }]]));
+  const c = proved.complete();
+  assertExit(c, 0, `${c.stderr}${c.stdout}`);
+  assert.equal(c.json.ok, true);
+  assert.deepEqual(c.json.review.substitute.agents, ['substitute-opus']);
+  assert.equal(proved.markers().length, 1);
 });
 
 test('review-complete: a valid substitute-only review posts a marker carrying substitute + substituteDigest and codexModel none-substitute:<model>', () => {

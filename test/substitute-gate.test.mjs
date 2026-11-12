@@ -89,6 +89,39 @@ test('substituteRefusal: an unproven substitute round (wrong agent for the risk,
   assert.equal(substituteRefusal(stateOf(H, [[1, { firstReviewer: 'substitute', risk: 'low' }]]))?.error, 'substitute-unproven', 'marked substitute with no record at all');
 });
 
+// A substitute second review as task D stores it (state.mjs secondReview.by + evidence + models + proof).
+const subItem = (id, agent = 'substitute-opus', over = {}, proofOver = {}) => ({
+  id, bucket: 'BLOCKING', category: 'bug', title: 't', fingerprint: `fp-${id}`,
+  secondReview: { by: agent, decision: 'ACCEPT', evidence: 'quota', models: { [MODELS[agent]]: 3 }, proof: { transcript: '/t/2nd.jsonl', models: { [MODELS[agent]]: 3 }, effort: 'high' , ...proofOver }, ...over },
+});
+
+test('substituteRefusal: a substitute SECOND review is judged like a round (agent, risk at that time, transcript, family, effort, Fable floor); a Codex second review and a proven one are not', () => {
+  const two = (item, risk = 'low', gate) => substituteRefusal(stateOf(H, [[1, { codexModel: 'gpt-x', risk, items: [item] }]], { risk }), gate);
+  assert.equal(two(subItem('R1-B1')), null, 'a proven Opus second review');
+  assert.equal(two(subItem('R1-B1', 'substitute-fable', {}, {}), 'high'), null, 'a proven Fable second review at high risk');
+  assert.equal(two({ ...subItem('R1-B1'), secondReview: { by: 'codex', decision: 'ACCEPT' } }), null, 'a Codex second review needs no substitute proof');
+  const bad = (item, re, risk = 'low', gate) => {
+    const r = two(item, risk, gate);
+    assert.equal(r?.error, 'substitute-unproven');
+    assert.match(r.reason, re);
+  };
+  bad({ ...subItem('R1-B1'), secondReview: { by: 'substitute-other', decision: 'ACCEPT' } }, /second review of R1-B1: agent "substitute-other" is not substitute-opus or substitute-fable/);
+  bad({ ...subItem('R1-B1'), secondReview: { by: 'substitute-opus', decision: 'ACCEPT', evidence: 'quota' } }, /second review of R1-B1: no proof transcript/, 'low');
+  bad(subItem('R1-B1', 'substitute-opus', {}, { transcript: '' }), /no proof transcript/);
+  bad(subItem('R1-B1', 'substitute-opus', {}, { models: {} }), /records no model/);
+  bad(subItem('R1-B1', 'substitute-opus', {}, { models: { 'claude-sonnet-4-5': 1 } }), /not a Opus/);
+  bad(subItem('R1-B1', 'substitute-opus', {}, { effort: 'low' }), /effort "low" is not high/);
+  bad(subItem('R1-B1', 'substitute-opus'), /needs substitute-fable, but substitute-opus reviewed it/, 'high');
+  bad(subItem('R1-B1', 'substitute-fable', {}, { models: { 'claude-opus-4-8': 2 } }), /not a Fable/, 'high');
+  bad(subItem('R1-B1', 'substitute-fable'), /below the Fable floor/, 'high', { threshold: 'claude-fable-5-3', allow: [] });
+  // the risk a second review needed is the PR's at that round: a risk that rose only LATER does not make an Opus second review wrong, a risk already high does
+  const later = substituteRefusal(stateOf(H, [[1, { codexModel: 'gpt-x', risk: 'low', items: [subItem('R1-B1')] }], [2, { codexModel: 'gpt-x', risk: 'high', wholePr: true }]], { risk: 'high' }));
+  assert.equal(later, null);
+  // a cached copy in a later round is the same review: one problem, not two
+  const copy = stateOf(H, [[1, { codexModel: 'gpt-x', risk: 'low', items: [subItem('R1-B1', 'substitute-opus', {}, { effort: 'low' })] }], [2, { codexModel: 'gpt-x', risk: 'low', items: [subItem('R2-B1', 'substitute-opus', { }, { effort: 'low' })].map((i) => ({ ...i, fingerprint: 'fp-R1-B1' })) }]]);
+  assert.equal(substituteRefusal(copy).reason.split('; ').length, 1);
+});
+
 // ---- the marker (R5-6) ------------------------------------------------------------------------------------------------------------------
 
 // The parser as it stood before the substitute fields (validation copied from the commit before this one): it must accept the new marker and drop the keys it does not know.

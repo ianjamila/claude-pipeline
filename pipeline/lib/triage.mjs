@@ -990,38 +990,55 @@ export function substituteSummary(state) {
   };
 }
 
-// Why a recorded substitute round does not stand as proof, or []. Re-judged from the state at every gate (a state file is just JSON): the agent is one of the two pinned ones and is
-// the strength the PR's risk needed (a round where the highest risk so far was high needs substitute-fable; a stronger agent than needed is fine), the proof names its transcript, the
-// models in it are the agent's family (claude-opus-* / claude-fable-*), effort is high, and a Fable is not below the floor (`gate` = { threshold, allow } as for staleFableRounds:
-// a floor raised between the apply and the merge makes the round stale). [string] one per problem.
+// Why ONE recorded substitute review (a round's `substitute`, or the {agent, proof} of a second review) does not stand as proof: [string], one per problem, each led by `label`.
+// The agent is one of the two pinned ones and is the strength the risk needed (`risk`: where the highest risk so far was high needs substitute-fable; a stronger agent than needed is
+// fine), the proof names its transcript, the models in it are the agent's family (claude-opus-* / claude-fable-*), effort is high, and a Fable is not below the floor (`gate` = { threshold,
+// allow } as for staleFableRounds: a floor raised between the apply and the merge makes the review stale).
+function substituteProofIssues(sub, risk, gate, label) {
+  const out = [];
+  const why = (text) => out.push(`${label}: ${text}`);
+  if (sub === null || typeof sub !== 'object' || Array.isArray(sub)) { why('marked as a substitute review but records no substitute proof'); return out; }
+  if (sub.agent !== 'substitute-opus' && sub.agent !== 'substitute-fable') { why(`agent ${JSON.stringify(sub.agent ?? null)} is not substitute-opus or substitute-fable`); return out; }
+  if (sub.agent === 'substitute-opus' && substituteAgentFor(risk) === 'substitute-fable') why('the PR was high-risk at this review, which needs substitute-fable, but substitute-opus reviewed it');
+  const proof = sub.proof;
+  const models = modelsOf(proof?.models);
+  if (proof === null || typeof proof !== 'object' || typeof proof.transcript !== 'string' || proof.transcript === '') why('no proof transcript recorded');
+  else if (models.length === 0) why('the proof records no model');
+  else {
+    const family = sub.agent === 'substitute-fable' ? /^claude-fable(-|$)/ : /^claude-opus(-|$)/;
+    const wrong = models.filter((m) => !family.test(m));
+    if (wrong.length > 0) why(`${sub.agent} was proven with ${wrong.join(', ')}, not a ${sub.agent === 'substitute-fable' ? 'Fable' : 'Opus'}`);
+    if (sub.agent === 'substitute-fable' && wrong.length === 0) {
+      const { stale, current } = fableModelsOf({ modelProof: { models: Object.fromEntries(models.map((m) => [m, 1])) } }, gate);
+      if (stale.length > 0 || current.length === 0) why(`its Fable ${stale.join(', ') || models.join(', ')} is below the Fable floor ${gate.threshold}: run a new substitute or Codex round`);
+    }
+  }
+  if (String(proof?.effort ?? '') !== 'high') why(`effort ${JSON.stringify(proof?.effort ?? null)} is not high`);
+  return out;
+}
+
+// Why a recorded substitute review does not stand as proof, or []. Re-judged from the state at every gate (a state file is just JSON): every substitute FIRST review (a round) and every
+// substitute SECOND review (an item whose secondReview.by starts with `substitute`), by the same rules (substituteProofIssues). The risk a round needed: the highest known up to and
+// including it, else (no risk recorded) the PR's, failing toward the stronger reviewer; a second review is judged at the round that first holds it (a cached copy in a later round is
+// the same review, listed once as in the inventory). [string] one per problem.
 export function substituteProofProblems(state, gate = DEFAULT_GATE) {
   const out = [];
   const rounds = Array.isArray(state?.rounds) ? state.rounds : [];
+  const judged = new Set();
   let seen;
   for (const r of rounds) {
     const known = RISK_LEVELS.includes(r?.risk);
     if (known) seen = seen === undefined || RISK_LEVELS.indexOf(r.risk) > RISK_LEVELS.indexOf(seen) ? r.risk : seen;
-    if (!isSubstituteRound(r)) continue;
-    const sub = r.substitute;
-    const why = (text) => out.push(`round ${r.n}: ${text}`);
-    if (sub === null || typeof sub !== 'object' || Array.isArray(sub)) { why('marked as a substitute review but records no substitute proof'); continue; }
-    if (sub.agent !== 'substitute-opus' && sub.agent !== 'substitute-fable') { why(`agent ${JSON.stringify(sub.agent ?? null)} is not substitute-opus or substitute-fable`); continue; }
-    // the risk the round needed: the highest known up to and including it, else (no risk recorded) the PR's, failing toward the stronger reviewer
-    if (sub.agent === 'substitute-opus' && substituteAgentFor(seen ?? maxRiskOf(state)) === 'substitute-fable') why('the PR was high-risk at this round, which needs substitute-fable, but substitute-opus reviewed it');
-    const proof = sub.proof;
-    const models = modelsOf(proof?.models);
-    if (proof === null || typeof proof !== 'object' || typeof proof.transcript !== 'string' || proof.transcript === '') why('no proof transcript recorded');
-    else if (models.length === 0) why('the proof records no model');
-    else {
-      const family = sub.agent === 'substitute-fable' ? /^claude-fable(-|$)/ : /^claude-opus(-|$)/;
-      const wrong = models.filter((m) => !family.test(m));
-      if (wrong.length > 0) why(`${sub.agent} was proven with ${wrong.join(', ')}, not a ${sub.agent === 'substitute-fable' ? 'Fable' : 'Opus'}`);
-      if (sub.agent === 'substitute-fable' && wrong.length === 0) {
-        const { stale, current } = fableModelsOf({ modelProof: { models: Object.fromEntries(models.map((m) => [m, 1])) } }, gate);
-        if (stale.length > 0 || current.length === 0) why(`its Fable ${stale.join(', ') || models.join(', ')} is below the Fable floor ${gate.threshold}: run a new substitute or Codex round`);
-      }
+    const risk = seen ?? maxRiskOf(state);
+    if (isSubstituteRound(r)) out.push(...substituteProofIssues(r.substitute, risk, gate, `round ${r.n}`));
+    for (const item of Array.isArray(r?.items) ? r.items : []) {
+      const sr = item?.secondReview;
+      if (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute')) continue;
+      const key = typeof item.fingerprint === 'string' && item.fingerprint !== '' ? `${item.fingerprint}|${sr.by}` : `${String(item.id)}|${sr.by}`;
+      if (judged.has(key)) continue;
+      judged.add(key);
+      out.push(...substituteProofIssues({ agent: sr.by, proof: sr.proof }, risk, gate, `second review of ${String(item.id)}`));
     }
-    if (String(proof?.effort ?? '') !== 'high') why(`effort ${JSON.stringify(proof?.effort ?? null)} is not high`);
   }
   return out;
 }
@@ -1043,7 +1060,7 @@ export function substituteRefusal(state, gate = DEFAULT_GATE) {
   const escalation = substituteEscalationProblem(state);
   if (escalation !== null) return { error: 'substitute-escalation', reason: escalation };
   const problems = substituteProofProblems(state, gate);
-  return problems.length === 0 ? null : { error: 'substitute-unproven', reason: `a substitute review round is not proven: ${problems.join('; ')}` };
+  return problems.length === 0 ? null : { error: 'substitute-unproven', reason: `a substitute review is not proven: ${problems.join('; ')}` };
 }
 
 // `Rulings <digest first 12>` then the rows, one per line; '' when there are none.
