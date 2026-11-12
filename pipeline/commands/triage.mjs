@@ -30,7 +30,8 @@ import {
 import {
   currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, reviewBaseRef, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
-import { establishBaseline, publishTriage } from '../lib/review-publish.mjs';
+import { establishBaseline, pastRoundHistoryProblem, publishTriage, readPublished } from '../lib/review-publish.mjs';
+import { pastRoundsNeedingApproval } from '../lib/owner-grants.mjs';
 
 export const meta = {
   summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane, ask for and record owner rulings made in chat, record Claude\'s own rulings, run the blind Codex second review',
@@ -44,7 +45,7 @@ export const meta = {
     'pipeline triage light-lane --round R [--repo DIR]',
     'pipeline triage ruling-request --pr N --ids ID[,ID…] [--repo DIR]',
     '  -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state\'s, or a repository off github.com)',
-    'pipeline triage round-request --pr N [--repo DIR]',
+    'pipeline triage round-request --pr N [--past] [--repo DIR]',
     '  -> {ok, line, k, n, head, rounds, cost, open, notClean, recommend, why, discard, summary, warnings}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`',
     '     (k = the counted round it would be: reviewed rounds + 1, base-only and resolution-only rounds not counted; n = the round number to pass to codex-review --round; head = the checked-out HEAD)',
     '  -> everything but line, k, n and head is display only and decides nothing: rounds {reviewed, max, autoExtraUsed, ownerGranted, next}; cost {bookedUsd, reviewUsd, fableUsd, perRoundUsd, lastRound, lastRoundUsd} (the last two from cost.byRound, \`cost --round R\`: the newest counted round with a booking, else null) from the PR\'s run record (read-only; null with a warning when it cannot be read);',
@@ -54,6 +55,10 @@ export const meta = {
     '  -> commit, push and quick-verify first: the grant is for that head. The owner answers `extra round` (or `grant round K`, optionally with #N); the owner-go hook records it, and',
     '     `codex-review --round n` then claims it (see its usage). Exit 1 for label mode (no grant exists), a --pr that is not the review state\'s, a repository off github.com,',
     '     or a round that is already allowed (within review.max_rounds, the automatic extra round, or an open grant for this head)',
+    '  -> --past: {ok, line, k, n, head, past: true, remaining}: the LAST line of the reply that asks the owner to approve a round that ALREADY ran (before owner grants were recorded, so it carries none and review-complete refuses it), `🔂 Approve past review round #N: round K · head <head12> · repo owner/name`',
+    '     (n = the round to pass to `state past-round-grant`, head = its full head, remaining: [{n, k}] the other rounds that still need it). It picks the OLDEST published counted round past review.max_rounds + 1 that has a LATER counted round and no owner grant (or one whose',
+    '     record is gone). Read-only: state, markers and the PR are untouched. The owner answers `approve round` (or `extra round`, `grant round K`, optionally with #N); the hook records it as kind past-round, which never admits a new round; then run `state past-round-grant --pr N --round n`',
+    '     exit 1 {ok:false, error, reason} BEFORE the owner is asked: label-mode, no-max-rounds, state-pr-mismatch, host, history-unreadable | no-published-history | stale-history (run `pipeline state show --pr N`) | unpublished-history (run `pipeline comment --pr N --kind triage`), or nothing-to-approve',
     'pipeline triage defer-fixes --pr N --ids ID[,ID…] --fix-head SHA --reason TEXT [--repo DIR]',
     '  -> {ok, deferred: [ids], rounds: [every round number holding a deferred item], published, next?}: closes the round limit without another round when the unreviewed fixes are all LOW severity. Each fix is taken out of the tree FIRST (the caller reverted',
     '     every commit since the last reviewed head, pushed and waited for CI); then those ACCEPTs become FOLLOW-UPs (final.by claude, cause round-cap, the overruled ACCEPT kept, the item-level roundCapDeferral {fixHead, reviewedHead, at}), published at once like claude-ruling.',
@@ -607,13 +612,41 @@ async function rulingRequest(rest, ctx) {
 // A lookup of the owner's extra-round records, shaped the way roundOutcome / deferEligibility take grants.
 const asGrants = (lookup) => (ordinal) => lookup(ordinal).map((r) => ({ grantId: grantIdOf(r), head: r.head, quote: r.prompt }));
 
+// `round-request --past`: the line that ends the reply asking the owner to approve a round that ALREADY ran (before owner grants were recorded, so it carries none): the CLI
+// picks the OLDEST published round that needs it (owner-grants.mjs#pastRoundsNeedingApproval, decided on the PUBLISHED state) and writes the line, so the agent cannot name
+// a round or head of its own. Read-only: the state, the markers and the PR are untouched. This copy and the PR must agree on history first (a refusal says how to fix it),
+// BEFORE the owner is asked. `state past-round-grant` then records the owner's words.
+function pastRoundRequest({ pr, root, config, ctx }) {
+  const refuse = (reason, error) => ({ exitCode: EXIT.FAILED, output: { ok: false, error, reason } });
+  if (config.owner_approval !== 'chat') return refuse('the owner\'s approval of a past round is recorded only with owner_approval: chat in pipeline.yml; in label mode the agent parks', 'label-mode');
+  const max = config.review?.max_rounds;
+  if (!Number.isInteger(max) || max < 1) return refuse('review.max_rounds is not configured in pipeline.yml, so no round is known to be past it', 'no-max-rounds');
+  const gh = createGitHub({ cwd: root, env: ctx.env });
+  return guardGh(() => withStateLock(root, ctx, () => {
+    const state = requireState(root);
+    if (state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`, 'state-pr-mismatch');
+    const { slug, host } = gh.repo();
+    if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded approval names a repository on github.com`, 'host');
+    const found = readPublished(gh, pr);
+    const { problem } = pastRoundHistoryProblem({ local: state, published: found, pr });
+    if (problem) return refuse(problem.message, problem.error);
+    const [first, ...others] = pastRoundsNeedingApproval(found.state, found.state, { maxRounds: max, repo: slug, pr });
+    if (first === undefined) {
+      return refuse(`no published round of PR #${pr} needs the owner's approval of a past round: it needs a counted round past review.max_rounds (${max}) and its automatic extra round, held by the PR's triage comment with a LATER counted round after it, and carrying no owner grant (or one whose record is gone)`, 'nothing-to-approve');
+    }
+    const line = `🔂 Approve past review round #${pr}: round ${first.k} · head ${first.toHead.slice(0, 12)} · repo ${slug}`;
+    return { exitCode: EXIT.OK, output: { ok: true, line, k: first.k, n: first.n, head: first.toHead, past: true, remaining: others.map(({ n, k }) => ({ n, k })) } };
+  }, pr));
+}
+
 // The line that ends the reply asking the owner for one more review round: the CLI writes it (counted ordinal k, the checked-out head, the
 // repository gh resolves on github.com), so the agent cannot ask for a round or a head of its own choosing. Chat mode only.
 async function roundRequest(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, past: { type: 'boolean' }, repo: { type: 'string' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
+  if (values.past) return pastRoundRequest({ pr, root, config, ctx });
   const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, reason } });
   if (config.owner_approval !== 'chat') return refuse('an extra review round is granted only with owner_approval: chat in pipeline.yml; in label mode the agent parks');
   const gh = createGitHub({ cwd: root, env: ctx.env });

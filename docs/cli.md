@@ -153,6 +153,9 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
     this machine): a grant already used, or recorded for another head ("ask again"), is exit 2 round-cap; Codex exit 3, head-moved and a kill before the claim
     leave the grant open (a failure after the claim spends it: ask again). Success adds grantUsed:{grantId}; the round records admission and ownerGrant {grantId, k, quote, ownerTs}
     base-only rounds and resolution-only rounds (below) never count toward the cap
+  exit 2 {error:stale-history | unpublished-history | history-unreadable} for a COUNTED round, before Codex runs (read again under the final lock): the PR's triage comment is the
+    published history. stale-history: this copy lacks a published round or owner grant (run `pipeline state show --pr N`); unpublished-history: this copy holds rounds the PR
+    lacks, an earlier publish failed (run `pipeline comment --pr N --kind triage`); history-unreadable: the comment holds no readable state. No triage comment: no check
   reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired
     (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker's brief for the sensitive files; judge otherwise. Once fable, always fable
   confirm fixed: an accepted item that a forced or Claude ruling marked implemented through files other than the one it names (state mark-implemented,
@@ -679,6 +682,7 @@ pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr 
   (local-ahead: the PR still holds what this copy last published, every published round and item is still in the local copy, and the local copy holds a second-review verdict or a Claude / forced final that was
   never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final), or an implementation mark or a follow-up issue link added after the last publish: kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline
   (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)
+  owner grants the PR holds on rounds this copy has (and it lacks or holds differently) are copied onto them, nothing is quarantined and local rounds / decisions are kept: grantsRestored:[round numbers]. This also holds when the PR moved off this copy's baseline by such a grant alone (another checkout published it) while this copy has unpublished decisions or a trailing round. A local-only owner grant (the PR's round has none) that does not verify on this machine is dropped, with the admission it set: grantsDropped:[round numbers] (the refusal `unverified-grant` of `state past-round-grant` names this remedy); it is checked against the gh repository, like `past-round-grant` does, and a check that failed with an error (not a "no") keeps the grant with a warning. After adopting grants the baseline follows the PR only when this copy equals the PR apart from grants and trailing local rounds (a copy that lacks a published decision or round-level proof keeps its baseline, so it cannot publish over it)
   (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)
 pipeline state discard-round --round R [--pr N] [--repo DIR]
   -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;
@@ -703,6 +707,17 @@ pipeline state fable-refresh --pr N [--repo DIR]
      and the content is what the last round reviewed, or only ledger rows were added since (review.docs_exempt_paths; the round then stays pinned at the last reviewed head) (error content-moved: run a normal codex-review round instead, its Fable pass already reads the whole PR). Then: arbiter needed --round R, the arbiter, arbiter apply
 pipeline state record-followup --id ID --url URL [--repo DIR]
 pipeline state set-outcome --outcome TEXT [--repo DIR]
+pipeline state past-round-grant --pr N --round n [--repo DIR]
+  -> {ok, round, k, grantId, claimed, saved, published, remaining}: records the owner's approval of round n, which ALREADY ran (before owner grants were recorded, so it carries none): the owner typed
+     "approve round" (or "extra round", "grant round K", optionally with #N) after a reply ending with the line `triage round-request --pr N --past` printed (`🔂 Approve past review round #N: round K · head <head12> · repo owner/name`;
+     the owner-go hook records it as kind past-round, any session, last 24 h, never usable for a new round). Saves ownerGrant {grantId, k, quote, ownerTs, past: true} and admission owner on round n, then publishes the state. Under the review lock
+  -> before anything is claimed or saved (state and markers untouched on a refusal, exit 2 {ok:false, error, message}): label-mode (needs owner_approval: chat), no-max-rounds, host (the gh repo is not on github.com), state-pr-mismatch;
+     the history check against the PR's triage comment: history-unreadable | no-published-history | stale-history (run `pipeline state show --pr N`) | unpublished-history (run `pipeline comment --pr N --kind triage`); this copy may be ahead
+     only by owner-grant metadata that verifies (unverified-grant otherwise), and a stale baseline is refreshed only when it equals the PR apart from grants and trailing rounds (stale-publication otherwise: the PR holds a decision or round-level proof this copy lacks, run `pipeline state show --pr N`); not-eligible (round n is not one `triage round-request --pr N --past` would pick: a counted round past review.max_rounds + 1, held by the PR with a later counted round,
+     with no owner grant or one whose record is gone), already-approved (the PR already holds a verified grant on it); no-grant (no past-round record for this repository, PR, counted round and head, younger than 24 h, typed by the owner)
+  -> every matching unspent record is claimed together (one machine-global marker each, like codex-review), the newest is recorded. An interrupted run is resumed by running the command again: a record whose marker is already spent and verifies is
+     used without a new claim (at any age), leftovers are claimed. claim-failed | save-failed (exit 1) keep the markers; a failed publication keeps the saved state: exit 3 {unavailable:true, saved:true, published:false, next} for GitHub, exit 1
+     {error: stale-publication | history-loss, saved:true, published:false} when the PR moved; run the command again to retry. Re-approving a round whose published grant no longer verifies replaces that grant. remaining: [{n, k}] the other rounds still to approve
 ```
 
 Exit: 0 · 2 no state / usage (`outcome` is 0 whether or not `clean`).
@@ -750,7 +765,7 @@ pipeline triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd C
 pipeline triage light-lane --round R [--repo DIR]
 pipeline triage ruling-request --pr N --ids ID[,ID…] [--repo DIR]
   -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state's, or a repository off github.com)
-pipeline triage round-request --pr N [--repo DIR]
+pipeline triage round-request --pr N [--past] [--repo DIR]
   -> {ok, line, k, n, head, rounds, cost, open, notClean, recommend, why, discard, summary, warnings}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`
      (k = the counted round it would be: reviewed rounds + 1, base-only and resolution-only rounds not counted; n = the round number to pass to codex-review --round; head = the checked-out HEAD)
   -> everything but line, k, n and head is display only and decides nothing: rounds {reviewed, max, autoExtraUsed, ownerGranted, next}; cost {bookedUsd, reviewUsd, fableUsd, perRoundUsd, lastRound, lastRoundUsd} (the last two from cost.byRound, `cost --round R`: the newest counted round with a booking, else null) from the PR's run record (read-only; null with a warning when it cannot be read);
@@ -760,6 +775,10 @@ pipeline triage round-request --pr N [--repo DIR]
   -> commit, push and quick-verify first: the grant is for that head. The owner answers `extra round` (or `grant round K`, optionally with #N); the owner-go hook records it, and
      `codex-review --round n` then claims it (see its usage). Exit 1 for label mode (no grant exists), a --pr that is not the review state's, a repository off github.com,
      or a round that is already allowed (within review.max_rounds, the automatic extra round, or an open grant for this head)
+  -> --past: {ok, line, k, n, head, past: true, remaining}: the LAST line of the reply that asks the owner to approve a round that ALREADY ran (before owner grants were recorded, so it carries none and review-complete refuses it), `🔂 Approve past review round #N: round K · head <head12> · repo owner/name`
+     (n = the round to pass to `state past-round-grant`, head = its full head, remaining: [{n, k}] the other rounds that still need it). It picks the OLDEST published counted round past review.max_rounds + 1 that has a LATER counted round and no owner grant (or one whose
+     record is gone). Read-only: state, markers and the PR are untouched. The owner answers `approve round` (or `extra round`, `grant round K`, optionally with #N); the hook records it as kind past-round, which never admits a new round; then run `state past-round-grant --pr N --round n`
+     exit 1 {ok:false, error, reason} BEFORE the owner is asked: label-mode, no-max-rounds, state-pr-mismatch, host, history-unreadable | no-published-history | stale-history (run `pipeline state show --pr N`) | unpublished-history (run `pipeline comment --pr N --kind triage`), or nothing-to-approve
 pipeline triage defer-fixes --pr N --ids ID[,ID…] --fix-head SHA --reason TEXT [--repo DIR]
   -> {ok, deferred: [ids], rounds: [every round number holding a deferred item], published, next?}: closes the round limit without another round when the unreviewed fixes are all LOW severity. Each fix is taken out of the tree FIRST (the caller reverted
      every commit since the last reviewed head, pushed and waited for CI); then those ACCEPTs become FOLLOW-UPs (final.by claude, cause round-cap, the overruled ACCEPT kept, the item-level roundCapDeferral {fixHead, reviewedHead, at}), published at once like claude-ruling.
