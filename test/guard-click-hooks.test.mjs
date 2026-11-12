@@ -985,6 +985,47 @@ test('R15: a heredoc pending on the outer line is read after the line ends, not 
   assert.match(r.reason, /git commit -F/);
 });
 
+test('R16: any unquoted or double-quoted ${ cmd; } is refused, its body is never parsed (owner rule: refuse, do not guess)', () => {
+  const cp = 'cp /tmp/payload ~/.claude/settings.json';
+  const failures = [];
+  for (const cmd of [
+    // R16-B1: a ${ cmd; } inside a double-quoted operand of a parameter expansion
+    'unset x; echo ${x:-"${ ' + cp + '; }"}',
+    'echo ${x:-"${|' + cp + '; }"}',
+    // R16-F1: the body closed by `}"`, more commands, then a later `}` at a command start
+    'echo "${ echo a;}"; ' + cp + '; echo "x; } "',
+    "echo \"${ echo a;}\"'; " + cp + "; '",
+    // R16-F2: a `}` after a redirection-only command is a command name, not the closer
+    'echo "${ >/tmp/f } ; ' + cp + '; }"',
+    'echo "${ <<<a } ; ' + cp + '; }"',
+    // R16-F3: groups the parser did not count (coproc NAME {, zsh short forms) close early
+    'echo "${ coproc N { echo a; } ; ' + cp + '; }"',
+    'echo "${ repeat 2 { echo a; } ; ' + cp + '; }"',
+    'echo "${ for x (a) { echo a; } ; ' + cp + '; }"',
+    // the same shapes unquoted, in a heredoc, in $[ ] and in a case pattern
+    'echo ${ coproc N { echo a; } ; ' + cp + '; }',
+    'cat <<E\n${ >/tmp/f } ; ' + cp + '; }\nE',
+    'echo $[ ${ ' + cp + '; } ]',
+    'case a in ${ ' + cp + '; }) echo;; esac',
+    // a harmless body is refused too: the guard no longer reads these bodies at all
+    'echo "${ echo a; }"',
+    'x=${ date; }',
+    'echo ${|REPLY=a; }',
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R16 lines were not refused');
+  const blocked = [];
+  for (const cmd of [
+    "echo '${ not run }'",
+    "node -e 'const a = `${ b }`'",
+    "cat <<'E'\n${ x }\nE",
+    'echo ${HOME} "${x:-a b}"',
+    // R16-F4: bash 5.3 compiles the `(` form out (parser.h: FUNSUB_CHAR under #if 0 is the only one listing it); zsh flags stay allowed
+    'print -l ${(f)x}',
+    'echo "${(j:,:)arr}"',
+  ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
+  assert.deepEqual(blocked, [], 'these R16 lines were refused');
+});
+
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------
 
 test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] argument no longer hide a fed interpreter', () => {
