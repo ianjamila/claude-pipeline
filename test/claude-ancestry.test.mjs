@@ -2,6 +2,7 @@
 // as an ancestor). The lookup is injected, so these tests never read the real process table.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn as spawnChild } from 'node:child_process';
 import { claudeCodeAncestorPid, hasClaudeCodeAncestor, isClaudeCodeProcess, processTable, realLookup } from '../pipeline/lib/claude-ancestry.mjs';
 
 const table = (rows) => (pid) => rows[pid] ?? null;
@@ -182,6 +183,18 @@ test('processTable (win32): an enumeration error terminates the script with a no
   assert.match(script, /try \{[\s\S]*\} catch \{ exit 1 \}/, 'a terminating error ends with exit code 1, not the last command\'s 0');
 });
 
+test('both PowerShell scripts switch stdout to UTF-8 (no BOM) first, so CJK code pages cannot corrupt the JSON (#317)', () => {
+  const prefix = '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ';
+  const table = spawnOf(jsonOut([]));
+  processTable('win32', table);
+  assert.ok(table.seen[0].args.at(-1).startsWith(prefix), 'whole-table script');
+  const perPid = spawnOf(jsonOut({ ParentProcessId: 5, Name: 'cmd.exe' }));
+  realLookup(77, 'win32', perPid);
+  assert.ok(perPid.seen[0].args.at(-1).startsWith(prefix), 'per-pid script');
+  assert.equal(table.seen[0].opts.encoding, 'utf8');
+  assert.equal(perPid.seen[0].opts.encoding, 'utf8');
+});
+
 test('win32: the status-1 result of an errored table query falls back to per-hop lookups (R1-B1)', () => {
   const rows = {
     900: { ParentProcessId: 800, Name: 'node.exe', Created: T },
@@ -337,6 +350,21 @@ test('processTable on a real Windows host lists this process with its parent and
   assert.ok(me, 'this process is in the table');
   assert.equal(me.ppid, process.ppid);
   assert.ok(Number.isFinite(me.created) && me.created <= Date.now(), `created=${me.created}`);
+});
+
+// R1-S1: the one test that crosses the real PowerShell stdout boundary. A mock cannot show that non-ASCII command-line args survive
+// Windows PowerShell 5.1's redirected stdout on a non-CJK OEM code page; only a live child and the real query can.
+test('processTable and realLookup on a real Windows host return a CJK command-line argument intact (UTF-8 stdout)', { skip: process.platform !== 'win32' }, (t) => {
+  const cjk = '测试中文引数';
+  const child = spawnChild(process.execPath, ['-e', 'setTimeout(()=>{},30000)', cjk], { windowsHide: true, stdio: 'ignore' });
+  t.after(() => { child.kill(); });
+  assert.ok(Number.isInteger(child.pid), 'the child started');
+  const row = processTable()?.get(child.pid);
+  assert.ok(row, 'the child is in the process table');
+  assert.ok(row.args.includes(cjk), `processTable args=${JSON.stringify(row.args)}`);
+  const one = realLookup(child.pid);
+  assert.ok(one, 'realLookup found the child');
+  assert.ok(one.args.includes(cjk), `realLookup args=${JSON.stringify(one.args)}`);
 });
 
 // ---- argument matching ------------------------------------------------------------------------------------------------------

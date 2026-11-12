@@ -222,6 +222,8 @@ pipeline comment --pr N --kind triage|summary|needs-human|blocked|awaiting-revie
   (exit 1 {ok:false, error:'stale-publication', reason}) when the PR holds a state this copy neither published nor restored: run `pipeline state show --pr N`
   and redo the decision; {action:'unchanged'} when the PR already holds exactly this state. The other kinds take no lock.
   --kind blocked renders the verify report's failure; with --reason TEXT it renders a "the review stopped: TEXT" comment instead (no report needed), e.g. the advice of a stop that waits for a terminal restart.
+  --kind needs-human adds, when a review state with at least one round exists for this PR, a short status block under the paragraph: rounds, booked cost (with the last round's share),
+  open items with their severity and why the review is not clean (the extra-round ask's text without its recommendation). Display only: a part that cannot be read becomes a "not available" line; the comment is always written.
 ```
 
 Exit: 0 comment posted/updated · 2 usage · 3 GitHub (`gh`) unavailable.
@@ -244,10 +246,12 @@ book tokens / USD / retries of one agent call in the run record (shown by `P sum
 
 ```
 pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|substitute-opus|substitute-fable|verifier|controller|other
-              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--retry] [--session ID]... [--repo DIR]
-  -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount), 3 GitHub unavailable
+              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--round R] [--retry] [--session ID]... [--repo DIR]
+  -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount), 3 GitHub unavailable
   An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB);
   explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.
+  --round R: the review round the call served (judge or arbiter of round R, and the implementer that fixes round R's accepts); the entry is also added to cost.byRound[R],
+  which the extra-round ask uses to name what the last round cost. Build-phase calls pass none.
   USD: --usd X as given; otherwise the list price of each transcript message's own model version (--model M prices the messages that carry none)
   plus the explicit tokens at --model M. Tokens with no known model add no USD (a warning says so). Priced tokens are also booked in
   cost.byPrice (keyed model|tier|speed) so a later price table can re-price them; output `bucketed` says whether this entry carries them.
@@ -782,6 +786,22 @@ pipeline substitute apply --pr N --round R [--tag TAG] [--repo DIR]   (--project
 
 The substitute is a Claude stand-in for a round Codex could not review (a real quota stop proven from Codex's own events, or a small fix-check withheld by the Codex budget or weekly governor): `prepare` re-checks the round's route.json evidence and writes one input (the exact Codex prompt, an evidence map and the exported files a read-only agent cannot fetch itself); the review skill runs the named agent (`substitute-opus`, or `substitute-fable` once the PR was ever high risk) with the printed header; `apply` proves the transcript the way `arbiter apply` does (model, effort, agent type, Fable floor, one prompt) plus the substitute's own rules (exact first prompt, only Read/Grep/Glob, every packet file read, one transcript per tag) and records the round through the same code as `codex-review`.
 
+## stats
+
+review rounds of merged PRs: how many went past the limit, what they found and cost.
+
+```
+pipeline stats rounds [--repo-slug owner/name]... [--since YYYY-MM-DD] [--pr N]... [--json] [--repo DIR]
+  -> {ok, since, repos, totals, prs, warnings}: for the PRs merged since the date (default 7 days ago) in each --repo-slug (default: the repository gh resolves from the current directory), the PR's comments are
+     read (run record, triage state) and counted: totals {prs, prsPastCap, countedRounds, pastCapRounds, pastCapShare, admission {auto-extra|owner-granted|unknown}, previous (what the round before a past-limit round had
+     to re-check: no-accepts | only-low-fixes = non-BLOCKING non-security accepts | blocking-or-security), found (new-blocking | accepts | deferred = its accepts were all deferred past the cap | nothing-accepted), blockingLoopPrs, usd, pastCapUsd}; prs [{repo, pr, id, maxRounds,
+     countedRounds, pastCapRounds, usd, blockingLoop, rounds: [{n, k, pastCap, usd (cost.byRound, `cost --round R`), acceptedBlocking, admission?, previous?, found?}]}]. --pr N limits it to those PRs (merged or not listed by date).
+     Without --json the same numbers print as a plain-text table. Only the viewer's own comments count (the pipeline's comments posted under another login are ignored, with a warning); a pipeline comment that is skipped (other author, bound to another PR or repository, unreadable) is named in `warnings`. A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.
+     Read-only. Severity is judged from the recorded item (BLOCKING, a security category or a security word is not low), since a PR comment does not carry the reviewed diff `itemSeverity` needs.
+```
+
+Exit: 0 · 2 usage (a bad `--since`, `--pr` or `--repo-slug`) · 3 GitHub unavailable.
+
 ## summary
 
 upsert the PR summary comment and print the agent-log line.
@@ -812,7 +832,7 @@ pipeline triage ruling-request --pr N --ids ID[,ID…] [--repo DIR]
 pipeline triage round-request --pr N [--repo DIR]
   -> {ok, line, k, n, head, rounds, cost, open, notClean, recommend, why, discard, summary, warnings}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`
      (k = the counted round it would be: reviewed rounds + 1, base-only and resolution-only rounds not counted; n = the round number to pass to codex-review --round; head = the checked-out HEAD)
-  -> everything but line, k, n and head is display only and decides nothing: rounds {reviewed, max, autoExtraUsed, ownerGranted, next}; cost {bookedUsd, reviewUsd, fableUsd, perRoundUsd} from the PR's run record (read-only; null with a warning when it cannot be read);
+  -> everything but line, k, n and head is display only and decides nothing: rounds {reviewed, max, autoExtraUsed, ownerGranted, next}; cost {bookedUsd, reviewUsd, fableUsd, perRoundUsd, lastRound, lastRoundUsd} (the last two from cost.byRound, `cost --round R`: the newest counted round with a booking, else null) from the PR's run record (read-only; null with a warning when it cannot be read);
      open [{id, round, bucket, category, severity: low|high, title, file}] = every item that keeps the review from clean; notClean = why, in plain words; recommend follow-up|extra-round, with why (follow-up exactly when `defer-fixes` would accept the
      current state: every unreviewed accept is a low-severity judge/arbiter fix, nothing else is open, no owner grant is open); discard {anchor, count, commits} = the commits since the last reviewed head that deferring would take out; summary = 3-5 plain lines the reply
      pastes ABOVE the line; warnings (a severity or config error shows the items as high and recommends extra-round, it never suppresses the line). Titles are untrusted text: one ASCII line each
@@ -825,8 +845,8 @@ pipeline triage defer-fixes --pr N --ids ID[,ID…] --fix-head SHA --reason TEXT
      Run `followups create --round R` for EACH returned round afterwards (a retry is safe: it de-duplicates by fingerprint). Every deferral is a labelled row of the merge Rulings block, so the owner's "merge" binds each one by name
   -> only with owner_approval: chat; exit 1 (state untouched) unless ALL hold: the round limit is reached and nothing is pending, waiting for a human, open BLOCKING, unimplemented or owed a Fable pass, and no unspent owner grant exists for the next round at any head (the lookup is STRICT: a records folder or session file that cannot be read, a record file over the size limit or not a regular file, an unreadable repo-moves file, an unsafe consumed-grants folder, or a record whose provenance cannot be confirmed as the owner's, refuses too; a records folder that does not exist is no grant; round-request applies the same lookup to its follow-up recommendation);
      --ids is exactly the set of accepts no round has reviewed, each low severity (non-BLOCKING; category performance, maintainability, testing, design, docs or other; its file in the reviewed diff, on no risk.high_risk_paths / review.arbiter_always_paths glob,
-     not the file of a BLOCKING or security ACCEPT) and each accepted by the judge or the arbiter (not the owner, Claude, a second review, a test or a cache copy; and no other accepted fix of ANY round is marked implemented unless it was marked before the last counted round began: `state mark-implemented` records the newest round number at the time as the item's implementedAfterRound, and a carried copy records the round before the one it sits in; a fix marked after that round, or a mark with no record, may be out of the reviewed head and refuses, so the round runs); the tree equals the last round's content (every commit since reverted; when the default branch was merged in and moved the content, record that update as a base-only round first: codex-review runs no Codex for it); --fix-head is an ancestor of HEAD, a descendant of the last REVIEWED head (the last round that is not a base-only one); the reviewedHead the issues compare against is the NEWEST recorded round, base-only or not, whose head --fix-head descends from (the base-only round recorded before the fix was made, or the last reviewed head when the update is recorded only after the revert), with
-     other content (it only points the follow-up issues at the removed fix); and the state with the fixes deferred reads as a clean review. A severity or config error refuses. Claude cannot reopen a deferral (claude-ruling and second-review refuse it); it writes review state format version 3; the owner's owner-ruling can
+     not the file of a BLOCKING or security ACCEPT) and each accepted by the judge or the arbiter (not the owner, Claude, a second review, a test or a cache copy; and no other accepted fix of ANY round is marked implemented unless it was marked before the last counted round began: `state mark-implemented` records the newest round number at the time as the item's implementedAfterRound, and a carried copy records the round before the one it sits in; a fix marked after that round, or a mark with no record, may be out of the reviewed head and refuses, so the round runs); the tree equals the last round's content (every commit since reverted; when the default branch was merged in and moved the content, record that update as a base-only round first: codex-review runs no Codex for it); --fix-head is an ancestor of HEAD, a descendant of the last REVIEWED head (the last round that is not a base-only one), and has other content than the reviewed one (it only points the follow-up issues at the removed fix); the reviewedHead the issues compare against is the comparison point whose merged-in default branch matches --fix-head's, so the compare shows just the fix: the NEWEST recorded round, base-only or not, whose head --fix-head descends from (the base-only round recorded before the fix was made, or the last reviewed head when the update is recorded only after the revert), or, when the default branch was merged in between the fix and the revert, the last round (the reverted tree carries that merge); with no match the first one and a `warnings` entry in the output;
+     and the state with the fixes deferred reads as a clean review. A severity or config error refuses. Claude cannot reopen a deferral (claude-ruling and second-review refuse it); it writes review state format version 3; the owner's owner-ruling can
 pipeline triage claude-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --pr N [--repo DIR]
   -> {ok, round, id, final, published, next?}; records CLAUDE's decision (final.by claude, needsHuman false, the overruled final and the cause kept) for an item waiting for a human, or tightens a Claude dismissal
   -> only with owner_approval: chat; exit 1 for label mode, a --pr that is not the review state's, an empty reason or one over 1000 characters, or a ruling the rules refuse (state untouched)
