@@ -41,10 +41,11 @@ Picking up an existing `awaiting-review` PR (Codex was unavailable): `P state sh
 
 1. `git fetch origin <default_branch>` and `git worktree add --no-track -b agent/<slug> <worktree_dir>/agent-<slug> origin/<default_branch>`
    (`--no-track`: a branch tracking `origin/main` can make a bare push target main). All work happens there; give subagents its absolute path.
-2. Split the work into small tasks. Per task dispatch the `implementer` agent with: the task, worktree path, acceptance criteria,
-   the tests to write (a bug ⇒ the failing test first, its failing output kept), `verify.quick`, and the commit trailer your system
-   context prescribes (pass it verbatim). Independent tasks may run in parallel only on different files.
-3. Quick check on the changed area (`verify.quick`) after each task and before every push. Red ⇒ implementer with the failing
+2. ONE `implementer` dispatch builds the whole change (task list in order, commits in small steps): hand it the tasks, worktree path, acceptance criteria, the tests to write
+   (a bug ⇒ the failing test first, its failing output kept), `verify.quick`, and the commit trailer your system context prescribes (pass it verbatim). More dispatches only when the
+   change is big: > ~500 changed non-test lines expected, more than one subsystem, or parts on disjoint files worth running in parallel (only on different files). An implementer that
+   stops before it is done (call budget, context) ⇒ continue THE SAME agent once (SendMessage with what is left; extend its budget once) before a fresh dispatch, which gets only the rest.
+3. Quick check on the changed area (`verify.quick`) after each dispatch and before every push. Red ⇒ implementer with the failing
    step and excerpt, max 3 fix cycles; still red ⇒ stop (outcome `blocked`): before the PR exists (step 4) only report to the owner; once it exists,
    first `gh pr edit N --add-label pipeline-blocked` and `P comment --pr N --kind blocked`, then the stop ritual.
 4. Draft PR: `git push -u origin agent/<slug>`, `gh pr create --draft --title "<title>" --body-file <file>`. The body opens
@@ -93,12 +94,12 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    and exit 2 `no-code-change` means the fix changed no code (back to the implementer; marking never replaces a fix).
 6. **Outcome.** `P state outcome`: `clean` ⇒ leave the loop; `needsHuman` non-empty ⇒ see Rulings; more rounds left ⇒ round R+1 (the Codex fix
    check reviews only what changed since this round's head); none left ⇒ park, cause `unresolved: <ids>`, except one case: `reachedMax`, no
-   `extraRound`, `owner_approval: chat`, and the fixes are pushed and `verify.quick` is green ⇒ ask the owner for one more round (Extra round, below). Label mode ⇒ park.
+   `extraRound`, `owner_approval: chat`, and the fixes are pushed and `verify.quick` is green ⇒ ask the owner for one more round (Extra round, below): the ask shows rounds, booked cost and open-item severity, and when only low-severity fixes are left it recommends filing them as follow-ups instead (`reference/owner-merge.md`, Follow up instead of a round). Label mode ⇒ park.
 **Park** (every `needs-human` stop is this): `gh pr edit N --add-label needs-human`, `P comment --pr N --kind needs-human --reason "<cause, what was checked, what the owner does>"`,
 with `merge.hold_command` in `P config` `P merge-hold --pr N --release --reason parked` (a parked PR must not keep the merge line), then the stop ritual with outcome `needs-human`. The summary renders from the round state, so at least one Codex round must have run; before that a stop is `blocked` or `awaiting-review`. The park comment is your own text: 3.3 shows a later hold from GitHub's label event and quotes the comment only as agent-written.
 
 Book every agent call (implementer, judge, arbiter; an `arbiter-fix` call is booked as role `arbiter`) right after it returns:
-`P cost --pr N --phase <build|review> --role <implementer|judge|arbiter> --from-transcript <the agent's transcript>` (add `--retry` on a fix retry). The transcript is
+`P cost --pr N --phase <build|review> --role <implementer|judge|arbiter> --from-transcript <the agent's transcript>` (add `--retry` on a fix retry). An implementer you continued is booked ONCE, after its last leg: the transcript sums the whole run, so booking each leg counts it twice. The transcript is
 `~/.claude/projects/<encoded-cwd>/<session-id>/subagents/agent-<agentId>.jsonl`; the `agentId` is in the Agent tool's result. Calls made before the PR exists (no `N` yet)
 are noted (role, phase, transcript) and all booked right after `gh pr create`. A failed `P cost` is a warning, never a reason to stop.
 
@@ -150,8 +151,7 @@ Never type, paraphrase or forge the owner's words, and never run Codex outside `
    **Queued behind** and stop. `hold-unreadable` ⇒ retry once after 60 s (a confirmed hold is kept, `holdTaken: true`; a take that may have half-written one is already released: `holdRelease`), then tell the owner and stop
    (with `holdTaken: true`, first `P merge-hold --pr N --release --reason hold-unreadable`).
    **Queue mode** (`P update-branch` answers `outcome: "queue-mode"`, the dry run says `queue: true`): it exists only when GitHub reports a merge queue on the base branch, which tests the PR on top of main and everything ahead of it. A moved base is no problem there: no `P update-branch` for "behind", no merge hold (`P merge-hold` answers `queueMode: true`), no catch-up CI. `owner-merge.md` (Merge as a job) has the merge-job outcomes. Queue off ⇒ everything above as today.
-3. **STOP** (outcome `awaiting-owner-merge`; `owner_approval: label` with a blocking item parks instead, no merge request): run the stop ritual first, then tell the owner in plain English what changed, the PR link, the review outcome and
-   follow-up issues.
+3. **STOP** (outcome `awaiting-owner-merge`; `owner_approval: label` with a blocking item parks instead, no merge request): run the stop ritual first, then tell the owner in plain English what changed, the PR link, the review outcome and follow-up issues.
    Then Read `reference/owner-merge.md` (section 3.3) and end the reply exactly as it says: which ending applies depends on the item note from 1.5 (as refreshed in step 2)
    (a `blocking` item ⇒ the repo's `merge.command`; otherwise `P merge --pr N --dry-run --owner-go` and its closing lines). The owner says "merge" ⇒ `P merge --pr N --owner-go` as a job
    (`P job start merge -- …`), never `gh pr merge` yourself. The block order is Rulings (when present), Areas, Hold, Head, 🔀; copy it from the dry run, never type the digest. Read the dry run whole: grep or a single-key `jq` drops the Rulings block. The closing lines look like:
