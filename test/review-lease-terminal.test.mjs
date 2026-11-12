@@ -202,6 +202,19 @@ test('SIGTERM closes the lease and the process dies of SIGTERM', POSIX_ONLY, asy
   assert.deepEqual(files(t), []);
 });
 
+test('a signal sent the moment the lease file appears still closes it (the handlers are registered before the file is written; repeated, because the window is a few ticks wide)', POSIX_ONLY, async () => {
+  const t = terminal();
+  const repo = reviewRepo();
+  for (const [i, signal] of ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGTERM', 'SIGINT', 'SIGHUP', 'SIGTERM', 'SIGINT'].entries()) {
+    const held = await holdOpen(t, repo);
+    held.cmd.child.kill(signal);
+    const out = await held.cmd.done;
+    held.unlock();
+    assert.equal(out.signal, signal, `round ${i}`);
+    assert.deepEqual(files(t), [], `round ${i}: ${signal} left a lease file`);
+  }
+});
+
 test('SIGKILL leaves the file; it is judged dead (pid gone, kill(pid, 0) says ESRCH even without ps) and sweepDeadLeases removes it', POSIX_ONLY, async () => {
   const t = terminal();
   const repo = reviewRepo();

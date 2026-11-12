@@ -241,14 +241,25 @@ function processHolder(opts) {
 // it the session's identity (HOLDER_ENV) and that session is still the real one (same ps start, same record: the checks a direct holder gets), it
 // is that session's holder (viaJob), so its lease lands in the session's own file and the session's summary / ended closes it. Anything that does
 // not check out (forged, stale, the session gone or cleared) is NOT trusted: the TTL-only holder below.
-export function resolveHolder({ worktree, ...opts } = {}) {
-  const env = opts.env ?? process.env;
+function ancestorOf(opts) {
   let ancestor = null;
   try {
     const given = opts.ancestorPid;
     ancestor = given !== undefined ? (typeof given === 'function' ? given() : given) : claudeCodeAncestorPid(opts.ancestry ?? {});
   } catch { ancestor = null; }
-  if (!isPosInt(ancestor)) ancestor = null;
+  return isPosInt(ancestor) ? ancestor : null;
+}
+
+// Would resolveHolder answer with this process's own holder (a plain terminal)? Cheap for a session (CLAUDECODE=1 decides without asking ps), so the wiring can
+// register its exit / signal close BEFORE the lease file is written (a signal between the write and the registration would leave the file behind).
+export function isProcessHolderCase(opts = {}) {
+  if ((opts.env ?? process.env).CLAUDECODE === '1') return false;
+  return ancestorOf(opts) === null;
+}
+
+export function resolveHolder({ worktree, ...opts } = {}) {
+  const env = opts.env ?? process.env;
+  const ancestor = ancestorOf(opts);
   if (ancestor === null && env.CLAUDECODE !== '1') return processHolder(opts);
   if (ancestor !== null) {
     const direct = verifiedSession(ancestor, opts);

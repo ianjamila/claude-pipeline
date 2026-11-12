@@ -121,10 +121,22 @@ export async function holdReviewLease(name, argv, ctx = {}) {
     const rawWait = seamValue(ADMISSION_WAIT_ENV, env);
     const waitMs = rawWait === undefined ? NaN : Number(rawWait);
     const leaseOpts = ctx.leaseOpts ?? {}; // in-process seams of the tests (an injected holder, ps ...); never from the environment
-    const result = await openOrRenewLease({ worktree: root, repoId: repoLockKey(root), command: name, ...(pr !== undefined ? { pr } : { branch }), env, ...(waitMs >= 0 ? { waitMs } : {}), ...leaseOpts });
+    // A plain terminal's exit / signal close is registered BEFORE the file is written (a signal between the write and a later registration would leave the file
+    // behind). The generation is not known yet: until it is, the close takes this process's lease whatever its generation (the file is this process's own).
+    const held = { worktree: root, generation: undefined, action: undefined, sessionId: undefined, process: false, leaseOpts, undo: () => {} };
+    const { isProcessHolderCase } = await import('./review-lease.mjs');
+    const early = isProcessHolderCase({ env, ...leaseOpts }) ? await registerExitClose(held, env) : null;
+    let result;
+    try {
+      result = await openOrRenewLease({ worktree: root, repoId: repoLockKey(root), command: name, ...(pr !== undefined ? { pr } : { branch }), env, ...(waitMs >= 0 ? { waitMs } : {}), ...leaseOpts });
+    } catch (err) {
+      early?.();
+      throw err;
+    }
+    if (result.skipped || !PROCESS_ID.test(result.sessionId)) early?.(); // no lease, or not a process lease after all: nothing to close on exit
     if (result.skipped) return { held: null };
-    const held = { worktree: root, generation: result.generation, action: result.action, sessionId: result.sessionId, process: PROCESS_ID.test(result.sessionId), leaseOpts, undo: () => {} };
-    if (held.process) held.undo = await registerExitClose(held, env);
+    Object.assign(held, { generation: result.generation, action: result.action, sessionId: result.sessionId, process: PROCESS_ID.test(result.sessionId) });
+    if (held.process) held.undo = early ?? (await registerExitClose(held, env));
     return { held };
   } catch (err) {
     return { failure: failureOf(err) };
