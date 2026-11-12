@@ -6,7 +6,7 @@
 //   R6-F4     `"${=…}"` and `"$=x"` split even inside double quotes.
 //   R6-F5     `echo "$((path[\$(rm S)]))"` and `echo "${(e):-\$(rm S)}"` evaluate with no assignment at all.
 // Home is /home/u and the filesystem is faked. Protected paths are built from parts so this file does not spell them either.
-import { test } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 
@@ -258,3 +258,51 @@ for (const [label, line] of R7_ALLOW) {
     assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
   });
 }
+
+// PR #288 post-push security review: the arithmetic gate (a) reads a lone `_` in ANY spelling (quoted, escaped, assigned) and `typeset -i` / `integer` / `declare -i` / `local -i` as arithmetic,
+// and (b) is decided on the UNMASKED line, so a protected path inside a value the guard treats as prose (a quoted echo argument, a commit message) still counts.
+describe('post-push 2', () => {
+  const PLANT = `echo 'path[${D}(rm ${S})]';`;
+  const DENY2 = [
+    ['printf %d "_"', `${PLANT} printf %d "_"`],
+    ["printf %d '_'", `${PLANT} printf %d '_'`],
+    ['printf %d \\_', `${PLANT} printf %d ${BSL}_`],
+    ['typeset -i n=_', `${PLANT} typeset -i n=_`],
+    ['integer n=_', `${PLANT} integer n=_`],
+    ['declare -i n=_', `${PLANT} declare -i n=_`],
+    ['local -i n=_', `${PLANT} local -i n=_`],
+    ['typeset -i n (no underscore)', `${PLANT} typeset -i n=3`],
+    ['[ "_" -gt 0 ]', `${PLANT} [ "_" -gt 0 ]`],
+    ['[ "_" = 0 ]', `${PLANT} [ "_" = 0 ]`],
+    ['_ after =', `${PLANT} x=_`],
+    ['(b) path only in a quoted echo argument + $((_))', `echo 'see ${S}'; echo ${D}((_))`],
+    ['(b) path only in a quoted echo argument + (( ))', `echo "note: ${S}"; ((n=_))`],
+    ['(b) path only in a quoted echo argument + let', `echo 'see ${S}'; let n=1`],
+    ['(b) path only in a quoted echo argument + printf %d "_"', `echo 'see ${S}'; printf %d "_"`],
+    ['(b) path only in a commit message + arithmetic', `git commit -m 'fix ${S}'; echo ${D}((_))`],
+  ];
+  for (const [label, line] of DENY2) {
+    test(`denies: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'deny', `${line} -> ${r.decision}`);
+    });
+  }
+  const ALLOW2 = [
+    ['no protected file: echo $((1+2))', 'echo $((1+2))'],
+    ['no protected file: printf %d _', 'printf %d _'],
+    ['no protected file: printf %d "_"', 'printf %d "_"'],
+    ['no protected file: typeset -i n=_', 'typeset -i n=_'],
+    ['no protected file: let', 'let n=1+2'],
+    ['cat S a_b', `cat ${S} a_b`],
+    ['cat S _x', `cat ${S} _x`],
+    ['cat S x_', `cat ${S} x_`],
+    ['cat S a_b _x x_ __init__', `cat ${S} a_b _x x_ __init__`],
+    ['cat S under_score.txt', `cat ${S} under_score.txt`],
+  ];
+  for (const [label, line] of ALLOW2) {
+    test(`allows: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
+    });
+  }
+});

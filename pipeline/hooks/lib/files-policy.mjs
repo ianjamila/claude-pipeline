@@ -1585,9 +1585,9 @@ const CDPATH_NAMES = ['CDPATH', 'cdpath'];
 const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'source', '.']);
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
 const LAST_WORD_RE = /\$_(?![A-Za-z0-9_])|\$\{_(?:[^A-Za-z0-9_}][^}]*)?\}/; // `$_` / `${_}`: the last word of the previous command (not `$_x`)
-// R7-F3 (#266): an arithmetic context on a line that names a protected file: `$((`, `((`, `$[`, a `let` word, a numeric test operator word (`-eq`, `-lt` ...) and a lone `_` word (whitespace-delimited;
-// `${x:_}`, `$a[_]`, `printf %d _`, `[ _ ... ]` read it as arithmetic). Each alternative is a literal or a one-class run, so the scan is linear.
-const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])let(?=\s)|\s-(?:eq|ne|lt|gt|le|ge)(?=\s)|(?:^|[\s:[(])_(?=[\s\])}:;&|]|$)/;
+// R7-F3 (#266): an arithmetic context on a line that names a protected file: `$((`, `((`, `$[`, a `let` word, a numeric test operator word (`-eq`, `-lt` ...), an integer declaration (`typeset -i`, `declare -i`, `local -i`, `integer`) and a lone `_` in ANY spelling (bare, quoted, escaped or assigned:
+// `${x:_}`, `$a[_]`, `printf %d "_"`, `n=_`, `[ "_" -gt 0 ]` read it as arithmetic; any `_` not touching a letter, digit or `_` fails closed; `$_` and `${_}` are expansions of the last word, not a name, and are judged by LAST_WORD_RE). Each alternative is a literal, a lookaround or a one-class run, so the scan is linear.
+const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])(?:let|integer)(?=\s)|(?:^|[\s;&|(){`])(?:typeset|declare|local)\s+-[A-Za-z]*i|\s-(?:eq|ne|lt|gt|le|ge)(?=\s)|(?<![$\p{L}\p{N}_]|\$\{)_(?![\p{L}\p{N}_])/u;
 const FD_DUP =/^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
 const FAN_OUT_RE = /(?:^|[\s;&|(`])(?:xargs|parallel)(?=\s|$)/;
@@ -3769,8 +3769,9 @@ function evaluateBashForFilesFrame(command, opts) {
   // when the raw text names a protected file at all.
   if ((cmds.dynamic || ctx.dynamic) && protectedInRaw) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
   // R7-F3 (#266): in arithmetic zsh reads a bare name `_` (the last word of the previous command) and evaluates its text again, a subscript with a substitution included. `echo 'path[$(cmd)]'; echo $((_))`
-  // plants nothing a rule can refuse, and the reader names no protected file, so it is never judged: on a line that names a protected file an arithmetic context anywhere denies the line.
-  if (protectedInRaw && ARITH_CONTEXT.test(raw)) return deny(`the command line refers to a protected pipeline file and holds an arithmetic context ($(( )), $[ ], (( )), let, a numeric test operator or a lone _ word), which can evaluate text planted by an earlier command; split it so the arithmetic is on its own line (${PROTECTED_MSG})`);
+  // plants nothing a rule can refuse, and the reader names no protected file, so it is never judged: on a line that names a protected file an arithmetic context anywhere denies the line. The gate reads the UNMASKED line (post-push review of #288): a path inside a prose value
+  // (a quoted echo argument, a commit message) is masked out of protectedInRaw, but the planted text can sit anywhere.
+  if ((protectedInRaw || m.rawHit(raw, dirs)) && ARITH_CONTEXT.test(raw)) return deny(`the command line refers to a protected pipeline file and holds an arithmetic context ($(( )), $[ ], (( )), let, a numeric test operator, an integer declaration or a lone _), which can evaluate text planted by an earlier command; split it so the arithmetic is on its own line (${PROTECTED_MSG})`);
 
   const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(rawOfCmd(c));
   // Why: in a rerun that assumes the directory (after a cd only known at run time) every relative word resolves inside the assumed protected directory (`npm`, `test`), so a word counts only when it can name
