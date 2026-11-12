@@ -721,3 +721,20 @@ test('triageComment: the Claude rulings list defuses the reason like any other c
   assert.ok(listLine && listLine.includes('tokcr'), 'reason missing from the list');
   assert.ok(!listLine.includes('<!--') && !listLine.includes('-->') && !listLine.includes('@'), 'raw marker or @ survived in the list');
 });
+
+// ---- the one current-lane line (risk-rating PR) -------------------------------------------------------------------------------
+import { triageComment as laneTriageComment } from '../pipeline/lib/render.mjs';
+
+test('triage comment: one "Second reviewer: Sonnet judge" line only while the state is judge AND medium; never for low, high, Fable or a pre-upgrade state', () => {
+  const LINE = /Second reviewer: Sonnet judge \(medium for size only; review\.size_only_medium_reviewer\)/;
+  const base = stateWith([]);
+  const comment = (over) => laneTriageComment({ ...base, ...over });
+  assert.match(comment({ reviewer: 'judge', risk: 'medium' }), LINE);
+  assert.equal((comment({ reviewer: 'judge', risk: 'medium' }).match(/Second reviewer:/g) ?? []).length, 1);
+  for (const over of [{ reviewer: 'judge', risk: 'low' }, { reviewer: 'fable', risk: 'medium' }, { reviewer: 'judge', risk: 'high' }, { reviewer: undefined, risk: 'medium' }, {}]) {
+    assert.doesNotMatch(comment(over), /Second reviewer:/, JSON.stringify(over));
+  }
+  // low -> medium size-only -> back to low: the line follows the CURRENT state only
+  assert.match(comment({ reviewer: 'judge', risk: 'medium' }), LINE);
+  assert.doesNotMatch(comment({ reviewer: 'judge', risk: 'low' }), LINE);
+});

@@ -540,3 +540,17 @@ test('telemetry: the agent-log line shows the Fable passes and how many were fix
   assert.equal(agentLogLine({ date: '2026-11-11', pr: 1, title: 't', risk: 'low', rounds: 2, arbiterCalls: 1, outcome: 'merged' }), '- 2026-11-11 · #1 · t · risk low · rounds 2 · arbiter 1 · merged');
   assert.equal(agentLogLine({ date: '2026-11-11', pr: 1, title: 't', risk: 'low', rounds: 2, arbiterCalls: 2, fixVerifyCalls: 1, outcome: 'merged' }), '- 2026-11-11 · #1 · t · risk low · rounds 2 · arbiter 2 (fix-verify 1) · merged');
 });
+
+test('arbiter needed: a P-path-only round range is the fix-verify brief when risk.ignore_hard_stop_rules lists P-path in BOTH configs, the full brief when it does not', (t) => {
+  const ignoring = 'risk:\n  ignore_hard_stop_rules: [P-path]\n';
+  const w = fixWorld(t, { yml: YML(`hard_stops:\n  paths: [src/hard.js]\n${ignoring}`), files: { 'src/b.js': bFile(true), 'src/hard.js': 'export const h = 1;\n' } });
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.scope, r.json.brief, r.json.agent], ['round', 'fix-verify', 'arbiter-fix']);
+  // the list is only in the working tree: the committed (base) config still counts the hit, so the brief is full
+  const w2 = fixWorld(t, { yml: YML('hard_stops:\n  paths: [src/hard.js]\n'), files: { 'src/b.js': bFile(true), 'src/hard.js': 'export const h = 1;\n' } });
+  writeFileSync(join(w2.repo.dir, '.claude', 'pipeline.yml'), YML(`hard_stops:\n  paths: [src/hard.js]\n${ignoring}`));
+  const r2 = w2.needed(2);
+  assertExit(r2, 0, r2.stdout + r2.stderr);
+  assert.deepEqual([r2.json.scope, r2.json.brief], ['round', 'full']);
+});
