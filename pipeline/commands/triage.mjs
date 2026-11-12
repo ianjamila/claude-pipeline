@@ -14,7 +14,7 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
-import { git, headSha, isAncestor, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
+import { git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
@@ -28,7 +28,7 @@ import {
   isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, rulingContentDigest, secondReviewRefusal, settleSecondReview, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
-  currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, withStateLock, writeFileAtomic, writeJson,
+  currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, reviewBaseRef, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
 import { establishBaseline, publishTriage } from '../lib/review-publish.mjs';
 
@@ -60,8 +60,8 @@ export const meta = {
     '     Run `followups create --round R` for EACH returned round afterwards (a retry is safe: it de-duplicates by fingerprint). Every deferral is a labelled row of the merge Rulings block, so the owner\'s "merge" binds each one by name',
     '  -> only with owner_approval: chat; exit 1 (state untouched) unless ALL hold: the round limit is reached and nothing is pending, waiting for a human, open BLOCKING, unimplemented or owed a Fable pass, and no unspent owner grant exists for the next round at any head (the lookup is STRICT: a records folder or session file that cannot be read, a record file over the size limit or not a regular file, an unreadable repo-moves file, an unsafe consumed-grants folder, or a record whose provenance cannot be confirmed as the owner\'s, refuses too; a records folder that does not exist is no grant; round-request applies the same lookup to its follow-up recommendation);',
     '     --ids is exactly the set of accepts no round has reviewed, each low severity (non-BLOCKING; category performance, maintainability, testing, design, docs or other; its file in the reviewed diff, on no risk.high_risk_paths / review.arbiter_always_paths glob,',
-    '     not the file of a BLOCKING or security ACCEPT) and each accepted by the judge or the arbiter (not the owner, Claude, a second review, a test or a cache copy; and no other accepted fix of ANY round is marked implemented unless it was marked before the last counted round began: `state mark-implemented` records the newest round number at the time as the item\'s implementedAfterRound, and a carried copy records the round before the one it sits in; a fix marked after that round, or a mark with no record, may be out of the reviewed head and refuses, so the round runs); the tree equals the last round\'s content (every commit since reverted; when the default branch was merged in and moved the content, record that update as a base-only round first: codex-review runs no Codex for it); --fix-head is an ancestor of HEAD, a descendant of the last REVIEWED head (the last round that is not a base-only one); the reviewedHead the issues compare against is the NEWEST recorded round, base-only or not, whose head --fix-head descends from (the base-only round recorded before the fix was made, or the last reviewed head when the update is recorded only after the revert), with',
-    '     other content (it only points the follow-up issues at the removed fix); and the state with the fixes deferred reads as a clean review. A severity or config error refuses. Claude cannot reopen a deferral (claude-ruling and second-review refuse it); it writes review state format version 3; the owner\'s owner-ruling can',
+    '     not the file of a BLOCKING or security ACCEPT) and each accepted by the judge or the arbiter (not the owner, Claude, a second review, a test or a cache copy; and no other accepted fix of ANY round is marked implemented unless it was marked before the last counted round began: `state mark-implemented` records the newest round number at the time as the item\'s implementedAfterRound, and a carried copy records the round before the one it sits in; a fix marked after that round, or a mark with no record, may be out of the reviewed head and refuses, so the round runs); the tree equals the last round\'s content (every commit since reverted; when the default branch was merged in and moved the content, record that update as a base-only round first: codex-review runs no Codex for it); --fix-head is an ancestor of HEAD, a descendant of the last REVIEWED head (the last round that is not a base-only one), and has other content than the reviewed one (it only points the follow-up issues at the removed fix); the reviewedHead the issues compare against is the comparison point whose merged-in default branch matches --fix-head\'s, so the compare shows just the fix: the NEWEST recorded round, base-only or not, whose head --fix-head descends from (the base-only round recorded before the fix was made, or the last reviewed head when the update is recorded only after the revert), or, when the default branch was merged in between the fix and the revert, the last round (the reverted tree carries that merge); with no match the first one and a `warnings` entry in the output;',
+    '     and the state with the fixes deferred reads as a clean review. A severity or config error refuses. Claude cannot reopen a deferral (claude-ruling and second-review refuse it); it writes review state format version 3; the owner\'s owner-ruling can',
     'pipeline triage claude-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --pr N [--repo DIR]',
     '  -> {ok, round, id, final, published, next?}; records CLAUDE\'s decision (final.by claude, needsHuman false, the overruled final and the cause kept) for an item waiting for a human, or tightens a Claude dismissal',
     '  -> only with owner_approval: chat; exit 1 for label mode, a --pr that is not the review state\'s, an empty reason or one over 1000 characters, or a ruling the rules refuse (state untouched)',
@@ -740,8 +740,20 @@ async function deferFixes(rest, ctx) {
     if (!isAncestor(revParse(lastReviewed.toHead, o), fixFull, o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is older than the last reviewed head ${String(lastReviewed.toHead).slice(0, 12)}: pass the head that held the fixes (a descendant of the reviewed head)`);
     // The anchor (the reviewedHead the issue compares against): the NEWEST round, base-only or not, whose head the fix descends from, so the issue shows just the fix whether the default branch
     // was merged in before the fix (that base-only round) or only after the revert (a base-only round the fix does not descend from, so an older one). A head that no longer resolves is skipped.
+    // When the default branch was merged in BETWEEN the fix and the revert, no round sits after that merge and above the fix, so that anchor lacks the merge and the issue's compare would show it (#287).
+    // The right comparison point is the one with the same merged-in default branch as the fix head: compare each candidate's merge-base with the default branch against the fix head's.
     const descends = (r) => { try { return isAncestor(revParse(r.toHead, o), fixFull, o); } catch { return false; } };
-    const anchor = [...state.rounds].reverse().find(descends) ?? lastReviewed;
+    const ancestorAnchor = [...state.rounds].reverse().find(descends) ?? lastReviewed;
+    const baseRef = reviewBaseRef(root, config);
+    const baseOf = (rev) => { try { return mergeBase(baseRef, rev, o); } catch { return null; } };
+    const fixBase = baseOf(fixFull);
+    const warnings = [];
+    let anchor = ancestorAnchor;
+    if (fixBase === null || baseOf(revParse(ancestorAnchor.toHead, o)) !== fixBase) {
+      // HEAD's content is the last round's and it descends from --fix-head: it carries whatever was merged in after the fix
+      if (fixBase !== null && baseOf('HEAD') === fixBase) anchor = last;
+      else warnings.push(`the follow-up issues compare the removed fix with ${String(ancestorAnchor.toHead).slice(0, 12)}, but the default branch merged into the fix head is not the same one: the compare may show that merge too`);
+    }
     const fixHash = reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log, head: fixFull }, o);
     if ([last, anchor, lastReviewed].some((r) => fixHash === r.contentHashAtToHead)) {
       return refuse(`--fix-head ${fixFull.slice(0, 12)} has the reviewed content, so it is not the head that held the fixes: pass the head the round-request line named`);
@@ -752,7 +764,7 @@ async function deferFixes(rest, ctx) {
     saveState(root, next);
     const wanted = new Set(want);
     const rounds = next.rounds.filter((r) => (r.items ?? []).some((i) => wanted.has(i.id))).map((r) => r.n).sort((a, b) => a - b);
-    return { exitCode: EXIT.OK, output: { ok: true, deferred: want, rounds, ...publishRuling({ ctx, root, pr, state: next }) } };
+    return { exitCode: EXIT.OK, output: { ok: true, deferred: want, rounds, ...publishRuling({ ctx, root, pr, state: next }), ...(warnings.length ? { warnings } : {}) } };
   }, pr));
 }
 
