@@ -507,6 +507,54 @@ test('pipeline-guards.yml runs on every label the pipeline acts on and skips any
   assert.equal(lists[0].length, 1);
 });
 
+test('pipeline-guards.yml skips drafts except approval-label events, and converted_to_draft cancels a running evaluation', () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const wf = parseYaml(readFileSync(join(root, 'pipeline', 'templates', 'workflows', 'pipeline-guards.yml'), 'utf8'));
+  const types = wf.on.pull_request_target.types;
+  for (const t of ['converted_to_draft', 'ready_for_review', 'labeled', 'unlabeled']) assert.ok(types.includes(t), `${t} must be a trigger`);
+
+  const runs = actionsExpr(wf.jobs.guards.if);
+  const groupParts = /^pipeline-guards-\$\{\{ (.+?) \}\}\$\{\{ (.+) \}\}$/.exec(wf.concurrency.group);
+  assert.ok(groupParts, wf.concurrency.group);
+  const group = (github) => `pipeline-guards-${actionsExpr(groupParts[1])(github)}${actionsExpr(groupParts[2])(github)}`;
+  const ev = (action, draft, extra = {}) => ({ event: { action, pull_request: { number: 7, draft }, changes: {}, ...extra } });
+
+  // On a draft: only a labeled/unlabeled of the two approval labels runs (their run posts the receipt the approval needs).
+  for (const name of ['human-approved', 'test-change-approved']) {
+    for (const action of ['labeled', 'unlabeled']) {
+      assert.equal(Boolean(runs(ev(action, true, { label: { name } }))), true, `${action} ${name} on a draft must run`);
+    }
+  }
+  // Every other event on a draft skips: plain events, the other pipeline labels, a base retarget, the conversion itself.
+  for (const action of ['opened', 'synchronize', 'reopened', 'converted_to_draft']) {
+    assert.equal(Boolean(runs(ev(action, true))), false, `${action} on a draft must skip`);
+  }
+  assert.equal(Boolean(runs(ev('edited', true, { changes: { base: { ref: { from: 'dev' } } } }))), false);
+  for (const name of ['pipeline-recheck', 'awaiting-review', 'needs-human', 'pipeline-blocked', 'pipeline-pause', 'pipeline-rollback', 'bug']) {
+    for (const action of ['labeled', 'unlabeled']) {
+      assert.equal(Boolean(runs(ev(action, true, { label: { name } }))), false, `${action} ${name} on a draft must skip`);
+    }
+  }
+  // ready_for_review re-evaluates (the PR is no longer a draft in its payload); a ready PR behaves as before.
+  assert.equal(Boolean(runs(ev('ready_for_review', false))), true);
+  for (const action of ['opened', 'synchronize', 'reopened']) assert.equal(Boolean(runs(ev(action, false))), true, action);
+  assert.equal(Boolean(runs(ev('labeled', false, { label: { name: 'pipeline-recheck' } }))), true);
+  assert.equal(Boolean(runs(ev('labeled', false, { label: { name: 'bug' } }))), false);
+
+  // converted_to_draft is in the PR's REAL group (a skipped run there still cancels the evaluation running on the old head),
+  // never the -noop group.
+  assert.equal(group(ev('converted_to_draft', true)), 'pipeline-guards-7');
+  assert.equal(group(ev('ready_for_review', false)), 'pipeline-guards-7');
+  assert.equal(wf.concurrency['cancel-in-progress'], true);
+
+  // The draft exception names exactly the two approval labels the guard reads, and adds no second label list (the
+  // concurrency/if list equality above stays a single list).
+  const guardSrc = readFileSync(join(root, 'pipeline', 'templates', 'scripts', 'pipeline', 'ci-guard.mjs'), 'utf8');
+  const approvals = ['INTEGRITY_LABEL', 'HARDSTOP_LABEL'].map((k) => new RegExp(`^export const ${k} = '([^']+)';$`, 'm').exec(guardSrc)?.[1]);
+  const named = [...wf.jobs.guards.if.matchAll(/github\.event\.label\.name == '([^']+)'/g)].map((m) => m[1]).sort();
+  assert.deepEqual(named, [...approvals].sort());
+});
+
 // ---- who may approve: ci.approvers, the owner of a user repo, never an org name -----------------------------------------
 
 const APPROVERS = { config: CONFIG(undefined, 'ci:\n  approvers: [alice, "Bob"]\n') };

@@ -26,6 +26,14 @@
 # listen to: `pipeline review-complete` adds and removes the label `pipeline-recheck` on a ready PR to start a run (a draft
 # gets its run when it is marked ready).
 #
+# Drafts: nothing is judged on a draft (it cannot merge, and a run per push would verdict a head nobody is waiting on). The
+# job's `if` skips every event on a draft except a `labeled`/`unlabeled` of the two approval labels; `ready_for_review`
+# re-evaluates everything. The exception follows from the receipt rule below: an approval counts only if its `labeled` run
+# posted a receipt on the head, so skipping that run would let an approval given on a draft be removed at ready.
+# `converted_to_draft` is listed so that it lands in the PR's real concurrency group (below) and cancels an evaluation still
+# running on the head the PR just left; its own run skips because the PR is a draft by then. The cancelled run's last step marks
+# a still-pending guard status `error` ("guard did not finish"); `ready_for_review` replaces it, and a draft cannot merge meanwhile.
+#
 # Approvals: a `labeled` run by an allowed approver first posts a receipt status (`pipeline-approval: <label>`) on the
 # exact head sha; an approval label only counts for a head that carries a fresh receipt from github-actions[bot], so an
 # approval can never carry over to a later commit. The label name and the sender reach the job only through env:.
@@ -41,7 +49,7 @@ name: Pipeline guards
 on:
   pull_request_target:
     # edited: a PR retargeted with `gh pr edit --base` must be judged against its NEW base, or its old statuses stay green.
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled, edited]
 
 permissions:
   contents: read        # read base + fetch the PR head as data
@@ -64,11 +72,15 @@ jobs:
   guards:
     name: pipeline-guards
     # `edited` also fires for title/body edits: only a base-branch change needs a new verdict. A label event runs only for a
-    # label the pipeline acts on (same list as `concurrency`).
+    # label the pipeline acts on (same list as `concurrency`). A draft is skipped, except a label event of the two approval
+    # labels (their labeled run posts the receipt the approval needs at ready; see "Drafts" in the header).
     if: >-
       (github.event.action != 'edited' || github.event.changes.base)
       && ((github.event.action != 'labeled' && github.event.action != 'unlabeled')
       || contains(fromJSON('["human-approved","test-change-approved","pipeline-recheck","awaiting-review","needs-human","pipeline-blocked","pipeline-pause","pipeline-rollback"]'), github.event.label.name))
+      && (!github.event.pull_request.draft
+      || ((github.event.action == 'labeled' || github.event.action == 'unlabeled')
+      && (github.event.label.name == 'human-approved' || github.event.label.name == 'test-change-approved')))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
