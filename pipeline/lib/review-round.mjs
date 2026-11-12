@@ -25,7 +25,7 @@ import { collectHardStops } from './hardstops.mjs';
 import { createGitHub } from './github.mjs';
 import { GhError } from './proc.mjs';
 import { assessRisk, isLightLane, reviewLane } from './risk.mjs';
-import { addRound, emptyState, loadState, saveState } from './state.mjs';
+import { addRound, emptyState, loadState, maxRiskOf, saveState } from './state.mjs';
 import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from './triage.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
@@ -263,8 +263,10 @@ export const baseOnlyFindings = () => ({
 });
 
 // Phase two. `findings` are the reviewer's validated findings (validateFindings ok). `roundFields` are stored on the round as given.
+// `gate()` runs first inside the lock, before anything is read or written (throw to abort: codex-review's compare-and-swap on route.json, exit 2 superseded);
+// `afterSave()` runs inside the lock once the state is saved.
 // Returns { items (the round's items after reuse of prior rulings), state (the saved state), grantUsed: {grantId} | undefined }.
-export async function recordRound({ adm, findings, roundFields = {} }) {
+export async function recordRound({ adm, findings, roundFields = {}, gate, afterSave }) {
   const { root, ctx, pr, round, base, head, config, dir } = adm;
   const o = { cwd: root };
   const flags = { baseOnly: adm.baseOnly, resolutionOnly: adm.resolutionOnly };
@@ -288,6 +290,7 @@ export async function recordRound({ adm, findings, roundFields = {} }) {
   const items = await withReviewLock(root, pr, ctx, async () => {
     // The reviewer took a while: whatever happened to the review meanwhile (another session recorded this round, the PR's
     // state was replaced) is read again, and what is there now wins.
+    if (gate) await gate();
     const fresh = readReviewState(root);
     checkRound(fresh, adm);
     // A grant that admitted the round before the reviewer ran but is gone now (another checkout claimed it meanwhile) says so.
@@ -328,8 +331,9 @@ export async function recordRound({ adm, findings, roundFields = {} }) {
     const ruled = linkDeferredFollowups(reuseRuled(assignIds(findings, round, excerptFor, { contentHash: adm.hashAtHead }), ruledCacheFrom(allItems(base0)), { round }), allItems(base0));
     const reviewer = adm.fable || fresh?.reviewer === 'fable' ? 'fable' : 'judge';
     const reasons = adm.lane.reasons.length > 0 ? adm.lane.reasons : ['reviewed by Fable in an earlier round'];
-    const next = addRound({ ...base0, risk: adm.level, lightLane: reviewer === 'fable' ? false : adm.lightLane, reviewer, currentContentHash: adm.hashAtHead }, {
-      n: round, fromHead: base, toHead: head, contentHashAtToHead: adm.hashAtHead, items: ruled,
+    // maxRisk is read from the state as it was BEFORE this round overwrites state.risk (a legacy state without maxRisk starts it from what it recorded).
+    const next = addRound({ ...base0, ...(fresh ? { maxRisk: maxRiskOf(fresh) } : {}), risk: adm.level, lightLane: reviewer === 'fable' ? false : adm.lightLane, reviewer, currentContentHash: adm.hashAtHead }, {
+      n: round, fromHead: base, toHead: head, contentHashAtToHead: adm.hashAtHead, items: ruled, risk: adm.level,
       reviewBase: adm.review.base, reviewBaseKind: adm.review.kind, forkPoint: adm.forkPoint, ...roundFields, ...(adm.baseOnly ? { baseOnly: true } : {}),
       ...(admission === 'uncounted' ? {} : { admission }), ...(ownerGrant === undefined ? {} : { ownerGrant }),
       ...(adm.confirmItems.length > 0 ? { confirmFixed: adm.confirmItems.map((i) => i.id) } : {}),
@@ -341,6 +345,7 @@ export async function recordRound({ adm, findings, roundFields = {} }) {
     claimGrant();
     saveState(root, next);
     saved = next;
+    if (afterSave) await afterSave();
     grantUsed = ownerGrant === undefined ? undefined : { grantId: ownerGrant.grantId };
     return ruled;
   });

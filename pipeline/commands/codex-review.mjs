@@ -18,6 +18,7 @@
 // so a second reviewer records a round through exactly the same code; this command is the Codex part: the prompt, running Codex, validating
 // what it wrote.
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { FINDINGS_SCHEMA_PATH, buildCodexArgs, validateFindings } from '../lib/codex.mjs';
@@ -26,6 +27,13 @@ import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs
 import { headSha, revParse } from '../lib/git.mjs';
 import { admitRound, baseOnlyFindings, headMoved, recordRound, roundPrompt, unavailable } from '../lib/review-round.mjs';
 import { roundDir, writeFileAtomic } from '../lib/review-context.mjs';
+import { createGitHub } from '../lib/github.mjs';
+import { noteCodexAnswered, noteQuotaStop } from '../lib/codex-usage.mjs';
+import { higherRisk, maxRiskOf } from '../lib/state.mjs';
+import { substituteAgentFor } from '../lib/triage.mjs';
+import {
+  assertCurrentAttempt, finishAttempt, publishAttemptFiles, startAttempt, substituteEligibility, writeFinalRoute,
+} from '../lib/route-record.mjs';
 
 export const meta = {
   summary: 'run one Codex review round over base..head and record its findings',
@@ -54,7 +62,15 @@ export const meta = {
     '    {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise',
     '    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not',
     '    taken alone',
-    '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver',
+    '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver. A Codex failure also carries',
+    '    substitute:{eligible, why, agent, resetAt, waitUntil?}: eligible only for a real quota stop (Codex\'s own turn.failed event, confirmed by its session log when found) with',
+    '    review.substitute.mode auto; agent is substitute-fable once the PR was ever high risk (maxRisk), else substitute-opus; review.substitute.min_wait_minutes above 0 and a',
+    '    reset within it gives eligible:false, waitUntil (default 0: never wait). A quota stop also carries quota:{proof: session-log|stream, resetAt, resetText}, and is noted',
+    '    in the machine-wide Codex record (P codex-status: lastOutage, waiting); the next Codex answer for the PR clears it (best effort: a failure there is a warnings entry, never a failed round)',
+    '  a Codex timeout is retried once (same prompt, same attempt): retried:{reason:timeout}; a second timeout is exit 3 unavailable with timedOut:true, never a substitute',
+    '  every Codex attempt first replaces .review/round-R/route.json with {attemptId, evidence:pending, round, base, head, patchSha256, risk, agent, at} and keeps its files in',
+    '    round-R/attempt-<attemptId>/ (codex-raw.json, prompt.md). The final evidence (quota | none) and a recorded round are written under the review lock only while route.json still',
+    '    holds this attempt in pending, else exit 2 {error:superseded} (nothing written, nothing deleted); the winner\'s files are copied to round-R/. The file is written by this command only',
     '  env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)',
   ].join('\n'),
 };
@@ -86,14 +102,15 @@ export const run = guarded(async (argv, ctx) => {
   }
 
   const dir = roundDir(root, round);
-  const outPath = path.join(dir, 'codex-raw.json');
   const model = values.model ?? config.review.codex_model;
-  let args;
-  try {
-    args = buildCodexArgs({ cwd: root, model, effort, schemaPath: FINDINGS_SCHEMA_PATH, outPath });
-  } catch (err) {
-    throw new UsageError(err.message);
-  }
+  const argsFor = (outPath) => {
+    try {
+      return buildCodexArgs({ cwd: root, model, effort, schemaPath: FINDINGS_SCHEMA_PATH, outPath });
+    } catch (err) {
+      throw new UsageError(err.message);
+    }
+  };
+  argsFor(path.join(dir, 'codex-raw.json')); // a bad effort or model is a usage error before anything runs
 
   const adm = await admitRound({ root, config, ctx, pr, round, base, head });
   const { baseOnly, resolutionOnly, resolutionView, resolution, resolutionIneligible } = adm;
@@ -105,13 +122,63 @@ export const run = guarded(async (argv, ctx) => {
   const promptBytes = Buffer.from(prompt, 'utf8');
   const promptSha256 = baseOnly ? undefined : createHash('sha256').update(promptBytes).digest('hex');
 
+  // The repository's slug for the machine-wide Codex record (best effort: null when GitHub cannot say).
+  const repoSlug = () => {
+    if (adm.ghRepo?.slug) return adm.ghRepo.slug;
+    if (adm.slug) return adm.slug;
+    try {
+      return createGitHub({ cwd: root, env: ctx.env }).repo().slug;
+    } catch {
+      return null;
+    }
+  };
+  const sub = config.review.substitute;
+
+  // One attempt: route.json says 'pending' (and the attempt's files live in round-R/attempt-<id>/) before Codex starts. A base-only round asks nothing: no attempt.
+  let attempt = null;
+  let outPath;
+  let args;
+  if (!baseOnly) {
+    // The agent is chosen by the highest risk the PR ever had (a shrinking diff never brings the cheaper reviewer back).
+    const risk = adm.state ? higherRisk(maxRiskOf(adm.state), adm.level) : adm.level;
+    const patchSha256 = createHash('sha256').update(readFileSync(path.join(dir, 'diff.patch'))).digest('hex');
+    attempt = await startAttempt({ root, pr, ctx, round, base, head, patchSha256, risk, agent: substituteAgentFor(risk) });
+    outPath = path.join(attempt.dir, 'codex-raw.json');
+    args = argsFor(outPath);
+  }
+
+  // A failed run: the verdict on a substitute, the final evidence (compare-and-swap: a superseded attempt exits 2 here instead), the machine-wide record.
+  const failed = async (reason, extra, { ran, detail } = {}) => {
+    const verdict = substituteEligibility({
+      reason, timedOut: ran?.timedOut === true, quota: ran?.quota, mode: sub.mode, minWaitMinutes: sub.min_wait_minutes, agent: attempt.route.agent,
+    });
+    const quotaStop = reason === 'quota' && ran?.quota?.eligible === true;
+    const final = quotaStop
+      ? {
+        evidence: 'quota', outcome: 'failed', reason: 'quota', resetAt: ran.quota.resetAt, resetText: ran.quota.resetText,
+        errorEvent: { type: 'turn.failed', message: ran.quota.message }, threadId: ran.quota.threadId ?? null, promptSha256, proof: ran.quota.proof,
+      }
+      : { evidence: 'none', outcome: 'failed', reason, ...(ran?.timedOut ? { timedOut: true } : {}), ...(detail === undefined ? {} : { detail }) };
+    await finishAttempt({ root, pr, ctx, round, attempt, final });
+    const warnings = quotaStop
+      ? await noteQuotaStop({ at: new Date(), resetAt: ran.quota.resetAt, resetText: ran.quota.resetText, repo: repoSlug(), pr, round, worktree: root, env: ctx.env })
+      : [];
+    return unavailable(reason, {
+      ...extra,
+      ...(ran?.retried ? { retried: ran.retried } : {}),
+      ...(quotaStop || (reason === 'quota' && ran?.quota) ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
+      substitute: verdict,
+      ...(warnings.length > 0 ? { warnings } : {}),
+    });
+  };
+
   // Runs Codex over the prepared prompt and returns its validated findings (every failure is an exit-3 Fail).
   const askCodex = async () => {
     // execCodex removes whatever is at the output path first (so it can never be read as this run's answer; the mtime check in
     // readCodexAnswer is the second line of defence, the tree kill on timeout the third).
-    writeFileAtomic(path.join(dir, 'prompt.md'), promptBytes);
+    writeFileAtomic(path.join(attempt.dir, 'prompt.md'), promptBytes);
     const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
-    if (!ran.ok) throw unavailable(ran.reason, { code: ran.code, timedOut: ran.timedOut, detail: ran.detail });
+    if (!ran.ok) throw await failed(ran.reason, { code: ran.code, timedOut: ran.timedOut, detail: ran.detail }, { ran, detail: ran.detail });
 
     if (headSha(o) !== head) throw headMoved();
 
@@ -119,21 +186,32 @@ export const run = guarded(async (argv, ctx) => {
     try {
       findings = readCodexAnswer(outPath, ran.startedAt);
     } catch (err) {
-      throw unavailable('malformed', { errors: [err.message] });
+      throw await failed('malformed', { errors: [err.message] }, { ran: { retried: ran.retried } });
     }
     const checked = validateFindings(findings);
-    if (!checked.ok) throw unavailable('malformed', { errors: checked.errors });
+    if (!checked.ok) throw await failed('malformed', { errors: checked.errors }, { ran: { retried: ran.retried } });
 
-    return findings;
+    return { findings, retried: ran.retried };
   };
   // A base-merge-only round has nothing to ask about: zero findings, and the round says why.
-  const findings = baseOnly
-    ? baseOnlyFindings()
+  const { findings, retried } = baseOnly
+    ? { findings: baseOnlyFindings(), retried: undefined }
     : await askCodex();
 
+  // The round is recorded only while route.json still holds this attempt (compare-and-swap under the review lock): else exit 2 superseded and nothing is written.
+  let pendingRoute;
   const { items, state, grantUsed } = await recordRound({
     adm, findings, roundFields: { codexModel: model, ...(promptSha256 === undefined ? {} : { promptSha256 }) },
+    ...(attempt === null ? {} : {
+      gate: () => {
+        pendingRoute = assertCurrentAttempt(root, round, attempt.attemptId);
+        publishAttemptFiles(root, round, attempt.attemptId, ['prompt.md', 'codex-raw.json']);
+      },
+      afterSave: () => writeFinalRoute(root, round, pendingRoute, { evidence: 'none', outcome: 'recorded' }),
+    }),
   });
+  // Codex answered: the PR is no longer waiting for it and its last outage is over (best effort).
+  const warnings = baseOnly ? [] : await noteCodexAnswered({ pr, repo: repoSlug, env: ctx.env });
 
   return {
     exitCode: EXIT.OK,
@@ -146,6 +224,8 @@ export const run = guarded(async (argv, ctx) => {
         worth_considering: findings.worth_considering.length,
       },
       ...(baseOnly ? { baseOnly: true } : {}),
+      ...(retried ? { retried } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
       ...(resolutionOnly ? { resolutionOnly: true, conflicted: resolutionView.conflicted, conflictedCount: resolution.conflictedCount } : {}),
       ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }),
       ...(grantUsed === undefined ? {} : { grantUsed }),

@@ -268,7 +268,7 @@ test('codex-review: a valid findings file becomes round 1 with ids, state, codex
   const [call] = w.captured();
   const at = (flag) => call.argv[call.argv.indexOf(flag) + 1];
   assert.equal(call.argv[0], 'exec');
-  assert.equal(at('-o'), w.roundFile(1, 'codex-raw.json'));
+  assert.match(at('-o'), /[\\/]round-1[\\/]attempt-[0-9a-f]{16}[\\/]codex-raw\.json$/, 'Codex writes into the attempt\'s own folder; the winner\'s copy is round-1/codex-raw.json');
   assert.equal(at('-C'), w.repo.dir);
   assert.match(at('--output-schema'), /codex-findings\.schema\.json$/);
   assert.ok(call.argv.includes('model="gpt-6-astra"') && call.argv.includes('model_reasoning_effort="high"'));
@@ -383,7 +383,10 @@ test('codex-review: a leftover raw file from an earlier run is never read as thi
   assertExit(r, 3);
   assert.equal(r.json.reason, 'malformed');
   assert.ok(!existsSync(join(w.repo.dir, '.review', 'state.json')));
-  assert.ok(!existsSync(stale), 'the stale file was removed before Codex ran');
+  // Codex now writes into the attempt's own folder (cp #256), so a file left at round-1/codex-raw.json is never even the output path: it is not read, and an
+  // attempt that fails publishes nothing over it. The remove-before-run guard for the attempt's own output path is pinned in codex-exec.test.mjs.
+  const attempt = readdirSync(join(w.repo.dir, '.review', 'round-1')).find((n) => n.startsWith('attempt-'));
+  assert.ok(!existsSync(join(w.repo.dir, '.review', 'round-1', attempt, 'codex-raw.json')), 'nothing was read from, or written to, the attempt folder');
 });
 
 test('codex-review: an answer Codex writes during the run is read even when its source bytes are old (fake writes fresh, not a Windows copy)', (t) => {

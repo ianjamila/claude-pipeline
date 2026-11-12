@@ -16,4 +16,7 @@ export function scratchFloorDir() {
 }
 
 export const SHARED_FLOOR_DIR = scratchFloorDir();
-export const floorEnv = (dir = SHARED_FLOOR_DIR) => ({ PIPELINE_MODEL_FLOOR_DIR: dir });
+// PIPELINE_CODEX_STATUS_DIR: the machine-wide Codex outage record codex-review writes on a quota stop; a scratch folder, so no test touches the account's real one.
+const SHARED_STATUS_DIR = join(realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-codex-status-'))), 'codex');
+made.push(join(SHARED_STATUS_DIR, '..'));
+export const floorEnv = (dir = SHARED_FLOOR_DIR) => ({ PIPELINE_MODEL_FLOOR_DIR: dir, PIPELINE_CODEX_STATUS_DIR: SHARED_STATUS_DIR });

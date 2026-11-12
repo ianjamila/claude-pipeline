@@ -273,3 +273,41 @@ export function backAtMs(status, nowMs) {
   const future = times.filter((t) => Number.isFinite(t) && t > nowMs);
   return future.length === 0 ? null : Math.max(...future);
 }
+
+// ---- best-effort notes the commands make (a failure here is a warning, never a failed round) ---------------------------------------------------
+// -> [warning text]. Neither throws.
+// A quota stop: lastOutage = this stop, and the PR is parked until Codex is back (the resume prompt names the worktree).
+export async function noteQuotaStop({ at, resetAt, resetText, repo, pr, round, worktree, now, env } = {}) {
+  const warnings = [];
+  try {
+    await recordOutage({ at, resetAt, resetText, repo, pr, round, worktree, now }, { env });
+  } catch (err) {
+    warnings.push(`could not record the Codex outage: ${err.message}`);
+  }
+  try {
+    await addWaiting({ repo, pr, worktree, round, since: at, now }, { env });
+  } catch (err) {
+    warnings.push(`could not record the PR as waiting for Codex: ${err.message}`);
+  }
+  return warnings;
+}
+
+// Codex answered a review for this PR: the PR is no longer waiting, and the last outage is over. Reads the record first (no lock, no file written) and
+// does nothing when it holds nothing to clear. `repo` is a slug, or a function that gives one (null when unknown: the waiting entry is then left).
+export async function noteCodexAnswered({ pr, repo, env } = {}) {
+  const warnings = [];
+  try {
+    const status = readStatus({ env });
+    const parked = status.waiting.some((w) => w.pr === pr);
+    if (status.lastOutage === null && !parked) return warnings;
+    if (parked) {
+      const slug = typeof repo === 'function' ? repo() : repo;
+      if (typeof slug === 'string' && slug !== '') await removeWaiting({ repo: slug, pr }, { env });
+      else warnings.push('could not tell which repository the waiting PR belongs to; it stays in the Codex waiting list');
+    }
+    if (status.lastOutage !== null) await clearOutage({ env });
+  } catch (err) {
+    warnings.push(`could not update the Codex outage record: ${err.message}`);
+  }
+  return warnings;
+}

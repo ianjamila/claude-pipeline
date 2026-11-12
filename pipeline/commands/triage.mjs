@@ -521,7 +521,12 @@ async function secondReview(rest, ctx) {
   writeFileAtomic(path.join(dir, `second-review-${ids[0]}.md`), promptBytes);
   const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
   if (!ran.ok) {
-    throw new Fail(EXIT.UNAVAILABLE, { ok: false, unavailable: true, reason: ran.reason, code: ran.code, timedOut: ran.timedOut, detail: ran.detail });
+    // The facts of the run are forwarded as codex-review does (a timeout was retried once; a quota stop carries its proof and reset time).
+    throw new Fail(EXIT.UNAVAILABLE, {
+      ok: false, unavailable: true, reason: ran.reason, code: ran.code, timedOut: ran.timedOut, detail: ran.detail,
+      ...(ran.retried ? { retried: ran.retried } : {}),
+      ...(ran.reason === 'quota' && ran.quota ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
+    });
   }
   // From here on a bad answer stores nothing, so the call can simply be run again.
   let answer;
