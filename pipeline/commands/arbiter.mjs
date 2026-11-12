@@ -14,8 +14,7 @@ import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { fingerprint, largeBinaryNote, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
 import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
-import { loadConfig, validateConfig } from '../lib/config.mjs';
-import { parseYaml } from '../lib/yaml.mjs';
+import { baseConfigAt, loadConfig } from '../lib/config.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, expectationOf, fixRoundCandidate } from '../lib/fix-verify.mjs';
 import { assessRisk, reviewLane } from '../lib/risk.mjs';
@@ -275,26 +274,6 @@ function reviewSection(state, round, diff, fix = null) {
 // (arbiter needed --full). Anything unreadable (config, base config, range) is `full`: the fallback is today's behaviour, never a cheaper review by accident.
 // -> { expectation, fix, reason }: `reason` says why (also the message of an error that was caught on the way), printed and stored as briefReason.
 const msgOf = (err) => String(err?.message ?? err).split('\n')[0];
-
-// The config as the base side (the PR's fork point) has it: { ok: true, config } | { ok: false, reason }.
-function baseConfigAt(forkPoint, root) {
-  if (typeof forkPoint !== 'string' || forkPoint === '') return { ok: false, reason: 'the round records no fork point' };
-  let text;
-  try {
-    text = showFile(forkPoint, '.claude/pipeline.yml', { cwd: root });
-  } catch (err) {
-    return { ok: false, reason: `could not read .claude/pipeline.yml at the fork point: ${msgOf(err)}` };
-  }
-  if (text === null) return { ok: false, reason: 'the fork point has no .claude/pipeline.yml' };
-  let parsed;
-  try {
-    parsed = validateConfig(parseYaml(text));
-  } catch (err) {
-    return { ok: false, reason: `the fork point's .claude/pipeline.yml cannot be parsed: ${msgOf(err)}` };
-  }
-  if (!parsed.ok) return { ok: false, reason: `the fork point's .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
-  return { ok: true, config: parsed.config };
-}
 
 async function chooseBrief(state, round, diff, root, { forceFull = false } = {}) {
   const full = (reason) => ({ expectation: BRIEFS[BRIEF_FULL], fix: null, reason });

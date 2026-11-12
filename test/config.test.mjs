@@ -1001,3 +1001,31 @@ test('verify.ci_proof parses from real YAML (hyphenated step names, nested mappi
   assert.equal(r.ok, true, r.errors.join('; '));
   assert.deepEqual(r.config.verify.ci_proof, { 'sql-arms': { workflow: '.github/workflows/ci.yml', job: 'SQL arms', event: 'pull_request' } });
 });
+
+test('risk.ignore_hard_stop_rules: defaults to empty; only P-path and R4-config are accepted, anything else names the allowlist', () => {
+  assert.deepEqual(DEFAULTS.risk.ignore_hard_stop_rules, []);
+  const ok = validateConfig({ ...minimal(), risk: { ignore_hard_stop_rules: ['P-path', 'R4-config'] } });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual(ok.config.risk.ignore_hard_stop_rules, ['P-path', 'R4-config']);
+  assert.deepEqual(validateConfig(minimal()).config.risk.ignore_hard_stop_rules, []);
+  // the guard core, the database/auth/secret rules and the rest can never be discounted
+  for (const rule of ['R4-pipeline', 'R0-unscannable', 'R1-destructive', 'R2-auth', 'R3-secrets', 'R5-major-dep', 'R6-sensitive', 'P-pattern', 'nonsense']) {
+    const r = validateConfig({ ...minimal(), risk: { ignore_hard_stop_rules: [rule] } });
+    assert.ok(has(r, 'risk.ignore_hard_stop_rules[0]'), rule);
+    assert.ok(has(r, 'P-path, R4-config'), `${rule}: the error names the allowlist`);
+  }
+  for (const bad of ['P-path', { a: 1 }, null, [1]]) {
+    assert.ok(has(validateConfig({ ...minimal(), risk: { ignore_hard_stop_rules: bad } }), 'risk.ignore_hard_stop_rules'), JSON.stringify(bad));
+  }
+});
+
+test('review.size_only_medium_reviewer: judge (default) or fable, anything else rejected', () => {
+  assert.equal(DEFAULTS.review.size_only_medium_reviewer, 'judge');
+  assert.equal(validateConfig(minimal()).config.review.size_only_medium_reviewer, 'judge');
+  const fable = validateConfig({ ...minimal(), review: { size_only_medium_reviewer: 'fable' } });
+  assert.equal(fable.ok, true, fable.errors.join('; '));
+  assert.equal(fable.config.review.size_only_medium_reviewer, 'fable');
+  for (const bad of ['sonnet', '', true, null, ['judge']]) {
+    assert.ok(has(validateConfig({ ...minimal(), review: { size_only_medium_reviewer: bad } }), 'review.size_only_medium_reviewer'), JSON.stringify(bad));
+  }
+});
