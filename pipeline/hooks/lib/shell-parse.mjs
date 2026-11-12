@@ -2229,60 +2229,91 @@ class Parser {
     return out;
   }
 
+  // One reading of a heredoc body that starts at `from`: where the shell would end it and what it would hand the command.
+  //   raw   every physical line is compared with the delimiter as written (a quoted delimiter; the <<- tab strip is per line)
+  //   bash  an UNQUOTED body: backslash-newline joins the lines, then <<- strips the tabs of the joined line (bash: make_here_document)
+  //   zsh   as bash, but <<- strips the tabs of the FIRST physical line of a logical line before the join (zsh: gethere)
+  // Returns { end (just past the terminator line, or the end of the text), found, lines, odd, bodyEnd (where the terminator line starts) }.
+  hdReading(from, h, mode) {
+    const s = this.src;
+    const n = s.length;
+    let pos = from;
+    const lines = [];
+    let odd = false;
+    while (pos < n) {
+      const logicalAt = pos;
+      const parts = [];
+      let line;
+      let first = true;
+      for (;;) {
+        const eol = s.indexOf('\n', pos);
+        const end = eol < 0 ? n : eol;
+        line = s.slice(pos, end);
+        pos = eol < 0 ? n : eol + 1;
+        if (h.strip && (mode === 'raw' || (mode === 'zsh' && first))) line = line.replace(/^\t+/, '');
+        first = false;
+        if (mode === 'raw') break;
+        let b = line.length;
+        while (b > 0 && line.charCodeAt(b - 1) === 92) b--;
+        const run = line.length - b;
+        if (run === 0) break;
+        odd = true; // (a body line ends in a backslash: this is where the readings may part)
+        if (run % 2 === 0 || pos >= n) break;
+        parts.push(line.slice(0, -1));
+      }
+      if (parts.length) { parts.push(line); line = parts.join(''); }
+      if (h.strip && mode === 'bash') line = line.replace(/^\t+/, '');
+      if (line.replace(/\r$/, '') === h.delim) {
+        if (line.endsWith('\r')) odd = true; // (the shell does not end a body at `EOF\r`: the two disagree)
+        return { end: pos, found: true, lines, odd, bodyEnd: logicalAt };
+      }
+      lines.push(line);
+    }
+    return { end: n, found: false, lines, odd, bodyEnd: n };
+  }
+
   // this.i is at the start of the lines after a command line that opened heredocs: consume the bodies.
+  // R11: bash and zsh part over backslash-newline inside a body (the join, and where the <<- tab strip falls), so no single reading is safe. An UNQUOTED body that has a
+  // backslash-ended line is read every plausible way; the parse continues after the LATEST terminator, every reading's body is scanned for substitutions, and the lines
+  // between the earliest terminator and the latest are ALSO parsed as commands (as written): a command is seen whichever reading the shell takes.
   readHeredocs() {
     const s = this.src;
     let pos = this.i;
     for (const h of this.hd) {
-      const lines = []; // (the body's lines as the command reads them: for an unquoted delimiter, joined where a line ends in a backslash)
-      const rawLines = []; // (and as written)
       const bodyAt = pos;
-      let found = false;
-      while (pos < s.length) {
-        // R10-F1/F2: with an UNQUOTED delimiter bash and zsh remove backslash-newline before they compare a line with the delimiter (the <<- tab strip is per physical line, before the join): a line ending in an odd run of
-        // backslashes joins the next one. A quoted delimiter compares raw lines. The parts are collected and joined once per logical line (a long run of continued lines stays linear).
-        const parts = [];
-        let line;
-        for (;;) {
-          const eol = s.indexOf('\n', pos);
-          const end = eol < 0 ? s.length : eol;
-          line = s.slice(pos, end);
-          pos = eol < 0 ? s.length : eol + 1;
-          rawLines.push(line);
-          if (h.strip) line = line.replace(/^\t+/, ''); // (<<- strips the tabs of every physical line, a continuation too)
-          if (h.quoted) break;
-          let b = line.length;
-          while (b > 0 && line.charCodeAt(b - 1) === 92) b--;
-          const run = line.length - b;
-          if (run === 0) break;
-          this.ctx.hdOdd = true; // (fail closed: whatever the join does, a body line ending in a backslash is where the two readings may part)
-          if (run % 2 === 0 || pos >= s.length) break;
-          parts.push(line.slice(0, -1));
+      const rs = [this.hdReading(bodyAt, h, h.quoted ? 'raw' : 'bash')];
+      if (!h.quoted) {
+        if (rs[0].odd) {
+          this.ctx.hdOdd = true;
+          rs.push(this.hdReading(bodyAt, h, 'raw'));
+          if (h.strip) rs.push(this.hdReading(bodyAt, h, 'zsh'));
         }
-        if (parts.length) { parts.push(line); line = parts.join(''); }
-        const cmp = line.replace(/\r$/, '');
-        if (cmp === h.delim) { found = true; if (line.endsWith('\r')) this.ctx.hdOdd = true; rawLines.length = rawLines.length - (parts.length || 1); break; } // (the shell does not end a body at `EOF\r`: the two disagree)
-        lines.push(line);
       }
-      // Why: `<<-` strips the leading tabs of the body before the command reads it (`bash <<-'EOF'` + `\tgit pu\` + `\tsh origin main`: one push the tabs hid)
-      const raw = rawLines.join('\n');
-      const text = lines.join('\n');
-      h.seg.heredocs.push({ text, quoted: h.quoted, lines: lines.length });
-      // where the body sits in the line (see heredocSpans in simpleCommands): only for a body this parser read out of the line itself and that ended at
-      // its terminator; one read out of another text (backticks, bash -c, a body's own substitution) or that ran to the end is not located.
+      const found = rs.filter((r) => r.found);
+      const last = rs.reduce((m, r) => (r.end > m.end ? r : m), rs[0]);
+      const agree = rs.every((r) => r.end === rs[0].end && r.found === rs[0].found);
+      const first = found.length ? found.reduce((m, r) => (r.end < m.end ? r : m), found[0]) : null;
+      // the texts the command reads (one per distinct reading): `<<-` strips the tabs before the command reads the body (`bash <<-'EOF'` + `\tgit pu\` + `\tsh origin main`: one push the tabs hid)
+      const byText = new Map(rs.map((r) => [r.lines.join('\n'), r.lines.length]));
+      const texts = [...byText.keys()];
+      for (const [text, lines] of byText) h.seg.heredocs.push({ text, quoted: h.quoted, lines });
+      // where the body sits in the line (see heredocSpans in simpleCommands): only for a body this parser read out of the line itself that every reading ended at the same
+      // terminator; one read out of another text (backticks, bash -c, a body's own substitution), that ran to the end or that the readings part over is not located.
       // The span covers the raw body as written (tabs included), not the stripped text
-      if (found && this.src === this.ctx.rootSrc) this.ctx.hdSpans.push([bodyAt, bodyAt + raw.length, h.quoted]);
+      if (agree && rs[0].found && this.src === this.ctx.rootSrc) this.ctx.hdSpans.push([bodyAt, bodyAt + Math.max(0, rs[0].bodyEnd - bodyAt - 1), h.quoted]);
       else this.ctx.hdForeign = true;
+      pos = last.end;
       h.seg.pending--;
       if (h.seg.muted) continue;
       const grp = this.ctx.grp;
       this.ctx.grp = h.seg.grp; // (the body expands where its command runs: inside the subshells that command was written in)
       try {
-        // No terminator: either a malformed command or a `<<` we mistook for a heredoc that then swallowed the rest
-        // of the line. Parsing the body as script costs a false positive at worst, never a miss.
-        if (!found) this.subParse(text, h.seg.depth + 1);
-        // An unquoted heredoc still expands $(...) and backticks, so a body can run commands. Quoted ones are inert data.
-        else if (!h.quoted) this.scanExpansions(text, h.seg.depth);
+        // An unquoted heredoc still expands $(...) and backticks, so a body can run commands (whatever the text around them: a `#` or single quotes are plain body text). Quoted ones are inert data.
+        if (!h.quoted) for (const text of texts) this.scanExpansions(text, h.seg.depth);
+        // The lines the readings part over (after the earliest terminator, up to the latest) are commands under another reading. No terminator at all: either a malformed
+        // command or a `<<` we mistook for a heredoc that then swallowed the rest of the line: the body, as written, is parsed as script (a false positive at worst, never a miss).
+        const from = first ? first.end : bodyAt;
+        if (from < last.end) this.subParse(s.slice(from, last.end), h.seg.depth + 1);
       } finally { this.ctx.grp = grp; }
     }
     this.hd = [];
