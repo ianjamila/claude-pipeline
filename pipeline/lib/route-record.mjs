@@ -1,7 +1,7 @@
 // .review/round-R/route.json: the ONE record of how a Codex attempt for a round went and whether a Claude substitute may stand in for it
 // (plan 2026-11-11-codex-substitute-reviewer, R4-10, R4-12, R5-7). Its lifecycle:
 //
-//   start   every codex-review attempt first replaces route.json atomically (under the review lock) with
+//   start   every codex-review attempt first replaces route.json atomically (write-then-rename, WITHOUT the review lock: Codex itself runs unlocked) with
 //           { attemptId, evidence: 'pending', round, base, head, patchSha256, risk, agent, at }, so evidence from an earlier attempt is gone before
 //           Codex runs. The attempt's files live in round-R/attempt-<attemptId>/ (codex-raw.json, prompt.md): a later attempt can neither read nor
 //           remove them.
@@ -49,15 +49,14 @@ export function assertCurrentAttempt(root, round, attemptId) {
 }
 
 // Atomically replaces route.json with a fresh pending record and makes the attempt's folder. -> { attemptId, dir, route }.
-export async function startAttempt({ root, pr, ctx, round, base, head, patchSha256, risk, agent, now = Date.now() }) {
+export async function startAttempt({ root, round, base, head, patchSha256, risk, agent, now = Date.now() }) {
   const attemptId = newAttemptId();
   const route = { attemptId, evidence: 'pending', round, base, head, patchSha256, risk, agent, at: new Date(now).toISOString() };
   const dir = attemptDir(root, round, attemptId);
-  await withReviewLock(root, pr, ctx, () => {
-    ensureRoundDir(root, round);
-    mkdirSync(dir, { recursive: true });
-    writeJson(routeFile(root, round), route);
-  });
+  // No review lock: the review lock is held only to record a round, never while Codex runs. The rename is atomic; the compare-and-swap that needs the lock is the final write.
+  ensureRoundDir(root, round);
+  mkdirSync(dir, { recursive: true });
+  writeJson(routeFile(root, round), route);
   return { attemptId, dir, route };
 }
 

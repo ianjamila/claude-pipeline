@@ -263,7 +263,7 @@ export const baseOnlyFindings = () => ({
 });
 
 // Phase two. `findings` are the reviewer's validated findings (validateFindings ok). `roundFields` are stored on the round as given.
-// `gate()` runs first inside the lock, before anything is read or written (throw to abort: codex-review's compare-and-swap on route.json, exit 2 superseded);
+// `gate()` runs inside the lock right after the round-order check, before anything is written (throw to abort: codex-review's compare-and-swap on route.json, exit 2 superseded);
 // `afterSave()` runs inside the lock once the state is saved.
 // Returns { items (the round's items after reuse of prior rulings), state (the saved state), grantUsed: {grantId} | undefined }.
 export async function recordRound({ adm, findings, roundFields = {}, gate, afterSave }) {
@@ -290,9 +290,9 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
   const items = await withReviewLock(root, pr, ctx, async () => {
     // The reviewer took a while: whatever happened to the review meanwhile (another session recorded this round, the PR's
     // state was replaced) is read again, and what is there now wins.
-    if (gate) await gate();
     const fresh = readReviewState(root);
-    checkRound(fresh, adm);
+    checkRound(fresh, adm); // a round another writer recorded meanwhile wins first (exit 2 round-order), as before
+    if (gate) await gate();
     // A grant that admitted the round before the reviewer ran but is gone now (another checkout claimed it meanwhile) says so.
     const admission = checkCap(adm, fresh, flags, { already: adm.preAdmission === 'owner' });
     checkBase(fresh, adm);

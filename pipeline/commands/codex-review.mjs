@@ -142,7 +142,7 @@ export const run = guarded(async (argv, ctx) => {
     // The agent is chosen by the highest risk the PR ever had (a shrinking diff never brings the cheaper reviewer back).
     const risk = adm.state ? higherRisk(maxRiskOf(adm.state), adm.level) : adm.level;
     const patchSha256 = createHash('sha256').update(readFileSync(path.join(dir, 'diff.patch'))).digest('hex');
-    attempt = await startAttempt({ root, pr, ctx, round, base, head, patchSha256, risk, agent: substituteAgentFor(risk) });
+    attempt = await startAttempt({ root, round, base, head, patchSha256, risk, agent: substituteAgentFor(risk) });
     outPath = path.join(attempt.dir, 'codex-raw.json');
     args = argsFor(outPath);
   }
