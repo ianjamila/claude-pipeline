@@ -167,7 +167,7 @@ jobs:
               --jq "[.[] | select(.context == \"$ctx\")][0].state" 2>/dev/null || true)
             if [ -z "$cur" ] || [ "$cur" = "pending" ]; then
               gh api "repos/$REPO/statuses/$EVENT_HEAD" -f state=error -f context="$ctx" \
-                -f description="guard did not finish — push a commit, or close and reopen the PR, to run it again" \
+                -f description="guard did not finish — push a commit, or close and reopen the PR, to run it again (a draft: mark it ready)" \
                 -f target_url="$RUN_URL" > /dev/null || true
             fi
           done

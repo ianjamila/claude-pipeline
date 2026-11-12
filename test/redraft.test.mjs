@@ -63,6 +63,7 @@ test('1. ready + iterating + holds: the hold is released (redraft sentence) BEFO
   assert.equal(r.json.draft, true);
   assert.equal(r.json.changed, true);
   assert.equal('skipped' in r.json, false);
+  assert.equal('autoMergeDisabled' in r.json, false, 'nothing armed: no do-not-push signal');
   assert.equal(r.json.holdRelease.reason, 'redraft');
   assert.equal(r.json.holdRelease.confirmed, true);
   assert.deepEqual(r.json.warnings, []);
@@ -95,6 +96,7 @@ test('3. already draft + holds: the release runs, no mutation, changed:false; a 
   assert.equal(r.json.wasDraft, true);
   assert.equal(r.json.draft, true);
   assert.equal(r.json.changed, false);
+  assert.equal('autoMergeDisabled' in r.json, false);
   assert.equal(r.json.holdRelease.confirmed, true);
   assert.deepEqual(holdCalls(s), [`release ${PR} ${RELEASE_REASONS.redraft}`]);
   assert.deepEqual(mutations(s), []);
@@ -105,6 +107,7 @@ test('3. already draft + holds: the release runs, no mutation, changed:false; a 
   const k = redraft(own);
   assertExit(k, 0, k.stdout);
   assert.equal(k.json.changed, false);
+  assert.equal('autoMergeDisabled' in k.json, false);
   assert.equal('holdRelease' in k.json, false, 'the hold taken for the pipeline\'s own catch-up is kept');
   assert.deepEqual(holdCalls(own), []);
   assert.deepEqual(mutations(own), []);
@@ -117,6 +120,7 @@ test('4. not iterating (ci.draft_while_iterating false): the release runs, no mu
   assert.equal(r.json.changed, false);
   assert.equal(r.json.draft, false);
   assert.equal(r.json.skipped, 'draft-not-iterating');
+  assert.equal('autoMergeDisabled' in r.json, false);
   assert.equal(r.json.holdRelease.confirmed, true);
   assert.deepEqual(holdCalls(s), [`release ${PR} ${RELEASE_REASONS.redraft}`]);
   assert.deepEqual(mutations(s), []);

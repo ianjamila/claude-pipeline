@@ -1274,3 +1274,12 @@ test('the review comment --jq filter keeps only marker comments, shaped as the o
     { id: 11, by: 'mallory', at: T('10:03'), updated: T('10:04'), body: `${body}\n` },
   ]);
 });
+
+test('pipeline-guards.yml: the "did not finish" status names the remedy that works on a draft (mark it ready) and fits the 140-char cap', () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const yml = readFileSync(join(root, 'pipeline', 'templates', 'workflows', 'pipeline-guards.yml'), 'utf8');
+  const m = /-f description="(guard did not finish[^"]*)"/.exec(yml);
+  assert.ok(m, 'the fail-closed step must post a "guard did not finish" description');
+  assert.match(m[1], /a draft: mark it ready/);
+  assert.ok([...m[1]].length <= 140, `${[...m[1]].length} chars`);
+});
