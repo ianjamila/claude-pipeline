@@ -207,3 +207,45 @@ test('R2-F1 analysePr: the round before a past-limit round counts its NEW accept
   assert.equal(prevOf([cached('R1-S1'), acc('R1-B1', 'BLOCKING')]), 'blocking-or-security', 'a new BLOCKING accept next to a cached one');
   assert.equal(prevOf([acc('R1-S1')]), 'only-low-fixes');
 });
+
+const noteOf = (r) => r.json.warnings.join('\n');
+const onlyComments = (extra) => [world[0], { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(1, summaryBody(cost7)), mine(2, triageBody(state7)), ...extra] }];
+
+test('R2-F2 stats rounds: a pipeline comment that is skipped says why in the warnings (other author, other PR or repository, unreadable); an ordinary comment says nothing', () => {
+  const otherRepo = emptyRecord({ repo: 'acme/other', pr: 7, branch: 'feat/x', baseRef: 'main' });
+  const cases = [
+    ['a state by another author', [{ id: 3, user: { login: 'mallory' }, body: triageBody(state7) }], /widgets#7: ignored a review state comment by mallory: only the viewer's own comments count/],
+    ['a record by another author', [{ id: 3, user: { login: 'mallory' }, body: summaryBody(cost7) }], /widgets#7: ignored a run record comment by mallory: only the viewer's own comments count/],
+    ['a record of another repository', [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...otherRepo, cost: cost7 })}`)], /widgets#7: ignored a run record bound to acme\/other#7: not this PR or repository/],
+    ['a record of another PR', [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'acme/widgets', pr: 8, branch: 'feat/x', baseRef: 'main' }), cost: cost7 })}`)], /widgets#7: ignored a run record bound to acme\/widgets#8: not this PR or repository/],
+    ['a state of another PR', [mine(3, triageBody({ ...state7, pr: 8 }))], /widgets#7: ignored a review state bound to PR 8: not this PR/],
+    ['a state with an unnumbered round', [mine(3, triageBody(stateOf([round('x', [])])))], /widgets#7: ignored a review state: unreadable/],
+    ['a state that does not decode', [mine(3, `${MARKERS.triage}\n\nno state here`)], /widgets#7: ignored a review state: unreadable/],
+    ['a record that does not decode', [mine(3, `${MARKERS.summary}\n\n<!-- claude-pipeline:record:AAAA -->`)], /widgets#7: ignored a run record: unreadable \(invalid\)/],
+  ];
+  for (const [what, extra, want] of cases) {
+    const r = statsCli(onlyComments(extra), ['--json', '--pr', '7']);
+    assertExit(r, 0, r.stderr + r.stdout);
+    if (want) assert.match(noteOf(r), want, what);
+    assert.equal(r.json.warnings.length, 1, `${what}: ${noteOf(r)}`);
+  }
+  const quiet = statsCli(onlyComments([mine(3, 'LGTM'), { id: 4, user: { login: 'mallory' }, body: 'a remark' }, mine(5, `> quoted\n${triageBody(state7)}`), mine(6, `${MARKERS.summary}\n\nan old summary without a record`)]), ['--json', '--pr', '7']);
+  assert.deepEqual(quiet.json.warnings, [], 'comments that are not the pipeline\'s say nothing');
+});
+
+test('R2-F2 stats rounds: a hostile login or round number in a skipped comment stays one printable line in the warning', () => {
+  const r = statsCli(onlyComments([{ id: 3, user: { login: 'mal\nlory\u001b[2J' }, body: triageBody(state7) }]), ['--pr', '7', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(/[\u001b\r]/.test(r.stdout), false);
+  assert.match(r.stdout, /Warnings:\n- acme\/widgets#7: ignored a review state comment by mal/);
+});
+
+test('R2-F2 stats rounds: the plain-text table prints how many PRs had no review state', () => {
+  const r = statsCli([...world, { match: '^api repos/acme/widgets/issues/22/comments', stdoutJson: [mine(1, 'hello')] }], ['--pr', '7', '--pr', '22']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(r.stdout, /PRs without a review state: 1/);
+  const none = statsCli(world, ['--pr', '7']);
+  assert.match(none.stdout, /PRs without a review state: 0/);
+  const text = renderTable({ since: '2026-11-05', repos: ['acme/widgets'], totals: aggregate([]), prs: [], withoutState: 3 });
+  assert.match(text, /PRs without a review state: 3/);
+});

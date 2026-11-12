@@ -93,7 +93,7 @@ const cell = (s) => asciiLine(s, 200);
 const usdText = (v) => (v === null || v === undefined ? '-' : `$${v.toFixed(2)}`);
 
 // The plain-text table: one line per PR, then the totals.
-export function renderTable({ since, repos, totals, prs }) {
+export function renderTable({ since, repos, totals, prs, withoutState }) {
   const out = [cell(`Review rounds of PRs merged since ${since} in ${repos.join(', ')}`), ''];
   out.push(`${pad('PR', 28)}${pad('limit', 7)}${pad('rounds', 8)}${pad('past', 6)}${pad('cost', 10)}${pad('loop', 6)}past-limit rounds (admission, previous round, found)`);
   for (const p of prs) {
@@ -103,6 +103,7 @@ export function renderTable({ since, repos, totals, prs }) {
   const list = (o) => Object.entries(o).map(([k, v]) => cell(`${k} ${v}`)).join(', ') || 'none';
   out.push('', `PRs ${totals.prs} (${totals.prsPastCap} went past the limit) · counted rounds ${totals.countedRounds} · past the limit ${totals.pastCapRounds}${totals.pastCapShare === null ? '' : ` (${(totals.pastCapShare * 100).toFixed(1)}%)`} · booked ${usdText(totals.usd)}`);
   out.push(`Past-limit admission: ${list(totals.admission)}`, `Round before them: ${list(totals.previous)}`, `What they found: ${list(totals.found)}`);
+  out.push(`PRs without a review state: ${Number.isFinite(withoutState) ? withoutState : 0}`);
   out.push(`PRs with a BLOCKING loop (BLOCKING accepted in 2+ consecutive rounds): ${totals.blockingLoopPrs}${totals.pastCapUsd ? ` · past-limit rounds with a booking: ${totals.pastCapUsd.rounds}, ${usdText(totals.pastCapUsd.usd)}` : ''}`);
   return out.join('\n');
 }

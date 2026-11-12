@@ -690,7 +690,7 @@ pipeline stats rounds [--repo-slug owner/name]... [--since YYYY-MM-DD] [--pr N].
      read (run record, triage state) and counted: totals {prs, prsPastCap, countedRounds, pastCapRounds, pastCapShare, admission {auto-extra|owner-granted|unknown}, previous (what the round before a past-limit round had
      to re-check: no-accepts | only-low-fixes = non-BLOCKING non-security accepts | blocking-or-security), found (new-blocking | accepts | deferred = its accepts were all deferred past the cap | nothing-accepted), blockingLoopPrs, usd, pastCapUsd}; prs [{repo, pr, id, maxRounds,
      countedRounds, pastCapRounds, usd, blockingLoop, rounds: [{n, k, pastCap, usd (cost.byRound, `cost --round R`), acceptedBlocking, admission?, previous?, found?}]}]. --pr N limits it to those PRs (merged or not listed by date).
-     Without --json the same numbers print as a plain-text table. A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.
+     Without --json the same numbers print as a plain-text table. Only the viewer's own comments count (the pipeline's comments posted under another login are ignored, with a warning); a pipeline comment that is skipped (other author, bound to another PR or repository, unreadable) is named in `warnings`. A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.
      Read-only. Severity is judged from the recorded item (BLOCKING, a security category or a security word is not low), since a PR comment does not carry the reviewed diff `itemSeverity` needs.
 ```
 

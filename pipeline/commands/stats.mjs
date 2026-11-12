@@ -17,7 +17,7 @@ export const meta = {
     '     read (run record, triage state) and counted: totals {prs, prsPastCap, countedRounds, pastCapRounds, pastCapShare, admission {auto-extra|owner-granted|unknown}, previous (what the round before a past-limit round had',
     '     to re-check: no-accepts | only-low-fixes = non-BLOCKING non-security accepts | blocking-or-security), found (new-blocking | accepts | deferred = its accepts were all deferred past the cap | nothing-accepted), blockingLoopPrs, usd, pastCapUsd}; prs [{repo, pr, id, maxRounds,',
     '     countedRounds, pastCapRounds, usd, blockingLoop, rounds: [{n, k, pastCap, usd (cost.byRound, `cost --round R`), acceptedBlocking, admission?, previous?, found?}]}]. --pr N limits it to those PRs (merged or not listed by date).',
-    '     Without --json the same numbers print as a plain-text table. A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.',
+    '     Without --json the same numbers print as a plain-text table. Only the viewer\'s own comments count (the pipeline\'s comments posted under another login are ignored, with a warning); a pipeline comment that is skipped (other author, bound to another PR or repository, unreadable) is named in `warnings`. A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.',
     '     Read-only. Severity is judged from the recorded item (BLOCKING, a security category or a security word is not low), since a PR comment does not carry the reviewed diff `itemSeverity` needs.',
   ].join('\n'),
 };
@@ -68,14 +68,29 @@ async function rounds(rest, ctx) {
           let record = null;
           let state = null;
           const slugLower = slug.toLowerCase();
+          const skip = (what, why) => warnings.push(`${slug}#${number}: ignored ${what}${why}`);
           for (const c of comments) {
-            // only our own comment that STARTS with the marker, for this repository and PR: a quote, a copy or someone else's comment is never the state
-            if (c?.user?.login !== me || typeof c.body !== 'string') continue;
-            const r = decodeRecord(c.body);
-            if (r.status === 'ok' && r.record.pr === number && String(r.record.repo ?? '').toLowerCase() === slugLower) record = r.record;
-            if (c.body.startsWith(MARKERS.triage)) {
+            if (typeof c?.body !== 'string') continue;
+            const isState = c.body.startsWith(MARKERS.triage);
+            const isRecord = c.body.startsWith(MARKERS.summary);
+            // only our own comment that STARTS with the marker, for this repository and PR: a quote, a copy or someone else's comment is never the state.
+            // A comment that does start with a marker but is skipped says why, so the totals are not silently short.
+            if (c.user?.login !== me) {
+              if (isState || isRecord) skip(`a ${isState ? 'review state' : 'run record'} comment by ${asciiLine(c.user?.login, 60) || 'an unknown author'}`, ": only the viewer's own comments count");
+              continue;
+            }
+            if (isRecord) {
+              const r = decodeRecord(c.body);
+              if (r.status === 'ok') {
+                if (r.record.pr === number && String(r.record.repo ?? '').toLowerCase() === slugLower) record = r.record;
+                else skip(`a run record bound to ${asciiLine(r.record.repo, 80)}#${asciiLine(r.record.pr, 20)}`, ': not this PR or repository');
+              } else if (r.status === 'invalid' || r.status === 'unsupported') skip('a run record', `: unreadable (${r.status})`);
+            }
+            if (isState) {
               const decoded = decodeFromComment(c.body);
               if (isReadableState(decoded, number)) state = decoded;
+              else if (decoded && Number.isInteger(decoded.pr) && decoded.pr !== number) skip(`a review state bound to PR ${decoded.pr}`, ': not this PR');
+              else skip('a review state', ': unreadable');
             }
           }
           const p = analysePr({ repo: slug, pr: number, state, record });
