@@ -1489,13 +1489,14 @@ function cdUnknownShape(argv) {
   if (cn === 'cd' && args.filter((x) => !x.startsWith('-')).length > 1) return true;
   return t !== undefined && /^~(?:[-+]|[A-Za-z_])/.test(t);
 }
-// R12: a word is provably literal when nothing in it is settled at run time: no `$`, backtick, glob character, brace or quote left in it
-const literalWord = (w) => !/[$`*?[{(\\'"]/.test(w);
+// R12: a word is provably literal when nothing in it is settled at run time. R13: a POSITIVE shape (letters, digits and `_ . , : / = @ % + -`), not a list of bad characters: zsh's `^ # ~ < > !`
+// (extendedglob, redirections, history) and whatever else a shell may read as more than the characters themselves make a word non-literal
+const literalWord = (w) => /^[A-Za-z0-9_.,:\/=@%+-]+$/.test(w);
 const literalCommand = (w) => w === '[' || literalWord(w); // (the test builtin `[` is a name, not a glob)
 // R11-F2: `set` is safe (no effect on what `cd` means) only as a WHITELIST: every flag word is literal letters from SAFE_SET_FLAGS, or `-o` / `+o` (also `-eo NAME`, `-oNAME`) with a name in SAFE_SET_OPTIONS,
 // up to the first word that is not a flag (the positional parameters) or `--`. R12-B2: that word must be literal (`set "$F"`, `set $(echo -T)`, `set *` may be `set -T`); a word after a literal `--` is positional whatever it is. Anything else -- zsh's `-T` (CDABLE_VARS), other letters, `-$F` (letters only known at run time), a bare `-o`, an unknown name -- is a switch.
 const SAFE_SET_OPTIONS = new Set(['errexit', 'nounset', 'pipefail', 'xtrace', 'verbose', 'noclobber']);
-const SAFE_SET_FLAGS = new Set(['e', 'u', 'x', 'v', 'f', 'C', 'a']);
+const SAFE_SET_FLAGS = new Set(['e', 'u', 'x', 'v', 'f', 'C', 'a', 'E']); // (R13-F3: E is errtrace in bash and PUSHD_SILENT in zsh; neither changes where `cd NAME` goes)
 const optionWord = (w) => w.toLowerCase().replace(/[_-]/g, '');
 function setIsSafe(argv) {
   const args = argv.slice(1);
@@ -1536,9 +1537,12 @@ function optionSwitch(c) {
 // Is this a command that may turn on CDABLE_VARS (`cd NAME` then goes to $NAME) or is it a switch whose name cannot be read? Then a cd of the line leads to a directory only known at run time.
 // `set` outside the whitelist; `setopt` / `unsetopt` / `emulate` / `shopt` with ANY word (an option name, a flag such as `-T`, a run-time word): one spelling is as good as another (`unsetopt nocdablevars`).
 // R12-F3 / R13-B1: a command word only known at run time (`S=shopt; $S -s cdable_vars`, or the whole command in one word, `S="shopt -s cdable_vars"; $S`), or behind a wrapper, is one too, whatever the argument count.
+// The one run-time command word that is no switch: a whole command that is a single double-quoted word of plain parameter references and literal text (`"$HERE/build.sh"`), with no argument.
+// Inside double quotes the value is not split or globbed (no `$S` that holds `shopt -s cdable_vars`; `"${=S}"`, `"${(z)S}"`, `"$@"` and `"$(..)"` do not match), and a program run without arguments cannot set an option.
+const loneQuotedRef = (c) => c.argv.length === 1 && /^"(?:[^"$`\\]|\$[A-Za-z_]\w*|\$\{[A-Za-z_]\w*\})*"$/.test((c.raw ?? '').trim());
 function cdMeaningSwitch(c) {
   const { argv, blind } = unwrapBuiltin(c.argv);
-  if (blind || (argv.length > 0 && !literalCommand(argv[0]))) return true; // (no command word at all, `A=1`, is no switch)
+  if (blind || (argv.length > 0 && !literalCommand(argv[0]) && !loneQuotedRef(c))) return true; // (no command word at all, `A=1`, is no switch)
   const name = baseOf(argv[0] ?? '');
   if (name === 'set' && !setIsSafe(argv)) return true;
   if (['setopt', 'unsetopt', 'emulate', 'shopt'].includes(name) && argv.length > 1) return true;
@@ -3425,8 +3429,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false, cdSwitch: false };
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
-  // (R11-F3: a source below that switches it on counts from there on. R13: so does the line's own switch, which the sources it follows run under: `set -T; source ./a.sh` with a `cd proj` in a.sh)
-  let cdSwitched = ctx.lineCdSwitch === true || cmds.some(cdMeaningSwitch);
+  let cdSwitched = cmds.some(cdMeaningSwitch); // (R11-F3: a source below that switches it on counts from there on)
   const from = flowStart(cmds);
   const seen = new Map();
   const local = Object.create(null);
@@ -3502,7 +3505,8 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   for (const m of text.matchAll(/\{([A-Za-z_]\w*)\}\s*(?:[<>]|&>)/g)) bind([m[1]]);
   // R12-F4: the commands are walked in text order, not run order: a cd in a function or a loop body that comes before the source that switches cdablevars on runs after it. A switch anywhere
   // in the file or its nested sources makes every cd / pushd / chdir of the file unknown
-  if (cdSwitched && cmds.some((c) => CD_NAMED.has(baseOf(c.argv[0] ?? '')))) out.unknownCd = true;
+  // R13: the line's own switch counts for the cds of the file too (`set -T; source ./a.sh`, a.sh holds `cd proj`), but is not the file's switch (out.cdSwitch stays the file's own)
+  if ((cdSwitched || ctx.lineCdSwitch === true) && cmds.some((c) => CD_NAMED.has(baseOf(c.argv[0] ?? '')))) out.unknownCd = true;
   out.cdSwitch = cdSwitched;
   return out;
 }
