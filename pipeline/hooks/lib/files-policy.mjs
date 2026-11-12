@@ -915,16 +915,27 @@ const REL_PREFIX = '(?<![\\w$.~/\\\\-])(?:[\\w.\\-]+/+)*';
 // (cp #256 R6-F1: the ~/.codex folder itself behind a prefix only known at run time, `cp -R /tmp/forged/. "$(echo ~)/.codex"`; a relative one is judged by the resolved-path checks)
 const CODEX_DIR = '\\.codex/*(?![\\w.\\-/])|';
 // (cp #256 R6-F1 hardening: the same path spelled with `.`, `//` or `x/..` segments, `$H/./.codex`, `$H/.codex/.`, `$H/.codex/x/..`: collapsed here, so the matchers do not list spellings)
-const DOT_SEGMENTS = [[/\/{2,}/g, "/"], [/\/\.(?=\/)/g, ""], [/\/\.(?=$|[\s'"`;|&)])/g, ""], [/\/(?!\.\.?(?:\/|$))[^/\s'"`;|&()]+\/\.\.(?=\/|$|[\s'"`;|&)])/g, ""]];
-function collapseDots(text) {
-  let cur = text;
-  for (let k = 0; k < 20; k++) {
-    let next = cur;
-    for (const [re, to] of DOT_SEGMENTS) next = next.replace(re, to);
-    if (next === cur) break;
-    cur = next;
+// (a single pass over each path-like run: a segment stack, so any nesting depth collapses in linear time)
+function collapseRun(run) {
+  if (!run.includes('/')) return run;
+  const abs = run.startsWith('/');
+  const segs = run.split('/');
+  const trail = segs.length > 1 && segs[segs.length - 1] === '';
+  const out = [];
+  let base = 0; // a relative run's first segment is the unresolved base (`$H`, `.`, `x`): never dropped or popped
+  for (let k = 0; k < segs.length; k++) {
+    const seg = segs[k];
+    if (!abs && k === 0) { out.push(seg); base = 1; continue; }
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..' && out.length > base && out[out.length - 1] !== '..') { out.pop(); continue; }
+    out.push(seg);
   }
-  return cur;
+  const body = out.join('/');
+  if (abs) return '/' + body + (trail && body ? '/' : '');
+  return body + (trail && !body.endsWith('/') ? '/' : '');
+}
+function collapseDots(text) {
+  return text.replace(/[^\s'"`;|&()]+/g, collapseRun);
 }
 const sensitive = (text) => SENSITIVE_WORDS.test(text) || SENSITIVE_WORDS.test(collapseDots(text));
 function suffixRegexes(ci) {

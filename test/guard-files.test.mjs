@@ -1980,6 +1980,8 @@ test('#256 R5-B1 the ~/.codex folder itself is a protected reference: a recursiv
     // R6-F1 hardening: the same folder spelled with `.`, `//` or `x/..` segments
     'cp -R /tmp/forged/. $H/.codex/.', 'cp -R /tmp/forged/. $H/./.codex', 'rsync -a /tmp/forged/ "$(echo ~)/.codex/./"', 'cp -R /tmp/forged/. $H/.codex/x/..',
     'tar -xf /tmp/f.tar -C "$(echo ~)//.codex//"',
+    // R6-F1 hardening: nesting deeper than any fixed collapse count
+    `cp -R /tmp/f/. $H/.codex/` + 'a/'.repeat(30) + '../'.repeat(30),
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of ['ls ~/.codex', 'ls -la /home/u/.codex/', 'cat ~/.codex/config.toml', 'cd ~/.codex && ls', 'cd ~/.codex && cat config.toml', 'echo x > ~/.codex/notes.txt',
     'ls "$(echo ~)/.codex"', 'cat "$H/.codex/sessions/x.jsonl"', 'cat "$H/.codex/config.toml"', 'codex --version', 'echo the .codex folder']) assert.equal(bash(cmd), 'allow', cmd);
