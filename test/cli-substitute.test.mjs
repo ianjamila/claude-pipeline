@@ -258,6 +258,48 @@ function governorRound(w) {
   return home;
 }
 
+test('R2-F1: prepare says when it hands back an attempt that is already open; a resumed session proves it with apply FIRST (not-found records nothing) instead of launching a second agent', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  assert.equal(prep.reused, false, 'a first attempt is new');
+  // session A ran the agent and was lost before apply; session B starts the step again from the top
+  install(w, prep, { agentId: 'a1' });
+  assertExit(w.run(), 3);
+  const resumed = w.prepare();
+  assertExit(resumed, 0, resumed.stdout + resumed.stderr);
+  assert.equal(resumed.json.tag, prep.tag);
+  assert.equal(resumed.json.reused, true, 'the same open attempt');
+  const r = w.apply(w.projects, ['--tag', resumed.json.tag]);
+  assertExit(r, 0, r.stdout + r.stderr); // the transcript session A left is proven: no second agent
+  assert.deepEqual(w.attempts().attempts.map((a) => a.status), ['applied']);
+});
+
+test('R2-F1: reused attempt with no agent run yet: apply first is exit 2 not-found, records nothing, and the attempt stays open for the one agent call; after an invalid attempt the next one is new', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const again = w.prepare().json;
+  assert.equal(again.reused, true);
+  const before = readFileSync(join(w.dir(), 'substitute-attempts.json'), 'utf8');
+  const nf = w.apply(w.projects, []);
+  assertExit(nf, 2, nf.stdout + nf.stderr);
+  assert.equal(nf.json.error, 'not-found');
+  assert.equal(readFileSync(join(w.dir(), 'substitute-attempts.json'), 'utf8'), before, 'nothing recorded');
+  install(w, again, { agentId: 'a1', models: ['claude-sonnet-4-6'] });
+  assertExit(w.apply(w.projects), 1); // invalid
+  const next = w.prepare().json;
+  assert.equal(next.attempt, 2);
+  assert.equal(next.reused, false, 'a new attempt after a recorded invalid one');
+  assert.equal(prep.reused, false);
+});
+
+test('R2-F1: the review skill tells a resumed session to run apply first when prepare says reused', () => {
+  const skill = readFileSync(new URL('../skills/review/SKILL.md', import.meta.url), 'utf8');
+  const step = skill.split('\n').find((l) => l.includes('P substitute prepare --pr N --round R'));
+  assert.ok(step, 'the substitute step');
+  assert.match(step, /`reused: true`[^]*P substitute apply --pr N --round R` FIRST[^]*not-found/);
+  assert.ok(step.indexOf('FIRST') < step.indexOf('then ONE call of the agent'), 'apply first, then the agent');
+});
+
 test('R1-F2 / R2-B1: governor evidence written by codex-review expires: a reading back under the limit, or an old route with no readable figure, is reset-passed; a figure still at the limit keeps an old route', (t) => {
   const w = world(t);
   const home = governorRound(w);

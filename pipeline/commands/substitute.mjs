@@ -27,7 +27,7 @@ export const meta = {
   summary: 'prepare the input for the Claude substitute reviewer of a round Codex could not review, then prove and record its answer',
   usage: [
     'pipeline substitute prepare --pr N --round R [--repo DIR]',
-    '  -> {ok, round, agent, tag, promptHeader, inputPath, digest, digest8, attempt, evidence, files, bytes}',
+    '  -> {ok, round, agent, tag, promptHeader, inputPath, digest, digest8, attempt, reused, evidence, files, bytes}',
     '  agent: substitute-opus (the PR\'s highest risk, ever, is low or medium) or substitute-fable (it was ever high); the tag is `pipeline-substitute R<R> <id8>` (`... a<k>` for attempt k > 1; id8 is minted when the attempts record of the round is created, so it survives a new codex-review attempt, an evidence kind or path change, and is new after `state discard-round`)',
     '  needs the evidence of THIS round: .review/round-R/route.json from a codex-review attempt that ended with evidence quota (Codex\'s own usage-limit stop), budget or governor (a small fix-check',
     '    Codex was not run for), for the same attempt, round, base, head and patch digest (and, for quota, the same Codex prompt digest); the checked-out HEAD must be that head;',
@@ -38,8 +38,9 @@ export const meta = {
     '  writes .review/round-R/substitute-input.md (header ROUND: R / INPUT-DIGEST: <sha256 of the rest>, then the exact prompt Codex would have got, then an evidence map) and the files the agent cannot fetch with',
     '    Read/Grep/Glob under .review/round-R/substitute/: diff.patch (the range the prompt names), rules/AGENTS.md and rules/CLAUDE.md (git show <merge base>:..., when present) and, for a resolution round,',
     '    sides/ours/<path> and sides/base/<path> for each conflicted file; the input lists every file with its sha256, so the digest covers them all; .review/round-R/substitute-attempts.json keeps the attempts',
-    '  a second attempt (tag `... a2`) is allowed only after `apply` recorded the first one invalid (a re-run of prepare before that returns the same attempt); two invalid attempts: park (substitute:invalid).',
+    '  a second attempt (tag `... a2`) is allowed only after `apply` recorded the first one invalid (a re-run of prepare before that returns the same attempt, with reused:true); two invalid attempts: park (substitute:invalid).',
     '    An attempt that failed only because the terminal runs an older Fable than the floor (restartRequired) does not count against the two',
+    '  reused:true = prepare handed back an attempt that is already open (a resumed session, or a second codex-review for unchanged content): an agent may already have run under its tag, so run `apply` FIRST (exit 2 not-found recorded nothing: only then start the agent); a second agent under the same tag would be rejected as rerolled and count as invalid',
     '  start the agent with promptHeader + "\\nRead <inputPath> and review the pull request.\\n", pasted exactly, description = tag, and no model argument',
     'pipeline substitute apply --pr N --round R [--tag TAG] [--repo DIR]   (--projects-dir DIR and --max-age-ms N exist for the test suite only: without PIPELINE_TEST_MODE they exit 2 test-only-flag)',
     '  proves the transcript tagged TAG (default: the open attempt\'s tag), searched only under the account\'s own projects folder (a transcript that is not really inside it is unproven): exactly ONE transcript carries the tag (else rerolled); agent type = the one prepare named; every assistant turn on claude-opus- (substitute-opus)',
@@ -259,12 +260,14 @@ async function prepareLocked({ root, pr, round, ctx }) {
     writeFileAtomic(target, f.content);
   }
   writeFileAtomic(inputPath, packet.text);
-  const entry = { k, tag, digest: packet.digest, agent, status: 'prepared', preparedAt: new Date().toISOString() };
+  // An open attempt handed back (reused): the agent may already have run under this tag, so the caller proves it with `apply` before starting another (R2-F1).
+  const reused = last?.status === 'prepared';
+  const entry = { k, tag, digest: packet.digest, agent, status: 'prepared', preparedAt: reused ? last.preparedAt : new Date().toISOString() };
   saveAttempts(root, round, { identity: record.identity, lineage: record.lineage, attempts: [...record.attempts.filter((a) => a.k !== k), entry].sort((a, b) => a.k - b.k) });
   return {
     exitCode: EXIT.OK,
     output: {
-      ok: true, round, agent, tag, promptHeader: headerFor(round, packet.digest), inputPath, digest: packet.digest, digest8: packet.digest.slice(0, 8), attempt: k,
+      ok: true, round, agent, tag, promptHeader: headerFor(round, packet.digest), inputPath, digest: packet.digest, digest8: packet.digest.slice(0, 8), attempt: k, reused,
       evidence: route.evidence, files: packet.files.map((f) => f.rel), bytes: packet.bytes,
     },
   };
