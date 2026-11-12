@@ -186,11 +186,11 @@ test('R1-F1: a forged, stale or unknown handed identity falls back to the TTL-on
   assert.equal(h.sessionId, 'sess-two');
 });
 
-test('R1-F1: a plain terminal (no CLAUDECODE, no ancestor) takes no lease even with a handed value that checks out', (t) => {
+test('R1-F1: a plain terminal (no CLAUDECODE, no ancestor) never becomes the session, even with a handed value that checks out (it is a process holder)', (t) => {
   const w = world(t);
   w.session(500, 'sess-one');
   const handed = { [HOLDER_ENV]: JSON.stringify({ sessionId: 'sess-one', pid: 500, pidStart: START }) };
-  assert.equal(resolveHolder({ worktree: w.wt('a'), ...w.as(null, { env: handed }) }).kind, 'none');
+  assert.equal(resolveHolder({ worktree: w.wt('a'), ...w.as(null, { env: handed }) }).kind, 'process');
   assert.equal(resolveHolder({ worktree: w.wt('a'), ...w.as(null, { env: { CLAUDECODE: '1', ...handed } }) }).kind, 'session');
 });
 
