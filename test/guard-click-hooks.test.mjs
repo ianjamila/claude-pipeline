@@ -381,3 +381,34 @@ test('R4-F1: a program fed on stdin is judged whatever option the interpreter ho
     `node -r fs -e "console.log(1)"`,
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
+
+// ---- round 5 (R5-B1, R5-F1) ------------------------------------------------------------------------------------------------------------
+
+test('R5-B1, R5-F1: a code option does not prove the program is not on stdin: -c after the stdin operand, a value-taking option, -i / PYTHONINSPECT / --interactive, lua with -', () => {
+  const py = "import os; os.link('/tmp/payload','.claude/settings.local.json')";
+  const js = "require('fs').linkSync('/tmp/payload','.claude/settings.local.json')";
+  const lua = "os.execute('ln /tmp/payload .claude/settings.local.json')";
+  const pl = "link '/tmp/payload','.claude/settings.local.json';";
+  for (const cmd of [
+    `echo "${py}" | python3 - -c ignored`,
+    `echo "${py}" | python3 -X -cx`,
+    `echo "${py}" | python3 -W -c -`,
+    `echo "${py}" | python3 -- -c x`,
+    `echo "${py}" | python3 -m foo -c x`,
+    `echo "${pl}" | perl -I -e -`,
+    `echo "${py}" | python3 -i -c pass`,
+    `echo "${py}" | python3 -ic pass`,
+    `echo "${py}" | PYTHONINSPECT=1 python3 -c pass`,
+    `export PYTHONINSPECT=1; echo "${py}" | python3 -c pass`,
+    `echo "${js}" | node -i -e 0`,
+    `echo "${js}" | node --interactive -e 0`,
+    `echo "${lua}" | lua -e '' -`,
+    `echo "${lua}" | lua -i -e ''`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())'`,
+    `echo ".claude/settings.json" | python3 -Bu -c 'import sys; print(sys.stdin.read())'`,
+    `echo ".claude/settings.json" | node --no-warnings -e "console.log(1)"`,
+    `echo ".claude/settings.json" | perl -w -e 'print 1'`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});

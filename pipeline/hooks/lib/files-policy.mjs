@@ -1705,24 +1705,39 @@ function countCdRun(budget) {
 // Does the command run interpreter code that is not a file (`node -e`, `python3 -c`, `perl -e`, a program on stdin, an awk program that is not read-only; every interpreter run that is not `interp FILE`)? It can build any file name at run time.
 const INLINE_RUNNERS = /^(?:node|nodejs|deno|bun|tsx|ts-node|python\d*(?:\.\d+)*|ruby|perl|php|lua|Rscript|awk|gawk|mawk|nawk)$/;
 const BENIGN_INTERP_OPTS = /^(?:--no-warnings|--trace-warnings|--enable-source-maps|--harmony|-B|-u|-O|-OO|-v|-w|-T|-t|-s)$/;
-// (R4-F1) Is the program of this interpreter given in its arguments? Only when a real code option carries a program word (python `-c X`; node / bun / tsx / ts-node `-e -p --eval --print X`; ruby / perl / lua / Rscript `-e X`
-// (perl `-E`); php `-r X`; `deno eval X`; an awk program). Any other option (`-E`, `-R`, `-rjson`, `-r fs`, `-Mstrict`) leaves the program on stdin. (runsInlineCode's pattern is a fail-closed guess; it is no proof of this.)
-const CODE_OPTS = [
-  [/^(?:python\d*(?:\.\d+)*)$/, /^-[bBdEiIOPqRsSuvx]*c(.*)$/s],
-  [/^(?:node|nodejs|bun|tsx|ts-node)$/, /^(?:-e|-p|-pe|-ep|--eval|--print)(?:=(.*))?$/s],
-  [/^ruby$/, /^-[nplaSsdwvy]*e(.*)$/s],
-  [/^perl$/, /^-[nplawsSCtTuUWXc0-9]*[eE](.*)$/s],
-  [/^(?:lua|Rscript)$/, /^-e(.*)$/s],
-  [/^php$/, /^-r(.*)$/s],
+// (R4-F1, R5-B1, R5-F1) Is the program of this interpreter given in its arguments, so that stdin is not program text? Only when a real code option (python `-c X`; node / bun / tsx / ts-node `-e -p --eval --print X`;
+// ruby / perl / lua / Rscript `-e X` (perl `-E`); php `-r X`; `deno eval X`) is reached by a strict left-to-right walk of the interpreter's own words through options known to be plain flags (no value). The walk stops
+// with "no" at the first operand, `-`, `--`, `-m`, or any option it does not know (it may take a value, so the next word is not a code option: `python3 -X -cx`, `python3 -W -c -`, `perl -I -e -`), and for an
+// interactive flag (`-i`, `-ic`, `--interactive`, PYTHONINSPECT: the interpreter runs the code and then reads stdin) or a lua / node `-` operand (the script is stdin). A trailing `-c` after the stdin operand is a script argument.
+// Anything else leaves the program on stdin and the line is scanned as such. (runsInlineCode's pattern is a fail-closed guess; it is no proof of this.)
+const CODE_WALK = [
+  // [interpreter, code option (group 1 = attached program text), plain flag (no value), option whose next word is a known value (skipped), words that put the program on stdin anywhere after the interpreter]
+  [/^python\d*(?:\.\d+)*$/, /^-[bBdEIOPqRsSuvx]*c(.*)$/s, /^-[bBdEIOPqRsSuvx]+$/, null, /^(?:-|-i|--interactive)$/],
+  [/^(?:node|nodejs|bun|tsx|ts-node)$/, /^(?:-e|-p|-pe|-ep|--eval|--print)(?:=(.*))?$/s, /^(?:--no-warnings|--no-deprecation|--trace-warnings|--trace-deprecation|--enable-source-maps|--harmony|--(?:require|import|loader)=.*)$/, /^(?:-r|--require|--import|--loader)$/, /^(?:-|-i|--interactive)$/],
+  [/^ruby$/, /^-[nplaSsdwvy]*e(.*)$/s, /^-[nplaSsdwvy]+$/, null, /^-$/],
+  [/^perl$/, /^-[nplawsSCtTuUWXc0-9]*[eE](.*)$/s, /^-[nplawsSCtTuUWXc0-9]+$/, null, /^-$/],
+  [/^lua$/, /^-e(.*)$/s, /^(?:-v|-E|-W)$/, null, /^(?:-|-i)$/],
+  [/^Rscript$/, /^-e(.*)$/s, /^--(?:verbose|vanilla|no-environ|no-site-file|no-init-file|no-restore|no-save|quiet|silent|slave)$/, null, /^-$/],
+  [/^php$/, /^-r(.*)$/s, /^-[nqCH]$/, null, /^(?:-|-a|--interactive)$/],
 ];
-function programInArgv(argv) {
+function programInArgv(argv, line = '') {
   const runners = argv.map((w, i) => [baseOf(w), i]).filter(([b]) => INLINE_RUNNERS.test(b));
   return runners.length > 0 && runners.every(([b, i]) => {
     const rest = argv.slice(i + 1);
-    if (/^(?:awk|gawk|mawk|nawk)$/.test(b)) return true;
+    if (/^(?:awk|gawk|mawk|nawk)$/.test(b)) return !rest.some((a) => /^(?:-f|--file)/.test(a));
     if (b === 'deno') return rest[0] === 'eval' && rest.length > 1;
-    const opt = CODE_OPTS.find(([name]) => name.test(b))?.[1];
-    return opt !== undefined && rest.some((a, k) => { const m = opt.exec(a); return m !== null && ((m[1] ?? '') !== '' || k + 1 < rest.length); });
+    const row = CODE_WALK.find(([name]) => name.test(b));
+    if (row === undefined) return false;
+    const [, code, plain, valueOpt, onStdinWord] = row;
+    if (/^python/.test(b) && /PYTHONINSPECT/i.test(line)) return false;
+    if (rest.some((a) => onStdinWord.test(a) && !code.test(a))) return false;
+    for (let k = 0; k < rest.length; k++) {
+      const m = code.exec(rest[k]);
+      if (m !== null) return (m[1] ?? '') !== '' || k + 1 < rest.length;
+      if (valueOpt?.test(rest[k])) { k++; continue; }
+      if (!plain.test(rest[k])) return false;
+    }
+    return false;
   });
 }
 function runsInlineCode(c, ctx) {
@@ -3415,7 +3430,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const c of cmds) {
       if (runsInlineCode(c, ctx)) {
         const reds = c.redirects ?? [];
-        const codeInArgv = programInArgv(c.argv);
+        const codeInArgv = programInArgv(c.argv, raw);
         const onStdin = !codeInArgv || reds.some((r) => /^<<(?!<)/.test(r.op ?? ''));
         const text = [...wordsOf(c), ...reds.filter((r) => r.op === '<<<').map((r) => r.target ?? ''), ...(onStdin ? [scanRaw] : [])].join('\n');
         if (HOOK_SURFACE_TEXT.test(text)) return deny(`an inline program names a file that can declare hooks, and what it does to it cannot be checked (${HOOKS_MSG})`);
