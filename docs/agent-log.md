@@ -144,3 +144,4 @@ full record.
 - 2026-11-11 · #279 · Extra-round ask shows rounds, cost and severity; safe follow-up path; one implementer per PR · risk high · rounds 3 · arbiter 2 · blocked
 - 2026-11-11 · #266 · Guard false refusals + holes, owner-answer glyph/visibility, gh rate-limit retry, ci-wait status holder, worktree self-check (#190 #245 #244 + folds) · risk high · rounds 6 · arbiter 5 · blocked
 - 2026-11-12 · #266 · Owner-answer glyph and visibility, gh rate-limit retry, ci-wait status holder, worktree self-session (#190 non-guard items, #245, #214, #246, #253, #243; #244 pending) · risk high · rounds 8 · arbiter 8 · blocked
+- 2026-11-12 · #242 · Queue: refuse pre-switch branches (+ update-branch catch-up), fix queue-guards template, fold #237 #238 #239 and EW #1784 #1785 · risk high · rounds 16 · arbiter 15 · needs-human
