@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -56,6 +56,8 @@ function world(t, { yml = CHAT_YML, items = 2 } = {}) {
     cli(args, env = {}) {
       const merged = { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...floorEnv(), ...env };
       for (const k of ['PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_TEST_MODE', 'FAKE_CODEX_OUTPUT']) if (!(k in env)) delete merged[k];
+      // --projects-dir / --max-age-ms are honoured only in test mode (lib/substitute-proof.mjs#refuseTestOnlyFlags): a call that passes one runs in it unless the test sets it itself
+      if (args.includes('--projects-dir') && !('PIPELINE_TEST_MODE' in env)) merged.PIPELINE_TEST_MODE = '1';
       const r = spawnSync(process.execPath, [bin, ...args], { cwd: repo.dir, env: merged, encoding: 'utf8' });
       let json = null;
       try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* the assertion on json says so */ }
@@ -433,4 +435,31 @@ test('the Codex waiting record (P codex-status): a second-review quota stop park
   assertExit(q, 3, q.stdout + q.stderr);
   assert.equal(q.json.substitute.eligible, true, 'the hand-off to the substitute still stands');
   assert.ok(q.json.warnings.some((x) => /could not record the Codex outage/.test(x)), q.stdout);
+});
+
+test('apply refuses --projects-dir and --max-age-ms outside test mode (exit 2 test-only-flag); without them only the account projects folder is searched, and a link out of it proves nothing', (t) => {
+  const w = world(t);
+  const sub = w.ready('R1-B1');
+  const projects = install(w, sub, ['R1-B1']);
+  const base = ['triage', 'second-review', '--apply', '--pr', '7', '--tag', sub.tag];
+  const off = { PIPELINE_TEST_MODE: '0' };
+  for (const [flag, value] of [['--projects-dir', projects], ['--max-age-ms', '3600000']]) {
+    const r = w.cli([...base, flag, value], off);
+    assertExit(r, 2, r.stdout + r.stderr);
+    assert.equal(r.json.error, 'test-only-flag');
+    assert.ok(r.json.message.includes(flag), r.json.message);
+  }
+  assert.equal(w.item('R1-B1').secondReview, undefined, 'nothing stored');
+
+  const account = join(w.scratch, 'account-projects');
+  mkdirSync(account, { recursive: true });
+  const env = { ...off, PIPELINE_ACCOUNT_PROJECTS_DIR: account };
+  const none = w.cli(base, env);
+  assertExit(none, 2, none.stdout + none.stderr);
+  assert.equal(none.json.error, 'not-found');
+  symlinkSync(join(projects, '-tmp-work'), join(account, '-tmp-work'));
+  const linked = w.cli(base, env);
+  assertExit(linked, 1, linked.stdout + linked.stderr);
+  assert.ok(linked.json.errors.some((e) => e.includes("not under the account's projects folder")), linked.stdout);
+  assert.equal(w.item('R1-B1').secondReview, undefined, 'nothing stored');
 });

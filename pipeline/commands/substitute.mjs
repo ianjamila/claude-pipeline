@@ -18,7 +18,7 @@ import { codexSpend } from '../lib/review-route.mjs';
 import { higherRisk, maxRiskOf } from '../lib/state.mjs';
 import { substituteAgentFor } from '../lib/triage.mjs';
 import { extractJsonBlock } from '../lib/transcript.mjs';
-import { proveSubstituteRun } from '../lib/substitute-proof.mjs';
+import { proveSubstituteRun, refuseTestOnlyFlags } from '../lib/substitute-proof.mjs';
 import { roundDir, sha256, withReviewLock, writeFileAtomic, writeJson } from '../lib/review-context.mjs';
 
 export const meta = {
@@ -39,8 +39,8 @@ export const meta = {
     '  a second attempt (tag `... a2`) is allowed only after `apply` recorded the first one invalid (a re-run of prepare before that returns the same attempt); two invalid attempts: park (substitute:invalid).',
     '    An attempt that failed only because the terminal runs an older Fable than the floor (restartRequired) does not count against the two',
     '  start the agent with promptHeader + "\\nRead <inputPath> and review the pull request.\\n", pasted exactly, description = tag, and no model argument',
-    'pipeline substitute apply --pr N --round R [--tag TAG] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
-    '  proves the transcript tagged TAG (default: the open attempt\'s tag): exactly ONE transcript carries the tag (else rerolled); agent type = the one prepare named; every assistant turn on claude-opus- (substitute-opus)',
+    'pipeline substitute apply --pr N --round R [--tag TAG] [--repo DIR]   (--projects-dir DIR and --max-age-ms N exist for the test suite only: without PIPELINE_TEST_MODE they exit 2 test-only-flag)',
+    '  proves the transcript tagged TAG (default: the open attempt\'s tag), searched only under the account\'s own projects folder (a transcript that is not really inside it is unproven): exactly ONE transcript carries the tag (else rerolled); agent type = the one prepare named; every assistant turn on claude-opus- (substitute-opus)',
     '    or on claude-fable- at or above this machine\'s floor (substitute-fable: stale-model + restartRequired exactly like `arbiter apply`; Opus where Fable is required is refused); effort high; tools only',
     '    Read/Grep/Glob; the first prompt is EXACTLY promptHeader + "\\nRead <inputPath> and review the pull request.\\n" (nothing added); the transcript shows a successful Read of the input, diff.patch and every exported file;',
     '    the input and exported files on disk are still what prepare wrote (same digest); route.json still holds the same attempt, round, base, head and digests (resetAt is NOT judged here); the final JSON block',
@@ -257,6 +257,7 @@ function apply(rest, ctx) {
   }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const round = intOption(values, 'round', { required: true, min: 1 });
+  refuseTestOnlyFlags(values, ctx.env);
   if (values.tag === '' || values['projects-dir'] === '') throw new UsageError('--tag and --projects-dir must not be empty');
   const maxAgeMs = intOption(values, 'max-age-ms', { min: 0 });
   const root = resolveRepo(values, ctx);
@@ -303,7 +304,7 @@ async function applyLocked({ root, pr, round, ctx, givenTag, projectsDir, maxAge
   // Transcript, model, effort, agent type, prompt, tools and reads: the proof shared with `triage second-review --apply` (lib/substitute-proof.mjs).
   const inputPath = inputPathOf(root, round);
   const proven = proveSubstituteRun({
-    tag, projectsDir, maxAgeMs, agent: open.agent, errors,
+    tag, projectsDir, maxAgeMs, agent: open.agent, errors, env,
     expectedPrompt: firstPromptFor(round, open.digest, inputPath),
     requiredReads: [inputPath, ...packet.files.map((f) => path.join(packet.dir, f.rel))],
   });

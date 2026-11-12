@@ -131,11 +131,20 @@ export function mayRaiseFloor({ transcript, projectsDirGiven, env, home = accoun
   } else if (!seamValue(FLOOR_DIR_ENV, env, seamOpts)) {
     return { ok: false, why: 'a repo checkout raises only a floor redirected by PIPELINE_MODEL_FLOOR_DIR' };
   }
-  const projectsRoot = (!installed && seamValue(PROJECTS_DIR_ENV, env, seamOpts)) || path.join(home, '.claude', 'projects');
+  if (!transcriptUnderRoot(transcript, accountProjectsRoot({ env, home, root }))) return { ok: false, why: "the transcript is not under the account's projects folder" };
+  return { ok: true };
+}
+
+// The account's own projects folder: <passwd home>/.claude/projects (never $HOME); a repo checkout may redirect it with PIPELINE_ACCOUNT_PROJECTS_DIR (an installed copy never).
+export function accountProjectsRoot({ env, home = accountHome(), root = pipelineRoot() } = {}) {
+  return (!isInstalledCopy(root) && seamValue(PROJECTS_DIR_ENV, env, { root })) || path.join(home, '.claude', 'projects');
+}
+
+// Is this transcript file really (realpath, so a symlink out of the folder does not count) under that projects folder?
+export function transcriptUnderRoot(transcript, projectsRoot) {
   const rootReal = real(projectsRoot);
   const fileReal = typeof transcript === 'string' ? real(transcript) : null;
-  if (rootReal === null || fileReal === null || !inside(fileReal, rootReal)) return { ok: false, why: "the transcript is not under the account's projects folder" };
-  return { ok: true };
+  return rootReal !== null && fileReal !== null && inside(fileReal, rootReal);
 }
 
 // How long to wait for the floor lock: the library default, or the test seam's value.

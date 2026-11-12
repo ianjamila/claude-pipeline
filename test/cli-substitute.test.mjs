@@ -4,7 +4,7 @@
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { roundWorld, findingsOf, low } from './helpers/round-world.mjs';
@@ -21,6 +21,10 @@ function world(t, opts = {}) {
   const w = roundWorld(t, { max: 3, ...opts });
   const status = join(realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-sub-status-'))), 'codex');
   t.after(() => rmSync(join(status, '..'), { recursive: true, force: true }));
+  // --projects-dir / --max-age-ms are honoured only in test mode (a substitute replaces a Codex review: lib/substitute-proof.mjs#refuseTestOnlyFlags), so every call that passes one runs in it
+  // unless the test sets PIPELINE_TEST_MODE itself.
+  const cli = w.cli;
+  w.cli = (args, env = {}) => cli(args, args.includes('--projects-dir') && !('PIPELINE_TEST_MODE' in env) ? { PIPELINE_TEST_MODE: '1', ...env } : env);
   w.quota = (msg = QUOTA) => ({ FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: msg, FAKE_CODEX_THREAD_ID: randomUUID(), CODEX_HOME: join(w.scratch, 'codex-home'), PIPELINE_CODEX_STATUS_DIR: status });
   w.run = (round = 1, env = w.quota(), { from = w.base, to = w.head } = {}) => w.cli(['codex-review', '--pr', '7', '--round', String(round), '--base', from, '--head', to, '--effort', 'high'], env);
   w.dir = (round = 1) => join(w.repo.dir, '.review', `round-${round}`);
@@ -391,4 +395,45 @@ test('risk rises after an Opus substitute round: the next substitute is substitu
   const round3 = w.state().rounds[2];
   assert.deepEqual([round3.wholePr, round3.reviewBase, round3.substitute.agent], [true, w.base, 'substitute-fable']);
   assert.equal(w.cli(['state', 'outcome']).json.wholePrOwed, false, 'the whole-PR round cleared it');
+});
+
+test('apply refuses --projects-dir and --max-age-ms outside test mode (exit 2 test-only-flag, naming the flag); nothing is recorded and the attempt stays open', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const projects = install(w, prep);
+  for (const [flag, value] of [['--projects-dir', projects], ['--max-age-ms', '3600000']]) {
+    const r = w.cli(['substitute', 'apply', '--pr', '7', '--round', '1', flag, value], { PIPELINE_TEST_MODE: '0' });
+    assertExit(r, 2, r.stdout + r.stderr);
+    assert.equal(r.json.error, 'test-only-flag');
+    assert.ok(r.json.message.includes(flag), r.json.message);
+  }
+  assert.throws(() => w.stateText(), /ENOENT/, 'nothing recorded: no review state exists');
+  assert.equal(w.attempts().attempts[0].status, 'prepared', 'the attempt is still open');
+  assertExit(w.apply(projects), 0); // the same transcript is accepted in test mode
+});
+
+test('apply without the flags searches only the account projects folder, and refuses a transcript that is a link out of it', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const outside = install(w, prep, { projects: join(w.scratch, 'elsewhere') });
+  const account = join(w.scratch, 'account-projects');
+  const env = { PIPELINE_TEST_MODE: '0', PIPELINE_ACCOUNT_PROJECTS_DIR: account };
+  // nothing under the account's folder: not found (the folder given nowhere is never searched)
+  mkdirSync(account, { recursive: true });
+  const none = w.cli(['substitute', 'apply', '--pr', '7', '--round', '1'], env);
+  assertExit(none, 2, none.stdout + none.stderr);
+  assert.equal(none.json.error, 'not-found');
+  // a symlinked session folder pointing outside the account's folder is found by the tag but is not inside it
+  symlinkSync(join(outside, '-tmp-work'), join(account, '-tmp-work'));
+  const linked = w.cli(['substitute', 'apply', '--pr', '7', '--round', '1'], env);
+  assertExit(linked, 1, linked.stdout + linked.stderr);
+  assert.ok(linked.json.errors.some((e) => e.includes("not under the account's projects folder")), linked.stdout);
+  assert.throws(() => w.stateText(), /ENOENT/, 'nothing recorded: no review state exists');
+  // a real copy under the account's folder is accepted without any flag
+  rmSync(join(account, '-tmp-work'));
+  const prep2 = w.prepare();
+  assertExit(prep2, 0, prep2.stdout + prep2.stderr);
+  install(w, prep2.json, { projects: account, agentId: 'a2' });
+  const ok = w.cli(['substitute', 'apply', '--pr', '7', '--round', '1'], env);
+  assertExit(ok, 0, ok.stdout + ok.stderr);
 });

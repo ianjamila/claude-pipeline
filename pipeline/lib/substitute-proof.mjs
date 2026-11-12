@@ -4,6 +4,10 @@
 // What the answer must look like (findings, or second-review verdicts) is the caller's to judge from `proof.finalAssistantText`.
 import { findSubagentTranscript, findTaggedTranscripts, proveModel, toolCallsOf } from './transcript.mjs';
 import { readFileOrFail } from './review-context.mjs';
+import { EXIT } from './cli.mjs';
+import { Fail } from './cmd-common.mjs';
+import { accountProjectsRoot, transcriptUnderRoot } from './floor-proof.mjs';
+import { seamFlag } from './proc.mjs';
 
 export const READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob'];
 // The hand-back tool is how a background subagent delivers its report (transcript.mjs); it is not a way to act on the repository.
@@ -11,11 +15,27 @@ export const ALLOWED_TOOLS = [...READ_ONLY_TOOLS, 'SubagentHandback'];
 export const MODEL_PREFIX = { 'substitute-opus': 'claude-opus-', 'substitute-fable': 'claude-fable-' };
 export const PROOF_EFFORT = 'high';
 
+// `--projects-dir` and `--max-age-ms` let a caller point the proof at any folder and any age, which is only fair for the test suite: a substitute REPLACES a Codex review,
+// so an agent that could name the folder could forge the transcript that proves it. Outside test mode (the checkout-only seam PIPELINE_TEST_MODE, ignored by an installed
+// copy: lib/seams.mjs) either flag is a usage error, and the transcript is searched only under the account's own projects folder (proveSubstituteRun below).
+export function refuseTestOnlyFlags(values, env) {
+  if (seamFlag('PIPELINE_TEST_MODE', env)) return;
+  for (const name of ['projects-dir', 'max-age-ms']) {
+    if (values[name] !== undefined) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'test-only-flag', message: `--${name} is a test-only flag: a substitute review is proven only from a transcript under the account's own projects folder, found by its tag (drop --${name})` });
+    }
+  }
+}
+
 // -> null when no recent transcript carries the tag; else { found, proof, claudeCodeVersions, jsonlText }. Every problem is pushed to `errors` (the caller's list).
 //   agent: the agent type the attempt was prepared for; expectedPrompt: the exact first prompt; requiredReads: absolute paths that must each show a successful Read.
-export function proveSubstituteRun({ tag, projectsDir, maxAgeMs, agent, expectedPrompt, requiredReads, errors }) {
+//   projectsDir / maxAgeMs: test mode only (refuseTestOnlyFlags); without projectsDir the search is under the account's projects folder and a found transcript must really be inside it.
+export function proveSubstituteRun({ tag, projectsDir, maxAgeMs, agent, expectedPrompt, requiredReads, errors, env }) {
+  const accountRoot = projectsDir === undefined ? accountProjectsRoot({ env }) : undefined;
+  if (accountRoot !== undefined) projectsDir = accountRoot;
   const found = findSubagentTranscript({ tag, projectsDir, maxAgeMs });
   if (!found) return null;
+  if (accountRoot !== undefined && !transcriptUnderRoot(found.jsonlPath, accountRoot)) errors.push("the transcript is not under the account's projects folder (a link out of it does not count)");
   const jsonlText = readFileOrFail(found.jsonlPath, 'transcript');
   const metaText = found.metaPath === null ? undefined : readFileOrFail(found.metaPath, 'meta');
 

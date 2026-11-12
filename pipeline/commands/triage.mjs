@@ -35,7 +35,7 @@ import { assertCurrentAttempt, finishAttempt, readRoute, startAttempt, substitut
 import { headMoved } from '../lib/review-round.mjs';
 import { noteCodexAnswered, noteQuotaStop } from '../lib/codex-usage.mjs';
 import { floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
-import { PROOF_EFFORT, proveSubstituteRun } from '../lib/substitute-proof.mjs';
+import { PROOF_EFFORT, proveSubstituteRun, refuseTestOnlyFlags } from '../lib/substitute-proof.mjs';
 import {
   MAX_INVALID_SECOND_ATTEMPTS, SECOND_EVIDENCE_KINDS, TAG_RE, checkSecondInputOnDisk, countedSecondInvalid, firstPromptFor, inputPathOf, packetIdOf, prepareSecondAttempt, readSecondAttempts,
   routeFileFor, saveSecondAttempts,
@@ -93,7 +93,7 @@ export const meta = {
     '     packetId = sha256 of the sorted ids, the head, the digest of the asked findings\' text and their finals. Every run first writes .review/round-R/route-2nd-<packetId8>.json (the lifecycle of route.json: pending before Codex runs, final evidence by compare-and-swap under the lock,',
     '     a newer run for the same packet supersedes the older: exit 2), and a quota stop also writes the blind packet as .review/round-R/second-review-<packetId8>.md (header MODE: SECOND-REVIEW / ROUND: R / INPUT-DIGEST, then the exact Codex prompt and an evidence map; no earlier ruling)',
     '  -> start the substitute agent with promptHeader + "\\nRead <inputPath> and verify the findings it lists.\\n", pasted exactly, description = tag, no model argument; its answer is {"items":[{id, decision, confidence, reasoning}]} (second-review.schema.json), not the findings format',
-    'pipeline triage second-review --apply --pr N --tag TAG [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
+    'pipeline triage second-review --apply --pr N --tag TAG [--repo DIR]   (--projects-dir DIR and --max-age-ms N: test suite only, exit 2 test-only-flag without PIPELINE_TEST_MODE)',
     '  -> proves the transcript tagged TAG exactly as `substitute apply` does (lib/substitute-proof.mjs: exactly ONE transcript, agent type, pinned model per turn, Fable floor, effort high, only Read/Grep/Glob, the first prompt EXACTLY the prepared one, a successful Read of the input),',
     '     the input on disk is still what was written, route-2nd-<packetId8>.json holds evidence quota (budget / governor are accepted kinds; no record or none / pending: refused no-route / no-evidence), and the review state is still the one asked about (HEAD, each finding\'s text, each final, no second review yet on any id:',
     '     head-moved, finding-changed, final-changed, item-changed), then stores each verdict like a Codex one with secondReview.by substitute-opus|substitute-fable (+ evidence, models, proof), version 4; the stricter-of-two rule is unchanged. A first-review transcript proves nothing (tag, mode header, fixed prompt and input digest differ)',
@@ -671,6 +671,7 @@ async function secondReview(rest, ctx) {
 async function secondReviewApply(values, ctx) {
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const tag = requireOption(values, 'tag');
+  refuseTestOnlyFlags(values, ctx.env);
   for (const k of ['round', 'ids']) if (values[k] !== undefined) throw new UsageError(`--${k} is not used with --apply: the tag names the round and the packet`);
   if (values['projects-dir'] === '') throw new UsageError('--projects-dir must not be empty');
   const maxAgeMs = intOption(values, 'max-age-ms', { min: 0 });
@@ -725,7 +726,7 @@ async function secondReviewApply(values, ctx) {
     const inputPath = inputPathOf(root, n, route.packetId);
     errors.push(...checkSecondInputOnDisk(inputPath, open));
     const proven = proveSubstituteRun({
-      tag, projectsDir: values['projects-dir'], maxAgeMs, agent: open.agent, errors, expectedPrompt: firstPromptFor(n, open.digest, inputPath), requiredReads: [inputPath],
+      tag, projectsDir: values['projects-dir'], maxAgeMs, agent: open.agent, errors, env, expectedPrompt: firstPromptFor(n, open.digest, inputPath), requiredReads: [inputPath],
     });
     if (proven === null) throw fail(EXIT.USAGE, 'not-found', `no recent subagent transcript tagged ${JSON.stringify(tag)}`);
     const { found, proof, claudeCodeVersions } = proven;
