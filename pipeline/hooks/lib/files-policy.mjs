@@ -3868,23 +3868,131 @@ function evaluateBashForFilesFrame(command, opts) {
   // The home directory and each of its parents hold the protected tree, so a word that resolves to one of them is an ancestor of a protected path like any other: a command that is not read-only is
   // refused on it (`rm -rf ~`, `find / -delete`, `mv ~ /tmp/x`), see `names`. A cheap filter first: a word with no `/`, `~`, `$`, backtick, glob or brace character, no `claude` and not `.` / `..`
   // cannot name one (a bare relative word reaches a protected root only from a cwd that is inside or above one, which insideRoot already covers).
+  // (R4-F2 #288: the lexical home and its resolved form, as every other home comparison reads it; $HOME can be a symlink)
   const homeChain = new Set();
-  for (let d = ctx.homePosix, n = 0; n < 32; n++) {
-    homeChain.add(ctx.ci ? d.toLowerCase() : d);
-    const up = pathsFor().dirname(d);
-    if (up === d || up === '.') break;
-    d = up;
+  for (const home of unique([ctx.homePosix, realResolve(ctx.homePosix, ctx.api)])) {
+    for (let d = home, n = 0; n < 32; n++) {
+      homeChain.add(ctx.ci ? d.toLowerCase() : d);
+      const up = pathsFor().dirname(d);
+      if (up === d || up === '.') break;
+      d = up;
+    }
   }
   const maybePath = /[/~$`\\*?[{]|claude|^\.\.?$/i;
-  const homeWord = (word) => {
-    const w = /^--[\w-]+=./.test(word) ? word.slice(word.indexOf('=') + 1) : word;
+  // R4-B2: a glob word is matched against each member of the chain (a glob that globToRe cannot read is a hit); R4-F2: ~NAME spellings, see homeWord
+  const hitChain = (path) => {
+    const e = pathsFor().normalize(path).replace(/(.)\/+$/, '$1');
+    if (/[*?[]/.test(e)) {
+      const re = globToRe(e, ctx.ci);
+      return !re || [...homeChain].some((h) => re.test(h));
+    }
+    return homeChain.has(ctx.ci ? e.toLowerCase() : e);
+  };
+  // R4-F1: the directories a command can run in. Without a ( ) { } or a compound keyword on the line, a command that follows a cd to a directory known now by && only (and by && only, up to it) runs in that
+  // directory alone: the cd ran and succeeded. Any other join (; || | &) keeps the cd that may have failed or run elsewhere in view, so such a command is read against every directory of the line (`dirs`).
+  const cdOf = (c) => CD_CMDS.has(baseOf(c.argv[0] ?? ''));
+  const keywordLine = cmds.subshell === true || /(?:^|[\s;&|])(?:[({}]|(?:if|then|else|elif|fi|for|while|until|do|done|case|esac|select|function|coproc)(?![\w./-]))/.test(raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, ''));
+  const landings = (e, base) => { // (where the cd target leads from each directory of base; a '..' after a symlink also reads as the target's parent, see collectDirs)
+    const out = [];
+    for (const d of base) {
+      out.push(isAbs(e) ? pathsFor().normalize(e) : pathsFor().join(d, e));
+      if (/(?:^|\/)\.\.(?:\/|$)/.test(e)) {
+        let cur = isAbs(e) ? '/' : d;
+        for (const seg of e.split('/')) {
+          if (seg === '' || seg === '.') continue;
+          cur = seg === '..' ? pathsFor().dirname(realResolve(cur, ctx.api)) : pathsFor().join(cur, seg);
+        }
+        out.push(cur);
+      }
+    }
+    const u = unique(out);
+    return u.length > 32 ? null : u;
+  };
+  const cdTarget = (c) => { // the plain target of a `cd` whose destination is known now, else null
+    if (baseOf(c.argv[0] ?? '') !== 'cd' || c.raw.includes('\\')) return null;
+    const rest = c.argv.slice(1).filter((a) => a !== '--' && !/^-[LPe@]+$/.test(a));
+    if (rest.length > 1) return null;
+    const e = expandRefs(rest.length ? rest[0] : '~', ctx);
+    if (!e || e.startsWith('-') || e.startsWith('~') || /[$`*?[(){}\\]/.test(e)) return null;
+    if (!isAbs(e) && (/cdpath/i.test(raw) || (opts.env ?? process.env).CDPATH)) return null; // (a relative name may lead anywhere through CDPATH)
+    return e;
+  };
+  const narrowDirs = new Map();
+  if (opts._writesOnly !== true && !keywordLine && cmds.some(cdOf) && !unknownCwd()) {
+    let known = [ctx.cwd]; // where the shell can be so far
+    let chain = null; // the directories after an &&-joined run of sure cd's
+    let lost = false; // a cd whose destination is not known: nothing after it is narrowed
+    const top = cmds.filter((c) => !(c.depth > 0)); // (the commands inside a substitution are listed before the one that holds them)
+    for (const [k, c] of top.entries()) {
+      checkDeadline(ctx.budget);
+      if (c.sep !== '&&') chain = null;
+      if (chain) narrowDirs.set(c, chain);
+      if (!cdOf(c)) continue;
+      const t = lost ? null : cdTarget(c);
+      const reach = t === null ? null : landings(t, chain ?? known);
+      if (reach === null) { lost = true; chain = null; continue; }
+      known = unique([...known, ...reach]);
+      if (known.length > 32) { lost = true; chain = null; continue; }
+      chain = c.sep !== '||' && c.sep !== '|' && top[k + 1]?.sep === '&&' ? reach : null;
+    }
+  }
+  // the command's own working directory: git -C DIR / make -C DIR, each relative to the one before it
+  const dirsOf = (c) => {
+    const base = narrowDirs.get(c) ?? dirs;
+    const name = baseOf(c.argv[0] ?? '');
+    if (name !== 'git' && name !== 'make' && name !== 'gmake') return base;
+    let cur = base;
+    for (const v of baseDirsOf(c.argv)) {
+      const e = expandRefs(v, ctx);
+      if (!e || /[$`*?[(){}\\]/.test(e) || e.startsWith('~')) return base; // (only known at run time: as before)
+      cur = landings(e, cur) ?? base;
+    }
+    return cur;
+  };
+  const NON_PATH_OPTIONS = new Set(['base', 'base-href', 'public-path', 'basename', 'deploy-url']); // (a URL prefix, not a path: `vite build --base=/`)
+  const SLASH_NOT_A_PATH = new Set(['expr', 'ssh', 'docker', 'podman', 'kubectl', 'oc', 'scp', 'mosh', 'bc', 'dc', 'curl', 'wget', 'gh']); // (a lone `/` is division, or a path on another machine / in a container)
+  // R4-F2: ~u (and ~$USER) is home, ~+ is each directory the command may be in, ~- and any other ~NAME are only known at run time (a hit: this is asked of commands that are not read-only)
+  const homeWord = (word, wdirs = dirs, cname = '') => {
+    const opt = /^--([\w-]+)=./.exec(word);
+    const w = opt ? word.slice(word.indexOf('=') + 1) : word;
     if (!w || w.startsWith('-')) return false; // (an option, or a lone `-`)
-    // a relative word is resolved against every directory the line may be in (the cwd and each `cd` target: `dirs`, as pathHit reads one) and normalized (`.`, `..`)
-    const x = expandRefs(w, ctx);
-    return (isAbs(x) ? [''] : dirs).some((d) => {
-      const e = pathsFor().normalize(isAbs(x) ? x : pathsFor().join(d, x)).replace(/(.)\/+$/, '$1');
-      return homeChain.has(ctx.ci ? e.toLowerCase() : e);
-    });
+    if (w === '/' && ((opt && NON_PATH_OPTIONS.has(opt[1])) || SLASH_NOT_A_PATH.has(cname))) return false;
+    const hits = (paths) => paths.some(hitChain);
+    const wu = w.replace(USER_RE, ctx.user);
+    if (/^~\+(?:\/|$)/.test(wu)) return hits(wdirs.map((d) => pathsFor().join(d, wu.slice(2) || '.')));
+    let x = expandRefs(w, ctx);
+    const plus = ctx.homePosix + '+'; // (expandRefs reads ~+ as the home directory and a plus: a variable that holds it, too)
+    if (x === plus || x.startsWith(plus + '/')) return hits(wdirs.map((d) => pathsFor().join(d, x.slice(plus.length) || '.')));
+    if (x[0] === '~' && !isAbs(x)) {
+      const m = /^~([^/]*)(.*)$/.exec(x);
+      if (!(ctx.ci ? m[1].toLowerCase() === ctx.user.toLowerCase() : m[1] === ctx.user)) return true;
+      x = ctx.homePosix + m[2];
+    }
+    // a relative word is resolved against the directories the command can run in and normalized (`.`, `..`)
+    for (const piece of x.includes('{') ? braceExpand(x, ctx).split(/\s+/).filter(Boolean) : [x]) {
+      if (isAbs(piece) ? hitChain(piece) : hits(wdirs.map((d) => pathsFor().join(d, piece)))) return true;
+    }
+    return false;
+  };
+  // what a command is given as operands: the value of a URL-prefix option is none
+  const operandsOf = (c) => {
+    const ws = wordsOf(c).slice(1);
+    return ws.filter((w, i) => !(i > 0 && /^--[\w-]+$/.test(ws[i - 1]) && NON_PATH_OPTIONS.has(ws[i - 1].slice(2))));
+  };
+  // item 7: a command whose only operand is the directory it runs in (`git clean -fdx`, `find -delete`)
+  const implicitCwd = (c, name) => {
+    const args = c.argv.slice(1);
+    if (name === 'git') {
+      let i = 0;
+      while (i < args.length && args[i].startsWith('-')) i += ['-C', '-c', '--git-dir', '--work-tree', '--namespace'].includes(args[i]) ? 2 : 1;
+      return args[i] === 'clean' && !args.slice(i + 1).some((a) => a === '--dry-run' || /^-[A-Za-z]*n/.test(a));
+    }
+    if (name === 'find') {
+      let i = 0;
+      while (i < args.length && (/^-[HLP]$|^-O\d?$/.test(args[i]) || args[i] === '-D')) i += args[i] === '-D' ? 2 : 1;
+      return i >= args.length || /^[-(!]/.test(args[i]);
+    }
+    return false;
   };
   // The ordinary (short) path: a command that is not read-only and is given home or a parent of it as an operand (the command name itself is no operand: the parser reports the code of a glob
   // qualifier, `out(/)`, as a command named `/`). Read-only commands on home stay allowed (`ls ~`, `du -sh ~`, `find ~ -name x`), and a file directly in home is no ancestor. cp / install into home write
@@ -3893,16 +4001,19 @@ function evaluateBashForFilesFrame(command, opts) {
     const homeWriter = cmds.find((c) => {
       const name = c.argv.length ? baseOf(c.argv[0]) : '';
       if (!name || NOT_WRITERS.has(name) || isReadOnly(c, ctx)) return false;
+      const wd = dirsOf(c);
+      const hit = (w) => homeWord(w, wd, name);
       if (DEST_ONLY.has(name)) {
         if (name !== 'rsync') return false;
         const f = rsyncFlags(c.argv, ctx);
         if (!f.del && !f.rm && !f.unknown) return false;
         const { dests, sources } = splitOperands(wordsOf(c), name);
-        return ((f.del || f.unknown) && dests.some(homeWord)) || ((f.rm || f.unknown) && sources.some(homeWord)); // (--delete removes what the source lacks at the destination; --remove-source-files removes the sources)
+        return ((f.del || f.unknown) && dests.some(hit)) || ((f.rm || f.unknown) && sources.some(hit)); // (--delete removes what the source lacks at the destination; --remove-source-files removes the sources)
       }
+      if (implicitCwd(c, name) && homeWord('.', wd, name)) return true;
       // (mv / ln INTO home or a parent writes DIR/basename(SRC), judged below like cp; what they move or link away is a source)
       const dest = MOVERS.has(name) ? destsOf(wordsOf(c), name)[0] : undefined;
-      return wordsOf(c).slice(1).some((w) => w !== dest && homeWord(w));
+      return operandsOf(c).some((w) => w !== dest && hit(w));
     });
     if (homeWriter) return deny(`${baseOf(homeWriter.argv[0])} is given the home directory or a directory above it, which holds the protected pipeline files, and is not a read-only command (${PROTECTED_MSG})`);
   }
@@ -3911,7 +4022,7 @@ function evaluateBashForFilesFrame(command, opts) {
       for (const t of wordsOf(c)) {
         checkDeadline(ctx.budget); // (the evaluation deadline)
         if (!maybePath.test(t)) continue;
-        if (m.rawHit(t, dirs) || m.pathHit(t, dirs, true) || homeWord(t)) return deny('the command line has more than 5,000 words, so it is not scanned word by word, and a word names a protected pipeline file, a directory that holds one, or the home directory; split the command up');
+        if (m.rawHit(t, dirs) || m.pathHit(t, dirs, true) || homeWord(t, dirsOf(c), baseOf(c.argv[0] ?? ''))) return deny('the command line has more than 5,000 words, so it is not scanned word by word, and a word names a protected pipeline file, a directory that holds one, or the home directory; split the command up');
       }
     }
   }
