@@ -18,9 +18,9 @@ number, `R` a review round, `<slug>` 2–5 lowercase words from the request.
    (3.3). You never run `gh pr merge` or the repo's merge command yourself, never push to `main`/`master`
    or force-push (`git push -u origin agent/<slug>`), never add `human-approved` / `test-change-approved`, never remove
    `needs-human` / `pipeline-blocked` / `pipeline-pause` / `pipeline-rollback` yourself (`P merge --owner-go` lifts exactly the `needs-human` hold the owner's verified "merge" named, 3.3). The guards block these; don't route around them.
-2. No cross-model review, no merge. Codex unavailable (`exitCode: 3`) ⇒ `gh pr edit N --add-label awaiting-review`,
+2. No cross-model review, no merge. Codex unavailable (`exitCode: 3`) with `substitute.eligible` ⇒ the substitute path (2.1), not a stop. Otherwise ⇒ `gh pr edit N --add-label awaiting-review`,
    `P comment --pr N --kind awaiting-review --reason "<reason from the JSON>"`, tell the owner, stop (outcome `awaiting-review`). A failed Codex run is never "no findings".
-3. Never pass a `model` parameter to `judge`, `arbiter`, `arbiter-fix` or `implementer`: their agent files pin the model (Sonnet, Fable, Fable, Sonnet).
+3. Never pass a `model` parameter to `judge`, `arbiter`, `arbiter-fix`, `implementer`, `substitute-opus` or `substitute-fable`: their agent files pin the model (Sonnet, Fable, Fable, Sonnet, Opus, Fable).
 4. Keep your context lean: work from `P` JSON, subagent summaries and file paths; hand paths, not logs or diffs, to subagents.
 5. Anything over 2 minutes runs as `P job start <name> -- <command>`, then `P job wait <name> --run-id <runId> --timeout 540`
    until `state` is `done` (`replaced`/`lost` ⇒ start it again once). Read `exitCode` (the command's own code) and the JSON in `tail`.
@@ -62,9 +62,10 @@ Picking up an existing `awaiting-review` PR (Codex was unavailable): `P state sh
 Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Commands run as jobs report the real code as `exitCode`.
 
 1. **Codex.** base: round 1 `git merge-base origin/<default_branch> HEAD`, later the previous round's `toHead` (`.review/state.json`);
-   head: the pushed HEAD; effort: `review.effort[<risk>]`, later rounds `review.effort.followup`.
+   head: the pushed HEAD; `P state outcome` `nextRound.base` is the base (the merge base when `wholePrOwed`: that round reviews the whole PR). BEFORE every codex-review call run it with `--plan` (same `--pr --round --base --head`) and pass its `expectedEffort` as `--effort`: codex-review refuses any other.
    `P job start codex-rR -- node ~/.claude/pipeline/bin/pipeline.mjs codex-review --pr N --round R --base <base> --head <head> --effort <effort>`,
    then `P job wait codex-rR …`. Exit 2 `empty-range`: the "fix" changed no code, go back to step 5. `base-mismatch` / `head-moved`: recompute and rerun.
+   Exit 3 with `substitute.eligible` (a real quota stop, or `reason: withheld`: the Codex round budget or weekly governor): `gh pr edit N --add-label awaiting-review`, `P comment --pr N --kind awaiting-review --reason "<reason>"`, `P substitute prepare --pr N --round R`, then ONE call of the agent it names (`substitute-opus` / `substitute-fable`; description = `tag`, prompt = its `promptHeader` verbatim, then `Read <inputPath> and review the pull request.`; never a model), `P substitute apply --round R --tag "<tag>"` (exit 1 `retry: prepare` ⇒ once more; `park` ⇒ park; `restartRequired` as for the arbiter), then continue at 2.2 (`review-complete` takes `awaiting-review` off). `waitUntil` ⇒ `P job start codex-wait -- node ~/.claude/pipeline/bin/pipeline.mjs codex-status --wait`, then this step again. Not eligible ⇒ rule 2.
    An interrupted round (no triage comment yet): `P state discard-round --round R --pr N` before rerunning it.
    `baseOnly: true` (only main merged in): Codex did not run, no items, not counted; it carries the last reviewed result forward.
    `resolutionOnly: true` (a main conflict resolved by choosing lines): a real review of just the resolution, triaged as usual
@@ -97,8 +98,8 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
 **Park** (every `needs-human` stop is this): `gh pr edit N --add-label needs-human`, `P comment --pr N --kind needs-human --reason "<cause, what was checked, what the owner does>"`,
 with `merge.hold_command` in `P config` `P merge-hold --pr N --release --reason parked` (a parked PR must not keep the merge line), then the stop ritual with outcome `needs-human`. The summary renders from the round state, so at least one Codex round must have run; before that a stop is `blocked` or `awaiting-review`. The park comment is your own text: 3.3 shows a later hold from GitHub's label event and quotes the comment only as agent-written.
 
-Book every agent call (implementer, judge, arbiter; an `arbiter-fix` call is booked as role `arbiter`) right after it returns:
-`P cost --pr N --phase <build|review> --role <implementer|judge|arbiter> --from-transcript <the agent's transcript>` (add `--retry` on a fix retry). An implementer you continued is booked ONCE, after its last leg: the transcript sums the whole run, so booking each leg counts it twice. The transcript is
+Book every agent call (implementer, judge, arbiter, substitute; an `arbiter-fix` call is booked as role `arbiter`) right after it returns:
+`P cost --pr N --phase <build|review> --role <implementer|judge|arbiter|substitute-opus|substitute-fable> --from-transcript <the agent's transcript>` (add `--retry` on a fix retry). An implementer you continued is booked ONCE, after its last leg: the transcript sums the whole run, so booking each leg counts it twice. The transcript is
 `~/.claude/projects/<encoded-cwd>/<session-id>/subagents/agent-<agentId>.jsonl`; the `agentId` is in the Agent tool's result. Calls made before the PR exists (no `N` yet)
 are noted (role, phase, transcript) and all booked right after `gh pr create`. A failed `P cost` is a warning, never a reason to stop.
 
@@ -110,7 +111,7 @@ An item left `needsHuman` ⇒ never ask the owner to type a ruling: decide it yo
 - ACCEPT is always allowed. FOLLOW-UP alone only for a non-BLOCKING, non-security item.
 - Any REJECT, or dismissing a BLOCKING or security item, needs Codex first, run BEFORE you form a view:
   `P triage second-review --round R --ids … --pr N` as a job. Codex ACCEPT ⇒ the item is ACCEPT, fix it. Codex dismisses at high confidence ⇒ claude-ruling may dismiss;
-  the stricter of the two stands. Below high ⇒ ACCEPT. Exit 3 ⇒ rule 2 (`awaiting-review`); never substitute another reviewer.
+  the stricter of the two stands. Below high ⇒ ACCEPT. Exit 3 ⇒ rule 2 (`awaiting-review`), unless it carries `substitute{…}` (a quota stop only): call the agent it names (description = tag, prompt = `promptHeader` verbatim, then `Read <inputPath> and verify the findings it lists.`; never a model), then `P triage second-review --apply --pr N --tag "<tag>"`; no other reviewer.
 - A malfunction cause (`model-proof`, `invalid-arbiter`, `invalid-judge`): `P arbiter needed --round R` re-runs the arbiter, or ACCEPT.
 - You may tighten your own dismissal to ACCEPT before the merge, never loosen an ACCEPT. Only the owner's typed path loosens: if, and only if, the owner says they want to dismiss it,
   follow `reference/owner-merge.md` Owner override.

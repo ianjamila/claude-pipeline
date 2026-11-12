@@ -185,3 +185,18 @@ test('extra-round discipline: the ask shows rounds, cost and severity; "follow u
   assert.match(cli, /Follow up instead of a round/);
   assert.match(cli, /pipeline triage defer-fixes --pr N --ids/);
 });
+
+test('the review skill sends a quota stop, a withheld round and a second review to the substitute, and the owner hand-off explains it', () => {
+  const review = read('skills/review/SKILL.md');
+  const merge = read('skills/review/reference/owner-merge.md');
+  assert.match(review, /with `substitute\.eligible` ⇒ the substitute path/);
+  assert.match(review, /P substitute prepare --pr N --round R/);
+  assert.match(review, /P substitute apply --round R --tag/);
+  assert.match(review, /BEFORE every codex-review call run it with `--plan`.*`expectedEffort` as `--effort`/);
+  assert.match(review, /`nextRound\.base`/);
+  assert.match(review, /codex-status --wait/);
+  assert.match(review, /P triage second-review --apply --pr N --tag/);
+  assert.match(review, /substitute-opus\|substitute-fable/);
+  assert.match(merge, /\*\*Substitute reviews\*\* \(`ownerStep\.substitute`/);
+  assert.match(merge, /label mode never merges one|Label mode ⇒ no request/);
+});
