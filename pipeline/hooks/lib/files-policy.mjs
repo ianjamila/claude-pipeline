@@ -411,6 +411,7 @@ function makeCtx(opts) {
     // #128: a transcript folder (R1-B1) is a protected reference when a word IS it; a shell sitting in one (cwd, a cd target) may write only what is not a transcript
     // (hit), but runs of its own (tar -x, cp -R x .) land in it, so there ctx.hitTranscriptBelow counts like an ancestor (R8-B1: projects/ itself too; the same folders as hitTranscriptDir, see transcriptRes; notes stay writable in projects/<proj>/memory/)
     // (R4-B2 / R4-F2: a trailing zsh glob qualifier, `claude-config(/)`, is not part of the name: dropped, which can only widen the match)
+    hitTranscriptFile: (p) => withoutQualifier(p).some((q) => transcripts.files.some((re) => re.test(unFirm(q)))), // (a transcript file itself, no other protected path: the wording of the "pass a copy" advice)
     hitTranscriptDir: (p) => withoutQualifier(p).some((q) => transcripts.dirs.some((re) => re.test(unFirm(q)))),
     hitTranscriptBelow: (p) => withoutQualifier(p).some((q) => transcripts.below.some((re) => re.test(unFirm(q)))),
     hitPipelineAncestor: pipelineAncestor,
@@ -1456,7 +1457,7 @@ function modelledCd(t, cmds, idx, ctx) {
     if (cmds.some((c) => (c.redirects ?? []).some((q) => UP.test(q.target ?? '')) || c.argv.slice(1).some((a) => UP.test(a)))) return null;
     return pathsFor().join('/tmp/.mktemp', sub(m[3]));
   }
-  m = /^\$\{?TMPDIR\}?(\/[\w./-]*)?$/.exec(t); // (no default: \`\${TMPDIR:-x}\` and an unset or empty TMPDIR are unknown)
+  m = /^\$\{?TMPDIR\}?(\/[\w./-]*)?$/.exec(t); // (no default: \`${TMPDIR:-x}\` and an unset or empty TMPDIR are unknown)
   if (m && !touched(['TMPDIR'])) {
     const v = ctx.env.TMPDIR;
     if (typeof v === 'string' && v !== '' && isAbs(toPosix(v)) && !/[$`*?[{]/.test(v)) return pathsFor().normalize(pathsFor().join(toPosix(v), sub(m[1])));
@@ -1583,7 +1584,11 @@ const MOVERS = new Set(['mv', 'ln', 'ditto']); // any named protected path count
 const CDPATH_NAMES = ['CDPATH', 'cdpath'];
 const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'source', '.']);
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
-const FD_DUP = /^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
+const LAST_WORD_RE = /\$_(?![A-Za-z0-9_])|\$\{_(?:[^A-Za-z0-9_}][^}]*)?\}/; // `$_` / `${_}`: the last word of the previous command (not `$_x`)
+// R7-F3 (#266): an arithmetic context on a line that names a protected file: `$((`, `((`, `$[`, a `let` word, a numeric test operator word (`-eq`, `-lt` ...) and a lone `_` word (whitespace-delimited;
+// `${x:_}`, `$a[_]`, `printf %d _`, `[ _ ... ]` read it as arithmetic). Each alternative is a literal or a one-class run, so the scan is linear.
+const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])let(?=\s)|\s-(?:eq|ne|lt|gt|le|ge)(?=\s)|(?:^|[\s:[(])_(?=[\s\])}:;&|]|$)/;
+const FD_DUP =/^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
 const FAN_OUT_RE = /(?:^|[\s;&|(`])(?:xargs|parallel)(?=\s|$)/;
 
@@ -1678,15 +1683,321 @@ function ghReadOnly(args, cmd, ctx) {
   if (words[0] === 'api') return !args.some((a) => /^(?:-o|--output|--cache)/.test(a));
   return Object.hasOwn(GH_PRINTERS, words[0] ?? '') && GH_PRINTERS[words[0]].includes(words[1]);
 }
+// #190 case 4 (T1.1, narrowed by the Fable plan pass F1 / F3): a plain `NAME=value` command is not itself a risk, only what later reads NAME is, and the redirect and writer rules already expand
+// NAME. So an assignment that names a protected path is harmless exactly when nothing on the line can hand the value to a program or change how it is read:
+//   - top level only: a sourced or startup file, a script and a `bash -c` string are judged as before (their later consumers are not visible to the evaluation);
+//   - (i) NAME is not in the hook's own environment (a plain assignment to an exported name changes what children see) and is no special name (a shell parameter the shell itself acts on
+//     (PATH, TMPDIR, TMPPREFIX, IFS ...), or a family the tools read: GIT_ LESS PAGER NODE_ RIPGREP_ GH_ XDG_ LD_ DYLD_);
+//   - (ii) the value, after expansion, is ONE path-shaped token (so it can be no option, program text, list or command: `O=-o<S>; sort $O p` stays refused);
+//   - (iii) nothing on the line exports, declares, evals, traps, aliases, defines a function, sources or sets an option (`set -a`);
+//   - (iv) every other command is an env-inert reader, so a later use can only read.
+const ENV_INERT = new Set(['cat', 'head', 'tail', 'wc', 'ls', 'stat', 'grep', 'cut', 'echo', 'printf', 'test', '[', 'shasum', 'cmp']);
+const SPECIAL_NAMES = new Set(['PATH', 'path', 'fpath', 'cdpath', 'CDPATH', 'HOME', 'TMPDIR', 'TMPPREFIX', 'IFS', 'NULLCMD', 'READNULLCMD', 'ZDOTDIR', 'ENV', 'BASH_ENV', 'PS4', 'PS1', 'PS2', 'PS3', 'PROMPT_COMMAND',
+  'HISTFILE', 'SHELLOPTS', 'BASHOPTS', 'GLOBIGNORE', 'FIGNORE', 'MAIL', 'MAILPATH', 'TMOUT', 'LANG', 'TZ', 'SHELL', 'EDITOR', 'VISUAL', 'PWD', 'OLDPWD', 'USER', 'LOGNAME', '_']);
+const SPECIAL_FAMILIES = /^(?:GIT_|LESS|PAGER|NODE_|RIPGREP_|GH_|GITHUB_|XDG_|LD_|DYLD_|LC_|ZSH|BASH_|SHELL|MANPAGER|PIPELINE_|CLAUDE)/;
+const PATH_VALUE = /^[A-Za-z0-9_@%+,./~${}-]+$/; // (no space, quote, backslash, glob or list character, `=`, `:`, `(`)
+// (a function, a `${NAME:=word}` default that assigns, an arithmetic expression: each can set a name the line never assigns)
+const FUNCTION_TEXT = /\bfunction\b|\w\s*\(\)|\$\{[A-Za-z_]\w*:?=|\(\(/;
+function assignmentOnlyHarmless(cmds, ctx, topLevel) {
+  const no = () => false;
+  if (!topLevel || cmds.dynamic || cmds.truncated || ctx.unknownAll) return no;
+  const isAssign = (c) => c.argv.length === 0 && Object.keys(c.env ?? {}).length > 0 && !(c.redirects ?? []).length;
+  const valueOk = (name, v) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || SPECIAL_NAMES.has(name) || SPECIAL_FAMILIES.test(name) || Object.hasOwn(ctx.env ?? {}, name)) return false;
+    if (typeof v !== 'string' || !PATH_VALUE.test(v) || /^-/.test(v)) return false;
+    const e = expandRefs(v, ctx);
+    return !/[$`{}]/.test(e) && /^(?:\/|~|\.)/.test(e);
+  };
+  const inert = (c) => (isAssign(c) ? Object.entries(c.env).every(([k, v]) => valueOk(k, v)) : c.argv.length > 0 && ENV_INERT.has(baseOf(c.argv[0])) && !Object.keys(c.env ?? {}).length && !(baseOf(c.argv[0]) === 'printf' && c.argv.some((a) => /^-v/.test(a))) && !evaluatesSubscript(baseOf(c.argv[0]), c.argv.slice(1), ctx, c.raw)); // (printf -v NAME assigns a shell variable; test -v / a numeric comparison evaluates an array subscript)
+  if (!cmds.every(inert)) return no;
+  if (FUNCTION_TEXT.test(ctx.ghLine ?? '')) return no;
+  return (c) => isAssign(c);
+}
+
+// T1.7 (c) / (f): a tool that reads a variable to decide WHERE it writes (git's GIT_TRACE*, less's LESSHISTFILE / LESSOPEN, a pager, rg's config) or what it loads (node's NODE_OPTIONS / NODE_PATH) is
+// not read-only when the line sets one: as a prefix of the command, by an assignment or `export` / `declare -x` anywhere on the line, or through a name a sourced file may have changed.
+// (Same reading as ghEnvTouched; a name only the session's own environment holds is outside the line's control, as for every command here.)
+const GIT_TOOL_ENV = 'GIT_|LESS|PAGER|MANPAGER|MORE|BAT_|RIPGREP_';
+const NODE_TOOL_ENV = 'NODE_OPTIONS|NODE_PATH';
+const envPatterns = new Map();
+function toolEnvTouched(cmd, ctx, src) {
+  let p = envPatterns.get(src);
+  if (!p) {
+    p = {
+      name: new RegExp(`^(?:${src})`),
+      assign: new RegExp(`(?:^|[\\s;&|(\`{])(?:${src})[A-Za-z0-9_]*\\s*(?:\\+?=|\\[)`),
+      declare: new RegExp(`\\b(?:export|declare|typeset|readonly|local|setenv)\\b[^;&|\\n]*(?<![A-Za-z0-9_])(?:${src})[A-Za-z0-9_]*`),
+    };
+    envPatterns.set(src, p);
+  }
+  const names = [...Object.keys(cmd.env ?? {}), ...Object.keys(ctx.vars ?? {}), ...(ctx.unknownVars ?? []), ...(ctx.pickUnknown ?? []), ...(ctx.srcChanged ?? []), ...(ctx.srcTouched ?? [])];
+  if (names.some((n) => p.name.test(n))) return true;
+  const line = ctx.ghLine ?? '';
+  return p.assign.test(line) || p.declare.test(line);
+}
+
+// T1.7 (a): isReadOnly judges the words the shell will pass. A same-line name is replaced by its value first (`D=-delete; find S $D`); a word whose value is still only known at run time
+// ($NAME no assignment gave, `$(…)`, a backtick) can be an option, so it is no read-only call. Where such a word can stand for an option: a word that starts with `$` or a backtick (the
+// unknown part can be the whole option, `$O` = `-o/x`) or with `-` (`-delet$X`); for sed and awk, whose program is a plain word, any run-time part of it (`$1` and `$NF` of a quoted
+// program are no shell variables and stay as they are).
+const OPTION_TOOLS = new Set(['find', 'git', 'jq', 'tree', 'xxd', 'openssl', 'sort', 'rg']);
+const PROGRAM_TOOLS = new Set(['sed', 'gsed', 'awk', 'gawk', 'mawk', 'nawk']);
+const RUNTIME_PART = /[$`]/;
+function judgedWords(name, args, ctx) {
+  if (!args.some((a) => RUNTIME_PART.test(a))) return { args, unknown: false };
+  const touched = (n) => Object.hasOwn(ctx.vars ?? {}, n) || ctx.unknownVars?.has(n) || ctx.pickUnknown?.has(n) || ctx.srcChanged?.has(n) || ctx.srcTouched?.has(n) || ctx.unknownAll === true;
+  let unknown = false;
+  const out = args.map((a) => {
+    if (!RUNTIME_PART.test(a)) return a;
+    const e = expandRefs(a, ctx);
+    if (RUNTIME_PART.test(e)) {
+      if (PROGRAM_TOOLS.has(name)) { if (/`|\$[({]/.test(e) || [...e.matchAll(/\$(\w+)/g)].some((m) => touched(m[1]))) unknown = true; }
+      else if (OPTION_TOOLS.has(name) && (/^[$`]/.test(e) || e.startsWith('-'))) unknown = true;
+    }
+    return e;
+  });
+  return { args: out, unknown };
+}
+// R1-B2 / R2-B1 / R2-F1 / R3 (#266): bash and zsh read some operands as a variable NAME or an arithmetic expression, and evaluate an array subscript in it (`test -v 'a[$(rm "$T")]'` runs the
+// substitution). Such a call with an operand holding `[`, `$(` or a backtick is no read-only call. The forms: `test` / `[` with -v, -R, -t (zsh reads its operand as arithmetic) or a numeric
+// comparison (-eq -ne -lt -le -gt -ge); `printf -v`; and zsh's printf, which reads the argument of a numeric conversion (%d %i %u %o %x %X %e %E %f %g %G) and of a `*` width / precision as
+// arithmetic with no -v at all. Both the words as written and as expanded are judged (a same-line name may carry the subscript or the option); a printf option word that is still only known
+// at run time can be -v, and a format still only known at run time can hold a numeric conversion.
+// Rounds 1-3 kept finding one more spelling, so the check fails closed for the class (R3): test, `[`, `[[` and printf are no read-only call when ANY word, as written or as expanded, holds a
+// subscript-evaluation form (SUBSCRIPT_FORM: a `[` followed later in the word by `$(`, `${`, `$[` or a backtick), whatever the operator or the format. The precise analysis below stays for the words
+// that only hold a run-time part (`"$(cmd)"`, whose output may be such a form). A same-line assignment whose value holds the form is refused by assignmentOnlyHarmless (PATH_VALUE has no `[`),
+// which matters because zsh evaluates the VALUE of a name read as arithmetic (`y='a[$(…)]'; printf '%d' y`).
+const SUBSCRIPT_EVAL = /[\[`]|\$[({]/;
+const SUBSCRIPT_FORM = /\[[^]*(?:\$[({[]|`)/;
+const PRINTF_PLAIN_SPEC = /^%[-+ #0-9.]*[sbcq]/; // (a conversion whose argument is never read as arithmetic)
+const PRINTF_PERCENT_ESCAPE = /\\(?:[xuU]|[0-7][0-7])/; // (a hex, unicode or octal escape can spell a %: zsh decodes \u0025d to a live %d; a lone \0 or a \n stays plain)
+function printfFormatEvaluates(fmt) {
+  if (/[$`]/.test(fmt) || PRINTF_PERCENT_ESCAPE.test(fmt)) return true; // (not known)
+  let rest = fmt.replace(/%%/g, '');
+  while (rest.includes('%')) {
+    rest = rest.slice(rest.indexOf('%'));
+    const m = PRINTF_PLAIN_SPEC.exec(rest);
+    if (!m) return true; // (a numeric conversion, a `*`, or a form this check does not know)
+    rest = rest.slice(m[0].length);
+  }
+  return false;
+}
+// R4-F1 (#266): test / [ / [[ are read BY POSITION, not by hunting for a bracket. Strip the closing `]` / `]]` and a leading `!`; then one word is a plain string, two words are a unary
+// operator and its operand, three are an operand, a binary operator and an operand; every other shape (-a, -o, parentheses, more words) is unknown. The operator must be a LITERAL word (no `$`,
+// no backtick): a run-time operator can be -v, -t or -eq whatever the operands look like. A word that holds a run-time part and is not double-quoted is split by the shell into any number of
+// words (probed with zsh 5.9: `test -n $(printf 'x -a -v a\x5b'; …)` runs the subscript's substitution), so then no position can be trusted and the call is judged as an unknown shape.
+const TEST_UNARY = new Set(['-n', '-z', '-e', '-f', '-d', '-s', '-r', '-w', '-x', '-L', '-h', '-b', '-c', '-p', '-S', '-g', '-u', '-k', '-O', '-G', '-N']); // (read no operand as a name or arithmetic)
+const TEST_UNARY_EVAL = new Set(['-v', '-R', '-t']); // (a variable name, or arithmetic in zsh)
+const TEST_BINARY = new Set(['=', '==', '!=', '<', '>', '-nt', '-ot', '-ef']); // (string and file comparisons)
+const TEST_BINARY_EVAL = /^-(?:eq|ne|lt|le|gt|ge)$/; // (arithmetic)
+// Is there a `$` expansion or a backtick in `raw` outside double quotes? Single quotes and backslashes are honoured and a `$(…)` or a backtick pair is read as a unit; anything this scan cannot
+// follow (an unbalanced quote, `$'…'`) counts as unquoted. No `raw` is the same.
+function unquotedRuntime(raw) {
+  if (typeof raw !== 'string') return true;
+  const n = raw.length;
+  const skipTick = (i) => { for (; i < n; i++) { if (raw[i] === '\\') i++; else if (raw[i] === '`') return i + 1; } return -1; };
+  let skipSub, skipDq;
+  skipSub = (i) => { // just after `$(`: the index after the matching `)`
+    let depth = 1;
+    while (i < n) {
+      const c = raw[i];
+      if (c === '\\') i += 2;
+      else if (c === "'") { const j = raw.indexOf("'", i + 1); if (j < 0) return -1; i = j + 1; }
+      else if (c === '"') { i = skipDq(i + 1); if (i < 0) return -1; }
+      else if (c === '`') { i = skipTick(i + 1); if (i < 0) return -1; }
+      else if (c === '(') { depth++; i++; } else if (c === ')') { i++; if (--depth === 0) return i; } else i++;
+    }
+    return -1;
+  };
+  skipDq = (i) => { // just after an opening double quote: the index after the closing one
+    while (i < n) {
+      const c = raw[i];
+      if (c === '\\') i += 2;
+      else if (c === '"') return i + 1;
+      else if (c === '$' && raw[i + 1] === '(') { i = skipSub(i + 2); if (i < 0) return -1; }
+      else if (c === '`') { i = skipTick(i + 1); if (i < 0) return -1; }
+      else i++;
+    }
+    return -1;
+  };
+  for (let i = 0; i < n;) {
+    const c = raw[i];
+    if (c === '\\') i += 2;
+    else if (c === "'") { const j = raw.indexOf("'", i + 1); if (j < 0) return true; i = j + 1; }
+    else if (c === '"') { i = skipDq(i + 1); if (i < 0) return true; }
+    else if (c === '`' || (c === '$' && /[({'\w@*#?!$=~^+-]/.test(raw[i + 1] ?? ''))) return true;
+    else i++;
+  }
+  return false;
+}
+// R5-F4 (#266): a word that splits into several words even inside double quotes: `"${(@f)$(cmd)}"` (any flag group), `"$@"`, `"$*"`, `"${@}"`, `"${arr[@]}"`, `"${arr[*]}"`. Probed with zsh 5.9: test
+// "${(@f)$(cat f)}", test "$@" and test "${arr[@]}" hand test several words, so no position can be trusted (quoted or not).
+const SPLITTING_WORD = /\$\{\(|\$\{=|\$=|\$[@*]|\$\{[@*]|\[[@*]\]/; // (R6-F4: `"${=x}"` and `"$=x"` split inside double quotes too)
+function testEvaluates(name, args, words, expand, raw) {
+  const rtWord = (a) => RUNTIME_PART.test(a) || SUBSCRIPT_EVAL.test(a) || RUNTIME_PART.test(expand(a)) || SUBSCRIPT_EVAL.test(expand(a));
+  if (args.some((a) => SPLITTING_WORD.test(a) || SPLITTING_WORD.test(expand(a)))) return true; // (the words it makes are unknown: no read-only call)
+  const unknownShape = args.some(rtWord); // (an unknown shape is no read-only call when ANY word, as written or as expanded, is run-time or may hold a subscript)
+  if (!unknownShape) return false;
+  if (args.some((a) => RUNTIME_PART.test(expand(a))) && unquotedRuntime(raw)) return true; // (a word the shell splits: no position holds)
+  const w = [...args];
+  if (name === '[' && w.at(-1) === ']') w.pop();
+  else if (name === '[[' && w.at(-1) === ']]') w.pop();
+  while (w[0] === '!') w.shift();
+  const lit = (a) => !RUNTIME_PART.test(a);
+  const evalWord = () => words.some((a) => SUBSCRIPT_EVAL.test(a)); // (the known operators that evaluate: as before, any word that holds a subscript form)
+  if (w.length === 1) return false; // (a plain string, whatever it holds; a run-time word that is double-quoted stays one word)
+  if (w.length === 2) {
+    if (!lit(w[0])) return true;
+    if (TEST_UNARY_EVAL.has(w[0])) return evalWord();
+    return !TEST_UNARY.has(w[0]);
+  }
+  if (w.length === 3) {
+    if (!lit(w[1])) return true;
+    if (TEST_BINARY_EVAL.test(w[1])) return evalWord();
+    return !TEST_BINARY.has(w[1]);
+  }
+  return true;
+}
+// R4-F2 / R5 / R6 (#266): an expansion that ASSIGNS (`${y:=w}`, `${y::=w}`, `${y=w}`, `${1:=w}`, `${=y:=w}`) plants the text of w as the value of y; a later `printf '%d' y` / `(( y ))` /
+// `let y` reads that value as arithmetic and evaluates a subscript in it (zsh). Rounds 4-6 kept finding one more spelling (a flag, a prefix, the zero-colon form, a positional name, a flag group long or
+// decoyed enough to hide the name, a here-string or heredoc), so the class is refused: a command is no read-only call when ANY of its words, its env values, its redirect targets or its own text (which
+// holds a here-string and a redirect word), or a heredoc body of the line, holds
+//   (a) a `${(` flag group, a `$((` or a `$[`: each can run a substitution or evaluate a subscript with no assignment at all (the `(e)` flag, `$((path[\$(cmd)]))`), and a flag group may hold quotes,
+//       substitutions and a `}` that does not close the expansion, so nothing between its `${(` and its name can be trusted (R6-B1, R6-F3, R6-F5);
+//   (b) an `=` (so `=`, `:=`, `::=`) after a name char or a `]`, between the first `${` and the last `}` of the text, whose word is not plain path characters up to a closing brace (R6-F2: a
+//       positional name counts). One linear pass: the first head and the last `}` are found once and each `=` is judged where it stands, so no decoy `}` ends the region early and no head is
+//       rescanned (R6-F1: a hook past the host's 15 s is ALLOWED, and the two lazy patterns of round 5 backtracked quadratically: 16 s at 190 kB). Over-matching (`${x:-a=$(b)}`, `echo ${A} k=$(b)`) fails closed.
+const EVALUATING_WORD = /\$\{\(|\$\(\(|\$\[|\$(?:[\p{L}\p{N}_]+|[@*#?$!-])\[|\}\[/u; // (`$name[…]`, `${name}[…]` and (R7-F2) `$@[` `$*[` `$#[` `$?[` `$$[` `$![` `$-[` are subscripts too; each alternative is anchored on its `$` and holds at most one repetition of a class that excludes `$`, so the scan is linear)
+const PLAIN_DEFAULT = /[A-Za-z0-9_./~+-]*\}/y; // (the default word up to its closing brace: plain path characters only; sticky, so it is matched where the `=` ends and nowhere else)
+const SPAN_STOP = /[[`'"\\{]/; // (inside a `${…}`: what can run a substitution, evaluate a subscript, hide a `}` or open a brace of its own; with `$(` it makes the span unjudgeable, so the text is refused)
+const isDigit = (c) => c >= '0' && c <= '9';
+const isNameChar = (c) => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || isDigit(c) || c === '_' || c.charCodeAt(0) > 127; // (non-ASCII: a letter, a mark or a surrogate half; zsh with MULTIBYTE allows them in a name)
+// The `:` of a `${name:…}` at text[i] (R7-F1 / PP3): `:- :+ := :? :# :| :^` are operators (their word is scanned by the caller for what can run); `::=` is the assigning operator (`::` alone is NOT one: zsh may read
+// `${x::len}` as an offset plus an arithmetic length). Anything else is an offset (and length): zsh evaluates it as arithmetic, so only plain digits are accepted (`:1`, `:1:2`, `: -1`; `:-1` is the default
+// operator). Returns true when the colon is acceptable. Linear: it only walks forward.
+function colonOk(text, i) {
+  const n = text.length;
+  const c = text[i + 1];
+  if (c === '-' || c === '+' || c === '=' || c === '?' || c === '#' || c === '|' || c === '^') return true;
+  if (c === ':') return text[i + 2] === '=';
+  let j = i + 1;
+  for (let part = 0; part < 2; part++) {
+    while (j < n && (text[j] === ' ' || text[j] === '\t')) j++;
+    if (text[j] === '-') j++;
+    const d = j;
+    while (j < n && isDigit(text[j])) j++;
+    if (j === d) return false;
+    while (j < n && (text[j] === ' ' || text[j] === '\t')) j++;
+    if (text[j] === ':' && part === 0) { j++; continue; }
+    break;
+  }
+  return text[j] === '}';
+}
+// One linear pass with a stack depth of open `${` (R7-B1, R7-F1, PP3-a/b/c): every `${…}` is judged against its TRUE closing brace, however deep, and no regex with overlapping repetitions is used.
+//   - the head: flag chars `= ~ ^ + ! #`, then a plain name (letters, digits, `_`, non-ASCII) or ONE special char `@ * ? $ ! -`; a head that goes on with `$`, `{`, `(`, `[` or a quote is refused (a nested head);
+//   - the char after the head: `}` ends, `:` must be a known operator or a plain-digit offset / length, anything else (`%`, `#`, `/`, `-`, `=`, a space ...) starts a pattern or default word;
+//   - inside any open span a `[`, a backtick, a quote, a backslash, a bare `{` or a `$(` (also `$((`) refuses the text: the span may run a substitution or evaluate a subscript, or hide a `}`;
+//   - a `}` that closes an inner span and is followed by `:` or `[` is refused (a nested head with an offset). Over-matching fails closed (`${x:-${y}:z}`, `${x:-"a"}`, a lone `{` in a default word).
+function scanExpansions(text, first) {
+  const n = text.length;
+  let depth = 0;
+  for (let i = first; i < n;) {
+    const c = text[i];
+    if (c === '$' && text[i + 1] === '{') {
+      depth++;
+      let j = i + 2;
+      while (j < n && '=~^+!#'.includes(text[j])) j++;
+      if (j < n && isNameChar(text[j])) { while (j < n && isNameChar(text[j])) j++; }
+      else if (j < n && '@*?$!-'.includes(text[j])) {
+        if (text[j] === '$' && (text[j + 1] === '{' || text[j + 1] === '(' || text[j + 1] === '$' || (j + 1 < n && isNameChar(text[j + 1])))) return true; // (a head that is itself an expansion)
+        j++;
+      }
+      const h = text[j];
+      if (h === undefined) return false; // (the text ends in a head: nothing more to judge)
+      if (h === '[' || h === '$' || h === '{' || h === '(' || h === '`' || h === "'" || h === '"' || h === '\\') return true;
+      if (h === ':' && !colonOk(text, j)) return true;
+      i = j;
+    } else if (c === '}') {
+      if (depth > 0) {
+        depth--;
+        if (depth > 0 && (text[i + 1] === ':' || text[i + 1] === '[')) return true; // (PP3-c: a nested head with an offset)
+      }
+      i++;
+    } else if (depth > 0 && (SPAN_STOP.test(c) || (c === '$' && text[i + 1] === '('))) return true;
+    else i++;
+  }
+  return false;
+}
+function plantsInText(text) {
+  if (typeof text !== 'string') return false;
+  if (EVALUATING_WORD.test(text)) return true;
+  const first = text.indexOf('${');
+  if (first === -1) return false;
+  const end = text.lastIndexOf('}');
+  if (scanExpansions(text, first)) return true;
+  // an `=` after a name char, a `]` or any non-ASCII char (zsh with MULTIBYTE allows letters like `é` in a name; a mark or a surrogate half is above 127 too) assigns when its word is not plain
+  let at = text.indexOf('=', first + 2);
+  while (at !== -1 && at < end) {
+    let k = at - 1;
+    if (text[k] === ':') k--; // (`:=`)
+    if (text[k] === ':') k--; // (`::=`)
+    if (k >= 0 && (text[k] === ']' || /\w/.test(text[k]) || text.charCodeAt(k) > 127)) {
+      PLAIN_DEFAULT.lastIndex = at + 1;
+      if (!PLAIN_DEFAULT.test(text)) return true;
+    }
+    at = text.indexOf('=', at + 1);
+  }
+  return false;
+}
+function plantsSubscript(cmd, ctx) {
+  const texts = [...cmd.argv, ...Object.values(cmd.env ?? {}), ...(cmd.redirects ?? []).map((r) => r.target), cmd.raw];
+  // (a heredoc body is on no command: ctx.heredocPlants says whether a body of this text holds one)
+  return ctx?.heredocPlants === true || texts.some(plantsInText);
+}
+function evaluatesSubscript(name, args, ctx, raw) {
+  const test = name === 'test' || name === '[' || name === '[[';
+  if (!test && name !== 'printf') return false;
+  const expand = (a) => (/[$`]/.test(a) ? expandRefs(a, ctx) : a);
+  const words = [...args, ...args.map(expand)];
+  if (words.some((a) => SUBSCRIPT_FORM.test(a))) return true; // (the class rule: whatever the operator or the format)
+  if (test) return testEvaluates(name, args, words, expand, raw);
+  if (!words.some((a) => SUBSCRIPT_EVAL.test(a))) return false;
+  if (words.some((a) => /^-v/.test(a))) return true;
+  // the format: the first word that is no option; `--` ends the options (the next word is the format, a dash word or not), a lone `-` is the format itself
+  let fmt = -1;
+  for (let i = 0; i < args.length; i++) {
+    const e = expand(args[i]);
+    if (RUNTIME_PART.test(e)) return true; // (an option or a format only known at run time)
+    if (e !== args[i] && (/^-/.test(args[i]) || /^-/.test(e))) return true; // (a name rewrites a dash word: unknown)
+    if (e === '--') { fmt = i + 1; break; }
+    if (/^-./.test(e)) continue;
+    fmt = i;
+    break;
+  }
+  if (fmt < 0 || fmt >= args.length) return true; // (all options, or `--` and nothing after it)
+  const operands = args.slice(fmt + 1);
+  if (!operands.some((a) => SUBSCRIPT_EVAL.test(a) || SUBSCRIPT_EVAL.test(expand(a)))) return false;
+  return printfFormatEvaluates(args[fmt]) || printfFormatEvaluates(expand(args[fmt])); // (the format as written and as expanded)
+}
 function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
   if (!argv.length) return false;
   const name = baseOf(argv[0]);
-  const args = argv.slice(1);
+  const judged = judgedWords(name, argv.slice(1), ctx);
+  if (judged.unknown) return false;
+  const args = judged.args;
+  if (evaluatesSubscript(name, argv.slice(1), ctx, cmd.raw)) return false;
+  if (plantsSubscript(cmd, ctx)) return false;
+  // R1-B1 (#266): a sed / awk program is plain program text, and the expansion above rewrites a same-line name in it (`system=length; awk 'BEGIN { $system("rm S") }'` reads as length(...)
+  // while awk runs system()). The program as written must be read-only too.
+  if (PROGRAM_TOOLS.has(name) && !(name === 'sed' || name === 'gsed' ? sedReadOnly(argv.slice(1)) : awkReadOnly(argv.slice(1), cmd.env))) return false;
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
-  if (READ_ONLY.has(name)) return !(name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre=')));
+  if (READ_ONLY.has(name)) {
+    if (name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre='))) return false;
+    return !(['less', 'more', 'bat', 'rg'].includes(name) && toolEnvTouched(cmd, ctx, GIT_TOOL_ENV));
+  }
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
-  if (name === 'git') return gitReadOnly(args);
+  if (name === 'git') return gitReadOnly(args) && !toolEnvTouched(cmd, ctx, GIT_TOOL_ENV);
   if (name === 'gh') return ghReadOnly(args, cmd, ctx);
   if (name === 'jq') return !args.some((a) => /^-[A-Za-z]*i/.test(a) || a === '--in-place');
   if (name === 'sed' || name === 'gsed') return sedReadOnly(args);
@@ -1696,8 +2007,9 @@ function isReadOnly(cmd, ctx) {
   if (name === 'xxd') return !args.includes('-r') && positional(args).length <= 1;
   if (name === 'openssl') return args[0] === 'dgst' && !args.some((a) => a === '-out' || a === '-sign' || a === '-prverify');
   if ((name === 'python' || name === 'python3') && args[0] === '-m' && args[1] === 'json.tool') return positional(args.slice(2)).length <= 1;
-  if (isPipelineTool(argv[0], ctx)) return true;
-  if (name === 'node') return isPipelineTool(argv[1], ctx) || (cmd.raw.includes('\\') && pipelineToolInRaw(cmd.raw, ctx));
+  // (T1.7 f: the trusted CLI runs foreign code when NODE_OPTIONS / NODE_PATH make node load it)
+  if (isPipelineTool(argv[0], ctx)) return !toolEnvTouched(cmd, ctx, NODE_TOOL_ENV);
+  if (name === 'node') return (isPipelineTool(argv[1], ctx) || (cmd.raw.includes('\\') && pipelineToolInRaw(cmd.raw, ctx))) && !toolEnvTouched(cmd, ctx, NODE_TOOL_ENV);
   if (name === 'pwsh' || name === 'powershell') return pwshReadOnly(argv);
   return PS_READ_ONLY.has(name);
 }
@@ -2396,7 +2708,13 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   // program text in another language: the admin switch, the hook switch, or a write next to a protected path
   if (variantsOf(text).some((t) => setsAdmin(t, ctx.platform) || hasDisableAll(t))) return deny(`the program ${sf.file} sets PIPELINE_ADMIN or mentions disableAllHooks; only the owner may switch the pipeline guard off`);
   const m = makeMatchers(ctx);
-  if (text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true) && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})${programHitWhere(text, m, dir, ctx, sf.file)}`);
+  // (#190 case 5: scanning a script's text brace-expands it, and above 5,000 characters braceExpand sets ctx.dynamic, which means "THE LINE's scan was skipped"
+  // to the rule at the end of the evaluation. A script's size is no fact about the line: the flag is kept as it was, so a trusted CLI call next to a long
+  // script no longer fails closed. The script's own verdict is unchanged: it never denied on that flag.)
+  const dynamicBefore = ctx.dynamic;
+  const hitsProtected = text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true);
+  ctx.dynamic = dynamicBefore;
+  if (hitsProtected && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})${programHitWhere(text, m, dir, ctx, sf.file)}`);
   return null;
 }
 
@@ -3027,6 +3345,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
+  ctx.heredocPlants = /<</.test(raw) && plantsInText(raw); // (R5-F3: a heredoc body is on no command; the line's text is judged for an assigning expansion, a quoted body included)
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
   const proseValues = [...prose.values()].flatMap((p) => p.values);
@@ -3324,7 +3643,7 @@ function evaluateBashForFilesFrame(command, opts) {
     if (!c.argv.length) continue;
     const runs = RUNTIMES.has(baseOf(c.argv[0])) || OWNER_GO_RECORDER.test(toPosix(c.argv[0]));
     if (runs && c.argv.some((w) => /owner-go\.mjs/i.test(toPosix(expandRefs(w, ctx))))) {
-      return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types (PIPELINE_ADMIN=1 for the owner)');
+      return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types; to change its source, edit the source with the Edit tool (a program that runs or rewrites it is refused; PIPELINE_ADMIN=1 for the owner)');
     }
   }
 
@@ -3427,7 +3746,7 @@ function evaluateBashForFilesFrame(command, opts) {
       for (const target of [r.target, ...(r.target.startsWith('&') ? [r.target.slice(1)] : []), ...braceExpand(expandRefs(r.target, ctx), ctx).split(/\s+/).filter((x) => x && x !== r.target)]) {
       const e = expandRefs(target, ctx);
       // Why: a target built at run time (`echo settings.json`, an unset name) inside a protected directory can be any file there
-      if (/[`$]/.test(e) && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTree(d))) return deny(`the command redirects output to ${target}, a name only known at run time, inside a protected pipeline directory, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
+      if ((/[`$]/.test(e) && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTree(d))) || (protectedInRaw && LAST_WORD_RE.test(e))) return deny(`the command redirects output to ${target}, a name only known at run time, inside a protected pipeline directory, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
       const abs = isAbs(e) ? [pathsFor().normalize(e)] : dirs.map((d) => pathsFor().join(d, e));
       const viaLink = abs.some((p) => !/[*?[]/.test(p) && (ctx.hit(realResolve(p, ctx.api)) || ctx.hitInode(p)));
       if (m.rawHit(target, dirs) || m.pathHit(target, dirs, true) || viaLink) return deny(`the command redirects output to ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
@@ -3449,6 +3768,9 @@ function evaluateBashForFilesFrame(command, opts) {
   // A scan that was cut short (parse caps, dynamic commands, sizes) cannot prove a command harmless: fail closed
   // when the raw text names a protected file at all.
   if ((cmds.dynamic || ctx.dynamic) && protectedInRaw) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
+  // R7-F3 (#266): in arithmetic zsh reads a bare name `_` (the last word of the previous command) and evaluates its text again, a subscript with a substitution included. `echo 'path[$(cmd)]'; echo $((_))`
+  // plants nothing a rule can refuse, and the reader names no protected file, so it is never judged: on a line that names a protected file an arithmetic context anywhere denies the line.
+  if (protectedInRaw && ARITH_CONTEXT.test(raw)) return deny(`the command line refers to a protected pipeline file and holds an arithmetic context ($(( )), $[ ], (( )), let, a numeric test operator or a lone _ word), which can evaluate text planted by an earlier command; split it so the arithmetic is on its own line (${PROTECTED_MSG})`);
 
   const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(rawOfCmd(c));
   // Why: in a rerun that assumes the directory (after a cd only known at run time) every relative word resolves inside the assumed protected directory (`npm`, `test`), so a word counts only when it can name
@@ -3459,7 +3781,10 @@ function evaluateBashForFilesFrame(command, opts) {
   const tokenHitAll = (t) => m.rawHit(t, dirs) || m.pathHit(t, dirs, true);
   // does the command name a protected file anywhere (source or destination)?
   // (anc 'pipeline': a repo's .review folder does not count as a holder, see mentions)
-  const names = (c, anc = true) => insideRoot
+  // T1.7 (b): `$_` is the last word of the previous command, a name only known at run time (`echo S; tee $_`, `cat TR; node x.mjs $_`): when the line names a protected file at all, a command that
+  // uses it (as a word, a prefix value or a redirect target) may be using that file
+  const usesLast = (c) => protectedInRaw && [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => LAST_WORD_RE.test(String(w)));
+  const names = (c, anc = true) => insideRoot || usesLast(c)
     || m.rawHit(rawOfCmd(c), dirs) || winAncestor(c)
     || Object.values(c.env).some((v) => m.rawHit(v, dirs))
     || (!tooMany && opts._writesOnly !== true && wordsOf(c).some((t) => tokenHit(t, anc))); // (a rerun that only assumes a directory judges writes: a bare word that resolves into it names nothing)
@@ -3471,6 +3796,7 @@ function evaluateBashForFilesFrame(command, opts) {
     if (opts._writesOnly === true && (impliesCwdWrite(c) || (runsInlineCode(c, ctx) && WRITE_HINT.test(c.raw ?? c.argv.join(' '))))) return true;
     // (a destination word is never filtered: a writer may create a protected name that does not exist yet)
     if (DEST_ONLY.has(name)) {
+      if (usesLast(c)) return true; // (T1.7 b)
       if (destsOf(wordsOf(c), name).some(tokenHitAll)) return true;
       if (makesHardLinks(c) && wordsOf(c).some(tokenHitAll)) return true; // (R1-F2: and its sources)
       // (#111: `cp x .review/{state,y}.json` -- the parser keeps only the last expansion as the destination, but a brace form is a family of targets: each expansion is judged as one)
@@ -3497,10 +3823,19 @@ function evaluateBashForFilesFrame(command, opts) {
   if (cmds.some((c) => FAN_OUT_RE.test(c.raw) || (SHELL_NAMES.has(baseOf(c.argv[0] ?? '')) && !isReadOnly(c, ctx)))) return deny('the command refers to a protected pipeline file and hands work to xargs or a shell, which could modify it');
 
   const pool = unaccounted ? cmds.filter((c) => c.argv.length) : mentioning;
-  const bad = pool.find((c) => !isReadOnly(c, ctx));
+  const harmless = assignmentOnlyHarmless(cmds, ctx, ctx.frames.indexOf(frame) === 0);
+  const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c));
   if (bad) {
     const name = bad.argv.length ? baseOf(bad.argv[0]) : '(assignment)';
-    return deny(`${name} refers to a protected pipeline file (or the directory that holds it) and is not a read-only command (${PROTECTED_MSG})`);
+    const literal = bad.argv.length ? '' : '; if the variable only holds a path, pass the path literally, or use it only with cat / head / tail / wc / ls / stat / grep / cut / echo / printf / test on a line without export, eval, source or another program';
+    // (#190 case 3, wording only: when the ONLY protected references are transcript paths, say how to get on: a copy is no protected file)
+    const isTranscriptWord = (w) => { const v = expandRefs(String(w), ctx); return new RegExp(TRANSCRIPT_TEXT_SRC, ctx.ci ? 'i' : '').test(v) || (isAbs(v) && ctx.hitTranscriptFile(v)); };
+    const trWords = bad.argv.slice(1).filter(isTranscriptWord);
+    const otherRef = () => insideRoot || usesLast(bad) || winAncestor(bad) || bad.argv.some((w, i) => (i === 0 || !isTranscriptWord(w)) && tokenHit(w))
+      || Object.values(bad.env ?? {}).some((v) => m.rawHit(v, dirs)) || (bad.redirects ?? []).some((r) => tokenHit(r.target ?? ''));
+    const copyAdvice = trWords.length && trWords.length <= 20 && !otherRef() // (cheap: no stats for a long word list)
+      ? '; the only protected reference is a transcript path: copy it first (cp <transcript> "$TMPDIR/x.jsonl"; reading a copy is allowed) and pass the copy' : '';
+    return deny(`${name} refers to a protected pipeline file (or the directory that holds it) and is not a read-only command (${PROTECTED_MSG}${literal})${copyAdvice}`);
   }
   return allow();
 }
