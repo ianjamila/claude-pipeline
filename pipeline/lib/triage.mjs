@@ -994,7 +994,8 @@ export function substituteSummary(state) {
 // The agent is one of the two pinned ones and is the strength the risk needed (`risk`: where the highest risk so far was high needs substitute-fable; a stronger agent than needed is
 // fine), the proof names its transcript, the models in it are the agent's family (claude-opus-* / claude-fable-*), effort is high, and a Fable is not below the floor (`gate` = { threshold,
 // allow } as for staleFableRounds: a floor raised between the apply and the merge makes the review stale).
-function substituteProofIssues(sub, risk, gate, label) {
+// `floorOk`: a later whole-PR pass at or above the floor replaced this review's Fable (staleFableRounds' supersession rule): its Fable being old is then no problem. `pr` names the fix.
+function substituteProofIssues(sub, risk, gate, label, { floorOk = false, pr } = {}) {
   const out = [];
   const why = (text) => out.push(`${label}: ${text}`);
   if (sub === null || typeof sub !== 'object' || Array.isArray(sub)) { why('marked as a substitute review but records no substitute proof'); return out; }
@@ -1010,7 +1011,7 @@ function substituteProofIssues(sub, risk, gate, label) {
     if (wrong.length > 0) why(`${sub.agent} was proven with ${wrong.join(', ')}, not a ${sub.agent === 'substitute-fable' ? 'Fable' : 'Opus'}`);
     if (sub.agent === 'substitute-fable' && wrong.length === 0) {
       const { stale, current } = fableModelsOf({ modelProof: { models: Object.fromEntries(models.map((m) => [m, 1])) } }, gate);
-      if (stale.length > 0 || current.length === 0) why(`its Fable ${stale.join(', ') || models.join(', ')} is below the Fable floor ${gate.threshold}: run a new substitute or Codex round`);
+      if (!floorOk && (stale.length > 0 || current.length === 0)) why(`its Fable ${stale.join(', ') || models.join(', ')} is below the Fable floor ${gate.threshold}: run \`pipeline state fable-refresh${pr === undefined ? '' : ` --pr ${pr}`}\` (one extra Fable pass that re-reviews the whole PR with the current Fable; it is not counted against review.max_rounds)`);
     }
   }
   if (String(proof?.effort ?? '') !== 'high') why(`effort ${JSON.stringify(proof?.effort ?? null)} is not high`);
@@ -1030,15 +1031,45 @@ export function substituteProofProblems(state, gate = DEFAULT_GATE) {
     const known = RISK_LEVELS.includes(r?.risk);
     if (known) seen = seen === undefined || RISK_LEVELS.indexOf(r.risk) > RISK_LEVELS.indexOf(seen) ? r.risk : seen;
     const risk = seen ?? maxRiskOf(state);
-    if (isSubstituteRound(r)) out.push(...substituteProofIssues(r.substitute, risk, gate, `round ${r.n}`));
+    const floorOk = rounds.some((later) => later.n > r.n && supersedes(later, gate));
+    if (isSubstituteRound(r)) out.push(...substituteProofIssues(r.substitute, risk, gate, `round ${r.n}`, { floorOk, pr: state?.pr }));
     for (const item of Array.isArray(r?.items) ? r.items : []) {
       const sr = item?.secondReview;
       if (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute')) continue;
       const key = typeof item.fingerprint === 'string' && item.fingerprint !== '' ? `${item.fingerprint}|${sr.by}` : `${String(item.id)}|${sr.by}`;
       if (judged.has(key)) continue;
       judged.add(key);
-      out.push(...substituteProofIssues({ agent: sr.by, proof: sr.proof }, risk, gate, `second review of ${String(item.id)}`));
+      out.push(...substituteProofIssues({ agent: sr.by, proof: sr.proof }, risk, gate, `second review of ${String(item.id)}`, { floorOk, pr: state?.pr }));
     }
+  }
+  return out;
+}
+
+// The rounds holding a substitute-fable review (a round's own, or a second review first held there) whose Fable is below the floor and that no LATER whole-PR pass at or above
+// it replaced: [{ round, models }] in round order. Like staleFableRounds for the arbiter's pass: `state fable-refresh` is the way out (its whole-PR Fable pass supersedes them),
+// and the historical substitute inventory stays as recorded.
+export function staleSubstituteFableRounds(state, gate = DEFAULT_GATE) {
+  const rounds = Array.isArray(state?.rounds) ? state.rounds : [];
+  const staleOf = (sub) => {
+    if (sub?.agent !== 'substitute-fable') return [];
+    const models = modelsOf(sub.proof?.models);
+    if (models.length === 0 || models.some((m) => !/^claude-fable(-|$)/.test(m))) return [];
+    return fableModelsOf({ modelProof: { models: Object.fromEntries(models.map((m) => [m, 1])) } }, gate).stale;
+  };
+  const out = [];
+  const judged = new Set();
+  for (const r of rounds) {
+    const stale = new Set(isSubstituteRound(r) ? staleOf(r.substitute) : []);
+    for (const item of Array.isArray(r?.items) ? r.items : []) {
+      const sr = item?.secondReview;
+      if (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute')) continue;
+      const key = typeof item.fingerprint === 'string' && item.fingerprint !== '' ? `${item.fingerprint}|${sr.by}` : `${String(item.id)}|${sr.by}`;
+      if (judged.has(key)) continue;
+      judged.add(key);
+      for (const m of staleOf({ agent: sr.by, proof: sr.proof })) stale.add(m);
+    }
+    if (stale.size === 0 || rounds.some((later) => later.n > r.n && supersedes(later, gate))) continue;
+    out.push({ round: r.n, models: [...stale].sort() });
   }
   return out;
 }

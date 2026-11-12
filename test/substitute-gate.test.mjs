@@ -16,7 +16,7 @@ import { recheckGated, recheckOwnerGo } from '../pipeline/lib/queue-route.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { parseReviewRecord } from '../pipeline/lib/review-marker.mjs';
 import { reviewCompleteBody, reviewRecord } from '../pipeline/commands/review-complete.mjs';
-import { substituteDigest, substituteInventory, substituteItemLine, substituteRefusal, substituteSummary } from '../pipeline/lib/triage.mjs';
+import { staleSubstituteFableRounds, substituteDigest, substituteInventory, substituteItemLine, substituteRefusal, substituteSummary } from '../pipeline/lib/triage.mjs';
 
 const unique = (repo) => { bump(repo); repo.write('.salt', randomUUID()); };
 const goYml = (mode = 'chat') => `${ymlFor().replace('{pr} {sha}', '{pr} --match-head-commit {sha}')}owner_approval: ${mode}\n`;
@@ -87,6 +87,35 @@ test('substituteRefusal: an unproven substitute round (wrong agent for the risk,
   assert.match(fable({ 'claude-opus-4-8': 2 }).reason, /not a Fable/, 'an Opus transcript offered for a Fable round');
   assert.match(fable({ 'claude-fable-5-2': 2 }, { threshold: 'claude-fable-5-3', allow: [] }).reason, /below the Fable floor/, 'a floor raised between apply and merge makes the round stale');
   assert.equal(substituteRefusal(stateOf(H, [[1, { firstReviewer: 'substitute', risk: 'low' }]]))?.error, 'substitute-unproven', 'marked substitute with no record at all');
+});
+
+// R1-B3: a substitute-fable proof that a floor raise made stale is superseded by a later whole-PR Fable pass at or above the floor (the staleFableRounds rule), not stuck for ever.
+test('substituteRefusal: a substitute-fable round under a raised floor is cleared by a LATER whole-PR pass at or above it, and the advice names state fable-refresh', () => {
+  const raised = { threshold: 'claude-fable-5-3', allow: [] };
+  const stale = [1, subRound('substitute-fable', 'high')];
+  // addRound keeps only the fields it knows, so the Fable pass fields are put on the round afterwards (as stale-fable.test.mjs builds its states)
+  const pass = (n, { scope = 'whole-pr', model = 'claude-fable-5-3' } = {}) => [n, { codexModel: 'gpt-x', risk: 'high', _pass: { fableRequired: true, arbiter: { proofOk: true, scope }, modelProof: { transcript: '/t', models: { [model]: 1 } } } }];
+  const st = (rounds) => {
+    const state = stateOf(H, rounds.map(([n, over]) => [n, Object.fromEntries(Object.entries(over).filter(([k]) => k !== '_pass'))]), { risk: 'high' });
+    state.rounds = state.rounds.map((r) => ({ ...r, ...(rounds.find(([n]) => n === r.n)[1]._pass ?? {}) }));
+    return state;
+  };
+  const refusal = substituteRefusal(st([stale]), raised);
+  assert.equal(refusal?.error, 'substitute-unproven');
+  assert.match(refusal.reason, new RegExp('run `pipeline state fable-refresh --pr ' + PR + '`'), 'the advice is the command that works');
+  assert.deepEqual(staleSubstituteFableRounds(st([stale]), raised), [{ round: 1, models: ['claude-fable-5-2'] }]);
+  assert.equal(substituteRefusal(st([stale, pass(2)]), raised), null, 'a later whole-PR pass at the new floor supersedes it');
+  assert.deepEqual(staleSubstituteFableRounds(st([stale, pass(2)]), raised), []);
+  assert.equal(substituteRefusal(st([stale, pass(2, { scope: 'round' })]), raised)?.error, 'substitute-unproven', 'a pass of its own round only does not');
+  assert.equal(substituteRefusal(st([stale, pass(2, { model: 'claude-fable-5-2' })]), raised)?.error, 'substitute-unproven', 'a pass that is itself under the floor does not');
+  assert.equal(substituteRefusal(st([pass(1), [2, subRound('substitute-fable', 'high')]]), raised)?.error, 'substitute-unproven', 'an EARLIER pass does not replace a later stale proof');
+  // the other problems of the same review are not cleared by it
+  const wrongEffort = [1, { ...subRound('substitute-fable', 'high'), substitute: sub('substitute-fable', { proof: { transcript: '/t', models: { 'claude-fable-5-2': 1 }, effort: 'low' } }) }];
+  assert.match(substituteRefusal(st([wrongEffort, pass(2)]), raised).reason, /effort "low" is not high/);
+  // a substitute SECOND review is superseded the same way
+  const second = [1, { codexModel: 'gpt-x', risk: 'high', items: [subItem('R1-B1', 'substitute-fable')] }];
+  assert.deepEqual(staleSubstituteFableRounds(st([second]), raised), [{ round: 1, models: ['claude-fable-5-2'] }]);
+  assert.equal(substituteRefusal(st([second, pass(2)]), raised), null);
 });
 
 // A substitute second review as task D stores it (state.mjs secondReview.by + evidence + models + proof).

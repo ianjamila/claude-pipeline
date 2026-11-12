@@ -4422,6 +4422,26 @@ test('review-complete and the final gate refuse a PR whose Fable round was prove
   assertExit(refreshOf(w), 2, 'nothing is stale any more');
 });
 
+test('R1-B3: a substitute-fable round under a raised floor is refused by review-complete with the working advice, and a proven fable-refresh round clears it', (t) => {
+  const w = oldProofWorld(t, { models: { 'claude-fable-5-2': 1 } });
+  editState(w, (s) => {
+    s.rounds[0].firstReviewer = 'substitute';
+    s.rounds[0].substitute = { agent: 'substitute-fable', models: { [OLD_FABLE]: 1 }, evidence: 'quota', resetAt: null, outageAt: '2026-11-11T07:23:00.000Z', attempts: 1, proof: { transcript: '/t/x.jsonl', models: { [OLD_FABLE]: 1 }, effort: 'high' } };
+    s.version = 4;
+  });
+  const refused = w.cli(['review-complete', '--pr', '7']);
+  assertExit(refused, 1, refused.stdout + refused.stderr);
+  assert.equal(refused.json.error, 'substitute-unproven');
+  assert.match(refused.json.reason, /run `pipeline state fable-refresh --pr 7`/);
+  const r = refreshOf(w);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.round, r.json.scope, r.json.staleRounds], [2, 'whole-pr', [{ round: 1, models: [OLD_FABLE] }]]);
+  const { applied } = proveRound(w, 2);
+  assertExit(applied, 0, applied.stdout);
+  const ok = w.cli(['review-complete', '--pr', '7']);
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+});
+
 test('state fable-refresh is refused with a named reason when nothing is stale, work is unfinished, the content moved or the head is not pushed', (t) => {
   const fresh = oldProofWorld(t, { models: { 'claude-fable-5-2': 1 } });
   const none = refreshOf(fresh);
