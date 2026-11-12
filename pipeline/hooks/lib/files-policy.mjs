@@ -1376,12 +1376,14 @@ function runsInlineCode(c, ctx) {
 // `~-` / `~+` / `~name` (OLDPWD, PWD, another user's home). R13-F2: under the PowerShell tool a location command with any parameter (`-Path:X`, `-LiteralPath X`, `-StackName s X`, an abbreviation
 // like `-Pa`) is read by PowerShell's own binder, which the first-non-dash-word reading below gets wrong (`-Path:X` hides the target, `-StackName s X` names `s`), so only `-PassThru` (no value) is harmless there.
 // (Bash's `cd -P` / `-L` and cmd's `/d` keep their reading on their routes.)
-function cdUnknownShape(argv, ctx) {
+function cdUnknownShape(argv, ctx, cmd) {
   const cn = baseOf(argv[0] ?? '');
   const args = argv.slice(1);
   if (cn === 'popd' || cn === 'pop-location' || args.includes('-')) return true;
   if (ctx?.shell === 'powershell' && args.some((a) => a.startsWith('-') && !/^-passthru$/i.test(a))) return true;
   const t = cdOperand(argv);
+  // R13-F3: under PowerShell a location command takes its target from the pipeline when it is a pipe stage (`echo C:/x | Set-Location`) and has none to read when it has no operand: unknown either way
+  if (ctx?.shell === 'powershell' && (t === undefined || cmd?.sep === '|')) return true;
   if (cn === 'pushd' && (t === undefined || args.some((a) => /^[+-]\d+$/.test(a)))) return true;
   if ((cn === 'cd' || cn === 'chdir') && args.filter((x) => !x.startsWith('-')).length > 1) return true;
   return t !== undefined && /^~(?:[-+]|[A-Za-z_])/.test(t);
@@ -1748,13 +1750,14 @@ const PS_ESCAPED_SYNTAX = /\\(?![A-Za-z0-9._-])/;
 // The exceptions (R12-F3, so the trusted pipeline CLI keeps working): a bare variable name (`$DEST`, `$_`; never `${`, `$(`, `$$`), which the trusted `cd $DEST; node <CLI>` line of R9-B1 needs; a word-initial `~/` or
 // `~\` (not after a quote, where it is literal; PowerShell gives `~` no lexical meaning there, a cmdlet reads it as the home and the guard does too, the stricter reading; but a NATIVE command such as node gets it
 // literally, so isPipelineTool never trusts a tilde operand under PowerShell, R13-F3); and the forms PowerShell and Bash read the same: `2>&1`, `>` / `>>` / `2>` / `2>>` followed by a plain
-// target word (the target is judged like any other word), and `&&` as a separator (`||` is plain already). A lone `&` stays not plain (PowerShell's call operator).
+// target word (the target is judged like any other word; R13-F1: not one holding a backslash, which the Bash parser drops from an unquoted word while PowerShell reads it as a separator, so that line stays not plain),
+// and `&&` as a separator (`||` is plain already). A lone `&` stays not plain (PowerShell's call operator).
 const PS_NOT_PLAIN_CHARS = /[^A-Za-z0-9 \t\n._:/\\|;=,"'-]/;
 const PS_NOT_PLAIN_SYNTAX = /@["']|<#|#>|`|--%/;
 const psPlainView = (text) => text
   .replace(/(?<![^\s;|])~(?=[/\\])/g, '')
   .replace(/(?<![^\s;|])[12]>&[12](?![^\s;|])/g, ' ')
-  .replace(/(?<![^\s;|])[12]?>>?(?=[ \t]*["']?[A-Za-z0-9._:/\\-])/g, ' ')
+  .replace(/(?<![^\s;|])[12]?>>?(?=[ \t]*["']?[A-Za-z0-9._:/-][A-Za-z0-9._:/-]*(?![A-Za-z0-9._:/\\-]))/g, ' ')
   .replace(/(?<!&)&&(?!&)/g, ';')
   .replace(/\$[A-Za-z_][A-Za-z0-9_]*/g, '');
 const psUnparsed = (raw) => {
@@ -1782,7 +1785,9 @@ const psOffender = (raw) => {
 // R14-F3: the same scan runs on a PLAIN line too: there the parse is trusted for what it read, but a cd word it did not read as a cd command (a module-qualified `Microsoft.PowerShell.Management\Set-Location`, one inside a
 // quoted string that is run, `iex 'cd X'`) makes the directory unknown, and the line is judged in each assumed protected folder (every command that is not read-only is then a possible write there, impliesCwdWrite).
 // (R14-F3: not the tail or head of a file name: `cd.txt`, `out.cd`, `a.sl` are names, not commands)
-const PS_CD_WORD = /(?<![A-Za-z0-9_.-])(?:cd\.\.|cd\\|(?:set-location|push-location|pop-location|chdir|pushd|popd|cd|sl)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_]))/gi;
+// (R13-F4: and a drive function, `C:`, as a command word: PowerShell defines one per drive letter, each a Set-Location)
+const PS_DRIVE_WORD = /^[A-Za-z]:$/;
+const PS_CD_WORD = /(?:(?<![A-Za-z0-9_.-])(?:cd\.\.|cd\\|(?:set-location|push-location|pop-location|chdir|pushd|popd|cd|sl)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_]))|(?<=(?:^|[;|&\n])[ \t]*)[A-Za-z]:(?![^\s;|&]))/gi;
 const PS_CD_DOTNET = /CurrentDirectory/i; // (SetCurrentDirectory too)
 const PS_PREFIX_STOP = /[^A-Za-z0-9 \t\n._:/\\|;=,-]|@["']|<#|#>|`|--%|\\(?![A-Za-z0-9._-])/;
 // The end of the text's leading run that PowerShell and the guard's parser read the same: plain characters only, NO quote (one opened there can swallow what follows), no escape, comment, here-string or backtick.
@@ -1800,7 +1805,7 @@ function psCdUnreadable(texts) {
   }
   if (inPrefix === 0) return false;
   const inner = simpleCommands(norm[0].slice(0, cut));
-  return inner.truncated || inPrefix > inner.filter((c) => CD_CMDS.has(baseOf(c.argv[0] ?? ''))).length;
+  return inner.truncated || inPrefix > inner.filter((c) => CD_CMDS.has(baseOf(c.argv[0] ?? '')) || PS_DRIVE_WORD.test(c.argv[0] ?? '')).length;
 }
 // The text PowerShell sees once it has read its backtick escapes (R10 security review): `u{hex1-6} is that code point, `0 `a `b `e `f `n `r `t `v are control characters, a backtick before a line break
 // continues the line (nothing), a backtick before any other character is that character. Returns null when a `u{ is malformed (no closing brace, no or non-hex digits, more than six, past U+10FFFF):
@@ -2025,13 +2030,18 @@ function collectDirs(cmds, ctx, cdOnly = false) {
     if (!CD_CMDS.has(cdName)) continue;
     let t = cdOperand(c.argv);
     if (!t && (cdName === 'cd' || cdName === 'chdir' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
+    // Why: the Bash parser drops an unquoted backslash, but PowerShell reads it as a separator (`cd C:\Users\u\.claude\plugins`): the raw text is read as well, AFTER any option words (-P, -L, --, -PassThru),
+    // and only where a backslash is a separator (the PowerShell tool; a quoted word on win32). R13-B1 / F2: it is a second reading beside the parsed operand, never a replacement (off Windows a backslash
+    // escapes the next character, and the parsed operand already has it applied).
+    const readings = t ? [t] : [];
     if (c.raw.includes('\\')) {
-      const m = /^\s*(?:cd|chdir|pushd|push-location|set-location|sl)\s+(?:\/d\s+)?["']?([^"';&|\n]+)/i.exec(c.raw);
-      if (m) t = m[1].trim();
+      const m = /^\s*(?:cd|chdir|pushd|push-location|set-location|sl)\s+(?:(?:\/d|-{1,2}[A-Za-z]*)\s+)*(["']?)([^"';&|\n]+)/i.exec(c.raw);
+      if (m && (ctx.shell === 'powershell' || (ctx.platform === 'win32' && m[1] !== '')) && m[2].trim() && !readings.includes(m[2].trim())) readings.push(m[2].trim());
     }
-    if (!t) continue;
-    const mc = modelledCd(t, cmds, ci, ctx);
-    addDir(mc !== null ? mc : expandRefs(t, ctx), mc === null ? ci : -1);
+    for (const r of readings) {
+      const mc = modelledCd(r, cmds, ci, ctx);
+      addDir(mc !== null ? mc : expandRefs(r, ctx), mc === null ? ci : -1);
+    }
   }
   return dirs;
 }
@@ -2918,7 +2928,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
       const t = cdOperand(c.argv);
       const v = t === undefined ? t : substVars(t, local, ctx.budget);
       const cdpath = (ctx.env?.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (ctx.vars[n] ?? '') !== '' || out.vars.has(n) || ctx.pickUnknown.has(n) || ctx.srcChanged.has(n) || (c.env?.[n] ?? '') !== '' || cmds.some((x) => x.argv.some((a) => a.startsWith(`${n}[`))));
-      if (cdUnknownShape(c.argv, ctx) || (v !== undefined && /[`$*?[{]/.test(v)) || (cdpath && v !== undefined && !isAbs(toPosix(v)) && !/^(?:\.\.?(?:[\\/]|$)|~)/.test(v))) out.unknownCd = true;
+      if (cdUnknownShape(c.argv, ctx, c) || (v !== undefined && /[`$*?[{]/.test(v)) || (cdpath && v !== undefined && !isAbs(toPosix(v)) && !/^(?:\.\.?(?:[\\/]|$)|~)/.test(v))) out.unknownCd = true;
       else out.cds.push(t ?? '~');
       set('PWD', null, false); set('OLDPWD', null, false); // (cd rebinds both)
     }
@@ -3290,9 +3300,10 @@ function evaluateBashForFilesFrame(command, opts) {
     const cdpathSet = (startupEnv.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (Object.hasOwn(ctx.vars, n) && ctx.vars[n] !== '') || moved(n) || cmds.some((c) => (c.env?.[n] ?? '') !== '' || c.argv.some((a) => a.startsWith(`${n}[`))));
     return cmds.some((c, ci) => {
       const cn = baseOf(c.argv[0] ?? '');
+      if (ctx.shell === 'powershell' && PS_DRIVE_WORD.test(c.argv[0] ?? '')) return true; // (R13-F4: a drive function, `D:`, is a Set-Location to where that drive was last left)
       if (!CD_CMDS.has(cn)) return false;
       const { unknownName } = stateAt(ci);
-      if (cdUnknownShape(c.argv, ctx)) return true;
+      if (cdUnknownShape(c.argv, ctx, c)) return true;
       const t = cdOperand(c.argv);
       if (t !== undefined && modelledCd(t, cmds, ci, ctx) !== null) return false;
       if (t === undefined || /^~(?:\/|$)|^\$\{?HOME\b/.test(t)) { if (homeMoved) return true; if (t === undefined) return false; } // (a bare cd goes home)

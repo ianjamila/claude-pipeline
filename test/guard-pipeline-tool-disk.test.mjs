@@ -696,3 +696,51 @@ test('R14-F3: every PowerShell line is scanned for directory changes (module-qua
   assert.equal(psW('Set-Content cd.txt x'), 'allow', 'cd.txt is a file name, not a directory change');
   assert.equal(psW('Set-Content out.cd x'), 'allow');
 });
+
+// R13 round-13 review: the raw-text cd reading adds to the parsed operand (never replaces it) and only where a backslash is a separator; a redirection to a backslash target keeps the line not plain;
+// a location command fed by the pipeline or without an operand, and a drive function (`C:`), are unknown cds under PowerShell.
+test('R13-B1/F2: a backslash path after a cd option (-PassThru, -P) is read, quoted or not; an escape off Windows keeps the parsed target', () => {
+  const Q = 'C:\\Users\\u\\.claude\\plugins';
+  assert.equal(psW(`Set-Location -PassThru '${Q}'; Set-Content ../settings.json x`), 'deny', 'PowerShell, quoted');
+  assert.equal(psW(`Set-Location -PassThru ${Q}; Set-Content ../settings.json x`), 'deny', 'PowerShell, unquoted');
+  assert.equal(bashW(`cd -P '${Q}'; echo x > ../settings.json`), 'deny', 'Git Bash on win32, quoted');
+  assert.equal(run('cd ~/.claude/skil\\ls; echo x > ../settings.json'), 'deny', 'darwin: the backslash is an escape, the directory is ~/.claude/skills');
+  assert.equal(evaluateBashForFiles('cd ~/.claude/skil\\ls; echo x > ../settings.json', { ...opts, platform: 'linux' }).decision, 'deny', 'linux');
+  // unrelated directories stay allowed
+  assert.equal(psW("Set-Location -PassThru 'C:\\repo\\sub'; Set-Content ../out.txt x"), 'allow');
+  assert.equal(bashW("cd -P 'C:\\repo\\sub'; echo x > ../out.txt"), 'allow');
+});
+
+test('R13-F1: a PowerShell redirection to an unquoted backslash target is judged (the line is not plain)', () => {
+  assert.equal(psW('echo x > C:\\Users\\u\\.claude\\settings.json'), 'deny');
+  assert.equal(psW('echo x >> C:\\Users\\u\\.claude\\settings.json'), 'deny');
+  assert.equal(psW('echo x 2> C:\\Users\\u\\.claude\\settings.json'), 'deny');
+  assert.equal(psW('cd C:/Users/u; echo x > .claude\\settings.json'), 'deny');
+  assert.equal(psW('echo x > "C:\\Users\\u\\.claude\\settings.json"'), 'deny', 'quoted, as before');
+  // the existing allowed forms stay allowed
+  assert.equal(psW('echo x > out.txt'), 'allow');
+  assert.equal(psW('echo x > C:/repo/out.txt'), 'allow');
+});
+
+test('R13-F3: a PowerShell location command fed by the pipeline, or without an operand, is an unknown cd; Bash `cd` still means home', () => {
+  const lines = [
+    'echo C:/Users/u | Set-Location; Set-Content .claude/settings.json x',
+    'echo C:/Users/u | sl; Set-Content .claude/settings.json x',
+    'echo C:/Users/u | chdir; Set-Content .claude/settings.json x',
+    'echo C:/Users/u | Push-Location; Set-Content .claude/settings.json x',
+    'echo C:/Users/u/.claude | cd; Set-Content settings.json x',
+    'Set-Location; Set-Content .claude/settings.json x',
+  ];
+  for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
+  assert.equal(psW('Set-Location C:/repo; Set-Content out.txt x'), 'allow');
+  assert.equal(run('cd; echo x > .claude/settings.json'), 'deny', 'Bash: a bare cd is the home');
+  assert.equal(run('cd /repo; echo x > out.txt'), 'allow');
+});
+
+test('R13-F4: a PowerShell drive function (`C:`) is an unknown cd', () => {
+  const fromD = { ...WIN, shell: 'powershell', cwd: 'D:\\repo' };
+  assert.equal(evaluateBashForFiles('C:; Set-Content Users/u/.claude/settings.json x', fromD).decision, 'deny');
+  assert.equal(evaluateBashForFiles('c:; Set-Content Users/u/.claude/settings.json x', fromD).decision, 'deny');
+  assert.equal(evaluateBashForFiles('D:; Set-Content out.txt x', fromD).decision, 'deny', 'any drive function: the folder it lands in is unknown');
+  assert.equal(evaluateBashForFiles('Set-Content out.txt x', fromD).decision, 'allow');
+});
