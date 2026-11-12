@@ -16,7 +16,7 @@ import { arbiterFailures, finalIsReopenable, isOwnerRuled, isProtectedFinal, rev
 import { readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
-  roundDir, stateExtends, withStateLock,
+  adoptPublishedGrants, roundDir, stateExtends, withStateLock,
 } from '../lib/review-context.mjs';
 
 export const meta = {
@@ -30,6 +30,7 @@ export const meta = {
     '  (local-ahead: the PR still holds what this copy last published, every published round and item is still in the local copy, and the local copy holds a second-review verdict or a Claude / forced final that was',
     '  never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final), or an implementation mark or a follow-up issue link added after the last publish: kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline',
     '  (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)',
+    '  owner grants the PR holds on rounds this copy has (and it lacks or holds differently) are copied onto them, nothing is quarantined and local rounds / decisions are kept: grantsRestored:[round numbers]',
     '  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)',
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
@@ -177,6 +178,7 @@ async function showLocked(values, n, pr, root, ctx) {
   let source = 'local';
   const warnings = [];
   let quarantinedTo;
+  let grantsRestored;
   if (!state) {
     if (pr === undefined) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'no-state', message: 'no review state here: pass --pr N to rebuild it from the PR triage comment' });
@@ -221,13 +223,24 @@ async function showLocked(values, n, pr, root, ctx) {
       // first decision on a published item would be quarantined here and refused as stale at publication (lib/review-publish.mjs#establishBaseline).
       writeBaseline(root, pr, found.hash);
     }
+    // Grant metadata is add-only history: a local copy that lacks (or holds another) owner grant the PR holds on a round it has takes the PR's,
+    // keeping its own decisions and trailing rounds, instead of being quarantined or later refused as history-loss at publication.
+    if (found?.state && (source === 'local' || source === 'local-ahead')) {
+      const adopted = adoptPublishedGrants(state, found.state);
+      if (adopted.restored.length > 0) {
+        state = adopted.state;
+        saveState(root, state);
+        writeBaseline(root, pr, found.hash); // this copy has now seen everything the PR holds
+        grantsRestored = adopted.restored;
+      }
+    }
   }
 
   const pool = n === undefined ? allItems(state) : findRound(state, n).items;
   const items = pool.filter((i) => (!values.accepted || isAccepted(i)) && (!values.disputed || isDisputed(i)) && (!values['needs-human'] || needsHuman(i)));
   return {
     exitCode: EXIT.OK,
-    output: { ok: true, recovered, source, ...(quarantinedTo ? { quarantinedTo } : {}), ...(warnings.length ? { warnings } : {}), pr: state.pr, lightLane: state.lightLane, count: items.length, items },
+    output: { ok: true, recovered, source, ...(quarantinedTo ? { quarantinedTo } : {}), ...(grantsRestored ? { grantsRestored } : {}), ...(warnings.length ? { warnings } : {}), pr: state.pr, lightLane: state.lightLane, count: items.length, items },
   };
 }
 
