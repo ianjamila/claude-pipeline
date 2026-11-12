@@ -766,6 +766,10 @@ test('R10: [[ .. && .. ]] pieces, function definitions, loop / match variables a
     'for a b (echo ~/.claude/settings.json) cp /tmp/payload $b',
     'foreach f (echo ~/.claude/settings.json) cp /tmp/payload $f; end',
     'for a b in x .claude/settings.local.json; do cp /tmp/payload $b; done',
+    // (#269 scan) a loop name spelled `in` is still a name: the keyword is looked for after it
+    'for in (echo ~/.claude/settings.json) cp /tmp/payload $in',
+    'foreach in (echo ~/.claude/settings.json) cp /tmp/payload $in; end',
+    'set -- ~/.claude/settings.json; for in; do cp /tmp/payload $in; done',
     // R10-F5: a prefix assignment hands the path to the program
     'F=.claude/settings.local.json python3 -c \'import os; os.link("/tmp/payload", os.environ["F"])\'',
   ];

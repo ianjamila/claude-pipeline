@@ -2223,7 +2223,8 @@ function collectVars(cmds, ctx) {
     // (#269 R11-F2) zsh takes several names per loop (`for a b (LIST)`, `for a b in LIST`: N names take the next N words) and `foreach NAME (LIST)`: EVERY name before `in` (or to the end of the header)
     // is only known at run time, except the single name of a plain `for NAME in LIST` that loopReadings pins
     if (LOOP_HEADS.has(c.argv[0])) {
-      const inAt = c.argv.indexOf('in', 1);
+      // (the first word is always a name, even when it is spelled `in`: `for in (echo FILE) cp x $in`, `for in; do`; the keyword is looked for after it -- #269 scan)
+      const inAt = c.argv.indexOf('in', 2);
       const names = c.argv.slice(1, inAt < 0 ? undefined : inAt).filter((w) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(w));
       if (c.argv[0] === 'for' && inAt === 2 && names.length === 1) {
         if (pins !== undefined) { if (pins === null || !pins.has(names[0])) unknown.add(names[0]); else if (pins.get(names[0]) !== LOOP_NOT_RUN) set(names[0], pins.get(names[0]), true); }
