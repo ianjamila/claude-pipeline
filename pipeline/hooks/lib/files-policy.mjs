@@ -1597,9 +1597,13 @@ function closeBracketFollowedByWord(text) {
 // the parser pass reads the header's argv. A C-style `for ((…))` names nothing.
 const PLAIN_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const badLoopName = (n) => !PLAIN_NAME.test(n) || n === 'argv' || n === 'ARGV';
+// (a loop keyword is reserved only where a command starts: the line start, after a separator or bracket (`;` `&` `|` `(` `)` `{` `}` `!` a backtick, a newline), or after a reserved word or a
+// precommand word (do then else elif if while until time nocorrect noglob coproc exec builtin command `-`, zsh `repeat N`). Generous on purpose; a `select` that is an ARGUMENT -- `man select 2`, the SQL
+// `select 1::int -- a note` of a psql input read as shell text -- is no loop.)
+const LOOP_HEAD_TEXT = /(?:^|[;&|(){}!`\n]|(?:^|[\s;&|(){}!`])(?:do|then|else|elif|if|while|until|time|nocorrect|noglob|coproc|exec|builtin|command|-|repeat[ \t]+\S+))[ \t]*(?:for|foreach|select)(?=[ \t])/g;
 function loopNameRefusedText(text) {
   const m = maskLines(text);
-  for (const h of m.matchAll(/(?:^|[\s;&|({!])(?:for|foreach|select)(?=[ \t])/g)) {
+  for (const h of m.matchAll(LOOP_HEAD_TEXT)) {
     const head = m.slice(h.index + h[0].length, h.index + h[0].length + 2000).split(/[;\n]/, 1)[0].trim(); // (a window: a line of headers stays linear)
     if (head.startsWith('((')) continue;
     const words = head.split(/\s+/).filter(Boolean);

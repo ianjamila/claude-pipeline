@@ -786,6 +786,13 @@ test('R10: [[ .. && .. ]] pieces, function definitions, loop / match variables a
     'for ARGV in .claude/settings.local.json; do cp /tmp/payload $1; done',
     'select 1 in .claude/settings.local.json; do cp /tmp/payload $@; done',
     'echo ok\nfor 1 in .claude/settings.local.json; do cp /tmp/payload $@; done',
+    // (a loop keyword where a command starts: after `do`, a zsh short-form list `)`, `then`, `repeat N`, `!`, a backtick or `$(`)
+    'for x in a; do for 1 in .claude/settings.local.json; do cp /tmp/payload $@; done; done',
+    'for x (a) for 1 in .claude/settings.local.json; do cp /tmp/payload $@; done',
+    'if true; then for 1 in .claude/settings.local.json; do cp /tmp/payload $@; done; fi',
+    'repeat 1 for 1 in .claude/settings.local.json; do cp /tmp/payload $@; done',
+    '! for 1 in .claude/settings.local.json; do cp /tmp/payload $@; done',
+    'echo $(for 1 in .claude/settings.local.json; do cp /tmp/payload $@; done)',
     // R10-F5: a prefix assignment hands the path to the program
     'F=.claude/settings.local.json python3 -c \'import os; os.link("/tmp/payload", os.environ["F"])\'',
   ];
@@ -800,6 +807,10 @@ test('R10: [[ .. && .. ]] pieces, function definitions, loop / match variables a
     'for f in a b; do echo $f; done',
     'for i in 1 2 3; do echo $i; done',
     'for ((i=0; i<3; i++)); do echo $i; done',
+    // (a loop keyword that is an argument is no loop header)
+    'man select 2',
+    'grep -n "for 1 in" notes.md',
+    'echo select 1::int -- a note',
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 
