@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { contextsIn, scanWorkflowDir, workflowContextFindings } from '../pipeline/lib/workflow-contexts.mjs';
+import { contextsIn, findingKind, functionsIn, scanWorkflowDir, workflowContextFindings } from '../pipeline/lib/workflow-contexts.mjs';
 
 const run = (yaml) => workflowContextFindings(new Map([['w.yml', yaml]]));
 
@@ -93,11 +93,12 @@ test('reports unparseable YAML as a finding instead of skipping it', () => {
   assert.match(f[0], /^w\.yml: not valid YAML/);
 });
 
-test('the planted fixture reports exactly 4', () => {
+test('the planted fixture reports exactly 6 (4 contexts, a special function, an unclosed expression)', () => {
   const planted = readFileSync(new URL('./fixtures/workflow-contexts/planted.yml', import.meta.url), 'utf8');
   const f = workflowContextFindings(new Map([['planted.yml', planted]]));
-  assert.equal(f.length, 4, f.join('\n'));
-  assert.deepEqual(f.map((x) => /uses `(\w+)`/.exec(x)[1]).sort(), ['env', 'runner', 'runner', 'steps']);
+  assert.equal(f.length, 6, f.join('\n'));
+  assert.deepEqual(f.filter((x) => findingKind(x) === 'context').map((x) => /uses `(\w+)`/.exec(x)[1]).sort(), ['env', 'runner', 'runner', 'steps']);
+  assert.deepEqual(f.map(findingKind).sort(), ['context', 'context', 'context', 'context', 'function', 'unclosed']);
 });
 
 test('review round 1: environment.url has its own wider list; the environment name does not', () => {
@@ -168,8 +169,11 @@ jobs:
           echo ${quotes}
 `;
   const t0 = Date.now();
-  assert.deepEqual(run(yaml), []);
+  const findings = run(yaml);
   assert.ok(Date.now() - t0 < 1000, 'must not backtrack');
+  // the unclosed ${{ itself is a finding (rule 3: GitHub rejects the whole file for it)
+  assert.equal(findings.length, 1);
+  assert.match(findings[0], /not closed/);
   // a doubled-quote escape still ends where GitHub ends
   assert.equal(run(job("    env:\n      X: ${{ format('it''s {0}', runner.temp) }}")).length, 1);
 });
@@ -240,4 +244,120 @@ test('review R1-B1: whitespace (or a newline) after a property dot does not turn
   const t = Date.now();
   contextsIn(`a.${' '.repeat(200000)}b`);
   assert.ok(Date.now() - t < 1000);
+});
+
+// ---- rule 3: an unclosed ${{ (ported from EagleWatch #1791) ----------------------------------------------------------------------
+
+test('unclosed expression: flags a ${{ with no closing }} in a step run, a job env and a workflow-level key, naming the key', () => {
+  const f = run(steps('      - run: echo "${{ github.sha }"'));
+  assert.equal(f.length, 1);
+  assert.ok(f[0].includes('w.yml: jobs.j.steps[0].run'), f[0]);
+  assert.ok(f[0].includes('not closed'), f[0]);
+  assert.equal(run(job('    env:\n      A: ${{ github.sha }')).length, 1);
+  assert.equal(run('on: push\nname: ${{ github.sha\njobs: {}\n').length, 1);
+});
+
+test('unclosed expression: flags one that follows a closed one, and still reports a disallowed context in the closed one', () => {
+  assert.equal(run(steps('      - run: echo "${{ github.sha }} ${{ github.ref }"')).length, 1);
+  assert.equal(run(job('    env:\n      A: ${{ runner.temp }} ${{ github.ref }')).length, 2);
+});
+
+test('unclosed expression: passes closed expressions, a }} or ${{ inside a string literal, and a lone } or {{', () => {
+  assert.deepEqual(run(steps('      - run: echo "${{ github.sha }}"')), []);
+  assert.deepEqual(run(steps("      - run: echo \"${{ format('{{0}} ${{', github.sha) }}\"")), []);
+  assert.deepEqual(run(steps('      - run: echo "{{ x }} } {{"')), []);
+});
+
+test('unclosed expression: a mapping KEY is read the same way (GitHub rejects an unclosed ${{ in a key); a normal or closed key is clean', () => {
+  const f = run(job("    env:\n      '${{ github.ref': value"));
+  assert.equal(f.length, 1, f.join('\n'));
+  assert.ok(f[0].includes('jobs.j.env'), f[0]);
+  assert.ok(f[0].includes('not closed'), f[0]);
+  assert.equal(findingKind(f[0]), 'unclosed');
+  assert.equal(run("on: push\n'${{ github.ref': 1\njobs: {}\n").length, 1);
+  assert.deepEqual(run(job('    env:\n      NORMAL: value')), []);
+  assert.deepEqual(run(job("    env:\n      '${{ github.ref }}': value")), []);
+});
+
+test('unclosed expression: removing a closed expression never joins its neighbours into a false ${{ (GitHub accepts `$${{ x }}{{`)', () => {
+  assert.deepEqual(run(steps("      - run: echo '$${{ github.sha }}{{'")), []);
+  assert.deepEqual(run(steps("      - run: echo '$${{ github.sha }}{{ github.ref }}'")), []);
+  // ...while a real unclosed one after a closed one is still flagged
+  assert.equal(run(steps("      - run: echo '$${{ github.sha }}${{ github.ref'")).length, 1);
+});
+
+// ---- rule 2: special functions outside their keys (ported from EagleWatch #1789) --------------------------------------------------
+
+test('special functions: functionsIn finds them, ignores string literals, property names and other functions', () => {
+  assert.deepEqual(functionsIn(" hashFiles('**/package-lock.json') "), ['hashfiles']);
+  assert.deepEqual(functionsIn(' always() && failure() '), ['always', 'failure']);
+  assert.deepEqual(functionsIn(" format('{0}', 'hashFiles(x)') && github.event.always(1) && contains(a, b) "), []);
+  assert.deepEqual(functionsIn(" HashFiles('x') "), ['hashfiles']);
+  assert.deepEqual(functionsIn(' CANCELLED() '), ['cancelled']);
+});
+
+test('special functions: hashFiles in a job-level env is flagged, naming the function, key and file', () => {
+  const f = run(job("    env:\n      KEY: ${{ hashFiles('package-lock.json') }}"));
+  assert.equal(f.length, 1);
+  assert.ok(f[0].includes('w.yml: jobs.j.env calls `hashFiles()`'), f[0]);
+  assert.ok(f[0].includes('Unrecognized function'), f[0]);
+});
+
+test('special functions: a status function outside if: and hashFiles in a job if: are flagged', () => {
+  assert.equal(run(job('    continue-on-error: ${{ failure() }}')).length, 1);
+  assert.equal(run(steps('      - run: echo\n        env: { S: "${{ success() }}" }')).length, 1);
+  assert.equal(run(job("    if: hashFiles('x') != ''")).length, 1);
+  assert.equal(run(`on: push\nenv:\n  K: \${{ hashFiles('x') }}\njobs: {}\n`).length, 1);
+  assert.equal(run(`on: push\nconcurrency: \${{ always() }}\njobs: {}\n`).length, 1);
+});
+
+test('special functions: a step key GitHub gives none (shell) and a status function in a step run are flagged', () => {
+  assert.equal(run(steps('      - run: echo "${{ always() }}"')).length, 1);
+  assert.equal(run(steps("      - run: echo\n        shell: ${{ hashFiles('x') }}")).length, 1);
+});
+
+test('special functions: pass in the keys GitHub allows them', () => {
+  assert.deepEqual(run(job('    if: always() && !cancelled() || success() || failure()')), []);
+  assert.deepEqual(run(job('    if: ${{ failure() }}')), []);
+  assert.deepEqual(run(steps("      - if: always() && hashFiles('x') != ''\n        run: echo")), []);
+  assert.deepEqual(
+    run(
+      steps(
+        [
+          "      - name: ${{ hashFiles('a') }}",
+          "        run: echo ${{ hashFiles('b') }}",
+          "        env: { K: \"${{ hashFiles('c') }}\" }",
+          "        working-directory: ${{ hashFiles('d') }}",
+          "        continue-on-error: ${{ hashFiles('e') != '' }}",
+          "        timeout-minutes: ${{ hashFiles('f') && 1 }}",
+        ].join('\n'),
+      ),
+    ),
+    [],
+  );
+  assert.deepEqual(run(steps("      - uses: actions/cache@v4\n        with:\n          key: k-${{ hashFiles('**/package-lock.json') }}")), []);
+});
+
+test('special functions: a disallowed context and a disallowed function in one scalar are reported separately; other functions pass anywhere', () => {
+  assert.equal(run(job("    env:\n      A: ${{ runner.temp }}-${{ hashFiles('x') }}")).length, 2);
+  assert.deepEqual(run(job("    env:\n      A: ${{ format('{0}', github.sha) }}-${{ fromJSON(needs.a.outputs.o) }}-${{ toJSON(github) }}")), []);
+});
+
+test("special functions: the allow-list prints with GitHub's casing (hashFiles, not hashfiles)", () => {
+  const g = run(steps('      - run: echo\n        shell: ${{ always() }}\n        continue-on-error: ${{ success() }}'));
+  assert.equal(g.length, 2);
+  assert.ok(g[0].includes('calls `always()`'), g[0]);
+  assert.ok(g[0].includes('no special function'), g[0]);
+  const h = run(job("    if: hashFiles('x') != ''"));
+  assert.ok(h[0].includes('only always, cancelled, success, failure there'), h[0]);
+  const i = run(steps('      - run: echo\n        working-directory: ${{ always() }}'));
+  assert.ok(i[0].includes('only hashFiles there'), i[0]);
+  assert.ok(!i[0].includes('hashfiles'), i[0]);
+});
+
+test('findingKind tells a context, a special function, an unclosed expression and a YAML syntax error apart', () => {
+  assert.equal(findingKind(run(job('    env:\n      A: ${{ runner.temp }}'))[0]), 'context');
+  assert.equal(findingKind(run(job("    env:\n      A: ${{ hashFiles('x') }}"))[0]), 'function');
+  assert.equal(findingKind(run(steps('      - run: echo "${{ github.sha }"'))[0]), 'unclosed');
+  assert.equal(findingKind(run('on: push\njobs: [unclosed\n')[0]), 'yaml');
 });

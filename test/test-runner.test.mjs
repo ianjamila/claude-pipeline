@@ -298,5 +298,6 @@ test('verify --quick lists exact .test.mjs files only, each present in test/ (a 
     assert.ok(existsSync(join(root, 'test', a)), `test/${a} does not exist`);
   }
   assert.ok(args.includes('cli.test.mjs'), 'a bare `cli` would also run every *-cli test');
+  assert.ok(args.includes('test-runner.test.mjs'), 'the quick check must test its own file selection');
   assert.ok(!args.includes('worktree-prune-config-fallback.test.mjs'), 'the slow prune fallback test is not a quick check');
 });

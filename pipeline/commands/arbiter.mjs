@@ -38,7 +38,7 @@ import {
 export const meta = {
   summary: 'decide which items need the arbiter, then prove and apply its rulings',
   usage: [
-    'pipeline arbiter needed --round R [--force] [--full] [--repo DIR]',
+    'pipeline arbiter needed --round R [--pr N] [--force] [--full] [--repo DIR]',
     '  -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader, brief[, briefReason], effort, agent[, diffPath, scope]}',
     '  brief / effort / agent: which Fable agent to call. `fix-verify` / `medium` / `arbiter-fix` for a FIX ROUND: mode review, scope round (never whole-pr, a Fable refresh or a resolution-only round), a plain previous-round review base',
     '    (never a whole-pr fallback base after a conflicting base merge, never a synthetic tree base after a clean base merge, never a resolution base), the previous counted round had an ACCEPT item, and the round\'s own range',
@@ -56,7 +56,7 @@ export const meta = {
     '  a retry clears an unproven or malformed ruling (model-proof / invalid-arbiter, in either mode) so the arbiter answers again; the owner\'s and Claude\'s rulings are kept; an item the arbiter no longer needs is settled by the judge again',
     '  mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none',
     '  start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman',
-    'pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
+    'pipeline arbiter apply --round R [--pr N] [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
     '  the proof is pinned to claude-fable- and to the round\'s STORED brief: agent `arbiter` at effort high (full; a round stored without a brief is full), agent `arbiter-fix` at effort medium or higher (fix-verify);',
     '    --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)',
     '  -> {ok, round, tag, transcript, errors, items[, findings]}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript',
@@ -85,6 +85,15 @@ const testMode = (env) => seamFlag('PIPELINE_TEST_MODE', env);
 function nonEmpty(values, name) {
   if (values[name] === '') throw new UsageError(`--${name} must not be empty`);
   return values[name];
+}
+
+// --pr N (optional, as on `state discard-round`): refuses a review state that belongs to another PR, before the lock is taken or anything is written.
+function requireStatePr(root, pr) {
+  if (pr === undefined) return;
+  const local = requireState(root);
+  if (local.pr !== pr) {
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'state-pr-mismatch', message: `.review/state.json belongs to PR #${local.pr}, not #${pr}` });
+  }
 }
 
 // ---- needed ---------------------------------------------------------------------------------
@@ -144,10 +153,12 @@ function itemSection(item, root) {
 
 function needed(rest, ctx) {
   const { values } = parseCommandArgs(rest, {
-    round: { type: 'string' }, force: { type: 'boolean' }, full: { type: 'boolean' }, repo: { type: 'string' },
+    round: { type: 'string' }, pr: { type: 'string' }, force: { type: 'boolean' }, full: { type: 'boolean' }, repo: { type: 'string' },
   }, { allowPositionals: false });
   const n = intOption(values, 'round', { required: true, min: 1 });
+  const pr = intOption(values, 'pr', { min: 1 });
   const root = resolveRepo(values, ctx);
+  requireStatePr(root, pr);
   return withStateLock(root, ctx, () => neededLocked(values, n, root, ctx));
 }
 
@@ -443,7 +454,7 @@ function fingerprintAt(head, contentHash, root) {
 
 function apply(rest, ctx) {
   const { values } = parseCommandArgs(rest, {
-    round: { type: 'string' }, tag: { type: 'string' }, 'agent-id': { type: 'string' },
+    round: { type: 'string' }, pr: { type: 'string' }, tag: { type: 'string' }, 'agent-id': { type: 'string' },
     'expect-model': { type: 'string' }, 'expect-effort': { type: 'string' },
     'projects-dir': { type: 'string' }, 'max-age-ms': { type: 'string' }, repo: { type: 'string' },
   }, { allowPositionals: false });
@@ -459,8 +470,10 @@ function apply(rest, ctx) {
   const askedEffort = testMode(env) ? asked.effort : undefined;
   const maxAgeMs = intOption(values, 'max-age-ms', { min: 0 });
   const projectsDir = nonEmpty(values, 'projects-dir');
+  const pr = intOption(values, 'pr', { min: 1 });
 
   const root = resolveRepo(values, ctx);
+  requireStatePr(root, pr);
   return withStateLock(root, ctx, () => applyLocked({
     n, agentId, givenTag, expectModelPrefix, askedEffort, maxAgeMs, projectsDir, env, root,
     ignoredExpectations: !testMode(env) && (asked.model !== undefined || asked.effort !== undefined),

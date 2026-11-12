@@ -50,7 +50,7 @@ Exit: 0 ok · 1 some PRs could not be read (close; the others are still processe
 decide which items need the arbiter, then prove and apply its rulings.
 
 ```
-pipeline arbiter needed --round R [--force] [--full] [--repo DIR]
+pipeline arbiter needed --round R [--pr N] [--force] [--full] [--repo DIR]
   -> {needed:false, items:[], mode} | {needed:true, mode, items, inputPath, digest, digest8, tag, promptHeader, brief[, briefReason], effort, agent[, diffPath, scope]}
   brief / effort / agent: which Fable agent to call. `fix-verify` / `medium` / `arbiter-fix` for a FIX ROUND: mode review, scope round (never whole-pr, a Fable refresh or a resolution-only round), a plain previous-round review base
     (never a whole-pr fallback base after a conflicting base merge, never a synthetic tree base after a clean base merge, never a resolution base), the previous counted round had an ACCEPT item, and the round's own range
@@ -68,7 +68,7 @@ pipeline arbiter needed --round R [--force] [--full] [--repo DIR]
   a retry clears an unproven or malformed ruling (model-proof / invalid-arbiter, in either mode) so the arbiter answers again; the owner's and Claude's rulings are kept; an item the arbiter no longer needs is settled by the judge again
   mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none
   start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman
-pipeline arbiter apply --round R [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
+pipeline arbiter apply --round R [--pr N] [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
   the proof is pinned to claude-fable- and to the round's STORED brief: agent `arbiter` at effort high (full; a round stored without a brief is full), agent `arbiter-fix` at effort medium or higher (fix-verify);
     --expect-model / --expect-effort are honoured only with PIPELINE_TEST_MODE=1 in a repo checkout (an installed copy ignores it)
   -> {ok, round, tag, transcript, errors, items[, findings]}; exit 0 proven + applied, 1 unproven (every arbitrated item needsHuman), 2 no transcript
@@ -528,7 +528,7 @@ Why: the owner-go records (your chat "merge", `⚖️` rulings, `extra round` gr
 post the review-complete comment (and remove awaiting-review) once the review is valid for the current content.
 
 ```
-pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?}; exit 1 {ok:false, reason} when the review is not valid
+pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?, warnings?}; exit 1 {ok:false, reason} when the review is not valid
   origin/<default_branch> is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated
   from its base branch and pulled is judged against the main that was merged in
   after the validity checks it also refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet
@@ -547,6 +547,10 @@ pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused
   when a proven Fable round counts as current only because of the owner's allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line
   "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},
   and the final gate's review check detail carries the same note
+  a DRAFT whose head lacks commits of origin/<default_branch> is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:'behind-base', error:'behind-base', base, behindBy, detail (why the check refused it: the helper's reason), remedy},
+  so the review skill catches it up BEFORE `gh pr ready` and CI runs once, on current main: the remedy is `pipeline update-branch --pr N`, `git pull --ff-only`, the next codex-review round (only main was merged in: baseOnly, Codex does not run,
+  nothing is counted), then review-complete again. merge.behind_base: update = behind when origin/<default_branch> is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`; a `mergeable` GitHub has not computed yet, UNKNOWN, is not a conflict: if everything else passes, the draft posts with a warning).
+  A ready PR is never refused for this; the check is skipped with a `warnings` entry when the base ref could not be refreshed (offline), the base has a merge queue (or it cannot be read), or the ancestry cannot be read
 ```
 
 Exit: 0 comment posted (or our identical one reused) and the label is off · 1 review not valid for this head (nothing posted) · 2 usage · 3 GitHub unavailable, or the label still on the PR after removal.
@@ -867,7 +871,7 @@ Exit: 0 copied / no drift · 1 drift found (`--check`) · 2 usage.
 
 Vendoring removes a leftover `scripts/pipeline/stop-verify.mjs` from an earlier vendor (the Stop hook was retired; output `removed` lists it, and only that file is ever deleted); `--check` reports it as drift with reason `retired`. If `.claude/settings.json` or `.claude/settings.local.json` still has a hook that runs `stop-verify`, both modes add a `warnings` entry telling the owner to remove that Stop hook entry; the settings files are never edited. Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to the project's `.gitattributes` (idempotent; output `gitattributes` lists what was added), so a Windows autocrlf checkout cannot make the byte comparison drift. `--check` warns when the entries are missing. The vendored libs include `lib/review-marker.mjs` (the review-complete marker and its parser, used by the guards for `Cross-model review`).
 
-Workflow-context check: vendor also copies `scripts/pipeline/workflow-contexts.mjs` (with `lib/workflow-contexts.mjs`). It reads the project's own `.github/workflows/*.yml|*.yaml` as data and fails when an expression uses a context GitHub does not allow at that key (for example `runner.temp` in a job-level `env:`): GitHub then rejects the WHOLE file, and a `workflow_run`-only workflow never runs (that jammed a merge queue on 2026-11-10). Run it from the repo root (`--repo DIR` optional). Exit 0 and `N workflow file(s) checked, no disallowed contexts` when clean (a project with no workflow files is clean); exit 1 with one line per finding (file, key, context; a file that is not valid YAML is a finding); exit 2 only for a usage error or an unreadable directory. The `verify.yml` template runs it before `node scripts/verify.mjs`.
+Workflow-context check: vendor also copies `scripts/pipeline/workflow-contexts.mjs` (with `lib/workflow-contexts.mjs`). It reads the project's own `.github/workflows/*.yml|*.yaml` as data and fails on three things: an expression that uses a context GitHub does not allow at that key (for example `runner.temp` in a job-level `env:`), a special function (`always`, `cancelled`, `success`, `failure`, `hashFiles`) at a key that does not allow it, and a `${{` that no `}}` closes. GitHub then rejects the WHOLE file, and a `workflow_run`-only workflow never runs (that jammed a merge queue on 2026-11-10). Run it from the repo root (`--repo DIR` optional). Exit 0 and `N workflow file(s) checked, no disallowed contexts` when clean (a project with no workflow files is clean); exit 1 with one line per finding (file, key, context or function; a file that is not valid YAML is a finding) and one remedy line per kind of finding; exit 2 only for a usage error or an unreadable directory. The `verify.yml` template runs it before `node scripts/verify.mjs`.
 
 Warning `workflow-contexts-unwired`: plain vendor and `--check` add it to `warnings` (not drift; the exit code does not change, and it also appears next to drift) when no file directly under `.github/workflows/` contains `scripts/pipeline/workflow-contexts.mjs`; a missing or unreadable `.github/workflows/` gives the same warning. The vendored check protects a project only when its CI runs it.
 
