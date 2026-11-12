@@ -151,3 +151,4 @@ full record.
 - 2026-11-12 · #308 · redraft follow-ups: starter CI skips drafts; #302 test; #303 cancelled-merge warning · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
 - 2026-11-12 · #327 · fix: force UTF-8 stdout in the Windows ancestry PowerShell scripts (#317) · risk high · rounds 3 · arbiter 2 · awaiting-owner-merge
 - 2026-11-12 · #333 · Cheaper review for big-but-safe PRs: size-only medium goes to the Sonnet judge; trusted two-config risk rating; #325; implementer wait cap · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge
+- 2026-11-12 · #332 · Owner approval of past review rounds (🔂) + published review history can't shrink · risk high · rounds 5 · arbiter 4 · awaiting-owner-merge
