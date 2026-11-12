@@ -603,6 +603,18 @@ test('R8: any interpreter fed on a line naming a hook file is refused (pipe, red
     `cat .claude/settings.json | osascript -e 'x'`,
     `cat .claude/settings.json | julia -e '1'`,
     `cat .claude/settings.json | tclsh8.6`,
+    // the json.tool exemption is narrow: any variable, option, extra operand or `-` operand leaves it refused
+    'PYTHONINSPECT=1 python3 -m json.tool < .claude/settings.json',
+    'export PYTHONSTARTUP=/dev/stdin; python3 -m json.tool < .claude/settings.json',
+    'cat .claude/settings.json | python3 -i -m json.tool',
+    'python3 -m json.tool -c x < .claude/settings.json',
+    'python3 -m json.tool --json-lines < .claude/settings.json',
+    'python3 -X dev -m json.tool < .claude/settings.json',
+    'python3 -m json.tool a b c < .claude/settings.json',
+    '${PY:-python3} -m json.tool < .claude/settings.json',
+    'exec 0<x; python3 -m json.tool .claude/settings.json',
+    'python3 -m json.tool <(echo x) < .claude/settings.json',
+    `echo "${py}" | python3 -m json.tool -`,
   ]) if (bash(cmd) !== 'deny') failures.push(cmd);
   assert.deepEqual(failures, [], 'these lines were not refused');
   // R8-F4: an ordinary script FILE run is not refused for its path; fed but naming no hook file, jq, and a non-fed awk are fine
@@ -617,6 +629,10 @@ test('R8: any interpreter fed on a line naming a hook file is refused (pipe, red
     'cat .claude/settings.json | jq .hooks',
     "awk '{print}' README.md > /dev/null",
     'cat .claude/settings.json | grep -c python',
+    // the one fed interpreter run kept allowed: a bare python -m json.tool pretty-print
+    'python -m json.tool < ~/.claude/settings.json',
+    'cat .claude/settings.json | python3 -m json.tool',
+    'cat .claude/settings.json | python3.12 -m json.tool',
     'cat .claude/settings.json | grep node',
     'python3 -c "print(1)" | cat; ls .claude/settings.json',
   ]) assert.equal(bash(cmd), 'allow', cmd);

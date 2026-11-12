@@ -1717,6 +1717,14 @@ function isInterpreterCmd(argv) {
   if (/[$`*?[{]/.test(argv[0])) return true;
   return argv.some((w) => INTERPRETERS.test(baseOf(w)));
 }
+// (R8, owner decision 2026-11-12) The one fed interpreter run that stays allowed: Python's JSON pretty-printer, `python3 -m json.tool` with at most two plain operands (in / out file) and nothing else -- no other option, no operand
+// starting with `-` (`-` is stdin) or holding an expansion -- on a line that mentions no PYTHON* variable, no exec, no coproc and no <( ). It prints what it reads; it never runs it.
+function jsonToolOnly(c, raw) {
+  const [name, m, mod, ...operands] = c.argv;
+  if (!/^python\d*(?:\.\d+)*$/.test(baseOf(name ?? '')) || m !== '-m' || mod !== 'json.tool' || operands.length > 2) return false;
+  if (operands.some((o) => o.startsWith('-') || /[$`*?[{]/.test(o))) return false;
+  return !/PYTHON[A-Z_]/i.test(raw) && !/\bexec\b|\bcoproc\b|<\(/.test(raw) && !Object.keys(c.env ?? {}).some((k) => /^PYTHON/i.test(k));
+}
 const inputRedirect = (c) => (c.redirects ?? []).some((r) => /</.test(r.op ?? ''));
 const hasProcSub = (c) => c.argv.some((w) => w.includes('<('));
 // Is this interpreter FED input on the line? Fail closed: it receives a pipe (`|`, `|&`), has an input redirect (`<`, `<<`, `<<-`, `<<<`, `<&`, `<>`, `0<`), or a word holding `<(`; a coproc or an `exec` that
@@ -3425,7 +3433,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const isFed = feedInfo(cmds, raw);
     const namesSurface = HOOK_SURFACE_TEXT.test(scanRaw);
     for (const c of cmds) {
-      if (isInterpreterCmd(c.argv) && isFed(c)) {
+      if (isInterpreterCmd(c.argv) && isFed(c) && !jsonToolOnly(c, raw)) {
         if (namesSurface) return deny(`input is fed into an interpreter on a line that names a file that can declare hooks; whether the interpreter runs that input as code cannot be checked (${HOOKS_MSG})`);
       } else if (runsInlineCode(c, ctx)) {
         const text = [...wordsOf(c), ...(c.redirects ?? []).filter((r) => r.op === '<<<').map((r) => r.target ?? '')].join('\n');
