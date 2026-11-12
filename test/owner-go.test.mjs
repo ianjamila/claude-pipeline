@@ -1319,6 +1319,25 @@ test('owner-go round grant: ownerGrantLookups throws when a read was skipped, wh
   const consumed = seeded();
   writeFileSync(join(ownerGoDir(consumed), 'consumed'), '');
   both(consumed, /consumed-grants folder is not a real folder/, 'consumed is a file');
+  // R3-B1: the consumed-grants folder is a real folder but cannot be searched: the marker lookup fails with EACCES, which is not proof the grant was spent
+  if (process.getuid?.() !== 0) {
+    const closed = seeded();
+    const consumedDir = join(ownerGoDir(closed), 'consumed');
+    mkdirSync(consumedDir);
+    chmodSync(consumedDir, 0o000);
+    try {
+      both(closed, /cannot be checked \(EACCES\)/, 'consumed folder cannot be searched');
+      assert.equal(ownerGrantGap({ repo: REPO, pr: 58, k: 4, anyHead: true, home: closed, now: () => AT + 1000 }), 'none', 'the tolerant lookup treats the grant as spent');
+    } finally {
+      chmodSync(consumedDir, 0o700);
+    }
+    // a marker that really exists stays spent, with no failure
+    const claimedHome = seeded();
+    const [record] = ownerGrantLookups(q(claimedHome)).grants(4);
+    assert.equal(claimGrantMarkers([record], { repo: REPO, pr: 58, k: 4, head: 'a'.repeat(40), checkout: null }, { home: claimedHome, now: () => AT }).ok, true);
+    const after = ownerGrantLookups(q(claimedHome));
+    assert.deepEqual([after.grants(4), after.grantGap(4)], [[], 'none'], 'a consumed grant is spent, not a failure');
+  }
   // the recorded repository moves are present but unreadable
   const moves = seeded();
   writeFileSync(join(ownerGoDir(moves), 'repo-moves.json'), 'not json');
