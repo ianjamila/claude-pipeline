@@ -67,8 +67,19 @@ function reviewRepo() {
 }
 const stateBytes = (repo) => readFileSync(join(repo.dir, '.review', 'state.json'), 'utf8');
 
-function start(t, repo, args, env = {}) {
+// `tc` is the node:test context: its after() hook SIGKILLs a child that is still running and closes its pipes, so a failed assertion or a missed ready line
+// cannot leave an orphan whose open pipes keep the test file (and the runner, which has no per-test timeout) alive. Nothing to kill on the happy path (it has exited).
+function killOnTeardown(tc, child) {
+  tc.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    child.stdout.destroy();
+    child.stderr.destroy();
+  });
+}
+
+function start(tc, t, repo, args, env = {}) {
   const child = spawn(process.execPath, [BIN, ...args], { cwd: repo.dir, env: { ...t.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+  killOnTeardown(tc, child);
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (d) => { stdout += d; });
@@ -88,20 +99,20 @@ async function until(cond, what, ms = 15_000) {
   }
 }
 // Holds a command open: it waits for the PR's state lock, which the test owns, AFTER it took its lease (the lease comes first, wiring header ORDER).
-async function holdOpen(t, repo, args = ['state', 'set-outcome', '--outcome', 'needs-human']) {
+async function holdOpen(tc, t, repo, args = ['state', 'set-outcome', '--outcome', 'needs-human']) {
   const lock = tryAcquire(reviewLockName(repo.dir, PR), { dir: LOCK_DIR, machineId: MACHINE });
   assert.equal(lock.acquired, true);
-  const cmd = start(t, repo, args, { PIPELINE_LOCK_WAIT_MS: '30000' });
+  const cmd = start(tc, t, repo, args, { PIPELINE_LOCK_WAIT_MS: '30000' });
   await until(() => procFiles(t).length === 1, 'the lease of the waiting command');
   return { cmd, unlock: () => release(lock.lock) };
 }
 
 // ---- lifecycle ------------------------------------------------------------------------------------------------------------------------------
 
-test('a plain terminal command holds a process lease while it runs (version 2, its own pid, the command name) and none once it has exited', async () => {
+test('a plain terminal command holds a process lease while it runs (version 2, its own pid, the command name) and none once it has exited', async (tc) => {
   const t = terminal();
   const repo = reviewRepo();
-  const held = await holdOpen(t, repo);
+  const held = await holdOpen(tc, t, repo);
   try {
     const [file] = procFiles(t);
     const rec = readLease(t, file);
@@ -180,10 +191,10 @@ test('process.exit inside the command still closes the lease (the exit handler),
   assert.deepEqual(files(t), []);
 });
 
-test('SIGINT (Ctrl-C) closes the lease and the process still dies of SIGINT, exactly as without a lease', POSIX_ONLY, async () => {
+test('SIGINT (Ctrl-C) closes the lease and the process still dies of SIGINT, exactly as without a lease', POSIX_ONLY, async (tc) => {
   const t = terminal();
   const repo = reviewRepo();
-  const held = await holdOpen(t, repo);
+  const held = await holdOpen(tc, t, repo);
   held.cmd.child.kill('SIGINT');
   const out = await held.cmd.done;
   held.unlock();
@@ -215,15 +226,9 @@ function signalFixture(t, mode) {
   return script;
 }
 
-// `tc` is the node:test context: its after() hook SIGKILLs a fixture child that is still running and closes its pipes, so a failed assertion or a missed ready line
-// cannot leave an orphan whose open pipes keep the test file (and the runner, which has no per-test timeout) alive. Nothing to kill on the happy path (it has exited).
 function spawnFixture(tc, t, repo, script, mode, extraArgs = []) {
   const child = spawn(process.execPath, [script, mode, ...extraArgs], { cwd: repo.dir, env: t.env, stdio: ['ignore', 'pipe', 'pipe'] });
-  tc.after(() => {
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-    child.stdout.destroy();
-    child.stderr.destroy();
-  });
+  killOnTeardown(tc, child);
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (d) => { stdout += d; });
@@ -266,10 +271,10 @@ test('the sole signal listener still closes the lease and re-raises (died of the
   assert.deepEqual(files(t), []);
 });
 
-test('SIGTERM closes the lease and the process dies of SIGTERM', POSIX_ONLY, async () => {
+test('SIGTERM closes the lease and the process dies of SIGTERM', POSIX_ONLY, async (tc) => {
   const t = terminal();
   const repo = reviewRepo();
-  const held = await holdOpen(t, repo);
+  const held = await holdOpen(tc, t, repo);
   held.cmd.child.kill('SIGTERM');
   const out = await held.cmd.done;
   held.unlock();
@@ -277,11 +282,11 @@ test('SIGTERM closes the lease and the process dies of SIGTERM', POSIX_ONLY, asy
   assert.deepEqual(files(t), []);
 });
 
-test('a signal sent the moment the lease file appears still closes it (the handlers are registered before the file is written; repeated, because the window is a few ticks wide)', POSIX_ONLY, async () => {
+test('a signal sent the moment the lease file appears still closes it (the handlers are registered before the file is written; repeated, because the window is a few ticks wide)', POSIX_ONLY, async (tc) => {
   const t = terminal();
   const repo = reviewRepo();
   for (const [i, signal] of ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGTERM', 'SIGINT', 'SIGHUP', 'SIGTERM', 'SIGINT'].entries()) {
-    const held = await holdOpen(t, repo);
+    const held = await holdOpen(tc, t, repo);
     held.cmd.child.kill(signal);
     const out = await held.cmd.done;
     held.unlock();
@@ -290,10 +295,10 @@ test('a signal sent the moment the lease file appears still closes it (the handl
   }
 });
 
-test('SIGKILL leaves the file; it is judged dead (pid gone, kill(pid, 0) says ESRCH even without ps) and sweepDeadLeases removes it', POSIX_ONLY, async () => {
+test('SIGKILL leaves the file; it is judged dead (pid gone, kill(pid, 0) says ESRCH even without ps) and sweepDeadLeases removes it', POSIX_ONLY, async (tc) => {
   const t = terminal();
   const repo = reviewRepo();
-  const held = await holdOpen(t, repo);
+  const held = await holdOpen(tc, t, repo);
   held.cmd.child.kill('SIGKILL');
   const out = await held.cmd.done;
   held.unlock();
@@ -333,10 +338,10 @@ test('a detached job still running at close moves the lease into the worktree\'s
   assert.deepEqual(files(t), []);
 });
 
-test('the finally close also sweeps dead proc files of earlier SIGKILLed commands (best effort, only proc- / job- files)', POSIX_ONLY, async () => {
+test('the finally close also sweeps dead proc files of earlier SIGKILLed commands (best effort, only proc- / job- files)', POSIX_ONLY, async (tc) => {
   const t = terminal();
   const repo = reviewRepo();
-  const held = await holdOpen(t, repo);
+  const held = await holdOpen(tc, t, repo);
   held.cmd.child.kill('SIGKILL');
   await held.cmd.done;
   held.unlock();

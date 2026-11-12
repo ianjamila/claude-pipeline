@@ -255,9 +255,14 @@ test('a lease folder that cannot be written fails the command closed with a code
 // ---- order: admission before the state lock; a review that starts after the final scan ------------------------------------------------
 
 // Starts the real CLI without waiting; `done` resolves { code, stdout, stderr } when it exits.
-function startCli(w, repo, args) {
+function startCli(tc, w, repo, args) {
   const env = { ...process.env, PIPELINE_LOCK_DIR: LOCK_DIR, PIPELINE_MACHINE_ID: MACHINE, ...w.env };
   const child = spawn(process.execPath, [BIN, ...args], { cwd: repo.dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  tc.after(() => { // an assertion that fails first must not leave this child (and its open pipes) hanging the file
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    child.stdout.destroy();
+    child.stderr.destroy();
+  });
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (d) => { stdout += d; });
@@ -267,7 +272,7 @@ function startCli(w, repo, args) {
 }
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 
-test('a review that starts after the installer\'s final scan waits for admission, then gets its lease AFTER the swap; it never holds the PR state lock while it waits', async () => {
+test('a review that starts after the installer\'s final scan waits for admission, then gets its lease AFTER the swap; it never holds the PR state lock while it waits', async (tc) => {
   const w = world();
   const repo = reviewRepo();
   process.env.PIPELINE_MACHINE_ID = MACHINE;
@@ -277,7 +282,7 @@ test('a review that starts after the installer\'s final scan waits for admission
   assert.deepEqual(blocking(scanLeases({ dir: w.dir, env: { [SESSION_VAR]: '1' } })), [], 'the final scan finds no review');
 
   // A review command starts now, after that scan.
-  const review = startCli(w, repo, ['state', 'show']);
+  const review = startCli(tc, w, repo, ['state', 'show']);
   await pause(1500);
   assert.equal(review.exited(), false, 'it is waiting for admission, not running');
   assert.deepEqual(leaseFiles(w), [], 'and has no lease');
