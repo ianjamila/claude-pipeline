@@ -306,3 +306,44 @@ describe('post-push 2', () => {
     });
   }
 });
+
+// PR #288 post-push security review, part 3: the gates for a name resolved at RUN TIME (a redirect to `$_` / `${_}`, a command that uses `$_`, a scan cut short) read the UNMASKED line too.
+// A path inside a value the guard treats as prose (a commit message, a PR body) is masked out of the prose-exempt scan, but it becomes `$_` for the next command.
+describe('post-push 3', () => {
+  const MSG = `git commit -m "x ${S}"`;
+  const DENY3 = [
+    ['commit message, then > $_', `${MSG}; echo x > ${D}_`],
+    ['commit message, then > ${_}', `${MSG}; echo x > ${OB}_}`],
+    ['commit message, then >> $_', `${MSG}; echo x >> ${D}_`],
+    ['commit message, then >> ${_}', `${MSG}; echo x >> ${OB}_}`],
+    ['commit message, then cp /tmp/a $_', `${MSG}; cp /tmp/a ${D}_`],
+    ['commit message, then cp /tmp/a ${_}', `${MSG}; cp /tmp/a ${OB}_}`],
+    ['commit message, then printf x | tee $_', `${MSG}; printf x | tee ${D}_`],
+    ['commit message, then tee $_ < file', `${MSG}; tee ${D}_ < /tmp/a`],
+    ['PR body, then cp /tmp/a $_', `gh pr create --title t --body "see ${S}"; cp /tmp/a ${D}_`],
+    ['PR body, then > $_', `gh pr create --title t --body "see ${S}"; echo x > ${D}_`],
+    ['quoted echo argument, then > $_', `echo "${S}"; echo x > ${D}_`],
+    ['quoted echo argument, then printf x | tee $_', `echo "${S}"; printf x | tee ${D}_`],
+    ['quoted echo argument, then cp /tmp/a $_', `echo "${S}"; cp /tmp/a ${D}_`],
+  ];
+  for (const [label, line] of DENY3) {
+    test(`denies: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'deny', `${line} -> ${r.decision}`);
+    });
+  }
+  const ALLOW3 = [
+    ['a commit message that mentions the file, nothing reads $_', `git commit -m "docs: mention ${S}"`],
+    ['a commit message that mentions the file, then push', `git commit -m "docs: mention ${S}" && git push`],
+    ['a quoted echo of the file alone', `echo "${S}"`],
+    ['a commit message that mentions the file, then a read-only reader of $_', `${MSG}; ls ${D}_`],
+    ['no protected file anywhere: > $_', `echo hi; echo x > ${D}_`],
+    ['no protected file anywhere: cp /tmp/a $_', 'git commit -m "docs: x"; cp /tmp/a $_'],
+  ];
+  for (const [label, line] of ALLOW3) {
+    test(`allows: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
+    });
+  }
+});

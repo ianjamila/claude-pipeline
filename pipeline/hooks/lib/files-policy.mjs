@@ -3636,6 +3636,9 @@ function evaluateBashForFilesFrame(command, opts) {
   if (tooMany) ctx.dynamic = true;
   const insideRoot = opts._writesOnly !== true && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTranscriptBelow(d) || (/[*?[]/.test(d) && m.configDirGlob(d))); // cwd or a `cd` target is a protected dir (or its parent): relative words and bare commands reach it
   const protectedInRaw = m.rawHit(scanRaw, dirs);
+  // (post-push 3 of #288) protectedInRaw reads the line with prose values (a commit message, a PR body) masked out: right for the prose exemption itself (a literal mention in a message stays allowed: `unaccounted` below).
+  // A gate about a name resolved at RUN TIME ($_ / ${_} carry the last word of the previous command, which may be that prose value; a scan cut short) reads the UNMASKED line too: protectedAnywhere.
+  const protectedAnywhere = protectedInRaw || m.rawHit(raw, dirs);
 
   // #58: running the owner-go recorder (any copy) by hand would write an owner "merge" the owner never typed. Only Claude Code runs it,
   // on the owner's prompt. Reading, diffing or committing the file stays allowed: only a runtime (or the file run by path) is refused.
@@ -3746,7 +3749,7 @@ function evaluateBashForFilesFrame(command, opts) {
       for (const target of [r.target, ...(r.target.startsWith('&') ? [r.target.slice(1)] : []), ...braceExpand(expandRefs(r.target, ctx), ctx).split(/\s+/).filter((x) => x && x !== r.target)]) {
       const e = expandRefs(target, ctx);
       // Why: a target built at run time (`echo settings.json`, an unset name) inside a protected directory can be any file there
-      if ((/[`$]/.test(e) && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTree(d))) || (protectedInRaw && LAST_WORD_RE.test(e))) return deny(`the command redirects output to ${target}, a name only known at run time, inside a protected pipeline directory, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
+      if ((/[`$]/.test(e) && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTree(d))) || (protectedAnywhere && LAST_WORD_RE.test(e))) return deny(`the command redirects output to ${target}, a name only known at run time, inside a protected pipeline directory, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
       const abs = isAbs(e) ? [pathsFor().normalize(e)] : dirs.map((d) => pathsFor().join(d, e));
       const viaLink = abs.some((p) => !/[*?[]/.test(p) && (ctx.hit(realResolve(p, ctx.api)) || ctx.hitInode(p)));
       if (m.rawHit(target, dirs) || m.pathHit(target, dirs, true) || viaLink) return deny(`the command redirects output to ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
@@ -3767,11 +3770,11 @@ function evaluateBashForFilesFrame(command, opts) {
 
   // A scan that was cut short (parse caps, dynamic commands, sizes) cannot prove a command harmless: fail closed
   // when the raw text names a protected file at all.
-  if ((cmds.dynamic || ctx.dynamic) && protectedInRaw) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
+  if ((cmds.dynamic || ctx.dynamic) && protectedAnywhere) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
   // R7-F3 (#266): in arithmetic zsh reads a bare name `_` (the last word of the previous command) and evaluates its text again, a subscript with a substitution included. `echo 'path[$(cmd)]'; echo $((_))`
   // plants nothing a rule can refuse, and the reader names no protected file, so it is never judged: on a line that names a protected file an arithmetic context anywhere denies the line. The gate reads the UNMASKED line (post-push review of #288): a path inside a prose value
   // (a quoted echo argument, a commit message) is masked out of protectedInRaw, but the planted text can sit anywhere.
-  if ((protectedInRaw || m.rawHit(raw, dirs)) && ARITH_CONTEXT.test(raw)) return deny(`the command line refers to a protected pipeline file and holds an arithmetic context ($(( )), $[ ], (( )), let, a numeric test operator, an integer declaration or a lone _), which can evaluate text planted by an earlier command; split it so the arithmetic is on its own line (${PROTECTED_MSG})`);
+  if (protectedAnywhere && ARITH_CONTEXT.test(raw)) return deny(`the command line refers to a protected pipeline file and holds an arithmetic context ($(( )), $[ ], (( )), let, a numeric test operator, an integer declaration or a lone _), which can evaluate text planted by an earlier command; split it so the arithmetic is on its own line (${PROTECTED_MSG})`);
 
   const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(rawOfCmd(c));
   // Why: in a rerun that assumes the directory (after a cd only known at run time) every relative word resolves inside the assumed protected directory (`npm`, `test`), so a word counts only when it can name
@@ -3784,7 +3787,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // (anc 'pipeline': a repo's .review folder does not count as a holder, see mentions)
   // T1.7 (b): `$_` is the last word of the previous command, a name only known at run time (`echo S; tee $_`, `cat TR; node x.mjs $_`): when the line names a protected file at all, a command that
   // uses it (as a word, a prefix value or a redirect target) may be using that file
-  const usesLast = (c) => protectedInRaw && [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => LAST_WORD_RE.test(String(w)));
+  const usesLast = (c) => protectedAnywhere && [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => LAST_WORD_RE.test(String(w)));
   const names = (c, anc = true) => insideRoot || usesLast(c)
     || m.rawHit(rawOfCmd(c), dirs) || winAncestor(c)
     || Object.values(c.env).some((v) => m.rawHit(v, dirs))
