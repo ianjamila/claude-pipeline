@@ -1,7 +1,7 @@
 // `pipeline stats rounds`: what the review rounds past the limit (review.max_rounds) found and cost, read from the merged PRs' own comments (the triage state and the
 // run record). Pure: the command fetches and decodes, this module only counts. Display only: nothing here decides anything. The audit scripts of 2026-11-11 were the
 // first version of this (their SEC regex is the fallback security heuristic below).
-import { ROUND_CAP_CAUSE, SECURITY_CATEGORIES, countsTowardCap, isRoundCapDeferral } from './triage.mjs';
+import { ROUND_CAP_CAUSE, SECURITY_CATEGORIES, asciiLine, countsTowardCap, isRoundCapDeferral } from './triage.mjs';
 
 // itemSeverity needs the reviewed diff, which a PR comment does not carry, so the audit's rule judges an item: BLOCKING or security is not low.
 const SEC = /secur|auth|permission|rls|grant|policy|privilege|role|token|secret|injection|xss|csrf|leak|pii|tenant|access|escalat|sanitiz|credential|session|data loss|corrupt|migration|idempot|race|integrity/i;
@@ -24,6 +24,9 @@ function admissionOf(round, k, max) {
   if (round.admission === undefined && k === max + 1) return 'auto-extra';
   return 'unknown';
 }
+
+// A decoded triage state that belongs to PR `pr` and whose rounds are numbered (a comment is untrusted text: a round `n` that is not an integer would be printed as it is).
+export const isReadableState = (state, pr) => !!state && state.pr === pr && Array.isArray(state.rounds) && state.rounds.every((r) => Number.isInteger(r?.n));
 
 // One PR: { repo, pr, id, maxRounds, countedRounds, pastCapRounds, usd, blockingLoop, rounds: [one row per counted round] }, or null when it has no review state.
 export function analysePr({ repo, pr, state, record }) {
@@ -83,18 +86,20 @@ export function aggregate(analysed) {
   return t;
 }
 
-const pad = (s, n) => String(s).padEnd(n);
+// Every printed value goes through asciiLine: one line, printable ASCII, whatever a comment or a state carried.
+const pad = (s, n) => asciiLine(s, 200).padEnd(n);
+const cell = (s) => asciiLine(s, 200);
 const usdText = (v) => (v === null || v === undefined ? '-' : `$${v.toFixed(2)}`);
 
 // The plain-text table: one line per PR, then the totals.
 export function renderTable({ since, repos, totals, prs }) {
-  const out = [`Review rounds of PRs merged since ${since} in ${repos.join(', ')}`, ''];
+  const out = [cell(`Review rounds of PRs merged since ${since} in ${repos.join(', ')}`), ''];
   out.push(`${pad('PR', 28)}${pad('limit', 7)}${pad('rounds', 8)}${pad('past', 6)}${pad('cost', 10)}${pad('loop', 6)}past-limit rounds (admission, previous round, found)`);
   for (const p of prs) {
-    const past = p.rounds.filter((r) => r.pastCap).map((r) => `r${r.n}(${r.admission}; ${r.previous}; ${r.found}${r.usd === null ? '' : `; ${usdText(r.usd)}`})`).join(' ');
+    const past = p.rounds.filter((r) => r.pastCap).map((r) => cell(`r${r.n}(${r.admission}; ${r.previous}; ${r.found}${r.usd === null ? '' : `; ${usdText(r.usd)}`})`)).join(' ');
     out.push(`${pad(p.id, 28)}${pad(p.maxRounds ?? '-', 7)}${pad(p.countedRounds, 8)}${pad(p.pastCapRounds, 6)}${pad(usdText(p.usd), 10)}${pad(p.blockingLoop ? 'yes' : '', 6)}${past}`);
   }
-  const list = (o) => Object.entries(o).map(([k, v]) => `${k} ${v}`).join(', ') || 'none';
+  const list = (o) => Object.entries(o).map(([k, v]) => cell(`${k} ${v}`)).join(', ') || 'none';
   out.push('', `PRs ${totals.prs} (${totals.prsPastCap} went past the limit) · counted rounds ${totals.countedRounds} · past the limit ${totals.pastCapRounds}${totals.pastCapShare === null ? '' : ` (${(totals.pastCapShare * 100).toFixed(1)}%)`} · booked ${usdText(totals.usd)}`);
   out.push(`Past-limit admission: ${list(totals.admission)}`, `Round before them: ${list(totals.previous)}`, `What they found: ${list(totals.found)}`);
   out.push(`PRs with a BLOCKING loop (BLOCKING accepted in 2+ consecutive rounds): ${totals.blockingLoopPrs}${totals.pastCapUsd ? ` · past-limit rounds with a booking: ${totals.pastCapUsd.rounds}, ${usdText(totals.pastCapUsd.usd)}` : ''}`);

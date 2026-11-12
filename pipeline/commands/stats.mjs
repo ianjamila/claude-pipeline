@@ -5,7 +5,8 @@ import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { decodeRecord } from '../lib/run-record.mjs';
 import { decodeFromComment } from '../lib/state.mjs';
-import { aggregate, analysePr, renderTable } from '../lib/round-stats.mjs';
+import { aggregate, analysePr, isReadableState, renderTable } from '../lib/round-stats.mjs';
+import { MARKERS } from '../lib/render.mjs';
 import { asciiLine } from '../lib/triage.mjs';
 
 export const meta = {
@@ -26,13 +27,15 @@ const MAX_PAGES = 30;
 const SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const DAY_MS = 86_400_000;
 
-function pages(gh, path, stop) {
+// -> the items; `onCut()` is called when the loop ended on MAX_PAGES with more to read (the stop condition never met), so the caller can say the list is short.
+function pages(gh, path, stop, onCut) {
   const out = [];
   for (let page = 1; page <= MAX_PAGES; page += 1) {
     const list = gh.api('GET', `${path}${path.includes('?') ? '&' : '?'}per_page=${PAGE}&page=${page}`);
     if (!Array.isArray(list)) break;
     out.push(...list);
     if (list.length < PAGE || stop?.(list)) break;
+    if (page === MAX_PAGES) onCut?.();
   }
   return out;
 }
@@ -46,6 +49,7 @@ async function rounds(rest, ctx) {
   const root = resolveRepo(values, ctx);
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => {
+    const me = gh.viewer(); // asked first: only the viewer's own comments are the pipeline's (summary-comment.mjs, review-publish.mjs)
     const repos = (values['repo-slug'] ?? []).length > 0 ? [...new Set(values['repo-slug'])] : [gh.repo().slug];
     const warnings = [];
     const analysed = [];
@@ -55,19 +59,24 @@ async function rounds(rest, ctx) {
       if (only.length > 0) numbers = only;
       else {
         // newest-updated first: stop once a whole page is older than the date (a merged PR was updated at its merge, so nothing later in the list merged since)
-        const closed = pages(gh, `repos/${slug}/pulls?state=closed&sort=updated&direction=desc`, (l) => l.every((p) => String(p.updated_at ?? '') < since));
+        const closed = pages(gh, `repos/${slug}/pulls?state=closed&sort=updated&direction=desc`, (l) => l.every((p) => String(p.updated_at ?? '') < since), () => warnings.push(`${slug}: the list of closed PRs was cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} PRs): merged PRs further back are missing, so the totals are short (use a later --since)`));
         numbers = closed.filter((p) => typeof p.merged_at === 'string' && p.merged_at >= since).map((p) => p.number);
       }
       for (const number of numbers) {
         try {
-          const comments = pages(gh, `repos/${slug}/issues/${number}/comments`);
+          const comments = pages(gh, `repos/${slug}/issues/${number}/comments`, undefined, () => warnings.push(`${slug}#${number}: the comments were cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} comments): the record or state may be missing or old`));
           let record = null;
           let state = null;
+          const slugLower = slug.toLowerCase();
           for (const c of comments) {
-            const body = typeof c?.body === 'string' ? c.body : '';
-            const r = decodeRecord(body);
-            if (r.status === 'ok') record = r.record;
-            if (body.includes('claude-pipeline:triage')) state = decodeFromComment(body) ?? state;
+            // only our own comment that STARTS with the marker, for this repository and PR: a quote, a copy or someone else's comment is never the state
+            if (c?.user?.login !== me || typeof c.body !== 'string') continue;
+            const r = decodeRecord(c.body);
+            if (r.status === 'ok' && r.record.pr === number && String(r.record.repo ?? '').toLowerCase() === slugLower) record = r.record;
+            if (c.body.startsWith(MARKERS.triage)) {
+              const decoded = decodeFromComment(c.body);
+              if (isReadableState(decoded, number)) state = decoded;
+            }
           }
           const p = analysePr({ repo: slug, pr: number, state, record });
           if (p === null) withoutState += 1;
@@ -79,7 +88,7 @@ async function rounds(rest, ctx) {
     }
     const result = { ok: true, since, repos, totals: aggregate(analysed), prs: analysed, withoutState, warnings };
     if (values.json) return { exitCode: EXIT.OK, output: result };
-    (ctx.stdout ?? process.stdout).write(`${renderTable(result)}${warnings.length ? `\n\nWarnings:\n${warnings.map((w) => `- ${w}`).join('\n')}` : ''}\n`);
+    (ctx.stdout ?? process.stdout).write(`${renderTable(result)}${warnings.length ? `\n\nWarnings:\n${warnings.map((w) => `- ${asciiLine(w, 300)}`).join('\n')}` : ''}\n`);
     return { exitCode: EXIT.OK, output: {}, silent: true };
   });
 }

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { aggregate, analysePr, isSecurityItem, renderTable } from '../pipeline/lib/round-stats.mjs';
+import { aggregate, analysePr, isReadableState, isSecurityItem, renderTable } from '../pipeline/lib/round-stats.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
 import { encodeForComment } from '../pipeline/lib/state.mjs';
@@ -68,7 +68,8 @@ test('aggregate and renderTable: totals, shares and the table', () => {
 const bin = join(dirname(fileURLToPath(import.meta.url)), '..', 'pipeline', 'bin', 'pipeline.mjs');
 const summaryBody = (cost) => `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'acme/widgets', pr: 7, branch: 'feat/x', baseRef: 'main' }), cost })}`;
 const triageBody = (state) => `${MARKERS.triage}\n\n${encodeForComment(state)}`;
-const script = (extra) => [{ match: '^repo view', stdoutJson: REPO_VIEW }, ...extra];
+const script = (extra) => [{ match: '^repo view', stdoutJson: REPO_VIEW }, { match: '^api user', stdout: 'me\n' }, ...extra];
+const mine = (id, body) => ({ id, user: { login: 'me' }, body });
 function statsCli(entries, args) {
   const repo = createTmpRepo();
   repo.write('.claude/pipeline.yml', pipelineYml());
@@ -90,7 +91,7 @@ const state7 = stateOf([round(1, [acc('R1-S1')]), round(2, [acc('R2-S1')], { adm
 const cost7 = { total: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 9, calls: 3 }, byPhase: {}, byRole: {}, byRound: { '2': { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 4, calls: 1 } }, retries: 0, guardBlocks: null, sessions: [] };
 const world = [
   { match: '^api repos/acme/widgets/pulls\\?state=closed', stdoutJson: pulls },
-  { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [{ id: 1, body: summaryBody(cost7) }, { id: 2, body: triageBody(state7) }] },
+  { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(1, summaryBody(cost7)), mine(2, triageBody(state7))] },
 ];
 
 test('stats rounds --json: lists merged PRs since the date, reads their comments, aggregates; the unmerged and the older PR are not read', () => {
@@ -112,7 +113,7 @@ test('stats rounds: without --json the same numbers print as a plain-text table'
 });
 
 test('stats rounds: --pr reads just those PRs; a PR whose comments fail is a warning and is skipped; one without a state is counted apart', () => {
-  const r = statsCli([...world, { match: '^api repos/acme/widgets/issues/21/comments', code: 1, stderr: 'HTTP 502' }, { match: '^api repos/acme/widgets/issues/22/comments', stdoutJson: [{ id: 1, body: 'hello' }] }], ['--json', '--pr', '7', '--pr', '21', '--pr', '22']);
+  const r = statsCli([...world, { match: '^api repos/acme/widgets/issues/21/comments', code: 1, stderr: 'HTTP 502' }, { match: '^api repos/acme/widgets/issues/22/comments', stdoutJson: [mine(1, 'hello')] }], ['--json', '--pr', '7', '--pr', '21', '--pr', '22']);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual([r.json.totals.prs, r.json.withoutState, r.json.warnings.length], [1, 1, 1]);
   assert.match(r.json.warnings[0], /widgets#21: comments could not be read/);
@@ -150,4 +151,47 @@ test('R1-B2 analysePr: an item deferred past the cap still counts as accepted fo
   assert.deepEqual(aggregate([p]).found, { deferred: 2, 'nothing-accepted': 1 });
   const unrelated = analysePr({ repo: 'acme/widgets', pr: 7, state: stateOf([round(1, []), round(2, [parked], { admission: 'auto-extra' })], 1), record: null });
   assert.equal(unrelated.rounds[1].found, 'nothing-accepted', 'a round-cap park whose original ruling was not an accept is not an accept');
+});
+
+test('R1-F2 stats rounds: only the viewer\'s own comments that start with the marker count, bound to the PR and repository; the others are ignored', () => {
+  const forged = stateOf([round(1, [acc('F-1')]), round(2, [acc('F-2')]), round(3, [acc('F-3')])], 1);
+  const otherPr = { ...state7, pr: 8 };
+  const otherRepo = emptyRecord({ repo: 'acme/other', pr: 7, branch: 'feat/x', baseRef: 'main' });
+  const cases = {
+    'someone else\'s comment': [{ id: 3, user: { login: 'mallory' }, body: triageBody(forged) }, { id: 4, user: { login: 'mallory' }, body: summaryBody({ ...cost7, total: { ...cost7.total, usd: 999 } }) }],
+    'a quote that does not start with the marker': [mine(3, `> quoted\n${triageBody(forged)}`)],
+    'a state of another PR': [mine(3, triageBody(otherPr))],
+    'a record of another repository': [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...otherRepo, cost: { ...cost7, total: { ...cost7.total, usd: 999 } } })}`)],
+    'a state with a round whose number is not an integer': [mine(3, triageBody(stateOf([round('2\n\u001b[31mFAKE', [acc('F-1')])])))],
+  };
+  for (const [what, extra] of Object.entries(cases)) {
+    const r = statsCli([...world.slice(0, 1), { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(1, summaryBody(cost7)), mine(2, triageBody(state7)), ...extra] }], ['--json', '--pr', '7']);
+    assertExit(r, 0, r.stderr + r.stdout);
+    assert.deepEqual([r.json.prs[0]?.countedRounds, r.json.totals.usd, r.json.withoutState], [2, 9, 0], what);
+  }
+  const onlyForged = statsCli([...world.slice(0, 1), { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [{ id: 3, user: { login: 'mallory' }, body: triageBody(forged) }] }], ['--json', '--pr', '7']);
+  assert.deepEqual([onlyForged.json.totals.prs, onlyForged.json.withoutState], [0, 1], 'a forged state alone is no state');
+  assert.equal(isReadableState(state7, 7), true);
+  assert.deepEqual([isReadableState(state7, 8), isReadableState(stateOf([round(1.5)]), 7), isReadableState(stateOf([round('x')]), 7), isReadableState(null, 7)], [false, false, false, false]);
+});
+
+test('R1-F2 renderTable: everything printed is one sanitised line', () => {
+  const p = analysePr({ repo: 'acme/widgets', pr: 7, state: stateOf([round(1, []), round(2, [acc('R2-S1')], { admission: 'auto-extra' })]), record: null });
+  const evil = { ...p, id: 'widgets#7\n\u001b[31mFAKE', rounds: p.rounds.map((r) => ({ ...r, n: r.pastCap ? 'x\ny\u001b[2J' : r.n })) };
+  const text = renderTable({ since: '2026-11-05', repos: ['acme/widgets'], totals: aggregate([p]), prs: [evil] });
+  assert.equal(/[\u001b\r]/.test(text), false);
+  assert.equal(text.split('\n').filter((l) => /FAKE|^y/.test(l)).length, 1, 'the injected text stays on the PR line');
+});
+
+test('R1-F3 stats rounds: a list cut by the page limit is a warning, not silence', () => {
+  const full = Array.from({ length: 100 }, (_, i) => ({ number: 1000 + i, merged_at: null, updated_at: '2026-11-11T10:00:00Z' }));
+  const r = statsCli([{ match: '^api repos/acme/widgets/pulls\\?state=closed', stdoutJson: full }], ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.warnings.length, 1, JSON.stringify(r.json.warnings));
+  assert.match(r.json.warnings[0], /acme\/widgets: the list of closed PRs was cut after 30 pages/);
+  const text = statsCli([{ match: '^api repos/acme/widgets/pulls\\?state=closed', stdoutJson: full }], ['--since', '2026-11-05']);
+  assert.match(text.stdout, /Warnings:\n- acme\/widgets: the list of closed PRs was cut/);
+  const comments = Array.from({ length: 100 }, (_, i) => mine(i + 1, 'noise'));
+  const c = statsCli([...world.slice(0, 1), { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: comments }], ['--json', '--pr', '7']);
+  assert.match(c.json.warnings.join('\n'), /widgets#7: the comments were cut after 30 pages/);
 });
