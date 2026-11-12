@@ -358,11 +358,11 @@ function makeCtx(opts) {
       const at = segs.findIndex((s) => /[*?[]/.test(s));
       if (at < 0) return hitReviewInode(glob, true);
       const prefix = segs.slice(0, at).join('/') || '/';
-      if (segs[at] === '**' || segs.slice(at).includes('**') || depth > 8) return true;
+      if (segs.slice(at).some(isDeepSeg) || depth > 8) return true;
       const last = at === segs.length - 1;
       if (last) {
         const re = globToRe(segs[at], ci);
-        if (re === null) return true;
+        if (re.unreadable) return true;
         // (in a round folder anything is protected; in the review folder the glob must be able to match a protected name)
         if (hitReviewInode(P.join(prefix, 'x')) || REVIEW_SAMPLES.some((n) => re.test(n) && hitReviewInode(P.join(prefix, n)))) return true;
         // (Codex recheck: the samples are not every protected name (`staging-smoke.json`), and a hard link to a protected file can sit in any
@@ -378,7 +378,7 @@ function makeCtx(opts) {
         return false;
       }
       const re = globToRe(segs[at], ci);
-      if (re === null) return true;
+      if (re.unreadable) return true;
       const entries = (opts.readDir ?? defaultReadDir)(prefix);
       if (entries === null) return false;
       if (!Array.isArray(entries) || entries.length > 4000) return true;
@@ -933,11 +933,10 @@ function globReaches(g, root, ci) {
   const rs = root.split('/');
   for (let i = 0; i < rs.length; i++) {
     if (i >= gs.length) return false; // shorter than the root: it can only match a directory above it (checked separately)
-    if (gs[i] === '**') return true;
+    if (isDeepSeg(gs[i])) return true;
     if (gs[i] === rs[i]) continue;
     if (!/[*?[]/.test(gs[i])) { if (ci ? gs[i].toLowerCase() !== rs[i].toLowerCase() : true) return false; continue; }
-    const re = segmentRe(gs[i], ci);
-    if (!re || !re.test(rs[i])) return false;
+    if (!segmentRe(gs[i], ci).test(rs[i])) return false; // (an unreadable segment matches anything: it may reach)
   }
   return true;
 }
@@ -965,12 +964,19 @@ function bracketEnd(g, i, budget) {
   return -1;
 }
 // -> the glob's elements: { k: 'c', c } a character, { k: '?' } one character, { k: '*', deep } any run; a bracket expression is '?' (see above). null: too tangled to read.
+// R7-S1: a segment of two or more stars and nothing else (`**`, zsh's `***`, any longer run) stands for any number of directories, zero included
+const isDeepSeg = (seg) => seg.length >= 2 && seg.replaceAll('*', '') === '';
 function globElements(g) {
   const out = [];
   const budget = bracketBudget(g);
   for (let i = 0; i < g.length; i++) {
     const c = g[i];
-    if (c === '*') { const deep = g[i + 1] === '*'; if (deep) i++; out.push({ k: '*', deep }); } else if (c === '?') out.push({ k: '?' });
+    if (c === '*') { // (R7-S1: a run of stars is ONE element, deep when it holds two or more: `***…` of any length costs one position, not one per star)
+      let j = i;
+      while (g[j + 1] === '*') j++;
+      out.push({ k: '*', deep: j > i });
+      i = j;
+    } else if (c === '?') out.push({ k: '?' });
     else if (c === '[') {
       const j = bracketEnd(g, i, budget);
       if (j === -2) return null;
@@ -981,11 +987,17 @@ function globElements(g) {
 }
 // R6-F1 (#288): a matcher with a `test(string)` like a RegExp, but NOT a RegExp. The pattern `/**?**?…Z` as a regular expression (`.*[^/].*[^/]…`) backtracks over every split of the string: ten pairs took 12 s, and
 // a hook that outlasts its timeout fails open. This one keeps the set of pattern positions the text read so far can have reached (the usual NFA walk): O(text × pattern), whatever the pattern. A deep `*` also matches a newline.
+// R7-S1: a pattern that cannot be read (too tangled, or more than 20000 elements once the runs of `*` are one) is not null any more: it is a matcher that matches EVERYTHING, with `unreadable` set. A caller that
+// forgot to ask can only fail closed (a hit); round 6 returned null, and `segmentRe(…)?.test(…)`, `!!re && …` and `!re || !re.test(…)` each read it as "no match" -- a long glob stepped past three checks.
+const UNREADABLE = Object.freeze({ unreadable: true, test: () => true });
 function globToRe(g, ci) {
   const els = globElements(g);
-  if (els === null || els.length > 20000) return null; // (as before: a pattern too large to read -- V8 refused the regexp -- is unreadable, and the callers fail closed)
+  if (els === null || els.length > 20000) return UNREADABLE;
   const n = els.length;
-  const fold = (c) => (ci ? c.toLowerCase() : c);
+  // R7-F3: the pattern and the text are folded the same way, one code unit at a time, and a unit whose lower case is not one unit (`İ` is two) stays as it is: the final-sigma rule and the
+  // two-unit results of whole-string folding differ from the per-unit ones, and a home like /Users/ΝΙΚΟΣ or C:/Users/İbrahim then matched nothing
+  const fold1 = (u) => { const l = u.toLowerCase(); return l.length === u.length ? l : u; };
+  const fold = (c) => (ci ? Array.from({ length: c.length }, (_, k) => fold1(c[k])).join('') : c);
   const lits = els.map((e) => (e.k === 'c' ? fold(e.c) : null));
   const settle = (at) => { for (let j = 0; j < n; j++) if (at[j] && els[j].k === '*') at[j + 1] = 1; return at; }; // (a `*` may match nothing)
   return {
@@ -1055,10 +1067,10 @@ function makeMatchers(ctx) {
   // for a round folder, so anything after it counts. A wildcard reaches a dot name only with DOT_GLOB on the line.
   // Can this glob segment stand for `name`? (`**` and a wildcard reach a dot name only with DOT_GLOB on the line)
   const can = (seg, name) => {
-    if (seg === '**') return ctx.dotGlob === true || !name.startsWith('.');
+    if (isDeepSeg(seg)) return ctx.dotGlob === true || !name.startsWith('.');
     if (!/[*?[]/.test(seg)) return ctx.ci ? seg.toLowerCase() === name.toLowerCase() : seg === name;
     if (name.startsWith('.') && !seg.startsWith('.') && ctx.dotGlob !== true) return false;
-    return !!segmentRe(seg, ctx.ci)?.test(name);
+    return segmentRe(seg, ctx.ci).test(name);
   };
   const reviewGlob = (g) => withoutQualifier(g).some(reviewGlobOf);
   const reviewGlobOf = (g) => {
@@ -1067,7 +1079,7 @@ function makeMatchers(ctx) {
     for (let i = 0; i < segs.length; i++) {
       if (!can(segs[i], '.review')) continue;
       const rest = segs.slice(i + 1).filter((s) => s !== '');
-      if (rest.length === 0 || segs[i] === '**' || rest[0] === '**') return true;
+      if (rest.length === 0 || isDeepSeg(segs[i]) || isDeepSeg(rest[0])) return true;
       // (Codex R1: comparing the next name with REVIEW_SAMPLES let `.rev*/round-2/codex.json` and `.rev*/staging-smoke.json` through. A
       // literal name is judged by the protected pattern itself; a wildcard one in a review folder may be any protected file: refused.)
       if (/[*?[]/.test(rest[0]) || reviewName.test(`.review/${rest[0]}`)) return true;
@@ -1087,11 +1099,11 @@ function makeMatchers(ctx) {
   const claudeSeg = (seg) => {
     if (!/[*?[]/.test(seg)) return /^\.claude/i.test(seg);
     if (!seg.startsWith('.') && ctx.dotGlob !== true) return false; // (a wildcard reaches a dot name only with DOT_GLOB, as in can())
-    if (seg === '**') return true;
+    if (isDeepSeg(seg)) return true;
     // (R3-F1: one regex per cut grows quadratically with the segment, and a hook that outlasts its timeout fails open: a segment this long is read as a hit, as a wildcard
     // segment is that nothing could tell from .claude. No folder has a real name this long.)
     if (seg.length > 256) return true;
-    for (let i = 1; i <= seg.length; i++) if (segmentRe(seg.slice(0, i), ctx.ci)?.test(CLAUDE)) return true;
+    for (let i = 1; i <= seg.length; i++) if (segmentRe(seg.slice(0, i), ctx.ci).test(CLAUDE)) return true;
     return false;
   };
   const transcriptTail = (rest) => {
@@ -1119,7 +1131,7 @@ function makeMatchers(ctx) {
   const configDirGlobOf = (g) => {
     const gp = trimSlashes(g); // (R4-B2: before both the pattern test and the split at the last slash, which would land inside `(/)`)
     const re = globToRe(gp, ctx.ci);
-    if (re && ctx.transcriptRoots.some((r) => re.test(trimSlashes(r)))) return true;
+    if (re.unreadable || ctx.transcriptRoots.some((r) => re.test(trimSlashes(r)))) return true;
     const at = gp.lastIndexOf('/');
     const last = gp.slice(at + 1);
     const parent = gp.slice(0, at);
@@ -1232,7 +1244,7 @@ function makeMatchers(ctx) {
     if (ctx.roots.some((r) => globReaches(g, r, ctx.ci))) return true;
     // ... or a directory that holds them (~/.cla*, ~/.claude/*)
     const re = globToRe(g, ctx.ci);
-    return !!re && ancestors.some((a) => re.test(a));
+    return re.unreadable === true || ancestors.some((a) => re.test(a));
   };
 
   // A word that, resolved against any directory the command line has been in, lands inside a protected root (or is
@@ -1262,11 +1274,13 @@ function makeMatchers(ctx) {
           if (/(?:^|\/)\.\.(?:\/|$)/.test(e)) {
             const ph = physicalDots(isAbs(e) ? e : `${trimSlashes(d)}/${e}`, ctx.api);
             if (ph !== null && ph !== full) fulls.push(ph, realResolve(ph, ctx.api));
-          } else if (isAbs(e) && !/[*?[]/.test(e)) {
-            // R6-F4: an absolute word that reaches a protected place through a symlink with no `..` (`/tmp/link/settings.json`, the link being the home directory) is read the way the kernel resolves it too
+          }
+          if (!/[*?[]/.test(e)) {
+            // R6-F4 / R7-B2: a word that reaches a protected place through a symlink (`/tmp/link/settings.json`, the link being the home directory; `cp x s` from /tmp with s a link to a protected file) is read the way the
+            // kernel resolves it too: `full` is already absolute whether the word was written absolute or joined to a directory, so this holds for every glob-free reading
             let rl = realMemoPath.get(full);
             if (rl === undefined) { rl = realResolve(full, ctx.api); realMemoPath.set(full, rl); }
-            if (rl !== full) fulls.push(rl);
+            if (rl !== full && !fulls.includes(rl)) fulls.push(rl);
           }
           for (const fl of fulls) {
             if (/[*?[]/.test(fl) ? globHit(fl) : (ctx.hit(fl) || (withAncestors === 'pipeline' ? ctx.hitPipelineAncestor(fl) : withAncestors && (ctx.hitAncestor(fl) || ctx.hitTranscriptDir(fl)))) && (!plausible || plausible(fl, e))) return true;
@@ -1897,9 +1911,9 @@ const GLOB_CHARS = /[*?[()^<>]|.[#~]/;
 // Can the glob word `w` become a word that matches the token pattern `toks` (every token one character: {c} that character, {any} any character but `/`; {star} zero or more of it)?
 // A product of the glob's elements and the pattern positions: linear in the word (the pattern is a few characters long). A glob element (`*`, `?`, a bracket) never matches `/`; a literal `/` of the word is part of a path the pattern spans.
 function globMeets(w, toks) {
-  // R6-F3: a group, qualifier, range or extended glob is not read, it is too tangled: a word that begins with `-` or with a glob (it can match a string that starts with `-`) is a possible option. A word that begins
-  // with another plain character (`print(x)`, `s/(a)/b/`) cannot start with `-` whatever follows, and is judged below.
-  if (/[()^<>]|.[#~]/.test(w) && /^[-*?[(^<]/.test(w)) return true;
+  // R6-F3 / R7-B1: a group, qualifier, range or extended glob (`(a|b)`, `@(-x)`, `+(-x)`, `!(x)`, `x(#c0)-x`, `x#-x`, `a~b`, `^x`, `<1-3>`) is not read, it is too tangled: the word is a possible option WHATEVER it starts with
+  // (round 6 let a word that starts with a plain character through, and `x#` and `@(…)` match a string that starts with a dash). The cost: a quoted program with a paren, next to an unquoted glob on the same line.
+  if (/[()^<>]|.[#~]/.test(w)) return true;
   const els = globElements(w);
   if (els === null) return true; // (too tangled to read: it may be anything)
   const m = toks.length;
@@ -1923,17 +1937,25 @@ function globMeets(w, toks) {
   return at.has(m);
 }
 // R6-F1 / F2 (#288): the command line with its quoted strings removed, in ONE pass (the regexes this replaces were quadratic on an unterminated quote). An escaped character stays as written (`\\x`).
-// null: cannot be told -- no text, an unterminated quote, or an ANSI-C / locale string (`$'…'`, `$"…"`: a backslash-quote in it does not end the string, and the parser keeps no per-word quoting to ask), so
-// every reader of this fails closed on it.
+// null: cannot be told -- no text, an unterminated quote, an ANSI-C / locale string (`$'…'`, `$"…"`: a backslash-quote in it does not end the string, and the parser keeps no per-word quoting to ask), or text that may
+// hold a comment or a heredoc body (R7-F1: a quote in a comment or a heredoc body is no quote, and this reader does not tell them apart: an unquoted `#` at the start of a word, or a `<<` anywhere) -- so every reader
+// of this fails closed on it.
+// (R7-F4: the `$'` / `$"` test is made here, at the top level only: a `$` that ends a quoted string -- `grep 'x$' f` -- starts nothing.)
 function withoutQuotes(raw) {
-  if (typeof raw !== 'string' || raw.includes("$'") || raw.includes('$"')) return null;
+  if (typeof raw !== 'string') return null;
   const n = raw.length;
   const out = [];
   let from = 0;
   for (let i = 0; i < n; i++) {
     const c = raw[i];
     if (c === '\\') i++;
-    else if (c === "'") {
+    else if (c === '$') {
+      if (raw[i + 1] === "'" || raw[i + 1] === '"') return null;
+    } else if (c === '<') {
+      if (raw[i + 1] === '<') return null;
+    } else if (c === '#') {
+      if (i === 0 || /[\s;&|()<>]/.test(raw[i - 1])) return null;
+    } else if (c === "'") {
       const j = raw.indexOf("'", i + 1);
       if (j < 0) return null;
       out.push(raw.slice(from, i));
@@ -4078,9 +4100,11 @@ function evaluateBashForFilesFrame(command, opts) {
   // cannot name one (a bare relative word reaches a protected root only from a cwd that is inside or above one, which insideRoot already covers).
   // (R4-F2 #288: the lexical home and its resolved form, as every other home comparison reads it; $HOME can be a symlink)
   const homeChain = new Set();
+  const homeRaw = []; // (R7-F3: a glob folds its text itself, one unit at a time: it is given the directories as they are written, not lower-cased as a whole)
   for (const home of unique([ctx.homePosix, realResolve(ctx.homePosix, ctx.api)])) {
     for (let d = home, n = 0; n < 32; n++) {
       homeChain.add(ctx.ci ? d.toLowerCase() : d);
+      homeRaw.push(d);
       const up = pathsFor().dirname(d);
       if (up === d || up === '.') break;
       d = up;
@@ -4095,7 +4119,7 @@ function evaluateBashForFilesFrame(command, opts) {
       let hit = globMemo.get(e);
       if (hit === undefined) {
         const re = globToRe(e, ctx.ci);
-        hit = !re || [...homeChain].some((h) => re.test(h));
+        hit = re.unreadable === true || homeRaw.some((h) => re.test(h));
         globMemo.set(e, hit);
       }
       return hit;
