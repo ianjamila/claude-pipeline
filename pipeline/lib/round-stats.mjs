@@ -13,7 +13,8 @@ const isNewAccept = (item) => decisionOf(item) === 'ACCEPT' && item.final.by !==
 // An accept that `triage defer-fixes` turned into a FOLLOW-UP (applyRoundCapDefer keeps the original ACCEPT in final.claude.overruled). The round still FOUND it; its fix is out of
 // the tree, so the next round had nothing to re-check for it (decisionOf already reads it as a FOLLOW-UP, so `previous` leaves it out).
 const isDeferredAccept = (item) => isRoundCapDeferral(item) || (item?.final?.claude?.cause === ROUND_CAP_CAUSE && item.final.claude.overruled?.decision === 'ACCEPT');
-const accepted = (round) => (round?.items ?? []).filter((i) => decisionOf(i) === 'ACCEPT');
+// what a round newly accepted (the fixes the round after it had to re-check): the same isNewAccept rule `found` uses, so a cached accept carried as implemented is no fix.
+const newAccepts = (round) => (round?.items ?? []).filter(isNewAccept);
 const money = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : null);
 const share = (n, d) => (d > 0 ? Math.round((n / d) * 1000) / 1000 : null);
 
@@ -45,7 +46,7 @@ export function analysePr({ repo, pr, state, record }) {
     const items = r.items ?? [];
     const row = { n: r.n, k, pastCap: max !== null && k > max, usd: money(byRound[String(r.n)]?.usd), acceptedBlocking: items.some((i) => i.bucket === 'BLOCKING' && isNewAccept(i)) };
     if (row.pastCap) {
-      const prevAccepts = accepted(prev);
+      const prevAccepts = newAccepts(prev);
       row.admission = admissionOf(r, k, max);
       // what the round before it had to re-check: nothing, only fixes of non-BLOCKING non-security items ("low"), or something heavier
       row.previous = prevAccepts.length === 0 ? 'no-accepts' : prevAccepts.every((i) => i.bucket !== 'BLOCKING' && !isSecurityItem(i)) ? 'only-low-fixes' : 'blocking-or-security';

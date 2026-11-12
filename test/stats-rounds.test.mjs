@@ -195,3 +195,15 @@ test('R1-F3 stats rounds: a list cut by the page limit is a warning, not silence
   const c = statsCli([...world.slice(0, 1), { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: comments }], ['--json', '--pr', '7']);
   assert.match(c.json.warnings.join('\n'), /widgets#7: the comments were cut after 30 pages/);
 });
+
+// ---- round 2 review fixes ------------------------------------------------------------------------------------------
+
+test('R2-F1 analysePr: the round before a past-limit round counts its NEW accepts only; a cached accept is not a fix to re-check', () => {
+  const cached = (id, bucket = 'SUGGESTION', over = {}) => acc(id, bucket, { final: { decision: 'ACCEPT', by: 'cache' }, ...over });
+  const prevOf = (items) => analysePr({ repo: 'acme/widgets', pr: 7, state: stateOf([round(1, items), round(2, [], { admission: 'auto-extra' })]), record: null }).rounds[1].previous;
+  assert.equal(prevOf([cached('R1-S1')]), 'no-accepts', 'only a cached accept before: nothing new to re-check');
+  assert.equal(prevOf([cached('R1-B1', 'BLOCKING')]), 'no-accepts', 'a cached BLOCKING accept is carried as implemented, not new');
+  assert.equal(prevOf([cached('R1-S1'), acc('R1-S2')]), 'only-low-fixes', 'a new low accept next to a cached one');
+  assert.equal(prevOf([cached('R1-S1'), acc('R1-B1', 'BLOCKING')]), 'blocking-or-security', 'a new BLOCKING accept next to a cached one');
+  assert.equal(prevOf([acc('R1-S1')]), 'only-low-fixes');
+});
