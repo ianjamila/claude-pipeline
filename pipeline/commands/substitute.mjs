@@ -118,17 +118,17 @@ function checkAgainstRound(route, adm, packet, root) {
 }
 
 // A quota stop is evidence until its reset time (2 hours when it gave none). Governor evidence is judged again against the weekly figure as it is now: still at or above the
-// hard limit, or (when no current figure is readable) not older than a reading may be (MAX_AGE_MS from when it was formed) - the weekly reset must not leave it admitting a weaker
-// reviewer for ever (R1-F2). Only prepare asks.
+// limit codex-review stored (governor.threshold, the hard limit it acted on), or (when no current figure is readable) not older than a reading may be (MAX_AGE_MS from when it was
+// formed) - the weekly reset must not leave it admitting a weaker reviewer for ever (R1-F2). A record with no usable limit cannot be judged and is expired (R2-B1). Only prepare asks.
 function checkReset(route, now, env) {
   if (route.evidence === 'governor') {
-    const hard = Number(route.governor?.hard);
+    const limit = typeof route.governor?.threshold === 'number' ? route.governor.threshold : NaN;
     const usage = readWeeklyUsage({ env, now });
-    const stillHard = usage.source === 'codex-sessions' && Number.isFinite(hard) ? usage.weeklyUsedPct >= hard : null;
     const at = Date.parse(route.at);
     const young = Number.isFinite(at) && now - at < MAX_AGE_MS;
-    if (stillHard === false || (stillHard === null && !young)) {
-      throw refuse('reset-passed', `the weekly Codex quota is no longer at the governor's hard limit (${usage.weeklyUsedPct ?? 'no current reading'}% used): run \`pipeline codex-review\` for round ${route.round} again`);
+    const stillHard = usage.source === 'codex-sessions' ? usage.weeklyUsedPct >= limit : null;
+    if (!Number.isFinite(limit) || stillHard === false || (stillHard === null && !young)) {
+      throw refuse('reset-passed', `the weekly Codex quota is no longer evidence for round ${route.round} (limit ${Number.isFinite(limit) ? `${limit}%` : 'not recorded'}, ${usage.weeklyUsedPct ?? 'no current reading'}% used): run \`pipeline codex-review\` for round ${route.round} again`);
     }
     return;
   }

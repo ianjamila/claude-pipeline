@@ -230,26 +230,50 @@ test('R1-F1: a fresh codex-review attempt for the same content does not reset th
   assert.equal(w.prepare().json.attempt, 2);
 });
 
-test('R1-F2: governor evidence expires: a reading that is back under the hard limit, or an old route with no readable figure, is reset-passed', (t) => {
-  const w = world(t);
-  assertExit(w.run(), 3);
-  const gov = (at) => w.editRoute((r) => { r.evidence = 'governor'; r.governor = { usedPct: 95, soft: 70, hard: 90, observedAt: at }; r.at = at; });
-  gov(new Date().toISOString());
-  assertExit(w.prepare(), 0); // fresh, nothing readable to contradict it
-  gov(new Date(Date.now() - 7 * 3600_000).toISOString());
-  const old = w.prepare();
-  assertExit(old, 1, old.stdout);
-  assert.equal(old.json.error, 'reset-passed');
-  // a readable current figure under the hard limit: the weekly quota has room again
-  const home = join(w.scratch, 'gov-home');
+// A weekly reading in Codex's own session logs (used_percent p, observed now, resetting in two days), in a Codex home of the test's own.
+function usageHome(w, p, name = 'gov-home') {
+  const home = join(w.scratch, name);
   const day = new Date();
   const dir = join(home, 'sessions', String(day.getUTCFullYear()), String(day.getUTCMonth() + 1).padStart(2, '0'), String(day.getUTCDate()).padStart(2, '0'));
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'rollout-t.jsonl'), `${JSON.stringify({ type: 'event_msg', timestamp: day.toISOString(), payload: { type: 'token_count', rate_limits: { limit_id: 'codex', primary: { used_percent: 5, window_minutes: 10080, resets_at: Math.floor(Date.now() / 1000) + 2 * 86400 } } } })}\n`);
-  gov(new Date().toISOString());
-  const low = w.cli(['substitute', 'prepare', '--pr', '7', '--round', '1'], { PIPELINE_CODEX_HOME: home });
-  assertExit(low, 1, low.stdout);
-  assert.equal(low.json.error, 'reset-passed');
+  writeFileSync(join(dir, 'rollout-t.jsonl'), `${JSON.stringify({ type: 'event_msg', timestamp: day.toISOString(), payload: { type: 'token_count', rate_limits: { limit_id: 'codex', primary: { used_percent: p, window_minutes: 10080, resets_at: Math.floor(Date.now() / 1000) + 2 * 86400 } } } })}\n`);
+  return home;
+}
+
+// Round 1 recorded by Codex, then a small round 2 that the weekly governor withholds (95 % used): route.json is codex-review's OWN governor record. -> the round 2 tail commit.
+function governorRound(w) {
+  const home = usageHome(w, 95);
+  const first = w.codex(1, findingsOf([], []));
+  assertExit(first, 0, first.stdout + first.stderr);
+  w.repo.write('src/a.js', readFileSync(join(w.repo.dir, 'src', 'a.js'), 'utf8').replace('compute(x.y)', 'compute(x.z)'));
+  const small = w.repo.commit('small tweak');
+  const r = w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', small, '--effort', 'high'], { PIPELINE_CODEX_HOME: home });
+  assertExit(r, 3, r.stdout + r.stderr);
+  assert.equal(r.json.substitute.evidence, 'governor');
+  return home;
+}
+
+test('R1-F2 / R2-B1: governor evidence written by codex-review expires: a reading back under the limit, or an old route with no readable figure, is reset-passed; a figure still at the limit keeps an old route', (t) => {
+  const w = world(t);
+  const home = governorRound(w);
+  const route = w.route(2);
+  assert.deepEqual([route.evidence, route.governor.usedPct, route.governor.threshold], ['governor', 95, 90], 'the field codex-review stores is the threshold');
+  const prep2 = (env = {}) => w.cli(['substitute', 'prepare', '--pr', '7', '--round', '2'], env);
+  const at = (ms) => w.editRoute((r) => { r.at = new Date(Date.now() - ms).toISOString(); }, 2);
+  const passed = (r) => { assertExit(r, 1, r.stdout + r.stderr); assert.equal(r.json.error, 'reset-passed'); };
+
+  assertExit(prep2(), 0); // fresh, nothing readable to contradict it
+  at(7 * 3600_000);
+  passed(prep2()); // old, no readable figure
+  assertExit(prep2({ PIPELINE_CODEX_HOME: home }), 0); // old, but the weekly figure (95) is still at the limit (90)
+  at(0);
+  passed(prep2({ PIPELINE_CODEX_HOME: usageHome(w, 5, 'low-home') })); // fresh, but the quota has room again
+  // fail closed: a record without a usable limit is expired, whatever it says
+  for (const bad of [undefined, null, 'x']) {
+    w.editRoute((r) => { r.at = new Date().toISOString(); if (bad === undefined) delete r.governor.threshold; else r.governor.threshold = bad; }, 2);
+    passed(prep2());
+    passed(prep2({ PIPELINE_CODEX_HOME: home }));
+  }
 });
 
 test('apply: no transcript with the tag is exit 2 not-found and records nothing; no prepared attempt is no-prepare', (t) => {
