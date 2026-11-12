@@ -936,6 +936,51 @@ test('R14: the [[ / ]] and loop-name text checks judge the line as written: no h
   assert.ok(t4 - t3 < 3000, 'closing brackets took ' + (t4 - t3) + ' ms');
 });
 
+test('R15: a heredoc pending on the outer line is read after the line ends, not at a newline inside a substitution; ${ cmd; } and ${|cmd;} run commands', () => {
+  const loop = 'for 1 in .claude/settings.local.json; do cp /tmp/payload $@; done';
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json';
+  const failures = [];
+  for (const cmd of [
+    // R15-F1: the newline inside the substitution is part of a word; the heredoc body starts after the line that ends the outer command
+    'cat <<E $(echo\n' + loop + '\nE\n)\nE',
+    'cat <<E $(echo\n' + cp + '\nE\n)\nE',
+    'cat <<true $(echo\n' + cp + '\ntrue\n)\ntrue',
+    'cat <<E "$(echo\n' + cp + '\nE\n)"\nE',
+    'cat <<E <(echo\n' + cp + '\nE\n)\nE',
+    'cat <<E >(echo\n' + cp + '\nE\n)\nE',
+    // R15-F4: bash 5.3 / zsh ${ cmd; } and ${|cmd;} run commands
+    "bash -c '${ " + cp + "; }'",
+    'echo ${ ' + cp + '; }',
+    'echo ${|' + cp + '; }',
+    'echo ${\t' + cp + '; }',
+    'echo ${\n' + cp + '\n}',
+    'echo "${ ' + cp + '; }"',
+    'cat <<E\n${ ' + loop + '; }\nE',
+    'cat <<E\n${ ' + cp + '; }\nE',
+    'cat <<E\n${|' + cp + '; }\nE',
+    'echo ${ { echo a; } ; ' + cp + '; }',
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R15 lines were not refused');
+  const blocked = [];
+  for (const cmd of [
+    'cat <<E $(date)\nhello\nE',
+    "x=$(cat <<'E'\nselect 1;\nE\n)",
+    'echo ${HOME}',
+    'echo "${x:-a b}"',
+    "echo '${ not run }'",
+    "node -e 'const a = `${ b }`'",
+    "cat <<'E'\n${ x }\nE",
+    'echo ${HOME} ${x:-y}',
+  ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
+  assert.deepEqual(blocked, [], 'these R15 lines were refused');
+  // R15-F2: the ]] message says the check reads quoted text and heredoc bodies, and where such text goes
+  const r = evaluateBashForFiles('git commit -m "guard: refuse if [[ a ]] cmd"', { ...LINUX, cwd: '/home/u' });
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /quoted text and heredoc bodies/);
+  assert.match(r.reason, /Write tool/);
+  assert.match(r.reason, /git commit -F/);
+});
+
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------
 
 test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] argument no longer hide a fed interpreter', () => {

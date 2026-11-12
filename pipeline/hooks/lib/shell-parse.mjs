@@ -2070,6 +2070,8 @@ function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
 }
 
 const MAX_PARAM_WORK = 2_000_000;
+// (#269 R15-F4) `${` followed by a blank, tab, newline or `|` (and, to be generous, any other white space) at s[at]: a command substitution of bash 5.3 and newer zsh, not a parameter expansion
+const isFunsubAt = (s, at) => s[at] === '$' && s[at + 1] === '{' && at + 2 < s.length && /[\s|]/.test(s[at + 2]);
 class Parser {
   constructor(ctx, src) {
     this.ctx = ctx;
@@ -2122,9 +2124,21 @@ class Parser {
     if (depth > ctx.maxDepth) {
       ctx.truncated = true;
       ctx.muted++;
-      try { this.parseList(depth, opts); } finally { ctx.muted--; }
-    } else {
-      this.parseList(depth, opts);
+      try { return this.parseList(depth, opts); } finally { ctx.muted--; }
+    }
+    return this.parseList(depth, opts);
+  }
+
+  // Runs the in-place parse of a substitution with a list of pending heredocs of its own (#269 R15-F1): the outer line's heredocs are read after the newline that ENDS the outer line,
+  // never at a newline inside the `$( )` (that newline is part of a word, and the lines after it are the substitution's commands). A heredoc opened inside and still pending at the
+  // closing paren keeps the older reading (its body is read at the end of the outer line, as part of the commands finished with it) but counts as not located (hdForeign).
+  ownHeredocs(fn) {
+    const outer = this.hd;
+    this.hd = [];
+    try { return fn(); } finally {
+      const left = this.hd;
+      this.hd = outer;
+      if (left.length) { this.hd.push(...left); this.ctx.hdForeign = true; }
     }
   }
 
@@ -2135,7 +2149,21 @@ class Parser {
     const mark = this.log.length;
     this.i += 2;
     // (`$((` is arithmetic, where `a > b` compares, only when it closes as `))`; else it is a subshell in a command substitution -- `$((cmd > f) )` RUNS cmd and writes f, in bash and zsh -- and its redirects count)
-    this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: s[start] === '$' && s[this.i] === '(' && closesAsArith(s, start, 3) }));
+    this.ownHeredocs(() => this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: s[start] === '$' && s[this.i] === '(' && closesAsArith(s, start, 3) })));
+    this.subAcc.push(...this.log.slice(mark));
+    return s.slice(start, this.i);
+  }
+
+  // `${ cmd; }` and `${|cmd;}` at this.i (bash 5.3, zsh after 5.9; #269 R15-F4): a `${` followed by a blank, tab, newline or `|` runs its body as commands, up to the matching `}`.
+  // Parsed in place like `$( )`. One that never closes is truncated (the guard refuses a line it could not read to the end).
+  funsub(depth) {
+    const s = this.src;
+    const start = this.i;
+    const mark = this.log.length;
+    this.i += 2;
+    if (s[this.i] === '|') this.i++;
+    const closed = this.ownHeredocs(() => this.inGroup(() => this.nestParse(depth + 1, { stopAtBrace: true })));
+    if (!closed) this.ctx.truncated = true;
     this.subAcc.push(...this.log.slice(mark));
     return s.slice(start, this.i);
   }
@@ -2177,7 +2205,7 @@ class Parser {
       if (c === '$') {
         const nx = s[j + 1];
         if (nx === '(' || nx === "'") return -1;
-        if (nx === '{') { depth++; j++; }
+        if (nx === '{') { if (isFunsubAt(s, j)) return -1; depth++; j++; }
         continue;
       }
       if (c === "'") { j = s.indexOf("'", j + 1); if (j < 0) { j = n; return -1; } continue; }
@@ -2215,6 +2243,7 @@ class Parser {
         else if (nx === '"' || nx === '\\' || nx === '$' || nx === '`') { out += nx; this.i += 2; }
         else { out += '\\' + nx; this.i += 2; }
       } else if (c === '$' && nx === '(') { dyn = true; subText = this.substitution(depth); out += subText; subN++; }
+      else if (c === '$' && isFunsubAt(s, this.i)) { dyn = true; subText = this.funsub(depth); out += subText; subN++; }
       else if (c === '`') { dyn = true; subText = this.backtick(depth); out += subText; subN++; }
       else {
         if (c === '$' && nx !== undefined && DYN_AFTER_DOLLAR.test(nx)) dyn = true;
@@ -2279,28 +2308,29 @@ class Parser {
       const c = text[p.i];
       if (c === '\\') p.i += 2;
       else if (c === '$' && text[p.i + 1] === '(') p.substitution(depth);
+      else if (c === '$' && isFunsubAt(text, p.i)) p.funsub(depth);
       else if (c === '`') p.backtick(depth);
       else p.i++;
     }
     p.drain(true);
   }
 
-  parseList(depth, { stopAtParen = false, noRedir = false }) {
+  parseList(depth, { stopAtParen = false, noRedir = false, stopAtBrace = false }) {
     const ctx = this.ctx;
-    if (ctx.nest >= MAX_NEST) { ctx.stopped = true; ctx.truncated = true; this.i = this.src.length; return; }
+    if (ctx.nest >= MAX_NEST) { ctx.stopped = true; ctx.truncated = true; this.i = this.src.length; return false; }
     ctx.nest++;
     const saved = this.subAcc;
     this.subAcc = [];
     const base = this.ctlBase;
     this.ctlBase = this.ctlStack.length;
-    try { this.lex(depth, stopAtParen, noRedir); } finally {
+    try { return this.lex(depth, stopAtParen, noRedir, stopAtBrace); } finally {
       ctx.nest--; this.subAcc = saved;
       while (this.ctlStack.length > this.ctlBase) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); if (CTL_COUNTER[kind]) ctx.ctl[CTL_COUNTER[kind]]--; } // (left open: ends with the level)
       this.ctlBase = base;
     }
   }
 
-  lex(depth, stopAtParen, noRedir) {
+  lex(depth, stopAtParen, noRedir, stopAtBrace = false) {
     const ctx = this.ctx;
     const s = this.src;
     const n = s.length;
@@ -2523,6 +2553,7 @@ class Parser {
         startSeg();
         const nx = s[this.i + 1];
         if (nx === '(') { inWord = true; wdyn = true; const n0 = this.subAcc.length; const at = cur.length; cur += this.substitution(depth); wspans.push([at, cur.length]); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
+        else if (isFunsubAt(s, this.i)) { inWord = true; wdyn = true; const n0 = this.subAcc.length; const at = cur.length; cur += this.funsub(depth); wspans.push([at, cur.length]); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
         else if (nx === "'") { mark(); const r = readAnsiC(s, this.i + 1); cur += r.text; this.i = r.next; }
         else if (nx === '"') { mark(); this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; takeSubs(); }
         else if (nx === '{' && this.paramSpan(this.i) > 0) {
@@ -2653,7 +2684,12 @@ class Parser {
         endSeg(this.i);
         lastSep = ';';
         this.i++;
-        if (stopAtParen) return;
+        if (stopAtParen) return false;
+      } else if (stopAtBrace && c === '}' && !inWord && this.funsubCloses(s, this.i)) {
+        // the `}` that ends a `${ cmd; }`: a `}` word that no `{` group opened inside it is waiting for
+        endSeg(this.i);
+        this.i++;
+        return true;
       } else {
         startSeg();
         inWord = true;
@@ -2667,6 +2703,15 @@ class Parser {
     }
     if (lit > 0 && litGlob) { this.ctx.dynamic = true; this.qualifierCode(s.slice(gRaw), cur.slice(gCur), depth, false); } // never closed: cannot be delimited
     endSeg(n);
+    return false;
+  }
+
+  // At a `}` that starts a word inside a `${ }` body: it closes the body when it is a whole word and no `{` / function body opened inside the body is still open (the commands being lexed: ctlStack).
+  funsubCloses(s, at) {
+    const nx = s[at + 1];
+    if (!(nx === undefined || /[\s;&|()<>]/.test(nx))) return false;
+    for (let k = this.ctlStack.length - 1; k >= this.ctlBase; k--) if (this.ctlStack[k] === 'brace' || this.ctlStack[k] === 'fn' || this.ctlStack[k] === 'cbrace') return false;
+    return true;
   }
 
   // The code a glob group runs (see qualifierCodes): each string is parsed as commands one level deeper, like a `-c` string.
@@ -2746,6 +2791,7 @@ class Parser {
       else if (c === "'") { const j = s.indexOf("'", i + 1); i = j < 0 ? n : j + 1; }
       else if (c === '"' || (c === '$' && s[i + 1] === '"')) { this.i = i + (c === '$' ? 2 : 1); this.readDq(depth); i = this.i; }
       else if (c === '$' && s[i + 1] === '(') { this.i = i; this.substitution(depth); i = this.i; }
+      else if (isFunsubAt(s, i)) { this.i = i; this.funsub(depth); i = this.i; }
       else if (c === '`') { this.i = i; this.backtick(depth); i = this.i; }
       else if (c === '$' && s[i + 1] === "'") i = readAnsiC(s, i + 1).next;
       else if (c === '$' && s[i + 1] === '{' && this.paramSpan(i) > 0) i = this.paramSpan(i);

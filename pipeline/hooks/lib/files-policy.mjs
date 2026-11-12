@@ -1607,7 +1607,7 @@ const badLoopName = (n) => !PLAIN_NAME.test(n) || n === 'argv' || n === 'ARGV';
 const LOOP_HEAD_TEXT = /(?:^|[;&|(){}!`\n]|(?:^|[\s;&|(){}!`])(?:do|then|else|elif|if|while|until|time|nocorrect|noglob|coproc|exec|builtin|command|-|repeat[ \t]+\S+))[ \t]*(?:for|foreach|select)(?=[ \t])/g;
 const LOOP_HEADER_WINDOW = /[^;\n]{0,2000}/y; // (the header: up to the next `;` / newline, at most 2000 characters, found without slicing the rest of the text)
 // (#269 R14, owner decision 2026-11-12) The text the LOOP check reads: as written, except that a here-document body is data (a psql input `select 1;` is no loop). The parser's body spans (heredocSpans) say
-// where each body is: a body whose delimiter was quoted is left out; an unquoted one too, unless it holds `$(`, a backtick or `<(` / `>(` (the only places the shell runs commands in it), which keeps it whole.
+// where each body is: a body whose delimiter was quoted is left out; an unquoted one too, unless it holds `$(`, `${` + a blank, tab, newline or `|` (bash 5.3 / zsh `${ cmd; }`), a backtick or `<(` / `>(` (the only places the shell runs commands in it), which keeps it whole.
 // Any doubt (no spans, a span that overlaps, runs past the text or does not start a line) keeps the whole text. One linear pass; the `]]` check does not use this and reads every body.
 function loopCheckText(text, cmds) {
   if (!/<</.test(text)) return asWritten(text);
@@ -1617,7 +1617,7 @@ function loopCheckText(text, cmds) {
   let at = 0;
   for (const [a, b, quoted] of [...spans].sort((x, y) => x[0] - y[0])) {
     if (!(a >= at && b >= a && b <= text.length && (a === 0 || text[a - 1] === '\n'))) return asWritten(text);
-    if (!quoted && /\$\(|`|[<>]\(/.test(asWritten(text.slice(a, b)))) continue; // (kept: the body runs commands)
+    if (!quoted && /\$\(|\$\{[\s|]|`|[<>]\(/.test(asWritten(text.slice(a, b)))) continue; // (kept: the body runs commands)
     out += text.slice(at, a);
     at = b;
   }
@@ -3548,7 +3548,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
   if (closeBracketNotLast(cmds)) return deny('a command follows a closing ]] on the same piece (zsh\'s short `if [[ … ]] cmd` form), or ]] is an argument next to a [[: the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`');
   // (#269 R13-F1, R13-F2; owner decision 2026-11-12: text-level refusals, on top of the parser-based checks)
-  if (closeBracketFollowedByWord(raw)) return deny('a word follows a closing ]] on a line with a [[ (zsh\'s short `if [[ … ]] cmd` form, `<->` number patterns, a redirect): the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`');
+  if (closeBracketFollowedByWord(raw)) return deny('a word follows a closing ]] on a line with a [[ (zsh\'s short `if [[ … ]] cmd` form, `<->` number patterns, a redirect): the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`. The check reads quoted text and heredoc bodies too: put such text in a file written with the Write tool (`git commit -F FILE`, `gh … --body-file FILE`)');
   if (loopNameRefused(cmds) || loopNameRefusedText(raw, cmds)) return deny('a loop variable that is a positional parameter, argv, or a subscripted name cannot be followed by the guard; use a plain name');
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
