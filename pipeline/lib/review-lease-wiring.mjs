@@ -147,9 +147,9 @@ const PROCESS_ID = /^proc-[1-9][0-9]*-[0-9a-f]{8}$/;
 const SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 
 // The paths that skip bin/pipeline.mjs's finally (R4-2): an 'exit' listener (process.exit anywhere) and, for each of SIGINT / SIGTERM / SIGHUP that has NO listener
-// yet, one that closes synchronously and then, if it is still the only listener, removes itself and re-raises the signal (default death, the same status as
-// without a lease). When the command installed a handler of its own meanwhile (hold.mjs installRestoreOnSignal), that handler's process.exit reaches the 'exit'
-// close. -> the function that unregisters them all (called only after a successful close).
+// yet, one that, only while it is the sole listener, closes synchronously, removes itself and re-raises the signal (default death, the same status as without a
+// lease). When the command installed a handler of its own meanwhile (verify slot --run, hold.mjs installRestoreOnSignal) it does nothing: the command keeps running
+// and keeps its lease, and ends it through process.exit (the 'exit' close) or main's finally. -> the function that unregisters them all (called only after a successful close).
 async function registerExitClose(held, env) {
   const { closeLeaseSync } = await import('./review-lease.mjs');
   const close = () => {
@@ -161,11 +161,13 @@ async function registerExitClose(held, env) {
   for (const sig of SIGNALS) {
     if (process.listenerCount(sig) > 0) continue;
     const onSignal = () => {
-      close();
       if (process.listenerCount(sig) === 1 && process.listeners(sig)[0] === onSignal) {
+        close();
         process.removeListener(sig, onSignal);
         process.kill(process.pid, sig);
       }
+      // Another listener (verify slot --run forwards the signal to its child tree and waits; hold.mjs restores and exits) means the command keeps running: the
+      // lease stays until that path ends the process (the 'exit' close) or main's finally settles it (R4-F1).
     };
     process.on(sig, onSignal);
     handlers.push([sig, onSignal]);

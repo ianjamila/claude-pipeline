@@ -191,6 +191,62 @@ test('SIGINT (Ctrl-C) closes the lease and the process still dies of SIGINT, exa
   assert.deepEqual(files(t), [], 'the signal handler closed it before the default death');
 });
 
+// R4-F1: a command that installs its own signal listener after the lease (verify slot --run forwards the signal to its child tree and waits; hold.mjs's restore
+// handler exits later) keeps running after the signal, so its lease must stay until it ends: the lease handler closes only when it is the sole listener.
+function signalFixture(t, mode) {
+  const script = join(t.root, `signal-${mode}.mjs`);
+  const wiring = join(here, '..', 'pipeline', 'lib', 'review-lease-wiring.mjs');
+  writeFileSync(script, [
+    `import { holdReviewLease, settleReviewLease } from ${JSON.stringify(new URL(`file://${wiring.replace(/\\/g, '/')}`).href)};`,
+    "const ctx = { env: process.env, cwd: process.cwd() };",
+    "const lease = await holdReviewLease('state', ['show'], ctx);",
+    "if (!lease.held) { console.error(JSON.stringify(lease)); process.exit(9); }",
+    "if (process.argv[2] === 'second') {",
+    "  process.on('SIGINT', () => { setTimeout(() => process.exit(5), 600); }); // keeps running after the signal, exits by itself later (code 5: its own exit, not the signal's)",
+    "}",
+    "setInterval(() => {}, 1000); // stays alive until a signal (sole mode: only the lease handler listens, so it re-raises)",
+    "console.log('ready');",
+  ].join('\n'));
+  return script;
+}
+
+function spawnFixture(t, repo, script, mode) {
+  const child = spawn(process.execPath, [script, mode], { cwd: repo.dir, env: t.env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (d) => { stdout += d; });
+  child.stderr.on('data', (d) => { stderr += d; });
+  const done = new Promise((resolve) => child.on('close', (code, signal) => resolve({ code, signal, stdout, stderr })));
+  return { child, done, ready: () => until(() => stdout.includes('ready') || /\S/.test(stderr), 'the fixture to hold its lease') };
+}
+
+test('a command that keeps running after SIGINT (a second listener) keeps its lease until it exits', POSIX_ONLY, async () => {
+  const t = terminal();
+  const repo = reviewRepo();
+  const cmd = spawnFixture(t, repo, signalFixture(t, 'second'), 'second');
+  await cmd.ready();
+  assert.equal(procFiles(t).length, 1, `lease taken (${cmd.child.pid})`);
+  cmd.child.kill('SIGINT');
+  await new Promise((r) => setTimeout(r, 250));
+  assert.equal(cmd.child.exitCode, null, 'the process is still running');
+  assert.equal(procFiles(t).length, 1, 'the lease is still on record while the command runs after the signal');
+  const out = await cmd.done;
+  assert.equal(out.code, 5, `its own handler's exit, not the signal (${out.signal}) ${out.stderr}`);
+  assert.deepEqual(files(t), [], 'the exit handler closed it when the process ended');
+});
+
+test('the sole signal listener still closes the lease and re-raises (died of the signal)', POSIX_ONLY, async () => {
+  const t = terminal();
+  const repo = reviewRepo();
+  const cmd = spawnFixture(t, repo, signalFixture(t, 'sole'), 'sole');
+  await cmd.ready();
+  assert.equal(procFiles(t).length, 1);
+  cmd.child.kill('SIGINT');
+  const out = await cmd.done;
+  assert.equal(out.signal, 'SIGINT', `killed by the signal (${out.code})`);
+  assert.deepEqual(files(t), []);
+});
+
 test('SIGTERM closes the lease and the process dies of SIGTERM', POSIX_ONLY, async () => {
   const t = terminal();
   const repo = reviewRepo();
