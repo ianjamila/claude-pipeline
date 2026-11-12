@@ -565,7 +565,7 @@ async function secondReview(rest, ctx) {
   const packetId = packetIdOf({ ids, head: asked.head, findings: asked.snapshot.digest, finals: asked.snapshot.finals });
   const routeFile = routeFileFor(packetId);
   const attempt = await startAttempt({
-    root, round: n, head: asked.head, risk: asked.maxRisk, agent: asked.agent, file: routeFile,
+    root, pr, ctx, round: n, head: asked.head, risk: asked.maxRisk, agent: asked.agent, file: routeFile,
     extra: { kind: 'second-review', ids: [...ids].sort(), packetId, findingsDigest: asked.snapshot.digest, finalsSha256: sha256(asked.snapshot.finals) },
   });
   const failAttempt = (final) => finishAttempt({ root, pr, ctx, round: n, attempt, final, files: [], file: routeFile });

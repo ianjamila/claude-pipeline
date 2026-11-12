@@ -1,7 +1,7 @@
 // .review/round-R/route.json: the ONE record of how a Codex attempt for a round went and whether a Claude substitute may stand in for it
 // (plan 2026-11-11-codex-substitute-reviewer, R4-10, R4-12, R5-7). Its lifecycle:
 //
-//   start   every codex-review attempt first replaces route.json atomically (write-then-rename, WITHOUT the review lock: Codex itself runs unlocked) with
+//   start   every codex-review attempt first replaces route.json atomically (write-then-rename, under the review lock for that write only: Codex itself runs unlocked) with
 //           { attemptId, evidence: 'pending', round, base, head, patchSha256, risk, agent, at }, so evidence from an earlier attempt is gone before
 //           Codex runs. The attempt's files live in round-R/attempt-<attemptId>/ (codex-raw.json, prompt.md): a later attempt can neither read nor
 //           remove them.
@@ -51,14 +51,15 @@ export function assertCurrentAttempt(root, round, attemptId, file = ROUTE_FILE) 
 
 // Atomically replaces route.json with a fresh pending record and makes the attempt's folder. -> { attemptId, dir, route }.
 // `extra` adds fields to the record (a second review's kind, ids and packet identity); `file` is the record's name.
-export async function startAttempt({ root, round, base, head, patchSha256, risk, agent, now = Date.now(), file = ROUTE_FILE, extra = {} }) {
+export async function startAttempt({ root, pr, ctx, round, base, head, patchSha256, risk, agent, now = Date.now(), file = ROUTE_FILE, extra = {} }) {
   const attemptId = newAttemptId();
   const route = { attemptId, evidence: 'pending', round, base, head, patchSha256, risk, agent, ...extra, at: new Date(now).toISOString() };
   const dir = attemptDir(root, round, attemptId);
-  // No review lock: the review lock is held only to record a round, never while Codex runs. The rename is atomic; the compare-and-swap that needs the lock is the final write.
+  // The review lock is taken for this one write only (never while Codex runs): the final write is a compare-and-swap under the lock, and a pending record installed between its
+  // compare and its write would be overwritten by the older attempt (R1-B2).
   ensureRoundDir(root, round);
   mkdirSync(dir, { recursive: true });
-  writeJson(routeFile(root, round, file), route);
+  await withReviewLock(root, pr, ctx, () => writeJson(routeFile(root, round, file), route));
   return { attemptId, dir, route };
 }
 
