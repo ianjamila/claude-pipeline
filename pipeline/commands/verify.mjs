@@ -461,8 +461,9 @@ async function slotCommand(rest, ctx) {
   if (!verdict.allow) return { exitCode: EXIT.FAILED, output: { ok: false, refused: true, reason: verdict.reason } };
   const poll = Number(env.PIPELINE_SLOT_POLL_MS);
   const code = await runWithSlot({ command, cwd: root, n, maxLoad, maxLoadWaitMinutes, lockDir, env, ...(poll > 0 ? { pollMs: poll } : {}) });
-  // The verify's own output owns stdout, so no JSON result is printed: leave with its exit code directly.
-  process.exit(code);
+  // The verify's own output owns stdout, so no JSON result is printed: a silent result carries its exit code (cli.mjs emit) instead of process.exit, so the
+  // dispatcher's finally still closes the review lease.
+  return { exitCode: code, output: {}, silent: true };
 }
 
 export const run = guarded(async (argv, ctx) => {

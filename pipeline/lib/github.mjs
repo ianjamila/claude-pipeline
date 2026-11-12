@@ -11,6 +11,10 @@ import { resolve } from 'node:path';
 // A hung gh must never hang the pipeline: a call that outlives this is a failure.
 const CALL_TIMEOUT_MS = 60_000;
 const PER_PAGE = 30;
+// The follow-up creator scan pages through every issue and PR an account ever opened in the repo (#268): 100 per page,
+// and its own, longer limit for that one paginated call. Every other call keeps CALL_TIMEOUT_MS.
+const SCAN_PER_PAGE = 100;
+const SCAN_TIMEOUT_MS = 180_000;
 
 // ---- GraphQL: paged pull request lists -----------------------------------------------------------
 // Page size 20: a bigger page can trip GitHub's node limit on heavy queries.
@@ -90,7 +94,7 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
   let repoIdCache; // undefined = not read yet
   let viewerCache = null;
 
-  const exec = (args, { input } = {}) => ghFn(args, { cwd, env, input, timeoutMs: CALL_TIMEOUT_MS });
+  const exec = (args, { input, timeoutMs = CALL_TIMEOUT_MS } = {}) => ghFn(args, { cwd, env, input, timeoutMs });
   const failure = (r, args) => {
     const err = new GhError({ code: r.code, stderr: r.stderr, args, timedOut: r.timedOut, overBuffer: r.overBuffer === true });
     err.stdout = r.stdout;
@@ -241,9 +245,12 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     // Every issue `creator` opened, open AND closed by default, whatever its page and WHATEVER ITS LABELS: the follow-up
     // dedupe must still see an issue the owner promoted (relabelled agent-suggestion -> agent-build) or closed. This is the
     // REST list, not the search API, which lags behind a just-created issue. It returns pull requests too; they are dropped.
-    listIssuesByCreator({ creator, state = 'all' }) {
-      const args = ['api', `repos/${self.repo().slug}/issues?creator=${encodeURIComponent(creator)}&state=${encodeURIComponent(state)}&per_page=${PER_PAGE}`, '--paginate'];
-      const r = ok(args);
+    // `since` (a UTC ISO instant) keeps only issues UPDATED at or after it, so a caller that knows when its issues can first
+    // exist skips years of history; a promoted or closed issue was updated later still, so it stays in view.
+    listIssuesByCreator({ creator, state = 'all', since }) {
+      const bound = since === undefined ? '' : `&since=${encodeURIComponent(since)}`;
+      const args = ['api', `repos/${self.repo().slug}/issues?creator=${encodeURIComponent(creator)}&state=${encodeURIComponent(state)}&per_page=${SCAN_PER_PAGE}${bound}`, '--paginate'];
+      const r = ok(args, { timeoutMs: SCAN_TIMEOUT_MS });
       let list;
       try {
         list = parseConcatenatedJson(r.stdout);

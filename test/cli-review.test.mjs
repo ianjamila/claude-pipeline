@@ -22,6 +22,7 @@ import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { SHARED_FLOOR_DIR, floorEnv, scratchFloorDir } from './helpers/floor-env.mjs';
 import { resetFloor } from '../pipeline/lib/model-floor.mjs';
+import { leasesDir } from '../pipeline/lib/review-lease.mjs';
 import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
@@ -58,7 +59,7 @@ const standardFindings = () => findingsOf(
 // What `followups create` asks before it files anything: who we are and which issues of ours exist (none).
 const noIssues = (slug) => [
   { match: '^api user', stdout: 'me\n' },
-  { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=30 --paginate`, stdout: '[]' },
+  { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=100 --paginate`, stdout: '[]' },
 ];
 const NO_ISSUES = noIssues('acme/widgets');
 
@@ -148,7 +149,7 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
       const r = spawnSync(process.execPath, [useBin, ...args], { cwd: repo.dir, env: merged, encoding: 'utf8' });
       let json = null;
       try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* leave null: the assertion on json will say so */ }
-      return { code: r.status, json, stdout: r.stdout, stderr: r.stderr };
+      return { code: r.status, json, stdout: r.stdout, stderr: r.stderr, pid: r.pid };
     },
     file(name, content) {
       const p = join(scratch, name);
@@ -2073,7 +2074,7 @@ test('a full round: codex -> judge -> arbiter -> implement -> follow-ups -> clea
     gh: [
       ...GH, REMOVE_LABEL,
       { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 21, html_url: url } },
-      { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=30 --paginate', stdout: '[]' },
+      { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=100 --paginate', stdout: '[]' },
       { match: '^api user', stdout: 'me\n' },
       { match: 'issues/7/comments --paginate', stdoutJson: [] },
       { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 5, html_url: 'https://github.com/acme/widgets/pull/7#issuecomment-5' } },
@@ -2515,6 +2516,12 @@ test('arbiter apply: an installed copy ignores PIPELINE_TEST_MODE (with a warnin
   const r = arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs'), ...noClaudeSession() } });
   assertAllNeedHuman(w, r, /unexpected model claude-opus-5-1/);
   assert.match(r.stderr, /ignoring PIPELINE_TEST_MODE/);
+  // R4-6: an installed copy ignores PIPELINE_REVIEW_LEASE_DIR, so this child (a plain process: noClaudeSession) took a REAL, momentary process lease and real admission in the
+  // account's folder - no opt-out is wanted here, it is the path the owner's terminal takes. It must have closed it: no proc-* file of that child's pid is left. (If a real
+  // update holds admission while this runs, the child waits up to 20 s and then refuses with update-in-progress; the assertions above would fail loudly rather than hang.)
+  const leaseFolder = leasesDir();
+  const left = existsSync(leaseFolder) ? readdirSync(leaseFolder).filter((n) => n.startsWith(`proc-${r.pid}-`)) : [];
+  assert.deepEqual(left, [], `the child's process lease was closed (${leaseFolder})`);
 });
 
 test('arbiter apply: PIPELINE_ARBITER_MODEL_OVERRIDE never relaxes the proof, not even for a model that looks right', (t) => {
@@ -2840,7 +2847,7 @@ test('triage settle: a passing test that dismisses a security item still goes to
 
 // ---- review replay: published state wins (state show --pr, discard-round) ---------------------------------
 
-const ISSUES_URL = '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=30 --paginate';
+const ISSUES_URL = '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=100 --paginate';
 const COMMENTS = (...comments) => [
   { match: '^api user', stdout: 'me\n' },
   { match: 'issues/7/comments --paginate', stdoutJson: comments },
@@ -3165,6 +3172,67 @@ test('followups create: an issue-list outage is exit 3 and nothing is filed', (t
   assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
   assertExit(w.cli(['followups', 'create', '--round', '1']), 3);
   assert.equal(posts(w).length, 0, 'never create blind when the duplicate check could not run');
+});
+
+// #268: the creator scan is bounded by the PR's creation time (minus an hour) when it can be read.
+const GH_CREATED = (createdAt) => [{ match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x', createdAt } }, GH[1]];
+function sinceWorld(t, createdAt, issues, { issuesReply } = {}) {
+  const w = world(t, {
+    gh: [...GH_CREATED(createdAt), { match: '^api user', stdout: 'me\n' }, { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=100', ...(issuesReply ?? { stdoutJson: issues }) },
+      { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 50, html_url: 'https://github.com/acme/widgets/issues/50' } }],
+  });
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other', testable: false })])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  return w;
+}
+const scanLines = (w) => w.fake.lines().filter((l) => /issues\?creator=me/.test(l));
+
+test('followups create: the creator scan asks for 100 per page and only issues updated since the PR was created, minus an hour (UTC)', (t) => {
+  const w = sinceWorld(t, '2026-11-10T09:30:00+08:00', []);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(scanLines(w), ['api repos/acme/widgets/issues?creator=me&state=all&per_page=100&since=2026-11-10T00%3A30%3A00Z --paginate']);
+  assert.ok(w.fake.lines().includes('pr view 7 --json createdAt'), 'one call reads the PR creation time');
+  assert.equal(r.json.created.length, 1);
+});
+
+test('followups create: a missing, unparsable, future or unreadable createdAt means the full scan (no since), never a failure', (t) => {
+  const future = new Date(Date.now() + 86_400_000).toISOString();
+  for (const createdAt of [undefined, null, '', 'not a date', '2', '2026-11-10', 12345, future]) {
+    const w = sinceWorld(t, createdAt, []);
+    const r = w.cli(['followups', 'create', '--round', '1']);
+    assertExit(r, 0, String(createdAt) + r.stderr + r.stdout);
+    assert.deepEqual(scanLines(w), ['api repos/acme/widgets/issues?creator=me&state=all&per_page=100 --paginate'], String(createdAt));
+    assert.equal(r.json.created.length, 1);
+  }
+  // the lookup itself failing
+  const w = world(t, { gh: [{ match: '^pr view 7 --json createdAt', code: 1, stderr: 'HTTP 502' }, ...GH, { match: '^api user', stdout: 'me\n' },
+    { match: ISSUES_URL, stdoutJson: [] }, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 50, html_url: 'https://github.com/acme/widgets/issues/50' } }] });
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other', testable: false })])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(scanLines(w), ['api repos/acme/widgets/issues?creator=me&state=all&per_page=100 --paginate']);
+  assert.equal(r.json.created.length, 1);
+});
+
+test('followups create: with a since bound an earlier issue for this PR (even promoted and closed) is still found, never filed twice', (t) => {
+  const marker = FP_ISSUE(followupWorld(t, []));
+  const w = sinceWorld(t, '2026-11-10T09:30:00Z', [issue(90, `${marker}\nbody`, { state: 'closed', labels: [{ name: 'agent-build' }] })]);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.reused, [{ id: 'R1-W1', number: 90, url: 'https://github.com/acme/widgets/issues/90' }]);
+  assert.equal(posts(w).length, 0);
+  assert.match(scanLines(w)[0], /&since=2026-11-10T08%3A30%3A00Z /);
+});
+
+test('followups create: a page failing mid-pagination is the existing exit 3 and nothing is filed', (t) => {
+  const w = sinceWorld(t, '2026-11-10T09:30:00Z', null, { issuesReply: { code: 1, stdout: '[{"number":1,"user":{"login":"me"},"body":"x"}]', stderr: 'gh: HTTP 502 (page 3)' } });
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 3, r.stderr + r.stdout);
+  assert.match(r.stderr + r.stdout, /HTTP 502/);
+  assert.equal(posts(w).length, 0, 'never create blind when the duplicate check could not finish');
+  assert.equal(w.item('R1-W1').followupIssue ?? null, null);
 });
 
 // ---- model proofs travel in the state ---------------------------------------------------------------------
