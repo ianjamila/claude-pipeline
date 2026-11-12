@@ -26,7 +26,7 @@ const world = (t, { withLog = true } = {}) => {
   mkdirSync(join(codexHome, 'sessions', '2026', '11', '11'), { recursive: true });
   if (withLog) writeFileSync(join(codexHome, 'sessions', '2026', '11', '11', 'rollout-a.jsonl'), `${REAL_LINE}\n`);
   const record = { dir: join(root, 'record') };
-  return { root, codexHome, record, env: { CODEX_HOME: codexHome } };
+  return { root, codexHome, record, env: { PIPELINE_CODEX_HOME: codexHome } };
 };
 
 // A fake clock: sleep() advances it, and every sleep is recorded.
@@ -58,7 +58,7 @@ test('unreadable telemetry is source unknown with null figures, exit 0, and the 
   assert.deepEqual([output.ok, output.weeklyUsedPct, output.windowMinutes, output.resetsAt, output.observedAt, output.source, output.lastOutage], [true, null, null, null, null, 'unknown', null]);
   assert.equal(output.waiting.length, 1);
   const none = world(t, { withLog: false });
-  assert.equal((await run([], { env: { CODEX_HOME: join(none.root, 'missing') }, record: none.record, now: () => NOW })).output.source, 'unknown');
+  assert.equal((await run([], { env: { PIPELINE_CODEX_HOME: join(none.root, 'missing') }, record: none.record, now: () => NOW })).output.source, 'unknown');
 });
 
 test('reading writes nothing: no record file, no folder, and the session logs are untouched', async (t) => {

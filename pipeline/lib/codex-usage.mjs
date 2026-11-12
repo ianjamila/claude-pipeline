@@ -1,15 +1,14 @@
 // How much of Codex's WEEKLY quota is used, when it resets, the last quota outage and the PRs waiting for Codex (plan 2026-11-11-codex-substitute-reviewer,
 // B1 and R4-9). Two sources:
-//   1. readWeeklyUsage(): Codex's own session logs, `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`. Their `token_count` events carry
+//   1. readWeeklyUsage(): Codex's own session logs, `<account home>/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. Their `token_count` events carry
 //      `payload.rate_limits = {limit_id, primary: {used_percent, window_minutes, resets_at}}` (Codex CLI 0.154). That is Codex's private log format, read
 //      as best effort: anything that does not fit is ignored and the answer is `source: 'unknown'`. It never throws.
 //   2. A machine-global record, `<account home>/.claude/pipeline-state/codex/status.json`, that the pipeline keeps: the last quota outage and the PRs
 //      parked until Codex is back. Written under a lock (locks.mjs withLock, as the model floor registry is) with write-then-rename, so concurrent
 //      sessions never lose each other's entries and a reader never sees half a file.
 // Nothing in here decides a review; it only reports. Wiring into codex-review / review-complete / hooks is a later task.
-import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { codexHomeDir } from './codex-session.mjs';
 import { withLock } from './locks.mjs';
 import { accountHome } from './paths.mjs';
 import { seamValue } from './seams.mjs';
@@ -117,12 +116,32 @@ function newestObservationIn(file, nowMs) {
   }
 }
 
+// The folder the governor reads: the ACCOUNT's own Codex home (<accountHome()>/.codex, never $HOME), or null. $CODEX_HOME is caller-controlled: a log an agent
+// writes anywhere it can and points CODEX_HOME at would fake "the weekly quota is spent" and so steer which reviewer a round gets. So a CODEX_HOME that names
+// any other folder turns the governor OFF (null: the reading is unknown, Codex runs), it is never trusted. PIPELINE_CODEX_HOME (a test seam, honoured by a
+// repo checkout only, seams.mjs) names a scratch home for the test suite.
+export const PIPELINE_CODEX_HOME_ENV = 'PIPELINE_CODEX_HOME';
+const same = (a, b) => {
+  const real = (p) => { try { return realpathSync.native(p); } catch { return path.resolve(p); } };
+  return real(a) === real(b);
+};
+export function governorCodexHome({ env = process.env, home } = {}) {
+  const seam = seamValue(PIPELINE_CODEX_HOME_ENV, env);
+  if (seam) return path.resolve(seam);
+  const own = path.join(home ?? accountHome(), '.codex');
+  const named = env?.CODEX_HOME;
+  if (typeof named === 'string' && named.trim() !== '' && !same(named, own)) return null;
+  return own;
+}
+
 // -> { weeklyUsedPct, windowMinutes, resetsAt (ISO), observedAt (ISO, the event's own time), source: 'codex-sessions' } or the same keys null with
 // source 'unknown'. The newest event wins by its OWN timestamp across the scanned files (a newer-mtime file can hold an older event). Never throws.
-export function readWeeklyUsage({ env = process.env, now = Date.now(), dayFolders, maxFiles } = {}) {
+export function readWeeklyUsage({ env = process.env, now = Date.now(), home, dayFolders, maxFiles } = {}) {
   try {
     const nowMs = toMs(now);
-    const sessions = path.join(codexHomeDir(env), 'sessions');
+    const codexHome = governorCodexHome({ env, home });
+    if (codexHome === null) return { ...UNKNOWN };
+    const sessions = path.join(codexHome, 'sessions');
     let best = null;
     for (const { file } of newestSessionFiles(sessions, { dayFolders, maxFiles })) {
       const o = newestObservationIn(file, nowMs);

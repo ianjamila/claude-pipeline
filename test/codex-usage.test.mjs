@@ -43,7 +43,7 @@ const event = ({ at, limitId, primary, ...rest } = {}) => {
   if (primary !== undefined) e.payload.rate_limits.primary = primary === null ? null : { ...e.payload.rate_limits.primary, ...primary };
   return Object.assign(e, rest);
 };
-const read = (home, now = NOW) => readWeeklyUsage({ env: { CODEX_HOME: home }, now });
+const read = (home, now = NOW) => readWeeklyUsage({ env: { PIPELINE_CODEX_HOME: home }, now });
 const UNKNOWN = { weeklyUsedPct: null, windowMinutes: null, resetsAt: null, observedAt: null, source: 'unknown' };
 
 // ---- (29) the log reader ---------------------------------------------------------------------------------------------------------------------
@@ -112,11 +112,11 @@ test('a reset that is not after the event, or has already passed, makes the read
   assert.equal(at(undefined).source, 'unknown');
   // reset-boundary: a reading is current only while the reset is still ahead
   const home = codexHome(t, { 'r.jsonl': { lines: [REAL_LINE] } });
-  assert.equal(readWeeklyUsage({ env: { CODEX_HOME: home }, now: RESETS_MS - 1 }).source, 'unknown', 'older than 6 h anyway');
+  assert.equal(readWeeklyUsage({ env: { PIPELINE_CODEX_HOME: home }, now: RESETS_MS - 1 }).source, 'unknown', 'older than 6 h anyway');
   const fresh = codexHome(t, { 'r.jsonl': { lines: [event({ at: RESETS_MS - 60_000 })] } });
-  assert.equal(readWeeklyUsage({ env: { CODEX_HOME: fresh }, now: RESETS_MS - 1 }).source, 'codex-sessions');
-  assert.equal(readWeeklyUsage({ env: { CODEX_HOME: fresh }, now: RESETS_MS }).source, 'unknown', 'at the reset instant the reset is no longer ahead');
-  assert.equal(readWeeklyUsage({ env: { CODEX_HOME: fresh }, now: RESETS_MS + 1 }).source, 'unknown');
+  assert.equal(readWeeklyUsage({ env: { PIPELINE_CODEX_HOME: fresh }, now: RESETS_MS - 1 }).source, 'codex-sessions');
+  assert.equal(readWeeklyUsage({ env: { PIPELINE_CODEX_HOME: fresh }, now: RESETS_MS }).source, 'unknown', 'at the reset instant the reset is no longer ahead');
+  assert.equal(readWeeklyUsage({ env: { PIPELINE_CODEX_HOME: fresh }, now: RESETS_MS + 1 }).source, 'unknown');
 });
 
 test('the newest event wins by its own timestamp, even when the newer-mtime file holds the older event', (t) => {
@@ -136,15 +136,15 @@ test('only the newest files by mtime are scanned (a bounded scan)', (t) => {
   const files = { 'rollout-old.jsonl': { lines: [REAL_LINE], mtime: NOW - 3 * 3600_000 } };
   for (let i = 0; i < 3; i++) files[`rollout-new-${i}.jsonl`] = { lines: [{ type: 'session_meta' }], mtime: NOW - i * 60_000 };
   const home = codexHome(t, files);
-  assert.equal(readWeeklyUsage({ env: { CODEX_HOME: home }, now: NOW, maxFiles: 3 }).source, 'unknown', 'the 3 newest files hold no reading');
-  assert.equal(readWeeklyUsage({ env: { CODEX_HOME: home }, now: NOW, maxFiles: 4 }).source, 'codex-sessions');
+  assert.equal(readWeeklyUsage({ env: { PIPELINE_CODEX_HOME: home }, now: NOW, maxFiles: 3 }).source, 'unknown', 'the 3 newest files hold no reading');
+  assert.equal(readWeeklyUsage({ env: { PIPELINE_CODEX_HOME: home }, now: NOW, maxFiles: 4 }).source, 'codex-sessions');
 });
 
 test('only the newest date folders are listed, and a huge file is read from its tail', (t) => {
   const home = codexHome(t, { 'r.jsonl': { lines: [REAL_LINE] } }, '2026/11/01');
   for (const day of ['02', '03', '04', '05']) mkdirSync(join(home, 'sessions', '2026', '11', day), { recursive: true });
   assert.equal(read(home).source, 'unknown', 'five newer (empty) day folders push 11/01 out of the scan');
-  assert.equal(readWeeklyUsage({ env: { CODEX_HOME: home }, now: NOW, dayFolders: 10 }).source, 'codex-sessions');
+  assert.equal(readWeeklyUsage({ env: { PIPELINE_CODEX_HOME: home }, now: NOW, dayFolders: 10 }).source, 'codex-sessions');
   const filler = JSON.stringify({ type: 'response_item', payload: { text: 'x'.repeat(4000) } });
   const big = codexHome(t, { 'r.jsonl': { lines: [REAL_LINE, ...Array(300).fill(filler)] } });
   assert.equal(read(big).source, 'unknown', 'the reading is before the last 512 KB, which is all that is read');
@@ -273,4 +273,17 @@ test('backAtMs: the later of the outage reset (2 h after `at` when it has none) 
   assert.equal(backAtMs({ lastOutage: { at, resetAt: null } }, Date.parse(at) + 2 * 3600_000), null);
   assert.equal(backAtMs({ lastOutage: null, weeklyUsedPct: 100, resetsAt: '2026-11-18T00:00:00.000Z' }, nowMs), Date.parse('2026-11-18T00:00:00Z'));
   assert.equal(backAtMs({ lastOutage: { at, resetAt: reset }, weeklyUsedPct: 100, resetsAt: '2026-11-18T00:00:00.000Z' }, nowMs), Date.parse('2026-11-18T00:00:00Z'));
+});
+
+// ---- R1-B1: the governor trusts only the account's own Codex home -----------------------------------------------------------------------------
+test('the weekly reading comes from <account home>/.codex only: a CODEX_HOME elsewhere (a forged log) is no evidence', (t) => {
+  const account = scratch(t);
+  const own = join(account, '.codex', 'sessions', '2026', '11', '11');
+  mkdirSync(own, { recursive: true });
+  writeFileSync(join(own, 'rollout-a.jsonl'), `${REAL_LINE}\n`);
+  const forged = codexHome(t, { 'rollout-f.jsonl': { lines: [event({ primary: { used_percent: 100 } })] } });
+  assert.equal(readWeeklyUsage({ env: {}, home: account, now: NOW }).weeklyUsedPct, 4, 'no CODEX_HOME: the account home is read');
+  assert.equal(readWeeklyUsage({ env: { CODEX_HOME: join(account, '.codex') }, home: account, now: NOW }).weeklyUsedPct, 4, 'CODEX_HOME naming the same folder is fine');
+  assert.deepEqual(readWeeklyUsage({ env: { CODEX_HOME: forged }, home: account, now: NOW }), UNKNOWN, 'CODEX_HOME elsewhere: governor off, the account log is not substituted either');
+  assert.deepEqual(readWeeklyUsage({ env: { CODEX_HOME: forged }, home: join(scratch(t), 'empty'), now: NOW }), UNKNOWN);
 });

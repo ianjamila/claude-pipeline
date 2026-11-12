@@ -18,7 +18,7 @@ function world(t, { review = '', yml = "", max = 5 } = {}) {
   const home = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-effort-home-')));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   w.home = home;
-  w.env = { CODEX_HOME: home };
+  w.env = { CODEX_HOME: home, PIPELINE_CODEX_HOME: home };
   // a weekly reading in Codex's own session logs: used_percent p, observed now, resetting in two days
   w.usage = (p) => {
     const day = new Date();
