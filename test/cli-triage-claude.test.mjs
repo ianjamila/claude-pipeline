@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { createCommentsGh, createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createCommentsGh, createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { decodeFromComment } from '../pipeline/lib/state.mjs';
 import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
@@ -61,6 +61,7 @@ function world(t, { yml = CHAT_YML, slug = 'acme/widgets', comments = false } = 
     { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: head } },
     { match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: slug, url: `https://github.com/${slug}` } },
     { match: '^pr edit 7 ', code: 0 },
+    ...NO_COMMENTS,
   ]);
   const lockDir = join(scratch, 'locks');
   const w = {

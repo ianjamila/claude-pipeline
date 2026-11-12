@@ -12,7 +12,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { scratchFloorDir } from './helpers/floor-env.mjs';
-import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { raiseFloor, readFloor, resetFloor, withFloorLock } from '../pipeline/lib/model-floor.mjs';
 
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id'; // the in-process floor lock must not create a machine-id file in the real pipeline state folder
@@ -41,6 +41,7 @@ const FINDINGS = {
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x' } },
   { match: '^repo view', stdoutJson: REPO_VIEW },
+  ...NO_COMMENTS,
 ];
 const JUDGE = {
   items: Object.entries({ 'R1-B1': ['ACCEPT'], 'R1-S1': ['REJECT', 'high'], 'R1-S2': ['REJECT', 'low'], 'R1-W1': ['FOLLOW-UP'] }).map(([id, [decision, confidence = 'high']]) => ({

@@ -2940,7 +2940,8 @@ function publishedWorld(t) {
   assertExit(w.judge(1, STANDARD_JUDGE), 0);
   const published = w.state();
   const script = JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8'));
-  w.fake.setScript([...script, ...COMMENTS(mine(published))]);
+  // (the comments come FIRST: the world's own script ends with the empty-comments fallback, and the first match wins)
+  w.fake.setScript([...COMMENTS(mine(published)), ...script]);
   return { w, published };
 }
 const staleDirs = (w) => readdirSync(join(w.repo.dir, '.review')).filter((n) => n.startsWith('stale-'));
@@ -3965,7 +3966,7 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   const published = w.state();
   const markerTree = published.rounds[1].reviewBase;
   const roundPatch = patchOf(w, 2);
-  w.fake.setScript([...JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')), REMOVE_LABEL, ...COMMENTS(mine(published)), REVIEW_COMMENT[2],
+  w.fake.setScript([...COMMENTS(mine(published)), ...JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')), REMOVE_LABEL, REVIEW_COMMENT[2],
     { match: '^api -X PATCH repos/acme/widgets/issues/comments/9 ', stdoutJson: { id: 9, html_url: 'u9' } }]); // review-complete publishes the state first
 
   // A fresh clone (--no-local: a local clone would copy every object): only the objects reachable from a branch come along, so the marker tree is not there.

@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { scratchFloorDir } from './helpers/floor-env.mjs';
-import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { withFloorLock } from '../pipeline/lib/model-floor.mjs';
 import { arbiterFailures, roundOutcome } from '../pipeline/lib/triage.mjs';
 import { triageComment } from '../pipeline/lib/render.mjs';
@@ -32,6 +32,7 @@ const ONE_FINDING = { ...NO_FINDINGS, suggestions: [finding({ title: 'Rename hel
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x' } },
   { match: '^repo view', stdoutJson: REPO_VIEW },
+  ...NO_COMMENTS,
 ];
 const fenced = (obj) => `Done.\n\n\`\`\`json\n${JSON.stringify(obj)}\n\`\`\``;
 
