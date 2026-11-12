@@ -675,8 +675,14 @@ function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, w
       }
     };
     const trusted = trustedBaseConfig(root, config);
-    if (trusted.problem) warnings.push(`the trusted base config could not be read (${asciiLine(trusted.problem, 120)}): only the working-tree sensitive paths are checked`);
-    follow = deferEligibility(state, config, diff.files, { grants: readable(grants), grantGap: readable(grantGap), baseConfig: trusted.config });
+    if (trusted.problem) {
+      // `defer-fixes` refuses on this (severity cannot be judged without the trusted lists), so the ask must not offer the path it would then refuse.
+      const refusal = `severity could not be judged: the trusted base config is unreadable (${asciiLine(trusted.problem, 120)})`;
+      warnings.push(refusal);
+      follow = { eligible: false, refusals: [refusal], ids: [], severities: [] };
+    } else {
+      follow = deferEligibility(state, config, diff.files, { grants: readable(grants), grantGap: readable(grantGap), baseConfig: trusted.config });
+    }
   } catch (err) {
     follow = { eligible: false, refusals: [`severity could not be judged (${asciiLine(err?.message, 120)})`], ids: [], severities: [] };
     if (!warnings.some((w) => w.startsWith('severity could not be judged'))) warnings.push(follow.refusals[0]);
