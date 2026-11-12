@@ -33,7 +33,7 @@ const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its r
 const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
-const SENSITIVE_WORDS = /\.claude|\.codex\W+sessions|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|substitute-attempts|prod-before|[\w.-]*smoke)/i;
+const SENSITIVE_WORDS = /\.claude|\.codex(?:\/*(?![\w.\-\/])|\W+sessions)|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|substitute-attempts|prod-before|[\w.-]*smoke)/i;
 
 // ---- the protected set ------------------------------------------------------------------------
 
@@ -902,9 +902,9 @@ function ancestorRegexes(ctx) {
 
 // The protected files named by their tail (`.claude/settings.json`), whatever lies in front of it.
 const SEP = "(?=[ \\t]*[/'\"`,+])[/'\"`,+ \\t]+"; // between pieces of a code-built path: '.claude', 'skills', 'ship'
-function suffixBody(sep) {
+function suffixBody(sep, bareCodex = '') {
   const end = '(?![\\w.\\-])';
-  return `(?:\\.codex${sep}sessions${end}|\\.claude${sep}(?:settings\\.json${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter|arbiter-fix|substitute-opus|substitute-fable)\\.md${end}))`;
+  return `(?:${bareCodex}\\.codex${sep}sessions${end}|\\.claude${sep}(?:settings\\.json${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter|arbiter-fix|substitute-opus|substitute-fable)\\.md${end}))`;
 }
 // ...preceded by something only known at run time: a variable, a command substitution, a template `${...}`, a call
 // result `)`, a `+` or `,` joining pieces, `~user`, `.join(` / `.joinpath(`.
@@ -912,10 +912,12 @@ const NONLIT_PREFIX = "(?:[})\\]]|\\$\\w+|~\\w*|[+,][ \\t]*|join(?:path)?\\([ \\
 // ...or preceded by a plain relative prefix (`.claude/x`, `../.claude/x`, `sub/.claude/x`), resolved against the directories in play.
 const REL_PREFIX = '(?<![\\w$.~/\\\\-])(?:[\\w.\\-]+/+)*';
 
+// (cp #256 R6-F1: the ~/.codex folder itself behind a prefix only known at run time, `cp -R /tmp/forged/. "$(echo ~)/.codex"`; a relative one is judged by the resolved-path checks)
+const CODEX_DIR = '\\.codex/*(?![\\w.\\-/])|';
 function suffixRegexes(ci) {
   const flags = ci ? 'i' : '';
   return {
-    nonlit: new RegExp(NONLIT_PREFIX + suffixBody(SEP), flags),
+    nonlit: new RegExp(NONLIT_PREFIX + suffixBody(SEP, CODEX_DIR), flags),
     rel: new RegExp(REL_PREFIX + suffixBody('/+'), `g${flags}`),
   };
 }
