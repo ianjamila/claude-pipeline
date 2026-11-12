@@ -288,9 +288,11 @@ export const run = guarded(async (argv, ctx) => {
   // merge that leaves the content hash alone is exactly that case, so refusing it as empty-range (#1658) was wrong. Still before
   // checkCap and before anything is written. base == head is kind 'previous' with an empty patch, so never baseOnly.
   const hasAccepted = allItems(state ?? { rounds: [] }).some((i) => i.final?.decision === 'ACCEPT');
-  if (state && hasAccepted && !baseOnly && (base === head || currentContentHash(root, config) === state.rounds.at(-1)?.contentHashAtToHead)) {
+  // An escalated round (judge to Fable) reviews the whole PR whatever changed since the last round, so with no accepted item waiting for its fix it is
+  // never empty: review-complete needs that Fable round and nothing else can produce it (a config change merged in from main moves no content).
+  const waiting = state ? roundOutcome(state).newAccepted : [];
+  if (state && hasAccepted && !baseOnly && !(escalated && waiting.length === 0) && (base === head || currentContentHash(root, config) === state.rounds.at(-1)?.contentHashAtToHead)) {
     const last = state.rounds.at(-1).n;
-    const waiting = roundOutcome(state).newAccepted;
     throw new Fail(EXIT.USAGE, {
       ok: false, error: 'empty-range',
       message: waiting.length > 0
