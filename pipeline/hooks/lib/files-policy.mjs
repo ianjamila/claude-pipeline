@@ -1566,8 +1566,10 @@ function makeMatchers(ctx) {
 // ---- Bash: command classification -----------------------------------------------------------------
 
 // (#269 R10-F1) The parser ends a segment at every `&&` / `||` with no `[[` state, so zsh's `if [[ -n a && echo == echo ]] cp x FILE` arrives as the pieces `[[ -n a` and `echo == echo ]] cp x FILE`: the
-// second one would be judged as `echo`. A `]]` that is not the last word of a piece closes a condition: what follows it is the command. The piece is split there into a `[[ .. ]]` header (an ordinary,
+// second one would be judged as `echo`. A `]]` that is not the last word of a piece may close a condition: what follows it is then the command. The piece is split there into a `[[ .. ]]` header (an ordinary,
 // non-read-only `[[`) and that command, which carries the piece's redirects, prefix assignments and place in the line. Done once per piece, in place (the array keeps the parser's non-enumerable fields).
+// (#269 scan S3) The parser has lost the quotes, so a quoted argument -- `bash -s ']]' x`, `python3 - ']]' x` -- looks the same. The split is therefore ADDITIVE: the original piece stays, judged as written (a
+// fed `bash` is still seen), and the header and the command after it are added behind it. A `cd` is applied once: the original is the only piece that can start with it (the header starts with `[[`).
 function splitCloseBrackets(cmds) {
   for (let i = 0; i < cmds.length; i++) {
     const c = cmds[i];
@@ -1575,8 +1577,8 @@ function splitCloseBrackets(cmds) {
     if (k < 0) continue;
     const clone = (over) => Object.create(Object.getPrototypeOf(c), { ...Object.getOwnPropertyDescriptors(c), ...Object.fromEntries(Object.entries(over).map(([n, value]) => [n, { value, enumerable: true, writable: true, configurable: true }])) });
     const argv = c.argv[0] === '[[' ? c.argv.slice(0, k + 1) : ['[[', ...c.argv.slice(0, k + 1)];
-    cmds.splice(i, 1, clone({ argv, env: {}, redirects: [], raw: argv.join(' ') }), clone({ argv: c.argv.slice(k + 1) }));
-    i++; // (the command after the `]]` is judged as it is: a later `]]` there is an argument)
+    cmds.splice(i + 1, 0, clone({ argv, env: {}, redirects: [], raw: argv.join(' ') }), clone({ argv: c.argv.slice(k + 1) }));
+    i += 2; // (the original and the two pieces are done; the command after the `]]` is judged as it is: a later `]]` there is an argument)
   }
 }
 
@@ -1729,12 +1731,24 @@ const INTERPRETERS = new RegExp(`^(?:node|nodejs|deno|bun|tsx|ts-node|python|pyp
 // name counts, and so does the first word that is not an option when it is only known at run time. `command -v NAME` / `-V` is a lookup, not a run.
 const WRAPPER_CMDS = new Set(['env', 'command', 'builtin', 'exec', 'eval', 'nohup', 'time', 'timeout', 'stdbuf', 'nice', 'ionice', 'sudo', 'doas', 'su', 'xargs', 'chroot', 'setsid', 'unbuffer', 'caffeinate', 'arch', 'taskset', 'chrt', 'strace', 'ltrace', 'watch', 'parallel', 'flock', 'script']);
 const RUNTIME_NAME = /[$`*?[{]/;
-function isInterpreterCmd(argv) {
+// (#269 scan S1, owner decision: false refusals over bypasses) Commands known to START no other program. Any other command may be a runner (`uv run`, `pyenv exec`, `mise exec --`, `npx`, `rlwrap`, `valgrind`,
+// `gtimeout`, `nvm exec` ...), so for the wide check below the wrapper rules apply to it, whatever the list of known wrappers says.
+const NON_RUNNERS = new Set([...READ_ONLY, 'export', 'which', 'type', 'whence', 'where', 'hash', 'unset', 'man', 'test', '[', '[[']);
+// the narrow check: argv[0] is an interpreter's name (or a known wrapper starts one) -- it keeps prose such as `git commit -m "... python3 ..."` masked (R9-F3)
+function isInterpreterCmd(argv) { return interpreterCmd(argv, false); }
+// the wide check, for the fed-interpreter rule: also any command that is not a known non-runner (it may start an interpreter)
+function mayRunInterpreter(argv) { return interpreterCmd(argv, true); }
+function interpreterCmd(argv, wide) {
   const at = argv.findIndex((w) => !/^[A-Za-z_]\w*=/.test(w)); // (an assignment the parser did not take apart -- `LUA_''INIT=@/dev/stdin lua -e ''` -- is no command name)
   argv = at < 0 ? [] : argv.slice(at);
   if (!argv.length) return false;
   const name = baseOf(argv[0]);
-  const wrapped = WRAPPER_CMDS.has(name) || (name === 'find' && argv.some((w) => /^-(?:exec|execdir|ok|okdir)$/.test(w)));
+  if (wide) {
+    if (RUNTIME_NAME.test(argv[0]) && argv[0] !== '[' && argv[0] !== '[[') return true;
+    if (INTERPRETERS.test(name)) return true;
+    if (NON_RUNNERS.has(name) || argv[0] === '[' || argv[0] === '[[') return false;
+  }
+  const wrapped = wide || WRAPPER_CMDS.has(name) || (name === 'find' && argv.some((w) => /^-(?:exec|execdir|ok|okdir)$/.test(w)));
   if (!wrapped) return argv[0] === '[' || argv[0] === '[[' ? false : RUNTIME_NAME.test(argv[0]) || INTERPRETERS.test(name);
   if (name === 'command' && /^-[pP]*[vV]/.test(argv[1] ?? '')) return false; // (`command -v python3` is a lookup; `command python3 -` still runs it)
   const rest = argv.slice(1).flatMap((w) => String(w).split(/\s+/)).filter((w) => w !== '');
@@ -1773,7 +1787,13 @@ function lacksOwnProgram(argv) {
   if (i < 0) i = 0; // (a name known only at run time: its words follow it)
   const rest = argv.slice(i + 1);
   if (rest.some((a) => /^--(?:eval|print|exec)(?:=|$)/.test(a) || /^-[A-Za-z]*[ecEprR]/.test(a))) return false;
-  if (rest.length === 1 && /^(?:--version|-v|-VV?|--help|-h)$/.test(rest[0])) return false; // (R10-F6: `node -v`, `python3 -VV` print a version)
+  // (R10-F6: `node -v`, `python3 -VV` print a version. #269 scan S2: only where the flag is a version / help flag: `-v` is verbose mode for python, bash, sh and zsh and ruby runs stdin after it, `bash -h` is hashall)
+  if (rest.length === 1) {
+    const n = i < 0 || i >= argv.length ? '' : baseOf(argv[i]);
+    if (/^--(?:version|help)$/.test(rest[0])) return false;
+    if (rest[0] === '-v' && new RegExp(`^(?:node|nodejs|deno|bun|php|perl)${VERSION}$`).test(n)) return false;
+    if (/^-(?:VV?|h)$/.test(rest[0]) && new RegExp(`^(?:python|pypy)${VERSION}$`).test(n)) return false;
+  }
   const file = rest.findIndex((a) => !a.startsWith('-') || a === '-');
   return file < 0 || rest[file] === '-';
 }
@@ -3480,7 +3500,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const c of cmds) {
       const text = [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).filter((r) => r.op === '<<<').map((r) => r.target ?? '')].join('\n'); // (R10-F5: `F=.claude/settings.local.json python3 -c '..os.environ["F"]..'`)
       // (R9-F1) an interpreter with no program of its own reads it from stdin: on a line naming such a file it counts as fed whatever the feed looks like
-      if (isInterpreterCmd(c.argv) && !jsonToolOnly(c, raw) && (isFed(c) || (namesSurface && lacksOwnProgram(c.argv)))) {
+      if (mayRunInterpreter(c.argv) && !jsonToolOnly(c, raw) && (isFed(c) || (namesSurface && lacksOwnProgram(c.argv)))) {
         if (namesSurface || HOOK_SURFACE_TEXT.test(text)) return deny(`input is fed into an interpreter on a line that names a file that can declare hooks; whether the interpreter runs that input as code cannot be checked (${HOOKS_MSG})`);
       } else if (runsInlineCode(c, ctx)) {
         if (HOOK_SURFACE_TEXT.test(text)) return deny(`an inline program names a file that can declare hooks, and what it does to it cannot be checked (${HOOKS_MSG})`);

@@ -676,12 +676,13 @@ test('R9: feeds through >( =( and functions, quote-split names on a fed interpre
   // R9-F4: [[ ]], loops and builtins that never run their words are not interpreters; wrappers still are
   for (const cmd of [
     'for t in node python3; do which $t; done | cat',
-    'for t in node python3; do command -v $t; done | cat; ls .claude/settings.json',
     'type python3 | cat; cat .claude/settings.json',
     'export P=python3; cat .claude/settings.json | head',
-    'case $x in node) cat .claude/settings.json | head;; esac',
     'while read -r l; do echo "$l"; done < .claude/settings.json',
   ]) assert.equal(bash(cmd), 'allow', cmd);
+  // (#269 scan, owner decision: false refusals over bypasses) the `for` header names node / python3 and the line is fed: refused, since a `for` header is no known non-runner
+  assert.equal(bash('for t in node python3; do command -v $t; done | cat; ls .claude/settings.json'), 'deny');
+  assert.equal(bash('case $x in node) cat .claude/settings.json | head;; esac'), 'deny');
 });
 
 // ---- round 9 security review: for / select / case / [[ are harmless only as a bare header ---------------------------------------------------
@@ -716,15 +717,17 @@ test('R9 security review: loop keywords are exempt only as bare headers', () => 
     `select f (x) node -; echo "${py}"`,
     `for f (x) python3 -; cat .claude/settings.local.json`,
     `[[ -f a ]] python3 -; cat .claude/settings.local.json`,
+    // (#269 scan, owner decision: false refusals over bypasses) a `for` header is no known non-runner, so one that names node / python3 on a fed line is refused
+    'for t in node python3; do command -v $t; done | cat; ls .claude/settings.json',
+    // (a `case` pattern naming node is no known non-runner either)
+    'case $x in node) cat .claude/settings.json | head;; esac',
   ]) if (bash(cmd) !== 'deny') failures.push(cmd);
   assert.deepEqual(failures, [], 'these lines were not refused');
   // a bare header (or a header whose body the parser split off) stays harmless
   for (const cmd of [
     'for t in node python3; do which $t; done | cat',
-    'for t in node python3; do command -v $t; done | cat; ls .claude/settings.json',
     'type python3 | cat; cat .claude/settings.json',
     'export P=python3; cat .claude/settings.json | head',
-    'case $x in node) cat .claude/settings.json | head;; esac',
     'while read -r l; do echo "$l"; done < .claude/settings.json',
     'for f in .claude/settings.json; do head -3 "$f"; done',
     'for f in a b\ndo head -3 "$f"; done; cat .claude/settings.json',
@@ -768,9 +771,36 @@ test('R10: [[ .. && .. ]] pieces, function definitions, loop / match variables a
   for (const cmd of [
     'node -v && cat .claude/settings.json',
     'python3 -VV; cat .claude/settings.json',
+    'grep python3 f; cat .claude/settings.json',
+    'export P=python3; cat .claude/settings.json',
+    'for f in a b; do echo $f; done',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------
+
+test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] argument no longer hide a fed interpreter', () => {
+  const py = 'open(".claude/settings.json","w")';
+  const failures = [];
+  const cases = [
+    // S1: a runner that is not on the wrapper list hides the interpreter it starts
+    ...['uv run python3 -', 'pyenv exec python3 -', 'mise exec -- python3 -', 'npx node', 'rlwrap python3', 'valgrind python3 -', 'gtimeout 5 python3 -', 'nvm exec node'].map((prog) => `printf '${py}' | ${prog}`),
+    // (#269 scan, owner decision: false refusals over bypasses) a command that merely names an interpreter is refused too
     'brew install node; cat .claude/settings.json',
     'nvm use node; cat .claude/settings.json',
     'git switch bash; cat .claude/settings.json',
-    'for f in a b; do echo $f; done',
-  ]) assert.equal(bash(cmd), 'allow', cmd);
+    // S2: -v / -h are not version flags for these interpreters (the program is still read from stdin)
+    ...['python3 -v', 'ruby -v', 'bash -v', 'bash -h', 'zsh -v', 'sh -v', 'python3 -V -V', 'ruby -V'].map((prog) => `printf '${py}' | ${prog}`),
+    'python3 -v; cat .claude/settings.json',
+    'ruby -v; cat .claude/settings.json',
+    'bash -h; cat .claude/settings.json',
+    // S3: a quoted ]] argument is not a [[ condition
+    `printf 'cp /tmp/p ~/.claude/settings.json' | bash -s ']]' x`,
+    `printf '${py}' | python3 - ']]' x`,
+    `printf '${py}' | python3 - ']]'`,
+  ];
+  for (const cmd of cases) if (bash(cmd) !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these lines were not refused');
+  // a version flag that is one for that interpreter stays allowed
+  for (const cmd of ['node -v; cat .claude/settings.json', 'python3 -V; cat .claude/settings.json', 'perl -v; cat .claude/settings.json', 'ruby --version; cat .claude/settings.json', 'bash --help; cat .claude/settings.json', '[[ -n a && echo == echo ]] && head x; ls .claude/settings.json']) assert.equal(bash(cmd), 'allow', cmd);
 });
