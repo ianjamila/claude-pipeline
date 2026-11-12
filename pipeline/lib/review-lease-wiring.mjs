@@ -3,7 +3,7 @@
 // no command (and no later command someone adds to LEASED_COMMANDS) calls the library itself.
 //
 // WHICH COMMANDS. Every command that reads or writes a worktree's review state or the run that goes with it: the review loop (codex-review, triage,
-// arbiter, state, comment, followups, review-complete, verify), the gate and merge steps (final-gate, merge, merge-hold, update-branch, ci-wait, smoke),
+// arbiter, state, comment, followups, review-complete, verify), the gate and merge steps (final-gate, merge, merge-hold, redraft, update-branch, ci-wait, smoke),
 // the run record (checkpoint, cost, summary, agent-log) and the detached jobs (job). A lease is opened-or-renewed by each of them (renew opens when
 // absent, so a review begun on an older install gets one at its next command). NOT leased: commands that only compute or only talk to the machine
 // (preflight, config, labels, update, version, vendor, model-floor, model-proof, risk, hardstops, integrity, queue-sweep, stacks, worktrees, protect,
@@ -43,7 +43,7 @@ import { isInstalledCopy, seamValue } from './seams.mjs';
 
 export const LEASED_COMMANDS = new Set([
   'agent-log', 'arbiter', 'checkpoint', 'ci-wait', 'codex-review', 'comment', 'cost', 'final-gate', 'followups', 'job', 'merge', 'merge-hold',
-  'review-complete', 'smoke', 'state', 'summary', 'triage', 'update-branch', 'verify',
+  'redraft', 'review-complete', 'smoke', 'state', 'summary', 'triage', 'update-branch', 'verify',
 ]);
 export const ADMISSION_WAIT_ENV = 'PIPELINE_ADMISSION_WAIT_MS';
 

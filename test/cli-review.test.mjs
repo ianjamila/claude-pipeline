@@ -557,6 +557,47 @@ test('codex-review: a round that only merged the base branch in is recorded as b
   assert.equal(outcome.json.coverageValid, true);
 });
 
+// ---- the redraft advice (plan 2026-11-12-redraft-fix-rounds): a COUNTED round on a READY PR of a repo that iterates in draft ----------------
+
+const ITERATING_YML = pipelineYml().replace('  guard_checks: false\n', '  guard_checks: false\n  draft_while_iterating: true\n');
+const readyGh = (view) => [{ match: '^pr view 7 --json isDraft$', ...view }, ...GH];
+const adviceLines = (w) => w.fake.lines().filter((l) => /^pr view 7 --json isDraft$/.test(l));
+
+test('codex-review advice: a counted round on a READY PR of an iterating repo warns to run `pipeline redraft --pr N` (redraftAdvice:true), the round still succeeds', (t) => {
+  const w = worldIgnoringReview(t, { yml: ITERATING_YML, gh: readyGh({ stdoutJson: { isDraft: false } }) });
+  const r = w.codex(1, findingsOf());
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.redraftAdvice, true);
+  assert.equal(r.json.warnings.length, 1);
+  assert.match(r.json.warnings[0], /PR #7 is ready/);
+  assert.match(r.json.warnings[0], /`pipeline redraft --pr 7`/);
+  assert.equal(w.state().rounds.length, 1);
+});
+
+test('codex-review advice: none for a draft PR, a repo that does not iterate, an unreadable PR, or a base-only round (and a repo that does not iterate reads nothing extra)', (t) => {
+  const none = (r, why) => {
+    assertExit(r, 0, why + r.stderr + r.stdout);
+    assert.equal(r.json.ok, true, why);
+    assert.equal('redraftAdvice' in r.json, false, why);
+    assert.equal('warnings' in r.json, false, why);
+  };
+  none(worldIgnoringReview(t, { yml: ITERATING_YML, gh: readyGh({ stdoutJson: { isDraft: true } }) }).codex(1, findingsOf()), 'draft: ');
+  const plain = worldIgnoringReview(t, { gh: readyGh({ stdoutJson: { isDraft: false } }) });
+  none(plain.codex(1, findingsOf()), 'not iterating: ');
+  assert.deepEqual(adviceLines(plain), [], 'not iterating: the PR is not read for the advice');
+  none(worldIgnoringReview(t, { yml: ITERATING_YML, gh: readyGh({ code: 1, stderr: 'gh: Server Error (HTTP 502)' }) }).codex(1, findingsOf()), 'unreadable: ');
+
+  const w = worldIgnoringReview(t, { yml: ITERATING_YML, gh: readyGh({ stdoutJson: { isDraft: false } }) });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' });
+  const before = adviceLines(w).length;
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  none(r, 'base-only: ');
+  assert.equal(r.json.baseOnly, true);
+  assert.equal(adviceLines(w).length, before, 'base-only: no extra read');
+});
+
 test('codex-review: a base-only round past review.max_rounds is recorded (it does not count), a round with PR changes is still capped', (t) => {
   const w = worldIgnoringReview(t, { yml: `${pipelineYml()}review:\n  max_rounds: 1\n` });
   assertExit(w.codex(1, findingsOf()), 0);

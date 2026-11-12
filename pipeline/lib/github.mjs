@@ -445,6 +445,18 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       return { id: queueField(e.id, 'string', 'the queue entry id'), state: queueField(e.state, 'string', 'the queue entry state'), position: queueField(e.position, 'number', 'the queue entry position') };
     },
 
+    // Turns a ready PR back to draft (`pipeline redraft`): the node id, then one GraphQL mutation whose answer carries the new state AND whether
+    // auto-merge is armed on the PR (so there is no read-after-write lag to wait out). -> { isDraft, autoMergeArmed }. Throws GhError on any
+    // refusal or an answer without the pull request.
+    convertToDraft(n) {
+      const id = self.prNodeId(n);
+      const args = ['api', 'graphql'];
+      const data = self.graphql('mutation ConvertToDraft($pullRequestId:ID!){convertPullRequestToDraft(input:{pullRequestId:$pullRequestId}){pullRequest{isDraft autoMergeRequest{enabledAt}}}}', { pullRequestId: id });
+      const p = data?.convertPullRequestToDraft?.pullRequest;
+      if (!p || typeof p !== 'object') throw new GhError({ code: 0, stderr: 'convertPullRequestToDraft returned no pull request', args });
+      return { isDraft: p.isDraft === true, autoMergeArmed: p.autoMergeRequest !== null && p.autoMergeRequest !== undefined };
+    },
+
     // Takes the PR out of the queue (the owner's stop conditions, the pipeline's confirmed dequeue).
     dequeue(n) {
       const id = self.prNodeId(n);
