@@ -61,6 +61,13 @@ export function fullProtection(checks = ['ci']) {
 
 export const REPO_VIEW = { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'main' }, url: 'https://github.com/acme/widgets' };
 
+// codex-review reads the PR's triage comment before it admits a counted round (published history): a plain fake gh answers "no comment" with these
+// entries, appended AFTER a test's own so a test that scripts the comments itself wins. (createCommentsGh answers both calls on its own.)
+export const NO_COMMENTS = [
+  { match: '^api user', stdout: 'me\n' },
+  { match: '^api repos/\\S+/issues/\\d+/comments --paginate', stdoutJson: [] },
+];
+
 // A minimal valid .claude/pipeline.yml declaring the given enforcement mode and required checks.
 // guardChecks stays false here: most tests are about the configured list, not the always-required guard contexts.
 export const pipelineYml = (enforcement = 'github', checks = ['ci'], { guardChecks = false } = {}) => [

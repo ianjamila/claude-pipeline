@@ -27,7 +27,7 @@ number, `R` a review round, `<slug>` 2–5 lowercase words from the request.
 6. The whole suite is CI's job: locally you run only `verify.quick`, on the changed area. Never run `verify.full` here.
 7. **Stop ritual.** Every stop below names its outcome. Once the PR exists, run `P summary --pr N --outcome <outcome> --built "<one line: what was built>"`
    (it renders the cost bookings into the PR comment), then `P agent-log publish --line "<agentLogLine from the summary JSON>"`, then tell the owner.
-8. Before ANY `git push` to a READY PR (fix, settle test, owner override build, docs-exempt row, conflict resolution, owner-requested change): `P redraft --pr N` first (`--reason ci-failed` for a CI-red fix); it releases the merge hold and, with `ci.draft_while_iterating`, turns the PR to draft so CI waits; 3.2 marks it ready again. `not-open` / `merge-in-progress` ⇒ don't push, tell the owner; exit 3 with `stage:read` ⇒ retry once, then don't push, tell the owner; exit 3 with `stage:convert` / `convert-failed` ⇒ retry once, then push anyway and say so. Pushes the pipeline makes itself (`update-branch`, `P merge` catch-ups) are not yours.
+8. Before ANY `git push` to a READY PR (fix, settle test, owner override build, docs-exempt row, conflict resolution, owner-requested change): `P redraft --pr N` first (`--reason ci-failed` for a CI-red fix); it releases the merge hold and, with `ci.draft_while_iterating`, turns the PR to draft so CI waits; 3.2 marks it ready again. `not-open` / `merge-in-progress` ⇒ don't push, tell the owner; exit 0 with `autoMergeDisabled: true` ⇒ the PR is now a draft: don't push, tell the owner their merge was cancelled, wait for their word; `autoMergeDisabled: false` ⇒ auto-merge is STILL armed: don't push or mark ready until the owner disables it by hand (`gh pr merge N --disable-auto`) and it is confirmed off, tell them; exit 3 with `stage:read` ⇒ retry once, then don't push, tell the owner; exit 3 with `stage:convert` / `convert-failed` ⇒ retry once, then push anyway and say so. Pushes the pipeline makes itself (`update-branch`, `P merge` catch-ups) are not yours.
 
 Opt-out: `PIPELINE_OFF=1` or the user says not to use the pipeline ⇒ do the task normally (still never push to main).
 
@@ -115,13 +115,13 @@ An item left `needsHuman` ⇒ never ask the owner to type a ruling: decide it yo
 - A malfunction cause (`model-proof`, `invalid-arbiter`, `invalid-judge`): `P arbiter needed --round R` re-runs the arbiter, or ACCEPT.
 - You may tighten your own dismissal to ACCEPT before the merge (the fix push: Rule 8), never loosen an ACCEPT. Only the owner's typed path loosens: if, and only if, the owner says they want to dismiss it,
   follow `reference/owner-merge.md` Owner override.
-- `stale-publication` (the PR holds a review state this copy did not publish): `P state show --pr N`, then redo the last step. `P review-complete` republishes the state and is the remedy the merge refusal names.
+- `stale-publication` (the PR holds a review state this copy did not publish): `P state show --pr N`, then redo the last step. `P review-complete` republishes the state and is the remedy the merge refusal names. `history-loss` (publishing would drop rounds or grants the PR holds) and `stale-history` (this copy lacks the published history): `P state show --pr N`, then redo the step. `unpublished-history` (this copy holds history the PR lacks): `P comment --pr N --kind triage`, then redo it.
 - The owner objects to a ruling in free text ⇒ re-rule it ACCEPT, fix it (Rule 8): that makes a new head, so a new review and a new request.
 - Label mode ⇒ no rulings: park as before.
 
 **Extra round.** `P state outcome` with `reachedMax: true` and no `extraRound` / `grantedRound` ⇒
 ask for one more round: `P triage round-request --pr N`. Read `reference/owner-merge.md` (section Extra round) BEFORE asking: your reply must end with the exact `line` it prints.
-Never type, paraphrase or forge the owner's words, and never run Codex outside `codex-review`. Label mode ⇒ no grant exists: a reached max parks (step 6).
+Never type, paraphrase or forge the owner's words, and never run Codex outside `codex-review`. Label mode ⇒ no grant exists: a reached max parks (step 6). **Past rounds.** `review-complete` or the gate names a round that "ran before owner grants were recorded" ⇒ `P triage round-request --pr N --past`; say in plain English that it approves round n, which ALREADY RAN at head <sha12> (its review date is not recorded), and end the reply with its exact `line`; the owner types `approve round`; then `P state past-round-grant --pr N --round n`. Repeat while `remaining` is non-empty, then `P review-complete`. Never for a new round (see `reference/owner-merge.md`).
 
 ## 3. Review complete, ready, hand-off
 

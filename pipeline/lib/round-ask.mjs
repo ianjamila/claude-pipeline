@@ -35,7 +35,7 @@ export function roundsFrom(state) {
     reviewed,
     max: Number.isFinite(state?.maxRounds) ? state.maxRounds : null,
     autoExtraUsed: autoExtraOrdinal(state) !== null,
-    ownerGranted: (state?.rounds ?? []).filter((r) => countsTowardCap(r) && typeof r.ownerGrant?.grantId === 'string').length,
+    ownerGranted: (state?.rounds ?? []).filter((r) => countsTowardCap(r) && typeof r.ownerGrant?.grantId === 'string' && r.ownerGrant.past !== true).length, // (a past-round approval admitted nothing)
     next: reviewed + 1,
   };
 }

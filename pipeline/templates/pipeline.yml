@@ -48,9 +48,11 @@ ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names
   e2e_label: null              # label that triggers CI E2E for high-risk PRs, if any
   draft_while_iterating: false # true: before a fix push to a READY PR, `pipeline redraft` turns it back to draft so CI waits and
-  #                            # runs once, when review is complete and the PR is marked ready. Set true only when EVERY heavy
-  #                            # required workflow skips drafts and lists `converted_to_draft` in its pull_request types (or shares
-  #                            # one concurrency group per PR); false: a fix push only releases the merge hold.
+  #                            # runs once, when review is complete and the PR is marked ready. The starter templates
+  #                            # (verify.yml, pipeline-guards.yml) already skip drafts and list `converted_to_draft`, so a repo whose
+  #                            # heavy required CI is these may set true; any other required workflow must meet the same rule (skip
+  #                            # drafts, list `converted_to_draft` or share one concurrency group per PR).
+  #                            # false: a fix push only releases the merge hold.
   # guard_checks: true         # default true: preflight and `protect` ALWAYS require the "Test integrity" and "Hard-stop scan"
   #                            # statuses on top of required_checks. Set false only for a repo that does not run
   #                            # pipeline-guards.yml (then list its real checks in required_checks).

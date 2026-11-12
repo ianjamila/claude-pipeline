@@ -93,7 +93,7 @@ Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard cont
   the project's REQUIRED PR-check workflow (it fails a PR that adds a workflow GitHub rejects as a whole, e.g. `runner.temp` in a
   job-level `env:`) and say so in the setup report; `P vendor --check` warns `workflow-contexts-unwired` until some workflow runs it.
   The `verify.yml` template already runs that step before `node scripts/verify.mjs`.
-- Set `ci.draft_while_iterating: true` only when every heavy required workflow skips drafts and lists `converted_to_draft` in its `pull_request` types (or shares one concurrency group per PR): `pipeline redraft` then turns a ready PR back to draft before a fix push, so CI runs once at re-ready. Otherwise leave it `false`.
+- Set `ci.draft_while_iterating: true` only when every heavy required workflow skips drafts and lists `converted_to_draft` in its `pull_request` types (or shares one concurrency group per PR): `pipeline redraft` then turns a ready PR back to draft before a fix push, so CI runs once at re-ready. The `verify.yml` and `pipeline-guards.yml` templates already do; existing CI must meet the same rule. Otherwise leave it `false`.
 - Branch protection is applied **after the onboarding PR merges**: `P protect --repo .` prints
   the exact `gh api` calls (required checks = `ci.required_checks` + the two guard contexts, each pinned to GitHub Actions;
   a check another app posts, such as `Vercel`, keeps its current app or takes `--pin Vercel=<app id>`); `P protect --repo . --apply` (requires the session to have been

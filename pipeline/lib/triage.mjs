@@ -713,7 +713,8 @@ const grantsOf = (grants, k) => {
   }
 };
 const coversHead = (g, head) => head === undefined || (typeof head === 'string' && head.startsWith(g.head));
-const grantedRetained = (state) => (state?.rounds ?? []).filter((r) => countsTowardCap(r) && typeof r.ownerGrant?.grantId === 'string').length;
+// A grant with `past: true` is the owner's approval of a round that ALREADY ran (`state past-round-grant`): it admits nothing, so it lifts no limit and is not counted here.
+const grantedRetained = (state) => (state?.rounds ?? []).filter((r) => countsTowardCap(r) && typeof r.ownerGrant?.grantId === 'string' && r.ownerGrant.past !== true).length;
 
 // The counted ordinal (1-based) the automatic extra round took, or null. It is the counted round at max + 1 that no owner grant admitted:
 // recorded `admission: 'auto-extra'`, or (a state written before admission was recorded) no admission and no ownerGrant.
@@ -721,7 +722,7 @@ export function autoExtraOrdinal(state) {
   const max = state?.maxRounds;
   if (!Number.isFinite(max)) return null;
   const r = (state?.rounds ?? []).filter(countsTowardCap)[max];
-  if (r === undefined || r.ownerGrant !== undefined) return null;
+  if (r === undefined || (r.ownerGrant !== undefined && r.ownerGrant.past !== true)) return null;
   return r.admission === 'auto-extra' || r.admission === undefined ? max + 1 : null;
 }
 

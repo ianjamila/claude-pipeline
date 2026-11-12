@@ -30,6 +30,7 @@ import { GhError } from '../lib/proc.mjs';
 import { rateBranch } from '../lib/risk.mjs';
 import { addRound, emptyState, loadState, saveState } from '../lib/state.mjs';
 import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from '../lib/triage.mjs';
+import { assertPublishedHistory } from '../lib/review-publish.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
   allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, writeFileAtomic,
@@ -52,6 +53,9 @@ export const meta = {
     '    this machine): a grant already used, or recorded for another head ("ask again"), is exit 2 round-cap; Codex exit 3, head-moved and a kill before the claim',
     '    leave the grant open (a failure after the claim spends it: ask again). Success adds grantUsed:{grantId}; the round records admission and ownerGrant {grantId, k, quote, ownerTs}',
     '    base-only rounds and resolution-only rounds (below) never count toward the cap',
+    '  exit 2 {error:stale-history | unpublished-history | history-unreadable} for a COUNTED round, before Codex runs (read again under the final lock): the PR\'s triage comment is the',
+    '    published history. stale-history: this copy lacks a published round or owner grant (run `pipeline state show --pr N`); unpublished-history: this copy holds rounds the PR',
+    '    lacks, an earlier publish failed (run `pipeline comment --pr N --kind triage`); history-unreadable: the comment holds no readable state. No triage comment: no check',
     '  reviewer: fable (medium/high risk, except medium for size only, or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
     '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable.',
     '    The judge also reviews a medium PR that is medium ONLY for its size (no hard-stop hit of any kind, no sensitive path, base branch = the default branch) unless',
@@ -301,6 +305,19 @@ export const run = guarded(async (argv, ctx) => {
     });
   }
   const preAdmission = checkCap(state, { baseOnly, resolutionOnly });
+  // A COUNTED round builds on the PUBLISHED history: refuse before Codex runs when this copy lacks a published round or grant (stale-history), holds
+  // rounds the PR lacks (unpublished-history), or the triage comment cannot be read. A PR with no triage comment passes. Read again under the lock below.
+  const countedRound = !baseOnly && !resolutionOnly;
+  const checkPublished = (st) => {
+    if (!countedRound) return;
+    try {
+      assertPublishedHistory({ gh, pr, state: st });
+    } catch (err) {
+      if (err instanceof GhError) throw unavailable('github', { error: 'unavailable', message: err.message });
+      throw err;
+    }
+  };
+  checkPublished(state);
   const resolutionView = resolutionOnly ? resolutionSummary(resolution) : null;
   ensureRoundDir(root, round);
   const note = largeBinaryNote(largeBinaries);
@@ -382,6 +399,7 @@ export const run = guarded(async (argv, ctx) => {
     // A grant that admitted the round before Codex ran but is gone now (another checkout claimed it meanwhile) says so.
     const admission = checkCap(fresh, { baseOnly, resolutionOnly }, { already: preAdmission === 'owner' });
     checkBase(fresh);
+    checkPublished(fresh);
     if (headSha(o) !== head) throw headMoved();
     // The cap waiver rests on the proof above. from (checkBase), head and forkPoint are pinned, but origin/<default> may have moved
     // while Codex ran, and it is one of the proof's inputs: prove it again, and only accept the very range Codex was shown.

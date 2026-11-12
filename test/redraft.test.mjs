@@ -1,7 +1,7 @@
 // `pipeline redraft --pr N [--reason CODE]` through the real CLI against the scripted fake gh and the fake hold provider
 // (test/helpers/merge-hold-env.mjs): release the merge hold, then (ci.draft_while_iterating) turn a ready PR back to draft.
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { BASE_SHA, LOCK_DIR, PR, cli, scenario, ymlFor } from './helpers/gate-env.mjs';
@@ -9,7 +9,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { FAKE_HOLD, holdCalls, holdFiles, holdPuts, holdYml } from './helpers/merge-hold-env.mjs';
 import { RELEASE_REASONS, recordSuccessor } from '../pipeline/lib/merge-hold.mjs';
 import { mergeLockName } from '../pipeline/lib/hold.mjs';
-import { openRecord } from '../pipeline/lib/merge-queue.mjs';
+import { openRecord, queueRecordPath } from '../pipeline/lib/merge-queue.mjs';
 import { release as releaseLock, tryAcquire } from '../pipeline/lib/locks.mjs';
 
 const VIEW = '^pr view 12 --json number,state,isDraft,headRefOid,autoMergeRequest$';
@@ -63,6 +63,7 @@ test('1. ready + iterating + holds: the hold is released (redraft sentence) BEFO
   assert.equal(r.json.draft, true);
   assert.equal(r.json.changed, true);
   assert.equal('skipped' in r.json, false);
+  assert.equal('autoMergeDisabled' in r.json, false, 'nothing armed: no do-not-push signal');
   assert.equal(r.json.holdRelease.reason, 'redraft');
   assert.equal(r.json.holdRelease.confirmed, true);
   assert.deepEqual(r.json.warnings, []);
@@ -95,6 +96,7 @@ test('3. already draft + holds: the release runs, no mutation, changed:false; a 
   assert.equal(r.json.wasDraft, true);
   assert.equal(r.json.draft, true);
   assert.equal(r.json.changed, false);
+  assert.equal('autoMergeDisabled' in r.json, false);
   assert.equal(r.json.holdRelease.confirmed, true);
   assert.deepEqual(holdCalls(s), [`release ${PR} ${RELEASE_REASONS.redraft}`]);
   assert.deepEqual(mutations(s), []);
@@ -105,6 +107,7 @@ test('3. already draft + holds: the release runs, no mutation, changed:false; a 
   const k = redraft(own);
   assertExit(k, 0, k.stdout);
   assert.equal(k.json.changed, false);
+  assert.equal('autoMergeDisabled' in k.json, false);
   assert.equal('holdRelease' in k.json, false, 'the hold taken for the pipeline\'s own catch-up is kept');
   assert.deepEqual(holdCalls(own), []);
   assert.deepEqual(mutations(own), []);
@@ -117,6 +120,7 @@ test('4. not iterating (ci.draft_while_iterating false): the release runs, no mu
   assert.equal(r.json.changed, false);
   assert.equal(r.json.draft, false);
   assert.equal(r.json.skipped, 'draft-not-iterating');
+  assert.equal('autoMergeDisabled' in r.json, false);
   assert.equal(r.json.holdRelease.confirmed, true);
   assert.deepEqual(holdCalls(s), [`release ${PR} ${RELEASE_REASONS.redraft}`]);
   assert.deepEqual(mutations(s), []);
@@ -175,6 +179,24 @@ test('7. merge-in-progress, each trigger (queue entry, armed auto-merge, local m
   const recorded = world({ entries: [mutation()] });
   openRecord(recorded.repo.dir, PR, recorded.head, {}, { repo: 'acme/widgets', repoId: 1 });
   refused(recorded, 'live queue record', /merge-queue record/);
+});
+
+test('7b. an unreadable local merge-queue record (malformed JSON) fails closed: exit 1 merge-in-progress, no release, no mutation, nothing written', () => {
+  for (const [label, text] of [['invalid JSON', '{"pr": 12, "head": '], ['not a record', '[]']]) {
+    const s = world({ entries: [mutation()] });
+    const file = queueRecordPath(s.repo.dir, PR);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, text);
+    const r = redraft(s);
+    assertExit(r, 1, `${label}: ${r.stdout}`);
+    assert.equal(r.json.ok, false, label);
+    assert.equal(r.json.reason, 'merge-in-progress', label);
+    assert.match(r.json.message, /unreadable/, label);
+    assert.match(r.json.message, /do NOT push/, label);
+    assert.deepEqual(holdCalls(s), [], `${label}: a corrupt record may own a lifted hold, so no release`);
+    assert.deepEqual(writes(s), [], `${label}: no conversion, no other write`);
+    assert.equal(readFileSync(file, 'utf8'), text, `${label}: the record is left as found`);
+  }
 });
 
 test('8. a mutation that answers isDraft:false, or errors, is exit 1 convert-failed; an unreachable GitHub (read, queue read, mutation) is exit 3', () => {
@@ -244,19 +266,27 @@ test('9. a release that is NOT confirmed is still exit 0 with holdRelease.confir
   assert.equal(mutations(s).length, 1);
 });
 
-test('10. auto-merge armed in the mutation answer is disabled and reported (autoMergeDisabled:true)', () => {
+test('10. auto-merge armed in the mutation answer is disabled and ALWAYS reported: exit 0, a warning that the owner\'s merge was cancelled, do NOT push (#303)', () => {
   const s = world({ entries: [mutation({ isDraft: true, autoMergeRequest: { enabledAt: '2026-11-12T01:00:00Z' } })] });
   const r = redraft(s);
   assertExit(r, 0, r.stdout);
   assert.equal(r.json.changed, true);
   assert.equal(r.json.autoMergeDisabled, true);
+  assert.equal(r.json.warnings.length, 1);
+  assert.match(r.json.warnings[0], /cancelled/);
+  assert.match(r.json.warnings[0], /do NOT push/);
+  assert.match(r.json.warnings[0], /tell the owner/);
   assert.ok(s.fake.lines().some((l) => /^pr merge 12 --disable-auto/.test(l)));
 
   const stuck = world({ gh: { disableAutoCode: 1 }, entries: [mutation({ isDraft: true, autoMergeRequest: { enabledAt: '2026-11-12T01:00:00Z' } })] });
   const k = redraft(stuck);
   assertExit(k, 0, k.stdout);
   assert.equal(k.json.autoMergeDisabled, false);
-  assert.match(k.json.warnings.join(' '), /could not be disabled/);
+  assert.equal(k.json.warnings.length, 1);
+  assert.match(k.json.warnings[0], /could not be disabled/);
+  assert.match(k.json.warnings[0], new RegExp(`gh pr merge ${PR} --disable-auto`));
+  assert.match(k.json.warnings[0], /do NOT push/);
+  assert.match(k.json.warnings[0], /tell the owner/);
 });
 
 test('11. exit 3 vs convert-failed is judged on gh\'s stderr: a "network" in the gh arguments or GitHub\'s "Could not resolve to a node" refusal is convert-failed; "could not resolve host" is exit 3', () => {
