@@ -762,6 +762,10 @@ test('R10: [[ .. && .. ]] pieces, function definitions, loop / match variables a
     'select f in ~/.claude/settings.json; do cp /tmp/payload $f; break; done <<< 1',
     '[[ $HOME/.claude/settings.json =~ .+ ]] && cp /tmp/payload $MATCH',
     '[[ $HOME/.claude/settings.json =~ .+ ]] && cp /tmp/payload "${BASH_REMATCH[0]}"',
+    // R11-F2: every name of a multi-name `for` / zsh `foreach` is only known at run time
+    'for a b (echo ~/.claude/settings.json) cp /tmp/payload $b',
+    'foreach f (echo ~/.claude/settings.json) cp /tmp/payload $f; end',
+    'for a b in x .claude/settings.local.json; do cp /tmp/payload $b; done',
     // R10-F5: a prefix assignment hands the path to the program
     'F=.claude/settings.local.json python3 -c \'import os; os.link("/tmp/payload", os.environ["F"])\'',
   ];
@@ -775,6 +779,26 @@ test('R10: [[ .. && .. ]] pieces, function definitions, loop / match variables a
     'export P=python3; cat .claude/settings.json',
     'for f in a b; do echo $f; done',
   ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+test('R11-F1: a quoted ]] in a [[ condition does not hide the command after the real closing ]]', () => {
+  const failures = [];
+  // R11-F1: a quoted ']]' inside the condition (the parser has lost the quotes) must not hide the cd after the real closing ]]; run from the home folder, where `cd .claude/plans` lands in a protected place
+  const closers = [
+    'if [[ -n a ]] cd .claude/plans; cp /tmp/payload ../settings.json',
+    "if [[ -n ']]' ]] cd .claude/plans; cp /tmp/payload ../settings.json",
+    "if [[ ']]' != x ]] cd .claude/plans; cp /tmp/payload ../settings.json",
+    "if [[ -n ']]' && -n ']]' ]] cd .claude/plans; cp /tmp/payload ../settings.json",
+    // (the same lines with an absolute cd, from the repo)
+    'if [[ -n a ]] cd ~/.claude/plans; cp /tmp/payload ../settings.json',
+    "if [[ -n ']]' ]] cd ~/.claude/plans; cp /tmp/payload ../settings.json",
+    "if [[ ']]' != x ]] cd ~/.claude/plans; cp /tmp/payload ../settings.json",
+    // (past the cap of ]] words in one piece the line is refused as too complex, whatever follows)
+    `if [[ ${"-n ']]' ".repeat(9)}]] cd .claude/plans; cp /tmp/payload ../settings.json`,
+    `if [[ ${"-n ']]' ".repeat(9)}]] cd sub; ls`,
+  ];
+  for (const cmd of closers) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R11-F1 lines were not refused');
 });
 
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------

@@ -1569,17 +1569,27 @@ function makeMatchers(ctx) {
 // second one would be judged as `echo`. A `]]` that is not the last word of a piece may close a condition: what follows it is then the command. The piece is split there into a `[[ .. ]]` header (an ordinary,
 // non-read-only `[[`) and that command, which carries the piece's redirects, prefix assignments and place in the line. Done once per piece, in place (the array keeps the parser's non-enumerable fields).
 // (#269 scan S3) The parser has lost the quotes, so a quoted argument -- `bash -s ']]' x`, `python3 - ']]' x` -- looks the same. The split is therefore ADDITIVE: the original piece stays, judged as written (a
-// fed `bash` is still seen), and the header and the command after it are added behind it. A `cd` is applied once: the original is the only piece that can start with it (the header starts with `[[`).
+// fed `bash` is still seen), and the header and the command after it are added behind it. A `cd` is applied once per `]]`: the original is the only piece that can start with it (a header starts with `[[`).
+// (#269 R11-F1) For the same reason a quoted `]]` INSIDE the condition (`[[ -n ']]' ]] cd DIR`) cannot be told from the closer: the piece is split at EVERY non-final `]]`, one header and one command per
+// `]]`, so the command after the real one is among them (a `cd` keyed on argv[0] is seen). More than MAX_CLOSE_BRACKETS of them in one piece is refused (returns true: the caller denies the line).
+const MAX_CLOSE_BRACKETS = 8;
 function splitCloseBrackets(cmds) {
   for (let i = 0; i < cmds.length; i++) {
     const c = cmds[i];
-    const k = c.argv.findIndex((w, j) => w === ']]' && j < c.argv.length - 1);
-    if (k < 0) continue;
+    const ks = [];
+    for (let j = 0; j < c.argv.length - 1; j++) if (c.argv[j] === ']]') ks.push(j);
+    if (!ks.length) continue;
+    if (ks.length > MAX_CLOSE_BRACKETS) return true;
     const clone = (over) => Object.create(Object.getPrototypeOf(c), { ...Object.getOwnPropertyDescriptors(c), ...Object.fromEntries(Object.entries(over).map(([n, value]) => [n, { value, enumerable: true, writable: true, configurable: true }])) });
-    const argv = c.argv[0] === '[[' ? c.argv.slice(0, k + 1) : ['[[', ...c.argv.slice(0, k + 1)];
-    cmds.splice(i + 1, 0, clone({ argv, env: {}, redirects: [], raw: argv.join(' ') }), clone({ argv: c.argv.slice(k + 1) }));
-    i += 2; // (the original and the two pieces are done; the command after the `]]` is judged as it is: a later `]]` there is an argument)
+    const added = [];
+    for (const k of ks) {
+      const argv = c.argv[0] === '[[' ? c.argv.slice(0, k + 1) : ['[[', ...c.argv.slice(0, k + 1)];
+      added.push(clone({ argv, env: {}, redirects: [], raw: argv.join(' ') }), clone({ argv: c.argv.slice(k + 1) }));
+    }
+    cmds.splice(i + 1, 0, ...added);
+    i += added.length; // (the original and the pieces added are done; a later `]]` in an added command is covered by its own split)
   }
+  return false;
 }
 
 const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
@@ -2210,9 +2220,14 @@ function collectVars(cmds, ctx) {
   for (const c of cmds) {
     // (#269 R10-F4) A `select NAME` reads its value at run time, and so does a two-word `for NAME` (the parser ends the header there: zsh's `for f (echo FILE) cp x $f` takes its words from the
     // list that follows, not from "$@"): the name is only known at run time wherever it is used (ctx.unknownVars: a writer that uses it is refused)
-    if ((c.argv[0] === 'select' || (c.argv[0] === 'for' && c.argv.length === 2)) && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) unknown.add(c.argv[1]);
-    else if (pins !== undefined && c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) {
-      if (pins === null || !pins.has(c.argv[1])) unknown.add(c.argv[1]); else if (pins.get(c.argv[1]) !== LOOP_NOT_RUN) set(c.argv[1], pins.get(c.argv[1]), true);
+    // (#269 R11-F2) zsh takes several names per loop (`for a b (LIST)`, `for a b in LIST`: N names take the next N words) and `foreach NAME (LIST)`: EVERY name before `in` (or to the end of the header)
+    // is only known at run time, except the single name of a plain `for NAME in LIST` that loopReadings pins
+    if (LOOP_HEADS.has(c.argv[0])) {
+      const inAt = c.argv.indexOf('in', 1);
+      const names = c.argv.slice(1, inAt < 0 ? undefined : inAt).filter((w) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(w));
+      if (c.argv[0] === 'for' && inAt === 2 && names.length === 1) {
+        if (pins !== undefined) { if (pins === null || !pins.has(names[0])) unknown.add(names[0]); else if (pins.get(names[0]) !== LOOP_NOT_RUN) set(names[0], pins.get(names[0]), true); }
+      } else for (const n of names) unknown.add(n);
     }
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
     // (`set -- ev.sh`: the positional parameters, so `bash $1` is that file)
@@ -3125,7 +3140,7 @@ function linkReachesProtected(cmds, dirs, ctx) {
 
 const VAR_COMMANDS = new Set(['export', 'declare', 'typeset', 'local', 'readonly']);
 // builtins that bind a name without a NAME=value word
-const BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select', 'for', 'shift', 'wait', 'coproc']);
+const BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select', 'for', 'foreach', 'shift', 'wait', 'coproc']);
 const RUNS_CODE = new Set(['eval', 'source', '.', 'exec', 'trap', 'alias', 'unalias', 'enable', 'builtin', 'command', 'setopt', 'unsetopt', 'shopt', 'emulate', 'zmodload', 'autoload']);
 const LINE_BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'printf', 'select', 'wait']);
 const HOME_NAMES = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']);
@@ -3373,7 +3388,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   // environment (any name the line does not set). A loop variable takes each word of its list in turn: the text is judged once per word ("readings"; a
   // word that expands stands as written, so a `$(…)` or a glob is judged as if it were written where the variable is). Past 64 readings every loop
   // variable is only known at run time (a script or a writer it picks is refused).
-  if (typeof command === 'string' && opts._loopPins?.text !== command && /(?:^|[\s;&|(){])for\s/.test(command)) {
+  if (typeof command === 'string' && opts._loopPins?.text !== command && /(?:^|[\s;&|(){])(?:for|foreach)\s/.test(command)) {
     const readings = loopReadings(command, opts);
     if (readings) {
       for (const pins of readings) {
@@ -3409,6 +3424,8 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   }
 }
 const MAX_LOOP_READINGS = 64;
+// (the loop headers whose names are bound at run time)
+const LOOP_HEADS = new Set(['for', 'foreach', 'select']);
 // (a reading where the loop did not run: the name is not set by the line, as main read every loop variable)
 const LOOP_NOT_RUN = Symbol('loop not run');
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`).
@@ -3417,7 +3434,8 @@ function loopReadings(command, opts) {
   const cmds = simpleCommands(command, { env: opts.env ?? process.env });
   const loops = new Map();
   for (const c of cmds) {
-    if (c.argv[0] !== 'for' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) continue;
+    // (only the plain one-name forms are pinned here; a loop with several names is unknown in the header pass: #269 R11-F2)
+    if (c.argv[0] !== 'for' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '') || (c.argv.length > 2 && c.argv[2] !== 'in')) continue;
     const words = c.argv[2] === 'in' ? c.argv.slice(3) : ['$@'];
     loops.set(c.argv[1], [...new Set([...(loops.get(c.argv[1]) ?? []), ...(words.length ? words : ['']), LOOP_NOT_RUN])]);
   }
@@ -3469,7 +3487,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
-  splitCloseBrackets(cmds);
+  if (splitCloseBrackets(cmds)) return deny('the command line has too many ]] words in one command to check (a [[ condition cannot hold that many); split it into simpler commands');
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
   const proseValues = [...prose.values()].flatMap((p) => p.values);
