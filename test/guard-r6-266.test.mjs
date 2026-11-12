@@ -586,3 +586,54 @@ describe('#288 R3 long lines', () => {
     });
   }
 });
+
+// #288 (found while fixing R3): the home directory and its parents hold the protected tree, so for a command that is not read-only a word that resolves to one of them counts like any other
+// ancestor of a protected path (`rm -rf ~` deletes the config folder too). Read-only commands on home stay allowed, a file directly in home is no ancestor, and cp / rsync / install into
+// home are judged as before by what they write there (DIR/basename(SRC)), except rsync with --delete, which also removes what the source lacks.
+describe('#288 R3 home and its parents', () => {
+  for (const [label, line] of [
+    ['rm -rf ~', 'rm -rf ~'],
+    ['rm -rf $HOME', 'rm -rf $HOME'],
+    ['rm -rf ${HOME}', 'rm -rf ${HOME}'],
+    ['rm -rf ~/', 'rm -rf ~/'],
+    ['rm -rf /home/u', 'rm -rf /home/u'],
+    ['rm -rf /home', 'rm -rf /home'],
+    ['rm -rf /', 'rm -rf /'],
+    ['rm -rf ~/. (a dot segment)', 'rm -rf ~/.'],
+    ['rm -rf $HOME/proj/.. (a parent segment)', 'rm -rf $HOME/proj/..'],
+    ['find ~ -delete', 'find ~ -delete'],
+    ['find / -delete', 'find / -delete'],
+    ['mv ~ /tmp/x', 'mv ~ /tmp/x'],
+    ['chmod -R 000 ~', 'chmod -R 000 ~'],
+    ['rsync --delete into home', 'rsync -a --delete /tmp/x/ ~/'],
+    ['cp -a of a backup config folder into home', `cp -a /tmp/backup/${['.claude'].join('')} ~/`],
+  ]) {
+    test(`denies: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'deny', `${line} -> ${r.decision}`);
+    });
+  }
+  for (const [label, line] of [
+    ['ls ~', 'ls ~'],
+    ['ls -la $HOME', 'ls -la $HOME'],
+    ['find ~ -name x', 'find ~ -name x'],
+    ['find / -name x', 'find / -name x'],
+    ['du -sh ~', 'du -sh ~'],
+    ['cat ~/notes.txt', 'cat ~/notes.txt'],
+    ['rm ~/tmp-file.txt (a file in home)', 'rm ~/tmp-file.txt'],
+    ['rm -rf ~/Desktop/old', 'rm -rf ~/Desktop/old'],
+    ['cp /tmp/x ~/Desktop/', 'cp /tmp/x ~/Desktop/'],
+    ['cp /tmp/x ~ (writes ~/x)', 'cp /tmp/x ~'],
+    ['cp -r /tmp/x ~ (writes ~/x)', 'cp -r /tmp/x ~'],
+    ['rsync without --delete into home', 'rsync -a /tmp/x/ ~/'],
+    ['cd ~', 'cd ~'],
+    ['git -C ~ status', 'git -C ~ status'],
+    ['mkdir ~/newdir', 'mkdir ~/newdir'],
+    ['rm -rf /tmp/x', 'rm -rf /tmp/x'],
+  ]) {
+    test(`allows: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
+    });
+  }
+});

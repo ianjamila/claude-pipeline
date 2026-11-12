@@ -3840,23 +3840,42 @@ function evaluateBashForFilesFrame(command, opts) {
   if ((cmds.dynamic || ctx.dynamic) && protectedAnywhere) return deny('the command line is too complex or too dynamic to check and refers to a protected pipeline file');
   // #288 (found while fixing R3): a line of more than 5,000 words skips the per-token scans (tooMany), and the raw-text scan above matches a protected FILE, not the bare directory that holds it
   // (`find <config dir> x x x … -delete`). Fail closed: on such a line a word that resolves to a protected path, a directory above one (pathHit with ancestors, as the ordinary scan reads a word),
-  // or the home directory or one of its parents denies. A cheap filter first: a word with no `/`, `~`, `$`, backtick, glob or brace character, no `claude` and not `.` / `..` cannot name any of them
-  // (a bare relative word reaches a protected root only from a cwd that is inside or above one, which insideRoot already covers).
+  // or the home directory or one of its parents denies.
+  // The home directory and each of its parents hold the protected tree, so a word that resolves to one of them is an ancestor of a protected path like any other: a command that is not read-only is
+  // refused on it (`rm -rf ~`, `find / -delete`, `mv ~ /tmp/x`), see `names`. A cheap filter first: a word with no `/`, `~`, `$`, backtick, glob or brace character, no `claude` and not `.` / `..`
+  // cannot name one (a bare relative word reaches a protected root only from a cwd that is inside or above one, which insideRoot already covers).
+  const homeChain = new Set();
+  for (let d = ctx.homePosix, n = 0; n < 32; n++) {
+    homeChain.add(ctx.ci ? d.toLowerCase() : d);
+    const up = pathsFor().dirname(d);
+    if (up === d || up === '.') break;
+    d = up;
+  }
+  const maybePath = /[/~$`\\*?[{]|claude|^\.\.?$/i;
+  const homeWord = (word) => {
+    const w = /^--[\w-]+=./.test(word) ? word.slice(word.indexOf('=') + 1) : word;
+    if (!maybePath.test(w)) return false;
+    const e = pathsFor().normalize(expandRefs(w, ctx)).replace(/(.)\/+$/, '$1');
+    return homeChain.has(ctx.ci ? e.toLowerCase() : e);
+  };
+  // The ordinary (short) path: a command that is not read-only and is given home or a parent of it as an operand (the command name itself is no operand: the parser reports the code of a glob
+  // qualifier, `out(/)`, as a command named `/`). Read-only commands on home stay allowed (`ls ~`, `du -sh ~`, `find ~ -name x`), and a file directly in home is no ancestor. cp / install into home write
+  // DIR/basename(SRC), which the scan below judges; rsync --delete into home or a parent of it also removes whatever the source lacks, the protected tree included.
+  if (opts._writesOnly !== true) {
+    const homeWriter = cmds.find((c) => {
+      const name = c.argv.length ? baseOf(c.argv[0]) : '';
+      if (!name || NOT_WRITERS.has(name) || isReadOnly(c, ctx)) return false;
+      if (DEST_ONLY.has(name)) return name === 'rsync' && c.argv.some((a) => /^--(?:del|delete)/.test(a)) && destsOf(wordsOf(c), name).some(homeWord);
+      return wordsOf(c).slice(1).some(homeWord);
+    });
+    if (homeWriter) return deny(`${baseOf(homeWriter.argv[0])} is given the home directory or a directory above it, which holds the protected pipeline files, and is not a read-only command (${PROTECTED_MSG})`);
+  }
   if (tooMany && opts._writesOnly !== true) {
-    const homeChain = new Set();
-    for (let d = ctx.homePosix, n = 0; n < 32; n++) {
-      homeChain.add(ctx.ci ? d.toLowerCase() : d);
-      const up = pathsFor().dirname(d);
-      if (up === d || up === '.') break;
-      d = up;
-    }
-    const maybePath = /[/~$`\\*?[{]|claude|^\.\.?$/i;
     for (const c of cmds) {
       for (const t of wordsOf(c)) {
         checkDeadline(ctx.budget); // (the evaluation deadline)
         if (!maybePath.test(t)) continue;
-        const e = pathsFor().normalize(expandRefs(t, ctx)).replace(/(.)\/+$/, '$1');
-        if (m.rawHit(t, dirs) || m.pathHit(t, dirs, true) || homeChain.has(ctx.ci ? e.toLowerCase() : e)) return deny('the command line has more than 5,000 words, so it is not scanned word by word, and a word names a protected pipeline file, a directory that holds one, or the home directory; split the command up');
+        if (m.rawHit(t, dirs) || m.pathHit(t, dirs, true) || homeWord(t)) return deny('the command line has more than 5,000 words, so it is not scanned word by word, and a word names a protected pipeline file, a directory that holds one, or the home directory; split the command up');
       }
     }
   }
