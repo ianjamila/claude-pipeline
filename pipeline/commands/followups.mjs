@@ -19,6 +19,7 @@ export const meta = {
     '  Each issue body starts with <!-- claude-pipeline:followup pr=N fp=FINGERPRINT -->; before creating, an issue of ours',
     '  (any state) with that marker is REUSED (several: lowest number is canonical, the rest are listed, never closed)',
     '  (the scan reads 100 per page under its own 180 s limit and, when the PR creation time is readable, only issues updated since 1 h before it)',
+    '  A finding raised again in a later round after its fix was deferred past the round limit is linked by codex-review to the issue already filed for it (item.followupIssue, item.reraisedDeferral), the triage comment lists it under "Raised again after a deferral", and no second issue is filed (when it is accepted again its fix is made in the PR, and the line says to close the issue when the PR merges)',
   ].join('\n'),
 };
 
@@ -60,7 +61,8 @@ export function followupMarker(pr, item) {
 // (the marker is ours and goes in first, after the defusing).
 export function issueBody(item, pr) {
   const where = item.file ? (item.line > 0 ? `${item.file}:${item.line}` : item.file) : null;
-  const decidedBy = item.final?.by === 'owner' ? 'Owner' : item.arbiter && item.final?.by === 'arbiter' ? 'Arbiter' : 'Judge';
+  const deferral = item.roundCapDeferral;
+  const decidedBy = item.final?.by === 'owner' ? 'Owner' : deferral ? 'Claude (round limit)' : item.arbiter && item.final?.by === 'arbiter' ? 'Arbiter' : 'Judge';
   const lines = [
     String(item.detail ?? '').trim(),
     '',
@@ -72,6 +74,10 @@ export function issueBody(item, pr) {
     '',
   ];
   if (where) lines.push(`Location: \`${oneLine(where)}\``, '');
+  // A fix deferred past the round limit (triage defer-fixes) was written and taken out again: say where it is. No cherry-pick claim: the fix head may hold other work.
+  if (deferral && typeof deferral.fixHead === 'string' && typeof deferral.reviewedHead === 'string') {
+    lines.push(`A fix was written on PR #${pr} at ${deferral.fixHead} and taken out before merge to keep the review closed; compare it with the reviewed code: git diff ${deferral.reviewedHead} ${deferral.fixHead}`, '');
+  }
   lines.push(`From PR #${pr}, item ${item.id}.`, '', 'Promote this by relabelling `agent-suggestion` to `agent-build`.');
   return `${followupMarker(pr, item)}\n${defuseMarkdown(lines.join('\n'))}`;
 }

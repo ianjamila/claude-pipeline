@@ -563,7 +563,7 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
     // owner's word. A judge's REJECT or an earlier cache copy must never overrule what Fable just raised.
     const cache = Object.fromEntries(Object.entries(ruledCacheFrom(state.rounds.filter((r) => r.n < n).flatMap((r) => r.items ?? [])))
       .filter(([, entry]) => entry.by === 'arbiter' || isOwnerRuled({ final: entry })));
-    const reused = reuseRuled(fresh.map(({ final, ...rest }) => rest), cache);
+    const reused = reuseRuled(fresh.map(({ final, ...rest }) => rest), cache, { round: n });
     const findingItems = fresh.map((item, i) => (reused[i].final ? reused[i] : item));
     const items = [...finalizeWithoutArbiter(ruled, { lightLane: state.lightLane, force: forceArbiter(env) }), ...findingItems];
 

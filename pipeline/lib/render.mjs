@@ -69,7 +69,20 @@ function claudeRulingLines(rounds) {
   return rounds.flatMap((r) => (r.items ?? []).filter(claudeRuled).map((item) => {
     const sr = item.secondReview;
     const codex = sr ? `Codex ${line(sr.decision)}, ${line(sr.confidence)}` : 'no Codex check';
+    // A fix taken out at the round limit (triage defer-fixes) says so: it is a FOLLOW-UP whose fix is NOT in this merge.
+    if (item.roundCapDeferral) return `- ${line(item.id)}: ${line(item.final.decision ?? 'unknown')} (deferred past the round limit; its fix was taken out, NOT in this merge) - ${line(item.final.reason, 300)}`;
     return `- ${line(item.id)}: ${line(item.final.decision ?? 'unknown')} (${claudeBy(item)}; ${codex}) - ${line(item.final.reason, 300)}`;
+  }));
+}
+
+// A finding raised again after its fix was deferred past the round limit (codex-review linked it to the follow-up issue already filed): say so, no second issue.
+// When the judge accepted it again its fix is made in THIS PR, so the issue is not the place it is tracked any more: say the issue is to be closed when the PR merges.
+function reraisedLines(rounds) {
+  return rounds.flatMap((r) => (r.items ?? []).filter((item) => isObject(item.reraisedDeferral)).map((item) => {
+    const d = item.reraisedDeferral;
+    const head = `- ${line(item.id)}: the same finding as ${line(d.id)}, whose fix was deferred past the round limit; `;
+    if (item.final?.decision === 'ACCEPT') return `${head}it is accepted again and is being fixed in this PR: close follow-up issue ${line(d.issue, 120)} when this PR merges`;
+    return `${head}follow-up issue ${line(d.issue, 120)} is already filed, no new issue`;
   }));
 }
 
@@ -81,6 +94,8 @@ export function triageComment(state) {
   else if (rows.length === 0) out.push('', '_Codex raised no findings._');
   const claudeLines = claudeRulingLines(rounds);
   if (claudeLines.length > 0) out.push('', '#### Claude rulings', '', ...claudeLines);
+  const reraised = reraisedLines(rounds);
+  if (reraised.length > 0) out.push('', '#### Raised again after a deferral', '', ...reraised);
   const granted = grantedRounds(state);
   if (granted.length > 0) out.push('', `Owner-granted extra round(s): ${granted.map((g) => `${grantLabel(g)} - "${line(g.quote, 300)}"`).join('; ')}`);
   // A Fable pass that stopped on the floor or a stale terminal (arbiter.mjs): visible even when the round has no item to carry the cause.
