@@ -141,7 +141,20 @@ run one Codex review round over base..head and record its findings.
 
 ```
 pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium|high|xhigh [--model M] [--repo DIR]
+  pipeline codex-review --pr N --round R --base SHA --head SHA --plan [--repo DIR]   -> {ok, plan, expectedEffort}
   -> {ok, round, counts:{blocking, suggestions, worth_considering}, preRuled, lightLane, reviewer, reviewerReasons, path}
+  --effort must be the configured effort for the round, else exit 2 {error:effort-mismatch, expected}: round 1 and a whole-PR round use review.effort.<risk> (low|medium|high), every later round review.effort.followup,
+    except that a small fix-check (the reviewed range is at most review.effort.small_fix_lines changed lines, adds no new file and touches no risk.high_risk_paths / review.arbiter_always_paths path) and, while the weekly Codex quota used is
+    at least review.codex_budget.soft, every other round that is not protected use review.effort.small_fix. Protected rounds always keep the normal effort: round 1, the first round after a maxRisk rise (or one that sees the rise),
+    a round with confirmFixed items, a resolution-only round, a whole-PR round that is owed. The round records effort; a round the governor lowered also records governor:{usedPct, threshold, observedAt} (state version 4)
+  --plan prints what the round would do and runs nothing, writes no route.json and no round: {ok, plan:{route: codex|substitute, evidence: none|budget|governor, effort, why, round, base, wholePrOwed, protected, small, lowered?, budget:{used, budget},
+    governor:{usedPct, soft, hard, observedAt}|null, facts:{changedLines, newFile, sensitive}}, expectedEffort}; the skill passes expectedEffort as --effort (--effort is optional with --plan)
+  a small fix-check (not protected, see above) goes to the substitute instead of Codex when the PR has used review.codex_round_budget Codex runs (recorded Codex rounds and recorded Codex second reviews in the state; a killed or retried run
+    does not count) or the weekly Codex quota used is at least review.codex_budget.hard (P codex-status; an unreadable figure turns the governor off). Codex is not run: exit 3 {ok:false, unavailable:true, reason:withheld, message,
+    substitute:{eligible:true, why: budget-spent|governor-hard, evidence: budget|governor, agent, resetAt:null}, plan}; route.json holds {evidence: budget, budget:{used, budget}} or {evidence: governor, governor:{usedPct, threshold, observedAt}}
+    with outcome withheld (valid for this attempt only). A larger round, or any protected round, stays on Codex however much was spent; review.substitute.mode off never substitutes
+  a whole-PR round is owed (state outcome wholePrOwed) when an Opus substitute round came before the PR's risk rose to high and no whole-PR round has run since: that round must use the PR's merge base as --base (else exit 2 base-mismatch),
+    reviews the whole PR (reviewBaseKind merge-base, never base-only or resolution-only, counts toward the cap) and records wholePr:true and patchSha256. An all-Codex history owes none
   --base must be the PR's merge base for round 1 and the previous round's toHead after that, else exit 2 {error:base-mismatch}
   exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head, an empty commit,
     an amend); the message names the accepted items still waiting for a fix, or says the content is what round N reviewed. Never for a round that only merged
@@ -675,7 +688,9 @@ pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr 
 pipeline state discard-round --round R [--pr N] [--repo DIR]
   -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;
      refused (exit 2) when the PR triage comment already holds round R, or (error round-has-verdict) when the round holds a second-review verdict
-pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean
+pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures, followupsPending, rounds, reviewedRounds, maxRounds, wholePrOwed, nextRound:{round, base, wholePrOwed}[, base]}; exit 0 whether or not clean
+  wholePrOwed: true (with base: the PR's merge base) when an Opus substitute round came before the PR's risk rose to high and no whole-PR round has run since; the next round must start at that base (nextRound.base is the base to pass).
+  The effort and route of that round: `pipeline codex-review --plan`
   roundOutcome carries substituteRounds:[n] (rounds a Claude substitute reviewed first, while Codex was out of quota) and maxRisk (the highest risk the PR ever had: low|medium|high)
   first fetches origin/<default_branch> (best effort: offline keeps the cached ref), so a PR updated from its base branch is not read as changed
   grantedRound {k, grantId, head, quote}: the owner's open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner
