@@ -488,6 +488,7 @@ const WRAPPERS = {
   builtin: plain(),
   noglob: plain(), // (zsh precommand modifiers: `noglob read k` runs read; #56 Fable review of 2edea61)
   nocorrect: plain(),
+  '-': (argv) => rest(argv, 1), // (R13-F1: zsh's fifth precommand modifier, `- git push`; it takes no options)
   exec: plain('a'),
   nohup: plain(),
   setsid: plain(),

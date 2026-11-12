@@ -1515,12 +1515,12 @@ function setIsSafe(argv) {
   }
   return true;
 }
-// The command a line word really runs, past `builtin` / `command` / `noglob` / `nocorrect` (and their flags, and one `--`): `builtin set -T`, `command -p -- shopt -s cdable_vars`.
+// The command a line word really runs, past `builtin` / `command` / `noglob` / `nocorrect` / zsh's `-` (and their flags, and one `--`): `builtin set -T`, `command -p -- shopt -s cdable_vars`.
 // `blind`: a wrapper's next word is not a literal name (`builtin $S -T`), so what it runs is not known
 function unwrapBuiltin(argv) {
   let k = 0;
-  while (k < argv.length && ['builtin', 'command', 'noglob', 'nocorrect'].includes(baseOf(argv[k]))) {
-    k++;
+  while (k < argv.length && (argv[k] === '-' || ['builtin', 'command', 'noglob', 'nocorrect'].includes(baseOf(argv[k])))) {
+    if (argv[k++] === '-') continue; // (R13-F1: zsh's precommand modifier `-` runs the next word as a command, with no options of its own)
     while (k < argv.length && /^-[A-Za-z]*$/.test(argv[k])) k++;
     if (argv[k] === '--') k++;
   }
