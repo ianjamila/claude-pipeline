@@ -959,6 +959,10 @@ test('R15: a heredoc pending on the outer line is read after the line ends, not 
     'cat <<E\n${ ' + cp + '; }\nE',
     'cat <<E\n${|' + cp + '; }\nE',
     'echo ${ { echo a; } ; ' + cp + '; }',
+    // (#269 scan) an ARGUMENT `}` does not close the body: only a `}` where a command starts does
+    'echo "${ echo }; ' + cp + '; }"',
+    'echo "${ echo a } b; ' + cp + '; }"',
+    'echo "${ echo > }; ' + cp + '; }"',
   ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
   assert.deepEqual(failures, [], 'these R15 lines were not refused');
   const blocked = [];

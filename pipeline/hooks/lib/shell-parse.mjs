@@ -2685,8 +2685,9 @@ class Parser {
         lastSep = ';';
         this.i++;
         if (stopAtParen) return false;
-      } else if (stopAtBrace && c === '}' && !inWord && this.funsubCloses(s, this.i)) {
-        // the `}` that ends a `${ cmd; }`: a `}` word that no `{` group opened inside it is waiting for
+      } else if (stopAtBrace && c === '}' && !inWord && (!seg || seg.words.length === 0) && !redir && this.funsubCloses(s, this.i)) {
+        // the `}` that ends a `${ cmd; }`: a `}` word that no `{` group opened inside it is waiting for, where a command starts (after a separator or a newline: the shell
+        // reads `}` as the closer only there). An argument `}` (`${ echo }; cp …; }`) is a plain word; a body that never closes is truncated (refused).
         endSeg(this.i);
         this.i++;
         return true;
