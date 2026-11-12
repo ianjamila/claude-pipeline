@@ -184,7 +184,7 @@ Base: origin/main **after #226 merges** (interval LaunchAgents in `lib/schedule.
   pid and start time match AND the session record's id equals the lease's (a `/clear` keeps the pid but changes the id,
   so the old lease dies) AND `renewedAt` is within 6 h (idle terminals stop blocking updates). `CLAUDECODE=1` but the
   lookup fails ⇒ a TTL-only lease (6 h). A detached `P job` is covered by its job record (live pid). A plain terminal
-  (no Claude ancestor, no `CLAUDECODE`) writes no lease.
+  (no Claude ancestor, no `CLAUDECODE`) writes no lease. (Superseded by `docs/plans/2026-11-12-terminal-leases-hardening.md`: a plain terminal now takes a process lease.)
 - **Lifecycle:** opened-or-renewed by every pipeline command that reads or writes a worktree's review state (renew opens
   if absent, so a review started on an older install gets a lease at its next command); closed by the stop ritual
   (`P summary --outcome …`) and by `ended` runs. A long Fable pass with no command in between stays covered: the lease

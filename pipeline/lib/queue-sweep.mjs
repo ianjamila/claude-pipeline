@@ -25,13 +25,21 @@ const refuse = (error, reasons, extra = {}) => ({ exitCode: 1, output: { ok: fal
 // ---- the owner is told about each terminal outcome ---------------------------------------------------------------------------------
 // There is no other notification path in this pipeline, so a notice is: a line on stderr (a `P merge` session sees it; the LaunchAgent's log keeps it), a line in
 // <log dir>/queue-sweep-notices.log, and on macOS a banner. A failing notifier never undoes a settled record (settleRecord swallows it).
-const appleText = (text) => String(text).replace(/[\u0000-\u001f]/g, ' ').replace(/\\/g, '\\\\').replace(/"/g, '\\"').slice(0, 240);
+// The banner shows at most BANNER_MAX characters. The DISPLAY text is flattened and cut to that FIRST and escaped afterwards: escaping first and cutting after would let
+// a quote or backslash (two characters once escaped) push a message that fits over the cut, and could cut an escape sequence in half.
+export const BANNER_MAX = 240;
+const appleText = (text) => String(text).replace(/[\u0000-\u001f]/g, ' ').slice(0, BANNER_MAX).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
+// The notifier takes a string (the text of all three channels) or { text, banner }: the stderr line and the log get `text` whole, the banner gets `banner` (the caller's own
+// budgeted wording, cut to BANNER_MAX if it still is too long). A second argument { banner } is the same thing for a caller that wants to keep `text` as the first argument.
 // `event` names another kind of notice that uses the same three channels (`pipeline-update`: the auto-update job): its own stderr prefix,
 // log file (<event>-notices.log) and banner title, so it is not mistaken for a merge-queue notice. The default is the queue sweep's.
 export function defaultNotify({ env = process.env, platform = process.platform, stderr = process.stderr, spawn = spawnSync, event = 'queue-sweep' } = {}) {
   const title = event === 'queue-sweep' ? 'claude-pipeline merge queue' : `claude-pipeline ${event.replace(/^pipeline-/, '')}`;
-  return (text) => {
+  return (input, extra) => {
+    const given = input !== null && typeof input === 'object';
+    const text = given ? String(input.text ?? '') : input;
+    const banner = (given ? input.banner : extra?.banner) ?? text;
     stderr.write(`${event}: ${text}\n`);
     try {
       const dir = pruneLogDir(env);
@@ -40,7 +48,7 @@ export function defaultNotify({ env = process.env, platform = process.platform, 
     } catch { /* the stderr line is the notice that matters */ }
     if (platform === 'darwin' && env.PIPELINE_NO_BANNER !== '1') {
       try {
-        spawn('/usr/bin/osascript', ['-e', `display notification "${appleText(text)}" with title "${title}"`], { timeout: 5000, stdio: 'ignore' });
+        spawn('/usr/bin/osascript', ['-e', `display notification "${appleText(banner)}" with title "${title}"`], { timeout: 5000, stdio: 'ignore' });
       } catch { /* no banner is not a failure */ }
     }
   };

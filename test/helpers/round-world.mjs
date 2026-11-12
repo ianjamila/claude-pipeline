@@ -52,7 +52,7 @@ export function roundWorld(t, { max = 1, review = '', yml = '', comments = [], s
     { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: sha } },
     { match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: slug, url: `https://github.com/${slug}` } },
     { match: '^pr edit 7 ', code: 0 },
-    { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=30 --paginate`, stdout: '[]' },
+    { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=100 --paginate`, stdout: '[]' },
     { match: `^api -X POST repos/${slug}/issues `, stdoutJson: { number: 31, html_url: issueUrl(31) } },
     { match: '^pr edit 7 --remove-label', code: 0 },
   ];

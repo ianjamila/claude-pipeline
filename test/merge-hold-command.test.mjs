@@ -15,7 +15,7 @@ test('merge-hold is a registered command with a usage text that names its three 
   const r = cli(['merge-hold', '--help'], { dir: s.repo.dir, fake: s.fake });
   assertExit(r, 0);
   assert.match(r.json.usage, /merge-hold --pr N --check/);
-  assert.match(r.json.usage, /--release --reason <new-commits\|parked\|owner-declined\|handoff-withdrawn\|ci-failed\|update-conflict\|queued-behind\|hold-unreadable\|restart>/);
+  assert.match(r.json.usage, /--release --reason <new-commits\|parked\|owner-declined\|handoff-withdrawn\|ci-failed\|update-conflict\|queued-behind\|hold-unreadable\|restart\|redraft>/);
   assert.match(r.json.usage, /merge-hold --pr N --check --wait \[--max-minutes M=120\]/);
   assert.match(r.json.usage, /kept:true, why:'own-successor'/);
   const list = cli(['--help'], { dir: s.repo.dir, fake: s.fake });
@@ -95,7 +95,7 @@ test('usage errors (exit 2, nothing run): unknown reason code, free text, missin
     assert.equal(r.json.error, 'usage');
     assert.match(r.json.message, pattern);
   };
-  bad(['--pr', '12', '--release', '--reason', 'because'], /must be one of new-commits, parked, owner-declined, handoff-withdrawn, ci-failed, update-conflict, queued-behind, hold-unreadable, restart/);
+  bad(['--pr', '12', '--release', '--reason', 'because'], /must be one of new-commits, parked, owner-declined, handoff-withdrawn, ci-failed, update-conflict, queued-behind, hold-unreadable, restart, redraft/);
   bad(['--pr', '12', '--wait'], /--wait belongs to --check/);
   bad(['--pr', '12', '--release', '--reason', 'parked', '--wait'], /--wait belongs to --check/);
   bad(['--pr', '12', '--max-minutes', '10'], /--max-minutes belongs to --check --wait/);
