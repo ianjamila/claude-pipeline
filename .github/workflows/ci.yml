@@ -40,7 +40,9 @@ jobs:
   test-ubuntu:
     name: test (ubuntu)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The whole suite runs twice here (Node 20, then Node 24), ~12-15 min each on a slow runner: 30 min cut a green
+    # Node 24 pass short three times on 2026-11-12 (PR #308). 45 matches the Windows shards.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
