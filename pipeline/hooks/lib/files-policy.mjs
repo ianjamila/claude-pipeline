@@ -729,7 +729,7 @@ function listedDialogScripts(base, readText) {
 // or in the file name) and that can resolve to a surface is refused (R2-F1, maybeSurface). The line's writes to a target are asked of the write model (writtenTo); what lands there must be a text the guard
 // can read (a static text, a file on disk, the file itself) and none may add or change hooks, as for a file tool. A write whose content is only known at run time (a program's output, a rewrite by jq / sed
 // we cannot emulate, an inline program, a copy after a command the guard does not model, R2-F3) is refused: permission edits go through Edit / Write. A plugin's hooks file is never written from Bash.
-// -> a reason or null. `io.wordsOf(c)`: the command's words without its prose; `io.dirs`: the folders the line may be working in.
+// -> a reason or null. `io.wordsOf(c)`: the command's words without its prose (R9-F3: but an interpreter's words are all kept -- `node -e .. -- -t FILE`); `io.dirs`: the folders the line may be working in.
 const DELETERS = new Set(['rm', 'rmdir', 'unlink', 'trash']);
 const MAX_SURFACE_WORDS = 4000;
 // git subcommands that stage, record or delete: they never put new text into a working-tree file (checkout, restore, reset, apply, stash, merge ... do, and stay targets)
@@ -758,7 +758,7 @@ function hookSurfaceBashReason(cmds, frame, ctx, io) {
       if (!writer && redirects.length === 0) continue;
       let words = [];
       if (writer && !DELETERS.has(name) && !(name === 'git' && GIT_NO_CONTENT.has(gitSubcommand(c.argv)))) {
-        const own = io.wordsOf(c);
+        const own = isInterpreterCmd(c.argv) ? c.argv : io.wordsOf(c); // (R9-F3: an interpreter's `-t VALUE` is a word that can be a target, not prose)
         words = DEST_ONLY.has(name) || MOVERS.has(name) ? destsOf(own, name) : own.slice(1);
       } else if (writer && name === 'git' && GIT_NO_CONTENT.has(gitSubcommand(c.argv))) {
         // (R3-F1) log / show / diff ... write nothing into the tree except through --output: its value is a target
@@ -1565,7 +1565,7 @@ function makeMatchers(ctx) {
 
 // ---- Bash: command classification -----------------------------------------------------------------
 
-const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
+const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', '[[', 'for', 'case', 'select', 'cut', 'du', 'hexdump', 'bat']);
 const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
 const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'set-location', 'sl']);
@@ -1709,11 +1709,14 @@ const INLINE_RUNNERS = new RegExp(`^(?:node|nodejs|deno|bun|tsx|ts-node|python|p
 // (#269 R8, owner decision 2026-11-12) Every program that reads and runs text: the inline runners above, the other scripting languages, and the shells. A generous, fail-closed name list.
 const INTERPRETERS = new RegExp(`^(?:node|nodejs|deno|bun|tsx|ts-node|python|pypy|ruby|perl|php|lua|luajit|rscript|r|awk|gawk|mawk|nawk|wish|osascript|jjs|groovy|julia|sh|bash|zsh|dash|ash|ksh|ksh93|mksh|fish|busybox|csh|tcsh)${VERSION}$|^tclsh`);
 // (commands that only print or search their arguments: an interpreter's name among their words is a pattern or a file name, not a program)
-const NEVER_RUNS_ARGS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'echo', 'printf', 'cat', 'ls', 'which', 'type', 'whereis', 'man', 'wc', 'head', 'tail', 'sort', 'uniq', 'tr', 'cut', 'jq', 'diff', 'cmp', 'test', '[', 'stat', 'basename', 'dirname', 'realpath', 'readlink']);
+const NEVER_RUNS_ARGS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'echo', 'printf', 'cat', 'ls', 'which', 'type', 'whereis', 'man', 'wc', 'head', 'tail', 'sort', 'uniq', 'tr', 'cut', 'jq', 'diff', 'cmp', 'test', '[', '[[', ']]', 'stat', 'basename', 'dirname', 'realpath', 'readlink',
+  // (R9-F4) keywords and builtins that never run their words: `for t in node python3`, `[[ -f x ]]`, `export P=python3`, `read -r V`, `cd /dev`
+  'for', 'case', 'select', 'while', 'until', 'if', 'then', 'do', 'true', 'false', ':', 'cd', 'pushd', 'popd', 'export', 'local', 'declare', 'typeset', 'readonly', 'read', 'hash', 'whence', 'where']);
 // Is this command an interpreter (its name, past any wrapper the parser did not unwrap -- `timeout 5 python3`, `stdbuf -oL node` -- is one of INTERPRETERS), or a command whose name is only known at run time (`$PY`, `${X}`, a glob)?
 function isInterpreterCmd(argv) {
   if (!argv.length) return false;
   if (NEVER_RUNS_ARGS.has(baseOf(argv[0]))) return false;
+  if (baseOf(argv[0]) === 'command' && /^-[pP]*[vV]/.test(argv[1] ?? '')) return false; // (`command -v python3` is a lookup; `command python3 -` still runs it)
   if (/[$`*?[{]/.test(argv[0])) return true;
   return argv.some((w) => INTERPRETERS.test(baseOf(w)));
 }
@@ -1726,18 +1729,31 @@ function jsonToolOnly(c, raw) {
   return !/PYTHON[A-Z_]/i.test(raw) && !/\bexec\b|\bcoproc\b|<\(/.test(raw) && !Object.keys(c.env ?? {}).some((k) => /^PYTHON/i.test(k));
 }
 const inputRedirect = (c) => (c.redirects ?? []).some((r) => /</.test(r.op ?? ''));
-const hasProcSub = (c) => c.argv.some((w) => w.includes('<('));
+// (R9-F1) a process substitution in any direction: `<(cmd)`, `>(cmd)` (also as a redirect target: `> >(python3)`), zsh `=(cmd)` (a word of its own)
+const hasProcSub = (c) => c.argv.some((w) => /[<>]\(/.test(w) || w.startsWith('=(')) || (c.redirects ?? []).some((r) => /^[<>=]\(/.test(r.target ?? ''));
 // Is this interpreter FED input on the line? Fail closed: it receives a pipe (`|`, `|&`), has an input redirect (`<`, `<<`, `<<-`, `<<<`, `<&`, `<>`, `0<`), or a word holding `<(`; a coproc or an `exec` that
 // replaces stdin feeds every command of the line; and a command whose place in a pipeline is not known (inside a group, subshell, loop, if / case branch or function, or on a line holding a `{ ` group) is fed when the line has
 // any pipe or input redirect at all.
 function feedInfo(cmds, raw) {
-  const lineFeeds = /<|(?<![|])\|(?![|])/.test(raw) || cmds.some((c) => c.sep === '|' || inputRedirect(c) || hasProcSub(c));
+  const lineFeeds = /<|>\(|(?:^|[\s;&|(])=\(|(?<![|])\|(?![|])/.test(raw) || cmds.some((c) => c.sep === '|' || inputRedirect(c) || hasProcSub(c));
   const stdinReplaced = /\bcoproc\b/.test(raw) || cmds.some((c) => baseOf(c.argv[0] ?? '') === 'exec' && (inputRedirect(c) || c.argv.slice(1).some((w) => /^\d*</.test(w)))) || /\bexec\b[^;&|\n]*</.test(raw);
-  const groupOnLine = /(?:^|[\s;&|(])\{(?:\s|$)/.test(raw);
+  // (a function definition -- `f() cmd`, `function f ...` -- runs its body wherever the function is called: from a pipe, too)
+  const groupOnLine = /(?:^|[\s;&|(])\{(?:\s|$)/.test(raw) || /(?:^|[\s;&|({])(?:function\s+[\w.:@+-]+|[\w.:@+-]+\s*\(\s*\))/.test(raw);
   return (c) => stdinReplaced || c.sep === '|' || inputRedirect(c) || hasProcSub(c)
     || (lineFeeds && (groupOnLine || (c.depth ?? 0) > 0 || (c.grp?.length ?? 0) > 0 || Object.values(c.ctl ?? {}).some(Boolean)));
 }
 const BENIGN_INTERP_OPTS = /^(?:--no-warnings|--trace-warnings|--enable-source-maps|--harmony|-B|-u|-O|-OO|-v|-w|-T|-t|-s)$/;
+// (R9-F1) Does the interpreter run on a program of its own (a code option, or a file operand that is not `-`)? `python3`, `python3 -`, `node`, `bash -s` read their program from stdin, wherever it comes from.
+// The same computation as runsInlineCode's last line; a version / help flag alone runs nothing.
+function lacksOwnProgram(argv) {
+  let i = argv.findIndex((w) => INTERPRETERS.test(baseOf(w)));
+  if (i < 0) i = 0; // (a name known only at run time: its words follow it)
+  const rest = argv.slice(i + 1);
+  if (rest.some((a) => /^--(?:eval|print|exec)(?:=|$)/.test(a) || /^-[A-Za-z]*[ecEprR]/.test(a))) return false;
+  if (rest.length === 1 && /^(?:--version|-V|--help|-h)$/.test(rest[0])) return false;
+  const file = rest.findIndex((a) => !a.startsWith('-') || a === '-');
+  return file < 0 || rest[file] === '-';
+}
 function runsInlineCode(c, ctx) {
   if (!c.argv.length || isReadOnly(c, ctx)) return false;
   return c.argv.some((w, i) => {
@@ -1965,7 +1981,7 @@ const makesHardLinks = (c) => {
 const MOVERS = new Set(['mv', 'ln', 'ditto']); // any named protected path counts, and so does DEST/basename(SRC)
 // (zsh's lowercase `cdpath` array is tied to CDPATH: setting either sets both)
 const CDPATH_NAMES = ['CDPATH', 'cdpath'];
-const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'source', '.']);
+const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'for', 'case', 'select', 'source', '.']);
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
 const FD_DUP = /^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
@@ -3431,12 +3447,15 @@ function evaluateBashForFilesFrame(command, opts) {
   {
     const hooksWord = /hooks/i.test(scanRaw);
     const isFed = feedInfo(cmds, raw);
-    const namesSurface = HOOK_SURFACE_TEXT.test(scanRaw);
+    // (R9-F2, R9-F3) Read the line as written AND the de-quoted words of every command (so `.cl""aude/settings.local.json` is seen), with no prose masked: a test runner's `-t VALUE` / `--grep` value is
+    // prose only for the protected-file references of a commit message or test name, never for a target or a program text.
+    const namesSurface = HOOK_SURFACE_TEXT.test(raw) || cmds.some((c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => HOOK_SURFACE_TEXT.test(String(w))));
     for (const c of cmds) {
-      if (isInterpreterCmd(c.argv) && isFed(c) && !jsonToolOnly(c, raw)) {
-        if (namesSurface) return deny(`input is fed into an interpreter on a line that names a file that can declare hooks; whether the interpreter runs that input as code cannot be checked (${HOOKS_MSG})`);
+      const text = [...c.argv, ...(c.redirects ?? []).filter((r) => r.op === '<<<').map((r) => r.target ?? '')].join('\n');
+      // (R9-F1) an interpreter with no program of its own reads it from stdin: on a line naming such a file it counts as fed whatever the feed looks like
+      if (isInterpreterCmd(c.argv) && !jsonToolOnly(c, raw) && (isFed(c) || (namesSurface && lacksOwnProgram(c.argv)))) {
+        if (namesSurface || HOOK_SURFACE_TEXT.test(text)) return deny(`input is fed into an interpreter on a line that names a file that can declare hooks; whether the interpreter runs that input as code cannot be checked (${HOOKS_MSG})`);
       } else if (runsInlineCode(c, ctx)) {
-        const text = [...wordsOf(c), ...(c.redirects ?? []).filter((r) => r.op === '<<<').map((r) => r.target ?? '')].join('\n');
         if (HOOK_SURFACE_TEXT.test(text)) return deny(`an inline program names a file that can declare hooks, and what it does to it cannot be checked (${HOOKS_MSG})`);
       }
       if (!hooksWord) continue;

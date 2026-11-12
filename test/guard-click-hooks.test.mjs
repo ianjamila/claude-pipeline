@@ -637,3 +637,51 @@ test('R8: any interpreter fed on a line naming a hook file is refused (pipe, red
     'python3 -c "print(1)" | cat; ls .claude/settings.json',
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
+
+// ---- round 9 (R9-F1..F4): feeds by >( and =(, own words on a fed interpreter, unmasked hook names, keywords are not interpreters ----------------
+
+test('R9: feeds through >( =( and functions, quote-split names on a fed interpreter, prose flags and a bare interpreter are refused; [[ and keywords are not interpreters', () => {
+  const py = "import os; os.link('/tmp/payload','.claude/settings.local.json')";
+  const split = "import os; os.link('/tmp/payload','.cl\"\"aude/settings.local.json')";
+  const failures = [];
+  for (const cmd of [
+    // R9-F1: feeds the older list did not know
+    `echo "${py}" > >(python3)`,
+    `exec > >(python3 -); echo "${py}"`,
+    `{ echo "${py}"; } > >(node -)`,
+    `python3 =(echo "${py}")`,
+    `f() python3 -; echo "${py}" | f`,
+    `function f { python3 -; }; echo "${py}" | f`,
+    `f() { node; }; echo "${py}" | f`,
+    // a bare interpreter (no program of its own) on a line naming the file, with no visible feed
+    'python3 -; cat .claude/settings.local.json',
+    'python3 - ; : .claude/settings.local.json',
+    'node; cat .claude/settings.json',
+    'python3; cat .claude/settings.json',
+    'bash -s; cat .claude/settings.json',
+    'command python3 -; cat .claude/settings.json',
+    'exec python3; cat .claude/settings.json',
+    'env python3; cat .claude/settings.json',
+    // R9-F2: a fed interpreter's own words, a here-string and the feeding command's words are read de-quoted
+    `python3 -c "${split}" < /dev/null`,
+    `python3 <<< "${split}"`,
+    `echo "${split}" | python3`,
+    `echo "${split}" > >(python3)`,
+    // R9-F3: a test-runner prose flag does not hide the name
+    `node -e 'require("fs").copyFileSync("/tmp/payload.json", process.argv[2])' -- -t .claude/settings.local.json`,
+    `git log --grep=.claude/settings.local.json; echo "${py}" | python3`,
+    `node -e 'require("fs").copyFileSync("/tmp/payload.json", process.argv[2])' -- --test-name-pattern=.claude/settings.local.json`,
+  ]) if (bash(cmd) !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these lines were not refused');
+  // R9-F4: [[ ]], loops and builtins that never run their words are not interpreters; wrappers still are
+  for (const cmd of [
+    'if [[ -f .claude/settings.json ]]; then jq .hooks .claude/settings.json | head; fi',
+    'for f in ~/.claude/skills/*/SKILL.md; do [[ -s $f ]] && head -3 "$f" | grep name; done',
+    'for t in node python3; do which $t; done | cat',
+    'for t in node python3; do command -v $t; done | cat; ls .claude/settings.json',
+    'type python3 | cat; cat .claude/settings.json',
+    'export P=python3; cat .claude/settings.json | head',
+    'case $x in node) cat .claude/settings.json | head;; esac',
+    'while read -r l; do echo "$l"; done < .claude/settings.json',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
