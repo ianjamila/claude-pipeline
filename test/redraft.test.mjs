@@ -1,5 +1,7 @@
 // `pipeline redraft --pr N [--reason CODE]` through the real CLI against the scripted fake gh and the fake hold provider
 // (test/helpers/merge-hold-env.mjs): release the merge hold, then (ci.draft_while_iterating) turn a ready PR back to draft.
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { BASE_SHA, LOCK_DIR, PR, cli, scenario, ymlFor } from './helpers/gate-env.mjs';
@@ -187,24 +189,28 @@ test('8. a mutation that answers isDraft:false, or errors, is exit 1 convert-fai
   const b = redraft(refusedMutation);
   assertExit(b, 1, b.stdout);
   assert.equal(b.json.reason, 'convert-failed');
+  assert.equal(b.json.stage, 'convert');
   assert.match(b.json.message, /Resource not accessible/);
 
   const down = world({ entries: [{ match: 'convertPullRequestToDraft', code: 1, stderr: 'gh: Server Error (HTTP 502)' }] });
   const c = redraft(down);
   assertExit(c, 3, c.stdout);
   assert.equal(c.json.unavailable, true);
+  assert.equal(c.json.stage, 'convert', 'the refusal checks had passed: only this exit 3 may be pushed past');
 
   const readFails = world({ viewReply: { code: 1, stderr: 'gh: Server Error (HTTP 502)' } });
   const d = redraft(readFails);
   assertExit(d, 3, d.stdout);
   assert.equal(d.json.ok, false);
   assert.equal(d.json.unavailable, true);
+  assert.equal(d.json.stage, 'read', 'the merge-in-progress check could not run: never pushed past');
   assert.deepEqual(holdCalls(readFails), [], 'a failed read changes nothing');
 
   const queueFails = world({ gh: { queue: 'error' }, entries: [mutation()] });
   const e = redraft(queueFails);
   assertExit(e, 3, e.stdout);
   assert.equal(e.json.unavailable, true);
+  assert.equal(e.json.stage, 'read');
   assert.deepEqual(holdCalls(queueFails), []);
   assert.deepEqual(mutations(queueFails), []);
 });
@@ -236,4 +242,50 @@ test('10. auto-merge armed in the mutation answer is disabled and reported (auto
   assertExit(k, 0, k.stdout);
   assert.equal(k.json.autoMergeDisabled, false);
   assert.match(k.json.warnings.join(' '), /could not be disabled/);
+});
+
+test('11. exit 3 vs convert-failed is judged on gh\'s stderr: a "network" in the gh arguments or GitHub\'s "Could not resolve to a node" refusal is convert-failed; "could not resolve host" is exit 3', () => {
+  // The node id reaches the error message through the gh arguments (pullRequestId=...), never the stderr; "network" and "timeout" in it must not make a refusal exit 3.
+  const named = world({ entries: [
+    { match: 'PrNodeId', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_network_timeout_connection' } } } } },
+    { match: 'convertPullRequestToDraft', code: 1, stderr: 'gh: Resource not accessible by integration' },
+  ] });
+  const a = redraft(named);
+  assertExit(a, 1, a.stdout);
+  assert.match(a.json.message, /Resource not accessible/);
+  assert.equal(a.json.reason, 'convert-failed');
+
+  const node = world({ entries: [{ match: 'convertPullRequestToDraft', code: 1, stderr: 'gh: Could not resolve to a node with the global id of \'PR_node12\'' }] });
+  const b = redraft(node);
+  assertExit(b, 1, b.stdout);
+  assert.equal(b.json.reason, 'convert-failed');
+  assert.equal(b.json.stage, 'convert');
+
+  const host = world({ entries: [{ match: 'convertPullRequestToDraft', code: 1, stderr: 'gh: error connecting: could not resolve host: api.github.com' }] });
+  const c = redraft(host);
+  assertExit(c, 3, c.stdout);
+  assert.equal(c.json.stage, 'convert');
+});
+
+test('12. the PR\'s merge lock is held through the hold release and the conversion: a merge started meanwhile cannot take it, and it is free again afterwards', () => {
+  const name = mergeLockName('acme/widgets', PR);
+  const locks = new URL('../pipeline/lib/locks.mjs', import.meta.url).href;
+  // The hold provider plays the second merge: while redraft's release is running it tries to take the same merge lock.
+  const probe = [
+    "if (verb === 'release') {",
+    `  const { tryAcquire } = await import(${JSON.stringify(locks)});`,
+    `  const got = tryAcquire(${JSON.stringify(name)}, { dir: process.env.PIPELINE_LOCK_DIR, machineId: 'gate-env-test-machine' });`,
+    "  appendFileSync('.review/lock-probe.log', `${got.acquired}\\n`);",
+    '}',
+  ].join('\n');
+  const probing = { ...holdFiles, 'scripts/fake-hold.mjs': FAKE_HOLD.replace("const exit = (name)", `${probe}\nconst exit = (name)`) };
+  const s = world({ baseFiles: probing, entries: [mutation()] });
+  const r = redraft(s);
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.changed, true);
+  assert.equal(readFileSync(join(s.repo.dir, '.review', 'lock-probe.log'), 'utf8').trim(), 'false', 'a second merge could not take the lock during the release');
+  // ...and the lock is gone once redraft has returned.
+  const after = tryAcquire(name, { dir: LOCK_DIR, machineId: 'gate-env-test-machine' });
+  assert.equal(after.acquired, true);
+  releaseLock(after.lock);
 });

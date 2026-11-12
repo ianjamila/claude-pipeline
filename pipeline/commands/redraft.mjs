@@ -7,7 +7,7 @@ import { EXIT, UsageError, parseCommandArgs, intOption } from '../lib/cli.mjs';
 import { Fail, requireConfig, resolveRepo, guarded } from '../lib/cmd-common.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { GhError } from '../lib/proc.mjs';
-import { mergeInProgress } from '../lib/hold.mjs';
+import { withMergeLock } from '../lib/hold.mjs';
 import { disableAutoMerge } from '../lib/finalgate.mjs';
 import { QueueRecordUnreadable, QueueUnreadable, queueModeFor, readQueueRecord } from '../lib/merge-queue.mjs';
 import { RELEASE_REASONS, holdsConfigured, ownSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
@@ -15,11 +15,12 @@ import { RELEASE_REASONS, holdsConfigured, ownSuccessor, releaseHold, unreleased
 const DEFAULT_REASON = 'redraft';
 const REASON_CODES = Object.keys(RELEASE_REASONS);
 // A mutation failure that is the network or GitHub being down is "unavailable" (exit 3); anything else the mutation answered is a refusal (convert-failed).
-const UNREACHABLE = /HTTP 5\d\d|timed? ?out|rate limit|could not resolve|connection|network|EOF|ECONN|ETIMEDOUT/i;
+// Matched against gh's STDERR only: the error message also carries the gh arguments (a repo named `network`) and GitHub's own refusals ('Could not resolve to a node').
+const UNREACHABLE = /HTTP 5\d\d|timed? ?out|rate limit|could not resolve host|connection|network|EOF|ECONN|ETIMEDOUT/i;
 
 export const meta = {
   summary: 'before a fix push to a READY PR: release its merge hold and (ci.draft_while_iterating) turn it back to draft so CI waits for the re-ready',
-  usage: `pipeline redraft --pr N [--reason <${REASON_CODES.join('|')}>=redraft] [--repo DIR]   -> {ok, pr, head, wasDraft, draft, changed, skipped?, holdRelease?, autoMergeDisabled?, warnings:[]} : run it right BEFORE you push a code fix to a ready PR (a fix, a settle test, an owner-override build, a conflict resolution, a change the owner asked for); never pushes or merges and never moves the head. Steps: (1) read the PR and its merge-queue state; (2) refuse (exit 1, nothing changed) when the PR is not OPEN (reason not-open) or a merge of it is under way (reason merge-in-progress: a merge-queue entry, armed auto-merge, a running local \`pipeline merge\` or a live local queue record: do NOT push, tell the owner); (3) for a repo with the merge.hold_* keys, release the PR\'s own merge hold with --reason (default redraft; the same fixed codes as \`merge-hold --release\`), for a draft PR too (a hold left by an earlier release that was not confirmed would otherwise come back to life at the next ready) except a draft whose head is the pipeline\'s own update-branch successor (the hold is kept); holdRelease {reason, confirmed, code, lines, notStarted?}, and a release that is NOT confirmed is exit 0 with a warnings line naming the manual release; (4) only when ci.draft_while_iterating is true and the PR is ready, convert it to draft with one GraphQL mutation (changed:true, draft:true); a repo whose CI runs on drafts (draft_while_iterating false) gets skipped:'draft-not-iterating' and no conversion, a draft PR changed:false; auto-merge found armed by the mutation is disabled (autoMergeDisabled). Exit 0 done or nothing to do, 1 refused (not-open, merge-in-progress) or the conversion failed (convert-failed; the hold release, if any, has already run and is reported), 2 usage error (unknown --reason), 3 GitHub unavailable (a read failed, the merge queue state was unreadable, or the mutation could not reach GitHub: nothing was changed by that step). Mark the PR ready again with \`gh pr ready\` once review is complete (review-complete runs first)`,
+  usage: `pipeline redraft --pr N [--reason <${REASON_CODES.join('|')}>=redraft] [--repo DIR]   -> {ok, pr, head, wasDraft, draft, changed, skipped?, holdRelease?, autoMergeDisabled?, warnings:[]} (exit 3 and convert-failed also carry stage: read | convert) : run it right BEFORE you push a code fix to a ready PR (a fix, a settle test, an owner-override build, a conflict resolution, a change the owner asked for); never pushes or merges and never moves the head. Steps: Steps 1-4 run holding this PR's local merge lock (the one \`pipeline merge\` takes), so a merge cannot start in the middle of them; (1) read the PR and its merge-queue state; (2) refuse (exit 1, nothing changed) when the PR is not OPEN (reason not-open) or a merge of it is under way (reason merge-in-progress: a merge-queue entry, armed auto-merge, a running local \`pipeline merge\` or a live local queue record, or the merge lock held by another run: do NOT push, tell the owner); (3) for a repo with the merge.hold_* keys, release the PR\'s own merge hold with --reason (default redraft; the same fixed codes as \`merge-hold --release\`), for a draft PR too (a hold left by an earlier release that was not confirmed would otherwise come back to life at the next ready) except a draft whose head is the pipeline\'s own update-branch successor (the hold is kept); holdRelease {reason, confirmed, code, lines, notStarted?}, and a release that is NOT confirmed is exit 0 with a warnings line naming the manual release; (4) only when ci.draft_while_iterating is true and the PR is ready, convert it to draft with one GraphQL mutation (changed:true, draft:true); a repo whose CI runs on drafts (draft_while_iterating false) gets skipped:'draft-not-iterating' and no conversion, a draft PR changed:false; auto-merge found armed by the mutation is disabled (autoMergeDisabled). Exit 0 done or nothing to do, 1 refused (not-open, merge-in-progress) or the conversion failed (convert-failed; the hold release, if any, has already run and is reported), 2 usage error (unknown --reason), 3 GitHub unavailable (stage read: a read failed or the merge queue state was unreadable, so the merge-in-progress check could not run: do NOT push, retry once, then tell the owner; stage convert: the mutation could not reach GitHub, nothing was changed by that step, the refusal checks had passed). Mark the PR ready again with \`gh pr ready\` once review is complete (review-complete runs first)`,
 };
 
 export const run = guarded(async (argv, ctx) => {
@@ -31,21 +32,35 @@ export const run = guarded(async (argv, ctx) => {
   const { config } = await requireConfig(root);
   const env = ctx.env;
   const gh = createGitHub({ cwd: root, env });
-  const unavailable = (message) => new Fail(EXIT.UNAVAILABLE, { ok: false, pr, unavailable: true, error: 'unavailable', message });
+  const unavailable = (message, stage, extra = {}) => new Fail(EXIT.UNAVAILABLE, { ok: false, pr, ...extra, unavailable: true, error: 'unavailable', stage, message });
   const refuse = (why, message, extra = {}) => new Fail(EXIT.FAILED, { ok: false, pr, reason: why, message, ...extra });
 
-  // 1. Read everything first. Any failure (including an unreadable merge queue) fails closed: exit 3, nothing changed.
+  // Steps 1-4 run holding the PR's local merge lock (the one `pipeline merge` and the queue sweep take): without it a merge could start while the hold release
+  // (up to five minutes) or the conversion is under way, and redraft would then draft the PR or disarm auto-merge in the middle of that merge. The lock also covers a
+  // live merge child of an earlier run, so there is no separate peek. Residual (not closed here): once redraft returns the lock is gone, so for a repo that does not
+  // convert to draft (nothing to re-read afterwards) a merge started between redraft and the caller's `git push` is not seen; the caller pushes right after.
+  const mergeBusy = (error, reasons, extra = {}) => ({
+    exitCode: EXIT.FAILED,
+    output: { ok: false, pr, reason: 'merge-in-progress', message: `${reasons.join('; ')}; the owner's merge is under way, so do NOT push; tell the owner`, reasons, ...extra },
+  });
+  return withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse: mergeBusy, fn: () => redraftLocked({ pr, reason, root, config, env, gh, ctx, unavailable, refuse }) }).catch((err) => {
+    // gh.repo() (the lock's name) failed before the lock existed: same as an unreadable step-1 read.
+    if (err instanceof GhError) throw unavailable(String(err.message).split('\n')[0], 'read');
+    throw err;
+  });
+});
+
+async function redraftLocked({ pr, reason, root, config, env, gh, ctx, unavailable, refuse }) {
+  // 1. Read everything first. Any failure (including an unreadable merge queue) fails closed: exit 3 stage 'read', nothing changed.
   let view;
   let queue;
-  let mergeLocal;
   let record;
   let recordWhy = null;
   try {
     view = gh.prView(pr, ['number', 'state', 'isDraft', 'headRefOid', 'autoMergeRequest']);
     queue = queueModeFor({ gh, pr });
-    mergeLocal = mergeInProgress({ gh, pr, env });
   } catch (err) {
-    if (err instanceof GhError || err instanceof QueueUnreadable) throw unavailable(String(err.message).split('\n')[0]);
+    if (err instanceof GhError || err instanceof QueueUnreadable) throw unavailable(String(err.message).split('\n')[0], 'read');
     throw err;
   }
   try {
@@ -56,12 +71,11 @@ export const run = guarded(async (argv, ctx) => {
     recordWhy = err.message;
   }
 
-  // 2. Refuse, nothing changed.
-  if (view.state !== 'OPEN') throw refuse('not-open', `PR #${pr} is ${String(view.state).toLowerCase()}, not open: nothing was changed`);
+  // 2. Refuse, nothing changed. (A running local merge was refused by the lock above.)
+  if (view.state !== 'OPEN') throw refuse('not-open', `PR #${pr} is ${String(view.state).toLowerCase()}, not open: nothing was changed. Do NOT push; tell the owner`);
   const underway = [];
   if (queue.state.inQueue) underway.push(`PR #${pr} is in the merge queue (position ${queue.state.entry.position})`);
   if (view.autoMergeRequest !== null && view.autoMergeRequest !== undefined) underway.push(`auto-merge is armed on PR #${pr}`);
-  if (mergeLocal) underway.push(mergeLocal.why);
   if (record !== null && record.terminal === null) underway.push(`a merge-queue record for #${pr} is still live in this repository`);
   if (recordWhy !== null) underway.push(`the merge-queue record for #${pr} is unreadable (${recordWhy})`);
   if (underway.length > 0) {
@@ -96,13 +110,13 @@ export const run = guarded(async (argv, ctx) => {
   } catch (err) {
     if (!(err instanceof GhError)) throw err;
     const message = String(err.message).split('\n')[0];
-    if (err.timedOut || err.overBuffer || UNREACHABLE.test(err.message)) {
-      throw new Fail(EXIT.UNAVAILABLE, { ok: false, ...result, unavailable: true, error: 'unavailable', message, changed: false, warnings });
+    if (err.timedOut || err.overBuffer || UNREACHABLE.test(String(err.stderr ?? ''))) {
+      throw new Fail(EXIT.UNAVAILABLE, { ok: false, ...result, unavailable: true, error: 'unavailable', stage: 'convert', message, changed: false, warnings });
     }
-    throw new Fail(EXIT.FAILED, { ok: false, ...result, reason: 'convert-failed', message: `PR #${pr} could not be turned back to draft: ${message}`, draft: false, changed: false, warnings });
+    throw new Fail(EXIT.FAILED, { ok: false, ...result, reason: 'convert-failed', stage: 'convert', message: `PR #${pr} could not be turned back to draft: ${message}`, draft: false, changed: false, warnings });
   }
   if (converted.isDraft !== true) {
-    throw new Fail(EXIT.FAILED, { ok: false, ...result, reason: 'convert-failed', message: `GitHub did not report PR #${pr} as a draft after the conversion`, draft: false, changed: false, warnings });
+    throw new Fail(EXIT.FAILED, { ok: false, ...result, reason: 'convert-failed', stage: 'convert', message: `GitHub did not report PR #${pr} as a draft after the conversion`, draft: false, changed: false, warnings });
   }
   // Auto-merge armed between the read and the conversion: a draft cannot merge, but an armed request would fire at the next ready, so disarm it.
   if (converted.autoMergeArmed) {
@@ -112,4 +126,4 @@ export const run = guarded(async (argv, ctx) => {
 
   // 5. Done.
   return { exitCode: EXIT.OK, output: { ok: true, ...result, draft: true, changed: true, warnings } };
-});
+}
