@@ -4,7 +4,7 @@
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { roundWorld, findingsOf, low } from './helpers/round-world.mjs';
@@ -461,6 +461,50 @@ test('R3-B1: a discarded round that had been applied is not a fresh attempt eith
   const r = w.apply(w.projects, [], 2);
   assertExit(r, 0, r.stdout + r.stderr);
   assert.match(r.json.transcript, /agent-old\.jsonl$/, 'the same run, not a second one');
+});
+
+// Make every transcript file under a projects folder look hours old (past the default 6 h search window).
+function age(projects, hours) {
+  const when = new Date(Date.now() - hours * 3600e3);
+  const walk = (dir) => { for (const e of readdirSync(dir, { withFileTypes: true })) { const p = join(dir, e.name); if (e.isDirectory()) walk(p); else utimesSync(p, when, when); } };
+  walk(projects);
+}
+
+test('R3-F1: a tagged transcript older than the default 6 h window is still found: a resumed session proves it with apply (not-found would start a second agent and a rerolled count)', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  install(w, prep, { agentId: 'a1' });
+  age(w.projects, 30); // session A was lost; the PR is resumed a day later
+  assertExit(w.run(), 3);
+  const resumed = w.prepare();
+  assertExit(resumed, 0, resumed.stdout + resumed.stderr);
+  assert.equal(resumed.json.reused, true);
+  const r = w.apply(w.projects, ['--tag', resumed.json.tag]);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.match(r.json.transcript, /agent-a1\.jsonl$/);
+  assert.deepEqual(w.attempts().attempts.map((a) => a.status), ['applied']);
+});
+
+test('R3-F1: an old tagged transcript that is not valid takes the normal invalid path (counted), never not-found; the seam max age does not hide it either', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  install(w, prep, { agentId: 'a1', models: ['claude-sonnet-4-6'] });
+  age(w.projects, 30);
+  const r = w.apply(w.projects, ['--max-age-ms', '3600000']);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.retry, 'prepare');
+  assert.deepEqual(w.attempts().attempts.map((a) => a.status), ['invalid']);
+  assert.equal(w.prepare().json.attempt, 2, 'the stale run was counted: waiting 6 h is not a re-roll');
+});
+
+test('R3-F1: with no transcript carrying the tag at all apply is still exit 2 not-found, however old other transcripts are', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  install(w, prep, { agentId: 'other', tag: 'pipeline-substitute R1 deadbeef' });
+  age(w.projects, 30);
+  const r = w.apply(w.projects);
+  assertExit(r, 2, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'not-found');
 });
 
 test('apply: no transcript with the tag is exit 2 not-found and records nothing; no prepared attempt is no-prepare', (t) => {

@@ -14,6 +14,8 @@ export const READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob'];
 export const ALLOWED_TOOLS = [...READ_ONLY_TOOLS, 'SubagentHandback'];
 export const MODEL_PREFIX = { 'substitute-opus': 'claude-opus-', 'substitute-fable': 'claude-fable-' };
 export const PROOF_EFFORT = 'high';
+// findSubagentTranscript refuses a non-finite age, so "any age" is a number of milliseconds longer than any file can be old.
+const ANY_AGE_MS = Number.MAX_SAFE_INTEGER;
 
 // `--projects-dir` and `--max-age-ms` let a caller point the proof at any folder and any age, which is only fair for the test suite: a substitute REPLACES a Codex review,
 // so an agent that could name the folder could forge the transcript that proves it. Outside test mode (the checkout-only seam PIPELINE_TEST_MODE, ignored by an installed
@@ -27,19 +29,22 @@ export function refuseTestOnlyFlags(values, env) {
   }
 }
 
-// -> null when no recent transcript carries the tag; else { found, proof, claudeCodeVersions, jsonlText }. Every problem is pushed to `errors` (the caller's list).
+// -> null when no transcript carries the tag (one that does is judged whatever its age: the window applies only when none does); else { found, proof, claudeCodeVersions, jsonlText }. Every problem is pushed to `errors` (the caller's list).
 //   agent: the agent type the attempt was prepared for; expectedPrompt: the exact first prompt; requiredReads: absolute paths that must each show a successful Read.
 //   projectsDir / maxAgeMs: test mode only (refuseTestOnlyFlags); without projectsDir the search is under the account's projects folder and a found transcript must really be inside it.
 export function proveSubstituteRun({ tag, projectsDir, maxAgeMs, agent, expectedPrompt, requiredReads, errors, env }) {
   const accountRoot = projectsDir === undefined ? accountProjectsRoot({ env }) : undefined;
   if (accountRoot !== undefined) projectsDir = accountRoot;
-  const found = findSubagentTranscript({ tag, projectsDir, maxAgeMs });
+  // The tag binds a transcript to one attempt at one round content, so a transcript that carries it is THE run whatever its age: the re-roll count (findTaggedTranscripts below) has
+  // no age limit either, and answering "not found" for an old one would send the caller to start a second agent that the next apply rejects as rerolled (cp #256 R3-F1). The
+  // age window only keeps an unrelated old run from being picked when nothing carries the tag at all - and then it finds nothing either.
+  const tagged = findTaggedTranscripts({ tag, projectsDir });
+  const found = findSubagentTranscript({ tag, projectsDir, maxAgeMs: tagged.length > 0 ? ANY_AGE_MS : maxAgeMs });
   if (!found) return null;
   if (accountRoot !== undefined && !transcriptUnderRoot(found.jsonlPath, accountRoot)) errors.push("the transcript is not under the account's projects folder (a link out of it does not count)");
   const jsonlText = readFileOrFail(found.jsonlPath, 'transcript');
   const metaText = found.metaPath === null ? undefined : readFileOrFail(found.metaPath, 'meta');
 
-  const tagged = findTaggedTranscripts({ tag, projectsDir });
   if (tagged.length !== 1) errors.push(`rerolled: ${tagged.length} transcripts carry the tag ${JSON.stringify(tag)}; a tag is one run`);
 
   // The arbiter's proof: pinned model per turn, effort, agent type, no per-call model, one prompt, a complete final answer.
