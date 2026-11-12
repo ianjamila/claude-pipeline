@@ -4,15 +4,18 @@
 // status / bookkeeping files live in a scratch account home. The real download + installer-flag path is in update-scheduled-installer.test.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { run as update, meta } from '../pipeline/commands/update.mjs';
 import { emit } from '../pipeline/lib/cli.mjs';
 import {
-  DEFER_NOTICE_MS, STATE_FILE, STATUS_FILE, TRANSIENT_RUNS, describeLive, normalizeLive, ownerCommand, pipelineStateDir,
+  DEFER_NOTICE_MS, STATE_FILE, STATUS_FILE, TRANSIENT_RUNS, composeNotice, describeLive, normalizeLive, ownerCommand, pipelineStateDir,
 } from '../pipeline/lib/auto-update.mjs';
-import { defaultNotify } from '../pipeline/lib/queue-sweep.mjs';
+import { scanLiveWork } from '../pipeline/lib/live-work-scan.mjs';
+import { BANNER_MAX, defaultNotify } from '../pipeline/lib/queue-sweep.mjs';
+import { openOrRenewLease } from '../pipeline/lib/review-lease.mjs';
 
 const made = [];
 process.on('exit', () => { for (const d of made) rmSync(d, { recursive: true, force: true }); });
@@ -466,7 +469,9 @@ test('normalizeLive / describeLive: repo, PR and worktree are named; unknown sha
 test('R3-F2: describeLive shows the detail of job / state-lock / merge-lock entries that name no PR, and leaves entries with a PR as they were', () => {
   const job = { kind: 'job', repo: '/work/app', worktree: '/work/app', detail: 'job ci has an unreadable record (meta.json), treated as running: remove .review/jobs/ci in that worktree if it is stale' };
   const text = describeLive(normalizeLive([job]));
-  assert.match(text, /job ci has an unreadable record \(meta\.json\), treated as running: remove \.review\/jobs\/ci in that worktree if it is stale/);
+  // #258: the remove instruction is a hint field now; describeLive keeps the cause and never prints a hint.
+  assert.match(text, /job ci has an unreadable record \(meta\.json\), treated as running$/);
+  assert.doesNotMatch(text, /remove/);
   assert.match(text, /\/work\/app/);
   assert.match(describeLive(normalizeLive([{ kind: 'state-lock', detail: 'pr-state-acme-app-7 is held by pid 9 on host, since T' }])), /state-lock.*pr-state-acme-app-7 is held by pid 9/);
   assert.match(describeLive(normalizeLive([{ kind: 'merge-lock', detail: 'the merge command record merge-x.child.json is unreadable (not JSON), treated as running' }])), /merge-lock.*merge-x\.child\.json is unreadable/);
@@ -474,30 +479,70 @@ test('R3-F2: describeLive shows the detail of job / state-lock / merge-lock entr
   assert.equal(describeLive(normalizeLive([withPr])), 'acme/app #12 (/w)');
 });
 
-// R4-F1: the remove hint is never cut: a long worktree path and job name must not produce a hint naming a different folder.
-test('R4-F1: a job hint for a long worktree and a long job name is whole or absent after normalizeLive, never a truncated path', async () => {
-  const { scanLiveWork } = await import('../pipeline/lib/live-work-scan.mjs');
-  const worktree = '/Users/someone/Claude/some-project/.worktrees/agent-a-rather-long-worktree-name-for-this-task-xx';
-  assert.ok(worktree.length >= 85);
-  const hintOf = (name) => `remove .review/jobs/${name} in that worktree if it is stale`;
-  const detailFor = (name) => `job ${name} has an unreadable record (meta.json), treated as running: ${hintOf(name)}`;
+// Real scan output for the hint tests below (#258 asks for the notice to be driven by what scanLiveWork returns, not a hand-written copy). One scratch machine: its own lock, lease
+// and home folders, and a git repository at a (long) path whose `.review/jobs/<name>/meta.json` is corrupt.
+const LEASE_ENV = (dir) => ({ PIPELINE_LOCK_DIR: join(dir, 'locks'), PIPELINE_REVIEW_LEASE_DIR: join(dir, 'leases'), PIPELINE_MACHINE_ID: 'test-machine-id' });
+function gitRepo(dir) {
+  mkdirSync(dir, { recursive: true });
+  const r = spawnSync('git', ['init', '-q'], { cwd: dir, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  return dir;
+}
+function brokenJobRepo(dir, repoName, jobName) {
+  const repo = gitRepo(join(dir, repoName));
+  const jobDir = join(repo, '.review', 'jobs', jobName);
+  mkdirSync(jobDir, { recursive: true });
+  writeFileSync(join(jobDir, 'meta.json'), '{ not json');
+  return repo;
+}
+function scanOf(dir, repos, leaseOpts = {}) {
+  mkdirSync(join(dir, 'locks'), { recursive: true });
+  return scanLiveWork({ env: LEASE_ENV(dir), home: join(dir, 'home'), repos, leaseOpts });
+}
+const hintOf = (name) => `remove .review/jobs/${name} in that worktree if it is stale`;
+
+// R4-F1: the remove hint is never cut: a long worktree path and job name must not produce a hint naming a different folder. It is its own field now (#258), whole or dropped (> 300).
+test('R4-F1 / #258: a job hint for a long worktree and a long job name, from REAL scan output, is whole in its own field or absent after normalizeLive, and never inside detail or describeLive', () => {
+  const dir = scratch();
+  const longRepo = 'agent-a-rather-long-worktree-name-for-this-task-xx-and-some-more-to-be-sure-it-is-long';
   for (const name of ['codex-review-final-pass', 'a'.repeat(60)]) {
-    const [by] = normalizeLive([{ kind: 'job', repo: worktree, worktree, detail: detailFor(name) }]);
-    assert.ok(by.detail.includes(`job ${name} has an unreadable record (meta.json), treated as running`), 'the cause stays');
-    assert.ok(by.detail.endsWith(hintOf(name)) || !by.detail.includes('remove'), `hint whole or absent: ${by.detail}`);
+    const repo = brokenJobRepo(dir, `${longRepo}-${name.length}`, name);
+    assert.ok(repo.length >= 85);
+    const real = scanOf(dir, [repo]).filter((e) => e.kind === 'job');
+    assert.equal(real.length, 1, JSON.stringify(real));
+    assert.ok(real[0].detail.endsWith(`: ${hintOf(name)}`), 'the scan keeps the legacy text for older installed readers');
+    const [by] = normalizeLive(real);
+    assert.equal(by.hint, hintOf(name), 'the hint travels whole');
+    assert.ok(by.detail.startsWith(`job ${name} has an unreadable record`), 'the cause stays');
+    assert.ok(!by.detail.includes('remove'), `no hint inside detail: ${by.detail}`);
     const text = describeLive([by]);
-    assert.ok(text.includes(`(${worktree})`), 'the worktree is printed');
-    assert.ok(!/remove [^ ]*$/.test(text), `no dangling cut path: ${text}`);
+    assert.ok(text.includes(`(${repo})`), 'the worktree is printed');
+    assert.ok(!text.includes('remove'), `describeLive never carries a hint: ${text}`);
   }
-  // a name long enough that the whole hint cannot fit: dropped, not cut
-  const long = 'j'.repeat(70);
-  const [dropped] = normalizeLive([{ kind: 'job', repo: worktree, worktree, detail: detailFor(long) }]);
+  // a name so long that the hint cannot be trusted whole (> 300): the hint is dropped, never cut, and the legacy suffix is gone from detail too
+  const long = 'j'.repeat(250);
+  const repo = brokenJobRepo(dir, 'dropped', long);
+  const [dropped] = normalizeLive(scanOf(dir, [repo]).filter((e) => e.kind === 'job'));
+  assert.ok(hintOf(long).length > 300);
+  assert.equal(dropped.hint, undefined, 'dropped, not cut');
   assert.ok(dropped.detail.length <= 200);
-  assert.ok(!dropped.detail.includes('remove'), `hint dropped, not cut: ${dropped.detail}`);
-  assert.ok(dropped.detail.startsWith(`job ${long} has an unreadable record (meta.json), treated as running`));
-  // and a name that fits keeps its whole hint
-  const [kept] = normalizeLive([{ kind: 'job', repo: worktree, worktree, detail: detailFor('codex-review-final-pass') }]);
-  assert.ok(kept.detail.endsWith(hintOf('codex-review-final-pass')));
+  assert.ok(!dropped.detail.includes('remove'), dropped.detail);
+  assert.ok(dropped.detail.startsWith(`job ${long.slice(0, 40)}`));
+});
+
+test('#258 skew: an OLDER installer sends the hint only inside detail: normalizeLive moves the legacy suffix into hint; a hint field and the suffix together are not doubled; other hints are left alone', () => {
+  const legacy = `job x has an unreadable record (meta.json), treated as running: ${hintOf('x')}`;
+  const [old] = normalizeLive([{ kind: 'job', worktree: '/w', detail: legacy }]);
+  assert.deepEqual({ detail: old.detail, hint: old.hint }, { detail: 'job x has an unreadable record (meta.json), treated as running', hint: hintOf('x') });
+  const [both] = normalizeLive([{ kind: 'job', worktree: '/w', detail: legacy, hint: hintOf('x') }]);
+  assert.deepEqual({ detail: both.detail, hint: both.hint }, { detail: old.detail, hint: hintOf('x') });
+  const [scanErr] = normalizeLive([{ kind: 'scan-error', detail: 'cannot judge the review lease of proc-1-aaaaaaaa', hint: 'delete /l/proc-1-aaaaaaaa.json if no pipeline command is running in a terminal' }]);
+  assert.equal(scanErr.hint, 'delete /l/proc-1-aaaaaaaa.json if no pipeline command is running in a terminal');
+  assert.equal(scanErr.detail, 'cannot judge the review lease of proc-1-aaaaaaaa');
+  assert.equal(normalizeLive([{ kind: 'job', detail: 'job y is running' }])[0].hint, undefined);
+  assert.equal(normalizeLive([{ kind: 'job', detail: 'job y', hint: 5 }])[0].hint, undefined, 'a hint that is not text is ignored');
+  assert.equal(normalizeLive([{ kind: 'job', detail: 'job y', hint: `delete ${'p'.repeat(300)}` }])[0].hint, undefined, '> 300 characters: dropped');
+  assert.ok(!describeLive(normalizeLive([{ kind: 'job', worktree: '/w', detail: legacy }])).includes('remove'));
 });
 
 test('defaultNotify with event pipeline-update: its own stderr prefix, notices log and banner title; the queue sweep keeps its own', () => {
@@ -732,4 +777,161 @@ test('R2-F3: a scan-error next to a real review keeps the review wording and sti
   const r = await t.go();
   assert.match(r.output.message, /waits for a live review: acme\/app #12/);
   assert.match(r.output.message, /could not check.*queue-sweep-repos\.json/);
+});
+
+// ---- #258 / R4-1: the 24 hour notice is composed by budget; the banner never cuts an instruction; the log and stderr carry everything ------------------
+
+// The text AFTER osascript parsed it: display notification "<escaped>" with title "..." -> the escaped text, un-escaped.
+const bannerOf = (spawned) => {
+  const arg = spawned.at(-1)[1][1];
+  const m = /^display notification "(.*)" with title "[^"]*"$/s.exec(arg);
+  assert.ok(m, arg);
+  return m[1].replace(/\\(["\\])/g, '$1');
+};
+// A notifier that writes to a scratch log and records stderr and osascript calls, for a real run of the scheduled update.
+function recordingNotify(dir) {
+  const seen = { stderr: '', spawned: [] };
+  const notify = defaultNotify({ env: { PIPELINE_PRUNE_LOG_DIR: join(dir, 'log') }, platform: 'darwin', stderr: { write: (s) => { seen.stderr += s; } }, spawn: (...a) => seen.spawned.push(a), event: 'pipeline-update' });
+  return { seen, notify, log: () => readFileSync(join(dir, 'log', 'pipeline-update-notices.log'), 'utf8') };
+}
+const deferredWith = (live) => ({ exitCode: 1, output: { ok: false, error: 'deferred', deferred: true, live, message: 'a review is live' } });
+// Two runs a day apart, with the default account (the owner's command is the short `node ~/.claude/pipeline/bin/pipeline.mjs update`); -> the rig.
+async function dayLater(live, extra = {}) {
+  const t = rig({ install: deferredWith(live) });
+  const go = () => update(['--scheduled', '--json', '--claude-home', join(homedir(), '.claude')], { env: {}, hasClaudeCodeAncestor: () => false, auto: { ...t.auto, ...extra } });
+  await go();
+  t.w.clock = T0 + DEFER_NOTICE_MS + 60 * 1000;
+  await go();
+  return t;
+}
+// A terminal process lease whose end cannot be confirmed (ps cannot answer), in a worktree with a long path, in the scratch lease folder.
+async function uncertainLease(dir, worktree) {
+  mkdirSync(worktree, { recursive: true });
+  const env = LEASE_ENV(dir);
+  const base = { env, home: join(dir, 'home'), ancestorPid: null, now: Date.now(), kill: () => {}, jobLive: () => false };
+  const holder = { sessionId: 'proc-4242-0123abcd', pid: 4242, pidStart: 'Thu Nov 12 07:00:00 2026' };
+  await openOrRenewLease({ worktree, repoId: 'acme/app', pr: 7, command: 'codex-review', processHolder: holder, starts: () => new Map([[4242, holder.pidStart]]), ...base });
+  return { file: join(dir, 'leases', `${holder.sessionId}.json`), scan: () => scanOf(dir, [], { ...base, starts: () => null }) };
+}
+
+test('R4-1: a job hint that fits is whole in the banner; the log, stderr and the status file carry it too', async () => {
+  const dir = scratch();
+  const repo = brokenJobRepo(dir, 'wt', 'review');
+  const live = scanOf(dir, [repo]);
+  const rec = recordingNotify(dir);
+  const t = await dayLater(live, { notify: rec.notify });
+  const banner = bannerOf(rec.seen.spawned);
+  assert.ok(banner.length <= BANNER_MAX, `${banner.length}: ${banner}`);
+  assert.ok(banner.includes(hintOf('review')), banner);
+  assert.ok(banner.includes('more than 24 hours'));
+  assert.ok(rec.seen.stderr.includes(hintOf('review')) && rec.log().includes(hintOf('review')));
+  assert.equal(t.status().deferredBy[0].hint, hintOf('review'));
+  assert.doesNotMatch(t.status().deferredBy[0].detail, /remove/);
+});
+
+test('R4-1: an uncertain process lease with a real lease path in a long worktree: the banner has the whole pointer (never a cut path); stderr and the log keep the whole delete hint; the status file keeps it', async () => {
+  const dir = scratch();
+  const worktree = join(dir, 'Claude', 'some-project', '.worktrees', 'agent-a-rather-long-worktree-name-for-this-task-xx-and-some-more-to-be-sure');
+  const lease = await uncertainLease(dir, worktree);
+  const live = lease.scan();
+  assert.equal(live[0].kind, 'scan-error', JSON.stringify(live));
+  const hint = `delete ${lease.file} if no pipeline command is running in a terminal`;
+  assert.equal(live[0].hint, hint);
+  const rec = recordingNotify(dir);
+  const statusFile = join(dir, 'update-status.json'); // a short path: the pointer carries it whole
+  const t = await dayLater(live, { notify: rec.notify, statusFile });
+  const pointer = `run: pipeline leases (or see ${statusFile})`;
+  const banner = bannerOf(rec.seen.spawned);
+  assert.ok(banner.length <= BANNER_MAX, `${banner.length}: ${banner}`);
+  assert.ok(banner.includes(pointer), banner);
+  assert.ok(!banner.includes('proc-4242') && !banner.includes('review-leases'), `no part of the lease path in the banner: ${banner}`);
+  assert.ok(banner.includes('could not check for running reviews'), banner);
+  assert.ok(rec.seen.stderr.includes(hint), 'stderr carries the whole hint');
+  assert.ok(rec.log().includes(hint), 'the notices log carries the whole hint');
+  assert.ok(rec.seen.stderr.includes('cannot judge the review lease of proc-4242-0123abcd on '), 'and the cause, naming the session');
+  assert.equal(JSON.parse(readFileSync(statusFile, 'utf8')).deferredBy[0].hint, hint, 'the status file keeps every hint whole');
+});
+
+test('R4-1: the cause takes the rest of the budget and is cut with an ellipsis; the action stays whole; a 24 h notice with no hint keeps its wording', async () => {
+  const long = [{ kind: 'scan-error', detail: `the repository registry ${'/very/long/path'.repeat(30)} cannot be read` }];
+  const rec = recordingNotify(scratch());
+  await dayLater(long, { notify: rec.notify });
+  const banner = bannerOf(rec.seen.spawned);
+  assert.ok(banner.length <= BANNER_MAX && banner.includes('…'), banner);
+  assert.ok(banner.endsWith('Fix that, or run in your own terminal: node ~/.claude/pipeline/bin/pipeline.mjs update'), banner);
+  assert.ok(rec.seen.stderr.includes('/very/long/path'.repeat(10)), 'the log line is the whole cause');
+  assert.ok(!rec.seen.stderr.includes('…'), 'and is not cut');
+});
+
+test('R4-1: the "deferred N runs" notice is budgeted the same way: a long installer message is cut in the banner only, the command stays whole', async () => {
+  const dir = scratch();
+  const rec = recordingNotify(dir);
+  const message = `another update or a review start holds admission ${'x'.repeat(400)}`;
+  const t = rig({ install: deferredBy('admission-busy', message) });
+  for (let i = 1; i <= TRANSIENT_RUNS; i += 1) {
+    t.w.clock += 60 * 1000;
+    await update(['--scheduled', '--json', '--claude-home', join(homedir(), '.claude')], { env: {}, hasClaudeCodeAncestor: () => false, auto: { ...t.auto, notify: rec.notify } });
+  }
+  const banner = bannerOf(rec.seen.spawned);
+  assert.ok(banner.length <= BANNER_MAX && banner.includes('…'), banner);
+  assert.ok(banner.endsWith('run in your own terminal: node ~/.claude/pipeline/bin/pipeline.mjs update'), banner);
+  assert.ok(rec.seen.stderr.includes('x'.repeat(400)), 'stderr has the whole message');
+});
+
+test('P2-5: appleText cuts the flattened DISPLAY text to BANNER_MAX first and escapes afterwards: quotes and backslashes at the boundary never push a fitting message over the cut', () => {
+  assert.equal(BANNER_MAX, 240);
+  for (const unit of ['"', '\\', 'a"b\\']) {
+    for (let n = BANNER_MAX - 6; n <= BANNER_MAX + 6; n += 1) {
+      const text = unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+      const spawned = [];
+      defaultNotify({ env: { PIPELINE_PRUNE_LOG_DIR: scratch() }, platform: 'darwin', stderr: { write() {} }, spawn: (...a) => spawned.push(a) })(text);
+      assert.equal(bannerOf(spawned), text.slice(0, BANNER_MAX), `${JSON.stringify(unit)} x ${n}`);
+    }
+  }
+  // control characters are flattened to spaces before the cut
+  const spawned = [];
+  defaultNotify({ env: { PIPELINE_PRUNE_LOG_DIR: scratch() }, platform: 'darwin', stderr: { write() {} }, spawn: (...a) => spawned.push(a) })('a\nb\tc');
+  assert.equal(bannerOf(spawned), 'a b c');
+});
+
+test('defaultNotify takes { text, banner }: stderr and the log get the whole text, the banner gets its own (cut) text; a bare string still serves all three', () => {
+  const dir = scratch();
+  let err = '';
+  const spawned = [];
+  const notify = defaultNotify({ env: { PIPELINE_PRUNE_LOG_DIR: dir }, platform: 'darwin', stderr: { write: (s) => { err += s; } }, spawn: (...a) => spawned.push(a), event: 'pipeline-update' });
+  notify({ text: 'the whole text with "quotes" and every hint', banner: 'short "banner"' });
+  assert.equal(err, 'pipeline-update: the whole text with "quotes" and every hint\n');
+  assert.match(readFileSync(join(dir, 'pipeline-update-notices.log'), 'utf8'), / the whole text with "quotes" and every hint\n$/);
+  assert.equal(bannerOf(spawned), 'short "banner"');
+  notify('plain');
+  assert.equal(bannerOf(spawned), 'plain');
+});
+
+test('R4-1: composeNotice reserves head + action, gives the cause the rest, and steps down hints+tail -> hints -> pointer+tail -> pointer -> pointer without its path; the text is always whole', () => {
+  const tail = 'run in your own terminal: node ~/p update';
+  const action = (hint, pointer) => ({ lead: 'Finish or close them', hintLead: 'Finish or close them; ', hints: [hint], tail, pointer });
+  const head = 'pipeline update to aaaaaaa has been waiting more than 24 hours for live reviews:';
+  const cause = 'c'.repeat(400);
+  const small = 'remove .review/jobs/x in that worktree if it is stale';
+  const big = `delete /${'h'.repeat(140)} if no pipeline command is running in a terminal`;
+  const ptr = (n) => `run: pipeline leases (or see /${'p'.repeat(n)}/s.json)`;
+  const run = (hint, pointer, h = head) => {
+    const n = composeNotice({ head: h, cause, action: action(hint, pointer) });
+    assert.ok(n.banner.length <= BANNER_MAX, `${n.banner.length}`);
+    assert.ok(n.text.includes(hint) && n.text.includes(cause) && n.text.endsWith('node ~/p update'), 'text: whole cause, every hint, the tail');
+    return n.banner;
+  };
+  const roomy = composeNotice({ head: 'update to aaaaaaa waits:', cause: 'short cause', action: action(small, ptr(0)) });
+  assert.equal(roomy.banner, roomy.text, 'everything fits: banner = text');
+  const t1 = composeNotice({ head: 'update to aaaaaaa waits:', cause: 'x'.repeat(120), action: action(small, ptr(0)) });
+  assert.ok(t1.banner.endsWith(`; ${small}. Or ${tail}`) && t1.banner.includes('…') && t1.banner.length <= BANNER_MAX, t1.banner);
+  const t2 = run(small, ptr(0));
+  assert.ok(t2.endsWith(`; ${small}.`) && !t2.includes('Or run in your own') && t2.includes('…'), `hints without the tail: ${t2}`);
+  const t3 = run(big, ptr(0));
+  assert.ok(t3.endsWith(`${ptr(0)}. Or ${tail}`) && !t3.includes('hhh'), `pointer + tail: ${t3}`);
+  const t4 = run(big, ptr(80));
+  assert.ok(t4.endsWith(`${ptr(80)}.`) && !t4.includes('Or run in your own'), `the whole pointer: ${t4}`);
+  const t5 = run(big, ptr(300));
+  assert.ok(t5.endsWith('Finish or close them; run: pipeline leases.') && !t5.includes('ppp'), `no cut path: ${t5}`);
+  assert.ok([t2, t3, t4, t5].every((b) => b.includes('…')), 'the cause is cut with an ellipsis');
 });
