@@ -93,6 +93,10 @@ export const DEFAULTS = deepFreeze({
     // A commit after the last review round that only ADDS lines to these files needs no new round (lib/docs-exempt.mjs).
     // Empty = off.
     docs_exempt_paths: [],
+    // The stand-in reviewer used for a round Codex refuses with a real quota error (plan 2026-11-11-codex-substitute-reviewer).
+    // mode: auto = use it, off = park as before. min_wait_minutes: 0 never waits for Codex; above 0, a reset that near is waited for instead
+    // (no substitute, the output says waitUntil). max_packet_mb: the evidence a substitute needs may not pass this size.
+    substitute: { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 },
   },
   agent_log: 'docs/agent-log.md',
 });
@@ -154,6 +158,7 @@ export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 // the PR ahead, the provider's own release of that PR, or the provider's own override.
 export const MERGE_HOLD_KEYS = ['hold_command', 'hold_release_command', 'hold_check_command'];
 export const BEHIND_BASE_MODES = Object.freeze(['update', 'disjoint']);
+export const SUBSTITUTE_MODES = Object.freeze(['auto', 'off']);
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
@@ -170,7 +175,8 @@ const KEYS = {
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'arbiter_always_paths', 'docs_exempt_paths'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute'],
+  review_substitute: ['mode', 'min_wait_minutes', 'max_packet_mb'],
   smoke: ['path', 'status', 'contains', 'location_contains'],
 };
 
@@ -673,6 +679,14 @@ export function validateConfig(obj) {
         if (!EFFORT_LANES.includes(lane)) errors.push(`unknown key: review.effort.${lane} (lanes are ${EFFORT_LANES.join('|')})`);
         else if (!EFFORTS.includes(review.effort[lane])) errors.push(`review.effort.${lane} must be one of ${EFFORTS.join('|')}`);
       }
+    }
+    const sub = review.substitute;
+    if (!isObj(sub)) errors.push('review.substitute must be a mapping');
+    else {
+      unknownKeys(sub, KEYS.review_substitute, 'review.substitute.', errors);
+      if (!SUBSTITUTE_MODES.includes(sub.mode)) errors.push(`review.substitute.mode must be one of ${SUBSTITUTE_MODES.join('|')}`);
+      if (!inRange(sub.min_wait_minutes, 0, 720)) errors.push('review.substitute.min_wait_minutes must be an integer 0..720');
+      checkPosInt(sub.max_packet_mb, 'review.substitute.max_packet_mb', errors);
     }
   }
 

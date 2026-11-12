@@ -133,5 +133,9 @@ review:
                                 # a hard-stop path rule, integrity.test_globs, hard_stops.paths, arbiter_always_paths or risk.high_risk_paths covers, nothing under supabase/ or
                                 # migrations/. Read from the config at the reviewed head, so the commit that adds a path cannot use it. Empty = off. The vendored CI runner
                                 # validates this key: run `pipeline vendor` first, or it rejects the unknown key
+  substitute:                   # the stand-in reviewer (Claude Opus, Fable for a high-risk PR) for a round Codex refuses because its quota is spent
+    mode: auto                  #   auto = use it (the owner's own "merge" is then required); off = park the PR until Codex is back
+    min_wait_minutes: 0         #   0 = never wait for Codex; N > 0 = when Codex says it is back within N minutes, wait for it instead
+    max_packet_mb: 8            #   the evidence a substitute needs (rules files, the patch) may not pass this size, else the round parks
 
 agent_log: docs/agent-log.md   # one line per run; kept on the orphan branch `pipeline-agent-log` (`pipeline agent-log publish`), never committed to a PR branch

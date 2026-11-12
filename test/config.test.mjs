@@ -1001,3 +1001,27 @@ test('verify.ci_proof parses from real YAML (hyphenated step names, nested mappi
   assert.equal(r.ok, true, r.errors.join('; '));
   assert.deepEqual(r.config.verify.ci_proof, { 'sql-arms': { workflow: '.github/workflows/ci.yml', job: 'SQL arms', event: 'pull_request' } });
 });
+
+test('review.substitute: defaults (auto, never wait, 8 MB packet) and validation of every key', () => {
+  const d = validateConfig(minimal());
+  assert.deepEqual(d.config.review.substitute, { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 });
+  assert.ok(Object.isFrozen(DEFAULTS.review.substitute));
+  const ok = validateConfig({ ...minimal(), review: { substitute: { mode: 'off', min_wait_minutes: 20 } } });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual(ok.config.review.substitute, { mode: 'off', min_wait_minutes: 20, max_packet_mb: 8 });
+  const cases = [
+    [{ mode: 'on' }, 'review.substitute.mode must be one of auto|off'],
+    [{ min_wait_minutes: -1 }, 'review.substitute.min_wait_minutes must be an integer 0..720'],
+    [{ min_wait_minutes: 1.5 }, 'review.substitute.min_wait_minutes must be an integer 0..720'],
+    [{ min_wait_minutes: 721 }, 'review.substitute.min_wait_minutes must be an integer 0..720'],
+    [{ max_packet_mb: 0 }, 'review.substitute.max_packet_mb must be a positive integer'],
+    [{ max_packet_mb: 'big' }, 'review.substitute.max_packet_mb must be a positive integer'],
+    [{ modee: 'auto' }, 'unknown key: review.substitute.modee'],
+  ];
+  for (const [substitute, expected] of cases) {
+    const r = validateConfig({ ...minimal(), review: { substitute } });
+    assert.equal(r.ok, false, expected);
+    assert.ok(has(r, expected), `${expected}: ${r.errors.join(' | ')}`);
+  }
+  assert.ok(has(validateConfig({ ...minimal(), review: { substitute: 'auto' } }), 'review.substitute must be a mapping'));
+});
