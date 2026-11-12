@@ -153,6 +153,9 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
     this machine): a grant already used, or recorded for another head ("ask again"), is exit 2 round-cap; Codex exit 3, head-moved and a kill before the claim
     leave the grant open (a failure after the claim spends it: ask again). Success adds grantUsed:{grantId}; the round records admission and ownerGrant {grantId, k, quote, ownerTs}
     base-only rounds and resolution-only rounds (below) never count toward the cap
+  exit 2 {error:stale-history | unpublished-history | history-unreadable} for a COUNTED round, before Codex runs (read again under the final lock): the PR's triage comment is the
+    published history. stale-history: this copy lacks a published round or owner grant (run `pipeline state show --pr N`); unpublished-history: this copy holds rounds the PR
+    lacks, an earlier publish failed (run `pipeline comment --pr N --kind triage`); history-unreadable: the comment holds no readable state. No triage comment: no check
   reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired
     (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker's brief for the sensitive files; judge otherwise. Once fable, always fable
   confirm fixed: an accepted item that a forced or Claude ruling marked implemented through files other than the one it names (state mark-implemented,
@@ -679,6 +682,7 @@ pipeline state show [--round R] [--accepted] [--disputed] [--needs-human] [--pr 
   (local-ahead: the PR still holds what this copy last published, every published round and item is still in the local copy, and the local copy holds a second-review verdict or a Claude / forced final that was
   never published, or a decision that continues the published Claude / forced final or the published final of an item waiting for a human (a tightened ACCEPT, an owner ruling; possibly several unpublished steps, whose overruled chain reaches the published final), or an implementation mark or a follow-up issue link added after the last publish: kept, with a warning naming the retry command). A restored or quarantined copy records the published state as its baseline
   (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)
+  owner grants the PR holds on rounds this copy has (and it lacks or holds differently) are copied onto them, nothing is quarantined and local rounds / decisions are kept: grantsRestored:[round numbers]
   (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)
 pipeline state discard-round --round R [--pr N] [--repo DIR]
   -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;
