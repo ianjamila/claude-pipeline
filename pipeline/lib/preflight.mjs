@@ -9,7 +9,6 @@ import { isClean } from './git.mjs';
 import { run, codexCommand } from './proc.mjs';
 import { createGitHub } from './github.mjs';
 import { claudeCodeStatus } from './claude-code-version.mjs';
-import { evaluateBashForFiles } from '../hooks/lib/files-policy.mjs';
 import { MIN_FABLE, readFloor, readableAllowedIds, standingBypasses } from './model-floor.mjs';
 
 const CODEX_TIMEOUT_MS = 15_000;
@@ -138,17 +137,6 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
   const warnings = [];
   if (claudeCode.stale === true) {
     warnings.push(`this terminal runs Claude Code ${claudeCode.running} but ${claudeCode.installed} is installed: restart it before a review's Fable pass`);
-  }
-
-  // #161: the guard refuses a script an agent runs when the script's text spells the config-root path (even in a comment) and writes. The rule stays strict (no
-  // comment exemption), so say so BEFORE an agent is refused: run the guard on verify.quick from the repo root and carry its line-and-reword reason. Informational:
-  // it never changes canMerge, and a guard that cannot judge (any error) says nothing. (vendor --check has no loaded config here, so it does not run this.)
-  if (config.ok && typeof cfg?.verify?.quick === 'string') {
-    try {
-      const home = env.HOME || env.USERPROFILE || undefined;
-      const verdict = evaluateBashForFiles(cfg.verify.quick, { cwd: root, env, ...(home ? { home } : {}) });
-      if (verdict.decision === 'deny') warnings.push(`verify.quick (\`${cfg.verify.quick}\`) would be refused by the guard when an agent runs it: ${verdict.reason}`);
-    } catch { /* the guard could not judge it: nothing to warn about */ }
   }
 
   // A standing owner allowance or a hold below MIN_FABLE lets a Fable proof through that the shipped floor would refuse: say so until it is cleared.
