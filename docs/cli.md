@@ -252,6 +252,7 @@ pipeline followups create --round R [--repo DIR]
   one issue per fingerprint across the whole review; a FOLLOW-UP that needs a human is held, not filed.
   Each issue body starts with <!-- claude-pipeline:followup pr=N fp=FINGERPRINT -->; before creating, an issue of ours
   (any state) with that marker is REUSED (several: lowest number is canonical, the rest are listed, never closed)
+  (the scan reads 100 per page under its own 180 s limit and, when the PR creation time is readable, only issues updated since 1 h before it)
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
