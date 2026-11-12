@@ -407,7 +407,21 @@ const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice
 // `unset`), set in the environment, or a sourced script that may have set variables.
 // A name can be written without the letters IFS in a row (`eval "I""FS=,"`, `read $N`, `printf -v $N`, `declare I""FS=,`, `N=IFS; export $N`),
 // so the commands that assign a variable by a computed or split-up name count as well.
-const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s|\b(?:export|unset|declare|typeset|local|readonly)\b[^;&|\n]*[$`'"]/;
+const SETS_BY_NAME_HEAD = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s/;
+const DECLARING_WORD = /\b(?:export|unset|declare|typeset|local|readonly)\b/;
+// (#288 R3-F3: the declaring words used to be one pattern, `\b(?:export|…)\b[^;&|\n]*[$`'"]`, which rescans the rest of the segment from EVERY declaring word: 27,000 `export` words took 7 s. A segment holds a name-setting
+// declaration when its FIRST declaring word is followed by a quote, `$` or backtick before the segment ends -- the same answer, one pass per segment.)
+const SETS_BY_NAME = {
+  test(text) {
+    const s = String(text);
+    if (SETS_BY_NAME_HEAD.test(s)) return true;
+    for (const seg of s.split(/[;&|\n]/)) {
+      const k = DECLARING_WORD.exec(seg);
+      if (k && /[$`'"]/.test(seg.slice(k.index + k[0].length))) return true;
+    }
+    return false;
+  },
+};
 // Both the text as written and with its quotes and backslashes removed (`printf -vI""FS ,` spells the name only once they are gone).
 // Why (#81 Codex R1-B1 follow-up): a script the guard opens is judged with its own text too -- `bash wrapper.sh` hid `declare -n r=IFS; r=x` from the outer line. Whole-line comments are left out of
 // the binder test only (a comment that says "read" is no binder); the name IFS anywhere, a comment included, still counts.

@@ -482,3 +482,58 @@ describe('#288 R2', () => {
     });
   }
 });
+
+// #288 round 3: the whole / split enumeration of an expanded word had a third reading nobody listed (mixed quoting across words, `"$A"$B` inside one), and the class is closed fail-closed
+// now: an option tool / program tool / git word that an expansion changed must be ONE plain token (no blank, no leading `(`, no empty value, IFS untouched), else the call is no read-only call.
+// R3-F1: any `$` followed by something other than the end of the word or `/` is a run-time part (zsh `$=D`, `$~D`, `$^D`, `$+D`). R3-F2/F3: the IFS scan is done once per line.
+describe('#288 R3', () => {
+  const DENIED = [
+    ['R3-B1 mixed quoting across words', `N='x status'; O='--namespace '; git --namespace "$N" $O status clean -fdx .review`],
+    ['R3-F2 mixed quoting inside one word', `A='x status'; B=' --namespace'; git --namespace "$A"$B status clean -fdx .review`],
+    ['R3-F2 empty value drops a git operand', `E=; git -C $E status clean -fdx .review`],
+    ['R3-F2 zsh array value, git', `C=(x status); git -C $C clean -fdx .review`],
+    ['R3-F1 find $=D', `D=-delete; find ${CFG} $=D`],
+    ['R3-F1 find $=D, two options', `D='-true -delete'; find ${CFG} $=D`],
+    ['R3-F1 sort $=O', `O=-o; sort $=O ${S}`],
+    ['R3-F1 rg $~O', `O=--pre=cmd; rg $~O x ${S}`],
+    ['R3-F1 tree $=O', `O=-o/x; tree $=O ${CFG}`],
+    ['R3-F1 find -x$=D', `D=-delete; find ${CFG} -x$=D`],
+    ['R3-F1 find $~D', `D=-delete; find ${CFG} $~D`],
+    ['R3-F1 find $^D', `D=-delete; find ${CFG} $^D`],
+    ['R3-F1 find $+D', `D=-delete; find ${CFG} $+D`],
+    ['R3-F1 sort $^O', `O=-o; sort $^O ${S}`],
+    ['R3-F1 tree $~O', `O=-o/x; tree $~O ${CFG}`],
+    ['R3-F1 rg $+O', `O=--pre=cmd; rg $+O x ${S}`],
+  ];
+  for (const [label, line] of DENIED) {
+    test(`denies: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'deny', `${line} -> ${r.decision}`);
+    });
+  }
+  for (const [label, line] of [
+    ['190 kB line with 4,900 `$D` words (R3-F2)', `D=x; find ${S} ${'$D '.repeat(4900)}-delete ${'a'.repeat(170000)}`],
+    ['27,000 repeated export words on a protected line (R3-F3)', `D=x; find ${CFG} $D ${'export '.repeat(27000)}; cat ${S}`],
+    ['IFS may be set, 4,900 expanded words', `IFS=:; D=x; find ${S} ${'$D '.repeat(4900)}-delete ${'a'.repeat(170000)}`],
+  ]) {
+    test(`timing: ${label} is denied in under 2 s`, () => {
+      const t0 = performance.now();
+      const r = run(line);
+      const ms = performance.now() - t0;
+      assert.equal(r.decision, 'deny', `${r.decision}: ${r.reason}`);
+      assert.ok(ms < 2000, `took ${ms.toFixed(0)} ms`);
+    });
+  }
+  for (const [label, line] of [
+    ['a same-line one-word option value (find .)', 'D=-name; find . $D x'],
+    ['a one-word option value on a protected dir', `D=-L; find ${CFG} $D`],
+    ['git -C "$PWD" status', 'git -C "$PWD" status'],
+    ['a regex ending in a dollar for rg', `rg 'foo$' ${S}`],
+    ['an awk program with $1 and $NF', `awk '{print $1,$NF}' ${S}`],
+  ]) {
+    test(`allows: ${label}`, () => {
+      const r = run(line);
+      assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
+    });
+  }
+});
