@@ -1936,10 +1936,12 @@ function globMeets(w, toks) {
   }
   return at.has(m);
 }
-// R6-F1 / F2 (#288): the command line with its quoted strings removed, in ONE pass (the regexes this replaces were quadratic on an unterminated quote). An escaped character stays as written (`\\x`).
-// null: cannot be told -- no text, an unterminated quote, an ANSI-C / locale string (`$'…'`, `$"…"`: a backslash-quote in it does not end the string, and the parser keeps no per-word quoting to ask), or text that may
-// hold a comment or a heredoc body (R7-F1: a quote in a comment or a heredoc body is no quote, and this reader does not tell them apart: an unquoted `#` at the start of a word, or a `<<` anywhere) -- so every reader
-// of this fails closed on it.
+// R6-F1 / F2 (#288): the text of a command with its quoted strings removed, in ONE pass (the regexes this replaces were quadratic on an unterminated quote). An escaped character stays as written (`\\x`).
+// R8 (#288): the ONLY reader of this is unquotedGlob, which adds denials. The cd narrowing does not read quotes any more (it takes its facts from the parser).
+// null: cannot be told -- no text, an unterminated quote, an ANSI-C / locale string (`$'…'`, `$"…"`: a backslash-quote in it does not end the string, and the parser keeps no per-word quoting to ask),
+// text that may hold a comment or a heredoc body (R7-F1: a quote in a comment or a heredoc body is no quote: an unquoted `#` at the start of a word, or a `<<` anywhere), a backtick anywhere (R8-F2: the body
+// of a backtick substitution has its own backslash and comment rules), or a `$(` / `${` / backtick inside a double-quoted string (R8-B1 / F1: the shell starts a new quoting context there, which this flat
+// reader cannot follow) -- so unquotedGlob reads every one of them as holding a glob.
 // (R7-F4: the `$'` / `$"` test is made here, at the top level only: a `$` that ends a quoted string -- `grep 'x$' f` -- starts nothing.)
 function withoutQuotes(raw) {
   if (typeof raw !== 'string') return null;
@@ -1949,6 +1951,7 @@ function withoutQuotes(raw) {
   for (let i = 0; i < n; i++) {
     const c = raw[i];
     if (c === '\\') i++;
+    else if (c === '`') return null;
     else if (c === '$') {
       if (raw[i + 1] === "'" || raw[i + 1] === '"') return null;
     } else if (c === '<') {
@@ -1963,7 +1966,11 @@ function withoutQuotes(raw) {
       from = j + 1;
     } else if (c === '"') {
       let j = i + 1;
-      while (j < n && raw[j] !== '"') j += raw[j] === '\\' ? 2 : 1;
+      while (j < n && raw[j] !== '"') {
+        const d = raw[j];
+        if (d === '`' || (d === '$' && (raw[j + 1] === '(' || raw[j + 1] === '{'))) return null;
+        j += d === '\\' ? 2 : 1;
+      }
       if (j >= n) return null;
       out.push(raw.slice(from, i));
       i = j;
@@ -1978,20 +1985,6 @@ function withoutQuotes(raw) {
 function unquotedGlob(raw) {
   const t = withoutQuotes(raw);
   return t === null || /[*?[(^]|\S[#~]|<[\d-]*>/.test(t.replace(/\\[\s\S]/g, ''));
-}
-// R6-F1: is there a `!` at a command position (after the start of the line, `;`, `&`, `|`, `(` or a newline, then only blanks and followed by a blank) in text withoutQuotes has read? One pass.
-function bangAtCommandStart(t) {
-  let start = true;
-  for (let i = 0; i < t.length; i++) {
-    const c = t[i];
-    if (c === ';' || c === '&' || c === '|' || c === '(' || c === '\n') start = true;
-    else if (/\s/.test(c)) continue;
-    else {
-      if (start && c === '!' && i + 1 < t.length && /\s/.test(t[i + 1])) return true;
-      start = false;
-    }
-  }
-  return false;
 }
 // The options end at a lone `--` for the tools that read it so (a pathspec or a file after it is no option)
 const DASHDASH_ENDS = new Set(['git', 'rg', 'sort', 'tree', 'jq', 'xxd', 'sed', 'gsed']);
@@ -4139,9 +4132,18 @@ function evaluateBashForFilesFrame(command, opts) {
   // R4-F1: the directories a command can run in. Without a ( ) { } or a compound keyword on the line, a command that follows a cd to a directory known now by && only (and by && only, up to it) runs in that
   // directory alone: the cd ran and succeeded. Any other join (; || | &) keeps the cd that may have failed or run elsewhere in view, so such a command is read against every directory of the line (`dirs`).
   const cdOf = (c) => CD_CMDS.has(baseOf(c.argv[0] ?? ''));
-  // R6-F1 / F2: ONE linear reading of the quotes (withoutQuotes); a line it cannot read (an unterminated quote, `$'…'`, `$"…"`) is read as holding a keyword and a `!`, and so is never narrowed
-  const unquoted = withoutQuotes(raw);
-  const keywordLine = cmds.subshell === true || unquoted === null || /(?:^|[\s;&|])(?:[({}]|(?:if|then|else|elif|fi|for|while|until|do|done|case|esac|select|function|coproc)(?![\w./-]))/.test(unquoted);
+  // R8 (#288): whether a cd surely ran before the next command is read from the PARSER, which lexes nested substitutions, heredocs, comments and control constructs as the shell does -- no second, flat
+  // quote reader any more (it disagreed with the shell inside `"$( )"`, backticks and `$'…'`, and each round found a new flip that hid a loop or a `!` from it).
+  // markedOut: the command may not run, may run again, or runs in another shell (a loop, a branch, a function body, a trap action, a ( ) / $( ) / backtick subshell).
+  const markedOut = (c) => !c.ctl || !c.grp || c.grp.length > 0 || Object.values(c.ctl).some(Boolean);
+  // negated: a `!` before the command word (the parser drops it from argv and keeps it in the raw text): `! cd X && cmd` runs cmd when the cd FAILS. Not found in its own raw text: read as negated.
+  const negated = (c) => {
+    const text = String(c.raw ?? '');
+    if (/^\s*!/.test(text)) return true;
+    if (c.argv.length === 0) return false;
+    const at = text.indexOf(c.argv[0]);
+    return at < 0 || text.slice(0, at).includes('!');
+  };
   const landings = (e, base) => { // (where the cd target leads from each directory of base; a '..' after a symlink also reads as the target's parent, see collectDirs)
     const out = [];
     for (const d of base) {
@@ -4172,11 +4174,15 @@ function evaluateBashForFilesFrame(command, opts) {
   // back (chdir, eval, source, `.`, builtin / command / exec, an alias, a name that is only known at run time), and the cd target is read both lexically and through its symlinks (the real directory
   // too: `cd /tmp/link && find ..` is the link target's parent). Otherwise the command is read against every directory of the line (`dirs`).
   const withReal = (list) => unique([...list, ...list.map(realOf)]);
-  const bangLine = unquoted === null || bangAtCommandStart(unquoted);
   const staticName = (c) => { const n = c.argv[0] ?? ''; return n === '[' || n === '[[' || (n !== '' && !/[$`*?[\](){}~'"\\<>=]/.test(n)); };
   const changesDir = (c) => c.argv.length > 0 && (!staticName(c) || DIR_CHANGERS.has(baseOf(c.argv[0])));
+  // Narrowing needs a parse whose marks can be trusted (not cut short, no closer without its opener, every heredoc located, no ( ) subshell, function or `$'…'` / `$"…"` string on the line: R6-F2 keeps
+  // those lines un-narrowed), no `!` before any command, and no command that changes the directory (a cd, eval, source, ...) that is marked out, or sits in a trap action: such a cd may run in a later pass
+  // or not at all, so nothing is read as having a known directory. (A command inside a substitution is another shell's: its marks say so, except a trap action, which runs in this one.)
+  const unsureChange = (c) => c.argv.length > 0 && (cdOf(c) || changesDir(c)) && (c.depth > 0 ? c.ctl?.trap !== false : markedOut(c));
+  const cdUnsure = cmds.truncated === true || cmds.ctlBroken === true || cmds.subshell === true || cmds.ansiC === true || cmds.heredocSpans == null || (cmds.fns?.size ?? 0) > 0 || cmds.some((c) => negated(c) || unsureChange(c));
   const narrowDirs = new Map();
-  if (opts._writesOnly !== true && !keywordLine && !bangLine && cmds.some(cdOf) && !unknownCwd()) {
+  if (opts._writesOnly !== true && !cdUnsure && cmds.some(cdOf) && !unknownCwd()) {
     let known = [ctx.cwd]; // where the shell can be so far
     let chain = null; // the directories after an &&-joined run of sure cd's
     let lost = false; // a cd whose destination is not known, or a command that may change the directory: nothing after it is narrowed
@@ -4184,7 +4190,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const [k, c] of top.entries()) {
       checkDeadline(ctx.budget);
       if (c.sep !== '&&') chain = null;
-      if (chain) narrowDirs.set(c, chain);
+      if (chain && !markedOut(c)) narrowDirs.set(c, chain);
       if (!cdOf(c)) {
         if (changesDir(c)) { lost = true; chain = null; }
         continue;
