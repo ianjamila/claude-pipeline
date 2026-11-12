@@ -34,6 +34,7 @@ export const meta = {
     '  from its base branch and pulled is judged against the main that was merged in',
     '  after the validity checks it also refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet',
     '  confirmed by a later round, and (exit 1 {error:closing-keywords}) a PR body that lists several issues after one closing keyword ("Closes #1, #2" closes only #1),',
+    '  a substitute review (a Claude stand-in for Codex while its quota was spent) writes substitute {rounds, agents, models} and substituteDigest into the record, and codexModel none-substitute:<model> when no Codex round ran (the newest Codex model otherwise); it refuses (exit 1 {error}) substitute-escalation (a high-risk PR whose substitute rounds were Opus alone, with no later whole-PR Fable-substitute or Codex round) and substitute-unproven (a substitute round whose agent, models, effort or Fable floor proof does not hold)',
     '  then publishes the triage state when the PR holds a different one (exit 1 {error:stale-publication} when the PR holds a state this',
     '  copy did not publish or restore: run `pipeline state show --pr N`), and only then posts the marker. The record carries rulingsDigest only when there are rulings',
     '  the checked-out HEAD must be the head GitHub holds for the PR; the PR must have had every Fable pass its risk or paths need',
