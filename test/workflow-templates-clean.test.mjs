@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
+import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { workflowContextFindings } from '../pipeline/lib/workflow-contexts.mjs';
 
 const DIR = new URL('../pipeline/templates/workflows/', import.meta.url);
@@ -34,4 +35,16 @@ test('verify.yml runs the workflow-context check before node scripts/verify.mjs'
   // the helper is not vacuous: the order matters, and a template without the step fails it
   assert.equal(verifyRunsContextCheckFirst('- run: node scripts/verify.mjs\n- run: node scripts/pipeline/workflow-contexts.mjs\n'), false);
   assert.equal(verifyRunsContextCheckFirst('- run: node scripts/verify.mjs\n'), false);
+});
+
+// The Verify template skips drafts and cancels on conversion back to draft, so a repo built from it can turn on
+// ci.draft_while_iterating (`pipeline redraft`): ready_for_review starts the first real run, converted_to_draft joins the PR's
+// concurrency group (cancelling a running verify) while its own run skips the draft.
+test('verify.yml skips drafts, runs at ready_for_review and cancels on converted_to_draft', () => {
+  const wf = parseYaml(readFileSync(new URL('verify.yml', DIR), 'utf8'));
+  const types = wf.on.pull_request.types;
+  for (const t of ['opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft']) assert.ok(types.includes(t), t);
+  assert.equal(wf.jobs.verify.if, '${{ !github.event.pull_request.draft }}');
+  assert.match(wf.concurrency.group, /github\.event\.pull_request\.number/);
+  assert.equal(wf.concurrency['cancel-in-progress'], true);
 });
