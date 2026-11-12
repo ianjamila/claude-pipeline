@@ -27,6 +27,7 @@ number, `R` a review round, `<slug>` 2–5 lowercase words from the request.
 6. The whole suite is CI's job: locally you run only `verify.quick`, on the changed area. Never run `verify.full` here.
 7. **Stop ritual.** Every stop below names its outcome. Once the PR exists, run `P summary --pr N --outcome <outcome> --built "<one line: what was built>"`
    (it renders the cost bookings into the PR comment), then `P agent-log publish --line "<agentLogLine from the summary JSON>"`, then tell the owner.
+8. Before ANY `git push` to a READY PR (fix, settle test, owner override build, docs-exempt row, conflict resolution, owner-requested change): `P redraft --pr N` first (`--reason ci-failed` for a CI-red fix); it releases the merge hold and, with `ci.draft_while_iterating`, turns the PR to draft so CI waits; 3.2 marks it ready again. `merge-in-progress` ⇒ don't push, tell the owner; exit 3 / `convert-failed` ⇒ retry once, then push anyway and say so. Pushes the pipeline makes itself (`update-branch`, `P merge` catch-ups) are not yours.
 
 Opt-out: `PIPELINE_OFF=1` or the user says not to use the pipeline ⇒ do the task normally (still never push to main).
 
@@ -88,7 +89,7 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    Any other exit 1 ⇒ the items are `needsHuman` (Fable round: run `needed` and the arbiter once more; failing twice ⇒ park, cause `arbiter:model-proof`).
 5. **Publish and fix.** `P comment --pr N --kind triage` FIRST, then `P followups create --round R` for FOLLOW-UP items, then the triage comment again
    (issue links). ACCEPT items: one `implementer` dispatch with `P state show --round R --accepted`; it fixes, adds tests, runs `verify.quick`, commits;
-   push. Then **`P state mark-implemented --ids <ids>`** for each fixed ACCEPT item: `review-complete` refuses an ACCEPT that is not marked, from ANY round,
+   push (Rule 8). Then **`P state mark-implemented --ids <ids>`** for each fixed ACCEPT item: `review-complete` refuses an ACCEPT that is not marked, from ANY round,
    and exit 2 `no-code-change` means the fix changed no code (back to the implementer; marking never replaces a fix).
 6. **Outcome.** `P state outcome`: `clean` ⇒ leave the loop; `needsHuman` non-empty ⇒ see Rulings; more rounds left ⇒ round R+1 (the Codex fix
    check reviews only what changed since this round's head); none left ⇒ park, cause `unresolved: <ids>`, except one case: `reachedMax`, no
@@ -111,10 +112,10 @@ An item left `needsHuman` ⇒ never ask the owner to type a ruling: decide it yo
   `P triage second-review --round R --ids … --pr N` as a job. Codex ACCEPT ⇒ the item is ACCEPT, fix it. Codex dismisses at high confidence ⇒ claude-ruling may dismiss;
   the stricter of the two stands. Below high ⇒ ACCEPT. Exit 3 ⇒ rule 2 (`awaiting-review`); never substitute another reviewer.
 - A malfunction cause (`model-proof`, `invalid-arbiter`, `invalid-judge`): `P arbiter needed --round R` re-runs the arbiter, or ACCEPT.
-- You may tighten your own dismissal to ACCEPT before the merge, never loosen an ACCEPT. Only the owner's typed path loosens: if, and only if, the owner says they want to dismiss it,
+- You may tighten your own dismissal to ACCEPT before the merge (the fix push: Rule 8), never loosen an ACCEPT. Only the owner's typed path loosens: if, and only if, the owner says they want to dismiss it,
   follow `reference/owner-merge.md` Owner override.
 - `stale-publication` (the PR holds a review state this copy did not publish): `P state show --pr N`, then redo the last step. `P review-complete` republishes the state and is the remedy the merge refusal names.
-- The owner objects to a ruling in free text ⇒ re-rule it ACCEPT, fix it: that makes a new head, so a new review and a new request.
+- The owner objects to a ruling in free text ⇒ re-rule it ACCEPT, fix it (Rule 8): that makes a new head, so a new review and a new request.
 - Label mode ⇒ no rulings: park as before.
 
 **Extra round.** `P state outcome` with `reachedMax: true` and no `extraRound` / `grantedRound` ⇒
@@ -125,23 +126,23 @@ Never type, paraphrase or forge the owner's words, and never run Codex outside `
 
 1. `P review-complete --pr N` (HEAD pushed and equal to the PR head). Exit 0 posts the marker comment and takes `awaiting-review` off. Exit 1 ⇒ read
    `reason` (a commit since the last round, an unmarked ACCEPT, a Fable pass owed) and go back to the round it names. A reason naming `fable-refresh` (a Fable proof below the newest Fable) ⇒ `P state fable-refresh --pr N` (an uncounted Fable-only round on the pushed head), then 2.4 for that round (the pass reviews the whole PR diff), 2.5 and 2.6 as usual, then `P review-complete` again. A reason `behind-base` (a draft behind its base) ⇒ run its `remedy` (`P update-branch --pr N`, `git pull --ff-only`, the baseOnly `codex-review` round, `review-complete` again) BEFORE `gh pr ready`, so CI runs once on current main. Any later commit that changes
-   the code needs another round and another `review-complete`. One exception: commits after the last round that ONLY ADD lines to `review.docs_exempt_paths` documents (`P config`) need no round, and each added line must be a strict ledger row (`` | 0240 | `name` | YYYY-MM-DD | #PR | | ``, last in the file, numbers rising, for a migration at the reviewed head); anything else, or a listed document an instruction file `@`-imports, takes a round;
+   the code needs another round and another `review-complete`; push it per Rule 8. One exception: commits after the last round that ONLY ADD lines to `review.docs_exempt_paths` documents (`P config`) need no round, and each added line must be a strict ledger row (`` | 0240 | `name` | YYYY-MM-DD | #PR | | ``, last in the file, numbers rising, for a migration at the reviewed head); anything else, or a listed document an instruction file `@`-imports, takes a round;
    `review-complete` posts for the current head (`docsExempt`), a refusal names the file that forces a round. Verification of that head is still owed.
 2. Only after that exit 0. If the head changed since 1.5 ran (any review fix), re-run 1.5 on it first: the label below, the CI reading and 3's ending use its notes.
    High risk (1.5's `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured); then `gh pr ready N`.
    CI runs now and is the full proof. Wait with `P job start ci -- node ~/.claude/pipeline/bin/pipeline.mjs ci-wait --pr N`, then
    `P job wait ci --run-id <runId> …` again until it is done. Never `gh pr checks --watch` here: right after `gh pr ready` a required
    check's only result is the draft-era SKIPPED one, which `gh` counts as passed (Phase 6: hand-off 14 min early); ci-wait waits for
-   every required check of the base branch to report after the PR became ready. Its `verdict` when not ok: `failed` ⇒ implementer fix
-   (below; a ready-era failure of an attempt a re-run has superseded is waited on, so `failed` is the newer attempt's own result, unless its message says "superseded by a newer attempt that never reported": then the superseded failure stood at `--appear-timeout` and no newer result replaced it); `head-moved` / `base-changed` ⇒ back to step 1 of this section; `missing` / `stale-skipped` (a required check never ran on the ready event: ci-wait only says `missing` once no run that could produce the check is still going on the head (a ready-era run, or one started before ready: `heldBy.predatesReady`), and `stale-skipped` once nothing created or (re-)started after `gh pr ready` is still running, since a `needs:`-gated aggregate appears late by design; `heldBy` in the output names the run it was waiting on),
+   every required check of the base branch to report after the PR became ready. Its `verdict` when not ok: `failed` ⇒ implementer fix, pushed per Rule 8 with `--reason ci-failed`
+   (below; a ready-era failure of an attempt a re-run has superseded is waited on, so `failed` is the newer attempt's own result, unless its message says "superseded by a newer attempt that never reported": then the superseded failure stood at `--appear-timeout` and no newer result replaced it); `head-moved` / `base-changed` ⇒ back to step 1 of this section; `draft` ⇒ the PR is a draft (the ready step was skipped or undone): mark it ready again, start ci-wait again; `missing` / `stale-skipped` (a required check never ran on the ready event: ci-wait only says `missing` once no run that could produce the check is still going on the head (a ready-era run, or one started before ready: `heldBy.predatesReady`), and `stale-skipped` once nothing created or (re-)started after `gh pr ready` is still running, since a `needs:`-gated aggregate appears late by design; `heldBy` in the output names the run it was waiting on),
    `unverified` (branch protection or rules unreadable), `no-required-checks`, `timeout` ⇒ tell the owner in plain English, with the
    check names, and wait. `owner_approval: label` with a blocking item noted at 1.5: run it with `--wait-all`; the guard checks
    reporting just those items are expected to be red — that is not a fix target: park (section 2) once ci-wait shows every other check
-   green. Any other red ⇒ implementer fix, push, back to step 1 of this section. With `merge.hold_command` in `P config`, a `failed` verdict first releases this PR's merge hold:
+   green. Any other red ⇒ implementer fix, push (Rule 8), back to step 1 of this section. With `merge.hold_command` in `P config`, a `failed` verdict first releases this PR's merge hold:
    `P merge-hold --pr N --release --reason ci-failed` (a red PR must not keep the merge line; it acts only on N).
    Base moved ⇒ `P update-branch --pr N`, `git pull --ff-only`, review again if content changed. With `merge.hold_command`, update-branch takes this PR's merge hold right
    before the update (output `hold`), so another PR's merge cannot undo the catch-up's CI round. The hold stays through that pipeline-made head (`P merge-hold --release --reason new-commits`
-   answers `kept: own-successor` for it, so run that release whenever you push; it decides). update-branch releases the hold itself on `checks-failed` (`ci-failed`) and `rebase-needed` (`update-conflict`):
+   answers `kept: own-successor` for it; after your push Rule 8 already released the hold, so `new-commits` is only for a push made without `P redraft`). update-branch releases the hold itself on `checks-failed` (`ci-failed`) and `rebase-needed` (`update-conflict`):
    `holdRelease` not `confirmed` ⇒ run that release once yourself, from this PR's own worktree on its branch (a provider may refuse a release from any other checkout or a detached HEAD: EagleWatch does). `head-timeout`, `checks-timeout`, `cycle-cap`, `head-moved` keep it (retry, or re-read: a PR-side push ⇒ the `new-commits` release).
    `outcome: "queued-behind"` (another PR's older merge hold is ahead; `blockedBy`, `doNotUpdate`) ⇒ never update past it; wait your turn:
    `P job start turn -- node ~/.claude/pipeline/bin/pipeline.mjs merge-hold --pr N --check --wait` (one check every 5 min, up to 120 min), `P job wait turn --run-id <runId> --timeout 540`
