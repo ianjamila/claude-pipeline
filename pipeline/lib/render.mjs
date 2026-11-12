@@ -236,12 +236,19 @@ export function summaryComment(state, opts) {
 
 const yesNo = (v) => (v === true ? 'yes' : v === false ? 'no' : v == null ? 'not run' : line(v));
 
-export function needsHumanComment({ reasons, hits = [], verified, reviewed }) {
+// `review`: the review's status lines (round-status.mjs#parkStatusLines: rounds, booked cost, open items with severity, why it is not clean), shown as bullets under
+// the paragraph. Display only; absent or empty renders nothing.
+export function needsHumanComment({ reasons, hits = [], verified, reviewed, review = [] }) {
   const why = [].concat(reasons ?? []).map((r) => line(r)).filter(Boolean);
   const paragraph =
     `This PR was stopped for a human decision: ${why.length ? why.join('; ') : 'no reason recorded'}. ` +
     `Verified: ${yesNo(verified)}. Reviewed: ${yesNo(reviewed)}.`;
   const out = [MARKERS.needsHuman, '', paragraph];
+  const status = (Array.isArray(review) ? review : []).map((l) => line(l)).filter(Boolean);
+  if (status.length) {
+    out.push('');
+    for (const l of status) out.push(`- ${l}`);
+  }
   if (hits.length) {
     out.push('');
     for (const h of hits) out.push(isObject(h) ? `- ${line(h.rule)} — ${line(h.file)}` : `- ${line(h)}`);

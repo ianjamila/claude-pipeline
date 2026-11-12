@@ -14,14 +14,13 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
-import { diffFiles, git, headSha, isAncestor, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
-import { diffStats } from '../lib/diff.mjs';
+import { git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
-import { readSummaryComment } from '../lib/summary-comment.mjs';
-import { askSummary, costFrom, notCleanReasons, openItems, roundsFrom } from '../lib/round-ask.mjs';
+import { askSummary } from '../lib/round-ask.mjs';
+import { gatherRoundStatus, reviewedDiff } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
@@ -48,7 +47,7 @@ export const meta = {
     'pipeline triage round-request --pr N [--repo DIR]',
     '  -> {ok, line, k, n, head, rounds, cost, open, notClean, recommend, why, discard, summary, warnings}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`',
     '     (k = the counted round it would be: reviewed rounds + 1, base-only and resolution-only rounds not counted; n = the round number to pass to codex-review --round; head = the checked-out HEAD)',
-    '  -> everything but line, k, n and head is display only and decides nothing: rounds {reviewed, max, autoExtraUsed, ownerGranted, next}; cost {bookedUsd, reviewUsd, fableUsd, perRoundUsd} from the PR\'s run record (read-only; null with a warning when it cannot be read);',
+    '  -> everything but line, k, n and head is display only and decides nothing: rounds {reviewed, max, autoExtraUsed, ownerGranted, next}; cost {bookedUsd, reviewUsd, fableUsd, perRoundUsd, lastRound, lastRoundUsd} (the last two from cost.byRound, \`cost --round R\`: the newest counted round with a booking, else null) from the PR\'s run record (read-only; null with a warning when it cannot be read);',
     '     open [{id, round, bucket, category, severity: low|high, title, file}] = every item that keeps the review from clean; notClean = why, in plain words; recommend follow-up|extra-round, with why (follow-up exactly when `defer-fixes` would accept the',
     '     current state: every unreviewed accept is a low-severity judge/arbiter fix, nothing else is open, no owner grant is open); discard {anchor, count, commits} = the commits since the last reviewed head that deferring would take out; summary = 3-5 plain lines the reply',
     '     pastes ABOVE the line; warnings (a severity or config error shows the items as high and recommends extra-round, it never suppresses the line). Titles are untrusted text: one ASCII line each',
@@ -61,8 +60,8 @@ export const meta = {
     '     Run `followups create --round R` for EACH returned round afterwards (a retry is safe: it de-duplicates by fingerprint). Every deferral is a labelled row of the merge Rulings block, so the owner\'s "merge" binds each one by name',
     '  -> only with owner_approval: chat; exit 1 (state untouched) unless ALL hold: the round limit is reached and nothing is pending, waiting for a human, open BLOCKING, unimplemented or owed a Fable pass, and no unspent owner grant exists for the next round at any head (the lookup is STRICT: a records folder or session file that cannot be read, a record file over the size limit or not a regular file, an unreadable repo-moves file, an unsafe consumed-grants folder, or a record whose provenance cannot be confirmed as the owner\'s, refuses too; a records folder that does not exist is no grant; round-request applies the same lookup to its follow-up recommendation);',
     '     --ids is exactly the set of accepts no round has reviewed, each low severity (non-BLOCKING; category performance, maintainability, testing, design, docs or other; its file in the reviewed diff, on no risk.high_risk_paths / review.arbiter_always_paths glob,',
-    '     not the file of a BLOCKING or security ACCEPT) and each accepted by the judge or the arbiter (not the owner, Claude, a second review, a test or a cache copy; and no other accepted fix of ANY round is marked implemented unless it was marked before the last counted round began: `state mark-implemented` records the newest round number at the time as the item\'s implementedAfterRound, and a carried copy records the round before the one it sits in; a fix marked after that round, or a mark with no record, may be out of the reviewed head and refuses, so the round runs); the tree equals the last round\'s content (every commit since reverted; when the default branch was merged in and moved the content, record that update as a base-only round first: codex-review runs no Codex for it); --fix-head is an ancestor of HEAD, a descendant of the last REVIEWED head (the last round that is not a base-only one); the reviewedHead the issues compare against is the NEWEST recorded round, base-only or not, whose head --fix-head descends from (the base-only round recorded before the fix was made, or the last reviewed head when the update is recorded only after the revert), with',
-    '     other content (it only points the follow-up issues at the removed fix); and the state with the fixes deferred reads as a clean review. A severity or config error refuses. Claude cannot reopen a deferral (claude-ruling and second-review refuse it); it writes review state format version 3; the owner\'s owner-ruling can',
+    '     not the file of a BLOCKING or security ACCEPT) and each accepted by the judge or the arbiter (not the owner, Claude, a second review, a test or a cache copy; and no other accepted fix of ANY round is marked implemented unless it was marked before the last counted round began: `state mark-implemented` records the newest round number at the time as the item\'s implementedAfterRound, and a carried copy records the round before the one it sits in; a fix marked after that round, or a mark with no record, may be out of the reviewed head and refuses, so the round runs); the tree equals the last round\'s content (every commit since reverted; when the default branch was merged in and moved the content, record that update as a base-only round first: codex-review runs no Codex for it); --fix-head is an ancestor of HEAD, a descendant of the last REVIEWED head (the last round that is not a base-only one), and has other content than the reviewed one (it only points the follow-up issues at the removed fix); the reviewedHead the issues compare against is the comparison point whose merged-in default branch matches --fix-head\'s, so the compare shows just the fix: the NEWEST recorded round, base-only or not, whose head --fix-head descends from (the base-only round recorded before the fix was made, or the last reviewed head when the update is recorded only after the revert), or, when the default branch was merged in between the fix and the revert, the last round (the reverted tree carries that merge); with no match the first one and a `warnings` entry in the output;',
+    '     and the state with the fixes deferred reads as a clean review. A severity or config error refuses. Claude cannot reopen a deferral (claude-ruling and second-review refuse it); it writes review state format version 3; the owner\'s owner-ruling can',
     'pipeline triage claude-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --pr N [--repo DIR]',
     '  -> {ok, round, id, final, published, next?}; records CLAUDE\'s decision (final.by claude, needsHuman false, the overruled final and the cause kept) for an item waiting for a human, or tightens a Claude dismissal',
     '  -> only with owner_approval: chat; exit 1 for label mode, a --pr that is not the review state\'s, an empty reason or one over 1000 characters, or a ruling the rules refuse (state untouched)',
@@ -648,58 +647,10 @@ async function roundRequest(rest, ctx) {
   }, pr));
 }
 
-// The files of the PR's reviewed diff (the last round's head against where the branch forked from the default branch): what a finding's location must resolve to.
-// null (and a warning from the caller) when it cannot be read. Throws on nothing the caller needs to handle.
-function reviewedDiff(root, config, state) {
-  const toHead = state.rounds.at(-1)?.toHead;
-  if (typeof toHead !== 'string' || toHead === '') return { files: null, problem: 'the last round records no head' };
-  try {
-    return { files: diffFiles(reviewBaseRef(root, config), revParse(toHead, { cwd: root }), { cwd: root }), problem: null };
-  } catch (err) {
-    return { files: null, problem: asciiLine(err?.message, 160) };
-  }
-}
-
-// The commits since the last reviewed head (what deferring would take out), and, when nothing explains them as fixes, how much changed.
-function sinceLastReview(root, config, state, { withChanges }) {
-  const anchor = state.rounds.at(-1)?.toHead;
-  const none = { anchor: null, count: 0, commits: [], changed: null };
-  if (typeof anchor !== 'string' || anchor === '') return none;
-  const o = { cwd: root };
-  const full = revParse(anchor, o);
-  const log = git(['log', '--format=%h %s', `${full}..HEAD`], o).split('\n').filter(Boolean);
-  let changed = null;
-  if (withChanges && log.length > 0) {
-    const files = diffFiles(full, 'HEAD', o).filter((f) => f.path !== config.agent_log && f.newPath !== config.agent_log);
-    changed = { commits: log.length, files: files.length, lines: diffStats(files).changedLines };
-  }
-  return { anchor: full.slice(0, 12), count: log.length, commits: log.slice(0, 20).map((l) => asciiLine(l, 100)), changed };
-}
-
 // The display fields of the ask. `grants` is the same lookup the admission check used (any head); `grantGap` says why it found nothing ('provenance' = a record exists that cannot be
 // confirmed as the owner's). A lookup that fails here degrades to a warning and the extra-round recommendation: it never loses the ask (`defer-fixes` itself refuses on it).
 function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, warnings }) {
-  refreshBaseRef(root, config);
-  const hash = currentContentHash(root, config);
-  const outcome = roundOutcome({ ...state, currentContentHash: hash });
-  const rounds = roundsFrom(state);
-  let cost = null;
-  try {
-    const found = readSummaryComment(gh, pr);
-    cost = found.status === 'ok' ? costFrom(found.record, rounds.reviewed) : null;
-    if (cost === null) warnings.push(found.status === 'ok' ? 'the run record holds no booked cost yet' : `no usable run record on the PR (${found.status}): cost not shown`);
-  } catch (err) {
-    warnings.push(`the booked cost could not be read (${asciiLine(err?.message, 120)})`);
-  }
-  const diff = reviewedDiff(root, config, state);
-  if (diff.problem) warnings.push(`the reviewed diff could not be read (${diff.problem}): every open item is shown as high`);
-  let since = { anchor: null, count: 0, commits: [], changed: null };
-  try {
-    since = sinceLastReview(root, config, state, { withChanges: !outcome.coverageValid && outcome.newAccepted.length === 0 });
-  } catch (err) {
-    warnings.push(`the commits since the last review could not be listed (${asciiLine(err?.message, 120)})`);
-  }
-  const open = openItems(state, outcome, { config, files: diff.files }, warnings);
+  const { rounds, cost, diff, since, open, notClean } = gatherRoundStatus({ root, config, state, pr, gh, warnings });
   let follow;
   try {
     const readable = (lookup) => (ordinal) => {
@@ -717,7 +668,6 @@ function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, w
     if (!warnings.some((w) => w.startsWith('severity could not be judged'))) warnings.push(follow.refusals[0]);
   }
   if (follow.eligible && since.anchor === null) follow = { ...follow, eligible: false, refusals: ['the commits since the last review could not be listed'] };
-  const notClean = notCleanReasons(outcome, since.changed);
   const discard = { anchor: since.anchor, count: since.count, commits: since.commits };
   const { summary, why } = askSummary({ rounds, cost, open, notClean, follow, discard });
   return { rounds, cost, open, notClean, recommend: follow.eligible ? 'follow-up' : 'extra-round', why, discard, summary };
@@ -790,8 +740,22 @@ async function deferFixes(rest, ctx) {
     if (!isAncestor(revParse(lastReviewed.toHead, o), fixFull, o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is older than the last reviewed head ${String(lastReviewed.toHead).slice(0, 12)}: pass the head that held the fixes (a descendant of the reviewed head)`);
     // The anchor (the reviewedHead the issue compares against): the NEWEST round, base-only or not, whose head the fix descends from, so the issue shows just the fix whether the default branch
     // was merged in before the fix (that base-only round) or only after the revert (a base-only round the fix does not descend from, so an older one). A head that no longer resolves is skipped.
+    // When the default branch was merged in BETWEEN the fix and the revert, no round sits after that merge and above the fix, so that anchor lacks the merge and the issue's compare would show it (#287).
+    // The right comparison point is the one with the same merged-in default branch as the fix head: compare each candidate's merge-base with the default branch against the fix head's.
     const descends = (r) => { try { return isAncestor(revParse(r.toHead, o), fixFull, o); } catch { return false; } };
-    const anchor = [...state.rounds].reverse().find(descends) ?? lastReviewed;
+    const ancestorAnchor = [...state.rounds].reverse().find(descends) ?? lastReviewed;
+    const baseRef = reviewBaseRef(root, config);
+    const baseOf = (rev) => { try { return mergeBase(baseRef, rev, o); } catch { return null; } };
+    const fixBase = baseOf(fixFull);
+    const warnings = [];
+    let anchor = ancestorAnchor;
+    if (fixBase === null || baseOf(revParse(ancestorAnchor.toHead, o)) !== fixBase) {
+      // the last round's own head (not HEAD: nothing says a round was recorded after the revert) carries the default branch merged in after the fix, and its content is the reviewed one
+      let lastBase = null;
+      try { lastBase = baseOf(revParse(last.toHead, o)); } catch { /* a head that no longer resolves is no comparison point */ }
+      if (fixBase !== null && lastBase === fixBase) anchor = last;
+      else warnings.push(`the follow-up issues compare the removed fix with ${String(ancestorAnchor.toHead).slice(0, 12)}, but the default branch merged into the fix head is not the same one: the compare may show that merge too`);
+    }
     const fixHash = reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log, head: fixFull }, o);
     if ([last, anchor, lastReviewed].some((r) => fixHash === r.contentHashAtToHead)) {
       return refuse(`--fix-head ${fixFull.slice(0, 12)} has the reviewed content, so it is not the head that held the fixes: pass the head the round-request line named`);
@@ -802,7 +766,7 @@ async function deferFixes(rest, ctx) {
     saveState(root, next);
     const wanted = new Set(want);
     const rounds = next.rounds.filter((r) => (r.items ?? []).some((i) => wanted.has(i.id))).map((r) => r.n).sort((a, b) => a - b);
-    return { exitCode: EXIT.OK, output: { ok: true, deferred: want, rounds, ...publishRuling({ ctx, root, pr, state: next }) } };
+    return { exitCode: EXIT.OK, output: { ok: true, deferred: want, rounds, ...publishRuling({ ctx, root, pr, state: next }), ...(warnings.length ? { warnings } : {}) } };
   }, pr));
 }
 
