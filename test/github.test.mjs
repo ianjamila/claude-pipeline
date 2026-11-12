@@ -295,3 +295,43 @@ test('protection / updateBranch / checks: an overBuffer reply throws (its text i
   // sanity: the same text without the flag is still an answer
   assert.deepEqual(mkGh(cut('gh: Branch not protected (HTTP 404)', { overBuffer: false })).protection('main').reason, 'not-protected');
 });
+
+// ---- #268: the creator issue scan ---------------------------------------------------------------------------
+
+function scanGh(reply = { code: 0, stdout: '[]', stderr: '', timedOut: false }) {
+  const calls = [];
+  const ghFn = (args, opts) => {
+    calls.push({ args, timeoutMs: opts.timeoutMs });
+    if (args[0] === 'repo') return { code: 0, stdout: JSON.stringify(REPO_VIEW), stderr: '', timedOut: false };
+    if (args[0] === 'api' && String(args[1]).includes('/issues?creator=')) return reply;
+    return { code: 0, stdout: '{}', stderr: '', timedOut: false };
+  };
+  return { calls, gh: createGitHub({ cwd, ghFn }) };
+}
+const scanCall = (calls) => calls.find((c) => String(c.args[1] ?? '').includes('/issues?creator='));
+
+test('listIssuesByCreator: per_page=100, no since by default, and a 180 s timeout for this call only', () => {
+  const { calls, gh } = scanGh();
+  gh.listIssuesByCreator({ creator: 'me' });
+  const c = scanCall(calls);
+  assert.deepEqual(c.args, ['api', 'repos/acme/widgets/issues?creator=me&state=all&per_page=100', '--paginate']);
+  assert.equal(c.timeoutMs, 180_000);
+  gh.listIssues({ label: 'x' });
+  gh.viewer();
+  const others = calls.filter((x) => x !== c);
+  assert.ok(others.length >= 3 && others.every((x) => x.timeoutMs === 60_000), JSON.stringify(others.map((x) => [x.args[0], x.timeoutMs])));
+});
+
+test('listIssuesByCreator: since is URL-encoded into the query; the listing helpers elsewhere keep per_page=30', () => {
+  const { calls, gh } = scanGh();
+  gh.listIssuesByCreator({ creator: 'me', state: 'all', since: '2026-11-09T23:30:00Z' });
+  assert.equal(scanCall(calls).args[1], 'repos/acme/widgets/issues?creator=me&state=all&per_page=100&since=2026-11-09T23%3A30%3A00Z');
+  const comments = scanGh({ code: 0, stdout: '[]', stderr: '', timedOut: false });
+  comments.gh.listComments(5);
+  assert.ok(comments.calls.some((c) => /issues\/5\/comments$/.test(String(c.args[1]))), 'comments are untouched');
+});
+
+test('listIssuesByCreator: a 180 s timeout and a mid-pagination failure are GhErrors', () => {
+  assert.throws(() => scanGh({ code: 124, stdout: '[{"number":1}]', stderr: '', timedOut: true }).gh.listIssuesByCreator({ creator: 'me' }), GhError);
+  assert.throws(() => scanGh({ code: 1, stdout: '[{"number":1}]', stderr: 'HTTP 502', timedOut: false }).gh.listIssuesByCreator({ creator: 'me', since: '2026-11-09T23:30:00Z' }), GhError);
+});

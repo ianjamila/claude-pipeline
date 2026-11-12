@@ -47,33 +47,38 @@ function worktreesOf(root, live) {
   }
 }
 
-// -> [text] for what is running; scan-error entries for a jobs folder that cannot be listed (not just absent) go to `live`.
+// -> [{ detail, hint? }] for what is running; scan-error entries for a jobs folder that cannot be listed (not just absent) go to `live`.
+// An unreadable job record carries its remove instruction twice: inside `detail` (the legacy text, so an older installed reader keeps working) and as `hint` (#258).
 function jobsIn(worktree, live) {
   const dir = path.join(worktree, '.review', 'jobs');
   let names;
   try { names = fs.readdirSync(dir); } catch (err) {
-    if (err?.code !== 'ENOENT') live.push({ kind: 'scan-error', worktree, detail: `cannot list the jobs folder ${dir}: ${msg(err)}` });
+    // ENOTDIR: a parent is a file, and a job needs .review/jobs/<name>/, which cannot exist under one: no jobs (review-lease.mjs liveJobIn says the same).
+    if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') live.push({ kind: 'scan-error', worktree, detail: `cannot list the jobs folder ${dir}: ${msg(err)}` });
     return [];
   }
   const out = [];
   for (const name of names) {
     if (name.endsWith('.starting')) {
       const job = name.slice(0, -'.starting'.length);
-      try { if (Date.now() - fs.statSync(path.join(dir, name)).mtimeMs <= STARTING_FRESH_MS) out.push(`job ${job} is being started`); } catch (err) {
-        if (err?.code !== 'ENOENT') out.push(`job ${job} start marker cannot be read (${msg(err)}), treated as being started`); // only a vanished marker is "gone"
+      try { if (Date.now() - fs.statSync(path.join(dir, name)).mtimeMs <= STARTING_FRESH_MS) out.push({ detail: `job ${job} is being started` }); } catch (err) {
+        if (err?.code !== 'ENOENT') out.push({ detail: `job ${job} start marker cannot be read (${msg(err)}), treated as being started` }); // only a vanished marker is "gone"
       }
       continue;
     }
     let isDir = false;
     try { isDir = fs.statSync(path.join(dir, name)).isDirectory(); } catch (err) {
-      if (err?.code !== 'ENOENT') out.push(`job ${name} cannot be inspected (${msg(err)}), treated as running`); // only a vanished entry is "gone"
+      if (err?.code !== 'ENOENT') out.push({ detail: `job ${name} cannot be inspected (${msg(err)}), treated as running` }); // only a vanished entry is "gone"
       continue;
     }
     if (!isDir) continue; // a stray file is not a job
     try {
       const job = jobMayBeRunning(name, { cwd: worktree });
-      if (job.running) out.push(job.why ? `job ${name} has an unreadable record (${job.why}), treated as running: remove .review/jobs/${name} in that worktree if it is stale` : `job ${name} is running`);
-    } catch (err) { out.push(`job ${name} cannot be read (${msg(err)}), treated as running`); }
+      if (job.running && job.why) {
+        const hint = `remove .review/jobs/${name} in that worktree if it is stale`;
+        out.push({ detail: `job ${name} has an unreadable record (${job.why}), treated as running: ${hint}`, hint });
+      } else if (job.running) out.push({ detail: `job ${name} is running` });
+    } catch (err) { out.push({ detail: `job ${name} cannot be read (${msg(err)}), treated as running` }); }
   }
   return out;
 }
@@ -114,7 +119,18 @@ export function scanLiveWork({ env: baseEnv = process.env, home, lockDir, deadli
   tick();
   try {
     for (const e of blocking(scanLeases({ env, ...leaseOpts }))) {
-      live.push({ kind: 'lease', ...(e.repoId !== undefined ? { repo: String(e.repoId) } : {}), ...(e.pr !== undefined ? { pr: e.pr } : {}), ...(e.worktree ? { worktree: e.worktree } : {}), sessionId: e.sessionId, detail: e.why });
+      const where = {
+        ...(e.repoId !== undefined ? { repo: String(e.repoId) } : {}), ...(e.pr !== undefined ? { pr: e.pr } : {}), ...(e.worktree ? { worktree: e.worktree } : {}), sessionId: e.sessionId,
+      };
+      // A lease the judge could not decide (an uncertain terminal process, an unreadable jobs folder, an unreadable proc- / job- file) is something the scan could not
+      // CHECK, not a review known to run: the owner is told to fix it, with its own instruction in `hint`.
+      if (e.unchecked) live.push({ kind: 'scan-error', ...where, detail: `cannot judge the review lease of ${e.sessionId}${e.worktree ? ` on ${e.worktree}` : ''}: ${e.why}`, ...(e.hint ? { hint: e.hint } : {}) });
+      else {
+        live.push({
+          kind: 'lease', ...where, detail: e.why,
+          ...(e.command !== undefined ? { command: e.command } : {}), ...(e.holder !== undefined ? { holder: e.holder } : {}), ...(e.pid !== undefined ? { pid: e.pid } : {}),
+        });
+      }
     }
   } catch (err) {
     live.push({ kind: 'scan-error', detail: `cannot scan the review leases: ${msg(err)}` });
@@ -136,7 +152,7 @@ export function scanLiveWork({ env: baseEnv = process.env, home, lockDir, deadli
     for (const wt of [root, ...worktreesOf(root, live)]) {
       if (seen.has(wt)) continue;
       seen.add(wt);
-      for (const detail of jobsIn(wt, live)) live.push({ kind: 'job', repo: root, worktree: wt, detail });
+      for (const { detail, hint } of jobsIn(wt, live)) live.push({ kind: 'job', repo: root, worktree: wt, detail, ...(hint ? { hint } : {}) });
     }
     tick();
     try {

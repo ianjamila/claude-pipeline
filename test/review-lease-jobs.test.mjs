@@ -186,11 +186,11 @@ test('R1-F1: a forged, stale or unknown handed identity falls back to the TTL-on
   assert.equal(h.sessionId, 'sess-two');
 });
 
-test('R1-F1: a plain terminal (no CLAUDECODE, no ancestor) takes no lease even with a handed value that checks out', (t) => {
+test('R1-F1: a plain terminal (no CLAUDECODE, no ancestor) never becomes the session, even with a handed value that checks out (it is a process holder)', (t) => {
   const w = world(t);
   w.session(500, 'sess-one');
   const handed = { [HOLDER_ENV]: JSON.stringify({ sessionId: 'sess-one', pid: 500, pidStart: START }) };
-  assert.equal(resolveHolder({ worktree: w.wt('a'), ...w.as(null, { env: handed }) }).kind, 'none');
+  assert.equal(resolveHolder({ worktree: w.wt('a'), ...w.as(null, { env: handed }) }).kind, 'process');
   assert.equal(resolveHolder({ worktree: w.wt('a'), ...w.as(null, { env: { CLAUDECODE: '1', ...handed } }) }).kind, 'session');
 });
 
@@ -209,11 +209,12 @@ test('R1-F1: `job start` run in a session passes the session identity to the job
     assert.equal(res.exitCode, 0, JSON.stringify(res.output));
     const deadline = Date.now() + 20_000;
     while (!fs.existsSync(path.join(repo, `${name}.txt`)) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
-    const seen = fs.readFileSync(path.join(repo, `${name}.txt`), 'utf8');
     // The runner writes exit.json last: once it exists the detached runner is done with the folder (Windows cannot delete a folder a live process uses).
     const exitFile = path.join(repo, '.review', 'jobs', name, 'exit.json');
     while (!fs.existsSync(exitFile) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
     assert.ok(fs.existsSync(exitFile), `${name}: the job runner wrote exit.json`);
+    // Read the output only now: the script creates the file and then writes it (two steps), exit.json comes after the command has exited (#260).
+    const seen = fs.readFileSync(path.join(repo, `${name}.txt`), 'utf8');
     return seen;
   };
   const env = { ...process.env, CLAUDECODE: '1', HOME: repo, USERPROFILE: repo };

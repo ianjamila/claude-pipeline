@@ -18,6 +18,7 @@ export const meta = {
     '  one issue per fingerprint across the whole review; a FOLLOW-UP that needs a human is held, not filed.',
     '  Each issue body starts with <!-- claude-pipeline:followup pr=N fp=FINGERPRINT -->; before creating, an issue of ours',
     '  (any state) with that marker is REUSED (several: lowest number is canonical, the rest are listed, never closed)',
+    '  (the scan reads 100 per page under its own 180 s limit and, when the PR creation time is readable, only issues updated since 1 h before it)',
     '  A finding raised again in a later round after its fix was deferred past the round limit is linked by codex-review to the issue already filed for it (item.followupIssue, item.reraisedDeferral), the triage comment lists it under "Raised again after a deferral", and no second issue is filed (when it is accepted again its fix is made in the PR, and the line says to close the issue when the PR merges)',
   ].join('\n'),
 };
@@ -27,6 +28,25 @@ const TITLE_PREFIX = '[agent-suggestion] ';
 const TITLE_MAX = 120;
 
 const clip = (s, max) => (Array.from(s).length > max ? `${Array.from(s).slice(0, max - 1).join('').trimEnd()}…` : s);
+
+// The creator scan can skip the account's whole history before this PR: a follow-up issue for the PR is created after the PR
+// exists, and an issue's updated_at never precedes its creation (a promoted or closed one is later still). One hour of margin
+// absorbs clock skew. `readCreatedAt` is the PR lookup; anything but a clean, past ISO instant (a failed or malformed lookup, a
+// date-only or future value) means NO bound, i.e. the full scan, and never fails the command.
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$/;
+const SCAN_MARGIN_MS = 60 * 60 * 1000;
+export function scanSince(readCreatedAt, now = Date.now()) {
+  let createdAt;
+  try {
+    createdAt = readCreatedAt();
+  } catch {
+    return undefined;
+  }
+  if (typeof createdAt !== 'string' || !ISO_INSTANT.test(createdAt)) return undefined;
+  const ms = Date.parse(createdAt);
+  if (!Number.isFinite(ms) || ms > now) return undefined;
+  return new Date(ms - SCAN_MARGIN_MS).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
 
 // What a reader (a re-run, a resume on another machine) looks for to know this suggestion is already filed. Only the
 // pipeline writes the first line of a body, and only ITS author's issues count, so quoted or forged markers are inert.
@@ -101,8 +121,9 @@ export const run = guarded(async (argv, ctx) => {
       const findFiled = (item) => {
         if (known === null) {
           const me = gh.viewer();
+          const since = scanSince(() => gh.prView(state.pr, ['createdAt']).createdAt);
           // By creator, not by label: promoting a suggestion (agent-suggestion -> agent-build) must not hide it from this lookup.
-          known = gh.listIssuesByCreator({ creator: me, state: 'all' }).filter((i) => i.author === me);
+          known = gh.listIssuesByCreator({ creator: me, state: 'all', since }).filter((i) => i.author === me);
         }
         const marker = followupMarker(state.pr, item);
         return known.filter((i) => i.body.startsWith(marker)).sort((a, b) => a.number - b.number);
