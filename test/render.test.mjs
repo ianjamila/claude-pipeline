@@ -738,3 +738,11 @@ test('triage comment: one "Second reviewer: Sonnet judge" line only while the st
   assert.match(comment({ reviewer: 'judge', risk: 'medium' }), LINE);
   assert.doesNotMatch(comment({ reviewer: 'judge', risk: 'low' }), LINE);
 });
+
+test('triage comment: no lane line for a sticky-Fable PR, even when its last round was base-only', () => {
+  const base = stateWith([]);
+  const sticky = laneTriageComment({ ...base, reviewer: 'fable', risk: 'medium', rounds: [{ n: 1, items: [] }, { n: 2, baseOnly: true, items: [] }] });
+  assert.doesNotMatch(sticky, /Second reviewer:/);
+  const stickyLow = laneTriageComment({ ...base, reviewer: 'fable', risk: 'low', rounds: [{ n: 1, baseOnly: true, items: [] }] });
+  assert.doesNotMatch(stickyLow, /Second reviewer:/);
+});

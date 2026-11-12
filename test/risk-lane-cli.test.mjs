@@ -214,3 +214,26 @@ test('laneProblem: a scan that throws forces Fable whatever the recorded level; 
   // a throwing scan under a recorded high is Fable without scanning at all
   assert.match(await laneProblem({ risk: 'high', rounds: [] }, repo.dir, config, 'main', { rate: boom }), /high risk/);
 });
+
+test('codex-review: review.size_only_medium_reviewer: fable set ONLY in the uncommitted working tree still means Fable', (t) => {
+  const w = world(t, { workingYml: withBlocks('review:\n  size_only_medium_reviewer: fable\n') });
+  const r = w.codex(1);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.reviewer, r.json.reviewerReasons], ['fable', ['medium risk']]);
+});
+
+test('P risk: a size-only medium PR reports sizeOnly, drivers, reviewer judge and the note; a PR with a hit reports fable and no note', (t) => {
+  const w = world(t);
+  const r = w.cli(['risk', '--base', w.base, '--head', w.head]);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.level, r.json.sizeOnly, r.json.reviewer, r.json.hardStops], ['medium', true, 'judge', []]);
+  assert.deepEqual(r.json.drivers, { hardStop: false, advisory: false, path: false, size: true });
+  assert.match(r.json.note, /medium for size only: Sonnet judge/);
+
+  const hit = world(t, { baseYml: withBlocks('hard_stops:\n  paths: [src/big.js]\n') });
+  const rh = hit.cli(['risk', '--base', hit.base, '--head', hit.head]);
+  assertExit(rh, 0, rh.stderr + rh.stdout);
+  assert.deepEqual([rh.json.sizeOnly, rh.json.reviewer, rh.json.note], [false, 'fable', undefined]);
+  assert.ok(rh.json.hardStops.length > 0);
+  assert.equal(rh.json.drivers.hardStop, true);
+});

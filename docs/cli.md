@@ -646,7 +646,7 @@ report-only or ignored, and no sensitive path; base branch = the default branch)
 or any file on `risk.high_risk_paths` or `review.arbiter_always_paths` → one Fable pass per round that rules on every Codex item and reviews the diff itself
 (`arbiter needed` mode `review`). `risk.ignore_hard_stop_rules` (only `P-path`, `R4-config`; default none) leaves those hits out of the level only. The rating is
 worked out under the working-tree config AND the one committed at the default branch's fork point (stricter wins; an unreadable one means Fable). `P risk`
-adds `sizeOnly`, `drivers`, `reviewer`, `laneReasons` and the lane `note`. A PR that goes from judge to Fable reviews the whole PR in that round.
+adds `sizeOnly`, `drivers`, `reviewer`, `laneReasons` and the lane `note`. A PR that goes from judge to Fable reviews the whole PR in that round. Set the two new keys only after the installed pipeline is updated AND `pipeline vendor` has re-copied `risk.mjs` and `config.mjs` into the project (older validators reject unknown keys).
 
 ## smoke
 
