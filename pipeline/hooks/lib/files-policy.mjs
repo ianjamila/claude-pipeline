@@ -3425,7 +3425,8 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false, cdSwitch: false };
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
-  let cdSwitched = cmds.some(cdMeaningSwitch); // (R11-F3: a source below that switches it on counts from there on)
+  // (R11-F3: a source below that switches it on counts from there on. R13: so does the line's own switch, which the sources it follows run under: `set -T; source ./a.sh` with a `cd proj` in a.sh)
+  let cdSwitched = ctx.lineCdSwitch === true || cmds.some(cdMeaningSwitch);
   const from = flowStart(cmds);
   const seen = new Map();
   const local = Object.create(null);
@@ -3741,6 +3742,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
   ctx.pickUnknown = new Set(opts._unknown ?? []); // (a name the line gave a run-time value: only a script it picks is refused; the writer rule is for the names above)
+  ctx.lineCdSwitch = cmds.some(cdMeaningSwitch); // (R13: whether the line itself may turn cdablevars on; computed before any source is evaluated and handed to sourcedEffects)
   ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
   ctx.unknownAll = opts._unknownAll === true || ctx.arith.dynamic; // (an arithmetic that assigns through a name may set any name, also one the line never gave. Defence in depth for the names the line gave: collectVars marks every one when arith.dynamic)
   ctx.srcChanged = new Set(opts._srcChanged ?? []); // names an unfollowable sourced file may have changed (a write target that uses one is refused)
