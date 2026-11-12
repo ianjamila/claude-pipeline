@@ -10,7 +10,7 @@
 // - A write counts for a command when it comes before it on the line (strictly: even a conditional or background one), runs in the same
 //   pipeline, races with a background job, or may repeat before it (a loop).
 // Pure: the policies supply how to expand a word and where a command runs (see newWriteFrame).
-import { commandName, isStdinPath } from './shell-parse.mjs';
+import { commandName } from './shell-parse.mjs';
 import { applySed, sedReadings, dynamic } from './sed-emulate.mjs';
 
 // ---- control flow -------------------------------------------------------------------------------------------
@@ -1002,7 +1002,7 @@ const AWK_PROGRAM_CODE = /[>|]|\bsystem\s*\(|@(?:include|load|namespace)\b/;
 const AWK_INPLACE_INCLUDE = /@include\s*(["'])inplace(?:\.awk)?\1/g;
 const isInplaceLib = (v) => /^inplace(?:\.awk)?$/.test(v);
 function awkScan(args, env = {}, read = null) {
-  const r = { impure: false, other: false, inPlace: false, writes: false, stdinProgram: false, programs: [], files: [] };
+  const r = { impure: false, other: false, inPlace: false, writes: false, programs: [], files: [] };
   const libPath = Object.keys(env ?? {}).some((k) => /^AWK(?:LIB)?PATH$/.test(k));
   const pos = [];
   let progOpt = false;
@@ -1014,7 +1014,7 @@ function awkScan(args, env = {}, read = null) {
   };
   // Why: a program FILE (-f / -E / --file / --exec) is scanned like the program text when it can be read; unreadable (or no reader: the caller cannot place it) = not pure
   // (a device or a pipe -- `-`, /dev/stdin, /dev/fd/N, /proc/... -- is not a file the hook can read: awk would see other text)
-  const programFile = (w) => { const dev = isStdinPath(w); if (dev) r.stdinProgram = true; const texts = read && !dev && !/^(?:-|\/(?:dev|proc|sys)(?:\/|$))/.test(w) ? read(w) : null; if (texts === null || texts === undefined) bad(); else for (const t of texts) program(t); };
+  const programFile = (w) => { const texts = read && !/^(?:-|\/(?:dev|proc|sys)(?:\/|$))/.test(w) ? read(w) : null; if (texts === null || texts === undefined) bad(); else for (const t of texts) program(t); };
   const all = Object.values(AWK_LONG).flat();
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -1023,10 +1023,10 @@ function awkScan(args, env = {}, read = null) {
       const eq = a.indexOf('=');
       const nm = eq > 0 ? a.slice(2, eq) : a.slice(2);
       const full = all.includes(nm) ? nm : (() => { const m = all.filter((x) => x.startsWith(nm)); return nm !== '' && m.length === 1 ? m[0] : null; })();
-      if (full === null) { bad(); if (isStdinPath(eq > 0 ? a.slice(eq + 1) : (args[i + 1] ?? ''))) r.stdinProgram = true; continue; } // (an unknown or ambiguous abbreviation (`--fi`) next to a stdin name: fail closed)
+      if (full === null) { bad(); continue; }
       const val = () => (eq > 0 ? a.slice(eq + 1) : (args[++i] ?? ''));
       if (AWK_LONG.value.includes(full)) val();
-      else if (full === 'source') { progOpt = true; program(val()); } else if (full === 'include') { const v = val(); if (isStdinPath(v)) r.stdinProgram = true; if (isInplaceLib(v)) r.inPlace = true; bad(); } else if (AWK_LONG.code.includes(full)) { progOpt = true; if (full === 'load') { if (isStdinPath(val())) r.stdinProgram = true; bad(); } else programFile(val()); } else if (AWK_LONG.optional.includes(full)) bad();
+      else if (full === 'source') { progOpt = true; program(val()); } else if (full === 'include') { if (isInplaceLib(val())) r.inPlace = true; bad(); } else if (AWK_LONG.code.includes(full)) { progOpt = true; if (full === 'load') { val(); bad(); } else programFile(val()); } else if (AWK_LONG.optional.includes(full)) bad();
       else if (eq > 0 && !['lint', 'optimize'].includes(full)) bad(); // (a switch given a value: not a form we know)
       continue;
     }
@@ -1037,10 +1037,9 @@ function awkScan(args, env = {}, read = null) {
         const val = () => (rest !== '' ? rest : (args[++i] ?? ''));
         if (ch === 'F' || ch === 'v') { val(); break; }
         if (ch === 'e') { progOpt = true; program(val()); break; }
-        if (ch === 'i') { const v = val(); if (isStdinPath(v)) r.stdinProgram = true; if (isInplaceLib(v)) r.inPlace = true; bad(); break; }
+        if (ch === 'i') { if (isInplaceLib(val())) r.inPlace = true; bad(); break; }
         if (ch === 'f' || ch === 'E') { progOpt = true; programFile(val()); break; }
-        if (ch === 'W') { val(); r.stdinProgram = true; bad(); break; } // (R7-B1) -W is gawk/mawk's implementation-option switch (-W exec=-, -Wexec=-, -W exec -, -W file=-, -W include=..., abbreviations): the value can name stdin in more spellings than we parse, so any -W counts as a program on stdin
-        if (ch === 'l') { if (isStdinPath(val())) r.stdinProgram = true; bad(); break; }
+        if ('lW'.includes(ch)) { val(); bad(); break; }
         if (!'bcCMnNOPrsStVh'.includes(ch)) { bad(); break; } // (-d -D -o -p -g -L write or run, and so does anything we do not know)
       }
       continue;
@@ -1051,8 +1050,6 @@ function awkScan(args, env = {}, read = null) {
   if (libPath) bad();
   return r;
 }
-// (R6-B1) does a program-file option (-f -E -i -l, --file --exec --include --load, short clusters, gawk's abbreviations) name stdin (`-`, /dev/stdin ...): the program is then the text fed on stdin
-export const awkStdinProgram = (args, env = {}) => awkScan(args, env, null).stdinProgram;
 export const awkArgsPure = (args, env = {}, read = null) => !awkScan(args, env, read).impure;
 
 function isPure(cmd, name, lineEnv = {}, io = {}) {

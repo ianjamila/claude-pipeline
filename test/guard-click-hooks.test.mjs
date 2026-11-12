@@ -283,7 +283,8 @@ test('R2-F7: an interpreter\'s inline code that names a hook surface file is ref
   assert.equal(bash(`python3 -c "import base64;open('.claude/settings.local.json','w').write(base64.b64decode('e30=').decode())"`), 'deny');
   assert.equal(bash(`node -e "require('fs').writeFileSync('.claude/settings.json','{}')"`), 'deny');
   assert.equal(bash(`python3 -c "print(open('.claude/settings.json').read())"`), 'deny', 'R4-B1: no plain-read exemption: a program that names the file is refused');
-  assert.equal(bash(`cat .claude/settings.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'`), 'allow');
+  // owner decision 2026-11-12 (#269 R8): a fed interpreter on a line naming a hook file is refused
+  assert.equal(bash(`cat .claude/settings.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'`), 'deny');
   assert.equal(bash('git add .claude/settings.json'), 'allow');
 });
 
@@ -298,9 +299,10 @@ test('R3-B1: inline code that names a hook surface file in its program text is r
     `python3 <<'PY'\nimport os\nos.link('/tmp/payload', '.claude/settings.local.json')\nPY`,
     `echo "import os; os.link('/tmp/payload', '.claude/settings.local.json')" | python3`,
     `python3 - <<< "import os; os.link('/tmp/payload', '.claude/skills/s/SKILL.md')"`,
+    // owner decision 2026-11-12 (#269 R8): a fed interpreter on a line naming a hook file is refused
+    `cat .claude/settings.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [
-    `cat .claude/settings.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'`,
     `python3 -c "import os; os.link('/tmp/a','/tmp/b')"`,
     `node -e "console.log(1)"`,
     `git add .claude/settings.json`,
@@ -360,7 +362,8 @@ test('R4-B1: no plain-read exemption: an inline program that names a hook surfac
     `python3 -c "print(Path('.claude/settings.json').read_text())"`,
     `node -e "console.log(require('fs').readFileSync('.claude/settings.json','utf8'))"`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
-  assert.equal(bash(`cat .claude/settings.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'`), 'allow');
+  // owner decision 2026-11-12 (#269 R8): a fed interpreter on a line naming a hook file is refused
+  assert.equal(bash(`cat .claude/settings.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'`), 'deny');
 });
 
 test('R4-F1: a program fed on stdin is judged whatever option the interpreter holds that carries no program (-E, -R, -rjson, -r fs, -Mstrict)', () => {
@@ -374,10 +377,11 @@ test('R4-F1: a program fed on stdin is judged whatever option the interpreter ho
     `echo "link '/tmp/payload','.claude/settings.local.json';" | perl -Mstrict`,
     `python3 -E <<< "${prog}"`,
     `ruby -rjson <<< "File.link('/tmp/payload','.claude/settings.local.json')"`,
+    // owner decision 2026-11-12 (#269 R8): a fed interpreter on a line naming a hook file is refused
+    `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())'`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [
     `python3 -c "import os; os.link('/tmp/a','/tmp/b')" 2>&1`,
-    `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())'`,
     `node -r fs -e "console.log(1)"`,
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
@@ -404,13 +408,12 @@ test('R5-B1, R5-F1: a code option does not prove the program is not on stdin: -c
     `echo "${js}" | node --interactive -e 0`,
     `echo "${lua}" | lua -e '' -`,
     `echo "${lua}" | lua -i -e ''`,
-  ]) assert.equal(bash(cmd), 'deny', cmd);
-  for (const cmd of [
+    // owner decision 2026-11-12 (#269 R8): a fed interpreter on a line naming a hook file is refused
     `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())'`,
     `echo ".claude/settings.json" | python3 -Bu -c 'import sys; print(sys.stdin.read())'`,
     `echo ".claude/settings.json" | node --no-warnings -e "console.log(1)"`,
     `echo ".claude/settings.json" | perl -w -e 'print 1'`,
-  ]) assert.equal(bash(cmd), 'allow', cmd);
+  ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 
 // ---- round 6 (R6-B1, R6-F1) ------------------------------------------------------------------------------------------------------------
@@ -450,12 +453,13 @@ test('R6-B1, R6-F1: a program on stdin named by a path or a program-file option 
     `echo "${lua}" | LUA_INIT=/dev/stdin lua -e ''`,
   ]) if (bash(cmd) !== 'deny') failures.push(cmd);
   assert.deepEqual(failures, [], 'these lines were not refused');
+  // owner decision 2026-11-12 (#269 R8): a fed interpreter on a line naming a hook file is refused
   for (const cmd of [
     `echo ".claude/settings.json" | awk '{print}'`,
     `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())'`,
     `echo ".claude/settings.json" | python3 /tmp/after.py`,
-    `node -r fs -e "console.log(1)"`,
-  ]) assert.equal(bash(cmd), 'allow', cmd);
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  assert.equal(bash(`node -r fs -e "console.log(1)"`), 'allow');
 });
 
 test('R6 security review: non-canonical stdin paths and spaced assignments', () => {
@@ -487,12 +491,13 @@ test('R6 security review: non-canonical stdin paths and spaced assignments', () 
     `echo "${lua}" | LUA_INIT_5_4=@/dev/stdin lua -e ''`,
   ]) if (bash(cmd) !== 'deny') failures.push(cmd);
   assert.deepEqual(failures, [], 'these lines were not refused');
+  // owner decision 2026-11-12 (#269 R8): a fed interpreter on a line naming a hook file is refused
   for (const cmd of [
     `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())' 2>/dev/null`,
     `echo ".claude/settings.json" | awk '{print}' > /dev/null`,
     `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())' > /dev/null 2>&1`,
-    `FOO=bar node -r fs -e "console.log(1)"`,
-  ]) assert.equal(bash(cmd), 'allow', cmd);
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  assert.equal(bash(`FOO=bar node -r fs -e "console.log(1)"`), 'allow');
 });
 
 // ---- round 7 (R7-B1, R7-F1, R7-F2) -----------------------------------------------------------------------------------------------------
@@ -529,13 +534,90 @@ test('R7: -W options, non-literal stdin paths, startup variables without NAME=',
     `read -r LUA_INIT <<< '@/dev/stdin'; export LUA_INIT; echo "${lua}" | lua -e ''`,
   ]) if (bash(cmd) !== 'deny') failures.push(cmd);
   assert.deepEqual(failures, [], 'these lines were not refused');
+  // owner decision 2026-11-12 (#269 R8): a fed interpreter on a line naming a hook file is refused
   for (const cmd of [
     `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())'`,
-    `node -r fs -e "require('fs').readFileSync('README.md','utf8')"`,
     `echo ".claude/settings.json" | awk '{print}' > /dev/null`,
     `echo ".claude/settings.json" | node -r ./lib/x.js -e 0`,
     `echo ".claude/settings.json" | awk -f prog.awk`,
     `echo ".claude/settings.json" | python3 script.py`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `node -r fs -e "require('fs').readFileSync('README.md','utf8')"`,
     `python3 script.py < input.txt`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// ---- round 8 (R8-B1, R8-F1..F5; owner decision 2026-11-12): no guessing whether an interpreter runs its input as code ------------------------
+
+test('R8: any interpreter fed on a line naming a hook file is refused (pipe, redirect, here-string, process substitution, exec); fed but naming none, or not fed, stays allowed', () => {
+  const py = "import os; os.link('/tmp/payload','.claude/settings.local.json')";
+  const js = "require('fs').linkSync('/tmp/payload','.claude/settings.local.json')";
+  const lua = "os.execute('ln /tmp/payload .claude/settings.local.json')";
+  const awk = 'BEGIN { system("ln /tmp/payload .claude/settings.local.json") }';
+  const R = "system('ln /tmp/payload .claude/settings.local.json')";
+  const dollar = '$';
+  const failures = [];
+  for (const cmd of [
+    // R8-B1 / R8-F1 / R8-F2: names built by quoting or expansion, startup variables of every interpreter
+    `LUA_''INIT=@/dev/stdin lua -e '' <<< "${lua}"`,
+    `echo "${lua}" | LUA_''INIT=@/dev/stdin lua -e ''`,
+    `read -r LUA_''INIT <<< '@/dev/stdin'; export LUA_''INIT; echo "${lua}" | lua -e ''`,
+    `a=LUA_; read -r ${dollar}{a}INIT <<< '@/dev/stdin'; export ${dollar}{a}INIT; echo "${lua}" | lua -e ''`,
+    `read -r R_PROFILE_USER <<< /dev/stdin; export R_PROFILE_USER; echo "${R}" | Rscript -e 0`,
+    `read -r AWKPATH <<< /dev; export AWKPATH; echo '${awk}' | gawk -i stdin 'BEGIN{}'`,
+    `echo "${js}" | bun --preload /dev/stdin -e 0`,
+    `echo "${js}" | deno eval --preload /dev/stdin 0`,
+    // R8-F3: a working directory under /dev makes a plain name stdin
+    `cd /dev && echo "${py}" | python3 stdin`,
+    `cd /dev/fd && echo "${py}" | python3 0`,
+    `cd /dev && echo "${js}" | node -r ./stdin -e 0`,
+    `cd /dev && echo '${awk}' | gawk -f stdin`,
+    `pushd /dev; echo "${py}" | python3 stdin`,
+    `(cd /dev; echo "${py}" | python3 stdin)`,
+    // R8-F4/F5: spellings of the path, interpreter names with versions, shells
+    `echo "${js}" | node --import=file:///%64ev/stdin -e 0`,
+    `echo "link '/tmp/payload','.claude/settings.local.json';" | perl5.34`,
+    `echo "File.link('/tmp/payload','.claude/settings.local.json')" | ruby3.3 -e 0`,
+    `echo "ln /tmp/payload .claude/settings.local.json" | sh`,
+    `echo "ln /tmp/payload .claude/settings.local.json" | bash -s`,
+    `echo "${py}" | /usr/bin/env python3`,
+    `echo "${py}" | timeout 5 python3`,
+    `echo "${py}" | python3.12 -`,
+    `echo "${py}" |& python3`,
+    // other ways to feed one
+    `python3 <(echo "${py}")`,
+    `python3 /dev/stdin < /tmp/prog.py # ${py}`,
+    `exec 0</tmp/p; python3 /dev/stdin # .claude/settings.local.json`,
+    `exec < /tmp/p; node /dev/stdin; : .claude/settings.local.json`,
+    `python3 0< /tmp/p.py; : .claude/settings.local.json`,
+    `python3 script.py < .claude/settings.json`,
+    `python3 <<< "x"; cat .claude/settings.json`,
+    `cat x.py | { python3 -; } # .claude/settings.json`,
+    `cat x.py | (python3 -) # .claude/settings.json`,
+    `cat x.py | while read l; do python3 -c 0; done # .claude/settings.json`,
+    `{ python3 -c 0; } < x.py # .claude/settings.json`,
+    `coproc python3 -c 0; cat .claude/settings.json`,
+    `cat .claude/settings.json | ${dollar}PY -c 0`,
+    `cat .claude/settings.json | php -r 'echo 1;'`,
+    `cat .claude/settings.json | osascript -e 'x'`,
+    `cat .claude/settings.json | julia -e '1'`,
+    `cat .claude/settings.json | tclsh8.6`,
+  ]) if (bash(cmd) !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these lines were not refused');
+  // R8-F4: an ordinary script FILE run is not refused for its path; fed but naming no hook file, jq, and a non-fed awk are fine
+  for (const cmd of [
+    'node ~/.claude/pipeline/bin/pipeline.mjs status; cat .claude/settings.json',
+    // (a script handed a hook file BY NAME -- `python3 ../tools/lint.py .claude/commands/x.md` -- stays refused by the older unknown-write rule (R2-F6), also before round 5; these read it in a separate command)
+    'python3 ../tools/lint.py README.md; cat .claude/commands/x.md',
+    'node "$ROOT/check.mjs" --all; cat .claude/skills/a/SKILL.md',
+    'node scripts/dev/check.mjs; cat .claude/settings.json',
+    'node ~/x.mjs; cat .claude/settings.json',
+    'node ~/.claude/pipeline/bin/pipeline.mjs job wait x --run-id y | node -e \'let s="";process.stdin.on("data",d=>s+=d)\'',
+    'cat .claude/settings.json | jq .hooks',
+    "awk '{print}' README.md > /dev/null",
+    'cat .claude/settings.json | grep -c python',
+    'cat .claude/settings.json | grep node',
+    'python3 -c "print(1)" | cat; ls .claude/settings.json',
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });

@@ -10,7 +10,6 @@
 // A shell / source / eval fed script text from files (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`) carries them in a
 // non-enumerable `feeds`; scriptFeedsOf turns it into script-file records for the callers.
 
-import { posix as posixPath } from 'node:path';
 import { sqlShellEscapes, sqlFamilyOf, sqlClientPlan, SQL_CLIENT_NAMES, SQL_RC_MENTION } from './sql-clients.mjs';
 const MAX_COMMANDS = 500;
 const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up on the line
@@ -35,20 +34,7 @@ const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ash', 'ksh', 'ksh93', 'mks
 const TMUX_RUNNERS = new Set(['new-session', 'new', 'new-window', 'neww', 'split-window', 'splitw', 'respawn-pane', 'respawnp', 'respawn-window', 'respawnw', 'run-shell', 'run', 'pipe-pane', 'pipep', 'display-popup', 'popup', 'if-shell', 'if']);
 const TMUX_KEY_RE = /^(Enter|Space|Tab|Escape|BSpace|Up|Down|Left|Right|Home|End|PageUp|PageDown|[CMS]-.+|F[0-9]+|KP.+)$/;
 const PS_START_VALUED = ['workingdirectory', 'verb', 'windowstyle', 'redirectstandardinput', 'redirectstandardoutput', 'redirectstandarderror', 'credential', 'environment'];
-export const STDIN_FILES = new Set(['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0']);
-// (R6 security review, R7-F1) Could this word name stdin (or another process's / device's stream) once the shell and the kernel have resolved it? The hook stays pure (no filesystem lookups), so it fails closed on anything it
-// cannot prove is an ordinary file name: `-`; a word still holding an expansion, a glob or an escape (`$`, backtick, `*`, `?`, `[`, `{`, a leading `~`, a backslash, a quote, `<(` / `>(`); a `..` segment anywhere (relative
-// climbing to /dev); or ANY path segment named dev, proc, fd or Volumes (`/dev/stdin`, `//dev/./stdin`, `/proc/self/fd/0`, `/Volumes/<disk>/dev/stdin`, `a/dev/stdin`), in any letter case.
-export function isStdinPath(word) {
-  if (typeof word !== 'string') return false;
-  let w = word.trim();
-  if (w === '-') return true;
-  const q = /^(["'])(.*)\1$/s.exec(w);
-  if (q) w = q[2];
-  if (w === '-') return true;
-  if (/[$`*?[{\\'"]/.test(w) || w.startsWith('~') || /[<>]\(/.test(w)) return true;
-  return w.split('/').some((seg) => seg === '..' || /^(?:dev|proc|fd|Volumes)$/i.test(seg));
-}
+const STDIN_FILES = new Set(['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0']);
 const DYN_AFTER_DOLLAR = /[A-Za-z_{0-9@*#?!$[-]/;
 const WIN_PATH_RE = /[^\\]\\[^\\]|^\\\\/; // C:\Git\git.exe, .\git.exe, \\server\share\git.exe
 const ANSI_C = { n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', v: '\v', '\\': '\\', "'": "'", '"': '"', '?': '?' };

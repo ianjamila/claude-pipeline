@@ -23,8 +23,8 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { isStdinPath, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
-import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, awkStdinProgram, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
 const posix = path.posix;
@@ -1703,74 +1703,46 @@ function countCdRun(budget) {
   if (budget.cdRuns > MAX_CD_RERUNS) throw new GuardLimit('too many commands run after a cd into a directory known only at run time (each is checked in every protected directory), so they cannot be verified. Write the directory out.');
 }
 // Does the command run interpreter code that is not a file (`node -e`, `python3 -c`, `perl -e`, a program on stdin, an awk program that is not read-only; every interpreter run that is not `interp FILE`)? It can build any file name at run time.
-const INLINE_RUNNERS = /^(?:node|nodejs|deno|bun|tsx|ts-node|python\d*(?:\.\d+)*|ruby|perl|php|lua|Rscript|awk|gawk|mawk|nawk)$/;
+// (command names are lower-cased by commandName; every family also runs under a version suffix: python3.12, perl5.34, ruby3.3, lua5.4, node22 -- #289)
+const VERSION = '(?:[-_]?\\d+(?:\\.\\d+)*)?';
+const INLINE_RUNNERS = new RegExp(`^(?:node|nodejs|deno|bun|tsx|ts-node|python|pypy|ruby|perl|php|lua|luajit|rscript|awk|gawk|mawk|nawk)${VERSION}$`);
+// (#269 R8, owner decision 2026-11-12) Every program that reads and runs text: the inline runners above, the other scripting languages, and the shells. A generous, fail-closed name list.
+const INTERPRETERS = new RegExp(`^(?:node|nodejs|deno|bun|tsx|ts-node|python|pypy|ruby|perl|php|lua|luajit|rscript|r|awk|gawk|mawk|nawk|wish|osascript|jjs|groovy|julia|sh|bash|zsh|dash|ash|ksh|ksh93|mksh|fish|busybox|csh|tcsh)${VERSION}$|^tclsh`);
+// (commands that only print or search their arguments: an interpreter's name among their words is a pattern or a file name, not a program)
+const NEVER_RUNS_ARGS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'echo', 'printf', 'cat', 'ls', 'which', 'type', 'whereis', 'man', 'wc', 'head', 'tail', 'sort', 'uniq', 'tr', 'cut', 'jq', 'diff', 'cmp', 'test', '[', 'stat', 'basename', 'dirname', 'realpath', 'readlink']);
+// Is this command an interpreter (its name, past any wrapper the parser did not unwrap -- `timeout 5 python3`, `stdbuf -oL node` -- is one of INTERPRETERS), or a command whose name is only known at run time (`$PY`, `${X}`, a glob)?
+function isInterpreterCmd(argv) {
+  if (!argv.length) return false;
+  if (NEVER_RUNS_ARGS.has(baseOf(argv[0]))) return false;
+  if (/[$`*?[{]/.test(argv[0])) return true;
+  return argv.some((w) => INTERPRETERS.test(baseOf(w)));
+}
+const inputRedirect = (c) => (c.redirects ?? []).some((r) => /</.test(r.op ?? ''));
+const hasProcSub = (c) => c.argv.some((w) => w.includes('<('));
+// Is this interpreter FED input on the line? Fail closed: it receives a pipe (`|`, `|&`), has an input redirect (`<`, `<<`, `<<-`, `<<<`, `<&`, `<>`, `0<`), or a word holding `<(`; a coproc or an `exec` that
+// replaces stdin feeds every command of the line; and a command whose place in a pipeline is not known (inside a group, subshell, loop, if / case branch or function, or on a line holding a `{ ` group) is fed when the line has
+// any pipe or input redirect at all.
+function feedInfo(cmds, raw) {
+  const lineFeeds = /<|(?<![|])\|(?![|])/.test(raw) || cmds.some((c) => c.sep === '|' || inputRedirect(c) || hasProcSub(c));
+  const stdinReplaced = /\bcoproc\b/.test(raw) || cmds.some((c) => baseOf(c.argv[0] ?? '') === 'exec' && (inputRedirect(c) || c.argv.slice(1).some((w) => /^\d*</.test(w)))) || /\bexec\b[^;&|\n]*</.test(raw);
+  const groupOnLine = /(?:^|[\s;&|(])\{(?:\s|$)/.test(raw);
+  return (c) => stdinReplaced || c.sep === '|' || inputRedirect(c) || hasProcSub(c)
+    || (lineFeeds && (groupOnLine || (c.depth ?? 0) > 0 || (c.grp?.length ?? 0) > 0 || Object.values(c.ctl ?? {}).some(Boolean)));
+}
 const BENIGN_INTERP_OPTS = /^(?:--no-warnings|--trace-warnings|--enable-source-maps|--harmony|-B|-u|-O|-OO|-v|-w|-T|-t|-s)$/;
-// (R4-F1, R5-B1, R5-F1) Is the program of this interpreter given in its arguments, so that stdin is not program text? Only when a real code option (python `-c X`; node / bun / tsx / ts-node `-e -p --eval --print X`;
-// ruby / perl / lua / Rscript `-e X` (perl `-E`); php `-r X`; `deno eval X`) is reached by a strict left-to-right walk of the interpreter's own words through options known to be plain flags (no value). The walk stops
-// with "no" at the first operand, `-`, `--`, `-m`, or any option it does not know (it may take a value, so the next word is not a code option: `python3 -X -cx`, `python3 -W -c -`, `perl -I -e -`), and for an
-// interactive flag (`-i`, `-ic`, `--interactive`, PYTHONINSPECT: the interpreter runs the code and then reads stdin) or a lua / node `-` operand (the script is stdin). A trailing `-c` after the stdin operand is a script argument.
-// Anything else leaves the program on stdin and the line is scanned as such. (runsInlineCode's pattern is a fail-closed guess; it is no proof of this.)
-const CODE_WALK = [
-  // [interpreter, code option (group 1 = attached program text), plain flag (no value), option whose next word is a known value (skipped), words that put the program on stdin anywhere after the interpreter]
-  [/^python\d*(?:\.\d+)*$/, /^-[bBdEIOPqRsSuvx]*c(.*)$/s, /^-[bBdEIOPqRsSuvx]+$/, null, /^(?:-|-i|--interactive)$/],
-  [/^(?:node|nodejs|bun|tsx|ts-node)$/, /^(?:-e|-p|-pe|-ep|--eval|--print)(?:=(.*))?$/s, /^(?:--no-warnings|--no-deprecation|--trace-warnings|--trace-deprecation|--enable-source-maps|--harmony|--(?:require|import|loader)=.*)$/, /^(?:-r|--require|--import|--loader)$/, /^(?:-|-i|--interactive)$/],
-  [/^ruby$/, /^-[nplaSsdwvy]*e(.*)$/s, /^-[nplaSsdwvy]+$/, null, /^-$/],
-  [/^perl$/, /^-[nplawsSCtTuUWXc0-9]*[eE](.*)$/s, /^-[nplawsSCtTuUWXc0-9]+$/, null, /^-$/],
-  [/^lua$/, /^-e(.*)$/s, /^(?:-v|-E|-W)$/, null, /^(?:-|-i)$/],
-  [/^Rscript$/, /^-e(.*)$/s, /^--(?:verbose|vanilla|no-environ|no-site-file|no-init-file|no-restore|no-save|quiet|silent|slave)$/, null, /^-$/],
-  [/^php$/, /^-r(.*)$/s, /^-[nqCH]$/, null, /^(?:-|-a|--interactive)$/],
-];
-// (R6-B1, R6-F1, R6 security review) A word that names stdin as a file -- `-`, /dev/stdin, /dev/fd/N, /proc/<pid>/fd/N, in any spelling isStdinPath resolves (`//dev/stdin`, `/dev/./stdin`) -- or an option / assignment
-// value of that kind (`--require=/dev/stdin`, `=@/dev/stdin`, any text after an `=`)
-const STDIN_WORD = (a) => isStdinPath(a) || a.split('=').slice(1).some((v) => isStdinPath(v.startsWith('@') ? v.slice(1) : v));
-// (an assignment anywhere on the raw line (prefix, export, declare, quoted value with spaces) whose value holds a /dev/ or /proc/ path -- `NODE_OPTIONS="--require /dev/stdin" node -e 0` -- lets the interpreter read its startup code
-// from stdin; so does ANY assignment of a variable that carries startup code, whatever its value. A redirect (`2>/dev/null`) has no NAME= in front and is not one.)
-const ASSIGN_VALUE = /(?:^|[^\w])[A-Za-z_]\w*\+?=((?:"(?:[^"\\]|\\.)*"|'[^']*'|\\.|[^\s"'\\])*)/g;
-// (R7-F2) ANY mention of a startup-code variable on the line, however it gets its value (`: "${NODE_OPTIONS:=...}"`, `read -r NODE_OPTIONS`, `printf -v`, `declare`, `mapfile`, `export`) -- no `=` needed
-const STARTUP_VAR_ASSIGN = /\b(?:NODE_OPTIONS|LUA_INIT\w*|RUBYOPT|RUBYLIB|PERL5OPT|PERL5LIB|PERLLIB|PYTHONSTARTUP|PYTHONINSPECT|PYTHONPATH|NODE_PATH)\b/;
-function stdinAssign(line) {
-  if (STARTUP_VAR_ASSIGN.test(line)) return true;
-  // (R7 note A) fail closed on a value that could be, or build, a /dev or /proc path: an escape or expansion in it (`X=/d\ev/stdin`, `d=$(...)`), or a dev / proc segment anywhere, with or without a trailing slash (`d=/dev`)
-  for (const m of line.matchAll(ASSIGN_VALUE)) if (/[\\$`]/.test(m[1]) || /(?:^|\/)(?:dev|proc)(?:\/|$)/i.test(m[1].replace(/["'\\]/g, '').replace(/\/{2,}/g, '/'))) return true;
-  return false;
-}
-function programInArgv(argv, line = '') {
-  if (stdinAssign(line)) return false;
-  const runners = argv.map((w, i) => [baseOf(w), i]).filter(([b]) => INLINE_RUNNERS.test(b));
-  return runners.length > 0 && runners.every(([b, i]) => {
-    const rest = argv.slice(i + 1);
-    if (/^(?:awk|gawk|mawk|nawk)$/.test(b)) return !awkStdinProgram(rest) && !rest.some((a) => /^(?:-f|--file)/.test(a));
-    if (b === 'deno') return rest[0] === 'eval' && rest.length > 1;
-    const row = CODE_WALK.find(([name]) => name.test(b));
-    if (row === undefined) return false;
-    const [, code, plain, valueOpt, onStdinWord] = row;
-    if (/^python/.test(b) && /PYTHONINSPECT/i.test(line)) return false;
-    // (R7-F1) the program text itself (`-e <text>`, `-pe<text>`, `--eval=<text>`) is not a file name: quotes, `$` and `/` in it are ordinary code, so it is left out of the stdin-path test
-    const text = new Set();
-    for (let k = 0; k < rest.length; k++) { const m = code.exec(rest[k]); if (m !== null) { text.add((m[1] ?? '') !== '' ? k : k + 1); break; } }
-    if (rest.some((a, k) => (onStdinWord.test(a) && !code.test(a)) || (!text.has(k) && STDIN_WORD(a)))) return false;
-    for (let k = 0; k < rest.length; k++) {
-      const m = code.exec(rest[k]);
-      if (m !== null) return (m[1] ?? '') !== '' || k + 1 < rest.length;
-      if (valueOpt?.test(rest[k])) { k++; continue; }
-      if (!plain.test(rest[k])) return false;
-    }
-    return false;
-  });
-}
 function runsInlineCode(c, ctx) {
   if (!c.argv.length || isReadOnly(c, ctx)) return false;
   return c.argv.some((w, i) => {
     if (!INLINE_RUNNERS.test(baseOf(w))) return false;
     const rest = c.argv.slice(i + 1);
     // (a program text next to -f -- gawk -e / --source / -E / --exec -- is inline code too; so is an include / load of a library)
-    if (/^(?:awk|gawk|mawk|nawk)$/.test(baseOf(w))) return !rest.some((a) => /^(?:-f|--file)/.test(a)) || rest.some((a) => /^(?:-[eEil]|--(?:source|exec|include|load))/.test(a)) || awkStdinProgram(rest);
+    if (/^(?:awk|gawk|mawk|nawk)$/.test(baseOf(w))) return !rest.some((a) => /^(?:-f|--file)/.test(a)) || rest.some((a) => /^(?:-[eEil]|--(?:source|exec|include|load))/.test(a));
     if (baseOf(w) === 'deno' && rest[0] === 'eval') return true;
     // (fail closed: any word that is a code option, attached or not (`-e'..'`, `-cprint(1)`, `--eval`), no file operand, or an option we do not know before the first operand
     // (it may take a value, so what follows is not known to be the file: `node -r x.js -e ..`, `perl -I lib -e ..`, `python3 -W ignore -c ..`))
     if (rest.some((a) => /^--(?:eval|print|exec)(?:=|$)/.test(a) || /^-[A-Za-z]*[ecEprR]/.test(a))) return true;
     const file = rest.findIndex((a) => !a.startsWith('-') || a === '-');
-    return file < 0 || isStdinPath(rest[file]) || rest.slice(0, file).some((a) => !BENIGN_INTERP_OPTS.test(a));
+    return file < 0 || rest[file] === '-' || rest.slice(0, file).some((a) => !BENIGN_INTERP_OPTS.test(a));
   });
 }
 // Why: a cd whose target cannot be named from its words: `cd -` (OLDPWD), `popd`, a bare `pushd`, `pushd +1`, several operands (a brace list the parser split; zsh `cd old new`),
@@ -3440,17 +3412,23 @@ function evaluateBashForFilesFrame(command, opts) {
   }
   // #261: a write whose text names a file that can declare a hook on the owner's dialogs inside a program or a quoted string, and whose line says "hooks" (its effect cannot be evaluated). A write whose TARGET is
   // such a file is judged by the target and what lands in it (R1-B1, hookSurfaceBashReason below, once the line's writes are known)
-  // (R2-F7, R3-B1) an interpreter's inline code (-e / -c, a program on stdin) whose program text names such a file is refused without the word "hooks" and whatever it does with the file (a write word is no gate:
-  // os.link, os.sendfile, shutil.copy, fs.linkSync ...): the program builds what lands there. The program text is the interpreter command's own words, a here-string, and (a heredoc or a program fed on stdin)
-  // the line; not the whole line for a program given by a real code option (-e / -c ...; programInArgv: `cat <settings> | python3 -c '…json.load(sys.stdin)'` names none). (R4-B1) A read is no exception: a program that names the file is refused.
+  // (R2-F7, R3-B1, R8; owner decision 2026-11-12) Two rules, with no guessing whether an interpreter runs its input as code (rounds 5-8 kept finding ways to make one run its stdin despite a code option):
+  // 1. An interpreter (node, python, ruby, perl, php, lua, R, awk, deno, bun, tclsh, osascript ..., with or without a version suffix, and the shells) that is FED input on the line -- it receives a pipe, has an input
+  //    redirect or here-string or heredoc, holds a <( ) word, or an earlier `exec` / `coproc` replaced stdin, or its place in a pipeline is not known (inside a group, loop, branch or function on a line with a pipe or an
+  //    input redirect) -- is refused when the line names a file that can declare hooks. What it reads may be its program, and it may build the file name at run time, so the line is not scanned further.
+  // 2. An interpreter that is not fed and runs inline code (-e / -c, an awk program) is refused when its own words (or a here-string) name such a file, without the word "hooks" and whatever it does with the file
+  //    (a write word is no gate: os.link, os.sendfile, shutil.copy, fs.linkSync ...). (R4-B1) A read is no exception.
+  // So `cat <settings> | python3 -c '…json.load(sys.stdin)'` is refused too (read the file with the Read tool or jq). An interpreter that is fed on a line naming no such file, and an ordinary `interp FILE` run, are not touched.
+  // Known residual, out of reach of a text check: a program staged in a file by an EARLIER command (R4-F3 follow-up), and a program that is not fed and builds the path at run time.
   {
     const hooksWord = /hooks/i.test(scanRaw);
+    const isFed = feedInfo(cmds, raw);
+    const namesSurface = HOOK_SURFACE_TEXT.test(scanRaw);
     for (const c of cmds) {
-      if (runsInlineCode(c, ctx)) {
-        const reds = c.redirects ?? [];
-        const codeInArgv = programInArgv(c.argv, raw);
-        const onStdin = !codeInArgv || reds.some((r) => /^<<(?!<)/.test(r.op ?? ''));
-        const text = [...wordsOf(c), ...reds.filter((r) => r.op === '<<<').map((r) => r.target ?? ''), ...(onStdin ? [scanRaw] : [])].join('\n');
+      if (isInterpreterCmd(c.argv) && isFed(c)) {
+        if (namesSurface) return deny(`input is fed into an interpreter on a line that names a file that can declare hooks; whether the interpreter runs that input as code cannot be checked (${HOOKS_MSG})`);
+      } else if (runsInlineCode(c, ctx)) {
+        const text = [...wordsOf(c), ...(c.redirects ?? []).filter((r) => r.op === '<<<').map((r) => r.target ?? '')].join('\n');
         if (HOOK_SURFACE_TEXT.test(text)) return deny(`an inline program names a file that can declare hooks, and what it does to it cannot be checked (${HOOKS_MSG})`);
       }
       if (!hooksWord) continue;
