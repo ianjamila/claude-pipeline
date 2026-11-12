@@ -83,8 +83,15 @@ export const DEFAULTS = deepFreeze({
   },
   review: {
     codex_model: 'gpt-6-astra',
-    effort: { low: 'medium', medium: 'medium', high: 'high', followup: 'medium' },
+    // low|medium|high: round 1 by the PR's risk; followup: every later round. small_fix: the effort of a fix-check round whose reviewed range is at most
+    // small_fix_lines changed lines, adds no new file and touches no sensitive path (also used for every non-protected round when the weekly Codex governor is soft).
+    // The review command refuses an --effort that is not the configured one for the round.
+    effort: { low: 'medium', medium: 'medium', high: 'high', followup: 'medium', small_fix: 'low', small_fix_lines: 40 },
     max_rounds: 2,
+    // Codex runs (rounds and second reviews the state records) one PR may use before a small fix-check goes to the substitute instead.
+    codex_round_budget: 6,
+    // The weekly Codex quota used, in percent (P codex-status): soft lowers every non-protected round to small_fix effort; hard sends small fix-checks to the substitute. Unreadable = off.
+    codex_budget: { soft: 75, hard: 90 },
     light_lane_max_lines: 50,
     // Paths whose every review round gets the Fable pass (triage + its own review), whatever the risk level.
     arbiter_always_paths: [],
@@ -120,7 +127,7 @@ export function requiredChecks(ci) {
 }
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
-const EFFORT_LANES = ['low', 'medium', 'high', 'followup'];
+const EFFORT_LANES = ['low', 'medium', 'high', 'followup', 'small_fix'];
 const OWNER_APPROVALS = ['label', 'chat'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Who owns the production smoke: a session or a CI workflow that posts the result on the merged PR.
@@ -175,7 +182,8 @@ const KEYS = {
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute', 'codex_round_budget', 'codex_budget'],
+  review_codex_budget: ['soft', 'hard'],
   review_substitute: ['mode', 'min_wait_minutes', 'max_packet_mb'],
   smoke: ['path', 'status', 'contains', 'location_contains'],
 };
@@ -676,9 +684,20 @@ export function validateConfig(obj) {
     if (!isObj(review.effort)) errors.push('review.effort must be a mapping');
     else {
       for (const lane of Object.keys(review.effort)) {
-        if (!EFFORT_LANES.includes(lane)) errors.push(`unknown key: review.effort.${lane} (lanes are ${EFFORT_LANES.join('|')})`);
+        if (lane === 'small_fix_lines') {
+          if (!inRange(review.effort.small_fix_lines, 1, 10000)) errors.push('review.effort.small_fix_lines must be an integer 1..10000');
+        } else if (!EFFORT_LANES.includes(lane)) errors.push(`unknown key: review.effort.${lane} (lanes are ${EFFORT_LANES.join('|')}, plus small_fix_lines)`);
         else if (!EFFORTS.includes(review.effort[lane])) errors.push(`review.effort.${lane} must be one of ${EFFORTS.join('|')}`);
       }
+    }
+    if (!inRange(review.codex_round_budget, 1, 100)) errors.push('review.codex_round_budget must be an integer 1..100');
+    const cb = review.codex_budget;
+    if (!isObj(cb)) errors.push('review.codex_budget must be a mapping');
+    else {
+      unknownKeys(cb, KEYS.review_codex_budget, 'review.codex_budget.', errors);
+      if (!inRange(cb.soft, 1, 100)) errors.push('review.codex_budget.soft must be an integer 1..100');
+      if (!inRange(cb.hard, 1, 100)) errors.push('review.codex_budget.hard must be an integer 1..100');
+      else if (inRange(cb.soft, 1, 100) && cb.soft > cb.hard) errors.push('review.codex_budget.soft must not be above review.codex_budget.hard');
     }
     const sub = review.substitute;
     if (!isObj(sub)) errors.push('review.substitute must be a mapping');

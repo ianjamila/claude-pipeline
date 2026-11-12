@@ -124,7 +124,12 @@ hard_stops:                    # project extras on top of the universal list
 
 review:
   codex_model: gpt-6-astra
-  effort: {low: medium, medium: medium, high: high, followup: medium}
+  effort: {low: medium, medium: medium, high: high, followup: medium, small_fix: low, small_fix_lines: 40}
+                                # low/medium/high: round 1 by the PR's risk; followup: later rounds. small_fix: the effort of a fix-check round whose reviewed
+                                # range is at most small_fix_lines changed lines, adds no new file and touches no sensitive path (also every non-protected round
+                                # while the weekly Codex governor is soft). `pipeline codex-review` refuses an --effort that is not the configured one for the round
+  codex_round_budget: 6         # Codex runs (rounds + second reviews recorded in the state) per PR; past it a small fix-check goes to the substitute, never to more Codex
+  codex_budget: {soft: 75, hard: 90}   # weekly Codex quota used (P codex-status): soft = every non-protected round at small_fix effort; hard = small fix-checks go to the substitute. Unreadable = off
   max_rounds: 2                 # plus one confirm round when the last round only accepted fixes; base-only rounds (main merged in) don't count
   light_lane_max_lines: 50
   arbiter_always_paths: []      # globs: a PR touching one gets the Fable review pass every round, even at low risk

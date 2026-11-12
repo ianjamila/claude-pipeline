@@ -1025,3 +1025,30 @@ test('review.substitute: defaults (auto, never wait, 8 MB packet) and validation
   }
   assert.ok(has(validateConfig({ ...minimal(), review: { substitute: 'auto' } }), 'review.substitute must be a mapping'));
 });
+
+test('review.effort.small_fix / small_fix_lines, review.codex_round_budget and review.codex_budget: defaults and validation', () => {
+  const d = validateConfig(minimal());
+  assert.equal(d.config.review.effort.small_fix, 'low');
+  assert.equal(d.config.review.effort.small_fix_lines, 40);
+  assert.equal(d.config.review.codex_round_budget, 6);
+  assert.deepEqual(d.config.review.codex_budget, { soft: 75, hard: 90 });
+  const ok = validateConfig({ ...minimal(), review: { effort: { small_fix: 'medium', small_fix_lines: 20 }, codex_round_budget: 4, codex_budget: { soft: 60 } } });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual([ok.config.review.effort.small_fix, ok.config.review.effort.small_fix_lines, ok.config.review.codex_round_budget], ['medium', 20, 4]);
+  assert.deepEqual(ok.config.review.codex_budget, { soft: 60, hard: 90 });
+  const cases = [
+    [{ effort: { small_fix: 'tiny' } }, 'review.effort.small_fix must be one of'],
+    [{ effort: { small_fix_lines: 0 } }, 'review.effort.small_fix_lines must be an integer 1..10000'],
+    [{ effort: { small_fix_lines: 'x' } }, 'review.effort.small_fix_lines must be an integer 1..10000'],
+    [{ codex_round_budget: 0 }, 'review.codex_round_budget must be an integer 1..100'],
+    [{ codex_budget: { soft: 95 } }, 'review.codex_budget.soft must not be above review.codex_budget.hard'],
+    [{ codex_budget: { hard: 101 } }, 'review.codex_budget.hard must be an integer 1..100'],
+    [{ codex_budget: { sofft: 1 } }, 'unknown key: review.codex_budget.sofft'],
+    [{ codex_budget: 80 }, 'review.codex_budget must be a mapping'],
+  ];
+  for (const [review, expected] of cases) {
+    const r = validateConfig({ ...minimal(), review });
+    assert.equal(r.ok, false, expected);
+    assert.ok(has(r, expected), `${expected}: ${r.errors.join(' | ')}`);
+  }
+});
