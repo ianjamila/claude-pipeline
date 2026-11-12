@@ -3854,9 +3854,13 @@ function evaluateBashForFilesFrame(command, opts) {
   const maybePath = /[/~$`\\*?[{]|claude|^\.\.?$/i;
   const homeWord = (word) => {
     const w = /^--[\w-]+=./.test(word) ? word.slice(word.indexOf('=') + 1) : word;
-    if (!maybePath.test(w)) return false;
-    const e = pathsFor().normalize(expandRefs(w, ctx)).replace(/(.)\/+$/, '$1');
-    return homeChain.has(ctx.ci ? e.toLowerCase() : e);
+    if (!w || w.startsWith('-')) return false; // (an option, or a lone `-`)
+    // a relative word is resolved against every directory the line may be in (the cwd and each `cd` target: `dirs`, as pathHit reads one) and normalized (`.`, `..`)
+    const x = expandRefs(w, ctx);
+    return (isAbs(x) ? [''] : dirs).some((d) => {
+      const e = pathsFor().normalize(isAbs(x) ? x : pathsFor().join(d, x)).replace(/(.)\/+$/, '$1');
+      return homeChain.has(ctx.ci ? e.toLowerCase() : e);
+    });
   };
   // The ordinary (short) path: a command that is not read-only and is given home or a parent of it as an operand (the command name itself is no operand: the parser reports the code of a glob
   // qualifier, `out(/)`, as a command named `/`). Read-only commands on home stay allowed (`ls ~`, `du -sh ~`, `find ~ -name x`), and a file directly in home is no ancestor. cp / install into home write
@@ -3866,7 +3870,9 @@ function evaluateBashForFilesFrame(command, opts) {
       const name = c.argv.length ? baseOf(c.argv[0]) : '';
       if (!name || NOT_WRITERS.has(name) || isReadOnly(c, ctx)) return false;
       if (DEST_ONLY.has(name)) return name === 'rsync' && c.argv.some((a) => /^--(?:del|delete)/.test(a)) && destsOf(wordsOf(c), name).some(homeWord);
-      return wordsOf(c).slice(1).some(homeWord);
+      // (mv / ln INTO home or a parent writes DIR/basename(SRC), judged below like cp; what they move or link away is a source)
+      const dest = MOVERS.has(name) ? destsOf(wordsOf(c), name)[0] : undefined;
+      return wordsOf(c).slice(1).some((w) => w !== dest && homeWord(w));
     });
     if (homeWriter) return deny(`${baseOf(homeWriter.argv[0])} is given the home directory or a directory above it, which holds the protected pipeline files, and is not a read-only command (${PROTECTED_MSG})`);
   }

@@ -636,4 +636,46 @@ describe('#288 R3 home and its parents', () => {
       assert.equal(r.decision, 'allow', `${line} -> ${r.decision}: ${r.reason}`);
     });
   }
+  // a relative word resolves against the directory the command runs in (the cwd, or a `cd` target of the line)
+  const IN_PROJ = '/home/u/proj';
+  const IN_HOME = '/home/u';
+  for (const [label, cwd, line] of [
+    ['proj: rm -rf ..', IN_PROJ, 'rm -rf ..'],
+    ['proj: find .. -delete', IN_PROJ, 'find .. -delete'],
+    ['proj: rm -rf ../..', IN_PROJ, 'rm -rf ../..'],
+    ['proj: rm -rf ../', IN_PROJ, 'rm -rf ../'],
+    ['home: find . -delete', IN_HOME, 'find . -delete'],
+    ['home: rm -rf ./', IN_HOME, 'rm -rf ./'],
+    ['home: rm -rf ./.', IN_HOME, 'rm -rf ./.'],
+    ['home: chmod -R 000 .', IN_HOME, 'chmod -R 000 .'],
+    ['home: rm -rf .', IN_HOME, 'rm -rf .'],
+    ['home: rm -rf proj/..', IN_HOME, 'rm -rf proj/..'],
+    ['/home: rm -rf u', '/home', 'rm -rf u'],
+    ['/: rm -rf home', '/', 'rm -rf home'],
+    ['after cd ~: rm -rf .', IN_PROJ, 'cd ~; rm -rf .'],
+    ['after cd ..: rm -rf .', IN_PROJ, 'cd ..; rm -rf .'],
+    ['proj: mv .. /tmp/x (the parent is moved away)', IN_PROJ, 'mv .. /tmp/x'],
+  ]) {
+    test(`denies (relative): ${label}`, () => {
+      const r = run(line, { cwd });
+      assert.equal(r.decision, 'deny', `${line} in ${cwd} -> ${r.decision}`);
+    });
+  }
+  for (const [label, cwd, line] of [
+    ['proj: rm -rf ./build', IN_PROJ, 'rm -rf ./build'],
+    ['proj: find . -name x', IN_PROJ, 'find . -name x'],
+    ['proj: rm -rf ../other-proj/tmp', IN_PROJ, 'rm -rf ../other-proj/tmp'],
+    ['proj: rm -rf build', IN_PROJ, 'rm -rf build'],
+    ['home: ls .', IN_HOME, 'ls .'],
+    ['home: find . -name x', IN_HOME, 'find . -name x'],
+    ['home: du -sh .', IN_HOME, 'du -sh .'],
+    ['home: rm notes.txt', IN_HOME, 'rm notes.txt'],
+    ['proj: mv a.txt .. (a file moved INTO the parent)', IN_PROJ, 'mv a.txt ..'],
+    ['home: rm -rf Desktop/old', IN_HOME, 'rm -rf Desktop/old'],
+  ]) {
+    test(`allows (relative): ${label}`, () => {
+      const r = run(line, { cwd });
+      assert.equal(r.decision, 'allow', `${line} in ${cwd} -> ${r.decision}: ${r.reason}`);
+    });
+  }
 });
