@@ -750,8 +750,10 @@ async function deferFixes(rest, ctx) {
     const warnings = [];
     let anchor = ancestorAnchor;
     if (fixBase === null || baseOf(revParse(ancestorAnchor.toHead, o)) !== fixBase) {
-      // HEAD's content is the last round's and it descends from --fix-head: it carries whatever was merged in after the fix
-      if (fixBase !== null && baseOf('HEAD') === fixBase) anchor = last;
+      // the last round's own head (not HEAD: nothing says a round was recorded after the revert) carries the default branch merged in after the fix, and its content is the reviewed one
+      let lastBase = null;
+      try { lastBase = baseOf(revParse(last.toHead, o)); } catch { /* a head that no longer resolves is no comparison point */ }
+      if (fixBase !== null && lastBase === fixBase) anchor = last;
       else warnings.push(`the follow-up issues compare the removed fix with ${String(ancestorAnchor.toHead).slice(0, 12)}, but the default branch merged into the fix head is not the same one: the compare may show that merge too`);
     }
     const fixHash = reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log, head: fixFull }, o);

@@ -31,3 +31,24 @@ test('defer-fixes: main merged in between the fix and the revert: the issue comp
   const post = w.fake.calls().find((c) => c.argv.join(' ').startsWith(`api -X POST repos/${w.slug}/issues `));
   assert.ok(JSON.parse(post.stdin).body.includes(`git diff ${revert} ${merge}`), JSON.parse(post.stdin).body);
 });
+
+test('defer-fixes: main merged in between the fix and the revert without moving the PR\'s content (no base-only round): the anchor stays the reviewed head and the compare warning is returned (R1-F1)', (t) => {
+  const w = roundWorld(t);
+  const { h1, h2 } = w.atCap();
+  // main changes a file the PR does not touch and is merged in on top of the fix: the PR's own patch (and so the content hash) is unchanged
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/other.js', 'export const other = 1;\n');
+  w.repo.commit('main edits elsewhere');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', 'main']);
+  const merge = w.repo.git(['rev-parse', 'HEAD']).trim();
+  const revert = w.revert(h2);
+  w.prHead(revert);
+  assert.equal(w.state().rounds.at(-1).baseOnly, undefined, 'no base-only round was recorded');
+  const ok = w.cli(['triage', 'defer-fixes', '--pr', '7', '--ids', 'R2-S1', '--fix-head', merge, '--reason', 'minor, file it']);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  assert.equal((ok.json.warnings ?? []).length, 1, JSON.stringify(ok.json.warnings));
+  assert.match(ok.json.warnings[0], /the default branch merged into the fix head is not the same one/);
+  // the last round (not HEAD) was reviewed before the merge, so it is not a better anchor than the one found by ancestry
+  assert.equal(w.item('R2-S1').roundCapDeferral.reviewedHead, h1);
+});
