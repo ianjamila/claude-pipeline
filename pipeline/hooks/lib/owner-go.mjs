@@ -1268,6 +1268,17 @@ export const ownerGrantedRounds = (q = {}) => ownedBy(grantsFor(q), { grant: tru
 // ownerPastRoundRecords after it (the owner's own prompts only). Nothing in the extra-round path reads these.
 export const pastRoundGrantsFor = (q = {}) => grantRecordsFor(isPastRoundRecord, q);
 export const ownerPastRoundRecords = (q = {}) => ownedBy(pastRoundGrantsFor(q), { grant: true, home: q.home });
+// Every past-round record the owner typed for (repo, pr, k, full head), at ANY age and whatever its marker says, newest first: `state past-round-grant` resumes from a
+// record whose marker an earlier, interrupted run already spent (the lookups above skip spent records).
+export function ownerPastRoundHistory({ repo, pr, k, head, ...opts } = {}) {
+  const key = repoKey(repo);
+  if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || !FULL_HEAD.test(String(head))) return [];
+  const moves = movesOf(opts);
+  const found = readRecords({ ...opts, maxAgeMs: Infinity, maxBytes: VERIFY_MAX_BYTES })
+    .filter((r) => isPastRoundRecord(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && head.startsWith(r.head))
+    .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
+  return ownedBy(found, { grant: true, home: opts.home });
+}
 
 // Why ownerGrantedRounds found nothing, for the message: 'none' (no such record), 'provenance' (records exist but none is confirmed as typed
 // by the owner) or 'ok' (at least one is the owner's).

@@ -19,7 +19,7 @@ import { Fail } from './cmd-common.mjs';
 import { MARKERS, triageComment } from './render.mjs';
 import { decodeFromComment } from './state.mjs';
 import { REVIEW_COMPLETE_MARKER, latestReviewComment } from './review-marker.mjs';
-import { canonicalJson, compareHistory, historyPreserved, reviewDir, sha256, stateExtends, writeJson } from './review-context.mjs';
+import { canonicalJson, compareHistory, historyDiff, historyPreserved, reviewDir, sha256, stateExtends, writeJson } from './review-context.mjs';
 
 export const reviewContentHash = (state) => sha256(canonicalJson(state?.rounds ?? []));
 
@@ -106,13 +106,17 @@ export const lossText = ({ lostRounds, lostGrants }) => [
  * Throws Fail(EXIT.FAILED, {ok:false, error:'stale-publication', reason}) when the PR holds a different state than this copy last published
  * (or, with no usable baseline for this PR, one this copy does not extend: a state from an older CLI is still allowed to move forward). Throws GhError
  * when GitHub fails (the caller decides: exit 3, or "local result stands").
+ * `replaceGrants`: round numbers whose PUBLISHED owner grant may be replaced by this copy's (`state past-round-grant` re-approving a grant whose owner record is
+ * gone, after it verified the new one and found the old one unverifiable); every other changed or dropped grant is still history-loss.
  */
-export function publishTriage({ gh, root, pr, state }) {
+export function publishTriage({ gh, root, pr, state, replaceGrants = [] }) {
   const published = readPublished(gh, pr);
   const mine = reviewContentHash(state);
   if (published.state !== null && published.hash !== mine) {
     // Before the baseline question, and on both paths: a baseline equal to the PR's hash proves only that this copy saw it, not that it kept it.
     const kept = historyPreserved(state, published.state);
+    kept.lostGrants = kept.lostGrants.filter((n) => !replaceGrants.includes(n));
+    kept.ok = kept.lostRounds.length === 0 && kept.lostGrants.length === 0;
     if (!kept.ok) {
       throw new Fail(EXIT.FAILED, {
         ok: false, error: 'history-loss',
@@ -169,4 +173,33 @@ export function assertPublishedHistory({ gh, pr, state }) {
     ok: false, error: 'stale-history',
     message: `this copy's review history is not the published one${kept.ok ? '' : ` (the PR holds ${lossText(kept)} that this copy lacks or holds differently)`}: run \`pipeline state show --pr ${pr}\` to restore the published state here, then run the round again`,
   });
+}
+
+/**
+ * The read-only history check of the past-round commands (`triage round-request --past`, `state past-round-grant`): the owner approves a round of the PUBLISHED
+ * history, so this copy and the PR's triage comment must agree on it before the owner is asked or anything is claimed. `published` is a readPublished() result.
+ * -> { problem: null | { error, message }, diff } (diff: historyDiff of local against the PR's state, or null when there is none to compare). Errors:
+ *   history-unreadable    the comment holds no readable state
+ *   no-published-history  the PR has no triage comment (nothing is published history yet)
+ *   stale-history         this copy lacks published rounds or grants, or both sides hold what the other lacks (`pipeline state show --pr N`)
+ *   unpublished-history   this copy holds rounds the PR lacks, or grants it lacks while `tolerateGrants` is false (`pipeline comment --pr N --kind triage`)
+ * `tolerateGrants` (the grant command, which publishes): a copy that is ahead ONLY by owner-grant metadata on rounds the PR holds (a grant the PR lacks, or another
+ * one) passes with no problem; the caller verifies each grant in `diff.grantsAhead` / `diff.grantsDiffer`.
+ */
+export function pastRoundHistoryProblem({ local, published, pr, tolerateGrants = false }) {
+  if (published.undecodable) {
+    return { diff: null, problem: { error: 'history-unreadable', message: `the PR's triage comment holds no readable review state, so the published history cannot be compared with this copy: look at the triage comment on PR #${pr}` } };
+  }
+  if (published.state === null) {
+    return { diff: null, problem: { error: 'no-published-history', message: `PR #${pr} has no triage comment, so none of its rounds is published history yet: publish this state first with \`pipeline comment --pr ${pr} --kind triage\`` } };
+  }
+  const diff = historyDiff(local, published.state);
+  const relation = compareHistory(local, published.state);
+  if (relation === 'in-sync') return { diff, problem: null };
+  if (tolerateGrants && diff.missing.length === 0 && diff.changed.length === 0 && diff.grantsBehind.length === 0 && diff.extra.length === 0) return { diff, problem: null };
+  if (relation === 'local-ahead') {
+    return { diff, problem: { error: 'unpublished-history', message: `the local review state holds history the PR's triage comment lacks (an earlier publish failed): publish it first with \`pipeline comment --pr ${pr} --kind triage\`, then try again` } };
+  }
+  const kept = historyPreserved(local ?? { rounds: [] }, published.state);
+  return { diff, problem: { error: 'stale-history', message: `this copy's review history is not the published one${kept.ok ? '' : ` (the PR holds ${lossText(kept)} that this copy lacks or holds differently)`}: run \`pipeline state show --pr ${pr}\` to restore the published state here, then try again` } };
 }

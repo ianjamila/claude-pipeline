@@ -24,7 +24,7 @@ import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
 import { closingKeywordProblem, multiIssueClosingLines } from '../lib/closing-keywords.mjs';
 import { currentContentHash, refreshBaseRef, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
-import { publishTriage, reviewContentHash } from '../lib/review-publish.mjs';
+import { publishTriage, readPublished, reviewContentHash } from '../lib/review-publish.mjs';
 
 export const meta = {
   summary: 'post the review-complete comment (and remove awaiting-review) once the review is valid for the current content',
@@ -237,7 +237,16 @@ export const run = guarded(async (argv, ctx) => {
         return { exitCode: EXIT.FAILED, output: { ok: false, reason: staleFableReason(staleFable, pr, gate.threshold), error: 'fable-refresh', staleFableRounds: staleFable, currentContentHash: hash } };
       }
       // The same proof as the final gate: a round past review.max_rounds must be backed by the owner's record and its marker.
-      const grants = verifyOwnerGrants(state, { repo: gh.repo().slug, pr, maxRounds: config.review.max_rounds });
+      const grantOpts = { repo: gh.repo().slug, pr, maxRounds: config.review.max_rounds };
+      let grants = verifyOwnerGrants(state, grantOpts);
+      if (!grants.ok) {
+        // The refusal for a round that ran before grants were recorded names the remedy only for a round the PR really holds: read the published state for that (best effort).
+        let published;
+        try {
+          published = readPublished(gh, pr).state ?? { rounds: [] };
+        } catch { /* local-only remedy text */ }
+        if (published !== undefined) grants = verifyOwnerGrants(state, { ...grantOpts, published });
+      }
       if (!grants.ok) return { exitCode: EXIT.FAILED, output: { ok: false, reason: grants.problems.join('; '), currentContentHash: hash } };
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
       const lane = laneProblem(state, root, config, base);

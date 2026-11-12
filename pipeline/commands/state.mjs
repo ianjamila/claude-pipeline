@@ -5,15 +5,17 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { mkdirSync, existsSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
+import { GhError } from '../lib/proc.mjs';
 import { GitError, effectiveReviewBase, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
-import { grantIdOf, ownerGrantedRounds } from '../hooks/lib/owner-go.mjs';
+import { claimGrantMarkers, grantIdOf, ownerGrantedRounds, ownerPastRoundHistory, ownerPastRoundRecords, verifyOwnerGrant } from '../hooks/lib/owner-go.mjs';
+import { pastRoundsNeedingApproval } from '../lib/owner-grants.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
-import { arbiterFailures, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds } from '../lib/triage.mjs';
-import { readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
+import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds } from '../lib/triage.mjs';
+import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
   adoptPublishedGrants, roundDir, stateExtends, withStateLock,
@@ -55,6 +57,17 @@ export const meta = {
     '     and the content is what the last round reviewed, or only ledger rows were added since (review.docs_exempt_paths; the round then stays pinned at the last reviewed head) (error content-moved: run a normal codex-review round instead, its Fable pass already reads the whole PR). Then: arbiter needed --round R, the arbiter, arbiter apply',
     'pipeline state record-followup --id ID --url URL [--repo DIR]',
     'pipeline state set-outcome --outcome TEXT [--repo DIR]',
+    'pipeline state past-round-grant --pr N --round n [--repo DIR]',
+    '  -> {ok, round, k, grantId, claimed, saved, published, remaining}: records the owner\'s approval of round n, which ALREADY ran (before owner grants were recorded, so it carries none): the owner typed',
+    '     "approve round" (or "extra round", "grant round K", optionally with #N) after a reply ending with the line `triage round-request --pr N --past` printed (`🔂 Approve past review round #N: round K · head <head12> · repo owner/name`;',
+    '     the owner-go hook records it as kind past-round, any session, last 24 h, never usable for a new round). Saves ownerGrant {grantId, k, quote, ownerTs, past: true} and admission owner on round n, then publishes the state. Under the review lock',
+    '  -> before anything is claimed or saved (state and markers untouched on a refusal, exit 2 {ok:false, error, message}): label-mode (needs owner_approval: chat), no-max-rounds, host (the gh repo is not on github.com), state-pr-mismatch;',
+    '     the history check against the PR\'s triage comment: history-unreadable | no-published-history | stale-history (run `pipeline state show --pr N`) | unpublished-history (run `pipeline comment --pr N --kind triage`); this copy may be ahead',
+    '     only by owner-grant metadata that verifies (unverified-grant otherwise); not-eligible (round n is not one `triage round-request --pr N --past` would pick: a counted round past review.max_rounds + 1, held by the PR with a later counted round,',
+    '     with no owner grant or one whose record is gone), already-approved (the PR already holds a verified grant on it); no-grant (no past-round record for this repository, PR, counted round and head, younger than 24 h, typed by the owner)',
+    '  -> every matching unspent record is claimed together (one machine-global marker each, like codex-review), the newest is recorded. An interrupted run is resumed by running the command again: a record whose marker is already spent and verifies is',
+    '     used without a new claim (at any age), leftovers are claimed. claim-failed | save-failed (exit 1) keep the markers; a failed publication keeps the saved state: exit 3 {unavailable:true, saved:true, published:false, next} for GitHub, exit 1',
+    '     {error: stale-publication | history-loss, saved:true, published:false} when the PR moved; run the command again to retry. Re-approving a round whose published grant no longer verifies replaces that grant. remaining: [{n, k}] the other rounds still to approve',
   ].join('\n'),
 };
 
@@ -588,8 +601,113 @@ async function fableRefresh(rest, ctx) {
   }, pr);
 }
 
+// ---- past-round-grant ---------------------------------------------------------------------
+
+// The counted ordinal of round n in `state` (base-only and resolution-only rounds do not count), or null.
+function ordinalOf(state, n) {
+  let k = 0;
+  for (const r of state.rounds ?? []) {
+    if (countsTowardCap(r)) k += 1;
+    if (r.n === n) return countsTowardCap(r) ? k : null;
+  }
+  return null;
+}
+
+async function pastRoundGrant(rest, ctx) {
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, round: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const pr = intOption(values, 'pr', { required: true, min: 1 });
+  const n = intOption(values, 'round', { required: true, min: 1 });
+  const root = resolveRepo(values, ctx);
+  const { config } = await requireConfig(root);
+  const refuse = (error, message, extra = {}) => new Fail(EXIT.USAGE, { ok: false, error, message, ...extra });
+  if (config.owner_approval !== 'chat') throw refuse('label-mode', 'the owner\'s approval of a past round is recorded only with owner_approval: chat in pipeline.yml; in label mode the agent parks');
+  const max = config.review?.max_rounds;
+  if (!Number.isInteger(max) || max < 1) throw refuse('no-max-rounds', 'review.max_rounds is not configured in pipeline.yml, so no round is known to be past it');
+  const gh = createGitHub({ cwd: root, env: ctx.env });
+  return guardGh(() => withStateLock(root, ctx, () => {
+    const local = requireState(root);
+    if (local.pr !== pr) throw refuse('state-pr-mismatch', `the review state here belongs to PR #${local.pr}, not #${pr}`);
+    const { slug, host } = gh.repo();
+    if (host !== 'github.com') throw refuse('host', `gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded approval names a repository on github.com`);
+    const found = readPublished(gh, pr);
+    const { problem, diff } = pastRoundHistoryProblem({ local, published: found, pr, tolerateGrants: true });
+    if (problem) throw refuse(problem.error, problem.message);
+    const ours = { repo: slug, pr };
+    // Eligibility is decided on what the PR holds.
+    const eligible = pastRoundsNeedingApproval(found.state, found.state, { maxRounds: max, ...ours });
+    const target = eligible.find((e) => e.n === n);
+    const publishedRound = found.state.rounds.find((r) => r.n === n);
+    if (target === undefined) {
+      const done = publishedRound?.ownerGrant !== undefined && verifyOwnerGrant({ ...ours, k: ordinalOf(found.state, n), toHead: publishedRound.toHead, ownerGrant: publishedRound.ownerGrant }).ok;
+      if (done) throw refuse('already-approved', `round ${n} already carries an owner grant that verifies on this machine: nothing to approve`);
+      throw refuse('not-eligible', `round ${n} is not a round the owner can approve after it ran: it must be a counted round past review.max_rounds (${max}) and its automatic extra round, held by the PR's triage comment with a LATER counted round after it, and carry no owner grant (or one whose record is gone)${eligible.length > 0 ? `; the rounds that qualify: ${eligible.map((e) => e.n).join(', ')}` : ''}`);
+    }
+    const { k, toHead } = target;
+    const localRound = local.rounds.find((r) => r.n === n);
+    // Grant metadata this copy holds that the PR lacks (or holds differently) is published with this call, so it must verify here first; a different grant is allowed
+    // only for the round being re-approved, whose published grant has to be the unverifiable one.
+    for (const m of [...(diff?.grantsAhead ?? []), ...(diff?.grantsDiffer ?? [])]) {
+      const r = local.rounds.find((x) => x.n === m);
+      const v = verifyOwnerGrant({ ...ours, k: ordinalOf(local, m), toHead: r.toHead, ownerGrant: r.ownerGrant });
+      if (!v.ok) throw refuse('unverified-grant', `this copy holds an owner grant on round ${m} that the PR lacks and that does not verify on this machine (${v.reason}): run \`pipeline state show --pr ${pr}\` to take the PR's state, then ask again`);
+      if (diff.grantsDiffer.includes(m) && m !== n) throw refuse('stale-history', `this copy holds another owner grant than the PR on round ${m}: run \`pipeline state show --pr ${pr}\` to restore the published state here, then try again`);
+    }
+    const replaced = publishedRound.ownerGrant !== undefined; // re-approval: the published grant no longer verifies (it is why the round is eligible)
+    const q = { ...ours, k, head: toHead };
+    // Resume: a record of this round whose marker is already spent and verifies (an earlier run claimed it and stopped before saving or publishing).
+    const asGrant = (rec) => ({ grantId: grantIdOf(rec), k, quote: rec.prompt, ownerTs: rec.ts, past: true });
+    const resumed = ownerPastRoundHistory(q).find((rec) => verifyOwnerGrant({ ...ours, k, toHead, ownerGrant: asGrant(rec) }).ok);
+    const fresh = ownerPastRoundRecords(q); // unspent, < 24 h, the owner's own prompts
+    if (resumed === undefined && fresh.length === 0) {
+      throw refuse('no-grant', `no approval of past round ${n} (counted round ${k}, head ${toHead.slice(0, 12)}) is recorded for ${slug} #${pr}: run \`P triage round-request --pr ${pr} --past\`, show its closing line, and ask the owner to type "approve round" (within 24 h, typed by the owner, not while the agent is working)`);
+    }
+    const chosen = resumed ?? fresh[0];
+    const claimed = [];
+    // Every matching record is consumed together (a duplicate "approve round" must not outlive the claim); on resume only the leftovers are.
+    const toClaim = resumed === undefined ? fresh : fresh.filter((rec) => grantIdOf(rec) !== grantIdOf(resumed));
+    if (toClaim.length > 0) {
+      const claim = claimGrantMarkers(toClaim, { repo: slug, pr, k, head: toHead, checkout: root });
+      claimed.push(...(claim.claimed ?? []).map((c) => c.grantId));
+      if (!claim.ok) {
+        throw new Fail(EXIT.FAILED, {
+          ok: false, error: 'claim-failed', round: n, k, claimed,
+          message: `the owner's approval could not be claimed (${claim.reason}${claimed.length > 0 ? `; ${claimed.length} marker(s) are already spent` : ''}): run the command again to resume${claim.reason === 'used' ? '; if another checkout used the approval, it is picked up then' : ''}`,
+        });
+      }
+    }
+    const ownerGrant = asGrant(chosen);
+    const alreadySaved = localRound.ownerGrant !== undefined && JSON.stringify(localRound.ownerGrant) === JSON.stringify(ownerGrant) && localRound.admission === 'owner';
+    const next = { ...local, rounds: local.rounds.map((r) => (r.n === n ? { ...r, ownerGrant, admission: 'owner' } : r)) };
+    if (!alreadySaved) {
+      try {
+        saveState(root, next);
+      } catch (err) {
+        throw new Fail(EXIT.FAILED, {
+          ok: false, error: 'save-failed', round: n, k, grantId: ownerGrant.grantId, claimed,
+          message: `the owner's approval is claimed (its marker stays spent) but the review state could not be saved (${String(err?.message ?? err).split('\n')[0].slice(0, 160)}): run the command again to resume`,
+        });
+      }
+    }
+    const out = { round: n, k, grantId: ownerGrant.grantId, claimed, saved: !alreadySaved };
+    const remaining = eligible.filter((e) => e.n !== n).map(({ n: m, k: ord }) => ({ n: m, k: ord }));
+    const retry = `run \`pipeline state past-round-grant --pr ${pr} --round ${n}\` again (or \`pipeline comment --pr ${pr} --kind triage\`) to publish it`;
+    try {
+      publishTriage({ gh, root, pr, state: alreadySaved ? local : next, replaceGrants: replaced ? [n] : [] });
+    } catch (err) {
+      if (err instanceof GhError || err instanceof UnavailableError) {
+        return { exitCode: EXIT.UNAVAILABLE, output: { ok: false, unavailable: true, reason: 'github', ...out, published: false, remaining, next: `GitHub could not be reached, so the approval is saved here only: ${retry}` } };
+      }
+      if (err instanceof Fail && (err.output?.error === 'stale-publication' || err.output?.error === 'history-loss')) {
+        return { exitCode: EXIT.FAILED, output: { ok: false, error: err.output.error, ...out, published: false, remaining, reason: err.output.reason, next: `NOT published: the approval is saved here only. Run \`pipeline state show --pr ${pr}\`, then ${retry}` } };
+      }
+      throw err;
+    }
+    return { exitCode: EXIT.OK, output: { ok: true, ...out, published: true, remaining } };
+  }, pr));
+}
+
 const SUBCOMMANDS = {
-  show, 'discard-round': discardRound, outcome, 'mark-implemented': markImplemented, 'fable-refresh': fableRefresh, 'record-followup': recordFollowup, 'set-outcome': setOutcome,
+  show, 'discard-round': discardRound, outcome, 'mark-implemented': markImplemented, 'fable-refresh': fableRefresh, 'record-followup': recordFollowup, 'set-outcome': setOutcome, 'past-round-grant': pastRoundGrant,
 };
 
 export const run = guarded(async (argv, ctx) => {
