@@ -373,8 +373,8 @@ test('liveJobIn: true | false | { unreadable: code }; ENOENT / ENOTDIR are "no j
   const jobs = path.join(root, 'locked', '.review', 'jobs');
   fs.mkdirSync(jobs, { recursive: true });
   fs.chmodSync(jobs, 0o000);
-  t.after(() => fs.chmodSync(jobs, 0o700));
-  assert.deepEqual(liveJobIn(path.join(root, 'locked')), { unreadable: 'EACCES' });
+  // restore in the body, not in t.after: on Node 20 tmp(t)'s cleanup can run first and remove the folder
+  try { assert.deepEqual(liveJobIn(path.join(root, 'locked')), { unreadable: 'EACCES' }); } finally { fs.chmodSync(jobs, 0o700); }
 });
 
 test('an unreadable jobs folder keeps a dead lease live, unchecked, with a distinct reason; close says jobRunning unknown; the sweep keeps it', async (t) => {

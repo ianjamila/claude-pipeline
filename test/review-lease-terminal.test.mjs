@@ -173,12 +173,14 @@ test('process.exit inside the command still closes the lease (the exit handler),
   writeFileSync(script, [
     `import { holdReviewLease, settleReviewLease } from ${JSON.stringify(new URL(`file://${wiring.replace(/\\/g, '/')}`).href)};`,
     "const mode = process.argv[2];",
+    "const count = () => ({ exit: process.listenerCount('exit'), int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM'), hup: process.listenerCount('SIGHUP') });",
+    "const before = count(); // Node 20 registers its own 'exit' listener for an ESM entry with top-level await, so count against a baseline",
     "const ctx = { env: process.env, cwd: process.cwd() };",
     "const lease = await holdReviewLease('state', ['show'], ctx);",
     "if (!lease.held) { console.error(JSON.stringify(lease)); process.exit(9); }",
     "if (mode === 'settle') {",
     "  await settleReviewLease('state', { exitCode: 0, output: {} }, lease.held, ctx);",
-    "  console.log(JSON.stringify({ exit: process.listenerCount('exit'), int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM'), hup: process.listenerCount('SIGHUP') }));",
+    "  console.log(JSON.stringify({ before, after: count() }));",
     "} else process.exit(3);",
   ].join('\n'));
   const exited = spawnSync(process.execPath, [script, 'exit'], { cwd: repo.dir, env: t.env, encoding: 'utf8' });
@@ -187,7 +189,8 @@ test('process.exit inside the command still closes the lease (the exit handler),
 
   const settled = spawnSync(process.execPath, [script, 'settle'], { cwd: repo.dir, env: t.env, encoding: 'utf8' });
   assert.equal(settled.status, 0, settled.stderr);
-  assert.deepEqual(JSON.parse(settled.stdout), { exit: 0, int: 0, term: 0, hup: 0 }, 'every handler is unregistered after the successful close');
+  const counts = JSON.parse(settled.stdout);
+  assert.deepEqual(counts.after, counts.before, 'every handler the lease registered is unregistered after the successful close');
   assert.deepEqual(files(t), []);
 });
 
