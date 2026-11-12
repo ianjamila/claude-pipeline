@@ -724,6 +724,8 @@ const arithEnd = (s, i, skip = 3) => {
 };
 // (does the `$((` / `((` at i close as `))` within 2000 characters? A longer one reads as a subshell: its redirects count. Bounded, so a text of many openers stays linear.)
 const closesAsArith = (s, i, skip) => arithEnd(s.slice(i, i + 2000 + skip), 0, skip) >= 0;
+// (the same, as the offset from i just past the closing `))`, or -1; #269 R19: the caller checks the parser closed the construct at that same place)
+const arithProofEnd = (s, i, skip) => arithEnd(s.slice(i, i + 2000 + skip), 0, skip);
 // The text with what the shell never expands blanked out: single-quoted strings and comments (double-quoted text expands, so it stays). Null for `$'…'`
 // or an unterminated quote (the caller keeps its answer).
 export function withoutLiteralText(s, { dqData = false } = {}) {
@@ -2077,6 +2079,12 @@ const MAX_PARAM_WORK = 2_000_000;
 const contAt = (s, k) => s[k] === '\\' && (s[k + 1] === '\n' || (s[k + 1] === '\r' && s[k + 2] === '\n'));
 const isFunsubAt = (s, at) => s[at] === '$' && (contAt(s, at + 1) || (s[at + 1] === '{' && at + 2 < s.length && (/[\s|]/.test(s[at + 2]) || contAt(s, at + 2))));
 const REFUSED_FUNSUB = 'a `${ cmd; }` / `${|cmd;}` command substitution (bash 5.3, newer zsh), or a line continuation (backslash-newline) right after `$` or `${`';
+// (#269 R19-F2) what to write instead, per refusal (the `$(cmd)` advice does not fit arithmetic that already holds one)
+export function refusalAdvice(reason) {
+  return reason === REFUSED_ARITH
+    ? 'compute the value first and keep quotes, backslashes and `#` out of the arithmetic (`n=$(wc -l < "$f"); echo $(( n + 1 ))`), and for nested subshells put a space between the parentheses: `( (cmd) )`'
+    : 'write `$(cmd)` on one line instead, or put such text in a file with the Write tool (git commit -F <file>, gh … --body-file <file>)';
+}
 const REFUSED_ARITH = 'arithmetic (`$(( ))`, `(( ))`, `for (( ))`) the guard cannot prove plain: one holding a quote, backtick, backslash or `#`, longer than 2000 characters, or a `((` that may be nested subshells; the shell expands such text as if double-quoted and still runs what is in it';
 // (#269 R18) Is the text at k a `(`, after any line continuations (bash reads the character after `(` with them removed: `$(\⏎(` and `(\⏎(` are `$((` and `((`)?
 const arithOpenAt = (s, k) => { while (contAt(s, k)) k += s[k + 1] === '\r' ? 3 : 2; return s[k] === '('; };
@@ -2160,9 +2168,13 @@ class Parser {
     // `$((cmd) )` subshells) is refused: inside arithmetic the shell expands the text as if double-quoted, so the command-lexing rules below (quotes, `#`
     // comments, heredocs, the `${…}` fast path) would read as inert text what the shell runs.
     // (Marked, not stopped: the text is still parsed as before, so nothing in it is dropped from the commands; the line is refused all the same.)
-    if (s[start] === '$' && arithOpenAt(s, this.i) && !(s[this.i] === '(' && closesAsArith(s, start, 3))) this.markRefused(REFUSED_ARITH);
+    const arithAt = s[start] === '$' && s[this.i] === '(' ? arithProofEnd(s, start, 3) : -1;
+    if (s[start] === '$' && arithOpenAt(s, this.i) && arithAt < 0) this.markRefused(REFUSED_ARITH);
     // (`$((` is arithmetic, where `a > b` compares, only when it closes as `))`; else it is a subshell in a command substitution -- `$((cmd > f) )` RUNS cmd and writes f, in bash and zsh -- and its redirects count)
-    this.ownHeredocs(() => this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: s[start] === '$' && s[this.i] === '(' && closesAsArith(s, start, 3), maybeArith: s[start] === '$' && s[this.i] === '(' })));
+    this.ownHeredocs(() => this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: arithAt >= 0, maybeArith: s[start] === '$' && s[this.i] === '(' })));
+    // (#269 R19-B1, R19-F1) The proof counts raw parentheses; the shell skips a `)` inside `${…}`, a heredoc body or a comment of a nested `$( )`. When the parser
+    // closed the construct anywhere else than where the proof did, the proof read a different text than the shell runs: refused (`$(( ${x:-0))} + $'$(cmd)' ))`).
+    if (arithAt >= 0 && this.i !== start + arithAt) this.markRefused(REFUSED_ARITH);
     this.subAcc.push(...this.log.slice(mark));
     return s.slice(start, this.i);
   }
@@ -2578,7 +2590,12 @@ class Parser {
         const nx = s[this.i + 1];
         if (nx === '(') { inWord = true; wdyn = true; const n0 = this.subAcc.length; const at = cur.length; cur += this.substitution(depth); wspans.push([at, cur.length]); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
         else if (isFunsubAt(s, this.i)) { inWord = true; wdyn = true; const n0 = this.subAcc.length; const at = cur.length; cur += this.funsub(); wspans.push([at, cur.length]); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
-        else if (nx === "'") { mark(); const r = readAnsiC(s, this.i + 1); cur += r.text; this.i = r.next; }
+        else if (nx === "'") {
+          mark();
+          // (#269 R19-F1) in arithmetic `$'` is no quote either: `$` then a quote that is an ordinary character, so `$'$(cmd)'` runs cmd. Refused, not read.
+          if (noRedir || maybeArith) { cur += this.funsub(REFUSED_ARITH); continue; }
+          const r = readAnsiC(s, this.i + 1); cur += r.text; this.i = r.next;
+        }
         else if (nx === '"') { mark(); this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; takeSubs(); }
         else if (nx === '{' && this.paramSpan(this.i) > 0) {
           // `${f%%(*}`, `${x:-a b;c}`: one word; the ( ) ; | & and blanks inside the braces are not shell syntax
@@ -2697,8 +2714,11 @@ class Parser {
           if (cond) this.ctx.ctl.cond++;
           try {
             // (#269 R18) a `((` that does not prove plain arithmetic is refused, as for `$((` in substitution()
-            if (!noRedir && arithOpenAt(s, this.i) && !(s[this.i] === '(' && closesAsArith(s, this.i - 1, 2))) this.markRefused(REFUSED_ARITH); // (parsed as before: main's case-pattern reading keeps its commands)
-            this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || (s[this.i] === '(' && closesAsArith(s, this.i - 1, 2)), maybeArith: maybeArith || s[this.i] === '(' })); // ((...)) is arithmetic when it closes as `))`; `((cmd) )` is nested subshells, redirects and all
+            const open = this.i - 1;
+            const arithAt = s[this.i] === '(' ? arithProofEnd(s, open, 2) : -1;
+            if (!noRedir && arithOpenAt(s, this.i) && arithAt < 0) this.markRefused(REFUSED_ARITH); // (parsed as before: main's case-pattern reading keeps its commands)
+            this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || arithAt >= 0, maybeArith: maybeArith || s[this.i] === '(' })); // ((...)) is arithmetic when it closes as `))`; `((cmd) )` is nested subshells, redirects and all
+            if (!noRedir && arithAt >= 0 && this.i !== open + arithAt) this.markRefused(REFUSED_ARITH); // (#269 R19-F1: the parser closed it elsewhere than the proof, as in substitution())
           } finally { if (body) this.ctx.ctl.fn--; if (cond) this.ctx.ctl.cond--; }
           fnPending = false;
           if (head?.length) { for (const name of head) ctx.fns.add(name); fnPending = true; }

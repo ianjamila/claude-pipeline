@@ -1100,6 +1100,39 @@ test('R17: a line continuation after $ / ${ / <, and a substitution in single qu
   }
 });
 
+test('R19: arithmetic whose `))` the proof finds before the shell does (a `)` inside ${…}, a heredoc body or a comment) is refused, and so is a $\'…\' in arithmetic; the arithmetic refusal gives its own remedy', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json'; // (the name is built at run time: no plain-text match refuses the line)
+  const failures = [];
+  for (const cmd of [
+    "x=0; echo $(( ${x:-0))} + $'$(" + cp + ")' ))", // R19-B1
+    "echo $(( $(cat <<E\n)))\nE\n) + $'$(" + cp + ")' ))", // R19-F1 (1): a heredoc body in a nested substitution
+    "echo $(( $(echo 1 # )))\n) + $'$(" + cp + ")' ))", // R19-F1 (2): a comment in a nested substitution
+    "(( ${x:-0))} + $'$(" + cp + ")' ))", // R19-F1 (3): the (( command
+    "(( $(cat <<E\n)))\nE\n) + $'$(" + cp + ")' ))",
+    'd=.clau; echo $(( ${x:-))} ; echo payload > ~/${d}de/settings.json ))', // R19-F1 (4): bash runs it as a command substitution
+    "echo $(( 1 + ${x:-0} + $'\\x41' ))", // a $'…' in proven arithmetic: no quote there is a quote
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R19 lines were not refused');
+  const blocked = [];
+  for (const cmd of [
+    'x=1; echo $(( ${x:-0} + 1 ))',
+    'x=ab; echo $(( ${#x} + 1 ))',
+    'echo $(( (1 + 2) - (3 - 1) ))',
+    'i=0; (( (i + 1) > 0 )) && echo y',
+    'n=$(wc -l < /tmp/a); echo $(( n + 1 ))',
+    '( (cd /tmp && ls) )',
+  ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
+  assert.deepEqual(blocked, [], 'these R19 lines were refused');
+  // R19-F2: an arithmetic refusal says how to rewrite arithmetic (the `$(cmd)` advice of the ${ cmd; } refusal does not apply)
+  for (const cmd of ['echo $(( $(wc -l < "/tmp/a") + 1 ))', "(( $(grep -c 'x' /tmp/f) > 0 ))", '((cd /tmp && make) || echo fail)']) {
+    const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/home/u' });
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /compute the value first/, cmd);
+    assert.match(r.reason, /\( \(cmd\) \)/, cmd);
+    assert.doesNotMatch(r.reason, /write `\$\(cmd\)` on one line/, cmd);
+  }
+});
+
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------
 
 test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] argument no longer hide a fed interpreter', () => {

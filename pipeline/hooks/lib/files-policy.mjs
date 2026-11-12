@@ -23,7 +23,7 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -3545,7 +3545,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const cmds = simpleCommands(raw, { env: opts.env ?? process.env, bashState: opts._bashState, expired: () => opts._budget.now() > opts._budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
-  if (cmds.truncated) return deny(cmds.refused ? `the command line uses ${cmds.refused}, which the guard does not read; write \`$(cmd)\` on one line instead, or put such text in a file with the Write tool (git commit -F <file>, gh … --body-file <file>)` : 'the command line is too complex to check (the parser gave up); split it into simpler commands');
+  if (cmds.truncated) return deny(cmds.refused ? `the command line uses ${cmds.refused}, which the guard does not read; ${refusalAdvice(cmds.refused)}` : 'the command line is too complex to check (the parser gave up); split it into simpler commands');
   if (closeBracketNotLast(cmds)) return deny('a command follows a closing ]] on the same piece (zsh\'s short `if [[ … ]] cmd` form), or ]] is an argument next to a [[: the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`');
   // (#269 R13-F1, R13-F2; owner decision 2026-11-12: text-level refusals, on top of the parser-based checks)
   if (closeBracketFollowedByWord(raw)) return deny('a word follows a closing ]] on a line with a [[ (zsh\'s short `if [[ … ]] cmd` form, `<->` number patterns, a redirect): the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`. The check reads quoted text and heredoc bodies too: put such text in a file written with the Write tool (`git commit -F FILE`, `gh … --body-file FILE`)');
