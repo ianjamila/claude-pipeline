@@ -41,7 +41,7 @@ export const run = guarded(async (argv, ctx) => {
   // convert to draft (nothing to re-read afterwards) a merge started between redraft and the caller's `git push` is not seen; the caller pushes right after.
   const mergeBusy = (error, reasons, extra = {}) => ({
     exitCode: EXIT.FAILED,
-    output: { ok: false, pr, reason: 'merge-in-progress', message: `${reasons.join('; ')}; another pipeline run (merge or redraft) holds the merge lock for #${pr} (or it could not be taken), so do NOT push; tell the owner`, reasons, ...extra },
+    output: { ok: false, pr, reason: 'merge-in-progress', message: `${reasons.join('; ')}; a merge (or another redraft) of #${pr} may be under way, so do NOT push; tell the owner`, reasons, ...extra },
   });
   return withMergeLock({ gh, pr, env: ctx.env ?? process.env, refuse: mergeBusy, fn: () => redraftLocked({ pr, reason, root, config, env, gh, ctx, unavailable, refuse }) }).catch((err) => {
     // gh.repo() (the lock's name) failed before the lock existed: same as an unreadable step-1 read.
