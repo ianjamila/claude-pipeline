@@ -177,8 +177,9 @@ test('rateBranch: one config rates the size-only PR low and the other medium for
 test('rateBranch: a low evaluation that still has a raw hit (here an ignored one) keeps sizeOnly false, so Fable is demanded', async (t) => {
   const baseYml = yml('owner_approval: chat\nrisk:\n  medium_lines: 300\n  ignore_hard_stop_rules: [P-path]\nhard_stops:\n  paths: ["src/a.js"]\n');
   const w = world(t, { baseYml, feature: (r) => r.write('src/a.js', lines(200)) });
-  // the working config is the strict one: no ignore list, so the P-path hit is real there too; either way the hit makes it more than size
-  const r = await w.rate(yml('owner_approval: chat\nhard_stops:\n  paths: ["src/a.js"]\nrisk:\n  medium_lines: 100\n  ignore_hard_stop_rules: [P-path]\n'));
+  // the working config lists no hard-stop path: on its own it is size-only medium (200 lines > 100) with zero hits; the trusted config rates low (its P-path hit is ignored, size under 300)
+  // but still reports the raw hit, and that hit must keep the merged result from reading as size-only
+  const r = await w.rate(yml('owner_approval: chat\nrisk:\n  medium_lines: 100\n'));
   assert.equal(r.sizeOnly, false);
   assert.equal(r.reviewer, 'fable');
 });
