@@ -1816,6 +1816,17 @@ function psWords(text) {
   return words;
 }
 const psMixedWord = (text) => psWords(text).find((w) => w.includes('\\') && /["']/.test(w) && !PS_WHOLE_QUOTED.test(w));
+// R15-B1 / F1: on a line PowerShell reads differently from the guard's parser (psUnparsed) the parsed command list says nothing sure (a backslash folds the rest of the line into the cd operand, a `#` inside a
+// typographic-quoted string drops it as a comment), so whether the line writes is judged from the RAW text, fail closed: read-only only when the text (its terminated block comments cut out) holds none of `< > $ { } ( ) @` or a backtick, and every
+// statement (cut at `; | &` and any line break, also inside quotes: the stricter reading) starts with a directory change, a drive word or a command from this short list of pure readers. Anything else writes.
+const PS_RAW_READERS = new Set(['echo', 'write-output', 'write-host', 'get-childitem', 'gci', 'ls', 'dir', 'get-content', 'gc', 'cat', 'type', 'get-location', 'gl', 'pwd', 'get-item', 'test-path', 'get-date', 'select-string', 'sls']);
+function psRawReadOnly(text) {
+  if (/[<>$@{}()`]/.test(text)) return false;
+  return text.split(/[;|&]|[^\S \t]/).every((seg) => {
+    const word = seg.trim().split(/\s+/)[0] ?? '';
+    return word === '' || PS_RAW_READERS.has(word.toLowerCase()) || PS_DRIVE_WORD.test(word) || CD_CMDS.has(baseOf(word));
+  });
+}
 const PS_PREFIX_STOP = /[^A-Za-z0-9 \t\n._:/\\|;=,-]|@["']|<#|#>|`|--%|\\(?![A-Za-z0-9._-])/;
 // The end of the text's leading run that PowerShell and the guard's parser read the same: plain characters only, NO quote (one opened there can swallow what follows), no escape, comment, here-string or backtick.
 const psPlainPrefixEnd = (text) => { const i = text.search(PS_PREFIX_STOP); return i < 0 ? text.length : i; };
@@ -3553,7 +3564,8 @@ function evaluateBashForFilesFrame(command, opts) {
     // (the Bash parse reads a block comment `<# ... #>` as a line comment and drops the rest of the line, so the commands are also read from the text with its block comments cut out; an unterminated `<#` counts as a write)
     const stripped = raw.replace(/<#[\s\S]*?#>/g, ' ');
     const nonReadOnly = (c) => c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !PS_DRIVE_WORD.test(c.argv[0]) && !isReadOnly(c, ctx);
-    const writes = cmds.some(nonReadOnly) || psRedirects(stripped) || stripped.includes('<#') || (stripped !== raw && simpleCommands(stripped).some(nonReadOnly));
+    // R15-B1 / F1: on a line PowerShell reads differently from the guard's parser (psUnparsed: a backslash escape, a typographic quote, any not-plain text) the parsed list is not trusted: it writes unless provably read-only from the raw text
+    const writes = cmds.some(nonReadOnly) || psRedirects(stripped) || stripped.includes('<#') || (stripped !== raw && simpleCommands(stripped).some(nonReadOnly)) || ((ctx.psHazard || psUnparsed(raw)) && !psRawReadOnly(stripped));
     if (writes) {
       const texts = [raw, ...(psDecoded !== null && psDecoded !== raw ? [psDecoded] : []), ...(raw.includes('`') ? [raw.replace(/`/g, '')] : [])];
       if (psChangesDirectory(texts)) {

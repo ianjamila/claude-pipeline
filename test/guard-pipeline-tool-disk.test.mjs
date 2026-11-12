@@ -833,3 +833,47 @@ test('R14 one rule: a directory change plus a write on one PowerShell line is re
   // Bash route unchanged
   assert.equal(bashW('cd C:/repo; echo x > out.txt'), 'allow');
 });
+
+// R15 round-15 review: the entry condition of the R14 rule (`writes`) must not trust the guard's own parse on a line PowerShell reads differently (psUnparsed): there a line counts as writing
+// unless its raw text is provably read-only.
+test('R15-B1: a backslash before the separator (the Bash parse folds the rest of the line into the cd operand) cannot hide the write from the directory-change rule', () => {
+  const lines = [
+    'Set-Location ..\\Users\\u\\.cl"aude"\\pipeline\\; Set-Content hooks/guard-files.mjs x',
+    'cd ..\\Users\\u\\.cl"aude"\\pipeline\\; Set-Content hooks/guard-files.mjs x',
+    'Set-Location C:/repo\\; Set-Content out.txt x',
+  ];
+  for (const c of lines) {
+    const r = psWhy(c);
+    assert.equal(r.decision, 'deny', JSON.stringify(c));
+    assert.match(r.reason, DENY_CD, r.reason);
+  }
+  // a read-only tail after such a separator stays allowed (nothing writes)
+  assert.equal(psW('Set-Location C:/repo\\; Get-ChildItem'), 'allow');
+});
+
+test('R15-F1: a # inside a typographic-quoted string (a comment to the guard, text to PowerShell) cannot hide the write from the R14 refusals', () => {
+  const cdLines = [
+    'Set-Location ..\\Users\\u\\.cl"aude"\\pipeline; echo \u2018a #b\u2019; Set-Content hooks/guard-files.mjs x',
+    'cd C:/repo; echo \u201C#x\u201D; Set-Content out.txt x',
+    'Set-Location C:/repo; echo \u2018a #b\u2019; Set-Content out.txt x',
+  ];
+  for (const c of cdLines) {
+    const r = psWhy(c);
+    assert.equal(r.decision, 'deny', JSON.stringify(c));
+    assert.match(r.reason, DENY_CD, r.reason);
+  }
+  const mixLines = [
+    'echo \u201C#x\u201D; Set-Content ..\\Users\\u\\.cl"aude"\\settings.json x',
+    'echo \u2018a #b\u2019; Set-Content ..\\Users\\u\\.cl\'aude\'\\settings.json x',
+  ];
+  for (const c of mixLines) {
+    const r = psWhy(c);
+    assert.equal(r.decision, 'deny', JSON.stringify(c));
+    assert.match(r.reason, DENY_MIX, r.reason);
+  }
+  // reads on such a line stay allowed
+  assert.equal(psW('Set-Location C:/repo/sub; echo \u2018a #b\u2019; Get-ChildItem'), 'allow');
+  assert.equal(psW('echo \u201C#x\u201D; Get-Content ..\\Users\\u\\.cl"aude"\\settings.json'), 'allow');
+  // Bash route unchanged
+  assert.equal(bashW('cd C:/repo; echo \u2018a #b\u2019; echo y > out.txt'), 'allow');
+});
