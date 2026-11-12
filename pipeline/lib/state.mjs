@@ -39,6 +39,8 @@ const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArr
 // ---- substitute rounds and the sticky risk --------------------------------------------------------------------------------------------------
 // A round reviewed first by the substitute (Claude) instead of Codex.
 export const isSubstituteRound = (round) => round?.firstReviewer === 'substitute' || isPlainObject(round?.substitute);
+// Who gave a second review: 'codex' (no `by`, the first kind), or the pinned Claude substitute that did (R5-5). Anything else that starts with `substitute` reads as plain `substitute`.
+export const secondReviewerOf = (sr) => (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute') ? 'codex' : sr.by === 'substitute-opus' || sr.by === 'substitute-fable' ? sr.by : 'substitute');
 const isSubstituteSecondReview = (item) => typeof item?.secondReview?.by === 'string' && item.secondReview.by.startsWith('substitute');
 // The lowest version that may hold this state: 4 when it holds a substitute round / second review or a governor / budget decision.
 export function requiredStateVersion(state) {

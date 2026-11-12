@@ -19,18 +19,26 @@ import { diffStats } from '../lib/diff.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
-import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
+import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
 import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { askSummary, costFrom, notCleanReasons, openItems, roundsFrom } from '../lib/round-ask.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
-  isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, rulingContentDigest, secondReviewRefusal, settleSecondReview, validateSecondReview, validateTriage,
+  isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
-  currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, reviewBaseRef, withStateLock, writeFileAtomic, writeJson,
+  currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, reviewBaseRef, roundDir, sha256, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
+import { assertCurrentAttempt, finishAttempt, readRoute, startAttempt, substituteEligibility, superseded, writeFinalRoute } from '../lib/route-record.mjs';
+import { headMoved } from '../lib/review-round.mjs';
+import { floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
+import { PROOF_EFFORT, proveSubstituteRun } from '../lib/substitute-proof.mjs';
+import {
+  MAX_INVALID_SECOND_ATTEMPTS, SECOND_EVIDENCE_KINDS, TAG_RE, checkSecondInputOnDisk, countedSecondInvalid, firstPromptFor, inputPathOf, packetIdOf, prepareSecondAttempt, readSecondAttempts,
+  routeFileFor, saveSecondAttempts,
+} from '../lib/second-review-substitute.mjs';
 import { establishBaseline, publishTriage } from '../lib/review-publish.mjs';
 
 export const meta = {
@@ -466,8 +474,30 @@ function secondReviewNext(verdicts) {
   ].filter(Boolean).join('; ');
 }
 
+// What a second review's verdict adds when a Claude substitute gave it instead of Codex: who, on what evidence, and the proof (substituteInventory reads by / evidence / models).
+const substituteVerdictFields = ({ agent, route, proof, transcript }) => ({
+  by: agent, evidence: route.evidence, models: proof.models, proof: { transcript, models: proof.models, effort: PROOF_EFFORT },
+});
+
+// The output of a recorded second review, the same for Codex and for a substitute.
+function secondReviewOutput({ n, settled, published, publishNext, extra = {} }) {
+  const verdicts = settled.map((i) => ({ id: i.id, decision: i.secondReview.decision, confidence: i.secondReview.confidence, reasoning: i.secondReview.reasoning, final: i.final }));
+  return {
+    exitCode: EXIT.OK,
+    output: {
+      ok: true, round: n, verdicts, forcedAccept: verdicts.filter((v) => v.decision === 'ACCEPT').map((v) => v.id), ...extra, ...published,
+      next: [secondReviewNext(verdicts), publishNext].filter(Boolean).join('. '),
+    },
+  };
+}
+
 async function secondReview(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { round: { type: 'string' }, ids: { type: 'string' }, pr: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, {
+    round: { type: 'string' }, ids: { type: 'string' }, pr: { type: 'string' }, repo: { type: 'string' },
+    apply: { type: 'boolean' }, tag: { type: 'string' }, 'projects-dir': { type: 'string' }, 'max-age-ms': { type: 'string' },
+  }, { allowPositionals: false });
+  if (values.apply) return secondReviewApply(values, ctx);
+  for (const k of ['tag', 'projects-dir', 'max-age-ms']) if (values[k] !== undefined) throw new UsageError(`--${k} goes with --apply`);
   const n = intOption(values, 'round', { required: true, min: 1 });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean))];
@@ -480,6 +510,7 @@ async function secondReview(rest, ctx) {
   }
   const o = { cwd: root };
   const model = config.review.codex_model;
+  const sub = config.review.substitute;
 
   // Check under the lock; the packet is built from the state and git right here.
   const asked = await withStateLock(root, ctx, () => {
@@ -493,7 +524,8 @@ async function secondReview(rest, ctx) {
       if (why) return refuse(why);
       items.push(item);
     }
-    return { head: headSha(o), risk: state.risk, items: items.map(packetItem), snapshot: askedSnapshot(items) };
+    const maxRisk = maxRiskOf(state);
+    return { head: headSha(o), risk: state.risk, maxRisk, agent: substituteAgentFor(maxRisk), items: items.map(packetItem), snapshot: askedSnapshot(items) };
   }, pr);
   if (asked.exitCode !== undefined) return asked;
 
@@ -517,15 +549,46 @@ async function secondReview(rest, ctx) {
     throw new UsageError(err.message);
   }
 
+  // The attempt (route-2nd-<packetId8>.json, the lifecycle of route.json): pending before Codex runs, so evidence of an earlier attempt for this packet is gone; the final evidence
+  // is written by compare-and-swap under the lock, and only while the record still holds this attempt (else exit 2 `superseded`, nothing written).
+  const packetId = packetIdOf({ ids, head: asked.head, findings: asked.snapshot.digest, finals: asked.snapshot.finals });
+  const routeFile = routeFileFor(packetId);
+  const attempt = await startAttempt({
+    root, round: n, head: asked.head, risk: asked.maxRisk, agent: asked.agent, file: routeFile,
+    extra: { kind: 'second-review', ids: [...ids].sort(), packetId, findingsDigest: asked.snapshot.digest, finalsSha256: sha256(asked.snapshot.finals) },
+  });
+  const failAttempt = (final) => finishAttempt({ root, pr, ctx, round: n, attempt, final, files: [], file: routeFile });
+
   // Codex runs WITHOUT the lock (it can take minutes). The prompt is kept before it starts, so a crashed run still leaves what it was asked.
   writeFileAtomic(path.join(dir, `second-review-${ids[0]}.md`), promptBytes);
   const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
   if (!ran.ok) {
+    const verdict = substituteEligibility({
+      reason: ran.reason, timedOut: ran.timedOut === true, quota: ran.quota, mode: sub.mode, minWaitMinutes: sub.min_wait_minutes, agent: asked.agent,
+    });
+    const quotaStop = ran.reason === 'quota' && ran.quota?.eligible === true;
+    await failAttempt(quotaStop
+      ? {
+        evidence: 'quota', outcome: 'failed', reason: 'quota', resetAt: ran.quota.resetAt, resetText: ran.quota.resetText,
+        errorEvent: { type: 'turn.failed', message: ran.quota.message }, threadId: ran.quota.threadId ?? null, promptSha256: inputDigest, proof: ran.quota.proof,
+      }
+      : { evidence: 'none', outcome: 'failed', reason: ran.reason, ...(ran.timedOut ? { timedOut: true } : {}), ...(ran.detail === undefined ? {} : { detail: ran.detail }) });
+    // A real quota stop: the same blind packet, for the risk's substitute agent (opened under the lock: the attempts file is shared by later runs).
+    let substitute = verdict;
+    if (verdict.eligible) {
+      const prepared = await withStateLock(root, ctx, () => prepareSecondAttempt({
+        root, round: n, packetId, agent: asked.agent, prompt, head: asked.head, evidence: 'quota', resetText: ran.quota.resetText,
+      }), pr);
+      substitute = prepared.ok
+        ? { ...verdict, packetId, attempt: prepared.k, tag: prepared.tag, promptHeader: prepared.header, inputPath: prepared.inputPath, digest: prepared.digest }
+        : { ...verdict, eligible: false, why: prepared.why };
+    }
     // The facts of the run are forwarded as codex-review does (a timeout was retried once; a quota stop carries its proof and reset time).
     throw new Fail(EXIT.UNAVAILABLE, {
       ok: false, unavailable: true, reason: ran.reason, code: ran.code, timedOut: ran.timedOut, detail: ran.detail,
       ...(ran.retried ? { retried: ran.retried } : {}),
       ...(ran.reason === 'quota' && ran.quota ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
+      substitute,
     });
   }
   // From here on a bad answer stores nothing, so the call can simply be run again.
@@ -533,10 +596,14 @@ async function secondReview(rest, ctx) {
   try {
     answer = readCodexAnswer(outPath, ran.startedAt);
   } catch (err) {
+    await failAttempt({ evidence: 'none', outcome: 'failed', reason: 'malformed', detail: err.message });
     return refuse(`no usable Codex answer: ${err.message}; nothing was recorded, run second-review again`);
   }
   const checked = validateSecondReview(answer, ids);
-  if (!checked.ok) return refuse(`the Codex answer is not one valid verdict per item: ${checked.errors.join('; ')}; nothing was recorded, run second-review again`, { errors: checked.errors });
+  if (!checked.ok) {
+    await failAttempt({ evidence: 'none', outcome: 'failed', reason: 'malformed', detail: checked.errors.join('; ') });
+    return refuse(`the Codex answer is not one valid verdict per item: ${checked.errors.join('; ')}; nothing was recorded, run second-review again`, { errors: checked.errors });
+  }
 
   return withStateLock(root, ctx, () => {
     const state = requireState(root);
@@ -553,6 +620,8 @@ async function secondReview(rest, ctx) {
     const now = askedSnapshot(items);
     if (now.digest !== asked.snapshot.digest) return refuse('a finding changed while Codex was reviewing; nothing was recorded, run second-review again');
     if (now.finals !== asked.snapshot.finals) return refuse('an item\'s final changed while Codex was reviewing; nothing was recorded, run second-review again');
+    // Still this attempt (a newer one for the same packet replaced it: exit 2, nothing written)?
+    const pending = assertCurrentAttempt(root, n, attempt.attemptId, routeFile);
     seedBaseline({ ctx, root, pr, state });
     const ranAt = new Date().toISOString();
     const byId = new Map(answer.items.map((e) => [e.id, e]));
@@ -563,15 +632,133 @@ async function secondReview(rest, ctx) {
     // Format version 2 at least: an older pipeline must not read a state that holds a second-review verdict (state.mjs SUPPORTED_STATE_VERSION); a higher version stays.
     const saved = withStateVersion(updateItems(state, n, settled), STATE_VERSION_CLAUDE);
     saveState(root, saved);
-    const verdicts = settled.map((i) => ({ id: i.id, decision: i.secondReview.decision, confidence: i.secondReview.confidence, reasoning: i.secondReview.reasoning, final: i.final }));
+    writeFinalRoute(root, n, pending, { evidence: 'none', outcome: 'recorded' }, Date.now(), routeFile);
     const { next: publishNext, ...published } = publishRuling({ ctx, root, pr, state: saved });
-    return {
-      exitCode: EXIT.OK,
-      output: {
-        ok: true, round: n, verdicts, forcedAccept: verdicts.filter((v) => v.decision === 'ACCEPT').map((v) => v.id), ...published,
-        next: [secondReviewNext(verdicts), publishNext].filter(Boolean).join('. '),
-      },
+    return secondReviewOutput({ n, settled, published, publishNext });
+  }, pr);
+}
+
+// `triage second-review --apply --tag TAG`: the substitute's answer to a second review Codex could not give. The proof is `substitute apply`'s (lib/substitute-proof.mjs); the
+// question is the one `second-review` asked (route-2nd-<packetId8>.json + the packet on disk), and the state must still be the one it was asked about.
+async function secondReviewApply(values, ctx) {
+  const pr = intOption(values, 'pr', { required: true, min: 1 });
+  const tag = requireOption(values, 'tag');
+  for (const k of ['round', 'ids']) if (values[k] !== undefined) throw new UsageError(`--${k} is not used with --apply: the tag names the round and the packet`);
+  if (values['projects-dir'] === '') throw new UsageError('--projects-dir must not be empty');
+  const maxAgeMs = intOption(values, 'max-age-ms', { min: 0 });
+  const root = resolveRepo(values, ctx);
+  const { config } = await requireConfig(root);
+  const fail = (code, error, message, extra = {}) => new Fail(code, { ok: false, error, message, ...extra });
+  const m = TAG_RE.exec(tag);
+  if (m === null) throw fail(EXIT.USAGE, 'bad-tag', `--tag ${JSON.stringify(tag)} is not a second-review tag (pipeline-substitute-2nd R<R> <packetId8>)`);
+  const n = Number(m[1]);
+  const id8 = m[2];
+  if (config.owner_approval !== 'chat') throw fail(EXIT.FAILED, 'label-mode', 'a second review is run only with owner_approval: chat in pipeline.yml');
+  if (config.review.substitute.mode === 'off') throw fail(EXIT.FAILED, 'mode-off', 'review.substitute.mode is off: no substitute reviewer');
+  const env = ctx.env ?? process.env;
+  const o = { cwd: root };
+
+  return withStateLock(root, ctx, async () => {
+    const file = `route-2nd-${id8}.json`;
+    const route = readRoute(root, n, file);
+    if (route === null) throw fail(EXIT.FAILED, 'no-route', `round ${n} has no .review/round-${n}/${file}: run \`pipeline triage second-review\` for these items first`);
+    if (route.kind !== 'second-review' || route.round !== n || typeof route.packetId !== 'string' || !route.packetId.startsWith(id8) || !Array.isArray(route.ids)) {
+      throw fail(EXIT.FAILED, 'route-mismatch', `${file} does not describe a second review of round ${n}`);
+    }
+    if (!SECOND_EVIDENCE_KINDS.includes(route.evidence)) {
+      throw fail(EXIT.FAILED, 'no-evidence', `${file} holds evidence ${JSON.stringify(route.evidence ?? null)}, not quota | budget | governor: Codex was not refused (or is still being asked): run \`pipeline triage second-review\` again`, { evidence: route.evidence ?? null });
+    }
+    const record = readSecondAttempts(root, n, route.packetId);
+    const open = record.attempts.find((a) => a.status === 'prepared');
+    if (open === undefined) throw fail(EXIT.USAGE, 'no-prepare', `second review ${id8} has no open substitute attempt: run \`pipeline triage second-review\` again`);
+    if (tag !== open.tag) throw fail(EXIT.USAGE, 'tag-mismatch', `--tag ${JSON.stringify(tag)} is not the open attempt's tag ${JSON.stringify(open.tag)} (an attempt recorded invalid cannot be proven again)`);
+    if (headSha(o) !== route.head) throw headMoved();
+
+    // The locked snapshot checks of the Codex path, against the state as it is NOW: a changed final, finding, head or an item that has a second review by now refuses.
+    const state = requireState(root);
+    if (state.pr !== pr) throw fail(EXIT.FAILED, 'state-pr-mismatch', `the review state is for PR #${state.pr}, not #${pr}`);
+    const round = findRound(state, n);
+    const items = [];
+    for (const id of route.ids) {
+      const item = round.items.find((i) => i.id === id);
+      const why = secondReviewCheck(item, id, n);
+      if (why) throw fail(EXIT.FAILED, 'item-changed', `${why} (it changed since the second review was asked); nothing was recorded`);
+      items.push(item);
+    }
+    const now = askedSnapshot(items);
+    if (now.digest !== route.findingsDigest) throw fail(EXIT.FAILED, 'finding-changed', 'a finding changed since the second review was asked; nothing was recorded, run second-review again');
+    if (sha256(now.finals) !== route.finalsSha256) throw fail(EXIT.FAILED, 'final-changed', 'an item\'s final changed since the second review was asked; nothing was recorded, run second-review again');
+    if (packetIdOf({ ids: route.ids, head: route.head, findings: now.digest, finals: now.finals }) !== route.packetId) throw fail(EXIT.FAILED, 'route-mismatch', `${file} does not match the review state`);
+    const agent = substituteAgentFor(maxRiskOf(state));
+    if (route.agent !== agent) throw fail(EXIT.FAILED, 'agent-changed', `${file} names ${route.agent} but the PR's highest risk needs ${agent}: run \`pipeline triage second-review\` again`);
+
+    const errors = [];
+    if (agent !== open.agent) errors.push(`the open attempt was prepared for ${open.agent} but the PR needs ${agent}`);
+    const inputPath = inputPathOf(root, n, route.packetId);
+    errors.push(...checkSecondInputOnDisk(inputPath, open));
+    const proven = proveSubstituteRun({
+      tag, projectsDir: values['projects-dir'], maxAgeMs, agent: open.agent, errors, expectedPrompt: firstPromptFor(n, open.digest, inputPath), requiredReads: [inputPath],
+    });
+    if (proven === null) throw fail(EXIT.USAGE, 'not-found', `no recent subagent transcript tagged ${JSON.stringify(tag)}`);
+    const { found, proof, claudeCodeVersions } = proven;
+
+    // The answer is the SECOND-REVIEW schema (items: one verdict per id): a findings-shaped answer fails here.
+    let answer = null;
+    try {
+      const json = extractJsonBlock(proof.finalAssistantText);
+      const checked = validateSecondReview(json, route.ids);
+      if (checked.ok) answer = json;
+      else errors.push(...checked.errors.map((e) => `second review: ${e}`));
+    } catch {
+      errors.push('second review: no JSON found in the substitute\'s final message');
+    }
+
+    const baseOk = errors.length === 0 && answer !== null;
+    const settleAttempt = (status, extra = {}) => {
+      const entry = { ...open, status, endedAt: new Date().toISOString(), ...extra };
+      saveSecondAttempts(root, n, { ...record, attempts: record.attempts.map((a) => (a.k === open.k ? entry : a)) });
     };
+    const publish = (judged) => {
+      const proofOk = errors.length === 0 && answer !== null;
+      writeJson(path.join(roundDir(root, n), `second-review-proof-${id8}.json`), {
+        ok: proofOk, transcript: found.jsonlPath, models: proof.models, efforts: proof.efforts, stopReasonMissing: proof.stopReasonMissing, finalVia: proof.finalVia,
+        claudeCodeVersions, errors, tag, round: n, attempt: open.k, agent: open.agent,
+      });
+      if (!proofOk) {
+        const floorOnly = baseOk && judged.applies === true && judged.restartRequired === true && judged.unparseable?.length === 0 && judged.unreadable !== true;
+        settleAttempt('invalid', { reason: errors[0] ?? 'unproven', ...(floorOnly ? { restartRequired: true } : {}) });
+        const counted = countedSecondInvalid({ attempts: record.attempts.map((a) => (a.k === open.k ? { ...a, status: 'invalid', ...(floorOnly ? { restartRequired: true } : {}) } : a)) });
+        return {
+          exitCode: EXIT.FAILED,
+          output: { ok: false, round: n, tag, attempt: open.k, transcript: found.jsonlPath, errors, ...floorOutput(judged), retry: counted >= MAX_INVALID_SECOND_ATTEMPTS ? 'park' : 'second-review' },
+        };
+      }
+      // Still this evidence (a newer Codex attempt for the packet replaced the record: nothing is written; resetAt is NOT judged here, as for a first review).
+      const current = readRoute(root, n, file);
+      if (current === null || current.attemptId !== route.attemptId || current.evidence !== route.evidence || current.packetId !== route.packetId || current.head !== route.head) throw superseded();
+      seedBaseline({ ctx, root, pr, state });
+      const ranAt = new Date().toISOString();
+      const byId = new Map(answer.items.map((e) => [e.id, e]));
+      const fields = substituteVerdictFields({ agent: open.agent, route, proof, transcript: found.jsonlPath });
+      const settled = items.map((item) => {
+        const e = byId.get(item.id);
+        return settleSecondReview(item, {
+          decision: e.decision, confidence: e.confidence, reasoning: clip(e.reasoning.trim(), REASONING_MAX), model: Object.keys(proof.models ?? {}).join(', '),
+          effort: PROOF_EFFORT, inputDigest: open.digest, ranAt, ...fields,
+        });
+      });
+      // Version 4: an older pipeline must not read a substitute second review (state.mjs#stateVersionFor).
+      const saved = withStateVersion(updateItems(state, n, settled), STATE_VERSION_SUBSTITUTE);
+      saveState(root, saved);
+      writeFinalRoute(root, n, current, { evidence: 'none', outcome: 'recorded', via: 'substitute', substituteEvidence: route.evidence }, Date.now(), file);
+      settleAttempt('applied');
+      const { next: publishNext, ...published } = publishRuling({ ctx, root, pr, state: saved });
+      return secondReviewOutput({ n, settled, published, publishNext, extra: { tag, attempt: open.k, transcript: found.jsonlPath, agent: open.agent, evidence: route.evidence, ...floorOutput(judged) } });
+    };
+    const failFloor = (code, message, advice, extra = {}) => {
+      throw new Fail(EXIT.FAILED, { ok: false, error: code, message, advice, ...extra });
+    };
+    return judgeAndPublish({ command: 'triage second-review --apply', proof, claudeCodeVersions, env, errors, baseOk, transcript: found.jsonlPath, projectsDirGiven: values['projects-dir'] !== undefined, publish, failFloor });
   }, pr);
 }
 

@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { CATEGORIES } from './codex.mjs';
 import { MIN_FABLE, compareVersions, parseModelId } from './model-floor.mjs';
 import { isSensitivePath } from './risk.mjs';
-import { RISK_LEVELS, isSubstituteRound, maxRiskOf } from './state.mjs';
+import { RISK_LEVELS, isSubstituteRound, maxRiskOf, secondReviewerOf } from './state.mjs';
 import { wholePrOwed } from './review-route.mjs';
 
 export const SECURITY_CATEGORIES = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
@@ -897,7 +897,8 @@ function rowWhy(item) {
 const byLabel = (item) => {
   const by = item.final?.by;
   if (by === 'claude' && isRoundCapDeferral(item)) return 'claude (round limit)';
-  if (by === 'claude') return item.secondReview !== undefined ? 'claude+codex' : 'claude';
+  // who reviewed it second is part of the bound Rulings row (R5-5): claude+codex | claude+substitute-opus | claude+substitute-fable
+  if (by === 'claude') return item.secondReview !== undefined ? `claude+${secondReviewerOf(item.secondReview)}` : 'claude';
   return typeof by === 'string' && by !== '' ? by : 'unknown';
 };
 const isCriticalItem = (item) => item.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(item.category);

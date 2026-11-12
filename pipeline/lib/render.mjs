@@ -6,7 +6,7 @@
 // finding can never forge or close a marker the pipeline looks for, and "@" becomes the fullwidth
 // commercial at (U+FF20) so it can never notify anyone (it looks the same, also inside code).
 // Single-line values are flattened, and pipes in table cells become &#124;.
-import { encodeForComment } from './state.mjs';
+import { encodeForComment, secondReviewerOf } from './state.mjs';
 import { skipOf } from './verify-steps.mjs';
 
 export const MARKERS = {
@@ -44,7 +44,7 @@ const ownerReason = (final) => (typeof final?.ownerQuote === 'string' && final.o
 
 // A Claude-ruled item names who decided: claude alone, or claude+codex when a second review (Codex) is stored in the item.
 const claudeRuled = (item) => item?.final?.by === 'claude';
-const claudeBy = (item) => (item.secondReview !== undefined ? 'claude+codex' : 'claude');
+const claudeBy = (item) => (item.secondReview !== undefined ? `claude+${secondReviewerOf(item.secondReview)}` : 'claude');
 
 function triageRow(n, item) {
   const { final, judge, arbiter } = item;
@@ -68,7 +68,7 @@ const grantLabel = (g) => `round ${line(g.k ?? g.n)}`;
 function claudeRulingLines(rounds) {
   return rounds.flatMap((r) => (r.items ?? []).filter(claudeRuled).map((item) => {
     const sr = item.secondReview;
-    const codex = sr ? `Codex ${line(sr.decision)}, ${line(sr.confidence)}` : 'no Codex check';
+    const codex = sr ? `${secondReviewerOf(sr) === 'codex' ? 'Codex' : `Substitute (${secondReviewerOf(sr)})`} ${line(sr.decision)}, ${line(sr.confidence)}` : 'no Codex check';
     // A fix taken out at the round limit (triage defer-fixes) says so: it is a FOLLOW-UP whose fix is NOT in this merge.
     if (item.roundCapDeferral) return `- ${line(item.id)}: ${line(item.final.decision ?? 'unknown')} (deferred past the round limit; its fix was taken out, NOT in this merge) - ${line(item.final.reason, 300)}`;
     return `- ${line(item.id)}: ${line(item.final.decision ?? 'unknown')} (${claudeBy(item)}; ${codex}) - ${line(item.final.reason, 300)}`;
