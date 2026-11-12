@@ -2075,6 +2075,10 @@ function readOnlyWith(name, args, cmd, ctx, argv) {
 // `sources` are the other words; copying SRC into a directory writes DIR/basename(SRC), which matters when that
 // lands on a protected path (cp -a /tmp/backup/.claude ~/).
 function destsOf(argv, name) {
+  return splitOperands(argv, name).written;
+}
+// (R4 #288: the same split, with the sources too: rsync --remove-source-files deletes them)
+function splitOperands(argv, name) {
   const args = argv.slice(1);
   const pos = [];
   let target = null;
@@ -2096,7 +2100,27 @@ function destsOf(argv, name) {
     const b = posix.basename(toPosix(src).replace(/\/+$/, ''));
     if (b && b !== '.' && b !== '..' && !/[*?[]/.test(b)) written.push(`${d.replace(/\/+$/, '')}/${b}`);
   }
-  return written;
+  return { written, dests, sources };
+}
+
+// R4-B1 / item 6 (#288): rsync's options as the shell passes them. A same-line name is replaced by its value (`D=--delete; rsync -a "$D" SRC ~/`) and a value that holds blanks is several words; a word that
+// can still be an option (it starts with `-`, `$` or a backtick) and holds a part only known at run time is a possible --delete / --remove-source-files, like a value the shell may split on other
+// characters (IFS). { del: deletes at the destination, rm: deletes its sources, unknown: either, as far as can be told }
+function rsyncFlags(argv, ctx) {
+  const out = { del: false, rm: false, unknown: false };
+  const ifs = ifsMayBeSet(ctx);
+  for (const a of argv.slice(1)) {
+    if (ctx.budget) checkDeadline(ctx.budget);
+    if (a === '--') break;
+    const e = RUNTIME_PART.test(a) ? expandRefs(a, ctx) : a;
+    if (e !== a && ifs) out.unknown = true;
+    if (RUN_TIME.test(e) && /^[-$`]/.test(e)) out.unknown = true;
+    for (const piece of e.split(/\s+/)) {
+      if (/^--del/.test(piece)) out.del = true;
+      else if (/^--remove-/.test(piece)) out.rm = true;
+    }
+  }
+  return out;
 }
 
 // $NAME values assigned on the line: `D=x cmd`, a bare `D=x`, `export D=x`, `declare -x D=x`.
@@ -3869,7 +3893,13 @@ function evaluateBashForFilesFrame(command, opts) {
     const homeWriter = cmds.find((c) => {
       const name = c.argv.length ? baseOf(c.argv[0]) : '';
       if (!name || NOT_WRITERS.has(name) || isReadOnly(c, ctx)) return false;
-      if (DEST_ONLY.has(name)) return name === 'rsync' && c.argv.some((a) => /^--(?:del|delete)/.test(a)) && destsOf(wordsOf(c), name).some(homeWord);
+      if (DEST_ONLY.has(name)) {
+        if (name !== 'rsync') return false;
+        const f = rsyncFlags(c.argv, ctx);
+        if (!f.del && !f.rm && !f.unknown) return false;
+        const { dests, sources } = splitOperands(wordsOf(c), name);
+        return ((f.del || f.unknown) && dests.some(homeWord)) || ((f.rm || f.unknown) && sources.some(homeWord)); // (--delete removes what the source lacks at the destination; --remove-source-files removes the sources)
+      }
       // (mv / ln INTO home or a parent writes DIR/basename(SRC), judged below like cp; what they move or link away is a source)
       const dest = MOVERS.has(name) ? destsOf(wordsOf(c), name)[0] : undefined;
       return wordsOf(c).slice(1).some((w) => w !== dest && homeWord(w));
@@ -3917,6 +3947,7 @@ function evaluateBashForFilesFrame(command, opts) {
       if (usesLast(c)) return true; // (T1.7 b)
       if (destsOf(wordsOf(c), name).some(tokenHitAll)) return true;
       if (makesHardLinks(c) && wordsOf(c).some(tokenHitAll)) return true; // (R1-F2: and its sources)
+      if (name === 'rsync') { const f = rsyncFlags(c.argv, ctx); if ((f.rm || f.unknown) && wordsOf(c).some(tokenHitAll)) return true; } // (R4 item 6: --remove-source-files, or an option only known at run time, deletes its sources)
       // (#111: `cp x .review/{state,y}.json` -- the parser keeps only the last expansion as the destination, but a brace form is a family of targets: each expansion is judged as one)
       const bw = braceWordsOf(rawOfCmd(c));
       return (bw.over && ctx.hasReviewDir()) || bw.words.some(tokenHitAll);
