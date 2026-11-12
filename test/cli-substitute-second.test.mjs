@@ -159,6 +159,15 @@ test('quota stop: exit 3 with the substitute packet (tag, header, input path), a
   assert.deepEqual(substituteInventory(w.state()).map((e) => [e.item, e.agent, e.evidence]), [['R1-B1', 'substitute-opus', 'quota'], ['R1-B2', 'substitute-opus', 'quota']]);
 });
 
+test('R1-B4: --ids in any order (not the sorted one) gives the same packet, and applying the substitute answer still matches the stored state', (t) => {
+  const w = world(t);
+  const sub = w.ready('R1-B2,R1-B1');
+  assert.equal(w.ready('R1-B1,R1-B2').tag, sub.tag, 'the packet does not depend on the order the ids were typed in');
+  const r = w.apply(sub.tag, install(w, sub, ['R1-B1', 'R1-B2'], { answer: answerOf(['R1-B1', 'REJECT', 'high'], ['R1-B2', 'ACCEPT', 'medium']) }));
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(w.item('R1-B2').secondReview.by, 'substitute-opus');
+});
+
 test('stricter of two with a substitute: a dismissal below high confidence cannot be dismissed by claude-ruling, only accepted', (t) => {
   const w = world(t, { items: 1 });
   const sub = w.ready('R1-B1');

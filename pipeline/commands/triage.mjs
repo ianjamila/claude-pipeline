@@ -511,7 +511,8 @@ async function secondReview(rest, ctx) {
   for (const k of ['tag', 'projects-dir', 'max-age-ms']) if (values[k] !== undefined) throw new UsageError(`--${k} goes with --apply`);
   const n = intOption(values, 'round', { required: true, min: 1 });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
-  const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean))];
+  // Sorted once, here: the snapshot, the packet id, the prompt and the file names all use this order, and `--apply` rebuilds the items from the sorted ids the route stores (R1-B4).
+  const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean))].sort();
   if (ids.length === 0) throw new UsageError('--ids must name at least one item');
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
@@ -566,7 +567,7 @@ async function secondReview(rest, ctx) {
   const routeFile = routeFileFor(packetId);
   const attempt = await startAttempt({
     root, pr, ctx, round: n, head: asked.head, risk: asked.maxRisk, agent: asked.agent, file: routeFile,
-    extra: { kind: 'second-review', ids: [...ids].sort(), packetId, findingsDigest: asked.snapshot.digest, finalsSha256: sha256(asked.snapshot.finals) },
+    extra: { kind: 'second-review', ids, packetId, findingsDigest: asked.snapshot.digest, finalsSha256: sha256(asked.snapshot.finals) },
   });
   const failAttempt = (final) => finishAttempt({ root, pr, ctx, round: n, attempt, final, files: [], file: routeFile });
   // The repository's slug for the machine-wide Codex record (best effort: null when GitHub cannot say), as codex-review does.
