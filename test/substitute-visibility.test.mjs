@@ -66,3 +66,51 @@ test('triage comment: nothing changes for a PR Codex reviewed throughout, and fr
   const s = stateWith([sub({ resetText: '4:21 PM\n- forged' })]);
   assert.ok(!/^- forged/m.test(triageComment(s)));
 });
+
+// ---- round pile-up stats and the Codex usage line ----------------------------------------------------------------------------------------
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { roundStats } from '../pipeline/lib/round-stats.mjs';
+import { kindOf, summariseUsage } from '../pipeline/lib/codex-usage-kinds.mjs';
+import { run as codexStatus } from '../pipeline/commands/codex-status.mjs';
+
+test('roundStats: items per round by bucket, and how often a finding that was already ruled came back', () => {
+  const it = (id, bucket, fp, final) => ({ id, bucket, fingerprint: fp, final: final ?? null });
+  const s = stateWith([{ items: [it('R1-B1', 'BLOCKING', 'a', { decision: 'REJECT' }), it('R1-S1', 'SUGGESTION', 'b')] }, { items: [it('R2-B1', 'BLOCKING', 'a'), it('R2-S1', 'SUGGESTION', 'b'), it('R2-W1', 'WORTH_CONSIDERING', 'c')] }]);
+  assert.deepEqual(roundStats(s), {
+    rounds: [{ n: 1, items: 2, byBucket: { BLOCKING: 1, SUGGESTION: 1 } }, { n: 2, items: 3, byBucket: { BLOCKING: 1, SUGGESTION: 1, WORTH_CONSIDERING: 1 } }],
+    reRaised: 2, ruledReRaised: 1,
+  });
+  assert.deepEqual(roundStats(null), { rounds: [], reRaised: 0, ruledReRaised: 0 });
+});
+
+test('codex usage: sessions are summed by kind from the prompt header; unknown is `other`; sessions before --since are left out; the line is one line', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'cp-usage-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const day = join(home, 'sessions', '2026', '11', '11');
+  mkdirSync(day, { recursive: true });
+  const session = (name, text, tokens, ts = '2026-11-11T10:00:00Z') => writeFileSync(join(day, name), [
+    { type: 'session_meta', payload: { timestamp: ts } },
+    { type: 'response_item', payload: { role: 'user', content: [{ type: 'input_text', text }] } },
+    { type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: tokens } } } },
+  ].map((e) => JSON.stringify(e)).join('\n'));
+  session('a.jsonl', 'You are an independent reviewer of a pull request.\nReview round: 1', 3_000_000);
+  session('b.jsonl', 'You are an independent reviewer of a pull request.\nReview round: 3', 1_000_000);
+  session('c.jsonl', 'You are an independent second reviewer.', 500_000);
+  session('d.jsonl', 'hello', 100_000);
+  session('e.jsonl', 'You are an independent reviewer of a pull request.\nReview round: 1', 9_000_000, '2026-11-01T10:00:00Z');
+  const u = summariseUsage({ env: { CODEX_HOME: home }, now: Date.parse('2026-11-12T00:00:00Z'), since: '2026-11-10T00:00:00Z' });
+  assert.equal(u.sessions, 4);
+  assert.deepEqual(u.byKind['pipeline round 1'], { sessions: 1, tokens: 3_000_000 });
+  assert.deepEqual(u.byKind['pipeline fix-check'], { sessions: 1, tokens: 1_000_000 });
+  assert.deepEqual(u.byKind['pipeline second review'], { sessions: 1, tokens: 500_000 });
+  assert.deepEqual(u.byKind.other, { sessions: 1, tokens: 100_000 });
+  assert.match(u.line, /^- 2026-11-12 · Codex usage since 2026-11-10 · 4\.6M tokens in 4 sessions · pipeline round 1 3\.0M \(1\)/);
+  assert.ok(!u.line.includes('\n'));
+  assert.equal(kindOf(['no header']), 'other');
+  const cmd = await codexStatus(['--usage', '--since', '2026-11-10T00:00:00Z'], { env: { CODEX_HOME: home }, now: () => Date.parse('2026-11-12T00:00:00Z') });
+  assert.equal(cmd.exitCode, 0);
+  assert.equal(cmd.output.sessions, 4);
+  await assert.rejects(() => codexStatus(['--since', '2026-11-10'], {}), /needs --usage/);
+});
