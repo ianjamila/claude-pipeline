@@ -153,7 +153,7 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
     this machine): a grant already used, or recorded for another head ("ask again"), is exit 2 round-cap; Codex exit 3, head-moved and a kill before the claim
     leave the grant open (a failure after the claim spends it: ask again). Success adds grantUsed:{grantId}; the round records admission and ownerGrant {grantId, k, quote, ownerTs}
     base-only rounds and resolution-only rounds (below) never count toward the cap
-  reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired
+  reviewer: fable (medium/high risk, except medium for size only, or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired
     (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker's brief for the sensitive files; judge otherwise. Once fable, always fable
   confirm fixed: an accepted item that a forced or Claude ruling marked implemented through files other than the one it names (state mark-implemented,
     implementedVia other-files) is listed in the prompt of the next round that runs Codex (not a base-only one), with its original finding fenced as untrusted
@@ -636,8 +636,12 @@ Exit: 0 whenever a level could be computed (it is a report, not a gate) · 2 usa
 Levels: a blocking hard-stop hit, an `ownerMerge` hit (owner_approval: chat) or a `risk.high_risk_paths` match is
 `high`; a report-only (advisory) hit alone is `medium`; size adds `medium` / `high` by `risk.medium_lines`,
 `risk.high_lines`, `risk.medium_files`. The level picks the reviewer after Codex (`codex-review` records it): `low` →
-the judge (Sonnet); `medium` / `high`, or any file on `risk.high_risk_paths` or `review.arbiter_always_paths` → one
-Fable pass per round that rules on every Codex item and reviews the diff itself (`arbiter needed` mode `review`).
+the judge (Sonnet), and so does a `medium` PR that is medium **only for its size** (`sizeOnly`: no hard-stop hit of any kind, blocking, owner-merge,
+report-only or ignored, and no sensitive path; base branch = the default branch) unless `review.size_only_medium_reviewer` is `fable`; other `medium` / `high`,
+or any file on `risk.high_risk_paths` or `review.arbiter_always_paths` → one Fable pass per round that rules on every Codex item and reviews the diff itself
+(`arbiter needed` mode `review`). `risk.ignore_hard_stop_rules` (only `P-path`, `R4-config`; default none) leaves those hits out of the level only. The rating is
+worked out under the working-tree config AND the one committed at the default branch's fork point (stricter wins; an unreadable one means Fable). `P risk`
+adds `sizeOnly`, `drivers`, `reviewer`, `laneReasons` and the lane `note`. A PR that goes from judge to Fable reviews the whole PR in that round.
 
 ## smoke
 

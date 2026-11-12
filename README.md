@@ -3,7 +3,7 @@
 A global **build → verify → review → merge → production check** pipeline for Claude Code. Once a
 repo is onboarded, asking Claude to build or fix something runs the build and review unattended: a
 branch and worktree, the change plus tests, a quick local check, a draft pull request, a cross-model
-review loop (Codex finds, a Sonnet judge triages low-risk PRs, a Fable pass rules on and reviews every medium/high-risk or sensitive PR), then CI (the full proof) on the
+review loop (Codex finds, a Sonnet judge triages low-risk PRs (and medium ones that are medium only for their size; `review.size_only_medium_reviewer`), a Fable pass rules on and reviews every other medium/high-risk or sensitive PR), then CI (the full proof) on the
 exact commit. You merge: the agent hands you the exact merge request and never merges itself. Nothing reaches `main` without proof, and anything sensitive stops for you.
 
 Design: [`docs/specs/2026-10-01-claude-pipeline-design.md`](docs/specs/2026-10-01-claude-pipeline-design.md) ·

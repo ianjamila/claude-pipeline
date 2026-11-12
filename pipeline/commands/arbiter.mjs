@@ -4,7 +4,7 @@
 // rulings count. Anything unproven or unparseable marks every arbitrated item needsHuman: a ruling that cannot be
 // shown to come from the pinned model must not steer the decision.
 //
-// A Fable review round (the round has `fableRequired`: the PR is medium/high risk or touches a sensitive path) is the other
+// A Fable review round (the round has `fableRequired`: the PR is medium/high risk, other than medium for size only, or touches a sensitive path) is the other
 // mode of the same two steps: `needed` ALWAYS sends the round to Fable, even with zero Codex items, with the diff to review
 // (the whole PR the first time, the round's slice after a proven Fable round) pinned by its digest; `apply` also takes
 // Fable's own `findings` as new items. Until a proven pass is applied the round is not clean (triage.mjs#fablePendingRounds),
@@ -17,7 +17,7 @@ import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, reviewPat
 import { baseConfigAt, loadConfig } from '../lib/config.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, expectationOf, fixRoundCandidate } from '../lib/fix-verify.mjs';
-import { assessRisk, reviewLane } from '../lib/risk.mjs';
+import { assessRisk, reviewLane, riskHits } from '../lib/risk.mjs';
 import { claudeCodeStatus } from '../lib/claude-code-version.mjs';
 import { holdsLock } from '../lib/locks.mjs';
 import { floorBypass, floorOutput, floorPauseSeam, floorWaitMs, fableModelsOf, judgeFloor, mayRaiseFloor } from '../lib/floor-proof.mjs';
@@ -291,7 +291,8 @@ async function chooseBrief(state, round, diff, root, { forceFull = false } = {})
     const files = diffFiles(diff.from, round.toHead, { cwd: root });
     for (const [label, config] of configs) {
       const hits = await collectHardStops({ base: diff.from, head: round.toHead, cwd: root, config });
-      if (hits.length > 0) return full(`hard-stop hit in the round range (${label} config)`);
+      // risk.ignore_hard_stop_rules (P-path / R4-config only) lets a repo whose every file is a P-path hit still get the fix-verify brief; every other hit forces the full one.
+      if (riskHits(hits, config).length > 0) return full(`hard-stop hit in the round range (${label} config)`);
       if (reviewLane({ level: 'low', files, config }).sensitivePaths.length > 0) return full(`sensitive path in the round range (${label} config)`);
       const risk = assessRisk({ files, hits, config });
       if (risk.level !== 'low') return full(`the round's own range is ${risk.level} risk (${label} config): ${risk.reasons.join('; ')}`);

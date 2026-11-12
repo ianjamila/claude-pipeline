@@ -746,7 +746,9 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   } else {
     let lowRisk = false;
     try {
-      lowRisk = !ownerGo && loadState(root, { cleanup: false })?.risk === 'low';
+      // Belt and braces: a PR the gate lists any owner-merge item for is never the low-risk path, whatever risk the review state recorded.
+      const noOwnerItems = Number(live?.ownerMerge ?? 0) === 0 && Number(gate?.ownerMerge ?? 0) === 0 && (live?.ownerItems ?? 'none') === 'none';
+      lowRisk = !ownerGo && noOwnerItems && loadState(root, { cleanup: false })?.risk === 'low';
     } catch { /* an unreadable review state is not a low-risk one */ }
     // --owner-go: the live scan's digest, and for protected areas the Areas line to print right above the Head line (areas: that line, areaIds: the ids).
     if (!lowRisk) {
