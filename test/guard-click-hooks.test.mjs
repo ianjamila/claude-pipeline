@@ -412,3 +412,48 @@ test('R5-B1, R5-F1: a code option does not prove the program is not on stdin: -c
     `echo ".claude/settings.json" | perl -w -e 'print 1'`,
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
+
+// ---- round 6 (R6-B1, R6-F1) ------------------------------------------------------------------------------------------------------------
+
+test('R6-B1, R6-F1: a program on stdin named by a path or a program-file option (awk -E - / -f - / -bf -, python3 /dev/stdin, node -r /dev/stdin, LUA_INIT=@/dev/stdin) is scanned', () => {
+  const py = "import os; os.link('/tmp/payload','.claude/settings.local.json')";
+  const js = "require('fs').linkSync('/tmp/payload','.claude/settings.local.json')";
+  const lua = "os.execute('ln /tmp/payload .claude/settings.local.json')";
+  const pl = "link '/tmp/payload','.claude/settings.local.json';";
+  const awk = 'BEGIN { system("ln /tmp/payload .claude/settings.local.json") }';
+  const rb = "File.link('/tmp/payload','.claude/settings.local.json')";
+  const failures = [];
+  for (const cmd of [
+    `echo '${awk}' | awk -E -`,
+    `echo '${awk}' | gawk -E -`,
+    `echo '${awk}' | awk --exec -`,
+    `echo '${awk}' | awk --fi -`,
+    `echo '${awk}' | awk --exe -`,
+    `echo '${awk}' | awk -bf -`,
+    `echo '${awk}' | awk -f -`,
+    `echo '${awk}' | awk -f /dev/stdin`,
+    `echo '${awk}' | awk -f /dev/fd/0`,
+    `echo '${awk}' | awk --file=/dev/stdin`,
+    `echo '${awk}' | gawk -i /dev/stdin 'BEGIN{}'`,
+    `echo "${py}" | python3 /dev/stdin`,
+    `echo "${py}" | python3 /dev/fd/0`,
+    `echo "${py}" | python3 /proc/self/fd/0`,
+    `echo "${pl}" | perl /dev/stdin`,
+    `echo "${rb}" | ruby /dev/stdin`,
+    `echo "${js}" | node /dev/stdin`,
+    `echo "${lua}" | lua /dev/stdin`,
+    `echo "${js}" | node -r /dev/stdin -e 0`,
+    `echo "${js}" | node --require=/dev/stdin -e 0`,
+    `echo "${js}" | node --import=/dev/stdin -e 0`,
+    `echo "${js}" | node --loader /dev/fd/0 -e 0`,
+    `echo "${lua}" | LUA_INIT=@/dev/stdin lua -e ''`,
+    `echo "${lua}" | LUA_INIT=/dev/stdin lua -e ''`,
+  ]) if (bash(cmd) !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these lines were not refused');
+  for (const cmd of [
+    `echo ".claude/settings.json" | awk '{print}'`,
+    `echo ".claude/settings.json" | python3 -E -c 'import sys; print(sys.stdin.read())'`,
+    `echo ".claude/settings.json" | python3 /tmp/after.py`,
+    `node -r fs -e "console.log(1)"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});

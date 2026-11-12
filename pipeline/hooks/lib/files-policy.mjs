@@ -23,8 +23,8 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
-import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
+import { STDIN_FILES, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, awkStdinProgram, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
 const posix = path.posix;
@@ -1720,17 +1720,23 @@ const CODE_WALK = [
   [/^Rscript$/, /^-e(.*)$/s, /^--(?:verbose|vanilla|no-environ|no-site-file|no-init-file|no-restore|no-save|quiet|silent|slave)$/, null, /^-$/],
   [/^php$/, /^-r(.*)$/s, /^-[nqCH]$/, null, /^(?:-|-a|--interactive)$/],
 ];
+// (R6-B1, R6-F1) A word that names stdin as a file: `-`, /dev/stdin, /dev/fd/0, /proc/self/fd/0 (the parser's own list), or an option / assignment value of that kind (`--require=/dev/stdin`, `=@/dev/stdin`)
+const STDIN_PATH_TAIL = [...STDIN_FILES].filter((f) => f !== '-').map((f) => f.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')).join('|');
+const STDIN_WORD = (a) => STDIN_FILES.has(a) || new RegExp(`=@?(?:${STDIN_PATH_TAIL})$`).test(a);
+// (an assignment anywhere on the line whose value holds such a path -- `LUA_INIT=@/dev/stdin lua -e ''` -- lets the interpreter read its startup code from stdin)
+const STDIN_ASSIGN = new RegExp(`(?:^|[^\\w])[A-Za-z_][A-Za-z0-9_]*\\+?=[^\\s]*(?:${STDIN_PATH_TAIL})`);
 function programInArgv(argv, line = '') {
+  if (STDIN_ASSIGN.test(line)) return false;
   const runners = argv.map((w, i) => [baseOf(w), i]).filter(([b]) => INLINE_RUNNERS.test(b));
   return runners.length > 0 && runners.every(([b, i]) => {
     const rest = argv.slice(i + 1);
-    if (/^(?:awk|gawk|mawk|nawk)$/.test(b)) return !rest.some((a) => /^(?:-f|--file)/.test(a));
+    if (/^(?:awk|gawk|mawk|nawk)$/.test(b)) return !awkStdinProgram(rest) && !rest.some((a) => /^(?:-f|--file)/.test(a));
     if (b === 'deno') return rest[0] === 'eval' && rest.length > 1;
     const row = CODE_WALK.find(([name]) => name.test(b));
     if (row === undefined) return false;
     const [, code, plain, valueOpt, onStdinWord] = row;
     if (/^python/.test(b) && /PYTHONINSPECT/i.test(line)) return false;
-    if (rest.some((a) => onStdinWord.test(a) && !code.test(a))) return false;
+    if (rest.some((a) => (onStdinWord.test(a) && !code.test(a)) || STDIN_WORD(a))) return false;
     for (let k = 0; k < rest.length; k++) {
       const m = code.exec(rest[k]);
       if (m !== null) return (m[1] ?? '') !== '' || k + 1 < rest.length;
@@ -1746,13 +1752,13 @@ function runsInlineCode(c, ctx) {
     if (!INLINE_RUNNERS.test(baseOf(w))) return false;
     const rest = c.argv.slice(i + 1);
     // (a program text next to -f -- gawk -e / --source / -E / --exec -- is inline code too; so is an include / load of a library)
-    if (/^(?:awk|gawk|mawk|nawk)$/.test(baseOf(w))) return !rest.some((a) => /^(?:-f|--file)/.test(a)) || rest.some((a) => /^(?:-[eEil]|--(?:source|exec|include|load))/.test(a));
+    if (/^(?:awk|gawk|mawk|nawk)$/.test(baseOf(w))) return !rest.some((a) => /^(?:-f|--file)/.test(a)) || rest.some((a) => /^(?:-[eEil]|--(?:source|exec|include|load))/.test(a)) || awkStdinProgram(rest);
     if (baseOf(w) === 'deno' && rest[0] === 'eval') return true;
     // (fail closed: any word that is a code option, attached or not (`-e'..'`, `-cprint(1)`, `--eval`), no file operand, or an option we do not know before the first operand
     // (it may take a value, so what follows is not known to be the file: `node -r x.js -e ..`, `perl -I lib -e ..`, `python3 -W ignore -c ..`))
     if (rest.some((a) => /^--(?:eval|print|exec)(?:=|$)/.test(a) || /^-[A-Za-z]*[ecEprR]/.test(a))) return true;
     const file = rest.findIndex((a) => !a.startsWith('-') || a === '-');
-    return file < 0 || rest[file] === '-' || rest.slice(0, file).some((a) => !BENIGN_INTERP_OPTS.test(a));
+    return file < 0 || STDIN_FILES.has(rest[file]) || rest.slice(0, file).some((a) => !BENIGN_INTERP_OPTS.test(a));
   });
 }
 // Why: a cd whose target cannot be named from its words: `cd -` (OLDPWD), `popd`, a bare `pushd`, `pushd +1`, several operands (a brace list the parser split; zsh `cd old new`),
