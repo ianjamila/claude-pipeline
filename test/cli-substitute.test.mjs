@@ -4,7 +4,7 @@
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { roundWorld, findingsOf, low } from './helpers/round-world.mjs';
@@ -33,7 +33,7 @@ function world(t, opts = {}) {
   w.editRoute = (fn, round = 1) => { const r = w.route(round); fn(r); writeFileSync(w.routeFile(round), JSON.stringify(r, null, 2)); };
   w.attempts = (round = 1) => JSON.parse(readFileSync(join(w.dir(round), 'substitute-attempts.json'), 'utf8'));
   w.prepare = (round = 1) => w.cli(['substitute', 'prepare', '--pr', '7', '--round', String(round)]);
-  w.apply = (projects, extra = []) => w.cli(['substitute', 'apply', '--pr', '7', '--round', '1', '--projects-dir', projects, ...extra]);
+  w.apply = (projects, extra = [], round = 1) => w.cli(['substitute', 'apply', '--pr', '7', '--round', String(round), '--projects-dir', projects, ...extra]);
   // Codex quota stop + prepare: the printed prepare result
   w.ready = () => {
     assertExit(w.run(), 3);
@@ -240,13 +240,18 @@ function usageHome(w, p, name = 'gov-home') {
   return home;
 }
 
-// Round 1 recorded by Codex, then a small round 2 that the weekly governor withholds (95 % used): route.json is codex-review's OWN governor record. -> the round 2 tail commit.
-function governorRound(w) {
-  const home = usageHome(w, 95);
+// Round 1 recorded by Codex, then one small commit on top of it (the range of a round 2). -> that commit.
+function smallFixAfterRound1(w) {
   const first = w.codex(1, findingsOf([], []));
   assertExit(first, 0, first.stdout + first.stderr);
   w.repo.write('src/a.js', readFileSync(join(w.repo.dir, 'src', 'a.js'), 'utf8').replace('compute(x.y)', 'compute(x.z)'));
-  const small = w.repo.commit('small tweak');
+  return w.repo.commit('small tweak');
+}
+
+// A small round 2 that the weekly governor withholds (95 % used): route.json is codex-review's OWN governor record.
+function governorRound(w) {
+  const home = usageHome(w, 95);
+  const small = smallFixAfterRound1(w);
   const r = w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', small, '--effort', 'high'], { PIPELINE_CODEX_HOME: home });
   assertExit(r, 3, r.stdout + r.stderr);
   assert.equal(r.json.substitute.evidence, 'governor');
@@ -274,6 +279,74 @@ test('R1-F2 / R2-B1: governor evidence written by codex-review expires: a readin
     passed(prep2());
     passed(prep2({ PIPELINE_CODEX_HOME: home }));
   }
+});
+
+test('#331: an evidence-kind flip or a moved worktree changes the packet text but not the content: the attempt counter, the invalid count and the tag stay', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  install(w, prep, { agentId: 'a1', models: ['claude-sonnet-4-6'] });
+  assertExit(w.apply(w.projects), 1); // attempt 1 is recorded invalid (counts)
+  // the same range, now withheld by the governor instead of a quota stop: the packet text differs ("Codex evidence ...")
+  w.editRoute((r) => { r.evidence = 'governor'; r.governor = { usedPct: 95, soft: 75, threshold: 90, observedAt: new Date().toISOString() }; r.at = new Date().toISOString(); });
+  const flipped = w.prepare();
+  assertExit(flipped, 0, flipped.stdout + flipped.stderr);
+  assert.notEqual(flipped.json.digest, prep.digest, 'the packet differs');
+  assert.equal(flipped.json.attempt, 2, 'the invalid attempt still counts: not a fresh attempt 1');
+  assert.equal(flipped.json.tag, `${prep.tag} a2`, 'same tag lineage');
+  assert.deepEqual(w.attempts().attempts.map((a) => [a.k, a.status]), [[1, 'invalid'], [2, 'prepared']]);
+  install(w, flipped.json, { agentId: 'b1', models: ['claude-sonnet-4-6'] });
+  assertExit(w.apply(w.projects), 1);
+  // a moved worktree (the exported files have other absolute paths): the cap still holds
+  const oldDir = w.repo.dir;
+  const movedDir = join(w.scratch, 'moved-checkout');
+  renameSync(oldDir, movedDir);
+  w.repo.dir = movedDir;
+  try {
+    const exhausted = w.prepare();
+    assertExit(exhausted, 1, exhausted.stdout + exhausted.stderr);
+    assert.equal(exhausted.json.error, 'attempts-exhausted');
+  } finally {
+    renameSync(movedDir, oldDir);
+    w.repo.dir = oldDir;
+  }
+});
+
+test('#331: a moved worktree on an OPEN attempt is the same attempt (same tag, rewritten files), not a fresh attempt 1', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const oldDir = w.repo.dir;
+  const movedDir = join(w.scratch, 'moved-checkout');
+  renameSync(oldDir, movedDir);
+  w.repo.dir = movedDir;
+  try {
+    const again = w.prepare();
+    assertExit(again, 0, again.stdout + again.stderr);
+    assert.notEqual(again.json.digest, prep.digest, 'the paths are in the packet');
+    assert.equal(again.json.tag, prep.tag);
+    assert.equal(again.json.attempt, 1);
+    assert.equal(w.attempts().attempts.length, 1);
+  } finally {
+    renameSync(movedDir, oldDir);
+    w.repo.dir = oldDir;
+  }
+});
+
+test('R2-F1: state discard-round moves the attempts away with the round: the next prepare gets a tag no earlier transcript carries', (t) => {
+  const w = world(t);
+  const small = smallFixAfterRound1(w);
+  const run2 = () => w.run(2, w.quota(), { from: w.head, to: small });
+  assertExit(run2(), 3);
+  const first = w.prepare(2);
+  assertExit(first, 0, first.stdout + first.stderr);
+  install(w, first.json, { agentId: 'old' }); // an agent ran under the tag, then the session was lost before apply
+  assertExit(w.cli(['state', 'discard-round', '--round', '2', '--pr', '7']), 0);
+  assertExit(run2(), 3);
+  const second = w.prepare(2);
+  assertExit(second, 0, second.stdout + second.stderr);
+  assert.equal(second.json.attempt, 1);
+  assert.notEqual(second.json.tag, first.json.tag, 'the old transcript is not under this tag');
+  const r = w.apply(install(w, second.json, { agentId: 'new' }), [], 2);
+  assertExit(r, 0, r.stdout + r.stderr); // one transcript under the tag: not rerolled
 });
 
 test('apply: no transcript with the tag is exit 2 not-found and records nothing; no prepared attempt is no-prepare', (t) => {

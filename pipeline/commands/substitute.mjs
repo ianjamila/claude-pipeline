@@ -5,6 +5,7 @@
 // (lib/review-round.mjs). Anything unproven or unparseable records the attempt as invalid and records nothing: a review that cannot be shown to come from the
 // pinned model must never read as "nothing found". The model, effort, agent-type, floor and final-answer proofs are the arbiter's (lib/transcript.mjs,
 // lib/floor-proof.mjs), not copies of them.
+import { randomBytes } from 'node:crypto';
 import { readFileSync, rmSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
@@ -27,10 +28,10 @@ export const meta = {
   usage: [
     'pipeline substitute prepare --pr N --round R [--repo DIR]',
     '  -> {ok, round, agent, tag, promptHeader, inputPath, digest, digest8, attempt, evidence, files, bytes}',
-    '  agent: substitute-opus (the PR\'s highest risk, ever, is low or medium) or substitute-fable (it was ever high); the tag is `pipeline-substitute R<R> <digest8>` (`... a<k>` for attempt k > 1)',
+    '  agent: substitute-opus (the PR\'s highest risk, ever, is low or medium) or substitute-fable (it was ever high); the tag is `pipeline-substitute R<R> <id8>` (`... a<k>` for attempt k > 1; id8 is minted when the attempts record of the round is created, so it survives a new codex-review attempt, an evidence kind or path change, and is new after `state discard-round`)',
     '  needs the evidence of THIS round: .review/round-R/route.json from a codex-review attempt that ended with evidence quota (Codex\'s own usage-limit stop), budget or governor (a small fix-check',
     '    Codex was not run for), for the same attempt, round, base, head and patch digest (and, for quota, the same Codex prompt digest); the checked-out HEAD must be that head;',
-    '    review.substitute.mode is not off; a quota stop with a reset time is evidence only until that time (a stop with none: 2 hours): the reset is judged HERE and nowhere else (apply does not re-judge it); governor evidence is re-checked here too (the weekly figure must still be at or above the hard limit, else an evidence older than 6 h with no readable figure) and the attempts are kept per packet (a new codex-review attempt for unchanged content neither resets them nor changes the tag)',
+    '    review.substitute.mode is not off; a quota stop with a reset time is evidence only until that time (a stop with none: 2 hours): the reset is judged HERE and nowhere else (apply does not re-judge it); governor evidence is re-checked here too (the weekly figure must still be at or above the hard limit, else an evidence older than 6 h with no readable figure) and the attempts are kept per round content (round, base, head, patch digest: a new codex-review attempt, another evidence kind or a moved worktree neither resets the attempt counter / the two-invalid cap nor changes the tag)',
     '  refuses (exit 1) no-route | no-evidence (route.json holds pending / none) | route-mismatch | agent-changed | mode-off | reset-passed (run codex-review again) |',
     '    packet-too-large (the evidence passes review.substitute.max_packet_mb: not eligible, park as without a substitute) | attempts-exhausted (two invalid attempts) | new-attempt-not-allowed;',
     '    exit 2 for the shared round admission: round-order, state-pr-mismatch, base-mismatch (a whole-PR round owed after an Opus substitute round must start at the merge base), round-cap, empty-range, head-moved',
@@ -75,16 +76,20 @@ const sub = (root, round) => path.join(roundDir(root, round), SUBSTITUTE_DIR);
 const inputPathOf = (root, round) => path.join(roundDir(root, round), INPUT_FILE);
 const attemptsPathOf = (root, round) => path.join(roundDir(root, round), ATTEMPTS_FILE);
 
-// ---- the attempts of one Codex attempt's evidence ---------------------------------------------------------------------------------------------
+// ---- the attempts at one round's content ------------------------------------------------------------------------------------------------------
 
-// Keyed by the PACKET (its digest covers the round, range, prompt, exported files and evidence kind), not by the Codex attempt: a fresh codex-review attempt for unchanged content
-// must neither reset the two-invalid cap nor mint a new tag, or the first review could be re-rolled until its answer pleased (R1-F1). Changed content is a new packet.
-function readAttempts(root, round, packetDigest) {
+// Keyed by the CONTENT of the round - its number, base, head and patch digest - not by the Codex attempt and not by the packet text. A fresh codex-review attempt for unchanged
+// content must neither reset the two-invalid cap nor mint a new tag, or the first review could be re-rolled until its answer pleased (R1-F1); and the packet text also holds
+// things that change without the content (the evidence kind, the absolute paths of the exported files), which must not reset it either (#331). Changed content is a new record.
+// The tag carries a `lineage` minted when the record is created, not a digest of the packet: the record lives in the round folder, so `state discard-round` takes it away with the
+// round, and the next record's tag then differs from any transcript the discarded one left behind (a second agent under an old tag would be rejected as rerolled).
+const identityOf = (round, route) => sha256(JSON.stringify([round, route.base, route.head, route.patchSha256]));
+function readAttempts(root, round, identity) {
   try {
     const parsed = JSON.parse(readFileSync(attemptsPathOf(root, round), 'utf8'));
-    if (parsed && parsed.packetDigest === packetDigest && Array.isArray(parsed.attempts)) return parsed;
+    if (parsed && parsed.identity === identity && /^[0-9a-f]{8}$/.test(parsed.lineage ?? '') && Array.isArray(parsed.attempts)) return parsed;
   } catch { /* none, or unreadable: start fresh */ }
-  return { packetDigest, attempts: [] };
+  return { identity, lineage: randomBytes(4).toString('hex'), attempts: [] };
 }
 const saveAttempts = (root, round, record) => writeJson(attemptsPathOf(root, round), record);
 // Invalid attempts that count against the two: a restartRequired failure (an older terminal) is not the agent's fault.
@@ -204,7 +209,7 @@ function buildPacket(adm, route, root, maxBytes) {
   return { prompt, promptSha256: sha256(prompt), files, body, digest, text: `ROUND: ${adm.round}\nINPUT-DIGEST: ${digest}\n\n${body}`, bytes, dir };
 }
 
-const tagFor = (round, digest, k) => `pipeline-substitute R${round} ${digest.slice(0, 8)}${k > 1 ? ` a${k}` : ''}`;
+const tagFor = (round, lineage, k) => `pipeline-substitute R${round} ${lineage}${k > 1 ? ` a${k}` : ''}`;
 const headerFor = (round, digest) => `ROUND: ${round}\nINPUT-DIGEST: ${digest}`;
 const firstPromptFor = (round, digest, inputPath) => `${headerFor(round, digest)}\nRead ${inputPath} and review the pull request.\n`;
 
@@ -231,7 +236,7 @@ async function prepareLocked({ root, pr, round, ctx }) {
   checkReset(route, Date.now(), ctx.env);
 
   // The attempt: the first, the open one again, or the next one after a recorded invalid.
-  const record = readAttempts(root, round, packet.digest);
+  const record = readAttempts(root, round, identityOf(round, route));
   const last = record.attempts.at(-1);
   let k;
   if (last === undefined) {
@@ -244,7 +249,7 @@ async function prepareLocked({ root, pr, round, ctx }) {
   } else {
     throw refuse('new-attempt-not-allowed', `attempt ${last.k} is ${last.status}: a new attempt needs the previous one recorded invalid`);
   }
-  const tag = tagFor(round, packet.digest, k);
+  const tag = tagFor(round, record.lineage, k);
   const inputPath = inputPathOf(root, round);
 
   rmSync(sub(root, round), { recursive: true, force: true });
@@ -255,7 +260,7 @@ async function prepareLocked({ root, pr, round, ctx }) {
   }
   writeFileAtomic(inputPath, packet.text);
   const entry = { k, tag, digest: packet.digest, agent, status: 'prepared', preparedAt: new Date().toISOString() };
-  saveAttempts(root, round, { packetDigest: packet.digest, attempts: [...record.attempts.filter((a) => a.k !== k), entry].sort((a, b) => a.k - b.k) });
+  saveAttempts(root, round, { identity: record.identity, lineage: record.lineage, attempts: [...record.attempts.filter((a) => a.k !== k), entry].sort((a, b) => a.k - b.k) });
   return {
     exitCode: EXIT.OK,
     output: {
@@ -304,8 +309,8 @@ async function applyLocked({ root, pr, round, ctx, givenTag, projectsDir, maxAge
   if (adm.baseOnly) throw refuse('base-only', `round ${round} only merges the base branch in: nothing for a reviewer to ask`);
   const packet = buildPacket(adm, route, root, config.review.substitute.max_packet_mb * 1024 * 1024);
   const agent = checkAgainstRound(route, adm, packet, root);
-  // The open attempt is found by the packet just built (attempts are kept per packet, not per Codex attempt).
-  const record = readAttempts(root, round, packet.digest);
+  // The open attempt is found by the round's content (attempts are kept per content, not per Codex attempt or packet text).
+  const record = readAttempts(root, round, identityOf(round, route));
   const open = record.attempts.find((a) => a.status === 'prepared');
   if (open === undefined) throw usageFail('no-prepare', `round ${round} has no open substitute attempt for this evidence: run \`pipeline substitute prepare\` first`);
   if (givenTag !== undefined && givenTag !== open.tag) {
