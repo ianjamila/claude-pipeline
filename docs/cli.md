@@ -182,6 +182,8 @@ pipeline comment --pr N --kind triage|summary|needs-human|blocked|awaiting-revie
   (exit 1 {ok:false, error:'stale-publication', reason}) when the PR holds a state this copy neither published nor restored: run `pipeline state show --pr N`
   and redo the decision; {action:'unchanged'} when the PR already holds exactly this state. The other kinds take no lock.
   --kind blocked renders the verify report's failure; with --reason TEXT it renders a "the review stopped: TEXT" comment instead (no report needed), e.g. the advice of a stop that waits for a terminal restart.
+  --kind needs-human adds, when a review state with at least one round exists for this PR, a short status block under the paragraph: rounds, booked cost (with the last round's share),
+  open items with their severity and why the review is not clean (the extra-round ask's text without its recommendation). Display only: a part that cannot be read becomes a "not available" line; the comment is always written.
 ```
 
 Exit: 0 comment posted/updated · 2 usage · 3 GitHub (`gh`) unavailable.

@@ -88,10 +88,11 @@ const sentence = (s) => {
   return t === '' ? t : `${t[0].toUpperCase()}${t.slice(1)}${/[.!?]$/.test(t) ? '' : '.'}`;
 };
 
-// The plain-English block the agent pastes above the closing line, and the one-sentence why. `follow` = deferEligibility's answer.
-export function askSummary({ rounds, cost, open, notClean, follow, discard }) {
+// The status lines the ask and the park comment share: Rounds, Booked agent cost, Open (with severity), Not clean because. `asking` (the ask) adds "this would be round N" to the
+// Rounds line; the park comment is not asking for a round and leaves it out.
+export function statusLines({ rounds, cost, open, notClean, asking = true }) {
   const limit = [`limit ${rounds.max ?? 'none'}`, rounds.autoExtraUsed ? 'the automatic extra round' : null, rounds.ownerGranted > 0 ? plural(rounds.ownerGranted, 'owner-granted round') : null].filter(Boolean).join(' + ');
-  const lines = [`Rounds: ${rounds.reviewed} reviewed (${limit}); this would be round ${rounds.next}.`];
+  const lines = [`Rounds: ${rounds.reviewed} reviewed (${limit})${asking ? `; this would be round ${rounds.next}` : ''}.`];
   lines.push(cost === null
     ? 'Booked agent cost so far: not available.'
     : `Booked agent cost so far: ${usd(cost.bookedUsd)}, review ${usd(cost.reviewUsd)}${costDetail(cost)}.`);
@@ -103,6 +104,12 @@ export function askSummary({ rounds, cost, open, notClean, follow, discard }) {
     lines.push(`Open: ${shown.join(', ')}${open.length > SHOWN ? `, and ${open.length - SHOWN} more` : ''}: ${verdict}.`);
   }
   if (notClean.length > 0) lines.push(`Not clean because: ${notClean.join('; ')}.`);
+  return lines;
+}
+
+// The plain-English block the agent pastes above the closing line, and the one-sentence why. `follow` = deferEligibility's answer.
+export function askSummary({ rounds, cost, open, notClean, follow, discard }) {
+  const lines = statusLines({ rounds, cost, open, notClean });
   if (follow.eligible) {
     lines.push(`Recommendation: file them as follow-up issues and merge what was reviewed (say "follow up"), or type "extra round". Following up takes out ${plural(discard.count, 'commit')} made since the last review (listed under discard): the fixes and anything else in them.`);
   } else {

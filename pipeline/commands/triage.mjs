@@ -14,14 +14,13 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
-import { diffFiles, git, headSha, isAncestor, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
-import { diffStats } from '../lib/diff.mjs';
+import { git, headSha, isAncestor, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
-import { readSummaryComment } from '../lib/summary-comment.mjs';
-import { askSummary, costFrom, notCleanReasons, openItems, roundsFrom } from '../lib/round-ask.mjs';
+import { askSummary } from '../lib/round-ask.mjs';
+import { gatherRoundStatus, reviewedDiff } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
@@ -29,7 +28,7 @@ import {
   isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, rulingContentDigest, secondReviewRefusal, settleSecondReview, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
-  currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, reviewBaseRef, withStateLock, writeFileAtomic, writeJson,
+  currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
 import { establishBaseline, publishTriage } from '../lib/review-publish.mjs';
 
@@ -648,58 +647,10 @@ async function roundRequest(rest, ctx) {
   }, pr));
 }
 
-// The files of the PR's reviewed diff (the last round's head against where the branch forked from the default branch): what a finding's location must resolve to.
-// null (and a warning from the caller) when it cannot be read. Throws on nothing the caller needs to handle.
-function reviewedDiff(root, config, state) {
-  const toHead = state.rounds.at(-1)?.toHead;
-  if (typeof toHead !== 'string' || toHead === '') return { files: null, problem: 'the last round records no head' };
-  try {
-    return { files: diffFiles(reviewBaseRef(root, config), revParse(toHead, { cwd: root }), { cwd: root }), problem: null };
-  } catch (err) {
-    return { files: null, problem: asciiLine(err?.message, 160) };
-  }
-}
-
-// The commits since the last reviewed head (what deferring would take out), and, when nothing explains them as fixes, how much changed.
-function sinceLastReview(root, config, state, { withChanges }) {
-  const anchor = state.rounds.at(-1)?.toHead;
-  const none = { anchor: null, count: 0, commits: [], changed: null };
-  if (typeof anchor !== 'string' || anchor === '') return none;
-  const o = { cwd: root };
-  const full = revParse(anchor, o);
-  const log = git(['log', '--format=%h %s', `${full}..HEAD`], o).split('\n').filter(Boolean);
-  let changed = null;
-  if (withChanges && log.length > 0) {
-    const files = diffFiles(full, 'HEAD', o).filter((f) => f.path !== config.agent_log && f.newPath !== config.agent_log);
-    changed = { commits: log.length, files: files.length, lines: diffStats(files).changedLines };
-  }
-  return { anchor: full.slice(0, 12), count: log.length, commits: log.slice(0, 20).map((l) => asciiLine(l, 100)), changed };
-}
-
 // The display fields of the ask. `grants` is the same lookup the admission check used (any head); `grantGap` says why it found nothing ('provenance' = a record exists that cannot be
 // confirmed as the owner's). A lookup that fails here degrades to a warning and the extra-round recommendation: it never loses the ask (`defer-fixes` itself refuses on it).
 function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, warnings }) {
-  refreshBaseRef(root, config);
-  const hash = currentContentHash(root, config);
-  const outcome = roundOutcome({ ...state, currentContentHash: hash });
-  const rounds = roundsFrom(state);
-  let cost = null;
-  try {
-    const found = readSummaryComment(gh, pr);
-    cost = found.status === 'ok' ? costFrom(found.record, rounds.reviewed, state) : null;
-    if (cost === null) warnings.push(found.status === 'ok' ? 'the run record holds no booked cost yet' : `no usable run record on the PR (${found.status}): cost not shown`);
-  } catch (err) {
-    warnings.push(`the booked cost could not be read (${asciiLine(err?.message, 120)})`);
-  }
-  const diff = reviewedDiff(root, config, state);
-  if (diff.problem) warnings.push(`the reviewed diff could not be read (${diff.problem}): every open item is shown as high`);
-  let since = { anchor: null, count: 0, commits: [], changed: null };
-  try {
-    since = sinceLastReview(root, config, state, { withChanges: !outcome.coverageValid && outcome.newAccepted.length === 0 });
-  } catch (err) {
-    warnings.push(`the commits since the last review could not be listed (${asciiLine(err?.message, 120)})`);
-  }
-  const open = openItems(state, outcome, { config, files: diff.files }, warnings);
+  const { rounds, cost, diff, since, open, notClean } = gatherRoundStatus({ root, config, state, pr, gh, warnings });
   let follow;
   try {
     const readable = (lookup) => (ordinal) => {
@@ -717,7 +668,6 @@ function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, w
     if (!warnings.some((w) => w.startsWith('severity could not be judged'))) warnings.push(follow.refusals[0]);
   }
   if (follow.eligible && since.anchor === null) follow = { ...follow, eligible: false, refusals: ['the commits since the last review could not be listed'] };
-  const notClean = notCleanReasons(outcome, since.changed);
   const discard = { anchor: since.anchor, count: since.count, commits: since.commits };
   const { summary, why } = askSummary({ rounds, cost, open, notClean, follow, discard });
   return { rounds, cost, open, notClean, recommend: follow.eligible ? 'follow-up' : 'extra-round', why, discard, summary };
