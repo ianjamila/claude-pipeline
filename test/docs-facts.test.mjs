@@ -191,7 +191,7 @@ test('the review skill sends a quota stop, a withheld round and a second review 
   const merge = read('skills/review/reference/owner-merge.md');
   assert.match(review, /with `substitute\.eligible` ⇒ the substitute path/);
   assert.match(review, /P substitute prepare --pr N --round R/);
-  assert.match(review, /P substitute apply --round R --tag/);
+  assert.match(review, /P substitute apply --pr N --round R --tag/);
   assert.match(review, /BEFORE every codex-review call run it with `--plan`.*`expectedEffort` as `--effort`/);
   assert.match(review, /`nextRound\.base`/);
   assert.match(review, /codex-status --wait/);
