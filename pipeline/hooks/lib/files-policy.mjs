@@ -23,7 +23,7 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -754,11 +754,11 @@ function hookSurfaceBashReason(cmds, frame, ctx, io) {
     for (const [idx, c] of cmds.entries()) {
       const redirects = (c.redirects ?? []).filter((r) => WRITE_OPS.has(r.op) && typeof r.target === 'string' && r.target !== '' && !FD_DUP.test(r.target) && r.target !== '/dev/null').map((r) => r.target);
       const name = c.argv.length > 0 ? baseOf(c.argv[0]) : '';
-      const writer = name !== '' && !notWriter(c.argv) && !isReadOnly(c, ctx);
+      const writer = name !== '' && !NOT_WRITERS.has(name) && !isReadOnly(c, ctx);
       if (!writer && redirects.length === 0) continue;
       let words = [];
       if (writer && !DELETERS.has(name) && !(name === 'git' && GIT_NO_CONTENT.has(gitSubcommand(c.argv)))) {
-        const own = isInterpreterCmd(c.argv) ? c.argv : io.wordsOf(c); // (R9-F3: an interpreter's `-t VALUE` is a word that can be a target, not prose)
+        const own = isInterpreterCmd(c.argv) ? [...c.argv, ...Object.values(c.env ?? {})] : io.wordsOf(c); // (R9-F3: an interpreter's `-t VALUE` is a word that can be a target, not prose)
         words = DEST_ONLY.has(name) || MOVERS.has(name) ? destsOf(own, name) : own.slice(1);
       } else if (writer && name === 'git' && GIT_NO_CONTENT.has(gitSubcommand(c.argv))) {
         // (R3-F1) log / show / diff ... write nothing into the tree except through --output: its value is a target
@@ -1565,26 +1565,22 @@ function makeMatchers(ctx) {
 
 // ---- Bash: command classification -----------------------------------------------------------------
 
-const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
-// (#269 R9 security review) `for` / `select` / `case` / `[[` are harmless only as a bare HEADER the parser has already cut the body off: zsh's short loop form keeps the body in the same segment
-// (`for f (x) cp /tmp/p FILE`, `[[ -f a ]] cp /tmp/p FILE`), so these words are never exempt by name. -> the keyword when argv is such a header, else ''.
-const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
-function bareKeywordHeader(argv) {
-  const kw = argv[0];
-  if (kw === 'for' || kw === 'select') {
-    if (argv.length < 2 || !IDENT.test(argv[1])) return ''; // (`for ((..))`, `for a b in ..`: classified as any command)
-    if (argv.length === 2) return kw;
-    if (argv[2] !== 'in') return '';
-    return argv.slice(3).some((w) => /[()]/.test(w) || /^(?:do|then|done|else|elif|fi|esac|\{|\}|end)$/.test(w)) ? '' : kw;
+// (#269 R10-F1) The parser ends a segment at every `&&` / `||` with no `[[` state, so zsh's `if [[ -n a && echo == echo ]] cp x FILE` arrives as the pieces `[[ -n a` and `echo == echo ]] cp x FILE`: the
+// second one would be judged as `echo`. A `]]` that is not the last word of a piece closes a condition: what follows it is the command. The piece is split there into a `[[ .. ]]` header (an ordinary,
+// non-read-only `[[`) and that command, which carries the piece's redirects, prefix assignments and place in the line. Done once per piece, in place (the array keeps the parser's non-enumerable fields).
+function splitCloseBrackets(cmds) {
+  for (let i = 0; i < cmds.length; i++) {
+    const c = cmds[i];
+    const k = c.argv.findIndex((w, j) => w === ']]' && j < c.argv.length - 1);
+    if (k < 0) continue;
+    const clone = (over) => Object.create(Object.getPrototypeOf(c), { ...Object.getOwnPropertyDescriptors(c), ...Object.fromEntries(Object.entries(over).map(([n, value]) => [n, { value, enumerable: true, writable: true, configurable: true }])) });
+    const argv = c.argv[0] === '[[' ? c.argv.slice(0, k + 1) : ['[[', ...c.argv.slice(0, k + 1)];
+    cmds.splice(i, 1, clone({ argv, env: {}, redirects: [], raw: argv.join(' ') }), clone({ argv: c.argv.slice(k + 1) }));
+    i++; // (the command after the `]]` is judged as it is: a later `]]` there is an argument)
   }
-  if (kw === 'case') return (argv.length === 2 || (argv.length === 3 && argv[2] === 'in')) ? kw : '';
-  if (kw === '[[') { // the parser cuts `&&` / `||` apart, so a piece is `[[ words`, `words ]]` or a whole `[[ .. ]]`; a `]]` before the last word is followed by a command
-    const close = argv.indexOf(']]');
-    return close === -1 || close === argv.length - 1 ? kw : '';
-  }
-  return '';
 }
-const notWriter = (argv) => NOT_WRITERS.has(baseOf(argv[0])) || bareKeywordHeader(argv) !== '';
+
+const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
 const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
 const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'set-location', 'sl']);
@@ -1727,17 +1723,24 @@ const VERSION = '(?:[-_]?\\d+(?:\\.\\d+)*)?';
 const INLINE_RUNNERS = new RegExp(`^(?:node|nodejs|deno|bun|tsx|ts-node|python|pypy|ruby|perl|php|lua|luajit|rscript|awk|gawk|mawk|nawk)${VERSION}$`);
 // (#269 R8, owner decision 2026-11-12) Every program that reads and runs text: the inline runners above, the other scripting languages, and the shells. A generous, fail-closed name list.
 const INTERPRETERS = new RegExp(`^(?:node|nodejs|deno|bun|tsx|ts-node|python|pypy|ruby|perl|php|lua|luajit|rscript|r|awk|gawk|mawk|nawk|wish|osascript|jjs|groovy|julia|sh|bash|zsh|dash|ash|ksh|ksh93|mksh|fish|busybox|csh|tcsh)${VERSION}$|^tclsh`);
-// (commands that only print or search their arguments: an interpreter's name among their words is a pattern or a file name, not a program)
-const NEVER_RUNS_ARGS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'echo', 'printf', 'cat', 'ls', 'which', 'type', 'whereis', 'man', 'wc', 'head', 'tail', 'sort', 'uniq', 'tr', 'cut', 'jq', 'diff', 'cmp', 'test', '[', 'stat', 'basename', 'dirname', 'realpath', 'readlink',
-  // (R9-F4) builtins that never run their words: `export P=python3`, `read -r V`, `cd /dev`. `for` / `case` / `select` / `[[` count only as a bare header (bareKeywordHeader); `while` / `if` / `then` / `do` are cut away by the parser
-  'true', 'false', ':', 'cd', 'pushd', 'popd', 'export', 'local', 'declare', 'typeset', 'readonly', 'read', 'hash', 'whence', 'where']);
-// Is this command an interpreter (its name, past any wrapper the parser did not unwrap -- `timeout 5 python3`, `stdbuf -oL node` -- is one of INTERPRETERS), or a command whose name is only known at run time (`$PY`, `${X}`, a glob)?
+// (#269 R10-F6) Is this command an interpreter? Its NAME is judged, not every word: `brew install node`, `nvm use node`, `git switch bash`, `grep python3 f` and `export P=python3` run no interpreter.
+// The name is argv[0] (a name only known at run time -- `$PY`, `${X}`, a backtick, a glob -- counts as one; the builtins `[` and `[[` are literal names, not a glob), or what a wrapper the parser did not unwrap
+// starts: `timeout 5 python3 -`, `stdbuf -oL node`, `sudo -u root bash -s`, `find . -exec sh {} \;`. Past a wrapper an option may take a value (`sudo -u root`, `nice -n 5`), so any word that is an interpreter's
+// name counts, and so does the first word that is not an option when it is only known at run time. `command -v NAME` / `-V` is a lookup, not a run.
+const WRAPPER_CMDS = new Set(['env', 'command', 'builtin', 'exec', 'eval', 'nohup', 'time', 'timeout', 'stdbuf', 'nice', 'ionice', 'sudo', 'doas', 'su', 'xargs', 'chroot', 'setsid', 'unbuffer', 'caffeinate', 'arch', 'taskset', 'chrt', 'strace', 'ltrace', 'watch', 'parallel', 'flock', 'script']);
+const RUNTIME_NAME = /[$`*?[{]/;
 function isInterpreterCmd(argv) {
+  const at = argv.findIndex((w) => !/^[A-Za-z_]\w*=/.test(w)); // (an assignment the parser did not take apart -- `LUA_''INIT=@/dev/stdin lua -e ''` -- is no command name)
+  argv = at < 0 ? [] : argv.slice(at);
   if (!argv.length) return false;
-  if (NEVER_RUNS_ARGS.has(baseOf(argv[0])) || bareKeywordHeader(argv)) return false;
-  if (baseOf(argv[0]) === 'command' && /^-[pP]*[vV]/.test(argv[1] ?? '')) return false; // (`command -v python3` is a lookup; `command python3 -` still runs it)
-  if (/[$`*?[{]/.test(argv[0])) return true;
-  return argv.some((w) => INTERPRETERS.test(baseOf(w)));
+  const name = baseOf(argv[0]);
+  const wrapped = WRAPPER_CMDS.has(name) || (name === 'find' && argv.some((w) => /^-(?:exec|execdir|ok|okdir)$/.test(w)));
+  if (!wrapped) return argv[0] === '[' || argv[0] === '[[' ? false : RUNTIME_NAME.test(argv[0]) || INTERPRETERS.test(name);
+  if (name === 'command' && /^-[pP]*[vV]/.test(argv[1] ?? '')) return false; // (`command -v python3` is a lookup; `command python3 -` still runs it)
+  const rest = argv.slice(1).flatMap((w) => String(w).split(/\s+/)).filter((w) => w !== '');
+  if (rest.some((w) => INTERPRETERS.test(baseOf(w)))) return true;
+  const first = rest.find((w) => !/^-/.test(w) && !/^[A-Za-z_]\w*=/.test(w) && !/^\d+(?:\.\d+)?[smhd]?$/.test(w));
+  return first !== undefined && /^[$`]/.test(first);
 }
 // (R8, owner decision 2026-11-12) The one fed interpreter run that stays allowed: Python's JSON pretty-printer, `python3 -m json.tool` with at most two plain operands (in / out file) and nothing else -- no other option, no operand
 // starting with `-` (`-` is stdin) or holding an expansion -- on a line that mentions no PYTHON* variable, no exec, no coproc and no <( ). It prints what it reads; it never runs it.
@@ -1757,7 +1760,8 @@ function feedInfo(cmds, raw) {
   const lineFeeds = /<|>\(|(?:^|[\s;&|(])=\(|(?<![|])\|(?![|])/.test(raw) || cmds.some((c) => c.sep === '|' || inputRedirect(c) || hasProcSub(c));
   const stdinReplaced = /\bcoproc\b/.test(raw) || cmds.some((c) => baseOf(c.argv[0] ?? '') === 'exec' && (inputRedirect(c) || c.argv.slice(1).some((w) => /^\d*</.test(w)))) || /\bexec\b[^;&|\n]*</.test(raw);
   // (a function definition -- `f() cmd`, `function f ...` -- runs its body wherever the function is called: from a pipe, too)
-  const groupOnLine = /(?:^|[\s;&|(])\{(?:\s|$)/.test(raw) || /(?:^|[\s;&|({])(?:function\s+[\w.:@+-]+|[\w.:@+-]+\s*\(\s*\))/.test(raw);
+  // (R10-F3: any spelling of the name -- `'f'()`, `a,b()`, a non-ASCII one -- is in the parser's own list; the text test is a second signal)
+  const groupOnLine = /(?:^|[\s;&|(])\{(?:\s|$)/.test(raw) || /(?:^|[\s;&|({])(?:function\s+[\w.:@+-]+|[\w.:@+-]+\s*\(\s*\))/.test(raw) || (cmds.fns?.size ?? 0) > 0;
   return (c) => stdinReplaced || c.sep === '|' || inputRedirect(c) || hasProcSub(c)
     || (lineFeeds && (groupOnLine || (c.depth ?? 0) > 0 || (c.grp?.length ?? 0) > 0 || Object.values(c.ctl ?? {}).some(Boolean)));
 }
@@ -1769,7 +1773,7 @@ function lacksOwnProgram(argv) {
   if (i < 0) i = 0; // (a name known only at run time: its words follow it)
   const rest = argv.slice(i + 1);
   if (rest.some((a) => /^--(?:eval|print|exec)(?:=|$)/.test(a) || /^-[A-Za-z]*[ecEprR]/.test(a))) return false;
-  if (rest.length === 1 && /^(?:--version|-V|--help|-h)$/.test(rest[0])) return false;
+  if (rest.length === 1 && /^(?:--version|-v|-VV?|--help|-h)$/.test(rest[0])) return false; // (R10-F6: `node -v`, `python3 -VV` print a version)
   const file = rest.findIndex((a) => !a.startsWith('-') || a === '-');
   return file < 0 || rest[file] === '-';
 }
@@ -2000,7 +2004,7 @@ const makesHardLinks = (c) => {
 const MOVERS = new Set(['mv', 'ln', 'ditto']); // any named protected path counts, and so does DEST/basename(SRC)
 // (zsh's lowercase `cdpath` array is tied to CDPATH: setting either sets both)
 const CDPATH_NAMES = ['CDPATH', 'cdpath'];
-const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', 'source', '.']);
+const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'source', '.']);
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
 const FD_DUP = /^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
@@ -2103,7 +2107,6 @@ function isReadOnly(cmd, ctx) {
   const name = baseOf(argv[0]);
   const args = argv.slice(1);
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
-  if (bareKeywordHeader(argv)) return true;
   if (READ_ONLY.has(name)) return !(name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre=')));
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
   if (name === 'git') return gitReadOnly(args);
@@ -2185,7 +2188,10 @@ function collectVars(cmds, ctx) {
   };
   const pins = ctx.loopPins; // (see loopReadings: the word each loop variable holds in this reading, or null: every one is only known at run time)
   for (const c of cmds) {
-    if (pins !== undefined && c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) {
+    // (#269 R10-F4) A `select NAME` reads its value at run time, and so does a two-word `for NAME` (the parser ends the header there: zsh's `for f (echo FILE) cp x $f` takes its words from the
+    // list that follows, not from "$@"): the name is only known at run time wherever it is used (ctx.unknownVars: a writer that uses it is refused)
+    if ((c.argv[0] === 'select' || (c.argv[0] === 'for' && c.argv.length === 2)) && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) unknown.add(c.argv[1]);
+    else if (pins !== undefined && c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) {
       if (pins === null || !pins.has(c.argv[1])) unknown.add(c.argv[1]); else if (pins.get(c.argv[1]) !== LOOP_NOT_RUN) set(c.argv[1], pins.get(c.argv[1]), true);
     }
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
@@ -3443,6 +3449,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
+  splitCloseBrackets(cmds);
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
   const proseValues = [...prose.values()].flatMap((p) => p.values);
@@ -3471,7 +3478,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // prose only for the protected-file references of a commit message or test name, never for a target or a program text.
     const namesSurface = HOOK_SURFACE_TEXT.test(raw) || cmds.some((c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => HOOK_SURFACE_TEXT.test(String(w))));
     for (const c of cmds) {
-      const text = [...c.argv, ...(c.redirects ?? []).filter((r) => r.op === '<<<').map((r) => r.target ?? '')].join('\n');
+      const text = [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).filter((r) => r.op === '<<<').map((r) => r.target ?? '')].join('\n'); // (R10-F5: `F=.claude/settings.local.json python3 -c '..os.environ["F"]..'`)
       // (R9-F1) an interpreter with no program of its own reads it from stdin: on a line naming such a file it counts as fed whatever the feed looks like
       if (isInterpreterCmd(c.argv) && !jsonToolOnly(c, raw) && (isFed(c) || (namesSurface && lacksOwnProgram(c.argv)))) {
         if (namesSurface || HOOK_SURFACE_TEXT.test(text)) return deny(`input is fed into an interpreter on a line that names a file that can declare hooks; whether the interpreter runs that input as code cannot be checked (${HOOKS_MSG})`);
@@ -3657,6 +3664,10 @@ function evaluateBashForFilesFrame(command, opts) {
     if (anyName) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     if (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-v/.test(a)))) names.push(...bindsOf(cn, c.argv).names);
     names.push(...implicitBindsOf(c)); // (`[[ x =~ y ]]` sets MATCH, a (#m) pattern flag too: see implicitBindsOf)
+    // (#269 R10-F2) What a match or a `select` binds holds a word of the line (`[[ FILE =~ .+ ]] && cp x $MATCH`): only known at run time, so a writer that uses it is refused (unknownVars)
+    if (cn === '[[' || cn === 'select' || [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => String(w).includes('(#'))) {
+      for (const k of cn === 'select' ? ['REPLY', 'reply'] : MATCH_NAMES) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); }
+    }
     if (['declare', 'typeset', 'local'].includes(cn) && c.argv.slice(1).some((a) => /^-[A-Za-z]*n/.test(a))) for (const a of c.argv.slice(1)) { const t = /^[A-Za-z_]\w*=([A-Za-z_]\w*)/.exec(a); if (t) { names.push(t[1]); ctx.declared?.unknown.add(t[1]); } }
     for (const k of names) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); }
   };
@@ -3936,7 +3947,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // Why: below ~/.claude (projects/, skills/other) nothing is protected by name, yet a destination built at run time (`cp x "$V"`, `tee $(echo ../settings.json)`) can climb back to a protected file:
   // refused for every command that is not read-only (FP: a command with a run-time word, run from inside ~/.claude/**)
   if (!insideRoot && opts._writesOnly !== true && dirs.some((d) => ctx.hitTree(d))) {
-    const w = cmds.find((c) => c.argv.length && !notWriter(c.argv) && !isReadOnly(c, ctx) && c.argv.slice(1).some((a) => /[`$]/.test(expandRefs(a, ctx))));
+    const w = cmds.find((c) => c.argv.length && !NOT_WRITERS.has(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && c.argv.slice(1).some((a) => /[`$]/.test(expandRefs(a, ctx))));
     if (w) return deny(`${baseOf(w.argv[0])} is given a name only known at run time inside the protected pipeline tree, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
   }
   // A reference no single command names lives in a heredoc body or in program text the shell parser cut into

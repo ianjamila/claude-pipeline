@@ -841,7 +841,7 @@ export function indirectExpansionOnLine(str, cmds) {
 // substitution (it runs in a subshell). Anything else after the flags (`${(f)F::=x}`, `${(f)F:=x}`, `${(s:$x:)…}`) stays an indirect expansion.
 const SAFE_FLAG_EXPANSION = /\$\{\((?:[@fFuUoOinkvaqQzLcwWt0]|[sj]:[^:$(){}'"`\\]*:)+\)(?=[A-Za-z_]\w*\}|"?\$\()/g;
 // zsh `=~` and the (#b) / (#m) glob flags set these, bash `=~` sets BASH_REMATCH
-const MATCH_NAMES = ['MATCH', 'match', 'MBEGIN', 'MEND', 'mbegin', 'mend', 'BASH_REMATCH'];
+export const MATCH_NAMES = ['MATCH', 'match', 'MBEGIN', 'MEND', 'mbegin', 'mend', 'BASH_REMATCH'];
 // The names a command sets without being given them: `read` REPLY (zsh `read -A`: reply), `select` REPLY, `getopts` OPTARG / OPTIND, `mapfile` MAPFILE,
 // `[[ … =~ … ]]` and a (#…) pattern flag the match names. (Why, #56 Codex recheck of d925d42: `for REPLY in 5; do read <<< 7; gh issue close $REPLY; done`
 // closed issue 7 while the readings judged 5.)

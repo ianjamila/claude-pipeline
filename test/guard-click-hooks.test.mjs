@@ -675,8 +675,6 @@ test('R9: feeds through >( =( and functions, quote-split names on a fed interpre
   assert.deepEqual(failures, [], 'these lines were not refused');
   // R9-F4: [[ ]], loops and builtins that never run their words are not interpreters; wrappers still are
   for (const cmd of [
-    'if [[ -f .claude/settings.json ]]; then jq .hooks .claude/settings.json | head; fi',
-    'for f in ~/.claude/skills/*/SKILL.md; do [[ -s $f ]] && head -3 "$f" | grep name; done',
     'for t in node python3; do which $t; done | cat',
     'for t in node python3; do command -v $t; done | cat; ls .claude/settings.json',
     'type python3 | cat; cat .claude/settings.json',
@@ -722,8 +720,6 @@ test('R9 security review: loop keywords are exempt only as bare headers', () => 
   assert.deepEqual(failures, [], 'these lines were not refused');
   // a bare header (or a header whose body the parser split off) stays harmless
   for (const cmd of [
-    'if [[ -f .claude/settings.json ]]; then jq .hooks .claude/settings.json | head; fi',
-    'for f in ~/.claude/skills/*/SKILL.md; do [[ -s $f ]] && head -3 "$f" | grep name; done',
     'for t in node python3; do which $t; done | cat',
     'for t in node python3; do command -v $t; done | cat; ls .claude/settings.json',
     'type python3 | cat; cat .claude/settings.json',
@@ -733,5 +729,48 @@ test('R9 security review: loop keywords are exempt only as bare headers', () => 
     'for f in .claude/settings.json; do head -3 "$f"; done',
     'for f in a b\ndo head -3 "$f"; done; cat .claude/settings.json',
     '[[ -f a && -s b ]] && head x; ls .claude/settings.json',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// ---- round 10 (R10-F1..F6): the keyword exemptions are gone; a `]]` piece is split; the command NAME is judged; functions, run-time loop / match variables and prefix assignments ----------
+
+test('R10: [[ .. && .. ]] pieces, function definitions, loop / match variables and prefix assignments are refused; version flags and non-command interpreter names are allowed', () => {
+  const py = "import os; os.link('/tmp/payload','.claude/settings.local.json')";
+  const failures = [];
+  const cases = [
+    // R10: refused by the general protected-file rule, as on main; the R9-F4 keyword exemption was reverted (bypasses R10-F1/F2)
+    'if [[ -f .claude/settings.json ]]; then jq .hooks .claude/settings.json | head; fi',
+    'for f in ~/.claude/skills/*/SKILL.md; do [[ -s $f ]] && head -3 "$f" | grep name; done',
+    // R10-F1: the piece after a `&&` / `||` cut inside [[ ]] is `words ]] command`
+    'if [[ -n a && echo == echo ]] cp /tmp/payload ~/.claude/settings.json',
+    `if [[ -n a || echo == echo ]] python3 - <<< "${py}"`,
+    '[[ -n a && cat == cat ]] cp /tmp/payload ~/.claude/hooks/notify.mjs',
+    // R10-F6: the interpreter rule still covers a bare interpreter and every wrapper form
+    ...['python3 -', 'node', 'bash -s', 'command python3 -', 'exec python3', 'env python3', 'env -i python3 -', 'timeout 5 python3 -', '$PY -', 'sudo -u root python3 -', 'nice -n 5 bash -s'].flatMap((prog) => [
+      `${prog}; cat .claude/settings.local.json`,
+      `echo "${py}" | ${prog}; ls .claude/settings.local.json`,
+    ]),
+    // R10-F3: a function whose name the text test cannot read
+    `'f'() python3 -c 'exec(open(0).read())'; echo "${py}" | f`,
+    `a,b() python3 -c 'exec(open(0).read())'; echo "${py}" | a,b`,
+    // R10-F4: the variable of a two-word `for NAME` / of a `select`, and a match binder, are only known at run time
+    'for f (echo ~/.claude/settings.json) cp /tmp/payload $f',
+    'for f (echo .claude/settings.local.json) cp /tmp/payload $f',
+    'select f in ~/.claude/settings.json; do cp /tmp/payload $f; break; done <<< 1',
+    '[[ $HOME/.claude/settings.json =~ .+ ]] && cp /tmp/payload $MATCH',
+    '[[ $HOME/.claude/settings.json =~ .+ ]] && cp /tmp/payload "${BASH_REMATCH[0]}"',
+    // R10-F5: a prefix assignment hands the path to the program
+    'F=.claude/settings.local.json python3 -c \'import os; os.link("/tmp/payload", os.environ["F"])\'',
+  ];
+  for (const cmd of cases) if (bash(cmd) !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these lines were not refused');
+  // R10-F6: a version flag, and an interpreter's name as an ARGUMENT, run nothing
+  for (const cmd of [
+    'node -v && cat .claude/settings.json',
+    'python3 -VV; cat .claude/settings.json',
+    'brew install node; cat .claude/settings.json',
+    'nvm use node; cat .claude/settings.json',
+    'git switch bash; cat .claude/settings.json',
+    'for f in a b; do echo $f; done',
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
