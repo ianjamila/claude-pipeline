@@ -775,6 +775,17 @@ test('R10: [[ .. && .. ]] pieces, function definitions, loop / match variables a
     'for a 1 in x .claude/settings.local.json; do cp /tmp/payload $1; done',
     'foreach 1 (echo ~/.claude/settings.json) cp /tmp/payload $1; end',
     'for a[1] in .claude/settings.local.json; do cp /tmp/payload $a; done',
+    // R13-F2 (owner decision 2026-11-12: text-level refusals): a loop name that is a positional parameter, argv or subscripted cannot be followed by the guard
+    'for 1 in .claude/settings.local.json; do cp /tmp/payload $@; done',
+    'for 1 in .claude/settings.local.json; do cp /tmp/payload "$*"; done',
+    'for 1 in .claude/settings.local.json; do cp /tmp/payload $argv; done',
+    'for argv in .claude/settings.local.json; do cp /tmp/payload $1; done',
+    'for argv[1] in .claude/settings.local.json; do cp /tmp/payload $1; done',
+    'for @ in .claude/settings.local.json; do cp /tmp/payload $1; done',
+    'for * in .claude/settings.local.json; do cp /tmp/payload $1; done',
+    'for ARGV in .claude/settings.local.json; do cp /tmp/payload $1; done',
+    'select 1 in .claude/settings.local.json; do cp /tmp/payload $@; done',
+    'echo ok\nfor 1 in .claude/settings.local.json; do cp /tmp/payload $@; done',
     // R10-F5: a prefix assignment hands the path to the program
     'F=.claude/settings.local.json python3 -c \'import os; os.link("/tmp/payload", os.environ["F"])\'',
   ];
@@ -787,6 +798,8 @@ test('R10: [[ .. && .. ]] pieces, function definitions, loop / match variables a
     'grep python3 f; cat .claude/settings.json',
     'export P=python3; cat .claude/settings.json',
     'for f in a b; do echo $f; done',
+    'for i in 1 2 3; do echo $i; done',
+    'for ((i=0; i<3; i++)); do echo $i; done',
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 
@@ -823,6 +836,34 @@ test('R12-F1: a ]] that is not the last word of a piece, on a line with a [[, is
   ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
   assert.deepEqual(failures, [], 'these R12-F1 lines were not refused');
   for (const cmd of ["grep ']]' notes.md", '[[ -f a ]] && cp a b', 'if [[ -n a ]]; then echo ok; fi']) assert.equal(bash(cmd, {}, '/home/u'), 'allow', cmd);
+});
+
+test('R13-F1: a ]] followed by a word on a line with a [[ is refused when judged as written, even when the parser reads the ]] as a redirect target; quoted and heredoc text is not judged', () => {
+  const failures = [];
+  // R13-F1 (owner decision 2026-11-12: text-level refusals): zsh's <-> / <1-5> number patterns make the parser read `]]` as the target of a redirect
+  for (const cmd of [
+    'if [[ 1 == <-> ]] cd .claude/plans; cp /tmp/payload ../settings.json',
+    'if [[ 1 == <1-5> ]] cd .claude/plans; cp /tmp/payload ../settings.json',
+    'if [[ x == *<-> ]] cd .claude/plans; cp /tmp/payload ../settings.json',
+    '[[ -n a ]] > /tmp/x cd .claude/plans; cp /tmp/payload ../settings.json',
+    '[[ -n a ]] &> /tmp/x cd .claude/plans; cp /tmp/payload ../settings.json',
+    'echo "a" # it is fine\nif [[ 1 == <-> ]] cd .claude/plans; cp /tmp/payload ../settings.json',
+    "echo 'don' # it's fine\nif [[ 1 == <-> ]] cd .claude/plans; cp /tmp/payload ../settings.json",
+    "cat <<'EOF'\nbody\nEOF\nif [[ 1 == <-> ]] cd .claude/plans; cp /tmp/payload ../settings.json",
+    "cat <<EOF\nbody\n\nif [[ 1 == <-> ]] cd .claude/plans; cp /tmp/payload ../settings.json",
+    "echo $((1<<E))\nif [[ 1 == <-> ]] cd .claude/plans; cp /tmp/payload ../settings.json\nE",
+    'if [[ 1 == <-> ]] \\\n cd .claude/plans; cp /tmp/payload ../settings.json',
+    'if [\\\n[ 1 == <-> ]] cd .claude/plans; cp /tmp/payload ../settings.json',
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R13-F1 lines were not refused');
+  for (const cmd of [
+    "grep ']]' notes.md", '[[ -f a ]] && cp a b', 'if [[ -n a ]]; then echo ok; fi', '[[ $x == <-> ]] && echo num', 'echo "[[ a ]] b"',
+    "cat > /tmp/n.md <<'EOF'\nsee [[other-note]] here\nEOF",
+    '[[ -n a ]] # a comment',
+    'if [[ -n a ]]\nthen echo ok\nfi',
+    '[[ -n a ]] || echo no',
+    '[[ -n a ]] | cat',
+  ]) assert.equal(bash(cmd, {}, '/home/u'), 'allow', cmd);
 });
 
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------

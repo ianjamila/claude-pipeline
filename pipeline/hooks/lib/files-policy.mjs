@@ -23,7 +23,7 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+import { simpleCommands, maskLines, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 
@@ -1572,6 +1572,54 @@ function makeMatchers(ctx) {
 function closeBracketNotLast(cmds) {
   if (!cmds.some((c) => c.argv.includes('[['))) return false;
   return cmds.some((c) => c.argv.slice(0, -1).includes(']]'));
+}
+
+// (#269 R13-F1, owner decision 2026-11-12: TEXT-LEVEL refusals) Rounds 11-13 kept finding shapes the parser reads differently from zsh (R13-F1: the number pattern `<->` makes the parser take
+// `]]` for a redirect target, so no argv holds it), so the line is also judged AS WRITTEN. The text is masked (quotes, escapes; heredoc bodies left out; every line: maskLines); on a text with a
+// `[[` word, any `]]` must be followed (after blanks) by `&&` `||` `;` `|` `&` `)` `}` a newline, a comment (`#` after a blank) or the end of the text; `&>` is a redirect, so it is refused.
+// False refusals are accepted (`[[ -f a ]] 2>/dev/null`, `[[ -n ${a[b[1]]} ]]`); the parser-based closeBracketNotLast stays as well.
+const TEST_OPEN = /(?:^|[\s;&|({!])\[\[(?=\s)/;
+function closeBracketFollowedByWord(text) {
+  const m = maskLines(text);
+  if (!TEST_OPEN.test(m)) return false;
+  for (let at = m.indexOf(']]'); at >= 0; at = m.indexOf(']]', at + 1)) {
+    const rest = m.slice(at + 2);
+    const nx = rest.replace(/^[ \t]+/, '');
+    if (nx === '' || /^[\n;|)}]/.test(nx)) continue;
+    if (nx[0] === '&') { if (nx[1] === '>') return true; continue; }
+    if (nx[0] === '#' && nx.length < rest.length) continue;
+    return true;
+  }
+  return false;
+}
+// (#269 R13-F2) A loop name that is a positional parameter (`for 1 in LIST` binds $1, which `$@`, `$*` and `$argv` hold too), `argv`, or a subscripted / odd word cannot be followed by the guard (the
+// writer rule finds names with \w+): refuse any loop header whose name is not a plain identifier. The text pass reads the masked line (the keyword, then its names up to `in`, `(`, `;` or a newline);
+// the parser pass reads the header's argv. A C-style `for ((…))` names nothing.
+const PLAIN_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const badLoopName = (n) => !PLAIN_NAME.test(n) || n === 'argv' || n === 'ARGV';
+function loopNameRefusedText(text) {
+  const m = maskLines(text);
+  for (const h of m.matchAll(/(?:^|[\s;&|({!])(?:for|foreach|select)(?=[ \t])/g)) {
+    const head = m.slice(h.index + h[0].length, h.index + h[0].length + 2000).split(/[;\n]/, 1)[0].trim(); // (a window: a line of headers stays linear)
+    if (head.startsWith('((')) continue;
+    const words = head.split(/\s+/).filter(Boolean);
+    for (let i = 0; i < words.length; i++) {
+      if (i > 0 && words[i] === 'in') break;
+      const p = words[i].indexOf('(');
+      const name = p < 0 ? words[i] : words[i].slice(0, p);
+      if (name !== '' && badLoopName(name)) return true;
+      if (p >= 0) break;
+      if (i === words.length - 1 && head.length >= 1990) return true; // (a header longer than the window: its names cannot be read)
+    }
+  }
+  return false;
+}
+function loopNameRefused(cmds) {
+  return cmds.some((c) => {
+    if (!LOOP_HEADS.has(c.argv[0]) || c.argv.length < 2) return false;
+    const inAt = c.argv.indexOf('in', 2);
+    return c.argv.slice(1, inAt < 0 ? undefined : inAt).some(badLoopName);
+  });
 }
 
 const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
@@ -3472,6 +3520,9 @@ function evaluateBashForFilesFrame(command, opts) {
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
   if (closeBracketNotLast(cmds)) return deny('a command follows a closing ]] on the same piece (zsh\'s short `if [[ … ]] cmd` form), or ]] is an argument next to a [[: the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`');
+  // (#269 R13-F1, R13-F2; owner decision 2026-11-12: text-level refusals, on top of the parser-based checks)
+  if (closeBracketFollowedByWord(raw)) return deny('a word follows a closing ]] on a line with a [[ (zsh\'s short `if [[ … ]] cmd` form, `<->` number patterns, a redirect): the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`');
+  if (loopNameRefused(cmds) || loopNameRefusedText(raw)) return deny('a loop variable that is a positional parameter, argv, or a subscripted name cannot be followed by the guard; use a plain name');
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
   const proseValues = [...prose.values()].flatMap((p) => p.values);
