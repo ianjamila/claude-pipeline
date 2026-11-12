@@ -348,6 +348,8 @@ async function applyLocked({ root, pr, round, ctx, givenTag, projectsDir, maxAge
     }
     const substitute = {
       agent: open.agent, models: proof.models, evidence: route.evidence, resetAt: route.resetAt ?? null, outageAt: route.at, attempts: open.k,
+      // why Codex did not review, for the triage comment (display only): the reset time as Codex wrote it, the budget / governor facts
+      ...(typeof route.resetText === 'string' ? { resetText: route.resetText } : {}), ...(route.budget ? { budget: route.budget } : {}), ...(route.governor ? { governor: route.governor } : {}),
       proof: { transcript: found.jsonlPath, models: proof.models, ...(efforts ? { effort: efforts } : {}) },
     };
     const { items, state } = await recordRound({

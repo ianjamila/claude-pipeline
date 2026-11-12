@@ -86,6 +86,23 @@ function reraisedLines(rounds) {
   }));
 }
 
+// "Round 2 — substitute review (Claude Opus; Codex quota, resets 4:21 PM)": who reviewed a round Codex did not, why, and which attempt. The record is
+// agent-written, so every value goes through line(). The ids in the rows above are unchanged.
+const SUBSTITUTE_NAMES = { 'substitute-opus': 'Claude Opus', 'substitute-fable': 'Claude Fable' };
+function substituteWhy(sub) {
+  if (sub.evidence === 'budget') return isObject(sub.budget) ? `Codex round budget ${line(sub.budget.used)} used` : 'Codex round budget spent';
+  if (sub.evidence === 'governor') return isObject(sub.governor) ? `Codex weekly ${line(sub.governor.usedPct)}% ≥ ${line(sub.governor.threshold)}%` : 'Codex weekly quota high';
+  const reset = typeof sub.resetText === 'string' && sub.resetText.trim() !== '' ? sub.resetText : typeof sub.resetAt === 'string' ? sub.resetAt : '';
+  return reset ? `Codex quota, resets ${line(reset, 40)}` : 'Codex quota';
+}
+function substituteLines(rounds) {
+  return rounds.filter((r) => isObject(r?.substitute)).map((r) => {
+    const sub = r.substitute;
+    const attempt = Number(sub.attempts) > 1 ? `, attempt ${line(sub.attempts)}` : '';
+    return `- Round ${line(r.n)} — substitute review (${SUBSTITUTE_NAMES[sub.agent] ?? 'Claude stand-in'}; ${substituteWhy(sub)}${attempt})`;
+  });
+}
+
 export function triageComment(state) {
   const rounds = state.rounds ?? [];
   const rows = rounds.flatMap((r) => (r.items ?? []).map((item) => triageRow(r.n, item)));
@@ -94,6 +111,8 @@ export function triageComment(state) {
   else if (rows.length === 0) out.push('', '_Codex raised no findings._');
   const claudeLines = claudeRulingLines(rounds);
   if (claudeLines.length > 0) out.push('', '#### Claude rulings', '', ...claudeLines);
+  const standIns = substituteLines(rounds);
+  if (standIns.length > 0) out.push('', '#### Substitute reviews', '', ...standIns);
   const reraised = reraisedLines(rounds);
   if (reraised.length > 0) out.push('', '#### Raised again after a deferral', '', ...reraised);
   const granted = grantedRounds(state);
@@ -335,8 +354,9 @@ export function awaitingReviewComment(reason) {
 // by people and may be pasted into a table).
 // A run with fix-verify Fable passes reads `arbiter F (fix-verify K)` (F = every Fable pass, K of them the narrow fix-verify brief); one without reads
 // `arbiter F` as it always did, so old and new lines keep one label for the same count.
-export function agentLogLine({ date, pr, title, risk, rounds, arbiterCalls, fixVerifyCalls = 0, outcome }) {
+export function agentLogLine({ date, pr, title, risk, rounds, arbiterCalls, fixVerifyCalls = 0, substituteCalls = 0, outcome }) {
   const f = (v) => line(v).replace(/\|/g, '&#124;');
   const passes = Number(fixVerifyCalls) > 0 ? `arbiter ${f(arbiterCalls)} (fix-verify ${f(fixVerifyCalls)})` : `arbiter ${f(arbiterCalls)}`;
-  return `- ${f(date)} · #${f(pr)} · ${f(title)} · risk ${f(risk)} · rounds ${f(rounds)} · ${passes} · ${f(outcome)}`;
+  const standIn = Number(substituteCalls) > 0 ? ` · substitute ${f(substituteCalls)}` : '';
+  return `- ${f(date)} · #${f(pr)} · ${f(title)} · risk ${f(risk)} · rounds ${f(rounds)} · ${passes}${standIn} · ${f(outcome)}`;
 }

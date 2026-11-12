@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 // Who spent the tokens. Anything not named here is booked as `other` (never dropped, never a new key).
-export const ROLES = Object.freeze(['implementer', 'judge', 'arbiter', 'verifier', 'controller', 'other']);
+export const ROLES = Object.freeze(['implementer', 'judge', 'arbiter', 'substitute-opus', 'substitute-fable', 'verifier', 'controller', 'other']);
 // The run's phases are the record steps (a test pins this list to run-record's STEPS: that module imports this one, so it
 // cannot be imported back); a phase the caller invents is booked as `other`.
 export const PHASES = Object.freeze(['build', 'verify', 'pr', 'review', 'gate', 'awaiting-owner-merge', 'merge', 'prod-watch', 'ended', 'other']);
