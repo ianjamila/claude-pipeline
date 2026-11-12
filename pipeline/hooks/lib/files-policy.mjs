@@ -1789,6 +1789,33 @@ const psOffender = (raw) => {
 const PS_DRIVE_WORD = /^[A-Za-z]:$/;
 const PS_CD_WORD = /(?:(?<![A-Za-z0-9_.-])(?:cd\.\.|cd\\|(?:set-location|push-location|pop-location|chdir|pushd|popd|cd|sl)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_]))|(?<=(?:^|[;|&\n])[ \t]*)[A-Za-z]:(?![^\s;|&]))/gi;
 const PS_CD_DOTNET = /CurrentDirectory/i; // (SetCurrentDirectory too)
+// R14-B1 / F1 / F2 / F3 (round-14 review; the owner chose ONE fail-closed rule over four point patches). On the PowerShell route the guard cannot always tell which folder a directory change lands in (a trailing
+// switch or redirection after the operand, a drive function run through iex or dot-sourcing, a quote inside a backslash word that PowerShell joins and the Bash parse drops), so it stops trying on a line that can write:
+//  1. a line that changes the directory (a cd word ANYWHERE in the text, quoted or run from a string, the .NET ways, or a drive word `C:`) and also holds a command that is not read-only, or a redirection, is refused, whatever the target;
+//  2. a whitespace-delimited word holding both a backslash and a quote character (unless it is one fully quoted run) on a line with such a command or a redirection is refused.
+// A line of read-only commands and a lone directory change are not touched (the next call reads the real cwd). A drive word is a whole token: bounded by the start / end, a blank, a quote or `; | & ( )` on both sides, so
+// `C:/repo`, `C:\x` and `c:x` are paths, not drive functions.
+const PS_DRIVE_TOKEN = /(?<![^\s'";|&()])[A-Za-z]:(?![^\s'";|&()])/;
+const PS_CD_TEXT = /(?<![A-Za-z0-9_.-])(?:cd\.\.|cd\\|(?:set-location|push-location|pop-location|chdir|pushd|popd|cd|sl)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_]))/i; // (the location words of PS_CD_WORD, without its command-start drive branch)
+const psChangesDirectory = (texts) => texts.some((t) => PS_CD_DOTNET.test(t) || PS_CD_TEXT.test(t) || PS_DRIVE_TOKEN.test(t));
+const psRedirects = (text) => />/.test(text.replace(/(?<![^\s;|])[12]>&[12](?![^\s;|])/g, ' ').replace(/#>/g, ' ')); // (`2>&1` and the end of a block comment `#>` are not a write; a `>` inside a comment still counts, the stricter reading)
+const PS_WHOLE_QUOTED = /^(?:"[^"]*"|'[^']*')$/;
+// the whitespace-delimited words of the text; quote-aware (a blank inside quotes does not end a word) unless the text holds a backtick, whose escapes it does not model: then a plain split, the stricter reading
+function psWords(text) {
+  if (text.includes('`')) return text.split(/\s+/).filter(Boolean);
+  const words = [];
+  let cur = '';
+  let q = '';
+  for (const ch of text) {
+    if (q) { cur += ch; if (ch === q) q = ''; continue; }
+    if (/\s/.test(ch)) { if (cur) words.push(cur); cur = ''; continue; }
+    if (ch === '"' || ch === "'") q = ch;
+    cur += ch;
+  }
+  if (cur) words.push(cur);
+  return words;
+}
+const psMixedWord = (text) => psWords(text).find((w) => w.includes('\\') && /["']/.test(w) && !PS_WHOLE_QUOTED.test(w));
 const PS_PREFIX_STOP = /[^A-Za-z0-9 \t\n._:/\\|;=,-]|@["']|<#|#>|`|--%|\\(?![A-Za-z0-9._-])/;
 // The end of the text's leading run that PowerShell and the guard's parser read the same: plain characters only, NO quote (one opened there can swallow what follows), no escape, comment, here-string or backtick.
 const psPlainPrefixEnd = (text) => { const i = text.search(PS_PREFIX_STOP); return i < 0 ? text.length : i; };
@@ -3518,6 +3545,24 @@ function evaluateBashForFilesFrame(command, opts) {
     const inTree = insideRoot || dirs.some((d) => ctx.hitTree(d));
     if (namesFile || inTree) {
       return deny(`the PowerShell command ${namesFile ? 'refers to a protected pipeline file (or the directory that holds it)' : 'runs in a folder below ~/.claude'} and holds ${psDecoded === null ? 'a backtick `u{ escape that does not decode' : psOffender(raw)}, which PowerShell may read differently from the guard's parser, so what it runs cannot be checked; on such a line only letters, digits, blanks and . _ - : / \\ | ; = , " ' , a bare $NAME, a leading ~/ and the redirections 2>&1, > FILE, >> FILE and 2> FILE are accepted (${PROTECTED_MSG})`);
+    }
+  }
+
+  // R14-B1 / F1 / F2 / F3: the one fail-closed rule for a PowerShell line that can write (see psChangesDirectory). Placed after the not-plain refusals above so their more specific messages keep winning.
+  if (ctx.shell === 'powershell') {
+    // (the Bash parse reads a block comment `<# ... #>` as a line comment and drops the rest of the line, so the commands are also read from the text with its block comments cut out; an unterminated `<#` counts as a write)
+    const stripped = raw.replace(/<#[\s\S]*?#>/g, ' ');
+    const nonReadOnly = (c) => c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !PS_DRIVE_WORD.test(c.argv[0]) && !isReadOnly(c, ctx);
+    const writes = cmds.some(nonReadOnly) || psRedirects(stripped) || stripped.includes('<#') || (stripped !== raw && simpleCommands(stripped).some(nonReadOnly));
+    if (writes) {
+      const texts = [raw, ...(psDecoded !== null && psDecoded !== raw ? [psDecoded] : []), ...(raw.includes('`') ? [raw.replace(/`/g, '')] : [])];
+      if (psChangesDirectory(texts)) {
+        return deny(`On PowerShell a directory change and a write cannot share one command line (the folder the write lands in cannot be read safely from the text): run the directory change (cd / Set-Location / a drive like C:) as its own command, then the write (${PROTECTED_MSG})`);
+      }
+      const mixed = psMixedWord(raw);
+      if (mixed !== undefined) {
+        return deny(`On PowerShell a word that mixes a backslash and a quote cannot be read safely (${mixed.length > 60 ? `${mixed.slice(0, 60)}...` : mixed}): write the path with forward slashes or quote the whole word (${PROTECTED_MSG})`);
+      }
     }
   }
 

@@ -504,7 +504,7 @@ test('R11-F2: a PowerShell line that hides a relative write behind a cd below ~/
 });
 
 test('R11-F2: the same non-plain lines are allowed when no directory in play is protected and no word reaches a protected file; Bash is unchanged', () => {
-  assert.equal(psW('cd C:/repo; echo x <# #>; Set-Content ../out.txt x'), 'allow');
+  assert.equal(psW('cd C:/repo; echo x <# #>; Set-Content ../out.txt x'), 'deny', 'R14: a directory change and a write on one PowerShell line is refused whatever the target (was allow)');
   assert.equal(psW('echo \u2018 " \u2019 ; Set-Content out.txt x'), 'allow');
   assert.equal(psW('cd C:/repo; echo x <# #>; Get-ChildItem sub'), 'allow');
   // Bash: the same text is judged by the Bash parser only
@@ -545,8 +545,8 @@ test('R12-F2: chdir, Push-Location, Pop-Location and cd.. / cd\\ move the direct
   assert.equal(run('chdir ~/.claude/plugins; echo x > ../settings.json'), 'deny');
   assert.equal(run(`chdir ${HOME}/.claude/plugins; echo x > ../settings.json`), 'deny');
   // unrelated directories stay allowed
-  assert.equal(psW('Push-Location C:/repo; Set-Content ../out.txt x'), 'allow');
-  assert.equal(psW('chdir C:/repo; Set-Content out.txt x'), 'allow');
+  assert.equal(psW('Push-Location C:/repo; Set-Content ../out.txt x'), 'deny', 'R14: a directory change and a write on one PowerShell line is refused whatever the target (was allow)');
+  assert.equal(psW('chdir C:/repo; Set-Content out.txt x'), 'deny', 'R14: a directory change and a write on one PowerShell line is refused whatever the target (was allow)');
   assert.equal(run('chdir /repo/sub; echo x > ../out.txt'), 'allow');
 });
 
@@ -633,7 +633,7 @@ test('R13-F2: a PowerShell location cmdlet with a parameter is an unknown cd, no
   ];
   for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
   // a harmless switch alone keeps the target readable; no protected folder is involved
-  assert.equal(psW('Set-Location -PassThru C:/repo; Set-Content ../out.txt x'), 'allow');
+  assert.equal(psW('Set-Location -PassThru C:/repo; Set-Content ../out.txt x'), 'deny', 'R14: a directory change and a write on one PowerShell line is refused whatever the target (was allow)');
 });
 
 test('R13-F3: under PowerShell a tilde operand is not a trusted tool path (a native command gets `~` literally); Bash keeps it', () => {
@@ -691,7 +691,7 @@ test('R14-F3: every PowerShell line is scanned for directory changes (module-qua
     'Invoke-Expression "Set-Location C:/other"; Invoke-WebRequest http://x -OutFile out.txt',
   ];
   for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
-  assert.equal(psW('cd C:/repo; Set-Content out.txt x'), 'allow', 'a plain known cd is modelled as before');
+  assert.equal(psW('cd C:/repo; Set-Content out.txt x'), 'deny', 'R14: a directory change and a write on one PowerShell line is refused whatever the target (was allow)');
   assert.equal(psW('Get-Content cd.txt'), 'allow');
   assert.equal(psW('Set-Content cd.txt x'), 'allow', 'cd.txt is a file name, not a directory change');
   assert.equal(psW('Set-Content out.cd x'), 'allow');
@@ -707,7 +707,7 @@ test('R13-B1/F2: a backslash path after a cd option (-PassThru, -P) is read, quo
   assert.equal(run('cd ~/.claude/skil\\ls; echo x > ../settings.json'), 'deny', 'darwin: the backslash is an escape, the directory is ~/.claude/skills');
   assert.equal(evaluateBashForFiles('cd ~/.claude/skil\\ls; echo x > ../settings.json', { ...opts, platform: 'linux' }).decision, 'deny', 'linux');
   // unrelated directories stay allowed
-  assert.equal(psW("Set-Location -PassThru 'C:\\repo\\sub'; Set-Content ../out.txt x"), 'allow');
+  assert.equal(psW("Set-Location -PassThru 'C:\\repo\\sub'; Set-Content ../out.txt x"), 'deny', 'R14: a directory change and a write on one PowerShell line is refused whatever the target (was allow)');
   assert.equal(bashW("cd -P 'C:\\repo\\sub'; echo x > ../out.txt"), 'allow');
 });
 
@@ -732,7 +732,7 @@ test('R13-F3: a PowerShell location command fed by the pipeline, or without an o
     'Set-Location; Set-Content .claude/settings.json x',
   ];
   for (const c of lines) assert.equal(psW(c), 'deny', JSON.stringify(c));
-  assert.equal(psW('Set-Location C:/repo; Set-Content out.txt x'), 'allow');
+  assert.equal(psW('Set-Location C:/repo; Set-Content out.txt x'), 'deny', 'R14: a directory change and a write on one PowerShell line is refused whatever the target (was allow)');
   assert.equal(run('cd; echo x > .claude/settings.json'), 'deny', 'Bash: a bare cd is the home');
   assert.equal(run('cd /repo; echo x > out.txt'), 'allow');
 });
@@ -743,4 +743,93 @@ test('R13-F4: a PowerShell drive function (`C:`) is an unknown cd', () => {
   assert.equal(evaluateBashForFiles('c:; Set-Content Users/u/.claude/settings.json x', fromD).decision, 'deny');
   assert.equal(evaluateBashForFiles('D:; Set-Content out.txt x', fromD).decision, 'deny', 'any drive function: the folder it lands in is unknown');
   assert.equal(evaluateBashForFiles('Set-Content out.txt x', fromD).decision, 'allow');
+});
+
+// R14 round-14 review (owner's choice: ONE fail-closed rule on the PowerShell route instead of four point patches):
+//  1. a line that changes the directory (a cd word anywhere in the text, quoted or run from a string, or a drive word `C:`) AND holds a command that is not read-only (or a redirection) is refused, whatever the target;
+//  2. a whitespace-delimited word holding both a backslash and a quote (unless it is one fully quoted run) on a line with a non-read-only command or a redirection is refused.
+// A line of read-only commands, and a lone directory change, stay allowed.
+const DENY_CD = /a directory change and a write cannot share one command line/;
+const DENY_MIX = /a word that mixes a backslash and a quote cannot be read safely/;
+const psWhy = (command, extra = {}) => evaluateBashForFiles(command, { ...WIN, shell: 'powershell', ...extra });
+
+test('R14-B1: a trailing switch after a cd operand (-PassThru) cannot hide the real directory from a write on the same line', () => {
+  const lines = [
+    'Set-Location C:\\Users\\u\\.claude -PassThru; Set-Content settings.json x',
+    'Set-Location ..\\Users\\u\\.claude\\pipeline -PassThru; Set-Content hooks/guard-files.mjs x',
+    'cd ..\\Users\\u\\.claude\\pipeline -PassThru; Set-Content hooks/guard-files.mjs x',
+  ];
+  for (const c of lines) {
+    const r = psWhy(c);
+    assert.equal(r.decision, 'deny', JSON.stringify(c));
+    assert.match(r.reason, DENY_CD, r.reason);
+  }
+});
+
+test('R14-F1: a trailing redirection after a cd operand (> f, 2> f, 2>&1) cannot hide the real directory from a write on the same line', () => {
+  const lines = [
+    'Set-Location ..\\Users\\u\\.claude\\pipeline > out.txt; Set-Content hooks/guard-files.mjs x',
+    'Set-Location ..\\Users\\u\\.claude\\pipeline 2> e.txt; Set-Content hooks/guard-files.mjs x',
+    'Set-Location ..\\Users\\u\\.claude\\pipeline 2>&1; Set-Content hooks/guard-files.mjs x',
+    'Set-Location ..\\Users\\u\\.claude\\pipeline >> out.txt; Set-Content hooks/guard-files.mjs x',
+  ];
+  for (const c of lines) {
+    const r = psWhy(c);
+    assert.equal(r.decision, 'deny', JSON.stringify(c));
+    assert.match(r.reason, DENY_CD, r.reason);
+  }
+});
+
+test('R14-F2: a drive function run through iex / dot-source (not as the first word of a command) is a directory change too', () => {
+  const fromD = { cwd: 'D:\\repo' };
+  const lines = [
+    "iex 'C:'; Set-Content Users/u/.claude/settings.json x",
+    'iex C:; Set-Content Users/u/.claude/settings.json x',
+    '. C:; Set-Content Users/u/.claude/settings.json x',
+    'Invoke-Expression "C:"; Set-Content Users/u/.claude/settings.json x',
+  ];
+  for (const c of lines) {
+    const r = psWhy(c, fromD);
+    assert.equal(r.decision, 'deny', JSON.stringify(c));
+    assert.match(r.reason, DENY_CD, r.reason);
+  }
+  // a path that merely starts with a drive letter is not a drive word
+  assert.equal(psWhy('Set-Content C:/repo/out.txt x', fromD).decision, 'allow');
+  assert.equal(psWhy('Set-Content C:\\repo\\out.txt x', fromD).decision, 'allow');
+  assert.equal(psWhy('Set-Content out.txt c:x', fromD).decision, 'allow');
+});
+
+test('R14-F3: a word holding a backslash and an inner quote (.cl"aude"\\settings.json) on a line that writes is refused, as a redirection target, a cd operand and a plain operand', () => {
+  const lines = [
+    'cd C:/Users/u; echo x > .cl"aude"\\settings.json',
+    'echo x > ..\\Users\\u\\.cl"aude"\\settings.json',
+    'Set-Location ..\\Users\\u\\.cl"aude"\\pipeline; Set-Content hooks/guard-files.mjs x',
+    'Set-Content ..\\Users\\u\\.cl"aude"\\settings.json x',
+    "Set-Content ..\\Users\\u\\.cl'aude'\\settings.json x",
+  ];
+  for (const c of lines) {
+    const r = psWhy(c);
+    assert.equal(r.decision, 'deny', JSON.stringify(c));
+    assert.match(r.reason, c.startsWith('Set-Location') || c.startsWith('cd ') ? /a directory change and a write|mixes a backslash and a quote/ : DENY_MIX, r.reason);
+  }
+  assert.match(psWhy('Set-Content ..\\Users\\u\\.cl"aude"\\settings.json x').reason, DENY_MIX);
+  // a whole-word quoted path is one fully quoted run (spaces included), and a line of reads is untouched
+  assert.equal(psW("Set-Content 'C:\\repo\\a b.txt' x"), 'allow');
+  assert.equal(psW('Set-Content "C:\\repo\\out.txt" x'), 'allow');
+  assert.equal(psW('Get-Content ..\\Users\\u\\.cl"aude"\\settings.json'), 'allow', 'read-only commands only: the rule does not apply');
+});
+
+test('R14 one rule: a directory change plus a write on one PowerShell line is refused whatever the target; reads and a lone directory change stay allowed', () => {
+  for (const c of ['cd C:/repo; Set-Content out.txt x', "Set-Location -PassThru 'C:\\repo\\sub'; Set-Content ../out.txt x", 'cd C:/repo; echo x > out.txt', "iex 'cd C:/repo'; Set-Content out.txt x"]) {
+    const r = psWhy(c);
+    assert.equal(r.decision, 'deny', JSON.stringify(c));
+    assert.match(r.reason, DENY_CD, r.reason);
+  }
+  for (const c of ['Set-Location C:/repo/sub; Get-ChildItem', 'cd ..; ls', 'Set-Location C:/repo/sub', 'Set-Location -PassThru C:/repo', 'Get-Content cd.txt', 'Set-Content cd.txt x']) {
+    assert.equal(psW(c), 'allow', JSON.stringify(c));
+  }
+  // the trusted pipeline CLI after a cd still runs (it is read-only to the guard)
+  assert.equal(psW(`cd C:/repo; node C:\\Users\\u\\.claude\\pipeline\\bin\\pipeline.mjs preflight`), 'allow');
+  // Bash route unchanged
+  assert.equal(bashW('cd C:/repo; echo x > out.txt'), 'allow');
 });
