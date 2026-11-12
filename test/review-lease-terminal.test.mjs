@@ -215,8 +215,15 @@ function signalFixture(t, mode) {
   return script;
 }
 
-function spawnFixture(t, repo, script, mode, extraArgs = []) {
+// `tc` is the node:test context: its after() hook SIGKILLs a fixture child that is still running and closes its pipes, so a failed assertion or a missed ready line
+// cannot leave an orphan whose open pipes keep the test file (and the runner, which has no per-test timeout) alive. Nothing to kill on the happy path (it has exited).
+function spawnFixture(tc, t, repo, script, mode, extraArgs = []) {
   const child = spawn(process.execPath, [script, mode, ...extraArgs], { cwd: repo.dir, env: t.env, stdio: ['ignore', 'pipe', 'pipe'] });
+  tc.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    child.stdout.destroy();
+    child.stderr.destroy();
+  });
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (d) => { stdout += d; });
@@ -229,11 +236,11 @@ function spawnFixture(t, repo, script, mode, extraArgs = []) {
   };
 }
 
-test('a command that keeps running after SIGINT (a second listener) keeps its lease until it exits', POSIX_ONLY, async () => {
+test('a command that keeps running after SIGINT (a second listener) keeps its lease until it exits', POSIX_ONLY, async (tc) => {
   const t = terminal();
   const repo = reviewRepo();
   const stop = join(t.root, 'stop-second');
-  const cmd = spawnFixture(t, repo, signalFixture(t, 'second'), 'second', [stop]);
+  const cmd = spawnFixture(tc, t, repo, signalFixture(t, 'second'), 'second', [stop]);
   await cmd.ready();
   assert.equal(procFiles(t).length, 1, `lease taken (${cmd.child.pid})`);
   cmd.child.kill('SIGINT');
@@ -247,10 +254,10 @@ test('a command that keeps running after SIGINT (a second listener) keeps its le
   assert.deepEqual(files(t), [], 'the exit handler closed it when the process ended');
 });
 
-test('the sole signal listener still closes the lease and re-raises (died of the signal)', POSIX_ONLY, async () => {
+test('the sole signal listener still closes the lease and re-raises (died of the signal)', POSIX_ONLY, async (tc) => {
   const t = terminal();
   const repo = reviewRepo();
-  const cmd = spawnFixture(t, repo, signalFixture(t, 'sole'), 'sole');
+  const cmd = spawnFixture(tc, t, repo, signalFixture(t, 'sole'), 'sole');
   await cmd.ready();
   assert.equal(procFiles(t).length, 1);
   cmd.child.kill('SIGINT');
