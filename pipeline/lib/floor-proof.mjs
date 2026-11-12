@@ -5,7 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { accountHome } from './paths.mjs';
 import { compareSemver, installedVersion, runningVersion } from './claude-code-version.mjs';
-import { FLOOR_DIR_ENV, MIN_FABLE, allowedIds, checkFloor, compareVersions, parseModelId, readFloor } from './model-floor.mjs';
+import { FLOOR_DIR_ENV, MIN_FABLE, allowedIds, checkFloor, compareVersions, parseModelId, raiseFloor, readFloor, withFloorLock } from './model-floor.mjs';
+import { holdsLock } from './locks.mjs';
 import { isInstalledCopy, pipelineRoot, seamValue } from './seams.mjs';
 
 // Test-only seams (a repo checkout honours them, an installed copy ignores them, like PIPELINE_TEST_MODE):
@@ -154,4 +155,61 @@ export async function floorPauseSeam(env, { root = pipelineRoot(), maxMs = 30_00
   const deadline = Date.now() + maxMs;
   while (!fs.existsSync(`${base}.go`) && Date.now() < deadline) await new Promise((r) => setTimeout(r, pollMs));
   return true;
+}
+
+export const floorBusyAdvice = (command) => `another review holds the machine-wide floor lock: run \`${command}\` again in a minute; if it persists, the owner runs \`pipeline model-floor reset --clear-lock --keep-floor\` in a plain terminal (it keeps the learned floor; a bare \`--clear-lock\` resets it to the shipped minimum)`;
+
+// The Fable floor as a proof's apply step (`arbiter apply`, `substitute apply`) applies it, ONE copy for both. The proof is already in `proof` (transcript.mjs#proveModel);
+// `errors` is the caller's error list (pushed to, never replaced); `baseOk` = the proof was otherwise good; `publish(judged)` records the outcome and returns the command result;
+// `failFloor(code, message, advice, extra)` records the failure and throws (the caller's own Fail), used for a floor failure that saves no proof.
+// Any Fable on any line must be at least the floor. No Fable at all: nothing to judge. Already failing: judged read-only so a stale terminal is still told to restart.
+// A proven pass reads the floor, compares, raises and publishes in one hold of the machine-wide lock, and fences (lock still ours, floor re-read) just before anything is raised or saved.
+export async function judgeAndPublish({ command = 'arbiter apply', proof, claudeCodeVersions, env, errors, baseOk, transcript, projectsDirGiven, publish, failFloor }) {
+  const judgeOpts = { models: proof.models, claudeCodeVersions, env };
+  if (fableModelsOf(proof.models).length === 0) return publish({ applies: false });
+  if (!baseOk) {
+    const judged = judgeFloor(judgeOpts);
+    errors.push(...judged.errors);
+    return publish(judged);
+  }
+  try {
+    return await withFloorLock({ env, waitMs: floorWaitMs(env) }, async ({ lock }) => {
+      let judged = judgeFloor(judgeOpts);
+      errors.push(...judged.errors);
+      // The lock can be removed from under a running apply (an older pipeline, a manual rm) and the floor then moved by another review: the compare above
+      // is only good while the lock is ours. So just before anything is raised or saved: still ours? and does the floor, read again, still pass this proof?
+      const fenced = () => {
+        if (!holdsLock(lock)) failFloor('model-floor-busy', 'the floor lock was taken away while this review was being proven: nothing was saved', floorBusyAdvice(command));
+      };
+      if (judged.ok) {
+        await floorPauseSeam(env);
+        fenced();
+        judged = judgeFloor(judgeOpts);
+        if (!judged.ok) failFloor(judged.error ?? 'stale-model', judged.errors.join(' '), judged.advice ?? null, floorOutput(judged));
+        // An id the parser cannot read never raises the floor (an owner allowance does not change that); a readable one, allowed or not, is judged and may raise it.
+        const raisable = fableModelsOf(proof.models).filter((id) => parseModelId(id) !== null);
+        const top = raisable.length === 0 ? null : raisable.reduce((a, b) => (compareVersions(parseModelId(b), parseModelId(a)) > 0 ? b : a));
+        if (top !== null && compareVersions(parseModelId(top), parseModelId(judged.floor)) > 0 && mayRaiseFloor({ transcript, projectsDirGiven, env }).ok) {
+          try {
+            fenced();
+            raiseFloor({ env, model: top, claudeCode: claudeCodeVersions.length > 0 ? claudeCodeVersions[claudeCodeVersions.length - 1] : null, transcript });
+          } catch (err) {
+            if (err?.code !== 'model-floor-unreadable') throw err;
+            errors.push(err.message);
+            judged.ok = false;
+            judged.unreadable = true;
+            judged.error ??= err.code;
+          }
+        }
+        fenced();
+      }
+      return publish(judged);
+    });
+  } catch (err) {
+    // Fail closed, nothing published or saved: the retry proves again.
+    if (err?.code === 'model-floor-busy' || err?.code === 'model-floor-unwritable') {
+      return failFloor(err.code, err.message, err.code === 'model-floor-busy' ? floorBusyAdvice(command) : 'the owner runs `pipeline model-floor reset` in a plain terminal');
+    }
+    throw err;
+  }
 }
