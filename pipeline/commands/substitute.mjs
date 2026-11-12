@@ -379,7 +379,7 @@ async function applyLocked({ root, pr, round, ctx, givenTag, projectsDir, maxAge
       proof: { transcript: found.jsonlPath, models: proof.models, ...(efforts ? { effort: efforts } : {}) },
     };
     const { items, state } = await recordRound({
-      adm, findings, locked: true,
+      adm, findings, locked: true, routeLock: true,
       roundFields: { firstReviewer: 'substitute', substitute, promptSha256: packet.promptSha256, patchSha256: route.patchSha256 },
       // The evidence must still be this attempt's, finished, and describe this very round (resetAt is NOT judged here: a substitute started just before the reset still counts).
       gate: () => {

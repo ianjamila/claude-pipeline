@@ -1,11 +1,11 @@
 // .review/round-R/route.json: the ONE record of how a Codex attempt for a round went and whether a Claude substitute may stand in for it
 // (plan 2026-11-11-codex-substitute-reviewer, R4-10, R4-12, R5-7). Its lifecycle:
 //
-//   start   every codex-review attempt first replaces route.json atomically (write-then-rename, under the review lock for that write only: Codex itself runs unlocked) with
+//   start   every codex-review attempt first replaces route.json atomically (write-then-rename, under the ROUTE lock for that write only: Codex itself runs unlocked, and a held review lock does not stop it) with
 //           { attemptId, evidence: 'pending', round, base, head, patchSha256, risk, agent, at }, so evidence from an earlier attempt is gone before
 //           Codex runs. The attempt's files live in round-R/attempt-<attemptId>/ (codex-raw.json, prompt.md): a later attempt can neither read nor
 //           remove them.
-//   finish  the final evidence ('quota' | 'none') and a successful round are written by compare-and-swap UNDER THE REVIEW LOCK, and only while
+//   finish  the final evidence ('quota' | 'none') and a successful round are written by compare-and-swap UNDER THE REVIEW LOCK and the ROUTE lock (review, then route), and only while
 //           route.json still holds this attempt in 'pending'. Otherwise the attempt is superseded (exit 2, `superseded`): it writes nothing and
 //           deletes nothing. Only the winner's files are copied from its attempt folder to round-R/.
 //
@@ -19,7 +19,7 @@ import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { Fail } from './cmd-common.mjs';
 import { OUTAGE_NO_RESET_MS } from './codex-usage.mjs';
-import { ensureRoundDir, roundDir, withReviewLock, writeJson } from './review-context.mjs';
+import { ensureRoundDir, roundDir, withReviewLock, withRouteLock, writeJson } from './review-context.mjs';
 
 export const ROUTE_FILE = 'route.json';
 // `file` names another record of the same lifecycle in the round folder: a second review's `route-2nd-<packetId8>.json` (R5-7); the default is the round's own route.json.
@@ -42,7 +42,7 @@ export const superseded = () => new Fail(EXIT.USAGE, {
   message: 'a newer codex-review attempt for this round replaced this one: its result was discarded and nothing was written; run the round again only if the newer attempt did not finish',
 });
 
-// Inside the review lock: is route.json still this attempt, unfinished? Else exit 2 `superseded` (the caller writes and deletes nothing).
+// Inside the review and route locks: is route.json still this attempt, unfinished? Else exit 2 `superseded` (the caller writes and deletes nothing).
 export function assertCurrentAttempt(root, round, attemptId, file = ROUTE_FILE) {
   const current = readRoute(root, round, file);
   if (current === null || current.attemptId !== attemptId || current.evidence !== 'pending') throw superseded();
@@ -55,11 +55,11 @@ export async function startAttempt({ root, pr, ctx, round, base, head, patchSha2
   const attemptId = newAttemptId();
   const route = { attemptId, evidence: 'pending', round, base, head, patchSha256, risk, agent, ...extra, at: new Date(now).toISOString() };
   const dir = attemptDir(root, round, attemptId);
-  // The review lock is taken for this one write only (never while Codex runs): the final write is a compare-and-swap under the lock, and a pending record installed between its
-  // compare and its write would be overwritten by the older attempt (R1-B2).
+  // The ROUTE lock (not the review lock: Codex must start while a round is being recorded) is taken for this one write only, never while Codex runs: the final write is a
+  // compare-and-swap under the same lock, and a pending record installed between its compare and its write would be overwritten by the older attempt (R1-B2).
   ensureRoundDir(root, round);
   mkdirSync(dir, { recursive: true });
-  await withReviewLock(root, pr, ctx, () => writeJson(routeFile(root, round, file), route));
+  await withRouteLock(root, pr, ctx, () => writeJson(routeFile(root, round, file), route));
   return { attemptId, dir, route };
 }
 
@@ -76,19 +76,19 @@ export function publishAttemptFiles(root, round, attemptId, names) {
   }
 }
 
-// Inside the review lock: writes the attempt's final evidence over its pending record. `final` = { evidence, ...fields }.
+// Inside the review and route locks: writes the attempt's final evidence over its pending record. `final` = { evidence, ...fields }.
 export function writeFinalRoute(root, round, pending, final, now = Date.now(), file = ROUTE_FILE) {
   writeJson(routeFile(root, round, file), { ...pending, ...final, at: new Date(now).toISOString(), startedAt: pending.at });
 }
 
-// The failure path: under the review lock, only while this attempt is still the current one, copy its files to round-R/ and write the final evidence.
+// The failure path: under the review lock and the route lock, only while this attempt is still the current one, copy its files to round-R/ and write the final evidence.
 // A superseded attempt throws (exit 2) and touches nothing.
 export async function finishAttempt({ root, pr, ctx, round, attempt, final, files = ['prompt.md'], now, file = ROUTE_FILE }) {
-  return withReviewLock(root, pr, ctx, () => {
+  return withReviewLock(root, pr, ctx, () => withRouteLock(root, pr, ctx, () => {
     const pending = assertCurrentAttempt(root, round, attempt.attemptId, file);
     publishAttemptFiles(root, round, attempt.attemptId, files);
     writeFinalRoute(root, round, pending, final, now, file);
-  });
+  }));
 }
 
 // When does a quota record stop being evidence (epoch ms)? At resetAt; with no reset time, 2 hours after it was formed.

@@ -29,7 +29,7 @@ import {
   isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
-  currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, reviewBaseRef, roundDir, sha256, withStateLock, writeFileAtomic, writeJson,
+  currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
 import { assertCurrentAttempt, finishAttempt, readRoute, startAttempt, substituteEligibility, superseded, writeFinalRoute } from '../lib/route-record.mjs';
 import { headMoved } from '../lib/review-round.mjs';
@@ -630,7 +630,7 @@ async function secondReview(rest, ctx) {
     return refuse(`the Codex answer is not one valid verdict per item: ${checked.errors.join('; ')}; nothing was recorded, run second-review again`, { errors: checked.errors });
   }
 
-  const recorded = await withStateLock(root, ctx, () => {
+  const recorded = await withStateLock(root, ctx, async () => {
     const state = requireState(root);
     if (state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`);
     if (headSha(o) !== asked.head) return refuse('HEAD moved while Codex was reviewing; nothing was recorded, run second-review again');
@@ -645,19 +645,22 @@ async function secondReview(rest, ctx) {
     const now = askedSnapshot(items);
     if (now.digest !== asked.snapshot.digest) return refuse('a finding changed while Codex was reviewing; nothing was recorded, run second-review again');
     if (now.finals !== asked.snapshot.finals) return refuse('an item\'s final changed while Codex was reviewing; nothing was recorded, run second-review again');
-    // Still this attempt (a newer one for the same packet replaced it: exit 2, nothing written)?
-    const pending = assertCurrentAttempt(root, n, attempt.attemptId, routeFile);
-    seedBaseline({ ctx, root, pr, state });
-    const ranAt = new Date().toISOString();
-    const byId = new Map(answer.items.map((e) => [e.id, e]));
-    const settled = items.map((item) => {
-      const e = byId.get(item.id);
-      return settleSecondReview(item, { decision: e.decision, confidence: e.confidence, reasoning: clip(e.reasoning.trim(), REASONING_MAX), model, effort: SECOND_REVIEW_EFFORT, inputDigest, ranAt });
+    // Still this attempt (a newer one for the same packet replaced it: exit 2, nothing written)? The compare and the final write hold the route lock together (review, then route; R1-B2).
+    const { saved, settled } = await withRouteLock(root, pr, ctx, () => {
+      const pending = assertCurrentAttempt(root, n, attempt.attemptId, routeFile);
+      seedBaseline({ ctx, root, pr, state });
+      const ranAt = new Date().toISOString();
+      const byId = new Map(answer.items.map((e) => [e.id, e]));
+      const settled = items.map((item) => {
+        const e = byId.get(item.id);
+        return settleSecondReview(item, { decision: e.decision, confidence: e.confidence, reasoning: clip(e.reasoning.trim(), REASONING_MAX), model, effort: SECOND_REVIEW_EFFORT, inputDigest, ranAt });
+      });
+      // Format version 2 at least: an older pipeline must not read a state that holds a second-review verdict (state.mjs SUPPORTED_STATE_VERSION); a higher version stays.
+      const saved = withStateVersion(updateItems(state, n, settled), STATE_VERSION_CLAUDE);
+      saveState(root, saved);
+      writeFinalRoute(root, n, pending, { evidence: 'none', outcome: 'recorded' }, Date.now(), routeFile);
+      return { saved, settled };
     });
-    // Format version 2 at least: an older pipeline must not read a state that holds a second-review verdict (state.mjs SUPPORTED_STATE_VERSION); a higher version stays.
-    const saved = withStateVersion(updateItems(state, n, settled), STATE_VERSION_CLAUDE);
-    saveState(root, saved);
-    writeFinalRoute(root, n, pending, { evidence: 'none', outcome: 'recorded' }, Date.now(), routeFile);
     const { next: publishNext, ...published } = publishRuling({ ctx, root, pr, state: saved });
     return secondReviewOutput({ n, settled, published, publishNext });
   }, pr);
@@ -748,7 +751,7 @@ async function secondReviewApply(values, ctx) {
       const entry = { ...open, status, endedAt: new Date().toISOString(), ...extra };
       saveSecondAttempts(root, n, { ...record, attempts: record.attempts.map((a) => (a.k === open.k ? entry : a)) });
     };
-    const publish = (judged) => {
+    const publish = async (judged) => {
       const proofOk = errors.length === 0 && answer !== null;
       writeJson(path.join(roundDir(root, n), `second-review-proof-${id8}.json`), {
         ok: proofOk, transcript: found.jsonlPath, models: proof.models, efforts: proof.efforts, stopReasonMissing: proof.stopReasonMissing, finalVia: proof.finalVia,
@@ -763,24 +766,28 @@ async function secondReviewApply(values, ctx) {
           output: { ok: false, round: n, tag, attempt: open.k, transcript: found.jsonlPath, errors, ...floorOutput(judged), retry: counted >= MAX_INVALID_SECOND_ATTEMPTS ? 'park' : 'second-review' },
         };
       }
-      // Still this evidence (a newer Codex attempt for the packet replaced the record: nothing is written; resetAt is NOT judged here, as for a first review).
-      const current = readRoute(root, n, file);
-      if (current === null || current.attemptId !== route.attemptId || current.evidence !== route.evidence || current.packetId !== route.packetId || current.head !== route.head) throw superseded();
-      seedBaseline({ ctx, root, pr, state });
-      const ranAt = new Date().toISOString();
-      const byId = new Map(answer.items.map((e) => [e.id, e]));
-      const fields = substituteVerdictFields({ agent: open.agent, route, proof, transcript: found.jsonlPath });
-      const settled = items.map((item) => {
-        const e = byId.get(item.id);
-        return settleSecondReview(item, {
-          decision: e.decision, confidence: e.confidence, reasoning: clip(e.reasoning.trim(), REASONING_MAX), model: Object.keys(proof.models ?? {}).join(', '),
-          effort: PROOF_EFFORT, inputDigest: open.digest, ranAt, ...fields,
+      // The compare and the final write of route.json hold the route lock together (review, then route; R1-B2).
+      const { saved, settled } = await withRouteLock(root, pr, ctx, () => {
+        // Still this evidence (a newer Codex attempt for the packet replaced the record: nothing is written; resetAt is NOT judged here, as for a first review).
+        const current = readRoute(root, n, file);
+        if (current === null || current.attemptId !== route.attemptId || current.evidence !== route.evidence || current.packetId !== route.packetId || current.head !== route.head) throw superseded();
+        seedBaseline({ ctx, root, pr, state });
+        const ranAt = new Date().toISOString();
+        const byId = new Map(answer.items.map((e) => [e.id, e]));
+        const fields = substituteVerdictFields({ agent: open.agent, route, proof, transcript: found.jsonlPath });
+        const settled = items.map((item) => {
+          const e = byId.get(item.id);
+          return settleSecondReview(item, {
+            decision: e.decision, confidence: e.confidence, reasoning: clip(e.reasoning.trim(), REASONING_MAX), model: Object.keys(proof.models ?? {}).join(', '),
+            effort: PROOF_EFFORT, inputDigest: open.digest, ranAt, ...fields,
+          });
         });
+        // Version 4: an older pipeline must not read a substitute second review (state.mjs#stateVersionFor).
+        const saved = withStateVersion(updateItems(state, n, settled), STATE_VERSION_SUBSTITUTE);
+        saveState(root, saved);
+        writeFinalRoute(root, n, current, { evidence: 'none', outcome: 'recorded', via: 'substitute', substituteEvidence: route.evidence }, Date.now(), file);
+        return { saved, settled };
       });
-      // Version 4: an older pipeline must not read a substitute second review (state.mjs#stateVersionFor).
-      const saved = withStateVersion(updateItems(state, n, settled), STATE_VERSION_SUBSTITUTE);
-      saveState(root, saved);
-      writeFinalRoute(root, n, current, { evidence: 'none', outcome: 'recorded', via: 'substitute', substituteEvidence: route.evidence }, Date.now(), file);
       settleAttempt('applied');
       const { next: publishNext, ...published } = publishRuling({ ctx, root, pr, state: saved });
       return secondReviewOutput({ n, settled, published, publishNext, extra: { tag, attempt: open.k, transcript: found.jsonlPath, agent: open.agent, evidence: route.evidence, ...floorOutput(judged) } });

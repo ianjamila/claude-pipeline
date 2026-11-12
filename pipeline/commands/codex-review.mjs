@@ -84,7 +84,7 @@ export const meta = {
     '    in the machine-wide Codex record (P codex-status: lastOutage, waiting); the next Codex answer for the PR clears it (best effort: a failure there is a warnings entry, never a failed round)',
     '  a Codex timeout is retried once (same prompt, same attempt): retried:{reason:timeout}; a second timeout is exit 3 unavailable with timedOut:true, never a substitute',
     '  every Codex attempt first replaces .review/round-R/route.json with {attemptId, evidence:pending, round, base, head, patchSha256, risk, agent, at} and keeps its files in',
-    '    round-R/attempt-<attemptId>/ (codex-raw.json, prompt.md). The final evidence (quota | none) and a recorded round are written under the review lock only while route.json still',
+    '    round-R/attempt-<attemptId>/ (codex-raw.json, prompt.md). The final evidence (quota | none) and a recorded round are written under the review lock and a per-PR route lock (review, then route; the pending record takes the route lock alone, so a held review lock never stops Codex from starting) only while route.json still',
     '    holds this attempt in pending, else exit 2 {error:superseded} (nothing written, nothing deleted); the winner\'s files are copied to round-R/. The file is written by this command only',
     '  env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)',
   ].join('\n'),
@@ -272,6 +272,7 @@ export const run = guarded(async (argv, ctx) => {
       ...(adm.wholePr && attempt !== null ? { patchSha256: attempt.route.patchSha256 } : {}),
     },
     ...(attempt === null ? {} : {
+      routeLock: true, // compare (gate) and write (afterSave) of route.json under the route lock (R1-B2)
       gate: () => {
         pendingRoute = assertCurrentAttempt(root, round, attempt.attemptId);
         publishAttemptFiles(root, round, attempt.attemptId, ['prompt.md', 'codex-raw.json']);

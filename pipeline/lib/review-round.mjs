@@ -31,7 +31,7 @@ import { readWeeklyUsage } from './codex-usage.mjs';
 import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from './triage.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
-  allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, writeFileAtomic, writeJson,
+  allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, withRouteLock, writeFileAtomic, writeJson,
 } from './review-context.mjs';
 
 // What the prompt and the stored round carry of a proven resolution. The lists are cut to 50 (dropped blocks first, so a cut never
@@ -318,10 +318,11 @@ export const baseOnlyFindings = () => ({
 // Phase two. `findings` are the reviewer's validated findings (validateFindings ok). `roundFields` are stored on the round as given.
 // `gate()` runs inside the lock right after the round-order check, before anything is written (throw to abort: codex-review's compare-and-swap on route.json, exit 2 superseded);
 // `afterSave()` runs inside the lock once the state is saved.
+// `routeLock: true`: the body also holds the per-PR route lock (review, then route), for a caller whose gate / afterSave compare and write route.json (R1-B2).
 // `locked: true`: the caller already holds the per-PR review lock (the substitute's apply holds it across its whole proof, so the lock order stays review -> floor);
 // the body then runs as it is, everything else is the same.
 // Returns { items (the round's items after reuse of prior rulings), state (the saved state), grantUsed: {grantId} | undefined }.
-export async function recordRound({ adm, findings, roundFields = {}, gate, afterSave, locked = false }) {
+export async function recordRound({ adm, findings, roundFields = {}, gate, afterSave, locked = false, routeLock = false }) {
   const { root, ctx, pr, round, base, head, config, dir } = adm;
   const o = { cwd: root };
   const flags = { baseOnly: adm.baseOnly, resolutionOnly: adm.resolutionOnly };
@@ -342,7 +343,8 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
   };
   let grantUsed;
   let saved;
-  const items = await (locked ? (fn) => fn() : (fn) => withReviewLock(root, pr, ctx, fn))(async () => {
+  const underRouteLock = routeLock ? (fn) => withRouteLock(root, pr, ctx, fn) : (fn) => fn();
+  const items = await (locked ? (fn) => fn() : (fn) => withReviewLock(root, pr, ctx, fn))(() => underRouteLock(async () => {
     // The reviewer took a while: whatever happened to the review meanwhile (another session recorded this round, the PR's
     // state was replaced) is read again, and what is there now wins.
     const fresh = readReviewState(root);
@@ -404,6 +406,6 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
     if (afterSave) await afterSave();
     grantUsed = ownerGrant === undefined ? undefined : { grantId: ownerGrant.grantId };
     return ruled;
-  });
+  }));
   return { items, state: saved, grantUsed };
 }
