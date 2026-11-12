@@ -2072,7 +2072,12 @@ function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
 const MAX_PARAM_WORK = 2_000_000;
 // (#269 R15-F4) `${` followed by a blank, tab, newline or `|` (and, to be generous, any other white space) at s[at]: a command substitution of bash 5.3 and newer zsh, not a parameter expansion.
 // (R16-F4) Not `(`: bash 5.3's parser.h lists `(` only in a FUNSUB_CHAR under `#if 0`, and zsh's `${(f)x}` is a plain expansion with flags.
-const isFunsubAt = (s, at) => s[at] === '$' && s[at + 1] === '{' && at + 2 < s.length && /[\s|]/.test(s[at + 2]);
+// (#269 R17-F1) Or a backslash-newline right after `$` or `${`: bash drops it while reading, so `$\⏎(cmd)`, `$\⏎{ cmd; }` and `${\⏎ cmd; }` run cmd,
+// while the parser would read the backslash as an escape. Refused the same way (never written by hand; prefer a false refusal).
+const contAt = (s, k) => s[k] === '\\' && (s[k + 1] === '\n' || (s[k + 1] === '\r' && s[k + 2] === '\n'));
+const isFunsubAt = (s, at) => s[at] === '$' && (contAt(s, at + 1) || (s[at + 1] === '{' && at + 2 < s.length && (/[\s|]/.test(s[at + 2]) || contAt(s, at + 2))));
+const REFUSED_FUNSUB = 'a `${ cmd; }` / `${|cmd;}` command substitution (bash 5.3, newer zsh), or a line continuation (backslash-newline) right after `$` or `${`';
+const REFUSED_ARITH = 'a `$(`, `${` or backtick inside single quotes in arithmetic (`$(( ))`, `(( ))`, `for (( ))`), where the shell still runs it';
 class Parser {
   constructor(ctx, src) {
     this.ctx = ctx;
@@ -2150,7 +2155,7 @@ class Parser {
     const mark = this.log.length;
     this.i += 2;
     // (`$((` is arithmetic, where `a > b` compares, only when it closes as `))`; else it is a subshell in a command substitution -- `$((cmd > f) )` RUNS cmd and writes f, in bash and zsh -- and its redirects count)
-    this.ownHeredocs(() => this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: s[start] === '$' && s[this.i] === '(' && closesAsArith(s, start, 3) })));
+    this.ownHeredocs(() => this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: s[start] === '$' && s[this.i] === '(' && closesAsArith(s, start, 3), maybeArith: s[start] === '$' && s[this.i] === '(' })));
     this.subAcc.push(...this.log.slice(mark));
     return s.slice(start, this.i);
   }
@@ -2160,7 +2165,9 @@ class Parser {
   // exactly like the shell (#269 R16-B1, R16-F1..F3), and a wrong guess hides commands. So the line is truncated, which the guards refuse
   // (owner rule 2026-11-12: refuse, do not guess; Claude never needs this form). Every unquoted and double-quoted `${ ` reaches here: the lexer,
   // readDq, scanExpansions (heredoc bodies, $[ ]) and casePattern call it, and paramSpan hands such a word to the ordinary path.
-  funsub() {
+  // (R17-F3) The reason is kept (ctx.refused, the result's `refused`) so the guards can say which form to rewrite instead of "too complex".
+  funsub(reason = REFUSED_FUNSUB) {
+    this.ctx.refused ??= reason;
     this.ctx.truncated = true;
     this.ctx.stopped = true;
     const start = this.i;
@@ -2204,8 +2211,8 @@ class Parser {
       if ((c === '<' || c === '>' || c === '=') && s[j + 1] === '(') return -1; // <(cmd) >(cmd) =(cmd) run code in the operand word
       if (c === '$') {
         const nx = s[j + 1];
-        if (nx === '(' || nx === "'") return -1;
-        if (nx === '{') { if (isFunsubAt(s, j)) return -1; depth++; j++; }
+        if (nx === '(' || nx === "'" || isFunsubAt(s, j)) return -1;
+        if (nx === '{') { depth++; j++; }
         continue;
       }
       if (c === "'") { j = s.indexOf("'", j + 1); if (j < 0) { j = n; return -1; } continue; }
@@ -2315,7 +2322,8 @@ class Parser {
     p.drain(true);
   }
 
-  parseList(depth, { stopAtParen = false, noRedir = false }) {
+  // maybeArith: the text may be the inside of `$((` / `((` arithmetic (it starts like it; closesAsArith gives up on any quote, so noRedir alone misses `$(( '…' ))`)
+  parseList(depth, { stopAtParen = false, noRedir = false, maybeArith = false }) {
     const ctx = this.ctx;
     if (ctx.nest >= MAX_NEST) { ctx.stopped = true; ctx.truncated = true; this.i = this.src.length; return false; }
     ctx.nest++;
@@ -2323,14 +2331,14 @@ class Parser {
     this.subAcc = [];
     const base = this.ctlBase;
     this.ctlBase = this.ctlStack.length;
-    try { return this.lex(depth, stopAtParen, noRedir); } finally {
+    try { return this.lex(depth, stopAtParen, noRedir, maybeArith); } finally {
       ctx.nest--; this.subAcc = saved;
       while (this.ctlStack.length > this.ctlBase) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); if (CTL_COUNTER[kind]) ctx.ctl[CTL_COUNTER[kind]]--; } // (left open: ends with the level)
       this.ctlBase = base;
     }
   }
 
-  lex(depth, stopAtParen, noRedir) {
+  lex(depth, stopAtParen, noRedir, maybeArith = false) {
     const ctx = this.ctx;
     const s = this.src;
     const n = s.length;
@@ -2531,6 +2539,8 @@ class Parser {
       } else if (c === "'") {
         startSeg(); mark();
         const j = s.indexOf("'", this.i + 1);
+        // (#269 R17-F2) in arithmetic a quote is no quote: `$(( 1 + '$(cmd)' ))` runs cmd (then fails the math). Refused, not read.
+        if ((noRedir || maybeArith) && /[$`]/.test(s.slice(this.i + 1, j < 0 ? n : j))) { cur += this.funsub(REFUSED_ARITH); continue; } // (a real `$((cmd '$x') )` subshell too: a false refusal)
         if (j < 0) { cur += s.slice(this.i + 1); this.i = n; } else { cur += s.slice(this.i + 1, j); this.i = j + 1; }
         lastCur = null;
       } else if (c === '"') {
@@ -2672,7 +2682,7 @@ class Parser {
           if (body) this.ctx.ctl.fn++;
           if (cond) this.ctx.ctl.cond++;
           try {
-            this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || (s[this.i] === '(' && closesAsArith(s, this.i - 1, 2)) })); // ((...)) is arithmetic when it closes as `))`; `((cmd) )` is nested subshells, redirects and all
+            this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || (s[this.i] === '(' && closesAsArith(s, this.i - 1, 2)), maybeArith: maybeArith || s[this.i] === '(' })); // ((...)) is arithmetic when it closes as `))`; `((cmd) )` is nested subshells, redirects and all
           } finally { if (body) this.ctx.ctl.fn--; if (cond) this.ctx.ctl.cond--; }
           fnPending = false;
           if (head?.length) { for (const name of head) ctx.fns.add(name); fnPending = true; }
@@ -3294,7 +3304,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, refused: null, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -3334,6 +3344,8 @@ export function simpleCommands(str, opts) {
     try { parser?.drain(true); } catch { /* best effort */ }
   }
   Object.defineProperty(ctx.out, 'truncated', { value: ctx.truncated, enumerable: false });
+  // refused: with `truncated`, the form the parser refuses to read (a ${ cmd; } or similar; #269 R17-F3), so the guard can name it; null otherwise
+  Object.defineProperty(ctx.out, 'refused', { value: ctx.refused, enumerable: false });
   Object.defineProperty(ctx.out, 'dynamic', { value: ctx.dynamic || ctx.dynamicHead, enumerable: false });
   // dynamicOther: dynamic for a reason other than a command word that starts with `$` or holds a substitution (#81 t8: such a head is resolved per reading by the git policy's onceAssignedNames;
   // a stdin feed of that command, a process substitution, an unknown descriptor ... still count here)

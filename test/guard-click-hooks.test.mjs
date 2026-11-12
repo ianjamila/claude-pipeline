@@ -1026,6 +1026,50 @@ test('R16: any unquoted or double-quoted ${ cmd; } is refused, its body is never
   assert.deepEqual(blocked, [], 'these R16 lines were refused');
 });
 
+test('R17: a line continuation after $ / ${ / <, and a substitution in single quotes inside arithmetic, are refused; the ${ refusal says why', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json'; // (the name is built at run time: no plain-text match refuses the line)
+  const failures = [];
+  for (const cmd of [
+    // R17-F1: bash drops backslash-newline while reading, so these are ${ cmd; }, $( ) and <( ) to the shell
+    'echo ${\\\n ' + cp + '; }',
+    'echo "${\\\n ' + cp + '; }"',
+    'echo $\\\n{ ' + cp + '; }',
+    'echo "$\\\n(' + cp + ')"',
+    'echo $\\\n(' + cp + ')',
+    'echo "$\\\r\n(' + cp + ')"',
+    'echo ${x:-$\\\n(' + cp + ')}',
+    'echo ${x:-"$\\\n(' + cp + ')"}',
+    'cat <<E\n$\\\n(' + cp + ')\nE',
+    'case a in $\\\n(' + cp + ')) echo;; esac',
+    'cat <\\\n(' + cp + ')',
+    // R17-F2: inside $(( )), (( )) and for (( )) a single quote is an ordinary character: the substitution runs
+    "echo $(( 1 + '${ " + cp + "; }' ))",
+    "echo $(( 1 + '$(" + cp + ")' ))",
+    "echo $(( 1 + '`" + cp + "`' ))",
+    "(( 1 + '$(" + cp + ")' ))",
+    "for (( i = 0; i < '$(" + cp + ")'; i++ )); do :; done",
+    "echo $(( 1 + ( '$(" + cp + ")' ) ))",
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R17 lines were not refused');
+  const blocked = [];
+  for (const cmd of [
+    'ls \\\n  -la /tmp',
+    "echo 'a$\\\nb'",
+    'echo $(( 1 + 2 ))',
+    "echo $(( 1 + 2 )) 'a$(b)'",
+    "cat <<'E'\n$\\\n(x)\nE",
+  ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
+  assert.deepEqual(blocked, [], 'these R17 lines were refused');
+  // R17-F3: the refusal names the form and what to do instead (not "split it into simpler commands")
+  for (const cmd of ['x=${ date; }', 'echo "${ echo a; }"', 'git commit -m "use ${ x; } here"']) {
+    const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/home/u' });
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /\$\{ cmd; \}/, cmd);
+    assert.match(r.reason, /Write tool/, cmd);
+    assert.doesNotMatch(r.reason, /split it into simpler commands/, cmd);
+  }
+});
+
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------
 
 test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] argument no longer hide a fed interpreter', () => {

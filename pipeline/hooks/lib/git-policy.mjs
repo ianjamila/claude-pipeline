@@ -2813,7 +2813,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
-  if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
+  if (cmds.truncated) return deny(cmds.refused ? `the command uses ${cmds.refused}, which the guard does not read. Write \`$(cmd)\` on one line instead, or put such text in a file with the Write tool (git commit -F <file>, gh … --body-file <file>).` : 'command too complex to verify (the parser gave up). Split it into simpler commands.');
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Rewrite: write the command out literally (`git push origin agent/x`, not `$G push` or `... | sh`); if the guarded words are only text (a commit message, a PR body), put that text in a file (`git commit -F msg.txt`, `gh pr create --body-file body.md`).');
   }
