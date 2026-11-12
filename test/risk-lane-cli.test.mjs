@@ -237,3 +237,32 @@ test('P risk: a size-only medium PR reports sizeOnly, drivers, reviewer judge an
   assert.ok(rh.json.hardStops.length > 0);
   assert.equal(rh.json.drivers.hardStop, true);
 });
+
+test('codex-review + review-complete: an uncommitted medium_lines that rates the PR low next to the fork point config (medium for size) records judge rounds that review-complete accepts', (t) => {
+  const w = world(t, { workingYml: withBlocks('risk:\n  medium_lines: 300\n') });
+  const r = w.codex(1);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.reviewer, r.json.sizeOnly, r.json.reviewerReasons], ['judge', true, []]);
+  assert.match(r.json.laneNote, /medium for size only: Sonnet judge/);
+  assert.equal(w.state().risk, 'medium');
+  const done = w.cli(['review-complete', '--pr', '7']);
+  assertExit(done, 0, done.stderr + done.stdout);
+  assert.equal(done.json.ok, true);
+});
+
+test('codex-review + review-complete: the same disagreement where the lenient config still holds a (discounted) hit demands Fable on both sides', (t) => {
+  // fork point: medium_lines 300 (low) with an ignored P-path hit; working tree: defaults (medium for size, no hit). The hit is more than size.
+  const base = withBlocks('owner_approval: chat\nrisk:\n  medium_lines: 300\n  ignore_hard_stop_rules: [P-path]\nhard_stops:\n  paths: [src/big.js]\n');
+  const w = world(t, { baseYml: base, workingYml: pipelineYml() });
+  const r = w.codex(1);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.reviewer, r.json.sizeOnly, r.json.laneNote], ['fable', undefined, undefined]);
+  assert.equal(w.state().rounds[0].fableRequired, true);
+  const st = w.state();
+  st.reviewer = 'judge';
+  st.rounds = st.rounds.map(({ fableRequired, fableReasons, sensitivePaths, ...rest }) => rest);
+  w.saveState(st);
+  const done = w.cli(['review-complete', '--pr', '7']);
+  assertExit(done, 1);
+  assert.match(done.json.reason, /needs the Fable review pass/);
+});

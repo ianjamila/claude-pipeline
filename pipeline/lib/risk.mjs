@@ -215,16 +215,26 @@ export async function rateBranch({ root, head, config, defaultBranch = config.de
   const sizeCandidate = rated.some((r) => r.risk.sizeOnly);
   if (stacked && sizeCandidate) reasons.push(`stacked PR: base is ${prBase} (no size-only judge)`);
   if (!trusted.ok) laneReasons.push(`trusted base config unreadable: ${trusted.reason}`);
-  const hitKey = new Set();
-  const hits = rated.flatMap((r) => r.hits).filter((h) => {
-    const key = `${h?.rule}\u0000${h?.file}`;
-    if (hitKey.has(key)) return false;
-    hitKey.add(key);
-    return true;
-  });
+  // The collector's own identity (hardstops.mjs makeSink: rule, file, line; the detail when there is no line), and the stricter status
+  // (blocking > ownerMerge > report-only) when both configs report the same hit.
+  const strength = (h) => (h?.advisory !== true ? 2 : h.ownerMerge === true ? 1 : 0);
+  const merged = new Map();
+  for (const h of rated.flatMap((r) => r.hits)) {
+    const key = `${h?.rule}\0${h?.file}\0${h?.line ?? ''}\0${h?.line === undefined ? h?.detail : ''}`;
+    const seen = merged.get(key);
+    if (seen === undefined || strength(h) > strength(seen)) merged.set(key, h);
+  }
+  const hits = [...merged.values()];
   const sensitivePaths = [...new Set(rated.flatMap((r) => r.lane.sensitivePaths))];
-  const sizeOnly = trusted.ok && !stacked && rated.every((r) => r.risk.sizeOnly);
-  const reviewer = !trusted.ok || rated.some((r) => r.lane.reviewer === 'fable') ? 'fable' : 'judge';
+  // Size alone raised the level in at least one evaluation and every other evaluation is plainly low (no raw hit, no sensitive path): the judge
+  // lane review-complete accepts. A low evaluation next to a size-only medium one (the configs disagree on a threshold) must not deadlock it.
+  const sizeOnly = trusted.ok && !stacked && rated.some((r) => r.risk.sizeOnly)
+    && rated.every((r) => r.risk.sizeOnly || (r.risk.level === 'low' && r.hits.length === 0));
+  // A medium that is not size-only overall (one evaluation's size-only judge lane next to another's low-with-a-hit) is Fable: review-complete
+  // accepts a recorded medium on judge rounds only when sizeOnly is true, so the lane and that check must agree.
+  const mediumNotSizeOnly = level === 'medium' && !sizeOnly;
+  if (mediumNotSizeOnly && !laneReasons.some((x) => x.endsWith('medium risk'))) laneReasons.push('medium risk');
+  const reviewer = !trusted.ok || mediumNotSizeOnly || rated.some((r) => r.lane.reviewer === 'fable') ? 'fable' : 'judge';
   const sizeOnlyJudge = reviewer === 'judge' && rated.some((r) => r.lane.sizeOnlyJudge === true);
   const first = rated[0].risk;
   return {

@@ -161,3 +161,40 @@ test('rateBranch (cp-like): a big cp PR keeps Fable because its P-path hits make
   assert.equal(rl.reviewer, 'fable');
   assert.equal(rl.level, 'high');
 });
+
+test('rateBranch: one config rates the size-only PR low and the other medium for size only: sizeOnly is true and the judge reviews (no deadlock)', async (t) => {
+  // trusted base config: defaults (medium_lines 150, so 200 lines is medium); the uncommitted config raises medium_lines to 300 (low)
+  const w = world(t, { feature: (r) => r.write('src/a.js', lines(200)) });
+  const r = await w.rate(yml('risk:\n  medium_lines: 300\n'));
+  assert.equal(r.baseConfig.same, false);
+  assert.deepEqual([r.level, r.sizeOnly, r.reviewer, r.sizeOnlyJudge], ['medium', true, 'judge', true]);
+  // and the other way round: the trusted config is the lenient one
+  const rev = world(t, { baseYml: yml('risk:\n  medium_lines: 300\n'), feature: (r2) => r2.write('src/a.js', lines(200)) });
+  const rr = await rev.rate(yml());
+  assert.deepEqual([rr.level, rr.sizeOnly, rr.reviewer], ['medium', true, 'judge']);
+});
+
+test('rateBranch: a low evaluation that still has a raw hit (here an ignored one) keeps sizeOnly false, so Fable is demanded', async (t) => {
+  const baseYml = yml('owner_approval: chat\nrisk:\n  medium_lines: 300\n  ignore_hard_stop_rules: [P-path]\nhard_stops:\n  paths: ["src/a.js"]\n');
+  const w = world(t, { baseYml, feature: (r) => r.write('src/a.js', lines(200)) });
+  // the working config is the strict one: no ignore list, so the P-path hit is real there too; either way the hit makes it more than size
+  const r = await w.rate(yml('owner_approval: chat\nhard_stops:\n  paths: ["src/a.js"]\nrisk:\n  medium_lines: 100\n  ignore_hard_stop_rules: [P-path]\n'));
+  assert.equal(r.sizeOnly, false);
+  assert.equal(r.reviewer, 'fable');
+});
+
+test('rateBranch: hits keep the collector identity (rule, file, line) and the stricter status when both configs report the same hit', async (t) => {
+  const pat = '  patterns:\n    - { name: todo, regex: "export const x" }\n';
+  const feature = (r) => r.write('src/a.js', 'export const x1 = 1;\nexport const x2 = 2;\nexport const y = 3;\n');
+  // one config: two matches in one file on different lines stay two hits
+  const one = world(t, { baseYml: yml(`hard_stops:\n${pat}`), feature });
+  const r1 = await one.rate();
+  const p1 = r1.hits.filter((h) => h.rule === 'P-pattern');
+  assert.deepEqual(p1.map((h) => h.line).sort(), [1, 2]);
+  // two configs: the same two hits are reported by both; report-only in the working config, blocking in the trusted one -> the blocking copy survives
+  const two = world(t, { baseYml: yml(`hard_stops:\n${pat}`), feature });
+  const r2 = await two.rate(yml(`hard_stops:\n${pat}  report_only_rules: [P-pattern]\n`));
+  const p2 = r2.hits.filter((h) => h.rule === 'P-pattern');
+  assert.equal(p2.length, 2);
+  assert.ok(p2.every((h) => h.advisory !== true), JSON.stringify(p2));
+});
