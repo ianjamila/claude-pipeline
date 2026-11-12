@@ -22,14 +22,15 @@ import { OUTAGE_NO_RESET_MS } from './codex-usage.mjs';
 import { ensureRoundDir, roundDir, withReviewLock, writeJson } from './review-context.mjs';
 
 export const ROUTE_FILE = 'route.json';
-export const routeFile = (root, round) => path.join(roundDir(root, round), ROUTE_FILE);
+// `file` names another record of the same lifecycle in the round folder: a second review's `route-2nd-<packetId8>.json` (R5-7); the default is the round's own route.json.
+export const routeFile = (root, round, file = ROUTE_FILE) => path.join(roundDir(root, round), file);
 export const attemptDir = (root, round, attemptId) => path.join(roundDir(root, round), `attempt-${attemptId}`);
 export const newAttemptId = () => randomBytes(8).toString('hex');
 
 // The record as it is on disk, or null (missing, unreadable, not an object). Never throws.
-export function readRoute(root, round) {
+export function readRoute(root, round, file = ROUTE_FILE) {
   try {
-    const route = JSON.parse(readFileSync(routeFile(root, round), 'utf8'));
+    const route = JSON.parse(readFileSync(routeFile(root, round, file), 'utf8'));
     return route !== null && typeof route === 'object' && !Array.isArray(route) ? route : null;
   } catch {
     return null;
@@ -42,21 +43,22 @@ export const superseded = () => new Fail(EXIT.USAGE, {
 });
 
 // Inside the review lock: is route.json still this attempt, unfinished? Else exit 2 `superseded` (the caller writes and deletes nothing).
-export function assertCurrentAttempt(root, round, attemptId) {
-  const current = readRoute(root, round);
+export function assertCurrentAttempt(root, round, attemptId, file = ROUTE_FILE) {
+  const current = readRoute(root, round, file);
   if (current === null || current.attemptId !== attemptId || current.evidence !== 'pending') throw superseded();
   return current;
 }
 
 // Atomically replaces route.json with a fresh pending record and makes the attempt's folder. -> { attemptId, dir, route }.
-export async function startAttempt({ root, round, base, head, patchSha256, risk, agent, now = Date.now() }) {
+// `extra` adds fields to the record (a second review's kind, ids and packet identity); `file` is the record's name.
+export async function startAttempt({ root, round, base, head, patchSha256, risk, agent, now = Date.now(), file = ROUTE_FILE, extra = {} }) {
   const attemptId = newAttemptId();
-  const route = { attemptId, evidence: 'pending', round, base, head, patchSha256, risk, agent, at: new Date(now).toISOString() };
+  const route = { attemptId, evidence: 'pending', round, base, head, patchSha256, risk, agent, ...extra, at: new Date(now).toISOString() };
   const dir = attemptDir(root, round, attemptId);
   // No review lock: the review lock is held only to record a round, never while Codex runs. The rename is atomic; the compare-and-swap that needs the lock is the final write.
   ensureRoundDir(root, round);
   mkdirSync(dir, { recursive: true });
-  writeJson(routeFile(root, round), route);
+  writeJson(routeFile(root, round, file), route);
   return { attemptId, dir, route };
 }
 
@@ -74,17 +76,17 @@ export function publishAttemptFiles(root, round, attemptId, names) {
 }
 
 // Inside the review lock: writes the attempt's final evidence over its pending record. `final` = { evidence, ...fields }.
-export function writeFinalRoute(root, round, pending, final, now = Date.now()) {
-  writeJson(routeFile(root, round), { ...pending, ...final, at: new Date(now).toISOString(), startedAt: pending.at });
+export function writeFinalRoute(root, round, pending, final, now = Date.now(), file = ROUTE_FILE) {
+  writeJson(routeFile(root, round, file), { ...pending, ...final, at: new Date(now).toISOString(), startedAt: pending.at });
 }
 
 // The failure path: under the review lock, only while this attempt is still the current one, copy its files to round-R/ and write the final evidence.
 // A superseded attempt throws (exit 2) and touches nothing.
-export async function finishAttempt({ root, pr, ctx, round, attempt, final, files = ['prompt.md'], now }) {
+export async function finishAttempt({ root, pr, ctx, round, attempt, final, files = ['prompt.md'], now, file = ROUTE_FILE }) {
   return withReviewLock(root, pr, ctx, () => {
-    const pending = assertCurrentAttempt(root, round, attempt.attemptId);
+    const pending = assertCurrentAttempt(root, round, attempt.attemptId, file);
     publishAttemptFiles(root, round, attempt.attemptId, files);
-    writeFinalRoute(root, round, pending, final, now);
+    writeFinalRoute(root, round, pending, final, now, file);
   });
 }
 

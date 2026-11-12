@@ -17,8 +17,9 @@ import { quotaValidUntilMs, readRoute, superseded, writeFinalRoute } from '../li
 import { codexSpend } from '../lib/review-route.mjs';
 import { higherRisk, maxRiskOf } from '../lib/state.mjs';
 import { substituteAgentFor } from '../lib/triage.mjs';
-import { extractJsonBlock, findSubagentTranscript, findTaggedTranscripts, proveModel, toolCallsOf } from '../lib/transcript.mjs';
-import { readFileOrFail, roundDir, sha256, withReviewLock, writeFileAtomic, writeJson } from '../lib/review-context.mjs';
+import { extractJsonBlock } from '../lib/transcript.mjs';
+import { proveSubstituteRun } from '../lib/substitute-proof.mjs';
+import { roundDir, sha256, withReviewLock, writeFileAtomic, writeJson } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'prepare the input for the Claude substitute reviewer of a round Codex could not review, then prove and record its answer',
@@ -58,11 +59,6 @@ const ATTEMPTS_FILE = 'substitute-attempts.json';
 const PROOF_FILE = 'substitute-proof.json';
 const EVIDENCE_KINDS = ['quota', 'budget', 'governor'];
 const MAX_INVALID_ATTEMPTS = 2;
-const READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob'];
-// The hand-back tool is how a background subagent delivers its report (transcript.mjs); it is not a way to act on the repository.
-const ALLOWED_TOOLS = [...READ_ONLY_TOOLS, 'SubagentHandback'];
-const MODEL_PREFIX = { 'substitute-opus': 'claude-opus-', 'substitute-fable': 'claude-fable-' };
-const PROOF_EFFORT = 'high';
 
 const refuse = (error, message, extra = {}) => new Fail(EXIT.FAILED, { ok: false, error, message, ...extra });
 const usageFail = (error, message) => new Fail(EXIT.USAGE, { ok: false, error, message });
@@ -299,33 +295,20 @@ async function applyLocked({ root, pr, round, ctx, givenTag, projectsDir, maxAge
   const packet = buildPacket(adm, route, root, config.review.substitute.max_packet_mb * 1024 * 1024);
   const agent = checkAgainstRound(route, adm, packet, root);
 
-  const found = findSubagentTranscript({ tag, projectsDir, maxAgeMs });
-  if (!found) throw usageFail('not-found', `no recent subagent transcript tagged ${JSON.stringify(tag)}`);
-  const jsonlText = readFileOrFail(found.jsonlPath, 'transcript');
-  const metaText = found.metaPath === null ? undefined : readFileOrFail(found.metaPath, 'meta');
-
   const errors = [];
   if (agent !== open.agent) errors.push(`the open attempt was prepared for ${open.agent} but the PR needs ${agent}`);
-  const tagged = findTaggedTranscripts({ tag, projectsDir });
-  if (tagged.length !== 1) errors.push(`rerolled: ${tagged.length} transcripts carry the tag ${JSON.stringify(tag)}; a tag is one run`);
   if (packet.digest !== open.digest) errors.push('the round\'s input is no longer the one `substitute prepare` wrote (digest differs): prepare again');
   errors.push(...checkPacketOnDisk(packet, root, round));
 
-  // The arbiter's proof: pinned model per turn, effort, agent type, no per-call model, one prompt, a complete final answer.
-  const proof = proveModel({ jsonlText, metaText, expectModelPrefix: MODEL_PREFIX[open.agent] ?? '', expectEffort: PROOF_EFFORT, expectMetaModel: null, expectAgentType: open.agent });
-  errors.push(...proof.errors);
+  // Transcript, model, effort, agent type, prompt, tools and reads: the proof shared with `triage second-review --apply` (lib/substitute-proof.mjs).
   const inputPath = inputPathOf(root, round);
-  const expectedPrompt = firstPromptFor(round, open.digest, inputPath);
-  // Trailing whitespace is not text; everything else must be equal, so nothing can be added in front of or after the fixed prompt.
-  if (proof.firstUserText.trimEnd() !== expectedPrompt.trimEnd()) errors.push('the agent\'s first prompt is not exactly the prepared one (promptHeader + the fixed Read line): text was added or changed');
-
-  // Only Read / Grep / Glob were used, and every file of the packet was really read.
-  const calls = toolCallsOf(jsonlText);
-  for (const name of new Set(calls.map((c) => c.name))) if (!ALLOWED_TOOLS.includes(name)) errors.push(`tool ${name} was used; only ${READ_ONLY_TOOLS.join(', ')} are allowed`);
-  const required = [inputPath, ...packet.files.map((f) => path.join(packet.dir, f.rel))];
-  for (const file of required) {
-    if (!calls.some((c) => c.name === 'Read' && c.input.file_path === file && c.answered && !c.isError)) errors.push(`the transcript shows no successful Read of ${file}`);
-  }
+  const proven = proveSubstituteRun({
+    tag, projectsDir, maxAgeMs, agent: open.agent, errors,
+    expectedPrompt: firstPromptFor(round, open.digest, inputPath),
+    requiredReads: [inputPath, ...packet.files.map((f) => path.join(packet.dir, f.rel))],
+  });
+  if (proven === null) throw usageFail('not-found', `no recent subagent transcript tagged ${JSON.stringify(tag)}`);
+  const { found, proof, claudeCodeVersions } = proven;
 
   let findings = null;
   try {
@@ -338,7 +321,6 @@ async function applyLocked({ root, pr, round, ctx, givenTag, projectsDir, maxAge
   }
 
   const baseOk = errors.length === 0 && findings !== null;
-  const claudeCodeVersions = proof.claudeCodeVersions ?? [];
   const efforts = proof.efforts && typeof proof.efforts === 'object' ? Object.keys(proof.efforts).join(', ') : '';
   const settle = (status, extra = {}) => {
     const entry = { ...open, status, endedAt: new Date().toISOString(), ...extra };
