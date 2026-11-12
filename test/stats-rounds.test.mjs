@@ -137,3 +137,17 @@ test('R1-B1 analysePr: a cached accept (an already-fixed suggestion re-raised) i
   const mixed = analysePr({ repo: 'acme/widgets', pr: 7, state: stateOf([round(1, []), round(2, [cached('R2-S1'), acc('R2-S2')], { admission: 'auto-extra' })]), record: null });
   assert.equal(mixed.rounds[1].found, 'accepts');
 });
+
+test('R1-B2 analysePr: an item deferred past the cap still counts as accepted for what its round found (as "deferred"), and not as a fix the next round re-checked', () => {
+  const overruled = { decision: 'ACCEPT', by: 'judge' };
+  const deferred = (id, over = {}) => ({ id, bucket: 'SUGGESTION', category: 'maintainability', title: 'Rename helper', final: { decision: 'FOLLOW-UP', by: 'claude', claude: { cause: 'round-cap', overruled } }, ...over });
+  const viaMarker = deferred('R2-S1', { roundCapDeferral: { fixHead: 'a', reviewedHead: 'b', at: 't' } });
+  const viaCause = deferred('R2-S2');
+  const parked = { id: 'R2-S3', bucket: 'SUGGESTION', category: 'maintainability', final: { decision: 'FOLLOW-UP', by: 'claude', claude: { cause: 'round-cap', overruled: { decision: 'REJECT', by: 'judge' } } } };
+  const state = stateOf([round(1, []), round(2, [viaMarker], { admission: 'auto-extra' }), round(3, [viaCause, parked], { admission: 'owner', ownerGrant: { grantId: 'g', k: 3, quote: 'extra round' } }), round(4, [])], 1);
+  const p = analysePr({ repo: 'acme/widgets', pr: 7, state, record: null });
+  assert.deepEqual(p.rounds.filter((r) => r.pastCap).map((r) => [r.n, r.found, r.previous]), [[2, 'deferred', 'no-accepts'], [3, 'deferred', 'no-accepts'], [4, 'nothing-accepted', 'no-accepts']]);
+  assert.deepEqual(aggregate([p]).found, { deferred: 2, 'nothing-accepted': 1 });
+  const unrelated = analysePr({ repo: 'acme/widgets', pr: 7, state: stateOf([round(1, []), round(2, [parked], { admission: 'auto-extra' })], 1), record: null });
+  assert.equal(unrelated.rounds[1].found, 'nothing-accepted', 'a round-cap park whose original ruling was not an accept is not an accept');
+});

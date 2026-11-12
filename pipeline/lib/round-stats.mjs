@@ -1,7 +1,7 @@
 // `pipeline stats rounds`: what the review rounds past the limit (review.max_rounds) found and cost, read from the merged PRs' own comments (the triage state and the
 // run record). Pure: the command fetches and decodes, this module only counts. Display only: nothing here decides anything. The audit scripts of 2026-11-11 were the
 // first version of this (their SEC regex is the fallback security heuristic below).
-import { SECURITY_CATEGORIES, countsTowardCap } from './triage.mjs';
+import { ROUND_CAP_CAUSE, SECURITY_CATEGORIES, countsTowardCap, isRoundCapDeferral } from './triage.mjs';
 
 // itemSeverity needs the reviewed diff, which a PR comment does not carry, so the audit's rule judges an item: BLOCKING or security is not low.
 const SEC = /secur|auth|permission|rls|grant|policy|privilege|role|token|secret|injection|xss|csrf|leak|pii|tenant|access|escalat|sanitiz|credential|session|data loss|corrupt|migration|idempot|race|integrity/i;
@@ -10,6 +10,9 @@ export const isSecurityItem = (item) => SECURITY_CATEGORIES.includes(item?.categ
 const decisionOf = (item) => item?.final?.decision ?? null;
 // The rule roundOutcome uses for a NEW accept (triage.mjs isNewAccept): a ruling copied from the cache is an already-accepted, already-fixed finding raised again, not something this round found.
 const isNewAccept = (item) => decisionOf(item) === 'ACCEPT' && item.final.by !== 'cache';
+// An accept that `triage defer-fixes` turned into a FOLLOW-UP (applyRoundCapDefer keeps the original ACCEPT in final.claude.overruled). The round still FOUND it; its fix is out of
+// the tree, so the next round had nothing to re-check for it (decisionOf already reads it as a FOLLOW-UP, so `previous` leaves it out).
+const isDeferredAccept = (item) => isRoundCapDeferral(item) || (item?.final?.claude?.cause === ROUND_CAP_CAUSE && item.final.claude.overruled?.decision === 'ACCEPT');
 const accepted = (round) => (round?.items ?? []).filter((i) => decisionOf(i) === 'ACCEPT');
 const money = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : null);
 const share = (n, d) => (d > 0 ? Math.round((n / d) * 1000) / 1000 : null);
@@ -43,7 +46,7 @@ export function analysePr({ repo, pr, state, record }) {
       row.admission = admissionOf(r, k, max);
       // what the round before it had to re-check: nothing, only fixes of non-BLOCKING non-security items ("low"), or something heavier
       row.previous = prevAccepts.length === 0 ? 'no-accepts' : prevAccepts.every((i) => i.bucket !== 'BLOCKING' && !isSecurityItem(i)) ? 'only-low-fixes' : 'blocking-or-security';
-      row.found = row.acceptedBlocking ? 'new-blocking' : items.some(isNewAccept) ? 'accepts' : 'nothing-accepted';
+      row.found = row.acceptedBlocking ? 'new-blocking' : items.some(isNewAccept) ? 'accepts' : items.some(isDeferredAccept) ? 'deferred' : 'nothing-accepted';
     }
     rows.push(row);
     prev = r;
