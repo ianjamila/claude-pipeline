@@ -779,14 +779,21 @@ export function readApprovals(opts = {}) {
 }
 
 // Every valid record (any kind) younger than maxAgeMs, as written. Never throws.
-function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES } = {}) {
+// `problems` (an array; the strict lookup ownerGrantLookups passes one): each read that was skipped is described in it (the folder or a file that cannot be read, a
+// file that is not a regular file or is over maxBytes); an absent folder or a file that vanished is no problem. Without it a skipped read is silent, as before.
+function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES, problems = null } = {}) {
   const dir = ownerGoDir(home);
   const out = [];
   let names = [];
+  const note = (why) => { if (Array.isArray(problems)) problems.push(why); };
   try {
-    if (!lstatSync(dir).isDirectory()) return out;
+    if (!lstatSync(dir).isDirectory()) {
+      note(`${dir} is not a real folder`);
+      return out;
+    }
     names = session === null ? readdirSync(dir).filter((n) => n.endsWith('.jsonl')) : SESSION_RE.test(String(session)) ? [`${session}.jsonl`] : [];
-  } catch {
+  } catch (err) {
+    if (err?.code !== 'ENOENT') note(`${dir} cannot be read (${err?.code ?? 'error'})`);
     return out;
   }
   const t = now();
@@ -795,7 +802,10 @@ function readRecords({ home = accountHome(), session = null, now = Date.now, max
     let text = '';
     try {
       const st = lstatSync(file);
-      if (!st.isFile() || st.size > maxBytes) continue;
+      if (!st.isFile() || st.size > maxBytes) {
+        note(`${file} is ${st.isFile() ? 'over the size limit' : 'not a regular file'}`);
+        continue;
+      }
       const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
       try {
         const buf = Buffer.alloc(st.size);
@@ -804,7 +814,8 @@ function readRecords({ home = accountHome(), session = null, now = Date.now, max
       } finally {
         closeSync(fd);
       }
-    } catch {
+    } catch (err) {
+      if (err?.code !== 'ENOENT') note(`${file} cannot be read (${err?.code ?? 'error'})`);
       continue;
     }
     for (const line of text.split('\n')) {
@@ -1190,6 +1201,14 @@ function chainState(home, rel) {
   return 'ok';
 }
 
+// Is this record's marker spent? A marker lookup that fails for a reason other than "not there" still counts as spent (the tolerant lookups), but the strict one
+// (opts.problems) records it, so a consumed folder that cannot be searched does not hide an unspent grant (R3-B1).
+function spentMarker(record, { home, problems = null } = {}) {
+  const marker = readGrantMarker(grantIdOf(record), { home });
+  if (marker.lookupError && Array.isArray(problems)) problems.push(`a grant's marker cannot be checked (${marker.lookupError})`);
+  return marker.spent;
+}
+
 // The unspent records (before the provenance check) for this repository, PR, counted round k, newest first (see ownerGrantedRounds).
 function grantsFor({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
   const key = repoKey(repo);
@@ -1197,7 +1216,7 @@ function grantsFor({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
   const moves = movesOf(opts);
   return readRecords(opts)
     .filter((r) => isRoundRecord(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head))
-      && !readGrantMarker(grantIdOf(r), { home: opts.home }).spent)
+      && !spentMarker(r, opts))
     .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
 }
 
@@ -1213,6 +1232,32 @@ export function ownerGrantGap(q = {}) {
   const found = grantsFor(q);
   if (found.length === 0) return 'none';
   return ownedBy(found, { grant: true, home: q.home }).length > 0 ? 'ok' : 'provenance';
+}
+
+// STRICT lookups for `triage defer-fixes` (and the follow-up recommendation of `triage round-request`), which must not defer past a grant it could not see: ownerGrantedRounds and
+// ownerGrantGap answer [] / 'none' when the records cannot be read (readRecords never throws), so here every skipped read makes a lookup THROW instead: the records folder present but
+// unreadable or not a real folder, a session file that cannot be read, is not a regular file or is over the size limit, a repo-moves file that is present but unreadable, and a
+// consumed-grants folder that is not a real folder (readGrantMarker would call every grant spent), and a marker whose lookup fails for any reason but "not there" (a consumed folder that cannot be searched). An absent folder (nothing was ever recorded) is no grant, as before.
+// Returns { grants(k), grantGap(k) } for the repository and PR at counted round k and ANY head: grants -> the records the owner typed (provenance confirmed), grantGap -> 'none' | 'provenance' | 'ok'.
+export function ownerGrantLookups({ repo, pr, home = accountHome(), now = Date.now } = {}) {
+  const base = [];
+  const moves = readRepoMoves({ home });
+  if (moves.error) base.push(`the recorded repository moves cannot be read (${moves.error})`);
+  if (chainState(home, CONSUMED_REL) === 'unsafe') base.push('the consumed-grants folder is not a real folder');
+  const read = (k) => {
+    const problems = [...base];
+    const found = grantsFor({ repo, pr, k, anyHead: true, home, now, repoMoves: moves.moves, problems });
+    if (problems.length > 0) throw new Error(problems.slice(0, 3).join('; '));
+    return found;
+  };
+  return {
+    grants: (k) => ownedBy(read(k), { grant: true, home }),
+    grantGap(k) {
+      const found = read(k);
+      if (found.length === 0) return 'none';
+      return ownedBy(found, { grant: true, home }).length > 0 ? 'ok' : 'provenance';
+    },
+  };
 }
 
 // R2-F3 for a grant: text to append to a refusal when the unconfirmed records' transcripts are under a config dir this process does not know ('' otherwise).
@@ -1262,7 +1307,8 @@ export function claimGrantMarkers(records, body, { home = accountHome(), now = D
 }
 
 // What is on disk for a grant id: { spent: false, verifiable: false } (no marker), { spent: true, verifiable: true, marker } or
-// { spent: true, verifiable: false } (a partial, unparseable, linked or otherwise odd marker, or an unsafe folder: spent, never trusted).
+// { spent: true, verifiable: false } (a partial, unparseable, linked or otherwise odd marker, or an unsafe folder: spent, never trusted); the last also
+// carries lookupError (an error code) when the marker could not even be looked up (not ENOENT), which is not proof it exists.
 export function readGrantMarker(grantId, { home = accountHome() } = {}) {
   const file = markerPath(grantId, { home });
   if (file === null) return { spent: true, verifiable: false };
@@ -1272,7 +1318,7 @@ export function readGrantMarker(grantId, { home = accountHome() } = {}) {
   try {
     if (!lstatSync(file).isFile()) return { spent: true, verifiable: false };
   } catch (err) {
-    return err?.code === 'ENOENT' ? { spent: false, verifiable: false } : { spent: true, verifiable: false };
+    return err?.code === 'ENOENT' ? { spent: false, verifiable: false } : { spent: true, verifiable: false, lookupError: err?.code ?? 'unknown' };
   }
   try {
     const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));

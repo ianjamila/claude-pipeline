@@ -30,7 +30,7 @@ import { createGitHub } from '../lib/github.mjs';
 import { GhError } from '../lib/proc.mjs';
 import { assessRisk, isLightLane, reviewLane } from '../lib/risk.mjs';
 import { addRound, emptyState, loadState, saveState } from '../lib/state.mjs';
-import { reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from '../lib/triage.mjs';
+import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from '../lib/triage.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
   allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, writeFileAtomic,
@@ -392,7 +392,7 @@ export const run = guarded(async (argv, ctx) => {
       };
     }
     const base0 = fresh ?? emptyState({ repo: slug, pr, branch: view.headRefName ?? 'HEAD', risk: level, lightLane, maxRounds: config.review.max_rounds });
-    const ruled = reuseRuled(assignIds(findings, round, excerptFor, { contentHash: hashAtHead }), ruledCacheFrom(allItems(base0)));
+    const ruled = linkDeferredFollowups(reuseRuled(assignIds(findings, round, excerptFor, { contentHash: hashAtHead }), ruledCacheFrom(allItems(base0)), { round }), allItems(base0));
     const reviewer = fable || fresh?.reviewer === 'fable' ? 'fable' : 'judge';
     const reasons = lane.reasons.length > 0 ? lane.reasons : ['reviewed by Fable in an earlier round'];
     const next = addRound({ ...base0, risk: level, lightLane: reviewer === 'fable' ? false : lightLane, reviewer, currentContentHash: hashAtHead }, {
