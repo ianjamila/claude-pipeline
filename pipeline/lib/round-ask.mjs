@@ -12,14 +12,19 @@ const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const BUCKET_WORDS = { BLOCKING: 'BLOCKING', SUGGESTION: 'SUGGESTIONS', WORTH_CONSIDERING: 'WORTH CONSIDERING' };
 const SHOWN = 6;
 
-// { bookedUsd, reviewUsd, fableUsd, perRoundUsd } from a run record (record.cost), or null when it holds no usable cost.
-export function costFrom(record, reviewed) {
+// { bookedUsd, reviewUsd, fableUsd, perRoundUsd, lastRound, lastRoundUsd } from a run record (record.cost), or null when it holds no usable cost.
+// lastRoundUsd is what was booked to the newest COUNTED round of `state` that has a cost.byRound entry (`P cost --round R`; R is the round's number `n`), lastRound its
+// number; both null for a record without byRound, or when no state is given. A base-only / resolution-only round is not a counted one, so its booking is skipped.
+export function costFrom(record, reviewed, state) {
   const c = record?.cost;
   if (!isObj(c) || !isObj(c.total) || !Number.isFinite(c.total.usd)) return null;
   const reviewUsd = Number.isFinite(c.byPhase?.review?.usd) ? c.byPhase.review.usd : 0;
   const fableUsd = Number.isFinite(c.byRole?.arbiter?.usd) ? c.byRole.arbiter.usd : 0;
+  const byRound = isObj(c.byRound) ? c.byRound : {};
+  const last = [...(state?.rounds ?? [])].reverse().find((r) => countsTowardCap(r) && Number.isInteger(r.n) && Number.isFinite(byRound[String(r.n)]?.usd));
   return {
     bookedUsd: cents(c.total.usd), reviewUsd: cents(reviewUsd), fableUsd: cents(fableUsd), perRoundUsd: reviewed > 0 ? cents(reviewUsd / reviewed) : null,
+    lastRound: last ? last.n : null, lastRoundUsd: last ? cents(byRound[String(last.n)].usd) : null,
   };
 }
 
@@ -69,6 +74,15 @@ export function notCleanReasons(outcome, changed) {
   return out;
 }
 
+// "(the last round (R) cost $X; about $Y per round)": the last round's own figure when `P cost --round` booked one, the average as the fallback.
+const costDetail = (cost) => {
+  const parts = [
+    Number.isFinite(cost.lastRoundUsd) && Number.isInteger(cost.lastRound) ? `the last round (${cost.lastRound}) cost ${usd(cost.lastRoundUsd)}` : null,
+    cost.perRoundUsd === null || cost.perRoundUsd === undefined ? null : `about ${usd(cost.perRoundUsd)} per round`,
+  ].filter(Boolean);
+  return parts.length ? ` (${parts.join('; ')})` : '';
+};
+
 const sentence = (s) => {
   const t = String(s).trim();
   return t === '' ? t : `${t[0].toUpperCase()}${t.slice(1)}${/[.!?]$/.test(t) ? '' : '.'}`;
@@ -80,7 +94,7 @@ export function askSummary({ rounds, cost, open, notClean, follow, discard }) {
   const lines = [`Rounds: ${rounds.reviewed} reviewed (${limit}); this would be round ${rounds.next}.`];
   lines.push(cost === null
     ? 'Booked agent cost so far: not available.'
-    : `Booked agent cost so far: ${usd(cost.bookedUsd)}, review ${usd(cost.reviewUsd)}${cost.perRoundUsd === null ? '' : ` (about ${usd(cost.perRoundUsd)} per round)`}.`);
+    : `Booked agent cost so far: ${usd(cost.bookedUsd)}, review ${usd(cost.reviewUsd)}${costDetail(cost)}.`);
   if (open.length === 0) lines.push('Open: no item is open.');
   else {
     const shown = open.slice(0, SHOWN).map((i) => `${i.id} (${BUCKET_WORDS[i.bucket] ?? asciiLine(i.bucket, 20)}, ${i.category ?? 'no category'})`);

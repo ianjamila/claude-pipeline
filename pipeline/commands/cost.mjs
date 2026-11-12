@@ -14,10 +14,12 @@ export const meta = {
   summary: 'book tokens / USD / retries of one agent call in the run record (shown by `P summary`)',
   usage: [
     'pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|verifier|controller|other',
-    '              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--retry] [--session ID]... [--repo DIR]',
-    '  -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount), 3 GitHub unavailable',
+    '              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--round R] [--retry] [--session ID]... [--repo DIR]',
+    '  -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount), 3 GitHub unavailable',
     '  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB);',
     '  explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.',
+  '  --round R: the review round the call served (judge or arbiter of round R, and the implementer that fixes round R\'s accepts); the entry is also added to cost.byRound[R],',
+  '  which the extra-round ask uses to name what the last round cost. Build-phase calls pass none.',
   '  USD: --usd X as given; otherwise the list price of each transcript message\'s own model version (--model M prices the messages that carry none)',
   '  plus the explicit tokens at --model M. Tokens with no known model add no USD (a warning says so). Priced tokens are also booked in',
   '  cost.byPrice (keyed model|tier|speed) so a later price table can re-price them; output `bucketed` says whether this entry carries them.',
@@ -43,16 +45,18 @@ export const run = guarded(async (argv, ctx) => {
     pr: { type: 'string' }, phase: { type: 'string' }, role: { type: 'string' },
     input: { type: 'string' }, output: { type: 'string' }, 'cache-read': { type: 'string' }, 'cache-write': { type: 'string' },
     usd: { type: 'string' }, model: { type: 'string' }, 'from-transcript': { type: 'string' }, retry: { type: 'boolean' }, session: { type: 'string', multiple: true },
-    repo: { type: 'string' },
+    round: { type: 'string' }, repo: { type: 'string' },
   }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const phase = requireOption(values, 'phase');
   const role = requireOption(values, 'role');
+  const round = intOption(values, 'round', { min: 1 });
   const root = resolveRepo(values, ctx);
 
   const spent = ['input', 'output', 'cache-read', 'cache-write', 'usd', 'from-transcript'].some((k) => values[k] !== undefined);
   if (!spent && !values.retry && !values.session?.length) throw new UsageError('nothing to record: pass amounts (--input … --usd), --retry or --session');
 
+  if (round !== undefined && !spent) throw new UsageError('--round books an amount: pass amounts (--input … --usd) with it');
   if (values.model !== undefined && modelFamily(values.model) === null) throw new UsageError(`--model ${values.model}: not one of opus, sonnet, haiku, fable`);
   const fromFile = values['from-transcript'] ? transcriptUsage(values['from-transcript'], root, values.model) : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, unpricedMessages: 0, byPrice: {} };
   const num = (flag) => {
@@ -90,6 +94,7 @@ export const run = guarded(async (argv, ctx) => {
       input: fromFile.input + num('input'), output: fromFile.output + num('output'),
       cacheRead: fromFile.cacheRead + num('cache-read'), cacheWrite: fromFile.cacheWrite + num('cache-write'),
       usd: Math.round(usd * 1e6) / 1e6,
+      ...(round !== undefined ? { round } : {}),
       ...(Object.keys(byPrice).length ? { byPrice, priceTable: PRICE_TABLE_DATE } : {}),
     };
     bucketed = complete && Object.keys(byPrice).length > 0;
