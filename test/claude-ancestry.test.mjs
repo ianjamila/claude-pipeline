@@ -138,7 +138,6 @@ test('processTable (win32) parses an array of rows into a pid -> info Map, with 
     { ParentProcessId: 4, Name: 'noid.exe', CommandLine: 'c', Created: 1 },
     { ProcessId: '12', ParentProcessId: 4, Name: 'strid.exe', Created: 1 },
     { ProcessId: 1.5, ParentProcessId: 4, Name: 'frac.exe', Created: 1 },
-    null,
   ]));
   const t = processTable('win32', spawn);
   assert.ok(t instanceof Map);
@@ -177,7 +176,7 @@ test('processTable (win32) is one bounded PowerShell query over ALL processes', 
 test('processTable returns null on any failure, and off win32 without spawning', () => {
   for (const r of [
     { status: 1, stdout: '[]' }, { status: 0, stdout: '' }, { status: 0, stdout: 'not json' }, { status: 0, stdout: '42' },
-    { status: 0, stdout: '"str"' }, { status: 0, stdout: 'null' }, { status: 0, stdout: '[1,2]' }, { status: null, signal: 'SIGTERM', stdout: '[]' },
+    { status: 0, stdout: '"str"' }, { status: 0, stdout: 'null' }, { status: 0, stdout: '[1,2]' }, { status: 0, stdout: '[null]' }, { status: null, signal: 'SIGTERM', stdout: '[]' },
     { status: 0, stdout: '[]', error: new Error('ETIMEDOUT') }, { status: 0, stdout: undefined }, { status: 0, stdout: '[]x' },
   ]) assert.equal(processTable('win32', spawnOf(r)), null, JSON.stringify(r));
   assert.equal(processTable('win32', () => { throw new Error('ENOENT'); }), null, 'a throwing spawn');

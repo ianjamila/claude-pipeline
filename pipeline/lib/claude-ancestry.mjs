@@ -12,6 +12,14 @@
 // lands on Claude Code itself refuses too: fail closed, rare; the message tells the user to close Claude Code or retry).
 // Missing or non-finite times on either side, equal times and a gap up to the skew continue the walk as before.
 //
+// Cost (Windows): a PowerShell start is 1-3 s, so one lookup per hop made a 4-hop walk ~10 s. On win32 the walk therefore reads the
+// WHOLE process table once (processTable: one Get-CimInstance over every process) and answers the own-process lookup and every hop
+// from that Map. A pid absent from the snapshot means "cannot be looked up" and ends the walk (null), exactly as a process that is
+// already gone does today. The reuse rule above applies unchanged; the snapshot is one point-in-time view, which is if anything
+// stricter than lookups made seconds apart. If the snapshot itself fails the walk falls back to the per-hop realLookup, so it degrades
+// to the old cost, never to a different answer. A caller-injected `lookup` always wins (tests, the seam): it is used as is and no
+// snapshot is taken. POSIX keeps the per-hop `ps`, which costs milliseconds, so there is nothing to batch.
+//
 // Accepted residuals (Fable ruling 11-04: the time rule must not fail closed, that would bring #25 back with no security gain):
 //  - Clock rollback: Win32 CreationDate is wall-clock based, so setting the system time back by more than 2 s between a real
 //    non-Claude parent's start and its child's start makes that parent look recycled and the walk stops early, missing a Claude
@@ -101,18 +109,47 @@ const psOut = (args) => {
   return r.status === 0 && typeof r.stdout === 'string' ? r.stdout.trim() : null;
 };
 
-// { ppid, comm, args, created? } for `pid`, or null when it cannot be looked up. `created` (win32 only) is the process start as
-// integer epoch ms: DateTimeOffset converts the CIM date inside PowerShell, so no locale or timezone string is parsed here.
+// One Win32_Process JSON row -> { ppid, comm, args, created? }. Shared by realLookup (one row) and processTable (every row) so the two
+// cannot drift. `created` is the process start as integer epoch ms: DateTimeOffset converts the CIM date inside PowerShell, so no
+// locale or timezone string is parsed here. Throws on a non-object (callers catch).
+function winRowInfo(j) {
+  const info = { ppid: Number(j.ParentProcessId), comm: String(j.Name ?? ''), args: String(j.CommandLine ?? '') };
+  if (typeof j.Created === 'number' && Number.isFinite(j.Created)) info.created = j.Created;
+  return info;
+}
+
+// The whole Windows process table in ONE PowerShell: Map pid -> { ppid, comm, args, created? }, or null on any failure (not win32, a
+// non-zero status, a timeout or other spawn error, empty or malformed output, a payload that is not an array of objects). A row
+// without an integer ProcessId is skipped. The script always emits a JSON array (@(...) + -InputObject; PowerShell would otherwise
+// unroll a one-element array to a bare object, which is also accepted here). Timeout: twice realLookup's 6 s, because this one start
+// also enumerates every process and serialises their command lines (typically 1-3 s on a busy machine); it replaces several
+// starts, so even the worst case is bounded well below the old 4-hop total. maxBuffer 32 MB: a few thousand processes with long
+// command lines is a few MB; an overflow is an error and reads as null (fallback), never a truncated table.
+export function processTable(platform = process.platform, spawn = spawnSync) {
+  if (platform !== 'win32') return null;
+  const script = `ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,@{n='Created';e={if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }}})`;
+  try {
+    const r = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: LOOKUP_TIMEOUT_MS * 4, maxBuffer: 32 * 1024 * 1024, windowsHide: true });
+    if (!r || r.error || r.status !== 0 || typeof r.stdout !== 'string' || !r.stdout.trim()) return null;
+    const parsed = JSON.parse(r.stdout);
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    if (!rows.every((j) => j !== null && typeof j === 'object' && !Array.isArray(j))) return null;
+    const table = new Map();
+    for (const j of rows) if (Number.isInteger(j.ProcessId)) table.set(j.ProcessId, winRowInfo(j));
+    return table;
+  } catch {
+    return null;
+  }
+}
+
+// { ppid, comm, args, created? } for `pid`, or null when it cannot be looked up. `created` is win32 only (see winRowInfo).
 export function realLookup(pid, platform = process.platform, spawn = spawnSync) {
   if (platform === 'win32') {
     const script = `Get-CimInstance Win32_Process -Filter 'ProcessId=${Number(pid)}' | Select-Object ParentProcessId,Name,CommandLine,@{n='Created';e={([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()}} | ConvertTo-Json -Compress`;
     const r = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: LOOKUP_TIMEOUT_MS * 2, windowsHide: true });
     if (r.status !== 0 || !r.stdout) return null;
     try {
-      const j = JSON.parse(r.stdout);
-      const info = { ppid: Number(j.ParentProcessId), comm: String(j.Name ?? ''), args: String(j.CommandLine ?? '') };
-      if (typeof j.Created === 'number' && Number.isFinite(j.Created)) info.created = j.Created;
-      return info;
+      return winRowInfo(JSON.parse(r.stdout));
     } catch {
       return null;
     }
@@ -131,7 +168,15 @@ const finiteTime = (t) => (typeof t === 'number' && Number.isFinite(t) ? t : und
 // recycled Windows PID). The one walk behind hasClaudeCodeAncestor and the review leases (lib/review-lease.mjs needs the pid to find
 // the session's own record). Cycle- and depth-safe; a failed lookup ends the walk with null. On win32 the walk also stops (null) at a
 // non-Claude parent created more than REUSE_SKEW_MS after its child (a recycled PID).
-export function claudeCodeAncestorPid({ startPid = process.ppid, lookup = realLookup, platform = process.platform, maxHops = MAX_HOPS, ownPid = process.pid } = {}) {
+export function claudeCodeAncestorPid({ startPid = process.ppid, lookup: injected, platform = process.platform, maxHops = MAX_HOPS, ownPid = process.pid, spawn = spawnSync, table = () => processTable(platform, spawn) } = {}) {
+  // `table` (a function returning the pid -> info Map or null) and `spawn` are seams for tests. An injected `lookup` wins over both.
+  const perHop = injected ?? ((pid, plat) => realLookup(pid, plat, spawn));
+  let lookup = perHop;
+  if (injected === undefined && platform === 'win32') {
+    let snapshot = null;
+    try { snapshot = table(); } catch { snapshot = null; }
+    if (snapshot instanceof Map) lookup = (pid) => snapshot.get(pid) ?? null;
+  }
   let childCreated;
   if (platform === 'win32') {
     try { childCreated = finiteTime(lookup(ownPid, platform)?.created); } catch { childCreated = undefined; }
