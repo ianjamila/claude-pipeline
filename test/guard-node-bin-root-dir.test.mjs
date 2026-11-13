@@ -270,3 +270,27 @@ test('#352 R2-F1: a workspace plan whose order differs by candidate directory is
   const al = run('git', line, mk('git config alias.ship "' + PUSH + ' origin"', `git ship ${MAIN}`), { currentBranch: () => MAIN });
   assert.equal(al.decision, 'deny', 'alias: ' + al.reason);
 });
+
+// Why (#352 R3-F1): judgeReadings reset aliasUnsure for every reading and built its union from alias MAP differences only; judgeAlternatives (a lost cd in a script) restores the map and leaves only an unsure mark,
+// so a mark made in a reading other than the last was wiped. The loop `for s in setup other` reads the script twice; the mark of the first reading (npm run setup) must survive the second (npm run other).
+const LOOP_START = '#!/bin/bash\nfor s in setup other; do cd "$SOME_DIR" || exit 1; npm run $s; done\n';
+const loopFiles = (setup, release) => ({
+  'package.json': JSON.stringify({ name: 'x', scripts: { setup, other: 'echo hi' } }),
+  'start.sh': LOOP_START,
+  'release.sh': `#!/bin/bash\n${release}\n`,
+});
+const LOOP_LINE = `bash ${GIT_ROOT}/start.sh; bash ${GIT_ROOT}/release.sh`;
+test('#352 R3-F1: an alias made in a reading of a loop that is not the last stays unsure (refused for the alias, not otherwise)', () => {
+  const r = run('git', LOOP_LINE, loopFiles('git config alias.ship "' + PUSH + ' origin ' + MAIN + '"', 'git ship'));
+  assert.equal(r.decision, 'deny', r.reason);
+  assert.match(r.reason, /may have been \(re\)defined/, r.reason);
+  assert.match(r.reason, /"ship"/, r.reason);
+});
+test('#352 R3-F1 allow twins: a harmless alias under another name, or no alias at all, in the same loop is not refused', () => {
+  const other = run('git', LOOP_LINE, loopFiles('git config alias.st status', 'git ship'));
+  assert.equal(other.decision, 'allow', 'other alias: ' + other.reason);
+  const none = run('git', LOOP_LINE, loopFiles('echo setup', 'git ship'));
+  assert.equal(none.decision, 'allow', 'no alias: ' + none.reason);
+  const plain = run('git', LOOP_LINE, loopFiles('git config alias.ship "' + PUSH + ' origin ' + MAIN + '"', 'git status'));
+  assert.equal(plain.decision, 'allow', 'a command that is not the alias: ' + plain.reason);
+});
