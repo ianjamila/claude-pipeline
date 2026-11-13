@@ -3168,7 +3168,8 @@ function evalString(str, startDir, ctx, level, child = false) {
     }
     // (#352 R9: a text a new shell process runs (bash -c) leaves the directory it started in: a cd in it is lost when it ends)
     const upNow = c.up ?? [];
-    for (const e of prevUp) if (e.proc && !upNow.includes(e) && procDir.has(e)) { dir = procDir.get(e); procDir.delete(e); }
+    // (a directory the text left unknown stays unknown: it did something the walk cannot follow, `bash -c 'cd() { :; }'`; with a state hazard on the line nothing is restored)
+    for (const e of prevUp) if (e.proc && !upNow.includes(e) && procDir.has(e)) { if (dir !== null && !hazard) dir = procDir.get(e); procDir.delete(e); }
     if (hazard) forgetState();
     settle(c);
     for (const e of upNow) if (e.proc && !prevUp.includes(e) && !procDir.has(e)) procDir.set(e, dir);
