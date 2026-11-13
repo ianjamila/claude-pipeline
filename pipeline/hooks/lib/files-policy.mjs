@@ -3285,7 +3285,7 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
   // script on the line, and the scripts it was copied from are the same files each time)
   const done = (ctx.budget.writtenOk ??= new Set());
   const once = (key, judge) => {
-    const k = `${sf.kind}\u0000${dir}\u0000${opts._depth ?? 0}\u0000${key}`;
+    const k = `${sf.kind}\u0000${dir}\u0000${opts._depth ?? 0}\u0000${opts._cdpath === true || ctx.cdpath === true}\u0000${key}`; // (#386: a verdict is for one CDPATH state, like the startup keys)
     if (done.has(k)) return null;
     const r = judge();
     if (!r) done.add(k);
@@ -3567,8 +3567,8 @@ function setPositionals(argv) {
   }
   return null;
 }
-function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false) { // (rep: the file is sourced from a frame that can run it again, R18)
-  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: mentionsCdpath(text) };
+function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false, cdpSeed = false) { // (rep: the file is sourced from a frame that can run it again, R18)
+  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: cdpSeed || mentionsCdpath(text) }; // (#385: cdpSeed: the file that sources this one already had CDPATH in play)
   const cdpNow = () => ctx.cdpath === true || out.cdpath; // (R20-F1: read at each cd, a nested file may set it after this point; R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
@@ -3634,7 +3634,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
       const t = abs && !seenFiles.has(abs) && !writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: false }) ? ctx.readText(abs) : null;
       if (typeof t !== 'string') out.all = true;
       else {
-        const sub = sourcedEffects(t, ctx, depth + 1, new Set([...seenFiles, abs]), again);
+        const sub = sourcedEffects(t, ctx, depth + 1, new Set([...seenFiles, abs]), again, cdpNow());
         for (const [k, val] of sub.vars) set(k, val, sure && val !== null);
         out.cds.push(...sub.cds);
         if (sub.all) out.all = true;

@@ -178,3 +178,15 @@ describe('#384: a subshell that surrounds a loop does not undo the loop\'s repea
     ['a subshell, no loop at all', '(cd .. && true); find . -delete', DEEP],
   ]);
 });
+
+describe('#385 / #386: a CDPATH set by an outer file or by a later source reaches the nested file and the cached verdict', () => {
+  const files = (map) => ({ cwd: '/home/u/proj', existsSync: (p) => Object.hasOwn(map, p) || p === '/home/u/proj/skills', readText: (p) => map[p] ?? null });
+  const W = 'echo x > settings.json';
+  decide('deny', [
+    ['#385: outer file sets CDPATH, then sources an inner file with a plain cd', `source ./outer.sh; ${W}`, files({ '/home/u/proj/outer.sh': 'export CDPATH=/home/u/lib\n. /home/u/proj/inner.sh\n', '/home/u/proj/inner.sh': 'cd skills\n' })],
+    ['#386: a written script run before and after a source that sets CDPATH', `printf 'cd skills && find . -delete\\n' > n.sh; bash n.sh; source ./env.sh; bash n.sh`, files({ '/home/u/proj/env.sh': 'export CDPATH=/home/u/lib\n' })],
+  ]);
+  decide('allow', [
+    ['#385: no CDPATH anywhere, a plain cd in the nested file narrows', `source ./outer.sh; ${W}`, files({ '/home/u/proj/outer.sh': 'export FOO=1\n. /home/u/proj/inner.sh\n', '/home/u/proj/inner.sh': 'cd skills\n' })],
+  ]);
+});
