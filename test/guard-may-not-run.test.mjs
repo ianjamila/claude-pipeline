@@ -296,3 +296,51 @@ test('#352 R11-F3: a backtick text lexed while an earlier command still waits fo
   allows('twin: a backtick in a later line', `cat <<EOF\nx\nEOF\necho \`date\``, {}, GIT_ROOT);
   allows('twin: a $( ) after the heredoc command keeps its order', `cd /work/other2 <<EOF; echo $(${SHIP})\nEOF`, {}, GIT_ROOT);
 });
+
+// (#352 R12: a ( ) stage of a pipeline keeps its own commands' certainty; a text scanned out of a heredoc body / $[ ] is not emitted before an earlier command still waiting in the queue; a redirect after
+// `)` continues the subshell's command; a redirect-only command carries its own operator)
+test('#352 R12-B1: the commands inside a ( ) stage of a pipeline keep their own directory', () => {
+  allows('(cd d && push) | (cat)', `(cd /work/other2 && ${SHIP}) | (cat)`);
+  allows('(cd d && push) | cat', `(cd /work/other2 && ${SHIP}) | cat`);
+  allows('cat | (cd d && push)', `cat | (cd /work/other2 && ${SHIP})`);
+  allows('(cd d && push) 2>&1 | (cat)', `(cd /work/other2 && ${SHIP}) 2>&1 | (cat)`);
+  denies('cd | ( ) && push', `cd /work/other2 | (cat) && ${SHIP}`);
+  denies('cat | ( cd ) && push', `cat | (cd /work/other2) && ${SHIP}`);
+  denies('( switch ) | push', `(${RESET}) | ${SHIP}`);
+  denies('( cd ) | cat && push', `(cd /work/other2) | cat && ${SHIP}`);
+});
+
+test('#352 R12-F1: a text scanned out of a heredoc body or $[ ] is not emitted before an earlier command that still waits for its body', () => {
+  ANY_DENY('cat <<A; cd main; cat <<B, $( push ) in B', `cat <<A; cd ${MAIN_DIR}; cat <<B\nx\nA\n$(${SHIP})\nB`, {}, GIT_ROOT);
+  ANY_DENY('cd main <<A; cat <<B, $( push ) in B', `cd ${MAIN_DIR} <<A; cat <<B\nx\nA\n$(${SHIP})\nB`, {}, GIT_ROOT);
+  ANY_DENY('cd main <<EOF; echo $[ $( push ) ]', `cd ${MAIN_DIR} <<EOF; echo $[ $(${SHIP}) ]\nEOF`, {}, GIT_ROOT);
+  ANY_DENY('cat <<A; cd main; cat <<B, a backtick push in B', `cat <<A; cd ${MAIN_DIR}; cat <<B\nx\nA\n\`${SHIP}\`\nB`, {}, GIT_ROOT);
+  allows('twin: one heredoc whose body has a $( )', `cat <<EOF\n$(${SHIP})\nEOF`, {}, GIT_ROOT);
+  allows('twin: two heredocs, nothing changes state between', `cat <<A; cat <<B\nx\nA\n$(${SHIP})\nB`, {}, GIT_ROOT);
+  allows('twin: a cd waiting for its heredoc, the $( ) push in its own body', `cd /work/other2 <<EOF; echo hi\n$(${SHIP})\nEOF`, {}, GIT_ROOT);
+  allows('twin: a $[ ] after a heredoc command keeps its order', `cd /work/other2 <<EOF; echo $[ $(${SHIP}) ]\nEOF`, {}, GIT_ROOT);
+});
+
+test('#352 R12-F2: a redirect right after ) continues that subshell\'s command: pipeline and background bookkeeping reach the part before it', () => {
+  denies('cd d && ( ) 2>&1 & push', `cd /work/other2 && (true) 2>&1 & ${SHIP}`);
+  denies('cd d && ( ) > log 2>&1 & push', `cd /work/other2 && (npm run dev) > /tmp/log 2>&1 & ${SHIP}`);
+  denies('cd d && ( ) 2>&1 | cat & push', `cd /work/other2 && (true) 2>&1 | cat & ${SHIP}`);
+  denies('cd d && ( ) 2>&1 && b & push', `cd /work/other2 && (true) 2>&1 && echo b & ${SHIP}`);
+  denies('switch || ( ) 2>&1 | push', `${RESET} || ( ) 2>&1 | ${SHIP}`);
+  denies('switch || ( ) 2>&1 | cat; push', `${RESET} || (true) 2>&1 | cat; ${SHIP}`);
+  allows('twin: cd d && ( ) 2>&1 && push', `cd /work/other2 && (true) 2>&1 && ${SHIP}`);
+  allows('twin: cd d && ( ) > log 2>&1; push', `cd /work/other2 && (npm run dev) > /tmp/log 2>&1; ${SHIP}`);
+  allows('twin: cd d; ( ) 2>&1 | cat; push', `cd /work/other2; (true) 2>&1 | cat; ${SHIP}`);
+  allows('twin: cd d && ( ) 2>&1 | cat && push (the stage is the subshell\'s)', `cd /work/other2 && (true) 2>&1 | cat && ${SHIP}`);
+});
+
+test('#352 R12-F3: a redirect-only command carries the operator before it', () => {
+  denies('switch || >/dev/null && push', `${RESET} || >/dev/null && ${SHIP}`);
+  denies('cd d || >x && push', `cd /work/other2 || >x && ${SHIP}`);
+  denies('switch || >x ; push', `${RESET} || >x; ${SHIP}`);
+  denies('cd d || >x ; push', `cd /work/other2 || >x; ${SHIP}`);
+  denies('switch | >x && push', `${RESET} | >x && ${SHIP}`);
+  allows('twin: switch && >x && push', `${RESET} && >x && ${SHIP}`);
+  allows('twin: cd d && >x && push', `cd /work/other2 && >x && ${SHIP}`);
+  allows('twin: cd d; >x; push', `cd /work/other2; >x; ${SHIP}`);
+});
