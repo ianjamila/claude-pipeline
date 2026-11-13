@@ -19,7 +19,7 @@ import { readModelProofs } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
-  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")',
+  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost, redraft?}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending"; redraft {draftSince}: the PR is a DRAFT that the pipeline itself turned back to draft (`pipeline redraft`) and nobody has marked ready since; the comment then says "Back to draft for fixes since <time> (<age>)"; an unreadable timeline leaves it out)',
 };
 
 // These stops never reach a review round (verify red three times, Codex out in round 1) or happen after the run's state
@@ -71,6 +71,17 @@ function guardBlocksFor(record, extraSessions, ctx) {
   return { blocks: log.blocks, bySession: log.bySession, warnings: log.skipped ? [`guard log: ${log.skipped} unreadable line(s) skipped`] : [] };
 }
 
+// The time of the newest converted_to_draft made by `me` (the pipeline's own login) that no ready_for_review follows, or null.
+function backToDraftSince(events, me) {
+  if (!Array.isArray(events)) return null;
+  const at = (e) => Date.parse(e?.created_at);
+  const converts = events.filter((e) => e?.event === 'converted_to_draft' && Number.isFinite(at(e)));
+  const last = converts.sort((a, b) => at(a) - at(b)).at(-1);
+  if (!last || last.actor?.login !== me) return null;
+  if (events.some((e) => e?.event === 'ready_for_review' && at(e) > at(last))) return null;
+  return last.created_at;
+}
+
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(inlineOptionValues(argv, ['--outcome', '--built', '--session']), {
     pr: { type: 'string' }, outcome: { type: 'string' }, built: { type: 'string' }, repo: { type: 'string' },
@@ -97,9 +108,17 @@ export const run = guarded(async (argv, ctx) => {
 
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => {
-    const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
+    const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid', 'isDraft']);
     const { title } = view;
-    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state) });
+    // A draft the pipeline itself turned back to draft: one line in the comment and `redraft` in the output (an unreadable timeline leaves it out).
+    let redraft = null;
+    if (view.isDraft === true) {
+      try {
+        const draftSince = backToDraftSince(gh.timelineOf(pr), gh.viewer());
+        if (draftSince) redraft = { draftSince };
+      } catch { /* omitted: the line is informational */ }
+    }
+    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state), redraft: redraft ? { ...redraft, nowMs: Date.now() } : null });
     const agentLogLine = buildAgentLogLine({ state, pr, title, outcome });
     // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
     const existing = readSummaryComment(gh, pr);
@@ -111,7 +130,7 @@ export const run = guarded(async (argv, ctx) => {
     });
     warnings.push(...guard.warnings);
     const posted = writeSummaryComment(gh, pr, { record, sections, existing });
-    const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, cost: costReport(record.cost), warnings };
+    const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, cost: costReport(record.cost), ...(redraft ? { redraft } : {}), warnings };
     // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.
     if (outcome === 'merged') output.pendingLogLine = buildAgentLogLine({ state, pr, title, outcome: DEFAULT_OUTCOME });
     return { exitCode: EXIT.OK, output };

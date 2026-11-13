@@ -753,7 +753,7 @@ Exit: 0 · 2 usage (a bad `--since`, `--pr` or `--repo-slug`) · 3 GitHub unavai
 upsert the PR summary comment and print the agent-log line.
 
 ```
-pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")
+pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost, redraft?}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending"; redraft {draftSince}: the PR is a DRAFT that the pipeline itself turned back to draft (`pipeline redraft`) and nobody has marked ready since; the comment then says "Back to draft for fixes since <time> (<age>)"; an unreadable timeline leaves it out)
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
