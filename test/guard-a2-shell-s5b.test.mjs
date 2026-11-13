@@ -46,7 +46,7 @@ const withParents = (ds) => [...new Set(ds.flatMap((d) => { const out = []; for 
 const routeFs = (extra = []) => fakeFs(GIT_ROOT, {}, withParents([...DIRS, PROJ, ...ROUTES, ...extra]));
 test('S5b: a cd into a route directory with (group) and [id] parts is that directory (it exists)', () => {
   const fs = routeFs();
-  const cds = ['cd ./"src/app/(staff)/[id]"', 'cd /home/u/proj/app/\\[id\\]/print', 'cd "/home/u/proj/src/app/(staff)/staff/(dashboard)/visits/[id]"', 'cd src/app/\\(staff\\)/x', 'cd /home/u/pro[j]/sib[l]ing'];
+  const cds = ['cd ./"src/app/(staff)/[id]"', 'cd /home/u/proj/app/\\[id\\]/print', 'cd "/home/u/proj/src/app/(staff)/staff/(dashboard)/visits/[id]"', 'cd ./src/app/\\(staff\\)/x', 'cd /home/u/pro[j]/sib[l]ing'];
   for (const cd of cds) {
     for (const rest of ['echo x > notes.txt', 'touch notes.txt', 'node -e \'require("fs").writeFileSync("a.ts", "x")\'', 'git add -A']) assert.equal(files(`${cd} && ${rest}`, fs).decision, 'allow', `${cd} && ${rest}`);
   }

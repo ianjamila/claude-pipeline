@@ -78,19 +78,40 @@ describe('R17 owner decision: a cd target narrows only when it is . or .. or sta
   });
 });
 
-describe('R17 AUTO_CD (a bare word runs a cd): setting it makes the directory unknown', () => {
+describe('R17 AUTO_CD (a command word that is a directory runs a cd): the word decides, not the option', () => {
+  // (/home/u/proj/proj and /home/u/proj/x are directories; build.sh is a file)
+  const DIRSET = new Set(['/home/u/proj/proj', '/home/u/proj/x']);
+  const fsx = (files = {}) => ({ cwd: '/home/u/proj', readText: (p) => files[p] ?? null, existsSync: (p) => Object.hasOwn(files, p) || DIRSET.has(p), readDir: (p) => (DIRSET.has(p) ? [] : null) });
+  const FB = fsx({ '/home/u/proj/build.sh': 'echo build\n' });
   denies('autocd', [
-    ['setopt autocd', 'setopt autocd; ..; find . -delete'],
-    ['setopt auto_cd', 'setopt auto_cd; ..; find . -delete'],
-    ['unsetopt noautocd', 'unsetopt noautocd; ..; find . -delete'],
-    ['set -o autocd', 'set -o autocd; ..; find . -delete'],
-    ['options[autocd]=on', 'options[autocd]=on; ..; find . -delete'],
-    ['setopt in a sourced file', 'source ./sw.sh; ..; find . -delete', stub({ '/home/u/proj/sw.sh': 'setopt autocd\n' })],
-    ['setopt before a sourced file', 'setopt autocd; source ./b.sh', stub({ '/home/u/proj/b.sh': '..\nfind . -delete\n' })],
+    ['setopt autocd, .. runs a cd', 'setopt autocd; ..; find . -delete'],
+    ['options[autocd]=on, ..', 'options[autocd]=on; ..; find . -delete'],
+    ['shopt -s autocd, a directory word', 'shopt -s autocd; proj; find . -delete', FB],
+    ['BASHOPTS=autocd, a directory word', 'export BASHOPTS=autocd; bash -c "proj; find . -delete"', FB],
+    ['bash -O autocd -c', "bash -O autocd -c 'proj && find . -delete'", FB],
+    ['zsh -o autocd -c', "zsh -o autocd -c 'proj && find . -delete'", FB],
+    ['zsh -J -c', "zsh -J -c 'proj && find . -delete'", FB],
+    ['no option at all: the word is enough', 'proj; find . -delete', FB],
+    ['a word ending in a slash', 'proj/; find . -delete', FB],
+    ['a lone dot-dot', '..; find . -delete'],
+    ['an absolute directory word', '/home/u/proj/x; find . -delete', FB],
+    ['a directory made earlier on the line (mkdir)', 'mkdir x; x; find . -delete'],
+    ['a directory made earlier on the line (mkdir -p a/b, word a)', 'mkdir -p a/b; a; find . -delete'],
+    ['a directory made earlier on the line (cp -r / mv / git clone)', 'git clone https://h/r.git y; y; find . -delete'],
+    ['a directory made earlier on the line (tar / unzip operand)', 'unzip a.zip z; z; find . -delete'],
+    ['a run-time command word', '$D; find . -delete'],
+    ['a command-substitution word', '$(pick); find . -delete'],
+    ['a quoted run-time word', '"$D"; find . -delete'],
+    ['a directory word in a sourced file', 'source ./sw.sh; find . -delete', stub({ '/home/u/proj/sw.sh': 'proj\n' }, { existsSync: (p) => DIRSET.has(p) || p === '/home/u/proj/sw.sh', readDir: (p) => (DIRSET.has(p) ? [] : null) })],
+    ['a directory word in eval text run by bash -c', "bash -c 'eval proj; find . -delete'", FB],
   ]);
   allows('autocd', [
-    ['setopt of another option', 'setopt extendedglob; cd ./proj && rm -rf build'],
-    ['no switch at all', 'echo hi; rm -rf build'],
+    ['git status', 'git status', FB],
+    ['ls && ./build.sh (a file)', 'ls && ./build.sh', FB],
+    ['npm test', 'npm test', FB],
+    ['setopt of another option', 'setopt extendedglob; cd ./proj && rm -rf build', FB],
+    ['no switch at all', 'echo hi; rm -rf build', FB],
+    ['a known variable that holds a plain command name', 'G=git; $G status', FB],
   ]);
 });
 

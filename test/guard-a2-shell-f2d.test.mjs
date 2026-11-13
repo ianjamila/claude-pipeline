@@ -62,7 +62,6 @@ test('F2c 95: a default word spliced into an option position of a shell is judge
     allows(run, {}, [
       `bash ${D}{A:--x} ok.sh`,
       `bash ok.sh ${D}{V:-default}`,
-      `bash -c "${D}{CMD:-echo hi}"`,
       `bash ${D}{A:--c ./ok.sh}`,
       `bash ${D}{A:--s} < ok.sh`,
       `echo ${D}{A:--c ./ev.sh}`,
@@ -113,7 +112,8 @@ test('F2c 85: a `..` after a symlinked directory also names the target\'s parent
   const fs = fakeFs(PROJ, BASE, ['/home/u/.cla' + 'ude/pipeline', '/home/u/proj/lnk']);
   const run = (c) => evaluateBashForFiles(c, { home: '/home/u', env: {}, platform: 'linux', realpath: real, cwd: PROJ, ...fs, existsSync: fs.pathExists });
   for (const c of ['cd -P lnk/..; echo x > settings.json', 'set -P; cd lnk/..; echo x > settings.json', 'cd -eP -- lnk/..; echo x > settings.json', 'pushd -P lnk/..; echo x > settings.json', 'cd lnk/../.; echo x > settings.json']) assert.equal(run(c).decision, 'deny', c);
-  for (const c of ['cd lnk2/..; echo x > settings.json', 'cd sub/..; echo x > out.txt', 'cd ..; echo x > out.txt']) assert.equal(run(c).decision, 'allow', c);
+  for (const c of ['cd ./lnk2/..; echo x > settings.json', 'cd ./sub/..; echo x > out.txt', 'cd ..; echo x > out.txt']) assert.equal(run(c).decision, 'allow', c);
+  for (const c of ['cd lnk2/..; echo x > settings.json', 'cd sub/..; echo x > out.txt']) assert.equal(run(c).decision, 'deny', c + ' (R17 owner decision: a bare cd is unknown)');
 });
 
 test('F2c 85: git-policy does not take the link\'s parent for the directory of `cd -P link/..`', () => {
@@ -135,7 +135,8 @@ test('F2c 77: the script\'s own directory (a relative dirname) is unknown while 
   const cp = 'CDPATH=/home/u/.cla' + 'ude';
   for (const c of [`${cp} bash scripts/run`, `export ${cp}; bash scripts/run`, `${cp}; bash scripts/run`]) assert.equal(run(c).decision, 'deny', c);
   assert.equal(run('bash scripts/run', { CDPATH: '/home/u/.cla' + 'ude' }).decision, 'deny');
-  assert.equal(run('bash scripts/run').decision, 'allow');
+  assert.equal(run('bash ./scripts/run').decision, 'allow'); // (the dirname `./scripts` is a literal cd target)
+  assert.equal(run('bash scripts/run').decision, 'deny'); // (R17 owner decision: a bare cd is unknown: the dirname `scripts` is a bare name)
   assert.equal(run(`${cp} bash /home/u/proj/scripts/run`).decision, 'allow'); // (an absolute $0 has an absolute dirname: no CDPATH lookup)
 });
 
@@ -185,7 +186,9 @@ test('F2d 99: cdpath (zsh) is CDPATH for the directory of a relative cd and of a
     `cdpath=(/x); cd sub && ${W}`, `cdpath+=(/x); cd sub && ${W}`, `cdpath=(/x) cd sub && ${W}`, `cdpath[1]=/x; cd sub && ${W}`, `cdpath=(/x); pushd sub && ${W}`, `typeset -T CDPATH cdpath; cdpath=(/x); cd sub && ${W}`,
     `cdpath=(/x); export CDPATH; cd sub && ${W}`, `export cdpath=(/x); cd sub && ${W}`, `typeset -T CDPATH cdpath=(/x); cd sub && ${W}`, `typeset -T CDPATH=/x cdpath; cd sub && ${W}`, `declare -x cdpath=(/x); cd sub && ${W}`, `. ./b.sh; ${W}`, `cdpath=(/x); bash scripts/run`, `cdpath+=(/x); bash scripts/run`,
   ]) assert.equal(run(c).decision, 'deny', c);
-  for (const c of [`cdpath=(/x); cd ./sub && ${W}`, `cdpath=(/x); cd /tmp/sub && ${W}`, `cd sub && ${W}`, `cdpath=(); cd ./sub && ${W}`, '. ./c.sh; ' + W, 'bash scripts/run', `cdpath=(/x); bash /home/u/proj/scripts/run`]) assert.equal(run(c).decision, 'allow', c);
+  assert.equal(run(`cd sub && ${W}`).decision, 'deny', '(R17 owner decision: a bare cd is unknown)');
+  assert.equal(run('bash scripts/run').decision, 'deny', '(R17 owner decision: a bare cd is unknown)');
+  for (const c of [`cdpath=(/x); cd ./sub && ${W}`, `cdpath=(/x); cd /tmp/sub && ${W}`, `cd ./sub && ${W}`, `cdpath=(); cd ./sub && ${W}`, '. ./c.sh; ' + W, 'bash ./scripts/run', `cdpath=(/x); bash /home/u/proj/scripts/run`]) assert.equal(run(c).decision, 'allow', c);
 });
 
 // Why (item 99): git-policy never looked at CDPATH, so `cd sub` was taken as <cwd>/sub while the shell goes to the first CDPATH entry holding `sub`.
@@ -200,4 +203,9 @@ test('F2d 99: git-policy takes a relative cd as unknown while CDPATH / cdpath ma
   for (const c of [`cd sub && ${P}`, `cd ./sub && ${P}`, `cdpath=(/o); cd ./sub && ${P}`, `CDPATH=/o; cd ../repo && ${P}`, `CDPATH=/o; cd /work/repo/sub && ${P}`, `CDPATH=/o; cd ~ ; ${P.replace('git', 'git -C /work/repo')}`, `CDPATH= cd sub && ${P}`, P]) assert.equal(run(c).decision, 'allow', c);
   assert.equal(run(`cd ./sub && ${P}`, { CDPATH: '/o' }).decision, 'allow');
   assert.equal(run(`cd sub && ${P}`, { CDPATH: '' }).decision, 'allow');
+});
+
+// (R17 owner decision: a command word only known at run time and standing alone may be a directory (autocd), so the directory is unknown: moved here from the allow list of F2c 95)
+test('F2c 95 (R17 owner decision: a lone run-time command word makes the directory unknown): bash -c with a default word as the whole text', () => {
+  denies(files, {}, [`bash -c "${D}{CMD:-echo hi}"`]);
 });

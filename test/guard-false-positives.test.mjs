@@ -357,7 +357,7 @@ test('I: a helper named from the script\'s own directory (or by names the line s
   }, ['scripts']), { env: { HOME: '/home/u', ZDOTDIR: '/home/u' } });
   const words = ['"$(dirname "$0")/helper"', '"$(cd "$(dirname "$0")" && pwd)/helper"', '"${0%/*}/helper"', '"$(cd "$(dirname "$0")" && pwd -P)/helper"'];
   for (const w of words) {
-    for (const outer of ['bash scripts/run.sh p', 'bash /home/u/proj/scripts/run.sh p', 'S=/home/u/proj/scripts; bash $S/run.sh p']) {
+    for (const outer of ['bash ./scripts/run.sh p', 'bash /home/u/proj/scripts/run.sh p', 'S=/home/u/proj/scripts; bash $S/run.sh p']) {
       const spec = { 'scripts/run.sh': `set -eu\nx=$("\${BASH:-bash}" ${w} "$1")\necho "$x"\n` };
       assert.equal(run(outer, 'echo hi', spec).decision, 'allow', `${outer} / ${w}`);
       assert.equal(run(outer, BAD_FILES, spec).decision, 'deny', `${outer} / ${w} (bad helper)`);

@@ -291,10 +291,12 @@ test('S2: several producers of one feed are judged joined when every one of them
 
 test('S2: the program text of an inline interpreter run is not a file name', () => {
   for (const c of [
-    `bash -c "$(node -e 'console.log([1,2].map((x)=>x*2)[0] === 2)')"`, `eval "$(node -e 'console.log(a[0] === 2)')"`, "bash -c \"$(node -e 'a=`x`')\"",
-    `node -e 'console.log(a[0] === 2)' | $PSQL $DB`, `node -e 'console.log(a[0] === 2)' | bash`, `python3 -c 'print(a[0])' | bash`, `bash -c "$(python3 -c 'print([1][0])')"`, `perl -e 'print $a[0]' | sh`,
+    `eval "$(node -e 'console.log(a[0] === 2)')"`, "bash -c \"$(node -e 'a=`x`')\"",
+    `bash -c "$(python3 -c 'print([1][0])')"`, `node -e 'console.log(a[0] === 2)' | $PSQL $DB`, `node -e 'console.log(a[0] === 2)' | bash`, `python3 -c 'print(a[0])' | bash`, `perl -e 'print $a[0]' | sh`,
     `node --eval='console.log(a[0])' | bash`,
   ]) allowBoth(c, FEED);
+  // (R17 owner decision: the output of a command is a command word only known at run time, alone in the -c text: it may be a directory, so the directory is unknown)
+  for (const c of [`bash -c "$(node -e 'console.log([1,2].map((x)=>x*2)[0] === 2)')"`]) assert.equal(files(c, fakeFs(PROJ, FEED, DIRS)).decision, 'deny', c);
   // the other words of the run are still files it may print
   for (const c of [`node -e 'console.log(1)' f.sh | bash`, `bash -c "$(node -e 'x[0]' f.sh)"`, `python3 -c 'print(1)' f.sh | bash`]) denyBoth(c, FEED);
 });
@@ -542,7 +544,7 @@ test('S4b: a relative write to a protected name after a cd into an unknown direc
   // (a brace list in a redirection target is several targets, also in a known protected directory)
   for (const c of ['cd ~/.claude && echo x > settings.{json,x}', 'echo x > ~/.claude/settings.{json,x}']) assert.equal(files(c, fs).decision, 'deny', c);
   // (a known directory keeps relative writes to ordinary and protected-looking names alike, as before)
-  for (const c of ['cd ./sub && echo x > settings.json', 'D=sub; cd $D && cp ok.sh settings.json', 'cd ~ && echo x > notes.txt']) assert.equal(files(c, fs).decision, 'allow', c);
+  for (const c of ['cd ./sub && echo x > settings.json', 'D=./sub; cd $D && cp ok.sh settings.json', 'cd ~ && echo x > notes.txt']) assert.equal(files(c, fs).decision, 'allow', c);
 });
 
 // ---- S4c: one SQL client model (psql, mysql, sqlite3) for the direct path, the variable-named path and the files they read -------------------------------------------
@@ -737,17 +739,18 @@ test('S4d: cd ~- / ~+ / CDPATH / a changed HOME / a cd inside a sourced file mak
   const fs = fakeFs(PROJ, sh, DIRS);
   for (const c of [
     'cd ~- && W', 'cd ~+/x && W', 'cd ~+ && W', 'cd ~-/x && W', 'cd ~root && W',
-    'CDPATH=/x cd ./sub && W', 'CDPATH=/x; cd ./sub && W', 'export CDPATH=/x; cd ./sub && W', 'declare -x CDPATH=/x; cd ./sub && W', 'CDPATH=$X; cd ./sub && W', 
+    'CDPATH=/x cd sub && W', 'CDPATH=/x; cd sub && W', 'export CDPATH=/x; cd sub && W', 'declare -x CDPATH=/x; cd sub && W', 'CDPATH=$X; cd sub && W', 
     'HOME=/x; source $X; cd && W', 'HOME=/x; source $X; cd ~ && W', 'HOME=/x; source $X; cd ~/sub && W', 'HOME=/x; cd && W', 'export HOME=/x; cd && W',
     '. ./set.sh; W', 'source set.sh && W', '. ./set2.sh; W', '. ./set4.sh; W', '. ./set5.sh; W', '. ./set6.sh; W', '. ./set7.sh; W', '. ./set8.sh; W', '. ./set9.sh; W',
   ]) assert.equal(files(c.replace('W', W), fs).decision, 'deny', c);
   // (CDPATH inside a sourced file: set on the line, in the file, in the hook's environment)
-  const cp = fakeFs(PROJ, { 'a.sh': 'cd ./sub', 'b.sh': 'CDPATH=/x\ncd sub', 'c.sh': 'cd ./sub', 'd.sh': 'export CDPATH=/y; cd ./sub' }, DIRS);
+  const cp = fakeFs(PROJ, { 'a.sh': 'cd sub', 'b.sh': 'CDPATH=/x\ncd sub', 'c.sh': 'cd ./sub', 'd.sh': 'export CDPATH=/y; cd sub' }, DIRS);
   for (const c of ['CDPATH=/x; . ./a.sh; W', 'export CDPATH=/x; source a.sh; W', '. ./b.sh; W', '. ./d.sh; W', 'CDPATH=/x . ./a.sh; W']) assert.equal(files(c.replace('W', W), cp).decision, 'deny', c);
   assert.equal(files('. ./a.sh; ' + W, cp, { env: { CDPATH: '/x' } }).decision, 'deny');
-  for (const c of ['. ./a.sh; W', 'CDPATH=/x; . ./c.sh; W']) assert.equal(files(c.replace('W', W), cp).decision, 'allow', c);
+  assert.equal(files('. ./a.sh; ' + W, cp).decision, 'deny', '(R17 owner decision: a bare cd is unknown)');
+  for (const c of ['. ./c.sh; W', 'CDPATH=/x; . ./c.sh; W']) assert.equal(files(c.replace('W', W), cp).decision, 'allow', c);
   // (CDPATH only matters for a relative name; a name that starts with / ./ ../ is not searched; the environment's CDPATH counts too)
-  assert.equal(files('cd ./sub && ' + W, fakeFs(PROJ, sh, DIRS), { env: { CDPATH: '/x' } }).decision, 'deny');
+  assert.equal(files('cd sub && ' + W, fakeFs(PROJ, sh, DIRS), { env: { CDPATH: '/x' } }).decision, 'deny');
   assert.equal(files('cd ./sub && ' + W, fakeFs(PROJ, sh, DIRS), { env: { CDPATH: '/x' } }).decision, 'allow');
   assert.equal(files('cd /tmp/sub && ' + W, fakeFs(PROJ, sh, DIRS), { env: { CDPATH: '/x' } }).decision, 'allow');
   for (const c of ['cd ./sub && W', 'CDPATH= cd ./sub && W', 'cd ~ && W', 'cd && W', '. ./set3.sh; W', 'HOME=/x; cd /tmp && W', 'cd ~root2 && echo x > /tmp/o']) assert.equal(files(c.replace('W', W), fs).decision, 'allow', c);

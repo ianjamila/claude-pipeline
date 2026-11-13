@@ -543,7 +543,7 @@ test('h controls: unrelated writes and harmless contents are allowed', () => {
     'cp f.sh n.sh; bash ok.sh', 'cp f.sh elsewhere.txt; bash n.sh', 'cp f.sh sub/n.sh; bash n.sh', 'cd ./sub; cp ok.sh n.sh; bash n.sh', 'cat f.sh > n.txt; bash ok.sh',
     'cat ok.sh | tee n.sh >/dev/null; bash n.sh', 'tee n.sh < ok.sh >/dev/null; bash n.sh', 'mv ok.sh n.sh && bash n.sh', 'ln -s ok.sh n.sh; bash n.sh',
     'echo hi > n.sh; bash n.sh', 'touch n.sh; bash n.sh', ': > n.sh; bash n.sh', 'cp -r src d; bash d/ok.sh', 'install -m 755 ok.sh n.sh; bash n.sh', 'dd if=ok.sh of=n.sh; bash n.sh',
-    'cp f.sh d/n.sh; cd e; bash n.sh', 'cp f.sh $HOME/n.sh; bash n.sh',
+    'cp f.sh d/n.sh; cd ./e; bash n.sh', 'cp f.sh $HOME/n.sh; bash n.sh',
   ]) allowBoth(c);
   allowBoth(() => 'printf \'echo hi\' > n.sh; bash n.sh');
   allowBoth(() => 'printf \'echo %s\' hi > n.sh; bash n.sh');
