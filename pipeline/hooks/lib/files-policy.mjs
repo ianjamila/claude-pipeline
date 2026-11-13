@@ -1562,10 +1562,25 @@ const cdRelative = (e) => typeof e === 'string' && !isAbs(e) && !cdStaysPut(e);
 // R19-F1: only a target with a `..` segment climbs once per run (`./x`, `x`, `web/app` only descend: the directories the line already lists cover them), and a cd inside a `( … )` subshell the command is in ends with it
 // every time (the parser's c.grp lists the subshells the command is in; a loop that is itself inside the subshell is not told apart: that is a constructed climb, issue #373)
 const cdClimbs = (e) => cdRelative(e) && /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(e);
-const cdInSubshell = (c) => (c?.grp?.length ?? 0) > 0;
 const repeats = (cmds, i) => {
   const c = cmds[i];
   return cmds.ctlBroken === true || (c?.ctl ? Boolean(c.ctl.loop || c.ctl.fn || c.ctl.trap) : inFlow(flowStart(cmds), i));
+};
+// #384: ...but a subshell that surrounds the loop survives every iteration (`(for ...; do cd ..; done; find . -delete)`), so the climbs add up. The cd is lost each run only in a subshell opened INSIDE the repeating
+// body, which the parser does not say; it is read from the commands the subshell holds: one of them that does not repeat (the `find` above, or a call of a function defined in it) was written outside the loop,
+// so the subshell started before it. A subshell that holds only repeating commands (`for ...; do (cd ..); done`) is taken as inside the body (a loop nested inside a subshell inside another loop is not told apart, #373).
+// `whole`: the text itself runs again (a file sourced from a loop), every subshell in it is inside the repetition.
+const outerSubshells = new WeakMap();
+const cdInSubshell = (c, cmds, whole = false) => {
+  const ids = c?.grp ?? [];
+  if (whole || ids.length === 0 || !cmds) return ids.length > 0;
+  let outer = outerSubshells.get(cmds);
+  if (!outer) {
+    outer = new Set();
+    for (let i = 0; i < cmds.length; i++) for (const id of cmds[i].grp ?? []) if (!outer.has(id) && !repeats(cmds, i)) outer.add(id);
+    outerSubshells.set(cmds, outer);
+  }
+  return ids.some((id) => !outer.has(id)); // (every caller asks only for a command that repeats)
 };
 // Option names are compared without case, `_` or `-` (`AUTO_CD`, `auto-cd`, `noautocd`)
 const optionWord = (w) => w.toLowerCase().replace(/[_-]/g, '');
@@ -3594,7 +3609,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
       if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || bare) { out.unknownCd = true; if (bare) out.bareCd = true; }
       else {
         out.cds.push(t ?? '~');
-        if (again && !homeForm && cdClimbs(toPosix(v)) && !cdInSubshell(c)) out.unknownCd = true; // (R18: a relative cd that repeats climbs one level per run; R19-F1: only a `..` target outside a subshell)
+        if (again && !homeForm && cdClimbs(toPosix(v)) && !cdInSubshell(c, cmds, rep)) out.unknownCd = true; // (R18: a relative cd that repeats climbs one level per run; R19-F1: only a `..` target outside a subshell)
       }
       set('PWD', null, false); set('OLDPWD', null, false); // (cd rebinds both)
     }
@@ -3971,14 +3986,14 @@ function evaluateBashForFilesFrame(command, opts) {
       const { unknownName } = stateAt(ci);
       if (cdUnknownShape(c.argv)) return true;
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
-      if (t !== undefined) { const mc = modelledCd(t, cmds, ci, ctx); if (mc !== null) return repeats(cmds, ci) && cdClimbs(mc) && !cdInSubshell(c); } // (R18: a modelled target that climbs moves again on each run; R19-F1)
+      if (t !== undefined) { const mc = modelledCd(t, cmds, ci, ctx); if (mc !== null) return repeats(cmds, ci) && cdClimbs(mc) && !cdInSubshell(c, cmds); } // (R18: a modelled target that climbs moves again on each run; R19-F1)
       if (t === undefined || /^~(?:\/|$)|^\$\{?HOME\b/.test(t)) { if (homeMoved) return true; if (t === undefined) return false; } // (a bare cd goes home)
       const e = expandRefs(t, ctx);
       if (/[*?[{(]/.test(e) && resolveGlobCd(e, dirs, ctx, cmds, ci) === null) return true; // (a glob or a brace list can spell ~/.claude: `cd ~/.cl*`)
       if (/[`$]/.test(e) || /\$\{!/.test(t) || /[`]|\$\(/.test(t)) return true;
       // (R17: the one whitelist: a target that is not `.` / `..` or `/` `./` `../` prefixed may be read through CDPATH or cdable_vars. The deny reason then names the fix)
       if (!cdTargetLiteral(e, ctx.cdpath)) { ctx.bareCd = true; return true; }
-      if (repeats(cmds, ci) && cdClimbs(e) && !cdInSubshell(c)) return true; // (R18-B1 / F7: `cd ..` / `../x` in a loop, a function or a trap climbs once per run; R19-F1: not `./x`, `x`, and not inside a subshell)
+      if (repeats(cmds, ci) && cdClimbs(e) && !cdInSubshell(c, cmds)) return true; // (R18-B1 / F7: `cd ..` / `../x` in a loop, a function or a trap climbs once per run; R19-F1: not `./x`, `x`, and not inside a subshell)
       return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
     });
   };

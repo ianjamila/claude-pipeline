@@ -162,3 +162,19 @@ describe('#379: CDPATH counts only when it may hold a value (an empty assignment
     ['the environment', 'unset CDPATH; cd sub && find . -delete', { env: { CDPATH: '/x' } }],
   ]);
 });
+
+describe('#384: a subshell that surrounds a loop does not undo the loop\'s repeated climb', () => {
+  const DEEP = { cwd: '/home/u/a/b/c/d/proj' };
+  decide('deny', [
+    ['a subshell around a for loop of cd ..', '(for i in 1 2 3 4 5; do cd ..; done; find . -delete)', DEEP],
+    ['a subshell around a while loop', '(while true; do cd ..; done; find . -delete)', DEEP],
+    ['a subshell around a function called repeatedly', '(f() { cd ..; }; f; f; f; f; find . -delete)', DEEP],
+    ['no subshell at all (kept)', 'for i in 1 2 3 4 5; do cd ..; done; find . -delete', DEEP],
+  ]);
+  decide('allow', [
+    ['a subshell inside the loop body (the cd is lost each time)', 'for i in 1 2 3 4 5; do (cd ..); done; find . -delete', DEEP],
+    ['a subshell inside the loop body, then the write in it', 'for i in 1 2 3; do (cd ../web && rm -rf dist); done', DEEP],
+    ['a subshell inside a function body', 'f() { (cd ..); }; f; f; find . -delete', DEEP],
+    ['a subshell, no loop at all', '(cd .. && true); find . -delete', DEEP],
+  ]);
+});
