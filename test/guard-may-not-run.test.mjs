@@ -170,3 +170,20 @@ test('#352 R9 scan (ii): an alias defined where it may not run is unsure for eve
   assert.match(reason(`${ALIAS}; if false; then ${HARMLESS}; fi && git ship`), /may have been \(re\)defined|pushing to main is blocked/);
   allows('twin: a certain redefinition', `${ALIAS}; ${HARMLESS} && git ship`);
 });
+
+// (#400: shapes the generated differential test found, test/guard-may-not-run-differential.test.mjs)
+test('#400 differential: a failure that && passes on reaches a later ||; a cd in a child process, a pipeline stage or a background list is lost; a group behind || is skipped as a whole', () => {
+  denies('change && x || push', `${RESET} && A=1 || ${SHIP}`);
+  denies('a group: { cd && x; } || push', `{ cd /work/other2 && A=1; } || ${SHIP}`);
+  denies('cd || a substitution that pushes', `cd /work/other2 || echo $(cat; ${SHIP})`);
+  denies('a cd in the last stage of a pipeline, then &&', `false | cd /work/other2 && ${SHIP}`);
+  denies('bash -c cd, then &&', `bash -c 'cd /work/other2' && ${SHIP}`);
+  denies('a text with a change in an if, then &&', `bash -c 'if false; then npm run reset; fi' && ${SHIP}`, HERE);
+  denies('a && list in the background', `cd /work/other2 && true & ${SHIP}`);
+  denies('a group after && in the background', `false & { cd /work/other2; } && false & ${SHIP}`);
+  denies('a later command of a group behind ||', `false || { cat; ${RESET}; }; ${SHIP}`);
+  denies('a pipeline stage behind &&', `A=1 && false | npm run reset; ${SHIP}`, HERE);
+  denies('a bash -c cd in a loop, then &&', `while false; do bash -c 'cd /work/other2; false'; done && ${SHIP}`);
+  allows('twin: the cd and the push in one bash -c text', `bash -c 'cd /work/other2 && ${SHIP}'`);
+  allows('twin: eval runs in this shell, its cd stays', `eval 'cd /work/other2' && ${SHIP}`);
+});

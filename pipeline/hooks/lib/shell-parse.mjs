@@ -2384,7 +2384,7 @@ class Parser {
           pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep, afterClose: lastSep === '&&' && lastAfterClose,
           up: ctx.up, negIn: ctx.neg > 0, negPipe: lastSep === '|' && lastNeg, negLead: false, // (negation: R9-F3; up: R9-F1)
         };
-        if (lastSep !== '|') this.pipeStart = ctx.out.length;
+        if (lastSep !== '|' && lastSep !== '&&' && lastSep !== '||') this.pipeStart = ctx.out.length; // (a & ends the whole and-or list: `a && b &`)
         lastAfterClose = false;
       }
     };
@@ -2615,7 +2615,7 @@ class Parser {
         } else this.i++;
       } else if (c === '&') {
         const nx = s[this.i + 1];
-        if (nx === '&') { flushWord(); const closed = seg?.closesFrom; const kind = this.lastCloseKind; endSeg(this.i); lastSep = '&&'; lastAfterClose = closed !== undefined && this.closeMaySkip(kind, closed); this.i += 2; }
+        if (nx === '&') { flushWord(); const closed = seg?.closesFrom; const kind = this.lastCloseKind; endSeg(this.i); if (closed !== undefined) this.pipeStart = Math.min(this.lastClosePS, this.pipeStart); lastSep = '&&'; lastAfterClose = closed !== undefined && this.closeMaySkip(kind, closed); this.i += 2; } // (the and-or list a later & ends began where the group began)
         else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; const from = closed !== undefined ? Math.min(this.lastClosePS, this.pipeStart) : this.pipeStart; endSeg(this.i); this.markClosedOut(closed); this.markBackground(from); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
         else if (nx === '>' && !noRedir) {
           flushWord(); startSeg();
@@ -2627,7 +2627,8 @@ class Parser {
         flushWord(); // (`}|cat`: the closing word first)
         const closed = seg?.closesFrom;
         endSeg(this.i);
-        if (nx !== '|') { this.markClosedOut(closed); if (closed !== undefined) this.pipeStart = Math.min(this.lastClosePS, this.pipeStart); }
+        if (nx !== '|') this.markClosedOut(closed);
+        if (closed !== undefined) this.pipeStart = Math.min(this.lastClosePS, this.pipeStart);
         if (nx === '|') { lastSep = '||'; this.i += 2; }
         else if (nx === '&') { lastSep = '|'; this.i += 2; }
         else { lastSep = '|'; this.i++; }
@@ -2681,7 +2682,7 @@ class Parser {
           const cond = !body && !(seg && seg.words.length && seg.kwOnly === false) && ['&&', '||', '|'].includes(seg ? seg.sep : lastSep); // (R9-F2: a `!` in front is no command)
           const opened = this.lexOp(); // (the operator before the subshell, see inGroup: of the open segment when there is one, a `!` for one, R9-F2)
           const negHere = !!(seg && segNeg(seg)); // (R9-F3: `! ( ... )`: its commands are negated)
-          const stageStart = seg ? this.pipeStart : lastSep !== '|' ? ctx.out.length : this.pipeStart;
+          const stageStart = seg ? this.pipeStart : lastSep !== '|' && lastSep !== '&&' && lastSep !== '||' ? ctx.out.length : this.pipeStart;
           endSeg(this.i);
           lastSep = ';';
           if (negHere) ctx.neg++;
@@ -3312,7 +3313,7 @@ class Parser {
     const depth = seg.depth + 1;
     if (SHELLS.has(name)) {
       const r = shellInvocation(argv);
-      if (r.kind === 'script') this.runScript(seg, [r.text], r.text, depth);
+      if (r.kind === 'script') { this.ctx.upHold[this.ctx.upHold.length - 1].proc = true; this.runScript(seg, [r.text], r.text, depth); } // (#352 R9: a new process: what it cds is lost when it ends; eval, source and a trap run in this shell)
       else if (r.kind === 'stdin') this.runStdin(seg, depth);
       else if (r.kind === 'file' && isProcSub(r.text)) this.runProcessSub(seg, r.text, depth);
       else if (r.kind === 'file' && FD_PATH.test(r.text)) this.runFd(seg, r.text);
