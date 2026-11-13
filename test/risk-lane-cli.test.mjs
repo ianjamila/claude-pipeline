@@ -68,7 +68,7 @@ function world(t, { baseYml = pipelineYml(), feature = (r) => r.write('src/big.j
       writeFileSync(out, JSON.stringify(findings));
       // The command refuses an --effort that is not the configured one for the round (review.effort), so ask the plan for it.
       const args = ['codex-review', '--pr', '7', '--round', String(round), '--base', from, '--head', to];
-      const effort = w.cli([...args, '--plan'], { FAKE_CODEX_OUTPUT: out }).json?.expectedEffort ?? 'high';
+      const effort = w.cli([...args, '--plan'], { FAKE_CODEX_OUTPUT: out }).json?.expectedEffort;
       return w.cli([...args, '--effort', effort], { FAKE_CODEX_OUTPUT: out });
     },
     state: () => JSON.parse(readFileSync(join(repo.dir, '.review', 'state.json'), 'utf8')),
