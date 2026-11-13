@@ -28,6 +28,8 @@ const relLevel = (o, grp, depth) => {
 const segNeg = (seg) => !!(seg.negLead || seg.negIn || seg.negPipe);
 const ctlMarks = (c) => ({ loop: c.loop > 0, fn: c.fn > 0, trap: c.trap > 0, cond: c.cond > 0 });
 const LOOP_WORDS = new Set(['while', 'until', 'for', 'select', 'repeat', 'foreach']);
+// (#352 R14-F1: the reserved words that can stand right after a subshell's `)`, giving its redirect tail back)
+const AFTER_PAREN_RESERVED = new Set(['then', 'else', 'elif', 'fi', 'do', 'done', 'esac', '}']);
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
 // A word right before a ( that opens a subshell, a condition or arithmetic (`if(true)`, `for((i=0;;))`), not a glob qualifier group.
 const LEAD_WORDS = new Set([...KEYWORDS, 'for', 'case', 'select', 'in', 'time', 'function', 'foreach', 'switch', 'catch', 'elseif', 'param', 'trap', 'return', 'exit', 'throw']);
@@ -2484,10 +2486,13 @@ class Parser {
         this.hd.push({ delim: text, strip, quoted: q >= 0, seg });
         return;
       }
-      // (#352 R13-F1: a word after `)` (`else`, `then`, a command) is no redirect of the subshell: the segment is an ordinary one that follows a `;`)
+      // (#352 R13-F1: a reserved word that closes or continues a construct after `)` (`else`, `then`, `fi`, ...) is no redirect of the subshell: the segment is an ordinary one that follows a `;`.
+      // R14-F1: any other word (`{fd}` of a named-descriptor redirect, the `{` of a zsh `() { }`, a short-form body) still continues the list that began before the `(`, so the tail stays)
       if (tailUndo && tailUndo.seg === seg) {
-        seg.sep = ';'; seg.lead = null; seg.afterClose = false;
-        this.pipeStart = tailUndo.at; this.pipeHead = tailUndo.at; this.pipeLead = ';';
+        if (q < 0 && AFTER_PAREN_RESERVED.has(text)) {
+          seg.sep = ';'; seg.lead = null; seg.afterClose = false;
+          this.pipeStart = tailUndo.at; this.pipeHead = tailUndo.at; this.pipeLead = ';';
+        }
         tailUndo = null;
       }
       let win;
