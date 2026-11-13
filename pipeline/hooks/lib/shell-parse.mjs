@@ -2054,7 +2054,7 @@ function noteRedef(ctx, argv, env) {
   else if (argv.some((w) => REDEF_TABLE.test(w)) || Object.keys(env ?? {}).some((k) => REDEF_TABLE.test(k))) ctx.defs.redef = true;
 }
 
-function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
+function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';', afterClose = false) {
   noteRedef(ctx, argv, env);
   if (ctx.out.length >= MAX_COMMANDS) { ctx.truncated = true; ctx.stopped = true; return null; }
   const cmd = { argv, env, raw, depth, redirects };
@@ -2067,6 +2067,8 @@ function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
   Object.defineProperty(cmd, 'loops', { value: ctx.loops, enumerable: false });
   // sep: the operator before it (; & && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
   Object.defineProperty(cmd, 'sep', { value: sep, enumerable: false });
+  // afterClose (#352 R7-F2): its `&&` follows the closer of a construct whose body may not have run (`fi &&`, `done &&`, `esac &&`, a group that may skip): it is chained to the construct, not to the body's last command. Not enumerable
+  Object.defineProperty(cmd, 'afterClose', { value: afterClose, enumerable: false });
   // binPath: it is part of a script text a package runner runs (node_modules/.bin is on its PATH). Not enumerable
   if (ctx.binPath) Object.defineProperty(cmd, 'binPath', { value: true, enumerable: false });
   ctx.out.push(cmd);
@@ -2333,6 +2335,7 @@ class Parser {
     let gCur = 0; // index in `cur` just after it
     let gGlob = false; // the word before the group holds a glob character
     let lastSep = ';';
+    let lastAfterClose = false; // (the `&&` just read follows the closer of a construct that may have skipped its body: the next segment takes it, see emit)
     // `case` statements open at this level: st 'subj' (its word comes next), 'in', 'pat' (patterns up to `)` come next: no commands),
     // 'body' (an arm's commands, up to ;; ;& ;;& ;| or esac), 'end' (the esac word comes next). A stack: arms hold nested cases.
     const cs = [];
@@ -2344,8 +2347,9 @@ class Parser {
         seg = {
           words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, fns: ctx.fns, defs: ctx.defs, cmd: null, meta: new Map(), win: new Map(),
           start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl), loops: ctx.loops,
-          pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep,
+          pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep, afterClose: lastSep === '&&' && lastAfterClose,
         };
+        lastAfterClose = false;
       }
     };
     const mark = () => { if (qa < 0) qa = cur.length; inWord = true; };
@@ -2573,7 +2577,7 @@ class Parser {
         } else this.i++;
       } else if (c === '&') {
         const nx = s[this.i + 1];
-        if (nx === '&') { endSeg(this.i); lastSep = '&&'; this.i += 2; }
+        if (nx === '&') { flushWord(); const closed = seg?.closesFrom; const kind = this.lastCloseKind; endSeg(this.i); lastSep = '&&'; lastAfterClose = closed !== undefined && this.closeMaySkip(kind, closed); this.i += 2; }
         else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; endSeg(this.i); this.markClosedOut(closed); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
         else if (nx === '>' && !noRedir) {
           flushWord(); startSeg();
@@ -2793,11 +2797,20 @@ class Parser {
     for (let k = this.ctlStack.length - 1; k >= this.ctlBase; k--) {
       if (!kinds.includes(this.ctlStack[k])) continue;
       const from = this.ctlFrom[k];
+      this.lastCloseKind = this.ctlStack[k];
       while (this.ctlStack.length > k) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); ctlDec(this.ctx, kind); }
       return from;
     }
     this.ctx.ctlBroken = true; // (a closer with no opener we saw: a prefix we do not model hid it (`nocorrect if ...`), so the marks are not to be trusted)
     return undefined;
+  }
+
+  // (#352 R7-F2: a construct whose body may not have run, closed right before `&&`: an if / case / loop, a function body, a group after && / || / |, and a plain group that holds one of those. Commands still
+  // waiting for a heredoc are not out yet: assumed to.)
+  closeMaySkip(kind, from) {
+    if (['if', 'case', 'loop', 'fn', 'cbrace'].includes(kind)) return true;
+    if (this.queue.length) return true;
+    return this.ctx.out.slice(from).some((c) => c.ctl.cond || c.ctl.loop);
   }
 
   // The commands of a construct that closed right before `|` or a background `&` ran in a subshell: they may not run in this shell (marked cond). Commands still
@@ -2867,7 +2880,7 @@ class Parser {
       if (nextEq) value = nextEq.length > 1 ? nextEq.slice(1) : (words[i + 2]?.text ?? '');
       else if (value === '') value = words[i + 1]?.text ?? '';
       setEnv(env, ps[1], value);
-      return emit(this.ctx, [], env, seg.raw, seg.depth, [], seg.sep);
+      return emit(this.ctx, [], env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
     }
     for (; i < words.length; i++) {
       const a = assignOf(words[i]);
@@ -2952,11 +2965,11 @@ class Parser {
     // a command name that is only known at run time ($g push, $(echo git) push)
     const headDyn = a.length > 0 && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'));
     if (headDyn) this.ctx.dynamicHead = true; // (kept apart from the other causes of ctx.dynamic: see dynamicOther in simpleCommands)
-    const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep);
+    const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
     if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
     if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
-    if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep);
+    if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
     // the words that are exactly one command substitution (`for f in $(cmd)`): see wspans (#81)
     if (cmd) Object.defineProperty(cmd, 'subWords', { value: new Set(a.filter((w) => seg.meta.get(w)?.one === true)), enumerable: false });
     if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });

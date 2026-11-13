@@ -1,6 +1,8 @@
 // Why (#352 R6): a loop body is judged to a FIXPOINT, not a fixed number of times. Every loop is its own range with its own entry state (adjacent loops, nested loops); what a body may leave for its
 // next iteration is sampled after EVERY body command (`continue`, `break`, a command that may not run: the state in the middle of the body is one the next iteration can start in), the readings of a
 // loop word are iterations of ONE loop (what one reading leaves is carried into every reading), and a start (a directory the body moves to) is judged again whenever the carry grew.
+// (R7: the places a body starts an iteration in are shared by the readings as the carry is, a loop's frame is taken after the subshell bookkeeping of its first command, and an `&&` after the closer of a
+// construct that may have skipped its body is not chained to the body's last command.)
 // A bound that is exceeded refuses. Changes made outside a loop are still never carried into its body (R5-F1): see guard-loop-carry.test.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -144,13 +146,22 @@ test('#352 R7-F1: a loop frame holds the state the loop\'s first command really 
 });
 
 test('#352 R7-F2: a state change inside an if / loop is not certain for a command chained with && after its closer', () => {
-  denies('if false, switch, fi &&', 'if false; then git switch agent/x; fi && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
-  denies('while false, cd, done &&', 'while false; do cd /work/other2; done && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
-  denies('for, cd, done &&', 'for i in; do cd /work/other2; done && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
-  denies('until, cd, done &&', 'until true; do cd /work/other2; done && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
-  denies('case, switch, esac &&', 'case $x in a) git switch agent/x;; esac && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
-  denies('group, switch, } &&', '{ [ -f x ] && git switch agent/x; } && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
-  denies('if, switch, fi ||', 'if false; then git switch agent/x; fi || ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
+  const BAD = /pushing to main is blocked|cannot determine the current branch/;
+  denies('if false, switch, fi &&', 'if false; then git switch agent/x; fi && ' + SHIP, {}, BAD, MAIN_DIR);
+  denies('while false, cd, done &&', 'while false; do cd /work/other2; done && ' + SHIP, {}, BAD, MAIN_DIR);
+  denies('for, cd, done &&', 'for i in; do cd /work/other2; done && ' + SHIP, {}, BAD, MAIN_DIR);
+  denies('until, cd, done &&', 'until true; do cd /work/other2; done && ' + SHIP, {}, BAD, MAIN_DIR);
+  denies('case, switch, esac &&', 'case $x in a) git switch agent/x;; esac && ' + SHIP, {}, BAD, MAIN_DIR);
+  denies('group, switch behind ||, } &&', '{ [ -f x ] || git switch agent/x; } && ' + SHIP, {}, BAD, MAIN_DIR);
+  denies('group holding an if, } &&', '{ if [ -f x ]; then git switch agent/x; fi; } && ' + SHIP, {}, BAD, MAIN_DIR);
+  denies('group after ||, } &&', 'false || { git switch agent/x; } && ' + SHIP, {}, BAD, MAIN_DIR);
+  denies('a switch behind ||, then &&', 'true || git switch agent/x && ' + SHIP, {}, BAD, MAIN_DIR);
+  denies('a cd behind ||, then &&', 'true || cd /work/other2 && ' + SHIP, {}, BAD, MAIN_DIR);
+  denies('in a script', `bash ${GIT_ROOT}/run.sh`, { 'run.sh': '#!/bin/bash\nif false; then git switch agent/x; fi && ' + SHIP + '\n' }, BAD, MAIN_DIR);
+  allows('twin: a group chained with &&', '{ [ -f x ] && git switch agent/x; } && ' + SHIP, {}, MAIN_DIR);
+  allows('twin: a plain group', '{ git switch agent/x; } && ' + SHIP, {}, MAIN_DIR);
+  allows('twin: && after && after a switch', 'true && git switch agent/x && ' + SHIP, {}, MAIN_DIR);
+  denies('if, switch, fi ||', 'if false; then git switch agent/x; fi || ' + SHIP, {}, BAD, MAIN_DIR);
   allows('twin: a feature branch, fi &&', 'if [ -f x ]; then git status; fi && ' + SHIP, {});
   allows('twin: a plain chain stays certain', 'git switch agent/x && ' + SHIP, {}, MAIN_DIR);
   allows('twin: a plain cd chain stays certain', 'cd /work/other2 && ' + SHIP, {}, MAIN_DIR);
@@ -163,4 +174,20 @@ test('#352 R7-F3: a loop whose carry keeps growing at every new place it moves t
   const deep = { 'package.json': alias(1), 'sub/package.json': alias(2), 'sub/sub/package.json': alias(3), 'sub/sub/sub/package.json': alias(4) };
   denies('four aliases in four places', 'for i in 1 2; do npm run a; cd sub; done', deep, /keeps leaving git state for its next iteration, or moves to ever new places/);
   allows('twin: the same body, one alias in every place', 'for i in 1 2; do npm run a; cd sub; done', { 'package.json': alias(1), 'sub/package.json': alias(1), 'sub/sub/package.json': alias(1), 'sub/sub/sub/package.json': alias(1) });
+});
+
+test('#352 R7 adjacent shapes: groups, case, a pipeline, a loop in a function keep their verdicts around a moving loop', () => {
+  const sub = (a) => ({ 'package.json': pk({ a: 'echo a' }), 'sub/package.json': pk({ a }) });
+  const P = /pushing to main is blocked/;
+  const loop = 'for i in 1 2; do npm run a; cd sub; done';
+  denies('the loop in a group', '{ ' + loop + '; }', sub(PUSH_MAIN), P);
+  denies('a group in the loop', 'for i in 1 2; do { npm run a; cd sub; }; done', sub(PUSH_MAIN), P);
+  denies('a case in the loop', 'for i in 1 2; do case $i in 1) npm run a; cd sub;; esac; done', sub(PUSH_MAIN), P);
+  denies('a pipeline into the loop', 'git status | while read x; do npm run a; cd sub; done', sub(PUSH_MAIN), P);
+  denies('|| after the loop', loop + ' || true', sub(PUSH_MAIN), P);
+  denies('a loop in a loop word, in a group', 'for s in a b; do for t in 1 2; do npm run $s; cd /work/$s; done; done', { 'package.json': pk({ a: 'echo', b: 'echo' }), '/work/a/package.json': pk({ a: 'echo', b: PUSH_MAIN }) }, P);
+  allows('a subshell cd in the loop is lost', 'for i in 1 2; do (npm run a; cd sub); done', sub(PUSH_MAIN));
+  allows('a subshell cd in the loop word loop is lost', 'for s in a b; do (cd /work/$s; npm run $s); done', { 'package.json': pk({ a: 'echo', b: 'echo' }), '/work/a/package.json': pk({ a: 'echo', b: PUSH_MAIN }) });
+  denies('a state change in an until, then ||', 'until true; do git switch agent/x; done || ' + SHIP, {}, /cannot determine the current branch|pushing to main is blocked/, MAIN_DIR);
+  allows('a switch before a loop, a push after done &&', 'git switch agent/x; for i in 1 2; do git status; done && ' + SHIP, {}, MAIN_DIR);
 });

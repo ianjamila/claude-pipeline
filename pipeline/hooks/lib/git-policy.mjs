@@ -1954,6 +1954,8 @@ function loopReseed(ctx, entry, left) {
 const MAX_LOOP_STARTS = 4;
 const MAX_LOOP_PASSES = 12; // (the passes over one loop's body, from every start and every growth of the carry: more is refused)
 const MAX_READING_PASSES = 4; // (the passes over all readings of a loop word, each with what the others left)
+// (R7-F3: no input is known to reach MAX_READING_PASSES, so no test names its refusal: the carry holds only what a body leaves whatever state it started from, and the starts are capped at MAX_LOOP_STARTS + 1,
+// so every reading has contributed everything it can by the second pass; the bound is the fail-closed end of the loop, kept in case a later change makes a reading depend on what another left. MAX_LOOP_PASSES is reached: see guard-loop-fixpoint.test.mjs)
 // The directories a loop body (commands loop.start .. loop.end) can end in when it starts in `from`: its cd / pushd / popd in order, outside any subshell of its own (a cd there is lost with the subshell);
 // one that may not run (after && / ||, in an if / case branch, in the background) keeps the directory it started from as well. null: a place that cannot be named.
 function loopEndDirs(cmds, loop, from, ctx, cdp) {
@@ -2942,9 +2944,10 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
   const redefined = new Set();
   // (#352 R4-F1, R6-B1: the readings of a loop word are consecutive iterations of ONE loop, and a word can steer more than a git subcommand (`npm run $s`, `bash $s.sh` are another script per reading), so what the
   // body of a loop leaves for its next iteration is the union over ALL readings: the carry of each loop is shared (ctx.readingMemo), every reading judges the loop's body from entry + that carry, and the readings
-  // are judged again while the carry grows (a reading judged before another one added to it). More passes than MAX_READING_PASSES refuse.)
-  const memo = total > 1 ? { str, level, carries: new Map() } : null;
-  const memoSize = () => { let n = 0; for (const c of memo.carries.values()) n += carrySize(c); return n; };
+  // are judged again while the carry grows (a reading judged before another one added to it). The same goes for the places the body starts an iteration in (R7-B1: `cd /work/$s` moves iteration a to a place
+  // where iteration b runs): every reading judges the body from every start any reading found. More passes than MAX_READING_PASSES refuse.)
+  const memo = total > 1 ? { str, level, carries: new Map(), dirs: new Map() } : null;
+  const memoSize = () => { let n = 0; for (const c of memo.carries.values()) n += carrySize(c); for (const d of memo.dirs.values()) n += d.length - 1; return n; }; // (a loop's starts: the first is where its entry is, the others are places a body moved to)
   const outerMemo = ctx.readingMemo;
   ctx.readingMemo = memo;
   try {
@@ -3026,6 +3029,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   const cdp = cdpathMaybe(cmds, ctx);
   const from = flowStart(cmds);
   let uncertain = false; // an earlier cd / branch change may not have taken effect for the commands that follow
+  let orChanged = false; // (it is behind `||`: a command chained with && after it may run without it)
   const forgetState = () => { dir = null; for (const e of ctx.branches.values()) e.name = null; };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
@@ -3100,14 +3104,6 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (i >= cmds.length) break;
     const c = cmds[i];
     if (chdirBase !== undefined) { dir = chdirBase; chdirBase = undefined; }
-    for (const r of loopsAt.get(i) ?? []) {
-      if (frames.some((x) => x.id === r.id)) continue;
-      const fr = { id: r.id, start: r.start, end: r.end, entry: loopEntry(ctx), carry: memo?.carries.get(r.id) ?? newLoopLeft(), dir0: dir, uncertain0: uncertain, dirs: [dir], passDir: dir, judged: new Map(), passes: 1, subs: subs ? subs.map((x) => ({ ...x })) : [] };
-      if (memo && !memo.carries.has(r.id)) memo.carries.set(r.id, fr.carry);
-      if (carrySize(fr.carry)) loopMark(ctx, fr.carry); // (what the other readings of the loop word left: the body is judged from entry + that carry in this one as well)
-      fr.judged.set(dir, carrySize(fr.carry));
-      frames.push(fr);
-    }
     const argv = c.argv;
     if (subs) {
       // Why: a cd inside a subshell ($( ), ( ), backticks, <( )) moves that subshell only: when it ends, the line goes on in the directory it had when the subshell
@@ -3123,19 +3119,36 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
       for (; k < c.grp.length; k++) subs.push({ id: c.grp[k], dir, uncertain });
     }
+    // (R7-F1: a loop's frame is taken once the subshells this command ends or opens are settled, above: the directory, the open subshells and the state it holds are what the loop's FIRST command starts with,
+    // and what every further pass restarts from. Before it, a pass restored a subshell that had ended (`(true); for ...`) or lacked the one the loop is in (`( for ...; done ); push`).)
+    for (const r of loopsAt.get(i) ?? []) {
+      if (frames.some((x) => x.id === r.id)) continue;
+      // (R7-B1: the starts are shared by the readings of a loop word, as the carry is: a place another reading moved to is a place this one is judged from as well)
+      const starts = memo?.dirs.get(r.id) ?? [];
+      if (memo && !memo.dirs.has(r.id)) memo.dirs.set(r.id, starts);
+      if (!starts.includes(dir)) { if (starts.length < MAX_LOOP_STARTS || !starts.length) starts.push(dir); else if (!starts.includes(null)) starts.push(null); }
+      const fr = { id: r.id, start: r.start, end: r.end, entry: loopEntry(ctx), carry: memo?.carries.get(r.id) ?? newLoopLeft(), dir0: dir, uncertain0: uncertain, dirs: starts, passDir: dir, judged: new Map(), passes: 1, subs: subs ? subs.map((x) => ({ ...x })) : [] };
+      if (memo && !memo.carries.has(r.id)) memo.carries.set(r.id, fr.carry);
+      if (carrySize(fr.carry)) loopMark(ctx, fr.carry); // (what the other readings of the loop word left: the body is judged from entry + that carry in this one as well)
+      fr.judged.set(dir, carrySize(fr.carry));
+      frames.push(fr);
+    }
     if (hazard) forgetState();
     // Only commands chained with && after it are certain to see the change (`cd d && git push`); anything else may run
     // without it (`false && cd d; git push`, `cd d &`, `(cd d)`, `cd d || git push`), so the state is unknown.
-    if (uncertain && c.sep !== '&&') {
+    // (#352 R7-F2: not the `&&` after the closer of a construct that may have skipped its body: `if false; then cd d; fi && git push`, `done &&`, `esac &&` chain to the construct, not to the body's last command.
+    // Nor the `&&` after a change that was itself behind `||`: `true || cd d && git push` runs the push without the cd.)
+    if (uncertain && (c.sep !== '&&' || c.afterClose || orChanged)) {
       forgetState();
       uncertain = false;
+      orChanged = false;
     }
     if (argv.length) {
       const nm = baseName(argv[0]);
       const changesState = DIR_CHANGERS.includes(nm) || (nm === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l'));
       // `cd d || exit`: when the cd fails nothing after it runs, so the commands that do run see the change
       const orExits = cmds[i + 1]?.sep === '||' && ['exit', 'return'].includes(cmds[i + 1].argv[0]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&';
-      if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
+      if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) { uncertain = true; if (c.sep === '||') orChanged = true; }
     }
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
     // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)
