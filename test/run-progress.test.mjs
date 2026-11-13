@@ -16,7 +16,7 @@ const ID = { repo: 'acme/widgets', pr: PR, branch: 'feat/x', baseRef: 'main' };
 const NOW = Date.UTC(2026, 10, 13, 9, 0);
 const RESUMED = { at: '2026-11-12T08:00:00.000Z', host: 'pc-2', head: 'a'.repeat(40) };
 
-// A stateful stand-in for the github wrapper (viewer / listComments / upsertComment / prView / repo).
+// A stateful stand-in for the github wrapper (viewer / listComments / upsertComment / createComment / prView / repo).
 function memoryGh(initial = []) {
   const comments = [...initial];
   let next = 100;
@@ -30,6 +30,11 @@ function memoryGh(initial = []) {
       next += 1;
       comments.push({ id: next, body, user: { login: 'me' }, html_url: `https://x/${next}` });
       return { id: next, url: `https://x/${next}`, action: 'created' };
+    },
+    createComment(pr, body) {
+      next += 1;
+      comments.push({ id: next, body, user: { login: 'me' }, html_url: `https://x/${next}` });
+      return { id: next, url: `https://x/${next}` };
     },
     prView: () => ({ headRefOid: HEAD, headRefName: ID.branch, baseRefName: ID.baseRef }),
     repo: () => ({ slug: ID.repo, host: 'github.com' }),
@@ -199,19 +204,63 @@ test('resumedRunState: a record that cannot be read, or events that cannot be re
   assert.equal(state.resumed, false);
 });
 
-test('writeRunRecord: an invalid comment replaced by a resumed-marked record also leaves a run-resumed event (best effort, warned when it fails)', () => {
+test('writeRunRecord: an invalid comment replaced by a resumed-marked record also leaves a run-resumed event, posted before the record', () => {
   const gh = memoryGh([{ id: 7, body: INVALID_BODY, user: { login: 'me' } }]);
   gh.createComment = (pr, body) => { gh.comments.push({ id: 60, body, user: { login: 'me' } }); return { id: 60, url: 'u' }; };
-  const warnings = [];
-  writeRunRecord(gh, PR, { record: plain(), repo: ID.repo, branch: ID.branch, host: 'pc-1', now: NOW, onWarning: (w) => warnings.push(w) });
+  writeRunRecord(gh, PR, { record: plain(), repo: ID.repo, branch: ID.branch, host: 'pc-1', now: NOW });
   const events = gh.comments.map((c) => parseEvent(c.body)).filter((e) => e?.kind === 'run-resumed');
   assert.equal(events.length, 1);
   assert.deepEqual([events[0].data.host, events[0].data.head], ['pc-1', HEAD]);
-  assert.deepEqual(warnings, []);
+});
+
+// R10-B1: the event is REQUIRED. A write that stamps a resumed mark the re-read does not carry must have posted the event first; when the post fails nothing is
+// written (the comment stays invalid, which the gate reads as unchecked, and the next write retries). Residual, stated honestly: a writer whose read
+// PREDATES the corruption can still PATCH an unmarked record over an invalid one (GitHub has no conditional edit), whatever this path does.
+test('writeRunRecord: when the run-resumed event cannot be posted nothing is written and the call fails; the invalid comment stays invalid (a stale pre-corruption PATCH remains the residual)', () => {
   const broken = memoryGh([{ id: 7, body: INVALID_BODY, user: { login: 'me' } }]);
   broken.createComment = () => { throw new Error('boom 502'); };
-  const w2 = [];
-  const posted = writeRunRecord(broken, PR, { record: plain(), repo: ID.repo, branch: ID.branch, host: 'pc-1', now: NOW, onWarning: (w) => w2.push(w) });
-  assert.ok(posted.record.resumed, 'the record is still written and marked');
-  assert.match(w2.join('\n'), /run-resumed event not posted: boom 502/);
+  assert.throws(() => writeRunRecord(broken, PR, { record: plain(), repo: ID.repo, branch: ID.branch, host: 'pc-1', now: NOW }), /boom 502/);
+  assert.equal(broken.comments.find((c) => c.id === 7).body, INVALID_BODY, 'the comment was not touched');
+  assert.equal(readSummaryComment(broken, PR).status, 'invalid');
+  assert.equal(resumedRunState(broken, PR).unchecked, 'the run record is invalid', 'the gate still fails closed');
+  // the recorder turns the throw into a warning and a null record, and the next write retries
+  const rec = recorderFor(broken);
+  assert.equal(rec.update({ step: 'review' }), null);
+  assert.match(rec.warnings.join('\n'), /run record not updated: boom 502/);
+  broken.createComment = (pr, body) => { broken.comments.push({ id: 61, body, user: { login: 'me' } }); return { id: 61, url: 'u' }; };
+  assert.ok(recorderFor(broken).update({ step: 'review' }).resumed);
+  assert.equal(resumedRunState(broken, PR).resumed, true);
+});
+
+test('writeRunRecord: a resumed stamp made on an earlier read still gets its event when the re-read is no longer invalid (ok, unmarked)', () => {
+  const gh = memoryGh();
+  seed(gh, plain());
+  gh.createComment = (pr, body) => { gh.comments.push({ id: 62, body, user: { login: 'me' } }); return { id: 62, url: 'u' }; };
+  // baseRecordFor saw an invalid record and stamped; a stale writer then replaced it with an ordinary one before the re-read
+  const stamped = { ...plain(), resumed: RESUMED };
+  const posted = writeRunRecord(gh, PR, { record: stamped, host: 'pc-1', now: NOW });
+  assert.deepEqual(posted.record.resumed, RESUMED);
+  const events = gh.comments.map((c) => parseEvent(c.body)).filter((e) => e?.kind === 'run-resumed');
+  assert.deepEqual(events.map((e) => e.data), [RESUMED]);
+  // the caller that already posted its own event (skipResumedEvent), or a re-read that already carries the mark, posts none
+  const again = memoryGh();
+  seed(again, resumedRecord());
+  again.createComment = () => { throw new Error('must not post'); };
+  assert.deepEqual(writeRunRecord(again, PR, { record: stamped }).record.resumed, RESUMED);
+  const skipped = memoryGh();
+  seed(skipped, plain());
+  skipped.createComment = () => { throw new Error('must not post'); };
+  assert.deepEqual(writeRunRecord(skipped, PR, { record: stamped, skipResumedEvent: true }).record.resumed, RESUMED);
+});
+
+test('writeRunRecord: a malformed resumed.head (not shape-checked on decode) cannot block the mandatory event', () => {
+  for (const head of ['bad head/with*chars', 'x'.repeat(200), '\n<!--', '\u00e9\u00e9']) {
+    const gh = memoryGh([{ id: 7, body: INVALID_BODY, user: { login: 'me' } }]);
+    gh.createComment = (pr, body) => { gh.comments.push({ id: 63, body, user: { login: 'me' } }); return { id: 63, url: 'u' }; };
+    const record = { ...plain(), head, resumed: { at: new Date(NOW).toISOString(), host: 'pc-1', head } };
+    writeRunRecord(gh, PR, { record, host: 'pc-1', now: NOW });
+    const events = gh.comments.map((c) => parseEvent(c.body)).filter((e) => e?.kind === 'run-resumed');
+    assert.equal(events.length, 1, JSON.stringify(head));
+    assert.equal(resumedRunState(gh, PR).resumed, true, JSON.stringify(head));
+  }
 });

@@ -44,10 +44,14 @@ const stampResumed = ({ host, now, head }) => ({ at: new Date(now).toISOString()
 //  - a record from a newer CLI appeared meanwhile (and this re-read sees it): refuse (throws) instead of overwriting it;
 //  - the fresh record is ok and `resumed` and `record` lacks the mark: carry it over. Bound to this PR or not: the comment IS this PR's summary,
 //    the one the merge gate reads, so a repo / branch rename must not clear the mark;
-//  - the fresh record is unreadable (invalid): mark the replacement resumed (fail closed, same as baseRecordFor) and, best effort, also post the
-//    run-resumed event (a failure is reported to `onWarning`; the record mark still covers it). `skipResumedEvent`: the caller posted it already.
+//  - the fresh record is unreadable (invalid): mark the replacement resumed (fail closed, same as baseRecordFor);
+//  - the event is keyed on what THIS write does, not on the re-read status: whenever the record about to be written carries a `resumed` stamp that the
+//    fresh record does not carry (stamped here, or by baseRecordFor on an earlier read that a stale writer has since replaced), the run-resumed event is
+//    posted FIRST and REQUIRED: a failed post throws, nothing is written, the comment stays as it was (an invalid one stays invalid, which the gate reads as
+//    unchecked) and the next write retries. `skipResumedEvent`: the caller posted it already. Residual, not closable here: a writer whose read PREDATES
+//    the corruption can still PATCH an unmarked record over an invalid one (GitHub has no conditional edit).
 // The fresh read also supplies the kept sections.
-export function writeRunRecord(gh, pr, { record, sections, host = hostname(), now = Date.now(), onWarning = () => {}, skipResumedEvent = false }) {
+export function writeRunRecord(gh, pr, { record, sections, host = hostname(), now = Date.now(), skipResumedEvent = false }) {
   const fresh = readSummaryComment(gh, pr);
   if (fresh.status === 'unsupported') throw new Error(UNSUPPORTED);
   let out = record;
@@ -55,19 +59,14 @@ export function writeRunRecord(gh, pr, { record, sections, host = hostname(), no
     if (fresh.status === 'ok' && fresh.record.resumed) out = { ...out, resumed: fresh.record.resumed };
     else if (fresh.status === 'invalid') out = { ...out, resumed: stampResumed({ host, now, head: out.head }) };
   }
-  if (fresh.status === 'invalid' && !skipResumedEvent) {
-    try {
-      postResumedEvent(gh, pr, out.resumed);
-    } catch (err) {
-      onWarning(`run-resumed event not posted: ${String(err?.message ?? err).slice(0, 200)}`);
-    }
-  }
+  if (out.resumed && !skipResumedEvent && !(fresh.status === 'ok' && fresh.record.resumed)) postResumedEvent(gh, pr, out.resumed);
   return writeSummaryComment(gh, pr, { record: out, sections, existing: fresh });
 }
 
-// The append-only evidence that this run was resumed: one new comment, never edited. Throws when it cannot be posted.
+// The append-only evidence that this run was resumed: one new comment, never edited. Throws when it cannot be posted. The event id is built from
+// the head text, which is not shape-checked on decode, so it is reduced to the id alphabet: a malformed head can never block the post.
 export const postResumedEvent = (gh, pr, { at, host, head }) => postEvent(
-  gh, pr, 'run-resumed', `pr${pr}-${String(head || 'unknown').slice(0, 12)}-${Date.parse(at) || 0}`,
+  gh, pr, 'run-resumed', `pr${pr}-${String(head ?? '').replace(/[^A-Za-z0-9]/g, '').slice(0, 12) || 'unknown'}-${Date.parse(at) || 0}`,
   'This run was taken over from an earlier session: the owner must say "merge" for it.', { at, host, head },
 );
 
@@ -106,7 +105,7 @@ export function createRunRecorder({ gh, pr, host = hostname(), now = () => Date.
         const base = baseRecordFor(existing, { repo, pr, branch: view.headRefName, baseRef: view.baseRefName, step: initialStep, host, now: now(), head: view.headRefOid });
         base.warnings.forEach(warn);
         const record = applyCheckpoint(base.record, patch, { host, now: now() });
-        const posted = writeRunRecord(gh, pr, { record, host, now: now(), onWarning: warn });
+        const posted = writeRunRecord(gh, pr, { record, host, now: now() });
         return posted.record;
       } catch (err) {
         warn(`run record not updated: ${String(err?.message ?? err).slice(0, 200)}`);

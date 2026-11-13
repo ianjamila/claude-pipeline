@@ -147,7 +147,7 @@ export const run = guarded(async (argv, ctx) => {
       throw new UsageError(err.message);
     }
     // (the guarded writer re-reads first, which only narrows the window for a concurrent writer's `resumed` mark: the run-resumed event is the durable evidence)
-    const posted = writeRunRecord(gh, pr, { record, onWarning: (w) => warnings.push(w), skipResumedEvent: Boolean(values.resumed) });
+    const posted = writeRunRecord(gh, pr, { record, skipResumedEvent: Boolean(values.resumed) });
     return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, record: posted.record, warnings } };
   });
 });
