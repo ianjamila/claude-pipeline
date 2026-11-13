@@ -149,7 +149,7 @@ export const run = guarded(async (argv, ctx) => {
   if (planOnly) {
     return {
       exitCode: EXIT.OK,
-      output: { ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base } : planOutput(plan), expectedEffort: plan?.effort ?? null },
+      output: { ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base } : planOutput(plan), expectedEffort: plan?.effort ?? config.review.effort.followup },
     };
   }
 

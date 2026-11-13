@@ -2,7 +2,7 @@
 // and a base-only round's plan names a valid effort (R13-B2). The real CLI against a throwaway repo, a fake gh and a scripted fake Codex.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { roundWorld, findingsOf, low } from './helpers/round-world.mjs';
+import { roundWorld, findingsOf, low, aFile } from './helpers/round-world.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { strictestRouteConfig } from '../pipeline/lib/review-round.mjs';
 
@@ -84,3 +84,22 @@ test('strictestRouteConfig: lower small_fix_lines, higher budgets, mode off if e
   assert.deepEqual([d.smallFixLines, d.mode], [40, 'off'], 'unreadable base: never looser than the defaults, substitute off');
 });
 
+test('R13-B2: the plan of a base-only round names the follow-up effort, and codex-review with it records the base-only round', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const one = w.codex(1, findingsOf([], [low()]));
+  assertExit(one, 0, one.stderr + one.stdout);
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/a.js', aFile(false).replace('export const v10 = 10;', 'export const v10 = 1000;'));
+  w.repo.commit('main moves');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', 'main']);
+  const merged = w.repo.git(['rev-parse', 'HEAD']).trim();
+  w.prHead(merged);
+  const p = plan(w, w.head, merged);
+  assertExit(p, 0, p.stderr + p.stdout);
+  assert.equal(p.json.plan.baseOnly, true);
+  assert.equal(p.json.expectedEffort, 'high', 'review.effort.followup, not null');
+  const run = w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', merged, '--effort', p.json.expectedEffort]);
+  assertExit(run, 0, run.stderr + run.stdout);
+  assert.equal(w.state().rounds.at(-1).baseOnly, true);
+});
