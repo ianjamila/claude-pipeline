@@ -773,7 +773,11 @@ function braceRange(body) {
 // #111 (final round): ranges expand too; an expansion cut by a cap sets ctx.braceOver (rawHitOne fails closed on it while a review folder exists).
 function braceExpand(s, ctx) {
   if (!s.includes('{') || !(s.includes(',') || s.includes('..'))) return s;
-  if (s.length > 5000) { ctx.dynamic = true; return s; }
+  if (s.length > 5000) {
+    if (ctx.braceChunks === true) return braceExpandChunks(s, ctx);
+    ctx.dynamic = true;
+    return s;
+  }
   let cur = s.replace(/(?<!\$)\{([^{}\s,]+)\}/g, (m, body) => {
     const r = braceRange(body);
     if (!r) return m;
@@ -790,6 +794,25 @@ function braceExpand(s, ctx) {
     if (!changed || cur.length > 50_000) break;
   }
   return cur;
+}
+
+// #265 (g): a program's text past 5,000 characters is expanded piece by piece. A brace group holds no whitespace (the expansion above reads only `\S` runs), so the text is cut at whitespace into
+// pieces of at most 4,000 characters (a single longer run is cut where it stands: no one word of a program is that long), and each piece costs what a short text costs.
+const BRACE_CHUNK = 4000;
+function braceExpandChunks(s, ctx) {
+  const parts = [];
+  for (let from = 0; from < s.length;) {
+    let to = Math.min(s.length, from + BRACE_CHUNK);
+    if (to < s.length) {
+      let k = to;
+      while (k > from && !/\s/.test(s[k - 1])) k--;
+      if (k > from) to = k;
+    }
+    const piece = s.slice(from, to);
+    parts.push(piece.includes('{') ? braceExpand(piece, ctx) : piece);
+    from = to;
+  }
+  return parts.join('');
 }
 
 // One word with unquoted braces -> { list, over }: every expansion (nested, ranges), at most BRACE_MAX of them; over: the cap cut the list.
@@ -2043,7 +2066,31 @@ function toolEnvTouched(cmd, ctx, src) {
   }
   const names = [...Object.keys(cmd.env ?? {}), ...Object.keys(ctx.vars ?? {}), ...(ctx.unknownVars ?? []), ...(ctx.pickUnknown ?? []), ...(ctx.srcChanged ?? []), ...(ctx.srcTouched ?? [])];
   if (names.some((n) => p.name.test(n))) return true;
+  if (src === GIT_TOOL_ENV && inheritedToolEnvRisky(ctx.env)) return true;
   return lineTouchesToolEnv(ctx, src, p);
+}
+// #265 (d): the same variables in the HOOK's own environment (what the session was started with) reach the tool just as one on the line does. Not every inherited value is a risk: a terminal has LESS=-R,
+// PAGER=less, GIT_EDITOR=true. A name is a risk by itself when it names a program or a file (LESSOPEN, GIT_EXTERNAL_DIFF, RIPGREP_*, any GIT_ name not on the short list of
+// harmless ones), and a pager or an options variable (PAGER, GIT_PAGER, LESS, MORE ...) only when its VALUE is no plain pager name / no plain short options.
+const PLAIN_PAGER = /^\s*(?:(?:\/opt\/homebrew|\/usr\/local|\/usr)?\/s?bin\/)?(?:less|more|cat|most|bat|head|tail)(?:\s+-{1,2}[A-Za-z][A-Za-z-]*)*\s*$/;
+// (short option clusters, a few long ones; no option that names a file: -k lesskey, -o / -O log file, -t / -T tag file)
+const LESS_FLAG = '(?:-(?![A-Za-z]*[kKoOtT])[A-Za-z]{1,12}|-[jxzhb]\\d{1,3}|--(?:quit-if-one-screen|RAW-CONTROL-CHARS|raw-control-chars|no-init|ignore-case|IGNORE-CASE|chop-long-lines|LONG-PROMPT|line-numbers|squeeze-blank-lines|no-keypad|clear-screen|tabs=\\d{1,2}))';
+const PLAIN_OPTIONS = new RegExp(`^\\s*(?:${LESS_FLAG}(?:\\s+|$))*$`);
+const HARMLESS_INHERITED = /^(?:GIT_(?:EDITOR|SEQUENCE_EDITOR|AUTHOR_\w+|COMMITTER_\w+|TERMINAL_PROMPT|ASKPASS|SSH|SSH_COMMAND|SSH_VARIANT|OPTIONAL_LOCKS|MERGE_AUTOEDIT|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM)|LESS(?:CHARSET|CHARDEF|BINFMT|UTFBINFMT|UTFCHARDEF|ANSIENDCHARS|ANSIMIDCHARS|SECURE)|BAT_(?:THEME|STYLE|TABS))$/;
+const inheritedMemo = new WeakMap();
+function inheritedToolEnvRisky(env) {
+  if (!env || typeof env !== 'object') return false;
+  const hit = inheritedMemo.get(env);
+  if (hit !== undefined) return hit;
+  const toolName = new RegExp(`^(?:${GIT_TOOL_ENV})`);
+  let risky = false;
+  for (const [n, v] of Object.entries(env)) {
+    if (!toolName.test(n) || HARMLESS_INHERITED.test(n)) continue;
+    const value = typeof v === 'string' ? v : '';
+    if (/^(?:PAGER|MANPAGER|GIT_PAGER|BAT_PAGER)$/.test(n)) { if (!PLAIN_PAGER.test(value)) { risky = true; break; } } else if (/^(?:LESS|MORE)$/.test(n)) { if (!PLAIN_OPTIONS.test(value)) { risky = true; break; } } else { risky = true; break; }
+  }
+  inheritedMemo.set(env, risky);
+  return risky;
 }
 // R1-F2 (#288): what the LINE says is the same for every command, so it is computed once per (line, pattern) and cached on ctx; it is linear too: the line is cut at `;`, `&`, `|` and a newline, and a
 // segment is touched when its first declaring keyword is followed by a name of the family (the old single pattern backtracked from every keyword, and ran again for every isReadOnly call).
@@ -2061,6 +2108,32 @@ function lineTouchesToolEnv(ctx, src, p) {
   }
   memo.set(src, { line, touched });
   return touched;
+}
+
+// #265 (e): a line that defines a function or an alias, or changes where the shell looks for programs (PATH), can make a read-only name run something else (`function cat { tee "$@"; }; cat FILE`,
+// `PATH=/tmp/evil:$PATH; cat FILE`). So every command AFTER the first such definition on the line is no read-only call ('all': a function or alias can shadow any name, a builtin too; 'path': a builtin
+// (echo, printf, test, [, cd) still runs as itself). A command before the definition ran before it. A PATH that only adds the usual system and tool folders is no change worth refusing
+// (`export PATH=/opt/homebrew/bin:$PATH; cat FILE` is an everyday line); a prefix `PATH=… cmd` is judged for that one command.
+const SAFE_PATH_ENTRY = /^(?:\$\{?PATH\}?|\/(?:opt\/homebrew\/|usr\/local\/|usr\/)?s?bin|(?:\$HOME|\$\{HOME\}|~)\/(?:\.local\/)?bin)$/;
+const PATH_BUILTINS = new Set(['echo', 'printf', 'test', '[', ...CD_CMDS]);
+const pathValueMoves = (v) => typeof v !== 'string' || !v.split(':').every((e) => SAFE_PATH_ENTRY.test(e));
+const setsPath = (c) => {
+  const named = Object.entries(c.env ?? {}).some(([k, v]) => (k === 'PATH' || k === 'path') && pathValueMoves(v));
+  if (named) return true;
+  if (!['export', 'declare', 'typeset', 'readonly', 'local', 'setenv', 'env'].includes(baseOf(c.argv[0] ?? ''))) return false;
+  return c.argv.slice(1).some((a) => { const m = /^(?:PATH|path)\+?=(.*)$/s.exec(a); return m !== null && pathValueMoves(m[1]); });
+};
+function shadowedCommands(cmds, ctx) {
+  const out = new Map();
+  let kind = null;
+  for (const c of cmds) {
+    if (kind !== null) { if (!out.has(c)) out.set(c, kind); continue; }
+    if (c.argv.length > 0 && Object.entries(c.env ?? {}).some(([k, v]) => (k === 'PATH' || k === 'path') && pathValueMoves(v))) out.set(c, 'path'); // (PATH=… cmd: for that command only)
+    const name = baseOf(c.argv[0] ?? '');
+    if (c.ctl?.fn === true || /^\s*function\b/.test(c.raw) || name === 'alias' || (c.argv.length === 1 && ctx.lineDefs?.has(c.argv[0]))) kind = 'all';
+    else if (setsPath(c)) kind = 'path';
+  }
+  return out;
 }
 
 // T1.7 (a): isReadOnly judges the words the shell will pass. A same-line name is replaced by its value first (`D=-delete; find S $D`); a word whose value is still only known at run time
@@ -2462,6 +2535,8 @@ function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
   if (!argv.length) return false;
   const name = baseOf(argv[0]);
+  const shadow = ctx.shadowed?.get(cmd);
+  if (shadow !== undefined && (shadow === 'all' ? !CD_CMDS.has(name) : !PATH_BUILTINS.has(name))) return false; // (#265 e)
   const judged = judgedWords(name, argv.slice(1), ctx);
   if (judged.unknown) return false;
   if (evaluatesSubscript(name, argv.slice(1), ctx, cmd.raw)) return false;
@@ -3223,7 +3298,9 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   // to the rule at the end of the evaluation. A script's size is no fact about the line: the flag is kept as it was, so a trusted CLI call next to a long
   // script no longer fails closed. The script's own verdict is unchanged: it never denied on that flag.)
   const dynamicBefore = ctx.dynamic;
-  const hitsProtected = text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true);
+  ctx.braceChunks = true; // (#265 g: the text is brace-expanded in pieces, so a brace-split protected path in a long program is seen)
+  let hitsProtected;
+  try { hitsProtected = text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true); } finally { ctx.braceChunks = false; }
   ctx.dynamic = dynamicBefore;
   if (hitsProtected && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})${programHitWhere(text, m, dir, ctx, sf.file)}`);
   return null;
@@ -3874,6 +3951,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
+  ctx.shadowed = shadowedCommands(cmds, ctx);
   ctx.heredocPlants = /<</.test(raw) && plantsInText(raw); // (R5-F3: a heredoc body is on no command; the line's text is judged for an assigning expansion, a quoted body included)
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
@@ -4463,11 +4541,25 @@ function evaluateBashForFilesFrame(command, opts) {
     };
     // #410: `cd DIR || exit 1` (also `|| exit`, `|| return`): when the cd fails the shell leaves, so whatever runs after the exit command surely follows a cd that succeeded. The exit must be a plain command of its own
     // (not a pipeline stage or a background job: those leave only a subshell), in the same construct as the cd.
-    const leavesAfter = (k) => {
+    // (the same for a brace group, `cd DIR || { echo "no dir"; exit 1; }`: its last command is the exit and every command before it is joined by ; or a newline, so the exit surely runs when the group does)
+    const leavesAfter = (k) => { // the index of the command that surely follows a cd that succeeded, or -1
       const x = top[k + 1];
-      if (x === undefined || x.sep !== '||' || evAt.has(k + 1) || evAt.has(k + 2) || !staticName(x) || !['exit', 'return'].includes(x.argv[0])) return false;
-      const y = top[k + 2];
-      return y === undefined || y.sep === ';' || y.sep === '&&';
+      if (x === undefined) return -1;
+      const opens = evAt.get(k + 1);
+      let last = k + 1; // (the command that must be the exit, and the index of the command after the construct)
+      if (opens !== undefined) {
+        if (opens.length !== 1 || opens[0].kind !== '{' || opens[0].sep !== '||') return -1;
+        let j = k + 2;
+        while (j < top.length && !evAt.has(j)) j++;
+        const closes = evAt.get(j);
+        if (closes === undefined || closes.length !== 1 || closes[0].kind !== '}') return -1;
+        for (let m = k + 2; m < j; m++) if (top[m].sep !== ';') return -1;
+        last = j - 1;
+      } else if (x.sep !== '||' || evAt.has(k + 2)) return -1;
+      const e = top[last];
+      if (!staticName(e) || !['exit', 'return'].includes(e.argv[0])) return -1;
+      const y = top[last + 1];
+      return y === undefined || y.sep === ';' || y.sep === '&&' ? last + 1 : -1;
     };
     let resume; // (the chain a cd leaves for the command after its `|| exit`, { at, chain })
     let known = unique([ctx.cwd, ...seedDirs]); // where the shell can be so far
@@ -4512,7 +4604,7 @@ function evaluateBashForFilesFrame(command, opts) {
       if (known.length > 32 || here.length > 32) { lost = true; chain = null; continue; }
       const ran = (sep !== '||' && sep !== '|') || entered; // (a cd after || or | may not have run, unless it opens the subshell or group that was entered that way)
       chain = ran && joinAfter(k) === '&&' ? here : null;
-      if (ran && joinAfter(k) === '||' && leavesAfter(k)) resume = { at: k + 2, chain: here };
+      if (ran && joinAfter(k) === '||') { const at = leavesAfter(k); if (at >= 0) resume = { at, chain: here }; }
     }
     return stack.length === 0;
   };
