@@ -3054,10 +3054,13 @@ function evalString(str, startDir, ctx, level, child = false) {
   let trackers = []; // the certain changes so far: { up: the levels it is in, cond: it may not have run (it follows &&), lost: it may have moved the directory, before: the git state before it }
   const snap = () => ({ dir, trackers: [...trackers] });
   const restore = (x) => { dir = x.dir; trackers = [...x.trackers]; };
+  // (an alias a change that is not certain (re)defined is unsure for every later use, as for a speculative candidate (judgeScopedIn): the use is refused, whatever the value the walk gave it)
+  const aliasesUnsure = (was) => {
+    for (const [kind, then, now] of [['git', was.git, ctx.gitAliases], ['gh', was.gh, ctx.ghAliases]]) for (const n of new Set([...Object.keys(then), ...Object.keys(now)])) if (then[n] !== now[n]) ctx.aliasUnsure.add(`${kind}:${n.toLowerCase()}`);
+  };
   const forget = (x) => {
     if (x.lost) forgetState(); else forgetBranches();
-    // (an alias a change that is not certain (re)defined is unsure for every later use, as for a speculative candidate (judgeScopedIn): the use is refused, whatever the value the walk gave it)
-    for (const [kind, then, now] of [['git', x.before.git, ctx.gitAliases], ['gh', x.before.gh, ctx.ghAliases]]) for (const n of new Set([...Object.keys(then), ...Object.keys(now)])) if (then[n] !== now[n]) ctx.aliasUnsure.add(`${kind}:${n.toLowerCase()}`);
+    aliasesUnsure(x.before);
   };
   // For command c: the operator before the item of a tracker's list that holds it (c itself, or the group / text / subshell that holds c): && keeps the change certain, ; and everything else ends a conditional one,
   // || any (`cd d || exit 1`: nothing after it runs when the change failed).
@@ -3157,7 +3160,7 @@ function evalString(str, startDir, ctx, level, child = false) {
         if (l.e.kind === 'sub' || l.e.proc) {
           // (a directory a text left unknown stays unknown: it did something the walk cannot follow, `bash -c 'cd() { :; }'. A subshell's own snapshot is the directory the line goes on in, whatever a text inside it did: R10-F5)
           if (l.e.kind === 'sub' || (dir !== null && !hazard)) dir = l.dir;
-          if (l.state) forgetBranches();
+          if (l.state) { forgetBranches(); aliasesUnsure(l.al); } // (#352 R11-B1: an alias it (re)defined is unsure too: the level may not have run, as for a change that is not certain)
         }
         else if (l.e.kind === 'blk') { for (const x of trackers) if (x.scoped && x.up.includes(l.e)) forget(x); } // (a change in a branch / loop / function body: unknown once the body is left)
         else if (l.e.kind === 'brace' && (l.e.sep === ';' || l.e.sep === '&')) {
@@ -3169,13 +3172,14 @@ function evalString(str, startDir, ctx, level, child = false) {
           if (outer) { outer.lost ||= l.lost; outer.state ||= l.state; }
         } else {
           if (l.lost) forgetState(); else if (l.state) forgetBranches();
+          if (l.state) aliasesUnsure(l.al);
           if (outer) { outer.lost ||= l.lost; outer.state ||= l.state; }
         }
       }
     }
     if (hazard) forgetState();
     settle(c); // (what a subshell saves is the SETTLED state: the rule is applied for the operator before it first, so a state the subshell's own commands forget cannot be given back as certain)
-    if (levels) for (let k = levels.length; k < c.up.length; k++) levels.push({ e: c.up[k], dir, lost: false, state: false });
+    if (levels) for (let k = levels.length; k < c.up.length; k++) levels.push({ e: c.up[k], dir, lost: false, state: false, al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases } } });
     // (R7-F1: a loop's frame is taken once the subshells this command ends or opens are settled, above: the directory, the open subshells and the state it holds are what the loop's FIRST command starts with,
     // and what every further pass restarts from. Before it, a pass restored a subshell that had ended (`(true); for ...`) or lacked the one the loop is in (`( for ...; done ); push`).)
     for (const r of loopsAt.get(i) ?? []) {
