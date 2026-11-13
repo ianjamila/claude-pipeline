@@ -1,9 +1,10 @@
 // A scriptable stand-in for `gh`, so tests never touch GitHub. Point PIPELINE_GH at
 // `node <this file>` and describe the replies in the JSON file named by PIPELINE_FAKE_GH_SCRIPT:
-//   [{ match: "<regex source>", stdout?, stdoutJson?, stderr?, code? }]
+//   [{ match: "<regex source>", stdout?, stdoutJson?, stderr?, code?, seq? }]
+// `seq: [reply, ...]` (each reply the same shape) answers the nth call that hits the entry with seq[n]; the last reply repeats.
 // The first entry whose regex matches the space-joined argv wins. Every call is also appended to
 // PIPELINE_FAKE_GH_LOG (one JSON line: argv, cwd, stdin) so tests can assert what was run.
-import { readFileSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'node:fs';
 
 // stdin is read only when something is piped in; a 200 ms cap means an idle inherited stdin never hangs us.
 function readStdin() {
@@ -36,7 +37,16 @@ if (process.env.PIPELINE_FAKE_GH_LOG) {
 const scriptPath = process.env.PIPELINE_FAKE_GH_SCRIPT;
 const entries = scriptPath ? JSON.parse(readFileSync(scriptPath, 'utf8')) : [];
 const joined = argv.join(' ');
-const hit = entries.find((e) => new RegExp(e.match).test(joined));
+const index = entries.findIndex((e) => new RegExp(e.match).test(joined));
+let hit = entries[index];
+if (hit && Array.isArray(hit.seq)) {
+  const countsPath = `${scriptPath}.counts`;
+  const counts = existsSync(countsPath) ? JSON.parse(readFileSync(countsPath, 'utf8')) : {};
+  const n = counts[index] ?? 0;
+  counts[index] = n + 1;
+  writeFileSync(countsPath, JSON.stringify(counts));
+  hit = hit.seq[Math.min(n, hit.seq.length - 1)];
+}
 
 if (!hit) {
   process.stderr.write(`fake-gh: no match for ${joined}`);
