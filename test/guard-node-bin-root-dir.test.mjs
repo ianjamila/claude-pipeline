@@ -143,3 +143,31 @@ test('#352 follow-up: the clean next chain behind the same cd is still allowed b
     }
   }
 });
+
+// Why (#352 follow-up 2): the same lost directory hid a bin run by a package runner (`exec npx evil` after the cd): the runner's bin lookup got no directory at all.
+const RUNNERS = ['npx evil', 'npm exec evil', 'pnpm exec evil', 'yarn exec evil', 'bunx evil'];
+const RUNNERS_CLEAN = ['npx next start', 'npm exec next', 'pnpm exec next start'];
+test('#352 follow-up: a runner run after a cd to the script\'s parent still reaches the bin (pushes / writes a protected file)', () => {
+  const bad = (g) => `#!/bin/sh\n${BAD[g]}\n`;
+  for (const tail of RUNNERS) {
+    for (const cd of ['cd "${0:A:h:h}" || exit 1', 'cd "$(dirname "$0")/.." || exit 1']) {
+      for (const g of GUARDS) {
+        const root = g === 'git' ? GIT_ROOT : PROJ;
+        const files = { ...project(g, { start: 'evil' }, bad), 'node_modules/.bin/evil': bad(g), 'scripts/serve.sh': `#!/bin/zsh\n${cd}\nexec ${tail}\n` };
+        const r = run(g, `${root}/scripts/serve.sh`, files);
+        assert.equal(r.decision, 'deny', `${g}: ${cd}; exec ${tail} -> ${r.reason}`);
+      }
+    }
+  }
+});
+
+test('#352 follow-up: the clean runner chain (npx next start, npm exec next) behind the same cd is still allowed by both guards', () => {
+  for (const tail of RUNNERS_CLEAN) {
+    for (const g of GUARDS) {
+      const root = g === 'git' ? GIT_ROOT : PROJ;
+      const files = { ...project(g, { start: 'next start' }, NEXT_JS), 'scripts/serve.sh': `#!/bin/zsh\ncd "\${0:A:h:h}" || exit 1\nexec ${tail}\n` };
+      const r = run(g, `false && ${root}/scripts/serve.sh`, files);
+      assert.equal(r.decision, 'allow', `${g}: exec ${tail} -> ${r.reason}`);
+    }
+  }
+});

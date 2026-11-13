@@ -1572,6 +1572,7 @@ function pkgFileWritten(ctx, abs) {
 }
 
 // The directories a script file may have moved to with a cd the guard cannot follow: its own directory and every one above it.
+// (Why every one above it: the safe side. A package.json or bin in an ancestor the script would not really run from can only cause a false refusal, never a missed one.)
 function selfDirs(ctx) {
   const out = [];
   if (typeof ctx.selfScript !== 'string') return out;
@@ -1687,7 +1688,15 @@ function binVerdict(name, dir, ctx, level, quiet = false, lookup = dir) {
 }
 function runnerBinVerdict(argv, dir, ctx, level, quiet = false, lookup = dir) {
   const name = expandVars(argv[0], ctx);
-  return name.includes('/') ? null : binVerdict(name, dir, ctx, level, quiet, lookup);
+  if (name.includes('/')) return null;
+  // (#352) a runner (npx, npm exec, pnpm dlx / exec, yarn exec, bunx) run after a cd the guard cannot follow, in a script file: its bin is looked up from the script's own directory and each one above it
+  if (dir === null && lookup === null) {
+    for (const d of selfDirs(ctx)) {
+      const v = binVerdict(name, d, ctx, level, quiet, d);
+      if (v) return v;
+    }
+  }
+  return binVerdict(name, dir, ctx, level, quiet, lookup);
 }
 
 function judgeSqlEscapes(escapes, sf, dir, ctx, level) {
