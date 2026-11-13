@@ -1167,6 +1167,37 @@ test('R20: arithmetic holding a ${…} the parser cannot span (a newline, <( >( 
   assert.deepEqual(blocked, [], 'these R20 lines were refused');
 });
 
+test('R21: a declined ${…} is no command text, a (( keeps the outer heredoc out, and an unmatched [ ] in arithmetic is refused', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json'; // (built at run time, as in R19)
+  const failures = [];
+  for (const cmd of [
+    'echo ${x:-$(true) # $(' + cp + ')}', // R21-F1 (a): `#` is no comment inside ${…}
+    "echo ${x:-$(true) <<'E'}\n" + cp + '\nE', // (b): a << inside ${…} is no heredoc
+    "cat <<'E' ${x:-$(true)\n$(" + cp + ')}\nbody\nE', // (c): a newline inside ${…} while a heredoc is pending
+    // R21-F2: a newline inside (( … )) is part of the arithmetic; the outer heredoc starts after the line that ends it
+    "cat <<'E'; (( 1 +\n$(" + cp + ')\nE\n ))\nbody\nE',
+    "cat <<'E'; for (( i=0; i<1;\n$(" + cp + ')\nE\n i++ )); do :; done\nbody\nE',
+    // R21-F3: zsh re-reads arithmetic with an unmatched bracket as a subshell, where > is a redirect
+    'd=.clau; echo $(( 1 ] > ~/${d}de/settings.json ))',
+    'd=.clau; (( a[1 > ~/${d}de/settings.json ))',
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R21 lines were not refused');
+  const blocked = [];
+  for (const cmd of [
+    'echo ${x:-$(date)}',
+    'echo "${x:-$(date)}"',
+    'echo $(( a[1] + 2 ))',
+    '(( i++ ))',
+    "cat <<'E'\nbody\nE\n(( i++ ))",
+    'echo ${x:-$(date)} # fine',
+  ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
+  assert.deepEqual(blocked, [], 'these R21 lines were refused');
+  // R21-F4: the arithmetic refusal names the new causes
+  const r = evaluateBashForFiles('echo $(( 1 ] + 2 ))', { ...LINUX, cwd: '/home/u' });
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /unmatched/);
+});
+
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------
 
 test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] argument no longer hide a fed interpreter', () => {

@@ -712,13 +712,18 @@ export const ZSH_NAME_BINDERS = new Set(['vared', 'zparseopts', 'strftime', 'zst
   'ztcp', 'zsocket', 'zpty', 'zselect', 'zsystem', 'sysopen', 'syswrite', 'pcre_match', 'zgetattr', 'zlistattr', 'zcurses', 'compadd', 'zle']);
 // #81: the end (just after the closing `))`) of the `$((` arithmetic that starts at i, or -1 when it cannot be told from a subshell inside a command
 // substitution (`$((cmd) )`, `$((a); b)`) or holds a quote, backtick or backslash (those would need the frames).
+// (#269 R21-F3) Square brackets are counted too: zsh's math lexer counts them, and on a `]` with no open `[`, or the closing `))` reached with a `[` still open, it re-reads the
+// text as a subshell, where `>` is a real redirect. Not provably arithmetic: -1 (refused).
 const arithEnd = (s, i, skip = 3) => {
   let depth = 0;
+  let brackets = 0;
   for (let j = i + skip; j < s.length; j++) {
     const c = s[j];
     if (c === '"' || c === "'" || c === '`' || c === '\\') return -1;
     if (c === '(') depth++;
-    else if (c === ')') { if (depth > 0) depth--; else return s[j + 1] === ')' ? j + 2 : -1; }
+    else if (c === '[') brackets++;
+    else if (c === ']') { if (brackets === 0) return -1; brackets--; }
+    else if (c === ')') { if (depth > 0) depth--; else return s[j + 1] === ')' && brackets === 0 ? j + 2 : -1; }
   }
   return -1;
 };
@@ -2079,13 +2084,16 @@ const MAX_PARAM_WORK = 2_000_000;
 const contAt = (s, k) => s[k] === '\\' && (s[k + 1] === '\n' || (s[k + 1] === '\r' && s[k + 2] === '\n'));
 const isFunsubAt = (s, at) => s[at] === '$' && (contAt(s, at + 1) || (s[at + 1] === '{' && at + 2 < s.length && (/[\s|]/.test(s[at + 2]) || contAt(s, at + 2))));
 const REFUSED_FUNSUB = 'a `${ cmd; }` / `${|cmd;}` command substitution (bash 5.3, newer zsh), or a line continuation (backslash-newline) right after `$` or `${`';
+// (#269 R21-F1) a `${…}` that paramSpan declines (it holds a `$( )`, `<( )`, `$'…'`, a backtick or a newline) is lexed on as command text; inside it the shell has no comments or heredocs and reads a newline as part of the word
+const REFUSED_PARAM = 'a `${…}` holding a command substitution (or a newline, a process substitution, `$\'…\'` or a backtick) together with a `#`, a `<<`, a newline or a stray `)` inside the braces: the shell reads all of it as one word and runs every substitution in it';
 // (#269 R19-F2) what to write instead, per refusal (the `$(cmd)` advice does not fit arithmetic that already holds one)
 export function refusalAdvice(reason) {
+  if (reason === REFUSED_PARAM) return 'compute the value first on its own line (`d=$(date)`) and keep `#`, `<<`, newlines and stray parentheses out of a `${…}` that holds a `$( )`: `echo ${x:-$d}`';
   return reason === REFUSED_ARITH
     ? 'compute the value first and keep quotes, backslashes and `#` out of the arithmetic (`n=$(wc -l < "$f"); echo $(( n + 1 ))`), and for nested subshells put a space between the parentheses: `( (cmd) )`'
     : 'write `$(cmd)` on one line instead, or put such text in a file with the Write tool (git commit -F <file>, gh … --body-file <file>)';
 }
-const REFUSED_ARITH = 'arithmetic (`$(( ))`, `(( ))`, `for (( ))`) the guard cannot prove plain: one holding a quote, backtick, backslash or `#`, longer than 2000 characters, or a `((` that may be nested subshells; the shell expands such text as if double-quoted and still runs what is in it';
+const REFUSED_ARITH = 'arithmetic (`$(( ))`, `(( ))`, `for (( ))`) the guard cannot prove plain: one holding a quote, backtick, backslash or `#`, a `${…}` that holds a `$( )`, a newline, a process substitution or a `{`, a `case` statement, an unmatched `[` or `]`, longer than 2000 characters, or a `((` that may be nested subshells; the shell expands such text as if double-quoted and still runs what is in it';
 // (#269 R18) Is the text at k a `(`, after any line continuations (bash reads the character after `(` with them removed: `$(\⏎(` and `(\⏎(` are `$((` and `((`)?
 const arithOpenAt = (s, k) => { while (contAt(s, k)) k += s[k + 1] === '\r' ? 3 : 2; return s[k] === '('; };
 class Parser {
@@ -2100,6 +2108,7 @@ class Parser {
     this.braceStack = []; // log positions where standalone { groups opened
     this.subAcc = []; // segments run by substitutions inside the word being lexed
     this.lastDqDyn = false;
+    this.dbrace = 0; // open braces of a `${…}` paramSpan declined, lexed as command text (see REFUSED_PARAM); 0 outside one
     this.lastDqSubs = 0;
     this.cmd = null; // the command object interpret() is working on
     this.comments = null; // [start, end] of each comment of this text, when asked for (see withoutComments)
@@ -2171,7 +2180,9 @@ class Parser {
     const arithAt = s[start] === '$' && s[this.i] === '(' ? arithProofEnd(s, start, 3) : -1;
     if (s[start] === '$' && arithOpenAt(s, this.i) && arithAt < 0) this.markRefused(REFUSED_ARITH);
     // (`$((` is arithmetic, where `a > b` compares, only when it closes as `))`; else it is a subshell in a command substitution -- `$((cmd > f) )` RUNS cmd and writes f, in bash and zsh -- and its redirects count)
-    this.ownHeredocs(() => this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: arithAt >= 0, maybeArith: s[start] === '$' && s[this.i] === '(' })));
+    const outerBrace = this.dbrace; // (a real command substitution inside a declined ${…} is commands again: its own comments and newlines are the shell's)
+    this.dbrace = 0;
+    try { this.ownHeredocs(() => this.inGroup(() => this.nestParse(depth + 1, { stopAtParen: true, noRedir: arithAt >= 0, maybeArith: s[start] === '$' && s[this.i] === '(' }))); } finally { this.dbrace = outerBrace; }
     // (#269 R19-B1, R19-F1) The proof counts raw parentheses; the shell skips a `)` inside `${…}`, a heredoc body or a comment of a nested `$( )`. When the parser
     // closed the construct anywhere else than where the proof did, the proof read a different text than the shell runs: refused (`$(( ${x:-0))} + $'$(cmd)' ))`).
     if (arithAt >= 0 && this.i !== start + arithAt) this.markRefused(REFUSED_ARITH);
@@ -2556,12 +2567,14 @@ class Parser {
         flushWord();
         this.i++;
       } else if (c === '\n') {
+        if (this.dbrace > 0) this.markRefused(REFUSED_PARAM); // (#269 R21-F1)
         const had = !!seg || inWord;
         endSeg(this.i);
         if (had) lastSep = ';';
         this.i++;
         if (this.hd.length) this.readHeredocs();
       } else if (c === '#' && !inWord) {
+        if (this.dbrace > 0) this.markRefused(REFUSED_PARAM); // (#269 R21-F1: there are no comments inside ${…}; the rest of the word, with its substitutions, is the shell's)
         if (noRedir || maybeArith) { cur += this.funsub(REFUSED_ARITH); continue; } // (#269 R18-F4: arithmetic has no comments; `$(( 1 + # $(cmd)⏎ 2 ))` runs cmd)
         const from = this.i;
         while (this.i < n && s[this.i] !== '\n') this.i++;
@@ -2640,6 +2653,9 @@ class Parser {
           cur += s.slice(this.i, Math.min(j + 1, n));
           this.scanExpansions(s.slice(this.i + 2, j), depth);
           this.i = Math.min(j + 1, n);
+        } else if (nx === '{') {
+          // (#269 R21-F1) paramSpan declined this `${…}` (it holds code, a newline or never closes): lexed on as words, but tracked until its closing brace (see dbrace)
+          inWord = true; wdyn = true; cur += '${'; lastCur = cur; lastCh = '{'; this.i += 2; this.dbrace++;
         } else { inWord = true; if (nx !== undefined && DYN_AFTER_DOLLAR.test(nx)) wdyn = true; cur += '$'; lastCur = cur; lastCh = '$'; this.i++; }
       } else if (c === ';') {
         endSeg(this.i);
@@ -2670,6 +2686,7 @@ class Parser {
         else if (nx === '&') { lastSep = '|'; this.i += 2; }
         else { lastSep = '|'; this.i++; }
       } else if ((c === '<' || c === '>') && !noRedir) {
+        if (this.dbrace > 0 && c === '<' && s[this.i + 1] === '<') this.markRefused(REFUSED_PARAM); // (#269 R21-F1: no heredocs inside ${…})
         if (s[this.i + 1] === '(') {
           startSeg(); inWord = true;
           cur += this.substitution(depth);
@@ -2729,7 +2746,10 @@ class Parser {
             const open = this.i - 1;
             const arithAt = s[this.i] === '(' ? arithProofEnd(s, open, 2) : -1;
             if (!noRedir && arithOpenAt(s, this.i) && arithAt < 0) this.markRefused(REFUSED_ARITH); // (parsed as before: main's case-pattern reading keeps its commands)
-            this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || arithAt >= 0, maybeArith: maybeArith || s[this.i] === '(' })); // ((...)) is arithmetic when it closes as `))`; `((cmd) )` is nested subshells, redirects and all
+            // (#269 R21-F2) a `((` reads under heredocs of its own, as substitution() does: a newline inside the arithmetic is no end of the outer line, so it must not read the outer line's pending heredoc
+            const dbl = s[this.i] === '(';
+            const run = () => this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || arithAt >= 0, maybeArith: maybeArith || dbl })); // ((...)) is arithmetic when it closes as `))`; `((cmd) )` is nested subshells, redirects and all
+            if (dbl) this.ownHeredocs(run); else run();
             if (!noRedir && arithAt >= 0 && this.i !== open + arithAt) this.markRefused(REFUSED_ARITH); // (#269 R19-F1: the parser closed it elsewhere than the proof, as in substitution())
           } finally { if (body) this.ctx.ctl.fn--; if (cond) this.ctx.ctl.cond--; }
           fnPending = false;
@@ -2739,6 +2759,7 @@ class Parser {
           this.lastStage = this.log.slice(mark0).filter((x) => x.depth === depth);
         }
       } else if (c === ')') {
+        if (this.dbrace > 0) this.markRefused(REFUSED_PARAM); // (#269 R21-F1: the shell reads a `)` inside ${…} as text; here it would end the construct early)
         endSeg(this.i);
         lastSep = ';';
         this.i++;
@@ -2746,6 +2767,7 @@ class Parser {
       } else {
         startSeg();
         inWord = true;
+        if (this.dbrace > 0) { if (c === '{') this.dbrace++; else if (c === '}') this.dbrace--; } // (a bare { nests, as bash counts it: never end the tracking early)
         if (!(lit > 0 && litGlob) && ((c === '{' && !(cur === lastCur ? lastCh === '$' : cur.endsWith('$'))) || c === ',' || c === '}')) bm.push(cur.length); // (the cheap test first: endsWith flattens the word built so far)
         if (/[*?[^#~]/.test(c)) wpat = true;
         cur += c;

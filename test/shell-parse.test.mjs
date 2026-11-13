@@ -1022,3 +1022,55 @@ test('R20: in $(( )) and (( )), a ${…} the parser cannot span, a bare { in ${�
     assert.equal(simpleCommands(c).truncated, false, c);
   }
 });
+
+// #269 R21: a ${…} paramSpan declines is no command text (no comment, heredoc or newline in it); a (( does not read the outer line's heredoc; unmatched [ ] in arithmetic is refused
+test('R21: outside arithmetic, a declined ${…} holding a comment start, a << or a newline is refused; a plain one still parses', () => {
+  const notRefused = [];
+  for (const c of [
+    'echo ${x:-$(date) # $(date)}', // R21-F1 (a): `#` after a blank
+    'echo ${x:-$(date) <<\'E\'}', // (b): a heredoc opener
+    'echo ${x:-$(date) <<E}',
+    "cat <<'E' ${x:-$(true)\n$(date)}\nbody\nE", // (c): a newline with a heredoc pending
+    'echo ${x:-\nfoo}', // a newline alone is declined too
+    'echo ${x:-{a $(date) # b}}', // a bare { nests: still inside after the first }
+    'echo $(echo ${x:-$(a) ) # $(b)})', // a stray ) would end the outer $( ) early, hiding the rest from the lexer
+    'echo ${x:-$(a) (b # c) $(d)}', // a ( group inside keeps the tracking
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ['echo ${x:-$(date)}', 'echo "${x:-$(date)}"', 'echo ${x:-$(date)} # a $(comment)', 'echo ${x:-$(date)}; echo ${y:-$(date)} b', 'echo a#b ${x:-$(date)#2}', 'echo ${x:-$(\n a # note\n)}', 'echo ${x:-(b)$(a)} # z']) {
+    const r = simpleCommands(c);
+    assert.equal(r.truncated, false, c);
+  }
+  assert.ok(argvs('echo ${x:-$(date)}').includes('date'));
+});
+
+test('R21: a (( or for (( with a newline in it does not read the heredoc pending on the outer line', () => {
+  const cp = 'cp /tmp/payload ~/.x/y';
+  for (const c of [
+    "cat <<'E'; (( 1 +\n$(" + cp + ')\nE\n ))\nbody\nE',
+    "cat <<'E'; for (( i=0; i<1;\n$(" + cp + ')\nE\n i++ )); do :; done\nbody\nE',
+  ]) assert.ok(argvs(c).includes(cp), c + ' => ' + JSON.stringify(argvs(c)));
+  assert.equal(simpleCommands("cat <<'E'\nbody\nE\n(( i++ ))").truncated, false);
+  assert.ok(argvs("cat <<'E'\nbody (not code)\nE\n(( i++ )); echo after").includes('echo after'));
+});
+
+test('R21: $(( )) and (( )) holding an unmatched [ or ] are refused as arithmetic; balanced brackets still read', () => {
+  const notRefused = [];
+  for (const open of ['echo $((', '((']) {
+    for (const body of [' 1 ] > out ', ' a[1 > out ', ' a[1] ] > out ', ' [ ']) {
+      const r = simpleCommands(open + body + '))');
+      if (!(r.truncated && /arithmetic/.test(r.refused ?? ''))) notRefused.push(open + body + '))');
+    }
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused as arithmetic');
+  for (const c of ['echo $(( a[1] + 2 ))', '(( a[i] > 0 )) && echo y', 'echo $(( a[b[1]] + 1 ))']) assert.equal(simpleCommands(c).truncated, false, c);
+});
+
+test('R21: the arithmetic refusal names its causes', () => {
+  const r = simpleCommands('echo $(( ${x:-$(date)} + 1 ))');
+  assert.ok(r.truncated);
+  for (const word of ['\\$\\( \\)', 'newline', 'process substitution', 'case', 'unmatched']) assert.match(r.refused, new RegExp(word));
+});
