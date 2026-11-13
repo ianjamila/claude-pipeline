@@ -246,13 +246,20 @@ test('#352 R1-F2: a package.json reached from many ancestor directories is judge
 
 // Why (#352 R2-B1): an inner judgeAlternatives restored the alias map and kept the change only in aliasUnsure; the outer one then reset aliasUnsure to its own start, so the uncertainty was lost.
 test('#352 R2-B1: an alias defined by a script nested in a speculative script is still unsure afterwards', () => {
-  const files = {
-    'package.json': JSON.stringify({ name: 'x', scripts: { start: 'cd "$SOME_DIR" || exit 1; npm run setup', setup: 'git config alias.ship "' + PUSH + ' origin ' + MAIN + '"' } }),
+  const mk = (setup, release = 'git ship') => ({
+    'package.json': JSON.stringify({ name: 'x', scripts: { start: 'cd "$SOME_DIR" || exit 1; npm run setup', setup } }),
     'start.sh': '#!/bin/bash\ncd "$SOME_DIR" || exit 1\nnpm start\n',
-    'release.sh': '#!/bin/bash\ngit ship\n',
-  };
-  const r = run('git', `bash ${GIT_ROOT}/start.sh; bash ${GIT_ROOT}/release.sh`, files);
+    'release.sh': `#!/bin/bash\n${release}\n`,
+  });
+  const line = `bash ${GIT_ROOT}/start.sh; bash ${GIT_ROOT}/release.sh`;
+  const r = run('git', line, mk('git config alias.ship "' + PUSH + ' origin ' + MAIN + '"'));
   assert.equal(r.decision, 'deny', r.reason);
+  assert.match(r.reason, /the git alias "ship" may have been \(re\)defined/, r.reason); // (the uncertainty, not the unknown directory or another refusal)
+  // allow twins: a harmless alias under another name, no alias, and a release that does not use the alias are not refused
+  for (const [what, files] of [['other alias', mk('git config alias.st status')], ['no alias', mk('echo setup')], ['not the alias', mk('git config alias.ship "' + PUSH + ' origin ' + MAIN + '"', 'git status')]]) {
+    const ok = run('git', line, files);
+    assert.equal(ok.decision, 'allow', `${what}: ${ok.reason}`);
+  }
 });
 
 // Why (#352 R2-F1): runs of one workspace plan share state (an alias, a config change), and the plan's ORDER depends on the candidate directory; skipping a run already judged for another directory
@@ -267,8 +274,15 @@ test('#352 R2-F1: a workspace plan whose order differs by candidate directory is
   const line = `bash ${GIT_ROOT}/pkgs/b/run.sh`;
   const cfg = run('git', line, mk('git config push.default upstream', PUSH_BARE)); // (on a feature branch a bare push is unsafe only once push.default may point it at main)
   assert.equal(cfg.decision, 'deny', 'push.default: ' + cfg.reason);
+  assert.match(cfg.reason, /changes upstream\/push configuration/, 'push.default: ' + cfg.reason);
   const al = run('git', line, mk('git config alias.ship "' + PUSH + ' origin"', `git ship ${MAIN}`), { currentBranch: () => MAIN });
   assert.equal(al.decision, 'deny', 'alias: ' + al.reason);
+  assert.match(al.reason, /pushing to main is blocked/, 'alias: ' + al.reason);
+  // allow twins: the same two workspace scripts with a harmless configuration / alias are not refused
+  const cfgOk = run('git', line, mk('git config user.name x', PUSH_BARE));
+  assert.equal(cfgOk.decision, 'allow', 'harmless config: ' + cfgOk.reason);
+  const alOk = run('git', line, mk('git config alias.ship status', `git ship ${MAIN}`), { currentBranch: () => MAIN });
+  assert.equal(alOk.decision, 'allow', 'harmless alias: ' + alOk.reason);
 });
 
 // Why (#352 R3-F1): judgeReadings reset aliasUnsure for every reading and built its union from alias MAP differences only; judgeAlternatives (a lost cd in a script) restores the map and leaves only an unsure mark,
