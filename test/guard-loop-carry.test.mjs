@@ -32,8 +32,9 @@ function fakeFs(root, files) {
     readDir: (p) => (D.has(resolve(p)) ? names(resolve(p)) : null),
   };
 }
+// (the repository at GIT_ROOT is on agent/x; any other directory, /work/other for one, is a repository on main)
 const run = (cmd, files = {}) => evaluateGitCommand(cmd, {
-  cwd: GIT_ROOT, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(GIT_ROOT, files),
+  cwd: GIT_ROOT, home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(GIT_ROOT, files),
 });
 // package.json whose `setup` script is `setup`; `other` is harmless
 const pkg = (setup) => ({ 'package.json': JSON.stringify({ name: 'x', scripts: { setup, other: 'echo hi' } }) });
@@ -100,4 +101,32 @@ test('#352 R5 allow twins: a branch made before the loop, a switch inside it, or
   allows('a harmless package script in a loop', `for i in 1 2; do ${PB} origin HEAD; npm run other; done`, pkg(SWITCH_MAIN));
   allows('a harmless setup script', `while true; do ${PB} origin HEAD; npm run setup; done`, pkg('echo setup'));
   allows('a harmless alias in a loop', 'for i in 1 2; do git ship; git config alias.st status; done');
+});
+
+// Why (#352 R5, directory loop-back): a body that moves to another directory starts its next iteration THERE: `git push origin HEAD; cd /work/other` pushes /work/other's branch the second time round.
+// The body is judged again from the directory it ended in (unknown when it cannot be named), then from an unknown one when that moves again (`cd ..` goes up every time).
+test('#352 R5: a directory the body changes to is where its next iteration starts', () => {
+  for (const [what, loop] of [
+    ['absolute cd', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; done`],
+    ['relative cd', `for i in 1 2; do ${PB} origin HEAD; cd ../other; done`],
+    ['cd to a variable', `X=/work/other; for i in 1 2; do ${PB} origin HEAD; cd "$X"; done`],
+    ['pushd', `for i in 1 2; do ${PB} origin HEAD; pushd /work/other; done`],
+    ['cd up every time', `while true; do ${PB} origin HEAD; cd ..; done`],
+    ['cd chained', `for i in 1 2; do ${PB} origin HEAD; cd ../other && echo; done`],
+    ['cd to a place not named', `for i in 1 2; do ${PB} origin HEAD; cd "$(mktemp -d)"; done`],
+  ]) {
+    denies(what, loop, {}, BRANCH);
+    denies(`${what}, in a script`, RUN_SH, script('echo', loop), BRANCH);
+  }
+});
+test('#352 R5 allow twins: a body that stays in the repository, or moves only in a subshell, is not refused', () => {
+  allows('cd into a subdirectory and push', `for i in 1 2; do cd sub && ${PB} origin HEAD; done`);
+  allows('push, then cd into a subdirectory', `for i in 1 2; do ${PB} origin HEAD; cd sub; done`);
+  allows('subshell cd before the push', `for i in 1 2; do (cd sub && make); ${PB} origin HEAD; done`);
+  allows('subshell cd to another repository after the push', `for i in 1 2; do ${PB} origin HEAD; (cd /work/other && make); done`);
+  allows('command substitution cd', `for i in 1 2; do ${PB} origin HEAD; echo $(cd /work/other && pwd); done`);
+  allows('cd and back', `for i in 1 2; do ${PB} origin HEAD; cd sub && cd ..; done`);
+  allows('cd to the repository itself', `for i in 1 2; do ${PB} origin HEAD; cd ${GIT_ROOT}; done`);
+  allows('cd into another repository, no push in the loop', 'for i in 1 2; do cd /work/other; git status; done');
+  allows('in a script', RUN_SH, script('echo', `for i in 1 2; do (cd sub && make); ${PB} origin HEAD; cd sub; done`));
 });
