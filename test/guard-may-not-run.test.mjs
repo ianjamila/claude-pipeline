@@ -187,3 +187,51 @@ test('#400 differential: a failure that && passes on reaches a later ||; a cd in
   allows('twin: the cd and the push in one bash -c text', `bash -c 'cd /work/other2 && ${SHIP}'`);
   allows('twin: eval runs in this shell, its cd stays', `eval 'cd /work/other2' && ${SHIP}`);
 });
+
+// (#352 R10: the rule is an ALLOWLIST. A change counts as certain for the commands after it only when it is at the top of the line (or of the text it is in), not in a group / branch / loop /
+// function body, not negated, not a pipeline stage, not in the background, not run by a wrapper that starts a process, and only `&&` / `;` follow it before the later command)
+test('#352 R10-B1: a loop inside a bash -c text carries the text\'s own cd to its next iteration', () => {
+  denies('for in bash -c: the push, then a cd to main', `bash -c 'for x in a b; do ${SHIP}; cd ${MAIN_DIR}; done'`, {}, '/work/other2');
+  denies('while in sh -c: the push, then a cd to main', `sh -c 'while true; do ${SHIP}; cd ${MAIN_DIR}; done'`, {}, '/work/other2');
+  allows('twin: the loop in the text never leaves its directory', `bash -c 'for x in a b; do ${SHIP}; cd /work/other2; done'`, {}, '/work/other2');
+});
+test('#352 R10-F1: a script a shell reads from stdin, a here-string, a heredoc or a process substitution is a new process', () => {
+  denies('bash <<<', `bash <<< 'cd /work/other2' && ${SHIP}`);
+  denies('piped into bash', `echo 'cd /work/other2' | bash && ${SHIP}`);
+  denies('sh -s <<<', `sh -s <<< 'cd /work/other2' && ${SHIP}`);
+  denies('bash <( )', `bash <(echo cd /work/other2) && ${SHIP}`);
+  denies('a heredoc', `bash <<EOF && ${SHIP}\ncd /work/other2\nEOF`);
+  denies('a switch in a here-string', `bash <<< '${RESET}' && ${SHIP}`);
+  allows('twin: the here-string text holds both', `bash <<< 'cd /work/other2 && ${SHIP}'`);
+});
+test('#352 R10-F2: a { } group or an if chained with && does not hide the || after it', () => {
+  denies('{ a; b; } || push', `${RESET} && { echo a; echo b; } || ${SHIP}`);
+  denies('if, fi || push', `${RESET} && if true; then echo; fi || ${SHIP}`);
+  denies('cd && { a; b; } || push', `cd /work/other2 && { echo a; echo b; } || ${SHIP}`);
+  allows('twin: && after the group', `cd /work/other2 && { echo a; echo b; } && ${SHIP}`);
+});
+test('#352 R10-F3: a { } group that is the first stage of a pipeline keeps the operator before the pipeline', () => {
+  denies('false && { a; b; } | npm run reset', `false && { echo a; echo b; } | npm run reset; ${SHIP}`, HERE);
+  denies('true || { a; b; } | npm run reset', `true || { echo a; echo b; } | npm run reset; ${SHIP}`, HERE);
+  denies('a group stage, then &&', `{ echo a; echo b; } | npm run reset && ${SHIP}`, HERE);
+});
+test('#352 R10-F4: a background pipeline whose first stage waits for a heredoc is a background job', () => {
+  denies('npm run <<EOF | cat &', `npm run reset <<EOF | cat & ${SHIP}\nx\nEOF`, HERE);
+  denies('npm run reset | cat <<EOF &', `npm run reset | cat <<EOF & ${SHIP}\nx\nEOF`, HERE);
+});
+test('#352 R10-F5: a cd in a subshell is lost when it ends, whatever a text inside it did', () => {
+  allows('( cd && bash -c ); push', `(cd /work/other2 && bash -c 'echo hi'); ${SHIP}`, {}, '/work/other2');
+  allows('( cd && bash -c ) && push', `(cd /work/other2 && bash -c 'echo hi') && ${SHIP}`, {}, '/work/other2');
+  denies('twin: the same line from main', `(cd /work/other2 && bash -c 'echo hi'); ${SHIP}`);
+});
+test('#403 (R10-F6): a cd run through a wrapper that starts a process is that process\'s, not this shell\'s', () => {
+  denies('nohup cd', `nohup cd /work/other2; ${SHIP}`);
+  denies('env cd &&', `env cd /work/other2 && ${SHIP}`);
+  denies('nice cd &&', `nice cd /work/other2 && ${SHIP}`);
+  denies('timeout cd &&', `timeout 5 cd /work/other2 && ${SHIP}`);
+  denies('sudo cd &&', `sudo cd /work/other2 && ${SHIP}`);
+  denies('xargs cd', `echo /work/other2 | xargs cd && ${SHIP}`);
+  denies('find -exec cd', `find . -exec cd /work/other2 ';' && ${SHIP}`);
+  denies('a wrapped switch', `nohup ${RESET} && ${SHIP}`);
+  allows('twin: command / builtin / exec stay transparent', `command cd /work/other2 && builtin cd /work/other2 && ${SHIP}`);
+});
