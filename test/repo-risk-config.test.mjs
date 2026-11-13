@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { validateConfig } from '../pipeline/lib/config.mjs';
 import { matchAny } from '../pipeline/lib/glob.mjs';
+import { assessRisk, reviewLane } from '../pipeline/lib/risk.mjs';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const raw = parseYaml(fs.readFileSync(path.join(root, '.claude', 'pipeline.yml'), 'utf8'));
@@ -39,9 +40,17 @@ test('repo config: the rating tests read this same high_risk_paths list (no hand
   }
 });
 
-// Static relative imports of a source file: `import ... from './x.mjs'`, `export ... from '../x.mjs'`, bare `import './x.mjs'`, also over several lines.
+// Static relative imports of a source file: `import ... from './x.mjs'`, `export ... from '../x.mjs'`, bare `import './x.mjs'`, also over
+// several lines (the braces may hold comments with quotes, semicolons or braces), plus dynamic `import('./x.mjs')` with a literal path.
 // A statement must start a line, so a commented-out import is not followed. Bare specifiers (node:fs, packages) are ignored.
-const IMPORT_RE = /(?:^|\n)[ \t]*(?:import|export)\s+(?:[^'";]*?\s+from\s+)?['"]([^'"]+)['"]/g;
+const STATIC_IMPORT_RE = /(?:^|\n)[ \t]*(?:import|export)\s+(?:(?:[^'";{}]|\{[^}]*\})*?\s*from\s*)?['"]([^'"]+)['"]/g;
+const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+
+// Comments are dropped first (a `//` or `/*` only counts at a line start or after whitespace, so URLs and globs in strings survive).
+function importSpecifiers(src) {
+  const code = src.replace(/(^|\s)\/\*[\s\S]*?\*\//g, '$1 ').replace(/(^|\s)\/\/[^\n]*/g, '$1');
+  return [...[...code.matchAll(STATIC_IMPORT_RE)].map((m) => m[1]), ...[...code.matchAll(DYNAMIC_IMPORT_RE)].map((m) => m[1])];
+}
 
 function importClosure(startRel) {
   const seen = new Set();
@@ -52,9 +61,9 @@ function importClosure(startRel) {
     const abs = path.join(root, rel);
     assert.ok(fs.existsSync(abs), `${rel} is imported but does not exist`);
     seen.add(rel);
-    for (const m of fs.readFileSync(abs, 'utf8').matchAll(IMPORT_RE)) {
-      if (!m[1].startsWith('./') && !m[1].startsWith('../')) continue;
-      queue.push(path.relative(root, path.resolve(path.dirname(abs), m[1])).split(path.sep).join('/'));
+    for (const spec of importSpecifiers(fs.readFileSync(abs, 'utf8'))) {
+      if (!spec.startsWith('./') && !spec.startsWith('../')) continue;
+      queue.push(path.relative(root, path.resolve(path.dirname(abs), spec)).split(path.sep).join('/'));
     }
   }
   return [...seen].sort();
@@ -62,8 +71,47 @@ function importClosure(startRel) {
 
 test('repo config: the import walker finds multi-line, export-from and bare imports and skips bare specifiers and comments', () => {
   const src = "import a from './a.mjs';\nimport {\n  b,\n  c,\n} from '../b.mjs';\nexport { d } from './d.mjs';\nimport './e.mjs';\nimport fs from 'node:fs';\n// import x from './nope.mjs';\nexport const s = './f.mjs';\n";
-  const found = [...src.matchAll(IMPORT_RE)].map((m) => m[1]);
-  assert.deepEqual(found, ['./a.mjs', '../b.mjs', './d.mjs', './e.mjs', 'node:fs']);
+  assert.deepEqual(importSpecifiers(src), ['./a.mjs', '../b.mjs', './d.mjs', './e.mjs', 'node:fs']);
+});
+
+test('repo config: the import walker follows a dynamic import with a literal path and ignores a computed one or a commented one', () => {
+  const src = "const m = await import('./dyn.mjs');\nconst n = import(\"../up.mjs\").then((x) => x);\nawait import(name);\nawait import(`./tpl-${x}.mjs`);\n// await import('./nope.mjs');\n";
+  assert.deepEqual(importSpecifiers(src), ['./dyn.mjs', '../up.mjs']);
+});
+
+test('repo config: the import walker does not skip a multi-line import whose braces hold a comment with a quote, semicolon or brace', () => {
+  const src = [
+    "import {",
+    "  a, // the owner's pick; see #1",
+    "  /* don't drop; \"b\" } */ b,",
+    "  c, // a } stray brace",
+    "} from './multi.mjs';",
+    "import { d } from './after.mjs';",
+    "",
+  ].join('\n');
+  assert.deepEqual(importSpecifiers(src), ['./multi.mjs', './after.mjs']);
+});
+
+test('repo config: the gate and review-proof named set is in risk.high_risk_paths, and a one-line change to any of them rates high', () => {
+  const named = [
+    'pipeline/lib/transcript.mjs', 'pipeline/lib/ci-proof.mjs', 'pipeline/lib/integrity.mjs', 'pipeline/lib/guard-provenance.mjs',
+    'pipeline/lib/state.mjs', 'pipeline/lib/review-publish.mjs', 'pipeline/lib/review-context.mjs', 'pipeline/lib/locks.mjs',
+    'pipeline/lib/round-status.mjs', 'pipeline/commands/final-gate.mjs', 'pipeline/commands/triage.mjs', 'pipeline/commands/model-proof.mjs',
+    'pipeline/bin/pipeline.mjs',
+  ];
+  const list = raw.risk.high_risk_paths;
+  const { config } = validateConfig(raw);
+  for (const p of named) {
+    assert.ok(matchAny(p, list, { nocase: true }), `${p} is not matched by risk.high_risk_paths`);
+    const files = [{ path: p, added: ['// one line'], removed: [] }];
+    const r = assessRisk({ files, hits: [], config });
+    assert.equal(r.level, 'high', `${p}: ${r.reasons.join('; ')}`);
+    assert.equal(r.drivers.path, true, p);
+    assert.equal(reviewLane({ level: r.level, files, config }).reviewer, 'fable', p);
+  }
+  // Control: a file outside the list with the same one-line change stays low and goes to the judge.
+  const other = [{ path: 'pipeline/lib/unlisted-example.mjs', added: ['// one line'], removed: [] }];
+  assert.equal(assessRisk({ files: other, hits: [], config }).level, 'low');
 });
 
 test('repo config: every file the risk rating imports (transitively) is covered by risk.high_risk_paths', () => {
