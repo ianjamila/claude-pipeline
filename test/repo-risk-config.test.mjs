@@ -195,36 +195,16 @@ test('repo config: a source the engine cannot parse makes the scanner throw (the
   assert.throws(() => scanImports(["import x from './a.mjs';\nconst = ;\n"]), /static import parse failed/);
 });
 
-// The gate and review-proof set: listed BY HAND in risk.high_risk_paths. Roots and leaves come from the config, not from a second list here:
-// every LITERAL .mjs entry of risk.high_risk_paths is a depth-1 ROOT (the files each one imports directly must be listed or exempt), except
-// the DEPTH1_LEAVES below. A leaf is listed only because a root imports it: its own imports are not followed (depth 1 counts from the roots
-// only, issue #356). A file that DECIDES something (a gate, a proof, a trust boundary, what code is installed or run) is a root, never a leaf:
-// a leaf is a lookup the roots read (identity, repo slug, lease and event plumbing). A glob entry (pipeline/hooks/**, pipeline/vendor/**) is
-// never a root. A NEW literal .mjs entry therefore becomes a root automatically; to make it a leaf, add it to DEPTH1_LEAVES with the roots
-// that import it.
-const DEPTH1_LEAVES = new Map([
-  // leaf -> the repo paths of the roots that import it (the test below checks that each is a root and really imports the leaf)
-  ['pipeline/lib/remote-url.mjs', ['pipeline/lib/review-context.mjs']],
-  ['pipeline/lib/repo.mjs', ['pipeline/lib/cmd-common.mjs', 'pipeline/lib/github.mjs', 'pipeline/lib/merge-hold.mjs', 'pipeline/lib/merge-queue.mjs', 'pipeline/lib/preflight.mjs', 'pipeline/lib/queue-route.mjs', 'pipeline/lib/review-lease-wiring.mjs']],
-  ['pipeline/lib/identity.mjs', ['install.mjs', 'pipeline/commands/update.mjs', 'pipeline/lib/auto-update.mjs']],
-  ['pipeline/lib/review-lease.mjs', ['install.mjs', 'pipeline/lib/live-work-scan.mjs', 'pipeline/lib/review-lease-wiring.mjs']],
-  ['pipeline/lib/queue-sweep.mjs', ['pipeline/commands/final-gate.mjs', 'pipeline/commands/merge.mjs', 'pipeline/lib/auto-update.mjs', 'pipeline/lib/live-work-scan.mjs']],
-  ['pipeline/lib/run-events.mjs', ['pipeline/commands/merge.mjs', 'pipeline/lib/hold.mjs']],
-]);
+// The gate and review-proof set: listed BY HAND in risk.high_risk_paths. Roots come from the config, not from a second list here: every
+// LITERAL .mjs entry of risk.high_risk_paths is a depth-1 ROOT, and each file it imports directly must be listed or sit in DEPTH1_EXEMPT, so
+// the list is closed under "a direct import of a listed file is listed or exempt" (issue #356; round 7 dropped the leaf set: a file that
+// decides something is a root, and a file that decides nothing belongs in DEPTH1_EXEMPT with a true reason, not in a half-checked middle).
+// A glob entry (pipeline/hooks/**, pipeline/vendor/**) is never a root. A NEW literal .mjs entry therefore becomes a root automatically.
 const isLiteralMjs = (p) => p.endsWith('.mjs') && !/[*?[{]/.test(p);
 const LITERAL = raw.risk.high_risk_paths.filter(isLiteralMjs);
-const ROOTS = LITERAL.filter((p) => !DEPTH1_LEAVES.has(p));
+const ROOTS = LITERAL;
 
-test('repo config: every DEPTH1_LEAVES file is a listed literal entry that real roots import (each named importer is a root and imports it); no duplicate entry; no glob became a root', () => {
-  const list = raw.risk.high_risk_paths;
-  for (const [leaf, importers] of DEPTH1_LEAVES) {
-    assert.ok(list.includes(leaf), `DEPTH1_LEAVES ${leaf} is not a literal entry of risk.high_risk_paths: list it, or drop the leaf`);
-    assert.ok(Array.isArray(importers) && importers.length > 0, `DEPTH1_LEAVES ${leaf}: name at least one importer`);
-    for (const importer of importers) {
-      assert.ok(ROOTS.includes(importer), `DEPTH1_LEAVES ${leaf}: ${importer} is not a root (a literal .mjs entry of risk.high_risk_paths that is not itself a leaf)`);
-      assert.ok(directImports([importer])[0].includes(leaf), `DEPTH1_LEAVES ${leaf}: ${importer} does not import it any more`);
-    }
-  }
+test('repo config: every literal .mjs entry of risk.high_risk_paths is a root; no duplicate entry; no glob became a root', () => {
   assert.equal(new Set(LITERAL).size, LITERAL.length, 'a duplicate literal .mjs entry in risk.high_risk_paths');
   assert.ok(ROOTS.length >= 60, `suspiciously few roots: ${ROOTS.length}`);
   assert.ok(!ROOTS.some((p) => /[*?[{]/.test(p)), 'a glob entry became a root');
@@ -269,10 +249,11 @@ test('repo config: every file the risk rating imports (transitively) is covered 
 // merge-cleanup out of this map for that reason).
 const DEPTH1_EXEMPT = new Map([
   ['pipeline/lib/round-ask.mjs', 'display only: the text of the extra-round ask and the park comment (round-status.mjs hands costFrom, roundsFrom, openItems, notCleanReasons and statusLines to the owner-facing display, triage.mjs hands askSummary to the ask); admission and defer eligibility are decided in triage.mjs (listed) and defer-fixes re-checks'],
-  ['pipeline/lib/worktree-prune/run.mjs', 'update-schedule.mjs and queue-sweep-schedule.mjs import only pruneLogDir (the folder the cron-*.log files are appended to); it picks no command, argument or code to run, and the worktree prune the file holds decides no gate, proof, trust or install'],
+  ['pipeline/lib/worktree-prune/inspect.mjs', 'live-sessions.mjs imports only unFirm (strips the macOS /System/Volumes/Data firmlink prefix from a path), which only liveSessionsIn calls (the worktree-prune session match); review-lease.mjs uses claudeConfigDirs and psStarts, never liveSessionsIn, so no gate, proof, trust or install branches on it'],
+  ['pipeline/lib/worktree-prune/run.mjs', 'update-schedule.mjs, queue-sweep-schedule.mjs and queue-sweep.mjs import only pruneLogDir (the folder the cron-*.log files are appended to); it picks no command, argument or code to run, and the worktree prune the file holds decides no gate, proof, trust or install'],
 ]);
 
-test('repo config: every relative import (depth 1) of every root (literal .mjs entry that is not a leaf) is covered by risk.high_risk_paths or listed in DEPTH1_EXEMPT', () => {
+test('repo config: every relative import (depth 1) of every root (literal .mjs entry) is covered by risk.high_risk_paths or listed in DEPTH1_EXEMPT', () => {
   const list = raw.risk.high_risk_paths;
   const imports = directImports(ROOTS);
   const byFile = new Map(ROOTS.map((rel, i) => [rel, imports[i]]));
