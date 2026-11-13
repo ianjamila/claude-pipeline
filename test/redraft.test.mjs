@@ -284,7 +284,7 @@ test('10. auto-merge armed in the mutation answer is disabled and ALWAYS reporte
   assert.equal(k.json.autoMergeDisabled, false);
   assert.equal(k.json.warnings.length, 1);
   assert.match(k.json.warnings[0], /could not be disabled/);
-  assert.match(k.json.warnings[0], new RegExp(`gh pr merge ${PR} --disable-auto`));
+  assert.match(k.json.warnings[0], new RegExp(`ask the owner to run \`gh pr merge ${PR} --disable-auto\`, confirm it is off, and wait for their word`));
   assert.match(k.json.warnings[0], /do NOT push/);
   assert.match(k.json.warnings[0], /tell the owner/);
 });

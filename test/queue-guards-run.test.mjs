@@ -413,9 +413,9 @@ test('queue-guards.yml: workflow_run on Queue intake, main\'s copy only, runs th
   assert.match(job.env.RUN_URL, /github\.run_id/);
   const runs = job.steps.map((s) => s.run ?? s.uses);
   assert.deepEqual(runs, [
-    'actions/checkout@v4',
+    'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
     'node scripts/pipeline/queue-guards-run.mjs',
-    'actions/upload-artifact@v4',
+    'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a',
     'node scripts/pipeline/queue-guards-run.mjs --publish',
     'node scripts/pipeline/queue-guards-run.mjs --publish --error "the poster failed"',
   ]);

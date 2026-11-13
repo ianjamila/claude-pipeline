@@ -80,6 +80,28 @@ test('the highest run_number wins, then the run\'s newest attempt: an older succ
   assert.ok(!attempts.calls.some((c) => c.includes('/attempts/1/jobs')));
 });
 
+// The draft flow (ci.draft_while_iterating, `pipeline redraft`): a draft head gets a run that concludes skipped (the CI jobs skip drafts); marking the PR
+// ready starts the real run on the SAME head, with a higher run_number.
+test('draft-era skipped run: with a later green ready-era run on the same head it proves; alone, or when it is the newest, it does not', async () => {
+  const both = lookupScenario();
+  both.addRun({ id: 1, number: 10, patch: { conclusion: 'skipped' } });
+  both.addRun({ id: 2, number: 11 });
+  const res = await lookup(both);
+  is(res, 'pass', null, 'draft-era skipped run #10, ready-era green run #11');
+  assert.equal(res.run.id, 2, 'the ready-era run is the proof');
+
+  const only = lookupScenario();
+  only.addRun({ id: 1, number: 10, patch: { conclusion: 'skipped' } });
+  is(await lookup(only), 'missing', /run 1 attempt 1 was skipped/, 'only the draft-era run');
+  assert.ok(!only.calls.some((c) => c.includes('/jobs?')), 'no job lookup for a skipped run');
+
+  // a converted_to_draft run on the same head AFTER the green one is the newest: fail closed (the Mac runs the step), never a stale pass
+  const redrafted = lookupScenario();
+  redrafted.addRun({ id: 1, number: 10 });
+  redrafted.addRun({ id: 2, number: 11, patch: { conclusion: 'skipped' } });
+  is(await lookup(redrafted), 'missing', /run 2 attempt 1 was skipped/, 'newest run is the skipped converted_to_draft one');
+});
+
 test('a newer run or attempt that is queued or in progress makes the answer pending, never the older success', async () => {
   for (const status of ['queued', 'in_progress', 'waiting', 'requested', 'pending']) {
     const s = lookupScenario();
