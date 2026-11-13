@@ -52,7 +52,9 @@ risk:
   # provenance, state, review publish/context, locks, round status, the final-gate, triage and model-proof commands, the CLI entry, the
   # libs finalgate.mjs imports directly (a test checks those), the GitHub, Codex, fix-verify, hold, CLI and lease-wiring helpers the
   # review commands run on, and the commands that read or write a gate input or proof (state, model-floor, verify, ci-wait, plus the
-  # risk, hardstops, integrity and preflight wrappers, and the owner-only, command-guard and ci-wait libs they use). Only the import
+  # risk, hardstops, integrity and preflight wrappers, and the owner-only, command-guard and ci-wait libs they use), plus the claude-
+  # ancestry and branch-protection libs, the comment command, and the update command and its schedule lib (the set also covers the
+  # owner-only guards: update and the model-floor reset). Only the import
   # closure of risk.mjs is checked in full (issue #356, owner chose the named set 2026-11-13). A PR touching one stays high and gets
   # Fable. A NEW file in pipeline/commands/ or a NEW import deeper than finalgate.mjs's own is NOT covered automatically (the CLI entry
   # loads commands by name, so no import reaches them): add it here by hand when it decides a gate or a proof.
@@ -76,6 +78,8 @@ risk:
     "pipeline/commands/state.mjs", "pipeline/commands/model-floor.mjs", "pipeline/lib/owner-only.mjs", "pipeline/commands/verify.mjs",
     "pipeline/lib/command-guard.mjs", "pipeline/commands/ci-wait.mjs", "pipeline/lib/ci-wait.mjs",
     "pipeline/commands/risk.mjs", "pipeline/commands/hardstops.mjs", "pipeline/commands/integrity.mjs", "pipeline/commands/preflight.mjs",
+    "pipeline/lib/claude-ancestry.mjs", "pipeline/lib/protection.mjs", "pipeline/commands/comment.mjs", "pipeline/commands/update.mjs",
+    "pipeline/lib/update-schedule.mjs",
     "install.sh", "install.ps1"]
   # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
   # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other

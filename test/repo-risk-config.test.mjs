@@ -178,6 +178,9 @@ test('repo config: the gate and review-proof named set is in risk.high_risk_path
     'pipeline/commands/state.mjs', 'pipeline/commands/model-floor.mjs', 'pipeline/lib/owner-only.mjs', 'pipeline/commands/verify.mjs',
     'pipeline/lib/command-guard.mjs', 'pipeline/commands/ci-wait.mjs', 'pipeline/lib/ci-wait.mjs',
     'pipeline/commands/risk.mjs', 'pipeline/commands/hardstops.mjs', 'pipeline/commands/integrity.mjs', 'pipeline/commands/preflight.mjs',
+    // the comment publisher, the update commands (owner-only guards), and the libs the gate-side commands use
+    'pipeline/lib/claude-ancestry.mjs', 'pipeline/lib/protection.mjs', 'pipeline/commands/comment.mjs', 'pipeline/commands/update.mjs',
+    'pipeline/lib/update-schedule.mjs',
   ];
   const list = raw.risk.high_risk_paths;
   const { config } = validateConfig(raw);
