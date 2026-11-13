@@ -3947,6 +3947,9 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   assert.equal(spawnSync('git', ['clone', '-q', '--no-local', w.repo.dir, clone], { encoding: 'utf8' }).status, 0);
   const hasTree = () => gitIn('cat-file', '-e', markerTree).status === 0;
   assert.equal(hasTree(), false, 'precondition: the marker tree exists only where the round was made');
+  // The fixture repo has the PR branch checked out, so the clone's origin/HEAD would name feat/x; a real remote's HEAD is its default branch, which is the anchor every
+  // content hash is measured from (#369, EW #2056). Point it there, as GitHub's clone does.
+  assert.equal(gitIn('remote', 'set-head', 'origin', 'main').status, 0);
   // The clone's own git would write a different marker style: the forced config must make the rebuilt tree identical.
   gitIn('config', 'merge.conflictStyle', 'zdiff3');
   const cloneCli = (args, env = {}) => {
