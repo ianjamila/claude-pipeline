@@ -56,3 +56,63 @@ describe('#411: a brace group entered by & runs in this shell (only the command 
     ['a group that is itself backgrounded runs in a subshell', '{ cd /tmp; } & find . -delete'],
   ]);
 });
+
+describe('#412 / #373: the repository root walk (git -C "$(git rev-parse --show-toplevel)") reads every configuration file that can move the root', () => {
+  const TOP = '"$(git rev-parse --show-toplevel)"';
+  const fsOf = (files) => ({ existsSync: (p) => Object.hasOwn(files, p), readText: (p) => files[p] ?? null });
+  const WT = '/home/u/main/.git/worktrees/x';
+  const linked = (extra) => fsOf({
+    '/home/u/wt/.git': `gitdir: ${WT}\n`,
+    [`${WT}/commondir`]: '../..\n',
+    [`${WT}/HEAD`]: 'ref: refs/heads/agent/worktree-x\n',
+    [`${WT}/gitdir`]: '/home/u/wt/.git\n',
+    '/home/u/main/.git/config': '[core]\n\trepositoryformatversion = 0\n',
+    ...extra,
+  });
+  const clean = (ex) => run(`git -C ${TOP} clean -fd`, { ...ex, cwd: '/home/u/wt/sub' });
+  test('a linked worktree with plain configs is read (the baseline of the pins below)', () => {
+    assert.equal(clean(linked({})).decision, 'allow');
+  });
+  for (const [name, files] of [
+    ['its own config', { [`${WT}/config`]: '[core]\n\tworktree = /home/u\n' }],
+    ['its config.worktree', { [`${WT}/config.worktree`]: '[core]\n\tworktree = /home/u\n' }],
+    ['its own config, extensions.worktreeConfig', { [`${WT}/config`]: '[extensions]\n\tworktreeConfig = true\n' }],
+    ['its config.worktree, in a section line', { [`${WT}/config.worktree`]: '[core] worktree = /home/u\n' }],
+  ]) {
+    test(`#412 pin: a worktree key in ${name} makes the toplevel unknown (deny)`, () => {
+      assert.equal(clean(linked(files)).decision, 'deny');
+    });
+  }
+  test('#412 pin: an unreadable own config of a linked worktree makes the toplevel unknown', () => {
+    assert.equal(clean({ ...linked({}), existsSync: (p) => p === `${WT}/config` || linked({}).existsSync(p) }).decision, 'deny');
+  });
+
+  // #373 comment (from #409): the key test reads any whitespace, and a key with no value
+  const rooted = (cfg) => ({ ...fsOf({ '/home/u/proj/.git': null, '/home/u/proj/.git/config': cfg }), cwd: '/home/u/proj/sub' });
+  for (const [name, cfg] of [
+    ['a key with no value', '[core]\n\tworktree\n'],
+    ['a key with no value and no newline', '[core]\n\tworktree'],
+    ['a key with trailing blanks and no value', '[core]\n\tworktree  \t\n'],
+    ['a form feed before the key', '[core]\n\f worktree = /home/u\n'],
+    ['a vertical tab before the key', '[core]\n\v worktree=/home/u\n'],
+    ['a form feed before the equals sign', '[core]\n\tworktree\f= /home/u\n'],
+    ['worktreeConfig with no value', '[extensions]\n\tworktreeConfig\n'],
+  ]) {
+    test(`#373 config key: ${name} makes the toplevel unknown (deny)`, () => {
+      assert.equal(run(`git -C ${TOP} clean -fd`, rooted(cfg)).decision, 'deny', JSON.stringify(cfg));
+    });
+  }
+  test('#373 config key: a key that only starts with worktree, or a branch / remote named so, is still read', () => {
+    for (const cfg of ['[core]\n\tworktreeFoo = 1\n', '[branch "worktree"]\n\tremote = origin\n', '[remote "worktree"]\n\turl = x\n', '[core]\n\t# worktree = /x\n']) {
+      assert.equal(run(`git -C ${TOP} clean -fd`, rooted(cfg)).decision, 'allow', JSON.stringify(cfg));
+    }
+  });
+  test('#373 git dir: HEAD + objects + refs make a directory a git directory (root unknown)', () => {
+    const ex = fsOf({ '/home/u/sep.git/HEAD': null, '/home/u/sep.git/objects': null, '/home/u/sep.git/refs': null, '/home/u/sep.git/config': '[core]\n' });
+    assert.equal(run(`git -C ${TOP} clean -fd`, { ...ex, cwd: '/home/u/sep.git/refs' }).decision, 'deny');
+  });
+  test('#373 git dir: a folder with HEAD and objects but no refs (a case-insensitive disk finds `head`) is no git directory', () => {
+    const ex = { ...fsOf({ '/home/u/proj/.git': null, '/home/u/proj/.git/config': '[core]\n', '/home/u/proj/sub/HEAD': null, '/home/u/proj/sub/objects': null }), cwd: '/home/u/proj/sub/x' };
+    assert.equal(run(`git -C ${TOP} clean -fd`, ex).decision, 'allow');
+  });
+});

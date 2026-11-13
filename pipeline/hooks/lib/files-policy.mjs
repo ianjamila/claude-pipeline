@@ -1689,17 +1689,17 @@ function gitRootFrom(start, ctx) {
       const common = typeof text === 'string' ? ctx.readText(pathsFor().join(gitdir, 'commondir')) : null;
       const linked = typeof common === 'string' && common.trim() !== '';
       const configs = linked ? [pathsFor().join(posix.resolve(gitdir, toPosix(common.trim())), 'config'), ...(ctx.api.existsSync(own) ? [own] : [])] : [own];
-      // (a worktree key anywhere, or an include of another file, anywhere in the repo's, the user's or the XDG config: the root may be elsewhere)
+      // (a worktree key anywhere, with or without a value and past any whitespace git skips (isspace: also \f \v \r), or an include of another file, anywhere in the repo's, the user's or the XDG config: the root may be elsewhere)
       const xdg = ctx.env.XDG_CONFIG_HOME && isAbs(toPosix(ctx.env.XDG_CONFIG_HOME)) ? toPosix(ctx.env.XDG_CONFIG_HOME) : pathsFor().join(ctx.homePosix, '.config');
       const users = [pathsFor().join(ctx.homePosix, '.gitconfig'), pathsFor().join(xdg, 'git/config')];
       // (the per-worktree file `config.worktree` is read when extensions.worktreeConfig is on: its core.worktree moves the root too)
       const texts = [...configs, pathsFor().join(gitdir, 'config.worktree')].filter((q, qi) => qi < configs.length || ctx.api.existsSync(q)).map((q) => ctx.readText(q));
       for (const q of users) if (ctx.api.existsSync(q)) texts.push(ctx.readText(q));
-      if (texts.some((x) => typeof x !== 'string') || texts.some((x) => /(?:^|\])[ \t]*worktree(?:config)?[ \t]*=/mi.test(x) || /^\s*\[\s*include/mi.test(x))) return null;
+      if (texts.some((x) => typeof x !== 'string') || texts.some((x) => /(?:^|\])\s*worktree(?:config)?\s*(?:=|$)/mi.test(x) || /^\s*\[\s*include/mi.test(x))) return null;
       return d;
     }
     // (R1-F3: git also finds a repository when the directory is itself a git directory, and honours its core.worktree: a walk that meets one reads the root as unknown)
-    if (ctx.api.existsSync(pathsFor().join(d, 'HEAD')) && ctx.api.existsSync(pathsFor().join(d, 'objects'))) return null;
+    if (['HEAD', 'objects', 'refs'].every((n) => ctx.api.existsSync(pathsFor().join(d, n)))) return null; // (#373: all three, as git's own check: a case-insensitive disk finds `head` for HEAD, which alone would make an ordinary folder read as a git directory)
     const up = pathsFor().dirname(d);
     if (up === d) break;
     d = up;

@@ -262,9 +262,9 @@ describe('#373 review round 1 (R1-B1, R1-B2, R1-B3, R1-F1, R1-F2, R1-F3)', () =>
     }
   });
   test('R1-F3: an ancestor that is itself a git directory makes the root unknown', () => {
-    const ex = fsOf({ '/home/u/.git': 'gitdir: /home/u/sep.git\n', '/home/u/sep.git/config': '[core]\n\tbare = false\n', '/home/u/sep.git/HEAD': 'ref: refs/heads/main\n', '/home/u/sep.git/objects': null });
+    const ex = fsOf({ '/home/u/.git': 'gitdir: /home/u/sep.git\n', '/home/u/sep.git/config': '[core]\n\tbare = false\n', '/home/u/sep.git/HEAD': 'ref: refs/heads/main\n', '/home/u/sep.git/objects': null, '/home/u/sep.git/refs': null });
     assert.equal(run(`git -C ${TOP} clean -fd`, { ...ex, cwd: '/home/u/sep.git/refs' }).decision, 'deny');
-    assert.equal(run(`git -C ${TOP} clean -fd`, { ...fsOf({ '/work/r.git/HEAD': null, '/work/r.git/objects': null }), cwd: '/work/r.git/refs' }).decision, 'deny');
+    assert.equal(run(`git -C ${TOP} clean -fd`, { ...fsOf({ '/work/r.git/HEAD': null, '/work/r.git/objects': null, '/work/r.git/refs': null }), cwd: '/work/r.git/refs' }).decision, 'deny');
   });
 });
 
