@@ -2134,10 +2134,14 @@ function lineTouchesToolEnv(ctx, src, p) {
 const SAFE_PATH_ENTRY = /^(?:\$\{?PATH\}?|\/(?:opt\/homebrew\/|usr\/local\/|usr\/)?s?bin|(?:\$HOME|\$\{HOME\}|~)\/(?:\.local\/)?bin)$/;
 const PATH_BUILTINS = new Set(['echo', 'printf', 'test', '[', ...CD_CMDS]);
 const pathValueMoves = (v) => typeof v !== 'string' || !v.split(':').every((e) => SAFE_PATH_ENTRY.test(e));
-const setsPath = (c) => {
-  const named = Object.entries(c.env ?? {}).some(([k, v]) => (k === 'PATH' || k === 'path') && pathValueMoves(v));
-  if (named) return true;
-  if (!['export', 'declare', 'typeset', 'readonly', 'local', 'setenv', 'env'].includes(baseOf(c.argv[0] ?? ''))) return false;
+const PATH_NAMES = ['PATH', 'path'];
+const envMovesPath = (env) => env != null && PATH_NAMES.some((k) => Object.hasOwn(env, k) && pathValueMoves(env[k]));
+const PATH_SETTERS = ['export', 'declare', 'typeset', 'readonly', 'local', 'setenv', 'env'];
+// (a cheap necessary test, run on every command of every program text before the exact one: the first word ends in one of these names, any case, with or without .exe and the like; baseOf says the rest)
+const SHADOW_WORD = /(?:alias|export|declare|typeset|readonly|local|setenv|env)(?:\.(?:exe|cmd|bat|com))?$/i;
+const setsPath = (c, name) => {
+  if (envMovesPath(c.env)) return true;
+  if (!PATH_SETTERS.includes(name)) return false;
   return c.argv.slice(1).some((a) => { const m = /^(?:PATH|path)\+?=(.*)$/s.exec(a); return m !== null && pathValueMoves(m[1]); });
 };
 function shadowedCommands(cmds, ctx) {
@@ -2145,10 +2149,11 @@ function shadowedCommands(cmds, ctx) {
   let kind = null;
   for (const c of cmds) {
     if (kind !== null) { if (!out.has(c)) out.set(c, kind); continue; }
-    if (c.argv.length > 0 && Object.entries(c.env ?? {}).some(([k, v]) => (k === 'PATH' || k === 'path') && pathValueMoves(v))) out.set(c, 'path'); // (PATH=… cmd: for that command only)
-    const name = baseOf(c.argv[0] ?? '');
-    if (c.ctl?.fn === true || /^\s*function\b/.test(c.raw) || name === 'alias' || (c.argv.length === 1 && ctx.lineDefs?.has(c.argv[0]))) kind = 'all';
-    else if (setsPath(c)) kind = 'path';
+    if (c.argv.length > 0 && envMovesPath(c.env)) out.set(c, 'path'); // (PATH=… cmd: for that command only)
+    const first = c.argv[0] ?? '';
+    const name = SHADOW_WORD.test(first) ? baseOf(first) : '';
+    if (c.ctl?.fn === true || name === 'alias' || (typeof c.raw === 'string' && c.raw.includes('function') && /^\s*function\b/.test(c.raw)) || (c.argv.length === 1 && ctx.lineDefs?.has(first))) kind = 'all';
+    else if (setsPath(c, name)) kind = 'path';
   }
   return out;
 }
