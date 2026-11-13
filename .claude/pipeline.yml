@@ -44,7 +44,19 @@ production: null
 smoke_checks: []
 
 risk:
-  high_risk_paths: ["pipeline/hooks/**", "pipeline/lib/hardstops.mjs", "pipeline/lib/finalgate.mjs", "install.mjs", "pipeline/lib/installer.mjs"]
+  # Plan 2026-11-12-cp-risk-rating R3-6: the files that decide what is safe (guards, hard stops, the final gate, the installer,
+  # the risk rating and config itself, the review/merge commands, triage, owner grants, review proof, model floor) plus
+  # anything that runs code on install or commit (package.json scripts, git hooks). A PR touching one stays high and gets Fable.
+  high_risk_paths: [
+    "pipeline/hooks/**", "pipeline/lib/hardstops.mjs", "pipeline/lib/finalgate.mjs", "install.mjs", "pipeline/lib/installer.mjs",
+    "pipeline/lib/risk.mjs", "pipeline/lib/config.mjs", "pipeline/commands/codex-review.mjs", "pipeline/commands/review-complete.mjs",
+    "pipeline/commands/arbiter.mjs", "pipeline/commands/merge.mjs", "pipeline/lib/triage.mjs", "pipeline/lib/owner-grants.mjs",
+    "pipeline/lib/review-marker.mjs", "pipeline/lib/floor-proof.mjs", "pipeline/lib/model-floor.mjs", "package.json",
+    "**/.githooks/**", "**/.husky/**"]
+  # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
+  # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other
+  # pipeline config still rates high (R4-config is never ignored for the change itself: the rating reads the base config).
+  ignore_hard_stop_rules: [P-path, R4-config]
 
 hard_stops:
   paths: ["**"]
