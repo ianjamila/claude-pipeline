@@ -16,6 +16,7 @@ import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.
 import { DEFAULT_OUTCOME, buildAgentLogLine } from '../lib/agentlog.mjs';
 import { inlineOptionValues } from '../lib/cmd-io.mjs';
 import { readModelProofs } from '../lib/review-context.mjs';
+import { pushedWhileReadyOf } from '../lib/ci-usage-pr.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
@@ -96,10 +97,11 @@ export const run = guarded(async (argv, ctx) => {
   }
 
   const gh = createGitHub({ cwd: root, env: ctx.env });
+  const ciUsage = await pushedWhileReadyOf({ root, gh, pr }); // ci.draft_while_iterating only; report only, never throws
   return guardGh(() => {
     const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
     const { title } = view;
-    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state) });
+    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state), ciNote: ciUsage.note });
     const agentLogLine = buildAgentLogLine({ state, pr, title, outcome });
     // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
     const existing = readSummaryComment(gh, pr);
@@ -109,9 +111,10 @@ export const run = guarded(async (argv, ctx) => {
       repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
       outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession,
     });
-    warnings.push(...guard.warnings);
+    warnings.push(...guard.warnings, ...ciUsage.warnings);
     const posted = writeSummaryComment(gh, pr, { record, sections, existing });
     const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, cost: costReport(record.cost), warnings };
+    if (ciUsage.field) output.pushedWhileReady = ciUsage.field;
     // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.
     if (outcome === 'merged') output.pendingLogLine = buildAgentLogLine({ state, pr, title, outcome: DEFAULT_OUTCOME });
     return { exitCode: EXIT.OK, output };

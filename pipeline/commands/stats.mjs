@@ -3,6 +3,7 @@
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
+import { MAX_PAGES, PAGE, pages } from '../lib/gh-pages.mjs';
 import { decodeRecord } from '../lib/run-record.mjs';
 import { decodeFromComment } from '../lib/state.mjs';
 import { aggregate, analysePr, isReadableState, renderTable } from '../lib/round-stats.mjs';
@@ -22,23 +23,8 @@ export const meta = {
   ].join('\n'),
 };
 
-const PAGE = 100;
-const MAX_PAGES = 30;
 const SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const DAY_MS = 86_400_000;
-
-// -> the items; `onCut()` is called when the loop ended on MAX_PAGES with more to read (the stop condition never met), so the caller can say the list is short.
-function pages(gh, path, stop, onCut) {
-  const out = [];
-  for (let page = 1; page <= MAX_PAGES; page += 1) {
-    const list = gh.api('GET', `${path}${path.includes('?') ? '&' : '?'}per_page=${PAGE}&page=${page}`);
-    if (!Array.isArray(list)) break;
-    out.push(...list);
-    if (list.length < PAGE || stop?.(list)) break;
-    if (page === MAX_PAGES) onCut?.();
-  }
-  return out;
-}
 
 async function rounds(rest, ctx) {
   const { values } = parseCommandArgs(rest, { 'repo-slug': { type: 'string', multiple: true }, since: { type: 'string' }, pr: { type: 'string', multiple: true }, json: { type: 'boolean' }, repo: { type: 'string' } }, { allowPositionals: false });
