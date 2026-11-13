@@ -555,3 +555,46 @@ test('arbiter needed: a P-path-only round range is the fix-verify brief when ris
   assertExit(r2, 0, r2.stdout + r2.stderr);
   assert.deepEqual([r2.json.scope, r2.json.brief], ['round', 'full']);
 });
+
+// ---- #374 change 2: the late lane (review.fix_verify_after_round) ----------------------------------------------------------------------------------------
+
+// Both fix files are sensitive (arbiter_always_paths), so without the setting every fix round is full; with it set in the working-tree, fork-point AND trusted
+// config (all the same file here) a counted round above N may take the narrow brief.
+const LATE = (after = 1, extra = '') => `${pipelineYml()}review:\n  arbiter_always_paths: [src/a.js, src/b.js]\n${after === null ? '' : `  fix_verify_after_round: ${after}\n`}${extra}`;
+const bigFix = Array.from({ length: 170 }, (_, i) => `export const z${i} = ${i};`).join('\n') + '\n';
+
+test('late lane: counted round 2 > fix_verify_after_round 1 on sensitive paths gets fix-verify, with the late reason and the fix scope in the input', (t) => {
+  const w = fixWorld(t, { yml: LATE(1) });
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.brief, r.json.agent, r.json.effort], ['fix-verify', 'arbiter-fix', 'medium']);
+  assert.match(r.json.briefReason, /late fix round: counted round 2 > review\.fix_verify_after_round 1; sensitive paths allowed/);
+  assert.match(w.inputText(2), /Fix scope: \d+ non-test added line\(s\) \(limit 150\), 0 new non-test file\(s\)/);
+  assert.match(w.inputText(2), /verify each listed fix, then look for regressions in the round diff/);
+});
+
+test('late lane: round 2 is NOT late when fix_verify_after_round is 2 (round 3 is the first); an unset key, or a sensitive path without it, stays full', (t) => {
+  const atRound = fixWorld(t, { yml: LATE(2) });
+  assert.equal(atRound.needed(2).json.brief, 'full');
+  assert.match(atRound.needed(2).json.briefReason, /sensitive path in the round range/);
+  const off = fixWorld(t, { yml: LATE(null) });
+  assert.equal(off.needed(2).json.brief, 'full');
+});
+
+test('late lane: a setting that only the working tree has (the base config lacks it) does not count', (t) => {
+  const w = fixWorld(t, { yml: LATE(null) });
+  w.repo.write('.claude/pipeline.yml', LATE(1));
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.brief, 'full', 'a PR cannot enable the lane for itself');
+});
+
+test('late lane: a flagged fix scope (a 170-line fix, over review.fix_round_max_lines 150; or a new source file) falls back to the full brief', (t) => {
+  const big = fixWorld(t, { yml: LATE(1), files: { 'src/b.js': bigFix } });
+  const r = big.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.brief, 'full');
+  assert.match(r.json.briefReason, /late fix round: the fix scope is flagged \(170 non-test added lines > 150/);
+  const fresh = fixWorld(t, { yml: LATE(1), files: { 'src/b.js': bFile(true), 'src/helper.js': 'export const h = 1;\n' } });
+  assert.match(fresh.needed(2).json.briefReason, /new non-test file: src\/helper\.js/);
+});

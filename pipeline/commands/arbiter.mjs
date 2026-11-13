@@ -361,7 +361,7 @@ async function chooseBrief(state, round, diff, root, { forceFull = false, truste
     const configs = [];
     for (const [label, config] of [['working-tree', loaded.config], ['base', base.config], ...(trusted === null ? [] : [['trusted', trusted]])]) {
       const seen = configs.find((c) => JSON.stringify(c[1]) === JSON.stringify(config));
-      if (seen) seen[0] += ` and ${label}`;
+      if (seen) { if (label !== 'trusted') seen[0] += ` and ${label}`; }
       else configs.push([label, config]);
     }
     const files = givenFiles ?? diffFiles(diff.from, round.toHead, { cwd: root });
