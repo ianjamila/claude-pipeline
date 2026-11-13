@@ -54,7 +54,10 @@ risk:
   # the commands that read or write a gate input or proof (state, model-floor, verify, ci-wait, plus the risk, hardstops, integrity and
   # preflight wrappers, and the owner-only, command-guard and ci-wait libs they use), the claude-ancestry and branch-protection libs, the
   # comment command, the update command and its schedule lib (the set also covers the owner-only guards: update and the model-floor
-  # reset), and the render (markers, forgery defence), upstream, private-tmp and auto-update libs.
+  # reset), and the render (markers, forgery defence), upstream, private-tmp and auto-update libs, plus the resumed-run guard (the run
+  # record and its cost shape check, the summary comment with its viewer-only filter, run-progress, and the checkpoint command, the only
+  # writer of record.resumed), the installer's scan, stacks and schedule libs with the jobs lib behind the install admission, the schedule
+  # builder, and the files that write the gate file (cmd-io) or word a merge result (merge-cleanup).
   # The model is roots, leaves and exemptions (issue #356, owner chose it 2026-11-13). Every LITERAL .mjs path here is a depth-1 ROOT: a test
   # checks that each file it imports directly is listed here or sits in the test's DEPTH1_EXEMPT map with a true one-line reason. The ones
   # in the test's DEPTH1_LEAVES set are LEAVES: listed only because a root imports them, their own imports are not followed. Globs are never
@@ -87,6 +90,9 @@ risk:
     "pipeline/lib/queue-sweep.mjs", "pipeline/lib/run-events.mjs",
     "pipeline/lib/run-record.mjs", "pipeline/lib/claude-code-version.mjs", "pipeline/lib/queue-route.mjs", "pipeline/lib/updatebranch.mjs",
     "pipeline/lib/live-work-scan.mjs", "pipeline/lib/stacks/paths.mjs", "pipeline/lib/stacks/uninstall.mjs", "pipeline/lib/queue-sweep-schedule.mjs",
+    "pipeline/lib/summary-comment.mjs", "pipeline/lib/run-progress.mjs", "pipeline/commands/checkpoint.mjs",
+    "pipeline/lib/jobs.mjs", "pipeline/lib/run-cost.mjs",
+    "pipeline/lib/schedule.mjs", "pipeline/lib/cmd-io.mjs", "pipeline/lib/merge-cleanup.mjs",
     "install.sh", "install.ps1"]
   # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
   # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other

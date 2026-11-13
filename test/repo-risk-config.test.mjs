@@ -198,43 +198,35 @@ test('repo config: a source the engine cannot parse makes the scanner throw (the
 // The gate and review-proof set: listed BY HAND in risk.high_risk_paths. Roots and leaves come from the config, not from a second list here:
 // every LITERAL .mjs entry of risk.high_risk_paths is a depth-1 ROOT (the files each one imports directly must be listed or exempt), except
 // the DEPTH1_LEAVES below. A leaf is listed only because a root imports it: its own imports are not followed (depth 1 counts from the roots
-// only, issue #356). A glob entry (pipeline/hooks/**, pipeline/vendor/**) is never a root. A NEW literal .mjs entry therefore becomes a root
-// automatically; to make it a leaf, add it to DEPTH1_LEAVES with the root that imports it.
+// only, issue #356). A file that DECIDES something (a gate, a proof, a trust boundary, what code is installed or run) is a root, never a leaf:
+// a leaf is a lookup the roots read (identity, repo slug, lease and event plumbing). A glob entry (pipeline/hooks/**, pipeline/vendor/**) is
+// never a root. A NEW literal .mjs entry therefore becomes a root automatically; to make it a leaf, add it to DEPTH1_LEAVES with the roots
+// that import it.
 const DEPTH1_LEAVES = new Map([
-  // leaf -> the roots that import it (a leaf no root imports has no reason to be a leaf: the test below checks it)
-  ['pipeline/lib/remote-url.mjs', 'review-context.mjs'],
-  ['pipeline/lib/repo.mjs', 'cmd-common.mjs, github.mjs, merge-hold.mjs, merge-queue.mjs, preflight.mjs, review-lease-wiring.mjs'],
-  ['pipeline/lib/identity.mjs', 'install.mjs, update.mjs, auto-update.mjs'],
-  ['pipeline/lib/review-lease.mjs', 'install.mjs, review-lease-wiring.mjs'],
-  ['pipeline/lib/queue-sweep.mjs', 'final-gate.mjs, merge.mjs, auto-update.mjs'],
-  ['pipeline/lib/run-events.mjs', 'hold.mjs, merge.mjs'],
-  // round 5 (R5-S1, R5-F1, R5-F2): each decides a gate, proof, trust boundary or what code is installed or run
-  ['pipeline/lib/run-record.mjs', 'merge.mjs, comment.mjs (packJson/unpackJson are the codec of the hold-lift evidence hold.mjs reads, through run-events.mjs)'],
-  ['pipeline/lib/claude-code-version.mjs', 'arbiter.mjs, floor-proof.mjs, preflight.mjs (arbiter stops with stale-terminal on it; floor-proof advises on it)'],
-  ['pipeline/lib/queue-route.mjs', 'merge.mjs (gateFreshSince, recheckOwnerGo, recheckGated: the gate and owner-approval recheck before a re-queue)'],
-  ['pipeline/lib/updatebranch.mjs', 'merge.mjs (brings the PR up to date with expected_head_sha before the final gate; every answer but up-to-date stops the merge)'],
-  ['pipeline/lib/live-work-scan.mjs', 'the installer (the admission scan: is any review live before an unattended install swaps the pipeline files; unreadable counts as live)'],
-  ['pipeline/lib/stacks/paths.mjs', 'the installer (the stacks root and isolation: a stray override must never point a real stop at a real stack)'],
-  ['pipeline/lib/stacks/uninstall.mjs', 'the installer (what uninstall pauses, waits for and removes, and when the machine schedule is touched)'],
-  ['pipeline/lib/queue-sweep-schedule.mjs', 'the installer (writes the LaunchAgent that runs queue-sweep unattended: what code runs, and only for the user\'s own claude home)'],
+  // leaf -> the repo paths of the roots that import it (the test below checks that each is a root and really imports the leaf)
+  ['pipeline/lib/remote-url.mjs', ['pipeline/lib/review-context.mjs']],
+  ['pipeline/lib/repo.mjs', ['pipeline/lib/cmd-common.mjs', 'pipeline/lib/github.mjs', 'pipeline/lib/merge-hold.mjs', 'pipeline/lib/merge-queue.mjs', 'pipeline/lib/preflight.mjs', 'pipeline/lib/queue-route.mjs', 'pipeline/lib/review-lease-wiring.mjs']],
+  ['pipeline/lib/identity.mjs', ['install.mjs', 'pipeline/commands/update.mjs', 'pipeline/lib/auto-update.mjs']],
+  ['pipeline/lib/review-lease.mjs', ['install.mjs', 'pipeline/lib/live-work-scan.mjs', 'pipeline/lib/review-lease-wiring.mjs']],
+  ['pipeline/lib/queue-sweep.mjs', ['pipeline/commands/final-gate.mjs', 'pipeline/commands/merge.mjs', 'pipeline/lib/auto-update.mjs', 'pipeline/lib/live-work-scan.mjs']],
+  ['pipeline/lib/run-events.mjs', ['pipeline/commands/merge.mjs', 'pipeline/lib/hold.mjs']],
 ]);
 const isLiteralMjs = (p) => p.endsWith('.mjs') && !/[*?[{]/.test(p);
 const LITERAL = raw.risk.high_risk_paths.filter(isLiteralMjs);
 const ROOTS = LITERAL.filter((p) => !DEPTH1_LEAVES.has(p));
 
-test('repo config: every DEPTH1_LEAVES file is listed in the config, and every literal .mjs entry is a root or a leaf', () => {
+test('repo config: every DEPTH1_LEAVES file is a listed literal entry that real roots import (each named importer is a root and imports it); no duplicate entry; no glob became a root', () => {
   const list = raw.risk.high_risk_paths;
-  for (const [leaf, importer] of DEPTH1_LEAVES) {
-    assert.ok(importer.length > 0, leaf);
+  for (const [leaf, importers] of DEPTH1_LEAVES) {
     assert.ok(list.includes(leaf), `DEPTH1_LEAVES ${leaf} is not a literal entry of risk.high_risk_paths: list it, or drop the leaf`);
+    assert.ok(Array.isArray(importers) && importers.length > 0, `DEPTH1_LEAVES ${leaf}: name at least one importer`);
+    for (const importer of importers) {
+      assert.ok(ROOTS.includes(importer), `DEPTH1_LEAVES ${leaf}: ${importer} is not a root (a literal .mjs entry of risk.high_risk_paths that is not itself a leaf)`);
+      assert.ok(directImports([importer])[0].includes(leaf), `DEPTH1_LEAVES ${leaf}: ${importer} does not import it any more`);
+    }
   }
-  const neither = LITERAL.filter((p) => !ROOTS.includes(p) && !DEPTH1_LEAVES.has(p));
-  assert.deepEqual(neither, []);
-  // A leaf exists because a root imports it: one no root imports is a stale leaf (list it as a root, or drop it from the config).
-  const rootImports = new Set(directImports(ROOTS).flat());
-  for (const leaf of DEPTH1_LEAVES.keys()) assert.ok(rootImports.has(leaf), `DEPTH1_LEAVES ${leaf} is not imported by any root: it is no longer a leaf`);
   assert.equal(new Set(LITERAL).size, LITERAL.length, 'a duplicate literal .mjs entry in risk.high_risk_paths');
-  assert.ok(ROOTS.length + DEPTH1_LEAVES.size === LITERAL.length && ROOTS.length >= 60, `suspiciously few roots: ${ROOTS.length}`);
+  assert.ok(ROOTS.length >= 60, `suspiciously few roots: ${ROOTS.length}`);
   assert.ok(!ROOTS.some((p) => /[*?[{]/.test(p)), 'a glob entry became a root');
 });
 
@@ -270,16 +262,14 @@ test('repo config: every file the risk rating imports (transitively) is covered 
   assert.deepEqual(uncovered, [], `imported by pipeline/lib/risk.mjs but not in risk.high_risk_paths: ${uncovered.join(', ')}`);
 });
 
-// Files a named file imports DIRECTLY that are deliberately NOT in risk.high_risk_paths: path -> one line on why it decides no gate, proof,
-// trust boundary, owner-only check, or which code is installed or run (display, logging, IO plumbing, scheduling).
+// Files a root imports DIRECTLY that are deliberately NOT in risk.high_risk_paths: path -> one line on why it decides no gate, proof, trust
+// boundary, owner-only check, or which code is installed or run. Each reason must hold for EVERY root that imports the file: before an entry
+// is added, read each importer's call sites and check that no root branches, refuses, merges, lifts a hold, installs or trusts something on
+// the file's return value or side effect (then LIST it instead; round 6 moved summary-comment, run-progress, cmd-io, schedule and
+// merge-cleanup out of this map for that reason).
 const DEPTH1_EXEMPT = new Map([
-  ['pipeline/lib/round-ask.mjs', 'display only: the text of the extra-round ask (round-status.mjs and triage.mjs show it; its header says nothing here decides anything, triage defer-fixes re-checks)'],
-  ['pipeline/lib/summary-comment.mjs', 'reads and writes the PR summary comment the owner reads (round-status.mjs, comment.mjs, merge.mjs); it carries display and routing hints, the codec is run-record.mjs (listed)'],
-  ['pipeline/lib/run-progress.mjs', 'writes the run record (display and routing hints) from merge.mjs; its header says a failure is only a warning and never changes what the command decides'],
-  ['pipeline/lib/merge-cleanup.mjs', 'only words a merge that already happened (merge.mjs); GitHub\'s MERGED state decides merged or not, this adds a note and the command output'],
-  ['pipeline/lib/cmd-io.mjs', 'IO plumbing: folds option values, clips command output, writes a .review json file atomically (tmp + rename); the callers (final-gate.mjs writes its gate file this way) choose the name and content'],
-  ['pipeline/lib/schedule.mjs', 'builds the cron line or launchd plist from the nodePath, binPath and args its caller passes; update-schedule.mjs (listed) chooses what runs'],
-  ['pipeline/lib/worktree-prune/run.mjs', 'update-schedule.mjs imports only pruneLogDir (a log folder path); the worktree prune itself decides no gate, proof, trust or install'],
+  ['pipeline/lib/round-ask.mjs', 'display only: the text of the extra-round ask and the park comment (round-status.mjs hands costFrom, roundsFrom, openItems, notCleanReasons and statusLines to the owner-facing display, triage.mjs hands askSummary to the ask); admission and defer eligibility are decided in triage.mjs (listed) and defer-fixes re-checks'],
+  ['pipeline/lib/worktree-prune/run.mjs', 'update-schedule.mjs and queue-sweep-schedule.mjs import only pruneLogDir (the folder the cron-*.log files are appended to); it picks no command, argument or code to run, and the worktree prune the file holds decides no gate, proof, trust or install'],
 ]);
 
 test('repo config: every relative import (depth 1) of every root (literal .mjs entry that is not a leaf) is covered by risk.high_risk_paths or listed in DEPTH1_EXEMPT', () => {
