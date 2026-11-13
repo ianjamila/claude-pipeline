@@ -2074,8 +2074,8 @@ function dirLikeWord(cmds, ci, ctx, bases, fromFile = false) {
   const u = unwrapBuiltin(c.argv);
   const w = u.argv[0] ?? '';
   if (w === '[' || w === '[[' || (w === '.' && u.argv.length > 1)) return false; // (the test builtin, and `. FILE`, which is source)
-  // (merge of #288 with #269 R23/R24: a literal subscript assignment `name[0]=1` alone is an assignment in both shells, read before AUTO_CD looks at the word; the parser leaves it as a one-word command, whose `[` would make it a run-time directory name)
-  if (u.argv === c.argv && /^[A-Za-z_][A-Za-z0-9_]*\[[A-Za-z0-9_-]+\]\+?=[^$`\\'"(){}*?[\s]*$/.test(w)) return false;
+  // (merge of #288 with #269 R23/R24: a literal subscript assignment `name[0]=1` alone is an assignment in both shells (R31-F1: judged by the RAW word, so a quoted or escaped spelling, a command word, stays a directory word), read before AUTO_CD looks at the word; the parser leaves it as a one-word command, whose `[` would make it a run-time directory name)
+  if (u.argv === c.argv && (c.raw ?? '').trim() === w && /^[A-Za-z_][A-Za-z0-9_]*\[[A-Za-z0-9_-]+\]\+?=[^$`\\'"(){}*?[\s]*$/.test(w)) return false;
   // R18-F8: AUTO_CD runs a command of ONE word (zsh; bash: no other words after the name): `test -f x`, `supabase db reset`, `docs build` are programs, whatever folders exist. An argument that may vanish at run time does not count
   const unq = unquotedText(c.raw);
   const lone = u.argv.slice(1).every((a) => mayVanish(a, ctx, fromFile, unq));

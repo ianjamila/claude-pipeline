@@ -1323,3 +1323,14 @@ test('a code-built path to the local settings file is refused like settings.json
   for (const [i, cmd] of build('settings.json').entries()) assert.equal(bash(cmd, {}, '/home/u/proj'), 'deny', `settings.json control ${i}: ${cmd}`);
   for (const [i, cmd] of build('settings.local.json').entries()) assert.equal(bash(cmd, {}, '/home/u/proj'), 'deny', `settings.local.json ${i}: ${cmd}`);
 });
+
+// #269 R31-F1 (verification defect): the `name[sub]=value` carve-out judged the de-quoted word, so a quoted or escaped spelling (a command word, not an assignment) escaped the AUTO_CD refusal of the directory it names.
+test('R31-F1: only the bare raw word `a[0]=1` is an assignment (no AUTO_CD directory); a quoted, escaped or redirected spelling is a command word that may be a directory', () => {
+  const dirs = new Set(['/home/u/proj/a[0]=1']);
+  const o = { readText: () => null, existsSync: (p) => dirs.has(p), readDir: (p) => (dirs.has(p) ? [] : null) };
+  const run = (cmd) => bash(cmd, o, '/home/u/proj');
+  for (const cmd of ['"a[0]=1"; find . -delete', "'a[0]=1'; find . -delete", 'a"[0]"=1; find . -delete', 'a\\[0]=1; find . -delete', 'a[0]=1 2>/dev/null; find . -delete'])
+    assert.equal(run(cmd), 'deny', cmd);
+  for (const cmd of ['a[0]=1; find . -delete', 'a[0]=1 ; find . -delete', "cat <<'E' > f; a[0]=1\nbody\nE\necho done"])
+    assert.equal(run(cmd), 'allow', cmd);
+});
