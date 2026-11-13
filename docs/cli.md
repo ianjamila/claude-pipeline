@@ -170,8 +170,6 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --effort low|medium
     {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise
     the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not
     taken alone
-  redraftAdvice: a COUNTED round of a repo with ci.draft_while_iterating on a PR that is READY adds {redraftAdvice:true, warnings:[...]}: run `pipeline redraft --pr N` before
-    the first fix push (never a failure; a draft PR, a base-only or resolution-only round, or a PR that cannot be read gets no advice)
   exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver
   env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)
 ```
@@ -192,6 +190,8 @@ pipeline comment --pr N --kind triage|summary|needs-human|blocked|awaiting-revie
   --kind blocked renders the verify report's failure; with --reason TEXT it renders a "the review stopped: TEXT" comment instead (no report needed), e.g. the advice of a stop that waits for a terminal restart.
   --kind needs-human adds, when a review state with at least one round exists for this PR, a short status block under the paragraph: rounds, booked cost (with the last round's share),
   open items with their severity and why the review is not clean (the extra-round ask's text without its recommendation). Display only: a part that cannot be read becomes a "not available" line; the comment is always written.
+  --kind triage also adds {redraftAdvice:true, warnings:[...]}: run `pipeline redraft --pr N` before the first fix push, when the repo has ci.draft_while_iterating, the state holds
+  an ACCEPT item not yet implemented (a fix is coming) and the PR is READY. Advice only, never a failure: no such item, a draft PR or a PR that cannot be read gets none.
 ```
 
 Exit: 0 comment posted/updated · 2 usage · 3 GitHub (`gh`) unavailable.
@@ -539,7 +539,7 @@ pipeline redraft --pr N [--reason <new-commits|parked|owner-declined|handoff-wit
 
 Exit: 0 done or nothing to do (exit 0 with `autoMergeDisabled` present, true or false, means a merge was started during the run: do NOT push, tell the owner; with false auto-merge is still armed: disable it by hand and confirm before any push or ready; a hold release that was not confirmed is still 0, with a `warnings` line naming the manual release) · 1 refused (`not-open`, `merge-in-progress`) or `convert-failed` · 2 usage error (unknown `--reason`) · 3 GitHub unavailable (output `stage`: `read` = a safety read failed, so do not push; `convert` = only the conversion could not reach GitHub, the refusal checks had passed).
 
-Why: with `ci.draft_while_iterating: true` the repo says its heavy workflows skip drafts, list `ready_for_review` and `converted_to_draft`, and cancel in one concurrency group per PR, so every fix push to a READY PR re-runs the whole suite; turning the PR back to draft first keeps CI quiet until the review is complete, and the review's `gh pr ready` step then runs it once on the reviewed head. The review skill calls it before ANY push to a ready PR (Rule 8); `codex-review` warns (`redraftAdvice`) when it sees a ready PR in such a repo. `update-branch` and `merge` catch-ups are the pipeline's own pushes and are never redrafted.
+Why: with `ci.draft_while_iterating: true` the repo says its heavy workflows skip drafts, list `ready_for_review` and `converted_to_draft`, and cancel in one concurrency group per PR, so every fix push to a READY PR re-runs the whole suite; turning the PR back to draft first keeps CI quiet until the review is complete, and the review's `gh pr ready` step then runs it once on the reviewed head. The review skill calls it before ANY push to a ready PR (Rule 8); `comment --kind triage` warns (`redraftAdvice`) when the round has an ACCEPT item to fix and the PR is ready in such a repo. `update-branch` and `merge` catch-ups are the pipeline's own pushes and are never redrafted.
 
 ## repo-move
 
