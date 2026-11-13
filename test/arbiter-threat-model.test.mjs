@@ -130,7 +130,7 @@ test('R2/F7: the PR editing the model changes nothing: the base text applies, wi
   assert.equal(w.state().rounds[0].trustedConfigSha, null, 'never recomputed on a retry');
 });
 
-test('apply: an out-of-model BLOCKING security finding on a modelled file needs no human, is marked, lifts the state to version 4, shows in the inventory and blocks review-complete until filed', (t) => {
+test('apply: an out-of-model BLOCKING security finding on a modelled file needs no human, is marked, lifts the state to version 5, shows in the inventory and blocks review-complete until filed', (t) => {
   const w = world(t);
   const needed = w.round1();
   const applied = w.apply(needed, { rulings: [], findings: [finding()] });
@@ -138,7 +138,7 @@ test('apply: an out-of-model BLOCKING security finding on a modelled file needs 
   const s = w.state();
   const item = s.rounds[0].items.find((i) => i.id === 'R1-F1');
   assert.deepEqual([item.final.decision, item.final.needsHuman, item.final.outOfModel], ['FOLLOW-UP', false, 'guards']);
-  assert.equal(s.version, 4);
+  assert.equal(s.version, 5);
   assert.equal(rulingsInventory(s).rows[0].split(' · ')[4], 'by arbiter (outside threat model guards)');
   assert.match(reviewEligibilityProblems(s).join(';'), /out-of-model follow-up\(s\) without a filed issue: R1-F1/);
   const filed = structuredClone(s);

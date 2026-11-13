@@ -414,7 +414,7 @@ Threat models and the late lane are read from the TRUSTED config (the default br
 
 **Install order.** An installed pipeline or vendored `config.mjs` older than this release rejects a `pipeline.yml` with these keys. (1) Merge and install this release (`pipeline update`); (2) `pipeline vendor --check`, and `pipeline vendor` on drift; (3) only then set the keys, in a later PR (the settings take effect from the next PR on, since the fork-point config is read).
 
-**Roll back.** Remove the three keys from `.claude/pipeline.yml` first (the review then behaves as before). An arbiter ruling that carries `outOfModel` lifts that PR's review state to version 4, which an older CLI refuses to read: finish or re-run the review of such a PR on the new CLI (or `pipeline state discard-round` the affected round) before you downgrade. To revert this release alone, `git revert` its commits after that; states without an out-of-model ruling stay at their old version and read fine.
+**Roll back.** Remove the three keys from `.claude/pipeline.yml` first (the review then behaves as before). An arbiter ruling that carries `outOfModel` lifts that PR's review state to version 5, which an older CLI refuses to read: finish or re-run the review of such a PR on the new CLI (or `pipeline state discard-round` the affected round) before you downgrade. To revert this release alone, `git revert` its commits after that; states without an out-of-model ruling stay at their old version and read fine.
 
 ### Merge hold (opt-in)
 
