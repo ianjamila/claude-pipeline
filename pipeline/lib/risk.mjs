@@ -199,7 +199,7 @@ export function trustedBase({ root, head, config }) {
 // records the Fable round review-complete will ask for.
 // `base` (optional) is the ref the diff starts from; it defaults to the trusted fork point (codex-review passes its own, stack-aware, fork point).
 // Throws what the scan throws (the callers decide how to fail closed). -> {
-//   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
+//   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, laneNotes, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
 //   trustedFork, baseConfig: { ok, reason? }, stacked }
 export async function rateBranch({ root, head, config, prBase, base }) {
   const o = { cwd: root };
@@ -243,8 +243,10 @@ export async function rateBranch({ root, head, config, prBase, base }) {
   if (stacked && sizeCandidate) reasons.push(`stacked PR: base is ${prBase} (no size-only judge)`);
   if (!trusted.ok) laneReasons.push(`trusted base config unreadable: ${trusted.reason}`);
   else if (mismatch !== null) laneReasons.push(`trusted base config unreadable: ${mismatch}`);
+  // Informational, never a reason for Fable (codex-review stores laneReasons as the Fable reasons): its own field (#367).
+  const laneNotes = [];
   if (remoteDefault !== null) {
-    laneReasons.push(`origin/HEAD names default branch ${JSON.stringify(remoteDefault)}, pipeline.yml names ${JSON.stringify(config.default_branch)}: the rating follows origin/HEAD (fix a stale one with \`git remote set-head origin -a\`)`);
+    laneNotes.push(`origin/HEAD names default branch ${JSON.stringify(remoteDefault)}, pipeline.yml names ${JSON.stringify(config.default_branch)}: the rating follows origin/HEAD (fix a stale one with \`git remote set-head origin -a\`)`);
   }
   // The collector's own identity (hardstops.mjs makeSink: rule, file, line; the detail when there is no line), and the stricter status
   // (blocking > ownerMerge > report-only) when both configs report the same hit.
@@ -274,7 +276,7 @@ export async function rateBranch({ root, head, config, prBase, base }) {
       hardStop: rated.some((r) => r.risk.drivers.hardStop), advisory: rated.some((r) => r.risk.drivers.advisory),
       path: rated.some((r) => r.risk.drivers.path), size: rated.some((r) => r.risk.drivers.size),
     },
-    sizeOnly, reviewer, laneReasons, sensitivePaths, ...(sizeOnlyJudge ? { sizeOnlyJudge: true, note: SIZE_ONLY_NOTE } : {}),
+    sizeOnly, reviewer, laneReasons, laneNotes, sensitivePaths, ...(sizeOnlyJudge ? { sizeOnlyJudge: true, note: SIZE_ONLY_NOTE } : {}),
     hits, files, lightLane: rated.every((r) => r.lightLane), trustedFork, baseConfig: trustedOk ? { ok: true, same: sameConfig } : { ok: false, reason: trusted.ok ? mismatch : trusted.reason }, stacked,
   };
 }

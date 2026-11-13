@@ -28,11 +28,11 @@ export const run = guarded(async (argv, ctx) => {
 
   const o = { cwd: root };
   const rated = await rateBranch({ root, head, config, base, ...(values['pr-base'] ? { prBase: values['pr-base'] } : {}) });
-  const { level, reasons, changedLines, fileCount, lightLane, hits, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths } = rated;
+  const { level, reasons, changedLines, fileCount, lightLane, hits, drivers, sizeOnly, reviewer, laneReasons, laneNotes, sensitivePaths } = rated;
   return {
     exitCode: EXIT.OK,
     output: {
-      ok: true, level, reasons, lightLane, changedLines, fileCount, hardStops: hits, sizeOnly, drivers, reviewer, laneReasons, sensitivePaths,
+      ok: true, level, reasons, lightLane, changedLines, fileCount, hardStops: hits, sizeOnly, drivers, reviewer, laneReasons, ...(laneNotes.length > 0 ? { laneNotes } : {}), sensitivePaths,
       ...(rated.note ? { note: rated.note } : {}), ...(rated.baseConfig.ok ? {} : { baseConfigError: rated.baseConfig.reason }),
       base, head, mergeBase: mergeBase(base, head, o),
     },

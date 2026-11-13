@@ -460,6 +460,7 @@ export const run = guarded(async (argv, ctx) => {
       reviewer: state.reviewer,
       ...(rated.sizeOnly ? { sizeOnly: true } : {}),
       ...(rated.note && state.reviewer === 'judge' ? { laneNote: rated.note } : {}),
+      ...(rated.laneNotes.length > 0 ? { laneNotes: rated.laneNotes } : {}),
       reviewerReasons: state.rounds.at(-1)?.fableReasons ?? [],
       path: dir,
     },

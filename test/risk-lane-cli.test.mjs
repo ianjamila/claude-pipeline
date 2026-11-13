@@ -266,3 +266,26 @@ test('codex-review + review-complete: the same disagreement where the lenient co
   assertExit(done, 1);
   assert.match(done.json.reason, /needs the Fable review pass/);
 });
+
+// #367: the origin/HEAD note is a note, never a reason for Fable, and it shows in codex-review's output for either lane. pipeline.yml names develop, origin/HEAD names main.
+const headNote = (w) => {
+  w.repo.git(['update-ref', 'refs/remotes/origin/main', 'main']);
+  w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+  return w;
+};
+test('codex-review: a judge-lane PR shows the origin/HEAD note in laneNotes, with no reviewer reason', (t) => {
+  const w = headNote(world(t, { baseYml: withBlocks('default_branch: develop\n') }));
+  const r = w.codex(1);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.reviewer, r.json.reviewerReasons], ['judge', []]);
+  assert.equal(r.json.laneNotes.length, 1, JSON.stringify(r.json.laneNotes));
+  assert.match(r.json.laneNotes[0], /origin\/HEAD names default branch "main", pipeline\.yml names "develop"/);
+});
+test('codex-review: a Fable-lane PR keeps the origin/HEAD note out of the Fable reasons (laneNotes only)', (t) => {
+  const w = headNote(world(t, { baseYml: withBlocks('default_branch: develop\nreview:\n  size_only_medium_reviewer: fable\n') }));
+  const r = w.codex(1);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.reviewer, r.json.reviewerReasons], ['fable', ['medium risk']]);
+  assert.match(r.json.laneNotes[0], /origin\/HEAD names default branch/);
+  assert.deepEqual(w.state().rounds[0].fableReasons, ['medium risk']);
+});

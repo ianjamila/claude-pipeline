@@ -301,14 +301,15 @@ test('rateBranch: a dangling origin/HEAD falls back to the config default_branch
   assert.equal(r.stacked, false);
 });
 
-test('rateBranch: a remote default branch that differs from config.default_branch is named in the lane reasons, with the remedy', async (t) => {
+test('rateBranch: a remote default branch that differs from config.default_branch is named in the lane notes (not the reasons), with the remedy', async (t) => {
   const w = world(t, { feature: (r) => r.write('src/a.js', lines(3)) });
   w.repo.git(['branch', 'develop', 'main']);
   w.repo.git(['update-ref', 'refs/remotes/origin/develop', 'develop']);
   w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop']);
   const r = await w.rate();
-  const reason = r.laneReasons.find((x) => /origin\/HEAD/.test(x));
-  assert.ok(reason, r.laneReasons.join('; '));
+  const reason = r.laneNotes.find((x) => /origin\/HEAD/.test(x));
+  assert.ok(reason, r.laneNotes.join('; '));
+  assert.ok(!r.laneReasons.some((x) => /origin\/HEAD/.test(x)), 'a note is no reason for Fable (#367)');
   assert.match(reason, /"develop"/);
   assert.match(reason, /"main"/);
   assert.match(reason, /git remote set-head origin -a/);
