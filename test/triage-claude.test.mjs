@@ -23,7 +23,7 @@ import {
   ruledCacheFrom,
   settleSecondReview,
 } from '../pipeline/lib/triage.mjs';
-import { SUPPORTED_STATE_VERSION, decodeFromComment, emptyState, encodeForComment, loadState, saveState } from '../pipeline/lib/state.mjs';
+import { SUPPORTED_STATE_VERSION, decodeFromComment, emptyState, encodeForComment, loadState, saveState, withStateVersion } from '../pipeline/lib/state.mjs';
 
 // ---- fixtures -------------------------------------------------------------------------------
 
@@ -322,20 +322,28 @@ test('applyOwnerRuling: a needs-human item or a Claude/forced final that is not 
 
 // ---- the state format version -----------------------------------------------------------------
 
-test('SUPPORTED_STATE_VERSION 2: a newer state is refused by loadState and decodeFromComment; 1 and 2 load', () => {
-  assert.equal(SUPPORTED_STATE_VERSION, 2);
+test('withStateVersion raises the version and never lowers it', () => {
+  const base = emptyState({ repo: 'a/b', pr: 7, branch: 'x' });
+  assert.equal(withStateVersion(base, 2).version, 2);
+  assert.equal(withStateVersion({ ...base, version: 3 }, 2).version, 3, 'a deferral state stays at 3 through a Claude ruling');
+  assert.equal(withStateVersion({ ...base, version: undefined }, 2).version, 2);
+  assert.equal(base.version, 1, 'the argument is not changed');
+});
+
+test('SUPPORTED_STATE_VERSION 3: a newer state is refused by loadState and decodeFromComment; 1, 2 (Claude ruling) and 3 (deferral) load', () => {
+  assert.equal(SUPPORTED_STATE_VERSION, 3);
   const dir = mkdtempSync(join(tmpdir(), 'cp-state-version-'));
   try {
     const base = emptyState({ repo: 'a/b', pr: 7, branch: 'x' });
     assert.equal(base.version, 1, 'ordinary states stay at 1');
-    for (const version of [1, 2]) {
+    for (const version of [1, 2, 3]) {
       saveState(dir, { ...base, version });
       assert.equal(loadState(dir).version, version);
       assert.equal(decodeFromComment(encodeForComment({ ...base, version })).version, version);
     }
-    saveState(dir, { ...base, version: 3 });
-    assert.throws(() => loadState(dir), /version 3.*supports.*2/);
-    assert.equal(decodeFromComment(encodeForComment({ ...base, version: 3 })), null);
+    saveState(dir, { ...base, version: 4 });
+    assert.throws(() => loadState(dir), /version 4.*supports.*3/);
+    assert.equal(decodeFromComment(encodeForComment({ ...base, version: 4 })), null);
     mkdirSync(join(dir, '.review'), { recursive: true });
     writeFileSync(join(dir, '.review', 'state.json'), JSON.stringify({ ...base, version: 99 }));
     assert.throws(() => loadState(dir), /newer/);

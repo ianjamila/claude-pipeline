@@ -20,10 +20,15 @@ const RENAME_WAIT_MS = 50;
 const STRAY_TMP = /^state\.json\..+\.tmp$/;
 const STRAY_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 
-// The newest state format this code understands. A state with a higher `version` was written by a newer pipeline (a Claude ruling or a
-// second review: those, and only those, write version 2; every other state stays 1): loadState refuses it and decodeFromComment reads it
-// as no state, so an older reader never rules from a state it cannot fully see.
-export const SUPPORTED_STATE_VERSION = 2;
+// The newest state format this code understands. A state with a higher `version` was written by a newer pipeline: loadState refuses it and
+// decodeFromComment reads it as no state, so an older reader never rules from a state it cannot fully see. Version 2: a Claude ruling or a
+// second review wrote it. Version 3: `triage defer-fixes` wrote it (a deferral is a Claude dismissal an installation from before this change
+// would leave out of the Rulings block and let Claude reopen). Every other state stays 1.
+export const SUPPORTED_STATE_VERSION = 3;
+export const STATE_VERSION_CLAUDE = 2;
+export const STATE_VERSION_DEFERRAL = 3;
+// The state at (at least) `version`: a writer never lowers the version a state already carries.
+export const withStateVersion = (state, version) => ({ ...state, version: Math.max(Number.isFinite(state?.version) ? state.version : 1, version) });
 const newerThanSupported = (state) => Number.isFinite(state.version) && state.version > SUPPORTED_STATE_VERSION;
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);

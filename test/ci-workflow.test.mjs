@@ -1,6 +1,7 @@
 // Structure of .github/workflows/ci.yml, parsed with the vendored YAML reader. What it pins: the required check names in
 // .claude/pipeline.yml are real job names, and the Windows suite is split into shards behind an aggregate "test (windows)"
-// job that is red (never green or skipped) unless every shard succeeded. Only a real CI run proves the matrix expands
+// job that is red (never green or skipped) unless every shard succeeded, except on a draft PR, where the suite is skipped as a whole
+// (ci.draft_while_iterating). Only a real CI run proves the matrix expands
 // and the runners schedule; this guards the wiring that would silently weaken the required check.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,6 +18,14 @@ const config = load('.claude/pipeline.yml');
 const jobs = ci.jobs;
 const shardJob = jobs['test-windows-shard'];
 const aggregate = jobs['test-windows'];
+// The draft skip of the suite (ci.draft_while_iterating): the same condition on both real jobs and, behind always(), on the aggregate.
+const NOT_DRAFT = "github.event_name != 'pull_request' || !github.event.pull_request.draft";
+// Evaluates one of the `if:` expressions above for an event (no other construct is allowed in them).
+const runsOn = (cond, { event, draft = false }) => {
+  assert.match(cond, /^[\w.()'!=&| ]+$/, cond);
+  // eslint-disable-next-line no-new-func
+  return new Function('always', 'github', `return Boolean(${cond.replaceAll('github.event.pull_request.draft', 'github.draft').replaceAll('github.event_name', 'github.event')});`)(() => true, { event, draft });
+};
 
 // The check names GitHub shows: a matrix job's name has its ${{ matrix.* }} expressions expanded, one per combination.
 const expandedNames = (job) => {
@@ -68,10 +77,10 @@ test('the installer round trip runs on Windows in shard 3 only', () => {
   assert.match(installer[0].if, /^matrix\.shard == 3 && \(/);
 });
 
-test('test (windows) aggregates the shard job: needs it, runs always, on ubuntu', () => {
+test('test (windows) aggregates the shard job: needs it, runs always (but on a draft PR), on ubuntu', () => {
   assert.equal(aggregate.name, 'test (windows)');
   assert.equal(aggregate.needs, 'test-windows-shard');
-  assert.equal(aggregate.if, 'always()', 'without always() a failed shard would skip the aggregate, and a skipped required check can pass');
+  assert.equal(aggregate.if, `always() && (${NOT_DRAFT})`, 'without always() a failed shard would skip the aggregate, and a skipped required check can pass; the only other condition is the draft skip of the shards');
   assert.equal(aggregate['runs-on'], 'ubuntu-latest');
   assert.equal(aggregate.steps.length, 1, 'one step: nothing can succeed independently of the shard result');
   assert.ok(!aggregate.steps[0].if, 'the step has no condition of its own that could skip it');
@@ -99,4 +108,22 @@ test('the ubuntu job is unchanged: Node 20 and 24, both with the installer round
 test('the CI proof for `tests` still points at the ubuntu job', () => {
   assert.equal(config.verify.ci_proof.tests.job, 'test (ubuntu)');
   assert.ok(jobs['test-ubuntu']);
+});
+
+test('ci.yml listens to ready_for_review and converted_to_draft, and one PR\'s runs share one cancelling group', () => {
+  // a bare `pull_request:` has neither: the default types are opened, synchronize, reopened
+  assert.deepEqual(ci.on.pull_request.types, ['opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft']);
+  assert.deepEqual(ci.on.push.branches, ['main']);
+  assert.equal(ci.concurrency.group, 'ci-${{ github.ref }}', 'every event of one PR has the same ref, so converted_to_draft cancels a running suite');
+  assert.equal(ci.concurrency['cancel-in-progress'], "${{ github.event_name == 'pull_request' }}", 'push to main never cancels');
+});
+
+test('a draft PR skips the whole suite (both required checks read skipped); a ready PR and a push to main run it', () => {
+  assert.equal(jobs['test-ubuntu'].if, NOT_DRAFT);
+  assert.equal(shardJob.if, NOT_DRAFT);
+  for (const [name, cond] of [['ubuntu', jobs['test-ubuntu'].if], ['shard', shardJob.if], ['aggregate', aggregate.if]]) {
+    assert.equal(runsOn(cond, { event: 'pull_request', draft: true }), false, `${name}: a draft PR (also the converted_to_draft run) is skipped`);
+    assert.equal(runsOn(cond, { event: 'pull_request', draft: false }), true, `${name}: a ready PR (also the ready_for_review run) runs`);
+    assert.equal(runsOn(cond, { event: 'push' }), true, `${name}: push to main is unchanged`);
+  }
 });

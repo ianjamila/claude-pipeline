@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -259,24 +259,45 @@ test('selectTestFiles: an exact .test.mjs argument that names no file is reporte
   assert.deepEqual(selectTestFiles(pool, ['ci.test.mjs']), { names: [], missing: ['ci.test.mjs'] });
 });
 
+test('selectTestFiles: a substring argument that matches no file is reported as missing; a matching one is not', async () => {
+  const { selectTestFiles } = await import('../scripts/lib/select-tests.mjs');
+  assert.deepEqual(selectTestFiles(pool, ['config', 'no-such-substring']), { names: ['config.test.mjs'], missing: ['no-such-substring'] });
+  assert.deepEqual(selectTestFiles(pool, ['config', 'docs']), { names: ['config.test.mjs', 'docs-facts.test.mjs'], missing: [] });
+  // both kinds at once, in argument order
+  assert.deepEqual(selectTestFiles(pool, ['nope', 'clii.test.mjs']).missing, ['nope', 'clii.test.mjs']);
+});
+
 test('scripts/test.mjs: an unknown exact .test.mjs name is exit 2 naming it, even when other arguments match', () => {
   for (const argv of [['no-such-file.test.mjs'], ['test-runner', 'no-such-file.test.mjs']]) {
     const r = spawnSync(process.execPath, [runner, ...argv], { encoding: 'utf8', env: nestedEnv() });
     assert.equal(r.status, 2, `${argv}: exit ${r.status}, stderr ${r.stderr}`);
-    assert.match(r.stderr, /no-such-file\.test\.mjs/);
+    assert.match(r.stderr, /no-such-file\.test\.mjs \(exact file name\)/);
     assert.doesNotMatch(r.stdout, /^# tests/m, 'no test ran');
   }
 });
 
-test('scripts/test.mjs: a substring that matches nothing is still "no test files matched" exit 2', () => {
-  const r = spawnSync(process.execPath, [runner, 'zzz-no-such-substring'], { encoding: 'utf8', env: nestedEnv() });
-  assert.equal(r.status, 2);
-  assert.match(r.stderr, /no test files matched/);
+test('scripts/test.mjs: a substring that matches nothing is exit 2 naming it, even when other arguments match', () => {
+  for (const [argv, label] of [
+    [['zzz-no-such-substring'], /zzz-no-such-substring \(substring filter\)/],
+    [['config.test.mjs', 'no-such-substring-xyz'], /no-such-substring-xyz \(substring filter\)/],
+  ]) {
+    const r = spawnSync(process.execPath, [runner, ...argv], { encoding: 'utf8', env: nestedEnv() });
+    assert.equal(r.status, 2, `${argv}: exit ${r.status}, stderr ${r.stderr}`);
+    assert.match(r.stderr, label);
+    assert.doesNotMatch(r.stdout, /^# tests/m, 'no test ran');
+  }
 });
 
-test('verify --quick runs test/cli.test.mjs by exact name (docs/cli.md must match the usage text before CI)', () => {
+test('verify --quick lists exact .test.mjs files only, each present in test/ (a renamed file must not quietly drop out)', () => {
   const src = readFileSync(join(root, 'scripts', 'verify.mjs'), 'utf8');
   const quick = /quickCmd: '([^']*)'/.exec(src)?.[1] ?? '';
-  assert.match(quick, /(^| )cli\.test\.mjs( |$)/);
-  assert.doesNotMatch(quick, /(^| )cli( |$)/, 'a bare `cli` would also run every *-cli test');
+  const args = quick.split(/\s+/).slice(quick.split(/\s+/).indexOf('scripts/test.mjs') + 1).filter(Boolean);
+  assert.ok(args.length > 0, `no arguments after scripts/test.mjs in "${quick}"`);
+  for (const a of args) {
+    assert.ok(a.endsWith('.test.mjs'), `${a} must be an exact .test.mjs name, not a substring`);
+    assert.ok(existsSync(join(root, 'test', a)), `test/${a} does not exist`);
+  }
+  assert.ok(args.includes('cli.test.mjs'), 'a bare `cli` would also run every *-cli test');
+  assert.ok(args.includes('test-runner.test.mjs'), 'the quick check must test its own file selection');
+  assert.ok(!args.includes('worktree-prune-config-fallback.test.mjs'), 'the slow prune fallback test is not a quick check');
 });

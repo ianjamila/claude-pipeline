@@ -1,8 +1,14 @@
-# Full verify in CI on every PR (for repos where Actions minutes are not a constraint).
+# Full verify in CI on every ready PR (for repos where Actions minutes are not a constraint).
+#
+# Draft PRs are skipped: the job's `if:` below swallows `opened` and every push to a draft, and `ready_for_review` is in the
+# trigger list (it is not in GitHub's default types), so the first run happens when the PR is marked ready and again on every
+# push after that. `converted_to_draft` is listed too: it shares the PR's concurrency group, so turning a PR back into a draft
+# (`pipeline redraft`, with ci.draft_while_iterating: true) cancels a running verify, and its own run skips because the PR is
+# a draft by then.
 name: Verify
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 permissions:
   contents: read
 concurrency:
@@ -11,6 +17,7 @@ concurrency:
 jobs:
   verify:
     name: Verify
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -22,8 +29,9 @@ jobs:
       - run: node scripts/pipeline/workflow-contexts.mjs
       - run: node scripts/verify.mjs
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: verify-report
           path: .verify/
+          include-hidden-files: true
           if-no-files-found: ignore

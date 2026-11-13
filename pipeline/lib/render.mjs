@@ -61,7 +61,7 @@ function triageRow(n, item) {
 // The rounds an owner's chat words admitted past the cap (the quote is the owner record's own prompt, kept on the round by codex-review).
 const grantedRounds = (state) => (state.rounds ?? [])
   .filter((r) => typeof r?.ownerGrant?.quote === 'string' && r.ownerGrant.quote !== '')
-  .map((r) => ({ k: Number.isInteger(r.ownerGrant.k) ? r.ownerGrant.k : null, n: r.n, quote: r.ownerGrant.quote }));
+  .map((r) => ({ k: Number.isInteger(r.ownerGrant.k) ? r.ownerGrant.k : null, n: r.n, quote: r.ownerGrant.quote, past: r.ownerGrant.past === true }));
 const grantLabel = (g) => `round ${line(g.k ?? g.n)}`;
 
 // One list item per Claude-ruled item: id, decision, the Codex verdict (when one exists) and Claude's reason.
@@ -69,7 +69,20 @@ function claudeRulingLines(rounds) {
   return rounds.flatMap((r) => (r.items ?? []).filter(claudeRuled).map((item) => {
     const sr = item.secondReview;
     const codex = sr ? `Codex ${line(sr.decision)}, ${line(sr.confidence)}` : 'no Codex check';
+    // A fix taken out at the round limit (triage defer-fixes) says so: it is a FOLLOW-UP whose fix is NOT in this merge.
+    if (item.roundCapDeferral) return `- ${line(item.id)}: ${line(item.final.decision ?? 'unknown')} (deferred past the round limit; its fix was taken out, NOT in this merge) - ${line(item.final.reason, 300)}`;
     return `- ${line(item.id)}: ${line(item.final.decision ?? 'unknown')} (${claudeBy(item)}; ${codex}) - ${line(item.final.reason, 300)}`;
+  }));
+}
+
+// A finding raised again after its fix was deferred past the round limit (codex-review linked it to the follow-up issue already filed): say so, no second issue.
+// When the judge accepted it again its fix is made in THIS PR, so the issue is not the place it is tracked any more: say the issue is to be closed when the PR merges.
+function reraisedLines(rounds) {
+  return rounds.flatMap((r) => (r.items ?? []).filter((item) => isObject(item.reraisedDeferral)).map((item) => {
+    const d = item.reraisedDeferral;
+    const head = `- ${line(item.id)}: the same finding as ${line(d.id)}, whose fix was deferred past the round limit; `;
+    if (item.final?.decision === 'ACCEPT') return `${head}it is accepted again and is being fixed in this PR: close follow-up issue ${line(d.issue, 120)} when this PR merges`;
+    return `${head}follow-up issue ${line(d.issue, 120)} is already filed, no new issue`;
   }));
 }
 
@@ -81,13 +94,20 @@ export function triageComment(state) {
   else if (rows.length === 0) out.push('', '_Codex raised no findings._');
   const claudeLines = claudeRulingLines(rounds);
   if (claudeLines.length > 0) out.push('', '#### Claude rulings', '', ...claudeLines);
+  const reraised = reraisedLines(rounds);
+  if (reraised.length > 0) out.push('', '#### Raised again after a deferral', '', ...reraised);
   const granted = grantedRounds(state);
-  if (granted.length > 0) out.push('', `Owner-granted extra round(s): ${granted.map((g) => `${grantLabel(g)} - "${line(g.quote, 300)}"`).join('; ')}`);
+  const shownGrants = (list) => list.map((g) => `${grantLabel(g)} - "${line(g.quote, 300)}"`).join('; ');
+  if (granted.some((g) => !g.past)) out.push('', `Owner-granted extra round(s): ${shownGrants(granted.filter((g) => !g.past))}`);
+  // The owner's approval of a round that had ALREADY run (no grant was recorded then): it admitted nothing.
+  if (granted.some((g) => g.past)) out.push('', `Owner-approved past round(s) (already run): ${shownGrants(granted.filter((g) => g.past))}`);
   // A Fable pass that stopped on the floor or a stale terminal (arbiter.mjs): visible even when the round has no item to carry the cause.
   for (const r of rounds) {
     const f = r?.arbiter?.failure;
     if (isObject(f) && f.cause && r.arbiter.proofOk !== true) out.push('', `Round ${line(r.n)} arbiter stopped: ${line(f.cause)}${f.advice ? ` — ${line(f.advice)}` : ''}`);
   }
+  // The one current-lane line (no state of its own): a medium PR whose second reviewer is the judge is medium for size only.
+  if (state.reviewer === 'judge' && state.risk === 'medium') out.push('', 'Second reviewer: Sonnet judge (medium for size only; review.size_only_medium_reviewer)');
   out.push('', encodeForComment(state));
   return out.join('\n');
 }
@@ -221,12 +241,19 @@ export function summaryComment(state, opts) {
 
 const yesNo = (v) => (v === true ? 'yes' : v === false ? 'no' : v == null ? 'not run' : line(v));
 
-export function needsHumanComment({ reasons, hits = [], verified, reviewed }) {
+// `review`: the review's status lines (round-status.mjs#parkStatusLines: rounds, booked cost, open items with severity, why it is not clean), shown as bullets under
+// the paragraph. Display only; absent or empty renders nothing.
+export function needsHumanComment({ reasons, hits = [], verified, reviewed, review = [] }) {
   const why = [].concat(reasons ?? []).map((r) => line(r)).filter(Boolean);
   const paragraph =
     `This PR was stopped for a human decision: ${why.length ? why.join('; ') : 'no reason recorded'}. ` +
     `Verified: ${yesNo(verified)}. Reviewed: ${yesNo(reviewed)}.`;
   const out = [MARKERS.needsHuman, '', paragraph];
+  const status = (Array.isArray(review) ? review : []).map((l) => line(l)).filter(Boolean);
+  if (status.length) {
+    out.push('');
+    for (const l of status) out.push(`- ${l}`);
+  }
   if (hits.length) {
     out.push('');
     for (const h of hits) out.push(isObject(h) ? `- ${line(h.rule)} — ${line(h.file)}` : `- ${line(h)}`);
@@ -318,7 +345,10 @@ export function awaitingReviewComment(reason) {
 
 // Every field is sanitised: one line, markers and mentions defused, pipes escaped (the log is read
 // by people and may be pasted into a table).
-export function agentLogLine({ date, pr, title, risk, rounds, arbiterCalls, outcome }) {
+// A run with fix-verify Fable passes reads `arbiter F (fix-verify K)` (F = every Fable pass, K of them the narrow fix-verify brief); one without reads
+// `arbiter F` as it always did, so old and new lines keep one label for the same count.
+export function agentLogLine({ date, pr, title, risk, rounds, arbiterCalls, fixVerifyCalls = 0, outcome }) {
   const f = (v) => line(v).replace(/\|/g, '&#124;');
-  return `- ${f(date)} · #${f(pr)} · ${f(title)} · risk ${f(risk)} · rounds ${f(rounds)} · arbiter ${f(arbiterCalls)} · ${f(outcome)}`;
+  const passes = Number(fixVerifyCalls) > 0 ? `arbiter ${f(arbiterCalls)} (fix-verify ${f(fixVerifyCalls)})` : `arbiter ${f(arbiterCalls)}`;
+  return `- ${f(date)} · #${f(pr)} · ${f(title)} · risk ${f(risk)} · rounds ${f(rounds)} · ${passes} · ${f(outcome)}`;
 }

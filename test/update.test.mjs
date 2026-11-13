@@ -636,7 +636,7 @@ test('a post-checkout hook in the CALLER\'s configured hooksPath (global config 
   const dir = scratch('cp-upd-hook');
   const { marker, home, global } = plantedHookConfig(dir);
   const { bare, sha } = remote();
-  const callerEnv = { ...process.env, HOME: home, GIT_CONFIG_GLOBAL: global, GIT_CONFIG_NOSYSTEM: '1' };
+  const callerEnv = { ...process.env, HOME: home, USERPROFILE: home, GIT_CONFIG_GLOBAL: global, GIT_CONFIG_NOSYSTEM: '1' };
   // Control: with the caller's configuration, the same fetch + checkout DOES run the hook, so the assertions below can fail.
   const plain = join(dir, 'plain');
   for (const args of [['init', '--quiet', plain], ['-C', plain, '-c', 'protocol.file.allow=always', 'fetch', '--quiet', '--depth', '1', bare, sha], ['-C', plain, ...CHECKOUT]]) {
@@ -646,8 +646,8 @@ test('a post-checkout hook in the CALLER\'s configured hooksPath (global config 
   assert.equal(existsSync(marker), true, 'control: the planted hook is a real vector on this git');
   rmSync(marker);
 
-  const saved = { HOME: process.env.HOME, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL };
-  Object.assign(process.env, { HOME: home, GIT_CONFIG_GLOBAL: global });
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL };
+  Object.assign(process.env, { HOME: home, USERPROFILE: home, GIT_CONFIG_GLOBAL: global });
   try {
     withIsolatedGit(scratch('cp-upd-hookhome'), (git) => {
       const repo = join(dir, 'repo');
@@ -669,8 +669,8 @@ test('update: a hook planted in the caller\'s git configuration does not run, an
   const { marker, home: plantedHome, global } = plantedHookConfig(dir);
   const { sha } = remote();
   const home = newHome();
-  const saved = { HOME: process.env.HOME, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL };
-  Object.assign(process.env, { HOME: plantedHome, GIT_CONFIG_GLOBAL: global });
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL };
+  Object.assign(process.env, { HOME: plantedHome, USERPROFILE: plantedHome, GIT_CONFIG_GLOBAL: global });
   try {
     const { result: r, left } = await withTmp(home, () => update(['--claude-home', home], { env: envFor(ghFor(sha, cmp('identical', sha, sha))) }));
     assert.equal(r.exitCode, 0, JSON.stringify(r.output));
@@ -868,6 +868,20 @@ test('the installer child does not inherit NODE_OPTIONS or NODE_PATH, and keeps 
   assert.deepEqual(env, { PIPELINE_ADMIN: '1', PIPELINE_LOCK_DIR: '/l', PIPELINE_INSTALL_NO_PROBES: '1', PATH: '/p' });
 });
 
+// R1-F2: `update --scheduled` runs the installer from the DOWNLOAD, which has no INSTALLED.json, so the installer would take every seam as a checkout does.
+// An installed caller must not hand them over; a checkout caller (the suite) still does.
+test('an installed copy strips every test seam from the installer child; a checkout caller keeps them', () => {
+  const seams = {
+    PIPELINE_REVIEW_LEASE_DIR: '/x', PIPELINE_TEST_MODE: '1', PIPELINE_INSTALL_ACCOUNT_HOME: '/a', PIPELINE_INSTALL_SWAP_GATE: '/g',
+    PIPELINE_INSTALL_SCAN_DELAY_MS: '5', PIPELINE_INSTALL_RETIRED_SKILLS: 'x', PIPELINE_INSTALL_WORKER_WAIT_MS: '1', PIPELINE_GH: '/gh', PIPELINE_UPDATE_REMOTE: '/r',
+    PIPELINE_MODEL_FLOOR_DIR: '/f', PIPELINE_ADMISSION_WAIT_MS: '1',
+  };
+  const base = { PATH: '/p', PIPELINE_LOCK_DIR: '/l', PIPELINE_INSTALL_NO_PROBES: '1', NODE_OPTIONS: '--require x' };
+  assert.deepEqual(installerEnv({ ...base, ...seams }, { installed: true }), { PATH: '/p', PIPELINE_LOCK_DIR: '/l', PIPELINE_INSTALL_NO_PROBES: '1' });
+  assert.deepEqual(installerEnv({ ...base, ...seams }, { installed: false }), { PATH: '/p', PIPELINE_LOCK_DIR: '/l', PIPELINE_INSTALL_NO_PROBES: '1', ...seams });
+  assert.equal(Object.keys(installerEnv({ ...seams })).length, Object.keys(seams).length, 'this suite runs as a checkout');
+});
+
 test('update: NODE_OPTIONS=--require in the caller environment does not run inside the installer', async () => {
   const dir = scratch('cp-upd-nodeopt');
   const marker = join(dir, 'loaded');
@@ -893,4 +907,99 @@ test('the suggested manual command quotes the home so sh (and PowerShell) read i
     assert.equal(r.stdout, s);
   }
   assert.equal(psQuote("C:\\Users\\Jane O'Doe\\.claude"), "'C:\\Users\\Jane O''Doe\\.claude'");
+});
+
+// ---- --scheduled over the REAL download and the REAL installer (ported from #67, adapted to lib/auto-update.mjs) -------------------------
+// The installed copy is a real install whose manifest says it came from an older commit; `relate` runs after the scheduled run decided "clean and
+// ahead" and before it downloads, so changing the home inside it is the owner editing a file (or installing by hand) during the download.
+// The home is <account>/.claude, because --require-no-live-reviews only installs into the account's own claude-home.
+const OLD_SHA = 'c'.repeat(40);
+
+async function scheduledWorld() {
+  const account = scratch('cp-upd-account');
+  const home = join(account, '.claude');
+  cpSync(await updatedHome(), home, { recursive: true });
+  const manifestFile = join(home, 'pipeline', 'INSTALLED.json');
+  const manifest = JSON.parse(readFileSync(manifestFile, 'utf8'));
+  writeFileSync(manifestFile, `${JSON.stringify({ ...manifest, sourceSha: OLD_SHA }, null, 2)}\n`);
+  const leases = scratch('cp-upd-leases');
+  return { account, home, manifestFile, leases };
+}
+
+async function scheduledOver(w, { beforeInstall } = {}) {
+  const { sha } = remote();
+  const notices = [];
+  const stateDir = join(scratch('cp-upd-state'), 'state');
+  const env = envFor(null, { PIPELINE_TEST_MODE: '1', PIPELINE_INSTALL_ACCOUNT_HOME: w.account, PIPELINE_REVIEW_LEASE_DIR: w.leases });
+  const r = await update(['--scheduled', '--json', '--claude-home', w.home], {
+    env,
+    hasClaudeCodeAncestor: () => false,
+    auto: {
+      mainSha: () => ({ ok: true, sha, via: 'gh' }),
+      relate: () => { beforeInstall?.(); return { status: 'ahead' }; },
+      notify: async (text) => { notices.push(text); },
+      now: () => new Date(Date.UTC(2026, 10, 11)),
+      statusFile: join(stateDir, 'update-status.json'),
+      stateFile: join(stateDir, 'update-auto-state.json'),
+    },
+  });
+  const status = JSON.parse(readFileSync(join(stateDir, 'update-status.json'), 'utf8'));
+  return { r, notices, sha, status };
+}
+
+test('scheduled, real installer: a clean install behind main is updated (the installer accepted --require-no-live-reviews and --expect-installed), verified, announced', async () => {
+  const w = await scheduledWorld();
+  const { r, notices, sha, status } = await scheduledOver(w);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.action, 'updated');
+  assert.equal(readManifest(w.home).sourceSha, sha);
+  assert.deepEqual(notices, [`pipeline updated to ${sha.slice(0, 7)} (upstream)`]);
+  assert.deepEqual([status.state, status.installedSha, status.mainSha], ['current', sha, sha]);
+});
+
+test('scheduled, real installer: a file edited during the download is not overwritten - paused as modified, exit 0, the owner told once', async () => {
+  const w = await scheduledWorld();
+  const file = join(w.home, 'pipeline', 'bin', 'pipeline.mjs');
+  const { r, notices, status } = await scheduledOver(w, { beforeInstall: () => writeFileSync(file, '// owner edit\n', { flag: 'a' }) });
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.deepEqual([r.output.action, r.output.reason], ['blocked', 'modified']);
+  assert.match(readFileSync(file, 'utf8'), /owner edit/, 'the edit survived');
+  assert.equal(readManifest(w.home).sourceSha, OLD_SHA, 'nothing was installed');
+  assert.equal(notices.length, 1);
+  assert.match(notices[0], /paused/);
+  assert.equal(status.state, 'blocked-modified');
+});
+
+test('scheduled, real installer: a different version installed during the download is not replaced - judged again next run, quietly', async () => {
+  const w = await scheduledWorld();
+  const other = JSON.parse(readFileSync(w.manifestFile, 'utf8'));
+  const { r, notices, status } = await scheduledOver(w, { beforeInstall: () => writeFileSync(w.manifestFile, `${JSON.stringify({ ...other, sourceSha: 'e'.repeat(40) }, null, 2)}\n`) });
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.action, 'changed');
+  assert.equal(readManifest(w.home).sourceSha, 'e'.repeat(40), 'nothing was written');
+  assert.equal(notices.length, 0);
+  assert.equal(status.state, 'behind');
+});
+
+test('scheduled, real installer: a live review lease defers (exit 0), names the holder, writes nothing and tells nobody', async () => {
+  const w = await scheduledWorld();
+  const { openOrRenewLease } = await import('../pipeline/lib/review-lease.mjs');
+  await openOrRenewLease({ worktree: join(w.account, 'wt'), repoId: 'acme/app', pr: 7, dir: w.leases, home: w.account, env: { CLAUDECODE: '1' }, ancestorPid: null, waitMs: 150 });
+  const before = readFileSync(w.manifestFile, 'utf8');
+  const { r, notices, status } = await scheduledOver(w);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.action, 'deferred');
+  assert.match(r.output.message, /acme\/app #7/);
+  assert.equal(readFileSync(w.manifestFile, 'utf8'), before, 'nothing was installed');
+  assert.equal(notices.length, 0);
+  assert.equal(status.state, 'deferred-by-review');
+  assert.equal(status.deferredBy[0].repo, 'acme/app');
+});
+
+// R2-F4: on Windows an environment name is case-insensitive, so a mixed-case spelling reaches the child's PIPELINE_TEST_MODE lookup all the same.
+test('R2-F4: an installed copy strips a seam whatever the case of its name; a checkout caller keeps it', () => {
+  const mixed = { Pipeline_Test_Mode: '1', pipeline_review_lease_dir: '/x', Pipeline_Install_Account_Home: '/a', PIPELINE_install_swap_gate: '/g' };
+  const base = { PATH: '/p', PIPELINE_LOCK_DIR: '/l' };
+  assert.deepEqual(installerEnv({ ...base, ...mixed }, { installed: true }), base);
+  assert.deepEqual(installerEnv({ ...base, ...mixed }, { installed: false }), { ...base, ...mixed });
 });

@@ -24,14 +24,14 @@ import { CODEX_TIMEOUT_MS, execCodex, readCodexAnswer } from '../lib/codex-exec.
 import { recordCodexRun } from '../lib/codex-usage.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import {
-  GitError, NETWORK_TIMEOUT_MS, diffFiles, effectiveReviewBase, git, headSha, mergeBase, resolutionReviewBase, reviewPatch, revParse, showFile,
+  GitError, NETWORK_TIMEOUT_MS, effectiveReviewBase, git, headSha, mergeBase, resolutionReviewBase, reviewPatch, revParse, showFile,
 } from '../lib/git.mjs';
-import { collectHardStops } from '../lib/hardstops.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { GhError } from '../lib/proc.mjs';
-import { assessRisk, isLightLane, reviewLane } from '../lib/risk.mjs';
+import { rateBranch } from '../lib/risk.mjs';
 import { addRound, emptyState, loadState, saveState } from '../lib/state.mjs';
-import { reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from '../lib/triage.mjs';
+import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from '../lib/triage.mjs';
+import { assertPublishedHistory } from '../lib/review-publish.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
   allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, writeFileAtomic,
@@ -54,8 +54,14 @@ export const meta = {
     '    this machine): a grant already used, or recorded for another head ("ask again"), is exit 2 round-cap; Codex exit 3, head-moved and a kill before the claim',
     '    leave the grant open (a failure after the claim spends it: ask again). Success adds grantUsed:{grantId}; the round records admission and ownerGrant {grantId, k, quote, ownerTs}',
     '    base-only rounds and resolution-only rounds (below) never count toward the cap',
-    '  reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
-    '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable',
+    '  exit 2 {error:stale-history | unpublished-history | history-unreadable} for a COUNTED round, before Codex runs (read again under the final lock): the PR\'s triage comment is the',
+    '    published history. stale-history: this copy lacks a published round or owner grant (run `pipeline state show --pr N`); unpublished-history: this copy holds rounds the PR',
+    '    lacks, an earlier publish failed (run `pipeline comment --pr N --kind triage`); history-unreadable: the comment holds no readable state. No triage comment: no check',
+    '  reviewer: fable (medium/high risk, except medium for size only, or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
+    '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable.',
+    '    The judge also reviews a medium PR that is medium ONLY for its size (no hard-stop hit of any kind, no sensitive path, base branch = the default branch) unless',
+    '    review.size_only_medium_reviewer is fable; the output then has sizeOnly:true and laneNote. The rating uses the working-tree config AND the one committed at the',
+    '    default branch\'s fork point (stricter wins; an unreadable one means fable). A PR that goes from judge to fable reviews the WHOLE PR in that round (kind whole-pr)',
     '  confirm fixed: an accepted item that a forced or Claude ruling marked implemented through files other than the one it names (state mark-implemented,',
     '    implementedVia other-files) is listed in the prompt of the next round that runs Codex (not a base-only one), with its original finding fenced as untrusted',
     '    text: Codex says whether it is really fixed and raises it again as BLOCKING when it is not. The round records round.confirmFixed:[ids] (absent when none)',
@@ -224,14 +230,14 @@ export const run = guarded(async (argv, ctx) => {
 
   // Risk and light lane describe the whole PR (merge base..head), whatever slice this round reviews. A later round can
   // only take a PR off the light lane, never put it on.
-  const files = diffFiles(forkPoint, head, o);
-  const hits = await collectHardStops({ base: forkPoint, head, cwd: root, config });
-  const { level, changedLines } = assessRisk({ files, hits, config });
+  // The rating is worked out under the working-tree config AND the one committed at the default branch's fork point, stricter wins (risk.mjs#rateBranch).
+  const rated = await rateBranch({ root, head, config, prBase, base: forkPoint });
+  const { level } = rated;
+  const lane = { reviewer: rated.reviewer, reasons: rated.laneReasons, sensitivePaths: rated.sensitivePaths };
   // The reviewer after Codex: a PR that was ever reviewed by Fable stays with Fable (a later round can only escalate), and a
   // Fable PR is never on the light lane (that lane exists to skip the second reviewer).
-  const lane = reviewLane({ level, files, config });
   const fable = lane.reviewer === 'fable' || state?.reviewer === 'fable';
-  const lightLane = !fable && (state ? state.lightLane === true : true) && isLightLane({ level, changedLines, hits, config });
+  const lightLane = !fable && (state ? state.lightLane === true : true) && rated.lightLane;
 
   // What Codex is shown (and what the fix commits are measured against) is exactly this range. Round 1 starts at the merge
   // base; a later round starts where the previous one ended, with the base branch's commits merged in since then taken out.
@@ -259,6 +265,13 @@ export const run = guarded(async (argv, ctx) => {
       }
     }
   }
+  // A PR the judge has been reviewing that now needs Fable (it gained a hit or a sensitive path, or grew past risk.high_lines): this round reviews the
+  // WHOLE PR, so the Fable pass sees everything the judge-only rounds covered (never a resolution-only round: that is a slice by definition).
+  const escalated = state?.rounds.length > 0 && state.reviewer === 'judge' && lane.reviewer === 'fable';
+  if (escalated) {
+    review = { base: forkPoint, kind: 'whole-pr' };
+    resolution = null;
+  }
   const resolutionOnly = resolution !== null;
   // Large binary documents would overflow the buffer; they are named at the end of the patch and in the prompt instead.
   const { patch, skipped: largeBinaries } = reviewPatch(review.base, head, o);
@@ -271,9 +284,11 @@ export const run = guarded(async (argv, ctx) => {
   // merge that leaves the content hash alone is exactly that case, so refusing it as empty-range (#1658) was wrong. Still before
   // checkCap and before anything is written. base == head is kind 'previous' with an empty patch, so never baseOnly.
   const hasAccepted = allItems(state ?? { rounds: [] }).some((i) => i.final?.decision === 'ACCEPT');
-  if (state && hasAccepted && !baseOnly && (base === head || currentContentHash(root, config) === state.rounds.at(-1)?.contentHashAtToHead)) {
+  // An escalated round (judge to Fable) reviews the whole PR whatever changed since the last round, so with no accepted item waiting for its fix it is
+  // never empty: review-complete needs that Fable round and nothing else can produce it (a config change merged in from main moves no content).
+  const waiting = state ? roundOutcome(state).newAccepted : [];
+  if (state && hasAccepted && !baseOnly && !(escalated && waiting.length === 0) && (base === head || currentContentHash(root, config) === state.rounds.at(-1)?.contentHashAtToHead)) {
     const last = state.rounds.at(-1).n;
-    const waiting = roundOutcome(state).newAccepted;
     throw new Fail(EXIT.USAGE, {
       ok: false, error: 'empty-range',
       message: waiting.length > 0
@@ -282,6 +297,19 @@ export const run = guarded(async (argv, ctx) => {
     });
   }
   const preAdmission = checkCap(state, { baseOnly, resolutionOnly });
+  // A COUNTED round builds on the PUBLISHED history: refuse before Codex runs when this copy lacks a published round or grant (stale-history), holds
+  // rounds the PR lacks (unpublished-history), or the triage comment cannot be read. A PR with no triage comment passes. Read again under the lock below.
+  const countedRound = !baseOnly && !resolutionOnly;
+  const checkPublished = (st) => {
+    if (!countedRound) return;
+    try {
+      assertPublishedHistory({ gh, pr, state: st });
+    } catch (err) {
+      if (err instanceof GhError) throw unavailable('github', { error: 'unavailable', message: err.message });
+      throw err;
+    }
+  };
+  checkPublished(state);
   const resolutionView = resolutionOnly ? resolutionSummary(resolution) : null;
   ensureRoundDir(root, round);
   const note = largeBinaryNote(largeBinaries);
@@ -370,6 +398,7 @@ export const run = guarded(async (argv, ctx) => {
     // A grant that admitted the round before Codex ran but is gone now (another checkout claimed it meanwhile) says so.
     const admission = checkCap(fresh, { baseOnly, resolutionOnly }, { already: preAdmission === 'owner' });
     checkBase(fresh);
+    checkPublished(fresh);
     if (headSha(o) !== head) throw headMoved();
     // The cap waiver rests on the proof above. from (checkBase), head and forkPoint are pinned, but origin/<default> may have moved
     // while Codex ran, and it is one of the proof's inputs: prove it again, and only accept the very range Codex was shown.
@@ -402,7 +431,7 @@ export const run = guarded(async (argv, ctx) => {
       };
     }
     const base0 = fresh ?? emptyState({ repo: slug, pr, branch: view.headRefName ?? 'HEAD', risk: level, lightLane, maxRounds: config.review.max_rounds });
-    const ruled = reuseRuled(assignIds(findings, round, excerptFor, { contentHash: hashAtHead }), ruledCacheFrom(allItems(base0)));
+    const ruled = linkDeferredFollowups(reuseRuled(assignIds(findings, round, excerptFor, { contentHash: hashAtHead }), ruledCacheFrom(allItems(base0)), { round }), allItems(base0));
     const reviewer = fable || fresh?.reviewer === 'fable' ? 'fable' : 'judge';
     const reasons = lane.reasons.length > 0 ? lane.reasons : ['reviewed by Fable in an earlier round'];
     const next = addRound({ ...base0, risk: level, lightLane: reviewer === 'fable' ? false : lightLane, reviewer, currentContentHash: hashAtHead }, {
@@ -439,6 +468,8 @@ export const run = guarded(async (argv, ctx) => {
       preRuled: items.filter((i) => i.final).length,
       lightLane: state.lightLane,
       reviewer: state.reviewer,
+      ...(rated.sizeOnly ? { sizeOnly: true } : {}),
+      ...(rated.note && state.reviewer === 'judge' ? { laneNote: rated.note } : {}),
       reviewerReasons: state.rounds.at(-1)?.fableReasons ?? [],
       path: dir,
       ...(usageWarnings.length ? { warnings: usageWarnings } : {}),

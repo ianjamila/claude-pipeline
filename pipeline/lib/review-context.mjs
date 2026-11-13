@@ -240,6 +240,90 @@ export function stateExtends(local, published) {
   });
 }
 
+// ---- published history (rounds and owner grants) ---------------------------------------------
+
+// A round's identity: what makes it THE round n of this review (the decisions on its items may still change). Grant metadata on it
+// (`ownerGrant`) is add-only history: a grant the PR already holds is never dropped or altered.
+const sameRound = (a, b) => a.toHead === b.toHead && a.contentHashAtToHead === b.contentHashAtToHead;
+const sameGrant = (a, b) => canonicalJson(a.ownerGrant ?? null) === canonicalJson(b.ownerGrant ?? null);
+
+/**
+ * Round-by-round difference between a LOCAL review state and the PUBLISHED one, read-only. Every field is a sorted list of round numbers:
+ *   missing        published rounds the local state has no round n for
+ *   changed        published rounds whose local round n has another toHead or contentHashAtToHead (another round wearing the number)
+ *   grantsBehind   identity-equal rounds where the PR holds an `ownerGrant` the local round lacks
+ *   grantsDiffer   identity-equal rounds where both hold an `ownerGrant` and they are not equal
+ *   extra          local rounds the PR does not hold (an unpublished trailing round, or a gap)
+ *   grantsAhead    identity-equal rounds where only the local round holds an `ownerGrant`
+ */
+export function historyDiff(local, published) {
+  const mine = new Map((local?.rounds ?? []).map((r) => [r.n, r]));
+  const theirs = new Map((published?.rounds ?? []).map((r) => [r.n, r]));
+  const d = { missing: [], changed: [], grantsBehind: [], grantsDiffer: [], extra: [], grantsAhead: [] };
+  for (const [n, p] of theirs) {
+    const r = mine.get(n);
+    if (r === undefined) d.missing.push(n);
+    else if (!sameRound(r, p)) d.changed.push(n);
+    else if (!sameGrant(r, p)) {
+      if (p.ownerGrant === undefined) d.grantsAhead.push(n);
+      else if (r.ownerGrant === undefined) d.grantsBehind.push(n);
+      else d.grantsDiffer.push(n);
+    }
+  }
+  for (const n of mine.keys()) if (!theirs.has(n)) d.extra.push(n);
+  for (const list of Object.values(d)) list.sort((a, b) => a - b);
+  return d;
+}
+
+/**
+ * Would replacing the published state with `local` lose published history? -> { ok, lostRounds:[n], lostGrants:[n] } (always an object: test `.ok`).
+ * ok when every published round is present locally with the same (n, toHead, contentHashAtToHead) and every published `ownerGrant` is equal
+ * on the local round. Item decisions may differ (that is what a publication is for); extra local rounds and grants are fine.
+ */
+export function historyPreserved(local, published) {
+  const d = historyDiff(local, published);
+  const lostRounds = [...d.missing, ...d.changed].sort((a, b) => a - b);
+  const lostGrants = [...d.grantsBehind, ...d.grantsDiffer].sort((a, b) => a - b);
+  return { ok: lostRounds.length === 0 && lostGrants.length === 0, lostRounds, lostGrants };
+}
+
+/**
+ * How the local review state relates to the published one, as history only (decisions are not compared). Read-only.
+ *   'in-sync'      the same rounds and the same grant metadata
+ *   'local-ahead'  local strictly extends the PR: whole trailing rounds the PR lacks and / or grants added on identity-equal rounds
+ *   'local-behind' the PR holds rounds or grants the local state lacks
+ *   'diverged'     both: each side has history the other lacks, or a round number or a grant is held by something different
+ */
+export function compareHistory(local, published) {
+  const d = historyDiff(local, published);
+  if (d.changed.length > 0 || d.grantsDiffer.length > 0) return 'diverged';
+  const behind = d.missing.length > 0 || d.grantsBehind.length > 0;
+  // A local round numbered below the newest published one is not a trailing round: the PR has a gap there, so neither side extends the other.
+  const maxPublished = Math.max(0, ...(published?.rounds ?? []).map((r) => r.n));
+  const ahead = d.grantsAhead.length > 0 || d.extra.length > 0;
+  if (d.extra.some((n) => n < maxPublished)) return 'diverged';
+  if (behind && ahead) return 'diverged';
+  if (behind) return 'local-behind';
+  return ahead ? 'local-ahead' : 'in-sync';
+}
+
+/**
+ * The local state with the PR's owner grants copied onto the identity-equal rounds that lack them or hold another one (the grant and the admission that
+ * goes with it). Nothing else changes: local decisions and local trailing rounds are kept. -> { state, restored:[n] } (state is the same object when
+ * nothing was copied). Why: grants are add-only history, so a copy that is missing one takes it from the PR instead of being replaced by it.
+ */
+export function adoptPublishedGrants(local, published) {
+  const theirs = new Map((published?.rounds ?? []).filter((p) => p.ownerGrant !== undefined).map((p) => [p.n, p]));
+  const restored = [];
+  const rounds = (local?.rounds ?? []).map((r) => {
+    const p = theirs.get(r.n);
+    if (p === undefined || !sameRound(r, p) || sameGrant(r, p)) return r;
+    restored.push(r.n);
+    return { ...r, ownerGrant: p.ownerGrant, ...(p.admission === undefined ? {} : { admission: p.admission }) };
+  });
+  return { state: restored.length === 0 ? local : { ...local, rounds }, restored: restored.sort((a, b) => a - b) };
+}
+
 // ---- stale quarantine -----------------------------------------------------------------------
 
 // `.review/stale-<UTC timestamp>/`, never deleted: it holds whatever the published state replaced or a discarded round.

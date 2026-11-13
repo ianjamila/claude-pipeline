@@ -282,7 +282,9 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
 
   // An empty expectation would "prove" anything, so it is itself a failure.
   const prefixOk = typeof expectModelPrefix === 'string' && expectModelPrefix !== '';
-  const effortOk = typeof expectEffort === 'string' && expectEffort !== '';
+  // One effort, or a list of accepted ones (a fix-verify arbiter pass is accepted at medium or higher: lib/fix-verify.mjs).
+  const okEfforts = Array.isArray(expectEffort) ? expectEffort : [expectEffort];
+  const effortOk = okEfforts.length > 0 && okEfforts.every((e) => typeof e === 'string' && e !== '');
   if (!prefixOk) errors.push('invalid expectation: expectModelPrefix');
   if (!effortOk) errors.push('invalid expectation: expectEffort');
   const agentTypeGiven = expectAgentType !== null && expectAgentType !== undefined;
@@ -335,11 +337,11 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
             : `isApiErrorMessage ${JSON.stringify(line.isApiErrorMessage)}`;
         errors.push(`API error on line ${n}: ${detail}`);
       }
-      if (effortOk && line.effort !== expectEffort) {
+      if (effortOk && !okEfforts.includes(line.effort)) {
         errors.push(`unexpected effort ${String(line.effort)} on line ${n}`);
       }
       // null means "no per-turn override"; any real value must agree with the pinned effort too.
-      if (effortOk && has(line, 'perTurnEffort') && line.perTurnEffort !== null && line.perTurnEffort !== expectEffort) {
+      if (effortOk && has(line, 'perTurnEffort') && line.perTurnEffort !== null && !okEfforts.includes(line.perTurnEffort)) {
         errors.push(`unexpected perTurnEffort ${String(line.perTurnEffort)} on line ${n}`);
       }
     }

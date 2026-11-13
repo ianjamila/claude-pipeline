@@ -8,6 +8,7 @@ import { guardVerdict } from '../lib/command-guard.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { headSha } from '../lib/git.mjs';
 import { startJob, waitJob, readJob } from '../lib/jobs.mjs';
+import { holderHandoff } from '../lib/review-lease.mjs';
 import { escapeArgument } from '../lib/proc.mjs';
 
 export const meta = {
@@ -94,7 +95,12 @@ async function start(rest, ctx) {
   };
 
   try {
-    const started = startJob(name, quoteCommand(args, platform), { cwd: root, policy, tag: values.tag ?? headOrNull(root) });
+    // A leased command run inside the job has no Claude ancestor: hand it this session's identity so its lease joins the session's (review-lease.mjs).
+    // `ctx.leaseAncestorPid` is the walk this command's lease already made (review-lease-wiring.mjs); `ctx.leaseHolderOpts` is a test seam (an injected ancestor / ps / session record).
+    const holderOpts = ctx?.leaseHolderOpts ?? {};
+    const walked = ctx?.leaseAncestorPid && holderOpts.ancestry === undefined ? { ancestorPid: ctx.leaseAncestorPid } : {};
+    const handoff = holderHandoff({ worktree: root, env, ...walked, ...holderOpts });
+    const started = startJob(name, quoteCommand(args, platform), { cwd: root, policy, tag: values.tag ?? headOrNull(root), env: handoff });
     return { exitCode: EXIT.OK, output: { ok: true, ...started } };
   } catch (err) {
     if (refusal !== null) return { exitCode: EXIT.FAILED, output: { ok: false, refused: true, reason: refusal } };

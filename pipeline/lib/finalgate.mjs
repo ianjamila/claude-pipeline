@@ -155,7 +155,7 @@ export const localContentHash = (root, config) =>
 
 // `explicit` ({ sha, branch }, --owner-go): scan merge-base(sha, HEAD)..HEAD for the base commit GitHub names (baseRefOid), never a local
 // ref. The commit must be a local object already (no fetch here, and no fallback to origin/<branch> or the local branch).
-function lazyDiff(root, config, explicit = null) {
+export function lazyDiff(root, config, explicit = null) {
   let cached = null;
   return () => {
     if (cached) return cached;
@@ -654,7 +654,7 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   // from the state alone). A grant lets a round run; it is no merge authority, so it is shown but never an owner-merge item.
   const grants = verifyOwnerGrants(state, { repo, pr, maxRounds: config?.review?.max_rounds, ...ownerGo });
   if (!grants.ok) return check('review', false, grants.problems.join('; '));
-  const grantNote = grants.granted.map((g) => `; owner-granted round ${g.k}: "${clip(g.quote.replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('');
+  const grantNote = grants.granted.map((g) => `; ${g.past ? 'owner-approved past round' : 'owner-granted round'} ${g.k}: "${clip(g.quote.replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('');
   // owner_approval: chat: an item the owner ruled in chat (an original or a later round's cached copy) never clears the merge by
   // itself. It stays visible here and counts as ownerMerge, so the owner's "merge" for this head is still needed.
   const ruled = ownerRuledItems(state);

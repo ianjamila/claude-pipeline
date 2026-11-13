@@ -1,8 +1,14 @@
 # Repo CI for claude-pipeline itself. The two check names "test (ubuntu)" and "test (windows)" are this repo's required
 # checks (.claude/pipeline.yml ci.required_checks): renaming either breaks branch protection. "test (windows)" is an
 # AGGREGATE job: the suite runs in three shards ("test (windows 1/3)" .. "3/3", not required on their own) and the
-# aggregate goes green only when every shard succeeded. A failed, cancelled or skipped shard makes it red, never
-# green or skipped, so a required check can never be satisfied by a shard that did not run.
+# aggregate goes green only when every shard succeeded. On a non-draft event a failed, cancelled or skipped shard makes
+# it red, never green or skipped, so a required check can never be satisfied by a shard that did not run.
+#
+# Draft PRs are skipped (ci.draft_while_iterating: true in .claude/pipeline.yml; `pipeline redraft` turns a ready PR back to
+# draft before each review-fix push): both required checks read "skipped" on a draft, the suite runs once when the PR is marked
+# ready (`ready_for_review`) and on every push after that. `converted_to_draft` is a listed trigger: it joins the PR's
+# concurrency group (below), so redrafting cancels a suite that is still running, and its own run skips because the PR is a draft
+# by then. The aggregate skips on exactly the same condition as the shards, never on anything else. Push to main is unchanged.
 #
 # Every step runs under bash (Git Bash on Windows) so one script serves both runners. The
 # installer runs into a throwaway Claude home whose path contains a space, then --check must
@@ -19,6 +25,8 @@ name: CI
 
 on:
   pull_request:
+    # The default types (opened, synchronize, reopened) plus the two the draft flow needs.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
 
@@ -39,8 +47,11 @@ defaults:
 jobs:
   test-ubuntu:
     name: test (ubuntu)
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The whole suite runs twice here (Node 20, then Node 24), ~12-15 min each on a slow runner: 30 min cut a green
+    # Node 24 pass short three times on 2026-11-12 (PR #308). 45 matches the Windows shards.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -97,6 +108,7 @@ jobs:
   # on ubuntu.
   test-windows-shard:
     name: test (windows ${{ matrix.shard }}/3)
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
@@ -152,11 +164,12 @@ jobs:
 
   # The required check. always() makes it run (and report) even when a shard failed or was cancelled; it is green only
   # when the shard job's overall result is exactly "success" (a skipped or cancelled matrix would otherwise leave the
-  # check missing or neutral). Do not add steps that can succeed independently of that result.
+  # check missing or neutral). Do not add steps that can succeed independently of that result. On a draft PR the shards are
+  # skipped by design, so this skips too (same condition); on every other event it is still always().
   test-windows:
     name: test (windows)
     needs: test-windows-shard
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

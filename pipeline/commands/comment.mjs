@@ -11,7 +11,8 @@ import { MARKERS, summarySections, needsHumanComment, blockedComment, blockedRea
 import { recordForOutcome } from '../lib/run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
 import { createGitHub, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
-import { readModelProofs, withReviewLock } from '../lib/review-context.mjs';
+import { parkStatusLines } from '../lib/round-status.mjs';
+import { allItems, readModelProofs, withReviewLock } from '../lib/review-context.mjs';
 import { publishTriage } from '../lib/review-publish.mjs';
 
 export const meta = {
@@ -22,6 +23,10 @@ export const meta = {
     '  (exit 1 {ok:false, error:\'stale-publication\', reason}) when the PR holds a state this copy neither published nor restored: run `pipeline state show --pr N`',
     '  and redo the decision; {action:\'unchanged\'} when the PR already holds exactly this state. The other kinds take no lock.',
     '  --kind blocked renders the verify report\'s failure; with --reason TEXT it renders a "the review stopped: TEXT" comment instead (no report needed), e.g. the advice of a stop that waits for a terminal restart.',
+    '  --kind needs-human adds, when a review state with at least one round exists for this PR, a short status block under the paragraph: rounds, booked cost (with the last round\'s share),',
+    '  open items with their severity and why the review is not clean (the extra-round ask\'s text without its recommendation). Display only: a part that cannot be read becomes a "not available" line; the comment is always written.',
+    '  --kind triage also adds {redraftAdvice:true, warnings:[...]}: run `pipeline redraft --pr N` before the first fix push, when the repo has ci.draft_while_iterating, the state holds',
+    '  an ACCEPT item not yet implemented (a fix is coming) and the PR is READY. Advice only, never a failure: no such item, a draft PR or a PR that cannot be read gets none.',
   ].join('\n'),
 };
 
@@ -75,6 +80,28 @@ function summaryKind(gh, pr, sections, outcome) {
   return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: record.step, warnings } };
 }
 
+// true only when GitHub says the PR is a ready (non-draft) PR; a failed read, or any other answer, is false.
+function prIsReady(gh, pr) {
+  try {
+    return gh.prView(pr, ['isDraft']).isDraft === false;
+  } catch {
+    return false;
+  }
+}
+
+// The review round has a fix coming (an ACCEPT item no one has implemented yet) in a repo that iterates in draft (ci.draft_while_iterating) and the PR is
+// READY: every fix push would re-run the heavy CI, so say so before the first one (the review skill's Rule 8: `pipeline redraft`). Advice only, never a failure.
+// The cheap checks come first: a repo that does not iterate, or a round with nothing to fix, never reads the PR.
+function redraftAdvice({ config, state, gh, pr }) {
+  if (config?.ci?.draft_while_iterating !== true) return {};
+  const fixComing = allItems(state).some((i) => i.final?.decision === 'ACCEPT' && i.final.needsHuman !== true && !i.implemented);
+  if (!fixComing || !prIsReady(gh, pr)) return {};
+  return {
+    redraftAdvice: true,
+    warnings: [`PR #${pr} is ready and this repo iterates in draft (ci.draft_while_iterating): run \`pipeline redraft --pr ${pr}\` BEFORE you push any fix from this round, so CI waits for the re-ready instead of running on every fix push`],
+  };
+}
+
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
     pr: { type: 'string' },
@@ -115,13 +142,16 @@ export const run = guarded(async (argv, ctx) => {
     // Whatever the format, an advisory (report-only) hit never makes a PR need a human: drop it before the note is built.
     const hits = listed.filter((h) => h?.advisory !== true);
     const state = stateOrNull(root);
-    const reportFile = await reportPath(root);
+    const cfg = await loadConfig(root);
+    const reportFile = resolve(root, cfg.ok ? cfg.config.verify.report : DEFAULTS.verify.report);
     const report = existsSync(reportFile) ? readJson(reportFile, 'verify report') : null;
     body = needsHumanComment({
       reasons: [reason],
       hits,
       verified: typeof report?.ok === 'boolean' ? report.ok : null,
       reviewed: state ? state.rounds?.length > 0 : null,
+      // Display only: rounds, booked cost, open items and why the review is not clean (never throws; a failed line says "not available").
+      review: parkStatusLines({ root, config: cfg.ok ? cfg.config : null, state, pr, gh: createGitHub({ cwd, env: ctx.env }) }),
     });
   } else {
     body = awaitingReviewComment(values.reason ?? '');
@@ -130,9 +160,11 @@ export const run = guarded(async (argv, ctx) => {
   const gh = createGitHub({ cwd, env: ctx.env });
   // The triage state is read again under the lock, so what is published is what the lock-holders before us left.
   if (kind === 'triage') {
+    const cfg = await loadConfig(root);
     return guardGh(() => withReviewLock(root, pr, ctx, () => {
-      const r = publishTriage({ gh, root, pr, state: requireState(root, kind) });
-      return { exitCode: EXIT.OK, output: { ok: true, kind, pr, action: r.action, url: r.url, id: r.id } };
+      const state = requireState(root, kind);
+      const r = publishTriage({ gh, root, pr, state });
+      return { exitCode: EXIT.OK, output: { ok: true, kind, pr, action: r.action, url: r.url, id: r.id, ...redraftAdvice({ config: cfg.ok ? cfg.config : null, state, gh, pr }) } };
     }));
   }
   return guardGh(() => {

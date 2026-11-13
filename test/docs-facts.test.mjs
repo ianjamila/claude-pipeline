@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GUARD_FILES_MATCHER, GUARD_GIT_MATCHER } from '../pipeline/lib/installer.mjs';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
+import { BRIEFS } from '../pipeline/lib/fix-verify.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(root, rel), 'utf8');
@@ -103,6 +104,24 @@ test('agents: implementer and verifier inherit effort (spec 5.4); judge (Sonnet)
   assert.match(read('agents/judge.md'), /every pending item exactly once/);
 });
 
+test('agents: arbiter-fix is the arbiter (same Fable pin, same body) at the lower effort the fix-verify brief expects', () => {
+  const front = (doc) => read(doc).split('---')[1];
+  const body = (doc) => read(doc).split('---').slice(2).join('---');
+  assert.match(front('agents/arbiter-fix.md'), /^name: arbiter-fix$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^model: fable$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^effort: medium$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^tools: Read, Grep, Glob$/m);
+  assert.match(front('agents/arbiter-fix.md'), /fix-verify/);
+  assert.equal(body('agents/arbiter-fix.md'), body('agents/arbiter.md'), 'one instruction text for both: the brief comes from the input file');
+  assert.match(front('agents/arbiter.md'), /^name: arbiter$/m);
+  assert.match(front('agents/arbiter.md'), /^model: fable$/m);
+  // lib/fix-verify.mjs names the agent and effort each brief expects
+  assert.equal(BRIEFS['fix-verify'].agent, 'arbiter-fix');
+  assert.equal(BRIEFS['fix-verify'].effort, 'medium');
+  assert.equal(BRIEFS.full.agent, 'arbiter');
+  assert.equal(BRIEFS.full.effort, 'high');
+});
+
 test('pipeline-setup: ignores the worktree dir, pins verify.expected_steps, mentions the executable shim and the ci keys', () => {
   const setup = read('skills/pipeline-setup/SKILL.md');
   for (const needle of ['<worktree_dir>/', 'verify.expected_steps', '100755', 'ci.approvers', 'ci.guard_checks', '.gitattributes', '{{OWNER}}', '--reason']) {
@@ -128,4 +147,25 @@ test('the review skill says one closing keyword per issue (GitHub links only the
   const skill = read('skills/review/SKILL.md');
   assert.match(skill, /one keyword per issue, `Closes #1\. Closes #2\.`/);
   assert.match(skill, /one keyword per issue, `Closes #170\. Closes #171\.` \(GitHub closes only the first number of\s+`Closes #170, #171`\)/);
+});
+
+test('extra-round discipline: the ask shows rounds, cost and severity; "follow up" is the owner\'s literal words and starts a revert, CI wait and defer-fixes; one implementer builds a PR unless it is big', () => {
+  const review = reviewText();
+  const merge = read('skills/review/reference/owner-merge.md');
+  assert.match(merge, /pastes `summary`/);
+  assert.match(merge, /only the owner's literal "follow up" or "file follow-ups" starts it/);
+  assert.match(merge, /P ci-wait --pr N` on THAT head/);
+  assert.match(merge, /P triage defer-fixes --pr N --ids/);
+  assert.match(merge, /ONE PR per reply/);
+  assert.match(merge, /With `recommend: extra-round` never offer the follow-up path/);
+  assert.match(review, /ONE `implementer` dispatch builds the whole change/);
+  assert.match(review, /continue THE SAME agent/);
+  assert.match(review, /booked ONCE, after its last leg/);
+  assert.ok(!/Split the work into small tasks/.test(review));
+  const implementer = read('agents/implementer.md');
+  assert.match(implementer, /the whole change of a PR \(or one part of a big one\)/);
+  assert.match(implementer, /Work through the task list in order, commit per step/);
+  const cli = read('docs/cli.md');
+  assert.match(cli, /Follow up instead of a round/);
+  assert.match(cli, /pipeline triage defer-fixes --pr N --ids/);
 });

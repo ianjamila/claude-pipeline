@@ -22,10 +22,12 @@ import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { SHARED_FLOOR_DIR, floorEnv, scratchFloorDir } from './helpers/floor-env.mjs';
 import { resetFloor } from '../pipeline/lib/model-floor.mjs';
-import { cleanupAtExit, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { leasesDir } from '../pipeline/lib/review-lease.mjs';
+import { cleanupAtExit, ownerApprovesPast, ownerGrants, ownerRules, pastRoundRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
 import { reviewCheck } from '../pipeline/lib/finalgate.mjs';
+import { noClaudeSession } from './helpers/no-claude-session.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -57,9 +59,16 @@ const standardFindings = () => findingsOf(
 // What `followups create` asks before it files anything: who we are and which issues of ours exist (none).
 const noIssues = (slug) => [
   { match: '^api user', stdout: 'me\n' },
-  { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=30 --paginate`, stdout: '[]' },
+  { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=100 --paginate`, stdout: '[]' },
 ];
 const NO_ISSUES = noIssues('acme/widgets');
+
+// codex-review reads the PR's triage comment before it admits a counted round (published history): a world answers "no comment" unless a test
+// scripts the comments itself (these entries come LAST, so a test's own entries win).
+const NO_COMMENTS = [
+  { match: '^api user', stdout: 'me\n' },
+  { match: '^api repos/\\S+/issues/\\d+/comments --paginate', stdoutJson: [] },
+];
 
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x' } },
@@ -114,7 +123,7 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
   // The PR as GitHub reports it: its base branch and the head commit it holds (what review-complete compares to).
   // (a world with its own slug: every API path the scripts match on names that repository instead of acme/widgets)
   const forSlug = (e) => (slug === 'acme/widgets' || e.match.includes(slug) ? e : { ...e, match: e.match.split('acme/widgets').join(slug) });
-  const withPr = (sha) => gh.map((e) => {
+  const withPr = (sha, list = gh) => [...list, ...NO_COMMENTS].map((e) => {
     if (e.match === '^pr view 7') return { ...e, stdoutJson: { baseRefName: 'main', headRefOid: sha, ...e.stdoutJson } };
     if (e.match === '^repo view' && slug !== 'acme/widgets') return { ...e, stdoutJson: { ...e.stdoutJson, nameWithOwner: slug, url: `https://github.com/${slug}` } };
     return forSlug(e);
@@ -127,6 +136,8 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
     repo, base, head, scratch, fake, capture, lockDir, slug,
     // Tell the fake GitHub the PR's head moved (after a new commit).
     prHead: (sha) => fake.setScript(withPr(sha)),
+    // Swap the scripted gh entries (e.g. the PR's comments) for the rest of the test; the PR head stays where the world put it.
+    setGh: (list, sha = head) => fake.setScript(withPr(sha, list)),
     cli(args, env = {}) {
       const merged = {
         ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, FAKE_CODEX_CAPTURE: capture,
@@ -147,7 +158,7 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
       const r = spawnSync(process.execPath, [useBin, ...args], { cwd: repo.dir, env: merged, encoding: 'utf8' });
       let json = null;
       try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* leave null: the assertion on json will say so */ }
-      return { code: r.status, json, stdout: r.stdout, stderr: r.stderr };
+      return { code: r.status, json, stdout: r.stdout, stderr: r.stderr, pid: r.pid };
     },
     file(name, content) {
       const p = join(scratch, name);
@@ -478,6 +489,75 @@ test('codex-review: GitHub being unreachable is exit 3 with unavailable:true, re
   assert.equal(w.captured().length, 0);
 });
 
+// ---- codex-review reads the published history before it admits a counted round (plan 2026-11-12-legacy-round-grants.md, A) -------------
+
+const commentsEntry = (comments) => ({ match: '^api repos/\\S+/issues/\\d+/comments --paginate', stdoutJson: comments });
+const triageNote = (state, over = {}) => ({ id: 9, user: { login: 'me' }, body: triageComment(state), created_at: '2026-11-05T10:00:00Z', updated_at: '2026-11-05T10:00:00Z', ...over });
+const noRoundWritten = (w, n) => !existsSync(join(w.repo.dir, '.review', `round-${n}`));
+
+test('codex-review: a counted round needs the local history to match the published one (stale-history, unpublished-history, unreadable); no comment passes', (t) => {
+  const w = worldIgnoringReview(t, { yml: `${pipelineYml()}review:\n  max_rounds: 5\n` });
+  const advance = (n) => {
+    w.repo.write(`src/h${n}.js`, `export const h${n} = ${n};\n`);
+    return w.repo.commit(`more ${n}`);
+  };
+  const refuse = (n, from, to, error, re) => {
+    const stateBefore = w.stateText();
+    const calls = w.captured().length;
+    const r = w.codex(n, findingsOf(), { from, to });
+    assertExit(r, 2, r.stdout + r.stderr);
+    assert.equal(r.json.error, error);
+    assert.match(r.json.message, re);
+    assert.equal(w.stateText(), stateBefore, 'the state is unchanged');
+    assert.equal(w.captured().length, calls, 'Codex was not started');
+    assert.ok(noRoundWritten(w, n), 'no round folder was left behind');
+  };
+
+  // no triage comment (a new PR): round 1 runs
+  assertExit(w.codex(1, findingsOf()), 0);
+  const s1 = w.state();
+  const head2 = advance(2);
+  // the PR holds exactly what this copy has: in sync, the round runs
+  w.setGh([...GH, commentsEntry([triageNote(s1)])]);
+  assertExit(w.codex(2, findingsOf(), { from: w.head, to: head2 }), 0);
+  const s2 = w.state();
+  const head3 = advance(3);
+
+  // an earlier publish failed: local holds round 2, the PR only round 1
+  refuse(3, head2, head3, 'unpublished-history', /pipeline comment --pr 7 --kind triage/);
+  // the PR holds a grant on round 2 that this copy lacks / another round 1 / a longer history
+  const withGrant = { ...s2, rounds: s2.rounds.map((r) => (r.n === 2 ? { ...r, admission: 'owner', ownerGrant: { grantId: 'g', k: 2, quote: 'extra round', ownerTs: '2026-11-05T10:00:00.000Z' } } : r)) };
+  w.setGh([...GH, commentsEntry([triageNote(withGrant)])]);
+  refuse(3, head2, head3, 'stale-history', /owner grant on round 2.*pipeline state show --pr 7/);
+  const other = { ...s2, rounds: s2.rounds.map((r) => (r.n === 1 ? { ...r, toHead: 'e'.repeat(40) } : r)) };
+  w.setGh([...GH, commentsEntry([triageNote(other)])]);
+  refuse(3, head2, head3, 'stale-history', /pipeline state show --pr 7/);
+  const longer = { ...s2, rounds: [...s2.rounds, { ...s2.rounds[1], n: 3 }] };
+  w.setGh([...GH, commentsEntry([triageNote(longer)])]);
+  refuse(3, head2, head3, 'stale-history', /round 3.*pipeline state show --pr 7/);
+  // a comment with no readable state
+  w.setGh([...GH, commentsEntry([triageNote(s2, { body: `${MARKERS.triage}\nnot a state` })])]);
+  refuse(3, head2, head3, 'history-unreadable', /pipeline comment --pr 7 --kind triage/);
+  // somebody else's triage comment is no history
+  w.setGh([...GH, commentsEntry([triageNote(longer, { user: { login: 'mallory' } })])]);
+  const ok = w.codex(3, findingsOf(), { from: head2, to: head3 });
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+  assert.equal(w.state().rounds.length, 3);
+});
+
+test('codex-review: a fresh worktree (no local state) cannot start round 1 over a published history', (t) => {
+  const donor = worldIgnoringReview(t);
+  assertExit(donor.codex(1, findingsOf()), 0);
+  const published = donor.state();
+  const w = worldIgnoringReview(t, { gh: [...GH, commentsEntry([triageNote(published)])] });
+  const r = w.codex(1, findingsOf());
+  assertExit(r, 2, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'stale-history');
+  assert.match(r.json.message, /round 1.*pipeline state show --pr 7/);
+  assert.equal(w.captured().length, 0, 'Codex was not started');
+  assert.ok(!existsSync(join(w.repo.dir, '.review')), 'a refused round leaves nothing behind');
+});
+
 test('codex-review: rulings from earlier rounds go into the next prompt and pre-rule an unchanged finding (cache)', (t) => {
   const w = world(t);
   assertExit(w.codex(1, standardFindings()), 0);
@@ -594,6 +674,19 @@ test('codex-review: a round that only merged the base branch in is recorded as b
   assertExit(outcome, 0);
   assert.equal(outcome.json.clean, true, JSON.stringify(outcome.json));
   assert.equal(outcome.json.coverageValid, true);
+});
+
+// ---- the redraft advice moved to `comment --kind triage` (test/review-publish.test.mjs): a review round with nothing to fix must not advise a redraft ----------
+
+test('codex-review: no redraft advice and no extra PR read, even for a READY PR of a repo that iterates in draft (the advice is the triage publication\'s)', (t) => {
+  const yml = pipelineYml().replace('  guard_checks: false\n', '  guard_checks: false\n  draft_while_iterating: true\n');
+  const w = worldIgnoringReview(t, { yml, gh: [{ match: '^pr view 7 --json isDraft$', stdoutJson: { isDraft: false } }, ...GH] });
+  const r = w.codex(1, findingsOf());
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.ok, true);
+  assert.equal('redraftAdvice' in r.json, false);
+  assert.equal('warnings' in r.json, false);
+  assert.deepEqual(w.fake.lines().filter((l) => /^pr view 7 --json isDraft$/.test(l)), []);
 });
 
 test('codex-review: a base-only round past review.max_rounds is recorded (it does not count), a round with PR changes is still capped', (t) => {
@@ -2072,7 +2165,7 @@ test('a full round: codex -> judge -> arbiter -> implement -> follow-ups -> clea
     gh: [
       ...GH, REMOVE_LABEL,
       { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 21, html_url: url } },
-      { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=30 --paginate', stdout: '[]' },
+      { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=100 --paginate', stdout: '[]' },
       { match: '^api user', stdout: 'me\n' },
       { match: 'issues/7/comments --paginate', stdoutJson: [] },
       { match: '^api -X POST repos/acme/widgets/issues/7/comments ', stdoutJson: { id: 5, html_url: 'https://github.com/acme/widgets/pull/7#issuecomment-5' } },
@@ -2511,9 +2604,15 @@ test('arbiter apply: an installed copy ignores PIPELINE_TEST_MODE (with a warnin
   const w = readyForArbiter(t);
   w.cli(['arbiter', 'needed', '--round', '1']);
   const asked = ['--expect-model', 'claude-opus-', '--expect-effort', 'low'];
-  const r = arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs') } });
+  const r = arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs'), ...noClaudeSession() } });
   assertAllNeedHuman(w, r, /unexpected model claude-opus-5-1/);
   assert.match(r.stderr, /ignoring PIPELINE_TEST_MODE/);
+  // R4-6: an installed copy ignores PIPELINE_REVIEW_LEASE_DIR, so this child (a plain process: noClaudeSession) took a REAL, momentary process lease and real admission in the
+  // account's folder - no opt-out is wanted here, it is the path the owner's terminal takes. It must have closed it: no proc-* file of that child's pid is left. (If a real
+  // update holds admission while this runs, the child waits up to 20 s and then refuses with update-in-progress; the assertions above would fail loudly rather than hang.)
+  const leaseFolder = leasesDir();
+  const left = existsSync(leaseFolder) ? readdirSync(leaseFolder).filter((n) => n.startsWith(`proc-${r.pid}-`)) : [];
+  assert.deepEqual(left, [], `the child's process lease was closed (${leaseFolder})`);
 });
 
 test('arbiter apply: PIPELINE_ARBITER_MODEL_OVERRIDE never relaxes the proof, not even for a model that looks right', (t) => {
@@ -2839,7 +2938,7 @@ test('triage settle: a passing test that dismisses a security item still goes to
 
 // ---- review replay: published state wins (state show --pr, discard-round) ---------------------------------
 
-const ISSUES_URL = '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=30 --paginate';
+const ISSUES_URL = '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=100 --paginate';
 const COMMENTS = (...comments) => [
   { match: '^api user', stdout: 'me\n' },
   { match: 'issues/7/comments --paginate', stdoutJson: comments },
@@ -2854,7 +2953,8 @@ function publishedWorld(t) {
   assertExit(w.judge(1, STANDARD_JUDGE), 0);
   const published = w.state();
   const script = JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8'));
-  w.fake.setScript([...script, ...COMMENTS(mine(published))]);
+  // (the comments come FIRST: the world's own script ends with the empty-comments fallback, and the first match wins)
+  w.fake.setScript([...COMMENTS(mine(published)), ...script]);
   return { w, published };
 }
 const staleDirs = (w) => readdirSync(join(w.repo.dir, '.review')).filter((n) => n.startsWith('stale-'));
@@ -3164,6 +3264,67 @@ test('followups create: an issue-list outage is exit 3 and nothing is filed', (t
   assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
   assertExit(w.cli(['followups', 'create', '--round', '1']), 3);
   assert.equal(posts(w).length, 0, 'never create blind when the duplicate check could not run');
+});
+
+// #268: the creator scan is bounded by the PR's creation time (minus an hour) when it can be read.
+const GH_CREATED = (createdAt) => [{ match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x', createdAt } }, GH[1]];
+function sinceWorld(t, createdAt, issues, { issuesReply } = {}) {
+  const w = world(t, {
+    gh: [...GH_CREATED(createdAt), { match: '^api user', stdout: 'me\n' }, { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=100', ...(issuesReply ?? { stdoutJson: issues }) },
+      { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 50, html_url: 'https://github.com/acme/widgets/issues/50' } }],
+  });
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other', testable: false })])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  return w;
+}
+const scanLines = (w) => w.fake.lines().filter((l) => /issues\?creator=me/.test(l));
+
+test('followups create: the creator scan asks for 100 per page and only issues updated since the PR was created, minus an hour (UTC)', (t) => {
+  const w = sinceWorld(t, '2026-11-10T09:30:00+08:00', []);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(scanLines(w), ['api repos/acme/widgets/issues?creator=me&state=all&per_page=100&since=2026-11-10T00%3A30%3A00Z --paginate']);
+  assert.ok(w.fake.lines().includes('pr view 7 --json createdAt'), 'one call reads the PR creation time');
+  assert.equal(r.json.created.length, 1);
+});
+
+test('followups create: a missing, unparsable, future or unreadable createdAt means the full scan (no since), never a failure', (t) => {
+  const future = new Date(Date.now() + 86_400_000).toISOString();
+  for (const createdAt of [undefined, null, '', 'not a date', '2', '2026-11-10', 12345, future]) {
+    const w = sinceWorld(t, createdAt, []);
+    const r = w.cli(['followups', 'create', '--round', '1']);
+    assertExit(r, 0, String(createdAt) + r.stderr + r.stdout);
+    assert.deepEqual(scanLines(w), ['api repos/acme/widgets/issues?creator=me&state=all&per_page=100 --paginate'], String(createdAt));
+    assert.equal(r.json.created.length, 1);
+  }
+  // the lookup itself failing
+  const w = world(t, { gh: [{ match: '^pr view 7 --json createdAt', code: 1, stderr: 'HTTP 502' }, ...GH, { match: '^api user', stdout: 'me\n' },
+    { match: ISSUES_URL, stdoutJson: [] }, { match: '^api -X POST repos/acme/widgets/issues ', stdoutJson: { number: 50, html_url: 'https://github.com/acme/widgets/issues/50' } }] });
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other', testable: false })])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(scanLines(w), ['api repos/acme/widgets/issues?creator=me&state=all&per_page=100 --paginate']);
+  assert.equal(r.json.created.length, 1);
+});
+
+test('followups create: with a since bound an earlier issue for this PR (even promoted and closed) is still found, never filed twice', (t) => {
+  const marker = FP_ISSUE(followupWorld(t, []));
+  const w = sinceWorld(t, '2026-11-10T09:30:00Z', [issue(90, `${marker}\nbody`, { state: 'closed', labels: [{ name: 'agent-build' }] })]);
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.reused, [{ id: 'R1-W1', number: 90, url: 'https://github.com/acme/widgets/issues/90' }]);
+  assert.equal(posts(w).length, 0);
+  assert.match(scanLines(w)[0], /&since=2026-11-10T08%3A30%3A00Z /);
+});
+
+test('followups create: a page failing mid-pagination is the existing exit 3 and nothing is filed', (t) => {
+  const w = sinceWorld(t, '2026-11-10T09:30:00Z', null, { issuesReply: { code: 1, stdout: '[{"number":1,"user":{"login":"me"},"body":"x"}]', stderr: 'gh: HTTP 502 (page 3)' } });
+  const r = w.cli(['followups', 'create', '--round', '1']);
+  assertExit(r, 3, r.stderr + r.stdout);
+  assert.match(r.stderr + r.stdout, /HTTP 502/);
+  assert.equal(posts(w).length, 0, 'never create blind when the duplicate check could not finish');
+  assert.equal(w.item('R1-W1').followupIssue ?? null, null);
 });
 
 // ---- model proofs travel in the state ---------------------------------------------------------------------
@@ -3818,7 +3979,7 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   const published = w.state();
   const markerTree = published.rounds[1].reviewBase;
   const roundPatch = patchOf(w, 2);
-  w.fake.setScript([...JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')), REMOVE_LABEL, ...COMMENTS(mine(published)), REVIEW_COMMENT[2],
+  w.fake.setScript([...COMMENTS(mine(published)), ...JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8')), REMOVE_LABEL, REVIEW_COMMENT[2],
     { match: '^api -X PATCH repos/acme/widgets/issues/comments/9 ', stdoutJson: { id: 9, html_url: 'u9' } }]); // review-complete publishes the state first
 
   // A fresh clone (--no-local: a local clone would copy every object): only the objects reachable from a branch come along, so the marker tree is not there.
@@ -3935,6 +4096,22 @@ test('codex-review owner grant: no grant is the same round-cap as before, and th
   assert.equal(capped.json.error, 'round-cap');
   assert.match(capped.json.message, /review\.max_rounds \(1\) and its one extra round, or an owner-granted round/);
   assert.equal(w.captured().length, calls, 'Codex never ran');
+});
+
+test('codex-review owner grant: a recorded owner approval of a PAST round admits nothing: the refusal is the plain round-cap and Codex never runs', (t) => {
+  const { w, h1, h2 } = atCap(t);
+  const record = ownerApprovesPast(t, 'approve past round', pastRoundRequest(7, 3, h2, w.slug));
+  assert.ok(record, 'the hook recorded the past-round approval');
+  assert.equal(record.kind, 'past-round');
+  t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+  const calls = w.captured().length;
+  const capped = codexThree(w, h1, h2);
+  assertExit(capped, 2, capped.stdout);
+  assert.equal(capped.json.error, 'round-cap');
+  assert.match(capped.json.message, /review\.max_rounds \(1\) and its one extra round, or an owner-granted round/);
+  assert.doesNotMatch(capped.json.message, /is recorded for this PR/, 'not even named as a grant that cannot be confirmed');
+  assert.equal(w.captured().length, calls, 'Codex never ran');
+  assert.equal(existsSync(markerPath(grantIdOf(record))), false, 'no marker was claimed');
 });
 
 test('codex-review owner grant: an "extra round" whose prompt is synthetic or missing from the transcript admits nothing, and the refusal says it cannot be confirmed as typed by the owner (#128)', (t) => {

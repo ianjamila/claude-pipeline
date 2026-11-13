@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { createCommentsGh, createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createCommentsGh, createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { decodeFromComment } from '../pipeline/lib/state.mjs';
 import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
@@ -61,6 +61,7 @@ function world(t, { yml = CHAT_YML, slug = 'acme/widgets', comments = false } = 
     { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: head } },
     { match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: slug, url: `https://github.com/${slug}` } },
     { match: '^pr edit 7 ', code: 0 },
+    ...NO_COMMENTS,
   ]);
   const lockDir = join(scratch, 'locks');
   const w = {
@@ -435,10 +436,10 @@ test('arbiter needed in a dispute round leaves a judgement (low confidence) and 
 test('a state of a newer format is refused by every command that reads it', (t) => {
   const w = world(t);
   assertExit(w.codex(1, findingsOf([], [sugg()])), 0);
-  w.edit((s) => { s.version = 3; });
+  w.edit((s) => { s.version = 4; });
   const r = w.cli(['state', 'outcome']);
   assertExit(r, 2, r.stdout + r.stderr);
-  assert.match(r.json.message, /version 3.*supports up to 2/);
+  assert.match(r.json.message, /version 4.*supports up to 3/);
   const c = w.cli(ruling('R1-S1', 'FOLLOW-UP'));
   assertExit(c, 2, c.stdout);
 });
