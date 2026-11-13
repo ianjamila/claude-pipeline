@@ -3170,10 +3170,12 @@ function evalString(str, startDir, ctx, level, child = false) {
     // `cd d || exit`: when the cd fails nothing after it runs, so the commands that do run see the change
     const orExits = cmds[i + 1]?.sep === '||' && ['exit', 'return'].includes(cmds[i + 1].argv[0]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&';
     // (c.depth > 0: a command of a `bash -c` / eval text runs only when that command does. A cd is also lost in a pipeline stage, but a script that ran in one still switched the repository's branch: that is for the words only.)
-    // (a command of a `bash -c` / eval text runs when the command that holds the text does, under ITS operator: `true || bash -c 'cd d' && x`)
-    let op = c;
-    if (c.depth > 0) for (let j = i - 1; j >= 0; j--) if (cmds[j].depth < c.depth) { op = cmds[j]; break; }
-    const mayNotRun = inFlow(from, i) || op.negated === true || c.depth > 0 || op.sep === '&&' || op.sep === '||' || cmds[i + 1]?.sep === '&' || (cmds[i + 1]?.sep === '||' && !orExits);
+    // (#352 R9-B1 R9-F1: a command of a `bash -c` / eval text or a substitution runs when EVERY command that holds the text does, under each one's operator: `true || bash -c 'cd d' && x`, `true || bash -c "bash -c 'cd d'" && x`.
+    // The ones that hold it come from the parser (c.up, outermost first), not from a search of the commands before it: a substitution's holder is emitted AFTER its commands. orChanged is the OR of its own operator and every one of them.)
+    const ups = c.up ?? [];
+    const orOp = c.sep === '||' || c.negated === true || ups.some((u) => u.sep === '||' || u.negated === true);
+    // (R9-F4: a pipeline a `&` ends is a background job whichever stage the change is in: the parser marks all its commands, nested ones included)
+    const mayNotRun = inFlow(from, i) || c.negated === true || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ups.some((u) => u.sep === '&&' || u.sep === '||' || u.negated === true) || c.bg === true || cmds[i + 1]?.sep === '&' || (cmds[i + 1]?.sep === '||' && !orExits);
     const wordMayNotRun = mayNotRun || ranInSubshell(cmds, i);
     const before = mayNotRun && argv.length ? stateMark(ctx) : null;
     const changesStateWords = argv.length > 0 && (DIR_CHANGERS.includes(baseName(argv[0])) || (baseName(argv[0]) === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l')));
@@ -3281,11 +3283,13 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (startupList.some((st) => !st.implicit)) withStartupScope(c, ctx, judgeRest); else judgeRest();
     }
     if (verdict && verdict.decision === 'deny') return verdict;
+    // (#352 R9 scan: an alias that a command which may not run (re)defined is unsure for every later use, as for a speculative candidate (judgeScopedIn): the use is refused, whatever the value the walk gave it)
+    if (before) for (const [kind, then, now] of [['git', before.git, ctx.gitAliases], ['gh', before.gh, ctx.ghAliases]]) for (const n of new Set([...Object.keys(then), ...Object.keys(now)])) if (then[n] !== now[n]) ctx.aliasUnsure.add(`${kind}:${n.toLowerCase()}`);
     const wordChange = changesStateWords && wordMayNotRun;
     if (wordChange || (mayNotRun && stateChanged(ctx, before))) {
       flags.uncertain = true;
       if (wordChange) flags.lostDir = true;
-      if (op.sep === '||' || op.negated === true) flags.orChanged = true; // (a negated command: its && successor runs when it failed)
+      if (orOp) flags.orChanged = true; // (a negated command: its && successor runs when it failed; R9: a negated pipeline or group, a command behind || at any level)
     }
     markPackageState(ctx.budget, [argv], { dirs: dir === null ? null : [dir], expand: (w) => expandVars(w, ctx), home: ctx.home, p: path }); // (what this command may change, for the package scripts after it)
     if (SOURCING.includes(name)) {

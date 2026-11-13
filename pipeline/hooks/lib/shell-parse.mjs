@@ -20,6 +20,12 @@ const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)\+?=/;
 const CTL_COUNTER = { loop: 'loop', fn: 'fn', if: 'cond', case: 'cond', cbrace: 'cond' }; // (cbrace: a { group after && / || / |)
 // (a loop's id: each `for` / `while` / `until` header of one parse gets the next number; a command carries the ids of the loops it is in, outermost first: cmd.loops)
 const ctlDec = (ctx, kind) => { if (CTL_COUNTER[kind]) ctx.ctl[CTL_COUNTER[kind]]--; if (kind === 'loop') ctx.loops = ctx.loops.slice(0, -1); };
+// (#352 R9-F2: where a command is emitted, relative to the segment that owes the may-skip mark: 'same' level (same subshells, same text depth), 'inside' (a command of a subshell / text it opened), or 'outside')
+const relLevel = (o, grp, depth) => {
+  if (o.grp.length > grp.length || !o.grp.every((id, k) => grp[k] === id) || depth < o.depth) return 'outside';
+  return grp.length === o.grp.length && depth === o.depth ? 'same' : 'inside';
+};
+const segNeg = (seg) => !!(seg.negLead || seg.negIn || seg.negPipe);
 const ctlMarks = (c) => ({ loop: c.loop > 0, fn: c.fn > 0, trap: c.trap > 0, cond: c.cond > 0 });
 const LOOP_WORDS = new Set(['while', 'until', 'for', 'select', 'repeat', 'foreach']);
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
@@ -2058,9 +2064,17 @@ function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';', afterClose 
   noteRedef(ctx, argv, env);
   if (ctx.out.length >= MAX_COMMANDS) { ctx.truncated = true; ctx.stopped = true; return null; }
   // (#352 R8-F1: a may-skip mark stays pending until a command that carries it is emitted: a segment that emitted nothing left it in ctx.owedClose, and the next command chained with && takes it)
-  if (sep === '&&' && ctx.owedClose) afterClose = true;
-  ctx.owedClose = false;
+  // (R9-F2: a command of a deeper subshell / text neither takes nor clears the mark: it belongs to the segment at the level that owes it)
+  if (ctx.owedClose) {
+    const rel = relLevel(ctx.owedClose, ctx.grp, depth);
+    if (rel !== 'inside') {
+      if (rel === 'same' && sep === '&&') afterClose = true;
+      ctx.owedClose = null;
+    }
+  }
   const cmd = { argv, env, raw, depth, redirects };
+  // up (#352 R9-B1 R9-F1): the operator and negation of every level that holds the text this command is in (a `bash -c` / eval text: the holder's own operator, negation included; a substitution: its holder's operator), outermost first. Not enumerable
+  Object.defineProperty(cmd, 'up', { value: ctx.up, enumerable: false });
   // grp: the subshells (`$( )`, `( )`, backticks, `<( )`) it runs inside, outermost first, as ids: a cd in one is lost when it ends. Not enumerable
   Object.defineProperty(cmd, 'grp', { value: ctx.grp, enumerable: false });
   // ctl: it is in a loop (may run again after a later command), a function body or a trap action (runs when called / when the signal fires: maybe after any command),
@@ -2097,6 +2111,10 @@ class Parser {
     this.ctlFrom = []; // ctx.out length when each open construct opened
     this.ctlStack = []; // loops / function bodies / { groups open (see ctlOpen), for every nesting level of this text
     this.ctlBase = 0; // where the current level's entries start
+    this.ctlNeg = []; // for each open construct: it was opened under a `!` (its commands are negated, see ctx.neg)
+    this.ctlPS = []; // and the start of the pipeline it was opened in (an index of ctx.out), for a `&` after its closer
+    this.pipeStart = ctx.out.length; // the first command of the pipeline being read (ctx.out index): a `&` after it makes all of them a background job (cmd.bg)
+    this.lastClosePS = 0;
     ctx.work += src.length;
     if (ctx.work > MAX_WORK) { ctx.stopped = true; ctx.truncated = true; }
   }
@@ -2112,29 +2130,37 @@ class Parser {
 
   // Parses text found inside this one (backticks, bash -c, eval, ...) as its own script at `depth`.
   // Returns the segments that parse interpreted (used to find what a substitution prints).
-  subParse(text, depth) {
+  // (hold: the levels that hold the text, see emit: up. While a command is being finished (finalize) it is that command's own, ctx.upHold; from the lexer, the current text's levels and the operator being read)
+  subParse(text, depth, hold = this.ctx.upHold ?? [...this.ctx.up, { sep: this.lexOp?.().sep ?? ';', negated: false }]) {
     const ctx = this.ctx;
     if (depth > ctx.maxDepth) { ctx.truncated = true; return []; }
     const p = new Parser(ctx, text);
+    const up = ctx.up;
+    const upHold = ctx.upHold;
+    ctx.up = hold;
+    ctx.upHold = null;
     try {
       p.parseTop(depth);
     } catch {
       ctx.truncated = true;
       try { p.drain(true); } catch { /* best effort */ }
-    }
+    } finally { ctx.up = up; ctx.upHold = upHold; }
     return p.log;
   }
 
   // Parses in place (same source string) so quoting and heredocs inside $( ) / ( ) stay correct.
   nestParse(depth, opts) {
     const ctx = this.ctx;
-    if (depth > ctx.maxDepth) {
-      ctx.truncated = true;
-      ctx.muted++;
-      try { this.parseList(depth, opts); } finally { ctx.muted--; }
-    } else {
-      this.parseList(depth, opts);
-    }
+    const stage = this.pipeStart; // (the pipeline the group is part of goes on after it)
+    try {
+      if (depth > ctx.maxDepth) {
+        ctx.truncated = true;
+        ctx.muted++;
+        try { this.parseList(depth, opts); } finally { ctx.muted--; }
+      } else {
+        this.parseList(depth, opts);
+      }
+    } finally { this.pipeStart = stage; }
   }
 
   // `$(`, `<(` or `>(` at this.i: parse the body as commands, return the original text of the whole construct.
@@ -2163,7 +2189,7 @@ class Parser {
       body += c;
       this.i++;
     }
-    this.subAcc.push(...this.inGroup(() => this.subParse(body, depth + 1)));
+    this.subAcc.push(...this.inGroup(() => this.subParse(body, depth + 1, this.ctx.up), undefined, true));
     return s.slice(start, this.i);
   }
 
@@ -2270,7 +2296,7 @@ class Parser {
       try {
         // No terminator: either a malformed command or a `<<` we mistook for a heredoc that then swallowed the rest
         // of the line. Parsing the body as script costs a false positive at worst, never a miss.
-        if (!found) this.subParse(text, h.seg.depth + 1);
+        if (!found) this.subParse(text, h.seg.depth + 1, [...h.seg.up, { sep: h.seg.sep, negated: segNeg(h.seg) }]);
         // An unquoted heredoc still expands $(...) and backticks, so a body can run commands. Quoted ones are inert data.
         else if (!h.quoted) this.scanExpansions(text, h.seg.depth);
       } finally { this.ctx.grp = grp; }
@@ -2306,7 +2332,7 @@ class Parser {
     try { this.lex(depth, stopAtParen, noRedir); } finally {
       this.lexOp = outerOp;
       ctx.nest--; this.subAcc = saved;
-      while (this.ctlStack.length > this.ctlBase) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); ctlDec(ctx, kind); } // (left open: ends with the level)
+      while (this.ctlStack.length > this.ctlBase) this.popCtl(); // (left open: ends with the level)
       this.ctlBase = base;
     }
   }
@@ -2340,6 +2366,7 @@ class Parser {
     let gCur = 0; // index in `cur` just after it
     let gGlob = false; // the word before the group holds a glob character
     let lastSep = ';';
+    let lastNeg = false; // (the stage before a `|` was negated: `! a | b` negates the pipeline, so b's commands too)
     let lastAfterClose = false; // (the `&&` just read follows the closer of a construct that may have skipped its body: the next segment takes it, see emit)
     // the operator before the command being read (a substitution in its words runs under it, see inGroup)
     this.lexOp = () => (seg ? { sep: seg.sep, afterClose: seg.afterClose } : { sep: lastSep, afterClose: lastSep === '&&' && lastAfterClose });
@@ -2355,7 +2382,9 @@ class Parser {
           words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, fns: ctx.fns, defs: ctx.defs, cmd: null, meta: new Map(), win: new Map(),
           start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl), loops: ctx.loops,
           pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep, afterClose: lastSep === '&&' && lastAfterClose,
+          up: ctx.up, negIn: ctx.neg > 0, negPipe: lastSep === '|' && lastNeg, negLead: false, // (negation: R9-F3; up: R9-F1)
         };
+        if (lastSep !== '|') this.pipeStart = ctx.out.length;
         lastAfterClose = false;
       }
     };
@@ -2430,6 +2459,7 @@ class Parser {
       }
       const top = cs[cs.length - 1];
       const cmdPos = seg.kwOnly !== false; // every word before this one is an unquoted keyword or `{` (kept as it goes: a rescan per word is quadratic)
+      if (cmdPos && q < 0 && text === '!') seg.negLead = true; // (R9-F3: a `!` in front: the command, group, pipeline or construct that follows is negated)
       // (`time` and its options before a compound command: `time if ...; fi` -- review of #50)
       const timeOpt = seg.timePrefix === true && /^(?:-[A-Za-z]+|--)$/.test(text);
       seg.kwOnly = cmdPos && q < 0 && (KEYWORDS.has(text) || text === '{' || text === 'time' || timeOpt);
@@ -2438,7 +2468,7 @@ class Parser {
       else if (top?.st === 'in') { if (q < 0 && text === 'in') top.st = 'pat'; else { cs.pop(); this.ctlClose(['case']); } } // `case x {` (zsh) and the like: patterns read as commands (strict)
       else if (q < 0 && cmdPos && text === 'esac' && (top?.st === 'body' || top?.st === 'end')) { cs.pop(); seg.closesFrom = this.ctlClose(['case']); }
       else if (q < 0 && cmdPos && text === 'esac') ctx.ctlBroken = true; // (an esac with no case we opened: a prefix we do not model hid it)
-      else if (q < 0 && cmdPos && text === 'case') { cs.push({ st: 'subj' }); this.ctlOpen('case'); seg.ctl = { ...seg.ctl, cond: true }; }
+      else if (q < 0 && cmdPos && text === 'case') { cs.push({ st: 'subj' }); this.ctlOpen('case', segNeg(seg)); seg.ctl = { ...seg.ctl, cond: true }; }
       // loops, if / case branches and function bodies (see emit: ctl): `while`/`for`/... open a loop (its own words loop too), `done` closes one; `if`/`fi`, `case`/`esac` likewise; a `{` after `f()` (or
       // `function f`) opens a function body, any other command-position `{` a plain group; `}` closes the last of those
       // (`function NAME` -- after keywords or `time`, its `{` on this line or the next: every word up to the `{` / `(` is a name the text defines)
@@ -2446,15 +2476,15 @@ class Parser {
       if (q < 0 && cmdPos && text === 'function') seg.fnActive = true;
       else if (seg.fnActive && text !== '{') { fnName = true; ctx.fns.add(text); seg.fnHasName = true; }
       const fnKw = text === '{' && seg.fnActive === true && seg.fnHasName === true;
-      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop'); seg.ctl = { ...seg.ctl, loop: true }; seg.loops = this.ctx.loops; }
-      else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if'); seg.ctl = { ...seg.ctl, cond: true }; }
+      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop', segNeg(seg)); seg.ctl = { ...seg.ctl, loop: true }; seg.loops = this.ctx.loops; }
+      else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if', segNeg(seg)); seg.ctl = { ...seg.ctl, cond: true }; }
       else if (q < 0 && cmdPos && text === 'fi') seg.closesFrom = this.ctlClose(['if']);
       else if (q < 0 && cmdPos && text === 'done') seg.closesFrom = this.ctlClose(['loop']);
       else if (q < 0 && cmdPos && text === '}') seg.closesFrom = this.ctlClose(['fn', 'brace', 'cbrace']);
       else if (q < 0 && (cmdPos || fnKw) && text === '{') {
         // (a plain group after && / || runs only when that holds, and one that is a pipeline stage runs in a subshell: its commands may not run here -- review of #50)
         const kind = fnPending || fnKw ? 'fn' : ['&&', '||', '|'].includes(seg.sep) ? 'cbrace' : 'brace';
-        this.ctlOpen(kind);
+        this.ctlOpen(kind, kind !== 'fn' && segNeg(seg));
         if (kind === 'fn') seg.ctl = { ...seg.ctl, fn: true }; // (the body's first command is in this segment: `{ echo x > f; }`)
         if (kind === 'cbrace') seg.ctl = { ...seg.ctl, cond: true };
       }
@@ -2470,6 +2500,7 @@ class Parser {
       seg.raw = s.slice(seg.start, Math.min(idx, n)).trim();
       this.queue.push(seg);
       this.lastStage = seg.groupStage ?? [seg];
+      lastNeg = segNeg(seg);
       seg = null;
       this.drain(false);
     };
@@ -2585,7 +2616,7 @@ class Parser {
       } else if (c === '&') {
         const nx = s[this.i + 1];
         if (nx === '&') { flushWord(); const closed = seg?.closesFrom; const kind = this.lastCloseKind; endSeg(this.i); lastSep = '&&'; lastAfterClose = closed !== undefined && this.closeMaySkip(kind, closed); this.i += 2; }
-        else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; endSeg(this.i); this.markClosedOut(closed); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
+        else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; const from = closed !== undefined ? Math.min(this.lastClosePS, this.pipeStart) : this.pipeStart; endSeg(this.i); this.markClosedOut(closed); this.markBackground(from); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
         else if (nx === '>' && !noRedir) {
           flushWord(); startSeg();
           redir = 'file'; rfd = null;
@@ -2596,7 +2627,7 @@ class Parser {
         flushWord(); // (`}|cat`: the closing word first)
         const closed = seg?.closesFrom;
         endSeg(this.i);
-        if (nx !== '|') this.markClosedOut(closed);
+        if (nx !== '|') { this.markClosedOut(closed); if (closed !== undefined) this.pipeStart = Math.min(this.lastClosePS, this.pipeStart); }
         if (nx === '|') { lastSep = '||'; this.i += 2; }
         else if (nx === '&') { lastSep = '|'; this.i += 2; }
         else { lastSep = '|'; this.i++; }
@@ -2647,10 +2678,13 @@ class Parser {
           const body = fnPending; // (this group is the body of the function named just before it)
           // (a subshell after && / || runs only when that holds, and one that is a pipeline stage runs apart: its commands may not run, as for a { } group (cbrace).
           // `{ cat a; true || (cat x); cat c; } | bash` runs a+c, which the join a+x+c hid)
-          const cond = !body && !(seg && seg.words.length) && ['&&', '||', '|'].includes(lastSep);
-          const opened = { sep: lastSep, afterClose: lastSep === '&&' && lastAfterClose }; // (the operator before the subshell, see inGroup)
+          const cond = !body && !(seg && seg.words.length && seg.kwOnly === false) && ['&&', '||', '|'].includes(seg ? seg.sep : lastSep); // (R9-F2: a `!` in front is no command)
+          const opened = this.lexOp(); // (the operator before the subshell, see inGroup: of the open segment when there is one, a `!` for one, R9-F2)
+          const negHere = !!(seg && segNeg(seg)); // (R9-F3: `! ( ... )`: its commands are negated)
+          const stageStart = seg ? this.pipeStart : lastSep !== '|' ? ctx.out.length : this.pipeStart;
           endSeg(this.i);
           lastSep = ';';
+          if (negHere) ctx.neg++;
           this.i++;
           if (depth === 0) this.ctx.subshell = true; // ((...)) arithmetic too: conservative (and the `()` of `f()`: flowStart reads it as "from here on, maybe later")
           const mark0 = this.log.length;
@@ -2658,7 +2692,9 @@ class Parser {
           if (cond) this.ctx.ctl.cond++;
           try {
             this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || (s[this.i] === '(' && closesAsArith(s, this.i - 1, 2)) }), opened); // ((...)) is arithmetic when it closes as `))`; `((cmd) )` is nested subshells, redirects and all
-          } finally { if (body) this.ctx.ctl.fn--; if (cond) this.ctx.ctl.cond--; }
+          } finally { if (body) this.ctx.ctl.fn--; if (cond) this.ctx.ctl.cond--; if (negHere) ctx.neg--; }
+          this.pipeStart = stageStart;
+          lastNeg = negHere;
           fnPending = false;
           if (head?.length) { for (const name of head) ctx.fns.add(name); fnPending = true; }
           // Why: the group's own commands print into the pipe; a substitution's body (`{ X=$(cat x); cat a; cat b; } | bash`, one level deeper) prints into its word, not the
@@ -2782,24 +2818,39 @@ class Parser {
     this.ctx.loops = seg.loops;
     this.ctx.ctl = { loop: +seg.ctl.loop, fn: +seg.ctl.fn, trap: +seg.ctl.trap, cond: +seg.ctl.cond };
     this.ctx.grp = seg.grp; // (what it runs, `bash -c` text included, is in the subshells it was written in, wherever the queue finishes it)
+    const up = this.ctx.up;
+    const upHold = this.ctx.upHold;
+    this.ctx.up = seg.up; // (and in the texts that hold it; the text it holds is held by it too: see subParse)
+    this.ctx.upHold = [...seg.up, { sep: seg.sep, negated: segNeg(seg) }];
     try {
       const out0 = this.ctx.out.length;
       this.finalizeSeg(seg);
-      if (seg.afterClose && this.ctx.out.length === out0) this.ctx.owedClose = true; // (it emitted nothing: the mark waits for the next command, see emit)
+      if (seg.afterClose && this.ctx.out.length === out0) this.ctx.owedClose = { grp: seg.grp, depth: seg.depth }; // (it emitted nothing: the mark waits for the next command of ITS level, see emit)
     } catch {
       // never lose the command to an unexpected failure: report its words as written and say we were cut short
       this.ctx.truncated = true;
       const argv = seg.words.map((w) => w.text);
       if (argv.length) emit(this.ctx, argv, {}, seg.raw, seg.depth, [...seg.redirects]);
-    } finally { this.ctx.grp = grp; this.ctx.ctl = ctl; this.ctx.loops = loops; }
+    } finally { this.ctx.grp = grp; this.ctx.ctl = ctl; this.ctx.loops = loops; this.ctx.up = up; this.ctx.upHold = upHold; }
   }
 
   // A loop / function body / plain `{` group opens at this nesting level (closed by ctlClose, or when the level ends: see parseList).
-  ctlOpen(kind) {
+  ctlOpen(kind, neg = false) {
     this.ctlStack.push(kind);
     this.ctlFrom.push(this.ctx.out.length);
+    this.ctlNeg.push(neg);
+    this.ctlPS.push(this.pipeStart);
+    if (neg) this.ctx.neg++;
     if (CTL_COUNTER[kind]) this.ctx.ctl[CTL_COUNTER[kind]]++;
     if (kind === 'loop') this.ctx.loops = [...this.ctx.loops, ++this.ctx.loopSeq];
+  }
+
+  popCtl() {
+    const kind = this.ctlStack.pop();
+    this.ctlFrom.pop();
+    this.ctlPS.pop();
+    if (this.ctlNeg.pop()) this.ctx.neg--;
+    ctlDec(this.ctx, kind);
   }
 
   // Closes the last open construct of one of `kinds` at this level, and whatever was opened after it; nothing when there is none.
@@ -2808,7 +2859,8 @@ class Parser {
       if (!kinds.includes(this.ctlStack[k])) continue;
       const from = this.ctlFrom[k];
       this.lastCloseKind = this.ctlStack[k];
-      while (this.ctlStack.length > k) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); ctlDec(this.ctx, kind); }
+      this.lastClosePS = this.ctlPS[k];
+      while (this.ctlStack.length > k) this.popCtl();
       return from;
     }
     this.ctx.ctlBroken = true; // (a closer with no opener we saw: a prefix we do not model hid it (`nocorrect if ...`), so the marks are not to be trusted)
@@ -2823,6 +2875,12 @@ class Parser {
     return this.ctx.out.slice(from).some((c) => c.ctl.cond || c.ctl.loop);
   }
 
+  // (#352 R9-F4: every command of the pipeline that a `&` ends, nested ones included, is a background job: bg. Not enumerable. Commands still waiting for a heredoc are not out yet: the marks are not to be trusted)
+  markBackground(from) {
+    if (this.queue.length) this.ctx.ctlBroken = true;
+    for (const c of this.ctx.out.slice(from)) Object.defineProperty(c, 'bg', { value: true, enumerable: false, configurable: true });
+  }
+
   // The commands of a construct that closed right before `|` or a background `&` ran in a subshell: they may not run in this shell (marked cond). Commands still
   // waiting for a heredoc are not out yet: the marks are then not to be trusted.
   markClosedOut(from) {
@@ -2834,12 +2892,19 @@ class Parser {
   // Runs fn with one more subshell open (see emit: grp).
   // (#352 R8-F2: op = the operator that came before the subshell, { sep, afterClose }: a walk applies the may-not-run rule for it when it enters the subshell, so what it saves is settled.
   // A substitution takes the operator of the command it is in (lexOp); anything else, none known: `;`, which trusts nothing.)
-  inGroup(fn, op = this.lexOp?.() ?? { sep: ';', afterClose: false }) {
+  // (holds: a substitution, which runs under the operator of the command it is in: its commands carry that operator, see emit: up. R9-F2: a may-skip mark still owed at this level is part of the operator)
+  inGroup(fn, opIn, holdsIn) {
+    let op = opIn ?? this.lexOp?.() ?? { sep: ';', afterClose: false };
+    const holds = holdsIn ?? opIn === undefined;
     const saved = this.ctx.grp;
+    const savedUp = this.ctx.up;
     const id = ++this.ctx.grpN;
+    const owed = this.ctx.owedClose;
+    if (op.sep === '&&' && !op.afterClose && owed && relLevel(owed, saved, owed.depth) === 'same') op = { sep: op.sep, afterClose: true };
     this.ctx.grp = [...saved, id];
     this.ctx.grpOps.set(id, op);
-    try { return fn(); } finally { this.ctx.grp = saved; }
+    if (holds) this.ctx.up = [...savedUp, { sep: op.sep, negated: false }];
+    try { return fn(); } finally { this.ctx.grp = saved; this.ctx.up = savedUp; }
   }
 
   finalizeSeg(seg) {
@@ -2885,7 +2950,7 @@ class Parser {
       else if (w.text === 'function' && i + 1 < words.length) i += 2;
       else break;
     }
-    seg.negated = words.slice(0, i).some((w) => w.text === '!' && w.qa < 0); // (`! cmd`: its status is inverted, so a command chained with && after it runs when cmd FAILED)
+    if (words.slice(0, i).some((w) => w.text === '!' && w.qa < 0)) seg.negated = true; // (`! cmd`: its status is inverted, so a command chained with && after it runs when cmd FAILED. R9-F3: never taken back by the next group of the segment: `! { cmd; }`)
     const env = {};
     // PowerShell: `$env:NAME = "v"` / `$env:NAME="v"` sets an environment variable
     const ps = i < words.length ? PS_ENV_RE.exec(words[i].text) : null;
@@ -2983,7 +3048,7 @@ class Parser {
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
     if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
-    if (cmd && seg.negated) Object.defineProperty(cmd, 'negated', { value: true, enumerable: false }); // (#352 R8: see git-policy's may-not-run rule)
+    if (cmd && (seg.negated || segNeg(seg))) Object.defineProperty(cmd, 'negated', { value: true, enumerable: false }); // (#352 R8: see git-policy's may-not-run rule)
     if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
     if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
     // the words that are exactly one command substitution (`for f in $(cmd)`): see wspans (#81)
@@ -3297,7 +3362,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, loops: [], loopSeq: 0, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, owedClose: false, grpOps: new Map(), muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, loops: [], loopSeq: 0, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, owedClose: null, up: [], upHold: null, neg: 0, grpOps: new Map(), muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not

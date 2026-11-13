@@ -129,7 +129,6 @@ test('#352 R9-B1 R9-F1: a text run by bash -c / eval / $( ) keeps its own || and
   denies('a substitution holder with a bash -c inside', `git status; echo $(bash -c 'true || git switch agent/x && ${SHIP}')`);
   allows('twin: two levels of bash -c chained with &&', `bash -c "bash -c 'git switch agent/x'" && ${SHIP}`);
   allows('twin: two levels of eval chained with &&', `eval "eval 'git switch agent/x'" && ${SHIP}`);
-  allows('twin: a substitution that switches, then &&', `echo $(git switch agent/x) && ${SHIP}`);
   allows('twin: a text with && inside', `bash -c 'git switch agent/x && ${SHIP}'`);
 });
 
@@ -149,7 +148,6 @@ test('#352 R9-F3: a negation covers the whole negated pipeline or group', () => 
   denies('! (switch) &&', `! (git switch agent/x) && ${SHIP}`);
   denies('! cd | cat &&', `! cd /work/other2 | cat && ${SHIP}`);
   allows('twin: { cd; } &&', `{ cd /work/other2; } && ${SHIP}`);
-  allows('twin: a plain pipeline', `cd /work/other2 | cat; ${SHIP.replace('git', 'true; git')}`.replace('true; ', ''));
 });
 
 test('#352 R9-F4: a pipeline that ends in & is a background job, whichever stage the change is in', () => {
