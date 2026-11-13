@@ -27,6 +27,7 @@ const INTERPRETERS = Object.freeze(['node', 'sh', 'bash', 'zsh']);
 const NOT_A_SCRIPT = /^(?:node|nodejs|sh|bash|zsh|dash|fish|env|python[0-9.]*|perl|ruby|deno|bun|npx|npm|pnpm|yarn|osascript|php|cmd|powershell|pwsh)(?:\.exe|\.cmd|\.bat)?$/i;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const HOME_MARK = '\u0001HOME\u0001'; // stands for the home folder while a command is split into words
+const ROOT_MARK = '\u0002'; // stands for the plugin install path (CLAUDE_PLUGIN_ROOT) while a command is split into words
 const SHELL_CHARS = '|&;<>()`\\*?[]{}!#$';
 const OPEN_READ = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0);
 const OPEN_EXCL = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
@@ -90,16 +91,17 @@ export function matcherMatchesDialog(matcher, tool = DIALOG_TOOL) {
   }
 }
 
-// (Windows) A hook command written for Windows holds backslash paths (`node C:\Users\me\.claude\hooks\x.mjs`). On win32 a backslash is a path separator, not an escape, so words() keeps it; on any other platform it stays
-// an escape and is refused. Only a drive-letter path counts as absolute there (UNC is refused, below) (a rooted `\x` or a drive-relative `C:x` is ambiguous: refused).
+// (Windows) Claude Code runs a command hook on Windows under Git Bash, where an unquoted backslash is an escape the shell removes: words() therefore refuses a backslash on EVERY platform (unquoted or inside
+// double quotes), and a Windows path is written with forward slashes (`node C:/Users/me/x.mjs`) or in single quotes. Only a drive-letter path counts as absolute there (UNC is refused, below) (a rooted `\x` or a
+// drive-relative `C:x` is ambiguous: refused). The already-split target is then normalised to native separators (scriptTarget), so it matches the path the file is opened by.
 const isWin = (platform) => platform === 'win32';
 const pathOf = (platform) => (isWin(platform) ? path.win32 : path);
 // A UNC / `//server` path is refused (#269: reading a network share to fingerprint it can leak credentials and the bytes can change between hash and run).
 const isAbsoluteOn = (p, platform) => (isWin(platform) ? /^[A-Za-z]:[\\/]/.test(p) && path.win32.isAbsolute(p) : path.isAbsolute(p));
 
 // Words of a simple command line: whitespace separates, '...' and "..." group. Anything a shell would interpret (pipes, redirects, substitutions, globs, escapes, variables other than a leading HOME) -> null.
-function words(text, platform = process.platform) {
-  const shellChars = isWin(platform) ? SHELL_CHARS.replace('\\', '') : SHELL_CHARS;
+// `rootRisky`: the plugin install path would be split or expanded by a shell when written unquoted, so an unquoted ROOT_MARK is refused.
+function words(text, rootRisky = false) {
   const out = [];
   let cur = '';
   let has = false;
@@ -109,7 +111,7 @@ function words(text, platform = process.platform) {
     if (quote === "'") { if (c === "'") quote = null; else cur += c; continue; }
     if (quote === '"') {
       if (c === '"') quote = null;
-      else if (c === '$' || c === '`' || (c === '\\' && !isWin(platform))) return null;
+      else if (c === '$' || c === '`' || c === '\\') return null;
       else cur += c;
       continue;
     }
@@ -119,7 +121,7 @@ function words(text, platform = process.platform) {
       if (has) { out.push(cur); cur = ''; has = false; }
       continue;
     }
-    if (shellChars.includes(c)) return null;
+    if (SHELL_CHARS.includes(c) || (rootRisky && c === ROOT_MARK)) return null;
     cur += c;
     has = true;
   }
@@ -139,19 +141,20 @@ export function resolveCommand(command, opts = {}) {
 export function commandTarget(command, { home, pluginRoot = null, platform = process.platform } = {}) {
   if (typeof command !== 'string' || command.trim() === '') return null;
   let text = command.trim();
-  if (pluginRoot) text = text.replace(/\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g, () => pluginRoot);
+  // (the install path never passes the shell-word rules: its own separators are the platform's, while anything the author typed after the variable still does; it goes in after the split, like the home folder)
+  if (pluginRoot) text = text.replace(/\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g, () => ROOT_MARK);
   text = text.replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, () => HOME_MARK).replace(/(^|[\s"'])~(?=\/)/g, (_m, lead) => lead + HOME_MARK);
-  const w = words(text, platform); // (a $ left after the expansions above is not a home reference: words() refuses it)
-  return scriptTarget(w, home, platform);
+  const w = words(text, !!pluginRoot && /[\s*?[\]{}!#$`&;<>()|'"]/.test(pluginRoot)); // (a $ left after the expansions above is not a home reference: words() refuses it)
+  return scriptTarget(w, home, platform, pluginRoot);
 }
 
 const isFile = (p) => { try { return statSync(p).isFile(); } catch { return false; } };
 
 // The script path a list of words names (see resolveCommand), or null; the file itself is not looked at. A Windows path is normalised (one separator form, so `~/x` + a backslash home gives the same string as path.join).
-export function scriptTarget(w, home, platform = process.platform) {
+export function scriptTarget(w, home, platform = process.platform, pluginRoot = null) {
   if (!w || w.length === 0) return null;
   const P = pathOf(platform);
-  const real = (s) => s.replaceAll(HOME_MARK, home);
+  const real = (s) => s.replaceAll(HOME_MARK, home).replaceAll(ROOT_MARK, pluginRoot ?? '');
   let target;
   if (INTERPRETERS.includes(w[0])) {
     if (w.length < 2) return null;

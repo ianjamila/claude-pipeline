@@ -6,7 +6,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { approveDialogHooks, checkDialogHooks, commandTarget, dialogHandlers, dialogHooksFile, hookCheck, matcherMatchesDialog, resolveCommand, tilde } from '../pipeline/hooks/lib/dialog-hooks.mjs';
 import { run } from '../pipeline/commands/owner-go.mjs';
+import { toPosix as posix } from '../pipeline/lib/paths.mjs';
 
+// A hook command is written the way a working Windows hook is (Git Bash: a forward-slash path; a backslash is an escape and is refused), while the script is still compared by its native path.
 const ADMIN = { ['PIPELINE_' + 'ADMIN']: '1' }; // (the owner's switch, built here so this file does not itself look like a script that sets it)
 
 // A temp account home (with ~/.claude), an empty project folder, and helpers. managedPaths is always injected: the real machine's managed settings are never read.
@@ -34,7 +36,7 @@ test('matcher: absent, "", "*", a regex that matches the dialog, an invalid rege
 test('a handler whose matcher cannot match the dialog, or on another event, is not collected', () => {
   const w = world();
   const f = w.script('.claude/hooks/a.mjs');
-  w.settings({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `node ${f}` }] }], PostToolUse: [{ hooks: [{ type: 'command', command: `node ${f}` }] }] } });
+  w.settings({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `node ${posix(f)}` }] }], PostToolUse: [{ hooks: [{ type: 'command', command: `node ${posix(f)}` }] }] } });
   const r = w.handlers();
   assert.equal(r.ok, true);
   assert.deepEqual(r.handlers, []);
@@ -44,7 +46,7 @@ test('a handler whose matcher cannot match the dialog, or on another event, is n
 test('an unlisted handler is not ok and the reason names it in plain words', () => {
   const w = world();
   const f = w.script('.claude/hooks/notify.mjs');
-  w.settings(hookEntry(`node ${f}`, 'AskUserQuestion|ExitPlanMode'));
+  w.settings(hookEntry(`node ${posix(f)}`, 'AskUserQuestion|ExitPlanMode'));
   const r = w.check();
   assert.equal(r.ok, false);
   assert.equal(r.reason, 'unlisted dialog hook ~/.claude/hooks/notify.mjs (PreToolUse AskUserQuestion|ExitPlanMode)');
@@ -64,7 +66,7 @@ test('~ and $HOME / ${HOME} in the command are expanded with the account home', 
 test('listed with the same bytes => ok; the bytes changed => not ok; a different command for the same script => not ok', () => {
   const w = world();
   const f = w.script('.claude/hooks/notify.mjs', 'console.log(1)\n');
-  w.settings(hookEntry(`node ${f}`));
+  w.settings(hookEntry(`node ${posix(f)}`));
   assert.equal(w.check().ok, false);
   const a = w.approve();
   assert.equal(a.ok, true);
@@ -81,7 +83,7 @@ test('listed with the same bytes => ok; the bytes changed => not ok; a different
   assert.notEqual(changed.hookLayersSha256, before, 'the fingerprint follows the script bytes');
   writeFileSync(f, 'console.log(1)\n');
   assert.equal(w.check().ok, true);
-  w.settings(hookEntry(`node ${f} --other`));
+  w.settings(hookEntry(`node ${posix(f)} --other`));
   assert.equal(w.check().ok, false, 'same script, other command: not the listed one');
 });
 
@@ -103,10 +105,10 @@ test('an inline sh -c on the dialog is unresolvable: not ok, and approve refuses
 test('commands that are not one script are unresolvable: npx, inline node, pipes, env prefixes, relative paths, a missing file, an interpreter as the script, a non-command hook', () => {
   const w = world();
   const f = w.script('.claude/hooks/ok.mjs');
-  for (const cmd of ['npx some-tool', 'node -e "1"', `node ${f} | cat`, `FOO=1 node ${f}`, 'node ./hooks/x.mjs', `node ${w.home}/missing.mjs`, '/usr/bin/env node /x.mjs', `node ${f}; true`, `node $(echo ${f})`, 'node "unterminated', '']) {
+  for (const cmd of ['npx some-tool', 'node -e "1"', `node ${posix(f)} | cat`, `FOO=1 node ${posix(f)}`, 'node ./hooks/x.mjs', `node ${posix(w.home)}/missing.mjs`, '/usr/bin/env node /x.mjs', `node ${posix(f)}; true`, `node $(echo ${posix(f)})`, 'node "unterminated', '']) {
     assert.equal(resolveCommand(cmd, { home: w.home }), null, cmd);
   }
-  assert.equal(resolveCommand(`node ${f}`, { home: w.home }), f);
+  assert.equal(resolveCommand(`node ${posix(f)}`, { home: w.home }), f);
   w.settings({ hooks: { PermissionRequest: [{ hooks: [{ type: 'prompt', prompt: 'allow?' }] }] } });
   const r = w.check();
   assert.equal(r.ok, false);
@@ -135,9 +137,9 @@ test('settings.local.json and the project settings are sources too', () => {
   const a = w.script('.claude/hooks/a.mjs');
   const b = w.script('project/hooks/b.mjs');
   const c = w.script('project/hooks/c.mjs');
-  w.settings(hookEntry(`node ${a}`), join(w.home, '.claude'), 'settings.local.json');
-  w.settings(hookEntry(`node ${b}`), join(w.cwd, '.claude'), 'settings.json');
-  w.settings(hookEntry(`node ${c}`), join(w.cwd, '.claude'), 'settings.local.json');
+  w.settings(hookEntry(`node ${posix(a)}`), join(w.home, '.claude'), 'settings.local.json');
+  w.settings(hookEntry(`node ${posix(b)}`), join(w.cwd, '.claude'), 'settings.json');
+  w.settings(hookEntry(`node ${posix(c)}`), join(w.cwd, '.claude'), 'settings.local.json');
   const h = w.handlers().handlers;
   assert.deepEqual(h.map((x) => x.scriptPath).sort(), [a, b, c].sort());
   assert.equal(w.check().ok, false);
@@ -151,7 +153,7 @@ test('the second account config dir (~/.claude-eaglewatch) is a source; a link t
   const w = world();
   const f = w.script('.claude/hooks/a.mjs');
   mkdirSync(join(w.home, '.claude-eaglewatch'), { recursive: true });
-  w.settings(hookEntry(`node ${f}`));
+  w.settings(hookEntry(`node ${posix(f)}`));
   symlinkSync(join(w.home, '.claude', 'settings.json'), join(w.home, '.claude-eaglewatch', 'settings.json'));
   const h = w.handlers().handlers;
   assert.equal(h.length, 2, 'one per config dir');
@@ -161,7 +163,7 @@ test('the second account config dir (~/.claude-eaglewatch) is a source; a link t
 test('managed settings are a source (injected path); an absent one is fine', () => {
   const w = world();
   const f = w.script('.claude/hooks/m.mjs');
-  const managed = w.json(join(w.home, 'managed', 'managed-settings.json'), hookEntry(`node ${f}`, 'AskUserQuestion'));
+  const managed = w.json(join(w.home, 'managed', 'managed-settings.json'), hookEntry(`node ${posix(f)}`, 'AskUserQuestion'));
   assert.equal(dialogHandlers({ home: w.home, cwd: w.cwd, managedPaths: [join(w.home, 'nope.json')] }).ok, true);
   const r = dialogHandlers({ home: w.home, cwd: w.cwd, managedPaths: [managed] });
   assert.equal(r.handlers.length, 1);
@@ -227,7 +229,7 @@ test('a settings file that exists but cannot be parsed makes the check not ok (a
 test('a malformed approved list is not ok', () => {
   const w = world();
   const f = w.script('.claude/hooks/a.mjs');
-  w.settings(hookEntry(`node ${f}`));
+  w.settings(hookEntry(`node ${posix(f)}`));
   assert.equal(w.approve().ok, true);
   writeFileSync(dialogHooksFile(w.home), '{ nope');
   const r = w.check();
@@ -241,18 +243,18 @@ test('the fingerprint changes when a handler is added, and not when nothing chan
   const b = w.script('.claude/hooks/b.mjs');
   const none = w.check().hookLayersSha256;
   assert.equal(w.check().hookLayersSha256, none);
-  w.settings(hookEntry(`node ${a}`));
+  w.settings(hookEntry(`node ${posix(a)}`));
   const one = w.check().hookLayersSha256;
   assert.notEqual(one, none);
   assert.equal(w.check().hookLayersSha256, one);
-  w.settings({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: `node ${a}` }, { type: 'command', command: `node ${b}` }] }] } });
+  w.settings({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: `node ${posix(a)}` }, { type: 'command', command: `node ${posix(b)}` }] }] } });
   assert.notEqual(w.check().hookLayersSha256, one);
 });
 
 test('hookCheck (the default for recordClick) reads the hook input cwd', () => {
   const w = world();
   const f = w.script('project/hooks/p.mjs');
-  w.settings(hookEntry(`node ${f}`), join(w.cwd, '.claude'));
+  w.settings(hookEntry(`node ${posix(f)}`), join(w.cwd, '.claude'));
   const without = hookCheck({ home: w.home, input: {} });
   assert.equal(without.ok, true);
   const withCwd = hookCheck({ home: w.home, input: { cwd: w.cwd } });
@@ -265,7 +267,7 @@ test('R1-F2: the project layer follows CLAUDE_PROJECT_DIR as well as cwd, and th
   const w = world();
   const launch = join(w.home, 'launch');
   const f = w.script('project/hooks/p.mjs');
-  w.json(join(launch, '.claude', 'settings.json'), hookEntry(`node ${f}`));
+  w.json(join(launch, '.claude', 'settings.json'), hookEntry(`node ${posix(f)}`));
   assert.equal(w.check().ok, true, 'cwd alone does not see the launch folder');
   const seen = w.check({ projectDirs: [launch] });
   assert.equal(seen.ok, false);
@@ -281,7 +283,7 @@ test('R1-F2: the project layer follows CLAUDE_PROJECT_DIR as well as cwd, and th
   assert.equal(a.hookLayersSha256, c.hookLayersSha256);
   // an account-wide handler still changes it
   const g = w.script('.claude/hooks/g.mjs');
-  w.settings(hookEntry(`node ${g}`));
+  w.settings(hookEntry(`node ${posix(g)}`));
   assert.notEqual(w.check({ projectDirs: [launch] }).hookLayersSha256, a.hookLayersSha256);
 });
 
@@ -386,7 +388,7 @@ const go = (argv, w, { env = {}, ancestor = false } = {}) =>
 test('owner-go dialog-hooks: read-only status, allowed anywhere', async () => {
   const w = world();
   const f = w.script('.claude/hooks/a.mjs');
-  w.settings(hookEntry(`node ${f}`));
+  w.settings(hookEntry(`node ${posix(f)}`));
   const r = await go(['dialog-hooks'], w, { env: { CLAUDECODE: '1' }, ancestor: true });
   assert.equal(r.exitCode, 1);
   assert.equal(r.output.ok, false);
@@ -404,7 +406,7 @@ test('owner-go dialog-hooks: read-only status, allowed anywhere', async () => {
 test('owner-go approve-dialog-hooks: refused inside Claude Code without the admin bypass, writes with it or outside', async () => {
   const w = world();
   const f = w.script('.claude/hooks/a.mjs');
-  w.settings(hookEntry(`node ${f}`));
+  w.settings(hookEntry(`node ${posix(f)}`));
   for (const [env, ancestor] of [[{ CLAUDECODE: '1' }, false], [{}, true]]) {
     const r = await go(['approve-dialog-hooks'], w, { env, ancestor });
     assert.equal(r.exitCode, 2);
@@ -435,7 +437,7 @@ test('owner-go approve-dialog-hooks: an unresolvable hook is refused with the of
 
 test('approveDialogHooks refuses inside Claude Code in the function itself (#273): CLAUDECODE=1 or an ancestor, nothing written; the owner switch lifts it', () => {
   const w = world();
-  w.settings(hookEntry(`node ${w.script('x/hook.mjs')}`));
+  w.settings(hookEntry(`node ${posix(w.script('x/hook.mjs'))}`));
   const outside = { hasClaudeCodeAncestor: () => false };
   const a = w.approve({ env: { CLAUDECODE: '1' }, ctx: outside });
   assert.equal(a.ok, false);
@@ -457,20 +459,51 @@ test('approveDialogHooks refuses inside Claude Code in the function itself (#273
 
 const WIN_HOME = 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\dialog-hooks-x';
 const WIN_SCRIPT = `${WIN_HOME}\\.claude\\hooks\\notify.mjs`;
+const WIN_POSIX = WIN_SCRIPT.replaceAll('\\', '/'); // the form a Git Bash hook is written in
 const win = (cmd, over = {}) => commandTarget(cmd, { home: WIN_HOME, platform: 'win32', ...over });
 
-test('windows: a backslash path, a forward-slash path, a quoted path and a ~ / $HOME path all resolve to the same normalised script', () => {
+test('windows: a forward-slash path, a single-quoted path and a ~ / $HOME path all resolve to the same normalised native script', () => {
   for (const cmd of [
-    `node ${WIN_SCRIPT}`,
-    `node "${WIN_SCRIPT}" --flag=1`,
-    `node ${WIN_SCRIPT.replaceAll('\\', '/')}`,
-    `${WIN_SCRIPT}`,
+    `node ${WIN_POSIX}`,
+    `node "${WIN_POSIX}" --flag=1`,
+    `${WIN_POSIX}`,
     'node ~/.claude/hooks/notify.mjs',
     'node $HOME/.claude/hooks/notify.mjs',
     'node "${HOME}/.claude/hooks/notify.mjs"',
     `node 'C:/Users/RUNNER~1/AppData/Local/Temp/dialog-hooks-x/.claude/hooks/notify.mjs'`,
+    `node '${WIN_SCRIPT}'`, // (single-quoted text is literal in Git Bash and PowerShell alike)
   ]) assert.equal(win(cmd), WIN_SCRIPT, cmd);
-  assert.equal(win('node ${CLAUDE_PLUGIN_ROOT}\\hooks\\a.mjs', { pluginRoot: 'D:\\plugins\\p' }), 'D:\\plugins\\p\\hooks\\a.mjs');
+});
+
+// Claude Code runs a command hook on Windows under Git Bash (docs/specs/2026-10-01-claude-pipeline-design.md): an unquoted backslash is removed by the shell and one in double quotes can escape a quote, so the checker
+// would hash a different script from the one that runs. Refused (a false refusal is the safe side) on every platform.
+test('windows: a backslash is refused unquoted and in double quotes (all-backslash path, bare path, before a space or a quote, mid-path, trailing) on Windows and elsewhere', () => {
+  for (const cmd of [
+    `node ${WIN_SCRIPT}`, `${WIN_SCRIPT}`, `node "${WIN_SCRIPT}" --flag=1`,
+    'node C:\\a.mjs', 'node C:/Users/me/pipeline\\hooks/owner-go.mjs', 'node C:/Users/me/dir\\ name/a.mjs', 'node C:/Users/me/\\"a.mjs', 'node "C:/Users/me/\\"a.mjs"',
+    'node C:/Users/me/a.mjs\\', `node ${WIN_POSIX} \\`, `node ${WIN_POSIX}\\`, `node "${WIN_POSIX}\\"`,
+  ]) {
+    assert.equal(win(cmd), null, cmd);
+    assert.equal(commandTarget(cmd, { home: '/h', platform: 'linux' }), null, `linux: ${cmd}`);
+  }
+});
+
+test('windows: ${CLAUDE_PLUGIN_ROOT} is the install path as it is (native separators); what the author types after it still follows the shell-word rules', () => {
+  const pluginRoot = 'D:\\plugins\\p';
+  const hook = 'D:\\plugins\\p\\hooks\\a.mjs';
+  assert.equal(win('node ${CLAUDE_PLUGIN_ROOT}/hooks/a.mjs', { pluginRoot }), hook);
+  assert.equal(win('node "${CLAUDE_PLUGIN_ROOT}/hooks/a.mjs"', { pluginRoot }), hook);
+  assert.equal(win('node $CLAUDE_PLUGIN_ROOT/hooks/a.mjs', { pluginRoot }), hook);
+  assert.equal(win('node ${CLAUDE_PLUGIN_ROOT}\\hooks\\a.mjs', { pluginRoot }), null, 'a backslash the author typed after the variable is an escape');
+  assert.equal(win('node ${CLAUDE_PLUGIN_ROOT}/hooks\\a.mjs', { pluginRoot }), null);
+  assert.equal(win('node "${CLAUDE_PLUGIN_ROOT}\\hooks\\a.mjs"', { pluginRoot }), null);
+  assert.equal(win('node ${CLAUDE_PLUGIN_ROOT}/hooks/a.mjs | cat', { pluginRoot }), null);
+  assert.equal(win('node ${CLAUDE_PLUGIN_ROOT}/hooks/a.mjs'), null, 'no plugin root: the variable is not expanded, and a $ is refused');
+  // a root a shell would split or expand is only taken when it is quoted
+  const spaced = 'D:\\My Plugins\\p';
+  assert.equal(win('node "${CLAUDE_PLUGIN_ROOT}/hooks/a.mjs"', { pluginRoot: spaced }), 'D:\\My Plugins\\p\\hooks\\a.mjs');
+  assert.equal(win('node ${CLAUDE_PLUGIN_ROOT}/hooks/a.mjs', { pluginRoot: spaced }), null);
+  assert.equal(commandTarget('node ${CLAUDE_PLUGIN_ROOT}/hooks/a.mjs', { home: '/h', platform: 'linux', pluginRoot: '/opt/p' }), '/opt/p/hooks/a.mjs');
 });
 
 test('windows: a network (UNC or //server) script path is refused: fingerprinting a share can leak credentials and its bytes can change', () => {
@@ -481,15 +514,15 @@ test('windows: a network (UNC or //server) script path is refused: fingerprintin
 test('windows: everything ambiguous stays unresolvable (rooted or drive-relative paths, relative paths, shell syntax, interpreters, escapes in a double quote)', () => {
   for (const cmd of [
     'node \\hooks\\a.mjs', 'node C:hooks\\a.mjs', 'node .\\hooks\\a.mjs', 'node hooks\\a.mjs', 'node ..\\a.mjs',
-    `node ${WIN_SCRIPT} | more`, `node ${WIN_SCRIPT} & echo`, `node ${WIN_SCRIPT}; echo`, `node $(echo ${WIN_SCRIPT})`, 'node -e "1"', 'node', 'npx tool',
+    `node ${WIN_POSIX} | more`, `node ${WIN_POSIX} & echo`, `node ${WIN_POSIX}; echo`, `node $(echo ${WIN_POSIX})`, 'node -e "1"', 'node', 'npx tool',
     'C:\\Windows\\System32\\cmd.exe', '"C:\\Program Files\\nodejs\\node.exe" x.mjs', 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
-    `node "${WIN_HOME}\\$X\\a.mjs"`, `node "${WIN_HOME}\\\`x\\a.mjs"`, 'node "C:\\unterminated',
+    'node "C:/Users/me/$X/a.mjs"', 'node "C:/Users/me/`x/a.mjs"', 'node "C:/unterminated', 'node C:a.mjs', 'node C:hooks/a.mjs', 'node /hooks/a.mjs',
   ]) assert.equal(win(cmd), null, cmd);
 });
 
-test('windows: a backslash is still an escape (refused) away from Windows, and a drive-letter path is not absolute there', () => {
+test('windows: a drive-letter path is not absolute away from Windows', () => {
   for (const platform of ['linux', 'darwin']) {
-    assert.equal(commandTarget(`node ${WIN_SCRIPT}`, { home: '/h', platform }), null, platform);
+    assert.equal(commandTarget(`node ${WIN_POSIX}`, { home: '/h', platform }), null, platform);
     assert.equal(commandTarget('node C:/x/a.mjs', { home: '/h', platform }), null, platform);
     assert.equal(commandTarget('node /x/a.mjs', { home: '/h', platform }), '/x/a.mjs');
   }

@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { cli, ghEntries, PR, REPO, scenario, ymlFor } from './helpers/gate-env.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
+import { toPosix } from '../pipeline/lib/paths.mjs';
 import { presentedRequests, presentedRoundRequest, presentedRuling, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 import { asksDir, readAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { run as mergeRun, dryRunMany, withAsk } from '../pipeline/commands/merge.mjs';
@@ -28,7 +29,7 @@ function addDialogHook(home, event = 'PreToolUse') {
   const dir = join(home, '.claude', 'hooks');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'notify.mjs'), 'process.exit(0)\n');
-  const entry = { ...(event === 'PreToolUse' ? { matcher: 'AskUserQuestion' } : {}), hooks: [{ type: 'command', command: `node ${join(dir, 'notify.mjs')}` }] };
+  const entry = { ...(event === 'PreToolUse' ? { matcher: 'AskUserQuestion' } : {}), hooks: [{ type: 'command', command: `node ${toPosix(join(dir, 'notify.mjs'))}` }] };
   writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({ hooks: { [event]: [entry] } }));
 }
 
