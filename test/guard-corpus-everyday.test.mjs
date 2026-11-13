@@ -1,5 +1,5 @@
 // PR #288 round 19 (owner-approved merge gate): everyday commands stay allowed. From a deep project directory, and (for the lines that do not lean on the cwd) from the home directory too.
-// A case marked todo is an over-denial the owner accepted for now; tracked in issue #373 (a larger mechanism would be needed). Home is /home/u. Synthetic lines only.
+// The over-denials of that round (a subshell, an if, a pipe, a brace group, git -C "$(git rev-parse --show-toplevel)") were fixed in issue #373 and are plain allow cases now. Home is /home/u. Synthetic lines only.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
@@ -86,14 +86,14 @@ const FROM_PROJECT = [
   "find . -name \"*.tmp\" -delete",
   "find . -name .DS_Store -delete",
 ];
-// over-denials from one directory that need a larger mechanism than this PR adds: node:test todo, tracked in issue #373
-const TODO = [
-  ["(cd /home/u/proj && git clean -fd)", "home"],
-  ["if cd /home/u/proj; then git clean -fd; fi", "home"],
-  ["cd /home/u/proj && git clean -fd | tail -5", "home"],
-  ["cd /home/u/proj && git clean -fd 2>&1 | tail -5", "home"],
-  ["git -C \"$(git rev-parse --show-toplevel)\" clean -fd", "home+project"],
-  ["cd /home/u/proj && { git clean -fd; }", "home"],
+// over-denials of round 19 (they were node:test todo cases, tracked in issue #373), allowed from the home directory and from the project directory
+const SHAPES = [
+  "(cd /home/u/proj && git clean -fd)",
+  "if cd /home/u/proj; then git clean -fd; fi",
+  "cd /home/u/proj && git clean -fd | tail -5",
+  "cd /home/u/proj && git clean -fd 2>&1 | tail -5",
+  "git -C \"$(git rev-parse --show-toplevel)\" clean -fd",
+  "cd /home/u/proj && { git clean -fd; }",
 ];
 
 describe('#288 R19 corpus: everyday commands stay allowed', () => {
@@ -111,11 +111,11 @@ describe('#288 R19 corpus: everyday commands stay allowed', () => {
       assert.equal(r.decision, 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
     });
   }
-  for (const [line, where] of TODO) {
+  for (const line of SHAPES) {
     for (const cwd of [HOME, DEEP]) {
-      test(`allows from ${cwd}: ${line}`, { todo: `over-denial (${where}), tracked in #373` }, () => {
+      test(`allows from ${cwd}: ${line}`, () => {
         const r = evaluateBashForFiles(line, { ...BASE, cwd });
-        assert.equal(r.decision, 'allow', `${JSON.stringify(line)} from ${cwd} -> ${r.decision}`);
+        assert.equal(r.decision, 'allow', `${JSON.stringify(line)} from ${cwd} -> ${r.decision}: ${r.reason}`);
       });
     }
   }

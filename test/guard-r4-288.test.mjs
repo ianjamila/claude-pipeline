@@ -120,10 +120,10 @@ describe('R4-F1: a relative word resolves where the command can run', () => {
     ['cwd home: git -C .. add .  from proj', 'git -C .. rm -r .'],
     ['cwd home: cd proj && cd .. && rm -rf .', 'cd proj && cd .. && rm -rf .', { cwd: HOME }],
     ['cwd home: make -C . clean-all style', 'make -C .. install', { cwd: PROJ }],
-    // (R9 whitelist: a `||` anywhere on the line turns the narrowing off, so this R4 allow case is now a deny)
-    ['cwd home: cd proj && git add . || echo failed', 'cd proj && git add . || echo failed', { cwd: HOME }],
   ]);
   allows('F1', [
+    // (R9 turned this R4 allow case into a deny, a `||` anywhere turning the narrowing off; #373 widened the whitelist: the `git add .` is read in proj, the `echo` after the `||` anywhere)
+    ['cwd home: cd proj && git add . || echo failed', 'cd proj && git add . || echo failed', { cwd: HOME }],
     ['cwd home: cd ~/Claude/proj && git add .', 'cd ~/Claude/proj && git add .', { cwd: HOME }],
     ['cwd home: git -C ~/Claude/proj add .', 'git -C ~/Claude/proj add .', { cwd: HOME }],
     ['cwd home: git -C proj add .', 'git -C proj add .', { cwd: HOME }],

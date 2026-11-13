@@ -22,6 +22,8 @@ const ctlMarks = (c) => ({ loop: c.loop > 0, fn: c.fn > 0, trap: c.trap > 0, con
 const LOOP_WORDS = new Set(['while', 'until', 'for', 'select', 'repeat', 'foreach']);
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
 // plainSeq (see simpleCommands): the words that, at the start of a command, are shell syntax and no plain simple command (a compound command, a keyword, a group, a coprocess, a function, `[[`)
+// shape (see simpleCommands): the words that may open or continue a whitelisted construct at the start of a segment (the rest of the segment is read as an ordinary plain command)
+const SHAPE_HEADS = new Set(['if', 'then', 'else', 'fi', '{', '}']);
 const NOT_PLAIN_HEAD = new Set([...KEYWORDS, ...LOOP_WORDS, 'case', 'select', 'function', 'time', 'always', '{', '}', '[[']);
 // A word right before a ( that opens a subshell, a condition or arithmetic (`if(true)`, `for((i=0;;))`), not a glob qualifier group.
 const LEAD_WORDS = new Set([...KEYWORDS, 'for', 'case', 'select', 'in', 'time', 'function', 'foreach', 'switch', 'catch', 'elseif', 'param', 'trap', 'return', 'exit', 'throw']);
@@ -2133,6 +2135,7 @@ function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
   // binPath: it is part of a script text a package runner runs (node_modules/.bin is on its PATH). Not enumerable
   if (ctx.binPath) Object.defineProperty(cmd, 'binPath', { value: true, enumerable: false });
   ctx.out.push(cmd);
+  if (depth === 0) ctx.n0++; // (the commands of the text's own level, counted for the shape events: see shapeEvent)
   return cmd;
 }
 
@@ -2782,7 +2785,7 @@ class Parser {
           if (noRedir || maybeArith) { cur += this.funsub(REFUSED_ARITH); continue; }
           const r = readAnsiC(s, this.i + 1); cur += r.text; this.i = r.next;
         }
-        else if (nx === '"') { mark(); ctx.ansiC = true; this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; takeSubs(); }
+        else if (nx === '"') { mark(); ctx.ansiC = true; ctx.dqTrans = true; this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; takeSubs(); }
         // (#269 R20-F1, R20-F3) in arithmetic a `${…}` the parser does not span as the shell does is refused, not lexed on as ordinary characters: the comparison with the proof would then pass
         else if (nx === '{' && (noRedir || maybeArith) && !this.arithParamPlain(this.i)) { cur += this.funsub(REFUSED_ARITH); continue; }
         else if (nx === '{' && this.paramSpan(this.i) > 0) {
@@ -2899,7 +2902,10 @@ class Parser {
           // `{ cat a; true || (cat x); cat c; } | bash` runs a+c, which the join a+x+c hid)
           const cond = !body && !(seg && seg.words.length) && ['&&', '||', '|'].includes(lastSep);
           if (depth === 0) ctx.notPlain = true; // (a subshell, a function body, `((`)
+          const hadWords = !!(seg && seg.words.length); // (`f ()`, `! (`, `if (`: the words before it make it no plain subshell)
+          const sepBefore = lastSep;
           endSeg(this.i);
+          if (depth === 0) { if (hadWords || body || this.queue.length) ctx.notWide = true; else this.shapeEvent('(', sepBefore); } // (a heredoc body still to come: the order of the events and the commands is not known yet)
           lastSep = ';';
           this.i++;
           if (depth === 0) this.ctx.subshell = true; // ((...)) arithmetic too: conservative (and the `()` of `f()`: flowStart reads it as "from here on, maybe later")
@@ -2927,6 +2933,7 @@ class Parser {
         if (this.dbrace > 0) this.markRefused(REFUSED_PARAM); // (#269 R21-F1: the shell reads a `)` inside ${…} as text; here it would end the construct early)
         if (depth === 0) ctx.notPlain = true;
         endSeg(this.i);
+        if (depth === 0) { if (!stopAtParen || this.queue.length) ctx.notWide = true; else this.shapeEvent(')', ';'); }
         lastSep = ';';
         this.i++;
         if (stopAtParen) return false;
@@ -3038,6 +3045,63 @@ class Parser {
     return done(false);
   }
 
+  // shape (see simpleCommands): one event { kind, at, sep } for each `(` `)` `{` `}` `if` `then` `else` `fi` of the text's own level, in order. at: how many commands of the text's own level came before it;
+  // sep: the join written before the construct (an opener), ';' for the others. The constructs are a whitelist: a subshell, a brace group or an if / then / else / fi, one level only (none inside another), each closer
+  // matching its opener; an empty one, or any other order, turns the whole text off (ctx.notWide). Only the parser's own view of the words counts, never the raw text.
+  shapeEvent(kind, sep, at = this.ctx.n0) {
+    const ctx = this.ctx;
+    if (ctx.notWide) return;
+    if (ctx.muted > 0) { ctx.notWide = true; return; }
+    const st = ctx.shapeStack;
+    const top = st[st.length - 1];
+    const last = ctx.shapeEvents[ctx.shapeEvents.length - 1];
+    const opener = kind === '(' || kind === '{' || kind === 'if';
+    let ok = true;
+    if (opener) ok = st.length === 0; // (no nesting)
+    else if (!last || last.at === at) ok = false; // (an empty subshell, group, condition or branch)
+    else if (kind === ')') ok = top?.kind === '(';
+    else if (kind === '}') ok = top?.kind === '{';
+    else if (kind === 'then') ok = top?.kind === 'if' && top.phase === 'cond';
+    else if (kind === 'else') ok = top?.kind === 'if' && top.phase === 'then';
+    else if (kind === 'fi') ok = top?.kind === 'if' && top.phase !== 'cond';
+    else ok = false;
+    if (!ok) { ctx.notWide = true; return; }
+    if (opener) st.push({ kind, phase: 'cond' });
+    else if (kind === 'then' || kind === 'else') top.phase = kind;
+    else st.pop();
+    ctx.shapeEvents.push({ kind, at, sep });
+  }
+
+  // The widened plain-text check of one finished segment of the text's own level (see shapeEvent): an optional leading `if` `then` `else` `fi` `{` `}`, then (for all but `fi` / `}`) one plain simple command
+  // the way plainSeq reads it. A segment that emits no command, or whose words start with any other keyword (`!`, `time`, a loop word, `elif`, `function`, ...), is not plain.
+  shapeSeg(seg, last, n0, outFrom) {
+    const w = seg.words;
+    const ctx = this.ctx;
+    let kw = null;
+    if (w.length > 0 && w[0].qa < 0 && SHAPE_HEADS.has(w[0].text)) kw = w[0].text;
+    let plain = true;
+    let headOnly = true;
+    for (let i = kw ? 1 : 0; i < w.length; i++) {
+      const x = w[i];
+      if (x.qa >= 0) { headOnly = false; continue; }
+      if (x.text === '{' || x.text === '}' || x.text === '[[' || (headOnly && NOT_PLAIN_HEAD.has(x.text))) { plain = false; break; }
+      headOnly = headOnly && NOT_PLAIN_HEAD.has(x.text);
+    }
+    const rest = w.length - (kw ? 1 : 0);
+    if (plain) {
+      if (kw === 'fi' || kw === '}') plain = rest === 0;
+      else if (kw === 'then' || kw === 'else' || kw === '{') plain = rest === 0 || !!last;
+      else plain = !!last && rest > 0; // (if: its condition; or no keyword at all)
+    }
+    if (plain && kw && kw !== 'if' && kw !== '{' && seg.sep !== ';') plain = false; // (a `then`, `else`, `fi` or `}` after a `&` / join: the shell and this reading may part ways)
+    if (!plain) { ctx.notWide = true; return; }
+    if (kw) {
+      this.shapeEvent(kw, seg.sep, n0);
+      // (the keyword is no part of the command: its raw text starts with it, see `lead`)
+      for (let k = outFrom; k < ctx.out.length; k++) if (ctx.out[k].depth === 0) Object.defineProperty(ctx.out[k], 'lead', { value: kw, enumerable: false });
+    }
+  }
+
   // Interprets one finished simple command: strip keywords/assignments/wrappers, emit it, recurse into interpreters.
   finalize(seg) {
     if (seg.muted) return;
@@ -3115,7 +3179,10 @@ class Parser {
     }
     seg.final = { argv: [] };
     let last = null;
+    const outFrom = this.ctx.out.length;
+    const n0 = this.ctx.n0;
     for (const g of groups) last = this.finalizeGroup(g, seg) ?? last;
+    if (seg.depth === 0 && !this.ctx.notWide) this.shapeSeg(seg, last, n0, outFrom);
     if (seg.depth === 0) { // (plainSeq: a segment that is no plain simple command: it emits none, or opens / closes a group, or starts with a keyword)
       let plain = !!last && seg.words.length > 0;
       let headOnly = true; // (every word so far is an unquoted keyword: one running flag, a prefix rescan per word is quadratic)
@@ -3555,7 +3622,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, ansiC: false, notPlain: false, hdOdd: false, undecidable: false, fns: new Set(), defs: { redef: false }, stopped: false, refused: null, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, ansiC: false, dqTrans: false, notPlain: false, notWide: false, n0: 0, shapeEvents: [], shapeStack: [], hdOdd: false, undecidable: false, fns: new Set(), defs: { redef: false }, stopped: false, refused: null, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -3613,11 +3680,18 @@ export function simpleCommands(str, opts) {
   Object.defineProperty(ctx.out, 'ctlBroken', { value: ctx.ctlBroken, enumerable: false });
   // ansiC: the text holds a `$'…'` or `$"…"` string anywhere (a caller that wants to fail closed on strings whose quoting rules differ from a plain one)
   Object.defineProperty(ctx.out, 'ansiC', { value: ctx.ansiC, enumerable: false });
+  // dqTrans: the text holds a `$"…"` string (locale translation in bash; the shells differ on it, and the parser reads it as a plain double-quoted one). The cd narrowing still fails closed on it; `$'…'` it reads structurally.
+  Object.defineProperty(ctx.out, 'dqTrans', { value: ctx.dqTrans, enumerable: false });
   // plainSeq: the whole text is a plain sequence of simple commands joined by && ; or a newline, and nothing else (comments and heredoc bodies aside). Set false for any { } ( ) group or subshell,
   // `!`, coproc, always, function, compound command (if / for / while / until / select / case), `[[`, `time`, `||`, `|`, `|&`, `&`, a segment that emits no command, a cut-short parse (truncated, ctlBroken),
   // a heredoc whose body the parser cannot locate or whose delimiter spelling or terminator line the shell may read differently. A caller that needs to know a command surely ran after the one before it
   // (the cd narrowing of the files policy) trusts the order of the commands only for such a text. Only the text's own level counts: what a substitution or a `-c` string holds runs in another shell.
   Object.defineProperty(ctx.out, 'plainSeq', { value: !ctx.notPlain && !ctx.hdOdd && !ctx.truncated && !ctx.ctlBroken && !ctx.hdForeign, enumerable: false });
+  // shape: null unless the text is a WIDER whitelist than plainSeq: simple commands joined by && ; a newline || | |& or &, and at the top level only (not inside one another) a subshell `( … )`, a brace group
+  // `{ …; }` or `if CMD; then … [else …] fi`, each holding such a sequence; nothing else (no `!`, coproc, always, function, loop, case, `elif`, `[[`, `time`, command-less segment, cut-short parse, heredoc the parser and
+  // the shell may read differently). Then an array of the constructs' events, see shapeEvent. The cd narrowing of the files policy reads it: from the commands in order, each one's own join (`sep`) and these events it
+  // works out what a command surely ran after. A command that opens a segment with `if` / `then` / `else` / `{` has `lead` = that word (its `raw` starts with it). plainSeq is the narrower, older flag.
+  Object.defineProperty(ctx.out, 'shape', { value: !ctx.notWide && !ctx.hdOdd && !ctx.truncated && !ctx.ctlBroken && !ctx.hdForeign && ctx.shapeStack.length === 0 ? ctx.shapeEvents : null, enumerable: false });
   // heredocSpans: [start, end, quoted] of every heredoc body in the text (quoted: its delimiter was quoted, so nothing in it expands), or null when one cannot be located (read out of other text, no terminator, a parse that gave up)
   Object.defineProperty(ctx.out, 'heredocSpans', { value: ctx.hdForeign || ctx.truncated ? null : ctx.hdSpans, enumerable: false });
   return ctx.out;

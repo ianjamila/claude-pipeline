@@ -1,6 +1,6 @@
 // PR #288 round 6: "fix + simplify". Each round found one more spelling, so this round removes whole areas of risk instead of listing spellings.
 //   R6-F1  PLAIN_CD backtracked exponentially and bangLine / the quote strip were quadratic: linear scans, and a timing test for each.
-//   R6-F2  `$'…\'…'`: the second quote reader is gone; a line holding `$'` or `$"` is read fail closed (a glob may be live, cd narrowing is off).
+//   R6-F2  `$'…\'…'`: the second quote reader is gone; a line holding `$'` or `$"` is read fail closed (a glob may be live). (#373: the cd narrowing no longer turns off for a `$'…'` string, which the parser reads structurally since R8; it still does for `$"…"`.)
 //   R6-F3  zsh glob groups / qualifiers `( ) < > | # ^ ~` in a word of an option tool or rsync: a possible option.
 //   R6-B1  a glob option inside a variable (`D="--[d]elete"; rsync -a $D …`): every expanded piece is tested, whatever the raw text says.
 //   R6-B2  `git clean -fdx -n --no-dry-run`: any later `--no-…` word means no dry run.
@@ -88,12 +88,13 @@ describe('R6-F2: $\'…\' strings', () => {
     ['find with an ANSI-C quote hiding a glob option', `find ${DIR} -name $'\\'' -o -[d]elete -name \\'`],
     ['rsync with an ANSI-C quote hiding a glob option', "rsync -a $'\\'' --[d]elete /tmp/empty/ ~/ \\'"],
     ['rsync $"…" hiding a glob option', 'rsync -a $"x" --[d]elete /tmp/empty/ ~/'],
-    ['a $\' on the line turns the cd narrowing off', "cd proj && echo $'x' && find . -delete", AT_HOME],
     ['a $\' pair hiding a !', "echo $'\\'' ; ! cd /tmp/nonexistent && find . -delete \\'", AT_HOME],
     ['a $\' pair hiding a keyword', "echo $'\\'' ; if true; then cd proj; fi && find . -delete \\'", AT_HOME],
     ['a $" on the line turns the cd narrowing off', 'cd proj && echo $"x" && find . -delete', AT_HOME],
   ]);
   allows('F2', [
+    // (#373: was a deny while a `$'` anywhere on the line turned the cd narrowing off; the parser reads the string structurally, so the cd still narrows the find)
+    ["a $' on the line no longer turns the cd narrowing off", "cd proj && echo $'x' && find . -delete", AT_HOME],
     ['plain quotes still narrow', "cd ./proj && echo 'x' && git add .", AT_HOME],
     ['find -name with a quoted glob', `find ${DIR} -name '*.mjs'`],
   ]);

@@ -2141,12 +2141,53 @@ const SELF_RES = [new RegExp(`^(?:${SELF_DIR}|\\$\\{(0|BASH_SOURCE(?:\\[0\\])?)%
 function selfPathWord(t, cmds, idx, ctx) {
   return SELF_RES.some((re) => re.test(t)) ? modelledCd(t, cmds, idx, ctx) : null;
 }
+// does the line (or its environment model) bind, or may it bind, one of these variable names?
+function lineTouches(names, cmds, ctx) {
+  return ctx.unknownAll || names.some((n) => Object.hasOwn(ctx.vars, n) || ctx.unknownVars.has(n) || ctx.pickUnknown.has(n) || ctx.srcChanged.has(n)
+    || cmds.some((c) => Object.hasOwn(c.env ?? {}, n) || c.argv.some((a) => a === n || a.startsWith(`${n}=`) || a.startsWith(`${n}+=`) || a.startsWith(`${n}[`))));
+}
+// The names that move where git finds its repository or its configuration.
+const GIT_MOVERS = ['GIT_CONFIG_PARAMETERS', 'PATH', 'HOME', 'XDG_CONFIG_HOME', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_COMMON_DIR', 'GIT_CEILING_DIRECTORIES'];
+// The repo root a `.git` walk finds from `start` (a directory or a file): a directory; undefined when none is found; null when the repository's own configuration may move the root (core.worktree, an include)
+function gitRootFrom(start, ctx) {
+  const sub = (x) => x ?? '';
+  for (let d = start, n = 0; n < 64; n++) {
+    const dotgit = pathsFor().join(d, '.git');
+    if (ctx.api.existsSync(dotgit)) {
+      const text = ctx.readText(dotgit);
+      let gitdir = dotgit; // (a directory)
+      if (typeof text === 'string') {
+        const g = /^gitdir:\s*(.+?)\s*$/m.exec(text);
+        if (!g) return null;
+        gitdir = posix.resolve(d, toPosix(g[1]));
+      }
+      // (R1-F1: a linked worktree's own git dir holds no `config`: the common dir's is the one that counts, and an absent one is skipped; any other git dir's config must be readable)
+      const own = pathsFor().join(gitdir, 'config');
+      const common = typeof text === 'string' ? ctx.readText(pathsFor().join(gitdir, 'commondir')) : null;
+      const linked = typeof common === 'string' && common.trim() !== '';
+      const configs = linked ? [pathsFor().join(posix.resolve(gitdir, toPosix(common.trim())), 'config'), ...(ctx.api.existsSync(own) ? [own] : [])] : [own];
+      // (a worktree key anywhere, or an include of another file, anywhere in the repo's, the user's or the XDG config: the root may be elsewhere)
+      const xdg = ctx.env.XDG_CONFIG_HOME && isAbs(toPosix(ctx.env.XDG_CONFIG_HOME)) ? toPosix(ctx.env.XDG_CONFIG_HOME) : pathsFor().join(ctx.homePosix, '.config');
+      const users = [pathsFor().join(ctx.homePosix, '.gitconfig'), pathsFor().join(xdg, 'git/config')];
+      // (the per-worktree file `config.worktree` is read when extensions.worktreeConfig is on: its core.worktree moves the root too)
+      const texts = [...configs, pathsFor().join(gitdir, 'config.worktree')].filter((q, qi) => qi < configs.length || ctx.api.existsSync(q)).map((q) => ctx.readText(q));
+      for (const q of users) if (ctx.api.existsSync(q)) texts.push(ctx.readText(q));
+      if (texts.some((x) => typeof x !== 'string') || texts.some((x) => /(?:^|\])[ \t]*worktree(?:config)?[ \t]*=/mi.test(x) || /^\s*\[\s*include/mi.test(x))) return null;
+      return d;
+    }
+    // (R1-F3: git also finds a repository when the directory is itself a git directory, and honours its core.worktree: a walk that meets one reads the root as unknown)
+    if (ctx.api.existsSync(pathsFor().join(d, 'HEAD')) && ctx.api.existsSync(pathsFor().join(d, 'objects'))) return null;
+    const up = pathsFor().dirname(d);
+    if (up === d) break;
+    d = up;
+  }
+  return undefined;
+}
 function modelledCd(t, cmds, idx, ctx) {
   if (/(?:^|\/)\.\.(?:\/|$)/.test(t)) return null; // (a suffix that climbs is not modelled)
   const sub = (x) => x ?? '';
   const earlierMove = cmds.slice(0, idx).some((c) => c.depth === 0 && c.argv.length && (CD_CMDS.has(baseOf(c.argv[0])) || ['source', '.'].includes(baseOf(c.argv[0]))));
-  const touched = (names) => ctx.unknownAll || names.some((n) => Object.hasOwn(ctx.vars, n) || ctx.unknownVars.has(n) || ctx.pickUnknown.has(n) || ctx.srcChanged.has(n)
-    || cmds.some((c) => Object.hasOwn(c.env ?? {}, n) || c.argv.some((a) => a === n || a.startsWith(`${n}=`) || a.startsWith(`${n}+=`) || a.startsWith(`${n}[`))));
+  const touched = (names) => lineTouches(names, cmds, ctx);
   for (const [ri, re] of SELF_RES.entries()) {
     const m = re.exec(t);
     if (!m) continue;
@@ -2166,33 +2207,8 @@ function modelledCd(t, cmds, idx, ctx) {
     // Why: the root is where a `.git` is found walking up from the directory the line starts in: only before any cd / source, with nothing on the line able to redirect git (PATH, GIT_*, HOME, XDG_CONFIG_HOME), and no core.worktree in the repo config
     if (earlierMove || cmds.slice(0, idx).some((c) => (baseOf(c.argv[0] ?? '') === 'git' && c.argv[1] !== 'rev-parse') || /\.git\b|gitconfig/i.test(c.raw ?? '') || Object.keys(c.env ?? {}).some((k) => /^GIT_CONFIG_(?:KEY|VALUE)_/.test(k)))
       || touched(['GIT_CONFIG_PARAMETERS', 'PATH', 'HOME', 'XDG_CONFIG_HOME', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_COMMON_DIR', 'GIT_CEILING_DIRECTORIES'])) return null;
-    for (let d = ctx.cwd, n = 0; n < 64; n++) {
-      const dotgit = pathsFor().join(d, '.git');
-      if (ctx.api.existsSync(dotgit)) {
-        const text = ctx.readText(dotgit);
-        let gitdir = dotgit; // (a directory)
-        if (typeof text === 'string') {
-          const g = /^gitdir:\s*(.+?)\s*$/m.exec(text);
-          if (!g) return null;
-          gitdir = posix.resolve(d, toPosix(g[1]));
-        }
-        const configs = [pathsFor().join(gitdir, 'config')];
-        const common = typeof text === 'string' ? ctx.readText(pathsFor().join(gitdir, 'commondir')) : null;
-        if (typeof common === 'string' && common.trim()) configs.push(pathsFor().join(posix.resolve(gitdir, toPosix(common.trim())), 'config'));
-        // (a worktree key anywhere, or an include of another file, anywhere in the repo's, the user's or the XDG config: the root may be elsewhere)
-        const xdg = ctx.env.XDG_CONFIG_HOME && isAbs(toPosix(ctx.env.XDG_CONFIG_HOME)) ? toPosix(ctx.env.XDG_CONFIG_HOME) : pathsFor().join(ctx.homePosix, '.config');
-        const users = [pathsFor().join(ctx.homePosix, '.gitconfig'), pathsFor().join(xdg, 'git/config')];
-        // (the per-worktree file `config.worktree` is read when extensions.worktreeConfig is on: its core.worktree moves the root too)
-        const texts = [...configs, pathsFor().join(gitdir, 'config.worktree')].filter((q, qi) => qi < configs.length || ctx.api.existsSync(q)).map((q) => ctx.readText(q));
-        for (const q of users) if (ctx.api.existsSync(q)) texts.push(ctx.readText(q));
-        if (texts.some((x) => typeof x !== 'string') || texts.some((x) => /worktree/i.test(x) || /^\s*\[\s*include/mi.test(x))) return null;
-        return pathsFor().normalize(pathsFor().join(d, sub(m[1])));
-      }
-      const up = pathsFor().dirname(d);
-      if (up === d) break;
-      d = up;
-    }
-    return null;
+    const root = gitRootFrom(ctx.cwd, ctx);
+    return typeof root === 'string' ? pathsFor().normalize(pathsFor().join(root, sub(m[1]))) : null;
   }
   m = /^(?:\$\(\s*mktemp\b([^()`]*)\)|`\s*mktemp\b([^()`]*)`)(\/[\w./-]*)?$/.exec(t);
   if (m) {
@@ -4878,9 +4894,10 @@ function evaluateBashForFilesFrame(command, opts) {
   // R4-F1: the directories a command can run in. A command that follows a cd to a directory known now by && only (and by && only, up to it) runs in that directory alone: the cd ran and succeeded.
   // Any other join (; || | &) keeps the cd that may have failed or run elsewhere in view, so such a command is read against every directory of the line (`dirs`).
   const cdOf = (c) => CD_CMDS.has(baseOf(c.argv[0] ?? ''));
-  // R9 (#288): a WHITELIST. Whether a cd surely ran before the next command is read from the PARSER and from nothing else: the line must be a plain sequence of simple commands joined by && ; or a newline
-  // (`cmds.plainSeq`, see simpleCommands). Any group, subshell, `!`, coprocess, always block, function, compound command, `[[`, || | |& &, command-less segment, cut-short parse or heredoc the parser and the
-  // shell may read differently turns the narrowing off for the whole line: its commands are read against every directory of the line. (Rounds 5 to 8 listed what to refuse, and each found a construct not on the list.)
+  // R9 (#288): a WHITELIST. Whether a cd surely ran before the next command is read from the PARSER and from nothing else: the line must be a sequence of simple commands joined by && ; a newline || | |& or &, with
+  // at most (#373) a top-level subshell `( … )`, brace group `{ …; }` or `if CD; then …; [else …;] fi` of such a sequence, none inside another (`cmds.shape`, see simpleCommands: it is null for anything else). Any
+  // `!`, coprocess, always block, function, loop, case, `elif`, nested construct, compound command, `[[`, command-less segment, cut-short parse or heredoc the parser and the shell may read differently turns the
+  // narrowing off for the whole line: its commands are read against every directory of the line. (Rounds 5 to 8 listed what to refuse, and each found a construct not on the list.)
   const landings = (e, base) => { // (where the cd target leads from each directory of base; a '..' after a symlink also reads as the target's parent, see collectDirs)
     const out = [];
     for (const d of base) {
@@ -4898,7 +4915,9 @@ function evaluateBashForFilesFrame(command, opts) {
     return u.length > 32 ? null : u;
   };
   const cdTarget = (c) => { // the plain target of a `cd` whose destination is known now, else null
-    if (cdNameOf(c.argv[0]) !== 'cd' || c.raw.includes('\\') || !PLAIN_CD.test(c.raw)) return null; // (R5-F1: `env cd`, `sudo cd`, `time cd` run no builtin in this shell)
+    // (#373: the segment of `if cd X` / `then cd X` / `{ cd X` starts with the keyword the parser read, `c.lead`; its text is no part of the command)
+    const raw = c.lead === undefined ? c.raw : c.raw.startsWith(c.lead) ? c.raw.slice(c.lead.length) : null;
+    if (cdNameOf(c.argv[0]) !== 'cd' || raw === null || raw.includes('\\') || !PLAIN_CD.test(raw)) return null; // (R5-F1: `env cd`, `sudo cd`, `time cd` run no builtin in this shell)
     const rest = c.argv.slice(1).filter((a) => a !== '--' && !/^-[LPe@]+$/.test(a));
     if (rest.length > 1) return null;
     const word = rest.length ? rest[0].replace(/^\$\{?HOME\}?(?=\/|$)/, '~') : '~'; // (R19: a literal $HOME / ${HOME} is the home like ~; unknownCwd already refuses it when the line or a sourced file sets HOME)
@@ -4916,21 +4935,71 @@ function evaluateBashForFilesFrame(command, opts) {
   const withReal = (list) => unique([...list, ...list.map(realOf)]);
   const staticName = (c) => { const n = c.argv[0] ?? ''; return n === '[' || n === '[[' || (n !== '' && !/[$`*?[\](){}~'"\\<>=]/.test(n)); };
   const changesDir = (c) => (c.argv.length > 0 && (!staticName(c) || DIR_CHANGERS.has(baseOf(c.argv[0])))) ; // (R17: a bare word that is a directory makes the whole directory unknown, see dirLikeWord, so there is no narrowing at all then)
-  // Narrowing needs a plain sequence (cmds.plainSeq: it also covers a cut-short parse, a closer with no opener, a heredoc not located, a group, a subshell, a function, a `!`), no `$'…'` / `$"…"` string on the
-  // line (R6-F2), and no command that changes the directory (a cd, eval, source, ...) in a trap action: it runs in this shell, but later. (Any other command inside a substitution or a `-c` string is
-  // another shell's, and a plain sequence has no loop, branch or group to run a command out of turn.)
+  // Narrowing needs a text of the whitelisted shapes (cmds.shape: it also covers a cut-short parse, a closer with no opener, a heredoc not located, a nested group, a function, a `!`), and no command that
+  // changes the directory (a cd, eval, source, ...) in a trap action: it runs in this shell, but later. (Any other command inside a substitution or a `-c` string is another shell's, and the shapes have no loop,
+  // case or nested group to run a command out of turn.) A `$'…'` string is read by the parser structurally (R8), so it needs no special case here (#373: R6-F2 / R7-F4 pinned it off; a cd target holding a `$` is no
+  // literal, cdTarget); a `$"…"` string stays a fail-closed pin: the shells read it differently.
   const unsureChange = (c) => c.argv.length > 0 && (cdOf(c) || changesDir(c)) && c.depth > 0 && c.ctl?.trap !== false;
-  const cdUnsure = cmds.plainSeq !== true || cmds.ansiC === true || cmds.some(unsureChange);
+  const cdUnsure = !Array.isArray(cmds.shape) || cmds.dqTrans === true || cmds.some(unsureChange);
   const narrowDirs = new Map();
-  if (opts._writesOnly !== true && !cdUnsure && cmds.some(cdOf) && !unknownCwd()) {
+  // #373: the commands in order, with the parser's events for a subshell / brace group / if (cmds.shape). A command is narrowed to the directories of the chain only when every step to it is a join the shell runs only
+  // after the cd succeeded: && (and `then` after the condition). The rules, all read from the parser's `sep` and events:
+  //  - the chain survives only a join by && (any other join, `;` `||` `|` `&`, ends it), and a cd that follows `||` / `|` starts none (it may not have run, or may have run in a subshell);
+  //  - a subshell runs from the directories known at its opening (the chain if its own join is &&); a cd inside it never leaks out: after the `)` the state is as before it (only `known` may have grown);
+  //  - a brace group runs in this shell: its first command takes the group's own join, a cd inside persists after the `}`, and a `}` is looked through when the join after a cd is read (the group's status is its last command's);
+  //    except a group entered by `||`, `|` or `&` (skipped, or run in a subshell): it exports no chain through its `}` (R1-B1);
+  //  - `if CD; then BODY [else ELSE] fi`: the condition must be exactly one cd to a literal target, else nothing is narrowed. The body is joined to it as by && (it runs only when the cd succeeded); the else body and
+  //    everything after the `fi` are read against every directory known (the chain ends);
+  //  - inside a subshell, group or body entered with a live chain, `;` keeps the chain until a command that may change the directory has run there.
+  const narrowShapes = (top) => {
+    const evAt = new Map();
+    for (const e of cmds.shape) { const l = evAt.get(e.at); if (l) l.push(e); else evAt.set(e.at, [e]); }
+    const joinAfter = (k) => { // the join that follows top[k]: the next command's own, `then` reads as &&, a `}` is looked through, any other closer ends the construct
+      for (const e of evAt.get(k + 1) ?? []) {
+        if (e.kind === '}') continue;
+        if (e.kind === 'then') return '&&';
+        if (e.kind === '(' || e.kind === '{' || e.kind === 'if') return e.sep;
+        return null;
+      }
+      return top[k + 1]?.sep ?? null;
+    };
+    const joinOf = (k) => { // the join before top[k]: the first command of a subshell or group takes the construct's own, one after `then` is joined as by &&
+      const l = evAt.get(k);
+      const e = l ? l[l.length - 1] : undefined;
+      if (e === undefined) return top[k].sep;
+      if (e.kind === '(' || e.kind === '{') return e.sep;
+      if (e.kind === 'then') return '&&';
+      if (e.kind === 'else') return ';';
+      return top[k].sep;
+    };
     let known = unique([ctx.cwd, ...seedDirs]); // where the shell can be so far
     let chain = null; // the directories after an &&-joined run of sure cd's
     let lost = false; // a cd whose destination is not known, or a command that may change the directory: nothing after it is narrowed
-    const top = cmds.filter((c) => !(c.depth > 0)); // (the commands inside a substitution are listed before the one that holds them)
-    for (const [k, c] of top.entries()) {
+    const stack = []; // the open constructs (the parser allows one level)
+    for (let k = 0; k <= top.length; k++) {
       checkDeadline(ctx.budget);
-      if (c.sep !== '&&') chain = null;
+      for (const e of evAt.get(k) ?? []) {
+        const fr = stack[stack.length - 1];
+        if (e.kind === '(' || e.kind === '{') {
+          if (e.sep !== '&&') chain = null;
+          stack.push({ kind: e.kind, chain0: chain, lost0: lost, live: chain !== null, touched: false, skip: e.kind === '{' && (e.sep === '||' || e.sep === '|' || e.sep === '&') });
+        } else if (e.kind === 'if') stack.push({ kind: 'if', from: k, live: false, touched: false });
+        else if (!fr) return false;
+        else if (e.kind === ')') { stack.pop(); chain = fr.chain0; lost = fr.lost0; }
+        else if (e.kind === '}') { stack.pop(); if (fr.skip) chain = null; } // (R1-B1: a group entered by || | & may not run at all, or runs in a subshell: no cd inside it leaves a chain behind)
+        else if (e.kind === 'then') {
+          if (k - fr.from !== 1 || !cdOf(top[k - 1]) || cdTarget(top[k - 1]) === null) return false; // (the condition: exactly one cd to a literal target)
+          fr.live = chain !== null;
+          fr.touched = false;
+        } else if (e.kind === 'else') { chain = null; fr.live = false; } else { stack.pop(); chain = null; } // (fi)
+      }
+      if (k === top.length) break;
+      const c = top[k];
+      const sep = joinOf(k);
+      const fr = stack[stack.length - 1];
+      if (sep !== '&&') chain = sep === ';' && fr !== undefined && fr.live && !fr.touched ? chain : null;
       if (chain) narrowDirs.set(c, chain);
+      if (fr && (cdOf(c) || changesDir(c))) fr.touched = true;
       if (!cdOf(c)) {
         if (changesDir(c)) { lost = true; chain = null; }
         continue;
@@ -4941,22 +5010,73 @@ function evaluateBashForFilesFrame(command, opts) {
       const here = withReal(reach);
       known = unique([...known, ...here]);
       if (known.length > 32 || here.length > 32) { lost = true; chain = null; continue; }
-      chain = c.sep !== '||' && c.sep !== '|' && top[k + 1]?.sep === '&&' ? here : null;
+      chain = sep !== '||' && sep !== '|' && joinAfter(k) === '&&' ? here : null;
     }
+    return stack.length === 0;
+  };
+  if (opts._writesOnly !== true && !cdUnsure && cmds.some(cdOf) && !unknownCwd()) {
+    if (!narrowShapes(cmds.filter((c) => !(c.depth > 0)))) narrowDirs.clear(); // (the commands inside a substitution are listed before the one that holds them)
   }
   // the command's own working directory, { ds, unknown }: its wrapper's directory (env -C DIR / --chdir, applied on top of the narrowed base), then git -C DIR / make -C DIR / tar -C DIR, each relative to the one
   // before it. R5-F4: a directory that is not a known string (two wrappers, sudo -D, a run-time value) makes the directory unknown, and a relative operand is then a hit (see homeWord).
+  // #373: `git -C "$(git rev-parse --show-toplevel)"` (quoted or not, only this exact text and an optional `/literal/suffix`): git is given the root of the repository the command's own directory is in,
+  // found NOW by the same `.git` walk as `cd $(git rev-parse --show-toplevel)` (gitRootFrom), for each directory the command can run in. Where no repository is found the substitution prints nothing, `-C ""` leaves the
+  // directory, and git fails outside a repository: that directory adds nothing (an empty reading) unless the subcommand works there (init, clone), when it stays as it is. Refused (read as run-time unknown) when anything on the
+  // line or in the environment can move git's repository or configuration (GIT_DIR, GIT_WORK_TREE, GIT_CEILING_DIRECTORIES, PATH, HOME ...), when an earlier command of the line is a git command other than rev-parse (an init,
+  // clone, config or worktree could make or move a repository), when the line sources or evals text, or when the repository's configuration may move its root.
+  const TOPLEVEL_WORD = /^\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)(\/[\w.-]+(?:\/[\w.-]+)*)?$/;
+  let topGuard; // (once per line: the first command that must not be preceded by a git command other than rev-parse, and whether any variable moves git)
+  const topIndex = new Map();
+  const toplevelDirs = (c, base, suffix) => {
+    if (topGuard === undefined) {
+      cmds.forEach((x, i) => topIndex.set(x, i));
+      const firstBad = cmds.findIndex((x) => (baseOf(x.argv[0] ?? '') === 'git' && x.argv[1] !== 'rev-parse') || /\.git\b|gitconfig/i.test(x.raw ?? '') || Object.keys(x.env ?? {}).some((k) => /^GIT_CONFIG_(?:KEY|VALUE)_/.test(k)));
+      const envMoves = GIT_MOVERS.filter((n) => n !== 'PATH' && n !== 'HOME' && n !== 'XDG_CONFIG_HOME').some((n) => ctx.env[n] !== undefined);
+      topGuard = { firstBad, ok: !envMoves && !lineTouches(GIT_MOVERS, cmds, ctx) && !cmds.some((x) => x.argv.length > 0 && ['source', '.', 'eval'].includes(baseOf(x.argv[0]))) };
+    }
+    if (!topGuard.ok || (topGuard.firstBad >= 0 && topGuard.firstBad < topIndex.get(c)) || /(?:^|\/)\.\.(?:\/|$)/.test(suffix ?? '')) return null;
+    const args = c.argv.slice(1);
+    let i = 0;
+    while (i < args.length && args[i].startsWith('-')) i += ['-C', '-c', '--git-dir', '--work-tree', '--namespace'].includes(args[i]) ? 2 : 1;
+    const makes = i >= args.length || ['init', 'clone'].includes(args[i]); // (works outside a repository, or no subcommand read)
+    const out = [];
+    for (const d of base) {
+      const root = gitRootFrom(d, ctx);
+      if (root === null) return null;
+      if (root === undefined) { if (makes) out.push(d); } else out.push(pathsFor().normalize(pathsFor().join(root, suffix ?? '')));
+    }
+    return unique(out);
+  };
+  // R1-B2 / R1-F2 / R1-B3: the toplevel word is read only when it is the git command's SOLE directory option and its only repository-moving option: no wrapper chdir (env -C, --chdir, sudo -D), no other -C
+  // (before it the substitution would be read in the wrong directory, after it git runs in a directory this reading cannot give), no --git-dir / --work-tree / -c / --bare / --namespace ... (git is given its
+  // repository, so "no repository found" no longer means "git fails"). Any other case reads it as unknown, as before #373.
+  const HARMLESS_GIT_OPTS = new Set(['--no-pager', '-P', '--no-optional-locks', '--no-replace-objects', '--literal-pathspecs', '--no-literal-pathspecs']);
+  const soleToplevel = (c) => {
+    if (c.chdir !== undefined) return false;
+    let dirOpts = 0;
+    const args = c.argv.slice(1);
+    for (let i = 0; i < args.length && args[i].startsWith('-'); i++) {
+      if (args[i] === '-C') { dirOpts++; i++; } else if (!HARMLESS_GIT_OPTS.has(args[i])) return false;
+    }
+    return dirOpts === 1;
+  };
   const dirsOf = (c) => {
     let cur = withReal(narrowDirs.get(c) ?? dirs);
     let unknown = false;
-    const apply = (v) => {
+    const apply = (v, tool = '') => {
+      const tl = tool === 'git' ? TOPLEVEL_WORD.exec(v) : null;
+      if (tl) {
+        const to = soleToplevel(c) ? toplevelDirs(c, cur, tl[1]) : null;
+        if (to === null || to.length > 32) unknown = true; else cur = withReal(to);
+        return;
+      }
       const e = expandRefs(v, ctx).replace(/\([^()]*\)$/, ''); // (a trailing zsh glob qualifier is no part of the name)
       if (!e || /[$`(){}\\]/.test(e) || (e.startsWith('~') && !isAbs(e))) { unknown = true; return; }
       const to = landings(e, cur);
       if (to === null) unknown = true; else cur = withReal(to);
     };
     if (c.chdir === null) unknown = true; else if (typeof c.chdir === 'string') apply(c.chdir);
-    if (['git', 'make', 'gmake', 'tar', 'bsdtar', 'gtar'].includes(baseOf(c.argv[0] ?? ''))) for (const v of baseDirsOf(c.argv)) apply(v);
+    if (['git', 'make', 'gmake', 'tar', 'bsdtar', 'gtar'].includes(baseOf(c.argv[0] ?? ''))) for (const v of baseDirsOf(c.argv)) apply(v, baseOf(c.argv[0]));
     return { ds: cur, unknown };
   };
   const NON_PATH_OPTIONS = new Set(['base', 'base-href', 'public-path', 'basename', 'deploy-url']); // (a URL prefix, not a path: `vite build --base=/`)

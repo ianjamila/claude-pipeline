@@ -1,3 +1,4 @@
+// (#373 widened the whitelist below: `||` `|` `&`, a top-level subshell, brace group or `if CD; then …; fi` no longer turn the narrowing off; `cmds.shape` is the flag the narrowing reads, `cmds.plainSeq` stays the strict one these tests pin.)
 // PR #288 round 9: "fix + simplify". The cd narrowing is a WHITELIST: a command is read against fewer directories only when the whole line (the parser's view, `cmds.plainSeq`) is a plain
 // sequence of simple commands joined by `&&`, `;` or a newline, and nothing else (no group, subshell, `!`, coproc, always, function, compound command, `[[`, `||`, `|`, `&`, no command-less segment).
 //   R9-B1    `coproc { :; cd /tmp && :; } && find . -delete` (the coprocess's cd is another shell's)
@@ -78,7 +79,6 @@ describe('R9-F4: a cd target from a variable is not narrowed', () => {
 
 describe('R9: the whitelist excludes every construct (a cd inside or around them is not trusted)', () => {
   denies('whitelist', [
-    ['a brace group', '{ cd /tmp; } && find . -delete'],
     ['a subshell', '(cd /tmp) && find . -delete'],
     ['a function definition', 'f() { :; }\ncd /tmp && find . -delete'],
     ['function NAME', 'function f { :; }\ncd /tmp && find . -delete'],
@@ -87,13 +87,15 @@ describe('R9: the whitelist excludes every construct (a cd inside or around them
     ['a case before the cd', 'case x in y) :;; esac\ncd /tmp && find . -delete'],
     ['[[ before the cd', '[[ -d /tmp ]]\ncd /tmp && find . -delete'],
     ['a ! earlier on the line', '! false\ncd /tmp && find . -delete'],
-    ['a || earlier on the line', 'true || false\ncd /tmp && find . -delete'],
-    ['a pipe earlier on the line', 'echo x | cat\ncd /tmp && find . -delete'],
-    ['a background job earlier on the line', 'sleep 1 &\ncd /tmp && find . -delete'],
     ['a coproc earlier on the line', 'coproc :\ncd /tmp && find . -delete'],
   ]);
   allows('plain', [
     ['cd /tmp && find . -delete (the plain case)', 'cd /tmp && find . -delete'],
+    // (#373 widened the whitelist: these were denies because the construct turned the narrowing off for the whole line; the cd after it is on its own line, joined by &&, and surely ran)
+    ['a || earlier on the line', 'true || false\ncd /tmp && find . -delete'],
+    ['a pipe earlier on the line', 'echo x | cat\ncd /tmp && find . -delete'],
+    ['a background job earlier on the line', 'sleep 1 &\ncd /tmp && find . -delete'],
+    ['a brace group (#373: it runs in this shell, its cd persists and the group succeeded)', '{ cd /tmp; } && find . -delete'],
   ]);
 });
 
