@@ -39,7 +39,11 @@ const rnd = mulberry32(SEED);
 const pick = (xs) => xs[Math.floor(rnd() * xs.length)];
 const weighted = (pairs) => { let r = rnd() * pairs.reduce((s, p) => s + p[1], 0); for (const [v, w] of pairs) { r -= w; if (r < 0) return v; } return pairs[0][0]; };
 const OPS = [[';', 25], ['&&', 35], ['||', 25], ['&', 8]];
-const NOOPS = ['true', 'false', 'A=1', 'echo hi', 'cat'];
+// (#352 R12-F3: a redirect-only command is a no-op that carries its operator: `change || >x && push` runs the redirect when the change failed)
+const NOOPS = ['true', 'false', 'A=1', 'echo hi', 'cat', '>x', '> /dev/null'];
+// (#352 R12-F2: a redirect right after the `)` of a subshell belongs to the subshell's command: `cd d && (a) 2>&1 & push`)
+const SUB_REDIRS = [' 2>&1', ' > log', ' >/dev/null 2>&1', ' 2>&1 > log'];
+const subNode = (body) => (rnd() < 0.4 ? { t: 'sub', body, redir: pick(SUB_REDIRS) } : { t: 'sub', body });
 const WRAPPERS = [['group', 12], ['sub', 12], ['subst', 8], ['btick', 4], ['bashc', 10], ['eval', 6], ['if', 9], ['iftrue', 6], ['while', 6], ['loop', 6], ['case', 5], ['not', 14], ['pipe', 14], ['stdin', 9]];
 // (#352 R10: wrappers of a command: the ones that start a child process (what the command changes is the child's) and the ones that stay in this shell)
 const SPAWN = new Set(['nohup', 'env', 'nice', 'timeout 5', 'sudo', 'find']);
@@ -53,7 +57,8 @@ const noop = () => ({ t: 'noop', txt: pick(NOOPS) });
 const noopStage = (depth, first) => {
   const kind = weighted([['noop', 4], ['hd', 3], ['sub', 2], ['group', 2], ['empty', first ? 2 : 0]]);
   if (kind === 'hd') return quoted === 0 ? { ...noop(), hd: true } : noop();
-  if (kind === 'sub' || kind === 'group') return { t: kind, body: genBody('none', depth + 1) };
+  if (kind === 'sub') return subNode(genBody('none', depth + 1));
+  if (kind === 'group') return { t: kind, body: genBody('none', depth + 1) };
   return kind === 'empty' ? { t: 'empty' } : noop();
 };
 const leaf = (need) => (need === 'none' ? noop() : { t: need, txt: need });
@@ -103,7 +108,7 @@ function genWrapper(need, depth, forced) {
   if (q) quoted++;
   try {
     const body = genBody(need, depth + 1);
-    return kind === 'stdin' ? { t: 'stdin', how: pick(quoted > 1 ? HOW.slice(0, 3) : HOW), body } /* (a heredoc only where no text a shell reads holds this one) */ : { t: kind, body };
+    return kind === 'stdin' ? { t: 'stdin', how: pick(quoted > 1 ? HOW.slice(0, 3) : HOW), body } /* (a heredoc only where no text a shell reads holds this one) */ : kind === 'sub' ? subNode(body) : { t: kind, body };
   } finally { if (q) quoted--; }
 }
 
@@ -119,7 +124,7 @@ function render(n, kind) {
     case 'empty': return '{ }';
     case 'list': return n.items.map((x, i) => (i ? OPTXT[n.ops[i - 1]] : '') + render(x, kind)).join('');
     case 'group': return `{ ${render(n.body, kind)}; }`;
-    case 'sub': return `( ${render(n.body, kind)} )`;
+    case 'sub': return `( ${render(n.body, kind)} )${n.redir ?? ''}`;
     case 'subst': return `echo $(${render(n.body, kind)})`;
     case 'btick': return `echo \`${render(n.body, kind)}\``;
     case 'bashc': return `bash -c ${shq(render(n.body, kind))}`;
@@ -245,7 +250,9 @@ test('#400: the guard denies every generated line whose push can run without the
   for (const [name, re] of [['here-string', /bash <<< /], ['stdin pipe', /echo '.*' \| bash/], ['process substitution', /bash <\(echo/], ['heredoc shell', /bash <<EOF/], ['heredoc on a command', /(?:cd|git switch|npm run) [^\n]*<<EOF[^\n]*[|&]/], ['spawn wrapper', /(?:nohup|env|nice|timeout 5|sudo|find \.) /], ['transparent wrapper', /command |builtin /], ['loop', /for x in a b/], ['group before ||', /\{ [^\n]*; [^\n]*; \} \|\|/], ['if before ||', /fi \|\|/], ['group stage', /\{ [^\n]*; [^\n]* \} \|/],
     // (#352 R11-F4: a pipeline whose other stage is a subshell or a group of commands that change nothing, an empty first stage, a heredoc on one stage while the other holds a backtick or $( ) text, a negated pipeline)
     ['sub stage', /(?:\| \( [^\n]*\)|\( (?:true|false|A=1|echo hi|cat)[^\n]*\) \|)/], ['group stage of noops', /(?:\| \{ (?:true|false|A=1|echo hi|cat)[^\n]*; \}|\{ (?:true|false|A=1|echo hi|cat)[^\n]*; \} \|)/],
-    ['empty first stage', /\{ \} \|/], ['heredoc stage, then a backtick text', /<<EOF\d* \| echo `/], ['heredoc stage, then a $( ) text', /<<EOF\d* \| echo \$\(/], ['negated pipeline', /(?:^|[;&|(] ?)! [^\n|]* \| /]]) {
+    ['empty first stage', /\{ \} \|/], ['heredoc stage, then a backtick text', /<<EOF\d* \| echo `/], ['heredoc stage, then a $( ) text', /<<EOF\d* \| echo \$\(/], ['negated pipeline', /(?:^|[;&|(] ?)! [^\n|]* \| /],
+    // (#352 R12: a redirect-only command; a redirect right after the `)` of a subshell, alone and with a pipe or a background `&` after it)
+    ['redirect-only command', /(?:^|[;&|{(] ?)>(?:x| \/dev\/null)(?: |;|$)/], ['subshell with a trailing redirect', /\) (?:2>&1|> log|>\/dev\/null 2>&1)/], ['subshell redirect, then a pipe', /\) (?:2>&1|> log|>\/dev\/null 2>&1) \|/], ['subshell redirect, then &', /\) (?:2>&1|> log|>\/dev\/null 2>&1) &(?!&)/]]) {
     assert.ok([...seen].filter((l) => re.test(l)).length >= 5, `the generator should produce lines with: ${name}`);
   }
   assert.ok(mustDeny > checked * 0.3 && checked - mustDeny > checked * 0.05, 'the generator should produce both kinds of line');
