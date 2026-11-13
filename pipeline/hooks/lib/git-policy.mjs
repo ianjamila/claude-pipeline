@@ -1907,6 +1907,70 @@ function isolatedState(ctx, fn) {
   }
 }
 
+// #352 R5: a loop body runs again after it ran, so a command early in the body meets what the body itself left behind (a branch, an alias, a push.default). evalString judges every loop once from
+// its entry state, takes what the BODY left relative to that state (loopLeft), and, when it left something, judges the BODY alone once more from entry + that carry (loopReseed). What the line does
+// before or after the loop is no part of it. Only git state is carried (branches, aliases, config); variables keep the values the first pass left them, as they would be in the next iteration.
+const loopEntry = (ctx) => ({
+  branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, unsure: new Set(ctx.aliasUnsure), cfg: ctx.cfgDirty, envCfg: ctx.envCfgDirty,
+});
+const newLoopLeft = () => ({ moved: new Set(), redefined: new Set(), cfg: false, envCfg: false });
+const loopLeftAny = (left) => left.moved.size > 0 || left.redefined.size > 0 || left.cfg || left.envCfg;
+// (adds to `left` whatever the walk changed since `entry`: directories whose branch differs, alias keys whose text differs or that were marked unsure, config that became dirty)
+function loopLeft(ctx, entry, left) {
+  for (const d of new Set([...entry.branches.keys(), ...ctx.branches.keys()])) {
+    const a = entry.branches.get(d);
+    const b = ctx.branches.get(d);
+    if (a?.name !== b?.name || a?.trackMain !== b?.trackMain) left.moved.add(d);
+  }
+  for (const [kind, was, now] of [['git', entry.git, ctx.gitAliases], ['gh', entry.gh, ctx.ghAliases]]) {
+    for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) left.redefined.add(`${kind}:${n}`);
+  }
+  // (a mark made without a change to the map: judgeAlternatives restores the map and leaves only the mark)
+  for (const n of ctx.aliasUnsure) if (!entry.unsure.has(n)) left.redefined.add(n);
+  if (ctx.cfgDirty && !entry.cfg) left.cfg = true;
+  if (ctx.envCfgDirty && !entry.envCfg) left.envCfg = true;
+  return left;
+}
+// (the marks alone: a branch is unknown, an alias unsure, a config dirty, as after a loop that may have run any number of times)
+function loopMark(ctx, left) {
+  for (const d of left.moved) ctx.branches.set(d, { name: null, trackMain: false });
+  for (const a of left.redefined) ctx.aliasUnsure.add(a);
+  if (left.cfg) ctx.cfgDirty = true;
+  if (left.envCfg) ctx.envCfgDirty = true;
+}
+// (the state the next iteration starts in: the entry state with the marks)
+function loopReseed(ctx, entry, left) {
+  for (const [k, was] of [['gitAliases', entry.git], ['ghAliases', entry.gh]]) { for (const n of Object.keys(ctx[k])) delete ctx[k][n]; Object.assign(ctx[k], was); }
+  ctx.aliasUnsure.clear();
+  for (const n of entry.unsure) ctx.aliasUnsure.add(n);
+  ctx.branches.clear();
+  for (const [d, e] of entry.branches) ctx.branches.set(d, { ...e });
+  ctx.cfgDirty = entry.cfg;
+  ctx.envCfgDirty = entry.envCfg;
+  loopMark(ctx, left);
+}
+// The loops of a command list as [start, end) ranges of consecutive commands the parser marks as in a loop (the `for` / `while` header, its condition and its body; a loop inside a loop is part of the
+// outer range, and two loops with nothing between them are one range: a later loop is then judged as if it could run again, which only refuses more). Marks not to be trusted (cmds.ctlBroken):
+// everything from the first loop header on.
+const LOOP_HEAD = /^\s*(?:while|until|for|select|repeat|foreach)(?=[\s;&|(){]|$)/;
+function loopRunsOf(cmds) {
+  const out = new Map();
+  if (cmds.truncated) return out;
+  if (cmds.ctlBroken) {
+    const head = cmds.findIndex((c) => LOOP_HEAD.test(c.raw ?? '') || ['for', 'select'].includes(c.argv[0]));
+    if (head >= 0) out.set(head, cmds.length);
+    return out;
+  }
+  for (let i = 0; i < cmds.length; i++) {
+    if (!cmds[i].ctl?.loop) continue;
+    let j = i;
+    while (j < cmds.length && cmds[j].ctl?.loop) j++;
+    out.set(i, j);
+    i = j - 1;
+  }
+  return out;
+}
+
 // Why: an earlier command on the line wrote (or may have written) the script about to be judged (cp f.sh n.sh; bash n.sh): judge each content it may
 // hold. Static text and the files copied / catted into it are judged like the script; a file a rewriting command computes it from is scanned for
 // guarded words; content that only exists at run time (curl -o, a program's output, a missing script after a command we do not model) is
@@ -2841,52 +2905,38 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
   let envDirty = false;
   const moved = new Set(); // (directories whose branch some reading left different from the start; alias keys likewise: see below)
   const redefined = new Set();
-  // #352 R4-F1: the readings of a loop word are consecutive iterations of ONE shell, not alternatives: a command early in the body meets what an earlier iteration left (an alias, a
-  // push.default, a branch). So when some name is a loop word, more than one reading ran and they left something behind, the readings are judged once more starting from the union
-  // of what any of them left (aliases unsure, branches unknown, config dirty). It only refuses more; a loop that leaves nothing behind is not judged twice.
-  const loops = total > 1 && names.some(({ modes }) => modes.some((m) => typeof m === 'object'));
+  // (#352 R4-F1, R5: the readings of a loop word are consecutive iterations of ONE shell, so what a body leaves for its next iteration is judged where the loop is walked: evalString, loopRunsOf)
   try {
-    for (let pass = 0; pass < 2; pass++) {
-      if (pass === 1) {
-        if (!loops || !(moved.size || redefined.size || dirty !== saved.cfgDirty || envDirty !== saved.envCfgDirty)) break;
+    for (let r = 0; r < total; r++) {
+      checkDeadline(ctx.budget);
+      countReading(ctx.budget); // (the readings of the whole evaluation, nested scripts included, share one allowance)
+      restoreLineState(ctx, saved);
+      ctx.pinsLevel = level;
+      ctx.pins = new Map();
+      let rest = r;
+      for (const [x, { k, modes }] of names.entries()) {
+        const m = plan ? modes[plan[r][x]] : modes[rest % modes.length];
+        rest = Math.floor(rest / modes.length);
+        ctx.pins.set(k, m);
+        if (typeof m === 'object') ctx.vars[k] = m.val; // (a loop variable: every use comes after the `for`, so it holds the word from the start)
       }
-      for (let r = 0; r < total; r++) {
-        checkDeadline(ctx.budget);
-        countReading(ctx.budget); // (the readings of the whole evaluation, nested scripts included, share one allowance)
-        restoreLineState(ctx, saved);
-        if (pass === 1) {
-          ctx.cfgDirty = dirty;
-          ctx.envCfgDirty = envDirty;
-          for (const d of moved) ctx.branches.set(d, { name: null, trackMain: false });
-          for (const a of redefined) ctx.aliasUnsure.add(a);
-        }
-        ctx.pinsLevel = level;
-        ctx.pins = new Map();
-        let rest = r;
-        for (const [x, { k, modes }] of names.entries()) {
-          const m = plan ? modes[plan[r][x]] : modes[rest % modes.length];
-          rest = Math.floor(rest / modes.length);
-          ctx.pins.set(k, m);
-          if (typeof m === 'object') ctx.vars[k] = m.val; // (a loop variable: every use comes after the `for`, so it holds the word from the start)
-        }
-        const v = evalString(str, startDir, ctx, level);
-        if (v.decision === 'deny') return v;
-        dirty ||= ctx.cfgDirty;
-        envDirty ||= ctx.envCfgDirty;
-        // (t4 state-union, security review: the end state of EVERY reading is compared with the start, not only the last one's: a branch or alias an earlier reading changed
-        // and the last did not would stay known. The readings are alternatives, so whatever any of them changed is unknown afterwards.)
-        for (const d of new Set([...saved.branches.keys(), ...ctx.branches.keys()])) {
-          const a = saved.branches.get(d);
-          const b = ctx.branches.get(d);
-          if (a?.name !== b?.name || a?.trackMain !== b?.trackMain) moved.add(d);
-        }
-        for (const [kind, now] of [['git', ctx.gitAliases], ['gh', ctx.ghAliases]]) {
-          const was = saved[kind === 'git' ? 'gitAliases' : 'ghAliases'];
-          for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) redefined.add(`${kind}:${n}`);
-        }
-        // (#352 R3-F1: a mark made without a change to the map -- judgeAlternatives restores the map and leaves only the mark -- is wiped by the next reading's restoreLineState, so it is taken here)
-        for (const n of ctx.aliasUnsure) if (!saved.aliasUnsure.has(n)) redefined.add(n);
+      const v = evalString(str, startDir, ctx, level);
+      if (v.decision === 'deny') return v;
+      dirty ||= ctx.cfgDirty;
+      envDirty ||= ctx.envCfgDirty;
+      // (t4 state-union, security review: the end state of EVERY reading is compared with the start, not only the last one's: a branch or alias an earlier reading changed
+      // and the last did not would stay known. The readings are alternatives, so whatever any of them changed is unknown afterwards.)
+      for (const d of new Set([...saved.branches.keys(), ...ctx.branches.keys()])) {
+        const a = saved.branches.get(d);
+        const b = ctx.branches.get(d);
+        if (a?.name !== b?.name || a?.trackMain !== b?.trackMain) moved.add(d);
       }
+      for (const [kind, now] of [['git', ctx.gitAliases], ['gh', ctx.ghAliases]]) {
+        const was = saved[kind === 'git' ? 'gitAliases' : 'ghAliases'];
+        for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) redefined.add(`${kind}:${n}`);
+      }
+      // (#352 R3-F1: a mark made without a change to the map -- judgeAlternatives restores the map and leaves only the mark -- is wiped by the next reading's restoreLineState, so it is taken here)
+      for (const n of ctx.aliasUnsure) if (!saved.aliasUnsure.has(n)) redefined.add(n);
     }
     if (level > 0 && total > 1) {
       // (config is only ever set; a branch or alias that differs from the state the script started with, in any reading, may or may not have changed)
@@ -2959,10 +3009,32 @@ function evalString(str, startDir, ctx, level, child = false) {
   // the subshells open at the command being walked, outermost first: { id, dir, uncertain } as they were when it started (null: marks not trusted, see subshellsTrusted)
   const subs = subshellsTrusted(cmds) ? [] : null;
   let chdirBase; // (the list's own directory while one command runs in its wrapper's -C / --chdir directory)
+  // #352 R5: the loop being walked (see loopEntry): its range, the state at its entry, what its body left so far, and the walk state to start the second pass from
+  const loopEnds = loopRunsOf(cmds);
+  let loop = null;
   try {
-  for (const [i, c] of cmds.entries()) {
+  for (let i = 0; ; i++) {
     checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
+    if (loop && i >= loop.end) {
+      loopLeft(ctx, loop.entry, loop.left);
+      if (!loop.again && loopLeftAny(loop.left)) {
+        countReading(ctx.budget); // (the extra pass counts against the allowance of readings, as any other)
+        loop.again = true;
+        loopReseed(ctx, loop.entry, loop.left);
+        dir = loop.dir;
+        uncertain = loop.uncertain;
+        chdirBase = undefined;
+        if (subs) subs.splice(0, subs.length, ...loop.subs.map((x) => ({ ...x })));
+        i = loop.start;
+      } else {
+        loopMark(ctx, loop.left); // (after the loop: the body may have run any number of times)
+        loop = null;
+      }
+    }
+    if (i >= cmds.length) break;
+    const c = cmds[i];
     if (chdirBase !== undefined) { dir = chdirBase; chdirBase = undefined; }
+    if (!loop && loopEnds.has(i)) loop = { start: i, end: loopEnds.get(i), again: false, entry: loopEntry(ctx), left: newLoopLeft(), dir, uncertain, subs: subs ? subs.map((x) => ({ ...x })) : [] };
     const argv = c.argv;
     if (subs) {
       // Why: a cd inside a subshell ($( ), ( ), backticks, <( )) moves that subshell only: when it ends, the line goes on in the directory it had when the subshell
