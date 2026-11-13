@@ -55,7 +55,7 @@ risk:
     "pipeline/lib/review-marker.mjs", "pipeline/lib/floor-proof.mjs", "pipeline/lib/model-floor.mjs", "package.json",
     "**/.githooks/**", "**/.husky/**",
     "pipeline/lib/glob.mjs", "pipeline/lib/git.mjs", "pipeline/lib/diff.mjs", "pipeline/lib/doc-paths.mjs", "pipeline/lib/docs-exempt.mjs",
-    "install.sh", "install.ps1"]
+    "pipeline/lib/yaml.mjs", "install.sh", "install.ps1"]
   # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
   # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other
   # pipeline config is an R4-pipeline hit, which is not ignorable, so it stays high (R4-config hits stop raising the level only

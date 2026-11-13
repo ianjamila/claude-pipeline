@@ -33,7 +33,7 @@ test('repo config: the rating tests read this same high_risk_paths list (no hand
   assert.match(src, /CP_HIGH = parseYaml\(.*\.claude\/pipeline\.yml.*\)\.risk\.high_risk_paths/, 'risk-rate-branch.test.mjs must read the real list, not a copy');
   const list = raw.risk.high_risk_paths;
   assert.equal(new Set(list).size, list.length);
-  for (const p of ['pipeline/lib/glob.mjs', 'pipeline/lib/git.mjs', 'pipeline/lib/diff.mjs', 'pipeline/lib/doc-paths.mjs', 'pipeline/lib/docs-exempt.mjs', 'install.sh', 'install.ps1']) {
+  for (const p of ['pipeline/lib/glob.mjs', 'pipeline/lib/git.mjs', 'pipeline/lib/diff.mjs', 'pipeline/lib/doc-paths.mjs', 'pipeline/lib/docs-exempt.mjs', 'pipeline/lib/yaml.mjs', 'install.sh', 'install.ps1']) {
     assert.ok(list.includes(p), p);
   }
 });
