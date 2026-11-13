@@ -588,7 +588,14 @@ function maskRuntime(w) {
   }
   return out;
 }
+// (#269 CI: a segment of many `*` made `[^/]*[^/]*…` backtrack over every split of the name (`bash ${'*'.repeat(20)}.sh` ran for minutes). A run of `*` is one `*` (the same language); a segment that still holds more than
+// SEG_STAR_CAP separate stars is no pattern worth modelling: it is read as matching anything, the refusing side, like an unreadable one below.)
+const SEG_STAR_CAP = 6;
 function surfaceSegRe(seg, ci) {
+  seg = seg.replace(/\*{2,}/g, '*');
+  let stars = 0;
+  for (const c of seg) if (c === '*' || c === SUBST) stars++;
+  if (stars > SEG_STAR_CAP) return /^.*$/s;
   let re = '';
   for (let i = 0; i < seg.length; i++) {
     const c = seg[i];
