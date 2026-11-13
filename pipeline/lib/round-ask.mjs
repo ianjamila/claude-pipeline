@@ -41,16 +41,21 @@ export function roundsFrom(state) {
 }
 
 // Every item that keeps the outcome from clean, as { id, round, bucket, category, severity, title, file }. A severity or config error makes every item high
-// (and adds a warning): the ask is still written.
-export function openItems(state, outcome, { config, files }, warnings) {
+// (and adds a warning): the ask is still written. `baseConfig`: the trusted base config (itemSeverity takes the union of both sensitive lists); `baseProblem` (why it
+// could not be read) shows every item as high, as defer-fixes refuses on it.
+export function openItems(state, outcome, { config, files, baseConfig, baseProblem }, warnings) {
   const ids = new Set([...outcome.newAccepted, ...outcome.unimplemented, ...outcome.openBlocking, ...outcome.pending, ...outcome.needsHuman]);
   const found = (state?.rounds ?? []).flatMap((r) => (r.items ?? []).map((item) => ({ item, round: item.round ?? r.n }))).filter(({ item }) => ids.has(item.id));
   let broken = false;
+  if (baseProblem) {
+    broken = true;
+    warnings.push(`severity could not be judged: the trusted base config is unreadable (${asciiLine(baseProblem, 120)}): every open item is shown as high`);
+  }
   return found.map(({ item, round }) => {
     let severity = 'high';
     if (!broken) {
       try {
-        severity = itemSeverity(item, { state, config, files }).level;
+        severity = itemSeverity(item, { state, config, files, baseConfig }).level;
       } catch (err) {
         broken = true;
         warnings.push(`severity could not be judged (${asciiLine(err?.message, 120)}): every open item is shown as high`);
