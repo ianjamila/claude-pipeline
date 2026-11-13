@@ -163,3 +163,4 @@ full record.
 - 2026-11-13 · #269 · Click to approve: merge, extra round and rulings as a choice dialog (#261) · risk high · rounds 24 · arbiter 23 · blocked
 - 2026-11-13 · #364 · fix(risk): trusted fork from the remote default branch; stacked-PR range; round-ask severity under base config · risk high · rounds 3 · arbiter 2 · awaiting-owner-merge
 - 2026-11-13 · #405 · Redraft safety: reconcile lost replies, --before-push, approval warning, hold-release retries · risk high · rounds 1 · arbiter 0 · blocked
+- 2026-11-13 · #406 · Workflow audit: warn when draft_while_iterating prerequisites are missing · risk high · rounds 1 · arbiter 0 · blocked
