@@ -10,7 +10,7 @@ import { GhError } from '../lib/proc.mjs';
 import { withMergeLock } from '../lib/hold.mjs';
 import { disableAutoMerge } from '../lib/finalgate.mjs';
 import { QueueRecordUnreadable, QueueUnreadable, queueModeFor, readQueueRecord } from '../lib/merge-queue.mjs';
-import { RELEASE_REASONS, holdsConfigured, ownSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
+import { RELEASE_REASONS, holdsConfigured, ownSuccessor, releaseHoldTwice, unreleasedWarning } from '../lib/merge-hold.mjs';
 import { GitError, currentBranch, headSha, isAncestor } from '../lib/git.mjs';
 import { APPROVAL_LABELS } from '../lib/guard-provenance.mjs';
 
@@ -20,10 +20,9 @@ const REASON_CODES = Object.keys(RELEASE_REASONS);
 // Matched against gh's STDERR only: the error message also carries the gh arguments (a repo named `network`) and GitHub's own refusals ('Could not resolve to a node').
 const UNREACHABLE = /HTTP 5\d\d|timed? ?out|rate limit|could not resolve host|connection|network|EOF|ECONN|ETIMEDOUT/i;
 // After a convert error the PR is read again (reconcile): up to RECONCILE_READS times, RECONCILE_PAUSE_MS apart (a definite rejection is read once).
-// A hold release that was not confirmed is run once more after HOLD_RETRY_PAUSE_MS. PIPELINE_REDRAFT_PAUSE_MS can only SHORTEN both pauses (tests).
+// PIPELINE_REDRAFT_PAUSE_MS can only SHORTEN that pause and the one before the second hold release (lib/merge-hold.mjs#releaseHoldTwice; tests).
 const RECONCILE_READS = 3;
 const RECONCILE_PAUSE_MS = 2000;
-const HOLD_RETRY_PAUSE_MS = 3000;
 const RECONCILE_FIELDS = ['number', 'state', 'isDraft', 'headRefOid', 'autoMergeRequest'];
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pauseOf = (env, ms) => {
@@ -217,13 +216,7 @@ async function redraftLocked({ pr, reason, beforePush, root, config, env, gh, ct
   // 3. The merge hold. Before the conversion: if that fails, the PR has still left the merge line (the safe side). A draft whose head is the pipeline's
   // own catch-up successor keeps the hold it took for that catch-up. A release that is not confirmed is run once more after a short pause.
   if (holdsConfigured(config) && !(wasDraft && typeof head === 'string' && ownSuccessor({ root, pr, head, gh }))) {
-    let rel = await releaseHold({ config, pr, reason, root, env, run: ctx.runHold });
-    let attempts = 1;
-    if (rel.configured && rel.confirmed !== true) {
-      await sleep(pauseOf(env, HOLD_RETRY_PAUSE_MS));
-      rel = await releaseHold({ config, pr, reason, root, env, run: ctx.runHold });
-      attempts = 2;
-    }
+    const { rel, attempts } = await releaseHoldTwice({ config, pr, reason, root, env, run: ctx.runHold, sleep });
     if (rel.configured) {
       result.holdRelease = { reason, confirmed: rel.confirmed === true, attempts, code: rel.code ?? null, lines: rel.lines ?? [], ...(rel.notStarted ? { notStarted: true } : {}) };
       if (!result.holdRelease.confirmed) {

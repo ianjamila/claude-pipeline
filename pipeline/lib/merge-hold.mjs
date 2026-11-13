@@ -118,6 +118,20 @@ export async function releaseHold({ config, pr, reason, root, env, run = runShel
   return runWrite((c) => c.merge.hold_release_command, { pr: String(pr), reason: quoteReason(RELEASE_REASONS[reason]) }, { config, root, env, run });
 }
 
+// A release that is not confirmed is run once more after a short pause (a label write can lose a race with GitHub's own event; the command is idempotent: releasing
+// a hold that is not there is the provider's no-op, exit 0). -> { rel, attempts } with rel as releaseHold answers (rel.configured false: nothing ran, attempts 0).
+// PIPELINE_REDRAFT_PAUSE_MS can only SHORTEN the pause (tests).
+export const HOLD_RETRY_PAUSE_MS = 3000;
+export async function releaseHoldTwice({ config, pr, reason, root, env, run = runShellAsync, sleep = defaultSleep }) {
+  let rel = await releaseHold({ config, pr, reason, root, env, run });
+  if (!rel.configured) return { rel, attempts: 0 };
+  if (rel.confirmed === true) return { rel, attempts: 1 };
+  const n = Number(env?.PIPELINE_REDRAFT_PAUSE_MS);
+  await sleep(Number.isInteger(n) && n >= 0 && n < HOLD_RETRY_PAUSE_MS ? n : HOLD_RETRY_PAUSE_MS);
+  rel = await releaseHold({ config, pr, reason, root, env, run });
+  return { rel, attempts: 2 };
+}
+
 // The PR numbers a merge command's output says this PR is queued behind: { prs:[A,…] } (in order, no repeats) or null when the
 // text never says it. Read from the FULL stdout+stderr, not a display tail (the line may sit above 30 others). On a line with the
 // verdict the numbers are those after "queued behind" (EagleWatch's wording; a title like "Fix #5" on the same line is no PR
