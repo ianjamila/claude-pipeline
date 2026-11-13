@@ -95,9 +95,9 @@ export function matcherMatchesDialog(matcher, tool = DIALOG_TOOL) {
 // double quotes), and a Windows path is written with forward slashes (`node C:/Users/me/x.mjs`) or in single quotes. Only a drive-letter path counts as absolute there (UNC is refused, below) (a rooted `\x` or a
 // drive-relative `C:x` is ambiguous: refused). The already-split target is then normalised to native separators (scriptTarget), so it matches the path the file is opened by.
 const isWin = (platform) => platform === 'win32';
-const pathOf = (platform) => (isWin(platform) ? path.win32 : path);
+const pathOf = (platform) => (isWin(platform) ? path.win32 : path.posix);
 // A UNC / `//server` path is refused (#269: reading a network share to fingerprint it can leak credentials and the bytes can change between hash and run).
-const isAbsoluteOn = (p, platform) => (isWin(platform) ? /^[A-Za-z]:[\\/]/.test(p) && path.win32.isAbsolute(p) : path.isAbsolute(p));
+const isAbsoluteOn = (p, platform) => (isWin(platform) ? /^[A-Za-z]:[\\/]/.test(p) && path.win32.isAbsolute(p) : path.posix.isAbsolute(p));
 
 // Words of a simple command line: whitespace separates, '...' and "..." group. Anything a shell would interpret (pipes, redirects, substitutions, globs, escapes, variables other than a leading HOME) -> null.
 // `rootRisky`: the plugin install path would be split or expanded by a shell when written unquoted, so an unquoted ROOT_MARK is refused.

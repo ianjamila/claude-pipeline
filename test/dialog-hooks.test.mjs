@@ -317,7 +317,7 @@ test('R1-F3: handler args are resolved with the command, listed with it, and par
 test('R1-B2/B3: front matter in quoted / flow forms and in commands and plugin skills, agents, commands, manifest locations is inventoried', () => {
   const w = world();
   const hooked = (key) => `---\nname: s\n${key}\n  PostToolUse:\n    - matcher: x\n---\nbody\n`;
-  const kinds = () => w.handlers().handlers.filter((h) => h.command === '(frontmatter hooks)').map((h) => h.source.replace(w.home, '~'));
+  const kinds = () => w.handlers().handlers.filter((h) => h.command === '(frontmatter hooks)').map((h) => tilde(h.source, w.home));
   w.script('.claude/skills/q/SKILL.md', hooked('"hooks":').replace('PostToolUse:', 'PreToolUse:'));
   w.script('.claude/commands/c.md', '﻿--- \n{hooks: {PreToolUse: []}}\n---\n');
   w.script('.claude/commands/ns/d.md', '---\n<<: *x\n---\n');
@@ -376,7 +376,7 @@ test('R2-B1 / R2-F4: the inventory reads an indented root mapping, a bare-CR hoo
   w.script('.claude/skills/ind/SKILL.md', '---\n  name: custom\n  hooks:\n    PreToolUse:\n      - matcher: AskUserQuestion\n---\n');
   w.script('.claude/skills/cr/SKILL.md', '---\nname: x\rhooks:\r  PreToolUse:\r    - matcher: AskUserQuestion\n---\n');
   w.script('.claude/skills/dots/SKILL.md', '---\nname: x\n...\nhooks:\n  PreToolUse:\n    - matcher: AskUserQuestion\n---\n');
-  const src = w.handlers().handlers.filter((h) => h.command === '(frontmatter hooks)').map((h) => h.source.replace(w.home, '~')).sort();
+  const src = w.handlers().handlers.filter((h) => h.command === '(frontmatter hooks)').map((h) => tilde(h.source, w.home)).sort();
   assert.deepEqual(src, ['~/.claude/skills/cr/SKILL.md', '~/.claude/skills/dots/SKILL.md', '~/.claude/skills/ind/SKILL.md']);
 });
 
