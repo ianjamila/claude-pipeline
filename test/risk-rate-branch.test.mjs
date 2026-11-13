@@ -1,6 +1,9 @@
 // rateBranch: the whole rating decision under the working-tree config AND the config committed at the default branch's fork point, stricter wins.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { rateBranch } from '../pipeline/lib/risk.mjs';
@@ -8,13 +11,8 @@ import { rateBranch } from '../pipeline/lib/risk.mjs';
 const yml = (extra = '') => `version: 1\nproject: p\nverify:\n  full: f\n  quick: q\n${extra}`;
 const lines = (n, tag = 'x') => Array.from({ length: n }, (_, i) => `export const ${tag}${i} = ${i};`).join('\n') + '\n';
 
-// The cp-like config: chat approval, every path a P-path hit, the high-risk list PR B gives claude-pipeline (R3-6).
-const CP_HIGH = [
-  'pipeline/hooks/**', 'pipeline/lib/hardstops.mjs', 'pipeline/lib/finalgate.mjs', 'install.mjs', 'pipeline/lib/installer.mjs', 'pipeline/lib/risk.mjs',
-  'pipeline/lib/config.mjs', 'pipeline/commands/codex-review.mjs', 'pipeline/commands/review-complete.mjs', 'pipeline/commands/arbiter.mjs',
-  'pipeline/commands/merge.mjs', 'pipeline/lib/triage.mjs', 'pipeline/lib/owner-grants.mjs', 'pipeline/lib/review-marker.mjs',
-  'pipeline/lib/floor-proof.mjs', 'pipeline/lib/model-floor.mjs', 'package.json', '**/.githooks/**', '**/.husky/**',
-];
+// The cp-like config: chat approval, every path a P-path hit, and the repo's own high-risk list (read from .claude/pipeline.yml so the fixture can't drift).
+const CP_HIGH = parseYaml(fs.readFileSync(fileURLToPath(new URL('../.claude/pipeline.yml', import.meta.url)), 'utf8')).risk.high_risk_paths;
 const cpYml = (ignore = '[P-path, R4-config]') => yml(
   `owner_approval: chat\nhard_stops:\n  paths: ["**"]\nrisk:\n  high_risk_paths: [${CP_HIGH.map((p) => JSON.stringify(p)).join(', ')}]\n  ignore_hard_stop_rules: ${ignore}\n`,
 );
