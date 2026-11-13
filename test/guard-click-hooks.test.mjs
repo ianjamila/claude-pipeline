@@ -1231,6 +1231,31 @@ test('R22: a case in a declined ${…}, brackets across expansions in arithmetic
   assert.deepEqual(blocked, [], 'these R22 lines were refused');
 });
 
+test('R23: a declined ${…} in a case pattern, subscripts across line breaks, and nested $( ) regions in arithmetic are refused', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json'; // (built at run time, as in R19)
+  const failures = [];
+  for (const cmd of [
+    // R23-F1: the ) inside the braces is no end of the pattern, so the # is no comment
+    'case x in ${y:-{) # $(' + cp + ')}}) true;; esac',
+    // R23-B1: a continuation between the name and [
+    "cat <<'E' >/dev/null; a\\\n[0\n+$(" + cp + ')]=1\nE\ntrue\n',
+    // R23-F2: an operator inside the subscript before the newline; the heredoc opened after it
+    "cat <<'E' >/dev/null; a[0;\n+$(" + cp + ')]=1\nE\ntrue\n',
+    "a[0; cat <<'E' >/dev/null\n+$(" + cp + ')]=1\nE\ntrue\n',
+    // R23-F3: a nested $( ) whose case arm ) the raw count takes for its end
+    'd=.clau; echo $(( $(case x in a) echo ${x:-(} [ ;; esac) ] > ~/${d}de/settings.json ))',
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R23 lines were not refused');
+  const blocked = [];
+  for (const cmd of [
+    'case x in ${y:-a}) echo hi;; esac',
+    "cat <<'E' > f; a[0]=1\nbody\nE\necho done",
+    'echo $(( $(echo a[1]) + 1 ))',
+    'echo $(( $(wc -l <f) + 1 ))',
+  ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
+  assert.deepEqual(blocked, [], 'these R23 lines were refused');
+});
+
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------
 
 test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] argument no longer hide a fed interpreter', () => {

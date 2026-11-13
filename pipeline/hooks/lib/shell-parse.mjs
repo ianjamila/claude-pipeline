@@ -718,20 +718,23 @@ export const ZSH_NAME_BINDERS = new Set(['vared', 'zparseopts', 'strftime', 'zst
 // outside it (nor the reverse). Each region (the text, each `${…}`, each `$( )`) must balance on its own: a stack of counters, one per open region.
 const arithEnd = (s, i, skip = 3) => {
   let depth = 0;
+  let subs = 0; // (open `$( )` regions)
   const regions = [{ brackets: 0, brace: 0, parenAt: -1 }]; // (the text itself; a `${` region ends at its matching `}`, a `$(` region when its `)` brings depth back to parenAt)
   for (let j = i + skip; j < s.length; j++) {
     const c = s[j];
     if (c === '"' || c === "'" || c === '`' || c === '\\') return -1;
+    // (#269 R23-F3) inside a nested `$( )` the shell does not count a case-arm `)`, nor one in a comment or a heredoc body, so the raw count would close the region early: not provably arithmetic
+    if (subs > 0 && (c === '#' || c === '\n' || (c === '<' && s[j + 1] === '<') || ((c === 'c' || c === 'e') && !/[\w-]/.test(s[j - 1] ?? ' ') && /^(?:case|esac)(?![\w-])/.test(s.slice(j, j + 5))))) return -1;
     const top = regions[regions.length - 1];
     if (c === '$' && s[j + 1] === '{') { regions.push({ brackets: 0, brace: 1, parenAt: -1 }); j++; continue; }
-    if (c === '$' && s[j + 1] === '(') { regions.push({ brackets: 0, brace: 0, parenAt: depth }); continue; } // (the `(` itself is counted on the next turn)
+    if (c === '$' && s[j + 1] === '(') { regions.push({ brackets: 0, brace: 0, parenAt: depth }); subs++; continue; } // (the `(` itself is counted on the next turn)
     if (c === '{' && top.brace > 0) top.brace++;
     else if (c === '}' && top.brace > 0) { if (--top.brace === 0) { if (top.brackets !== 0) return -1; regions.pop(); } }
     else if (c === '(') depth++;
     else if (c === '[') top.brackets++;
     else if (c === ']') { if (top.brackets === 0) return -1; top.brackets--; }
     else if (c === ')') {
-      if (depth > 0) { depth--; if (top.parenAt === depth) { if (top.brackets !== 0) return -1; regions.pop(); } }
+      if (depth > 0) { depth--; if (top.parenAt === depth) { if (top.brackets !== 0) return -1; regions.pop(); subs--; } }
       else return s[j + 1] === ')' && regions.length === 1 && top.brackets === 0 ? j + 2 : -1;
     }
   }
@@ -2101,19 +2104,29 @@ const REFUSED_HEREDOC_NL = 'a newline inside an array literal `NAME=( … )`, a 
 // The raw text of a command up to a newline: does it hold an assignment-looking word `name[` whose `]` is not plainly there (bash reads such a subscript across newlines)? Fail-closed: any quote, `$`, backtick,
 // backslash or parenthesis before the close counts as not closed, and so does a text too long to scan.
 const SUBSCRIPT_AT = /(?:^|[\s;&|()])[A-Za-z_][A-Za-z0-9_]*\+?\[/g;
-const unclosedSubscript = (raw) => {
+const unclosedSubscript = (rawLine) => {
+  const raw = rawLine.replace(/\\\r?\n/g, ''); // (#269 R23-B1: the shell drops a backslash-newline before it reads the name)
   if (raw.length > 4096) return raw.includes('[');
+  let closedTo = 0;
   for (const m of raw.matchAll(SUBSCRIPT_AT)) {
+    const from = m.index + m[0].length;
+    if (from < closedTo) continue; // (#269 R23-F4: a match inside a subscript that closed is closed too: it has the same `]` and no character that breaks the scan; one pass)
     let depth = 1;
-    for (let k = m.index + m[0].length; k < raw.length && depth > 0; k++) {
+    for (let k = from; k < raw.length && depth > 0; k++) {
       const c = raw[k];
       if (c === '[') depth++;
-      else if (c === ']') depth--;
+      else if (c === ']') { if (--depth === 0) closedTo = k + 1; }
       else if (/[$`'"\\()]/.test(c)) break;
     }
     if (depth > 0) return true;
   }
   return false;
+};
+// (#269 R23-F2) where the logical line holding `at` begins: after the last newline that is not a continuation
+const logicalLineStart = (s, at) => {
+  let st = at;
+  while (st > 0 && !(s[st - 1] === '\n' && !(s[st - 2] === '\\' || (s[st - 2] === '\r' && s[st - 3] === '\\')))) st--;
+  return st;
 };
 // (#269 R19-F2) what to write instead, per refusal (the `$(cmd)` advice does not fit arithmetic that already holds one)
 export function refusalAdvice(reason) {
@@ -2603,7 +2616,9 @@ class Parser {
         this.i++;
       } else if (c === '\n') {
         if (this.dbrace > 0) this.markRefused(REFUSED_PARAM); // (#269 R21-F1)
-        if (this.hd.length && seg && unclosedSubscript(s.slice(seg.start, this.i))) this.markRefused(REFUSED_HEREDOC_NL); // (#269 R22-F4: bash reads an assignment subscript across the newline)
+        // (#269 R22-F4, R23-F2) bash reads an assignment subscript across the newline, through `;` `&` `|` `)`: the whole logical line is checked, and so is every earlier line (one that left a subscript open makes a heredoc opened later suspect)
+        if (unclosedSubscript(s.slice(logicalLineStart(s, this.i), this.i))) this.subNl = true;
+        if (this.subNl && this.hd.length) this.markRefused(REFUSED_HEREDOC_NL);
         const had = !!seg || inWord;
         endSeg(this.i);
         if (had) lastSep = ';';
@@ -2898,6 +2913,7 @@ class Parser {
       else if (c === '`') { this.i = i; this.backtick(depth); i = this.i; }
       else if (c === '$' && s[i + 1] === "'") i = readAnsiC(s, i + 1).next;
       else if (c === '$' && s[i + 1] === '{' && this.paramSpan(i) > 0) i = this.paramSpan(i);
+      else if (c === '$' && s[i + 1] === '{') { this.markRefused(REFUSED_PARAM); i++; } // (#269 R23-F1: paramSpan declined it; read on character by character, a `)` inside the braces would end the pattern early)
       else if (c === '(') { if (d++ === 0) gOpen = i + 1; i++; }
       else if (c === ')') { if (--d === 0) this.qualifierCode(s.slice(gOpen, i), s.slice(gOpen, i), depth, false); i++; }
       else i++;

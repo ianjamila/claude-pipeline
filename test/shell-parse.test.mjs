@@ -1168,3 +1168,72 @@ test('R22-F4: a newline inside an unclosed NAME[ … of an assignment word while
     assert.equal(simpleCommands(c).truncated, false, c);
   }
 });
+
+// #269 R23: a declined ${ in a case pattern; the subscript check over the whole logical line; nested $( ) regions in arithmetic; one-pass subscript scan
+test('R23-F1: a ${…} that paramSpan declines inside a case pattern is refused (its ) is no end of the pattern); an ordinary ${…} pattern still parses', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json';
+  const notRefused = [];
+  for (const c of [
+    'case x in ${y:-{) # $(' + cp + ')}}) true;; esac',
+    'case x in ${y:-{) # $(' + cp + ')}}) true;; esac # tail',
+    'case x in a|${y:-$(true)) # $(' + cp + ')}) true;; esac',
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ['case x in ${y:-a}) echo hi;; esac', 'case x in a|${y}) echo hi;; esac', 'case "$x" in ${y:-a}|b) echo hi;; esac']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R23-B1 / R23-F2: the unclosed-subscript check joins continuations and reads the whole logical line, not the current segment; a subscript newline earlier on the line counts too', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json';
+  const notRefused = [];
+  for (const c of [
+    "cat <<'E' >/dev/null; a\\\n[0\n+$(" + cp + ')]=1\nE\ntrue\n', // continuation between the name and [
+    "cat <<'E' >/dev/null; a\\\r\n[0\n+$(" + cp + ')]=1\nE\ntrue\n',
+    "cat <<'E' >/dev/null; a[0;\n+$(" + cp + ')]=1\nE\ntrue\n', // ; & | ) inside the subscript before the newline
+    "cat <<'E' >/dev/null; a[0&&\n+$(" + cp + ')]=1\nE\ntrue\n',
+    "cat <<'E' >/dev/null; a[0|\n+$(" + cp + ')]=1\nE\ntrue\n',
+    "cat <<'E' >/dev/null; a[0)\n+$(" + cp + ')]=1\nE\ntrue\n',
+    "a[0; cat <<'E' >/dev/null\n+$(" + cp + ')]=1\nE\ntrue\n', // the heredoc is opened after the ;
+    "a[0\nb; cat <<'E' >/dev/null\n+$(" + cp + ')]=1\nE\ntrue\n', // the subscript newline came on an earlier line
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ["cat <<'E' > f; a[0]=1\nbody\nE\ntouch ran", "cat <<'E' > f; a\\\n[0]=1\nbody\nE\ntouch ran", "cat <<'E'; echo a[1]; echo b;\nbody\nE\ntouch ran", 'a[0\n+1]=1\ntouch ran']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R23-F3: arithmetic holding a nested $( ) with a case, a #, a << or a newline is not proven arithmetic (the shell does not count its parentheses like the raw count does)', () => {
+  const notRefused = [];
+  for (const open of ['echo $((', '((']) {
+    for (const body of [
+      ' $(case x in a) echo ${x:-(} [ ;; esac) ] > out ',
+      ' $(echo hi # ) ${x:-(}\n) [ ) ] > out ',
+      ' $(cat <<E\nx )\nE\n echo ${x:-(} [ ) ] > out ',
+      ' $(echo a; case x in a) echo ;; esac; echo ${x:-(} [) ] > out ',
+    ]) {
+      const r = simpleCommands(open + body + '))');
+      if (!(r.truncated && r.refused)) notRefused.push(open + body + '))');
+    }
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ['echo $(( $(echo a[1]) + 1 ))', 'echo $(( $(wc -l <f) + 1 ))', '(( $(echo a[1]) > 0 )) && echo y', 'echo $(( $(echo $(echo 1)) + 1 ))']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R23-F4: the unclosed-subscript scan is one pass: a ~4000-char line of nested closed name[ openers with a heredoc pending parses fast', () => {
+  const line = 'a[ '.repeat(1000) + ']'.repeat(1000);
+  const cmd = "cat <<'E' > f; " + line + '\nbody\nE\ntouch ran';
+  const t0 = performance.now();
+  const r = simpleCommands(cmd);
+  const ms = performance.now() - t0;
+  assert.ok(ms < 200, 'took ' + ms + ' ms');
+  assert.equal(typeof r.truncated, 'boolean');
+});
