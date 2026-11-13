@@ -55,8 +55,9 @@ risk:
   # preflight wrappers, and the owner-only, command-guard and ci-wait libs they use), the claude-ancestry and branch-protection libs, the
   # comment command, the update command and its schedule lib (the set also covers the owner-only guards: update and the model-floor
   # reset), and the render (markers, forgery defence), upstream, private-tmp and auto-update libs, plus the resumed-run guard (the run
-  # record and its cost shape check, the summary comment with its viewer-only filter, run-progress, and the checkpoint command, the only
-  # writer of record.resumed), the installer's scan, stacks and schedule libs with the jobs lib behind the install admission, the schedule
+  # record and its cost shape check, the summary comment with its viewer-only filter, run-progress, and the checkpoint command, which
+  # stamps the mark; run-progress and run-record also write and carry it, and run-events holds the append-only run-resumed evidence the merge
+  # gate reads), the installer's scan, stacks and schedule libs with the jobs lib behind the install admission, the schedule
   # builder, and the files that write the gate file (cmd-io) or word a merge result (merge-cleanup), plus the classification itself: the
   # test that holds the exemption maps (DEPTH1_EXEMPT, COMMANDS_EXEMPT) and the import scanner it runs (test/fixtures/static-imports.mjs) are
   # listed, so an edit to either rates high (they are depth-1 roots of their own check like every other literal .mjs entry).
