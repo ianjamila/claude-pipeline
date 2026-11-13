@@ -30,8 +30,22 @@ const isAbsolutePosix = (s, platform = process.platform) => s.startsWith('/') ||
 
 // Normalised POSIX form: absolute, ".." resolved, no trailing slash (except a bare root), and
 // lower-cased on case-insensitive platforms.
+// (an absolute path normalises the same whatever the working directory, so those answers are kept, bounded: the guards ask about the same roots and words again and again)
+const normalised = new Map();
 function normalise(p, platform) {
-  let s = toPosix(p);
+  const s0 = toPosix(p);
+  if (!isAbsolutePosix(s0, platform) || s0.length > 512) return normaliseUncached(s0, platform);
+  const key = `${platform}\0${s0}`;
+  let out = normalised.get(key);
+  if (out === undefined) {
+    out = normaliseUncached(s0, platform);
+    if (normalised.size >= 8192) normalised.clear();
+    normalised.set(key, out);
+  }
+  return out;
+}
+function normaliseUncached(p, platform) {
+  let s = p;
   if (!isAbsolutePosix(s, platform)) s = `${toPosix(process.cwd())}/${s}`;
   const unc = /^\/\/[^/]/.test(s); // keep a UNC prefix; posix.normalize would collapse "//" to "/"
   // (on Windows `..` stops at the drive root and at the share root of a UNC path)

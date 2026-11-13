@@ -277,8 +277,10 @@ function makeCtx(opts) {
   const cfgDir = configDirOf(opts.env ?? process.env, homePosix);
   const transcriptRoots = unique([cfgDir, cfgDir && realResolve(cfgDir, api)].filter(Boolean));
   const transcripts = transcriptRes(transcriptRoots, ci, unique([homePosix, realResolve(homePosix, api)]));
-  const pipelineHit = (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); };
-  const pipelineAncestor = (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); };
+  // (one evaluation asks about the same words again and again: the answers are kept, bounded)
+  const memo = (fn) => { const seen = new Map(); return (p) => { const k = String(p); let v = seen.get(k); if (v === undefined) { v = fn(k); if (seen.size < 4096) seen.set(k, v); } return v; }; };
+  const pipelineHit = memo((p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); });
+  const pipelineAncestor = memo((p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); });
   let rootIds = null;
   // #111: a symlink (or any other spelling) of the cwd's review folder. dev:ino of <cwd>/.review and of each existing
   // <cwd>/.review/round-*; none when the folder is missing (no error). NOT added to rootIds: hitInode walks the ancestors of a
@@ -699,7 +701,21 @@ const HOME_RE = new RegExp(
 const TILDE_RE = /(^|[\s'"`=:(,[{;|&<>+])~(?=\/|$|[\s'"`)\]};|&<>,+])/g;
 const USER_RE = /\$(?:USER|LOGNAME|USERNAME)(?![A-Za-z0-9_])|\$\{(?:USER|LOGNAME|USERNAME)\}|\$\(\s*(?:whoami|logname|id\s+-un)\s*\)|`\s*(?:whoami|logname|id\s+-un)\s*`|%USERNAME%|\$env:USERNAME\b/gi;
 
+const HOME_HINT = /[~$%`]|home|userprofile/i; // (every alternative of HOME_RE and TILDE_RE holds one of these: a text without any is returned as it is)
+const homeRefsSeen = new Map();
 function expandHomeRefs(text, home) {
+  if (!HOME_HINT.test(text)) return text;
+  if (text.length > 256) return expandHomeRefsUncached(text, home);
+  const key = `${home}\0${text}`;
+  let out = homeRefsSeen.get(key);
+  if (out === undefined) {
+    out = expandHomeRefsUncached(text, home);
+    if (homeRefsSeen.size >= 4096) homeRefsSeen.clear();
+    homeRefsSeen.set(key, out);
+  }
+  return out;
+}
+function expandHomeRefsUncached(text, home) {
   const mark = freeMark(text + home);
   return text
     .replace(HOME_RE, (_m, glue) => home + mark + (glue ? (glue.includes('+') ? '' : '/') : ''))
@@ -1257,10 +1273,11 @@ function makeMatchers(ctx) {
   const ALIAS_WORD = /[^\s'"`;|&<>(){}[\],=*?$]+/g;
   const ALIAS_WORD_WIDE = /[^\s'"`;|&<>(){}[\]*?$]+/g;
   const aliasInText = (v, dirs) => {
-    if (v.length > MAX_ALIAS_TEXT) return ctx.hasReviewDir();
+    if (!ctx.hasReviewDir()) return false; // (no review folder: nothing below can match, see hitReviewInode)
+    if (v.length > MAX_ALIAS_TEXT) return true;
     const where = dirs?.length ? dirs : [ctx.cwd];
     const words = new Set([...(v.match(ALIAS_WORD) ?? []), ...(v.match(ALIAS_WORD_WIDE) ?? [])]);
-    if (words.size * where.length > MAX_ALIAS_LOOKUPS) return ctx.hasReviewDir();
+    if (words.size * where.length > MAX_ALIAS_LOOKUPS) return true;
     for (const word of words) {
       if (!/[A-Za-z0-9]/.test(word)) continue;
       const e = word === '~' || word.startsWith('~/') ? pathsFor().join(ctx.homePosix, word.slice(1)) : word;
