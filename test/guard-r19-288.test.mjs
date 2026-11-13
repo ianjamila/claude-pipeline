@@ -170,7 +170,7 @@ describe('#288 CI H2: a very long lone command word is not an AUTO_CD directory'
       const t0 = cpu();
       run(fill(unit), PROJ);
       const ms = cpu() - t0;
-      assert.ok(ms < 1500, `${Math.round(ms)} ms of CPU`); // (main: ~0.2-0.6 s locally; one pass per assumed directory took 2-3.5 s)
+      assert.ok(ms < 2500, `${Math.round(ms)} ms of CPU`); // (main: ~0.2-0.6 s locally, ~4x on a Windows runner: the 2500 ms of test/guard-t8b.test.mjs; one pass per assumed directory took 2-3.5 s locally, #393)
     });
   }
 });
