@@ -79,7 +79,7 @@ test('R9-F1: coverage is what the Read RETURNED, not what it asked for', () => {
   assert.equal(readsCoverFile([{ ...read({ offset: 1, limit: 50 }), returned: undefined }], FILE, 50), false, 'a call without a parsed range');
 });
 
-test('toolCallsOf keeps, for a Read, the range of line numbers its result showed (from the tool_result text; a partial result counts only the lines it shows)', () => {
+test('toolCallsOf keeps, for a Read, the range of line numbers its result showed (from the numbered rows of the tool_result text)', () => {
   const call = (id, input, content, extra = {}) => [
     { type: 'assistant', message: { content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: FILE, ...input } }] } },
     { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content, ...extra }] } },
@@ -90,14 +90,14 @@ test('toolCallsOf keeps, for a Read, the range of line numbers its result showed
     ...call('b', { offset: 525 }, text(124, 525)),
     ...call('c', { offset: 0 }, text(3)), // offset 0 returns from line 1
     ...call('d', {}, [{ type: 'text', text: text(2, 10) }]), // block content
-    ...call('e', {}, `${text(2)}\n\n<system-reminder>PARTIAL view: showing lines 1-1 of 9 total (26233 tokens, cap 25000)</system-reminder>`), // the note limits it to what it shows
+    ...call('e', {}, `${text(2)}\n\n<system-reminder>PARTIAL view: showing lines 1-1 of 9 total (26233 tokens, cap 25000)</system-reminder>`), // R10-B1: the numbered rows decide; no clamp by a note
     ...call('f', {}, 'ok'), // no numbered lines
     ...call('g', {}, `1\ta\n3\tc`), // a gap in the numbers
     ...call('h', {}, text(4), { is_error: true }),
     ...call('i', {}, `  7\u2192seven\n  8\u2192eight`), // arrow-separated numbers
   ];
   const got = toolCallsOf(rows.map((l) => JSON.stringify(l)).join('\n')).map((c) => c.returned);
-  assert.deepEqual(got, [{ first: 1, last: 524 }, { first: 525, last: 648 }, { first: 1, last: 3 }, { first: 10, last: 11 }, { first: 1, last: 1 }, null, null, null, { first: 7, last: 8 }]);
+  assert.deepEqual(got, [{ first: 1, last: 524 }, { first: 525, last: 648 }, { first: 1, last: 3 }, { first: 10, last: 11 }, { first: 1, last: 2 }, null, null, null, { first: 7, last: 8 }]);
 });
 
 test('readResultText models Read: numbered lines, offset 0 from line 1, a cap that stops early', () => {
@@ -146,4 +146,70 @@ test('R9-F1: a file needs max(ceil(lines / 2000), ceil(estimated tokens / READ_T
 test('R9-F2: a long line is not a reason to refuse: a 10,000-character line is just counted in the token estimate', () => {
   const r = unreadablePacket([{ rel: 'a', content: `ok\n${'y'.repeat(10000)}\nfine\n` }]);
   assert.equal(r, null);
+});
+
+// ---- R10-B1 / R10-F1 / R10-F2 ----
+
+const resultOf = (id, input, content) => [
+  { type: 'assistant', message: { content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: FILE, ...input } }] } },
+  { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content }] } },
+];
+const callsFor = (...results) => toolCallsOf(results.flat().map((l) => JSON.stringify(l)).join('\n'));
+const numbered = (arr, from = 1) => arr.map((t, i) => `${from + i}\t${t}`).join('\n');
+
+test('R10-B1: file text that contains "showing lines A-B" does not shrink or null the credited range', () => {
+  const fileLines = ['# agent', 'it says "PARTIAL view: showing lines 1-1 of 9" in its text', 'last'];
+  const calls = callsFor(resultOf('a', {}, numbered(fileLines)));
+  assert.deepEqual(calls[0].returned, { first: 1, last: 3 });
+  assert.equal(readsCoverFile(calls, FILE, 3, `${fileLines.join('\n')}\n`), true);
+  const odd = callsFor(resultOf('b', {}, numbered(['x', 'showing lines 5-9 here', 'y'])));
+  assert.deepEqual(odd[0].returned, { first: 1, last: 3 }, 'a phrase naming other lines nulls nothing');
+});
+
+test('R10-F1: a row is credited only when its text equals the file\'s line; coverage ends before the first row that differs', () => {
+  const file = ['alpha', 'bravo', 'charlie', 'delta'];
+  const text = `${file.join('\n')}\n`;
+  // a row cut short (line 2 returned as "brav"): lines 2.. are not credited, nor are later lines that match
+  const cut = callsFor(resultOf('a', {}, numbered(['alpha', 'brav', 'charlie', 'delta'])));
+  assert.equal(readsCoverFile(cut, FILE, 4, text), false);
+  const withFollow = callsFor(resultOf('a', {}, numbered(['alpha', 'brav', 'charlie', 'delta'])), resultOf('b', { offset: 3 }, numbered(['charlie'], 3)));
+  assert.equal(readsCoverFile(withFollow, FILE, 4, text), false, 'line 2 and 4 stay unread');
+  const fixed = callsFor(resultOf('a', {}, numbered(['alpha', 'brav'])), resultOf('b', { offset: 2 }, numbered(['bravo', 'charlie', 'delta'], 2)));
+  assert.equal(readsCoverFile(fixed, FILE, 4, text), true, 'the re-Read of the cut line completes it');
+  // the first row cut short credits nothing
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['alp', 'bravo', 'charlie', 'delta']))), FILE, 4, text), false);
+  // a trailing \r on either side is ignored
+  const crlf = 'one\r\ntwo\r\n';
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['one', 'two']))), FILE, 2, crlf), true, 'file has CR, result has none');
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['one\r', 'two\r']))), FILE, 2, 'one\ntwo\n'), true, 'result has CR, file has none');
+  // text a Read invented (right numbers, wrong text) credits nothing
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['nope', 'nope']))), FILE, 2, 'one\ntwo\n'), false);
+});
+
+test('R10-F1: a 10,000-character line returned whole is credited', () => {
+  const long = 'y'.repeat(10000);
+  const text = `ok\n${long}\nfine\n`;
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['ok', long, 'fine']))), FILE, 3, text), true);
+});
+
+test('R10-F1: a single line over the per-call token budget makes the packet unreadable, naming the file and the line', () => {
+  const huge = 'z'.repeat(READ_TOKENS_PER_CALL * 3 + 10);
+  const r = unreadablePacket([{ rel: 'in.md', content: 'ok\n' }, { rel: 'diff.patch', content: `a\n${huge}\nb\n` }]);
+  assert.ok(r !== null, 'refused');
+  assert.match(r.message, /diff\.patch/);
+  assert.match(r.message, /line 2/);
+  assert.deepEqual([r.longLine.rel, r.longLine.line], ['diff.patch', 2]);
+  assert.equal(unreadablePacket([{ rel: 'a', content: `${'z'.repeat(READ_TOKENS_PER_CALL * 3 - 10)}\n` }]), null, 'a line that just fits is fine');
+});
+
+test('R10-F2: a required file Read cannot return as numbered text makes the packet unreadable, naming it', () => {
+  for (const rel of ['sides/ours/a/logo.png', 'sides/base/x.JPG', 'sides/ours/n.ipynb', 'sides/ours/d.pdf', 'sides/ours/i.jpeg', 'sides/ours/i.gif', 'sides/ours/i.webp', 'sides/ours/i.bmp', 'sides/ours/i.ico']) {
+    const r = unreadablePacket([{ rel: 'in.md', content: 'ok\n' }, { rel, content: 'text-like\n' }]);
+    assert.ok(r !== null, rel);
+    assert.ok(r.message.includes(rel), r.message);
+    assert.equal(r.unreadableFile.rel, rel);
+  }
+  const nul = unreadablePacket([{ rel: 'sides/ours/data.bin', content: 'ab\u0000cd\n' }]);
+  assert.ok(nul !== null && nul.message.includes('sides/ours/data.bin') && /NUL|binary/.test(nul.message));
+  assert.equal(unreadablePacket([{ rel: 'sides/ours/logo.svg', content: '<svg/>\n' }, { rel: 'sides/ours/a.md', content: 'x\n' }]), null, 'svg is text');
 });

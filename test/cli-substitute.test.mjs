@@ -68,7 +68,7 @@ function install(w, prep, o = {}) {
   const lines = [
     { type: 'user', message: { role: 'user', content: prompt }, uuid: 'u0' },
     turn(models[0], 'm0', 'tool_use', calls.map((c, i) => ({ type: 'tool_use', id: `t${i}`, name: c.name, input: c.input }))),
-    { type: 'user', message: { role: 'user', content: calls.map((c, i) => ({ type: 'tool_result', tool_use_id: `t${i}`, content: c.name === 'Read' ? readResultText(c.input, { maxLines: c.maxLines }) : 'ok' })) }, uuid: 'u1' },
+    { type: 'user', message: { role: 'user', content: calls.map((c, i) => ({ type: 'tool_result', tool_use_id: `t${i}`, content: c.name === 'Read' ? readResultText(c.input, { maxLines: c.maxLines, cutRow: c.cutRow }) : 'ok' })) }, uuid: 'u1' },
     turn(models.at(-1), 'm1', 'end_turn', [{ type: 'text', text: fenced(answer) }]),
   ];
   writeFileSync(join(dir, `agent-${agentId}.jsonl`), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
@@ -916,4 +916,60 @@ test('R9-F3: a Read with offset 0 returns from line 1 and counts; offset -1 is s
   const again = w.prepare().json;
   const ok = w.apply(install(w, again, { agentId: 'a2', skipRead: [diff], extraTools: [{ name: 'Read', input: { file_path: diff, offset: 0 } }] }));
   assertExit(ok, 0, ok.stdout + ok.stderr);
+});
+
+test('R10-F1: a Read whose row came back cut short does not credit that line, nor the ones after it; a re-Read of it completes the proof', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const { diff, lines } = diffInfo(w, prep);
+  assert.ok(lines >= 4);
+  const cut = w.apply(install(w, prep, { skipRead: [diff], extraTools: [{ name: 'Read', input: { file_path: diff }, cutRow: 2 }] }));
+  assertExit(cut, 1, cut.stdout + cut.stderr);
+  assert.ok(cut.json.errors.some((e) => e.includes(diff) && /do not cover/.test(e)), cut.stdout);
+  const again = w.prepare().json;
+  const ok = w.apply(install(w, again, { agentId: 'a2', skipRead: [diff], extraTools: [
+    { name: 'Read', input: { file_path: diff }, cutRow: 2 },
+    { name: 'Read', input: { file_path: diff, offset: 2 } },
+  ] }));
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+});
+
+test('R10-F1: prepare refuses packet-unreadable when one line alone is more than a Read call is budgeted at, naming the file and the line', (t) => {
+  const w = longDiffWorld(t, (i) => (i === 3 ? 'y'.repeat(70000) : `line ${i}`), 10);
+  const p = w.prepare();
+  assertExit(p, 1, p.stdout.slice(0, 400));
+  assert.equal(p.json.error, 'packet-unreadable');
+  assert.equal(p.json.longLine.rel, 'diff.patch');
+  assert.ok(p.json.longLine.tokens > 20000 && /diff\.patch/.test(p.json.message), p.stdout.slice(0, 500));
+  assert.ok(!existsSync(w.attemptsFile), 'no attempt was opened');
+});
+
+test('R10-F2 (#360): a resolution packet that would export a conflicted image (.png) file is packet-unreadable at prepare, naming the file', (t) => {
+  const w = world(t);
+  w.repo.checkout('main');
+  w.repo.write('assets/logo.png', 'head\noriginal\nfoot\n');
+  w.base = w.repo.commit('a logo');
+  w.repo.checkout('feat/x');
+  w.repo.git(['rebase', 'main']);
+  w.repo.write('assets/logo.png', 'head\nfeature-side\nfoot\n');
+  w.head = w.repo.commit('feature edits the logo');
+  w.prHead(w.head);
+  assertExit(w.codex(1, findingsOf(), { from: w.base, to: w.head }), 0);
+  w.repo.checkout('main');
+  w.repo.write('assets/logo.png', 'head\nmain-side\nfoot\n');
+  w.repo.commit('main adds a different logo');
+  w.repo.checkout('feat/x');
+  try { w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']); } catch { /* the conflict: resolved below */ }
+  w.repo.write('assets/logo.png', 'head\nfeature-side\nfoot\n');
+  w.repo.git(['add', '-A']);
+  w.repo.git(['commit', '-q', '--no-edit']);
+  const merged = w.repo.git(['rev-parse', 'HEAD']).trim();
+  w.prHead(merged);
+  assertExit(w.run(2, w.quota(), { from: w.head, to: merged }), 3);
+  const p = w.prepare(2);
+  assertExit(p, 1, p.stdout.slice(0, 500));
+  assert.equal(p.json.error, 'packet-unreadable');
+  assert.equal(p.json.unreadableFile.rel, 'sides/ours/assets/logo.png');
+  assert.ok(p.json.message.includes('assets/logo.png'));
+  assert.ok(!existsSync(w.attemptsFile), 'no attempt was opened');
 });
