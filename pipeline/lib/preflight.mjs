@@ -4,6 +4,7 @@
 // paused; unreadable protection means no protection). Codex is the one exception, by design: its
 // absence defers the review (awaiting-review) but does not stop the pipeline from running.
 import { loadConfig, requiredChecks } from './config.mjs';
+import { auditDraftWorkflows, draftWorkflowWarnings } from './workflow-audit.mjs';
 import { repoRoot } from './repo.mjs';
 import { isClean } from './git.mjs';
 import { run, codexCommand } from './proc.mjs';
@@ -151,6 +152,16 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
     } catch { /* the guard could not judge it: nothing to warn about */ }
   }
 
+  // ci.draft_while_iterating: true is safe only when every required workflow skips drafts, lists ready_for_review + converted_to_draft and
+  // cancels per PR (skills/pipeline-setup). Warn-only, and only when the flag is on; `draftWorkflows` carries the per-file result.
+  let draftWorkflows = null;
+  if (config.ok && cfg?.ci?.draft_while_iterating === true) {
+    try {
+      draftWorkflows = auditDraftWorkflows(root, cfg);
+      warnings.push(...draftWorkflowWarnings(draftWorkflows));
+    } catch { /* unreadable workflows: nothing to warn about */ }
+  }
+
   // A standing owner allowance or a hold below MIN_FABLE lets a Fable proof through that the shipped floor would refuse: say so until it is cleared.
   // Informational like the build check: it never changes canMerge (an unreadable registry is for arbiter apply to report).
   try {
@@ -186,6 +197,7 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
     codex: codexState,
     clean,
     claudeCode,
+    draftWorkflows,
     canMerge: config.ok && authed && !off && !pause.open && !rollback.open && enforcementOk,
     reasons,
     warnings,

@@ -96,6 +96,18 @@ function workflowWiringWarnings(root) {
   } catch { /* missing or unreadable directory: nothing wires it */ }
   return [`workflow-contexts-unwired: no file in .github/workflows runs \`node ${WIRING}\`, so nothing stops a PR from adding a workflow GitHub rejects as a whole (a context not allowed at its key, e.g. runner.temp in a job-level env). Add that step to the workflow that runs on every PR and is a required check (the Verify template already has it)`];
 }
+// ci.draft_while_iterating: true needs every required workflow to skip drafts, list ready_for_review + converted_to_draft and cancel per
+// PR (lib/workflow-audit.mjs). Warn-only, --check only; no config, a config that does not load, or the flag off says nothing.
+// Imported lazily: vendor must keep working from an install whose lib was hand-edited (a broken import only costs this warning).
+async function draftWorkflowWarningsFor(root) {
+  try {
+    const { loadConfig } = await import('../lib/config.mjs');
+    const { auditDraftWorkflows, draftWorkflowWarnings } = await import('../lib/workflow-audit.mjs');
+    const loaded = await loadConfig(root);
+    if (!loaded.ok || loaded.config?.ci?.draft_while_iterating !== true) return [];
+    return draftWorkflowWarnings(auditDraftWorkflows(root, loaded.config));
+  } catch { return []; }
+}
 // The retired entries still lying in <repo>/scripts/pipeline (a file or a symlink; a directory under that name is not ours).
 function retiredFiles(target) {
   const found = [];
@@ -183,7 +195,7 @@ export async function run(argv) {
       const have = readFileSync(vfile, 'utf8').trim().split('+')[0];
       if (have !== base) drift.push({ file: repoRel(VERSION_FILE), reason: `version ${have} != pipeline ${base}` });
     }
-    const stopWarnings = [...stopVerifyWarnings(root), ...workflowWiringWarnings(root)];
+    const stopWarnings = [...stopVerifyWarnings(root), ...workflowWiringWarnings(root), ...await draftWorkflowWarningsFor(root)];
     if (drift.length > 0) return { exitCode: EXIT.FAILED, output: { ok: false, drift, ...(stopWarnings.length ? { warnings: stopWarnings } : {}) } };
     const gaFile = join(root, '.gitattributes');
     const present = attributeLines(existsSync(gaFile) ? readFileSync(gaFile, 'utf8') : '');
