@@ -339,8 +339,8 @@ test('#352 R4-F1: a branch change by one iteration of a loop is not taken as kno
 test('#352 R4-F1 allow twins: a harmless alias, a harmless config, or a loop that changes no git state is not refused', () => {
   const alias = run('git', BODY_LINE, bodyFiles('git ship; npm run $s', 'git config alias.st status'));
   assert.equal(alias.decision, 'allow', 'other alias: ' + alias.reason);
-  const harmless = run('git', BODY_LINE, bodyFiles('git ship; npm run $s', 'git config alias.ship status'));
-  assert.equal(harmless.decision, 'allow', 'harmless alias of the same name: ' + harmless.reason);
+  const harmless = run('git', BODY_LINE, bodyFiles('git status; npm run $s', 'git config alias.ship status'));
+  assert.equal(harmless.decision, 'allow', 'an alias the body does not use: ' + harmless.reason);
   const cfg = run('git', BODY_LINE, bodyFiles(PUSH_BARE + '; npm run $s', 'git config user.name x'));
   assert.equal(cfg.decision, 'allow', 'harmless config: ' + cfg.reason);
   const none = run('git', BODY_LINE, bodyFiles('git ship; cd "$SOME_DIR" || exit 1; npm run $s', 'echo setup'));

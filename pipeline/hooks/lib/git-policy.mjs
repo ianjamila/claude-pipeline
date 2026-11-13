@@ -2841,37 +2841,52 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
   let envDirty = false;
   const moved = new Set(); // (directories whose branch some reading left different from the start; alias keys likewise: see below)
   const redefined = new Set();
+  // #352 R4-F1: the readings of a loop word are consecutive iterations of ONE shell, not alternatives: a command early in the body meets what an earlier iteration left (an alias, a
+  // push.default, a branch). So when some name is a loop word, more than one reading ran and they left something behind, the readings are judged once more starting from the union
+  // of what any of them left (aliases unsure, branches unknown, config dirty). It only refuses more; a loop that leaves nothing behind is not judged twice.
+  const loops = total > 1 && names.some(({ modes }) => modes.some((m) => typeof m === 'object'));
   try {
-    for (let r = 0; r < total; r++) {
-      checkDeadline(ctx.budget);
-      countReading(ctx.budget); // (the readings of the whole evaluation, nested scripts included, share one allowance)
-      restoreLineState(ctx, saved);
-      ctx.pinsLevel = level;
-      ctx.pins = new Map();
-      let rest = r;
-      for (const [x, { k, modes }] of names.entries()) {
-        const m = plan ? modes[plan[r][x]] : modes[rest % modes.length];
-        rest = Math.floor(rest / modes.length);
-        ctx.pins.set(k, m);
-        if (typeof m === 'object') ctx.vars[k] = m.val; // (a loop variable: every use comes after the `for`, so it holds the word from the start)
+    for (let pass = 0; pass < 2; pass++) {
+      if (pass === 1) {
+        if (!loops || !(moved.size || redefined.size || dirty !== saved.cfgDirty || envDirty !== saved.envCfgDirty)) break;
       }
-      const v = evalString(str, startDir, ctx, level);
-      if (v.decision === 'deny') return v;
-      dirty ||= ctx.cfgDirty;
-      envDirty ||= ctx.envCfgDirty;
-      // (t4 state-union, security review: the end state of EVERY reading is compared with the start, not only the last one's: a branch or alias an earlier reading changed
-      // and the last did not would stay known. The readings are alternatives, so whatever any of them changed is unknown afterwards.)
-      for (const d of new Set([...saved.branches.keys(), ...ctx.branches.keys()])) {
-        const a = saved.branches.get(d);
-        const b = ctx.branches.get(d);
-        if (a?.name !== b?.name || a?.trackMain !== b?.trackMain) moved.add(d);
+      for (let r = 0; r < total; r++) {
+        checkDeadline(ctx.budget);
+        countReading(ctx.budget); // (the readings of the whole evaluation, nested scripts included, share one allowance)
+        restoreLineState(ctx, saved);
+        if (pass === 1) {
+          ctx.cfgDirty = dirty;
+          ctx.envCfgDirty = envDirty;
+          for (const d of moved) ctx.branches.set(d, { name: null, trackMain: false });
+          for (const a of redefined) ctx.aliasUnsure.add(a);
+        }
+        ctx.pinsLevel = level;
+        ctx.pins = new Map();
+        let rest = r;
+        for (const [x, { k, modes }] of names.entries()) {
+          const m = plan ? modes[plan[r][x]] : modes[rest % modes.length];
+          rest = Math.floor(rest / modes.length);
+          ctx.pins.set(k, m);
+          if (typeof m === 'object') ctx.vars[k] = m.val; // (a loop variable: every use comes after the `for`, so it holds the word from the start)
+        }
+        const v = evalString(str, startDir, ctx, level);
+        if (v.decision === 'deny') return v;
+        dirty ||= ctx.cfgDirty;
+        envDirty ||= ctx.envCfgDirty;
+        // (t4 state-union, security review: the end state of EVERY reading is compared with the start, not only the last one's: a branch or alias an earlier reading changed
+        // and the last did not would stay known. The readings are alternatives, so whatever any of them changed is unknown afterwards.)
+        for (const d of new Set([...saved.branches.keys(), ...ctx.branches.keys()])) {
+          const a = saved.branches.get(d);
+          const b = ctx.branches.get(d);
+          if (a?.name !== b?.name || a?.trackMain !== b?.trackMain) moved.add(d);
+        }
+        for (const [kind, now] of [['git', ctx.gitAliases], ['gh', ctx.ghAliases]]) {
+          const was = saved[kind === 'git' ? 'gitAliases' : 'ghAliases'];
+          for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) redefined.add(`${kind}:${n}`);
+        }
+        // (#352 R3-F1: a mark made without a change to the map -- judgeAlternatives restores the map and leaves only the mark -- is wiped by the next reading's restoreLineState, so it is taken here)
+        for (const n of ctx.aliasUnsure) if (!saved.aliasUnsure.has(n)) redefined.add(n);
       }
-      for (const [kind, now] of [['git', ctx.gitAliases], ['gh', ctx.ghAliases]]) {
-        const was = saved[kind === 'git' ? 'gitAliases' : 'ghAliases'];
-        for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) redefined.add(`${kind}:${n}`);
-      }
-      // (#352 R3-F1: a mark made without a change to the map -- judgeAlternatives restores the map and leaves only the mark -- is wiped by the next reading's restoreLineState, so it is taken here)
-      for (const n of ctx.aliasUnsure) if (!saved.aliasUnsure.has(n)) redefined.add(n);
     }
     if (level > 0 && total > 1) {
       // (config is only ever set; a branch or alias that differs from the state the script started with, in any reading, may or may not have changed)
