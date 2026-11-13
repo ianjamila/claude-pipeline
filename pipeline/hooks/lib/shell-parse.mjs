@@ -2105,6 +2105,7 @@ class Parser {
     this.hd = []; // heredocs whose bodies start after the current line
     this.log = []; // every segment interpreted by this parser, in order
     this.lastStage = []; // segments of the previous pipeline stage (a simple command, or a whole (...) / { ...; } group)
+    this.lastStageParen = false; // (#352 R12-B1: it is a ( ) group)
     this.braceStack = []; // log positions where standalone { groups opened
     this.subAcc = []; // segments run by substitutions inside the word being lexed
     this.lastDqDyn = false;
@@ -2408,7 +2409,7 @@ class Parser {
         seg = {
           words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, fns: ctx.fns, defs: ctx.defs, cmd: null, meta: new Map(), win: new Map(),
           start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl), loops: ctx.loops,
-          pipedFrom: lastSep === '|' ? this.lastStage : null, sep: tail ? tail.sep : lastSep, lead: tail ? tail.lead : lastSep === '|' ? this.pipeLead : null, afterClose: tail ? tail.afterClose : lastSep === '&&' && lastAfterClose,
+          pipedFrom: lastSep === '|' ? this.lastStage : null, pipeSkip: lastSep === '|' && this.lastStageParen ? this.lastStage : null, sep: tail ? tail.sep : lastSep, lead: tail ? tail.lead : lastSep === '|' ? this.pipeLead : null, afterClose: tail ? tail.afterClose : lastSep === '&&' && lastAfterClose,
           up: ctx.up, negIn: ctx.neg > 0, negPipe: lastSep === '|' && lastNeg, negLead: false, // (negation: R9-F3; up: R9-F1)
         };
         if (!tail && lastSep !== '|' && lastSep !== '&&' && lastSep !== '||') this.pipeStart = ctx.out.length; // (a & ends the whole and-or list: `a && b &`)
@@ -2528,6 +2529,7 @@ class Parser {
       seg.raw = s.slice(seg.start, Math.min(idx, n)).trim();
       this.queue.push(seg);
       this.lastStage = seg.groupStage ?? [seg];
+      this.lastStageParen = false;
       lastNeg = segNeg(seg);
       seg = null;
       this.drain(false);
@@ -2715,9 +2717,9 @@ class Parser {
           const stageStart = seg ? this.pipeStart : lastSep !== '|' && lastSep !== '&&' && lastSep !== '||' ? ctx.out.length : this.pipeStart;
           const stageHead = seg ? this.pipeHead : lastSep !== '|' ? ctx.out.length : this.pipeHead;
           const stageLead = seg ? this.pipeLead : lastSep !== '|' ? lastSep : this.pipeLead;
-          const underPipe = (seg ? seg.sep : lastSep) === '|';
           const outFrom = ctx.out.length;
           endSeg(this.i);
+          const queued = new Set(this.queue);
           lastSep = ';';
           if (negHere) ctx.neg++;
           this.i++;
@@ -2732,13 +2734,17 @@ class Parser {
           this.pipeHead = stageHead;
           this.pipeLead = stageLead;
           subTail = { sep: opened.sep, lead: opened.lead ?? null, afterClose: opened.afterClose, end: this.i };
-          if (underPipe) this.markPipe(outFrom); // (#352 R11-F1: a ( ) stage of a pipeline runs in a subshell of its own: its commands carry no change on)
+          // (#352 R12-B1: a ( ) stage of a pipeline is no pipe mark for its OWN commands: they share the stage's directory with each other, and the level that ends gives back what a change in it did.
+          // What came before the `|` is marked when the `|` is read (markPipe), and the group as a whole takes the operator of the pipeline (lead).)
+          for (const c of ctx.out.slice(outFrom)) Object.defineProperty(c, 'paren', { value: true, enumerable: false, configurable: true });
+          for (const q of this.queue) if (!queued.has(q)) q.inParen = true;
           lastNeg = negHere;
           fnPending = false;
           if (head?.length) { for (const name of head) ctx.fns.add(name); fnPending = true; }
           // Why: the group's own commands print into the pipe; a substitution's body (`{ X=$(cat x); cat a; cat b; } | bash`, one level deeper) prints into its word, not the
           // stream, so it is no part of it (x's text in front of a+b hid a guarded line in the join)
           this.lastStage = this.log.slice(mark0).filter((x) => x.depth === depth);
+          this.lastStageParen = true;
         }
       } else if (c === ')') {
         endSeg(this.i);
@@ -2869,7 +2875,7 @@ class Parser {
       this.finalizeSeg(seg);
       // (#352 R10: every command of a pipeline (the stages, and what they hold) is marked: a change in one is its subshell's. A stage is marked when the stage after it is finished)
       seg.span = [out0, this.ctx.out.length];
-      for (const s of seg.sep === '|' ? [seg, ...(seg.pipedFrom ?? [])] : []) if (s.span) for (const c of this.ctx.out.slice(...s.span)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true });
+      for (const s of seg.sep === '|' ? [seg, ...(seg.pipedFrom ?? []).filter((p) => !seg.pipeSkip?.includes(p))] : []) if (s.span) for (const c of this.ctx.out.slice(...s.span)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true });
       if (seg.pipeOut) for (const c of this.ctx.out.slice(...seg.span)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true }); // (#352 R11-F1: a | was read while it waited for its heredoc body: see markPipe)
       if (seg.afterClose && this.ctx.out.length === out0) this.ctx.owedClose = { grp: seg.grp, depth: seg.depth }; // (it emitted nothing: the mark waits for the next command of ITS level, see emit)
     } catch {
@@ -2942,8 +2948,8 @@ class Parser {
   markPipe(from) {
     // (a stage still waiting for its heredoc body has emitted nothing yet: it is marked when the queue finishes it (finalize). Every waiting segment is: one that is not in this pipeline only loses certainty.
     // Before, the whole line lost it (ctlBroken), and `cd d && cat <<'EOF' | wc -l && git push` was refused.)
-    for (const s of this.queue) s.pipeOut = true;
-    for (const c of this.ctx.out.slice(from)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true });
+    for (const s of this.queue) if (!s.inParen) s.pipeOut = true; // (#352 R12-B1: the commands of a ( ) group are its own: see the `(` branch)
+    for (const c of this.ctx.out.slice(from)) if (!c.paren) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true });
   }
 
   // The commands of a construct that closed right before `|` or a background `&` ran in a subshell: they may not run in this shell (marked cond). Commands still
