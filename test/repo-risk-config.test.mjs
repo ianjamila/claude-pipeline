@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { validateConfig } from '../pipeline/lib/config.mjs';
@@ -40,73 +41,75 @@ test('repo config: the rating tests read this same high_risk_paths list (no hand
   }
 });
 
-// Static relative imports of a source file: `import ... from './x.mjs'`, `export ... from '../x.mjs'`, bare `import './x.mjs'`, also over
-// several lines (the braces may hold comments with quotes, semicolons or braces), plus dynamic `import('./x.mjs')` with a literal path.
-// A statement must start a line, so a commented-out import is not followed. Bare specifiers (node:fs, packages) are ignored.
-const STATIC_IMPORT_RE = /(?:^|\n)[ \t]*(?:import|export)\s+(?:(?:[^'";{}]|\{[^}]*\})*?\s*from\s*)?['"]([^'"]+)['"]/g;
-const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*(?:['"]([^'"]+)['"]|`((?:[^`$\\]|\$(?!\{))+)`)\s*\)/g;
+// Relative imports of a source file. STATIC ones (`import ... from`, `export ... from`, bare `import './x.mjs'`, multi-line, any comment or
+// string or regex-literal or nested-template shape) come from V8's own module parser, run in ONE child process per call
+// (test/fixtures/static-imports.mjs, `vm.SourceTextModule` needs --experimental-vm-modules); this file does not parse JavaScript itself.
+// A source that does not parse throws, so the test fails closed. DYNAMIC `import('./x.mjs')` needs a literal specifier ('…', "…", or a
+// backtick without `${`) and is found by a regex over the RAW text with no comment stripping: a mention inside a comment or string
+// over-matches, which is the safe direction (importClosure skips a dynamic target that does not exist on disk).
+const STATIC_IMPORTS_HELPER = path.join(root, 'test', 'fixtures', 'static-imports.mjs');
+const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:'([^'\n]+)'|"([^"\n]+)"|`((?:[^`$\\]|\$(?!\{))+)`)\s*[,)]/g;
 
-// Comments are dropped in ONE pass that also tracks string literals ('…', "…", `…`), so a `/*` or `//` inside a string, or a `/*` inside a
-// `//` comment, never starts a comment, and a block comment ends only at its own `*/`. A '…' or "…" string ends at a newline too, so a quote
-// inside a regex literal cannot swallow the rest of the file. Strings are kept (the specifiers are in them).
-function stripComments(src) {
-  let out = '';
-  let i = 0;
-  while (i < src.length) {
-    const c = src[i];
-    const n = src[i + 1];
-    if (c === '/' && n === '/') {
-      while (i < src.length && src[i] !== '\n') i++;
-    } else if (c === '/' && n === '*') {
-      const end = src.indexOf('*/', i + 2);
-      i = end === -1 ? src.length : end + 2;
-      out += ' ';
-    } else if (c === "'" || c === '"' || c === '`') {
-      let j = i + 1;
-      while (j < src.length && src[j] !== c && !(c !== '`' && src[j] === '\n')) j += src[j] === '\\' ? 2 : 1;
-      out += src.slice(i, j + 1);
-      i = j + 1;
-    } else {
-      out += c;
-      i++;
-    }
-  }
-  return out;
+function staticSpecifiers(sources) {
+  const r = spawnSync(process.execPath, ['--experimental-vm-modules', '--no-warnings', STATIC_IMPORTS_HELPER], {
+    input: JSON.stringify(sources), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+  });
+  if (r.error) throw r.error;
+  if (r.status !== 0) throw new Error(`static import parse failed (exit ${r.status}): ${r.stderr}`);
+  return JSON.parse(r.stdout);
 }
 
-function importSpecifiers(src) {
-  const code = stripComments(src);
-  return [...[...code.matchAll(STATIC_IMPORT_RE)].map((m) => m[1]), ...[...code.matchAll(DYNAMIC_IMPORT_RE)].map((m) => m[1] ?? m[2])];
+function dynamicSpecifiers(src) {
+  return [...src.matchAll(DYNAMIC_IMPORT_RE)].map((m) => m[1] ?? m[2] ?? m[3]);
+}
+
+// One entry per source: { static: [...], dynamic: [...] }.
+function scanImports(sources) {
+  const stat = staticSpecifiers(sources);
+  return sources.map((src, i) => ({ static: stat[i], dynamic: dynamicSpecifiers(src) }));
+}
+
+const isRelative = (spec) => spec.startsWith('./') || spec.startsWith('../');
+const relFrom = (fromAbs, spec) => path.relative(root, path.resolve(path.dirname(fromAbs), spec)).split(path.sep).join('/');
+
+// Direct relative imports of each file in `rels` (repo-relative, posix): every static one (a missing target is reported by the caller),
+// plus each dynamic one whose target exists on disk. Bare specifiers (node:fs, packages) are ignored.
+function directImports(rels) {
+  const scans = scanImports(rels.map((rel) => {
+    const abs = path.join(root, rel);
+    assert.ok(fs.existsSync(abs), `${rel} is imported but does not exist`);
+    return fs.readFileSync(abs, 'utf8');
+  }));
+  return rels.map((rel, i) => {
+    const abs = path.join(root, rel);
+    const stat = scans[i].static.filter(isRelative).map((s) => relFrom(abs, s));
+    const dyn = scans[i].dynamic.filter(isRelative).map((s) => relFrom(abs, s)).filter((t) => fs.existsSync(path.join(root, t)));
+    return [...new Set([...stat, ...dyn])];
+  });
 }
 
 function importClosure(startRel) {
   const seen = new Set();
-  const queue = [startRel];
-  while (queue.length) {
-    const rel = queue.pop();
-    if (seen.has(rel)) continue;
-    const abs = path.join(root, rel);
-    assert.ok(fs.existsSync(abs), `${rel} is imported but does not exist`);
-    seen.add(rel);
-    for (const spec of importSpecifiers(fs.readFileSync(abs, 'utf8'))) {
-      if (!spec.startsWith('./') && !spec.startsWith('../')) continue;
-      queue.push(path.relative(root, path.resolve(path.dirname(abs), spec)).split(path.sep).join('/'));
-    }
+  let frontier = [startRel];
+  while (frontier.length) {
+    const batch = [...new Set(frontier)].filter((rel) => !seen.has(rel));
+    for (const rel of batch) seen.add(rel);
+    frontier = directImports(batch).flat();
   }
   return [...seen].sort();
 }
 
-test('repo config: the import walker finds multi-line, export-from and bare imports and skips bare specifiers and comments', () => {
+test('repo config: the import scanner finds multi-line, export-from and bare imports and skips bare specifiers and comments', () => {
   const src = "import a from './a.mjs';\nimport {\n  b,\n  c,\n} from '../b.mjs';\nexport { d } from './d.mjs';\nimport './e.mjs';\nimport fs from 'node:fs';\n// import x from './nope.mjs';\nexport const s = './f.mjs';\n";
-  assert.deepEqual(importSpecifiers(src), ['./a.mjs', '../b.mjs', './d.mjs', './e.mjs', 'node:fs']);
+  assert.deepEqual(scanImports([src])[0].static, ['./a.mjs', '../b.mjs', './d.mjs', './e.mjs', 'node:fs']);
 });
 
-test('repo config: the import walker follows a dynamic import with a literal path and accepts a backtick one with no interpolation, and ignores an interpolated one or a commented one', () => {
-  const src = "const m = await import('./dyn.mjs');\nconst n = import(\"../up.mjs\").then((x) => x);\nawait import(name);\nawait import(`./tpl-${x}.mjs`);\nawait import(`./tick.mjs`);\n// await import('./nope.mjs');\n";
-  assert.deepEqual(importSpecifiers(src), ['./dyn.mjs', '../up.mjs', './tick.mjs']);
+test('repo config: the import scanner follows a dynamic import with a literal path (any quote, a backtick with no interpolation), ignores an interpolated or computed one, and over-matches a commented one', () => {
+  const src = "const m = await import('./dyn.mjs');\nconst n = import(\"../up.mjs\").then((x) => x);\nawait import(name);\nawait import(`./tpl-${x}.mjs`);\nawait import(`./tick.mjs`);\nawait import(/* why */ './cmt.mjs', { with: {} });\n// await import('./mention.mjs');\n";
+  assert.deepEqual(scanImports([src])[0].dynamic, ['./dyn.mjs', '../up.mjs', './tick.mjs', './cmt.mjs', './mention.mjs']);
 });
 
-test('repo config: the import walker does not skip a multi-line import whose braces hold a comment with a quote, semicolon or brace', () => {
+test('repo config: the import scanner does not skip a multi-line import whose braces hold a comment with a quote, semicolon or brace', () => {
   const src = [
     "import {",
     "  a, // the owner's pick; see #1",
@@ -116,18 +119,31 @@ test('repo config: the import walker does not skip a multi-line import whose bra
     "import { d } from './after.mjs';",
     "",
   ].join('\n');
-  assert.deepEqual(importSpecifiers(src), ['./multi.mjs', './after.mjs']);
+  assert.deepEqual(scanImports([src])[0].static, ['./multi.mjs', './after.mjs']);
 });
 
-test('repo config: a `/*` inside a string or a `//` comment does not hide the imports after it (only a real comment is dropped)', () => {
+test('repo config: a `/*` inside a string, a `//` comment, a regex literal or a nested template does not hide the imports after it', () => {
   const inString = "const g = 'a /* b';\nimport { x } from './kept-after-string.mjs';\nconst h = 'src/**/*.mjs';\nexport { y } from './kept-after-glob.mjs';\n";
-  assert.deepEqual(importSpecifiers(inString), ['./kept-after-string.mjs', './kept-after-glob.mjs']);
+  assert.deepEqual(scanImports([inString])[0].static, ['./kept-after-string.mjs', './kept-after-glob.mjs']);
   const inLine = "// see /* the glob\nimport { x } from './kept-after-line.mjs';\n// and src/**/ here\nimport './kept-after-glob.mjs';\n";
-  assert.deepEqual(importSpecifiers(inLine), ['./kept-after-line.mjs', './kept-after-glob.mjs']);
+  assert.deepEqual(scanImports([inLine])[0].static, ['./kept-after-line.mjs', './kept-after-glob.mjs']);
   const inTemplate = "const t = `/* ${1}`;\nimport z from './kept-after-template.mjs';\n/* real */ import w from './kept-after-block.mjs';\n";
-  assert.deepEqual(importSpecifiers(inTemplate), ['./kept-after-template.mjs', './kept-after-block.mjs']);
+  assert.deepEqual(scanImports([inTemplate])[0].static, ['./kept-after-template.mjs', './kept-after-block.mjs']);
   // A real block comment still hides an import it holds, and ends at its own `*/`.
-  assert.deepEqual(importSpecifiers("/*\nimport a from './hidden.mjs';\n*/\nimport b from './shown.mjs';\n"), ['./shown.mjs']);
+  assert.deepEqual(scanImports(["/*\nimport a from './hidden.mjs';\n*/\nimport b from './shown.mjs';\n"])[0].static, ['./shown.mjs']);
+  // Round-2 regressions (R2-B1, R2-F1): the old hand-written scanner opened a fake block comment at each of these and dropped the import after it.
+  const inRegex = "const re = /[/*]/;\nimport x from './late.mjs';\n";
+  assert.deepEqual(scanImports([inRegex])[0].static, ['./late.mjs']);
+  const nested = "const g = `${a ? `${d}/*` : ''}`;\nimport x from './late.mjs';\n";
+  assert.deepEqual(scanImports([nested])[0].static, ['./late.mjs']);
+  const tickInRegex = "const r = /[`'\"]/;\nconst t = `a/*`;\nimport x from './late.mjs';\nexport * from './reexp.mjs';\n";
+  assert.deepEqual(scanImports([tickInRegex])[0].static, ['./late.mjs', './reexp.mjs']);
+  const everything = ["const re = /[/*]/;", "const g = `${a ? `${d}/*` : ''}`;", "import x from './late.mjs';", "import {", "  a, // a } stray brace", "  /* b } */ b,", "} from './multi.mjs';", "export * from './reexp.mjs';", ""].join('\n');
+  assert.deepEqual(scanImports([everything])[0].static, ['./late.mjs', './multi.mjs', './reexp.mjs']);
+});
+
+test('repo config: a source the engine cannot parse makes the scanner throw (the closure test fails closed)', () => {
+  assert.throws(() => scanImports(["import x from './a.mjs';\nconst = ;\n"]), /static import parse failed/);
 });
 
 test('repo config: the gate and review-proof named set is in risk.high_risk_paths, and a one-line change to any of them rates high', () => {
