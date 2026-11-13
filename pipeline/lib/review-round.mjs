@@ -24,8 +24,8 @@ import {
 import { createGitHub } from './github.mjs';
 import { assertPublishedHistory } from './review-publish.mjs';
 import { GhError } from './proc.mjs';
-import { isSensitivePath, rateBranch } from './risk.mjs';
-import { DEFAULTS, baseConfigAt } from './config.mjs';
+import { isSensitivePath, rateBranch, trustedBase } from './risk.mjs';
+import { DEFAULTS } from './config.mjs';
 import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } from './state.mjs';
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
 import { readWeeklyUsage } from './codex-usage.mjs';
@@ -190,7 +190,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   // Risk and light lane describe the whole PR (merge base..head), whatever slice this round reviews. A later round can
   // only take a PR off the light lane, never put it on.
   // The rating is worked out under the working-tree config AND the one committed at the default branch's fork point, stricter wins (risk.mjs#rateBranch).
-  const rated = await rateBranch({ root, head, config, defaultBranch: config.default_branch, prBase, base: forkPoint });
+  const rated = await rateBranch({ root, head, config, prBase, base: forkPoint });
   const { level } = rated;
   const lane = { reviewer: rated.reviewer, reasons: rated.laneReasons, sensitivePaths: rated.sensitivePaths };
   // The reviewer after Codex: a PR that was ever reviewed by Fable stays with Fable (a later round can only escalate), and a
@@ -350,11 +350,15 @@ export function strictestRouteConfig(config, trusted) {
   };
 }
 
-// The config committed at the fork point of the DEFAULT branch (the trusted one rateBranch reads; `forkPoint` when the caller already has it), as baseConfigAt answers:
-// { ok, config } | { ok: false, reason }. A git failure is an unreadable base, never a throw.
+// The config committed at the fork point of the DEFAULT branch, for the routing / substitute gates: the SAME trusted fork rateBranch and the status display use
+// (risk.mjs#trustedBase: the remote's default branch, refs/remotes/origin/HEAD, never the working-tree config's default_branch; `forkPoint` when the caller already has
+// it). As baseConfigAt answers: { ok, config } | { ok: false, reason }. A git failure is an unreadable base, never a throw. A readable committed config that names another
+// default_branch than the working tree's is not trusted here either (the PR may have moved the anchor): it reads as unreadable, so the gates fall back to the built-in
+// defaults and the substitute is off (the status display, round-status.mjs#trustedBaseConfig, keeps its lists for the severity union and reports the mismatch apart).
 export function trustedBaseOf(root, config, forkPoint) {
   try {
-    return baseConfigAt(forkPoint ?? mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root }), root);
+    const { trusted, mismatch } = trustedBase({ root, head: 'HEAD', config, trustedFork: forkPoint });
+    return trusted.ok && mismatch !== null ? { ok: false, reason: mismatch } : trusted;
   } catch (err) {
     return { ok: false, reason: String(err?.message ?? err).split('\n')[0].slice(0, 160) };
   }

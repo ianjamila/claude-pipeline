@@ -2,11 +2,26 @@
 // feeds both the extra-round ask (`triage round-request`) and the park comment (`comment --kind needs-human`), so the two cannot drift. Display only: nothing here decides
 // anything. Untrusted text (titles, categories) goes through asciiLine inside round-ask.mjs.
 import { diffFiles, git, revParse } from './git.mjs';
+import { trustedBase } from './risk.mjs';
 import { diffStats } from './diff.mjs';
 import { costFrom, notCleanReasons, openItems, roundsFrom, statusLines } from './round-ask.mjs';
 import { currentContentHash, refreshBaseRef, reviewBaseRef } from './review-context.mjs';
 import { readSummaryComment } from './summary-comment.mjs';
 import { asciiLine, roundOutcome } from './triage.mjs';
+
+// The config committed at the default branch's fork point (the trusted one rateBranch also reads: risk.mjs#trustedBase, anchored on the remote's default branch, not the
+// working-tree config), for the union of the sensitive-path lists: a PR must not shrink its own list.
+// -> { config, problem }: unreadable gives config null (its lists count as empty, nothing is loosened) and says why.
+export function trustedBaseConfig(root, config) {
+  try {
+    const { trusted, mismatch } = trustedBase({ root, head: 'HEAD', config });
+    if (!trusted.ok) return { config: null, problem: trusted.reason };
+    // a readable committed config that names another default_branch still counts for the union (its lists are kept); the mismatch is the problem
+    return { config: trusted.config, problem: mismatch };
+  } catch (err) {
+    return { config: null, problem: String(err?.message ?? err).split('\n')[0].slice(0, 160) };
+  }
+}
 
 // The files of the PR's reviewed diff (the last round's head against where the branch forked from the default branch): what a finding's location must resolve to.
 // null (and a warning from the caller) when it cannot be read. Throws on nothing the caller needs to handle.
@@ -36,7 +51,7 @@ export function sinceLastReview(root, config, state, { withChanges }) {
   return { anchor: full.slice(0, 12), count: log.length, commits: log.slice(0, 20).map((l) => asciiLine(l, 100)), changed };
 }
 
-// Everything the ask and the park comment both show: { outcome, rounds, cost, diff, since, open, notClean }. A cost, diff, listing or severity problem becomes a warning (pushed to
+// Everything the ask and the park comment both show: { outcome, rounds, cost, diff, since, open, notClean, trusted } (trusted: trustedBaseConfig, read once here). A cost, diff, listing or severity problem becomes a warning (pushed to
 // `warnings`) and a degraded value, never a throw; only the base-ref refresh and the content hash can throw, and the callers decide what that means.
 export function gatherRoundStatus({ root, config, state, pr, gh, warnings }) {
   refreshBaseRef(root, config);
@@ -59,9 +74,10 @@ export function gatherRoundStatus({ root, config, state, pr, gh, warnings }) {
   } catch (err) {
     warnings.push(`the commits since the last review could not be listed (${asciiLine(err?.message, 120)})`);
   }
-  const open = openItems(state, outcome, { config, files: diff.files }, warnings);
+  const trusted = trustedBaseConfig(root, config);
+  const open = openItems(state, outcome, { config, files: diff.files, baseConfig: trusted.config, baseProblem: trusted.problem }, warnings);
   const notClean = notCleanReasons(outcome, since.changed);
-  return { outcome, rounds, cost, diff, since, open, notClean };
+  return { outcome, rounds, cost, diff, since, open, notClean, trusted };
 }
 
 const SEVERITY_WARNING = /^(severity could not be judged|the reviewed diff could not be read)/;

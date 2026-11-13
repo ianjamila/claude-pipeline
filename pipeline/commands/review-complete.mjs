@@ -90,7 +90,7 @@ export async function laneProblem(state, root, config, base, { prBase = config.d
   if (recorded === 'high') return needs('high risk');
   let rated;
   try {
-    rated = await rate({ root, head: 'HEAD', config, defaultBranch: config.default_branch, prBase, base });
+    rated = await rate({ root, head: 'HEAD', config, prBase, base });
   } catch (err) {
     return needs(`hard stops could not be collected: ${oneLine(err)}`);
   }
