@@ -54,6 +54,8 @@ export const meta = {
     '  review.effort.small_fix_lines, review.codex_round_budget, review.codex_budget.soft / .hard and review.substitute.mode / min_wait_minutes / max_packet_mb are each read as the stricter of the working-tree config and the config',
     '    committed at the fork point of the default branch (lower small_fix_lines and max_packet_mb, higher budgets and min_wait_minutes, mode off when either says off), so a PR cannot loosen them; an unreadable base config means mode off;',
     '    a mode-off plan or substitute verdict carries modeOffFrom: which config said off (the working tree, the base at the fork point, or an unreadable base with the reason)',
+    '  review.effort.low|medium|high|followup|small_fix are each read as the HIGHER effort (low < medium < high < xhigh) of the working-tree config and the config at the fork point of the default branch (an unreadable base: held against the built-in lanes), so a PR cannot lower its own review effort;',
+    '    review.codex_model is the base config\'s (an unreadable base: the built-in default), never the working tree\'s, and --model must name it, else exit 2 {error:model-mismatch, expected}',
     '  a whole-PR round is owed (state outcome wholePrOwed) when an Opus substitute round came before the PR\'s risk rose to high and no whole-PR round has run since: that round must use the PR\'s merge base as --base (else exit 2 base-mismatch),',
     '    reviews the whole PR (reviewBaseKind merge-base, never base-only or resolution-only, counts toward the cap) and records wholePr:true and patchSha256. An all-Codex history owes none',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
@@ -134,7 +136,10 @@ export const run = guarded(async (argv, ctx) => {
   }
 
   const dir = roundDir(root, round);
-  const model = values.model ?? config.review.codex_model;
+  // The model is the TRUSTED one (the config at the default branch's fork point, else the built-in default: review-round.mjs#strictestRouteConfig), never the working tree's, which a PR
+  // can edit; --model must name it too (#389). The shape of a --model is checked first (a usage error), then that it is the trusted one (model-mismatch).
+  const trustedModel = routeConfigFor(root, config).codexModel;
+  const model = values.model ?? trustedModel;
   const argsFor = (outPath) => {
     try {
       return buildCodexArgs({ cwd: root, model, effort, schemaPath: FINDINGS_SCHEMA_PATH, outPath });
@@ -143,8 +148,16 @@ export const run = guarded(async (argv, ctx) => {
     }
   };
   argsFor(path.join(dir, 'codex-raw.json')); // a bad effort or model is a usage error before anything runs
+  if (model !== trustedModel) {
+    throw new Fail(EXIT.USAGE, {
+      ok: false, error: 'model-mismatch', expected: trustedModel,
+      message: `--model ${model} is not the configured Codex model: use --model ${trustedModel} or leave --model out (the model is review.codex_model of the pipeline.yml at the default branch's fork point, else the built-in default; the working-tree value is ignored)`,
+    });
+  }
 
   const adm = await admitRound({ root, config, ctx, pr, round, base, head });
+  // The stricter of the working tree's and the trusted base config (a PR must not turn its own substitute on / shorten the wait / lower its own effort).
+  const sub = routeConfigFor(root, config, adm.rated.trustedFork);
   const { baseOnly, resolutionOnly, resolutionView, resolution, resolutionIneligible } = adm;
   const prompt = roundPrompt(adm);
 
@@ -153,7 +166,7 @@ export const run = guarded(async (argv, ctx) => {
   if (planOnly) {
     return {
       exitCode: EXIT.OK,
-      output: { ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base } : planOutput(plan), expectedEffort: plan?.effort ?? config.review.effort.followup },
+      output: { ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base } : planOutput(plan), expectedEffort: plan?.effort ?? sub.effort.followup },
     };
   }
 
@@ -173,8 +186,7 @@ export const run = guarded(async (argv, ctx) => {
       return null;
     }
   };
-  // The verdict on a substitute reads the stricter of the working tree's and the trusted base config (a PR must not turn its own substitute on / shorten the wait).
-  const sub = routeConfigFor(root, config, adm.rated.trustedFork);
+  // (`sub`, above: the verdict on a substitute reads the same stricter config.)
 
   // The effort is the configuration's, not the caller's: a round that is a small fix-check (or runs while the weekly Codex governor is soft) is cheaper,
   // every other round keeps the normal effort. A round the budget / governor sends to the substitute never runs Codex, so the effort is not asked about.

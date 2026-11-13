@@ -16,6 +16,7 @@ import { behindFreshEnough, lazyDiff } from '../lib/finalgate.mjs';
 import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, rateBranch, reviewLane, trustedDefaultBranch } from '../lib/risk.mjs';
+import { routeConfigFor } from '../lib/review-round.mjs';
 import { isSubstituteRound, loadState } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
 import { noteReviewed } from '../lib/codex-usage.mjs';
@@ -297,7 +298,7 @@ export const run = guarded(async (argv, ctx) => {
       publishTriage({ gh, root, pr, state });
 
       const record = reviewRecord(state, {
-        contentHash: hash, base, head: local, modelProofs: fableProofs(state), defaultCodexModel: config.review.codex_model,
+        contentHash: hash, base, head: local, modelProofs: fableProofs(state), defaultCodexModel: routeConfigFor(root, config).codexModel,
       });
       const bypass = fableBypassRounds(state, gate);
       const fableNote = fableBypassNote(bypass, gate);

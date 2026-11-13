@@ -25,7 +25,7 @@ import { createGitHub } from './github.mjs';
 import { assertPublishedHistory } from './review-publish.mjs';
 import { GhError } from './proc.mjs';
 import { isSensitivePath, rateBranch, trustedBase, trustedDefaultBranch } from './risk.mjs';
-import { DEFAULTS } from './config.mjs';
+import { DEFAULTS, EFFORTS, EFFORT_LANES } from './config.mjs';
 import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } from './state.mjs';
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
 import { readWeeklyUsage } from './codex-usage.mjs';
@@ -330,11 +330,15 @@ export function protectedKindsOf(adm) {
 // The substitute's own gates (review.substitute.*, read by codex-review's verdict, `substitute prepare|apply` and `triage second-review`) follow the same rule: a HIGHER
 // min_wait_minutes (Codex is waited for longer) and a LOWER max_packet_mb (fewer packets may go to a substitute).
 // An unreadable or invalid base config cannot be compared: the working tree is held against the built-in defaults instead (never looser than them), and the mode is off.
-// -> { smallFixLines, codexRoundBudget, soft, hard, mode, minWaitMinutes, maxPacketMb, modeOffFrom }; modeOffFrom says where an off came from (null when the mode is auto): the
+// -> { smallFixLines, codexRoundBudget, soft, hard, mode, minWaitMinutes, maxPacketMb, effort, codexModel, modeOffFrom }; modeOffFrom says where an off came from (null when the mode is auto): the
 // working-tree config, the base config at the fork point, or an unreadable base config (with trustedBaseOf's reason), for the refusals that name it.
+// The effort lanes (review.effort.low|medium|high|followup|small_fix) are the stricter per lane too: the HIGHER effort (low < medium < high < xhigh) of the two, and an unreadable base
+// holds the working tree against the built-in lanes, so a PR cannot lower the effort its own review runs at (#389) -> `effort`: { low, medium, high, followup, small_fix }.
+// review.codex_model is not a stricter-of-two but the trusted one: the base config's when it is readable, else the built-in default, never the working tree's, which a PR can edit
+// to point the review at a model of its choosing (#389) -> `codexModel`.
 export function strictestRouteConfig(config, trusted) {
   const knobs = (c, mode) => ({
-    smallFixLines: c.review.effort.small_fix_lines, codexRoundBudget: c.review.codex_round_budget,
+    smallFixLines: c.review.effort.small_fix_lines, codexRoundBudget: c.review.codex_round_budget, effort: c.review.effort, codexModel: c.review.codex_model,
     soft: c.review.codex_budget.soft, hard: c.review.codex_budget.hard, mode: mode ?? c.review.substitute.mode,
     minWaitMinutes: c.review.substitute.min_wait_minutes, maxPacketMb: c.review.substitute.max_packet_mb,
   });
@@ -344,8 +348,10 @@ export function strictestRouteConfig(config, trusted) {
     : other.mode !== 'off' ? null
       : trusted?.ok === true ? "the pipeline.yml at the default branch's fork point sets review.substitute.mode off (the stricter of it and the working-tree config applies, so the working tree cannot turn the substitute on)"
         : `the pipeline.yml at the default branch's fork point could not be read (${trusted?.reason ?? 'no reason given'}); an unreadable base config turns the substitute off`;
+  const higher = (a, b) => (EFFORTS.indexOf(b) > EFFORTS.indexOf(a) ? b : a);
+  const effort = Object.fromEntries(EFFORT_LANES.map((lane) => [lane, higher(wt.effort[lane], other.effort[lane])]));
   return {
-    modeOffFrom,
+    modeOffFrom, effort, codexModel: other.codexModel,
     smallFixLines: Math.min(wt.smallFixLines, other.smallFixLines), codexRoundBudget: Math.max(wt.codexRoundBudget, other.codexRoundBudget),
     soft: Math.max(wt.soft, other.soft), hard: Math.max(wt.hard, other.hard), mode: wt.mode === 'off' || other.mode === 'off' ? 'off' : wt.mode,
     minWaitMinutes: Math.max(wt.minWaitMinutes, other.minWaitMinutes), maxPacketMb: Math.min(wt.maxPacketMb, other.maxPacketMb),
@@ -373,12 +379,12 @@ export const routeConfigFor = (root, config, forkPoint) => strictestRouteConfig(
 // -> { route, evidence, effort, why, protected, small, lowered?, round, base, wholePr, spend, budget, governor, facts }
 export function planRound(adm, { env = process.env, now = Date.now() } = {}) {
   const { config, state, round, root } = adm;
-  const effort = config.review.effort;
   const kinds = protectedKindsOf(adm);
   // A PR must not loosen its own routing: the sensitive-path test and the knobs are read under the working-tree config AND the trusted base config, stricter wins
   // (R13-B1 / R13-F1); a base config that cannot be read counts every path as sensitive.
   const trusted = trustedBaseOf(root, config, adm.rated.trustedFork);
   const route = strictestRouteConfig(config, trusted);
+  const effort = route.effort; // the stricter lanes (#389): a PR cannot lower its own review effort
   const facts = rangeFacts(adm.review.base, adm.head, trusted.ok ? [config, trusted.config] : [config], { cwd: root });
   if (!trusted.ok) facts.sensitive = true;
   const small = facts.changedLines <= route.smallFixLines && !facts.newFile && !facts.sensitive;

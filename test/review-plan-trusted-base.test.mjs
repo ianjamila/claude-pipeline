@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { roundWorld, findingsOf, low, aFile } from './helpers/round-world.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { strictestRouteConfig } from '../pipeline/lib/review-round.mjs';
+import { DEFAULTS } from '../pipeline/lib/config.mjs';
 
 const lines = (n, tag) => Array.from({ length: n }, (_, i) => `export const ${tag}${i} = ${i};`).join('\n') + '\n';
 
@@ -125,4 +126,32 @@ test('a committed base config naming another default_branch than the working tre
   assert.equal(r.json.plan.small, false);
   assert.equal(r.json.plan.route, 'codex', 'a sensitive fix-check is never withheld for the budget');
   assert.match(r.json.plan.modeOffFrom, /could not be read .*default_branch/, 'the plan says the off came from an unreadable base, naming the mismatch');
+});
+
+// #389: the effort lanes are the stricter (higher) of the working tree and the trusted base config, per lane; the base here has every lane at high (roundWorld).
+const LOW_EFFORT = '  effort: {low: low, medium: low, high: low, followup: low, small_fix: low}\n';
+const plan1 = (w, extra = []) => w.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, ...extra]);
+
+test('#389: a working tree that lowers every effort lane to low still gets the base\'s high: --plan expectedEffort and the effort-mismatch check', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  w.config({ review: LOW_EFFORT });
+  const planned = plan1(w, ['--plan']);
+  assertExit(planned, 0, planned.stderr + planned.stdout);
+  assert.deepEqual([planned.json.expectedEffort, planned.json.plan.effort], ['high', 'high']);
+  const refused = plan1(w, ['--effort', 'low']);
+  assertExit(refused, 2);
+  assert.deepEqual([refused.json.error, refused.json.expected], ['effort-mismatch', 'high']);
+});
+
+test('strictestRouteConfig: effort lanes take the higher per lane (low < medium < high < xhigh); an unreadable base holds the working tree against the built-in lanes; codexModel is the base\'s or the default, never the working tree\'s (#389)', () => {
+  const cfg = (effort, model) => ({ review: { effort: { small_fix_lines: 40, ...effort }, codex_round_budget: 6, codex_budget: { soft: 75, hard: 90 }, substitute: { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 }, codex_model: model } });
+  const wt = cfg({ low: 'xhigh', medium: 'low', high: 'low', followup: 'medium', small_fix: 'low' }, 'wt-model');
+  const base = cfg({ low: 'medium', medium: 'high', high: 'high', followup: 'medium', small_fix: 'medium' }, 'base-model');
+  const both = strictestRouteConfig(wt, { ok: true, config: base });
+  assert.deepEqual(both.effort, { low: 'xhigh', medium: 'high', high: 'high', followup: 'medium', small_fix: 'medium' });
+  assert.equal(both.codexModel, 'base-model');
+  const unreadable = strictestRouteConfig(cfg({ low: 'low', medium: 'low', high: 'low', followup: 'low', small_fix: 'low' }, 'wt-model'), { ok: false, reason: 'x' });
+  // the built-in lanes (config.mjs DEFAULTS.review.effort): low medium, medium medium, high high, followup medium, small_fix low
+  assert.deepEqual(unreadable.effort, { low: 'medium', medium: 'medium', high: 'high', followup: 'medium', small_fix: 'low' });
+  assert.equal(unreadable.codexModel, DEFAULTS.review.codex_model);
 });
