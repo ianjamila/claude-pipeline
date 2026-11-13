@@ -195,30 +195,35 @@ test('repo config: a source the engine cannot parse makes the scanner throw (the
   assert.throws(() => scanImports(["import x from './a.mjs';\nconst = ;\n"]), /static import parse failed/);
 });
 
+// The gate and review-proof named set: listed BY HAND in risk.high_risk_paths. The tests below check each entry rates high, and that every
+// file each one imports DIRECTLY (depth 1, not further) is in risk.high_risk_paths or in DEPTH1_EXEMPT. Files added to risk.high_risk_paths
+// only because a named file imports them (remote-url, repo, identity, review-lease, queue-sweep, run-events) are deliberately NOT in this
+// array: their own imports are not checked (depth 1 from this set only; the owner's named-set choice, issue #356).
+const NAMED = [
+  'pipeline/lib/transcript.mjs', 'pipeline/lib/ci-proof.mjs', 'pipeline/lib/integrity.mjs', 'pipeline/lib/guard-provenance.mjs',
+  'pipeline/lib/state.mjs', 'pipeline/lib/review-publish.mjs', 'pipeline/lib/review-context.mjs', 'pipeline/lib/locks.mjs',
+  'pipeline/lib/round-status.mjs', 'pipeline/commands/final-gate.mjs', 'pipeline/commands/triage.mjs', 'pipeline/commands/model-proof.mjs',
+  'pipeline/bin/pipeline.mjs', 'pipeline/lib/finalgate.mjs',
+  // direct imports of finalgate.mjs, then the helpers the review commands run on
+  'pipeline/lib/closing-keywords.mjs', 'pipeline/lib/preflight.mjs', 'pipeline/lib/verify-steps.mjs', 'pipeline/lib/merge-queue.mjs',
+  'pipeline/lib/github.mjs', 'pipeline/lib/codex.mjs', 'pipeline/lib/codex-exec.mjs', 'pipeline/lib/fix-verify.mjs',
+  'pipeline/lib/hold.mjs', 'pipeline/lib/merge-hold.mjs', 'pipeline/lib/cli.mjs', 'pipeline/lib/cmd-common.mjs',
+  'pipeline/lib/review-lease-wiring.mjs',
+  // the commands that read or write a gate input or proof, the thin wrappers, and the libs they use (listed by hand: no import reaches them)
+  'pipeline/commands/state.mjs', 'pipeline/commands/model-floor.mjs', 'pipeline/lib/owner-only.mjs', 'pipeline/commands/verify.mjs',
+  'pipeline/lib/command-guard.mjs', 'pipeline/commands/ci-wait.mjs', 'pipeline/lib/ci-wait.mjs',
+  'pipeline/commands/risk.mjs', 'pipeline/commands/hardstops.mjs', 'pipeline/commands/integrity.mjs', 'pipeline/commands/preflight.mjs',
+  // the comment publisher, the update commands (owner-only guards), and the libs the gate-side commands use
+  'pipeline/lib/claude-ancestry.mjs', 'pipeline/lib/protection.mjs', 'pipeline/commands/comment.mjs', 'pipeline/commands/update.mjs',
+  'pipeline/lib/update-schedule.mjs',
+  // the review-comment renderer and marker-forgery defence, and the upstream, private-tmp and auto-update libs the update path runs on
+  'pipeline/lib/render.mjs', 'pipeline/lib/upstream.mjs', 'pipeline/lib/private-tmp.mjs', 'pipeline/lib/auto-update.mjs',
+];
+
 test('repo config: the gate and review-proof named set is in risk.high_risk_paths, and a one-line change to any of them rates high', () => {
-  const named = [
-    'pipeline/lib/transcript.mjs', 'pipeline/lib/ci-proof.mjs', 'pipeline/lib/integrity.mjs', 'pipeline/lib/guard-provenance.mjs',
-    'pipeline/lib/state.mjs', 'pipeline/lib/review-publish.mjs', 'pipeline/lib/review-context.mjs', 'pipeline/lib/locks.mjs',
-    'pipeline/lib/round-status.mjs', 'pipeline/commands/final-gate.mjs', 'pipeline/commands/triage.mjs', 'pipeline/commands/model-proof.mjs',
-    'pipeline/bin/pipeline.mjs',
-    // direct imports of finalgate.mjs, then the helpers the review commands run on
-    'pipeline/lib/closing-keywords.mjs', 'pipeline/lib/preflight.mjs', 'pipeline/lib/verify-steps.mjs', 'pipeline/lib/merge-queue.mjs',
-    'pipeline/lib/github.mjs', 'pipeline/lib/codex.mjs', 'pipeline/lib/codex-exec.mjs', 'pipeline/lib/fix-verify.mjs',
-    'pipeline/lib/hold.mjs', 'pipeline/lib/merge-hold.mjs', 'pipeline/lib/cli.mjs', 'pipeline/lib/cmd-common.mjs',
-    'pipeline/lib/review-lease-wiring.mjs',
-    // the commands that read or write a gate input or proof, the thin wrappers, and the libs they use (listed by hand: no import reaches them)
-    'pipeline/commands/state.mjs', 'pipeline/commands/model-floor.mjs', 'pipeline/lib/owner-only.mjs', 'pipeline/commands/verify.mjs',
-    'pipeline/lib/command-guard.mjs', 'pipeline/commands/ci-wait.mjs', 'pipeline/lib/ci-wait.mjs',
-    'pipeline/commands/risk.mjs', 'pipeline/commands/hardstops.mjs', 'pipeline/commands/integrity.mjs', 'pipeline/commands/preflight.mjs',
-    // the comment publisher, the update commands (owner-only guards), and the libs the gate-side commands use
-    'pipeline/lib/claude-ancestry.mjs', 'pipeline/lib/protection.mjs', 'pipeline/commands/comment.mjs', 'pipeline/commands/update.mjs',
-    'pipeline/lib/update-schedule.mjs',
-    // the review-comment renderer and marker-forgery defence, and the upstream, private-tmp and auto-update libs the update path runs on
-    'pipeline/lib/render.mjs', 'pipeline/lib/upstream.mjs', 'pipeline/lib/private-tmp.mjs', 'pipeline/lib/auto-update.mjs',
-  ];
   const list = raw.risk.high_risk_paths;
   const { config } = validateConfig(raw);
-  for (const p of named) {
+  for (const p of NAMED) {
     assert.ok(matchAny(p, list, { nocase: true }), `${p} is not matched by risk.high_risk_paths`);
     const files = [{ path: p, added: ['// one line'], removed: [] }];
     const r = assessRisk({ files, hits: [], config });
@@ -237,9 +242,9 @@ test('repo config: every file the risk rating imports (transitively) is covered 
   // The 14 files the rater reads today (2026-11-13). A walker that silently loses an import drops one of them and fails here; a NEW
   // import only grows the closure and must be covered by the check below.
   const known = [
-    'pipeline/lib/risk.mjs', 'pipeline/lib/config.mjs', 'pipeline/lib/diff.mjs', 'pipeline/lib/doc-paths.mjs', 'pipeline/lib/git.mjs',
-    'pipeline/lib/glob.mjs', 'pipeline/lib/hardstops.mjs', 'pipeline/lib/paths.mjs', 'pipeline/lib/proc.mjs', 'pipeline/lib/resolution.mjs',
-    'pipeline/lib/seams.mjs', 'pipeline/lib/shell-words.mjs', 'pipeline/lib/yaml.mjs', 'pipeline/vendor/js-yaml.mjs',
+  'pipeline/lib/risk.mjs', 'pipeline/lib/config.mjs', 'pipeline/lib/diff.mjs', 'pipeline/lib/doc-paths.mjs', 'pipeline/lib/git.mjs',
+  'pipeline/lib/glob.mjs', 'pipeline/lib/hardstops.mjs', 'pipeline/lib/paths.mjs', 'pipeline/lib/proc.mjs', 'pipeline/lib/resolution.mjs',
+  'pipeline/lib/seams.mjs', 'pipeline/lib/shell-words.mjs', 'pipeline/lib/yaml.mjs', 'pipeline/vendor/js-yaml.mjs',
   ];
   assert.deepEqual(known.filter((f) => !closure.includes(f)), [], `import closure of pipeline/lib/risk.mjs lost a known file: ${closure.join(', ')}`);
   assert.ok(closure.length >= known.length, `suspiciously small import closure: ${closure.join(', ')}`);
@@ -247,12 +252,34 @@ test('repo config: every file the risk rating imports (transitively) is covered 
   assert.deepEqual(uncovered, [], `imported by pipeline/lib/risk.mjs but not in risk.high_risk_paths: ${uncovered.join(', ')}`);
 });
 
-test('repo config: every relative import of pipeline/lib/finalgate.mjs (depth 1) is covered by risk.high_risk_paths', () => {
+// Files a named file imports DIRECTLY that are deliberately NOT in risk.high_risk_paths: path -> one line on why it decides no gate, proof,
+// trust boundary, owner-only check, or which code is installed or run (display, logging, IO plumbing, scheduling).
+const DEPTH1_EXEMPT = new Map([
+  ['pipeline/lib/round-ask.mjs', 'display only: the text of the extra-round ask (its header says nothing here decides anything; triage defer-fixes re-checks)'],
+  ['pipeline/lib/summary-comment.mjs', 'reads and writes the PR summary comment the owner reads; the run record it carries is display and routing hints (run-record.mjs)'],
+  ['pipeline/lib/run-record.mjs', 'the run record is display plus routing hints, editable by anyone with comment rights; nothing a gate needs lives only there (run-events.mjs is the evidence)'],
+  ['pipeline/lib/cmd-io.mjs', 'IO plumbing: folds option values, clips command output, writes a .review json file atomically; the callers choose the name and content'],
+  ['pipeline/lib/claude-code-version.mjs', 'a stale-terminal hint: preflight turns it into a warning only, never a block'],
+  ['pipeline/lib/schedule.mjs', 'builds the cron line or launchd plist from the nodePath, binPath and args its caller passes; update-schedule.mjs (listed) chooses what runs'],
+  ['pipeline/lib/worktree-prune/run.mjs', 'update-schedule.mjs imports only pruneLogDir (a log folder path); the worktree prune itself decides no gate, proof, trust or install'],
+]);
+
+test('repo config: every relative import (depth 1) of every file in the named set is covered by risk.high_risk_paths or listed in DEPTH1_EXEMPT', () => {
   const list = raw.risk.high_risk_paths;
-  const [direct] = directImports(['pipeline/lib/finalgate.mjs']);
+  const imports = directImports(NAMED);
+  const byFile = new Map(NAMED.map((rel, i) => [rel, imports[i]]));
   // finalgate.mjs imports a few dozen files today (2026-11-13); a scanner that silently loses its imports fails here.
+  const direct = byFile.get('pipeline/lib/finalgate.mjs');
   assert.ok(direct.length >= 20, `suspiciously few direct imports of finalgate.mjs: ${direct.join(', ')}`);
   for (const f of ['pipeline/lib/triage.mjs', 'pipeline/lib/model-floor.mjs', 'pipeline/hooks/lib/owner-go.mjs']) assert.ok(direct.includes(f), `${f} is no longer found in finalgate.mjs's imports: ${direct.join(', ')}`);
-  const uncovered = direct.filter((f) => !matchAny(f, list, { nocase: true }));
-  assert.deepEqual(uncovered, [], `imported by pipeline/lib/finalgate.mjs but not in risk.high_risk_paths: ${uncovered.join(', ')}`);
+  const uncovered = [];
+  for (const [rel, targets] of byFile) for (const t of targets) if (!matchAny(t, list, { nocase: true }) && !DEPTH1_EXEMPT.has(t)) uncovered.push(`${t} (imported by ${rel})`);
+  assert.deepEqual(uncovered, [], `imported by a named high-risk file but neither in risk.high_risk_paths nor in DEPTH1_EXEMPT: ${uncovered.join(', ')}`);
+  // A stale exemption hides nothing but rots: each must still exist, still be imported by a named file, and not be listed after all.
+  const imported = new Set([...byFile.values()].flat());
+  for (const [t, why] of DEPTH1_EXEMPT) {
+    assert.ok(why.length > 0 && fs.existsSync(path.join(root, t)), `DEPTH1_EXEMPT ${t}: missing file or reason`);
+    assert.ok(imported.has(t), `DEPTH1_EXEMPT ${t} is no longer imported by a named file: remove it`);
+    assert.ok(!matchAny(t, list, { nocase: true }), `DEPTH1_EXEMPT ${t} is now in risk.high_risk_paths: remove the exemption`);
+  }
 });
