@@ -89,16 +89,18 @@ export function unreadablePacket(files) {
   };
 }
 
-// The line numbers a Read credits when its returned rows (call.rows) are held against the file's text: a row counts only when its text equals the file's line n (a trailing \r
-// ignored on both sides), and the range ends before the first row that differs (a row cut short is not credited, nor is anything after it). -> { first, last } or null.
+// The line numbers a Read credits when its returned rows (call.rows) are held against the file's text: a row counts only when its text equals the file's line n (all trailing \r
+// and a leading BOM on line 1 ignored on both sides), and the range ends before the first row that differs (a row cut short is not credited, nor is anything after it). -> { first, last } or null.
 export function creditedRange(rows, fileText) {
   if (!Array.isArray(rows) || rows.length === 0 || typeof fileText !== 'string') return null;
   const fileLines = fileText.split('\n');
   const total = lineCountOf(fileText);
-  const same = (a, b) => a.replace(/\r$/, '') === b.replace(/\r$/, '');
+  // all trailing \r are ignored on both sides, and a UTF-8 BOM leading line 1 (Read may drop it)
+  const norm = (s, n) => (n === 1 ? s.replace(/^﻿/, '') : s).replace(/\r+$/, '');
+  const same = (a, b, n) => norm(a, n) === norm(b, n);
   let last = null;
   for (const row of rows) {
-    if (!Number.isInteger(row.n) || row.n < 1 || row.n > total || !same(row.text, fileLines[row.n - 1])) break;
+    if (!Number.isInteger(row.n) || row.n < 1 || row.n > total || !same(row.text, fileLines[row.n - 1], row.n)) break;
     last = row.n;
   }
   return last === null ? null : { first: rows[0].n, last };

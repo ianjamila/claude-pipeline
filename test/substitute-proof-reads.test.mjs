@@ -213,3 +213,17 @@ test('R10-F2: a required file Read cannot return as numbered text makes the pack
   assert.ok(nul !== null && nul.message.includes('sides/ours/data.bin') && /NUL|binary/.test(nul.message));
   assert.equal(unreadablePacket([{ rel: 'sides/ours/logo.svg', content: '<svg/>\n' }, { rel: 'sides/ours/a.md', content: 'x\n' }]), null, 'svg is text');
 });
+
+test('R11-F1: a leading BOM and repeated trailing \\r do not stop a faithful row from being credited', () => {
+  // (a) the file starts with a UTF-8 BOM; Read returns row 1 without it
+  const bom = '﻿one\ntwo\n';
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['one', 'two']))), FILE, 2, bom), true, 'file has BOM, result has none');
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['﻿one', 'two']))), FILE, 2, 'one\ntwo\n'), true, 'result has BOM, file has none');
+  // (b) a line ending \r\r\n is read back as 'x'
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['x', 'two']))), FILE, 2, 'x\r\r\ntwo\n'), true, 'file has \\r\\r');
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['x\r\r', 'two']))), FILE, 2, 'x\ntwo\n'), true, 'result has \\r\\r');
+  // (c) a row that really differs is still not credited (a BOM only counts on line 1)
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['one', 'tw']))), FILE, 2, bom), false, 'cut row');
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['one', '﻿two']))), FILE, 2, 'one\ntwo\n'), false, 'a BOM past line 1 is real text');
+  assert.equal(readsCoverFile(callsFor(resultOf('a', {}, numbered(['y', 'two']))), FILE, 2, 'x\r\r\ntwo\n'), false, 'different text');
+});
