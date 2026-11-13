@@ -4,7 +4,7 @@
 import { createHash } from 'node:crypto';
 import { CATEGORIES } from './codex.mjs';
 import { MIN_FABLE, compareVersions, parseModelId } from './model-floor.mjs';
-import { isSensitivePath } from './risk.mjs';
+import { isSensitivePath, threatModelsFor } from './risk.mjs';
 import { RISK_LEVELS, isSubstituteRound, maxRiskOf, secondReviewerOf } from './state.mjs';
 import { wholePrOwed } from './review-route.mjs';
 
@@ -79,6 +79,7 @@ export function validateRulings(json, itemIds, { review = false } = {}) {
     if (!oneOf(r.ruling, DECISIONS)) errors.push(`${r.id}: ruling must be one of ${DECISIONS.join('|')}`);
     if (!oneOf(r.confidence, CONFIDENCES)) errors.push(`${r.id}: confidence must be one of ${CONFIDENCES.join('|')}`);
     if (typeof r.reasoning !== 'string') errors.push(`${r.id}: reasoning must be a string`);
+    if (r.scope !== undefined && r.scope !== OUT_OF_MODEL) errors.push(`${r.id}: scope must be "${OUT_OF_MODEL}" when given`);
   }
   if (review) errors.push(...findingErrors(json.findings));
   else if (json.findings !== undefined) errors.push('findings are only accepted in a Fable review round');
@@ -87,11 +88,34 @@ export function validateRulings(json, itemIds, { review = false } = {}) {
 
 // ---- Fable review rounds --------------------------------------------------------------------
 
+// ---- threat models (review.threat_models, read from the trusted default-branch config; #374) ---------------------------------------------------------
+// The one value `scope` may take on a ruling or a Fable finding: it says the item lies outside the threat model the arbiter's input stated for its file.
+export const OUT_OF_MODEL = 'out-of-model';
+const modelsAmong = (models, paths) => threatModelsFor(paths.map((p) => ({ path: p })), { review: { threat_models: Array.isArray(models) ? models : [] } });
+
+// -> { name, waive } | null. `name` is the first model (config order) whose paths match the item's file: the marker `final.outOfModel`, set for every validated
+// out-of-model FOLLOW-UP on such a file (so the filing gate sees it), whatever its bucket. `waive` is true only when the BLOCKING-security needsHuman
+// exception may apply: (a) the file is a clean repo path that resolves to exactly ONE entry of the reviewed diff (`files`, git.mjs#diffFiles entries),
+// (b) every path of that entry (old and new) matches one model (a rename out of the model is a human's), (c) the category is literally `security`
+// (auth, permissions, data-integrity and data-loss keep their security-dismissal). Anything else: no waiver, today's rule.
+function outOfModelOf(item, { models, files }) {
+  if (!Array.isArray(models) || models.length === 0 || typeof item.file !== 'string' || item.file === '') return null;
+  const hit = modelsAmong(models, [item.file])[0];
+  if (hit === undefined) return null;
+  const entries = Array.isArray(files) && locationProblem(item.file) === null ? files.filter((f) => entryPaths(f).includes(item.file)) : [];
+  if (item.category === 'security' && entries.length === 1) {
+    const paths = entryPaths(entries[0]);
+    const whole = models.find((m) => modelsAmong([m], paths).length === 1 && paths.every((p) => modelsAmong([m], [p]).length === 1));
+    if (whole !== undefined) return { name: whole.name, waive: true };
+  }
+  return { name: hit.name, waive: false };
+}
+
 // What Fable may raise on its own. A finding it raises is something to do, so it is ACCEPT (fix it here) or FOLLOW-UP (an
 // issue), never REJECT. The cap keeps a runaway answer from flooding the triage comment.
 export const FABLE_FINDINGS_MAX = 20;
 const FINDING_DECISIONS = ['ACCEPT', 'FOLLOW-UP'];
-const FINDING_KEYS = ['bucket', 'category', 'title', 'file', 'line', 'detail', 'ruling', 'confidence', 'reasoning'];
+const FINDING_KEYS = ['bucket', 'category', 'title', 'file', 'line', 'detail', 'ruling', 'confidence', 'reasoning', 'scope'];
 const FINDING_TEXT_MAX = 4000;
 
 function findingErrors(findings) {
@@ -115,6 +139,7 @@ function findingErrors(findings) {
     if (!Number.isInteger(f.line) || f.line < 0) errors.push(`${at}.line must be an integer >= 0`);
     if (!oneOf(f.ruling, FINDING_DECISIONS)) errors.push(`${at}.ruling must be one of ${FINDING_DECISIONS.join('|')}`);
     if (!oneOf(f.confidence, CONFIDENCES)) errors.push(`${at}.confidence must be one of ${CONFIDENCES.join('|')}`);
+    if (f.scope !== undefined && f.scope !== OUT_OF_MODEL) errors.push(`${at}.scope must be "${OUT_OF_MODEL}" when given`);
   });
   return errors;
 }
@@ -123,7 +148,8 @@ function findingErrors(findings) {
 // PROVEN answer: an unproven one adds nothing (the round stays Fable-pending, see fablePendingRounds). Low confidence, or
 // deferring a BLOCKING security / data finding to a follow-up, goes to a human exactly like an arbiter ruling would.
 // `fingerprintFor(finding)` gives the cache fingerprint (it reads the code at head, so it is the caller's).
-export function fableFindingItems(findings, round, { transcript = null, fingerprintFor = () => null } = {}) {
+// `models` / `diffFiles`: the threat models in force and the reviewed diff (see outOfModelOf); none = today's rules.
+export function fableFindingItems(findings, round, { transcript = null, fingerprintFor = () => null, models = [], diffFiles = null } = {}) {
   if (!Number.isInteger(round) || round < 1) throw new Error(`invalid round ${String(round)}`);
   const errors = findingErrors(findings);
   if (errors.length > 0) throw new Error(`invalid findings: ${errors.join('; ')}`);
@@ -131,7 +157,11 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
     const defersBlockingSecurity = f.bucket === 'BLOCKING' && SECURITY_CATEGORIES.includes(f.category) && f.ruling === 'FOLLOW-UP';
     let final = { decision: f.ruling, by: 'arbiter', needsHuman: false, reason: f.reasoning };
     if (f.confidence === 'low') final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence' };
-    else if (defersBlockingSecurity) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'would defer a blocking security/data finding', cause: 'security-dismissal' };
+    else {
+      const oom = f.scope === OUT_OF_MODEL && f.ruling === 'FOLLOW-UP' ? outOfModelOf(f, { models, files: diffFiles }) : null;
+      if (oom !== null && (oom.waive || !defersBlockingSecurity)) final = { ...final, outOfModel: oom.name };
+      else if (defersBlockingSecurity) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'would defer a blocking security/data finding', cause: 'security-dismissal' };
+    }
     const item = {
       id: `R${round}-F${i + 1}`,
       round,
@@ -325,7 +355,8 @@ export function finalizeWithoutArbiter(items, opts = {}) {
 // fails closed.
 // `proofCause` names why an unproven answer is unproven when it is not the plain model-proof failure ('stale-model': the proof failed on the
 // Fable floor alone).
-export function applyRulings(items, rulings, { proofOk, transcript, proofCause } = {}) {
+// `models` / `diffFiles`: the threat models in force and the reviewed diff (see outOfModelOf); none = today's rules.
+export function applyRulings(items, rulings, { proofOk, transcript, proofCause, models = [], diffFiles = null } = {}) {
   const list = Array.isArray(rulings) ? rulings : (rulings?.rulings ?? []);
   const byId = new Map(list.map((r) => [r.id, r]));
   return items.map((item) => {
@@ -362,10 +393,13 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause }
       };
     } else if (r.confidence === 'low') {
       next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence' };
-    } else if (dismissesBlockingSecurity) {
-      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'would dismiss a blocking security/data item', cause: 'security-dismissal' };
     } else {
-      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning };
+      const oom = r.scope === OUT_OF_MODEL && r.ruling === 'FOLLOW-UP' ? outOfModelOf(item, { models, files: diffFiles }) : null;
+      if (dismissesBlockingSecurity && !(oom?.waive === true)) {
+        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'would dismiss a blocking security/data item', cause: 'security-dismissal' };
+      } else {
+        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning, ...(oom === null ? {} : { outOfModel: oom.name }) };
+      }
     }
     return next;
   });
@@ -900,6 +934,7 @@ const byLabel = (item) => {
   if (by === 'claude' && isRoundCapDeferral(item)) return 'claude (round limit)';
   // who reviewed it second is part of the bound Rulings row (R5-5): claude+codex | claude+substitute-opus | claude+substitute-fable
   if (by === 'claude') return item.secondReview !== undefined ? `claude+${secondReviewerOf(item.secondReview)}` : 'claude';
+  if (by === 'arbiter' && typeof item.final?.outOfModel === 'string' && item.final.outOfModel !== '') return `arbiter (outside threat model ${asciiLine(item.final.outOfModel, 40)})`;
   return typeof by === 'string' && by !== '' ? by : 'unknown';
 };
 const isCriticalItem = (item) => item.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(item.category);
@@ -1110,6 +1145,9 @@ export function reviewEligibilityProblems(state) {
   const rounds = state?.rounds ?? [];
   const noIssue = allItems(state).filter((i) => isClaudeRuled(i) && i.final?.decision === 'FOLLOW-UP' && !i.followupIssue).map((i) => i.id);
   if (noIssue.length > 0) problems.push(`Claude-ruled follow-up(s) without a filed issue: ${noIssue.join(', ')} (run followups create, or rule them ACCEPT)`);
+  // An arbiter FOLLOW-UP ruled outside a threat model (final.outOfModel) leaves the merge only through its issue, like the Claude-ruled one above (#374). Only here: roundOutcome is untouched.
+  const noModelIssue = allItems(state).filter((i) => typeof i.final?.outOfModel === 'string' && i.final.decision === 'FOLLOW-UP' && !i.followupIssue).map((i) => i.id);
+  if (noModelIssue.length > 0) problems.push(`out-of-model follow-up(s) without a filed issue: ${noModelIssue.join(', ')} (run followups create)`);
   const unconfirmed = rounds.flatMap((r) => (r.items ?? [])
     .filter((i) => i.implementedVia === 'other-files' && !rounds.some((later) => later.n > r.n && Array.isArray(later.confirmFixed) && later.confirmFixed.includes(i.id)))
     .map((i) => i.id));
