@@ -274,21 +274,20 @@ test('repo config: every relative import (depth 1) of every root (literal .mjs e
 });
 
 // Every file in pipeline/commands/ is either matched by risk.high_risk_paths or sits here with a one-line TRUE reason (round 7, R7-F2: the
-// commands were the one dimension still audited by hand, one file per round). A command is exempt only when it decides no gate, proof, trust,
-// owner-only or install question, writes no review state or run record, takes or releases no hold, arms or disarms no merge, guards no job and
-// changes no branch protection: it only reads or displays, or it is a thin wrapper whose decision lives in a listed lib (named below). A new
-// or unaudited command fails the test below until it is listed in risk.high_risk_paths or classified here. Before adding an entry, read what the
-// command does (not its header).
+// commands were the one dimension still audited by hand, one file per round). A command is exempt only when it decides no review gate, merge,
+// hold or review proof and writes no review state or run record: it reads or displays, or it only manages local machine state or GitHub labels
+// (labels.mjs, stacks.mjs and worktrees.mjs act through libs that are not listed; the owner decided 2026-11-13 they stay exempt, tracked in
+// issue #392). A command that books into the run record (cost.mjs) is listed. A new or unaudited command fails the test below until it is
+// listed in risk.high_risk_paths or classified here. Before adding an entry, read what the command does (not its header).
 const COMMANDS_EXEMPT = new Map([
   ['config.mjs', 'read-only display: prints the validated config; the validation and defaults are lib/config.mjs (listed) through requireConfig in lib/cmd-common.mjs (listed)'],
-  ['cost.mjs', 'books spend (tokens, USD, retries) in the run record\'s cost section through createRunRecorder (lib/run-progress.mjs, listed, which decides what a record write keeps); no gate, merge, hold or proof reads the cost section, it is display in the summary and the extra-round ask'],
   ['guard-log.mjs', 'read-only: counts the guard deny log per day and reason code; writes nothing and no decision reads it'],
-  ['labels.mjs', 'creates or realigns the label names, colours and descriptions on GitHub (idempotent); it applies and removes no label on any PR and grants nothing, and no gate reads a label\'s colour or description'],
+  ['labels.mjs', 'creates or realigns the label names, colours and descriptions on GitHub (idempotent); it applies and removes no label on any PR and grants nothing, and no gate reads a label\'s colour or description; it writes GitHub labels but no review state or run record'],
   ['leases.mjs', 'read-only: shows what the review-lease folder says; takes no lease and sweeps nothing, the live-or-dead judgement is scanLeases in lib/review-lease.mjs (listed)'],
   ['stats.mjs', 'read-only display of review rounds of merged PRs (reads PR comments, prints a table or JSON); writes nothing and no gate reads it'],
-  ['stacks.mjs', 'stops idle local dev Supabase stacks and dev servers (the stack-stop sweep, session-end worker, status, repair, init) and installs one fixed schedule line (stacks sweep --apply --summary-only, constant arguments) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the stack-stop libs are not gate inputs'],
+  ['stacks.mjs', 'stops idle local dev Supabase stacks and dev servers (the stack-stop sweep, session-end worker, status, repair, init) and installs one fixed schedule line (stacks sweep --apply --summary-only, constant arguments) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the stack-stop libs are not gate inputs; tracked in issue #392 (owner, 2026-11-13: stays exempt)'],
   ['version.mjs', 'read-only: prints the version stamp; what an install proves is decided in lib/identity.mjs and lib/installer.mjs (both listed)'],
-  ['worktrees.mjs', 'removes finished local worktrees (prune), keep-locks, the holding folder and the read-only sessions check, and installs one fixed schedule line (worktrees prune --summary-only) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the prune rules live in lib/worktree-prune/*, which no gate reads'],
+  ['worktrees.mjs', 'removes finished local worktrees (prune), keep-locks, the holding folder and the read-only sessions check, and installs one fixed schedule line (worktrees prune --summary-only) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the prune rules live in lib/worktree-prune/*; of those only live-sessions.mjs is listed (review-lease.mjs reads it), the rest decides no gate; the unlisted libs this command acts through are tracked in issue #392 (owner, 2026-11-13: stays exempt)'],
 ]);
 
 test('repo config: every file in pipeline/commands/ is matched by risk.high_risk_paths or sits in COMMANDS_EXEMPT with a reason (a new command fails until it is classified)', () => {
