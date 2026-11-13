@@ -101,7 +101,7 @@ risk:
     "pipeline/commands/summary.mjs", "pipeline/commands/queue-sweep.mjs", "pipeline/commands/merge-hold.mjs", "pipeline/commands/job.mjs", "pipeline/commands/update-branch.mjs", "pipeline/commands/redraft.mjs", "pipeline/commands/protect.mjs", "pipeline/commands/repo-move.mjs", "pipeline/commands/smoke.mjs", "pipeline/commands/followups.mjs", "pipeline/commands/artifacts.mjs", "pipeline/commands/vendor.mjs", "pipeline/commands/agent-log.mjs",
     "pipeline/commands/cost.mjs",
     "pipeline/lib/agentlog.mjs", "pipeline/lib/agentlog-close.mjs",
-    "pipeline/lib/codex-usage.mjs", "pipeline/lib/click-ask.mjs", "pipeline/lib/local-branches.mjs", "pipeline/commands/owner-go.mjs",
+    "pipeline/lib/click-ask.mjs", "pipeline/lib/local-branches.mjs", "pipeline/commands/owner-go.mjs",
     "test/repo-risk-config.test.mjs", "test/fixtures/static-imports.mjs",
     "pipeline/commands/substitute.mjs", "pipeline/commands/codex-status.mjs", "pipeline/lib/codex-session.mjs", "pipeline/lib/codex-usage.mjs",
     "pipeline/lib/review-round.mjs", "pipeline/lib/review-route.mjs", "pipeline/lib/round-stats.mjs", "pipeline/lib/route-record.mjs",
