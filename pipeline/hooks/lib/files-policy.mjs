@@ -1509,18 +1509,49 @@ const literalCommand = (w) => w === '[' || literalWord(w) || spacedPath(w) || (w
 const cdTargetLiteral = (e) => isAbs(e) || /^\.\.?(?:[\\/]|$)/.test(e);
 // Option names are compared without case, `_` or `-` (`AUTO_CD`, `auto-cd`, `noautocd`)
 const optionWord = (w) => w.toLowerCase().replace(/[_-]/g, '');
-// zsh AUTO_CD runs a bare word that names a directory as a cd, which is no cd command the walk sees: the line's directory is then unknown. Only the option's name is read (setopt / unsetopt / emulate with the name or a
-// run-time word, `set -o autocd` / `set -J`, `options[autocd]=on` or an `options[...]` subscript only known at run time, any other assignment to `options`).
-function autocdSwitch(c) {
-  const { argv } = unwrapBuiltin(c.argv ?? []);
-  const sub = (w) => /^options\[(.*)\]/.exec(w)?.[1];
-  if (Object.hasOwn(c.env ?? {}, 'options') || (c.argv ?? []).some((a) => /^options(?:\+?=)/.test(a))) return true;
-  if ((c.argv ?? []).some((a) => { const s = sub(a); return s !== undefined && (optionWord(s).includes('autocd') || /[$`*?[{(]/.test(s)); })) return true;
-  const head = baseOf(argv[0] ?? '');
-  const args = argv.slice(1);
-  if (['setopt', 'unsetopt', 'emulate'].includes(head)) return args.some((w) => optionWord(w).includes('autocd') || /[$`]/.test(w));
-  if (head === 'set') return args.some((w, i) => optionWord(w).includes('autocd') || /^[-+][A-Za-z]*J/.test(w) || (/[$`]/.test(w) && /^[-+][A-Za-z]*o$/.test(args[i - 1] ?? '')));
-  return false;
+// R17: AUTO_CD (zsh) / autocd (bash `shopt -s autocd`, BASHOPTS, `-O autocd`, a shebang option, eval'd text ...) runs a command word that names a directory as a cd, which is no cd command the walk sees.
+// Instead of tracking where the option could be set, the WORD is looked at, whatever the option state: a command word that could be a directory at run time makes the directory unknown (from that
+// command on, as far as the frame is concerned). That is a word that (a) is literal and names an existing directory, relative to any candidate cwd, or absolute; (b) is `..`, a lone `.` or ends in `/`;
+// (c) is literal and equals an operand (or a leading part of one) of another mkdir / cp / mv / ln / install / git clone / tar / unzip on the line, which may have made that directory; (d) is only known at
+// run time (`$D`, `$(pick)`, a glob) and stands alone as a command, unless the line knows its value, which is then judged by (a) to (c).
+const DIR_MAKERS = new Set(['mkdir', 'cp', 'mv', 'ln', 'install', 'tar', 'bsdtar', 'gtar', 'unzip', 'rsync', 'ditto']);
+// (the operands of the commands that may make a directory, listed once per command list: a long line asks about every command)
+const trimTrailingSlashes = (o) => { let n = o.length; while (n > 0 && o[n - 1] === '/') n--; return o.slice(0, n); }; // (linear: a regex for a run of slashes is quadratic)
+const makerOperands = new WeakMap();
+function makerOps(cmds) {
+  let list = makerOperands.get(cmds);
+  if (list) return list;
+  list = cmds.map((x) => {
+    if (!x.argv?.length) return null;
+    const y = unwrapBuiltin(x.argv).argv;
+    const n = baseOf(y[0] ?? '');
+    if (!(DIR_MAKERS.has(n) || (n === 'git' && y.slice(1).includes('clone')))) return null;
+    return y.slice(1).filter((o) => !o.startsWith('-')).map((o) => o.replace(/^(?:\.\/)+/, '')).map(trimTrailingSlashes);
+  });
+  makerOperands.set(cmds, list);
+  return list;
+}
+function dirLikeWord(cmds, ci, ctx, bases) {
+  const c = cmds[ci];
+  if (!c.argv?.length) return false;
+  const u = unwrapBuiltin(c.argv);
+  const w = u.argv[0] ?? '';
+  if (w === '[' || w === '[[' || (w === '.' && u.argv.length > 1)) return false; // (the test builtin, and `. FILE`, which is source)
+  const lone = u.argv.length === 1;
+  if (u.blind) return lone; // (a wrapper whose next word is only known at run time)
+  const e = expandRefs(w, ctx);
+  // (d) a run-time word. Only a command of one word is run as a cd by autocd (bash: no other words after the name; the wrapper cases above and `$G ok.sh` are programs with arguments), and a double-quoted
+  // word with no reference in it is literal text (`"a[@]"`)
+  const rawWord = (c.raw ?? '').trim();
+  const quotedLiteral = /^"[^"$`\\]*"$/.test(rawWord) || /^'[^']*'$/.test(rawWord);
+  if (/[`$*?[{(]/.test(e) && !quotedLiteral) return lone;
+  if (e === '..' || e.endsWith('/') || (e === '.' && u.argv.length === 1)) return true; // (b)
+  const p = pathsFor();
+  const places = isAbs(e) ? [p.normalize(e)] : bases.map((d) => p.join(d, e));
+  if (places.some((q) => ctx.api.existsSync(q) && Array.isArray(ctx.readDir(q)))) return true; // (a)
+  const bare = e.replace(/^(?:\.\/)+/, '');
+  if (bare === '' || bare.startsWith('-')) return false;
+  return makerOps(cmds).some((ops, k) => k !== ci && ops !== null && ops.some((q) => q === bare || q.startsWith(`${bare}/`))); // (c)
 }
 // The command a line word really runs, past `builtin` / `command` / `noglob` / `nocorrect` / zsh's `-` (and their flags, and one `--`): `builtin set -T`, `command -p -- shopt -s cdable_vars`.
 // `blind`: a wrapper's next word is not a literal name (`builtin $S -T`), so what it runs is not known
@@ -3428,7 +3459,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false };
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
-  if (cmds.some(autocdSwitch)) out.unknownCd = true; // (R17: AUTO_CD turned on: a bare word runs a cd)
+  if (cmds.some((_, i) => dirLikeWord(cmds, i, ctx, [ctx.cwd]))) out.unknownCd = true; // (R17: AUTO_CD: a command word that could be a directory runs a cd)
   const from = flowStart(cmds);
   const seen = new Map();
   const local = Object.create(null);
@@ -3456,7 +3487,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
       for (const k of d.bare) if (d.unknown || d.transform) set(k, null, false);
     } else if (CD_CMDS.has(name)) {
       // (a target that stays a run-time value, a pattern or a brace list, `cd -`, popd, several operands: the directory is unknown from here on, not a literal. R17: so is any target that is not
-      // `.` / `..` / `/..` / `./..` / `../..` or a home form: a bare name may be read through CDPATH or as a variable)
+      // `.` / `..` / a `/`, `./` or `../` prefix or a home form: a bare name may be read through CDPATH or as a variable)
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
       const v = t === undefined ? t : substVars(t, local, ctx.budget);
       const homeForm = v === undefined || v === '~' || v.startsWith('~/');
@@ -3801,6 +3832,9 @@ function evaluateBashForFilesFrame(command, opts) {
   const newName = (n) => ctx.unknownAll && !Object.hasOwn(ctx.vars, n);
   const snaps = []; // per command: the names a sourced file may have changed / set at run time as that command runs (the checks after the loop would otherwise see the end state)
   // Is the directory the line works in only known at run time? (a `cd` into an unset / substituted / maybe-changed name, `cd -`, `popd`; or the frame was started in one)
+  let dirWordsAt = -1;
+  let dirWordsVal = false;
+  const dirWords = () => { if (dirWordsAt !== dirs.length) { dirWordsVal = cmds.some((_, i) => dirLikeWord(cmds, i, ctx, dirs)); dirWordsAt = dirs.length; } return dirWordsVal; }; // (once per frame, again when a sourced cd added directories)
   const unknownCwd = () => {
     if (assumedCwd) return false; // (a rerun that already assumes a directory: the unknown cd is what it stands for)
     if (opts._unknownCwd === true || ctx.sourcedCdUnknown) return true;
@@ -3825,7 +3859,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const homeMoved = ctx.unknownAll || ctx.homeSourced === true || moved('HOME') || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[|$)/.test(a)));
     return cmds.some((c, ci) => {
       const cn = baseOf(c.argv[0] ?? '');
-      if (autocdSwitch(c)) return true; // (R17: AUTO_CD)
+      if (dirWords()) return true; // (R17: AUTO_CD, whether or not an option is set: a command word that could be a directory)
       if (!CD_CMDS.has(cn)) return false;
       const { unknownName } = stateAt(ci);
       if (cdUnknownShape(c.argv)) return true;
@@ -4260,7 +4294,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // too: `cd /tmp/link && find ..` is the link target's parent). Otherwise the command is read against every directory of the line (`dirs`).
   const withReal = (list) => unique([...list, ...list.map(realOf)]);
   const staticName = (c) => { const n = c.argv[0] ?? ''; return n === '[' || n === '[[' || (n !== '' && !/[$`*?[\](){}~'"\\<>=]/.test(n)); };
-  const changesDir = (c) => (c.argv.length > 0 && (!staticName(c) || DIR_CHANGERS.has(baseOf(c.argv[0])))) || autocdSwitch(c); // (R17: AUTO_CD turns a bare word into a cd)
+  const changesDir = (c) => (c.argv.length > 0 && (!staticName(c) || DIR_CHANGERS.has(baseOf(c.argv[0])))) ; // (R17: a bare word that is a directory makes the whole directory unknown, see dirLikeWord, so there is no narrowing at all then)
   // Narrowing needs a plain sequence (cmds.plainSeq: it also covers a cut-short parse, a closer with no opener, a heredoc not located, a group, a subshell, a function, a `!`), no `$'…'` / `$"…"` string on the
   // line (R6-F2), and no command that changes the directory (a cd, eval, source, ...) in a trap action: it runs in this shell, but later. (Any other command inside a substitution or a `-c` string is
   // another shell's, and a plain sequence has no loop, branch or group to run a command out of turn.)
