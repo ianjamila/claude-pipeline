@@ -33,4 +33,5 @@ jobs:
         with:
           name: verify-report
           path: .verify/
+          include-hidden-files: true
           if-no-files-found: ignore

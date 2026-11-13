@@ -66,3 +66,30 @@ test('the SHA-pin check sees the actions of the templates (it is not vacuous)', 
   assert.ok(all.length >= 8, all.join(', '));
   assert.ok(all.some((u) => u.startsWith('actions/upload-artifact@')));
 });
+
+// upload-artifact skips hidden files by default (include-hidden-files: false), and @actions/glob skips any item whose basename starts
+// with a dot, the search root included: `path: .verify/` uploaded an empty verify-report in every project (round 2 of #350). So every
+// upload step whose literal path has a dot-led segment must say include-hidden-files: true. `${{ ... }}` paths are not judged here.
+const uploadSteps = (f) => {
+  const wf = parseYaml(readFileSync(new URL(f, DIR), 'utf8'));
+  return Object.values(wf.jobs ?? {}).flatMap((j) => (j.steps ?? []).filter((s) => /^actions\/upload-artifact@/.test(s.uses ?? '')));
+};
+const hasHiddenSegment = (p) => !p.includes('${{') && p.split(/[\n/\\]+/).some((seg) => seg.startsWith('.'));
+
+for (const f of files) {
+  test(`workflow template ${f} sets include-hidden-files: true on upload-artifact steps that upload a dot path`, () => {
+    for (const s of uploadSteps(f)) {
+      const p = String(s.with?.path ?? '');
+      if (hasHiddenSegment(p)) assert.equal(s.with['include-hidden-files'], true, `${f}: upload-artifact path ${JSON.stringify(p)} needs include-hidden-files: true`);
+    }
+  });
+}
+
+test('the hidden-path upload check sees verify.yml\'s .verify/ upload (it is not vacuous)', () => {
+  const paths = uploadSteps('verify.yml').map((s) => s.with.path);
+  assert.ok(paths.some((p) => p.startsWith('.verify')), paths.join(', '));
+  assert.equal(hasHiddenSegment('.verify/'), true);
+  assert.equal(hasHiddenSegment('a/.b/c'), true);
+  assert.equal(hasHiddenSegment('${{ runner.temp }}/.x'), false);
+  assert.equal(hasHiddenSegment('out/report.json'), false);
+});
