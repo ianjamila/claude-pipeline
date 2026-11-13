@@ -1390,10 +1390,10 @@ test('#128 R4-B2/F2: a trailing zsh glob qualifier (/) does not hide the config 
   ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
   for (const cmd of [
     'tar -xf x -C /tmp/out?(/)',
-    'tar -xf x -C /tmp/out(/)',
-    'tar -xf x -C /home/u/claude-config-old(/)',
     'rsync -a /tmp/f/ /home/u/claude-confi?-old(/)',
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  // (R17 owner decision: the parser reads `(/)` as a command named `/`, a word that ends in a slash may be a directory (autocd): the directory is unknown)
+  for (const cmd of ['tar -xf x -C /tmp/out(/)', 'tar -xf x -C /home/u/claude-config-old(/)']) assert.equal(bash(cmd, { env }), 'deny', cmd);
 });
 
 // Codex finding 1: dropping a trailing (...) may only WIDEN the match; a real folder whose name ends in (...) is still that folder.

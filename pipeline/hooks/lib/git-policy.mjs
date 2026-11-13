@@ -15,8 +15,8 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
-export { withoutLiteralText, INDIRECT_EXPANSION };
+import { UNDECIDABLE_HEREDOC, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
+export { withoutLiteralText, INDIRECT_EXPANSION, SETS_BY_NAME };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
@@ -407,7 +407,21 @@ const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice
 // `unset`), set in the environment, or a sourced script that may have set variables.
 // A name can be written without the letters IFS in a row (`eval "I""FS=,"`, `read $N`, `printf -v $N`, `declare I""FS=,`, `N=IFS; export $N`),
 // so the commands that assign a variable by a computed or split-up name count as well.
-const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s|\b(?:export|unset|declare|typeset|local|readonly)\b[^;&|\n]*[$`'"]/;
+const SETS_BY_NAME_HEAD = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s/;
+const DECLARING_WORD = /\b(?:export|unset|declare|typeset|local|readonly)\b/;
+// (#288 R3-F3: the declaring words used to be one pattern, `\b(?:export|…)\b[^;&|\n]*[$`'"]`, which rescans the rest of the segment from EVERY declaring word: 27,000 `export` words took 7 s. A segment holds a name-setting
+// declaration when its FIRST declaring word is followed by a quote, `$` or backtick before the segment ends -- the same answer, one pass per segment.)
+const SETS_BY_NAME = {
+  test(text) {
+    const s = String(text);
+    if (SETS_BY_NAME_HEAD.test(s)) return true;
+    for (const seg of s.split(/[;&|\n]/)) {
+      const k = DECLARING_WORD.exec(seg);
+      if (k && /[$`'"]/.test(seg.slice(k.index + k[0].length))) return true;
+    }
+    return false;
+  },
+};
 // Both the text as written and with its quotes and backslashes removed (`printf -vI""FS ,` spells the name only once they are gone).
 // Why (#81 Codex R1-B1 follow-up): a script the guard opens is judged with its own text too -- `bash wrapper.sh` hid `declare -n r=IFS; r=x` from the outer line. Whole-line comments are left out of
 // the binder test only (a comment that says "read" is no binder); the name IFS anywhere, a comment included, still counts.
@@ -2813,6 +2827,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
+  if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
   if (cmds.truncated) return deny(cmds.refused ? `the command uses ${cmds.refused}, which the guard does not read. ${refusalAdvice(cmds.refused).replace(/^./, (c) => c.toUpperCase())}.` : 'command too complex to verify (the parser gave up). Split it into simpler commands.');
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Rewrite: write the command out literally (`git push origin agent/x`, not `$G push` or `... | sh`); if the guarded words are only text (a commit message, a PR body), put that text in a file (`git commit -F msg.txt`, `gh pr create --body-file body.md`).');

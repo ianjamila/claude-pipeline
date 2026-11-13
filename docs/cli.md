@@ -526,12 +526,12 @@ report whether the pipeline may merge (config, gh, protection, pause, Codex).
 
 ```
 pipeline preflight [--repo DIR]   (exit 0 can merge, 1 cannot, 2 config missing/invalid)
-  warnings (informational, never change canMerge): a stale terminal; an owner allowance (model-floor reset --allow-id) or a hold below MIN_FABLE still in force in the model floor registry; an allowed id the parser can read now (the allowance is no longer needed)
+  warnings (informational, never change canMerge): the guard would refuse verify.quick as an agent runs it (the reason names the script line to reword); a stale terminal; an owner allowance (model-floor reset --allow-id) or a hold below MIN_FABLE still in force in the model floor registry; an allowed id the parser can read now (the allowance is no longer needed)
 ```
 
 Exit: 0 pipeline may merge · 1 it may not (`reasons`) · 2 config missing or invalid.
 
-The report also carries `claudeCode: {running, installed, stale}` (the Claude Code build this terminal runs, from `AI_AGENT`, against the installed one, from `CLAUDE_CODE_EXECPATH`; `stale` is `true` when the terminal is older, `null` when either is unknown) and a `warnings` array; a stale terminal adds a "restart it before a review's Fable pass" warning. Neither ever changes `canMerge` or the exit code.
+A `warnings` entry also appears when the guard (`evaluateBashForFiles`, run from the repo root on the configured `verify.quick`, with the `HOME` of the environment given) would refuse that command: it carries the guard's reason, which names the script line to reword (a comment counts as a reference; the guard has no comment exemption). `vendor --check` does not run this check. The report also carries `claudeCode: {running, installed, stale}` (the Claude Code build this terminal runs, from `AI_AGENT`, against the installed one, from `CLAUDE_CODE_EXECPATH`; `stale` is `true` when the terminal is older, `null` when either is unknown) and a `warnings` array; a stale terminal adds a "restart it before a review's Fable pass" warning. Neither ever changes `canMerge` or the exit code.
 
 Branch protection must require `ci.required_checks` AND, unless `ci.guard_checks: false`, the guard contexts `Test integrity` and `Hard-stop scan` (plus `Cross-model review` with `ci.review_check: true`); `protect` sets that same list.
 
