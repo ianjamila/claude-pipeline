@@ -2993,7 +2993,7 @@ class Parser {
     // Redirections belong to the command they were written on; a redirect with no command of its own
     // (`> file`, `{ a; } > file`, `(a) > file`) still has to reach the caller.
     if (last) last.redirects = [...seg.redirects];
-    else if (seg.redirects.length) emit(this.ctx, [], {}, seg.raw, seg.depth, [...seg.redirects]);
+    else if (seg.redirects.length) emit(this.ctx, [], {}, seg.raw, seg.depth, [...seg.redirects], seg.sep, seg.afterClose); // (#352 R12-F3: it carries the operator before it, as `A=1` does: `change || >x && push` runs the redirect when the change failed)
   }
 
   // Returns the command object that was emitted for this group of words (or null).
