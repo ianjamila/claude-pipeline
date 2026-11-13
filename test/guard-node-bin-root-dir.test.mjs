@@ -308,3 +308,41 @@ test('#352 R3-F1 allow twins: a harmless alias under another name, or no alias a
   const plain = run('git', LOOP_LINE, loopFiles('git config alias.ship "' + PUSH + ' origin ' + MAIN + '"', 'git status'));
   assert.equal(plain.decision, 'allow', 'a command that is not the alias: ' + plain.reason);
 });
+
+// Why (#352 R4-F1): the readings of a `for` word are consecutive iterations of ONE shell, but judgeReadings judged each from the start state, so a command early in the body never saw what an earlier
+// iteration left (an alias, a push.default, a branch). The body is judged once more from the union of what the readings left.
+const bodyFiles = (body, setup) => ({
+  'package.json': JSON.stringify({ name: 'x', scripts: { setup, other: 'echo hi' } }),
+  'start.sh': `#!/bin/bash\nfor s in setup other; do ${body}; done\n`,
+});
+const BODY_LINE = `bash ${GIT_ROOT}/start.sh`;
+const SHIP = 'git config alias.ship "' + PUSH + ' origin ' + MAIN + '"';
+test('#352 R4-F1: an alias made by one iteration of a loop is judged against the command at the top of the next iteration', () => {
+  for (const [what, body] of [['plain', 'git ship; npm run $s'], ['lost cd', 'git ship; cd "$SOME_DIR" || exit 1; npm run $s']]) {
+    const r = run('git', BODY_LINE, bodyFiles(body, SHIP));
+    assert.equal(r.decision, 'deny', `${what}: ${r.reason}`);
+    assert.match(r.reason, /may have been \(re\)defined/, `${what}: ${r.reason}`);
+    assert.match(r.reason, /"ship"/, `${what}: ${r.reason}`);
+  }
+});
+test('#352 R4-F1: a push.default change by one iteration of a loop is judged against the bare push at the top of the next', () => {
+  for (const [what, body] of [['plain', PUSH_BARE + '; npm run $s'], ['lost cd', PUSH_BARE + '; cd "$SOME_DIR" || exit 1; npm run $s']]) {
+    const r = run('git', BODY_LINE, bodyFiles(body, 'git config push.default upstream'));
+    assert.equal(r.decision, 'deny', `${what}: ${r.reason}`);
+    assert.match(r.reason, /changes upstream\/push configuration/, `${what}: ${r.reason}`);
+  }
+});
+test('#352 R4-F1: a branch change by one iteration of a loop is not taken as known at the top of the next', () => {
+  const r = run('git', BODY_LINE, bodyFiles(PUSH_BARE + ' origin HEAD; npm run $s', 'git switch ' + MAIN), { currentBranch: () => 'agent/x' });
+  assert.equal(r.decision, 'deny', r.reason);
+});
+test('#352 R4-F1 allow twins: a harmless alias, a harmless config, or a loop that changes no git state is not refused', () => {
+  const alias = run('git', BODY_LINE, bodyFiles('git ship; npm run $s', 'git config alias.st status'));
+  assert.equal(alias.decision, 'allow', 'other alias: ' + alias.reason);
+  const harmless = run('git', BODY_LINE, bodyFiles('git ship; npm run $s', 'git config alias.ship status'));
+  assert.equal(harmless.decision, 'allow', 'harmless alias of the same name: ' + harmless.reason);
+  const cfg = run('git', BODY_LINE, bodyFiles(PUSH_BARE + '; npm run $s', 'git config user.name x'));
+  assert.equal(cfg.decision, 'allow', 'harmless config: ' + cfg.reason);
+  const none = run('git', BODY_LINE, bodyFiles('git ship; cd "$SOME_DIR" || exit 1; npm run $s', 'echo setup'));
+  assert.equal(none.decision, 'allow', 'nothing changes git state: ' + none.reason);
+});
