@@ -874,8 +874,12 @@ export function binSite(bin, runDir, exists, p = nodePath) {
   const fold = (x) => { const s = toPosix(x); return win ? s.toLowerCase() : s; };
   const bare = (x) => (win ? x.replace(/^[A-Za-z]:(?=\/|$)/, '') : x);
   const under = (a, r) => a === r || a.startsWith(r.endsWith('/') ? r : `${r}/`);
+  // (#352: the file system root is not the project. The bin is also judged as run from every directory the line may be in, and from / every path -- /usr/bin/env too -- lies 'inside', so a plain
+  // `#!/usr/bin/env node` program was opened as a shell script. It still counts when it is the only root there is: a bin that really lives under /)
+  const atFsRoot = (r) => typeof r === 'string' && p.dirname(r) === r;
+  const insideRoots = roots.some((r) => !atFsRoot(r)) ? roots.filter((r) => !atFsRoot(r)) : roots;
   return {
-    inside: (abs) => { const a = fold(abs); return roots.some((r) => { const q = fold(r); return under(a, q) || (win && !/^[A-Za-z]:/.test(a) && under(a, bare(q))); }); },
+    inside: (abs) => { const a = fold(abs); return insideRoots.some((r) => { const q = fold(r); return under(a, q) || (win && !/^[A-Za-z]:/.test(a) && under(a, bare(q))); }); },
     hasBin: (name) => findBin(name) !== null,
     findBin,
     resolve: (w) => (runDir ? p.resolve(runDir, w) : null),
