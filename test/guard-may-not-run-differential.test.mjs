@@ -40,15 +40,22 @@ const pick = (xs) => xs[Math.floor(rnd() * xs.length)];
 const weighted = (pairs) => { let r = rnd() * pairs.reduce((s, p) => s + p[1], 0); for (const [v, w] of pairs) { r -= w; if (r < 0) return v; } return pairs[0][0]; };
 const OPS = [[';', 25], ['&&', 35], ['||', 25], ['&', 8]];
 const NOOPS = ['true', 'false', 'A=1', 'echo hi', 'cat'];
-const WRAPPERS = [['group', 12], ['sub', 12], ['subst', 8], ['bashc', 10], ['eval', 6], ['if', 9], ['iftrue', 6], ['while', 6], ['loop', 6], ['case', 5], ['not', 14], ['pipe', 14], ['stdin', 9]];
+const WRAPPERS = [['group', 12], ['sub', 12], ['subst', 8], ['btick', 4], ['bashc', 10], ['eval', 6], ['if', 9], ['iftrue', 6], ['while', 6], ['loop', 6], ['case', 5], ['not', 14], ['pipe', 14], ['stdin', 9]];
 // (#352 R10: wrappers of a command: the ones that start a child process (what the command changes is the child's) and the ones that stay in this shell)
 const SPAWN = new Set(['nohup', 'env', 'nice', 'timeout 5', 'sudo', 'find']);
 const SPAWN_WORDS = ['nohup', 'env', 'nice', 'timeout 5', 'sudo'];
 const HOW = ['herestr', 'pipe', 'procsub', 'heredoc']; // (how a shell reads the text it runs: a here-string, stdin from a pipe, a process substitution, a heredoc)
 let quoted = 0; // (inside text a shell reads: no heredoc can be written there)
 
-// nodes: { t: 'change' | 'push' | 'noop', txt } | { t: 'list', items, ops } | { t: wrapper, body } | { t: 'not', body } | { t: 'pipe', stages } | { t: 'wrap', w, leaf } | { t: 'stdin', how, body }
+// nodes: { t: 'change' | 'push' | 'noop', txt } | { t: 'empty' } | { t: 'list', items, ops } | { t: wrapper, body } | { t: 'not', body } | { t: 'pipe', stages, neg } | { t: 'wrap', w, leaf } | { t: 'stdin', how, body }
 const noop = () => ({ t: 'noop', txt: pick(NOOPS) });
+// (#352 R11-F4: the stage of a pipeline next to the change or the push: a plain command (a heredoc waiting on it, where a text may hold one), a subshell or a group of commands that change nothing, or an empty group (zsh runs `{ }`))
+const noopStage = (depth, first) => {
+  const kind = weighted([['noop', 4], ['hd', 3], ['sub', 2], ['group', 2], ['empty', first ? 2 : 0]]);
+  if (kind === 'hd') return quoted === 0 ? { ...noop(), hd: true } : noop();
+  if (kind === 'sub' || kind === 'group') return { t: kind, body: genBody('none', depth + 1) };
+  return kind === 'empty' ? { t: 'empty' } : noop();
+};
 const leaf = (need) => (need === 'none' ? noop() : { t: need, txt: need });
 function genBody(need, depth) {
   if (need === 'none') { // (a few commands that change nothing: the `;` inside a group, a branch, a text)
@@ -80,15 +87,19 @@ function genItem(need, depth) {
   if (depth >= 2 || rnd() < 0.3) return need === 'change' && quoted === 0 && rnd() < 0.08 ? { ...leaf(need), hd: true } : leaf(need);
   return genWrapper(need, depth);
 }
-function genWrapper(need, depth) {
-  const kind = weighted(WRAPPERS);
+function genWrapper(need, depth, forced) {
+  const kind = forced ?? weighted(WRAPPERS);
   if (kind === 'not') return { t: 'not', body: depth >= 2 || rnd() < 0.5 ? (need === 'both' ? genWrapper('both', depth) : leaf(need)) : genWrapper(need, depth) };
   if (kind === 'pipe' && need !== 'both') {
-    const stages = rnd() < 0.5 ? [genItem(need, depth), noop()] : [noop(), genItem(need, depth)];
-    return { t: 'pipe', stages };
+    const first = rnd() < 0.5; // (the stage that holds the change or the push comes first)
+    const other = noopStage(depth, !first);
+    // (a heredoc waiting on one stage while the other holds a backtick or $( ) text that runs the change or the push)
+    const main = other.hd && need !== 'none' && rnd() < 0.8 ? genWrapper(need, depth, pick(['subst', 'btick'])) : genItem(need, depth);
+    return { t: 'pipe', stages: first ? [main, other] : [other, main], neg: !other.hd && rnd() < 0.15 };
   }
   if (kind === 'pipe') return { t: 'group', body: genBody('both', depth + 1) };
-  const q = ['subst', 'bashc', 'eval', 'stdin'].includes(kind);
+  if (kind === 'btick' && quoted > 0) return genWrapper(need, depth, 'subst'); // (a backtick text holds no backtick: it would need its own escapes)
+  const q = ['subst', 'btick', 'bashc', 'eval', 'stdin'].includes(kind);
   if (q) quoted++;
   try {
     const body = genBody(need, depth + 1);
@@ -104,11 +115,13 @@ function render(n, kind) {
   switch (n.t) {
     case 'change': return CHANGES[kind] + (n.hd ? heredoc('x') : '');
     case 'push': return PUSH_CMD;
-    case 'noop': return n.txt;
+    case 'noop': return n.txt + (n.hd ? heredoc('x') : '');
+    case 'empty': return '{ }';
     case 'list': return n.items.map((x, i) => (i ? OPTXT[n.ops[i - 1]] : '') + render(x, kind)).join('');
     case 'group': return `{ ${render(n.body, kind)}; }`;
     case 'sub': return `( ${render(n.body, kind)} )`;
     case 'subst': return `echo $(${render(n.body, kind)})`;
+    case 'btick': return `echo \`${render(n.body, kind)}\``;
     case 'bashc': return `bash -c ${shq(render(n.body, kind))}`;
     case 'eval': return `eval ${shq(render(n.body, kind))}`;
     case 'if': return `if false; then ${render(n.body, kind)}; fi`;
@@ -117,7 +130,7 @@ function render(n, kind) {
     case 'loop': return `for x in a b; do ${render(n.body, kind)}; done`;
     case 'case': return `case x in x) ${render(n.body, kind)};; esac`;
     case 'not': return `! ${render(n.body, kind)}`;
-    case 'pipe': return n.stages.map((x) => render(x, kind)).join(' | ');
+    case 'pipe': return (n.neg ? '! ' : '') + n.stages.map((x) => render(x, kind)).join(' | ');
     case 'stdin': {
       const body = render(n.body, kind);
       if (n.how === 'herestr') return `bash <<< ${shq(body)}`;
@@ -179,6 +192,7 @@ function evalNode(n, s, kind) {
     case 'change': return [{ ...s, ok: false, fl: true }, { ...s, ...(kind === 'cd' ? { cd: true } : { sw: true }), ok: true, fl: false }];
     case 'push': return both({ ...s, bad: s.bad || !(s.sw || s.cd) });
     case 'noop': return both(s);
+    case 'empty': return [{ ...s, ok: true, fl: false }];
     case 'list': return evalList(n, [s], kind);
     case 'group': case 'eval': return evalList(n.body, [s], kind);
     case 'case': return evalList(n.body, [s], kind);
@@ -189,7 +203,7 @@ function evalNode(n, s, kind) {
       const r = evalNode(n.leaf, s, kind);
       return SPAWN.has(n.w) && n.leaf.t === 'change' && kind === 'cd' ? r.map((x) => ({ ...x, cd: s.cd })) : r;
     }
-    case 'subst': return flat(evalList(n.body, [s], kind), (r) => both({ ...r, cd: s.cd }));
+    case 'subst': case 'btick': return flat(evalList(n.body, [s], kind), (r) => both({ ...r, cd: s.cd }));
     case 'if': case 'while': return uniq([{ ...s, ok: true, fl: false }, ...evalList(n.body, [{ ...s, fl: false }], kind)]);
     case 'not': return evalNode(n.body, s, kind).map((r) => ({ ...r, ok: !r.ok }));
     case 'pipe': {
@@ -199,7 +213,7 @@ function evalNode(n, s, kind) {
         const outs = evalNode(st, { ...s, ok: true, fl: false }, kind).filter((o) => !o.fl || idx === n.stages.length - 1); // (a stage that is not the last: its status is gone past, as for a ;)
         acc = flat(acc, (a) => outs.map((o) => ({ sw: a.sw || o.sw, cd: s.cd, bad: a.bad || o.bad, ok: idx === n.stages.length - 1 ? o.ok : a.ok, fl: idx === n.stages.length - 1 ? o.fl : a.fl })));
       });
-      return acc;
+      return n.neg ? acc.map((a) => ({ ...a, ok: !a.ok })) : acc; // (`! a | b` inverts the status of the pipeline)
     }
     default: throw new Error(n.t);
   }
@@ -228,7 +242,10 @@ test('#400: the guard denies every generated line whose push can run without the
   console.log(`# differential: ${checked} lines (seed ${SEED}), ${mustDeny} where the push can run without the change, ${checked - mustDeny} where it surely cannot; soundness failures: ${failures.length}; over-refusals: ${over.length}; ${ms} ms`);
   for (const l of over.slice(0, 3)) console.log(`#   over-refusal (allowed by the reference): ${l}`);
   // (the generator must reach the shapes the rule was found wrong on: R10-F1 stdin / here-string / heredoc / process-substitution shells, F2 { } / if before ||, F3 a group stage, F4 a heredoc with & or |, #403 wrappers, a change in a loop)
-  for (const [name, re] of [['here-string', /bash <<< /], ['stdin pipe', /echo '.*' \| bash/], ['process substitution', /bash <\(echo/], ['heredoc shell', /bash <<EOF/], ['heredoc on a command', /(?:cd|git switch|npm run) [^\n]*<<EOF[^\n]*[|&]/], ['spawn wrapper', /(?:nohup|env|nice|timeout 5|sudo|find \.) /], ['transparent wrapper', /command |builtin /], ['loop', /for x in a b/], ['group before ||', /\{ [^\n]*; [^\n]*; \} \|\|/], ['if before ||', /fi \|\|/], ['group stage', /\{ [^\n]*; [^\n]* \} \|/]]) {
+  for (const [name, re] of [['here-string', /bash <<< /], ['stdin pipe', /echo '.*' \| bash/], ['process substitution', /bash <\(echo/], ['heredoc shell', /bash <<EOF/], ['heredoc on a command', /(?:cd|git switch|npm run) [^\n]*<<EOF[^\n]*[|&]/], ['spawn wrapper', /(?:nohup|env|nice|timeout 5|sudo|find \.) /], ['transparent wrapper', /command |builtin /], ['loop', /for x in a b/], ['group before ||', /\{ [^\n]*; [^\n]*; \} \|\|/], ['if before ||', /fi \|\|/], ['group stage', /\{ [^\n]*; [^\n]* \} \|/],
+    // (#352 R11-F4: a pipeline whose other stage is a subshell or a group of commands that change nothing, an empty first stage, a heredoc on one stage while the other holds a backtick or $( ) text, a negated pipeline)
+    ['sub stage', /(?:\| \( [^\n]*\)|\( (?:true|false|A=1|echo hi|cat)[^\n]*\) \|)/], ['group stage of noops', /(?:\| \{ (?:true|false|A=1|echo hi|cat)[^\n]*; \}|\{ (?:true|false|A=1|echo hi|cat)[^\n]*; \} \|)/],
+    ['empty first stage', /\{ \} \|/], ['heredoc stage, then a backtick text', /<<EOF\d* \| echo `/], ['heredoc stage, then a $( ) text', /<<EOF\d* \| echo \$\(/], ['negated pipeline', /(?:^|[;&|(] ?)! [^\n|]* \| /]]) {
     assert.ok([...seen].filter((l) => re.test(l)).length >= 5, `the generator should produce lines with: ${name}`);
   }
   assert.ok(mustDeny > checked * 0.3 && checked - mustDeny > checked * 0.05, 'the generator should produce both kinds of line');
