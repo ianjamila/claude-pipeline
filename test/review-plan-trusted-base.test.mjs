@@ -111,3 +111,18 @@ test('R13-B2: the plan of a base-only round names the follow-up effort, and code
   assertExit(run, 0, run.stderr + run.stdout);
   assert.equal(w.state().rounds.at(-1).baseOnly, true);
 });
+
+// A readable base config that names another default_branch than the working tree's is no trusted base for ROUTING either (the PR may have moved the anchor): trustedBaseOf reads it
+// as unreadable, so the substitute is off and every path is sensitive (round-status.mjs#trustedBaseConfig keeps its lists for the severity display only).
+test('a committed base config naming another default_branch than the working tree reads as an unreadable base: substitute off, every path sensitive', (t) => {
+  const w = roundWorld(t, { max: 3, review: '  codex_round_budget: 1\n' });
+  const fix = afterRoundOne(w, 5);
+  w.repo.git(['branch', 'other', 'main']); // a branch the edited config can name that forks from the same commit, so the fork point still resolves
+  w.config({ review: '  codex_round_budget: 1\n', yml: 'default_branch: other\n' }); // the working tree moves the anchor; the committed config says main
+  const r = plan(w, w.head, fix);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.plan.facts.sensitive, true, 'an unreadable base counts every path as sensitive');
+  assert.equal(r.json.plan.small, false);
+  assert.equal(r.json.plan.route, 'codex', 'a sensitive fix-check is never withheld for the budget');
+  assert.match(r.json.plan.modeOffFrom, /could not be read .*default_branch/, 'the plan says the off came from an unreadable base, naming the mismatch');
+});
