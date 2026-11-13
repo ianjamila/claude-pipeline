@@ -111,3 +111,27 @@ describe('R19-F2: a double-quoted argument never vanishes', () => {
     ['$D *.nomatch (a glob)', '$D *.nomatch; rm -f settings.json'],
   ]);
 });
+
+// ---- R20: a CDPATH learned from a sourced file reaches child frames and later cds ----
+describe('R20: a CDPATH set by a sourced file is seen by what runs after it', () => {
+  const SKILLS = `${HOME}/.claude/skills`;
+  const withFs = (files) => ({ ...fsx(files), existsSync: (p) => Object.hasOwn(files, p) || p === SKILLS });
+  const CD_FILES = {
+    [`${HOME}/proj/env.sh`]: 'export CDPATH=/home/u/lib\n',
+    [`${HOME}/proj/clean.sh`]: 'cd skills && find . -delete\n',
+  };
+  denies('R20-B2', [
+    ['source env.sh then bash ./clean.sh', 'source ./env.sh; bash ./clean.sh', withFs(CD_FILES)],
+    ['source env.sh then bash -c', "source ./env.sh; bash -c 'cd skills && find . -delete'", withFs(CD_FILES)],
+  ]);
+  denies('R20-F1', [
+    ['a nested `. /abs/env.sh` sets CDPATH before a later plain cd',
+      'source ./outer.sh; find . -delete',
+      withFs({ [`${HOME}/proj/outer.sh`]: '. /home/u/proj/env.sh\ncd skills\n', [`${HOME}/proj/env.sh`]: 'export CDPATH=/home/u/lib\n' })],
+  ]);
+  allows('R20 (no CDPATH anywhere)', [
+    ['source env-plain.sh then bash ./clean.sh with a plain cd build',
+      'source ./env-plain.sh; bash ./clean.sh',
+      withFs({ [`${HOME}/proj/env-plain.sh`]: 'export FOO=1\n', [`${HOME}/proj/clean.sh`]: 'cd build && rm -rf out\n', [`${HOME}/proj/build`]: '' })],
+  ]);
+});
