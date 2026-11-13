@@ -1248,7 +1248,7 @@ function ancestorRegexes(ctx) {
 const SEP = "(?=[ \\t]*[/'\"`,+])[/'\"`,+ \\t]+"; // between pieces of a code-built path: '.claude', 'skills', 'ship'
 function suffixBody(sep) {
   const end = '(?![\\w.\\-])';
-  return `\\.claude${sep}(?:settings\\.json${end}|hooks${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter|arbiter-fix)\\.md${end})`;
+  return `\\.claude${sep}(?:settings(?:\\.local)?\\.json${end}|hooks${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter|arbiter-fix)\\.md${end})`;
 }
 // ...preceded by something only known at run time: a variable, a command substitution, a template `${...}`, a call
 // result `)`, a `+` or `,` joining pieces, `~user`, `.join(` / `.joinpath(`.

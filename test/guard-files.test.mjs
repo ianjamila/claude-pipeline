@@ -1905,12 +1905,20 @@ test('#128 R7-F1: the home .claude folder spelled as a quoted piece with a path 
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 
-test('#128 R7-F3: a repo path with a home word, and text naming no root, stay open', () => {
+test('#128 R7-F3: text naming no root stays open (the repo settings.local.json write moved to #269 R26-F3)', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    "python3 -c \"print('x', 'a')\"",
+  ]) { assert.equal(bash(cmd, { env }), 'allow', cmd); assert.equal(bash(cmd), 'allow', cmd); }
+});
+
+test("#269 R26-F3: a run-time-built path to a repo's .claude/settings.local.json is refused (moved from the R7-F3 allow list)", () => {
   const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
   for (const cmd of [
     "python3 -c \"import os; open(os.path.join('/home/u/repo', '.claude', 'settings.local.json'), 'w').write('{}')\"",
-    "python3 -c \"print('x', 'a')\"",
-  ]) { assert.equal(bash(cmd, { env }), 'allow', cmd); assert.equal(bash(cmd), 'allow', cmd); }
+    "node -e \"fs.writeFileSync(join(dir, '.claude', 'settings.local.json'), '{}')\"",
+    "node -e \"fs.writeFileSync(['..', '.claude', 'settings.local.json'].join('/'), '{}')\"",
+  ]) { assert.equal(bash(cmd, { env }), 'deny', cmd); assert.equal(bash(cmd), 'deny', cmd); }
 });
 
 // R5-F1: a wildcard root/projects segment with a literal folder below the project is the session folder the literal rule protects (mirrors TRANSCRIPT_BELOW).
