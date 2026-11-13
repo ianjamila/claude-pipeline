@@ -524,3 +524,56 @@ test('a missing or unreadable .github/workflows warns instead of crashing', asyn
   assert.equal(r3.exitCode, 0);
   assert.equal(unwired(r3).length, 1);
 });
+
+// ---- ci.draft_while_iterating prerequisite audit in --check (warn-only) ----
+const BARE_CI = `name: CI
+on:
+  pull_request:
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+`;
+function draftCheckRepo(flag) {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', `version: 1\nproject: demo\nenforcement: github\nverify:\n  full: npm run verify\n  quick: npm run verify:quick\nci:\n  required_checks: [ci]\n  guard_checks: false\n  draft_while_iterating: ${flag}\n`);
+  repo.write('.github/workflows/ci.yml', BARE_CI);
+  repo.commit('init');
+  return repo;
+}
+
+test('vendor --check: draft_while_iterating false adds no draft-workflows warning', async () => {
+  const repo = draftCheckRepo(false);
+  await vendorInto(repo.dir);
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 0);
+  assert.ok(!(r.output.warnings ?? []).some((w) => w.startsWith('draft-workflows:')));
+});
+
+test('vendor --check: draft_while_iterating true with a bare pull_request workflow warns (exit code unchanged), also beside drift', async () => {
+  const repo = draftCheckRepo(true);
+  await vendorInto(repo.dir);
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 0, 'warn-only');
+  const lines = r.output.warnings.filter((w) => w.startsWith('draft-workflows:'));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /ci\.yml.*draft-skip.*no-ready_for_review.*no-converted_to_draft.*no-pr-concurrency-group.*no-cancel-in-progress/);
+  writeFileSync(join(sp(repo.dir), 'smoke.mjs'), '// edited\n');
+  const drifted = await vendorInto(repo.dir, ['--check']);
+  assert.equal(drifted.exitCode, 1);
+  assert.ok(drifted.output.warnings.some((w) => w.startsWith('draft-workflows:')));
+});
+
+test('vendor --check: a repo with no pipeline config says nothing about draft workflows', async () => {
+  const repo = createTmpRepo();
+  repo.write('.github/workflows/ci.yml', BARE_CI);
+  await vendorInto(repo.dir);
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.ok(!(r.output.warnings ?? []).some((w) => w.startsWith('draft-workflows:')));
+});
+
+test('dogfood: vendor --check on this repository has no draft-workflows warning', async () => {
+  const r = await vendor(['--repo', root, '--check'], { cwd: root, env: process.env });
+  assert.ok(!(r.output.warnings ?? []).some((w) => w.startsWith('draft-workflows:')));
+});

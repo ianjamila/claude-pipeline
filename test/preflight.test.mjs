@@ -381,3 +381,58 @@ test('a bypass warning never turns a blocked world into a mergeable one, and an 
   writeFileSync(join(dir, 'fable.json'), '{ not json');
   assert.deepEqual((await runPreflight({ cwd: repo.dir, env: world([], { env: floorEnv(dir) }).env })).warnings, []);
 });
+
+// ---- ci.draft_while_iterating prerequisite audit (warn-only) ----
+const DRAFT_CI = (types) => `name: CI
+on:
+  pull_request:${types ? `\n    types: [${types}]` : ''}
+concurrency:
+  group: ci-\${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    name: ci
+    if: \${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+`;
+function draftRepo(flag, workflow) {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci']) + `  draft_while_iterating: ${flag}\n`);
+  repo.write('.github/workflows/ci.yml', workflow);
+  repo.commit('init');
+  return repo;
+}
+
+test('draft_while_iterating false: no audit output, whatever the workflows look like', async () => {
+  const repo = draftRepo(false, DRAFT_CI());
+  const r = await runPreflight({ cwd: repo.dir, env: world().env });
+  assert.equal(r.draftWorkflows, null);
+  assert.ok(!r.warnings.some((w) => w.startsWith('draft-workflows:')));
+});
+
+test('draft_while_iterating true with a non-compliant workflow: a warning line and the audit, canMerge untouched', async () => {
+  const repo = draftRepo(true, DRAFT_CI());
+  const r = await runPreflight({ cwd: repo.dir, env: world().env });
+  assert.deepEqual(r.draftWorkflows, [{ file: '.github/workflows/ci.yml', name: 'CI', produces: ['ci'], missing: ['no-ready_for_review', 'no-converted_to_draft'] }]);
+  const lines = r.warnings.filter((w) => w.startsWith('draft-workflows:'));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /\.github\/workflows\/ci\.yml \(ci\).*no-ready_for_review.*no-converted_to_draft/);
+  assert.equal(r.canMerge, true);
+});
+
+test('draft_while_iterating true with a compliant workflow: audit present, no warnings', async () => {
+  const repo = draftRepo(true, DRAFT_CI('opened, synchronize, reopened, ready_for_review, converted_to_draft'));
+  const r = await runPreflight({ cwd: repo.dir, env: world().env });
+  assert.deepEqual(r.draftWorkflows.map((a) => a.missing), [[]]);
+  assert.ok(!r.warnings.some((w) => w.startsWith('draft-workflows:')));
+});
+
+test('dogfood: preflight on this repository (draft_while_iterating true) has no draft-workflows warning', async () => {
+  const { dirname } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const r = await runPreflight({ cwd: root, env: world().env });
+  assert.ok(Array.isArray(r.draftWorkflows) && r.draftWorkflows.length === 1);
+  assert.ok(!r.warnings.some((w) => w.startsWith('draft-workflows:')), r.warnings.join('\n'));
+});
