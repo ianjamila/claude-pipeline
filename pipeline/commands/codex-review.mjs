@@ -239,7 +239,6 @@ export const run = guarded(async (argv, ctx) => {
 
   // Runs Codex over the prepared prompt and returns its validated findings (every failure is an exit-3 Fail).
   const usageWarnings = [];
-  const repoSlugOrNull = () => { try { return gh.repo().slug; } catch { return null; } };
   const askCodex = async () => {
     // execCodex removes whatever is at the output path first (so it can never be read as this run's answer; the mtime check in
     // readCodexAnswer is the second line of defence, the tree kill on timeout the third).
@@ -247,7 +246,7 @@ export const run = guarded(async (argv, ctx) => {
     const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
     // One line per real Codex run, kept or not (the weekly figure in the agent-log line); a ledger that cannot be written is a warning.
     const logged = recordCodexRun({
-      kind: 'review', repo: state?.repo || slug || repoSlugOrNull(), pr, round, effort, model, ok: ran.ok, resolutionOnly,
+      kind: 'review', repo: adm.state?.repo || repoSlug(), pr, round, effort, model, ok: ran.ok, resolutionOnly,
     }, { env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });
     if (!logged.ok) usageWarnings.push(logged.warning);
     if (!ran.ok) throw await failed(ran.reason, { code: ran.code, timedOut: ran.timedOut, detail: ran.detail }, { ran, detail: ran.detail });
