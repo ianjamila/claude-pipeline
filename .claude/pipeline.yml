@@ -26,7 +26,7 @@ verify:
   deferrable_steps: [tests]
   ci_proof:
     tests: { workflow: .github/workflows/ci.yml, job: "test (ubuntu)", event: pull_request }
-  ci_proof_wait_minutes: 25      # ubuntu job ~9 min + queue; past this the Mac runs the tests
+  ci_proof_wait_minutes: 45      # ubuntu job ~25-33 min (two Node passes) + queue, = the job timeout; past this the Mac runs the tests
 
 ci:
   required_checks: ["test (ubuntu)", "test (windows)"]
