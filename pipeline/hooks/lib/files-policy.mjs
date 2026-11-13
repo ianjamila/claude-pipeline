@@ -1452,6 +1452,7 @@ function resolveGlobCd(e, bases, ctx, cmds, idx) {
 // Phase 3b: 200 → 256 with the two review folders assumedCwds added, which cost a psql line under an unfollowable startup file 168 → 224
 // reruns (guard-false-positives J); the CPU deadline still bounds the line)
 const MAX_CD_RERUNS = 256;
+const MAX_DIR_WORD = 4096; // (#288 CI H2: PATH_MAX; a longer lone command word is not an AUTO_CD directory, see dirLikeWord)
 const MAKES_DIRS = new Set(['mkdir', 'cp', 'mv', 'tar', 'bsdtar', 'gtar', 'unzip', 'git', 'rsync', 'ditto', 'install', 'ln', 'curl', 'wget']);
 const MAX_BELOW_ROOT_DIRS = 64; // (subdirectories of the protected roots a rerun may add for a `..` write)
 // R17-F7: the passes that judge a frame again from the directories a later sourced file moved the shell to (at most two per frame), counted across the evaluation
@@ -1567,6 +1568,9 @@ function dirLikeWord(cmds, ci, ctx, bases, fromFile = false) {
   const lone = u.argv.slice(1).every((a) => mayVanish(a, ctx, fromFile, unq));
   if (!lone) return false;
   if (u.blind) return true; // (a wrapper whose next word is only known at run time)
+  // (#288 CI H2: no directory name is longer than PATH_MAX (4 kB); a longer command word is not read as one. Reading it as one made the whole line be judged again in every assumed
+  // directory, seconds of CPU on a 200 kB word; main has no AUTO_CD reading at all, and a crafted run-time word that collapses to a short name needs AUTO_CD, which is off by default)
+  if (w.length > MAX_DIR_WORD) return false;
   // (a sourced file is judged on its own text: the line's variables are not what its assignments leave, R18-F6)
   const e = fromFile ? w : expandRefs(w, ctx);
   // (d) a run-time word, and a double-quoted word with no reference in it is literal text (`"a[@]"`)
@@ -4173,8 +4177,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // by name); inline interpreter code is refused (it can build any name at run time). Child frames inherit the flag and judge their own text the same way.
   // (FP: any relative write, or a command that is not read-only, after such a cd; an absolute path outside the protected set and reads stay allowed.)
   // (a pass that only judges the earlier files again, R17-F7, does not run the line's own commands in every assumed directory once more: the first pass already did, with the unknown state it ended in)
-  if (unknownCwd() && !unknownSeeded) { // (R18-F1: also in a rerun that found the unknown state itself; a rerun seeded unknown by the pass above leaves it to that pass)
-    // (a script or fed file named relative to the unknown directory is judged where it may be: step 7 looks in the protected directories too; inline code is judged by its own text)
+  if (unknownCwd() && !unknownSeeded) { // (R18-F1: also in a rerun that found the unknown state itself; a rerun seeded unknown by the pass above leaves it to that pass)    // (a script or fed file named relative to the unknown directory is judged where it may be: step 7 looks in the protected directories too; inline code is judged by its own text)
     // Why: the directory may be BELOW a protected root (`cd $X` into ~/.claude/pipeline/hooks), where `echo x > ../guard.mjs` lands inside the root. With k = the `..` segments of the
     // relative write targets plus those of the `cd` steps, the line is also rerun with the cwd in each existing subdirectory of each protected root down to depth k (writes only).
     const ups = (w) => (typeof w === 'string' ? braceExpand(expandRefs(w, ctx), ctx).split(/\s+/).map((x) => (x && !isAbs(toPosix(x)) && !/^~(?:\/|$)/.test(x) ? toPosix(x).split('/').filter((s) => s === '..').length : 0)) : [0]);
