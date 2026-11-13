@@ -2,11 +2,18 @@
 // lines (Read's offset / limit, default offset 1 and limit 2000), not just one Read call that names it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MAX_READ_PAGES, READ_LINE_CHARS, READ_PAGE_LINES, lineCountOf, readsCoverFile, unreadablePacket } from '../pipeline/lib/substitute-proof.mjs';
+import { MAX_READ_PAGES, READ_PAGE_LINES, READ_TOKENS_PER_CALL, lineCountOf, readsCoverFile, unreadablePacket } from '../pipeline/lib/substitute-proof.mjs';
 import { toolCallsOf } from '../pipeline/lib/transcript.mjs';
+import { readResultText } from './helpers/read-result.mjs';
 
 const FILE = '/work/.review/round-1/substitute/diff.patch';
-const read = (input = {}, { answered = true, isError = false, file = FILE } = {}) => ({ name: 'Read', input: { file_path: file, ...input }, id: 't', answered, isError });
+// A successful Read call as toolCallsOf yields it: `returned` is the range of line numbers its result showed (lib/transcript.mjs#readReturnedRange); by default what a faithful
+// Read of a long file returns for the request (offset 0 returns from line 1), or `returned` as given (null: the result could not be parsed).
+const read = (input = {}, { answered = true, isError = false, file = FILE, returned } = {}) => {
+  const start = input.offset === undefined || input.offset < 1 ? 1 : input.offset;
+  const faithful = Number.isInteger(start) && Number.isInteger(input.limit ?? 2000) ? { first: start, last: start + (input.limit ?? READ_PAGE_LINES) - 1 } : null;
+  return { name: 'Read', input: { file_path: file, ...input }, id: 't', answered, isError, returned: returned === undefined ? faithful : returned };
+};
 
 test('lineCountOf: lines as Read numbers them (a final newline does not add one; an empty file has none)', () => {
   assert.equal(lineCountOf(''), 0);
@@ -55,6 +62,50 @@ test('a malformed offset / limit never counts as covering anything', () => {
   }
 });
 
+test('R9-F3: a Read with offset 0 is accepted (it returns from line 1); offset -1 stays refused', () => {
+  assert.equal(readsCoverFile([read({ offset: 0, limit: 50 })], FILE, 50), true);
+  assert.equal(readsCoverFile([read({ offset: 0 })], FILE, 5), true);
+  assert.equal(readsCoverFile([read({ offset: -1 })], FILE, 5), false);
+});
+
+test('R9-F1: coverage is what the Read RETURNED, not what it asked for', () => {
+  // a Read that stopped at the size cap: lines 1-524 of 648 came back
+  assert.equal(readsCoverFile([read({}, { returned: { first: 1, last: 524 } })], FILE, 648), false);
+  assert.equal(readsCoverFile([read({}, { returned: { first: 1, last: 524 } }), read({ offset: 525 }, { returned: { first: 525, last: 648 } })], FILE, 648), true, 'the follow-up from line 525 completes it');
+  assert.equal(readsCoverFile([read({ offset: 1, limit: 100000 }, { returned: { first: 1, last: 524 } })], FILE, 30000), false, 'limit 100000 asked for far more than came back');
+  assert.equal(readsCoverFile([read({ offset: 1, limit: 100000 }, { returned: { first: 1, last: 524 } }), read({ offset: 600 }, { returned: { first: 600, last: 648 } })], FILE, 648), false, 'lines 525-599 never came back');
+  // a result whose line numbers could not be parsed credits nothing (fail closed), and so does a Read that returned nothing
+  assert.equal(readsCoverFile([read({ offset: 1, limit: 50 }, { returned: null })], FILE, 50), false);
+  assert.equal(readsCoverFile([{ ...read({ offset: 1, limit: 50 }), returned: undefined }], FILE, 50), false, 'a call without a parsed range');
+});
+
+test('toolCallsOf keeps, for a Read, the range of line numbers its result showed (from the tool_result text; a partial result counts only the lines it shows)', () => {
+  const call = (id, input, content, extra = {}) => [
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: FILE, ...input } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content, ...extra }] } },
+  ];
+  const text = (n, from = 1) => Array.from({ length: n }, (_, i) => `${from + i}\tline ${from + i}`).join('\n');
+  const rows = [
+    ...call('a', {}, text(524)), // stopped at the size cap: 1-524 of 648
+    ...call('b', { offset: 525 }, text(124, 525)),
+    ...call('c', { offset: 0 }, text(3)), // offset 0 returns from line 1
+    ...call('d', {}, [{ type: 'text', text: text(2, 10) }]), // block content
+    ...call('e', {}, `${text(2)}\n\n<system-reminder>PARTIAL view: showing lines 1-1 of 9 total (26233 tokens, cap 25000)</system-reminder>`), // the note limits it to what it shows
+    ...call('f', {}, 'ok'), // no numbered lines
+    ...call('g', {}, `1\ta\n3\tc`), // a gap in the numbers
+    ...call('h', {}, text(4), { is_error: true }),
+    ...call('i', {}, `  7\u2192seven\n  8\u2192eight`), // arrow-separated numbers
+  ];
+  const got = toolCallsOf(rows.map((l) => JSON.stringify(l)).join('\n')).map((c) => c.returned);
+  assert.deepEqual(got, [{ first: 1, last: 524 }, { first: 525, last: 648 }, { first: 1, last: 3 }, { first: 10, last: 11 }, { first: 1, last: 1 }, null, null, null, { first: 7, last: 8 }]);
+});
+
+test('readResultText models Read: numbered lines, offset 0 from line 1, a cap that stops early', () => {
+  const body = 'a\nb\nc\n';
+  assert.equal(readResultText({ file_path: 'x', offset: 0 }, { text: body }), '1\ta\n2\tb\n3\tc');
+  assert.equal(readResultText({ file_path: 'x', offset: 2, limit: 5 }, { text: body, maxLines: 1 }), '2\tb');
+});
+
 test('toolCallsOf keeps a Read call\'s offset and limit', () => {
   const jsonl = [
     { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'a', name: 'Read', input: { file_path: FILE, offset: 5, limit: 7 } }] } },
@@ -66,22 +117,33 @@ test('toolCallsOf keeps a Read call\'s offset and limit', () => {
 
 const lines = (n, width = 5) => `${Array.from({ length: n }, () => 'x'.repeat(width)).join('\n')}\n`;
 
-test('unreadablePacket: a file needs ceil(lines / 2000) Reads (an empty one needs 1); the pages of all files together may not pass MAX_READ_PAGES', () => {
+test('unreadablePacket: a file needs ceil(lines / 2000) Reads (an empty one needs 1); the Read calls of all files together may not pass MAX_READ_PAGES', () => {
   assert.equal(MAX_READ_PAGES, 15);
-  assert.equal(READ_LINE_CHARS, 2000);
   assert.equal(unreadablePacket([{ rel: 'in.md', content: lines(10) }, { rel: 'diff.patch', content: lines(5000) }, { rel: 'e', content: '' }]), null, '1 + 3 + 1 pages');
   assert.equal(unreadablePacket([{ rel: 'a', content: lines(2000 * 14) }, { rel: 'b', content: lines(1) }]), null, 'exactly 15 pages');
   const over = unreadablePacket([{ rel: 'a', content: lines(2000 * 14) }, { rel: 'b', content: lines(1) }, { rel: 'c', content: lines(1) }]);
   assert.equal(over.pages, 16);
   assert.equal(over.maxPages, 15);
   assert.deepEqual(over.files.map((f) => [f.rel, f.lines, f.pages]), [['a', 28000, 14], ['b', 1, 1], ['c', 1, 1]]);
-  assert.match(over.message, /Read pages/);
+  assert.match(over.message, /Read calls/);
 });
 
-test('unreadablePacket: a line over 2000 characters is refused and named (file, line, length); 2000 exactly is fine', () => {
-  assert.equal(unreadablePacket([{ rel: 'a', content: `ok\n${'y'.repeat(2000)}\n` }]), null);
-  const bad = unreadablePacket([{ rel: 'a', content: `ok\nfine\n${'y'.repeat(2001)}\n` }]);
-  assert.deepEqual(bad.files.find((f) => f.rel === 'a').longLine, { line: 3, chars: 2001 });
-  assert.equal(bad.maxLineChars, 2000);
-  assert.match(bad.message, /2000 characters/);
+test('R9-F1: a file needs max(ceil(lines / 2000), ceil(estimated tokens / READ_TOKENS_PER_CALL)) Reads: a few huge lines are many calls', () => {
+  assert.ok(READ_TOKENS_PER_CALL > 0 && READ_TOKENS_PER_CALL < 25000, 'below the 25,000-token cap of one Read');
+  // 400 lines of 3000 characters: 1.2M characters, a million-odd characters is far beyond 15 calls of 20,000 tokens
+  const big = unreadablePacket([{ rel: 'diff.patch', content: `${'q'.repeat(2999)}\n`.repeat(400) }]);
+  assert.ok(big !== null, 'refused');
+  const row = big.files[0];
+  assert.equal(row.lines, 400);
+  assert.ok(row.tokens > 300000 && row.pages === Math.ceil(row.tokens / READ_TOKENS_PER_CALL) && row.pages > MAX_READ_PAGES, JSON.stringify(row));
+  assert.match(big.message, /tokens/);
+  // the same lines, short: fine
+  assert.equal(unreadablePacket([{ rel: 'diff.patch', content: lines(400, 100) }]), null);
+  // within budget by lines AND tokens: 100 lines of 1000 characters is 2 calls
+  assert.equal(unreadablePacket([{ rel: 'a', content: lines(100, 1000) }]), null);
+});
+
+test('R9-F2: a long line is not a reason to refuse: a 10,000-character line is just counted in the token estimate', () => {
+  const r = unreadablePacket([{ rel: 'a', content: `ok\n${'y'.repeat(10000)}\nfine\n` }]);
+  assert.equal(r, null);
 });

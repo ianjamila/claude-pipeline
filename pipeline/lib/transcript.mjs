@@ -510,8 +510,35 @@ export function findTaggedTranscripts({ tag, projectsDir = path.join(os.homedir(
   return found.sort();
 }
 
-// The tool calls of a transcript, in order, from its assistant lines: [{name, input, id, answered, isError}]. `answered` = a tool_result for the call id came back;
-// `isError` = that result was flagged as an error. A line that does not parse is skipped here (proveModel already fails the transcript for it).
+// The line numbers a Read result really showed: { first, last }, or null when they cannot be told (a caller credits nothing then). Read answers with the lines it returned,
+// each numbered ("<n>\t<text>", or "<n>→<text>"), and stops early at a size cap (about 25,000 tokens a call) WITHOUT an error, so what was read is what came back and not what
+// the call asked for (offset / limit). The numbers must run on by one from the first; anything else (no numbered line, a gap) is refused. A result that also carries the
+// truncation note ("PARTIAL view: showing lines A-B of N") counts only A-B. `content` is the tool_result's content: a string or an array of text blocks.
+export function readReturnedRange(content) {
+  const text = typeof content === 'string' ? content : Array.isArray(content) ? content.map((b) => (isPlainObject(b) && typeof b.text === 'string' ? b.text : '')).join('\n') : '';
+  let first = null;
+  let last = null;
+  for (const row of text.split('\n')) {
+    const m = /^\s*(\d+)(?:\t|\u2192)/.exec(row);
+    if (m === null) continue;
+    const n = Number(m[1]);
+    if (first === null) first = n;
+    else if (n !== last + 1) return null;
+    last = n;
+  }
+  if (first === null) return null;
+  const note = /showing lines (\d+)-(\d+)/.exec(text);
+  if (note !== null) {
+    first = Math.max(first, Number(note[1]));
+    last = Math.min(last, Number(note[2]));
+    if (last < first) return null;
+  }
+  return { first, last };
+}
+
+// The tool calls of a transcript, in order, from its assistant lines: [{name, input, id, answered, isError, returned}]. `answered` = a tool_result for the call id came back;
+// `isError` = that result was flagged as an error; `returned` (a Read call only, else null) = readReturnedRange of its result. A line that does not parse is skipped here
+// (proveModel already fails the transcript for it).
 export function toolCallsOf(jsonlText) {
   const calls = [];
   const byId = new Map();
@@ -524,13 +551,14 @@ export function toolCallsOf(jsonlText) {
     for (const b of blocksOf(line.message.content)) {
       if (!isPlainObject(b)) continue;
       if (line.type === 'assistant' && b.type === 'tool_use') {
-        const call = { name: String(b.name), input: isPlainObject(b.input) ? b.input : {}, id: typeof b.id === 'string' ? b.id : null, answered: false, isError: false };
+        const call = { name: String(b.name), input: isPlainObject(b.input) ? b.input : {}, id: typeof b.id === 'string' ? b.id : null, answered: false, isError: false, returned: null };
         calls.push(call);
         if (call.id !== null) byId.set(call.id, call);
       } else if (line.type === 'user' && b.type === 'tool_result' && byId.has(b.tool_use_id)) {
         const call = byId.get(b.tool_use_id);
         call.answered = true;
         call.isError = b.is_error === true;
+        if (call.name === 'Read' && !call.isError) call.returned = readReturnedRange(b.content);
       }
     }
   }

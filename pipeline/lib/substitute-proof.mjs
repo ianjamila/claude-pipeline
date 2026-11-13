@@ -14,12 +14,17 @@ export const READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob'];
 // The hand-back tool is how a background subagent delivers its report (transcript.mjs); it is not a way to act on the repository.
 export const ALLOWED_TOOLS = [...READ_ONLY_TOOLS, 'SubagentHandback'];
 export const MODEL_PREFIX = { 'substitute-opus': 'claude-opus-', 'substitute-fable': 'claude-fable-' };
-// What one Read call returns: the agent's Read default is offset 1, limit 2000 lines, and a line longer than 2000 characters is cut short (so it can never be read in full).
-// A longer file is read in pages (offset / limit), one call per page; the proof below needs the pages to cover every line.
+// What one Read call returns: at most READ_PAGE_LINES lines (the agent's Read default is offset 1, limit 2000), and fewer when the page would pass Read's size cap of about 25,000
+// tokens a call: Read then stops early and answers normally (no error), so the agent must go on from the last line shown. A longer file is read in several calls; the proof below
+// credits only the lines each call RETURNED (lib/transcript.mjs#readReturnedRange) and needs them to cover every line. A long line is returned whole (it only costs tokens).
 export const READ_PAGE_LINES = 2000;
-export const READ_LINE_CHARS = 2000;
-// The most Read pages (calls) a packet may need, input file and exported files together. The call-budget hook stops a reviewer-type subagent at 40 tool calls (its tightest
-// stop line; other agents 90), and the agent also needs calls for Grep / Read of the repository around the diff: 15 pages leaves it 25 of the 40. `substitute prepare` and
+// The tokens one Read call is budgeted at when estimating how many calls a packet needs: well below the 25,000-token cap, so a packet the estimate admits is not one that
+// needs more calls than counted. A text's tokens are estimated at one per 3 characters (code, JSON and diffs run 2.5 to 4 characters a token) plus 2 for each line's number.
+export const READ_TOKENS_PER_CALL = 20000;
+export const CHARS_PER_TOKEN = 3;
+export const LINE_NUMBER_TOKENS = 2;
+// The most Read calls a packet may need, input file and exported files together. The call-budget hook stops a reviewer-type subagent at 40 tool calls (its tightest
+// stop line; other agents 90), and the agent also needs calls for Grep / Read of the repository around the diff: 15 calls leaves it 25 of the 40. `substitute prepare` and
 // `triage second-review` refuse a packet over this (packet-unreadable) instead of letting the agent burn its attempts on one it cannot finish.
 export const MAX_READ_PAGES = 15;
 export const PROOF_EFFORT = 'high';
@@ -41,46 +46,37 @@ export function refuseTestOnlyFlags(values, env) {
 // The lines of a text as Read numbers them: a final newline does not start another line, and an empty file has none.
 export const lineCountOf = (text) => (text === '' ? 0 : text.split('\n').length - (text.endsWith('\n') ? 1 : 0));
 
+// The tokens a Read of this text shows, estimated: its characters over CHARS_PER_TOKEN, and a number per line.
+export const estimateTokens = (text) => Math.ceil(text.length / CHARS_PER_TOKEN) + lineCountOf(text) * LINE_NUMBER_TOKENS;
+
 // Could a substitute agent read all of these files in full? files: [{rel, content}] (the input file and every exported file). -> null when it can, else
-// { message, pages, maxPages, maxLineChars, files: [{rel, lines, pages, longLine?: {line, chars}}] } (message + extra fields are for the refusal's output).
-// Refused when a file has a line over READ_LINE_CHARS characters (Read truncates it) or the files together need more than MAX_READ_PAGES pages (ceil(lines / READ_PAGE_LINES) each, an empty file 1).
+// { message, pages, maxPages, files: [{rel, lines, tokens, pages}] } (message + extra fields are for the refusal's output).
+// A file needs max(ceil(lines / READ_PAGE_LINES), ceil(estimateTokens / READ_TOKENS_PER_CALL)) Read calls (an empty file 1), and the files together may not need more than MAX_READ_PAGES.
 export function unreadablePacket(files) {
   const rows = files.map((f) => {
     const lines = lineCountOf(f.content);
-    const long = f.content.split('\n').findIndex((l) => l.length > READ_LINE_CHARS);
-    return {
-      rel: f.rel, lines, pages: Math.max(1, Math.ceil(lines / READ_PAGE_LINES)),
-      ...(long < 0 ? {} : { longLine: { line: long + 1, chars: f.content.split('\n')[long].length } }),
-    };
+    const tokens = estimateTokens(f.content);
+    return { rel: f.rel, lines, tokens, pages: Math.max(1, Math.ceil(lines / READ_PAGE_LINES), Math.ceil(tokens / READ_TOKENS_PER_CALL)) };
   });
   const pages = rows.reduce((n, r) => n + r.pages, 0);
-  const longOnes = rows.filter((r) => r.longLine !== undefined);
-  if (longOnes.length === 0 && pages <= MAX_READ_PAGES) return null;
-  const why = [
-    ...longOnes.map((r) => `${r.rel} line ${r.longLine.line} is ${r.longLine.chars} characters (Read cuts a line at ${READ_LINE_CHARS} characters)`),
-    ...(pages > MAX_READ_PAGES ? [`the files need ${pages} Read pages of ${READ_PAGE_LINES} lines (${rows.map((r) => `${r.rel}: ${r.lines} lines`).join(', ')}), over the ${MAX_READ_PAGES} the agent can spend`] : []),
-  ];
+  if (pages <= MAX_READ_PAGES) return null;
   return {
-    message: `the evidence for a substitute cannot be read in full by the agent: ${why.join('; ')}: not eligible; park the round as without a substitute`,
-    pages, maxPages: MAX_READ_PAGES, maxLineChars: READ_LINE_CHARS, files: rows,
+    message: `the evidence for a substitute cannot be read in full by the agent: the files need an estimated ${pages} Read calls (${rows.map((r) => `${r.rel}: ${r.lines} lines, about ${r.tokens} tokens`).join(', ')}; a call returns at most ${READ_PAGE_LINES} lines or about ${READ_TOKENS_PER_CALL} tokens), over the ${MAX_READ_PAGES} the agent can spend: not eligible; park the round as without a substitute`,
+    pages, maxPages: MAX_READ_PAGES, files: rows,
   };
 }
 
-// Do the successful Reads of `file` in `calls` (toolCallsOf) together cover all of its `lines` lines? Each Read covers offset .. offset + limit - 1 (default offset 1, limit
-// READ_PAGE_LINES); the ranges may come in any order and overlap, but a gap leaves lines unread. An offset or limit that is not a whole number (>= 1 for a limit, >= 1 for an
-// offset) covers nothing. An empty file needs one successful Read. (cp #256 R8-B2: one Read naming the file, even of a single line, used to be enough.)
+// Do the successful Reads of `file` in `calls` (toolCallsOf) together cover all of its `lines` lines? Each Read covers the line numbers its RESULT showed (call.returned: Read
+// stops early at a size cap and still answers normally, so the requested offset / limit prove nothing); a call whose numbers could not be parsed covers nothing. The ranges may
+// come in any order and overlap, but a gap leaves lines unread. A call with a malformed input (an offset that is not a whole number >= 0, a limit that is not a whole number
+// >= 1) covers nothing; offset 0 is valid (Read returns from line 1). An empty file needs one successful Read. (cp #256 R8-B2: one Read naming the file used to be enough;
+// R9-F1: so did a Read that stopped early.)
 export function readsCoverFile(calls, file, lines) {
   const whole = (v, min) => Number.isInteger(v) && v >= min;
-  const ranges = [];
-  for (const c of calls) {
-    if (c.name !== 'Read' || c.input?.file_path !== file || !c.answered || c.isError) continue;
-    const { offset, limit } = c.input;
-    if (offset !== undefined && !whole(offset, 1)) continue;
-    if (limit !== undefined && !whole(limit, 1)) continue;
-    const start = offset ?? 1;
-    ranges.push([start, start + (limit ?? READ_PAGE_LINES) - 1]);
-  }
-  if (ranges.length === 0) return false;
+  const ok = calls.filter((c) => c.name === 'Read' && c.input?.file_path === file && c.answered && !c.isError
+    && (c.input.offset === undefined || whole(c.input.offset, 0)) && (c.input.limit === undefined || whole(c.input.limit, 1)));
+  if (lines === 0) return ok.length > 0;
+  const ranges = ok.map((c) => c.returned).filter((r) => r && whole(r.first, 1) && whole(r.last, r.first)).map((r) => [r.first, r.last]);
   ranges.sort((x, y) => x[0] - y[0]);
   let next = 1; // the first line not yet seen to be read
   for (const [from, to] of ranges) {
@@ -122,7 +118,7 @@ export function proveSubstituteRun({ tag, projectsDir, maxAgeMs, agent, expected
     try { lines = lineCountOf(readFileSync(file, 'utf8')); } catch { errors.push(`${file} cannot be read to check that the agent read all of it`); continue; }
     if (!readsCoverFile(calls, file, lines)) {
       errors.push(calls.some((c) => c.name === 'Read' && c.input?.file_path === file && c.answered && !c.isError)
-        ? `the transcript's Reads of ${file} do not cover all of its ${lines} lines (offset / limit: every line must be read; a Read without them returns the first ${READ_PAGE_LINES})`
+        ? `the transcript's Reads of ${file} do not cover all of its ${lines} lines (every line must be read, in order: a Read stops at ${READ_PAGE_LINES} lines or at its size cap of about 25,000 tokens, whichever comes first, so go on from the last line shown)`
         : `the transcript shows no successful Read of ${file}`);
     }
   }
