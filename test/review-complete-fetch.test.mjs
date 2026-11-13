@@ -41,7 +41,7 @@ const GH = [
 // A PR repo whose "origin" is a bare repository, on feat/x (one 60-line file off the light lane, a change in src/a.js), with
 // round 1 already recorded. `withOrigin: false` is a repo that never had a remote.
 function world(t, { withOrigin = true, accept = false } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-rcfetch-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));

@@ -13,6 +13,11 @@ import {
   decodeFromComment,
   addRound,
   updateItems,
+  SUPPORTED_STATE_VERSION,
+  STATE_VERSION_DEFERRAL,
+  STATE_VERSION_SUBSTITUTE,
+  maxRiskOf,
+  withStateVersion,
 } from '../pipeline/lib/state.mjs';
 
 function tmp() {
@@ -450,4 +455,87 @@ test('addRound persists promptSha256; it survives save, comment encode/decode an
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---- cp #256: substitute rounds, state version 4, maxRisk -------------------------------------------------------------------
+
+const subRound = (over = {}) => ({
+  n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], firstReviewer: 'substitute',
+  substitute: { agent: 'substitute-opus', models: ['claude-opus-4-8'], reason: 'quota', resetAt: null }, ...over,
+});
+
+test('addRound keeps the substitute fields (firstReviewer, substitute, wholePr, reviewBase, patchSha256, risk, governor, budget); a plain round carries none', () => {
+  const s0 = emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'medium' });
+  const full = addRound(s0, subRound({
+    wholePr: true, reviewBase: 'fork', reviewBaseKind: 'merge-base', patchSha256: 'cd'.repeat(32), risk: 'high',
+    governor: { usedPct: 93, threshold: 'hard' }, budget: { used: 6, budget: 6 },
+  })).rounds[0];
+  assert.equal(full.firstReviewer, 'substitute');
+  assert.deepEqual(full.substitute, { agent: 'substitute-opus', models: ['claude-opus-4-8'], reason: 'quota', resetAt: null });
+  assert.deepEqual([full.wholePr, full.reviewBase, full.patchSha256, full.risk], [true, 'fork', 'cd'.repeat(32), 'high']);
+  assert.deepEqual(full.governor, { usedPct: 93, threshold: 'hard' });
+  assert.deepEqual(full.budget, { used: 6, budget: 6 });
+  const plain = addRound(s0, { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], wholePr: false }).rounds[0];
+  for (const k of ['firstReviewer', 'substitute', 'wholePr', 'patchSha256', 'risk', 'governor', 'budget']) assert.equal(Object.hasOwn(plain, k), false, k);
+  const input = { agent: 'substitute-opus' };
+  const copied = addRound(s0, subRound({ substitute: input })).rounds[0];
+  input.agent = 'changed';
+  assert.equal(copied.substitute.agent, 'substitute-opus', 'copied, not shared');
+});
+
+test('state version 4: a substitute round, a substitute second review, a governor or a budget decision save as 4; a plain state stays as it was', () => {
+  assert.equal(SUPPORTED_STATE_VERSION, 4);
+  assert.ok(STATE_VERSION_SUBSTITUTE > STATE_VERSION_DEFERRAL, 'a reader from before this change (supports up to the deferral version) refuses it');
+  const s0 = emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'low' });
+  const plain = addRound(s0, { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [] });
+  assert.equal(plain.version, 1);
+  assert.equal(addRound(s0, subRound()).version, 4);
+  assert.equal(addRound(s0, subRound({ substitute: undefined, firstReviewer: undefined, governor: { usedPct: 91, threshold: 'hard' } })).version, 4, 'governor');
+  assert.equal(addRound(s0, subRound({ substitute: undefined, firstReviewer: undefined, budget: { used: 7, budget: 6 } })).version, 4, 'budget');
+  // a later writer keeps the higher version
+  assert.equal(addRound({ ...addRound(s0, subRound()), version: 3 }, { n: 2, fromHead: 'b', toHead: 'c', contentHashAtToHead: 'h2', items: [] }).version, 4);
+  assert.equal(withStateVersion(addRound(s0, subRound()), 2).version, 4);
+  // a substitute second review lands through updateItems
+  const withItem = addRound(s0, { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [it('R1-B1')] });
+  assert.equal(updateItems(withItem, 1, [it('R1-B1', { secondReview: { by: 'substitute-opus', decision: 'REJECT' } })]).version, 4);
+  assert.equal(updateItems(withItem, 1, [it('R1-B1', { secondReview: { by: 'codex', decision: 'REJECT' } })]).version, 1);
+});
+
+test('state version 4 is what is SAVED and PUBLISHED: saveState and encodeForComment raise a state that holds a substitute round, and a v5 state is refused', () => {
+  const dir = tmp();
+  try {
+    const s = addRound(emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'low' }), subRound());
+    const stale = { ...s, version: 1 }; // a writer that rebuilt the state from an old copy
+    saveState(dir, stale);
+    assert.equal(loadState(dir).version, 4);
+    assert.equal(decodeFromComment(encodeForComment(stale)).version, 4);
+    saveState(dir, { ...s, version: 5 });
+    assert.throws(() => loadState(dir), /version 5.*supports.*4/);
+    assert.equal(decodeFromComment(encodeForComment({ ...s, version: 5 })), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('maxRisk only goes up: a smaller diff never lowers it, and a legacy state starts it from what it recorded (fail toward high)', () => {
+  const add = (s, n, risk) => addRound(s, { n, fromHead: 'a', toHead: 'b', contentHashAtToHead: `h${n}`, items: [], ...(risk ? { risk } : {}) });
+  let s = emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'medium' });
+  s = add(s, 1, 'medium');
+  assert.equal(s.maxRisk, 'medium');
+  s = add({ ...s, risk: 'high' }, 2, 'high');
+  assert.equal(s.maxRisk, 'high');
+  s = add({ ...s, risk: 'low' }, 3, 'low'); // the diff shrank: state.risk is shown as-is, maxRisk stays
+  assert.equal(s.maxRisk, 'high');
+  assert.equal(s.rounds.map((r) => r.risk).join(), 'medium,high,low');
+  // R4-14: legacy states (no maxRisk)
+  assert.equal(maxRiskOf({ risk: 'medium', rounds: [] }), 'medium');
+  assert.equal(maxRiskOf({ risk: 'low', rounds: [{ risk: 'high' }, { risk: 'low' }] }), 'high', 'the highest recorded round risk counts');
+  assert.equal(maxRiskOf({ risk: null, rounds: [{ n: 1 }] }), 'high', 'nothing readable: fail toward high');
+  assert.equal(maxRiskOf({ risk: 'weird', maxRisk: 7, rounds: [] }), 'high');
+  assert.equal(maxRiskOf({ risk: 'low', maxRisk: 'high', rounds: [] }), 'high');
+  assert.equal(maxRiskOf(null), 'high');
+  // a legacy state gains maxRisk on its next round, from what it recorded
+  const legacy = { ...emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'high' }) };
+  assert.equal(add({ ...legacy, rounds: [{ n: 1, items: [] }] }, 2, 'low').maxRisk, 'high', 'state.risk high is read');
+  assert.equal(add({ repo: 'o/r', pr: 3, rounds: [{ n: 1, items: [] }] }, 2, 'low').maxRisk, 'high', 'an earlier round with nothing readable: high');
 });

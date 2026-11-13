@@ -23,7 +23,7 @@ import { toPosix } from './paths.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
-import { claudeRulingRows, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
+import { claudeRulingRows, substituteDigest, substituteInventory, substituteRefusal, substituteItemLine, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
 import { readPublished, reviewContentHash as stateContentHash } from './review-publish.mjs';
 import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
@@ -655,6 +655,13 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   const grants = verifyOwnerGrants(state, { repo, pr, maxRounds: config?.review?.max_rounds, ...ownerGo });
   if (!grants.ok) return check('review', false, grants.problems.join('; '));
   const grantNote = grants.granted.map((g) => `; ${g.past ? 'owner-approved past round' : 'owner-granted round'} ${g.k}: "${clip(g.quote.replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('');
+  // A Claude stand-in reviewed instead of Codex (plan 2026-11-11-codex-substitute-reviewer R4-1): a high-risk PR it only covered with Opus is refused (substitute-escalation); any other
+  // substitute review is an owner-merge item bound to the inventory, on EVERY return below, so a live or queued recheck and the owner-go scan all see it.
+  const subRefusal = substituteRefusal(state, fableGate);
+  if (subRefusal !== null) return check('review', false, `${subRefusal.error}: ${subRefusal.reason}`);
+  const subLine = substituteItemLine(state);
+  const subItems = subLine === null ? [] : [subLine];
+  const subNote = subLine === null ? '' : `; ${substituteInventory(state).length} substitute review(s) (Claude instead of Codex), owner-merge: ${subLine}`;
   // owner_approval: chat: an item the owner ruled in chat (an original or a later round's cached copy) never clears the merge by
   // itself. It stays visible here and counts as ownerMerge, so the owner's "merge" for this head is still needed.
   const ruled = ownerRuledItems(state);
@@ -664,14 +671,15 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
     const claudeItems = claudeRulings.map(({ id, row }) => `review-ruling ${id} ${createHash('sha256').update(row).digest('hex').slice(0, 12)}`);
     const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`);
     const ruledNote = ruled.length > 0 ? `; ${ruled.length} owner-ruled item(s), owner-merge: ${shown.join('; ')}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}` : '';
-    return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}${ruledNote}; ${claudeRulings.length} Claude-made dismissal(s), owner-merge: ${claudeRulings.slice(0, OWNER_RULED_SHOWN).map((c) => c.id).join(', ')}${claudeRulings.length > OWNER_RULED_SHOWN ? ', ...' : ''}${grantNote}`,
-      ruled.length + claudeRulings.length, [...ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`), ...claudeItems]);
+    return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}${ruledNote}; ${claudeRulings.length} Claude-made dismissal(s), owner-merge: ${claudeRulings.slice(0, OWNER_RULED_SHOWN).map((c) => c.id).join(', ')}${claudeRulings.length > OWNER_RULED_SHOWN ? ', ...' : ''}${subNote}${grantNote}`,
+      ruled.length + claudeRulings.length + subItems.length, [...ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`), ...claudeItems, ...subItems]);
   }
   if (ruled.length > 0) {
     const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('; ');
-    return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}${grantNote}`, ruled.length,
-      ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`));
+    return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}${subNote}${grantNote}`, ruled.length + subItems.length,
+      [...ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`), ...subItems]);
   }
+  if (subItems.length > 0) return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}${subNote}${grantNote}`, subItems.length, subItems);
   return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}${grantNote}`);
 }
 
@@ -928,6 +936,29 @@ function scanRangeCheck({ root, gh, pr, diff, info, explicit }) {
 // The owner-item lines are "<kind> <rule or type> <file>": the area of a line is its second word (hard-stop rule id, integrity kind).
 export const areasOf = (lines) => [...new Set(lines.map((l) => String(l).split(' ')[1]).filter((a) => typeof a === 'string' && a !== ''))].sort();
 
+// ---- a PR a Claude stand-in reviewed (plan 2026-11-11-codex-substitute-reviewer R4-11, R5-1) --------------------------------------------------------------
+// With a substitute review in the review state (triage.mjs#substituteInventory):
+//   * owner_approval: label  -> `P merge` refuses on EVERY route (substitute-label-mode): no label or flag clears it, the owner merges by hand;
+//   * the gated route and the queue sweep's gated recheck refuse (substitute-owner-go-only): they bind the items digest only, and the Areas line (which carries `substitute`)
+//     is what the owner is shown; only `--owner-go` binds it. That also keeps the PR out of any low-risk auto-merge (the gated route is the only one).
+// -> { error, reason } or null. `route`: 'gated' | 'owner-go'. An unreadable or absent state is no inventory here (the review checks fail it on their own).
+export function substituteRouteProblem({ root, config, pr, route }) {
+  let state = null;
+  try {
+    state = loadState(root, { cleanup: false });
+  } catch {
+    return null;
+  }
+  if (!state || state.pr !== pr || substituteInventory(state).length === 0) return null;
+  if (config?.owner_approval === 'label') {
+    return { error: 'substitute-label-mode', reason: `#${pr} was reviewed by a Claude stand-in while Codex was out of quota, and owner_approval is label: the owner merges this PR by hand (no approval flag or label clears it)` };
+  }
+  if (route === 'gated') {
+    return { error: 'substitute-owner-go-only', reason: `#${pr} was reviewed by a Claude stand-in while Codex was out of quota: it merges only on the owner's word for its Areas line, so ask with \`pipeline merge --pr ${pr} --dry-run --owner-go\`, show the request it prints (Areas line included), and merge with \`pipeline merge --pr ${pr} --owner-go\`` };
+  }
+  return null;
+}
+
 export function ownerItemsCheck({ items, hardstops, integrity, label }) {
   const shown = `${items.length} owner item(s) (${items.slice(0, 3).join('; ')}${items.length > 3 ? '; ...' : ''})`;
   if (!hardstops.ok || !integrity.ok) {
@@ -946,14 +977,18 @@ export function ownerItemsCheck({ items, hardstops, integrity, label }) {
 // marker for this very content, issued for this very review state (its stateHash and round count), plus state equality already prove review-complete checked them on exactly what is judged here.
 // Equality of the local and the published state alone would not: a state republished after the marker (`comment --kind triage`) is equal on both sides but was never checked.
 const NO_RULINGS = Object.freeze({ block: '', digest: 'none', blockDigest: 'none', count: 0 });
-const stripRulings = ({ rulings, ...rest }) => rest;
+const stripRulings = ({ rulings, substitute, ...rest }) => rest;
+// The substitute reviews of a state (triage.mjs#substituteInventory), as the owner-go scan needs them: the digest the marker must carry and the owner-merge item line (null = none).
+const NO_SUBSTITUTE = Object.freeze({ digest: 'none', line: null, count: 0, refusal: null });
+const substituteOf = (state, gate) => ({ digest: substituteDigest(state), line: substituteItemLine(state), count: substituteInventory(state).length, refusal: substituteRefusal(state, gate) });
 const rulingsOf = (state) => {
   const block = rulingsBlock(state);
   return { block, digest: rulingsDigest(state), blockDigest: rulingsBlockDigest(block), count: rulingsInventory(state).count };
 };
 
 export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep = defaultSleep, env }) {
-  const fail = (detail, rulings = NO_RULINGS) => ({ ...check('review-complete', false, detail), rulings });
+  let sub = NO_SUBSTITUTE; // set once the local state is known: every result below (a refusal too) carries it, so the owner-go scan lists the item whatever else fails
+  const fail = (detail, rulings = NO_RULINGS) => ({ ...check('review-complete', false, detail), rulings, substitute: sub });
   const RUN = `run \`pipeline review-complete --pr ${pr}\``;
   let state;
   try {
@@ -962,9 +997,10 @@ export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep 
     return fail(`the local review state is unreadable (${String(err?.message ?? err).slice(0, 160)}): restore it with \`pipeline state show --pr ${pr}\``);
   }
   const local = state && state.pr === pr ? state : null;
+  if (local !== null && substituteInventory(local).length > 0) sub = substituteOf(local, readReviewGate({ env })); // (the Fable floor is read only for a PR that holds a substitute)
   let published = readPublished(gh, pr);
   if (!published.history) {
-    if (local === null) return { ...check('review-complete', true, 'no review history on this PR and no local review state: the review skill never ran'), rulings: NO_RULINGS };
+    if (local === null) return { ...check('review-complete', true, 'no review history on this PR and no local review state: the review skill never ran'), rulings: NO_RULINGS, substitute: sub };
     return fail(`this checkout holds a review state for #${pr} but the PR has no triage or review-complete comment from us: ${RUN}`, rulingsOf(local));
   }
   if (local === null) return fail(`this PR has review history but this checkout holds no review state for it: finish the review here, or restore it with \`pipeline state show --pr ${pr}\``);
@@ -992,6 +1028,8 @@ export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep 
     if (p.hash === null || p.hash !== mine) return `the review state on this machine differs from the one published on the PR: ${RUN} (it publishes this copy first), or restore the published one with \`pipeline state show --pr ${pr}\``;
     if (m.record.stateHash !== mine || m.record.rounds !== local.rounds.length) return `the review-complete comment was issued for another review state (${short(m.record.stateHash)} with ${m.record.rounds} round(s) there, ${short(mine)} with ${local.rounds.length} now: the state was republished or changed after it): ${RUN}`;
     if (m.record.rulingsDigest !== rulings.digest) return `the review-complete comment does not carry the current rulings (${m.record.rulingsDigest === 'none' ? 'none' : short(m.record.rulingsDigest)} there, ${rulings.digest === 'none' ? 'none' : short(rulings.digest)} now): ${RUN}`;
+    // The substitute reviews (a Claude stand-in for Codex) the marker vouches for are the ones the state holds now: a substitute round or second review added at the same head changes the digest.
+    if ((m.record.substituteDigest ?? 'none') !== sub.digest) return `the review-complete comment does not carry the current substitute reviews (${(m.record.substituteDigest ?? 'none') === 'none' ? 'none' : short(m.record.substituteDigest)} there, ${sub.digest === 'none' ? 'none' : short(sub.digest)} now): ${RUN}`;
     return null;
   };
   let problem = problemWith(published);
@@ -1003,7 +1041,8 @@ export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep 
   if (problem !== null) return fail(problem, rulings);
   const eligibility = reviewEligibilityProblems(local);
   if (eligibility.length > 0) return fail(`${eligibility.join('; ')}`, rulings);
-  return { ...check('review-complete', true, `review complete for content ${short(liveHash)}, state equal to the published one${rulings.count > 0 ? `; ${rulings.count} dismissal(s) in the Rulings block` : ''}`), rulings };
+  if (sub.refusal !== null) return fail(`${sub.refusal.error}: ${sub.refusal.reason}`, rulings);
+  return { ...check('review-complete', true, `review complete for content ${short(liveHash)}, state equal to the published one${rulings.count > 0 ? `; ${rulings.count} dismissal(s) in the Rulings block` : ''}`), rulings, substitute: sub };
 }
 
 // `exemptHold` (Rev-4 8): the labels check ignores needs-human for the eligible hold the owner's "merge" names; nothing else does.
@@ -1026,8 +1065,10 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     const hash = baseSha ? reviewContentHash({ branch: explicit.branch, agentLog: config.agent_log, baseSha }, { cwd: root }) : undefined;
     completion = await reviewCompletionCheck({ root, config, pr, gh, hash, sleep, env });
   } catch (err) {
-    completion = { ...check('review-complete', false, `could not evaluate: ${String(err?.message ?? err)}`), rulings: NO_RULINGS };
+    completion = { ...check('review-complete', false, `could not evaluate: ${String(err?.message ?? err)}`), rulings: NO_RULINGS, substitute: NO_SUBSTITUTE };
   }
+  // The substitute reviews of the local state are an owner item here too (the same line reviewCheck gives the gated route), so the Areas line carries `substitute` and a recheck of a queued merge sees it.
+  if (completion.substitute?.line) items.push(completion.substitute.line);
   // Behind its base: refused as always, unless the BASE's merge.behind_base is "disjoint" and main's new commits are fresh enough (behindFreshEnough).
   let behind = null;
   let queueError = null;

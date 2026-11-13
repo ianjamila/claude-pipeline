@@ -9,6 +9,9 @@ import {
   largeBinaryNote,
   validateFindings,
   classifyCodexFailure,
+  analyzeCodexFailure,
+  parseCodexEvents,
+  parseQuotaReset,
   normalizeTitle,
   fingerprint,
   assignIds,
@@ -39,7 +42,7 @@ test('buildCodexArgs returns the exact non-interactive read-only argv', () => {
   assert.deepEqual(
     buildCodexArgs({ cwd: '/repo', model: 'gpt-5.1-codex', effort: 'high', schemaPath: '/s.json', outPath: '/o.json' }),
     [
-      'exec', '--sandbox', 'read-only', '--color', 'never', '--skip-git-repo-check',
+      'exec', '--sandbox', 'read-only', '--color', 'never', '--skip-git-repo-check', '--json',
       '-C', '/repo', '-o', '/o.json', '--output-schema', '/s.json',
       '-c', 'model="gpt-5.1-codex"', '-c', 'model_reasoning_effort="high"', '-',
     ],
@@ -253,21 +256,26 @@ test('validateFindings rejects a non-object finding entry', () => {
   assert.equal(validateFindings(sample({ blocking: [null] })).ok, false);
 });
 
+const jsonl = (...events) => `${events.map((e) => JSON.stringify(e)).join('\n')}\n`;
+const turnFailed = (message) => ({ type: 'turn.failed', error: { message } });
+// `codex exec --json` stdout for a run that failed with this message
+const failed = (message) => jsonl({ type: 'turn.started' }, turnFailed(message));
+
 // ---------- classifyCodexFailure ----------
 
 test('classifyCodexFailure maps quota messages', () => {
-  assert.equal(classifyCodexFailure({ code: 1, stderr: "Error: You've hit your usage limit" }), 'quota');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: '429 Too Many Requests' }), 'quota');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'rate-limit exceeded, retry later' }), 'quota');
-  assert.equal(classifyCodexFailure({ code: 1, stdout: 'insufficient_quota: add credits' }), 'quota');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'You exceeded your current quota' }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed("Error: You've hit your usage limit") }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('429 Too Many Requests') }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('rate-limit exceeded, retry later') }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('insufficient_quota: add credits') }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('You exceeded your current quota') }), 'quota');
 });
 
 test('classifyCodexFailure maps auth messages', () => {
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'Not logged in. Please run codex login' }), 'auth');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'HTTP 401 Unauthorized' }), 'auth');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'Unauthorised: expired token' }), 'auth');
-  assert.equal(classifyCodexFailure({ code: 1, stdout: 'authentication failed' }), 'auth');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('Not logged in. Please run codex login') }), 'auth');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('HTTP 401 Unauthorized') }), 'auth');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('Unauthorised: expired token') }), 'auth');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('authentication failed') }), 'auth');
 });
 
 test('classifyCodexFailure maps a missing binary and timeouts to unavailable', () => {
@@ -278,57 +286,59 @@ test('classifyCodexFailure maps a missing binary and timeouts to unavailable', (
 });
 
 test('classifyCodexFailure maps network trouble to unavailable', () => {
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'stream error: ETIMEDOUT' }), 'unavailable');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'getaddrinfo: could not resolve host api.openai.com' }), 'unavailable');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'read ECONNRESET' }), 'unavailable');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'upstream returned 503 Service Unavailable' }), 'unavailable');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: '502 Bad Gateway' }), 'unavailable');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('stream error: ETIMEDOUT') }), 'unavailable');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('getaddrinfo: could not resolve host api.openai.com') }), 'unavailable');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('read ECONNRESET') }), 'unavailable');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('upstream returned 503 Service Unavailable') }), 'unavailable');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('502 Bad Gateway') }), 'unavailable');
 });
 
 test('classifyCodexFailure falls back to error for anything unrecognised', () => {
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'panic: something' }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('panic: something') }), 'error');
   assert.equal(classifyCodexFailure({ code: 2 }), 'error');
   assert.equal(classifyCodexFailure({}), 'error');
 });
 
-test('classifyCodexFailure is case-insensitive and reads stdout as well as stderr', () => {
-  assert.equal(classifyCodexFailure({ code: 1, stdout: 'USAGE LIMIT REACHED' }), 'quota');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'NOT LOGGED IN' }), 'auth');
+test('classifyCodexFailure is case-insensitive and reads the structured events, not stderr', () => {
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('USAGE LIMIT REACHED') }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('NOT LOGGED IN') }), 'auth');
+  // stderr is Codex tracing or a shell complaint: it never decides quota, auth or network
+  assert.equal(classifyCodexFailure({ code: 1, stderr: 'ERROR codex_api: usage limit; Not logged in; 401 Unauthorized' }), 'error');
 });
 
 test('classifyCodexFailure checks quota before auth before network', () => {
   // A 429 body often also mentions authentication or the network; quota must win.
-  assert.equal(classifyCodexFailure({ code: 1, stderr: '429 too many requests (authentication ok, network fine)' }), 'quota');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'unauthorized: network error while refreshing' }), 'auth');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('429 too many requests (authentication ok, network fine)') }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('unauthorized: network error while refreshing') }), 'auth');
 });
 
 test('classifyCodexFailure: timedOut wins over a quota-looking message', () => {
-  assert.equal(classifyCodexFailure({ code: null, timedOut: true, stderr: '429' }), 'unavailable');
+  assert.equal(classifyCodexFailure({ code: null, timedOut: true, stdout: failed('429 usage limit') }), 'unavailable');
 });
 
 test('classifyCodexFailure never returns a value that could be read as success', () => {
   const allowed = new Set(['quota', 'auth', 'unavailable', 'error']);
-  for (const input of [{}, { code: 0 }, { code: 1, stderr: '' }, { stderr: 'ok' }]) {
+  for (const input of [{}, { code: 0 }, { code: 1, stdout: failed('') }, { stderr: 'ok' }]) {
     assert.ok(allowed.has(classifyCodexFailure(input)));
   }
 });
 
 test('classifyCodexFailure does not match status codes embedded in longer numbers', () => {
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'at line 14290 of build.js' }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('at line 14290 of build.js') }), 'error');
 });
 
 test('classifyCodexFailure matches numeric codes in HTTP-ish contexts', () => {
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'unexpected status 429' }), 'quota');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'HTTP 429' }), 'quota');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: '{"status":429}' }), 'quota');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'error: 401' }), 'auth');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'status code 401' }), 'auth');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'http 503' }), 'unavailable');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'code: 502' }), 'unavailable');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('unexpected status 429') }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('HTTP 429') }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('{"status":429}') }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('error: 401') }), 'auth');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('status code 401') }), 'auth');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('http 503') }), 'unavailable');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('code: 502') }), 'unavailable');
 });
 
 test('classifyCodexFailure ignores status-looking numbers in file:line text', () => {
-  for (const stderr of [
+  for (const message of [
     'src/parser.js:429:12',
     'at foo (/repo/lib/x.js:401:5)',
     'see build/401.log',
@@ -336,18 +346,18 @@ test('classifyCodexFailure ignores status-looking numbers in file:line text', ()
     'TypeError: x is not a function (a.js:502)',
     'panic in worker 4290',
   ]) {
-    assert.equal(classifyCodexFailure({ code: 1, stderr }), 'error', stderr);
+    assert.equal(classifyCodexFailure({ code: 1, stdout: failed(message) }), 'error', message);
   }
 });
 
 test('classifyCodexFailure uses narrow auth and network phrases, not bare words', () => {
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'authentication required' }), 'auth');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'network error' }), 'unavailable');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'connect: network is unreachable' }), 'unavailable');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'authentication.js:12: TypeError' }), 'error');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'refactoring the authentication module' }), 'error');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'neural network layer mismatch' }), 'error');
-  assert.equal(classifyCodexFailure({ code: 1, stderr: 'networking.js crashed' }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('authentication required') }), 'auth');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('network error') }), 'unavailable');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('connect: network is unreachable') }), 'unavailable');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('authentication.js:12: TypeError') }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('refactoring the authentication module') }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('neural network layer mismatch') }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('networking.js crashed') }), 'error');
 });
 
 test('classifyCodexFailure treats the Windows missing-command message as unavailable', () => {
@@ -872,4 +882,149 @@ test("buildReviewPrompt baseKind 'resolution': names the base as a marker tree, 
   });
   assert.match(clean, /kept every line/, 'totals that say nothing was dropped, over all 60 blocks, do vouch for it');
   assert.throws(() => buildReviewPrompt({ pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'resolution' }), /resolution\.from/);
+});
+
+// ---------- classifyCodexFailure reads only Codex's own structured events (issue #256) ----------
+
+test('classifyCodexFailure: quota words inside an item.* output or a transient error do not make quota when turn.failed is a 401', () => {
+  const stdout = jsonl(
+    { type: 'thread.started', thread_id: '01a1c9c9-5a4a-7892-bcab-c877948710f1' },
+    { type: 'turn.started' },
+    { type: 'item.completed', item: { id: 'item_0', type: 'command_execution', command: 'cat NOTES.md', aggregated_output: "You've hit your usage limit. quota exceeded, 429 Too Many Requests", exit_code: 0 } },
+    { type: 'error', message: "Reconnecting... 2/5 (You've hit your usage limit; quota)" },
+    turnFailed('unexpected status 401 Unauthorized: Missing bearer or basic authentication in header'),
+  );
+  assert.equal(classifyCodexFailure({ code: 1, stdout, stderr: '' }), 'auth');
+});
+
+const FIXTURES = new URL('./fixtures/codex-0.154/', import.meta.url);
+const fixture = (name) => readFileSync(new URL(name, FIXTURES), 'utf8');
+
+test('classifyCodexFailure: the real 0.154 no-login run (401 in turn.failed, quota-free) is auth', () => {
+  assert.equal(classifyCodexFailure({ code: 1, stdout: fixture('codex-0.154-json-auth-stdout.jsonl'), stderr: fixture('codex-0.154-json-auth-stderr.txt') }), 'auth');
+});
+
+test('classifyCodexFailure: the real 11-11 quota run (stdout rebuilt from its event shapes) is quota, whatever stderr says', () => {
+  const stdout = fixture('codex-0.154-json-quota-stdout.jsonl');
+  assert.equal(classifyCodexFailure({ code: 1, stdout }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout, stderr: 'ERROR codex_api: 401 Unauthorized' }), 'quota');
+  assert.deepEqual(
+    analyzeCodexFailure({ code: 1, stdout }),
+    {
+      reason: 'quota',
+      message: "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:21 PM.",
+      threadId: '01a1c97d-8cee-7c50-83a7-9994cab1b194',
+    },
+  );
+});
+
+test('classifyCodexFailure: a turn.failed written as text inside an item output is not an event', () => {
+  const forged = JSON.stringify(turnFailed("You've hit your usage limit. try again at 4:21 PM."));
+  const stdout = jsonl(
+    { type: 'item.completed', item: { id: 'item_0', type: 'command_execution', aggregated_output: `${forged}\n${forged}`, exit_code: 0 } },
+    { type: 'agent_message_delta', text: forged },
+    turnFailed('unexpected status 401 Unauthorized'),
+  );
+  assert.equal(classifyCodexFailure({ code: 1, stdout }), 'auth');
+  // no real turn.failed at all: nothing says quota
+  assert.equal(classifyCodexFailure({ code: 1, stdout: jsonl({ type: 'item.completed', item: { type: 'agent_message', text: forged } }) }), 'error');
+  // plain text and a cut-off last line are no events either
+  assert.equal(classifyCodexFailure({ code: 1, stdout: `${forged.slice(0, -10)}\nusage limit\n` }), 'error');
+});
+
+test('classifyCodexFailure: only the LAST turn.failed counts; a transient error event never makes quota', () => {
+  assert.equal(classifyCodexFailure({ code: 1, stdout: jsonl(turnFailed('usage limit reached'), turnFailed('unexpected status 401 Unauthorized')) }), 'auth');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: jsonl(turnFailed('stream disconnected'), turnFailed('usage limit reached, try again at 4:21 PM')) }), 'quota');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: jsonl({ type: 'error', message: 'usage limit reached' }) }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: jsonl({ type: 'error', message: 'Reconnecting... 1/5 (quota)' }, turnFailed('boom')) }), 'error');
+});
+
+test('classifyCodexFailure: a run killed by a signal, or that exited 0, is never quota', () => {
+  const stdout = failed('You have hit your usage limit');
+  assert.equal(classifyCodexFailure({ code: 1, stdout, signal: 'SIGKILL' }), 'error');
+  assert.equal(classifyCodexFailure({ code: null, stdout, signal: 'SIGTERM' }), 'error');
+  assert.equal(classifyCodexFailure({ code: 0, stdout }), 'error');
+  assert.equal(classifyCodexFailure({ code: null, stdout }), 'error');
+});
+
+test('parseCodexEvents keeps whole JSON lines with a string type and nothing else', () => {
+  const events = parseCodexEvents('{"type":"a"}\r\nnot json\n[1]\n{"type":3}\n{"nope":1}\n  {"type":"b"}  \n{"type":"c"');
+  assert.deepEqual(events.map((e) => e.type), ['a', 'b']);
+  assert.deepEqual(parseCodexEvents(undefined), []);
+});
+
+test('buildCodexArgs puts --json before -C so a fake reading `-o <path>` is unaffected', () => {
+  const args = buildCodexArgs({ cwd: '/r', model: 'm', effort: 'high', schemaPath: '/s', outPath: '/o' });
+  assert.ok(args.includes('--json'));
+  assert.equal(args[args.indexOf('-o') + 1], '/o');
+});
+
+// ---------- parseQuotaReset ----------
+
+const MANILA = { timeZone: 'Asia/Manila' };
+const at = (iso) => ({ now: Date.parse(iso) });
+
+test('parseQuotaReset: "try again at 4:21 PM" is the next 16:21 local, from the real 11-11 message', () => {
+  const real = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:21 PM.";
+  assert.deepEqual(parseQuotaReset(real, { ...at('2026-11-11T07:23:34Z'), ...MANILA }), { resetAt: '2026-11-11T08:21:00.000Z', resetText: 'at 4:21 PM' });
+});
+
+test('parseQuotaReset: 24-hour clock, the other meridiem spellings, and tomorrow when the time has passed', () => {
+  assert.equal(parseQuotaReset('try again at 16:21', { ...at('2026-11-11T07:23:34Z'), ...MANILA }).resetAt, '2026-11-11T08:21:00.000Z');
+  assert.equal(parseQuotaReset('try again at 4:21 p.m.', { ...at('2026-11-11T07:23:34Z'), ...MANILA }).resetAt, '2026-11-11T08:21:00.000Z');
+  assert.equal(parseQuotaReset('try again at 4:21pm', { ...at('2026-11-11T07:23:34Z'), ...MANILA }).resetAt, '2026-11-11T08:21:00.000Z');
+  // 16:30 Manila; 4:21 PM already passed, so the next one is tomorrow's (23 h 51 min away)
+  assert.equal(parseQuotaReset('try again at 4:21 PM', { ...at('2026-11-11T08:30:00Z'), ...MANILA }).resetAt, '2026-11-12T08:21:00.000Z');
+  assert.equal(parseQuotaReset('try again at 12:00 PM', { ...at('2026-11-11T07:23:34Z'), ...MANILA }).resetAt, '2026-11-12T04:00:00.000Z');
+});
+
+test('parseQuotaReset: midnight rollover, 23:50 local + "12:10 AM" is 00:10 the next day', () => {
+  assert.equal(parseQuotaReset('try again at 12:10 AM', { ...at('2026-11-11T15:50:00Z'), ...MANILA }).resetAt, '2026-11-11T16:10:00.000Z');
+  assert.equal(parseQuotaReset('try again at 00:10', { ...at('2026-11-11T15:50:00Z'), ...MANILA }).resetAt, '2026-11-11T16:10:00.000Z');
+});
+
+test('parseQuotaReset: relative and absolute forms', () => {
+  const now = '2026-11-11T07:23:34Z';
+  assert.deepEqual(parseQuotaReset('Try again in 37 minutes.', at(now)), { resetAt: '2026-11-11T08:00:34.000Z', resetText: 'in 37 minutes' });
+  assert.deepEqual(parseQuotaReset('try again in 2 hours', at(now)), { resetAt: '2026-11-11T09:23:34.000Z', resetText: 'in 2 hours' });
+  assert.equal(parseQuotaReset('try again in 1 hour and 5 minutes', at(now)).resetAt, '2026-11-11T08:28:34.000Z');
+  assert.deepEqual(parseQuotaReset('retry after 2026-11-11T08:21:00Z please', at(now)), { resetAt: '2026-11-11T08:21:00.000Z', resetText: 'after 2026-11-11T08:21:00Z' });
+  assert.equal(parseQuotaReset('after 2026-11-11T16:21:00+08:00', at(now)).resetAt, '2026-11-11T08:21:00.000Z');
+});
+
+test('parseQuotaReset: anything else is null (no guess)', () => {
+  const now = at('2026-11-11T07:23:34Z');
+  for (const text of ['', null, undefined, 'try again later', 'in the meantime', 'in 2 days', 'after the break', 'after 2026-11-11T08:21:00', 'at noon', 'at 4 PM']) {
+    assert.deepEqual(parseQuotaReset(text, { ...now, ...MANILA }), { resetAt: null, resetText: null }, String(text));
+  }
+  // matched but not a time of day: the words are kept, there is no instant
+  for (const text of ['try again at 25:00', 'try again at 13:00 PM', 'try again at 0:30 AM', 'try again at 4:61 PM']) {
+    const r = parseQuotaReset(text, { ...now, ...MANILA });
+    assert.equal(r.resetAt, null, text);
+    assert.match(r.resetText, /^at /, text);
+  }
+  assert.deepEqual(parseQuotaReset('try again at 4:21 PM', { now: NaN }), { resetAt: null, resetText: null });
+});
+
+test('parseQuotaReset: a daylight-saving gap or repeat makes the clock time ambiguous, so resetAt is null', () => {
+  const NY = { timeZone: 'America/New_York' };
+  // 2026-03-08 02:30 does not exist in New York (clocks go 02:00 -> 03:00); it is 00:00 EST there now
+  assert.deepEqual(parseQuotaReset('try again at 2:30 AM', { ...at('2026-03-08T05:00:00Z'), ...NY }), { resetAt: null, resetText: 'at 2:30 AM' });
+  // 2026-11-01 01:30 happens twice; it is 23:00 EDT on Oct 31 now
+  assert.deepEqual(parseQuotaReset('try again at 1:30 AM', { ...at('2026-11-01T03:00:00Z'), ...NY }), { resetAt: null, resetText: 'at 1:30 AM' });
+  // the days around them are plain
+  assert.equal(parseQuotaReset('try again at 2:30 AM', { ...at('2026-03-09T05:00:00Z'), ...NY }).resetAt, '2026-03-09T06:30:00.000Z');
+  assert.equal(parseQuotaReset('try again at 9:00 AM', { ...at('2026-03-08T05:00:00Z'), ...NY }).resetAt, '2026-03-08T13:00:00.000Z');
+});
+
+test('parseQuotaReset: with no timeZone it uses the machine zone (TZ)', () => {
+  const saved = process.env.TZ;
+  try {
+    process.env.TZ = 'Asia/Manila';
+    assert.equal(parseQuotaReset('try again at 4:21 PM', at('2026-11-11T07:23:34Z')).resetAt, '2026-11-11T08:21:00.000Z');
+    process.env.TZ = 'America/Los_Angeles';
+    assert.equal(parseQuotaReset('try again at 4:21 PM', at('2026-11-11T07:23:34Z')).resetAt, '2026-11-12T00:21:00.000Z');
+  } finally {
+    if (saved === undefined) delete process.env.TZ; else process.env.TZ = saved;
+  }
 });

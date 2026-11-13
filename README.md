@@ -17,7 +17,7 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | Piece | What it does |
 |---|---|
 | skills `review`, `verify`, `pipeline-setup` | the process: review builds the change and runs the cross-model review, then asks you to merge; verify runs the quick check; pipeline-setup onboards a repo |
-| agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `arbiter` and `arbiter-fix` (Fable; `arbiter-fix` is the lower-effort variant `arbiter needed` picks for a fix round) | the judgment; models are pinned in the agent files and proven from transcripts |
+| agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `substitute-opus` / `substitute-fable` (read-only stand-ins for Codex on a round it could not review: `pipeline substitute`), `arbiter` and `arbiter-fix` (Fable; `arbiter-fix` is the lower-effort variant `arbiter needed` picks for a fix round) | the judgment; models are pinned in the agent files and proven from transcripts |
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge) |
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
@@ -381,6 +381,8 @@ head you did not review (the receipt names the head the event carried).
   fails, the line stays queued and goes out with the next run. The PR's summary comment is the immediate record.
 
 ## Project settings and environment
+
+**Substitute review (Codex quota spent).** When Codex stops on its usage limit, or a small fix-check meets the PR's `review.codex_round_budget` (default 6) or the weekly `review.codex_budget.hard` (default 90 %), a read-only Claude agent reviews that round instead: `substitute-opus`, `substitute-fable` once the PR was ever high risk (`review.substitute.mode` auto|off, `min_wait_minutes`, `max_packet_mb`; `review.effort.small_fix`, `small_fix_lines`). Only your typed "merge" accepts such a PR (the `substitute` area; never the gated route, never label mode). A review state that holds one is version 4: run `pipeline update` on every machine before the first substitute round, and finish or park those PRs before rolling the pipeline back (an older CLI cannot read them). `pipeline codex-status` shows the weekly use and the PRs waiting for Codex (`--usage`: where the tokens went); a new session says "Codex is back" once the outage is over.
 
 `.claude/pipeline.yml` is documented in its template (`pipeline/templates/pipeline.yml`). Three keys deserve a
 mention: `owner_approval` (`label` by default; `chat` drops the approval labels: blocking hard-stops and test-integrity

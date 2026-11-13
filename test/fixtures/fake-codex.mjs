@@ -2,6 +2,13 @@
 // prompt on stdin and writes its structured answer to the file named by `-o <path>`; this does the same, steered by env:
 //   FAKE_CODEX_CAPTURE=<file>  append {argv, stdin} as one JSON line (so a test can assert on the prompt and argv)
 //   FAKE_CODEX_EXIT=<n>        exit n (with FAKE_CODEX_STDERR on stderr) without writing any output
+//   FAKE_CODEX_TURN_FAILED=<msg>  print Codex's --json failure events on stdout (thread.started, turn.started, turn.failed {error:{message}}):
+//                              the only place the pipeline reads a failure reason from (stderr never decides quota)
+//   FAKE_CODEX_STDOUT=<file>   print that file's bytes on stdout first (a captured --json stream); FAKE_CODEX_THREAD_ID overrides the id above
+//   FAKE_CODEX_FAIL_ONCE=<f>   when <f> does not exist yet, create it and fail this run at once (exit 1, the FAKE_CODEX_TURN_FAILED events); later runs behave
+//                              normally (FAKE_CODEX_TURN_FAILED is then ignored)
+//   FAKE_CODEX_SIGNAL=<sig>    after printing, kill this process with that signal (a run killed from outside)
+//   FAKE_CODEX_HANG_ONCE=<f>   hang (until the timeout kills it) when <f> does not exist yet, creating it; later runs behave normally
 //   FAKE_CODEX_NO_WRITE=1      exit 0 without writing the output file (a run that "succeeded" but produced nothing)
 //   FAKE_CODEX_OUTPUT=<file>   copy that file's bytes to the `-o` path (a findings JSON, or garbage for a malformed run)
 //   FAKE_CODEX_DURING=<cmd>    run this shell command (synchronously) before answering: lets a test change the world
@@ -9,7 +16,7 @@
 //   FAKE_CODEX_DURING_OUTPUT=<file>  FAKE_CODEX_OUTPUT for that command (cmd.exe has no `VAR=x cmd` prefix)
 //   FAKE_CODEX_HANG=<pidfile>  start a helper (its pid goes to <pidfile>, its pipes are closed) that writes the `-o`
 //                              file after 2 s, then never answer: a hung Codex that left a helper behind
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 
 const argv = process.argv.slice(2);
@@ -22,8 +29,21 @@ if (process.env.FAKE_CODEX_CAPTURE) {
   appendFileSync(process.env.FAKE_CODEX_CAPTURE, `${JSON.stringify({ argv, stdin })}\n`);
 }
 
+if (process.env.FAKE_CODEX_FAIL_ONCE && !existsSync(process.env.FAKE_CODEX_FAIL_ONCE)) {
+  writeFileSync(process.env.FAKE_CODEX_FAIL_ONCE, 'failed');
+  const id = process.env.FAKE_CODEX_THREAD_ID || '01a1c97d-8cee-7c50-83a7-9994cab1b194';
+  for (const e of [{ type: 'thread.started', thread_id: id }, { type: 'turn.started' }, { type: 'turn.failed', error: { message: process.env.FAKE_CODEX_TURN_FAILED ?? '' } }]) writeSync(1, `${JSON.stringify(e)}\n`);
+  process.exit(1);
+}
+
 if (process.env.FAKE_CODEX_DURING) {
   spawnSync(process.env.FAKE_CODEX_DURING, { shell: true, stdio: 'ignore', env: { ...process.env, FAKE_CODEX_DURING: '', FAKE_CODEX_OUTPUT: process.env.FAKE_CODEX_DURING_OUTPUT || process.env.FAKE_CODEX_OUTPUT } });
+}
+
+if (process.env.FAKE_CODEX_HANG_ONCE && !existsSync(process.env.FAKE_CODEX_HANG_ONCE)) {
+  writeFileSync(process.env.FAKE_CODEX_HANG_ONCE, 'hung');
+  setInterval(() => {}, 1000);
+  await new Promise(() => {});
 }
 
 if (process.env.FAKE_CODEX_HANG) {
@@ -35,6 +55,13 @@ if (process.env.FAKE_CODEX_HANG) {
   setInterval(() => {}, 1000);
   await new Promise(() => {});
 }
+
+if (process.env.FAKE_CODEX_STDOUT) writeSync(1, readFileSync(process.env.FAKE_CODEX_STDOUT));
+if (process.env.FAKE_CODEX_TURN_FAILED && !process.env.FAKE_CODEX_FAIL_ONCE) {
+  const id = process.env.FAKE_CODEX_THREAD_ID || '01a1c97d-8cee-7c50-83a7-9994cab1b194';
+  for (const e of [{ type: 'thread.started', thread_id: id }, { type: 'turn.started' }, { type: 'turn.failed', error: { message: process.env.FAKE_CODEX_TURN_FAILED } }]) writeSync(1, `${JSON.stringify(e)}\n`);
+}
+if (process.env.FAKE_CODEX_SIGNAL) process.kill(process.pid, process.env.FAKE_CODEX_SIGNAL);
 
 const exit = Number(process.env.FAKE_CODEX_EXIT ?? 0);
 if (exit !== 0) {
