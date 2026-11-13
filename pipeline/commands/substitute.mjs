@@ -19,7 +19,7 @@ import { MAX_AGE_MS, readWeeklyUsage } from '../lib/codex-usage.mjs';
 import { higherRisk, maxRiskOf } from '../lib/state.mjs';
 import { substituteAgentFor } from '../lib/triage.mjs';
 import { extractJsonBlock, findTaggedTranscripts } from '../lib/transcript.mjs';
-import { proveSubstituteRun, refuseTestOnlyFlags } from '../lib/substitute-proof.mjs';
+import { READ_PAGE_LINES, lineCountOf, proveSubstituteRun, refuseTestOnlyFlags } from '../lib/substitute-proof.mjs';
 import { reviewDir, roundDir, sha256, withReviewLock, writeFileAtomic, writeJson } from '../lib/review-context.mjs';
 
 export const meta = {
@@ -166,6 +166,15 @@ function checkReset(route, now, env, minWaitMinutes = 0) {
   }
 }
 
+// The agent must Read every file of the packet in full (apply proves the Reads cover every line: lib/substitute-proof.mjs#readsCoverFile), and one Read returns READ_PAGE_LINES
+// lines: a file longer than that is refused here, before an attempt is spent on a packet no honest run could pass (cp #256 R8-B2). Applies to the input file and each exported file.
+function checkReadable(packet) {
+  const tooLong = [{ rel: 'substitute-input.md', lines: lineCountOf(packet.text) }, ...packet.files.map((f) => ({ rel: f.rel, lines: lineCountOf(f.content) }))].filter((f) => f.lines > READ_PAGE_LINES);
+  if (tooLong.length > 0) {
+    throw refuse('packet-unreadable', `the evidence for a substitute has a file the agent cannot read in full (${tooLong.map((f) => `${f.rel}: ${f.lines} lines`).join(', ')}; one Read returns ${READ_PAGE_LINES}): not eligible; park the round as without a substitute`, { maxLines: READ_PAGE_LINES, files: tooLong });
+  }
+}
+
 // ---- the packet -----------------------------------------------------------------------------------------------------------------------------
 
 // A path git lists (a conflicted file) becomes a file name below sides/: it must not climb out of there.
@@ -255,6 +264,7 @@ async function prepareLocked({ root, pr, round, ctx }) {
   const maxBytes = config.review.substitute.max_packet_mb * 1024 * 1024;
   const packet = buildPacket(adm, route, root, maxBytes);
   const agent = checkAgainstRound(route, adm, packet, root);
+  checkReadable(packet);
   checkReset(route, Date.now(), ctx.env, config.review.substitute.min_wait_minutes);
 
   // The attempt: the first, the open one again, or the next one after a recorded invalid.
