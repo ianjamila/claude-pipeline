@@ -210,8 +210,8 @@ describe('#373 review round 1 (R1-B1, R1-B2, R1-B3, R1-F1, R1-F2, R1-F3)', () =>
   const fsOf = (files) => ({ existsSync: (p) => Object.hasOwn(files, p), readText: (p) => files[p] ?? null });
   const repoAtHome = fsOf({ '/home/u/.git': null, '/home/u/.git/config': '[core]\n' });
   const dotsDir = (extra = {}) => ({ '/home/u/proj/.git': null, '/home/u/proj/.git/config': '[core]\n', ...extra });
-  test('R1-B1: a brace group entered by || | or & exports no chain through its }', () => {
-    for (const line of ['true || { true; cd /tmp; } && find . -delete', 'true || { true && cd /tmp; } && find . -delete', 'a | { true; cd /tmp; } && find . -delete', 'a & { true; cd /tmp; } && find . -delete']) {
+  test('R1-B1: a brace group entered by || or | exports no chain through its }', () => { // (#411: not one entered by &, see test/guard-followups-410-412.test.mjs)
+    for (const line of ['true || { true; cd /tmp; } && find . -delete', 'true || { true && cd /tmp; } && find . -delete', 'a | { true; cd /tmp; } && find . -delete']) {
       assert.equal(run(line).decision, 'deny', line);
     }
   });

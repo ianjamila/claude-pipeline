@@ -4439,6 +4439,15 @@ function evaluateBashForFilesFrame(command, opts) {
       if (e.kind === 'else') return ';';
       return top[k].sep;
     };
+    // #410: `cd DIR || exit 1` (also `|| exit`, `|| return`): when the cd fails the shell leaves, so whatever runs after the exit command surely follows a cd that succeeded. The exit must be a plain command of its own
+    // (not a pipeline stage or a background job: those leave only a subshell), in the same construct as the cd.
+    const leavesAfter = (k) => {
+      const x = top[k + 1];
+      if (x === undefined || x.sep !== '||' || evAt.has(k + 1) || evAt.has(k + 2) || !staticName(x) || !['exit', 'return'].includes(x.argv[0])) return false;
+      const y = top[k + 2];
+      return y === undefined || y.sep === ';' || y.sep === '&&';
+    };
+    let resume; // (the chain a cd leaves for the command after its `|| exit`, { at, chain })
     let known = unique([ctx.cwd, ...seedDirs]); // where the shell can be so far
     let chain = null; // the directories after an &&-joined run of sure cd's
     let lost = false; // a cd whose destination is not known, or a command that may change the directory: nothing after it is narrowed
@@ -4449,11 +4458,11 @@ function evaluateBashForFilesFrame(command, opts) {
         const fr = stack[stack.length - 1];
         if (e.kind === '(' || e.kind === '{') {
           if (e.sep !== '&&') chain = null;
-          stack.push({ kind: e.kind, chain0: chain, lost0: lost, live: chain !== null, touched: false, skip: e.kind === '{' && (e.sep === '||' || e.sep === '|' || e.sep === '&') });
+          stack.push({ kind: e.kind, chain0: chain, lost0: lost, live: chain !== null, touched: false, skip: e.kind === '{' && (e.sep === '||' || e.sep === '|') });
         } else if (e.kind === 'if') stack.push({ kind: 'if', from: k, live: false, touched: false });
         else if (!fr) return false;
         else if (e.kind === ')') { stack.pop(); chain = fr.chain0; lost = fr.lost0; }
-        else if (e.kind === '}') { stack.pop(); if (fr.skip) chain = null; } // (R1-B1: a group entered by || | & may not run at all, or runs in a subshell: no cd inside it leaves a chain behind)
+        else if (e.kind === '}') { stack.pop(); if (fr.skip) chain = null; } // (R1-B1: a group entered by || | may not run at all, or runs in a subshell: no cd inside it leaves a chain behind; #411: one entered by & runs in this shell, only the command before the & is the job)
         else if (e.kind === 'then') {
           if (k - fr.from !== 1 || !cdOf(top[k - 1]) || cdTarget(top[k - 1]) === null) return false; // (the condition: exactly one cd to a literal target)
           fr.live = chain !== null;
@@ -4464,7 +4473,9 @@ function evaluateBashForFilesFrame(command, opts) {
       const c = top[k];
       const sep = joinOf(k);
       const fr = stack[stack.length - 1];
-      if (sep !== '&&') chain = sep === ';' && fr !== undefined && fr.live && !fr.touched ? chain : null;
+      const entered = (evAt.get(k) ?? []).some((e) => e.kind === '(' || e.kind === '{'); // (the first command of a subshell or group: it runs whenever the construct does, whatever joined the construct to what is before it)
+      if (resume !== undefined && resume.at === k && (sep === ';' || sep === '&&')) chain = resume.chain;
+      else if (sep !== '&&') chain = sep === ';' && fr !== undefined && fr.live && !fr.touched ? chain : null;
       if (chain) narrowDirs.set(c, chain);
       if (fr && (cdOf(c) || changesDir(c))) fr.touched = true;
       if (!cdOf(c)) {
@@ -4477,7 +4488,9 @@ function evaluateBashForFilesFrame(command, opts) {
       const here = withReal(reach);
       known = unique([...known, ...here]);
       if (known.length > 32 || here.length > 32) { lost = true; chain = null; continue; }
-      chain = sep !== '||' && sep !== '|' && joinAfter(k) === '&&' ? here : null;
+      const ran = (sep !== '||' && sep !== '|') || entered; // (a cd after || or | may not have run, unless it opens the subshell or group that was entered that way)
+      chain = ran && joinAfter(k) === '&&' ? here : null;
+      if (ran && joinAfter(k) === '||' && leavesAfter(k)) resume = { at: k + 2, chain: here };
     }
     return stack.length === 0;
   };
