@@ -756,3 +756,25 @@ test('R5-F2: budget / governor evidence is judged against the protected-round ru
   assert.equal(applied.json.error, 'route-mismatch');
   assert.equal(w.state().rounds.length, 1, 'no substitute round recorded');
 });
+
+test('R8-B1: prepare enforces review.substitute.min_wait_minutes like codex-review: a quota reset within the wait is refused reset-near with waitUntil; a later reset is still prepared', (t) => {
+  const near = world(t, { review: '  substitute:\n    min_wait_minutes: 60\n' });
+  const run = near.run(1, near.quota("You've hit your usage limit. Upgrade to Pro, or try again in 10 minutes."));
+  assertExit(run, 3);
+  assert.deepEqual([run.json.substitute.eligible, run.json.substitute.why], [false, 'reset-near'], 'codex-review itself says wait');
+  const refused = near.prepare();
+  assertExit(refused, 1, refused.stdout + refused.stderr);
+  assert.equal(refused.json.error, 'reset-near');
+  assert.equal(refused.json.waitUntil, near.route().resetAt);
+  assert.ok(!existsSync(join(near.dir(), 'substitute-input.md')), 'no packet is written for a refused round');
+
+  const far = world(t, { review: '  substitute:\n    min_wait_minutes: 60\n' });
+  assertExit(far.run(), 3); // "try again in 3 hours": beyond the 60-minute wait
+  const ok = far.prepare();
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+
+  const noReset = world(t, { review: '  substitute:\n    min_wait_minutes: 60\n' });
+  assertExit(noReset.run(), 3);
+  noReset.editRoute((r) => { r.resetAt = null; });
+  assertExit(noReset.prepare(), 0); // no reset time: nothing to wait until, never waited for
+});
