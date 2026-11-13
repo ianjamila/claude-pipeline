@@ -794,6 +794,8 @@ pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
 
+In a repository with `ci.draft_while_iterating: true` the output also carries `pushedWhileReady: {count, heads: [sha12, ...]}` (and a `warnings` line, and one line in the summary comment) when the PR's head commits were pushed while it was ready, without `pipeline redraft` first, so CI ran the full suite each time. It is the classifier of `pipeline ci-usage` (heads from the PR's timeline, commits and `pull_request` runs; catch-ups, re-runs and the opening head left out). Report only: it never redrafts and never fails the summary; a read error is a warning. With the setting `false` or absent nothing extra is read.
+
 Without `.review/state.json` only `--outcome blocked`, `awaiting-review`, `stopped`, `closed` and `merged-externally` are accepted (the early-stop paths: verify red three times, Codex out in round 1, a stop on a gate or merge refusal, the owner closing the PR, a merge made outside the pipeline): the comment is rendered with no rounds (a `blocked` one names the failing step from the verify report) and `agentLogLine` is still printed. Any other outcome without state is exit 2.
 
 
