@@ -996,3 +996,29 @@ test('subshell: set for a top-level ( group however the quotes around it are wri
   ];
   for (const c of no) assert.equal(simpleCommands(c).subshell, false, c);
 });
+
+// #269 R20: arithmetic holding something the parser does not read as the shell does is refused with the arithmetic reason (never lexed on as ordinary text)
+test('R20: in $(( )) and (( )), a ${…} the parser cannot span, a bare { in ${…} and a case pattern are refused as arithmetic', () => {
+  const notRefused = [];
+  for (const open of ['echo $((', '((']) {
+    for (const body of [
+      ' ${x:-\n0))} + 1 ', // R20-F1: newline in the ${…}
+      ' ${x:-<(:)0))} + 1 ', // <(
+      ' ${x:->(:)0))} + 1 ', // >(
+      ' ${x:-=(:)0))} + 1 ', // =(
+      ' ${x:-$(:)0))} + 1 ', // a $( inside
+      ' ${x:-{a} + 1 ', // R20-F3: a bare {
+      ' ${x:-${y:-{b}}} + 1 ',
+      ' case x in\n# note\n(a) 1 ', // R20-F2: the comment skip of the case-pattern reader
+      ' case x in (a) 1 ',
+    ]) {
+      const r = simpleCommands(open + body + '))');
+      if (!(r.truncated && /arithmetic/.test(r.refused ?? ''))) notRefused.push(open + body + '))');
+    }
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused as arithmetic');
+  // plain arithmetic still reads
+  for (const c of ['echo $(( x + 1 ))', '(( i++ ))', 'echo $(( ${x:-1} + 1 ))', 'echo $(( ${x:-${y:-1}} + ${#z} ))', '(( ${x:-1} > 0 )) && echo y']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});

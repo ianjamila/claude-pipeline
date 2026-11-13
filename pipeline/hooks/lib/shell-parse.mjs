@@ -2255,6 +2255,15 @@ class Parser {
     } finally { this.spanWork = (this.spanWork ?? 0) + (j - from) + 1; }
   }
 
+  // Inside arithmetic: is the `${…}` at `from` one paramSpan spans, with no bare `{` in it (#269 R20-F1, R20-F3)? paramSpan declines a newline, `<(` `>(` `=(`, a `$(`, and past
+  // its work cap; zsh may count a bare `{` (not `${`) and close the expansion at a later `}`. Either way the parser and the shell could end the construct at different `))`: refused.
+  arithParamPlain(from) {
+    const end = this.paramSpan(from);
+    if (end <= 0) return false;
+    for (let k = from + 2; k < end - 1; k++) if (this.src[k] === '{' && this.src[k - 1] !== '$') return false;
+    return true;
+  }
+
   // Body of a double-quoted string (this.i is just past the opening quote). Substitutions run inside it.
   // Sets this.lastDqDyn when something inside is only known at run time ($VAR, $(...), backticks).
   readDq(depth) {
@@ -2524,6 +2533,7 @@ class Parser {
 
     while (this.i < n && !ctx.stopped) {
       if (cs.length && cs[cs.length - 1].st === 'pat' && !inWord && lit === 0) {
+        if (noRedir || maybeArith) { this.funsub(REFUSED_ARITH); continue; } // (#269 R20-F2: a `case` is never arithmetic; its pattern reader skips `#` comments that arithmetic does not have)
         endSeg(this.i);
         lastSep = ';';
         const top = cs[cs.length - 1];
@@ -2597,6 +2607,8 @@ class Parser {
           const r = readAnsiC(s, this.i + 1); cur += r.text; this.i = r.next;
         }
         else if (nx === '"') { mark(); this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; takeSubs(); }
+        // (#269 R20-F1, R20-F3) in arithmetic a `${…}` the parser does not span as the shell does is refused, not lexed on as ordinary characters: the comparison with the proof would then pass
+        else if (nx === '{' && (noRedir || maybeArith) && !this.arithParamPlain(this.i)) { cur += this.funsub(REFUSED_ARITH); continue; }
         else if (nx === '{' && this.paramSpan(this.i) > 0) {
           // `${f%%(*}`, `${x:-a b;c}`: one word; the ( ) ; | & and blanks inside the braces are not shell syntax
           const end = this.paramSpan(this.i);

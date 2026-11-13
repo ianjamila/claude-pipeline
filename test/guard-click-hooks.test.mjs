@@ -1133,6 +1133,40 @@ test('R19: arithmetic whose `))` the proof finds before the shell does (a `)` in
   }
 });
 
+test('R20: arithmetic holding a ${…} the parser cannot span (a newline, <( >( =(, a $( , a bare {), or a case pattern, is refused for $(( and (( alike', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json'; // (built at run time, as in R19)
+  const hidden = "'$(" + cp + ")'"; // inert in command lexing; the shell expands it inside arithmetic
+  const failures = [];
+  for (const open of ['echo $((', '((']) {
+    for (const body of [
+      ' ${x:-\n0))} + ' + hidden + ' ', // R20-F1: a newline in the ${…}: paramSpan declines it, the early ")" is counted by both readers
+      ' ${x:-<(:)0))} + ' + hidden + ' ', // <(
+      ' ${x:->(:)0))} + ' + hidden + ' ', // >(
+      ' ${x:-=(:)0))} + ' + hidden + ' ', // =(
+      ' ${x:-$(:)0))} + ' + hidden + ' ', // a $( inside
+      ' ${x:-{a} + 1 ', // R20-F3: a bare { (zsh may close the expansion at a later })
+      ' ${x:-${y:-{b}}} + 1 ',
+      ' case x in\n# $(' + cp + ')\n(a) 1 ', // R20-F2: the case-pattern reader skips the comment
+      ' case x in (a) 1 ',
+    ]) {
+      const cmd = open + body + '))';
+      if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+    }
+  }
+  assert.deepEqual(failures, [], 'these R20 lines were not refused');
+  const blocked = [];
+  for (const cmd of [
+    'echo $(( x + 1 ))',
+    '(( i++ ))',
+    'echo $(( ${x:-1} + 1 ))',
+    '(( ${x:-1} > 0 )) && echo y',
+    'x=ab; echo $(( ${#x} + ${x:-2} ))',
+    'echo $(( ${x:-${y:-1}} + 1 ))',
+    'i=0; (( i < 3 )) && echo "ok {x}"',
+  ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
+  assert.deepEqual(blocked, [], 'these R20 lines were refused');
+});
+
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------
 
 test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] argument no longer hide a fed interpreter', () => {
