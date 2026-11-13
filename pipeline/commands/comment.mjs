@@ -9,7 +9,8 @@ import { loadConfig, DEFAULTS } from '../lib/config.mjs';
 import { loadState } from '../lib/state.mjs';
 import { MARKERS, summarySections, needsHumanComment, blockedComment, blockedReasonComment, awaitingReviewComment } from '../lib/render.mjs';
 import { recordForOutcome } from '../lib/run-record.mjs';
-import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
+import { writeRunRecord } from '../lib/run-progress.mjs';
+import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createGitHub, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
 import { parkStatusLines } from '../lib/round-status.mjs';
 import { allItems, readModelProofs, withReviewLock } from '../lib/review-context.mjs';
@@ -76,8 +77,8 @@ function summaryKind(gh, pr, sections, outcome) {
     repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
     outcome, host: hostname(), now: Date.now(),
   });
-  const r = writeSummaryComment(gh, pr, { record, sections, existing });
-  return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: record.step, warnings } };
+  const r = writeRunRecord(gh, pr, { record, sections, repo: gh.repo().slug, branch: view.headRefName });
+  return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: r.record.step, warnings } };
 }
 
 // true only when GitHub says the PR is a ready (non-draft) PR; a failed read, or any other answer, is false.

@@ -9,8 +9,8 @@ import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { GitError, headSha, isAncestor, treeFingerprint } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { LIMITS, STEPS, applyCheckpoint } from '../lib/run-record.mjs';
-import { VIEW_FIELDS, baseRecordFor } from '../lib/run-progress.mjs';
-import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
+import { VIEW_FIELDS, baseRecordFor, writeRunRecord } from '../lib/run-progress.mjs';
+import { readSummaryComment } from '../lib/summary-comment.mjs';
 
 export const meta = {
   summary: 'record where the review run stands in the PR summary comment (refuses unless local HEAD is the pushed PR head)',
@@ -133,7 +133,7 @@ export const run = guarded(async (argv, ctx) => {
 
     const existing = readSummaryComment(gh, pr);
     if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
-    const base = baseRecordFor(existing, { repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName });
+    const base = baseRecordFor(existing, { repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: local });
     warnings.push(...base.warnings);
     let record;
     try {
@@ -141,7 +141,8 @@ export const run = guarded(async (argv, ctx) => {
     } catch (err) {
       throw new UsageError(err.message);
     }
-    const posted = writeSummaryComment(gh, pr, { record, existing });
-    return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, record, warnings } };
+    // (the guarded writer re-reads first: a `resumed` mark a concurrent checkpoint added since our read is carried over, never cleared)
+    const posted = writeRunRecord(gh, pr, { record, repo: gh.repo().slug, branch: view.headRefName });
+    return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, record: posted.record, warnings } };
   });
 });
