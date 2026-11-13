@@ -49,8 +49,12 @@ test('repo config: the rating tests read this same high_risk_paths list (no hand
 // `import`, `(`, the specifier and the closing `,` or `)`. The regex may only OVER-match: a mention inside a comment or string is taken as an
 // import, which is the safe direction (importClosure skips a dynamic target that does not exist on disk). A computed or interpolated
 // specifier has no path to follow and is deliberately not matched.
+// No match may consume text: the pattern is tried with a STICKY regex at EVERY `import` token (one candidate per token), so a real literal
+// import always matches from its own token and an earlier `import`, comment or quote cannot swallow it. A block comment ends at its FIRST
+// `*/` and a line comment at its line end (no backtracking to a later one), so one candidate never reaches into the next import.
 const STATIC_IMPORTS_HELPER = path.join(root, 'test', 'fixtures', 'static-imports.mjs');
-const DYNAMIC_IMPORT_RE = /\bimport(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*)*\((?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*)*(?:'([^'\n]+)'|"([^"\n]+)"|`((?:[^`$\\]|\$(?!\{))+)`)(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*)*[,)]/g;
+const SKIP = String.raw`(?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\n]*(?![^\n]))*`;
+const DYNAMIC_IMPORT_AT = new RegExp(String.raw`import${SKIP}\(${SKIP}(?:'([^'\n]+)'|"([^"\n]+)"|\`((?:[^\`$\\]|\$(?!\{))+)\`)${SKIP}[,)]`, 'y');
 
 function staticSpecifiers(sources) {
   const r = spawnSync(process.execPath, ['--experimental-vm-modules', '--no-warnings', STATIC_IMPORTS_HELPER], {
@@ -62,7 +66,13 @@ function staticSpecifiers(sources) {
 }
 
 function dynamicSpecifiers(src) {
-  return [...src.matchAll(DYNAMIC_IMPORT_RE)].map((m) => m[1] ?? m[2] ?? m[3]);
+  const out = [];
+  for (const token of src.matchAll(/\bimport/g)) {
+    DYNAMIC_IMPORT_AT.lastIndex = token.index;
+    const m = DYNAMIC_IMPORT_AT.exec(src);
+    if (m) out.push(m[1] ?? m[2] ?? m[3]);
+  }
+  return out;
 }
 
 // One entry per source: { static: [...], dynamic: [...] }.
@@ -124,6 +134,28 @@ test('repo config: the dynamic-import scan allows a comment between import, the 
     "",
   ].join('\n');
   assert.deepEqual(scanImports([src])[0].dynamic, ['./a-trail.mjs', './b-before-paren.mjs', './c-line.mjs', './d-mixed.mjs', './e-tick.mjs', './f-star.mjs']);
+});
+
+test('repo config: round-4 regressions (R4-B1, R4-F1): no dynamic-import match consumes a later import, whatever comment or computed import comes first', () => {
+  // A computed import with a leading block comment must not reach a later `*/` and eat the real import after it.
+  const computed = "await import(/* @vite-ignore */ url);\nawait import('./real.mjs');\nlog(/* level */ 'info', msg);\n";
+  assert.deepEqual(scanImports([computed])[0].dynamic, ['./real.mjs']);
+  // Codex's case: a mention in a line comment opens a `/*` that a later line comment closes; the real import in between stays found.
+  const fake = "// import('./fake.mjs' /*\nawait import('./real.mjs');\n// */);\n";
+  assert.deepEqual(scanImports([fake])[0].dynamic, ['./fake.mjs', './real.mjs']);
+  // The earlier test's `import(/* why */ name)` line moved FIRST must still return every later specifier.
+  const moved = [
+    "await import(/* why */ name);",
+    "await import('./a-trail.mjs' /* why */);",
+    "await import /* why */ ('./b-before-paren.mjs');",
+    "await import( // why",
+    "  './c-line.mjs');",
+    "",
+  ].join('\n');
+  assert.deepEqual(scanImports([moved])[0].dynamic, ['./a-trail.mjs', './b-before-paren.mjs', './c-line.mjs']);
+  // A static import with a comment before its brace, then a comment before a later parenthesis.
+  const staticFirst = "import /* types */ { a } from './a.mjs';\nconst s = f /* x */ ('./not-an-import.mjs');\nawait import('./later.mjs');\n";
+  assert.deepEqual(scanImports([staticFirst])[0].dynamic, ['./later.mjs']);
 });
 
 test('repo config: the import scanner does not skip a multi-line import whose braces hold a comment with a quote, semicolon or brace', () => {
