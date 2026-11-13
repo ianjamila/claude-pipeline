@@ -1949,6 +1949,32 @@ function loopReseed(ctx, entry, left) {
   ctx.envCfgDirty = entry.envCfg;
   loopMark(ctx, left);
 }
+const MAX_LOOP_STARTS = 4;
+// The directories a loop body (commands loop.start .. loop.end) can end in when it starts in `from`: its cd / pushd / popd in order, outside any subshell of its own (a cd there is lost with the subshell);
+// one that may not run (after && / ||, in an if / case branch, in the background) keeps the directory it started from as well. null: a place that cannot be named.
+function loopEndDirs(cmds, loop, from, ctx, cdp) {
+  let own = Infinity;
+  for (let j = loop.start; j < loop.end; j++) own = Math.min(own, cmds[j].grp?.length ?? 0);
+  let dirs = [from];
+  for (let j = loop.start; j < loop.end; j++) {
+    const c = cmds[j];
+    const nm = c.argv.length ? baseName(c.argv[0]) : '';
+    if (!DIR_CHANGERS.includes(nm) || (c.grp?.length ?? 0) > own) continue;
+    const next = cmds[j + 1];
+    const orExits = next?.sep === '||' && ['exit', 'return'].includes(next.argv[0]) && cmds[j + 2]?.sep !== '|' && cmds[j + 2]?.sep !== '&';
+    const may = c.ctl?.cond || c.sep === '&&' || c.sep === '||' || c.sep === '&' || c.sep === '|' || next?.sep === '&' || next?.sep === '|' || (next?.sep === '||' && !orExits);
+    let moved = dirs.map((d) => nextDir(d, nm, c.argv, ctx, cdp, c.env ?? {}));
+    // (`cd a && cd b`: the second runs only when the first did, so the pair either moves twice or not at all)
+    if (!may && next?.sep === '&&' && next.argv.length && DIR_CHANGERS.includes(baseName(next.argv[0])) && (next.grp?.length ?? 0) <= own && !next.ctl?.cond) {
+      const after = moved.map((d) => nextDir(d, baseName(next.argv[0]), next.argv, ctx, cdp, next.env ?? {}));
+      moved = [...dirs, ...after];
+      j++;
+    }
+    dirs = [...new Set(may ? [...dirs, ...moved] : moved)];
+    if (dirs.length > 8) return [null];
+  }
+  return dirs;
+}
 // The loops of a command list as [start, end) ranges of consecutive commands the parser marks as in a loop (the `for` / `while` header, its condition and its body; a loop inside a loop is part of the
 // outer range, and two loops with nothing between them are one range: a later loop is then judged as if it could run again, which only refuses more). Marks not to be trusted (cmds.ctlBroken):
 // everything from the first loop header on.
@@ -3017,12 +3043,20 @@ function evalString(str, startDir, ctx, level, child = false) {
     checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
     if (loop && i >= loop.end) {
       loopLeft(ctx, loop.entry, loop.left);
-      if (!loop.again && loopLeftAny(loop.left)) {
+      // Where the body can end, replayed on its own cd / pushd / popd (the walk loses the directory at the command after a cd that is not chained with &&, which would make every body end in an unknown
+      // one): the places its next iteration may start in. A move to a place not yet judged from is judged from there; a body that keeps moving (`cd ..`, a relative path that is not a fixed point) is
+      // judged from at most 4 places and then from an unknown one. Marks not trusted, or a function / state hazard (no directory is known in any pass): no directory is followed.
+      const ends = hazard ? [] : subs ? loopEndDirs(cmds, loop, loop.starts[loop.starts.length - 1], ctx, cdp) : dir !== loop.dir ? [null] : [];
+      for (const d of ends) if (!loop.starts.includes(d) && !loop.queue.includes(d)) loop.queue.push(d);
+      if (loop.starts.length === 1 && loopLeftAny(loop.left)) loop.queue.unshift(loop.dir); // (it left git state: once more from where it started, before any other place, so that the refusal names the state)
+      if (loop.queue.length && loop.starts.length >= MAX_LOOP_STARTS) { loop.queue.length = 0; if (!loop.starts.includes(null)) loop.queue.push(null); }
+      if (loop.queue.length) {
+        const nextDir = loop.queue.shift();
         countReading(ctx.budget); // (the extra pass counts against the allowance of readings, as any other)
-        loop.again = true;
+        loop.starts.push(nextDir);
         loopReseed(ctx, loop.entry, loop.left);
-        dir = loop.dir;
-        uncertain = loop.uncertain;
+        dir = nextDir;
+        uncertain = nextDir === loop.dir ? loop.uncertain : false;
         chdirBase = undefined;
         if (subs) subs.splice(0, subs.length, ...loop.subs.map((x) => ({ ...x })));
         i = loop.start;
@@ -3034,7 +3068,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (i >= cmds.length) break;
     const c = cmds[i];
     if (chdirBase !== undefined) { dir = chdirBase; chdirBase = undefined; }
-    if (!loop && loopEnds.has(i)) loop = { start: i, end: loopEnds.get(i), again: false, entry: loopEntry(ctx), left: newLoopLeft(), dir, uncertain, subs: subs ? subs.map((x) => ({ ...x })) : [] };
+    if (!loop && loopEnds.has(i)) loop = { start: i, end: loopEnds.get(i), starts: [dir], queue: [], entry: loopEntry(ctx), left: newLoopLeft(), dir, uncertain, subs: subs ? subs.map((x) => ({ ...x })) : [] };
     const argv = c.argv;
     if (subs) {
       // Why: a cd inside a subshell ($( ), ( ), backticks, <( )) moves that subshell only: when it ends, the line goes on in the directory it had when the subshell

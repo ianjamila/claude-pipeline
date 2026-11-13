@@ -42,6 +42,7 @@ const script = (setup, text) => ({ ...pkg(setup), 'run.sh': `#!/bin/bash\n${text
 const RUN_SH = `bash ${GIT_ROOT}/run.sh`;
 const BRANCH = /cannot determine the current branch/;
 const ALIAS = /the git alias "ship" may have been \(re\)defined/;
+const DIRS = /cannot determine the current branch|pushing to main is blocked/; // (the next iteration's directory is a repository on main, or is not known)
 const CONFIG = /changes upstream\/push configuration/;
 
 function denies(what, cmd, files, reason) {
@@ -115,18 +116,19 @@ test('#352 R5: a directory the body changes to is where its next iteration start
     ['cd chained', `for i in 1 2; do ${PB} origin HEAD; cd ../other && echo; done`],
     ['cd to a place not named', `for i in 1 2; do ${PB} origin HEAD; cd "$(mktemp -d)"; done`],
   ]) {
-    denies(what, loop, {}, BRANCH);
-    denies(`${what}, in a script`, RUN_SH, script('echo', loop), BRANCH);
+    denies(what, loop, {}, DIRS);
+    denies(`${what}, in a script`, RUN_SH, script('echo', loop), DIRS);
   }
 });
 test('#352 R5 allow twins: a body that stays in the repository, or moves only in a subshell, is not refused', () => {
-  allows('cd into a subdirectory and push', `for i in 1 2; do cd sub && ${PB} origin HEAD; done`);
-  allows('push, then cd into a subdirectory', `for i in 1 2; do ${PB} origin HEAD; cd sub; done`);
+  allows('cd into a subdirectory and push, then back', `for i in 1 2; do cd sub && ${PB} origin HEAD; cd ..; done`);
+  allows('cd into a subdirectory of the repository by its full path', `for i in 1 2; do cd ${GIT_ROOT}/sub && ${PB} origin HEAD; done`);
+  allows('push, then cd into a subdirectory by its full path', `for i in 1 2; do ${PB} origin HEAD; cd ${GIT_ROOT}/sub; done`);
   allows('subshell cd before the push', `for i in 1 2; do (cd sub && make); ${PB} origin HEAD; done`);
   allows('subshell cd to another repository after the push', `for i in 1 2; do ${PB} origin HEAD; (cd /work/other && make); done`);
   allows('command substitution cd', `for i in 1 2; do ${PB} origin HEAD; echo $(cd /work/other && pwd); done`);
   allows('cd and back', `for i in 1 2; do ${PB} origin HEAD; cd sub && cd ..; done`);
   allows('cd to the repository itself', `for i in 1 2; do ${PB} origin HEAD; cd ${GIT_ROOT}; done`);
   allows('cd into another repository, no push in the loop', 'for i in 1 2; do cd /work/other; git status; done');
-  allows('in a script', RUN_SH, script('echo', `for i in 1 2; do (cd sub && make); ${PB} origin HEAD; cd sub; done`));
+  allows('in a script', RUN_SH, script('echo', `for i in 1 2; do (cd sub && make); ${PB} origin HEAD; cd ${GIT_ROOT}/sub; done`));
 });
