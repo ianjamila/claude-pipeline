@@ -471,7 +471,11 @@ test('windows: a backslash path, a forward-slash path, a quoted path and a ~ / $
     `node 'C:/Users/RUNNER~1/AppData/Local/Temp/dialog-hooks-x/.claude/hooks/notify.mjs'`,
   ]) assert.equal(win(cmd), WIN_SCRIPT, cmd);
   assert.equal(win('node ${CLAUDE_PLUGIN_ROOT}\\hooks\\a.mjs', { pluginRoot: 'D:\\plugins\\p' }), 'D:\\plugins\\p\\hooks\\a.mjs');
-  assert.equal(win('node \\\\server\\share\\hooks\\a.mjs'), '\\\\server\\share\\hooks\\a.mjs');
+});
+
+test('windows: a network (UNC or //server) script path is refused: fingerprinting a share can leak credentials and its bytes can change', () => {
+  for (const cmd of ['node \\\\server\\share\\hooks\\a.mjs', 'node //server/share/hooks/a.mjs', '\\\\server\\share\\a.mjs', 'node "\\\\?\\C:\\x\\a.mjs"'])
+    assert.equal(win(cmd), null, cmd);
 });
 
 test('windows: everything ambiguous stays unresolvable (rooted or drive-relative paths, relative paths, shell syntax, interpreters, escapes in a double quote)', () => {

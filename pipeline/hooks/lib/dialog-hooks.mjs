@@ -91,10 +91,11 @@ export function matcherMatchesDialog(matcher, tool = DIALOG_TOOL) {
 }
 
 // (Windows) A hook command written for Windows holds backslash paths (`node C:\Users\me\.claude\hooks\x.mjs`). On win32 a backslash is a path separator, not an escape, so words() keeps it; on any other platform it stays
-// an escape and is refused. Only a drive-letter or UNC path counts as absolute there (a rooted `\x` or a drive-relative `C:x` is ambiguous: refused).
+// an escape and is refused. Only a drive-letter path counts as absolute there (UNC is refused, below) (a rooted `\x` or a drive-relative `C:x` is ambiguous: refused).
 const isWin = (platform) => platform === 'win32';
 const pathOf = (platform) => (isWin(platform) ? path.win32 : path);
-const isAbsoluteOn = (p, platform) => (isWin(platform) ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]|\/\/[^\\/])/.test(p) && path.win32.isAbsolute(p) : path.isAbsolute(p));
+// A UNC / `//server` path is refused (#269: reading a network share to fingerprint it can leak credentials and the bytes can change between hash and run).
+const isAbsoluteOn = (p, platform) => (isWin(platform) ? /^[A-Za-z]:[\\/]/.test(p) && path.win32.isAbsolute(p) : path.isAbsolute(p));
 
 // Words of a simple command line: whitespace separates, '...' and "..." group. Anything a shell would interpret (pipes, redirects, substitutions, globs, escapes, variables other than a leading HOME) -> null.
 function words(text, platform = process.platform) {
