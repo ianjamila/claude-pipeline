@@ -131,9 +131,6 @@ export const run = guarded(async (argv, ctx) => {
     patch.head = local;
     if (values.resumed) {
       patch.resumed = { at: new Date().toISOString(), host: hostname(), head: local };
-      // The append-only evidence, posted BEFORE the record: the record is one editable comment that a concurrent writer can overwrite, the event cannot be.
-      // A stamp that may be lost must not look successful, so a failed post fails the command (guardGh: exit 3) and nothing is written.
-      postResumedEvent(gh, pr, patch.resumed);
     }
 
     const existing = readSummaryComment(gh, pr);
@@ -145,6 +142,12 @@ export const run = guarded(async (argv, ctx) => {
       record = applyCheckpoint(base.record, patch, { host: hostname(), now: Date.now() });
     } catch (err) {
       throw new UsageError(err.message);
+    }
+    if (values.resumed) {
+      // The append-only evidence, posted BEFORE the record: the record is one editable comment that a concurrent writer can overwrite, the event cannot be.
+      // It comes after the usage checks above (an exit 2 posts nothing). A stamp that may be lost must not look successful, so a failed post fails the
+      // command (guardGh: exit 3) and nothing is written.
+      postResumedEvent(gh, pr, patch.resumed);
     }
     // (the guarded writer re-reads first, which only narrows the window for a concurrent writer's `resumed` mark: the run-resumed event is the durable evidence)
     const posted = writeRunRecord(gh, pr, { record, skipResumedEvent: Boolean(values.resumed) });
