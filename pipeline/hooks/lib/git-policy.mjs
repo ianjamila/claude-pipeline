@@ -1430,7 +1430,7 @@ function cdTargets(cmds, startDir, ctx) {
   const dirs = startDir === null ? [] : [startDir];
   for (const c of cmds) {
     const nm = c.argv.length ? baseName(c.argv[0]) : '';
-    if (nm !== 'cd' && nm !== 'pushd') continue;
+    if (nm !== 'cd' && nm !== 'chdir' && nm !== 'pushd') continue;
     const t = c.argv.slice(1).find((a) => !a.startsWith('-'));
     const e = t === undefined ? '~' : expandVars(t, ctx).replace(/^\$\{?HOME\}?(?=\/|$)/, () => lineHome(ctx) ?? '$HOME');
     if (DYNAMIC.test(e) || e === '-') continue;
@@ -2268,7 +2268,7 @@ const UNSURE_OK = new Set([
   'break', 'continue', 'return', 'exit', 'shift',
   ...VAR_BUILTINS, ...VALUE_BINDERS,
 ]);
-const DIR_CHANGERS = ['cd', 'pushd', 'popd'];
+const DIR_CHANGERS = ['cd', 'chdir', 'pushd', 'popd']; // (#372: zsh's chdir is cd)
 
 // A line that defines a function (its body is parsed as if it ran — `f(){ cd /safe; }; git push` never runs the cd),
 // an alias, a trap (`trap "cd …" DEBUG` runs before every command) or changes shell options / builtins can change
@@ -2928,7 +2928,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
     } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
-    else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
+    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name === 'chdir' ? 'cd' : name, argv, ctx, cdp, c.env ?? {});
     else if (name === 'git' || name === 'gh') {
       // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
       if (name === 'git' && argv.includes('remote') && argv.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true;

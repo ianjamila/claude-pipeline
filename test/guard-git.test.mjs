@@ -328,6 +328,7 @@ const MORE_DENY = [
   ['find . -name x -exec git push origin main ;'],
   // cwd tracking
   ['cd /other && git push', { byDir: { '/work/repo': 'agent/x', '/other': 'main' } }],
+  ['chdir /other && git push', { byDir: { '/work/repo': 'agent/x', '/other': 'main' } }], // (#372: zsh's chdir is cd)
   ['git -C /other push', { byDir: { '/work/repo': 'agent/x', '/other': 'master' } }],
   ['git -C ../other push', { cwd: '/work/repo', byDir: { '/work/other': 'main' } }],
   ['git -C a -C b push', { cwd: '/w', byDir: { '/w/a/b': 'main' } }],
