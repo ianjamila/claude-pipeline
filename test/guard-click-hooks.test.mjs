@@ -30,8 +30,9 @@ test('the user-level hooks folder and local settings are protected for every fil
 
 test('another account config dir (~/.claude-eaglewatch) is held the same: hooks/, settings.json and settings.local.json', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-click-hooks-'));
+  // (a real temp dir is judged by the platform it lives on: a Windows path under platform 'linux' is a relative name, the drive-letter rule; the win32 reading is pinned by the fake-file-system test below)
   fs.mkdirSync(path.join(home, '.claude-eaglewatch'), { recursive: true });
-  const opts = { home, platform: 'linux', env: {}, realpath: (p) => p, existsSync: (p) => fs.existsSync(p) };
+  const opts = { home, platform: process.platform, env: {}, realpath: (p) => p, existsSync: (p) => fs.existsSync(p) };
   const ew = path.join(home, '.claude-eaglewatch');
   const write = (p, o = opts) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: p, content: 'x' }, cwd: '/repo' }, o).decision;
   for (const rel of ['hooks/tab.mjs', 'settings.local.json', 'settings.json']) {
@@ -44,6 +45,23 @@ test('another account config dir (~/.claude-eaglewatch) is held the same: hooks/
   const cfg = { ...opts, env: { CLAUDE_CONFIG_DIR: '/data/claude-cfg' } };
   assert.equal(write('/data/claude-cfg/hooks/x.mjs', cfg), 'deny');
   assert.equal(write('/data/claude-cfg/notes.md', cfg), 'allow');
+});
+
+// (#269 CI, Windows: the same rules on every platform, proved here on any host with a fake file system) A Windows home and backslash, drive-letter, mixed-case and `\\?\` spellings of a hook surface are refused under the win32 rules.
+test('win32: backslash, forward-slash, mixed-case and device-prefix spellings of another account config dir hold hooks/, settings.json and settings.local.json', () => {
+  const home = 'C:\\Users\\u';
+  const opts = { home, platform: 'win32', env: {}, realpath: (p) => p, existsSync: () => false, readDir: (d) => (/Users[\\/]u$/.test(d) ? ['.claude-eaglewatch', '.claude'] : null) };
+  const write = (p) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: p, content: 'x' }, cwd: 'C:\\repo' }, opts).decision;
+  const viaBash = (p) => evaluateBashForFiles(`echo x > ${p}`, { ...opts, cwd: 'C:\\repo' }).decision;
+  for (const rel of ['hooks/tab.mjs', 'settings.local.json', 'settings.json']) {
+    for (const ew of ['.claude-eaglewatch', '.claude']) {
+      const back = `C:\\Users\\u\\${ew}\\${rel.replace(/\//g, '\\')}`;
+      for (const p of [back, back.replace(/\\/g, '/'), `\\\\?\\${back}`, back.toUpperCase(), back.replace('C:', 'c:')]) assert.equal(write(p), 'deny', p);
+      assert.equal(viaBash(back.replace(/\\/g, '/')), 'deny', back);
+    }
+  }
+  assert.equal(write('C:\\Users\\u\\.claude-eaglewatch\\CLAUDE.md'), 'allow', 'the rest of the config dir stays writable');
+  assert.equal(write('C:\\Users\\u\\other\\hooks\\tab.mjs'), 'allow', 'a hooks folder elsewhere');
 });
 
 test('every scriptPath of the approved dialog-hook list is protected; a missing, unreadable or malformed list adds nothing', () => {
@@ -239,7 +257,7 @@ test('R2-B2: the guard protects what the inventory reads: namespaced commands / 
   fs.mkdirSync(path.join(install, '.claude-plugin'), { recursive: true });
   fs.writeFileSync(path.join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({ plugins: { 'p@m': [{ installPath: install }] } }));
   fs.writeFileSync(path.join(install, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'p', skills: './extra' }));
-  const opts = { home, platform: 'linux', env: {}, realpath: (p) => p, existsSync: (p) => fs.existsSync(p), readText: () => null };
+  const opts = { home, platform: process.platform, env: {}, realpath: (p) => p, existsSync: (p) => fs.existsSync(p), readText: () => null };
   const write = (p, content) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: p, content }, cwd: '/repo' }, opts).decision;
   for (const p of [path.join(install, 'skills', 's', 'SKILL.md'), path.join(install, 'extra', 'example', 'SKILL.md'), path.join(install, 'commands', 'x', 'y.md')]) {
     assert.equal(write(p, hooked), 'deny', p);
@@ -314,7 +332,7 @@ test('R3-B2: a plugin install or manifest location past the old 500 / 50 / 100 l
   fs.mkdirSync(path.join(home, '.claude', 'plugins'), { recursive: true });
   const hooked = '---\nname: n\nhooks:\n  Stop: []\n---\n';
   const make = (name) => { const d = path.join(home, 'elsewhere', name); fs.mkdirSync(path.join(d, '.claude-plugin'), { recursive: true }); return d; };
-  const opts = { home, platform: 'linux', env: {}, realpath: (p) => p, existsSync: (p) => fs.existsSync(p), readText: () => null };
+  const opts = { home, platform: process.platform, env: {}, realpath: (p) => p, existsSync: (p) => fs.existsSync(p), readText: () => null };
   const write = (p) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: p, content: hooked }, cwd: '/repo' }, opts).decision;
   const list = (plugins) => fs.writeFileSync(path.join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({ plugins }));
   // the 56th installation of one plugin
