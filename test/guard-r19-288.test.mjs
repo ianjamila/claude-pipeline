@@ -151,3 +151,26 @@ describe('R21: ~/.zshenv sees a CDPATH learned from a sourced file', () => {
       withFs({ [`${HOME}/proj/env-plain.sh`]: 'export FOO=1\n', [`${HOME}/.zshenv`]: 'cd build && rm -rf out\n', [`${HOME}/proj/build`]: '' })],
   ]);
 });
+
+// ---- CI (Windows H2): a command word longer than any directory name is not read as an AUTO_CD directory (that made the line be judged again in every assumed directory) ----
+describe('#288 CI H2: a very long lone command word is not an AUTO_CD directory', () => {
+  const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
+  const LIMIT = 200_000;
+  const fill = (u) => u.repeat(Math.ceil(LIMIT / u.length)).slice(0, LIMIT);
+  test('a lone run-time word over PATH_MAX does not make the directory unknown; a short one still does', () => {
+    assert.equal(run('`'.repeat(5000) + '; echo hi > out.txt', PROJ).decision, 'allow');
+    assert.equal(run('$D; echo hi > out.txt', PROJ).decision, 'deny');
+  });
+  test('a short line after a cd into a run-time directory is still judged in each assumed directory (an absolute path outside them stays allowed)', () => {
+    assert.equal(run('cd "$X" && echo hi > /tmp/out.txt', PROJ).decision, 'allow');
+    assert.equal(run('cd "$X" && echo hi > out.txt', PROJ).decision, 'deny');
+  });
+  for (const [name, unit] of [['backslashes', '\\'], ['backticks', '`'], ['dollar-brace', '${'], ['nested name-subscripts', 'a[']]) {
+    test(`a 200 kB line of ${name} costs about one pass, not one per assumed directory`, () => {
+      const t0 = cpu();
+      run(fill(unit), PROJ);
+      const ms = cpu() - t0;
+      assert.ok(ms < 1500, `${Math.round(ms)} ms of CPU`); // (main: ~0.2-0.6 s locally; one pass per assumed directory took 2-3.5 s)
+    });
+  }
+});
