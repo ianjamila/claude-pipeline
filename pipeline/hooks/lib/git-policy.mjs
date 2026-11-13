@@ -1978,7 +1978,7 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
   for (let j = loop.start; j < loop.end; j++) {
     const c = cmds[j];
     const nm = c.argv.length ? baseName(c.argv[0]) : '';
-    if (!DIR_CHANGERS.includes(nm) || (c.grp?.length ?? 0) > own || c.up?.some((u) => u.proc)) continue; // (a cd in a text a new process runs is lost when it ends)
+    if (!DIR_CHANGERS.includes(nm) || (c.grp?.length ?? 0) > own || c.spawn || c.up?.some((u) => u.proc && !cmds[loop.start].up.includes(u))) continue; // (a cd in a text a new process runs, or in a command a wrapper started, is lost when it ends: one in a text the loop is itself in is not, R10-B1)
     const next = cmds[j + 1];
     const orExits = next?.sep === '||' && ['exit', 'return'].includes(next.argv[0]) && cmds[j + 2]?.sep !== '|' && cmds[j + 2]?.sep !== '&';
     const may = c.ctl?.cond || c.sep === '&&' || c.sep === '||' || c.sep === '&' || c.sep === '|' || next?.sep === '&' || next?.sep === '|' || (next?.sep === '||' && !orExits);
@@ -2600,13 +2600,16 @@ function unsureVarReachingCommand(cmds, ctx) {
 // The subshell marks (grp, see shell-parse.mjs) can tell where a subshell ends: the parse finished and trusts its marks, every command carries them, and the commands
 // of each subshell come one after the other (a heredoc body the parser finishes later, after commands outside its subshell, would make one end too early).
 function subshellsTrusted(cmds) {
-  if (cmds.truncated || cmds.ctlBroken || !cmds.every((c) => Array.isArray(c.grp))) return false;
+  if (cmds.truncated || cmds.ctlBroken || !cmds.every((c) => Array.isArray(c.grp) && Array.isArray(c.up))) return false;
   const ended = new Set();
   let prev = [];
+  let prevUp = [];
   for (const c of cmds) {
     for (const id of prev) if (!c.grp.includes(id)) ended.add(id);
-    if (c.grp.some((id) => ended.has(id))) return false;
+    for (const e of prevUp) if (!c.up.includes(e)) ended.add(e); // (the levels of the parser's up marks: a group, a text, a subshell, a construct)
+    if (c.grp.some((id) => ended.has(id)) || c.up.some((e) => ended.has(e))) return false;
     prev = c.grp;
+    prevUp = c.up;
   }
   return true;
 }
@@ -3040,26 +3043,32 @@ function evalString(str, startDir, ctx, level, child = false) {
   }
   let dir = startDir;
   const cdp = cdpathMaybe(cmds, ctx);
-  const from = flowStart(cmds);
-  // (#352 R8: ONE state for the may-not-run rule. uncertain: an earlier cd / branch change may not have taken effect for the commands that follow; orChanged: that change is behind `||`, so a command
-  // chained with && after it may run without it. They are saved and restored together with the directory (snap / restore) by every subshell and loop frame.)
-  // lostDir: the change may have moved the directory (a cd, or a direct git command: as before); a change only found in the git state (a script that switched the branch) leaves the directory known, so the
-  // package scripts after it are still followed.)
-  const flags = { uncertain: false, orChanged: false, lostDir: false };
+  const trusted = subshellsTrusted(cmds); // (the marks of the parser (up, grp, ctl) say where every level starts and ends: when they are not to be trusted, no change is certain and no level is given back)
+  // (#352 R10: ONE rule, an ALLOWLIST, certainChange: a command that changed git state or the directory and is not certain leaves it UNKNOWN for every later command at once (forget). One that is certain stays so for the
+  // commands after it in its own level while only && (or ;, when it surely ran) joins them to it: a tracker, looked at by every command (settle). A level that ends gives back what a child process did (a directory) or
+  // leaves unknown what a change in this shell's own level (a group, eval, source) did.)
   const forgetBranches = () => { for (const e of ctx.branches.values()) e.name = null; };
   const forgetState = () => { dir = null; forgetBranches(); };
-  const snap = () => ({ dir, uncertain: flags.uncertain, orChanged: flags.orChanged, lostDir: flags.lostDir });
-  const restore = (x) => { dir = x.dir; flags.uncertain = x.uncertain; flags.orChanged = x.orChanged; flags.lostDir = x.lostDir; };
-  // The rule, for a command (or a subshell) that comes after an uncertain change, with the operator before it: only commands chained with && after the change are certain to see it (`cd d && git push`);
-  // anything else may run without it (`false && cd d; git push`, `cd d &`, `(cd d)`, `cd d || git push`), so the state is unknown.
-  // (#352 R7-F2: not the `&&` after the closer of a construct that may have skipped its body: `if false; then cd d; fi && git push`, `done &&`, `esac &&` chain to the construct, not to the body's last command.
-  // Nor the `&&` after a change that was itself behind `||`: `true || cd d && git push` runs the push without the cd.)
-  const settle = (op) => {
-    if (!flags.uncertain || (op.sep === '&&' && !op.afterClose && !flags.orChanged)) return;
-    if (flags.lostDir) forgetState(); else forgetBranches();
-    flags.uncertain = false;
-    flags.orChanged = false;
-    flags.lostDir = false;
+  let trackers = []; // the certain changes so far: { up: the levels it is in, cond: it may not have run (it follows &&), lost: it may have moved the directory, before: the git state before it }
+  const snap = () => ({ dir, trackers: [...trackers] });
+  const restore = (x) => { dir = x.dir; trackers = [...x.trackers]; };
+  const forget = (x) => {
+    if (x.lost) forgetState(); else forgetBranches();
+    // (an alias a change that is not certain (re)defined is unsure for every later use, as for a speculative candidate (judgeScopedIn): the use is refused, whatever the value the walk gave it)
+    for (const [kind, then, now] of [['git', x.before.git, ctx.gitAliases], ['gh', x.before.gh, ctx.ghAliases]]) for (const n of new Set([...Object.keys(then), ...Object.keys(now)])) if (then[n] !== now[n]) ctx.aliasUnsure.add(`${kind}:${n.toLowerCase()}`);
+  };
+  // For command c: the operator before the item of a tracker's list that holds it (c itself, or the group / text / subshell that holds c): && keeps the change certain, ; and everything else ends a conditional one,
+  // || any (`cd d || exit 1`: nothing after it runs when the change failed).
+  const settle = (c) => {
+    trackers = trackers.filter((x) => {
+      if (!x.up.every((e, k) => c.up[k] === e)) return false; // (its level has ended: the rule of that level took over)
+      const deeper = c.up.length > x.up.length;
+      const op = deeper ? c.up[x.up.length].sep : c.sep;
+      if (op === '&&' || op === '|') return true; // (a later stage of a pipeline belongs to the item whose operator was settled at its first stage)
+      if (op === '||' && !deeper && ['exit', 'return'].includes(c.argv[0]) && !c.pipe && !c.bg) return true;
+      if (op === '||' || x.cond) forget(x);
+      return false;
+    });
   };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
@@ -3087,11 +3096,8 @@ function evalString(str, startDir, ctx, level, child = false) {
     tick: () => checkDeadline(ctx.budget),
   });
   ctx.writeFrames.push(frame);
-  // the subshells open at the command being walked, outermost first: { id, dir, uncertain } as they were when it started (null: marks not trusted, see subshellsTrusted)
-  const subs = subshellsTrusted(cmds) ? [] : null;
-  let chdirBase; // (the list's own directory while one command runs in its wrapper's -C / --chdir directory)
-  let prevUp = []; // the levels that held the command before (see emit: up in shell-parse.mjs), and the directory each new-process text started in
-  const procDir = new Map();
+  const levels = trusted ? [] : null; // (the levels open at the command being walked, outermost first, see emit: up in shell-parse.mjs: { e: the level, dir: where this shell was when it opened, lost / state: a change in it that is certain })
+  let chdirBase;
   // #352 R6: the loops being walked, outermost first, each a frame: its range, the state at its entry, its carry (what its body may leave for the next iteration), the places its body can start in and
   // the carry each was judged with, and the walk state to start a pass from. A frame is finished when no start is left that was not judged with the carry as it is now.
   const loopsAt = loopRangesOf(cmds);
@@ -3108,7 +3114,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       // Where the body can end, replayed on its own cd / pushd / popd (the walk loses the directory at the command after a cd that is not chained with &&, which would make every body end in an unknown
       // one): the places its next iteration may start in. A move to a place not yet judged from is judged from there; a body that keeps moving (`cd ..`, a relative path that is not a fixed point) is
       // judged from at most 4 places and then from an unknown one. Marks not trusted, or a function / state hazard (no directory is known in any pass): no directory is followed.
-      const ends = hazard ? [] : subs ? loopEndDirs(cmds, fr, fr.passDir, ctx, cdp) : dir !== fr.passDir ? [null] : [];
+      const ends = hazard ? [] : trusted ? loopEndDirs(cmds, fr, fr.passDir, ctx, cdp) : dir !== fr.passDir ? [null] : [];
       for (const d of ends) {
         if (fr.dirs.includes(d)) continue;
         if (fr.dirs.length < MAX_LOOP_STARTS) fr.dirs.push(d);
@@ -3126,11 +3132,9 @@ function evalString(str, startDir, ctx, level, child = false) {
       fr.judged.set(nextDir, carrySize(fr.carry));
       fr.passDir = nextDir;
       loopReseed(ctx, fr.entry, fr.carry);
-      restore(nextDir === fr.at.dir ? fr.at : { dir: nextDir, uncertain: false, orChanged: false, lostDir: false });
+      restore(nextDir === fr.at.dir ? fr.at : { dir: nextDir, trackers: fr.at.trackers });
       chdirBase = undefined;
-      prevUp = [];
-      procDir.clear();
-      if (subs) subs.splice(0, subs.length, ...fr.subs.map((x) => ({ ...x })));
+      if (levels) levels.splice(0, levels.length, ...fr.levels.map((x) => ({ ...x }))); // (the places the levels it is in will give back are those of its entry, not of the pass that started here: R10-B1)
       i = fr.start;
       break;
     }
@@ -3138,20 +3142,26 @@ function evalString(str, startDir, ctx, level, child = false) {
     const c = cmds[i];
     if (chdirBase !== undefined) { dir = chdirBase; chdirBase = undefined; }
     const argv = c.argv;
-    if (subs) {
-      // Why: a cd inside a subshell ($( ), ( ), backticks, <( )) moves that subshell only: when it ends, the line goes on in the directory it had when the subshell
-      // started, whatever the commands are named (superpowers' task-brief finds its helper with `$(cd "$(dirname "$0")" && pwd)` and then goes on where it was).
-      // A branch switched in it is the repository's, so it stays switched, or unknown when the switch may not have run.
+    // Why: a cd inside a subshell ($( ), ( ), backticks, <( ), a text a new process runs: bash -c, a shell fed on stdin) moves that process only: when it ends, the line goes on in the directory it had when it started,
+    // whatever the commands are named (superpowers' task-brief finds its helper with `$(cd "$(dirname "$0")" && pwd)` and then goes on where it was). A branch switched in it is the repository's, so it stays switched,
+    // or unknown when the switch may not have run. A change in this shell's own level (a { } group, eval, source) is unknown after it: the level itself may not have run.
+    if (levels) {
       let k = 0;
-      while (k < subs.length && k < c.grp.length && subs[k].id === c.grp[k]) k++;
-      if (k < subs.length) {
-        if (flags.uncertain) for (const e of ctx.branches.values()) e.name = null;
-        restore(subs[k]);
-        subs.length = k;
+      while (k < levels.length && k < c.up.length && levels[k].e === c.up[k]) k++;
+      while (levels.length > k) {
+        const l = levels.pop();
+        const outer = levels[levels.length - 1];
+        if (l.e.kind === 'sub' || l.e.proc) { dir = l.dir; if (l.state) forgetBranches(); }
+        else if (l.e.kind === 'blk') { for (const x of trackers) if (x.scoped && x.up.includes(l.e)) forget(x); } // (a change in a branch / loop / function body: unknown once the body is left)
+        else {
+          if (l.lost) forgetState(); else if (l.state) forgetBranches();
+          if (outer) { outer.lost ||= l.lost; outer.state ||= l.state; }
+        }
       }
-      // (#352 R8-F2: what a subshell saves is the SETTLED state: the rule is applied for the operator before it first, so a state the subshell's own commands forget cannot be given back as certain)
-      for (; k < c.grp.length; k++) { settle(cmds.grpOps?.get(c.grp[k]) ?? { sep: ';', afterClose: false }); subs.push({ id: c.grp[k], ...snap() }); }
     }
+    if (hazard) forgetState();
+    settle(c); // (what a subshell saves is the SETTLED state: the rule is applied for the operator before it first, so a state the subshell's own commands forget cannot be given back as certain)
+    if (levels) for (let k = levels.length; k < c.up.length; k++) levels.push({ e: c.up[k], dir, lost: false, state: false });
     // (R7-F1: a loop's frame is taken once the subshells this command ends or opens are settled, above: the directory, the open subshells and the state it holds are what the loop's FIRST command starts with,
     // and what every further pass restarts from. Before it, a pass restored a subshell that had ended (`(true); for ...`) or lacked the one the loop is in (`( for ...; done ); push`).)
     for (const r of loopsAt.get(i) ?? []) {
@@ -3160,37 +3170,18 @@ function evalString(str, startDir, ctx, level, child = false) {
       const starts = memo?.dirs.get(r.id) ?? [];
       if (memo && !memo.dirs.has(r.id)) memo.dirs.set(r.id, starts);
       if (!starts.includes(dir)) { if (starts.length < MAX_LOOP_STARTS || !starts.length) starts.push(dir); else if (!starts.includes(null)) starts.push(null); }
-      const fr = { id: r.id, start: r.start, end: r.end, entry: loopEntry(ctx), carry: memo?.carries.get(r.id) ?? newLoopLeft(), at: snap(), dirs: starts, passDir: dir, judged: new Map(), passes: 1, subs: subs ? subs.map((x) => ({ ...x })) : [] };
+      const fr = { id: r.id, start: r.start, end: r.end, entry: loopEntry(ctx), carry: memo?.carries.get(r.id) ?? newLoopLeft(), at: snap(), dirs: starts, passDir: dir, judged: new Map(), passes: 1, levels: levels ? levels.map((x) => ({ ...x })) : [] };
       if (memo && !memo.carries.has(r.id)) memo.carries.set(r.id, fr.carry);
       if (carrySize(fr.carry)) loopMark(ctx, fr.carry); // (what the other readings of the loop word left: the body is judged from entry + that carry in this one as well)
       fr.judged.set(dir, carrySize(fr.carry));
       frames.push(fr);
     }
-    // (#352 R9: a text a new shell process runs (bash -c) leaves the directory it started in: a cd in it is lost when it ends)
-    const upNow = c.up ?? [];
-    // (a directory the text left unknown stays unknown: it did something the walk cannot follow, `bash -c 'cd() { :; }'`; with a state hazard on the line nothing is restored)
-    for (const e of prevUp) if (e.proc && !upNow.includes(e) && procDir.has(e)) { if (dir !== null && !hazard) dir = procDir.get(e); procDir.delete(e); }
-    if (hazard) forgetState();
-    settle(c);
-    for (const e of upNow) if (e.proc && !prevUp.includes(e) && !procDir.has(e)) procDir.set(e, dir);
-    prevUp = upNow;
-    // (#352 R8-B1: may this command not run, and did it change state? The first is decided here, once, for every kind of command; the second after it was judged, by comparing the git state before and after
-    // (stateMark / stateChanged), so a package script or a script file whose own judgement switched the branch counts like `git switch`. The words below are what the state does not show: a cd that stays where it was
-    // judged from, a git command that changes the checkout in a way the walk does not model.)
-    // `cd d || exit`: when the cd fails nothing after it runs, so the commands that do run see the change
-    const orExits = cmds[i + 1]?.sep === '||' && ['exit', 'return'].includes(cmds[i + 1].argv[0]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&';
-    // (c.depth > 0: a command of a `bash -c` / eval text runs only when that command does. A cd is also lost in a pipeline stage, but a script that ran in one still switched the repository's branch: that is for the words only.)
-    // (#352 R9-B1 R9-F1: a command of a `bash -c` / eval text or a substitution runs when EVERY command that holds the text does, under each one's operator: `true || bash -c 'cd d' && x`, `true || bash -c "bash -c 'cd d'" && x`.
-    // The ones that hold it come from the parser (c.up, outermost first), not from a search of the commands before it: a substitution's holder is emitted AFTER its commands. orChanged is the OR of its own operator and every one of them.)
-    const ups = c.up ?? [];
-    const head = pipeHead(cmds, i); // (the stages of a pipeline run under the operator before its first stage: `A=1 && x | y`)
-    const orOp = c.sep === '||' || head.sep === '||' || c.negated === true || (c.depth > 0 && c.ctl !== undefined && Object.values(c.ctl).some(Boolean)) || // (inside a text, a mark of its own: the && after the text is not chained to it)
-       ups.some((u) => u.sep === '||' || u.negated === true);
-    // (R9-F4: a pipeline a `&` ends is a background job whichever stage the change is in: the parser marks all its commands, nested ones included)
-    const mayNotRun = inFlow(from, i) || c.ctl?.cond === true || c.negated === true || c.depth > 0 || c.sep === '&&' || c.sep === '||' || head.sep === '&&' || head.sep === '||' || ups.some((u) => u.sep === '&&' || u.sep === '||' || u.negated === true) || c.bg === true || cmds[i + 1]?.sep === '&' || (orFollows(cmds, i) && !orExits);
-    const wordMayNotRun = mayNotRun || ranInSubshell(cmds, i);
-    const before = mayNotRun && argv.length ? stateMark(ctx) : null;
-    const changesStateWords = argv.length > 0 && (DIR_CHANGERS.includes(baseName(argv[0])) || (baseName(argv[0]) === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l')));
+    // (#352 R8-B1: did this command change state? Compared after it was judged: the git state before and after (stateMark / stateChanged), so a package script or a script file whose own judgement switched the branch counts like
+    // `git switch`. The words are what the state does not show: a cd that stays where it was judged from, a git command that changes the checkout in a way the walk does not model. R10: a cd of a command a wrapper started
+    // (`nohup cd d`, `env cd d`, find -exec cd) is that child's, and leaves this shell where it was.)
+    const childCd = c.spawn === true && argv.length > 0 && DIR_CHANGERS.includes(baseName(argv[0]));
+    const before = argv.length ? stateMark(ctx) : null;
+    const changesStateWords = argv.length > 0 && !childCd && (DIR_CHANGERS.includes(baseName(argv[0])) || (baseName(argv[0]) === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l')));
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
     // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)
     if (c.chdir !== undefined) { chdirBase = dir; dir = c.chdir === null || dir === null ? null : joinDir(dir, c.chdir, ctx); }
@@ -3207,6 +3198,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
     } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
+    else if (childCd) { /* the child's own directory */ }
     else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
     else if (name === 'git' || name === 'gh') {
       // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
@@ -3295,14 +3287,14 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (startupList.some((st) => !st.implicit)) withStartupScope(c, ctx, judgeRest); else judgeRest();
     }
     if (verdict && verdict.decision === 'deny') return verdict;
-    // (#352 R9 scan: an alias that a command which may not run (re)defined is unsure for every later use, as for a speculative candidate (judgeScopedIn): the use is refused, whatever the value the walk gave it)
-    if (before) for (const [kind, then, now] of [['git', before.git, ctx.gitAliases], ['gh', before.gh, ctx.ghAliases]]) for (const n of new Set([...Object.keys(then), ...Object.keys(now)])) if (then[n] !== now[n]) ctx.aliasUnsure.add(`${kind}:${n.toLowerCase()}`);
-    const wordChange = changesStateWords && wordMayNotRun;
-    if (wordChange || (mayNotRun && stateChanged(ctx, before))) {
-      flags.uncertain = true;
-      if (wordChange) flags.lostDir = true;
-      if (orOp || (wordChange && ranInSubshell(cmds, i))) flags.orChanged = true; // (a cd in a pipeline stage or a background job is lost: the && after it is not chained to it)
- // (a negated command: its && successor runs when it failed; R9: a negated pipeline or group, a command behind || at any level)
+    if (argv.length > 0 && (changesStateWords || stateChanged(ctx, before))) {
+      const how = certainChange(cmds, c, trusted);
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', scoped: how === 'chain', lost: changesStateWords, before };
+      if (how) {
+        trackers.push(x);
+        const top = levels?.[levels.length - 1];
+        if (top) { top.lost ||= x.lost; top.state = true; }
+      } else forget(x);
     }
     markPackageState(ctx.budget, [argv], { dirs: dir === null ? null : [dir], expand: (w) => expandVars(w, ctx), home: ctx.home, p: path }); // (what this command may change, for the package scripts after it)
     if (SOURCING.includes(name)) {
@@ -3323,28 +3315,14 @@ function evalString(str, startDir, ctx, level, child = false) {
   }
 }
 
-// (#352 R9, differential test: the status of a command passes on through the && that follow it, so `cd d && x || git push` runs the push when the cd failed. Nested commands (a substitution's, a text's, a subshell's) between are skipped.)
-function orFollows(cmds, i) {
-  const c = cmds[i];
-  for (let j = i + 1; j < cmds.length; j++) {
-    const x = cmds[j];
-    if (x.depth > c.depth || (x.grp.length > c.grp.length && c.grp.every((id, k) => x.grp[k] === id))) continue;
-    if (x.sep === '||') return true;
-    if (x.sep !== '&&' && x.sep !== '|') return false;
-  }
-  return false;
-}
-
-// (the first stage of the pipeline the command is a stage of: the command itself when it is none or the first; commands of texts and groups between the stages are skipped)
-function pipeHead(cmds, i) {
-  const c = cmds[i];
-  let h = c;
-  for (let j = i - 1; j >= 0 && h.sep === '|'; j--) {
-    const x = cmds[j];
-    if (x.depth > c.depth || x.grp.length > c.grp.length) continue;
-    h = x;
-  }
-  return h;
+// (#352 R10: the ONE rule for "is what this command changed (the directory, a branch, an alias, config) certain for the commands after it?", an ALLOWLIST: it is only when the command is at the top of its level (this
+// shell, or a text / subshell: what that level gives back when it ends is the level's own rule), not in a branch / loop / function body or a trap (ctl), not negated, not a stage of a pipeline, not in the
+// background (the whole and-or list a `&` ends), not started by a wrapper (spawn: the child's change), and not behind `||` (nor, with nothing before it but the line, behind anything but ; and &&: `cond`). What follows it
+// in its list is settled by evalString (settle): && keeps it, || forgets it, ; ends a conditional one. Marks not to be trusted: nothing is certain.
+// ('chain': it is in a branch / loop / function body or a trap but otherwise as above: the command chained to it with && sees it (`if x; then cd d && git push; fi`: it runs only when the change did), nothing else does)
+function certainChange(cmds, c, trusted) {
+  if (!trusted || cmds.ctlBroken || cmds.truncated || c.negated === true || c.bg === true || c.pipe === true || c.spawn === true || !(c.sep === ';' || c.sep === '&&' || c.sep === '&')) return null;
+  return Object.values(c.ctl).some(Boolean) ? 'chain' : 'certain';
 }
 
 // Why (#84): text too long to parse inside the time budget is refused whatever it says. Judging it by the guarded words it

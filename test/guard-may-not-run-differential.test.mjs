@@ -40,44 +40,69 @@ const pick = (xs) => xs[Math.floor(rnd() * xs.length)];
 const weighted = (pairs) => { let r = rnd() * pairs.reduce((s, p) => s + p[1], 0); for (const [v, w] of pairs) { r -= w; if (r < 0) return v; } return pairs[0][0]; };
 const OPS = [[';', 25], ['&&', 35], ['||', 25], ['&', 8]];
 const NOOPS = ['true', 'false', 'A=1', 'echo hi', 'cat'];
-const WRAPPERS = [['group', 12], ['sub', 12], ['subst', 8], ['bashc', 10], ['eval', 6], ['if', 9], ['while', 6], ['case', 5], ['not', 14], ['pipe', 14]];
+const WRAPPERS = [['group', 12], ['sub', 12], ['subst', 8], ['bashc', 10], ['eval', 6], ['if', 9], ['iftrue', 6], ['while', 6], ['loop', 6], ['case', 5], ['not', 14], ['pipe', 14], ['stdin', 9]];
+// (#352 R10: wrappers of a command: the ones that start a child process (what the command changes is the child's) and the ones that stay in this shell)
+const SPAWN = new Set(['nohup', 'env', 'nice', 'timeout 5', 'sudo', 'find']);
+const SPAWN_WORDS = ['nohup', 'env', 'nice', 'timeout 5', 'sudo'];
+const HOW = ['herestr', 'pipe', 'procsub', 'heredoc']; // (how a shell reads the text it runs: a here-string, stdin from a pipe, a process substitution, a heredoc)
+let quoted = 0; // (inside text a shell reads: no heredoc can be written there)
 
-// nodes: { t: 'change' | 'push' | 'noop', txt } | { t: 'list', items, ops } | { t: wrapper, body } | { t: 'not', body } | { t: 'pipe', stages }
+// nodes: { t: 'change' | 'push' | 'noop', txt } | { t: 'list', items, ops } | { t: wrapper, body } | { t: 'not', body } | { t: 'pipe', stages } | { t: 'wrap', w, leaf } | { t: 'stdin', how, body }
 const noop = () => ({ t: 'noop', txt: pick(NOOPS) });
+const leaf = (need) => (need === 'none' ? noop() : { t: need, txt: need });
 function genBody(need, depth) {
-  if (need === 'none') return { t: 'list', items: [noop()], ops: [] };
+  if (need === 'none') { // (a few commands that change nothing: the `;` inside a group, a branch, a text)
+    const items = [noop()];
+    const ops = [];
+    for (let k = rnd() * 3 | 0; k > 0; k--) { ops.push(weighted(OPS)); items.push(noop()); }
+    return { t: 'list', items, ops };
+  }
   const items = [];
   const ops = [];
   const add = (n) => { if (items.length) ops.push(weighted(OPS)); items.push(n); };
   if (rnd() < 0.25) add(noop());
   if (need === 'both') {
     if (depth < 2 && rnd() < 0.4) add(genWrapper('both', depth));
-    else { add(genItem('change', depth)); if (rnd() < 0.2) add(noop()); add(genItem('push', depth)); }
+    else {
+      add(genItem('change', depth));
+      if (rnd() < 0.45) add(depth < 2 && rnd() < 0.7 ? genWrapper('none', depth) : noop()); // (a middle item: a group, a branch, a text, a pipeline stage between the change and the push)
+      add(genItem('push', depth));
+    }
   } else add(genItem(need, depth));
   if (rnd() < 0.2) add(noop());
   return { t: 'list', items, ops };
 }
 function genItem(need, depth) {
-  if (depth >= 2 || rnd() < 0.3) return { t: need, txt: need };
+  if (need !== 'none' && rnd() < 0.1) { // a wrapper in front of the command
+    const w = need === 'change' && rnd() < 0.15 ? 'find' : pick([...SPAWN_WORDS, 'command', 'builtin']);
+    if (!(need === 'push' && w === 'builtin')) return { t: 'wrap', w, leaf: leaf(need) };
+  }
+  if (depth >= 2 || rnd() < 0.3) return need === 'change' && quoted === 0 && rnd() < 0.08 ? { ...leaf(need), hd: true } : leaf(need);
   return genWrapper(need, depth);
 }
 function genWrapper(need, depth) {
   const kind = weighted(WRAPPERS);
-  if (kind === 'not') return { t: 'not', body: depth >= 2 || rnd() < 0.5 ? (need === 'both' ? genWrapper('both', depth) : { t: need, txt: need }) : genWrapper(need, depth) };
+  if (kind === 'not') return { t: 'not', body: depth >= 2 || rnd() < 0.5 ? (need === 'both' ? genWrapper('both', depth) : leaf(need)) : genWrapper(need, depth) };
   if (kind === 'pipe' && need !== 'both') {
     const stages = rnd() < 0.5 ? [genItem(need, depth), noop()] : [noop(), genItem(need, depth)];
     return { t: 'pipe', stages };
   }
   if (kind === 'pipe') return { t: 'group', body: genBody('both', depth + 1) };
-  return { t: kind, body: genBody(need, depth + 1) };
+  const q = ['subst', 'bashc', 'eval', 'stdin'].includes(kind);
+  if (q) quoted++;
+  try {
+    const body = genBody(need, depth + 1);
+    return kind === 'stdin' ? { t: 'stdin', how: pick(quoted > 1 ? HOW.slice(0, 3) : HOW), body } /* (a heredoc only where no text a shell reads holds this one) */ : { t: kind, body };
+  } finally { if (q) quoted--; }
 }
 
 // ---- rendering ----
 const shq = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
 const OPTXT = { ';': '; ', '&&': ' && ', '||': ' || ', '&': ' & ' };
+const HD = []; // (the heredoc bodies of the line, written after its last line in the order the operators came)
 function render(n, kind) {
   switch (n.t) {
-    case 'change': return CHANGES[kind];
+    case 'change': return CHANGES[kind] + (n.hd ? heredoc('x') : '');
     case 'push': return PUSH_CMD;
     case 'noop': return n.txt;
     case 'list': return n.items.map((x, i) => (i ? OPTXT[n.ops[i - 1]] : '') + render(x, kind)).join('');
@@ -87,13 +112,35 @@ function render(n, kind) {
     case 'bashc': return `bash -c ${shq(render(n.body, kind))}`;
     case 'eval': return `eval ${shq(render(n.body, kind))}`;
     case 'if': return `if false; then ${render(n.body, kind)}; fi`;
+    case 'iftrue': return `if true; then ${render(n.body, kind)}; fi`;
     case 'while': return `while false; do ${render(n.body, kind)}; done`;
+    case 'loop': return `for x in a b; do ${render(n.body, kind)}; done`;
     case 'case': return `case x in x) ${render(n.body, kind)};; esac`;
     case 'not': return `! ${render(n.body, kind)}`;
     case 'pipe': return n.stages.map((x) => render(x, kind)).join(' | ');
+    case 'stdin': {
+      const body = render(n.body, kind);
+      if (n.how === 'herestr') return `bash <<< ${shq(body)}`;
+      if (n.how === 'pipe') return `echo ${shq(body)} | bash`;
+      if (n.how === 'procsub') return `bash <(echo ${shq(body)})`;
+      return `bash${heredoc(body)}`;
+    }
+    case 'wrap': {
+      const text = render(n.leaf, kind);
+      if (n.w === 'find') return `find . -exec ${text} ';'`;
+      return `${n.w === 'builtin' && !(n.leaf.t === 'change' && kind === 'cd') ? 'command' : n.w} ${text}`;
+    }
     default: throw new Error(n.t);
   }
 }
+function heredoc(body) { HD.push(body); return ` <<@${HD.length - 1}@`; }
+// (the delimiters are numbered in the order the operators stand in the text, and each body follows the last line in that order)
+const renderLine = (ast, kind) => {
+  HD.length = 0;
+  const text = render(ast, kind);
+  const order = [...text.matchAll(/<<@(\d+)@/g)].map((m) => Number(m[1]));
+  return text.replace(/<<@(\d+)@/g, (_, id) => `<<EOF${order.indexOf(Number(id))}`) + order.map((id, k) => `\n${HD[id]}\nEOF${k}`).join('');
+};
 
 // ---- the reference evaluator: the set of states the line can end a command in, each with the push's verdict so far ----
 // state: { sw: the branch was switched (the repository's), cd: this shell is in the other directory, bad: a push ran where neither holds, ok: the last status, fl: that status is the change's failure, not yet decided on by an && / || }
@@ -135,7 +182,13 @@ function evalNode(n, s, kind) {
     case 'list': return evalList(n, [s], kind);
     case 'group': case 'eval': return evalList(n.body, [s], kind);
     case 'case': return evalList(n.body, [s], kind);
-    case 'sub': case 'bashc': return evalList(n.body, [s], kind).map((r) => ({ ...r, cd: s.cd }));
+    case 'sub': case 'bashc': case 'stdin': return evalList(n.body, [s], kind).map((r) => ({ ...r, cd: s.cd }));
+    case 'iftrue': return evalList(n.body, [s], kind);
+    case 'loop': return flat(evalList(n.body, [s], kind).filter((r) => !r.fl), (r) => evalList(n.body, [r], kind)); // (`for x in a b` runs its body twice, the second time from what the first left; a failure the loop goes past is not modelled, as for a ;)
+    case 'wrap': { // (a child process: its cd is lost, a branch it switches stays; command / builtin run in this shell)
+      const r = evalNode(n.leaf, s, kind);
+      return SPAWN.has(n.w) && n.leaf.t === 'change' && kind === 'cd' ? r.map((x) => ({ ...x, cd: s.cd })) : r;
+    }
     case 'subst': return flat(evalList(n.body, [s], kind), (r) => both({ ...r, cd: s.cd }));
     case 'if': case 'while': return uniq([{ ...s, ok: true, fl: false }, ...evalList(n.body, [{ ...s, fl: false }], kind)]);
     case 'not': return evalNode(n.body, s, kind).map((r) => ({ ...r, ok: !r.ok }));
@@ -163,7 +216,7 @@ test('#400: the guard denies every generated line whose push can run without the
   for (let n = 0; n < LINES * 4 && checked < LINES; n++) {
     const kind = pick(['switch', 'cd', 'script']);
     const ast = genBody('both', 0);
-    const line = render(ast, kind);
+    const line = renderLine(ast, kind);
     if (seen.has(line)) continue;
     seen.add(line);
     checked++;
@@ -174,6 +227,10 @@ test('#400: the guard denies every generated line whose push can run without the
   const ms = Date.now() - t0;
   console.log(`# differential: ${checked} lines (seed ${SEED}), ${mustDeny} where the push can run without the change, ${checked - mustDeny} where it surely cannot; soundness failures: ${failures.length}; over-refusals: ${over.length}; ${ms} ms`);
   for (const l of over.slice(0, 3)) console.log(`#   over-refusal (allowed by the reference): ${l}`);
+  // (the generator must reach the shapes the rule was found wrong on: R10-F1 stdin / here-string / heredoc / process-substitution shells, F2 { } / if before ||, F3 a group stage, F4 a heredoc with & or |, #403 wrappers, a change in a loop)
+  for (const [name, re] of [['here-string', /bash <<< /], ['stdin pipe', /echo '.*' \| bash/], ['process substitution', /bash <\(echo/], ['heredoc shell', /bash <<EOF/], ['heredoc on a command', /(?:cd|git switch|npm run) [^\n]*<<EOF[^\n]*[|&]/], ['spawn wrapper', /(?:nohup|env|nice|timeout 5|sudo|find \.) /], ['transparent wrapper', /command |builtin /], ['loop', /for x in a b/], ['group before ||', /\{ [^\n]*; [^\n]*; \} \|\|/], ['if before ||', /fi \|\|/], ['group stage', /\{ [^\n]*; [^\n]* \} \|/]]) {
+    assert.ok([...seen].filter((l) => re.test(l)).length >= 5, `the generator should produce lines with: ${name}`);
+  }
   assert.ok(mustDeny > checked * 0.3 && checked - mustDeny > checked * 0.05, 'the generator should produce both kinds of line');
   assert.equal(failures.length, 0, `${failures.length} line(s) the guard allows but whose push can run without the change; first ${Math.min(SHOW, failures.length)}:\n${failures.slice(0, SHOW).join('\n')}`);
 });

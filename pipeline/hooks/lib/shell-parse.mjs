@@ -512,6 +512,7 @@ const WRAPPERS = {
   busybox: plain(),
 };
 
+const SHELL_OWN_WRAPPERS = new Set(['command', 'builtin', 'exec', 'noglob', 'nocorrect', 'time']);
 const PACKAGE_RUNNERS = new Set(['npx', 'bunx', 'pnpx', 'npm', 'pnpm', 'yarn']);
 function unwrap(argv) {
   const name = base(argv[0]);
@@ -2109,6 +2110,7 @@ class Parser {
     this.cmd = null; // the command object interpret() is working on
     this.comments = null; // [start, end] of each comment of this text, when asked for (see withoutComments)
     this.ctlFrom = []; // ctx.out length when each open construct opened
+    this.ctlUp = []; // the levels (ctx.up) before each construct opened
     this.ctlStack = []; // loops / function bodies / { groups open (see ctlOpen), for every nesting level of this text
     this.ctlBase = 0; // where the current level's entries start
     this.ctlNeg = []; // for each open construct: it was opened under a `!` (its commands are negated, see ctx.neg)
@@ -2131,7 +2133,7 @@ class Parser {
   // Parses text found inside this one (backticks, bash -c, eval, ...) as its own script at `depth`.
   // Returns the segments that parse interpreted (used to find what a substitution prints).
   // (hold: the levels that hold the text, see emit: up. While a command is being finished (finalize) it is that command's own, ctx.upHold; from the lexer, the current text's levels and the operator being read)
-  subParse(text, depth, hold = this.ctx.upHold ?? [...this.ctx.up, { sep: this.lexOp?.().sep ?? ';', negated: false }]) {
+  subParse(text, depth, hold = this.ctx.upHold ?? [...this.ctx.up, { sep: this.lexOp?.().sep ?? ';', kind: 'text' }]) {
     const ctx = this.ctx;
     if (depth > ctx.maxDepth) { ctx.truncated = true; return []; }
     const p = new Parser(ctx, text);
@@ -2189,7 +2191,7 @@ class Parser {
       body += c;
       this.i++;
     }
-    this.subAcc.push(...this.inGroup(() => this.subParse(body, depth + 1, this.ctx.up), undefined, true));
+    this.subAcc.push(...this.inGroup(() => this.subParse(body, depth + 1, this.ctx.up)));
     return s.slice(start, this.i);
   }
 
@@ -2296,7 +2298,7 @@ class Parser {
       try {
         // No terminator: either a malformed command or a `<<` we mistook for a heredoc that then swallowed the rest
         // of the line. Parsing the body as script costs a false positive at worst, never a miss.
-        if (!found) this.subParse(text, h.seg.depth + 1, [...h.seg.up, { sep: h.seg.sep, negated: segNeg(h.seg) }]);
+        if (!found) this.subParse(text, h.seg.depth + 1, [...h.seg.up, { sep: h.seg.sep, kind: 'text' }]);
         // An unquoted heredoc still expands $(...) and backticks, so a body can run commands. Quoted ones are inert data.
         else if (!h.quoted) this.scanExpansions(text, h.seg.depth);
       } finally { this.ctx.grp = grp; }
@@ -2468,7 +2470,7 @@ class Parser {
       else if (top?.st === 'in') { if (q < 0 && text === 'in') top.st = 'pat'; else { cs.pop(); this.ctlClose(['case']); } } // `case x {` (zsh) and the like: patterns read as commands (strict)
       else if (q < 0 && cmdPos && text === 'esac' && (top?.st === 'body' || top?.st === 'end')) { cs.pop(); seg.closesFrom = this.ctlClose(['case']); }
       else if (q < 0 && cmdPos && text === 'esac') ctx.ctlBroken = true; // (an esac with no case we opened: a prefix we do not model hid it)
-      else if (q < 0 && cmdPos && text === 'case') { cs.push({ st: 'subj' }); this.ctlOpen('case', segNeg(seg)); seg.ctl = { ...seg.ctl, cond: true }; }
+      else if (q < 0 && cmdPos && text === 'case') { cs.push({ st: 'subj' }); this.ctlOpen('case', segNeg(seg), seg); seg.ctl = { ...seg.ctl, cond: true }; }
       // loops, if / case branches and function bodies (see emit: ctl): `while`/`for`/... open a loop (its own words loop too), `done` closes one; `if`/`fi`, `case`/`esac` likewise; a `{` after `f()` (or
       // `function f`) opens a function body, any other command-position `{` a plain group; `}` closes the last of those
       // (`function NAME` -- after keywords or `time`, its `{` on this line or the next: every word up to the `{` / `(` is a name the text defines)
@@ -2476,15 +2478,15 @@ class Parser {
       if (q < 0 && cmdPos && text === 'function') seg.fnActive = true;
       else if (seg.fnActive && text !== '{') { fnName = true; ctx.fns.add(text); seg.fnHasName = true; }
       const fnKw = text === '{' && seg.fnActive === true && seg.fnHasName === true;
-      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop', segNeg(seg)); seg.ctl = { ...seg.ctl, loop: true }; seg.loops = this.ctx.loops; }
-      else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if', segNeg(seg)); seg.ctl = { ...seg.ctl, cond: true }; }
+      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop', segNeg(seg), seg); seg.ctl = { ...seg.ctl, loop: true }; seg.loops = this.ctx.loops; }
+      else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if', segNeg(seg), seg); seg.ctl = { ...seg.ctl, cond: true }; }
       else if (q < 0 && cmdPos && text === 'fi') seg.closesFrom = this.ctlClose(['if']);
       else if (q < 0 && cmdPos && text === 'done') seg.closesFrom = this.ctlClose(['loop']);
       else if (q < 0 && cmdPos && text === '}') seg.closesFrom = this.ctlClose(['fn', 'brace', 'cbrace']);
       else if (q < 0 && (cmdPos || fnKw) && text === '{') {
         // (a plain group after && / || runs only when that holds, and one that is a pipeline stage runs in a subshell: its commands may not run here -- review of #50)
         const kind = fnPending || fnKw ? 'fn' : ['&&', '||', '|'].includes(seg.sep) ? 'cbrace' : 'brace';
-        this.ctlOpen(kind, kind !== 'fn' && segNeg(seg));
+        this.ctlOpen(kind, kind !== 'fn' && segNeg(seg), seg);
         if (kind === 'fn') seg.ctl = { ...seg.ctl, fn: true }; // (the body's first command is in this segment: `{ echo x > f; }`)
         if (kind === 'cbrace') seg.ctl = { ...seg.ctl, cond: true };
       }
@@ -2822,10 +2824,13 @@ class Parser {
     const up = this.ctx.up;
     const upHold = this.ctx.upHold;
     this.ctx.up = seg.up; // (and in the texts that hold it; the text it holds is held by it too: see subParse)
-    this.ctx.upHold = [...seg.up, { sep: seg.sep, negated: segNeg(seg) }];
+    this.ctx.upHold = [...seg.up, { sep: seg.sep, kind: 'text' }];
     try {
       const out0 = this.ctx.out.length;
       this.finalizeSeg(seg);
+      // (#352 R10: every command of a pipeline (the stages, and what they hold) is marked: a change in one is its subshell's. A stage is marked when the stage after it is finished)
+      seg.span = [out0, this.ctx.out.length];
+      for (const s of seg.sep === '|' ? [seg, ...(seg.pipedFrom ?? [])] : []) if (s.span) for (const c of this.ctx.out.slice(...s.span)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true });
       if (seg.afterClose && this.ctx.out.length === out0) this.ctx.owedClose = { grp: seg.grp, depth: seg.depth }; // (it emitted nothing: the mark waits for the next command of ITS level, see emit)
     } catch {
       // never lose the command to an unexpected failure: report its words as written and say we were cut short
@@ -2836,8 +2841,12 @@ class Parser {
   }
 
   // A loop / function body / plain `{` group opens at this nesting level (closed by ctlClose, or when the level ends: see parseList).
-  ctlOpen(kind, neg = false) {
+  ctlOpen(kind, neg = false, seg = null) {
     this.ctlStack.push(kind);
+    // (#352 R10: every construct is a level of its own (up): its commands run under the operator of the construct, whatever `;` they are separated by inside it)
+    this.ctlUp.push(this.ctx.up);
+    this.ctx.up = [...this.ctx.up, { sep: seg ? seg.sep : this.lexOp().sep, kind: kind === 'brace' ? 'brace' : 'blk' }];
+    if (seg) seg.up = this.ctx.up;
     this.ctlFrom.push(this.ctx.out.length);
     this.ctlNeg.push(neg);
     this.ctlPS.push(this.pipeStart);
@@ -2848,6 +2857,7 @@ class Parser {
 
   popCtl() {
     const kind = this.ctlStack.pop();
+    this.ctx.up = this.ctlUp.pop();
     this.ctlFrom.pop();
     this.ctlPS.pop();
     if (this.ctlNeg.pop()) this.ctx.neg--;
@@ -2894,9 +2904,8 @@ class Parser {
   // (#352 R8-F2: op = the operator that came before the subshell, { sep, afterClose }: a walk applies the may-not-run rule for it when it enters the subshell, so what it saves is settled.
   // A substitution takes the operator of the command it is in (lexOp); anything else, none known: `;`, which trusts nothing.)
   // (holds: a substitution, which runs under the operator of the command it is in: its commands carry that operator, see emit: up. R9-F2: a may-skip mark still owed at this level is part of the operator)
-  inGroup(fn, opIn, holdsIn) {
+  inGroup(fn, opIn) {
     let op = opIn ?? this.lexOp?.() ?? { sep: ';', afterClose: false };
-    const holds = holdsIn ?? opIn === undefined;
     const saved = this.ctx.grp;
     const savedUp = this.ctx.up;
     const id = ++this.ctx.grpN;
@@ -2904,7 +2913,7 @@ class Parser {
     if (op.sep === '&&' && !op.afterClose && owed && relLevel(owed, saved, owed.depth) === 'same') op = { sep: op.sep, afterClose: true };
     this.ctx.grp = [...saved, id];
     this.ctx.grpOps.set(id, op);
-    if (holds) this.ctx.up = [...savedUp, { sep: op.sep, negated: false }];
+    this.ctx.up = [...savedUp, { sep: op.sep, kind: 'sub' }];
     try { return fn(); } finally { this.ctx.grp = saved; this.ctx.up = savedUp; }
   }
 
@@ -3006,6 +3015,7 @@ class Parser {
     let chdir = chdir0 !== undefined ? chdir0 : this.ctx.chdirInherit !== undefined ? null : undefined;
     let fan = null; // the xargs / parallel that built this command from stdin text
     const runnerDirs = [];
+    let spawn = isExec; // (#352 R10-F6: a wrapper that starts a child process (env, nohup, nice, timeout, sudo, xargs ...), find -exec, a launcher: what the command changes is the child's; command / builtin / exec / noglob / nocorrect / time stay this shell's)
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
     for (let guard = 0; guard < 32 && a.length; guard++) {
       const un = unwrap(a);
@@ -3019,6 +3029,7 @@ class Parser {
         }
       }
       if (!fan && (base(a[0]) === 'xargs' || base(a[0]) === 'parallel')) fan = a;
+      if (!SHELL_OWN_WRAPPERS.has(base(a[0]))) spawn = true;
       if (un.chdir !== undefined) chdir = chdir === undefined && typeof un.chdir === 'string' ? un.chdir : null;
       // the other readings of an `env` option not understood (unwrapEnv `alts`), judged too; their environment is unsure (no GH_REPO / GH_HOST
       // is read from it). More than ALT_CAP on one line gives up: truncated, which the guards deny.
@@ -3048,6 +3059,7 @@ class Parser {
     if (headDyn) this.ctx.dynamicHead = true; // (kept apart from the other causes of ctx.dynamic: see dynamicOther in simpleCommands)
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
     if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
+    if (cmd && spawn) Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
     if (cmd && (seg.negated || segNeg(seg))) Object.defineProperty(cmd, 'negated', { value: true, enumerable: false }); // (#352 R8: see git-policy's may-not-run rule)
     if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
@@ -3214,6 +3226,12 @@ class Parser {
     return exact && words.every((w) => seg.meta.has(w));
   }
 
+  // (#352 R10-F1: the texts a command holds run in a NEW process, whatever way they reach it (-c, stdin, a here-string, a heredoc, <( ), a tmux / watch / pwsh / cmd text): what they cd is lost when they end. eval, source and a trap run in this shell)
+  markProc() {
+    const hold = this.ctx.upHold;
+    if (hold) hold[hold.length - 1].proc = true;
+  }
+
   runScript(seg, words, text, depth) {
     // Why: `eval "$(cat f)"`: the script is f's text, judged as it is (noteWords); read again, the text `$(cat f)` would be a command word, which is split (scanned)
     if (this.noteWords(seg, words, depth, true)) return;
@@ -3246,6 +3264,7 @@ class Parser {
   }
 
   tmux(argv, seg, depth) {
+    this.markProc();
     let i = 1;
     while (i < argv.length && argv[i].length > 1 && argv[i][0] === '-') { // global options; -c runs a shell command
       if (argv[i] === '-c' && argv[i + 1] !== undefined) this.runScript(seg, [argv[i + 1]], argv[i + 1], depth);
@@ -3313,7 +3332,8 @@ class Parser {
     const depth = seg.depth + 1;
     if (SHELLS.has(name)) {
       const r = shellInvocation(argv);
-      if (r.kind === 'script') { this.ctx.upHold[this.ctx.upHold.length - 1].proc = true; this.runScript(seg, [r.text], r.text, depth); } // (#352 R9: a new process: what it cds is lost when it ends; eval, source and a trap run in this shell)
+      this.markProc();
+      if (r.kind === 'script') this.runScript(seg, [r.text], r.text, depth);
       else if (r.kind === 'stdin') this.runStdin(seg, depth);
       else if (r.kind === 'file' && isProcSub(r.text)) this.runProcessSub(seg, r.text, depth);
       else if (r.kind === 'file' && FD_PATH.test(r.text)) this.runFd(seg, r.text);
@@ -3342,12 +3362,12 @@ class Parser {
       }
     } else if (name === 'watch') {
       const i = skipOpts(argv, 1, 'n', ['--interval']);
-      if (i < argv.length) this.runScript(seg, argv.slice(i), argv.slice(i).join(' '), depth); // watch runs its args via sh -c
+      if (i < argv.length) { this.markProc(); this.runScript(seg, argv.slice(i), argv.slice(i).join(' '), depth); } // watch runs its args via sh -c
     } else if (name === 'tmux') {
       this.tmux(argv, seg, depth);
     } else if (name === 'pwsh' || name === 'powershell') {
       const text = pwshInvocation(argv);
-      if (text) this.runScript(seg, argv.slice(1), text, depth);
+      if (text) { this.markProc(); this.runScript(seg, argv.slice(1), text, depth); }
     } else if (name === 'iex' || name === 'invoke-expression') {
       const words = argv.slice(1).filter((w) => !/^-c(o(m(m(a(n(d)?)?)?)?)?)?$/i.test(w));
       if (words.length) this.runScript(seg, words, words.join(' '), depth);
@@ -3355,7 +3375,7 @@ class Parser {
       this.startLauncher(argv, seg, name);
     } else if (name === 'cmd') {
       const text = cmdInvocation(argv);
-      if (text) this.runScript(seg, argv.slice(1), text, depth);
+      if (text) { this.markProc(); this.runScript(seg, argv.slice(1), text, depth); }
     } else if (name === 'find') {
       for (const sub of findExecs(argv)) this.process(sub, {}, seg, true);
     }

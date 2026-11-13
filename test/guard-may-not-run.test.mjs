@@ -83,7 +83,8 @@ test('#352 R8-F1: a NAME=value segment after the closer of a construct that may 
   denies('a switch: fi && A=1 &&', 'if false; then ' + RESET + '; fi && A=1 && ' + SHIP);
   denies('fi && A=1 && B=2 &&', 'if false; then cd /work/other2; fi && A=1 && B=2 && ' + SHIP);
   allows('twin: a plain chain with an assignment', 'cd /work/other2 && A=1 && ' + SHIP);
-  allows('twin: a construct that cannot skip, then an assignment', '{ cd /work/other2; } && A=1 && ' + SHIP);
+  denies('twin (R10: a change in a { } group is unknown after it): a construct that cannot skip, then an assignment', '{ cd /work/other2; } && A=1 && ' + SHIP);
+  allows('twin: the cd outside the group', 'cd /work/other2 && { A=1; } && A=1 && ' + SHIP);
 });
 
 test('#352 R8-F2: a subshell between an uncertain change and && does not give the change back as certain', () => {
@@ -99,7 +100,8 @@ test('#352 R8-F2: a subshell between an uncertain change and && does not give th
   allows('twin: cd d && (true) &&', 'cd /work/other2 && (true) && ' + SHIP);
   allows('twin: cd d && (true) && (true) &&', 'cd /work/other2 && (true) && (true) && ' + SHIP);
   allows('twin: cd d && echo $(true) &&', 'cd /work/other2 && echo $(true) && ' + SHIP);
-  denies('as before: a switch && (true) && (the subshell forgets a branch the line switched)', RESET + ' && (true) && ' + SHIP);
+  allows('R10: a switch at the top of the line, && (true) &&: the switch is certain, and a subshell that changes nothing gives nothing back', RESET + ' && (true) && ' + SHIP);
+  denies('a switch in the subshell is unknown after it', '(' + RESET + ') && ' + SHIP);
 });
 
 test('#352 R8 adjacent shapes: negation, a text run by bash -c under ||, a pipeline stage, a subshell around a script keep or gain the right verdict', () => {
@@ -111,8 +113,8 @@ test('#352 R8 adjacent shapes: negation, a text run by bash -c under ||, a pipel
   denies('case, esac && (true) &&', 'case $x in a) cd /work/other2;; esac && (true) && ' + SHIP);
   denies('case, esac && A=1 &&', 'case $x in a) cd /work/other2;; esac && A=1 && ' + SHIP);
   denies('a script in a subshell, ;', '(npm run reset); ' + SHIP, HERE);
-  allows('twin: bash -c switch &&', "bash -c 'git switch agent/x' && " + SHIP);
-  allows('twin: a script in a pipeline stage still switched the branch', 'npm run reset | cat; ' + SHIP, HERE);
+  denies('R10: a switch in a bash -c text is unknown after it (the text is a process of its own)', "bash -c 'git switch agent/x' && " + SHIP);
+  denies('R10: a change in a pipeline stage is unknown after it', 'npm run reset | cat; ' + SHIP, HERE);
   allows('twin: a nested subshell with a cd behind ||, then a switch', '( (true || cd /safe) ); ' + RESET + ' && ' + SHIP);
   allows('twin: cd d && A=$(true) &&', 'cd /work/other2 && A=$(true) && ' + SHIP);
 });
@@ -127,8 +129,8 @@ test('#352 R9-B1 R9-F1: a text run by bash -c / eval / $( ) keeps its own || and
   denies('a substitution with || inside, after another command', `git status; echo $(true || git switch agent/x && ${SHIP})`);
   denies('a substitution behind ||', `true || echo $(git switch agent/x) && ${SHIP}`);
   denies('a substitution holder with a bash -c inside', `git status; echo $(bash -c 'true || git switch agent/x && ${SHIP}')`);
-  allows('twin: two levels of bash -c chained with &&', `bash -c "bash -c 'git switch agent/x'" && ${SHIP}`);
-  allows('twin: two levels of eval chained with &&', `eval "eval 'git switch agent/x'" && ${SHIP}`);
+  denies('R10: two levels of bash -c: unknown after them', `bash -c "bash -c 'git switch agent/x'" && ${SHIP}`);
+  denies('R10: two levels of eval: unknown after them', `eval "eval 'git switch agent/x'" && ${SHIP}`);
   allows('twin: a text with && inside', `bash -c 'git switch agent/x && ${SHIP}'`);
 });
 
@@ -147,14 +149,14 @@ test('#352 R9-F3: a negation covers the whole negated pipeline or group', () => 
   denies('! { a; switch; } &&', `! { git status; git switch agent/x; } && ${SHIP}`);
   denies('! (switch) &&', `! (git switch agent/x) && ${SHIP}`);
   denies('! cd | cat &&', `! cd /work/other2 | cat && ${SHIP}`);
-  allows('twin: { cd; } &&', `{ cd /work/other2; } && ${SHIP}`);
+  denies('R10: { cd; } &&: a change in a group is unknown after it', `{ cd /work/other2; } && ${SHIP}`);
 });
 
 test('#352 R9-F4: a pipeline that ends in & is a background job, whichever stage the change is in', () => {
   denies('npm run | cat &', `npm run reset | cat & ${SHIP}`, HERE);
   denies('switch | cat &', `git switch agent/x | cat & ${SHIP}`);
   denies('cat | npm run &', `cat x | npm run reset & ${SHIP}`, HERE);
-  allows('twin: npm run | cat ;', `npm run reset | cat; ${SHIP}`, HERE);
+  denies('R10: npm run | cat ; (a change in a pipeline stage is unknown after it)', `npm run reset | cat; ${SHIP}`, HERE);
 });
 
 test('#352 R9 scan (ii): an alias defined where it may not run is unsure for every later use', () => {
@@ -185,7 +187,7 @@ test('#400 differential: a failure that && passes on reaches a later ||; a cd in
   denies('a pipeline stage behind &&', `A=1 && false | npm run reset; ${SHIP}`, HERE);
   denies('a bash -c cd in a loop, then &&', `while false; do bash -c 'cd /work/other2; false'; done && ${SHIP}`);
   allows('twin: the cd and the push in one bash -c text', `bash -c 'cd /work/other2 && ${SHIP}'`);
-  allows('twin: eval runs in this shell, its cd stays', `eval 'cd /work/other2' && ${SHIP}`);
+  denies('R10: eval: a change in a text is unknown after it', `eval 'cd /work/other2' && ${SHIP}`);
 });
 
 // (#352 R10: the rule is an ALLOWLIST. A change counts as certain for the commands after it only when it is at the top of the line (or of the text it is in), not in a group / branch / loop /
