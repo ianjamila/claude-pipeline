@@ -146,7 +146,7 @@ function ciExplicitlyEmpty(root) {
 // ---- refs, hashes -------------------------------------------------------------------------------
 
 // The default branch the gate anchors on: what the remote calls its default (origin/HEAD), else config.default_branch (git.mjs#anchorBranch; #369).
-const anchorOf = (root, config) => anchorBranch(config.default_branch, { cwd: root });
+export const anchorOf = (root, config) => anchorBranch(config.default_branch, { cwd: root });
 
 // `refs/remotes/origin/<default>` when the remote ref exists (the PR's real base), else the local default branch.
 export const baseRefFor = (root, config) => reviewBaseRef(anchorOf(root, config), { cwd: root });
@@ -199,9 +199,12 @@ function prOpenCheck({ info, head, root, config, behind = null, queueMode = fals
   if (info.headRefOid !== head) problems.push(`PR head ${short(info.headRefOid)} is not the local HEAD ${short(head)}`);
   // Branch protection is not strict (spec 6.6), so GitHub will merge a PR that is behind its base: that would land code on a
   // base nobody verified it against. The branch must be updated (and re-verified) first.
-  if (behind && !queueMode) problems.push(`behind-base: ${behind}; update the branch from ${branch} and re-verify before merging`);
+  let baseProblem = false;
+  if (behind && !queueMode) { problems.push(`behind-base: ${behind}; update the branch from ${branch} and re-verify before merging`); baseProblem = true; }
   // The hard-stop, integrity and review diffs are taken against the default branch; any other base would be judged on the wrong diff.
-  if (info.baseRefName !== branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${branch}`);
+  if (info.baseRefName !== branch) { problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${branch}`); baseProblem = true; }
+  // The branch named above came from origin/HEAD, not from pipeline.yml: say so (and how to repoint a stale one) when the two differ, or the refusal reads as a contradiction (#369).
+  if (baseProblem && branch !== config.default_branch) problems.push(`${JSON.stringify(branch)} is the default branch origin/HEAD names (pipeline.yml says default_branch ${JSON.stringify(config.default_branch)}; origin/HEAD wins); if origin/HEAD is stale, run \`git remote set-head origin -a\``);
   return problems.length ? check('pr-open', false, problems.join('; ')) : check('pr-open', true, `open at ${short(head)}`);
 }
 

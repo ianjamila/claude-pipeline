@@ -146,6 +146,17 @@ test('final-gate pr-open: the PR base must be the remote default branch, and the
   const detail = named(r.json, 'pr-open').detail;
   assert.match(detail, /behind-base: .*; update the branch from develop and re-verify/);
   assert.doesNotMatch(detail, /PR base is/, 'a PR on the remote default branch has the right base');
+  // the refusal says where develop came from and how to repoint a stale origin/HEAD (R1-F1)
+  assert.match(detail, /"develop" is the default branch origin\/HEAD names \(pipeline\.yml says default_branch "main"; origin\/HEAD wins\).*git remote set-head origin -a/);
+  assert.match(named(bad.json, 'pr-open').detail, /origin\/HEAD names.*git remote set-head origin -a/);
+});
+
+test('final-gate pr-open: with no origin/HEAD (or one that agrees with pipeline.yml) the refusal carries no origin/HEAD note', (t) => {
+  const s = scenario({ gh: { base: 'release' } }); // no origin/HEAD in the fixture: the anchor is the config's main
+  t.after(() => s.repo.cleanup());
+  const detail = named(s.gate().json, 'pr-open').detail;
+  assert.match(detail, /PR base is "release", not main/);
+  assert.doesNotMatch(detail, /origin\/HEAD|set-head/);
 });
 
 test('final-gate ci proof: the deferral settings come from the anchor branch\'s config (fetched), not config.default_branch\'s', async () => {
