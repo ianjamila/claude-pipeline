@@ -170,3 +170,4 @@ full record.
 - 2026-11-13 · #416 · Implementer: stop and report when the pipeline guard blocks a command · risk low · rounds 1 · arbiter 0 · awaiting-owner-merge
 - 2026-11-13 · #326 · Stand-in reviewer when Codex is out of quota, plus cheaper Codex rounds (#256) · risk high · rounds 22 · arbiter 20 · awaiting-owner-merge
 - 2026-11-13 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 15 · arbiter 14 · blocked
+- 2026-11-13 · #422 · Merge preview shows the items digest the real merge checks; hermetic gate-CLI tests (#417) · risk high · rounds 1 · arbiter 0 · blocked
