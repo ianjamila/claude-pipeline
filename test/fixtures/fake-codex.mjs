@@ -5,6 +5,8 @@
 //   FAKE_CODEX_TURN_FAILED=<msg>  print Codex's --json failure events on stdout (thread.started, turn.started, turn.failed {error:{message}}):
 //                              the only place the pipeline reads a failure reason from (stderr never decides quota)
 //   FAKE_CODEX_STDOUT=<file>   print that file's bytes on stdout first (a captured --json stream); FAKE_CODEX_THREAD_ID overrides the id above
+//   FAKE_CODEX_FAIL_ONCE=<f>   when <f> does not exist yet, create it and fail this run at once (exit 1, the FAKE_CODEX_TURN_FAILED events); later runs behave
+//                              normally (FAKE_CODEX_TURN_FAILED is then ignored)
 //   FAKE_CODEX_SIGNAL=<sig>    after printing, kill this process with that signal (a run killed from outside)
 //   FAKE_CODEX_HANG_ONCE=<f>   hang (until the timeout kills it) when <f> does not exist yet, creating it; later runs behave normally
 //   FAKE_CODEX_NO_WRITE=1      exit 0 without writing the output file (a run that "succeeded" but produced nothing)
@@ -25,6 +27,13 @@ for await (const chunk of process.stdin) stdin += chunk;
 
 if (process.env.FAKE_CODEX_CAPTURE) {
   appendFileSync(process.env.FAKE_CODEX_CAPTURE, `${JSON.stringify({ argv, stdin })}\n`);
+}
+
+if (process.env.FAKE_CODEX_FAIL_ONCE && !existsSync(process.env.FAKE_CODEX_FAIL_ONCE)) {
+  writeFileSync(process.env.FAKE_CODEX_FAIL_ONCE, 'failed');
+  const id = process.env.FAKE_CODEX_THREAD_ID || '01a1c97d-8cee-7c50-83a7-9994cab1b194';
+  for (const e of [{ type: 'thread.started', thread_id: id }, { type: 'turn.started' }, { type: 'turn.failed', error: { message: process.env.FAKE_CODEX_TURN_FAILED ?? '' } }]) writeSync(1, `${JSON.stringify(e)}\n`);
+  process.exit(1);
 }
 
 if (process.env.FAKE_CODEX_DURING) {
@@ -48,7 +57,7 @@ if (process.env.FAKE_CODEX_HANG) {
 }
 
 if (process.env.FAKE_CODEX_STDOUT) writeSync(1, readFileSync(process.env.FAKE_CODEX_STDOUT));
-if (process.env.FAKE_CODEX_TURN_FAILED) {
+if (process.env.FAKE_CODEX_TURN_FAILED && !process.env.FAKE_CODEX_FAIL_ONCE) {
   const id = process.env.FAKE_CODEX_THREAD_ID || '01a1c97d-8cee-7c50-83a7-9994cab1b194';
   for (const e of [{ type: 'thread.started', thread_id: id }, { type: 'turn.started' }, { type: 'turn.failed', error: { message: process.env.FAKE_CODEX_TURN_FAILED } }]) writeSync(1, `${JSON.stringify(e)}\n`);
 }
