@@ -228,7 +228,7 @@ export const run = guarded(async (argv, ctx) => {
   // Risk and light lane describe the whole PR (merge base..head), whatever slice this round reviews. A later round can
   // only take a PR off the light lane, never put it on.
   // The rating is worked out under the working-tree config AND the one committed at the default branch's fork point, stricter wins (risk.mjs#rateBranch).
-  const rated = await rateBranch({ root, head, config, defaultBranch: config.default_branch, prBase, base: forkPoint });
+  const rated = await rateBranch({ root, head, config, prBase, base: forkPoint });
   const { level } = rated;
   const lane = { reviewer: rated.reviewer, reasons: rated.laneReasons, sensitivePaths: rated.sensitivePaths };
   // The reviewer after Codex: a PR that was ever reviewed by Fable stays with Fable (a later round can only escalate), and a

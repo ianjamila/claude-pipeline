@@ -14,14 +14,13 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
-import { baseConfigAt } from '../lib/config.mjs';
 import { git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
 import { askSummary } from '../lib/round-ask.mjs';
-import { gatherRoundStatus, reviewedDiff } from '../lib/round-status.mjs';
+import { gatherRoundStatus, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
@@ -681,21 +680,10 @@ async function roundRequest(rest, ctx) {
   }, pr));
 }
 
-// The config committed at the default branch's fork point (the trusted one rateBranch also reads), for the union of the sensitive-path lists: a PR must not shrink its own list.
-// -> { config, problem }: unreadable gives config null (its lists count as empty, nothing is loosened) and says why.
-function trustedBaseConfig(root, config) {
-  try {
-    const base = baseConfigAt(mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root }), root);
-    return base.ok ? { config: base.config, problem: null } : { config: null, problem: base.reason };
-  } catch (err) {
-    return { config: null, problem: String(err?.message ?? err).split('\n')[0].slice(0, 160) };
-  }
-}
-
 // The display fields of the ask. `grants` is the same lookup the admission check used (any head); `grantGap` says why it found nothing ('provenance' = a record exists that cannot be
 // confirmed as the owner's). A lookup that fails here degrades to a warning and the extra-round recommendation: it never loses the ask (`defer-fixes` itself refuses on it).
 function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, warnings }) {
-  const { rounds, cost, diff, since, open, notClean } = gatherRoundStatus({ root, config, state, pr, gh, warnings });
+  const { rounds, cost, diff, since, open, notClean, trusted } = gatherRoundStatus({ root, config, state, pr, gh, warnings });
   let follow;
   try {
     const readable = (lookup) => (ordinal) => {
@@ -707,11 +695,10 @@ function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, w
         throw err;
       }
     };
-    const trusted = trustedBaseConfig(root, config);
     if (trusted.problem) {
       // `defer-fixes` refuses on this (severity cannot be judged without the trusted lists), so the ask must not offer the path it would then refuse.
       const refusal = `severity could not be judged: the trusted base config is unreadable (${asciiLine(trusted.problem, 120)})`;
-      warnings.push(refusal);
+      if (!warnings.some((w) => w.startsWith(refusal))) warnings.push(refusal); // (gatherRoundStatus already said it when it showed the open items as high)
       follow = { eligible: false, refusals: [refusal], ids: [], severities: [] };
     } else {
       follow = deferEligibility(state, config, diff.files, { grants: readable(grants), grantGap: readable(grantGap), baseConfig: trusted.config });
