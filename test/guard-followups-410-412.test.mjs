@@ -21,7 +21,6 @@ describe('#410: a cd whose only || alternative leaves the shell surely succeeded
   decide('allow', [
     ['cd X || exit 1, write on the next line', `${P} || exit 1\nfind . -delete`],
     ['cd X || exit, write after ;', `${P} || exit; find . -delete`],
-    ['cd X || return 1, write on the next line', `${P} || return 1\nfind . -delete`],
     ['cd X || exit 1 && write', `${P} || exit 1 && find . -delete`],
     ['a join before the cd does not matter', `true && ${P} || exit 1\nfind . -delete`],
     ['a subshell entered by ||', '[ -d x ] || (cd /home/u/proj && find . -delete)'],
@@ -40,6 +39,23 @@ describe('#410: a cd whose only || alternative leaves the shell surely succeeded
     ['a subshell entered by ||: a write after the ) is read against every directory', '[ -d x ] || (cd /home/u/proj && true); find . -delete'],
     ['a cd inside the || subshell does not leak out of it', 'true || (cd /home/u/proj); find . -delete'],
     ['cd to the home itself still reaches home', `cd /home/u || exit 1\nfind . -delete`],
+    // R1-B1 (Codex round 1): a top-level `return` is an error and the shell goes on (only a function or a sourced file leaves), so it is no exit
+    ['cd X || return 1 (a top-level return does not leave)', `${P} || return 1\nfind . -delete`],
+    ['set +e; cd /missing || return 1; find . -delete', 'set +e; cd /missing || return 1; find . -delete'],
+    ['cd X || { …; return 1; }', `${P} || { echo no; return 1; }; find . -delete`],
+    // R1-B2: a failed redirection keeps the exit from running, so the shell goes on after the failed cd
+    ['set +e; cd /missing || exit 1 < /missing; find . -delete', 'set +e; cd /missing || exit 1 < /missing; find . -delete'],
+    ['cd X || exit 1 2>/dev/null (a redirection on the exit)', `${P} || exit 1 2>/dev/null\nfind . -delete`],
+    ['cd X || { exit 1; } < /missing (a redirection on the group)', `${P} || { exit 1; } < /missing; find . -delete`],
+    ['the same with the set +e of the report', 'set +e; cd /missing || { exit 1; } < /missing; find . -delete'],
+    ['cd X || { echo e; exit 1 < /missing; } (a redirection on the exit inside the group)', `${P} || { echo e; exit 1 < /missing; }; find . -delete`],
+    ['cd X || { exit 1; } 2>/dev/null (a redirection after the closer)', `${P} || { exit 1; } 2>/dev/null; find . -delete`],
+  ]);
+  decide('allow', [
+    // (the everyday shapes keep narrowing: a redirection on the echo is not one on the exit or the group)
+    ['cd ~/Claude/proj || exit 1; npm test (the report\'s everyday shape)', 'cd ~/Claude/proj || exit 1; npm test'],
+    ['cd X || { echo "no dir" >&2; exit 1; }; npm test', 'cd ~/Claude/proj || { echo "no dir" >&2; exit 1; }; npm test'],
+    ['the same, a write after it', `${P} || { echo "no dir" >&2; exit 1; }; find . -delete`],
   ]);
 });
 

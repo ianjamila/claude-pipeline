@@ -145,12 +145,13 @@ describe('cd X || { …; exit 1; } narrows what follows (everyday shape, as cd X
     ['a find -delete after it (a relative write from the home would reach the protected folders)', `${P} || { echo "no dir"; exit 1; }; find . -delete`, HOMECWD],
     ['a group on several lines', `${P} || {\n  echo "no dir"\n  exit 1\n}\nfind . -delete`, HOMECWD],
     ['exit alone in the group', `${P} || { exit 1; }; find . -delete`, HOMECWD],
-    ['return in the group', `${P} || { echo no; return 1; }; find . -delete`, HOMECWD],
     ['joined by && after the group', `${P} || { echo no; exit 1; } && find . -delete`, HOMECWD],
     ['a cd inside the group only runs when the first failed, and then leaves', `${P} || { cd /home/u; exit 1; }; find . -delete`, HOMECWD],
     ['two messages before the exit', `${P} || { echo a; echo b; exit 2; }; find . -delete`, HOMECWD],
   ]);
   decide('deny', [
+    ['return in the group (R1-B1: a top-level return does not leave the shell)', `${P} || { echo no; return 1; }; find . -delete`, HOMECWD],
+    ['a redirection on the group closer (R1-B2: a failed redirection keeps the exit from running)', `${P} || { echo no; exit 1; } < /missing; find . -delete`, HOMECWD],
     ['the group does not end in an exit', `${P} || { echo failed; }; find . -delete`, HOMECWD],
     ['the exit is only reached when echo succeeds (&&)', `${P} || { echo failed && exit 1; }; find . -delete`, HOMECWD],
     ['the exit is only reached when echo fails (||)', `${P} || { echo failed || exit 1; }; find . -delete`, HOMECWD],

@@ -4561,7 +4561,7 @@ function evaluateBashForFilesFrame(command, opts) {
       if (e.kind === 'else') return ';';
       return top[k].sep;
     };
-    // #410: `cd DIR || exit 1` (also `|| exit`, `|| return`): when the cd fails the shell leaves, so whatever runs after the exit command surely follows a cd that succeeded. The exit must be a plain command of its own
+    // #410: `cd DIR || exit 1` (also `|| exit`; not `|| return`, see below): when the cd fails the shell leaves, so whatever runs after the exit command surely follows a cd that succeeded. The exit must be a plain command of its own
     // (not a pipeline stage or a background job: those leave only a subshell), in the same construct as the cd.
     // (the same for a brace group, `cd DIR || { echo "no dir"; exit 1; }`: its last command is the exit and every command before it is joined by ; or a newline, so the exit surely runs when the group does)
     const leavesAfter = (k) => { // the index of the command that surely follows a cd that succeeded, or -1
@@ -4579,7 +4579,11 @@ function evaluateBashForFilesFrame(command, opts) {
         last = j - 1;
       } else if (x.sep !== '||' || evAt.has(k + 2)) return -1;
       const e = top[last];
-      if (!staticName(e) || !['exit', 'return'].includes(e.argv[0])) return -1;
+      // R1-B1 (Codex round 1): only `exit` counts. A top-level `return` is an error and the shell goes on (it leaves only inside a function or a sourced file, and a function is no shape that is narrowed at all).
+      // R1-B2: a redirection on the exit, or on the group's closer (`} < f`, read as a command of no words that holds it), may fail before the exit runs, and then the shell goes on: no narrowing.
+      // (a redirection on a command before the exit, `{ echo no >&2; exit 1; }`, only fails that command)
+      if (!staticName(e) || e.argv[0] !== 'exit' || (e.redirects ?? []).length > 0) return -1;
+      if (last !== k + 1 && top[last + 1] !== undefined && top[last + 1].argv.length === 0 && (top[last + 1].redirects ?? []).length > 0) return -1;
       const y = top[last + 1];
       return y === undefined || y.sep === ';' || y.sep === '&&' ? last + 1 : -1;
     };
