@@ -62,9 +62,11 @@ describe('owner (R19): a plain `cd NAME` narrows like `./NAME` unless CDPATH is 
     ['cd proj && git checkout -- .', 'cd proj && git checkout -- .'],
     ['cd proj && git add .', 'cd proj && git add .'],
     ['cd web/app && rm -rf dist', 'cd web/app && rm -rf dist'],
-    ['mkdir -p out && cd out && rm -rf *', 'mkdir -p out && cd out && rm -rf *'],
+    ['mkdir -p out && cd out && rm -rf *.tmp', 'mkdir -p out && cd out && rm -rf *.tmp'],
   ];
   for (const [label, cwd] of [['deep cwd', DEEP], ['home cwd', HOMECWD]]) allows(`plain name (${label})`, EVERYDAY.map(([n, l]) => [n, l, cwd]));
+  // (a bare `*` from the cwd /home/u itself is denied by main for ANY cd target, `cd /home/u/out && rm -rf *` included: not part of this rule)
+  allows('plain name (deep cwd)', [['mkdir -p out && cd out && rm -rf *', 'mkdir -p out && cd out && rm -rf *', DEEP]]);
   denies('CDPATH in the hook environment', [
     ['cd proj && rm -rf dist', 'cd proj && rm -rf dist', { ...PROJ, env: { CDPATH: '.:/home/u' } }],
     ['cd proj && git reset --hard (home cwd)', 'cd proj && find . -delete', { ...HOMECWD, env: { CDPATH: '/home/u/.claude' } }],
