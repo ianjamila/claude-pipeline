@@ -42,9 +42,10 @@ const OPS = [[';', 25], ['&&', 35], ['||', 25], ['&', 8]];
 // (#352 R12-F3: a redirect-only command is a no-op that carries its operator: `change || >x && push` runs the redirect when the change failed)
 const NOOPS = ['true', 'false', 'A=1', 'echo hi', 'cat', '>x', '> /dev/null'];
 // (#352 R12-F2: a redirect right after the `)` of a subshell belongs to the subshell's command: `cd d && (a) 2>&1 & push`)
-const SUB_REDIRS = [' 2>&1', ' > log', ' >/dev/null 2>&1', ' 2>&1 > log'];
-const subNode = (body) => (rnd() < 0.4 ? { t: 'sub', body, redir: pick(SUB_REDIRS) } : { t: 'sub', body });
-const WRAPPERS = [['group', 12], ['sub', 12], ['subst', 8], ['btick', 4], ['bashc', 10], ['eval', 6], ['if', 9], ['iftrue', 6], ['while', 6], ['loop', 6], ['case', 5], ['not', 14], ['pipe', 14], ['stdin', 9]];
+// (#352 R13-B1: the redirect may sit on the next line behind a backslash)
+const SUB_REDIRS = [' 2>&1', ' > log', ' >/dev/null 2>&1', ' 2>&1 > log', ' \\\n 2>&1', ' \\\n > log', ' \\\n \\\n >/dev/null 2>&1'];
+const subNode = (body) => (rnd() < 0.5 ? { t: 'sub', body, redir: pick(SUB_REDIRS) } : { t: 'sub', body });
+const WRAPPERS = [['group', 12], ['sub', 12], ['subst', 8], ['btick', 4], ['bashc', 10], ['eval', 6], ['if', 9], ['iftrue', 6], ['while', 6], ['loop', 6], ['case', 5], ['not', 14], ['pipe', 14], ['stdin', 9], ['ifelse', 7]];
 // (#352 R10: wrappers of a command: the ones that start a child process (what the command changes is the child's) and the ones that stay in this shell)
 const SPAWN = new Set(['nohup', 'env', 'nice', 'timeout 5', 'sudo', 'find']);
 const SPAWN_WORDS = ['nohup', 'env', 'nice', 'timeout 5', 'sudo'];
@@ -103,6 +104,15 @@ function genWrapper(need, depth, forced) {
     return { t: 'pipe', stages: first ? [main, other] : [other, main], neg: !other.hd && rnd() < 0.15 };
   }
   if (kind === 'pipe') return { t: 'group', body: genBody('both', depth + 1) };
+  if (kind === 'ifelse') {
+    // (#352 R13-F1: `if C; then A && ( ) else B; fi`, also with `elif B; then`: a reserved word straight after the `)` of a subshell; the change and the push may stand in different branches)
+    const swap = rnd() < 0.5;
+    const thenNeed = need === 'both' ? (swap ? 'push' : 'change') : need;
+    const elseNeed = need === 'both' ? (swap ? 'change' : 'push') : 'none';
+    const body = genBody(thenNeed, depth + 1);
+    if (rnd() < 0.75) { body.ops.push(pick(['&&', '&&', ';'])); body.items.push(subNode(genBody('none', depth + 1))); }
+    return { t: 'ifelse', cond: rnd() < 0.7 ? 'false' : 'true', elif: rnd() < 0.3, body, other: genBody(elseNeed, depth + 1) };
+  }
   if (kind === 'btick' && quoted > 0) return genWrapper(need, depth, 'subst'); // (a backtick text holds no backtick: it would need its own escapes)
   const q = ['subst', 'btick', 'bashc', 'eval', 'stdin'].includes(kind);
   if (q) quoted++;
@@ -130,6 +140,11 @@ function render(n, kind) {
     case 'bashc': return `bash -c ${shq(render(n.body, kind))}`;
     case 'eval': return `eval ${shq(render(n.body, kind))}`;
     case 'if': return `if false; then ${render(n.body, kind)}; fi`;
+    case 'ifelse': {
+      const last = n.body.items[n.body.items.length - 1];
+      const then = render(n.body, kind) + (last.t === 'sub' ? ' ' : '; ');
+      return n.elif ? `if ${n.cond}; then ${then}elif ${render(n.other, kind)}; then true; fi` : `if ${n.cond}; then ${then}else ${render(n.other, kind)}; fi`;
+    }
     case 'iftrue': return `if true; then ${render(n.body, kind)}; fi`;
     case 'while': return `while false; do ${render(n.body, kind)}; done`;
     case 'loop': return `for x in a b; do ${render(n.body, kind)}; done`;
@@ -203,6 +218,7 @@ function evalNode(n, s, kind) {
     case 'case': return evalList(n.body, [s], kind);
     case 'sub': case 'bashc': case 'stdin': return evalList(n.body, [s], kind).map((r) => ({ ...r, cd: s.cd }));
     case 'iftrue': return evalList(n.body, [s], kind);
+    case 'ifelse': return n.cond === 'true' ? evalList(n.body, [{ ...s, fl: false }], kind) : evalList(n.other, [{ ...s, fl: false }], kind).map((r) => (n.elif ? { ...r, ok: true, fl: false } : r)); // (the condition is known: one branch runs; an elif's condition leaves the status of the `true` after it)
     case 'loop': return flat(evalList(n.body, [s], kind).filter((r) => !r.fl), (r) => evalList(n.body, [r], kind)); // (`for x in a b` runs its body twice, the second time from what the first left; a failure the loop goes past is not modelled, as for a ;)
     case 'wrap': { // (a child process: its cd is lost, a branch it switches stays; command / builtin run in this shell)
       const r = evalNode(n.leaf, s, kind);
@@ -252,7 +268,7 @@ test('#400: the guard denies every generated line whose push can run without the
     ['sub stage', /(?:\| \( [^\n]*\)|\( (?:true|false|A=1|echo hi|cat)[^\n]*\) \|)/], ['group stage of noops', /(?:\| \{ (?:true|false|A=1|echo hi|cat)[^\n]*; \}|\{ (?:true|false|A=1|echo hi|cat)[^\n]*; \} \|)/],
     ['empty first stage', /\{ \} \|/], ['heredoc stage, then a backtick text', /<<EOF\d* \| echo `/], ['heredoc stage, then a $( ) text', /<<EOF\d* \| echo \$\(/], ['negated pipeline', /(?:^|[;&|(] ?)! [^\n|]* \| /],
     // (#352 R12: a redirect-only command; a redirect right after the `)` of a subshell, alone and with a pipe or a background `&` after it)
-    ['redirect-only command', /(?:^|[;&|{(] ?)>(?:x| \/dev\/null)(?: |;|$)/], ['subshell with a trailing redirect', /\) (?:2>&1|> log|>\/dev\/null 2>&1)/], ['subshell redirect, then a pipe', /\) (?:2>&1|> log|>\/dev\/null 2>&1) \|/], ['subshell redirect, then &', /\) (?:2>&1|> log|>\/dev\/null 2>&1) &(?!&)/]]) {
+    ['redirect-only command', /(?:^|[;&|{(] ?)>(?:x| \/dev\/null)(?: |;|$)/], ['subshell with a trailing redirect', /\) (?:2>&1|> log|>\/dev\/null 2>&1)/], ['subshell redirect, then a pipe', /\) (?:2>&1|> log|>\/dev\/null 2>&1) \|/], ['reserved word after )', /\)(?: 2>&1| > log|>\/dev\/null 2>&1)? (?:else|elif) /], ['reserved word after a plain subshell, glued', /&& \( [^\n]*\) else /], ['subshell redirect after a line continuation', /\) \\\n (?:2>&1|> log)/], ['subshell redirect after two continuations', /\) \\\n \\\n >\/dev\/null 2>&1/], ['continuation redirect, then &', /\) \\\n (?:2>&1|> log) &(?!&)/], ['continuation redirect, then a pipe', /\) \\\n (?:2>&1|> log) \|/], ['subshell redirect, then &', /\) (?:2>&1|> log|>\/dev\/null 2>&1) &(?!&)/]]) {
     assert.ok([...seen].filter((l) => re.test(l)).length >= 5, `the generator should produce lines with: ${name}`);
   }
   assert.ok(mustDeny > checked * 0.3 && checked - mustDeny > checked * 0.05, 'the generator should produce both kinds of line');
