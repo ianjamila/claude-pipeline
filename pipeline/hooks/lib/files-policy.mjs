@@ -1552,6 +1552,8 @@ const literalCommand = (w) => w === '[' || literalWord(w) || spacedPath(w) || (w
 // A cd / pushd target is a known literal folder when, after the line's known variable expansion, it is `.` / `..`, starts with `/`, `./` or `../`, or is a plain name (letters, digits and `_ . , : @ % = / + -` or a space,
 // not starting with `-` `+` `=` `~`) and CDPATH is not in play (the home forms `cd`, `cd ~`, `cd ~/x` keep their own handling). Every other target (`~user`, `-`, `+N`, a run-time value) leaves the directory unknown.
 const cdPlainName = (e) => /^[A-Za-z0-9_.,@%:][A-Za-z0-9_.,:@%=\/+ -]*$/.test(e);
+// #379: the text names CDPATH (any case: zsh's cdpath array is CDPATH), except an EMPTY assignment (`CDPATH= cd -- dir`: no search list) and `unset CDPATH`; every other mention (a value, an export, a comment) counts
+const mentionsCdpath = (text) => /CDPATH/i.test(String(text).replace(/\bCDPATH=(?:""|'')?(?=[\s;&|)]|$)/g, ' ').replace(/\bunset\s+(?:-v\s+)?CDPATH(?![\w=[])/g, ' '));
 const cdTargetLiteral = (e, cdpath) => isAbs(e) || /^\.\.?(?:[\\/]|$)/.test(e) || (cdpath !== true && cdPlainName(e));
 // R18 (B1 / F1 / F7, one class): a command that can run more than once (in a loop, a function body or a trap action; a file sourced from one runs there too) moves the shell again each time. A RELATIVE cd target
 // (`..`, `../x`, `./x`; only `.` stays put) climbs or descends once per run, so how far the shell gets is not a number the guard can count: in such a place the directory is unknown (an absolute target may still join the set).
@@ -1592,9 +1594,14 @@ function makerOps(cmds) {
 // (R18-F6/F8: an argument surely survives expansion when nothing in it is settled at run time. argv holds the dequoted words, so a quoted `"$X"` cannot be told from an unquoted one: any `$`, backtick or glob character,
 // or an expansion that comes out empty, may vanish (an empty `$X`, `$@`, a glob without a match), and the command may then be lone. A file's own text is not expanded with the line's variables.)
 // R19-F2: ...but only when the RAW text shows the word unquoted: a double-quoted word (`"$f"`, `"$@"`) or a single-quoted one never disappears, so `"$PYTHON" "$SCRIPT"` is no lone word. `unq` is the command's raw text with its quoted spans cut out.
-const mayVanish = (a, ctx, fromFile, unq) => {
+// #380: the parser says which words are quoted in every occurrence (cmd.quotedWords); the raw-text search (`unq.includes`) matched the wrong token (`$P` inside the unquoted `$PYTHON`) and is kept only for a command the parser did
+// not list. #383: a word with any quoting is kept by the shell even when it expands to nothing, except a quoted "$@" / "${@}" / "${a[@]}", which expands to no word at all.
+const POSITIONALS = /\$\{?@|\[@\]/;
+const mayVanish = (a, ctx, fromFile, unq, quoted) => {
   const e = fromFile ? a : expandRefs(a, ctx);
-  return (e === '' || /[$`*?[(^<]/.test(e)) && (unq === null || unq.includes(a));
+  if (!(e === '' || /[$`*?[(^<]/.test(e))) return false;
+  if (quoted) return !quoted.has(a) || POSITIONALS.test(a);
+  return unq === null || unq.includes(a);
 };
 const unquotedText = (raw) => (typeof raw === 'string' ? raw.replace(/"(?:[^"\\]|\\[\s\S])*"|'[^']*'/g, ' ') : null);
 function dirLikeWord(cmds, ci, ctx, bases, fromFile = false) {
@@ -1605,7 +1612,7 @@ function dirLikeWord(cmds, ci, ctx, bases, fromFile = false) {
   if (w === '[' || w === '[[' || (w === '.' && u.argv.length > 1)) return false; // (the test builtin, and `. FILE`, which is source)
   // R18-F8: AUTO_CD runs a command of ONE word (zsh; bash: no other words after the name): `test -f x`, `supabase db reset`, `docs build` are programs, whatever folders exist. An argument that may vanish at run time does not count
   const unq = unquotedText(c.raw);
-  const lone = u.argv.slice(1).every((a) => mayVanish(a, ctx, fromFile, unq));
+  const lone = u.argv.slice(1).every((a) => mayVanish(a, ctx, fromFile, unq, c.quotedWords));
   if (!lone) return false;
   if (u.blind) return true; // (a wrapper whose next word is only known at run time)
   // (#288 CI H2: no directory name is longer than PATH_MAX (4 kB); a longer command word is not read as one. Reading it as one made the whole line be judged again in every assumed
@@ -3546,7 +3553,7 @@ function setPositionals(argv) {
   return null;
 }
 function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false) { // (rep: the file is sourced from a frame that can run it again, R18)
-  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: /CDPATH/i.test(text) }; // (any case: zsh's cdpath array is CDPATH)
+  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: mentionsCdpath(text) };
   const cdpNow = () => ctx.cdpath === true || out.cdpath; // (R20-F1: read at each cd, a nested file may set it after this point; R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
@@ -3832,7 +3839,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const raw = typeof command === 'string' ? command : '';
   if (!raw.trim()) return allow();
   ctx.dotGlob = DOT_GLOB.test(raw) || DOT_GLOB.test(String(ctx.env.BASHOPTS ?? '')); // (makeMatchers: may a wildcard match the .review folder)
-  ctx.cdpath = opts._cdpath === true || Boolean(ctx.env.CDPATH) || /CDPATH/i.test(raw); // (R19: CDPATH in the hook's environment, in a parent's text, or on this line: a plain `cd NAME` may lead anywhere)
+  ctx.cdpath = opts._cdpath === true || Boolean(ctx.env.CDPATH) || mentionsCdpath(raw); // (R19: CDPATH in the hook's environment, in a parent's text, or on this line: a plain `cd NAME` may lead anywhere)
   opts = { ...opts, _cdpath: ctx.cdpath }; // (a script, a -c text or a file this frame runs inherits it)
   // the words a `${X:=w}` on the line (or the line this text came from) may have assigned: a later $X may be any of them
   ctx.assigned = new Map([...(opts._assigned ?? [])].map(([n, ws]) => [n, [...ws]]));

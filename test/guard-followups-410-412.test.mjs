@@ -116,3 +116,49 @@ describe('#412 / #373: the repository root walk (git -C "$(git rev-parse --show-
     assert.equal(run(`git -C ${TOP} clean -fd`, ex).decision, 'allow');
   });
 });
+
+describe('#380 / #383: which argument words may vanish at run time (AUTO_CD: a lone run-time command word may be a directory)', () => {
+  const at = { cwd: '/home/u/proj' };
+  const runner = { cwd: '/home/u/proj', env: { RUNNER: '/home/u/.claude' } };
+  decide('allow', [
+    ['a quoted word whose name starts the unquoted command name ($PYTHON "$P")', '$PYTHON "$P"; find . -delete', at],
+    ['the same with $NODE "$N"', '$NODE "$N"; find . -delete', at],
+    ['a quoted word that is also the stem of an unquoted redirect target', '"$BIN" "$f" > $f.log; find . -delete', at],
+    ['a quoted scalar is an empty word, not a vanished one', '$D "$X"; find . -delete', at],
+    ['a partly quoted word never vanishes', '$D "a"$X; find . -delete', at],
+  ]);
+  decide('deny', [
+    ['the same variable unquoted can vanish', '$D $P; find . -delete', at],
+    ['an unquoted word beside a quoted one of the same text', '$D "$P" $P; find . -delete', at],
+    ['a quoted "$@" vanishes with no parameters (#383)', '"$RUNNER" "$@"; rm -f settings.json', runner],
+    ['a quoted "${@}" vanishes too', '"$RUNNER" "${@}"; rm -f settings.json', runner],
+    ['a quoted "${arr[@]}" vanishes with an empty array', '"$RUNNER" "${arr[@]}"; rm -f settings.json', runner],
+    ['an unquoted $@', '$RUNNER $@; rm -f settings.json', runner],
+  ]);
+});
+
+describe('#379: CDPATH counts only when it may hold a value (an empty assignment and `unset CDPATH` do not)', () => {
+  const files = (map) => ({ cwd: '/home/u/proj', existsSync: (p) => Object.hasOwn(map, p), readText: (p) => map[p] ?? null });
+  const W = 'echo x > settings.json'; // (a protected file only in a directory above the project)
+  decide('allow', [
+    ['an empty prefix assignment', 'CDPATH= cd sub && find . -delete'],
+    ['an empty assignment with quotes', 'CDPATH="" cd sub && find . -delete'],
+    ['an empty assignment on its own', 'CDPATH=; cd sub && find . -delete'],
+    ['the script idiom', 'CDPATH= cd -- sub && find . -delete'],
+    ['unset CDPATH', 'unset CDPATH; cd sub && find . -delete'],
+    ['unset -v CDPATH', 'unset -v CDPATH\ncd sub && find . -delete'],
+    ['a sourced file with the empty idiom', `. /home/u/a.sh; ${W}`, files({ '/home/u/a.sh': 'CDPATH= cd sub\n' })],
+    ['a sourced file with unset CDPATH', `. /home/u/a.sh; ${W}`, files({ '/home/u/a.sh': 'unset CDPATH\ncd sub\n' })],
+  ]);
+  decide('deny', [
+    ['a value', 'CDPATH=/x cd sub && find . -delete'],
+    ['a value after an unset', 'unset CDPATH; CDPATH=/x; cd sub && find . -delete'],
+    ['a value after an empty one', 'CDPATH= true; CDPATH=/x; cd sub && find . -delete'],
+    ['a run-time value', 'CDPATH=$X cd sub && find . -delete'],
+    ['an export of the name', 'export CDPATH; cd sub && find . -delete'],
+    ['a lowercase cdpath array', 'cdpath=(/x); cd sub && find . -delete'],
+    ['unset of another name beside it', 'unset FOO CDPATH; cd sub && find . -delete'],
+    ['a sourced file with a value', `. /home/u/a.sh; ${W}`, files({ '/home/u/a.sh': 'export CDPATH=/y\ncd sub\n' })],
+    ['the environment', 'unset CDPATH; cd sub && find . -delete', { env: { CDPATH: '/x' } }],
+  ]);
+});

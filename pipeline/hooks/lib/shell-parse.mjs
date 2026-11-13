@@ -2980,6 +2980,8 @@ class Parser {
     if (group.length) groups.push(group);
     for (const w of seg.words) {
       if (w.pat) seg.pat.add(w.text);
+      if (w.qa < 0) (seg.bare ??= new Set()).add(w.text); // (#380: the texts of the words that have no quoting at all, and of those with some)
+      else (seg.quo ??= new Set()).add(w.text);
       if (w.win !== undefined) seg.win.set(w.text, w.win);
       if (w.dyn || w.subs.length) {
         const m = seg.meta.get(w.text) ?? { dyn: false, subs: [] };
@@ -3123,6 +3125,8 @@ class Parser {
     if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep);
     // the words that are exactly one command substitution (`for f in $(cmd)`): see wspans (#81)
     if (cmd) Object.defineProperty(cmd, 'subWords', { value: new Set(a.filter((w) => seg.meta.get(w)?.one === true)), enumerable: false });
+    // (the words that have quoting in EVERY occurrence: an empty expansion in them leaves an empty word, never none, except "$@" and "${a[@]}"; a word the parser did not read as one, or with a bare occurrence, is not listed)
+    if (cmd) Object.defineProperty(cmd, 'quotedWords', { value: new Set(a.filter((w) => seg.quo?.has(w) && !seg.bare?.has(w))), enumerable: false });
     if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });
     if (!isExec) { seg.final = { argv: a }; seg.cmd = cmd; }
     // what the command prints and what it reads on stdin, for callers that ask which text a write of its output holds (see line-writes.mjs); lazy, most commands never need it

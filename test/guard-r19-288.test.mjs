@@ -99,13 +99,13 @@ describe('R19-F1: a relative cd in a loop / function narrows unless it climbs (`
   ]);
 });
 
-describe('R19-F2: a double-quoted argument never vanishes', () => {
+describe('R19-F2: a double-quoted argument never vanishes (but "$@" does, #383)', () => {
   allows('F2', [
     ['"$PYTHON" "$SCRIPT"; rm -f out.tmp', '"$PYTHON" "$SCRIPT"; rm -f out.tmp'],
     ['$RUNNER "$f"; rm -f out.tmp', '$RUNNER "$f"; rm -f out.tmp'],
-    ['$RUNNER "$@"; rm -f out.tmp', '$RUNNER "$@"; rm -f out.tmp'],
   ]);
   denies('F2', [
+    ['$RUNNER "$@" (a quoted "$@" expands to no word with no parameters, #383)', '$RUNNER "$@"; rm -f out.tmp'],
     ['$D $EMPTY (unquoted)', '$D $EMPTY; rm -f settings.json'],
     ['"$D" $EMPTY (the argument is unquoted)', '"$D" $EMPTY; rm -f settings.json'],
     ['$D *.nomatch (a glob)', '$D *.nomatch; rm -f settings.json'],
