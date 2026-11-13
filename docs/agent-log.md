@@ -172,3 +172,4 @@ full record.
 - 2026-11-13 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 15 · arbiter 14 · blocked
 - 2026-11-13 · #422 · Merge preview shows the items digest the real merge checks; hermetic gate-CLI tests (#417) · risk high · rounds 1 · arbiter 0 · blocked
 - 2026-11-13 · #420 · fix(review): one default-branch anchor, resolved fully qualified; follow-ups #367 #368 #387 #388 #392 #396 #407 · risk high · rounds 2 · arbiter 1 · blocked
+- 2026-11-13 · #425 · Guard follow-ups: inherited tool settings, shadowed names, long scripts, cd &#124;&#124; {…}, CDPATH/quoting fixes, 15% faster (#265 #372 #379 #380 #383–#386 #393 #410–#412) · risk high · rounds 1 · arbiter 0 · blocked
