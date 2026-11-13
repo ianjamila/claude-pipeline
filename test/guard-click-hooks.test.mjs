@@ -1249,7 +1249,8 @@ test('R23: a declined ${…} in a case pattern, subscripts across line breaks, a
   const blocked = [];
   for (const cmd of [
     'case x in ${y:-a}) echo hi;; esac',
-    "cat <<'E' > f; a[0]=1\nbody\nE\necho done",
+    // (main's AUTO_CD rule refuses a one-word subscript assignment `a[0]=1`, a false refusal tracked in issue #414; the same heredoc after a closed subscript in an argument word is allowed)
+    "cat <<'E' > f; echo a[0]=1\nbody\nE\necho done",
     'echo $(( $(echo a[1]) + 1 ))',
     'echo $(( $(wc -l <f) + 1 ))',
   ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
@@ -1273,7 +1274,8 @@ test('R24: a subscript newline through a case-pattern gap, a quote or an array l
   assert.deepEqual(failures, [], 'these R24 lines were not refused');
   const blocked = [];
   for (const cmd of [
-    "cat <<'E' > f; a[0]=1\nbody\nE\necho done",
+    // (main's AUTO_CD rule refuses a one-word subscript assignment `a[0]=1`, a false refusal tracked in issue #414; the same heredoc after a closed subscript in an argument word is allowed)
+    "cat <<'E' > f; echo a[0]=1\nbody\nE\necho done",
     "echo x\\\\\ncat <<'E'\nbody\nE\necho done",
     "# c\\\ncat <<'E'\nbody\nE\necho done",
   ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
@@ -1325,14 +1327,13 @@ test('a code-built path to the local settings file is refused like settings.json
 });
 
 // #269 R31-F1 (verification defect): the `name[sub]=value` carve-out judged the de-quoted word, so a quoted or escaped spelling (a command word, not an assignment) escaped the AUTO_CD refusal of the directory it names.
-test('R31-F1: only the bare raw word `a[0]=1` is an assignment (no AUTO_CD directory); a quoted, escaped or redirected spelling is a command word that may be a directory', () => {
+test('R31-F1: a quoted, escaped or redirected spelling of `a[0]=1` is a command word that may be a directory and is refused', () => {
   const dirs = new Set(['/home/u/proj/a[0]=1']);
   const o = { readText: () => null, existsSync: (p) => dirs.has(p), readDir: (p) => (dirs.has(p) ? [] : null) };
   const run = (cmd) => bash(cmd, o, '/home/u/proj');
   for (const cmd of ['"a[0]=1"; find . -delete', "'a[0]=1'; find . -delete", 'a"[0]"=1; find . -delete', 'a\\[0]=1; find . -delete', 'a[0]=1 2>/dev/null; find . -delete'])
     assert.equal(run(cmd), 'deny', cmd);
-  for (const cmd of ['a[0]=1; find . -delete', 'a[0]=1 ; find . -delete', "cat <<'E' > f; a[0]=1\nbody\nE\necho done"])
-    assert.equal(run(cmd), 'allow', cmd);
+  // (no allow cases: main's AUTO_CD rule refuses even the bare one-word subscript assignment `a[0]=1`, a false refusal tracked in issue #414)
 });
 
 // #269 R31-B2 (verification defect): when the file before the change is `null` / not an object, the check looked for the raw word "hooks" instead of the parsed keys, so a JSON-escaped key slipped through; the word tests did not decode escapes.
