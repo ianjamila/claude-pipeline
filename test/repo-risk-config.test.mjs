@@ -100,6 +100,56 @@ function directImports(rels) {
   });
 }
 
+// The names a source imports from one specifier (#388), from its import clause: '{ a, b as c }' -> a, b; 'x' -> default; '* as ns' / 'export *' / a dynamic import
+// that is not destructured -> '*'; a bare `import 'x'` -> '(side effect)'. A clause that cannot be found for a specifier V8 reported fails the caller closed.
+// Comments are blanked in one pass that steps over string literals (a '/*' or '//' inside a string is no comment); a miss fails the caller closed.
+const SIDE_EFFECT = '(side effect)';
+function importedNames(src, spec) {
+  const clean = src.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`/g, (t) => (t.startsWith('/') ? ' ' : t));
+  const q = spec.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  const names = new Set();
+  let found = false;
+  for (const m of clean.matchAll(new RegExp(String.raw`\b(?:import|export)\s*([^;'"]*?)\s*from\s*['"]${q}['"]`, 'g'))) {
+    found = true;
+    const clause = m[1].trim();
+    const braces = /\{([^}]*)\}/.exec(clause);
+    if (braces) for (const part of braces[1].split(',')) { const n = part.trim().split(/\s+as\s+/)[0].trim(); if (n) names.add(n); }
+    const rest = clause.replace(/\{[^}]*\}/, '').replace(/,/g, ' ').trim();
+    if (rest.startsWith('*')) names.add('*');
+    else if (rest !== '' && !/^type\b/.test(rest)) names.add('default');
+  }
+  if (new RegExp(String.raw`\bimport\s*['"]${q}['"]`).test(clean)) { found = true; names.add(SIDE_EFFECT); }
+  for (const m of clean.matchAll(new RegExp(String.raw`\bimport\s*\(\s*(?:'${q}'|"${q}"|\`${q}\`)`, 'g'))) {
+    found = true;
+    const before = clean.slice(Math.max(0, m.index - 300), m.index);
+    const d = /(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(?:await\s+)?$/.exec(before);
+    if (d) for (const part of d[1].split(',')) { const n = part.trim().split(/\s*:\s*/)[0].trim(); if (n) names.add(n); }
+    else names.add('*');
+  }
+  if (!found) throw new Error(`no import clause found for ${spec}`);
+  return names;
+}
+
+// root -> target -> the names that root imports from it (relative imports only, to files that exist).
+function importedNamesByTarget(rels) {
+  const out = new Map();
+  for (const rel of rels) {
+    const abs = path.join(root, rel);
+    const src = fs.readFileSync(abs, 'utf8');
+    const scan = scanImports([src])[0];
+    const byTarget = new Map();
+    for (const spec of new Set([...scan.static, ...scan.dynamic].filter(isRelative))) {
+      const t = relFrom(abs, spec);
+      if (!fs.existsSync(path.join(root, t))) continue;
+      let names;
+      try { names = importedNames(src, spec); } catch (err) { throw new Error(`${rel}: ${err.message}`); }
+      byTarget.set(t, new Set([...(byTarget.get(t) ?? []), ...names]));
+    }
+    out.set(rel, byTarget);
+  }
+  return out;
+}
+
 function importClosure(startRel) {
   const seen = new Set();
   let frontier = [startRel];
@@ -202,7 +252,13 @@ test('repo config: a source the engine cannot parse makes the scanner throw (the
 // A glob entry (pipeline/hooks/**, pipeline/vendor/**) is never a root. A NEW literal .mjs entry therefore becomes a root automatically.
 const isLiteralMjs = (p) => p.endsWith('.mjs') && !/[*?[{]/.test(p);
 const LITERAL = raw.risk.high_risk_paths.filter(isLiteralMjs);
-const ROOTS = LITERAL;
+// pipeline/hooks/** is a glob, so it is never a LITERAL root, but every .mjs the glob covers on disk is one (#387): what a hook file imports directly is
+// listed or exempt like what a listed file imports. Expanded here from the config's own glob entries, not from a second list.
+const hookGlobs = raw.risk.high_risk_paths.filter((p) => p.startsWith('pipeline/hooks/') && /[*?[{]/.test(p));
+const hookFiles = (dir) => fs.readdirSync(path.join(root, dir), { withFileTypes: true }).flatMap((e) => (
+  e.isDirectory() ? hookFiles(`${dir}/${e.name}`) : (e.name.endsWith('.mjs') ? [`${dir}/${e.name}`] : [])));
+const HOOK_ROOTS = hookFiles('pipeline/hooks').filter((f) => matchAny(f, hookGlobs, { nocase: true })).sort();
+const ROOTS = [...new Set([...LITERAL, ...HOOK_ROOTS])];
 
 test('repo config: every literal .mjs entry of risk.high_risk_paths is a root; no duplicate entry; no glob became a root', () => {
   assert.equal(new Set(LITERAL).size, LITERAL.length, 'a duplicate literal .mjs entry in risk.high_risk_paths');
@@ -247,10 +303,26 @@ test('repo config: every file the risk rating imports (transitively) is covered 
 // is added, read each importer's call sites and check that no root branches, refuses, merges, lifts a hold, installs or trusts something on
 // the file's return value or side effect (then LIST it instead; round 6 moved summary-comment, run-progress, cmd-io, schedule and
 // merge-cleanup out of this map for that reason).
+const STACKS_EXEMPT_WHY = 'owner decision 2026-11-13 (#392): unattended stack/worktree jobs are exempt';
 const DEPTH1_EXEMPT = new Map([
   ['pipeline/lib/round-ask.mjs', 'display only: the text of the extra-round ask and the park comment (round-status.mjs hands costFrom, roundsFrom, openItems, notCleanReasons and statusLines to the owner-facing display, triage.mjs hands askSummary to the ask); admission and defer eligibility are decided in triage.mjs (listed) and defer-fixes re-checks'],
   ['pipeline/lib/worktree-prune/inspect.mjs', 'live-sessions.mjs imports only unFirm (strips the macOS /System/Volumes/Data firmlink prefix from a path), which only liveSessionsIn calls (the worktree-prune session match); review-lease.mjs uses claudeConfigDirs and psStarts, never liveSessionsIn, so no gate, proof, trust or install branches on it'],
   ['pipeline/lib/worktree-prune/run.mjs', 'update-schedule.mjs, queue-sweep-schedule.mjs and queue-sweep.mjs import only pruneLogDir (the folder the cron-*.log files are appended to); it picks no command, argument or code to run, and the worktree prune the file holds decides no gate, proof, trust or install'],
+  ...['pipeline/lib/stacks/dev.mjs', 'pipeline/lib/stacks/fastpath.mjs', 'pipeline/lib/stacks/register.mjs', 'pipeline/lib/stacks/session-end.mjs']
+    .map((p) => [p, STACKS_EXEMPT_WHY]),
+]);
+
+// The names a root may import from each DEPTH1_EXEMPT file (#388): an exemption is a claim about the HELPERS the roots use, so a root that starts
+// importing anything else from the file (a namespace, a default, a new name, a side-effect import) fails until someone re-reads it. '*' = a namespace
+// or an unreadable clause; '(side effect)' = a bare `import './x.mjs'`. Checked against every root's import clause, static and dynamic.
+const DEPTH1_NAMES = new Map([
+  ['pipeline/lib/round-ask.mjs', ['askSummary', 'costFrom', 'notCleanReasons', 'openItems', 'roundsFrom', 'statusLines']],
+  ['pipeline/lib/worktree-prune/inspect.mjs', ['unFirm']],
+  ['pipeline/lib/worktree-prune/run.mjs', ['pruneLogDir']],
+  ['pipeline/lib/stacks/dev.mjs', ['runDevBind']],
+  ['pipeline/lib/stacks/fastpath.mjs', ['devBindFastSkip', 'registerFastSkip']],
+  ['pipeline/lib/stacks/register.mjs', ['register']],
+  ['pipeline/lib/stacks/session-end.mjs', ['sessionEndHook']],
 ]);
 
 test('repo config: every relative import (depth 1) of every root (literal .mjs entry) is covered by risk.high_risk_paths or listed in DEPTH1_EXEMPT', () => {
@@ -273,6 +345,42 @@ test('repo config: every relative import (depth 1) of every root (literal .mjs e
   }
 });
 
+test('repo config: DEPTH1_NAMES pins the names every root imports from each DEPTH1_EXEMPT file; a root that imports more fails', () => {
+  assert.deepEqual([...DEPTH1_NAMES.keys()].sort(), [...DEPTH1_EXEMPT.keys()].sort(), 'DEPTH1_NAMES and DEPTH1_EXEMPT list different files');
+  const used = new Map([...DEPTH1_EXEMPT.keys()].map((t) => [t, new Set()]));
+  const extra = [];
+  for (const [rel, byTarget] of importedNamesByTarget(ROOTS)) {
+    for (const [t, names] of byTarget) {
+      if (!used.has(t)) continue;
+      for (const n of names) {
+        used.get(t).add(n);
+        if (!DEPTH1_NAMES.get(t).includes(n)) extra.push(`${rel} imports ${n} from ${t}`);
+      }
+    }
+  }
+  assert.deepEqual(extra, [], `a root imports more than DEPTH1_NAMES allows from an exempt file: re-read the file, then list the name or list the file in risk.high_risk_paths: ${extra.join('; ')}`);
+  for (const [t, names] of DEPTH1_NAMES) assert.deepEqual([...used.get(t)].sort(), [...names].sort(), `DEPTH1_NAMES ${t} pins a name no root imports (or lacks one): keep it exactly the names in use`);
+});
+
+test('repo config: the import-clause reader names default, namespace, side-effect, renamed and destructured dynamic imports', () => {
+  const src = [
+    "import def, { a, b as c } from './x.mjs';", "import * as ns from './y.mjs';", "import './z.mjs';", "export { d } from './w.mjs';", "export * from './v.mjs';",
+    "const { e, f: g } = await import('./u.mjs');", "const m = await import('./t.mjs');", "// import { nope } from './x.mjs';",
+  ].join('\n');
+  const at = (spec) => [...importedNames(src, spec)].sort();
+  assert.deepEqual(at('./x.mjs'), ['a', 'b', 'default']);
+  assert.deepEqual(at('./y.mjs'), ['*']);
+  assert.deepEqual(at('./z.mjs'), [SIDE_EFFECT]);
+  assert.deepEqual(at('./w.mjs'), ['d']);
+  assert.deepEqual(at('./v.mjs'), ['*']);
+  assert.deepEqual(at('./u.mjs'), ['e', 'f']);
+  assert.deepEqual(at('./t.mjs'), ['*']);
+  assert.throws(() => importedNames(src, './gone.mjs'), /no import clause found/);
+  // the pin fails a root that imports more than the named helper: here a second name from the same file
+  const more = new Set([...importedNames("import { helper, other } from './x.mjs';", './x.mjs')]);
+  assert.deepEqual([...more].filter((n) => !['helper'].includes(n)), ['other']);
+});
+
 // Every file in pipeline/commands/ is either matched by risk.high_risk_paths or sits here with a one-line TRUE reason (round 7, R7-F2: the
 // commands were the one dimension still audited by hand, one file per round). A command is exempt only when it decides no review gate, merge,
 // hold or review proof and writes no review state or run record: it reads or displays, or it only manages local machine state or GitHub labels
@@ -285,9 +393,9 @@ const COMMANDS_EXEMPT = new Map([
   ['labels.mjs', 'creates or realigns the label names, colours and descriptions on GitHub (idempotent); it applies and removes no label on any PR and grants nothing, and no gate reads a label\'s colour or description; it writes GitHub labels but no review state or run record'],
   ['leases.mjs', 'read-only: shows what the review-lease folder says; takes no lease and sweeps nothing, the live-or-dead judgement is scanLeases in lib/review-lease.mjs (listed)'],
   ['stats.mjs', 'read-only display of review rounds of merged PRs (reads PR comments, prints a table or JSON); writes nothing and no gate reads it'],
-  ['stacks.mjs', 'stops idle local dev Supabase stacks and dev servers (the stack-stop sweep, session-end worker, status, repair, init) and installs one fixed schedule line (stacks sweep --apply --summary-only, constant arguments) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the stack-stop libs are not gate inputs; tracked in issue #392 (owner, 2026-11-13: stays exempt)'],
+  ['stacks.mjs', 'stops idle local dev Supabase stacks and dev servers (the stack-stop sweep, session-end worker, status, repair, init) and installs one fixed schedule line (stacks sweep --apply --summary-only, constant arguments) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the stack-stop libs are not gate inputs; tracked in issue #392 (owner, 2026-11-13: stays exempt); owner decision 2026-11-13 (#392): unattended stack/worktree jobs are exempt'],
   ['version.mjs', 'read-only: prints the version stamp; what an install proves is decided in lib/identity.mjs and lib/installer.mjs (both listed)'],
-  ['worktrees.mjs', 'removes finished local worktrees (prune), keep-locks, the holding folder and the read-only sessions check, and installs one fixed schedule line (worktrees prune --summary-only) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the prune rules live in lib/worktree-prune/*; of those only live-sessions.mjs is listed (review-lease.mjs reads it), the rest decides no gate; the unlisted libs this command acts through are tracked in issue #392 (owner, 2026-11-13: stays exempt)'],
+  ['worktrees.mjs', 'removes finished local worktrees (prune), keep-locks, the holding folder and the read-only sessions check, and installs one fixed schedule line (worktrees prune --summary-only) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the prune rules live in lib/worktree-prune/*; of those only live-sessions.mjs is listed (review-lease.mjs reads it), the rest decides no gate; the unlisted libs this command acts through are tracked in issue #392 (owner, 2026-11-13: stays exempt); owner decision 2026-11-13 (#392): unattended stack/worktree jobs are exempt'],
 ]);
 
 test('repo config: every file in pipeline/commands/ is matched by risk.high_risk_paths or sits in COMMANDS_EXEMPT with a reason (a new command fails until it is classified)', () => {
