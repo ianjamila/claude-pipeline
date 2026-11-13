@@ -65,6 +65,7 @@ test('R13-F1: substitute.mode off in the base config holds although the working 
   assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.plan.route, 'codex', 'a small fix-check past the budget is withheld only when the mode is auto');
   assert.match(r.json.plan.why, /^mode-off/);
+  assert.match(r.json.plan.modeOffFrom, /default branch's fork point sets review\.substitute\.mode off/, 'the plan says the off came from the base config');
 });
 
 test('strictestRouteConfig: lower small_fix_lines, higher budgets, mode off if either says off; an unreadable base is the strictest', () => {
@@ -86,6 +87,9 @@ test('strictestRouteConfig: lower small_fix_lines, higher budgets, mode off if e
   assert.deepEqual([g.minWaitMinutes, g.maxPacketMb], [90, 2]);
   const d = strictestRouteConfig(cfg({ effort: { small_fix_lines: 10000 } }), { ok: false, reason: 'none' });
   assert.deepEqual([d.smallFixLines, d.mode], [40, 'off'], 'unreadable base: never looser than the defaults, substitute off');
+  assert.match(d.modeOffFrom, /could not be read \(none\)/);
+  assert.equal(strictestRouteConfig(cfg(), { ok: true, config: cfg() }).modeOffFrom, null);
+  assert.match(strictestRouteConfig(cfg({ mode: 'off' }), { ok: true, config: cfg() }).modeOffFrom, /working-tree/);
 });
 
 test('R13-B2: the plan of a base-only round names the follow-up effort, and codex-review with it records the base-only round', (t) => {

@@ -974,7 +974,7 @@ test('R10-F2 (#360): a resolution packet that would export a conflicted image (.
   assert.ok(!existsSync(w.attemptsFile), 'no attempt was opened');
 });
 
-test('R13-F2: substitute prepare / apply read review.substitute under the stricter of the working tree and the base config: base mode off is not undone by a working tree that says auto', (t) => {
+test('R13-F1: substitute prepare / apply read review.substitute under the stricter of the working tree and the base config: base mode off is not undone by a working tree that says auto', (t) => {
   const w = world(t, { review: '  substitute:\n    mode: off\n' });
   w.config({ review: '' }); // the working tree (the PR's own pipeline.yml) turns the substitute back on
   assertExit(w.run(), 3); // the fact (a real quota stop) is recorded whatever the mode says
@@ -987,7 +987,43 @@ test('R13-F2: substitute prepare / apply read review.substitute under the strict
   assert.equal(a.json.error, 'mode-off');
 });
 
-test('R13-F2: a working tree min_wait_minutes 0 does not undo the base config\'s 60: codex-review and prepare both refuse reset-near', (t) => {
+test('R14-F1: the mode-off refusal says where the off came from: the base config at the fork point, not the working tree', (t) => {
+  const w = world(t, { review: '  substitute:\n    mode: off\n' });
+  w.config({ review: '' });
+  assertExit(w.run(), 3);
+  const p = w.prepare();
+  assertExit(p, 1, p.stdout + p.stderr);
+  assert.equal(p.json.error, 'mode-off');
+  assert.match(p.json.message, /default branch's fork point/);
+  assert.match(p.json.message, /stricter/);
+  assert.doesNotMatch(p.json.message, /working-tree pipeline\.yml sets/);
+  const own = world(t, { review: '' });
+  own.config({ review: '  substitute:\n    mode: off\n' });
+  assertExit(own.run(), 3);
+  const q = own.prepare();
+  assert.equal(q.json.error, 'mode-off');
+  assert.match(q.json.message, /working-tree pipeline\.yml sets review\.substitute\.mode off/);
+});
+
+test('R14-F1: the mode-off refusal names an unreadable base config and its reason', (t) => {
+  const w = world(t);
+  // main drops the config and is merged into the PR, which keeps its own copy: the fork point (main's tip) has no pipeline.yml, the working tree does
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.git(['rm', '-q', '.claude/pipeline.yml']);
+  w.repo.commit('main drops the config');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', '--no-commit', 'main']);
+  w.repo.git(['checkout', 'HEAD', '--', '.claude/pipeline.yml']);
+  const head = w.repo.commit('merge main, keep the config');
+  assertExit(w.run(1, w.quota(), { from: w.repo.git(['rev-parse', 'main']).trim(), to: head }), 3);
+  const p = w.prepare();
+  assertExit(p, 1, p.stdout + p.stderr);
+  assert.equal(p.json.error, 'mode-off');
+  assert.match(p.json.message, /could not be read/);
+  assert.match(p.json.message, /the fork point has no \.claude\/pipeline\.yml/);
+});
+
+test('R13-F1: a working tree min_wait_minutes 0 does not undo the base config\'s 60: codex-review and prepare both refuse reset-near', (t) => {
   const w = world(t, { review: '  substitute:\n    min_wait_minutes: 60\n' });
   w.config({ review: '' });
   const run = w.run(1, w.quota("You've hit your usage limit. Upgrade to Pro, or try again in 10 minutes."));
@@ -998,7 +1034,7 @@ test('R13-F2: a working tree min_wait_minutes 0 does not undo the base config\'s
   assert.equal(p.json.error, 'reset-near');
 });
 
-test('R13-F2: a working tree max_packet_mb 1000 does not undo the base config\'s limit: prepare refuses packet-too-large', (t) => {
+test('R13-F1: a working tree max_packet_mb 1000 does not undo the base config\'s limit: prepare refuses packet-too-large', (t) => {
   const w = world(t, { review: '  substitute:\n    max_packet_mb: 1\n' });
   w.config({ review: '  substitute:\n    max_packet_mb: 1000\n' });
   w.repo.write('src/huge.js', `${'x'.repeat(100)}\n`.repeat(12000)); // about 1.2 MB of changed lines

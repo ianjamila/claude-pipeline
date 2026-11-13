@@ -111,12 +111,12 @@ export function resetNear({ resetAt, minWaitMinutes = 0, now = Date.now() }) {
 //   reason / timedOut / quota: what execCodex reported ({eligible, proof, resetAt, ...} for a quota); mode / minWaitMinutes: review.substitute.
 // -> { eligible, why, agent, resetAt, waitUntil? }. min_wait_minutes 0 (the default) never waits; above 0, a reset within that many minutes is waited for instead
 // (eligible false, waitUntil = the reset), and a quota with no reset time is never waited for (nothing to wait until).
-export function substituteEligibility({ reason, timedOut = false, quota, mode, minWaitMinutes = 0, agent, now = Date.now() }) {
+export function substituteEligibility({ reason, timedOut = false, quota, mode, modeOffFrom = null, minWaitMinutes = 0, agent, now = Date.now() }) {
   const resetAt = quota?.resetAt ?? null;
   const out = (eligible, why, extra = {}) => ({ eligible, why, agent, resetAt, ...extra });
   if (timedOut) return out(false, 'timed-out');
   if (reason !== 'quota') return out(false, `not-quota:${reason}`);
-  if (mode === 'off') return out(false, 'mode-off');
+  if (mode === 'off') return out(false, 'mode-off', modeOffFrom === null ? {} : { modeOffFrom }); // modeOffFrom: where the off came from (strictestRouteConfig)
   if (quota?.eligible !== true) return out(false, 'quota-unproven');
   if (resetNear({ resetAt, minWaitMinutes, now })) return out(false, 'reset-near', { waitUntil: resetAt });
   return out(true, 'quota');

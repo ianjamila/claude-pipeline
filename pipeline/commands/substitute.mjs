@@ -30,7 +30,7 @@ export const meta = {
     '  agent: substitute-opus (the PR\'s highest risk, ever, is low or medium) or substitute-fable (it was ever high); the tag is `pipeline-substitute R<R> <id8>` (`... a<k>` for attempt k > 1; id8 is the first 8 hex digits of the digest of the round content (round, base, head, patch digest) - nothing random - so it survives a new codex-review attempt, an evidence kind or path change and `state discard-round`)',
     '  needs the evidence of THIS round: .review/round-R/route.json from a codex-review attempt that ended with evidence quota (Codex\'s own usage-limit stop), budget or governor (a small fix-check',
     '    Codex was not run for), for the same attempt, round, base, head and patch digest (and, for quota, the same Codex prompt digest); the checked-out HEAD must be that head;',
-    '    review.substitute.mode is not off; a quota stop with a reset time is evidence only until that time (a stop with none: 2 hours), and, with review.substitute.min_wait_minutes above 0, only when Codex is NOT due back within that many minutes (the same rule as codex-review\'s `reset-near` verdict, which keeps the quota evidence either way: prepare refuses `reset-near` with `waitUntil`, the reset time): the reset is judged HERE and nowhere else (apply does not re-judge it); governor evidence is re-checked here too (the weekly figure must still be at or above the hard limit, else an evidence older than 6 h with no readable figure) and the attempts are kept per round content (round, base, head, patch digest: a new codex-review attempt, another evidence kind or a moved worktree neither resets the attempt counter / the two-invalid cap nor changes the tag)',
+    '    review.substitute.mode is not off (every review.substitute.* knob is read as the stricter of the working-tree config and the config committed at the fork point of the default branch: mode off when either says off or the base cannot be read, the higher min_wait_minutes, the lower max_packet_mb; a mode-off refusal carries modeOffFrom, which config said off and why); a quota stop with a reset time is evidence only until that time (a stop with none: 2 hours), and, with review.substitute.min_wait_minutes above 0, only when Codex is NOT due back within that many minutes (the same rule as codex-review\'s `reset-near` verdict, which keeps the quota evidence either way: prepare refuses `reset-near` with `waitUntil`, the reset time): the reset is judged HERE and nowhere else (apply does not re-judge it); governor evidence is re-checked here too (the weekly figure must still be at or above the hard limit, else an evidence older than 6 h with no readable figure) and the attempts are kept per round content (round, base, head, patch digest: a new codex-review attempt, another evidence kind or a moved worktree neither resets the attempt counter / the two-invalid cap nor changes the tag)',
     '  refuses (exit 1) no-route | no-evidence (route.json holds pending / none) | route-mismatch (head, base, patch, prompt, budget spent, or, for budget / governor evidence, the round is protected NOW, e.g. an item marked implemented since makes it a confirm-fixed round: only a quota stop of Codex itself sends a protected round to a substitute; checked by prepare and apply) | agent-changed | mode-off | reset-passed (run codex-review again) | reset-near {waitUntil} (review.substitute.min_wait_minutes: Codex is due back within that wait: wait for it, run codex-review again) |',
     '    packet-too-large (the evidence passes review.substitute.max_packet_mb: not eligible, park as without a substitute) | packet-unreadable {pages, maxPages, files:[{rel, lines, tokens, pages}]} | {longLine:{rel, line, tokens}} | {unreadableFile:{rel, reason}} (the agent could not read the packet in full, so apply would never prove it: the input file and the exported files together need more than 15 Read calls, each file counted as the larger of ceil(lines / 2000) and ceil(estimated tokens / 20000), the tokens estimated from the characters; a Read returns at most 2000 lines and stops early at a size cap of about 25,000 tokens; MAX_READ_PAGES, lib/substitute-proof.mjs: the call-budget hook stops a reviewer-type subagent at 40 tool calls, and 15 calls leave it 25 for Grep and Read of the code around the diff; a long line is not refused, Read returns it whole, unless that one line alone is estimated at more than 20000 tokens (READ_TOKENS_PER_CALL: no single Read call can hold it: longLine names the file and the line); a required file Read does not return as numbered text, a notebook (.ipynb), an image (png, jpg, jpeg, gif, webp, bmp, ico, tif, heic, avif; svg is text) or a PDF, or a file with a NUL byte, is refused up front too, naming it (unreadableFile; for a resolution round that is a conflicted file, exported as sides/ours/<path> and sides/base/<path>)); not eligible, park as without a substitute; nothing is written and no attempt is opened) | attempts-exhausted (two invalid attempts) | new-attempt-not-allowed;',
     '    exit 2 for the shared round admission: round-order, state-pr-mismatch, base-mismatch (a whole-PR round owed after an Opus substitute round must start at the merge base), round-cap, empty-range, head-moved',
@@ -110,13 +110,13 @@ const countedInvalid = (record) => record.attempts.filter((a) => a.status === 'i
 // ---- the evidence ---------------------------------------------------------------------------------------------------------------------------
 
 // route.json must hold finished evidence of an eligible kind for this very round. (Everything about the reset time is prepare's alone, below.)
-function checkEvidence(route, { round, mode }) {
+function checkEvidence(route, { round, mode, modeOffFrom }) {
   if (route === null) throw refuse('no-route', `round ${round} has no .review/round-${round}/route.json: run \`pipeline codex-review\` for it first`);
   if (!EVIDENCE_KINDS.includes(route.evidence)) {
     throw refuse('no-evidence', `round ${round}'s route.json holds evidence ${JSON.stringify(route.evidence)}, not quota | budget | governor: Codex was not refused (or is still being asked): run \`pipeline codex-review\` again`, { evidence: route.evidence ?? null });
   }
   if (route.round !== round) throw refuse('route-mismatch', `route.json is for round ${route.round}, not ${round}`);
-  if (mode === 'off') throw refuse('mode-off', 'review.substitute.mode is off: no substitute reviewer; park the round as without one');
+  if (mode === 'off') throw refuse('mode-off', `review.substitute.mode is off: no substitute reviewer; park the round as without one (${modeOffFrom})`, { modeOffFrom });
 }
 
 // The facts of the admitted round against the evidence. `packet` carries the prompt digest. The agent is what the PR's highest risk, ever, needs.
@@ -259,7 +259,7 @@ async function prepareLocked({ root, pr, round, ctx }) {
   const { config } = await requireConfig(root);
   const route = readRoute(root, round);
   const gates = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute (a PR must not loosen it)
-  checkEvidence(route, { round, mode: gates.mode });
+  checkEvidence(route, { round, mode: gates.mode, modeOffFrom: gates.modeOffFrom });
   if (headSha({ cwd: root }) !== route.head) throw headMoved();
   const adm = await admitRound({ root, config, ctx, pr, round, base: route.base, head: route.head });
   if (adm.baseOnly) throw refuse('base-only', `round ${round} only merges the base branch in: nothing for a reviewer to ask`);
@@ -346,7 +346,7 @@ async function applyLocked({ root, pr, round, ctx, givenTag, projectsDir, maxAge
   const { config } = await requireConfig(root);
   const route = readRoute(root, round);
   const gates = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute (a PR must not loosen it)
-  checkEvidence(route, { round, mode: gates.mode });
+  checkEvidence(route, { round, mode: gates.mode, modeOffFrom: gates.modeOffFrom });
   if (headSha({ cwd: root }) !== route.head) throw headMoved();
   // The shared admission (round order, base rule, round cap and grants, empty range, resolution proof) runs again; the recorder runs its final locked half below.
   const adm = await admitRound({ root, config, ctx, pr, round, base: route.base, head: route.head });

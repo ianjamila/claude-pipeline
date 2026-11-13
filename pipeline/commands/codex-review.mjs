@@ -51,6 +51,9 @@ export const meta = {
     '    does not count) or the weekly Codex quota used is at least review.codex_budget.hard (P codex-status; an unreadable figure turns the governor off). Codex is not run: exit 3 {ok:false, unavailable:true, reason:withheld, message,',
     '    substitute:{eligible:true, why: budget-spent|governor-hard, evidence: budget|governor, agent, resetAt:null}, plan}; route.json holds {evidence: budget, budget:{used, budget}} or {evidence: governor, governor:{usedPct, threshold, observedAt}}',
     '    with outcome withheld (valid for this attempt only). A larger round, or any protected round, stays on Codex however much was spent; review.substitute.mode off never substitutes',
+    '  review.effort.small_fix_lines, review.codex_round_budget, review.codex_budget.soft / .hard and review.substitute.mode / min_wait_minutes / max_packet_mb are each read as the stricter of the working-tree config and the config',
+    '    committed at the fork point of the default branch (lower small_fix_lines and max_packet_mb, higher budgets and min_wait_minutes, mode off when either says off), so a PR cannot loosen them; an unreadable base config means mode off;',
+    '    a mode-off plan or substitute verdict carries modeOffFrom: which config said off (the working tree, the base at the fork point, or an unreadable base with the reason)',
     '  a whole-PR round is owed (state outcome wholePrOwed) when an Opus substitute round came before the PR\'s risk rose to high and no whole-PR round has run since: that round must use the PR\'s merge base as --base (else exit 2 base-mismatch),',
     '    reviews the whole PR (reviewBaseKind merge-base, never base-only or resolution-only, counts toward the cap) and records wholePr:true and patchSha256. An all-Codex history owes none',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
@@ -83,7 +86,7 @@ export const meta = {
     '    taken alone',
     '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver. A Codex failure also carries',
     '    substitute:{eligible, why, agent, resetAt, waitUntil?}: eligible only for a real quota stop (Codex\'s own turn.failed event, confirmed by its session log when found) with',
-    '    review.substitute.mode auto; agent is substitute-fable once the PR was ever high risk (maxRisk), else substitute-opus; review.substitute.min_wait_minutes above 0 and a',
+    '    review.substitute.mode auto (the stricter of the working-tree and the fork-point config, as above); agent is substitute-fable once the PR was ever high risk (maxRisk), else substitute-opus; review.substitute.min_wait_minutes above 0 and a',
     '    reset within it gives eligible:false, waitUntil (default 0: never wait). A quota stop also carries quota:{proof: session-log|stream, resetAt, resetText}, and is noted',
     '    in the machine-wide Codex record (P codex-status: lastOutage, waiting); the next Codex answer for the PR clears it (best effort: a failure there is a warnings entry, never a failed round)',
     '  a Codex timeout, or a failure whose last turn.failed says the model is at capacity, is retried once in total (same prompt, same attempt; capacity after a wait): retried:{reason:timeout|capacity}; a second timeout is exit 3 unavailable with timedOut:true, never a substitute; a second capacity failure keeps its usual classification (error); quota is never retried',
@@ -100,6 +103,7 @@ export { CODEX_TIMEOUT_MS };
 const planOutput = (p) => ({
   route: p.route, evidence: p.evidence, effort: p.effort, why: p.why, round: p.round, base: p.base, wholePrOwed: p.wholePr, protected: p.protected, small: p.small,
   ...(p.lowered === undefined ? {} : { lowered: p.lowered }),
+  ...(p.why.startsWith('mode-off') && p.modeOffFrom ? { modeOffFrom: p.modeOffFrom } : {}),
   budget: p.budget, governor: p.governor === null ? null : { usedPct: p.governor.usedPct, soft: p.governor.soft, hard: p.governor.hard, observedAt: p.governor.observedAt },
   facts: { changedLines: Number.isFinite(p.facts.changedLines) ? p.facts.changedLines : null, newFile: p.facts.newFile, sensitive: p.facts.sensitive },
 });
@@ -209,7 +213,7 @@ export const run = guarded(async (argv, ctx) => {
   // A failed run: the verdict on a substitute, the final evidence (compare-and-swap: a superseded attempt exits 2 here instead), the machine-wide record.
   const failed = async (reason, extra, { ran, detail } = {}) => {
     const verdict = substituteEligibility({
-      reason, timedOut: ran?.timedOut === true, quota: ran?.quota, mode: sub.mode, minWaitMinutes: sub.minWaitMinutes, agent: attempt.route.agent,
+      reason, timedOut: ran?.timedOut === true, quota: ran?.quota, mode: sub.mode, modeOffFrom: sub.modeOffFrom, minWaitMinutes: sub.minWaitMinutes, agent: attempt.route.agent,
     });
     const quotaStop = reason === 'quota' && ran?.quota?.eligible === true;
     const final = quotaStop

@@ -99,6 +99,7 @@ export const meta = {
     '  -> start the substitute agent with promptHeader + "\\nRead <inputPath> and verify the findings it lists.\\n", pasted exactly, description = tag, no model argument; its answer is {"items":[{id, decision, confidence, reasoning}]} (second-review.schema.json), not the findings format',
     '     substitute also carries reused (as `substitute prepare`): true = the open attempt was handed back, or a transcript anywhere under the account\'s projects folder already carries the tag (a lost session), so an agent may already have run: run `--apply` FIRST (exit 2 not-found = none did: only then start the agent). Only `substitute.eligible: true` is a packet to run; a `substitute` without it is a refusal (`why`).',
     '     One unsettled packet per item (cp #256 R5-F1): `--ids` is the caller\'s, so a packet that shares an item with another packet of the round at the same head that is open (prepared), recorded invalid or exhausted gets no attempt: substitute {eligible: false, why: overlapping-packet, packet: <packetId8 of that one>}. Apply or park that packet first; the same ids again are the same packet and retry normally. Disjoint packets are independent.',
+    '  -> review.substitute.mode, min_wait_minutes and max_packet_mb are read as the stricter of the working-tree config and the config committed at the fork point of the default branch (mode off when either says off or the base cannot be read); a mode-off refusal or verdict carries modeOffFrom, which config said off and why',
     '  -> review.substitute.min_wait_minutes and the readability limit apply to a second review as to a first: a quota reset within the wait is substitute {eligible: false, why: reset-near, waitUntil}; an input the agent cannot read in full (more than 15 Read calls, counted from its lines and its estimated tokens, or one line alone of more than 20000 estimated tokens, or a NUL byte) is substitute {eligible: false, why: packet-unreadable, pages, maxPages, files} (or longLine {rel, line, tokens} / unreadableFile {rel, reason}) (nothing written, no attempt opened). It also may carry `warnings` (output beside `substitute`): the machine-wide Codex record that the PR now waits for Codex could not be written (best effort: it never changes the exit code or the substitute verdict)',
     'pipeline triage second-review --apply --pr N --tag TAG [--repo DIR]   (--projects-dir DIR and --max-age-ms N: test suite only, exit 2 test-only-flag without PIPELINE_TEST_MODE)',
     '  -> proves the transcript tagged TAG exactly as `substitute apply` does (lib/substitute-proof.mjs: exactly ONE transcript, agent type, pinned model per turn, Fable floor, effort high, only Read/Grep/Glob, the first prompt EXACTLY the prepared one, successful Reads that cover EVERY line of the input (coverage is credited from the line numbers and the text each Read RETURNED, not from its offset / limit: a returned row counts only when its text equals the file\'s line, a row cut short ends the credit, and the pages together must leave no gap),',
@@ -591,7 +592,7 @@ async function secondReview(rest, ctx) {
   const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
   if (!ran.ok) {
     const verdict = substituteEligibility({
-      reason: ran.reason, timedOut: ran.timedOut === true, quota: ran.quota, mode: sub.mode, minWaitMinutes: sub.minWaitMinutes, agent: asked.agent,
+      reason: ran.reason, timedOut: ran.timedOut === true, quota: ran.quota, mode: sub.mode, modeOffFrom: sub.modeOffFrom, minWaitMinutes: sub.minWaitMinutes, agent: asked.agent,
     });
     const quotaStop = ran.reason === 'quota' && ran.quota?.eligible === true;
     await failAttempt(quotaStop
@@ -694,7 +695,8 @@ async function secondReviewApply(values, ctx) {
   const n = Number(m[1]);
   const id8 = m[2];
   if (config.owner_approval !== 'chat') throw fail(EXIT.FAILED, 'label-mode', 'a second review is run only with owner_approval: chat in pipeline.yml');
-  if (routeConfigFor(root, config).mode === 'off') throw fail(EXIT.FAILED, 'mode-off', 'review.substitute.mode is off: no substitute reviewer');
+  const gates = routeConfigFor(root, config);
+  if (gates.mode === 'off') throw fail(EXIT.FAILED, 'mode-off', `review.substitute.mode is off: no substitute reviewer (${gates.modeOffFrom})`, { modeOffFrom: gates.modeOffFrom });
   const env = ctx.env ?? process.env;
   const o = { cwd: root };
 

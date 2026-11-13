@@ -328,7 +328,8 @@ export function protectedKindsOf(adm) {
 // The substitute's own gates (review.substitute.*, read by codex-review's verdict, `substitute prepare|apply` and `triage second-review`) follow the same rule: a HIGHER
 // min_wait_minutes (Codex is waited for longer) and a LOWER max_packet_mb (fewer packets may go to a substitute).
 // An unreadable or invalid base config cannot be compared: the working tree is held against the built-in defaults instead (never looser than them), and the mode is off.
-// -> { smallFixLines, codexRoundBudget, soft, hard, mode, minWaitMinutes, maxPacketMb }
+// -> { smallFixLines, codexRoundBudget, soft, hard, mode, minWaitMinutes, maxPacketMb, modeOffFrom }; modeOffFrom says where an off came from (null when the mode is auto): the
+// working-tree config, the base config at the fork point, or an unreadable base config (with trustedBaseOf's reason), for the refusals that name it.
 export function strictestRouteConfig(config, trusted) {
   const knobs = (c, mode) => ({
     smallFixLines: c.review.effort.small_fix_lines, codexRoundBudget: c.review.codex_round_budget,
@@ -337,7 +338,12 @@ export function strictestRouteConfig(config, trusted) {
   });
   const wt = knobs(config);
   const other = trusted?.ok === true ? knobs(trusted.config) : knobs(DEFAULTS, 'off');
+  const modeOffFrom = wt.mode === 'off' ? 'the working-tree pipeline.yml sets review.substitute.mode off'
+    : other.mode !== 'off' ? null
+      : trusted?.ok === true ? "the pipeline.yml at the default branch's fork point sets review.substitute.mode off (the stricter of it and the working-tree config applies, so the working tree cannot turn the substitute on)"
+        : `the pipeline.yml at the default branch's fork point could not be read (${trusted?.reason ?? 'no reason given'}); an unreadable base config turns the substitute off`;
   return {
+    modeOffFrom,
     smallFixLines: Math.min(wt.smallFixLines, other.smallFixLines), codexRoundBudget: Math.max(wt.codexRoundBudget, other.codexRoundBudget),
     soft: Math.max(wt.soft, other.soft), hard: Math.max(wt.hard, other.hard), mode: wt.mode === 'off' || other.mode === 'off' ? 'off' : wt.mode,
     minWaitMinutes: Math.max(wt.minWaitMinutes, other.minWaitMinutes), maxPacketMb: Math.min(wt.maxPacketMb, other.maxPacketMb),
@@ -379,7 +385,7 @@ export function planRound(adm, { env = process.env, now = Date.now() } = {}) {
     mode: route.mode, protectedKinds: kinds, small, governor, budget,
     normal: baseEffort({ effort, firstOrWholePr: round === 1 || adm.wholePr === true, level: adm.level }), smallFix: effort.small_fix,
   });
-  return { ...decision, round, base: adm.review.base, wholePr: adm.wholePr === true, budget, governor, facts };
+  return { ...decision, round, base: adm.review.base, wholePr: adm.wholePr === true, budget, governor, facts, modeOffFrom: route.modeOffFrom };
 }
 
 // A base-merge-only round has nothing to ask about: zero findings, and the round says why.

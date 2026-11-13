@@ -153,5 +153,8 @@ review:
     mode: auto                  #   auto = use it (the owner's own "merge" is then required); off = park the PR until Codex is back
     min_wait_minutes: 0         #   0 = never wait for Codex; N > 0 = when Codex says it is back within N minutes, wait for it instead
     max_packet_mb: 8            #   the evidence a substitute needs (rules files, the patch) may not pass this size, else the round parks
+                                # The three knobs above, small_fix_lines, codex_round_budget and codex_budget are also read as committed at the default branch's fork point,
+                                # and the STRICTER of the two wins (lower small_fix_lines / max_packet_mb, higher budgets / min_wait_minutes, mode off if either says off), so a PR
+                                # cannot loosen its own routing. A fork-point config that cannot be read counts as mode off.
 
 agent_log: docs/agent-log.md   # one line per run; kept on the orphan branch `pipeline-agent-log` (`pipeline agent-log publish`), never committed to a PR branch
