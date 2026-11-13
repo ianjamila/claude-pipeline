@@ -38,13 +38,14 @@ const GH = [
 // Every Fable round here comes from src/a.js being a path the config sends to Fable each round; src/b.js is the "fix" file.
 const YML = (extra = '') => `${pipelineYml()}review:\n  arbiter_always_paths: [src/a.js]\n${extra}`;
 
-function world(t, { yml = YML() } = {}) {
+function world(t, { yml = YML(), initFiles = {} } = {}) {
   const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
   repo.write('.gitignore', '.review/\n');
   repo.write('src/a.js', aFile(false));
   repo.write('src/b.js', bFile(false));
+  for (const [p, c] of Object.entries(initFiles)) repo.write(p, c);
   const base = repo.commit('init');
   repo.branch('feat/x');
   repo.write('src/a.js', aFile(true));
@@ -111,6 +112,16 @@ function world(t, { yml = YML() } = {}) {
       fake.setScript(withHead(sha));
       w.headNow = sha;
       assertExit(w.codex(2, findingsOf(), { from: head, to: sha }), 0);
+      return sha;
+    },
+    // A later fix round n (previous round's head -> new commit over `files`), Codex over it with `findings`.
+    nextRound(n, files, findings = findingsOf()) {
+      const from = w.headNow;
+      for (const [p, c] of Object.entries(files)) repo.write(p, c);
+      const sha = repo.commit(`fix round ${n}`);
+      fake.setScript(withHead(sha));
+      w.headNow = sha;
+      assertExit(w.codex(n, findings, { from, to: sha }), 0);
       return sha;
     },
     needed(n) { return w.cli(['arbiter', 'needed', '--round', String(n)]); },
@@ -597,4 +608,53 @@ test('late lane: a flagged fix scope (a 170-line fix, over review.fix_round_max_
   assert.match(r.json.briefReason, /late fix round: the fix scope is flagged \(170 non-test added lines > 150/);
   const fresh = fixWorld(t, { yml: LATE(1), files: { 'src/b.js': bFile(true), 'src/helper.js': 'export const h = 1;\n' } });
   assert.match(fresh.needed(2).json.briefReason, /new non-test file: src\/helper\.js/);
+});
+
+test('late lane: an R4-pipeline hit in the round range stays full (only a P-path is discounted)', (t) => {
+  const w = fixWorld(t, { yml: LATE(1), initFiles: { '.github/workflows/ci.yml': 'name: ci\non: push\n' }, files: { 'src/b.js': bFile(true), '.github/workflows/ci.yml': 'name: ci\non: [push, pull_request]\n' } });
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.brief, 'full');
+  assert.match(r.json.briefReason, /hard-stop hit in the round range/);
+});
+
+test('late lane: a size driver (the round range alone is medium by size) stays full; a path-only high risk does not', (t) => {
+  const w = fixWorld(t, { yml: LATE(1, '  light_lane_max_lines: 1\nrisk:\n  medium_lines: 1\n') });
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.brief, 'full');
+  assert.match(r.json.briefReason, /round's own range is medium risk/);
+  const pathOnly = fixWorld(t, { yml: LATE(1, 'risk:\n  high_risk_paths: [src/b.js]\n') });
+  const p = pathOnly.needed(2);
+  assertExit(p, 0, p.stdout + p.stderr);
+  assert.equal(p.json.brief, 'fix-verify', 'high_risk_paths alone is the path driver the late lane allows');
+});
+
+test('late lane: a P-path hit is discounted WITHOUT risk.ignore_hard_stop_rules (R7); outside the late lane the same range is full', (t) => {
+  const initFiles = { 'src/hard.js': 'export const h = 1;\n' };
+  const files = { 'src/b.js': bFile(true), 'src/hard.js': 'export const h = 2;\n' };
+  const hard = 'hard_stops:\n  paths: [src/hard.js]\n';
+  const late = fixWorld(t, { yml: LATE(1, hard), initFiles, files });
+  const r = late.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.brief, r.json.agent], ['fix-verify', 'arbiter-fix']);
+  const early = fixWorld(t, { yml: LATE(2, hard), initFiles, files });
+  assert.equal(early.needed(2).json.brief, 'full');
+});
+
+test('late lane, R3 over three rounds: round 2 widens integrity.test_globs, round 3 adds a helper there: the fork-point config calls it a new source file, so the round is full', (t) => {
+  const widened = `${LATE(1, '  max_rounds: 4\n')}integrity:\n  test_globs: ['helpers/**', 'test/**', '**/*.test.*']\n`;
+  const w = world(t, { yml: LATE(1, '  max_rounds: 4\n') });
+  w.round1('ACCEPT');
+  w.nextRound(2, { 'src/b.js': bFile(true), '.claude/pipeline.yml': widened }, findingsOf([finding({ title: 'Another rename', line: 5 })]));
+  const n2 = w.needed(2);
+  assertExit(n2, 0, n2.stdout + n2.stderr);
+  assert.equal(n2.json.brief, 'full', 'editing pipeline.yml is an R4-pipeline hit');
+  const a2 = w.apply(2, n2.json, { answer: { rulings: [{ id: 'R2-S1', ruling: 'ACCEPT', confidence: 'high', reasoning: 'src/b.js:5 is vague' }], findings: [] } });
+  assertExit(a2, 0, a2.stdout);
+  w.nextRound(3, { 'helpers/make.js': 'export const make = () => 1;\n' });
+  const n3 = w.needed(3);
+  assertExit(n3, 0, n3.stdout + n3.stderr);
+  assert.equal(n3.json.brief, 'full');
+  assert.match(n3.json.briefReason, /late fix round: the fix scope is flagged \(new non-test file: helpers\/make\.js\)/);
 });

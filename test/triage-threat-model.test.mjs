@@ -3,8 +3,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  applyRulings, fableFindingItems, reviewEligibilityProblems, roundOutcome, rulingsDigest, rulingsInventory, validateRulings,
+  applyRulings, fableFindingItems, reviewEligibilityProblems, roundOutcome, rulingsBlock, rulingsDigest, rulingsInventory, validateRulings,
 } from '../pipeline/lib/triage.mjs';
+import { rulingsBlockDigest } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const MODELS = [{ name: 'guards', paths: ['pipeline/hooks/**'], text: 't' }, { name: 'docs', paths: ['docs/**'], text: 'd' }];
 const entry = (path, over = {}) => ({ path, oldPath: path, newPath: path, status: 'M', binary: false, added: [], removed: [], ...over });
@@ -198,4 +199,16 @@ test('F5: an unfiled marked FOLLOW-UP blocks review-complete; filing it clears; 
   assert.deepEqual(roundOutcome(unfiled), roundOutcome(filed), 'reachedMax / extraRound / newAccepted do not move with the filing');
   const plain = marked({ final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'x' } });
   assert.deepEqual(reviewEligibilityProblems(stateOf([plain])), [], 'an ordinary arbiter follow-up is not this rule');
+});
+
+test('the merge gate sees it: the Rulings block (what the final gate binds the owner\'s "merge" to) lists "outside threat model guards" and its digest moves with the attribution; a legacy block is unchanged', () => {
+  const legacy = marked({ final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'outside' } });
+  const block = rulingsBlock(stateOf([marked()]));
+  assert.match(block, /^Rulings [0-9a-f]{12}\n/);
+  assert.match(block, /by arbiter \(outside threat model guards\)/);
+  const other = rulingsBlock(stateOf([marked({ final: { ...marked().final, outOfModel: 'docs' } })]));
+  assert.notEqual(rulingsBlockDigest(block), rulingsBlockDigest(other), 'a changed model name is a different block: a prior "merge" no longer binds');
+  assert.notEqual(rulingsBlockDigest(block), rulingsBlockDigest(rulingsBlock(stateOf([legacy]))));
+  assert.doesNotMatch(rulingsBlock(stateOf([legacy])), /threat model/, 'a ruling without the marker renders exactly as before');
+  assert.equal(rulingsBlockDigest(rulingsBlock(stateOf([]))), 'none');
 });
