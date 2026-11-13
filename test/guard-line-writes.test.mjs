@@ -112,7 +112,7 @@ test('h: a file copied, moved, linked or catted into a script that is then run i
     'install -m 755 f.sh n.sh; bash n.sh', 'cp -f f.sh n.sh; bash n.sh', 'dd if=f.sh of=n.sh 2>/dev/null; bash n.sh', 'rsync f.sh n.sh; bash n.sh', 'ditto f.sh n.sh; bash n.sh',
     'head -c 99999 f.sh > n.sh; bash n.sh', 'cp -t d f.sh; bash d/f.sh', 'cp f.sh d/; bash d/f.sh', 'cp f.sh d; bash d/f.sh', 'mv f.sh d/n.sh; bash d/n.sh',
     'cp -a src d; bash d/f.sh', 'cp -r src e; bash e/f.sh', 'cp -r src d; bash d/src/f.sh', 'ln -s src e; bash e/f.sh',
-    'cd sub && cp ../f.sh n.sh && bash n.sh', 'cd sub; cp f.sh n.sh; bash n.sh', 'cp f.sh n.sh; cd sub; bash ../n.sh',
+    'cd ./sub && cp ../f.sh n.sh && bash n.sh', 'cd ./sub; cp f.sh n.sh; bash n.sh', 'cp f.sh n.sh; cd ./sub; bash ../n.sh',
   ]) denyBoth(c);
   // git mv is a move; a word `mv` elsewhere on a git command does not make it one
   denyBoth('git mv f.sh n.sh; bash n.sh');
@@ -238,7 +238,7 @@ test('h: what a script judged earlier on the line wrote is still written for the
   denyBoth('. ./mk.sh; bash n.sh', mk);
   denyBoth('./mk.sh; bash n.sh', mk);
   denyBoth('bash mk2.sh; bash n.sh', mk);
-  denyBoth('cd sub; bash mk.sh; bash n.sh', mk);
+  denyBoth('cd ./sub; bash mk.sh; bash n.sh', mk);
   denyBoth('bash mk.sh && cat n.sh | bash', mk);
   denyBoth((_, mid) => `bash mkc.sh; ${mid}; bash n.sh`, mk);
   denyBoth((bad) => `echo '${bad}' > mk3.sh; bash mk3.sh; bash n.sh`, { ...mk, 'mk3.sh': 'echo hi' });
@@ -490,7 +490,7 @@ test('h: every way a script is judged sees the line\'s writes', () => {
   const own = { ...SPEC, 'w.sh': 'cp f.sh m.sh; bash m.sh' };
   denyBoth('bash w.sh', own);
   const own2 = { ...SPEC, 'w2.sh': 'cp ../f.sh m.sh; bash m.sh', 'sub/w2.sh': 'cp ../f.sh m.sh; bash m.sh' };
-  denyBoth('cd sub; bash w2.sh', own2);
+  denyBoth('cd ./sub; bash w2.sh', own2);
 });
 
 test('h: the startup files a shell runs see the line\'s writes', () => {
@@ -540,10 +540,10 @@ test('h: a write in a conditional or background command still counts (strict)', 
 test('h controls: unrelated writes and harmless contents are allowed', () => {
   for (const c of [
     'echo hi > out.txt; bash ok.sh', 'cp ok.sh n.sh; bash n.sh', 'cat ok.sh > n.sh && bash n.sh', 'npm run build && bash ok.sh', 'mkdir -p d && cp ok.sh d/ && bash d/ok.sh',
-    'cp f.sh n.sh; bash ok.sh', 'cp f.sh elsewhere.txt; bash n.sh', 'cp f.sh sub/n.sh; bash n.sh', 'cd sub; cp ok.sh n.sh; bash n.sh', 'cat f.sh > n.txt; bash ok.sh',
+    'cp f.sh n.sh; bash ok.sh', 'cp f.sh elsewhere.txt; bash n.sh', 'cp f.sh sub/n.sh; bash n.sh', 'cd ./sub; cp ok.sh n.sh; bash n.sh', 'cat f.sh > n.txt; bash ok.sh',
     'cat ok.sh | tee n.sh >/dev/null; bash n.sh', 'tee n.sh < ok.sh >/dev/null; bash n.sh', 'mv ok.sh n.sh && bash n.sh', 'ln -s ok.sh n.sh; bash n.sh',
     'echo hi > n.sh; bash n.sh', 'touch n.sh; bash n.sh', ': > n.sh; bash n.sh', 'cp -r src d; bash d/ok.sh', 'install -m 755 ok.sh n.sh; bash n.sh', 'dd if=ok.sh of=n.sh; bash n.sh',
-    'cp f.sh d/n.sh; cd e; bash n.sh', 'cp f.sh $HOME/n.sh; bash n.sh',
+    'cp f.sh d/n.sh; cd ./e; bash n.sh', 'cp f.sh $HOME/n.sh; bash n.sh',
   ]) allowBoth(c);
   allowBoth(() => 'printf \'echo hi\' > n.sh; bash n.sh');
   allowBoth(() => 'printf \'echo %s\' hi > n.sh; bash n.sh');
@@ -1421,10 +1421,10 @@ test('L3: generic fallback: a command that is not provably pure and names the sc
   }
   denyBoth((_, mid) => `mytool src; ${mid}; bash src/ok.sh`); // (a directory above it)
   denyBoth((_, mid) => `mytool .; ${mid}; bash src/ok.sh`);
-  denyBoth((_, mid) => `cd src; mytool o*; ${mid}; bash ok.sh`);
+  denyBoth((_, mid) => `cd ./src; mytool o*; ${mid}; bash ok.sh`);
   // Why: the same relative word means another file after a cd (a remembered location is per command, never per word)
-  denyBoth((_, mid) => `cd src; mytool ok.sh; cd ..; ${mid}; mytool ok.sh; bash ok.sh`);
-  allowBoth((_, __, calm) => `cd src; mytool ok.sh; cd ..; ${calm}; bash ok.sh`);
+  denyBoth((_, mid) => `cd ./src; mytool ok.sh; cd ..; ${mid}; mytool ok.sh; bash ok.sh`);
+  allowBoth((_, __, calm) => `cd ./src; mytool ok.sh; cd ..; ${calm}; bash ok.sh`);
   // every OTHER file word is a possible source of the text: it is judged as a script
   denyBoth('mytool f.sh ok.sh; bash ok.sh');
   denyBoth('mytool --src=f.sh ok.sh; bash ok.sh');

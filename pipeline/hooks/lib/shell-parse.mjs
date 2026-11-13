@@ -21,6 +21,8 @@ const CTL_COUNTER = { loop: 'loop', fn: 'fn', if: 'cond', case: 'cond', cbrace: 
 const ctlMarks = (c) => ({ loop: c.loop > 0, fn: c.fn > 0, trap: c.trap > 0, cond: c.cond > 0 });
 const LOOP_WORDS = new Set(['while', 'until', 'for', 'select', 'repeat', 'foreach']);
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
+// plainSeq (see simpleCommands): the words that, at the start of a command, are shell syntax and no plain simple command (a compound command, a keyword, a group, a coprocess, a function, `[[`)
+const NOT_PLAIN_HEAD = new Set([...KEYWORDS, ...LOOP_WORDS, 'case', 'select', 'function', 'time', 'always', '{', '}', '[[']);
 // A word right before a ( that opens a subshell, a condition or arithmetic (`if(true)`, `for((i=0;;))`), not a glob qualifier group.
 const LEAD_WORDS = new Set([...KEYWORDS, 'for', 'case', 'select', 'in', 'time', 'function', 'foreach', 'switch', 'catch', 'elseif', 'param', 'trap', 'return', 'exit', 'throw']);
 // A group on a glob word that holds nothing but qualifier characters (`*(.)`, `*(^/)`, `*(om[1,3])`, `*(N)`) is not also read as a subshell.
@@ -486,6 +488,7 @@ const WRAPPERS = {
   builtin: plain(),
   noglob: plain(), // (zsh precommand modifiers: `noglob read k` runs read; #56 Fable review of 2edea61)
   nocorrect: plain(),
+  '-': (argv) => rest(argv, 1), // (R13-F1: zsh's fifth precommand modifier, `- git push`; it takes no options)
   exec: plain('a'),
   nohup: plain(),
   setsid: plain(),
@@ -536,7 +539,16 @@ const isProcSub = (w) => w.startsWith('<(') || w.startsWith('=(') || /^\$\{[^}]*
 // -s, `-`, /dev/stdin and /dev/fd/0 all mean "read the script from stdin".
 // `amb`: a word up to the decision point (the operand, or the `-c` / `-s` that made it a string or stdin) expands, so what
 // the shell runs may not be what the words as written say (`bash -o $X -c f.sh`: an empty $X makes -o swallow -c, and f.sh is the script file).
+// R17-F1: bash lets EVERY o / O in an option cluster take the next argv word, wherever it sits in the cluster (`bash -abouo emacs ignoreeof -hP`, `bash -oe pipefail f.sh`: o takes `pipefail`);
+// zsh ends the cluster at its first LOWERCASE o (the rest of the cluster is the option name: `zsh -ocdablevars f`, and `-oe` is the name `e`); R18-F3: in zsh an uppercase O is a plain flag (`zsh -Oc TEXT`, `zsh -O -c TEXT`, `zsh -cO TEXT` run TEXT). Where the two readings lead to another operand the record is ambiguous
+// (amb: every word is a candidate for the file kind) and `alt` holds the zsh reading, so a -c text is parsed both ways.
 function shellInvocation(argv) {
+  const bashReading = shellScan(argv, false);
+  const zshReading = shellScan(argv, true);
+  if (bashReading.at === zshReading.at && bashReading.kind === zshReading.kind) return bashReading; // (R18-F3: `zsh -O -c TEXT` ends at the same word, but there it is the -c text)
+  return { ...bashReading, amb: true, alt: { ...zshReading, amb: true } };
+}
+function shellScan(argv, zshGlued) {
   let i = 1;
   let sawC = false;
   let sawS = false;
@@ -550,18 +562,24 @@ function shellInvocation(argv) {
     if (t === '--') { i++; break; }
     if (t.length < 2 || (t[0] !== '-' && t[0] !== '+') || (t[0] === '+' && !/^\+[A-Za-z]/.test(t))) break; // (`+(f|fa).sh` is a pattern operand, not an option)
     if (t.startsWith('--')) { execUnsure = true; i += t === '--rcfile' || t === '--init-file' ? 2 : 1; continue; }
-    if (t[0] === '-' && t.includes('c')) sawC = true;
-    if (t[0] === '-' && t.includes('s')) sawS = true;
-    if (/n/.test(t.slice(1))) noexec = t[0] === '-';
-    if (/i/.test(t.slice(1))) execUnsure = true;
-    if (/[oO]$/.test(t) && /exec/i.test(argv[i + 1] ?? '')) execUnsure = true;
-    i += /[oO]$/.test(t) ? 2 : 1; // -o / -O take an option name
+    const letters = t.slice(1);
+    const firstO = zshGlued ? letters.search(/o/) : letters.search(/[oO]/); // (R18-F3: zsh: only lowercase o takes a name)
+    // (the letters that are flags in this reading, and how many option names the cluster takes from the words after it)
+    const flags = zshGlued && firstO >= 0 ? letters.slice(0, firstO + 1) : letters;
+    const take = zshGlued ? (firstO >= 0 && firstO === letters.length - 1 ? 1 : 0) : (letters.match(/[oO]/g) ?? []).length;
+    if (t[0] === '-' && flags.includes('c')) sawC = true;
+    if (t[0] === '-' && flags.includes('s')) sawS = true;
+    if (/n/.test(flags)) noexec = t[0] === '-';
+    if (/i/.test(flags)) execUnsure = true;
+    if (take > 0 && argv.slice(i + 1, i + 1 + take).some((w) => /exec/i.test(w))) execUnsure = true;
+    if (zshGlued && firstO >= 0 && firstO < letters.length - 1 && /exec/i.test(letters.slice(firstO + 1))) execUnsure = true; // (`zsh -oexec f`)
+    i += 1 + take; // -o / -O take an option name each
   }
   const before = argv.slice(1, i).some(hasExpansion);
-  if (sawC) return i < argv.length ? { kind: 'script', text: argv[i], amb: before } : { kind: 'none' };
-  if (sawS) return { kind: 'stdin', amb: before };
-  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', amb: before } : { kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion), parseOnly: noexec && !execUnsure && !before };
-  return { kind: 'stdin', amb: argv.slice(1).some(hasExpansion) }; // `bash -$X` may be `bash -x f.sh`
+  if (sawC) return i < argv.length ? { kind: 'script', text: argv[i], amb: before, at: i } : { kind: 'none', at: i };
+  if (sawS) return { kind: 'stdin', amb: before, at: i };
+  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', amb: before, at: i } : { at: i, kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion), parseOnly: noexec && !execUnsure && !before };
+  return { kind: 'stdin', amb: argv.slice(1).some(hasExpansion), at: i }; // `bash -$X` may be `bash -x f.sh`
 }
 
 // ---- script files -------------------------------------------------------------------------------
@@ -910,6 +928,7 @@ function scriptFileOfArgv(argv) {
   const name = base(argv[0]);
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
+    if (r.alt) return { kind: 'shell', file: r.kind === 'file' ? r.text : r.alt.kind === 'file' ? r.alt.text : undefined, ambiguous: true, words: argv.slice(1) }; // (R17-F1: the two readings of the option cluster lead to other operands)
     if (r.kind === 'file' && r.parseOnly && !r.amb && !isProcSub(r.text) && !FD_PATH.test(r.text)) return null; // (`bash -n f.sh`: checks the syntax, runs nothing)
     // a `<(...)` operand is script text, not a file, unless a word before it expands: then it is one more candidate word
     if (r.kind === 'file' && (r.amb || !isProcSub(r.text))) return r.amb ? { kind: 'shell', file: r.text, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: r.text };
@@ -1094,7 +1113,7 @@ function producerScript(argv) {
   const name = argv.length ? base(argv[0]) : '';
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
-    if (r.kind !== 'file' || isProcSub(r.text)) return null;
+    if (r.alt || r.kind !== 'file' || isProcSub(r.text)) return null;
     return argv.slice(1, argv.indexOf(r.text, 1)).some(hasExpansion) ? null : r.text;
   }
   const sf = scriptFileOfArgv(argv);
@@ -1891,6 +1910,15 @@ export const applyTransform = (value, transform) => (transform === 'lower' ? Str
 
 // The options before the operand: login / interactive flags (zsh), `unknown` when one expands, and the rc files bash is given.
 function startupOptions(argv, lit = new Set()) {
+  // R18-F4: the union of the bash reading (every o / O takes the next word) and the zsh reading (the cluster ends at its first lowercase o: the rest is the name, nothing more is taken; an uppercase O is a flag).
+  // A word one reading takes as an option name is a flag in the other (`zsh -oextendedglob -i -c true`), so the flags of both are taken, and when the readings differ on login / interactive both rc files are judged (unknown)
+  const bashRead = startupScan(argv, lit, false);
+  const zshRead = startupScan(argv, lit, true);
+  const o = { login: bashRead.login || zshRead.login, interactive: bashRead.interactive || zshRead.interactive, unknown: bashRead.unknown || zshRead.unknown, rc: [...new Set([...bashRead.rc, ...zshRead.rc])] };
+  if (bashRead.login !== zshRead.login || bashRead.interactive !== zshRead.interactive) o.unknown = true;
+  return o;
+}
+function startupScan(argv, lit, zsh) {
   const o = { login: false, interactive: false, unknown: false, rc: [] };
   let sawC = false;
   for (let i = 1; i < argv.length; i++) {
@@ -1906,14 +1934,33 @@ function startupOptions(argv, lit = new Set()) {
       else if (t === '--rcfile' || t === '--init-file') { if (argv[i + 1] !== undefined) o.rc.push(argv[i + 1]); i++; } else if (/^--(?:rcfile|init-file)=/.test(t)) o.rc.push(t.slice(t.indexOf('=') + 1));
       continue;
     }
-    if (t.includes('l')) o.login = true;
-    if (t.includes('i')) o.interactive = true;
-    if (t.includes('c')) sawC = true;
-    if (/[oO]$/.test(t)) {
-      const v = argv[++i] ?? '';
-      if (hasExpansion(v)) o.unknown = true;
-      if (/^login$/i.test(v)) o.login = true;
-      if (/^interactive$/i.test(v)) o.interactive = true;
+    const letters = t.slice(1);
+    const firstO = zsh ? letters.search(/o/) : letters.search(/[oO]/);
+    const flags = zsh && firstO >= 0 ? letters.slice(0, firstO + 1) : letters; // (the letters that are flags in this reading)
+    if (flags.includes('l')) o.login = true;
+    if (flags.includes('i')) o.interactive = true;
+    if (flags.includes('c')) sawC = true;
+    if (zsh) {
+      // (the rest of the cluster after the first o is the option name: `zsh -ologin`; an o that ends the cluster takes the next word)
+      if (firstO >= 0 && firstO < letters.length - 1) {
+        const glued = letters.slice(firstO + 1);
+        if (/^login$/i.test(glued)) o.login = true;
+        if (/^interactive$/i.test(glued)) o.interactive = true;
+        if (!/^[A-Za-z]+$/.test(glued)) o.unknown = true;
+      } else if (firstO >= 0) {
+        const v = argv[++i] ?? '';
+        if (hasExpansion(v)) o.unknown = true;
+        if (/^login$/i.test(v)) o.login = true;
+        if (/^interactive$/i.test(v)) o.interactive = true;
+      }
+    } else {
+      // (R17-F1: every o / O of a cluster takes the next word in bash)
+      for (let k = (letters.match(/[oO]/g) ?? []).length; k > 0; k--) {
+        const v = argv[++i] ?? '';
+        if (hasExpansion(v)) o.unknown = true;
+        if (/^login$/i.test(v)) o.login = true;
+        if (/^interactive$/i.test(v)) o.interactive = true;
+      }
     }
   }
   return o;
@@ -2227,43 +2274,85 @@ class Parser {
     return out;
   }
 
+  // One reading of a heredoc body that starts at `from`: where the shell would end it and what it would hand the command.
+  //   raw   every physical line is compared with the delimiter as written (a quoted delimiter; the <<- tab strip is per line)
+  //   bash  an UNQUOTED body: backslash-newline joins the lines, then <<- strips the tabs of the joined line (bash: make_here_document)
+  //   zsh   as bash, but <<- strips the tabs of the FIRST physical line of a logical line before the join (zsh: gethere)
+  // Returns { end (just past the terminator line, or the end of the text), found, lines, odd (a body line ends in a backslash), cr (a candidate terminator line is the delimiter plus a \r:
+  // the shell compares the line with the delimiter exactly, this parser tolerates the \r), bodyEnd (where the terminator line starts) }.
+  hdReading(from, h, mode) {
+    const s = this.src;
+    const n = s.length;
+    let pos = from;
+    const lines = [];
+    let odd = false;
+    let cr = false;
+    while (pos < n) {
+      const logicalAt = pos;
+      const parts = [];
+      let line;
+      let first = true;
+      for (;;) {
+        const eol = s.indexOf('\n', pos);
+        const end = eol < 0 ? n : eol;
+        line = s.slice(pos, end);
+        pos = eol < 0 ? n : eol + 1;
+        if (h.strip && (mode === 'raw' || (mode === 'zsh' && first))) line = line.replace(/^\t+/, '');
+        first = false;
+        if (mode === 'raw') break;
+        let b = line.length;
+        while (b > 0 && line.charCodeAt(b - 1) === 92) b--;
+        const run = line.length - b;
+        if (run === 0) break;
+        odd = true; // (a body line ends in a backslash: this is where the readings may part)
+        if (run % 2 === 0 || pos >= n) break;
+        parts.push(line.slice(0, -1));
+      }
+      if (parts.length) { parts.push(line); line = parts.join(''); }
+      if (h.strip && mode === 'bash') line = line.replace(/^\t+/, '');
+      if (line.endsWith('\r') && line.slice(0, -1) === h.delim) cr = true;
+      if (line.replace(/\r$/, '') === h.delim) return { end: pos, found: true, lines, odd, cr, bodyEnd: logicalAt };
+      lines.push(line);
+    }
+    return { end: n, found: false, lines, odd, cr, bodyEnd: n };
+  }
+
   // this.i is at the start of the lines after a command line that opened heredocs: consume the bodies.
+  // R12: bash and zsh part over backslash-newline inside an unquoted body (the join, and where the <<- tab strip falls), and over a \r on the terminator line or the delimiter. The body is read
+  // every plausible way (raw, bash, zsh); when the readings end it at different places, or a \r touches the delimiter or a terminator candidate, no single reading can be trusted for the
+  // commands that follow (they may be body in one reading and code in another, with quote state to match): the parse is UNDECIDABLE (ctx.undecidable, also truncated), which the git and
+  // files policies refuse. When the readings agree, their body texts are all scanned for substitutions.
   readHeredocs() {
     const s = this.src;
     let pos = this.i;
     for (const h of this.hd) {
-      const lines = [];
       const bodyAt = pos;
-      let found = false;
-      while (pos < s.length) {
-        const eol = s.indexOf('\n', pos);
-        const end = eol < 0 ? s.length : eol;
-        const line = s.slice(pos, end);
-        pos = eol < 0 ? s.length : eol + 1;
-        let cmp = line.replace(/\r$/, '');
-        if (h.strip) cmp = cmp.replace(/^\t+/, '');
-        if (cmp === h.delim) { found = true; break; }
-        lines.push(line);
+      const rs = [this.hdReading(bodyAt, h, h.quoted ? 'raw' : 'bash')];
+      if (!h.quoted && rs[0].odd) {
+        this.ctx.hdOdd = true; // (R10-F1: a body with a backslash-ended line is never a plain sequence, whatever the readings say)
+        rs.push(this.hdReading(bodyAt, h, 'raw'));
+        if (h.strip) rs.push(this.hdReading(bodyAt, h, 'zsh'));
       }
-      // Why: `<<-` strips the leading tabs of the body before the command reads it (`bash <<-'EOF'` + `\tgit pu\` + `\tsh origin main`: one push the tabs hid)
-      const raw = lines.join('\n');
-      const text = h.strip ? lines.map((l) => l.replace(/^\t+/, '')).join('\n') : raw;
-      h.seg.heredocs.push({ text, quoted: h.quoted, lines: lines.length });
-      // where the body sits in the line (see heredocSpans in simpleCommands): only for a body this parser read out of the line itself and that ended at
-      // its terminator; one read out of another text (backticks, bash -c, a body's own substitution) or that ran to the end is not located.
-      // The span covers the raw body as written (tabs included), not the stripped text
-      if (found && this.src === this.ctx.rootSrc) this.ctx.hdSpans.push([bodyAt, bodyAt + raw.length, h.quoted]);
+      const r0 = rs[0];
+      if (h.crDelim || rs.some((r) => r.cr || r.end !== r0.end || r.found !== r0.found)) { this.ctx.undecidable = true; this.ctx.truncated = true; }
+      // the texts the command reads (one per distinct reading): `<<-` strips the tabs before the command reads the body (`bash <<-'EOF'` + `\tgit pu\` + `\tsh origin main`: one push the tabs hid)
+      const byText = new Map(rs.map((r) => [r.lines.join('\n'), r.lines.length]));
+      const texts = [...byText.keys()];
+      for (const [text, lines] of byText) h.seg.heredocs.push({ text, quoted: h.quoted, lines });
+      // where the body sits in the line (see heredocSpans in simpleCommands): only for a body this parser read out of the line itself and found a terminator for; one read out of
+      // another text (backticks, bash -c, a body's own substitution) or that ran to the end is not located. The span covers the raw body as written (tabs included), not the stripped text
+      if (r0.found && this.src === this.ctx.rootSrc) this.ctx.hdSpans.push([bodyAt, bodyAt + Math.max(0, r0.bodyEnd - bodyAt - 1), h.quoted]);
       else this.ctx.hdForeign = true;
+      pos = r0.end;
       h.seg.pending--;
       if (h.seg.muted) continue;
       const grp = this.ctx.grp;
       this.ctx.grp = h.seg.grp; // (the body expands where its command runs: inside the subshells that command was written in)
       try {
-        // No terminator: either a malformed command or a `<<` we mistook for a heredoc that then swallowed the rest
-        // of the line. Parsing the body as script costs a false positive at worst, never a miss.
-        if (!found) this.subParse(text, h.seg.depth + 1);
-        // An unquoted heredoc still expands $(...) and backticks, so a body can run commands. Quoted ones are inert data.
-        else if (!h.quoted) this.scanExpansions(text, h.seg.depth);
+        // An unquoted heredoc still expands $(...) and backticks, so a body can run commands (whatever the text around them: a `#` or single quotes are plain body text). Quoted ones are inert data.
+        if (!h.quoted) for (const text of texts) this.scanExpansions(text, h.seg.depth);
+        // No terminator at all: either a malformed command or a `<<` we mistook for a heredoc that then swallowed the rest of the line: the body, as written, is parsed as script (a false positive at worst, never a miss).
+        if (!r0.found && bodyAt < r0.end) this.subParse(s.slice(bodyAt, r0.end), h.seg.depth + 1);
       } finally { this.ctx.grp = grp; }
     }
     this.hd = [];
@@ -2401,7 +2490,9 @@ class Parser {
       if (mode === 'heredoc') {
         seg.redirects.push({ op: '<<', target: null, fd: rfd });
         seg.pending++;
-        this.hd.push({ delim: text, strip, quoted: q >= 0, seg });
+        // (the parser and the shell must end the body at the same line: a delimiter is trusted only when it is plain text and its spelling is that text with some quotes / backslashes added; anything else is odd)
+        if (!/^[A-Za-z0-9_.-]+$/.test(text) || s.slice(from, Math.min(this.i, n)).replace(/['"\\]/g, '') !== text) ctx.hdOdd = true;
+        this.hd.push({ delim: text, strip, quoted: q >= 0, seg, crDelim: s[Math.min(this.i, n)] === '\r' }); // (a \r right after the delimiter word: the shell's delimiter ends in \r, this parser's does not)
         return;
       }
       let win;
@@ -2523,8 +2614,8 @@ class Parser {
         startSeg();
         const nx = s[this.i + 1];
         if (nx === '(') { inWord = true; wdyn = true; const n0 = this.subAcc.length; const at = cur.length; cur += this.substitution(depth); wspans.push([at, cur.length]); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
-        else if (nx === "'") { mark(); const r = readAnsiC(s, this.i + 1); cur += r.text; this.i = r.next; }
-        else if (nx === '"') { mark(); this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; takeSubs(); }
+        else if (nx === "'") { mark(); ctx.ansiC = true; const r = readAnsiC(s, this.i + 1); cur += r.text; this.i = r.next; }
+        else if (nx === '"') { mark(); ctx.ansiC = true; this.i += 2; cur += this.readDq(depth); if (this.lastDqDyn) wdyn = true; takeSubs(); }
         else if (nx === '{' && this.paramSpan(this.i) > 0) {
           // `${f%%(*}`, `${x:-a b;c}`: one word; the ( ) ; | & and blanks inside the braces are not shell syntax
           const end = this.paramSpan(this.i);
@@ -2570,7 +2661,7 @@ class Parser {
       } else if (c === '&') {
         const nx = s[this.i + 1];
         if (nx === '&') { endSeg(this.i); lastSep = '&&'; this.i += 2; }
-        else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; endSeg(this.i); this.markClosedOut(closed); lastSep = '&'; this.i++; } // a background job: the command before it ran in a subshell
+        else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; endSeg(this.i); this.markClosedOut(closed); lastSep = '&'; this.i++; if (depth === 0) ctx.notPlain = true; } // a background job: the command before it ran in a subshell
         else if (nx === '>' && !noRedir) {
           flushWord(); startSeg();
           redir = 'file'; rfd = null;
@@ -2579,6 +2670,7 @@ class Parser {
       } else if (c === '|') {
         const nx = s[this.i + 1];
         flushWord(); // (`}|cat`: the closing word first)
+        if (depth === 0) ctx.notPlain = true; // (| |& ||)
         const closed = seg?.closesFrom;
         endSeg(this.i);
         if (nx !== '|') this.markClosedOut(closed);
@@ -2633,6 +2725,7 @@ class Parser {
           // (a subshell after && / || runs only when that holds, and one that is a pipeline stage runs apart: its commands may not run, as for a { } group (cbrace).
           // `{ cat a; true || (cat x); cat c; } | bash` runs a+c, which the join a+x+c hid)
           const cond = !body && !(seg && seg.words.length) && ['&&', '||', '|'].includes(lastSep);
+          if (depth === 0) ctx.notPlain = true; // (a subshell, a function body, `((`)
           endSeg(this.i);
           lastSep = ';';
           this.i++;
@@ -2650,6 +2743,7 @@ class Parser {
           this.lastStage = this.log.slice(mark0).filter((x) => x.depth === depth);
         }
       } else if (c === ')') {
+        if (depth === 0) ctx.notPlain = true;
         endSeg(this.i);
         lastSep = ';';
         this.i++;
@@ -2834,6 +2928,16 @@ class Parser {
     seg.final = { argv: [] };
     let last = null;
     for (const g of groups) last = this.finalizeGroup(g, seg) ?? last;
+    if (seg.depth === 0) { // (plainSeq: a segment that is no plain simple command: it emits none, or opens / closes a group, or starts with a keyword)
+      let plain = !!last && seg.words.length > 0;
+      let headOnly = true; // (every word so far is an unquoted keyword: one running flag, a prefix rescan per word is quadratic)
+      for (const w of seg.words) {
+        if (w.qa >= 0) { headOnly = false; continue; }
+        if (w.text === '{' || w.text === '}' || w.text === '[[' || (headOnly && NOT_PLAIN_HEAD.has(w.text))) { plain = false; break; }
+        headOnly = headOnly && NOT_PLAIN_HEAD.has(w.text);
+      }
+      if (!plain) this.ctx.notPlain = true;
+    }
     if (seg.outSubs.length || seg.words.some((w) => w.subs.length && w.text.includes('>('))) this.feedOutSubs(seg);
     // Redirections belong to the command they were written on; a redirect with no command of its own
     // (`> file`, `{ a; } > file`, `(a) > file`) still has to reach the caller.
@@ -3014,7 +3118,7 @@ class Parser {
       else if (t.startsWith('--arg-file=')) argFile = t.slice(11);
     }
     const parallel = base(fan[0]) === 'parallel';
-    const fed = r.kind === 'none' || (r.kind === 'script' && (parallel ? /\{[^}]*\}/.test(r.text) : [...repl].some((x) => r.text.includes(x))));
+    const fed = [r, ...(r.alt ? [r.alt] : [])].some((q) => q.kind === 'none' || (q.kind === 'script' && (parallel ? /\{[^}]*\}/.test(q.text) : [...repl].some((x) => q.text.includes(x)))));
     if (!fed) return;
     const src = stdinSource(seg);
     const st = src.st;
@@ -3210,12 +3314,14 @@ class Parser {
     const name = base(argv[0]);
     const depth = seg.depth + 1;
     if (SHELLS.has(name)) {
-      const r = shellInvocation(argv);
-      if (r.kind === 'script') this.runScript(seg, [r.text], r.text, depth);
-      else if (r.kind === 'stdin') this.runStdin(seg, depth);
-      else if (r.kind === 'file' && isProcSub(r.text)) this.runProcessSub(seg, r.text, depth);
-      else if (r.kind === 'file' && FD_PATH.test(r.text)) this.runFd(seg, r.text);
-      if (r.amb) this.maybeProcessSubs(seg, argv, depth, r.kind === 'file' ? r.text : undefined);
+      const r0 = shellInvocation(argv);
+      for (const r of [r0, ...(r0.alt ? [r0.alt] : [])]) { // (R17-F1: both readings of an option cluster whose o / O letters take words differently)
+        if (r.kind === 'script') this.runScript(seg, [r.text], r.text, depth);
+        else if (r.kind === 'stdin') this.runStdin(seg, depth);
+        else if (r.kind === 'file' && isProcSub(r.text)) this.runProcessSub(seg, r.text, depth);
+        else if (r.kind === 'file' && FD_PATH.test(r.text)) this.runFd(seg, r.text);
+        if (r.amb) this.maybeProcessSubs(seg, argv, depth, r.kind === 'file' ? r.text : undefined);
+      }
     } else if (name === 'source' || name === '.') {
       const op = argv[1];
       if (op === undefined) return;
@@ -3261,7 +3367,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, ansiC: false, notPlain: false, hdOdd: false, undecidable: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -3278,6 +3384,9 @@ function withoutComments(src, maxDepth, expired) {
   for (const [a, b] of p.comments) { out += src.slice(at, a) + ' '.repeat(b - a); at = b; }
   return out + src.slice(at);
 }
+
+// The reason a policy gives for a line whose parse is undecidable (see readHeredocs)
+export const UNDECIDABLE_HEREDOC = 'the line has a heredoc whose end the shells read differently (a backslash-newline or a carriage return in its body or delimiter), so it cannot be said what is body text and what is a command. Rewrite it with a plain delimiter and no trailing backslash or carriage return in the body (or write the text to a file first).';
 
 export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
@@ -3301,6 +3410,8 @@ export function simpleCommands(str, opts) {
     try { parser?.drain(true); } catch { /* best effort */ }
   }
   Object.defineProperty(ctx.out, 'truncated', { value: ctx.truncated, enumerable: false });
+  // undecidable: a heredoc whose end the shells read differently (see readHeredocs); truncated is set with it, so a caller that refuses a cut-short parse refuses this one too, and one that wants the cause can ask
+  Object.defineProperty(ctx.out, 'undecidable', { value: ctx.undecidable, enumerable: false });
   Object.defineProperty(ctx.out, 'dynamic', { value: ctx.dynamic || ctx.dynamicHead, enumerable: false });
   // dynamicOther: dynamic for a reason other than a command word that starts with `$` or holds a substitution (#81 t8: such a head is resolved per reading by the git policy's onceAssignedNames;
   // a stdin feed of that command, a process substitution, an unknown descriptor ... still count here)
@@ -3310,6 +3421,13 @@ export function simpleCommands(str, opts) {
   Object.defineProperty(ctx.out, 'fns', { value: ctx.fns, enumerable: false });
   // ctlBroken: the loop / branch / function marks (ctl) are not to be trusted (an unmatched closer, a construct finished out of order): callers read the line as before
   Object.defineProperty(ctx.out, 'ctlBroken', { value: ctx.ctlBroken, enumerable: false });
+  // ansiC: the text holds a `$'…'` or `$"…"` string anywhere (a caller that wants to fail closed on strings whose quoting rules differ from a plain one)
+  Object.defineProperty(ctx.out, 'ansiC', { value: ctx.ansiC, enumerable: false });
+  // plainSeq: the whole text is a plain sequence of simple commands joined by && ; or a newline, and nothing else (comments and heredoc bodies aside). Set false for any { } ( ) group or subshell,
+  // `!`, coproc, always, function, compound command (if / for / while / until / select / case), `[[`, `time`, `||`, `|`, `|&`, `&`, a segment that emits no command, a cut-short parse (truncated, ctlBroken),
+  // a heredoc whose body the parser cannot locate or whose delimiter spelling or terminator line the shell may read differently. A caller that needs to know a command surely ran after the one before it
+  // (the cd narrowing of the files policy) trusts the order of the commands only for such a text. Only the text's own level counts: what a substitution or a `-c` string holds runs in another shell.
+  Object.defineProperty(ctx.out, 'plainSeq', { value: !ctx.notPlain && !ctx.hdOdd && !ctx.truncated && !ctx.ctlBroken && !ctx.hdForeign, enumerable: false });
   // heredocSpans: [start, end, quoted] of every heredoc body in the text (quoted: its delimiter was quoted, so nothing in it expands), or null when one cannot be located (read out of other text, no terminator, a parse that gave up)
   Object.defineProperty(ctx.out, 'heredocSpans', { value: ctx.hdForeign || ctx.truncated ? null : ctx.hdSpans, enumerable: false });
   return ctx.out;
