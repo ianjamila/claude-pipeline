@@ -258,16 +258,16 @@ function prepare(rest, ctx) {
 async function prepareLocked({ root, pr, round, ctx }) {
   const { config } = await requireConfig(root);
   const route = readRoute(root, round);
-  const sub = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute (a PR must not loosen it)
-  checkEvidence(route, { round, mode: sub.mode });
+  const gates = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute (a PR must not loosen it)
+  checkEvidence(route, { round, mode: gates.mode });
   if (headSha({ cwd: root }) !== route.head) throw headMoved();
   const adm = await admitRound({ root, config, ctx, pr, round, base: route.base, head: route.head });
   if (adm.baseOnly) throw refuse('base-only', `round ${round} only merges the base branch in: nothing for a reviewer to ask`);
-  const maxBytes = sub.maxPacketMb * 1024 * 1024;
+  const maxBytes = gates.maxPacketMb * 1024 * 1024;
   const packet = buildPacket(adm, route, root, maxBytes);
   const agent = checkAgainstRound(route, adm, packet, root);
   checkReadable(packet);
-  checkReset(route, Date.now(), ctx.env, sub.minWaitMinutes);
+  checkReset(route, Date.now(), ctx.env, gates.minWaitMinutes);
 
   // The attempt: the first, the open one again, or the next one after a recorded invalid.
   const record = readAttempts(root, round, identityOf(round, route));
@@ -345,13 +345,13 @@ async function applyLocked({ root, pr, round, ctx, givenTag, projectsDir, maxAge
   const env = ctx.env ?? process.env;
   const { config } = await requireConfig(root);
   const route = readRoute(root, round);
-  const sub = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute (a PR must not loosen it)
-  checkEvidence(route, { round, mode: sub.mode });
+  const gates = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute (a PR must not loosen it)
+  checkEvidence(route, { round, mode: gates.mode });
   if (headSha({ cwd: root }) !== route.head) throw headMoved();
   // The shared admission (round order, base rule, round cap and grants, empty range, resolution proof) runs again; the recorder runs its final locked half below.
   const adm = await admitRound({ root, config, ctx, pr, round, base: route.base, head: route.head });
   if (adm.baseOnly) throw refuse('base-only', `round ${round} only merges the base branch in: nothing for a reviewer to ask`);
-  const packet = buildPacket(adm, route, root, sub.maxPacketMb * 1024 * 1024);
+  const packet = buildPacket(adm, route, root, gates.maxPacketMb * 1024 * 1024);
   const agent = checkAgainstRound(route, adm, packet, root);
   // The open attempt is found by the round's content (attempts are kept per content, not per Codex attempt or packet text).
   const record = readAttempts(root, round, identityOf(round, route));
