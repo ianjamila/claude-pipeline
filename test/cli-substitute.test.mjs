@@ -650,7 +650,8 @@ test('a resolution-only round: the packet exports sides/ours and sides/base for 
   assert.equal(readFileSync(join(sub, 'sides', 'ours', 'src/a.js'), 'utf8'), ours, 'ours = the reviewed branch (the base of the resolution round)');
   assert.equal(readFileSync(join(sub, 'sides', 'base', 'src/a.js'), 'utf8').includes('1200'), true, 'base = the base branch\'s side');
   const input = readFileSync(p.json.inputPath, 'utf8');
-  assert.ok(input.includes('sides/ours/<path>') && input.includes('sides/base/<path>'), 'the map explains the side files');
+  // (the map names the side folders with the platform's own separator, like every exported path: backslashes on Windows)
+  assert.ok(input.includes(join(sub, 'sides', 'ours', '<path>')) && input.includes(join(sub, 'sides', 'base', '<path>')), 'the map explains the side files');
   assert.ok(input.includes(join(sub, 'sides', 'ours', 'src/a.js')) && input.includes(join(sub, 'sides', 'base', 'src/a.js')), 'the exported list names each side file with its digest');
   const r = w.cli(['substitute', 'apply', '--pr', '7', '--round', '2', '--projects-dir', install(w, p.json)]);
   assertExit(r, 0, r.stdout + r.stderr);
