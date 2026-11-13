@@ -443,7 +443,7 @@ test('comment --kind triage advice: an ACCEPT item still to fix on a READY PR of
   assert.equal(r.json.redraftAdvice, true);
   assert.equal(r.json.warnings.length, 1);
   assert.match(r.json.warnings[0], /PR #7 is ready/);
-  assert.match(r.json.warnings[0], /`pipeline redraft --pr 7`/);
+  assert.match(r.json.warnings[0], /`pipeline redraft --pr 7 --before-push`/);
   assert.equal(w.fake.comments().length, 1);
 });
 
