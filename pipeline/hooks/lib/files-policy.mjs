@@ -1570,7 +1570,36 @@ function quotedRefOnly(raw) {
   return i === n - 1; // (the closing quote is the last character: nothing was skipped past it)
 }
 const loneQuotedRef = (c) => c.argv.length === 1 && quotedRefOnly((c.raw ?? '').trim());
+// R15-F3: a child bash turns shopt options (cdable_vars) on at start-up from BASHOPTS in its environment (SHELLOPTS the same for `set -o` options). ANY mention of the name that is not a plain read
+// (`$BASHOPTS`) is a switch handed to every child shell, whatever the value: an env prefix, `env NAME=..`, a plain assignment, `export` / `declare -x` / `typeset -x` / `readonly` of the name (spelled out
+// in the raw text or dequoted in the words), or a name built at run time on a command that binds names (`export $N=..`, `declare "$N=.."`). The value is never parsed.
+const OPTS_NAME = /^(?:BASHOPTS|SHELLOPTS)$/;
+const OPTS_MENTION = /(?<![\w$])(?:BASHOPTS|SHELLOPTS)(?![\w])/;
+const NAME_BINDING_HEADS = new Set(['export', 'declare', 'typeset', 'readonly', 'local', 'env']);
+function bashoptsAssigned(c) {
+  if (Object.keys(c.env ?? {}).some((k) => OPTS_NAME.test(k))) return true;
+  if ((c.argv ?? []).some((a) => /^(?:BASHOPTS|SHELLOPTS)(?:\+?=|\[|$)/.test(a))) return true;
+  if (OPTS_MENTION.test(c.raw ?? '')) return true;
+  const head = unwrapBuiltin(c.argv ?? []).argv;
+  return NAME_BINDING_HEADS.has(baseOf(head[0] ?? '')) && head.slice(1).some((a) => /[$`]/.test(a.includes('=') ? a.slice(0, a.indexOf('=')) : a));
+}
+// R15-F1: the command a line word really runs, past the wrappers, decides whose shell the text runs in. source / . / eval run it in THIS shell (and a wrapper whose next word is only known at run time may be one of
+// them: fail closed); a literal shell command word (bash, sh, zsh ...) surely starts a new one.
+const NEW_SHELL_WORDS = new Set(['bash', 'sh', 'zsh', 'dash', 'ash', 'ksh', 'ksh93', 'mksh', 'pdksh', 'yash', 'rbash', 'fish', 'csh', 'tcsh']);
+function runsInThisShell(c) {
+  const u = unwrapBuiltin(c.argv);
+  return u.blind || ['source', '.', 'eval'].includes(baseOf(u.argv[0] ?? ''));
+}
+function sourcesHere(c) {
+  const u = unwrapBuiltin(c.argv);
+  return u.blind || ['source', '.'].includes(baseOf(u.argv[0] ?? ''));
+}
+function startsNewShell(c) {
+  const u = unwrapBuiltin(c.argv);
+  return !u.blind && NEW_SHELL_WORDS.has(baseOf(u.argv[0] ?? ''));
+}
 function cdMeaningSwitch(c) {
+  if (bashoptsAssigned(c)) return true;
   const { argv, blind } = unwrapBuiltin(c.argv);
   if (blind || (argv.length > 0 && !literalCommand(argv[0]) && !loneQuotedRef(c))) return true; // (no command word at all, `A=1`, is no switch)
   const name = baseOf(argv[0] ?? '');
@@ -3456,7 +3485,7 @@ function setPositionals(argv) {
   return null;
 }
 function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
-  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, cdSwitch: false };
+  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, cdSwitch: false, childOpts: false };
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
   let cdSwitched = cmds.some(cdMeaningSwitch); // (R11-F3: a source below that switches it on counts from there on)
@@ -3522,6 +3551,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
         if (sub.all) out.all = true;
         if (sub.unknownCd) out.unknownCd = true;
         if (sub.cdSwitch) cdSwitched = true;
+        if (sub.childOpts) out.childOpts = true;
         if (sub.home) out.home = true;
       }
     }
@@ -3538,6 +3568,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   // R13: the line's own switch counts for the cds of the file too (`set -T; source ./a.sh`, a.sh holds `cd proj`), but is not the file's switch (out.cdSwitch stays the file's own)
   if ((cdSwitched || ctx.lineCdSwitch === true) && cmds.some((c) => CD_NAMED.has(baseOf(c.argv[0] ?? '')))) out.unknownCd = true;
   out.cdSwitch = cdSwitched;
+  if (cmds.some(bashoptsAssigned)) out.childOpts = true; // (R15-F3: the file hands BASHOPTS / SHELLOPTS to the shells that start after it)
   return out;
 }
 
@@ -3604,6 +3635,7 @@ function absorbSourced(rec, dirs, ctx) {
     const eff = sourcedEffects(t, ctx);
     if (eff.all) poison();
     if (eff.home) ctx.homeSourced = true; // (a bare `cd` / `cd ~` / `~/x` then goes elsewhere)
+    if (eff.childOpts) ctx.childOptsSwitch = true; // (R15-F3)
     if (eff.cdSwitch) ctx.sourcedCdSwitch = true; // (R11-F3: the file may turn cdablevars on: the line's own `cd NAME` can then go to $NAME)
     if (eff.unknownCd) ctx.sourcedCdUnknown = true; // (a cd the file does into a directory only known at run time: the line's directory is unknown from here)
     effs.push(eff);
@@ -3776,7 +3808,10 @@ function evaluateBashForFilesFrame(command, opts) {
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
   ctx.pickUnknown = new Set(opts._unknown ?? []); // (a name the line gave a run-time value: only a script it picks is refused; the writer rule is for the names above)
-  ctx.lineCdSwitch = opts._lineCdSwitch === true || cmds.some(cdMeaningSwitch); // (R14-F2: also a switch the line that sourced this text had; R13: whether the line itself may turn cdablevars on; computed before any source is evaluated and handed to sourcedEffects)
+  // R15-F3: BASHOPTS / SHELLOPTS given to a child shell (assigned anywhere on the line, or by the outer line, or cdable_vars in the hook's own BASHOPTS) is a switch of every child frame; the hook's BASHOPTS also switches this shell
+  const envCdable = /(?:^|[:,\s])cdable_vars(?:$|[:,\s])/.test(String(ctx.env.BASHOPTS ?? ''));
+  ctx.childOptsSwitch = opts._childOpts === true || envCdable || cmds.some(bashoptsAssigned);
+  ctx.lineCdSwitch = opts._lineCdSwitch === true || envCdable || cmds.some(cdMeaningSwitch); // (R14-F2: also a switch the line that sourced this text had; R13: whether the line itself may turn cdablevars on; computed before any source is evaluated and handed to sourcedEffects)
   ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
   ctx.unknownAll = opts._unknownAll === true || ctx.arith.dynamic; // (an arithmetic that assigns through a name may set any name, also one the line never gave. Defence in depth for the names the line gave: collectVars marks every one when arith.dynamic)
   ctx.srcChanged = new Set(opts._srcChanged ?? []); // names an unfollowable sourced file may have changed (a write target that uses one is refused)
@@ -3874,7 +3909,7 @@ function evaluateBashForFilesFrame(command, opts) {
     });
   };
   // R14-F2: `sameShell`: the text runs in THIS shell (source / . / eval), so a switch of the line (before or after the source) or of an earlier source decides what its own `cd NAME` means too
-  const withLineVars = (o, c = null, sameShell = false) => ({ ...o, _lineCdSwitch: sameShell && (ctx.lineCdSwitch === true || ctx.sourcedCdSwitch === true), _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
+  const withLineVars = (o, c = null, sameShell = false) => ({ ...o, _lineCdSwitch: (sameShell && (ctx.lineCdSwitch === true || ctx.sourcedCdSwitch === true)) || ctx.childOptsSwitch === true, _childOpts: ctx.childOptsSwitch === true, _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -3945,6 +3980,13 @@ function evaluateBashForFilesFrame(command, opts) {
   };
   const cwdsNow = () => (unknownCwd() ? unique([...cwdDirs, ...assumedCwds(ctx)]) : cwdDirs); // (where the shell itself can be: a package manager starts there, not in a git -C directory)
   const sdirsNow = () => (unknownCwd() ? unique([...dirs, ...assumedCwds(ctx)]) : dirs); // (a sourced file may make the directory unknown part-way through the line)
+  // R15-F2: the commands are judged in text order, but loops, functions and traps run in another one: a file that turns cdablevars on (or hands BASHOPTS on) AFTER a same-shell file / child shell was judged
+  // has to reach that judgment too. Each judgment made without the switch is remembered (with the state it saw, the switch forced on) and judged again at the end of the line when the late switch is there.
+  const lateJudgments = [];
+  const judgeFile = (rec, c, sameShell, o0 = withLineVars(opts, c, sameShell)) => {
+    if (o0._lineCdSwitch !== true) lateJudgments.push({ rec, same: sameShell, dirs: sdirsNow(), o: { ...o0, _lineCdSwitch: true }, exec: ctx.execCmd });
+    return judgeScriptFile(rec, sdirsNow(), ctx, o0, scanRaw);
+  };
   if ((opts._depth ?? 0) < 4) {
     for (const [idx, c] of cmds.entries()) {
       checkDeadline(ctx.budget); // (the evaluation deadline)
@@ -3996,12 +4038,12 @@ function evaluateBashForFilesFrame(command, opts) {
         const sfj = sf;
         let v;
         try {
-          v = judgeScriptFile(sfj, sdirsNow(), ctx, { ...withLineVars(opts, c, sf.kind === 'shell' && ['source', '.', 'eval'].includes(baseOf(c.argv[0] ?? ''))) }, scanRaw);
+          v = judgeFile(sfj, c, sf.kind === 'shell' && runsInThisShell(c)); // (R15-F1: the word after the wrappers)
         } finally {
           ctx.execCmd = outer;
         }
         if (v) return v;
-        if (sf.kind === 'shell' && ['source', '.'].includes(baseOf(c.argv[0] ?? ''))) absorbSourced(sf, dirs, ctx); // (a sourced file runs in this shell: what it sets is the line's from here)
+        if (sf.kind === 'shell' && sourcesHere(c)) absorbSourced(sf, dirs, ctx); // (a sourced file runs in this shell: what it sets is the line's from here)
       }
       // #81 t9: `npm run NAME` and its kin run the text package.json holds for NAME
       {
@@ -4011,8 +4053,10 @@ function evaluateBashForFilesFrame(command, opts) {
       // script text that reaches a shell without being named (`bash < f.sh`, `cat f.sh | bash`, `eval "$(cat f.sh)"`): its files are judged like `bash f.sh`
       for (const fd of scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx))) {
         withPath(fd);
-        const v = judgeScriptFile(fd, sdirsNow(), ctx, withLineVars(opts, c, baseOf(c.argv[0] ?? '') === 'eval'), scanRaw);
+        // (R15-F1: fed text runs in THIS shell unless the command surely starts a new one: `source /dev/stdin < f`, `. <(cat f)`, `cat f | source /dev/stdin`, eval)
+        const v = judgeFile(fd, c, !startsNewShell(c));
         if (v) return v;
+        if (!startsNewShell(c) && sourcesHere(c)) absorbSourced(fd, dirs, ctx); // (what the fed text sets is the line's from here)
       }
       // #81 t9: and a bare name a package runner started is the bin node_modules/.bin/NAME
       if (c.viaRunner && c.argv[0] && !c.argv[0].includes('/')) {
@@ -4031,6 +4075,14 @@ function evaluateBashForFilesFrame(command, opts) {
       }
       markPackageState(ctx.budget, [c.argv], { dirs: cwdsNow(), expand: (w) => expandRefs(w, ctx), home: ctx.homePosix, p: pathsFor() }); // (what this command may change, for the package scripts after it)
       undo?.();
+    }
+    for (const j of lateJudgments) {
+      if (!(j.same ? ctx.sourcedCdSwitch === true : ctx.childOptsSwitch === true)) continue;
+      const outer = ctx.execCmd;
+      ctx.execCmd = j.exec;
+      let v;
+      try { v = judgeScriptFile(j.rec, j.dirs, ctx, j.o, scanRaw); } finally { ctx.execCmd = outer; }
+      if (v) return v;
     }
   } else {
     // at the depth limit nothing is followed any further: a named script, a fed file or a startup file the line names is refused; the
