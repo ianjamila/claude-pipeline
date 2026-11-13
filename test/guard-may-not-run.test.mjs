@@ -324,13 +324,13 @@ test('#352 R12-F1: a text scanned out of a heredoc body or $[ ] is not emitted b
 
 test('#352 R12-F2: a redirect right after ) continues that subshell\'s command: pipeline and background bookkeeping reach the part before it', () => {
   denies('cd d && ( ) 2>&1 & push', `cd /work/other2 && (true) 2>&1 & ${SHIP}`);
-  denies('cd d && ( ) > log 2>&1 & push', `cd /work/other2 && (npm run dev) > /tmp/log 2>&1 & ${SHIP}`);
+  denies('cd d && ( ) > log 2>&1 & push', `cd /work/other2 && (sleep 5) > /tmp/log 2>&1 & ${SHIP}`);
   denies('cd d && ( ) 2>&1 | cat & push', `cd /work/other2 && (true) 2>&1 | cat & ${SHIP}`);
   denies('cd d && ( ) 2>&1 && b & push', `cd /work/other2 && (true) 2>&1 && echo b & ${SHIP}`);
   denies('switch || ( ) 2>&1 | push', `${RESET} || ( ) 2>&1 | ${SHIP}`);
   denies('switch || ( ) 2>&1 | cat; push', `${RESET} || (true) 2>&1 | cat; ${SHIP}`);
   allows('twin: cd d && ( ) 2>&1 && push', `cd /work/other2 && (true) 2>&1 && ${SHIP}`);
-  allows('twin: cd d && ( ) > log 2>&1; push', `cd /work/other2 && (npm run dev) > /tmp/log 2>&1; ${SHIP}`);
+  allows('twin: cd d && ( ) > log 2>&1; push', `cd /work/other2 && (sleep 5) > /tmp/log 2>&1; ${SHIP}`);
   allows('twin: cd d; ( ) 2>&1 | cat; push', `cd /work/other2; (true) 2>&1 | cat; ${SHIP}`);
   allows('twin: cd d && ( ) 2>&1 | cat && push (the stage is the subshell\'s)', `cd /work/other2 && (true) 2>&1 | cat && ${SHIP}`);
 });

@@ -2390,6 +2390,8 @@ class Parser {
     let gCur = 0; // index in `cur` just after it
     let gGlob = false; // the word before the group holds a glob character
     let lastSep = ';';
+    // (#352 R12-F2: the ( ) group that just ended, while only blanks follow its `)`: a redirect there (`(a) 2>&1`, `(a) > log`) is part of the SAME command, so it takes the operator before the `(` and does not start a pipeline of its own)
+    let subTail = null;
     let lastNeg = false; // (the stage before a `|` was negated: `! a | b` negates the pipeline, so b's commands too)
     let lastAfterClose = false; // (the `&&` just read follows the closer of a construct that may have skipped its body: the next segment takes it, see emit)
     // the operator before the command being read (a substitution in its words runs under it, see inGroup)
@@ -2402,14 +2404,15 @@ class Parser {
     const startSeg = () => {
       if (!inWord) wstart = this.i;
       if (!seg) {
+        const tail = subTail && lastSep === ';' && /^[ \t]*$/.test(s.slice(subTail.end, wstart)) ? subTail : null;
         seg = {
           words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, fns: ctx.fns, defs: ctx.defs, cmd: null, meta: new Map(), win: new Map(),
           start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl), loops: ctx.loops,
-          pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep, lead: lastSep === '|' ? this.pipeLead : null, afterClose: lastSep === '&&' && lastAfterClose,
+          pipedFrom: lastSep === '|' ? this.lastStage : null, sep: tail ? tail.sep : lastSep, lead: tail ? tail.lead : lastSep === '|' ? this.pipeLead : null, afterClose: tail ? tail.afterClose : lastSep === '&&' && lastAfterClose,
           up: ctx.up, negIn: ctx.neg > 0, negPipe: lastSep === '|' && lastNeg, negLead: false, // (negation: R9-F3; up: R9-F1)
         };
-        if (lastSep !== '|' && lastSep !== '&&' && lastSep !== '||') this.pipeStart = ctx.out.length; // (a & ends the whole and-or list: `a && b &`)
-        if (lastSep !== '|') { this.pipeHead = ctx.out.length; this.pipeLead = lastSep; }
+        if (!tail && lastSep !== '|' && lastSep !== '&&' && lastSep !== '||') this.pipeStart = ctx.out.length; // (a & ends the whole and-or list: `a && b &`)
+        if (!tail && lastSep !== '|') { this.pipeHead = ctx.out.length; this.pipeLead = lastSep; }
         lastAfterClose = false;
       }
     };
@@ -2728,6 +2731,7 @@ class Parser {
           this.pipeStart = stageStart;
           this.pipeHead = stageHead;
           this.pipeLead = stageLead;
+          subTail = { sep: opened.sep, lead: opened.lead ?? null, afterClose: opened.afterClose, end: this.i };
           if (underPipe) this.markPipe(outFrom); // (#352 R11-F1: a ( ) stage of a pipeline runs in a subshell of its own: its commands carry no change on)
           lastNeg = negHere;
           fnPending = false;
