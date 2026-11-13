@@ -2,7 +2,7 @@
 //   R7-B1/F2  a word of an option tool or rsync that holds a tangled character (`( ) # ^ < > ~ | @ + !`) together with a glob/tangled character is a possible option, whatever it starts with.
 //   R7-B2     the real (symlink) reading of a path word is based on the joined, absolute `full`, so `cp payload s` with s a link is judged like `cp payload /tmp/s`.
 //   R7-F1     withoutQuotes does not read comments or heredoc bodies: a `#` at a word start or a `<<` makes the text unreadable (fail closed).
-//   R7-F4     the `$'` / `$"` test is part of the scan, at top level only: a `$` that ends a quoted string starts nothing.
+//   R7-F4     the `$'` / `$"` test is part of the scan, at top level only: a `$` that ends a quoted string starts nothing. (#373: a real `$'…'` no longer turns the cd narrowing off; a real `$"…"` still does.)
 //   R7-F3     the glob matcher folds the pattern and the text the same way (one code unit at a time).
 //   R7-S1     a glob of more than 20000 elements is a hit in every caller (null = unreadable = fail closed); runs of `*` collapse first.
 // Home is /home/u; /tmp/s is a link to the protected settings file. Protected paths are built from parts so this file does not spell them either.
@@ -107,11 +107,12 @@ describe('R7-F1: comments and heredoc bodies are no quotes', () => {
 
 describe('R7-F4: a $ that ends a quoted string starts no ANSI-C string', () => {
   denies('F4', [
-    ['a real $\' still turns the narrowing off', "cd proj && echo $'x' && find . -delete", AT_HOME],
     ['a real $" still turns the narrowing off', 'cd proj && echo $"x" && find . -delete', AT_HOME],
-    ['a quoted $ then a real $\'', "cd proj && echo 'a$' $'x' && find . -delete", AT_HOME],
   ]);
   allows('F4', [
+    // (#373: these two were denies while a real `$'` turned the narrowing off; the parser reads the string, so the cd narrows the find)
+    ["a real $' no longer turns the narrowing off", "cd proj && echo $'x' && find . -delete", AT_HOME],
+    ["a quoted $ then a real $' no longer turns the narrowing off", "cd proj && echo 'a$' $'x' && find . -delete", AT_HOME],
     ['grep -q \'x$\' f then git add', "cd ~/Claude/proj && grep -q 'x$' f && git add .", AT_HOME],
     ['rg "bar$" src', 'rg "bar$" src', AT_HOME],
     ['a double-quoted regex ending in $ before a cd', 'cd ~/Claude/proj && grep -c "x$" f && git add .', AT_HOME],
