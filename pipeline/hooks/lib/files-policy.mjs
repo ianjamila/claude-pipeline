@@ -3056,7 +3056,7 @@ function judgeJoinedScripts(sf, dirs, ctx, opts, scanRaw = '') {
         // (a database client reads the files as ONE stream: the escapes are read from the joined text)
         const joinedText = sf.kind === 'sql' ? sqlShellEscapes(joined, { family: sf.family, sources: abss }).join('\n') : joined;
         if (!joinedText) continue;
-        const r = evaluateBashForFiles(joinedText, { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
+        const r = evaluateBashForFiles(joinedText, { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _cdpath: opts._cdpath === true || ctx.cdpath === true, _startup: ctx.startup });
         if (r.decision === 'deny') return deny(`the scripts ${sf.file} would run: ${r.reason}`);
       }
     }
@@ -3069,7 +3069,7 @@ function judgeSqlLines(sf, dirs, ctx, opts) {
   if (!sf.lines.length) return null;
   // (every directory the command may run in: a relative write target lands in any of them)
   for (const d of new Set(dirs.length ? dirs : [""])) {
-    const r = evaluateBashForFiles(sf.lines.join("\n"), { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
+    const r = evaluateBashForFiles(sf.lines.join("\n"), { ...opts, cwd: d || ctx.cwd, _depth: (opts._depth ?? 0) + 1, _cdpath: opts._cdpath === true || ctx.cdpath === true, _startup: ctx.startup });
     if (r.decision === "deny") return deny(`the SQL client's input would run: ${r.reason}`);
   }
   return null;
@@ -3112,7 +3112,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   if (sf.kind === 'sql') {
     const esc = sqlShellEscapes(text, { family: sf.family, sources: [abs] }).join('\n');
     if (!esc) return null;
-    const r = evaluateBashForFiles(esc, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
+    const r = evaluateBashForFiles(esc, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _cdpath: opts._cdpath === true || ctx.cdpath === true, _startup: ctx.startup });
     return r.decision === 'deny' ? deny(`the input ${sf.file} would run: ${r.reason}`) : null;
   }
   let kind = sf.kind;
@@ -3130,7 +3130,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
     }
   }
   if (kind === 'shell') {
-    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, ...(sf.runsAsScript && sf.freshBash ? { _bashState: undefined } : {}), ...(sf.runsAsScript ? { _selfBash: abs, _selfZero: abs, _selfAbs: isAbs(expandRefs(String(sf.file), ctx)), _selfDirLit: selfDirLiteral(expandRefs(String(sf.file), ctx), ctx.cdpath), _selfZsh: sf.kind === 'exec' ? posix.basename(SHEBANG_PROGRAM.exec(text.split('\n', 1)[0])?.[1] ?? '') === 'zsh' : sf.runShell === 'zsh' } : {}) });
+    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _cdpath: opts._cdpath === true || ctx.cdpath === true, _startup: ctx.startup, ...(sf.runsAsScript && sf.freshBash ? { _bashState: undefined } : {}), ...(sf.runsAsScript ? { _selfBash: abs, _selfZero: abs, _selfAbs: isAbs(expandRefs(String(sf.file), ctx)), _selfDirLit: selfDirLiteral(expandRefs(String(sf.file), ctx), ctx.cdpath), _selfZsh: sf.kind === 'exec' ? posix.basename(SHEBANG_PROGRAM.exec(text.split('\n', 1)[0])?.[1] ?? '') === 'zsh' : sf.runShell === 'zsh' } : {}) });
     return r.decision === 'deny' ? deny(`the script ${sf.file} would run: ${r.reason}`) : null;
   }
   // program text in another language: the admin switch, the hook switch, or a write next to a protected path
@@ -3260,7 +3260,7 @@ function judgeSplices(c, dirs, ctx, opts) {
   for (const line of r.lines) {
     if ((opts._depth ?? 0) >= 4) return deny('a default word in an option position is nested too deeply to check');
     for (const d of dirs) {
-      const v = evaluateBashForFiles(line, { ...opts, cwd: d, _assigned: ctx.assigned, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
+      const v = evaluateBashForFiles(line, { ...opts, cwd: d, _assigned: ctx.assigned, _depth: (opts._depth ?? 0) + 1, _cdpath: opts._cdpath === true || ctx.cdpath === true, _startup: ctx.startup, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
       if (v.decision === 'deny') return deny(`a default word in this command may be an option; read as \`${line}\` it would run: ${v.reason}`);
     }
   }
@@ -3311,7 +3311,7 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
     if ((opts._depth ?? 0) >= 4) return deny('the command line held in a variable is nested too deeply to check');
     // run in every directory the command may be in, with the line's variables
     for (const d of dirs) {
-      const r = evaluateBashForFiles(line, { ...opts, cwd: d, _assigned: ctx.assigned, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
+      const r = evaluateBashForFiles(line, { ...opts, cwd: d, _assigned: ctx.assigned, _depth: (opts._depth ?? 0) + 1, _cdpath: opts._cdpath === true || ctx.cdpath === true, _startup: ctx.startup, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) } });
       if (r.decision === 'deny') return deny(`the command line ${sf.words[0]} expands to would run: ${r.reason}`);
     }
   }
@@ -3486,7 +3486,7 @@ function setPositionals(argv) {
 }
 function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false) { // (rep: the file is sourced from a frame that can run it again, R18)
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: /CDPATH/i.test(text) }; // (any case: zsh's cdpath array is CDPATH)
-  const cdp = ctx.cdpath === true || out.cdpath; // (R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
+  const cdpNow = () => ctx.cdpath === true || out.cdpath; // (R20-F1: read at each cd, a nested file may set it after this point; R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
   if (cmds.some((_, i) => dirLikeWord(cmds, i, ctx, [ctx.cwd], true))) out.unknownCd = true; // (R17: AUTO_CD: a command word that could be a directory runs a cd)
@@ -3522,7 +3522,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
       const v = t === undefined ? t : substVars(t, local, ctx.budget);
       const homeForm = v === undefined || v === '~' || v.startsWith('~/');
-      const bare = v !== undefined && !homeForm && !/[`$*?[{]/.test(v) && !cdUnknownShape(c.argv) && !cdTargetLiteral(toPosix(v), cdp);
+      const bare = v !== undefined && !homeForm && !/[`$*?[{]/.test(v) && !cdUnknownShape(c.argv) && !cdTargetLiteral(toPosix(v), cdpNow());
       if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || bare) { out.unknownCd = true; if (bare) out.bareCd = true; }
       else {
         out.cds.push(t ?? '~');
@@ -3854,7 +3854,7 @@ function evaluateBashForFilesFrame(command, opts) {
       checkDeadline(ctx.budget); // (the evaluation deadline)
       const inner = jobInner(c);
       if (!inner) continue;
-      const r = evaluateBashForFiles(inner, { ...opts, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
+      const r = evaluateBashForFiles(inner, { ...opts, _depth: (opts._depth ?? 0) + 1, _cdpath: opts._cdpath === true || ctx.cdpath === true, _startup: ctx.startup });
       if (r.decision === 'deny') return deny(`job start would run: ${r.reason}`);
     }
   }
@@ -3914,7 +3914,7 @@ function evaluateBashForFilesFrame(command, opts) {
       return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
     });
   };
-  const withLineVars = (o, c = null) => ({ ...o, _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
+  const withLineVars = (o, c = null) => ({ ...o, _cdpath: opts._cdpath === true || ctx.cdpath === true, _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
