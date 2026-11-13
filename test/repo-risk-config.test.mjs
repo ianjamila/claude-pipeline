@@ -136,6 +136,11 @@ test('repo config: the gate and review-proof named set is in risk.high_risk_path
     'pipeline/lib/state.mjs', 'pipeline/lib/review-publish.mjs', 'pipeline/lib/review-context.mjs', 'pipeline/lib/locks.mjs',
     'pipeline/lib/round-status.mjs', 'pipeline/commands/final-gate.mjs', 'pipeline/commands/triage.mjs', 'pipeline/commands/model-proof.mjs',
     'pipeline/bin/pipeline.mjs',
+    // direct imports of finalgate.mjs, then the helpers the review commands run on
+    'pipeline/lib/closing-keywords.mjs', 'pipeline/lib/preflight.mjs', 'pipeline/lib/verify-steps.mjs', 'pipeline/lib/merge-queue.mjs',
+    'pipeline/lib/github.mjs', 'pipeline/lib/codex.mjs', 'pipeline/lib/codex-exec.mjs', 'pipeline/lib/fix-verify.mjs',
+    'pipeline/lib/hold.mjs', 'pipeline/lib/merge-hold.mjs', 'pipeline/lib/cli.mjs', 'pipeline/lib/cmd-common.mjs',
+    'pipeline/lib/review-lease-wiring.mjs',
   ];
   const list = raw.risk.high_risk_paths;
   const { config } = validateConfig(raw);
