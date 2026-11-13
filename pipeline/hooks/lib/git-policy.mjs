@@ -2870,6 +2870,8 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
         const was = saved[kind === 'git' ? 'gitAliases' : 'ghAliases'];
         for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) redefined.add(`${kind}:${n}`);
       }
+      // (#352 R3-F1: a mark made without a change to the map -- judgeAlternatives restores the map and leaves only the mark -- is wiped by the next reading's restoreLineState, so it is taken here)
+      for (const n of ctx.aliasUnsure) if (!saved.aliasUnsure.has(n)) redefined.add(n);
     }
     if (level > 0 && total > 1) {
       // (config is only ever set; a branch or alias that differs from the state the script started with, in any reading, may or may not have changed)
