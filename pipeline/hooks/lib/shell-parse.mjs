@@ -714,16 +714,26 @@ export const ZSH_NAME_BINDERS = new Set(['vared', 'zparseopts', 'strftime', 'zst
 // substitution (`$((cmd) )`, `$((a); b)`) or holds a quote, backtick or backslash (those would need the frames).
 // (#269 R21-F3) Square brackets are counted too: zsh's math lexer counts them, and on a `]` with no open `[`, or the closing `))` reached with a `[` still open, it re-reads the
 // text as a subshell, where `>` is a real redirect. Not provably arithmetic: -1 (refused).
+// (R22-F1) Per region: zsh counts brackets only outside a nested `${…}`, and a nested `$( )` is lexed by a routine of its own, so a bracket inside one never balances a bracket
+// outside it (nor the reverse). Each region (the text, each `${…}`, each `$( )`) must balance on its own: a stack of counters, one per open region.
 const arithEnd = (s, i, skip = 3) => {
   let depth = 0;
-  let brackets = 0;
+  const regions = [{ brackets: 0, brace: 0, parenAt: -1 }]; // (the text itself; a `${` region ends at its matching `}`, a `$(` region when its `)` brings depth back to parenAt)
   for (let j = i + skip; j < s.length; j++) {
     const c = s[j];
     if (c === '"' || c === "'" || c === '`' || c === '\\') return -1;
-    if (c === '(') depth++;
-    else if (c === '[') brackets++;
-    else if (c === ']') { if (brackets === 0) return -1; brackets--; }
-    else if (c === ')') { if (depth > 0) depth--; else return s[j + 1] === ')' && brackets === 0 ? j + 2 : -1; }
+    const top = regions[regions.length - 1];
+    if (c === '$' && s[j + 1] === '{') { regions.push({ brackets: 0, brace: 1, parenAt: -1 }); j++; continue; }
+    if (c === '$' && s[j + 1] === '(') { regions.push({ brackets: 0, brace: 0, parenAt: depth }); continue; } // (the `(` itself is counted on the next turn)
+    if (c === '{' && top.brace > 0) top.brace++;
+    else if (c === '}' && top.brace > 0) { if (--top.brace === 0) { if (top.brackets !== 0) return -1; regions.pop(); } }
+    else if (c === '(') depth++;
+    else if (c === '[') top.brackets++;
+    else if (c === ']') { if (top.brackets === 0) return -1; top.brackets--; }
+    else if (c === ')') {
+      if (depth > 0) { depth--; if (top.parenAt === depth) { if (top.brackets !== 0) return -1; regions.pop(); } }
+      else return s[j + 1] === ')' && regions.length === 1 && top.brackets === 0 ? j + 2 : -1;
+    }
   }
   return -1;
 };
@@ -2084,10 +2094,30 @@ const MAX_PARAM_WORK = 2_000_000;
 const contAt = (s, k) => s[k] === '\\' && (s[k + 1] === '\n' || (s[k + 1] === '\r' && s[k + 2] === '\n'));
 const isFunsubAt = (s, at) => s[at] === '$' && (contAt(s, at + 1) || (s[at + 1] === '{' && at + 2 < s.length && (/[\s|]/.test(s[at + 2]) || contAt(s, at + 2))));
 const REFUSED_FUNSUB = 'a `${ cmd; }` / `${|cmd;}` command substitution (bash 5.3, newer zsh), or a line continuation (backslash-newline) right after `$` or `${`';
-// (#269 R21-F1) a `${…}` that paramSpan declines (it holds a `$( )`, `<( )`, `$'…'`, a backtick or a newline) is lexed on as command text; inside it the shell has no comments or heredocs and reads a newline as part of the word
-const REFUSED_PARAM = 'a `${…}` holding a command substitution (or a newline, a process substitution, `$\'…\'` or a backtick) together with a `#`, a `<<`, a newline or a stray `)` inside the braces: the shell reads all of it as one word and runs every substitution in it';
+// (#269 R21-F1) a `${…}` that paramSpan declines (it holds a `$( )`, `<( )`, `$'…'`, a backtick, a newline or a bare `{`) is lexed on as command text; inside it the shell has no comments or heredocs and reads a newline as part of the word
+const REFUSED_PARAM = 'a `${…}` holding a command substitution (or a newline, a process substitution, `$\'…\'`, a backtick or a bare `{`) together with a `#`, a `<<`, a newline, a `case` or a stray `)` inside the braces: the shell reads all of it as one word and runs every substitution in it';
+// (#269 R22-F3, R22-F4) a newline inside an array literal / glob group, or inside the subscript of an assignment word (bash), while a here-document is pending: the shells read the body at a different newline than this lexer
+const REFUSED_HEREDOC_NL = 'a newline inside an array literal `NAME=( … )`, a glob group or an assignment subscript `NAME[ … ]=` while a here-document is pending on the line: the shell reads the body at that newline, not at the end of the line';
+// The raw text of a command up to a newline: does it hold an assignment-looking word `name[` whose `]` is not plainly there (bash reads such a subscript across newlines)? Fail-closed: any quote, `$`, backtick,
+// backslash or parenthesis before the close counts as not closed, and so does a text too long to scan.
+const SUBSCRIPT_AT = /(?:^|[\s;&|()])[A-Za-z_][A-Za-z0-9_]*\+?\[/g;
+const unclosedSubscript = (raw) => {
+  if (raw.length > 4096) return raw.includes('[');
+  for (const m of raw.matchAll(SUBSCRIPT_AT)) {
+    let depth = 1;
+    for (let k = m.index + m[0].length; k < raw.length && depth > 0; k++) {
+      const c = raw[k];
+      if (c === '[') depth++;
+      else if (c === ']') depth--;
+      else if (/[$`'"\\()]/.test(c)) break;
+    }
+    if (depth > 0) return true;
+  }
+  return false;
+};
 // (#269 R19-F2) what to write instead, per refusal (the `$(cmd)` advice does not fit arithmetic that already holds one)
 export function refusalAdvice(reason) {
+  if (reason === REFUSED_HEREDOC_NL) return 'finish the array assignment (or the subscript) on its own line before the command that opens the here-document, or write the text to a file with the Write tool';
   if (reason === REFUSED_PARAM) return 'compute the value first on its own line (`d=$(date)`) and keep `#`, `<<`, newlines and stray parentheses out of a `${…}` that holds a `$( )`: `echo ${x:-$d}`';
   return reason === REFUSED_ARITH
     ? 'compute the value first and keep quotes, backslashes and `#` out of the arithmetic (`n=$(wc -l < "$f"); echo $(( n + 1 ))`), and for nested subshells put a space between the parentheses: `( (cmd) )`'
@@ -2230,7 +2260,7 @@ class Parser {
   }
 
   // End (just past the closing brace) of the plain parameter expansion `${...}` at `from`, or -1 when it holds anything lexed as code
-  // (`$(`, `<(`, `>(`, `=(`, `${ `, backticks, `$'`, a newline; quoted or not) or never closes: those take the ordinary path. Quotes and `\` inside are skipped; `${` nests.
+  // (`$(`, `<(`, `>(`, `=(`, `${ `, backticks, `$'`, a newline, a bare `{` (R22-F2: zsh nests it, bash does not; the nesting path reads it either way); quoted or not) or never closes: those take the ordinary path. Quotes and `\` inside are skipped; `${` nests.
   // Why: a scan that never finds its close (`${${${${…`) is made from every `${` of the text, so the scans together may not read more than MAX_PARAM_WORK characters:
   // past that every span is -1 and the ordinary path lexes the text (which polls the deadline too). At 200 kB of `${` the scans alone took 14 s.
   paramSpan(from) {
@@ -2244,6 +2274,7 @@ class Parser {
       const c = s[j];
       if (c === '\\') { j++; continue; }
       if (c === '`' || c === '\n') return -1;
+      if (c === '{') return -1; // (#269 R22-F2) a bare `{` (the `${` of a nested expansion is taken below): zsh nests it, so its `}` is not the close of this expansion; the nesting path decides
       if ((c === '<' || c === '>' || c === '=') && s[j + 1] === '(') return -1; // <(cmd) >(cmd) =(cmd) run code in the operand word
       if (c === '$') {
         const nx = s[j + 1];
@@ -2545,6 +2576,7 @@ class Parser {
     while (this.i < n && !ctx.stopped) {
       if (cs.length && cs[cs.length - 1].st === 'pat' && !inWord && lit === 0) {
         if (noRedir || maybeArith) { this.funsub(REFUSED_ARITH); continue; } // (#269 R20-F2: a `case` is never arithmetic; its pattern reader skips `#` comments that arithmetic does not have)
+        if (this.dbrace > 0) this.markRefused(REFUSED_PARAM); // (#269 R22-B1: inside ${…} a `case` is word text; caseGap would skip a `#` as a comment and read a heredoc at a newline, hiding substitutions the shell runs)
         endSeg(this.i);
         lastSep = ';';
         const top = cs[cs.length - 1];
@@ -2555,7 +2587,10 @@ class Parser {
         continue;
       }
       const c = s[this.i];
-      if (lit > 0 && (isSpace(c) || c === '\n')) { cur += ' '; this.i++; continue; }
+      if (lit > 0 && (isSpace(c) || c === '\n')) {
+        if (c === '\n' && this.hd.length) this.markRefused(REFUSED_HEREDOC_NL); // (#269 R22-F3: both shells read the pending heredoc at this newline; the lexer would read it at a later one)
+        cur += ' '; this.i++; continue;
+      }
       if (lit > 0 && (c === '(' || c === ')')) {
         lit += c === '(' ? 1 : -1;
         if (litGlob && lit === 0) this.qualifierCode(s.slice(gRaw, this.i), cur.slice(gCur), depth, gGlob);
@@ -2568,6 +2603,7 @@ class Parser {
         this.i++;
       } else if (c === '\n') {
         if (this.dbrace > 0) this.markRefused(REFUSED_PARAM); // (#269 R21-F1)
+        if (this.hd.length && seg && unclosedSubscript(s.slice(seg.start, this.i))) this.markRefused(REFUSED_HEREDOC_NL); // (#269 R22-F4: bash reads an assignment subscript across the newline)
         const had = !!seg || inWord;
         endSeg(this.i);
         if (had) lastSep = ';';
@@ -2767,7 +2803,7 @@ class Parser {
       } else {
         startSeg();
         inWord = true;
-        if (this.dbrace > 0) { if (c === '{') this.dbrace++; else if (c === '}') this.dbrace--; } // (a bare { nests, as bash counts it: never end the tracking early)
+        if (this.dbrace > 0) { if (c === '{') this.dbrace++; else if (c === '}') this.dbrace--; } // (a bare { nests, as zsh counts it (bash closes at the first }): never end the tracking early)
         if (!(lit > 0 && litGlob) && ((c === '{' && !(cur === lastCur ? lastCh === '$' : cur.endsWith('$'))) || c === ',' || c === '}')) bm.push(cur.length); // (the cheap test first: endsWith flattens the word built so far)
         if (/[*?[^#~]/.test(c)) wpat = true;
         cur += c;

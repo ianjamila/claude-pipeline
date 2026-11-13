@@ -1198,6 +1198,39 @@ test('R21: a declined ${…} is no command text, a (( keeps the outer heredoc ou
   assert.match(r.reason, /unmatched/);
 });
 
+test('R22: a case in a declined ${…}, brackets across expansions in arithmetic, a bare { in ${…}, and heredoc newlines in arrays and subscripts are refused', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json'; // (built at run time, as in R19)
+  const failures = [];
+  for (const cmd of [
+    // R22-B1: a `case` inside ${…} is no case; its # is no comment there
+    'echo ${x:-$(true); case x in # $(' + cp + ')}',
+    'echo ${x:-$(true) | case x in # $(' + cp + ')}',
+    'echo ${x:-$(true); (case x in # $(' + cp + ')}',
+    // R22-F1: a bracket inside ${…} or $( ) balances none outside it; zsh then re-reads the arithmetic as a subshell
+    'd=.clau; echo $(( ${x:-[} 1 ] > ~/${d}de/settings.json ))',
+    'd=.clau; (( [ ${x:-]} 1 > ~/${d}de/settings.json ))',
+    'd=.clau; echo $(( $(echo [) 1 ] > ~/${d}de/settings.json ))',
+    // R22-F2: zsh nests the bare { of ${x:-{}, so the # after the first } is inside the word
+    'echo ${x:-{} # $(' + cp + ')}',
+    // R22-F3: both shells read the pending heredoc at the newline inside the array literal
+    "cat <<'E' >/dev/null; a=(\nx\nE\n)\n" + cp + '\nE\n',
+    // R22-F4: bash reads the subscript across the newline
+    "cat <<'E' >/dev/null; a[0\n+$(" + cp + ')]=1\nE\ntrue\n',
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R22 lines were not refused');
+  const blocked = [];
+  for (const cmd of [
+    'echo ${x:-$(date)}; case x in a) echo hi;; esac',
+    'echo $(( ${#arr[@]} ))',
+    'echo $(( a[${i}] + 1 ))',
+    'echo ${x:-{}}',
+    'echo ${x:-{a,b}} # fine',
+    'a=(\nx\ny\n)\necho done',
+    "cat <<'E'\nbody\nE\na=(\nx\ny\n)\necho done",
+  ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
+  assert.deepEqual(blocked, [], 'these R22 lines were refused');
+});
+
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------
 
 test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] argument no longer hide a fed interpreter', () => {

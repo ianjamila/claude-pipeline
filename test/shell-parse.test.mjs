@@ -1074,3 +1074,97 @@ test('R21: the arithmetic refusal names its causes', () => {
   assert.ok(r.truncated);
   for (const word of ['\\$\\( \\)', 'newline', 'process substitution', 'case', 'unmatched']) assert.match(r.refused, new RegExp(word));
 });
+
+// #269 R22: a case inside a declined ${…}; brackets counted per region; a bare { nests in ${…}; heredocs and newlines in array literals and assignment subscripts
+test('R22-B1: a case statement inside a declined ${…} is refused (it has comments and reads heredocs the shell does not see there); case outside still parses', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json';
+  const notRefused = [];
+  for (const c of [
+    'echo ${x:-$(true); case x in # $(' + cp + ')}', // after `;`
+    'echo ${x:-$(true) | case x in # $(' + cp + ')}', // after `|`
+    'echo ${x:-$(true) && case x in # $(' + cp + ')}', // after `&&`
+    'echo ${x:-$(true); (case x in # $(' + cp + ')}', // the subshell `(` path
+    "cat <<'E' ${x:-$(true); case x in\n$(" + cp + ')}\nbody\nE', // a pending heredoc read at the newline in the case gap
+    'echo ${x:-$(true); case x in\n a) $(' + cp + ');; esac}',
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  assert.match(simpleCommands('echo ${x:-$(true); case x in # c\n}').refused, /case/);
+  for (const c of ['case x in a) echo hi;; esac', 'echo ${x:-$(date)}; case x in # note\n a) echo hi;; esac', 'echo ${x:-$(case y in a) echo 1;; esac)}']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R22-F1: brackets in arithmetic are counted per region, so a bracket inside a nested ${…} or $( ) never balances one outside', () => {
+  const notRefused = [];
+  for (const open of ['echo $((', '((']) {
+    for (const body of [
+      ' ${x:-[} 1 ] > out ', // [ inside the expansion, ] outside
+      ' [ ${x:-]} 1 > out ', // [ outside, ] inside
+      ' $(echo [) 1 ] > out ', // the same through a nested $( )
+      ' [ $(echo ]) 1 > out ',
+      ' ${x:-${y:-[}} 1 ] > out ',
+    ]) {
+      const r = simpleCommands(open + body + '))');
+      if (!(r.truncated && /arithmetic/.test(r.refused ?? ''))) notRefused.push(open + body + '))');
+    }
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused as arithmetic');
+  for (const c of ['echo $(( ${arr[1]} + 1 ))', 'echo $(( ${#arr[@]} ))', '(( ${a[i]} > 0 )) && echo y', 'echo $(( a[${i}] + 1 ))', 'echo $(( a[${b[1]}] + 1 ))', 'echo $(( $(wc -l <f) + 1 ))', 'echo $(( $(echo a[1]) + 1 ))']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R22-F2: a ${…} holding a bare { goes the nesting path: zsh closes it at a later }, so a comment or a substitution after the first } is inside the word', () => {
+  const notRefused = [];
+  for (const c of [
+    'echo ${x:-{} # $(touch ran)}',
+    'echo ${x:-{} # $(touch ran)}; true',
+    "cat <<'E' ${x:-{}\n$(touch ran)}\nbody\nE",
+    'echo ${x:-$(true) ${y:-{} # $(touch ran)}}',
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ['echo ${x:-{}}', 'echo ${x:-{}} # $(touch ran)', 'echo ${x:-{a,b}}', 'echo ${x:-{a,b}} # $(touch ran)', 'echo ${{ expr }}', 'echo ${x:-{a}b} c', 'f() { echo ${x:-{}}; }']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+  assert.deepEqual(argvs('echo ${x:-{}} # $(touch ran)'), ['echo ${x:-{}}']); // (a real comment after the closed expansion)
+});
+
+test('R22-F3: a newline inside a NAME=( … ) array literal or a glob group while a heredoc is pending is refused; without a pending heredoc it parses', () => {
+  const notRefused = [];
+  for (const c of [
+    "cat <<'E' >/dev/null; a=(\nx\nE\n)\ntouch ran\nE\n",
+    "cat <<'E' >/dev/null; a+=(\nx\nE\n)\ntouch ran\nE\n",
+    "cat <<'E'; ls *(\n.)\nbody\nE",
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  assert.ok(argvs('a=(\nx\ny\n)\ntouch ran').includes('touch ran'));
+  assert.equal(simpleCommands('a=(\nx\ny\n)\ntouch ran').truncated, false);
+  assert.equal(simpleCommands("cat <<'E'\nbody\nE\na=(\nx\ny\n)\ntouch ran").truncated, false);
+  assert.ok(argvs("cat <<'E'\nbody\nE\na=(\nx\ny\n)\ntouch ran").includes('touch ran'));
+  assert.equal(simpleCommands("cat <<'E'; a=(x y)\nbody\nE\ntouch ran").truncated, false);
+});
+
+test('R22-F4: a newline inside an unclosed NAME[ … of an assignment word while a heredoc is pending is refused (bash reads the subscript across it)', () => {
+  const notRefused = [];
+  for (const c of [
+    "cat <<'E' >/dev/null; a[0\n+$(touch ran)]=1\nE\ntrue\n",
+    "cat <<'E' >/dev/null; a[0\n+1]=1\nE\ntrue\n",
+    "cat <<'E' >/dev/null; x=1 a[0\n+1]=1\nE\ntrue\n",
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ["cat <<'E'\nbody\nE\na[0]=1\ntouch ran", "cat <<'E' > f; a[0]=1\nbody\nE\ntouch ran", 'a[0\n+1]=1\ntouch ran', "cat <<'E'\nbody [not a subscript\nE\ntouch ran"]) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
