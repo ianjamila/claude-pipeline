@@ -8,6 +8,7 @@ import { parseYaml } from './yaml.mjs';
 import { globToRegExp, matchAny } from './glob.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { isUniversalHardStopPath } from './hardstops.mjs';
+import { showFile } from './git.mjs';
 
 // How many verify proofs a run record holds, and how long a proof step name may be. Defined here (config.mjs is vendored into
 // project repos; run-record.mjs is not) and imported by run-record.mjs, so a config this file accepts always fits the record.
@@ -73,7 +74,10 @@ export const DEFAULTS = deepFreeze({
   // smoke_bypass_origins: the ONLY origins the header may be sent to (exact match, https, e.g. "https://www.example.com").
   // Required (non-empty) when smoke_bypass_header is set; a preview URL, any other host or localhost never gets the header.
   smoke_bypass_origins: [],
-  risk: { high_risk_paths: [], medium_lines: 150, high_lines: 600, medium_files: 10 },
+  // ignore_hard_stop_rules: hard-stop rules whose hits do NOT count toward the risk level (they stay hits: reported, owner-merge items, final gate,
+  // never the light lane). Only P-path and R4-config may be listed (RISK_IGNORABLE_RULES). The rating also reads the config committed at the PR's
+  // fork point and the stricter of the two wins (risk.mjs#rateBranch), so a PR cannot loosen its own rating.
+  risk: { high_risk_paths: [], medium_lines: 150, high_lines: 600, medium_files: 10, ignore_hard_stop_rules: [] },
   hard_stops: { paths: [], patterns: [], auth_calls: [], disable_rules: [], report_only_rules: [], report_only_paths: [] },
   integrity: {
     test_globs: [
@@ -86,6 +90,8 @@ export const DEFAULTS = deepFreeze({
     effort: { low: 'medium', medium: 'medium', high: 'high', followup: 'medium' },
     max_rounds: 2,
     light_lane_max_lines: 50,
+    // Who reviews after Codex when a PR is medium ONLY for its size (no hard-stop hit of any kind, no sensitive path): 'judge' (Sonnet) or 'fable'.
+    size_only_medium_reviewer: 'judge',
     // Paths whose every review round gets the Fable pass (triage + its own review), whatever the risk level.
     arbiter_always_paths: [],
     // EXACT repo-relative paths of ordinary documents (lib/doc-paths.mjs#isDocPath, no hard-stop path, not under supabase/ or a
@@ -166,11 +172,11 @@ const KEYS = {
   preview: ['environment', 'smoke', 'provider'],
   production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback', 'watch'],
   rollback: ['command', 'notes'],
-  risk: ['high_risk_paths', 'medium_lines', 'high_lines', 'medium_files'],
+  risk: ['high_risk_paths', 'medium_lines', 'high_lines', 'medium_files', 'ignore_hard_stop_rules'],
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'arbiter_always_paths', 'docs_exempt_paths'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths'],
   smoke: ['path', 'status', 'contains', 'location_contains'],
 };
 
@@ -492,6 +498,20 @@ function checkProduction(p, errors) {
 // chain lever), engines.node, and the fail-closed "package.json could not be parsed; dependency changes unchecked".
 // Migrations, destructive SQL, auth paths and removed guards, secrets, pipeline files, dependencies and unscannable
 // input stay on for every project; naming one of them is a config error, not a silent no-op.
+// Rules risk.ignore_hard_stop_rules may list: their hits stop counting toward the risk LEVEL (not toward anything else). Never the database / auth /
+// secret rules, nor R4-pipeline (the guard core: a PR that edits the rating config is itself an R4-pipeline hit, so it cannot lower its own rating).
+export const RISK_IGNORABLE_RULES = Object.freeze(['P-path', 'R4-config']);
+export const SIZE_ONLY_REVIEWERS = Object.freeze(['judge', 'fable']);
+
+function checkIgnoreRules(rules, errors) {
+  if (!Array.isArray(rules)) return errors.push('risk.ignore_hard_stop_rules must be an array');
+  rules.forEach((r, i) => {
+    if (!RISK_IGNORABLE_RULES.includes(r)) {
+      errors.push(`risk.ignore_hard_stop_rules[${i}]: ${JSON.stringify(r)} cannot be ignored for risk (allowed: ${RISK_IGNORABLE_RULES.join(', ')})`);
+    }
+  });
+}
+
 export const DISABLEABLE_HARD_STOP_RULES = Object.freeze(['R6-sensitive']);
 
 function checkDisableRules(rules, errors) {
@@ -667,6 +687,7 @@ export function validateConfig(obj) {
     if (!inRange(review.max_rounds, 1, 5)) errors.push('review.max_rounds must be an integer 1..5');
     checkPosInt(review.light_lane_max_lines, 'review.light_lane_max_lines', errors);
     checkStrArray(review.arbiter_always_paths, 'review.arbiter_always_paths', errors);
+    if (!SIZE_ONLY_REVIEWERS.includes(review.size_only_medium_reviewer)) errors.push(`review.size_only_medium_reviewer must be one of ${SIZE_ONLY_REVIEWERS.join('|')}`);
     if (!isObj(review.effort)) errors.push('review.effort must be a mapping');
     else {
       for (const lane of Object.keys(review.effort)) {
@@ -679,6 +700,7 @@ export function validateConfig(obj) {
   const risk = section(config, 'risk', errors);
   if (risk) {
     checkStrArray(risk.high_risk_paths, 'risk.high_risk_paths', errors);
+    checkIgnoreRules(risk.ignore_hard_stop_rules, errors);
     for (const k of ['medium_lines', 'high_lines', 'medium_files']) checkPosInt(risk[k], `risk.${k}`, errors);
     const pos = (v) => isInt(v) && v >= 1;
     if (pos(risk.medium_lines) && pos(risk.high_lines) && risk.medium_lines > risk.high_lines) {
@@ -775,6 +797,28 @@ export function stopHookTimeoutWarning(config, settingsText) {
     }
   }
   return null;
+}
+
+// The config as the base side (the PR's fork point) has it: { ok: true, config } | { ok: false, reason }. A PR must not loosen its own rules, so
+// the rating (risk.mjs#rateBranch), the Fable brief choice (arbiter) and the final gate read the committed copy too. Moved here from arbiter.mjs.
+export function baseConfigAt(forkPoint, root) {
+  const msgOf = (err) => String(err?.message ?? err).split('\n')[0];
+  if (typeof forkPoint !== 'string' || forkPoint === '') return { ok: false, reason: 'the round records no fork point' };
+  let text;
+  try {
+    text = showFile(forkPoint, '.claude/pipeline.yml', { cwd: root });
+  } catch (err) {
+    return { ok: false, reason: `could not read .claude/pipeline.yml at the fork point: ${msgOf(err)}` };
+  }
+  if (text === null) return { ok: false, reason: 'the fork point has no .claude/pipeline.yml' };
+  let parsed;
+  try {
+    parsed = validateConfig(parseYaml(text));
+  } catch (err) {
+    return { ok: false, reason: `the fork point's .claude/pipeline.yml cannot be parsed: ${msgOf(err)}` };
+  }
+  if (!parsed.ok) return { ok: false, reason: `the fork point's .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
+  return { ok: true, config: parsed.config };
 }
 
 /** Read <repoDir>/.claude/pipeline.yml and validate it. IO is injectable for tests. */

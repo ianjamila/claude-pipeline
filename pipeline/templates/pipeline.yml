@@ -116,6 +116,9 @@ risk:
   medium_lines: 150
   high_lines: 600
   medium_files: 10
+  # ignore_hard_stop_rules: [P-path, R4-config]   # default []. Hits of these rules stop counting toward the risk LEVEL only (they stay hits: reported, owner-merge
+  #                              # items, final gate, never the light lane). ONLY P-path and R4-config are allowed. The rating also reads this file as committed at the
+  #                              # default branch's fork point and the stricter of the two wins, so a PR cannot loosen its own rating.
 
 hard_stops:                    # project extras on top of the universal list
   paths: []
@@ -132,6 +135,8 @@ review:
   effort: {low: medium, medium: medium, high: high, followup: medium}
   max_rounds: 2                 # plus one confirm round when the last round only accepted fixes; base-only rounds (main merged in) don't count
   light_lane_max_lines: 50
+  # size_only_medium_reviewer: judge   # judge (default) | fable. Who follows Codex on a PR that is medium ONLY for its size (no hard-stop hit of any kind, no
+  #                              # sensitive path, base = the default branch): the Sonnet judge, or fable to keep the Fable pass for every medium PR.
   arbiter_always_paths: []      # globs: a PR touching one gets the Fable review pass every round, even at low risk
   docs_exempt_paths: []         # EXACT paths (no globs) of ordinary documents (markdown anywhere, docs/ text, LICENSE/CHANGELOG): lines ADDED to them after the last review round
                                 # need no new round (review-complete and the final gate agree). Never an agent instruction file (CLAUDE / AGENTS / AGENT / GEMINI .md and their .<variant>.md forms), html, mdx or source, nothing in a dot-directory or app/ pages/, nothing

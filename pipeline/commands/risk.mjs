@@ -3,13 +3,16 @@
 // taken from the merge-base, so commits that landed on base after the fork are never counted as this branch's.
 import { EXIT, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { diffFiles, mergeBase } from '../lib/git.mjs';
-import { collectHardStops } from '../lib/hardstops.mjs';
-import { assessRisk, isLightLane } from '../lib/risk.mjs';
+import { mergeBase } from '../lib/git.mjs';
+import { rateBranch } from '../lib/risk.mjs';
 
 export const meta = {
   summary: 'assess the risk level of a branch diff',
-  usage: 'pipeline risk --base REF --head REF [--repo DIR]   -> {ok, level, reasons, lightLane, changedLines, fileCount, hardStops, base, head, mergeBase}',
+  usage: [
+    'pipeline risk --base REF --head REF [--repo DIR]   -> {ok, level, reasons, lightLane, changedLines, fileCount, hardStops, sizeOnly, drivers, reviewer, laneReasons, sensitivePaths, note?, base, head, mergeBase}',
+    '  the rating uses the working-tree config AND the one committed at the default branch\'s fork point (stricter wins; an unreadable one means reviewer fable)',
+    '  sizeOnly: medium for size alone (no hit, no high-risk path); drivers {hardStop, advisory, path, size}; reviewer: who follows Codex (judge|fable); note says why a medium PR has the judge',
+  ].join('\n'),
 };
 
 export const run = guarded(async (argv, ctx) => {
@@ -22,14 +25,14 @@ export const run = guarded(async (argv, ctx) => {
   const { config } = await requireConfig(root);
 
   const o = { cwd: root };
-  const files = diffFiles(base, head, o);
-  const hits = await collectHardStops({ base, head, cwd: root, config });
-  const { level, reasons, changedLines, fileCount } = assessRisk({ files, hits, config });
-  const lightLane = isLightLane({ level, changedLines, hits, config });
+  const rated = await rateBranch({ root, head, config, base });
+  const { level, reasons, changedLines, fileCount, lightLane, hits, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths } = rated;
   return {
     exitCode: EXIT.OK,
     output: {
-      ok: true, level, reasons, lightLane, changedLines, fileCount, hardStops: hits, base, head, mergeBase: mergeBase(base, head, o),
+      ok: true, level, reasons, lightLane, changedLines, fileCount, hardStops: hits, sizeOnly, drivers, reviewer, laneReasons, sensitivePaths,
+      ...(rated.note ? { note: rated.note } : {}), ...(rated.baseConfig.ok ? {} : { baseConfigError: rated.baseConfig.reason }),
+      base, head, mergeBase: mergeBase(base, head, o),
     },
   };
 });

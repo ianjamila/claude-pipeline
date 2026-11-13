@@ -477,3 +477,40 @@ test('defer-fixes: main merged in BEFORE the fix was made (a base-only round rec
   assert.ok(JSON.parse(post.stdin).body.includes(`git diff ${merged} ${h2}`), 'the compare command shows just the fix');
   assert.equal(w.cli(['state', 'outcome']).json.clean, true);
 });
+
+test('defer-fixes: refused when the trusted base config cannot be read (the fork point has no .claude/pipeline.yml), state untouched (R1-F2)', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  // main drops the config and is merged into the PR, which keeps its own copy: the fork point (main's tip) has no pipeline.yml, the working tree does
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.git(['rm', '-q', '.claude/pipeline.yml']);
+  w.repo.commit('main drops the config');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', '--no-commit', 'main']);
+  w.repo.git(['checkout', 'HEAD', '--', '.claude/pipeline.yml']);
+  w.repo.commit('merge main, keep the config');
+  refused(w, () => defer(w, 'R2-S1', h2), /severity could not be judged: the trusted base config is unreadable/, 'no fork point config');
+});
+
+test('round-request: recommends the extra round, not the follow-up, when the trusted base config cannot be read, matching defer-fixes\' refusal (R2-F1)', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = w.atCap();
+  const before = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(before, 0, before.stderr + before.stdout);
+  assert.equal(before.json.recommend, 'follow-up', 'with a readable fork point config the follow-up is offered');
+  // same setup as the defer-fixes R1-F2 test: main drops the config and is merged into the PR, which keeps its own copy
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.git(['rm', '-q', '.claude/pipeline.yml']);
+  w.repo.commit('main drops the config');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', '--no-commit', 'main']);
+  w.repo.git(['checkout', 'HEAD', '--', '.claude/pipeline.yml']);
+  w.repo.commit('merge main, keep the config');
+  const r = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.recommend, 'extra-round');
+  assert.match(r.json.why, /trusted base config is unreadable/);
+  assert.doesNotMatch(r.json.summary, /say "follow up"/);
+  assert.ok(r.json.head && r.json.line.includes('Extra review round needed #7'), 'the ask itself and its line are still produced');
+  refused(w, () => defer(w, 'R2-S1', h2), /trusted base config is unreadable/, 'defer-fixes agrees');
+});

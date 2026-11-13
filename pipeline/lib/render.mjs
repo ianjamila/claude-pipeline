@@ -106,6 +106,8 @@ export function triageComment(state) {
     const f = r?.arbiter?.failure;
     if (isObject(f) && f.cause && r.arbiter.proofOk !== true) out.push('', `Round ${line(r.n)} arbiter stopped: ${line(f.cause)}${f.advice ? ` — ${line(f.advice)}` : ''}`);
   }
+  // The one current-lane line (no state of its own): a medium PR whose second reviewer is the judge is medium for size only.
+  if (state.reviewer === 'judge' && state.risk === 'medium') out.push('', 'Second reviewer: Sonnet judge (medium for size only; review.size_only_medium_reviewer)');
   out.push('', encodeForComment(state));
   return out.join('\n');
 }

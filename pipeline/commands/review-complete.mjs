@@ -11,11 +11,11 @@
 import { createHash } from 'node:crypto';
 import { EXIT, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { diffFiles, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
+import { git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { behindFreshEnough, lazyDiff } from '../lib/finalgate.mjs';
 import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { assessRisk, reviewLane } from '../lib/risk.mjs';
+import { rateBranch } from '../lib/risk.mjs';
 import { loadState } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
 import { fableBypassNote, fableBypassRounds, reviewEligibilityProblems, reviewValidFor, roundOutcome, rulingsDigest, staleFableReason, staleFableRounds } from '../lib/triage.mjs';
@@ -75,17 +75,26 @@ function whyNot(state, hash) {
   return 'the last review round accepted new items that still need a round to review their fixes';
 }
 
-// The state says which rounds needed Fable, but the state is a local file: re-derive the lane from the PR itself (its
-// files, size and recorded risk) and refuse a PR that needs Fable when no round ran a proven Fable pass.
-function laneProblem(state, root, config, base) {
-  const files = diffFiles(base, 'HEAD', { cwd: root });
-  const measured = assessRisk({ files, hits: [], config }).level; // hard-stop hits are in the recorded risk
+// The state says which rounds needed Fable, but the state is a local file: re-derive the lane from the PR itself (its files, size and
+// recorded risk, rated under the working-tree config and the default branch's committed one, risk.mjs#rateBranch) and refuse a PR that needs
+// Fable when no round ran a proven Fable pass. A recorded high risk is Fable without looking further. When the hard stops cannot be collected the
+// lane is Fable whatever the level (fail closed). A recorded medium stays medium and only the judge lane of a fresh size-only medium may keep it
+// with the judge: a medium that came from a hit (now gone from a fresh scan, or never found by it) needs Fable.
+// `prBase`: the PR's base branch; a stack never gets the size-only judge (rateBranch).
+export async function laneProblem(state, root, config, base, { prBase = config.default_branch, rate = rateBranch } = {}) {
   const recorded = LEVELS.includes(state.risk) ? state.risk : 'low';
-  const level = LEVELS[Math.max(LEVELS.indexOf(measured), LEVELS.indexOf(recorded))];
-  const lane = reviewLane({ level, files, config });
-  if (lane.reviewer !== 'fable') return null;
   const proven = state.rounds.some((r) => r.fableRequired === true && r.arbiter?.proofOk === true);
-  return proven ? null : `the PR needs the Fable review pass (${lane.reasons.join('; ')}), but no review round ran a proven one`;
+  const needs = (why) => (proven ? null : `the PR needs the Fable review pass (${why}), but no review round ran a proven one`);
+  if (recorded === 'high') return needs('high risk');
+  let rated;
+  try {
+    rated = await rate({ root, head: 'HEAD', config, defaultBranch: config.default_branch, prBase, base });
+  } catch (err) {
+    return needs(`hard stops could not be collected: ${oneLine(err)}`);
+  }
+  if (rated.reviewer === 'fable') return needs(rated.laneReasons.join('; ') || `${rated.level} risk`);
+  if (recorded === 'medium' && rated.sizeOnly !== true) return needs('recorded medium risk');
+  return null;
 }
 
 // The Fable review passes that count: proven ones of Fable rounds, in round order (a dispute-mode ruling or a failed
@@ -198,12 +207,12 @@ export const run = guarded(async (argv, ctx) => {
     if (state && state.pr !== pr) {
       return { exitCode: EXIT.FAILED, output: { ok: false, reason: `the review state belongs to PR #${state.pr}, not #${pr}` } };
     }
-    return guardGh(() => {
+    return guardGh(async () => {
       const gh = createGitHub({ cwd: root, env: ctx.env });
       // The review covers the content of the local checkout; the comment and the label are on the PR GitHub holds. They
       // must be the same commit, or the review of one would be used to vouch for the other.
       const local = headSha({ cwd: root });
-      const view = gh.prView(pr, ['headRefOid', 'isDraft', 'labels', 'body', 'mergeable']);
+      const view = gh.prView(pr, ['headRefOid', 'isDraft', 'labels', 'body', 'mergeable', 'baseRefName']);
       const remote = view.headRefOid;
       if (remote !== local) {
         return {
@@ -249,7 +258,8 @@ export const run = guarded(async (argv, ctx) => {
       }
       if (!grants.ok) return { exitCode: EXIT.FAILED, output: { ok: false, reason: grants.problems.join('; '), currentContentHash: hash } };
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
-      const lane = laneProblem(state, root, config, base);
+      const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
+      const lane = await laneProblem(state, root, config, base, { prBase });
       if (lane) return { exitCode: EXIT.FAILED, output: { ok: false, reason: lane, currentContentHash: hash } };
       // Items that read as resolved but are not yet: a Claude-ruled follow-up with no issue, a fix made outside the file the finding names that no
       // later round confirmed (triage.mjs#reviewEligibilityProblems).

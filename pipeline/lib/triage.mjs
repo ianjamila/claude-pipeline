@@ -150,7 +150,7 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
   });
 }
 
-// A round recorded with `fableRequired` (codex-review: risk.mjs#reviewLane said fable) is reviewed by ONE Fable pass that
+// A round recorded with `fableRequired` (codex-review: risk.mjs#rateBranch / reviewLane said fable; a low-risk or size-only-medium PR gets the judge) is reviewed by ONE Fable pass that
 // rules on every Codex item and reviews the diff itself. Until that pass is PROVEN (`arbiter.proofOk === true`) the round
 // is not reviewed, even when Codex found nothing: the Fable pass is the second review, not a dispute tie-break.
 // The Fable steps that stopped on the floor or a stale terminal and have not been proven since (round.arbiter.failure, written by arbiter.mjs).
@@ -973,7 +973,7 @@ const locationProblem = (file) => {
 const entryPaths = (f) => [...new Set([f?.oldPath, f?.newPath, f?.path].filter((p) => typeof p === 'string' && p !== ''))];
 
 // -> { level: 'low' | 'high', reasons: [why it is high] }. `files` = the PR's reviewed diff (git.mjs#diffFiles entries); null/undefined = unknown, so high.
-export function itemSeverity(item, { state, config, files } = {}) {
+export function itemSeverity(item, { state, config, files, baseConfig } = {}) {
   const high = (reason) => ({ level: 'high', reasons: [reason] });
   if (!isObject(item)) return high('not a review item');
   if (!BUCKETS.includes(item.bucket)) return high(`unknown bucket ${asciiLine(item.bucket, 30)}`);
@@ -991,7 +991,8 @@ export function itemSeverity(item, { state, config, files } = {}) {
   if (allItems(state).some((i) => i.final?.decision === 'ACCEPT' && sameFile.includes(i.file) && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)))) {
     return high(`${asciiLine(item.file, 60)} also holds an accepted BLOCKING or security finding`);
   }
-  if (isSensitivePath(hits[0], config)) return high(`${asciiLine(item.file, 60)} is on a sensitive path`);
+  // The union of the working-tree and the default branch's committed sensitive lists (callers pass baseConfig; a PR must not shrink its own list).
+  if (isSensitivePath(hits[0], config) || (baseConfig && isSensitivePath(hits[0], baseConfig))) return high(`${asciiLine(item.file, 60)} is on a sensitive path`);
   return { level: 'low', reasons: [] };
 }
 
@@ -1006,7 +1007,7 @@ const markedBefore = (item, rounds) => {
 // already back at the reviewed content (refusals 3 and 4 need git and are the command's). Pure. `grants` = k -> the owner's open extra-round records for counted round k at ANY head
 // (a function, as roundOutcome takes it): an unspent grant for the next round always wins over a deferral, and a lookup that fails (or a `grantGap` of 'provenance') refuses.
 // -> { eligible, refusals: [plain words], ids: [the accepts a round would have to review], severities: [{ id, level, reasons }] }. Throws (TypeError) on a config error.
-export function deferEligibility(state, config, files, { grants, grantGap } = {}) {
+export function deferEligibility(state, config, files, { grants, grantGap, baseConfig } = {}) {
   const refusals = [];
   const rounds = state?.rounds ?? [];
   const last = rounds.at(-1);
@@ -1057,7 +1058,7 @@ export function deferEligibility(state, config, files, { grants, grantGap } = {}
   const severities = [];
   for (const id of ids) {
     const item = byId.get(id);
-    const sev = itemSeverity(item, { state, config, files });
+    const sev = itemSeverity(item, { state, config, files, baseConfig });
     severities.push({ id, ...sev });
     if (sev.level !== 'low') refusals.push(`${id} is not low severity (${sev.reasons.join('; ')})`);
     const why = roundCapDeferRefusal(item);
