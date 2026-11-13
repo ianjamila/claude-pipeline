@@ -565,3 +565,14 @@ test('#269 R29-F1: white space other than space and tab (no-break space, line se
     assert.equal(commandTarget(cmd, { home: '/h', platform: 'linux' }), null, JSON.stringify(cmd));
   assert.equal(commandTarget('node /x/a.mjs --flag', { home: '/h', platform: 'linux' }), '/x/a.mjs');
 });
+
+test('#269 R31-B1 (parser defect): a quoted `~/` or a single-quoted $HOME / ${HOME} / plugin root stays literal in bash, so it never resolves to an installed script; the unquoted `~/` and a double-quoted $HOME still do', () => {
+  const o = { home: '/h', platform: 'linux' };
+  for (const cmd of ['node "~/.claude/hooks/x.mjs"', "node '~/.claude/hooks/x.mjs'", "node '$HOME/.claude/hooks/x.mjs'", "node '${HOME}/.claude/hooks/x.mjs'", 'node a"~/x.mjs"', '"~/.claude/hooks/x.mjs"'])
+    assert.equal(commandTarget(cmd, o), null, cmd);
+  assert.equal(commandTarget("node '${CLAUDE_PLUGIN_ROOT}/hooks/a.mjs'", { ...o, pluginRoot: '/opt/p' }), null);
+  assert.equal(commandTarget('node ~/.claude/hooks/x.mjs', o), '/h/.claude/hooks/x.mjs');
+  assert.equal(commandTarget('~/.claude/hooks/x.mjs --flag', o), '/h/.claude/hooks/x.mjs');
+  assert.equal(commandTarget('node "$HOME/.claude/hooks/x.mjs"', o), '/h/.claude/hooks/x.mjs');
+  assert.equal(commandTarget('node "${HOME}/.claude/hooks/x.mjs"', o), '/h/.claude/hooks/x.mjs');
+});

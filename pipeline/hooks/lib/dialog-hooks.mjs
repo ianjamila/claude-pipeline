@@ -108,13 +108,15 @@ function words(text, rootRisky = false) {
   let quote = null;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
-    if (quote === "'") { if (c === "'") quote = null; else cur += c; continue; }
+    // (#269 R31-B1) bash keeps a single-quoted $HOME / plugin root literal: a marker inside single quotes is refused
+    if (quote === "'") { if (c === "'") quote = null; else if (c === '\u0001' || c === ROOT_MARK) return null; else cur += c; continue; }
     if (quote === '"') {
       if (c === '"') quote = null;
       else if (c === '$' || c === '`' || c === '\\') return null;
       else cur += c;
       continue;
     }
+    if (!has && c === '~' && text[i + 1] === '/') { cur += HOME_MARK; has = true; continue; } // (#269 R31-B1) only an unquoted `~/` at the start of a word is the home; quoted or mid-word it stays literal
     if (c === "'" || c === '"') { quote = c; has = true; continue; }
     if (/\s/.test(c)) {
       if (c === '\n' || c === '\r') return null;
@@ -144,7 +146,7 @@ export function commandTarget(command, { home, pluginRoot = null, platform = pro
   let text = command.trim();
   // (the install path never passes the shell-word rules: its own separators are the platform's, while anything the author typed after the variable still does; it goes in after the split, like the home folder)
   if (pluginRoot) text = text.replace(/\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g, () => ROOT_MARK);
-  text = text.replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, () => HOME_MARK).replace(/(^|[\s"'])~(?=\/)/g, (_m, lead) => lead + HOME_MARK);
+  text = text.replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, () => HOME_MARK);
   const w = words(text, !!pluginRoot && /[\s*?[\]{}!#$`&;<>()|'"]/.test(pluginRoot)); // (a $ left after the expansions above is not a home reference: words() refuses it)
   return scriptTarget(w, home, platform, pluginRoot, true);
 }
