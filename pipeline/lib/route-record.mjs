@@ -99,6 +99,14 @@ export function quotaValidUntilMs(route) {
   return Number.isFinite(at) ? at + OUTAGE_NO_RESET_MS : NaN;
 }
 
+// Is Codex due back soon enough to wait for it (review.substitute.min_wait_minutes)? A reset time within that many minutes of `now` is; 0 never waits, and no reset time
+// (nothing to wait until) is never waited for. The one place the rule lives: substituteEligibility (the verdict codex-review gives) and `substitute prepare` (which admits the
+// evidence later) both ask it, so a caller cannot skip a wait the verdict asked for (cp #256 R8-B1).
+export function resetNear({ resetAt, minWaitMinutes = 0, now = Date.now() }) {
+  const resetMs = resetAt === null || resetAt === undefined ? NaN : Date.parse(resetAt);
+  return minWaitMinutes > 0 && Number.isFinite(resetMs) && resetMs - now <= minWaitMinutes * 60_000;
+}
+
 // May a substitute stand in for this failed Codex run? (plan Rev 6: a real quota stop, proven by Codex's own structured events.)
 //   reason / timedOut / quota: what execCodex reported ({eligible, proof, resetAt, ...} for a quota); mode / minWaitMinutes: review.substitute.
 // -> { eligible, why, agent, resetAt, waitUntil? }. min_wait_minutes 0 (the default) never waits; above 0, a reset within that many minutes is waited for instead
@@ -110,7 +118,6 @@ export function substituteEligibility({ reason, timedOut = false, quota, mode, m
   if (reason !== 'quota') return out(false, `not-quota:${reason}`);
   if (mode === 'off') return out(false, 'mode-off');
   if (quota?.eligible !== true) return out(false, 'quota-unproven');
-  const resetMs = resetAt === null ? NaN : Date.parse(resetAt);
-  if (minWaitMinutes > 0 && Number.isFinite(resetMs) && resetMs - now <= minWaitMinutes * 60_000) return out(false, 'reset-near', { waitUntil: resetAt });
+  if (resetNear({ resetAt, minWaitMinutes, now })) return out(false, 'reset-near', { waitUntil: resetAt });
   return out(true, 'quota');
 }

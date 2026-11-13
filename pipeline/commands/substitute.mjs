@@ -13,7 +13,7 @@ import { validateFindings } from '../lib/codex.mjs';
 import { headSha, showFile } from '../lib/git.mjs';
 import { accountProjectsRoot, floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
 import { admitRound, headMoved, protectedKindsOf, recordRound, roundPrompt } from '../lib/review-round.mjs';
-import { quotaValidUntilMs, readRoute, superseded, writeFinalRoute } from '../lib/route-record.mjs';
+import { quotaValidUntilMs, readRoute, resetNear, superseded, writeFinalRoute } from '../lib/route-record.mjs';
 import { codexSpend } from '../lib/review-route.mjs';
 import { MAX_AGE_MS, readWeeklyUsage } from '../lib/codex-usage.mjs';
 import { higherRisk, maxRiskOf } from '../lib/state.mjs';
@@ -143,7 +143,7 @@ function checkAgainstRound(route, adm, packet, root) {
 // A quota stop is evidence until its reset time (2 hours when it gave none). Governor evidence is judged again against the weekly figure as it is now: still at or above the
 // limit codex-review stored (governor.threshold, the hard limit it acted on), or (when no current figure is readable) not older than a reading may be (MAX_AGE_MS from when it was
 // formed) - the weekly reset must not leave it admitting a weaker reviewer for ever (R1-F2). A record with no usable limit cannot be judged and is expired (R2-B1). Only prepare asks.
-function checkReset(route, now, env) {
+function checkReset(route, now, env, minWaitMinutes = 0) {
   if (route.evidence === 'governor') {
     const limit = typeof route.governor?.threshold === 'number' ? route.governor.threshold : NaN;
     const usage = readWeeklyUsage({ env, now });
@@ -159,6 +159,10 @@ function checkReset(route, now, env) {
   const until = quotaValidUntilMs(route);
   if (!Number.isFinite(until) || until <= now) {
     throw refuse('reset-passed', `Codex's quota stop (${route.resetText ?? 'no reset time'}) is no longer evidence: run \`pipeline codex-review\` for round ${route.round} again`);
+  }
+  // review.substitute.min_wait_minutes: a reset that near is waited for, not substituted (the same rule as codex-review's verdict: codex-review keeps the quota evidence either way).
+  if (resetNear({ resetAt: route.resetAt, minWaitMinutes, now })) {
+    throw refuse('reset-near', `Codex's quota resets at ${route.resetAt} (${route.resetText ?? 'no reset text'}), within review.substitute.min_wait_minutes (${minWaitMinutes}): wait for Codex and run \`pipeline codex-review\` for round ${route.round} again`, { waitUntil: route.resetAt });
   }
 }
 
@@ -251,7 +255,7 @@ async function prepareLocked({ root, pr, round, ctx }) {
   const maxBytes = config.review.substitute.max_packet_mb * 1024 * 1024;
   const packet = buildPacket(adm, route, root, maxBytes);
   const agent = checkAgainstRound(route, adm, packet, root);
-  checkReset(route, Date.now(), ctx.env);
+  checkReset(route, Date.now(), ctx.env, config.review.substitute.min_wait_minutes);
 
   // The attempt: the first, the open one again, or the next one after a recorded invalid.
   const record = readAttempts(root, round, identityOf(round, route));
