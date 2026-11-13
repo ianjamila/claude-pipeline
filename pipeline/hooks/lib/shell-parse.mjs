@@ -2312,6 +2312,9 @@ class Parser {
       else this.ctx.hdForeign = true;
       h.seg.pending--;
       if (h.seg.muted) continue;
+      // (#352 R12-F1: what the body runs comes out where its command starts: the segments queued BEFORE that command are finished first (a cd that waited for an earlier body), or, when one of them still waits, the order is not known: refused)
+      while (this.queue.length && this.queue[0] !== h.seg && this.queue[0].pending === 0) this.finalize(this.queue.shift());
+      if (this.queue.length && this.queue[0] !== h.seg) this.ctx.truncated = true;
       const grp = this.ctx.grp;
       this.ctx.grp = h.seg.grp; // (the body expands where its command runs: inside the subshells that command was written in)
       try {
@@ -2622,6 +2625,7 @@ class Parser {
           let j = this.i + 1;
           for (; j < n; j++) { if (s[j] === '[') d++; else if (s[j] === ']' && --d === 0) break; }
           cur += s.slice(this.i, Math.min(j + 1, n));
+          this.lexedBeforePending(); // (#352 R12-F1)
           this.scanExpansions(s.slice(this.i + 2, j), depth);
           this.i = Math.min(j + 1, n);
         } else { inWord = true; if (nx !== undefined && DYN_AFTER_DOLLAR.test(nx)) wdyn = true; cur += '$'; lastCur = cur; lastCh = '$'; this.i++; }

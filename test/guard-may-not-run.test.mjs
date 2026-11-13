@@ -318,7 +318,8 @@ test('#352 R12-F1: a text scanned out of a heredoc body or $[ ] is not emitted b
   allows('twin: one heredoc whose body has a $( )', `cat <<EOF\n$(${SHIP})\nEOF`, {}, GIT_ROOT);
   allows('twin: two heredocs, nothing changes state between', `cat <<A; cat <<B\nx\nA\n$(${SHIP})\nB`, {}, GIT_ROOT);
   allows('twin: a cd waiting for its heredoc, the $( ) push in its own body', `cd /work/other2 <<EOF; echo hi\n$(${SHIP})\nEOF`, {}, GIT_ROOT);
-  allows('twin: a $[ ] after a heredoc command keeps its order', `cd /work/other2 <<EOF; echo $[ $(${SHIP}) ]\nEOF`, {}, GIT_ROOT);
+  allows('twin: a $[ ] with no heredoc waiting', `cd /work/other2; echo $[ $(${SHIP}) ]`, {}, GIT_ROOT);
+  allows('twin: a $[ ] after a heredoc whose body is read', `cat <<EOF\nx\nEOF\necho $[ $(${SHIP}) ]`, {}, GIT_ROOT);
 });
 
 test('#352 R12-F2: a redirect right after ) continues that subshell\'s command: pipeline and background bookkeeping reach the part before it', () => {
