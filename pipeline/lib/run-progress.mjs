@@ -50,14 +50,17 @@ const stampResumed = ({ host, now, head }) => ({ at: new Date(now).toISOString()
 //    posted FIRST and REQUIRED: a failed post throws, nothing is written, the comment stays as it was (an invalid one stays invalid, which the gate reads as
 //    unchecked) and the next write retries. `skipResumedEvent`: the caller posted it already. Residual, not closable here: a writer whose read PREDATES
 //    the corruption can still PATCH an unmarked record over an invalid one (GitHub has no conditional edit).
+//  - `firstRead`: the caller's OWN earlier read of the comment, for a caller that builds its record without baseRecordFor (`P summary`, `P comment --kind summary`):
+//    when it was invalid the record is stamped here exactly as baseRecordFor would have, so a stale writer that PATCHed an ordinary record in between does not
+//    leave the run unmarked and without an event.
 // The fresh read also supplies the kept sections.
-export function writeRunRecord(gh, pr, { record, sections, host = hostname(), now = Date.now(), skipResumedEvent = false }) {
+export function writeRunRecord(gh, pr, { record, sections, host = hostname(), now = Date.now(), skipResumedEvent = false, firstRead = null }) {
   const fresh = readSummaryComment(gh, pr);
   if (fresh.status === 'unsupported') throw new Error(UNSUPPORTED);
   let out = record;
   if (!out.resumed) {
     if (fresh.status === 'ok' && fresh.record.resumed) out = { ...out, resumed: fresh.record.resumed };
-    else if (fresh.status === 'invalid') out = { ...out, resumed: stampResumed({ host, now, head: out.head }) };
+    else if (fresh.status === 'invalid' || firstRead?.status === 'invalid') out = { ...out, resumed: stampResumed({ host, now, head: out.head }) };
   }
   if (out.resumed && !skipResumedEvent && !(fresh.status === 'ok' && fresh.record.resumed)) postResumedEvent(gh, pr, out.resumed);
   return writeSummaryComment(gh, pr, { record: out, sections, existing: fresh });

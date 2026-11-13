@@ -111,7 +111,7 @@ export const run = guarded(async (argv, ctx) => {
       outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession,
     });
     warnings.push(...guard.warnings);
-    const posted = writeRunRecord(gh, pr, { record, sections });
+    const posted = writeRunRecord(gh, pr, { record, sections, firstRead: existing });
     const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: posted.record.step, cost: costReport(posted.record.cost), warnings };
     // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.
     if (outcome === 'merged') output.pendingLogLine = buildAgentLogLine({ state, pr, title, outcome: DEFAULT_OUTCOME });

@@ -504,6 +504,33 @@ test('checkpoint --resumed: a usage error (exit 2: a record from a newer CLI, an
   assert.deepEqual(commentWrites(bad.fake), [], 'no comment written at all');
 });
 
+// R11-F1: `P summary` and `P comment --kind summary` read the summary comment, and it is INVALID; a stale writer (whose read predates the corruption) then PATCHes an
+// ordinary record before they write. The write must still end marked resumed, with the run-resumed event posted.
+const invalidSummary = () => ({ ...existingSummary({ record: baseRecord() }), body: `${MARKERS.summary}\n\nsome text\n\n<!-- claude-pipeline:record:bm90LWpzb24= -->` });
+function staleWriterScenario() {
+  const s = scenario();
+  const comments = { match: 'repos/acme/widgets/issues/12/comments --paginate', stdoutJsonSeq: [[invalidSummary()], [existingSummary({ record: baseRecord() })]] };
+  const views = [
+    { match: '^pr view 12 --json title,headRefName,baseRefName,headRefOid', stdoutJson: { title: 'Feature', headRefOid: s.head, headRefName: 'agent/feature', baseRefName: 'main' } },
+    { match: '^pr view 12 --json headRefName,baseRefName,headRefOid', stdoutJson: { headRefOid: s.head, headRefName: 'agent/feature', baseRefName: 'main' } },
+  ];
+  s.fake.setScript(ghEntries({ prHead: s.head, extra: [comments, ...views, PATCH_77] }));
+  return s;
+}
+for (const [name, args] of [['P summary', ['summary', '--pr', String(PR), '--outcome', 'merged']], ['P comment --kind summary', ['comment', '--pr', String(PR), '--kind', 'summary', '--outcome', 'merged']]]) {
+  test(`${name}: a first read that saw an invalid record still ends marked resumed with the run-resumed event posted, when a stale writer PATCHed an ordinary record in between`, () => {
+    const s = staleWriterScenario();
+    const r = cli(args, { dir: s.repo.dir, fake: s.fake, env: s.env });
+    assertExit(r, 0);
+    assert.equal(eventWrites(s.fake).length, 1, 'the run-resumed event was posted');
+    assert.equal(eventWrites(s.fake)[0].event.kind, 'run-resumed');
+    const written = recordWrites(s.fake);
+    assert.equal(written.length, 1);
+    assert.ok(written[0].record.resumed, 'the record written carries the resumed mark');
+    assert.deepEqual(written[0].record.resumed, eventWrites(s.fake)[0].event.data);
+  });
+}
+
 const RESUMED_EVENT = () => ({ id: 78, user: { login: 'me' }, body: renderEvent('run-resumed', `pr${PR}-aaaaaaaaaaaa`, 'This run was taken over from an earlier session.', RESUMED) });
 // the interleaving of R9-B1: the event is there, the record was then overwritten by a writer that had not seen the mark
 const withEventOnly = () => {

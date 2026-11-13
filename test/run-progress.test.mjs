@@ -253,6 +253,33 @@ test('writeRunRecord: a resumed stamp made on an earlier read still gets its eve
   assert.deepEqual(writeRunRecord(skipped, PR, { record: stamped, skipResumedEvent: true }).record.resumed, RESUMED);
 });
 
+// R11-F1: `P summary` and `P comment --kind summary` build their record without baseRecordFor, so they hand the writer the status of THEIR first read
+// (`firstRead`): an invalid one is stamped and its event posted exactly as baseRecordFor's callers do, even when a stale writer has since PATCHed an ordinary record.
+test('writeRunRecord: a first read that was invalid stamps resumed and posts the event although the re-read is ok and unmarked (stale writer in between)', () => {
+  const gh = memoryGh();
+  seed(gh, plain()); // what the stale writer PATCHed over the corrupted comment
+  gh.createComment = (pr, body) => { gh.comments.push({ id: 64, body, user: { login: 'me' } }); return { id: 64, url: 'u' }; };
+  const posted = writeRunRecord(gh, PR, { record: plain(), firstRead: { status: 'invalid' }, host: 'pc-1', now: NOW });
+  assert.deepEqual(posted.record.resumed, { at: new Date(NOW).toISOString(), host: 'pc-1', head: HEAD });
+  const events = gh.comments.map((c) => parseEvent(c.body)).filter((e) => e?.kind === 'run-resumed');
+  assert.deepEqual(events.map((e) => e.data), [posted.record.resumed], 'the run-resumed event was posted');
+  assert.equal(resumedRunState(gh, PR).resumed, true);
+  // a failed post still writes nothing (the event is required)
+  const broken = memoryGh();
+  seed(broken, plain());
+  const before = mineBody(broken);
+  broken.createComment = () => { throw new Error('boom 502'); };
+  assert.throws(() => writeRunRecord(broken, PR, { record: plain(), firstRead: { status: 'invalid' }, host: 'pc-1', now: NOW }), /boom 502/);
+  assert.equal(mineBody(broken), before);
+  // an ordinary first read (ok, absent) changes nothing
+  for (const firstRead of [{ status: 'ok', record: plain() }, { status: 'absent' }, undefined]) {
+    const ordinary = memoryGh();
+    seed(ordinary, plain());
+    ordinary.createComment = () => { throw new Error('must not post'); };
+    assert.equal(writeRunRecord(ordinary, PR, { record: plain(), firstRead }).record.resumed, undefined);
+  }
+});
+
 test('writeRunRecord: a malformed resumed.head (not shape-checked on decode) cannot block the mandatory event', () => {
   for (const head of ['bad head/with*chars', 'x'.repeat(200), '\n<!--', '\u00e9\u00e9']) {
     const gh = memoryGh([{ id: 7, body: INVALID_BODY, user: { login: 'me' } }]);
