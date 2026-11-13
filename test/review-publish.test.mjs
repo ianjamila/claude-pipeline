@@ -341,19 +341,19 @@ test('establishBaseline (R7-F1): a passed published result is used as is, with n
 
 const CHAT_YML = `${pipelineYml()}owner_approval: chat\n`;
 
-function world(t, { origin = null } = {}) {
+function world(t, { origin = null, yml = CHAT_YML, gh = [] } = {}) {
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-pubw-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
   const repo = createTmpRepo();
   t.after(() => repo.cleanup());
-  repo.write('.claude/pipeline.yml', CHAT_YML);
+  repo.write('.claude/pipeline.yml', yml);
   repo.write('.gitignore', '.review/\n');
   repo.write('src/a.js', 'export const a = 1;\n');
   repo.commit('init');
   if (origin) repo.git(['remote', 'add', 'origin', origin]);
   const dirB = join(scratch, 'wt-b');
   repo.git(['worktree', 'add', '-q', dirB, '-b', 'other']);
-  const fake = createCommentsGh([{ match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: 'acme/widgets', url: 'https://github.com/acme/widgets' } }]);
+  const fake = createCommentsGh([{ match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: 'acme/widgets', url: 'https://github.com/acme/widgets' } }, ...gh]);
   const lockDir = join(scratch, 'locks');
   const w = {
     A: repo.dir, B: dirB, fake, lockDir, scratch, repo,
@@ -425,6 +425,61 @@ test('comment --kind triage takes the review lock: a holder in another worktree 
   await new Promise((resolve) => holder.once('exit', resolve));
   assertExit(w.comment(w.B), 0);
   assert.equal(w.fake.comments().length, 1);
+});
+
+// ---- the redraft advice (plan 2026-11-12-redraft-fix-rounds): the triage publication of a round with a fix coming, on a READY PR of a repo that iterates in draft ----
+
+const ITERATING_YML = `${CHAT_YML}`.replace('  guard_checks: false\n', '  guard_checks: false\n  draft_while_iterating: true\n');
+const prReads = (w) => w.fake.lines().filter((l) => /^pr view 7 --json isDraft$/.test(l));
+const readyGh = (view) => [{ match: '^pr view 7 --json isDraft$', ...view }];
+
+test('comment --kind triage advice: an ACCEPT item still to fix on a READY PR of an iterating repo warns to run `pipeline redraft --pr N`, the publication still succeeds', (t) => {
+  const w = world(t, { yml: ITERATING_YML, gh: readyGh({ stdoutJson: { isDraft: false } }) });
+  saveState(w.A, mk([it('R1-B1'), it('R1-S1', { bucket: 'SUGGESTION', final: decided({ decision: 'REJECT' }) })]));
+  const r = w.comment(w.A);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.action, 'created');
+  assert.equal(r.json.redraftAdvice, true);
+  assert.equal(r.json.warnings.length, 1);
+  assert.match(r.json.warnings[0], /PR #7 is ready/);
+  assert.match(r.json.warnings[0], /`pipeline redraft --pr 7`/);
+  assert.equal(w.fake.comments().length, 1);
+});
+
+test('comment --kind triage advice: none when nothing is left to fix (no ACCEPT, an implemented ACCEPT, a needs-human one), and then the PR is not read', (t) => {
+  for (const [name, items] of [
+    ['no ACCEPT', [it('R1-B1', { final: decided({ decision: 'REJECT' }) }), it('R1-S1', { bucket: 'SUGGESTION', final: decided({ decision: 'FOLLOW-UP' }) })]],
+    ['implemented', [it('R1-B1', { implemented: true })]],
+    ['needs human', [it('R1-B1', { final: waiting() })]],
+  ]) {
+    const w = world(t, { yml: ITERATING_YML, gh: readyGh({ stdoutJson: { isDraft: false } }) });
+    saveState(w.A, mk(items));
+    const r = w.comment(w.A);
+    assertExit(r, 0, name + r.stdout + r.stderr);
+    assert.equal(r.json.ok, true, name);
+    assert.equal('redraftAdvice' in r.json, false, name);
+    assert.equal('warnings' in r.json, false, name);
+    assert.deepEqual(prReads(w), [], `${name}: the PR is not read`);
+  }
+});
+
+test('comment --kind triage advice: none for a draft PR, a repo that does not iterate (PR not read), or an unreadable PR (never a failure)', (t) => {
+  const none = (w, why) => {
+    saveState(w.A, mk([it('R1-B1')]));
+    const r = w.comment(w.A);
+    assertExit(r, 0, why + r.stdout + r.stderr);
+    assert.equal(r.json.ok, true, why);
+    assert.equal(r.json.action, 'created', why);
+    assert.equal('redraftAdvice' in r.json, false, why);
+    assert.equal('warnings' in r.json, false, why);
+    return r;
+  };
+  none(world(t, { yml: ITERATING_YML, gh: readyGh({ stdoutJson: { isDraft: true } }) }), 'draft: ');
+  const plain = world(t, { gh: readyGh({ stdoutJson: { isDraft: false } }) });
+  none(plain, 'not iterating: ');
+  assert.deepEqual(prReads(plain), [], 'not iterating: the PR is not read');
+  none(world(t, { yml: ITERATING_YML, gh: readyGh({ code: 1, stderr: 'gh: Server Error (HTTP 502)' }) }), 'unreadable: ');
 });
 
 test('comment --kind triage: other kinds take no lock, and a state of another PR is refused', async (t) => {
