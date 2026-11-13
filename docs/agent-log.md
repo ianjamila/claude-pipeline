@@ -154,3 +154,4 @@ full record.
 - 2026-11-12 · #332 · Owner approval of past review rounds (🔂) + published review history can't shrink · risk high · rounds 5 · arbiter 4 · awaiting-owner-merge
 - 2026-11-13 · #269 · Click to approve: merge, extra round and rulings as a choice dialog (#261) · risk high · rounds 20 · arbiter 19 · blocked
 - 2026-11-13 · #326 · Stand-in reviewer when Codex is out of quota, plus cheaper Codex rounds (#256) · risk high · rounds 8 · arbiter 7 · blocked
+- 2026-11-13 · #350 · Redraft follow-ups: correct setup rule, Rule 8 wording (#310), advice only when a fix is coming, pinned actions, CI proof wait 45 (#320), this repo iterates in draft · risk high · rounds 1 · arbiter 0 · blocked
