@@ -2862,6 +2862,7 @@ class Parser {
       // (#352 R10: every command of a pipeline (the stages, and what they hold) is marked: a change in one is its subshell's. A stage is marked when the stage after it is finished)
       seg.span = [out0, this.ctx.out.length];
       for (const s of seg.sep === '|' ? [seg, ...(seg.pipedFrom ?? [])] : []) if (s.span) for (const c of this.ctx.out.slice(...s.span)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true });
+      if (seg.pipeOut) for (const c of this.ctx.out.slice(...seg.span)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true }); // (#352 R11-F1: a | was read while it waited for its heredoc body: see markPipe)
       if (seg.afterClose && this.ctx.out.length === out0) this.ctx.owedClose = { grp: seg.grp, depth: seg.depth }; // (it emitted nothing: the mark waits for the next command of ITS level, see emit)
     } catch {
       // never lose the command to an unexpected failure: report its words as written and say we were cut short
@@ -2931,7 +2932,9 @@ class Parser {
 
   // (#352 R11-F1: every command from `from` on is a stage of a pipeline: a change in one is its subshell's. Commands still waiting for a heredoc are not out yet: the marks are not to be trusted)
   markPipe(from) {
-    if (this.queue.length) this.ctx.ctlBroken = true;
+    // (a stage still waiting for its heredoc body has emitted nothing yet: it is marked when the queue finishes it (finalize). Every waiting segment is: one that is not in this pipeline only loses certainty.
+    // Before, the whole line lost it (ctlBroken), and `cd d && cat <<'EOF' | wc -l && git push` was refused.)
+    for (const s of this.queue) s.pipeOut = true;
     for (const c of this.ctx.out.slice(from)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true });
   }
 

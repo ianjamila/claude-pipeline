@@ -269,6 +269,12 @@ test('#352 R11-F1: a cd in a pipeline stage followed by a ( ) / (( )) stage is t
   allows('twin: the cd before the pipeline', `cd /work/other2 && echo a | (cat) && ${SHIP}`);
   allows('twin: the cd before a pipeline of two ( ) stages', `cd /work/other2; (cat) | (cat); ${SHIP}`);
   allows('twin: the pipeline first', `echo a | (cat); cd /work/other2 && ${SHIP}`);
+  // (a stage that waits for its heredoc body when the | is read: it alone is the pipeline's, the cd before it stays certain)
+  denies('a cd waiting for its heredoc, | ( )', `cd /work/other2 <<'EOF' | (cat) && ${SHIP}\nx\nEOF`);
+  denies('a cd waiting for its heredoc, | a command', `cd /work/other2 <<'EOF' | cat && ${SHIP}\nx\nEOF`);
+  allows('twin: a cd, then a heredoc stage | a command, then the push', `cd /work/other2 && cat <<'EOF' | wc -l && ${SHIP}\na\nEOF`);
+  allows('twin: a cd, then a heredoc stage | a command, the push on the next line', `cd /work/other2 && cat <<'EOF' | wc -l\na\nEOF\n${SHIP}`);
+  allows('twin: a cd, then a heredoc stage | ( )', `cd /work/other2 && cat <<'EOF' | (cat) && ${SHIP}\na\nEOF`);
 });
 
 test('#352 R11-F2: the operator before a pipeline reaches every later stage, the levels they open included', () => {
