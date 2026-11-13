@@ -553,3 +553,15 @@ test('#269 R28: a control character in a hook command, or a marker-like characte
   assert.equal(commandTarget('node ~/a.mjs', o), '/h/a.mjs');
   assert.equal(commandTarget('node ${CLAUDE_PLUGIN_ROOT}/hooks/a.mjs', o), '/opt/p/hooks/a.mjs');
 });
+
+test('#269 R29-B1: a `$` in the plugin root or home is kept literally (never a replacement pattern)', () => {
+  for (const root of ['/opt/$$/p', '/opt/$&/p', "/opt/$'/p", '/opt/$`/p'])
+    assert.equal(commandTarget('node "${CLAUDE_PLUGIN_ROOT}/hooks/a.mjs"', { home: '/h', platform: 'linux', pluginRoot: root }), `${root}/hooks/a.mjs`, root);
+  assert.equal(commandTarget('node ~/a.mjs', { home: '/h/$$/x', platform: 'linux' }), '/h/$$/x/a.mjs');
+});
+
+test('#269 R29-F1: white space other than space and tab (no-break space, line separator, BOM, a trailing one) is refused: the checker would split there, bash does not', () => {
+  for (const cmd of ['node /x/a.mjs ../../y/b.mjs', 'node /x/a.mjs ../y.mjs', 'node /x/a.mjs﻿../y.mjs', 'node /x/a.mjs ', 'node /x/a.mjs\r'])
+    assert.equal(commandTarget(cmd, { home: '/h', platform: 'linux' }), null, JSON.stringify(cmd));
+  assert.equal(commandTarget('node /x/a.mjs --flag', { home: '/h', platform: 'linux' }), '/x/a.mjs');
+});

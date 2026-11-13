@@ -140,7 +140,7 @@ export function resolveCommand(command, opts = {}) {
 // resolveCommand without the look at the file: the script path the command names, or null. (Pure, so the Windows forms can be tested on any machine through `platform`.)
 export function commandTarget(command, { home, pluginRoot = null, platform = process.platform } = {}) {
   if (typeof command !== 'string' || command.trim() === '') return null;
-  if (/[\u0000-\u0008\u000a-\u001f\u007f]/.test(command)) return null; // (#269 R28) a control character could pose as the home / plugin-root markers below: refused
+  if (/[\u0000-\u0008\u000a-\u001f\u007f]|[^\S \t]/.test(command)) return null; // (#269 R28/R29) a control character could pose as the home / plugin-root markers below, and white space other than space/tab (no-break space, line separator, BOM …) splits words here but not in bash: refused
   let text = command.trim();
   // (the install path never passes the shell-word rules: its own separators are the platform's, while anything the author typed after the variable still does; it goes in after the split, like the home folder)
   if (pluginRoot) text = text.replace(/\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g, () => ROOT_MARK);
@@ -158,7 +158,7 @@ export function scriptTarget(w, home, platform = process.platform, pluginRoot = 
   // (#269 R28) a word that holds a control character other than through the markers commandTarget put in (an `args` word, or a marker with no plugin root) is refused, never substituted
   const MARKED = marked ? /\u0001HOME\u0001|\u0002/g : /(?!)/g; // only commandTarget's own words carry markers; `args` words never do
   if (w.some((s) => typeof s !== 'string' || /[\u0000-\u001f\u007f]/.test(s.replace(MARKED, '')) || (!pluginRoot && s.includes(ROOT_MARK)))) return null;
-  const real = (s) => s.replaceAll(HOME_MARK, home).replaceAll(ROOT_MARK, pluginRoot);
+  const real = (s) => s.replaceAll(HOME_MARK, () => home).replaceAll(ROOT_MARK, () => pluginRoot); // (#269 R29-B1) callbacks: a `$` in the path is literal, never a replacement pattern
   let target;
   if (INTERPRETERS.includes(w[0])) {
     if (w.length < 2) return null;
