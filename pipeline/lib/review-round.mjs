@@ -24,7 +24,7 @@ import {
 import { createGitHub } from './github.mjs';
 import { assertPublishedHistory } from './review-publish.mjs';
 import { GhError } from './proc.mjs';
-import { isSensitivePath, rateBranch, trustedBase } from './risk.mjs';
+import { isSensitivePath, rateBranch, trustedBase, trustedDefaultBranch } from './risk.mjs';
 import { DEFAULTS } from './config.mjs';
 import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } from './state.mjs';
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
@@ -172,8 +172,9 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
     throw err;
   }
 
-  // The merge base of the whole PR: where the PR forked from the branch it targets (origin/<base> when it exists).
-  const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
+  // The merge base of the whole PR: where the PR forked from the branch it targets (origin/<base> when it exists). GitHub's answer wins; without one the PR is read as
+  // targeting the TRUSTED default branch (risk.mjs#trustedDefaultBranch), never the working-tree config's default_branch, which the PR can edit (#398).
+  const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : trustedDefaultBranch(root, config).branch;
   // Best effort: a fresh origin/<base> is what "merged in from the base branch" is measured against. Offline, no remote or a
   // slow one just means the cached ref is used.
   try {
@@ -201,7 +202,8 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   // What the reviewer is shown (and what the fix commits are measured against) is exactly this range. Round 1 starts at the merge
   // base; a later round starts where the previous one ended, with the base branch's commits merged in since then taken out.
   // Only commits that came from the protected default branch are left out: the base side is origin/<default_branch> (never a
-  // branch the PR author chose), and a PR that targets any other branch leaves nothing out. A failed or stale fetch only
+  // branch the PR author chose), and a PR that targets any other branch leaves nothing out. "Targets the default branch" is the trusted one
+  // (rated.defaultBranch: origin/HEAD), not config.default_branch: a PR that names its own base branch there would otherwise have that branch's commits left out (#398). A failed or stale fetch only
   // leaves an older origin/<default_branch>, which can only make the range bigger.
   // The conflict case ('whole-pr' above): when the merge of the default branch conflicted and the resolution only chose lines the
   // two sides had, the range is the resolution alone and the round is free of the cap (resolutionReviewBase has every rule).
@@ -210,7 +212,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   let review = { base: forkPoint, kind: 'merge-base' };
   let resolution = null;
   if (state?.rounds.length > 0 && !wholePr) {
-    review = prBase === config.default_branch
+    review = prBase === rated.defaultBranch
       ? effectiveReviewBase({ from: base, forkPoint }, o)
       : { base, kind: 'previous' };
     if (review.kind === 'whole-pr') {

@@ -313,3 +313,15 @@ test('rateBranch: a remote default branch that differs from config.default_branc
   assert.match(reason, /"main"/);
   assert.match(reason, /git remote set-head origin -a/);
 });
+
+// #398: rateBranch hands the TRUSTED default branch back, so admitRound decides "does this PR target the default branch" without reading the editable working-tree value.
+test('rateBranch: defaultBranch is the remote\'s (origin/HEAD), not the one the working-tree config names (#398)', async (t) => {
+  const r = await attackWorld(t, { remote: true }).rate();
+  assert.equal(r.defaultBranch, 'main');
+  assert.equal(r.stacked, false);
+});
+
+test('rateBranch: defaultBranch falls back to the config default_branch in a clone with no remote anchor', async (t) => {
+  const w = world(t, { feature: (r) => r.write('src/a.js', lines(3)) });
+  assert.equal((await w.rate()).defaultBranch, 'main');
+});

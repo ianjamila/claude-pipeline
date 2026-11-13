@@ -165,6 +165,16 @@ export function reviewLane({ level, files, config, sizeOnly = false }) {
   return { reviewer: reasons.length > 0 ? 'fable' : 'judge', reasons, sensitivePaths };
 }
 
+// The default branch every review-path decision measures "is this the default branch" against (#398): what the remote calls its default (refs/remotes/origin/HEAD), and
+// only a clone without that ref falls back to the working-tree config's default_branch, which a PR can edit. admitRound's base rule (what counts as merged in from the
+// default branch, the base a missing baseRefName falls back to), review-complete's lane and rateBranch's stacked test all read it through here, so a PR that names its own
+// base branch as default_branch cannot make that branch's commits read as the default branch's. `remote`: the remote's default branch when it anchored, else null.
+// -> { branch, remote }
+export function trustedDefaultBranch(root, config) {
+  const remote = remoteDefaultBranch({ cwd: root });
+  return { branch: remote ?? config.default_branch, remote };
+}
+
 // The trust anchor of the rating, shared with the status display (round-status.mjs#trustedBaseConfig): the default branch is what the remote calls its default
 // (refs/remotes/origin/HEAD; only a clone without that ref falls back to the working-tree config's default_branch, which a PR can edit), the trusted fork point is
 // mergeBase(origin/<that>, head), and the trusted config is the one committed there. A committed config that names a different default_branch than the
@@ -175,8 +185,7 @@ export function reviewLane({ level, files, config, sizeOnly = false }) {
 // -> { defaultBranch, trustedFork, trusted: { ok: true, config } | { ok: false, reason }, mismatch: string | null, remoteDefault: string | null }. Throws what git throws (no fork point).
 export function trustedBase({ root, head, config, trustedFork: given }) {
   const o = { cwd: root };
-  const remote = remoteDefaultBranch(o);
-  const defaultBranch = remote ?? config.default_branch;
+  const { branch: defaultBranch, remote } = trustedDefaultBranch(root, config);
   const trustedFork = given ?? mergeBase(reviewBaseRef(defaultBranch, o), head, o);
   const trusted = baseConfigAt(trustedFork, root);
   const mismatch = trusted.ok && trusted.config.default_branch !== config.default_branch
@@ -201,7 +210,8 @@ export function trustedBase({ root, head, config, trustedFork: given }) {
 // `base` (optional) is the ref the diff starts from; it defaults to the trusted fork point (codex-review passes its own, stack-aware, fork point).
 // Throws what the scan throws (the callers decide how to fail closed). -> {
 //   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
-//   trustedFork, baseConfig: { ok, reason? }, stacked }
+//   trustedFork, baseConfig: { ok, reason? }, stacked, defaultBranch }
+// `defaultBranch` is the trusted one (trustedDefaultBranch), for a caller that decides "is the PR's base the default branch" (admitRound's base rule, #398).
 export async function rateBranch({ root, head, config, prBase, base }) {
   const o = { cwd: root };
   const { defaultBranch, trustedFork, trusted, mismatch, remoteDefault } = trustedBase({ root, head, config });
@@ -276,6 +286,6 @@ export async function rateBranch({ root, head, config, prBase, base }) {
       path: rated.some((r) => r.risk.drivers.path), size: rated.some((r) => r.risk.drivers.size),
     },
     sizeOnly, reviewer, laneReasons, sensitivePaths, ...(sizeOnlyJudge ? { sizeOnlyJudge: true, note: SIZE_ONLY_NOTE } : {}),
-    hits, files, lightLane: rated.every((r) => r.lightLane), trustedFork, baseConfig: trustedOk ? { ok: true, same: sameConfig } : { ok: false, reason: trusted.ok ? mismatch : trusted.reason }, stacked,
+    hits, files, lightLane: rated.every((r) => r.lightLane), trustedFork, baseConfig: trustedOk ? { ok: true, same: sameConfig } : { ok: false, reason: trusted.ok ? mismatch : trusted.reason }, stacked, defaultBranch,
   };
 }

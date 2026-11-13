@@ -736,6 +736,25 @@ test('codex-review: a PR that targets a branch other than the default branch exc
   assert.equal(w.state().rounds[1].reviewBaseKind, 'previous');
 });
 
+// #398: "is this PR's base the default branch" is answered by the trusted default branch (origin/HEAD), never by the working-tree config's default_branch, which the PR
+// can edit: naming its own base branch there must not make that branch's merged-in commits count as "from the default branch" and drop out of the next round.
+test('codex-review: a PR whose own pipeline.yml names its base branch as default_branch still has that branch\'s merged-in commits reviewed (#398)', (t) => {
+  const gh = GH.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { ...e.stdoutJson, baseRefName: 'release' } } : e));
+  const w = worldIgnoringReview(t, { gh, featFiles: { '.claude/pipeline.yml': `${pipelineYml()}default_branch: release\n` } });
+  w.repo.git(['branch', 'release', w.base]);
+  // the remote's own default branch (what origin/HEAD names) is main: the anchor the PR cannot edit
+  w.repo.git(['update-ref', 'refs/remotes/origin/main', w.base]);
+  w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-release.js': 'export const x = 1;\n' }, { branch: 'release' });
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, undefined, 'not a base-only round');
+  assert.equal(w.captured().length, 2, 'Codex ran');
+  assert.match(patchOf(w, 2), /from-release\.js/, 'the PR-chosen base branch\'s code is reviewed');
+  assert.equal(w.state().rounds[1].reviewBaseKind, 'previous');
+});
+
 test('codex-review: code merged in from a branch other than the PR\'s base is reviewed (only the default branch is left out)', (t) => {
   const w = worldIgnoringReview(t);
   w.repo.git(['branch', 'side', w.base]);

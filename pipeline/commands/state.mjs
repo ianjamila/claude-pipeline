@@ -15,6 +15,7 @@ import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
 import { wholePrOwed } from '../lib/review-route.mjs';
 import { roundStats } from '../lib/round-stats.mjs';
+import { trustedDefaultBranch } from '../lib/risk.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
 import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
@@ -689,7 +690,7 @@ async function fableRefresh(rest, ctx) {
     // The whole-PR range starts at the PR's merge base now (a base branch merged in since the last round moves it).
     let forkPoint = last.forkPoint ?? state.rounds[0]?.reviewBase;
     try {
-      const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
+      const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : trustedDefaultBranch(root, config).branch;
       forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
     } catch (err) {
       if (!(err instanceof GitError)) throw err;

@@ -15,7 +15,7 @@ import { git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { behindFreshEnough, lazyDiff } from '../lib/finalgate.mjs';
 import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { assessRisk, rateBranch, reviewLane } from '../lib/risk.mjs';
+import { assessRisk, rateBranch, reviewLane, trustedDefaultBranch } from '../lib/risk.mjs';
 import { isSubstituteRound, loadState } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
 import { noteReviewed } from '../lib/codex-usage.mjs';
@@ -82,15 +82,16 @@ function whyNot(state, hash) {
 // Fable when no round ran a proven Fable pass. A recorded high risk is Fable without looking further. When the hard stops cannot be collected the
 // lane is Fable whatever the level (fail closed). A recorded medium stays medium and only the judge lane of a fresh size-only medium may keep it
 // with the judge: a medium that came from a hit (now gone from a fresh scan, or never found by it) needs Fable.
-// `prBase`: the PR's base branch; a stack never gets the size-only judge (rateBranch).
-export async function laneProblem(state, root, config, base, { prBase = config.default_branch, rate = rateBranch } = {}) {
+// `prBase`: the PR's base branch; a stack never gets the size-only judge (rateBranch). Without one it is the TRUSTED default branch (rateBranch defaults it; never the
+// working-tree config's default_branch, which the PR can edit: #398).
+export async function laneProblem(state, root, config, base, { prBase, rate = rateBranch } = {}) {
   const recorded = LEVELS.includes(state.risk) ? state.risk : 'low';
   const proven = state.rounds.some((r) => r.fableRequired === true && r.arbiter?.proofOk === true);
   const needs = (why) => (proven ? null : `the PR needs the Fable review pass (${why}), but no review round ran a proven one`);
   if (recorded === 'high') return needs('high risk');
   let rated;
   try {
-    rated = await rate({ root, head: 'HEAD', config, prBase, base });
+    rated = await rate({ root, head: 'HEAD', config, ...(prBase === undefined ? {} : { prBase }), base });
   } catch (err) {
     return needs(`hard stops could not be collected: ${oneLine(err)}`);
   }
@@ -273,7 +274,7 @@ export const run = guarded(async (argv, ctx) => {
       }
       if (!grants.ok) return { exitCode: EXIT.FAILED, output: { ok: false, reason: grants.problems.join('; '), currentContentHash: hash } };
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
-      const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
+      const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : trustedDefaultBranch(root, config).branch;
       const lane = await laneProblem(state, root, config, base, { prBase });
       if (lane) return { exitCode: EXIT.FAILED, output: { ok: false, reason: lane, currentContentHash: hash } };
       // A Claude stand-in reviewed instead of Codex (plan 2026-11-11-codex-substitute-reviewer): a high-risk PR it covered with Opus alone, or a substitute round whose proof does not hold, is refused.
