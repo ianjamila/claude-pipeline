@@ -1299,6 +1299,8 @@ const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'mor
 const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
 const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'chdir', 'set-location', 'sl']); // (R18-F2: zsh's chdir is cd under another name, with the same target whitelist)
+// R19-B1: the name a cd command is judged under: chdir is read as cd ONCE, here, so a bare `chdir` goes home, narrows and is a cd for every check below that asks `=== 'cd'`
+const cdNameOf = (w) => { const n = baseOf(w ?? ''); return n === 'chdir' ? 'cd' : n; };
 // R5-F1 (#288): the builtin cd, written as the command itself (after only NAME=value words): not behind `env`, `sudo`, `time`, `builtin`, `command`
 // (R6-F1: a hand scan, one pass. The regex it replaces matched a quoted value two ways -- `'x'` is both `'[^']*'` and `\S*` -- and backtracked exponentially: 40 assignments before a failing `cd` outlasted the hook timeout)
 const PLAIN_CD = {
@@ -1311,7 +1313,7 @@ const PLAIN_CD = {
       while (i < n && isBlank(s[i])) i++;
       // NAME=value, the value one run of unquoted characters and quoted strings
       const m = /^[A-Za-z_]\w*=/.exec(s.slice(i, i + 256));
-      if (!m) { const c = s[i + 2]; return s.startsWith('cd', i) && (c === undefined || isBlank(c) || c === ';' || c === '&' || c === '|'); }
+      if (!m) { const k = s.startsWith('chdir', i) ? 5 : 2; const c = s[i + k]; return (k === 5 || s.startsWith('cd', i)) && (c === undefined || isBlank(c) || c === ';' || c === '&' || c === '|'); } // (R19-B1: chdir is a plain cd too)
       i += m[0].length;
       while (i < n && !isBlank(s[i])) {
         const q = s[i];
@@ -1486,14 +1488,14 @@ function runsInlineCode(c, ctx) {
 // Why: a cd whose target cannot be named from its words: `cd -` (OLDPWD), `popd`, a bare `pushd`, `pushd +1`, several operands (a brace list the parser split; zsh `cd old new`),
 // `~-` / `~+` / `~name` (OLDPWD, PWD, another user's home).
 function cdUnknownShape(argv) {
-  const cn = baseOf(argv[0] ?? '');
+  const cn = cdNameOf(argv[0]);
   const args = argv.slice(1);
   if (cn === 'popd' || args.includes('-')) return true;
   // R10-F3: zsh reads `cd +N` / `cd -N` as entry N of the directory stack (entry 0 is the current directory), not as a directory name
-  if ((cn === 'cd' || cn === 'chdir') && args.some((a) => /^[+-]\d+$/.test(a))) return true;
+  if (cn === 'cd' && args.some((a) => /^[+-]\d+$/.test(a))) return true;
   const t = args.find((a) => !a.startsWith('-') && a !== '/d');
   if (cn === 'pushd' && (t === undefined || args.some((a) => /^[+-]\d+$/.test(a)))) return true;
-  if ((cn === 'cd' || cn === 'chdir') && args.filter((x) => !x.startsWith('-')).length > 1) return true;
+  if (cn === 'cd' && args.filter((x) => !x.startsWith('-')).length > 1) return true;
   return t !== undefined && /^~(?:[-+]|[A-Za-z_])/.test(t);
 }
 // R12: a word is provably literal when nothing in it is settled at run time. R13: a POSITIVE shape (letters, digits and `_ . , : / = @ % + -`), not a list of bad characters: zsh's `^ # ~ < > !`
@@ -2599,7 +2601,7 @@ function collectDirs(cmds, ctx, cdOnly = false) {
     if (!cdOnly) for (const b of baseDirsOf(c.argv)) addDir(expandRefs(b, ctx));
     // (a wrapper's -C DIR / --chdir DIR, `env -C DIR cp x link/state.json`: the parser unwraps `env`, so the directory is on the command, not in its argv)
     if (!cdOnly && typeof c.chdir === 'string') addDir(expandRefs(c.chdir, ctx));
-    const cdName = baseOf(c.argv[0] ?? '');
+    const cdName = cdNameOf(c.argv[0]);
     if (!CD_CMDS.has(cdName)) continue;
     let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
     if (!t && (cdName === 'cd' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
@@ -3881,7 +3883,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // Why: HOME is never believed from the line (the guard reads `~` as the real home), so a line that sets it, or a source that may, leaves `cd` / `cd ~` / `cd ~/x` without a known target
     const homeMoved = ctx.unknownAll || ctx.homeSourced === true || moved('HOME') || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[|$)/.test(a)));
     return cmds.some((c, ci) => {
-      const cn = baseOf(c.argv[0] ?? '');
+      const cn = cdNameOf(c.argv[0]);
       if (dirWords()) return true; // (R17: AUTO_CD, whether or not an option is set: a command word that could be a directory)
       if (!CD_CMDS.has(cn)) return false;
       const { unknownName } = stateAt(ci);
@@ -4305,7 +4307,7 @@ function evaluateBashForFilesFrame(command, opts) {
     return u.length > 32 ? null : u;
   };
   const cdTarget = (c) => { // the plain target of a `cd` whose destination is known now, else null
-    if (baseOf(c.argv[0] ?? '') !== 'cd' || c.raw.includes('\\') || !PLAIN_CD.test(c.raw)) return null; // (R5-F1: `env cd`, `sudo cd`, `time cd` run no builtin in this shell)
+    if (cdNameOf(c.argv[0]) !== 'cd' || c.raw.includes('\\') || !PLAIN_CD.test(c.raw)) return null; // (R5-F1: `env cd`, `sudo cd`, `time cd` run no builtin in this shell)
     const rest = c.argv.slice(1).filter((a) => a !== '--' && !/^-[LPe@]+$/.test(a));
     if (rest.length > 1) return null;
     const word = rest.length ? rest[0] : '~';
