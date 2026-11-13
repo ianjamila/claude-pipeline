@@ -67,7 +67,6 @@ export function gatherRoundStatus({ root, config, state, pr, gh, warnings }) {
     warnings.push(`the booked cost could not be read (${asciiLine(err?.message, 120)})`);
   }
   const diff = reviewedDiff(root, config, state);
-  if (diff.problem) warnings.push(`the reviewed diff could not be read (${diff.problem}): every open item is shown as high`);
   let since = { anchor: null, count: 0, commits: [], changed: null };
   try {
     since = sinceLastReview(root, config, state, { withChanges: !outcome.coverageValid && outcome.newAccepted.length === 0 });
@@ -76,6 +75,8 @@ export function gatherRoundStatus({ root, config, state, pr, gh, warnings }) {
   }
   const trusted = trustedBaseConfig(root, config);
   const open = openItems(state, outcome, { config, files: diff.files, baseConfig: trusted.config, baseProblem: trusted.problem }, warnings);
+  // Only while an item is open (round-ask.mjs warns the same way): with nothing open there is no severity to guess (#368).
+  if (diff.problem && open.length > 0) warnings.push(`the reviewed diff could not be read (${diff.problem}): every open item is shown as high`);
   const notClean = notCleanReasons(outcome, since.changed);
   return { outcome, rounds, cost, diff, since, open, notClean, trusted };
 }
