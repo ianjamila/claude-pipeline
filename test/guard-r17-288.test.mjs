@@ -217,8 +217,8 @@ describe('R17-F7: a loop that runs an earlier file again after a later file move
   ]);
   allows('F7b', [
     ['straight line: b.sh runs before mv.sh, once', 'source ./b.sh; source ./mv.sh', stub({ ...F, '/home/u/proj/mv.sh': 'cd /home/u\n' })],
-    ['a loop whose later file stays in the project (read-only first file)', 'for i in 1 2; do source ./r.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/r.sh': 'ls\n', '/home/u/proj/mv.sh': 'cd ./sub\n' })],
-    ['a loop of harmless files', 'for i in 1 2; do source ./c.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/c.sh': 'echo hi\n', '/home/u/proj/mv.sh': 'cd /home/u\n' })],
+    ['a loop whose later file stays in the project (read-only first file; R18-B1: the move is an absolute path, a relative cd in a loop is unknown)', 'for i in 1 2; do source ./r.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/r.sh': 'ls\n', '/home/u/proj/sub/r.sh': 'ls\n', '/home/u/proj/sub/mv.sh': 'cd /home/u/proj/sub\n', '/home/u/proj/mv.sh': 'cd /home/u/proj/sub\n' })],
+    ['a loop of harmless files (R18-F1: both files exist in the directory the later file moves to too, a missing one there may have been made by the loop)', 'for i in 1 2; do source ./c.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/c.sh': 'echo hi\n', '/home/u/c.sh': 'echo hi\n', '/home/u/mv.sh': 'cd /home/u\n', '/home/u/proj/mv.sh': 'cd /home/u\n' })],
   ]);
 });
 

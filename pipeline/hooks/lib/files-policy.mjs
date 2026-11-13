@@ -1298,7 +1298,7 @@ function makeMatchers(ctx) {
 const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
 const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
-const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'set-location', 'sl']);
+const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'chdir', 'set-location', 'sl']); // (R18-F2: zsh's chdir is cd under another name, with the same target whitelist)
 // R5-F1 (#288): the builtin cd, written as the command itself (after only NAME=value words): not behind `env`, `sudo`, `time`, `builtin`, `command`
 // (R6-F1: a hand scan, one pass. The regex it replaces matched a quoted value two ways -- `'x'` is both `'[^']*'` and `\S*` -- and backtracked exponentially: 40 assignments before a failing `cd` outlasted the hook timeout)
 const PLAIN_CD = {
@@ -1322,7 +1322,7 @@ const PLAIN_CD = {
   },
 };
 // ...and the commands that can change the shell's directory (or what a command name means) without being a cd we model
-const DIR_CHANGERS = new Set([...CD_CMDS, 'chdir', 'eval', 'source', '.', 'builtin', 'command', 'exec', 'alias', 'unalias', 'setopt', 'unsetopt', 'shopt', 'enable', 'emulate']);
+const DIR_CHANGERS = new Set([...CD_CMDS, 'eval', 'source', '.', 'builtin', 'command', 'exec', 'alias', 'unalias', 'setopt', 'unsetopt', 'shopt', 'enable', 'emulate']);
 // Why: the directories an unknown `cd` may land in that matter: each protected directory (a file cannot be a cwd), each directory above one, and the home's parents.
 function assumedCwds(ctx) {
   const dirs = [...ctx.lexRoots.filter((r) => !/\.\w+$/.test(posix.basename(r))), ...ctx.lexAncestors];
@@ -1490,10 +1490,10 @@ function cdUnknownShape(argv) {
   const args = argv.slice(1);
   if (cn === 'popd' || args.includes('-')) return true;
   // R10-F3: zsh reads `cd +N` / `cd -N` as entry N of the directory stack (entry 0 is the current directory), not as a directory name
-  if (cn === 'cd' && args.some((a) => /^[+-]\d+$/.test(a))) return true;
+  if ((cn === 'cd' || cn === 'chdir') && args.some((a) => /^[+-]\d+$/.test(a))) return true;
   const t = args.find((a) => !a.startsWith('-') && a !== '/d');
   if (cn === 'pushd' && (t === undefined || args.some((a) => /^[+-]\d+$/.test(a)))) return true;
-  if (cn === 'cd' && args.filter((x) => !x.startsWith('-')).length > 1) return true;
+  if ((cn === 'cd' || cn === 'chdir') && args.filter((x) => !x.startsWith('-')).length > 1) return true;
   return t !== undefined && /^~(?:[-+]|[A-Za-z_])/.test(t);
 }
 // R12: a word is provably literal when nothing in it is settled at run time. R13: a POSITIVE shape (letters, digits and `_ . , : / = @ % + -`), not a list of bad characters: zsh's `^ # ~ < > !`
@@ -1507,6 +1507,14 @@ const literalCommand = (w) => w === '[' || literalWord(w) || spacedPath(w) || (w
 // handling). bash and zsh skip CDPATH for those prefixes, and cdable_vars only reads a non-directory argument that does not start with `/` as a variable name, so no option state changes where such a target goes.
 // Every other target (`cd proj`, `cd proj/sub`, `~user`, `-`, `+N`, a run-time value) leaves the directory unknown.
 const cdTargetLiteral = (e) => isAbs(e) || /^\.\.?(?:[\\/]|$)/.test(e);
+// R18 (B1 / F1 / F7, one class): a command that can run more than once (in a loop, a function body or a trap action; a file sourced from one runs there too) moves the shell again each time. A RELATIVE cd target
+// (`..`, `../x`, `./x`; only `.` stays put) climbs or descends once per run, so how far the shell gets is not a number the guard can count: in such a place the directory is unknown (an absolute target may still join the set).
+const cdStaysPut = (e) => /^(?:\.(?:\/+|$))+$/.test(e);
+const cdRelative = (e) => typeof e === 'string' && !isAbs(e) && !cdStaysPut(e);
+const repeats = (cmds, i) => {
+  const c = cmds[i];
+  return cmds.ctlBroken === true || (c?.ctl ? Boolean(c.ctl.loop || c.ctl.fn || c.ctl.trap) : inFlow(flowStart(cmds), i));
+};
 // Option names are compared without case, `_` or `-` (`AUTO_CD`, `auto-cd`, `noautocd`)
 const optionWord = (w) => w.toLowerCase().replace(/[_-]/g, '');
 // R17: AUTO_CD (zsh) / autocd (bash `shopt -s autocd`, BASHOPTS, `-O autocd`, a shebang option, eval'd text ...) runs a command word that names a directory as a cd, which is no cd command the walk sees.
@@ -1531,21 +1539,31 @@ function makerOps(cmds) {
   makerOperands.set(cmds, list);
   return list;
 }
-function dirLikeWord(cmds, ci, ctx, bases) {
+// (R18-F6/F8: an argument surely survives expansion when nothing in it is settled at run time. argv holds the dequoted words, so a quoted `"$X"` cannot be told from an unquoted one: any `$`, backtick or glob character,
+// or an expansion that comes out empty, may vanish (an empty `$X`, `$@`, a glob without a match), and the command may then be lone. A file's own text is not expanded with the line's variables.)
+const mayVanish = (a, ctx, fromFile) => {
+  const e = fromFile ? a : expandRefs(a, ctx);
+  return e === '' || /[$`*?[(^<]/.test(e);
+};
+function dirLikeWord(cmds, ci, ctx, bases, fromFile = false) {
   const c = cmds[ci];
   if (!c.argv?.length) return false;
   const u = unwrapBuiltin(c.argv);
   const w = u.argv[0] ?? '';
   if (w === '[' || w === '[[' || (w === '.' && u.argv.length > 1)) return false; // (the test builtin, and `. FILE`, which is source)
-  const lone = u.argv.length === 1;
-  if (u.blind) return lone; // (a wrapper whose next word is only known at run time)
-  const e = expandRefs(w, ctx);
-  // (d) a run-time word. Only a command of one word is run as a cd by autocd (bash: no other words after the name; the wrapper cases above and `$G ok.sh` are programs with arguments), and a double-quoted
-  // word with no reference in it is literal text (`"a[@]"`)
+  // R18-F8: AUTO_CD runs a command of ONE word (zsh; bash: no other words after the name): `test -f x`, `supabase db reset`, `docs build` are programs, whatever folders exist. An argument that may vanish at run time does not count
+  const lone = u.argv.slice(1).every((a) => mayVanish(a, ctx, fromFile));
+  if (!lone) return false;
+  if (u.blind) return true; // (a wrapper whose next word is only known at run time)
+  // (a sourced file is judged on its own text: the line's variables are not what its assignments leave, R18-F6)
+  const e = fromFile ? w : expandRefs(w, ctx);
+  // (d) a run-time word, and a double-quoted word with no reference in it is literal text (`"a[@]"`)
   const rawWord = (c.raw ?? '').trim();
   const quotedLiteral = /^"[^"$`\\]*"$/.test(rawWord) || /^'[^']*'$/.test(rawWord);
-  if (/[`$*?[{(]/.test(e) && !quotedLiteral) return lone;
-  if (e === '..' || e.endsWith('/') || (e === '.' && u.argv.length === 1)) return true; // (b)
+  if (/[`$*?[{(]/.test(e) && !quotedLiteral) return true;
+  // R18-F5: `~h` (a zsh named directory), `~u`, `~-`, `~+`, `~N`: a tilde word other than `~` and `~/..` is settled at run time
+  if (w.startsWith('~') && w !== '~' && !w.startsWith('~/')) return true; // (the word as written: the line's expansion turns `~+` into a path)
+  if (e === '..' || e === '.' || e.endsWith('/')) return true; // (b)
   const p = pathsFor();
   const places = isAbs(e) ? [p.normalize(e)] : bases.map((d) => p.join(d, e));
   if (places.some((q) => ctx.api.existsSync(q) && Array.isArray(ctx.readDir(q)))) return true; // (a)
@@ -2586,7 +2604,7 @@ function collectDirs(cmds, ctx, cdOnly = false) {
     let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
     if (!t && (cdName === 'cd' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
     if (c.raw.includes('\\')) {
-      const m = /^\s*(?:cd|pushd|set-location|sl)\s+(?:\/d\s+)?["']?([^"';&|\n]+)/i.exec(c.raw);
+      const m = /^\s*(?:cd|chdir|pushd|set-location|sl)\s+(?:\/d\s+)?["']?([^"';&|\n]+)/i.exec(c.raw);
       if (m) t = m[1].trim();
     }
     if (!t) continue;
@@ -3455,11 +3473,11 @@ function setPositionals(argv) {
   }
   return null;
 }
-function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
+function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false) { // (rep: the file is sourced from a frame that can run it again, R18)
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false };
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
-  if (cmds.some((_, i) => dirLikeWord(cmds, i, ctx, [ctx.cwd]))) out.unknownCd = true; // (R17: AUTO_CD: a command word that could be a directory runs a cd)
+  if (cmds.some((_, i) => dirLikeWord(cmds, i, ctx, [ctx.cwd], true))) out.unknownCd = true; // (R17: AUTO_CD: a command word that could be a directory runs a cd)
   const from = flowStart(cmds);
   const seen = new Map();
   const local = Object.create(null);
@@ -3476,6 +3494,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
     const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&');
     if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); continue; }
     const name = baseOf(c.argv[0]);
+    const again = rep || repeats(cmds, i); // (R18: this command can run again: from a loop / function / trap of the line, or of the file itself)
     // Why: a function or alias the LINE defines may stand behind a name that looks harmless (`ls() { read F; }`), and a nameref (`declare -n r=F`) binds F through another name
     if (ctx.lineDefs?.has(name) || (['declare', 'typeset', 'local'].includes(name) && c.argv.slice(1).some((a) => /^[-+][A-Za-z]*n/.test(a)))) { out.all = true; continue; }
     // (#56, Codex recheck of d925d42: zsh binders whose operands are not read may bind any name; `read` / `[[ =~ ]]` … set names they are not given)
@@ -3493,7 +3512,10 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
       const homeForm = v === undefined || v === '~' || v.startsWith('~/');
       const bare = v !== undefined && !homeForm && !/[`$*?[{]/.test(v) && !cdUnknownShape(c.argv) && !cdTargetLiteral(toPosix(v));
       if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || bare) { out.unknownCd = true; if (bare) out.bareCd = true; }
-      else out.cds.push(t ?? '~');
+      else {
+        out.cds.push(t ?? '~');
+        if (again && !homeForm && cdRelative(toPosix(v))) out.unknownCd = true; // (R18: a relative cd that repeats climbs one level per run)
+      }
       set('PWD', null, false); set('OLDPWD', null, false); // (cd rebinds both)
     }
     else if (BINDERS.has(name)) {
@@ -3517,7 +3539,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
       const t = abs && !seenFiles.has(abs) && !writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: false }) ? ctx.readText(abs) : null;
       if (typeof t !== 'string') out.all = true;
       else {
-        const sub = sourcedEffects(t, ctx, depth + 1, new Set([...seenFiles, abs]));
+        const sub = sourcedEffects(t, ctx, depth + 1, new Set([...seenFiles, abs]), again);
         for (const [k, val] of sub.vars) set(k, val, sure && val !== null);
         out.cds.push(...sub.cds);
         if (sub.all) out.all = true;
@@ -3588,7 +3610,7 @@ function sourcedTexts(rec, dirs, ctx) {
 // Why: a sourced file (and BASH_ENV / ENV, which the shell reads before the script it runs) assigns variables and cds in the shell that goes on: what it sets is
 // what the rest of the line sees. Known values are recorded; one that cannot be worked out is unknown (a script it picks is refused), and a file that cannot
 // be followed at all makes every name unknown from here on. Its cds join the directories the line may be in.
-function absorbSourced(rec, dirs, ctx) {
+function absorbSourced(rec, dirs, ctx, rep = false) { // (rep: the command that sources runs in a loop / function / trap, R18)
   const { texts, unknown } = sourcedTexts(rec, dirs, ctx);
   // (a file that can set any name: every name the line has set so far may have been changed, and any other may be set; a script they pick is refused. The values
   // stay for the paths a writer builds, which is what they were before the file ran)
@@ -3597,7 +3619,7 @@ function absorbSourced(rec, dirs, ctx) {
   const merged = new Map();
   const effs = [];
   for (const t of texts) {
-    const eff = sourcedEffects(t, ctx);
+    const eff = sourcedEffects(t, ctx, 0, new Set(), rep);
     if (eff.all) poison();
     if (eff.home) ctx.homeSourced = true; // (a bare `cd` / `cd ~` / `~/x` then goes elsewhere)
     if (eff.bareCd) ctx.bareCd = true;
@@ -3729,7 +3751,8 @@ function evaluateBashForFilesFrame(command, opts) {
   for (const [n, ws] of opts._assigned ?? []) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);
   const seedDirs = opts._seedDirs ?? [];
   const reseeds = opts._reseeds ?? 0;
-  opts = { ...opts, _seedDirs: undefined, _reseeds: undefined, _selfZero: null, _selfBash: null, _selfAbs: false, _selfDirLit: false, _selfZsh: false }; // (only the script file judged right now has a $0; text it runs or reads has none)
+  const unknownSeeded = opts._unknownSeeded === true; // (R18-F1: this pass was started unknown by the pass above, which runs the assumed-directory pass for it)
+  opts = { ...opts, _seedDirs: undefined, _reseeds: undefined, _unknownSeeded: undefined, _selfZero: null, _selfBash: null, _selfAbs: false, _selfDirLit: false, _selfZsh: false }; // (only the script file judged right now has a $0; text it runs or reads has none)
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';
   if (!raw.trim()) return allow();
@@ -3864,13 +3887,14 @@ function evaluateBashForFilesFrame(command, opts) {
       const { unknownName } = stateAt(ci);
       if (cdUnknownShape(c.argv)) return true;
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
-      if (t !== undefined && modelledCd(t, cmds, ci, ctx) !== null) return false;
+      if (t !== undefined) { const mc = modelledCd(t, cmds, ci, ctx); if (mc !== null) return repeats(cmds, ci) && cdRelative(mc); } // (R18: a modelled target that is relative moves again on each run)
       if (t === undefined || /^~(?:\/|$)|^\$\{?HOME\b/.test(t)) { if (homeMoved) return true; if (t === undefined) return false; } // (a bare cd goes home)
       const e = expandRefs(t, ctx);
       if (/[*?[{(]/.test(e) && resolveGlobCd(e, dirs, ctx, cmds, ci) === null) return true; // (a glob or a brace list can spell ~/.claude: `cd ~/.cl*`)
       if (/[`$]/.test(e) || /\$\{!/.test(t) || /[`]|\$\(/.test(t)) return true;
       // (R17: the one whitelist: a target that is not `.` / `..` or `/` `./` `../` prefixed may be read through CDPATH or cdable_vars. The deny reason then names the fix)
       if (!cdTargetLiteral(e)) { ctx.bareCd = true; return true; }
+      if (repeats(cmds, ci) && cdRelative(e)) return true; // (R18-B1 / F7: `cd ..` / `../x` / `./x` in a loop, a function or a trap climbs once per run)
       return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
     });
   };
@@ -4001,7 +4025,7 @@ function evaluateBashForFilesFrame(command, opts) {
           ctx.execCmd = outer;
         }
         if (v) return v;
-        if (sf.kind === 'shell' && sourcesHere(c)) absorbSourced(sf, dirs, ctx); // (a sourced file runs in this shell: what it sets is the line's from here)
+        if (sf.kind === 'shell' && sourcesHere(c)) absorbSourced(sf, dirs, ctx, repeats(cmds, idx)); // (a sourced file runs in this shell: what it sets is the line's from here)
       }
       // #81 t9: `npm run NAME` and its kin run the text package.json holds for NAME
       {
@@ -4014,7 +4038,7 @@ function evaluateBashForFilesFrame(command, opts) {
         // (R15-F1: fed text runs in THIS shell unless the command surely starts a new one: `source /dev/stdin < f`, `. <(cat f)`, `cat f | source /dev/stdin`, eval)
         const v = judgeScriptFile(fd, sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
         if (v) return v;
-        if (!startsNewShell(c) && sourcesHere(c)) absorbSourced(fd, dirs, ctx); // (fed text that a source / `.` runs in THIS shell is absorbed; eval's text may be the output of a script, so its effects are not taken)
+        if (!startsNewShell(c) && sourcesHere(c)) absorbSourced(fd, dirs, ctx, repeats(cmds, idx)); // (fed text that a source / `.` runs in THIS shell is absorbed; eval's text may be the output of a script, so its effects are not taken)
       }
       // #81 t9: and a bare name a package runner started is the bin node_modules/.bin/NAME
       if (c.viaRunner && c.argv[0] && !c.argv[0].includes('/')) {
@@ -4040,11 +4064,15 @@ function evaluateBashForFilesFrame(command, opts) {
     const gained = dirs.filter((d) => !dirs0.includes(d));
     const moved = opts._unknownCwd !== true && ((ctx.sourcedCdUnknown === true) || ctx.homeSourced === true);
     const poisoned = !startUnknownAll && ctx.unknownAll === true;
-    if ((gained.length > 0 || moved || poisoned) && reseeds < 2 && (flowStart(cmds) >= 0 || ctx.lineDefs.size > 0 || cmds.some((c) => baseOf(c.argv[0] ?? '') === 'trap'))) {
+    const repeatable = flowStart(cmds) >= 0 || ctx.lineDefs.size > 0 || cmds.some((c) => baseOf(c.argv[0] ?? '') === 'trap');
+    // R18-F1: a pass whose own state is already unknown hands that to the pass below (seeded _unknownCwd); the assumed-directory pass further down runs for the pass that FINDS the unknown state, rerun or not
+    // R18-B1: the cap. A third pass is not made; a pass that still gained directories at the cap leaves the directory unknown (fail closed) instead of stopping with the set it has
+    if (gained.length > 0 && reseeds >= 2 && repeatable) ctx.sourcedCdUnknown = true;
+    if ((gained.length > 0 || moved || poisoned) && reseeds < 2 && repeatable) {
       countRerun(ctx.budget);
       ctx.budget.writtenOk = new Set(); ctx.budget.startupOk = new Set(); ctx.budget.implicitStartup = new Map(); // (a verdict cached with the first state is not the verdict for this one)
       const at = ctx.frames.indexOf(frame);
-      const r = evaluateBashForFilesUnchecked(command, { ...opts0, _reseeds: reseeds + 1, _seedDirs: unique([...seedDirs, ...gained]), ...(moved || poisoned ? { _unknownCwd: true } : {}), ...(poisoned ? { _unknownAll: true, _srcChanged: [...ctx.srcChanged], _unknown: [...ctx.pickUnknown] } : {}), _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
+      const r = evaluateBashForFilesUnchecked(command, { ...opts0, _reseeds: reseeds + 1, _seedDirs: unique([...seedDirs, ...gained]), ...(moved || poisoned || unknownCwd() ? { _unknownCwd: true, _unknownSeeded: true } : {}), ...(poisoned ? { _unknownAll: true, _srcChanged: [...ctx.srcChanged], _unknown: [...ctx.pickUnknown] } : {}), _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
       if (r.decision === 'deny') return deny(`${r.reason} (judged again from the directory a file later on the line moves the shell to: a loop or a function runs the earlier files again there)`);
     }
   } else {
@@ -4128,7 +4156,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // by name); inline interpreter code is refused (it can build any name at run time). Child frames inherit the flag and judge their own text the same way.
   // (FP: any relative write, or a command that is not read-only, after such a cd; an absolute path outside the protected set and reads stay allowed.)
   // (a pass that only judges the earlier files again, R17-F7, does not run the line's own commands in every assumed directory once more: the first pass already did, with the unknown state it ended in)
-  if (unknownCwd() && reseeds === 0) {
+  if (unknownCwd() && !unknownSeeded) { // (R18-F1: also in a rerun that found the unknown state itself; a rerun seeded unknown by the pass above leaves it to that pass)
     // (a script or fed file named relative to the unknown directory is judged where it may be: step 7 looks in the protected directories too; inline code is judged by its own text)
     // Why: the directory may be BELOW a protected root (`cd $X` into ~/.claude/pipeline/hooks), where `echo x > ../guard.mjs` lands inside the root. With k = the `..` segments of the
     // relative write targets plus those of the `cd` steps, the line is also rerun with the cwd in each existing subdirectory of each protected root down to depth k (writes only).

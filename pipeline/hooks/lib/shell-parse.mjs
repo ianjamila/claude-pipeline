@@ -540,12 +540,12 @@ const isProcSub = (w) => w.startsWith('<(') || w.startsWith('=(') || /^\$\{[^}]*
 // `amb`: a word up to the decision point (the operand, or the `-c` / `-s` that made it a string or stdin) expands, so what
 // the shell runs may not be what the words as written say (`bash -o $X -c f.sh`: an empty $X makes -o swallow -c, and f.sh is the script file).
 // R17-F1: bash lets EVERY o / O in an option cluster take the next argv word, wherever it sits in the cluster (`bash -abouo emacs ignoreeof -hP`, `bash -oe pipefail f.sh`: o takes `pipefail`);
-// zsh ends the cluster at its first o (the rest of the cluster is the option name: `zsh -ocdablevars f`, and `-oe` is the name `e`). Where the two readings lead to another operand the record is ambiguous
+// zsh ends the cluster at its first LOWERCASE o (the rest of the cluster is the option name: `zsh -ocdablevars f`, and `-oe` is the name `e`); R18-F3: in zsh an uppercase O is a plain flag (`zsh -Oc TEXT`, `zsh -O -c TEXT`, `zsh -cO TEXT` run TEXT). Where the two readings lead to another operand the record is ambiguous
 // (amb: every word is a candidate for the file kind) and `alt` holds the zsh reading, so a -c text is parsed both ways.
 function shellInvocation(argv) {
   const bashReading = shellScan(argv, false);
   const zshReading = shellScan(argv, true);
-  if (bashReading.at === zshReading.at) return bashReading;
+  if (bashReading.at === zshReading.at && bashReading.kind === zshReading.kind) return bashReading; // (R18-F3: `zsh -O -c TEXT` ends at the same word, but there it is the -c text)
   return { ...bashReading, amb: true, alt: { ...zshReading, amb: true } };
 }
 function shellScan(argv, zshGlued) {
@@ -563,7 +563,7 @@ function shellScan(argv, zshGlued) {
     if (t.length < 2 || (t[0] !== '-' && t[0] !== '+') || (t[0] === '+' && !/^\+[A-Za-z]/.test(t))) break; // (`+(f|fa).sh` is a pattern operand, not an option)
     if (t.startsWith('--')) { execUnsure = true; i += t === '--rcfile' || t === '--init-file' ? 2 : 1; continue; }
     const letters = t.slice(1);
-    const firstO = letters.search(/[oO]/);
+    const firstO = zshGlued ? letters.search(/o/) : letters.search(/[oO]/); // (R18-F3: zsh: only lowercase o takes a name)
     // (the letters that are flags in this reading, and how many option names the cluster takes from the words after it)
     const flags = zshGlued && firstO >= 0 ? letters.slice(0, firstO + 1) : letters;
     const take = zshGlued ? (firstO >= 0 && firstO === letters.length - 1 ? 1 : 0) : (letters.match(/[oO]/g) ?? []).length;
@@ -1910,6 +1910,15 @@ export const applyTransform = (value, transform) => (transform === 'lower' ? Str
 
 // The options before the operand: login / interactive flags (zsh), `unknown` when one expands, and the rc files bash is given.
 function startupOptions(argv, lit = new Set()) {
+  // R18-F4: the union of the bash reading (every o / O takes the next word) and the zsh reading (the cluster ends at its first lowercase o: the rest is the name, nothing more is taken; an uppercase O is a flag).
+  // A word one reading takes as an option name is a flag in the other (`zsh -oextendedglob -i -c true`), so the flags of both are taken, and when the readings differ on login / interactive both rc files are judged (unknown)
+  const bashRead = startupScan(argv, lit, false);
+  const zshRead = startupScan(argv, lit, true);
+  const o = { login: bashRead.login || zshRead.login, interactive: bashRead.interactive || zshRead.interactive, unknown: bashRead.unknown || zshRead.unknown, rc: [...new Set([...bashRead.rc, ...zshRead.rc])] };
+  if (bashRead.login !== zshRead.login || bashRead.interactive !== zshRead.interactive) o.unknown = true;
+  return o;
+}
+function startupScan(argv, lit, zsh) {
   const o = { login: false, interactive: false, unknown: false, rc: [] };
   let sawC = false;
   for (let i = 1; i < argv.length; i++) {
@@ -1925,22 +1934,33 @@ function startupOptions(argv, lit = new Set()) {
       else if (t === '--rcfile' || t === '--init-file') { if (argv[i + 1] !== undefined) o.rc.push(argv[i + 1]); i++; } else if (/^--(?:rcfile|init-file)=/.test(t)) o.rc.push(t.slice(t.indexOf('=') + 1));
       continue;
     }
-    if (t.includes('l')) o.login = true;
-    if (t.includes('i')) o.interactive = true;
-    if (t.includes('c')) sawC = true;
-    // (R17-F1: every o / O of a cluster takes the next word in bash; in zsh the rest of the cluster after the first o is the name: `zsh -ologin`)
-    const firstO = t.slice(1).search(/[oO]/);
-    if (firstO >= 0 && firstO < t.length - 2) {
-      const glued = t.slice(firstO + 2);
-      if (/^login$/i.test(glued)) o.login = true;
-      if (/^interactive$/i.test(glued)) o.interactive = true;
-      if (!/^[A-Za-z]+$/.test(glued)) o.unknown = true;
-    }
-    for (let k = (t.slice(1).match(/[oO]/g) ?? []).length; k > 0; k--) {
-      const v = argv[++i] ?? '';
-      if (hasExpansion(v)) o.unknown = true;
-      if (/^login$/i.test(v)) o.login = true;
-      if (/^interactive$/i.test(v)) o.interactive = true;
+    const letters = t.slice(1);
+    const firstO = zsh ? letters.search(/o/) : letters.search(/[oO]/);
+    const flags = zsh && firstO >= 0 ? letters.slice(0, firstO + 1) : letters; // (the letters that are flags in this reading)
+    if (flags.includes('l')) o.login = true;
+    if (flags.includes('i')) o.interactive = true;
+    if (flags.includes('c')) sawC = true;
+    if (zsh) {
+      // (the rest of the cluster after the first o is the option name: `zsh -ologin`; an o that ends the cluster takes the next word)
+      if (firstO >= 0 && firstO < letters.length - 1) {
+        const glued = letters.slice(firstO + 1);
+        if (/^login$/i.test(glued)) o.login = true;
+        if (/^interactive$/i.test(glued)) o.interactive = true;
+        if (!/^[A-Za-z]+$/.test(glued)) o.unknown = true;
+      } else if (firstO >= 0) {
+        const v = argv[++i] ?? '';
+        if (hasExpansion(v)) o.unknown = true;
+        if (/^login$/i.test(v)) o.login = true;
+        if (/^interactive$/i.test(v)) o.interactive = true;
+      }
+    } else {
+      // (R17-F1: every o / O of a cluster takes the next word in bash)
+      for (let k = (letters.match(/[oO]/g) ?? []).length; k > 0; k--) {
+        const v = argv[++i] ?? '';
+        if (hasExpansion(v)) o.unknown = true;
+        if (/^login$/i.test(v)) o.login = true;
+        if (/^interactive$/i.test(v)) o.interactive = true;
+      }
     }
   }
   return o;

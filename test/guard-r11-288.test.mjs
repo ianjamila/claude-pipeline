@@ -132,7 +132,7 @@ describe('R11-F2: what turns cdablevars on (whitelist for set; any option word o
     ['emulate -R zsh', 'emulate -R zsh && cd proj && find . -delete', PROJ],
     ['a run-time flag word (set -$F)', 'F=T; set -$F && export proj=/home/u && cd proj && find . -delete', PROJ],
     ['an unknown -o name', 'set -o posix && cd proj && find . -delete', PROJ],
-    ['chdir after setopt (R17 owner decision: option state no longer matters for a literal cd)', 'export proj=/home/u && setopt cdablevars && chdir proj && find . -delete', PROJ],
+    ['chdir after setopt (R18-F2: chdir is a cd again, a bare target is unknown)', 'export proj=/home/u && setopt cdablevars && chdir proj && find . -delete', PROJ],
     ['shopt with any word', 'shopt -s extglob && cd proj && find . -delete', PROJ],
     ['builtin set -T', 'export proj=/home/u && builtin set -T && cd proj && find . -delete', PROJ],
     ['command setopt cdablevars', 'export proj=/home/u && command setopt cdablevars && cd proj && find . -delete', PROJ],
