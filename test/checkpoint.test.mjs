@@ -9,7 +9,7 @@ import { createFakeCodex } from './helpers/fakegh-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { decodeRecord } from '../pipeline/lib/run-record.mjs';
-import { parseEvent } from '../pipeline/lib/run-events.mjs';
+import { parseEvent, renderEvent } from '../pipeline/lib/run-events.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { run as mergeRun } from '../pipeline/commands/merge.mjs';
 import { approvalFlags, mergeRequest, ownerSays } from './helpers/owner-go.mjs';
@@ -461,6 +461,103 @@ test('checkpoint --resumed: stamps record.resumed {at, host, head}; a later chec
   assert.deepEqual(l.json.record.resumed, RESUMED, 'a resumed record stays resumed');
   const plain = scenario();
   assert.equal(checkpoint(plain, ['--step', 'review']).json.record.resumed, undefined, 'a normal run never carries it');
+});
+
+// R9-B1: "this run was resumed" is APPEND-ONLY evidence: its own never-edited event comment, posted before the (editable) record is written.
+test('checkpoint --resumed: posts a run-resumed event {at, host, head} BEFORE it writes the record', () => {
+  const s = scenario();
+  assertExit(checkpoint(s, ['--step', 'review', '--resumed']), 0);
+  const writes = commentWrites(s.fake);
+  const first = parseEvent(writes[0].body);
+  assert.deepEqual([writes[0].method, first?.kind, first?.data?.host, first?.data?.head], ['POST', 'run-resumed', hostname(), s.head]);
+  assert.ok(writes.slice(1).some((w) => w.body.startsWith(MARKERS.summary)), 'the record follows the event');
+  const plain = scenario();
+  assertExit(checkpoint(plain, ['--step', 'review']), 0);
+  assert.deepEqual(eventWrites(plain.fake), [], 'a checkpoint without --resumed posts no event');
+});
+
+test('checkpoint --resumed: a resumed stamp that cannot be made durable fails the command (exit 3) and writes no record', () => {
+  const s = scenario();
+  s.fake.setScript(ghEntries({ prHead: s.head, extra: [{ match: '-X POST repos/acme/widgets/issues/12/comments', code: 1, stderr: 'gh: Server Error (HTTP 502)' }] }));
+  const r = checkpoint(s, ['--step', 'review', '--resumed']);
+  assertExit(r, 3);
+  assert.match(r.stderr + r.stdout, /Server Error|unavailable/i);
+  const posts = s.fake.calls().filter((c) => isCommentWrite(c));
+  assert.equal(posts.length, 1, 'only the event was tried');
+  assert.equal(parseEvent(JSON.parse(posts[0].stdin).body)?.kind, 'run-resumed');
+});
+
+// R10-F2: the event is posted only once the command is past every usage error (an unsupported record, an invalid patch): an exit 2 posts nothing.
+test('checkpoint --resumed: a usage error (exit 2: a record from a newer CLI, an unknown task id) posts no run-resumed event and writes nothing', () => {
+  const s = scenario();
+  withComment(s, existingSummary({ record: baseRecord({ v: 2 }) }));
+  const r = checkpoint(s, ['--step', 'review', '--resumed']);
+  assertExit(r, 2);
+  assert.deepEqual(eventWrites(s.fake), []);
+  assert.deepEqual(commentWrites(s.fake), []);
+  // the other usage error, past the record read: the patch itself is refused (applyCheckpoint: no task "nope"), still before any event
+  const bad = scenario();
+  withComment(bad, existingSummary({ record: baseRecord() }));
+  const b = checkpoint(bad, ['--step', 'review', '--resumed', '--task-done', 'nope']);
+  assertExit(b, 2);
+  assert.deepEqual(eventWrites(bad.fake), [], 'no run-resumed event for a refused patch');
+  assert.deepEqual(commentWrites(bad.fake), [], 'no comment written at all');
+});
+
+// R11-F1: `P summary` and `P comment --kind summary` read the summary comment, and it is INVALID; a stale writer (whose read predates the corruption) then PATCHes an
+// ordinary record before they write. The write must still end marked resumed, with the run-resumed event posted.
+const invalidSummary = () => ({ ...existingSummary({ record: baseRecord() }), body: `${MARKERS.summary}\n\nsome text\n\n<!-- claude-pipeline:record:bm90LWpzb24= -->` });
+function staleWriterScenario() {
+  const s = scenario();
+  const comments = { match: 'repos/acme/widgets/issues/12/comments --paginate', stdoutJsonSeq: [[invalidSummary()], [existingSummary({ record: baseRecord() })]] };
+  const views = [
+    { match: '^pr view 12 --json title,headRefName,baseRefName,headRefOid', stdoutJson: { title: 'Feature', headRefOid: s.head, headRefName: 'agent/feature', baseRefName: 'main' } },
+    { match: '^pr view 12 --json headRefName,baseRefName,headRefOid', stdoutJson: { headRefOid: s.head, headRefName: 'agent/feature', baseRefName: 'main' } },
+  ];
+  s.fake.setScript(ghEntries({ prHead: s.head, extra: [comments, ...views, PATCH_77] }));
+  return s;
+}
+for (const [name, args] of [['P summary', ['summary', '--pr', String(PR), '--outcome', 'merged']], ['P comment --kind summary', ['comment', '--pr', String(PR), '--kind', 'summary', '--outcome', 'merged']]]) {
+  test(`${name}: a first read that saw an invalid record still ends marked resumed with the run-resumed event posted, when a stale writer PATCHed an ordinary record in between`, () => {
+    const s = staleWriterScenario();
+    const r = cli(args, { dir: s.repo.dir, fake: s.fake, env: s.env });
+    assertExit(r, 0);
+    assert.equal(eventWrites(s.fake).length, 1, 'the run-resumed event was posted');
+    assert.equal(eventWrites(s.fake)[0].event.kind, 'run-resumed');
+    const written = recordWrites(s.fake);
+    assert.equal(written.length, 1);
+    assert.ok(written[0].record.resumed, 'the record written carries the resumed mark');
+    assert.deepEqual(written[0].record.resumed, eventWrites(s.fake)[0].event.data);
+  });
+}
+
+const RESUMED_EVENT = () => ({ id: 78, user: { login: 'me' }, body: renderEvent('run-resumed', `pr${PR}-aaaaaaaaaaaa`, 'This run was taken over from an earlier session.', RESUMED) });
+// the interleaving of R9-B1: the event is there, the record was then overwritten by a writer that had not seen the mark
+const withEventOnly = () => {
+  const s = mergeScenario();
+  s.fake.setScript(ghEntries({ prHead: s.head, comments: [existingSummary({ record: baseRecord({ step: 'gate' }) }), RESUMED_EVENT()], extra: [PATCH_77] }));
+  return s;
+};
+
+test('merge: a run-resumed EVENT with an unmarked record (overwritten after the event) still refuses without the owner\'s word (R9-B1)', (t) => {
+  const s = withEventOnly();
+  const g = s.gate();
+  assertExit(g, 0);
+  const r = mergeWith(s);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.match(r.json.reason, /^resumed run: the owner must say "merge" for this exact head/);
+  assert.deepEqual(s.mergeCalls(), []);
+  assertExit(mergeWith(s, approvalFlags(s.head, g.json.ownerItems)), 1); // the flags alone are the agent's word
+  ownerSays(t, 'merge', mergeRequest(12, s.head, g.json.ownerItems));
+  assertExit(mergeWith(s, approvalFlags(s.head, g.json.ownerItems)), 0);
+});
+
+test('merge: a forged run-resumed event (another author) does not make a run resumed', () => {
+  const s = mergeScenario();
+  s.fake.setScript(ghEntries({ prHead: s.head, comments: [existingSummary({ record: baseRecord({ step: 'gate' }) }), { ...RESUMED_EVENT(), user: { login: 'mallory' } }], extra: [PATCH_77] }));
+  assertExit(s.gate(), 0);
+  assertExit(mergeWith(s), 0);
 });
 
 test('merge: a RESUMED run record refuses to merge without --owner-approved-head (pre-merge, exit 1; nothing posted, nothing merged)', () => {

@@ -18,6 +18,7 @@ import { loadConfig } from '../pipeline/lib/config.mjs';
 import { treeFingerprint } from '../pipeline/lib/git.mjs';
 import { verifyReportCheck } from '../pipeline/lib/finalgate.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
+import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import { answer, blocker, holdCalls, holdFiles, holdYml, seq } from './helpers/merge-hold-env.mjs';
 
 const scratch = mkdtempSync(join(tmpdir(), 'cp-dryrun-'));
@@ -279,6 +280,24 @@ test('dry run, a resumed run record -> ownerStep owner-approval-flags (reported,
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.ownerStep.kind, 'owner-approval-flags');
   assert.equal('closing' in d.r.json.ownerStep, false, 'owner-approval-flags has no closing lines');
+  assert.deepEqual(d.writes, []);
+});
+
+test('dry run, a run-resumed EVENT with an unmarked record (R9-B1) -> ownerStep owner-approval-flags, like a resumed record', () => {
+  const s = setup({});
+  s.fake.setScript(script(s));
+  assertExit(s.gate(), 0);
+  const record = {
+    v: 1, repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main', step: 'gate', outcome: null, next: '', detail: '', head: null,
+    request: '', tasks: [], verify: null, round: 0, mergeSha: null, inFlight: null, heartbeat: null, agentLogLine: null, cliVersion: null, history: [],
+  };
+  let body = '';
+  writeSummaryComment({ viewer: () => 'me', listComments: () => [], upsertComment: (num, m, b) => { body = b; return { id: 77, url: 'u', action: 'created' }; } }, PR, { record });
+  const event = { id: 78, user: { login: 'me' }, body: renderEvent('run-resumed', `pr${PR}-aaaaaaaaaaaa`, 'taken over', { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: 'a'.repeat(40) }) };
+  s.fake.setScript(script(s, { gh: { comments: [{ id: 77, user: { login: 'me' }, body }, event] } }));
+  const d = dry(s);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.ownerStep.kind, 'owner-approval-flags');
   assert.deepEqual(d.writes, []);
 });
 
