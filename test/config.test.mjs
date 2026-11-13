@@ -175,6 +175,49 @@ test('review.arbiter_always_paths: a list of glob strings, anything else rejecte
   }
 });
 
+test('review.threat_models / fix_verify_after_round / fix_round_max_lines: defaults', () => {
+  const r = validateConfig(minimal());
+  assert.deepEqual(r.config.review.threat_models, []);
+  assert.equal(r.config.review.fix_verify_after_round, null);
+  assert.equal(r.config.review.fix_round_max_lines, 150);
+  assert.deepEqual(DEFAULTS.review.threat_models, []);
+});
+
+const model = (over = {}) => ({ name: 'guards', paths: ['pipeline/hooks/**'], text: 'Attackers are other repo users, not the owner.', ...over });
+const withModels = (threat_models) => validateConfig({ ...minimal(), review: { threat_models } });
+
+test('review.threat_models: valid entries are kept in order; invalid ones are rejected naming the key', () => {
+  const ok = withModels([model(), model({ name: 'second-1', paths: ['a/**', 'b.mjs'] })]);
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual(ok.config.review.threat_models.map((m) => m.name), ['guards', 'second-1']);
+  assert.ok(has(withModels('x'), 'review.threat_models must be an array'));
+  assert.ok(has(withModels(['x']), 'review.threat_models[0] must be a mapping'));
+  for (const name of ['', 'Guards', 'has space', 'a'.repeat(41), 5, undefined]) {
+    assert.ok(has(withModels([model({ name })]), 'review.threat_models[0].name'), String(name));
+  }
+  assert.equal(withModels([model({ name: 'a'.repeat(40) })]).ok, true);
+  assert.ok(has(withModels([model(), model()]), 'is listed twice'));
+  for (const paths of [[], 'a/**', [1], undefined, null]) {
+    assert.ok(has(withModels([model({ paths })]), 'review.threat_models[0].paths'), JSON.stringify(paths));
+  }
+  assert.ok(has(withModels([model({ paths: ['a/' + '**/'.repeat(40) + 'b'] })]), 'review.threat_models[0].paths'));
+  for (const text of ['', '   ', 5, undefined]) assert.ok(has(withModels([model({ text })]), 'review.threat_models[0].text'), String(text));
+  assert.ok(has(withModels([model({ text: 'x'.repeat(4001) })]), 'review.threat_models[0].text'));
+  assert.equal(withModels([model({ text: 'x'.repeat(4000) })]).ok, true);
+  const many = Array.from({ length: 11 }, (_, i) => model({ name: 'm' + i }));
+  assert.ok(has(withModels(many), 'at most 10'));
+  assert.equal(withModels(many.slice(0, 10)).ok, true);
+  assert.ok(has(withModels([{ ...model(), x: 1 }]), 'unknown key: review.threat_models[0].x'));
+});
+
+test('review.fix_verify_after_round: null or an integer 1..10; review.fix_round_max_lines: a positive integer', () => {
+  const set = (k, v) => validateConfig({ ...minimal(), review: { [k]: v } });
+  for (const v of [null, 1, 3, 10]) assert.equal(set('fix_verify_after_round', v).ok, true, String(v));
+  for (const v of [0, 11, 2.5, '3', true]) assert.ok(has(set('fix_verify_after_round', v), 'review.fix_verify_after_round must be null or an integer 1..10'), String(v));
+  assert.equal(set('fix_round_max_lines', 1).ok, true);
+  for (const v of [0, -1, 1.5, '150', null]) assert.ok(has(set('fix_round_max_lines', v), 'review.fix_round_max_lines must be a positive integer'), String(v));
+});
+
 test('production without smoke is rejected; production: null is ok', () => {
   const r = validateConfig({
     ...minimal(),
