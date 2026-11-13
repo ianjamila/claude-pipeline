@@ -2,7 +2,7 @@
 // lines (Read's offset / limit, default offset 1 and limit 2000), not just one Read call that names it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { READ_PAGE_LINES, lineCountOf, readsCoverFile } from '../pipeline/lib/substitute-proof.mjs';
+import { MAX_READ_PAGES, READ_LINE_CHARS, READ_PAGE_LINES, lineCountOf, readsCoverFile, unreadablePacket } from '../pipeline/lib/substitute-proof.mjs';
 import { toolCallsOf } from '../pipeline/lib/transcript.mjs';
 
 const FILE = '/work/.review/round-1/substitute/diff.patch';
@@ -62,4 +62,26 @@ test('toolCallsOf keeps a Read call\'s offset and limit', () => {
   ].map((l) => JSON.stringify(l)).join('\n');
   const [call] = toolCallsOf(jsonl);
   assert.deepEqual([call.input.offset, call.input.limit, call.answered], [5, 7, true]);
+});
+
+const lines = (n, width = 5) => `${Array.from({ length: n }, () => 'x'.repeat(width)).join('\n')}\n`;
+
+test('unreadablePacket: a file needs ceil(lines / 2000) Reads (an empty one needs 1); the pages of all files together may not pass MAX_READ_PAGES', () => {
+  assert.equal(MAX_READ_PAGES, 15);
+  assert.equal(READ_LINE_CHARS, 2000);
+  assert.equal(unreadablePacket([{ rel: 'in.md', content: lines(10) }, { rel: 'diff.patch', content: lines(5000) }, { rel: 'e', content: '' }]), null, '1 + 3 + 1 pages');
+  assert.equal(unreadablePacket([{ rel: 'a', content: lines(2000 * 14) }, { rel: 'b', content: lines(1) }]), null, 'exactly 15 pages');
+  const over = unreadablePacket([{ rel: 'a', content: lines(2000 * 14) }, { rel: 'b', content: lines(1) }, { rel: 'c', content: lines(1) }]);
+  assert.equal(over.pages, 16);
+  assert.equal(over.maxPages, 15);
+  assert.deepEqual(over.files.map((f) => [f.rel, f.lines, f.pages]), [['a', 28000, 14], ['b', 1, 1], ['c', 1, 1]]);
+  assert.match(over.message, /Read pages/);
+});
+
+test('unreadablePacket: a line over 2000 characters is refused and named (file, line, length); 2000 exactly is fine', () => {
+  assert.equal(unreadablePacket([{ rel: 'a', content: `ok\n${'y'.repeat(2000)}\n` }]), null);
+  const bad = unreadablePacket([{ rel: 'a', content: `ok\nfine\n${'y'.repeat(2001)}\n` }]);
+  assert.deepEqual(bad.files.find((f) => f.rel === 'a').longLine, { line: 3, chars: 2001 });
+  assert.equal(bad.maxLineChars, 2000);
+  assert.match(bad.message, /2000 characters/);
 });

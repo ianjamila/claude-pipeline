@@ -819,17 +819,49 @@ test('R8-B2: a gap between the pages is refused', (t) => {
   assert.ok(r.json.errors.some((e) => e.includes(diff)));
 });
 
-test('R8-B2: prepare refuses packet-unreadable when a file of the packet is longer than one Read page (2000 lines), before any attempt is spent', (t) => {
+// A file of n short lines committed on the branch: the packet's diff.patch is a little longer than n lines.
+function longDiffWorld(t, lineFn, n) {
   const w = world(t);
-  w.repo.write('src/long.txt', `${Array.from({ length: 2500 }, (_, i) => `line ${i}`).join('\n')}\n`);
+  w.repo.write('src/long.txt', `${Array.from({ length: n }, (_, i) => lineFn(i)).join('\n')}\n`);
   w.head = w.repo.commit('long');
   w.prHead(w.head);
   assertExit(w.run(), 3);
+  return w;
+}
+
+test('R8-B2: a diff longer than one Read page is still a packet: 5000 lines are 3 pages, and three paged Reads prove it; the pages must still leave no gap', (t) => {
+  const w = longDiffWorld(t, (i) => `line ${i}`, 5000);
+  const prep = w.prepare();
+  assertExit(prep, 0, prep.stdout.slice(0, 400));
+  const diff = join(dirname(prep.json.inputPath), 'substitute', 'diff.patch');
+  const models = [prep.json.agent === 'substitute-fable' ? FABLE : OPUS]; // a diff this long can raise the risk
+  const pages = (offsets) => ({ models, skipRead: [diff], extraTools: offsets.map((offset) => ({ name: 'Read', input: { file_path: diff, offset, limit: 2000 } })) });
+  const gap = w.apply(install(w, prep.json, pages([1, 2001])));
+  assertExit(gap, 1, gap.stdout.slice(0, 400));
+  assert.ok(gap.json.errors.some((e) => e.includes(diff)), gap.stdout.slice(0, 400));
+  const again = w.prepare().json;
+  assert.equal(again.attempt, 2);
+  const ok = w.apply(install(w, again, { ...pages([1, 2001, 4001]), agentId: 'a2' }));
+  assertExit(ok, 0, ok.stdout.slice(0, 600));
+});
+
+test('R8-B2: prepare refuses packet-unreadable when the files need more Read pages than the agent can spend (MAX_READ_PAGES), before any attempt is opened', (t) => {
+  const w = longDiffWorld(t, (i) => `l${i}`, 31000); // 16 pages of diff.patch alone
   const p = w.prepare();
   assertExit(p, 1, p.stdout.slice(0, 400));
   assert.equal(p.json.error, 'packet-unreadable');
-  assert.equal(p.json.maxLines, 2000);
-  assert.ok(p.json.files.some((f) => f.rel === 'diff.patch' && f.lines > 2000), p.stdout.slice(0, 400));
+  assert.equal(p.json.maxPages, 15);
+  assert.ok(p.json.pages > 15 && p.json.files.some((f) => f.rel === 'diff.patch' && f.pages >= 16), p.stdout.slice(0, 500));
   assert.ok(!existsSync(join(w.dir(), 'substitute-input.md')));
   assert.ok(!existsSync(w.attemptsFile), 'no attempt was opened');
+});
+
+test('R8-B2: prepare refuses packet-unreadable when a file has a line over 2000 characters (Read truncates it, so it can never be read in full)', (t) => {
+  const w = longDiffWorld(t, (i) => (i === 3 ? 'y'.repeat(2500) : `line ${i}`), 10);
+  const p = w.prepare();
+  assertExit(p, 1, p.stdout.slice(0, 400));
+  assert.equal(p.json.error, 'packet-unreadable');
+  assert.equal(p.json.maxLineChars, 2000);
+  assert.ok(p.json.files.some((f) => f.rel === 'diff.patch' && f.longLine?.chars > 2000), p.stdout.slice(0, 500));
+  assert.ok(!existsSync(w.attemptsFile));
 });

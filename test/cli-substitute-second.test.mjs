@@ -535,3 +535,32 @@ test('R5-F3: a second review prepared again while its attempt is open, or after 
   assert.match(tail, /`substitute\.eligible: true`/, 'keys on eligible, not on the presence of substitute');
   assert.match(tail, /substitute\.reused[^]*--apply --pr N --tag[^]*FIRST[^]*not-found[^]*ONE call of the agent/);
 });
+
+const secondInputs = (w) => readdirSync(w.dir()).filter((n) => /^second-review-[0-9a-f]{8}\.md$/.test(n));
+const secondAttempts = (w) => readdirSync(w.dir()).filter((n) => /^second-review-attempts-/.test(n));
+
+test('R8-B1 parity: a second review whose quota reset is within review.substitute.min_wait_minutes is not eligible (reset-near, waitUntil) and opens nothing; a later reset still gets its packet', (t) => {
+  const yml = `${CHAT_YML}review:\n  substitute:\n    min_wait_minutes: 60\n`;
+  const near = world(t, { yml, items: 1 });
+  const r = near.second('R1-B1', { ...near.quota(), FAKE_CODEX_TURN_FAILED: "You've hit your usage limit. Upgrade to Pro, or try again in 10 minutes." });
+  assertExit(r, 3, r.stdout + r.stderr);
+  assert.deepEqual([r.json.substitute.eligible, r.json.substitute.why], [false, 'reset-near']);
+  assert.equal(typeof r.json.substitute.waitUntil, 'string');
+  assert.deepEqual(secondInputs(near), [], 'no input is written');
+  assert.deepEqual(secondAttempts(near), [], 'no attempt is opened');
+
+  const far = world(t, { yml, items: 1 });
+  far.ready('R1-B1'); // "try again in 3 hours": beyond the 60-minute wait
+});
+
+test('R8-B2 parity: a second-review input a substitute cannot read in full (a line over 2000 characters) is not eligible (packet-unreadable) and opens no attempt', (t) => {
+  const w = world(t, { items: 1 });
+  w.edit((s) => { s.rounds[0].items[0].detail = 'z'.repeat(2600); });
+  const r = w.second('R1-B1');
+  assertExit(r, 3, r.stdout + r.stderr);
+  assert.deepEqual([r.json.substitute.eligible, r.json.substitute.why], [false, 'packet-unreadable']);
+  assert.equal(r.json.substitute.maxLineChars, 2000);
+  assert.ok(r.json.substitute.files.some((f) => f.longLine?.chars >= 2600), r.stdout.slice(0, 500));
+  assert.deepEqual(secondInputs(w), [], 'no input is written');
+  assert.deepEqual(secondAttempts(w), []);
+});
