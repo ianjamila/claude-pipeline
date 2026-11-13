@@ -123,6 +123,41 @@ Exit: 0 recorded · 1 `unpushed` (local HEAD is ahead of the PR head on GitHub: 
 
 `--resumed` is passed by a session that takes over a stalled run (or adopts a PR) as its first checkpoint (kept so records written by the removed `ship resume` stay guarded): it stamps `record.resumed` `{at, host, head}`, which later checkpoints keep, and which makes `merge` demand the owner's recorded "merge" for the exact head and owner-item set (`--owner-approved-head` + `--owner-approved-items`, checked against the owner-go records). It sets the heartbeat (`os.hostname()` and the time) and keeps the summary sections already in the comment. `--verify-report` copies the report at `verify.report` only when its head and tree are this HEAD's; otherwise it is ignored and `warnings` says why. A step other than `ended` / `awaiting-owner-merge` clears a previous `outcome` (the run is going again).
 
+## ci-usage
+
+CI cost per PR and class of run, and pushes to a ready PR that skipped `pipeline redraft`.
+
+```
+pipeline ci-usage [--repo-slug owner/name]... [--since YYYY-MM-DD|Nd] [--workflow NAME]... [--max-calls 400] [--rate os=usd]... [--json] [--repo DIR]
+  -> {ok, classifierVersion, since, repos: [{slug, private, billing (free-public | estimate-private), draftWhileIterating (true | false | "unknown"), since, partial, calls, rateLimit, skipped {prs, jobs}, totals, assumptions, prs, unexcludable}], warnings}:
+     the workflow runs created since the date (default 7d: `Nd` = now minus N x 24 h, or a UTC midnight YYYY-MM-DD; anything else exits 2) in each --repo-slug (default: the repository gh resolves from the current directory),
+     optionally only the --workflow NAME(s) (a name, a path or a file name). Every PR with a run of a minute or more has its timeline and commits read, and every such run its jobs (`actions/runs/{id}/jobs?filter=all`, every attempt).
+     totals {prs, heavyRuns (jobs add up to >= 1 min; with the jobs unread, the run lasted >= 1 min), workflowElapsedMin (measured: run updated_at - run_started_at), jobMinutes {linux, windows, macos, self-hosted} (the sum of the job durations),
+     estimatedUsd (ESTIMATE: each job rounded up to a whole minute x the rate of its OS, self-hosted 0; a public repository is free-public and 0), coverage (% of the heavy runs whose jobs were read), byClass, byEvent, pushesWhileReady,
+     missedRedrafts (= pushesWhileReady when the repository's .claude/pipeline.yml has ci.draft_while_iterating: true, 0 when false, null when it could not be read), wastedRedrafts, catchupsPerPr, churnRuns, churnMinutes, finalCatchupReruns};
+     class of a run: ready-for-review | push-while-ready | push-while-draft | converted-cancel | catch-up | rerun | other (not a pull_request run, by event in byEvent) | unclassified (its PR was not read);
+     prs [{pr, readyCycles, pushesWhileReady, pushedHeads, pushesWhileDraft, wastedRedrafts, catchups, heavyRuns, workflowElapsedMin, jobMinutes, estimatedUsd, churnRuns, churnMinutes, finalCatchupReruns}];
+     unexcludable: what the numbers cannot tell apart. Rates (USD per minute, default linux 0.008, windows 0.016, macos 0.08) are overridden with --rate os=usd (os: linux | windows | macos).
+     Budget: --max-calls GitHub calls (one per page; the PRs' reads stop at 60% of it so the biggest runs get their jobs read) and a stop when fewer than 1000 rate-limit calls are left (checked at the start and every 50 calls): `partial: true`
+     with `skipped` counts and a warning; coverage then says how much of the cost is measured. Without --json the same numbers print as a plain-text table. Read-only; no billing endpoint, nothing is cached.
+```
+
+Exit: 0 (also `partial: true`) · 2 usage (a bad `--since`, `--rate`, `--max-calls` or `--repo-slug`) · 3 GitHub unavailable for the first list (the repository, the workflow runs).
+
+**What the numbers mean.** Three quantities are kept apart and never mixed: `workflowElapsedMin` is measured (a run's `updated_at` minus `run_started_at`; for a re-run only its last attempt), `jobMinutes` is the sum of the job durations read from
+`actions/runs/{id}/jobs?filter=all` (every attempt, one call per run, split by the runner's labels: ubuntu / linux, windows, macos; `self-hosted` and provider runners such as ubicloud are counted on their own and cost 0), and `estimatedUsd`
+is an ESTIMATE, not a bill: each job rounded up to a whole minute times the rate of its OS, for a private repository only (a public one is `free-public`, 0), over the heavy runs whose jobs were read (`coverage`; the rates are in `assumptions`; larger runners,
+included minutes and discounts are not modelled). A run that finished in under a minute is never counted as heavy, so a short run with many parallel jobs is missed; a heavy run whose jobs were not read (the call budget) counts by its elapsed time and is flagged in the coverage.
+Each run gets ONE class, the first that fits: `other` (not a pull_request run; `byEvent` names the event), `unclassified` (its PR was not read), `converted-cancel` (cancelled within 120 s after a `converted_to_draft`), `rerun` (run_attempt above 1, all its attempts),
+`ready-for-review` (created within 120 s after a `ready_for_review`: the one suite the redraft flow plans for), `catch-up` (its head is an update-branch merge: two parents and committer `web-flow`, or GitHub's message "Merge branch '<base>' into <branch>"), then
+`push-while-ready` / `push-while-draft` by the PR's phase when the run was created.
+
+A **push while ready** is a head commit whose first pull_request run was created while the PR was ready: all the workflows of one push count once; the PR's opening head, catch-up heads, heads whose first run was the ready_for_review one and re-runs (a re-run keeps the run's original creation time) are left out.
+It is a **missed redraft** only where the repository's own `.claude/pipeline.yml` has `ci.draft_while_iterating: true` (`missedRedrafts` is `null` when that file cannot be read; `pushesWhileReady` is always reported). What it cannot exclude (`unexcludable`): a push after a proven `convert-failed`
+rejection of `pipeline redraft` (Rule 8: push anyway) leaves no trace on GitHub and counts as pushed while ready. `wastedRedrafts` are the viewer's `converted_to_draft` followed by a `ready_for_review` with no new head, force push or commit in between.
+Base churn: `churnRuns` / `churnMinutes` are the heavy runs on catch-up heads (the ready-for-review suite is not churn; minutes only where the jobs were read), `catchupsPerPr` the update-branch merges per PR, and `finalCatchupReruns` the heavy runs on a catch-up head created after the PR's newest
+review-complete marker comment (the comments are read only for a PR with such a run). `classifierVersion` changes whenever a rule here changes, so two reports can be compared.
+
 ## ci-wait
 
 wait until the required CI of a ready PR is really done (ignores a draft-era skipped run), then report the verdict.
