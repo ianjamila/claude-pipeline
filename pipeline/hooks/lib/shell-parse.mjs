@@ -548,11 +548,13 @@ function shellInvocation(argv) {
   // interactive shell (`-i`), and any long option or -o / +o name we do not read (zsh `-o exec`, `--no-exec`) leaves it off.
   let noexec = false;
   let execUnsure = false;
+  let gluedName = false; // (R16-F1: `zsh -ocdablevars f`: the letters after an o / O are an option name or more flags, which of the two is not read here: every word is then a candidate)
   while (i < argv.length) {
     const t = argv[i];
     if (t === '--') { i++; break; }
     if (t.length < 2 || (t[0] !== '-' && t[0] !== '+') || (t[0] === '+' && !/^\+[A-Za-z]/.test(t))) break; // (`+(f|fa).sh` is a pattern operand, not an option)
     if (t.startsWith('--')) { execUnsure = true; i += t === '--rcfile' || t === '--init-file' ? 2 : 1; continue; }
+    if (/^[-+][A-Za-z]*[oO][A-Za-z]/.test(t)) gluedName = true;
     if (t[0] === '-' && t.includes('c')) sawC = true;
     if (t[0] === '-' && t.includes('s')) sawS = true;
     if (/n/.test(t.slice(1))) noexec = t[0] === '-';
@@ -560,7 +562,7 @@ function shellInvocation(argv) {
     if (/[oO]$/.test(t) && /exec/i.test(argv[i + 1] ?? '')) execUnsure = true;
     i += /[oO]$/.test(t) ? 2 : 1; // -o / -O take an option name
   }
-  const before = argv.slice(1, i).some(hasExpansion);
+  const before = gluedName || argv.slice(1, i).some(hasExpansion);
   if (sawC) return i < argv.length ? { kind: 'script', text: argv[i], amb: before } : { kind: 'none' };
   if (sawS) return { kind: 'stdin', amb: before };
   if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', amb: before } : { kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion), parseOnly: noexec && !execUnsure && !before };

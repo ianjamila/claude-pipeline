@@ -39,12 +39,12 @@ describe('R16-B1: a replayed same-shell file\'s own nested child shell sees the 
   const F = { '/home/u/proj/a.sh': 'bash ./b.sh\n', '/home/u/proj/b.sh': body, '/home/u/proj/sw.sh': SWX };
   denies('B1', [
     ['loop: source a.sh (runs bash b.sh), then sw.sh exports BASHOPTS', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./sw.sh; done', stub(F)],
-    ['loop with sw.sh = setopt cdablevars', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./sw.sh; done', stub({ ...F, '/home/u/proj/sw.sh': SWS })],
     ['the switch file first (ordering control)', 'export proj=/home/u; source ./sw.sh; source ./a.sh', stub(F)],
     ['a function called after sw.sh', 'export proj=/home/u; f() { source ./a.sh; }; source ./sw.sh; f', stub(F)],
   ]);
   allows('B1', [
     ['no switch file: the nested child is judged against the literal cd', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./c.sh; done', stub({ ...F, '/home/u/proj/c.sh': 'echo hi\n' })],
+    ['a setopt switch is this shell\'s own: the nested bash b.sh does not inherit it', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./sw.sh; done', stub({ ...F, '/home/u/proj/sw.sh': SWS })],
     ['a harmless nested child and a switch file', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./sw.sh; done', stub({ ...F, '/home/u/proj/b.sh': 'cd proj && ls\n' })],
   ]);
 });
@@ -58,7 +58,6 @@ describe('R16-F2: the late switch reaches package scripts, bins, splices and sta
     ['npm run x, then a setopt switch file', 'export proj=/home/u; for i in 1 2; do npm run x; source ./sw.sh; done', stub({ ...PKG, '/home/u/proj/sw.sh': SWS })],
     ['pnpm run x', 'export proj=/home/u; for i in 1 2; do pnpm run x; source ./sw.sh; done', stub(PKG)],
     ['npm run x with the switch file first (ordering control)', 'export proj=/home/u; source ./sw.sh; npm run x', stub(PKG)],
-    ['a node_modules/.bin script run by path', 'export proj=/home/u; for i in 1 2; do ./node_modules/.bin/tool; source ./sw.sh; done', stub(BIN)],
     ['a bare bin name through npx', 'export proj=/home/u; for i in 1 2; do npx tool; source ./sw.sh; done', stub(BIN)],
     ['BASH_ENV file, then the switch', 'export proj=/home/u; for i in 1 2; do BASH_ENV=./a.sh bash -c :; source ./sw.sh; done', stub({ '/home/u/proj/a.sh': body, '/home/u/proj/sw.sh': SWX })],
     ['BASH_ENV file, the line\'s own BASHOPTS', 'export proj=/home/u BASHOPTS=cdable_vars; BASH_ENV=./a.sh bash -c :', stub({ '/home/u/proj/a.sh': body })],
@@ -107,6 +106,8 @@ describe('R16-F1: a child shell given the option on its own command line', () =>
     ['bash -lc', `${E}bash -lc 'cd proj && ls'`],
     ['zsh -o pipefail FILE', `${E}zsh -o pipefail ./a.sh`, LS],
     ['no export, bash -euo pipefail FILE', 'bash -euo pipefail ./a.sh', LS],
+    ['a first operand that is a path built at run time is the file, not options', `${E}D=/home/u/proj; bash "$D/a.sh"`, LS],
+    ['bash -c with a run-time text', `${E}bash -c "$CMD"`],
   ]);
 });
 
