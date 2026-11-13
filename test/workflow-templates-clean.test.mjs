@@ -48,3 +48,21 @@ test('verify.yml skips drafts, runs at ready_for_review and cancels on converted
   assert.match(wf.concurrency.group, /github\.event\.pull_request\.number/);
   assert.equal(wf.concurrency['cancel-in-progress'], true);
 });
+
+// A third-party action in a template runs in every project that copies it (queue-guards.yml with `statuses: write`): every `uses:` is pinned
+// to a full commit SHA, never a movable tag. Local reusable workflows (`./...`) are the only exception.
+for (const f of files) {
+  test(`workflow template ${f} pins every action to a 40-hex commit SHA`, () => {
+    const uses = [...readFileSync(new URL(f, DIR), 'utf8').matchAll(/^\s*(?:-\s+)?uses:\s*(\S+)/gm)].map((m) => m[1]);
+    for (const u of uses) {
+      if (u.startsWith('./')) continue;
+      assert.match(u, /^[\w.-]+\/[\w./-]+@[0-9a-f]{40}$/, `${f}: ${u}`);
+    }
+  });
+}
+
+test('the SHA-pin check sees the actions of the templates (it is not vacuous)', () => {
+  const all = files.flatMap((f) => [...readFileSync(new URL(f, DIR), 'utf8').matchAll(/^\s*(?:-\s+)?uses:\s*(\S+)/gm)].map((m) => m[1]));
+  assert.ok(all.length >= 8, all.join(', '));
+  assert.ok(all.some((u) => u.startsWith('actions/upload-artifact@')));
+});
