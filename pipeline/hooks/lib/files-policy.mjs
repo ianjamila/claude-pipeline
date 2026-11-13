@@ -688,7 +688,10 @@ function textAfter(ti, before) {
 // Does this file-tool call add or alter hooks in a hook surface file? -> a reason, or null.
 function hooksChangeReason(kind, ti, ctx, candidate, shown) {
   if (kind === 'plugin') return `${shown} is a plugin's hooks file: a hook there could run on the owner's dialogs`;
-  const before = ctx.readText(candidate) ?? '';
+  const read = ctx.readText(candidate);
+  // (R31-F2: a file that is there but unread (over 1 MB, no access) is no empty file: an Edit cannot be compared with it; a full Write is compared in full, an absent file is empty)
+  if (read === null && typeof ti.content !== 'string' && ctx.api.existsSync(candidate)) return `${shown} exists but the guard cannot read it (over 1 MB or unreadable), so the change cannot be compared with the file`;
+  const before = read ?? '';
   const after = textAfter(ti, before);
   const words = writtenTexts(ti).flatMap(variantsOf).some((x) => /hooks/i.test(x)); // (R31-B2: a JSON / JS escape decoded, as the program-text check does)
   if (after === null) return words ? `${shown}: the change mentions hooks and cannot be compared with the file` : null;

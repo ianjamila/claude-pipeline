@@ -1358,3 +1358,22 @@ test('R31-B2: a JSON-escaped `hooks` key is found after a null or malformed prev
   assert.equal(file('Write', { file_path: M, content: '{"skills":["./evil"]}' }, reading({ [M]: 'null' })), 'deny');
   assert.equal(file('Write', { file_path: M, content: '{"name":"x"}' }, reading({ [M]: 'null' })), 'allow');
 });
+
+// #269 R31-F2 (verification defect): a hook surface file the guard cannot read (over 1 MB, unreadable) was compared as if it were empty, so an Edit to it was judged by its words alone.
+test('R31-F2: an Edit of an existing hook surface file the guard cannot read is refused; an absent file and a full Write keep their reading', () => {
+  const S = '/repo/.claude/settings.local.json';
+  const unreadable = { readText: () => null, existsSync: (p) => p === S }; // (exists, but readText gives null: over 1 MB or no read access)
+  const absent = { readText: () => null, existsSync: () => false };
+  const edit = { file_path: S, old_string: '"allow": [', new_string: '"allow": ["Bash(ls:*)", ' };
+  assert.equal(file('Edit', edit, unreadable), 'deny');
+  assert.equal(file('MultiEdit', { file_path: S, edits: [{ old_string: 'a', new_string: 'b' }] }, unreadable), 'deny');
+  assert.equal(file('Edit', { ...edit, new_string: '"ho" + "oks": {' }, unreadable), 'deny');
+  const reason = evaluateFileTool({ tool_name: 'Edit', tool_input: edit, cwd: '/repo' }, { ...LINUX, ...unreadable }).reason;
+  assert.match(reason, /cannot read/);
+  // the same Edit when the file is simply absent (or readable) is judged on its words, as before
+  assert.equal(file('Edit', edit, absent), 'allow');
+  assert.equal(file('Edit', edit, onDisk({ [S]: '{"permissions":{"allow": []}}' })), 'allow');
+  // a full Write is compared in full against an empty file, whether or not the old one can be read
+  assert.equal(file('Write', { file_path: S, content: PERMS }, unreadable), 'allow');
+  assert.equal(file('Write', { file_path: S, content: HOOKED }, unreadable), 'deny');
+});
