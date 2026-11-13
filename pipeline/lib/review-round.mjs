@@ -325,20 +325,37 @@ export function protectedKindsOf(adm) {
 // must not loosen its own routing (R13-F1). Stricter = more Codex, less substitute: a LOWER review.effort.small_fix_lines (fewer rounds count as small), a HIGHER
 // review.codex_round_budget (the per-PR Codex budget runs out later), a HIGHER review.codex_budget.soft / .hard (the weekly governor lowers effort / withholds
 // Codex later) and review.substitute.mode 'off' when either says off (SUBSTITUTE_MODES is auto|off; off never withholds Codex for budget or governor).
+// The substitute's own gates (review.substitute.*, read by codex-review's verdict, `substitute prepare|apply` and `triage second-review`) follow the same rule: a HIGHER
+// min_wait_minutes (Codex is waited for longer) and a LOWER max_packet_mb (fewer packets may go to a substitute).
 // An unreadable or invalid base config cannot be compared: the working tree is held against the built-in defaults instead (never looser than them), and the mode is off.
-// -> { smallFixLines, codexRoundBudget, soft, hard, mode }
+// -> { smallFixLines, codexRoundBudget, soft, hard, mode, minWaitMinutes, maxPacketMb }
 export function strictestRouteConfig(config, trusted) {
   const knobs = (c, mode) => ({
     smallFixLines: c.review.effort.small_fix_lines, codexRoundBudget: c.review.codex_round_budget,
     soft: c.review.codex_budget.soft, hard: c.review.codex_budget.hard, mode: mode ?? c.review.substitute.mode,
+    minWaitMinutes: c.review.substitute.min_wait_minutes, maxPacketMb: c.review.substitute.max_packet_mb,
   });
   const wt = knobs(config);
   const other = trusted?.ok === true ? knobs(trusted.config) : knobs(DEFAULTS, 'off');
   return {
     smallFixLines: Math.min(wt.smallFixLines, other.smallFixLines), codexRoundBudget: Math.max(wt.codexRoundBudget, other.codexRoundBudget),
     soft: Math.max(wt.soft, other.soft), hard: Math.max(wt.hard, other.hard), mode: wt.mode === 'off' || other.mode === 'off' ? 'off' : wt.mode,
+    minWaitMinutes: Math.max(wt.minWaitMinutes, other.minWaitMinutes), maxPacketMb: Math.min(wt.maxPacketMb, other.maxPacketMb),
   };
 }
+
+// The config committed at the fork point of the DEFAULT branch (the trusted one rateBranch reads; `forkPoint` when the caller already has it), as baseConfigAt answers:
+// { ok, config } | { ok: false, reason }. A git failure is an unreadable base, never a throw.
+export function trustedBaseOf(root, config, forkPoint) {
+  try {
+    return baseConfigAt(forkPoint ?? mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root }), root);
+  } catch (err) {
+    return { ok: false, reason: String(err?.message ?? err).split('\n')[0].slice(0, 160) };
+  }
+}
+
+// The stricter routing / substitute knobs for a command that decides whether a substitute may run (`forkPoint`: adm.rated.trustedFork where an admission exists).
+export const routeConfigFor = (root, config, forkPoint) => strictestRouteConfig(config, trustedBaseOf(root, config, forkPoint));
 
 // Who reviews this admitted round and at what effort (review-route.mjs has the table; this gathers its facts). A base-only round is never planned.
 // -> { route, evidence, effort, why, protected, small, lowered?, round, base, wholePr, spend, budget, governor, facts }
@@ -348,7 +365,7 @@ export function planRound(adm, { env = process.env, now = Date.now() } = {}) {
   const kinds = protectedKindsOf(adm);
   // A PR must not loosen its own routing: the sensitive-path test and the knobs are read under the working-tree config AND the trusted base config, stricter wins
   // (R13-B1 / R13-F1); a base config that cannot be read counts every path as sensitive.
-  const trusted = baseConfigAt(adm.rated.trustedFork, root);
+  const trusted = trustedBaseOf(root, config, adm.rated.trustedFork);
   const route = strictestRouteConfig(config, trusted);
   const facts = rangeFacts(adm.review.base, adm.head, trusted.ok ? [config, trusted.config] : [config], { cwd: root });
   if (!trusted.ok) facts.sensitive = true;

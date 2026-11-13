@@ -12,7 +12,7 @@ import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs
 import { validateFindings } from '../lib/codex.mjs';
 import { headSha, showFile } from '../lib/git.mjs';
 import { accountProjectsRoot, floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
-import { admitRound, headMoved, protectedKindsOf, recordRound, roundPrompt } from '../lib/review-round.mjs';
+import { admitRound, headMoved, protectedKindsOf, recordRound, roundPrompt, routeConfigFor } from '../lib/review-round.mjs';
 import { quotaValidUntilMs, readRoute, resetNear, superseded, writeFinalRoute } from '../lib/route-record.mjs';
 import { codexSpend } from '../lib/review-route.mjs';
 import { MAX_AGE_MS, readWeeklyUsage } from '../lib/codex-usage.mjs';
@@ -258,15 +258,16 @@ function prepare(rest, ctx) {
 async function prepareLocked({ root, pr, round, ctx }) {
   const { config } = await requireConfig(root);
   const route = readRoute(root, round);
-  checkEvidence(route, { round, mode: config.review.substitute.mode });
+  const sub = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute (a PR must not loosen it)
+  checkEvidence(route, { round, mode: sub.mode });
   if (headSha({ cwd: root }) !== route.head) throw headMoved();
   const adm = await admitRound({ root, config, ctx, pr, round, base: route.base, head: route.head });
   if (adm.baseOnly) throw refuse('base-only', `round ${round} only merges the base branch in: nothing for a reviewer to ask`);
-  const maxBytes = config.review.substitute.max_packet_mb * 1024 * 1024;
+  const maxBytes = sub.maxPacketMb * 1024 * 1024;
   const packet = buildPacket(adm, route, root, maxBytes);
   const agent = checkAgainstRound(route, adm, packet, root);
   checkReadable(packet);
-  checkReset(route, Date.now(), ctx.env, config.review.substitute.min_wait_minutes);
+  checkReset(route, Date.now(), ctx.env, sub.minWaitMinutes);
 
   // The attempt: the first, the open one again, or the next one after a recorded invalid.
   const record = readAttempts(root, round, identityOf(round, route));
@@ -344,12 +345,13 @@ async function applyLocked({ root, pr, round, ctx, givenTag, projectsDir, maxAge
   const env = ctx.env ?? process.env;
   const { config } = await requireConfig(root);
   const route = readRoute(root, round);
-  checkEvidence(route, { round, mode: config.review.substitute.mode });
+  const sub = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute (a PR must not loosen it)
+  checkEvidence(route, { round, mode: sub.mode });
   if (headSha({ cwd: root }) !== route.head) throw headMoved();
   // The shared admission (round order, base rule, round cap and grants, empty range, resolution proof) runs again; the recorder runs its final locked half below.
   const adm = await admitRound({ root, config, ctx, pr, round, base: route.base, head: route.head });
   if (adm.baseOnly) throw refuse('base-only', `round ${round} only merges the base branch in: nothing for a reviewer to ask`);
-  const packet = buildPacket(adm, route, root, config.review.substitute.max_packet_mb * 1024 * 1024);
+  const packet = buildPacket(adm, route, root, sub.maxPacketMb * 1024 * 1024);
   const agent = checkAgainstRound(route, adm, packet, root);
   // The open attempt is found by the round's content (attempts are kept per content, not per Codex attempt or packet text).
   const record = readAttempts(root, round, identityOf(round, route));

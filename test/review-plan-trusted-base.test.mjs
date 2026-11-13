@@ -71,7 +71,7 @@ test('strictestRouteConfig: lower small_fix_lines, higher budgets, mode off if e
   const cfg = (o = {}) => ({
     review: {
       effort: { small_fix_lines: 40, ...(o.effort ?? {}) }, codex_round_budget: 6, codex_budget: { soft: 75, hard: 90, ...(o.budget ?? {}) },
-      substitute: { mode: o.mode ?? 'auto' }, ...(o.top ?? {}),
+      substitute: { mode: o.mode ?? 'auto', min_wait_minutes: o.wait ?? 0, max_packet_mb: o.packet ?? 8 }, ...(o.top ?? {}),
     },
   });
   const a = strictestRouteConfig(cfg({ effort: { small_fix_lines: 10000 }, top: { codex_round_budget: 1 }, budget: { hard: 50 } }), { ok: true, config: cfg() });
@@ -80,6 +80,10 @@ test('strictestRouteConfig: lower small_fix_lines, higher budgets, mode off if e
   assert.equal(b.mode, 'off');
   const c = strictestRouteConfig(cfg(), { ok: true, config: cfg({ mode: 'off' }) });
   assert.equal(c.mode, 'off');
+  const e = strictestRouteConfig(cfg({ wait: 0, packet: 1000 }), { ok: true, config: cfg({ wait: 60, packet: 8 }) });
+  assert.deepEqual([e.minWaitMinutes, e.maxPacketMb], [60, 8], 'a higher wait, a lower packet limit');
+  const g = strictestRouteConfig(cfg({ wait: 90, packet: 2 }), { ok: true, config: cfg({ wait: 60, packet: 8 }) });
+  assert.deepEqual([g.minWaitMinutes, g.maxPacketMb], [90, 2]);
   const d = strictestRouteConfig(cfg({ effort: { small_fix_lines: 10000 } }), { ok: false, reason: 'none' });
   assert.deepEqual([d.smallFixLines, d.mode], [40, 'off'], 'unreadable base: never looser than the defaults, substitute off');
 });

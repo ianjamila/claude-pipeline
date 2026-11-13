@@ -14,7 +14,6 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
-import { baseConfigAt } from '../lib/config.mjs';
 import { git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
@@ -32,7 +31,7 @@ import {
   currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
 import { assertCurrentAttempt, finishAttempt, readRoute, startAttempt, substituteEligibility, superseded, writeFinalRoute } from '../lib/route-record.mjs';
-import { headMoved } from '../lib/review-round.mjs';
+import { headMoved, routeConfigFor, trustedBaseOf } from '../lib/review-round.mjs';
 import { noteCodexAnswered, noteQuotaStop } from '../lib/codex-usage.mjs';
 import { floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
 import { PROOF_EFFORT, proveSubstituteRun, refuseTestOnlyFlags } from '../lib/substitute-proof.mjs';
@@ -530,7 +529,7 @@ async function secondReview(rest, ctx) {
   }
   const o = { cwd: root };
   const model = config.review.codex_model;
-  const sub = config.review.substitute;
+  const sub = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute
 
   // Check under the lock; the packet is built from the state and git right here.
   const asked = await withStateLock(root, ctx, () => {
@@ -592,7 +591,7 @@ async function secondReview(rest, ctx) {
   const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
   if (!ran.ok) {
     const verdict = substituteEligibility({
-      reason: ran.reason, timedOut: ran.timedOut === true, quota: ran.quota, mode: sub.mode, minWaitMinutes: sub.min_wait_minutes, agent: asked.agent,
+      reason: ran.reason, timedOut: ran.timedOut === true, quota: ran.quota, mode: sub.mode, minWaitMinutes: sub.minWaitMinutes, agent: asked.agent,
     });
     const quotaStop = ran.reason === 'quota' && ran.quota?.eligible === true;
     await failAttempt(quotaStop
@@ -609,7 +608,7 @@ async function secondReview(rest, ctx) {
     let substitute = verdict;
     if (verdict.eligible) {
       const prepared = await withStateLock(root, ctx, () => prepareSecondAttempt({
-        root, round: n, packetId, ids, agent: asked.agent, prompt, head: asked.head, evidence: 'quota', resetText: ran.quota.resetText, resetAt: ran.quota.resetAt, minWaitMinutes: sub.min_wait_minutes, env: ctx.env ?? process.env,
+        root, round: n, packetId, ids, agent: asked.agent, prompt, head: asked.head, evidence: 'quota', resetText: ran.quota.resetText, resetAt: ran.quota.resetAt, minWaitMinutes: sub.minWaitMinutes, env: ctx.env ?? process.env,
       }), pr);
       substitute = prepared.ok
         ? { ...verdict, packetId, attempt: prepared.k, tag: prepared.tag, promptHeader: prepared.header, inputPath: prepared.inputPath, digest: prepared.digest, reused: prepared.reused }
@@ -695,7 +694,7 @@ async function secondReviewApply(values, ctx) {
   const n = Number(m[1]);
   const id8 = m[2];
   if (config.owner_approval !== 'chat') throw fail(EXIT.FAILED, 'label-mode', 'a second review is run only with owner_approval: chat in pipeline.yml');
-  if (config.review.substitute.mode === 'off') throw fail(EXIT.FAILED, 'mode-off', 'review.substitute.mode is off: no substitute reviewer');
+  if (routeConfigFor(root, config).mode === 'off') throw fail(EXIT.FAILED, 'mode-off', 'review.substitute.mode is off: no substitute reviewer');
   const env = ctx.env ?? process.env;
   const o = { cwd: root };
 
@@ -916,12 +915,8 @@ async function roundRequest(rest, ctx) {
 // The config committed at the default branch's fork point (the trusted one rateBranch also reads), for the union of the sensitive-path lists: a PR must not shrink its own list.
 // -> { config, problem }: unreadable gives config null (its lists count as empty, nothing is loosened) and says why.
 function trustedBaseConfig(root, config) {
-  try {
-    const base = baseConfigAt(mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root }), root);
-    return base.ok ? { config: base.config, problem: null } : { config: null, problem: base.reason };
-  } catch (err) {
-    return { config: null, problem: String(err?.message ?? err).split('\n')[0].slice(0, 160) };
-  }
+  const base = trustedBaseOf(root, config);
+  return base.ok ? { config: base.config, problem: null } : { config: null, problem: base.reason };
 }
 
 // The display fields of the ask. `grants` is the same lookup the admission check used (any head); `grantGap` says why it found nothing ('provenance' = a record exists that cannot be

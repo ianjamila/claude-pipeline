@@ -973,3 +973,39 @@ test('R10-F2 (#360): a resolution packet that would export a conflicted image (.
   assert.ok(p.json.message.includes('assets/logo.png'));
   assert.ok(!existsSync(w.attemptsFile), 'no attempt was opened');
 });
+
+test('R13-F2: substitute prepare / apply read review.substitute under the stricter of the working tree and the base config: base mode off is not undone by a working tree that says auto', (t) => {
+  const w = world(t, { review: '  substitute:\n    mode: off\n' });
+  w.config({ review: '' }); // the working tree (the PR's own pipeline.yml) turns the substitute back on
+  assertExit(w.run(), 3); // the fact (a real quota stop) is recorded whatever the mode says
+  assert.equal(w.route().evidence, 'quota');
+  const p = w.prepare();
+  assertExit(p, 1, p.stdout + p.stderr);
+  assert.equal(p.json.error, 'mode-off');
+  const a = w.apply(w.projects);
+  assertExit(a, 1, a.stdout + a.stderr);
+  assert.equal(a.json.error, 'mode-off');
+});
+
+test('R13-F2: a working tree min_wait_minutes 0 does not undo the base config\'s 60: codex-review and prepare both refuse reset-near', (t) => {
+  const w = world(t, { review: '  substitute:\n    min_wait_minutes: 60\n' });
+  w.config({ review: '' });
+  const run = w.run(1, w.quota("You've hit your usage limit. Upgrade to Pro, or try again in 10 minutes."));
+  assertExit(run, 3);
+  assert.deepEqual([run.json.substitute.eligible, run.json.substitute.why], [false, 'reset-near'], 'codex-review says wait');
+  const p = w.prepare();
+  assertExit(p, 1, p.stdout + p.stderr);
+  assert.equal(p.json.error, 'reset-near');
+});
+
+test('R13-F2: a working tree max_packet_mb 1000 does not undo the base config\'s limit: prepare refuses packet-too-large', (t) => {
+  const w = world(t, { review: '  substitute:\n    max_packet_mb: 1\n' });
+  w.config({ review: '  substitute:\n    max_packet_mb: 1000\n' });
+  w.repo.write('src/huge.js', `${'x'.repeat(100)}\n`.repeat(12000)); // about 1.2 MB of changed lines
+  const big = w.repo.commit('huge');
+  w.prHead(big);
+  assertExit(w.run(1, w.quota(), { to: big }), 3);
+  const p = w.prepare();
+  assertExit(p, 1, p.stdout + p.stderr);
+  assert.equal(p.json.error, 'packet-too-large');
+});

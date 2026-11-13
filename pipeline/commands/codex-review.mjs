@@ -25,7 +25,7 @@ import { FINDINGS_SCHEMA_PATH, buildCodexArgs, validateFindings } from '../lib/c
 import { CODEX_TIMEOUT_MS, execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { headSha, revParse } from '../lib/git.mjs';
-import { admitRound, baseOnlyFindings, headMoved, planRound, recordRound, roundPrompt, unavailable } from '../lib/review-round.mjs';
+import { admitRound, baseOnlyFindings, headMoved, planRound, recordRound, roundPrompt, routeConfigFor, unavailable } from '../lib/review-round.mjs';
 import { roundDir, writeFileAtomic } from '../lib/review-context.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { noteCodexAnswered, noteQuotaStop } from '../lib/codex-usage.mjs';
@@ -169,7 +169,8 @@ export const run = guarded(async (argv, ctx) => {
       return null;
     }
   };
-  const sub = config.review.substitute;
+  // The verdict on a substitute reads the stricter of the working tree's and the trusted base config (a PR must not turn its own substitute on / shorten the wait).
+  const sub = routeConfigFor(root, config, adm.rated.trustedFork);
 
   // The effort is the configuration's, not the caller's: a round that is a small fix-check (or runs while the weekly Codex governor is soft) is cheaper,
   // every other round keeps the normal effort. A round the budget / governor sends to the substitute never runs Codex, so the effort is not asked about.
@@ -208,7 +209,7 @@ export const run = guarded(async (argv, ctx) => {
   // A failed run: the verdict on a substitute, the final evidence (compare-and-swap: a superseded attempt exits 2 here instead), the machine-wide record.
   const failed = async (reason, extra, { ran, detail } = {}) => {
     const verdict = substituteEligibility({
-      reason, timedOut: ran?.timedOut === true, quota: ran?.quota, mode: sub.mode, minWaitMinutes: sub.min_wait_minutes, agent: attempt.route.agent,
+      reason, timedOut: ran?.timedOut === true, quota: ran?.quota, mode: sub.mode, minWaitMinutes: sub.minWaitMinutes, agent: attempt.route.agent,
     });
     const quotaStop = reason === 'quota' && ran?.quota?.eligible === true;
     const final = quotaStop

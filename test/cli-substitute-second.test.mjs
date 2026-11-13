@@ -572,3 +572,19 @@ test('R9-F2 parity: a second-review finding with one very long line (10,000 char
   assertExit(r, 3, r.stdout + r.stderr);
   assert.equal(r.json.substitute.eligible, true, r.stdout.slice(0, 500));
 });
+
+test('R13-F2: a second review reads review.substitute under the stricter of the working tree and the base config: base mode off holds against a working tree that says auto', (t) => {
+  const w = world(t, { yml: MODE_OFF_YML, items: 1 });
+  writeFileSync(pipelineYmlPath(w), CHAT_YML);
+  const o = w.second('R1-B1');
+  assertExit(o, 3, o.stdout);
+  assert.deepEqual([o.json.substitute.eligible, o.json.substitute.why], [false, 'mode-off']);
+});
+
+test('R13-F2: a second review whose quota reset is within the BASE config\'s min_wait_minutes (60) is reset-near although the working tree says 0', (t) => {
+  const w = world(t, { yml: `${CHAT_YML}review:\n  substitute:\n    min_wait_minutes: 60\n`, items: 1 });
+  writeFileSync(pipelineYmlPath(w), CHAT_YML);
+  const r = w.second('R1-B1', { ...w.quota(), FAKE_CODEX_TURN_FAILED: "You've hit your usage limit. Upgrade to Pro, or try again in 10 minutes." });
+  assertExit(r, 3, r.stdout + r.stderr);
+  assert.deepEqual([r.json.substitute.eligible, r.json.substitute.why], [false, 'reset-near']);
+});
