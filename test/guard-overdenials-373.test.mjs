@@ -206,6 +206,68 @@ describe('#373: the parser reports the shapes (cmds.shape)', () => {
   });
 });
 
+describe('#373 review round 1 (R1-B1, R1-B2, R1-B3, R1-F1, R1-F2, R1-F3)', () => {
+  const fsOf = (files) => ({ existsSync: (p) => Object.hasOwn(files, p), readText: (p) => files[p] ?? null });
+  const repoAtHome = fsOf({ '/home/u/.git': null, '/home/u/.git/config': '[core]\n' });
+  const dotsDir = (extra = {}) => ({ '/home/u/proj/.git': null, '/home/u/proj/.git/config': '[core]\n', ...extra });
+  test('R1-B1: a brace group entered by || | or & exports no chain through its }', () => {
+    for (const line of ['true || { true; cd /tmp; } && find . -delete', 'true || { true && cd /tmp; } && find . -delete', 'a | { true; cd /tmp; } && find . -delete', 'a & { true; cd /tmp; } && find . -delete']) {
+      assert.equal(run(line).decision, 'deny', line);
+    }
+  });
+  test('R1-B1: a group entered by ; or && still carries the cd out', () => {
+    for (const line of ['true; { true; cd /tmp; } && find . -delete', 'true && { true; cd /tmp; } && find . -delete']) {
+      assert.equal(run(line).decision, 'allow', line);
+    }
+  });
+  test('R1-B2: a toplevel word beside another -C or a wrapper chdir is unknown', () => {
+    for (const line of [`git -C /tmp -C ${TOP} clean -fd`, `env -C /tmp git -C ${TOP} clean -fd`, `env --chdir=/tmp git -C ${TOP} clean -fd`, `sudo -D /tmp git -C ${TOP} clean -fd`]) {
+      assert.equal(run(line, repoAtHome).decision, 'deny', line);
+    }
+  });
+  test('R1-F2: a second -C after the toplevel word is unknown', () => {
+    assert.equal(run(`git -C ${TOP} -C sub clean -fd`, repoAtHome).decision, 'deny');
+    assert.equal(run(`git -C ${TOP} -C ../u clean -fd`, { ...repoAtHome, cwd: '/tmp' }).decision, 'deny');
+  });
+  test('R1-B3: a repository-selecting global option beside the toplevel word is unknown', () => {
+    for (const opt of ['--git-dir=/tmp/repo', '--work-tree=/home/u', '-c core.worktree=/home/u', '--bare', '--namespace=x', '--git-dir /tmp/repo']) {
+      assert.equal(run(`git ${opt} -C ${TOP} clean -fd`).decision, 'deny', opt);
+    }
+  });
+  test('R1-B3: a harmless global option beside the toplevel word is still read', () => {
+    assert.equal(run(`git --no-pager -C ${TOP} clean -fd`).decision, 'allow');
+  });
+  const linked = (cfg) => fsOf({
+    '/home/u/wt/.git': 'gitdir: /home/u/main/.git/worktrees/x\n',
+    '/home/u/main/.git/worktrees/x/commondir': '../..\n',
+    '/home/u/main/.git/worktrees/x/HEAD': 'ref: refs/heads/agent/worktree-x\n',
+    '/home/u/main/.git/worktrees/x/gitdir': '/home/u/wt/.git\n',
+    '/home/u/main/.git/config': cfg,
+  });
+  const branchy = '[core]\n\trepositoryformatversion = 0\n[branch "agent/worktree-x"]\n\tremote = origin\n';
+  test('R1-F1: a linked worktree (no config in its own git dir, a branch named worktree) is read', () => {
+    const ex = { ...linked(branchy), cwd: '/home/u/wt/sub' };
+    assert.equal(run(`git -C ${TOP} clean -fd`, ex).decision, 'allow');
+    assert.equal(run(`cd ${TOP} && git clean -fd`, ex).decision, 'allow');
+  });
+  test('R1-F1: a main checkout whose config has a branch named worktree is read', () => {
+    const ex = { ...fsOf(dotsDir({ '/home/u/proj/.git/config': branchy })), cwd: '/home/u/proj/sub' };
+    assert.equal(run(`git -C ${TOP} clean -fd`, ex).decision, 'allow');
+    assert.equal(run(`cd ${TOP} && git clean -fd`, ex).decision, 'allow');
+  });
+  test('R1-F1: a real core.worktree / extensions.worktreeConfig key still makes the root unknown', () => {
+    for (const cfg of ['[core]\n\tworktree = /home/u\n', '[core]\nWorktree=/home/u\n', '[core] worktree = /home/u\n', '[extensions]\n  worktreeConfig = true\n']) {
+      assert.equal(run(`git -C ${TOP} clean -fd`, { ...linked(cfg), cwd: '/home/u/wt/sub' }).decision, 'deny', cfg);
+      assert.equal(run(`git -C ${TOP} clean -fd`, { ...fsOf(dotsDir({ '/home/u/proj/.git/config': cfg })), cwd: '/home/u/proj/sub' }).decision, 'deny', cfg);
+    }
+  });
+  test('R1-F3: an ancestor that is itself a git directory makes the root unknown', () => {
+    const ex = fsOf({ '/home/u/.git': 'gitdir: /home/u/sep.git\n', '/home/u/sep.git/config': '[core]\n\tbare = false\n', '/home/u/sep.git/HEAD': 'ref: refs/heads/main\n', '/home/u/sep.git/objects': null });
+    assert.equal(run(`git -C ${TOP} clean -fd`, { ...ex, cwd: '/home/u/sep.git/refs' }).decision, 'deny');
+    assert.equal(run(`git -C ${TOP} clean -fd`, { ...fsOf({ '/work/r.git/HEAD': null, '/work/r.git/objects': null }), cwd: '/work/r.git/refs' }).decision, 'deny');
+  });
+});
+
 describe('#373: a long line of each new shape stays linear', () => {
   const timed = (name, line) => test(`#373 timing: ${name}`, () => {
     const t = cpuTimed(() => run(line));

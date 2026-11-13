@@ -1644,18 +1644,22 @@ function gitRootFrom(start, ctx) {
         if (!g) return null;
         gitdir = posix.resolve(d, toPosix(g[1]));
       }
-      const configs = [pathsFor().join(gitdir, 'config')];
+      // (R1-F1: a linked worktree's own git dir holds no `config`: the common dir's is the one that counts, and an absent one is skipped; any other git dir's config must be readable)
+      const own = pathsFor().join(gitdir, 'config');
       const common = typeof text === 'string' ? ctx.readText(pathsFor().join(gitdir, 'commondir')) : null;
-      if (typeof common === 'string' && common.trim()) configs.push(pathsFor().join(posix.resolve(gitdir, toPosix(common.trim())), 'config'));
+      const linked = typeof common === 'string' && common.trim() !== '';
+      const configs = linked ? [pathsFor().join(posix.resolve(gitdir, toPosix(common.trim())), 'config'), ...(ctx.api.existsSync(own) ? [own] : [])] : [own];
       // (a worktree key anywhere, or an include of another file, anywhere in the repo's, the user's or the XDG config: the root may be elsewhere)
       const xdg = ctx.env.XDG_CONFIG_HOME && isAbs(toPosix(ctx.env.XDG_CONFIG_HOME)) ? toPosix(ctx.env.XDG_CONFIG_HOME) : pathsFor().join(ctx.homePosix, '.config');
       const users = [pathsFor().join(ctx.homePosix, '.gitconfig'), pathsFor().join(xdg, 'git/config')];
       // (the per-worktree file `config.worktree` is read when extensions.worktreeConfig is on: its core.worktree moves the root too)
       const texts = [...configs, pathsFor().join(gitdir, 'config.worktree')].filter((q, qi) => qi < configs.length || ctx.api.existsSync(q)).map((q) => ctx.readText(q));
       for (const q of users) if (ctx.api.existsSync(q)) texts.push(ctx.readText(q));
-      if (texts.some((x) => typeof x !== 'string') || texts.some((x) => /worktree/i.test(x) || /^\s*\[\s*include/mi.test(x))) return null;
+      if (texts.some((x) => typeof x !== 'string') || texts.some((x) => /(?:^|\])[ \t]*worktree(?:config)?[ \t]*=/mi.test(x) || /^\s*\[\s*include/mi.test(x))) return null;
       return d;
     }
+    // (R1-F3: git also finds a repository when the directory is itself a git directory, and honours its core.worktree: a walk that meets one reads the root as unknown)
+    if (ctx.api.existsSync(pathsFor().join(d, 'HEAD')) && ctx.api.existsSync(pathsFor().join(d, 'objects'))) return null;
     const up = pathsFor().dirname(d);
     if (up === d) break;
     d = up;
@@ -4370,6 +4374,7 @@ function evaluateBashForFilesFrame(command, opts) {
   //  - the chain survives only a join by && (any other join, `;` `||` `|` `&`, ends it), and a cd that follows `||` / `|` starts none (it may not have run, or may have run in a subshell);
   //  - a subshell runs from the directories known at its opening (the chain if its own join is &&); a cd inside it never leaks out: after the `)` the state is as before it (only `known` may have grown);
   //  - a brace group runs in this shell: its first command takes the group's own join, a cd inside persists after the `}`, and a `}` is looked through when the join after a cd is read (the group's status is its last command's);
+  //    except a group entered by `||`, `|` or `&` (skipped, or run in a subshell): it exports no chain through its `}` (R1-B1);
   //  - `if CD; then BODY [else ELSE] fi`: the condition must be exactly one cd to a literal target, else nothing is narrowed. The body is joined to it as by && (it runs only when the cd succeeded); the else body and
   //    everything after the `fi` are read against every directory known (the chain ends);
   //  - inside a subshell, group or body entered with a live chain, `;` keeps the chain until a command that may change the directory has run there.
@@ -4404,11 +4409,11 @@ function evaluateBashForFilesFrame(command, opts) {
         const fr = stack[stack.length - 1];
         if (e.kind === '(' || e.kind === '{') {
           if (e.sep !== '&&') chain = null;
-          stack.push({ kind: e.kind, chain0: chain, lost0: lost, live: chain !== null, touched: false });
+          stack.push({ kind: e.kind, chain0: chain, lost0: lost, live: chain !== null, touched: false, skip: e.kind === '{' && (e.sep === '||' || e.sep === '|' || e.sep === '&') });
         } else if (e.kind === 'if') stack.push({ kind: 'if', from: k, live: false, touched: false });
         else if (!fr) return false;
         else if (e.kind === ')') { stack.pop(); chain = fr.chain0; lost = fr.lost0; }
-        else if (e.kind === '}') stack.pop();
+        else if (e.kind === '}') { stack.pop(); if (fr.skip) chain = null; } // (R1-B1: a group entered by || | & may not run at all, or runs in a subshell: no cd inside it leaves a chain behind)
         else if (e.kind === 'then') {
           if (k - fr.from !== 1 || !cdOf(top[k - 1]) || cdTarget(top[k - 1]) === null) return false; // (the condition: exactly one cd to a literal target)
           fr.live = chain !== null;
@@ -4469,13 +4474,26 @@ function evaluateBashForFilesFrame(command, opts) {
     }
     return unique(out);
   };
+  // R1-B2 / R1-F2 / R1-B3: the toplevel word is read only when it is the git command's SOLE directory option and its only repository-moving option: no wrapper chdir (env -C, --chdir, sudo -D), no other -C
+  // (before it the substitution would be read in the wrong directory, after it git runs in a directory this reading cannot give), no --git-dir / --work-tree / -c / --bare / --namespace ... (git is given its
+  // repository, so "no repository found" no longer means "git fails"). Any other case reads it as unknown, as before #373.
+  const HARMLESS_GIT_OPTS = new Set(['--no-pager', '-P', '--no-optional-locks', '--no-replace-objects', '--literal-pathspecs', '--no-literal-pathspecs']);
+  const soleToplevel = (c) => {
+    if (c.chdir !== undefined) return false;
+    let dirOpts = 0;
+    const args = c.argv.slice(1);
+    for (let i = 0; i < args.length && args[i].startsWith('-'); i++) {
+      if (args[i] === '-C') { dirOpts++; i++; } else if (!HARMLESS_GIT_OPTS.has(args[i])) return false;
+    }
+    return dirOpts === 1;
+  };
   const dirsOf = (c) => {
     let cur = withReal(narrowDirs.get(c) ?? dirs);
     let unknown = false;
     const apply = (v, tool = '') => {
       const tl = tool === 'git' ? TOPLEVEL_WORD.exec(v) : null;
       if (tl) {
-        const to = toplevelDirs(c, cur, tl[1]);
+        const to = soleToplevel(c) ? toplevelDirs(c, cur, tl[1]) : null;
         if (to === null || to.length > 32) unknown = true; else cur = withReal(to);
         return;
       }
