@@ -3068,8 +3068,10 @@ function evalString(str, startDir, ctx, level, child = false) {
     trackers = trackers.filter((x) => {
       if (!x.up.every((e, k) => c.up[k] === e)) return false; // (its level has ended: the rule of that level took over)
       const deeper = c.up.length > x.up.length;
-      const op = deeper ? c.up[x.up.length].sep : c.sep;
-      if (op === '&&' || op === '|') return true; // (a later stage of a pipeline belongs to the item whose operator was settled at its first stage)
+      const own = deeper ? c.up[x.up.length] : c;
+      // (#352 R11-F2: a later stage of a pipeline takes the operator before the pipeline's FIRST stage (lead): that stage may not have come out before this one)
+      const op = own.sep === '|' ? (own.lead ?? ';') : own.sep;
+      if (op === '&&') return true;
       if (op === '||' && !deeper && ['exit', 'return'].includes(c.argv[0]) && !c.pipe && !c.bg) return true;
       if (op === '||' || x.cond) forget(x);
       return false;

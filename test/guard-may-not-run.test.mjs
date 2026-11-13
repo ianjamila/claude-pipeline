@@ -274,7 +274,7 @@ test('#352 R11-F1: a cd in a pipeline stage followed by a ( ) / (( )) stage is t
 test('#352 R11-F2: the operator before a pipeline reaches every later stage, the levels they open included', () => {
   denies('an empty group stage, then the push', `false && cd /work/other2; { } | ${SHIP}`);
   denies('an empty group stage, then a subshell push', `false && cd /work/other2; { } | (${SHIP})`);
-  denies('a heredoc stage, then a backtick push', `false && cd /work/other2; cat <<EOF | echo \`${SHIP}\`\nx\nEOF`);
+  ANY_DENY('a heredoc stage, then a backtick push (refused by R11-F3 as well)', `false && cd /work/other2; cat <<EOF | echo \`${SHIP}\`\nx\nEOF`);
   denies('a heredoc stage, then a $( ) push', `false && cd /work/other2; cat <<EOF | echo $(${SHIP})\nx\nEOF`);
   denies('after ||', `true || cd /work/other2; { } | ${SHIP}`);
   allows('twin: the cd before a pipeline of simple stages', `cd /work/other2 && cat | echo \`${SHIP}\``);
