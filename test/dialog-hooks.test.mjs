@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { approveDialogHooks, checkDialogHooks, dialogHandlers, dialogHooksFile, hookCheck, matcherMatchesDialog, resolveCommand } from '../pipeline/hooks/lib/dialog-hooks.mjs';
+import { approveDialogHooks, checkDialogHooks, commandTarget, dialogHandlers, dialogHooksFile, hookCheck, matcherMatchesDialog, resolveCommand, tilde } from '../pipeline/hooks/lib/dialog-hooks.mjs';
 import { run } from '../pipeline/commands/owner-go.mjs';
 
 const ADMIN = { ['PIPELINE_' + 'ADMIN']: '1' }; // (the owner's switch, built here so this file does not itself look like a script that sets it)
@@ -451,4 +451,53 @@ test('approveDialogHooks refuses inside Claude Code in the function itself (#273
   assert.notEqual(c.refused, true);
   assert.equal(c.ok, true, c.reason);
   assert.equal(existsSync(dialogHooksFile(w.home)), true);
+});
+
+// ---- Windows path forms, proven on any machine through the `platform` option (the Windows CI job runs the temp-folder tests above for real) ----
+
+const WIN_HOME = 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\dialog-hooks-x';
+const WIN_SCRIPT = `${WIN_HOME}\\.claude\\hooks\\notify.mjs`;
+const win = (cmd, over = {}) => commandTarget(cmd, { home: WIN_HOME, platform: 'win32', ...over });
+
+test('windows: a backslash path, a forward-slash path, a quoted path and a ~ / $HOME path all resolve to the same normalised script', () => {
+  for (const cmd of [
+    `node ${WIN_SCRIPT}`,
+    `node "${WIN_SCRIPT}" --flag=1`,
+    `node ${WIN_SCRIPT.replaceAll('\\', '/')}`,
+    `${WIN_SCRIPT}`,
+    'node ~/.claude/hooks/notify.mjs',
+    'node $HOME/.claude/hooks/notify.mjs',
+    'node "${HOME}/.claude/hooks/notify.mjs"',
+    `node 'C:/Users/RUNNER~1/AppData/Local/Temp/dialog-hooks-x/.claude/hooks/notify.mjs'`,
+  ]) assert.equal(win(cmd), WIN_SCRIPT, cmd);
+  assert.equal(win('node ${CLAUDE_PLUGIN_ROOT}\\hooks\\a.mjs', { pluginRoot: 'D:\\plugins\\p' }), 'D:\\plugins\\p\\hooks\\a.mjs');
+  assert.equal(win('node \\\\server\\share\\hooks\\a.mjs'), '\\\\server\\share\\hooks\\a.mjs');
+});
+
+test('windows: everything ambiguous stays unresolvable (rooted or drive-relative paths, relative paths, shell syntax, interpreters, escapes in a double quote)', () => {
+  for (const cmd of [
+    'node \\hooks\\a.mjs', 'node C:hooks\\a.mjs', 'node .\\hooks\\a.mjs', 'node hooks\\a.mjs', 'node ..\\a.mjs',
+    `node ${WIN_SCRIPT} | more`, `node ${WIN_SCRIPT} & echo`, `node ${WIN_SCRIPT}; echo`, `node $(echo ${WIN_SCRIPT})`, 'node -e "1"', 'node', 'npx tool',
+    'C:\\Windows\\System32\\cmd.exe', '"C:\\Program Files\\nodejs\\node.exe" x.mjs', 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
+    `node "${WIN_HOME}\\$X\\a.mjs"`, `node "${WIN_HOME}\\\`x\\a.mjs"`, 'node "C:\\unterminated',
+  ]) assert.equal(win(cmd), null, cmd);
+});
+
+test('windows: a backslash is still an escape (refused) away from Windows, and a drive-letter path is not absolute there', () => {
+  for (const platform of ['linux', 'darwin']) {
+    assert.equal(commandTarget(`node ${WIN_SCRIPT}`, { home: '/h', platform }), null, platform);
+    assert.equal(commandTarget('node C:/x/a.mjs', { home: '/h', platform }), null, platform);
+    assert.equal(commandTarget('node /x/a.mjs', { home: '/h', platform }), '/x/a.mjs');
+  }
+});
+
+test('windows: the display shortens the home to ~/ with forward slashes (case and separator alike); a path outside the home is shown as is', () => {
+  assert.equal(tilde(WIN_SCRIPT, WIN_HOME, 'win32'), '~/.claude/hooks/notify.mjs');
+  assert.equal(tilde(WIN_SCRIPT.toLowerCase(), WIN_HOME, 'win32'), '~/.claude/hooks/notify.mjs');
+  assert.equal(tilde(WIN_SCRIPT.replaceAll('\\', '/'), `${WIN_HOME}\\`, 'win32'), '~/.claude/hooks/notify.mjs');
+  assert.equal(tilde(WIN_HOME, WIN_HOME, 'win32'), '~');
+  assert.equal(tilde(`${WIN_HOME}-other\\a.mjs`, WIN_HOME, 'win32'), `${WIN_HOME}-other\\a.mjs`, 'a sibling folder with the same prefix is not inside the home');
+  assert.equal(tilde('D:\\elsewhere\\a.mjs', WIN_HOME, 'win32'), 'D:\\elsewhere\\a.mjs');
+  assert.equal(tilde('/home/me/.claude/a.mjs', '/home/me', 'linux'), '~/.claude/a.mjs');
+  assert.equal(tilde('/home/me2/a.mjs', '/home/me', 'linux'), '/home/me2/a.mjs');
 });

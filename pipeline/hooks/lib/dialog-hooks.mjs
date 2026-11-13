@@ -24,7 +24,7 @@ const DIALOG_EVENTS = Object.freeze(['PreToolUse', 'PermissionRequest']);
 const OTHER_EVENTS = Object.freeze(['PostToolUse', 'PostToolUseFailure', 'Stop', 'SubagentStop', 'SessionStart', 'SessionEnd', 'UserPromptSubmit', 'Notification', 'PreCompact', 'PostCompact']);
 const INTERPRETERS = Object.freeze(['node', 'sh', 'bash', 'zsh']);
 // A bare path whose file is one of these is not "the script" (the real script is an argument we do not hash): unresolvable.
-const NOT_A_SCRIPT = /^(?:node|nodejs|sh|bash|zsh|dash|fish|env|python[0-9.]*|perl|ruby|deno|bun|npx|npm|pnpm|yarn|osascript|php)$/;
+const NOT_A_SCRIPT = /^(?:node|nodejs|sh|bash|zsh|dash|fish|env|python[0-9.]*|perl|ruby|deno|bun|npx|npm|pnpm|yarn|osascript|php|cmd|powershell|pwsh)(?:\.exe|\.cmd|\.bat)?$/i;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const HOME_MARK = '\u0001HOME\u0001'; // stands for the home folder while a command is split into words
 const SHELL_CHARS = '|&;<>()`\\*?[]{}!#$';
@@ -90,8 +90,15 @@ export function matcherMatchesDialog(matcher, tool = DIALOG_TOOL) {
   }
 }
 
+// (Windows) A hook command written for Windows holds backslash paths (`node C:\Users\me\.claude\hooks\x.mjs`). On win32 a backslash is a path separator, not an escape, so words() keeps it; on any other platform it stays
+// an escape and is refused. Only a drive-letter or UNC path counts as absolute there (a rooted `\x` or a drive-relative `C:x` is ambiguous: refused).
+const isWin = (platform) => platform === 'win32';
+const pathOf = (platform) => (isWin(platform) ? path.win32 : path);
+const isAbsoluteOn = (p, platform) => (isWin(platform) ? /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]|\/\/[^\\/])/.test(p) && path.win32.isAbsolute(p) : path.isAbsolute(p));
+
 // Words of a simple command line: whitespace separates, '...' and "..." group. Anything a shell would interpret (pipes, redirects, substitutions, globs, escapes, variables other than a leading HOME) -> null.
-function words(text) {
+function words(text, platform = process.platform) {
+  const shellChars = isWin(platform) ? SHELL_CHARS.replace('\\', '') : SHELL_CHARS;
   const out = [];
   let cur = '';
   let has = false;
@@ -101,7 +108,7 @@ function words(text) {
     if (quote === "'") { if (c === "'") quote = null; else cur += c; continue; }
     if (quote === '"') {
       if (c === '"') quote = null;
-      else if (c === '$' || c === '`' || c === '\\') return null;
+      else if (c === '$' || c === '`' || (c === '\\' && !isWin(platform))) return null;
       else cur += c;
       continue;
     }
@@ -111,7 +118,7 @@ function words(text) {
       if (has) { out.push(cur); cur = ''; has = false; }
       continue;
     }
-    if (SHELL_CHARS.includes(c)) return null;
+    if (shellChars.includes(c)) return null;
     cur += c;
     has = true;
   }
@@ -122,18 +129,27 @@ function words(text) {
 
 // The one script a hook command runs: `node|sh|bash|zsh <abs path> [args]` or `<abs path> [args]`, with a leading ~ / $HOME / ${HOME} expanded. -> the path, or null (unresolvable: sh -c, npx, inline code,
 // pipes, env prefixes, a relative path, a missing file, an interpreter named as the script). `pluginRoot` expands ${CLAUDE_PLUGIN_ROOT} for a plugin's hooks.json.
-export function resolveCommand(command, { home, pluginRoot = null } = {}) {
+export function resolveCommand(command, opts = {}) {
+  const target = commandTarget(command, opts);
+  return target !== null && isFile(target) ? target : null;
+}
+
+// resolveCommand without the look at the file: the script path the command names, or null. (Pure, so the Windows forms can be tested on any machine through `platform`.)
+export function commandTarget(command, { home, pluginRoot = null, platform = process.platform } = {}) {
   if (typeof command !== 'string' || command.trim() === '') return null;
   let text = command.trim();
   if (pluginRoot) text = text.replace(/\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g, () => pluginRoot);
   text = text.replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, () => HOME_MARK).replace(/(^|[\s"'])~(?=\/)/g, (_m, lead) => lead + HOME_MARK);
-  const w = words(text); // (a $ left after the expansions above is not a home reference: words() refuses it)
-  return scriptOf(w, home);
+  const w = words(text, platform); // (a $ left after the expansions above is not a home reference: words() refuses it)
+  return scriptTarget(w, home, platform);
 }
 
-// The script a list of words runs (see resolveCommand), or null.
-function scriptOf(w, home) {
+const isFile = (p) => { try { return statSync(p).isFile(); } catch { return false; } };
+
+// The script path a list of words names (see resolveCommand), or null; the file itself is not looked at. A Windows path is normalised (one separator form, so `~/x` + a backslash home gives the same string as path.join).
+export function scriptTarget(w, home, platform = process.platform) {
   if (!w || w.length === 0) return null;
+  const P = pathOf(platform);
   const real = (s) => s.replaceAll(HOME_MARK, home);
   let target;
   if (INTERPRETERS.includes(w[0])) {
@@ -141,30 +157,33 @@ function scriptOf(w, home) {
     target = real(w[1]);
   } else {
     target = real(w[0]);
-    if (NOT_A_SCRIPT.test(path.basename(target))) return null;
+    if (NOT_A_SCRIPT.test(P.basename(target))) return null;
   }
-  if (!path.isAbsolute(target)) return null;
-  try {
-    if (!statSync(target).isFile()) return null;
-  } catch {
-    return null;
-  }
-  return target;
+  if (!isAbsoluteOn(target, platform)) return null;
+  return isWin(platform) ? path.win32.normalize(target) : target;
+}
+
+// The script a list of words runs (see resolveCommand), or null.
+function scriptOf(w, home, platform = process.platform) {
+  const target = scriptTarget(w, home, platform);
+  return target !== null && isFile(target) ? target : null;
 }
 
 // (R1-F3) A handler of the form { command, args: [...] }: the command must be an interpreter (a bare name, or an absolute path of one) and args[0] the ONE script it runs, ahead of that script's own arguments.
 // Any other non-empty args shape (a program with arguments, a non-string argument, a command that already holds spaces) resolves to nothing: its arguments are code we do not hash.
-function resolveHandler(h, { home, pluginRoot }) {
+function resolveHandler(h, { home, pluginRoot, platform = process.platform }) {
   const args = h.args;
-  if (args === undefined || args === null || (Array.isArray(args) && args.length === 0)) return resolveCommand(h.command, { home, pluginRoot });
+  if (args === undefined || args === null || (Array.isArray(args) && args.length === 0)) return resolveCommand(h.command, { home, pluginRoot, platform });
   if (!Array.isArray(args) || !args.every((a) => typeof a === 'string' && a !== '') || typeof h.command !== 'string') return null;
   const cmd = h.command.trim();
-  if (!(INTERPRETERS.includes(cmd) || (path.isAbsolute(cmd) && INTERPRETERS.includes(path.basename(cmd)) && !/\s/.test(cmd)))) return null;
+  const P = pathOf(platform);
+  const interpreter = (name) => INTERPRETERS.includes(isWin(platform) ? name.replace(/\.exe$/i, '').toLowerCase() : name);
+  if (!(INTERPRETERS.includes(cmd) || (isAbsoluteOn(cmd, platform) && interpreter(P.basename(cmd)) && !/\s/.test(cmd)))) return null;
   // (R2-F8) an argument vector is not shell-expanded: `~` and $HOME in args[0] would reach the interpreter as literal text (a path relative to the hook's working folder), so only a literal path counts.
   if (/^~(?:\/|$)|\$\{?HOME\b/.test(args[0])) return null;
   const expanded = pluginRoot ? args[0].replace(/\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g, () => pluginRoot) : args[0];
   if (/[$`]/.test(expanded)) return null;
-  return scriptOf(['node', expanded], home);
+  return scriptOf(['node', expanded], home, platform);
 }
 
 // ---- collecting the handlers ----------------------------------------------------------------------------------------------------------
@@ -403,7 +422,15 @@ export function readApprovedList({ home = accountHome() } = {}) {
 
 // ---- the check --------------------------------------------------------------------------------------------------------------------------
 
-const tilde = (p, home) => (typeof p === 'string' && home && (p === home || p.startsWith(`${home}/`)) ? `~${p.slice(home.length)}` : p);
+// A path shown to the owner: the home folder as `~` and forward slashes (on Windows both separators and letter case are alike, so the prefix test ignores them).
+export function tilde(p, home, platform = process.platform) {
+  if (typeof p !== 'string' || !home) return p;
+  if (!isWin(platform)) return p === home || p.startsWith(`${home}/`) ? `~${p.slice(home.length)}` : p;
+  const fwd = (x) => x.replaceAll('\\', '/');
+  const h = fwd(home).replace(/\/+$/, '');
+  const q = fwd(p);
+  return q.toLowerCase() === h.toLowerCase() || q.toLowerCase().startsWith(`${h.toLowerCase()}/`) ? `~${q.slice(h.length)}` : p;
+}
 const matcherText = (h) => (h.matcher === '' ? '*' : h.matcher);
 const describe = (h, home) => `${h.scriptPath ? tilde(h.scriptPath, home) : h.command} (${h.event} ${matcherText(h)})`;
 
