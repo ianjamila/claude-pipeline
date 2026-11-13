@@ -16,13 +16,13 @@ import { fingerprint, largeBinaryNote, resolutionBaseNote, resolutionSection } f
 import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
 import { baseConfigAt, loadConfig } from '../lib/config.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
-import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, expectationOf, fixRoundCandidate } from '../lib/fix-verify.mjs';
-import { assessRisk, reviewLane, riskHits } from '../lib/risk.mjs';
+import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, countedOrdinal, expectationOf, fixRoundCandidate, fixRoundScope } from '../lib/fix-verify.mjs';
+import { assessRisk, reviewLane, riskHits, threatModelsFor, trustedBase } from '../lib/risk.mjs';
 import { claudeCodeStatus } from '../lib/claude-code-version.mjs';
 import { floorBypass, floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
 import { seamFlag } from '../lib/proc.mjs';
-import { saveState, updateItems } from '../lib/state.mjs';
+import { STATE_VERSION_OUT_OF_MODEL, saveState, stateNeedsOutOfModelVersion, updateItems, withStateVersion } from '../lib/state.mjs';
 import { extractJsonBlock, findSubagentTranscript, proveModel } from '../lib/transcript.mjs';
 import {
   MALFUNCTION_CAUSES, applyRulings, arbiterNeeded, fableFindingItems, finalizeWithoutArbiter, isOwnerRuled, isProtectedFinal, needsHumanCause, provenNotStale, reuseRuled,
@@ -44,6 +44,10 @@ export const meta = {
     '    round\'s fork point (a PR cannot loosen its own rule; an unreadable base config is full); its input lists those ACCEPT items and asks Fable to verify each fix and the round diff. Everything else is',
     '    `full` / `high` / `arbiter` (the whole review job). Fable still runs on every Fable round either way. The choice is stored on the round (arbiter.brief / briefReason / effort / agent) and `apply` proves against the',
     '    stored one; running `needed` again recomputes and re-stores it (the digest and tag change with the brief), except that a brief forced by --full is kept (below)',
+    '  late lane (review.fix_verify_after_round N set in the working-tree, fork-point AND trusted configs): a counted round above N may get fix-verify although a path is sensitive (risk.high_risk_paths / review.arbiter_always_paths) or the risk is',
+    '    medium/high for paths alone; never with a hard-stop hit (only P-path is discounted besides risk.ignore_hard_stop_rules), a size or report-only driver, or a fix scope over review.fix_round_max_lines / with a new non-test source file (lib/fix-verify.mjs#fixRoundScope, computed live)',
+    '  threat model (review.threat_models, read from the TRUSTED default-branch config pinned as round.trustedConfigSha): a review input for a diff touching a model\'s paths starts with a "Threat model" section that stands alone; an out-of-model',
+    '    security finding is then ruled FOLLOW-UP with scope "out-of-model" and needs no human (category security only, a file that resolves to one diff entry wholly inside the model); the round stores arbiter.threatModels',
     '  briefReason (mode review): why that brief, e.g. `fix round: round 1 accepted 1 item(s) ...`, `synthetic review base ...`, `the round\'s own range is medium risk ...`, or the message of an error caught while assessing the range',
     '  --full: force the full brief (`full` / `high` / `arbiter`, briefReason `forced by --full`) on a Fable review round `needed` would class as fix-verify; the stored brief and the digest change with it. For when `arbiter-fix` cannot be started or the owner wants a full review. It sticks: the round stores arbiter.forcedFull, also when a stale terminal stops the call, so a later plain `needed` (the retry after a restart, or after an unproven or malformed pass) keeps the full brief, briefReason still `forced by --full`, until a pass is proven. The stop drops the stored input (fix-verify brief, digest, tag), so an earlier arbiter-fix pass cannot prove the round and the retry writes a fresh full input; `apply` also refuses (exit 1 forced-full-pending) a round that stores forcedFull beside a fix-verify brief',
     '  mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied',
@@ -229,6 +233,8 @@ function reviewSection(state, round, diff, fix = null) {
       `Brief: FIX-VERIFY. Round ${fix.round} (the previous counted round) accepted the items under "Fixes to verify" below; the diff above is what changed in round ${round.n}, mostly to fix them.`,
       'Verify each fix is correct and complete. Then look for bugs or regressions the round diff introduces, and raise any finding in the round diff as usual (same JSON, `findings`).',
       'Do not re-review code outside the round diff unless a fix depends on it.',
+      'Your own review is fix-specific: verify each listed fix, then look for regressions in the round diff; raise nothing about code outside the round diff. If the round adds a mechanism none of the accepted items asked for (a new option, helper module or code path), raise ONE finding, bucket SUGGESTION, category design.',
+      ...(fix.scope ? [`Fix scope: ${fix.scope.nonTestLines} non-test added line(s) (limit ${fix.scope.limit}), ${fix.scope.newFiles.length} new non-test file(s), ${fix.scope.newExports} new export(s)${fix.scope.flagged ? ' - FLAGGED' : ''}.`] : []),
     );
   }
   // File names, reasons and earlier titles come from the change author or a model that read the change: data in a fence
@@ -266,6 +272,71 @@ function reviewSection(state, round, diff, fix = null) {
   return out.join('\n');
 }
 
+// ---- the threat model of the input (review.threat_models, #374) ------------------------------------------------------------------------------------------------------
+
+// The trusted config of a round (F7): the commit codex-review pinned as round.trustedConfigSha (null = pinned unavailable); a round that has none (a Fable-refresh round, one written before
+// this existed) gets it computed ONCE here from the default branch's fork point and pinned by the caller, never recomputed on a retry. A trusted config that names another default_branch
+// than the working-tree one is unavailable (risk.mjs#trustedBase `mismatch`).
+// -> { sha: string|null, config: object|null, pin: boolean, problem?: string }
+async function trustedAnchor(round, root) {
+  let sha;
+  let pin = false;
+  if (Object.hasOwn(round, 'trustedConfigSha')) sha = round.trustedConfigSha;
+  else {
+    pin = true;
+    try {
+      const loaded = await loadConfig(root);
+      const tb = loaded.ok ? trustedBase({ root, head: round.toHead, config: loaded.config }) : null;
+      sha = tb !== null && tb.trusted.ok && tb.mismatch === null ? tb.trustedFork : null;
+    } catch {
+      sha = null;
+    }
+  }
+  if (typeof sha !== 'string' || sha === '') return { sha: null, config: null, pin, problem: 'the trusted config is unavailable' };
+  const read = baseConfigAt(sha, root);
+  return read.ok ? { sha, config: read.config, pin } : { sha, config: null, pin, problem: read.reason };
+}
+
+// The section is owner-committed config (never PR content), so it sits outside the untrusted-data fences. It STANDS ALONE: it says what it overrides in the agent's own
+// instructions and carries the `scope` instruction, so a stale agent file cannot undo it (the agent files only mirror it).
+export function threatModelSection(models, { changedInPr = false } = {}) {
+  const out = ['# Threat model (from .claude/pipeline.yml on the base branch)', ''];
+  if (models.length === 0) {
+    out.push('No threat model could be read.', '');
+    return out;
+  }
+  out.push(
+    'This section stands alone. For a security item or finding on a file matching one of the models below it OVERRIDES "Review as an attacker" and "prefer ACCEPT" in your instructions: judge it within the model stated here.',
+    'This model governs findings on files matching its paths only. Every other file is reviewed exactly as in your instructions (bugs and broken behaviour ACCEPT as usual).',
+    'A security finding (category `security`) on a matching file that lies OUTSIDE the stated model is not merge-blocking: rule it FOLLOW-UP (bucket SUGGESTION for your own findings) and add `"scope": "out-of-model"` to that ruling or finding object; never ACCEPT or REJECT on that ground. Omit `scope` in every other case.',
+    'A file that matches several models is outside them only when it is outside every one listed for it. Bugs, broken behaviour, data loss and auth or permission problems are not covered by this rule.',
+  );
+  if (changedInPr) out.push("This PR edits the threat model; the base branch's applies.");
+  for (const m of models) out.push('', `## Model ${m.name}`, `Paths: ${m.paths.join(', ')}`, '', String(m.text).trim());
+  out.push('');
+  return out;
+}
+
+// What the review input and `apply` need from the threat models: { section, names, models, sha, pin } (section null = none to show).
+async function threatModelContext(round, files, items, root) {
+  const anchor = await trustedAnchor(round, root);
+  const touched = [...(Array.isArray(files) ? files : []), ...items.filter((i) => typeof i.file === 'string' && i.file !== '').map((i) => ({ path: i.file }))];
+  const base = { sha: anchor.sha, pin: anchor.pin, config: anchor.config, names: [], models: [], section: null };
+  let working = null;
+  try {
+    const loaded = await loadConfig(root);
+    working = loaded.ok ? loaded.config : null;
+  } catch { /* unreadable: no comparison */ }
+  if (anchor.config === null) {
+    // No trusted config: no model applies. Said only when the working-tree config would have given one.
+    return working !== null && threatModelsFor(touched, working).length > 0 ? { ...base, section: threatModelSection([], {}) } : base;
+  }
+  const models = threatModelsFor(touched, anchor.config);
+  if (models.length === 0) return base;
+  const changedInPr = working !== null && JSON.stringify(working.review?.threat_models ?? []) !== JSON.stringify(anchor.config.review?.threat_models ?? []);
+  return { ...base, names: models.map((m) => m.name), models, section: threatModelSection(models, { changedInPr }) };
+}
+
 // The brief of a Fable review round: `fix-verify` only when it is clearly a fix round (lib/fix-verify.mjs#fixRoundCandidate: round scope, a plain
 // previous-round base, an ACCEPT in the previous counted round) AND the round's own range is clean under BOTH the working-tree config and the config
 // COMMITTED at the base side (round.forkPoint; a PR must not loosen its own rule, as lib/finalgate.mjs does for merge.behind_base): no hard-stop hit, no
@@ -274,32 +345,51 @@ function reviewSection(state, round, diff, fix = null) {
 // -> { expectation, fix, reason }: `reason` says why (also the message of an error that was caught on the way), printed and stored as briefReason.
 const msgOf = (err) => String(err?.message ?? err).split('\n')[0];
 
-async function chooseBrief(state, round, diff, root, { forceFull = false } = {}) {
+async function chooseBrief(state, round, diff, root, { forceFull = false, trusted = null, files: givenFiles } = {}) {
   const full = (reason) => ({ expectation: BRIEFS[BRIEF_FULL], fix: null, reason });
   if (forceFull) return full('forced by --full');
   const candidate = fixRoundCandidate(state, round, { scope: diff.scope });
   if (!candidate.ok) return full(candidate.reason);
+  let scope = null;
+  let lateReason = null;
   try {
     const loaded = await loadConfig(root);
     if (!loaded.ok) return full(`config unreadable: ${loaded.errors?.[0] ?? 'unknown'}`);
     const base = baseConfigAt(round.forkPoint, root);
     if (!base.ok) return full(base.reason);
-    // The same config twice is checked once (the usual case: nobody touched pipeline.yml).
-    const same = JSON.stringify(loaded.config) === JSON.stringify(base.config);
-    const configs = same ? [['working-tree and base', loaded.config]] : [['working-tree', loaded.config], ['base', base.config]];
-    const files = diffFiles(diff.from, round.toHead, { cwd: root });
+    // The same config twice is checked once (the usual case: nobody touched pipeline.yml). The trusted default-branch config joins when it is readable.
+    const configs = [];
+    for (const [label, config] of [['working-tree', loaded.config], ['base', base.config], ...(trusted === null ? [] : [['trusted', trusted]])]) {
+      const seen = configs.find((c) => JSON.stringify(c[1]) === JSON.stringify(config));
+      if (seen) seen[0] += ` and ${label}`;
+      else configs.push([label, config]);
+    }
+    const files = givenFiles ?? diffFiles(diff.from, round.toHead, { cwd: root });
+    // The late lane (review.fix_verify_after_round): every config sets it (the trusted one must be readable) and the counted ordinal is above the largest.
+    const afters = [loaded.config, base.config, ...(trusted === null ? [] : [trusted])].map((c) => c.review?.fix_verify_after_round);
+    const ordinal = countedOrdinal(state, round.n);
+    const late = trusted !== null && afters.every((a) => Number.isInteger(a)) && ordinal > Math.max(...afters);
+    scope = fixRoundScope({ files, configs: configs.map((c) => c[1]) });
+    if (late && scope.flagged) return full(`late fix round: the fix scope is flagged (${scope.reasons.join('; ')})`);
     for (const [label, config] of configs) {
       const hits = await collectHardStops({ base: diff.from, head: round.toHead, cwd: root, config });
       // risk.ignore_hard_stop_rules (P-path / R4-config only) lets a repo whose every file is a P-path hit still get the fix-verify brief; every other hit forces the full one.
-      if (riskHits(hits, config).length > 0) return full(`hard-stop hit in the round range (${label} config)`);
-      if (reviewLane({ level: 'low', files, config }).sensitivePaths.length > 0) return full(`sensitive path in the round range (${label} config)`);
-      const risk = assessRisk({ files, hits, config });
-      if (risk.level !== 'low') return full(`the round's own range is ${risk.level} risk (${label} config): ${risk.reasons.join('; ')}`);
+      // The late lane also discounts P-path hits without that list (R7: removed before assessRisk, so they raise no hard-stop driver); R4-pipeline, SQL, auth ... still force full.
+      const lateHits = hits.filter((h) => h?.rule !== 'P-path');
+      if ((late ? riskHits(lateHits, config) : riskHits(hits, config)).length > 0) return full(`hard-stop hit in the round range (${label} config)`);
+      if (!late && reviewLane({ level: 'low', files, config }).sensitivePaths.length > 0) return full(`sensitive path in the round range (${label} config)`);
+      const risk = assessRisk({ files, hits: late ? lateHits : hits, config });
+      const pathOnly = late && !risk.drivers.hardStop && !risk.drivers.advisory && !risk.drivers.size;
+      if (risk.level !== 'low' && !pathOnly) return full(`the round's own range is ${risk.level} risk (${label} config): ${risk.reasons.join('; ')}`);
     }
+    if (late) lateReason = `late fix round: counted round ${ordinal} > review.fix_verify_after_round ${Math.max(...afters)}; sensitive paths allowed`;
   } catch (err) {
     return full(`could not assess the round range: ${msgOf(err)}`);
   }
-  return { expectation: BRIEFS[BRIEF_FIX_VERIFY], fix: candidate.previous, reason: `fix round: round ${candidate.previous.round} accepted ${candidate.previous.accepted.length} item(s) and the round's own range is clean and low risk` };
+  return {
+    expectation: BRIEFS[BRIEF_FIX_VERIFY], fix: { ...candidate.previous, scope },
+    reason: lateReason ?? `fix round: round ${candidate.previous.round} accepted ${candidate.previous.accepted.length} item(s) and the round's own range is clean and low risk`,
+  };
 }
 
 async function neededLocked(values, n, root, ctx) {
@@ -358,11 +448,17 @@ async function neededLocked(values, n, root, ctx) {
   if (!review && items.length === 0) return { exitCode: EXIT.OK, output: { needed: false, items: [], mode } };
 
   const diff = review ? writeFableDiff(state, round, root, readReviewGate({ env: ctx.env ?? process.env })) : null;
-  const { expectation, fix, reason: briefReason } = review ? await chooseBrief(state, round, diff, root, { forceFull: forcedFull }) : { expectation: BRIEFS[BRIEF_FULL], fix: null, reason: null };
+  // The files the Fable diff covers (shared by the threat-model lookup and chooseBrief); null when git cannot list them (no model is shown then, chooseBrief says why).
+  let diffFileList = null;
+  if (review) {
+    try { diffFileList = diffFiles(diff.from, round.toHead, { cwd: root }); } catch { /* chooseBrief reports it */ }
+  }
+  const tm = review ? await threatModelContext(round, diffFileList, items, root) : null;
+  const { expectation, fix, reason: briefReason } = review ? await chooseBrief(state, round, diff, root, { forceFull: forcedFull, trusted: tm.config, ...(diffFileList === null ? {} : { files: diffFileList }) }) : { expectation: BRIEFS[BRIEF_FULL], fix: null, reason: null };
   const itemsPart = items.length > 0
     ? [`# Items to rule on (${items.length})`, '', ...items.map((item) => itemSection(item, root))]
     : ['# Items to rule on (0)', '', '_Codex raised nothing left to rule on in this round: your own review is the whole job._', ''];
-  const body = [...(review ? [reviewSection(state, round, diff, fix), ''] : []), ...itemsPart].join('\n');
+  const body = [...(review ? [...(tm.section ? [tm.section.join('\n')] : []), reviewSection(state, round, diff, fix), ''] : []), ...itemsPart].join('\n');
   const digest = sha256(body);
   const digest8 = digest.slice(0, 8);
   const tag = `pipeline-arbiter R${n} ${digest8}`;
@@ -371,8 +467,8 @@ async function neededLocked(values, n, root, ctx) {
   const ids = items.map((i) => i.id);
   const kept = round.arbiter?.failure;
   // The brief rides with a Fable review round only: a dispute round (and any round stored before this existed) has none, which `apply` reads as full.
-  const stored = { inputDigest: digest, items: ids, tag, mode, ...(review ? { brief: expectation.brief, briefReason, effort: expectation.effort, agent: expectation.agent } : {}), ...(forcedFull ? { forcedFull: true } : {}), ...(kept ? { failure: kept } : {}), ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}) };
-  saveState(root, patchRound(state, n, { arbiter: stored }));
+  const stored = { inputDigest: digest, items: ids, tag, mode, ...(review ? { brief: expectation.brief, briefReason, effort: expectation.effort, agent: expectation.agent } : {}), ...(forcedFull ? { forcedFull: true } : {}), ...(kept ? { failure: kept } : {}), ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}), ...(tm?.names.length > 0 ? { threatModels: tm.names, diffFrom: diff.from } : {}) };
+  saveState(root, patchRound(state, n, { arbiter: stored, ...(tm?.pin ? { trustedConfigSha: tm.sha } : {}) }));
   const promptHeader = `ROUND: ${n}\nINPUT-DIGEST: ${digest}`;
   return {
     exitCode: EXIT.OK,
@@ -477,6 +573,14 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
   }
   // What the round's STORED brief expects of the proof (never recomputed here): the agent, and the effort it ran at. A round stored without a brief is full.
   const expectation = expectationOf(stored);
+  // The threat models the input stated (apply recomputes nothing: the trusted config is pinned by sha, the names were stored by `needed`).
+  let tmModels = [];
+  let tmFiles = null;
+  if (Array.isArray(stored.threatModels) && stored.threatModels.length > 0 && typeof round.trustedConfigSha === 'string') {
+    const read = baseConfigAt(round.trustedConfigSha, root);
+    if (read.ok) tmModels = (read.config.review?.threat_models ?? []).filter((m) => stored.threatModels.includes(m.name));
+    try { tmFiles = diffFiles(stored.diffFrom, round.toHead, { cwd: root }); } catch { /* no diff: no waiver */ }
+  }
   const expectEffort = askedEffort ?? acceptedEfforts(expectation);
   const tag = givenTag ?? stored.tag;
 
@@ -531,12 +635,12 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
       : { rulings: stored.items.map((id) => ({ id, ruling: null, confidence: 'low', reasoning: 'unverified' })) };
     // The floor alone failed a proof that was otherwise good: the items wait with the cause stale-model (restart, then rule again), not model-proof.
     const floorOnly = baseOk && judged.applies === true && judged.restartRequired === true && judged.unparseable.length === 0 && judged.unreadable !== true;
-    const ruled = applyRulings(round.items, applied, { proofOk, transcript: found.jsonlPath, ...(floorOnly ? { proofCause: 'stale-model' } : {}) });
+    const ruled = applyRulings(round.items, applied, { proofOk, transcript: found.jsonlPath, models: tmModels, diffFiles: tmFiles, ...(floorOnly ? { proofCause: 'stale-model' } : {}) });
     // Fable's own findings count only when proven; an unproven answer adds nothing (the round stays Fable-pending).
     // A finding an earlier round already settled (same fingerprint, bucket and category) takes that ruling from the cache,
     // like a repeated Codex item, so re-raising it does not start a fresh ACCEPT (the cache keeps its security exceptions).
     const fresh = proofOk && review
-      ? fableFindingItems(rulings.findings, n, { transcript: found.jsonlPath, fingerprintFor: fingerprintAt(round.toHead, state.currentContentHash, root) })
+      ? fableFindingItems(rulings.findings, n, { transcript: found.jsonlPath, fingerprintFor: fingerprintAt(round.toHead, state.currentContentHash, root), models: tmModels, diffFiles: tmFiles })
       : [];
     // Only a ruling at least as strong as this proven pass may stand in for it: an earlier Fable (arbiter) ruling or the
     // owner's word. A judge's REJECT or an earlier cache copy must never overrule what Fable just raised.
@@ -566,7 +670,9 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
     // A floor failure is recorded on the round (a zero-item Fable round has no item to carry it); a proven or otherwise-failed apply clears the old one.
     const { failure: _earlier, ...storedNow } = stored;
     const failure = !proofOk && judged.applies === true && typeof judged.error === 'string' ? failureOf(judged.error, floorAdviceFor(judged)) : null;
-    saveState(root, patchRound(updateItems(state, n, items), n, { arbiter: { ...storedNow, proofOk, transcript: found.jsonlPath, ...(failure ? { failure } : {}) }, modelProof }));
+    const nextState = patchRound(updateItems(state, n, items), n, { arbiter: { ...storedNow, proofOk, transcript: found.jsonlPath, ...(failure ? { failure } : {}) }, modelProof });
+    // Version 4 only when a final carries the out-of-model marker: an older CLI must not read a state whose unfiled FOLLOW-UP it would count as done (state.mjs).
+    saveState(root, stateNeedsOutOfModelVersion(nextState) ? withStateVersion(nextState, STATE_VERSION_OUT_OF_MODEL) : nextState);
 
     const byId = new Map(items.map((i) => [i.id, i]));
     return {
