@@ -1237,3 +1237,56 @@ test('R23-F4: the unclosed-subscript scan is one pass: a ~4000-char line of nest
   assert.ok(ms < 200, 'took ' + ms + ' ms');
   assert.equal(typeof r.truncated, 'boolean');
 });
+
+// #269 R24: the subscript check runs at every newline the lexer consumes (case-gap, array literal) and reads the line the LEXER ended, not a raw-text guess
+test('R24-B1 / R24-F1: a newline consumed by a case-pattern gap, a quoted string or an array literal after a subscript opener, or after a line ending in an escaped backslash / a comment ending in a backslash, is refused with a heredoc pending', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json';
+  const tail = '\n+$(' + cp + ')]=1\nE\ntrue\n';
+  const notRefused = [];
+  for (const c of [
+    "cat <<'E' >/dev/null; a[0; case x in " + tail, // R24-B1: the newline goes through caseGap (note the blank after `in`)
+    "cat <<'E' >/dev/null; a[0; case x in\n+$(" + cp + ')]=1\nE\ntrue\n',
+    "cat <<'E' >/dev/null; a[0 \"x\ny\"" + tail, // R24-F1a: a newline in a quote after the opener
+    "cat <<'E' >/dev/null; a[0 'x\ny'" + tail,
+    "a[0 \"x\ny\" <<'E'" + tail, // (same simple command)
+    "x=1 a[0 'x\ny' <<'E'" + tail,
+    "cat <<'E' >/dev/null; a[0 b=(x\ny)" + tail, // R24-F1a: a newline in an array literal after the opener
+    "a[0 b=(x\ny); cat <<'E' >/dev/null" + tail,
+    "a[0 b=(x\ny) <<'E'" + tail,
+    "echo x\\\\\na[0 <<'E'" + tail, // R24-F1b: the previous line ends in an escaped backslash (a real line end)
+    "echo x\\\\\na[0; cat <<'E' >/dev/null" + tail,
+    "# c\\\na[0 <<'E'" + tail, // R24-F1b: a comment ending in a backslash ends its line
+    "# c\\\na[0; cat <<'E' >/dev/null" + tail,
+    "echo hi # c\\\na[0; cat <<'E' >/dev/null" + tail,
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  // a real continuation still joins the lines; ordinary lines after the name are fine
+  for (const c of ["echo x\\\\\na[0]=1 <<'E'\nbody\nE\ntouch ran", "# c\\\necho hi <<'E'\nbody\nE\ntouch ran", "cat <<'E'; case x in \nbody\nE\n a) true;; esac"]) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R24-F2: many short lines ending in an escaped backslash, or comment lines ending in a backslash, parse in linear time (no per-newline walk back over the whole text)', () => {
+  for (const unit of ['ab\\\\\n', '# c\\\n']) {
+    const cmd = unit.repeat(40000) + 'true\n';
+    const { r, ms } = cpuTimed(() => simpleCommands(cmd));
+    assert.ok(ms < 1500, JSON.stringify(unit) + ' took ' + ms + ' ms');
+    assert.equal(typeof r.truncated, 'boolean');
+  }
+});
+
+test('R24-F3: the sticky refusal (an earlier line holds a `name[` the guard cannot prove closed) says so, and the advice fits it', async () => {
+  const { refusalAdvice } = await import('../pipeline/hooks/lib/shell-parse.mjs');
+  const r = simpleCommands("arr[$i]=1\ncat <<'E'\nbody\nE\ntouch ran");
+  assert.equal(r.truncated, true);
+  assert.match(r.refused, /earlier line/);
+  assert.match(r.refused, /name\[/);
+  assert.match(refusalAdvice(r.refused), /separate command|its own line/);
+  assert.doesNotMatch(refusalAdvice(r.refused), /before the command that opens the here-document/);
+  // the same-line refusal keeps its own text
+  const same = simpleCommands("cat <<'E' >/dev/null; a[0\n+1]=1\nE\ntrue\n");
+  assert.match(same.refused, /while a here-document is pending on the line/);
+});

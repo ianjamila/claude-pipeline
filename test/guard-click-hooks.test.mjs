@@ -1256,6 +1256,30 @@ test('R23: a declined ${…} in a case pattern, subscripts across line breaks, a
   assert.deepEqual(blocked, [], 'these R23 lines were refused');
 });
 
+test('R24: a subscript newline through a case-pattern gap, a quote or an array literal, or after an escaped-backslash line or a comment ending in a backslash, is refused', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json';
+  const tail = '\n+$(' + cp + ')]=1\nE\ntrue\n';
+  const failures = [];
+  for (const cmd of [
+    "cat <<'E' >/dev/null; a[0; case x in " + tail, // R24-B1
+    "cat <<'E' >/dev/null; a[0 \"x\ny\"" + tail, // R24-F1: a newline in a quote after the opener
+    "a[0 'x\ny' <<'E'" + tail,
+    "a[0 b=(x\ny); cat <<'E' >/dev/null" + tail, // an array literal
+    "echo x\\\\\na[0 <<'E'" + tail, // the previous line ends in an escaped backslash
+    "echo x\\\\\na[0; cat <<'E' >/dev/null" + tail,
+    "# c\\\na[0 <<'E'" + tail, // a comment ending in a backslash
+    "# c\\\na[0; cat <<'E' >/dev/null" + tail,
+  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  assert.deepEqual(failures, [], 'these R24 lines were not refused');
+  const blocked = [];
+  for (const cmd of [
+    "cat <<'E' > f; a[0]=1\nbody\nE\necho done",
+    "echo x\\\\\ncat <<'E'\nbody\nE\necho done",
+    "# c\\\ncat <<'E'\nbody\nE\necho done",
+  ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
+  assert.deepEqual(blocked, [], 'these R24 lines were refused');
+});
+
 // ---- #269 scan S1..S3: bypasses found by an automatic security scan; every fix fails closed (owner decision: false refusals over bypasses) ----------------------------------------------------
 
 test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] argument no longer hide a fed interpreter', () => {

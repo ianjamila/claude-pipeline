@@ -2101,6 +2101,8 @@ const REFUSED_FUNSUB = 'a `${ cmd; }` / `${|cmd;}` command substitution (bash 5.
 const REFUSED_PARAM = 'a `${…}` holding a command substitution (or a newline, a process substitution, `$\'…\'`, a backtick or a bare `{`) together with a `#`, a `<<`, a newline, a `case` or a stray `)` inside the braces: the shell reads all of it as one word and runs every substitution in it';
 // (#269 R22-F3, R22-F4) a newline inside an array literal / glob group, or inside the subscript of an assignment word (bash), while a here-document is pending: the shells read the body at a different newline than this lexer
 const REFUSED_HEREDOC_NL = 'a newline inside an array literal `NAME=( … )`, a glob group or an assignment subscript `NAME[ … ]=` while a here-document is pending on the line: the shell reads the body at that newline, not at the end of the line';
+// (#269 R24-F3) the sticky case: the newline of THIS line is no subscript's, but an earlier line holds a `name[` the scan cannot prove closed (it fails closed on `$`, quotes, backslashes, parentheses and long lines), and a here-document is opened later
+const REFUSED_HEREDOC_SUB = 'a here-document opened after an earlier line that holds an assignment-looking `name[` the guard cannot prove closed (bash reads such a subscript across newlines, and the guard fails closed on `$`, quotes, backslashes and parentheses inside it)';
 // The raw text of a command up to a newline: does it hold an assignment-looking word `name[` whose `]` is not plainly there (bash reads such a subscript across newlines)? Fail-closed: any quote, `$`, backtick,
 // backslash or parenthesis before the close counts as not closed, and so does a text too long to scan.
 const SUBSCRIPT_AT = /(?:^|[\s;&|()])[A-Za-z_][A-Za-z0-9_]*\+?\[/g;
@@ -2122,14 +2124,9 @@ const unclosedSubscript = (rawLine) => {
   }
   return false;
 };
-// (#269 R23-F2) where the logical line holding `at` begins: after the last newline that is not a continuation
-const logicalLineStart = (s, at) => {
-  let st = at;
-  while (st > 0 && !(s[st - 1] === '\n' && !(s[st - 2] === '\\' || (s[st - 2] === '\r' && s[st - 3] === '\\')))) st--;
-  return st;
-};
 // (#269 R19-F2) what to write instead, per refusal (the `$(cmd)` advice does not fit arithmetic that already holds one)
 export function refusalAdvice(reason) {
+  if (reason === REFUSED_HEREDOC_SUB) return 'run the earlier line that holds the `name[` as a separate command (one that is finished and closed before this one starts), or write the text to a file with the Write tool';
   if (reason === REFUSED_HEREDOC_NL) return 'finish the array assignment (or the subscript) on its own line before the command that opens the here-document, or write the text to a file with the Write tool';
   if (reason === REFUSED_PARAM) return 'compute the value first on its own line (`d=$(date)`) and keep `#`, `<<`, newlines and stray parentheses out of a `${…}` that holds a `$( )`: `echo ${x:-$d}`';
   return reason === REFUSED_ARITH
@@ -2146,6 +2143,8 @@ class Parser {
     this.i = 0;
     this.queue = []; // finished segments waiting for their heredoc bodies before they are interpreted
     this.hd = []; // heredocs whose bodies start after the current line
+    this.lineStart = 0; // (#269 R24-F1) where the logical line being lexed began: moved ONLY where the lexer itself ends a line (newline branch, caseGap, after readHeredocs), never by a backslash-newline continuation
+    this.subNl = false; // an earlier line of this text held a `name[` the scan could not prove closed (see nlCheck)
     this.log = []; // every segment interpreted by this parser, in order
     this.lastStage = []; // segments of the previous pipeline stage (a simple command, or a whole (...) / { ...; } group)
     this.braceStack = []; // log positions where standalone { groups opened
@@ -2350,6 +2349,25 @@ class Parser {
     this.lastDqDyn = dyn;
     this.lastDqSubs = subN === 0 ? 0 : subN === 1 && out === subText ? 1 : 2; // (0: none, 1: the text is exactly one substitution, 2: anything else)
     return out;
+  }
+
+  // (#269 R22-F4, R23-F2, R24-B1, R24-F1/F2) this.i is at a newline the lexer is about to consume (the ordinary newline branch, caseGap, a blank inside an array literal): bash reads an assignment subscript
+  // across it, through `;` `&` `|` `)`. Checks the text of the logical line (from this.lineStart, which holds only what the lexer itself ended, so the slice is the line, once: linear overall), and
+  // remembers an unclosed one (sticky: it makes a heredoc opened on any later line suspect). The caller moves this.lineStart past the newline (and the heredoc bodies).
+  nlCheck() {
+    const s = this.src;
+    let own = false;
+    if (this.i > this.lineStart) {
+      this.ctx.work += this.i - this.lineStart;
+      if (this.ctx.work > MAX_WORK) { this.ctx.stopped = true; this.ctx.truncated = true; }
+      own = unclosedSubscript(s.slice(this.lineStart, this.i));
+    }
+    const earlier = this.subNl;
+    if (own) this.subNl = true;
+    if (this.hd.length) {
+      if (own) this.markRefused(REFUSED_HEREDOC_NL);
+      else if (earlier) this.markRefused(REFUSED_HEREDOC_SUB);
+    }
   }
 
   // this.i is at the start of the lines after a command line that opened heredocs: consume the bodies.
@@ -2601,7 +2619,11 @@ class Parser {
       }
       const c = s[this.i];
       if (lit > 0 && (isSpace(c) || c === '\n')) {
-        if (c === '\n' && this.hd.length) this.markRefused(REFUSED_HEREDOC_NL); // (#269 R22-F3: both shells read the pending heredoc at this newline; the lexer would read it at a later one)
+        if (c === '\n') {
+          if (this.hd.length) this.markRefused(REFUSED_HEREDOC_NL); // (#269 R22-F3: both shells read the pending heredoc at this newline; the lexer would read it at a later one)
+          this.nlCheck(); // (#269 R24-F1: a subscript opened before this newline is judged here; the next line's check then starts after it)
+          this.lineStart = this.i + 1;
+        }
         cur += ' '; this.i++; continue;
       }
       if (lit > 0 && (c === '(' || c === ')')) {
@@ -2616,14 +2638,13 @@ class Parser {
         this.i++;
       } else if (c === '\n') {
         if (this.dbrace > 0) this.markRefused(REFUSED_PARAM); // (#269 R21-F1)
-        // (#269 R22-F4, R23-F2) bash reads an assignment subscript across the newline, through `;` `&` `|` `)`: the whole logical line is checked, and so is every earlier line (one that left a subscript open makes a heredoc opened later suspect)
-        if (unclosedSubscript(s.slice(logicalLineStart(s, this.i), this.i))) this.subNl = true;
-        if (this.subNl && this.hd.length) this.markRefused(REFUSED_HEREDOC_NL);
         const had = !!seg || inWord;
-        endSeg(this.i);
+        endSeg(this.i); // (flushes the last word: a heredoc whose delimiter ends the line is pending only now)
+        this.nlCheck(); // (#269 R22-F4, R23-F2, R24-F1)
         if (had) lastSep = ';';
         this.i++;
         if (this.hd.length) this.readHeredocs();
+        this.lineStart = this.i;
       } else if (c === '#' && !inWord) {
         if (this.dbrace > 0) this.markRefused(REFUSED_PARAM); // (#269 R21-F1: there are no comments inside ${…}; the rest of the word, with its substitutions, is the shell's)
         if (noRedir || maybeArith) { cur += this.funsub(REFUSED_ARITH); continue; } // (#269 R18-F4: arithmetic has no comments; `$(( 1 + # $(cmd)⏎ 2 ))` runs cmd)
@@ -2867,7 +2888,7 @@ class Parser {
     while (this.i < n) {
       const c = s[this.i];
       if (isSpace(c)) this.i++;
-      else if (c === '\n') { this.i++; if (this.hd.length) this.readHeredocs(); }
+      else if (c === '\n') { this.nlCheck(); this.i++; if (this.hd.length) this.readHeredocs(); this.lineStart = this.i; } // (#269 R24-B1)
       else if (c === '\\' && s[this.i + 1] === '\n') this.i += 2;
       else if (c === '#') { while (this.i < n && s[this.i] !== '\n') this.i++; }
       else break;
@@ -2884,12 +2905,14 @@ class Parser {
     const s = this.src;
     const n = s.length;
     const start = this.i;
+    const lineStart = this.lineStart;
     let i = start;
     const done = (ok) => {
       ctx.work += Math.max(i - start, 1);
       if (ctx.work > MAX_WORK) { ctx.stopped = true; ctx.truncated = true; }
       this.subAcc.length = 0;
       this.i = ok ? i : start;
+      if (!ok) this.lineStart = lineStart; // (this.i went back: so does the start of the line it is on)
       return ok;
     };
     if (s[i] === '(') i++;
