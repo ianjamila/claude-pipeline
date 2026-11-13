@@ -165,6 +165,22 @@ export function reviewLane({ level, files, config, sizeOnly = false }) {
   return { reviewer: reasons.length > 0 ? 'fable' : 'judge', reasons, sensitivePaths };
 }
 
+// The trust anchor of the rating, shared with the status display (round-status.mjs#trustedBaseConfig): the default branch is what the remote calls its default
+// (refs/remotes/origin/HEAD; only a clone without that ref falls back to the working-tree config's default_branch, which a PR can edit), the trusted fork point is
+// mergeBase(origin/<that>, head), and the trusted config is the one committed there. A committed config that names a different default_branch than the
+// working-tree config is no trusted config (the PR moved the anchor).
+// -> { defaultBranch, trustedFork, trusted: { ok: true, config } | { ok: false, reason } }. Throws what git throws (no fork point).
+export function trustedBase({ root, head, config }) {
+  const o = { cwd: root };
+  const defaultBranch = remoteDefaultBranch(o) ?? config.default_branch;
+  const trustedFork = mergeBase(reviewBaseRef(defaultBranch, o), head, o);
+  const committed = baseConfigAt(trustedFork, root);
+  const trusted = committed.ok && committed.config.default_branch !== config.default_branch
+    ? { ok: false, reason: `the config at the fork point names default_branch ${JSON.stringify(committed.config.default_branch)}, the working-tree config ${JSON.stringify(config.default_branch)}` }
+    : committed;
+  return { defaultBranch, trustedFork, trusted };
+}
+
 // ---- the whole decision, under the working-tree config AND the trusted base config ------------------------------------------------
 //
 // One shared function for codex-review, review-complete and `pipeline risk`: the hard-stop scan, the level and the lane are worked out twice, once with
@@ -184,15 +200,10 @@ export function reviewLane({ level, files, config, sizeOnly = false }) {
 //   trustedFork, baseConfig: { ok, reason? }, stacked }
 export async function rateBranch({ root, head, config, prBase, base }) {
   const o = { cwd: root };
-  const defaultBranch = remoteDefaultBranch(o) ?? config.default_branch;
+  const { defaultBranch, trustedFork, trusted } = trustedBase({ root, head, config });
   prBase ??= defaultBranch;
-  const trustedFork = mergeBase(reviewBaseRef(defaultBranch, o), head, o);
   const from = base ?? trustedFork;
   const stacked = prBase !== defaultBranch;
-  const committed = baseConfigAt(trustedFork, root);
-  const trusted = committed.ok && committed.config.default_branch !== config.default_branch
-    ? { ok: false, reason: `the config at the fork point names default_branch ${JSON.stringify(committed.config.default_branch)}, the working-tree config ${JSON.stringify(config.default_branch)}` }
-    : committed;
   const sameConfig = trusted.ok && JSON.stringify(trusted.config) === JSON.stringify(config);
   const configs = [['', config], ...(trusted.ok && !sameConfig ? [['base config: ', trusted.config]] : [])];
   const files = diffFiles(from, head, o);

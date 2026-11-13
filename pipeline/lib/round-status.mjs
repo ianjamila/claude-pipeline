@@ -1,20 +1,21 @@
 // The review's status as the owner reads it: how many rounds ran, what they cost, which items are open and how serious, why the review is not clean. One gatherer
 // feeds both the extra-round ask (`triage round-request`) and the park comment (`comment --kind needs-human`), so the two cannot drift. Display only: nothing here decides
 // anything. Untrusted text (titles, categories) goes through asciiLine inside round-ask.mjs.
-import { baseConfigAt } from './config.mjs';
-import { diffFiles, git, mergeBase, revParse } from './git.mjs';
+import { diffFiles, git, revParse } from './git.mjs';
+import { trustedBase } from './risk.mjs';
 import { diffStats } from './diff.mjs';
 import { costFrom, notCleanReasons, openItems, roundsFrom, statusLines } from './round-ask.mjs';
 import { currentContentHash, refreshBaseRef, reviewBaseRef } from './review-context.mjs';
 import { readSummaryComment } from './summary-comment.mjs';
 import { asciiLine, roundOutcome } from './triage.mjs';
 
-// The config committed at the default branch's fork point (the trusted one rateBranch also reads), for the union of the sensitive-path lists: a PR must not shrink its own list.
+// The config committed at the default branch's fork point (the trusted one rateBranch also reads: risk.mjs#trustedBase, anchored on the remote's default branch, not the
+// working-tree config), for the union of the sensitive-path lists: a PR must not shrink its own list.
 // -> { config, problem }: unreadable gives config null (its lists count as empty, nothing is loosened) and says why.
 export function trustedBaseConfig(root, config) {
   try {
-    const base = baseConfigAt(mergeBase(reviewBaseRef(root, config), 'HEAD', { cwd: root }), root);
-    return base.ok ? { config: base.config, problem: null } : { config: null, problem: base.reason };
+    const { trusted } = trustedBase({ root, head: 'HEAD', config });
+    return trusted.ok ? { config: trusted.config, problem: null } : { config: null, problem: trusted.reason };
   } catch (err) {
     return { config: null, problem: String(err?.message ?? err).split('\n')[0].slice(0, 160) };
   }

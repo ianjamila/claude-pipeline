@@ -57,3 +57,22 @@ test('round-request and the park comment: a PR that drops a glob from its own ri
   assert.doesNotMatch(a.summary, /: (all )?low severity\./);
   assert.match(park(w), /^- Open: R2-S1 \(SUGGESTIONS, maintainability\): 1 of 1 not low severity \(R2-S1\)\.$/m);
 });
+
+test('round-request and the park comment: a fork-point config that names another default_branch is no trusted base config, so every open item is high (the anchor cannot be moved by the PR)', (t) => {
+  const w = roundWorld(t);
+  w.atCap();
+  assert.equal(ask(w).open[0].severity, 'low');
+  // main's committed config names another default_branch than the PR's working copy (which keeps its own, as in the sequences above)
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('.claude/pipeline.yml', `${w.repo.git(['show', 'HEAD:.claude/pipeline.yml'])}default_branch: trunk\n`);
+  w.repo.commit('main names another default branch');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', '--no-commit', 'main']);
+  w.repo.git(['checkout', 'HEAD', '--', '.claude/pipeline.yml']);
+  w.repo.commit('merge main, keep the config');
+  const a = ask(w);
+  assert.equal(a.recommend, 'extra-round');
+  assert.equal(a.open[0].severity, 'high');
+  assert.ok(a.warnings.some((x) => /^severity could not be judged: the trusted base config is unreadable \(the config at the fork point names default_branch "trunk"/.test(x)), JSON.stringify(a.warnings));
+  assert.match(park(w), /^- Open: not available \(severity could not be judged\)\.$/m);
+});
