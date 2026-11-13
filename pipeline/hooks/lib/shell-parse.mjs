@@ -539,7 +539,16 @@ const isProcSub = (w) => w.startsWith('<(') || w.startsWith('=(') || /^\$\{[^}]*
 // -s, `-`, /dev/stdin and /dev/fd/0 all mean "read the script from stdin".
 // `amb`: a word up to the decision point (the operand, or the `-c` / `-s` that made it a string or stdin) expands, so what
 // the shell runs may not be what the words as written say (`bash -o $X -c f.sh`: an empty $X makes -o swallow -c, and f.sh is the script file).
+// R17-F1: bash lets EVERY o / O in an option cluster take the next argv word, wherever it sits in the cluster (`bash -abouo emacs ignoreeof -hP`, `bash -oe pipefail f.sh`: o takes `pipefail`);
+// zsh ends the cluster at its first o (the rest of the cluster is the option name: `zsh -ocdablevars f`, and `-oe` is the name `e`). Where the two readings lead to another operand the record is ambiguous
+// (amb: every word is a candidate for the file kind) and `alt` holds the zsh reading, so a -c text is parsed both ways.
 function shellInvocation(argv) {
+  const bashReading = shellScan(argv, false);
+  const zshReading = shellScan(argv, true);
+  if (bashReading.at === zshReading.at) return bashReading;
+  return { ...bashReading, amb: true, alt: { ...zshReading, amb: true } };
+}
+function shellScan(argv, zshGlued) {
   let i = 1;
   let sawC = false;
   let sawS = false;
@@ -548,25 +557,29 @@ function shellInvocation(argv) {
   // interactive shell (`-i`), and any long option or -o / +o name we do not read (zsh `-o exec`, `--no-exec`) leaves it off.
   let noexec = false;
   let execUnsure = false;
-  let gluedName = false; // (R16-F1: `zsh -ocdablevars f`: the letters after an o / O are an option name or more flags, which of the two is not read here: every word is then a candidate)
   while (i < argv.length) {
     const t = argv[i];
     if (t === '--') { i++; break; }
     if (t.length < 2 || (t[0] !== '-' && t[0] !== '+') || (t[0] === '+' && !/^\+[A-Za-z]/.test(t))) break; // (`+(f|fa).sh` is a pattern operand, not an option)
     if (t.startsWith('--')) { execUnsure = true; i += t === '--rcfile' || t === '--init-file' ? 2 : 1; continue; }
-    if (/^[-+][A-Za-z]*[oO][A-Za-z]/.test(t)) gluedName = true;
-    if (t[0] === '-' && t.includes('c')) sawC = true;
-    if (t[0] === '-' && t.includes('s')) sawS = true;
-    if (/n/.test(t.slice(1))) noexec = t[0] === '-';
-    if (/i/.test(t.slice(1))) execUnsure = true;
-    if (/[oO]$/.test(t) && /exec/i.test(argv[i + 1] ?? '')) execUnsure = true;
-    i += /[oO]$/.test(t) ? 2 : 1; // -o / -O take an option name
+    const letters = t.slice(1);
+    const firstO = letters.search(/[oO]/);
+    // (the letters that are flags in this reading, and how many option names the cluster takes from the words after it)
+    const flags = zshGlued && firstO >= 0 ? letters.slice(0, firstO + 1) : letters;
+    const take = zshGlued ? (firstO >= 0 && firstO === letters.length - 1 ? 1 : 0) : (letters.match(/[oO]/g) ?? []).length;
+    if (t[0] === '-' && flags.includes('c')) sawC = true;
+    if (t[0] === '-' && flags.includes('s')) sawS = true;
+    if (/n/.test(flags)) noexec = t[0] === '-';
+    if (/i/.test(flags)) execUnsure = true;
+    if (take > 0 && argv.slice(i + 1, i + 1 + take).some((w) => /exec/i.test(w))) execUnsure = true;
+    if (zshGlued && firstO >= 0 && firstO < letters.length - 1 && /exec/i.test(letters.slice(firstO + 1))) execUnsure = true; // (`zsh -oexec f`)
+    i += 1 + take; // -o / -O take an option name each
   }
-  const before = gluedName || argv.slice(1, i).some(hasExpansion);
-  if (sawC) return i < argv.length ? { kind: 'script', text: argv[i], amb: before } : { kind: 'none' };
-  if (sawS) return { kind: 'stdin', amb: before };
-  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', amb: before } : { kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion), parseOnly: noexec && !execUnsure && !before };
-  return { kind: 'stdin', amb: argv.slice(1).some(hasExpansion) }; // `bash -$X` may be `bash -x f.sh`
+  const before = argv.slice(1, i).some(hasExpansion);
+  if (sawC) return i < argv.length ? { kind: 'script', text: argv[i], amb: before, at: i } : { kind: 'none', at: i };
+  if (sawS) return { kind: 'stdin', amb: before, at: i };
+  if (i < argv.length) return STDIN_FILES.has(argv[i]) ? { kind: 'stdin', amb: before, at: i } : { at: i, kind: 'file', text: argv[i], amb: argv.slice(1, i + 1).some(hasExpansion), parseOnly: noexec && !execUnsure && !before };
+  return { kind: 'stdin', amb: argv.slice(1).some(hasExpansion), at: i }; // `bash -$X` may be `bash -x f.sh`
 }
 
 // ---- script files -------------------------------------------------------------------------------
@@ -915,6 +928,7 @@ function scriptFileOfArgv(argv) {
   const name = base(argv[0]);
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
+    if (r.alt) return { kind: 'shell', file: r.kind === 'file' ? r.text : r.alt.kind === 'file' ? r.alt.text : undefined, ambiguous: true, words: argv.slice(1) }; // (R17-F1: the two readings of the option cluster lead to other operands)
     if (r.kind === 'file' && r.parseOnly && !r.amb && !isProcSub(r.text) && !FD_PATH.test(r.text)) return null; // (`bash -n f.sh`: checks the syntax, runs nothing)
     // a `<(...)` operand is script text, not a file, unless a word before it expands: then it is one more candidate word
     if (r.kind === 'file' && (r.amb || !isProcSub(r.text))) return r.amb ? { kind: 'shell', file: r.text, ambiguous: true, words: argv.slice(1) } : { kind: 'shell', file: r.text };
@@ -1099,7 +1113,7 @@ function producerScript(argv) {
   const name = argv.length ? base(argv[0]) : '';
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
-    if (r.kind !== 'file' || isProcSub(r.text)) return null;
+    if (r.alt || r.kind !== 'file' || isProcSub(r.text)) return null;
     return argv.slice(1, argv.indexOf(r.text, 1)).some(hasExpansion) ? null : r.text;
   }
   const sf = scriptFileOfArgv(argv);
@@ -1914,7 +1928,15 @@ function startupOptions(argv, lit = new Set()) {
     if (t.includes('l')) o.login = true;
     if (t.includes('i')) o.interactive = true;
     if (t.includes('c')) sawC = true;
-    if (/[oO]$/.test(t)) {
+    // (R17-F1: every o / O of a cluster takes the next word in bash; in zsh the rest of the cluster after the first o is the name: `zsh -ologin`)
+    const firstO = t.slice(1).search(/[oO]/);
+    if (firstO >= 0 && firstO < t.length - 2) {
+      const glued = t.slice(firstO + 2);
+      if (/^login$/i.test(glued)) o.login = true;
+      if (/^interactive$/i.test(glued)) o.interactive = true;
+      if (!/^[A-Za-z]+$/.test(glued)) o.unknown = true;
+    }
+    for (let k = (t.slice(1).match(/[oO]/g) ?? []).length; k > 0; k--) {
       const v = argv[++i] ?? '';
       if (hasExpansion(v)) o.unknown = true;
       if (/^login$/i.test(v)) o.login = true;
@@ -3076,7 +3098,7 @@ class Parser {
       else if (t.startsWith('--arg-file=')) argFile = t.slice(11);
     }
     const parallel = base(fan[0]) === 'parallel';
-    const fed = r.kind === 'none' || (r.kind === 'script' && (parallel ? /\{[^}]*\}/.test(r.text) : [...repl].some((x) => r.text.includes(x))));
+    const fed = [r, ...(r.alt ? [r.alt] : [])].some((q) => q.kind === 'none' || (q.kind === 'script' && (parallel ? /\{[^}]*\}/.test(q.text) : [...repl].some((x) => q.text.includes(x)))));
     if (!fed) return;
     const src = stdinSource(seg);
     const st = src.st;
@@ -3272,12 +3294,14 @@ class Parser {
     const name = base(argv[0]);
     const depth = seg.depth + 1;
     if (SHELLS.has(name)) {
-      const r = shellInvocation(argv);
-      if (r.kind === 'script') this.runScript(seg, [r.text], r.text, depth);
-      else if (r.kind === 'stdin') this.runStdin(seg, depth);
-      else if (r.kind === 'file' && isProcSub(r.text)) this.runProcessSub(seg, r.text, depth);
-      else if (r.kind === 'file' && FD_PATH.test(r.text)) this.runFd(seg, r.text);
-      if (r.amb) this.maybeProcessSubs(seg, argv, depth, r.kind === 'file' ? r.text : undefined);
+      const r0 = shellInvocation(argv);
+      for (const r of [r0, ...(r0.alt ? [r0.alt] : [])]) { // (R17-F1: both readings of an option cluster whose o / O letters take words differently)
+        if (r.kind === 'script') this.runScript(seg, [r.text], r.text, depth);
+        else if (r.kind === 'stdin') this.runStdin(seg, depth);
+        else if (r.kind === 'file' && isProcSub(r.text)) this.runProcessSub(seg, r.text, depth);
+        else if (r.kind === 'file' && FD_PATH.test(r.text)) this.runFd(seg, r.text);
+        if (r.amb) this.maybeProcessSubs(seg, argv, depth, r.kind === 'file' ? r.text : undefined);
+      }
     } else if (name === 'source' || name === '.') {
       const op = argv[1];
       if (op === undefined) return;
