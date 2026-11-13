@@ -747,7 +747,7 @@ test('S4d: cd ~- / ~+ / CDPATH / a changed HOME / a cd inside a sourced file mak
   const cp = fakeFs(PROJ, { 'a.sh': 'cd sub', 'b.sh': 'CDPATH=/x\ncd sub', 'c.sh': 'cd ./sub', 'd.sh': 'export CDPATH=/y; cd sub' }, DIRS);
   for (const c of ['CDPATH=/x; . ./a.sh; W', 'export CDPATH=/x; source a.sh; W', '. ./b.sh; W', '. ./d.sh; W', 'CDPATH=/x . ./a.sh; W']) assert.equal(files(c.replace('W', W), cp).decision, 'deny', c);
   assert.equal(files('. ./a.sh; ' + W, cp, { env: { CDPATH: '/x' } }).decision, 'deny');
-  assert.equal(files('. ./a.sh; ' + W, cp).decision, 'deny', '(R17 owner decision: a bare cd is unknown)');
+  assert.equal(files('. ./a.sh; ' + W, cp).decision, 'allow', '(R19 owner decision: a plain cd name narrows unless CDPATH is set)');
   for (const c of ['. ./c.sh; W', 'CDPATH=/x; . ./c.sh; W']) assert.equal(files(c.replace('W', W), cp).decision, 'allow', c);
   // (CDPATH only matters for a relative name; a name that starts with / ./ ../ is not searched; the environment's CDPATH counts too)
   assert.equal(files('cd sub && ' + W, fakeFs(PROJ, sh, DIRS), { env: { CDPATH: '/x' } }).decision, 'deny');

@@ -3485,7 +3485,7 @@ function setPositionals(argv) {
   return null;
 }
 function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false) { // (rep: the file is sourced from a frame that can run it again, R18)
-  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: /CDPATH/.test(text) };
+  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: /CDPATH/i.test(text) }; // (any case: zsh's cdpath array is CDPATH)
   const cdp = ctx.cdpath === true || out.cdpath; // (R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
@@ -3771,7 +3771,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const raw = typeof command === 'string' ? command : '';
   if (!raw.trim()) return allow();
   ctx.dotGlob = DOT_GLOB.test(raw) || DOT_GLOB.test(String(ctx.env.BASHOPTS ?? '')); // (makeMatchers: may a wildcard match the .review folder)
-  ctx.cdpath = opts._cdpath === true || Boolean(ctx.env.CDPATH) || /CDPATH/.test(raw); // (R19: CDPATH in the hook's environment, in a parent's text, or on this line: a plain `cd NAME` may lead anywhere)
+  ctx.cdpath = opts._cdpath === true || Boolean(ctx.env.CDPATH) || /CDPATH/i.test(raw); // (R19: CDPATH in the hook's environment, in a parent's text, or on this line: a plain `cd NAME` may lead anywhere)
   opts = { ...opts, _cdpath: ctx.cdpath }; // (a script, a -c text or a file this frame runs inherits it)
   // the words a `${X:=w}` on the line (or the line this text came from) may have assigned: a later $X may be any of them
   ctx.assigned = new Map([...(opts._assigned ?? [])].map(([n, ws]) => [n, [...ws]]));
