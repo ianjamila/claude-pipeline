@@ -291,3 +291,13 @@ test('writeRunRecord: a malformed resumed.head (not shape-checked on decode) can
     assert.equal(resumedRunState(gh, PR).resumed, true, JSON.stringify(head));
   }
 });
+
+// #407: P summary / P comment --kind summary build their record from null, so baseRecordFor's warning never reaches them: the shared writer reports the mark it stamps.
+test('writeRunRecord: stamping resumed on an unreadable record returns baseRecordFor\'s warning (and an ordinary write returns none)', () => {
+  const gh = memoryGh([{ id: 7, body: INVALID_BODY, user: { login: 'me' } }]);
+  const posted = writeRunRecord(gh, PR, { record: plain(), firstRead: { status: 'invalid' }, host: 'pc-1', now: NOW });
+  assert.equal(posted.warnings.length, 1);
+  assert.match(posted.warnings[0], /could not be read; started a new one, marked resumed/);
+  assert.equal(baseRecordFor({ status: 'invalid' }, { ...ID, host: 'pc-1', now: NOW }).warnings[0], posted.warnings[0], 'the same wording');
+  assert.deepEqual(writeRunRecord(memoryGh(), PR, { record: plain() }).warnings, []);
+});

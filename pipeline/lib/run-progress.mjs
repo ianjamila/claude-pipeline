@@ -30,11 +30,12 @@ export function baseRecordFor(existing, { repo, pr, branch, baseRef, step = 'bui
     if (existing.record.resumed) resumed = existing.record.resumed;
   } else if (existing.status === 'invalid') {
     resumed = stampResumed({ host, now, head });
-    warnings.push("the existing run record could not be read; started a new one, marked resumed (the merge then needs the owner's word)");
+    warnings.push(RESUMED_UNREADABLE);
   }
   return { record: { ...emptyRecord({ repo, pr, branch, baseRef }), step, ...(resumed ? { resumed } : {}) }, warnings };
 }
 
+export const RESUMED_UNREADABLE = "the existing run record could not be read; started a new one, marked resumed (the merge then needs the owner's word)";
 const UNSUPPORTED = 'the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first';
 const stampResumed = ({ host, now, head }) => ({ at: new Date(now).toISOString(), host: String(host ?? ''), head: String(head ?? '') });
 
@@ -58,12 +59,16 @@ export function writeRunRecord(gh, pr, { record, sections, host = hostname(), no
   const fresh = readSummaryComment(gh, pr);
   if (fresh.status === 'unsupported') throw new Error(UNSUPPORTED);
   let out = record;
+  const warnings = [];
   if (!out.resumed) {
     if (fresh.status === 'ok' && fresh.record.resumed) out = { ...out, resumed: fresh.record.resumed };
-    else if (fresh.status === 'invalid' || firstRead?.status === 'invalid') out = { ...out, resumed: stampResumed({ host, now, head: out.head }) };
+    else if (fresh.status === 'invalid' || firstRead?.status === 'invalid') {
+      out = { ...out, resumed: stampResumed({ host, now, head: out.head }) };
+      warnings.push(RESUMED_UNREADABLE); // the callers that build their record without baseRecordFor (P summary, P comment --kind summary) report it (#407)
+    }
   }
   if (out.resumed && !skipResumedEvent && !(fresh.status === 'ok' && fresh.record.resumed)) postResumedEvent(gh, pr, out.resumed);
-  return writeSummaryComment(gh, pr, { record: out, sections, existing: fresh });
+  return { ...writeSummaryComment(gh, pr, { record: out, sections, existing: fresh }), warnings };
 }
 
 // The append-only evidence that this run was resumed: one new comment, never edited. Throws when it cannot be posted. The event id is built from
