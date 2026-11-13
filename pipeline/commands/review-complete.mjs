@@ -15,7 +15,7 @@ import { git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { behindFreshEnough, lazyDiff } from '../lib/finalgate.mjs';
 import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { assessRisk, rateBranch, reviewLane, trustedDefaultBranch } from '../lib/risk.mjs';
+import { assessRisk, prBaseBranch, rateBranch, reviewLane } from '../lib/risk.mjs';
 import { routeConfigFor } from '../lib/review-round.mjs';
 import { isSubstituteRound, loadState } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
@@ -275,7 +275,9 @@ export const run = guarded(async (argv, ctx) => {
       }
       if (!grants.ok) return { exitCode: EXIT.FAILED, output: { ok: false, reason: grants.problems.join('; '), currentContentHash: hash } };
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
-      const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : trustedDefaultBranch(root, config).branch;
+      // GitHub's base branch, else the trusted default branch; when that fallback is the working tree's own (an origin remote that did not answer) the PR chose it: refuse (S1).
+      const { branch: prBase, untrusted: prBaseUntrusted } = prBaseBranch(view, root, config);
+      if (prBaseUntrusted !== null) return { exitCode: EXIT.FAILED, output: { ok: false, reason: `GitHub did not name the PR's base branch, and ${prBaseUntrusted}`, currentContentHash: hash } };
       const lane = await laneProblem(state, root, config, base, { prBase });
       if (lane) return { exitCode: EXIT.FAILED, output: { ok: false, reason: lane, currentContentHash: hash } };
       // A Claude stand-in reviewed instead of Codex (plan 2026-11-11-codex-substitute-reviewer): a high-risk PR it covered with Opus alone, or a substitute round whose proof does not hold, is refused.

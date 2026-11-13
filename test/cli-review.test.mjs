@@ -4789,3 +4789,20 @@ test('R1-F4: state fable-refresh accepts a head that only added ledger rows (doc
   moved.prHead(moved.repo.commit('unreviewed change'));
   assert.equal(refreshOf(moved).json.error, 'content-moved');
 });
+
+// S1: state fable-refresh measures its whole-PR range from the PR's base branch; when GitHub names none and the default branch cannot be anchored on the remote (an origin remote that
+// answered neither origin/HEAD nor ls-remote), the working tree's default branch is the PR's to choose, so the refresh keeps the fork point the last round recorded.
+test('state fable-refresh: an untrusted anchor does not move the whole-PR range: the refresh round keeps the recorded fork point', (t) => {
+  const w = oldProofWorld(t);
+  w.repo.git(['remote', 'add', 'origin', '/nonexistent/cp-no-such-origin-s1']);
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('docs.md', 'main moves\n');
+  const moved = w.repo.commit('main moves');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', 'main']); // the PR's content is unchanged, but its merge base with main is now main's new tip
+  w.setGh([{ match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'x', headRefName: 'feat/x', baseRefName: null } }, { match: '^repo view', stdoutJson: REPO_VIEW }], w.repo.git(['rev-parse', 'HEAD']).trim()); // GitHub names no base branch
+  const r = refreshOf(w);
+  assertExit(r, 0, r.stdout + r.stderr);
+  const [r1, r2] = w.state().rounds;
+  assert.deepEqual([r2.forkPoint, r2.forkPoint === moved], [r1.forkPoint, false]);
+});

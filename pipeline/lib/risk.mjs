@@ -187,6 +187,16 @@ export function trustedDefaultBranch(root, config) {
   };
 }
 
+// The branch a PR is read as targeting, for the commands that fetch / measure a range from it: GitHub's answer (the PR's baseRefName) wins; without one, the TRUSTED default branch
+// (trustedDefaultBranch), never a config value a PR can edit. `untrusted` is set only when that fallback was needed AND its anchor is the working tree's (an origin remote that did
+// not answer): that branch is the PR's to choose and must not be what narrows a reviewed range, so the callers refuse (or keep what they recorded) instead of using it (S1).
+// -> { branch, untrusted: string | null }
+export function prBaseBranch(view, root, config) {
+  if (typeof view?.baseRefName === 'string' && view.baseRefName !== '') return { branch: view.baseRefName, untrusted: null };
+  const { branch, untrusted } = trustedDefaultBranch(root, config);
+  return { branch, untrusted };
+}
+
 // The trust anchor of the rating, shared with the status display (round-status.mjs#trustedBaseConfig): the default branch is what the remote calls its default
 // (refs/remotes/origin/HEAD; only a clone without that ref falls back to the working-tree config's default_branch, which a PR can edit), the trusted fork point is
 // mergeBase(origin/<that>, head), and the trusted config is the one committed there. A committed config that names a different default_branch than the
@@ -195,7 +205,9 @@ export function trustedDefaultBranch(root, config) {
 // the working-tree config's default_branch (a repo where they disagree on purpose, or origin/HEAD is stale), else null.
 // `trustedFork` (optional): the fork point when the caller already has it (adm.rated.trustedFork, from rateBranch); the merge base is then not worked out again.
 // `mismatch` also carries an anchor that came from the working tree although an origin remote exists (trustedDefaultBranch's `untrusted`): the callers read it as "no trusted base config".
-// -> { defaultBranch, anchor, trustedFork, trusted: { ok: true, config } | { ok: false, reason }, mismatch: string | null, remoteDefault: string | null }. Throws what git throws (no fork point).
+// `untrusted` is trustedDefaultBranch's (a sentence, or null): it tells a mismatch whose ANCHOR is genuine (the remote named the default branch; only the working tree's default_branch moved, so
+// the fork point and the config committed there are the real ones) from one whose anchor the PR could have chosen (no trusted fork point at all).
+// -> { defaultBranch, anchor, untrusted, trustedFork, trusted: { ok: true, config } | { ok: false, reason }, mismatch: string | null, remoteDefault: string | null }. Throws what git throws (no fork point).
 export function trustedBase({ root, head, config, trustedFork: given }) {
   const o = { cwd: root };
   const { branch: defaultBranch, remote, anchor, untrusted } = trustedDefaultBranch(root, config);
@@ -204,7 +216,7 @@ export function trustedBase({ root, head, config, trustedFork: given }) {
   const mismatch = untrusted ?? (trusted.ok && trusted.config.default_branch !== config.default_branch
     ? `the config at the fork point names default_branch ${JSON.stringify(trusted.config.default_branch)}, the working-tree config ${JSON.stringify(config.default_branch)}`
     : null);
-  return { defaultBranch, anchor, trustedFork, trusted, mismatch, remoteDefault: remote !== null && remote !== config.default_branch ? remote : null };
+  return { defaultBranch, anchor, untrusted, trustedFork, trusted, mismatch, remoteDefault: remote !== null && remote !== config.default_branch ? remote : null };
 }
 
 // ---- the whole decision, under the working-tree config AND the trusted base config ------------------------------------------------
@@ -223,11 +235,12 @@ export function trustedBase({ root, head, config, trustedFork: given }) {
 // `base` (optional) is the ref the diff starts from; it defaults to the trusted fork point (codex-review passes its own, stack-aware, fork point).
 // Throws what the scan throws (the callers decide how to fail closed). -> {
 //   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
-//   trustedFork, baseConfig: { ok, reason? }, stacked, defaultBranch, anchor }
-// `defaultBranch` is the trusted one and `anchor` where it came from ('origin-head' | 'ls-remote' | 'config', trustedDefaultBranch), for a caller that decides "is the PR's base the default branch" (admitRound's base rule, #398).
+//   trustedFork, baseConfig: { ok, reason? }, stacked, defaultBranch, anchor, untrusted }
+// `defaultBranch` is the trusted one and `anchor` where it came from ('origin-head' | 'ls-remote' | 'config', trustedDefaultBranch), for a caller that decides "is the PR's base the default branch" (admitRound's base rule, #398); `untrusted` (a sentence, or null) says the anchor came from the working tree although an origin remote exists:
+// such a default branch is the PR's to choose and must not narrow a reviewed range (S1).
 export async function rateBranch({ root, head, config, prBase, base }) {
   const o = { cwd: root };
-  const { defaultBranch, anchor, trustedFork, trusted, mismatch, remoteDefault } = trustedBase({ root, head, config });
+  const { defaultBranch, anchor, untrusted, trustedFork, trusted, mismatch, remoteDefault } = trustedBase({ root, head, config });
   const trustedOk = trusted.ok && mismatch === null;
   prBase ??= defaultBranch;
   const from = base ?? trustedFork;
@@ -300,6 +313,6 @@ export async function rateBranch({ root, head, config, prBase, base }) {
       path: rated.some((r) => r.risk.drivers.path), size: rated.some((r) => r.risk.drivers.size),
     },
     sizeOnly, reviewer, laneReasons, sensitivePaths, ...(sizeOnlyJudge ? { sizeOnlyJudge: true, note: SIZE_ONLY_NOTE } : {}),
-    hits, files, lightLane: rated.every((r) => r.lightLane), trustedFork, baseConfig: trustedOk ? { ok: true, same: sameConfig } : { ok: false, reason: trusted.ok ? mismatch : trusted.reason }, stacked, defaultBranch, anchor,
+    hits, files, lightLane: rated.every((r) => r.lightLane), trustedFork, baseConfig: trustedOk ? { ok: true, same: sameConfig } : { ok: false, reason: trusted.ok ? mismatch : trusted.reason }, stacked, defaultBranch, anchor, untrusted,
   };
 }
