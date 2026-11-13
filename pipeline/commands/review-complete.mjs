@@ -30,7 +30,7 @@ export const meta = {
   summary: 'post the review-complete comment (and remove awaiting-review) once the review is valid for the current content',
   usage: [
     'pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?, warnings?}; exit 1 {ok:false, reason} when the review is not valid',
-    '  origin/<default_branch> is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated',
+    '  origin/<default branch> (the anchor `pipeline risk` describes) is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated',
     '  from its base branch and pulled is judged against the main that was merged in',
     '  after the validity checks it also refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet',
     '  confirmed by a later round, and (exit 1 {error:closing-keywords}) a PR body that lists several issues after one closing keyword ("Closes #1, #2" closes only #1),',
@@ -48,9 +48,9 @@ export const meta = {
     '  when a proven Fable round counts as current only because of the owner\'s allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line',
     '  "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},',
     '  and the final gate\'s review check detail carries the same note',
-    '  a DRAFT whose head lacks commits of origin/<default_branch> is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:\'behind-base\', error:\'behind-base\', base, behindBy, detail (why the check refused it: the helper\'s reason), remedy},',
+    '  a DRAFT whose head lacks commits of origin/<default branch> is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:\'behind-base\', error:\'behind-base\', base, behindBy, detail (why the check refused it: the helper\'s reason), remedy},',
     '  so the review skill catches it up BEFORE `gh pr ready` and CI runs once, on current main: the remedy is `pipeline update-branch --pr N`, `git pull --ff-only`, the next codex-review round (only main was merged in: baseOnly, Codex does not run,',
-    '  nothing is counted), then review-complete again. merge.behind_base: update = behind when origin/<default_branch> is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`; a `mergeable` GitHub has not computed yet, UNKNOWN, is not a conflict: if everything else passes, the draft posts with a warning).',
+    '  nothing is counted), then review-complete again. merge.behind_base: update = behind when origin/<default branch> is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`; a `mergeable` GitHub has not computed yet, UNKNOWN, is not a conflict: if everything else passes, the draft posts with a warning).',
     '  A ready PR is never refused for this; the check is skipped with a `warnings` entry when the base ref could not be refreshed (offline), the base has a merge queue (or it cannot be read), or the ancestry cannot be read',
   ].join('\n'),
 };
@@ -143,7 +143,7 @@ export function reviewCompleteBody(record, docsExempt = null, fableNote = null) 
 
 const oneLine = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 200);
 
-// A DRAFT that lacks commits of origin/<default_branch> is caught up BEFORE it is marked ready, so its required CI runs once, on current main (the
+// A DRAFT that lacks commits of origin/<default branch> is caught up BEFORE it is marked ready, so its required CI runs once, on current main (the
 // merge dry run sees behind-base only after CI, and the catch-up then costs a second full run). A ready PR is never judged here: the merge flow handles it.
 // -> { refusal } (the output of the exit-1 refusal) | { warning } (the check could not be made: offline refresh, a merge queue, an unreadable queue or
 // ancestry; never a block) | {} (not a draft, or not behind). merge.behind_base: 'update' = behind when origin/<branch> is not an ancestor of HEAD;
@@ -173,7 +173,7 @@ function draftBehindBase({ root, config, gh, pr, view, refresh }) {
   const known = view.mergeable === 'MERGEABLE' || view.mergeable === 'CONFLICTING';
   const fresh = behindFreshEnough({
     root, config, diff: lazyDiff(root, config, { sha: baseSha, branch }), baseSha,
-    info: { mergeStateStatus: 'CLEAN', mergeable: known ? view.mergeable : 'MERGEABLE' },
+    info: { mergeStateStatus: 'CLEAN', mergeable: known ? view.mergeable : 'MERGEABLE' }, branch,
   });
   if (fresh.ok) {
     return known ? {} : { warning: `behind-base check skipped: GitHub had not computed the PR's mergeability yet (mergeable is ${JSON.stringify(view.mergeable ?? null)}), so conflicts were not ruled out; origin/${branch} changed no file this PR touches` };
@@ -220,7 +220,7 @@ export const run = guarded(async (argv, ctx) => {
           output: { ok: false, reason: `local HEAD ${local} is not the head of PR #${pr} on GitHub (${remote ?? 'unknown'}): push or pull first`, localHead: local, prHead: remote ?? null },
         };
       }
-      // The hash is measured from origin/<default_branch>; after `update-branch` + `git pull --ff-only` that ref is older than the main that
+      // The hash is measured from origin/<default branch>; after `update-branch` + `git pull --ff-only` that ref is older than the main that
       // was merged in, so refresh it first (best effort: offline keeps the cached ref and the round's own hash is what it is compared to).
       const refresh = refreshBaseRef(root, config);
       const hash = currentContentHash(root, config);

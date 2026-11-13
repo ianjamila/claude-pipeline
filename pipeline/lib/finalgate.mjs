@@ -204,7 +204,8 @@ function prOpenCheck({ info, head, root, config, behind = null, queueMode = fals
   // The hard-stop, integrity and review diffs are taken against the default branch; any other base would be judged on the wrong diff.
   if (info.baseRefName !== branch) { problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${branch}`); baseProblem = true; }
   // The branch named above came from origin/HEAD, not from pipeline.yml: say so (and how to repoint a stale one) when the two differ, or the refusal reads as a contradiction (#369).
-  if (baseProblem && branch !== config.default_branch) problems.push(`${JSON.stringify(branch)} is the default branch origin/HEAD names (pipeline.yml says default_branch ${JSON.stringify(config.default_branch)}; origin/HEAD wins); if origin/HEAD is stale, run \`git remote set-head origin -a\``);
+  const configured = config.default_branch;
+  if (baseProblem && branch !== configured) problems.push(`${JSON.stringify(branch)} is the default branch origin/HEAD names (pipeline.yml says default_branch ${JSON.stringify(configured)}; origin/HEAD wins); if origin/HEAD is stale, run \`git remote set-head origin -a\``);
   return problems.length ? check('pr-open', false, problems.join('; ')) : check('pr-open', true, `open at ${short(head)}`);
 }
 
@@ -265,8 +266,8 @@ const namedFiles = (list) => `${list.slice(0, NAMED_SHOWN).join(', ')}${list.len
 //   4. none of main's paths changes how the checks run (built-in list, the base's verify.ci_proof_inputs and merge.behind_base_stale_paths);
 //   4b. main did not remove a directory the PR adds into.
 // -> { ok: true, behindBy, mergeBase, mainFiles } or { ok: false, reason }. Never throws, never null: every doubt is a refusal.
-export function behindFreshEnough({ root, config, diff, baseSha, info }) {
-  // `config.default_branch` below is display text only (#369): every comparison here runs on baseSha, GitHub's own baseRefOid.
+// `branch` (display text only, #369): the anchor branch the caller measured from; every comparison here runs on baseSha, GitHub's own baseRefOid.
+export function behindFreshEnough({ root, config, diff, baseSha, info, branch = anchorOf(root, config) }) {
   const no = (reason) => ({ ok: false, reason });
   const o = { cwd: root };
   try {
@@ -287,12 +288,12 @@ export function behindFreshEnough({ root, config, diff, baseSha, info }) {
     const prPaths = d.files.flatMap(pathsOf);
     const prFolded = new Set(prPaths.map(foldPath));
     const both = mainPaths.filter((p) => prFolded.has(foldPath(p)));
-    if (both.length > 0) return no(`${config.default_branch} changed ${both.length} file(s) this PR also touches (${namedFiles(both)})`);
+    if (both.length > 0) return no(`${branch} changed ${both.length} file(s) this PR also touches (${namedFiles(both)})`);
 
     const globs = [...CI_PROOF_PROTECTED, ...BEHIND_TOOLCHAIN, ...settings.inputs, ...settings.stale];
     for (const p of mainPaths) {
       const hit = globs.find((g) => matchGlob(p, g, { nocase: true }) || matchGlob(nfc(p), nfc(g), { nocase: true }));
-      if (hit !== undefined) return no(`${config.default_branch} changed ${p}, which changes how the checks run (matches ${hit})`);
+      if (hit !== undefined) return no(`${branch} changed ${p}, which changes how the checks run (matches ${hit})`);
     }
 
     // 4b: a path-level clash disjoint names cannot see (main moves src/foo/, the PR adds src/foo/new.js). Directories are compared folded,
@@ -313,12 +314,12 @@ export function behindFreshEnough({ root, config, diff, baseSha, info }) {
       const parts = f.newPath.split('/');
       for (let i = 1; i < parts.length; i += 1) {
         const dir = parts.slice(0, i).join('/');
-        if (removed.has(foldPath(dir))) return no(`${config.default_branch} removed ${dir}/, which this PR adds into (${f.newPath})`);
+        if (removed.has(foldPath(dir))) return no(`${branch} removed ${dir}/, which this PR adds into (${f.newPath})`);
       }
     }
     return { ok: true, behindBy, mergeBase: mb, mainFiles: mainPaths.length };
   } catch (err) {
-    return no(`could not compare ${config.default_branch}'s new commits with the PR: ${firstLine(err)}`);
+    return no(`could not compare ${branch}'s new commits with the PR: ${firstLine(err)}`);
   }
 }
 
@@ -1050,7 +1051,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     }
   }
   if (behindReason !== null) {
-    const fresh = behindFreshEnough({ root, config, diff, baseSha, info });
+    const fresh = behindFreshEnough({ root, config, diff, baseSha, info, branch: anchorOf(root, config) });
     if (fresh.ok) {
       behind = { behindBy: fresh.behindBy, mergeBase: fresh.mergeBase, baseRefOid: baseSha, mainFiles: fresh.mainFiles, rule: 'disjoint' };
       behindReason = null;

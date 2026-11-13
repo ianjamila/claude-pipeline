@@ -16,7 +16,7 @@ import { loadConfig, validateConfig } from '../pipeline/lib/config.mjs';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { anchorBranch as gitAnchorBranch, contentHash, mergeBase, remoteDefaultBranch, reviewBaseRef as gitReviewBaseRef, treeFingerprint } from '../pipeline/lib/git.mjs';
 import { anchorBranch, currentContentHash, prBaseOf, refreshBaseRef, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
-import { baseRefFor, localContentHash } from '../pipeline/lib/finalgate.mjs';
+import { anchorOf, baseRefFor, behindFreshEnough, localContentHash } from '../pipeline/lib/finalgate.mjs';
 import { docsExemptFrom } from '../pipeline/lib/docs-exempt.mjs';
 import { laneProblem } from '../pipeline/commands/review-complete.mjs';
 import { trustedBase } from '../pipeline/lib/risk.mjs';
@@ -212,18 +212,33 @@ test('a local branch named origin/main does not shadow the anchor either, and a 
 // ---- the remaining sites -----------------------------------------------------------------------------------------------------------
 
 // state, triage, codex-review and review-complete take their default branch from the helpers above; this pins that none of them reads the config again.
-// The files that may still name config.default_branch, and why.
+// The files that may still read the config's default_branch, with the EXACT number of reads each may hold and why (R1-F4): a file is not exempt wholesale, so a new
+// decision in finalgate.mjs / risk.mjs / review-context.mjs / docs-exempt.mjs shows as a changed count. Raising a count needs the reason written here.
 const CONFIG_BRANCH_OK = new Map([
-  ['pipeline/lib/risk.mjs', 'trustedBase: the fallback when origin/HEAD is unusable, and the mismatch comparison'],
-  ['pipeline/lib/review-context.mjs', 'anchorBranch: the fallback when origin/HEAD is unusable'],
-  ['pipeline/lib/finalgate.mjs', 'anchorOf: the same fallback; behindFreshEnough prints it (the comparison runs on baseSha)'],
-  ['pipeline/lib/docs-exempt.mjs', 'anchorBranch input: the same fallback'],
-  ['pipeline/lib/queue-route.mjs', 'the merge-queue rules of the repository\'s configured default branch (not a review anchor)'],
-  ['pipeline/commands/agent-log.mjs', 'where the agent log is published: the configured default branch (not a review anchor)'],
-  ['pipeline/commands/merge.mjs', 'display text of the behind note'],
-  ['pipeline/commands/risk.mjs', 'help text'],
+  ['pipeline/lib/risk.mjs', [7, 'trustedBase: the fallback when origin/HEAD is unusable, and the mismatch comparison; rate\'s laneNotes text']],
+  ['pipeline/lib/review-context.mjs', [1, 'anchorBranch: the fallback when origin/HEAD is unusable']],
+  ['pipeline/lib/finalgate.mjs', [2, 'anchorOf (the same fallback: the ONE read every gate decision and display text goes through, behindFreshEnough takes it as `branch`) + prOpenCheck\'s "pipeline.yml says" note']],
+  ['pipeline/lib/docs-exempt.mjs', [2, 'anchorBranch input: the same fallback (config?.default_branch ?? DEFAULTS.default_branch)']],
+  ['pipeline/lib/queue-route.mjs', [1, 'the merge-queue rules of the repository\'s configured default branch (not a review anchor)']],
+  ['pipeline/lib/guard-provenance.mjs', [2, 'GitHub\'s own .default_branch field of the repository API (a jq path, not the config)']],
+  ['pipeline/commands/agent-log.mjs', [6, 'where the agent log is published: the configured default branch (not a review anchor)']],
 ]);
-test('no review-loop or gate file reads config.default_branch except the documented anchor fallbacks and display sites', () => {
+// Every way the code reads the property: `config.default_branch`, `cfg?.default_branch`, `x.config.default_branch`, a destructuring (`const { default_branch } = config`,
+// `{ default_branch: base }`) and a bracket read. Comment lines and trailing comments are not reads.
+const BRANCH_READ = /\.default_branch\b|\{[^{}]*\bdefault_branch\b[^{}]*\}\s*=[^=>]|\[\s*['"]default_branch['"]\s*\]/g;
+const countBranchReads = (src) => src.split('\n').reduce((n, line) => n + (line.replace(/^\s*\/\/.*$/, '').replace(/\s\/\/\s.*$/, '').match(BRANCH_READ) ?? []).length, 0);
+
+test('the default_branch read counter sees plain, optional, aliased and destructured reads, and ignores comments', () => {
+  assert.equal(countBranchReads('const b = config.default_branch;'), 1);
+  assert.equal(countBranchReads('const b = cfg?.default_branch ?? DEFAULTS.default_branch;'), 2);
+  assert.equal(countBranchReads('const { default_branch } = config;'), 1);
+  assert.equal(countBranchReads('const { default_branch: base, agent_log } = loaded.config;'), 1);
+  assert.equal(countBranchReads("const b = config['default_branch'];"), 1);
+  assert.equal(countBranchReads('// config.default_branch is display text\nconst b = 1; // was config.default_branch'), 0);
+  assert.equal(countBranchReads('const f = ({ default_branch }) => default_branch;'), 0, 'a parameter pattern is not a read of the config (it names the property its caller passed)');
+});
+
+test('no review-loop or gate file reads the config\'s default_branch except the documented anchor fallbacks, each at its pinned count', () => {
   const root = join(here, '..', 'pipeline');
   const files = [];
   const walk = (dir) => {
@@ -233,8 +248,44 @@ test('no review-loop or gate file reads config.default_branch except the documen
     }
   };
   walk(root);
-  const offenders = files
-    .map((f) => relative(join(here, '..'), f).split('\\').join('/'))
-    .filter((f) => f !== 'pipeline/lib/config.mjs' && /config\??\.default_branch/.test(readFileSync(join(here, '..', f), 'utf8')) && !CONFIG_BRANCH_OK.has(f));
-  assert.deepEqual(offenders, [], 'route it through anchorBranch (review-context.mjs / git.mjs), or add the file here with the reason the config value is intended');
+  const found = {};
+  for (const f of files) {
+    const rel = relative(join(here, '..'), f).split('\\').join('/');
+    if (rel === 'pipeline/lib/config.mjs') continue;
+    const n = countBranchReads(readFileSync(f, 'utf8'));
+    if (n > 0) found[rel] = n;
+  }
+  const allowed = Object.fromEntries([...CONFIG_BRANCH_OK].map(([f, [n]]) => [f, n]));
+  assert.deepEqual(found, allowed, 'route it through anchorBranch (review-context.mjs / git.mjs; finalgate: anchorOf), or pin the file and its count here with the reason the config value is intended');
+});
+
+test('the help texts and docs/cli.md document laneNotes and the origin/HEAD override, and no longer call the mismatch a lane reason or origin/<default_branch> (R1-F2)', async () => {
+  const docs = readFileSync(join(here, '..', 'docs', 'cli.md'), 'utf8');
+  for (const name of ['risk', 'codex-review', 'review-complete', 'state']) {
+    const { meta } = await import(`../pipeline/commands/${name}.mjs`);
+    assert.doesNotMatch(meta.usage, /origin\/<default_branch>|a lane reason says so/, name);
+    if (name !== 'review-complete' && name !== 'state') assert.match(meta.usage, /laneNotes/, name);
+  }
+  const { meta } = await import('../pipeline/commands/risk.mjs');
+  assert.match(meta.usage, /origin\/HEAD overrides pipeline\.yml for the review base.*PR base the final gate requires.*CI-proof settings/);
+  assert.match(meta.usage, /laneReasons, laneNotes\?, sensitivePaths/);
+  assert.ok(docs.includes(meta.usage), 'docs/cli.md carries the risk usage verbatim');
+  assert.doesNotMatch(docs, /origin\/<default_branch>|a lane reason says so/);
+  assert.match(docs, /`laneNotes`/);
+  assert.equal(docs.split('origin/HEAD overrides pipeline.yml').length - 1, 1, 'the override rule is stated once');
+});
+
+test('behindFreshEnough prints the anchor branch (the caller\'s, else origin/HEAD\'s), not the config\'s: its refusals and the merge request\'s behind note', (t) => {
+  const w = world(t, { extraYml: 'merge:\n  behind_base: disjoint\n' }); // origin/HEAD -> develop, pipeline.yml names main
+  // develop moves on and touches a.txt, which the PR (feat/x, on d1) also touches: the PR is behind, and the overlap refuses it.
+  w.repo.git(['checkout', '-q', 'develop']);
+  w.repo.write('a.txt', 'a, changed on develop\n');
+  const tip = w.repo.commit('develop moves');
+  w.repo.git(['update-ref', REMOTE_DEVELOP, tip]);
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  const args = { root: w.root, config: w.cfg, baseSha: tip, info: { mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' },
+    diff: () => ({ ok: true, mb: w.d1, files: [{ status: 'M', oldPath: 'a.txt', newPath: 'a.txt' }] }) };
+  assert.deepEqual(behindFreshEnough(args), { ok: false, reason: 'develop changed 1 file(s) this PR also touches (a.txt)' }, 'the default: the anchor');
+  assert.deepEqual(behindFreshEnough({ ...args, branch: 'release' }), { ok: false, reason: 'release changed 1 file(s) this PR also touches (a.txt)' }, 'the caller names the branch it measured from');
+  assert.equal(anchorOf(w.root, w.cfg), 'develop');
 });

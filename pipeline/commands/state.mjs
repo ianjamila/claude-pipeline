@@ -38,7 +38,7 @@ export const meta = {
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
     '     refused (exit 2) when the PR triage comment already holds round R, or (error round-has-verdict) when the round holds a second-review verdict',
     'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean',
-    '  first fetches origin/<default_branch> (best effort: offline keeps the cached ref), so a PR updated from its base branch is not read as changed',
+    '  first fetches origin/<default branch> (the anchor `pipeline risk` describes; best effort: offline keeps the cached ref), so a PR updated from its base branch is not read as changed',
     '  grantedRound {k, grantId, head, quote}: the owner\'s open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner',
     '  record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the',
     '  automatic extra round took, or null',
@@ -48,8 +48,8 @@ export const meta = {
     '  -> a forced or Claude-ruled ACCEPT whose named file is empty or was not changed is still marked, with implementedVia \'other-files\': the next codex-review',
     '     round asks Codex to confirm it (round.confirmFixed) and review-complete waits for that round. Ordinary ACCEPTs get no such field',
     '  -> every mark records item.implementedAfterRound, the newest round number at that time (triage defer-fixes uses it to tell a fix made before the last reviewed round from a later one)',
-    '  -> exit 3 {ok:false, unavailable:true, reason:base-refresh} and nothing is marked when origin/<default_branch> cannot be fetched (offline, remote down) while the',
-    '     hash would be measured from it - also with no origin remote but a leftover origin/<default_branch> ref: a stale base would count the default branch\'s commits as the fix',
+    '  -> exit 3 {ok:false, unavailable:true, reason:base-refresh} and nothing is marked when origin/<default branch> cannot be fetched (offline, remote down) while the',
+    '     hash would be measured from it - also with no origin remote but a leftover origin/<default branch> ref: a stale base would count the default branch\'s commits as the fix',
     'pipeline state fable-refresh --pr N [--repo DIR]',
     '  -> {ok, round, staleRounds, scope: "whole-pr"}: opens an uncounted Fable-only round (no Codex, not counted against review.max_rounds, allowed past it and with no new commit) on the pushed head, so a Fable pass proven with',
     '     a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) is re-reviewed. Refused (exit 2) unless a proven Fable round is below that and no later whole-PR pass at or above it replaced it (error nothing-stale), every earlier round is finished',
@@ -402,7 +402,7 @@ async function outcome(rest, ctx) {
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
   const state = requireState(root);
-  // Best effort: a stale origin/<default_branch> (after update-branch + a plain pull) only makes coverage look invalid; offline keeps the cached ref.
+  // Best effort: a stale origin/<default branch> (after update-branch + a plain pull) only makes coverage look invalid; offline keeps the cached ref.
   refreshBaseRef(root, config);
   const hash = currentContentHash(root, config);
   // The owner's open extra-round grant for the next counted round, for the checked-out HEAD (chat mode only; codex-review is the authority).
@@ -502,7 +502,7 @@ async function markImplemented(rest, ctx) {
         throw new Fail(EXIT.USAGE, { ok: false, error: 'not-accepted', message: `${item.id} is not an accepted item, so it cannot be marked implemented` });
       }
     }
-    // The hash must be measured from a FRESH origin/<default_branch>: a stale one makes the hash differ merely because main's new commits
+    // The hash must be measured from a FRESH origin/<default branch>: a stale one makes the hash differ merely because main's new commits
     // (merged into the PR by update-branch, pulled without a fetch of main) count as the PR's diff, and they would pass for the fix.
     // So this fails CLOSED (exit 3, nothing marked) whenever the base ref used is origin/<branch> and it was not refreshed in this call:
     // the fetch failed or timed out, or there is no origin remote but a leftover refs/remotes/origin/<branch>. Only a repo whose base
@@ -637,7 +637,7 @@ async function fableRefresh(rest, ctx) {
     const last = state.rounds.at(-1);
     const o = { cwd: root };
     const head = headSha(o);
-    // As in state outcome: a stale origin/<default_branch> only makes the content look moved, and the refusal below says what to do then.
+    // As in state outcome: a stale origin/<default branch> only makes the content look moved, and the refusal below says what to do then.
     refreshBaseRef(root, config);
     const hash = currentContentHash(root, config);
     const outcome = roundOutcome({ ...state, currentContentHash: hash });

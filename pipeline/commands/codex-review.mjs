@@ -59,7 +59,7 @@ export const meta = {
     '  reviewer: fable (medium/high risk, except medium for size only, or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
     '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable.',
     '    The judge also reviews a medium PR that is medium ONLY for its size (no hard-stop hit of any kind, no sensitive path, base branch = the default branch) unless',
-    '    review.size_only_medium_reviewer is fable; the output then has sizeOnly:true and laneNote. The rating uses the working-tree config AND the one committed at the',
+    '    review.size_only_medium_reviewer is fable; the output then has sizeOnly:true and laneNote (and laneNotes when origin/HEAD and pipeline.yml name different default branches: see `pipeline risk`). The rating uses the working-tree config AND the one committed at the',
     '    default branch\'s fork point (stricter wins; an unreadable one means fable). A PR that goes from judge to fable reviews the WHOLE PR in that round (kind whole-pr)',
     '  confirm fixed: an accepted item that a forced or Claude ruling marked implemented through files other than the one it names (state mark-implemented,',
     '    implementedVia other-files) is listed in the prompt of the next round that runs Codex (not a base-only one), with its original finding fenced as untrusted',
