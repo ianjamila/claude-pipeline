@@ -9,8 +9,8 @@ import { guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { GitError, headSha, isAncestor, treeFingerprint } from '../lib/git.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { LIMITS, STEPS, applyCheckpoint } from '../lib/run-record.mjs';
-import { VIEW_FIELDS, baseRecordFor } from '../lib/run-progress.mjs';
-import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
+import { VIEW_FIELDS, baseRecordFor, postResumedEvent, writeRunRecord } from '../lib/run-progress.mjs';
+import { readSummaryComment } from '../lib/summary-comment.mjs';
 
 export const meta = {
   summary: 'record where the review run stands in the PR summary comment (refuses unless local HEAD is the pushed PR head)',
@@ -19,7 +19,7 @@ export const meta = {
     '                    [--request-file F] [--tasks-file F] [--task-done ID] [--verify-report] [--round R] [--resumed] [--repo DIR]',
     '  -> {ok, url, action, record, warnings}; exit 1 {error: unpushed | behind | diverged} (local HEAD is not the PR head on GitHub), 2 usage, 3 GitHub unavailable',
     "  --request-file: the user's request, text, at most 2 KB · --tasks-file: JSON [{id, title, spec}] · --task-done ID: mark one task done (repeatable)",
-    '  --resumed: this run was taken over from an earlier session (or adopts a PR): stamps record.resumed {at, host, head}, which later checkpoints keep and which makes `P merge` require the owner\'s recorded "merge" (--owner-approved-head + --owner-approved-items)',
+    '  --resumed: this run was taken over from an earlier session (or adopts a PR): posts a run-resumed event (append-only, fails the command when it cannot be posted) and stamps record.resumed {at, host, head}, which later checkpoints keep; either makes `P merge` require the owner\'s recorded "merge" (--owner-approved-head + --owner-approved-items)',
     "  --verify-report: copy {head, tree, mode, ok, failedStep} of the verify report, only when its head and tree are this HEAD's (otherwise a warning)",
   ].join('\n'),
 };
@@ -129,11 +129,13 @@ export const run = guarded(async (argv, ctx) => {
       else warnings.push(v.warning);
     }
     patch.head = local;
-    if (values.resumed) patch.resumed = { at: new Date().toISOString(), host: hostname(), head: local };
+    if (values.resumed) {
+      patch.resumed = { at: new Date().toISOString(), host: hostname(), head: local };
+    }
 
     const existing = readSummaryComment(gh, pr);
     if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
-    const base = baseRecordFor(existing, { repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName });
+    const base = baseRecordFor(existing, { repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: local });
     warnings.push(...base.warnings);
     let record;
     try {
@@ -141,7 +143,14 @@ export const run = guarded(async (argv, ctx) => {
     } catch (err) {
       throw new UsageError(err.message);
     }
-    const posted = writeSummaryComment(gh, pr, { record, existing });
-    return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, record, warnings } };
+    if (values.resumed) {
+      // The append-only evidence, posted BEFORE the record: the record is one editable comment that a concurrent writer can overwrite, the event cannot be.
+      // It comes after the usage checks above (an exit 2 posts nothing). A stamp that may be lost must not look successful, so a failed post fails the
+      // command (guardGh: exit 3) and nothing is written.
+      postResumedEvent(gh, pr, patch.resumed);
+    }
+    // (the guarded writer re-reads first, which only narrows the window for a concurrent writer's `resumed` mark: the run-resumed event is the durable evidence)
+    const posted = writeRunRecord(gh, pr, { record, skipResumedEvent: Boolean(values.resumed) });
+    return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, record: posted.record, warnings } };
   });
 });

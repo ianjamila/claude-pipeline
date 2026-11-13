@@ -1,6 +1,7 @@
 // A scriptable stand-in for `gh`, so tests never touch GitHub. Point PIPELINE_GH at
 // `node <this file>` and describe the replies in the JSON file named by PIPELINE_FAKE_GH_SCRIPT:
-//   [{ match: "<regex source>", stdout?, stdoutJson?, stderr?, code? }]
+//   [{ match: "<regex source>", stdout?, stdoutJson?, stdoutJsonSeq?, stderr?, code? }]
+// stdoutJsonSeq: an array of replies, one per call that matches this entry (the last one repeats): lets a test change what GitHub says between two reads.
 // The first entry whose regex matches the space-joined argv wins. Every call is also appended to
 // PIPELINE_FAKE_GH_LOG (one JSON line: argv, cwd, stdin) so tests can assert what was run.
 import { readFileSync, appendFileSync } from 'node:fs';
@@ -42,7 +43,13 @@ if (!hit) {
   process.stderr.write(`fake-gh: no match for ${joined}`);
   process.exitCode = 99;
 } else {
-  if (hit.stdoutJson !== undefined) process.stdout.write(JSON.stringify(hit.stdoutJson));
+  if (hit.stdoutJsonSeq !== undefined) {
+    // (this call is already in the log: the ones before it that matched the same entry are its position in the sequence)
+    const re = new RegExp(hit.match);
+    const log = process.env.PIPELINE_FAKE_GH_LOG ? readFileSync(process.env.PIPELINE_FAKE_GH_LOG, 'utf8').split('\n').filter(Boolean) : [];
+    const before = log.slice(0, -1).filter((l) => re.test(JSON.parse(l).argv.join(' '))).length;
+    process.stdout.write(JSON.stringify(hit.stdoutJsonSeq[Math.min(before, hit.stdoutJsonSeq.length - 1)]));
+  } else if (hit.stdoutJson !== undefined) process.stdout.write(JSON.stringify(hit.stdoutJson));
   else if (hit.stdout) process.stdout.write(hit.stdout);
   if (hit.stderr) process.stderr.write(hit.stderr);
   process.exitCode = hit.code ?? 0;

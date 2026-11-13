@@ -301,15 +301,18 @@ export function applyCheckpoint(record, patch, { host, now }) {
 export function recordForOutcome(existing, { repo, pr, branch, baseRef, head, outcome, detail, agentLogLine, host, now, sessions, guardBlocks, guardBySession }) {
   const warnings = [];
   let base = existing;
+  let carriedResumed = null;
   if (base) {
     const mismatch = bindRecord(base, { repo, pr, branch });
     if (mismatch.length) {
       warnings.push(`the existing run record does not belong to this PR (${mismatch.join('; ')}); started a new one`);
+      carriedResumed = base.resumed ?? null; // (a rename / transfer must not clear the merge gate's resumed mark: it is still this PR's summary comment)
       base = null;
     }
   }
   base ??= emptyRecord({ repo, pr, branch, baseRef });
   const patch = {};
+  if (carriedResumed) patch.resumed = carriedResumed;
   if (head) patch.head = head;
   if (agentLogLine !== undefined) patch.agentLogLine = agentLogLine;
   // Sessions named now join the ones already recorded; `guardBlocks` / `guardBySession` (counted by the caller from the guard log) replace the old counts.

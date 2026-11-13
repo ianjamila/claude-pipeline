@@ -12,7 +12,8 @@ import { loadConfig } from '../lib/config.mjs';
 import { summarySections } from '../lib/render.mjs';
 import { recordForOutcome } from '../lib/run-record.mjs';
 import { costReport, guardLogFile, readGuardLog } from '../lib/run-cost.mjs';
-import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
+import { writeRunRecord } from '../lib/run-progress.mjs';
+import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { DEFAULT_OUTCOME, buildAgentLogLine } from '../lib/agentlog.mjs';
 import { inlineOptionValues } from '../lib/cmd-io.mjs';
 import { readModelProofs } from '../lib/review-context.mjs';
@@ -110,8 +111,8 @@ export const run = guarded(async (argv, ctx) => {
       outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession,
     });
     warnings.push(...guard.warnings);
-    const posted = writeSummaryComment(gh, pr, { record, sections, existing });
-    const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, cost: costReport(record.cost), warnings };
+    const posted = writeRunRecord(gh, pr, { record, sections, firstRead: existing });
+    const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: posted.record.step, cost: costReport(posted.record.cost), warnings };
     // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.
     if (outcome === 'merged') output.pendingLogLine = buildAgentLogLine({ state, pr, title, outcome: DEFAULT_OUTCOME });
     return { exitCode: EXIT.OK, output };
