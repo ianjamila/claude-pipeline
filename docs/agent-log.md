@@ -157,3 +157,4 @@ full record.
 - 2026-11-13 · #350 · Redraft follow-ups: correct setup rule, Rule 8 wording (#310), advice only when a fix is coming, pinned actions, CI proof wait 45 (#320), this repo iterates in draft · risk high · rounds 1 · arbiter 0 · blocked
 - 2026-11-13 · #351 · config: switch on the risk rating for claude-pipeline (PR B) · risk high · rounds 1 · arbiter 0 · blocked
 - 2026-11-13 · #350 · Redraft follow-ups: correct setup rule, Rule 8 wording (#310), advice only when a fix is coming, pinned actions, CI proof wait 45 (#320), this repo iterates in draft · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge
+- 2026-11-13 · #351 · config: switch on the risk rating for claude-pipeline (PR B) · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge
