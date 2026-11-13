@@ -354,7 +354,8 @@ head you did not review (the receipt names the head the event carried).
   The stack-stop seams `PIPELINE_DOCKER`, `PIPELINE_PS`, `PIPELINE_LSOF`, `PIPELINE_SUPABASE`, `PIPELINE_STACKS_DEADLINE_MS` and `PIPELINE_INSTALL_WORKER_WAIT_MS` follow a stricter rule: an installed copy ignores them always; in the repo checkout they count only when `PIPELINE_STACKS_HOME` points somewhere other than the default `~/.claude/pipeline-state/stacks` **and** `PIPELINE_STACKS_ONLY` names the projects that isolated run may touch.
 - **What blocks a change to a guard.** A guard change is held back only for (a) allowing on the branch what `main` denies, (b) missing a command an agent would plausibly write unprompted,
   (c) denying an everyday command, or (d) failing open on a timeout for plausible input. A deliberately evasive construction (non-default shell options, a crafted sourced file) is not a merge blocker: it goes
-  to a follow-up issue (#373).
+  to a follow-up issue (#373). A repo can state this as `review.threat_models` (see "Review threat models and the late fix-verify lane"): the arbiter and
+  Codex then judge security findings on the matching paths within that model, and a security finding outside it becomes a follow-up issue, never a merge block.
 - **Your chat "merge" is checked locally.** The owner-go hook records only prompts you type (Claude Code never runs it for
   the model or a subagent), and `P merge` and guard-git trust only those records. But the agent runs as your OS user and with
   your GitHub token: a program the guards cannot see into (a script that builds the record path at run time, a test that
@@ -398,6 +399,22 @@ and `ci.approvers` (logins whose approval labels count; required for org-owned r
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep
 one: a real-looking secret key literal (not marked fake inside the key itself) is still a `needs-human` hit there.
+
+### Review threat models and the late fix-verify lane (opt-in)
+
+Three `review` keys, all inert until you set them (the defaults change nothing):
+
+| Key | Default | What it does |
+|---|---|---|
+| `review.threat_models` | `[]` | Up to 10 `{name, paths, text}` (name `/^[a-z0-9-]{1,40}$/`, unique; `paths` non-empty globs; `text` up to 4000 characters). For a PR that touches a matching path, the Fable arbiter's input and the Codex prompt carry the model. A security finding (category `security`) on a matching file that lies outside the model is ruled FOLLOW-UP with `scope: "out-of-model"`: an issue is filed (the review is not complete until it is) and the merge block lists it ("arbiter (outside threat model NAME)"). It is never a REJECT, and bugs, broken behaviour, data loss, auth and permission problems keep their usual route. |
+| `review.fix_verify_after_round` | `null` (off) | `1..10`: counted rounds past this ordinal may get the narrow `arbiter-fix` brief even on `risk.high_risk_paths` / `review.arbiter_always_paths` files (never past a hard-stop hit other than a P-path, a size driver or a flagged fix scope). |
+| `review.fix_round_max_lines` | `150` | Non-test added lines a late fix round may have, and a new non-test source file, before the round falls back to the full brief. Computed live from the round diff. |
+
+Threat models and the late lane are read from the TRUSTED config (the default branch's, at the fork point `risk.mjs#trustedBase` pins on the round), and the late lane also needs the working-tree and fork-point configs to agree (strictest wins): a PR cannot loosen its own review by editing `pipeline.yml`. If the trusted config is unavailable, no model applies and the full brief runs, as before.
+
+**Install order.** An installed pipeline or vendored `config.mjs` older than this release rejects a `pipeline.yml` with these keys. (1) Merge and install this release (`pipeline update`); (2) `pipeline vendor --check`, and `pipeline vendor` on drift; (3) only then set the keys, in a later PR (the settings take effect from the next PR on, since the fork-point config is read).
+
+**Roll back.** Remove the three keys from `.claude/pipeline.yml` first (the review then behaves as before). An arbiter ruling that carries `outOfModel` lifts that PR's review state to version 4, which an older CLI refuses to read: finish or re-run the review of such a PR on the new CLI (or `pipeline state discard-round` the affected round) before you downgrade. To revert this release alone, `git revert` its commits after that; states without an out-of-model ruling stay at their old version and read fine.
 
 ### Merge hold (opt-in)
 
