@@ -23,7 +23,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R12 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? AT);
-      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state|R19 owner decision/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -148,13 +148,13 @@ describe('R12: heredoc readings are linear', () => {
 
 describe('R12-B2: the positional exit of the set whitelist needs a literal word', () => {
   denies('B2', [
-    ['set "$F"', 'F=-T; set "$F"; export proj=/home/u; cd proj && find . -delete', PROJ],
-    ['set -e $F', 'F=-T; set -e $F; export proj=/home/u; cd proj && find . -delete', PROJ],
-    ['set $(echo -T)', 'set $(echo -T); export proj=/home/u; cd proj && find . -delete', PROJ],
-    ['set `echo -T`', 'set `echo -T`; export proj=/home/u; cd proj && find . -delete', PROJ],
-    ['set * (a file named -T)', 'set *; export proj=/home/u; cd proj && find . -delete', PROJ],
-    ['set -o $N (a run-time option name)', 'N=cdablevars; set -o $N; export proj=/home/u; cd proj && find . -delete', PROJ],
-    ['set -e ? (a glob word)', 'set -e ?; export proj=/home/u; cd proj && find . -delete', PROJ],
+    ['set "$F" (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'F=-T; set "$F"; export proj=/home/u; cd proj && find . -delete', PROJ],
+    ['set -e $F (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'F=-T; set -e $F; export proj=/home/u; cd proj && find . -delete', PROJ],
+    ['set $(echo -T) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set $(echo -T); export proj=/home/u; cd proj && find . -delete', PROJ],
+    ['set `echo -T` (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set `echo -T`; export proj=/home/u; cd proj && find . -delete', PROJ],
+    ['set * (a file named -T) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set *; export proj=/home/u; cd proj && find . -delete', PROJ],
+    ['set -o $N (a run-time option name) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'N=cdablevars; set -o $N; export proj=/home/u; cd proj && find . -delete', PROJ],
+    ['set -e ? (a glob word) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -e ?; export proj=/home/u; cd proj && find . -delete', PROJ],
   ]);
   allows('B2', [
     ['set -- a b', 'set -- a b && cd ./proj && git add .'],
@@ -166,12 +166,12 @@ describe('R12-B2: the positional exit of the set whitelist needs a literal word'
 
 describe('R12-F3: builtin / command with --, and a command word known only at run time', () => {
   denies('F3', [
-    ['builtin -- shopt -s cdable_vars', 'export proj=/home/u; builtin -- shopt -s cdable_vars; cd proj && find . -delete', PROJ],
-    ['command -- set -T', 'export proj=/home/u; command -- set -T; cd proj && find . -delete', PROJ],
-    ['command -p -- shopt -s cdable_vars', 'export proj=/home/u; command -p -- shopt -s cdable_vars; cd proj && find . -delete', PROJ],
-    ['a run-time command word ($S -s cdable_vars)', 'S=shopt; export proj=/home/u; $S -s cdable_vars; cd proj && find . -delete', PROJ],
-    ['a wrapper in front of a run-time word', 'S=set; export proj=/home/u; builtin $S -T; cd proj && find . -delete', PROJ],
-    ['a wrapper in front of a glob word', 'export proj=/home/u; command se* -T; cd proj && find . -delete', PROJ],
+    ['builtin -- shopt -s cdable_vars (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; builtin -- shopt -s cdable_vars; cd proj && find . -delete', PROJ],
+    ['command -- set -T (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; command -- set -T; cd proj && find . -delete', PROJ],
+    ['command -p -- shopt -s cdable_vars (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; command -p -- shopt -s cdable_vars; cd proj && find . -delete', PROJ],
+    ['a run-time command word ($S -s cdable_vars) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'S=shopt; export proj=/home/u; $S -s cdable_vars; cd proj && find . -delete', PROJ],
+    ['a wrapper in front of a run-time word (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'S=set; export proj=/home/u; builtin $S -T; cd proj && find . -delete', PROJ],
+    ['a wrapper in front of a glob word (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; command se* -T; cd proj && find . -delete', PROJ],
   ]);
   allows('F3', [
     ['builtin -- echo is not a switch', 'builtin -- echo hi && cd ./proj && git add .'],
@@ -182,11 +182,11 @@ describe('R12-F3: builtin / command with --, and a command word known only at ru
 describe('R12-F4: a source that switches cdablevars on makes every cd of the file unknown', () => {
   const stub = (files) => ({ cwd: `${HOME}/proj`, readText: (p) => files[p] ?? null, existsSync: (p) => Object.hasOwn(files, p) });
   denies('F4', [
-    ['a function that cds, defined before the nested source that switches (run after it)', 'source ./o.sh && find . -delete',
+    ['a function that cds, defined before the nested source that switches (run after it) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'source ./o.sh && find . -delete',
       stub({ '/home/u/proj/o.sh': 'f() { cd proj; }\nsource /home/u/proj/p.sh\nf\n', '/home/u/proj/p.sh': 'set -o cdablevars\nproj=/home/u\n' })],
-    ['a loop that cds, then sources the switch (second pass)', 'source ./o.sh && find . -delete',
+    ['a loop that cds, then sources the switch (second pass) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'source ./o.sh && find . -delete',
       stub({ '/home/u/proj/o.sh': 'for i in 1 2; do cd proj; source /home/u/proj/p.sh; done\n', '/home/u/proj/p.sh': 'set -o cdablevars\nproj=/home/u\n' })],
-    ['the switch in the file itself, a cd earlier in the text, no cd on the line', 'source ./o.sh && find . -delete',
+    ['the switch in the file itself, a cd earlier in the text, no cd on the line (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'source ./o.sh && find . -delete',
       stub({ '/home/u/proj/o.sh': 'f() { cd proj; }\nset -o cdablevars\nproj=/home/u\nf\n' })],
     ['a switched source and a later relative write (no cd ./anywhere) (R17 owner decision: option state no longer matters for a literal cd)', 'source ./o.sh && find . -delete',
       stub({ '/home/u/proj/o.sh': 'set -o cdablevars\n' })],

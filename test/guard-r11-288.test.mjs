@@ -25,7 +25,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R11 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? AT);
-      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state|R19 owner decision/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -115,27 +115,27 @@ describe('R11: heredoc readings are linear', () => {
 
 describe('R11-B2: cdablevars applies to pushd and chdir', () => {
   denies('B2', [
-    ['set -o cdablevars then pushd', 'export proj=/home/u && set -o cdablevars && pushd proj && find . -delete', PROJ],
-    ['setopt cdablevars then pushd', 'export proj=/home/u && setopt cdablevars && pushd proj && find . -delete', PROJ],
+    ['set -o cdablevars then pushd (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u && set -o cdablevars && pushd proj && find . -delete', PROJ],
+    ['setopt cdablevars then pushd (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u && setopt cdablevars && pushd proj && find . -delete', PROJ],
   ]);
 });
 
 describe('R11-F2: what turns cdablevars on (whitelist for set; any option word otherwise)', () => {
   denies('F2', [
-    ['set -T', 'export proj=/home/u && set -T && cd proj && find . -delete', PROJ],
-    ['set -eT (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u && set -eT && cd proj && find . -delete', PROJ],
-    ['set +T', 'set +T && cd proj && find . -delete', PROJ],
-    ['unsetopt nocdablevars', 'export proj=/home/u && unsetopt nocdablevars && cd proj && find . -delete', PROJ],
-    ['unsetopt with any word', 'unsetopt autocd && cd proj && find . -delete', PROJ],
-    ['setopt -T', 'export proj=/home/u && setopt -T && cd proj && find . -delete', PROJ],
-    ['emulate zsh -o cdablevars', 'export proj=/home/u && emulate zsh -o cdablevars && cd proj && find . -delete', PROJ],
-    ['emulate -R zsh', 'emulate -R zsh && cd proj && find . -delete', PROJ],
-    ['a run-time flag word (set -$F)', 'F=T; set -$F && export proj=/home/u && cd proj && find . -delete', PROJ],
-    ['an unknown -o name', 'set -o posix && cd proj && find . -delete', PROJ],
-    ['chdir after setopt (R18-F2: chdir is a cd again, a bare target is unknown)', 'export proj=/home/u && setopt cdablevars && chdir proj && find . -delete', PROJ],
-    ['shopt with any word', 'shopt -s extglob && cd proj && find . -delete', PROJ],
-    ['builtin set -T', 'export proj=/home/u && builtin set -T && cd proj && find . -delete', PROJ],
-    ['command setopt cdablevars', 'export proj=/home/u && command setopt cdablevars && cd proj && find . -delete', PROJ],
+    ['set -T (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u && set -T && cd proj && find . -delete', PROJ],
+    ['set -eT (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u && set -eT && cd proj && find . -delete', PROJ],
+    ['set +T (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set +T && cd proj && find . -delete', PROJ],
+    ['unsetopt nocdablevars (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u && unsetopt nocdablevars && cd proj && find . -delete', PROJ],
+    ['unsetopt with any word (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'unsetopt autocd && cd proj && find . -delete', PROJ],
+    ['setopt -T (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u && setopt -T && cd proj && find . -delete', PROJ],
+    ['emulate zsh -o cdablevars (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u && emulate zsh -o cdablevars && cd proj && find . -delete', PROJ],
+    ['emulate -R zsh (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'emulate -R zsh && cd proj && find . -delete', PROJ],
+    ['a run-time flag word (set -$F) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'F=T; set -$F && export proj=/home/u && cd proj && find . -delete', PROJ],
+    ['an unknown -o name (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -o posix && cd proj && find . -delete', PROJ],
+    ['chdir after setopt (R18-F2: chdir is a cd again, a bare target is unknown) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u && setopt cdablevars && chdir proj && find . -delete', PROJ],
+    ['shopt with any word (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'shopt -s extglob && cd proj && find . -delete', PROJ],
+    ['builtin set -T (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u && builtin set -T && cd proj && find . -delete', PROJ],
+    ['command setopt cdablevars (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u && command setopt cdablevars && cd proj && find . -delete', PROJ],
   ]);
   allows('F2', [
     ['set -euo pipefail stays narrowed from home', 'set -euo pipefail && cd ./proj && git add .'],
@@ -152,11 +152,11 @@ describe('R11-F3: a sourced file that switches cdablevars on', () => {
   const stub = (files) => ({ cwd: `${HOME}/proj`, readText: (p) => files[p] ?? null, existsSync: (p) => Object.hasOwn(files, p) });
   denies('F3', [
     ['source ./o.sh holding setopt cdablevars', 'source ./o.sh && export proj=/home/u && cd proj && find . -delete', stub({ '/home/u/proj/o.sh': 'setopt cdablevars\n' })],
-    ['source ./o.sh holding set -o cdablevars (a file nothing else poisons)', 'source ./o.sh && export proj=/home/u && cd proj && find . -delete', stub({ '/home/u/proj/o.sh': 'set -o cdablevars\n' })],
-    ['source ./o.sh holding set -T', 'source ./o.sh && export proj=/home/u && cd proj && find . -delete', stub({ '/home/u/proj/o.sh': 'set -T\n' })],
-    ['a nested source of set -o cdablevars', 'source ./o.sh && export proj=/home/u && cd proj && find . -delete',
+    ['source ./o.sh holding set -o cdablevars (a file nothing else poisons) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'source ./o.sh && export proj=/home/u && cd proj && find . -delete', stub({ '/home/u/proj/o.sh': 'set -o cdablevars\n' })],
+    ['source ./o.sh holding set -T (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'source ./o.sh && export proj=/home/u && cd proj && find . -delete', stub({ '/home/u/proj/o.sh': 'set -T\n' })],
+    ['a nested source of set -o cdablevars (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'source ./o.sh && export proj=/home/u && cd proj && find . -delete',
       stub({ '/home/u/proj/o.sh': 'source /home/u/proj/p.sh\n', '/home/u/proj/p.sh': 'set -o cdablevars\n' })],
-    ['a nested source', 'source ./o.sh && export proj=/home/u && cd proj && find . -delete',
+    ['a nested source (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'source ./o.sh && export proj=/home/u && cd proj && find . -delete',
       stub({ '/home/u/proj/o.sh': 'source /home/u/proj/p.sh\n', '/home/u/proj/p.sh': 'set -T\n' })],
     ['the variable set in the file too, pushd on the line', 'source ./o.sh && pushd proj && find . -delete', stub({ '/home/u/proj/o.sh': 'setopt cdablevars\nproj=/home/u\n' })],
   ]);

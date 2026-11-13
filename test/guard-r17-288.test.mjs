@@ -20,7 +20,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R17 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? PROJ);
-      assert.equal(r.decision, 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R19 owner decision|R19-F1|R19-B1/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -42,18 +42,18 @@ const OK = 'echo hi\n';
 
 describe('R17 owner decision: a cd target narrows only when it is . or .. or starts with /, ./ or ../', () => {
   denies('cd rule', [
-    ['bare name, no export', 'cd proj && find . -delete'],
-    ['bare name with a sub path', 'cd proj/sub && find . -delete'],
-    ['bare name that is a variable name (cdable_vars)', `${E}cd proj && find . -delete`],
+    ['bare name, no export (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'cd proj && find . -delete'],
+    ['bare name with a sub path (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'cd proj/sub && find . -delete'],
+    ['bare name that is a variable name (cdable_vars) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}cd proj && find . -delete`],
     ['bare name, CDPATH in the environment', 'export CDPATH=/home/u; cd proj && find . -delete'],
-    ['pushd with a bare name', 'pushd proj && find . -delete'],
-    ['cd -- NAME', 'cd -- proj && find . -delete'],
+    ['pushd with a bare name (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'pushd proj && find . -delete'],
+    ['cd -- NAME (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'cd -- proj && find . -delete'],
     ['cd ~user', 'cd ~root && find . -delete'],
     ['cd -', 'cd - && find . -delete'],
-    ['a name held in a variable', 'D=proj; cd $D && find . -delete'],
-    ['a bare name inside a sourced file', `source ./a.sh`, A],
-    ['a bare name in a file bash runs', `bash ./a.sh`, A],
-    ['a bare name in a -c text', `bash -c 'cd proj && find . -delete'`],
+    ['a name held in a variable (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'D=proj; cd $D && find . -delete'],
+    ['a bare name inside a sourced file (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `source ./a.sh`, A],
+    ['a bare name in a file bash runs (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `bash ./a.sh`, A],
+    ['a bare name in a -c text (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `bash -c 'cd proj && find . -delete'`],
   ]);
   allows('cd rule', [
     ['cd ./proj and a delete of a build folder', 'cd ./proj && rm -rf build'],
@@ -70,8 +70,8 @@ describe('R17 owner decision: a cd target narrows only when it is . or .. or sta
     ['a file with ./NAME', 'bash ./a.sh', stub({ '/home/u/proj/a.sh': 'cd ./proj && rm -rf build\n' })],
     ['set -euo pipefail does not matter', 'set -euo pipefail; cd ./proj && rm -rf build'],
   ]);
-  test('#288 R17 the deny reason for a bare cd names the fix', () => {
-    const r = run('cd proj && find . -delete', PROJ);
+  test('#288 R17 the deny reason for a bare cd names the fix (R19 owner decision: with CDPATH set)', () => {
+    const r = run('cd proj && find . -delete', { ...PROJ, env: { CDPATH: '/home/u' } });
     assert.equal(r.decision, 'deny');
     assert.match(r.reason, /\.\/NAME/);
     assert.match(r.reason, /absolute path/);
@@ -118,8 +118,8 @@ describe('R17 AUTO_CD (a command word that is a directory runs a cd): the word d
 describe('R17-B1: the startup file of a shell started with -O cdable_vars', () => {
   const RC = stub({ '/home/u/proj/rc.sh': body });
   denies('B1', [
-    ['BASH_ENV file, bash -O cdable_vars -c', `${E}BASH_ENV=./rc.sh bash -O cdable_vars -c :`, RC],
-    ['BASH_ENV file, plain bash -c', `${E}BASH_ENV=./rc.sh bash -c :`, RC],
+    ['BASH_ENV file, bash -O cdable_vars -c (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}BASH_ENV=./rc.sh bash -O cdable_vars -c :`, RC],
+    ['BASH_ENV file, plain bash -c (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}BASH_ENV=./rc.sh bash -c :`, RC],
   ]);
   allows('B1', [
     ['BASH_ENV file with ./NAME', `${E}BASH_ENV=./rc.sh bash -O cdable_vars -c :`, stub({ '/home/u/proj/rc.sh': 'cd ./proj && rm -rf build\n' })],
@@ -163,19 +163,19 @@ describe('R17-F1: every o / O in an option cluster takes the next word', () => {
 describe('R17-F2: a file copied and run with and without the option', () => {
   const F = { '/home/u/proj/a.sh': body, '/home/u/proj/sw.sh': SWS };
   denies('F2', [
-    ['cp, run, run with -O cdable_vars', `${E}cp ./a.sh ./n.sh; bash ./n.sh; bash -O cdable_vars ./n.sh`, stub(F)],
+    ['cp, run, run with -O cdable_vars (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}cp ./a.sh ./n.sh; bash ./n.sh; bash -O cdable_vars ./n.sh`, stub(F)],
     ['cp, loop: run, then the switch file', `${E}cp ./a.sh ./n.sh; for i in 1 2; do bash ./n.sh; source ./sw.sh; done`, stub(F)],
-    ['cp, loop: run n.sh both ways', `${E}cp ./a.sh ./n.sh; for o in -O; do bash ./n.sh; bash $o cdable_vars ./n.sh; done`, stub(F)],
+    ['cp, loop: run n.sh both ways (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}cp ./a.sh ./n.sh; for o in -O; do bash ./n.sh; bash $o cdable_vars ./n.sh; done`, stub(F)],
   ]);
 });
 
 describe('R17-F3 / F4: a shebang that names the option', () => {
   denies('F3', [
-    ['node_modules/.bin/tool = #!/bin/zsh -T, npx tool', `${E}npx tool`, stub({ '/home/u/proj/node_modules/.bin/tool': `#!/bin/zsh -T\n${body}` })],
-    ['npx tool, plain sh shebang (bare cd is unknown on its own)', `${E}npx tool`, stub({ '/home/u/proj/node_modules/.bin/tool': `#!/bin/sh\n${body}` })],
+    ['node_modules/.bin/tool = #!/bin/zsh -T, npx tool (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}npx tool`, stub({ '/home/u/proj/node_modules/.bin/tool': `#!/bin/zsh -T\n${body}` })],
+    ['npx tool, plain sh shebang (bare cd is unknown on its own) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}npx tool`, stub({ '/home/u/proj/node_modules/.bin/tool': `#!/bin/sh\n${body}` })],
   ]);
   denies('F4', [
-    ['#!/usr/bin/env -S BASHOPTS=cdable_vars bash', `${E}./a.sh`, stub({ '/home/u/proj/a.sh': `#!/usr/bin/env -S BASHOPTS=cdable_vars bash\n${body}` })],
+    ['#!/usr/bin/env -S BASHOPTS=cdable_vars bash (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}./a.sh`, stub({ '/home/u/proj/a.sh': `#!/usr/bin/env -S BASHOPTS=cdable_vars bash\n${body}` })],
   ]);
   allows('F3', [
     ['npx tool with ./NAME', `${E}npx tool`, stub({ '/home/u/proj/node_modules/.bin/tool': '#!/bin/zsh -T\ncd ./proj && rm -rf build\n' })],
@@ -184,13 +184,13 @@ describe('R17-F3 / F4: a shebang that names the option', () => {
 
 describe('R17-F5: options held in a run-time word', () => {
   denies('F5', [
-    ['O=\'-O cdable_vars .\'; bash $O/a.sh', `${E}O='-O cdable_vars .'; bash $O/a.sh`, A],
+    ['O=\'-O cdable_vars .\'; bash $O/a.sh (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}O='-O cdable_vars .'; bash $O/a.sh`, A],
   ]);
 });
 
 describe('R17-F6: eval of a wrapper that sources a switch', () => {
   denies('F6', [
-    ['eval "$(cat wrap.sh)" (wrap.sh sources sw.sh), then the cd', `${E}eval "$(cat ./wrap.sh)"; cd proj && find . -delete`, stub({ '/home/u/proj/wrap.sh': '. ./sw.sh\n', '/home/u/proj/sw.sh': SWS })],
+    ['eval "$(cat wrap.sh)" (wrap.sh sources sw.sh), then the cd (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}eval "$(cat ./wrap.sh)"; cd proj && find . -delete`, stub({ '/home/u/proj/wrap.sh': '. ./sw.sh\n', '/home/u/proj/sw.sh': SWS })],
   ]);
   allows('F6', [
     ['the same with ./NAME', `${E}eval "$(cat ./wrap.sh)"; cd ./proj && rm -rf build`, stub({ '/home/u/proj/wrap.sh': '. ./sw.sh\n', '/home/u/proj/sw.sh': SWS })],
@@ -224,10 +224,10 @@ describe('R17-F7: a loop that runs an earlier file again after a later file move
 
 describe('R17 old pins that still hold', () => {
   denies('old', [
-    ['an exported BASHOPTS and a bare cd', `${E}export BASHOPTS=cdable_vars; cd proj && find . -delete`],
-    ['shopt -s cdable_vars and a bare cd', `${E}shopt -s cdable_vars; cd proj && find . -delete`],
-    ['set -T (zsh) and a bare cd', `${E}set -T; cd proj && find . -delete`],
-    ['zsh -T -c', `${E}zsh -T -c 'cd proj && find . -delete'`],
-    ['-ocdablevars glued', `${E}zsh -ocdablevars ./a.sh`, A],
+    ['an exported BASHOPTS and a bare cd (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}export BASHOPTS=cdable_vars; cd proj && find . -delete`],
+    ['shopt -s cdable_vars and a bare cd (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}shopt -s cdable_vars; cd proj && find . -delete`],
+    ['set -T (zsh) and a bare cd (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}set -T; cd proj && find . -delete`],
+    ['zsh -T -c (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}zsh -T -c 'cd proj && find . -delete'`],
+    ['-ocdablevars glued (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}zsh -ocdablevars ./a.sh`, A],
   ]);
 });

@@ -21,7 +21,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R13 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? PROJ);
-      assert.equal(r.decision, 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R19 owner decision|R19-F1|R19-B1/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -43,19 +43,19 @@ const tail = (word) => TAIL.replace('%W%', word);
 describe('R13-B1: a run-time command word is a switch whatever the argument count', () => {
   const S = 'S="shopt -s cdable_vars"; ';
   denies('B1', [
-    ['$S', S + tail('$S')],
+    ['$S (R19 owner decision: a plain cd name narrows unless CDPATH is set)', S + tail('$S')],
     ['${=S} (zsh word splitting)', S + tail('${=S}')],
     ['$=S (zsh word splitting)', S + tail('$=S')],
     ['$(echo shopt -s cdable_vars)', tail('$(echo shopt -s cdable_vars)')],
     ['`echo shopt -s cdable_vars`', tail('`echo shopt -s cdable_vars`')],
-    ['eval $S', S + tail('eval $S')],
-    ['eval "$S"', S + tail('eval "$S"')],
+    ['eval $S (R19 owner decision: a plain cd name narrows unless CDPATH is set)', S + tail('eval $S')],
+    ['eval "$S" (R19 owner decision: a plain cd name narrows unless CDPATH is set)', S + tail('eval "$S"')],
     ['a glob command word (se*)', tail('se*')],
     ['a quoted zsh splitting expansion ("${=S})"', S + tail('"${=S}"')],
     ['a quoted (z)-split expansion', S + tail('"${(z)S}"')],
     ['a quoted command substitution', tail('"$(echo shopt -s cdable_vars)"')],
-    ['a lone quoted word behind a wrapper', S + tail('builtin "$S"')],
-    ['an unquoted path word', 'X=/a; ' + tail('$X/b.sh')],
+    ['a lone quoted word behind a wrapper (R19 owner decision: a plain cd name narrows unless CDPATH is set)', S + tail('builtin "$S"')],
+    ['an unquoted path word (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'X=/a; ' + tail('$X/b.sh')],
   ]);
   allows('B1', [
     ['a literal command word alone', 'ls && cd proj && git add .'],
@@ -66,11 +66,11 @@ describe('R13-B1: a run-time command word is a switch whatever the argument coun
 
 describe('R13-F1: the zsh precommand modifier `-` is a wrapper', () => {
   denies('F1', [
-    ['- setopt cdablevars', tail('- setopt cdablevars')],
-    ['- set -T', tail('- set -T')],
-    ['- emulate zsh -o cdablevars', tail('- emulate zsh -o cdablevars')],
-    ['- builtin set -T (a wrapper behind it)', tail('- builtin set -T')],
-    ['- $S (a run-time word behind it)', 'S="setopt cdablevars"; ' + tail('- $S')],
+    ['- setopt cdablevars (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('- setopt cdablevars')],
+    ['- set -T (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('- set -T')],
+    ['- emulate zsh -o cdablevars (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('- emulate zsh -o cdablevars')],
+    ['- builtin set -T (a wrapper behind it) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('- builtin set -T')],
+    ['- $S (a run-time word behind it) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'S="setopt cdablevars"; ' + tail('- $S')],
   ]);
   allows('F1', [
     ['- before a harmless command', '- echo hi && cd proj && git add .'],
@@ -120,9 +120,9 @@ describe('R13-F3 (1): E is a safe set flag', () => {
 
 describe('R13 post-push (2): the line\'s own switch reaches the sources it follows', () => {
   denies('switch + source', [
-    ['set -T, then a source that cds', 'set -T; export proj=/home/u; source ./a.sh && find . -delete', stub({ '/home/u/proj/a.sh': 'cd proj\n' })],
+    ['set -T, then a source that cds (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; source ./a.sh && find . -delete', stub({ '/home/u/proj/a.sh': 'cd proj\n' })],
     ['setopt cdablevars after the source in the text', 'export proj=/home/u; source ./a.sh && find . -delete; setopt cdablevars', stub({ '/home/u/proj/a.sh': 'cd proj\n' })],
-    ['a nested source that cds', 'set -T; export proj=/home/u; source ./a.sh && find . -delete', stub({ '/home/u/proj/a.sh': 'source /home/u/proj/b.sh\n', '/home/u/proj/b.sh': 'pushd proj\n' })],
+    ['a nested source that cds (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; source ./a.sh && find . -delete', stub({ '/home/u/proj/a.sh': 'source /home/u/proj/b.sh\n', '/home/u/proj/b.sh': 'pushd proj\n' })],
   ]);
   allows('switch + source', [
     ['no switch: a source that cds to a literal directory', 'source ./a.sh && find . -delete', stub({ '/home/u/proj/a.sh': 'cd /tmp/safe\n' })],
@@ -131,13 +131,13 @@ describe('R13 post-push (2): the line\'s own switch reaches the sources it follo
 
 describe('R13 post-push (3): a literal word is a positive shape', () => {
   denies('literal shape', [
-    ['set ^x (a zsh glob spelling -o cdablevars)', tail('set ^x')],
-    ['set ~x', tail('set ~x')],
-    ['set -e ^x', tail('set -e ^x')],
-    ['set <x', tail('set \\<x')],
-    ['s#etopt (a zsh glob command word)', tail('s#etopt cdablevars')],
-    ['s#etopt with no argument', tail('s#etopt')],
-    ['!set', tail('\\!set -T')],
+    ['set ^x (a zsh glob spelling -o cdablevars) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('set ^x')],
+    ['set ~x (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('set ~x')],
+    ['set -e ^x (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('set -e ^x')],
+    ['set <x (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('set \\<x')],
+    ['s#etopt (a zsh glob command word) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('s#etopt cdablevars')],
+    ['s#etopt with no argument (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('s#etopt')],
+    ['!set (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('\\!set -T')],
   ]);
   allows('literal shape', [
     ['set -- a b', 'set -- a b && cd proj && git add .'],

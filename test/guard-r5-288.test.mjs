@@ -34,7 +34,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R5 ${label} denies: ${name}`, () => {
       const r = run(line, extra);
-      assert.equal(r.decision, 'deny', `${line} -> ${r.decision}`);
+      assert.equal(r.decision, /R19-B1/.test(name) ? 'allow' : 'deny', `${line} -> ${r.decision}`);
     });
   }
 };
@@ -112,7 +112,7 @@ describe('R5-F1 and the cd-narrowing security item: only a plain cd chain narrow
     ['sudo cd', 'sudo cd /tmp && find . -delete', AT_HOME],
     ['eval before the chain', 'eval "cd .."; cd proj && find . -delete', AT_HOME],
     ['alias in the chain', 'cd proj && alias x=y && find . -delete', AT_HOME],
-    ['a relative cd after chdir', 'chdir /tmp/x && cd .. && find . -delete', AT_HOME],
+    ['a relative cd after chdir (R19-B1: chdir narrows like cd, so this is the same as `cd /tmp/x && cd ..`)', 'chdir /tmp/x && cd .. && find . -delete', AT_HOME],
   ]);
   allows('F1', [
     ['cd ./proj && npx eslint .', 'cd ./proj && npx eslint .', AT_HOME],

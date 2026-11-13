@@ -16,7 +16,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R8 ${label} denies: ${name}`, () => {
       const r = run(line, extra);
-      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state|R19 owner decision/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -68,7 +68,7 @@ describe('R8: the narrowing keeps refusing what the shell may not run', () => {
   denies('keep', [
     ['! cd', '! cd /tmp/nonexistent && find . -delete', AT],
     ['a negated command in the chain', 'cd /tmp/nonexistent && ! true && find . -delete', AT],
-    ['chdir', 'chdir /tmp/nonexistent && find . -delete', AT],
+    ['chdir (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'chdir /tmp/nonexistent && find . -delete', AT],
     ['eval', 'eval "cd /tmp/nonexistent" && find . -delete', AT],
     ['source', 'source ./x && cd /tmp/nonexistent && find . -delete', AT],
     ['a cd in an if condition', 'if cd /tmp/nonexistent; then :; fi && find . -delete', AT],
@@ -96,7 +96,7 @@ describe('R8-F3 (#315): everyday lines narrow to the project', () => {
   const AT = { cwd: HOME };
   allows('F3', [
     ['a trailing comment', 'cd ~/Claude/proj && git add . # stage', AT],
-    ['a leading comment (R17 owner decision: a bare cd is unknown)', '# stage the work\ncd proj && git add .', AT],
+    ['a leading comment (R19 owner decision: a plain cd name narrows unless CDPATH is set)', '# stage the work\ncd proj && git add .', AT],
     ['git commit -F - with a heredoc', "cd ./proj && git add . && git commit -F - <<'EOF'\nfix: the thing\n\nbody\nEOF", AT],
     ['git commit -m with a heredoc in a substitution', "cd ./proj && git add . && git commit -m \"$(cat <<'EOF'\nfix: the thing\nEOF\n)\"", AT],
     ['a plain cd ./narrowing', 'cd ./proj && git add .', AT],

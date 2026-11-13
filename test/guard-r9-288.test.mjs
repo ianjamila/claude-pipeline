@@ -21,7 +21,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R9 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? AT);
-      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state|R19 owner decision/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -103,7 +103,7 @@ describe('R9: everyday lines still narrow to the project', () => {
     ['eslint', 'cd ./proj && npx eslint .'],
     ['mkdir then cd ./then cmake', 'mkdir build && cd ./build && cmake ..', { cwd: '/home/u/proj' }],
     ['a trailing comment', 'cd ./proj && git add . # stage'],
-    ['a leading comment line (R17 owner decision: a bare cd is unknown)', '# stage the work\ncd proj && git add .'],
+    ['a leading comment line (R19 owner decision: a plain cd name narrows unless CDPATH is set)', '# stage the work\ncd proj && git add .'],
     ['git commit -F - heredoc', "cd ./proj && git add . && git commit -F - <<'EOF'\nfix: the thing\n\nbody\nEOF"],
     ['git commit -m "$(cat <<EOF)"', "cd ./proj && git add . && git commit -m \"$(cat <<'EOF'\nfix: the thing\nEOF\n)\""],
     ['an assignment prefix on the cd', 'A=x cd ./proj && git add .'],

@@ -18,7 +18,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R14 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? PROJ);
-      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state|R19 owner decision/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -71,16 +71,16 @@ describe('R14-F1: a double-quoted word that zsh splits is no exemption', () => {
 describe('R14-F2: the line\'s own switch reaches the frame that judges a sourced file\'s own commands', () => {
   const body = 'cd proj && find . -delete\n';
   denies('F2', [
-    ['set -T; source ./a.sh (relative)', 'set -T; export proj=/home/u; source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
-    ['setopt cdablevars; . /home/u/proj/a.sh (absolute)', 'setopt cdablevars; export proj=/home/u; . /home/u/proj/a.sh', stub({ '/home/u/proj/a.sh': body })],
-    ['a nested source (a.sh sources b.sh, which holds the cd and the find)', 'set -T; export proj=/home/u; source ./a.sh', stub({ '/home/u/proj/a.sh': 'source /home/u/proj/b.sh\n', '/home/u/proj/b.sh': body })],
-    ['the switch after the source in the text', 'export proj=/home/u; source ./a.sh; setopt cdablevars', stub({ '/home/u/proj/a.sh': body })],
-    ['eval of the file text (same shell)', 'set -T; export proj=/home/u; eval "$(cat ./a.sh)"', stub({ '/home/u/proj/a.sh': body })],
-    ['builtin source', 'set -T; export proj=/home/u; builtin source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
+    ['set -T; source ./a.sh (relative) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
+    ['setopt cdablevars; . /home/u/proj/a.sh (absolute) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'setopt cdablevars; export proj=/home/u; . /home/u/proj/a.sh', stub({ '/home/u/proj/a.sh': body })],
+    ['a nested source (a.sh sources b.sh, which holds the cd and the find) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; source ./a.sh', stub({ '/home/u/proj/a.sh': 'source /home/u/proj/b.sh\n', '/home/u/proj/b.sh': body })],
+    ['the switch after the source in the text (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; source ./a.sh; setopt cdablevars', stub({ '/home/u/proj/a.sh': body })],
+    ['eval of the file text (same shell) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; eval "$(cat ./a.sh)"', stub({ '/home/u/proj/a.sh': body })],
+    ['builtin source (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; builtin source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
   ]);
   allows('F2', [
-    ['no switch: the same file is judged against the literal cd (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
-    ['a separate shell (bash FILE) does not inherit the line\'s switch (R17 owner decision: a bare cd is unknown)', 'set -T; export proj=/home/u; bash ./a.sh', stub({ '/home/u/proj/a.sh': body })],
+    ['no switch: the same file is judged against the literal cd (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
+    ['a separate shell (bash FILE) does not inherit the line\'s switch (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; bash ./a.sh', stub({ '/home/u/proj/a.sh': body })],
     ['a switch, but the file only holds a harmless command', 'set -T; source ./a.sh', stub({ '/home/u/proj/a.sh': 'echo hi\n' })],
   ]);
 });
@@ -95,7 +95,7 @@ describe('R14-F3: a ~/ command word and a dequoted path with a space are literal
     ['~x as a command word', tail('~x')],
     ['~+ as a command word', tail('~+')],
     ['~- as a command word', tail('~-')],
-    ['set ~x', tail('set ~x')],
-    ['~/ followed by a reference', 'S=shopt; ' + tail('~/$S')],
+    ['set ~x (R19 owner decision: a plain cd name narrows unless CDPATH is set)', tail('set ~x')],
+    ['~/ followed by a reference (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'S=shopt; ' + tail('~/$S')],
   ]);
 });

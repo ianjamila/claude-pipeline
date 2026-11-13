@@ -27,7 +27,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R18 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? PROJ);
-      assert.equal(r.decision, 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R19 owner decision|R19-F1|R19-B1/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -87,7 +87,7 @@ describe('R18-F7: the line\'s own repeat frames', () => {
     ['until: cd ..', 'until false; do find . -delete; cd ..; done', D],
     ['a function that climbs, called several times', 'f() { cd ..; }; f; f; f; f; find . -delete', D],
     ['cd ../x in a loop', 'for i in 1 2 3 4 5; do cd ../x; done; find . -delete', D],
-    ['cd ./x in a loop', 'for i in 1 2 3 4 5; do cd ./x; done; find . -delete', D],
+    ['cd ./x in a loop (R19-F1: ./x only descends, so it narrows)', 'for i in 1 2 3 4 5; do cd ./x; done; find . -delete', D],
     ['pushd .. in a loop', 'for i in 1 2 3 4 5; do pushd ..; done; find . -delete', D],
     ['chdir .. in a loop', 'for i in 1 2 3 4 5; do chdir ..; done; find . -delete', D],
     ['a climb in a trap action', "trap 'cd ..' DEBUG; true; true; true; true; find . -delete", D],
@@ -104,8 +104,8 @@ describe('R18-F7: the line\'s own repeat frames', () => {
 
 describe('R18-F2: chdir is a cd (the same whitelist)', () => {
   denies('F2', [
-    ['chdir proj (a bare name)', 'chdir proj && find . -delete'],
-    ['chdir proj after cdablevars is on', 'export proj=/home/u && setopt cdablevars && chdir proj && find . -delete'],
+    ['chdir proj (a bare name) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'chdir proj && find . -delete'],
+    ['chdir proj after cdablevars is on (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u && setopt cdablevars && chdir proj && find . -delete'],
     ['chdir /home/u', 'chdir /home/u && find . -delete'],
     ['chdir .. twice', 'chdir ..; chdir ..; find . -delete', { cwd: `${HOME}/a/b` }],
     ['chdir -', 'chdir - && find . -delete'],

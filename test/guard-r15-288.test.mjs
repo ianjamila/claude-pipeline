@@ -18,7 +18,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R15 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? PROJ);
-      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state|R19 owner decision/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -35,34 +35,34 @@ const A = stub({ '/home/u/proj/a.sh': body });
 
 describe('R15-F1: wrappers and feeds reach the same shell', () => {
   denies('F1', [
-    ['builtin source', 'set -T; export proj=/home/u; builtin source ./a.sh', A],
-    ['command .', 'setopt cdablevars; export proj=/home/u; command . ./a.sh', A],
-    ['command -p source', 'setopt cdablevars; export proj=/home/u; command -p source ./a.sh', A],
-    ['zsh - source', 'setopt cdablevars; export proj=/home/u; - source ./a.sh', A],
-    ['noglob source', 'set -T; export proj=/home/u; noglob source ./a.sh', A],
-    ['builtin eval of the file text', 'set -T; export proj=/home/u; builtin eval "$(cat ./a.sh)"', A],
-    ['source /dev/stdin < file (setopt cdablevars)', 'setopt cdablevars; export proj=/home/u; source /dev/stdin < ./a.sh', A],
-    ['source /dev/stdin < file (set -T)', 'set -T; export proj=/home/u; source /dev/stdin < ./a.sh', A],
-    ['. /dev/stdin < file', 'set -T; export proj=/home/u; . /dev/stdin < ./a.sh', A],
-    ['. <(cat file)', 'setopt cdablevars; export proj=/home/u; . <(cat ./a.sh)', A],
-    ['source <(cat file)', 'set -T; export proj=/home/u; source <(cat ./a.sh)', A],
-    ['cat file | source /dev/stdin', 'setopt cdablevars; export proj=/home/u; cat ./a.sh | source /dev/stdin', A],
-    ['cat file | . /dev/stdin', 'set -T; export proj=/home/u; cat ./a.sh | . /dev/stdin', A],
-    ['bash shopt -s cdable_vars, source /dev/stdin < file', 'shopt -s cdable_vars; export proj=/home/u; source /dev/stdin < ./a.sh', A],
-    ['bash shopt -s cdable_vars, builtin source', 'shopt -s cdable_vars; export proj=/home/u; builtin source ./a.sh', A],
-    ['builtin source /dev/stdin < file', 'set -T; export proj=/home/u; builtin source /dev/stdin < ./a.sh', A],
-    ['command . <(cat file)', 'set -T; export proj=/home/u; command . <(cat ./a.sh)', A],
+    ['builtin source (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; builtin source ./a.sh', A],
+    ['command . (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'setopt cdablevars; export proj=/home/u; command . ./a.sh', A],
+    ['command -p source (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'setopt cdablevars; export proj=/home/u; command -p source ./a.sh', A],
+    ['zsh - source (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'setopt cdablevars; export proj=/home/u; - source ./a.sh', A],
+    ['noglob source (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; noglob source ./a.sh', A],
+    ['builtin eval of the file text (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; builtin eval "$(cat ./a.sh)"', A],
+    ['source /dev/stdin < file (setopt cdablevars) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'setopt cdablevars; export proj=/home/u; source /dev/stdin < ./a.sh', A],
+    ['source /dev/stdin < file (set -T) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; source /dev/stdin < ./a.sh', A],
+    ['. /dev/stdin < file (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; . /dev/stdin < ./a.sh', A],
+    ['. <(cat file) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'setopt cdablevars; export proj=/home/u; . <(cat ./a.sh)', A],
+    ['source <(cat file) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; source <(cat ./a.sh)', A],
+    ['cat file | source /dev/stdin (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'setopt cdablevars; export proj=/home/u; cat ./a.sh | source /dev/stdin', A],
+    ['cat file | . /dev/stdin (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; cat ./a.sh | . /dev/stdin', A],
+    ['bash shopt -s cdable_vars, source /dev/stdin < file (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'shopt -s cdable_vars; export proj=/home/u; source /dev/stdin < ./a.sh', A],
+    ['bash shopt -s cdable_vars, builtin source (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'shopt -s cdable_vars; export proj=/home/u; builtin source ./a.sh', A],
+    ['builtin source /dev/stdin < file (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; builtin source /dev/stdin < ./a.sh', A],
+    ['command . <(cat file) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; command . <(cat ./a.sh)', A],
     ['source /dev/stdin < the switch file, then the line\'s own cd', 'export proj=/home/u; source /dev/stdin < ./sw.sh; cd proj && find . -delete', stub({ '/home/u/proj/sw.sh': 'setopt cdablevars\n' })],
-    ['eval "$(cat file)" (the pinned reading)', 'set -T; export proj=/home/u; eval "$(cat ./a.sh)"', A],
+    ['eval "$(cat file)" (the pinned reading) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; eval "$(cat ./a.sh)"', A],
   ]);
   allows('F1', [
-    ['no switch: builtin source of the same file (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; builtin source ./a.sh', A],
-    ['no switch: source /dev/stdin < file (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; source /dev/stdin < ./a.sh', A],
-    ['no switch: . <(cat file) (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; . <(cat ./a.sh)', A],
-    ['no switch: cat file | source /dev/stdin (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; cat ./a.sh | source /dev/stdin', A],
-    ['a switch, but a fresh shell reads the stream (bash < file) (R17 owner decision: a bare cd is unknown) (R17 owner decision: a bare cd is unknown)', 'set -T; export proj=/home/u; bash < ./a.sh', A],
-    ['a switch, but a fresh shell reads the stream (cat file | bash) (R17 owner decision: a bare cd is unknown)', 'set -T; export proj=/home/u; cat ./a.sh | bash', A],
-    ['a switch, but a fresh shell runs the file (command bash FILE) (R17 owner decision: a bare cd is unknown)', 'set -T; export proj=/home/u; command bash ./a.sh', A],
+    ['no switch: builtin source of the same file (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; builtin source ./a.sh', A],
+    ['no switch: source /dev/stdin < file (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; source /dev/stdin < ./a.sh', A],
+    ['no switch: . <(cat file) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; . <(cat ./a.sh)', A],
+    ['no switch: cat file | source /dev/stdin (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; cat ./a.sh | source /dev/stdin', A],
+    ['a switch, but a fresh shell reads the stream (bash < file) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; bash < ./a.sh', A],
+    ['a switch, but a fresh shell reads the stream (cat file | bash) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; cat ./a.sh | bash', A],
+    ['a switch, but a fresh shell runs the file (command bash FILE) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; command bash ./a.sh', A],
     ['a switch and a harmless file', 'set -T; builtin source ./a.sh', stub({ '/home/u/proj/a.sh': 'echo hi\n' })],
   ]);
 });
@@ -86,25 +86,25 @@ describe('R15-F2: a switch in a later sourced file reaches a same-shell file jud
 
 describe('R15-F3: BASHOPTS / SHELLOPTS reach every child shell', () => {
   denies('F3', [
-    ['env prefix on bash -c', 'proj=/home/u BASHOPTS=cdable_vars bash -c \'cd proj && find . -delete\''],
-    ['env NAME=value bash FILE', 'env BASHOPTS=cdable_vars proj=/home/u bash ./a.sh', A],
-    ['shopt, export BASHOPTS, then bash FILE', 'shopt -s cdable_vars; export BASHOPTS; export proj=/home/u; bash ./a.sh', A],
-    ['plain assignment, then bash -c', 'BASHOPTS=cdable_vars; export BASHOPTS proj=/home/u; bash -c \'cd proj && find . -delete\''],
-    ['export BASHOPTS=value', 'export BASHOPTS=cdable_vars proj=/home/u; bash -c \'cd proj && find . -delete\''],
-    ['declare -x BASHOPTS=value', 'declare -x BASHOPTS=cdable_vars; export proj=/home/u; bash -c \'cd proj && find . -delete\''],
-    ['typeset -x BASHOPTS', 'typeset -x BASHOPTS=cdable_vars; export proj=/home/u; bash ./a.sh', A],
-    ['SHELLOPTS prefix on bash FILE', 'proj=/home/u SHELLOPTS=posix bash ./a.sh', A],
-    ['any value counts (BASHOPTS=)', 'proj=/home/u BASHOPTS= bash -c \'cd proj && find . -delete\''],
-    ['sh -c with the env prefix', 'proj=/home/u BASHOPTS=cdable_vars sh -c \'cd proj && find . -delete\''],
-    ['the hook environment holds BASHOPTS with cdable_vars', 'export proj=/home/u; bash -c \'cd proj && find . -delete\'', { cwd: `${HOME}/proj`, env: { BASHOPTS: 'cmdhist:cdable_vars:extglob' } }],
+    ['env prefix on bash -c (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'proj=/home/u BASHOPTS=cdable_vars bash -c \'cd proj && find . -delete\''],
+    ['env NAME=value bash FILE (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'env BASHOPTS=cdable_vars proj=/home/u bash ./a.sh', A],
+    ['shopt, export BASHOPTS, then bash FILE (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'shopt -s cdable_vars; export BASHOPTS; export proj=/home/u; bash ./a.sh', A],
+    ['plain assignment, then bash -c (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'BASHOPTS=cdable_vars; export BASHOPTS proj=/home/u; bash -c \'cd proj && find . -delete\''],
+    ['export BASHOPTS=value (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export BASHOPTS=cdable_vars proj=/home/u; bash -c \'cd proj && find . -delete\''],
+    ['declare -x BASHOPTS=value (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'declare -x BASHOPTS=cdable_vars; export proj=/home/u; bash -c \'cd proj && find . -delete\''],
+    ['typeset -x BASHOPTS (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'typeset -x BASHOPTS=cdable_vars; export proj=/home/u; bash ./a.sh', A],
+    ['SHELLOPTS prefix on bash FILE (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'proj=/home/u SHELLOPTS=posix bash ./a.sh', A],
+    ['any value counts (BASHOPTS=) (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'proj=/home/u BASHOPTS= bash -c \'cd proj && find . -delete\''],
+    ['sh -c with the env prefix (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'proj=/home/u BASHOPTS=cdable_vars sh -c \'cd proj && find . -delete\''],
+    ['the hook environment holds BASHOPTS with cdable_vars (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; bash -c \'cd proj && find . -delete\'', { cwd: `${HOME}/proj`, env: { BASHOPTS: 'cmdhist:cdable_vars:extglob' } }],
     ['a sourced file exports BASHOPTS, a child bash judged earlier in a loop', 'export proj=/home/u; for i in 1 2; do bash ./a.sh; source ./sw.sh; done', stub({ '/home/u/proj/a.sh': body, '/home/u/proj/sw.sh': 'export BASHOPTS=cdable_vars\n' })],
-    ['a name built at run time on export', 'N=BASHOPTS; export $N=cdable_vars proj=/home/u; bash ./a.sh', A],
-    ['the hook environment holds BASHOPTS, bash FILE', 'export proj=/home/u; bash ./a.sh', stub({ '/home/u/proj/a.sh': body }, { env: { BASHOPTS: 'cdable_vars' } })],
+    ['a name built at run time on export (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'N=BASHOPTS; export $N=cdable_vars proj=/home/u; bash ./a.sh', A],
+    ['the hook environment holds BASHOPTS, bash FILE (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; bash ./a.sh', stub({ '/home/u/proj/a.sh': body }, { env: { BASHOPTS: 'cdable_vars' } })],
   ]);
   allows('F3', [
-    ['reading BASHOPTS is no switch (R17 owner decision: a bare cd is unknown)', 'echo "$BASHOPTS"; export proj=/home/u; bash ./a.sh', A],
-    ['a hook environment without BASHOPTS: bash FILE (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; bash ./a.sh', A],
-    ['no BASHOPTS: a separate shell (bash FILE) does not inherit the line\'s switch (R17 owner decision: a bare cd is unknown)', 'set -T; export proj=/home/u; bash ./a.sh', A],
+    ['reading BASHOPTS is no switch (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'echo "$BASHOPTS"; export proj=/home/u; bash ./a.sh', A],
+    ['a hook environment without BASHOPTS: bash FILE (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'export proj=/home/u; bash ./a.sh', A],
+    ['no BASHOPTS: a separate shell (bash FILE) does not inherit the line\'s switch (R19 owner decision: a plain cd name narrows unless CDPATH is set)', 'set -T; export proj=/home/u; bash ./a.sh', A],
     ['a hook environment BASHOPTS without cdable_vars', 'export proj=/home/u; bash -c \'cd ./proj && find . -delete\'', { cwd: `${HOME}/proj`, env: { BASHOPTS: 'cmdhist:extglob' } }],
     ['a harmless child with BASHOPTS set', 'BASHOPTS=cdable_vars bash -c \'echo hi\''],
   ]);
