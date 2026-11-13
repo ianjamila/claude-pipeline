@@ -63,6 +63,8 @@
   "guard-files-bypass.test.mjs": 1988,
   "guard-files-order-76.test.mjs": 346,
   "guard-files.test.mjs": 8000,
+  "guard-followups-265.test.mjs": 1500,
+  "guard-followups-410-412.test.mjs": 700,
   "guard-git-review-marker.test.mjs": 276,
   "guard-git.test.mjs": 21477,
   "guard-hidden-assignments.test.mjs": 8491,
