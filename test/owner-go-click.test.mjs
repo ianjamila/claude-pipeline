@@ -470,3 +470,25 @@ test('clickEvidence reports what the transcript holds, and nothing for an unprot
   assert.equal(clickEvidence(w.file, w.toolUseId, { home: tmpdir() }).reason, 'transcript-not-protected');
   assert.equal(clickEvidence(w.file, 'toolu_nope', { home: w.home }).reason, 'not-in-transcript');
 });
+
+// #269 R26-F2: the record's kind is part of what the click proves, so a record cannot be relabelled as another kind.
+test('clickProvenance: a record whose kind differs from the clicked ask is not the owner (merge, extra-round, ruling)', async (t) => {
+  const merge = world(t);
+  const m = (await merge.click()).recorded;
+  assert.equal(clickProvenance(m, { home: merge.home }), 'owner');
+  for (const kind of ['extra-round', 'past-round', 'ruling']) {
+    assert.equal(clickProvenance({ ...m, kind, repo: REPO, pr: 58, k: 4, head: GHEAD }, { home: merge.home }), 'synthetic', `a merge click relabelled ${kind}`);
+  }
+  const round = world(t, { parts: roundParts(), answer: 'Yes, one more round' });
+  const r = (await round.click()).recorded;
+  assert.equal(clickProvenance(r, { home: round.home }), 'owner');
+  for (const kind of ['past-round', 'ruling']) assert.equal(clickProvenance({ ...r, kind }, { home: round.home }), 'synthetic', `an extra-round click relabelled ${kind}`);
+  const { kind: _dropped, ...noKind } = r;
+  assert.equal(clickProvenance(noKind, { home: round.home }), 'synthetic', 'an extra-round click with its kind removed');
+  const ruling = world(t, { parts: rulingParts(), answer: 'Accept all' });
+  const g = (await ruling.click()).recorded;
+  assert.equal(clickProvenance(g, { home: ruling.home }), 'owner');
+  for (const kind of ['extra-round', 'past-round']) assert.equal(clickProvenance({ ...g, kind }, { home: ruling.home }), 'synthetic', `a ruling click relabelled ${kind}`);
+  const { kind: _k2, ...rulingNoKind } = g;
+  assert.equal(clickProvenance(rulingNoKind, { home: ruling.home }), 'synthetic', 'a ruling click with its kind removed');
+});

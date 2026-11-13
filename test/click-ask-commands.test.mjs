@@ -169,7 +169,7 @@ const manyStep = (pr, over = {}) => {
 };
 const canned = (steps) => async (pr) => {
   const step = steps[pr];
-  return { pr, wouldMerge: step?.kind === 'say-merge' && !step.blocked, blockers: step?.blocked ? [{ kind: 'live-check', detail: 'ci: red' }] : [], ownerStep: step ?? null };
+  return { pr, wouldMerge: step?.kind === 'say-merge' && !step.blocked, blockers: step?.blocked ? [{ kind: 'live-check', detail: 'ci: red' }] : [], ownerStep: step ?? null, config: step?.config };
 };
 // The repo's config and `gh repo view` come from a real scenario (root is its worktree); the dry runs themselves are the canned seam.
 async function many(prs, steps, { yml = CHAT(), home = newHome() } = {}) {
@@ -227,6 +227,24 @@ test('merge-many: label mode and click off skip the ask but still list every PR'
   const off = await many([12, 13], { 12: manyStep(12), 13: manyStep(13) }, { yml: CHAT('owner_go:\n  click: off\n') });
   assert.match(off.r.output.askSkipped, /owner_go\.click is off/);
   assert.deepEqual(asks(off.home), []);
+});
+
+// #269 R26-B1: each PR's OWN worktree config decides whether a click may approve it (the single-PR ask reads it in that worktree), not the invoking worktree's.
+test('merge-many: a PR whose own worktree has owner_go.click off, or is not in chat mode, is excluded click-off; the rest are asked', async () => {
+  const cfg = async (yml) => (await loadConfig(scenario({ yml, report: null, state: null }).repo.dir)).config;
+  const off = await cfg(CHAT('owner_go:\n  click: off\n'));
+  const label = await cfg(ymlFor());
+  const on = await cfg(CHAT());
+  const withConfig = (pr, config) => ({ ...manyStep(pr), config });
+  const a = await many([12, 13, 14, 15], { 12: withConfig(12, on), 13: withConfig(13, off), 14: withConfig(14, label), 15: withConfig(15, on) });
+  assert.deepEqual(a.r.output.prs.map((p) => [p.pr, p.included, p.excludedReason]), [[12, true, undefined], [13, false, 'click-off'], [14, false, 'click-off'], [15, true, undefined]]);
+  assert.deepEqual(a.r.output.ask.questions[0].options.map((o) => o.label), ['Merge #12', 'Merge #15']);
+  assert.ok(a.r.output.ask.questions[0].question.endsWith(readyLine([12, 15])));
+  assert.deepEqual(a.r.output.ask.questions[0].question.match(/#13|#14/g), null, 'the click-off PRs are not in the question');
+  const b = await many([12, 13], { 12: withConfig(12, on), 13: withConfig(13, off) });
+  assert.equal(b.r.output.ask, null);
+  assert.equal(b.r.output.askSkipped, 'fewer-than-two-ready');
+  assert.deepEqual(asks(b.home), []);
 });
 
 // ---- triage round-request / ruling-request ---------------------------------------------------------------------------------------------------------

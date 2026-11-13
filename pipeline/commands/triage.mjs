@@ -63,6 +63,7 @@ export const meta = {
     '  -> --past: {ok, line, k, n, head, past: true, remaining}: the LAST line of the reply that asks the owner to approve a round that ALREADY ran (before owner grants were recorded, so it carries none and review-complete refuses it), `🔂 Approve past review round #N: round K · head <head12> · repo owner/name`',
     '     (n = the round to pass to `state past-round-grant`, head = its full head, remaining: [{n, k}] the other rounds that still need it). It picks the OLDEST published counted round past review.max_rounds + 1 that has a LATER counted round and no owner grant (or one whose',
     '     record is gone). Read-only: state, markers and the PR are untouched. The owner answers `approve round` (or `extra round`, `grant round K`, optionally with #N); the hook records it as kind past-round, which never admits a new round; then run `state past-round-grant --pr N --round n`',
+    '     --past --ask (click-to-approve): a past round is approved by typing only, so the reply also carries ask: null and askSkipped: \'a past round is approved by typing\' (no ask is issued; type the closing line as before)',
     '     exit 1 {ok:false, error, reason} BEFORE the owner is asked: label-mode, no-max-rounds, state-pr-mismatch, host, history-unreadable | no-published-history | stale-history (run `pipeline state show --pr N`) | unpublished-history (run `pipeline comment --pr N --kind triage`), or nothing-to-approve',
     'pipeline triage defer-fixes --pr N --ids ID[,ID…] --fix-head SHA --reason TEXT [--repo DIR]',
     '  -> {ok, deferred: [ids], rounds: [every round number holding a deferred item], published, next?}: closes the round limit without another round when the unreviewed fixes are all LOW severity. Each fix is taken out of the tree FIRST (the caller reverted',
@@ -666,7 +667,11 @@ async function roundRequest(rest, ctx) {
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
-  if (values.past) return pastRoundRequest({ pr, root, config, ctx });
+  if (values.past) {
+    // A past round is approved by typing only (the click path has no past-round ask), so --ask still gets its contract: ask null and the reason.
+    const past = await pastRoundRequest({ pr, root, config, ctx });
+    return values.ask === true && past.output.ok === true ? { ...past, output: { ...past.output, ask: null, askSkipped: 'a past round is approved by typing' } } : past;
+  }
   const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, reason } });
   if (config.owner_approval !== 'chat') return refuse('an extra review round is granted only with owner_approval: chat in pipeline.yml; in label mode the agent parks');
   const gh = createGitHub({ cwd: root, env: ctx.env });

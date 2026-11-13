@@ -455,6 +455,7 @@ function finishReplay({ spent, ask, clickId, ev, session, home, input, transcrip
 
 // ---- the proof every consumer asks (B4) ---------------------------------------------------------------------------------------------------
 
+// 'kind' is compared for every kind (absent for a merge click, so a merge click's record cannot be relabelled as a round grant or ruling): R26-F2.
 const BINDING_KEYS = { approval: ['prs', 'requests'], 'extra-round': ['kind', 'repo', 'pr', 'k', 'head'], ruling: ['kind', 'repo', 'pr', 'ids', 'content'] };
 // 'owner' | 'synthetic' | 'missing' for a record with `via: 'ask'`, read at ANY age (a consumed extra-round grant is read by the final gate days later): the transcript entries are found again by the tool
 // use id and must still pass the entry checks, the ask file and spent marker must agree with the record, and the record's binding must be what the question and answer in the transcript say. Not
@@ -483,7 +484,7 @@ export function clickProvenance(record, { home = accountHome() } = {}) {
     const bound = bindAnswer(ask, mapped.text, ev.question);
     if (bound.error) return 'synthetic';
     const expected = clickRecordOf({ body: bound.body, session: record.session, text: mapped.text, cwd: null, transcriptPath: file, answeredAt: ev.answeredAt, ask: a });
-    const keys = ['ts', 'session', 'prompt', 'via', 'ask', ...BINDING_KEYS[expected.kind ?? 'approval']];
+    const keys = ['ts', 'session', 'prompt', 'via', 'ask', 'kind', ...BINDING_KEYS[expected.kind ?? 'approval']];
     const same = keys.every((k) => sortedJson(expected[k]) === sortedJson(record[k]));
     return same && (record.prompt_sha256 === undefined || record.prompt_sha256 === expected.prompt_sha256) ? 'owner' : 'synthetic';
   } catch {

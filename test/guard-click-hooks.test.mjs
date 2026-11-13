@@ -1307,3 +1307,19 @@ test('#269 scan S1..S3: unlisted runners, verbose / help flags and a quoted ]] a
   // a version flag that is one for that interpreter stays allowed
   for (const cmd of ['node -v; cat .claude/settings.json', 'python3 -V; cat .claude/settings.json', 'perl -v; cat .claude/settings.json', 'ruby --version; cat .claude/settings.json', 'bash --help; cat .claude/settings.json', '[[ -n a && echo == echo ]] && head x; ls .claude/settings.json']) assert.equal(bash(cmd), 'allow', cmd);
 });
+
+// #269 R26-F3: other layers of the guard already refuse a path to the local settings file that is built in code, like one to settings.json. NOT covered (and the same for a repo's own file): a path whose front is a run-time
+// variable joined with the pieces, e.g. join(dir, '.claude', 'settings.local.json'): the tail list in files-policy.mjs names settings.json only, and widening it to the local file would refuse the allowed
+// repo-file write pinned in guard-files.test.mjs (#128 R7-F3), so it stays an accepted residual unless the owner decides otherwise.
+test('a code-built path to the local settings file is refused like settings.json', () => {
+  const build = (name) => [
+    `node -e "require('fs').writeFileSync(require('path').join(require('os').homedir(),'.claude','${name}'),'{}')"`,
+    `node -e "fs.writeFileSync(path.join(os.homedir(), '.claude', '${name}'), '{}')"`,
+    `python3 -c "import os; open(os.path.join(os.path.expanduser('~'),'.claude','${name}'),'w').write('{}')"`,
+    `ruby -e "File.write(File.join(Dir.home, '.claude', '${name}'), '{}')"`,
+    `node -e "fs.writeFileSync(process.env.HOME + '/.claude/${name}', '{}')"`,
+    `D=$HOME; echo x > $D/.claude/${name}`,
+  ];
+  for (const [i, cmd] of build('settings.json').entries()) assert.equal(bash(cmd, {}, '/home/u/proj'), 'deny', `settings.json control ${i}: ${cmd}`);
+  for (const [i, cmd] of build('settings.local.json').entries()) assert.equal(bash(cmd, {}, '/home/u/proj'), 'deny', `settings.local.json ${i}: ${cmd}`);
+});

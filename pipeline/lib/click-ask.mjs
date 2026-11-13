@@ -8,9 +8,16 @@ import { issueAsk } from '../hooks/lib/owner-go-click.mjs';
 // May a click stand in for the owner's typed words in this repository, on this machine, right now? -> { ok: true, hookLayersSha256 } | { ok: false, reason }.
 // Checked in this order: owner_approval chat (label mode has no typed words to replace), pipeline.yml `owner_go.click` (a repository may only switch clicks OFF), the dialog hooks (B5: a hook
 // that could answer the dialog for the owner must be one the owner approved, `pipeline owner-go approve-dialog-hooks`).
+// Why a click cannot count under THIS config (the part of the gate that needs no hooks), or null. merge --prs reads it from each PR's own worktree (R26-B1).
+export function clickConfigRefusal(config) {
+  if (config.owner_approval !== 'chat') return 'owner_approval is not chat (label mode: no typed words to replace)';
+  if (config.owner_go?.click === 'off') return 'owner_go.click is off in pipeline.yml';
+  return null;
+}
+
 export function clickGate({ config, root, ctx = {} }) {
-  if (config.owner_approval !== 'chat') return { ok: false, reason: 'owner_approval is not chat (label mode: no typed words to replace)' };
-  if (config.owner_go?.click === 'off') return { ok: false, reason: 'owner_go.click is off in pipeline.yml' };
+  const refusal = clickConfigRefusal(config);
+  if (refusal !== null) return { ok: false, reason: refusal };
   let hooks;
   try {
     hooks = checkDialogHooks({ home: ctx.home, cwd: root, projectDirs: [process.env.CLAUDE_PROJECT_DIR], managedPaths: ctx.managedPaths });
