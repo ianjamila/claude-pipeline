@@ -238,3 +238,55 @@ test('#403 (R10-F6): a cd run through a wrapper that starts a process is that pr
   denies('a wrapped switch', `nohup ${RESET} && ${SHIP}`);
   allows('twin: command / builtin / exec stay transparent', `command cd /work/other2 && builtin cd /work/other2 && ${SHIP}`);
 });
+
+// (#352 R11: a level that ends gives its alias changes back as unsure; a stage before a `|` is marked when the `|` is read; the operator before a pipeline reaches every later stage; a text lexed while an earlier
+// command still waits for its heredoc is refused)
+const ANY_DENY = (what, cmd, files = {}, cwd = MAIN_DIR) => { const r = run(cmd, files, cwd); assert.equal(r.decision, 'deny', `${what}: allowed`); };
+test('#352 R11-B1: an alias changed inside an ended subshell / bash -c / eval text is unsure after it', () => {
+  const ALIAS = 'git config alias.ship "' + PUSH + ' origin ' + MAIN + '"';
+  const HARMLESS = 'git config alias.ship status';
+  const unsure = (what, cmd) => { const v = run(cmd); assert.equal(v.decision, 'deny', `${what}: allowed`); assert.match(v.reason, /may have been \(re\)defined|pushing to main is blocked/, what); };
+  unsure('true || bash -c', `${ALIAS}; true || bash -c '${HARMLESS}'; git ship`);
+  unsure('true || ( )', `${ALIAS}; true || (${HARMLESS}); git ship`);
+  unsure('( false && )', `${ALIAS}; (false && ${HARMLESS}); git ship`);
+  unsure('true || eval', `${ALIAS}; true || eval '${HARMLESS}'; git ship`);
+  unsure('bash -c ;', `${ALIAS}; bash -c '${HARMLESS}'; git ship`);
+  unsure('( ) &&', `${ALIAS}; (${HARMLESS}) && git ship`);
+  unsure('eval &&', `${ALIAS}; eval '${HARMLESS}' && git ship`);
+  allows('twin: the redefinition and its use in one bash -c text', `${ALIAS}; bash -c '${HARMLESS} && git ship'`);
+  allows('twin: a certain redefinition', `${ALIAS}; ${HARMLESS} && git ship`);
+  allows('twin: a subshell that changes no alias', `${ALIAS}; ${HARMLESS}; (true || echo hi); git ship`);
+});
+
+test('#352 R11-F1: a cd in a pipeline stage followed by a ( ) / (( )) stage is the stage\'s own', () => {
+  denies('cd | ( ) ;', `cd /work/other2 | (cat); ${SHIP}`);
+  denies('cd | ( ) &&', `cd /work/other2 | (cat) && ${SHIP}`);
+  denies('{ cd; } | ( ) &&', `{ cd /work/other2; } | (cat) && ${SHIP}`);
+  denies('cd | (( )) &&', `cd /work/other2 | (( 1 )) && ${SHIP}`);
+  denies('cd | cat | ( ) &&', `cd /work/other2 | cat | (cat) && ${SHIP}`);
+  denies('a switch | ( ) ;', `${RESET} | (cat); ${SHIP}`);
+  denies('a cd in the ( ) stage', `cat | (cd /work/other2) && ${SHIP}`);
+  allows('twin: the cd before the pipeline', `cd /work/other2 && echo a | (cat) && ${SHIP}`);
+  allows('twin: the cd before a pipeline of two ( ) stages', `cd /work/other2; (cat) | (cat); ${SHIP}`);
+  allows('twin: the pipeline first', `echo a | (cat); cd /work/other2 && ${SHIP}`);
+});
+
+test('#352 R11-F2: the operator before a pipeline reaches every later stage, the levels they open included', () => {
+  denies('an empty group stage, then the push', `false && cd /work/other2; { } | ${SHIP}`);
+  denies('an empty group stage, then a subshell push', `false && cd /work/other2; { } | (${SHIP})`);
+  denies('a heredoc stage, then a backtick push', `false && cd /work/other2; cat <<EOF | echo \`${SHIP}\`\nx\nEOF`);
+  denies('a heredoc stage, then a $( ) push', `false && cd /work/other2; cat <<EOF | echo $(${SHIP})\nx\nEOF`);
+  denies('after ||', `true || cd /work/other2; { } | ${SHIP}`);
+  allows('twin: the cd before a pipeline of simple stages', `cd /work/other2 && cat | echo \`${SHIP}\``);
+  allows('twin: a certain cd before an empty group stage', `cd /work/other2 && { } | ${SHIP}`);
+  allows('twin: a cd after ; (it surely ran) before a pipeline', `cd /work/other2; cat | ${SHIP}`);
+});
+
+test('#352 R11-F3: a backtick text lexed while an earlier command still waits for its heredoc is refused', () => {
+  ANY_DENY('cd <<EOF; echo `push`', `cd ${MAIN_DIR} <<EOF; echo \`${SHIP}\`\nEOF`, {}, GIT_ROOT);
+  ANY_DENY('cd <<EOF && echo `push`', `cd ${MAIN_DIR} <<EOF && echo \`${SHIP}\`\nEOF`, {}, GIT_ROOT);
+  ANY_DENY('cd <<EOF | echo `push`', `cd ${MAIN_DIR} <<EOF | echo \`${SHIP}\`\nEOF`, {}, GIT_ROOT);
+  allows('twin: the backtick first', `echo \`date\`; cat <<EOF\nx\nEOF`, {}, GIT_ROOT);
+  allows('twin: a backtick in a later line', `cat <<EOF\nx\nEOF\necho \`date\``, {}, GIT_ROOT);
+  allows('twin: a $( ) after the heredoc command keeps its order', `cd /work/other2 <<EOF; echo $(${SHIP})\nEOF`, {}, GIT_ROOT);
+});
