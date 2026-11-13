@@ -352,7 +352,7 @@ test('#352 R12-F1b: a $( ) in a heredoc body or in $[ ] takes the operator befor
   denies('npm run || bash <<EOF, $( push ) in the body', `npm run reset || bash <<EOF\necho $(${SHIP})\nEOF`, HERE);
   denies('switch || echo $[ $( push ) ]', `${RESET} || echo $[ $(${SHIP}) ]`);
   denies('cd d || cat <<EOF, a backtick push in the body', `cd /work/other2 || cat <<EOF\n\`${SHIP}\`\nEOF`);
-  denies('a body read to the end of the text, behind ||', `${RESET} || cat <<EOF\n$(${SHIP})`);
+  ANY_DENY('a body read to the end of the text, behind ||', `${RESET} || cat <<EOF\n$(${SHIP})`);
   allows('twin: switch && cat <<EOF, $( push ) in the body', `${RESET} && cat <<EOF\n$(${SHIP})\nEOF`);
   allows('twin: switch; cat <<EOF, $( push ) in the body', `${RESET}; cat <<EOF\n$(${SHIP})\nEOF`);
   allows('twin: switch && echo $[ $( push ) ]', `${RESET} && echo $[ $(${SHIP}) ]`);

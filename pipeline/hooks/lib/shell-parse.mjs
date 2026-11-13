@@ -2317,14 +2317,16 @@ class Parser {
       while (this.queue.length && this.queue[0] !== h.seg && this.queue[0].pending === 0) this.finalize(this.queue.shift());
       if (this.queue.length && this.queue[0] !== h.seg) this.ctx.truncated = true;
       const grp = this.ctx.grp;
+      const up = this.ctx.up;
       this.ctx.grp = h.seg.grp; // (the body expands where its command runs: inside the subshells that command was written in)
+      this.ctx.up = h.seg.up; // (and under the operator before it: `change || cat <<EOF` + `$(push)`)
       try {
         // No terminator: either a malformed command or a `<<` we mistook for a heredoc that then swallowed the rest
         // of the line. Parsing the body as script costs a false positive at worst, never a miss.
         if (!found) this.subParse(text, h.seg.depth + 1, [...h.seg.up, { sep: h.seg.sep, lead: h.seg.lead, kind: 'text' }]);
         // An unquoted heredoc still expands $(...) and backticks, so a body can run commands. Quoted ones are inert data.
-        else if (!h.quoted) this.scanExpansions(text, h.seg.depth);
-      } finally { this.ctx.grp = grp; }
+        else if (!h.quoted) this.scanExpansions(text, h.seg.depth, { sep: h.seg.sep, afterClose: h.seg.afterClose, lead: h.seg.lead });
+      } finally { this.ctx.grp = grp; this.ctx.up = up; }
     }
     this.hd = [];
     this.i = pos;
@@ -2332,8 +2334,10 @@ class Parser {
   }
 
   // Runs the substitutions ($(...), backticks) found in `text` (a heredoc body or $[ ] arithmetic) as commands.
-  scanExpansions(text, depth) {
+  // (#352 R12-F1: op = the operator before the command whose text it is, which the commands it runs take: `change || echo $[ $(push) ]`)
+  scanExpansions(text, depth, op = this.lexOp?.()) {
     const p = new Parser(this.ctx, text);
+    if (op) p.lexOp = () => op;
     const n = text.length;
     while (p.i < n && !this.ctx.stopped) {
       const c = text[p.i];
