@@ -157,6 +157,10 @@ test('repo config: the gate and review-proof named set is in risk.high_risk_path
     'pipeline/lib/github.mjs', 'pipeline/lib/codex.mjs', 'pipeline/lib/codex-exec.mjs', 'pipeline/lib/fix-verify.mjs',
     'pipeline/lib/hold.mjs', 'pipeline/lib/merge-hold.mjs', 'pipeline/lib/cli.mjs', 'pipeline/lib/cmd-common.mjs',
     'pipeline/lib/review-lease-wiring.mjs',
+    // the commands that read or write a gate input or proof, the thin wrappers, and the libs they use (listed by hand: no import reaches them)
+    'pipeline/commands/state.mjs', 'pipeline/commands/model-floor.mjs', 'pipeline/lib/owner-only.mjs', 'pipeline/commands/verify.mjs',
+    'pipeline/lib/command-guard.mjs', 'pipeline/commands/ci-wait.mjs', 'pipeline/lib/ci-wait.mjs',
+    'pipeline/commands/risk.mjs', 'pipeline/commands/hardstops.mjs', 'pipeline/commands/integrity.mjs', 'pipeline/commands/preflight.mjs',
   ];
   const list = raw.risk.high_risk_paths;
   const { config } = validateConfig(raw);
@@ -187,4 +191,14 @@ test('repo config: every file the risk rating imports (transitively) is covered 
   assert.ok(closure.length >= known.length, `suspiciously small import closure: ${closure.join(', ')}`);
   const uncovered = closure.filter((f) => !matchAny(f, list, { nocase: true }));
   assert.deepEqual(uncovered, [], `imported by pipeline/lib/risk.mjs but not in risk.high_risk_paths: ${uncovered.join(', ')}`);
+});
+
+test('repo config: every relative import of pipeline/lib/finalgate.mjs (depth 1) is covered by risk.high_risk_paths', () => {
+  const list = raw.risk.high_risk_paths;
+  const [direct] = directImports(['pipeline/lib/finalgate.mjs']);
+  // finalgate.mjs imports a few dozen files today (2026-11-13); a scanner that silently loses its imports fails here.
+  assert.ok(direct.length >= 20, `suspiciously few direct imports of finalgate.mjs: ${direct.join(', ')}`);
+  for (const f of ['pipeline/lib/triage.mjs', 'pipeline/lib/model-floor.mjs', 'pipeline/hooks/lib/owner-go.mjs']) assert.ok(direct.includes(f), `${f} is no longer found in finalgate.mjs's imports: ${direct.join(', ')}`);
+  const uncovered = direct.filter((f) => !matchAny(f, list, { nocase: true }));
+  assert.deepEqual(uncovered, [], `imported by pipeline/lib/finalgate.mjs but not in risk.high_risk_paths: ${uncovered.join(', ')}`);
 });

@@ -48,12 +48,14 @@ risk:
   # the risk rating and config itself, the review/merge commands, triage, owner grants, review proof, model floor) plus
   # anything that runs code on install or commit (package.json scripts, git hooks, the install wrappers), plus the glob/git/diff/
   # doc-path helpers the rating and the final gate read (every file risk.mjs imports, a test checks the closure), plus the gate and
-  # review-proof inputs: a named set (transcript, CI proof, integrity, guard provenance, state, review publish/context, locks, round
-  # status, final-gate, triage and model-proof commands, the CLI entry, and the libs finalgate.mjs imports directly plus the GitHub,
-  # Codex, fix-verify, hold, CLI and lease-wiring helpers the review commands run on); the import closure is checked for the rater
-  # only (issue #356, owner chose the named set 2026-11-13). A PR touching one stays high and gets Fable. A NEW file in
-  # pipeline/commands/ is NOT covered automatically (the CLI entry loads commands by name, so no import reaches it): add it here by
-  # hand when it decides a gate or a proof.
+  # review-proof inputs: a named set, listed BY HAND (nothing here is covered automatically): transcript, CI proof, integrity, guard
+  # provenance, state, review publish/context, locks, round status, the final-gate, triage and model-proof commands, the CLI entry, the
+  # libs finalgate.mjs imports directly (a test checks those), the GitHub, Codex, fix-verify, hold, CLI and lease-wiring helpers the
+  # review commands run on, and the commands that read or write a gate input or proof (state, model-floor, verify, ci-wait, plus the
+  # risk, hardstops, integrity and preflight wrappers, and the owner-only, command-guard and ci-wait libs they use). Only the import
+  # closure of risk.mjs is checked in full (issue #356, owner chose the named set 2026-11-13). A PR touching one stays high and gets
+  # Fable. A NEW file in pipeline/commands/ or a NEW import deeper than finalgate.mjs's own is NOT covered automatically (the CLI entry
+  # loads commands by name, so no import reaches them): add it here by hand when it decides a gate or a proof.
   high_risk_paths: [
     "pipeline/hooks/**", "pipeline/lib/hardstops.mjs", "pipeline/lib/finalgate.mjs", "install.mjs", "pipeline/lib/installer.mjs",
     "pipeline/lib/risk.mjs", "pipeline/lib/config.mjs", "pipeline/commands/codex-review.mjs", "pipeline/commands/review-complete.mjs",
@@ -71,6 +73,9 @@ risk:
     "pipeline/lib/github.mjs", "pipeline/lib/codex.mjs", "pipeline/lib/codex-exec.mjs", "pipeline/lib/fix-verify.mjs",
     "pipeline/lib/hold.mjs", "pipeline/lib/merge-hold.mjs", "pipeline/lib/cli.mjs", "pipeline/lib/cmd-common.mjs",
     "pipeline/lib/review-lease-wiring.mjs",
+    "pipeline/commands/state.mjs", "pipeline/commands/model-floor.mjs", "pipeline/lib/owner-only.mjs", "pipeline/commands/verify.mjs",
+    "pipeline/lib/command-guard.mjs", "pipeline/commands/ci-wait.mjs", "pipeline/lib/ci-wait.mjs",
+    "pipeline/commands/risk.mjs", "pipeline/commands/hardstops.mjs", "pipeline/commands/integrity.mjs", "pipeline/commands/preflight.mjs",
     "install.sh", "install.ps1"]
   # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
   # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other
