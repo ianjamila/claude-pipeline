@@ -57,7 +57,9 @@ risk:
   # reset), and the render (markers, forgery defence), upstream, private-tmp and auto-update libs, plus the resumed-run guard (the run
   # record and its cost shape check, the summary comment with its viewer-only filter, run-progress, and the checkpoint command, the only
   # writer of record.resumed), the installer's scan, stacks and schedule libs with the jobs lib behind the install admission, the schedule
-  # builder, and the files that write the gate file (cmd-io) or word a merge result (merge-cleanup).
+  # builder, and the files that write the gate file (cmd-io) or word a merge result (merge-cleanup), plus the classification itself: the
+  # test that holds the exemption maps (DEPTH1_EXEMPT, COMMANDS_EXEMPT) and the import scanner it runs (test/fixtures/static-imports.mjs) are
+  # listed, so an edit to either rates high (they are depth-1 roots of their own check like every other literal .mjs entry).
   # The model is roots and exemptions (issue #356, owner chose it 2026-11-13; round 7 dropped the leaf set). Every LITERAL .mjs path here is a
   # depth-1 ROOT: a test checks that each file it imports directly is listed here or sits in the test's DEPTH1_EXEMPT map with a true one-line
   # reason, so the list is closed under "a direct import of a listed file is listed or exempt". Globs are never roots. Only the import closure
@@ -98,6 +100,7 @@ risk:
     "pipeline/commands/summary.mjs", "pipeline/commands/queue-sweep.mjs", "pipeline/commands/merge-hold.mjs", "pipeline/commands/job.mjs", "pipeline/commands/update-branch.mjs", "pipeline/commands/redraft.mjs", "pipeline/commands/protect.mjs", "pipeline/commands/repo-move.mjs", "pipeline/commands/smoke.mjs", "pipeline/commands/followups.mjs", "pipeline/commands/artifacts.mjs", "pipeline/commands/vendor.mjs", "pipeline/commands/agent-log.mjs",
     "pipeline/commands/cost.mjs",
     "pipeline/lib/agentlog.mjs", "pipeline/lib/agentlog-close.mjs",
+    "test/repo-risk-config.test.mjs", "test/fixtures/static-imports.mjs",
     "install.sh", "install.ps1"]
   # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
   # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other
