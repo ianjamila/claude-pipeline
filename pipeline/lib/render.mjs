@@ -208,7 +208,14 @@ function followupsSection(entries, followups) {
 
 // The body of the summary comment without its marker (the run record's writer composes marker + status block + this +
 // record marker; see summary-comment.mjs).
-export function summarySections(state, { outcome, built, followups = [], modelProofs = [] }) {
+// "Back to draft for fixes since <time> (<age>)": a draft the pipeline itself turned back to draft (redraft) and has not marked ready again.
+export function redraftLine(draftSince, nowMs = Date.now()) {
+  const minutes = Math.max(0, Math.round((nowMs - Date.parse(draftSince)) / 60_000));
+  const age = minutes < 60 ? `${minutes} min` : minutes < 2880 ? `${Math.round(minutes / 60)} h` : `${Math.round(minutes / 1440)} d`;
+  return `Back to draft for fixes since ${draftSince} (${age})`;
+}
+
+export function summarySections(state, { outcome, built, followups = [], modelProofs = [], redraft = null }) {
   const entries = entriesOf(state);
   const implemented = unique(entries.filter(({ item }) => item.final?.decision === 'ACCEPT' && item.implemented)).map(
     ({ item, n }) => `- ${findingLabel(item)} (round ${n})`,
@@ -229,7 +236,7 @@ export function summarySections(state, { outcome, built, followups = [], modelPr
     '',
     section('### Rejected ideas', rejected.length ? rejected.join('\n') : '_None_'),
     '',
-    section('### Outcome', `**${line(outcome)}**`),
+    section('### Outcome', `**${line(outcome)}**${redraft ? `\n\n${redraftLine(redraft.draftSince, redraft.nowMs)}` : ''}`),
   ].join('\n');
 }
 

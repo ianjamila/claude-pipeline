@@ -22,6 +22,7 @@ import { fableBypassNote, fableBypassRounds, reviewEligibilityProblems, reviewVa
 import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
+import { holdsConfigured, ownSuccessor, releaseHoldTwice, unreleasedWarning } from '../lib/merge-hold.mjs';
 import { closingKeywordProblem, multiIssueClosingLines } from '../lib/closing-keywords.mjs';
 import { currentContentHash, refreshBaseRef, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 import { publishTriage, readPublished, reviewContentHash } from '../lib/review-publish.mjs';
@@ -52,6 +53,7 @@ export const meta = {
     '  so the review skill catches it up BEFORE `gh pr ready` and CI runs once, on current main: the remedy is `pipeline update-branch --pr N`, `git pull --ff-only`, the next codex-review round (only main was merged in: baseOnly, Codex does not run,',
     '  nothing is counted), then review-complete again. merge.behind_base: update = behind when origin/<default_branch> is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`; a `mergeable` GitHub has not computed yet, UNKNOWN, is not a conflict: if everything else passes, the draft posts with a warning).',
     '  A ready PR is never refused for this; the check is skipped with a `warnings` entry when the base ref could not be refreshed (offline), the base has a merge queue (or it cannot be read), or the ancestry cannot be read',
+    '  a DRAFT PR in a repo with ci.draft_while_iterating and the merge.hold_* keys has its leftover merge hold released first (reason redraft; a hold left by a redraft whose release was not confirmed would come back to life at the next ready), unless its head is the pipeline\'s own update-branch successor (the hold is kept); a release not confirmed is tried once more after 3 s, and one still not confirmed is exit 1 {ok:false, error:\'hold-unreleased\', reason: the remedy, holdRelease}: nothing is posted, run the named merge-hold command, then review-complete again; a READY PR is never touched; the output carries holdRelease {reason, confirmed, attempts} when a release ran',
   ].join('\n'),
 };
 
@@ -273,6 +275,18 @@ export const run = guarded(async (argv, ctx) => {
       const behind = draftBehindBase({ root, config, gh, pr, view, refresh });
       if (behind.refusal) return { exitCode: EXIT.FAILED, output: { ...behind.refusal, currentContentHash: hash } };
       const warnings = behind.warning ? [behind.warning] : [];
+      // A draft in a repo that iterates in draft: a merge hold left by a redraft whose release was not confirmed would come back to life at `gh pr ready`, so
+      // release it now, as redraft does for a draft (a draft whose head is the pipeline's own update-branch successor keeps the hold it took). A providers refuses
+      // takes on drafts, so no other hold can legitimately sit on a draft; releasing an absent hold is the provider's no-op. A READY PR is never touched here.
+      let holdRelease = null;
+      if (view.isDraft === true && config.ci.draft_while_iterating === true && holdsConfigured(config) && !ownSuccessor({ root, pr, head: local, gh })) {
+        const { rel, attempts } = await releaseHoldTwice({ config, pr, reason: 'redraft', root, env: ctx.env, run: ctx.runHold, sleep: ctx.sleep });
+        holdRelease = { reason: 'redraft', confirmed: rel.confirmed === true, attempts, code: rel.code ?? null, lines: rel.lines ?? [], ...(rel.notStarted ? { notStarted: true } : {}) };
+        if (!holdRelease.confirmed) {
+          const remedy = unreleasedWarning({ pr, reason: 'redraft', code: holdRelease.code, notStarted: holdRelease.notStarted === true, takeConfirmed: true, again: true });
+          return { exitCode: EXIT.FAILED, output: { ok: false, error: 'hold-unreleased', reason: `${remedy}; nothing was posted, run review-complete again afterwards`, holdRelease, currentContentHash: hash } };
+        }
+      }
       // The marker vouches for the state the PR holds, so publish it first when it differs (a base-only round or a late mark-implemented leaves the
       // copies apart). A PR that holds a state this copy did not publish or restore is refused (stale-publication, exit 1); GitHub failing is exit 3.
       publishTriage({ gh, root, pr, state });
@@ -323,7 +337,7 @@ export const run = guarded(async (argv, ctx) => {
           ok: true, ...(reused ? { reused: true } : { posted: true }), comment, review: record, removed: true, recheck,
           ...(docsExempt ? { docsExempt: { files: docsExempt.files, reviewedHead: docsExempt.reviewedHead } } : {}),
           ...(fableNote ? { fableBypass: { note: fableNote, rounds: bypass } } : {}),
-          ...(recheckError ? { recheckError } : {}), ...(warnings.length > 0 ? { warnings } : {}), pr, currentContentHash: hash,
+          ...(recheckError ? { recheckError } : {}), ...(warnings.length > 0 ? { warnings } : {}), ...(holdRelease ? { holdRelease } : {}), pr, currentContentHash: hash,
         },
       };
     });
