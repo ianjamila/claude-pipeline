@@ -37,7 +37,7 @@ const DIRS = ['bin', 'sub', '/home/u', '/tmp'];
 
 // ---- 1: a cd into a Next.js route directory ---------------------------------------------------------------------------------------------------------------------
 
-// Why: `cd "src/app/(staff)/[id]"` names a directory whose path has parentheses and brackets; the guard read them as run-time syntax and made the directory unknown, so the next relative write
+// Why: `cd ./"src/app/(staff)/[id]"` names a directory whose path has parentheses and brackets; the guard read them as run-time syntax and made the directory unknown, so the next relative write
 // was judged in every protected directory. The target is resolved against the real directory listing (each segment read as the literal name and as a shell pattern, with the dot rule): exactly one
 // existing directory -> that is the cwd.
 const ROUTES = [`${PROJ}/src/app/(staff)/[id]`, `${PROJ}/app/[id]/print`, `${PROJ}/src/app/(staff)/staff/(dashboard)/visits/[id]`, `${PROJ}/src/app/(staff)/x`, `${PROJ}/sibling`, `${PROJ}/link`, `${PROJ}/SIBLING-X`, `${PROJ}/.hidden`];
@@ -46,7 +46,7 @@ const withParents = (ds) => [...new Set(ds.flatMap((d) => { const out = []; for 
 const routeFs = (extra = []) => fakeFs(GIT_ROOT, {}, withParents([...DIRS, PROJ, ...ROUTES, ...extra]));
 test('S5b: a cd into a route directory with (group) and [id] parts is that directory (it exists)', () => {
   const fs = routeFs();
-  const cds = ['cd "src/app/(staff)/[id]"', 'cd /home/u/proj/app/\\[id\\]/print', 'cd "/home/u/proj/src/app/(staff)/staff/(dashboard)/visits/[id]"', 'cd src/app/\\(staff\\)/x', 'cd /home/u/pro[j]/sib[l]ing'];
+  const cds = ['cd ./"src/app/(staff)/[id]"', 'cd /home/u/proj/app/\\[id\\]/print', 'cd "/home/u/proj/src/app/(staff)/staff/(dashboard)/visits/[id]"', 'cd ./src/app/\\(staff\\)/x', 'cd /home/u/pro[j]/sib[l]ing'];
   for (const cd of cds) {
     for (const rest of ['echo x > notes.txt', 'touch notes.txt', 'node -e \'require("fs").writeFileSync("a.ts", "x")\'', 'git add -A']) assert.equal(files(`${cd} && ${rest}`, fs).decision, 'allow', `${cd} && ${rest}`);
   }
@@ -74,16 +74,16 @@ test('S5b: a glob cd that is not exactly one existing directory stays unknown (t
   const mapLink = { realpath: (q) => q.replace('/home/u/proj/link', '/home/u/.claude/plugins') }; // (a link into a directory that is not protected itself, next to one that is)
   assert.equal(files('cd /home/u/proj/lin[k] && echo x > ../pipeline/g.mjs', fs, mapLink).decision, 'deny', 'climb out of a link');
   // (the resolved directory sits at the depth the path says, so a climb out of it lands where the path says)
-  assert.equal(files('cd "src/app/(staff)/[id]" && echo x > ../../../../../.claude/settings.json', fs).decision, 'deny', 'cd "src/app/(staff)/[id]" && echo x > ../../../../../.claude/settings.json');
-  assert.equal(files('cd "src/app/(staff)/[id]" && echo x > ../../../../notes.txt', fs).decision, 'allow', 'cd "src/app/(staff)/[id]" && echo x > ../../../../notes.txt');
+  assert.equal(files('cd ./"src/app/(staff)/[id]" && echo x > ../../../../../.claude/settings.json', fs).decision, 'deny', 'cd ./"src/app/(staff)/[id]" && echo x > ../../../../../.claude/settings.json');
+  assert.equal(files('cd ./"src/app/(staff)/[id]" && echo x > ../../../../notes.txt', fs).decision, 'allow', 'cd ./"src/app/(staff)/[id]" && echo x > ../../../../notes.txt');
   // (an option command before the cd is a command that is not read-only: unknown)
-  for (const pre of ['shopt -s dotglob nocaseglob; ', 'setopt globdots; ', 'set -o noglob; ', 'emulate zsh; ']) assert.equal(files(`${pre}cd "src/app/(staff)/[id]" && touch notes.txt`, fs).decision, 'deny', pre);
+  for (const pre of ['shopt -s dotglob nocaseglob; ', 'setopt globdots; ', 'set -o noglob; ', 'emulate zsh; ']) assert.equal(files(`${pre}cd ./"src/app/(staff)/[id]" && touch notes.txt`, fs).decision, 'deny', pre);
   // (only the widest reading (dotglob) finds .hidden; by default nothing matches, and with nullglob that cd goes home: the two readings must agree)
   assert.equal(files('cd /home/u/proj/*idden && touch notes.txt', fs).decision, 'deny', 'dotglob-only match');
   assert.equal(files('cd /home/u/proj/.hid* && touch notes.txt', fs).decision, 'allow', 'a literal dot matches the dot name in both readings');
   // (the listing is the one now: anything before the cd that may change it makes the directory unknown)
-  for (const pre of ['mkdir -p src/app/new; ', 'rm -rf src/app/old; ', 'mv a b; ', 'ln -s /home/u/.claude src/app/link; ', 'cp -r a b; ', 'tar xf a.tar; ', 'git checkout x; ', 'echo x > f; ', 'source ./e.sh; ', 'BASH_ENV=e.sh true; ', 'npm install; ']) assert.equal(files(`${pre}cd "src/app/(staff)/[id]" && touch notes.txt`, fs).decision, 'deny', pre);
-  for (const pre of ['ls src; ', 'echo hi; ', 'export A=1; ', 'cd src; ', 'git status; ']) assert.equal(files(`${pre}cd "/home/u/proj/src/app/(staff)/[id]" && touch notes.txt`, fs).decision, 'allow', pre);
+  for (const pre of ['mkdir -p src/app/new; ', 'rm -rf src/app/old; ', 'mv a b; ', 'ln -s /home/u/.claude src/app/link; ', 'cp -r a b; ', 'tar xf a.tar; ', 'git checkout x; ', 'echo x > f; ', 'source ./e.sh; ', 'BASH_ENV=e.sh true; ', 'npm install; ']) assert.equal(files(`${pre}cd ./"src/app/(staff)/[id]" && touch notes.txt`, fs).decision, 'deny', pre);
+  for (const pre of ['ls src; ', 'echo hi; ', 'export A=1; ', 'cd ./src; ', 'git status; ']) assert.equal(files(`${pre}cd "/home/u/proj/src/app/(staff)/[id]" && touch notes.txt`, fs).decision, 'allow', pre);
   // (the directory does not exist: unknown)
   assert.equal(files('cd "src/app/(staff)/[gone]" && touch notes.txt', fs).decision, 'deny', 'cd "src/app/(staff)/[gone]" && touch notes.txt');
 });
