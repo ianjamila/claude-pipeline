@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { readResultText } from './helpers/read-result.mjs';
 import { floorEnv } from './helpers/floor-env.mjs';
 import { readStatus } from '../pipeline/lib/codex-usage.mjs';
 import { rulingsDigest, rulingsInventory, substituteDigest, substituteInventory } from '../pipeline/lib/triage.mjs';
@@ -110,7 +111,7 @@ function install(w, sub, ids, o = {}) {
   const lines = [
     { type: 'user', message: { role: 'user', content: prompt }, uuid: 'u0' },
     turn(models[0], 'm0', 'tool_use', calls.map((c, i) => ({ type: 'tool_use', id: `t${i}`, name: c.name, input: c.input }))),
-    { type: 'user', message: { role: 'user', content: calls.map((c, i) => ({ type: 'tool_result', tool_use_id: `t${i}`, content: 'ok' })) }, uuid: 'u1' },
+    { type: 'user', message: { role: 'user', content: calls.map((c, i) => ({ type: 'tool_result', tool_use_id: `t${i}`, content: c.name === 'Read' ? readResultText(c.input, { maxLines: c.maxLines }) : 'ok' })) }, uuid: 'u1' },
     turn(models.at(-1), 'm1', 'end_turn', [{ type: 'text', text: fenced(answer) }]),
   ];
   writeFileSync(join(dir, `agent-${agentId}.jsonl`), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
@@ -553,14 +554,21 @@ test('R8-B1 parity: a second review whose quota reset is within review.substitut
   far.ready('R1-B1'); // "try again in 3 hours": beyond the 60-minute wait
 });
 
-test('R8-B2 parity: a second-review input a substitute cannot read in full (a line over 2000 characters) is not eligible (packet-unreadable) and opens no attempt', (t) => {
+test('R8-B2 parity: a second-review input a substitute cannot read in full (too big for the Read calls it can spend) is not eligible (packet-unreadable) and opens no attempt', (t) => {
   const w = world(t, { items: 1 });
-  w.edit((s) => { s.rounds[0].items[0].detail = 'z'.repeat(2600); });
+  w.edit((s) => { s.rounds[0].items[0].detail = `${'z'.repeat(2999)}\n`.repeat(400); }); // 400 lines of 3000 characters: about 400k tokens
   const r = w.second('R1-B1');
   assertExit(r, 3, r.stdout + r.stderr);
   assert.deepEqual([r.json.substitute.eligible, r.json.substitute.why], [false, 'packet-unreadable']);
-  assert.equal(r.json.substitute.maxLineChars, 2000);
-  assert.ok(r.json.substitute.files.some((f) => f.longLine?.chars >= 2600), r.stdout.slice(0, 500));
+  assert.ok(r.json.substitute.pages > r.json.substitute.maxPages && r.json.substitute.files.some((f) => f.tokens > 300000), r.stdout.slice(0, 500));
   assert.deepEqual(secondInputs(w), [], 'no input is written');
   assert.deepEqual(secondAttempts(w), []);
+});
+
+test('R9-F2 parity: a second-review finding with one very long line (10,000 characters) is still eligible: Read returns it whole', (t) => {
+  const w = world(t, { items: 1 });
+  w.edit((s) => { s.rounds[0].items[0].detail = 'z'.repeat(10000); });
+  const r = w.second('R1-B1');
+  assertExit(r, 3, r.stdout + r.stderr);
+  assert.equal(r.json.substitute.eligible, true, r.stdout.slice(0, 500));
 });

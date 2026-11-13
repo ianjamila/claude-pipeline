@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { roundWorld, findingsOf, low } from './helpers/round-world.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { readResultText } from './helpers/read-result.mjs';
 
 const QUOTA = "You've hit your usage limit. Upgrade to Pro, or try again in 3 hours.";
 const OPUS = 'claude-opus-5-1';
@@ -67,7 +68,7 @@ function install(w, prep, o = {}) {
   const lines = [
     { type: 'user', message: { role: 'user', content: prompt }, uuid: 'u0' },
     turn(models[0], 'm0', 'tool_use', calls.map((c, i) => ({ type: 'tool_use', id: `t${i}`, name: c.name, input: c.input }))),
-    { type: 'user', message: { role: 'user', content: calls.map((c, i) => ({ type: 'tool_result', tool_use_id: `t${i}`, content: 'ok' })) }, uuid: 'u1' },
+    { type: 'user', message: { role: 'user', content: calls.map((c, i) => ({ type: 'tool_result', tool_use_id: `t${i}`, content: c.name === 'Read' ? readResultText(c.input, { maxLines: c.maxLines }) : 'ok' })) }, uuid: 'u1' },
     turn(models.at(-1), 'm1', 'end_turn', [{ type: 'text', text: fenced(answer) }]),
   ];
   writeFileSync(join(dir, `agent-${agentId}.jsonl`), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
@@ -856,12 +857,63 @@ test('R8-B2: prepare refuses packet-unreadable when the files need more Read pag
   assert.ok(!existsSync(w.attemptsFile), 'no attempt was opened');
 });
 
-test('R8-B2: prepare refuses packet-unreadable when a file has a line over 2000 characters (Read truncates it, so it can never be read in full)', (t) => {
-  const w = longDiffWorld(t, (i) => (i === 3 ? 'y'.repeat(2500) : `line ${i}`), 10);
+test('R9-F2: a line over 2000 characters is not a reason to refuse: Read returns long lines whole, so the packet is prepared (it only counts toward the token estimate)', (t) => {
+  const w = longDiffWorld(t, (i) => (i === 3 ? 'y'.repeat(10000) : `line ${i}`), 10);
+  const p = w.prepare();
+  assertExit(p, 0, p.stdout.slice(0, 400));
+  assert.ok(existsSync(w.attemptsFile), 'an attempt was opened');
+});
+
+test('R9-F1: prepare refuses packet-unreadable when the files are too big for the Read calls the agent can spend (token estimate), though they are few lines', (t) => {
+  const w = longDiffWorld(t, (i) => `${i} ${'w'.repeat(3000)}`, 400); // 400 lines, over a million characters: about 400k tokens, 20 calls of 20,000
   const p = w.prepare();
   assertExit(p, 1, p.stdout.slice(0, 400));
   assert.equal(p.json.error, 'packet-unreadable');
-  assert.equal(p.json.maxLineChars, 2000);
-  assert.ok(p.json.files.some((f) => f.rel === 'diff.patch' && f.longLine?.chars > 2000), p.stdout.slice(0, 500));
-  assert.ok(!existsSync(w.attemptsFile));
+  assert.ok(p.json.pages > 15 && p.json.files.some((f) => f.rel === 'diff.patch' && f.lines < 2000 && f.tokens > 300000), p.stdout.slice(0, 500));
+  assert.ok(!existsSync(w.attemptsFile), 'no attempt was opened');
+});
+
+// A Read that stops early at the size cap still answers normally: only the lines it returned are read (cp #256 R9-F1).
+function diffInfo(w, prep) {
+  const diff = join(dirname(prep.inputPath), 'substitute', 'diff.patch');
+  const text = readFileSync(diff, 'utf8');
+  return { diff, lines: text.split('\n').length - (text.endsWith('\n') ? 1 : 0) };
+}
+
+test('R9-F1: a Read that stops early (size cap) does not cover the file, however many lines it asked for; a follow-up Read from the last line shown completes it', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const { diff, lines } = diffInfo(w, prep);
+  assert.ok(lines >= 4, 'the fixture diff has several lines');
+  const cut = lines - 2;
+  const partial = w.apply(install(w, prep, { skipRead: [diff], extraTools: [{ name: 'Read', input: { file_path: diff }, maxLines: cut }] }));
+  assertExit(partial, 1, partial.stdout + partial.stderr);
+  assert.ok(partial.json.errors.some((e) => e.includes(diff) && /do not cover/.test(e)), partial.stdout);
+  const again = w.prepare().json;
+  assert.equal(again.attempt, 2);
+  const ok = w.apply(install(w, again, { agentId: 'a2', skipRead: [diff], extraTools: [
+    { name: 'Read', input: { file_path: diff }, maxLines: cut },
+    { name: 'Read', input: { file_path: diff, offset: cut + 1 } },
+  ] }));
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+});
+
+test('R9-F1: limit 100000 is credited only by the lines Read returned', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const { diff, lines } = diffInfo(w, prep);
+  const r = w.apply(install(w, prep, { skipRead: [diff], extraTools: [{ name: 'Read', input: { file_path: diff, offset: 1, limit: 100000 }, maxLines: lines - 1 }] }));
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.ok(r.json.errors.some((e) => e.includes(diff)), r.stdout);
+});
+
+test('R9-F3: a Read with offset 0 returns from line 1 and counts; offset -1 is still refused', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const { diff } = diffInfo(w, prep);
+  const bad = w.apply(install(w, prep, { skipRead: [diff], extraTools: [{ name: 'Read', input: { file_path: diff, offset: -1 } }] }));
+  assertExit(bad, 1, bad.stdout + bad.stderr);
+  const again = w.prepare().json;
+  const ok = w.apply(install(w, again, { agentId: 'a2', skipRead: [diff], extraTools: [{ name: 'Read', input: { file_path: diff, offset: 0 } }] }));
+  assertExit(ok, 0, ok.stdout + ok.stderr);
 });
