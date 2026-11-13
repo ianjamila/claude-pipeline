@@ -488,13 +488,20 @@ test('checkpoint --resumed: a resumed stamp that cannot be made durable fails th
 });
 
 // R10-F2: the event is posted only once the command is past every usage error (an unsupported record, an invalid patch): an exit 2 posts nothing.
-test('checkpoint --resumed: a usage error (exit 2: a record from a newer CLI) posts no run-resumed event and writes nothing', () => {
+test('checkpoint --resumed: a usage error (exit 2: a record from a newer CLI, an unknown task id) posts no run-resumed event and writes nothing', () => {
   const s = scenario();
   withComment(s, existingSummary({ record: baseRecord({ v: 2 }) }));
   const r = checkpoint(s, ['--step', 'review', '--resumed']);
   assertExit(r, 2);
   assert.deepEqual(eventWrites(s.fake), []);
   assert.deepEqual(commentWrites(s.fake), []);
+  // the other usage error, past the record read: the patch itself is refused (applyCheckpoint: no task "nope"), still before any event
+  const bad = scenario();
+  withComment(bad, existingSummary({ record: baseRecord() }));
+  const b = checkpoint(bad, ['--step', 'review', '--resumed', '--task-done', 'nope']);
+  assertExit(b, 2);
+  assert.deepEqual(eventWrites(bad.fake), [], 'no run-resumed event for a refused patch');
+  assert.deepEqual(commentWrites(bad.fake), [], 'no comment written at all');
 });
 
 const RESUMED_EVENT = () => ({ id: 78, user: { login: 'me' }, body: renderEvent('run-resumed', `pr${PR}-aaaaaaaaaaaa`, 'This run was taken over from an earlier session.', RESUMED) });
