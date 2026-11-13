@@ -113,3 +113,33 @@ test('#352 negative control: a node program that names a protected path in a wri
   assert.equal(r.decision, 'deny', r.reason);
   assert.equal(run('files', `${PROJ}/scripts/serve.sh`, { ...files, 'scripts/serve.sh': `#!/bin/sh\nexec ${PROJ}/tools/prog.mjs\n` }).decision, 'deny', 'through a script as well');
 });
+
+// Why (#352 follow-up): a zsh script that cd's to "${0:A:h:h}" left the git guard without a directory, and `exec npm start` after it was judged only when the line mentioned a guarded operation, so a package script
+// running a bin that pushes was allowed (`false && serve.sh`). In a script file the lost directory is judged as the script's own directory and each one above it, as the files guard resolves $0 itself.
+test('#352 follow-up: a cd to the script\'s own parent does not hide the package script (bin that pushes / writes a protected file)', () => {
+  const cds = ['cd "${0:A:h:h}" || exit 1', 'cd "${0:h:h}" || exit 1', 'cd "$(dirname "$0")/.." || exit 1', 'cd "$SOME_DIR" || exit 1'];
+  const bad = (g) => `#!/bin/sh\n${BAD[g]}\n`;
+  for (const cd of cds) {
+    for (const g of GUARDS) {
+      const root = g === 'git' ? GIT_ROOT : PROJ;
+      const files = { ...project(g, { start: 'evil' }, bad), 'node_modules/.bin/evil': bad(g), 'scripts/serve.sh': `#!/bin/zsh\n${cd}\nexec npm start\n` };
+      delete files['node_modules/.bin/next'];
+      delete files['node_modules/next/dist/bin/next'];
+      for (const line of [`false && ${root}/scripts/serve.sh`, `${root}/scripts/serve.sh`]) {
+        const r = run(g, line, files);
+        assert.equal(r.decision, 'deny', `${g}: ${cd}: ${line} -> ${r.reason}`);
+      }
+    }
+  }
+});
+
+test('#352 follow-up: the clean next chain behind the same cd is still allowed by both guards', () => {
+  for (const cd of ['cd "${0:A:h:h}" || exit 1', 'cd "$(dirname "$0")/.." || exit 1']) {
+    for (const g of GUARDS) {
+      const root = g === 'git' ? GIT_ROOT : PROJ;
+      const files = { ...project(g, { start: 'next start' }, NEXT_JS), 'scripts/serve.sh': `#!/bin/zsh\n${cd}\nexec npm start\n` };
+      const r = run(g, `false && ${root}/scripts/serve.sh`, files);
+      assert.equal(r.decision, 'allow', `${g}: ${cd} -> ${r.reason}`);
+    }
+  }
+});

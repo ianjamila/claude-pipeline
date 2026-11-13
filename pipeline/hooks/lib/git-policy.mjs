@@ -1533,7 +1533,16 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
     return why ? deny(`the program ${sf.file} contains a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
   }
   if (level >= MAX_NESTING) return deny(`the script ${sf.file} is nested too deeply (scripts running scripts) to verify.`);
-  const v = judgeScoped(text, dir, ctx, level, sf, !sf.sourced); // (a script of its own takes readings (judgeReadings); a sourced file shares the line's variables, which evalString's check after `source` makes unsure: the same as before)
+  // (#352: the file being judged -- a cd the guard cannot follow in it, `cd "${0:A:h:h}"`, may have taken the commands after it somewhere near it: see selfDirs)
+  const outerSelf = ctx.selfScript;
+  if (!sf.sourced && path.isAbsolute(abs)) ctx.selfScript = abs;
+  let v;
+  try {
+    v = judgeScoped(text, dir, ctx, level, sf, !sf.sourced);
+  } finally {
+    ctx.selfScript = outerSelf;
+  }
+  // (a script of its own takes readings (judgeReadings); a sourced file shares the line's variables, which evalString's check after `source` makes unsure: the same as before)
   return v.decision === 'deny' ? deny(`the script ${sf.file} would run a blocked command: ${v.reason}`) : null;
 }
 
@@ -1562,7 +1571,18 @@ function pkgFileWritten(ctx, abs) {
   return w.unknown || w.pieces || w.authored || w.programs.length || w.scans.length || w.texts.length || sources.length ? 'maybe' : null;
 }
 
-const MARKERS_MSG = (said, kind) => `package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) ${kind === 'known' ? 'creates, removes or renames' : 'may create, remove or rename (a path only known at run time), while the line mentions a guarded operation,'} a package.json, node_modules, server.js, binding.gyp or configuration file that \`${said}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own.`;
+// The directories a script file may have moved to with a cd the guard cannot follow: its own directory and every one above it.
+function selfDirs(ctx) {
+  const out = [];
+  if (typeof ctx.selfScript !== 'string') return out;
+  for (let d = path.dirname(ctx.selfScript); out.length < 16; d = path.dirname(d)) {
+    out.push(d);
+    if (path.dirname(d) === d) break;
+  }
+  return out;
+}
+
+const MARKERS_MSG =(said, kind) => `package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) ${kind === 'known' ? 'creates, removes or renames' : 'may create, remove or rename (a path only known at run time), while the line mentions a guarded operation,'} a package.json, node_modules, server.js, binding.gyp or configuration file that \`${said}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own.`;
 function packageScriptVerdict(argv, dir, ctx, level) {
   const call = pmCall(argv.map((a) => expandVars(a, ctx)));
   if (!call) return null;
@@ -1579,6 +1599,11 @@ function packageScriptVerdict(argv, dir, ctx, level) {
       : null;
   }
   if (dir === null) {
+    // (#352) inside a script file, a directory lost to a cd the guard cannot follow is most likely near the script (`cd "$(dirname "$0")/.."`): the package.json is read from the script's directory and each one above it
+    for (const d of selfDirs(ctx)) {
+      const v = packageScriptVerdict(argv, d, ctx, level);
+      if (v) return v;
+    }
     // a directory the guard lost track of (after a sourced file or a cd it cannot follow): judged like a script named at run time (`bash $F`) -- refused when the line mentions a guarded operation (t11)
     return lineMentionsGuarded(ctx) ? deny('package script: the directory this runs in is unknown (after a cd or a sourced file the guard cannot follow) and the line mentions a guarded operation, so which package.json `' + said + '` reads cannot be verified. Chain the cd with &&, or use an absolute --prefix.') : null;
   }
