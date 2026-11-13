@@ -18,6 +18,8 @@ const HARD_MAX_DEPTH = 50;
 const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)\+?=/;
 // the counter (ctx.ctl) each construct kind of ctlOpen raises: in a loop, a function body, an if / case branch
 const CTL_COUNTER = { loop: 'loop', fn: 'fn', if: 'cond', case: 'cond', cbrace: 'cond' }; // (cbrace: a { group after && / || / |)
+// (a loop's id: each `for` / `while` / `until` header of one parse gets the next number; a command carries the ids of the loops it is in, outermost first: cmd.loops)
+const ctlDec = (ctx, kind) => { if (CTL_COUNTER[kind]) ctx.ctl[CTL_COUNTER[kind]]--; if (kind === 'loop') ctx.loops = ctx.loops.slice(0, -1); };
 const ctlMarks = (c) => ({ loop: c.loop > 0, fn: c.fn > 0, trap: c.trap > 0, cond: c.cond > 0 });
 const LOOP_WORDS = new Set(['while', 'until', 'for', 'select', 'repeat', 'foreach']);
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
@@ -2061,6 +2063,8 @@ function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';') {
   // ctl: it is in a loop (may run again after a later command), a function body or a trap action (runs when called / when the signal fires: maybe after any command),
   // an if / case branch (cond: may not run; loops, function bodies and traps may not either). Not enumerable
   Object.defineProperty(cmd, 'ctl', { value: ctlMarks(ctx.ctl), enumerable: false });
+  // loops: the ids of the loops it is in, outermost first (each loop is a range of its own, nested or one after another). Not enumerable
+  Object.defineProperty(cmd, 'loops', { value: ctx.loops, enumerable: false });
   // sep: the operator before it (; & && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
   Object.defineProperty(cmd, 'sep', { value: sep, enumerable: false });
   // binPath: it is part of a script text a package runner runs (node_modules/.bin is on its PATH). Not enumerable
@@ -2295,7 +2299,7 @@ class Parser {
     this.ctlBase = this.ctlStack.length;
     try { this.lex(depth, stopAtParen, noRedir); } finally {
       ctx.nest--; this.subAcc = saved;
-      while (this.ctlStack.length > this.ctlBase) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); if (CTL_COUNTER[kind]) ctx.ctl[CTL_COUNTER[kind]]--; } // (left open: ends with the level)
+      while (this.ctlStack.length > this.ctlBase) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); ctlDec(ctx, kind); } // (left open: ends with the level)
       this.ctlBase = base;
     }
   }
@@ -2339,7 +2343,7 @@ class Parser {
       if (!seg) {
         seg = {
           words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, fns: ctx.fns, defs: ctx.defs, cmd: null, meta: new Map(), win: new Map(),
-          start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl),
+          start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl), loops: ctx.loops,
           pipedFrom: lastSep === '|' ? this.lastStage : null, sep: lastSep,
         };
       }
@@ -2431,7 +2435,7 @@ class Parser {
       if (q < 0 && cmdPos && text === 'function') seg.fnActive = true;
       else if (seg.fnActive && text !== '{') { fnName = true; ctx.fns.add(text); seg.fnHasName = true; }
       const fnKw = text === '{' && seg.fnActive === true && seg.fnHasName === true;
-      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop'); seg.ctl = { ...seg.ctl, loop: true }; }
+      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop'); seg.ctl = { ...seg.ctl, loop: true }; seg.loops = this.ctx.loops; }
       else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if'); seg.ctl = { ...seg.ctl, cond: true }; }
       else if (q < 0 && cmdPos && text === 'fi') seg.closesFrom = this.ctlClose(['if']);
       else if (q < 0 && cmdPos && text === 'done') seg.closesFrom = this.ctlClose(['loop']);
@@ -2762,6 +2766,8 @@ class Parser {
     this.log.push(seg);
     const grp = this.ctx.grp;
     const ctl = this.ctx.ctl;
+    const loops = this.ctx.loops;
+    this.ctx.loops = seg.loops;
     this.ctx.ctl = { loop: +seg.ctl.loop, fn: +seg.ctl.fn, trap: +seg.ctl.trap, cond: +seg.ctl.cond };
     this.ctx.grp = seg.grp; // (what it runs, `bash -c` text included, is in the subshells it was written in, wherever the queue finishes it)
     try {
@@ -2771,7 +2777,7 @@ class Parser {
       this.ctx.truncated = true;
       const argv = seg.words.map((w) => w.text);
       if (argv.length) emit(this.ctx, argv, {}, seg.raw, seg.depth, [...seg.redirects]);
-    } finally { this.ctx.grp = grp; this.ctx.ctl = ctl; }
+    } finally { this.ctx.grp = grp; this.ctx.ctl = ctl; this.ctx.loops = loops; }
   }
 
   // A loop / function body / plain `{` group opens at this nesting level (closed by ctlClose, or when the level ends: see parseList).
@@ -2779,6 +2785,7 @@ class Parser {
     this.ctlStack.push(kind);
     this.ctlFrom.push(this.ctx.out.length);
     if (CTL_COUNTER[kind]) this.ctx.ctl[CTL_COUNTER[kind]]++;
+    if (kind === 'loop') this.ctx.loops = [...this.ctx.loops, ++this.ctx.loopSeq];
   }
 
   // Closes the last open construct of one of `kinds` at this level, and whatever was opened after it; nothing when there is none.
@@ -2786,7 +2793,7 @@ class Parser {
     for (let k = this.ctlStack.length - 1; k >= this.ctlBase; k--) {
       if (!kinds.includes(this.ctlStack[k])) continue;
       const from = this.ctlFrom[k];
-      while (this.ctlStack.length > k) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); if (CTL_COUNTER[kind]) this.ctx.ctl[CTL_COUNTER[kind]]--; }
+      while (this.ctlStack.length > k) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); ctlDec(this.ctx, kind); }
       return from;
     }
     this.ctx.ctlBroken = true; // (a closer with no opener we saw: a prefix we do not model hid it (`nocorrect if ...`), so the marks are not to be trusted)
@@ -3261,7 +3268,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, loops: [], loopSeq: 0, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not

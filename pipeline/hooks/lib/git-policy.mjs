@@ -1907,14 +1907,16 @@ function isolatedState(ctx, fn) {
   }
 }
 
-// #352 R5: a loop body runs again after it ran, so a command early in the body meets what the body itself left behind (a branch, an alias, a push.default). evalString judges every loop once from
-// its entry state, takes what the BODY left relative to that state (loopLeft), and, when it left something, judges the BODY alone once more from entry + that carry (loopReseed). What the line does
-// before or after the loop is no part of it. Only git state is carried (branches, aliases, config); variables keep the values the first pass left them, as they would be in the next iteration.
+// #352 R5, R6: a loop body runs again after it ran, so a command early in the body meets what the body itself left behind (a branch, an alias, a push.default). Every loop is judged to a FIXPOINT
+// (see evalString): each loop is a range of its own (nested loops, loops one after another) with its own entry state (loopEntry); what its body MAY leave for the next iteration (the carry: loopLeft,
+// taken after EVERY body command, since a `continue`, a `break` or a command that may not run ends an iteration in the middle) is the union over everything the body is judged from; the body is
+// judged again from entry + carry (loopReseed) from every place it can start (a directory it moves to), until neither the carry nor the places grow. What the line does before or after the
+// loop is no part of it. Only git state is carried (branches, aliases, config); variables keep the values the first pass left them, as they would be in the next iteration.
 const loopEntry = (ctx) => ({
   branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, unsure: new Set(ctx.aliasUnsure), cfg: ctx.cfgDirty, envCfg: ctx.envCfgDirty,
 });
 const newLoopLeft = () => ({ moved: new Set(), redefined: new Set(), cfg: false, envCfg: false });
-const loopLeftAny = (left) => left.moved.size > 0 || left.redefined.size > 0 || left.cfg || left.envCfg;
+const carrySize = (left) => left.moved.size + left.redefined.size + (left.cfg ? 1 : 0) + (left.envCfg ? 1 : 0); // (a carry only grows: its size says whether it did)
 // (adds to `left` whatever the walk changed since `entry`: directories whose branch differs, alias keys whose text differs or that were marked unsure, config that became dirty)
 function loopLeft(ctx, entry, left) {
   for (const d of new Set([...entry.branches.keys(), ...ctx.branches.keys()])) {
@@ -1950,6 +1952,8 @@ function loopReseed(ctx, entry, left) {
   loopMark(ctx, left);
 }
 const MAX_LOOP_STARTS = 4;
+const MAX_LOOP_PASSES = 12; // (the passes over one loop's body, from every start and every growth of the carry: more is refused)
+const MAX_READING_PASSES = 4; // (the passes over all readings of a loop word, each with what the others left)
 // The directories a loop body (commands loop.start .. loop.end) can end in when it starts in `from`: its cd / pushd / popd in order, outside any subshell of its own (a cd there is lost with the subshell);
 // one that may not run (after && / ||, in an if / case branch, in the background) keeps the directory it started from as well. null: a place that cannot be named.
 function loopEndDirs(cmds, loop, from, ctx, cdp) {
@@ -1975,24 +1979,29 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
   }
   return dirs;
 }
-// The loops of a command list as [start, end) ranges of consecutive commands the parser marks as in a loop (the `for` / `while` header, its condition and its body; a loop inside a loop is part of the
-// outer range, and two loops with nothing between them are one range: a later loop is then judged as if it could run again, which only refuses more). Marks not to be trusted (cmds.ctlBroken):
-// everything from the first loop header on.
+// The loops of a command list as [start, end) ranges of the commands the parser marks as in that loop (cmd.loops: the `for` / `while` header, its condition and its body), by the index they start at,
+// outermost first: a loop inside a loop is a range of its own inside the outer one, and so is each of two loops with nothing between them. Marks not to be trusted (cmds.ctlBroken): one range from the first loop header on.
 const LOOP_HEAD = /^\s*(?:while|until|for|select|repeat|foreach)(?=[\s;&|(){]|$)/;
-function loopRunsOf(cmds) {
+function loopRangesOf(cmds) {
   const out = new Map();
   if (cmds.truncated) return out;
   if (cmds.ctlBroken) {
     const head = cmds.findIndex((c) => LOOP_HEAD.test(c.raw ?? '') || ['for', 'select'].includes(c.argv[0]));
-    if (head >= 0) out.set(head, cmds.length);
+    if (head >= 0) out.set(head, [{ id: 'broken', start: head, end: cmds.length }]);
     return out;
   }
+  const byId = new Map();
   for (let i = 0; i < cmds.length; i++) {
-    if (!cmds[i].ctl?.loop) continue;
-    let j = i;
-    while (j < cmds.length && cmds[j].ctl?.loop) j++;
-    out.set(i, j);
-    i = j - 1;
+    for (const id of cmds[i].loops ?? []) {
+      const r = byId.get(id);
+      if (r) r.end = i + 1;
+      else {
+        const made = { id, start: i, end: i + 1 };
+        byId.set(id, made);
+        if (!out.has(i)) out.set(i, []);
+        out.get(i).push(made);
+      }
+    }
   }
   return out;
 }
@@ -2931,11 +2940,16 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
   let envDirty = false;
   const moved = new Set(); // (directories whose branch some reading left different from the start; alias keys likewise: see below)
   const redefined = new Set();
-  // (#352 R4-F1, R5: the readings of a loop word are consecutive iterations of ONE shell, so what a body leaves for its next iteration is judged where the loop is walked: evalString, loopRunsOf.
-  // What one reading leaves for an early command of ANOTHER reading is not carried across readings: that command would have to be one whose own words depend on the loop word AND that is refused only
-  // by the other reading's leftovers; the one such command a word can steer, the git subcommand (`git $s`), is refused at run time whatever the leftovers are (RUN_TIME_SUBCOMMAND), and every other command
-  // is judged on the same words in every reading, so each reading's own second pass already meets what its body leaves.)
+  // (#352 R4-F1, R6-B1: the readings of a loop word are consecutive iterations of ONE loop, and a word can steer more than a git subcommand (`npm run $s`, `bash $s.sh` are another script per reading), so what the
+  // body of a loop leaves for its next iteration is the union over ALL readings: the carry of each loop is shared (ctx.readingMemo), every reading judges the loop's body from entry + that carry, and the readings
+  // are judged again while the carry grows (a reading judged before another one added to it). More passes than MAX_READING_PASSES refuse.)
+  const memo = total > 1 ? { str, level, carries: new Map() } : null;
+  const memoSize = () => { let n = 0; for (const c of memo.carries.values()) n += carrySize(c); return n; };
+  const outerMemo = ctx.readingMemo;
+  ctx.readingMemo = memo;
   try {
+   for (let pass = 0; ; pass++) {
+    const before = memo ? memoSize() : 0;
     for (let r = 0; r < total; r++) {
       checkDeadline(ctx.budget);
       countReading(ctx.budget); // (the readings of the whole evaluation, nested scripts included, share one allowance)
@@ -2967,6 +2981,9 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
       // (#352 R3-F1: a mark made without a change to the map -- judgeAlternatives restores the map and leaves only the mark -- is wiped by the next reading's restoreLineState, so it is taken here)
       for (const n of ctx.aliasUnsure) if (!saved.aliasUnsure.has(n)) redefined.add(n);
     }
+    if (!memo || memoSize() === before) break;
+    if (pass + 1 >= MAX_READING_PASSES) return deny('a loop here leaves git state for its next iteration that depends on its loop word, and the readings keep adding to it, so what its iterations do cannot be verified. Write the iterations out.');
+   }
     if (level > 0 && total > 1) {
       // (config is only ever set; a branch or alias that differs from the state the script started with, in any reading, may or may not have changed)
       // (the alias part is defence in depth: the candidate-script comparison (spec.git vs ctx.gitAliases) makes a redefined alias unsure as well)
@@ -2977,6 +2994,7 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
     }
     return allowed();
   } finally {
+    ctx.readingMemo = outerMemo;
     [ctx.pins, ctx.pinsLevel] = outer;
   }
 }
@@ -3038,40 +3056,58 @@ function evalString(str, startDir, ctx, level, child = false) {
   // the subshells open at the command being walked, outermost first: { id, dir, uncertain } as they were when it started (null: marks not trusted, see subshellsTrusted)
   const subs = subshellsTrusted(cmds) ? [] : null;
   let chdirBase; // (the list's own directory while one command runs in its wrapper's -C / --chdir directory)
-  // #352 R5: the loop being walked (see loopEntry): its range, the state at its entry, what its body left so far, and the walk state to start the second pass from
-  const loopEnds = loopRunsOf(cmds);
-  let loop = null;
+  // #352 R6: the loops being walked, outermost first, each a frame: its range, the state at its entry, its carry (what its body may leave for the next iteration), the places its body can start in and
+  // the carry each was judged with, and the walk state to start a pass from. A frame is finished when no start is left that was not judged with the carry as it is now.
+  const loopsAt = loopRangesOf(cmds);
+  const frames = [];
+  const memo = ctx.readingMemo && ctx.readingMemo.str === str && ctx.readingMemo.level === level ? ctx.readingMemo : null; // (the readings of a loop word share the carry of each loop: judgeReadings)
   try {
   for (let i = 0; ; i++) {
     checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
-    if (loop && i >= loop.end) {
-      loopLeft(ctx, loop.entry, loop.left);
+    for (;;) {
+      // (the state after the command before this one is one the next iteration can start in, for every loop open: a `continue`, a `break`, a command that may not run)
+      for (const fr of frames) loopLeft(ctx, fr.entry, fr.carry);
+      const fr = frames[frames.length - 1];
+      if (!fr || i < fr.end) break;
       // Where the body can end, replayed on its own cd / pushd / popd (the walk loses the directory at the command after a cd that is not chained with &&, which would make every body end in an unknown
       // one): the places its next iteration may start in. A move to a place not yet judged from is judged from there; a body that keeps moving (`cd ..`, a relative path that is not a fixed point) is
       // judged from at most 4 places and then from an unknown one. Marks not trusted, or a function / state hazard (no directory is known in any pass): no directory is followed.
-      const ends = hazard ? [] : subs ? loopEndDirs(cmds, loop, loop.starts[loop.starts.length - 1], ctx, cdp) : dir !== loop.dir ? [null] : [];
-      for (const d of ends) if (!loop.starts.includes(d) && !loop.queue.includes(d)) loop.queue.push(d);
-      if (loop.starts.length === 1 && loopLeftAny(loop.left)) loop.queue.unshift(loop.dir); // (it left git state: once more from where it started, before any other place, so that the refusal names the state)
-      if (loop.queue.length && loop.starts.length >= MAX_LOOP_STARTS) { loop.queue.length = 0; if (!loop.starts.includes(null)) loop.queue.push(null); }
-      if (loop.queue.length) {
-        const nextDir = loop.queue.shift();
-        countReading(ctx.budget); // (the extra pass counts against the allowance of readings, as any other)
-        loop.starts.push(nextDir);
-        loopReseed(ctx, loop.entry, loop.left);
-        dir = nextDir;
-        uncertain = nextDir === loop.dir ? loop.uncertain : false;
-        chdirBase = undefined;
-        if (subs) subs.splice(0, subs.length, ...loop.subs.map((x) => ({ ...x })));
-        i = loop.start;
-      } else {
-        loopMark(ctx, loop.left); // (after the loop: the body may have run any number of times)
-        loop = null;
+      const ends = hazard ? [] : subs ? loopEndDirs(cmds, fr, fr.passDir, ctx, cdp) : dir !== fr.passDir ? [null] : [];
+      for (const d of ends) {
+        if (fr.dirs.includes(d)) continue;
+        if (fr.dirs.length < MAX_LOOP_STARTS) fr.dirs.push(d);
+        else if (!fr.dirs.includes(null)) fr.dirs.push(null);
       }
+      // a start is judged again whenever the carry grew since it was last judged from (it left git state: from where it started first, so that the refusal names the state)
+      const nextDir = fr.dirs.find((d) => fr.judged.get(d) !== carrySize(fr.carry));
+      if (nextDir === undefined) {
+        loopMark(ctx, fr.carry); // (after the loop: the body may have run any number of times, and left what it left at any command)
+        frames.pop();
+        continue;
+      }
+      if (++fr.passes > MAX_LOOP_PASSES) return deny('a loop here keeps leaving git state for its next iteration, or moves to ever new places, so what its next iterations do cannot be verified. Simplify the loop or write its iterations out.');
+      countReading(ctx.budget); // (the extra pass counts against the allowance of readings, as any other)
+      fr.judged.set(nextDir, carrySize(fr.carry));
+      fr.passDir = nextDir;
+      loopReseed(ctx, fr.entry, fr.carry);
+      dir = nextDir;
+      uncertain = nextDir === fr.dir0 ? fr.uncertain0 : false;
+      chdirBase = undefined;
+      if (subs) subs.splice(0, subs.length, ...fr.subs.map((x) => ({ ...x })));
+      i = fr.start;
+      break;
     }
     if (i >= cmds.length) break;
     const c = cmds[i];
     if (chdirBase !== undefined) { dir = chdirBase; chdirBase = undefined; }
-    if (!loop && loopEnds.has(i)) loop = { start: i, end: loopEnds.get(i), starts: [dir], queue: [], entry: loopEntry(ctx), left: newLoopLeft(), dir, uncertain, subs: subs ? subs.map((x) => ({ ...x })) : [] };
+    for (const r of loopsAt.get(i) ?? []) {
+      if (frames.some((x) => x.id === r.id)) continue;
+      const fr = { id: r.id, start: r.start, end: r.end, entry: loopEntry(ctx), carry: memo?.carries.get(r.id) ?? newLoopLeft(), dir0: dir, uncertain0: uncertain, dirs: [dir], passDir: dir, judged: new Map(), passes: 1, subs: subs ? subs.map((x) => ({ ...x })) : [] };
+      if (memo && !memo.carries.has(r.id)) memo.carries.set(r.id, fr.carry);
+      if (carrySize(fr.carry)) loopMark(ctx, fr.carry); // (what the other readings of the loop word left: the body is judged from entry + that carry in this one as well)
+      fr.judged.set(dir, carrySize(fr.carry));
+      frames.push(fr);
+    }
     const argv = c.argv;
     if (subs) {
       // Why: a cd inside a subshell ($( ), ( ), backticks, <( )) moves that subshell only: when it ends, the line goes on in the directory it had when the subshell
