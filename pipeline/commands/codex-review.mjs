@@ -33,7 +33,7 @@ import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, 
 import { assertPublishedHistory } from '../lib/review-publish.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
-  allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, writeFileAtomic,
+  allItems, anchorBranch, currentContentHash, prBaseOf, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, writeFileAtomic,
   writeJson,
 } from '../lib/review-context.mjs';
 
@@ -202,7 +202,7 @@ export const run = guarded(async (argv, ctx) => {
   }
 
   // The merge base of the whole PR: where the PR forked from the branch it targets (origin/<base> when it exists).
-  const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
+  const prBase = prBaseOf(view, root, config);
   // Best effort: a fresh origin/<base> is what "merged in from the base branch" is measured against. Offline, no remote or a
   // slow one just means the cached ref is used.
   try {
@@ -249,7 +249,7 @@ export const run = guarded(async (argv, ctx) => {
   let resolution = null;
   let resolutionIneligible;
   if (state?.rounds.length > 0) {
-    review = prBase === config.default_branch
+    review = prBase === anchorBranch(root, config)
       ? effectiveReviewBase({ from: base, forkPoint }, o)
       : { base, kind: 'previous' };
     if (review.kind === 'whole-pr') {

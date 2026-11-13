@@ -275,7 +275,7 @@ function historyProblem({ from, head, baseRef }, o) {
     if (parents.length === 1) return fail('history-nonmerge', `${cur} is not a merge commit`);
     if (parents.length > 2) return fail('history-octopus', `${cur} merges ${parents.length} parents`);
     if (parents.length === 0) return fail('history-not-first-parent', `${cur} is a root commit`);
-    if (!isAncestor(parents[1], baseRef, o)) return fail('history-foreign-merge', `${cur} merges ${parents[1]}, which is not on ${baseRef}`);
+    if (!isAncestor(parents[1], baseRef, o)) return fail('history-foreign-merge', `${cur} merges ${parents[1]}, which is not on ${displayRef(baseRef)}`);
     cur = parents[0];
   }
   return null;
@@ -705,10 +705,12 @@ export function reviewPatch(from, to, o) {
   return { patch, skipped: names };
 }
 
-// `origin/<branch>` is what a PR will be merged into; a repo without that remote ref (a fresh clone of a local fixture,
-// a test) falls back to the local branch. Any other git failure is not swallowed.
+// `refs/remotes/origin/<branch>` is what a PR will be merged into; a repo without that remote ref (a fresh clone of a local fixture,
+// a test) falls back to the local branch. Any other git failure is not swallowed. The remote ref is returned FULLY QUALIFIED: git resolves a short
+// `origin/<branch>` as refs/tags/ and refs/heads/ first, so a tag or a local branch literally named `origin/main` would shadow it (EW #2056). Callers that
+// print the ref show `displayRef(ref)`.
 export function reviewBaseRef(branch, o) {
-  const remote = `origin/${branch}`;
+  const remote = `refs/remotes/origin/${branch}`;
   try {
     revParse(remote, o);
     return remote;
@@ -718,21 +720,28 @@ export function reviewBaseRef(branch, o) {
   }
 }
 
+// The short, human-facing form of a ref reviewBaseRef returned (refs/remotes/origin/main -> origin/main).
+export const displayRef = (ref) => String(ref).replace(/^refs\/remotes\//, '');
+
 // The branch the remote itself calls its default (what refs/remotes/origin/HEAD points at), or null when the clone has none or it is not a plain
 // origin/<branch>, or that ref does not resolve (a dangling symref after a rename fetched with prune: git symbolic-ref does not need the target to exist). A
-// source a PR cannot edit: unlike .claude/pipeline.yml it is not part of the tree under review.
+// source a PR cannot edit: unlike .claude/pipeline.yml it is not part of the tree under review. The target is resolved fully qualified, like the symref was read.
 export function remoteDefaultBranch(o) {
   const out = gitOrNull(['symbolic-ref', '-q', 'refs/remotes/origin/HEAD'], 1, o);
   const m = /^refs\/remotes\/origin\/(.+)\n?$/.exec(out ?? '');
   if (!m) return null;
   try {
-    revParse(`origin/${m[1]}`, o);
+    revParse(`refs/remotes/origin/${m[1]}`, o);
     return m[1];
   } catch (err) {
     if (err instanceof GitError) return null;
     throw err;
   }
 }
+
+// The default branch every trust decision is anchored on: what the remote calls its default (remoteDefaultBranch), else `configBranch` (the
+// working-tree config's default_branch, which a PR can edit: only a clone without a usable origin/HEAD has to rely on it).
+export const anchorBranch = (configBranch, o) => remoteDefaultBranch(o) ?? configBranch;
 
 // THE content hash of "the code that was reviewed": what HEAD changes relative to where it forked from the PR base,
 // minus the agent log the pipeline itself appends to. The review loop (round coverage, review-complete) and the final

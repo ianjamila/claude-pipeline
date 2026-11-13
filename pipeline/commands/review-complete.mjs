@@ -23,7 +23,7 @@ import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
 import { closingKeywordProblem, multiIssueClosingLines } from '../lib/closing-keywords.mjs';
-import { currentContentHash, refreshBaseRef, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
+import { anchorBranch, currentContentHash, prBaseOf, refreshBaseRef, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 import { publishTriage, readPublished, reviewContentHash } from '../lib/review-publish.mjs';
 
 export const meta = {
@@ -81,7 +81,7 @@ function whyNot(state, hash) {
 // lane is Fable whatever the level (fail closed). A recorded medium stays medium and only the judge lane of a fresh size-only medium may keep it
 // with the judge: a medium that came from a hit (now gone from a fresh scan, or never found by it) needs Fable.
 // `prBase`: the PR's base branch; a stack never gets the size-only judge (rateBranch).
-export async function laneProblem(state, root, config, base, { prBase = config.default_branch, rate = rateBranch } = {}) {
+export async function laneProblem(state, root, config, base, { prBase = anchorBranch(root, config), rate = rateBranch } = {}) {
   const recorded = LEVELS.includes(state.risk) ? state.risk : 'low';
   const proven = state.rounds.some((r) => r.fableRequired === true && r.arbiter?.proofOk === true);
   const needs = (why) => (proven ? null : `the PR needs the Fable review pass (${why}), but no review round ran a proven one`);
@@ -150,12 +150,12 @@ const oneLine = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 200
 // 'disjoint' = behind only when the merge path would refuse it too (finalgate.behindFreshEnough, which reads the mode from the BASE commit's config).
 function draftBehindBase({ root, config, gh, pr, view, refresh }) {
   if (view.isDraft !== true) return {};
-  const branch = config.default_branch;
+  const branch = anchorBranch(root, config);
   if (!refresh.refreshed) return { warning: `behind-base check skipped: origin/${branch} could not be refreshed (${refresh.reason ?? 'fetch failed'})` };
   const o = { cwd: root };
   let baseSha;
   try {
-    baseSha = revParse(`origin/${branch}^{commit}`, o);
+    baseSha = revParse(`refs/remotes/origin/${branch}^{commit}`, o);
     if (isAncestor(baseSha, 'HEAD', o)) return {};
   } catch (err) {
     return { warning: `behind-base check skipped: could not compare HEAD with origin/${branch} (${oneLine(err)})` };
@@ -234,7 +234,7 @@ export const run = guarded(async (argv, ctx) => {
           const note = ex && !ex.off ? `; the docs-only exemption does not apply: ${ex.reason}` : '';
           // A stale origin/<branch> is the one cause a person cannot see: say that the ref could not be refreshed.
           const stale = !refresh.refreshed && refresh.usesRemoteRef && why.startsWith('no review round covers')
-            ? ` (origin/${config.default_branch} could not be refreshed: ${refresh.reason})` : '';
+            ? ` (origin/${anchorBranch(root, config)} could not be refreshed: ${refresh.reason})` : '';
           return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${why}${stale}${note}`, currentContentHash: hash } };
         }
         docsExempt = ex;
@@ -258,7 +258,7 @@ export const run = guarded(async (argv, ctx) => {
       }
       if (!grants.ok) return { exitCode: EXIT.FAILED, output: { ok: false, reason: grants.problems.join('; '), currentContentHash: hash } };
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
-      const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
+      const prBase = prBaseOf(view, root, config);
       const lane = await laneProblem(state, root, config, base, { prBase });
       if (lane) return { exitCode: EXIT.FAILED, output: { ok: false, reason: lane, currentContentHash: hash } };
       // Items that read as resolved but are not yet: a Claude-ruled follow-up with no issue, a fix made outside the file the finding names that no

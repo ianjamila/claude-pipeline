@@ -233,7 +233,7 @@ test('currentContentHash: hashes against origin/<default> when that ref exists, 
   w.repo.checkout('feat/x');
   w.repo.git(['rebase', '-q', 'main']);
   w.repo.git(['update-ref', 'refs/remotes/origin/main', w.base]);
-  assert.equal(reviewBaseRef(w.repo.dir, config), 'origin/main');
+  assert.equal(reviewBaseRef(w.repo.dir, config), 'refs/remotes/origin/main');
   const viaOrigin = currentContentHash(w.repo.dir, config);
   assert.equal(viaOrigin, contentHash('origin/main', 'HEAD', { cwd: w.repo.dir, exclude: ['docs/agent-log.md'] }));
   assert.notEqual(viaOrigin, contentHash('main', 'HEAD', { cwd: w.repo.dir, exclude: ['docs/agent-log.md'] }));

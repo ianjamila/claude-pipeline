@@ -29,7 +29,7 @@ import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
 import { readReviewGate } from './model-floor.mjs';
 import { skipOf } from './verify-steps.mjs';
-import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
+import { NETWORK_TIMEOUT_MS, anchorBranch, commitTime, diffFiles, displayRef, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
 import { ownerItemsDigest, rulingsBlockDigest } from '../hooks/lib/owner-go.mjs';
 import { QueueUnreadable, queueModeFor } from './merge-queue.mjs';
 
@@ -145,13 +145,16 @@ function ciExplicitlyEmpty(root) {
 
 // ---- refs, hashes -------------------------------------------------------------------------------
 
-// `origin/<default>` when the remote ref exists (the PR's real base), else the local default branch.
-export const baseRefFor = (root, config) => reviewBaseRef(config.default_branch, { cwd: root });
+// The default branch the gate anchors on: what the remote calls its default (origin/HEAD), else config.default_branch (git.mjs#anchorBranch; #369).
+const anchorOf = (root, config) => anchorBranch(config.default_branch, { cwd: root });
+
+// `refs/remotes/origin/<default>` when the remote ref exists (the PR's real base), else the local default branch.
+export const baseRefFor = (root, config) => reviewBaseRef(anchorOf(root, config), { cwd: root });
 
 // The review's content hash for HEAD: the patch against the merge-base, minus the agent log the pipeline appends to.
 // Literally the review loop's hash: both call git.mjs#reviewContentHash.
 export const localContentHash = (root, config) =>
-  reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log }, { cwd: root });
+  reviewContentHash({ branch: anchorOf(root, config), agentLog: config.agent_log }, { cwd: root });
 
 // `explicit` ({ sha, branch }, --owner-go): scan merge-base(sha, HEAD)..HEAD for the base commit GitHub names (baseRefOid), never a local
 // ref. The commit must be a local object already (no fetch here, and no fallback to origin/<branch> or the local branch).
@@ -186,8 +189,9 @@ function assertBaseObject(explicit, o) {
 // ---- the checks ---------------------------------------------------------------------------------
 
 // `queueMode`: GitHub merges through its merge queue, which tests the PR on top of the base itself, so being behind is no problem.
-function prOpenCheck({ info, head, config, behind = null, queueMode = false }) {
+function prOpenCheck({ info, head, root, config, behind = null, queueMode = false }) {
   const problems = [];
+  const branch = anchorOf(root, config);
   if (info.state !== 'OPEN') problems.push(`PR state is ${info.state}`);
   if (info.isDraft !== false) problems.push('PR is a draft');
   if (info.mergeable === 'CONFLICTING') problems.push('PR has merge conflicts');
@@ -195,9 +199,9 @@ function prOpenCheck({ info, head, config, behind = null, queueMode = false }) {
   if (info.headRefOid !== head) problems.push(`PR head ${short(info.headRefOid)} is not the local HEAD ${short(head)}`);
   // Branch protection is not strict (spec 6.6), so GitHub will merge a PR that is behind its base: that would land code on a
   // base nobody verified it against. The branch must be updated (and re-verified) first.
-  if (behind && !queueMode) problems.push(`behind-base: ${behind}; update the branch from ${config.default_branch} and re-verify before merging`);
+  if (behind && !queueMode) problems.push(`behind-base: ${behind}; update the branch from ${branch} and re-verify before merging`);
   // The hard-stop, integrity and review diffs are taken against the default branch; any other base would be judged on the wrong diff.
-  if (info.baseRefName !== config.default_branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${config.default_branch}`);
+  if (info.baseRefName !== branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${branch}`);
   return problems.length ? check('pr-open', false, problems.join('; ')) : check('pr-open', true, `open at ${short(head)}`);
 }
 
@@ -214,7 +218,7 @@ function behindBase({ info, diff, root, config, baseSha = null, queueMode = fals
   try {
     const ref = baseSha ?? baseRefFor(root, config);
     const tip = baseSha ?? revParse(`${ref}^{commit}`, { cwd: root });
-    if (tip !== d.mb) return `the base (${baseSha ? 'GitHub\'s base commit' : ref} at ${short(tip)}) is not an ancestor of HEAD; the branch forked from ${short(d.mb)}`;
+    if (tip !== d.mb) return `the base (${baseSha ? 'GitHub\'s base commit' : displayRef(ref)} at ${short(tip)}) is not an ancestor of HEAD; the branch forked from ${short(d.mb)}`;
   } catch { /* an unreadable ref was already reported by the diff */ }
   return null;
 }
@@ -259,6 +263,7 @@ const namedFiles = (list) => `${list.slice(0, NAMED_SHOWN).join(', ')}${list.len
 //   4b. main did not remove a directory the PR adds into.
 // -> { ok: true, behindBy, mergeBase, mainFiles } or { ok: false, reason }. Never throws, never null: every doubt is a refusal.
 export function behindFreshEnough({ root, config, diff, baseSha, info }) {
+  // `config.default_branch` below is display text only (#369): every comparison here runs on baseSha, GitHub's own baseRefOid.
   const no = (reason) => ({ ok: false, reason });
   const o = { cwd: root };
   try {
@@ -344,25 +349,26 @@ const CI_PROOF_STATES = new Set(['pass', 'pending', 'failure', 'missing']);
 // the base first; any failure to fetch, read or validate it is { ok: false, reason }, which the caller turns into ci-proof-missing.
 function baseProofSettings({ root, config }) {
   const o = { cwd: root };
-  const branch = config.default_branch;
-  const ref = `origin/${branch}`;
+  const branch = anchorOf(root, config);
+  const ref = `refs/remotes/origin/${branch}`;
+  const label = displayRef(ref);
   try {
     git(['fetch', '--no-tags', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
   } catch (err) {
-    return { ok: false, reason: `could not fetch ${ref}: ${firstLine(err)}` };
+    return { ok: false, reason: `could not fetch ${label}: ${firstLine(err)}` };
   }
   try {
     const text = showFile(ref, '.claude/pipeline.yml', o);
-    if (text === null) return { ok: false, reason: `${ref} has no .claude/pipeline.yml` };
+    if (text === null) return { ok: false, reason: `${label} has no .claude/pipeline.yml` };
     const parsed = validateConfig(parseYaml(text));
-    if (!parsed.ok) return { ok: false, reason: `${ref}'s .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
+    if (!parsed.ok) return { ok: false, reason: `${label}'s .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
     const v = parsed.config.verify;
     return {
       ok: true, ref, branch, sha: revParse(`${ref}^{commit}`, o),
       deferrable: v.deferrable_steps ?? [], proof: v.ci_proof ?? {}, inputs: v.ci_proof_inputs ?? [],
     };
   } catch (err) {
-    return { ok: false, reason: `could not read the proof settings from ${ref}: ${firstLine(err)}` };
+    return { ok: false, reason: `could not read the proof settings from ${label}: ${firstLine(err)}` };
   }
 }
 
@@ -393,7 +399,7 @@ function baseProofSettingsReadOnly({ root, config, gh, baseSha }) {
     if (!parsed.ok) return unverified(`the base's .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}`);
     const v = parsed.config.verify;
     return {
-      ok: true, ref: baseSha, branch: config.default_branch, sha: baseSha,
+      ok: true, ref: baseSha, branch: anchorOf(root, config), sha: baseSha,
       deferrable: v.deferrable_steps ?? [], proof: v.ci_proof ?? {}, inputs: v.ci_proof_inputs ?? [],
     };
   } catch (err) {
@@ -418,9 +424,9 @@ async function proveDeferredStep({ step, ctx }) {
   try {
     const settings = ctx.settings();
     if (!settings.ok) return missing(settings.reason);
-    if (!settings.deferrable.includes(step)) return missing(`${settings.ref} does not list ${step} in verify.deferrable_steps`);
+    if (!settings.deferrable.includes(step)) return missing(`${displayRef(settings.ref)} does not list ${step} in verify.deferrable_steps`);
     const spec = Object.hasOwn(settings.proof, step) ? settings.proof[step] : undefined;
-    if (!isObject(spec)) return missing(`${settings.ref} has no verify.ci_proof entry for ${step}`);
+    if (!isObject(spec)) return missing(`${displayRef(settings.ref)} has no verify.ci_proof entry for ${step}`);
     const hit = ctx.protectedHit();
     if (hit !== null) return missing(`this PR changes ${hit}, an input of the CI proof, so only a local run can vouch for ${step}`);
     const res = await ctx.ciProof({
@@ -803,7 +809,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
 
   const proofs = [];
   const checks = [
-    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config, queueMode }), queueMode })),
+    await safely('pr-open', () => prOpenCheck({ info, head, root, config, behind: behindBase({ info, diff, root, config, queueMode }), queueMode })),
     await safely('labels', () => labelsCheck(info)),
     await safely('preflight', () => preflightCheck({ root, env, gh })),
     await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs, readOnly, baseSha: info?.baseRefOid ?? null })),
@@ -1013,7 +1019,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
   const head = headSha({ cwd: root });
   const info = await readPrSettled({ gh, pr, fields: [...OWNER_GO_FIELDS], sleep, pauseMs: mergeablePause(env) });
   // The range is GitHub's: the PR's base commit and head, as read now. headRefOid must be the local HEAD (pr-open), baseRefOid a local object.
-  const explicit = { sha: info?.baseRefOid, branch: typeof info?.baseRefName === 'string' && info.baseRefName !== '' ? info.baseRefName : config.default_branch };
+  const explicit = { sha: info?.baseRefOid, branch: typeof info?.baseRefName === 'string' && info.baseRefName !== '' ? info.baseRefName : anchorOf(root, config) };
   const baseSha = typeof explicit.sha === 'string' && FULL_SHA.test(explicit.sha) ? explicit.sha : null;
   const diff = lazyDiff(root, config, explicit);
   const hardstops = await safely('hardstops', () => hardstopsCheck({ root, config, diff }));
@@ -1050,7 +1056,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     }
   }
   const checks = [
-    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindReason, queueMode: queueMode === true })),
+    await safely('pr-open', () => prOpenCheck({ info, head, root, config, behind: behindReason, queueMode: queueMode === true })),
     await safely('labels', () => labelsCheck(info, { exemptHold })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
     await safely('scan-range', () => scanRangeCheck({ root, gh, pr, diff, info, explicit })),

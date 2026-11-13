@@ -17,7 +17,7 @@ import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds } from '../lib/triage.mjs';
 import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
-  allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
+  allItems, anchorBranch, canonicalJson, prBaseOf, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
   adoptPublishedGrants, roundDir, stateExtends, withStateLock,
 } from '../lib/review-context.mjs';
 
@@ -511,7 +511,7 @@ async function markImplemented(rest, ctx) {
     if (refresh.usesRemoteRef && !refresh.refreshed) {
       throw new Fail(EXIT.UNAVAILABLE, {
         ok: false, unavailable: true, reason: 'base-refresh',
-        message: `origin/${config.default_branch} could not be refreshed${refresh.reason ? ` (${refresh.reason})` : ''}, and a stale base would count the default branch's new commits as the fix: nothing was marked; retry when the remote is reachable`,
+        message: `origin/${anchorBranch(root, config)} could not be refreshed${refresh.reason ? ` (${refresh.reason})` : ''}, and a stale base would count the default branch's new commits as the fix: nothing was marked; retry when the remote is reachable`,
       });
     }
     // An accepted item is only "implemented" by a change to the code: the branch content must differ from what the
@@ -670,7 +670,7 @@ async function fableRefresh(rest, ctx) {
     // The whole-PR range starts at the PR's merge base now (a base branch merged in since the last round moves it).
     let forkPoint = last.forkPoint ?? state.rounds[0]?.reviewBase;
     try {
-      const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
+      const prBase = prBaseOf(view, root, config);
       forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
     } catch (err) {
       if (!(err instanceof GitError)) throw err;

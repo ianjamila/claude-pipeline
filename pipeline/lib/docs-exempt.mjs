@@ -26,7 +26,7 @@
 import { posix } from 'node:path';
 import { DEFAULTS, docsExemptProblem } from './config.mjs';
 import { isAgentInstructionPath } from './doc-paths.mjs';
-import { contentHash, diffFiles, diffModes, git, isAncestor, mergeBase, revParse, reviewBaseRef, showFile } from './git.mjs';
+import { anchorBranch, contentHash, diffFiles, diffModes, git, isAncestor, mergeBase, revParse, reviewBaseRef, showFile } from './git.mjs';
 import { reviewValidFor } from './triage.mjs';
 import { parseYaml } from './yaml.mjs';
 
@@ -377,7 +377,8 @@ function decide(state, { root, config, hash }) {
     return no('the last review round is not clean (an item is unresolved, a Fable pass is owed, or accepted fixes still need a round)');
   }
 
-  const branch = config?.default_branch ?? DEFAULTS.default_branch;
+  // The same base the review loop hashes from (review-context.mjs#currentContentHash): the remote's default branch, else the config's (#369).
+  const branch = anchorBranch(config?.default_branch ?? DEFAULTS.default_branch, o);
   const base = reviewBaseRef(branch, o);
   const agentLog = config?.agent_log ?? DEFAULTS.agent_log;
   const exclude = typeof agentLog === 'string' && agentLog !== '' ? [agentLog] : [];
