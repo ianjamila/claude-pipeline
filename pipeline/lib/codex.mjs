@@ -416,6 +416,16 @@ export function analyzeCodexFailure({ code, signal = null, stderr = '', stdout =
   return out('error');
 }
 
+// Codex says the model is overloaded: a non-zero exit, no timeout, no kill by a signal, and a LAST `turn.failed` event whose message is Codex's own
+// capacity wording ("Selected model is at capacity...", or its typed `server_overloaded`). Never stderr, never item.* or top-level error events (the model
+// and its tools can print that text). Such a failure is worth one retry; it keeps its ordinary classification (analyzeCodexFailure) if the retry fails too.
+const CAPACITY_RE = /selected model is at capacity|server[_ ]overloaded/i;
+export function isCapacityFailure({ code, signal = null, stdout = '', timedOut = false } = {}) {
+  if (typeof code !== 'number' || code === 0 || signal || timedOut) return false;
+  const { turnFailed } = readCodexVerdict(stdout);
+  return turnFailed !== null && CAPACITY_RE.test(turnFailed);
+}
+
 // -> 'quota' | 'auth' | 'unavailable' | 'error' (analyzeCodexFailure also returns the turn.failed message and the thread id).
 export function classifyCodexFailure(input = {}) {
   return analyzeCodexFailure(input).reason;

@@ -1,11 +1,20 @@
 // The part of "run Codex and read its answer file" that codex-review and triage second-review share: start the command with the prompt on
 // stdin, classify a failure (never readable as "found nothing"), and accept the output file only when this run wrote it.
 import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { analyzeCodexFailure, parseQuotaReset } from './codex.mjs';
+import { analyzeCodexFailure, isCapacityFailure, parseQuotaReset } from './codex.mjs';
 import { findSessionLog, readTaskCompleteError } from './codex-session.mjs';
 import { codexCommand, runAsync } from './proc.mjs';
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export const CODEX_TIMEOUT_MS = 30 * 60 * 1000;
+// How long to wait before the one retry of a "model is at capacity" failure; 0 is allowed (tests), unlike the timeout.
+export const CODEX_CAPACITY_RETRY_MS = 30 * 1000;
+const capacityRetryMs = (env) => {
+  const raw = env?.PIPELINE_CODEX_CAPACITY_RETRY_MS;
+  const n = raw === undefined || String(raw).trim() === '' ? NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : CODEX_CAPACITY_RETRY_MS;
+};
 // A file system may round mtimes down (1-2 s on some); the file was unlinked before the run, so this only has to
 // tell "written during this run" from "left over from long ago".
 export const MTIME_SLACK_MS = 2000;
@@ -41,8 +50,10 @@ function quotaFacts({ message, threadId }, { env, now, timeZone }) {
 }
 
 // Runs `codex <args>` with `promptBytes` on stdin (stdout is Codex's --json event stream). Whatever is at outPath beforehand was not
-// written by this run, so it is removed first. A timeout is retried ONCE with the same prompt bytes, the same outPath and the same
-// remove-first guard (`retried: {reason:'timeout'}` on the result); a second timeout is unavailable with timedOut:true, never quota.
+// written by this run, so it is removed first. A timeout, or a failure whose LAST turn.failed says the model is at capacity (isCapacityFailure; after
+// PIPELINE_CODEX_CAPACITY_RETRY_MS, default 30 s), is retried ONCE IN TOTAL with the same prompt bytes, the same outPath and the same remove-first guard
+// (`retried: {reason:'timeout'|'capacity'}` on the result; it is the same attempt, not a new Codex run). A second timeout is unavailable with
+// timedOut:true, never quota; a second capacity failure is classified exactly as before (error). A quota stop is never retried.
 // -> {ok:true, startedAt, retried?} or {ok:false, reason: quota|auth|unavailable|error, code, timedOut, detail, retried?, quota?}.
 // `detail` is the turn.failed message when Codex gave one, else the stderr tail. `quota` (reason 'quota' only) is
 // {eligible, proof: 'session-log'|'stream', resetAt, resetText, message, threadId}. `now`/`timeZone` are for tests.
@@ -51,6 +62,11 @@ export async function execCodex({ root, env, args, promptBytes, outPath, now, ti
   let { r, startedAt } = await attempt({ root, env, args, promptBytes, outPath });
   if (r.timedOut) {
     retried = { reason: 'timeout' };
+    ({ r, startedAt } = await attempt({ root, env, args, promptBytes, outPath }));
+  } else if (isCapacityFailure({ code: r.code, signal: r.signal, stdout: r.stdout, timedOut: r.timedOut })) {
+    retried = { reason: 'capacity' };
+    rmSync(outPath, { force: true });
+    await sleep(capacityRetryMs(env));
     ({ r, startedAt } = await attempt({ root, env, args, promptBytes, outPath }));
   }
   if (r.code !== 0 || r.timedOut) {

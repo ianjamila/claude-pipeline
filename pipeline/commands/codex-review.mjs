@@ -85,11 +85,11 @@ export const meta = {
     '    review.substitute.mode auto; agent is substitute-fable once the PR was ever high risk (maxRisk), else substitute-opus; review.substitute.min_wait_minutes above 0 and a',
     '    reset within it gives eligible:false, waitUntil (default 0: never wait). A quota stop also carries quota:{proof: session-log|stream, resetAt, resetText}, and is noted',
     '    in the machine-wide Codex record (P codex-status: lastOutage, waiting); the next Codex answer for the PR clears it (best effort: a failure there is a warnings entry, never a failed round)',
-    '  a Codex timeout is retried once (same prompt, same attempt): retried:{reason:timeout}; a second timeout is exit 3 unavailable with timedOut:true, never a substitute',
+    '  a Codex timeout, or a failure whose last turn.failed says the model is at capacity, is retried once in total (same prompt, same attempt; capacity after a wait): retried:{reason:timeout|capacity}; a second timeout is exit 3 unavailable with timedOut:true, never a substitute; a second capacity failure keeps its usual classification (error); quota is never retried',
     '  every Codex attempt first replaces .review/round-R/route.json with {attemptId, evidence:pending, round, base, head, patchSha256, risk, agent, at} and keeps its files in',
     '    round-R/attempt-<attemptId>/ (codex-raw.json, prompt.md). The final evidence (quota | none) and a recorded round are written under the review lock and a per-PR route lock (review, then route; the pending record takes the route lock alone, so a held review lock never stops Codex from starting) only while route.json still',
     '    holds this attempt in pending, else exit 2 {error:superseded} (nothing written, nothing deleted); the winner\'s files are copied to round-R/. The file is written by this command only',
-    '  env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout (tests)',
+    '  env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout, PIPELINE_CODEX_CAPACITY_RETRY_MS the 30 second wait before the capacity retry (tests)',
   ].join('\n'),
 };
 
