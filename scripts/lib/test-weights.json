@@ -1,7 +1,6 @@
 {
   "agent-log-close.test.mjs": 83592,
   "agent-log-publish.test.mjs": 131192,
-  "arbiter-threat-model.test.mjs": 17800,
   "artifacts.test.mjs": 42754,
   "checkpoint.test.mjs": 187569,
   "ci-guards.test.mjs": 778258,
@@ -33,7 +32,6 @@
   "docs-facts.test.mjs": 98,
   "entry-symlink.test.mjs": 63,
   "finalgate.test.mjs": 678,
-  "fix-scope.test.mjs": 60,
   "gate-fix-hardstops.test.mjs": 14076,
   "gate-fix-merge.test.mjs": 67566,
   "gate-fix-seams.test.mjs": 548,
@@ -153,7 +151,6 @@
   "timing.test.mjs": 214,
   "tmprepo.test.mjs": 5616,
   "transcript.test.mjs": 616,
-  "triage-threat-model.test.mjs": 60,
   "triage.test.mjs": 240,
   "update-branch.test.mjs": 55832,
   "update.test.mjs": 83490,
