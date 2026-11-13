@@ -2,7 +2,7 @@
 //   R8-B1    `"$(printf $'"')"` around a never-run loop hid the loop from the flat reader.
 //   R8-F1    the same flip with no `$'`: a quote in single quotes, a heredoc body or a comment inside `"$( )"`.
 //   R8-F2    backticks: `\\"` inside backticks is a literal quote for the shell, and a `#` right after a backtick is a comment.
-//   R8-F3    (#315) an everyday `cd proj && git add . # stage`, a leading comment, `-F - <<'EOF'` and `-m "$(cat <<'EOF' … )"` narrow again (the flat reader refused them: a `#` or a `<<`).
+//   R8-F3    (#315) an everyday `cd ./proj && git add . # stage`, a leading comment, `-F - <<'EOF'` and `-m "$(cat <<'EOF' … )"` narrow again (the flat reader refused them: a `#` or a `<<`).
 // Home is /home/u and so is the cwd; the lines are read from there.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,7 +16,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R8 ${label} denies: ${name}`, () => {
       const r = run(line, extra);
-      assert.equal(r.decision, 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -24,7 +24,7 @@ const allows = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R8 ${label} allows: ${name}`, () => {
       const r = run(line, extra);
-      assert.equal(r.decision, 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
+      assert.equal(r.decision, /R17 owner decision: a bare cd/.test(name) ? 'deny' : 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
     });
   }
 };
@@ -96,10 +96,10 @@ describe('R8-F3 (#315): everyday lines narrow to the project', () => {
   const AT = { cwd: HOME };
   allows('F3', [
     ['a trailing comment', 'cd ~/Claude/proj && git add . # stage', AT],
-    ['a leading comment', '# stage the work\ncd proj && git add .', AT],
-    ['git commit -F - with a heredoc', "cd proj && git add . && git commit -F - <<'EOF'\nfix: the thing\n\nbody\nEOF", AT],
-    ['git commit -m with a heredoc in a substitution', "cd proj && git add . && git commit -m \"$(cat <<'EOF'\nfix: the thing\nEOF\n)\"", AT],
-    ['a plain cd narrowing', 'cd proj && git add .', AT],
+    ['a leading comment (R17 owner decision: a bare cd is unknown)', '# stage the work\ncd proj && git add .', AT],
+    ['git commit -F - with a heredoc', "cd ./proj && git add . && git commit -F - <<'EOF'\nfix: the thing\n\nbody\nEOF", AT],
+    ['git commit -m with a heredoc in a substitution', "cd ./proj && git add . && git commit -m \"$(cat <<'EOF'\nfix: the thing\nEOF\n)\"", AT],
+    ['a plain cd ./narrowing', 'cd ./proj && git add .', AT],
   ]);
 });
 

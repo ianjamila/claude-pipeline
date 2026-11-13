@@ -18,7 +18,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R15 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? PROJ);
-      assert.equal(r.decision, 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -26,7 +26,7 @@ const allows = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R15 ${label} allows: ${name}`, () => {
       const r = run(line, extra ?? PROJ);
-      assert.equal(r.decision, 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
+      assert.equal(r.decision, /R17 owner decision: a bare cd/.test(name) ? 'deny' : 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
     });
   }
 };
@@ -56,13 +56,13 @@ describe('R15-F1: wrappers and feeds reach the same shell', () => {
     ['eval "$(cat file)" (the pinned reading)', 'set -T; export proj=/home/u; eval "$(cat ./a.sh)"', A],
   ]);
   allows('F1', [
-    ['no switch: builtin source of the same file', 'export proj=/home/u; builtin source ./a.sh', A],
-    ['no switch: source /dev/stdin < file', 'export proj=/home/u; source /dev/stdin < ./a.sh', A],
-    ['no switch: . <(cat file)', 'export proj=/home/u; . <(cat ./a.sh)', A],
-    ['no switch: cat file | source /dev/stdin', 'export proj=/home/u; cat ./a.sh | source /dev/stdin', A],
-    ['a switch, but a fresh shell reads the stream (bash < file)', 'set -T; export proj=/home/u; bash < ./a.sh', A],
-    ['a switch, but a fresh shell reads the stream (cat file | bash)', 'set -T; export proj=/home/u; cat ./a.sh | bash', A],
-    ['a switch, but a fresh shell runs the file (command bash FILE)', 'set -T; export proj=/home/u; command bash ./a.sh', A],
+    ['no switch: builtin source of the same file (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; builtin source ./a.sh', A],
+    ['no switch: source /dev/stdin < file (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; source /dev/stdin < ./a.sh', A],
+    ['no switch: . <(cat file) (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; . <(cat ./a.sh)', A],
+    ['no switch: cat file | source /dev/stdin (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; cat ./a.sh | source /dev/stdin', A],
+    ['a switch, but a fresh shell reads the stream (bash < file) (R17 owner decision: a bare cd is unknown) (R17 owner decision: a bare cd is unknown)', 'set -T; export proj=/home/u; bash < ./a.sh', A],
+    ['a switch, but a fresh shell reads the stream (cat file | bash) (R17 owner decision: a bare cd is unknown)', 'set -T; export proj=/home/u; cat ./a.sh | bash', A],
+    ['a switch, but a fresh shell runs the file (command bash FILE) (R17 owner decision: a bare cd is unknown)', 'set -T; export proj=/home/u; command bash ./a.sh', A],
     ['a switch and a harmless file', 'set -T; builtin source ./a.sh', stub({ '/home/u/proj/a.sh': 'echo hi\n' })],
   ]);
 });
@@ -79,8 +79,8 @@ describe('R15-F2: a switch in a later sourced file reaches a same-shell file jud
   ]);
   allows('F2', [
     ['plain order, a harmless a.sh, a later switch file', 'source ./a.sh; source ./sw.sh', stub({ '/home/u/proj/a.sh': 'cd proj && ls\n', '/home/u/proj/sw.sh': 'setopt cdablevars\n' })],
-    ['no switch file at all: a.sh judged against the literal cd', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./b.sh; done', stub({ '/home/u/proj/a.sh': body, '/home/u/proj/b.sh': 'echo hi\n' })],
-    ['a harmless a.sh and a loop', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./sw.sh; done', stub({ '/home/u/proj/a.sh': 'echo hi\n', '/home/u/proj/sw.sh': 'setopt cdablevars\n' })],
+    ['no switch file at all: a.sh judged against the literal cd (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./b.sh; done', stub({ '/home/u/proj/a.sh': body, '/home/u/proj/b.sh': 'echo hi\n' })],
+    ['a harmless a.sh and a loop (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./sw.sh; done', stub({ '/home/u/proj/a.sh': 'echo hi\n', '/home/u/proj/sw.sh': 'setopt cdablevars\n' })],
   ]);
 });
 
@@ -102,10 +102,10 @@ describe('R15-F3: BASHOPTS / SHELLOPTS reach every child shell', () => {
     ['the hook environment holds BASHOPTS, bash FILE', 'export proj=/home/u; bash ./a.sh', stub({ '/home/u/proj/a.sh': body }, { env: { BASHOPTS: 'cdable_vars' } })],
   ]);
   allows('F3', [
-    ['reading BASHOPTS is no switch', 'echo "$BASHOPTS"; export proj=/home/u; bash ./a.sh', A],
-    ['a hook environment without BASHOPTS: bash FILE', 'export proj=/home/u; bash ./a.sh', A],
-    ['no BASHOPTS: a separate shell (bash FILE) does not inherit the line\'s switch', 'set -T; export proj=/home/u; bash ./a.sh', A],
-    ['a hook environment BASHOPTS without cdable_vars', 'export proj=/home/u; bash -c \'cd proj && find . -delete\'', { cwd: `${HOME}/proj`, env: { BASHOPTS: 'cmdhist:extglob' } }],
+    ['reading BASHOPTS is no switch (R17 owner decision: a bare cd is unknown)', 'echo "$BASHOPTS"; export proj=/home/u; bash ./a.sh', A],
+    ['a hook environment without BASHOPTS: bash FILE (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; bash ./a.sh', A],
+    ['no BASHOPTS: a separate shell (bash FILE) does not inherit the line\'s switch (R17 owner decision: a bare cd is unknown)', 'set -T; export proj=/home/u; bash ./a.sh', A],
+    ['a hook environment BASHOPTS without cdable_vars', 'export proj=/home/u; bash -c \'cd ./proj && find . -delete\'', { cwd: `${HOME}/proj`, env: { BASHOPTS: 'cmdhist:extglob' } }],
     ['a harmless child with BASHOPTS set', 'BASHOPTS=cdable_vars bash -c \'echo hi\''],
   ]);
 });

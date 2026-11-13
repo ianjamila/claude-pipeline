@@ -115,17 +115,17 @@ describe('R5-F1 and the cd-narrowing security item: only a plain cd chain narrow
     ['a relative cd after chdir', 'chdir /tmp/x && cd .. && find . -delete', AT_HOME],
   ]);
   allows('F1', [
-    ['cd proj && npx eslint .', 'cd proj && npx eslint .', AT_HOME],
+    ['cd ./proj && npx eslint .', 'cd ./proj && npx eslint .', AT_HOME],
     ['cd ~/Claude/proj && git add .', 'cd ~/Claude/proj && git add .', AT_HOME],
-    ['cd proj && make && git add .', 'cd proj && make && git add .', AT_HOME],
-    ['cd proj && echo x && git add .', 'cd proj && echo x && git add .', AT_HOME],
-    ['cd proj && mkdir out && git add out', 'cd proj && mkdir out && git add out', AT_HOME],
-    ['cd proj && FOO=1 npm test && git add .', 'cd proj && FOO=1 npm test && git add .', AT_HOME],
-    ['mkdir build && cd build && cmake .. (from proj)', 'mkdir build && cd build && cmake ..'],
-    ['cd build && cmake .. (from proj)', 'cd build && cmake ..'],
+    ['cd ./proj && make && git add .', 'cd ./proj && make && git add .', AT_HOME],
+    ['cd ./proj && echo x && git add .', 'cd ./proj && echo x && git add .', AT_HOME],
+    ['cd ./proj && mkdir out && git add out', 'cd ./proj && mkdir out && git add out', AT_HOME],
+    ['cd ./proj && FOO=1 npm test && git add .', 'cd ./proj && FOO=1 npm test && git add .', AT_HOME],
+    ['mkdir build && cd ./build && cmake .. (from proj)', 'mkdir build && cd ./build && cmake ..'],
+    ['cd ./build && cmake .. (from proj)', 'cd ./build && cmake ..'],
     ['[ ! -d out ] with no cd', '[ ! -d out ] && mkdir out'],
     ['expr 8 / 2', 'expr 8 / 2'],
-    ['a ! inside a test while cd narrows', 'cd proj && [ ! -d out ] && git add .', AT_HOME],
+    ['a ! inside a test while cd ./narrows', 'cd ./proj && [ ! -d out ] && git add .', AT_HOME],
   ]);
   // a symlink: the lexical landing is /tmp/h or /tmp/l, the real one is home or the project
   denies('symlink cd', [

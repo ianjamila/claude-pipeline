@@ -23,7 +23,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R12 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? AT);
-      assert.equal(r.decision, 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -31,7 +31,7 @@ const allows = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R12 ${label} allows: ${name}`, () => {
       const r = run(line, extra ?? AT);
-      assert.equal(r.decision, 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
+      assert.equal(r.decision, /R17 owner decision: a bare cd/.test(name) ? 'deny' : 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
     });
   }
 };
@@ -157,10 +157,10 @@ describe('R12-B2: the positional exit of the set whitelist needs a literal word'
     ['set -e ? (a glob word)', 'set -e ?; export proj=/home/u; cd proj && find . -delete', PROJ],
   ]);
   allows('B2', [
-    ['set -- a b', 'set -- a b && cd proj && git add .'],
-    ['set -euo pipefail', 'set -euo pipefail && cd proj && git add .'],
-    ['set -- "$@" (after a literal --)', 'set -- "$@" && cd proj && git add .'],
-    ['set a b (literal positionals)', 'set a b && cd proj && git add .'],
+    ['set -- a b', 'set -- a b && cd ./proj && git add .'],
+    ['set -euo pipefail', 'set -euo pipefail && cd ./proj && git add .'],
+    ['set -- "$@" (after a literal --)', 'set -- "$@" && cd ./proj && git add .'],
+    ['set a b (literal positionals)', 'set a b && cd ./proj && git add .'],
   ]);
 });
 
@@ -174,8 +174,8 @@ describe('R12-F3: builtin / command with --, and a command word known only at ru
     ['a wrapper in front of a glob word', 'export proj=/home/u; command se* -T; cd proj && find . -delete', PROJ],
   ]);
   allows('F3', [
-    ['builtin -- echo is not a switch', 'builtin -- echo hi && cd proj && git add .'],
-    ['command -p ls', 'command -p ls && cd proj && git add .'],
+    ['builtin -- echo is not a switch', 'builtin -- echo hi && cd ./proj && git add .'],
+    ['command -p ls', 'command -p ls && cd ./proj && git add .'],
   ]);
 });
 
@@ -188,7 +188,7 @@ describe('R12-F4: a source that switches cdablevars on makes every cd of the fil
       stub({ '/home/u/proj/o.sh': 'for i in 1 2; do cd proj; source /home/u/proj/p.sh; done\n', '/home/u/proj/p.sh': 'set -o cdablevars\nproj=/home/u\n' })],
     ['the switch in the file itself, a cd earlier in the text, no cd on the line', 'source ./o.sh && find . -delete',
       stub({ '/home/u/proj/o.sh': 'f() { cd proj; }\nset -o cdablevars\nproj=/home/u\nf\n' })],
-    ['a switched source and a later relative write (no cd anywhere)', 'source ./o.sh && find . -delete',
+    ['a switched source and a later relative write (no cd ./anywhere) (R17 owner decision: option state no longer matters for a literal cd)', 'source ./o.sh && find . -delete',
       stub({ '/home/u/proj/o.sh': 'set -o cdablevars\n' })],
   ]);
   allows('F4', [

@@ -98,9 +98,9 @@ describe('R7-F1: comments and heredoc bodies are no quotes', () => {
     ['a heredoc quote hiding a while loop (unquoted tag)', "cat <<EOF\n'\nEOF\nwhile false; do\ncd /tmp/nonexistent\ndone && find . -delete\n: '", AT_HOME],
   ]);
   allows('F1', [
-    ['a plain cd narrowing', 'cd proj && git add .', AT_HOME],
-    ['a # inside a word is no comment', 'cd proj && echo a#b && git add .', AT_HOME],
-    ['a $# and a ${#x} are no comments', 'cd proj && echo $# ${#HOME} && git add .', AT_HOME],
+    ['a plain cd ./narrowing', 'cd ./proj && git add .', AT_HOME],
+    ['a # inside a word is no comment', 'cd ./proj && echo a#b && git add .', AT_HOME],
+    ['a $# and a ${#x} are no comments', 'cd ./proj && echo $# ${#HOME} && git add .', AT_HOME],
     ['a heredoc inside a double-quoted substitution', 'cd proj && git commit -m "$(cat <<\'EOF\'\nit is\nEOF\n)"', AT_HOME],
   ]);
 });

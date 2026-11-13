@@ -127,15 +127,15 @@ describe('R4-F1: a relative word resolves where the command can run', () => {
     ['cwd home: cd ~/Claude/proj && git add .', 'cd ~/Claude/proj && git add .', { cwd: HOME }],
     ['cwd home: git -C ~/Claude/proj add .', 'git -C ~/Claude/proj add .', { cwd: HOME }],
     ['cwd home: git -C proj add .', 'git -C proj add .', { cwd: HOME }],
-    ['cwd home: cd proj && npx eslint .', 'cd proj && npx eslint .', { cwd: HOME }],
-    ['cwd home: cd proj && prettier --write .', 'cd proj && prettier --write .', { cwd: HOME }],
-    ['cwd home: cd proj && docker build .', 'cd proj && docker build .', { cwd: HOME }],
-    ['cwd home: cd proj && cd src && git add .', 'cd proj && cd src && git add .', { cwd: HOME }],
-    ['cwd home: cd proj && git add . && git commit -m x', 'cd proj && git add . && git commit -m x', { cwd: HOME }],
-    ['cwd home: cd proj && git commit -m "$(cat msg)" && git add .', 'cd proj && git commit -m "$(cat msg)" && git add .', { cwd: HOME }],
-    ['cwd home: mkdir build && cd build && cmake .. (from proj)', 'mkdir build && cd build && cmake ..', { cwd: PROJ }],
-    ['cwd proj: cd build && cmake ..', 'cd build && cmake ..', { cwd: PROJ }],
-    ['cwd proj: cd src && git add ../lib', 'cd src && git add ../lib', { cwd: PROJ }],
+    ['cwd home: cd ./proj && npx eslint .', 'cd ./proj && npx eslint .', { cwd: HOME }],
+    ['cwd home: cd ./proj && prettier --write .', 'cd ./proj && prettier --write .', { cwd: HOME }],
+    ['cwd home: cd ./proj && docker build .', 'cd ./proj && docker build .', { cwd: HOME }],
+    ['cwd home: cd ./proj && cd ./src && git add .', 'cd ./proj && cd ./src && git add .', { cwd: HOME }],
+    ['cwd home: cd ./proj && git add . && git commit -m x', 'cd ./proj && git add . && git commit -m x', { cwd: HOME }],
+    ['cwd home: cd ./proj && git commit -m "$(cat msg)" && git add .', 'cd ./proj && git commit -m "$(cat msg)" && git add .', { cwd: HOME }],
+    ['cwd home: mkdir build && cd ./build && cmake .. (from proj)', 'mkdir build && cd ./build && cmake ..', { cwd: PROJ }],
+    ['cwd proj: cd ./build && cmake ..', 'cd ./build && cmake ..', { cwd: PROJ }],
+    ['cwd proj: cd ./src && git add ../lib', 'cd ./src && git add ../lib', { cwd: PROJ }],
     ['cwd proj: make -C build install', 'make -C build install', { cwd: PROJ }],
     ['cwd proj: git -C src add ..', 'git -C src add ..', { cwd: PROJ }],
     ['cwd home: git -C proj/src add ..', 'git -C proj/src add ..', { cwd: HOME }],
@@ -249,7 +249,7 @@ describe('R4-F1 item 7: residual implicit-cwd and dot globs', () => {
     ['cwd proj: git clean -fdx', 'git clean -fdx'],
     ['cwd home: git clean -n', 'git clean -n', { cwd: HOME }],
     ['cwd home: git clean --dry-run -fd', 'git clean --dry-run -fd', { cwd: HOME }],
-    ['cwd home: cd proj && git clean -fdx', 'cd proj && git clean -fdx', { cwd: HOME }],
+    ['cwd home: cd ./proj && git clean -fdx', 'cd ./proj && git clean -fdx', { cwd: HOME }],
     ['cwd home: git -C proj clean -fdx', 'git -C proj clean -fdx', { cwd: HOME }],
     ['cwd home: git status', 'git status', { cwd: HOME }],
   ]);
@@ -267,6 +267,6 @@ describe('R4 timing', () => {
   timed('a 190 kB glob option word', `find ${CFG}/pipeline -[${'a'.repeat(190000)}] x`, {}, 'allow');
   timed('a glob option of 60000 stars', `find ${CFG}/pipeline -${'*'.repeat(60000)}`, {}, 'deny');
   timed('a glob home word of 60000 stars', `rm -rf /${'*'.repeat(60000)}`, {}, 'deny');
-  timed('20 cd && chains', `${'cd proj && '.repeat(20)}git add .`, { cwd: HOME }, 'allow');
+  timed('20 cd && chains', `${'cd ./proj && '.repeat(20)}git add .`, { cwd: HOME }, 'allow');
   timed('60 cd && chains (more directories than are followed: fails closed)', `${'cd proj && '.repeat(60)}git add .`, { cwd: HOME }, 'deny');
 });

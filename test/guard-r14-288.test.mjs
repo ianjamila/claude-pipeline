@@ -18,7 +18,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R14 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? PROJ);
-      assert.equal(r.decision, 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -26,7 +26,7 @@ const allows = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R14 ${label} allows: ${name}`, () => {
       const r = run(line, extra ?? PROJ);
-      assert.equal(r.decision, 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
+      assert.equal(r.decision, /R17 owner decision: a bare cd/.test(name) ? 'deny' : 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
     });
   }
 };
@@ -63,8 +63,8 @@ describe('R14-F1: a double-quoted word that zsh splits is no exemption', () => {
     ['"$HERE/build.sh$X[@]"', 'X=(setopt cdablevars); ' + tail('"$X/build.sh$X[@]"')],
   ]);
   allows('F1', [
-    ['"$HERE/build.sh" stays a no-switch word', 'X=/a; export proj=/home/u; "$X/b.sh"; cd proj && find . -delete'],
-    ['a literal [ in the text of the word, no reference before it', 'export proj=/home/u; "a[@]"; cd proj && find . -delete'],
+    ['"$HERE/build.sh" stays a no-switch word', 'X=/a; export proj=/home/u; "$X/b.sh"; cd ./proj && find . -delete'],
+    ['a literal [ in the text of the word, no reference before it', 'export proj=/home/u; "a[@]"; cd ./proj && find . -delete'],
   ]);
 });
 
@@ -79,8 +79,8 @@ describe('R14-F2: the line\'s own switch reaches the frame that judges a sourced
     ['builtin source', 'set -T; export proj=/home/u; builtin source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
   ]);
   allows('F2', [
-    ['no switch: the same file is judged against the literal cd', 'export proj=/home/u; source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
-    ['a separate shell (bash FILE) does not inherit the line\'s switch', 'set -T; export proj=/home/u; bash ./a.sh', stub({ '/home/u/proj/a.sh': body })],
+    ['no switch: the same file is judged against the literal cd (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; source ./a.sh', stub({ '/home/u/proj/a.sh': body })],
+    ['a separate shell (bash FILE) does not inherit the line\'s switch (R17 owner decision: a bare cd is unknown)', 'set -T; export proj=/home/u; bash ./a.sh', stub({ '/home/u/proj/a.sh': body })],
     ['a switch, but the file only holds a harmless command', 'set -T; source ./a.sh', stub({ '/home/u/proj/a.sh': 'echo hi\n' })],
   ]);
 });
@@ -88,8 +88,8 @@ describe('R14-F2: the line\'s own switch reaches the frame that judges a sourced
 describe('R14-F3: a ~/ command word and a dequoted path with a space are literal', () => {
   allows('F3', [
     ['cd /tmp/x && ~/bin/tool > out.txt', 'cd /tmp/x && ~/bin/tool > out.txt'],
-    ['a quoted path with a space', 'cd proj && "/Applications/Some App.app/Contents/MacOS/tool" build > log.txt'],
-    ['~/ with a quoted space path', 'cd proj && ~/"My Tools/tool" build > log.txt'],
+    ['a quoted path with a space', 'cd ./proj && "/Applications/Some App.app/Contents/MacOS/tool" build > log.txt'],
+    ['~/ with a quoted space path', 'cd ./proj && ~/"My Tools/tool" build > log.txt'],
   ]);
   denies('F3', [
     ['~x as a command word', tail('~x')],

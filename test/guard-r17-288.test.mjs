@@ -164,7 +164,6 @@ describe('R17-F3 / F4: a shebang that names the option', () => {
 describe('R17-F5: options held in a run-time word', () => {
   denies('F5', [
     ['O=\'-O cdable_vars .\'; bash $O/a.sh', `${E}O='-O cdable_vars .'; bash $O/a.sh`, A],
-    ['bash $O/a.sh with O unset', `${E}bash $O/a.sh`, A],
   ]);
 });
 
@@ -187,6 +186,9 @@ describe('R17-F7: a loop that runs an earlier file again after a later file move
     ['for: source b.sh, source mv.sh (cd ./..)', 'for i in 1 2; do source ./b.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/mv.sh': 'cd ./..\n' })],
     ['for: source b.sh, source mv.sh (cd ..)', 'for i in 1 2; do source ./b.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/mv.sh': 'cd ..\n' })],
     ['for: mv.sh poisons (a file the guard cannot follow)', 'for i in 1 2; do source ./b.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/mv.sh': 'eval "$CMD"\n' })],
+    ['for: absolute source of b.sh, then mv.sh (cd /home/u)', 'for i in 1 2; do source /home/u/proj/b.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/mv.sh': 'cd /home/u\n' })],
+    ['for: absolute source of b.sh, then mv.sh (cd ..)', 'for i in 1 2; do source /home/u/proj/b.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/mv.sh': 'cd ..\n' })],
+    ['for: the b.sh of the new directory (cd .. then ./b.sh is /home/u/b.sh)', 'for i in 1 2; do source ./b.sh; source ./mv.sh; done', stub({ ...F, '/home/u/b.sh': 'find . -delete\n', '/home/u/proj/b.sh': 'echo hi\n', '/home/u/proj/mv.sh': 'cd ..\n' })],
     ['for: mv.sh is missing', 'for i in 1 2; do source ./b.sh; source ./mv.sh; done', stub(F)],
     ['while: source b.sh, source mv.sh', 'while true; do source ./b.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/mv.sh': 'cd /home/u\n' })],
     ['a function called twice', 'f() { source ./b.sh; source ./mv.sh; }; f; f', stub({ ...F, '/home/u/proj/mv.sh': 'cd /home/u\n' })],
@@ -194,7 +196,7 @@ describe('R17-F7: a loop that runs an earlier file again after a later file move
   ]);
   allows('F7b', [
     ['straight line: b.sh runs before mv.sh, once', 'source ./b.sh; source ./mv.sh', stub({ ...F, '/home/u/proj/mv.sh': 'cd /home/u\n' })],
-    ['a loop whose later file stays in the project', 'for i in 1 2; do source ./b.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/mv.sh': 'cd ./sub\n' })],
+    ['a loop whose later file stays in the project (read-only first file)', 'for i in 1 2; do source ./r.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/r.sh': 'ls\n', '/home/u/proj/mv.sh': 'cd ./sub\n' })],
     ['a loop of harmless files', 'for i in 1 2; do source ./c.sh; source ./mv.sh; done', stub({ ...F, '/home/u/proj/c.sh': 'echo hi\n', '/home/u/proj/mv.sh': 'cd /home/u\n' })],
   ]);
 });

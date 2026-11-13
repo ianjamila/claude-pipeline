@@ -25,7 +25,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R11 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? AT);
-      assert.equal(r.decision, 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -33,7 +33,7 @@ const allows = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R11 ${label} allows: ${name}`, () => {
       const r = run(line, extra ?? AT);
-      assert.equal(r.decision, 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
+      assert.equal(r.decision, /R17 owner decision: a bare cd/.test(name) ? 'deny' : 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
     });
   }
 };
@@ -123,7 +123,7 @@ describe('R11-B2: cdablevars applies to pushd and chdir', () => {
 describe('R11-F2: what turns cdablevars on (whitelist for set; any option word otherwise)', () => {
   denies('F2', [
     ['set -T', 'export proj=/home/u && set -T && cd proj && find . -delete', PROJ],
-    ['set -eT', 'export proj=/home/u && set -eT && cd proj && find . -delete', PROJ],
+    ['set -eT (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u && set -eT && cd proj && find . -delete', PROJ],
     ['set +T', 'set +T && cd proj && find . -delete', PROJ],
     ['unsetopt nocdablevars', 'export proj=/home/u && unsetopt nocdablevars && cd proj && find . -delete', PROJ],
     ['unsetopt with any word', 'unsetopt autocd && cd proj && find . -delete', PROJ],
@@ -132,19 +132,19 @@ describe('R11-F2: what turns cdablevars on (whitelist for set; any option word o
     ['emulate -R zsh', 'emulate -R zsh && cd proj && find . -delete', PROJ],
     ['a run-time flag word (set -$F)', 'F=T; set -$F && export proj=/home/u && cd proj && find . -delete', PROJ],
     ['an unknown -o name', 'set -o posix && cd proj && find . -delete', PROJ],
-    ['chdir after setopt', 'export proj=/home/u && setopt cdablevars && chdir proj && find . -delete', PROJ],
+    ['chdir after setopt (R17 owner decision: option state no longer matters for a literal cd)', 'export proj=/home/u && setopt cdablevars && chdir proj && find . -delete', PROJ],
     ['shopt with any word', 'shopt -s extglob && cd proj && find . -delete', PROJ],
     ['builtin set -T', 'export proj=/home/u && builtin set -T && cd proj && find . -delete', PROJ],
     ['command setopt cdablevars', 'export proj=/home/u && command setopt cdablevars && cd proj && find . -delete', PROJ],
   ]);
   allows('F2', [
-    ['set -euo pipefail stays narrowed from home', 'set -euo pipefail && cd proj && git add .'],
-    ['set -e', 'set -e && cd proj && git add .'],
-    ['set -x', 'set -x && cd proj && git add .'],
-    ['set -- -T x (the words after -- are positional)', 'set -- -T x && cd proj && git add .'],
-    ['set -o nounset', 'set -o nounset && cd proj && git add .'],
-    ['set -efuvxCa letters', 'set -efuvxCa && cd proj && git add .'],
-    ['a positional word ends the flags', 'set a -T && cd proj && git add .'],
+    ['set -euo pipefail stays narrowed from home', 'set -euo pipefail && cd ./proj && git add .'],
+    ['set -e', 'set -e && cd ./proj && git add .'],
+    ['set -x', 'set -x && cd ./proj && git add .'],
+    ['set -- -T x (the words after -- are positional)', 'set -- -T x && cd ./proj && git add .'],
+    ['set -o nounset', 'set -o nounset && cd ./proj && git add .'],
+    ['set -efuvxCa letters', 'set -efuvxCa && cd ./proj && git add .'],
+    ['a positional word ends the flags', 'set a -T && cd ./proj && git add .'],
   ]);
 });
 

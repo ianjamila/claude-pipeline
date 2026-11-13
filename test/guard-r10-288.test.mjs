@@ -23,7 +23,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R10 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? AT);
-      assert.equal(r.decision, 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -31,7 +31,7 @@ const allows = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R10 ${label} allows: ${name}`, () => {
       const r = run(line, extra ?? AT);
-      assert.equal(r.decision, 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
+      assert.equal(r.decision, /R17 owner decision: a bare cd/.test(name) ? 'deny' : 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
     });
   }
 };
@@ -101,7 +101,7 @@ describe('R10-F2: a terminator split by backslash-newline', () => {
 
 describe('R10-F1/F2: quoted heredocs and plain lines are unchanged', () => {
   allows('quoted', [
-    ['a quoted body with a trailing backslash ends at a raw EOF, then narrowing as before',
+    ['a quoted body with a trailing backslash ends at a raw EOF, then narrowing as before (R17 owner decision: a bare cd is unknown)',
       "cat <<'EOF'\nx\\\nEOF\ncd proj && git add .", AT],
     ['a quoted terminator after a body line ending in a backslash', "cd proj && cat <<'EOF' >/dev/null\nx\\\nEOF\n", AT],
     ['a plain heredoc keeps narrowing', 'cd /tmp/safe && cat <<EOF >/dev/null && find . -delete\nbody\nEOF\n', AT],
@@ -145,7 +145,7 @@ describe('R10-F3: zsh directory-stack words are not narrowed', () => {
   ]);
   allows('F3', [
     ['an ordinary cd keeps narrowing', 'cd /tmp/safe && find . -delete'],
-    ['a plus inside a name is a name', 'cd c++ && git add .'],
+    ['a plus inside a name is a name (R17 owner decision: a bare cd is unknown)', 'cd c++ && git add .'],
   ]);
 });
 
@@ -158,7 +158,7 @@ describe('R10-F4: options that change what cd means', () => {
     ['set -o CD_ABLE_VARS (zsh spelling)', 'set -o CD_ABLE_VARS && cd proj && find . -delete', PROJ],
     ['setopt cdablevars', 'setopt cdablevars && cd proj && find . -delete', PROJ],
     ['shopt -s cdable_vars', 'shopt -s cdable_vars && cd proj && find . -delete', PROJ],
-    ['a set -o outside the safe list turns narrowing off (from home)', 'set -o posix && cd /tmp/safe && find . -delete'],
+    ['a set -o outside the safe list turns narrowing off (from home) (R17 owner decision: option state no longer matters for a literal cd)', 'set -o posix && cd /tmp/safe && find . -delete'],
     ['an options[...] assignment turns narrowing off (from home)', 'options[autocd]=on && cd /tmp/safe && find . -delete'],
     ['set -o with a run-time name', 'set -o $OPT && cd proj && find . -delete', PROJ],
     ['options[cdablevars]=on (zsh)', 'export proj=/home/u && options[cdablevars]=on && cd proj && find . -delete', PROJ],
@@ -166,13 +166,13 @@ describe('R10-F4: options that change what cd means', () => {
     ['a bare set -o (lists / unknown)', 'set -o && cd proj && find . -delete', PROJ],
   ]);
   allows('F4', [
-    ['set -o pipefail then a project cd stays narrowed', 'set -o pipefail && cd proj && git add .'],
-    ['set -euo pipefail', 'set -euo pipefail && cd proj && git add .'],
-    ['set -e -o errexit', 'set -e -o errexit && cd proj && git add .'],
-    ['set +o xtrace', 'set +o xtrace && cd proj && git add .'],
-    ['set -o nounset, noclobber, verbose', 'set -o nounset && set -o noclobber && set -o verbose && cd proj && git add .'],
-    ['set -e (no -o)', 'set -e && cd proj && git add .'],
-    ['set -- positional words', 'set -- -o x && cd proj && git add .'],
+    ['set -o pipefail then a project cd ./stays narrowed', 'set -o pipefail && cd ./proj && git add .'],
+    ['set -euo pipefail', 'set -euo pipefail && cd ./proj && git add .'],
+    ['set -e -o errexit', 'set -e -o errexit && cd ./proj && git add .'],
+    ['set +o xtrace', 'set +o xtrace && cd ./proj && git add .'],
+    ['set -o nounset, noclobber, verbose', 'set -o nounset && set -o noclobber && set -o verbose && cd ./proj && git add .'],
+    ['set -e (no -o)', 'set -e && cd ./proj && git add .'],
+    ['set -- positional words', 'set -- -o x && cd ./proj && git add .'],
     ['narrowed from home after a safe set', 'set -o pipefail && cd /tmp/safe && find . -delete'],
   ]);
 });

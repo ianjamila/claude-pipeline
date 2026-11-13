@@ -396,7 +396,7 @@ function makeCtx(opts) {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
     hitReviewGlob,
     user: opts.user ?? posix.basename(homePosix),
-    selfZero: opts._selfZero ?? null, selfBash: opts._selfBash ?? null, selfAbs: opts._selfAbs === true, selfZsh: opts._selfZsh === true, // the judged script file's own path (its $0 unless it was sourced; BASH_SOURCE[0])
+    selfZero: opts._selfZero ?? null, selfBash: opts._selfBash ?? null, selfAbs: opts._selfAbs === true, selfDirLit: opts._selfDirLit === true, selfZsh: opts._selfZsh === true, // the judged script file's own path (its $0 unless it was sourced; BASH_SOURCE[0])
     parentFsChanged: opts._fsChanged === true, // (the calling line ran something before this script that may have changed which paths exist)
     vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
@@ -1323,8 +1323,6 @@ const PLAIN_CD = {
 };
 // ...and the commands that can change the shell's directory (or what a command name means) without being a cd we model
 const DIR_CHANGERS = new Set([...CD_CMDS, 'chdir', 'eval', 'source', '.', 'builtin', 'command', 'exec', 'alias', 'unalias', 'setopt', 'unsetopt', 'shopt', 'enable', 'emulate']);
-// ...and the ones that take a directory NAME, which CDABLE_VARS turns into a variable's value (`chdir` is zsh's own spelling of cd)
-const CD_NAMED = new Set(['cd', 'pushd', 'chdir']);
 // Why: the directories an unknown `cd` may land in that matter: each protected directory (a file cannot be a cwd), each directory above one, and the home's parents.
 function assumedCwds(ctx) {
   const dirs = [...ctx.lexRoots.filter((r) => !/\.\w+$/.test(posix.basename(r))), ...ctx.lexAncestors];
@@ -1453,13 +1451,15 @@ function resolveGlobCd(e, bases, ctx, cmds, idx) {
 const MAX_CD_RERUNS = 256;
 const MAKES_DIRS = new Set(['mkdir', 'cp', 'mv', 'tar', 'bsdtar', 'gtar', 'unzip', 'git', 'rsync', 'ditto', 'install', 'ln', 'curl', 'wget']);
 const MAX_BELOW_ROOT_DIRS = 64; // (subdirectories of the protected roots a rerun may add for a `..` write)
-// R16-B1 / F2: the passes that judge a frame again with a switch a later file turned on (one per frame at most, two when the second switch only shows up in the first pass), counted across the evaluation
-const MAX_SWITCH_RERUNS = 96;
-function countSwitchRun(budget) {
+// R17-F7: the passes that judge a frame again from the directories a later sourced file moved the shell to (at most two per frame), counted across the evaluation
+const MAX_RERUNS = 96;
+function countRerun(budget) {
   checkDeadline(budget);
   budget.switchRuns = (budget.switchRuns ?? 0) + 1;
-  if (budget.switchRuns > MAX_SWITCH_RERUNS) throw new GuardLimit('too many files that switch cd options on (each earlier command is checked again with the option on), so they cannot be verified. Write the files out.');
+  if (budget.switchRuns > MAX_RERUNS) throw new GuardLimit('too many files that move the shell to another directory inside a loop or function (each earlier command is checked again there), so they cannot be verified. Write the files out.');
 }
+// (R17: a bare relative cd target is not followed; the reason says how to write it so the guard can)
+const BARE_CD_HINT = ' -- a `cd NAME` with a bare relative name is not followed (it may go through CDPATH or cdable_vars, or be a variable named NAME): write the target as `./NAME` (or an absolute path) so the directory is known';
 function countCdRun(budget) {
   checkDeadline(budget);
   budget.cdRuns = (budget.cdRuns ?? 0) + 1;
@@ -1502,28 +1502,25 @@ const literalWord = (w) => /^[A-Za-z0-9_.,:\/=@%+-]+$/.test(w);
 // R14-F3: a command word may also be `~/` + the literal shape (a path under HOME; never `~x` / `~+` / `~-`), and a literal-shape word with spaces that holds a `/` (a dequoted path such as `/Applications/Some App.app/.../tool`): neither can be a builtin or a modifier
 const spacedPath = (w) => w.includes('/') && /^[A-Za-z0-9_.,:\/=@%+ -]+$/.test(w);
 const literalCommand = (w) => w === '[' || literalWord(w) || spacedPath(w) || (w.startsWith('~/') && (literalWord(w.slice(2)) || spacedPath(w.slice(2)))); // (the test builtin `[` is a name, not a glob)
-// R11-F2: `set` is safe (no effect on what `cd` means) only as a WHITELIST: every flag word is literal letters from SAFE_SET_FLAGS, or `-o` / `+o` (also `-eo NAME`, `-oNAME`) with a name in SAFE_SET_OPTIONS,
-// up to the first word that is not a flag (the positional parameters) or `--`. R12-B2: that word must be literal (`set "$F"`, `set $(echo -T)`, `set *` may be `set -T`); a word after a literal `--` is positional whatever it is. Anything else -- zsh's `-T` (CDABLE_VARS), other letters, `-$F` (letters only known at run time), a bare `-o`, an unknown name -- is a switch.
-const SAFE_SET_OPTIONS = new Set(['errexit', 'nounset', 'pipefail', 'xtrace', 'verbose', 'noclobber']);
-const SAFE_SET_FLAGS = new Set(['e', 'u', 'x', 'v', 'f', 'C', 'a', 'E']); // (R13-F3: E is errtrace in bash and PUSHD_SILENT in zsh; neither changes where `cd NAME` goes)
+// R17 (owner decision 11-13): ONE whitelist decides where a cd leads, instead of tracking every way an option could change what `cd NAME` means (cdable_vars, CDPATH, and every spelling that turns them on).
+// A cd / pushd target is a known literal folder ONLY when, after the line's known variable expansion, it is `.` / `..` or starts with `/`, `./` or `../` (the home forms `cd`, `cd ~`, `cd ~/x` keep their own
+// handling). bash and zsh skip CDPATH for those prefixes, and cdable_vars only reads a non-directory argument that does not start with `/` as a variable name, so no option state changes where such a target goes.
+// Every other target (`cd proj`, `cd proj/sub`, `~user`, `-`, `+N`, a run-time value) leaves the directory unknown.
+const cdTargetLiteral = (e) => isAbs(e) || /^\.\.?(?:[\\/]|$)/.test(e);
+// Option names are compared without case, `_` or `-` (`AUTO_CD`, `auto-cd`, `noautocd`)
 const optionWord = (w) => w.toLowerCase().replace(/[_-]/g, '');
-function setIsSafe(argv) {
+// zsh AUTO_CD runs a bare word that names a directory as a cd, which is no cd command the walk sees: the line's directory is then unknown. Only the option's name is read (setopt / unsetopt / emulate with the name or a
+// run-time word, `set -o autocd` / `set -J`, `options[autocd]=on` or an `options[...]` subscript only known at run time, any other assignment to `options`).
+function autocdSwitch(c) {
+  const { argv } = unwrapBuiltin(c.argv ?? []);
+  const sub = (w) => /^options\[(.*)\]/.exec(w)?.[1];
+  if (Object.hasOwn(c.env ?? {}, 'options') || (c.argv ?? []).some((a) => /^options(?:\+?=)/.test(a))) return true;
+  if ((c.argv ?? []).some((a) => { const s = sub(a); return s !== undefined && (optionWord(s).includes('autocd') || /[$`*?[{(]/.test(s)); })) return true;
+  const head = baseOf(argv[0] ?? '');
   const args = argv.slice(1);
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--') return true;
-    if (!/^[-+]/.test(a)) return literalWord(a); // (the positional parameters start here, if the word is certain to be one)
-    const m = /^[-+]([A-Za-z]*?)o(.*)$/.exec(a);
-    if (m && [...m[1]].every((ch) => SAFE_SET_FLAGS.has(ch))) {
-      if (!/^[A-Za-z]*$/.test(m[2])) return false;
-      const name = m[2] !== '' ? m[2] : args[i + 1];
-      if (name === undefined || !SAFE_SET_OPTIONS.has(optionWord(name))) return false;
-      if (m[2] === '') i++;
-      continue;
-    }
-    if (!/^[-+][A-Za-z]+$/.test(a) || ![...a.slice(1)].every((ch) => SAFE_SET_FLAGS.has(ch))) return false;
-  }
-  return true;
+  if (['setopt', 'unsetopt', 'emulate'].includes(head)) return args.some((w) => optionWord(w).includes('autocd') || /[$`]/.test(w));
+  if (head === 'set') return args.some((w, i) => optionWord(w).includes('autocd') || /^[-+][A-Za-z]*J/.test(w) || (/[$`]/.test(w) && /^[-+][A-Za-z]*o$/.test(args[i - 1] ?? '')));
+  return false;
 }
 // The command a line word really runs, past `builtin` / `command` / `noglob` / `nocorrect` / zsh's `-` (and their flags, and one `--`): `builtin set -T`, `command -p -- shopt -s cdable_vars`.
 // `blind`: a wrapper's next word is not a literal name (`builtin $S -T`), so what it runs is not known
@@ -1536,59 +1533,6 @@ function unwrapBuiltin(argv) {
   }
   const rest = k === 0 ? argv : argv.slice(k);
   return { argv: rest, blind: k > 0 && rest.length > 0 && !literalCommand(rest[0]) };
-}
-// A `set` outside the whitelist, and any assignment to zsh's `options[...]` (or `options+=`): the line may change what a command means
-function optionSwitch(c) {
-  const { argv, blind } = unwrapBuiltin(c.argv);
-  if (blind || (baseOf(argv[0] ?? '') === 'set' && !setIsSafe(argv))) return true;
-  return Object.hasOwn(c.env ?? {}, 'options') || c.argv.some((a) => /^options(?:\[|\+?=)/.test(a));
-}
-// Is this a command that may turn on CDABLE_VARS (`cd NAME` then goes to $NAME) or is it a switch whose name cannot be read? Then a cd of the line leads to a directory only known at run time.
-// `set` outside the whitelist; `setopt` / `unsetopt` / `emulate` / `shopt` with ANY word (an option name, a flag such as `-T`, a run-time word): one spelling is as good as another (`unsetopt nocdablevars`).
-// R12-F3 / R13-B1: a command word only known at run time (`S=shopt; $S -s cdable_vars`, or the whole command in one word, `S="shopt -s cdable_vars"; $S`), or behind a wrapper, is one too, whatever the argument count.
-// The one run-time command word that is no switch: a whole command that is a single double-quoted word of plain parameter references and literal text (`"$HERE/build.sh"`), with no argument.
-// Inside double quotes the value is not split or globbed (no `$S` that holds `shopt -s cdable_vars`; `"${=S}"`, `"${(z)S}"`, `"$@"` and `"$(..)"` do not match), and a program run without arguments cannot set an option.
-// R14-B1: a linear scanner (the regex it replaces backtracked exponentially on `"` + `$aa` x40 + `\x"`). R14-F1: a `[` right after a reference (`"$argv[@]"`, `"$X[*]"`, `"${X}[1]"`) is a zsh subscript,
-// which splits into one word per element: not accepted, whatever follows.
-function quotedRefOnly(raw) {
-  const n = raw.length;
-  if (n < 2 || raw[0] !== '"' || raw[n - 1] !== '"') return false;
-  const isNameStart = (ch) => (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch === '_';
-  const isName = (ch) => isNameStart(ch) || (ch >= '0' && ch <= '9');
-  let i = 1;
-  while (i < n - 1) {
-    const ch = raw[i];
-    if (ch === '"' || ch === '`' || ch === '\\') return false;
-    if (ch !== '$') { i++; continue; }
-    i++;
-    if (raw[i] === '{') {
-      if (!isNameStart(raw[i + 1] ?? '')) return false;
-      i += 2;
-      while (i < n - 1 && isName(raw[i])) i++;
-      if (raw[i] !== '}') return false;
-      i++;
-    } else {
-      if (i >= n - 1 || !isNameStart(raw[i])) return false;
-      i++;
-      while (i < n - 1 && isName(raw[i])) i++;
-    }
-    if (raw[i] === '[') return false;
-  }
-  return i === n - 1; // (the closing quote is the last character: nothing was skipped past it)
-}
-const loneQuotedRef = (c) => c.argv.length === 1 && quotedRefOnly((c.raw ?? '').trim());
-// R15-F3: a child bash turns shopt options (cdable_vars) on at start-up from BASHOPTS in its environment (SHELLOPTS the same for `set -o` options). ANY mention of the name that is not a plain read
-// (`$BASHOPTS`) is a switch handed to every child shell, whatever the value: an env prefix, `env NAME=..`, a plain assignment, `export` / `declare -x` / `typeset -x` / `readonly` of the name (spelled out
-// in the raw text or dequoted in the words), or a name built at run time on a command that binds names (`export $N=..`, `declare "$N=.."`). The value is never parsed.
-const OPTS_NAME = /^(?:BASHOPTS|SHELLOPTS)$/;
-const OPTS_MENTION = /(?<![\w$])(?:BASHOPTS|SHELLOPTS)(?![\w])/;
-const NAME_BINDING_HEADS = new Set(['export', 'declare', 'typeset', 'readonly', 'local', 'env']);
-function bashoptsAssigned(c) {
-  if (Object.keys(c.env ?? {}).some((k) => OPTS_NAME.test(k))) return true;
-  if ((c.argv ?? []).some((a) => /^(?:BASHOPTS|SHELLOPTS)(?:\+?=|\[|$)/.test(a))) return true;
-  if (OPTS_MENTION.test(c.raw ?? '')) return true;
-  const head = unwrapBuiltin(c.argv ?? []).argv;
-  return NAME_BINDING_HEADS.has(baseOf(head[0] ?? '')) && head.slice(1).some((a) => /[$`]/.test(a.includes('=') ? a.slice(0, a.indexOf('=')) : a));
 }
 // R15-F1: the command a line word really runs, past the wrappers, decides whose shell the text runs in. source / . / eval run it in THIS shell (and a wrapper whose next word is only known at run time may be one of
 // them: fail closed); a literal shell command word (bash, sh, zsh ...) surely starts a new one.
@@ -1604,49 +1548,6 @@ function sourcesHere(c) {
 function startsNewShell(c) {
   const u = unwrapBuiltin(c.argv);
   return !u.blind && NEW_SHELL_WORDS.has(baseOf(u.argv[0] ?? ''));
-}
-// R16-F1: a child shell started with an option on its OWN command line (`bash -O cdable_vars -c ..`, `bash -O cdable_vars f`, `zsh -o cdablevars f`, `zsh -T f`, `zsh --cdablevars -c ..`) is a switch for the text it runs
-// (its -c text, its file, the stream it reads). A WHITELIST of what the option part may hold: short flags from SAFE_SET_FLAGS plus c, l, i, s, and `-o` / `+o` with a name in SAFE_SET_OPTIONS (also glued: `-eo pipefail`,
-// `-opipefail`). Anything else is a switch: any long option, any `-O` / `+O` (its NAME is a shopt), a flag outside the list, a name outside the list, a word only known at run time. The option part ends at the first
-// word that is not an option, or at `--` (zsh and bash take no options after the operand).
-const SHELL_SAFE_FLAGS = new Set([...SAFE_SET_FLAGS, 'c', 'l', 'i', 's']);
-function shellStartSwitch(argvIn) {
-  const { argv, blind } = unwrapBuiltin(argvIn ?? []);
-  if (blind || !NEW_SHELL_WORDS.has(baseOf(argv[0] ?? ''))) return false; // (a blind wrapper is a switch of its own, see cdMeaningSwitch)
-  let sawC = false;
-  for (let i = 1; i < argv.length; i++) {
-    const t = argv[i];
-    if (t === '--') return false;
-    if (!/^[-+]/.test(t) || t === '-' || t === '+') return !sawC && !literalWord(t) && !t.includes('/'); // (the first operand: the -c text, a file, a stream. A bare run-time word may be options (`bash $OPTS f`); one with a path in it (`$DIR/run.sh`, `$(cd d && pwd)/helper`) is the file)
-    if (!literalWord(t) || t.startsWith('--')) return true; // (a long option, or a run-time word in the option part: `-$X`, `-o"$N"`)
-    const m = /^[-+]([A-Za-z]*)$/.exec(t);
-    if (!m) return true;
-    const letters = [...m[1]];
-    for (let k = 0; k < letters.length; k++) {
-      const ch = letters[k];
-      if (ch === 'o') {
-        const glued = letters.slice(k + 1).join('');
-        const name = glued !== '' ? glued : argv[i + 1];
-        if (name === undefined || !literalWord(name) || !SAFE_SET_OPTIONS.has(optionWord(name))) return true;
-        if (glued === '') i++;
-        break;
-      }
-      if (!SHELL_SAFE_FLAGS.has(ch)) return true; // (O, T, p, r, n, ... and anything not on the list)
-      if (ch === 'c' && t[0] === '-') sawC = true;
-    }
-  }
-  return false;
-}
-function cdMeaningSwitch(c) {
-  if (bashoptsAssigned(c) || shellStartSwitch(c.argv)) return true;
-  const { argv, blind } = unwrapBuiltin(c.argv);
-  if (blind || (argv.length > 0 && !literalCommand(argv[0]) && !loneQuotedRef(c))) return true; // (no command word at all, `A=1`, is no switch)
-  const name = baseOf(argv[0] ?? '');
-  if (name === 'set' && !setIsSafe(argv)) return true;
-  if (['setopt', 'unsetopt', 'emulate', 'shopt'].includes(name) && argv.length > 1) return true;
-  const sub = (w) => /^options\[(.*)\]/.exec(w)?.[1];
-  const opts = c.argv.map(sub).filter((x) => x !== undefined).map(optionWord);
-  return opts.some((w) => w.includes('cdablevars') || /[$`*?[{(]/.test(w)) || (Object.hasOwn(c.env ?? {}, 'options'));
 }
 // Why: a cd whose target a command computes is not always unknown. Modelled (an absolute directory, never a protected one unless the script / repo really is there; null = not one of these):
 // the directory of the judged script file itself (`$(dirname "$0")`, `${0%/*}`, `$(dirname "${BASH_SOURCE[0]}")`, each also in `$(cd ... && pwd)`), the repo root a `.git` walk finds
@@ -1674,8 +1575,8 @@ function modelledCd(t, cmds, idx, ctx) {
     if (!ctx.selfAbs && earlierMove) return null;
     // (something earlier in the script may have changed $0: BASH_ARGV0 / `0=` assigned, or code run by source / . / eval)
     if (touched(['BASH_ARGV0']) || cmds.some((c) => Object.hasOwn(c.env ?? {}, '0') || c.argv.some((a) => /^0\+?=/.test(a))) || cmds.slice(0, idx).some((c) => ['source', '.', 'eval'].includes(baseOf(c.argv[0] ?? '')))) return null;
-    // (a relative $0 gives a relative dirname (`scripts/run` -> `scripts`), which `cd` looks up along CDPATH first: the line's, the environment's, one a source may have set)
-    if (!ctx.selfAbs && ((ctx.env?.CDPATH ?? '') !== '' || touched(CDPATH_NAMES))) return null;
+    // (R17: a relative $0 gives a relative dirname (`scripts/run` -> `scripts`), a bare name the shell may read through CDPATH or cdable_vars: known only when it is written `./scripts` / `../x` / `.`)
+    if (!ctx.selfAbs && !ctx.selfDirLit) return null;
     return pathsFor().normalize(pathsFor().join(pathsFor().dirname(self), sub(m[m.length - 1])));
   }
   let m = /^\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)(\/[\w./-]*)?$/.exec(t);
@@ -1847,8 +1748,6 @@ const makesHardLinks = (c) => {
   return false;
 };
 const MOVERS = new Set(['mv', 'ln', 'ditto']); // any named protected path counts, and so does DEST/basename(SRC)
-// (zsh's lowercase `cdpath` array is tied to CDPATH: setting either sets both)
-const CDPATH_NAMES = ['CDPATH', 'cdpath'];
 const NOT_WRITERS = new Set(['cd', 'pushd', 'popd', 'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'shift', 'read', 'wait', 'true', 'false', ':', 'exit', 'return', 'test', '[', '[[', 'source', '.']);
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
 // (R1-F1 #288: `${_` not followed by a name character, with no search for the closing brace: the old `${_:…}` alternative backtracked quadratically on a repeated `${_:`; this over-matches (`${_x}` stays out, `${_:-w}` is in) and is linear)
@@ -3118,6 +3017,8 @@ function judgeSqlLines(sf, dirs, ctx, opts) {
 
 // A node_modules file is a package's own program, not judged -- except inside the package directory an `npm explore` runs its command in (opts._pkgDir)
 const inNodeModules = (abs, opts) => /\/node_modules\//.test(abs) && !(opts?._pkgDir && (abs === opts._pkgDir || abs.startsWith(`${opts._pkgDir}/`)));
+// R17: the directory part of the word a script was started with, as written (`./scripts/run.sh` -> `./scripts`), is a literal cd target (`.` / `..` / `/` `./` `../` prefixed)
+const selfDirLiteral = (w) => { const i = w.lastIndexOf('/'); return i >= 0 && cdTargetLiteral(i === 0 ? '/' : w.slice(0, i)); };
 // One existing script file (`abs`, found in directory `dir`).
 function judgeFoundScript(sf, abs, dir, ctx, opts) {
   if (ctx.trusted(abs) || ctx.trusted(realResolve(abs, ctx.api)) || inNodeModules(abs, opts)) return null;
@@ -3169,8 +3070,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
     }
   }
   if (kind === 'shell') {
-    const shebangSwitch = sf.kind === 'exec' && shellStartSwitch(shebangShell(text) ?? []); // (R16-F1: the shell a shebang names, with an option that switches cdablevars on)
-    const r = evaluateBashForFiles(text, { ...opts, ...(shebangSwitch ? { _lineCdSwitch: true } : {}), cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, ...(sf.runsAsScript && sf.freshBash ? { _bashState: undefined } : {}), ...(sf.runsAsScript ? { _selfBash: abs, _selfZero: abs, _selfAbs: isAbs(expandRefs(String(sf.file), ctx)), _selfZsh: sf.kind === 'exec' ? posix.basename(SHEBANG_PROGRAM.exec(text.split('\n', 1)[0])?.[1] ?? '') === 'zsh' : sf.runShell === 'zsh' } : {}) });
+    const r = evaluateBashForFiles(text, { ...opts, cwd: dir, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup, ...(sf.runsAsScript && sf.freshBash ? { _bashState: undefined } : {}), ...(sf.runsAsScript ? { _selfBash: abs, _selfZero: abs, _selfAbs: isAbs(expandRefs(String(sf.file), ctx)), _selfDirLit: selfDirLiteral(expandRefs(String(sf.file), ctx)), _selfZsh: sf.kind === 'exec' ? posix.basename(SHEBANG_PROGRAM.exec(text.split('\n', 1)[0])?.[1] ?? '') === 'zsh' : sf.runShell === 'zsh' } : {}) });
     return r.decision === 'deny' ? deny(`the script ${sf.file} would run: ${r.reason}`) : null;
   }
   // program text in another language: the admin switch, the hook switch, or a write next to a protected path
@@ -3525,10 +3425,10 @@ function setPositionals(argv) {
   return null;
 }
 function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
-  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, cdSwitch: false, childOpts: false };
+  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false };
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
-  let cdSwitched = cmds.some(cdMeaningSwitch); // (R11-F3: a source below that switches it on counts from there on)
+  if (cmds.some(autocdSwitch)) out.unknownCd = true; // (R17: AUTO_CD turned on: a bare word runs a cd)
   const from = flowStart(cmds);
   const seen = new Map();
   const local = Object.create(null);
@@ -3555,12 +3455,13 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
       for (const [k, v] of d.assigns) set(k, v, sure && !d.unknown && !d.transform && name !== 'local');
       for (const k of d.bare) if (d.unknown || d.transform) set(k, null, false);
     } else if (CD_CMDS.has(name)) {
-      // (a target that stays a run-time value, a pattern or a brace list, `cd -`, popd, several operands: the directory is unknown from here on, not a literal; with CDPATH set -- the
-      // line's, the hook's environment's, one this file set earlier or may have changed -- a relative name is searched along it)
+      // (a target that stays a run-time value, a pattern or a brace list, `cd -`, popd, several operands: the directory is unknown from here on, not a literal. R17: so is any target that is not
+      // `.` / `..` / `/..` / `./..` / `../..` or a home form: a bare name may be read through CDPATH or as a variable)
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
       const v = t === undefined ? t : substVars(t, local, ctx.budget);
-      const cdpath = (ctx.env?.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (ctx.vars[n] ?? '') !== '' || out.vars.has(n) || ctx.pickUnknown.has(n) || ctx.srcChanged.has(n) || (c.env?.[n] ?? '') !== '' || cmds.some((x) => x.argv.some((a) => a.startsWith(`${n}[`))));
-      if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || (cdpath && v !== undefined && !isAbs(toPosix(v)) && !/^(?:\.\.?(?:[\\/]|$)|~)/.test(v))) out.unknownCd = true;
+      const homeForm = v === undefined || v === '~' || v.startsWith('~/');
+      const bare = v !== undefined && !homeForm && !/[`$*?[{]/.test(v) && !cdUnknownShape(c.argv) && !cdTargetLiteral(toPosix(v));
+      if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || bare) { out.unknownCd = true; if (bare) out.bareCd = true; }
       else out.cds.push(t ?? '~');
       set('PWD', null, false); set('OLDPWD', null, false); // (cd rebinds both)
     }
@@ -3590,8 +3491,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
         out.cds.push(...sub.cds);
         if (sub.all) out.all = true;
         if (sub.unknownCd) out.unknownCd = true;
-        if (sub.cdSwitch) cdSwitched = true;
-        if (sub.childOpts) out.childOpts = true;
+        if (sub.bareCd) out.bareCd = true;
         if (sub.home) out.home = true;
       }
     }
@@ -3603,12 +3503,6 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   for (const m of text.matchAll(/\$\{([^}]*)\}/g)) if (m[1].includes('=')) bind(m[1].match(/[A-Za-z_]\w*/g) ?? []);
   for (const m of text.matchAll(/\(\(([^)]*)\)\)/g)) if (/(?<![=!<>])=(?!=)/.test(m[1])) bind(m[1].match(/[A-Za-z_]\w*/g) ?? []);
   for (const m of text.matchAll(/\{([A-Za-z_]\w*)\}\s*(?:[<>]|&>)/g)) bind([m[1]]);
-  // R12-F4: the commands are walked in text order, not run order: a cd in a function or a loop body that comes before the source that switches cdablevars on runs after it. A switch anywhere
-  // in the file or its nested sources makes every cd / pushd / chdir of the file unknown
-  // R13: the line's own switch counts for the cds of the file too (`set -T; source ./a.sh`, a.sh holds `cd proj`), but is not the file's switch (out.cdSwitch stays the file's own)
-  if ((cdSwitched || ctx.lineCdSwitch === true) && cmds.some((c) => CD_NAMED.has(baseOf(c.argv[0] ?? '')))) out.unknownCd = true;
-  out.cdSwitch = cdSwitched;
-  if (cmds.some(bashoptsAssigned)) out.childOpts = true; // (R15-F3: the file hands BASHOPTS / SHELLOPTS to the shells that start after it)
   return out;
 }
 
@@ -3663,18 +3557,8 @@ function sourcedTexts(rec, dirs, ctx) {
 // Why: a sourced file (and BASH_ENV / ENV, which the shell reads before the script it runs) assigns variables and cds in the shell that goes on: what it sets is
 // what the rest of the line sees. Known values are recorded; one that cannot be worked out is unknown (a script it picks is refused), and a file that cannot
 // be followed at all makes every name unknown from here on. Its cds join the directories the line may be in.
-// R16-F3: `switchesOnly` (fed text that eval runs in this shell, `eval "$(cat f)"`): the text may be the OUTPUT of a script (`eval "$(bash gen.sh)"`), not f's own text, so only the switches it turns on (cdablevars in this shell,
-// BASHOPTS / SHELLOPTS for the shells after it) are taken; what it sets or where it cds is not (the policy of eval before this round)
-function absorbSourced(rec, dirs, ctx, switchesOnly = false) {
+function absorbSourced(rec, dirs, ctx) {
   const { texts, unknown } = sourcedTexts(rec, dirs, ctx);
-  if (switchesOnly) {
-    for (const t of texts) {
-      const eff = sourcedEffects(t, ctx);
-      if (eff.childOpts) ctx.childOptsSwitch = true;
-      if (eff.cdSwitch) ctx.sourcedCdSwitch = true;
-    }
-    return;
-  }
   // (a file that can set any name: every name the line has set so far may have been changed, and any other may be set; a script they pick is refused. The values
   // stay for the paths a writer builds, which is what they were before the file ran)
   const poison = () => { ctx.unknownAll = true; ctx.sourcedCdUnknown = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.srcChanged.add(k); } };
@@ -3685,8 +3569,7 @@ function absorbSourced(rec, dirs, ctx, switchesOnly = false) {
     const eff = sourcedEffects(t, ctx);
     if (eff.all) poison();
     if (eff.home) ctx.homeSourced = true; // (a bare `cd` / `cd ~` / `~/x` then goes elsewhere)
-    if (eff.childOpts) ctx.childOptsSwitch = true; // (R15-F3)
-    if (eff.cdSwitch) ctx.sourcedCdSwitch = true; // (R11-F3: the file may turn cdablevars on: the line's own `cd NAME` can then go to $NAME)
+    if (eff.bareCd) ctx.bareCd = true;
     if (eff.unknownCd) ctx.sourcedCdUnknown = true; // (a cd the file does into a directory only known at run time: the line's directory is unknown from here)
     effs.push(eff);
     for (const [k, v] of eff.vars) merged.set(k, merged.has(k) && merged.get(k) !== v ? null : v); // (the file may be one of several: a name they set differently is unknown)
@@ -3813,7 +3696,9 @@ function evaluateBashForFilesFrame(command, opts) {
   ctx.ghLine = typeof command === 'string' ? command : ''; // (ghReadOnly: what the line says about gh's variables and configuration)
   ctx.assigned = assigningDefaults(typeof command === 'string' ? command : ''); // (and those of the line this text was made from: `: ${X:=w}; G=bash; $G $X`)
   for (const [n, ws] of opts._assigned ?? []) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);
-  opts = { ...opts, _selfZero: null, _selfBash: null, _selfAbs: false, _selfZsh: false }; // (only the script file judged right now has a $0; text it runs or reads has none)
+  const seedDirs = opts._seedDirs ?? [];
+  const reseeds = opts._reseeds ?? 0;
+  opts = { ...opts, _seedDirs: undefined, _reseeds: undefined, _selfZero: null, _selfBash: null, _selfAbs: false, _selfDirLit: false, _selfZsh: false }; // (only the script file judged right now has a $0; text it runs or reads has none)
   if (ctx.admin) return allow();
   const raw = typeof command === 'string' ? command : '';
   if (!raw.trim()) return allow();
@@ -3859,12 +3744,6 @@ function evaluateBashForFilesFrame(command, opts) {
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
   ctx.pickUnknown = new Set(opts._unknown ?? []); // (a name the line gave a run-time value: only a script it picks is refused; the writer rule is for the names above)
-  // R15-F3: BASHOPTS / SHELLOPTS given to a child shell (assigned anywhere on the line, or by the outer line, or cdable_vars in the hook's own BASHOPTS) is a switch of every child frame; the hook's BASHOPTS also switches this shell
-  const envCdable = /(?:^|[:,\s])cdable_vars(?:$|[:,\s])/.test(String(ctx.env.BASHOPTS ?? ''));
-  ctx.childOptsSwitch = opts._childOpts === true || envCdable || cmds.some(bashoptsAssigned);
-  ctx.lineCdSwitch = opts._lineCdSwitch === true || envCdable || cmds.some(cdMeaningSwitch); // (R14-F2: also a switch the line that sourced this text had; R13: whether the line itself may turn cdablevars on; computed before any source is evaluated and handed to sourcedEffects)
-  const startLineSwitch = ctx.lineCdSwitch === true; // (R16: what was already on when the frame started: a switch that turns on later is the late one)
-  const startChildOpts = ctx.childOptsSwitch === true;
   ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
   ctx.unknownAll = opts._unknownAll === true || ctx.arith.dynamic; // (an arithmetic that assigns through a name may set any name, also one the line never gave. Defence in depth for the names the line gave: collectVars marks every one when arith.dynamic)
   ctx.srcChanged = new Set(opts._srcChanged ?? []); // names an unfollowable sourced file may have changed (a write target that uses one is refused)
@@ -3872,6 +3751,9 @@ function evaluateBashForFilesFrame(command, opts) {
   if (Object.keys(ctx.vars).length && setsAdmin(substVars(flat, ctx.vars, ctx.budget), ctx.platform)) return deny('the command sets PIPELINE_ADMIN through a variable; only the owner may set it, when launching Claude Code');
   const dirs = collectDirs(cmds, ctx);
   const cwdDirs = collectDirs(cmds, ctx, true);
+  for (const d of seedDirs) { if (!dirs.includes(d) && dirs.length < 32) dirs.push(d); if (!cwdDirs.includes(d) && cwdDirs.length < 32) cwdDirs.push(d); } // (R17-F7: a rerun starts with the directories a later sourced file moved the shell to)
+  const dirs0 = dirs.slice();
+  const startUnknownAll = ctx.unknownAll === true;
   const frame = newWriteFrame(cmds, {
     text: raw,
     expand: (w) => {
@@ -3902,7 +3784,7 @@ function evaluateBashForFilesFrame(command, opts) {
       checkDeadline(ctx.budget); // (the evaluation deadline)
       const inner = jobInner(c);
       if (!inner) continue;
-      const r = evaluateBashForFiles(inner, { ...opts, _lineCdSwitch: ctx.childOptsSwitch === true, _childOpts: ctx.childOptsSwitch === true, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup }); // (R16: the inner command runs in a child process: BASHOPTS / SHELLOPTS the line gave reach it)
+      const r = evaluateBashForFiles(inner, { ...opts, _depth: (opts._depth ?? 0) + 1, _startup: ctx.startup });
       if (r.decision === 'deny') return deny(`job start would run: ${r.reason}`);
     }
   }
@@ -3941,13 +3823,9 @@ function evaluateBashForFilesFrame(command, opts) {
     const moved = (n) => stateAt(-1).moved(n) || Object.keys(snaps).some((ci) => stateAt(Number(ci)).moved(n));
     // Why: HOME is never believed from the line (the guard reads `~` as the real home), so a line that sets it, or a source that may, leaves `cd` / `cd ~` / `cd ~/x` without a known target
     const homeMoved = ctx.unknownAll || ctx.homeSourced === true || moved('HOME') || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[|$)/.test(a)));
-    // Why: with CDPATH set a relative `cd sub` goes to the first CDPATH entry that has `sub` (the line's, the environment's, one a source may have set)
-    const cdpathSet = (startupEnv.CDPATH ?? '') !== '' || CDPATH_NAMES.some((n) => (Object.hasOwn(ctx.vars, n) && ctx.vars[n] !== '') || moved(n) || cmds.some((c) => (c.env?.[n] ?? '') !== '' || c.argv.some((a) => a.startsWith(`${n}[`))));
-    const cdSwitched = ctx.lineCdSwitch === true || cmds.some(cdMeaningSwitch); // (R14-F2: lineCdSwitch also holds the switch of the line that sourced this text; R10-F4: cdablevars may be on, so `cd NAME` can go to $NAME. A source that turned it on made the whole cwd unknown above, R12-F4)
-    if (ctx.sourcedCdSwitch === true) return true; // (R12-F4: a source turned cdablevars on, and a cd it ran may have moved the shell anywhere: the line's own writes are relative to an unknown directory)
     return cmds.some((c, ci) => {
       const cn = baseOf(c.argv[0] ?? '');
-      if (cdSwitched && CD_NAMED.has(cn)) return true; // (R11-B2: pushd and zsh's chdir take the same fallback)
+      if (autocdSwitch(c)) return true; // (R17: AUTO_CD)
       if (!CD_CMDS.has(cn)) return false;
       const { unknownName } = stateAt(ci);
       if (cdUnknownShape(c.argv)) return true;
@@ -3957,13 +3835,12 @@ function evaluateBashForFilesFrame(command, opts) {
       const e = expandRefs(t, ctx);
       if (/[*?[{(]/.test(e) && resolveGlobCd(e, dirs, ctx, cmds, ci) === null) return true; // (a glob or a brace list can spell ~/.claude: `cd ~/.cl*`)
       if (/[`$]/.test(e) || /\$\{!/.test(t) || /[`]|\$\(/.test(t)) return true;
-      if (cdpathSet && !isAbs(e) && !/^\.\.?(?:\/|$)/.test(e)) return true;
+      // (R17: the one whitelist: a target that is not `.` / `..` or `/` `./` `../` prefixed may be read through CDPATH or cdable_vars. The deny reason then names the fix)
+      if (!cdTargetLiteral(e)) { ctx.bareCd = true; return true; }
       return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
     });
   };
-  // R14-F2: `sameShell`: the text runs in THIS shell (source / . / eval), so a switch of the line (before or after the source) or of an earlier source decides what its own `cd NAME` means too
-  const withLineVars = (o, c = null, sameShell = false) => ({ ...o, _lineCdSwitch: (sameShell && (ctx.lineCdSwitch === true || ctx.sourcedCdSwitch === true)) || ctx.childOptsSwitch === true || (c !== null && shellStartSwitch(c.argv)), // (R16-F1: the option on the child shell's own command line)
-     _childOpts: ctx.childOptsSwitch === true, _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
+  const withLineVars = (o, c = null) => ({ ...o, _unknownCwd: unknownCwd(), _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown]), _unknownW: new Set(ctx.unknownVars), _srcChanged: taintClosure(ctx.srcChanged, cmds, c?.env ?? {}, newName, ctx.srcChanged.size > 0 || ctx.unknownAll), _unknownAll: ctx.unknownAll, _assigned: ctx.assigned });
 
   // A startup file is judged once per evaluation. It is marked first: a startup file that starts shells itself would be judged again and
   // again otherwise (a denial ends the whole evaluation, so marking before the verdict is safe).
@@ -3972,7 +3849,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // line's text nor its directories, only on the variables the line has set (seeded below; one whose value is unknown refuses a script it picks)
     if (st.implicit) {
       const unknown = Object.keys(ctx.vars).filter((k) => /[$`]/.test(ctx.vars[k])).sort();
-      const key = `${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}, unknown, dirs, writeSignature(ctx.frames), ctx.childOptsSwitch === true])}`;
+      const key = `${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}, unknown, dirs, writeSignature(ctx.frames)])}`;
       const memo = (ctx.budget.implicitStartup ??= new Map());
       // a verdict that leaned on "a missing script may have been created by a command we do not model" is reused only while that is as true as it was
       const flag = unmodelledBefore(ctx.frames);
@@ -3980,7 +3857,7 @@ function evaluateBashForFilesFrame(command, opts) {
       if (known && (!known.sens || known.flag === flag)) return known.v;
       const seen0 = ctx.budget.unmodelledSeen ?? 0;
       memo.set(key, { v: null, sens: false, flag });
-      const seed = { ...opts, _lineCdSwitch: ctx.childOptsSwitch === true, _childOpts: ctx.childOptsSwitch === true, _ignoreUnmodelled: true, _depth: 0, _assigned: ctx.assigned, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(unknown) };
+      const seed = { ...opts, _ignoreUnmodelled: true, _depth: 0, _assigned: ctx.assigned, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(unknown) };
       let v = null;
       const abs = expandRefs(st.file, ctx);
       const text = isAbs(abs) ? ctx.readText(abs) : null;
@@ -4001,7 +3878,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // reused only for the same file, directories and nesting depth, never for a run-time name (its verdict depends on the line's text)
     // (the shell sees the variables the line gave it, its own prefix included: `F=f.sh BASH_ENV=rc bash -c :` where rc sources "$F")
     if (st.ambiguous) return judgeScriptFile(st, dirs, ctx, withLineVars(opts), scanRaw);
-    const key = `${dirs.join('\u0000')}\u0000${opts._depth ?? 0}\u0000${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}, ctx.childOptsSwitch === true])}\u0000${unmodelledBefore(ctx.frames)}\u0000${writeSignature(ctx.frames)}`;
+    const key = `${dirs.join('\u0000')}\u0000${opts._depth ?? 0}\u0000${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}])}\u0000${unmodelledBefore(ctx.frames)}\u0000${writeSignature(ctx.frames)}`;
     if (ctx.budget.startupOk.has(key)) return null;
     ctx.budget.startupOk.add(key);
     return judgeScriptFile(st, dirs, ctx, withLineVars(opts), scanRaw);
@@ -4085,7 +3962,7 @@ function evaluateBashForFilesFrame(command, opts) {
         const sfj = sf;
         let v;
         try {
-          v = judgeScriptFile(sfj, sdirsNow(), ctx, withLineVars(opts, c, sf.kind === 'shell' && runsInThisShell(c)), scanRaw); // (R15-F1: the word after the wrappers)
+          v = judgeScriptFile(sfj, sdirsNow(), ctx, withLineVars(opts, c), scanRaw); // (R15-F1: the word after the wrappers)
         } finally {
           ctx.execCmd = outer;
         }
@@ -4101,9 +3978,9 @@ function evaluateBashForFilesFrame(command, opts) {
       for (const fd of scriptFeedsOf(c, raw, (w) => expandRefs(w, ctx))) {
         withPath(fd);
         // (R15-F1: fed text runs in THIS shell unless the command surely starts a new one: `source /dev/stdin < f`, `. <(cat f)`, `cat f | source /dev/stdin`, eval)
-        const v = judgeScriptFile(fd, sdirsNow(), ctx, withLineVars(opts, c, !startsNewShell(c)), scanRaw);
+        const v = judgeScriptFile(fd, sdirsNow(), ctx, withLineVars(opts, c), scanRaw);
         if (v) return v;
-        if (!startsNewShell(c) && runsInThisShell(c)) absorbSourced(fd, dirs, ctx, !sourcesHere(c)); // (R16-F3: fed text that runs in THIS shell is absorbed, eval included: a source / `.` takes everything it sets, eval only the switches it turns on)
+        if (!startsNewShell(c) && sourcesHere(c)) absorbSourced(fd, dirs, ctx); // (fed text that a source / `.` runs in THIS shell is absorbed; eval's text may be the output of a script, so its effects are not taken)
       }
       // #81 t9: and a bare name a package runner started is the bin node_modules/.bin/NAME
       if (c.viaRunner && c.argv[0] && !c.argv[0].includes('/')) {
@@ -4123,16 +4000,18 @@ function evaluateBashForFilesFrame(command, opts) {
       markPackageState(ctx.budget, [c.argv], { dirs: cwdsNow(), expand: (w) => expandRefs(w, ctx), home: ctx.homePosix, p: pathsFor() }); // (what this command may change, for the package scripts after it)
       undo?.();
     }
-    // R16-B1 / F2: the commands are judged in text order, but loops, functions and traps run in another one. A switch that turned on DURING the walk (a sourced or fed file after a judged one: cdablevars in this shell,
-    // BASHOPTS / SHELLOPTS handed to the shells that start after it) has to reach everything the frame judged before it: files, their own nested shells, package scripts, bins, option splices, startup files, job
-    // inner commands. Instead of replaying single judgments, the WHOLE frame is judged once more with both switches seeded (the frame then starts with them on, so it cannot ask for a third pass).
-    const lateLine = ctx.sourcedCdSwitch === true && !startLineSwitch;
-    const lateChild = ctx.childOptsSwitch === true && !startChildOpts;
-    if (lateLine || lateChild) {
-      countSwitchRun(ctx.budget);
+    // R17-F7: the commands are judged in text order, but a loop, a function or a trap runs the earlier ones again after the later ones. A file sourced LATER that moved the shell (a cd into a new directory, a cd or a
+    // file the guard cannot follow, HOME set) changes where the earlier files run the next time round: the frame is judged once more, starting with those directories (or with the directory and the names unknown).
+    // Only frames that can repeat or reorder (a loop, a branch, a function, a trap); at most two passes more per frame, counted across the evaluation (MAX_RERUNS).
+    const gained = dirs.filter((d) => !dirs0.includes(d));
+    const moved = opts._unknownCwd !== true && ((ctx.sourcedCdUnknown === true) || ctx.homeSourced === true);
+    const poisoned = !startUnknownAll && ctx.unknownAll === true;
+    if ((gained.length > 0 || moved || poisoned) && reseeds < 2 && (flowStart(cmds) >= 0 || ctx.lineDefs.size > 0 || cmds.some((c) => baseOf(c.argv[0] ?? '') === 'trap'))) {
+      countRerun(ctx.budget);
+      ctx.budget.writtenOk = new Set(); ctx.budget.startupOk = new Set(); ctx.budget.implicitStartup = new Map(); // (a verdict cached with the first state is not the verdict for this one)
       const at = ctx.frames.indexOf(frame);
-      const r = evaluateBashForFilesUnchecked(command, { ...opts0, ...(lateLine ? { _lineCdSwitch: true } : {}), ...(lateChild ? { _childOpts: true } : {}), _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
-      if (r.decision === 'deny') return deny(`${r.reason} (judged again with the option a file later on the line turns on: cdablevars in this shell, BASHOPTS / SHELLOPTS in the shells it starts)`);
+      const r = evaluateBashForFilesUnchecked(command, { ...opts0, _reseeds: reseeds + 1, _seedDirs: unique([...seedDirs, ...gained]), ...(moved || poisoned ? { _unknownCwd: true } : {}), ...(poisoned ? { _unknownAll: true, _srcChanged: [...ctx.srcChanged], _unknown: [...ctx.pickUnknown] } : {}), _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
+      if (r.decision === 'deny') return deny(`${r.reason} (judged again from the directory a file later on the line moves the shell to: a loop or a function runs the earlier files again there)`);
     }
   } else {
     // at the depth limit nothing is followed any further: a named script, a fed file or a startup file the line names is refused; the
@@ -4214,7 +4093,8 @@ function evaluateBashForFilesFrame(command, opts) {
   // can name, so the rest of it is judged by the ordinary write checks as if the cwd were each protected directory and each directory above one (every writer model applies, none is listed
   // by name); inline interpreter code is refused (it can build any name at run time). Child frames inherit the flag and judge their own text the same way.
   // (FP: any relative write, or a command that is not read-only, after such a cd; an absolute path outside the protected set and reads stay allowed.)
-  if (unknownCwd()) {
+  // (a pass that only judges the earlier files again, R17-F7, does not run the line's own commands in every assumed directory once more: the first pass already did, with the unknown state it ended in)
+  if (unknownCwd() && reseeds === 0) {
     // (a script or fed file named relative to the unknown directory is judged where it may be: step 7 looks in the protected directories too; inline code is judged by its own text)
     // Why: the directory may be BELOW a protected root (`cd $X` into ~/.claude/pipeline/hooks), where `echo x > ../guard.mjs` lands inside the root. With k = the `..` segments of the
     // relative write targets plus those of the `cd` steps, the line is also rerun with the cwd in each existing subdirectory of each protected root down to depth k (writes only).
@@ -4258,7 +4138,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const d of unique([...assumedCwds(ctx), ...below])) {
       countCdRun(ctx.budget);
       const r = evaluateBashForFiles(command, { ...opts, cwd: d, _assumedCwd: true, _writesOnly: true, _unknownCwd: false, _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
-      if (r.decision === 'deny') return deny(`after a cd into a directory known only at run time, ${r.reason} (judged as if the directory were ${d})`);
+      if (r.decision === 'deny') return deny(`after a cd into a directory known only at run time, ${r.reason} (judged as if the directory were ${d})${ctx.bareCd ? BARE_CD_HINT : ''}`);
     }
   }
 
@@ -4371,7 +4251,7 @@ function evaluateBashForFilesFrame(command, opts) {
     if (/[$`*?[\]{}()\\!]/.test(word) || (word[0] === '~' && word !== '~' && !word.startsWith('~/'))) return null;
     const e = expandRefs(word, ctx);
     if (!e || /^[+-]/.test(word) || /^[+-]/.test(e) || e.startsWith('~') || /[$`*?[(){}\\]/.test(e)) return null;
-    if (!isAbs(e) && (/cdpath/i.test(raw) || (opts.env ?? process.env).CDPATH)) return null; // (a relative name may lead anywhere through CDPATH)
+    if (!cdTargetLiteral(e)) return null; // (R17: a bare name may lead anywhere through CDPATH or cdable_vars)
     return e;
   };
   // R5 (#288): the narrowing fails closed. A command is read against fewer directories ONLY when everything before it is positively known: the line is a plain sequence (see R9 above), every step of its
@@ -4380,7 +4260,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // too: `cd /tmp/link && find ..` is the link target's parent). Otherwise the command is read against every directory of the line (`dirs`).
   const withReal = (list) => unique([...list, ...list.map(realOf)]);
   const staticName = (c) => { const n = c.argv[0] ?? ''; return n === '[' || n === '[[' || (n !== '' && !/[$`*?[\](){}~'"\\<>=]/.test(n)); };
-  const changesDir = (c) => (c.argv.length > 0 && (!staticName(c) || DIR_CHANGERS.has(baseOf(c.argv[0])))) || optionSwitch(c); // (R10-F4: `set -o NAME`, `options[...]=`)
+  const changesDir = (c) => (c.argv.length > 0 && (!staticName(c) || DIR_CHANGERS.has(baseOf(c.argv[0])))) || autocdSwitch(c); // (R17: AUTO_CD turns a bare word into a cd)
   // Narrowing needs a plain sequence (cmds.plainSeq: it also covers a cut-short parse, a closer with no opener, a heredoc not located, a group, a subshell, a function, a `!`), no `$'…'` / `$"…"` string on the
   // line (R6-F2), and no command that changes the directory (a cd, eval, source, ...) in a trap action: it runs in this shell, but later. (Any other command inside a substitution or a `-c` string is
   // another shell's, and a plain sequence has no loop, branch or group to run a command out of turn.)
@@ -4388,7 +4268,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const cdUnsure = cmds.plainSeq !== true || cmds.ansiC === true || cmds.some(unsureChange);
   const narrowDirs = new Map();
   if (opts._writesOnly !== true && !cdUnsure && cmds.some(cdOf) && !unknownCwd()) {
-    let known = [ctx.cwd]; // where the shell can be so far
+    let known = unique([ctx.cwd, ...seedDirs]); // where the shell can be so far
     let chain = null; // the directories after an &&-joined run of sure cd's
     let lost = false; // a cd whose destination is not known, or a command that may change the directory: nothing after it is narrowed
     const top = cmds.filter((c) => !(c.depth > 0)); // (the commands inside a substitution are listed before the one that holds them)

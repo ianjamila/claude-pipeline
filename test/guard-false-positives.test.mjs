@@ -258,8 +258,8 @@ test('F: a variable holding a command line that runs files is judged as that lin
   denyBoth('X="nohup bash f.sh"; $X', spec);
   // it runs where the command runs, with the line's variables
   const sub = { ...spec, 'sub/f.sh': 'bad', 'sub/ok.sh': 'ok' };
-  denyBoth('cd sub; X="bash f.sh"; $X', { ...sub, 'f.sh': 'ok' });
-  denyBoth('F=f.sh; cd sub; X="bash $F"; $X', { ...sub, 'f.sh': 'ok' });
+  denyBoth('cd ./sub; X="bash f.sh"; $X', { ...sub, 'f.sh': 'ok' });
+  denyBoth('F=f.sh; cd ./sub; X="bash $F"; $X', { ...sub, 'f.sh': 'ok' });
   // a custom IFS splits the value somewhere else: every part stays a candidate
   denyBoth('IFS=:; X=bash:f.sh; $X', spec);
   denyBoth('IFS=:; X="env:bash:f.sh"; $X', spec);
@@ -326,16 +326,16 @@ test('C: variables the line sets reach the real home startup file (NVM_DIR=d ...
   allowBoth('NVM_DIR=d bash -l -c true', spec(false));
   // a relative value resolves where the shell starts, not in the hook's directory
   const rel = { ...spec(true), 'sub/d/nvm.sh': 'bad', 'sub/e/nvm.sh': 'ok', 'd/nvm.sh': 'ok' };
-  denyBoth('cd sub && NVM_DIR=d bash -l -c true', rel);
-  denyBoth('cd sub && export NVM_DIR=d; zsh -c :', rel);
-  allowBoth('cd sub && NVM_DIR=e bash -l -c true', rel);
+  denyBoth('cd ./sub && NVM_DIR=d bash -l -c true', rel);
+  denyBoth('cd ./sub && export NVM_DIR=d; zsh -c :', rel);
+  allowBoth('cd ./sub && NVM_DIR=e bash -l -c true', rel);
   // not set on the line: it comes from the real environment, which is judged independently
   allowBoth('bash -l -c true', spec(true));
 });
 
 test('H: a script by absolute path, judged where the directory is unknown, is judged (no internal error)', () => {
   const run = (command, spec) => git(command, fakeFs(GIT_ROOT, spec, DIRS));
-  const lines = (s) => [`f() { :; }; bash ${s}`, `export PATH=/x:$PATH; bash ${s}`, `f() { :; }; bash ${s} && cd sub`];
+  const lines = (s) => [`f() { :; }; bash ${s}`, `export PATH=/x:$PATH; bash ${s}`, `f() { :; }; bash ${s} && cd ./sub`];
   for (const l of lines('/work/repo/w.sh')) {
     const ok = run(l, { 'w.sh': 'echo hi > out.txt\ncd sub && echo hi > o2.txt\ncd /tmp; git status' });
     assert.equal(ok.decision, 'allow', `${l} -> ${ok.reason}`);
@@ -344,7 +344,7 @@ test('H: a script by absolute path, judged where the directory is unknown, is ju
     assert.doesNotMatch(bad.reason, /internal error/, l);
   }
   // a script the judged one writes and then runs, from a directory that is not known: still refused
-  const w = run('f() { :; }; bash /work/repo/w.sh', { 'w.sh': `cd sub; echo '${BAD_GIT}' > a.sh; bash /work/repo/sub/a.sh` });
+  const w = run('f() { :; }; bash /work/repo/w.sh', { 'w.sh': `cd ./sub; echo '${BAD_GIT}' > a.sh; bash /work/repo/sub/a.sh` });
   assert.equal(w.decision, 'deny');
   assert.doesNotMatch(w.reason, /internal error/);
 });
@@ -406,7 +406,7 @@ test('K: no login files are skipped on a value assigned later or alongside; a va
     assert.equal(run(`X=/home/u/proj/scripts; ${b}; bash $X/ok.sh`, {}).decision, 'deny', b);
   }
   // (an assignment that may not run leaves the inherited value or nothing: still no option, so still no login files)
-  for (const cmd of ['cd sub && S=/home/u/proj/scripts && bash $S/ok.sh', 'cd sub && S=/home/u/proj/scripts; bash $S/ok.sh', 'true || S=/home/u/proj/scripts; bash ${S}/ok.sh']) assert.equal(run(cmd, {}).decision, 'allow', cmd);
+  for (const cmd of ['cd ./sub && S=/home/u/proj/scripts && bash $S/ok.sh', 'cd ./sub && S=/home/u/proj/scripts; bash $S/ok.sh', 'true || S=/home/u/proj/scripts; bash ${S}/ok.sh']) assert.equal(run(cmd, {}).decision, 'allow', cmd);
   for (const cmd of ['source "$(echo x)"; bash $SQL_UNKNOWN_SHELL_LINE', 'source "$(echo x)"; $SQL_UNKNOWN_SHELL_LINE', 'eval "$(cat x)"; bash "$SQL_UNKNOWN_SHELL_LINE"']) {
     assert.equal(run(cmd, { x: 'SQL_UNKNOWN_SHELL_LINE=/home/u/proj/evil.sh', 'evil.sh': BAD_FILES }).decision, 'deny', cmd);
   }

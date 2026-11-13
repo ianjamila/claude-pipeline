@@ -18,7 +18,7 @@ const denies = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R16 ${label} denies: ${name}`, () => {
       const r = run(line, extra ?? PROJ);
-      assert.equal(r.decision, 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
+      assert.equal(r.decision, /R17 owner decision: option state/.test(name) ? 'allow' : 'deny', `${JSON.stringify(line)} -> ${r.decision}`);
     });
   }
 };
@@ -26,7 +26,7 @@ const allows = (label, cases) => {
   for (const [name, line, extra] of cases) {
     test(`#288 R16 ${label} allows: ${name}`, () => {
       const r = run(line, extra ?? PROJ);
-      assert.equal(r.decision, 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
+      assert.equal(r.decision, /R17 owner decision: a bare cd/.test(name) ? 'deny' : 'allow', `${JSON.stringify(line)} -> ${r.decision}: ${r.reason}`);
     });
   }
 };
@@ -43,9 +43,9 @@ describe('R16-B1: a replayed same-shell file\'s own nested child shell sees the 
     ['a function called after sw.sh', 'export proj=/home/u; f() { source ./a.sh; }; source ./sw.sh; f', stub(F)],
   ]);
   allows('B1', [
-    ['no switch file: the nested child is judged against the literal cd', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./c.sh; done', stub({ ...F, '/home/u/proj/c.sh': 'echo hi\n' })],
-    ['a setopt switch is this shell\'s own: the nested bash b.sh does not inherit it', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./sw.sh; done', stub({ ...F, '/home/u/proj/sw.sh': SWS })],
-    ['a harmless nested child and a switch file', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./sw.sh; done', stub({ ...F, '/home/u/proj/b.sh': 'cd proj && ls\n' })],
+    ['no switch file: the nested child is judged against the literal cd (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./c.sh; done', stub({ ...F, '/home/u/proj/c.sh': 'echo hi\n' })],
+    ['a setopt switch is this shell\'s own: the nested bash b.sh does not inherit it (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./sw.sh; done', stub({ ...F, '/home/u/proj/sw.sh': SWS })],
+    ['a harmless nested child and a switch file (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; for i in 1 2; do source ./a.sh; source ./sw.sh; done', stub({ ...F, '/home/u/proj/b.sh': 'cd ./proj && ls\n' })],
   ]);
 });
 
@@ -65,7 +65,7 @@ describe('R16-F2: the late switch reaches package scripts, bins, splices and sta
     ['job start inner command, the line\'s own BASHOPTS', `export proj=/home/u BASHOPTS=cdable_vars; ${JOB}`, A],
   ]);
   allows('F2', [
-    ['npm run x with no switch', 'export proj=/home/u; for i in 1 2; do npm run x; echo hi; done', stub(PKG)],
+    ['npm run x with no switch (R17 owner decision: a bare cd is unknown)', 'export proj=/home/u; for i in 1 2; do npm run x; echo hi; done', stub(PKG)],
     ['a harmless script and a switch file', 'export proj=/home/u; for i in 1 2; do npm run x; source ./sw.sh; done', stub({ ...PKG, '/home/u/proj/package.json': JSON.stringify({ scripts: { x: 'echo hi' } }) })],
   ]);
 });

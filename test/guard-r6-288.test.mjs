@@ -94,7 +94,7 @@ describe('R6-F2: $\'…\' strings', () => {
     ['a $" on the line turns the cd narrowing off', 'cd proj && echo $"x" && find . -delete', AT_HOME],
   ]);
   allows('F2', [
-    ['plain quotes still narrow', "cd proj && echo 'x' && git add .", AT_HOME],
+    ['plain quotes still narrow', "cd ./proj && echo 'x' && git add .", AT_HOME],
     ['find -name with a quoted glob', `find ${DIR} -name '*.mjs'`],
   ]);
 });
@@ -154,11 +154,11 @@ describe('R4 / R5 allow cases stay green', () => {
   allows('R4/R5', [
     ['cd ~/Claude/proj && git add . (cwd home)', 'cd ~/Claude/proj && git add .', AT_HOME],
     ['git -C ~/Claude/proj add . (cwd home)', 'git -C ~/Claude/proj add .', AT_HOME],
-    ['cd proj && npx eslint .', 'cd proj && npx eslint .', AT_HOME],
-    ['mkdir build && cd build && cmake ..', 'mkdir build && cd build && cmake ..'],
+    ['cd ./proj && npx eslint .', 'cd ./proj && npx eslint .', AT_HOME],
+    ['mkdir build && cd ./build && cmake ..', 'mkdir build && cd ./build && cmake ..'],
     ['expr 8 / 2', 'expr 8 / 2'],
     ['git clean -n', 'git clean -n', AT_HOME],
-    ['A=x cd proj && git add . (cwd home)', 'A=x cd proj && git add .', AT_HOME],
+    ['A=x cd ./proj && git add . (cwd home)', 'A=x cd ./proj && git add .', AT_HOME],
   ]);
 });
 

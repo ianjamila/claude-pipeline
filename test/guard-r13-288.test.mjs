@@ -59,7 +59,7 @@ describe('R13-B1: a run-time command word is a switch whatever the argument coun
   ]);
   allows('B1', [
     ['a literal command word alone', 'ls && cd proj && git add .'],
-    ['a lone double-quoted parameter path, run without arguments (cannot set an option)', 'X=/a; export proj=/home/u; "$X/b.sh"; cd proj && find . -delete'],
+    ['a lone double-quoted parameter path, run without arguments (cannot set an option)', 'X=/a; export proj=/home/u; "$X/b.sh"; cd ./proj && find . -delete'],
     ['an assignment is no command word', 'A=1; cd proj && git add .'],
   ]);
 });
@@ -75,7 +75,7 @@ describe('R13-F1: the zsh precommand modifier `-` is a wrapper', () => {
   allows('F1', [
     ['- before a harmless command', '- echo hi && cd proj && git add .'],
     ['`-` as an argument of echo', 'echo - && cd proj && git add .'],
-    ['`-` as an argument of a command', 'git checkout - && cd proj && git add .'],
+    ['`-` as an argument of a command', 'git checkout - && cd ./proj && git add .'],
     ['`-` as an argument of cat (stdin)', 'cat - < /dev/null && cd proj && git add .'],
   ]);
   for (const [name, line] of [

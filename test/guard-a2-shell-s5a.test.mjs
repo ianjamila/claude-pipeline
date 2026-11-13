@@ -60,28 +60,28 @@ test('S5a: quoted text that looks like a function definition does not make the d
   const sub = resolve(GIT_ROOT, 'sub');
   const fsFor = (where, text) => fakeFs(GIT_ROOT, { [where]: text, 'ok.sql': 'select 1;' }, [...DIRS, sub]);
   const quoted = [
-    'cd sub && psql -c "create function f(uuid);" && psql -f q.sql', "cd sub && node -e 'x.replace(\"fn_undo()\", 1)' && psql -f q.sql", 'cd sub && git commit -m "rename helper()" && psql -f q.sql',
+    'cd ./sub && psql -c "create function f(uuid);" && psql -f q.sql', "cd ./sub && node -e 'x.replace(\"fn_undo()\", 1)' && psql -f q.sql", 'cd ./sub && git commit -m "rename helper()" && psql -f q.sql',
   ];
   for (const c of quoted) {
     assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'allow', c);
     assert.equal(git(c, fsFor('sub/q.sql', `\\! ${bad}`)).decision, 'deny', `${c} (the file is judged where the cd went)`);
   }
   // (a builtin that evaluates its words in the current shell reads the quoted definition as code)
-  for (const c of ['mapfile -C \' foo() { :; }\' -c 1 a < /dev/null; cd sub && psql -f q.sql', 'complete -C \' bar() { :; }\' x; cd sub && psql -f q.sql', 'bind -x \'"\\C-x": " baz() { :; }"\'; cd sub && psql -f q.sql', 'PROMPT_COMMAND=\' foo() { :; }\'; cd sub && psql -f q.sql', 'let "a[\' foo() { :; }\']=1"; cd sub && psql -f q.sql', 'export "a[\' foo() { :; }\']=1"; cd sub && psql -f q.sql']) {
+  for (const c of ['mapfile -C \' foo() { :; }\' -c 1 a < /dev/null; cd ./sub && psql -f q.sql', 'complete -C \' bar() { :; }\' x; cd ./sub && psql -f q.sql', 'bind -x \'"\\C-x": " baz() { :; }"\'; cd ./sub && psql -f q.sql', 'PROMPT_COMMAND=\' foo() { :; }\'; cd ./sub && psql -f q.sql', 'let "a[\' foo() { :; }\']=1"; cd ./sub && psql -f q.sql', 'export "a[\' foo() { :; }\']=1"; cd ./sub && psql -f q.sql']) {
     assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'deny', c);
   }
   // (a zsh glob qualifier / ksh pattern list runs quoted text in the current shell, also after a data command)
-  for (const c of ["ls *(e:' foo() { :; }':); cd sub && psql -f q.sql", "cat ?(e:' foo() { :; }':); cd sub && psql -f q.sql", "grep x a[12](e:' foo() { :; }':); cd sub && psql -f q.sql"]) {
+  for (const c of ["ls *(e:' foo() { :; }':); cd ./sub && psql -f q.sql", "cat ?(e:' foo() { :; }':); cd ./sub && psql -f q.sql", "grep x a[12](e:' foo() { :; }':); cd ./sub && psql -f q.sql"]) {
     assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'deny', c);
   }
   // (quoting that cannot be trusted keeps the hazard: an apostrophe in a comment, \$'..\\'..' and an unterminated quote hide nothing)
-  for (const c of ["echo hi # it's\nfoo() { :; }; cd sub && psql -f q.sql\necho 'x'", "echo $'a\\'b'; foo() { :; }; cd sub && psql -f q.sql; echo '", "echo 'a'; foo() { :; }; cd sub && psql -f q.sql; echo \"x"]) {
+  for (const c of ["echo hi # it's\nfoo() { :; }; cd ./sub && psql -f q.sql\necho 'x'", "echo $'a\\'b'; foo() { :; }; cd ./sub && psql -f q.sql; echo '", "echo 'a'; foo() { :; }; cd ./sub && psql -f q.sql; echo \"x"]) {
     assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'deny', c);
   }
   // ('#' inside a word or a quote is no comment)
-  assert.equal(git('cd sub && psql -c "select \'#\' as c; create function f(uuid);" && psql -f q.sql', fsFor('nowhere.sql', 'select 1;')).decision, 'allow');
+  assert.equal(git('cd ./sub && psql -c "select \'#\' as c; create function f(uuid);" && psql -f q.sql', fsFor('nowhere.sql', 'select 1;')).decision, 'allow');
   // (a definition that is code: unquoted, or quoted text something on the line runs)
-  for (const c of ['function cd() { :; }; cd sub && psql -f q.sql', 'cd() { :; }; cd sub && psql -f q.sql', 'eval "true; function cd { :; }"; cd sub && psql -f q.sql', "bash -c 'cd() { :; }'; cd sub && psql -f q.sql", "cat <<EOF > /dev/null\ndon't\nEOF\nfunction cd() { :; }; echo 'x'; cd sub && psql -f q.sql"]) {
+  for (const c of ['function cd() { :; }; cd ./sub && psql -f q.sql', 'cd() { :; }; cd ./sub && psql -f q.sql', 'eval "true; function cd { :; }"; cd ./sub && psql -f q.sql', "bash -c 'cd() { :; }'; cd ./sub && psql -f q.sql", "cat <<EOF > /dev/null\ndon't\nEOF\nfunction cd() { :; }; echo 'x'; cd ./sub && psql -f q.sql"]) {
     assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'deny', c);
   }
 });
@@ -111,7 +111,7 @@ test('S5a: a write that climbs with .. is judged from every existing subdirector
 });
 
 test('S5a: a cd the line computes is known when it is a temp dir, the script own dir, the repo root or the current dir (files-policy)', () => {
-  const fs = withRoots({ '.git/config': '[core]\n', 'scripts/run': 'cd "$(dirname "$0")"\necho x > settings.json\n', 'scripts/mv': 'cd sub\ncd "$(dirname "$0")"\necho x > settings.json\n', 'scripts/up': 'cd "$(dirname "$0")/../.."\necho x > settings.json\n', 'scripts/wrap': 'cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\necho x > out.txt\n' }, ['.git', 'scripts']);
+  const fs = withRoots({ '.git/config': '[core]\n', 'scripts/run': 'cd "$(dirname "$0")"\necho x > settings.json\n', 'scripts/mv': 'cd ./sub\ncd "$(dirname "$0")"\necho x > settings.json\n', 'scripts/up': 'cd "$(dirname "$0")/../.."\necho x > settings.json\n', 'scripts/wrap': 'cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\necho x > out.txt\n' }, ['.git', 'scripts']);
   const dec = (c, f = fs, o = {}) => files(c, f, o).decision;
   // mktemp / TMPDIR
   assert.equal(dec('cd "$(mktemp -d)" && echo x > sub/notes.txt'), 'allow');
