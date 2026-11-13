@@ -175,8 +175,9 @@ export function reviewLane({ level, files, config, sizeOnly = false }) {
 // The default branch that anchors the trusted fork point is never taken from the working-tree config (a PR can edit it): it is what the remote calls its
 // default (refs/remotes/origin/HEAD); only a clone without that ref falls back to the config's default_branch. Whichever is used, a config committed at
 // that fork point that names a different default_branch than the working-tree config is no trusted base config either (Fable).
-// A PR whose base branch is not the default branch (a stack) never gets the size-only judge: it is rated from the default branch's fork point by
-// review-complete, and from its own base by codex-review, and the two must agree.
+// A PR whose base branch is not the default branch (a stack) never gets the size-only judge, and is rated over BOTH ranges, its own (`base`, what
+// codex-review reviews) and the default branch's fork point (what review-complete rates, parent branch included), stricter wins: codex-review therefore
+// records the Fable round review-complete will ask for.
 // `base` (optional) is the ref the diff starts from; it defaults to the trusted fork point (codex-review passes its own, stack-aware, fork point).
 // Throws what the scan throws (the callers decide how to fail closed). -> {
 //   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
@@ -195,14 +196,17 @@ export async function rateBranch({ root, head, config, prBase, base }) {
   const sameConfig = trusted.ok && JSON.stringify(trusted.config) === JSON.stringify(config);
   const configs = [['', config], ...(trusted.ok && !sameConfig ? [['base config: ', trusted.config]] : [])];
   const files = diffFiles(from, head, o);
+  const ranges = [['', from, files], ...(stacked && from !== trustedFork ? [['default branch range: ', trustedFork, diffFiles(trustedFork, head, o)]] : [])];
 
   const rated = [];
-  for (const [label, cfg] of configs) {
-    const hits = await collectHardStops({ base: from, head, cwd: root, config: cfg });
-    const risk = assessRisk({ files, hits, config: cfg });
-    const lane = reviewLane({ level: risk.level, files, config: cfg, sizeOnly: risk.sizeOnly && !stacked });
-    const lightLane = isLightLane({ level: risk.level, changedLines: risk.changedLines, hits, config: cfg });
-    rated.push({ label, hits, risk, lane, lightLane });
+  for (const [rangeLabel, rangeBase, rangeFiles] of ranges) {
+    for (const [label, cfg] of configs) {
+      const hits = await collectHardStops({ base: rangeBase, head, cwd: root, config: cfg });
+      const risk = assessRisk({ files: rangeFiles, hits, config: cfg });
+      const lane = reviewLane({ level: risk.level, files: rangeFiles, config: cfg, sizeOnly: risk.sizeOnly && !stacked });
+      const lightLane = isLightLane({ level: risk.level, changedLines: risk.changedLines, hits, config: cfg });
+      rated.push({ label: rangeLabel + label, hits, risk, lane, lightLane });
+    }
   }
 
   const level = LEVELS[Math.max(...rated.map((r) => LEVELS.indexOf(r.risk.level)))];

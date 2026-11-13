@@ -121,6 +121,43 @@ test('rateBranch: a PR whose base is not the default branch never gets the size-
   assert.ok(r.reasons.some((x) => /stacked PR: base is feat\/other/.test(x)));
 });
 
+test('rateBranch: a stacked PR is also rated over the default branch range (the parent\'s sensitive path and size count), stricter wins', async (t) => {
+  const baseYml = yml('risk:\n  high_risk_paths: ["src/vault/**"]\n');
+  let parentTip;
+  const w = world(t, {
+    baseYml,
+    feature: (r2) => {
+      r2.write('src/vault/store.js', lines(5));
+      parentTip = r2.commit('parent');
+      r2.write('src/b.js', lines(3));
+    },
+  });
+  // the child alone: small, nothing sensitive
+  const own = await w.rate(undefined, { prBase: 'parent', base: parentTip });
+  assert.equal(own.stacked, true);
+  assert.equal(own.reviewer, 'fable', own.laneReasons.join('; '));
+  assert.ok(own.laneReasons.some((x) => /^default branch range: sensitive path: src\/vault\/store\.js/.test(x)), own.laneReasons.join('; '));
+  assert.deepEqual(own.sensitivePaths, ['src/vault/store.js']);
+  // codex-review's own range stays the reported one
+  assert.equal(own.fileCount, 1);
+  // the same child on the default branch (not stacked) is rated over its own range only
+  const plain = await w.rate(undefined, { base: parentTip });
+  assert.deepEqual([plain.stacked, plain.reviewer, plain.level], [false, 'judge', 'low']);
+});
+
+test('rateBranch: a stacked PR whose parent plus child pass risk.medium_lines is medium and Fable (never the size-only judge)', async (t) => {
+  let parentTip;
+  const w = world(t, {
+    feature: (r2) => {
+      r2.write('src/p.js', lines(140, 'p'));
+      parentTip = r2.commit('parent');
+      r2.write('src/c.js', lines(20, 'c'));
+    },
+  });
+  const r = await w.rate(undefined, { prBase: 'parent', base: parentTip });
+  assert.deepEqual([r.level, r.sizeOnly, r.reviewer], ['medium', false, 'fable']);
+});
+
 test('rateBranch (cp-like fixture config): commands/*.mjs and markdown are low and judge (never the light lane), core files and the rater are high', async (t) => {
   const cases = [
     ['pipeline/commands/x.mjs', 'low'],
