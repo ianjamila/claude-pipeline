@@ -11,6 +11,7 @@ export const meta = {
   usage: [
     'pipeline risk --base REF --head REF [--pr-base BRANCH] [--repo DIR]   -> {ok, level, reasons, lightLane, changedLines, fileCount, hardStops, sizeOnly, drivers, reviewer, laneReasons, sensitivePaths, note?, base, head, mergeBase}',
     '  the rating uses the working-tree config AND the one committed at the default branch\'s fork point (stricter wins; an unreadable one means reviewer fable)',
+    '  the default branch is the anchor origin/HEAD names (a clone without it, or whose target is gone, uses config.default_branch); when the two differ a lane reason says so (fix a stale origin/HEAD: `git remote set-head origin -a`)',
     '  --pr-base: the branch the PR targets, when it is not the default branch (a stack): rated over both ranges like codex-review does, and never the size-only judge',
     '  sizeOnly: medium for size alone (no hit, no high-risk path); drivers {hardStop, advisory, path, size}; reviewer: who follows Codex (judge|fable); note says why a medium PR has the judge',
   ].join('\n'),
