@@ -95,6 +95,8 @@ risk:
     "pipeline/lib/jobs.mjs", "pipeline/lib/run-cost.mjs",
     "pipeline/lib/schedule.mjs", "pipeline/lib/cmd-io.mjs", "pipeline/lib/merge-cleanup.mjs",
     "pipeline/lib/stacks/config.mjs", "pipeline/lib/stacks/result.mjs", "pipeline/lib/worktree-prune/live-sessions.mjs",
+    "pipeline/commands/summary.mjs", "pipeline/commands/queue-sweep.mjs", "pipeline/commands/merge-hold.mjs", "pipeline/commands/job.mjs", "pipeline/commands/update-branch.mjs", "pipeline/commands/redraft.mjs", "pipeline/commands/protect.mjs", "pipeline/commands/repo-move.mjs", "pipeline/commands/smoke.mjs", "pipeline/commands/followups.mjs", "pipeline/commands/artifacts.mjs", "pipeline/commands/vendor.mjs", "pipeline/commands/agent-log.mjs",
+    "pipeline/lib/agentlog.mjs", "pipeline/lib/agentlog-close.mjs",
     "install.sh", "install.ps1"]
   # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
   # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other

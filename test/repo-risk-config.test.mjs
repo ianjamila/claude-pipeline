@@ -272,3 +272,42 @@ test('repo config: every relative import (depth 1) of every root (literal .mjs e
     assert.ok(!matchAny(t, list, { nocase: true }), `DEPTH1_EXEMPT ${t} is now in risk.high_risk_paths: remove the exemption`);
   }
 });
+
+// Every file in pipeline/commands/ is either matched by risk.high_risk_paths or sits here with a one-line TRUE reason (round 7, R7-F2: the
+// commands were the one dimension still audited by hand, one file per round). A command is exempt only when it decides no gate, proof, trust,
+// owner-only or install question, writes no review state or run record, takes or releases no hold, arms or disarms no merge, guards no job and
+// changes no branch protection: it only reads or displays, or it is a thin wrapper whose decision lives in a listed lib (named below). A new
+// or unaudited command fails the test below until it is listed in risk.high_risk_paths or classified here. Before adding an entry, read what the
+// command does (not its header).
+const COMMANDS_EXEMPT = new Map([
+  ['config.mjs', 'read-only display: prints the validated config; the validation and defaults are lib/config.mjs (listed) through requireConfig in lib/cmd-common.mjs (listed)'],
+  ['cost.mjs', 'books spend (tokens, USD, retries) in the run record\'s cost section through createRunRecorder (lib/run-progress.mjs, listed, which decides what a record write keeps); no gate, merge, hold or proof reads the cost section, it is display in the summary and the extra-round ask'],
+  ['guard-log.mjs', 'read-only: counts the guard deny log per day and reason code; writes nothing and no decision reads it'],
+  ['labels.mjs', 'creates or realigns the label names, colours and descriptions on GitHub (idempotent); it applies and removes no label on any PR and grants nothing, and no gate reads a label\'s colour or description'],
+  ['leases.mjs', 'read-only: shows what the review-lease folder says; takes no lease and sweeps nothing, the live-or-dead judgement is scanLeases in lib/review-lease.mjs (listed)'],
+  ['stats.mjs', 'read-only display of review rounds of merged PRs (reads PR comments, prints a table or JSON); writes nothing and no gate reads it'],
+  ['stacks.mjs', 'stops idle local dev Supabase stacks and dev servers (the stack-stop sweep, session-end worker, status, repair, init) and installs one fixed schedule line (stacks sweep --apply --summary-only, constant arguments) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the stack-stop libs are not gate inputs'],
+  ['version.mjs', 'read-only: prints the version stamp; what an install proves is decided in lib/identity.mjs and lib/installer.mjs (both listed)'],
+  ['worktrees.mjs', 'removes finished local worktrees (prune), keep-locks, the holding folder and the read-only sessions check, and installs one fixed schedule line (worktrees prune --summary-only) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the prune rules live in lib/worktree-prune/*, which no gate reads'],
+]);
+
+test('repo config: every file in pipeline/commands/ is matched by risk.high_risk_paths or sits in COMMANDS_EXEMPT with a reason (a new command fails until it is classified)', () => {
+  const list = raw.risk.high_risk_paths;
+  const files = fs.readdirSync(path.join(root, 'pipeline', 'commands')).filter((f) => f.endsWith('.mjs')).sort();
+  assert.ok(files.length >= 35, `suspiciously few command files: ${files.length}`);
+  const unclassified = files.filter((f) => !matchAny(`pipeline/commands/${f}`, list, { nocase: true }) && !COMMANDS_EXEMPT.has(f));
+  assert.deepEqual(unclassified, [], `in pipeline/commands/ but neither in risk.high_risk_paths nor in COMMANDS_EXEMPT: ${unclassified.join(', ')}: read what the command does, then list it or exempt it with a true reason`);
+  // A stale exemption hides nothing but rots: each must still exist, carry a real reason, and not be listed after all.
+  for (const [f, why] of COMMANDS_EXEMPT) {
+    assert.ok(files.includes(f), `COMMANDS_EXEMPT ${f} is not a file in pipeline/commands/: remove it`);
+    assert.ok(why.length >= 40, `COMMANDS_EXEMPT ${f}: give a real one-line reason`);
+    assert.ok(!matchAny(`pipeline/commands/${f}`, list, { nocase: true }), `COMMANDS_EXEMPT ${f} is now in risk.high_risk_paths: remove the exemption`);
+  }
+});
+
+test('repo config: the commands audit lists the decision-making commands (merge-hold, job, update-branch, redraft, protect, summary, queue-sweep)', () => {
+  const list = raw.risk.high_risk_paths;
+  for (const c of ['merge-hold', 'job', 'update-branch', 'redraft', 'protect', 'summary', 'queue-sweep', 'repo-move', 'followups']) {
+    assert.ok(list.includes(`pipeline/commands/${c}.mjs`), `pipeline/commands/${c}.mjs decides a hold, a guard, a protection, a record or an owner-only check: it must stay listed`);
+  }
+});
