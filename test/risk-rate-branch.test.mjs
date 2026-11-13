@@ -217,6 +217,10 @@ test('rateBranch: a low evaluation that still has a raw hit (here an ignored one
   const r = await w.rate(yml('owner_approval: chat\nrisk:\n  medium_lines: 100\n'));
   assert.equal(r.sizeOnly, false);
   assert.equal(r.reviewer, 'fable');
+  // pin the intended path (#338): the same pair also comes out of an unreadable base config, a hit the ignore list stops discounting, or a working config that stops rating medium
+  assert.equal(r.level, 'medium');
+  assert.equal(r.baseConfig.ok, true);
+  assert.ok(r.hits.some((h) => h.rule === 'P-path' && h.file === 'src/a.js'), JSON.stringify(r.hits));
 });
 
 test('rateBranch: hits keep the collector identity (rule, file, line) and the stricter status when both configs report the same hit', async (t) => {
