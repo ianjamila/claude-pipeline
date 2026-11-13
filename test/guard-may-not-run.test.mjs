@@ -373,7 +373,7 @@ test('#352 R13-F1: a reserved word right after ) is not the subshell\'s redirect
   denies('then switch && ( ) else push', `if false; then ${RESET} && (true) else ${SHIP}; fi`);
   denies('then cd d && ( ) \\<nl> else push', `if false; then cd /work/other2 && (true) \\\n else ${SHIP}; fi`);
   allows('twin: then cd d && ( ) 2>&1 && push', `if false; then cd /work/other2 && (true) 2>&1 && ${SHIP}; fi`);
-  allows('twin: then cd d && ( ) 2>&1; push', `if false; then cd /work/other2 && (true) 2>&1; ${SHIP}; fi`);
+  allows('twin: then cd d && ( ) 2>&1 && push, newline continuation', `if false; then cd /work/other2 && (true) \\\n 2>&1 && ${SHIP}; fi`);
 });
 
 test('#352 R13-F2: the command in front of a ( ) glued after its words is still a stage of the pipeline that follows', () => {

@@ -2397,6 +2397,7 @@ class Parser {
     let lastSep = ';';
     // (#352 R12-F2: the ( ) group that just ended, while only blanks follow its `)`: a redirect there (`(a) 2>&1`, `(a) > log`) is part of the SAME command, so it takes the operator before the `(` and does not start a pipeline of its own)
     let subTail = null;
+    let tailUndo = null; // (#352 R13-F1: what the segment that took subTail would have had without it, to give it back when that segment turns out to hold a word: only a redirect list continues the subshell's command)
     let lastNeg = false; // (the stage before a `|` was negated: `! a | b` negates the pipeline, so b's commands too)
     let lastAfterClose = false; // (the `&&` just read follows the closer of a construct that may have skipped its body: the next segment takes it, see emit)
     // the operator before the command being read (a substitution in its words runs under it, see inGroup)
@@ -2409,13 +2410,15 @@ class Parser {
     const startSeg = () => {
       if (!inWord) wstart = this.i;
       if (!seg) {
-        const tail = subTail && lastSep === ';' && /^[ \t]*$/.test(s.slice(subTail.end, wstart)) ? subTail : null;
+        // (#352 R13-B1: only blanks and line continuations lie between the `)` and this first token)
+        const tail = subTail && lastSep === ';' && /^(?:[ \t\r]|\\\r?\n)*$/.test(s.slice(subTail.end, wstart)) ? subTail : null;
         seg = {
           words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, fns: ctx.fns, defs: ctx.defs, cmd: null, meta: new Map(), win: new Map(),
           start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl), loops: ctx.loops,
           pipedFrom: lastSep === '|' ? this.lastStage : null, pipeSkip: lastSep === '|' && this.lastStageParen ? this.lastStage : null, sep: tail ? tail.sep : lastSep, lead: tail ? tail.lead : lastSep === '|' ? this.pipeLead : null, afterClose: tail ? tail.afterClose : lastSep === '&&' && lastAfterClose,
           up: ctx.up, negIn: ctx.neg > 0, negPipe: lastSep === '|' && lastNeg, negLead: false, // (negation: R9-F3; up: R9-F1)
         };
+        tailUndo = tail ? { seg, pipeStart: this.pipeStart, pipeHead: this.pipeHead, pipeLead: this.pipeLead, at: ctx.out.length } : null;
         if (!tail && lastSep !== '|' && lastSep !== '&&' && lastSep !== '||') this.pipeStart = ctx.out.length; // (a & ends the whole and-or list: `a && b &`)
         if (!tail && lastSep !== '|') { this.pipeHead = ctx.out.length; this.pipeLead = lastSep; }
         lastAfterClose = false;
@@ -2480,6 +2483,12 @@ class Parser {
         seg.pending++;
         this.hd.push({ delim: text, strip, quoted: q >= 0, seg });
         return;
+      }
+      // (#352 R13-F1: a word after `)` (`else`, `then`, a command) is no redirect of the subshell: the segment is an ordinary one that follows a `;`)
+      if (tailUndo && tailUndo.seg === seg) {
+        seg.sep = ';'; seg.lead = null; seg.afterClose = false;
+        this.pipeStart = tailUndo.at; this.pipeHead = tailUndo.at; this.pipeLead = ';';
+        tailUndo = null;
       }
       let win;
       if (s.slice(from, Math.min(this.i, n)).includes('\\')) {
@@ -2721,8 +2730,8 @@ class Parser {
           const stageStart = seg ? this.pipeStart : lastSep !== '|' && lastSep !== '&&' && lastSep !== '||' ? ctx.out.length : this.pipeStart;
           const stageHead = seg ? this.pipeHead : lastSep !== '|' ? ctx.out.length : this.pipeHead;
           const stageLead = seg ? this.pipeLead : lastSep !== '|' ? lastSep : this.pipeLead;
-          const outFrom = ctx.out.length;
           endSeg(this.i);
+          const outFrom = ctx.out.length; // (#352 R13-F2: after the segment in front of the ( is finished: only the group's own commands are `paren`)
           const queued = new Set(this.queue);
           lastSep = ';';
           if (negHere) ctx.neg++;
