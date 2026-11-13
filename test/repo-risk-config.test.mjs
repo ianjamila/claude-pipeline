@@ -45,10 +45,12 @@ test('repo config: the rating tests read this same high_risk_paths list (no hand
 // string or regex-literal or nested-template shape) come from V8's own module parser, run in ONE child process per call
 // (test/fixtures/static-imports.mjs, `vm.SourceTextModule` needs --experimental-vm-modules); this file does not parse JavaScript itself.
 // A source that does not parse throws, so the test fails closed. DYNAMIC `import('./x.mjs')` needs a literal specifier ('…', "…", or a
-// backtick without `${`) and is found by a regex over the RAW text with no comment stripping: a mention inside a comment or string
-// over-matches, which is the safe direction (importClosure skips a dynamic target that does not exist on disk).
+// backtick without `${`) and is found by a regex over the RAW text with no comment stripping. A block or line comment may sit between
+// `import`, `(`, the specifier and the closing `,` or `)`. The regex may only OVER-match: a mention inside a comment or string is taken as an
+// import, which is the safe direction (importClosure skips a dynamic target that does not exist on disk). A computed or interpolated
+// specifier has no path to follow and is deliberately not matched.
 const STATIC_IMPORTS_HELPER = path.join(root, 'test', 'fixtures', 'static-imports.mjs');
-const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:'([^'\n]+)'|"([^"\n]+)"|`((?:[^`$\\]|\$(?!\{))+)`)\s*[,)]/g;
+const DYNAMIC_IMPORT_RE = /\bimport(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*)*\((?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*)*(?:'([^'\n]+)'|"([^"\n]+)"|`((?:[^`$\\]|\$(?!\{))+)`)(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*)*[,)]/g;
 
 function staticSpecifiers(sources) {
   const r = spawnSync(process.execPath, ['--experimental-vm-modules', '--no-warnings', STATIC_IMPORTS_HELPER], {
@@ -107,6 +109,21 @@ test('repo config: the import scanner finds multi-line, export-from and bare imp
 test('repo config: the import scanner follows a dynamic import with a literal path (any quote, a backtick with no interpolation), ignores an interpolated or computed one, and over-matches a commented one', () => {
   const src = "const m = await import('./dyn.mjs');\nconst n = import(\"../up.mjs\").then((x) => x);\nawait import(name);\nawait import(`./tpl-${x}.mjs`);\nawait import(`./tick.mjs`);\nawait import(/* why */ './cmt.mjs', { with: {} });\n// await import('./mention.mjs');\n";
   assert.deepEqual(scanImports([src])[0].dynamic, ['./dyn.mjs', '../up.mjs', './tick.mjs', './cmt.mjs', './mention.mjs']);
+});
+
+test('repo config: the dynamic-import scan allows a comment between import, the paren, the specifier and the closing paren or comma', () => {
+  const src = [
+    "await import('./a-trail.mjs' /* why */);",
+    "await import /* why */ ('./b-before-paren.mjs');",
+    "await import( // why",
+    "  './c-line.mjs');",
+    "await import(\n  /* one */ /* two */ // three\n  \"./d-mixed.mjs\" // four\n  , { with: {} });",
+    "await import /* a */ // b\n (`./e-tick.mjs` /* c */);",
+    "await import(/* a * / b */ './f-star.mjs');",
+    "await import(/* why */ name);",
+    "",
+  ].join('\n');
+  assert.deepEqual(scanImports([src])[0].dynamic, ['./a-trail.mjs', './b-before-paren.mjs', './c-line.mjs', './d-mixed.mjs', './e-tick.mjs', './f-star.mjs']);
 });
 
 test('repo config: the import scanner does not skip a multi-line import whose braces hold a comment with a quote, semicolon or brace', () => {
