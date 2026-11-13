@@ -1,6 +1,7 @@
-// R8-F4: the run recorder must never erase the merge gate's fail-closed state. An unreadable (invalid) record is replaced by one
-// marked `resumed` (so `P merge` still needs the owner's word), a record from a newer CLI is never overwritten, and a write that
-// started from a stale read carries over a `resumed` mark a concurrent checkpoint added.
+// R8-F4 / R9: replacing the run record must not drop the merge gate's fail-closed state. An unreadable (invalid) record is replaced by one
+// marked `resumed` (so `P merge` still needs the owner's word), a record from a newer CLI that is seen is not overwritten, and a write whose re-read
+// sees a `resumed` mark carries it over. The re-read is NOT atomic (GitHub has no conditional edit): the durable evidence is the append-only
+// run-resumed event, which `resumedRunState` (what `P merge` reads) counts beside the record.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { MARKERS } from '../pipeline/lib/render.mjs';
@@ -106,7 +107,7 @@ test('recorder: a record from a newer CLI is not overwritten; update returns nul
 
 // ---- (c) stale write: a concurrent `resumed` is carried over ---------------------------------------------------------------------
 
-test('recorder: a checkpoint --resumed that lands between the read and the write is not erased', () => {
+test('recorder: a checkpoint --resumed that lands BEFORE the guarded writer\'s re-read (after the first read) is carried over; one landing after the re-read is the event\'s job (see resumedRunState)', () => {
   const gh = memoryGh();
   seed(gh, plain());
   // the first prView runs after the recorder's first read and before its write: a concurrent run marks the record resumed
@@ -128,7 +129,7 @@ test('recorder: a record that was already resumed keeps its mark through an ordi
   assert.equal(recorderFor(ok).update({ step: 'merge' }).resumed, undefined);
 });
 
-test('recorder: a newer-CLI record that appears between the read and the write is not overwritten', () => {
+test('recorder: a newer-CLI record that appears after the first read but before the guarded writer\'s re-read is not overwritten', () => {
   const gh = memoryGh();
   seed(gh, plain());
   const view = gh.prView;
@@ -147,7 +148,7 @@ test('writeRunRecord: an unreadable (invalid) comment gets a record marked resum
 });
 
 // R9-F1: the comment is this PR's summary comment, the one the merge gate reads: a mark on a record bound to another repo / branch (a rename or
-// transfer) is carried, never dropped.
+// transfer) is carried by the guarded writer's re-read.
 test('writeRunRecord: a resumed mark on a record bound to another repo or branch (rename / transfer) is still carried over', () => {
   for (const moved of [{ repo: 'acme/old-name' }, { branch: 'feat/old-branch' }, { pr: 99 }]) {
     const gh = memoryGh();

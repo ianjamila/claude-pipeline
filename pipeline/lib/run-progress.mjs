@@ -1,11 +1,11 @@
 // Writing the run record from the commands that own a stretch of the run (checkpoint, merge, update-branch). The record
-// is display + routing hints, never a safety check: a failure to read or write it is a WARNING the caller reports in its
+// is display + routing hints (the one thing the merge gate reads from it is "resumed", below): a failure to read or write it is a WARNING the caller reports in its
 // own JSON, and must never change what the command decides.
 // One thing the run carries for the merge gate: "resumed" (a run taken over from an earlier session needs the owner's word, and an unreadable
 // record needs it too). The DURABLE evidence is the append-only `run-resumed` event (run-events.mjs: its own never-edited comment, which no record
 // write can erase); `record.resumed` is a convenience copy of it. The record is one editable comment and GitHub has no conditional edit, so a
 // read-then-write here is NOT atomic: re-reading right before the write (writeRunRecord) only narrows the window in which a concurrent writer's
-// mark could be overwritten, and the merge gate reads the events too (resumedRunState). A record from a newer CLI is never overwritten.
+// mark could be overwritten, and the merge gate reads the events too (resumedRunState). A record from a newer CLI that the re-read sees is refused, not overwritten.
 import { hostname } from 'node:os';
 import { applyCheckpoint, bindRecord, emptyRecord } from './run-record.mjs';
 import { postEvent, readResumedEvidence } from './run-events.mjs';
@@ -17,7 +17,7 @@ export const VIEW_FIELDS = Object.freeze(['headRefOid', 'headRefName', 'baseRefN
 // (with a warning when a record existed but was not usable). `existing` is a readSummaryComment result.
 // A record bound to another repo / branch (a rename) is replaced too, but keeps its `resumed` mark.
 // An INVALID record may have been a resumed one, so its replacement is stamped `resumed` {at, host, head} (head: the PR head the caller
-// knows, else ''): `P merge` keeps asking for the owner's word. An UNSUPPORTED record (a newer CLI wrote it) is never replaced: this throws.
+// knows, else ''): `P merge` keeps asking for the owner's word. An UNSUPPORTED record (a newer CLI wrote it) is not replaced: this throws.
 export function baseRecordFor(existing, { repo, pr, branch, baseRef, step = 'build', host = hostname(), now = Date.now(), head = '' }) {
   const warnings = [];
   let resumed;
@@ -41,7 +41,7 @@ const stampResumed = ({ host, now, head }) => ({ at: new Date(now).toISOString()
 // The ONE guarded writer of a run record (the recorder, `P checkpoint`, `P summary` and `P comment --kind summary` all use it). It
 // re-reads the summary comment right before writing, because the record the caller built may rest on an older read. This narrows the window,
 // it is not atomic (the PATCH below is unconditional): the durable evidence of a resumed run is the `run-resumed` event, not this copy.
-//  - a record from a newer CLI appeared meanwhile: refuse (throws), never overwrite it;
+//  - a record from a newer CLI appeared meanwhile (and this re-read sees it): refuse (throws) instead of overwriting it;
 //  - the fresh record is ok and `resumed` and `record` lacks the mark: carry it over. Bound to this PR or not: the comment IS this PR's summary,
 //    the one the merge gate reads, so a repo / branch rename must not clear the mark;
 //  - the fresh record is unreadable (invalid): mark the replacement resumed (fail closed, same as baseRecordFor) and, best effort, also post the
