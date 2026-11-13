@@ -25,6 +25,7 @@ import { createGitHub } from './github.mjs';
 import { assertPublishedHistory } from './review-publish.mjs';
 import { GhError } from './proc.mjs';
 import { isSensitivePath, rateBranch } from './risk.mjs';
+import { DEFAULTS, baseConfigAt } from './config.mjs';
 import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } from './state.mjs';
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
 import { readWeeklyUsage } from './codex-usage.mjs';
@@ -289,8 +290,10 @@ export const roundPrompt = (adm) => buildReviewPrompt({
 });
 
 // The facts of the reviewed range that decide "a small fix-check" (review-route.mjs): changed lines (binary = unbounded), whether it adds a file, whether it
-// touches a sensitive path. A range git or the config cannot answer for is "not small" (fail toward the normal effort and Codex). Renames count as delete + add.
+// touches a sensitive path (under ANY of the configs: `config` may be one config or a list, a path is sensitive when one of them says so). A range git or the
+// config cannot answer for is "not small" (fail toward the normal effort and Codex). Renames count as delete + add.
 export function rangeFacts(from, to, config, o) {
+  const configs = Array.isArray(config) ? config : [config];
   const flags = ['--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', '-z', `${from}..${to}`];
   try {
     const stat = git(['diff', '--numstat', ...flags], o).split('\0').filter(Boolean);
@@ -303,7 +306,7 @@ export function rangeFacts(from, to, config, o) {
       changedLines += added === '-' || deleted === '-' ? Number.POSITIVE_INFINITY : Number(added) + Number(deleted);
     }
     const newFile = status.some((tok, i) => i % 2 === 0 && tok.startsWith('A'));
-    const sensitive = paths.some((p) => isSensitivePath({ path: p, oldPath: p, newPath: p }, config));
+    const sensitive = paths.some((p) => configs.some((cfg) => isSensitivePath({ path: p, oldPath: p, newPath: p }, cfg)));
     return { changedLines, newFile, sensitive };
   } catch (err) {
     if (err instanceof GitError || err instanceof TypeError) return { changedLines: Number.POSITIVE_INFINITY, newFile: true, sensitive: true };
@@ -318,21 +321,45 @@ export function protectedKindsOf(adm) {
   return protectedKindsFor({ state, round, resolutionOnly: adm.resolutionOnly, confirmCount: adm.confirmItems.length, risen });
 }
 
+// The routing knobs planRound reads, as the STRICTER of the working-tree config and the trusted base config (the one committed at the PR's fork point): a PR
+// must not loosen its own routing (R13-F1). Stricter = more Codex, less substitute: a LOWER review.effort.small_fix_lines (fewer rounds count as small), a HIGHER
+// review.codex_round_budget (the per-PR Codex budget runs out later), a HIGHER review.codex_budget.soft / .hard (the weekly governor lowers effort / withholds
+// Codex later) and review.substitute.mode 'off' when either says off (SUBSTITUTE_MODES is auto|off; off never withholds Codex for budget or governor).
+// An unreadable or invalid base config cannot be compared: the working tree is held against the built-in defaults instead (never looser than them), and the mode is off.
+// -> { smallFixLines, codexRoundBudget, soft, hard, mode }
+export function strictestRouteConfig(config, trusted) {
+  const knobs = (c, mode) => ({
+    smallFixLines: c.review.effort.small_fix_lines, codexRoundBudget: c.review.codex_round_budget,
+    soft: c.review.codex_budget.soft, hard: c.review.codex_budget.hard, mode: mode ?? c.review.substitute.mode,
+  });
+  const wt = knobs(config);
+  const other = trusted?.ok === true ? knobs(trusted.config) : knobs(DEFAULTS, 'off');
+  return {
+    smallFixLines: Math.min(wt.smallFixLines, other.smallFixLines), codexRoundBudget: Math.max(wt.codexRoundBudget, other.codexRoundBudget),
+    soft: Math.max(wt.soft, other.soft), hard: Math.max(wt.hard, other.hard), mode: wt.mode === 'off' || other.mode === 'off' ? 'off' : wt.mode,
+  };
+}
+
 // Who reviews this admitted round and at what effort (review-route.mjs has the table; this gathers its facts). A base-only round is never planned.
 // -> { route, evidence, effort, why, protected, small, lowered?, round, base, wholePr, spend, budget, governor, facts }
 export function planRound(adm, { env = process.env, now = Date.now() } = {}) {
   const { config, state, round, root } = adm;
   const effort = config.review.effort;
   const kinds = protectedKindsOf(adm);
-  const facts = rangeFacts(adm.review.base, adm.head, config, { cwd: root });
-  const small = facts.changedLines <= effort.small_fix_lines && !facts.newFile && !facts.sensitive;
+  // A PR must not loosen its own routing: the sensitive-path test and the knobs are read under the working-tree config AND the trusted base config, stricter wins
+  // (R13-B1 / R13-F1); a base config that cannot be read counts every path as sensitive.
+  const trusted = baseConfigAt(adm.rated.trustedFork, root);
+  const route = strictestRouteConfig(config, trusted);
+  const facts = rangeFacts(adm.review.base, adm.head, trusted.ok ? [config, trusted.config] : [config], { cwd: root });
+  if (!trusted.ok) facts.sensitive = true;
+  const small = facts.changedLines <= route.smallFixLines && !facts.newFile && !facts.sensitive;
   const usage = readWeeklyUsage({ env, now });
   const readable = usage.source === 'codex-sessions' && Number.isFinite(usage.weeklyUsedPct);
-  const { soft, hard } = config.review.codex_budget;
+  const { soft, hard } = route;
   const governor = readable ? { usedPct: usage.weeklyUsedPct, soft, hard, observedAt: usage.observedAt } : null;
-  const budget = { used: codexSpend(state), budget: config.review.codex_round_budget };
+  const budget = { used: codexSpend(state), budget: route.codexRoundBudget };
   const decision = decideRoute({
-    mode: config.review.substitute.mode, protectedKinds: kinds, small, governor, budget,
+    mode: route.mode, protectedKinds: kinds, small, governor, budget,
     normal: baseEffort({ effort, firstOrWholePr: round === 1 || adm.wholePr === true, level: adm.level }), smallFix: effort.small_fix,
   });
   return { ...decision, round, base: adm.review.base, wholePr: adm.wholePr === true, budget, governor, facts };
