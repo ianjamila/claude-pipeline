@@ -4,13 +4,17 @@
 // from posting it any other way.
 //
 // The comment: the marker line, one line of prose, then a ```json fence holding ONE line of JSON
-//   { contentHash, base, head, rounds, codexModel, modelProofDigest, stateHash[, rulingsDigest] }
+//   { contentHash, base, head, rounds, codexModel, modelProofDigest, stateHash[, rulingsDigest][, substitute, substituteDigest] }
 // contentHash is git.mjs#reviewContentHash of the reviewed head (merge base -> head, agent log excluded); base is that merge
 // base; modelProofDigest is the sha256 of the Fable model proofs, or null when no Fable pass ran. rulingsDigest (lib/triage.mjs#rulingsDigest,
 // the dismissed BLOCKING / security items and who decided them) is written only when there are some: an ordinary marker has no such field,
 // and a marker without it reads as 'none' (parseReviewRecord). stateHash (lib/review-publish.mjs#reviewContentHash) is the hash of the review state the marker was
 // issued for: the owner-go check (finalgate.mjs#reviewCompletionCheck) requires it to equal the state it is judging, so a state republished after the marker
 // does not ride on it. A marker written before the field reads as 'none' and is valid here (the CI status only judges the content) but refused there.
+// substitute { rounds, agents, models } and substituteDigest (lib/triage.mjs#substituteDigest) are written only when a Claude stand-in reviewed instead of Codex (plan
+// 2026-11-11-codex-substitute-reviewer): the digest is compared with the live inventory like rulingsDigest, so a substitute round or second review added at the same head is not covered
+// by an older marker. With no Codex round at all codexModel reads `none-substitute:<model>` (any non-empty string passes an older parser, so older vendored CI guards print that instead of
+// a Codex model that never ran). An older parser drops the two keys it does not know.
 //
 // Which comment counts (latestReviewComment): the NEWEST marker comment by an allowed author (the repo owner of a user-owned
 // repo, or a login in ci.approvers: the same rule as approval labels), and only if it was never edited. A newer comment
@@ -50,10 +54,22 @@ export function parseReviewRecord(body) {
   if (r.rulingsDigest !== undefined && !(typeof r.rulingsDigest === 'string' && HASH.test(r.rulingsDigest))) return null;
   // Absent = 'none' (a marker written before the field); present must be a 64-hex hash.
   if (r.stateHash !== undefined && !(typeof r.stateHash === 'string' && HASH.test(r.stateHash))) return null;
+  // Absent = none; present: a 64-hex digest and a { rounds: [int], agents: [string], models: [string] } summary (both or neither).
+  const sub = r.substitute;
+  const subOk = (v) => Array.isArray(v) && v.every((x) => typeof x === 'string' && x !== '');
+  if (sub !== undefined) {
+    if (sub === null || typeof sub !== 'object' || Array.isArray(sub)) return null;
+    if (!Array.isArray(sub.rounds) || !sub.rounds.every((n) => Number.isInteger(n) && n > 0) || !subOk(sub.agents) || !subOk(sub.models)) return null;
+    if (!(typeof r.substituteDigest === 'string' && HASH.test(r.substituteDigest))) return null;
+  } else if (r.substituteDigest !== undefined) {
+    return null;
+  }
   return {
     contentHash: r.contentHash, base: r.base, head: r.head, rounds: r.rounds, codexModel: r.codexModel, modelProofDigest: r.modelProofDigest,
     rulingsDigest: r.rulingsDigest === undefined ? 'none' : r.rulingsDigest,
     stateHash: r.stateHash === undefined ? 'none' : r.stateHash,
+    // (only when present, so the record of an ordinary review reads exactly as it always did; absent = 'none')
+    ...(sub === undefined ? {} : { substituteDigest: r.substituteDigest, substitute: { rounds: [...sub.rounds], agents: [...sub.agents], models: [...sub.models] } }),
   };
 }
 

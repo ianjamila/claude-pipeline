@@ -1016,6 +1016,57 @@ test('verify.ci_proof parses from real YAML (hyphenated step names, nested mappi
   assert.deepEqual(r.config.verify.ci_proof, { 'sql-arms': { workflow: '.github/workflows/ci.yml', job: 'SQL arms', event: 'pull_request' } });
 });
 
+test('review.substitute: defaults (auto, never wait, 8 MB packet) and validation of every key', () => {
+  const d = validateConfig(minimal());
+  assert.deepEqual(d.config.review.substitute, { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 });
+  assert.ok(Object.isFrozen(DEFAULTS.review.substitute));
+  const ok = validateConfig({ ...minimal(), review: { substitute: { mode: 'off', min_wait_minutes: 20 } } });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual(ok.config.review.substitute, { mode: 'off', min_wait_minutes: 20, max_packet_mb: 8 });
+  const cases = [
+    [{ mode: 'on' }, 'review.substitute.mode must be one of auto|off'],
+    [{ min_wait_minutes: -1 }, 'review.substitute.min_wait_minutes must be an integer 0..720'],
+    [{ min_wait_minutes: 1.5 }, 'review.substitute.min_wait_minutes must be an integer 0..720'],
+    [{ min_wait_minutes: 721 }, 'review.substitute.min_wait_minutes must be an integer 0..720'],
+    [{ max_packet_mb: 0 }, 'review.substitute.max_packet_mb must be a positive integer'],
+    [{ max_packet_mb: 'big' }, 'review.substitute.max_packet_mb must be a positive integer'],
+    [{ modee: 'auto' }, 'unknown key: review.substitute.modee'],
+  ];
+  for (const [substitute, expected] of cases) {
+    const r = validateConfig({ ...minimal(), review: { substitute } });
+    assert.equal(r.ok, false, expected);
+    assert.ok(has(r, expected), `${expected}: ${r.errors.join(' | ')}`);
+  }
+  assert.ok(has(validateConfig({ ...minimal(), review: { substitute: 'auto' } }), 'review.substitute must be a mapping'));
+});
+
+test('review.effort.small_fix / small_fix_lines, review.codex_round_budget and review.codex_budget: defaults and validation', () => {
+  const d = validateConfig(minimal());
+  assert.equal(d.config.review.effort.small_fix, 'low');
+  assert.equal(d.config.review.effort.small_fix_lines, 40);
+  assert.equal(d.config.review.codex_round_budget, 6);
+  assert.deepEqual(d.config.review.codex_budget, { soft: 75, hard: 90 });
+  const ok = validateConfig({ ...minimal(), review: { effort: { small_fix: 'medium', small_fix_lines: 20 }, codex_round_budget: 4, codex_budget: { soft: 60 } } });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual([ok.config.review.effort.small_fix, ok.config.review.effort.small_fix_lines, ok.config.review.codex_round_budget], ['medium', 20, 4]);
+  assert.deepEqual(ok.config.review.codex_budget, { soft: 60, hard: 90 });
+  const cases = [
+    [{ effort: { small_fix: 'tiny' } }, 'review.effort.small_fix must be one of'],
+    [{ effort: { small_fix_lines: 0 } }, 'review.effort.small_fix_lines must be an integer 1..10000'],
+    [{ effort: { small_fix_lines: 'x' } }, 'review.effort.small_fix_lines must be an integer 1..10000'],
+    [{ codex_round_budget: 0 }, 'review.codex_round_budget must be an integer 1..100'],
+    [{ codex_budget: { soft: 95 } }, 'review.codex_budget.soft must not be above review.codex_budget.hard'],
+    [{ codex_budget: { hard: 101 } }, 'review.codex_budget.hard must be an integer 1..100'],
+    [{ codex_budget: { sofft: 1 } }, 'unknown key: review.codex_budget.sofft'],
+    [{ codex_budget: 80 }, 'review.codex_budget must be a mapping'],
+  ];
+  for (const [review, expected] of cases) {
+    const r = validateConfig({ ...minimal(), review });
+    assert.equal(r.ok, false, expected);
+    assert.ok(has(r, expected), `${expected}: ${r.errors.join(' | ')}`);
+  }
+});
+
 test('risk.ignore_hard_stop_rules: defaults to empty; only P-path and R4-config are accepted, anything else names the allowlist', () => {
   assert.deepEqual(DEFAULTS.risk.ignore_hard_stop_rules, []);
   const ok = validateConfig({ ...minimal(), risk: { ignore_hard_stop_rules: ['P-path', 'R4-config'] } });

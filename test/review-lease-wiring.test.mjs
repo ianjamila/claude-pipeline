@@ -59,7 +59,7 @@ const leaseOn = (w, repo) => leasesOf(w).find((l) => l.worktree === realpathSync
 
 // A repo with a review state for PR 12 and a valid config; the state names its PR, so state-only commands get a PR lease.
 function reviewRepo({ state = true } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   repo.write('.claude/pipeline.yml', pipelineYml());
   repo.write('.gitignore', '.review/\n.verify/\n');
   repo.write('src/app.js', 'export const a = 1;\n');
@@ -88,7 +88,7 @@ const summaryGh = () => createFakeGh([
 test('wiring: the leased commands are exactly the ones that read or write a worktree\'s review state (read-only commands take none)', () => {
   assert.deepEqual([...LEASED_COMMANDS].sort(), [
     'agent-log', 'arbiter', 'checkpoint', 'ci-wait', 'codex-review', 'comment', 'cost', 'final-gate', 'followups', 'job', 'merge', 'merge-hold',
-    'redraft', 'review-complete', 'smoke', 'state', 'summary', 'triage', 'update-branch', 'verify',
+    'redraft', 'review-complete', 'smoke', 'state', 'substitute', 'summary', 'triage', 'update-branch', 'verify',
   ]);
   for (const name of ['preflight', 'config', 'labels', 'update', 'version', 'model-floor', 'risk', 'hardstops', 'integrity', 'queue-sweep', 'protect', 'vendor']) {
     assert.equal(LEASED_COMMANDS.has(name), false, name);

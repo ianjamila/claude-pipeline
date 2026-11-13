@@ -44,7 +44,7 @@ const DISPUTED = { disputedBug: true, settleTest: { possible: true, plan: 'write
 
 // comments: true swaps in a gh that remembers the PR's comments (test/fixtures/fake-gh-comments.mjs), so a publication can be read back.
 function world(t, { yml = CHAT_YML, slug = 'acme/widgets', comments = false } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
   repo.write('.gitignore', '.review/\n');
@@ -436,10 +436,10 @@ test('arbiter needed in a dispute round leaves a judgement (low confidence) and 
 test('a state of a newer format is refused by every command that reads it', (t) => {
   const w = world(t);
   assertExit(w.codex(1, findingsOf([], [sugg()])), 0);
-  w.edit((s) => { s.version = 4; });
+  w.edit((s) => { s.version = 5; });
   const r = w.cli(['state', 'outcome']);
   assertExit(r, 2, r.stdout + r.stderr);
-  assert.match(r.json.message, /version 4.*supports up to 3/);
+  assert.match(r.json.message, /version 5.*supports up to 4/);
   const c = w.cli(ruling('R1-S1', 'FOLLOW-UP'));
   assertExit(c, 2, c.stdout);
 });
@@ -643,7 +643,7 @@ test('second-review: a Codex outage is exit 3 {unavailable, reason} and leaves t
   assertExit(w.codex(1, findingsOf([finding()])), 0);
   w.wait('R1-B1');
   const before = w.stateText();
-  const quota = second(w, 'R1-B1', answerOf(['R1-B1']), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'You hit your usage limit' } });
+  const quota = second(w, 'R1-B1', answerOf(['R1-B1']), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'You hit your usage limit' } });
   assertExit(quota, 3, quota.stdout + quota.stderr);
   assert.equal(quota.json.ok, false);
   assert.equal(quota.json.unavailable, true);

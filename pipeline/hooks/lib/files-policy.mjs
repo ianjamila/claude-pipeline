@@ -35,7 +35,7 @@ const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its r
 const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
-const SENSITIVE_WORDS = /\.claude|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|prod-before|published-baseline|[\w.-]*smoke)/i;
+const SENSITIVE_WORDS = /\.claude|\.codex(?:\/*(?![\w.\-\/])|\W+sessions)|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|substitute-attempts|prod-before|published-baseline|[\w.-]*smoke)/i;
 
 // ---- the protected set ------------------------------------------------------------------------
 
@@ -49,6 +49,8 @@ const PROTECTED_REL = [
   '.claude/agents/judge.md',
   '.claude/agents/arbiter.md',
   '.claude/agents/arbiter-fix.md',
+  '.claude/agents/substitute-opus.md',
+  '.claude/agents/substitute-fable.md',
   '.claude/pipeline',
   '.claude/settings.json',
   // #261 (click-to-approve): a hook that runs on the owner's dialogs (AskUserQuestion) could answer one in the owner's name or hide a refusal, so the user-level hooks folder and the
@@ -57,24 +59,30 @@ const PROTECTED_REL = [
   '.claude/settings.local.json',
   // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it, P merge and the guard read it
   '.claude/pipeline-state/owner-go',
+  // cp #256: the machine-wide Codex outage record (status.json: the last quota stop and the PRs waiting for Codex; only pipeline commands write it) and Codex's own session
+  // logs (the weekly-usage figure is read from them, so an agent may not write them)
+  '.claude/pipeline-state/codex',
+  '.codex/sessions',
 ];
 
 // The directories that hold them. Writing INTO them is fine (history, projects, CLAUDE.md, other skills), but
 // replacing, deleting, moving or running a repo command in them reaches the protected files, so for a
 // non-read-only command a word that IS one of these (exactly, not a child) counts as a protected reference.
-const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents', '.claude/pipeline-state'];
+// (cp #256 R5-B1: also ~/.codex, which holds the session logs the weekly-usage figure is read from: `cp -R /tmp/forged/. ~/.codex` reaches them)
+const ANCESTOR_REL = ['.claude', '.claude/skills', '.claude/agents', '.claude/pipeline-state', '.codex'];
 
 // Phase 3b (Fable attacker pass on #107): a repo's review state and the proofs beside it. `pipeline review-complete` trusts
 // .review/state.json (a clean review of the current content there is what lets it post the review-complete comment that the
 // `Cross-model review` status is read from), and the gate and merge read the rest. Only pipeline commands write them, from their own
 // process, which this hook never sees; an agent that hand-wrote them would get a genuine comment for a review that never ran.
 // Protected in ANY directory (each checkout and worktree has its own .review/), by name: state.json (and its tmp files), every
-// round-<n>/ folder (codex.json, diff.patch, arbiter-input.md, model-proof.json …), final-gate.json, <target>-smoke.json,
+// round-<n>/ folder (codex.json, diff.patch, arbiter-input.md, model-proof.json …), final-gate.json, substitute-attempts.json (the substitute
+// reviewer's attempt count and tags, which must outlive a discarded round: cp #256 R3-B1), <target>-smoke.json,
 // prod-before.json and published-baseline.json (the hash `publishTriage` trusts as "what this copy last published": a forged one would let a
 // shorter history replace the published one). The .review folder itself is the directory that holds them (replacing or moving it reaches them); `mkdir` of it
 // stays allowed, as it only makes an empty folder (the ship skill runs `mkdir -p .review`, then writes hardstops.json, which the
 // agent produces itself and is not protected). The state's other source, the PR triage comment, is guarded in git-policy.mjs.
-const REVIEW_FILE_SRC = String.raw`(?:^|/)\.review/(?:state\.json(?:\.[^/]*)?|round-\d+(?:/.*)?|final-gate\.json(?:\.[^/]*)?|[^/]+-smoke\.json(?:\.[^/]*)?|prod-before\.json(?:\.[^/]*)?|published-baseline\.json(?:\.[^/]*)?)$`;
+const REVIEW_FILE_SRC = String.raw`(?:^|/)\.review/(?:state\.json(?:\.[^/]*)?|round-\d+(?:/.*)?|final-gate\.json(?:\.[^/]*)?|substitute-attempts\.json(?:\.[^/]*)?|[^/]+-smoke\.json(?:\.[^/]*)?|prod-before\.json(?:\.[^/]*)?|published-baseline\.json(?:\.[^/]*)?)$`;
 const REVIEW_DIR_SRC = String.raw`(?:^|/)\.review/*$`;
 // #128: Claude Code's own session transcripts (<config dir>/projects/<project>/<session>.jsonl, subagents/ below it; every config dir, `.claude*`,
 // as the stacks' default transcriptDirs). The owner-go check reads them to learn who typed a prompt (hooks/lib/owner-go.mjs promptProvenance), so a
@@ -84,7 +92,7 @@ const REVIEW_DIR_SRC = String.raw`(?:^|/)\.review/*$`;
 // (the file and folder patterns live in lib/paths.mjs, the one place the use-time check reads too: R1-B2)
 const TRANSCRIPT_TEXT_SRC = String.raw`(?<![\w.\-])\.claude[^/\s'"]*/projects/[^\s'"]*\.jsonl(?![\w.\-])`;
 // One name of each kind, for globs: a glob that can match one of them can match a protected file.
-const REVIEW_SAMPLES = ['state.json', 'state.json.1.tmp', 'round-1', 'final-gate.json', 'preview-smoke.json', 'production-smoke.json', 'prod-before.json', 'published-baseline.json'];
+const REVIEW_SAMPLES = ['state.json', 'state.json.1.tmp', 'round-1', 'final-gate.json', 'preview-smoke.json', 'production-smoke.json', 'prod-before.json', 'substitute-attempts.json', 'published-baseline.json'];
 // A wildcard matches a name that starts with a dot (the .review folder) only when the line may switch that on: bash dotglob (shopt, or
 // BASHOPTS), zsh globdots / GLOB_DOTS, GLOBIGNORE (bash then matches dot names), a zsh (D) glob qualifier. Otherwise only a segment that
 // itself starts with a dot can match it (`.r*`, `.review`), as in every shell.
@@ -96,7 +104,7 @@ const zshDotQualifier = (s) => String(s).split(/\s/).some((tok) => tok.split(')'
 }));
 const DOT_GLOB = { test: (s) => /dotglob|glob_?dots|GLOBIGNORE/i.test(s) || zshDotQualifier(s) };
 // The same names in command or program text, wherever they sit (a literal path, or one built from pieces: '.review', 'state.json').
-const reviewTextBody = (sep) => `(?<![\\w.\\-])\\.review${sep}(?:state\\.json|round-\\d+(?![\\w.\\-])|final-gate\\.json|[\\w.\\-]*-smoke\\.json|prod-before\\.json|published-baseline\\.json)`;
+const reviewTextBody = (sep) => `(?<![\\w.\\-])\\.review${sep}(?:state\\.json|round-\\d+(?![\\w.\\-])|final-gate\\.json|substitute-attempts\\.json|[\\w.\\-]*-smoke\\.json|prod-before\\.json|published-baseline\\.json)`;
 
 // Why: a name assigned from a changed name is changed too (`X=$D; echo x > $X/s`, `E=$D bash w.sh`): the assignments of the line (a bare `NAME=value`, a declaration's
 // `NAME=value`) and `extra` (the prefix values of the command a child frame is started by) taint the name they set, until nothing new is added.
@@ -864,7 +872,7 @@ function physicalTargets(target, ctx) {
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
 const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go\.mjs$/i;
 
-const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, *-smoke.json, prod-before.json, published-baseline.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
+const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, substitute-attempts.json, *-smoke.json, prod-before.json, published-baseline.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
 
 // MCP servers (a filesystem server, any other server's write tools, a browser or IDE that runs code) reach the
 // same files without Edit/Write. Their tool_input has no fixed shape, so values are picked out by key name.
@@ -1265,9 +1273,9 @@ function ancestorRegexes(ctx) {
 
 // The protected files named by their tail (`.claude/settings.json`), whatever lies in front of it.
 const SEP = "(?=[ \\t]*[/'\"`,+])[/'\"`,+ \\t]+"; // between pieces of a code-built path: '.claude', 'skills', 'ship'
-function suffixBody(sep) {
+function suffixBody(sep, bareCodex = '') {
   const end = '(?![\\w.\\-])';
-  return `\\.claude${sep}(?:settings(?:\\.local)?\\.json${end}|hooks${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter|arbiter-fix)\\.md${end})`;
+  return `(?:${bareCodex}\\.codex${sep}sessions${end}|\\.claude${sep}(?:settings(?:\\.local)?\\.json${end}|hooks${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter|arbiter-fix|substitute-opus|substitute-fable)\\.md${end}))`;
 }
 // ...preceded by something only known at run time: a variable, a command substitution, a template `${...}`, a call
 // result `)`, a `+` or `,` joining pieces, `~user`, `.join(` / `.joinpath(`.
@@ -1275,10 +1283,36 @@ const NONLIT_PREFIX = "(?:[})\\]]|\\$\\w+|~\\w*|[+,][ \\t]*|join(?:path)?\\([ \\
 // ...or preceded by a plain relative prefix (`.claude/x`, `../.claude/x`, `sub/.claude/x`), resolved against the directories in play.
 const REL_PREFIX = '(?<![\\w$.~/\\\\-])(?:[\\w.\\-]+/+)*';
 
+// (cp #256 R6-F1: the ~/.codex folder itself behind a prefix only known at run time, `cp -R /tmp/forged/. "$(echo ~)/.codex"`; a relative one is judged by the resolved-path checks)
+const CODEX_DIR = '\\.codex/*(?![\\w.\\-/])|';
+// (cp #256 R6-F1 hardening: the same path spelled with `.`, `//` or `x/..` segments, `$H/./.codex`, `$H/.codex/.`, `$H/.codex/x/..`: collapsed here, so the matchers do not list spellings)
+// (a single pass over each path-like run: a segment stack, so any nesting depth collapses in linear time)
+function collapseRun(run) {
+  if (!run.includes('/')) return run;
+  const abs = run.startsWith('/');
+  const segs = run.split('/');
+  const trail = segs.length > 1 && segs[segs.length - 1] === '';
+  const out = [];
+  let base = 0; // a relative run's first segment is the unresolved base (`$H`, `.`, `x`): never dropped or popped
+  for (let k = 0; k < segs.length; k++) {
+    const seg = segs[k];
+    if (!abs && k === 0) { out.push(seg); base = 1; continue; }
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..' && out.length > base && out[out.length - 1] !== '..') { out.pop(); continue; }
+    out.push(seg);
+  }
+  const body = out.join('/');
+  if (abs) return '/' + body + (trail && body ? '/' : '');
+  return body + (trail && !body.endsWith('/') ? '/' : '');
+}
+function collapseDots(text) {
+  return text.replace(/[^\s'"`;|&()]+/g, collapseRun);
+}
+const sensitive = (text) => SENSITIVE_WORDS.test(text) || SENSITIVE_WORDS.test(collapseDots(text));
 function suffixRegexes(ci) {
   const flags = ci ? 'i' : '';
   return {
-    nonlit: new RegExp(NONLIT_PREFIX + suffixBody(SEP), flags),
+    nonlit: new RegExp(NONLIT_PREFIX + suffixBody(SEP, CODEX_DIR), flags),
     rel: new RegExp(REL_PREFIX + suffixBody('/+'), `g${flags}`),
   };
 }
@@ -1584,8 +1618,11 @@ function makeMatchers(ctx) {
       if (reviewText.test(v)) return true; // (a repo's review state: protected wherever it is, so the name alone is the reference)
       if (transcriptText.test(v) || rootTranscriptText.some((re) => re.test(v)) || envTranscriptText(v)) return true; // (#128: a session transcript, in any config dir; R2-F1: also under $CLAUDE_CONFIG_DIR)
       if (aliasInText(v, dirs)) return true;
-      if (!(ctx.ci ? v.toLowerCase() : v).includes('.claude')) continue;
+      const lv = ctx.ci ? v.toLowerCase() : v;
+      if (!lv.includes('.claude') && !lv.includes('.codex')) continue;
       if (suffix.nonlit.test(v)) return true;
+      const cv = collapseDots(v);
+      if (cv !== v && suffix.nonlit.test(cv)) return true;
       if (dirs) {
         suffix.rel.lastIndex = 0;
         for (const mm of v.matchAll(suffix.rel)) for (const d of dirs) if (ctx.hit(pathsFor().join(d, mm[0]))) return true;
@@ -1626,7 +1663,7 @@ function makeMatchers(ctx) {
       const rs = hitReadings(part); // (#81 t8b: the words an operator or array assignment gives, see rawHit)
       if (rs.over) return true;
       // Why: a target built by a command substitution (`"$(echo ~/.claude)"/settings.json`) is only known at run time: when its own text names a protected thing it is refused
-      if (/\$\(|`/.test(part) && SENSITIVE_WORDS.test(part)) return true;
+      if (/\$\(|`/.test(part) && sensitive(part)) return true;
       for (const reading of rs) {
         const e = expandRefs(reading, ctx);
         const bases = isAbs(e) ? [''] : dirs;
@@ -1898,7 +1935,10 @@ function resolveGlobCd(e, bases, ctx, cmds, idx) {
 // Phase 3b: 200 → 256 with the two review folders assumedCwds added, which cost a psql line under an unfollowable startup file 168 → 224
 // reruns (guard-false-positives J); the CPU deadline still bounds the line)
 // #261 T3: 256 → 320 with the hooks folder and local settings file (and each other account config dir's) added to the protected set: the same psql line then needs 257 reruns (the CPU deadline still bounds the line)
-const MAX_CD_RERUNS = 320;
+// cp #256 R5 regression (guard-false-positives J): the count grows with the SQUARE of the assumed directories (n reruns of the line, each rerunning the unfollowable startup file in n+1 more:
+// 15 directories = 255, 18 = 360 since pipeline-state/codex, .codex/sessions and .codex joined the protected set), so 256 refused every psql line under an unfollowable startup file again.
+// (#261 T3 had meanwhile added the hooks folder and local settings file, and each other account config dir's, to the protected set.) 512 holds 22 directories; a refusal past it stays fail-closed, and the CPU deadline still bounds the time (the J line takes ~0.2 s at 360 reruns).
+const MAX_CD_RERUNS = 512;
 const MAX_DIR_WORD = 4096; // (#288 CI H2: PATH_MAX; a longer lone command word is not an AUTO_CD directory, see dirLikeWord)
 const MAKES_DIRS = new Set(['mkdir', 'cp', 'mv', 'tar', 'bsdtar', 'gtar', 'unzip', 'git', 'rsync', 'ditto', 'install', 'ln', 'curl', 'wget']);
 const MAX_BELOW_ROOT_DIRS = 64; // (subdirectories of the protected roots a rerun may add for a `..` write)

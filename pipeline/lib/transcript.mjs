@@ -490,3 +490,75 @@ export function extractJsonBlock(text) {
     throw new Error('no JSON found', { cause });
   }
 }
+
+// ---------- what a run did (the substitute reviewer's proof) ----------
+
+// Every transcript (any age, none from the future) whose meta description IS the tag: a tag is the one run's name, so a second run under it is a re-roll.
+// -> [jsonlPath]
+export function findTaggedTranscripts({ tag, projectsDir = path.join(os.homedir(), '.claude', 'projects'), now = Date.now() } = {}) {
+  if (typeof tag !== 'string' || tag === '' || typeof projectsDir !== 'string' || projectsDir === '') return [];
+  const found = [];
+  for (const dir of subagentDirs(projectsDir)) {
+    for (const name of listDir(dir)) {
+      if (!name.endsWith('.meta.json')) continue;
+      const file = path.join(dir, name);
+      const st = statOrNull(file);
+      if (!st?.isFile() || st.mtimeMs > now + FUTURE_SKEW_MS) continue;
+      if (readMetaObject(file)?.description === tag) found.push(file.replace(/\.meta\.json$/, '.jsonl'));
+    }
+  }
+  return found.sort();
+}
+
+// The numbered rows a Read result really showed: [{ n, text }] in order (the row's line number and the text after the separator), or null when they cannot be told (a caller credits
+// nothing then). Read answers with the lines it returned, each numbered ("<n>\t<text>", or "<n>\u2192<text>"), and stops early at a size cap (about 25,000 tokens a call) WITHOUT an
+// error, so what was read is what came back and not what the call asked for (offset / limit). The numbers must run on by one from the first; anything else (no numbered row, a gap)
+// is refused. Only the numbered rows count: the truncation note ("PARTIAL view: showing lines A-B") is a separate attachment row in the transcript, never part of this content, and
+// a file line that holds that phrase must not move the range (R10-B1). `content` is the tool_result's content: a string or an array of text blocks.
+export function readReturnedRows(content) {
+  const text = typeof content === 'string' ? content : Array.isArray(content) ? content.map((b) => (isPlainObject(b) && typeof b.text === 'string' ? b.text : '')).join('\n') : '';
+  const rows = [];
+  for (const row of text.split('\n')) {
+    const m = /^\s*(\d+)(?:\t|\u2192)([\s\S]*)$/.exec(row);
+    if (m === null) continue;
+    const n = Number(m[1]);
+    if (rows.length > 0 && n !== rows[rows.length - 1].n + 1) return null;
+    rows.push({ n, text: m[2] });
+  }
+  return rows.length === 0 ? null : rows;
+}
+
+// The line numbers a Read result showed: { first, last } (readReturnedRows), or null.
+export function readReturnedRange(content) {
+  const rows = readReturnedRows(content);
+  return rows === null ? null : { first: rows[0].n, last: rows[rows.length - 1].n };
+}
+
+// The tool calls of a transcript, in order, from its assistant lines: [{name, input, id, answered, isError, returned, rows}]. `answered` = a tool_result for the call id came back;
+// `isError` = that result was flagged as an error; `returned` (a Read call only, else null) = readReturnedRange of its result; `rows` = its readReturnedRows (the text of each line, for the proof). A line that does not parse is skipped here
+// (proveModel already fails the transcript for it).
+export function toolCallsOf(jsonlText) {
+  const calls = [];
+  const byId = new Map();
+  if (typeof jsonlText !== 'string') return calls;
+  for (const row of jsonlText.split(/\r?\n/)) {
+    if (row.trim() === '') continue;
+    let line;
+    try { line = JSON.parse(row); } catch { continue; }
+    if (!isPlainObject(line) || !isPlainObject(line.message)) continue;
+    for (const b of blocksOf(line.message.content)) {
+      if (!isPlainObject(b)) continue;
+      if (line.type === 'assistant' && b.type === 'tool_use') {
+        const call = { name: String(b.name), input: isPlainObject(b.input) ? b.input : {}, id: typeof b.id === 'string' ? b.id : null, answered: false, isError: false, returned: null, rows: null };
+        calls.push(call);
+        if (call.id !== null) byId.set(call.id, call);
+      } else if (line.type === 'user' && b.type === 'tool_result' && byId.has(b.tool_use_id)) {
+        const call = byId.get(b.tool_use_id);
+        call.answered = true;
+        call.isError = b.is_error === true;
+        if (call.name === 'Read' && !call.isError) { call.rows = readReturnedRows(b.content); call.returned = call.rows === null ? null : { first: call.rows[0].n, last: call.rows[call.rows.length - 1].n }; }
+      }
+    }
+  }
+  return calls;
+}

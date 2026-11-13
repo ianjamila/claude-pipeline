@@ -103,6 +103,9 @@ risk:
     "pipeline/lib/agentlog.mjs", "pipeline/lib/agentlog-close.mjs",
     "pipeline/lib/codex-usage.mjs", "pipeline/lib/click-ask.mjs", "pipeline/lib/local-branches.mjs", "pipeline/commands/owner-go.mjs",
     "test/repo-risk-config.test.mjs", "test/fixtures/static-imports.mjs",
+    "pipeline/commands/substitute.mjs", "pipeline/commands/codex-status.mjs", "pipeline/lib/codex-session.mjs", "pipeline/lib/codex-usage.mjs",
+    "pipeline/lib/review-round.mjs", "pipeline/lib/review-route.mjs", "pipeline/lib/round-stats.mjs", "pipeline/lib/route-record.mjs",
+    "pipeline/lib/second-review-substitute.mjs", "pipeline/lib/substitute-proof.mjs",
     "install.sh", "install.ps1"]
   # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
   # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other
