@@ -14,9 +14,14 @@ export const READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob'];
 // The hand-back tool is how a background subagent delivers its report (transcript.mjs); it is not a way to act on the repository.
 export const ALLOWED_TOOLS = [...READ_ONLY_TOOLS, 'SubagentHandback'];
 export const MODEL_PREFIX = { 'substitute-opus': 'claude-opus-', 'substitute-fable': 'claude-fable-' };
-// A Read call returns at most this many lines unless it is given a limit; the agent's Read default is offset 1, limit 2000. A required file longer than one page is not
-// accepted into a substitute packet at all (`substitute prepare`: packet-unreadable), so the agent is never asked for more than it can read in one go.
+// What one Read call returns: the agent's Read default is offset 1, limit 2000 lines, and a line longer than 2000 characters is cut short (so it can never be read in full).
+// A longer file is read in pages (offset / limit), one call per page; the proof below needs the pages to cover every line.
 export const READ_PAGE_LINES = 2000;
+export const READ_LINE_CHARS = 2000;
+// The most Read pages (calls) a packet may need, input file and exported files together. The call-budget hook stops a reviewer-type subagent at 40 tool calls (its tightest
+// stop line; other agents 90), and the agent also needs calls for Grep / Read of the repository around the diff: 15 pages leaves it 25 of the 40. `substitute prepare` and
+// `triage second-review` refuse a packet over this (packet-unreadable) instead of letting the agent burn its attempts on one it cannot finish.
+export const MAX_READ_PAGES = 15;
 export const PROOF_EFFORT = 'high';
 // findSubagentTranscript refuses a non-finite age, so "any age" is a number of milliseconds longer than any file can be old.
 const ANY_AGE_MS = Number.MAX_SAFE_INTEGER;
@@ -35,6 +40,31 @@ export function refuseTestOnlyFlags(values, env) {
 
 // The lines of a text as Read numbers them: a final newline does not start another line, and an empty file has none.
 export const lineCountOf = (text) => (text === '' ? 0 : text.split('\n').length - (text.endsWith('\n') ? 1 : 0));
+
+// Could a substitute agent read all of these files in full? files: [{rel, content}] (the input file and every exported file). -> null when it can, else
+// { message, pages, maxPages, maxLineChars, files: [{rel, lines, pages, longLine?: {line, chars}}] } (message + extra fields are for the refusal's output).
+// Refused when a file has a line over READ_LINE_CHARS characters (Read truncates it) or the files together need more than MAX_READ_PAGES pages (ceil(lines / READ_PAGE_LINES) each, an empty file 1).
+export function unreadablePacket(files) {
+  const rows = files.map((f) => {
+    const lines = lineCountOf(f.content);
+    const long = f.content.split('\n').findIndex((l) => l.length > READ_LINE_CHARS);
+    return {
+      rel: f.rel, lines, pages: Math.max(1, Math.ceil(lines / READ_PAGE_LINES)),
+      ...(long < 0 ? {} : { longLine: { line: long + 1, chars: f.content.split('\n')[long].length } }),
+    };
+  });
+  const pages = rows.reduce((n, r) => n + r.pages, 0);
+  const longOnes = rows.filter((r) => r.longLine !== undefined);
+  if (longOnes.length === 0 && pages <= MAX_READ_PAGES) return null;
+  const why = [
+    ...longOnes.map((r) => `${r.rel} line ${r.longLine.line} is ${r.longLine.chars} characters (Read cuts a line at ${READ_LINE_CHARS} characters)`),
+    ...(pages > MAX_READ_PAGES ? [`the files need ${pages} Read pages of ${READ_PAGE_LINES} lines (${rows.map((r) => `${r.rel}: ${r.lines} lines`).join(', ')}), over the ${MAX_READ_PAGES} the agent can spend`] : []),
+  ];
+  return {
+    message: `the evidence for a substitute cannot be read in full by the agent: ${why.join('; ')}: not eligible; park the round as without a substitute`,
+    pages, maxPages: MAX_READ_PAGES, maxLineChars: READ_LINE_CHARS, files: rows,
+  };
+}
 
 // Do the successful Reads of `file` in `calls` (toolCallsOf) together cover all of its `lines` lines? Each Read covers offset .. offset + limit - 1 (default offset 1, limit
 // READ_PAGE_LINES); the ranges may come in any order and overlap, but a gap leaves lines unread. An offset or limit that is not a whole number (>= 1 for a limit, >= 1 for an
