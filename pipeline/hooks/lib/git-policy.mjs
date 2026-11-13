@@ -1605,6 +1605,8 @@ function judgeAlternatives(ctx, items, judge) {
     ctx.branches.clear();
     for (const [d, e] of base.branches) ctx.branches.set(d, { ...e });
     for (const [k, was] of [['gitAliases', base.git], ['ghAliases', base.gh]]) { for (const n of Object.keys(ctx[k])) delete ctx[k][n]; Object.assign(ctx[k], was); }
+    // (an unsure mark added without a change to the map -- by a nested judgeAlternatives, judgeReadings, a carried implicit startup -- is a redefinition too)
+    for (const n of ctx.aliasUnsure) if (!base.unsure.has(n)) redefined.add(n);
     ctx.aliasUnsure.clear();
     for (const n of base.unsure) ctx.aliasUnsure.add(n);
   };
@@ -1640,7 +1642,7 @@ function packageScriptVerdict(argv, dir, ctx, level, seen = null) {
   }
   if (dir === null) {
     // (#352) inside a script file, a directory lost to a cd the guard cannot follow is most likely near the script (`cd "$(dirname "$0")/.."`): the package.json is read from the script's directory and each one above it
-    // (the same package.json is reached from several of them: each distinct script is judged once)
+    // (the same package.json is reached from several of them: each distinct plan, the ordered runs, is judged once)
     const judged = new Set();
     const v = judgeAlternatives(ctx, selfDirs(ctx), (d) => packageScriptVerdict(argv, d, ctx, level, judged));
     if (v) return v;
@@ -1651,12 +1653,12 @@ function packageScriptVerdict(argv, dir, ctx, level, seen = null) {
   if (plan.refuse) return deny(plan.refuse);
   const marked = pkgMarkersFor(ctx.budget, pmStartDirs(call, [dir], ctx.home, path), { pathExists: ctx.pathExists, real: (q) => realLocation(ctx.realpath, q), p: path });
   if (marked === 'known' || (marked === 'maybe' && lineMentionsGuarded(ctx))) return deny(MARKERS_MSG(said, marked));
-  for (const run of plan.runs ?? []) {
-    if (seen) { // (a script already judged for another candidate directory)
-      const key = [run.file, run.dir, run.binDir ?? '', run.name ?? run.label, run.text].join('\u0000'); // (not the label: it names the file relative to the directory the manager was started in, which differs)
-      if (seen.has(key)) continue;
-      seen.add(key);
-    }
+  // (a plan already judged for another candidate directory: the whole ORDERED list of runs, as runs of one plan share state -- an alias or a config change of one is there for the next -- and the order can depend on the directory)
+  // (the key is not the label: it names the file relative to the directory the manager was started in, which differs)
+  const planKey = (plan.runs ?? []).map((run) => [run.file, run.dir, run.binDir ?? '', run.name ?? run.label, run.text].join('\u0000')).join('\u0001');
+  const planSeen = seen !== null && seen.has(planKey);
+  if (seen && !planSeen) seen.add(planKey);
+  for (const run of planSeen ? [] : plan.runs ?? []) {
     // (the manager puts every node_modules/.bin from the package's directory upward on the PATH of the script's commands: a bare command name in it may be one of those bins)
     const outerBinDir = ctx.scriptBinDir;
     ctx.scriptBinDir = run.binDir ?? run.dir;

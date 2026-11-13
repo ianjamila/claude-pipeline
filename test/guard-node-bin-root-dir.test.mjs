@@ -243,3 +243,30 @@ test('#352 R1-F2: a package.json reached from many ancestor directories is judge
   const r = run('git', `${GIT_ROOT}/${dirs}/serve.sh`, files);
   assert.equal(r.decision, 'allow', r.reason);
 });
+
+// Why (#352 R2-B1): an inner judgeAlternatives restored the alias map and kept the change only in aliasUnsure; the outer one then reset aliasUnsure to its own start, so the uncertainty was lost.
+test('#352 R2-B1: an alias defined by a script nested in a speculative script is still unsure afterwards', () => {
+  const files = {
+    'package.json': JSON.stringify({ name: 'x', scripts: { start: 'cd "$SOME_DIR" || exit 1; npm run setup', setup: 'git config alias.ship "' + PUSH + ' origin ' + MAIN + '"' } }),
+    'start.sh': '#!/bin/bash\ncd "$SOME_DIR" || exit 1\nnpm start\n',
+    'release.sh': '#!/bin/bash\ngit ship\n',
+  };
+  const r = run('git', `bash ${GIT_ROOT}/start.sh; bash ${GIT_ROOT}/release.sh`, files);
+  assert.equal(r.decision, 'deny', r.reason);
+});
+
+// Why (#352 R2-F1): runs of one workspace plan share state (an alias, a config change), and the plan's ORDER depends on the candidate directory; skipping a run already judged for another directory
+// skipped the order npm really uses (a, then b), so `git ship main` was never judged after the alias existed.
+test('#352 R2-F1: a workspace plan whose order differs by candidate directory is judged in every order', () => {
+  const mk = (a, b) => ({
+    'package.json': JSON.stringify({ name: 'root', workspaces: ['pkgs/a', 'pkgs/b'] }),
+    'pkgs/a/package.json': JSON.stringify({ name: 'a', scripts: { go: a } }),
+    'pkgs/b/package.json': JSON.stringify({ name: 'b', scripts: { go: b } }),
+    'pkgs/b/run.sh': '#!/bin/bash\ncd "$SOME_DIR" || exit 1\nnpm run go --workspaces\n',
+  });
+  const line = `bash ${GIT_ROOT}/pkgs/b/run.sh`;
+  const cfg = run('git', line, mk('git config push.default upstream', PUSH_BARE)); // (on a feature branch a bare push is unsafe only once push.default may point it at main)
+  assert.equal(cfg.decision, 'deny', 'push.default: ' + cfg.reason);
+  const al = run('git', line, mk('git config alias.ship "' + PUSH + ' origin"', `git ship ${MAIN}`), { currentBranch: () => MAIN });
+  assert.equal(al.decision, 'deny', 'alias: ' + al.reason);
+});
