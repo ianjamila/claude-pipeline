@@ -2931,7 +2931,10 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
   let envDirty = false;
   const moved = new Set(); // (directories whose branch some reading left different from the start; alias keys likewise: see below)
   const redefined = new Set();
-  // (#352 R4-F1, R5: the readings of a loop word are consecutive iterations of ONE shell, so what a body leaves for its next iteration is judged where the loop is walked: evalString, loopRunsOf)
+  // (#352 R4-F1, R5: the readings of a loop word are consecutive iterations of ONE shell, so what a body leaves for its next iteration is judged where the loop is walked: evalString, loopRunsOf.
+  // What one reading leaves for an early command of ANOTHER reading is not carried across readings: that command would have to be one whose own words depend on the loop word AND that is refused only
+  // by the other reading's leftovers; the one such command a word can steer, the git subcommand (`git $s`), is refused at run time whatever the leftovers are (RUN_TIME_SUBCOMMAND), and every other command
+  // is judged on the same words in every reading, so each reading's own second pass already meets what its body leaves.)
   try {
     for (let r = 0; r < total; r++) {
       checkDeadline(ctx.budget);

@@ -1,6 +1,8 @@
 // Why (#352 R5-B1, R5-F1, R5-F2): a loop's body runs again after it ran, so a command early in the body meets what the body itself left behind (a branch, an alias, a push.default change): the
 // second iteration of `for i in 1 2; do git push origin HEAD; npm run setup; done` pushes the branch `setup` switched to. The guard walked a body once, forward only, and its first fix for loop words
 // replayed the WHOLE text from the whole line's differences, which lost a switch made before the loop (R5-B1) and refused changes made before or after it (R5-F1).
+// Not carried across the readings of a loop word: what one reading leaves for another reading's early command. `git $s` is refused whatever is left (a subcommand only known at run time), and a command the
+// word does not steer meets the same leftovers in its own reading's second pass.
 // Rule held here: every loop (for / while / until, with or without an unsure variable, on a line or in a script) is judged once from its entry state; what the BODY left relative to entry is
 // the carry; when something was left the BODY alone is judged once more from entry + carry; changes outside the loop are never part of it.
 import { test } from 'node:test';
