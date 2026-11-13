@@ -221,6 +221,16 @@ test('recordForOutcome: no record makes one; a record for another PR is replaced
   assert.match(other.warnings[0], /does not belong/);
 });
 
+// R9-F1: replacing a record bound to another repo / branch must not drop the merge gate's resumed mark (the comment is still this PR's).
+test('recordForOutcome: a resumed record bound to another repo (rename / transfer) is replaced by one that is still resumed', () => {
+  const resumed = { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: 'a'.repeat(40) };
+  const old = applyCheckpoint(emptyRecord({ ...ID, repo: 'acme/old-name' }), { resumed }, CTX);
+  const { record, warnings } = recordForOutcome(old, { ...ID, outcome: 'merged', ...CTX });
+  assert.deepEqual([record.repo, record.resumed], ['acme/widgets', resumed]);
+  assert.match(warnings[0], /does not belong/);
+  assert.equal(recordForOutcome(emptyRecord({ ...ID, repo: 'acme/old-name' }), { ...ID, outcome: 'merged', ...CTX }).record.resumed, undefined, 'an ordinary one stays ordinary');
+});
+
 test('renderStatusBlock: shape, and hostile text cannot forge or close a marker or mention anyone', () => {
   const rec = applyCheckpoint(emptyRecord(ID), {
     step: 'review',

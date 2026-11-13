@@ -59,6 +59,24 @@ test('baseRecordFor: an absent or legacy comment and a record of another PR stay
   assert.equal(baseRecordFor(other, ID).record.resumed, undefined);
 });
 
+// R9-F1: a record bound to another repo / branch is replaced, but the mark the merge gate reads is not dropped with it.
+test('baseRecordFor: a resumed record bound to another repo or branch (rename / transfer) is replaced by a fresh one that is still resumed', () => {
+  for (const moved of [{ repo: 'acme/old-name' }, { branch: 'feat/old-branch' }, { pr: 99 }]) {
+    const { record, warnings } = baseRecordFor({ status: 'ok', record: { ...resumedRecord(), ...moved } }, ID);
+    assert.deepEqual(record.resumed, RESUMED, JSON.stringify(moved));
+    assert.deepEqual([record.repo, record.branch, record.pr], [ID.repo, ID.branch, PR], 'bound to this PR again');
+    assert.match(warnings[0], /does not belong to this PR/);
+  }
+});
+
+test('recorder: after a repo rename the next record write keeps the merge gate reading the run as resumed', () => {
+  const gh = memoryGh();
+  seed(gh, { ...resumedRecord(), repo: 'acme/old-name' });
+  assert.deepEqual(recorderFor(gh).update({ step: 'merge' }).resumed, RESUMED);
+  const after = readSummaryComment(gh, PR);
+  assert.deepEqual([after.status, after.record.repo, after.record.resumed], ['ok', ID.repo, RESUMED]);
+});
+
 test('recorder: replacing an invalid record writes a record the merge gate still reads as resumed (owner word required)', () => {
   const gh = memoryGh([{ id: 7, body: INVALID_BODY, user: { login: 'me' } }]);
   assert.equal(readSummaryComment(gh, PR).status, 'invalid');

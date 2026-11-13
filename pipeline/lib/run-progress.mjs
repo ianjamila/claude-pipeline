@@ -15,6 +15,7 @@ export const VIEW_FIELDS = Object.freeze(['headRefOid', 'headRefName', 'baseRefN
 
 // The record to build on: the one in the summary comment when it is readable and belongs to this PR, else a fresh one
 // (with a warning when a record existed but was not usable). `existing` is a readSummaryComment result.
+// A record bound to another repo / branch (a rename) is replaced too, but keeps its `resumed` mark.
 // An INVALID record may have been a resumed one, so its replacement is stamped `resumed` {at, host, head} (head: the PR head the caller
 // knows, else ''): `P merge` keeps asking for the owner's word. An UNSUPPORTED record (a newer CLI wrote it) is never replaced: this throws.
 export function baseRecordFor(existing, { repo, pr, branch, baseRef, step = 'build', host = hostname(), now = Date.now(), head = '' }) {
@@ -25,6 +26,8 @@ export function baseRecordFor(existing, { repo, pr, branch, baseRef, step = 'bui
     const mismatch = bindRecord(existing.record, { repo, pr, branch });
     if (mismatch.length === 0) return { record: existing.record, warnings };
     warnings.push(`the existing run record does not belong to this PR (${mismatch.join('; ')}); started a new one`);
+    // (it is still THIS PR's summary comment, the one the merge gate reads: a repo or branch rename must not clear a resumed mark)
+    if (existing.record.resumed) resumed = existing.record.resumed;
   } else if (existing.status === 'invalid') {
     resumed = stampResumed({ host, now, head });
     warnings.push("the existing run record could not be read; started a new one, marked resumed (the merge then needs the owner's word)");
