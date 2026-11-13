@@ -116,3 +116,59 @@ test('#352 R8 adjacent shapes: negation, a text run by bash -c under ||, a pipel
   allows('twin: a nested subshell with a cd behind ||, then a switch', '( (true || cd /safe) ); ' + RESET + ' && ' + SHIP);
   allows('twin: cd d && A=$(true) &&', 'cd /work/other2 && A=$(true) && ' + SHIP);
 });
+
+// #352 R9: the may-not-run rule reads the command's OWN operator and negation, and those of EVERY level that holds it (a `bash -c` / eval text, a substitution), not one of them.
+test('#352 R9-B1 R9-F1: a text run by bash -c / eval / $( ) keeps its own || and !, and takes those of every level that holds it', () => {
+  denies('bash -c with || inside', `bash -c 'true || git switch agent/x && ${SHIP}'`);
+  denies('bash -c with ! inside', `bash -c '! git switch agent/x && ${SHIP}'`);
+  denies('two levels of bash -c behind ||', `true || bash -c "bash -c 'git switch agent/x'" && ${SHIP}`);
+  denies('two levels of eval behind ||', `true || eval "eval 'git switch agent/x'" && ${SHIP}`);
+  denies('bash -c behind ! (the push runs when the text failed)', `! bash -c "bash -c 'git switch agent/x'" && ${SHIP}`);
+  denies('a substitution with || inside, after another command', `git status; echo $(true || git switch agent/x && ${SHIP})`);
+  denies('a substitution behind ||', `true || echo $(git switch agent/x) && ${SHIP}`);
+  denies('a substitution holder with a bash -c inside', `git status; echo $(bash -c 'true || git switch agent/x && ${SHIP}')`);
+  allows('twin: two levels of bash -c chained with &&', `bash -c "bash -c 'git switch agent/x'" && ${SHIP}`);
+  allows('twin: two levels of eval chained with &&', `eval "eval 'git switch agent/x'" && ${SHIP}`);
+  allows('twin: a substitution that switches, then &&', `echo $(git switch agent/x) && ${SHIP}`);
+  allows('twin: a text with && inside', `bash -c 'git switch agent/x && ${SHIP}'`);
+});
+
+test('#352 R9-F2: a keyword-only segment (!) before a subshell does not lose the may-skip mark of the construct before it', () => {
+  denies('fi && ! (false) &&', `if false; then cd /work/other2; fi && ! (false) && ${SHIP}`);
+  denies('done && ! (false) &&', `while false; do cd /work/other2; done && ! (false) && ${SHIP}`);
+  denies('fi && ! ((0)) &&', `if false; then cd /work/other2; fi && ! ((0)) && ${SHIP}`);
+  denies('a switch: fi && ! (false) &&', `if false; then ${RESET}; fi && ! (false) && ${SHIP}`);
+  allows('twin: cd d && ! (false) &&', `cd /work/other2 && ! (false) && ${SHIP}`);
+});
+
+test('#352 R9-F3: a negation covers the whole negated pipeline or group', () => {
+  denies('! { switch; } &&', `! { git switch agent/x; } && ${SHIP}`);
+  denies('! true | switch &&', `! true | git switch agent/x && ${SHIP}`);
+  denies('! { cd; } &&', `! { cd /work/other2; } && ${SHIP}`);
+  denies('! { a; switch; } &&', `! { git status; git switch agent/x; } && ${SHIP}`);
+  denies('! (switch) &&', `! (git switch agent/x) && ${SHIP}`);
+  denies('! cd | cat &&', `! cd /work/other2 | cat && ${SHIP}`);
+  allows('twin: { cd; } &&', `{ cd /work/other2; } && ${SHIP}`);
+  allows('twin: a plain pipeline', `cd /work/other2 | cat; ${SHIP.replace('git', 'true; git')}`.replace('true; ', ''));
+});
+
+test('#352 R9-F4: a pipeline that ends in & is a background job, whichever stage the change is in', () => {
+  denies('npm run | cat &', `npm run reset | cat & ${SHIP}`, HERE);
+  denies('switch | cat &', `git switch agent/x | cat & ${SHIP}`);
+  denies('cat | npm run &', `cat x | npm run reset & ${SHIP}`, HERE);
+  allows('twin: npm run | cat ;', `npm run reset | cat; ${SHIP}`, HERE);
+});
+
+test('#352 R9 scan (ii): an alias defined where it may not run is unsure for every later use', () => {
+  const ALIAS = 'git config alias.ship "' + PUSH + ' origin main"';
+  const HARMLESS = 'git config alias.ship status';
+  const reason = (cmd) => { const v = run(cmd); assert.equal(v.decision, 'deny', cmd); return v.reason; };
+  assert.match(reason(`true || ${ALIAS}; git ship`), /may have been \(re\)defined/);
+  assert.match(reason(`if false; then ${ALIAS}; fi && git ship`), /may have been \(re\)defined/);
+  assert.match(reason(`false && ${ALIAS}; git ship`), /may have been \(re\)defined/);
+  // the alias was a push to main already; the redefinition may not have run
+  assert.match(reason(`${ALIAS}; true || ${HARMLESS}; git ship`), /may have been \(re\)defined|pushing to main is blocked/);
+  assert.match(reason(`${ALIAS}; true || ${HARMLESS} && git ship`), /may have been \(re\)defined|pushing to main is blocked/);
+  assert.match(reason(`${ALIAS}; if false; then ${HARMLESS}; fi && git ship`), /may have been \(re\)defined|pushing to main is blocked/);
+  allows('twin: a certain redefinition', `${ALIAS}; ${HARMLESS} && git ship`);
+});
