@@ -383,3 +383,21 @@ test('#352 R13-F2: the command in front of a ( ) glued after its words is still 
   allows('twin: (cd d && push) | cat', `(cd /work/other2 && ${SHIP}) | cat`);
   allows('twin: cd d && npm test 2>&1 | tail, push in its own line', `cd /work/other2 && echo hi 2>&1 | tail && ${SHIP}`);
 });
+
+// (#352 R14: only an unquoted reserved word that can follow `)` gives the subshell's tail back; a `{fd}>` redirect, a zsh anonymous function or a short-form body keeps the list going)
+test('#352 R14-B1: a named-descriptor redirect after ) is part of the subshell command: a & after it still backgrounds the cd', () => {
+  denies('cd d && ( ) {fd}>/dev/null & push', `cd /work/other2 && (true) {fd}>/dev/null & ${SHIP}`);
+  denies('switch && ( ) {fd}>/dev/null & push', `${RESET} && (true) {fd}>/dev/null & ${SHIP}`);
+  allows('twin: cd d && ( ) {fd}>/dev/null && push', `cd /work/other2 && (true) {fd}>/dev/null && ${SHIP}`);
+  allows('twin: cd d && ( ) {fd}>/dev/null; push', `cd /work/other2 && (true) {fd}>/dev/null; ${SHIP}`);
+});
+
+test('#352 R14-F1: a zsh anonymous function or short-form body after ) still continues the list that began before the (', () => {
+  denies('cd d && () { true; } & push', `cd /work/other2 && () { true; } & ${SHIP}`);
+  denies('switch || () { push; }', `${RESET} || () { ${SHIP}; }`);
+  denies('cd d && if (true) echo hi & push', `cd /work/other2 && if (true) echo hi & ${SHIP}`);
+  allows('twin: cd d && () { true; } && push', `cd /work/other2 && () { true; } && ${SHIP}`);
+  allows('twin: cd d && () { true; }; push', `cd /work/other2 && () { true; }; ${SHIP}`);
+  allows('twin: switch; () { push; }', `${RESET}; () { ${SHIP}; }`);
+  allows('twin: cd d && if (true) echo hi && push', `cd /work/other2 && if (true) echo hi && ${SHIP}`);
+});
